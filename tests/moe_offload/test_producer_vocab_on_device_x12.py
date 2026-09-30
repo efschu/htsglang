@@ -18,7 +18,7 @@ import types
 
 import torch
 
-from sglang.srt.speculative import draft_kv_producer as dkp
+from flliper.srt.speculative import draft_kv_producer as dkp
 
 
 def _producer(events):
@@ -78,14 +78,14 @@ def test_x13_the_scope_carries_the_drafters_dtype(monkeypatch):
     default (float32) as params_dtype, dequantized float32 rows and the MTP
     layer's gemma_rmsnorm refused them ('failed to dispatch data type Float').
     The scope opens the loader's dtype context like the draft build had."""
-    from sglang.srt.managers import weg2_memory_saver as ms
+    from flliper.srt.managers import pdflip_memory_saver as ms
 
     monkeypatch.setattr(ms, "weights_region",
                         lambda *a, **k: contextlib.nullcontext(), raising=True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0, raising=True)
     producer = dkp.DraftKvProducer.__new__(dkp.DraftKvProducer)
     producer.draft_runner = types.SimpleNamespace(
-        _weg2_manifest_identity={"region_tag": "weights_draft"},
+        _pdflip_manifest_identity={"region_tag": "weights_draft"},
         server_args=types.SimpleNamespace(enable_weights_cpu_backup=False,
                                           enable_draft_weights_cpu_backup=False),
         memory_saver_adapter=None,

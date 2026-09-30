@@ -25,7 +25,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.reshard_plan import (
+from flliper.srt.layers.dcp.reshard_plan import (
     KvReshardError,
     build_transition,
     owner_of,
@@ -34,9 +34,9 @@ from sglang.srt.layers.dcp.reshard_plan import (
     reshard_vector_set,
     rows_of,
 )
-from sglang.srt.managers.kv_reshard import KvPoolView, KvReshardRuntime
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.kv_reshard import KvPoolView, KvReshardRuntime
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -578,9 +578,9 @@ class TestLadderWiring(CustomTestCase):
     """The #287 dcp_ratio rung drives arm() when a reshard runtime is bound."""
 
     def test_flip_arms_reshard_with_operating_point_vector(self):
-        from sglang.srt.managers.admission_limiter import AdmissionLimiter
-        from sglang.srt.managers.kv_pressure_runtime import KvPressureRuntime
-        from sglang.srt.model_executor.kv_pressure_ladder import (
+        from flliper.srt.managers.admission_limiter import AdmissionLimiter
+        from flliper.srt.managers.kv_pressure_runtime import KvPressureRuntime
+        from flliper.srt.model_executor.kv_pressure_ladder import (
             STEP_BASE,
             STEP_RELIEF,
             KvPressureLadder,
@@ -643,9 +643,9 @@ class TestLadderWiring(CustomTestCase):
         self.assertEqual(armed, [(2, 11, 10)])
 
     def test_without_reshard_arm_stays_planned_only(self):
-        from sglang.srt.managers.admission_limiter import AdmissionLimiter
-        from sglang.srt.managers.kv_pressure_runtime import KvPressureRuntime
-        from sglang.srt.model_executor.kv_pressure_ladder import (
+        from flliper.srt.managers.admission_limiter import AdmissionLimiter
+        from flliper.srt.managers.kv_pressure_runtime import KvPressureRuntime
+        from flliper.srt.model_executor.kv_pressure_ladder import (
             STEP_BASE,
             STEP_RELIEF,
             KvPressureLadder,

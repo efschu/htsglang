@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.performance_test_runner import PerformanceTestParams
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.performance_test_runner import PerformanceTestParams
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 # Higher est_time due to 6 variants with both performance and accuracy tests
@@ -48,7 +48,7 @@ class TestGptOss120B(unittest.TestCase):
             "--speculative-num-draft-tokens=4",
         ]
         eagle3_env = {
-            "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+            "FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
         }
 
         variants = [

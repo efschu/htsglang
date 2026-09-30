@@ -2,10 +2,10 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -52,8 +52,8 @@ class TestAscendDeepSeekMTP(CustomTestCase):
             2,
         ]
 
-        envs.SGLANG_NPU_USE_MLAPO.set(True)
-        envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
+        envs.FLLIPER_NPU_USE_MLAPO.set(True)
+        envs.FLLIPER_ENABLE_OVERLAP_PLAN_STREAM.set(True)
 
     def test_a_gsm8k(self):
         for model in self.models:

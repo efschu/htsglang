@@ -1,9 +1,9 @@
 import os
 import unittest
 
-from sglang.test.ascend.test_ascend_utils import QWEN3_8B_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import (
+from flliper.test.ascend.test_ascend_utils import QWEN3_8B_WEIGHTS_PATH
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

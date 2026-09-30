@@ -9,7 +9,7 @@ inherited by every worker. It must:
 - never override values the user has already exported.
 
 No GPU, no process spawn: the helper only reads server_args.rank_gpu_id
-and os.environ. `sgl_kernel` is stubbed before the sglang imports.
+and os.environ. `sgl_kernel` is stubbed before the flliper imports.
 """
 
 import logging
@@ -49,17 +49,17 @@ def _install_sgl_kernel_stub():
 
 _install_sgl_kernel_stub()
 
-from sglang.srt.entrypoints.engine import (  # noqa: E402
+from flliper.srt.entrypoints.engine import (  # noqa: E402
     _configure_nccl_env_for_colocation,
 )
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 NCCL_KEYS = ("NCCL_MULTI_RANK_GPU_ENABLE", "NCCL_NVLS_ENABLE", "NCCL_MAX_CTAS")
 
-ENGINE_LOGGER = "sglang.srt.entrypoints.engine"
+ENGINE_LOGGER = "flliper.srt.entrypoints.engine"
 
 
 def make_args(rank_gpu_id):
@@ -151,7 +151,7 @@ class ColocationNCCLEnvTest(CustomTestCase):
         """
         os.environ.pop("NCCL_NVLS_ENABLE", None)
         with patch(
-            "sglang.srt.entrypoints.engine._mps_control_daemon_responsive",
+            "flliper.srt.entrypoints.engine._mps_control_daemon_responsive",
             return_value=True,
         ):
             with self.assertLogs(ENGINE_LOGGER, level=logging.WARNING) as logs:
@@ -159,7 +159,7 @@ class ColocationNCCLEnvTest(CustomTestCase):
         self.assertFalse(any("MPS" in m for m in logs.output))
         # The gate must be able to fire, or the assertion above is vacuous.
         with patch(
-            "sglang.srt.entrypoints.engine._mps_control_daemon_responsive",
+            "flliper.srt.entrypoints.engine._mps_control_daemon_responsive",
             return_value=False,
         ):
             with self.assertLogs(ENGINE_LOGGER, level=logging.WARNING) as logs:

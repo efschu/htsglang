@@ -40,7 +40,7 @@ AWQ family.
 
 import os
 
-os.environ.setdefault("SGLANG_OPT_FP8_WO_A_GEMM", "0")
+os.environ.setdefault("FLLIPER_OPT_FP8_WO_A_GEMM", "0")
 
 import unittest
 from types import SimpleNamespace
@@ -48,10 +48,10 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from sglang.srt.runtime_context import get_context, reset_context
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.runtime_context import get_context, reset_context
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -83,7 +83,7 @@ def _ensure_dist_initialized() -> None:
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
 
-    from sglang.srt.distributed.parallel_state import (
+    from flliper.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
         model_parallel_is_initialized,
@@ -101,7 +101,7 @@ def _ensure_dist_initialized() -> None:
 
 
 def _gptq_config():
-    from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig
+    from flliper.srt.layers.quantization.gptq.gptq import GPTQConfig
 
     return GPTQConfig(
         weight_bits=4,
@@ -113,25 +113,25 @@ def _gptq_config():
 
 
 def _awq_config():
-    from sglang.srt.layers.quantization.awq.awq import AWQConfig
+    from flliper.srt.layers.quantization.awq.awq import AWQConfig
 
     return AWQConfig(weight_bits=4, group_size=_GROUP_SIZE, zero_point=True)
 
 
 def _fp8_block_config():
-    from sglang.srt.layers.quantization.fp8 import Fp8Config
+    from flliper.srt.layers.quantization.fp8 import Fp8Config
 
     return Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
 
 
 def _int8_config():
-    from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+    from flliper.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
     return W8A8Int8Config()
 
 
 def _gguf_config():
-    from sglang.srt.layers.quantization.gguf import GGUFConfig
+    from flliper.srt.layers.quantization.gguf import GGUFConfig
 
     return GGUFConfig()
 
@@ -189,7 +189,7 @@ class TestGlm4MoeSharedExpertConstruction(_ServerArgsFixture):
     """(a) The falsifier: on the unfixed tree the GGUF case never returns."""
 
     def _build(self, quant_method, quant_config):
-        from sglang.srt.models.glm4_moe import Glm4MoeSparseMoeBlock
+        from flliper.srt.models.glm4_moe import Glm4MoeSparseMoeBlock
 
         return self._build_block(Glm4MoeSparseMoeBlock, quant_method, quant_config)
 
@@ -227,7 +227,7 @@ class TestGlm4MoeLiteSharedExpertDtypeGates(_ServerArgsFixture):
     """(b) The falsifier: on the unfixed tree fp8 answers False here."""
 
     def _build(self, quant_method, quant_config):
-        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteSparseMoeBlock
+        from flliper.srt.models.glm4_moe_lite import Glm4MoeLiteSparseMoeBlock
 
         return self._build_block(Glm4MoeLiteSparseMoeBlock, quant_method, quant_config)
 
@@ -291,7 +291,7 @@ class _FusedAProjFixture(CustomTestCase):
 
     def _fused_params(self, quant_config):
         """``{name: param}`` of a real ``fused_qkv_a_proj_with_mqa``."""
-        from sglang.srt.layers.linear import ReplicatedLinear
+        from flliper.srt.layers.linear import ReplicatedLinear
 
         with torch.device("meta"):
             layer = ReplicatedLinear(
@@ -330,7 +330,7 @@ class TestFuseQKvAProjLayout(_FusedAProjFixture):
     """(c) The fused tensor must come out with the destination's shape."""
 
     def _assert_round_trip(self, quant_config, expected_axes):
-        from sglang.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
+        from flliper.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
 
         seen = {}
         for name, param in self._fused_params(quant_config).items():
@@ -391,7 +391,7 @@ class TestFuseQKvAProjScalarMarkers(_FusedAProjFixture):
     """A 0-d checkpoint tensor is a marker, not a shard: one value survives."""
 
     def test_a_scalar_pair_yields_a_single_scalar(self):
-        from sglang.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
+        from flliper.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
 
         marker = torch.tensor(14, dtype=torch.uint8)
         fused = fuse_q_kv_a_proj(
@@ -411,7 +411,7 @@ class TestFuseQKvAProjRefusesUnfusableGIdx(_FusedAProjFixture):
         return self._fused_params(_gptq_config())["g_idx"]
 
     def test_matching_g_idx_is_passed_through_not_concatenated(self):
-        from sglang.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
+        from flliper.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
 
         param = self._g_idx_param()
         self.assertIsNone(getattr(param, "output_dim", None))
@@ -427,7 +427,7 @@ class TestFuseQKvAProjRefusesUnfusableGIdx(_FusedAProjFixture):
         self.assertEqual(torch.cat([g_idx, g_idx]).shape[0], 2 * param.shape[0])
 
     def test_differing_g_idx_is_refused_by_name(self):
-        from sglang.srt.models.deepseek_common.utils import (
+        from flliper.srt.models.deepseek_common.utils import (
             UnfusableAProjParameter,
             fuse_q_kv_a_proj,
         )
@@ -447,7 +447,7 @@ class TestFuseQKvAProjRefusesUnfusableGIdx(_FusedAProjFixture):
 
     def test_the_refusal_can_fire_only_when_the_two_differ(self):
         # The can-fail proof for the guard: identical input never refuses.
-        from sglang.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
+        from flliper.srt.models.deepseek_common.utils import fuse_q_kv_a_proj
 
         param = self._g_idx_param()
         g_idx = torch.zeros(_HIDDEN, dtype=torch.int32)
@@ -458,17 +458,17 @@ class TestEveryFusionSiteUsesTheHelper(CustomTestCase):
     """The enumeration existed in four copies; none may be left behind."""
 
     _SITES = (
-        "python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py",
-        "python/sglang/srt/models/longcat_flash.py",
-        "python/sglang/srt/models/longcat_flash_nextn.py",
-        "python/sglang/srt/models/bailing_moe_linear.py",
+        "python/flliper/srt/models/deepseek_common/deepseek_weight_loader.py",
+        "python/flliper/srt/models/longcat_flash.py",
+        "python/flliper/srt/models/longcat_flash_nextn.py",
+        "python/flliper/srt/models/bailing_moe_linear.py",
     )
 
     def _repo_root(self):
-        import sglang
+        import flliper
 
         return os.path.abspath(
-            os.path.join(os.path.dirname(sglang.__file__), os.pardir, os.pardir)
+            os.path.join(os.path.dirname(flliper.__file__), os.pardir, os.pardir)
         )
 
     def test_no_site_still_carries_the_quant_name_enumeration(self):

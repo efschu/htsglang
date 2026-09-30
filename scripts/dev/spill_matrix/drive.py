@@ -45,7 +45,7 @@ SIGNALS = {
     #     --kv-session-offload-wave-back-min-free-tokens is NON-default, so at
     #     the default 0 its absence means nothing at all.
     # The real per-tick observable is the restore-gate trace at :4465, which
-    # needs SGLANG_KVSO_TICK_TRACE=1 and reports the host tail draining
+    # needs FLLIPER_KVSO_TICK_TRACE=1 and reports the host tail draining
     # (boundary advancing towards L) once every 16 iterations.
     "H3": [("restoregate", r"kv-session-offload restore-gate: iter=\d+ L=\d+ boundary=\d+")],
     "H4": [("restore", r"restored to device")],                           # :5276

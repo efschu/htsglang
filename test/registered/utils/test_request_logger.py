@@ -8,10 +8,10 @@ from pathlib import Path
 
 import requests
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.constants import HEALTH_CHECK_RID_PREFIX
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -256,10 +256,10 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
 
 
 class TestCustomHeaderViaEnvVar(BaseTestRequestLogger, CustomTestCase):
-    """Test that custom headers can be added via SGLANG_LOG_REQUEST_HEADERS env var."""
+    """Test that custom headers can be added via FLLIPER_LOG_REQUEST_HEADERS env var."""
 
     log_requests_format = "text"
-    env_vars = {"SGLANG_LOG_REQUEST_HEADERS": TEST_CUSTOM_HEADER_NAME}
+    env_vars = {"FLLIPER_LOG_REQUEST_HEADERS": TEST_CUSTOM_HEADER_NAME}
     request_headers = {
         "X-SMG-Routing-Key": TEST_ROUTING_KEY,
         TEST_CUSTOM_HEADER_NAME: TEST_CUSTOM_HEADER_VALUE,

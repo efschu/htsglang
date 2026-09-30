@@ -5,12 +5,12 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
+from flliper.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     run_mla_attention_case,
 )
@@ -19,8 +19,8 @@ from sglang.test.kits.attention_unittest.attention_methods.mla_attention import 
 # enforces:
 #   - kv_cache_dtype == torch.float8_e4m3fn (kv_cache_dtype=fp8_e4m3)
 #   - page_size in {32, 64}
-# See python/sglang/srt/layers/attention/tokenspeed_mla_backend.py and
-# is_tokenspeed_mla_available() in python/sglang/srt/utils/common.py.
+# See python/flliper/srt/layers/attention/tokenspeed_mla_backend.py and
+# is_tokenspeed_mla_available() in python/flliper/srt/utils/common.py.
 #
 # The shared MLAAttentionCase fixture now supports `fp8_kv_cache=True`:
 # `MockMLAModelRunner` decouples `kv_cache_dtype` from the model `dtype`
@@ -57,7 +57,7 @@ MLA_SHAPE_KWARGS = dict(
 )
 
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")

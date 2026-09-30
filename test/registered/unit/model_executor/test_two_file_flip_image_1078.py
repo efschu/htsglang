@@ -30,7 +30,7 @@ are 55.99 GiB across the three ranks on this rig, the same class as W26's
 68.7 GiB, against #721's measured cgroup peak of 111.3 of 118 GiB. File-backed
 images are reclaimable page cache, not a pinned post, so the same two images
 cost DISK (+27.15 GiB against 501 GiB free) and no locked RAM. The scheme is
-therefore VALID ONLY under ``SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED``, and F4
+therefore VALID ONLY under ``FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED``, and F4
 below makes that a refusal in code rather than a sentence in a docstring.
 
 THE INVARIANT MOVES, and naming the new one is half the change. Today's
@@ -58,17 +58,17 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.model_executor import weights_arena
-from sglang.srt.model_executor.weights_arena import (
+from flliper.srt.environ import envs
+from flliper.srt.model_executor import weights_arena
+from flliper.srt.model_executor.weights_arena import (
     ArenaLayout,
     ArenaSlot,
     WeightsArenaError,
     image_from_tensors,
     uint8_checksum,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -101,23 +101,23 @@ class TestTwoFilePreconditions(CustomTestCase):
         Can-fail: drop the refusal and this returns None instead of raising,
         which is exactly how the scheme would reach a boot as a silent pin.
         """
-        with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(False):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(False):
                 with self.assertRaises(WeightsArenaError) as caught:
                     weights_arena.require_two_file_preconditions()
-        self.assertIn("SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED", str(caught.exception))
+        self.assertIn("FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED", str(caught.exception))
 
     def test_two_file_with_file_backed_is_allowed(self):
         """The other direction, or the refusal above would prove nothing."""
-        with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
-            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
+            with envs.FLLIPER_PHASE_FLIP_IMAGE_FILE_BACKED.override(True):
                 weights_arena.require_two_file_preconditions()
 
     def test_gate_is_off_by_default(self):
         """F3's precondition: the new arm is opt-in, so the default is the old
         path byte for byte."""
-        self.assertFalse(envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.get())
-        with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(False):
+        self.assertFalse(envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.get())
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.override(False):
             self.assertFalse(weights_arena.two_file_images_enabled())
 
 
@@ -292,13 +292,13 @@ class TestDefaultArmUntouched(CustomTestCase):
         Can-fail: route the default arm through the two-file leg and the
         outgoing trailer stops being written, which breaks the NEXT flip.
         """
-        from sglang.srt.model_executor.rotation_executor import rotate_arena
+        from flliper.srt.model_executor.rotation_executor import rotate_arena
 
         pp = _layout(4096)
         image = torch.zeros(6144 + 8, dtype=torch.uint8)
         arena = torch.zeros(6144, dtype=torch.uint8)
         arena[: pp.total_bytes] = 5
-        with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(False):
+        with envs.FLLIPER_PHASE_FLIP_IMAGE_TWO_FILE.override(False):
             rotate_arena(
                 arena=arena,
                 host_image=image,

@@ -17,7 +17,7 @@ fake object. Covers the design contract:
 
 import unittest
 
-from sglang.srt.planner.live_metrics import (
+from flliper.srt.planner.live_metrics import (
     GpuLive,
     read_gpu_live,
     snapshot,
@@ -141,7 +141,7 @@ def _cuda_fastest_first():
 def _inject_cuda_order(mapping):
     from unittest import mock
 
-    from sglang.srt.registry import nvml as registry_nvml
+    from flliper.srt.registry import nvml as registry_nvml
 
     return mock.patch.object(
         registry_nvml,
@@ -156,32 +156,32 @@ def _inject_cuda_order(mapping):
 def _metrics(prompt, gen, device=0, host=0, storage=0, *, spec=True,
              hicache=True):
     lines = [
-        "# HELP sglang:prompt_tokens_total total prompt tokens",
-        "# TYPE sglang:prompt_tokens_total counter",
-        f'sglang:prompt_tokens_total{{model="m"}} {prompt}',
-        f'sglang:generation_tokens_total{{model="m"}} {gen}',
-        f'sglang:gen_throughput{{model="m"}} 42.0',
+        "# HELP flliper:prompt_tokens_total total prompt tokens",
+        "# TYPE flliper:prompt_tokens_total counter",
+        f'flliper:prompt_tokens_total{{model="m"}} {prompt}',
+        f'flliper:generation_tokens_total{{model="m"}} {gen}',
+        f'flliper:gen_throughput{{model="m"}} 42.0',
     ]
     if device:
         lines.append(
-            f'sglang:cached_tokens_total{{model="m",cache_source="device"}} {device}')
+            f'flliper:cached_tokens_total{{model="m",cache_source="device"}} {device}')
     if host:
         lines.append(
-            f'sglang:cached_tokens_total{{model="m",cache_source="host"}} {host}')
+            f'flliper:cached_tokens_total{{model="m",cache_source="host"}} {host}')
     if storage:
         lines.append(
-            'sglang:cached_tokens_total{model="m",cache_source="storage_file"} '
+            'flliper:cached_tokens_total{model="m",cache_source="storage_file"} '
             f'{storage}')
     if spec:
         lines += [
-            'sglang:spec_accept_rate{model="m"} 0.72',
-            'sglang:spec_num_steps{model="m"} 3',
-            'sglang:spec_ema_accept_len{model="m"} 2.4',
+            'flliper:spec_accept_rate{model="m"} 0.72',
+            'flliper:spec_num_steps{model="m"} 3',
+            'flliper:spec_ema_accept_len{model="m"} 2.4',
         ]
     if hicache:
         lines += [
-            'sglang:hicache_host_used_tokens{model="m"} 120000',
-            'sglang:hicache_host_total_tokens{model="m"} 400000',
+            'flliper:hicache_host_used_tokens{model="m"} 120000',
+            'flliper:hicache_host_total_tokens{model="m"} 400000',
         ]
     return "\n".join(lines) + "\n"
 
@@ -385,7 +385,7 @@ class TestEndpointAndConfig(unittest.TestCase):
             port = 30000
 
             def launch_command(self):
-                return ["python", "-m", "sglang.launch_server", "--tp", "2"]
+                return ["python", "-m", "flliper.launch_server", "--tp", "2"]
 
         # dataclasses.asdict fails on a non-dataclass -> launch_config falls back
         # to None but base_url is still derived; server_info fetch is skipped
@@ -441,9 +441,9 @@ class TestConcurrencyGauges(unittest.TestCase):
         m = _metrics(prompt=100, gen=100)
         extra = []
         if running is not None:
-            extra.append('sglang:num_running_reqs{model="m"} %s' % running)
+            extra.append('flliper:num_running_reqs{model="m"} %s' % running)
         if queued is not None:
-            extra.append('sglang:num_queue_reqs{model="m"} %s' % queued)
+            extra.append('flliper:num_queue_reqs{model="m"} %s' % queued)
         return m + ("\n".join(extra) + "\n" if extra else "")
 
     def test_gauges_are_carried_into_the_snapshot(self):
@@ -527,7 +527,7 @@ class TestServerStateInSnapshot(unittest.TestCase):
         self.assertTrue(snap["server_state"]["running"])
 
     def test_refused_scrape_without_api_is_not_running(self):
-        from sglang.srt.planner import server_state as ss
+        from flliper.srt.planner import server_state as ss
 
         snap, _ = snapshot(
             "http://127.0.0.1:1", None, nvml=_rig(), metrics_text="",
@@ -540,7 +540,7 @@ class TestServerStateInSnapshot(unittest.TestCase):
         self.assertNotIn("enable-metrics", snap["server_state"]["headline"])
 
     def test_api_up_and_metrics_404_is_the_flag_diagnosis(self):
-        from sglang.srt.planner import server_state as ss
+        from flliper.srt.planner import server_state as ss
 
         class _R:
             def getcode(self):
@@ -564,7 +564,7 @@ class TestServerStateInSnapshot(unittest.TestCase):
         self.assertIn("--enable-metrics", snap["server_state"]["headline"])
 
     def test_managed_boot_is_starting_not_a_flag_claim(self):
-        from sglang.srt.planner import server_state as ss
+        from flliper.srt.planner import server_state as ss
 
         snap, _ = snapshot(
             "http://127.0.0.1:1", None, nvml=_rig(), metrics_text="",
@@ -587,7 +587,7 @@ class TestSpillTiersInSnapshot(unittest.TestCase):
         self.assertIn("hicache_host_ram", tiers["measured_tiers"])
 
     def test_a_measured_tier_shows_up_from_the_scrape(self):
-        extra = ('sglang:spill_tier_used_bytes{model="m",'
+        extra = ('flliper:spill_tier_used_bytes{model="m",'
                  'spill_tier="expert_host_ram"} 1024\n')
         snap, _ = snapshot("x", None, nvml=_rig(),
                            metrics_text=_metrics(prompt=1, gen=1) + extra,

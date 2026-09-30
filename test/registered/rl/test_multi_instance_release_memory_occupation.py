@@ -11,9 +11,9 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
-from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.entrypoints.engine import Engine as FlliperEngine
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
     CustomTestCase,
@@ -42,7 +42,7 @@ MIN_DELTA_MB = 200
 
 class EngineWrapper:
     """
-    A wrapper around Sglang engine to mock multi instance cases such as RL training.
+    A wrapper around Flliper engine to mock multi instance cases such as RL training.
 
     """
 
@@ -68,8 +68,8 @@ class EngineWrapper:
         )
         self._engine = None
         if first_rank_in_node:
-            os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-            self._engine = SglangEngine(**engine_kwargs)
+            os.environ["FLLIPER_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+            self._engine = FlliperEngine(**engine_kwargs)
 
         dist.barrier(group=self._device_mesh_cpu.get_group())
 
@@ -134,7 +134,7 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
         output_reader, output_writer = multiprocessing.Pipe(duplex=False)
         for rank in range(world_size):
             p = Process(
-                target=_run_sglang_subprocess,
+                target=_run_flliper_subprocess,
                 kwargs=dict(
                     rank=rank,
                     dp_size=dp_size,
@@ -156,7 +156,7 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
             p.join()
 
 
-def _run_sglang_subprocess(
+def _run_flliper_subprocess(
     rank: int,
     dp_size: int,
     tp_size: int,
@@ -206,7 +206,7 @@ def _run_sglang_subprocess(
             mem_after = get_gpu_memory_mb(rank)
             assert_memory_decreased(mem_before, mem_after, "release KV cache")
 
-        # 2 - release sglang weights
+        # 2 - release flliper weights
         if is_tp_master:
             mem_before = get_gpu_memory_mb(rank)
             print(f"GPU{rank} before releasing weights: {mem_before:.0f} MB")
@@ -230,7 +230,7 @@ def _run_sglang_subprocess(
             assert_memory_increased(mem_before, mem_after, "load HF model")
         dist.barrier(group=inference_device_mesh_cpu["tp"].get_group())
 
-        # 4 - resume sglang weights and update from hf model
+        # 4 - resume flliper weights and update from hf model
         engine.resume_memory_occupation(tags=["weights"])
         engine.update_weights_from_tensor(
             named_tensors=list(hf_model.named_parameters()) if hf_model else []

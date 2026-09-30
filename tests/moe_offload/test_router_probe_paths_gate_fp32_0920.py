@@ -8,8 +8,8 @@ import types
 
 import torch
 
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.models import qwen3_moe as qm
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.models import qwen3_moe as qm
 
 
 def test_the_router_probe_sits_on_all_three_kernel_paths():
@@ -38,8 +38,8 @@ def test_probe_accepts_missing_flat_weights(monkeypatch):
 
 def test_gate_fp32_switch_parses_and_stays_off_by_default():
     assert qm.moe_gate_fp32_on({}) is False
-    assert qm.moe_gate_fp32_on({"SGLANG_MOE_GATE_FP32": "1"}) is True
-    assert qm.moe_gate_fp32_on({"SGLANG_MOE_GATE_FP32": "0"}) is False
+    assert qm.moe_gate_fp32_on({"FLLIPER_MOE_GATE_FP32": "1"}) is True
+    assert qm.moe_gate_fp32_on({"FLLIPER_MOE_GATE_FP32": "0"}) is False
 
 
 def test_router_logits_take_the_fp32_gemm_only_when_asked(monkeypatch):
@@ -52,10 +52,10 @@ def test_router_logits_take_the_fp32_gemm_only_when_asked(monkeypatch):
         return torch.nn.functional.linear(h, w), None
 
     gate.weight = w
-    monkeypatch.delenv("SGLANG_MOE_GATE_FP32", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_GATE_FP32", raising=False)
     out = qm.moe_router_logits(gate, x)
     assert calls == [torch.bfloat16] and out.dtype == torch.bfloat16
-    monkeypatch.setenv("SGLANG_MOE_GATE_FP32", "1")
+    monkeypatch.setenv("FLLIPER_MOE_GATE_FP32", "1")
     out32 = qm.moe_router_logits(gate, x)
     assert len(calls) == 1  # the module gate was NOT called
     assert out32.dtype == torch.float32

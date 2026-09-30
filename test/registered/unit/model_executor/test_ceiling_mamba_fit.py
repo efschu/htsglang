@@ -25,14 +25,14 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     MAMBA_AUTO_ACTIVATION_RESERVE_MIB,
     MAMBA_BUDGET_POST,
     MAMBA_CEILING_FIT_MIN_KV_MIB,
     ModelRunnerKVCacheMixin,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -106,7 +106,7 @@ def _resolve_reqs(sa: ServerArgs, token_capacity: int = 400_000) -> int:
     return ModelRunnerKVCacheMixin._resolve_max_num_reqs(stub, token_capacity)
 
 
-class TestFenster3Constellation(unittest.TestCase):
+class TestWindow3Constellation(unittest.TestCase):
     """The two boots that died now fit -- and the one that carried is
     untouched."""
 
@@ -290,7 +290,7 @@ class TestRankUniformity(unittest.TestCase):
         self.assertEqual(resolved[0], agreed // RATIO)
 
     def test_the_admission_limiter_floats_below_the_fitted_ceiling(self):
-        from sglang.srt.managers.admission_limiter import (
+        from flliper.srt.managers.admission_limiter import (
             AdmissionLimiter,
             resolve_admission_start,
         )
@@ -315,7 +315,7 @@ class TestRankUniformity(unittest.TestCase):
         self.assertLessEqual(limiter.current, limiter.ceiling)
 
     def test_a_start_above_the_fitted_ceiling_is_clamped_not_desynced(self):
-        from sglang.srt.managers.admission_limiter import resolve_admission_start
+        from flliper.srt.managers.admission_limiter import resolve_admission_start
 
         self.assertEqual(resolve_admission_start(18, 64, dp_size=1, floor=1), 18)
 
@@ -325,7 +325,7 @@ class TestThrottleBeforeRetractOrder(unittest.TestCase):
     before the retraction fallback, and still on replicated inputs."""
 
     def test_throttle_then_release_hysteresis_unchanged(self):
-        from sglang.srt.managers.admission_limiter import AdmissionLimiter
+        from flliper.srt.managers.admission_limiter import AdmissionLimiter
 
         limiter = AdmissionLimiter(
             18,
@@ -346,7 +346,7 @@ class TestThrottleBeforeRetractOrder(unittest.TestCase):
         self.assertGreater(limiter.current, throttled)
 
     def test_pressure_input_stays_replicated(self):
-        from sglang.srt.managers.admission_limiter import replicated_pool_usage
+        from flliper.srt.managers.admission_limiter import replicated_pool_usage
 
         # Same replicated inputs on every rank -> same verdict on every rank.
         verdicts = {replicated_pool_usage(1000, 4000) for _ in range(3)}
@@ -414,12 +414,12 @@ class TestCardProofMarkerCoupling(unittest.TestCase):
         mod = self._verdict_module()
         mixin = self._source(
             "python",
-            "sglang",
+            "flliper",
             "srt",
             "model_executor",
             "model_runner_kv_cache_mixin.py",
         )
-        sched = self._source("python", "sglang", "srt", "managers", "scheduler.py")
+        sched = self._source("python", "flliper", "srt", "managers", "scheduler.py")
         for marker, source, name in (
             (mod.M_FIT, mixin, "mixin"),
             (mod.M_POOL, mixin, "mixin"),
@@ -472,14 +472,14 @@ class TestCardProofMarkerCoupling(unittest.TestCase):
 #: arm A boot (TP=3, 5090 + 2x 3080). Slot counts and per-request cost differ
 #: by rank because per_req is a property of each rank's shard; the group
 #: ceiling ("admits ~N reqs") is what has to agree.
-_BELEG_RANKS = (
+_EVIDENCE_RANKS = (
     (0, 94, "37.41", 214),  # 5090-hosted rank
     (2, 92, "18.70", 226),  # 3080-hosted rank
     (1, 90, "18.70", 221),  # 3080-hosted rank
 )
 
 
-def _beleg_fit_line(rank, slots, requested=64):
+def _evidence_fit_line(rank, slots, requested=64):
     return (
         f"[2026-07-31 02:50:19 TP{rank}] [auto-mamba] the concurrency target "
         f"does not fit this rank's budget: leaving no KV pool. Fitting the "
@@ -490,7 +490,7 @@ def _beleg_fit_line(rank, slots, requested=64):
     )
 
 
-def _beleg_pool_line(rank, slots, per_req_mib, fit_cap, admits, requested=64):
+def _evidence_pool_line(rank, slots, per_req_mib, fit_cap, admits, requested=64):
     return (
         f"[2026-07-31 02:50:19 TP{rank}] [auto-mamba] demand-driven mamba "
         f"pool: target_concurrency={requested} ratio=5 safety=1.25 -> "
@@ -500,7 +500,7 @@ def _beleg_pool_line(rank, slots, per_req_mib, fit_cap, admits, requested=64):
     )
 
 
-def _beleg_admit_lines(fitted, requested=64):
+def _evidence_admit_lines(fitted, requested=64):
     return (
         f"[2026-07-31 02:50:32 TP0] Dynamic admission limit: the requested "
         f"ceiling {requested} (per worker) does not fit the memory budget; "
@@ -514,19 +514,19 @@ def _beleg_admit_lines(fitted, requested=64):
     )
 
 
-def _beleg_markers(admits_by_rank, requested=64, fitted=18):
+def _evidence_markers(admits_by_rank, requested=64, fitted=18):
     text = "".join(
-        _beleg_fit_line(r, slots, requested) for r, slots, _, _ in _BELEG_RANKS
+        _evidence_fit_line(r, slots, requested) for r, slots, _, _ in _EVIDENCE_RANKS
     )
     text += "".join(
-        _beleg_pool_line(r, slots, per_req, fit_cap, admits_by_rank[r], requested)
-        for r, slots, per_req, fit_cap in _BELEG_RANKS
+        _evidence_pool_line(r, slots, per_req, fit_cap, admits_by_rank[r], requested)
+        for r, slots, per_req, fit_cap in _EVIDENCE_RANKS
     )
-    text += _beleg_admit_lines(fitted, requested)
+    text += _evidence_admit_lines(fitted, requested)
     return text
 
 
-_BELEG_INFO = {
+_EVIDENCE_INFO = {
     "internal_states": [
         {"admission_limiter": {"current": 8, "start": 8, "ceiling": 18, "floor": 1}}
     ]
@@ -555,8 +555,8 @@ class TestArmAUniformAdmissionUnderUnevenTP(unittest.TestCase):
         return rc, captured.getvalue()
 
     def test_the_real_uneven_tp_run_now_passes(self):
-        markers = _beleg_markers({0: 18, 2: 18, 1: 18})
-        rc, out = self._run_arm_a(markers, _BELEG_INFO)
+        markers = _evidence_markers({0: 18, 2: 18, 1: 18})
+        rc, out = self._run_arm_a(markers, _EVIDENCE_INFO)
         self.assertEqual(rc, 0, out)
         self.assertIn(
             "PASS  pool sizes may differ across ranks, but every rank admits "
@@ -571,8 +571,8 @@ class TestArmAUniformAdmissionUnderUnevenTP(unittest.TestCase):
     def test_a_divergent_admission_ceiling_still_fails(self):
         """Uniform slot counts would no longer be required even if they held
         -- but a genuinely divergent GROUP ceiling must still fail."""
-        markers = _beleg_markers({0: 18, 2: 18, 1: 17})
-        rc, out = self._run_arm_a(markers, _BELEG_INFO)
+        markers = _evidence_markers({0: 18, 2: 18, 1: 17})
+        rc, out = self._run_arm_a(markers, _EVIDENCE_INFO)
         self.assertEqual(rc, 1, out)
         self.assertIn(
             "FAIL  pool sizes may differ across ranks, but every rank admits "
@@ -604,7 +604,7 @@ class TestArmBPressureSizing(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def test_pool_from_info_reads_the_beleg_shape(self):
+    def test_pool_from_info_reads_the_evidence_shape(self):
         mod = self._sizing_module()
         info = {"internal_states": [{"max_mamba_cache_size": 90}]}
         self.assertEqual(mod.pool_from_info(info), 90)
@@ -618,7 +618,7 @@ class TestArmBPressureSizing(unittest.TestCase):
         self.assertIsNone(mod.pool_from_info({"internal_states": [{}]}))
         self.assertIsNone(mod.pool_from_info({}))
 
-    def test_the_real_beleg_pool_no_longer_undershoots_throttle_high(self):
+    def test_the_real_evidence_pool_no_longer_undershoots_throttle_high(self):
         """The exact failure: 24 requests against a 90-slot pool never
         crosses 0.30 * 90 = 27 occupied slots; the fixed sizing does."""
         mod = self._sizing_module()

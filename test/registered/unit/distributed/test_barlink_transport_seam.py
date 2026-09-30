@@ -17,14 +17,14 @@ CPU only: nothing here constructs a real transport or touches a device.
 import os
 import unittest
 
-from sglang.srt.distributed.device_communicators import barlink as barlink_mod
-from sglang.srt.distributed.device_communicators.barlink import (
+from flliper.srt.distributed.device_communicators import barlink as barlink_mod
+from flliper.srt.distributed.device_communicators.barlink import (
     TRANSPORT_REGISTRY,
     BarlinkCommunicator,
     _build_transport,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -223,11 +223,11 @@ class TestFallbackPolicy(CustomTestCase):
         So assert the rule against its own source, on both sides of the
         release switch.
         """
-        import sglang.srt.distributed.parallel_state as ps
+        import flliper.srt.distributed.parallel_state as ps
 
-        saved = os.environ.get("SGLANG_BARLINK_GRAPH_ENABLE")
+        saved = os.environ.get("FLLIPER_BARLINK_GRAPH_ENABLE")
         try:
-            os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = "0"
+            os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = "0"
             self.assertEqual(
                 {n for n in TRANSPORT_REGISTRY if barlink_mod._no_fallback(n)},
                 set(ps.capturable_transports()),
@@ -237,7 +237,7 @@ class TestFallbackPolicy(CustomTestCase):
             # Released, bar1/matrix must ALSO stop falling back -- released
             # for capture and still able to swap itself for the gloo plane
             # would be the worst pairing of the two.
-            os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = "1"
+            os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = "1"
             self.assertEqual(
                 {n for n in TRANSPORT_REGISTRY if barlink_mod._no_fallback(n)},
                 set(ps.capturable_transports()),
@@ -245,9 +245,9 @@ class TestFallbackPolicy(CustomTestCase):
             self.assertIn("bar1", ps.capturable_transports())
         finally:
             if saved is None:
-                os.environ.pop("SGLANG_BARLINK_GRAPH_ENABLE", None)
+                os.environ.pop("FLLIPER_BARLINK_GRAPH_ENABLE", None)
             else:
-                os.environ["SGLANG_BARLINK_GRAPH_ENABLE"] = saved
+                os.environ["FLLIPER_BARLINK_GRAPH_ENABLE"] = saved
 
 
 class TestRealTransportsDeclareTheExpectedCapability(CustomTestCase):
@@ -255,7 +255,7 @@ class TestRealTransportsDeclareTheExpectedCapability(CustomTestCase):
     without importing anything device-specific at module scope."""
 
     def test_shm_class_declares_all_reduce_only(self):
-        from sglang.srt.distributed.device_communicators.barlink_shm import (
+        from flliper.srt.distributed.device_communicators.barlink_shm import (
             BarlinkShmTransport,
         )
 
@@ -264,7 +264,7 @@ class TestRealTransportsDeclareTheExpectedCapability(CustomTestCase):
         self.assertTrue(hasattr(BarlinkShmTransport, "barlink_all_reduce"))
 
     def test_device_class_declares_all_three(self):
-        from sglang.srt.distributed.device_communicators.barlink_device import (
+        from flliper.srt.distributed.device_communicators.barlink_device import (
             BarlinkDeviceTransport,
         )
 
@@ -295,7 +295,7 @@ class TestRealTransportsDeclareTheExpectedCapability(CustomTestCase):
         import inspect
         import textwrap
 
-        from sglang.srt.distributed.device_communicators.barlink_device import (
+        from flliper.srt.distributed.device_communicators.barlink_device import (
             BarlinkDeviceTransport,
         )
 

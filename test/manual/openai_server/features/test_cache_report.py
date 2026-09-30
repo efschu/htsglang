@@ -3,8 +3,8 @@ import unittest
 import openai
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -116,17 +116,17 @@ class TestCacheReport(CustomTestCase):
         response = self.run_decode()
         # print(response.json())
         cached_tokens = int(response.json()["meta_info"]["cached_tokens"])
-        print(f"sglang first request cached_tokens: {cached_tokens}")
+        print(f"flliper first request cached_tokens: {cached_tokens}")
         print(
-            f"sglang first request prompt_tokens: {int(response.json()['meta_info']['prompt_tokens'])}"
+            f"flliper first request prompt_tokens: {int(response.json()['meta_info']['prompt_tokens'])}"
         )
         # can't assure to be 0: depends on the initialisation request / if a template is used with the model
         assert cached_tokens < self.min_cached
         response = self.run_decode()
         cached_tokens = int(response.json()["meta_info"]["cached_tokens"])
-        print(f"sglang second request cached_tokens: {cached_tokens}")
+        print(f"flliper second request cached_tokens: {cached_tokens}")
         print(
-            f"sglang second request prompt_tokens: {int(response.json()['meta_info']['prompt_tokens'])}"
+            f"flliper second request prompt_tokens: {int(response.json()['meta_info']['prompt_tokens'])}"
         )
         assert cached_tokens == int(response.json()["meta_info"]["prompt_tokens"]) - 1
 

@@ -48,8 +48,8 @@ async def one_turn(args, samples: np.ndarray, rate: int) -> dict:
     """Drive one push-to-talk turn and return what came back."""
     import websockets
 
-    from sglang.srt.translator.audio import negotiate_codec
-    from sglang.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.audio import negotiate_codec
+    from flliper.srt.translator.backends import AudioChunk
 
     codec = negotiate_codec(["pcm16"])
     endpoint = f"{args.url.rstrip('/')}/api/translator/stream"
@@ -181,9 +181,9 @@ async def run(args) -> int:
 
     import soundfile as sf
 
-    from sglang.srt.translator.asr_backends import FasterWhisperAsr
-    from sglang.srt.translator.backends import AudioChunk
-    from sglang.srt.translator.scoring import word_error_rate
+    from flliper.srt.translator.asr_backends import FasterWhisperAsr
+    from flliper.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.scoring import word_error_rate
 
     samples, rate = sf.read(str(args.audio), dtype="float32")
     if samples.ndim > 1:

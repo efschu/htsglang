@@ -5,12 +5,12 @@ from typing import Optional
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.activation import SiluAndMul
+from flliper.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=108, stage="base-b", runner_config="1-gpu-small")
 
@@ -286,7 +286,7 @@ class TestFusedMarlinMoe(CustomTestCase):
                 )
 
                 score = torch.randn((m, e), device="cuda", dtype=dtype)
-                from sglang.srt.layers.moe.topk import fused_topk_torch_native
+                from flliper.srt.layers.moe.topk import fused_topk_torch_native
 
                 topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
 
@@ -396,7 +396,7 @@ class TestFusedMarlinMoe(CustomTestCase):
                     qweight2 = stack_and_dev(qweight2_l).contiguous()
                     scales2 = stack_and_dev(scales2_l)
 
-                    from sglang.srt.layers.moe.topk import fused_topk_torch_native
+                    from flliper.srt.layers.moe.topk import fused_topk_torch_native
 
                     topk_weights, topk_ids = fused_topk_torch_native(
                         a, score, topk, False

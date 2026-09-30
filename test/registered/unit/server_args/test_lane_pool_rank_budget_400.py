@@ -37,12 +37,12 @@ bridge, the per-card memory read and the model's weight footprint are injected.
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.registry import nvml as registry_nvml
-from sglang.srt.registry.nvml import DeviceInfo, MemoryInfo
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.server_args as server_args_module
+from flliper.srt.registry import nvml as registry_nvml
+from flliper.srt.registry.nvml import DeviceInfo, MemoryInfo
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -274,9 +274,9 @@ class UnboundableLaneTest(_LaneRigCase):
         override, and the override actually works."""
         with self.assertRaises(ValueError) as ctx:
             self.resolve()
-        self.assertIn("SGLANG_DUAL_GROUP_LANE_SKIP_BUDGET_CHECK", str(ctx.exception))
+        self.assertIn("FLLIPER_DUAL_GROUP_LANE_SKIP_BUDGET_CHECK", str(ctx.exception))
         with patch.dict(
-            "os.environ", {"SGLANG_DUAL_GROUP_LANE_SKIP_BUDGET_CHECK": "1"}
+            "os.environ", {"FLLIPER_DUAL_GROUP_LANE_SKIP_BUDGET_CHECK": "1"}
         ):
             self.resolve()
 

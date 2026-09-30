@@ -1,4 +1,4 @@
-"""Unit tests for score_and_pool in sglang.srt.layers.pooler.
+"""Unit tests for score_and_pool in flliper.srt.layers.pooler.
 
 All tests run on CPU — no GPU required.  MIS delimiter positions are passed
 via forward_batch.multi_item_delimiter_indices (pre-computed by the caller).
@@ -10,14 +10,14 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers.pooler import (
+from flliper.srt.layers.pooler import (
     EmbeddingPoolerOutput,
     Pooler,
     PoolingType,
     score_and_pool,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

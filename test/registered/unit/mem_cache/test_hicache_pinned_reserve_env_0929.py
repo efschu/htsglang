@@ -6,7 +6,7 @@
     V4 paged host pool qsa_indexer 0.27 GB] does not fit in 11.18 GB available
     minus a 10.74 GB OS reserve (caller) = 0.44 GB usable.
 
-The container sets SGLANG_PINNED_HOST_RESERVE_GIB=2 (RC2.1), and
+The container sets FLLIPER_PINNED_HOST_RESERVE_GIB=2 (RC2.1), and
 check_and_register_pinned_post reads it -- but only when the caller passes no
 reserve. The six HiCache host-pool sites passed the fixed 10 GiB constant
 HICACHE_HOST_MEMORY_RESERVE_BYTES, so the env never reached them ("(caller)"
@@ -22,9 +22,9 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache import pinned_host_budget as phb
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import pinned_host_budget as phb
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -71,7 +71,7 @@ class TheHiCachePoolsReadTheConfiguredReserve(CustomTestCase):
         available, env reserve 2 GiB. Stops before the allocation."""
         import torch
 
-        from sglang.srt.mem_cache import memory_pool_host as mph
+        from flliper.srt.mem_cache import memory_pool_host as mph
 
         class Admitted(Exception):
             pass

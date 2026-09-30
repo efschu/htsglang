@@ -15,38 +15,38 @@ from registered.debug_utils.comparator.testing_helpers import (
     make_tensor_info as _make_tensor_info,
 )
 
-from sglang.srt.debug_utils.comparator.aligner.axis_aligner import AxisAlignerPlan
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
+from flliper.srt.debug_utils.comparator.aligner.axis_aligner import AxisAlignerPlan
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
     TracedAlignerPlan,
     TracedSidePlan,
     TracedStepPlan,
     TracedSubPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.reorderer.types import (
+from flliper.srt.debug_utils.comparator.aligner.reorderer.types import (
     ReordererPlan,
     ZigzagToNaturalParams,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     TokenAlignerPlan,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
-from sglang.srt.debug_utils.comparator.output_types import (
+from flliper.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
+from flliper.srt.debug_utils.comparator.output_types import (
     BundleFileInfo,
     BundleSideInfo,
     ComparisonTensorRecord,
     ReplicatedCheckResult,
     ShapeSnapshot,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
+from flliper.srt.debug_utils.comparator.tensor_comparator.formatter import (
     _format_abs_diff_percentiles_rich,
     _format_bundle_section,
     _format_plan_section_rich,
@@ -55,13 +55,13 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.formatter import (
     format_comparison_rich,
     format_replicated_checks,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
+from flliper.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorComparisonInfo,
     TensorStats,
 )
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 

@@ -1,5 +1,5 @@
 """
-Unit tests for sglang.srt.constrained.grammar_manager.
+Unit tests for flliper.srt.constrained.grammar_manager.
 
 Test Coverage:
 - GrammarManager initialization, queue management, len, clear
@@ -18,15 +18,15 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.constrained.base_grammar_backend import (
+from flliper.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
     InvalidGrammarObject,
 )
-from sglang.srt.constrained.grammar_manager import GrammarManager
-from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
-from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.constrained.grammar_manager import GrammarManager
+from flliper.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
+from flliper.srt.distributed.communication_tags import P2PTag
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -80,7 +80,7 @@ def _make_req(
 class TestGrammarManagerInit(unittest.TestCase):
     """Test GrammarManager initialization."""
 
-    @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
+    @patch("flliper.srt.constrained.grammar_manager.create_grammar_backend")
     def test_init_with_backend(self, mock_create):
         mock_create.return_value = MagicMock(spec=BaseGrammarBackend)
         scheduler = _make_scheduler("xgrammar")
@@ -95,7 +95,7 @@ class TestGrammarManagerInit(unittest.TestCase):
         mgr = GrammarManager(scheduler)
         self.assertIsNone(mgr.grammar_backend)
 
-    @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
+    @patch("flliper.srt.constrained.grammar_manager.create_grammar_backend")
     def test_len_and_has_waiting(self, mock_create):
         mock_create.return_value = None
         scheduler = _make_scheduler()
@@ -103,7 +103,7 @@ class TestGrammarManagerInit(unittest.TestCase):
         self.assertEqual(len(mgr), 0)
         self.assertFalse(mgr.has_waiting_grammars())
 
-    @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
+    @patch("flliper.srt.constrained.grammar_manager.create_grammar_backend")
     def test_clear_resets_backend(self, mock_create):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_create.return_value = mock_backend
@@ -114,7 +114,7 @@ class TestGrammarManagerInit(unittest.TestCase):
         mgr.clear()
         mock_backend.reset.assert_called_once()
 
-    @patch("sglang.srt.constrained.grammar_manager.create_grammar_backend")
+    @patch("flliper.srt.constrained.grammar_manager.create_grammar_backend")
     def test_clear_no_backend(self, mock_create):
         mock_create.return_value = None
         scheduler = _make_scheduler()
@@ -389,8 +389,8 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
         # Use very short poll interval for tests
-        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.01
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 3
+        mgr.FLLIPER_GRAMMAR_POLL_INTERVAL = 0.01
+        mgr.FLLIPER_GRAMMAR_MAX_POLL_ITERATIONS = 3
         return mgr
 
     def test_ready_future_returns_req(self):
@@ -448,7 +448,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
 
     def test_timeout_aborts_req(self):
         mgr = self._make_mgr()
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 1
+        mgr.FLLIPER_GRAMMAR_MAX_POLL_ITERATIONS = 1
 
         future = Future()  # Never completes
         req = _make_req(json_schema="slow")
@@ -472,7 +472,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
     def test_pending_future_stays_in_queue(self):
         """Futures that aren't done stay in the queue."""
         mgr = self._make_mgr()
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100  # High to avoid timeout
+        mgr.FLLIPER_GRAMMAR_MAX_POLL_ITERATIONS = 100  # High to avoid timeout
 
         future = Future()  # Never completes
         req = _make_req(json_schema="pending")
@@ -488,7 +488,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
 
     def test_mixed_ready_and_pending(self):
         mgr = self._make_mgr()
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100
+        mgr.FLLIPER_GRAMMAR_MAX_POLL_ITERATIONS = 100
 
         # Ready request
         grammar_obj = MagicMock(spec=BaseGrammarObject)
@@ -524,7 +524,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
     def test_progressive_timeout(self):
         """Request with partial wait_ct should timeout after remaining iterations."""
         mgr = self._make_mgr()
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 3
+        mgr.FLLIPER_GRAMMAR_MAX_POLL_ITERATIONS = 3
 
         future = Future()  # Never completes
         req = _make_req(json_schema="slow")
@@ -561,7 +561,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(cached_key, ("json", "schema"))
         self.assertEqual(cached_value.max_think_tokens, 99)
 
-    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    @patch("flliper.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
     def test_multi_rank_sync_intersects_ready_unions_failed(self, mock_all_gather):
         """With multiple ranks, ready = intersection, failed = union."""
         mgr = self._make_mgr()
@@ -584,7 +584,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req1.grammar_wait_ct = 0
 
         mgr.grammar_queue = [req0, req1]
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100
+        mgr.FLLIPER_GRAMMAR_MAX_POLL_ITERATIONS = 100
 
         # Simulate all_gather: rank 0 has {0} ready, rank 1 has {0,1} ready
         def fake_all_gather(output_list, _obj, group=None):  # noqa: ARG001
@@ -601,12 +601,12 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(len(mgr.grammar_queue), 1)
         self.assertIs(mgr.grammar_queue[0], req1)
 
-    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    @patch("flliper.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
     def test_multi_rank_sync_unions_failed(self, mock_all_gather):
         """Failed requests from any rank should be unioned."""
         mgr = self._make_mgr()
         mgr.grammar_sync_size = 2
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 1
+        mgr.FLLIPER_GRAMMAR_MAX_POLL_ITERATIONS = 1
 
         pending_future = Future()  # Never completes
         req = _make_req(json_schema="slow", rid="r0")
@@ -804,7 +804,7 @@ class TestStrictReasoningPaths(unittest.TestCase):
         req.grammar_key = ("json", '{"type": "object"}')
         mgr.grammar_queue.append(req)
 
-        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.001
+        mgr.FLLIPER_GRAMMAR_POLL_INTERVAL = 0.001
         result = mgr.get_ready_grammar_requests()
 
         self.assertEqual(len(result), 1)

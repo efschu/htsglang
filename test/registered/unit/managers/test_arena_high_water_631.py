@@ -25,8 +25,8 @@ MiB payload. :func:`test_the_gate_prices_the_growing_leg` fails because
 import types
 import unittest
 
-from sglang.srt.managers.phase_flip_boot import PhaseFlipStacks
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from flliper.srt.managers.phase_flip_boot import PhaseFlipStacks
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 
 MIB = 1024 * 1024
 
@@ -132,7 +132,7 @@ class TestArenaHighWater(unittest.TestCase):
         # #809/W28: the copy the leg makes is now the ROTATION, and
         # `_timed_arena_refill` imports it from this module at call time, so
         # this is the seam to instrument.
-        import sglang.srt.model_executor.rotation_executor as rx
+        import flliper.srt.model_executor.rotation_executor as rx
 
         self.rx = rx
         self._orig = rx.rotate_arena
@@ -207,7 +207,7 @@ class TestArenaHighWater(unittest.TestCase):
         # wiring is pinned HERE, at the call site this file already owns.
         # Without this, updating the stub's signature would have silently
         # tolerated the instrument being removed again.
-        from sglang.srt.model_executor.weights_arena import RefillLegTiming
+        from flliper.srt.model_executor.weights_arena import RefillLegTiming
 
         st, carrier = _stacks(6690, 7924, 6690, self.rec)
         self._install(st, carrier)
@@ -234,7 +234,7 @@ class TestGatePricesBothLegs(unittest.TestCase):
     on whichever leg has to grow, not on a leg chosen at authoring time."""
 
     def _runtime(self, pp_mib, tp_mib, committed_mib):
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         hi = max(pp_mib, tp_mib)
         carrier = _Carrier(hi * MIB, committed_mib * MIB)
@@ -261,7 +261,7 @@ class TestGatePricesBothLegs(unittest.TestCase):
         self.assertEqual(rt._arena_tail_bytes(PP_TO_TP), 0)
 
     def test_no_carrier_is_zero_not_a_raise(self):
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         rt = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
         rt._census_scheduler = types.SimpleNamespace(phase_flip_stacks=None)

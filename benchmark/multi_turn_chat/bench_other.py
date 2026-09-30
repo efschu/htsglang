@@ -8,8 +8,8 @@ from data_gen import gen_arguments
 from tqdm import tqdm
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
-from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
-from sglang.utils import dump_state_text
+from flliper.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from flliper.utils import dump_state_text
 
 
 def multi_turns(generate, qas):

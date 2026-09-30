@@ -22,7 +22,7 @@ The fix, R12 style:
   finds room.
 
 Hermetic: the real C arena on a temp file and the real ArenaMHAHostPool, one
-per rank on the SAME arena file. Real ``_weg2_direct_claim``,
+per rank on the SAME arena file. Real ``_pdflip_direct_claim``,
 ``_w3_arena_spill``, ``arena_secure_to_disk`` and ``form_a_host_shadow``
 attach/consume/apply. Pages of 64 B, page_size 1."""
 
@@ -40,10 +40,10 @@ import torch  # noqa: E402
 sys.path.insert(0, os.path.dirname(__file__))
 import test_w3_arena_spill_0929 as W  # noqa: E402
 
-from sglang.srt.mem_cache import form_a_host_shadow as R  # noqa: E402
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode  # noqa: E402
+from flliper.srt.mem_cache import form_a_host_shadow as R  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedTreeNode  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -130,7 +130,7 @@ def test_dual15_a_workers_refused_claim_is_spilled_by_tp0_and_mirrored(group):
     # not spill on its own, it leaves its need for TP0
     with _as("worker"):
         m1 = _claimer(g.t1, "b")
-        assert g.t1._weg2_direct_claim(m1) is False
+        assert g.t1._pdflip_direct_claim(m1) is False
     assert all(n.component_data[FULL].host_value is not None for n in g.n1), "a worker spilled on its own"
     # TP0's broadcast: it serves the request, spills, the SPILL events ride it
     with _as("host"):
@@ -154,7 +154,7 @@ def test_dual15_a_workers_refused_claim_is_spilled_by_tp0_and_mirrored(group):
         assert b.component_data[FULL].value is not None   # stays on the device
     # every rank's reference is gone -> the worker's claim finds its room now
     with _as("worker"):
-        pre = g.t1._weg2_direct_claim(m1)
+        pre = g.t1._pdflip_direct_claim(m1)
     assert pre is not False and pre is not None and int(pre.numel()) == 2, g.t1.refused
 
 
@@ -163,13 +163,13 @@ def test_tp0_own_refusal_spills_and_records(group):
     with _as("host"):
         R.register_tree(g.t0)
         m0 = _claimer(g.t0, "c")
-        g.t0._weg2_direct_claim(m0)                  # refused this pass: TP1 still holds the slots
+        g.t0._pdflip_direct_claim(m0)                  # refused this pass: TP1 still holds the slots
         sent = R.attach([])
     assert sent and any(e[0] == R.SPILL for e in sent[0].events)
     with _as("worker"):
         R.apply(g.t1, sent[0].events, seq=sent[0].seq)
     with _as("host"):
-        pre = g.t0._weg2_direct_claim(m0)
+        pre = g.t0._pdflip_direct_claim(m0)
     assert pre is not False and pre is not None, g.t0.refused
 
 
@@ -186,5 +186,5 @@ def test_a_page_not_complete_is_not_spilled_on_form_a(group):
 def test_off_path_unchanged_role_none(group):
     g = group
     with _as(None):
-        g.t0._weg2_direct_claim(_claimer(g.t0, "d"))
+        g.t0._pdflip_direct_claim(_claimer(g.t0, "d"))
     assert not R._S.ledger, "a classic boot recorded R12 events"

@@ -4,18 +4,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 # Import shim for the #249 default-device collection leak: an earlier
 # collected module may leave ``torch.set_default_device(<accelerator>)``
-# active; this module's sglang import chain constructs tensors at import
+# active; this module's flliper import chain constructs tensors at import
 # time and then dies with RuntimeError on a box without that accelerator.
 # Skip the module instead of erroring; side effects on the process are
 # identical to the crash, so every other collected module keeps its fate.
 try:
-    from sglang.srt.layers.moe.moe_runner.triton_utils import (
+    from flliper.srt.layers.moe.moe_runner.triton_utils import (
         fused_moe_triton_config,
     )
 except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
@@ -46,7 +46,7 @@ def test_down_moe_reuses_tuned_up_config_when_separate_config_is_absent(
     tuned_config = {"128": {"BLOCK_SIZE_M": 64}}
     (config_root / "up.json").write_text(json.dumps(tuned_config))
 
-    monkeypatch.setenv("SGLANG_MOE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("FLLIPER_MOE_CONFIG_DIR", str(tmp_path))
     monkeypatch.setattr(fused_moe_triton_config.triton, "__version__", "3.6.0")
     monkeypatch.setattr(
         fused_moe_triton_config,

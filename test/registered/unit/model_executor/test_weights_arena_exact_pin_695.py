@@ -18,7 +18,7 @@ The phase flip holds TWO such images per rank for the life of the process
 a transient overshoot, it is permanent resident host memory.
 
 MEASURED, on the live PP=3 boot of 2026-08-12 (``/proc/<pid>/smaps``, the
-three ``sglang::scheduler`` ranks). Payload figures are the ones this repo
+three ``flliper::scheduler`` ranks). Payload figures are the ones this repo
 already recorded at ``phase_flip_spill.py:851-854``::
 
     rank   layout_pp   -> mapping    layout_tp   -> mapping
@@ -58,9 +58,9 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
-from sglang.srt.model_executor import weights_arena
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.mmap_allocator import alloc_mmap
+from flliper.srt.model_executor import weights_arena
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

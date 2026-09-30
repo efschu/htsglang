@@ -6,24 +6,24 @@ wget -O question.jsonl https://raw.githubusercontent.com/lm-sys/FastChat/main/fa
 
 ## Run benchmark
 
-### Benchmark sglang
+### Benchmark flliper
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
-```
-
-```
-python3 bench_sglang.py --num-questions 80
+python -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
-### Benchmark sglang EAGLE
 ```
-python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3-8B-Instruct --speculative-algo EAGLE \
+python3 bench_flliper.py --num-questions 80
+```
+
+### Benchmark flliper EAGLE
+```
+python3 -m flliper.launch_server --model meta-llama/Meta-Llama-3-8B-Instruct --speculative-algo EAGLE \
     --speculative-draft-model-path lmsys/sglang-EAGLE-LLaMA3-Instruct-8B --speculative-num-steps 5 \
     --speculative-eagle-topk 8 --speculative-num-draft-tokens 64 --dtype float16 --port 30000
 ```
 
 ```
-python3 bench_sglang_eagle.py --num-questions 80 --parallel 1
+python3 bench_flliper_eagle.py --num-questions 80 --parallel 1
 ```
 
 

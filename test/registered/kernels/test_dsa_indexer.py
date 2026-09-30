@@ -4,34 +4,34 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.srt.environ import envs
+from flliper.srt.runtime_context import get_parallel
+from flliper.test.ci.ci_register import register_cuda_ci
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
-from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.dsa.dsa_indexer import (
+from flliper.srt.configs.model_config import AttentionArch
+from flliper.srt.layers.attention.dsa.dsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
     rotate_activation,
 )
-from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+from flliper.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
-from sglang.srt.layers.attention.dsa_backend import (
+from flliper.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAIndexerMetadata,
     DSAMetadata,
 )
-from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.layers.linear import LinearBase
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.layernorm import LayerNorm
+from flliper.srt.layers.linear import LinearBase
+from flliper.srt.mem_cache.memory_pool import DSATokenToKVPool
+from flliper.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-large")
 
@@ -394,7 +394,7 @@ class TestDSAIndexer(CustomTestCase):
         # publish ``self.backend`` for the duration of this fixture call so
         # ``get_attn_backend()`` / ``get_token_to_kv_pool()`` /
         # ``get_req_to_token_pool()`` resolve correctly.
-        from sglang.srt.model_executor.forward_context import (
+        from flliper.srt.model_executor.forward_context import (
             ForwardContext,
             set_forward_context,
         )
@@ -521,7 +521,7 @@ class TestDSAIndexer(CustomTestCase):
             topk_backend=topk_backend,
         )
 
-        with envs.SGLANG_DSA_FUSE_TOPK.override(False):
+        with envs.FLLIPER_DSA_FUSE_TOPK.override(False):
             topk_test = metadata.topk_transform(logits, topk, ks=row_starts)
         self.assertEqual(topk_test.shape, (batch_size, topk))
         self.assertEqual(topk_test.dtype, torch.int32)
@@ -642,7 +642,7 @@ class TestDSAIndexer(CustomTestCase):
         # preprocessed alongside the metadata (it asserts rather than silently
         # recomputing it) -- mirror what init_forward_metadata /
         # _build_forward_metadata_cuda_graph do.
-        from sglang.jit_kernel.dsv4.topk import plan_topk_v2
+        from flliper.jit_kernel.dsv4.topk import plan_topk_v2
 
         attn_metadata = DSAMetadata(
             page_size=1,
@@ -677,7 +677,7 @@ class TestDSAIndexer(CustomTestCase):
             topk_backend=DSATopKBackend.FLASHINFER,
         )
 
-        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+        with envs.FLLIPER_DSA_FUSE_TOPK.override(True):
             out_sgl = metadata_sgl.topk_transform(
                 logits,
                 topk,
@@ -704,7 +704,7 @@ class TestDSAIndexer(CustomTestCase):
             )
         )
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("flliper.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
     def test_indexer_basic_creation(self, mock_deep_gemm):
         """Test basic indexer creation and initialization."""
         mock_deep_gemm.get_num_sms.return_value = 132
@@ -718,8 +718,8 @@ class TestDSAIndexer(CustomTestCase):
         self.assertEqual(indexer.index_topk, self.config["index_topk"])
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
+    @patch("flliper.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("flliper.srt.layers.attention.dsa.triton_kernel.act_quant")
     def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
@@ -800,8 +800,8 @@ class TestDSAIndexer(CustomTestCase):
             topk_indices, self.batch_size, self.seq_len, self.config["index_topk"]
         )
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
+    @patch("flliper.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("flliper.srt.layers.attention.dsa.triton_kernel.act_quant")
     def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:
@@ -934,7 +934,7 @@ class TestDSAIndexer(CustomTestCase):
                         tie_break=tie_break,
                         with_row_starts=with_row_starts,
                     ):
-                        with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(
+                        with envs.FLLIPER_DSA_TOPK_FLASHINFER_TIE_BREAK.override(
                             tie_break
                         ):
                             self._run_unfused_topk_backend_validity_test(
@@ -967,7 +967,7 @@ class TestDSAIndexer(CustomTestCase):
                         topk_transform_method=topk_transform_method.name,
                         with_row_starts=with_row_starts,
                     ):
-                        with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(
+                        with envs.FLLIPER_DSA_TOPK_FLASHINFER_TIE_BREAK.override(
                             tie_break
                         ):
                             self._run_fused_topk_backend_equivalence_test(
@@ -983,7 +983,7 @@ class TestDSAIndexer(CustomTestCase):
                 with_row_starts=False,
                 query_lens="multi",
             ):
-                with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(tie_break):
+                with envs.FLLIPER_DSA_TOPK_FLASHINFER_TIE_BREAK.override(tie_break):
                     self._run_fused_topk_backend_equivalence_test(
                         batch_size=batch_size,
                         max_score_len=max_score_len,
@@ -994,7 +994,7 @@ class TestDSAIndexer(CustomTestCase):
                     )
 
     # TODO: enable this test after indexer accuracy aligned
-    # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    # @patch("flliper.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
     # def test_indexer_with_different_topk(self, mock_deep_gemm):
     #     """Test indexer with different topk values."""
     #     mock_deep_gemm.get_num_sms.return_value = 132
@@ -1004,7 +1004,7 @@ class TestDSAIndexer(CustomTestCase):
     #             indexer = self._create_indexer(index_topk=topk)
     #             self.assertEqual(indexer.index_topk, topk)
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("flliper.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
     def test_indexer_with_fused_wk(self, mock_deep_gemm):
         """Test indexer creation with fused wk and weights projection."""
         mock_deep_gemm.get_num_sms.return_value = 132
@@ -1014,7 +1014,7 @@ class TestDSAIndexer(CustomTestCase):
         indexer = self._create_indexer()
         self.assertIsNotNone(indexer)
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("flliper.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
     def test_indexer_with_alt_stream(self, mock_deep_gemm):
         """Test indexer creation with alternative CUDA stream."""
         mock_deep_gemm.get_num_sms.return_value = 132

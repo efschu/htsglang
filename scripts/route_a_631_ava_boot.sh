@@ -15,7 +15,7 @@
 # permitted difference between the two invocations is WT (which also sets
 # PYTHONPATH and the boot provenance).
 #
-# THE PER-RANK INSTRUMENT. SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 is set here
+# THE PER-RANK INSTRUMENT. FLLIPER_ENABLE_METRICS_DEVICE_TIMER=1 is set here
 # and is load-bearing for the gate, not decoration: under pp_size > 1 the
 # "Prefill rank batch ... gpu-ms (compute, wait)" split is NOT installed
 # (metrics_reporter._install_rank_prefill_timer returns early for
@@ -55,7 +55,7 @@ else
   SPEC_FLAGS="--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
 fi
 
-if pgrep -f "sglang.launch_server.*--port $PORT" >/dev/null 2>&1; then
+if pgrep -f "flliper.launch_server.*--port $PORT" >/dev/null 2>&1; then
   echo "REFUSE: a serving instance for port $PORT is already running." >&2
   exit 1
 fi
@@ -63,28 +63,28 @@ fi
 export PYTHONPATH="$WT/python"
 export LD_LIBRARY_PATH="/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 # The gate's per-rank compute/wait instrument (see header).
-export SGLANG_ENABLE_METRICS_DEVICE_TIMER=1
-export SGLANG_COLLECTIVE_CENSUS_INTERVAL="${SGLANG_COLLECTIVE_CENSUS_INTERVAL:-50}"
+export FLLIPER_ENABLE_METRICS_DEVICE_TIMER=1
+export FLLIPER_COLLECTIVE_CENSUS_INTERVAL="${FLLIPER_COLLECTIVE_CENSUS_INTERVAL:-50}"
 
 if [ "$BARLINK" = "1" ]; then
   if [ ! -e /dev/dmabuf_holder ]; then
     echo "REFUSE: bar1 transport requested but /dev/dmabuf_holder is missing." >&2
     exit 1
   fi
-  export SGLANG_BARLINK=1
-  export SGLANG_BARLINK_TRANSPORT=bar1
-  export SGLANG_BARLINK_BAR1_CAP_CYCLES=300000000000
+  export FLLIPER_BARLINK=1
+  export FLLIPER_BARLINK_TRANSPORT=bar1
+  export FLLIPER_BARLINK_BAR1_CAP_CYCLES=300000000000
   # NON-FLIP topology: only world:0 and pp:0 carry a window here, so the
   # flip-group budget of the production script does not apply. pp:0 keeps
   # the 96 MiB it needs for chunked-prefill activations.
-  export SGLANG_BARLINK_BAR1_WINDOW_MIB="${SGLANG_BARLINK_BAR1_WINDOW_MIB:-32}"
-  export SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0="${SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0:-96}"
+  export FLLIPER_BARLINK_BAR1_WINDOW_MIB="${FLLIPER_BARLINK_BAR1_WINDOW_MIB:-32}"
+  export FLLIPER_BARLINK_BAR1_WINDOW_MIB_PP_0="${FLLIPER_BARLINK_BAR1_WINDOW_MIB_PP_0:-96}"
 else
-  export SGLANG_BARLINK=0
-  unset SGLANG_BARLINK_TRANSPORT || true
+  export FLLIPER_BARLINK=0
+  unset FLLIPER_BARLINK_TRANSPORT || true
 fi
 
 # --- resolve cards by NAME -> UUID, 5090 FIRST (same rule as production) ----
@@ -106,7 +106,7 @@ BOOT_COMMIT="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 cd "$WT"
 CUDA_VISIBLE_DEVICES="$BIG_UUID,${SMALL_UUID[0]},${SMALL_UUID[1]}" \
-setsid "$PY" -m sglang.launch_server \
+setsid "$PY" -m flliper.launch_server \
     --model-path "$MODEL" --trust-remote-code \
     --served-model-name Qwen3.6-27B \
     --tp-size 1 --pp-size 3 \

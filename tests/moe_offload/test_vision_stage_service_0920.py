@@ -30,10 +30,10 @@ import types
 
 import pytest
 
-from sglang.srt.planner import vision_stage as vs
-from sglang.srt.weg2 import front as fr
-from sglang.srt.weg2 import vision_stage_runtime as vsr
-from sglang.srt.weg2 import vision_stage_service as svc
+from flliper.srt.planner import vision_stage as vs
+from flliper.srt.pdflip import front as fr
+from flliper.srt.pdflip import vision_stage_runtime as vsr
+from flliper.srt.pdflip import vision_stage_service as svc
 
 GIB = vs.GIB
 MIB = vs.MIB
@@ -130,7 +130,7 @@ def test_a_card_with_no_total_is_skipped_rather_than_dividing_by_it():
 def test_the_whole_path_attaches_rows_and_drops_the_pixels():
     s = service({0: 700, 1: 1670, 2: 2140})
     items = [_Item()]
-    out = s.encode_items(items, rid="weg2-1-7")
+    out = s.encode_items(items, rid="pdflip-1-7")
     assert out.ok is True
     assert out.code == svc.W_STAGE_OK
     assert out.card == 2  # the only card with the air, after the 0.45 GiB ctx
@@ -146,7 +146,7 @@ def test_the_outcome_is_serialisable_as_the_wire_form():
     d = s.encode_items([_Item()], rid="r1").as_dict()
     assert set(d) == {"ok", "code", "detail", "rid", "card", "rows", "seconds", "fatal"}
     assert d["ok"] is True and d["rid"] == "r1"
-    assert "W102 Weg2VisionStage" in d["detail"]
+    assert "W102 PdFlipVisionStage" in d["detail"]
 
 
 def test_the_encoder_flops_come_from_the_items_geometry():
@@ -361,7 +361,7 @@ def test_the_processor_calls_the_seam_and_cannot_be_broken_by_it():
     be breakable by a vision seam."""
     import inspect
 
-    from sglang.srt.multimodal.processors import base_processor
+    from flliper.srt.multimodal.processors import base_processor
 
     src = inspect.getsource(base_processor.BaseMultimodalProcessor.process_and_combine_mm_data)
     assert "_vss.maybe_run(all_collected_items)" in src
@@ -400,7 +400,7 @@ def test_the_refusal_codes_no_longer_carry_the_stage_verdict():
 
     src = inspect.getsource(fr.Front.handle_generate)
     head = src[: src.index("elif _verdict != VERDICT_ROUTE")]
-    assert "W102 Weg2VisionStage" in head
+    assert "W102 PdFlipVisionStage" in head
     tail = src[src.index("elif _verdict != VERDICT_ROUTE"):]
     assert "VERDICT_STAGE:" not in tail
 

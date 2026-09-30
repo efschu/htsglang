@@ -3,27 +3,27 @@ from array import array
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.managers.schedule_batch import Req
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
-from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.common import available_and_evictable_str
+from flliper.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+from flliper.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.utils import get_device
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
@@ -95,7 +95,7 @@ class TestMamba(unittest.TestCase):
             conv_kernel=4,
         )
 
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
             mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
 
         req_to_token_pool = HybridReqToTokenPool(
@@ -443,7 +443,7 @@ class TestMamba(unittest.TestCase):
         mamba_layers = [
             i for i in range(num_layers) if i not in full_attention_layer_ids
         ]
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
             shape = Mamba2StateShape.create(
                 tp_world_size=1,
                 intermediate_size=4096,
@@ -565,7 +565,7 @@ class TestMamba(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", page_size=1)
         server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
         set_global_server_args_for_scheduler(server_args)
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
             shape = Mamba2StateShape.create(
                 tp_world_size=1,
                 intermediate_size=4096,
@@ -675,7 +675,7 @@ class TestMamba(unittest.TestCase):
         or the PLE side states snapshot one token past the mamba state."""
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from flliper.srt.model_executor.forward_batch_info import ForwardBatch
 
         def aligned_for(chunk_size, track_seqlens, prefix_lens):
             server_args = ServerArgs(model_path="dummy", page_size=1)

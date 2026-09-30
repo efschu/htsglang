@@ -2,12 +2,12 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.ragged_verify import (
+from flliper.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -98,13 +98,13 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
 
 class TestCaptureVerifyLens(CustomTestCase):
     def test_small_tier_one_token_rows(self):
-        from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
+        from flliper.srt.speculative.ragged_verify import build_capture_verify_lens
 
         lens = build_capture_verify_lens(num_tokens=8, num_slots=8, num_draft_tokens=8)
         self.assertEqual(lens, [1] * 8)
 
     def test_large_tier_spreads_within_window(self):
-        from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
+        from flliper.srt.speculative.ragged_verify import build_capture_verify_lens
 
         lens = build_capture_verify_lens(
             num_tokens=1024, num_slots=128, num_draft_tokens=8
@@ -113,14 +113,14 @@ class TestCaptureVerifyLens(CustomTestCase):
         self.assertEqual(lens, [8] * 128)
 
     def test_uneven_tier_rows_stay_legal(self):
-        from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
+        from flliper.srt.speculative.ragged_verify import build_capture_verify_lens
 
         lens = build_capture_verify_lens(num_tokens=24, num_slots=5, num_draft_tokens=8)
         self.assertEqual(sum(lens), 24)
         self.assertTrue(all(1 <= v <= 8 for v in lens))
 
     def test_rejects_overpacked_tier(self):
-        from sglang.srt.speculative.ragged_verify import build_capture_verify_lens
+        from flliper.srt.speculative.ragged_verify import build_capture_verify_lens
 
         with self.assertRaises(ValueError):
             build_capture_verify_lens(num_tokens=64, num_slots=4, num_draft_tokens=8)

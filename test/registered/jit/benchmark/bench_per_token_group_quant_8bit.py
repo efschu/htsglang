@@ -5,20 +5,20 @@ import torch
 import triton
 from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
-from sglang.jit_kernel.benchmark.utils import get_benchmark_range
-from sglang.jit_kernel.per_token_group_quant_8bit import (
-    per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
+from flliper.jit_kernel.benchmark.utils import get_benchmark_range
+from flliper.jit_kernel.per_token_group_quant_8bit import (
+    per_token_group_quant_8bit as flliper_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from flliper.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
+from flliper.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
-from sglang.srt.utils import is_hip
-from sglang.srt.utils.bench_utils import bench_kineto
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.srt.utils import is_hip
+from flliper.srt.utils.bench_utils import bench_kineto
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -154,7 +154,7 @@ CONFIGS_MOE = list(
 # ---- Final configs ----
 CONFIGS = CONFIGS_GEMM + CONFIGS_MOE
 
-LINE_VALS = ["triton", "aot_v2", "sglang"]
+LINE_VALS = ["triton", "aot_v2", "flliper"]
 LINE_NAMES = ["Triton (Inaccurate)", "AOT v2 (sgl-kernel)", "JIT (this repo)"]
 STYLES = [("blue", "-"), ("red", "-"), ("green", "-")]
 
@@ -166,12 +166,12 @@ def _flatten_to_2d(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(-1, t.shape[-1])
 
 
-def _make_sglang_bench_fn(
+def _make_flliper_bench_fn(
     x: torch.Tensor,
     group_size: int,
     dst_dtype: torch.dtype,
     flags: dict,
-    provider: str = "sglang",
+    provider: str = "flliper",
 ):
     """
     Adapter that pre-allocates output tensors and returns a zero-arg callable
@@ -235,7 +235,7 @@ def _make_sglang_bench_fn(
     else:
 
         def _run():
-            sglang_per_token_group_quant_8bit(
+            flliper_per_token_group_quant_8bit(
                 input=x_input,
                 output_q=output_q,
                 output_s=output_s,
@@ -291,9 +291,9 @@ def benchmark(
             dst_dtype=dst_dtype,
             **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
         )
-    elif provider in ("sglang", "aot_v2"):
+    elif provider in ("flliper", "aot_v2"):
         kernel_names = "per_token_group_quant_8bit_kernel"
-        bench_fn = _make_sglang_bench_fn(
+        bench_fn = _make_flliper_bench_fn(
             x=x,
             group_size=group_size,
             dst_dtype=dst_dtype,

@@ -22,17 +22,17 @@ import ast
 import pathlib
 import unittest
 
-from sglang.srt.model_executor.offload_movement import (
+from flliper.srt.model_executor.offload_movement import (
     DEFAULT_PARK_TARGET_ORDER,
     park_target_order_from_register,
 )
-from sglang.srt.model_executor.offload_register import (
+from flliper.srt.model_executor.offload_register import (
     configure_global_register_from_server_args,
     get_global_register,
     reset_global_register,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -47,14 +47,14 @@ class _ServerArgs:
 
 
 class _RegisterOn:
-    """Turn SGLANG_OFFLOAD_REGISTER on for the duration of a test and leave
+    """Turn FLLIPER_OFFLOAD_REGISTER on for the duration of a test and leave
     the process-global register clean afterwards."""
 
     def __enter__(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         reset_global_register()
-        self._ctx = envs.SGLANG_OFFLOAD_REGISTER.override(True)
+        self._ctx = envs.FLLIPER_OFFLOAD_REGISTER.override(True)
         self._ctx.__enter__()
         return self
 
@@ -107,7 +107,7 @@ class TestFlagsAreObservableInTheRegister(CustomTestCase):
             )
 
     def test_movement_backend_default_takes_the_configured_order(self):
-        from sglang.srt.model_executor.offload_movement import (
+        from flliper.srt.model_executor.offload_movement import (
             FakeDeviceOps,
             RealMovementBackend,
         )
@@ -154,7 +154,7 @@ class TestRefusalsAreLoud(CustomTestCase):
 
 class TestDefaultPathAndIdempotence(CustomTestCase):
     def test_disabled_feature_is_a_no_op(self):
-        """SGLANG_OFFLOAD_REGISTER off => no register, no side effect."""
+        """FLLIPER_OFFLOAD_REGISTER off => no register, no side effect."""
         reset_global_register()
         self.assertIsNone(
             configure_global_register_from_server_args(_ServerArgs("capacity"))
@@ -188,7 +188,7 @@ class TestTheWiringIsAtRunnerInit(CustomTestCase):
     the call after the pools are built, which would silently restore the
     fallback register."""
 
-    RUNNER = "python/sglang/srt/model_executor/model_runner.py"
+    RUNNER = "python/flliper/srt/model_executor/model_runner.py"
 
     def test_the_runner_init_site_calls_the_configure_entry(self):
         tree = ast.parse((_REPO_ROOT / self.RUNNER).read_text())

@@ -2,7 +2,7 @@
 draft pool the RAW target rows; the DFlash window pool on D has 4113 slots
 and carries a slot mapper the base controller translates through. The 4k
 smoke wrote 200 rows past the pool (silent), the first 98k load crashed
-(illegal memory access); xsn278's WEG2-ARENA-LOAD guard named it
+(illegal memory access); xsn278's PDFLIP-ARENA-LOAD guard named it
 (dst=[1025,4314] of 4114). Both hybrid branches now translate."""
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hc  # noqa: E402
+from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hc  # noqa: E402
 
 
 class _Mapper:
@@ -33,7 +33,7 @@ class _Mapper:
 
 def test_a_window_pool_translates_and_a_mirror_pool_does_not():
     m = _Mapper()
-    pool = SimpleNamespace(weg2_slot_mapper=m)
+    pool = SimpleNamespace(pdflip_slot_mapper=m)
     idx = torch.tensor([1025, 4314])
     assert hc._draft_device_rows(pool, idx, "load").tolist() == [1025 % 5, 4314 % 5]
     assert hc._draft_device_rows(pool, idx, "write").tolist() == [1025 % 7, 4314 % 7]
@@ -52,7 +52,7 @@ def test_both_hybrid_branches_translate_the_draft_rows():
     k = src.index("_draft_rows_or_skip(\n")
     assert 'self.mem_pool_device_draft, device_indices, "load"' in src[k:k + 200]
     # the base controller's rule, verbatim: write -> translate_read, load -> translate_write
-    from sglang.srt.managers import cache_controller as cc
+    from flliper.srt.managers import cache_controller as cc
     b = open(cc.__file__).read()
     k = b.index("def _draft_device_indices")
     assert 'if direction == "write":' in b[k:k + 800] and "translate_read(device_indices)" in b[k:k + 800]
@@ -69,7 +69,7 @@ def test_xsn279_the_rows_are_moved_to_the_mappers_device_first():
             seen["device"] = str(idx.device)
             return idx
     m = _M(device="cpu")
-    pool = SimpleNamespace(weg2_slot_mapper=m)
+    pool = SimpleNamespace(pdflip_slot_mapper=m)
     hc._draft_device_rows(pool, torch.tensor([1, 2]), "load")
     assert seen["device"] == "cpu"
     src = open(hc.__file__).read()
@@ -84,7 +84,7 @@ def test_xsn288_a_long_prefix_loads_its_window_tail_not_nothing(caplog):
     sliced alike so the pair lists stay aligned; a short prefix is untouched."""
     import logging
     m = _Mapper(); m.num_draft_slots = 4113; m.ctx_cap = 4
-    pool = SimpleNamespace(weg2_slot_mapper=m)
+    pool = SimpleNamespace(pdflip_slot_mapper=m)
     dev = torch.arange(100, 110)      # 10 rows > cap 4
     host = torch.arange(200, 210)
     hc._DRAFT_WINDOW_LOGGED["n"] = 0
@@ -94,10 +94,10 @@ def test_xsn288_a_long_prefix_loads_its_window_tail_not_nothing(caplog):
     assert m.calls == [("write", [106, 107, 108, 109])]           # the LAST cap rows only
     assert rows.tolist() == [x % 5 for x in (106, 107, 108, 109)]
     assert hrows.tolist() == [206, 207, 208, 209]                  # aligned tail of the host rows
-    assert any("WEG2-DRAFT-LOAD WINDOW rows=4 of 10" in r.getMessage() for r in caplog.records)
+    assert any("PDFLIP-DRAFT-LOAD WINDOW rows=4 of 10" in r.getMessage() for r in caplog.records)
     # a prefix within the window: every row, host rows untouched (None passes through)
     m2 = _Mapper(); m2.ctx_cap = 4
-    rows, hrows, skipped = hc._draft_rows_or_skip(SimpleNamespace(weg2_slot_mapper=m2), torch.tensor([1, 2, 3]), "load", nrows=3)
+    rows, hrows, skipped = hc._draft_rows_or_skip(SimpleNamespace(pdflip_slot_mapper=m2), torch.tensor([1, 2, 3]), "load", nrows=3)
     assert m2.calls == [("write", [1, 2, 3])] and hrows is None and not skipped
     # the call site hands the sliced host rows to the draft load
     src = open(hc.__file__).read()
@@ -118,12 +118,12 @@ def test_xsn281_an_exhausted_window_pool_skips_the_draft_half_by_name(caplog):
             raise RuntimeError("DFLASH small solo pool exhausted: need 202 more draft slots "
                                "but only 0 reclaimable of 4113 total (ctx cap 2048).")
     m = _M(); m.num_draft_slots = 4113; m.ctx_cap = 2048
-    pool = SimpleNamespace(weg2_slot_mapper=m)
+    pool = SimpleNamespace(pdflip_slot_mapper=m)
     hc._DRAFT_SKIP_LOGGED["n"] = 0
     with caplog.at_level(logging.INFO):
         rows, hrows, skipped = hc._draft_rows_or_skip(pool, torch.tensor([1, 2, 3]), "load", nrows=4313)
     assert rows is None and hrows is None and skipped is True
-    assert any("WEG2-DRAFT-LOAD SKIPPED rows=4313" in r.getMessage() and "ctx_cap=2048" in r.getMessage()
+    assert any("PDFLIP-DRAFT-LOAD SKIPPED rows=4313" in r.getMessage() and "ctx_cap=2048" in r.getMessage()
                for r in caplog.records)
     # any other error still raises
     class _Boom(_Mapper):
@@ -131,9 +131,9 @@ def test_xsn281_an_exhausted_window_pool_skips_the_draft_half_by_name(caplog):
             raise RuntimeError("something else")
     import pytest
     with pytest.raises(RuntimeError):
-        hc._draft_rows_or_skip(SimpleNamespace(weg2_slot_mapper=_Boom()), torch.tensor([1]), "load", nrows=1)
+        hc._draft_rows_or_skip(SimpleNamespace(pdflip_slot_mapper=_Boom()), torch.tensor([1]), "load", nrows=1)
     # a healthy mapper: rows come back translated, not skipped
-    rows, hrows, skipped = hc._draft_rows_or_skip(SimpleNamespace(weg2_slot_mapper=_Mapper()), torch.tensor([6, 7]), "load", nrows=2)
+    rows, hrows, skipped = hc._draft_rows_or_skip(SimpleNamespace(pdflip_slot_mapper=_Mapper()), torch.tensor([6, 7]), "load", nrows=2)
     assert rows.tolist() == [1, 2] and hrows is None and skipped is False
     src = open(hc.__file__).read()
     i = src.index("draft_rows, draft_host_rows, draft_rows_skipped = None, None, False")

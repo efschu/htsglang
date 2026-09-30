@@ -13,7 +13,7 @@ import unittest
 
 import requests
 
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,

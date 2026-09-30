@@ -5,15 +5,15 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarBackend
-from sglang.srt.constrained.reasoner_grammar_backend import (
+from flliper.srt.constrained.base_grammar_backend import BaseGrammarBackend
+from flliper.srt.constrained.reasoner_grammar_backend import (
     ReasonerGrammarBackend,
     ReasonerGrammarObject,
 )
-from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+from flliper.srt.constrained.torch_ops.token_filter_torch_ops import (
     set_token_filter_torch,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -120,13 +120,13 @@ class TestReasonerGrammarObject(unittest.TestCase):
 
 class TestReasonerGrammarBackend(unittest.TestCase):
     def setUp(self):
-        self._prev_budget = os.environ.get("SGLANG_MAX_THINK_TOKENS")
+        self._prev_budget = os.environ.get("FLLIPER_MAX_THINK_TOKENS")
 
     def tearDown(self):
         if self._prev_budget is None:
-            os.environ.pop("SGLANG_MAX_THINK_TOKENS", None)
+            os.environ.pop("FLLIPER_MAX_THINK_TOKENS", None)
         else:
-            os.environ["SGLANG_MAX_THINK_TOKENS"] = self._prev_budget
+            os.environ["FLLIPER_MAX_THINK_TOKENS"] = self._prev_budget
 
     def _make_parser(self):
         detector = SimpleNamespace(
@@ -147,7 +147,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         )
 
     def test_init_strict_reasoning_grammar_uses_token_filter_and_budget(self):
-        os.environ["SGLANG_MAX_THINK_TOKENS"] = "2"
+        os.environ["FLLIPER_MAX_THINK_TOKENS"] = "2"
         backend = _DummyGrammarBackend(support_token_filter=True)
         reasoner = ReasonerGrammarBackend(
             backend,
@@ -175,7 +175,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertIsNone(reasoner.init_strict_reasoning_grammar(reasoning=True))
 
     def test_wraps_inner_grammar_with_reasoning_state_machine(self):
-        os.environ["SGLANG_MAX_THINK_TOKENS"] = "1"
+        os.environ["FLLIPER_MAX_THINK_TOKENS"] = "1"
         backend = _DummyGrammarBackend(support_token_filter=True)
         inner_grammar = MagicMock()
         backend._dispatch_result = inner_grammar

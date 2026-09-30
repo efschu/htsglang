@@ -21,7 +21,7 @@ Cases:
   through the helper (a writer-less family would print nothing forever).
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -30,11 +30,11 @@ import logging
 import pathlib
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.layers import ple_wait_span as pws
-from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
-from sglang.srt.managers.scheduler_components.wake_round_census import WakeRoundCensus
-from sglang.srt.utils.collective_clock import ClockBackend, CollectiveClock
+from flliper.srt.environ import envs
+from flliper.srt.layers import ple_wait_span as pws
+from flliper.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
+from flliper.srt.managers.scheduler_components.wake_round_census import WakeRoundCensus
+from flliper.srt.utils.collective_clock import ClockBackend, CollectiveClock
 
 PLE_STALL_MS = 6.4
 FLOOR_MS = 10.0
@@ -107,8 +107,8 @@ class PleWaitSpanTest(unittest.TestCase):
         self.log = DecodeRoundLog(clock=self.clock, rank=0)
         self.cap = _Capture()
         for name in (
-            "sglang.srt.managers.scheduler_components.decode_round_log",
-            "sglang.srt.managers.scheduler_components.wake_round_census",
+            "flliper.srt.managers.scheduler_components.decode_round_log",
+            "flliper.srt.managers.scheduler_components.wake_round_census",
         ):
             lg = logging.getLogger(name)
             lg.addHandler(self.cap)
@@ -137,7 +137,7 @@ class PleWaitSpanTest(unittest.TestCase):
         return [l for l in self.cap.lines if l.startswith("Decode rank batch")]
 
     def test_switch_on_names_the_stall_and_keeps_gpu_ms(self):
-        with envs.SGLANG_DEBUG_DECODE_PLE_WAIT.override(True):
+        with envs.FLLIPER_DEBUG_DECODE_PLE_WAIT.override(True):
             main = self._round()
             self._round()
         self.log.end_round()
@@ -149,7 +149,7 @@ class PleWaitSpanTest(unittest.TestCase):
         self.assertEqual(self.state.syncs, 0)
 
     def test_switch_off_is_the_old_split(self):
-        with envs.SGLANG_DEBUG_DECODE_PLE_WAIT.override(False):
+        with envs.FLLIPER_DEBUG_DECODE_PLE_WAIT.override(False):
             main = self._round()
             self._round()
         self.log.end_round()
@@ -173,7 +173,7 @@ class PleWaitSpanTest(unittest.TestCase):
             return real_span(*a, **k)
 
         self.clock.span = spy
-        with envs.SGLANG_DEBUG_DECODE_PLE_WAIT.override(True):
+        with envs.FLLIPER_DEBUG_DECODE_PLE_WAIT.override(True):
             self.assertFalse(self.clock.armed)
             pws.wait_for_ple_prefetch(self.side, clock=self.clock, current_stream=main)
         self.assertEqual(calls, [])

@@ -11,7 +11,7 @@ page size -- 1 on the arena host pool -- so the drain pays one Queue.get_nowait,
 append and len() per TOKEN plus a torch.cat over as many one-row tensors, to free
 rows `HostPoolGroup.free` then drops (placeholders / arena ids beyond staging).
 
-SGLANG_HICACHE_DRAIN_BUDGET=<rows per round> (default off): one queue entry per
+FLLIPER_HICACHE_DRAIN_BUDGET=<rows per round> (default off): one queue entry per
 release, at most <rows> rows (and ENTRY_BUDGET entries) per release queue and
 round with the rest re-queued at the front, at most N acks per round. What must
 hold: off is the unchanged path; on, a round never touches more than the
@@ -30,22 +30,22 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache import unified_radix_cache as u
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache import unified_radix_cache as u
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import HybridCacheController
+from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+from flliper.test.test_utils import CustomTestCase
 
 # literals, not the module's names: the same file runs (red) against the
 # parent tree, where hicache_drain_budget does not exist yet
-ENV_BUDGET = "SGLANG_HICACHE_DRAIN_BUDGET"
-ENV_ACK = "SGLANG_HICACHE_DRAIN_ACK_BUDGET"
+ENV_BUDGET = "FLLIPER_HICACHE_DRAIN_BUDGET"
+ENV_ACK = "FLLIPER_HICACHE_DRAIN_ACK_BUDGET"
 ENTRY_BUDGET = 512
 DEFAULT_ACK_BUDGET = 32
-_ENVS = (ENV_BUDGET, ENV_ACK, "SGLANG_HICACHE_ROUND_TIMING",
-         "SGLANG_HICACHE_DRAIN_AGREE_EVERY", "SGLANG_WEG2_RELEASE_DRAIN_CAP")
+_ENVS = (ENV_BUDGET, ENV_ACK, "FLLIPER_HICACHE_ROUND_TIMING",
+         "FLLIPER_HICACHE_DRAIN_AGREE_EVERY", "FLLIPER_PDFLIP_RELEASE_DRAIN_CAP")
 
 #: P's geometry in xsn429 (ARENA-PRESENT stats): staging rows, arena slots
 _STAGING, _SLOTS = 2442, 720896
@@ -140,7 +140,7 @@ class TheDefaultPathIsUnchanged(_EnvCase):
         self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
 
     def test_garbage_and_nonpositive_budgets_are_off(self):
-        from sglang.srt.mem_cache import hicache_drain_budget as hdb
+        from flliper.srt.mem_cache import hicache_drain_budget as hdb
 
         for v in ("x", "0", "-5", ""):
             os.environ[ENV_BUDGET] = v
@@ -287,7 +287,7 @@ class AcksBeyondTheBudgetWaitInTheirQueue(_EnvCase):
         released = []
         c.staging_write_ring = types.SimpleNamespace(release=released.append)
         c.dec_host_lock_ref = lambda node, params: None
-        c._weg2_rebind_host_to_arena = lambda node: True
+        c._pdflip_rebind_host_to_arena = lambda node: True
         for i in range(n):
             node = types.SimpleNamespace(l3_present=False)
             c.ongoing_backup[i] = (node, None)
@@ -317,7 +317,7 @@ class AcksBeyondTheBudgetWaitInTheirQueue(_EnvCase):
         allowance compose; with H74 off the allowance caps the agreed MIN."""
         os.environ[ENV_BUDGET] = "16384"
         os.environ[ENV_ACK] = "32"
-        os.environ["SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN"] = "0"
+        os.environ["FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN"] = "0"
         try:
             c, cc, released = self._backup_cache(100)
             per_round = []
@@ -326,12 +326,12 @@ class AcksBeyondTheBudgetWaitInTheirQueue(_EnvCase):
                 c.drain_storage_control_queues()
                 per_round.append(len(released) - before)
         finally:
-            os.environ.pop("SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN", None)
+            os.environ.pop("FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN", None)
         self.assertEqual(per_round, [32, 32, 32, 4, 0])
         self.assertEqual(released, list(range(100)))
 
     def test_default_ack_budget_applies_when_only_the_row_budget_is_set(self):
-        from sglang.srt.mem_cache import hicache_drain_budget as hdb
+        from flliper.srt.mem_cache import hicache_drain_budget as hdb
 
         os.environ[ENV_BUDGET] = "16384"
         self.assertEqual(hdb.drain_ack_budget(), DEFAULT_ACK_BUDGET)
@@ -346,7 +346,7 @@ class TheBudgetIsRankUniform(_EnvCase):
 
     def _run(self, every):
         os.environ[ENV_BUDGET] = "1000"
-        os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = str(every)
+        os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = str(every)
         pools = [_RecordingPool() for _ in range(3)]
         ranks = [_cache(_hybrid_cc(p), tp_world_size=3) for p in pools]
         agreed = {}
@@ -397,7 +397,7 @@ class TheBudgetIsRankUniform(_EnvCase):
 
 class TheInstrumentNamesThePart(_EnvCase):
     def test_the_timing_line_carries_the_parts_of_the_max_round(self):
-        os.environ["SGLANG_HICACHE_ROUND_TIMING"] = "4"
+        os.environ["FLLIPER_HICACHE_ROUND_TIMING"] = "4"
         pool, cc = _real_p_cc()
         c = _cache(cc)
         c.check_hicache_events()
@@ -415,7 +415,7 @@ class TheInstrumentNamesThePart(_EnvCase):
         self.assertIsNone(c._hc_parts)
 
     def test_with_the_budget_the_max_round_names_one_entry_and_the_slice(self):
-        os.environ["SGLANG_HICACHE_ROUND_TIMING"] = "4"
+        os.environ["FLLIPER_HICACHE_ROUND_TIMING"] = "4"
         os.environ[ENV_BUDGET] = "16384"
         pool, cc = _real_p_cc()
         c = _cache(cc)
@@ -429,7 +429,7 @@ class TheInstrumentNamesThePart(_EnvCase):
         self.assertIn("budget rows=16384 acks=32 release_q=1", line)
 
     def test_the_agreement_is_timed_apart_from_the_drains(self):
-        os.environ["SGLANG_HICACHE_ROUND_TIMING"] = "1"
+        os.environ["FLLIPER_HICACHE_ROUND_TIMING"] = "1"
         c = _cache(_hybrid_cc(_RecordingPool()), tp_world_size=3)
 
         def slow_reduce(tensor, op, label=""):

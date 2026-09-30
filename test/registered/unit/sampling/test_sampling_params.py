@@ -1,6 +1,6 @@
 """Unit tests for srt/sampling/sampling_params.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -12,13 +12,13 @@ from unittest.mock import MagicMock
 
 import msgspec
 
-from sglang.srt.sampling.sampling_params import (
+from flliper.srt.sampling.sampling_params import (
     MAX_LEN,
     TOP_K_ALL,
     SamplingParams,
     get_max_seq_length,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestSamplingParamsInit(CustomTestCase):

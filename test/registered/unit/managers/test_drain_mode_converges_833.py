@@ -50,14 +50,14 @@ This ticket bounds the wait and nothing else.
 
 import unittest
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PhasePolicyConfig,
     PhasePolicyInputs,
     PhasePolicyState,
     drain_stall_deadline_s,
     solved_tp_decode_floor_s,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -86,7 +86,7 @@ def _cfg(**kw):
 
 def _decide(cfg, state, **kw):
     """One policy decision in the TP phase, with the boot's shape."""
-    from sglang.srt.managers.phase_policy import _decide_from_load
+    from flliper.srt.managers.phase_policy import _decide_from_load
 
     fields = dict(
         phase="tp",
@@ -219,7 +219,7 @@ class TheProgressClockWatchesTheAdmittedSet(unittest.TestCase):
     """The axis itself: a refilled bundle is NOT progress."""
 
     def _observe(self, state, running_bs, now):
-        from sglang.srt.managers.phase_policy import observe_idle
+        from flliper.srt.managers.phase_policy import observe_idle
 
         observe_idle(
             state,
@@ -251,7 +251,7 @@ class TheProgressClockWatchesTheAdmittedSet(unittest.TestCase):
         state = PhasePolicyState()
         self._observe(state, 7, 0.0)
         stamped = state.last_bundle_progress_at
-        from sglang.srt.managers.phase_policy import observe_idle
+        from flliper.srt.managers.phase_policy import observe_idle
 
         for t, pending in ((1.0, 572792), (2.0, 572715), (3.0, 572600)):
             observe_idle(

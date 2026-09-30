@@ -7,18 +7,18 @@
 #
 # Usage: run_collective_cost.sh [iters] [tag]
 # Env:   RNDV=<bytes|inf>  sets UCX_RNDV_THRESH on both sides (default: unset)
-#        FP32=<0|1>        sets SGLANG_BARLINK_FP32_REDUCE
-#        RING=<MiB>        sets SGLANG_BARLINK_UCX_RING_MIB (0 = always ring)
-#        CHUNK=<MiB>       sets SGLANG_BARLINK_UCX_CHUNK_MIB
-#        RING_KIB=<KiB>    sets SGLANG_BARLINK_UCX_RING_KIB
-#        AG_RING_KIB=<KiB> sets SGLANG_BARLINK_UCX_AG_RING_KIB (0 = never ring)
+#        FP32=<0|1>        sets FLLIPER_BARLINK_FP32_REDUCE
+#        RING=<MiB>        sets FLLIPER_BARLINK_UCX_RING_MIB (0 = always ring)
+#        CHUNK=<MiB>       sets FLLIPER_BARLINK_UCX_CHUNK_MIB
+#        RING_KIB=<KiB>    sets FLLIPER_BARLINK_UCX_RING_KIB
+#        AG_RING_KIB=<KiB> sets FLLIPER_BARLINK_UCX_AG_RING_KIB (0 = never ring)
 #        OP=<all_reduce|all_gather>  collective for the SIZES sweep
-#        GRAIN=<elems>     sets SGLANG_BARLINK_UCX_GRAIN_ELEMS (0 = unchunked
+#        GRAIN=<elems>     sets FLLIPER_BARLINK_UCX_GRAIN_ELEMS (0 = unchunked
 #                          host passes, the pre-#263 A/B control)
-#        WORKERS=<n>       sets SGLANG_BARLINK_UCX_WORKERS (2 = second UCX
+#        WORKERS=<n>       sets FLLIPER_BARLINK_UCX_WORKERS (2 = second UCX
 #                          context; splits the flat exchange's peers over the
 #                          two workers, task #266)
-#        RING_BIDIR=<0|1>  sets SGLANG_BARLINK_UCX_RING_BIDIR (needs WORKERS=2;
+#        RING_BIDIR=<0|1>  sets FLLIPER_BARLINK_UCX_RING_BIDIR (needs WORKERS=2;
 #                          runs the ring half each way round. Measured
 #                          negative on this link -- kept as the A/B control)
 #        GATE=1            exactness gate across the threshold, not timing
@@ -43,8 +43,8 @@ RIG2_SCRIPT="${RIG2_COST_SCRIPT:-/root/link_collective_cost.py}"
 # between sessions, which is the same order as the effects being measured, so
 # "run A, edit, run B" is not a comparison. Point COMM/RIG2_COMM at a second
 # checkout and interleave instead.
-COMM="${COMM:-$R/python/sglang/srt/distributed/device_communicators}"
-RIG2_COMM="${RIG2_COMM:-${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>}/sglang/srt/distributed/device_communicators}"
+COMM="${COMM:-$R/python/flliper/srt/distributed/device_communicators}"
+RIG2_COMM="${RIG2_COMM:-${RIG2_FLLIPER_SRC:-<RIG2_FLLIPER_SRC>}/flliper/srt/distributed/device_communicators}"
 
 MASTER="${RDMA_R1:-<RDMA_R1>}"
 PORT=${PORT:-29581}
@@ -56,17 +56,17 @@ RIG2_RANKS=${RIG2_RANKS:-1}
 
 EXTRA=""
 [ -n "${RNDV:-}" ] && EXTRA="$EXTRA UCX_RNDV_THRESH=$RNDV"
-[ -n "${FP32:-}" ] && EXTRA="$EXTRA SGLANG_BARLINK_FP32_REDUCE=$FP32"
-[ -n "${RING:-}" ] && EXTRA="$EXTRA SGLANG_BARLINK_UCX_RING_MIB=$RING"
-[ -n "${CHUNK:-}" ] && EXTRA="$EXTRA SGLANG_BARLINK_UCX_CHUNK_MIB=$CHUNK"
-[ -n "${RING_KIB:-}" ] && EXTRA="$EXTRA SGLANG_BARLINK_UCX_RING_KIB=$RING_KIB"
-[ -n "${AG_RING_KIB:-}" ] && EXTRA="$EXTRA SGLANG_BARLINK_UCX_AG_RING_KIB=$AG_RING_KIB"
-[ -n "${GRAIN:-}" ] && EXTRA="$EXTRA SGLANG_BARLINK_UCX_GRAIN_ELEMS=$GRAIN"
-[ -n "${WORKERS:-}" ] && EXTRA="$EXTRA SGLANG_BARLINK_UCX_WORKERS=$WORKERS"
-[ -n "${RING_BIDIR:-}" ] && EXTRA="$EXTRA SGLANG_BARLINK_UCX_RING_BIDIR=$RING_BIDIR"
+[ -n "${FP32:-}" ] && EXTRA="$EXTRA FLLIPER_BARLINK_FP32_REDUCE=$FP32"
+[ -n "${RING:-}" ] && EXTRA="$EXTRA FLLIPER_BARLINK_UCX_RING_MIB=$RING"
+[ -n "${CHUNK:-}" ] && EXTRA="$EXTRA FLLIPER_BARLINK_UCX_CHUNK_MIB=$CHUNK"
+[ -n "${RING_KIB:-}" ] && EXTRA="$EXTRA FLLIPER_BARLINK_UCX_RING_KIB=$RING_KIB"
+[ -n "${AG_RING_KIB:-}" ] && EXTRA="$EXTRA FLLIPER_BARLINK_UCX_AG_RING_KIB=$AG_RING_KIB"
+[ -n "${GRAIN:-}" ] && EXTRA="$EXTRA FLLIPER_BARLINK_UCX_GRAIN_ELEMS=$GRAIN"
+[ -n "${WORKERS:-}" ] && EXTRA="$EXTRA FLLIPER_BARLINK_UCX_WORKERS=$WORKERS"
+[ -n "${RING_BIDIR:-}" ] && EXTRA="$EXTRA FLLIPER_BARLINK_UCX_RING_BIDIR=$RING_BIDIR"
 
 COMMON="MASTER_ADDR=$MASTER MASTER_PORT=$PORT UCX_TLS=rc,self,sm UCX_IB_GID_INDEX=3 $EXTRA"
-PVE_ENV="$COMMON UCX_NET_DEVICES=rocep4s0f1:1 SGLANG_BARLINK_UCX_LIB=/opt/ucx116/lib/libucp.so.0 GLOO_SOCKET_IFNAME=enp4s0f1np1"
+PVE_ENV="$COMMON UCX_NET_DEVICES=rocep4s0f1:1 FLLIPER_BARLINK_UCX_LIB=/opt/ucx116/lib/libucp.so.0 GLOO_SOCKET_IFNAME=enp4s0f1np1"
 RIG2_ENV="$COMMON UCX_NET_DEVICES=rocep1s0f1:1 GLOO_SOCKET_IFNAME=enp1s0f1np1"
 
 LOGS="${R3VAL_LOGS:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/logs}"

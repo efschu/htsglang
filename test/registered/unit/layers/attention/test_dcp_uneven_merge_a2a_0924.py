@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FlashInfer uneven-DCP LSE merge: SGLANG_DCP_LSE_MERGE=a2a for the 27B path.
+"""FlashInfer uneven-DCP LSE merge: FLLIPER_DCP_LSE_MERGE=a2a for the 27B path.
 
 ``_dcp_uneven_merge`` (layers/attention/flashinfer_backend.py) routes the merge
 of the paged-prefix / decode partials through ``cp_lse_ag_out_a2a_mha_uneven``
@@ -26,12 +26,12 @@ from unittest import mock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-from sglang.srt.layers.dcp import comm  # noqa: E402
+from flliper.srt.layers.dcp import comm  # noqa: E402
 
 
 class _World:
@@ -115,7 +115,7 @@ class TestA2aEqualsAllReduce(CustomTestCase):
 
     def test_bf16_wire_is_bf16_rounding(self):
         w = _World([12, 6, 6], seed=5)
-        with mock.patch.dict("os.environ", {"SGLANG_DCP_LSE_MERGE_DTYPE": "bf16"}):
+        with mock.patch.dict("os.environ", {"FLLIPER_DCP_LSE_MERGE_DTYPE": "bf16"}):
             _reset_merge_cache()
             for r in range(3):
                 grp = _FakeGroup(w, r)
@@ -133,7 +133,7 @@ class TestDispatcher(CustomTestCase):
         _reset_merge_cache()
 
     def _call(self, mode, weightless=False):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         with mock.patch.object(comm, "lse_merge_mode", return_value=mode), \
              mock.patch.object(comm, "weightless_kv_active", return_value=weightless), \
@@ -163,12 +163,12 @@ class TestDispatcher(CustomTestCase):
         with mock.patch.dict("os.environ", {}, clear=False):
             import os
 
-            os.environ.pop("SGLANG_DCP_LSE_MERGE", None)
+            os.environ.pop("FLLIPER_DCP_LSE_MERGE", None)
             _reset_merge_cache()
             self.assertEqual(comm.lse_merge_mode(), "ar")
 
     def test_every_head_merge_site_uses_the_dispatcher(self):
-        from sglang.srt.layers.attention import flashinfer_backend as fb
+        from flliper.srt.layers.attention import flashinfer_backend as fb
 
         src = inspect.getsource(fb.FlashInferAttnBackend)
         # the decode head path and both extend prefix merges

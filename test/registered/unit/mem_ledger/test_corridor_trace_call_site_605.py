@@ -35,8 +35,8 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_ledger import corridor_trace
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_ledger import corridor_trace
 
 
 class _Stub:
@@ -203,7 +203,7 @@ class TestTheWholeChainReachesTheRecord(unittest.TestCase):
     def test_a_breach_is_written_down_for_the_next_boot(self):
         stub = self._breaching_stub(free_min_mib=935)
         with mock.patch(
-            "sglang.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
+            "flliper.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
         ) as rec:
             _tick(stub)
         rec.assert_called_once()
@@ -215,7 +215,7 @@ class TestTheWholeChainReachesTheRecord(unittest.TestCase):
         stub = self._breaching_stub(free_min_mib=1200)
         stub._corridor_trace.summary.return_value["breach"] = False
         with mock.patch(
-            "sglang.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
+            "flliper.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
         ) as rec:
             _tick(stub)
         rec.assert_not_called()
@@ -223,7 +223,7 @@ class TestTheWholeChainReachesTheRecord(unittest.TestCase):
     def test_only_a_DEEPER_breach_is_reported_again(self):
         stub = self._breaching_stub(free_min_mib=935)
         with mock.patch(
-            "sglang.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
+            "flliper.srt.managers.phase_flip_seam_reserve.record_corridor_shortfall"
         ) as rec:
             _tick(stub)
             stub._corridor_trace_next_check = 0.0

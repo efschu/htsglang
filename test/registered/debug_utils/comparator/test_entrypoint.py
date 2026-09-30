@@ -7,13 +7,13 @@ from pathlib import Path
 import pytest
 import torch
 
-import sglang.srt.debug_utils.comparator.entrypoint as _entrypoint_module
-import sglang.srt.debug_utils.dumper as _dumper_module
-from sglang.srt.debug_utils.comparator.entrypoint import (
+import flliper.srt.debug_utils.comparator.entrypoint as _entrypoint_module
+import flliper.srt.debug_utils.dumper as _dumper_module
+from flliper.srt.debug_utils.comparator.entrypoint import (
     parse_args,
     run,
 )
-from sglang.srt.debug_utils.comparator.output_types import (
+from flliper.srt.debug_utils.comparator.output_types import (
     AnyRecord,
     ComparisonErrorRecord,
     ComparisonNonTensorRecord,
@@ -27,8 +27,8 @@ from sglang.srt.debug_utils.comparator.output_types import (
     _OutputRecord,
     parse_record_json,
 )
-from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper, _RecomputeStatus
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.dumper import DumperConfig, _Dumper, _RecomputeStatus
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 
@@ -579,7 +579,7 @@ class TestEntrypointGroupingLogical:
             baseline_path,
             target_path,
             diff_threshold=0.01,
-            preset="sglang_megatron",
+            preset="flliper_megatron",
         )
 
         records, _ = _run_and_parse(argv, capsys)
@@ -1091,7 +1091,7 @@ class TestEntrypointGroupingLogical:
 
 
 class TestEntrypointPerStepMode:
-    """Test per-step comparison mode (sglang_dev preset behavior)."""
+    """Test per-step comparison mode (flliper_dev preset behavior)."""
 
     def test_multi_step_per_step_comparison(self, tmp_path, capsys):
         """Multiple steps produce one ComparisonTensorRecord per step with step field set."""
@@ -1221,7 +1221,7 @@ class TestEntrypointConcatMode:
             baseline_path,
             target_path,
             diff_threshold=diff_threshold,
-            preset="sglang_megatron",
+            preset="flliper_megatron",
         )
         records, _ = _run_and_parse(argv, capsys)
         return records
@@ -1285,7 +1285,7 @@ class TestEntrypointConcatMode:
             baseline_dir / _FIXED_EXP_NAME,
             target_dir / _FIXED_EXP_NAME,
             diff_threshold=0.01,
-            preset="sglang_megatron",
+            preset="flliper_megatron",
         )
 
         records, _ = _run_and_parse(argv, capsys)
@@ -1544,7 +1544,7 @@ class TestEntrypointConcatMode:
             baseline_dir / _FIXED_EXP_NAME,
             target_dir / _FIXED_EXP_NAME,
             diff_threshold=0.01,
-            preset="sglang_megatron",
+            preset="flliper_megatron",
         )
 
         records, _ = _run_and_parse(argv, capsys)
@@ -1596,7 +1596,7 @@ class TestEntrypointConcatMode:
         argv: list[str] = _make_argv(
             baseline_path,
             target_path,
-            preset="sglang_megatron",
+            preset="flliper_megatron",
             diff_threshold=1e-3,
         )
         records, _ = _run_and_parse(argv, capsys)
@@ -1683,7 +1683,7 @@ class TestEntrypointAxisAligner:
         assert comp.name == "hidden"
 
     def test_squeeze_dim_one_side(self, tmp_path, capsys):
-        """SGLang dims 't h' vs Megatron dims 't 1 h': axis aligner squeezes the singleton dim."""
+        """fLLiper dims 't h' vs Megatron dims 't 1 h': axis aligner squeezes the singleton dim."""
         torch.manual_seed(42)
         full_tensor = torch.randn(4, 8)
 
@@ -2182,8 +2182,8 @@ class TestEntrypointReplicatedAxis:
 class TestEntrypointAlignment:
     """Test smart token alignment with aux tensors."""
 
-    def test_sglang_multi_step_alignment(self, tmp_path, capsys):
-        """SGLang multi-step dumps with aux tensors auto-trigger alignment."""
+    def test_flliper_multi_step_alignment(self, tmp_path, capsys):
+        """fLLiper multi-step dumps with aux tensors auto-trigger alignment."""
         torch.manual_seed(42)
         hidden_dim = 8
 
@@ -2244,8 +2244,8 @@ class TestEntrypointAlignment:
         assert summary.failed == 0
         assert summary.skipped == 0
 
-    def test_sglang_vs_megatron_cross_framework(self, tmp_path, capsys):
-        """SGLang 4-step thd baseline vs Megatron 1-step thd target align correctly."""
+    def test_flliper_vs_megatron_cross_framework(self, tmp_path, capsys):
+        """fLLiper 4-step thd baseline vs Megatron 1-step thd target align correctly."""
         torch.manual_seed(42)
         hidden_dim: int = 8
 
@@ -2253,24 +2253,24 @@ class TestEntrypointAlignment:
         seq_a_hiddens: torch.Tensor = all_hiddens[:6]
         seq_b_hiddens: torch.Tensor = all_hiddens[6:]
 
-        # --- SGLang baseline: 1 prefill + 3 decode ---
-        sglang_dir: Path = tmp_path / "baseline"
-        sglang_dir.mkdir()
-        sglang_dumper = _Dumper(
+        # --- fLLiper baseline: 1 prefill + 3 decode ---
+        flliper_dir: Path = tmp_path / "baseline"
+        flliper_dir.mkdir()
+        flliper_dumper = _Dumper(
             config=DumperConfig(
                 enable=True,
-                dir=str(sglang_dir),
+                dir=str(flliper_dir),
                 exp_name=_FIXED_EXP_NAME,
             )
         )
 
         # Step 0: prefill — seq A (3 tokens) + seq B (2 tokens)
-        sglang_dumper.dump("input_ids", torch.tensor([10, 20, 30, 40, 50]))
-        sglang_dumper.dump("positions", torch.tensor([0, 1, 2, 0, 1]))
-        sglang_dumper.dump("seq_lens", torch.tensor([3, 2]))
-        sglang_dumper.dump("req_pool_indices", torch.tensor([7, 3]))
-        sglang_dumper.dump("rids", ["A", "B"])
-        sglang_dumper.dump(
+        flliper_dumper.dump("input_ids", torch.tensor([10, 20, 30, 40, 50]))
+        flliper_dumper.dump("positions", torch.tensor([0, 1, 2, 0, 1]))
+        flliper_dumper.dump("seq_lens", torch.tensor([3, 2]))
+        flliper_dumper.dump("req_pool_indices", torch.tensor([7, 3]))
+        flliper_dumper.dump("rids", ["A", "B"])
+        flliper_dumper.dump(
             "hidden_states",
             torch.stack(
                 [
@@ -2282,7 +2282,7 @@ class TestEntrypointAlignment:
                 ]
             ),
         )
-        sglang_dumper.step()
+        flliper_dumper.step()
 
         # Steps 1-3: decode — 1 token per sequence
         decode_data: list[dict[str, object]] = [
@@ -2303,13 +2303,13 @@ class TestEntrypointAlignment:
             },
         ]
         for step_data in decode_data:
-            sglang_dumper.dump("input_ids", step_data["input_ids"])
-            sglang_dumper.dump("positions", step_data["positions"])
-            sglang_dumper.dump("seq_lens", torch.tensor([1, 1]))
-            sglang_dumper.dump("req_pool_indices", torch.tensor([7, 3]))
-            sglang_dumper.dump("rids", ["A", "B"])
-            sglang_dumper.dump("hidden_states", step_data["hidden"])
-            sglang_dumper.step()
+            flliper_dumper.dump("input_ids", step_data["input_ids"])
+            flliper_dumper.dump("positions", step_data["positions"])
+            flliper_dumper.dump("seq_lens", torch.tensor([1, 1]))
+            flliper_dumper.dump("req_pool_indices", torch.tensor([7, 3]))
+            flliper_dumper.dump("rids", ["A", "B"])
+            flliper_dumper.dump("hidden_states", step_data["hidden"])
+            flliper_dumper.step()
 
         # --- Megatron target: 1 step, thd [T, H] ---
         megatron_dir: Path = tmp_path / "target"
@@ -2337,7 +2337,7 @@ class TestEntrypointAlignment:
 
         # --- Run comparison ---
         argv = _make_argv(
-            sglang_dir / _FIXED_EXP_NAME,
+            flliper_dir / _FIXED_EXP_NAME,
             megatron_dir / _FIXED_EXP_NAME,
             grouping_skip_keys=["rank", "step"],
             token_aligner="smart",
@@ -2798,7 +2798,7 @@ def _create_rank_dump(
     tensor: torch.Tensor,
     dims: str | None = None,
     parallel_info: dict | None = None,
-    framework: str = "sglang",
+    framework: str = "flliper",
     num_steps: int = 1,
     extra_dumps: list[tuple[str, object]] | None = None,
 ) -> Path:
@@ -2839,7 +2839,7 @@ def _create_multi_step_rank_dump(
     tensors_per_step: list[torch.Tensor],
     dims: str | None = None,
     parallel_info: dict | None = None,
-    framework: str = "sglang",
+    framework: str = "flliper",
 ) -> Path:
     """Create a dump file with *different* tensors per step.
 
@@ -3398,8 +3398,8 @@ class TestEntrypointThdCpZigzag:
     unshard + reorder → tensor comparison.
     """
 
-    def test_sglang_vs_megatron_zigzag_cp(self, tmp_path: Path, capsys) -> None:
-        """SGLang single-rank THD baseline vs Megatron CP=2 zigzag target."""
+    def test_flliper_vs_megatron_zigzag_cp(self, tmp_path: Path, capsys) -> None:
+        """fLLiper single-rank THD baseline vs Megatron CP=2 zigzag target."""
         torch.manual_seed(42)
         hidden_dim: int = 8
         cp_size: int = 2
@@ -3413,24 +3413,24 @@ class TestEntrypointThdCpZigzag:
 
         hidden_states: torch.Tensor = torch.randn(total_tokens, hidden_dim)
 
-        # --- SGLang baseline: single rank, 1 step ---
-        sglang_dir: Path = tmp_path / "baseline"
-        sglang_dir.mkdir()
-        sglang_dumper = _Dumper(
+        # --- fLLiper baseline: single rank, 1 step ---
+        flliper_dir: Path = tmp_path / "baseline"
+        flliper_dir.mkdir()
+        flliper_dumper = _Dumper(
             config=DumperConfig(
                 enable=True,
-                dir=str(sglang_dir),
+                dir=str(flliper_dir),
                 exp_name=_FIXED_EXP_NAME,
             )
         )
 
         positions: list[int] = list(range(seq_lens[0])) + list(range(seq_lens[1]))
-        sglang_dumper.dump("input_ids", torch.tensor(all_ids))
-        sglang_dumper.dump("positions", torch.tensor(positions))
-        sglang_dumper.dump("seq_lens", torch.tensor(seq_lens))
-        sglang_dumper.dump("rids", ["A", "B"])
-        sglang_dumper.dump("hidden_states", hidden_states)
-        sglang_dumper.step()
+        flliper_dumper.dump("input_ids", torch.tensor(all_ids))
+        flliper_dumper.dump("positions", torch.tensor(positions))
+        flliper_dumper.dump("seq_lens", torch.tensor(seq_lens))
+        flliper_dumper.dump("rids", ["A", "B"])
+        flliper_dumper.dump("hidden_states", hidden_states)
+        flliper_dumper.step()
 
         # --- Megatron target: CP=2, zigzag, 1 step ---
         megatron_dir: Path = tmp_path / "target"
@@ -3477,7 +3477,7 @@ class TestEntrypointThdCpZigzag:
 
         # --- Run comparison ---
         argv: list[str] = _make_argv(
-            sglang_dir / _FIXED_EXP_NAME,
+            flliper_dir / _FIXED_EXP_NAME,
             megatron_dir / _FIXED_EXP_NAME,
             grouping_skip_keys=["rank", "step"],
             token_aligner="smart",
@@ -3553,8 +3553,8 @@ class TestEntrypointDpFilter:
     empty dp_rank items and produce correct comparison results.
     """
 
-    def test_dp2_sglang_both_sides(self, tmp_path: Path, capsys) -> None:
-        """DP=2 sglang: both baseline and target have 1 non-empty + 1 empty dp_rank."""
+    def test_dp2_flliper_both_sides(self, tmp_path: Path, capsys) -> None:
+        """DP=2 flliper: both baseline and target have 1 non-empty + 1 empty dp_rank."""
         torch.manual_seed(42)
         tensor_data: torch.Tensor = torch.randn(10, 8)
         target_data: torch.Tensor = tensor_data + torch.randn(10, 8) * 0.001
@@ -3579,7 +3579,7 @@ class TestEntrypointDpFilter:
                     "dp_rank": 0,
                     "dp_size": 2,
                 },
-                framework="sglang",
+                framework="flliper",
             )
 
             # dp_rank=1: empty tensor
@@ -3595,7 +3595,7 @@ class TestEntrypointDpFilter:
                     "dp_rank": 1,
                     "dp_size": 2,
                 },
-                framework="sglang",
+                framework="flliper",
             )
 
         argv: list[str] = _make_argv(
@@ -3663,8 +3663,8 @@ class TestEntrypointDpFilter:
         comparison: ComparisonTensorRecord = _assert_single_comparison_passed(records)
         assert comparison.name == "hidden"
 
-    def test_dp2_tp2_sglang(self, tmp_path: Path, capsys) -> None:
-        """DP=2 x TP=2 sglang: 4 ranks, dp_rank=0 has data, dp_rank=1 empty."""
+    def test_dp2_tp2_flliper(self, tmp_path: Path, capsys) -> None:
+        """DP=2 x TP=2 flliper: 4 ranks, dp_rank=0 has data, dp_rank=1 empty."""
         torch.manual_seed(42)
         full_tensor: torch.Tensor = torch.randn(10, 8)
         tp_chunks: list[torch.Tensor] = list(full_tensor.chunk(2, dim=1))
@@ -3697,7 +3697,7 @@ class TestEntrypointDpFilter:
                             "dp_rank": dp_rank,
                             "dp_size": 2,
                         },
-                        framework="sglang",
+                        framework="flliper",
                     )
                     rank += 1
 
@@ -3712,7 +3712,7 @@ class TestEntrypointDpFilter:
         assert comparison.name == "hidden"
 
     def test_dp2_both_nonempty_raises(self, tmp_path: Path, capsys) -> None:
-        """DP=2 sglang: both dp_rank=0 and dp_rank=1 have non-empty tensors => AssertionError."""
+        """DP=2 flliper: both dp_rank=0 and dp_rank=1 have non-empty tensors => AssertionError."""
         torch.manual_seed(42)
         tensor_data: torch.Tensor = torch.randn(10, 8)
         target_data: torch.Tensor = tensor_data + torch.randn(10, 8) * 0.001
@@ -3737,7 +3737,7 @@ class TestEntrypointDpFilter:
                         "dp_rank": dp_rank,
                         "dp_size": 2,
                     },
-                    framework="sglang",
+                    framework="flliper",
                 )
 
         argv: list[str] = _make_argv(
@@ -3784,7 +3784,7 @@ class TestEntrypointDpGroupAlias:
                     "dp_rank": 0,
                     "dp_size": 1,
                 },
-                framework="sglang",
+                framework="flliper",
             )
 
         argv: list[str] = _make_argv(
@@ -3822,7 +3822,7 @@ class TestEntrypointDpGroupAlias:
                     "moe_dp_rank": 0,
                     "moe_dp_size": 2,
                 },
-                framework="sglang",
+                framework="flliper",
             )
 
             # moe_dp_rank=1: empty
@@ -3840,7 +3840,7 @@ class TestEntrypointDpGroupAlias:
                     "moe_dp_rank": 1,
                     "moe_dp_size": 2,
                 },
-                framework="sglang",
+                framework="flliper",
             )
 
         argv: list[str] = _make_argv(
@@ -3882,7 +3882,7 @@ class TestEntrypointDpGroupAlias:
                         "moe_dp_rank": moe_dp_rank,
                         "moe_dp_size": 2,
                     },
-                    framework="sglang",
+                    framework="flliper",
                 )
 
         argv: list[str] = _make_argv(
@@ -4360,7 +4360,7 @@ class TestExitCodeSubprocess:
         cmd: list[str] = [
             sys.executable,
             "-m",
-            "sglang.srt.debug_utils.comparator",
+            "flliper.srt.debug_utils.comparator",
             "--baseline-path",
             str(baseline_path),
             "--target-path",
@@ -4503,7 +4503,7 @@ class TestReportOutput:
 
     def test_streaming_flush(self, tmp_path, capsys):
         """Report file is flushed after each record (readable before close)."""
-        from sglang.srt.debug_utils.comparator.report_sink import report_sink
+        from flliper.srt.debug_utils.comparator.report_sink import report_sink
 
         report_file: Path = tmp_path / "stream_report.jsonl"
         report_sink.configure(
@@ -4532,7 +4532,7 @@ class TestEntrypointDpAttentionMissingAlias:
     """
 
     @staticmethod
-    def _sglang_dp_attn_parallel_info(*, tp_rank: int) -> dict:
+    def _flliper_dp_attn_parallel_info(*, tp_rank: int) -> dict:
         return {
             "tp_rank": tp_rank,
             "tp_size": 2,
@@ -4574,7 +4574,7 @@ class TestEntrypointDpAttentionMissingAlias:
                     tensor=data,
                     dims="t h",
                     parallel_info={"tp_rank": 0, "tp_size": 1},
-                    framework="sglang",
+                    framework="flliper",
                 )
             else:
                 # Target: dp-attention, tp_rank=0 gets 0 tokens, tp_rank=1 gets all
@@ -4584,8 +4584,8 @@ class TestEntrypointDpAttentionMissingAlias:
                     name="layer_input",
                     tensor=torch.empty(0, 8),
                     dims="t h",
-                    parallel_info=self._sglang_dp_attn_parallel_info(tp_rank=0),
-                    framework="sglang",
+                    parallel_info=self._flliper_dp_attn_parallel_info(tp_rank=0),
+                    framework="flliper",
                 )
                 _create_rank_dump(
                     side_dir,
@@ -4593,8 +4593,8 @@ class TestEntrypointDpAttentionMissingAlias:
                     name="layer_input",
                     tensor=data,
                     dims="t h",
-                    parallel_info=self._sglang_dp_attn_parallel_info(tp_rank=1),
-                    framework="sglang",
+                    parallel_info=self._flliper_dp_attn_parallel_info(tp_rank=1),
+                    framework="flliper",
                 )
 
         argv: list[str] = _make_argv(

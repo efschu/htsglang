@@ -32,15 +32,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import (  # noqa: E402
+from flliper.srt.managers.io_struct import (  # noqa: E402
     InitWeightsUpdateGroupReqInput,
 )
-from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+from flliper.srt.managers.scheduler_pp_mixin import (  # noqa: E402
     SchedulerPPMixin,
 )
 

@@ -28,14 +28,14 @@ a closed loop where the policy's own choice determines what it gets to measure.
 import math
 import unittest
 
-from sglang.srt.speculative.adaptive_chain import (
+from flliper.srt.speculative.adaptive_chain import (
     AdaptiveChainPolicy,
     ChainCostModel,
     choose_chain_length,
     normalize_survival,
     switch_is_profitable,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -50,7 +50,7 @@ AB27A_COSTS = {1: None, 2: 27.4, 3: None, 4: 34.1, 5: 36.9}
 #: The survival readout itself -- two entries, because the round ran k=2.
 AB27A_SURVIVAL_RAW = [0.472, 0.343]
 
-#: The cost prior in force during that boot (``SGLANG_SPEC_ADAPTIVE_CHAIN_COST_MS``
+#: The cost prior in force during that boot (``FLLIPER_SPEC_ADAPTIVE_CHAIN_COST_MS``
 #: unset, so the built-in default).
 AB27A_PRIOR_VERIFY_MS = 26.0
 AB27A_PRIOR_DRAFT_MS = 2.5
@@ -439,7 +439,7 @@ class TestSwitchLog(unittest.TestCase):
         policy.record_survival([1.0, 1.0, 1.0])
         first = policy.choose()
         with self.assertLogs(
-            "sglang.srt.speculative.adaptive_chain", level="INFO"
+            "flliper.srt.speculative.adaptive_chain", level="INFO"
         ) as captured:
             # Confidence collapses past step 1: the short chain now wins.
             policy.record_survival([1.0, 0.01, 0.0])
@@ -466,7 +466,7 @@ class TestSwitchLog(unittest.TestCase):
         )
         policy.record_survival([0.9, 0.8, 0.7])
         policy.choose()
-        logger_name = "sglang.srt.speculative.adaptive_chain"
+        logger_name = "flliper.srt.speculative.adaptive_chain"
         with self.assertNoLogs(logger_name, level="INFO"):
             for _ in range(5):
                 policy.choose()

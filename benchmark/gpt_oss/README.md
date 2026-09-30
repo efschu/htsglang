@@ -1,10 +1,10 @@
-# How to reproduce the result of GPT-OSS with SGLang
+# How to reproduce the result of GPT-OSS with fLLiper
 
-### Install the latest SGLang
+### Install the latest fLLiper
 
 ```bash
 git clone https://github.com/sgl-project/sglang.git
-cd sglang
+cd flliper
 git checkout v0.5.1.post3
 
 pip install --upgrade pip
@@ -17,16 +17,16 @@ Launch Command
 
 ```bash
 # MXFP4 120B on H100
-python3 -m sglang.launch_server --model openai/gpt-oss-120b --tp 8 --attention-backend triton
+python3 -m flliper.launch_server --model openai/gpt-oss-120b --tp 8 --attention-backend triton
 
 # BF16 120B on H100
-python3 -m sglang.launch_server --model lmsys/gpt-oss-120b-bf16 --tp 8 --attention-backend triton
+python3 -m flliper.launch_server --model lmsys/gpt-oss-120b-bf16 --tp 8 --attention-backend triton
 
 # MXFP4 120B on B200
-python3 -m sglang.launch_server --model openai/gpt-oss-120b --tp 4
+python3 -m flliper.launch_server --model openai/gpt-oss-120b --tp 4
 
 # BF16 120B on B200
-python3 -m sglang.launch_server --model lmsys/gpt-oss-120b-bf16 --tp 4
+python3 -m flliper.launch_server --model lmsys/gpt-oss-120b-bf16 --tp 4
 ```
 
 Benchmark Command
@@ -34,7 +34,7 @@ Benchmark Command
 ```bash
 
 # MXFP4 120B on H100
-python3 -m sglang.bench_one_batch_server --model openai/gpt-oss-120b --base-url http://localhost:30000 --batch-size 1 --input-len 1024 --output-len 512 --show-report
+python3 -m flliper.bench_one_batch_server --model openai/gpt-oss-120b --base-url http://localhost:30000 --batch-size 1 --input-len 1024 --output-len 512 --show-report
 ```
 
 ### Reproduce the benchmark throughput result (Batch Size 32)
@@ -43,22 +43,22 @@ Launch Command
 
 ```bash
 # MXFP4 120B on H100
-python3 -m sglang.launch_server --model openai/gpt-oss-120b --tp 8
+python3 -m flliper.launch_server --model openai/gpt-oss-120b --tp 8
 
 # BF16 120B on H100
-python3 -m sglang.launch_server --model lmsys/gpt-oss-120b-bf16 --tp 8
+python3 -m flliper.launch_server --model lmsys/gpt-oss-120b-bf16 --tp 8
 
 # MXFP4 120B on B200
-python3 -m sglang.launch_server --model openai/gpt-oss-120b --tp 4
+python3 -m flliper.launch_server --model openai/gpt-oss-120b --tp 4
 
 # BF16 120B on B200
-python3 -m sglang.launch_server --model lmsys/gpt-oss-120b-bf16 --tp 4
+python3 -m flliper.launch_server --model lmsys/gpt-oss-120b-bf16 --tp 4
 ```
 
 Benchmark Command
 
 ```bash
-python3 -m sglang.bench_one_batch_server --model openai/gpt-oss-120b --base-url http://localhost:30000 --batch-size 32 --input-len 1024 8192 --output-len 512 --show-report
+python3 -m flliper.bench_one_batch_server --model openai/gpt-oss-120b --base-url http://localhost:30000 --batch-size 32 --input-len 1024 8192 --output-len 512 --show-report
 ```
 
 ### Reproduce the evaluation result
@@ -126,14 +126,14 @@ Launch Command
 ```bash
 # On Hopper:
 # - Tree decoding (topk > 1) and chain decoding (topk = 1) are supported on both FA3 and Triton backends.
-python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algorithm EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --tp 4
-python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algorithm EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 5 --speculative-eagle-topk 4 --speculative-num-draft-tokens 8 --tp 4
+python3 -m flliper.launch_server --model openai/gpt-oss-120b --speculative-algorithm EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --tp 4
+python3 -m flliper.launch_server --model openai/gpt-oss-120b --speculative-algorithm EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 5 --speculative-eagle-topk 4 --speculative-num-draft-tokens 8 --tp 4
 
 # On Blackwell:
 # - Chain decoding (topk = 1) is supported on TRTLLM-MHA backend. Tree decoding (topk > 1) is in progress, stay tuned!
 # - Both tree decoding (topk > 1) and chain decoding (topk = 1) are supported on the Triton backend.
-python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algo EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --tp 4
-python3 -m sglang.launch_server --model openai/gpt-oss-120b --speculative-algo EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 5 --speculative-eagle-topk 4 --speculative-num-draft-tokens 8 --attention-backend triton --tp 4
+python3 -m flliper.launch_server --model openai/gpt-oss-120b --speculative-algo EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --tp 4
+python3 -m flliper.launch_server --model openai/gpt-oss-120b --speculative-algo EAGLE3 --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 --speculative-num-steps 5 --speculative-eagle-topk 4 --speculative-num-draft-tokens 8 --attention-backend triton --tp 4
 ```
 
 Benchmark Command

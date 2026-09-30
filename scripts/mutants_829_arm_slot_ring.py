@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SRC = ROOT / "python" / "sglang" / "srt" / "managers" / "scheduler_pp_mixin.py"
+SRC = ROOT / "python" / "flliper" / "srt" / "managers" / "scheduler_pp_mixin.py"
 TEST = (
     ROOT
     / "test"

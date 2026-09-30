@@ -29,7 +29,7 @@ from dataclasses import replace
 
 import pytest
 
-from sglang.srt.planner import expert_pool_budget as epb
+from flliper.srt.planner import expert_pool_budget as epb
 
 GIB = epb.GIB
 MIB = epb.MIB
@@ -318,7 +318,7 @@ def test_a_log_without_the_dcp_vector_is_refused():
         epb.parse_boot_log(trimmed)
 
 
-def test_ranks_never_uneins_on_the_page_size(measured):
+def test_ranks_never_disagree_on_the_page_size(measured):
     mixed = list(measured)
     mixed[1] = replace(mixed[1], page_size=32)
     with pytest.raises(ValueError, match="RAENGE NIE UNEINS"):

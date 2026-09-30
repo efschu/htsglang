@@ -6,12 +6,12 @@ import triton
 from deep_gemm import ceil_div
 from flashinfer.gemm import gemm_fp8_nt_groupwise
 
-from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.layers.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
+from flliper.benchmark.bench_utils import run_bench
+from flliper.srt.layers.quantization.fp8_kernel import (
+    flliper_per_token_group_quant_fp8,
     w8a8_block_fp8_matmul_deepgemm,
 )
-from sglang.srt.layers.quantization.fp8_utils import requant_weight_ue8m0
+from flliper.srt.layers.quantization.fp8_utils import requant_weight_ue8m0
 
 BLOCK_SIZE = 128
 
@@ -138,7 +138,7 @@ def calculate_diff(m: int, n: int, k: int):
     y = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
     y_fp8, y_scale = per_block_cast_to_fp8(y)
-    x_fp8, x_scale = sglang_per_token_group_quant_fp8(
+    x_fp8, x_scale = flliper_per_token_group_quant_fp8(
         x, BLOCK_SIZE, column_major_scales=True
     )
     out_flashinfer = fp8_gemm_flashinfer(
@@ -148,7 +148,7 @@ def calculate_diff(m: int, n: int, k: int):
         y_scale,
     )
 
-    dg_x_fp8, dg_x_scale = sglang_per_token_group_quant_fp8(
+    dg_x_fp8, dg_x_scale = flliper_per_token_group_quant_fp8(
         x,
         BLOCK_SIZE,
         column_major_scales=True,
@@ -182,10 +182,10 @@ def _benchmark(m, n, k, tp_size, provider):
 
     # Preprocess data before benchmarking
     y_fp8, y_scale = per_block_cast_to_fp8(y)
-    x_fp8, x_scale = sglang_per_token_group_quant_fp8(
+    x_fp8, x_scale = flliper_per_token_group_quant_fp8(
         x, BLOCK_SIZE, column_major_scales=True
     )
-    dg_x_fp8, dg_x_scale = sglang_per_token_group_quant_fp8(
+    dg_x_fp8, dg_x_scale = flliper_per_token_group_quant_fp8(
         x,
         BLOCK_SIZE,
         column_major_scales=True,

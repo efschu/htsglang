@@ -25,7 +25,7 @@ import pytest
 @pytest.fixture()
 def _eagle_sample_tree():
     """Return the AST of eagle_sample without importing CUDA deps."""
-    import sglang.srt.speculative.eagle_utils as eagle_utils
+    import flliper.srt.speculative.eagle_utils as eagle_utils
 
     src = inspect.getsource(eagle_utils.eagle_sample)
     cleaned = textwrap.dedent(src)

@@ -16,9 +16,9 @@ from pathlib import Path
 #: The repository root, derived from this file's own location so the harness
 #: runs in any checkout or worktree rather than one hard-coded path.
 ROOT = Path(__file__).resolve().parents[4]
-DISP = ROOT / "python/sglang/srt/managers/pp_stash_disposition.py"
-MIXIN = ROOT / "python/sglang/srt/managers/scheduler_pp_mixin.py"
-RUNTIME = ROOT / "python/sglang/srt/managers/phase_flip_runtime.py"
+DISP = ROOT / "python/flliper/srt/managers/pp_stash_disposition.py"
+MIXIN = ROOT / "python/flliper/srt/managers/scheduler_pp_mixin.py"
+RUNTIME = ROOT / "python/flliper/srt/managers/phase_flip_runtime.py"
 SUITE = "test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py"
 
 MUTATIONS = [

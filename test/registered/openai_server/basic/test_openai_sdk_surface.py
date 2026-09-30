@@ -33,8 +33,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from openai_sdk_harness import CANNED_TEXT, MODEL_NAME, TOKENIZER_NAME, live_server
 
-from sglang.srt.entrypoints.openai.registry_view import RegisteredEngine, RegistryView
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.entrypoints.openai.registry_view import RegisteredEngine, RegistryView
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # CPU: the engine is mocked, so this needs no card -- which is the point.
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")

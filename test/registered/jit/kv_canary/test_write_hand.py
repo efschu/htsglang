@@ -7,20 +7,20 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary import write as write_module
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
-from sglang.jit_kernel.kv_canary.verify import (
+from flliper.jit_kernel.kv_canary import consts
+from flliper.jit_kernel.kv_canary import write as write_module
+from flliper.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
+from flliper.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
     VerifyOrWriteContext,
     launch_canary_verify_kernel,
 )
-from sglang.jit_kernel.kv_canary.write import (
+from flliper.jit_kernel.kv_canary.write import (
     launch_canary_write_kernel,
 )
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
+from flliper.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
     assert_only_bits_set,
@@ -37,19 +37,19 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     stamp_pair,
     to_signed_int64,
 )
-from sglang.jit_kernel.tests.kv_canary._differential import (
+from flliper.jit_kernel.tests.kv_canary._differential import (
     _run_both_write,
     run_write_diff,
 )
-from sglang.jit_kernel.tests.kv_canary._fixtures import (
+from flliper.jit_kernel.tests.kv_canary._fixtures import (
     clone_real_kv_sources,
     dummy_pseudo_tensors,
 )
-from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+from flliper.jit_kernel.tests.kv_canary._hand_oracle import (
     _hand_fold_all,
     _hand_fold_partial,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

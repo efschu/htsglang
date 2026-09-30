@@ -5,13 +5,13 @@ import argparse
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.model_executor.pool_configurator import (
+from flliper.srt.model_executor.pool_configurator import (
     SWAChunkCapPoolConfigurator,
     swa_pool_token_cap,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -155,7 +155,7 @@ class TestSwaHybridCapModeCeiling(CustomTestCase):
     """#90 cap in cap mode: full_need only (no ceil(swa_need/ratio) term)."""
 
     def _cap_for(self, sizing):
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
             ModelRunnerKVCacheMixin,
         )
 

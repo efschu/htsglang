@@ -32,8 +32,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
-from sglang.srt.managers.schedule_batch import Req
+from flliper.srt.managers.kv_session_offload import KVSessionOffloadManager
+from flliper.srt.managers.schedule_batch import Req
 
 # Row geometry shared by the arms: committed length, draft overhang, block.
 L = 128
@@ -159,7 +159,7 @@ def test_decline_on_empty_spill_plan_leaves_no_reclaim():
     _assert_untouched_and_poppable(mgr, victim)
 
 
-def test_decline_on_budget_regler_leaves_no_reclaim():
+def test_decline_on_budget_controller_leaves_no_reclaim():
     """Decline 2: a #236 volume/rate regler refuses the spill volume."""
     mgr = _manager(budget_armed=True)
     mgr._budget_admission_check = lambda spill_tokens: "volume"

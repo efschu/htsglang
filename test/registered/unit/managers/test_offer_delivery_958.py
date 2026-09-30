@@ -59,8 +59,8 @@ the report lying about what ran.
 import types
 import unittest
 
-from sglang.srt.managers.schedule_batch import Req
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.schedule_batch import Req
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20)
 
@@ -115,7 +115,7 @@ def _holder(**kw):
 
 
 def _guard():
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         PPAdmissionCongruenceGuard,
     )
 
@@ -129,7 +129,7 @@ def _offer(guard, req):
     here would be a second expression for the quantity under test, which is the
     very defect class this file measures.
     """
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         build_pp_admission_decision,
     )
 
@@ -144,7 +144,7 @@ def _offer(guard, req):
 
 
 def _run_terminator(holder, req):
-    from sglang.srt.managers.scheduler_pp_mixin import (
+    from flliper.srt.managers.scheduler_pp_mixin import (
         pp_apply_dead_premise_at_chunk_boundary,
         pp_mark_premise_dead,
     )
@@ -266,7 +266,7 @@ class TheTerminatorMustMoveTheOfferItWasSpentOn(unittest.TestCase):
         the request actually holds, and the extend is the chunk actually
         scheduled from it.
         """
-        from sglang.srt.managers.pp_admission_congruence import (
+        from flliper.srt.managers.pp_admission_congruence import (
             build_pp_admission_decision,
         )
 
@@ -341,7 +341,7 @@ class TheTerminatorMustMoveTheOfferItWasSpentOn(unittest.TestCase):
         and flipping it would have silenced them. A request that reaches the
         producer in THAT shape must still be refused by name.
         """
-        from sglang.srt.managers.pp_admission_congruence import PPScheduleRefused
+        from flliper.srt.managers.pp_admission_congruence import PPScheduleRefused
 
         guard, _holder_, req = self._stuck()
         req.extend_range = None  # the reset_for_retract shape, not the truncation
@@ -381,7 +381,7 @@ class TheInvariantTheActingHalfBreaks(unittest.TestCase):
 
     def _reported_start(self, req):
         """What the producer would put on the wire for `req` right now."""
-        from sglang.srt.managers.pp_admission_congruence import _executed_extent
+        from flliper.srt.managers.pp_admission_congruence import _executed_extent
 
         extent = _executed_extent(req)
         return None if extent is None else extent[0]

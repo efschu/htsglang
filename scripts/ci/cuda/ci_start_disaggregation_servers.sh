@@ -33,7 +33,7 @@ for i in {0..3}; do
   HOST="127.0.0.$((i + 1))"
   echo "Launching PREFILL server on GPU $i at $HOST:$PORT (bootstrap: $BOOTSTRAP_PORT)"
   CUDA_VISIBLE_DEVICES=$i \
-  python3 -m sglang.launch_server \
+  python3 -m flliper.launch_server \
     --model-path "$MODEL_PATH" \
     --disaggregation-mode prefill \
     --host "$HOST" \
@@ -48,7 +48,7 @@ for i in {4..7}; do
   HOST="127.0.0.$((i + 1))"
   echo "Launching DECODE server on GPU $i at $HOST:$PORT"
   CUDA_VISIBLE_DEVICES=$i \
-  python3 -m sglang.launch_server \
+  python3 -m flliper.launch_server \
     --model-path "$MODEL_PATH" \
     --disaggregation-mode decode \
     --host "$HOST" \

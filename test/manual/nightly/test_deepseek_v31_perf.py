@@ -1,7 +1,7 @@
 import unittest
 
-from sglang.test.nightly_utils import NightlyBenchmarkRunner
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
+from flliper.test.nightly_utils import NightlyBenchmarkRunner
+from flliper.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 DEEPSEEK_V31_MODEL_PATH = "deepseek-ai/DeepSeek-V3.1"
 PROFILE_DIR = "performance_profiles_deepseek_v31"

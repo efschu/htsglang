@@ -22,12 +22,12 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.turnkey import config as C
-from sglang.srt.turnkey import plan as PL
-from sglang.srt.turnkey import preflight as PF
-from sglang.srt.turnkey import refusal as RF
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.turnkey import config as C
+from flliper.srt.turnkey import plan as PL
+from flliper.srt.turnkey import preflight as PF
+from flliper.srt.turnkey import refusal as RF
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -55,7 +55,7 @@ venv = "%s/.venv"
 log_dir = "/var/log/t"
 
 [env]
-SGLANG_X = "1"
+FLLIPER_X = "1"
 
 [[cards]]
 uuid = "%s"
@@ -71,7 +71,7 @@ must_import = ["sgl_kernel"]
 
 [serving.ship]
 port = 30030
-argv = ["/bin/python", "-m", "sglang.launch_server"]
+argv = ["/bin/python", "-m", "flliper.launch_server"]
 cards = [1, 0]
 boot_log = "/var/log/t/ship.log"
 """ % (REPO, REPO, U1, U2)
@@ -241,7 +241,7 @@ class TestPreflight(CustomTestCase):
         self.assertIn(RF.REFUSE_DISK_HEADROOM, names)
 
     def test_busy_card_refusal_names_the_pid_not_a_pattern(self):
-        """Orphan cleanup is BY PID. `pkill -f sglang` also matches the
+        """Orphan cleanup is BY PID. `pkill -f flliper` also matches the
         router on :30099, whose liveness is a standing law here."""
         c = cfg()
         over = dict(

@@ -31,9 +31,9 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import window_for_layers
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import window_for_layers
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MixedGenerationError,
@@ -41,7 +41,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     audit_blob_generations,
     page_shard,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 ATTN_LAYER_IDS = list(range(3, 64, 4))
 CELL = 64
@@ -121,7 +121,7 @@ class TestStoreRefusesTwoBlobGenerations(CustomTestCase):
         because the next canonical write turns it into one."""
         _plant(self.root, f"cafe01.mamba{STAGE_SUFFIX}")
         with self.assertLogs(
-            "sglang.srt.mem_cache.hicache_storage", level="WARNING"
+            "flliper.srt.mem_cache.hicache_storage", level="WARNING"
         ) as logs:
             _backend(self.root, window=_window())
         self.assertTrue(
@@ -186,10 +186,10 @@ class TestRetiredReadPathRefusesConstruction(CustomTestCase):
         """Seam (a): the import is how the module gets back into a process."""
         import importlib
 
-        import sglang.srt.mem_cache.hi_mamba_radix_cache as mod
+        import flliper.srt.mem_cache.hi_mamba_radix_cache as mod
 
         with self.assertLogs(
-            "sglang.srt.mem_cache.hi_mamba_radix_cache", level="WARNING"
+            "flliper.srt.mem_cache.hi_mamba_radix_cache", level="WARNING"
         ) as logs:
             importlib.reload(mod)
         self.assertTrue(
@@ -200,7 +200,7 @@ class TestRetiredReadPathRefusesConstruction(CustomTestCase):
         """THE CAN-FAIL PROOF for the class seam. Built with a deliberately
         empty params object: the refusal must come BEFORE any argument
         validation, or a future caller with valid pools would slip past it."""
-        from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+        from flliper.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
 
         with self.assertRaises(NotImplementedError) as cm:
             HiMambaRadixCache(object(), object())
@@ -259,7 +259,7 @@ class TestEraAdmissionRingPredicate(CustomTestCase):
         import ast
         import inspect
 
-        from sglang.srt.managers import scheduler_pp_mixin as mod
+        from flliper.srt.managers import scheduler_pp_mixin as mod
 
         removed_names = {
             "_pp_era_ring_live",
@@ -341,7 +341,7 @@ class TestEraAdmissionRingPredicate(CustomTestCase):
         import inspect
         import textwrap
 
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         src = inspect.getsource(SchedulerPPMixin._pp_commit_comm_work)
         tree = ast.parse(textwrap.dedent(src))

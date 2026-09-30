@@ -20,7 +20,7 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.audio import (
+from flliper.srt.translator.audio import (
     CodecError,
     OpusCodec,
     Pcm16Codec,
@@ -28,7 +28,7 @@ from sglang.srt.translator.audio import (
     negotiate_codec,
     resample,
 )
-from sglang.srt.translator.backends import AudioChunk
+from flliper.srt.translator.backends import AudioChunk
 
 HAVE_OPUS = "opus" in available_codecs()
 OPUS_RATE = 48000

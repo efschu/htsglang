@@ -3,10 +3,10 @@ import unittest
 
 import torch
 
-from sglang.test.ascend.test_ascend_utils import BGE_RERANKER_V2_M3_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ascend.test_ascend_utils import BGE_RERANKER_V2_M3_WEIGHTS_PATH
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
+from flliper.test.test_utils import CustomTestCase
 
 register_npu_ci(
     est_time=400,
@@ -23,7 +23,7 @@ TORCH_DTYPES = [torch.bfloat16]
 
 class TestBgeReranker(CustomTestCase):
     """Testcase: This test case validates that the cross-encoder scores from the BAAI/bge-reranker-v2-m3 model in the
-    SGLang framework are less than 1e-2 different from the Hugging Face implementation.
+    fLLiper framework are less than 1e-2 different from the Hugging Face implementation.
 
     [Test Category] Model
     [Test Target] BAAI/bge-reranker-v2-m3

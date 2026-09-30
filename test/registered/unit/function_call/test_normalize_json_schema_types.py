@@ -5,9 +5,9 @@ import unittest
 
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.function_call.utils import normalize_json_schema_types
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.function_call.utils import normalize_json_schema_types
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 

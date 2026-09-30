@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.mem_cache.kv_vmm_backing import KvVmmArena
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.kv_vmm_backing import KvVmmArena
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

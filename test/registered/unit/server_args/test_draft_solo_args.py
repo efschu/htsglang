@@ -11,9 +11,9 @@ multi-node, PD disaggregation) with clear messages.
 import argparse
 import unittest
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -280,7 +280,7 @@ class TestSoloDraftGpuResolution(CustomTestCase):
         stated instead of being discovered later.
         """
         args = solo_args(tp_size=3, rank_gpu_id=[0, 1, 1], speculative_draft_gpu=1)
-        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
             args._handle_speculative_draft_placement()
         joined = "\n".join(cm.output)
         self.assertIn("co-located ranks", joined)
@@ -289,7 +289,7 @@ class TestSoloDraftGpuResolution(CustomTestCase):
 
     def test_no_warning_without_colocation(self):
         args = solo_args(tp_size=2, rank_gpu_id=[0, 1], speculative_draft_gpu=1)
-        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+        with self.assertNoLogs("flliper.srt.server_args", level="WARNING"):
             args._handle_speculative_draft_placement()
 
 

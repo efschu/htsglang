@@ -28,8 +28,8 @@ import pathlib
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -86,8 +86,8 @@ def _write_gguf(directory: pathlib.Path, arch: str) -> pathlib.Path:
 class TestDflashGgufSiblingConfig(CustomTestCase):
     def test_dflash_arch_is_a_sibling_config_arch(self):
         """The ratchet: the header string the peek dispatches on."""
-        from sglang.srt.model_loader.gguf_dflash import DFLASH_GGUF_ARCHS
-        from sglang.srt.model_loader.gguf_registry import sibling_config_gguf_archs
+        from flliper.srt.model_loader.gguf_dflash import DFLASH_GGUF_ARCHS
+        from flliper.srt.model_loader.gguf_registry import sibling_config_gguf_archs
 
         archs = sibling_config_gguf_archs()
         for arch in DFLASH_GGUF_ARCHS:
@@ -105,8 +105,8 @@ class TestDflashGgufSiblingConfig(CustomTestCase):
             self.assertIn(arch, archs)
 
     def test_get_config_reads_the_sibling_config_json(self):
-        from sglang.srt.utils.hf_transformers.config import _peek_bespoke_gguf_arch
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from flliper.srt.utils.hf_transformers.config import _peek_bespoke_gguf_arch
+        from flliper.srt.utils.hf_transformers_utils import get_config
 
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_gguf(pathlib.Path(tmp), "dflash-draft")
@@ -123,11 +123,11 @@ class TestDflashGgufSiblingConfig(CustomTestCase):
     def test_the_loader_half_now_sees_a_dflash_config(self):
         """The two halves meet: the config the peek produces is the one the
         weight loader dispatches on."""
-        from sglang.srt.model_loader.gguf_dflash import (
+        from flliper.srt.model_loader.gguf_dflash import (
             build_dflash_name_map,
             is_dflash_gguf_config,
         )
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from flliper.srt.utils.hf_transformers_utils import get_config
 
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_gguf(pathlib.Path(tmp), "dflash-draft")
@@ -145,7 +145,7 @@ class TestDflashGgufSiblingConfig(CustomTestCase):
         pass while silently changing how ordinary GGUFs are read. Only the
         registered archs may take that route.
         """
-        from sglang.srt.utils.hf_transformers.config import _peek_bespoke_gguf_arch
+        from flliper.srt.utils.hf_transformers.config import _peek_bespoke_gguf_arch
 
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_gguf(pathlib.Path(tmp), "some-unregistered-arch")
@@ -162,13 +162,13 @@ class TestDflashGgufSiblingConfigOnTheRealDrafter(CustomTestCase):
     def test_full_config_chain_on_the_released_drafter(self):
         import gguf
 
-        from sglang.srt.model_loader.gguf_dflash import (
+        from flliper.srt.model_loader.gguf_dflash import (
             audit_dflash_name_map,
             build_dflash_name_map,
             is_dflash_gguf_config,
         )
-        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from flliper.srt.speculative.dflash_utils import parse_dflash_draft_config
+        from flliper.srt.utils.hf_transformers_utils import get_config
 
         config = get_config(str(_REAL_DRAFT), trust_remote_code=True)
         self.assertEqual(config.architectures, ["DFlashDraftModel"])
@@ -186,7 +186,7 @@ class TestDflashGgufSiblingConfigOnTheRealDrafter(CustomTestCase):
     def test_model_config_builds_for_the_drafter(self):
         """What the draft worker actually does, and what the alias hook's probe
         only anticipates: ModelConfig on the drafter path."""
-        from sglang.srt.configs.model_config import ModelConfig
+        from flliper.srt.configs.model_config import ModelConfig
 
         config = ModelConfig(
             model_path=str(_REAL_DRAFT), trust_remote_code=True, is_draft_model=True

@@ -1,7 +1,7 @@
 import pytest
 
-from sglang.srt.debug_utils.comparator.preset import PRESETS, expand_preset
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.preset import PRESETS, expand_preset
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
@@ -11,12 +11,12 @@ class TestExpandPreset:
     """Test preset expansion logic."""
 
     def test_explicit_preset(self):
-        """--preset sglang_megatron expands into its argv."""
+        """--preset flliper_megatron expands into its argv."""
         argv = [
             "--baseline-path",
             "/a",
             "--preset",
-            "sglang_megatron",
+            "flliper_megatron",
             "--diff-threshold",
             "0.01",
         ]

@@ -26,9 +26,9 @@ import ast
 import pathlib
 import unittest
 
-from sglang.srt.managers.scheduler import derive_enable_hicache_storage
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.scheduler import derive_enable_hicache_storage
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -36,7 +36,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _MEM_CACHE = (
     pathlib.Path(__file__).resolve().parents[4]
     / "python"
-    / "sglang"
+    / "flliper"
     / "srt"
     / "mem_cache"
 )

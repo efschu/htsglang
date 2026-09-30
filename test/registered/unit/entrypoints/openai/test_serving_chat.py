@@ -6,7 +6,7 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -19,18 +19,18 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import (
+from flliper.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
 )
-from sglang.srt.entrypoints.openai.serving_chat import (
+from flliper.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.parser.template_detection import ReasoningToggleConfig
-from sglang.srt.utils import get_or_create_event_loop
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.io_struct import GenerateReqInput
+from flliper.srt.parser.template_detection import ReasoningToggleConfig
+from flliper.srt.utils import get_or_create_event_loop
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -122,7 +122,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_convert_to_internal_request_single(self):
         with (
             patch(
-                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+                "flliper.srt.entrypoints.openai.serving_chat.generate_chat_conv"
             ) as conv_mock,
             patch.object(self.chat, "_process_messages") as proc_mock,
         ):
@@ -186,7 +186,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "flliper.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
             adapted, processed = self.chat._convert_to_internal_request(
                 req, self.fastapi_request
@@ -601,7 +601,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as parser_cls:
             parser = parser_cls.return_value
             parser.get_structure_constraint.return_value = ("structural_tag", "tag")
@@ -774,7 +774,7 @@ class ServingChatTestCase(unittest.TestCase):
         initial_stop_str = ["\n"]
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "flliper.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
             # Create a mock conversation object that will be returned by generate_chat_conv
             conv_ins = Mock()
@@ -1068,7 +1068,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         # Mock FunctionCallParser.parse_non_stream to return one tool call
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as ParserMock:
             parser_instance = ParserMock.return_value
 
@@ -1118,7 +1118,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.chat.tool_call_parser = "deepseekv4"
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as ParserMock:
             parser_instance = ParserMock.return_value
             calls = []
@@ -1193,7 +1193,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         # Patch FunctionCallParser used inside _process_tool_call_stream
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as ParserMock:
             parser_instance = ParserMock.return_value
 
@@ -1236,7 +1236,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
-        from sglang.srt.parser.template_manager import TemplateManager
+        from flliper.srt.parser.template_manager import TemplateManager
 
         # Only mock the fields that _use_dpsk_v32_encoding() actually reads:
         # tokenizer.chat_template and hf_config.architectures
@@ -1299,7 +1299,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_attach_task_to_last_user_message(self):
         """Helper attaches task to the nearest user/developer message."""
-        from sglang.srt.entrypoints.openai import encoding_dsv4
+        from flliper.srt.entrypoints.openai import encoding_dsv4
 
         messages = [{"role": "user", "content": "Hi"}]
         encoding_dsv4.attach_task_to_last_user_message(messages, "domain")
@@ -1328,8 +1328,8 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dsv4_content_parts_list_normalized(self):
         """OpenAI list-of-parts content flattens to text before reaching the encoder."""
-        from sglang.srt.entrypoints.openai import encoding_dsv4
-        from sglang.srt.parser.jinja_template_utils import (
+        from flliper.srt.entrypoints.openai import encoding_dsv4
+        from flliper.srt.parser.jinja_template_utils import (
             process_content_for_template_format,
         )
 
@@ -1374,13 +1374,13 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_dsv4_task_and_reminder_encode_end_to_end(self):
         """Task + latest_reminder plumb through to the dsv4 encoder correctly."""
-        from sglang.srt.entrypoints.openai import encoding_dsv4
+        from flliper.srt.entrypoints.openai import encoding_dsv4
 
         # 1) task='domain' in chat mode -> `<｜domain｜>` appended, no Assistant
         #    prefix (this is a single-shot classification, not a chat turn).
         req = ChatCompletionRequest(
             model="x",
-            messages=[{"role": "user", "content": "What is SGLang?"}],
+            messages=[{"role": "user", "content": "What is fLLiper?"}],
             task="domain",
         )
         messages = [m.model_dump() for m in req.messages]
@@ -1458,7 +1458,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "flliper.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
             # Create a mock conversation object
             conv_ins = Mock()
@@ -1743,7 +1743,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "flliper.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
@@ -1880,7 +1880,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "flliper.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
@@ -2027,7 +2027,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "flliper.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
@@ -2156,7 +2156,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_nemotron_super_high_effort_warns_without_kwarg(self):
         self._setup_nemotron_super()
         with self.assertLogs(
-            "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+            "flliper.srt.entrypoints.openai.serving_chat", level="WARNING"
         ) as logs:
             kwargs = self._run_jinja_with_effort("high")
         self.assertNotIn("low_effort", kwargs)
@@ -2410,7 +2410,7 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"enable_thinking": True},
         )
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            "flliper.srt.entrypoints.openai.serving_chat.generate_chat_conv"
         ) as conv_mock:
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "BASE_PROMPT"
@@ -2453,7 +2453,7 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     def test_required_with_parser_uses_function_call_parser(self):
         """tool_choice='required' should use FunctionCallParser when tool_call_parser is set."""
         with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+            "flliper.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as ParserMock:
             call_info = Mock()
             call_info.name = "get_weather"

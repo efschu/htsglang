@@ -5,16 +5,16 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.srt.kv_canary import endpoint as endpoint_module
-from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.runner import kernel_launcher as kernel_launcher_module
-from sglang.srt.kv_canary.state import ViolationLog
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
-from sglang.test.kv_canary.runner_test_base import (
+from flliper.jit_kernel.kv_canary.consts import RealKvHashMode
+from flliper.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
+from flliper.jit_kernel.kv_canary.write import WritePlan
+from flliper.srt.kv_canary import endpoint as endpoint_module
+from flliper.srt.kv_canary.expected_inputs import ExpectedInputs
+from flliper.srt.kv_canary.runner import kernel_launcher as kernel_launcher_module
+from flliper.srt.kv_canary.state import ViolationLog
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
+from flliper.test.kv_canary.runner_test_base import (
     CanaryManagerTestCase,
     RecordingEndpoint,
     make_manager,

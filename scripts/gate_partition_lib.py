@@ -19,7 +19,7 @@ Known traps this encodes (each one has cost a wrong verdict before):
     error=11`` and left every WEG-1 slice unmeasurable:
       - a subtest's DESCRIPTION is glued to the keyword with no separator, so
         ``SUBFAILED(abandon="'no_quorum'")`` is not ``SUBFAILED`` + space;
-      - the PRODUCT's own logger writes ``ERROR    sglang.srt...`` in column
+      - the PRODUCT's own logger writes ``ERROR    flliper.srt...`` in column
         0, which a keyword match reads as a test name;
       - the tally compared SET SIZES against pytest's OCCURRENCE COUNTS, so
         eight collection errors for one module (one per xdist worker) counted
@@ -55,7 +55,7 @@ NAME_LINE = re.compile(r"^(FAILED|SUBFAILED|ERROR)\b")
 # ``::``-separated parts.
 #
 # THE HAZARD THIS SHAPE GUARDS: the product's own logger emits
-# ``ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289
+# ``ERROR    flliper.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289
 # PHASE-FLIP SEAM UNFUNDABLE ...`` at column 0, which is indistinguishable
 # from pytest's summary by keyword alone -- seven such lines in the 2026-09-04
 # run, every one taken as a test name. A ``file.py:LINE`` reference is not a

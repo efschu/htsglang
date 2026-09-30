@@ -7,14 +7,14 @@ from types import SimpleNamespace
 import requests
 from prometheus_client.parser import text_string_to_metric_families
 
-from sglang.srt.disaggregation.prefill import should_force_retry
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.srt.disaggregation.prefill import should_force_retry
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+from flliper.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
 
@@ -42,10 +42,10 @@ class OptimisticPrefillRetryCounterMixin:
         response.raise_for_status()
         total = 0.0
         for family in text_string_to_metric_families(response.text):
-            if family.name != "sglang:num_prefill_retries":
+            if family.name != "flliper:num_prefill_retries":
                 continue
             for sample in family.samples:
-                if sample.name == "sglang:num_prefill_retries_total":
+                if sample.name == "flliper:num_prefill_retries_total":
                     total += sample.value
         return total
 
@@ -64,12 +64,12 @@ class TestOptimisticPrefill(
     def setUpClass(cls):
         super().setUpClass()
         cls._force_retry_prob_was_set = (
-            envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.is_set()
+            envs.FLLIPER_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.is_set()
         )
         cls._force_retry_prob_value = (
-            envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
+            envs.FLLIPER_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.get()
         )
-        envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.set(FORCE_RETRY_PROB)
+        envs.FLLIPER_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.set(FORCE_RETRY_PROB)
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.extra_prefill_args = [
             "--optimistic-prefill-attempts",
@@ -87,11 +87,11 @@ class TestOptimisticPrefill(
             super().tearDownClass()
         finally:
             if getattr(cls, "_force_retry_prob_was_set", False):
-                envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.set(
+                envs.FLLIPER_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.set(
                     cls._force_retry_prob_value
                 )
             else:
-                envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.clear()
+                envs.FLLIPER_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.clear()
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -142,12 +142,12 @@ class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
         super().setUpClass()
         # enable optimistic prefill retry sampling and disagg failure prob
         cls._force_retry_ctx = (
-            envs.SGLANG_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.override(
+            envs.FLLIPER_TEST_FORCE_OPTIMISTIC_PREFILL_RETRY_PROB.override(
                 FORCE_RETRY_PROB
             )
         )
         cls._force_retry_ctx.__enter__()
-        cls._disagg_failure_ctx = envs.SGLANG_TEST_DISAGG_FAILURE_PROB.override(
+        cls._disagg_failure_ctx = envs.FLLIPER_TEST_DISAGG_FAILURE_PROB.override(
             FORCE_RETRY_PROB
         )
         cls._disagg_failure_ctx.__enter__()

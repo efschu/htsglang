@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
-from sglang.test.kl_multiturn_utils import get_input_ids
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from flliper.test.kl_multiturn_utils import get_input_ids
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -38,7 +38,7 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--page-size",
                 "64",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={"FLLIPER_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 

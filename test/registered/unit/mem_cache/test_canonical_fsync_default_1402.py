@@ -1,5 +1,5 @@
 """#1402 (boot xsn132, 2026-09-15): a completing canonical extent write no
-longer fsyncs every 32 KiB page by default; SGLANG_HICACHE_CANONICAL_FSYNC=1
+longer fsyncs every 32 KiB page by default; FLLIPER_HICACHE_CANONICAL_FSYNC=1
 turns the per-page fsync back on. The rename-on-complete protocol is untouched.
 """
 
@@ -9,7 +9,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.mem_cache import canonical_page_store as cps
+from flliper.srt.mem_cache import canonical_page_store as cps
 
 
 def _window(total=64):
@@ -20,9 +20,9 @@ def _window(total=64):
 
 def _write(tmp_path, monkeypatch, env, explicit=None):
     if env is None:
-        monkeypatch.delenv("SGLANG_HICACHE_CANONICAL_FSYNC", raising=False)
+        monkeypatch.delenv("FLLIPER_HICACHE_CANONICAL_FSYNC", raising=False)
     else:
-        monkeypatch.setenv("SGLANG_HICACHE_CANONICAL_FSYNC", env)
+        monkeypatch.setenv("FLLIPER_HICACHE_CANONICAL_FSYNC", env)
     calls = []
     monkeypatch.setattr(cps.os, "fsync", lambda fd: calls.append(fd))
     final = os.path.join(str(tmp_path), "ab", "abcd.bin")

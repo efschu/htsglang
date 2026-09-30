@@ -7,7 +7,7 @@ card, no server, no CUDA graph.
 WHAT WAS MISSING. Arms H (``H_ps2_prefill_spill``) and I (``I_dflash_shards``)
 of the #550 window ran under full CUDA graphs -- ``boot_matrix/arms.py``
 ``BASE_EXPECT`` declares ``graphs=True`` and both inherit it -- while the only
-per-tick observable, the ``SGLANG_KVSO_TICK_TRACE`` line, reported an interval,
+per-tick observable, the ``FLLIPER_KVSO_TICK_TRACE`` line, reported an interval,
 a ``tick_cost`` and a host-tail size with nothing saying whether that cost came
 from a graph-covered or an eager segment. ``ANALYSE_spill_matrix_20260804.md``
 S13 recorded the same hole as "the spill-tick decomposition instrument does not
@@ -31,15 +31,15 @@ goes red. Observed red before restoring.
 import inspect
 import unittest
 
-from sglang.srt.managers import kv_session_offload
-from sglang.srt.managers.kv_session_offload import (
+from flliper.srt.managers import kv_session_offload
+from flliper.srt.managers.kv_session_offload import (
     TICK_GRAPH_COVERED,
     TICK_GRAPH_EAGER,
     TICK_GRAPH_UNATTRIBUTED,
     tick_graph_state_from_slot,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -82,7 +82,7 @@ class TestSignalSurvivesHarvest(CustomTestCase):
     order-independent because harvesting does not touch it."""
 
     def test_harvest_does_not_disturb_the_signal(self):
-        from sglang.srt.utils.collective_clock import CollectiveClock
+        from flliper.srt.utils.collective_clock import CollectiveClock
 
         clock = CollectiveClock()
         clock.arm()
@@ -96,7 +96,7 @@ class TestSignalSurvivesHarvest(CustomTestCase):
     def test_harvest_clears_the_pairs_it_owns(self):
         """States the destructive half explicitly, so the reason kvso must not
         harvest is pinned rather than only commented."""
-        from sglang.srt.utils.collective_clock import CollectiveClock
+        from flliper.srt.utils.collective_clock import CollectiveClock
 
         clock = CollectiveClock()
         clock.arm()

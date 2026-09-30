@@ -1,4 +1,4 @@
-# htsglang (uneven-TP sglang fork) — single-node serving compose.
+# htsglang (uneven-TP flliper fork) — single-node serving compose.
 #
 #   cp docker/htsglang.env.example .env      # then edit the paths
 #   docker compose -f docker/htsglang.yml up
@@ -27,7 +27,7 @@ services:
       - apparmor=unconfined
     ports:
       # OpenAI-compatible API. Bind to 127.0.0.1 unless the LAN is trusted —
-      # sglang has no authentication of its own.
+      # flliper has no authentication of its own.
       - "${BIND_HOST:-127.0.0.1}:${PUBLISH_PORT:-30000}:30000"
     volumes:
       # --- models -----------------------------------------------------------
@@ -64,13 +64,13 @@ services:
       # nodes or between different --rank-gpu-id mappings.
       # MISSING -> every boot is a cold load. No error, just slower.
       - ${HIBERNATE_DIR_HOST:-./state/hibernate}:/var/lib/htsglang/hibernate
-      # ~/.cache/sglang: the rig hardware profile (hw_profile-*.json, the NVML
+      # ~/.cache/flliper: the rig hardware profile (hw_profile-*.json, the NVML
       # probe) and the MEASURED KV budget (kv_budget-*.json, written by one
       # boot and consumed by the next to size the KV pool without re-probing).
       # Also the planner's saved profiles and graph-memory anchors.
       # MISSING -> every boot re-probes the rig (seconds) and re-derives the KV
       # budget, which costs a boot cycle of the full sizing loop.
-      - ${SGLANG_CACHE_DIR:-./state/sglang-cache}:/root/.cache/sglang
+      - ${FLLIPER_CACHE_DIR:-./state/flliper-cache}:/root/.cache/flliper
       # flashinfer compiles its kernels at runtime with nvcc. This cache is the
       # difference between a warm boot and minutes of recompilation.
       # MISSING -> long first boot after every container recreate.
@@ -121,7 +121,7 @@ services:
       - DCP_SIZE=${DCP_SIZE:-}
       # Uneven-TP MLP self-calibration vector. The first boot suggests one;
       # put it here and restart for the full KV pool. Empty = uncalibrated.
-      - SGLANG_UNEVEN_MLP_VECTOR=${SGLANG_UNEVEN_MLP_VECTOR:-}
+      - FLLIPER_UNEVEN_MLP_VECTOR=${FLLIPER_UNEVEN_MLP_VECTOR:-}
 
       # --- kv cache / speculative decoding ---
       - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}

@@ -35,14 +35,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     MAMBA_AUTO_SAFETY_MARGIN,
     MAMBA_FULL_MEMORY_RATIO_DEFAULT,
     ModelRunnerKVCacheMixin,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5)
 
@@ -53,7 +53,7 @@ def _reorder_on():
     Without it the floor is 1+P+1+1 and the numbers below describe a different
     configuration than the one being sized for.
     """
-    return mock.patch.dict(os.environ, {"SGLANG_MAMBA_SLOT_REORDER": "1"}, clear=False)
+    return mock.patch.dict(os.environ, {"FLLIPER_MAMBA_SLOT_REORDER": "1"}, clear=False)
 
 
 def _server_args(**over):
@@ -173,7 +173,7 @@ class TestTheSizeItProduces(CustomTestCase):
         self.assertLess(size, 24, "it must actually cost less than the hand-pin")
 
     def test_the_retention_budget_is_what_is_left_above_the_floor(self):
-        from sglang.srt.mem_cache.mamba_pool_floor import mamba_retention_pin_budget
+        from flliper.srt.mem_cache.mamba_pool_floor import mamba_retention_pin_budget
 
         sa = _server_args()
         with _reorder_on():

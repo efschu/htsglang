@@ -44,7 +44,7 @@ cause of refusal is pinned to still refuse.
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 PENDING = 22
 ROWS_AVAIL = 72_033
@@ -65,7 +65,7 @@ def _queued(n_tokens=PENDING):
 
 
 def _sched(avail=ROWS_AVAIL, slots=MAMBA_SLOTS, evictable=0, chunk=512, queue=()):
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     s = Scheduler.__new__(Scheduler)
     s.server_args = SimpleNamespace(chunked_prefill_size=chunk)

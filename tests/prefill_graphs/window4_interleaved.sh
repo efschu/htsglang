@@ -32,15 +32,15 @@ REPS="${REPS:-3}"
 mkdir -p "$OUT"
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 
 boot() {
   local arm="$1"; shift
   local log="$OUT/boot_${arm}.log"
   echo "=== booting arm $arm"
-  setsid "$VENV/bin/python" -m sglang.launch_server \
+  setsid "$VENV/bin/python" -m flliper.launch_server \
     --model-path /spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8 \
     --served-model-name default \
     --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \

@@ -6,7 +6,7 @@ und die eine Zahl, die am Metall gemessen ist (fnFL2w24/w30: 324 Plaetze).
 
 import pytest
 
-from sglang.srt.layers.moe import expert_map as em
+from flliper.srt.layers.moe import expert_map as em
 
 
 RATIOS = [183, 137, 168]      # summiert 488, NICHT 512
@@ -15,7 +15,7 @@ FR_TP = [0.479, 0.319, 0.284]
 TOTAL = 512
 
 
-def test_ratios_werden_skaliert_nicht_roh_genommen():
+def test_ratios_are_scaled_not_taken_raw():
     """fnFL2w49 starb an genau 5 Ids (183..187).
 
     Ich hatte die rohen Ratios als Bereichsgrenzen genommen (0..182,
@@ -30,13 +30,13 @@ def test_ratios_werden_skaliert_nicht_roh_genommen():
         "keine Id darf zwischen zwei Baendern verschwinden")
 
 
-def test_die_plaetzezahl_ist_die_am_metall_gemessene():
+def test_slot_count_is_the_one_measured_on_metal():
     """fnFL2w24 und w30: 324 Plaetze, 506,25 MiB je Tensor, 36,71 GiB."""
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     assert k["slots"] == 324
 
 
-def test_der_store_haelt_den_TAUSCH_nicht_die_vereinigung():
+def test_store_holds_the_swap_not_the_union():
     """Nutzer 22.09.: "kein zusaetzlicher systemram dafuer notwendig".
 
     Die Vereinigung aller je kalten Ids waere 420 (512 minus die 92, die
@@ -48,39 +48,39 @@ def test_der_store_haelt_den_TAUSCH_nicht_die_vereinigung():
     res_p = {g for ids in k["phases"]["P"]["resident"] for g in ids}
     res_d = {g for ids in k["phases"]["D"]["resident"] for g in ids}
     assert len(res_p) == 188 and len(res_d) == 188
-    vereinigung = TOTAL - len(res_p & res_d)
-    assert vereinigung == 420, "die Zahl, die w49 belegt hat"
-    assert k["slots"] == 324 < vereinigung
+    union = TOTAL - len(res_p & res_d)
+    assert union == 420, "die Zahl, die w49 belegt hat"
+    assert k["slots"] == 324 < union
     assert k["shared_resident"] == 92, "was auf den Karten liegen bleibt"
     assert k["moves"] == 192, "96 raus + 96 rein, Platz gegen Platz"
 
 
 @pytest.mark.parametrize("phase", ["P", "D"])
-def test_jede_id_ist_entweder_resident_oder_im_store(phase):
+def test_each_id_is_resident_or_in_store(phase):
     """Die Bedingung, an der #97 VIERMAL gescheitert ist -- jetzt eine
     Eigenschaft der Karte statt einer Uebereinkunft zweier Rechnungen."""
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     res = {g for ids in k["phases"][phase]["resident"] for g in ids}
-    kalt = {int(x) for x in k["phases"][phase]["slot_of"]}
-    assert not (res & kalt), "keine Id darf beides sein"
-    assert len(res | kalt) == TOTAL, "und keine darf fehlen"
+    cold_ids = {int(x) for x in k["phases"][phase]["slot_of"]}
+    assert not (res & cold_ids), "keine Id darf beides sein"
+    assert len(res | cold_ids) == TOTAL, "und keine darf fehlen"
 
 
-def test_plaetze_sind_luecken_und_kollisionsfrei():
+def test_slots_are_gap_and_collision_free():
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     for phase in ("P", "D"):
-        plaetze = sorted(int(v) for v in k["phases"][phase]["slot_of"].values())
-        assert plaetze == list(range(len(plaetze))), (
+        slots = sorted(int(v) for v in k["phases"][phase]["slot_of"].values())
+        assert slots == list(range(len(slots))), (
             f"{phase}: Plaetze muessen 0..n-1 sein, luecken- und doppelfrei")
-        assert len(plaetze) <= k["slots"]
+        assert len(slots) <= k["slots"]
 
 
-def test_die_karte_prueft_sich_selbst():
+def test_map_checks_itself():
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     assert em.refuse_if_inconsistent(k) is None
 
 
-def test_eine_kaputte_karte_wird_benannt_nicht_verschluckt():
+def test_broken_map_is_named_not_swallowed():
     """Nach dem Umbau kann #97 nur noch aus einer falschen KARTE kommen --
     dann muss sie es sagen, mit Zahl."""
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
@@ -89,18 +89,18 @@ def test_eine_kaputte_karte_wird_benannt_nicht_verschluckt():
     assert grund and "resident UND im Store" in grund
 
 
-def test_slot_of_gibt_None_fuer_residente():
+def test_slot_of_gives_none_for_residents():
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     assert em.slot_of(k, "P", 0) is None, "Id 0 haelt P auf der Karte"
     assert em.slot_of(k, "P", 511) is not None, "Id 511 liegt im Store"
 
 
-def test_phase_of_trennt_die_gruppen():
+def test_phase_of_separates_the_groups():
     assert em.phase_of("P") == "P" and em.phase_of("PP") == "P"
     assert em.phase_of("D") == "D" and em.phase_of("TP") == "D"
 
 
-def test_fraction_null_haelt_nichts_und_eins_haelt_alles():
+def test_fraction_zero_holds_nothing_one_holds_all():
     # #160: TOTAL-1, nicht TOTAL. `resident_slot_count` hat ein
     # `max(1, ...)`, und das ist keine Kosmetik -- `plan_load_time_staging`
     # rechnet bei fraction 0.0 wirklich R=1 und legt EINEN Experten auf die
@@ -120,9 +120,9 @@ def test_fraction_null_haelt_nichts_und_eins_haelt_alles():
 # Datenstruktur prueft, haette das nie gezeigt.
 # --------------------------------------------------------------------------
 
-def test_der_leser_liest_was_der_schreiber_schreibt(tmp_path):
+def test_reader_reads_what_writer_writes(tmp_path):
     import json, os
-    from sglang.srt.layers.moe import expert_store as es
+    from flliper.srt.layers.moe import expert_store as es
 
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     p = tmp_path / "expert_map.json"
@@ -132,7 +132,7 @@ def test_der_leser_liest_was_der_schreiber_schreibt(tmp_path):
     es._EXPERT_MAP_CACHE.clear()
     os.environ[es.EXPERT_MAP_ENV] = str(p)
     try:
-        gelesen = es.expert_map()
+        read_back = es.expert_map()
     finally:
         es._EXPERT_MAP_CACHE.clear()
         if alt is None:
@@ -140,16 +140,16 @@ def test_der_leser_liest_was_der_schreiber_schreibt(tmp_path):
         else:
             os.environ[es.EXPERT_MAP_ENV] = alt
 
-    assert gelesen is not None, "der Leser verwirft, was der Schreiber schreibt"
-    assert gelesen["slots"] == 324
-    assert em.slot_of(gelesen, "P", 511) == em.slot_of(k, "P", 511)
+    assert read_back is not None, "der Leser verwirft, was der Schreiber schreibt"
+    assert read_back["slots"] == 324
+    assert em.slot_of(read_back, "P", 511) == em.slot_of(k, "P", 511)
 
 
-def test_eine_widerspruechliche_karte_wird_verworfen_nicht_benutzt(tmp_path):
+def test_contradictory_map_is_discarded_not_used(tmp_path):
     """#91s Regel, hier fuer die Karte: lieber keine als eine falsche --
     eine falsche Slot-Zuordnung ist Datenverlust, kein Speicherverlust."""
     import json, os
-    from sglang.srt.layers.moe import expert_store as es
+    from flliper.srt.layers.moe import expert_store as es
 
     k = em.build(TOTAL, RATIOS, FR_PP, FR_TP)
     k["phases"]["D"]["slot_of"]["0"] = 0     # Id 0 ist bei D resident
@@ -169,9 +169,9 @@ def test_eine_widerspruechliche_karte_wird_verworfen_nicht_benutzt(tmp_path):
             os.environ[es.EXPERT_MAP_ENV] = alt
 
 
-def test_ohne_env_keine_karte():
+def test_without_env_no_map():
     import os
-    from sglang.srt.layers.moe import expert_store as es
+    from flliper.srt.layers.moe import expert_store as es
 
     alt = os.environ.pop(es.EXPERT_MAP_ENV, None)
     es._EXPERT_MAP_CACHE.clear()
@@ -182,10 +182,10 @@ def test_ohne_env_keine_karte():
             os.environ[es.EXPERT_MAP_ENV] = alt
 
 
-def test_der_schreiber_zieht_die_vektoren_aus_extra_d():
+def test_writer_takes_vectors_from_extra_d():
     """Die Karte entsteht aus denselben Flaggen, die #106 publiziert --
     nicht aus einer zweiten Quelle, die abweichen koennte."""
-    from sglang.srt.weg2.launcher import _argv_vector
+    from flliper.srt.pdflip.launcher import _argv_vector
 
     extra_d = ('--rank-moe-ratio 183,137,168 '
                '--rank-moe-resident-fraction 0.479,0.319,0.284')
@@ -198,7 +198,7 @@ def test_der_schreiber_zieht_die_vektoren_aus_extra_d():
     assert k["slots"] == 324 and k["bounds"] == [0, 192, 336]
 
 
-def test_die_karte_schaltet_die_anderen_wege_AB_nicht_nur_vor():
+def test_map_disables_other_paths_not_just_precedes():
     """fnFL2w50 (07:15Z): meine erste Fassung war ein VORSPANN, kein Zweig.
 
     Sie setzte `_index`/`_slots` aus der Karte und liess den Rest der
@@ -209,16 +209,16 @@ def test_die_karte_schaltet_die_anderen_wege_AB_nicht_nur_vor():
     """
     import inspect
 
-    from sglang.srt.layers.moe import expert_offload as eo
+    from flliper.srt.layers.moe import expert_offload as eo
 
     src = inspect.getsource(eo._expert_store_rows_for)
-    i_karte = src.index("if _karte is not None:")
+    i_card = src.index("if _karte is not None:")
     i_global = src.index("elif _global_only is not None:")
     i_ratios = src.index("elif _ratios and _fracs:")
-    assert i_karte < i_global < i_ratios, (
+    assert i_card < i_global < i_ratios, (
         "die Karte muss der ERSTE Zweig sein, und die beiden alten Wege "
         "muessen `elif` sein -- sonst rechnen sie hinter ihr weiter")
 
-    zwischen = src[i_karte:i_global]
-    assert "_global_only = None if _karte is not None" in zwischen, (
+    between = src[i_card:i_global]
+    assert "_global_only = None if _karte is not None" in between, (
         "ohne diese Zeile liest der alte Weg wieder shared_resident_ids()")

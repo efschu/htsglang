@@ -51,7 +51,7 @@ sys.path.insert(0, BATTERY)
 
 from s12_log_analyse import (  # noqa: E402  one parser, one place
     RE_DECODE,
-    decode_tick_aggregat,
+    decode_tick_aggregate,
     parse_decode,
 )
 from s12_prefill_kurve import (  # noqa: E402
@@ -175,7 +175,7 @@ class TestParseDecodeBothModes:
 
 class TestAggregationWithoutAccept:
     def test_a_spec_off_window_reports_its_rate_and_no_accept(self):
-        agg = decode_tick_aggregat(parse_decode([LINE_SPEC_OFF]), running_req=1)
+        agg = decode_tick_aggregate(parse_decode([LINE_SPEC_OFF]), running_req=1)
         assert agg["ticks"] == 1
         assert agg["ticks_gewertet"] == 1
         assert agg["ticks_with_accept"] == 0
@@ -186,7 +186,7 @@ class TestAggregationWithoutAccept:
         assert agg["ms_pro_verify"] is None
 
     def test_a_spec_on_window_is_unchanged(self):
-        agg = decode_tick_aggregat(parse_decode([LINE_SPEC_ON]), running_req=1)
+        agg = decode_tick_aggregate(parse_decode([LINE_SPEC_ON]), running_req=1)
         assert agg["ticks_with_accept"] == 1
         assert agg["accept_len_median"] == 2.83
         assert agg["ms_pro_verify"] == pytest.approx(1000.0 / 93.65 * 2.83)

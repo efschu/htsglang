@@ -30,14 +30,14 @@ plays poorly with arbitrary subprocess launchers.
 import pytest
 import torch
 
-from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+from flliper.srt.distributed.device_communicators.custom_all_reduce_utils import (
     update_environment_variables,
 )
-from sglang.srt.distributed.parallel_state import (
+from flliper.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
 
@@ -82,7 +82,7 @@ def test_dispatch_probability_matches_torch_reference():
     """The fused CUDA `dispatch_probability` and the pure-torch reference
     must produce identical outputs for the same ``random_vals``. Single-rank,
     runs on any CUDA GPU."""
-    from sglang.jit_kernel.lplb.cuda_solver import (
+    from flliper.jit_kernel.lplb.cuda_solver import (
         dispatch_probability,
         dispatch_probability_torch_reference,
     )
@@ -135,9 +135,9 @@ def test_solve_ipm_matches_torch_reference():
     convergence test (the Big-M slack must reach ~0) and both backends would
     just return the 0.5 non-convergence sentinel — agreeing trivially without
     exercising the solve. Single-rank, any CUDA GPU."""
-    from sglang.jit_kernel.lplb.cuda_solver import solve_ipm as cuda_solve_ipm
-    from sglang.jit_kernel.lplb.torch_solver import solve_ipm_torch_reference
-    from sglang.srt.eplb.lplb_solver import LPLBSolver
+    from flliper.jit_kernel.lplb.cuda_solver import solve_ipm as cuda_solve_ipm
+    from flliper.jit_kernel.lplb.torch_solver import solve_ipm_torch_reference
+    from flliper.srt.eplb.lplb_solver import LPLBSolver
 
     torch.manual_seed(0)
     device = torch.device("cuda:0")
@@ -204,7 +204,7 @@ def _worker_main(local_rank: int, world_size: int):
     # Inject minimal ServerArgs before any LPLB module reads the global state.
     # Silent fallbacks no longer exist — the fused CUDA path is the only LP
     # path, so this test relies on hard failures, not gating flags.
-    from sglang.srt.server_args import (
+    from flliper.srt.server_args import (
         ServerArgs,
         set_global_server_args_for_scheduler,
     )
@@ -236,7 +236,7 @@ def _worker_main(local_rank: int, world_size: int):
         expert_model_parallel_size=world_size,
     )
 
-    from sglang.srt.eplb.lplb_solver import clear_global_lplb_solvers
+    from flliper.srt.eplb.lplb_solver import clear_global_lplb_solvers
 
     try:
         # Clear the global solver registry between subtests so a stale solver
@@ -253,7 +253,7 @@ def _worker_main(local_rank: int, world_size: int):
         # Use parallel_state's destroy helpers rather than raw
         # `dist.destroy_process_group()` so we don't leave _WORLD/_MOE_EP/_TP
         # globals stale for later tests.
-        from sglang.srt.distributed.parallel_state import (
+        from flliper.srt.distributed.parallel_state import (
             destroy_distributed_environment,
             destroy_model_parallel,
         )
@@ -265,8 +265,8 @@ def _worker_main(local_rank: int, world_size: int):
 
 def _build_solver():
     """Construct an LPLBSolver bound to the live moe_ep_group."""
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-    from sglang.srt.eplb.lplb_solver import LPLBSolver
+    from flliper.srt.distributed.parallel_state import get_moe_ep_group
+    from flliper.srt.eplb.lplb_solver import LPLBSolver
 
     phy2log, log2phy, num_valid = _make_metadata(rebalanced=False)
     return (
@@ -388,8 +388,8 @@ def _check_post_rebalance_reinit(rank: int, world_size: int, device: torch.devic
     """Build a NEW solver with different `phy2log` (the redundant logical
     moves from expert 0 to expert 1). Same input → DIFFERENT output, since
     the LP problem changed."""
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-    from sglang.srt.eplb.lplb_solver import LPLBSolver
+    from flliper.srt.distributed.parallel_state import get_moe_ep_group
+    from flliper.srt.eplb.lplb_solver import LPLBSolver
 
     solver_old, _, _, _ = _build_solver()
     phy2log_new, log2phy_new, num_valid_new = _make_metadata(rebalanced=True)

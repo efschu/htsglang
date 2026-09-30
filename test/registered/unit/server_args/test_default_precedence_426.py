@@ -35,10 +35,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-import sglang.srt.arg_groups.speculative_hook as speculative_hook
-from sglang.srt.arg_groups.deepseek_v4_hook import apply_deepseek_v4_defaults
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.arg_groups.speculative_hook as speculative_hook
+from flliper.srt.arg_groups.deepseek_v4_hook import apply_deepseek_v4_defaults
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -59,7 +59,7 @@ def _precedence():
     resolved wrongly.
     """
     try:
-        from sglang.srt.arg_groups import default_precedence
+        from flliper.srt.arg_groups import default_precedence
     except ImportError:  # pragma: no cover - unfixed tree only
         return None
     return default_precedence

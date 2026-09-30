@@ -13,7 +13,7 @@ Runs on CPU — pure-torch advanced indexing, no Triton.
     python -m pytest test/registered/unit/mem_cache/test_page_major_layout.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -21,13 +21,13 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.layout.page_major import (
+from flliper.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     build_page_major_mha_views,
     mamba_entry_bytes,
     mha_entry_bytes,
 )
-from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
+from flliper.srt.mem_cache.memory_pool import move_kv_cache_native
 
 _DEV = "cpu"
 _DT = torch.float32

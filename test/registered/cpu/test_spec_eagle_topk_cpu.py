@@ -7,16 +7,16 @@ timeout.
 
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.kits.spec_server_kits import (
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecCorrectnessKit,
     SpecFeatureKit,
     SpecLogprobKit,
     SpecPenaltyKit,
 )
-from sglang.test.server_fixtures.spec_eagle_fixture import EagleLlama2Base
+from flliper.test.server_fixtures.spec_eagle_fixture import EagleLlama2Base
 
 # Measured 830s all-green on a 40-core GNR socket (1 launch + 14 methods).
 register_cpu_ci(est_time=850, suite="base-b-test-cpu")
@@ -29,7 +29,7 @@ class _Core(EagleLlama2Base):
     disable_overlap = True
     mem_fraction_static = 0.3
     gsm8k_num_examples = 64
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    env_overrides = ((envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 
 class TestEagleLlama2Topk4(

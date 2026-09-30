@@ -41,9 +41,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -197,9 +197,9 @@ class TestSoloVocabBroadcastSetup(CustomTestCase):
         worker._solo_hs_buf = None
 
         with patch(
-            "sglang.srt.speculative.eagle_worker_v2._solo_gather_full_vocab_rows"
+            "flliper.srt.speculative.eagle_worker_v2._solo_gather_full_vocab_rows"
         ) as gather, patch(
-            "sglang.srt.speculative.eagle_worker_v2.install_shadow_draft_runner_surface"
+            "flliper.srt.speculative.eagle_worker_v2.install_shadow_draft_runner_surface"
         ) as install:
             worker._solo_setup_vocab_broadcast()
 
@@ -218,7 +218,7 @@ class TestSoloVocabBroadcastSetup(CustomTestCase):
         worker.draft_model_runner = MagicMock()
 
         with patch(
-            "sglang.srt.speculative.eagle_worker_v2.install_shadow_draft_runner_surface"
+            "flliper.srt.speculative.eagle_worker_v2.install_shadow_draft_runner_surface"
         ) as install:
             worker._solo_setup_vocab_broadcast()
 
@@ -277,10 +277,10 @@ class TestSoloHiddenBroadcast(CustomTestCase):
         host_group = LockstepTPGroup(world_size=3, rank=SOLO_RANK)
         host = make_worker(tp_group=host_group, is_host=True)
         with patch(
-            "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+            "flliper.srt.speculative.dflash_worker_v2.get_tp_group",
             return_value=host_group,
         ), patch(
-            "sglang.srt.speculative.dflash_worker_v2.capture_safe_tp_broadcast"
+            "flliper.srt.speculative.dflash_worker_v2.capture_safe_tp_broadcast"
         ) as bcast:
             out = host._solo_broadcast_draft_hidden(6, payload)
 
@@ -294,10 +294,10 @@ class TestSoloHiddenBroadcast(CustomTestCase):
         shadow_group = LockstepTPGroup(world_size=3, rank=2)
         shadow = make_worker(tp_group=shadow_group, is_host=False)
         with patch(
-            "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+            "flliper.srt.speculative.dflash_worker_v2.get_tp_group",
             return_value=shadow_group,
         ), patch(
-            "sglang.srt.speculative.dflash_worker_v2.capture_safe_tp_broadcast"
+            "flliper.srt.speculative.dflash_worker_v2.capture_safe_tp_broadcast"
         ) as bcast:
             recv = shadow._solo_broadcast_draft_hidden(6, None)
 
@@ -312,10 +312,10 @@ class TestSoloHiddenBroadcast(CustomTestCase):
         solo_group = LockstepTPGroup(world_size=1, rank=0)
         worker = make_worker(tp_group=solo_group)
         with patch(
-            "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+            "flliper.srt.speculative.dflash_worker_v2.get_tp_group",
             return_value=solo_group,
         ), patch(
-            "sglang.srt.speculative.dflash_worker_v2.capture_safe_tp_broadcast"
+            "flliper.srt.speculative.dflash_worker_v2.capture_safe_tp_broadcast"
         ) as bcast:
             out = worker._solo_broadcast_draft_hidden(5, payload)
         bcast.assert_not_called()
@@ -325,10 +325,10 @@ class TestSoloHiddenBroadcast(CustomTestCase):
         group = LockstepTPGroup(world_size=3, rank=0)
         worker = make_worker(tp_group=group)
         with patch(
-            "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+            "flliper.srt.speculative.dflash_worker_v2.get_tp_group",
             return_value=group,
         ), patch(
-            "sglang.srt.speculative.dflash_worker_v2.capture_safe_tp_broadcast"
+            "flliper.srt.speculative.dflash_worker_v2.capture_safe_tp_broadcast"
         ) as bcast:
             worker._solo_broadcast_draft_hidden(0, payload[:0])
         bcast.assert_not_called()
@@ -350,7 +350,7 @@ class TestVocabParallelGreedyMatchesFullTable(CustomTestCase):
                 shard_w, make_shard_indices(org_start, shard_w.shape[0])
             )
             with patch(
-                "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+                "flliper.srt.speculative.dflash_worker_v2.get_tp_group",
                 return_value=group,
             ):
                 worker._greedy_sample_from_vocab_parallel_head(
@@ -374,7 +374,7 @@ class TestVocabParallelGreedyMatchesFullTable(CustomTestCase):
                 shard_w, make_shard_indices(org_start, shard_w.shape[0])
             )
             with patch(
-                "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+                "flliper.srt.speculative.dflash_worker_v2.get_tp_group",
                 return_value=group,
             ):
                 results.append(
@@ -424,7 +424,7 @@ class TestVocabParallelGreedyMatchesFullTable(CustomTestCase):
 
 class TestNextnKeepsTheGather(CustomTestCase):
     def test_dflash_no_longer_imports_the_gather_helper(self):
-        import sglang.srt.speculative.dflash_worker_v2 as mod
+        import flliper.srt.speculative.dflash_worker_v2 as mod
 
         src = open(mod.__file__).read()
         self.assertNotIn("_solo_gather_full_vocab_rows", src)
@@ -435,7 +435,7 @@ class TestNextnKeepsTheGather(CustomTestCase):
         # NEXTN/EAGLE solo applies embed + lm_head inside its CAPTURED draft
         # graph (per-step embed->decode->lm_head->argmax feedback), and its
         # shadows hold no draft body, so it cannot use the broadcast route.
-        from sglang.srt.speculative.eagle_worker_v2 import (
+        from flliper.srt.speculative.eagle_worker_v2 import (
             _solo_gather_full_vocab_rows,
         )
 

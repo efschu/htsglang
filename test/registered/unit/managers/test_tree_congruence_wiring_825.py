@@ -22,10 +22,10 @@ from typing import List
 
 import torch
 
-from sglang.srt.managers import tree_congruence as tc
-from sglang.srt.managers.phase_flip_runtime import PHASE_PP, PhaseFlipRuntime
-from sglang.srt.managers.phase_policy import PP_TO_TP, TP_TO_PP
-from sglang.srt.managers.kv_reshard import KvPoolView
+from flliper.srt.managers import tree_congruence as tc
+from flliper.srt.managers.phase_flip_runtime import PHASE_PP, PhaseFlipRuntime
+from flliper.srt.managers.phase_policy import PP_TO_TP, TP_TO_PP
+from flliper.srt.managers.kv_reshard import KvPoolView
 
 N_RANKS = 2
 VEC = (7, 9)
@@ -276,7 +276,7 @@ def test_reconcile_is_off_by_default_after_the_metal_falsification(monkeypatch):
     Detection stays on; the action must be rebuilt against the lock refs. This
     pins the default so the crash cannot come back by omission.
     """
-    monkeypatch.delenv("SGLANG_TREE_RECONCILE", raising=False)
+    monkeypatch.delenv("FLLIPER_TREE_RECONCILE", raising=False)
     rts, trees = _diverged_pair()
     for rt in rts:
         rt._reconcile_trees_if_diverged(PP_TO_TP)
@@ -287,7 +287,7 @@ def test_reconcile_is_off_by_default_after_the_metal_falsification(monkeypatch):
 
 
 def test_reconcile_fires_on_pp_to_tp_and_resets_every_rank(monkeypatch):
-    monkeypatch.setenv("SGLANG_TREE_RECONCILE", "1")
+    monkeypatch.setenv("FLLIPER_TREE_RECONCILE", "1")
     rts, trees = _diverged_pair()
     for rt in rts:
         rt._reconcile_trees_if_diverged(PP_TO_TP)
@@ -296,7 +296,7 @@ def test_reconcile_fires_on_pp_to_tp_and_resets_every_rank(monkeypatch):
 
 
 def test_reconcile_does_not_fire_on_tp_to_pp(monkeypatch):
-    monkeypatch.setenv("SGLANG_TREE_RECONCILE", "1")
+    monkeypatch.setenv("FLLIPER_TREE_RECONCILE", "1")
     """The PP phase does not require identical trees -- #791 says each PP rank
     re-derives its own verdict from its own radix state. Paying the capacity
     cost there would be a cost for nothing."""
@@ -308,7 +308,7 @@ def test_reconcile_does_not_fire_on_tp_to_pp(monkeypatch):
 
 
 def test_reconcile_never_raises_when_the_tree_cannot_be_reset(monkeypatch):
-    monkeypatch.setenv("SGLANG_TREE_RECONCILE", "1")
+    monkeypatch.setenv("FLLIPER_TREE_RECONCILE", "1")
     """This runs with requests parked between the movers and the cutover. A
     raise here takes the instance down for a cache-capacity repair."""
 

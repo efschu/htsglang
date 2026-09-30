@@ -61,7 +61,7 @@ cd "$WT" || exit 1
 # capture set, one pool state. The server-side flag is exercised by the
 # hermetic suite; the window measures.
 launch_server "$LOG" "$PIDFILE" \
-  "$VENV/bin/python" -m sglang.launch_server \
+  "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$TARGET" \
   --tokenizer-path "$TARGET_DIR" \
   --tp-size 3 --rank-gpu-id 0,1,2 \

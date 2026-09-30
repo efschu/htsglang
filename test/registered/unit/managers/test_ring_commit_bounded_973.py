@@ -21,7 +21,7 @@ WHAT IS ASSERTED HERE, on real 3-process gloo (no CUDA, no serving):
   Arm 2   healthy paired traffic completes with no timeout and the handle
           list still cleared -- zero behaviour change.
   Arm 3   the shipped code with the bound NEUTERED via the documented escape
-          hatch (``SGLANG_PP_RING_COMMIT_BUDGET_S=0``) HANGS again. That is
+          hatch (``FLLIPER_PP_RING_COMMIT_BUDGET_S=0``) HANGS again. That is
           the can-fail proof: Arm 1b passes because of the bound, not because
           of the harness.
 
@@ -49,7 +49,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=120)
 
@@ -122,8 +122,8 @@ def _build_holder(rank, out_dir):
     supplied, which is also a check that the new code does not quietly grow a
     dependency on the whole Scheduler.
     """
-    from sglang.srt.managers.phase_flip_counters import CHAN_REQ, PhaseFlipCounters
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.phase_flip_counters import CHAN_REQ, PhaseFlipCounters
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     counters = PhaseFlipCounters(
         n_ranks=WORLD,
@@ -159,14 +159,14 @@ def _worker(rank, init_file, out_dir, variant):
     res = {"rank": rank, "ok": False, "error": None, "raised": None, "elapsed": None}
     try:
         if variant == "escape_hatch":
-            os.environ["SGLANG_PP_RING_COMMIT_BUDGET_S"] = "0"
+            os.environ["FLLIPER_PP_RING_COMMIT_BUDGET_S"] = "0"
         else:
-            os.environ["SGLANG_PP_RING_COMMIT_BUDGET_S"] = str(BUDGET_S)
+            os.environ["FLLIPER_PP_RING_COMMIT_BUDGET_S"] = str(BUDGET_S)
 
         dist.init_process_group(
             "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD
         )
-        from sglang.srt.distributed.parallel_state import P2PWork
+        from flliper.srt.distributed.parallel_state import P2PWork
 
         _progress(out_dir, rank, "initialised")
 
@@ -324,7 +324,7 @@ class RingCommitBounded973(unittest.TestCase):
         # deadline passed.
         self.assertIn("downstream rank 1", msg)
         self.assertIn("has NOT taken this send off the wire", msg)
-        self.assertIn("SGLANG_PP_RING_COMMIT_BUDGET_S", msg)
+        self.assertIn("FLLIPER_PP_RING_COMMIT_BUDGET_S", msg)
         # Inside its budget, with room for process/gloo latency -- and NOT
         # instant, which would mean something other than the bound fired.
         self.assertGreaterEqual(r0["elapsed"], BUDGET_S * 0.5, f"{r0}")
@@ -363,7 +363,7 @@ class RingCommitBounded973(unittest.TestCase):
         """
         import types as _types
 
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             RingCommitTimeout,
             SchedulerPPMixin,
         )
@@ -376,7 +376,7 @@ class RingCommitBounded973(unittest.TestCase):
             def __init__(self):
                 self.work = _NeverCompletingWork()
 
-        os.environ["SGLANG_PP_RING_COMMIT_BUDGET_S"] = "1.0"
+        os.environ["FLLIPER_PP_RING_COMMIT_BUDGET_S"] = "1.0"
         try:
             holder = _types.SimpleNamespace(
                 pp_flip_counters=None, pp_rank=1, pp_size=WORLD
@@ -396,7 +396,7 @@ class RingCommitBounded973(unittest.TestCase):
                 holder._pp_commit_pending_req_work()
             elapsed = time.monotonic() - started
         finally:
-            os.environ.pop("SGLANG_PP_RING_COMMIT_BUDGET_S", None)
+            os.environ.pop("FLLIPER_PP_RING_COMMIT_BUDGET_S", None)
 
         msg = str(caught.exception)
         self.assertIn("#973 RING COMMIT TIMEOUT", msg)

@@ -46,11 +46,11 @@ import unittest
 import unittest.mock
 from types import SimpleNamespace
 
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
-from sglang.srt.managers import phase_flip_runtime as _rt
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from flliper.srt.managers import phase_flip_runtime as _rt
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 #: How much device-tier work one round of serving hands to the controller. The
 #: value is arbitrary and the model only ever compares sums of it, so nothing
@@ -403,10 +403,10 @@ class TestDeferredGrowLeavesTheNoReturnWindow(CustomTestCase):
         rt = _runtime()
         sched = SimpleNamespace(phase_flip_runtime=rt)
         with unittest.mock.patch(
-            "sglang.srt.managers.phase_flip_spill.recover_kv_backing"
+            "flliper.srt.managers.phase_flip_spill.recover_kv_backing"
         ) as whole:
             with unittest.mock.patch(
-                "sglang.srt.managers.phase_flip_spill.level_kv_backing_to_group"
+                "flliper.srt.managers.phase_flip_spill.level_kv_backing_to_group"
             ) as half:
                 _rt.seam_kv_recover(sched, lambda v: v, TP_TO_PP)
         self.assertEqual(1, whole.call_count)
@@ -423,10 +423,10 @@ class TestDeferredGrowLeavesTheNoReturnWindow(CustomTestCase):
             _rt, "seam_shrink_defer_grow_enabled", lambda: True
         ):
             with unittest.mock.patch(
-                "sglang.srt.managers.phase_flip_spill.recover_kv_backing"
+                "flliper.srt.managers.phase_flip_spill.recover_kv_backing"
             ) as whole:
                 with unittest.mock.patch(
-                    "sglang.srt.managers.phase_flip_spill.level_kv_backing_to_group",
+                    "flliper.srt.managers.phase_flip_spill.level_kv_backing_to_group",
                     return_value=2048,
                 ) as half:
                     _rt.seam_kv_recover(sched, lambda v: v, TP_TO_PP)
@@ -448,7 +448,7 @@ class TestDeferredGrowLeavesTheNoReturnWindow(CustomTestCase):
             _rt, "seam_shrink_defer_grow_enabled", lambda: True
         ):
             with unittest.mock.patch(
-                "sglang.srt.managers.phase_flip_spill.recover_kv_backing"
+                "flliper.srt.managers.phase_flip_spill.recover_kv_backing"
             ) as whole:
                 _rt.seam_kv_recover(sched, lambda v: v, TP_TO_PP)
         self.assertEqual(1, whole.call_count)
@@ -466,11 +466,11 @@ class TestDeferredGrowLeavesTheNoReturnWindow(CustomTestCase):
 
         order = []
         with unittest.mock.patch(
-            "sglang.srt.managers.phase_flip_spill.grow_kv_backing_local",
+            "flliper.srt.managers.phase_flip_spill.grow_kv_backing_local",
             side_effect=lambda s: (order.append("grow"), 2048)[1],
         ):
             with unittest.mock.patch(
-                "sglang.srt.managers.phase_flip_spill.clamp_kv_exposure_to_level",
+                "flliper.srt.managers.phase_flip_spill.clamp_kv_exposure_to_level",
                 side_effect=lambda s, lv: (order.append(("clamp", lv)), 0)[1],
             ):
                 rt._pay_deferred_grow()
@@ -492,7 +492,7 @@ class TestDeferredGrowLeavesTheNoReturnWindow(CustomTestCase):
         rt._deferred_grow_level = 2048
         rt._pending = TP_TO_PP
         with unittest.mock.patch(
-            "sglang.srt.managers.phase_flip_spill.grow_kv_backing_local"
+            "flliper.srt.managers.phase_flip_spill.grow_kv_backing_local"
         ) as grow:
             rt._pay_deferred_grow()
         self.assertEqual(0, grow.call_count)
@@ -676,11 +676,11 @@ class TestSharedPathsTolerateAHolderWithoutTheFeature(CustomTestCase):
         rt._deferred_grow_level = 2048
         rt._grow_relief = lambda: SimpleNamespace(backed_rows=lambda: 2048)
         with unittest.mock.patch(
-            "sglang.srt.managers.phase_flip_spill.grow_kv_backing_local",
+            "flliper.srt.managers.phase_flip_spill.grow_kv_backing_local",
             return_value=0,
         ):
             with unittest.mock.patch(
-                "sglang.srt.managers.phase_flip_spill.clamp_kv_exposure_to_level",
+                "flliper.srt.managers.phase_flip_spill.clamp_kv_exposure_to_level",
                 return_value=0,
             ):
                 _rt.pay_deferred_grow(rt)
@@ -714,7 +714,7 @@ class TestTheGateIsOffByDefault(CustomTestCase):
         attribution."""
         import os
 
-        env = "SGLANG_SEAM_SHRINK_PREARM_QUIESCE"
+        env = "FLLIPER_SEAM_SHRINK_PREARM_QUIESCE"
         old = os.environ.get(env)
         try:
             os.environ[env] = "1"

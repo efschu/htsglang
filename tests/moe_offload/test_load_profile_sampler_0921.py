@@ -12,7 +12,7 @@ import logging
 import threading
 import time
 
-from sglang.srt.model_loader.loader import DefaultModelLoader, _LoadSampler
+from flliper.srt.model_loader.loader import DefaultModelLoader, _LoadSampler
 
 
 class _Sink(logging.Logger):
@@ -34,7 +34,7 @@ def test_the_sampler_counts_the_thread_that_built_it():
     s.report(sink, 0.2)
     assert len(sink.lines) == 1
     line = sink.lines[0]
-    assert "WEG2 LOAD-PROFILE" in line and "samples over 0.2 s" in line
+    assert "PDFLIP LOAD-PROFILE" in line and "samples over 0.2 s" in line
     # the busy loop above lives in THIS file, so it must be the top site
     assert "test_load_profile_sampler_0921.py" in line
 
@@ -56,7 +56,7 @@ def test_report_stops_the_thread():
 
 def test_it_is_off_unless_the_env_says_on_and_never_blocks_the_load():
     src = inspect.getsource(DefaultModelLoader.load_model)
-    assert 'os.environ.get("SGLANG_LOAD_PROFILE") == "1"' in src
+    assert 'os.environ.get("FLLIPER_LOAD_PROFILE") == "1"' in src
     # both the start and the report are wrapped: a broken sampler must never
     # keep a model from loading
     assert src.count("except Exception:") == 2
@@ -95,5 +95,5 @@ def test_it_still_counts_after_the_fix():
         pass
     sink = _Sink()
     s.report(sink, 0.15)
-    assert len(sink.lines) == 1 and "WEG2 LOAD-PROFILE" in sink.lines[0]
+    assert len(sink.lines) == 1 and "PDFLIP LOAD-PROFILE" in sink.lines[0]
     assert "test_load_profile_sampler_0921.py" in sink.lines[0]

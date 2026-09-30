@@ -3,11 +3,11 @@ a #1417 prefetch pin outlives the sleep flush and is released on the dead tree.
 
 MEASURED (D.log, all three ranks identical):
 
-    23:11:26-29 #1423 INSERT-PLACED req=weg2-0-7 / -0-8 / -1-1 / -2-1
+    23:11:26-29 #1423 INSERT-PLACED req=pdflip-0-7 / -0-8 / -1-1 / -2-1
                 reg_node=59 ... deepest=60 / 62 / 63 / 64   (prefetch inserts,
                 pinned by #1417 for the held requests)
-    23:12:45    WEG2-D-PARK park_running ... queued-behind=['weg2-1-9',
-                'weg2-0-7', 'weg2-0-8', ...]; FlushCacheReqInput;
+    23:12:45    PDFLIP-D-PARK park_running ... queued-behind=['pdflip-1-9',
+                'pdflip-0-7', 'pdflip-0-8', ...]; FlushCacheReqInput;
                 #1427 ARENA-REF RESET-RELEASE ... nodes=8 skipped_in_use=5;
                 Cache flushed successfully!  (x2, the sleep's two flushes)
     23:12:47    Sanity check FAILED (2 violations across 7 nodes):
@@ -26,13 +26,13 @@ Hermetic: the #1417b fixture (real UnifiedRadixCache FULL + MAMBA on CPU,
 real insert, pin, commit, reset and sanity_check).
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 from test_prefetch_pin_host_lru_sanity_1417b import MAMBA, _metal_form
 from test_prefetch_pin_host_lru_sanity_1417b import _tree as _tree_1417b
@@ -58,8 +58,8 @@ class PrefetchPinAcrossReset(CustomTestCase):
         cache = _tree()
         _metal_form(cache)
         _flush(cache)
-        cache.pop_prefetch_loaded_tokens("weg2-16-31")
-        cache.pop_prefetch_loaded_tokens("weg2-16-38")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-31")
+        cache.pop_prefetch_loaded_tokens("pdflip-16-38")
         self.assertEqual(cache.evictable_host_leaves, set())
         cache.sanity_check()
 

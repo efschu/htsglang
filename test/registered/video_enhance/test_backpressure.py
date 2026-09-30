@@ -14,18 +14,18 @@ exercised without a device.
 import asyncio
 import unittest
 
-from sglang.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
-from sglang.srt.video_enhance.frame_math import R4K, R1080P, PixelFormat, Resolution
-from sglang.srt.video_enhance.frames import Frame, HostResidencyError, StageBase
-from sglang.srt.video_enhance.pipeline import PipelineExecutor
-from sglang.srt.video_enhance.ring import (
+from flliper.srt.video_enhance.chain import ChainRequest, StageKind, build_chain
+from flliper.srt.video_enhance.frame_math import R4K, R1080P, PixelFormat, Resolution
+from flliper.srt.video_enhance.frames import Frame, HostResidencyError, StageBase
+from flliper.srt.video_enhance.pipeline import PipelineExecutor
+from flliper.srt.video_enhance.ring import (
     BoundedRing,
     OverloadPolicy,
     RingClosed,
     ring_depths_for,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

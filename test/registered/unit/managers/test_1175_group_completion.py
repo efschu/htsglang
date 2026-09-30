@@ -34,7 +34,7 @@ loses the reports; let a relay overwrite another rank's entry.
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.pp_prefetch_completion import (
+from flliper.srt.managers.pp_prefetch_completion import (
     PENDING,
     format_group_fact,
     group_completion_enabled,
@@ -126,17 +126,17 @@ class TestTheKillSwitchShipsOn(unittest.TestCase):
     def test_default_is_on_and_zero_restores_the_old_path(self):
         import os
 
-        prior = os.environ.pop("SGLANG_PP_GROUP_COMPLETION", None)
+        prior = os.environ.pop("FLLIPER_PP_GROUP_COMPLETION", None)
         try:
             self.assertTrue(group_completion_enabled())
-            os.environ["SGLANG_PP_GROUP_COMPLETION"] = "0"
+            os.environ["FLLIPER_PP_GROUP_COMPLETION"] = "0"
             self.assertFalse(group_completion_enabled())
-            os.environ["SGLANG_PP_GROUP_COMPLETION"] = "1"
+            os.environ["FLLIPER_PP_GROUP_COMPLETION"] = "1"
             self.assertTrue(group_completion_enabled())
         finally:
-            os.environ.pop("SGLANG_PP_GROUP_COMPLETION", None)
+            os.environ.pop("FLLIPER_PP_GROUP_COMPLETION", None)
             if prior is not None:
-                os.environ["SGLANG_PP_GROUP_COMPLETION"] = prior
+                os.environ["FLLIPER_PP_GROUP_COMPLETION"] = prior
 
 
 class _FakeTree:
@@ -161,13 +161,13 @@ def _holder(rank, queue_rids, tree):
 
 class TestTheFactRidesTheRingLap(unittest.TestCase):
     def test_pp0_is_a_consumer_not_a_producer(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_prefetch_completion_own
+        from flliper.srt.managers.scheduler_pp_mixin import pp_prefetch_completion_own
 
         h = _holder(0, ["r"], _FakeTree({"r": 12288}))
         self.assertEqual(pp_prefetch_completion_own(h), ())
 
     def test_a_follower_reports_int_pending_and_omits_silence(self):
-        from sglang.srt.managers.scheduler_pp_mixin import pp_prefetch_completion_own
+        from flliper.srt.managers.scheduler_pp_mixin import pp_prefetch_completion_own
 
         tree = _FakeTree({"done": 12288}, ongoing=["running"])
         h = _holder(1, ["done", "running", "silent"], tree)
@@ -177,7 +177,7 @@ class TestTheFactRidesTheRingLap(unittest.TestCase):
         self.assertNotIn("silent", [rid for rid, _c, _r in own])
 
     def test_a_relay_unions_and_never_overwrites_another_rank(self):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_prefetch_completion_facts_from_wire,
             pp_prefetch_completion_stamp,
         )
@@ -191,7 +191,7 @@ class TestTheFactRidesTheRingLap(unittest.TestCase):
         self.assertIn(("r", 12288, 2), facts, "PP2 adds its own")
 
     def test_pp0_absorbs_and_the_table_keys_by_rid_and_rank(self):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_note_prefetch_completion,
             pp_prefetch_completion_table,
         )
@@ -206,7 +206,7 @@ class TestTheFactRidesTheRingLap(unittest.TestCase):
         self.assertEqual(table[("r", 2)], PENDING)
 
     def test_a_message_without_the_key_leaves_the_table_alone(self):
-        from sglang.srt.managers.scheduler_pp_mixin import (
+        from flliper.srt.managers.scheduler_pp_mixin import (
             pp_note_prefetch_completion,
             pp_prefetch_completion_table,
         )
@@ -225,7 +225,7 @@ class TestTheFactRidesTheRingLap(unittest.TestCase):
         # decider is waiting for.
         import inspect
 
-        from sglang.srt.managers import scheduler_pp_mixin as m
+        from flliper.srt.managers import scheduler_pp_mixin as m
 
         src = inspect.getsource(m.pp_output_payload_with_return_trip)
         self.assertIn("completion_out", src)

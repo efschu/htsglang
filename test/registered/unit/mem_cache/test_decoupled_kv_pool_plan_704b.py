@@ -13,7 +13,7 @@ Hermetic: pure arithmetic, no CUDA, no pools.
 """
 
 import pytest
-from sglang.srt.mem_cache.decoupled_kv_pool_plan import (
+from flliper.srt.mem_cache.decoupled_kv_pool_plan import (
     DECOUPLED,
     STAGE_LOCAL,
     KvPoolPlanError,
@@ -69,7 +69,7 @@ def test_armed_holds_every_attention_layer_and_only_its_token_share():
         # a whole owner block (owner.py:155-181). round(share * T) would floor
         # here, which is the off-by-one that already cost an out-of-bounds
         # scatter.
-        from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
+        from flliper.srt.layers.dcp.owner import dcp_compact_pool_rows
 
         assert p.tokens == dcp_compact_pool_rows(
             T, PERIOD, round(SHARES[rank] * PERIOD)

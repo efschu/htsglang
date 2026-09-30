@@ -7,7 +7,7 @@
 #
 # What it proves (numbers, not adjectives):
 #   1. bench_masked_kv_bound_check.py -- ns/call for the masked KV writer with
-#      the in-kernel bound check OFF (SGLANG_DISABLE_KV_MASKED_BOUND_CHECK=1,
+#      the in-kernel bound check OFF (FLLIPER_DISABLE_KV_MASKED_BOUND_CHECK=1,
 #      the tl.device_assert lowers to nothing) vs ON (default), interleaved
 #      A/B with an A-vs-A noise floor established first, 100 reps x 200 launches
 #      per point, on the Qwen3.6-27B TP=3 decode row (4 KV heads x head_dim 256).

@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=1, suite="stage-b-test-1-gpu-small-amd")
@@ -65,7 +65,7 @@ class TestBaseProcessorConfigExtraction(unittest.TestCase):
 
     def _make_processor(self, mm_process_config):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
-        from sglang.srt.multimodal.processors.base_processor import (
+        from flliper.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
 
@@ -110,7 +110,7 @@ class TestProcessMmDataKwargs(unittest.TestCase):
 
     def _make_base_processor(self, mm_process_config):
         """Create a BaseMultimodalProcessor with process_mm_data testable."""
-        from sglang.srt.multimodal.processors.base_processor import (
+        from flliper.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
 
@@ -245,7 +245,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         return proc, mock_hf_processor
 
     def test_ernie45_vl_injects_images_kwargs(self):
-        from sglang.srt.multimodal.processors.ernie45_vl import (
+        from flliper.srt.multimodal.processors.ernie45_vl import (
             Ernie4_5_VLImageProcessor,
         )
 
@@ -265,7 +265,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         )
 
     def test_midashenglm_injects_audio_kwargs(self):
-        from sglang.srt.multimodal.processors.midashenglm import (
+        from flliper.srt.multimodal.processors.midashenglm import (
             MiDashengLMMultimodalProcessor,
         )
 
@@ -283,7 +283,7 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
 
     def test_midashenglm_user_config_overrides_truncation(self):
         """User config can override the default truncation=False."""
-        from sglang.srt.multimodal.processors.midashenglm import (
+        from flliper.srt.multimodal.processors.midashenglm import (
             MiDashengLMMultimodalProcessor,
         )
 
@@ -313,7 +313,7 @@ class TestDoubleBosGuard(unittest.TestCase):
     """
 
     def test_guard_passes_add_special_tokens_false_on_bug_condition(self):
-        from sglang.srt.multimodal.processors.base_processor import (
+        from flliper.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
 

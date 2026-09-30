@@ -4,7 +4,7 @@ measured-anchor store (measured-overrides-estimate), and the calibrated
 heuristic staying inside its stated error band on real measured values.
 
 The embedded log lines are VERBATIM lines from real boots of this rig
-(/tmp/sglang_boot_*.log, /tmp/energy_boot_*.log: Qwen3.6-27B-FP8 tp=3 with
+(/tmp/flliper_boot_*.log, /tmp/energy_boot_*.log: Qwen3.6-27B-FP8 tp=3 with
 and without the 5-rung adaptive ladder, Qwen3-0.6B tp=1) -- the calibration
 data the heuristic constants were fit against.
 """
@@ -13,15 +13,15 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner import graphmem
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import graphmem
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
-# Real capture lines (verbatim) from /tmp/sglang_boot_30100.log (tp=3 decode),
-# /tmp/sglang_boot_30099.log (tp=1 prefill+decode) and
+# Real capture lines (verbatim) from /tmp/flliper_boot_30100.log (tp=3 decode),
+# /tmp/flliper_boot_30099.log (tp=1 prefill+decode) and
 # /tmp/energy_boot_31008.log (spec: verify + adaptive draft ladder).
 _REAL_DECODE_TP3 = """\
 [2026-07-21 13:35:33 TP1] Capture target decode CUDA graph end. elapsed=4.81 s, mem usage=0.27 GB, avail mem=5.34 GB.
@@ -133,7 +133,7 @@ class TestAnchorStore(CustomTestCase):
 
     def test_scan_and_lookup_roundtrip(self):
         tmp = tempfile.mkdtemp()
-        log = os.path.join(tmp, "sglang_boot_1.log")
+        log = os.path.join(tmp, "flliper_boot_1.log")
         with open(log, "w") as f:
             f.write(_SERVER_ARGS_SNIPPET + _REAL_SPEC_LADDER)
         store = self._store()
@@ -163,7 +163,7 @@ class TestAnchorStore(CustomTestCase):
         heuristic, which is the honest answer.
         """
         tmp = tempfile.mkdtemp()
-        log = os.path.join(tmp, "sglang_boot_3.log")
+        log = os.path.join(tmp, "flliper_boot_3.log")
         with open(log, "w") as f:
             f.write(_SERVER_ARGS_SNIPPET + _REAL_SPEC_LADDER)
         store = self._store()
@@ -196,7 +196,7 @@ class TestAnchorStore(CustomTestCase):
         # MEASURED numbers; changing k (draft tokens) changes the key and
         # falls back to the (ladder-aware) heuristic.
         tmp = tempfile.mkdtemp()
-        log = os.path.join(tmp, "sglang_boot_2.log")
+        log = os.path.join(tmp, "flliper_boot_2.log")
         with open(log, "w") as f:
             f.write(_SERVER_ARGS_SNIPPET + _REAL_SPEC_LADDER)
         store = self._store()
@@ -254,7 +254,7 @@ class TestHeuristic(CustomTestCase):
 
     def test_27b_tp3_decode_within_band(self):
         # Qwen3.6-27B (hidden 5120, 64 layers) tp=3, 12 decode bs entries:
-        # measured 0.24-0.27 GB per rank (sglang_boot_30100.log).
+        # measured 0.24-0.27 GB per rank (flliper_boot_30100.log).
         est = graphmem.heuristic_estimate(
             {
                 "hidden_size": 5120,
@@ -270,7 +270,7 @@ class TestHeuristic(CustomTestCase):
 
     def test_0p6b_tp1_decode_within_band(self):
         # Qwen3-0.6B (hidden 1024, 28 layers) tp=1, 6 decode bs entries:
-        # measured 0.11 GB (sglang_boot_30099.log).
+        # measured 0.11 GB (flliper_boot_30099.log).
         est = graphmem.heuristic_estimate(
             {
                 "hidden_size": 1024,

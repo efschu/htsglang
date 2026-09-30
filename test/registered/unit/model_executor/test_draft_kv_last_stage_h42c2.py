@@ -14,9 +14,9 @@ Pinned: both sides charge the draft on the last stage alone.
 import inspect
 from types import SimpleNamespace
 
-from sglang.srt.model_executor import pool_configurator as pc
-from sglang.srt.planner import pp_cut
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.model_executor import pool_configurator as pc
+from flliper.srt.planner import pp_cut
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -71,7 +71,7 @@ def test_the_planner_prices_the_draft_on_the_last_stage():
     assert [round(x) for x in base] == [1904, 816, 544]  # x160's line
     assert [round(x) for x in last] == [1904, 816, 816]  # not x155's 2176/1088/816
 
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     src = inspect.getsource(launcher)
     assert "draft_attn_layers_by_stage=[0] * (n_stages_p - 1) + [_dr]," in src

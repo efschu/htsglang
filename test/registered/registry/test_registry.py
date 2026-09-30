@@ -13,27 +13,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.registry.adapter import (
+from flliper.srt.registry.adapter import (
     AdapterError,
     EstimateError,
     register_adapter,
 )
-from sglang.srt.registry.arbiter import (
+from flliper.srt.registry.arbiter import (
     DEFAULT_PROMOTION_COST_MS,
     EngineRegistry,
     PromotionRejected,
     RegistrationRejected,
     UnknownEngineError,
 )
-from sglang.srt.registry.ledger import MIB, ReservationStore, TenantState
-from sglang.srt.registry.spec import (
+from flliper.srt.registry.ledger import MIB, ReservationStore, TenantState
+from flliper.srt.registry.spec import (
     EngineClass,
     EngineSpec,
     ResidencyState,
     ResourceProfile,
     SpecError,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -97,7 +97,7 @@ class FakeAdapter:
         }
 
     def health(self):
-        from sglang.srt.registry.adapter import Health
+        from flliper.srt.registry.adapter import Health
 
         return Health(ok=True, detail="fake")
 
@@ -549,7 +549,7 @@ class CorridorTest(RegistryTestCase):
         with self.registry.capture_lock(CARD_5090, purpose="graph capture"):
             # A second holder on the same card must not get in; a different
             # card must.
-            from sglang.srt.registry.ledger import CardBusyError
+            from flliper.srt.registry.ledger import CardBusyError
 
             with self.assertRaises(CardBusyError):
                 with self.registry.capture_lock(CARD_5090, timeout=0):
@@ -561,14 +561,14 @@ class CorridorTest(RegistryTestCase):
 class CoTenancyWithM2Test(RegistryTestCase):
     """The Class-3 video tenant of M2 and a registry engine, one ledger.
 
-    M2 wrote its reservation through ``sglang.srt.video_enhance.reservation``
+    M2 wrote its reservation through ``flliper.srt.video_enhance.reservation``
     while the registry was not yet built. That name now re-exports the
     registry's ledger, so the two see each other. If they ever stopped doing
     so, each would believe it had the whole card.
     """
 
     def test_the_m2_import_path_is_the_same_store(self):
-        from sglang.srt.video_enhance import reservation as m2
+        from flliper.srt.video_enhance import reservation as m2
 
         self.assertIs(m2.ReservationStore, ReservationStore)
 
@@ -589,7 +589,7 @@ class CoTenancyWithM2Test(RegistryTestCase):
         self.assertIn("video-enhance", str(ctx.exception))
 
     def test_the_registry_sees_the_m2_tenant_in_its_card_view(self):
-        from sglang.srt.video_enhance import reservation as m2
+        from flliper.srt.video_enhance import reservation as m2
 
         tenant = m2.ReservationStore(
             self.root,

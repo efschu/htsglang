@@ -6,14 +6,14 @@ import numpy as np
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 try:
     import cuda.bindings.driver as cuda_driver
     import cutlass  # noqa: F401
     from cutlass.cute.runtime import from_dlpack
 
-    from sglang.jit_kernel import cutedsl_gdn
+    from flliper.jit_kernel import cutedsl_gdn
 
     CUTEDSL_AVAILABLE = True
 except ImportError:
@@ -21,7 +21,7 @@ except ImportError:
     cutedsl_gdn = None
 
 try:
-    from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+    from flliper.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 

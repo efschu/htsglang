@@ -23,8 +23,8 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.io_struct import SessionHandoverReqInput
-from sglang.srt.managers.session_handover import (
+from flliper.srt.managers.io_struct import SessionHandoverReqInput
+from flliper.srt.managers.session_handover import (
     STATE_EXPORTED,
     STATE_PARKED,
     HandoverLedger,
@@ -36,9 +36,9 @@ from sglang.srt.managers.session_handover import (
     validate_manifest_completeness,
     verify_import,
 )
-from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.base_prefix_cache import MatchResult
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

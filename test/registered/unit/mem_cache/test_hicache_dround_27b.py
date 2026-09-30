@@ -8,13 +8,13 @@ beeintraechtigen". Two things sat in the path between two D rounds:
    storage queue sizes over the attention group on EVERY scheduler round -- on
    group D (TP 3) one gloo all_reduce per decode round, parked on its own waiter
    thread, lock-stepping the three schedulers, for queues that are empty through
-   a decode phase. SGLANG_HICACHE_DRAIN_AGREE_EVERY=N runs it on a rank-uniform
+   a decode phase. FLLIPER_HICACHE_DRAIN_AGREE_EVERY=N runs it on a rank-uniform
    cadence instead (every round while it drains, every N-th while it finds
    nothing).
 2. The load-back's index copies block the scheduler thread, and since upstream
    #36738 the load stream waits for the forward in flight: a request admitted
    with a store hit between two D rounds holds the thread until the running
-   decode forward is done. SGLANG_HICACHE_LOAD_ASYNC_INDEX=1 moves those index
+   decode forward is done. FLLIPER_HICACHE_LOAD_ASYNC_INDEX=1 moves those index
    tensors through pinned memory / selects them on the device.
 
 Both default OFF; what must hold: off is the unchanged path, on is rank-uniform
@@ -31,13 +31,13 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.mem_cache import unified_radix_cache as u
-from sglang.srt.mem_cache.pool_host import arena_mamba_pool as amp
-from sglang.srt.mem_cache.pool_host import arena_pool as ap
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import unified_radix_cache as u
+from flliper.srt.mem_cache.pool_host import arena_mamba_pool as amp
+from flliper.srt.mem_cache.pool_host import arena_pool as ap
+from flliper.test.test_utils import CustomTestCase
 
-_ENVS = ("SGLANG_HICACHE_DRAIN_AGREE_EVERY", "SGLANG_HICACHE_ROUND_TIMING",
-         "SGLANG_HICACHE_LOAD_ASYNC_INDEX")
+_ENVS = ("FLLIPER_HICACHE_DRAIN_AGREE_EVERY", "FLLIPER_HICACHE_ROUND_TIMING",
+         "FLLIPER_HICACHE_LOAD_ASYNC_INDEX")
 
 
 class _EnvCase(CustomTestCase):
@@ -83,7 +83,7 @@ class TheDefaultIsTheUnchangedPath(_EnvCase):
         self.assertFalse(hasattr(c, "_hc_round_acc"))
 
     def test_every_1_is_the_default(self):
-        os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = "1"
+        os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = "1"
         c = _cache()
         c.drain_storage_control_queues = mock.Mock(return_value=False)
         for _ in range(5):
@@ -92,16 +92,16 @@ class TheDefaultIsTheUnchangedPath(_EnvCase):
 
     def test_garbage_and_nonpositive_values_are_every_round(self):
         for v in ("x", "0", "-3", ""):
-            os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = v
+            os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = v
             self.assertEqual(u._hicache_drain_agree_every(), 1, v)
-        os.environ["SGLANG_HICACHE_ROUND_TIMING"] = "x"
+        os.environ["FLLIPER_HICACHE_ROUND_TIMING"] = "x"
         self.assertEqual(u._hicache_round_timing_every(), 0)
 
     def test_group_p_takes_no_collective_so_the_gate_never_engages(self):
         """TP 1 / PP 3: the drain reduces over nobody -- a gate there would only
         delay P's local drain, so P keeps draining every round even when the
         variable reaches its environment."""
-        os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = "8"
+        os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = "8"
         c = _cache(tp_world_size=1)
         self.assertFalse(c._drain_agreement_is_collective())
         c.drain_storage_control_queues = mock.Mock(return_value=False)
@@ -139,7 +139,7 @@ class TheDrainReportsWhatTheGroupAgreed(_EnvCase):
         self.assertEqual((kw["n_revoke"], kw["n_backup"], kw["n_release"]), (0, None, 0))
 
     def test_switched_off_the_backup_acks_drain_the_agreed_count(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         c = _cache()
         c.cache_controller = self._cc()
@@ -147,7 +147,7 @@ class TheDrainReportsWhatTheGroupAgreed(_EnvCase):
         c.cache_controller.ack_backup_queue.put("op2")
         c._all_reduce_attn_groups = lambda t, op, label="": None
         c._drain_storage_control_queues_impl = mock.Mock()
-        with envs.SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
+        with envs.FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
             self.assertTrue(c.drain_storage_control_queues())
         kw = c._drain_storage_control_queues_impl.call_args.kwargs
         self.assertEqual((kw["n_revoke"], kw["n_backup"], kw["n_release"]), (0, 2, 0))
@@ -159,7 +159,7 @@ class TheCadenceIsRankUniform(_EnvCase):
     all_reduce is the wedge -- and drain the same MIN."""
 
     def _run(self, every, arrivals, rounds=120):
-        os.environ["SGLANG_HICACHE_DRAIN_AGREE_EVERY"] = str(every)
+        os.environ["FLLIPER_HICACHE_DRAIN_AGREE_EVERY"] = str(every)
         ranks = [_cache() for _ in range(3)]
         pending = [0, 0, 0]
         entered = [[] for _ in range(3)]
@@ -211,7 +211,7 @@ class TheCadenceIsRankUniform(_EnvCase):
 
 class TheRoundTimerOnlyMeasures(_EnvCase):
     def test_summary_every_n_rounds_and_no_state_when_off(self):
-        os.environ["SGLANG_HICACHE_ROUND_TIMING"] = "4"
+        os.environ["FLLIPER_HICACHE_ROUND_TIMING"] = "4"
         c = _cache()
         c.drain_storage_control_queues = mock.Mock(return_value=False)
         with self.assertLogs(u.logger, level="INFO") as cm:
@@ -239,12 +239,12 @@ class TheAsyncIndexMovesTheSameRows(_EnvCase):
         dst_k = torch.zeros(8, 2)
         dp = types.SimpleNamespace(k_buffer=[dst_k], v_buffer=[torch.zeros(8, 2)])
         for flag in ("0", "1"):
-            os.environ["SGLANG_HICACHE_LOAD_ASYNC_INDEX"] = flag
+            os.environ["FLLIPER_HICACHE_LOAD_ASYNC_INDEX"] = flag
             p = ap.ArenaMHAHostPool.__new__(ap.ArenaMHAHostPool)
             p.can_use_jit = True
             p.element_dim = 2
             kern = mock.Mock()
-            with mock.patch("sglang.jit_kernel.hicache.transfer_hicache_one_layer", kern):
+            with mock.patch("flliper.jit_kernel.hicache.transfer_hicache_one_layer", kern):
                 p._transfer(dp, object(), object(), torch.tensor([4, 0, 2], dtype=torch.int32),
                             torch.tensor([1, 6, 3]), 0)
             kw = kern.call_args.kwargs
@@ -269,7 +269,7 @@ class TheAsyncIndexMovesTheSameRows(_EnvCase):
             c_ext.append(segs)
         results = {}
         for flag in ("0", "1"):
-            os.environ["SGLANG_HICACHE_LOAD_ASYNC_INDEX"] = flag
+            os.environ["FLLIPER_HICACHE_LOAD_ASYNC_INDEX"] = flag
             pool = amp.ArenaMambaPoolHost.__new__(amp.ArenaMambaPoolHost)
             pool._slot_view = blob
             pool._page_bytes = slot_bytes

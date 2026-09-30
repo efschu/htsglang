@@ -4,7 +4,7 @@ halves the payload (fn7g: 12 x 100 MB fp32 all-reduce per 8k chunk)."""
 
 import torch
 
-from sglang.srt.layers.dcp import comm
+from flliper.srt.layers.dcp import comm
 
 COUNTS = [3, 2, 1]  # uneven head shards, like --rank-tp-ratio
 
@@ -58,8 +58,8 @@ def _reference(outs, lses):
 def _run(monkeypatch, mode, dtype):
     torch.manual_seed(1)
     comm._LSE_MERGE.update({"dtype": None, "mode": None})
-    monkeypatch.setenv("SGLANG_DCP_LSE_MERGE", mode)
-    monkeypatch.setenv("SGLANG_DCP_LSE_MERGE_DTYPE", dtype)
+    monkeypatch.setenv("FLLIPER_DCP_LSE_MERGE", mode)
+    monkeypatch.setenv("FLLIPER_DCP_LSE_MERGE_DTYPE", dtype)
     monkeypatch.setattr(comm, "weightless_kv_active", lambda: False)
     bounds = [(0, 3), (3, 5), (5, 6)]
     monkeypatch.setattr(comm, "cp_local_head_bounds", lambda g, c: bounds[g.rank_in_group])
@@ -110,7 +110,7 @@ def test_bf16_wire_halves_the_payload_within_tolerance(monkeypatch):
 def test_the_backend_picks_the_merge_by_env(monkeypatch):
     import inspect
 
-    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from flliper.srt.layers.attention import qwen_sparse_attn_backend as qb
 
     src = inspect.getsource(qb.QwenSparseAttnBackend._attend_rows) if hasattr(qb, "QwenSparseAttnBackend") else open(inspect.getsourcefile(qb)).read()
     assert 'lse_merge_mode() == "a2a"' in src

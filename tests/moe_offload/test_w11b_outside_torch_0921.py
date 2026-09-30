@@ -10,7 +10,7 @@ Posten, nicht als weitere Toleranz.
 
 import re
 
-from sglang.srt.weg2 import launcher as L
+from flliper.srt.pdflip import launcher as L
 
 
 def _line(**kw):
@@ -21,7 +21,7 @@ def _line(**kw):
     )
     base.update(kw)
     return (
-        "[2026-09-21 13:41:36 PP2] WEG2 DRAFT-KV-PRODUCER armed stage=3/3 "
+        "[2026-09-21 13:41:36 PP2] PDFLIP DRAFT-KV-PRODUCER armed stage=3/3 "
         "drafter=abc layout=v1 heads=2 head_dim=128 page_bytes=32768 "
         "embed=resident mtp_mib=1.0 embed_mib=2.0 "
         + " ".join(f"{k}={v}" for k, v in base.items())
@@ -86,7 +86,7 @@ def test_the_arithmetic_of_v86_v89():
 def test_the_emitter_prints_both():
     import inspect
 
-    from sglang.srt.managers import scheduler as S
+    from flliper.srt.managers import scheduler as S
 
     src = inspect.getsource(S.Scheduler)
     assert "outside_torch_mib=%.1f default_pool_inactive_mib=%.1f" in src
@@ -97,13 +97,13 @@ def test_the_emitter_prints_both():
 def test_the_producer_measures_before_and_after():
     import inspect
 
-    from sglang.srt.speculative import draft_kv_producer as P
+    from flliper.srt.speculative import draft_kv_producer as P
 
     src = inspect.getsource(P)
     assert "def _outside_torch_mib()" in src
     assert "def _default_pool_inactive_mib()" in src
     # der Import, der die Messung in v89 auf -1 fallen liess, ist weg
-    assert "from sglang.srt.utils import get_device_id" not in src
+    assert "from flliper.srt.utils import get_device_id" not in src
     assert "self._outside_before_mib = _outside_torch_mib()" in src
     assert "self.outside_torch_mib = (" in src
     # ein Instrument faellt nie einen Boot
@@ -140,7 +140,7 @@ def test_other_live_closes_the_v91_gap():
 def test_the_producer_measures_live_allocated_without_empty_cache():
     import inspect
 
-    from sglang.srt.speculative import draft_kv_producer as P
+    from flliper.srt.speculative import draft_kv_producer as P
 
     src = inspect.getsource(P)
     assert "def _live_allocated_mib()" in src
@@ -170,4 +170,4 @@ def test_the_gate_reports_instead_of_refusing_only_with_room():
     # v91 gemessen: 2294 frei gegen 533,7 unerklaert = das 4,3-fache
     assert 2294.0 >= L.W11B_FREE_OVER_UNACCOUNTED * 533.7 or True
     # und bei engem Rand verweigert es weiter
-    assert "raise Weg2LaunchRefused" in src
+    assert "raise PdFlipLaunchRefused" in src

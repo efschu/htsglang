@@ -32,8 +32,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from sglang.srt.layers.moe import cold_tier_shm as cts  # noqa: E402
-from sglang.srt.layers.moe.cold_tier_shm import (  # noqa: E402
+from flliper.srt.layers.moe import cold_tier_shm as cts  # noqa: E402
+from flliper.srt.layers.moe.cold_tier_shm import (  # noqa: E402
     HEADER_BYTES,
     ColdTierError,
     ColdTierLayout,
@@ -56,7 +56,7 @@ INSTANCE = "inst0001"
 
 @pytest.fixture(autouse=True)
 def _shm(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_MOE_COLD_TIER_SHM_DIR", str(tmp_path))
+    monkeypatch.setenv("FLLIPER_MOE_COLD_TIER_SHM_DIR", str(tmp_path))
     detach_all()
     yield tmp_path
     detach_all()

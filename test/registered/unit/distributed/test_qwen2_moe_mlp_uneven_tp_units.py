@@ -38,16 +38,16 @@ Pure functions, no GPU, no server.
 import math
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     ACTIVATION_VEC_ELEMS,
     assert_activation_aligned_shards,
     partition_units,
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.srt.layers.linear import _quant_block_aligned_units
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.linear import _quant_block_aligned_units
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -72,7 +72,7 @@ class _FakeGGUFConfig:
 
 
 def _qwen2_moe_mlp_units(intermediate: int, quant_config=None) -> int:
-    """Mirrors the derivation in sglang.srt.models.qwen2_moe.Qwen2MoeMLP."""
+    """Mirrors the derivation in flliper.srt.models.qwen2_moe.Qwen2MoeMLP."""
     units = intermediate // math.gcd(intermediate, 16)
     return _quant_block_aligned_units(intermediate, units, quant_config, 1)
 

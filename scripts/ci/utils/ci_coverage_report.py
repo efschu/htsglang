@@ -17,11 +17,11 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Add the ci_register module path directly to avoid heavy sglang imports
+# Add the ci_register module path directly to avoid heavy flliper imports
 sys.path.insert(
     0,
     str(
-        Path(__file__).parent.parent.parent.parent / "python" / "sglang" / "test" / "ci"
+        Path(__file__).parent.parent.parent.parent / "python" / "flliper" / "test" / "ci"
     ),
 )
 
@@ -41,7 +41,7 @@ assert set(BACKEND_DISPLAY_ORDER) == {
 # --------------------------------------------------------------------------- #
 # multimodal_gen test coverage
 #
-# multimodal_gen tests live under python/sglang/multimodal_gen/test/ and use
+# multimodal_gen tests live under python/flliper/multimodal_gen/test/ and use
 # their own run_suite.py / partitioning framework, NOT the register_*_ci()
 # registry used under test/registered/. To surface them in the daily
 # overview we synthesize CIRegistry records from file paths + filename
@@ -50,7 +50,7 @@ assert set(BACKEND_DISPLAY_ORDER) == {
 # gen.yml) currently invoke each file -- they MAY drift if a workflow
 # stops/starts running a directory.
 # --------------------------------------------------------------------------- #
-MULTIMODAL_GEN_TEST_DIR = "python/sglang/multimodal_gen/test"
+MULTIMODAL_GEN_TEST_DIR = "python/flliper/multimodal_gen/test"
 
 # Subdirectory (relative to MULTIMODAL_GEN_TEST_DIR) -> backends those files
 # run on by default. Empty string is the top-level. Files whose tokenized

@@ -59,12 +59,12 @@ AUFRUF
 ------
 ::
 
-    SGLANG_BARLINK=1 SGLANG_BARLINK_TRANSPORT=bar1 \\
+    FLLIPER_BARLINK=1 FLLIPER_BARLINK_TRANSPORT=bar1 \\
     torchrun --nproc_per_node=3 benchmark/bench_moe_dispatch.py \\
         --hidden 4096 --experts 24 --topk 8 \\
         --tokens 128,512,2048 --verteilung gleich,schief
 
-``SGLANG_BARLINK`` und ``SGLANG_BARLINK_TRANSPORT`` muessen **vor** dem Aufbau
+``FLLIPER_BARLINK`` und ``FLLIPER_BARLINK_TRANSPORT`` muessen **vor** dem Aufbau
 der Prozessgruppe stehen -- der ``GroupCoordinator`` liest sie dort. Das
 Programm prueft das und bricht mit Grund ab, statt eine gloo-Ebene zu messen
 und sie ``bar1ep`` zu nennen.
@@ -89,20 +89,20 @@ import torch.distributed as dist
 # ---------------------------------------------------------------------------
 
 
-def _env_int(name: str, vorgabe: int) -> int:
-    return int(os.environ.get(name, str(vorgabe)))
+def _env_int(name: str, fallback: int) -> int:
+    return int(os.environ.get(name, str(fallback)))
 
 
-def baue_umgebung(tp_size: int, rank: int, local_rank: int):
+def build_env(tp_size: int, rank: int, local_rank: int):
     """Verteilte Umgebung und TP-Gruppe, wie der Scheduler sie baut."""
-    from sglang.srt.distributed import parallel_state
+    from flliper.srt.distributed import parallel_state
 
     torch.cuda.set_device(local_rank)
     parallel_state.init_distributed_environment(
         world_size=tp_size,
         rank=rank,
         distributed_init_method=os.environ.get(
-            "SGLANG_BENCH_INIT", "env://"
+            "FLLIPER_BENCH_INIT", "env://"
         ),
         local_rank=local_rank,
         backend="nccl",
@@ -116,15 +116,15 @@ def baue_umgebung(tp_size: int, rank: int, local_rank: int):
     return parallel_state.get_tp_group()
 
 
-def setze_moe_flaggen(a2a: str) -> None:
+def set_moe_flags(a2a: str) -> None:
     """Genau die Felder, die ``initialize_moe_config`` setzt -- ohne ServerArgs.
 
     ``initialize_moe_config`` braucht ein vollstaendiges ``ServerArgs`` (also
     einen Modellpfad); hier wird nur der MoE-Teil gebraucht. Die Felder sind
     aus ``layers/moe/utils.py:initialize_moe_config`` uebernommen.
     """
-    from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend, MoeRunnerBackend
-    from sglang.srt.runtime_context import get_flags
+    from flliper.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend, MoeRunnerBackend
+    from flliper.srt.runtime_context import get_flags
 
     moe = get_flags().moe
     moe.a2a_backend = MoeA2ABackend(a2a)
@@ -145,7 +145,7 @@ def setze_moe_flaggen(a2a: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _torch_referenz_klasse():
+def _torch_reference_class():
     """``Bar1EPDispatcher`` mit ``torch.distributed`` statt BAR1.
 
     Nur ``_a2a_zeilen`` ist ersetzt, und der Konstruktor laesst die
@@ -154,26 +154,26 @@ def _torch_referenz_klasse():
     Rueckwegs -- ist Zeile fuer Zeile dieselbe. Der Unterschied in der
     Messung ist damit genau der Weg der Bytes.
     """
-    from sglang.srt.layers.moe.token_dispatcher.bar1ep import Bar1EPDispatcher
+    from flliper.srt.layers.moe.token_dispatcher.bar1ep import Bar1EPDispatcher
 
     class TorchRefDispatcher(Bar1EPDispatcher):
-        def __init__(self, gruppe, **kw):
+        def __init__(self, proc_group, **kw):
             # Absichtlich NICHT super().__init__: der Elternkonstruktor
             # verlangt den BAR1-Transport und laeuft seinen Byte-Beleg. Beides
             # gehoert nicht zu einer torch-Referenz.
-            from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
-            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            from flliper.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+            from flliper.srt.layers.moe.token_dispatcher.deepep import (
                 DeepEPPDispatchHooks,
             )
 
             BaseDispatcher.__init__(self)
-            self.gruppe = gruppe
+            self.proc_group = proc_group
             self.comm = None
             self.transport = None
-            self.device_group = gruppe.device_group
-            self.cpu_group = gruppe.cpu_group
-            self.welt = dist.get_world_size(gruppe.cpu_group)
-            self.rank = dist.get_rank(gruppe.cpu_group)
+            self.device_group = proc_group.device_group
+            self.cpu_group = proc_group.cpu_group
+            self.welt = dist.get_world_size(proc_group.cpu_group)
+            self.rank = dist.get_rank(proc_group.cpu_group)
             self.router_topk = int(kw["router_topk"])
             self.num_experts = int(kw["num_experts"])
             self.num_local_experts = int(kw["num_local_experts"])
@@ -188,31 +188,31 @@ def _torch_referenz_klasse():
             # es hier auch keine Runden. Das ist kein Vorteil, den man
             # wegrechnen muesste -- es ist der Unterschied zwischen einem
             # Fenster und keinem.
-            self._schlitz = 1 << 62
-            self._sende_zeilen = []
-            self._empf_zeilen = []
-            self._sende_index = None
-            self._token_zahl = 0
-            self._max_zeilen = 0
-            self._ausgabe_dtype = self.params_dtype
-            self._dispatch_zwischenstand = None
-            self._combine_zwischenstand = None
+            self._slot = 1 << 62
+            self._send_rows = []
+            self._recv_rows = []
+            self._send_index = None
+            self._token_number = 0
+            self._max_rows = 0
+            self._output_dtype = self.params_dtype
+            self._dispatch_interim = None
+            self._combine_interim = None
             self._bar1_dispatch_hooks = DeepEPPDispatchHooks()
-            self._setze_ausgabetyp()
+            self._set_ausgabetyp()
 
-        def _pruefe_fenster(self) -> None:
+        def _check_window(self) -> None:
             return
 
-        def _selbsttest_wenn_noetig(self) -> None:
+        def _selftest_if_needed(self) -> None:
             return
 
-        def _a2a_zeilen(self, aus, ein, sende_zeilen, empf_zeilen, zeilenbytes,
-                        max_zeilen, zeilen_pro_runde=None):
+        def _a2a_rows(self, aus, ein, send_rows, recv_rows, zeilenbytes,
+                        max_rows, rows_per_round=None):
             dist.all_to_all_single(
                 aus,
                 ein,
-                output_split_sizes=[int(n) for n in empf_zeilen],
-                input_split_sizes=[int(n) for n in sende_zeilen],
+                output_split_sizes=[int(n) for n in recv_rows],
+                input_split_sizes=[int(n) for n in send_rows],
                 group=self.device_group,
             )
             return aus
@@ -220,9 +220,9 @@ def _torch_referenz_klasse():
     return TorchRefDispatcher
 
 
-def baue_varianten(args, gruppe, welt: int) -> Tuple[Dict[str, object], List[str]]:
+def build_variants(args, proc_group, welt: int) -> Tuple[Dict[str, object], List[str]]:
     """Die lebenden Varianten und die Gruende der toten."""
-    lebend: Dict[str, object] = {}
+    alive: Dict[str, object] = {}
     tot: List[str] = []
 
     kw = dict(
@@ -239,18 +239,18 @@ def baue_varianten(args, gruppe, welt: int) -> Tuple[Dict[str, object], List[str
     # -- bar1ep
     if "bar1ep" in args.varianten:
         try:
-            from sglang.srt.layers.moe.token_dispatcher.bar1ep import (
+            from flliper.srt.layers.moe.token_dispatcher.bar1ep import (
                 Bar1EPDispatcher,
-                bar1ep_verfuegbar,
+                bar1ep_available,
             )
-            from sglang.srt.layers.moe.utils import DeepEPMode
+            from flliper.srt.layers.moe.utils import DeepEPMode
 
-            ok, grund = bar1ep_verfuegbar(gruppe)
+            ok, grund = bar1ep_available(proc_group)
             if not ok:
                 tot.append(f"bar1ep: {grund}")
             else:
-                lebend["bar1ep"] = Bar1EPDispatcher(
-                    group=gruppe.device_group,
+                alive["bar1ep"] = Bar1EPDispatcher(
+                    group=proc_group.device_group,
                     deepep_mode=DeepEPMode.NORMAL,
                     **kw,
                 )
@@ -260,7 +260,7 @@ def baue_varianten(args, gruppe, welt: int) -> Tuple[Dict[str, object], List[str
     # -- torch
     if "torch" in args.varianten:
         try:
-            lebend["torch"] = _torch_referenz_klasse()(gruppe, **kw)
+            alive["torch"] = _torch_reference_class()(proc_group, **kw)
         except Exception as e:  # noqa: BLE001
             tot.append(f"torch: {type(e).__name__}: {e}")
 
@@ -274,20 +274,20 @@ def baue_varianten(args, gruppe, welt: int) -> Tuple[Dict[str, object], List[str
             )
         else:
             try:
-                from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                from flliper.srt.layers.moe.token_dispatcher.deepep import (
                     DeepEPDispatcher,
                 )
-                from sglang.srt.layers.moe.utils import DeepEPMode
+                from flliper.srt.layers.moe.utils import DeepEPMode
 
-                lebend["deepep"] = DeepEPDispatcher(
-                    group=gruppe.device_group,
+                alive["deepep"] = DeepEPDispatcher(
+                    group=proc_group.device_group,
                     deepep_mode=DeepEPMode.NORMAL,
                     **kw,
                 )
             except Exception as e:  # noqa: BLE001
                 tot.append(f"deepep: {type(e).__name__}: {e}")
 
-    return lebend, tot
+    return alive, tot
 
 
 # ---------------------------------------------------------------------------
@@ -308,8 +308,8 @@ class _TopK:
         self.topk_weights = topk_weights
 
 
-def baue_last(tokens: int, hidden: int, experts: int, topk: int,
-              verteilung: str, rank: int, geraet, keim: int):
+def build_last(tokens: int, hidden: int, experts: int, topk: int,
+              verteilung: str, rank: int, dev, keim: int):
     """Eine Last, die aussieht wie eine echte.
 
     ``gleich``: jeder Experte gleich wahrscheinlich -- der freundliche Fall,
@@ -323,40 +323,40 @@ def baue_last(tokens: int, hidden: int, experts: int, topk: int,
     """
     g = torch.Generator(device="cpu").manual_seed(keim + 1000 * rank)
     if verteilung == "gleich":
-        gewicht = torch.ones(experts, dtype=torch.float32)
+        weight = torch.ones(experts, dtype=torch.float32)
     elif verteilung == "schief":
         # Zipf(1.0) auf einer je Rang verschobenen Expertenreihenfolge --
         # sonst waeren die heissen Experten auf allen Raengen dieselben und
         # die Schieflage traefe genau einen Zielrang statt einer Verteilung.
-        rang_ordnung = torch.randperm(experts, generator=g)
+        rang_order = torch.randperm(experts, generator=g)
         w = 1.0 / (torch.arange(experts, dtype=torch.float32) + 1.0)
-        gewicht = torch.empty(experts, dtype=torch.float32)
-        gewicht[rang_ordnung] = w
+        weight = torch.empty(experts, dtype=torch.float32)
+        weight[rang_order] = w
     else:
         raise ValueError(f"unbekannte Verteilung {verteilung!r}")
 
     if tokens == 0:
-        ids = torch.zeros((0, topk), dtype=torch.int64, device=geraet)
-        gew = torch.zeros((0, topk), dtype=torch.float32, device=geraet)
+        ids = torch.zeros((0, topk), dtype=torch.int64, device=dev)
+        gew = torch.zeros((0, topk), dtype=torch.float32, device=dev)
     else:
         ids = torch.multinomial(
-            gewicht.expand(tokens, experts).contiguous(),
+            weight.expand(tokens, experts).contiguous(),
             topk,
             replacement=False,
             generator=g,
-        ).to(geraet)
-        gew = torch.rand((tokens, topk), generator=g).to(geraet, torch.float32)
+        ).to(dev)
+        gew = torch.rand((tokens, topk), generator=g).to(dev, torch.float32)
         gew = gew / gew.sum(dim=1, keepdim=True)
 
     x = (
         torch.randn((tokens, hidden), generator=g, dtype=torch.float32)
-        .to(geraet)
+        .to(dev)
         .to(torch.bfloat16)
     )
     return x, _TopK(ids, gew)
 
 
-def erwartetes_ergebnis(x, topk_ids, num_local_experts, use_fp8):
+def expected_result(x, topk_ids, num_local_experts, use_fp8):
     """Die geschlossene Sollform von ``combine(dispatch(x))`` mit Identitaet.
 
     Ordnungsunabhaengig: sie sagt nichts darueber, in welcher Reihenfolge
@@ -364,12 +364,12 @@ def erwartetes_ergebnis(x, topk_ids, num_local_experts, use_fp8):
     jede Bibliothek dieselbe Probe.
     """
     if use_fp8:
-        from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
+        from flliper.srt.layers import deep_gemm_wrapper
+        from flliper.srt.layers.quantization.fp8_kernel import (
+            flliper_per_token_group_quant_fp8,
         )
 
-        xq, _ = sglang_per_token_group_quant_fp8(
+        xq, _ = flliper_per_token_group_quant_fp8(
             x.contiguous(),
             128,
             column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
@@ -379,30 +379,30 @@ def erwartetes_ergebnis(x, topk_ids, num_local_experts, use_fp8):
         basis = xq.to(torch.bfloat16)
     else:
         basis = x
-    ziel = torch.div(topk_ids, num_local_experts, rounding_mode="floor")
-    ziel = torch.where(topk_ids >= 0, ziel, torch.full_like(ziel, -1))
+    target = torch.div(topk_ids, num_local_experts, rounding_mode="floor")
+    target = torch.where(topk_ids >= 0, target, torch.full_like(target, -1))
     n = torch.zeros(
         (topk_ids.shape[0], 1), dtype=torch.float32, device=x.device
     )
-    for k in range(ziel.shape[1]):
-        neu = ziel[:, k : k + 1]
-        schon = torch.zeros_like(neu, dtype=torch.bool)
+    for k in range(target.shape[1]):
+        neu = target[:, k : k + 1]
+        already = torch.zeros_like(neu, dtype=torch.bool)
         for j in range(k):
-            schon |= ziel[:, j : j + 1] == neu
-        n += ((neu >= 0) & ~schon).to(torch.float32)
+            already |= target[:, j : j + 1] == neu
+        n += ((neu >= 0) & ~already).to(torch.float32)
     return (basis.to(torch.float32) * n).to(torch.bfloat16)
 
 
-def eine_runde(d, x, topk, ereignisse) -> Tuple[torch.Tensor, float, float]:
+def one_round(d, x, topk, events) -> Tuple[torch.Tensor, float, float]:
     """Ein Dispatch, ein Identitaets-"Experte", ein Combine. Getrennt gestoppt."""
-    e0, e1, e2 = ereignisse
+    e0, e1, e2 = events
     e0.record()
     aus = d.dispatch(hidden_states=x, topk_output=topk)
     e1.record()
     y = aus.hidden_states
     if y.dtype == torch.float8_e4m3fn:
         y = y.to(torch.bfloat16)
-    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+    from flliper.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPNormalCombineInput,
     )
 
@@ -419,67 +419,67 @@ def eine_runde(d, x, topk, ereignisse) -> Tuple[torch.Tensor, float, float]:
 # ---------------------------------------------------------------------------
 
 
-def messe(args, lebend, gruppe, welt, rank, geraet):
-    ereignisse = tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
-    ergebnisse = []
+def messe(args, alive, proc_group, welt, rank, dev):
+    events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(3))
+    results = []
     nle = args.experts // welt
 
     for verteilung in args.verteilung:
         for tokens in args.tokens:
-            x, topk = baue_last(
+            x, topk = build_last(
                 tokens, args.hidden, args.experts, args.topk, verteilung,
-                rank, geraet, args.keim,
+                rank, dev, args.keim,
             )
-            namen = list(lebend.keys())
-            soll = {}
-            for name, d in lebend.items():
-                soll[name] = erwartetes_ergebnis(
+            names = list(alive.keys())
+            want = {}
+            for name, d in alive.items():
+                want[name] = expected_result(
                     x, topk.topk_ids, nle, getattr(d, "use_fp8", False)
                 )
 
             # -- Vorlauf: mindestens drei Sekunden JE VARIANTE, nicht eine
             #    feste Rundenzahl. Die JIT-Uebersetzung faellt sonst in die
             #    Messung.
-            for name, d in lebend.items():
+            for name, d in alive.items():
                 t0 = time.perf_counter()
                 runden = 0
                 while time.perf_counter() - t0 < args.vorlauf or runden < 3:
-                    eine_runde(d, x, topk, ereignisse)
+                    one_round(d, x, topk, events)
                     runden += 1
                 # Ueber die CPU-Gruppe, nicht ueber die Vorgabegruppe: bei
                 # aktivem barlink ist die Vorgabegruppe NCCL, und auf einer
                 # Gruppe ueber zwei Hersteller ist das kein langsamerer Weg,
                 # sondern ein Haenger.
-                dist.barrier(group=gruppe.cpu_group)
+                dist.barrier(group=proc_group.cpu_group)
 
             # -- Messung, verschraenkt.
-            zeiten = {n: [] for n in namen}
-            fehler = {n: 0 for n in namen}
-            abweichung = {n: 0.0 for n in namen}
+            times = {n: [] for n in names}
+            errors = {n: 0 for n in names}
+            deviation = {n: 0.0 for n in names}
             for _ in range(args.runden):
-                for name in namen:
-                    z, td, tc = eine_runde(lebend[name], x, topk, ereignisse)
+                for name in names:
+                    z, td, tc = one_round(alive[name], x, topk, events)
                     # KORREKTHEIT IN JEDER RUNDE -- nicht einmal am Anfang.
                     d_abs = (
-                        (z.to(torch.float32) - soll[name].to(torch.float32))
+                        (z.to(torch.float32) - want[name].to(torch.float32))
                         .abs()
                         .max()
                         .item()
                         if z.numel()
                         else 0.0
                     )
-                    abweichung[name] = max(abweichung[name], d_abs)
+                    deviation[name] = max(deviation[name], d_abs)
                     if d_abs > args.schranke:
-                        fehler[name] += 1
-                    zeiten[name].append((td, tc))
-                dist.barrier(group=gruppe.cpu_group)
+                        errors[name] += 1
+                    times[name].append((td, tc))
+                dist.barrier(group=proc_group.cpu_group)
 
-            for name in namen:
-                paare = zeiten[name]
-                ds = sorted(t[0] for t in paare)
-                cs = sorted(t[1] for t in paare)
+            for name in names:
+                pairs = times[name]
+                ds = sorted(t[0] for t in pairs)
+                cs = sorted(t[1] for t in pairs)
                 m = len(ds) // 2
-                ergebnisse.append(
+                results.append(
                     dict(
                         variante=name,
                         verteilung=verteilung,
@@ -490,14 +490,14 @@ def messe(args, lebend, gruppe, welt, rank, geraet):
                         dispatch_ms_min=ds[0],
                         combine_ms_min=cs[0],
                         runden=len(ds),
-                        fehlrunden=fehler[name],
-                        max_abweichung=abweichung[name],
+                        fehlrunden=errors[name],
+                        max_abweichung=deviation[name],
                     )
                 )
-    return ergebnisse
+    return results
 
 
-def berichte(ergebnisse, tot, args, rank):
+def reports(results, tot, args, rank):
     if rank != 0:
         return
     print()
@@ -513,25 +513,25 @@ def berichte(ergebnisse, tot, args, rank):
         for grund in tot:
             print(f"  - {grund}")
         print()
-    if not ergebnisse:
+    if not results:
         print("Keine lebende Variante. Es gibt nichts zu berichten.")
         return
-    kopf = (
+    header = (
         f"{'Variante':<10}{'Verteilung':<12}{'Token':>7}"
         f"{'Dispatch ms':>13}{'Combine ms':>12}{'Summe ms':>11}"
         f"{'Fehlrunden':>12}{'max|d|':>10}"
     )
-    print(kopf)
-    print("-" * len(kopf))
-    for e in ergebnisse:
+    print(header)
+    print("-" * len(header))
+    for e in results:
         print(
             f"{e['variante']:<10}{e['verteilung']:<12}{e['tokens']:>7}"
             f"{e['dispatch_ms_median']:>13.4f}{e['combine_ms_median']:>12.4f}"
             f"{e['summe_ms_median']:>11.4f}{e['fehlrunden']:>12d}"
             f"{e['max_abweichung']:>10.4g}"
         )
-    schlecht = [e for e in ergebnisse if e["fehlrunden"]]
-    if schlecht:
+    bad = [e for e in results if e["fehlrunden"]]
+    if bad:
         print()
         print(
             "ACHTUNG: Zeilen mit Fehlrunden sind KEINE Messwerte -- in diesen "
@@ -540,7 +540,7 @@ def berichte(ergebnisse, tot, args, rank):
         )
     if args.json:
         with open(args.json, "w") as f:
-            json.dump({"ergebnisse": ergebnisse, "tot": tot}, f, indent=2)
+            json.dump({"ergebnisse": results, "tot": tot}, f, indent=2)
         print(f"\nJSON: {args.json}")
 
 
@@ -598,49 +598,49 @@ def main() -> int:
     # Diese beiden liest der GroupCoordinator beim Aufbau. Sie hier zu setzen
     # waere zu spaet -- also wird nur geprueft und mit Grund abgebrochen.
     if "bar1ep" in args.varianten:
-        if os.environ.get("SGLANG_BARLINK", "0") in ("0", "false", ""):
+        if os.environ.get("FLLIPER_BARLINK", "0") in ("0", "false", ""):
             print(
-                "SGLANG_BARLINK ist nicht gesetzt. Ohne barlink gibt es keinen "
+                "FLLIPER_BARLINK ist nicht gesetzt. Ohne barlink gibt es keinen "
                 "BAR1-Transport, und was dann liefe, waere die gloo-Ebene "
                 "unter dem Namen bar1ep. Abbruch."
             )
             return 2
-        if os.environ.get("SGLANG_BARLINK_TRANSPORT", "device") not in (
+        if os.environ.get("FLLIPER_BARLINK_TRANSPORT", "device") not in (
             "bar1", "matrix"
         ):
             print(
-                f"SGLANG_BARLINK_TRANSPORT="
-                f"{os.environ.get('SGLANG_BARLINK_TRANSPORT')!r} ist kein "
+                f"FLLIPER_BARLINK_TRANSPORT="
+                f"{os.environ.get('FLLIPER_BARLINK_TRANSPORT')!r} ist kein "
                 f"Direktpfad. bar1ep braucht 'bar1' oder 'matrix'. Abbruch."
             )
             return 2
 
-    gruppe = baue_umgebung(welt, rank, local_rank)
-    setze_moe_flaggen("bar1ep" if "bar1ep" in args.varianten else "deepep")
-    geraet = torch.device("cuda", local_rank)
+    proc_group = build_env(welt, rank, local_rank)
+    set_moe_flags("bar1ep" if "bar1ep" in args.varianten else "deepep")
+    dev = torch.device("cuda", local_rank)
 
-    lebend, tot = baue_varianten(args, gruppe, welt)
+    alive, tot = build_variants(args, proc_group, welt)
     # Tote Varianten muessen auf ALLEN Raengen dieselben sein -- sonst misst
     # ein Rang etwas, in das der andere nicht hineinlaeuft, und das Ergebnis
     # ist ein Haenger. Also einmal abgleichen, bevor irgendetwas laeuft.
-    traeger: list = [None] * welt
-    dist.all_gather_object(traeger, sorted(lebend.keys()), group=gruppe.cpu_group)
-    gemeinsam = set(traeger[0])
-    for t in traeger[1:]:
-        gemeinsam &= set(t)
-    for name in list(lebend.keys()):
-        if name not in gemeinsam:
+    carrier: list = [None] * welt
+    dist.all_gather_object(carrier, sorted(alive.keys()), group=proc_group.cpu_group)
+    common_ids = set(carrier[0])
+    for t in carrier[1:]:
+        common_ids &= set(t)
+    for name in list(alive.keys()):
+        if name not in common_ids:
             tot.append(
                 f"{name}: nicht auf allen Raengen verfuegbar "
-                f"({[i for i, t in enumerate(traeger) if name not in t]}). "
+                f"({[i for i, t in enumerate(carrier) if name not in t]}). "
                 f"Eine Variante, die nur ein Teil der Gruppe fahren kann, ist "
                 f"keine Variante, sondern ein Haenger."
             )
-            del lebend[name]
+            del alive[name]
 
-    ergebnisse = messe(args, lebend, gruppe, welt, rank, geraet) if lebend else []
-    berichte(ergebnisse, tot, args, rank)
-    dist.barrier(group=gruppe.cpu_group)
+    results = messe(args, alive, proc_group, welt, rank, dev) if alive else []
+    reports(results, tot, args, rank)
+    dist.barrier(group=proc_group.cpu_group)
     return 0
 
 

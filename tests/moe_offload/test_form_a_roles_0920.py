@@ -28,7 +28,7 @@ layers into a boot:
 
 import pytest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     set_tp_partition_ratios,
     scoped_tp_partition_ratios,
@@ -36,7 +36,7 @@ from sglang.srt.distributed.utils import (
     tp_partition_size,
     tp_partition_sizes,
 )
-from sglang.srt.rank_role import (
+from flliper.srt.rank_role import (
     FormASeamNotWired,
     HOST,
     RankRoleError,
@@ -138,7 +138,7 @@ def test_form_a_plan_gives_the_workers_nothing_of_every_dense_dimension():
     # a plain proportional dimension (no units): o_proj / mixer / vocab
     assert tp_partition_sizes(2560, 3) == [2560, 0, 0]
     # ... and the offsets stay coherent: the workers start where the host ends
-    from sglang.srt.distributed.utils import tp_partition_offset
+    from flliper.srt.distributed.utils import tp_partition_offset
 
     assert [tp_partition_offset(6144, 3, r, units=24) for r in range(3)] == [
         0,
@@ -239,7 +239,7 @@ def test_wired_seams_pass_and_unwired_seams_refuse_with_their_own_name():
 
 
 def test_the_remaining_work_is_ordered_and_complete():
-    from sglang.srt.rank_role import UNWIRED_ORDER
+    from flliper.srt.rank_role import UNWIRED_ORDER
 
     assert set(UNWIRED_ORDER) == set(UNWIRED)
     assert len(UNWIRED_ORDER) == len(set(UNWIRED_ORDER))
@@ -270,7 +270,7 @@ def test_unknown_seam_is_refused():
 
 
 def test_guards_fire_only_on_the_rank_whose_role_needs_them():
-    from sglang.srt.rank_role import (
+    from flliper.srt.rank_role import (
         FormAWorkerBuildsDraft,
         set_form_a_role_plan,
     )
@@ -310,7 +310,7 @@ def test_eager_is_an_allowed_worker_graph_mode_and_a_dense_capture_is_not():
     refused, now permanently and with its own class, is recording the DENSE
     body on a rank that holds no dense weights. The per-role graph itself
     has its own file, test_form_a_graph_0920.py."""
-    from sglang.srt.rank_role import (
+    from flliper.srt.rank_role import (
         GRAPH_BODY_MOE_ROUTE,
         FormAWorkerDenseGraph,
     )
@@ -328,7 +328,7 @@ def test_a_zero_width_linear_is_only_guarded_when_it_is_actually_zero():
     """F11's backstop. A positive width is the normal case and must cost
     nothing; a zero width must refuse, because F.linear with K=0 returns
     zeros without raising and the all-reduce adds them."""
-    from sglang.srt.rank_role import (
+    from flliper.srt.rank_role import (
         FormAZeroWidthLinear,
         guard_zero_width_linear,
     )
@@ -353,7 +353,7 @@ def test_subgroup_and_dcp_merge_guards_name_their_seams():
 def test_form_a_plan_shares_one_definition_of_the_host_with_the_role_vector():
     """Two copies of 'exactly one host' are two rules the moment one is
     edited, so the solver delegates to RankRolePlan."""
-    from sglang.srt.form_a_plan import (
+    from flliper.srt.form_a_plan import (
         CardBudget,
         ExpertGeometry,
         FormAGeometryInvalid,
@@ -407,7 +407,7 @@ def test_the_load_veto_keeps_routed_experts_and_nothing_else():
     """F3, the half that is built. Names are the real ones from the
     Qwen3.8-Flash-Next weight map, including every near-miss that a naive
     'experts' substring would have swallowed."""
-    from sglang.srt.rank_role import worker_keeps_parameter
+    from flliper.srt.rank_role import worker_keeps_parameter
 
     for name, expected in REAL_NAMES.items():
         assert worker_keeps_parameter(name, 512) is expected, name
@@ -417,7 +417,7 @@ def test_the_fused_shared_expert_is_host_only_despite_its_name():
     """models/qwen3_5.py:2448-2452 rewrites mlp.shared_expert. into
     mlp.experts.<num_routed>. -- after which only the ID tells them apart.
     The shared expert runs for EVERY token, so it belongs to the host."""
-    from sglang.srt.rank_role import worker_keeps_parameter
+    from flliper.srt.rank_role import worker_keeps_parameter
 
     fused = "model.language_model.layers.0.mlp.experts.512.down_proj.weight"
     assert worker_keeps_parameter(fused, 512) is False
@@ -428,7 +428,7 @@ def test_the_fused_shared_expert_is_host_only_despite_its_name():
 
 
 def test_the_installed_role_plan_is_inert_on_a_classic_boot():
-    from sglang.srt.rank_role import (
+    from flliper.srt.rank_role import (
         set_form_a_role_plan,
         this_rank_is_form_a_worker,
     )
@@ -450,7 +450,7 @@ def test_the_kv_budget_excludes_a_rank_that_funds_no_token():
     """F4 arithmetic. Under Form A only the host holds context tokens, so a
     zero entry must be left OUT of the min() -- not divide by zero, and not
     drag the budget to nothing."""
-    from sglang.srt.distributed.utils import cp_token_context_budget
+    from flliper.srt.distributed.utils import cp_token_context_budget
 
     # classic: three funding ranks, unchanged
     assert cp_token_context_budget([11, 11, 10], [358784, 359232, 329472]) == (
@@ -470,7 +470,7 @@ def test_w62_saturation_does_not_fire_for_a_rank_that_is_not_on_the_axis():
     every Form A vector as 'axis switched off'."""
     import inspect
 
-    from sglang.srt.weg2 import launcher
+    from flliper.srt.pdflip import launcher
 
     src = inspect.getsource(launcher.d_operating_point_rows)
     assert "Form A worker: not on this axis, not saturated" in src

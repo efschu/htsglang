@@ -76,10 +76,10 @@ from __future__ import annotations
 import types
 from typing import List
 
-from sglang.srt.managers.phase_flip_runtime import PHASE_PP
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.srt.managers.phase_flip_runtime import PHASE_PP
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 #: Rows the fixture's resident requests hold, one block per request. Small and
 #: fixed: the number is never the point, the accounting is.
@@ -98,7 +98,7 @@ def _ensure_global_server_args() -> None:
     `test_prefill_adder.py`, `test_chunked_commitment_701.py`), so a module
     that has already set richer ones keeps them.
     """
-    from sglang.srt.runtime_context import get_server_args
+    from flliper.srt.runtime_context import get_server_args
 
     try:
         get_server_args()
@@ -496,7 +496,7 @@ class FaithfulCensusScheduler:
         return list(self._residents)
 
     def live_req_count(self) -> int:
-        from sglang.srt.managers.phase_flip_runtime import _live_reqs
+        from flliper.srt.managers.phase_flip_runtime import _live_reqs
 
         return len(_live_reqs(self))
 

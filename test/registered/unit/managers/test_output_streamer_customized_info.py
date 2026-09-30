@@ -1,13 +1,13 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import unwrap_from_pickle
-from sglang.srt.managers.scheduler_components.output_streamer import (
+from flliper.srt.disaggregation.utils import DisaggregationMode
+from flliper.srt.managers.io_struct import unwrap_from_pickle
+from flliper.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

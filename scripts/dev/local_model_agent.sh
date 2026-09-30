@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-CONF_DEFAULT="${SGLANG_LOCAL_AGENT_CONF:-$HOME/.config/htsglang/local_model_agent.env}"
+CONF_DEFAULT="${FLLIPER_LOCAL_AGENT_CONF:-$HOME/.config/htsglang/local_model_agent.env}"
 if [[ -r "$CONF_DEFAULT" ]]; then
     # shellcheck disable=SC1090
     source "$CONF_DEFAULT"

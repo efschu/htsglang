@@ -42,16 +42,16 @@ import unittest
 
 import torch
 
-from sglang.srt.managers import phase_flip_runtime, phase_purity
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers import phase_flip_runtime, phase_purity
+from flliper.srt.managers.phase_purity import (
     SEAM_GRANT_CONSUMED_ATTR,
     SEAM_READMIT_ATTR,
     seam_transport_premise_holds,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache import unified_radix_cache
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache import unified_radix_cache
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 

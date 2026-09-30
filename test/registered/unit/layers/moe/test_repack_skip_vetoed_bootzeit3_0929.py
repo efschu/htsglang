@@ -3,7 +3,7 @@
 z30r3 D (H2 on): TP0 read 3171 of 9040 owned expert rows on 40 layers, TP1
 3320/6096, TP2 3120/7632 -- the rest were vetoed (P's bytes in the store) and
 never read, yet the repack ran one JIT launch per row over the whole [E]
-window, ~30 s per D rank. SGLANG_MOE_REPACK_SKIP_VETOED=1 hands the repack the
+window, ~30 s per D rank. FLLIPER_MOE_REPACK_SKIP_VETOED=1 hands the repack the
 kept rows only; every row a reader sees (residents, rows written to the
 store) is repacked exactly as before.
 """
@@ -16,12 +16,12 @@ import torch
 
 # gptq_kernels only through the quantization registry: importing it first
 # trips a pre-existing import cycle (see tests/moe_offload/test_repack_adoption_0922.py)
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (  # noqa: F401
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (  # noqa: F401
     compressed_tensors_wNa16_moe,
 )
-from sglang.srt.layers.moe import store_adopt as sa
+from flliper.srt.layers.moe import store_adopt as sa
 
-gk = sys.modules["sglang.srt.hardware_backend.gpu.quantization.gptq_kernels"]
+gk = sys.modules["flliper.srt.hardware_backend.gpu.quantization.gptq_kernels"]
 
 
 def _layer(vetoed):
@@ -31,18 +31,18 @@ def _layer(vetoed):
 
 
 def _window(lo, pad):
-    return mock.patch("sglang.srt.layers.moe.expert_offload._layer_expert_window",
+    return mock.patch("flliper.srt.layers.moe.expert_offload._layer_expert_window",
                       return_value=(lo, pad))
 
 
 def test_off_by_default_means_all_rows(monkeypatch):
-    monkeypatch.delenv("SGLANG_MOE_REPACK_SKIP_VETOED", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_REPACK_SKIP_VETOED", raising=False)
     with _window(6, True):
         assert sa.repack_rows(_layer({8, 10, 11}), 7) is None
 
 
 def test_on_keeps_pad_and_every_unvetoed_row(monkeypatch):
-    monkeypatch.setenv("SGLANG_MOE_REPACK_SKIP_VETOED", "1")
+    monkeypatch.setenv("FLLIPER_MOE_REPACK_SKIP_VETOED", "1")
     # window lo=6 with pad: local e>=1 is global 6+e-1 -> 8,10,11 are local 3,5,6
     with _window(6, True):
         assert sa.repack_rows(_layer({8, 10, 11}), 7) == [0, 1, 2, 4]
@@ -52,13 +52,13 @@ def test_on_keeps_pad_and_every_unvetoed_row(monkeypatch):
 
 
 def test_on_but_nothing_vetoed_or_no_window_means_all(monkeypatch):
-    monkeypatch.setenv("SGLANG_MOE_REPACK_SKIP_VETOED", "1")
+    monkeypatch.setenv("FLLIPER_MOE_REPACK_SKIP_VETOED", "1")
     with _window(6, True):
         assert sa.repack_rows(_layer(set()), 7) is None
         assert sa.repack_rows(types.SimpleNamespace(), 7) is None
         # vetoed ids outside this window change nothing
         assert sa.repack_rows(_layer({0, 1}), 7) is None
-    with mock.patch("sglang.srt.layers.moe.expert_offload._layer_expert_window",
+    with mock.patch("flliper.srt.layers.moe.expert_offload._layer_expert_window",
                     return_value=None):
         assert sa.repack_rows(_layer({8}), 7) is None
 

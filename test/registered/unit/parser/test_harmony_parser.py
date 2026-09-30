@@ -2,15 +2,15 @@
 
 import unittest
 
-from sglang.srt.parser.harmony_parser import (
+from flliper.srt.parser.harmony_parser import (
     CanonicalStrategy,
     HarmonyParser,
     TextStrategy,
     iter_tokens,
     prefix_hold,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -460,13 +460,13 @@ class TestIntegrationScenarios(CustomTestCase):
         """Test built-in tool call on analysis channel."""
         parser = HarmonyParser()
 
-        text = '<|channel|>analysis to=browser.search<|message|>{"query": "SGLang"}<|call|>'
+        text = '<|channel|>analysis to=browser.search<|message|>{"query": "fLLiper"}<|call|>'
 
         events = parser.parse(text)
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].event_type, "tool_call")
-        self.assertEqual(events[0].content, '{"query": "SGLang"}')
+        self.assertEqual(events[0].content, '{"query": "fLLiper"}')
 
     def test_streaming_property_canonical(self):
         """Test streaming property: chunked parsing produces same semantic content as one-shot parsing."""
@@ -634,7 +634,7 @@ class TestAdditionalEdgeCases(CustomTestCase):
 
     def test_iter_tokens_unknown_token_no_closing(self):
         """Test iter_tokens with <| that has no closing |>."""
-        from sglang.srt.parser.harmony_parser import iter_tokens
+        from flliper.srt.parser.harmony_parser import iter_tokens
 
         tokens = list(iter_tokens("<|broken text without close", 0))
         # Should emit TEXT tokens for the content after <|
@@ -642,7 +642,7 @@ class TestAdditionalEdgeCases(CustomTestCase):
 
     def test_iter_tokens_unknown_at_end_no_next_marker(self):
         """Test unknown token with |> close but no next <| marker after it."""
-        from sglang.srt.parser.harmony_parser import iter_tokens
+        from flliper.srt.parser.harmony_parser import iter_tokens
 
         # <|weird|> is unknown, has closing |>, but nothing after it
         tokens = list(iter_tokens("<|weird|>trailing", 0))
@@ -654,7 +654,7 @@ class TestAdditionalEdgeCases(CustomTestCase):
 
     def test_canonical_standalone_end_token_filtered(self):
         """Test that standalone <|end|> in TEXT position is filtered out."""
-        from sglang.srt.parser.harmony_parser import CanonicalStrategy
+        from flliper.srt.parser.harmony_parser import CanonicalStrategy
 
         strategy = CanonicalStrategy()
         # Malformed: <|end|> appears before any channel/message structure
@@ -666,7 +666,7 @@ class TestAdditionalEdgeCases(CustomTestCase):
 
     def test_text_strategy_commentary_only(self):
         """Test TextStrategy with commentary-only pattern (no 'assistantfinal')."""
-        from sglang.srt.parser.harmony_parser import TextStrategy
+        from flliper.srt.parser.harmony_parser import TextStrategy
 
         strategy = TextStrategy()
         text = "commentary: just a comment here"
@@ -678,7 +678,7 @@ class TestAdditionalEdgeCases(CustomTestCase):
 
     def test_text_strategy_commentary_with_hold(self):
         """Test TextStrategy commentary channel with prefix that could be 'assistantfinal'."""
-        from sglang.srt.parser.harmony_parser import TextStrategy
+        from flliper.srt.parser.harmony_parser import TextStrategy
 
         strategy = TextStrategy()
         # Content ends with "assistant" which is a prefix of "assistantfinal"

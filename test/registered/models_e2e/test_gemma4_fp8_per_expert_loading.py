@@ -3,7 +3,7 @@ loading on Gemma4 (e.g. RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic).
 
 Regression coverage for the load_weights path that recognises
 `experts.<id>.{gate,up,down}_proj.{weight,weight_scale}` keys and folds
-them into SGLang's fused FusedMoE parameters. Without that path, all
+them into fLLiper's fused FusedMoE parameters. Without that path, all
 routed-expert weights are silently skipped at load time and the model
 emits only `<pad>` tokens at inference (GSM8K collapses to 0.0).
 """
@@ -13,10 +13,10 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import get_device_sm, kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,

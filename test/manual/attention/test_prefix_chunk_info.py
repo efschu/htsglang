@@ -2,10 +2,10 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils.common import get_device
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import MLATokenToKVPool
+from flliper.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from flliper.srt.utils.common import get_device
+from flliper.test.test_utils import CustomTestCase
 
 TEST_CASES = [
     # Sequence with same prefix lens
@@ -207,7 +207,7 @@ class TestPrefixChunkInfo(CustomTestCase):
             # attn_backend that carries the pools (Pattern A invariant).
             from types import SimpleNamespace
 
-            from sglang.srt.model_executor.forward_context import (
+            from flliper.srt.model_executor.forward_context import (
                 ForwardContext,
                 set_forward_context,
             )

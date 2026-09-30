@@ -22,8 +22,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=120, stage="sgl-kernel-unit", runner_config="2-gpu-amd")
 
@@ -35,7 +35,7 @@ def get_open_port():
 
 
 def worker(world_size, rank, port):
-    envs.SGLANG_USE_1STAGE_ALLREDUCE.set("1")
+    envs.FLLIPER_USE_1STAGE_ALLREDUCE.set("1")
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
@@ -50,7 +50,7 @@ def worker(world_size, rank, port):
     try:
         from torch.distributed import new_group
 
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        from flliper.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
 

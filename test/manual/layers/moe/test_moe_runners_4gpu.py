@@ -2,9 +2,9 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -80,8 +80,8 @@ class TestMoERunner4GPU(CustomTestCase):
         other_args = config.get("other_args", [])
         eval_kwargs = self.DEFAULT_EVAL_KWARGS
         env = dict(os.environ)
-        env["SGLANG_ENABLE_JIT_DEEPGEMM"] = "1"
-        env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] = "0"
+        env["FLLIPER_ENABLE_JIT_DEEPGEMM"] = "1"
+        env["FLLIPER_JIT_DEEPGEMM_PRECOMPILE"] = "0"
         env.update(config.get("env_overrides", {}))
         timeout = config.get("timeout", self.TIMEOUT)
 

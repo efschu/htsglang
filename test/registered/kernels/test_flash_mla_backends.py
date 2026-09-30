@@ -10,7 +10,7 @@ Validates the SM120-specific FlashMLA implementation that replaces the upstream
 - ``flash_mla_sparse_decode_triton``: tiled Triton kernel.
 - ``_apply_attn_sink`` / ``_merge_partial_attn``: post-processing helpers.
 - ``flash_mla_with_kvcache_sm120``: entry-point dispatch on
-  ``SGLANG_SM120_TRITON_FLASHMLA`` selects torch/triton paths and both yield
+  ``FLLIPER_SM120_TRITON_FLASHMLA`` selects torch/triton paths and both yield
   matching output.
 
 DSv4 cache layout (per page):
@@ -26,8 +26,8 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.attention import flash_mla_sm120 as fmod
-from sglang.srt.layers.attention.flash_mla_sm120 import (
+from flliper.srt.layers.attention import flash_mla_sm120 as fmod
+from flliper.srt.layers.attention.flash_mla_sm120 import (
     _BYTES_PER_DST_PAGE,
     _BYTES_PER_DST_PAGE_PADDED,
     _D,
@@ -44,14 +44,14 @@ from sglang.srt.layers.attention.flash_mla_sm120 import (
     _split_kv_pages_to_64,
     flash_mla_with_kvcache_sm120,
 )
-from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+from flliper.srt.layers.attention.flash_mla_sm120_triton import (
     _apply_attn_sink,
     _merge_partial_attn,
     flash_mla_sparse_decode_triton,
 )
-from sglang.srt.runtime_context import get_resources
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.runtime_context import get_resources
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 
@@ -444,7 +444,7 @@ class TestEntryPointDispatch(CustomTestCase):
         cls.device = torch.device("cuda")
 
     def test_torch_backend_matches_triton_backend(self):
-        """SGLANG_SM120_TRITON_FLASHMLA toggles backend; both return matching out."""
+        """FLLIPER_SM120_TRITON_FLASHMLA toggles backend; both return matching out."""
         k_cache, _ = _build_kvcache(4, 64, device=self.device, seed=5)
         q, indices = _build_q_indices(1, 4, 32, 4, 64, device=self.device, seed=13)
         topk_length = torch.tensor([32], dtype=torch.int32, device=self.device)

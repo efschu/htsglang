@@ -55,17 +55,17 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsv4 import indexer as indexer_mod
-from sglang.srt.layers.attention.dsv4 import indexer_arch
-from sglang.srt.layers.attention.dsv4.indexer import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.dsv4 import indexer as indexer_mod
+from flliper.srt.layers.attention.dsv4 import indexer_arch
+from flliper.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     fp8_paged_mqa_logits_torch,
     fp8_paged_mqa_logits_torch_sm120,
 )
-from sglang.srt.layers.attention.dsv4.indexer_arch import deepgemm_indexer_supported
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.attention.dsv4.indexer_arch import deepgemm_indexer_supported
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -73,7 +73,7 @@ PAGE_SIZE = 64
 HEAD_DIM = 128
 PAGE_BYTES = PAGE_SIZE * HEAD_DIM + PAGE_SIZE * 4
 
-INDEXER_MOD = "sglang.srt.layers.attention.dsv4.indexer"
+INDEXER_MOD = "flliper.srt.layers.attention.dsv4.indexer"
 
 
 def _build_inputs(seq_lens, *, num_heads=8, seed=0):
@@ -378,7 +378,7 @@ class TestReluIsTheWholeDifference(CustomTestCase):
 
 
 class TestNonPagedCouplingIsAlreadyArchGuarded(CustomTestCase):
-    """#440 item 4 -- the ``SGLANG_FP8_PAGED_MQA_LOGITS_TORCH`` coupling.
+    """#440 item 4 -- the ``FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH`` coupling.
 
     Upstream ``_can_use_nonpaged_indexer`` disables the non-paged DeepGEMM fast
     path whenever that env is set, with no architecture guard ahead of it
@@ -409,9 +409,9 @@ class TestNonPagedCouplingIsAlreadyArchGuarded(CustomTestCase):
     def _is_eligible(self, capability, *, torch_env: bool):
         from types import SimpleNamespace
 
-        from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-        from sglang.srt.runtime_context import get_parallel
+        from flliper.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.runtime_context import get_parallel
 
         deepgemm_indexer_supported.cache_clear()
         with (
@@ -420,10 +420,10 @@ class TestNonPagedCouplingIsAlreadyArchGuarded(CustomTestCase):
                 is_cuda=lambda: True,
                 get_device_capability_no_init=lambda device_id: capability,
             ),
-            envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.override(True),
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_env),
+            envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER.override(True),
+            envs.FLLIPER_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.FLLIPER_OPT_USE_AITER_INDEXER.override(False),
+            envs.FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH.override(torch_env),
             mock.patch(f"{INDEXER_MOD}.is_cuda", return_value=True),
             mock.patch(f"{INDEXER_MOD}.is_hip", return_value=False),
             get_parallel().override(attn_cp_size=1),
@@ -460,7 +460,7 @@ class TestNonPagedCouplingIsAlreadyArchGuarded(CustomTestCase):
 
     def test_torch_paged_path_needs_no_env_on_a_card_without_deepgemm(self):
         """Why the upstream coupling has no victim here: nobody must set it."""
-        from sglang.srt.layers.attention.dsv4.indexer_arch import (
+        from flliper.srt.layers.attention.dsv4.indexer_arch import (
             BACKEND_TORCH,
             resolve_paged_mqa_logits_backend,
         )
@@ -474,9 +474,9 @@ class TestNonPagedCouplingIsAlreadyArchGuarded(CustomTestCase):
                         is_cuda=lambda: True,
                         get_device_capability_no_init=lambda device_id: capability,
                     ),
-                    envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-                    envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-                    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+                    envs.FLLIPER_OPT_USE_TILELANG_INDEXER.override(False),
+                    envs.FLLIPER_OPT_USE_AITER_INDEXER.override(False),
+                    envs.FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
                 ):
                     self.assertEqual(resolve_paged_mqa_logits_backend(0), BACKEND_TORCH)
 
@@ -503,7 +503,7 @@ class TestRowZeroPageTableReuseIsGuarded(CustomTestCase):
     def _backend():
         """A real mixin instance -- ``_get_nonpaged_indexer_plan`` calls back
         into ``_can_use_nonpaged_indexer`` through ``self``."""
-        from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+        from flliper.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 
         class _Backend(C4IndexerBackendMixin):
             def __init__(self):
@@ -514,13 +514,13 @@ class TestRowZeroPageTableReuseIsGuarded(CustomTestCase):
 
     @staticmethod
     def _ctx(*, capturing=False):
-        from sglang.srt.runtime_context import get_parallel
+        from flliper.srt.runtime_context import get_parallel
 
         return (
-            envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.override(True),
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+            envs.FLLIPER_OPT_DSV4_NONPAGED_INDEXER.override(True),
+            envs.FLLIPER_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.FLLIPER_OPT_USE_AITER_INDEXER.override(False),
+            envs.FLLIPER_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             mock.patch(f"{INDEXER_MOD}.is_cuda", return_value=True),
             mock.patch(f"{INDEXER_MOD}.is_hip", return_value=False),
             mock.patch(f"{INDEXER_MOD}.deepgemm_indexer_supported", return_value=True),
@@ -537,7 +537,7 @@ class TestRowZeroPageTableReuseIsGuarded(CustomTestCase):
     def _eligible(self, *, batch_size, capturing=False):
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         with contextlib.ExitStack() as stack:
             for ctx in self._ctx(capturing=capturing):
@@ -565,7 +565,7 @@ class TestRowZeroPageTableReuseIsGuarded(CustomTestCase):
     def _plan(self, *, seq_lens_cpu, extend_seq_lens_cpu, query_rows=8192):
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from flliper.srt.model_executor.forward_batch_info import ForwardMode
 
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,

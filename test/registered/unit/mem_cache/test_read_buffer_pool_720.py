@@ -22,9 +22,9 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache import pinned_host_budget as budget
-from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool, borrowed
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import pinned_host_budget as budget
+from flliper.srt.mem_cache.read_buffer_pool import ReadBufferPool, borrowed
+from flliper.test.test_utils import CustomTestCase
 
 PAGE_BYTES = 512
 
@@ -62,7 +62,7 @@ class TestReadBufferPool(CustomTestCase):
         host = _CountingHostPool()
         ring = ReadBufferPool(
             name="test-ring",
-            flag="SGLANG_HICACHE_READ_BUFFERS",
+            flag="FLLIPER_HICACHE_READ_BUFFERS",
             capacity=4,
             page_bytes=PAGE_BYTES,
             factory=host.get_dummy_flat_data_page,
@@ -118,7 +118,7 @@ class TestReadBufferPool(CustomTestCase):
         host = _CountingHostPool()
         ring = ReadBufferPool(
             name="test-ring",
-            flag="SGLANG_HICACHE_READ_BUFFERS",
+            flag="FLLIPER_HICACHE_READ_BUFFERS",
             capacity=8,
             page_bytes=PAGE_BYTES,
             factory=host.get_dummy_flat_data_page,
@@ -143,9 +143,9 @@ class TestReadBufferPool(CustomTestCase):
     # -- off by default ------------------------------------------------------
 
     def test_default_is_off(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        self.assertEqual(int(envs.SGLANG_HICACHE_READ_BUFFERS.get() or 0), 0)
+        self.assertEqual(int(envs.FLLIPER_HICACHE_READ_BUFFERS.get() or 0), 0)
 
 
 if __name__ == "__main__":

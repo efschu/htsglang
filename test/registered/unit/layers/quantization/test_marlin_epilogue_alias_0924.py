@@ -6,7 +6,7 @@ reduction buffer onto the B pipeline (``int4* sh_b = sh; int4* sh_red = sh;``),
 and the epilogue writes ``sh_red`` (``thread_block_reduce`` / ``write_result``)
 right after ``cp_async_wait<0>()`` with no block barrier in between. The NF
 line added such a barrier to the MoE twin of this kernel (b8c451a4f8,
-SGLANG_MARLIN_EPILOGUE_SYNC). Does the dense kernel need it?
+FLLIPER_MARLIN_EPILOGUE_SYNC). Does the dense kernel need it?
 
 Answer: no byte that is still USED can be hit. The argument rests on seven
 structural facts of the template, and this file pins each of them, so an
@@ -47,7 +47,7 @@ showed the #49 NaNs, whose root turned out to be PDL on sm_120 (0d33570001).
 The window test ``test_marlin_epilogue_alias_gpu_0924.py`` hammers the
 UNCHANGED kernel (no rebuild) at the running DFlash2-W8 draft's per-rank shapes.
 
-Hermetic: reads the template text, imports nothing from sglang.
+Hermetic: reads the template text, imports nothing from flliper.
 """
 
 import importlib.util
@@ -55,19 +55,19 @@ import pathlib
 import re
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _template_path() -> pathlib.Path:
-    # find_spec("sglang") locates the package WITHOUT executing its __init__;
+    # find_spec("flliper") locates the package WITHOUT executing its __init__;
     # the template read must be the one the JIT would compile for this tree.
-    spec = importlib.util.find_spec("sglang")
+    spec = importlib.util.find_spec("flliper")
     if spec is not None and spec.submodule_search_locations:
         base = pathlib.Path(list(spec.submodule_search_locations)[0])
     else:  # pragma: no cover - layout fallback
-        base = pathlib.Path(__file__).resolve().parents[5] / "python" / "sglang"
+        base = pathlib.Path(__file__).resolve().parents[5] / "python" / "flliper"
     return base / "jit_kernel" / "csrc" / "gemm" / "marlin" / "marlin_template.h"
 
 

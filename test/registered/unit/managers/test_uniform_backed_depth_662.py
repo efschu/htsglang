@@ -51,7 +51,7 @@ class _Owner:
     """The real accessor under test, bound to fakes."""
 
     def __init__(self, committed):
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 
         self._arena = _Arena(committed)
         self._specs = [_Spec(off) for off in committed]
@@ -78,12 +78,12 @@ class UniformDepthIsTheMinimum(unittest.TestCase):
     def test_tokens_per_row_is_honoured(self):
         o = _Owner({0: 100 * 1024})
         o._specs[0].desc.tokens_per_row = 4
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 
         self.assertEqual(KvVmmBufferOwner.uniform_backed_tokens.fget(o), 400)
 
     def test_no_arena_reads_as_nothing_to_give(self):
-        from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
+        from flliper.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 
         class _Gone:
             _arena = None

@@ -19,8 +19,8 @@ Hermetic: pure arithmetic, no CUDA.
 """
 
 import pytest
-from sglang.srt.planner.decoupled_kv import KvGeometry, collective_bytes_per_chunk
-from sglang.srt.planner.overlap_schedule import (
+from flliper.srt.planner.decoupled_kv import KvGeometry, collective_bytes_per_chunk
+from flliper.srt.planner.overlap_schedule import (
     OverlapScheduleError,
     solve_overlap,
 )
@@ -156,7 +156,7 @@ def test_pipelining_removes_the_exposure_at_every_rung():
 
 def test_link_reach_binds_to_card_identity_not_rank_index():
     """The guard against the mistake that produced the refuted analysis."""
-    from sglang.srt.planner.overlap_schedule import (
+    from flliper.srt.planner.overlap_schedule import (
         CardLink,
         OverlapScheduleError,
         all_measured,

@@ -6,22 +6,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-from sglang.srt.layers.attention.qsa.kernel import (
+from flliper.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
     torch_expand_qsa_block_indices,
 )
-from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+from flliper.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+from flliper.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 
 # MRotaryEmbedding reads the exec config bag at init; publish a minimal
 # process context for the bare pytest process.
-from sglang.srt.runtime_context import publish
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.runtime_context import publish
+from flliper.srt.server_args import ServerArgs
 
 publish(ServerArgs(model_path="dummy"), role="test")
 
@@ -211,8 +211,8 @@ def test_expand_block_indices_int_inputs(dtype):
 def test_decode_selection_equivalent():
     """Last-ulp norm flips must not change the selected blocks:
     scores are fp32 sums of 128-dim dots, so a 1-ulp flip only matters on exact ties."""
-    from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
-    from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_decode
+    from flliper.srt.layers.attention.qsa.kernel import qsa_fast_topk
+    from flliper.srt.layers.attention.qsa.mqa import torch_qsa_mqa_decode
 
     device = torch.device("cuda")
     dtype = torch.bfloat16

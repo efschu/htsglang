@@ -17,7 +17,7 @@ that brackets it, and these tests pin the two ways such a table could lie.
 
 import unittest
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     TERM_ACTIVATION,
     TERM_ATTN_WORKSPACE,
     TERM_GRAPH_CAPTURE,
@@ -27,13 +27,13 @@ from sglang.srt.mem_ledger.engine import (
     TERM_PARENT_CONTEXT,
     TERM_WEIGHTS,
 )
-from sglang.srt.mem_ledger.reconcile import (
+from flliper.srt.mem_ledger.reconcile import (
     TERM_TO_POST,
     ReconcileRefusal,
     reconcile,
     reconcile_card,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

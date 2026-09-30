@@ -5,7 +5,7 @@ group D noted 217,614 arrivals while ``_arrived`` stood at 467,649 of its
 524,288 cap; the 161k evictions each walked the growing run of deleted slots
 at the front of the dict (``next(iter(d))``) and held the scheduler thread for
 ~6 s inside ``check_prefetch_progress`` -- the kv resume sat unread in TP0's
-socket for that long. ``SGLANG_WEG2_CENSUS_O1_EVICT=1`` evicts with
+socket for that long. ``FLLIPER_PDFLIP_CENSUS_O1_EVICT=1`` evicts with
 ``OrderedDict.popitem(last=False)``.
 
 What is pinned here:
@@ -17,7 +17,7 @@ What is pinned here:
     (the quadratic is gone), measured as a ratio so a slow CI box cannot flake;
   * the batched ``note_prefetch_adopted`` under the switch equals per-key
     ``note_arrival`` (late arrivals included).
-Hermetic: no GPU, no sglang runtime.
+Hermetic: no GPU, no flliper runtime.
 """
 
 import time
@@ -25,7 +25,7 @@ from collections import OrderedDict
 
 import pytest
 
-import sglang.srt.mem_cache.producer_phase_census as m
+import flliper.srt.mem_cache.producer_phase_census as m
 
 
 @pytest.fixture(autouse=True)

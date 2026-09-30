@@ -299,9 +299,9 @@ def main():
         description=(
             "Process nsys rep and generate kernel non-overlapped cycles. \n"
             "Example:\n"
-            "gputrc2graph.py --in_file d1.nsys-rep,sglang,llama,100 \n"
-            "d2.nsys-rep,sglang,gpt-oss,102 "
-            '--out_dir results/ --title "Model=gpt-oss SGLANG chart"'
+            "gputrc2graph.py --in_file d1.nsys-rep,flliper,llama,100 \n"
+            "d2.nsys-rep,flliper,gpt-oss,102 "
+            '--out_dir results/ --title "Model=gpt-oss FLLIPER chart"'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -324,7 +324,7 @@ def main():
             "elapsed time from nsys-rep but that might inflate non-gpu time. "
             f"Available engine:[model] are: {engine_model_supported_str} "
             f"Example: --infile d1.nsys-rep,sglan,llama,100 "
-            "d2.nsys-rep,sglang,gpt-oss,102"
+            "d2.nsys-rep,flliper,gpt-oss,102"
         ),
         required=True,
     )

@@ -1,4 +1,4 @@
-"""fnFL2 H43 (SGLANG_QWEN4_PLE_PREFETCH_ADMIT): the first chunk's PLE read from
+"""fnFL2 H43 (FLLIPER_QWEN4_PLE_PREFETCH_ADMIT): the first chunk's PLE read from
 the request's admission.
 
 H32 reads chunk n+1 while chunk n computes; chunk 0 was always read inside its
@@ -36,12 +36,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.models import qwen4_exp_ple_admit as adm
-from sglang.srt.models import qwen4_exp_ple_prefetch as pf
-from sglang.srt.models import qwen4_exp_ple_table as pt
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.models import qwen4_exp_ple_admit as adm
+from flliper.srt.models import qwen4_exp_ple_prefetch as pf
+from flliper.srt.models import qwen4_exp_ple_table as pt
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
@@ -51,10 +51,10 @@ SHARDS = 4
 DIM = 160
 RB = DIM * 2
 HEADER = 100
-PF_LOGGER = "sglang.srt.models.qwen4_exp_ple_prefetch"
-ADM_LOGGER = "sglang.srt.models.qwen4_exp_ple_admit"
+PF_LOGGER = "flliper.srt.models.qwen4_exp_ple_prefetch"
+ADM_LOGGER = "flliper.srt.models.qwen4_exp_ple_admit"
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-SRT = os.path.join(ROOT, "python", "sglang", "srt")
+SRT = os.path.join(ROOT, "python", "flliper", "srt")
 
 
 def _table(tmpdir):
@@ -182,7 +182,7 @@ class TestAdmission(CustomTestCase):
         rig = _Rig(self.table, delay_s=0.3)
         try:
             rig.warm(self)
-            w = _Req("weg2-2-6", self._ids(150))
+            w = _Req("pdflip-2-6", self._ids(150))
             with self.assertLogs(ADM_LOGGER, logging.INFO) as ca, \
                     self.assertLogs(PF_LOGGER, logging.INFO) as cp:
                 self.assertEqual(adm.admit_ple_request(w, rig.chunk), "started")
@@ -200,7 +200,7 @@ class TestAdmission(CustomTestCase):
             self.assertLess(line["wait_ms"], 60.0)
             used = [l for l in _admit_lines(ca.records) if "queued_ms_before_forward" in l]
             self.assertEqual(len(used), 1)
-            self.assertIn("rid=weg2-2-6 rows=150 queued_ms_before_forward=2500.0", used[0])
+            self.assertIn("rid=pdflip-2-6 rows=150 queued_ms_before_forward=2500.0", used[0])
             self.assertIn("ready=yes source=queue dormant=0", used[0])
             self.assertIsNone(rig.g._adm)
             self.assertEqual(rig.g.stats["admit_used"], 1)
@@ -353,13 +353,13 @@ class TestAdmission(CustomTestCase):
         rig = _Rig(self.table, delay_s=0.3)
         try:
             rig.warm(self)
-            w = _Req("weg2-9-1", self._ids(150))
+            w = _Req("pdflip-9-1", self._ids(150))
             self.assertEqual(adm.admit_ple_request(w, rig.chunk), "started")
             with self.assertLogs(ADM_LOGGER, logging.INFO) as ca:
                 t = time.monotonic()
-                self.assertEqual(adm.drop_ple_admission("weg2-9-1"), 1)
+                self.assertEqual(adm.drop_ple_admission("pdflip-9-1"), 1)
                 self.assertLess(time.monotonic() - t, 0.1)  # the abort never waits on the read
-            self.assertIn("rid=weg2-9-1 dropped reason=abort", ca.output[-1])
+            self.assertIn("rid=pdflip-9-1 dropped reason=abort", ca.output[-1])
             self.assertTrue(rig.g._adm.orphan)
             # a queued admission behind it cannot start while the orphan reads
             w2 = _Req("w2", self._ids(160))
@@ -498,8 +498,8 @@ class TestSwitch(CustomTestCase):
     def test_switch_off_is_h32_unchanged(self):
         base = pt.PleCheckpointPreadGather(self.table, min_rows=16, workers=2)
         try:
-            with envs.SGLANG_QWEN4_PLE_PREFETCH.override(True), \
-                    envs.SGLANG_QWEN4_PLE_PREFETCH_ADMIT.override(False):
+            with envs.FLLIPER_QWEN4_PLE_PREFETCH.override(True), \
+                    envs.FLLIPER_QWEN4_PLE_PREFETCH_ADMIT.override(False):
                 g = pf.make_ple_prefetch_gather(base, self.table, _identity_hasher)
             self.assertIs(type(g), pf.PlePrefetchGather)
             self.assertEqual(adm._SINKS, [])
@@ -509,8 +509,8 @@ class TestSwitch(CustomTestCase):
             self.assertEqual(adm._BATCH, ())
             self.assertEqual(len(g._slots), 2)
             g._disable()
-            with envs.SGLANG_QWEN4_PLE_PREFETCH.override(True), \
-                    envs.SGLANG_QWEN4_PLE_PREFETCH_ADMIT.override(True):
+            with envs.FLLIPER_QWEN4_PLE_PREFETCH.override(True), \
+                    envs.FLLIPER_QWEN4_PLE_PREFETCH_ADMIT.override(True):
                 g = pf.make_ple_prefetch_gather(base, self.table, _identity_hasher)
             self.assertIs(type(g), adm.PleAdmitPrefetchGather)
             self.assertEqual(adm._SINKS, [g])
@@ -520,16 +520,16 @@ class TestSwitch(CustomTestCase):
             base.close()
 
     def test_group_d_does_not_admit(self):
-        from sglang.srt.managers import weg2_memory_saver as ms
+        from flliper.srt.managers import pdflip_memory_saver as ms
 
-        with envs.SGLANG_QWEN4_PLE_PREFETCH_ADMIT.override(True):
-            with mock.patch.object(ms, "weg2_group_name", lambda: "D"):
+        with envs.FLLIPER_QWEN4_PLE_PREFETCH_ADMIT.override(True):
+            with mock.patch.object(ms, "pdflip_group_name", lambda: "D"):
                 self.assertFalse(adm.ple_admission_wanted())
-            with mock.patch.object(ms, "weg2_group_name", lambda: "P"):
+            with mock.patch.object(ms, "pdflip_group_name", lambda: "P"):
                 self.assertTrue(adm.ple_admission_wanted())
-            with mock.patch.object(ms, "weg2_group_name", lambda: ""):
+            with mock.patch.object(ms, "pdflip_group_name", lambda: ""):
                 self.assertTrue(adm.ple_admission_wanted())
-        with envs.SGLANG_QWEN4_PLE_PREFETCH_ADMIT.override(False):
+        with envs.FLLIPER_QWEN4_PLE_PREFETCH_ADMIT.override(False):
             self.assertFalse(adm.ple_admission_wanted())
 
     def test_model_hasher_reports_readiness_and_warms(self):
@@ -590,7 +590,7 @@ class TestWiring(CustomTestCase):
                              ("handle_ple_prefetch_hint", "admit_ple_hint")):
             fn = _method(self.tree, "Scheduler", name)
             self.assertIn(callee, [n for _, n, _ in _calls(fn)])
-            self.assertIn("weg2_dormant", ast.unparse(fn))
+            self.assertIn("pdflip_dormant", ast.unparse(fn))
         fwd = _method(self.tree, "Scheduler", "_run_batch_forward")
         names = [n for _, n, _ in _calls(fwd)]
         self.assertLess(names.index("publish_ple_next_chunk"), names.index("note_ple_batch"))
@@ -606,12 +606,12 @@ class TestWiring(CustomTestCase):
         seen = []
         with mock.patch.object(adm, "admit_ple_request",
                                lambda req, cs, dormant=False: seen.append((req, cs, dormant))):
-            me = types.SimpleNamespace(chunked_prefill_size=16384, weg2_dormant=True)
+            me = types.SimpleNamespace(chunked_prefill_size=16384, pdflip_dormant=True)
             ns["_ple_admit_on_intake"](me, "REQ")
         self.assertEqual(seen, [("REQ", 16384, True)])
 
     def test_hint_struct_is_an_ipc_type(self):
-        from sglang.srt.managers import io_struct
+        from flliper.srt.managers import io_struct
 
         h = io_struct.PlePrefetchHintReqInput(rid="r", input_ids=[1, 2, 3])
         self.assertIn(io_struct.PlePrefetchHintReqInput, io_struct._all_types)
@@ -620,13 +620,13 @@ class TestWiring(CustomTestCase):
     def test_http_route_exists(self):
         with open(os.path.join(SRT, "entrypoints", "http_server.py")) as f:
             src = f.read()
-        self.assertIn('@app.api_route("/weg2/ple_prefetch_hint", methods=["POST"])', src)
+        self.assertIn('@app.api_route("/pdflip/ple_prefetch_hint", methods=["POST"])', src)
         self.assertIn("tm._dispatch_to_scheduler(hint)", src)
 
 
 class TestHint(CustomTestCase):
     def test_body_and_condition(self):
-        from sglang.srt.weg2 import ple_admit_hint as ph
+        from flliper.srt.pdflip import ple_admit_hint as ph
 
         self.assertTrue(ph.ple_hint_wanted(awake="D"))
         self.assertTrue(ph.ple_hint_wanted(awake=None))  # mid-flip
@@ -638,7 +638,7 @@ class TestHint(CustomTestCase):
         self.assertIsNone(ph.ple_hint_body("/health", {"rid": "r"}))
 
     def test_build_tokenizes_like_the_leg1_post(self):
-        from sglang.srt.weg2 import ple_admit_hint as ph
+        from flliper.srt.pdflip import ple_admit_hint as ph
 
         seen = []
 
@@ -654,12 +654,12 @@ class TestHint(CustomTestCase):
         enc = lambda s: [ord(c) for c in s]
         run = asyncio.new_event_loop().run_until_complete
         body = {"path": "/v1/chat/completions",
-                "payload": {"rid": "weg2-2-6", "model": "m", "max_tokens": 1,
+                "payload": {"rid": "pdflip-2-6", "model": "m", "max_tokens": 1,
                             "messages": [{"role": "user", "content": "hi"}]}}
         h = run(ph.build_ple_prefetch_hint(body, serving_chat=Chat(), serving_completion=None,
                                            encode=enc, raw_request="RAW"))
-        self.assertEqual((h.rid, h.input_ids), ("weg2-2-6", [5, 6, 7]))
-        self.assertEqual(seen, [("ChatCompletionRequest", "weg2-2-6", "RAW")])
+        self.assertEqual((h.rid, h.input_ids), ("pdflip-2-6", [5, 6, 7]))
+        self.assertEqual(seen, [("ChatCompletionRequest", "pdflip-2-6", "RAW")])
         h = run(ph.build_ple_prefetch_hint(body, serving_chat=Chat2(), serving_completion=None, encode=enc))
         self.assertEqual(h.input_ids, [97, 98, 99])
         h = run(ph.build_ple_prefetch_hint({"path": "/generate", "payload": {"rid": "g", "text": "ab"}},
@@ -669,8 +669,8 @@ class TestHint(CustomTestCase):
                                                          serving_chat=None, serving_completion=None, encode=enc)))
 
     def test_front_posts_the_hint_only_while_p_is_not_awake(self):
-        from sglang.srt.weg2 import front as fr
-        from sglang.srt.weg2 import ple_admit_hint as ph
+        from flliper.srt.pdflip import front as fr
+        from flliper.srt.pdflip import ple_admit_hint as ph
 
         async def go(awake, env=True, skip=False):
             posted = []
@@ -681,9 +681,9 @@ class TestHint(CustomTestCase):
 
             me = types.SimpleNamespace(
                 awake=awake, groups={"P": types.SimpleNamespace(url="http://p")}, session=object(), rpc=rpc)
-            p = types.SimpleNamespace(rid="weg2-2-6", path="/v1/chat/completions", skip_leg1=skip,
-                                      payload={"rid": "weg2-2-6", "messages": [], "stream": True})
-            with envs.SGLANG_WEG2_PLE_ADMIT_HINT.override(env):
+            p = types.SimpleNamespace(rid="pdflip-2-6", path="/v1/chat/completions", skip_leg1=skip,
+                                      payload={"rid": "pdflip-2-6", "messages": [], "stream": True})
+            with envs.FLLIPER_PDFLIP_PLE_ADMIT_HINT.override(env):
                 fr.Front._maybe_ple_admit_hint(me, p)
             await asyncio.sleep(0.01)
             return posted
@@ -692,7 +692,7 @@ class TestHint(CustomTestCase):
         posted = run(go("D"))
         self.assertEqual(posted, [("http://p", ph.HINT_PATH,
                                    {"path": "/v1/chat/completions",
-                                    "payload": {"rid": "weg2-2-6", "messages": []}})])
+                                    "payload": {"rid": "pdflip-2-6", "messages": []}})])
         self.assertEqual(run(go("P")), [])
         self.assertEqual(run(go("D", env=False)), [])
         self.assertEqual(run(go("D", skip=True)), [])

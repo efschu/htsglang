@@ -1,12 +1,12 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import BatchStrOutput
-from sglang.srt.managers.multi_tokenizer_mixin import (
+from flliper.srt.managers.io_struct import BatchStrOutput
+from flliper.srt.managers.multi_tokenizer_mixin import (
     TokenizerWorker,
     _handle_output_by_index,
     get_tokenizer_worker_class,

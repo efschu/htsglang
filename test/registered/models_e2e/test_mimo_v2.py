@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.server_fixtures.mmmu_fixture import MMMUServerBase
 
 register_cuda_ci(est_time=400, stage="base-c", runner_config="8-gpu-h200")
 
@@ -52,7 +52,7 @@ class TestMiMoV2(GSM8KMixin, MMMUServerBase):
 
     @classmethod
     def setUpClass(cls):
-        with envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.override(True):
+        with envs.FLLIPER_ENABLE_UNIFIED_RADIX_TREE.override(True):
             super().setUpClass()
 
 

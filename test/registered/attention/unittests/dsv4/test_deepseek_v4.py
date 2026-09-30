@@ -21,15 +21,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _FLASH_MLA_AVAILABLE = importlib.util.find_spec("flash_mla") is not None
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.dsv4_attention import (  # noqa: E402
     DSV4_PAGE_SIZE,
     DSV4AttentionCase,
     make_dsv4_cases,
@@ -37,13 +37,13 @@ from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import
     run_dsv4_compress_attention_case,
     run_dsv4_target_verify_attention_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
+from flliper.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (  # noqa: E402
+from flliper.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (  # noqa: E402
     run_dsv4_eagle_draft_cuda_graph_runner_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (  # noqa: E402
+from flliper.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (  # noqa: E402
     run_dsv4_eagle_verify_cuda_graph_case,
 )
 
@@ -283,7 +283,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
     @staticmethod
     def _make_sparse_prefill_cache(max_seq_len):
-        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+        from flliper.srt.layers.attention.dsv4.sparse_prefill_utils import (
             SparsePrefillChunkCache,
         )
 
@@ -303,7 +303,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
     def _make_core_metadata(self, base: int):
-        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
+        from flliper.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
 
         metadata = DSV4AttnMetadata(
             page_size=256,
@@ -349,11 +349,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         return metadata
 
     def test_bcg_is_explicit_and_dsv4_backend_opt_in_only(self):
-        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from flliper.srt.layers.attention.base_attn_backend import AttentionBackend
+        from flliper.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         # cg-refactor folded the legacy enable_breakable_cuda_graph flag
         # into cuda_graph_config. Verify the per-phase backend selectors
@@ -428,7 +428,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
     def test_backend_replay_keeps_captured_metadata_active(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from flliper.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
             DSV4Metadata,
         )
@@ -473,7 +473,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
 
     def test_sparse_prefill_workspace_reuses_and_grows(self):
-        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+        from flliper.srt.layers.attention.dsv4.sparse_prefill_utils import (
             SparsePrefillWorkspace,
         )
 
@@ -501,7 +501,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 )
 
     def test_sparse_prefill_c128_uses_live_extent(self):
-        from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
+        from flliper.srt.layers.attention.dsv4 import sparse_prefill_utils
 
         page_indices = torch.full((2, 8192), -1, dtype=torch.int32)
         for max_seq_len in (127, 128, 255, 256):
@@ -538,7 +538,7 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
     """
 
     def _make_backend(self, mapping: torch.Tensor):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from flliper.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
 

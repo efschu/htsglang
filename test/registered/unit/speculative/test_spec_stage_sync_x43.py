@@ -13,10 +13,10 @@ import logging
 import unittest
 from unittest import mock
 
-from sglang.srt.speculative import spec_stage_sync as sss
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.speculative import spec_stage_sync as sss
+from flliper.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="stage-a-weg2-unit")
+register_cpu_ci(est_time=3, suite="stage-a-pdflip-unit")
 
 
 class _Stream:

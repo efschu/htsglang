@@ -23,7 +23,7 @@ Hermetic: pure arithmetic, no CUDA.
 
 import pytest
 
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     budget_holdback_mib,
 )
 
@@ -73,7 +73,7 @@ def test_a_holdback_consuming_the_whole_budget_is_representable():
 
 
 def test_the_fraction_helper_refuses_a_zero_budget_rather_than_dividing():
-    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
         budget_holdback_fraction,
     )
 

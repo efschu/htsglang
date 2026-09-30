@@ -37,7 +37,7 @@ prefix.
 Hermetic: real ``UnifiedRadixCache`` on CPU, real allocator, no CUDA.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -46,10 +46,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 
@@ -158,7 +158,7 @@ class TheTwoSettersMustAgree927(CustomTestCase):
         `if ... is not None` branch never fired and the field kept its previous
         value -- 0 on a fresh Req -- while `prefix_indices` had just been given
         the tree's rows unconditionally."""
-        from sglang.srt.managers.schedule_policy import match_prefix_for_req
+        from flliper.srt.managers.schedule_policy import match_prefix_for_req
 
         cache, allocator, _ = self._fixture()
         self._seed_prefix(cache, allocator)

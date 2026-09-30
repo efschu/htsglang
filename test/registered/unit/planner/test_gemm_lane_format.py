@@ -32,9 +32,9 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -245,7 +245,7 @@ class TestFallbacksAreLoud(CustomTestCase):
         self.assertEqual(scores, [232.97, 62.72, 62.98])
         self.assertTrue(all("fallback" in x for x in labels))
         self.assertEqual(len(warnings), 3)
-        self.assertIn("SGLANG_PERF_REPROBE=1", warnings[0])
+        self.assertIn("FLLIPER_PERF_REPROBE=1", warnings[0])
 
     def test_a_card_with_no_lane_reports_the_reason_it_has_none(self):
         entries = _entries()
@@ -353,7 +353,7 @@ def _args(tune="enc", loose=0.0, model=None):
     return sa
 
 
-_ENV = {"SGLANG_MAMBA_SSM_DTYPE": "bfloat16"}
+_ENV = {"FLLIPER_MAMBA_SSM_DTYPE": "bfloat16"}
 
 
 def _ladder(log):

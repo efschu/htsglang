@@ -13,8 +13,8 @@ deployment does:
     --max-running-requests 4
     N = 7004                        (the measured break-even)
     purity  = prefill_in_tp         (prefill_runs_in_tp True)
-    SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S = 10
-    SGLANG_PHASE_POLICY_MIN_DWELL_S       = 3
+    FLLIPER_PHASE_POLICY_TP_DECODE_FLOOR_S = 10
+    FLLIPER_PHASE_POLICY_MIN_DWELL_S       = 3
 
 The NIAH context ladder submits ONE long request at a time and waits for
 it, so ``running_bs`` is 0 for the whole prefill: there is no other
@@ -23,7 +23,7 @@ generation to strand. That is the case the falsifier pins.
 
 from types import SimpleNamespace
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PHASE_TP,
     REST_DECODE,
     TP_TO_PP,
@@ -81,7 +81,7 @@ class _StubChunked:
 
 def _pending(queue=(), chunked=None):
     """Drive the REAL scheduler metric, never a stub of it."""
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     class S:
         pass
@@ -175,7 +175,7 @@ def test_a_queued_prompt_and_a_chunked_one_are_summed():
     )
 
 
-def test_amortisation_semantics_are_unchanged_below_the_threshold():
+def test_amortization_semantics_are_unchanged_below_the_threshold():
     """The fix must not lower the bar: genuinely small backlogs stay in TP."""
     pending = _pending(chunked=_StubChunked(10_000, 9_000))
     assert pending == 1_000

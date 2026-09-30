@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(
     reason="the pinned spill pool needs a CUDA context (host tensors only)",
 )
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     MoEExpertOffloadCache,
     presplit_expert_offload_after_repack,
     reset_expert_offload_release,
@@ -41,7 +41,7 @@ from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
     scratch_slot_count,
 )
 
-FRACTION_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
+FRACTION_ENV = "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"
 
 # Qwen3.6-35B-A3B-FP8 geometry, scaled down on the expert axis so the test is
 # cheap: hidden 2048, moe_intermediate 512, weight_block_size [128, 128].
@@ -175,7 +175,7 @@ def test_presplit_is_a_noop_without_the_offload_flag(monkeypatch):
 def _fp8_method(monkeypatch, block_quant=True):
     """An Fp8MoEMethod with just the fields create_weights /
     process_weights_after_loading read, and no distributed group behind it."""
-    from sglang.srt.layers.quantization import fp8 as fp8_mod
+    from flliper.srt.layers.quantization import fp8 as fp8_mod
 
     class _Cfg:
         is_checkpoint_fp8_serialized = True
@@ -240,7 +240,7 @@ def test_process_weights_after_loading_ends_in_the_presplit(monkeypatch):
     """The call must be the LAST statement: the Marlin fallback and the fnuz /
     aiter branches replace w13/w2_weight, and the presplit has to stage the
     tensors the kernel ends up reading."""
-    from sglang.srt.layers.moe import expert_offload as eo_mod
+    from flliper.srt.layers.moe import expert_offload as eo_mod
 
     method = _fp8_method(monkeypatch)
     layer = _block_fp8_layer()
@@ -264,7 +264,7 @@ def test_process_weights_after_loading_ends_in_the_presplit(monkeypatch):
 def test_marlin_fallback_runs_before_the_presplit(monkeypatch):
     """Order gate for the sm<89 path: _prepare_marlin_moe rewrites the expert
     tensors, so it must be finished when the presplit stages them."""
-    from sglang.srt.layers.moe import expert_offload as eo_mod
+    from flliper.srt.layers.moe import expert_offload as eo_mod
 
     method = _fp8_method(monkeypatch)
     method.use_marlin = True

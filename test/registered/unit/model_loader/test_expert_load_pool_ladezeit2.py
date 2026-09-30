@@ -1,6 +1,6 @@
 """Ladezeit 2 (23.09., fnFL2x26): the expert-shard consumer pool.
 
-Measured with SGLANG_LOAD_PROFILE on fnFL2x26: 50 % of a 107 s rank load was
+Measured with FLLIPER_LOAD_PROFILE on fnFL2x26: 50 % of a 107 s rank load was
 the per-shard strided host copy in FusedMoE._load_w13/_load_w2, serial on the
 loader thread while the eight file workers waited. The pool takes those
 calls off that thread. These cases pin what would load SILENTLY WRONG or
@@ -18,8 +18,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.model_loader import load_consumer as lc
+from flliper.srt.environ import envs
+from flliper.srt.model_loader import load_consumer as lc
 
 
 def _stacked_param(E=6, rows=64, cols=32):
@@ -53,7 +53,7 @@ def _fill(param, shards, pool):
 def test_parallel_and_serial_form_write_identical_bytes():
     shards = _shards()
     serial = _stacked_param()
-    with envs.SGLANG_LOAD_CONSUMER_THREADS.override(0):
+    with envs.FLLIPER_LOAD_CONSUMER_THREADS.override(0):
         _fill(serial, shards, lc.ExpertLoadPool(lc.consumer_threads()))
     parallel = _stacked_param()
     _fill(parallel, shards, lc.ExpertLoadPool(4))
@@ -129,11 +129,11 @@ def test_the_env_default_is_four_consumers():
     """Bookkeeping: the default is the production form (Ladezeit 2 ON);
     a stray os.environ read or a flipped default would load serially again
     without any boot noticing."""
-    with envs.SGLANG_LOAD_CONSUMER_THREADS.override(None):
+    with envs.FLLIPER_LOAD_CONSUMER_THREADS.override(None):
         pass
-    envs.SGLANG_LOAD_CONSUMER_THREADS.clear()
+    envs.FLLIPER_LOAD_CONSUMER_THREADS.clear()
     assert lc.consumer_threads() == 4
-    with envs.SGLANG_LOAD_CONSUMER_THREADS.override(-3):
+    with envs.FLLIPER_LOAD_CONSUMER_THREADS.override(-3):
         assert lc.consumer_threads() == 0
 
 
@@ -171,7 +171,7 @@ def test_deferred_work_runs_on_the_loader_thread_at_submit_and_drain():
 def test_the_presplit_trigger_hands_off_to_the_loader_thread():
     """Bound to FusedMoE._ct_stream_note itself: the last shard of a layer
     landing in a consumer thread must NOT run the presplit there."""
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     fired_on = []
 

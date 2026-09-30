@@ -43,11 +43,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.environ import envs
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.models.deepseek_v4 import (
+from flliper.srt.configs.deepseek_v4 import DeepSeekV4Config
+from flliper.srt.environ import envs
+from flliper.srt.layers.linear import ReplicatedLinear
+from flliper.srt.layers.quantization.fp8 import Fp8Config
+from flliper.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     _misaligned_scale_block_axis,
     _warn_wqkv_a_fusion_auto_off,
@@ -55,9 +55,9 @@ from sglang.srt.models.deepseek_v4 import (
     _wqkv_a_scale_block_misalignment,
     _wqkv_a_fusion_survives_quant_format,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.runtime_context import get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -214,7 +214,7 @@ def _mxfp8_stream(q_rows: int, seed: int = 11):
 
 
 def _run_load(stub, stream) -> None:
-    with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+    with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
         DeepseekV4ForCausalLM.load_weights(stub, iter(stream))
 
 
@@ -385,7 +385,7 @@ class TestPreFixJoinIsSilentlyWrong(CustomTestCase):
         stream, tensors = _fp8_block_stream(_MISALIGNED_Q)
 
         with mock.patch(
-            "sglang.srt.models.deepseek_v4._misaligned_scale_block_axis", _no_guard
+            "flliper.srt.models.deepseek_v4._misaligned_scale_block_axis", _no_guard
         ):
             sink = _load_fused(
                 _MISALIGNED_Q,
@@ -449,7 +449,7 @@ class TestPreFixJoinIsSilentlyWrong(CustomTestCase):
         stream, tensors = _fp8_block_stream(_ALIGNED_Q)
 
         with mock.patch(
-            "sglang.srt.models.deepseek_v4._misaligned_scale_block_axis", _no_guard
+            "flliper.srt.models.deepseek_v4._misaligned_scale_block_axis", _no_guard
         ):
             sink = _load_fused(
                 _ALIGNED_Q,
@@ -484,7 +484,7 @@ class TestConstructionTimeRefusal(CustomTestCase):
         _warn_wqkv_a_fusion_auto_off.cache_clear()
         linear = _fused_linear(_fp8_block_config(), _MISALIGNED_Q + _KV_ROWS)
 
-        with self.assertLogs("sglang.srt.models.deepseek_v4", level="WARNING") as logs:
+        with self.assertLogs("flliper.srt.models.deepseek_v4", level="WARNING") as logs:
             self.assertFalse(
                 _wqkv_a_fusion_survives_quant_format(
                     linear, False, q_rows=_MISALIGNED_Q
@@ -492,7 +492,7 @@ class TestConstructionTimeRefusal(CustomTestCase):
             )
 
         message = "\n".join(logs.output)
-        self.assertIn("SGLANG_OPT_FUSE_WQA_WKV", message)
+        self.assertIn("FLLIPER_OPT_FUSE_WQA_WKV", message)
         self.assertIn("128-row BLOCK axis", message)
         self.assertIn(str(_MISALIGNED_Q), message)
         self.assertIn("104", message)
@@ -504,7 +504,7 @@ class TestConstructionTimeRefusal(CustomTestCase):
 
         message = str(ctx.exception)
         self.assertIn("requested explicitly", message)
-        self.assertIn("SGLANG_OPT_FUSE_WQA_WKV=0", message)
+        self.assertIn("FLLIPER_OPT_FUSE_WQA_WKV=0", message)
         self.assertIn("BLOCK axis", message)
 
     def test_a_caller_that_does_not_know_the_cut_keeps_the_old_behaviour(self):
@@ -521,7 +521,7 @@ class TestConstructionTimeRefusal(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.models.deepseek_v4 import MqaAttentionBase
+        from flliper.srt.models.deepseek_v4 import MqaAttentionBase
 
         source = inspect.getsource(MqaAttentionBase.__init__)
         self.assertIn("_wqkv_a_fusion_survives_quant_format(", source)
@@ -552,7 +552,7 @@ class TestLoadTimeBackstop(CustomTestCase):
         message = str(ctx.exception)
         self.assertIn("cannot load the fused wqkv_a", message)
         self.assertIn("128-row BLOCK axis", message)
-        self.assertIn("SGLANG_OPT_FUSE_WQA_WKV=0", message)
+        self.assertIn("FLLIPER_OPT_FUSE_WQA_WKV=0", message)
 
     def test_an_unfused_build_is_never_refused(self):
         """Nothing to misalign when the two projections stayed split."""

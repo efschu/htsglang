@@ -93,25 +93,25 @@ from unittest import mock
 import torch
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.test.ci.ci_register import register_cpu_ci
 except ImportError:  # pragma: no cover - registration is a CI-time marker
 
     def register_cpu_ci(*args, **kwargs):
         return None
 
 
-from sglang.srt.managers.prefetch_ballot import (
+from flliper.srt.managers.prefetch_ballot import (
     PREFETCH_BALLOT_SLOTS,
     build_prefetch_ballot_payload,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.common import (
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.common import (
     peer_needs_mamba_evict,
     uniform_mamba_avail_for_evict,
 )
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -654,7 +654,7 @@ class WiredIntoTheProductionSitesTest(CustomTestCase):
     def test_alloc_req_slots_consults_the_floor(self):
         import inspect
 
-        from sglang.srt.mem_cache import common
+        from flliper.srt.mem_cache import common
 
         src = inspect.getsource(common.alloc_req_slots)
         self.assertIn("uniform_mamba_avail_for_evict", src)
@@ -665,8 +665,8 @@ class WiredIntoTheProductionSitesTest(CustomTestCase):
     def test_the_alloc_failure_sites_consult_the_peer_gate(self):
         import inspect
 
-        from sglang.srt.mem_cache import mamba_radix_cache
-        from sglang.srt.mem_cache.unified_cache_components import mamba_component
+        from flliper.srt.mem_cache import mamba_radix_cache
+        from flliper.srt.mem_cache.unified_cache_components import mamba_component
 
         # The ACTIVE implementation for hybrid SSM under hierarchical cache.
         src = inspect.getsource(mamba_component.MambaComponent)
@@ -682,14 +682,14 @@ class WiredIntoTheProductionSitesTest(CustomTestCase):
     def test_the_false_rank_uniform_claim_is_gone(self):
         import inspect
 
-        from sglang.srt.mem_cache import mamba_radix_cache
+        from flliper.srt.mem_cache import mamba_radix_cache
 
         doc = inspect.getdoc(mamba_radix_cache.MambaRadixCache._alloc_mamba_slot)
         self.assertNotIn("Rank-uniform without a collective:", doc)
         self.assertIn("NOT rank-uniform on its own", doc)
 
     def test_the_floor_is_declared_on_the_base_class(self):
-        from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+        from flliper.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
         self.assertIsNone(BasePrefixCache.uniform_mamba_avail_floor)
 
@@ -719,7 +719,7 @@ def _run_allnothing_trigger(tree, *, use_floor):
 
 def _has_prefix(prefix_lens):
     """The REAL predicate the detector's message names, not a paraphrase."""
-    from sglang.srt.layers.dcp.lockstep import weightless_has_prefix
+    from flliper.srt.layers.dcp.lockstep import weightless_has_prefix
 
     return weightless_has_prefix(False, prefix_lens)
 
@@ -829,7 +829,7 @@ class TheDetectorStaysADetectorTest(CustomTestCase):
     def test_the_check_refuses_rather_than_clamping(self):
         import inspect
 
-        from sglang.srt.layers.dcp import prefix_lens_check
+        from flliper.srt.layers.dcp import prefix_lens_check
 
         src = inspect.getsource(prefix_lens_check.assert_prefix_lens_rank_uniform)
         self.assertIn("raise PrefixLensRankDivergence", src)
@@ -840,7 +840,7 @@ class TheDetectorStaysADetectorTest(CustomTestCase):
     def test_prepare_for_extend_does_not_min_reduce_the_vector(self):
         import inspect
 
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from flliper.srt.managers.schedule_batch import ScheduleBatch
 
         src = inspect.getsource(ScheduleBatch.prepare_for_extend)
         head = src[: src.index("assert_prefix_lens_rank_uniform(prefix_lens)")]
@@ -856,7 +856,7 @@ class TheDetectorStaysADetectorTest(CustomTestCase):
         is bound to the node the match reached, not to a length."""
         import inspect
 
-        from sglang.srt.mem_cache.unified_cache_components import mamba_component
+        from flliper.srt.mem_cache.unified_cache_components import mamba_component
 
         src = inspect.getsource(mamba_component.MambaComponent.finalize_match_result)
         self.assertIn("mamba_value = last_node.component_data", src)

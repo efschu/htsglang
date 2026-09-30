@@ -49,8 +49,8 @@ divergence between ranks.
 import inspect
 import unittest
 
-from sglang.srt.managers import prefetch_ballot
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import prefetch_ballot
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -222,7 +222,7 @@ class TheLatchIsGoneAndTheRecoveryEdgeExists(unittest.TestCase):
         )
 
     def _source(self):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         return self._code_only(inspect.getsource(Scheduler._update_uniform_pool_budget))
 

@@ -46,7 +46,7 @@ and not an inert flag.
 
 import unittest
 
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.server_args import ServerArgs
 
 
 def _raw(**kw):

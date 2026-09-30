@@ -3,28 +3,28 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
 from fastapi.responses import JSONResponse  # noqa: E402
 
-from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
-from sglang.srt.entrypoints.anthropic.serving import (  # noqa: E402
+from flliper.srt.entrypoints.anthropic.serving import (  # noqa: E402
     AnthropicServing,
     ToolCallAssemblyError,
 )
-from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
+from flliper.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from sglang.srt.parser.template_detection import (  # noqa: E402
+from flliper.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
 )
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -188,7 +188,7 @@ class TestAnthropicServing(unittest.TestCase):
                                     {
                                         "index": 0,
                                         "type": "function",
-                                        "function": {"arguments": ': "sglang"}'},
+                                        "function": {"arguments": ': "flliper"}'},
                                     }
                                 ]
                             }
@@ -349,7 +349,7 @@ class TestAnthropicServing(unittest.TestCase):
                                 "content": [
                                     {
                                         "type": "search_result",
-                                        "title": "SGLang docs",
+                                        "title": "fLLiper docs",
                                         "source": "https://docs.sglang.ai",
                                         "content": [
                                             {
@@ -373,7 +373,7 @@ class TestAnthropicServing(unittest.TestCase):
             if msg["role"] == "tool"
         ][0]
 
-        self.assertIn("SGLang docs", tool_message["content"])
+        self.assertIn("fLLiper docs", tool_message["content"])
         self.assertIn("https://docs.sglang.ai", tool_message["content"])
         self.assertIn("Anthropic API notes", tool_message["content"])
 
@@ -382,7 +382,7 @@ class TestAnthropicServing(unittest.TestCase):
             {
                 "model": "test-model",
                 "max_tokens": 16,
-                "messages": [{"role": "user", "content": "search sglang"}],
+                "messages": [{"role": "user", "content": "search flliper"}],
                 "tools": [{"name": "web_search", "type": "web_search_20250305"}],
                 "tool_choice": {"type": "auto"},
             }
@@ -689,7 +689,7 @@ class TestAnthropicServing(unittest.TestCase):
             thinking={"type": "enabled", "budget_tokens": 2048}, stream=False
         )
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+            "flliper.srt.entrypoints.anthropic.serving", level=logging.WARNING
         ) as log:
             chat_request = serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
@@ -801,7 +801,7 @@ class TestAnthropicServing(unittest.TestCase):
             stream=False,
         )
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+            "flliper.srt.entrypoints.anthropic.serving", level=logging.WARNING
         ) as log:
             serving._convert_to_chat_completion_request(request)
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
@@ -838,7 +838,7 @@ class TestAnthropicServing(unittest.TestCase):
             stream=False,
         )
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+            "flliper.srt.entrypoints.anthropic.serving", level=logging.INFO
         ) as log:
             chat_request = serving._convert_to_chat_completion_request(request)
         # max_tokens is untouched
@@ -852,7 +852,7 @@ class TestAnthropicServing(unittest.TestCase):
         serving = self._serving()
         request = self._anthropic_request(betas=["thinking-2025-08-04"], stream=False)
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.INFO
+            "flliper.srt.entrypoints.anthropic.serving", level=logging.INFO
         ) as log:
             serving._convert_to_chat_completion_request(request)
         self.assertTrue(any("thinking-2025-08-04" in r for r in log.output))
@@ -916,7 +916,7 @@ class TestAnthropicServing(unittest.TestCase):
             ],
         )
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
+            "flliper.srt.entrypoints.anthropic.serving", level="WARNING"
         ) as log:
             chat_request = serving._convert_to_chat_completion_request(request)
         self.assertTrue(any("redacted_thinking" in line for line in log.output))
@@ -1468,7 +1468,7 @@ class TestAnthropicServing(unittest.TestCase):
         )
         serving = self._serving()
         with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+            "flliper.srt.entrypoints.anthropic.serving", level=logging.WARNING
         ) as log:
             anthropic_response = serving._convert_response(response)
         self.assertEqual(anthropic_response.stop_reason, "end_turn")

@@ -4,7 +4,7 @@ import os
 
 import torch
 
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_store as es
 
 
 def test_global_rows_skip_the_pad_expert():

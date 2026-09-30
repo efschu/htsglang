@@ -3,9 +3,9 @@ from __future__ import annotations
 import unittest
 from typing import ClassVar
 
-from sglang.srt.kv_canary.perturb.config import TargetGroupKind
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kv_canary.pd_fixture import CanaryPDFixture
+from flliper.srt.kv_canary.perturb.config import TargetGroupKind
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kv_canary.pd_fixture import CanaryPDFixture
 
 register_cuda_ci(est_time=180, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=231, stage="extra-a", runner_config="2-gpu-large-amd")
@@ -21,15 +21,15 @@ class _PDPerturbBase(CanaryPDFixture):
                 "abstract base; concrete subclasses set model_mode + target_group"
             )
         cls.extra_prefill_env = {
-            "SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "1.0",
-            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
-            "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+            "FLLIPER_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "1.0",
+            "FLLIPER_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
+            "FLLIPER_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
         }
         cls.extra_decode_env = {
-            "SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "0",
-            "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0",
-            "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0",
-            "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0",
+            "FLLIPER_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "0",
+            "FLLIPER_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0",
+            "FLLIPER_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0",
+            "FLLIPER_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0",
         }
         super().setUpClass()
 

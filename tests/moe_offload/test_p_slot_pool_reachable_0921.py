@@ -7,10 +7,10 @@ JEDE Residenz-Fraction (0.30, 0.55, 0.90), weil `_rank_moe_ratio_vector`
 None lieferte und der Block in `_expert_store_rows_for` uebersprungen wurde.
 """
 
-from sglang.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_offload as eo
 
 
-def test_p_ohne_ratio_bekommt_trivialen_vektor():
+def test_p_without_ratio_gets_trivial_vector():
     """Ein Rang haelt alle Experten -- das ist keine Annahme, sondern die
     Definition von tp_size==1. VOR dem Fix war das None."""
 
@@ -21,7 +21,7 @@ def test_p_ohne_ratio_bekommt_trivialen_vektor():
     assert eo._rank_moe_ratio_vector(LayerP()) == [512]
 
 
-def test_gesetzter_vektor_bleibt_unveraendert():
+def test_set_vector_stays_unchanged():
     """Gruppe D faehrt --rank-moe-ratio 183,137,168 (fnFA22-Bestform)."""
 
     class LayerD:
@@ -31,7 +31,7 @@ def test_gesetzter_vektor_bleibt_unveraendert():
     assert eo._rank_moe_ratio_vector(LayerD()) == [183, 137, 168]
 
 
-def test_ohne_expertenzahl_wird_nicht_geraten():
+def test_without_expert_count_no_guess():
     """Kein Vektor UND keine Expertenzahl -> None. Ein Default auf einem
     Rechenpfad waere eine Zahl, die nichts bedeutet und trotzdem zaehlt."""
 

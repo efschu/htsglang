@@ -28,7 +28,7 @@ import contextlib
 import unittest
 from unittest import mock
 
-from sglang.srt.utils import common
+from flliper.srt.utils import common
 
 # The rig this was found on: card 0 is the 5090, card 1 a 3080.
 _SM120 = (12, 0)
@@ -155,7 +155,7 @@ class TestFp8DispatchIsPerDevice(unittest.TestCase):
     """The FP8 dispatch layer, which is where this was found."""
 
     def _fp8_utils(self):
-        from sglang.srt.layers.quantization import fp8_utils
+        from flliper.srt.layers.quantization import fp8_utils
 
         return fp8_utils
 
@@ -222,7 +222,7 @@ class TestPdlIsPerDevice(unittest.TestCase):
     """
 
     def test_pdl_answers_per_device(self):
-        from sglang.srt.layers import fused_qk_rmsnorm_rope_gate as mod
+        from flliper.srt.layers import fused_qk_rmsnorm_rope_gate as mod
 
         rig = {0: (9, 0), 1: (8, 6)}
         with two_architecture_rig(rig=rig):
@@ -230,7 +230,7 @@ class TestPdlIsPerDevice(unittest.TestCase):
             self.assertFalse(mod._pdl_supported(1))
 
     def test_launch_asks_about_the_activation_s_card(self):
-        from sglang.srt.layers import fused_qk_rmsnorm_rope_gate as mod
+        from flliper.srt.layers import fused_qk_rmsnorm_rope_gate as mod
 
         rig = {0: (9, 0), 1: (8, 6)}
         with two_architecture_rig(rig=rig):

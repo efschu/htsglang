@@ -45,8 +45,8 @@ def main(args):
             port=args.port,
             url="http://localhost",
         )
-    elif args.backend == "sglang":
-        lm = dspy.HFClientSGLang(
+    elif args.backend == "flliper":
+        lm = dspy.HFClientFlliper(
             model="meta-llama/Llama-2-7b-chat-hf",
             port=args.port,
             url="http://localhost",
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-threads", type=int, default=32)
     parser.add_argument("--dev-size", type=int, default=150)
     parser.add_argument(
-        "--backend", type=str, choices=["sglang", "tgi", "vllm"], default="sglang"
+        "--backend", type=str, choices=["flliper", "tgi", "vllm"], default="flliper"
     )
     args = parser.parse_args()
 
@@ -185,7 +185,7 @@ if __name__ == "__main__":
             "vllm": 21000,
             "lightllm": 22000,
             "tgi": 24000,
-            "sglang": 30000,
+            "flliper": 30000,
         }
         args.port = default_port.get(args.backend, None)
 

@@ -21,7 +21,7 @@ def _model(actorder):
 
 
 def test_g_idx_placeholders_without_actorder_are_not_unloaded():
-    from sglang.srt.model_loader.weight_utils import (
+    from flliper.srt.model_loader.weight_utils import (
         load_time_derived_param_names,
         raise_on_unloaded_draft_parameters,
     )
@@ -35,7 +35,7 @@ def test_g_idx_placeholders_without_actorder_are_not_unloaded():
 
 
 def test_g_idx_with_actorder_still_counts_as_unloaded():
-    from sglang.srt.model_loader.weight_utils import raise_on_unloaded_draft_parameters
+    from flliper.srt.model_loader.weight_utils import raise_on_unloaded_draft_parameters
 
     model = _model("group")
     with pytest.raises(ValueError, match="g_idx"):
@@ -44,7 +44,7 @@ def test_g_idx_with_actorder_still_counts_as_unloaded():
 
 
 def test_a_real_unloaded_weight_is_still_reported():
-    from sglang.srt.model_loader.weight_utils import raise_on_unloaded_draft_parameters
+    from flliper.srt.model_loader.weight_utils import raise_on_unloaded_draft_parameters
 
     with pytest.raises(ValueError, match="fc.weight"):
         raise_on_unloaded_draft_parameters(

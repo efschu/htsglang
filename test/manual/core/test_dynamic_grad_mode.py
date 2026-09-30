@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from sglang.srt.utils import DynamicGradMode
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import DynamicGradMode
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestDynamicGradMode(CustomTestCase):

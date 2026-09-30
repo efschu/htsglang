@@ -31,21 +31,21 @@ import types
 import pytest
 import torch
 
-from sglang.srt.layers.attention.flashinfer_backend import (
+from flliper.srt.layers.attention.flashinfer_backend import (
     FlashInferIndicesUpdaterDecode,
     FlashInferIndicesUpdaterPrefill,
     _dcp_host_total_tokens,
 )
-from sglang.srt.layers.dcp.layout import (
+from flliper.srt.layers.dcp.layout import (
     dcp_host_even_total,
     dcp_host_lens,
     dcp_host_total_tokens,
     get_dcp_lens,
 )
-from sglang.srt.speculative.spec_info import SpecInputType
+from flliper.srt.speculative.spec_info import SpecInputType
 
-_FLASHINFER = "sglang.srt.layers.attention.flashinfer_backend"
-_TRITON = "sglang.srt.layers.attention.triton_backend"
+_FLASHINFER = "flliper.srt.layers.attention.flashinfer_backend"
+_TRITON = "flliper.srt.layers.attention.triton_backend"
 
 # The rig's weighted split for rank 0 (the 5090): 30/64 of the tokens.
 _CP_S, _CP_LO, _CP_HI, _CP_RATIO = 64, 0, 30, 30
@@ -512,7 +512,7 @@ def test_verify_site_falls_back_when_the_mirror_is_stale(monkeypatch):
 
 
 def _fake_triton_backend(weighted: bool):
-    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from flliper.srt.layers.attention.triton_backend import TritonAttnBackend
 
     fake = types.SimpleNamespace(
         uneven_dcp_weighted=weighted,
@@ -678,8 +678,8 @@ def test_update_single_wrapper_forwards_the_prefix_mirror_on_the_ragged_path():
 @pytest.mark.parametrize(
     "source",
     [
-        "sglang/srt/layers/attention/flashinfer_backend.py",
-        "sglang/srt/layers/attention/triton_backend.py",
+        "flliper/srt/layers/attention/flashinfer_backend.py",
+        "flliper/srt/layers/attention/triton_backend.py",
     ],
 )
 def test_no_owner_rule_builder_call_is_left_unwired(source):
@@ -689,9 +689,9 @@ def test_no_owner_rule_builder_call_is_left_unwired(source):
     import pathlib
     import re
 
-    import sglang
+    import flliper
 
-    root = pathlib.Path(sglang.__file__).resolve().parents[1]
+    root = pathlib.Path(flliper.__file__).resolve().parents[1]
     text = (root / source).read_text()
     # Call sites only: the alias assignment and the import carry no "(".
     starts = [

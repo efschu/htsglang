@@ -7,7 +7,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 
-from sglang.srt.layers.moe import expert_oracle_dump as od
+from flliper.srt.layers.moe import expert_oracle_dump as od
 
 
 def test_records_small_forwards_and_flushes_files(tmp_path):
@@ -33,10 +33,10 @@ def test_records_small_forwards_and_flushes_files(tmp_path):
 
 
 def test_other_ranks_and_unset_env_record_nothing(tmp_path, monkeypatch):
-    monkeypatch.setenv("SGLANG_EXPERT_ORACLE_DUMP_RANKS", "0")
+    monkeypatch.setenv("FLLIPER_EXPERT_ORACLE_DUMP_RANKS", "0")
     od._reset_for_tests(str(tmp_path), rank=1)
     assert not od.record_target("p", 0, torch.randn(1, 4), torch.zeros(1, 2))
-    monkeypatch.setenv("SGLANG_EXPERT_ORACLE_DUMP_RANKS", "all")
+    monkeypatch.setenv("FLLIPER_EXPERT_ORACLE_DUMP_RANKS", "all")
     od._reset_for_tests(str(tmp_path), rank=2)
     assert od.record_target("p", 0, torch.randn(1, 4), torch.zeros(1, 2))
     od.flush()

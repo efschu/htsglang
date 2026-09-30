@@ -1,4 +1,4 @@
-"""SGLANG_DFLASH_PLAN_SYNC_FREE: the DFLASH decode round plans without host reads.
+"""FLLIPER_DFLASH_PLAN_SYNC_FREE: the DFLASH decode round plans without host reads.
 
 Measured on the 27B D group (xsn421/xsn422, D TP0, bs 1): the host waited in
 every round for the draft forward -- owner.py ``compact[owned]`` (83-105
@@ -29,26 +29,26 @@ import types
 import pytest
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention import flashinfer_backend as fib
-from sglang.srt.layers.attention.flashinfer_backend import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention import flashinfer_backend as fib
+from flliper.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferIndicesUpdaterPrefill,
 )
-from sglang.srt.layers.dcp import owner
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp import owner
+from flliper.srt.layers.dcp.owner import (
     build_dcp_weighted_kv_indices,
     build_dcp_weighted_kv_indices_sync_free,
     dcp_weighted_pack_owned,
     dcp_weighted_read_slots,
 )
-from sglang.srt.layers.dcp.verify_preplan import (
+from flliper.srt.layers.dcp.verify_preplan import (
     DcpVerifyPrebuilt,
     host_arange_indptr,
     host_indptr_from_lens,
     host_ones,
 )
-from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from flliper.srt.speculative.dflash_info import DFlashVerifyInput
 
 # The rig's D split (--rank-tp-ratio 58,25,25) plus shapes that stress the rule.
 PLANS = ([58, 25, 25], [2, 1, 1], [1, 1, 1], [30, 17, 17])
@@ -85,7 +85,7 @@ def cpu_kernel(monkeypatch):
     k = _CpuKvIndicesKernel()
     monkeypatch.setattr(owner, "create_flashinfer_kv_indices_triton", k)
     monkeypatch.setattr(
-        "sglang.srt.speculative.dflash_info.create_flashinfer_kv_indices_triton", k
+        "flliper.srt.speculative.dflash_info.create_flashinfer_kv_indices_triton", k
     )
     return k
 
@@ -522,7 +522,7 @@ def _run_window(upd, seq_lens):
 
 
 def test_window_wrapper_gets_a_host_mirror_with_the_switch(monkeypatch):
-    monkeypatch.setenv("SGLANG_DFLASH_PLAN_SYNC_FREE", "1")
+    monkeypatch.setenv("FLLIPER_DFLASH_PLAN_SYNC_FREE", "1")
 
     def _no_device_sum(lens_cpu, lens):
         assert lens_cpu is not None, "window wrapper fell back to the device sum"
@@ -539,8 +539,8 @@ def test_window_wrapper_gets_a_host_mirror_with_the_switch(monkeypatch):
 
 
 def test_window_wrapper_is_unchanged_without_the_switch(monkeypatch):
-    monkeypatch.delenv("SGLANG_DFLASH_PLAN_SYNC_FREE", raising=False)
-    assert envs.SGLANG_DFLASH_PLAN_SYNC_FREE.get() is False
+    monkeypatch.delenv("FLLIPER_DFLASH_PLAN_SYNC_FREE", raising=False)
+    assert envs.FLLIPER_DFLASH_PLAN_SYNC_FREE.get() is False
     upd, seen = _window_updater(window=16)
     _run_window(upd, torch.tensor([10, 40], dtype=torch.int32))
     (a0, k0), _ = seen
@@ -553,7 +553,7 @@ def test_window_wrapper_is_unchanged_without_the_switch(monkeypatch):
 
 
 def _worker(*, switch=True, compact=True, page_size=1, target_backend=None):
-    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+    from flliper.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
     w = types.SimpleNamespace(
         _plan_sync_free=switch,
@@ -629,16 +629,16 @@ def test_worker_prebuild_skips_a_target_without_weighted_dcp():
 
 
 def test_vram_peak_fast_read_is_the_same_key(monkeypatch):
-    from sglang.srt.model_executor import vram_family_census as vfc
+    from flliper.srt.model_executor import vram_family_census as vfc
 
     nested = {"allocated_bytes": {"all": {"peak": 7 * 2**30, "current": 1}}}
     monkeypatch.setattr(torch._C, "_cuda_memoryStats", lambda dev: nested, raising=False)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: 123)
 
-    monkeypatch.delenv("SGLANG_VRAM_PEAK_FAST_READ", raising=False)
+    monkeypatch.delenv("FLLIPER_VRAM_PEAK_FAST_READ", raising=False)
     assert vfc._max_allocated_bytes(torch.cuda) == 123  # off: the public call
-    monkeypatch.setenv("SGLANG_VRAM_PEAK_FAST_READ", "1")
+    monkeypatch.setenv("FLLIPER_VRAM_PEAK_FAST_READ", "1")
     assert vfc._max_allocated_bytes(torch.cuda) == 7 * 2**30
 
     # A stand-in module (the tests' injection seam) is never bypassed.

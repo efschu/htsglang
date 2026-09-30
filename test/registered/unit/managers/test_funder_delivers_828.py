@@ -81,12 +81,12 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.funding_authority import (
+from flliper.srt.managers.funding_authority import (
     CAUSE_FUNDED,
     CAUSE_PHANTOM,
     authority_from_seam_snapshot,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 MIB = 1024 * 1024
 
@@ -384,7 +384,7 @@ class TheSeamCensusSpendsTheMeasurement(unittest.TestCase):
         _rank = 0
 
     def _census(self, **attrs):
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         stub = self._Runtime()
         for k, v in attrs.items():

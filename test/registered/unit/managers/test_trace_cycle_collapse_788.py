@@ -70,8 +70,8 @@ import re
 import types
 import unittest
 
-SCHEDULER_LOGGER = "sglang.srt.managers.scheduler"
-PARKED_LOGGER = "sglang.srt.managers.parked_decode_set"
+SCHEDULER_LOGGER = "flliper.srt.managers.scheduler"
+PARKED_LOGGER = "flliper.srt.managers.parked_decode_set"
 
 
 class _Grab(logging.Handler):
@@ -124,7 +124,7 @@ class _Rank:
     """
 
     def __init__(self, avail=40830, evictable=130):
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         self.holder = types.SimpleNamespace(
             token_to_kv_pool_allocator=types.SimpleNamespace(
@@ -160,7 +160,7 @@ class CycleCollapseUnit788(unittest.TestCase):
     """The predicate itself, away from either emitter."""
 
     def test_a_constant_stream_collapses_to_one_line(self):
-        from sglang.srt.managers.log_cycle_collapse import CycleCollapse
+        from flliper.srt.managers.log_cycle_collapse import CycleCollapse
 
         c = CycleCollapse(rollup_every=1000)
         verdicts = [c.observe("A") for _ in range(50)]
@@ -169,7 +169,7 @@ class CycleCollapseUnit788(unittest.TestCase):
 
     def test_the_measured_period_three_cycle_collapses(self):
         """instr14's actual parked-receipt shape: A B C A B C A B C ..."""
-        from sglang.srt.managers.log_cycle_collapse import CycleCollapse
+        from flliper.srt.managers.log_cycle_collapse import CycleCollapse
 
         c = CycleCollapse(rollup_every=1000)
         cycle = ["A", "B", "C"]
@@ -181,7 +181,7 @@ class CycleCollapseUnit788(unittest.TestCase):
         self.assertEqual(emitted, 5, "a period-3 cycle did not collapse")
 
     def test_a_break_in_the_cycle_prints_immediately_and_flushes(self):
-        from sglang.srt.managers.log_cycle_collapse import CycleCollapse
+        from flliper.srt.managers.log_cycle_collapse import CycleCollapse
 
         c = CycleCollapse(rollup_every=1000)
         for _ in range(40):
@@ -192,7 +192,7 @@ class CycleCollapseUnit788(unittest.TestCase):
         self.assertEqual(v.period, 1)
 
     def test_a_long_run_reports_periodically(self):
-        from sglang.srt.managers.log_cycle_collapse import CycleCollapse
+        from flliper.srt.managers.log_cycle_collapse import CycleCollapse
 
         every = 16
         c = CycleCollapse(rollup_every=every)
@@ -200,7 +200,7 @@ class CycleCollapseUnit788(unittest.TestCase):
         self.assertEqual([r for r in rollups if r], [every, every])
 
     def test_the_window_is_bounded(self):
-        from sglang.srt.managers.log_cycle_collapse import CycleCollapse
+        from flliper.srt.managers.log_cycle_collapse import CycleCollapse
 
         c = CycleCollapse(max_period=4)
         for i in range(10000):
@@ -301,7 +301,7 @@ class PPAdmissionCycleCollapse788(unittest.TestCase):
         """(iv) Under a sustained burst there is no changed payload to flush
         against, so without a periodic roll-up the log would be
         indistinguishable from a dead instrument."""
-        from sglang.srt.managers.log_cycle_collapse import (
+        from flliper.srt.managers.log_cycle_collapse import (
             CYCLE_COLLAPSE_ROLLUP_EVERY as every,
         )
 
@@ -364,7 +364,7 @@ class ParkedDecodeCycleCollapse788(unittest.TestCase):
 
     @staticmethod
     def _set(**kwargs):
-        from sglang.srt.managers.parked_decode_set import ParkedDecodeSet
+        from flliper.srt.managers.parked_decode_set import ParkedDecodeSet
 
         kwargs.setdefault("slot_pool", 24)
         kwargs.setdefault("max_running", 8)
@@ -441,7 +441,7 @@ class ParkedDecodeCycleCollapse788(unittest.TestCase):
 
     def test_a_long_run_still_reports_periodically(self):
         """(iv)"""
-        from sglang.srt.managers.log_cycle_collapse import (
+        from flliper.srt.managers.log_cycle_collapse import (
             CYCLE_COLLAPSE_ROLLUP_EVERY as every,
         )
 

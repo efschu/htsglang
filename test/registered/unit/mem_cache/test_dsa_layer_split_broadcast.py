@@ -19,8 +19,8 @@ import unittest
 import torch
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
 
@@ -41,11 +41,11 @@ def _run(rank: int, world: int, port: int):
     os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
     torch.cuda.set_device(rank)
 
-    from sglang.srt.distributed.parallel_state import (
+    from flliper.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from sglang.srt.runtime_context import get_parallel
+    from flliper.srt.runtime_context import get_parallel
 
     init_distributed_environment(
         world_size=world,
@@ -59,7 +59,7 @@ def _run(rank: int, world: int, port: int):
         attention_context_model_parallel_size=world,
     )
 
-    from sglang.srt.mem_cache.dsa_cache_layer_split import (
+    from flliper.srt.mem_cache.dsa_cache_layer_split import (
         LayerSplitDSATokenToKVPool,
     )
 

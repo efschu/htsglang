@@ -13,7 +13,7 @@ import re
 
 import pytest
 
-from sglang.test.ci import ci_register
+from flliper.test.ci import ci_register
 
 
 class DummyClass:

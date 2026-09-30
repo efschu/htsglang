@@ -44,14 +44,14 @@ So ``dcp_size > 1`` is the exact reachable condition, not a widening of it.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestNgramDcpBootReject(unittest.TestCase):
     def test_the_gate_refuses_every_dcp_size_above_one(self):
-        from sglang.srt.speculative.ngram_worker import reject_ngram_verify_under_dcp
+        from flliper.srt.speculative.ngram_worker import reject_ngram_verify_under_dcp
 
         for dcp_size in (2, 3, 4, 8):
             with self.subTest(dcp_size=dcp_size):
@@ -64,7 +64,7 @@ class TestNgramDcpBootReject(unittest.TestCase):
 
     def test_dcp_size_one_is_inert(self):
         """The default path must not move. dcp_size <= 1 is every stock boot."""
-        from sglang.srt.speculative.ngram_worker import reject_ngram_verify_under_dcp
+        from flliper.srt.speculative.ngram_worker import reject_ngram_verify_under_dcp
 
         for dcp_size in (0, 1):
             with self.subTest(dcp_size=dcp_size):
@@ -79,7 +79,7 @@ class TestNgramDcpBootReject(unittest.TestCase):
         """
         import inspect
 
-        from sglang.srt.speculative import ngram_worker
+        from flliper.srt.speculative import ngram_worker
 
         src = inspect.getsource(ngram_worker.NGRAMWorker.__init__)
         self.assertIn("reject_ngram_verify_under_dcp(", src)
@@ -95,7 +95,7 @@ class TestNgramDcpBootReject(unittest.TestCase):
         ``__init__``, before the draft worker is built."""
         import inspect
 
-        from sglang.srt.speculative import frozen_kv_mtp_worker_v2
+        from flliper.srt.speculative import frozen_kv_mtp_worker_v2
 
         src = inspect.getsource(
             frozen_kv_mtp_worker_v2.FrozenKVMTPWorkerV2.__init__
@@ -115,9 +115,9 @@ class TestNgramDcpBootReject(unittest.TestCase):
         the runtime refusals; this gate only moves the moment of truth to boot,
         it does not replace them.
         """
-        import sglang.srt.layers.attention.flashinfer_backend as fb
-        import sglang.srt.layers.attention.triton_backend as tb
-        from sglang.srt.speculative.spec_info import SpecInputType
+        import flliper.srt.layers.attention.flashinfer_backend as fb
+        import flliper.srt.layers.attention.triton_backend as tb
+        from flliper.srt.speculative.spec_info import SpecInputType
 
         self.assertNotIn(SpecInputType.NGRAM_VERIFY, tb._DCP_VERIFY_SPEC_INPUT_TYPES)
         self.assertNotIn(SpecInputType.NGRAM_VERIFY, fb._DCP_VERIFY_SPEC_INPUT_TYPES)
@@ -133,8 +133,8 @@ class TestNgramDcpBootReject(unittest.TestCase):
         added, this test is where its DCP story gets recorded: served by the
         split, or gated at boot.
         """
-        import sglang.srt.layers.attention.triton_backend as tb
-        from sglang.srt.speculative.spec_info import SpecInputType
+        import flliper.srt.layers.attention.triton_backend as tb
+        from flliper.srt.speculative.spec_info import SpecInputType
 
         verify_types = {
             t for t in SpecInputType if t.name.endswith("_VERIFY")

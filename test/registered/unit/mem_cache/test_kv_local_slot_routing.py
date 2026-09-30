@@ -5,7 +5,7 @@ and the translation from a global layer id was written inline as
 `layer_id - self.start_layer` in 64 places. That subtraction is correct only
 while a stage owns a contiguous RANGE.
 
-Under `SGLANG_PP_LAYER_SET` a stage owns a set — for the family plan, the
+Under `FLLIPER_PP_LAYER_SET` a stage owns a set — for the family plan, the
 full-attention layers `{3, 7, 11, …}` of a 64-layer hybrid — and then layer 7's
 local slot is **1** while the subtraction says **4**.
 
@@ -19,15 +19,15 @@ so subtraction and rank-lookup give different answers and a test that passed by
 accident is impossible.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import inspect
 import unittest
 
-from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.memory_pool import KVCache
+from flliper.test.test_utils import CustomTestCase
 
 #: `local_slot` reads exactly these two attributes, so a minimal carrier
 #: exercises the real function without constructing an abstract pool.
@@ -128,7 +128,7 @@ class TestEverySiteWasRouted(CustomTestCase):
         import io
         import tokenize
 
-        from sglang.srt.mem_cache import memory_pool
+        from flliper.srt.mem_cache import memory_pool
 
         src = inspect.getsource(memory_pool)
         code = " ".join(

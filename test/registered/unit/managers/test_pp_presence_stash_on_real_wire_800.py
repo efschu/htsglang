@@ -46,7 +46,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -83,7 +83,7 @@ class _GlooWire:
 
 def _victim_holder(wire, drained_state):
     """The SHIPPED methods bound to a holder carrying only what they read."""
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -115,7 +115,7 @@ def _victim_holder(wire, drained_state):
     # hand. It is the identical object `stash_typed(self.pp_group, ...)` writes
     # into, which is the whole point of this file: the census must read the key
     # the drain actually wrote, not one the test invented.
-    from sglang.srt.distributed.pp_typed_channel import typed_inbox
+    from flliper.srt.distributed.pp_typed_channel import typed_inbox
 
     h._pp_tensor_dict_inbox = typed_inbox(wire)
     for name in (
@@ -135,7 +135,7 @@ def _worker(rank, init_file, out_dir, case):
             "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD
         )
         if rank == UPSTREAM:
-            from sglang.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
+            from flliper.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
 
             wire = _GlooWire(rank, src=DOWNSTREAM, dst=VICTIM)
             kind = "output" if case == "output" else ADMISSION_DECISION_KIND
@@ -144,7 +144,7 @@ def _worker(rank, init_file, out_dir, case):
             # ("kind=admission_decision stamp=None").
             wire.send_tensor_dict({"__msg_type__": kind, "payload": 42})
         elif rank == VICTIM:
-            from sglang.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
+            from flliper.srt.managers.scheduler_pp_mixin import ADMISSION_DECISION_KIND
 
             wire = _GlooWire(rank, src=UPSTREAM, dst=DOWNSTREAM)
             state = {"posted": 1, "consumed": 0}

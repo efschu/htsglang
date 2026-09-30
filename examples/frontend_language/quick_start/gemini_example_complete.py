@@ -4,7 +4,7 @@ export GCP_PROJECT_ID=******
 python3 gemini_example_complete.py
 """
 
-import sglang as sgl
+import flliper as sgl
 
 
 @sgl.function

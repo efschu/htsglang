@@ -1,18 +1,18 @@
-# SGLang Monitoring Setup
+# fLLiper Monitoring Setup
 
-This directory contains a ready-to-use monitoring setup for SGLang using Prometheus and Grafana.
+This directory contains a ready-to-use monitoring setup for fLLiper using Prometheus and Grafana.
 
 ## Prerequisites
 
 - Docker and Docker Compose installed
-- SGLang server running with metrics enabled
+- fLLiper server running with metrics enabled
 
 ## Usage
 
-1. Start your SGLang server with metrics enabled:
+1. Start your fLLiper server with metrics enabled:
 
 ```bash
-python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000 --enable-metrics
+python -m flliper.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --port 30000 --enable-metrics
 ```
 
 By default, the metrics server will run on `127.0.0.1:30000`.
@@ -34,7 +34,7 @@ Default Grafana login credentials:
 
 You'll be prompted to change the password on first login.
 
-4. The SGLang dashboard will be automatically available in the "SGLang Monitoring" folder.
+4. The fLLiper dashboard will be automatically available in the "fLLiper Monitoring" folder.
 
 ## Troubleshooting
 
@@ -61,7 +61,7 @@ If you see errors like "port is already allocated":
 If Grafana cannot connect to Prometheus:
 1. Check that both services are running
 2. Verify the datasource configuration in Grafana
-3. Check that your SGLang server is properly exposing metrics
+3. Check that your fLLiper server is properly exposing metrics
 
 ## Configuration
 
@@ -69,7 +69,7 @@ If Grafana cannot connect to Prometheus:
 - Docker Compose configuration: `docker-compose.yaml`
 - Grafana datasource: `grafana/datasources/datasource.yaml`
 - Grafana dashboard configuration: `grafana/dashboards/config/dashboard.yaml`
-- SGLang dashboard JSON: `grafana/dashboards/json/sglang-dashboard.json`
+- fLLiper dashboard JSON: `grafana/dashboards/json/flliper-dashboard.json`
 
 ## Customization
 

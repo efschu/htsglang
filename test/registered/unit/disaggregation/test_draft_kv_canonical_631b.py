@@ -20,15 +20,15 @@ Three properties, and each exists because getting it wrong is silent:
 
 import unittest
 
-from sglang.srt.disaggregation.draft_kv_canonical import (
+from flliper.srt.disaggregation.draft_kv_canonical import (
     CANONICAL_LAYOUT_VERSION,
     DraftKvCanonicalLayout,
     DraftKvLayoutMismatch,
     check_full_head_shipment_is_justified,
     local_head_window,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

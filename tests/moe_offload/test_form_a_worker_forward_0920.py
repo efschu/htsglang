@@ -17,15 +17,15 @@ the same result afterwards). Under Form A that value exists on one card.
 import pytest
 import torch
 
-from sglang.srt.form_a_construction import HostOnlyModule
-from sglang.srt.form_a_symmetry import (
+from flliper.srt.form_a_construction import HostOnlyModule
+from flliper.srt.form_a_symmetry import (
     CollectiveMismatch,
     FormAWorkerWithoutMoeInput,
     RankTrace,
     probe_form_a_boot,
     trace_forward_edges,
 )
-from sglang.srt.form_a_worker_forward import (
+from flliper.srt.form_a_worker_forward import (
     FormAMoeInputUnavailable,
     FormAWorkerForwardError,
     FormAWorkerLayerMismatch,
@@ -36,7 +36,7 @@ from sglang.srt.form_a_worker_forward import (
     receive_moe_input,
     run_form_a_worker_layers,
 )
-from sglang.srt.rank_role import (
+from flliper.srt.rank_role import (
     RankRoleError,
     RankRolePlan,
     set_form_a_role_plan,
@@ -132,8 +132,8 @@ def test_an_unknown_width_refuses_rather_than_guessing():
 # ==========================================================================
 def test_the_carrier_defaults_to_the_one_that_needs_no_new_transport():
     assert moe_input_carrier({}) == "all_reduce_zero"
-    assert moe_input_carrier({"SGLANG_FORM_A_MOE_INPUT": ""}) == "all_reduce_zero"
-    assert moe_input_carrier({"SGLANG_FORM_A_MOE_INPUT": "broadcast"}) == "broadcast"
+    assert moe_input_carrier({"FLLIPER_FORM_A_MOE_INPUT": ""}) == "all_reduce_zero"
+    assert moe_input_carrier({"FLLIPER_FORM_A_MOE_INPUT": "broadcast"}) == "broadcast"
     assert set(MOE_INPUT_CARRIERS) == {"all_reduce_zero", "broadcast"}
 
 
@@ -141,7 +141,7 @@ def test_an_unknown_carrier_refuses_instead_of_defaulting():
     """Two ranks reading the carrier differently is a HANG, not a
     slowdown: they would enter different ops at the same position."""
     with pytest.raises(RankRoleError, match="hang, not a slowdown"):
-        moe_input_carrier({"SGLANG_FORM_A_MOE_INPUT": "allreduce"})
+        moe_input_carrier({"FLLIPER_FORM_A_MOE_INPUT": "allreduce"})
 
 
 def test_the_broadcast_carrier_uses_the_host_rank_as_source():
@@ -254,7 +254,7 @@ def test_it_is_inert_without_a_role_plan():
      "shared_expert", "hyper_connection", "ple", "draft"],
 )
 def test_every_dense_kind_the_worker_forward_skips_has_a_placeholder(kind):
-    from sglang.srt.form_a_construction import skip_on_worker
+    from flliper.srt.form_a_construction import skip_on_worker
 
     set_form_a_role_plan(FORM_A, 1)
     ph = skip_on_worker(kind, f"layers.0.{kind}")
@@ -263,7 +263,7 @@ def test_every_dense_kind_the_worker_forward_skips_has_a_placeholder(kind):
 
 
 def test_the_router_is_the_one_moe_side_module_a_worker_still_builds():
-    from sglang.srt.form_a_construction import skip_on_worker
+    from flliper.srt.form_a_construction import skip_on_worker
 
     set_form_a_role_plan(FORM_A, 1)
     assert skip_on_worker("experts") is None
@@ -342,12 +342,12 @@ def test_the_probe_still_refuses_the_48_collective_configuration():
 # 7. The boot gate declares the carrier, so a divergent env is caught
 # ==========================================================================
 def test_the_boot_gate_catches_two_ranks_reading_different_carriers():
-    from sglang.srt.form_a_boot_gate import (
+    from flliper.srt.form_a_boot_gate import (
         FormARanksDisagree,
         declare_layer_collectives,
         assert_ranks_agree,
     )
-    from sglang.srt.form_a_boot_gate import _encode
+    from flliper.srt.form_a_boot_gate import _encode
 
     def _ops(rank, carrier):
         return declare_layer_collectives(
@@ -367,7 +367,7 @@ def test_the_boot_gate_catches_two_ranks_reading_different_carriers():
 
 
 def test_the_boot_gate_passes_when_every_rank_reads_the_same_carrier():
-    from sglang.srt.form_a_boot_gate import gate_form_a_boot
+    from flliper.srt.form_a_boot_gate import gate_form_a_boot
 
     def _gather(blob):
         return [blob, blob, blob]
@@ -396,7 +396,7 @@ def test_the_boot_gate_and_the_worker_forward_have_real_call_sites():
     than by running it, because running it needs three GPUs."""
     import inspect
 
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from flliper.srt.model_executor.model_runner import ModelRunner
 
     src = inspect.getsource(ModelRunner._forward_raw)
     assert "self._run_form_a_boot_gate()" in src
@@ -416,7 +416,7 @@ def test_the_host_publishes_the_moe_input_in_the_layer_forward():
     the hyper-connection combine and mix, which a worker does not have."""
     import inspect
 
-    from sglang.srt.models import qwen4_exp
+    from flliper.srt.models import qwen4_exp
 
     src = inspect.getsource(
         qwen4_exp.Qwen4ExpLayerExtensionMixin._run_qwen4_exp_mlp

@@ -65,7 +65,7 @@ a measurement, not to a gate:
 Hermetic: host tensors only, no CUDA, no device path.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -73,8 +73,8 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.rotation_executor import TorchRotationOps
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.rotation_executor import TorchRotationOps
+from flliper.test.test_utils import CustomTestCase
 
 CHUNK = 4096
 
@@ -163,7 +163,7 @@ class TestTheSlicingItselfIsObservable(CustomTestCase):
     bounds the copy actually hands out."""
 
     def _bounds_for(self, n, workers):
-        import sglang.srt.model_executor.rotation_executor as rex
+        import flliper.srt.model_executor.rotation_executor as rex
 
         seen = []
 

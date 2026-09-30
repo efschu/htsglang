@@ -5,11 +5,11 @@ from dataclasses import dataclass
 
 import zmq
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.scripted_runtime.tokenizer_recv_proxy import (
     ScriptedTokenizerRecvProxy,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

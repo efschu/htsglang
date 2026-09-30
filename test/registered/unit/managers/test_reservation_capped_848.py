@@ -86,7 +86,7 @@ class TheReservationIsConsultedBeforeTheTarget(unittest.TestCase):
     """RED on integ/round7: the exit name does not exist there."""
 
     def test_the_exit_name_exists(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         self.assertTrue(
             hasattr(K, "FLOOR_NEED_RESERVATION_CAPPED"),
@@ -95,7 +95,7 @@ class TheReservationIsConsultedBeforeTheTarget(unittest.TestCase):
         self.assertIn(K.FLOOR_NEED_RESERVATION_CAPPED, K.FLOOR_NEED_EXITS)
 
     def test_the_window_7_constellation_reports_RESERVATION_CAPPED(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _capped_group()
         _ballot(ranks, close=False)
@@ -133,7 +133,7 @@ class TheReservationIsConsultedBeforeTheTarget(unittest.TestCase):
 
     def test_it_is_DISTINGUISHABLE_from_the_commit_exits(self):
         """The point of the ticket: window 7 could not tell these apart."""
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         capped = _capped_group()
         _ballot(capped, close=False)
@@ -154,7 +154,7 @@ class TheGuardDoesNotOverReach(unittest.TestCase):
     """Danger direction: refusing a grow that WOULD have worked is the bug here."""
 
     def test_a_healthy_reservation_still_grows(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _capped_group(reserved=RESERVATION)  # far above the target
         _ballot(ranks, close=False)
@@ -169,7 +169,7 @@ class TheGuardDoesNotOverReach(unittest.TestCase):
         An off-by-one here would refuse the last legal row and turn a working
         grow into a permanent named refusal -- worse than the defect.
         """
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _capped_group(reserved=W6_LIVE_SPAN)  # target == reservation
         _ballot(ranks, close=False)
@@ -183,7 +183,7 @@ class TheGuardDoesNotOverReach(unittest.TestCase):
         None must mean "no ceiling to check", never "ceiling of zero" -- a pool
         without an arena has to behave exactly as it did before this ticket.
         """
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _group()
         del ranks["PP1"].pool.reserved_backing_rows
@@ -193,7 +193,7 @@ class TheGuardDoesNotOverReach(unittest.TestCase):
         self.assertNotIn(K.FLOOR_NEED_RESERVATION_CAPPED, _exits(ranks["PP1"]))
 
     def test_a_zero_reservation_is_treated_as_unreadable_not_as_a_ceiling(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _capped_group(reserved=0)
         _ballot(ranks, close=False)
@@ -202,7 +202,7 @@ class TheGuardDoesNotOverReach(unittest.TestCase):
         self.assertNotIn(K.FLOOR_NEED_RESERVATION_CAPPED, _exits(ranks["PP1"]))
 
     def test_the_ranks_that_are_not_the_floor_are_untouched(self):
-        from sglang.srt.managers import kv_backing_relief as K
+        from flliper.srt.managers import kv_backing_relief as K
 
         ranks = _capped_group()
         _ballot(ranks, close=False)

@@ -24,21 +24,21 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
-from sglang.srt.planner.power_calibration import (
+from flliper.srt.planner.hardware import GpuDescriptor, HardwareSpec
+from flliper.srt.planner.power_calibration import (
     CardPowerMeasurement,
     PowerCalibrationResult,
     load_power_profile,
     power_profile_by_arch,
     save_power_profile,
 )
-from sglang.srt.planner.card_library import CardSpec, CardLibrary
-from sglang.srt.planner.roofline import (
+from flliper.srt.planner.card_library import CardSpec, CardLibrary
+from flliper.srt.planner.roofline import (
     IDLE_FRACTION_OF_TDP,
     estimate_roofline,
     roofline_energy,
 )
-from sglang.srt.uneven_perf import PlanInputs
+from flliper.srt.uneven_perf import PlanInputs
 
 
 # ---------------------------------------------------------------------------

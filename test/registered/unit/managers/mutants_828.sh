@@ -12,9 +12,9 @@
 set -u
 
 ROOT=${ROOT:-/spinning/htsglang/.claude/worktrees/agent-a598d5da61d3598a3}
-POOL=$ROOT/python/sglang/srt/mem_cache/memory_pool.py
-AUTH=$ROOT/python/sglang/srt/managers/funding_authority.py
-FLIP=$ROOT/python/sglang/srt/managers/phase_flip_runtime.py
+POOL=$ROOT/python/flliper/srt/mem_cache/memory_pool.py
+AUTH=$ROOT/python/flliper/srt/managers/funding_authority.py
+FLIP=$ROOT/python/flliper/srt/managers/phase_flip_runtime.py
 PY=${PY:-/bin/python3}
 
 BAK_DIR=$(mktemp -d)

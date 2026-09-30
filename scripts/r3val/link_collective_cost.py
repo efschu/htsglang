@@ -48,7 +48,7 @@ class Phases:
     (first post_recv, then wait), so the timestamps come from the real call
     sites without editing the transport.
 
-    With more than one UCX worker (SGLANG_BARLINK_UCX_WORKERS, task #266) the
+    With more than one UCX worker (FLLIPER_BARLINK_UCX_WORKERS, task #266) the
     ring and the flat fast paths do not call ``UcpWorker.wait`` at all -- they
     call the transport's ``_wait_split``, which progresses every worker in one
     loop. Both are wrapped: ``_wait_split`` delegates to ``UcpWorker.wait``
@@ -147,7 +147,7 @@ def main():
     dist.init_process_group(backend="gloo", rank=a.rank, world_size=a.world)
     mod = load_transport(a.comm_dir)
     bindings = sys.modules[
-        "sglang.srt.distributed.device_communicators.barlink_ucx_bindings"]
+        "flliper.srt.distributed.device_communicators.barlink_ucx_bindings"]
     lib = bindings.UcpLibrary.instance()
     print(f"[rank {a.rank}] UCX {lib.version_string()} from {lib.path}",
           file=sys.stderr, flush=True)
@@ -163,7 +163,7 @@ def main():
     res = {
         "rank": a.rank, "world": a.world, "iters": a.iters,
         "rndv_thresh": os.environ.get("UCX_RNDV_THRESH", "auto(unset)"),
-        "fp32_reduce": os.environ.get("SGLANG_BARLINK_FP32_REDUCE", "1(default)"),
+        "fp32_reduce": os.environ.get("FLLIPER_BARLINK_FP32_REDUCE", "1(default)"),
         "cells": {},
     }
 

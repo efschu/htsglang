@@ -38,11 +38,11 @@ import sys
 
 import torch
 
-from sglang.srt.distributed.device_communicators import barlink_abort_gate
-from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+from flliper.srt.distributed.device_communicators import barlink_abort_gate
+from flliper.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+from flliper.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     BreakableCUDAGraph,
 )
 

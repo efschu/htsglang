@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from sglang.srt.mem_ledger.calibration import (
+from flliper.srt.mem_ledger.calibration import (
     VRAM_CALIBRATION_VERSION,
     CalibrationProfile,
     CardResidual,
@@ -18,11 +18,11 @@ from sglang.srt.mem_ledger.calibration import (
     load_calibration,
     save_calibration,
 )
-from sglang.srt.mem_ledger.terms import (
+from flliper.srt.mem_ledger.terms import (
     DEFAULT_USER_RESERVE_MIB,
     USER_RESERVE_UNSET,
 )
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.server_args import ServerArgs
 
 MODEL = "/nonexistent/model"
 
@@ -210,10 +210,10 @@ def test_fingerprint_changes_with_card_set_driver_and_build():
 
 def test_calibration_roundtrips_under_its_own_fingerprint(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
+        "flliper.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
     )
     fingerprint, _gpus, _driver = __import__(
-        "sglang.srt.mem_ledger.calibration", fromlist=["live_fingerprint"]
+        "flliper.srt.mem_ledger.calibration", fromlist=["live_fingerprint"]
     ).live_fingerprint(inventory=_inventory())
     save_calibration(_profile(fingerprint), cache_dir=str(tmp_path))
     loaded = load_calibration(cache_dir=str(tmp_path), inventory=_inventory())
@@ -223,7 +223,7 @@ def test_calibration_roundtrips_under_its_own_fingerprint(tmp_path, monkeypatch)
 
 def test_a_calibration_from_another_rig_is_a_miss(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
+        "flliper.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
     )
     save_calibration(_profile("someoneelse"), cache_dir=str(tmp_path))
     assert load_calibration(cache_dir=str(tmp_path), inventory=_inventory()) is None
@@ -231,10 +231,10 @@ def test_a_calibration_from_another_rig_is_a_miss(tmp_path, monkeypatch):
 
 def test_a_version_bump_invalidates_rather_than_reinterprets(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
+        "flliper.srt.mem_ledger.calibration._build_id", lambda: "torch2.9+cuda13"
     )
     calib = __import__(
-        "sglang.srt.mem_ledger.calibration", fromlist=["live_fingerprint"]
+        "flliper.srt.mem_ledger.calibration", fromlist=["live_fingerprint"]
     )
     fingerprint, _gpus, _driver = calib.live_fingerprint(inventory=_inventory())
     path = calibration_cache_path(fingerprint, str(tmp_path))
@@ -257,7 +257,7 @@ def _install_footprints(monkeypatch, *, activation_mib, capture_mib):
     them. Injecting here rather than monkeypatching the old ServerArgs methods
     is the point: those methods are no longer on the ledger's path at all.
     """
-    from sglang.srt.mem_ledger.activation import FootprintProvenance, PhaseFootprint
+    from flliper.srt.mem_ledger.activation import FootprintProvenance, PhaseFootprint
 
     def fake(card_uuid, *, hw_fingerprint, profile, cache_dir=None):
         return PhaseFootprint(
@@ -269,10 +269,10 @@ def _install_footprints(monkeypatch, *, activation_mib, capture_mib):
         )
 
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.activation.resolve_phase_footprint", fake
+        "flliper.srt.mem_ledger.activation.resolve_phase_footprint", fake
     )
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.calibration.live_fingerprint",
+        "flliper.srt.mem_ledger.calibration.live_fingerprint",
         lambda **kw: ("testfp000000", [], "drv"),
     )
 
@@ -296,10 +296,10 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     reaches the ledger through the real ``DemandInputs.from_server_args``,
     which nothing else exercises end to end.
     """
-    import sglang.srt.server_args as sa
-    from sglang.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
+    import flliper.srt.server_args as sa
+    from flliper.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
 
-    monkeypatch.setenv("SGLANG_BARLINK", "1")
+    monkeypatch.setenv("FLLIPER_BARLINK", "1")
 
     class Card:
         def __init__(self, ordinal, uuid, name, total):
@@ -323,7 +323,7 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
         sa, "_resolve_rank_gpu_cards", lambda ids: {i: cards[i] for i in set(ids)}
     )
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.calibration.load_calibration",
+        "flliper.srt.mem_ledger.calibration.load_calibration",
         lambda **kw: CalibrationProfile(
             fingerprint="fp0",
             driver="580",
@@ -392,7 +392,7 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     assert non_kv == {0: 3693, 1: 3693}
     text = caplog.text
     assert "attention workspaces (capped)" in text
-    assert "SGLANG_FLASHINFER_WORKSPACE_SIZE" in text
+    assert "FLLIPER_FLASHINFER_WORKSPACE_SIZE" in text
     assert "VRAM ledger for GPU 0 (RTX 5090" in text
     assert "user reserve (external)" in text
     assert "calibrated@fp0" in text
@@ -407,11 +407,11 @@ def test_the_boot_path_refuses_an_overcommitted_card(monkeypatch):
     once the unrelated #595 NCCL refusal is out of the way. Verdicts of
     different kinds must not stand in for each other.
     """
-    import sglang.srt.server_args as sa
-    from sglang.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
-    from sglang.srt.mem_ledger.terms import LedgerOvercommit
+    import flliper.srt.server_args as sa
+    from flliper.srt.mem_ledger.calibration import CalibrationProfile, CardResidual
+    from flliper.srt.mem_ledger.terms import LedgerOvercommit
 
-    monkeypatch.setenv("SGLANG_BARLINK", "1")
+    monkeypatch.setenv("FLLIPER_BARLINK", "1")
 
     class Card:
         cuda_ordinal = 1
@@ -425,7 +425,7 @@ def test_the_boot_path_refuses_an_overcommitted_card(monkeypatch):
 
     monkeypatch.setattr(sa, "_resolve_rank_gpu_cards", lambda ids: {1: Card()})
     monkeypatch.setattr(
-        "sglang.srt.mem_ledger.calibration.load_calibration",
+        "flliper.srt.mem_ledger.calibration.load_calibration",
         lambda **kw: CalibrationProfile(
             fingerprint="fp0",
             driver="580",

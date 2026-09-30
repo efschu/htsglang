@@ -2,21 +2,21 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.parallel_info import (
     normalize_parallel_info,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
-from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
+from flliper.srt.debug_utils.comparator.dims_spec import ParallelAxis
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 class TestNormalizeParallelInfo:
-    def test_sglang_info(self) -> None:
+    def test_flliper_info(self) -> None:
         meta = {
-            "sglang_parallel_info": {
+            "flliper_parallel_info": {
                 "tp_rank": 2,
                 "tp_size": 4,
                 "pp_rank": 0,
@@ -49,7 +49,7 @@ class TestNormalizeParallelInfo:
 
     def test_both_present_raises(self) -> None:
         meta = {
-            "sglang_parallel_info": {"tp_rank": 0, "tp_size": 2},
+            "flliper_parallel_info": {"tp_rank": 0, "tp_size": 2},
             "megatron_parallel_info": {"tp_rank": 0, "tp_size": 2},
         }
         with pytest.raises(ValueError, match="multiple parallel_info"):
@@ -73,7 +73,7 @@ class TestNormalizeParallelInfo:
 
     def test_size_1_filtered(self) -> None:
         meta = {
-            "sglang_parallel_info": {
+            "flliper_parallel_info": {
                 "tp_rank": 0,
                 "tp_size": 1,
                 "cp_rank": 0,
@@ -87,7 +87,7 @@ class TestNormalizeParallelInfo:
         meta = {
             "recompute_pseudo_rank": 1,
             "recompute_pseudo_size": 2,
-            "sglang_parallel_info": {"tp_rank": 0, "tp_size": 2},
+            "flliper_parallel_info": {"tp_rank": 0, "tp_size": 2},
         }
         result = normalize_parallel_info(meta)
         assert result == {

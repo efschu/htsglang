@@ -10,11 +10,11 @@ try:
 except Exception:
     tabulate = None
 
-from sglang.jit_kernel.timestep_embedding import (
+from flliper.jit_kernel.timestep_embedding import (
     timestep_embedding as timestep_embedding_cuda,
 )
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.utils import get_ci_test_range
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
@@ -118,7 +118,7 @@ def test_timestep_embedding_correctness_with_diffusers(
 
 
 def test_timestep_embedding_perf():
-    if os.environ.get("SGLANG_RUN_JIT_KERNEL_PERF_TESTS") != "1":
+    if os.environ.get("FLLIPER_RUN_JIT_KERNEL_PERF_TESTS") != "1":
         pytest.skip("Perf test disabled by default")
     if tabulate is None:
         pytest.skip("Optional dependency 'tabulate' is not installed")

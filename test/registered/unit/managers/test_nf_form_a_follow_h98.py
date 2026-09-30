@@ -43,22 +43,22 @@ from array import array
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from flliper.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt import rank_role
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt import rank_role
 
 #: Written by NAME so this file collects and runs on 138d9df01c too, where
 #: nothing sets or reads them (that is the red).
 FLOOR_ATTR = "_tp_match_floor_group"
 FOLLOW_ATTR = "_tp_match_floor_follow_walk"
-SWITCH = "SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW"
+SWITCH = "FLLIPER_PDFLIP_ENABLE_FORM_A_TP0_FOLLOW"
 
 PAGE = 64
 PROMPT = 20000
@@ -167,7 +167,7 @@ def _as_rank(rank, roles=ROLES):
 
 @contextlib.contextmanager
 def _switch(value):
-    from sglang.srt.environ import envs
+    from flliper.srt.environ import envs
 
     field = getattr(envs, SWITCH, None)
     if field is None:  # 138d9df01c: the switch does not exist (= off)
@@ -255,7 +255,7 @@ def _rc9m():
 class TestRc9mWorkersFollowTp0(unittest.TestCase):
     def test_rc9m_resumes_at_tp0_depth_on_every_rank(self):
         with _switch(True):
-            planted, geometry = _run(_rc9m(), "weg2-18-15")
+            planted, geometry = _run(_rc9m(), "pdflip-18-15")
         self.assertEqual(
             geometry,
             {0: 18112, 1: 18112, 2: 18112},
@@ -264,13 +264,13 @@ class TestRc9mWorkersFollowTp0(unittest.TestCase):
             "cannot realize, H97 plants 0 and every rank RE-PREFILLS 18112 "
             "tokens instead of resuming (the H96 death before that)",
         )
-        self.assertEqual(planted, {"weg2-18-15": 18112})
+        self.assertEqual(planted, {"pdflip-18-15": 18112})
 
     def test_rc9l_resumes_at_tp0_depth(self):
         # rc9l (H96): TP0 host anchor 19712, workers 16384; KV path 19712.
         trees = {0: _Tree(19712, [16384, 19712]), 1: _Tree(19712, [16384]), 2: _Tree(19712, [16384])}
         with _switch(True):
-            planted, geometry = _run(trees, "weg2-21-21")
+            planted, geometry = _run(trees, "pdflip-21-21")
         self.assertEqual(set(geometry.values()), {19712}, f"rc9l: {planted} {geometry}")
 
     def test_rc9i_tombstone_on_workers_follows(self):
@@ -278,18 +278,18 @@ class TestRc9mWorkersFollowTp0(unittest.TestCase):
         # on the path at all); KV reached 18112 on every rank.
         trees = {0: _Tree(18112, [18112]), 1: _Tree(18112, []), 2: _Tree(18112, [])}
         with _switch(True):
-            planted, geometry = _run(trees, "weg2-32-26")
+            planted, geometry = _run(trees, "pdflip-32-26")
         self.assertEqual(set(geometry.values()), {18112}, f"rc9i: {planted} {geometry}")
 
     def test_follow_line_names_both_depths(self):
         with _switch(True), self.assertLogs(m.logger, level="WARNING") as cm:
-            _run(_rc9m(), "weg2-18-15")
+            _run(_rc9m(), "pdflip-18-15")
         lines = [l for l in cm.output if "RU FORM-A FOLLOW rid=" in l]
         self.assertEqual(len(lines), 2, cm.output)
         self.assertIn("tp0_depth=18112 worker_local=15552", lines[0])
 
 
-class TestRiegelStays(unittest.TestCase):
+class TestGuardStays(unittest.TestCase):
     def test_worker_kv_short_falls_back_to_h97(self):
         # A worker whose KV path is really shorter (dead node): its reach is
         # the honest constraint -> skew -> H97: TP0 has no anchor at 15552 ->
@@ -325,14 +325,14 @@ class TestSwitchOffIsH97(unittest.TestCase):
 
     def test_switch_off(self):
         with _switch(False):
-            planted, geometry = _run(_rc9m(), "weg2-18-15")
-        self.assertEqual(planted, {"weg2-18-15": 0})
+            planted, geometry = _run(_rc9m(), "pdflip-18-15")
+        self.assertEqual(planted, {"pdflip-18-15": 0})
         self.assertEqual(set(geometry.values()), {0})
 
     def test_classic_boot(self):
         with _switch(True):
-            planted, geometry = _run(_rc9m(), "weg2-18-15", roles=None)
-        self.assertEqual(planted, {"weg2-18-15": 0})
+            planted, geometry = _run(_rc9m(), "pdflip-18-15", roles=None)
+        self.assertEqual(planted, {"pdflip-18-15": 0})
         self.assertEqual(set(geometry.values()), {0})
 
 

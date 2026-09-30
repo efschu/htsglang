@@ -33,19 +33,19 @@ partition that is still mis-aligned is exactly the failure mode.
 
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     get_tp_partition_ratios,
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.srt.layers.linear import (
+from flliper.srt.layers.linear import (
     _marlin_min_thread_pair,
     _marlin_packable_family,
     _marlin_uneven_tp_block,
     _quant_block_aligned_units,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -104,7 +104,7 @@ class _Base(CustomTestCase):
 
 class TestTheConstantsAreImportedNotRestated(_Base):
     def test_min_thread_pair(self):
-        from sglang.srt.layers.quantization.marlin_utils import (
+        from flliper.srt.layers.quantization.marlin_utils import (
             GPTQ_MARLIN_MIN_THREAD_K,
             GPTQ_MARLIN_MIN_THREAD_N,
         )
@@ -202,8 +202,8 @@ class TestExistingSiblingsAreUnchanged(_Base):
     vehicles and must be called out, not shipped."""
 
     def test_gptq_and_awq_vehicles_keep_their_partition(self):
-        from sglang.srt.layers.quantization.awq.awq import awq_uneven_tp_block
-        from sglang.srt.layers.quantization.gptq.gptq import gptq_uneven_tp_block
+        from flliper.srt.layers.quantization.awq.awq import awq_uneven_tp_block
+        from flliper.srt.layers.quantization.gptq.gptq import gptq_uneven_tp_block
 
         for label, blk in (
             ("awq gs=128", awq_uneven_tp_block(128)),
@@ -282,11 +282,11 @@ class TestTheVerdictIsRankUniform(_Base):
         ``weight_block_size`` at all, so with no coarsening its uneven-TP
         shards land mid-tile, which is the #377/#383 abort reached through the
         one config that is marlin by definition."""
-        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
             CompressedTensorsConfig as RealCT,
         )
-        from sglang.srt.layers.quantization.fp8 import Fp8Config as RealFp8
-        from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
+        from flliper.srt.layers.quantization.fp8 import Fp8Config as RealFp8
+        from flliper.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 
         for cls in (RealFp8, RealCT, FBGEMMFp8Config):
             with self.subTest(config=cls.__name__):
@@ -304,8 +304,8 @@ class TestTheVerdictIsRankUniform(_Base):
         failure. It is pinned here because the declaration is what makes the
         hole closeable at all: a checkpoint routed to this config would
         otherwise repeat #377 with no way for the alignment module to know."""
-        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
-        from sglang.srt.layers.quantization.marlin_utils import MarlinConfig
+        from flliper.srt.layers.quantization import QUANTIZATION_METHODS
+        from flliper.srt.layers.quantization.marlin_utils import MarlinConfig
 
         self.assertTrue(MarlinConfig.marlin_packable_linear)
         self.assertNotIn("weight_block_size", MarlinConfig.__init__.__code__.co_names)
@@ -319,7 +319,7 @@ class TestTheVerdictIsRankUniform(_Base):
         import inspect
         import pathlib
 
-        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+        from flliper.srt.layers.quantization import QUANTIZATION_METHODS
 
         entry_points = (
             "prepare_fp8_layer_for_marlin",
@@ -350,8 +350,8 @@ class TestTheVerdictIsRankUniform(_Base):
         gaps. They are not: neither module reaches any marlin repack entry
         point (``prepare_fp8_layer_for_marlin`` / ``verify_marlin_supports_shape``
         / ``*_marlin_repack``), so declaring them would only tax their split."""
-        from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+        from flliper.srt.layers.quantization.quark.quark import QuarkConfig
+        from flliper.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
         for cls in (W8A8Fp8Config, QuarkConfig):
             with self.subTest(config=cls.__name__):
@@ -503,7 +503,7 @@ class TestEighthSiblingMxfp8(_Base):
         """The corpus must not drift from the config it claims to model."""
         import inspect
 
-        from sglang.srt.layers.quantization.fp8 import Fp8Config as RealFp8
+        from flliper.srt.layers.quantization.fp8 import Fp8Config as RealFp8
 
         src = inspect.getsource(RealFp8.from_config)
         self.assertIn("weight_block_size = [1, 32]", src)
@@ -553,7 +553,7 @@ class TestEighthSiblingMxfp8(_Base):
         """ANALYSE_442's argument, executed: ``lcm(32, 128) == 128`` is the
         block AWQ already imposes for group size 32, so registering MXFP8
         costs nothing a shipped vehicle does not already pay."""
-        from sglang.srt.layers.quantization.awq.awq import awq_uneven_tp_block
+        from flliper.srt.layers.quantization.awq.awq import awq_uneven_tp_block
 
         awq_block = awq_uneven_tp_block(32)
         for total in (34816, 32768, 17408):
@@ -571,8 +571,8 @@ class TestEighthSiblingMxfp8(_Base):
     def test_symmetric_exposures_are_untouched(self):
         """PLAN-EQUALITY PIN for the seven siblings: the new branch keys on
         ``raw[0] != raw[1]``, so every symmetric block must be unaffected."""
-        from sglang.srt.layers.quantization.awq.awq import awq_uneven_tp_block
-        from sglang.srt.layers.quantization.gptq.gptq import gptq_uneven_tp_block
+        from flliper.srt.layers.quantization.awq.awq import awq_uneven_tp_block
+        from flliper.srt.layers.quantization.gptq.gptq import gptq_uneven_tp_block
 
         for label, blk in (
             ("fp8 block", [128, 128]),
@@ -601,7 +601,7 @@ class TestEighthSiblingMxfp8(_Base):
 def _legacy_block_aligned_units(total, units, block):
     """The pre-#444b arithmetic for a config that exposes a block, restated so
     the plan-equality pin compares against a value and not against itself."""
-    from sglang.srt.distributed.utils import block_aligned_units
+    from flliper.srt.distributed.utils import block_aligned_units
 
     if not block:
         return units

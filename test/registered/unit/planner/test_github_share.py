@@ -18,7 +18,7 @@ Hermetic: the GitHub REST API is a fake; no network. Covers:
 
 import unittest
 
-from sglang.srt.planner.github_share import (
+from flliper.srt.planner.github_share import (
     API_ROOT,
     DEFAULT_REPO,
     GitHubShareError,
@@ -38,13 +38,13 @@ PAYLOAD = {
     "hardware": "1x RTX 5090 + 2x RTX 3080",
     "command": {
         "argv": [
-            "python", "-m", "sglang.launch_server",
+            "python", "-m", "flliper.launch_server",
             "--model-path", "/models/Qwen3.6-27B-FP8",
             "--tp", "3", "--rank-gpu-id", "0,1,2",
         ],
         "env": {
-            "SGLANG_UNEVEN_DCP": "1",
-            "SGLANG_UNEVEN_TOKEN_VECTOR": "33,13,18",
+            "FLLIPER_UNEVEN_DCP": "1",
+            "FLLIPER_UNEVEN_TOKEN_VECTOR": "33,13,18",
             "HF_TOKEN": "hf_secretsecretsecret",
         },
     },
@@ -104,13 +104,13 @@ class TestBuildReport(unittest.TestCase):
         # a basename, not the local filesystem path (#505-D3). Sharing a
         # reproducible result needs the FLAGS, never the directory layout.
         self.assertIn(
-            "python -m sglang.launch_server --model-path "
+            "python -m flliper.launch_server --model-path "
             "Qwen3.6-27B-FP8 --tp 3 --rank-gpu-id 0,1,2",
             md,
         )
         self.assertNotIn("/models/Qwen3.6-27B-FP8", md)
-        self.assertIn("SGLANG_UNEVEN_DCP=1", md)
-        self.assertIn("SGLANG_UNEVEN_TOKEN_VECTOR=33,13,18", md)
+        self.assertIn("FLLIPER_UNEVEN_DCP=1", md)
+        self.assertIn("FLLIPER_UNEVEN_TOKEN_VECTOR=33,13,18", md)
 
     def test_credential_env_values_redacted(self):
         md = build_report(PAYLOAD)

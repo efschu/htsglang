@@ -21,15 +21,15 @@ RESERVE="5500,3800,3800"
 mkdir -p "$OUT"
 export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$WT/python"
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
-export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_MAMBA_SSM_DTYPE=bfloat16
 
 boot() {
   local arm="$1"; shift
   local log="$OUT/boot_${arm}.log"
   echo "=== booting arm $arm"
-  setsid "$VENV/bin/python" -m sglang.launch_server \
+  setsid "$VENV/bin/python" -m flliper.launch_server \
     --model-path /spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8 \
     --served-model-name default \
     --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
@@ -98,7 +98,7 @@ run_arm() {
 STAGE="${STAGE:-nccl}"
 
 if [ "$STAGE" = "nccl" ] || [ "$STAGE" = "all" ]; then
-  unset SGLANG_BARLINK
+  unset FLLIPER_BARLINK
   run_arm E1 || { stop_arm E1; exit 1; }
   run_arm E2 || { stop_arm E2; exit 1; }
   run_arm G --cuda-graph-backend-prefill breakable || { stop_arm G; exit 1; }
@@ -127,14 +127,14 @@ if [ "$STAGE" = "barlink" ] || [ "$STAGE" = "all" ]; then
     echo "(barlink-583's repro window must clear the fix under live load first)."
     exit 2
   fi
-  export SGLANG_BARLINK=1
+  export FLLIPER_BARLINK=1
   # Only the two points the 2x2 is stated over: the long-prompt point and the
   # bs>1 short-prompt concurrency mix.
   SIZES="1900" run_arm BE1 || { stop_arm BE1; exit 1; }
   SIZES="1900" run_arm BE2 || { stop_arm BE2; exit 1; }
   SIZES="1900" run_arm BG --cuda-graph-backend-prefill breakable \
       || { stop_arm BG; exit 1; }
-  unset SGLANG_BARLINK
+  unset FLLIPER_BARLINK
 fi
 
 

@@ -29,22 +29,22 @@ import types
 import unittest
 from typing import Dict, Optional
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     RUNTIME_COMMUNICATOR_GROUPS,
     communicator_groups_from_server_args,
 )
-from sglang.srt.mem_ledger.nccl_transport import (
+from flliper.srt.mem_ledger.nccl_transport import (
     CommunicatorGroup,
     classify_communicator_groups,
     nccl_signature,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _parallel_state_path() -> str:
-    import sglang.srt.distributed.parallel_state as ps
+    import flliper.srt.distributed.parallel_state as ps
 
     return ps.__file__
 
@@ -113,17 +113,17 @@ class TestTheDeclarationNamesEveryGroupTheRuntimeBuilds(unittest.TestCase):
             enable_pdmux=True,
             enable_symm_mem=True,
         )
-        old = os.environ.get("SGLANG_KVSO_DECOUPLE")
-        os.environ["SGLANG_KVSO_DECOUPLE"] = "1"
+        old = os.environ.get("FLLIPER_KVSO_DECOUPLE")
+        os.environ["FLLIPER_KVSO_DECOUPLE"] = "1"
         try:
             names = [
                 g.name for g in communicator_groups_from_server_args(sa, list(range(8)))
             ]
         finally:
             if old is None:
-                os.environ.pop("SGLANG_KVSO_DECOUPLE", None)
+                os.environ.pop("FLLIPER_KVSO_DECOUPLE", None)
             else:
-                os.environ["SGLANG_KVSO_DECOUPLE"] = old
+                os.environ["FLLIPER_KVSO_DECOUPLE"] = old
         self.assertEqual(len(names), len(set(names)), names)
         for name in names:
             self.assertIn(name, RUNTIME_COMMUNICATOR_GROUPS, name)
@@ -213,20 +213,20 @@ class TestTheUnderDeclaredGroupsAppear(unittest.TestCase):
         )
 
     def test_the_kv_session_offload_spill_group_is_declared_with_its_env(self):
-        old = os.environ.get("SGLANG_KVSO_DECOUPLE")
+        old = os.environ.get("FLLIPER_KVSO_DECOUPLE")
         try:
-            os.environ["SGLANG_KVSO_DECOUPLE"] = "1"
+            os.environ["FLLIPER_KVSO_DECOUPLE"] = "1"
             self.assertIn("dcp_spill", self._names(tp_size=2, dcp_size=2))
             # Only with DCP on: the spill communicator is built inside the DCP
             # branch, so it cannot exist without it.
             self.assertNotIn("dcp_spill", self._names(dcp_size=1))
-            os.environ["SGLANG_KVSO_DECOUPLE"] = "0"
+            os.environ["FLLIPER_KVSO_DECOUPLE"] = "0"
             self.assertNotIn("dcp_spill", self._names(tp_size=2, dcp_size=2))
         finally:
             if old is None:
-                os.environ.pop("SGLANG_KVSO_DECOUPLE", None)
+                os.environ.pop("FLLIPER_KVSO_DECOUPLE", None)
             else:
-                os.environ["SGLANG_KVSO_DECOUPLE"] = old
+                os.environ["FLLIPER_KVSO_DECOUPLE"] = old
 
     def test_the_moe_groups_are_declared_with_their_real_transport(self):
         sa = types.SimpleNamespace(**{**self.BASE, "ep_size": 1})

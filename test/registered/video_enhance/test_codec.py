@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from sglang.srt.video_enhance import codec
-from sglang.srt.video_enhance.codec import (
+from flliper.srt.video_enhance import codec
+from flliper.srt.video_enhance.codec import (
     BT601,
     BT709,
     FULL_RANGE,
@@ -41,14 +41,14 @@ from sglang.srt.video_enhance.codec import (
     select_encode_backend,
     synthetic_frame_rgb,
 )
-from sglang.srt.video_enhance import frame_math
-from sglang.srt.video_enhance.frame_math import (
+from flliper.srt.video_enhance import frame_math
+from flliper.srt.video_enhance.frame_math import (
     PixelFormat,
     Resolution,
     codec_pool_bytes,
 )
-from sglang.srt.video_enhance.frames import Frame, HostResidencyError
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.video_enhance.frames import Frame, HostResidencyError
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 

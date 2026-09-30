@@ -36,7 +36,7 @@ import inspect
 import types
 
 
-from sglang.srt.managers.phase_policy import PhasePolicyInputs
+from flliper.srt.managers.phase_policy import PhasePolicyInputs
 
 
 def make_inputs(**kw):
@@ -85,7 +85,7 @@ class FakeReq:
 
 
 def admissible(queue):
-    from sglang.srt.managers.scheduler import Scheduler
+    from flliper.srt.managers.scheduler import Scheduler
 
     sched = types.SimpleNamespace(waiting_queue=queue)
     return Scheduler._admissible_prefill_tokens(sched)
@@ -134,7 +134,7 @@ def test_existence_class_sites_do_not_read_the_economics_number():
     prose in this file and in the module -- which necessarily quotes the
     defect -- cannot read as the defect.
     """
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     src = inspect.getsource(pp)
     tree = ast.parse(src)
@@ -161,7 +161,7 @@ def test_existence_class_sites_do_not_read_the_economics_number():
 def test_work_exists_is_the_single_definition():
     """The defect was two questions sharing one expression; the fix is worth
     nothing if the next consumer re-derives the answer a third way."""
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     src = inspect.getsource(pp)
     assert src.count("def work_exists") == 1
@@ -218,7 +218,7 @@ def test_verdict_and_message_come_from_one_read():
     a verdict of >0 printed beside a 0. The arm must show the number it used."""
     import inspect
 
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     src = inspect.getsource(pp)
     assert "demand_tokens = inp.demand_prefill_tokens()" in src
@@ -228,7 +228,7 @@ def test_verdict_and_message_come_from_one_read():
 def test_demand_is_the_single_definition():
     import inspect
 
-    import sglang.srt.managers.phase_policy as pp
+    import flliper.srt.managers.phase_policy as pp
 
     assert inspect.getsource(pp).count("def demand_prefill_tokens") == 1
 

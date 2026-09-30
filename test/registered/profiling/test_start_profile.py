@@ -18,10 +18,10 @@ import unittest
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -48,7 +48,7 @@ class TestStartProfile(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
+        envs.FLLIPER_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -145,7 +145,7 @@ class TestStartProfileWithNsys(CustomTestCase):
         if not _is_nsys_available():
             raise unittest.SkipTest("nsys (Nsight Systems) is not available")
 
-        envs.SGLANG_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
+        envs.FLLIPER_TORCH_PROFILER_DIR.set(OUTPUT_DIR)
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         # Use a different port to avoid conflicts with other tests
         cls.base_url = "http://127.0.0.1:21100"
@@ -202,7 +202,7 @@ class TestStartProfileWithNsys(CustomTestCase):
         try:
             # Kill server on our port
             subprocess.run(["lsof", "-ti", ":21100"], capture_output=True, timeout=5)
-            subprocess.run(["pkill", "-f", "sglang.launch_server.*21100"], timeout=5)
+            subprocess.run(["pkill", "-f", "flliper.launch_server.*21100"], timeout=5)
 
             # Kill any orphaned nsys agent processes
             subprocess.run(
@@ -235,7 +235,7 @@ class TestStartProfileWithNsys(CustomTestCase):
             os.path.join(OUTPUT_DIR, output_file),
             "python3",
             "-m",
-            "sglang.launch_server",
+            "flliper.launch_server",
             "--model-path",
             model,
             "--host",

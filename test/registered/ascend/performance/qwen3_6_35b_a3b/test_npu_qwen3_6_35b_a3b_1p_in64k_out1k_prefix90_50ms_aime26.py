@@ -1,15 +1,15 @@
 import unittest
 
-from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+from flliper.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_performance_utils import (
+from flliper.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
     DEFAULT_URL_FOR_TEST,
     QWEN3_6_35B_A3B_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+from flliper.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=3600,
@@ -25,9 +25,9 @@ QWEN3_6_35B_A3B_64K_PREFIX_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
+    "FLLIPER_SET_CPU_AFFINITY": "1",
+    "FLLIPER_ENABLE_SPEC_V2": "1",
+    "FLLIPER_ENABLE_OVERLAP_PLAN_STREAM": "0",
     "ASCEND_USE_FIA": "1",
     "GDN_ATTN_BACKEND_TRITON": "1",
 }
@@ -132,7 +132,7 @@ class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(
     tpot = 50
     request_rate = float("inf")
     output_token_throughput = 660
-    pop_sglang_is_in_ci_for_gsp = True
+    pop_flliper_is_in_ci_for_gsp = True
 
     @classmethod
     def setUpClass(cls):

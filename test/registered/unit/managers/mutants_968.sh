@@ -18,9 +18,9 @@
 set -u
 
 ROOT=${ROOT:-/spinning/wt-968-umbau}
-CONG=$ROOT/python/sglang/srt/managers/pp_admission_congruence.py
-PUR=$ROOT/python/sglang/srt/managers/phase_purity.py
-CC=$ROOT/python/sglang/srt/managers/cache_controller.py
+CONG=$ROOT/python/flliper/srt/managers/pp_admission_congruence.py
+PUR=$ROOT/python/flliper/srt/managers/phase_purity.py
+CC=$ROOT/python/flliper/srt/managers/cache_controller.py
 PY=${PY:-/spinning/htsglang-gpu/.venv/bin/python}
 TESTS=$ROOT/test/registered/unit/managers/test_968_starvation_umbau.py
 

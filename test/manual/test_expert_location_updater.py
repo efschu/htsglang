@@ -9,10 +9,10 @@ import torch.distributed
 import torch.multiprocessing as mp
 from torch.multiprocessing import Process
 
-from sglang.srt.eplb import expert_location_updater
-from sglang.srt.utils import get_device
-from sglang.test.test_utils import CustomTestCase, find_available_port
-from sglang.utils import is_in_ci
+from flliper.srt.eplb import expert_location_updater
+from flliper.srt.utils import get_device
+from flliper.test.test_utils import CustomTestCase, find_available_port
+from flliper.utils import is_in_ci
 
 
 @dataclass

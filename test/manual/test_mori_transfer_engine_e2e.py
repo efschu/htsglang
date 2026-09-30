@@ -4,10 +4,10 @@ import unittest
 
 import requests
 
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
@@ -17,18 +17,18 @@ from sglang.test.test_utils import (
 class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
     """
     Run:
-        SGLANG_MORI_MANUAL_E2E=1 python3 test/manual/test_mori_transfer_engine_e2e.py
+        FLLIPER_MORI_MANUAL_E2E=1 python3 test/manual/test_mori_transfer_engine_e2e.py
 
     Optional:
-    - SGLANG_MORI_E2E_TEST_MODEL: override model (defaults to a small test model)
-    - SGLANG_TEST_PD_DISAGG_DEVICES: RDMA devices string, e.g. "mlx5_roce0,mlx5_roce4"
+    - FLLIPER_MORI_E2E_TEST_MODEL: override model (defaults to a small test model)
+    - FLLIPER_TEST_PD_DISAGG_DEVICES: RDMA devices string, e.g. "mlx5_roce0,mlx5_roce4"
     """
 
     @classmethod
     def setUpClass(cls):
-        if os.environ.get("SGLANG_MORI_MANUAL_E2E", "") not in ("1", "true", "True"):
+        if os.environ.get("FLLIPER_MORI_MANUAL_E2E", "") not in ("1", "true", "True"):
             raise unittest.SkipTest(
-                "Set SGLANG_MORI_MANUAL_E2E=1 to run this manual MORI E2E test."
+                "Set FLLIPER_MORI_MANUAL_E2E=1 to run this manual MORI E2E test."
             )
 
         try:
@@ -40,12 +40,12 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
             raise unittest.SkipTest(f"torch is not available/usable: {e}")
 
         # Force the disaggregation fixture to use MORI backend in local/manual runs.
-        os.environ["SGLANG_TEST_PD_DISAGG_BACKEND"] = "mori"
+        os.environ["FLLIPER_TEST_PD_DISAGG_BACKEND"] = "mori"
 
         super().setUpClass()
 
         cls.model = os.environ.get(
-            "SGLANG_MORI_E2E_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+            "FLLIPER_MORI_E2E_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         )
 
         cls.start_prefill()
@@ -66,7 +66,7 @@ class TestMoriTransferEngineE2E(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_TEST_PD_DISAGG_BACKEND", None)
+        os.environ.pop("FLLIPER_TEST_PD_DISAGG_BACKEND", None)
         super().tearDownClass()
 
     @classmethod
@@ -160,9 +160,9 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
 
     @classmethod
     def setUpClass(cls):
-        if os.environ.get("SGLANG_MORI_MANUAL_E2E", "") not in ("1", "true", "True"):
+        if os.environ.get("FLLIPER_MORI_MANUAL_E2E", "") not in ("1", "true", "True"):
             raise unittest.SkipTest(
-                "Set SGLANG_MORI_MANUAL_E2E=1 to run this manual MORI E2E test."
+                "Set FLLIPER_MORI_MANUAL_E2E=1 to run this manual MORI E2E test."
             )
 
         try:
@@ -177,7 +177,7 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
         except Exception as e:
             raise unittest.SkipTest(f"torch is not available/usable: {e}")
 
-        os.environ["SGLANG_TEST_PD_DISAGG_BACKEND"] = "mori"
+        os.environ["FLLIPER_TEST_PD_DISAGG_BACKEND"] = "mori"
         super().setUpClass()
 
         # Shift ports to avoid clashing with TestMoriTransferEngineE2E.
@@ -189,7 +189,7 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
 
         cls.model = os.environ.get(
-            "SGLANG_MORI_E2E_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+            "FLLIPER_MORI_E2E_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         )
 
         cls.start_prefill()
@@ -209,7 +209,7 @@ class TestMoriTransferEngineTPMismatchE2E(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.pop("SGLANG_TEST_PD_DISAGG_BACKEND", None)
+        os.environ.pop("FLLIPER_TEST_PD_DISAGG_BACKEND", None)
         super().tearDownClass()
 
     @classmethod

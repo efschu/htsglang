@@ -8,23 +8,23 @@ from typing import Callable
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
-from sglang.jit_kernel.kv_canary.verify import (
+from flliper.jit_kernel.kv_canary import consts
+from flliper.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
+from flliper.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyOrWriteContext,
     VerifyPlan,
     launch_canary_verify_kernel,
 )
-from sglang.jit_kernel.kv_canary.verify_ref import (
+from flliper.jit_kernel.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
     launch_canary_verify_kernel_torch_reference,
 )
-from sglang.jit_kernel.kv_canary.write_ref import (
+from flliper.jit_kernel.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
-from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
+from flliper.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_only_bits_set,
     chain_anchor_signed,
@@ -42,16 +42,16 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     to_signed_int64,
     write_slot_fields,
 )
-from sglang.jit_kernel.tests.kv_canary._differential import (
+from flliper.jit_kernel.tests.kv_canary._differential import (
     _run_both_verify,
     run_verify_diff,
 )
-from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
-from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
+from flliper.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
+from flliper.jit_kernel.tests.kv_canary._hand_oracle import (
     _hand_fold_all,
     _hand_fold_partial,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

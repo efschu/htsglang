@@ -36,18 +36,18 @@ three-term arithmetic returns the phantom on the specimen below (asserted in
 defect rather than a story about one).
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     graph_pool_free_bytes_from_segments,
     releasable_cache_bytes_from_segments,
     releasable_cache_bytes_from_stats,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 MIB = 1024 * 1024
 

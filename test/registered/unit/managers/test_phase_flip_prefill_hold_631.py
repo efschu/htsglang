@@ -37,7 +37,7 @@ import types
 
 import pytest
 
-from sglang.srt.managers.phase_flip_runtime import chunk_blocks_quiescence
+from flliper.srt.managers.phase_flip_runtime import chunk_blocks_quiescence
 
 
 class FakeChunkedReq:

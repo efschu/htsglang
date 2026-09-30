@@ -1,6 +1,6 @@
 """Unit tests for srt/sampling/custom_logit_processor.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.sampling.custom_logit_processor import (
+from flliper.srt.sampling.custom_logit_processor import (
     CustomLogitProcessor,
     DeepseekOCRNoRepeatNGramLogitProcessor,
     DeepSeekR1ThinkingBudgetLogitProcessor,
@@ -20,7 +20,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 # Helper: mock a Req object (used by ThinkingBudget and NGram processors)

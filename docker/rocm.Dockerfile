@@ -1,10 +1,10 @@
-# Usage (to build SGLang ROCm docker image):
+# Usage (to build fLLiper ROCm docker image):
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
-# Usage (to build SGLang ROCm + Mori docker image):
+# Usage (to build fLLiper ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
 # Keep the build-arg for user to select the desired nic support, current choice: [ainic, bxnt]
 # if no set this arg, it will support nic auto detection. On a target with more than 1 type of
@@ -14,7 +14,7 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
-# Usage (to build SGLang ROCm + NIXL docker image, for prefill/decode disaggregation):
+# Usage (to build fLLiper ROCm + NIXL docker image, for prefill/decode disaggregation):
 # Builds UCX (--with-rocm) and upstream ai-dynamo/nixl from source by default.
 # Set ENABLE_NIXL=0 to skip NIXL.
 # At runtime use --disaggregation-transfer-backend nixl (env is wired via /etc/bash.bashrc).
@@ -211,8 +211,8 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 # -----------------------
 # AITER
-# Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
-# (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
+# Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not fLLiper's
+# (SETUPTOOLS_SCM_PRETEND_VERSION is set later for fLLiper nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
@@ -269,10 +269,10 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
     fi
 
 # -----------------------
-# Build SGLang
+# Build fLLiper
 ARG BUILD_TYPE=all
 
-# Set version for setuptools_scm if provided (for nightly builds). Only pass in the SGLang
+# Set version for setuptools_scm if provided (for nightly builds). Only pass in the fLLiper
 # pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
 ARG SETUPTOOLS_SCM_PRETEND_VERSION
 
@@ -282,9 +282,9 @@ RUN pip install IPython \
     && pip install torchao==0.9.0 \
     && pip install pybind11
 
-RUN pip uninstall -y sgl_kernel sglang
+RUN pip uninstall -y sgl_kernel flliper
 RUN git clone ${SGL_REPO} \
-    && cd sglang \
+    && cd flliper \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
          echo "Using ${SGL_DEFAULT}, default branch."; \
          git checkout ${SGL_DEFAULT}; \
@@ -307,8 +307,8 @@ RUN git clone ${SGL_REPO} \
 RUN python -m pip cache purge
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
-RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
-         /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
+RUN find /sgl-workspace/sglang/python/flliper/srt/layers/quantization/configs/ \
+         /sgl-workspace/sglang/python/flliper/srt/layers/moe/fused_moe_triton/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
 # Install Rust toolchain for sgl-model-gateway
@@ -511,7 +511,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # Builds UCX (--with-rocm) + nixl from source by default; skip with ENABLE_NIXL=0.
 # --no-build-isolation reuses the image's ROCm torch (nixl pins torch==2.11.* as a build dep,
 # which would otherwise pull a multi-GB CUDA torch); --no-deps keeps CUDA runtime deps out.
-# wheel_variant=rocm names the pkg nixl_rocm, so symlink `nixl` since SGLang imports plain nixl.
+# wheel_variant=rocm names the pkg nixl_rocm, so symlink `nixl` since fLLiper imports plain nixl.
 # taskflow (header-only) is provided via pkg-config so meson skips its broken upstream wrap
 # download (GitHub regenerated the v3.10.0 tarball, breaking the pinned source_hash).
 RUN /bin/bash -lc 'set -euo pipefail; \
@@ -659,17 +659,17 @@ PY
 # Performance environment variable.
 
 # Skip CuDNN compatibility check - not applicable for ROCm (uses MIOpen instead)
-ENV SGLANG_DISABLE_CUDNN_CHECK=1
+ENV FLLIPER_DISABLE_CUDNN_CHECK=1
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
-ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-ENV SGLANG_INT4_WEIGHT=0
-ENV SGLANG_MOE_PADDING=1
-ENV SGLANG_ROCM_DISABLE_LINEARQUANT=0
-ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
-ENV SGLANG_SET_CPU_AFFINITY=1
-ENV SGLANG_USE_AITER=1
-ENV SGLANG_USE_ROCM700A=1
+ENV FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+ENV FLLIPER_INT4_WEIGHT=0
+ENV FLLIPER_MOE_PADDING=1
+ENV FLLIPER_ROCM_DISABLE_LINEARQUANT=0
+ENV FLLIPER_ROCM_FUSED_DECODE_MLA=1
+ENV FLLIPER_SET_CPU_AFFINITY=1
+ENV FLLIPER_USE_AITER=1
+ENV FLLIPER_USE_ROCM700A=1
 
 ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8

@@ -3,11 +3,11 @@ from enum import Enum
 
 from pydantic import BaseModel, constr
 
-import sglang as sgl
-from sglang.srt.constrained.outlines_backend import build_regex_from_object
-from sglang.test.test_utils import (
-    add_common_sglang_args_and_parse,
-    select_sglang_backend,
+import flliper as sgl
+from flliper.srt.constrained.outlines_backend import build_regex_from_object
+from flliper.test.test_utils import (
+    add_common_flliper_args_and_parse,
+    select_flliper_backend,
 )
 
 IP_REGEX = r"((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)"
@@ -95,7 +95,7 @@ def character_gen(s):
 
 def main(args):
     # Select backend
-    backend = select_sglang_backend(args)
+    backend = select_flliper_backend(args)
     sgl.set_default_backend(backend)
 
     state = regex_gen.run(temperature=0)
@@ -116,7 +116,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    args = add_common_sglang_args_and_parse(parser)
+    args = add_common_flliper_args_and_parse(parser)
     main(args)
 
 # ==================== IP TEST ====================

@@ -1,6 +1,6 @@
 """
 Usage:
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 python json_decode.py
 """
 
@@ -8,8 +8,8 @@ from enum import Enum
 
 from pydantic import BaseModel
 
-import sglang as sgl
-from sglang.srt.constrained.outlines_backend import build_regex_from_object
+import flliper as sgl
+from flliper.srt.constrained.outlines_backend import build_regex_from_object
 
 character_regex = (
     r"""\{\n"""

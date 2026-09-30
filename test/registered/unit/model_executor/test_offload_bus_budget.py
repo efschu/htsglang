@@ -12,18 +12,18 @@ only the injected overlap cost function). No GPU, no CUDA.
 
 import unittest
 
-from sglang.srt.model_executor.offload_bus_budget import (
+from flliper.srt.model_executor.offload_bus_budget import (
     BUS_CONSUMER_EXPERT_STREAMING,
     BUS_CONSUMER_KV_SPILL,
     BUS_CONSUMER_STAGE2_PHASE,
     BusBudgetArbiter,
     ByteRateBucket,
 )
-from sglang.srt.model_executor.offload_register import (
+from flliper.srt.model_executor.offload_register import (
     OffloadRegister,
     resolve_class_policies,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 

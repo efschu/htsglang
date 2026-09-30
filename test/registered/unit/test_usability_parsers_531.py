@@ -11,7 +11,7 @@ Hermetic: no server, no CUDA, no NVML.
 
 import unittest
 
-from sglang.srt.planner.flags import (
+from flliper.srt.planner.flags import (
     _USABILITY_PARSER_TABLE,
     usability_argv,
     usability_parsers,

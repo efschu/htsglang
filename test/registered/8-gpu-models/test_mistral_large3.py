@@ -1,11 +1,11 @@
 import os
 import unittest
 
-from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.performance_test_runner import PerformanceTestParams
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from flliper.test.accuracy_test_runner import AccuracyTestParams
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.performance_test_runner import PerformanceTestParams
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 # Note: trtllm_mla backend may have hardware-specific behavior
@@ -33,13 +33,13 @@ class TestMistralLarge3(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Set environment variable to disable JIT DeepGemm
-        os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "0"
+        os.environ["FLLIPER_ENABLE_JIT_DEEPGEMM"] = "0"
 
     @classmethod
     def tearDownClass(cls):
         # Clean up environment variable
-        if "SGLANG_ENABLE_JIT_DEEPGEMM" in os.environ:
-            del os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"]
+        if "FLLIPER_ENABLE_JIT_DEEPGEMM" in os.environ:
+            del os.environ["FLLIPER_ENABLE_JIT_DEEPGEMM"]
 
     def test_mistral_large3_all_variants(self):
         """Run performance and accuracy for all Mistral-Large-3 variants."""

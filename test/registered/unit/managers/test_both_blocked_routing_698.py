@@ -14,9 +14,9 @@ comment is not an invariant. The test fails if the caller stops routing.
 import inspect
 import unittest
 
-from sglang.srt.managers import scheduler as scheduler_mod
-from sglang.srt.managers.phase_policy import BOTH_BLOCKED
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import scheduler as scheduler_mod
+from flliper.srt.managers.phase_policy import BOTH_BLOCKED
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

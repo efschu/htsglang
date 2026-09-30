@@ -111,7 +111,7 @@ def _health(port):
 def _boot(args, env, log_path):
     log = open(log_path, "w")
     proc = subprocess.Popen(
-        [VENV_PY, "-m", "sglang.launch_server", *args],
+        [VENV_PY, "-m", "flliper.launch_server", *args],
         stdout=log,
         stderr=subprocess.STDOUT,
         env=env,
@@ -334,7 +334,7 @@ def test_weightless_byte_identity():
 
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO_PY + ":" + env.get("PYTHONPATH", "")
-    env["SGLANG_UNEVEN_DCP"] = "1"
+    env["FLLIPER_UNEVEN_DCP"] = "1"
 
     wl_proc = base_proc = None
     try:
@@ -516,7 +516,7 @@ def test_weightless_chunked_prefill():
     global _ENV
     _ENV = dict(os.environ)
     _ENV["PYTHONPATH"] = REPO_PY + ":" + _ENV.get("PYTHONPATH", "")
-    _ENV["SGLANG_UNEVEN_DCP"] = "1"
+    _ENV["FLLIPER_UNEVEN_DCP"] = "1"
 
     radix = os.environ.get("WL_DISABLE_RADIX") != "1"
     graph = os.environ.get("WL_GRAPH") == "1"

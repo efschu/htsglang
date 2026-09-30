@@ -28,21 +28,21 @@ MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-NVFP4-RadixArk"
 def _worker(rank: int, world: int, port: str, a) -> None:
     import torch
 
-    import sglang.srt.server_args as SA
-    from sglang.srt.configs.load_config import LoadConfig
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed import parallel_state as ps
-    from sglang.srt.distributed.dual_group import NestedGroupPlan
-    from sglang.srt.distributed.utils import scoped_tp_partition_ratios
-    from sglang.srt.layers.dp_attention import initialize_dp_attention
-    from sglang.srt.model_executor import dual_group_lane as L
-    from sglang.srt.model_loader.loader import (
+    import flliper.srt.server_args as SA
+    from flliper.srt.configs.load_config import LoadConfig
+    from flliper.srt.configs.model_config import ModelConfig
+    from flliper.srt.distributed import parallel_state as ps
+    from flliper.srt.distributed.dual_group import NestedGroupPlan
+    from flliper.srt.distributed.utils import scoped_tp_partition_ratios
+    from flliper.srt.layers.dp_attention import initialize_dp_attention
+    from flliper.srt.model_executor import dual_group_lane as L
+    from flliper.srt.model_loader.loader import (
         _get_quantization_config,
         _initialize_model,
         set_default_torch_dtype,
     )
-    from sglang.srt.runtime_context import get_context
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.runtime_context import get_context
+    from flliper.srt.server_args import ServerArgs
 
     SA.is_cuda = lambda: True
     torch.cuda.get_device_capability = lambda *x, **k: (12, 0)

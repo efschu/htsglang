@@ -12,7 +12,7 @@ Run with:
     python3 -m pytest test/registered/unit/mem_cache/test_hicache_file_lru_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -25,14 +25,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import (
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
 )
-from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
+from flliper.test.test_utils import CustomTestCase
 
 
 # One 512-byte allocation unit. The evictor accounts what the filesystem
@@ -145,8 +145,8 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         self.make_backend = _BackendBuilder(self.tmpdir)
         # Neutralise env vars so user shell can't leak settings into tests.
         self._env_overrides = [
-            envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.override("0"),
-            envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.override("0"),
+            envs.FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE.override("0"),
+            envs.FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.override("0"),
         ]
         for cm in self._env_overrides:
             cm.__enter__()
@@ -163,16 +163,16 @@ class TestEnvDefaults(CustomTestCase):
     def test_min_free_space_default_is_zero(self):
         # Default must keep eviction off so existing users are unaffected.
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE", None)
+            os.environ.pop("FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE", None)
             self.assertEqual(
-                envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.get(),
+                envs.FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.get(),
                 "0",
             )
 
     def test_max_size_default_is_none(self):
         with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
-            self.assertIsNone(envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.get())
+            os.environ.pop("FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE", None)
+            self.assertIsNone(envs.FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE.get())
 
 
 class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
@@ -220,9 +220,9 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
         self.assertEqual(b._evictor._total_bytes, 0)
         self.assertEqual(len(b._evictor._lru), 0)
 
-    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); the default-on background
+    # the INLINE eviction contract (FLLIPER_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); the default-on background
     # path is covered by test_l3_evict_offpath_reset_join_0929.py
-    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
+    @mock.patch.dict(os.environ, {"FLLIPER_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_eviction_ratio_drops_to_watermark(self):
         # ratio=0.5 -> evict down to ~50% of the cap before adding.
         b = self.make_backend(max_size=str(4 * _UNIT), eviction_ratio=0.5)

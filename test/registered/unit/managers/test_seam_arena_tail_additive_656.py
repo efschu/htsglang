@@ -94,9 +94,9 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -379,7 +379,7 @@ class TheSizerCarriesTheSameSplitTest(unittest.TestCase):
         Every record written before the split carries the folded floor and no
         arena entry; those boots must size exactly as they did.
         """
-        from sglang.srt.managers.phase_flip_seam_reserve import solve_pool_tokens
+        from flliper.srt.managers.phase_flip_seam_reserve import solve_pool_tokens
 
         args = dict(corridor_relaxed_bytes=8 << 30, cell_bytes=4096, per_row_bytes=2.0)
         self.assertEqual(
@@ -394,7 +394,7 @@ class TheSizerCarriesTheSameSplitTest(unittest.TestCase):
         entirely and only the ADDITIVE one moves it. A solver that treated
         them alike would have no way to express the walk.
         """
-        from sglang.srt.managers.phase_flip_seam_reserve import solve_pool_tokens
+        from flliper.srt.managers.phase_flip_seam_reserve import solve_pool_tokens
 
         args = dict(corridor_relaxed_bytes=8 << 30, cell_bytes=4096, per_row_bytes=64.0)
         base = solve_pool_tokens(fixed_bytes=0, **args)
@@ -406,7 +406,7 @@ class TheSizerCarriesTheSameSplitTest(unittest.TestCase):
         self.assertLess(with_arena, base)
 
     def test_the_allowed_tokens_solver_carries_it_too(self):
-        from sglang.srt.managers.phase_flip_seam_reserve import (
+        from flliper.srt.managers.phase_flip_seam_reserve import (
             SeamReserve,
             seam_allowed_tokens,
         )
@@ -422,7 +422,7 @@ class TheSizerCarriesTheSameSplitTest(unittest.TestCase):
         )
 
     def test_both_floors_together_are_what_the_boot_must_be_able_to_fund(self):
-        from sglang.srt.managers.phase_flip_seam_reserve import SeamReserve
+        from flliper.srt.managers.phase_flip_seam_reserve import SeamReserve
 
         r = SeamReserve(fixed_bytes=300 << 20, arena_fixed_bytes=200 << 20)
         self.assertEqual(r.total_fixed_bytes, 500 << 20)
@@ -430,7 +430,7 @@ class TheSizerCarriesTheSameSplitTest(unittest.TestCase):
     def test_a_reserve_carrying_only_an_arena_tail_is_active(self):
         """``active`` gates the whole correction. A rank whose only seam cost
         is the arena tail must not read as "nothing measured"."""
-        from sglang.srt.managers.phase_flip_seam_reserve import SeamReserve
+        from flliper.srt.managers.phase_flip_seam_reserve import SeamReserve
 
         self.assertTrue(SeamReserve(arena_fixed_bytes=200 << 20, id_space=1000).active)
 

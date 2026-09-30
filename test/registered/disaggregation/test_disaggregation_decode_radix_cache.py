@@ -8,19 +8,19 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.utils import get_tokenizer
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.cache_hit_kit import (
-    async_request_sglang_generate,
+from flliper.benchmark.datasets.random import sample_random_requests
+from flliper.benchmark.utils import get_tokenizer
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.cache_hit_kit import (
+    async_request_flliper_generate,
     gen_payload,
     run_multiturn_cache_hit_test,
 )
-from sglang.test.run_eval import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.run_eval import run_eval
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     is_in_ci,
     try_cached_model,
@@ -180,8 +180,8 @@ class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase
 
     @classmethod
     def setUpClass(cls):
-        cls.hicache_dir = tempfile.mkdtemp(prefix="sglang-hicache-")
-        os.environ["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.hicache_dir
+        cls.hicache_dir = tempfile.mkdtemp(prefix="flliper-hicache-")
+        os.environ["FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR"] = cls.hicache_dir
 
         super().setUpClass()
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
@@ -194,7 +194,7 @@ class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
-        os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
+        os.environ.pop("FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR", None)
         shutil.rmtree(cls.hicache_dir, ignore_errors=True)
 
     def _post_ok(self, url):
@@ -207,7 +207,7 @@ class TestDisaggregationDecodeRadixHiCacheFileBackend(PDDisaggregationServerBase
 
     def _generate(self, input_ids, output_len):
         output = asyncio.run(
-            async_request_sglang_generate(
+            async_request_flliper_generate(
                 gen_payload(input_ids, output_len),
                 f"{self.base_url}/generate",
             )

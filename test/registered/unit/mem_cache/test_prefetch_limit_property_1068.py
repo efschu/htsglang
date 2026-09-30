@@ -44,9 +44,9 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -151,7 +151,7 @@ class TestRateLimitIsTheCounterForm(CustomTestCase):
         is gone from the controller's __init__ and from the ring module. It
         returns only together with the staging drain that frees host rows
         after ack_backup, i.e. with a consumer and its own tests."""
-        from sglang.srt.mem_cache import staging_write_ring
+        from flliper.srt.mem_cache import staging_write_ring
 
         for src in (
             inspect.getsource(HiCacheController.__init__),
@@ -223,7 +223,7 @@ class TestAttachCopiesTheHostRole(CustomTestCase):
             register_mem_pool_host=lambda pool: None, close=lambda: None
         )
         with mock.patch(
-            "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend",
+            "flliper.srt.mem_cache.storage.StorageBackendFactory.create_backend",
             return_value=backend,
         ):
             cc.attach_storage_backend("file")
@@ -246,7 +246,7 @@ class TestRatioSizingUnderSymmetricStorageIsRefused(CustomTestCase):
         return tree
 
     def test_ratio_sizing_under_symmetric_storage_is_refused(self):
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         tree = self._tree(UnifiedRadixCache)
         sa = types.SimpleNamespace(hicache_size=0)
@@ -261,7 +261,7 @@ class TestRatioSizingUnderSymmetricStorageIsRefused(CustomTestCase):
         tree._refuse_ratio_sizing_under_symmetric_storage(sa)
 
     def test_the_hiradix_twin_shares_the_refusal(self):
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
 
         tree = self._tree(HiRadixCache)
         with self.assertRaises(ValueError):
@@ -273,8 +273,8 @@ class TestRatioSizingUnderSymmetricStorageIsRefused(CustomTestCase):
         )
 
     def test_init_refuses_before_the_ring_and_never_symmetrizes(self):
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         for src in (
             inspect.getsource(UnifiedRadixCache.init_hicache),
@@ -288,8 +288,8 @@ class TestRatioSizingUnderSymmetricStorageIsRefused(CustomTestCase):
             )
 
     def test_no_symmetrize_twin_survives(self):
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+        from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         self.assertFalse(hasattr(UnifiedRadixCache, "_symmetrize_prefetch_capacity"))
         self.assertFalse(hasattr(HiRadixCache, "_symmetrize_prefetch_capacity"))

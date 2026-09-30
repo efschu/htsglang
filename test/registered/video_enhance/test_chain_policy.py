@@ -28,8 +28,8 @@ import unittest
 from fractions import Fraction
 from pathlib import Path
 
-from sglang.srt.planner.cost_model import Provenance, Rate
-from sglang.srt.video_enhance.chain_policy import (
+from flliper.srt.planner.cost_model import Provenance, Rate
+from flliper.srt.video_enhance.chain_policy import (
     REQUIRES_FRAME_DECIMATION,
     REQUIRES_SCALED_DECODE,
     ChainMode,
@@ -42,14 +42,14 @@ from sglang.srt.video_enhance.chain_policy import (
     require_chain,
     sr_entry_points,
 )
-from sglang.srt.video_enhance.frame_math import MIB, Resolution
-from sglang.srt.video_enhance.rife_ladder import (
+from flliper.srt.video_enhance.frame_math import MIB, Resolution
+from flliper.srt.video_enhance.rife_ladder import (
     RifeFrontier,
     default_ladder,
 )
-from sglang.srt.video_enhance.tenant import TenantConfig
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.video_enhance.tenant import TenantConfig
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

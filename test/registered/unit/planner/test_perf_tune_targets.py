@@ -44,10 +44,10 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.srt.distributed.utils import partition_units
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.srt.distributed.utils import partition_units
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -159,7 +159,7 @@ def _args(reserve=(3000, 2700, 2700), tune="enc", loose=0.0, demand=_DEMAND):
 
 #: The #264 boots ran with the bf16 SSM state (halves the mamba pool, hence
 #: the per-rank capacities); the model reads it from the environment.
-_ENV = {"SGLANG_MAMBA_SSM_DTYPE": "bfloat16"}
+_ENV = {"FLLIPER_MAMBA_SSM_DTYPE": "bfloat16"}
 
 
 def _plan(**kw):

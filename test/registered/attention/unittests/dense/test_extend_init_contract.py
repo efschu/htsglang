@@ -29,14 +29,14 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import get_device_sm
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.utils import get_device_sm
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
     build_dense_attention_fixture,
 )

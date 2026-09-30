@@ -3,8 +3,8 @@
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.entrypoints.openai.protocol import CompletionRequest
-from sglang.srt.parser.code_completion_parser import (
+from flliper.srt.entrypoints.openai.protocol import CompletionRequest
+from flliper.srt.parser.code_completion_parser import (
     CompletionTemplate,
     FimPosition,
     completion_template_exists,
@@ -15,8 +15,8 @@ from sglang.srt.parser.code_completion_parser import (
     register_completion_template,
     set_completion_template,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -126,7 +126,7 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
     def test_nonempty_suffix_uses_fim_template(self):
         """Test that non-empty suffix triggers FIM formatting."""
         with patch(
-            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "flliper.srt.parser.code_completion_parser.completion_template_name",
             "deepseek_coder",
         ):
             request = CompletionRequest(prompt="prefix", suffix="suffix")
@@ -141,7 +141,7 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
 class TestSetCompletionTemplate(CustomTestCase):
     def test_set_only_once(self):
         """Test that set_completion_template only sets the name once."""
-        import sglang.srt.parser.code_completion_parser as module
+        import flliper.srt.parser.code_completion_parser as module
 
         with patch.object(module, "completion_template_name", None):
             set_completion_template("star_coder")
@@ -152,7 +152,7 @@ class TestSetCompletionTemplate(CustomTestCase):
 
     def test_is_completion_template_defined(self):
         """Test the defined check before and after setting."""
-        import sglang.srt.parser.code_completion_parser as module
+        import flliper.srt.parser.code_completion_parser as module
 
         old_name = module.completion_template_name
         try:

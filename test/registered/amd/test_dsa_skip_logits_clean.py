@@ -21,9 +21,9 @@ import unittest
 
 import torch
 
-from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.utils import is_gfx95_supported, is_hip
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 

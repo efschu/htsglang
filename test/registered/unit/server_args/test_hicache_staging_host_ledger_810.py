@@ -29,9 +29,9 @@ Both directions of every gate, plus the default: with the role left at
 import unittest
 from unittest import mock
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -56,7 +56,7 @@ def _run(*, host_memory=ROOMY, **kwargs):
     base.update(kwargs)
     args = ServerArgs(model_path="dummy", **base)
     with mock.patch(
-        "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+        "flliper.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
         lambda: host_memory,
     ):
         args._handle_hicache_host_role()
@@ -120,7 +120,7 @@ class RetentionIsUnpricedTest(CustomTestCase):
             hicache_storage_backend="file",
         )
         with mock.patch(
-            "sglang.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
+            "flliper.srt.mem_cache.pinned_host_budget.pinned_host_memory_bytes",
             lambda: (1 * GB, 1 * GB),
         ):
             args._handle_hicache_host_role()
@@ -130,7 +130,7 @@ class RetentionIsUnpricedTest(CustomTestCase):
         """Not an omission: a ratio multiplies the DEVICE pool, which does not
         exist until the model is loaded and profiled. `staging` refuses the
         ratio precisely so that this case cannot arise under the role."""
-        from sglang.srt.mem_cache.pinned_host_budget import (
+        from flliper.srt.mem_cache.pinned_host_budget import (
             hicache_configured_host_bytes,
         )
 

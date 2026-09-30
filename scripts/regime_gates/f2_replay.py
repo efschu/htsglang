@@ -46,7 +46,7 @@ sys.path.insert(
     0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 )
 
-from sglang.srt.managers.regime_classifier import (  # noqa: E402
+from flliper.srt.managers.regime_classifier import (  # noqa: E402
     REGIME_DECODE_HEAVY,
     REGIME_PREFILL_HEAVY,
     RegimeSample,

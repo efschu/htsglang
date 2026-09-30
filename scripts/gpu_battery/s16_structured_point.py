@@ -81,7 +81,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from s12_log_analyse import im_fenster, parse_decode  # noqa: E402  one parser
+from s12_log_analyse import in_window, parse_decode  # noqa: E402  one parser
 
 KIND = "s16_structured"
 SCHEMA_VERSION = 1
@@ -174,12 +174,12 @@ def _flush_cache(port: int) -> str:
 
 def _metrics_snapshot(port: int) -> dict:
     keep = (
-        "sglang:num_running_reqs",
-        "sglang:num_queue_reqs",
-        "sglang:gen_throughput",
-        "sglang:spec_accept_length",
-        "sglang:token_usage",
-        "sglang:cache_hit_rate",
+        "flliper:num_running_reqs",
+        "flliper:num_queue_reqs",
+        "flliper:gen_throughput",
+        "flliper:spec_accept_length",
+        "flliper:token_usage",
+        "flliper:cache_hit_rate",
     )
     out: dict = {}
     try:
@@ -428,7 +428,7 @@ def _harvest_ticks(server_log: str, start: float, end: float, bs: int) -> dict:
             ticks = parse_decode(f)
     except OSError as exc:
         return {"tick_error": f"{type(exc).__name__}: {exc}"}
-    window = im_fenster(ticks, start, end)
+    window = in_window(ticks, start, end)
     out = {"tick_source": server_log}
     out.update({f"tick_{k}": v for k, v in tick_aggregate(window, bs).items()})
     return out

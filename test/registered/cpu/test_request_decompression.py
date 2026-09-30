@@ -3,10 +3,10 @@ import unittest
 
 import zstandard
 
-from sglang.srt.entrypoints.http_request_decompression import (
+from flliper.srt.entrypoints.http_request_decompression import (
     RequestDecompressionMiddleware,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 

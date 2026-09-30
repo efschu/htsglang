@@ -11,7 +11,7 @@ the only way to price the quantization error before a kernel exists, which the
 mandatory quality gate needs.
 
 WHAT IT IS NOT. Not a serving path, not an implementation, and deliberately
-not placed under `python/sglang/srt/` — int8 KV is UNBUILT in this fork
+not placed under `python/flliper/srt/` — int8 KV is UNBUILT in this fork
 (`server_args.py:1008` choices exclude it) and #489 stands as
 evaluated-and-declined. A reference living beside production code would read
 as a half-landed feature. If #726 is reopened and built, this moves next to
@@ -229,7 +229,7 @@ class TestTheDtypeKeyAlreadySeparatesFormats(unittest.TestCase):
         kv_cache_dtype = "fp8_e4m3"
 
     def _hash(self, kv_dtype):
-        from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
+        from flliper.srt.mem_cache.hicache_storage import compute_model_identity_hash
 
         args = TestTheDtypeKeyAlreadySeparatesFormats._Args()
         args.kv_cache_dtype = kv_dtype
@@ -256,7 +256,7 @@ class TestTheDtypeKeyAlreadySeparatesFormats(unittest.TestCase):
         something incidental. This states WHERE the separation comes from."""
         import inspect
 
-        from sglang.srt.mem_cache import hicache_storage
+        from flliper.srt.mem_cache import hicache_storage
 
         src = inspect.getsource(hicache_storage.compute_model_identity_hash)
         self.assertIn("server_args.kv_cache_dtype", src)

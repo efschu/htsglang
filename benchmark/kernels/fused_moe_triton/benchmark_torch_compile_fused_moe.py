@@ -6,9 +6,9 @@ import triton
 from torch.nn import functional as F
 from transformers import AutoConfig
 
-from sglang.benchmark.bench_utils import run_bench
-from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+from flliper.benchmark.bench_utils import run_bench
+from flliper.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from flliper.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe as fused_moe_triton,
 )
 
@@ -150,7 +150,7 @@ def fused_moe_torch_compile(
     )
 
 
-def fused_moe_sglang_api(
+def fused_moe_flliper_api(
     x,
     w1,
     w2,
@@ -242,7 +242,7 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
     api_func = (
         fused_moe_torch_compile
         if provider == "fused_moe_torch_compile"
-        else fused_moe_sglang_api
+        else fused_moe_flliper_api
     )
     for _ in range(10):
         y = api_func(

@@ -37,9 +37,9 @@ this box -- see the boundary note at the end of the module).
 
 import unittest
 
-from sglang.srt.uneven_perf import LayerFamilyCensus, layer_family_census
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.uneven_perf import LayerFamilyCensus, layer_family_census
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -203,7 +203,7 @@ class TestUniformModelsAreByteIdentical(CustomTestCase):
         class _Stub:
             pass
 
-        from sglang.srt.uneven_perf import PerfCostModel
+        from flliper.srt.uneven_perf import PerfCostModel
 
         for n in (12, 48, 64):
             stub = _Stub()
@@ -218,7 +218,7 @@ class TestUniformModelsAreByteIdentical(CustomTestCase):
         class _Stub:
             n_layers = 40
 
-        from sglang.srt.uneven_perf import PerfCostModel
+        from flliper.srt.uneven_perf import PerfCostModel
 
         self.assertEqual(PerfCostModel._mlp_layer_factor(_Stub()), 40.0)
 

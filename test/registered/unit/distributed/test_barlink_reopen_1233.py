@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""#1233 weg2 S2 -- BI-1 ``GroupCoordinator.barlink_reopen()``.
+"""#1233 pdflip S2 -- BI-1 ``GroupCoordinator.barlink_reopen()``.
 
 Weg 2 puts one of two process groups to sleep on every card. Sleep closes that
 group's barlink transports (``BarlinkBar1Transport.close()``, which is
@@ -69,13 +69,13 @@ import pathlib
 import pytest
 import torch
 
-from sglang.srt.distributed import parallel_state as ps
-from sglang.srt.distributed.device_communicators import barlink as barlink_mod
-from sglang.srt.distributed.device_communicators import barlink_abort_gate as gate
-from sglang.srt.distributed.device_communicators import (
+from flliper.srt.distributed import parallel_state as ps
+from flliper.srt.distributed.device_communicators import barlink as barlink_mod
+from flliper.srt.distributed.device_communicators import barlink_abort_gate as gate
+from flliper.srt.distributed.device_communicators import (
     barlink_matrix_transport as ledger,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -83,7 +83,7 @@ _PARALLEL_STATE = pathlib.Path(inspect.getsourcefile(ps))
 _BAR1 = pathlib.Path(
     inspect.getsourcefile(
         __import__(
-            "sglang.srt.distributed.device_communicators.barlink_bar1",
+            "flliper.srt.distributed.device_communicators.barlink_bar1",
             fromlist=["x"],
         )
     )
@@ -237,7 +237,7 @@ def coord(monkeypatch):
     group, so every behavioural test here exercises the agreement, with the
     siblings voting "no captured graphs" unless a test says otherwise.
     """
-    monkeypatch.setenv("SGLANG_BARLINK_TRANSPORT", "device")
+    monkeypatch.setenv("FLLIPER_BARLINK_TRANSPORT", "device")
     monkeypatch.setattr(ps, "should_build_barlink", lambda world_size: True)
     monkeypatch.setattr(barlink_mod, "BarlinkCommunicator", _FakeComm)
     _FakeComm.built = 0
@@ -399,7 +399,7 @@ _WAKE_FAILURES = [
     pytest.param(
         lambda: ledger.Bar1WindowRefused(
             "barlink-BAR1: group 'tp:0' was explicitly given 96 MiB via "
-            "SGLANG_BARLINK_BAR1_WINDOW_MIB, but only 32 MiB of BAR1 is "
+            "FLLIPER_BARLINK_BAR1_WINDOW_MIB, but only 32 MiB of BAR1 is "
             "available on this card."
         ),
         ledger.Bar1WindowRefused,
@@ -548,11 +548,11 @@ def test_reopen_refuses_when_the_cpu_group_is_gone(coord):
 def test_pin_flag_gate_is_unchanged():
     """The predicate stays the shared one, and the import stays inside it."""
     assert (
-        "return bool(envs.SGLANG_BARLINK.get()) and world_size > 1"
+        "return bool(envs.FLLIPER_BARLINK.get()) and world_size > 1"
         in inspect.getsource(ps.should_build_barlink)
     ), "should_build_barlink must still be exactly the flag-and-multi-rank gate"
     src = _PARALLEL_STATE.read_text()
-    import_line = "from sglang.srt.distributed.device_communicators.barlink import"
+    import_line = "from flliper.srt.distributed.device_communicators.barlink import"
     assert src.count(import_line) == 1
     assert src.index(import_line) > src.index(_GATE_LITERAL), (
         "the barlink import must sit inside the flag gate -- flag off must not "
@@ -822,7 +822,7 @@ class _DeviceTransportStub:
         (``barlink_shm.py:206``) has the same shape apart from the size test.
         ``_DownTransport`` above models the BAR1 shape, which is the other one.
 
-    This is the DEFAULT transport: ``SGLANG_BARLINK_TRANSPORT`` is
+    This is the DEFAULT transport: ``FLLIPER_BARLINK_TRANSPORT`` is
     ``EnvStr("device")`` (``environ.py:1004``), which the ``coord`` fixture
     also sets explicitly.
     """
@@ -959,7 +959,7 @@ def test_the_capture_verdict_is_agreed_across_the_group(coord):
         "the refusal must NAME the ranks that hold captured graphs; without "
         "them the message accuses this rank of a state it is not in, and an "
         "operator reading it on rank 0 has nothing to look at. The substring "
-        "carries the label because a bare '2' also matches 'weg2 register "
+        "carries the label because a bare '2' also matches 'pdflip register "
         f"U4' at the end of the same message: {excinfo.value}"
     )
     assert "rank(s) 0" not in str(excinfo.value), (

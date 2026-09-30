@@ -53,13 +53,13 @@ KNOWN LIMIT, STATED SO NOBODY DISCOVERS IT THE HARD WAY: the pin is a per-file
 COUNT, so removing one mutation from a file and adding another to the same file
 in the same commit nets to zero and passes. Tightening that means pinning
 statements rather than counts, which trades this blind spot for line-number
-churn on every edit. The runtime guard (``SGLANG_STRICT_CONFIG_MUTATION=1``,
+churn on every edit. The runtime guard (``FLLIPER_STRICT_CONFIG_MUTATION=1``,
 under which a bare post-resolution assignment raises) is what actually covers
 the post-resolution case; this static scan exists for the sites the tests never
 execute.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -68,10 +68,10 @@ import unittest
 from pathlib import Path
 from typing import Dict, Tuple
 
-import sglang
-from sglang.test.test_utils import CustomTestCase
+import flliper
+from flliper.test.test_utils import CustomTestCase
 
-_SGLANG_ROOT = Path(next(iter(sglang.__path__)))
+_FLLIPER_ROOT = Path(next(iter(flliper.__path__)))
 
 # Assignments to a server_args attribute (``server_args.x = ...``,
 # ``self.server_args.x = ...``, and the ``sa`` alias used by a few helpers).
@@ -153,8 +153,8 @@ _FIXED_VIOLATIONS = (
 
 def _counts_by_file() -> Dict[str, int]:
     found: Dict[str, int] = {}
-    for path in sorted(_SGLANG_ROOT.rglob("*.py")):
-        rel = path.relative_to(_SGLANG_ROOT).as_posix()
+    for path in sorted(_FLLIPER_ROOT.rglob("*.py")):
+        rel = path.relative_to(_FLLIPER_ROOT).as_posix()
         if rel.startswith(_EXCLUDED):
             continue
         source = path.read_text()
@@ -255,7 +255,7 @@ class TestServerArgsMutationRatchet(CustomTestCase):
         """Guards against a pin outliving the file it describes."""
         for rel in sorted(_PINNED):
             with self.subTest(file=rel):
-                self.assertTrue((_SGLANG_ROOT / rel).is_file())
+                self.assertTrue((_FLLIPER_ROOT / rel).is_file())
 
 
 if __name__ == "__main__":

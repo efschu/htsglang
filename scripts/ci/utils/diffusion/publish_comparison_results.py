@@ -1,4 +1,4 @@
-"""Publish SGLang-Diffusion nightly benchmark results to sgl-project/ci-data repo.
+"""Publish fLLiper-Diffusion nightly benchmark results to sgl-project/ci-data repo.
 
 Pushes comparison-results.json, dashboard.md, and chart PNG files to the
 ci-data repository for historical tracking. Chart PNGs are stored under
@@ -196,7 +196,7 @@ def publish_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Publish SGLang-Diffusion nightly benchmark results to ci-data"
+        description="Publish fLLiper-Diffusion nightly benchmark results to ci-data"
     )
     parser.add_argument(
         "--results",

@@ -4,7 +4,7 @@ Media the client supplied but that cannot be fetched or decoded must raise
 ``ValueError``; anything else must stay a ``RuntimeError``.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -14,10 +14,10 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.schedule_batch import Modality
+from flliper.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from flliper.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
+from flliper.test.test_utils import CustomTestCase
 
 MODALITIES = (Modality.IMAGE, Modality.AUDIO, Modality.VIDEO)
 
@@ -50,7 +50,7 @@ class TestBadInputIsClientError(CustomTestCase):
             for modality in MODALITIES:
                 with self.subTest(exc=type(exc).__name__, modality=modality):
                     with patch(
-                        "sglang.srt.utils.common.get_mm_http_session",
+                        "flliper.srt.utils.common.get_mm_http_session",
                         return_value=_session_raising(exc),
                     ):
                         self._assert_client_error("https://media.host/clip", modality)
@@ -69,7 +69,7 @@ class TestBadInputIsClientError(CustomTestCase):
     def test_undecodable_video_bytes(self):
         # Decoder is patched so no codec backend needs to be installed.
         with patch(
-            "sglang.srt.utils.common.VideoDecoderWrapper",
+            "flliper.srt.utils.common.VideoDecoderWrapper",
             side_effect=RuntimeError("invalid data found when processing input"),
         ):
             self._assert_client_error(b"definitely not a video", Modality.VIDEO)
@@ -80,7 +80,7 @@ class TestServerFaultStaysServerError(CustomTestCase):
 
     def _assert_server_error(self, side_effect):
         with patch(
-            "sglang.srt.utils.common.VideoDecoderWrapper", side_effect=side_effect
+            "flliper.srt.utils.common.VideoDecoderWrapper", side_effect=side_effect
         ):
             with self.assertRaises(RuntimeError):
                 _StubProcessor._load_single_item(b"payload", Modality.VIDEO)

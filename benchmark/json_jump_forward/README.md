@@ -18,24 +18,24 @@ pip install wikipedia
 python3 build_dataset.py
 ```
 
-### Benchmark sglang
+### Benchmark flliper
 
 Run Llama-7B
 
 ```bash
-python3 -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
+python3 -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000
 ```
 
 Benchmark Character Generation
 
 ```bash
-python3 bench_sglang.py --mode character
+python3 bench_flliper.py --mode character
 ```
 
 Benchmark City Information Retrieval
 
 ```bash
-python3 bench_sglang.py --mode city
+python3 bench_flliper.py --mode city
 ```
 
 

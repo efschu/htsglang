@@ -20,7 +20,7 @@ Two faults, one per test group:
    left the list: an endless walk inside the scheduler step.
 
 Hermetic: real ``UnifiedTreeNode``/``UnifiedLRUList`` and the real
-``_evict_device_leaf`` -> ``write_backup`` -> ``_weg2_direct_claim`` chain;
+``_evict_device_leaf`` -> ``write_backup`` -> ``_pdflip_direct_claim`` chain;
 pools, controller and components are recording fakes."""
 from __future__ import annotations
 
@@ -32,12 +32,12 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt import rank_role  # noqa: E402
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
-from sglang.srt.mem_cache.unified_radix_cache import (  # noqa: E402
+from flliper.srt import rank_role  # noqa: E402
+from flliper.srt.mem_cache.base_prefix_cache import EvictParams  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import (  # noqa: E402
     UnifiedLRUList,
     UnifiedRadixCache,
     UnifiedTreeNode,
@@ -106,12 +106,12 @@ def _tree(shadow_free=64):
     t.page_size = PAGE
     t.sidecar_pool_specs = []
     t.ongoing_write_through = {}
-    t._weg2_rid_anchor_cfg = 8
+    t._pdflip_rid_anchor_cfg = 8
     t.components = {F: _Comp(F), M: _Comp(M)}
     t._components_tuple = (t.components[F], t.components[M])
     t.kv = _KvArena()
-    t._weg2_direct_pool = lambda: t.kv
-    t._weg2_mamba_pool = lambda: None  # the worker has no mamba arena
+    t._pdflip_direct_pool = lambda: t.kv
+    t._pdflip_mamba_pool = lambda: None  # the worker has no mamba arena
     t.writes = []
 
     def _write(device_value, node_id=None, extra_pools=None, host_indices=None):
@@ -141,8 +141,8 @@ def _leaf(t, name="tail"):
     n.hash_value = [f"{name}{i}" for i in range(PAGES)]
     n.component_data[F].value = torch.arange(PAGE * PAGES)
     n.component_data[M].value = torch.tensor([7])
-    n.weg2_anchor_rid = None
-    n._weg2_end_anchor = False
+    n.pdflip_anchor_rid = None
+    n._pdflip_end_anchor = False
     return n
 
 
@@ -200,7 +200,7 @@ def test_the_weight_rank_without_a_mamba_arena_still_refuses(monkeypatch):
     t = _tree()
     n = _leaf(t)
     assert t.write_backup(n, write_back=True) == 0
-    assert t._weg2_sweep_last_refusal == "mamba_pool_unbound"
+    assert t._pdflip_sweep_last_refusal == "mamba_pool_unbound"
     assert t.kv.aborted, "the KV claim goes back with the refused node"
 
 

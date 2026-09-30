@@ -54,12 +54,12 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.dcp.reshard_plan import (
+from flliper.srt.layers.dcp.reshard_plan import (
     owner_of,
     reshard_ceiling_rows,
     rows_of,
 )
-from sglang.srt.managers.kv_reshard import (
+from flliper.srt.managers.kv_reshard import (
     CORRIDOR_FLOOR_MIB,
     KvPoolView,
     KvReshardRuntime,
@@ -463,7 +463,7 @@ class TestFailClosedAndNamed(unittest.TestCase):
         self.assertIn("NVML is not talking to us", f.runtimes[1].last_headroom["error"])
 
     def test_the_refusal_names_the_numbers(self):
-        with self.assertLogs("sglang.srt.managers.kv_reshard", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.managers.kv_reshard", level="WARNING") as cm:
             _Fleet([_plenty(), _short(), _plenty()]).run()
         refusals = [m for m in cm.output if "REFUSED for headroom" in m]
         self.assertTrue(refusals, "the refusal was not logged")
@@ -519,7 +519,7 @@ class TestTheProductionWiringSuppliesTheGuard(unittest.TestCase):
         boot: `free_bytes_fn=None` is inert by design."""
         import inspect
 
-        from sglang.srt.managers import kv_reshard
+        from flliper.srt.managers import kv_reshard
 
         src = inspect.getsource(kv_reshard.build_kv_reshard_runtime)
         self.assertIn("free_bytes_fn=", src)
@@ -528,7 +528,7 @@ class TestTheProductionWiringSuppliesTheGuard(unittest.TestCase):
         """A narrowed CUDA_VISIBLE_DEVICES renumbers indices; UUIDs survive."""
         import inspect
 
-        from sglang.srt.managers import kv_reshard
+        from flliper.srt.managers import kv_reshard
 
         src = inspect.getsource(kv_reshard._free_bytes_fn_for)
         self.assertIn("nvmlDeviceGetUUID", src)

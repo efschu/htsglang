@@ -31,7 +31,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.vram_dial import (
+from flliper.srt.managers.vram_dial import (
     MIB,
     BootCapacityPlan,
     KvCapacityError,
@@ -40,12 +40,12 @@ from sglang.srt.managers.vram_dial import (
     validate_vram_dial_compat,
     verify_pool_reached_capacity,
 )
-from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import graph_safe_store_bound
-from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from flliper.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.memory_pool import graph_safe_store_bound
+from flliper.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 

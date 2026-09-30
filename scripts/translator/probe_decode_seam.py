@@ -40,7 +40,7 @@ def main() -> int:
 
     import torch
 
-    from sglang.srt.translator.qwen3_tts_compat import (
+    from flliper.srt.translator.qwen3_tts_compat import (
         ensure_qwen3_tts_importable,
         refresh_rotary_buffers,
         restore_cache_position,

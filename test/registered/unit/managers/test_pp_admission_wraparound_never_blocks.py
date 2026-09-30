@@ -116,7 +116,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=45)
 
@@ -262,7 +262,7 @@ class _RingWire:
 
 
 def _make_holder(rank: int, wire: _RingWire):
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -319,11 +319,11 @@ def _read_progress(out_dir, rank):
 
 
 def _pp0_worker(init_file, out_dir, mode):
-    from sglang.srt.managers.pp_admission_congruence import (
+    from flliper.srt.managers.pp_admission_congruence import (
         PPAdmissionCongruenceGuard,
         PPAdmissionDecision,
     )
-    from sglang.srt.managers.scheduler_pp_mixin import _PP_ADMISSION_PENDING_SENDS_CAP
+    from flliper.srt.managers.scheduler_pp_mixin import _PP_ADMISSION_PENDING_SENDS_CAP
 
     res = {"rank": PP0, "ok": False, "error": None}
     try:
@@ -619,7 +619,7 @@ class PPAdmissionWraparoundCallSite(unittest.TestCase):
         test_pp_admission_wiring_791.py's own ordering test."""
         import inspect
 
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         src = inspect.getsource(SchedulerPPMixin._event_loop_pp_body)
         self.assertIn(

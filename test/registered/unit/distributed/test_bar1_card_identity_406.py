@@ -26,15 +26,15 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.distributed.device_communicators import barlink_bar1 as bar1_module
-from sglang.srt.distributed.device_communicators import barlink_matrix as matrix_module
-from sglang.srt.distributed.device_communicators import (
+from flliper.srt.distributed.device_communicators import barlink_bar1 as bar1_module
+from flliper.srt.distributed.device_communicators import barlink_matrix as matrix_module
+from flliper.srt.distributed.device_communicators import (
     barlink_matrix_transport as transport,
 )
-from sglang.srt.registry import nvml as registry_nvml
-from sglang.srt.registry.nvml import DeviceInfo, DeviceOrderUnresolvedError
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.registry import nvml as registry_nvml
+from flliper.srt.registry.nvml import DeviceInfo, DeviceOrderUnresolvedError
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -206,8 +206,8 @@ class _RigCase(CustomTestCase):
             patch.dict(
                 os.environ,
                 {
-                    "SGLANG_BARLINK_BAR1_WINDOW_MIB": str(REQUEST_MIB),
-                    "SGLANG_BARLINK_BAR1_RESERVE_MIB": str(RESERVE_MIB),
+                    "FLLIPER_BARLINK_BAR1_WINDOW_MIB": str(REQUEST_MIB),
+                    "FLLIPER_BARLINK_BAR1_RESERVE_MIB": str(RESERVE_MIB),
                 },
             ),
         ]
@@ -278,7 +278,7 @@ class Bar1FreeFollowsTheCardTest(_RigCase):
         request through -- a window the hosting card cannot hold.
 
         The SUBJECT here is card identity, not the clip policy: this fixture
-        pins ``SGLANG_BARLINK_BAR1_WINDOW_MIB`` only so the arithmetic is
+        pins ``FLLIPER_BARLINK_BAR1_WINDOW_MIB`` only so the arithmetic is
         exact. Since #603 an EXPLICIT window that does not fit refuses
         instead of being served smaller, so the observable is the refusal --
         and what it has to prove is unchanged: the arithmetic in it belongs
@@ -299,8 +299,8 @@ class Bar1FreeFollowsTheCardTest(_RigCase):
         explicit request the window is reduced rather than refused, and it is
         reduced to the HOSTING card's 68 MiB, not the 3080's 208."""
         env = {k: v for k, v in os.environ.items()
-               if k != "SGLANG_BARLINK_BAR1_WINDOW_MIB"}
-        env["SGLANG_BARLINK_BAR1_RESERVE_MIB"] = str(RESERVE_MIB)
+               if k != "FLLIPER_BARLINK_BAR1_WINDOW_MIB"}
+        env["FLLIPER_BARLINK_BAR1_RESERVE_MIB"] = str(RESERVE_MIB)
         with patch.dict(os.environ, env, clear=True):
             got = transport.window_for("tp", _FakeDevice(0))
         self.assertEqual(got, CORRECT_WINDOW_MIB * MIB)

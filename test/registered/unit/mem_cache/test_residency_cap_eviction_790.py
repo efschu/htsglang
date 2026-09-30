@@ -66,10 +66,10 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.kv_backing_relief import KvRowCap
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.common import alloc_token_slots
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers.kv_backing_relief import KvRowCap
+from flliper.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.common import alloc_token_slots
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

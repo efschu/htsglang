@@ -12,7 +12,7 @@ resident and cutover (WEG1_BUILD_SPEC_0901.md section 4.5).
 WHAT THIS PINS. Not behaviour -- ABSENCE. A deleted mechanism grows back one
 helper at a time ("just a small restore for the mid-chunk case"), and the
 first re-grown helper reads exactly like a bug fix. So the pin is an AST walk
-over `python/sglang/srt`: none of the seam-copy names may be DEFINED, no call
+over `python/flliper/srt`: none of the seam-copy names may be DEFINED, no call
 may pass `copy_state=`, `retract_all`/`release_req` may not accept it, `Req`
 may not carry the four copy-side fields, and the acceptance log markers that
 only the copy ever printed may not exist as string literals.
@@ -31,7 +31,7 @@ and `check_cpu_copy_rows` (both consumed by the retained `get_cpu_copy` /
 disaggregation path is kept, never converted into a silent illegal access).
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -39,10 +39,10 @@ import ast
 import pathlib
 import unittest
 
-import sglang
-from sglang.test.test_utils import CustomTestCase
+import flliper
+from flliper.test.test_utils import CustomTestCase
 
-SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
+SRT = pathlib.Path(flliper.__file__).resolve().parent / "srt"
 
 #: Functions / methods that must not be DEFINED anywhere under srt/.
 DELETED_DEFS = (
@@ -157,8 +157,8 @@ class TestSeamCopyIsDeleted(CustomTestCase):
         # The sweep may not take the decode-disaggregation retraction backup
         # or the pool-level guards its bodies call. Named here so the deletion
         # has a lower bound as well as an upper one.
-        from sglang.srt.managers.schedule_batch import Req
-        from sglang.srt.mem_cache import memory_pool
+        from flliper.srt.managers.schedule_batch import Req
+        from flliper.srt.mem_cache import memory_pool
 
         self.assertTrue(callable(getattr(Req, "offload_kv_cache", None)))
         self.assertTrue(callable(getattr(Req, "load_kv_cache", None)))

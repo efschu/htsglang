@@ -81,14 +81,14 @@ def release() -> None:
 #: transformers-5.12 compat shims and repairs rotary buffers that are
 #: otherwise NaN after meta-device construction (`inprocess_tts.py:205-214`).
 #: Reimplementing that here would be a second, diverging copy of somebody
-#: else's hard-won load path. So the run takes the 466 tree as `sglang` and
+#: else's hard-won load path. So the run takes the 466 tree as `flliper` and
 #: injects these two by path instead.
 _LOCAL_MODULES = {
-    "sglang.srt.models.qwen3_tts_fast_predictor": (
-        _HERE.parents[2] / "python/sglang/srt/models/qwen3_tts_fast_predictor.py"
+    "flliper.srt.models.qwen3_tts_fast_predictor": (
+        _HERE.parents[2] / "python/flliper/srt/models/qwen3_tts_fast_predictor.py"
     ),
-    "sglang.srt.models.qwen3_tts_graph_driver": (
-        _HERE.parents[2] / "python/sglang/srt/models/qwen3_tts_graph_driver.py"
+    "flliper.srt.models.qwen3_tts_graph_driver": (
+        _HERE.parents[2] / "python/flliper/srt/models/qwen3_tts_graph_driver.py"
     ),
 }
 
@@ -98,7 +98,7 @@ def install_local_modules() -> List[str]:
 
     Registered in ``sys.modules`` before anything imports them, so that
     ``qwen3_tts_graph_driver``'s own ``from ... import`` of the fast predictor
-    resolves to the file next to it rather than to whatever the ``sglang`` on
+    resolves to the file next to it rather than to whatever the ``flliper`` on
     ``PYTHONPATH`` happens to carry. Order matters: the dependency first.
     """
     installed = []
@@ -216,7 +216,7 @@ def _eager_inverse_cdf(logits, uniform, temperature, top_k, top_p, vocab_size):
     """
     import torch
 
-    from sglang.srt.models.qwen3_tts_fast_predictor import apply_warpers
+    from flliper.srt.models.qwen3_tts_fast_predictor import apply_warpers
 
     warped = apply_warpers(logits, temperature, top_k, top_p)
     cumulative = warped.float().softmax(dim=-1).cumsum(dim=-1)
@@ -243,8 +243,8 @@ def _eager_static_frame(talker, prompt, uniforms, sample_kwargs, vocab):
     import torch
     from transformers import StaticCache
 
-    from sglang.srt.models.qwen3_tts_fast_predictor import step_schedule
-    from sglang.srt.models.qwen3_tts_graph_driver import (
+    from flliper.srt.models.qwen3_tts_fast_predictor import step_schedule
+    from flliper.srt.models.qwen3_tts_graph_driver import (
         decode_mask,
         predictor_cache_lengths,
     )
@@ -301,7 +301,7 @@ def identity_gate(talker, frames: int = 4, seed: int = 488) -> dict:
     """
     import torch
 
-    from sglang.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
+    from flliper.srt.models.qwen3_tts_graph_driver import GraphedPredictorFrame
 
     predictor = talker.code_predictor
     groups = talker.config.num_code_groups
@@ -415,7 +415,7 @@ def reference_divergence(talker, frames: int = 4, seed: int = 488) -> dict:
     """
     import torch
 
-    from sglang.srt.models.qwen3_tts_fast_predictor import FastCodePredictor
+    from flliper.srt.models.qwen3_tts_fast_predictor import FastCodePredictor
 
     predictor = talker.code_predictor
     groups = talker.config.num_code_groups
@@ -474,7 +474,7 @@ def gate_loaded_model(model, frames: int = 3, keep_installed: bool = False) -> d
     """
     import torch
 
-    from sglang.srt.models.qwen3_tts_graph_driver import (
+    from flliper.srt.models.qwen3_tts_graph_driver import (
         GraphedPredictorFrame,
         reference_subtalker_defaults,
     )
@@ -576,7 +576,7 @@ def trunk_gate(talker, steps: int = 8) -> dict:
     import torch
     from transformers import DynamicCache, StaticCache
 
-    from sglang.srt.models.qwen3_tts_graph_driver import (
+    from flliper.srt.models.qwen3_tts_graph_driver import (
         GraphedTrunkStep,
         decode_mask,
         reset_cache_positions,
@@ -682,8 +682,8 @@ def ladder(profiler, talker) -> dict:
     """Every rung, back to back, in one window, on one card."""
     import torch
 
-    from sglang.srt.models.qwen3_tts_fast_predictor import FastCodePredictor
-    from sglang.srt.models.qwen3_tts_graph_driver import (
+    from flliper.srt.models.qwen3_tts_fast_predictor import FastCodePredictor
+    from flliper.srt.models.qwen3_tts_graph_driver import (
         GraphedPredictorFrame,
         GraphedTrunkStep,
     )
@@ -850,7 +850,7 @@ def main(argv=None) -> int:
 
 
 def _run(args, profiler, report) -> int:
-    from sglang.srt.translator.inprocess_tts import (
+    from flliper.srt.translator.inprocess_tts import (
         InProcessQwen3Tts,
         InProcessTtsConfig,
     )

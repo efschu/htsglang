@@ -9,7 +9,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from sglang.auto_benchmark_lib import build_candidates, build_server_candidates
+from flliper.auto_benchmark_lib import build_candidates, build_server_candidates
 
 
 def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
@@ -96,7 +96,7 @@ class AutoBenchmarkTestCase(unittest.TestCase):
         capability=None,
     ):
         with mock.patch(
-            "sglang.auto_benchmark_lib.detect_current_cuda_capability",
+            "flliper.auto_benchmark_lib.detect_current_cuda_capability",
             return_value=capability,
         ):
             return build_candidates(
@@ -115,7 +115,7 @@ class AutoBenchmarkTestCase(unittest.TestCase):
         capability=None,
     ):
         with mock.patch(
-            "sglang.auto_benchmark_lib.detect_current_cuda_capability",
+            "flliper.auto_benchmark_lib.detect_current_cuda_capability",
             return_value=capability,
         ):
             return build_server_candidates(
@@ -178,7 +178,7 @@ class AutoBenchmarkTestCase(unittest.TestCase):
             "server_cfg": {"host": "127.0.0.1", "port": 30000},
             "benchmark_cfg": benchmark_cfg,
             "dataset_summary": {"num_requests": 1},
-            "backend": "sglang-oai",
+            "backend": "flliper-oai",
             "dataset_path": str(self.tmpdir_path / "fake.jsonl"),
             "tokenizer_path": str(self.tokenizer_dir),
             "server_flags": {"model_path": "/model"},

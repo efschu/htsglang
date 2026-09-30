@@ -34,7 +34,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -58,7 +58,7 @@ def _scope(method: str, path: str) -> dict:
 
 class TestHibernateDirConfinement(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.utils.path_confinement import (  # noqa: PLC0415
+        from flliper.srt.utils.path_confinement import (  # noqa: PLC0415
             PathConfinementError,
             confine_to_root,
         )
@@ -130,7 +130,7 @@ class TestHibernateDirConfinement(unittest.TestCase):
 
 
 def _runtime_app():
-    from sglang.srt.entrypoints.http_server import app  # noqa: PLC0415
+    from flliper.srt.entrypoints.http_server import app  # noqa: PLC0415
 
     return app
 
@@ -177,7 +177,7 @@ class TestForkStateChangingRoutesCarryAdminLevel(unittest.TestCase):
     ]
 
     def test_all_resolve_to_an_admin_level(self):
-        from sglang.srt.utils.auth import (  # noqa: PLC0415
+        from flliper.srt.utils.auth import (  # noqa: PLC0415
             AuthLevel,
             _get_auth_level_from_app_and_scope,
         )
@@ -197,7 +197,7 @@ class TestForkStateChangingRoutesCarryAdminLevel(unittest.TestCase):
         ``--admin-api-key S3CR3T`` without ``--api-key`` does today for these
         paths (audit #506, finding A2-F2).
         """
-        from sglang.srt.utils.auth import (  # noqa: PLC0415
+        from flliper.srt.utils.auth import (  # noqa: PLC0415
             _get_auth_level_from_app_and_scope,
             decide_request_auth,
         )
@@ -229,7 +229,7 @@ class TestForkStateChangingRoutesCarryAdminLevel(unittest.TestCase):
 
     def test_the_default_deployment_is_unchanged(self):
         """No keys configured -> still open. This is the backward-compat arm."""
-        from sglang.srt.utils.auth import (  # noqa: PLC0415
+        from flliper.srt.utils.auth import (  # noqa: PLC0415
             _get_auth_level_from_app_and_scope,
             decide_request_auth,
         )
@@ -255,7 +255,7 @@ class TestForkStateChangingRoutesCarryAdminLevel(unittest.TestCase):
         Those are protected by ``--api-key`` and promoting them would change
         what an api-key-only deployment can reach.
         """
-        from sglang.srt.utils.auth import (  # noqa: PLC0415
+        from flliper.srt.utils.auth import (  # noqa: PLC0415
             AuthLevel,
             _get_auth_level_from_app_and_scope,
         )
@@ -294,7 +294,7 @@ class TestCorsPolicy(unittest.TestCase):
             )
 
     def test_configure_cors_keeps_credentials_off_for_wildcard(self):
-        from sglang.srt.entrypoints.http_server import configure_cors  # noqa: PLC0415
+        from flliper.srt.entrypoints.http_server import configure_cors  # noqa: PLC0415
 
         class _Args:
             cors_allow_origins = ["*"]
@@ -303,7 +303,7 @@ class TestCorsPolicy(unittest.TestCase):
         self.assertFalse(policy["allow_credentials"])
 
     def test_configure_cors_enables_credentials_for_an_explicit_list(self):
-        from sglang.srt.entrypoints.http_server import configure_cors  # noqa: PLC0415
+        from flliper.srt.entrypoints.http_server import configure_cors  # noqa: PLC0415
 
         class _Args:
             cors_allow_origins = ["https://ui.example"]
@@ -326,7 +326,7 @@ class TestCorsPolicy(unittest.TestCase):
         from fastapi.testclient import TestClient  # noqa: PLC0415
         from starlette.middleware.cors import CORSMiddleware  # noqa: PLC0415
 
-        from sglang.srt.entrypoints.http_server import cors_policy  # noqa: PLC0415
+        from flliper.srt.entrypoints.http_server import cors_policy  # noqa: PLC0415
 
         def _probe(origins):
             app = FastAPI()
@@ -354,7 +354,7 @@ class TestCorsPolicy(unittest.TestCase):
 
     def tearDown(self):
         # Restore the module default so test order cannot leak a policy.
-        from sglang.srt.entrypoints.http_server import configure_cors  # noqa: PLC0415
+        from flliper.srt.entrypoints.http_server import configure_cors  # noqa: PLC0415
 
         class _Args:
             cors_allow_origins = ["*"]
@@ -364,7 +364,7 @@ class TestCorsPolicy(unittest.TestCase):
 
 class TestCorsServerArg(unittest.TestCase):
     def test_the_flag_exists_and_defaults_to_wildcard(self):
-        from sglang.srt.server_args import ServerArgs  # noqa: PLC0415
+        from flliper.srt.server_args import ServerArgs  # noqa: PLC0415
 
         self.assertIn("cors_allow_origins", ServerArgs.__annotations__)
 
@@ -382,9 +382,9 @@ class TestRegistryAppAuth(unittest.TestCase):
         self._tmp.cleanup()
 
     def _app(self, **keys):
-        from sglang.srt.registry.arbiter import EngineRegistry  # noqa: PLC0415
-        from sglang.srt.registry.http_api import build_app  # noqa: PLC0415
-        from sglang.srt.registry.ledger import ReservationStore  # noqa: PLC0415
+        from flliper.srt.registry.arbiter import EngineRegistry  # noqa: PLC0415
+        from flliper.srt.registry.http_api import build_app  # noqa: PLC0415
+        from flliper.srt.registry.ledger import ReservationStore  # noqa: PLC0415
 
         registry = EngineRegistry(
             store=ReservationStore(Path(self._tmp.name) / "ledger"),
@@ -393,7 +393,7 @@ class TestRegistryAppAuth(unittest.TestCase):
         return build_app(registry, **keys)
 
     def test_state_changing_routes_carry_an_admin_level(self):
-        from sglang.srt.utils.auth import (  # noqa: PLC0415
+        from flliper.srt.utils.auth import (  # noqa: PLC0415
             AuthLevel,
             _get_auth_level_from_app_and_scope,
         )
@@ -449,13 +449,13 @@ class TestVideoAppAuth(unittest.TestCase):
     def _app(self, **keys):
         from unittest.mock import patch  # noqa: PLC0415
 
-        from sglang.srt.video_enhance import server as vsrv  # noqa: PLC0415
+        from flliper.srt.video_enhance import server as vsrv  # noqa: PLC0415
 
         with patch.object(vsrv, "VideoEnhanceService"):
             return vsrv.create_app(vsrv.TenantConfig(budget_mib=1024), **keys)
 
     def test_state_changing_routes_carry_an_admin_level(self):
-        from sglang.srt.utils.auth import (  # noqa: PLC0415
+        from flliper.srt.utils.auth import (  # noqa: PLC0415
             AuthLevel,
             _get_auth_level_from_app_and_scope,
         )
@@ -486,7 +486,7 @@ class TestVideoAppAuth(unittest.TestCase):
 
 class TestTrainingFileWriteRequiresTenant(unittest.TestCase):
     def _service(self, *, enabled: bool):
-        from sglang.srt.training.service import (  # noqa: PLC0415
+        from flliper.srt.training.service import (  # noqa: PLC0415
             TrainingService,
             TrainingServiceConfig,
         )
@@ -504,7 +504,7 @@ class TestTrainingFileWriteRequiresTenant(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_upload_is_refused_when_the_tenant_is_off(self):
-        from sglang.srt.training.service import TenantDisabled  # noqa: PLC0415
+        from flliper.srt.training.service import TenantDisabled  # noqa: PLC0415
 
         with self.assertRaises(TenantDisabled):
             self._service(enabled=False).create_file(
@@ -527,7 +527,7 @@ class TestTrainingFileWriteRequiresTenant(unittest.TestCase):
 
 class TestMuxDoesNotReflectSubprocessStderr(unittest.TestCase):
     def test_the_failure_message_carries_no_stderr(self):
-        from sglang.srt.video_enhance.mux import (  # noqa: PLC0415
+        from flliper.srt.video_enhance.mux import (  # noqa: PLC0415
             MuxError,
             subprocess_failure,
         )

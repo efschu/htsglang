@@ -25,9 +25,9 @@ The flag to drop the tail already exists and its docstring says why it exists
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.mem_cache.hicache_storage import compute_model_identity_hash
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_storage import compute_model_identity_hash
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -92,14 +92,14 @@ class TestTheCanonicalPathAsksForIt(CustomTestCase):
     format, and must NOT drop it otherwise."""
 
     def _hash_for(self, canonical: bool):
-        from sglang.srt.managers.cache_controller import (
+        from flliper.srt.managers.cache_controller import (
             canonical_identity_hash_for,
         )
 
         return canonical_identity_hash_for(_args(), canonical)
 
     def test_canonical_on_gives_a_geometry_free_hash(self):
-        from sglang.srt.managers.cache_controller import (
+        from flliper.srt.managers.cache_controller import (
             canonical_identity_hash_for,
         )
 
@@ -113,7 +113,7 @@ class TestTheCanonicalPathAsksForIt(CustomTestCase):
         Without the canonical page a stage's file really does hold only that
         stage's layers, so geometry belongs in the key.
         """
-        from sglang.srt.managers.cache_controller import (
+        from flliper.srt.managers.cache_controller import (
             canonical_identity_hash_for,
         )
 

@@ -3,12 +3,12 @@ import unittest
 
 import torch
 
-from sglang.test.ascend.test_ascend_utils import (
+from flliper.test.ascend.test_ascend_utils import (
     SKYWORK_REWARD_LLAMA_3_1_8B_V0_2_WEIGHTS_PATH,
 )
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_npu_ci
+from flliper.test.runners import HFRunner, SRTRunner
+from flliper.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
@@ -31,7 +31,7 @@ CONVS = [
 
 class TestLlama(CustomTestCase):
     """Testcase: This test case validates that the reward scores from the Skywork/Skywork-Reward-Llama-3.1-8B-v0.2 model
-    in the SGLang framework are less than 4e-2 different from the Hugging Face implementation.
+    in the fLLiper framework are less than 4e-2 different from the Hugging Face implementation.
 
     [Test Category] Model
     [Test Target] Skywork/Skywork-Reward-Llama-3.1-8B-v0.2

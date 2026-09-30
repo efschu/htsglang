@@ -51,9 +51,9 @@ from __future__ import annotations
 import inspect
 import unittest
 
-from sglang.srt.managers import phase_flip_spill as sp
-from sglang.srt.managers.phase_flip_boot import PhaseFlipStacks
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers import phase_flip_spill as sp
+from flliper.srt.managers.phase_flip_boot import PhaseFlipStacks
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
 MIB = 1024 * 1024
 
@@ -149,7 +149,7 @@ class ThePendingCommitIsPricedTest(unittest.TestCase):
         # The concern the old name carried -- that the tail must not be double
         # counted onto the drafter's leg -- is a max() at the call site and is
         # still pinned by test_staging_bytes_folds_the_tail_in_with_max_not_sum.
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 
         c = _carrier(13482)
         c.set_active_prefix(13163 * MIB)
@@ -180,7 +180,7 @@ class ThePendingCommitIsPricedTest(unittest.TestCase):
         self.assertEqual(r._arena_tail_bytes(PP_TO_TP), 319 * MIB)
 
     def test_nothing_is_priced_once_the_high_water_is_backed(self):
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+        from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
 
         c = _carrier(13482)
         c.set_active_prefix(13482 * MIB)
@@ -201,7 +201,7 @@ class ThePendingCommitIsPricedTest(unittest.TestCase):
         self.assertEqual(r._arena_tail_bytes(PP_TO_TP), 0)
 
     def test_no_carrier_prices_zero_rather_than_raising(self):
-        from sglang.srt.layers.dcp.phase_flip_plan import TP_TO_PP
+        from flliper.srt.layers.dcp.phase_flip_plan import TP_TO_PP
 
         r = PhaseFlipRuntime.__new__(PhaseFlipRuntime)
         r._census_scheduler = None
@@ -292,7 +292,7 @@ class TheRungIsOptInTest(unittest.TestCase):
         self.assertGreater(sp.DEPTH_DRAFT_GRAPHS, sp.IMPLEMENTED_DEPTH)
 
     def test_the_boot_only_builds_a_carrier_at_or_above_the_arena_depth(self):
-        from sglang.srt.managers import phase_flip_boot as boot
+        from flliper.srt.managers import phase_flip_boot as boot
 
         src = inspect.getsource(boot.build_phase_flip_tp_stack)
         self.assertIn("DEPTH_ARENA_TAIL", src)

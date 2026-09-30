@@ -21,8 +21,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.layers.moe import expert_store as es
 
 
 class _Layer:
@@ -63,7 +63,7 @@ def _rows_for(monkeypatch, tmpdir, rank, n_cold, fraction="0.41",
               resident_vec="0.59,0.59,0.59"):
     monkeypatch.setenv(es.STORE_DIR_ENV, str(tmpdir))
     monkeypatch.setenv(es.SLOT_FRACTION_ENV, fraction)
-    monkeypatch.setenv("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", resident_vec)
+    monkeypatch.setenv("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", resident_vec)
     layer = _Layer(rank, LO[rank], RATIOS[rank])
     return eo._expert_store_rows_for(layer, _cold_plan(rank, n_cold))
 
@@ -149,14 +149,14 @@ def test_a_group_without_moe_ratios_does_not_crash(monkeypatch, tmp_path):
     TypeError im Ladepfad, mitten in process_weights_after_loading.
 
     Sichtbar wurde das erst, als der Slot-Pool zum ersten Mal EINGESCHALTET
-    war: ohne SGLANG_MOE_EXPERT_STORE_SLOT_FRACTION ist
+    war: ohne FLLIPER_MOE_EXPERT_STORE_SLOT_FRACTION ist
     `slot_fraction() < 1.0` falsch und der ganze Block unerreichbar. Ein
     Feature, das nie lief, hat auch nie gezeigt, dass es bricht -- deshalb
     steht dieser Test hier und nicht nur der gruene Pfad daneben.
     """
     monkeypatch.setenv(es.STORE_DIR_ENV, str(tmp_path))
     monkeypatch.setenv(es.SLOT_FRACTION_ENV, "0.82")
-    monkeypatch.setenv("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", "0.12,0.3,0.3")
+    monkeypatch.setenv("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", "0.12,0.3,0.3")
     layer = _Layer(0, 0, 171, num_experts=512, ratios=())
     layer.moe_ratio = None          # genau P's Fall
     _, _, _, n_slots, index, _ = eo._expert_store_rows_for(layer, _Plan([1, 2, 3]))

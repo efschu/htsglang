@@ -1,6 +1,6 @@
 """Unit tests for the NIXL FILE L3 cleaner."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -9,16 +9,16 @@ import shutil
 import tempfile
 import unittest
 
-from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
+from flliper.srt.mem_cache.storage.nixl.nixl_cleaner import (
     HiCacheL3Cleaner,
     _parse_group_key,
     _safe_unlink,
 )
-from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
+from flliper.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlBackendConfig,
     NixlFileManager,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestHiCacheL3Cleaner(CustomTestCase):

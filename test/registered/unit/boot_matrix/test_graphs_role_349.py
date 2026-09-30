@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.srt.boot_matrix.effective import report_effective
+from flliper.srt.boot_matrix.effective import report_effective
 
 _READY = "[2026-08-01 00:00:09 TP0] The server is fired up and ready to roll!"
 

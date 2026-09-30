@@ -1,6 +1,6 @@
-"""Unit tests for sglang.srt.layers.quantization.quark.utils — CPU-only, no model loading."""
+"""Unit tests for flliper.srt.layers.quantization.quark.utils — CPU-only, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -8,8 +8,8 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.quark.utils import e8m0_to_f32
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.quark.utils import e8m0_to_f32
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestE8M0ToF32(CustomTestCase):

@@ -3,10 +3,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
-from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from flliper.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 

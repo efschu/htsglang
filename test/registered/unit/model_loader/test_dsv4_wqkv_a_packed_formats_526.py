@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DeepSeek V4 ``wq_a`` + ``wkv`` fusion must refuse packed quant formats.
 
-``SGLANG_OPT_FUSE_WQA_WKV`` is on by default and carried no format gate. The
+``FLLIPER_OPT_FUSE_WQA_WKV`` is on by default and carried no format gate. The
 join in ``DeepseekV4ForCausalLM.load_weights`` knows exactly four checkpoint
 leaves -- ``weight``, ``weight_scale_inv``, ``qweight``, ``qweight_type`` --
 and joins all of them by concatenating along dim 0, the output-row axis.
@@ -40,9 +40,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.models.deepseek_v4 import (
+from flliper.srt.environ import envs
+from flliper.srt.layers.linear import ReplicatedLinear
+from flliper.srt.models.deepseek_v4 import (
     _WQKV_A_LEAVES,
     DeepseekV4ForCausalLM,
     _is_wqkv_a_fusion_input,
@@ -50,8 +50,8 @@ from sglang.srt.models.deepseek_v4 import (
     _warn_wqkv_a_fusion_auto_off,
     _wqkv_a_fusion_survives_quant_format,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -110,7 +110,7 @@ def _run_load(
         name: _CapturingParam(name, sink, dtype) for name, dtype in param_specs.items()
     }
     stub = _make_stub(quant_name, params)
-    with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+    with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
         DeepseekV4ForCausalLM.load_weights(stub, iter(stream))
     sink.pop("__lock__", None)
     return sink
@@ -243,7 +243,7 @@ class TestLeafInventoryDiscriminates(CustomTestCase):
         self.assertEqual(self._leaves(None), ["weight"])
         self.assertEqual(_unroutable_wqkv_a_leaves(self._leaves(None)), ())
 
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
 
         gguf_leaves = self._leaves(GGUFConfig())
         self.assertEqual(gguf_leaves, ["qweight", "qweight_type"])
@@ -260,8 +260,8 @@ class TestLeafInventoryDiscriminates(CustomTestCase):
         self.assertEqual(_unroutable_wqkv_a_leaves(("weight", "weight_scale_inv")), ())
 
     def test_packed_integer_formats_are_not_routable(self):
-        from sglang.srt.layers.quantization.awq.awq import AWQConfig
-        from sglang.srt.layers.quantization.gptq import GPTQConfig
+        from flliper.srt.layers.quantization.awq.awq import AWQConfig
+        from flliper.srt.layers.quantization.gptq import GPTQConfig
 
         gptq_leaves = self._leaves(
             GPTQConfig(
@@ -292,7 +292,7 @@ class TestLeafInventoryDiscriminates(CustomTestCase):
 
     def test_per_tensor_fp8_is_not_routable_either(self):
         """The same hole, on a format nobody would call "packed"."""
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        from flliper.srt.layers.quantization.fp8 import Fp8Config
 
         leaves = self._leaves(
             Fp8Config(is_checkpoint_fp8_serialized=True, activation_scheme="static")
@@ -309,7 +309,7 @@ class TestLeafInventoryDiscriminates(CustomTestCase):
         pack_factor`` and the OUTPUT dim is dim 1, so the same concatenation
         joins two shards along their packed input axis.
         """
-        from sglang.srt.layers.quantization.gptq import GPTQConfig
+        from flliper.srt.layers.quantization.gptq import GPTQConfig
 
         linear = ReplicatedLinear(
             _HIDDEN,
@@ -345,16 +345,16 @@ class TestPreFixRoutingIsWrong(CustomTestCase):
         stub = _make_stub("gptq", params)
 
         with mock.patch(
-            "sglang.srt.models.deepseek_v4._unroutable_wqkv_a_leaves", _no_gate
+            "flliper.srt.models.deepseek_v4._unroutable_wqkv_a_leaves", _no_gate
         ):
-            with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+            with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
                 with self.assertRaises(RuntimeError) as ctx:
                     DeepseekV4ForCausalLM.load_weights(stub, iter(_gptq_stream()))
 
         # The only diagnosis the pre-fix code offers is a bare shape error.
         message = str(ctx.exception)
         self.assertIn("Sizes of tensors must match", message)
-        self.assertNotIn("SGLANG_OPT_FUSE_WQA_WKV", message)
+        self.assertNotIn("FLLIPER_OPT_FUSE_WQA_WKV", message)
         self.assertNotIn("gptq", message.lower())
 
         # And the three sibling leaves never reached a parameter at all: they
@@ -376,9 +376,9 @@ class TestPreFixRoutingIsWrong(CustomTestCase):
         stub = _make_stub("compressed-tensors", params)
 
         with mock.patch(
-            "sglang.srt.models.deepseek_v4._unroutable_wqkv_a_leaves", _no_gate
+            "flliper.srt.models.deepseek_v4._unroutable_wqkv_a_leaves", _no_gate
         ):
-            with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+            with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
                 DeepseekV4ForCausalLM.load_weights(
                     stub, iter(_compressed_tensors_stream())
                 )
@@ -387,13 +387,13 @@ class TestPreFixRoutingIsWrong(CustomTestCase):
         self.assertEqual(delivered, {})
 
     def test_the_pre_fix_fuse_flag_diverges_from_the_built_topology(self):
-        """``fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()``, kept executable.
+        """``fuse_wqa_wkv = envs.FLLIPER_OPT_FUSE_WQA_WKV.get()``, kept executable.
 
         The construction-time auto-off makes the env and the built topology
         disagree, and the pre-fix line followed the env: the wq_a/wkv tensors
         would have been routed into a fused parameter that does not exist.
         """
-        legacy_fuse = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        legacy_fuse = envs.FLLIPER_OPT_FUSE_WQA_WKV.get()
         self.assertTrue(legacy_fuse, "the flag is default-on; that is the trap")
 
         built_fused = any(".wqkv_a." in name for name in _GPTQ_SPLIT_PARAMS)
@@ -420,14 +420,14 @@ class TestPackedFormatsAreRefusedByName(CustomTestCase):
             for name, dtype in _GPTQ_FUSED_PARAMS.items()
         }
         stub = _make_stub("gptq", params)
-        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
             with self.assertRaises(ValueError) as ctx:
                 DeepseekV4ForCausalLM.load_weights(stub, probe())
 
         message = str(ctx.exception)
         for leaf in ("g_idx", "qzeros", "scales"):
             self.assertIn(leaf, message)
-        self.assertIn("SGLANG_OPT_FUSE_WQA_WKV=0", message)
+        self.assertIn("FLLIPER_OPT_FUSE_WQA_WKV=0", message)
         self.assertEqual(consumed, [], "refused only after reading the stream")
 
     def test_compressed_tensors_fused_build_is_refused(self):
@@ -436,7 +436,7 @@ class TestPackedFormatsAreRefusedByName(CustomTestCase):
             for name, dtype in _CT_FUSED_PARAMS.items()
         }
         stub = _make_stub("compressed-tensors", params)
-        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
             with self.assertRaises(ValueError) as ctx:
                 DeepseekV4ForCausalLM.load_weights(
                     stub, iter(_compressed_tensors_stream())
@@ -452,7 +452,7 @@ class TestPackedFormatsAreRefusedByName(CustomTestCase):
             for name, dtype in _GPTQ_FUSED_PARAMS.items()
         }
         stub = _make_stub("gptq", params)
-        with envs.SGLANG_OPT_FP8_WO_A_GEMM.override(False):
+        with envs.FLLIPER_OPT_FP8_WO_A_GEMM.override(False):
             with self.assertRaises(ValueError) as ctx:
                 DeepseekV4ForCausalLM.load_weights(stub, iter([]))
         for leaf in _WQKV_A_LEAVES:
@@ -479,7 +479,7 @@ class TestConstructionTimeDecision(CustomTestCase):
 
     @staticmethod
     def _gptq_config():
-        from sglang.srt.layers.quantization.gptq import GPTQConfig
+        from flliper.srt.layers.quantization.gptq import GPTQConfig
 
         return GPTQConfig(
             weight_bits=4,
@@ -490,7 +490,7 @@ class TestConstructionTimeDecision(CustomTestCase):
         )
 
     def test_routable_formats_keep_the_fusion(self):
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
 
         for tag, cfg in (("bf16", None), ("gguf", GGUFConfig())):
             with self.subTest(format=tag):
@@ -507,11 +507,11 @@ class TestConstructionTimeDecision(CustomTestCase):
         _warn_wqkv_a_fusion_auto_off.cache_clear()
         linear = self._linear(self._gptq_config(), params_dtype=torch.float16)
 
-        with self.assertLogs("sglang.srt.models.deepseek_v4", level="WARNING") as logs:
+        with self.assertLogs("flliper.srt.models.deepseek_v4", level="WARNING") as logs:
             self.assertFalse(_wqkv_a_fusion_survives_quant_format(linear, False))
 
         message = "\n".join(logs.output)
-        self.assertIn("SGLANG_OPT_FUSE_WQA_WKV", message)
+        self.assertIn("FLLIPER_OPT_FUSE_WQA_WKV", message)
         self.assertIn("GPTQLinearMethod", message)
         for leaf in ("g_idx", "qzeros", "scales"):
             self.assertIn(leaf, message)
@@ -523,7 +523,7 @@ class TestConstructionTimeDecision(CustomTestCase):
 
         message = str(ctx.exception)
         self.assertIn("requested explicitly", message)
-        self.assertIn("SGLANG_OPT_FUSE_WQA_WKV=0", message)
+        self.assertIn("FLLIPER_OPT_FUSE_WQA_WKV=0", message)
         for leaf in ("g_idx", "qzeros", "scales"):
             self.assertIn(leaf, message)
 
@@ -532,7 +532,7 @@ class TestConstructionTimeDecision(CustomTestCase):
         _warn_wqkv_a_fusion_auto_off.cache_clear()
         cfg = self._gptq_config()
 
-        with self.assertLogs("sglang.srt.models.deepseek_v4", level="WARNING") as logs:
+        with self.assertLogs("flliper.srt.models.deepseek_v4", level="WARNING") as logs:
             for _ in range(4):
                 self.assertFalse(
                     _wqkv_a_fusion_survives_quant_format(
@@ -561,7 +561,7 @@ class TestSplitBuildLoadsPackedFormatsUnchanged(CustomTestCase):
         This is the same call as above with the flag left untouched, which is
         exactly the configuration the pre-fix line got wrong.
         """
-        self.assertTrue(envs.SGLANG_OPT_FUSE_WQA_WKV.get())
+        self.assertTrue(envs.FLLIPER_OPT_FUSE_WQA_WKV.get())
         sink = _run_load("gptq", _gptq_stream(), _GPTQ_SPLIT_PARAMS)
         self.assertEqual(len(sink), len(_GPTQ_SPLIT_PARAMS))
 

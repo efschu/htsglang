@@ -12,11 +12,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
-from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from flliper.srt.speculative.eagle_utils import organize_draft_results
+from flliper.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from flliper.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -135,7 +135,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.speculative_num_steps = 2
 
         with patch(
-            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+            "flliper.srt.speculative.eagle_worker_v2.DraftBackendFactory",
             _make_backend_factory(decode_backend, None),
         ):
             worker.init_attention_backend()
@@ -159,7 +159,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.speculative_num_steps = 2
 
         with patch(
-            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+            "flliper.srt.speculative.eagle_worker_v2.DraftBackendFactory",
             _make_backend_factory(decode_backend, draft_extend_backend),
         ):
             worker.init_attention_backend()

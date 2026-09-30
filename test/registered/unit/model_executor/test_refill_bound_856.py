@@ -15,7 +15,7 @@ the same bytes:
 
 a 2.5x rate gap that two independent readers could not attribute from the
 code. The obvious readings were all checked and all fail: both directions
-take `_staged_file_refill` (`SGLANG_PHASE_FLIP_REFILL_STAGED` defaults True);
+take `_staged_file_refill` (`FLLIPER_PHASE_FLIP_REFILL_STAGED` defaults True);
 both `#802` fallback warnings appear ZERO times in the 3.45 MB capture against
 9 `FILE-BACKED` registrations; the O_DIRECT alignment cliff cannot fire
 because offsets are 32 MiB multiples of a 4096 alignment; and #802's own
@@ -31,18 +31,18 @@ as useless as the aggregate it replaces. "unattributed" and "MIXED" must
 therefore be REACHABLE, and they are asserted here as first-class outcomes.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.model_executor.weights_arena import (
+from flliper.srt.model_executor.weights_arena import (
     BOUND_MIN_COVERAGE,
     RefillLegTiming,
     refill_bound_phrase,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _timing(**kw) -> RefillLegTiming:
@@ -234,12 +234,12 @@ class TestTheRotationPathReachesTheRefusal(CustomTestCase):
     def test_a_real_cpu_rotation_refuses_instead_of_saying_LINK_BOUND(self):
         import torch
 
-        from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
-        from sglang.srt.model_executor.rotation_executor import (
+        from flliper.srt.mem_cache.read_buffer_pool import ReadBufferPool
+        from flliper.srt.model_executor.rotation_executor import (
             TorchRotationOps,
             rotate_arena,
         )
-        from sglang.srt.model_executor.weights_arena import (
+        from flliper.srt.model_executor.weights_arena import (
             _CHECKSUM_BYTES,
             uint8_checksum,
         )

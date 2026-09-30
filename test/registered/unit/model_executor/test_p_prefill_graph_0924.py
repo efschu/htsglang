@@ -28,29 +28,29 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.fla import index as fidx
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+from flliper.srt.layers.attention.fla import index as fidx
+from flliper.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
     is_plain_extend_graph_mode,
 )
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+from flliper.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
-from sglang.srt.model_executor.forward_batch_info import (
+from flliper.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.model_executor.model_runner import align_pipeline_layers
-from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+from flliper.srt.model_executor.model_runner import align_pipeline_layers
+from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
     PREFILL_GRAPH_POOL_ENV,
     prefill_transient_mib_for_rank,
 )
-from sglang.srt.model_executor.runner import prefill_cuda_graph_runner as pcgr
-from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.runner import prefill_cuda_graph_runner as pcgr
+from flliper.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -496,7 +496,7 @@ class TestTypedChannelMetadataIsNotAStageKey(CustomTestCase):
         self.assertEqual(live.tensors["__msg_type__"], "proxy")
 
     def test_every_listed_metadata_key_is_left_out(self):
-        from sglang.srt.distributed.pp_typed_channel import CHANNEL_META_KEYS
+        from flliper.srt.distributed.pp_typed_channel import CHANNEL_META_KEYS
 
         runner = _full_runner()
         live = self._live_with_meta(
@@ -536,7 +536,7 @@ class TestTypedChannelMetadataIsNotAStageKey(CustomTestCase):
         writes these three, _pp_recv_proxy_tensors pops two of them."""
         import os
 
-        from sglang.srt.distributed import pp_typed_channel as ch
+        from flliper.srt.distributed import pp_typed_channel as ch
 
         path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(ch.__file__))),
@@ -670,7 +670,7 @@ class _Outer:
             hidden, aux = out
             # what the eager tail (the logits processor) is handed
             self.body_rows = (int(hidden.shape[0]), [int(a.shape[0]) for a in aux])
-            from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+            from flliper.srt.layers.logits_processor import LogitsProcessorOutput
 
             return LogitsProcessorOutput(
                 next_token_logits=hidden[-1:].clone(),
@@ -934,7 +934,7 @@ class TestGdnTraceIsSkippedUnderCapture(CustomTestCase):
     swallows the exception. Under capture it must not touch the tensor."""
 
     def _extend(self, capturing):
-        from sglang.srt.layers.attention.linear.kernels import gdn_triton
+        from flliper.srt.layers.attention.linear.kernels import gdn_triton
 
         calls = {}
 
@@ -990,7 +990,7 @@ class TestGdnTraceIsSkippedUnderCapture(CustomTestCase):
 
 class TestGraphPoolPostEnv(CustomTestCase):
     def test_one_entry_per_rank(self):
-        self.assertEqual(PREFILL_GRAPH_POOL_ENV, "SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB")
+        self.assertEqual(PREFILL_GRAPH_POOL_ENV, "FLLIPER_KV_BUDGET_PREFILL_GRAPH_MIB")
         self.assertEqual(prefill_transient_mib_for_rank("160.0,150.5,140.0", 1), 150.5)
         self.assertEqual(prefill_transient_mib_for_rank("", 0), 0.0)
 

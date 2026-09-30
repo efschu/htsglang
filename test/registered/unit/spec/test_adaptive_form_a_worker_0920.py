@@ -5,7 +5,7 @@ one -- the worker's kv-head share is 0 and flashinfer divides by it
 
 import types
 
-from sglang.srt.speculative import eagle_worker_v2 as ew
+from flliper.srt.speculative import eagle_worker_v2 as ew
 
 
 def test_a_form_a_worker_gets_its_own_worker_backend_per_state(monkeypatch):
@@ -15,7 +15,7 @@ def test_a_form_a_worker_gets_its_own_worker_backend_per_state(monkeypatch):
         def __init__(self, runner):
             built.append(runner)
 
-    import sglang.srt.form_a_construction as fac
+    import flliper.srt.form_a_construction as fac
 
     monkeypatch.setattr(fac, "FormAWorkerAttnBackend", _Stub)
     calls = []

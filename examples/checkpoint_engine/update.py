@@ -1,7 +1,7 @@
 """
 Usage:
 1) Launch the server with wait-for-initial-weights option in one terminal:
-   python -m sglang.launch_server --model-path /workspace/Qwen/Qwen3-4B/ --tensor-parallel-size 2 --port 19730 --load-format dummy --checkpoint-engine-wait-weights-before-ready --mem-fraction-static 0.7
+   python -m flliper.launch_server --model-path /workspace/Qwen/Qwen3-4B/ --tensor-parallel-size 2 --port 19730 --load-format dummy --checkpoint-engine-wait-weights-before-ready --mem-fraction-static 0.7
 
 2) Torchrun this script in another terminal:
     torchrun --nproc-per-node 2 update.py --update-method broadcast --checkpoint-path /workspace/Qwen/Qwen3-4B/  --inference-parallel-size 2
@@ -33,7 +33,7 @@ def timer(msg: str):
     logger.info(f"{msg} duration: {end - start:.2f} seconds")
 
 
-def check_sglang_ready(
+def check_flliper_ready(
     endpoint: str, inference_parallel_size: int, uds: str | None = None
 ):
     if rank != rank // inference_parallel_size * inference_parallel_size:
@@ -51,7 +51,7 @@ def check_sglang_ready(
             except (httpx.ConnectError, httpx.HTTPStatusError) as e:
                 if retry_num % 10 == 0:
                     logger.warning(
-                        f"fail to check sglang ready, retry {retry_num} times, error: {e}"
+                        f"fail to check flliper ready, retry {retry_num} times, error: {e}"
                     )
                 retry_num += 1
                 time.sleep(0.1)
@@ -136,7 +136,7 @@ def update_weights(
         checkpoint_name, files=checkpoint_files, named_tensors=named_tensors
     )
     ps.init_process_group()
-    check_sglang_ready(endpoint, inference_parallel_size, uds)
+    check_flliper_ready(endpoint, inference_parallel_size, uds)
     dist.barrier()
     with timer("Gather metas"):
         ps.gather_metas(checkpoint_name)
@@ -171,7 +171,7 @@ def join(
     with open(load_metas_file, "rb") as f:
         metas = pickle.load(f)
     ps.init_process_group()
-    check_sglang_ready(endpoint, inference_parallel_size, uds)
+    check_flliper_ready(endpoint, inference_parallel_size, uds)
     dist.barrier()
     with timer("Gather metas before join"):
         ps.gather_metas(checkpoint_name)

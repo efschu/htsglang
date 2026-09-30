@@ -24,8 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from types import SimpleNamespace
 
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.test.ci.ci_register import register_cpu_ci
 
 from test_pool_eager_lru_hits_h107 import R, ROUTES, SPILL, _extend, _pool_cache
 

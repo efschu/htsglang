@@ -10,7 +10,7 @@ drivable at a desk or it is only ever tested on metal.
 
 THE DEFECT THIS SLICE CLOSES, restated because it is the point of every test
 below: slice 9 built the service and the seam, and NOTHING CALLED ``install``.
-A boot with ``--weg2-vision transient`` was therefore byte-for-byte a boot
+A boot with ``--pdflip-vision transient`` was therefore byte-for-byte a boot
 without it -- the seam a permanent no-op, the items leaving with ``feature``
 and no rows, and the failure surfacing three hops later inside a rank.  A
 silent no-op is the one outcome this path may not have.
@@ -39,12 +39,12 @@ import types
 
 import pytest
 
-from sglang.srt.planner import vision_stage as vs
-from sglang.srt.planner import vision_stage_load as vsl
-from sglang.srt.weg2 import front as fr
-from sglang.srt.weg2 import launcher as lz
-from sglang.srt.weg2 import vision_stage_boot as vsb
-from sglang.srt.weg2 import vision_stage_service as vss
+from flliper.srt.planner import vision_stage as vs
+from flliper.srt.planner import vision_stage_load as vsl
+from flliper.srt.pdflip import front as fr
+from flliper.srt.pdflip import launcher as lz
+from flliper.srt.pdflip import vision_stage_boot as vsb
+from flliper.srt.pdflip import vision_stage_service as vss
 
 
 # --------------------------------------------------------------- fakes --
@@ -408,7 +408,7 @@ def _item(feature=object(), embeddings=None):
 
 def test_arming_hands_the_images_to_the_RANK_stage(model_dir, monkeypatch):
     """User design 2026-09-24: the stage runs inside the P group's PP0 rank
-    (weg2/vision_rank_runner.py) and REPLACES the tokenizer-process stage.
+    (pdflip/vision_rank_runner.py) and REPLACES the tokenizer-process stage.
     Arming builds no service here, and the seam passes the pixels on."""
     monkeypatch.setenv(vsb.VISION_ENV, "transient")
     monkeypatch.setenv(vsb.VISION_GROUP_ENV, "P")
@@ -526,7 +526,7 @@ def test_the_processor_seam_does_NOT_swallow_the_not_armed_refusal():
     the silent shape the arming path exists to end."""
     import inspect
 
-    from sglang.srt.multimodal.processors import base_processor as bp
+    from flliper.srt.multimodal.processors import base_processor as bp
 
     src = inspect.getsource(bp.BaseMultimodalProcessor.process_and_combine_mm_data)
     assert "_vss.maybe_run(all_collected_items)" in src
@@ -564,7 +564,7 @@ def test_the_video_w_code_is_still_W103():
     import inspect
 
     src = inspect.getsource(fr.Front.handle_generate)
-    assert '"W103 Weg2VideoRefused"' in src
+    assert '"W103 PdFlipVideoRefused"' in src
 
 
 # -------------------------------- 5. without the flag, nothing is different --
@@ -590,7 +590,7 @@ def test_an_inherited_shell_value_is_POPPED_not_left_to_arm_a_stage(monkeypatch)
 
 
 def test_the_publisher_and_the_reader_use_ONE_key():
-    assert lz.VISION_STAGE_ENV == vsb.VISION_ENV == "SGLANG_WEG2_VISION"
+    assert lz.VISION_STAGE_ENV == vsb.VISION_ENV == "FLLIPER_PDFLIP_VISION"
 
 
 def test_the_launcher_default_publishes_nothing():
@@ -601,19 +601,19 @@ def test_the_launcher_default_publishes_nothing():
 
 @pytest.mark.parametrize("env", [
     {},
-    {"SGLANG_WEG2_VISION": ""},
-    {"SGLANG_WEG2_VISION": "off"},
-    {"SGLANG_WEG2_VISION": "resident"},
-    {"SGLANG_WEG2_VISION": "transient", "SGLANG_WEG2_GROUP": "D"},
+    {"FLLIPER_PDFLIP_VISION": ""},
+    {"FLLIPER_PDFLIP_VISION": "off"},
+    {"FLLIPER_PDFLIP_VISION": "resident"},
+    {"FLLIPER_PDFLIP_VISION": "transient", "FLLIPER_PDFLIP_GROUP": "D"},
 ])
 def test_arming_is_a_no_op_outside_P_transient(env):
     assert vsb.vision_mode(env) == ""
 
 
 def test_the_mode_is_transient_for_P_and_for_a_group_less_process():
-    assert vsb.vision_mode({"SGLANG_WEG2_VISION": "transient"}) == "transient"
+    assert vsb.vision_mode({"FLLIPER_PDFLIP_VISION": "transient"}) == "transient"
     assert vsb.vision_mode(
-        {"SGLANG_WEG2_VISION": "transient", "SGLANG_WEG2_GROUP": "P"}
+        {"FLLIPER_PDFLIP_VISION": "transient", "FLLIPER_PDFLIP_GROUP": "P"}
     ) == "transient"
 
 
@@ -653,7 +653,7 @@ def test_the_tokenizer_arms_from_its_own_process_after_BOTH_branches():
     """
     import inspect
 
-    from sglang.srt.managers import tokenizer_manager as tm
+    from flliper.srt.managers import tokenizer_manager as tm
 
     src = inspect.getsource(tm.TokenizerManager.init_tokenizer_and_processor)
     assert "arm_transient_vision(" in src
@@ -673,7 +673,7 @@ def test_a_transient_boot_with_no_multimodal_processor_REFUSES_by_name(model_dir
         types.SimpleNamespace(model_path=model_dir),
         types.SimpleNamespace(hf_config=_hf_config()),
         multimodal=False,
-        env={"SGLANG_WEG2_VISION": "transient"},
+        env={"FLLIPER_PDFLIP_VISION": "transient"},
     )
     assert out is False
     reason = vss.arm_refusal()

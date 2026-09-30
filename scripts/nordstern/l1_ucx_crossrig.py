@@ -8,8 +8,8 @@ real RDMA link without touching a GPU, so it can run while a GPU window is busy
 on either rig.
 
 The modules under test are loaded straight from a checkout by path, with the
-`sglang` package tree stubbed out. That is deliberate twice over: the second
-rig has no sglang install, and it proves the transport has no hidden
+`flliper` package tree stubbed out. That is deliberate twice over: the second
+rig has no flliper install, and it proves the transport has no hidden
 dependency on the rest of the runtime.
 
 Launch via l1_ucx_crossrig.sh, which sets the environment both sides need.
@@ -25,12 +25,12 @@ import types
 
 
 def load_transport(comm_dir: str):
-    """Import barlink_ucx{,_bindings} from `comm_dir` without importing sglang."""
+    """Import barlink_ucx{,_bindings} from `comm_dir` without importing flliper."""
     for name in (
-        "sglang",
-        "sglang.srt",
-        "sglang.srt.distributed",
-        "sglang.srt.distributed.device_communicators",
+        "flliper",
+        "flliper.srt",
+        "flliper.srt.distributed",
+        "flliper.srt.distributed.device_communicators",
     ):
         if name not in sys.modules or not hasattr(sys.modules[name], "__path__"):
             stub = types.ModuleType(name)
@@ -44,7 +44,7 @@ def load_transport(comm_dir: str):
         spec.loader.exec_module(mod)
         return mod
 
-    base = "sglang.srt.distributed.device_communicators."
+    base = "flliper.srt.distributed.device_communicators."
     _load(base + "barlink_ucx_bindings", os.path.join(comm_dir, "barlink_ucx_bindings.py"))
     return _load(base + "barlink_ucx", os.path.join(comm_dir, "barlink_ucx.py"))
 
@@ -85,7 +85,7 @@ def main() -> int:
     )
     mod = load_transport(args.comm_dir)
     bindings = sys.modules[
-        "sglang.srt.distributed.device_communicators.barlink_ucx_bindings"
+        "flliper.srt.distributed.device_communicators.barlink_ucx_bindings"
     ]
     lib = bindings.UcpLibrary.instance()
     print(f"[rank {args.rank}] UCX {lib.version_string()} from {lib.path}", flush=True)
@@ -176,7 +176,7 @@ def main() -> int:
     piped = t.barlink_all_reduce(comm, ramp[R].clone())
     # Save and RESTORE, never assign True back: the bench below reports which
     # path it measured, and a hard-coded restore would silently re-enable
-    # pipelining in the SGLANG_BARLINK_UCX_PIPELINE=0 control run -- turning the
+    # pipelining in the FLLIPER_BARLINK_UCX_PIPELINE=0 control run -- turning the
     # A/B into a measurement of the same code twice.
     was = t.pipeline
     t.pipeline = False

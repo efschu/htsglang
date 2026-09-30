@@ -4,14 +4,14 @@ from typing import Any
 import polars as pl
 import pytest
 
-from sglang.srt.debug_utils.comparator.bundle_matcher import (
+from flliper.srt.debug_utils.comparator.bundle_matcher import (
     TensorBundleInfo,
     TensorFileInfo,
     _rows_to_tensor_infos,
     match_bundles,
 )
-from sglang.srt.debug_utils.comparator.utils import Pair
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.utils import Pair
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 
@@ -176,7 +176,7 @@ class TestMatchBundlesPipelineParallel:
     LOGICAL_SKIP_KEYS: set[str] = {"filename", "rank", "dump_index", "recompute_status"}
 
     def test_same_layer_id_different_ranks_match(self) -> None:
-        """SGLang PP=2 rank 0 (layers 0-31) vs Megatron PP=4 rank 2 (layers 16-31):
+        """fLLiper PP=2 rank 0 (layers 0-31) vs Megatron PP=4 rank 2 (layers 16-31):
         layer_id=20 should match regardless of world rank."""
         target_df: pl.DataFrame = _make_df(
             [_make_row(name="hidden", rank=0, layer_id=20)]
@@ -210,18 +210,18 @@ class TestMatchBundlesPipelineParallel:
         assert len(results[0].y) == 1
 
     def test_different_pp_sizes_layer_and_non_layer_bundles(self) -> None:
-        """SGLang PP=2 TP=2 (4 ranks) vs Megatron PP=4 TP=2 (8 ranks).
+        """fLLiper PP=2 TP=2 (4 ranks) vs Megatron PP=4 TP=2 (8 ranks).
         Layer tensors match by (name, layer_id); non-layer tensors match by name.
         All ranks are grouped into the same bundle when rank is skipped."""
         target_df: pl.DataFrame = _make_df(
             [
-                # SGLang: pp_stage=0 has ranks 0,1 (TP=2)
+                # fLLiper: pp_stage=0 has ranks 0,1 (TP=2)
                 _make_row(name="hidden", rank=0, layer_id=20),
                 _make_row(name="hidden", rank=1, layer_id=20),
-                # SGLang: embedding on pp_stage=0
+                # fLLiper: embedding on pp_stage=0
                 _make_row(name="embed_tokens", rank=0),
                 _make_row(name="embed_tokens", rank=1),
-                # SGLang: lm_head on pp_stage=1, ranks 2,3
+                # fLLiper: lm_head on pp_stage=1, ranks 2,3
                 _make_row(name="lm_head", rank=2),
                 _make_row(name="lm_head", rank=3),
             ]

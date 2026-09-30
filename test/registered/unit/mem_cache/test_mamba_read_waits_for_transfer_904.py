@@ -55,8 +55,8 @@ region): a side stream whose join to compute exists in one direction only.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -105,7 +105,7 @@ def _hybrid_pool(counter, frame=None):
     mamba layer, which is the case that has no incidental FIFO cover from a
     later attention wait.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
     pool = object.__new__(HybridReqToTokenPool)
     pool.mamba_map = {0: 0, 1: 1, 2: 2}
@@ -156,7 +156,7 @@ class TestMambaReadJoinsItsTransfer(CustomTestCase):
         advance. The threshold must be the GLOBAL layer id, and the pool must
         not grow a ``local_slot`` consult.
         """
-        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from flliper.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
         spy = _CounterSpy(num_layers=48)
         pool = _hybrid_pool(spy, frame=48)
@@ -220,7 +220,7 @@ class TestTheTwoIndexSpacesAreOneRegistration(CustomTestCase):
     def test_assembler_passes_the_controller_frame_to_the_pool(self):
         import inspect
 
-        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+        from flliper.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 
         src = inspect.getsource(hybrid_pool_assembler)
         self.assertIn(
@@ -237,7 +237,7 @@ class TestTheTwoIndexSpacesAreOneRegistration(CustomTestCase):
         W31/W32/W33 shape."""
         import inspect
 
-        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+        from flliper.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 
         src = inspect.getsource(hybrid_pool_assembler._apply_stack_result)
         self.assertIn("mamba_transfer_frame=", src)

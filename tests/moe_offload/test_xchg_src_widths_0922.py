@@ -4,7 +4,7 @@ fnFL2w36/w37, Gruppe D als QUELLE (direction=tp_to_pp), Form A
 (`--rank-tp-ratio 1,0,0`: alles Dense auf Rang 0, die 3080er sind reine
 Experten-Worker):
 
-    W68 Weg2XchgPlanDisagree: lane src=1 dst=1 tag='weights_9':
+    W68 PdFlipXchgPlanDisagree: lane src=1 dst=1 tag='weights_9':
     33 of 37 descs have no address on the side this rank owns
     (first: model.layers.29.attn_hyper_connection.block_inject_weight.weight)
 
@@ -23,7 +23,7 @@ nie deponierte und P 90 s ins Zeitbudget lief.
 
 import pytest
 
-from sglang.srt.weg2 import weight_exchange as wx
+from flliper.srt.pdflip import weight_exchange as wx
 
 
 def _form_a_layout():
@@ -40,7 +40,7 @@ def _dense_geom(**kw):
         rows_full=4098, cols_full=1024, itemsize=2, **kw)
 
 
-def test_quelle_ehrt_die_halter_karte(monkeypatch):
+def test_source_honours_the_holder_map(monkeypatch):
     """DER FALL, DER w36 UND w37 TOETETE."""
     geom = _dense_geom(src_widths=(4098, 0, 0))
     blocks = wx._blocks_of(geom, _form_a_layout(), is_dst=False)
@@ -54,7 +54,7 @@ def test_quelle_ehrt_die_halter_karte(monkeypatch):
     assert sum(b.size for b in blocks[2]) == 0, "Rang 2 ebenso"
 
 
-def test_ziel_bleibt_unveraendert(monkeypatch):
+def test_target_stays_unchanged(monkeypatch):
     """Die Gegenrichtung P->D darf sich NICHT aendern (dst_widths seit je)."""
     geom = _dense_geom(dst_widths=(4098, 0, 0))
     blocks = wx._blocks_of(geom, _form_a_layout(), is_dst=True)
@@ -63,7 +63,7 @@ def test_ziel_bleibt_unveraendert(monkeypatch):
     assert sum(b.size for b in blocks[2]) == 0
 
 
-def test_ohne_karte_shardet_die_quelle_weiter(monkeypatch):
+def test_without_map_source_still_shards(monkeypatch):
     """Ohne Breitenvektor bleibt der generische Split -- sonst prueft der
     erste Test nur, dass irgendetwas leer ist."""
     geom = _dense_geom()
@@ -75,7 +75,7 @@ def test_ohne_karte_shardet_die_quelle_weiter(monkeypatch):
 
 def _tensor(widths, shard_axis=0):
     """Ein XchgTensor, wie der Join ihn baut."""
-    from sglang.srt.weg2 import xchg_manifest as xm
+    from flliper.srt.pdflip import xchg_manifest as xm
     return xm.JoinedTensor(
         param_name="model.layers.29.linear_attn.out_proj.weight_packed",
         tensor_class="LinearBase", tag="weights_9", itemsize=2,
@@ -83,7 +83,7 @@ def _tensor(widths, shard_axis=0):
         pp_stage=1, tp_widths=tuple(widths), pp_card=1)
 
 
-def test_geom_traegt_die_karte_in_beide_richtungen():
+def test_geom_carries_map_both_directions():
     """Der Join muss die Breiten auf DER Seite mitgeben, die gerade Quelle ist."""
     t = _tensor((4098, 0, 0))
     g_src = t.geom(tp_is_dst=False)   # D->P: die TP-Gruppe ist QUELLE

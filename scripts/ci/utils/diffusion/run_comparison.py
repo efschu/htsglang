@@ -1,9 +1,9 @@
-"""Diffusion serving benchmark for SGLang-Diffusion nightly CI.
+"""Diffusion serving benchmark for fLLiper-Diffusion nightly CI.
 
-Launches an SGLang-Diffusion server for each test case, sends a single
+Launches an fLLiper-Diffusion server for each test case, sends a single
 request, measures end-to-end latency, and writes comparison-results.json.
 The runner still supports extra frameworks via --frameworks, but the nightly
-config tracks SGLang-Diffusion only.
+config tracks fLLiper-Diffusion only.
 
 Usage:
     # Full run (requires GPU)
@@ -16,7 +16,7 @@ Usage:
     python3 scripts/ci/utils/diffusion/run_comparison.py --case-ids flux1_dev_t2i_1024
 
     # Run only specific framework(s)
-    python3 scripts/ci/utils/diffusion/run_comparison.py --frameworks sglang
+    python3 scripts/ci/utils/diffusion/run_comparison.py --frameworks flliper
 """
 
 import argparse
@@ -43,8 +43,8 @@ CONFIGS_PATH = Path(__file__).parent / "comparison_configs.json"
 INSTALL_SCRIPT = Path(__file__).parents[1] / "install_comparison_frameworks.sh"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 30000
-SGLANG_MASTER_PORT_OFFSET = 5
-SGLANG_SCHEDULER_PORT_OFFSET = 55
+FLLIPER_MASTER_PORT_OFFSET = 5
+FLLIPER_SCHEDULER_PORT_OFFSET = 55
 HEALTH_TIMEOUT = 2400  # seconds (40 min — keep large model download/warmup headroom)
 REQUEST_TIMEOUT = 1200  # seconds
 GPU_CLEAR_WAIT = 15  # seconds between framework runs
@@ -53,7 +53,7 @@ SERVER_FATAL_ERROR_PATTERNS = (
     "torch.OutOfMemoryError",
 )
 
-# Frameworks that need separate installation (conflict with sglang's deps)
+# Frameworks that need separate installation (conflict with flliper's deps)
 INSTALLABLE_FRAMEWORKS = {"vllm-omni", "lightx2v"}
 
 # Cached reference image (downloaded once)
@@ -66,9 +66,9 @@ _cached_ref_image_path: str | None = None
 # ---------------------------------------------------------------------------
 
 
-def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
+def _build_flliper_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
     cmd = [
-        "sglang",
+        "flliper",
         "serve",
         "--model-path",
         case["model"],
@@ -78,9 +78,9 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
         DEFAULT_HOST,
         "--strict-ports",
         "--master-port",
-        str(port + SGLANG_MASTER_PORT_OFFSET),
+        str(port + FLLIPER_MASTER_PORT_OFFSET),
         "--scheduler-port",
-        str(port + SGLANG_SCHEDULER_PORT_OFFSET),
+        str(port + FLLIPER_SCHEDULER_PORT_OFFSET),
     ]
     if case["num_gpus"] > 1:
         cmd += ["--num-gpus", str(case["num_gpus"])]
@@ -191,7 +191,7 @@ def _build_lightx2v_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
 
 def build_server_cmd(framework: str, case: dict, fw_cfg: dict, port: int) -> list[str]:
     builders = {
-        "sglang": _build_sglang_cmd,
+        "flliper": _build_flliper_cmd,
         "vllm-omni": _build_vllm_cmd,
         "lightx2v": _build_lightx2v_cmd,
     }
@@ -207,14 +207,14 @@ def build_server_cmd(framework: str, case: dict, fw_cfg: dict, port: int) -> lis
 
 # Health check endpoints per framework
 HEALTH_ENDPOINTS = {
-    "sglang": "/health",
+    "flliper": "/health",
     "vllm-omni": "/health",
     "lightx2v": "/v1/service/status",
 }
 
 
 def wait_for_health(
-    base_url: str, framework: str = "sglang", timeout: int = HEALTH_TIMEOUT
+    base_url: str, framework: str = "flliper", timeout: int = HEALTH_TIMEOUT
 ) -> None:
     """Poll health endpoint until 200, then verify model is loaded."""
     endpoint = HEALTH_ENDPOINTS.get(framework, "/health")
@@ -234,9 +234,9 @@ def wait_for_health(
             )
         time.sleep(2)
 
-    # For SGLang, /health can return 200 before model routes are registered.
+    # For fLLiper, /health can return 200 before model routes are registered.
     # Poll /v1/models to confirm the model is fully loaded.
-    if framework == "sglang":
+    if framework == "flliper":
         models_url = f"{base_url}/v1/models"
         while True:
             try:
@@ -253,7 +253,7 @@ def wait_for_health(
     print(f"  Server ready in {elapsed:.1f}s")
 
 
-KILLALL_SCRIPT = Path(__file__).parents[3] / "killall_sglang.sh"
+KILLALL_SCRIPT = Path(__file__).parents[3] / "killall_flliper.sh"
 
 
 def _is_port_available(port: int) -> bool:
@@ -272,7 +272,7 @@ def _require_ports_available(ports: list[int]) -> None:
         raise RuntimeError(f"Required port(s) unavailable before launch: {unavailable}")
 
 
-def _cleanup_sglang_processes() -> None:
+def _cleanup_flliper_processes() -> None:
     if KILLALL_SCRIPT.exists():
         subprocess.run(
             ["bash", str(KILLALL_SCRIPT)],
@@ -296,8 +296,8 @@ def kill_server(proc: subprocess.Popen) -> None:
             except (ProcessLookupError, PermissionError):
                 pass
             proc.wait(timeout=10)
-    # Use killall_sglang.sh for thorough cleanup (esp. multi-GPU workers)
-    _cleanup_sglang_processes()
+    # Use killall_flliper.sh for thorough cleanup (esp. multi-GPU workers)
+    _cleanup_flliper_processes()
 
 
 # ---------------------------------------------------------------------------
@@ -339,12 +339,12 @@ def _get_ref_image_path(config: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Request helpers — SGLang (OpenAI-compatible)
+# Request helpers — fLLiper (OpenAI-compatible)
 # ---------------------------------------------------------------------------
 
 
-def _build_sglang_payload(case: dict) -> dict:
-    """Build common SGLang request payload."""
+def _build_flliper_payload(case: dict) -> dict:
+    """Build common fLLiper request payload."""
     payload = {
         "model": case["model"],
         "prompt": case["prompt"],
@@ -385,11 +385,11 @@ def _read_perf_dump(perf_dump_path: str, timeout: float = 10.0) -> float | None:
     return None
 
 
-def send_image_request_sglang(
+def send_image_request_flliper(
     base_url: str, case: dict, perf_dump_path: str | None = None
 ) -> float:
-    """Send a single T2I request via SGLang's /v1/images/generations."""
-    payload = _build_sglang_payload(case)
+    """Send a single T2I request via fLLiper's /v1/images/generations."""
+    payload = _build_flliper_payload(case)
     if perf_dump_path:
         payload["perf_dump_path"] = perf_dump_path
 
@@ -419,11 +419,11 @@ def send_image_request_sglang(
     return client_latency
 
 
-def send_video_request_sglang(
+def send_video_request_flliper(
     base_url: str, case: dict, perf_dump_path: str | None = None
 ) -> float:
-    """Send a single T2V request via SGLang's /v1/videos (async)."""
-    payload = _build_sglang_payload(case)
+    """Send a single T2V request via fLLiper's /v1/videos (async)."""
+    payload = _build_flliper_payload(case)
     if perf_dump_path:
         payload["perf_dump_path"] = perf_dump_path
 
@@ -472,10 +472,10 @@ def send_video_request_sglang(
     return client_latency
 
 
-def send_image_conditioned_request_sglang(
+def send_image_conditioned_request_flliper(
     base_url: str, case: dict, config: dict, perf_dump_path: str | None = None
 ) -> float:
-    """Send an image-conditioned request (edit/I2V/TI2V) via SGLang multipart API."""
+    """Send an image-conditioned request (edit/I2V/TI2V) via fLLiper multipart API."""
     task = case["task"]
     ref_bytes = _get_ref_image_bytes(config)
 
@@ -556,7 +556,7 @@ def send_image_conditioned_request_sglang(
                 f"server-side {server_latency:.2f}s, diagnostic)"
             )
             return client_latency
-    print(f"  Generated in {client_latency:.2f}s (sglang, image-conditioned)")
+    print(f"  Generated in {client_latency:.2f}s (flliper, image-conditioned)")
     return client_latency
 
 
@@ -692,7 +692,7 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
 def send_request(
     base_url: str,
     case: dict,
-    framework: str = "sglang",
+    framework: str = "flliper",
     config: dict | None = None,
     perf_dump_path: str | None = None,
 ) -> float:
@@ -701,16 +701,16 @@ def send_request(
         return send_request_vllm_omni(base_url, case, config)
     elif framework == "lightx2v":
         return send_request_lightx2v(base_url, case, config)
-    # SGLang — use OpenAI-compatible endpoints with optional perf log
+    # fLLiper — use OpenAI-compatible endpoints with optional perf log
     task = case["task"]
     if case.get("reference_image"):
-        return send_image_conditioned_request_sglang(
+        return send_image_conditioned_request_flliper(
             base_url, case, config, perf_dump_path
         )
     elif task == "text-to-image":
-        return send_image_request_sglang(base_url, case, perf_dump_path)
+        return send_image_request_flliper(base_url, case, perf_dump_path)
     elif task == "text-to-video":
-        return send_video_request_sglang(base_url, case, perf_dump_path)
+        return send_video_request_flliper(base_url, case, perf_dump_path)
     else:
         raise ValueError(f"Unknown task type: {task}")
 
@@ -744,9 +744,9 @@ def run_single(
     env = os.environ.copy()
     env.update(fw_cfg.get("extra_env", {}))
 
-    # perf_dump_path for SGLang server-side timing (passed in request, zero overhead when None)
+    # perf_dump_path for fLLiper server-side timing (passed in request, zero overhead when None)
     perf_dump_path = None
-    if framework == "sglang":
+    if framework == "flliper":
         perf_dump_path = os.path.join(str(log_dir), f"perf_{case['id']}_measured.json")
 
     log_file = log_dir / f"{case['id']}_{framework}.log"
@@ -756,13 +756,13 @@ def run_single(
 
     proc = None
     try:
-        if framework == "sglang":
-            _cleanup_sglang_processes()
+        if framework == "flliper":
+            _cleanup_flliper_processes()
             _require_ports_available(
                 [
                     port,
-                    port + SGLANG_MASTER_PORT_OFFSET,
-                    port + SGLANG_SCHEDULER_PORT_OFFSET,
+                    port + FLLIPER_MASTER_PORT_OFFSET,
+                    port + FLLIPER_SCHEDULER_PORT_OFFSET,
                 ]
             )
 
@@ -802,7 +802,7 @@ def run_single(
         wait_for_health(base_url, framework)
 
         # No client-side warmup: each framework relies on its own server-side
-        # warmup before traffic. sglang's serve_args pass --warmup, which `serve`
+        # warmup before traffic. flliper's serve_args pass --warmup, which `serve`
         # resolves to server-based (synthetic) warmup that primes kernels at
         # startup, before the health check passes. This goes through the internal
         # warmup path that bypasses sampling-param preset validation (e.g.
@@ -813,7 +813,7 @@ def run_single(
         # to stay on equal footing — otherwise their measured request pays the
         # full cold-start.
 
-        # Measured request — pass perf_dump_path for SGLang server-side timing
+        # Measured request — pass perf_dump_path for fLLiper server-side timing
         if perf_dump_path and os.path.exists(perf_dump_path):
             os.remove(perf_dump_path)
         print("  Sending measured request...")
@@ -868,8 +868,8 @@ def run_comparison(
 ) -> dict:
     """Run all comparison cases, grouped by framework to minimize installs.
 
-    Order: sglang first (already installed), then vllm-omni, then lightx2v.
-    Each non-sglang framework is installed right before its cases run.
+    Order: flliper first (already installed), then vllm-omni, then lightx2v.
+    Each non-flliper framework is installed right before its cases run.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
     commit_sha = os.environ.get("GITHUB_SHA", "unknown")
@@ -879,7 +879,7 @@ def run_comparison(
     log_dir.mkdir(exist_ok=True)
 
     # Collect all (case, framework) pairs, grouped by framework
-    fw_order = ["sglang", "vllm-omni", "lightx2v"]
+    fw_order = ["flliper", "vllm-omni", "lightx2v"]
     fw_cases: dict[str, list[tuple[dict, dict]]] = {fw: [] for fw in fw_order}
 
     for case in config["cases"]:
@@ -975,7 +975,7 @@ def run_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SGLang-Diffusion serving benchmark (nightly CI)"
+        description="fLLiper-Diffusion serving benchmark (nightly CI)"
     )
     parser.add_argument(
         "--config",
@@ -992,7 +992,7 @@ def main():
         "--frameworks",
         nargs="+",
         default=None,
-        help="Only run specific frameworks (sglang, vllm-omni, lightx2v)",
+        help="Only run specific frameworks (flliper, vllm-omni, lightx2v)",
     )
     parser.add_argument(
         "--port",

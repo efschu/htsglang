@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """#1492/#1493: the per-flip driver leak, and the manual flip that must refuse.
 
-#1492 -- WHAT GREW OUTSIDE THE TORCH ALLOCATOR. `WEG2-DC-BREAKDOWN`'s `other
+#1492 -- WHAT GREW OUTSIDE THE TORCH ALLOCATOR. `PDFLIP-DC-BREAKDOWN`'s `other
 (context+driver+communicator+non-torch)` post crept on every rank of boots
 weg2xsn406/408 and never came back. The BAR1 lane builds a ring of CUDA
 streams per TAG, per PHASE, per LANE, on EVERY flip, and destroyed none of
 them -- while every other `create_stream` in the Weg-2 transport has its
 matching `destroy_stream`. The arithmetic, from the boots' own line counts:
 
-    rank   WEG2-BAR1 mapped   x ring=4   nvml_proc creep   MiB per stream
+    rank   PDFLIP-BAR1 mapped   x ring=4   nvml_proc creep   MiB per stream
     P PP0        140            560        +436 MiB          0.78
     D TP1        110            440        +326 MiB          0.74
     D TP2         90            360        +272 MiB          0.76
 
-#1493 -- THE MANUAL FLIP THAT SHOULD NOT HAVE STARTED. `POST /weg2/flip` with
+#1493 -- THE MANUAL FLIP THAT SHOULD NOT HAVE STARTED. `POST /pdflip/flip` with
 D awake flips D->P and immediately back P->D. On weg2xsn406 the RETURN wake
 had to fund D's whole kv_cache tag out of cards P had just prefilled on, and
 refused it on a device OOM. The sleeper's unreleased residency was measurable
@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.weg2.bar1_lanes import lane_streams
-from sglang.srt.weg2.front import (
+from flliper.srt.pdflip.bar1_lanes import lane_streams
+from flliper.srt.pdflip.front import (
     MANUAL_FLIP_RESIDENCY_SLACK_MIB,
     manual_flip_residency_refusal,
 )
@@ -130,7 +130,7 @@ def test_the_xsn406_shape_is_refused_by_name():
     why = manual_flip_residency_refusal(
         awake="D", sleeper="P", sleeper_used_mib=3900, sleeper_dormant_mib=1500)
     assert why is not None
-    assert "W115 Weg2ManualFlipRefused" in why
+    assert "W115 PdFlipManualFlipRefused" in why
     assert "group P still holds 3900 MiB" in why
     assert "dormant image of 1500 MiB" in why
     assert "2400 MiB of transient residency" in why

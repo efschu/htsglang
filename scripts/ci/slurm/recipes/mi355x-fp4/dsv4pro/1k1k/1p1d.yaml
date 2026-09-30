@@ -1,12 +1,12 @@
 # MI355X DeepSeek-V4-Pro (FP4) 2-node 1P1D disaggregation recipe.
 #
-# FP4 enables SGLANG_DSV4_FP4_EXPERTS in launch_mi355x.sh (driven by PRECISION).
+# FP4 enables FLLIPER_DSV4_FP4_EXPERTS in launch_mi355x.sh (driven by PRECISION).
 # Pro mirrors the Flash topology (TP8 1P1D) as a starting point; Pro weights are
 # larger, so mem_fraction_static / max_running_requests may need tuning.
 #
 # Consumed by:
 #   * scripts/ci/slurm/process_result.py reads `resources` and
-#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#     `backend.flliper_config` (TP/EP/DP + worker counts) for the summary table.
 #   * scripts/ci/slurm/launch_mi355x.sh reads `runtime` and `bench`.
 
 resources:
@@ -14,7 +14,7 @@ resources:
   decode_workers: 1
 
 backend:
-  sglang_config:
+  flliper_config:
     prefill:
       tensor-parallel-size: 8
       expert-parallel-size: 1

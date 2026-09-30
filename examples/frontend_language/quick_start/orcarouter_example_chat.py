@@ -6,7 +6,7 @@ python3 orcarouter_example_chat.py
 
 import os
 
-import sglang as sgl
+import flliper as sgl
 
 
 @sgl.function

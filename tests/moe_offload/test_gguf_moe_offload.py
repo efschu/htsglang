@@ -49,7 +49,7 @@ from gguf import GGMLQuantizationType as WeightType  # noqa: E402
 from gguf.constants import GGML_QUANT_SIZES  # noqa: E402
 from gguf.quants import dequantize  # noqa: E402
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     MoEExpertOffloadCache,
     assert_expert_offload_quant_supported,
     plan_load_time_staging,
@@ -57,8 +57,8 @@ from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
     stage_experts_into_tiers,
 )
 
-FRACTION_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
-SCRATCH_ENV = "SGLANG_MOE_SCRATCH_SLOTS"
+FRACTION_ENV = "FLLIPER_MOE_RESIDENT_EXPERT_FRACTION"
+SCRATCH_ENV = "FLLIPER_MOE_SCRATCH_SLOTS"
 
 # Toy geometry. Only two things have to be true of it for the tiering claims:
 # every row is a whole number of ggml blocks, and the expert axis is dim 0.
@@ -82,7 +82,7 @@ def _uncovered_ggml_type() -> WeightType:
     kernel in this stack at all; the search is the backstop if that ever
     changes.
     """
-    from sglang.srt.layers.quantization.gguf import MOE_OFFLOAD_SUPPORTED_TYPES
+    from flliper.srt.layers.quantization.gguf import MOE_OFFLOAD_SUPPORTED_TYPES
 
     covered = {int(t) for t in MOE_OFFLOAD_SUPPORTED_TYPES}
     for name in ("TQ1_0", "TQ2_0", "Q8_K"):
@@ -284,8 +284,8 @@ def _gguf_layer(num_owned=E, expert_shard=False, declared_w2_type=None):
     uninitialized GGUF parameters with their loader-populated
     ``expert_data_map``, the ggml type holders, and the shard flags.
     """
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.quantization.gguf import GGUFUninitializedParameter
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.quantization.gguf import GGUFUninitializedParameter
 
     class _StubGGUFMoELayer(torch.nn.Module):
         materialize_gguf_weights = FusedMoE.materialize_gguf_weights
@@ -359,7 +359,7 @@ def test_expert_source_drop_releases_both_holders():
     "one expert above the two tiers" host bound silently becomes "the whole
     loaded set above the two tiers".
     """
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     w = _expert_bytes(W2_TYPE, W2_ROWS, seed=42)
     expert_data_map = {(0, "w2"): w, (1, "w2"): w.clone()}
@@ -676,11 +676,11 @@ def test_round_trip_multi_wave(monkeypatch):
 
 
 def test_expert_stats_count_on_the_gguf_path(monkeypatch):
-    from sglang.srt.layers.moe import expert_stats
+    from flliper.srt.layers.moe import expert_stats
 
     monkeypatch.setenv(SCRATCH_ENV, "4")
     monkeypatch.setenv(FRACTION_ENV, "0.25")
-    monkeypatch.setenv("SGLANG_EXPERT_STATS", "1")
+    monkeypatch.setenv("FLLIPER_EXPERT_STATS", "1")
     expert_stats.reset_for_tests()
     reset_expert_offload_release()
     try:

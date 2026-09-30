@@ -46,7 +46,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from sglang.srt.managers import kv_backing_relief as kbr
+from flliper.srt.managers import kv_backing_relief as kbr
 
 #: A high-water ID over a sparse set: far above any plausible backed-row
 #: count, which is exactly the #714 shape that makes the plain floor a veto.
@@ -112,7 +112,7 @@ class TestEveryPlainFloorBranchNamesItself(unittest.TestCase):
         """The healthy cause: the pool is genuinely live. Still must be named."""
         r = _relief({"req_max": -1, "req_rows": 0})
         with mock.patch(
-            "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+            "flliper.srt.managers.kv_radix_watermark.evictable_rows_above",
             return_value=(0, 0),
         ):
             floor, rows = r._evict_floor_rows(MAX_LIVE)
@@ -137,7 +137,7 @@ class TestEveryPlainFloorBranchNamesItself(unittest.TestCase):
         # plain floor, but far enough up that the priced floor clears max_live.
         r = _relief({"req_max": MAX_LIVE - 100, "req_rows": 3})
         with mock.patch(
-            "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+            "flliper.srt.managers.kv_radix_watermark.evictable_rows_above",
             return_value=(0, 0),
         ):
             floor, rows = r._evict_floor_rows(MAX_LIVE)
@@ -162,7 +162,7 @@ class TestEveryPlainFloorBranchNamesItself(unittest.TestCase):
         """
         r = _relief({"req_max": 1_000, "req_rows": 3})
         with mock.patch(
-            "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+            "flliper.srt.managers.kv_radix_watermark.evictable_rows_above",
             return_value=(0, 0),
         ):
             floor, rows = r._evict_floor_rows(MAX_LIVE)
@@ -184,7 +184,7 @@ class TestEveryPlainFloorBranchNamesItself(unittest.TestCase):
         ):
             r = _relief(split)
             with mock.patch(
-                "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+                "flliper.srt.managers.kv_radix_watermark.evictable_rows_above",
                 return_value=(0, 0),
             ):
                 results.append(r._evict_floor_rows(MAX_LIVE))
@@ -195,7 +195,7 @@ class TestEveryPlainFloorBranchNamesItself(unittest.TestCase):
         """The success path is named too, or absence of a reason is ambiguous."""
         r = _relief({"req_max": -1, "req_rows": 0})
         with mock.patch(
-            "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+            "flliper.srt.managers.kv_radix_watermark.evictable_rows_above",
             return_value=(50_000, 3),
         ):
             floor, rows = r._evict_floor_rows(MAX_LIVE)
@@ -211,7 +211,7 @@ class TestTheReasonReachesTheRefusalLine(unittest.TestCase):
     def test_summary_carries_the_reason_when_the_rung_has_no_slack(self):
         r = _relief({"req_max": -1, "req_rows": 0})
         with mock.patch(
-            "sglang.srt.managers.kv_radix_watermark.evictable_rows_above",
+            "flliper.srt.managers.kv_radix_watermark.evictable_rows_above",
             return_value=(0, 0),
         ):
             floor, _rows = r._evict_floor_rows(MAX_LIVE)

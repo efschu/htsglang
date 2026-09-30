@@ -19,13 +19,13 @@ than producing a short number that looks complete.
 
 import unittest
 
-from sglang.srt.mem_ledger.engine import (
+from flliper.srt.mem_ledger.engine import (
     CardFacts,
     DemandInputs,
     build_card_ledgers,
     demand_outside_budget_mib,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -249,7 +249,7 @@ class TestServerArgsFullDemandPath(unittest.TestCase):
     """The three cases at the ServerArgs seam, same structure as #590."""
 
     def setUp(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         ServerArgs._full_demand_refusal_named = False
         self.SA = ServerArgs
@@ -272,7 +272,7 @@ class TestServerArgsFullDemandPath(unittest.TestCase):
         """A fully priced card returns its demand."""
         import types
 
-        from sglang.srt.mem_ledger.engine import TERM_ACTIVATION
+        from flliper.srt.mem_ledger.engine import TERM_ACTIVATION
 
         fake = types.SimpleNamespace(
             gpu_id=1,
@@ -294,19 +294,19 @@ class TestServerArgsFullDemandPath(unittest.TestCase):
         UNBOUNDED, so the whole reserve refuses and the boot keeps the
         inherited model. That is the correct outcome -- a constant there is the
         guess the ledger exists to remove -- and it means this payout needs
-        `python -m sglang.srt.mem_ledger.probe` run once on the rig.
+        `python -m flliper.srt.mem_ledger.probe` run once on the rig.
         """
         lg = ledger()
         self.assertTrue(
             any("hardware residual" in u for u in lg.unbounded), lg.unbounded
         )
-        with self.assertLogs("sglang.srt.server_args", level="WARNING"):
+        with self.assertLogs("flliper.srt.server_args", level="WARNING"):
             self.assertIsNone(self._stub(ledgers=[lg]).ledger_full_demand_per_gpu())
 
     def test_an_unbounded_term_refuses_and_names_it(self):
         lg = ledger(activation_mib_per_rank=[None])
         stub = self._stub(ledgers=[lg])
-        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
             got = stub.ledger_full_demand_per_gpu()
         self.assertIsNone(got, "a refusing ledger produced a number anyway")
         joined = "\n".join(cm.output)
@@ -316,7 +316,7 @@ class TestServerArgsFullDemandPath(unittest.TestCase):
     def test_the_refusal_is_named_once_per_process(self):
         lg = ledger(activation_mib_per_rank=[None])
         stub = self._stub(ledgers=[lg])
-        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+        with self.assertLogs("flliper.srt.server_args", level="WARNING") as cm:
             stub.ledger_full_demand_per_gpu()
             stub.ledger_full_demand_per_gpu()
         self.assertEqual(len(cm.output), 1, cm.output)
@@ -325,5 +325,5 @@ class TestServerArgsFullDemandPath(unittest.TestCase):
         """No NVML, no card facts: the caller keeps its previous behaviour and
         this path says nothing, because it has nothing to report."""
         stub = self._stub(raises=RuntimeError("no NVML"))
-        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+        with self.assertNoLogs("flliper.srt.server_args", level="WARNING"):
             self.assertIsNone(stub.ledger_full_demand_per_gpu())

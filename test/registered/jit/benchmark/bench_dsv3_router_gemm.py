@@ -1,7 +1,7 @@
 """Benchmark for DeepSeek V3 router GEMM (JIT kernel vs sgl_kernel AOT vs torch).
 
 Run on a Hopper (SM90+) GPU:
-    python -m sglang.jit_kernel.benchmark.bench_dsv3_router_gemm
+    python -m flliper.jit_kernel.benchmark.bench_dsv3_router_gemm
 """
 
 import torch
@@ -12,11 +12,11 @@ try:
 except ImportError:
     sgl_kernel_dsv3_router_gemm = None
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.benchmark.utils import create_random
-from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
-from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.benchmark.utils import create_random
+from flliper.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
+from flliper.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

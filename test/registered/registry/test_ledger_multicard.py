@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sglang.srt.registry.ledger import (
+from flliper.srt.registry.ledger import (
     MIB,
     CardDemand,
     MultiCardReservation,
@@ -24,7 +24,7 @@ from sglang.srt.registry.ledger import (
     adopt,
     plan_reservation,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 

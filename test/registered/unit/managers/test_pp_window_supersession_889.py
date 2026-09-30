@@ -35,14 +35,14 @@ WHAT THIS SUITE PINS
    to the configurations that were never ambiguous.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from unittest import mock
 
-from sglang.srt.managers.phase_policy import (
+from flliper.srt.managers.phase_policy import (
     PP_EXIT_BY_DRAIN,
     PP_EXIT_BY_SLO_CAP,
     PP_EXIT_BY_STOPWATCH,
@@ -56,7 +56,7 @@ from sglang.srt.managers.phase_policy import (
     pp_residency_cap_s,
     superseded_pp_bound_warning,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # The booted values on the w38b/w39/w40 line, so the numbers below are live.
 N = 7004
@@ -148,7 +148,7 @@ class TestTheSupersessionIsAnnounced(CustomTestCase):
         self.assertIn("173.6", msg)
         self.assertIn("LONGER", msg)
         self.assertIn("phase-policy-pp-window-s", msg)
-        self.assertIn("SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S", msg)
+        self.assertIn("FLLIPER_PHASE_POLICY_DECODE_STALL_SLO_S", msg)
 
     def test_a_cap_shorter_than_the_window_is_announced_as_shorter(self):
         msg = superseded_pp_bound_warning(_cfg(decode_stall_slo_s=20.0))
@@ -178,14 +178,14 @@ class TestTheBootLineStopsLying(CustomTestCase):
 
     def _boot(self, **env):
         base = {
-            "SGLANG_PHASE_POLICY_PP_WINDOW_S": "15",
-            "SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S": "180",
-            "SGLANG_PHASE_POLICY_FLIP_COST_S": "3.2",
+            "FLLIPER_PHASE_POLICY_PP_WINDOW_S": "15",
+            "FLLIPER_PHASE_POLICY_DECODE_STALL_SLO_S": "180",
+            "FLLIPER_PHASE_POLICY_FLIP_COST_S": "3.2",
         }
         base.update(env)
         with mock.patch.dict("os.environ", base, clear=False):
             with self.assertLogs(
-                "sglang.srt.managers.phase_policy", level="WARNING"
+                "flliper.srt.managers.phase_policy", level="WARNING"
             ) as cm:
                 cfg = config_from_env(enabled=True)
         return cfg, "\n".join(cm.output)
@@ -210,7 +210,7 @@ class TestTheBootLineStopsLying(CustomTestCase):
         self.assertIn("pp window 15s", armed)
 
     def test_a_slo_free_boot_names_the_stopwatch_in_the_armed_line(self):
-        _, log = self._boot(SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S="0")
+        _, log = self._boot(FLLIPER_PHASE_POLICY_DECODE_STALL_SLO_S="0")
         armed = self._armed_line(log)
         self.assertIn(PP_EXIT_BY_STOPWATCH, armed)
         self.assertIn("15s", armed)
@@ -222,7 +222,7 @@ class TestTheBootLineStopsLying(CustomTestCase):
         self.assertIn("15", log)
 
     def test_a_window_only_boot_says_the_window_governs_and_does_not_warn(self):
-        _, log = self._boot(SGLANG_PHASE_POLICY_DECODE_STALL_SLO_S="0")
+        _, log = self._boot(FLLIPER_PHASE_POLICY_DECODE_STALL_SLO_S="0")
         self.assertIn("armed:", log)
         self.assertNotIn("LONGER", log)
         self.assertNotIn("SHORTER", log)

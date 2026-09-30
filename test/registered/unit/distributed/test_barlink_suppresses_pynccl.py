@@ -10,7 +10,7 @@ rank 0 then segfaulted at
     pynccl.py:111 in __init__
     parallel_state.py:420 in __init__
 
-before the model was loaded. `use_pynccl` is independent of SGLANG_BARLINK, so
+before the model was loaded. `use_pynccl` is independent of FLLIPER_BARLINK, so
 enabling barlink rerouted the collectives but never stopped the construction.
 
 Three properties are pinned here, and the second matters most:
@@ -28,8 +28,8 @@ CPU only: this tests the construction DECISION, not NCCL itself.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -42,7 +42,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 # source-inspection test caught it. That is the same failure this codebase keeps
 # producing -- a check that verifies something adjacent to the thing under test.
 # Importing the real predicate is what makes the red check meaningful.
-from sglang.srt.distributed.parallel_state import should_build_pynccl as _should_build_pynccl
+from flliper.srt.distributed.parallel_state import should_build_pynccl as _should_build_pynccl
 
 
 class TestBarlinkSuppressesPynccl(CustomTestCase):
@@ -114,7 +114,7 @@ class TestBarlinkSuppressesPynccl(CustomTestCase):
         into testing a fiction."""
         import inspect
 
-        from sglang.srt.distributed import parallel_state
+        from flliper.srt.distributed import parallel_state
 
         src = inspect.getsource(parallel_state.GroupCoordinator.__init__)
         # The call site must go through the shared predicate, so that reverting

@@ -2,11 +2,11 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA
-from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.network import is_port_available
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.test_utils import (
+from flliper.srt.server_args import ZMQ_TCP_PORT_DELTA
+from flliper.srt.utils import kill_process_tree
+from flliper.srt.utils.network import is_port_available
+from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from flliper.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -36,10 +36,10 @@ def wait_all_ports_release(base_url, timeout_s=60):
 
 mori_env = {
     **os.environ,
-    "SGLANG_USE_AITER": "1",
-    "SGLANG_MORI_DISPATCH_DTYPE": "bf16",
-    "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096",
-    "SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE": "32",
+    "FLLIPER_USE_AITER": "1",
+    "FLLIPER_MORI_DISPATCH_DTYPE": "bf16",
+    "FLLIPER_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096",
+    "FLLIPER_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE": "32",
     "MORI_SHMEM_MODE": "ISOLATION",
 }
 

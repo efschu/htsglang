@@ -20,10 +20,10 @@ Everything is CPU arithmetic. No torch, no device.
 import unittest
 from pathlib import Path
 
-from sglang.srt.planner.cost_model import Provenance, Rate
-from sglang.srt.video_enhance.frame_math import R4K, R1080P, Resolution
-from sglang.srt.video_enhance.rife import KNOWN_WEIGHT_SHA256, SUPPORTED_VERSIONS
-from sglang.srt.video_enhance.rife_ladder import (
+from flliper.srt.planner.cost_model import Provenance, Rate
+from flliper.srt.video_enhance.frame_math import R4K, R1080P, Resolution
+from flliper.srt.video_enhance.rife import KNOWN_WEIGHT_SHA256, SUPPORTED_VERSIONS
+from flliper.srt.video_enhance.rife_ladder import (
     CARD_3080,
     CARD_5090,
     DEFAULT_QUALITY_RANK,
@@ -36,8 +36,8 @@ from sglang.srt.video_enhance.rife_ladder import (
     default_ladder,
     seeded_frontier,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -97,7 +97,7 @@ class TheRegistryTest(CustomTestCase):
         import tempfile
         from unittest import mock
 
-        from sglang.srt.video_enhance import rife
+        from flliper.srt.video_enhance import rife
 
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -176,7 +176,7 @@ class TheRegistryTest(CustomTestCase):
         # vendored architecture without ranking it would do.
         from unittest import mock
 
-        from sglang.srt.video_enhance import rife_ladder as module
+        from flliper.srt.video_enhance import rife_ladder as module
 
         thinned = {k: v for k, v in DEFAULT_QUALITY_RANK.items() if k != "4.18"}
         with mock.patch.object(module, "DEFAULT_QUALITY_RANK", thinned):

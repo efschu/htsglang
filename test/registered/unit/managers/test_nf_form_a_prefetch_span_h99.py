@@ -1,9 +1,9 @@
-"""H99 (rc9o, boot dkrnfbar1rc9o09260808 on 2eed285057, rid weg2-33-33):
+"""H99 (rc9o, boot dkrnfbar1rc9o09260808 on 2eed285057, rid pdflip-33-33):
 on a Form A D group the #580 prefetch span is the attention host's.
 
 MEASURED (D log 85540-85632, 08:29:00): ``#1042 EXTENT LIFECYCLE set
-rid=weg2-33-33 extent=32768`` on TP0, ``extent=26368`` on TP1/TP2, then on
-TP1/TP2 ``HiCacheCollectiveDesyncError: W65 Weg2PrefetchSpanSplit ...
+rid=pdflip-33-33 extent=32768`` on TP0, ``extent=26368`` on TP1/TP2, then on
+TP1/TP2 ``HiCacheCollectiveDesyncError: W65 PdFlipPrefetchSpanSplit ...
 DIFFERENT pre-vote spans (min=320 max=6720) ... group length of 320``, raised
 from ``_add_request_to_queue -> _prefetch_kvcache -> prefetch_from_storage``
 -- at INTAKE, before any admission, so H98's follow (admission only) never
@@ -29,15 +29,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt import rank_role
-from sglang.srt.managers import tp_match_floor as m
-from sglang.srt.mem_cache import unified_radix_cache as urc
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from flliper.srt import rank_role
+from flliper.srt.managers import tp_match_floor as m
+from flliper.srt.mem_cache import unified_radix_cache as urc
+from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 WORLD = 3
 THRESHOLD = 256
 ROLES = ("host", "worker", "worker")
-SWITCH = "SGLANG_WEG2_ENABLE_FORM_A_TP0_FOLLOW"
+SWITCH = "FLLIPER_PDFLIP_ENABLE_FORM_A_TP0_FOLLOW"
 SPAN_ATTR = "_tp_match_floor_prefetch_group_span"
 NF_D = types.SimpleNamespace(rank_tp_ratio=[1, 0, 0], hicache_size=4)
 
@@ -164,7 +164,7 @@ def _carrier(rank, group):
     )
     for name in (
         "prefetch_from_storage", "_retire_ongoing_prefetch", "_prefetch_line_terms",
-        "_log_prefetch_refused", "_log_prefetch_truncated", "_weg2_extent_topup",
+        "_log_prefetch_refused", "_log_prefetch_truncated", "_pdflip_extent_topup",
         "_hicache_prefetch_symmetric",
     ):
         setattr(cache, name, types.MethodType(getattr(UnifiedRadixCache, name), cache))
@@ -186,12 +186,12 @@ class _Env:
         self.stack = []
 
     def __enter__(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         self.prev = (rank_role._INSTALLED_PLAN, rank_role._INSTALLED_RANK)
         rank_role.set_form_a_role_plan(rank_role.RankRolePlan(ROLES), 0)
         for p in (
-            mock.patch("sglang.srt.runtime_context.get_server_args", return_value=NF_D),
+            mock.patch("flliper.srt.runtime_context.get_server_args", return_value=NF_D),
             mock.patch.object(urc, "uneven_dcp_active", return_value=False),
             mock.patch.object(rank_role, "this_rank_is_form_a_worker", _thread_is_worker),
         ):
@@ -230,7 +230,7 @@ RC9O = {0: TP0_PREFIX, 1: WORKER_PREFIX, 2: WORKER_PREFIX}
 
 class TestRc9oPrefetchSpanIsTheHosts(unittest.TestCase):
     def test_rc9o_no_w65_and_one_registration_length(self):
-        _c, results, errors, group = _intake(RC9O, "weg2-33-33")
+        _c, results, errors, group = _intake(RC9O, "pdflip-33-33")
         self.assertEqual(
             errors, {},
             "rc9o: the expert workers' shadow-anchor spans (6720) split the #580 "
@@ -240,7 +240,7 @@ class TestRc9oPrefetchSpanIsTheHosts(unittest.TestCase):
         self.assertEqual(group.errors, [])
 
     def test_workers_release_their_surplus_rows(self):
-        caches, _r, errors, _g = _intake(RC9O, "weg2-33-33")
+        caches, _r, errors, _g = _intake(RC9O, "pdflip-33-33")
         self.assertEqual(errors, {})
         self.assertEqual({r: c.cache_controller.released for r, c in caches.items()},
                          {0: 0, 1: 6400, 2: 6400})
@@ -248,13 +248,13 @@ class TestRc9oPrefetchSpanIsTheHosts(unittest.TestCase):
                          , {0: 320, 1: 320, 2: 320})
 
     def test_worker_bookkeeping_takes_the_host_prefix(self):
-        caches, _r, errors, _g = _intake(RC9O, "weg2-33-33")
+        caches, _r, errors, _g = _intake(RC9O, "pdflip-33-33")
         self.assertEqual(errors, {})
         with _Env():
             _ROLE.worker = True
             try:
                 req = types.SimpleNamespace(
-                    rid="weg2-33-33", _prefetch_span_tokens=MATCH_END - WORKER_PREFIX,
+                    rid="pdflip-33-33", _prefetch_span_tokens=MATCH_END - WORKER_PREFIX,
                     _prefetch_registered_prefix_len=WORKER_PREFIX,
                 )
                 got = m.adopt_host_prefetch_span(caches[1], req, MATCH_END)
@@ -276,7 +276,7 @@ class TestRc9oPrefetchSpanIsTheHosts(unittest.TestCase):
 
 class TestSwitchOffIsBase(unittest.TestCase):
     def test_switch_off_keeps_w65(self):
-        _c, _r, errors, _g = _intake(RC9O, "weg2-33-33", switch=False)
+        _c, _r, errors, _g = _intake(RC9O, "pdflip-33-33", switch=False)
         self.assertEqual(set(errors), {0, 1, 2})
         self.assertTrue(all("W65" in str(e) for e in errors.values()), errors)
 
@@ -307,7 +307,7 @@ class TestPieces(unittest.TestCase):
     def test_scheduler_delegates_after_the_vote(self):
         import inspect
 
-        from sglang.srt.managers.scheduler import Scheduler
+        from flliper.srt.managers.scheduler import Scheduler
 
         src = inspect.getsource(Scheduler._prefetch_kvcache)
         i = src.index("locally_eligible=locally_eligible,")
@@ -318,7 +318,7 @@ class TestAuditNoSilentFallback(unittest.TestCase):
     """Release audit: a broad except must not put ONE rank on another path."""
 
     def _raising_switch(self, only_rank=None):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
         field = getattr(envs, SWITCH)
         real = field.get
@@ -341,9 +341,9 @@ class TestAuditNoSilentFallback(unittest.TestCase):
         def _rank(r):
             c = _carrier(r, group)
             c.prefetch_from_storage(
-                "weg2-33-33", _host_node(), PROMPT[RC9O[r]:], last_hash=None, prefix_keys=None
+                "pdflip-33-33", _host_node(), PROMPT[RC9O[r]:], last_hash=None, prefix_keys=None
             )
-            return _registered_len(c, "weg2-33-33")
+            return _registered_len(c, "pdflip-33-33")
 
         with _Env(), self._raising_switch(only_rank=1):
             results, errors = run_ranks(_rank)

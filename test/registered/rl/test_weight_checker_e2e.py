@@ -25,9 +25,9 @@ from typing import List, Tuple
 import requests
 import torch
 
-from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import MultiprocessingSerializer, kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=150, suite="nightly-1-gpu", nightly=True)
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
-# We address the up half via the HF-style unfused name "up_proj.weight". sglang's
+# We address the up half via the HF-style unfused name "up_proj.weight". flliper's
 # stacked_params_mapping rewrites this to "gate_up_proj.weight" with shard_id=1,
 # so the upload writes only the up half of the fused tensor. Sending the fused
 # name directly hits a name.replace() collision (gate_up_proj contains up_proj),
@@ -58,7 +58,7 @@ class TestWeightCheckerE2E(CustomTestCase):
         # --mem-fraction-static 0.7 leaves enough free GPU for _check_tensors's
         # CPU->GPU round trip: snapshot lives on CPU, then _compare moves each
         # snapshot tensor back to GPU for byte equality. With the default 0.88,
-        # sglang holds ~29GB on a 32GB GPU and only ~200MB is free, so the
+        # flliper holds ~29GB on a 32GB GPU and only ~200MB is free, so the
         # vocab-embedding round-trip (~600MB) OOMs the snapshot/reset/compare
         # cycle in test_z_*.
         cls.process = popen_launch_server(
@@ -110,7 +110,7 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertEqual(self._post("snapshot").status_code, 200)
 
         # The unfused HF name "up_proj" is what update_weights_from_tensor accepts;
-        # sglang's loader rewrites it onto the fused gate_up_proj tensor.
+        # flliper's loader rewrites it onto the fused gate_up_proj tensor.
         upload_name = "model.layers.5.mlp.up_proj.weight"
         new_tensor = torch.full(_UP_PROJ_SHAPE, 1.5, device="cuda")
         update_resp = self._update_weights([(upload_name, new_tensor)])

@@ -64,10 +64,10 @@ import tempfile
 import types
 import unittest
 
-from sglang.srt.managers import phase_flip_runtime as pfr
-from sglang.srt.managers import phase_flip_seam_reserve as sr
-from sglang.srt.managers import phase_flip_spill
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers import phase_flip_runtime as pfr
+from flliper.srt.managers import phase_flip_seam_reserve as sr
+from flliper.srt.managers import phase_flip_spill
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
@@ -152,9 +152,9 @@ class TheColdRecordIsTheBootThatNeedsTheFloorMostTest(unittest.TestCase):
 
     def test_the_floor_target_is_the_gate_watermark_plus_a_load_margin(self):
         """Derived from the law, never a constant carried between rigs."""
-        from sglang.srt.managers import corridor_guard as cg
+        from flliper.srt.managers import corridor_guard as cg
 
-        with _Env(SGLANG_PHASE_FLIP_ARMING_MARGIN_MIB="192"):
+        with _Env(FLLIPER_PHASE_FLIP_ARMING_MARGIN_MIB="192"):
             self.assertEqual(
                 sr.arming_floor_target_bytes(),
                 (int(cg.arming_floor_mib()) << 20) + (192 << 20),
@@ -162,13 +162,13 @@ class TheColdRecordIsTheBootThatNeedsTheFloorMostTest(unittest.TestCase):
 
     def test_the_operators_override_RAISES_the_floor_the_pool_reserves_for(self):
         """CAUGHT ON THIS RIG BEFORE THE PROOF BOOT, and it would have been
-        silent. The live instance sets SGLANG_CORRIDOR_FLOOR_MIB=1536 while the
+        silent. The live instance sets FLLIPER_CORRIDOR_FLOOR_MIB=1536 while the
         derived floor is 1331. A sizer that reserved for the derived number
         would leave every rank 205 MiB short of the floor its own gate arms at
         -- a healthy-looking boot that simply never flips, which is the exact
         defect this whole change exists for, reintroduced one level down.
         """
-        with _Env(SGLANG_CORRIDOR_FLOOR_MIB="4096"):
+        with _Env(FLLIPER_CORRIDOR_FLOOR_MIB="4096"):
             self.assertEqual(sr.configured_arming_floor_mib(), 4096)
             self.assertEqual(
                 sr.arming_floor_target_bytes(configured_mib=4096),
@@ -179,7 +179,7 @@ class TheColdRecordIsTheBootThatNeedsTheFloorMostTest(unittest.TestCase):
         """A floor below the real draw launders breaches as passed checks, so
         a configured value may raise the derived one and may never lower it --
         the guard's own rule, applied to the number the pool reserves."""
-        from sglang.srt.managers import corridor_guard as cg
+        from flliper.srt.managers import corridor_guard as cg
 
         derived = cg.arming_floor_mib()
         low = sr.arming_floor_target_bytes(configured_mib=1)
@@ -193,13 +193,13 @@ class TheColdRecordIsTheBootThatNeedsTheFloorMostTest(unittest.TestCase):
         self.assertGreater(big, small)
 
     def test_a_malformed_override_is_not_a_floor_of_zero(self):
-        with _Env(SGLANG_CORRIDOR_FLOOR_MIB="wide open"):
+        with _Env(FLLIPER_CORRIDOR_FLOOR_MIB="wide open"):
             self.assertEqual(sr.configured_arming_floor_mib(), 0)
 
     def test_a_malformed_margin_falls_back_to_the_default_not_to_zero(self):
         """The failure this exists to prevent is a pool with no margin, so an
         unparsable override must not produce one."""
-        with _Env(SGLANG_PHASE_FLIP_ARMING_MARGIN_MIB="banana"):
+        with _Env(FLLIPER_PHASE_FLIP_ARMING_MARGIN_MIB="banana"):
             self.assertEqual(
                 sr._arming_margin_bytes(), sr.DEFAULT_ARMING_MARGIN_MIB << 20
             )
@@ -420,7 +420,7 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         g = _Guard(free=900 * MIB, deliverable=0)
         with _PatchedGuard(g):
             with self.assertLogs(
-                "sglang.srt.managers.phase_flip_runtime", level="WARNING"
+                "flliper.srt.managers.phase_flip_runtime", level="WARNING"
             ) as cm:
                 r._prearm_floor_relief(TP_TO_PP)
         joined = "\n".join(cm.output)
@@ -452,7 +452,7 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
             _PatchedGuard(g),
-            _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="2"),
+            _Env(FLLIPER_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="2"),
         ):
             for _ in range(6):
                 ok, _msg = r._prearm_floor_relief(TP_TO_PP)
@@ -464,7 +464,7 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
             _PatchedGuard(g),
-            _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="1"),
+            _Env(FLLIPER_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="1"),
         ):
             r._prearm_floor_relief(TP_TO_PP)
             r._prearm_floor_relief(TP_TO_PP)
@@ -477,7 +477,7 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
             _PatchedGuard(g),
-            _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="1"),
+            _Env(FLLIPER_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="1"),
         ):
             r._prearm_floor_relief(TP_TO_PP)
             g.free = FLOOR + MIB
@@ -492,7 +492,7 @@ class TheFloorIsSpilledForBeforeItIsRefusedForTest(unittest.TestCase):
         g = _Guard(free=900 * MIB, deliverable=2 * GIB)
         with (
             _PatchedGuard(g),
-            _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="0"),
+            _Env(FLLIPER_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="0"),
         ):
             ok, _ = r._prearm_floor_relief(TP_TO_PP)
         self.assertTrue(ok, "a zero bound must not refuse without asking")
@@ -537,7 +537,7 @@ class AnUnreadableInstrumentMayNotBlockAFlipTest(unittest.TestCase):
         g = _Guard(free=900 * MIB, deliverable=0)
         with (
             _PatchedGuard(g),
-            _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF="0"),
+            _Env(FLLIPER_PHASE_FLIP_PREARM_RELIEF="0"),
         ):
             ok, msg = r._prearm_floor_relief(TP_TO_PP)
         self.assertEqual((ok, msg), (True, ""))
@@ -585,11 +585,11 @@ class TheOrderIsTheConstraintTest(unittest.TestCase):
 
 class TheKnobsAreReadableTest(unittest.TestCase):
     def test_the_relief_defaults_on(self):
-        with _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF=None):
+        with _Env(FLLIPER_PHASE_FLIP_PREARM_RELIEF=None):
             self.assertTrue(pfr._prearm_relief_enabled())
 
     def test_a_malformed_bound_falls_back_to_the_default(self):
-        with _Env(SGLANG_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="lots"):
+        with _Env(FLLIPER_PHASE_FLIP_PREARM_RELIEF_ATTEMPTS="lots"):
             self.assertEqual(
                 pfr._prearm_relief_attempts(), pfr.DEFAULT_PREARM_RELIEF_ATTEMPTS
             )
@@ -768,7 +768,7 @@ class TheDrawIsOneLegTest(unittest.TestCase):
         defect 48ba9fe72a already fixed once. Pinned on the source."""
         import inspect
 
-        from sglang.srt.managers import phase_flip_spill
+        from flliper.srt.managers import phase_flip_spill
 
         guard_src = inspect.getsource(phase_flip_spill._measured_seam_draw_mib)
         # The RETURN, not merely a mention: the prose below it explains why

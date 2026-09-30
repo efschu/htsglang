@@ -12,10 +12,10 @@ from unittest.mock import patch
 
 import pytest
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.server_args as server_args_module
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -394,7 +394,7 @@ class TestAutoRatio(CustomTestCase):
         # leak in). Wiring-level assertion: the budgets follow
         # total - derived_reserve with the reserve from
         # derived_rank_auto_reserve_mib.
-        from sglang.srt.model_executor.cuda_graph_config import (
+        from flliper.srt.model_executor.cuda_graph_config import (
             default_cuda_graph_config,
         )
 
@@ -528,7 +528,7 @@ class TestGpuIdLookup(CustomTestCase):
 
 
 class TestMlpRatio(CustomTestCase):
-    """--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR: the MLP-family weight
+    """--rank-mlp-ratio / FLLIPER_UNEVEN_MLP_VECTOR: the MLP-family weight
     vector of the uneven-TP self-calibration (env wins over CLI; only
     valid on top of an active base plan)."""
 
@@ -588,39 +588,39 @@ class TestMlpRatio(CustomTestCase):
                 run_handler(args)
 
     def test_env_wins_over_cli(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4,4"):
+        with envs.FLLIPER_UNEVEN_MLP_VECTOR.override("7,4,4"):
             args = run_handler(self._valid_base(rank_mlp_ratio=[5, 3, 3]))
         self.assertEqual(args.rank_mlp_ratio, [7, 4, 4])
 
     def test_env_alone(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4,4"):
+        with envs.FLLIPER_UNEVEN_MLP_VECTOR.override("7,4,4"):
             args = run_handler(self._valid_base())
         self.assertEqual(args.rank_mlp_ratio, [7, 4, 4])
 
     def test_env_validated_like_cli(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4"):
+        with envs.FLLIPER_UNEVEN_MLP_VECTOR.override("7,4"):
             with self.assertRaisesRegex(ValueError, "length"):
                 run_handler(self._valid_base())
-        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("banana"):
+        with envs.FLLIPER_UNEVEN_MLP_VECTOR.override("banana"):
             with self.assertRaisesRegex(ValueError, "integer"):
                 run_handler(self._valid_base())
 
     def test_env_without_base_plan_fails_fast(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4,4"):
+        with envs.FLLIPER_UNEVEN_MLP_VECTOR.override("7,4,4"):
             with self.assertRaisesRegex(ValueError, "base plan"):
                 run_handler(make_args(tp_size=3))
 
 
 class TestMoeRatio(CustomTestCase):
-    """--rank-moe-ratio / SGLANG_UNEVEN_MOE_VECTOR: the expert-weight
+    """--rank-moe-ratio / FLLIPER_UNEVEN_MOE_VECTOR: the expert-weight
     family vector (same rules as the mlp family: env wins, base plan
     required)."""
 
@@ -661,17 +661,17 @@ class TestMoeRatio(CustomTestCase):
             run_handler(self._valid_base(rank_moe_ratio=[5, 0, 3]))
 
     def test_env_wins_over_cli(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_UNEVEN_MOE_VECTOR.override("9,5,5"):
+        with envs.FLLIPER_UNEVEN_MOE_VECTOR.override("9,5,5"):
             args = run_handler(self._valid_base(rank_moe_ratio=[5, 3, 3]))
         self.assertEqual(args.rank_moe_ratio, [9, 5, 5])
 
     def test_both_families_together(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4,4"):
-            with envs.SGLANG_UNEVEN_MOE_VECTOR.override("9,5,5"):
+        with envs.FLLIPER_UNEVEN_MLP_VECTOR.override("7,4,4"):
+            with envs.FLLIPER_UNEVEN_MOE_VECTOR.override("9,5,5"):
                 args = run_handler(self._valid_base())
         self.assertEqual(args.rank_mlp_ratio, [7, 4, 4])
         self.assertEqual(args.rank_moe_ratio, [9, 5, 5])
@@ -683,7 +683,7 @@ class TestTreeSpecDcpGuard(CustomTestCase):
     draft->draft verify attention on that path produces tree-topology-dependent
     verify logits -> non-deterministic, non-greedy output (proven on GPU vs a
     topk=1 oracle at temp 0). topk == 1 (linear chain) stays allowed and is
-    bitwise-deterministic. CPU only; is_cuda()/is_hip() and the SGLANG_UNEVEN_DCP
+    bitwise-deterministic. CPU only; is_cuda()/is_hip() and the FLLIPER_UNEVEN_DCP
     env are mocked so the CUDA weighted-DCP branch is exercised off-GPU."""
 
     def _run_guard(self, eagle_topk):
@@ -700,8 +700,8 @@ class TestTreeSpecDcpGuard(CustomTestCase):
         )
         env = {
             **os.environ,
-            "SGLANG_UNEVEN_DCP": "1",
-            "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+            "FLLIPER_UNEVEN_DCP": "1",
+            "FLLIPER_UNEVEN_DCP_WEIGHTED": "1",
         }
         with patch.object(
             server_args_module, "is_hip", return_value=False
@@ -970,7 +970,7 @@ class TestPinnedReserveShortfall(CustomTestCase):
     TIER_GPU_MEM = 32768.0
 
     def _args(self, reserve):
-        from sglang.srt.model_executor.cuda_graph_config import (
+        from flliper.srt.model_executor.cuda_graph_config import (
             default_cuda_graph_config,
         )
 
@@ -1133,7 +1133,7 @@ class TestLadderReserveDerivation(CustomTestCase):
     BASE_DEMAND_MIB = 4160
 
     def _args(self, **overrides):
-        from sglang.srt.model_executor.cuda_graph_config import (
+        from flliper.srt.model_executor.cuda_graph_config import (
             default_cuda_graph_config,
         )
 
@@ -1159,7 +1159,7 @@ class TestLadderReserveDerivation(CustomTestCase):
         """Patch the ladder's own posts to the MEASURED k5 footprint, so the
         derivation is exercised against the numbers the rig produced rather
         than against its own estimate."""
-        from sglang.srt.speculative.adaptive_graph_memory import (
+        from flliper.srt.speculative.adaptive_graph_memory import (
             LadderReserveDemand,
             LadderRungPost,
         )
@@ -1379,8 +1379,8 @@ def test_uneven_tp_is_rejected_on_models_whose_attention_is_not_aware():
     self.num_heads still reports the even count, turning a loud failure into a
     silent one. So the ratio is rejected until an architecture opts in.
     """
-    import sglang.srt.distributed.utils as du
-    from sglang.srt.models.qwen3 import _reject_uneven_tp_unaware_attention
+    import flliper.srt.distributed.utils as du
+    from flliper.srt.models.qwen3 import _reject_uneven_tp_unaware_attention
 
     saved = du.get_tp_partition_ratios
     saved_active = du.tp_plan_active
@@ -1425,7 +1425,7 @@ def test_kv_eq_tp_stays_in_normal_mode_by_measurement():
     request. The `<` semantics on the same config ran coherent,
     token-identical to TP=1, with the plan applied to every other dimension.
     """
-    import sglang.srt.distributed.utils as du
+    import flliper.srt.distributed.utils as du
 
     saved_active = du.tp_plan_active
     try:
@@ -1460,7 +1460,7 @@ def test_kv_eq_tp_stays_in_normal_mode_by_measurement():
 
 
 def test_token_vector_without_a_plan_is_rejected_not_ignored():
-    """SGLANG_UNEVEN_TOKEN_VECTOR without a non-uniform --rank-tp-ratio used
+    """FLLIPER_UNEVEN_TOKEN_VECTOR without a non-uniform --rank-tp-ratio used
     to be SILENTLY IGNORED: resolve_cp_token_ratios bails on `not weights`
     BEFORE reading the env, the server boots green, flashinfer's even-DCP
     no-op serves plain TP output -- and the requested token ownership never
@@ -1474,12 +1474,12 @@ def test_token_vector_without_a_plan_is_rejected_not_ignored():
     import os
     import types
 
-    import sglang.srt.distributed.utils as du
+    import flliper.srt.distributed.utils as du
 
     sa = types.SimpleNamespace(rank_tp_ratio=None, dcp_size=2)
-    saved = os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR")
+    saved = os.environ.get("FLLIPER_UNEVEN_TOKEN_VECTOR")
     try:
-        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "2,1"
+        os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = "2,1"
         with pytest.raises(ValueError) as ei:
             du.resolve_cp_token_ratios(sa)
         assert "silently ignored" in str(ei.value)
@@ -1489,13 +1489,13 @@ def test_token_vector_without_a_plan_is_rejected_not_ignored():
         assert du.resolve_cp_token_ratios(sa1) is None
 
         # default path: no vector, no plan -> silent None, unchanged
-        del os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"]
+        del os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"]
         assert du.resolve_cp_token_ratios(sa) is None
     finally:
         if saved is None:
-            os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
+            os.environ.pop("FLLIPER_UNEVEN_TOKEN_VECTOR", None)
         else:
-            os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = saved
+            os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = saved
         import importlib
 
         importlib.reload(du)
@@ -1536,8 +1536,8 @@ class TestTreeSpecDcpGuardHardenedForNewFlagPaths(CustomTestCase):
             args.speculative_dflash_tree_verify = dflash_tree
         env = {
             **os.environ,
-            "SGLANG_UNEVEN_DCP": "1",
-            "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+            "FLLIPER_UNEVEN_DCP": "1",
+            "FLLIPER_UNEVEN_DCP_WEIGHTED": "1",
         }
         with patch.object(
             server_args_module, "is_hip", return_value=False
@@ -1820,7 +1820,7 @@ class TestDerivedReserveInfeasibility(CustomTestCase):
     }
 
     def _window_args(self, reserve):
-        from sglang.srt.model_executor.cuda_graph_config import (
+        from flliper.srt.model_executor.cuda_graph_config import (
             default_cuda_graph_config,
         )
 
@@ -1949,7 +1949,7 @@ class TestDerivedReserveInfeasibility(CustomTestCase):
     def test_the_exhausted_budget_message_carries_the_note(self):
         """The two halves meet: the ValueError the window saw now ends with
         the reason its own remedy line could not be followed."""
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
             ModelRunnerKVCacheMixin,
         )
 

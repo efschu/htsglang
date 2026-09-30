@@ -3,15 +3,15 @@ set -euo pipefail
 
 # Parse command line arguments
 OPTIONAL_DEPS=""
-SKIP_SGLANG_BUILD=""
+SKIP_FLLIPER_BUILD=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --skip-sglang-build) SKIP_SGLANG_BUILD="1"; shift;;
+    --skip-flliper-build) SKIP_FLLIPER_BUILD="1"; shift;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] [OPTIONAL_DEPS]"
       echo "Options:"
-      echo "  --skip-sglang-build         Don't build checkout sglang, use what was shipped with the image"
+      echo "  --skip-flliper-build         Don't build checkout flliper, use what was shipped with the image"
       exit 0
       ;;
     *)
@@ -43,7 +43,7 @@ if [ -d "$torch_extensions_dir" ]; then
         -delete
 fi
 
-WHL_DIR="/sglang-checkout/whl"
+WHL_DIR="/flliper-checkout/whl"
 if [ -d "$WHL_DIR" ] && compgen -G "${WHL_DIR}"/*.whl > /dev/null; then
     echo "Uninstall old packages based on wheel METADATA..."
     PKGS=$(
@@ -61,12 +61,12 @@ if [ -d "$WHL_DIR" ] && compgen -G "${WHL_DIR}"/*.whl > /dev/null; then
     ${PIP_INSTALL} "${WHL_DIR}"/*.whl --user
 fi
 
-if [ -n "$SKIP_SGLANG_BUILD" ]; then
-    echo "Didn't build checkout SGLang"
+if [ -n "$SKIP_FLLIPER_BUILD" ]; then
+    echo "Didn't build checkout fLLiper"
     exit 0
 else
     pip uninstall sgl-kernel -y || true
-    pip uninstall sglang -y || true
+    pip uninstall flliper -y || true
     # Clear Python cache to ensure latest code is used (works for any env: venv, system, conda)
     REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
     find "$REPO_ROOT" -name "*.pyc" -delete 2>/dev/null || true

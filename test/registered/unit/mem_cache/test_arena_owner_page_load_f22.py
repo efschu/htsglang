@@ -3,7 +3,7 @@
 MEASURED (marker audit x178 vs z30w-park vs z30x2-kvdemand, 29.09.): the
 posten that x178 did not have is the Form A worker's loadback after the wake.
 TP0's ``prepare_ms`` of the first post-wake pass equals the slowest worker's
-``WEG2-START-LOADING kv_issue_ms`` flip by flip (kvdemand 3717 / 3734 ms,
+``PDFLIP-START-LOADING kv_issue_ms`` flip by flip (kvdemand 3717 / 3734 ms,
 1967 / 1988, 682 / 716; z30w-park median 998 / 1033 ms, n=56) -- TP0 waits in
 ``prepare_for_extend`` for the workers. x178 (no cut): TP0 page load
 ``mode=dma``, ``kv=5`` ms. Under the cut (#239 S4b F13 3/7, 89164b8a59) a
@@ -30,14 +30,14 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import (
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import (
     CanonicalPageWindow,
     owner_row_window,
     owner_token_runs,
 )
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -181,7 +181,7 @@ def test_registered_slots_take_the_dma_runs(arena, monkeypatch):
     """The production form: the arena pre-pinned at bind (#1436), an NF page
     above 32 KiB -> "dma" (one copy per run of consecutive slots). Forced here
     by the mode env on the desk's tiny page; the lane scatter is the same."""
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", "dma")
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE", "dma")
     w2 = _pool(arena, W2)
     w2._all_pinned = True
     slots = [2, 3, 4, 7]
@@ -227,7 +227,7 @@ def _pool27(tmp_path):
 
 
 def test_27b_page_one_has_no_owner_rows():
-    from sglang.srt.managers.cache_controller import canonical_kv_owner_rows_for
+    from flliper.srt.managers.cache_controller import canonical_kv_owner_rows_for
 
     assert canonical_kv_owner_rows_for((3, 0, 2), 1, object()) is None
     assert canonical_kv_owner_rows_for((3, 0, 2), 64, object()) == (64, 3, 0, 2)  # NF: paged
@@ -270,7 +270,7 @@ def test_27b_load_is_the_unchanged_whole_page_call_and_bytes(tmp_path):
 
 
 def test_page_load_switch_off_keeps_the_gather(arena, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PAGE_LOAD", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PAGE_LOAD", "0")
     w1 = _pool(arena, W1)
     _fill(w1, [5])
     host = _owner_rows(w1, [5])

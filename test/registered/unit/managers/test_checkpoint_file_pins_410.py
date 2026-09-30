@@ -38,12 +38,12 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.session_checkpoint import (
+from flliper.srt.managers.session_checkpoint import (
     PinCoverageIncomplete,
     take_file_tier_pins,
 )
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from flliper.test.test_utils import CustomTestCase
 
 IDENTITY = "sha256:410filepins"
 PAGE = torch.arange(512, dtype=torch.uint8)
@@ -142,7 +142,7 @@ class TestTheRuntimeCallsIt(CustomTestCase):
     def test_checkpoint_takes_file_tier_pins(self):
         import inspect
 
-        from sglang.srt.managers.session_checkpoint import SessionCheckpointRuntime
+        from flliper.srt.managers.session_checkpoint import SessionCheckpointRuntime
 
         src = inspect.getsource(SessionCheckpointRuntime._checkpoint)
         self.assertIn("take_file_tier_pins", src)
@@ -150,7 +150,7 @@ class TestTheRuntimeCallsIt(CustomTestCase):
     def test_the_runtime_can_reach_a_store(self):
         import inspect
 
-        from sglang.srt.managers.session_checkpoint import SessionCheckpointRuntime
+        from flliper.srt.managers.session_checkpoint import SessionCheckpointRuntime
 
         src = inspect.getsource(SessionCheckpointRuntime._file_tier_store)
         self.assertIn("storage_backend", src)

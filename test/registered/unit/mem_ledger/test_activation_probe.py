@@ -11,8 +11,8 @@ import json
 import os
 
 
-from sglang.srt.mem_ledger import activation_probe as ap
-from sglang.srt.mem_ledger.activation import (
+from flliper.srt.mem_ledger import activation_probe as ap
+from flliper.srt.mem_ledger.activation import (
     ActivationProfile,
     FootprintProvenance,
     load_footprints,
@@ -200,7 +200,7 @@ def test_ingest_with_no_dumps_explains_how_to_produce_them(tmp_path, capsys):
     empty.mkdir()
     m = load_script()
     assert m.ingest(str(empty), str(tmp_path / "c")) == 1
-    assert "SGLANG_PHASE_FOOTPRINT_DUMP" in capsys.readouterr().out
+    assert "FLLIPER_PHASE_FOOTPRINT_DUMP" in capsys.readouterr().out
 
 
 def test_show_prints_the_shipped_bounds(capsys):

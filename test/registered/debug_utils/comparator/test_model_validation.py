@@ -4,30 +4,30 @@ import sys
 import pytest
 from pydantic import ValidationError
 
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
     TracedAlignerPlan,
     TracedSidePlan,
     TracedStepPlan,
     TracedSubPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.entrypoint.types import (
+from flliper.srt.debug_utils.comparator.aligner.entrypoint.types import (
     AlignerPerStepPlan,
     AlignerPlan,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.types import (
     PositionalSeqId,
     TokenAlignerPlan,
     TokenAlignerSeqInfo,
     TokenAlignerStepAux,
     TokenLocator,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
     AxisInfo,
     ConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
-from sglang.srt.debug_utils.comparator.output_types import (
+from flliper.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
+from flliper.srt.debug_utils.comparator.output_types import (
     ComparisonErrorRecord,
     ComparisonNonTensorRecord,
     ComparisonSkipRecord,
@@ -36,13 +36,13 @@ from sglang.srt.debug_utils.comparator.output_types import (
     SummaryRecord,
     parse_record_json,
 )
-from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
+from flliper.srt.debug_utils.comparator.tensor_comparator.types import (
     DiffInfo,
     TensorInfo,
     TensorStats,
 )
-from sglang.srt.debug_utils.comparator.utils import Pair, _check_equal_lengths
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.utils import Pair, _check_equal_lengths
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")

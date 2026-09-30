@@ -3,7 +3,7 @@ mamba window for the attention host must cover the WHOLE blob; the unit
 partition's one-unit-per-rank floor gave each worker one of 16 units and
 cut the host to 7/8 (51480576 of 58834944 bytes)."""
 
-from sglang.srt.mem_cache import hicache_migrate as hm
+from flliper.srt.mem_cache import hicache_migrate as hm
 
 
 def _spec():
@@ -30,6 +30,6 @@ def test_host_window_under_form_a_is_the_whole_blob():
 
 
 def test_draft_migrate_uses_the_same_rule():
-    from sglang.srt.mem_cache import draft_migrate as dm
+    from flliper.srt.mem_cache import draft_migrate as dm
 
     assert dm._partition(32, [1, 0, 0], 16) == [32, 0, 0]

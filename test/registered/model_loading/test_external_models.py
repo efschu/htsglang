@@ -1,13 +1,13 @@
 import unittest
 
-import sglang as sgl
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import (
+import flliper as sgl
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd")
@@ -16,8 +16,8 @@ register_cpu_ci(est_time=203, suite="base-c-test-cpu")
 
 class TestExternalModels(CustomTestCase):
     def test_external_model(self):
-        envs.SGLANG_EXTERNAL_MODEL_PACKAGE.set("sglang.test.external_models")
-        envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.set("sglang.test.external_models")
+        envs.FLLIPER_EXTERNAL_MODEL_PACKAGE.set("flliper.test.external_models")
+        envs.FLLIPER_EXTERNAL_MM_PROCESSOR_PACKAGE.set("flliper.test.external_models")
         prompt = "Today is a sunny day and I like"
         model_path = "Qwen/Qwen2-VL-2B-Instruct"
 

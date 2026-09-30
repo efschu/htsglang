@@ -39,8 +39,8 @@ fast path they had before.
 
 import os
 
-# The DSV4 attention module captures SGLANG_OPT_FP8_WO_A_GEMM at import time.
-os.environ.setdefault("SGLANG_OPT_FP8_WO_A_GEMM", "0")
+# The DSV4 attention module captures FLLIPER_OPT_FP8_WO_A_GEMM at import time.
+os.environ.setdefault("FLLIPER_OPT_FP8_WO_A_GEMM", "0")
 
 import unittest
 from types import SimpleNamespace
@@ -48,10 +48,10 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from sglang.srt.runtime_context import get_context, get_parallel, reset_context
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.runtime_context import get_context, get_parallel, reset_context
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
@@ -108,7 +108,7 @@ def _ensure_dist_initialized() -> None:
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
 
-    from sglang.srt.distributed.parallel_state import (
+    from flliper.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
         model_parallel_is_initialized,
@@ -196,7 +196,7 @@ class TestIsPackedLayerIsStructural(CustomTestCase):
     """The predicate itself: it reads the layer, never a quantization name."""
 
     def test_dense_weights_of_every_dtype_are_not_packed(self):
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         for dtype in (
             torch.bfloat16,
@@ -209,7 +209,7 @@ class TestIsPackedLayerIsStructural(CustomTestCase):
                 self.assertFalse(is_packed_layer(_dense_layer(None, dtype)))
 
     def test_a_qweight_only_layer_is_packed(self):
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         layer = _packed_layer(None)
         self.assertTrue(is_packed_layer(layer))
@@ -220,19 +220,19 @@ class TestIsPackedLayerIsStructural(CustomTestCase):
         # compressed-tensors registers `weight_packed`; DeepseekV2MLP aliases
         # it onto `weight` afterwards, but the predicate must be right for the
         # window before that and for every other caller.
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         self.assertTrue(is_packed_layer(_packed_layer(None, "weight_packed")))
 
     def test_a_layer_with_no_weights_at_all_is_packed(self):
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         self.assertTrue(is_packed_layer(nn.Module()))
 
     def test_it_agrees_with_dense_weight_dtype(self):
         # The two helpers must not be able to disagree; several sites use one
         # and several the other on the same layer.
-        from sglang.srt.models.deepseek_common.utils import (
+        from flliper.srt.models.deepseek_common.utils import (
             dense_weight_dtype,
             is_packed_layer,
         )
@@ -251,7 +251,7 @@ class TestNameListBlindSpots(CustomTestCase):
     """What the retired enumeration got wrong, format by format."""
 
     def test_packed_formats_the_name_list_missed_are_now_packed(self):
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         for quant_name in ("gptq", "gptq_marlin", "auto-round", "gguf", "bitsandbytes"):
             with self.subTest(quant=quant_name):
@@ -260,7 +260,7 @@ class TestNameListBlindSpots(CustomTestCase):
                 self.assertTrue(is_packed_layer(layer))
 
     def test_compressed_tensors_packed_scheme_is_now_packed(self):
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         layer = _packed_layer("compressed-tensors", "weight_packed")
         self.assertFalse(_retired_name_verdict(layer))
@@ -271,7 +271,7 @@ class TestNameListVerdictsPreserved(CustomTestCase):
     """Everything the enumeration did classify keeps its answer."""
 
     def test_the_awq_family_is_still_packed(self):
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         for quant_name in sorted(_RETIRED_PACKED_QUANT_NAMES):
             with self.subTest(quant=quant_name):
@@ -280,7 +280,7 @@ class TestNameListVerdictsPreserved(CustomTestCase):
                 self.assertTrue(is_packed_layer(layer))
 
     def test_dense_quantizations_are_still_dense(self):
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         for quant_name, dtype in (
             (None, torch.bfloat16),
@@ -296,7 +296,7 @@ class TestNameListVerdictsPreserved(CustomTestCase):
     def test_an_unquantized_layer_inside_an_awq_checkpoint_stays_dense(self):
         # Modules on the ignore list get UnquantizedLinearMethod, which has no
         # `quant_config`; both the old and the new rule must call them dense.
-        from sglang.srt.models.deepseek_common.utils import is_packed_layer
+        from flliper.srt.models.deepseek_common.utils import is_packed_layer
 
         layer = _dense_layer(None)
         layer.quant_method = SimpleNamespace()
@@ -332,7 +332,7 @@ class TestAttentionPackedFlagIsStructural(_ServerArgsFixture):
     def _build_v3(self, quant_config, **config_overrides):
         from transformers import DeepseekV3Config
 
-        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+        from flliper.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
         config = DeepseekV3Config(**{**_V3_CONFIG, **config_overrides})
         with torch.device("meta"), get_parallel().override(
@@ -341,7 +341,7 @@ class TestAttentionPackedFlagIsStructural(_ServerArgsFixture):
             return DeepseekV2ForCausalLM(config=config, quant_config=quant_config)
 
     def test_gguf_attention_reports_packed(self):
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
 
         model = self._build_v3(GGUFConfig())
         attn = model.model.layers[1].self_attn
@@ -361,7 +361,7 @@ class TestAttentionPackedFlagIsStructural(_ServerArgsFixture):
         # missed. GPTQ has no MoE method ("please use gptq_marlin"), so the
         # model is built with dense MLPs -- the attention module, which is the
         # site under test, is identical either way.
-        from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig
+        from flliper.srt.layers.quantization.gptq.gptq import GPTQConfig
 
         model = self._build_v3(
             GPTQConfig(
@@ -403,7 +403,7 @@ class TestEagle3ReplacementLayerUsesTheSameRule(_ServerArgsFixture):
     def _build_layer(self, quant_config):
         from transformers import DeepseekV3Config
 
-        from sglang.srt.models.kimi_k25_eagle3 import Eagle3MLADecoderLayer
+        from flliper.srt.models.kimi_k25_eagle3 import Eagle3MLADecoderLayer
 
         config = DeepseekV3Config(**_V3_CONFIG)
         with torch.device("meta"), get_parallel().override(
@@ -414,7 +414,7 @@ class TestEagle3ReplacementLayerUsesTheSameRule(_ServerArgsFixture):
             )
 
     def test_gguf_replacement_projection_reports_packed(self):
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
 
         attn = self._build_layer(GGUFConfig()).self_attn
         self.assertTrue(hasattr(attn.fused_qkv_a_proj_with_mqa, "qweight"))
@@ -439,7 +439,7 @@ class TestSharedExpertDtypeGatesUnchanged(_ServerArgsFixture):
     """
 
     def _build(self, quant_method, quant_config):
-        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+        from flliper.srt.models.deepseek_v2 import DeepseekV2MoE
 
         self.server_args.disable_shared_experts_fusion = True
         with torch.device("meta"):
@@ -451,7 +451,7 @@ class TestSharedExpertDtypeGatesUnchanged(_ServerArgsFixture):
             )
 
     def test_gguf_selects_neither_fast_path(self):
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
+        from flliper.srt.layers.quantization.gguf import GGUFConfig
 
         moe = self._build("gguf", GGUFConfig())
         self.assertTrue(hasattr(moe.shared_experts.gate_up_proj, "qweight"))
@@ -465,7 +465,7 @@ class TestSharedExpertDtypeGatesUnchanged(_ServerArgsFixture):
         self.assertFalse(moe.shared_experts_is_fp8)
 
     def test_block_fp8_still_selects_the_fp8_path(self):
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        from flliper.srt.layers.quantization.fp8 import Fp8Config
 
         moe = self._build(
             "fp8",
@@ -476,7 +476,7 @@ class TestSharedExpertDtypeGatesUnchanged(_ServerArgsFixture):
         self.assertEqual(moe.shared_experts_weight_block_size, [128, 128])
 
     def test_w8a8_int8_still_selects_the_int8_path(self):
-        from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+        from flliper.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
         moe = self._build("w8a8_int8", W8A8Int8Config())
         self.assertTrue(moe.shared_experts_is_int8)

@@ -4,9 +4,9 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -23,18 +23,18 @@ register_mlx_ci(est_time=1, suite="stage-b-e2e-mlx")
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 
 # qwen3_moe architecture (Qwen3MoeForCausalLM), served on the MLX backend.
-# The model runs through mlx_lm's own qwen3_moe implementation; the SGLang MLX
+# The model runs through mlx_lm's own qwen3_moe implementation; the fLLiper MLX
 # backend does not require any srt/models file for it. This test is a black-box
 # correctness guard for the served model. Qwen3 is a hybrid-thinking model, so
 # thinking is disabled to keep outputs short and deterministic.
 #
 # Default is the MLX-community 4-bit repo so the test is portable. Override with
-# SGLANG_MLX_TEST_MODEL to point at a local copy, e.g.
-#   SGLANG_MLX_TEST_MODEL=models/Qwen3-30B-A3B-4bit
-MODEL_PATH = os.environ.get("SGLANG_MLX_TEST_MODEL", "mlx-community/Qwen3-30B-A3B-4bit")
+# FLLIPER_MLX_TEST_MODEL to point at a local copy, e.g.
+#   FLLIPER_MLX_TEST_MODEL=models/Qwen3-30B-A3B-4bit
+MODEL_PATH = os.environ.get("FLLIPER_MLX_TEST_MODEL", "mlx-community/Qwen3-30B-A3B-4bit")
 
 # mem-fraction is tuned conservatively for a 24 GB Apple Silicon machine.
-MEM_FRACTION_STATIC = os.environ.get("SGLANG_MLX_TEST_MEM_FRACTION", "0.9")
+MEM_FRACTION_STATIC = os.environ.get("FLLIPER_MLX_TEST_MEM_FRACTION", "0.9")
 
 
 @unittest.skipUnless(_HAS_MLX, "requires mlx (Apple Silicon only)")
@@ -45,7 +45,7 @@ class TestQwen3MoeMlxCorrectness(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         env = os.environ.copy()
-        env["SGLANG_USE_MLX"] = "1"
+        env["FLLIPER_USE_MLX"] = "1"
 
         cls.process = popen_launch_server(
             cls.model,

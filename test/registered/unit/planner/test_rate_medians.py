@@ -16,9 +16,9 @@ the_window`` is the falsifier: drop the delta predicates in
 
 import unittest
 
-from sglang.srt.planner import rate_medians as rm
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import rate_medians as rm
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

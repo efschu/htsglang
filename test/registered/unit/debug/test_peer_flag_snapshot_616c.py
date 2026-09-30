@@ -8,7 +8,7 @@ import ctypes
 import re
 
 
-from sglang.srt.distributed.device_communicators import barlink_bar1 as B
+from flliper.srt.distributed.device_communicators import barlink_bar1 as B
 
 
 # --------------------------------------------------------------------------- #

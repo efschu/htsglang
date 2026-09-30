@@ -11,13 +11,13 @@ import contextlib
 
 import pytest
 
-from sglang.srt.constants import (
+from flliper.srt.constants import (
     GPU_MEMORY_TYPE_CUDA_GRAPH,
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
-from sglang.srt.flip_form_a_sleep import ROLE_HOST, ROLE_WORKER, Weg2FlipFormAUntagged
-from sglang.srt.flip_form_a_sleep_hook import FormASleepHook
+from flliper.srt.flip_form_a_sleep import ROLE_HOST, ROLE_WORKER, PdFlipFormAUntagged
+from flliper.srt.flip_form_a_sleep_hook import FormASleepHook
 
 _GIB = 1024**3
 
@@ -39,7 +39,7 @@ _WORKER_ALLOCS = [
 class StubSaver:
     """Records the call order; that order IS the assertion."""
 
-    __module__ = "tests.stub"  # not sglang.* -> skips the adapter-shape check
+    __module__ = "tests.stub"  # not flliper.* -> skips the adapter-shape check
 
     def __init__(self, bytes_by_tag=None, resume_fails=()):
         self.calls = []
@@ -59,7 +59,7 @@ class StubSaver:
     def resume(self, tag):
         self.calls.append(("resume", tag))
         if tag in self.resume_fails:
-            raise RuntimeError(f"W119 Weg2TmsResumeRefused tag={tag}")
+            raise RuntimeError(f"W119 PdFlipTmsResumeRefused tag={tag}")
         self.paused.discard(tag)
 
     def tag_bytes(self, tag):
@@ -103,25 +103,25 @@ def test_an_unnamed_allocation_cannot_slip_through_untagged():
     invisible to a call-site review, because nothing is written where nothing
     was done."""
     hook, _ = _host_hook()
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         with hook.region("hc_mixer_int8_buffer"):
             pass
     msg = str(exc.value)
-    assert "W118 Weg2FlipFormAUntagged" in msg
+    assert "W118 PdFlipFormAUntagged" in msg
     assert "invisible to review" in msg
 
 
 def test_a_host_region_on_a_worker_is_refused():
     saver = StubSaver()
     hook = FormASleepHook(saver, ROLE_WORKER, 1, clock=FakeClock())
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         with hook.region("host_kv_pool"):
             pass
     assert "layout bug" in str(exc.value)
 
 
 def test_an_unknown_role_fails_at_construction_not_at_the_first_flip():
-    with pytest.raises(Weg2FlipFormAUntagged):
+    with pytest.raises(PdFlipFormAUntagged):
         FormASleepHook(StubSaver(), "stage", 0)
 
 
@@ -148,7 +148,7 @@ def test_a_refused_flush_stops_the_sleep_before_any_pause():
     saver = StubSaver({GPU_MEMORY_TYPE_KV_CACHE: 4 * _GIB})
     hook, saver = _host_hook(saver=saver, flush_fn=lambda: False)
     saver.calls.clear()
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         hook.sleep()
     assert "flush_cache() refused" in str(exc.value)
     assert "memory_pool.py:1017" in str(exc.value)
@@ -192,14 +192,14 @@ def test_wake_resumes_graph_first_and_kv_last():
 def test_a_double_sleep_is_refused():
     hook, _ = _host_hook(flush_fn=lambda: True)
     hook.sleep()
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         hook.sleep()
     assert "already" in str(exc.value)
 
 
 def test_a_wake_without_a_sleep_is_refused():
     hook, _ = _host_hook()
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         hook.wake()
     assert "not \nasleep" in str(exc.value) or "not asleep" in str(exc.value).replace(
         "\n", " "
@@ -218,7 +218,7 @@ def test_a_card_that_cannot_fund_the_kv_refuses_before_resuming():
     )
     hook.sleep()
     saver.calls.clear()
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         hook.wake()
     msg = str(exc.value)
     assert "VOID" in msg
@@ -270,24 +270,24 @@ def test_the_adapters_own_landing_refusal_propagates():
 # Hazard 3: the exclusion is the adapter's, and it must be there
 # --------------------------------------------------------------------------
 def test_the_real_adapter_still_carries_the_abort_poll_exclusion():
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
     assert hasattr(tms, "_abort_poll_excluded")
 
 
-def test_a_downgraded_sglang_adapter_is_refused(monkeypatch):
-    from sglang.srt.utils import torch_memory_saver_adapter as tms
+def test_a_downgraded_flliper_adapter_is_refused(monkeypatch):
+    from flliper.srt.utils import torch_memory_saver_adapter as tms
 
-    class SglangShapedSaver(StubSaver):
-        __module__ = "sglang.srt.utils.torch_memory_saver_adapter"
+    class FlliperShapedSaver(StubSaver):
+        __module__ = "flliper.srt.utils.torch_memory_saver_adapter"
 
-    saver = SglangShapedSaver({GPU_MEMORY_TYPE_KV_CACHE: 1 * _GIB})
+    saver = FlliperShapedSaver({GPU_MEMORY_TYPE_KV_CACHE: 1 * _GIB})
     hook = FormASleepHook(saver, ROLE_HOST, 0, clock=FakeClock())
     for n in _HOST_ALLOCS:
         with hook.region(n):
             pass
     monkeypatch.delattr(tms, "_abort_poll_excluded")
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         hook.sleep()
     assert "_abort_poll_excluded" in str(exc.value)
     assert "Do not wrap it" in str(exc.value)
@@ -317,7 +317,7 @@ def test_the_report_line_carries_tag_bytes_and_ms():
 # --------------------------------------------------------------------------
 def test_a_tagless_request_resolves_per_role_not_to_all_types():
     """One group-wide request, two different populations."""
-    from sglang.srt.flip_form_a_sleep_hook import resolve_rpc_tags
+    from flliper.srt.flip_form_a_sleep_hook import resolve_rpc_tags
 
     host = resolve_rpc_tags(ROLE_HOST, None)
     worker = resolve_rpc_tags(ROLE_WORKER, None)
@@ -329,9 +329,9 @@ def test_a_tagless_request_resolves_per_role_not_to_all_types():
 def test_a_kv_request_to_a_worker_is_refused_not_filtered():
     """Filtering is the silent form: host pauses three, workers two, both
     answer OK, and the front reads one verdict for two different acts."""
-    from sglang.srt.flip_form_a_sleep_hook import resolve_rpc_tags
+    from flliper.srt.flip_form_a_sleep_hook import resolve_rpc_tags
 
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         resolve_rpc_tags(ROLE_WORKER, [GPU_MEMORY_TYPE_KV_CACHE])
     msg = str(exc.value)
     assert "does not own" in msg
@@ -339,7 +339,7 @@ def test_a_kv_request_to_a_worker_is_refused_not_filtered():
 
 
 def test_a_request_naming_only_owned_tags_passes_through():
-    from sglang.srt.flip_form_a_sleep_hook import resolve_rpc_tags
+    from flliper.srt.flip_form_a_sleep_hook import resolve_rpc_tags
 
     assert resolve_rpc_tags(ROLE_WORKER, [GPU_MEMORY_TYPE_WEIGHTS]) == [
         GPU_MEMORY_TYPE_WEIGHTS
@@ -347,7 +347,7 @@ def test_a_request_naming_only_owned_tags_passes_through():
 
 
 def test_the_group_fence_accepts_the_measured_form_a_shape():
-    from sglang.srt.flip_form_a_sleep_hook import assert_group_agrees
+    from flliper.srt.flip_form_a_sleep_hook import assert_group_agrees
 
     assert_group_agrees(
         [
@@ -360,9 +360,9 @@ def test_the_group_fence_accepts_the_measured_form_a_shape():
 
 
 def test_two_hosts_in_the_gather_is_a_disagreement():
-    from sglang.srt.flip_form_a_sleep_hook import assert_group_agrees
+    from flliper.srt.flip_form_a_sleep_hook import assert_group_agrees
 
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         assert_group_agrees([(0, ROLE_HOST, []), (1, ROLE_HOST, [])])
     assert "2 attention host(s)" in str(exc.value)
 
@@ -370,9 +370,9 @@ def test_two_hosts_in_the_gather_is_a_disagreement():
 def test_a_worker_that_slept_kv_is_a_disagreement():
     """Memory RAENGE-NIE-UNEINS: disagreement is CRASH/STOP, never a
     per-rank best effort."""
-    from sglang.srt.flip_form_a_sleep_hook import assert_group_agrees
+    from flliper.srt.flip_form_a_sleep_hook import assert_group_agrees
 
-    with pytest.raises(Weg2FlipFormAUntagged) as exc:
+    with pytest.raises(PdFlipFormAUntagged) as exc:
         assert_group_agrees(
             [
                 (0, ROLE_HOST, [GPU_MEMORY_TYPE_KV_CACHE]),
@@ -385,7 +385,7 @@ def test_a_worker_that_slept_kv_is_a_disagreement():
 
 
 def test_an_empty_gather_is_not_agreement():
-    from sglang.srt.flip_form_a_sleep_hook import assert_group_agrees
+    from flliper.srt.flip_form_a_sleep_hook import assert_group_agrees
 
-    with pytest.raises(Weg2FlipFormAUntagged):
+    with pytest.raises(PdFlipFormAUntagged):
         assert_group_agrees([])

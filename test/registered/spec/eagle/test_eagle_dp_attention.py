@@ -3,11 +3,11 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.send_one import BenchArgs, send_one_prompt
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.send_one import BenchArgs, send_one_prompt
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -60,7 +60,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "--cuda-graph-max-bs-decode",
             "64",
         ]
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
+        with envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

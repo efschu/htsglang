@@ -62,10 +62,10 @@ from __future__ import annotations
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
-from sglang.srt.managers.pp_admission_congruence import (  # noqa: E402
+from flliper.srt.managers.pp_admission_congruence import (  # noqa: E402
     PPAdmissionCongruenceGuard,
     build_pp_admission_decision,
     reconcile_pp_admission_decision,

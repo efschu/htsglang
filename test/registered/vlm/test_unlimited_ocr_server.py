@@ -5,8 +5,8 @@ import unittest
 import openai
 from PIL import Image, ImageDraw, ImageFont
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.vlm_utils import TestOpenAIMLLMServerBase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.vlm_utils import TestOpenAIMLLMServerBase
 
 register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
 
@@ -41,7 +41,7 @@ class TestUnlimitedOCRServer(TestOpenAIMLLMServerBase):
         img = Image.new("RGB", (640, 360), "white")
         draw = ImageDraw.Draw(img)
         draw.rectangle((24, 24, 616, 336), outline="black", width=4)
-        draw.text((72, 92), "SGLang OCR", fill="black", font=cls._font(56))
+        draw.text((72, 92), "fLLiper OCR", fill="black", font=cls._font(56))
         draw.text((72, 180), "12345", fill="black", font=cls._font(72))
 
         buffer = io.BytesIO()
@@ -75,7 +75,7 @@ class TestUnlimitedOCRServer(TestOpenAIMLLMServerBase):
         text = response.choices[0].message.content
         self.assertIsInstance(text, str)
         self.assertIn("12345", text)
-        self.assertIn("sglang", text.lower())
+        self.assertIn("flliper", text.lower())
         self.assertGreater(response.usage.prompt_tokens, 0)
         self.assertGreater(response.usage.completion_tokens, 0)
         self.assertGreater(response.usage.total_tokens, 0)

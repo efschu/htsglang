@@ -12,14 +12,14 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.speculative.cross_algo_utils import (
+from flliper.srt.speculative.cross_algo_utils import (
     derive_policy_switch_ctx,
     policy_lookup_index,
     policy_select,
     resolve_drafter_policy_table,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -68,11 +68,11 @@ class TestSwitchCtxDerivation(CustomTestCase):
     def test_factor_env_override(self):
         with tempfile.TemporaryDirectory() as d:
             self._write_cfg(d, {"sliding_window": 2048})
-            os.environ["SGLANG_CROSS_POLICY_CTX_FACTOR"] = "3"
+            os.environ["FLLIPER_CROSS_POLICY_CTX_FACTOR"] = "3"
             try:
                 ctx, _ = derive_policy_switch_ctx(d)
             finally:
-                del os.environ["SGLANG_CROSS_POLICY_CTX_FACTOR"]
+                del os.environ["FLLIPER_CROSS_POLICY_CTX_FACTOR"]
         self.assertEqual(ctx, 6144)
 
     def test_capped_at_mpe(self):
@@ -119,7 +119,7 @@ class TestTableResolution(CustomTestCase):
             _resolve("0:dflash:auto,4096:nextn:3")
 
     def test_policy_select_passes_auto_stage_through(self):
-        from sglang.srt.speculative.cross_algo_utils import policy_select
+        from flliper.srt.speculative.cross_algo_utils import policy_select
 
         table = [(0, DFLASH16), (4096, ("nextn", 0))]
         rung, _, _ = policy_select(table, [(5000, 64)], 8192, 0.8, NEXTN3)

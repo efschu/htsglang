@@ -49,13 +49,13 @@ Hermetic: no CUDA, no NVML, no pool. CUDA_VISIBLE_DEVICES="".
 
 import unittest
 
-from sglang.srt.managers.funding_authority import (
+from flliper.srt.managers.funding_authority import (
     CAUSE_FUNDED,
     CAUSE_PHANTOM,
     CAUSE_SCARCITY,
     authority_from_seam_snapshot,
 )
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     PhaseFlipRuntime,
     releasable_cache_bytes_from_stats,
 )

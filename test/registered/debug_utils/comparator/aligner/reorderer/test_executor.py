@@ -3,28 +3,28 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.reorderer.executor import (
+from flliper.srt.debug_utils.comparator.aligner.reorderer.executor import (
     _reorder_zigzag_to_natural,
     _reorder_zigzag_to_natural_thd,
     execute_reorderer_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.reorderer.types import (
+from flliper.srt.debug_utils.comparator.aligner.reorderer.types import (
     ReordererPlan,
     ZigzagToNaturalThdParams,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.executor import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.executor import (
     execute_unsharder_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
     CpThdConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import (
+from flliper.srt.debug_utils.comparator.dims_spec import (
     ParallelAxis,
     apply_dim_names,
     without_dim_names,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")

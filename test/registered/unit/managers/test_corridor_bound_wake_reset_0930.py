@@ -11,7 +11,7 @@ Metal (y3r, ...dauer09292330, D TP1 = 3080, wake 18 at 23:45:28-30):
 and in between '[#656 CORRIDOR-ADMISSION] NARROWED ... from 4096 to 64 tokens:
 the card can fund -124 MiB ... the full width prices at 198 MiB' plus the
 group's '#794 GROUP-NARROWED ... from 4096 to 64'. The 220-token extend of
-weg2-35-47 ran as 64 + 156 (2490 + 1922 ms) while the card had ~2100 MiB free
+pdflip-35-47 ran as 64 + 156 (2490 + 1922 ms) while the card had ~2100 MiB free
 and the 158-row piece measured a 67 MiB transient.
 
 The tests model that sequence with the gate's own arithmetic (price 198 MiB at
@@ -28,9 +28,9 @@ from types import SimpleNamespace  # noqa: E402
 
 import pytest  # noqa: E402
 
-from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.managers.corridor_admission import PrefillAdmissionGate  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.environ import envs  # noqa: E402
+from flliper.srt.managers.corridor_admission import PrefillAdmissionGate  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -66,7 +66,7 @@ def _gate(monkeypatch, wake_t=500.0):
             tp_size=1,
             gdn_prefill_scratch_mib=lambda share, tokens: PRICE_4096_MIB * tokens / 4096.0,
         ),
-        _weg2_last_wake_t=wake_t,
+        _pdflip_last_wake_t=wake_t,
     )
     gate = PrefillAdmissionGate(sched)
     guard = _Guard()
@@ -86,7 +86,7 @@ def _dormant_then_wake(sched, gate, guard, clock):
         assert gate.granted_width(4096) == 64  # dormant: the card is P's
         clock.t += 1.0
     guard.free_mib = 2443.8
-    sched._weg2_last_wake_t = 900.0  # weight_updater: '...admission seams admit'
+    sched._pdflip_last_wake_t = 900.0  # weight_updater: '...admission seams admit'
     clock.t += 0.4
 
 
@@ -126,7 +126,7 @@ def test_no_second_reset_without_a_new_wake(monkeypatch):
 
 
 def test_switch_off_is_the_old_window(monkeypatch):
-    with envs.SGLANG_WEG2_CORRIDOR_BOUND_WAKE_RESET.override(False):
+    with envs.FLLIPER_PDFLIP_CORRIDOR_BOUND_WAKE_RESET.override(False):
         sched, gate, guard, clock = _gate(monkeypatch)
         _dormant_then_wake(sched, gate, guard, clock)
         assert gate.granted_width(4096) == 64
@@ -134,9 +134,9 @@ def test_switch_off_is_the_old_window(monkeypatch):
 
 
 def test_no_wake_attribute_is_byte_identical(monkeypatch):
-    """Non-weg2 boots never write _weg2_last_wake_t: the window never resets."""
+    """Non-pdflip boots never write _pdflip_last_wake_t: the window never resets."""
     sched, gate, guard, clock = _gate(monkeypatch, wake_t=None)
-    del sched._weg2_last_wake_t
+    del sched._pdflip_last_wake_t
     for _ in range(3):
         gate.granted_width(4096)
         clock.t += 1.0

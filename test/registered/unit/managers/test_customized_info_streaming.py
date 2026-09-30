@@ -5,16 +5,16 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.layers.sampler import Sampler, register_sampler_backend
-from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.mock_model.utils import MOCK_MODEL_PATH
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.entrypoints.engine import Engine
+from flliper.srt.layers.sampler import Sampler, register_sampler_backend
+from flliper.srt.managers.scheduler import run_scheduler_process
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.mock_model.utils import MOCK_MODEL_PATH
+from flliper.test.test_utils import CustomTestCase
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from flliper.srt.layers.logits_processor import LogitsProcessorOutput
+    from flliper.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=120, stage="stage-b", runner_config="1-gpu-small-amd")

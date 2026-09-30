@@ -27,19 +27,19 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
-from sglang.srt.layers.attention.triton_backend import (
+from flliper.srt.distributed.utils import get_cp_token_ratios, set_cp_token_ratios
+from flliper.srt.layers.attention.triton_backend import (
     TritonAttnBackend,
     replicated_kv_reindex,
 )
-from sglang.srt.layers.dcp.owner import (
+from flliper.srt.layers.dcp.owner import (
     dcp_weighted_owned_lengths,
     dcp_weighted_owner_bounds,
     dcp_weighted_read_slots,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -99,8 +99,8 @@ class TestTritonWeightedDcpWiring(CustomTestCase):
         -- must be call sites of ONE expression. If a future refactor gives the
         Triton backend its own copy of the owner rule, this fails.
         """
-        import sglang.srt.layers.attention.flashinfer_backend as fb
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.flashinfer_backend as fb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         for mod in (fb, tb):
             src = pathlib.Path(mod.__file__).read_text()
@@ -314,7 +314,7 @@ class TestTritonWeightedDcpWiring(CustomTestCase):
         are False whenever no --rank-tp-ratio plan is installed. Pinned in
         source so a later edit cannot leak a weighted branch into the default
         path without this failing."""
-        import sglang.srt.layers.attention.triton_backend as tb
+        import flliper.srt.layers.attention.triton_backend as tb
 
         src = pathlib.Path(tb.__file__).read_text()
         for line in src.splitlines():

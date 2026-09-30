@@ -31,10 +31,10 @@
     "own_vram_timeout_s": 180,
     "budget": {"target_low_s": 10.0, "target_high_s": 20.0, "ceiling_s": 60.0},
     "env": {
-      "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
-      "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
-      "SGLANG_UNEVEN_DCP": "1",
-      "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+      "FLLIPER_ENABLE_METRICS_DEVICE_TIMER": "1",
+      "FLLIPER_MAMBA_SSM_DTYPE": "bfloat16",
+      "FLLIPER_UNEVEN_DCP": "1",
+      "FLLIPER_UNEVEN_DCP_WEIGHTED": "1",
       "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
     }
   },

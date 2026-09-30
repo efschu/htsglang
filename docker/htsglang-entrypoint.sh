@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Entrypoint for the htsglang (uneven-TP sglang fork) runtime image.
+# Entrypoint for the htsglang (uneven-TP flliper fork) runtime image.
 #
 # Every launch_server flag that this fork adds, plus the stock flags a
 # deployment normally touches, is exposed as an environment variable. Empty ENV
 # => the flag is omitted entirely, so a variable can be cleared to fall back to
-# sglang's own default (e.g. RANK_GPU_ID="" disables the uneven-TP mapping).
+# flliper's own default (e.g. RANK_GPU_ID="" disables the uneven-TP mapping).
 # Any extra arguments passed to `docker run` are appended verbatim AFTER the
 # generated arg list, so they win for single-value argparse flags and can add
 # flags this script does not know about.
@@ -31,19 +31,19 @@
 # a flag variable regains a non-empty one.
 #
 # Defaults here are deliberately NEUTRAL — a bare `docker run` behaves like a
-# stock sglang image (TP=1, no speculation, no HiCache, no rank mapping). The
+# stock flliper image (TP=1, no speculation, no HiCache, no rank mapping). The
 # rig-specific production profile lives in docker/htsglang.yml and
 # docker/htsglang.env.example, not in this file.
 #
 # Modes (MODE, default "server"):
-#   server    python3 -m sglang.launch_server   (the OpenAI-compatible server)
-#   planner   python3 -m sglang.planner --serve (the web UI; it starts sglang
+#   server    python3 -m flliper.launch_server   (the OpenAI-compatible server)
+#   planner   python3 -m flliper.planner --serve (the web UI; it starts flliper
 #                                                itself, inside this container)
 #
 # Escape hatches:
 #   docker run ... --help               -> print this ENV surface and exit
 #   docker run ... bash                 -> interactive shell
-#   docker run ... python -m sglang...  -> fully custom command
+#   docker run ... python -m flliper...  -> fully custom command
 set -euo pipefail
 
 usage() {
@@ -87,19 +87,19 @@ already generated overrides it.
   RANK_VOCAB_RATIO               override the vocab/lm_head split
   RANK_KV_RATIO                  capacity|speed|explicit — KV token split
   RANK_PERF_TUNE                 auto-performance planner
-  BASE_GPU_ID                    stock sglang path; only when RANK_GPU_ID=""
+  BASE_GPU_ID                    stock flliper path; only when RANK_GPU_ID=""
   DCP_SIZE                       decode context parallel size
   SWA_POOL_SIZING                cap|ratio (required =cap for SWA-DCP)
-  SGLANG_UNEVEN_MLP_VECTOR       MLP self-calibration vector; the first boot
+  FLLIPER_UNEVEN_MLP_VECTOR       MLP self-calibration vector; the first boot
                                  suggests one, set it and restart
 
 --- second node ------------------------------------------------------------
   NNODES                         total nodes (>1 enables multi-node)
   NODE_RANK                      0 on the head node
   DIST_INIT_ADDR                 <head-ip>:<port>, reachable from both nodes
-  SGLANG_BARLINK                   1 = host-staged cross-vendor collectives
-  SGLANG_BARLINK_TRANSPORT         ucx|shm|gloo
-  SGLANG_BARLINK_UCX_LIB           path to a matching libucp.so.0
+  FLLIPER_BARLINK                   1 = host-staged cross-vendor collectives
+  FLLIPER_BARLINK_TRANSPORT         ucx|shm|gloo
+  FLLIPER_BARLINK_UCX_LIB           path to a matching libucp.so.0
   UCX_TLS UCX_IB_GID_INDEX UCX_NET_DEVICES
                                  passed through unchanged
   Note: barlink synchronises with the host inside every collective, so it
@@ -119,7 +119,7 @@ already generated overrides it.
                                  the same file
   SPECULATIVE_DRAFT_PLACEMENT    where the draft model lives
   SPECULATIVE_CROSS_ALGORITHM    NEXTN<->DFLASH ladder
-  DISABLE_CUDA_GRAPH             1 disables CUDA graphs (sglang's flag name)
+  DISABLE_CUDA_GRAPH             1 disables CUDA graphs (flliper's flag name)
   ENFORCE_EAGER                  1, alias for the same thing
 
 --- caches that survive a restart ------------------------------------------
@@ -151,13 +151,13 @@ already generated overrides it.
 
 --- planner / GUI mode (MODE=planner) --------------------------------------
   PLANNER_HOST PLANNER_PORT      web UI bind (default 0.0.0.0:8780)
-  PLANNER_ARGS                   extra `python -m sglang.planner` arguments
-  SGLANG_MODEL_ROOTS             os.pathsep-separated dirs the UI scans for
+  PLANNER_ARGS                   extra `python -m flliper.planner` arguments
+  FLLIPER_MODEL_ROOTS             os.pathsep-separated dirs the UI scans for
                                  models (default ~/.cache/huggingface/hub and
                                  ./models, the latter CWD-relative)
-  SGLANG_PLANNER_PROFILES        saved config profiles JSON
-  SGLANG_PLANNER_GRAPH_ANCHORS   CUDA-graph memory anchors JSON
-  The planner starts sglang itself, in this container, as a subprocess group.
+  FLLIPER_PLANNER_PROFILES        saved config profiles JSON
+  FLLIPER_PLANNER_GRAPH_ANCHORS   CUDA-graph memory anchors JSON
+  The planner starts flliper itself, in this container, as a subprocess group.
   It has NO authentication: anyone who reaches the port can start, stop and
   download models. Publish it to 127.0.0.1 only, or put it behind a proxy.
   The planner reads NVML for its short hardware probe. Clock and power control
@@ -165,7 +165,7 @@ already generated overrides it.
   container even as root with full capabilities — run those on the host.
 
 --- state directories (bind-mount these) -----------------------------------
-  /root/.cache/sglang            hw_profile-*.json (rig probe) and
+  /root/.cache/flliper            hw_profile-*.json (rig probe) and
                                  kv_budget-*.json (measured KV budget). Losing
                                  it costs a re-probe on every boot
   /root/.cache/flashinfer        flashinfer JIT cubins. Losing it costs
@@ -208,8 +208,8 @@ add_flag() { # add_flag <flag> <bool-ish> : append flag when value is truthy
 # The HiCache file backend reads this env var and falls back to /tmp/hicache
 # when it is unset, which is INSIDE the container's writable layer and dies
 # with the container. Exporting it here is what makes the mount effective.
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR:-$HICACHE_STORAGE_DIR}"
-mkdir -p "$SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR" 2>/dev/null || true
+export FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR="${FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR:-$HICACHE_STORAGE_DIR}"
+mkdir -p "$FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR" 2>/dev/null || true
 
 # --- planner / GUI mode ---------------------------------------------------
 : "${MODE:=server}"
@@ -217,7 +217,7 @@ if [ "$MODE" = "planner" ] || [ "$MODE" = "gui" ]; then
     : "${PLANNER_HOST:=0.0.0.0}"
     : "${PLANNER_PORT:=8780}"
     : "${PLANNER_ARGS:=}"
-    # The planner spawns `python3 -m sglang.launch_server` in its own process
+    # The planner spawns `python3 -m flliper.launch_server` in its own process
     # group and reaps it itself, but a crashed worker can still orphan onto
     # PID 1. Run the container with an init process (compose: `init: true`,
     # docker run: `--init`) so orphans get reaped.
@@ -226,7 +226,7 @@ if [ "$MODE" = "planner" ] || [ "$MODE" = "gui" ]; then
         echo "[htsglang-entrypoint] and it can start, stop and download models." >&2
         echo "[htsglang-entrypoint] Publish this port to 127.0.0.1 only." >&2
     fi
-    args=(python3 -m sglang.planner --serve --host "$PLANNER_HOST" --port "$PLANNER_PORT")
+    args=(python3 -m flliper.planner --serve --host "$PLANNER_HOST" --port "$PLANNER_PORT")
     # shellcheck disable=SC2206  # deliberate word splitting
     [ -n "$PLANNER_ARGS" ] && args+=($PLANNER_ARGS)
     args+=("$@")
@@ -280,7 +280,7 @@ fi
 : "${RANK_PERF_TUNE:=}"
 : "${DCP_SIZE:=}"
 : "${SWA_POOL_SIZING:=}"
-# BASE_GPU_ID is only meaningful when RANK_GPU_ID is empty (stock sglang path).
+# BASE_GPU_ID is only meaningful when RANK_GPU_ID is empty (stock flliper path).
 : "${BASE_GPU_ID:=}"
 
 # --- second node ----------------------------------------------------------
@@ -289,8 +289,8 @@ fi
 : "${DIST_INIT_ADDR:=}"
 # barlink and UCX are read from the environment by the fork / by libucp; export
 # whatever the caller set so the values reach the worker processes unchanged.
-for v in SGLANG_BARLINK SGLANG_BARLINK_TRANSPORT SGLANG_BARLINK_UCX_LIB \
-         SGLANG_BARLINK_UCX_OVERLAP UCX_TLS UCX_IB_GID_INDEX UCX_NET_DEVICES; do
+for v in FLLIPER_BARLINK FLLIPER_BARLINK_TRANSPORT FLLIPER_BARLINK_UCX_LIB \
+         FLLIPER_BARLINK_UCX_OVERLAP UCX_TLS UCX_IB_GID_INDEX UCX_NET_DEVICES; do
     if [ -n "${!v:-}" ]; then export "${v?}"; fi
 done
 
@@ -339,9 +339,9 @@ done
 : "${EXTRA_ARGS:=}"
 
 # --- uneven-TP runtime knobs (passed through to the process) --------------
-export SGLANG_UNEVEN_MLP_VECTOR="${SGLANG_UNEVEN_MLP_VECTOR:-}"
+export FLLIPER_UNEVEN_MLP_VECTOR="${FLLIPER_UNEVEN_MLP_VECTOR:-}"
 
-args=(python3 -m sglang.launch_server)
+args=(python3 -m flliper.launch_server)
 
 add --model-path "$MODEL_PATH"
 add --served-model-name "$SERVED_MODEL_NAME"
@@ -375,7 +375,7 @@ add --speculative-num-draft-tokens "$SPECULATIVE_NUM_DRAFT_TOKENS"
 add --speculative-draft-model-path "$SPECULATIVE_DRAFT_MODEL_PATH"
 add --speculative-draft-placement "$SPECULATIVE_DRAFT_PLACEMENT"
 add --speculative-cross-algorithm "$SPECULATIVE_CROSS_ALGORITHM"
-# sglang has no --enforce-eager (that is vLLM's spelling); the equivalent is
+# flliper has no --enforce-eager (that is vLLM's spelling); the equivalent is
 # --disable-cuda-graph. ENFORCE_EAGER is kept as an alias because the fork's
 # own notes use that word for the barlink requirement. Either variable sets the
 # same flag, and the flag is emitted at most once.

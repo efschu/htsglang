@@ -26,10 +26,10 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache import memory_pool_host as mph
-from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache import memory_pool_host as mph
+from flliper.srt.mem_cache.memory_pool_host import MambaPoolHost
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -102,7 +102,7 @@ class TestTheMiBBranchIsMinSynced(CustomTestCase):
         """L9: the #1035 provenance line carries synced_from_local=<local>
         so a later reader can see which rank bound the group."""
         group = _GroupMin(group_min=64)
-        with self.assertLogs("sglang.srt.mem_cache.memory_pool_host", level="INFO") as logs:
+        with self.assertLogs("flliper.srt.mem_cache.memory_pool_host", level="INFO") as logs:
             _build(PER_SLOT_PP2, group, anchor_host_mib=ANCHOR_MIB)
         prov = [line for line in logs.output if "#1035 ANCHOR-POOL PROVENANCE" in line]
         self.assertEqual(len(prov), 1, logs.output)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mutant harness for the #1273 B4i slice: the uncovered conv/5-D population
-# (weight_exchange.py) and the WEG2-XCHG-RESERVE emission (launcher.py).
+# (weight_exchange.py) and the PDFLIP-XCHG-RESERVE emission (launcher.py).
 #
 # SAME SNAPSHOT DISCIPLINE AS tools/mutants_b4h.sh AND FOR THE SAME MEASURED
 # REASON: a harness that restores with `git checkout --` reverts to the last
@@ -65,15 +65,15 @@ if before == after:
 PY
 }
 
-MS=python/sglang/srt/managers/weg2_memory_saver.py
-FR=python/sglang/srt/weg2/front.py
-WX=python/sglang/srt/weg2/weight_exchange.py
-SH=python/sglang/srt/weg2/weight_exchange_shadow.py
-T="test/registered/unit/weg2/test_weg2_xchg_draft_family_1273.py
-test/registered/unit/weg2/test_weg2_xchg_cover_1273.py
-test/registered/unit/weg2/test_weg2_coverage_verdict_1273.py
-test/registered/unit/weg2/test_weg2_xchg_shadow_1273.py
-test/registered/unit/weg2/test_weg2_xchg_manifest_1311.py"
+MS=python/flliper/srt/managers/pdflip_memory_saver.py
+FR=python/flliper/srt/pdflip/front.py
+WX=python/flliper/srt/pdflip/weight_exchange.py
+SH=python/flliper/srt/pdflip/weight_exchange_shadow.py
+T="test/registered/unit/pdflip/test_pdflip_xchg_draft_family_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_cover_1273.py
+test/registered/unit/pdflip/test_pdflip_coverage_verdict_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_shadow_1273.py
+test/registered/unit/pdflip/test_pdflip_xchg_manifest_1311.py"
 
 if [ "${1:-}" = "--selfcheck" ]; then
   PLANT="# MUTANT-HARNESS-SELFCHECK-PLANTED-$$"
@@ -147,12 +147,12 @@ m "M9 the rotation predicate reverts to CHUNK-only (the draft runner refuses its
   '        if ms.is_weights_chunk_tag(g.tag)}))'
 
 m "M10 a default provider built for ANOTHER runner wins again (draft plan keyed on the target's region)" "$WX" \
-  '        theirs = getattr(current, "_weg2_default_region", None)
+  '        theirs = getattr(current, "_pdflip_default_region", None)
         if theirs is None or theirs == str(region_tag):
             return False' \
   '        return False'
 m "M11 an EXPLICITLY registered provider is replaced too (every caller silently disarmed)" "$WX" \
-  '        theirs = getattr(current, "_weg2_default_region", None)
+  '        theirs = getattr(current, "_pdflip_default_region", None)
         if theirs is None or theirs == str(region_tag):
             return False' \
   '        pass'

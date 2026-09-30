@@ -26,9 +26,9 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-import sglang.srt.layers.quantization.gptq.gptq as gptq_mod
-import sglang.srt.layers.quantization.marlin_utils as marlin_utils
-from sglang.srt.layers.quantization.gptq.gptq import GPTQMarlinConfig
+import flliper.srt.layers.quantization.gptq.gptq as gptq_mod
+import flliper.srt.layers.quantization.marlin_utils as marlin_utils
+from flliper.srt.layers.quantization.gptq.gptq import GPTQMarlinConfig
 
 
 def _config(**overrides):
@@ -84,8 +84,8 @@ class TestDelegatedConfig(unittest.TestCase):
     """What apply_gptq_quant_layer actually hands to MoeWNA16."""
 
     def _delegate(self, use_marlin: bool):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-        from sglang.srt.layers.quantization import auto_round as ar
+        from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from flliper.srt.layers.quantization import auto_round as ar
 
         seen = {}
 
@@ -113,7 +113,7 @@ class TestDelegatedConfig(unittest.TestCase):
         cfg.get_layer_config = lambda layer, prefix: (4, 128, True)
 
         layer = FusedMoE.__new__(FusedMoE)
-        import sglang.srt.layers.quantization.moe_wna16 as wna
+        import flliper.srt.layers.quantization.moe_wna16 as wna
 
         # Both helpers are imported INSIDE apply_gptq_quant_layer
         # (auto_round.py:328-331), so they are patched at their source module.

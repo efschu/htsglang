@@ -6,7 +6,7 @@ Auto-tune Triton FP8/INT8 block-wise quantization kernels for optimal performanc
 
 **Use Triton FP8 Block-wise Quantization Kernel when:**
 - Output dtype is NOT `bfloat16` (e.g., `float16`, `float32`)
-- DeepGEMM is disabled (environment variable `SGLANG_ENABLE_JIT_DEEPGEMM=0`)
+- DeepGEMM is disabled (environment variable `FLLIPER_ENABLE_JIT_DEEPGEMM=0`)
 - Running on GPUs with compute capability < SM90 (DeepGEMM requires SM90+)
 - You need cross-platform compatibility (Triton works on both NVIDIA and AMD GPUs)
 
@@ -17,7 +17,7 @@ Auto-tune Triton FP8/INT8 block-wise quantization kernels for optimal performanc
 
 **Note:** DeepGEMM requires CUDA compute capability >= 9.0 (SM90+). It is specifically optimized for NVIDIA Hopper GPUs (H100/H200).
 
-The kernel selection logic in SGLang automatically chooses DeepGEMM when conditions are met (see `w8a8_block_fp8_matmul` function in `fp8_kernel.py`), otherwise falls back to Triton implementation.
+The kernel selection logic in fLLiper automatically chooses DeepGEMM when conditions are met (see `w8a8_block_fp8_matmul` function in `fp8_kernel.py`), otherwise falls back to Triton implementation.
 
 ## Quick Start
 
@@ -78,7 +78,7 @@ python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 5120 --K 1
 
 ## Output
 
-Generates JSON config files saved to `python/sglang/srt/layers/quantization/configs/`:
+Generates JSON config files saved to `python/flliper/srt/layers/quantization/configs/`:
 ```
 N={N},K={K},device_name={DEVICE},dtype=fp8_w8a8,block_shape=[128,128].json
 ```

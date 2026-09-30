@@ -1,9 +1,9 @@
 import unittest
 
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
-from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.kits.kl_divergence_kit import KLDivergenceMixin
+from flliper.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 

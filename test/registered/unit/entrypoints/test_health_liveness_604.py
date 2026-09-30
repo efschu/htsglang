@@ -1,7 +1,7 @@
 """#604: /health fast path must check scheduler subprocess liveness.
 
 Before this fix, GET /health with
-SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION disabled returned 200 unconditionally
+FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION disabled returned 200 unconditionally
 without checking whether the scheduler/detokenizer subprocesses were alive.
 This meant a server with dead schedulers could still appear healthy to external
 monitors.
@@ -18,14 +18,14 @@ import types
 import unittest
 from typing import List
 
-from sglang.srt.entrypoints.http_server import (
+from flliper.srt.entrypoints.http_server import (
     _GlobalState,
     _health_fast_path,
     _make_health_error_json,
     set_global_state,
 )
-from sglang.srt.utils.watchdog import SubprocessWatchdog
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.utils.watchdog import SubprocessWatchdog
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -257,7 +257,7 @@ class TestHealthFastPathLogging(unittest.TestCase):
     def setUp(self):
         self.handler = _ErrorCapture()
         self.handler.setLevel(logging.ERROR)
-        logger = logging.getLogger("sglang.srt.entrypoints.http_server")
+        logger = logging.getLogger("flliper.srt.entrypoints.http_server")
         logger.addHandler(self.handler)
         logger.setLevel(logging.DEBUG)
 
@@ -266,7 +266,7 @@ class TestHealthFastPathLogging(unittest.TestCase):
         _make_global_state(watchdog=_FakeWatchdog(processes=procs, names=names))
 
     def tearDown(self):
-        logger = logging.getLogger("sglang.srt.entrypoints.http_server")
+        logger = logging.getLogger("flliper.srt.entrypoints.http_server")
         logger.removeHandler(self.handler)
 
     def test_error_log_fires(self):
@@ -289,7 +289,7 @@ class TestHealthFastPathLogging(unittest.TestCase):
 
 class TestADeadRankIsUnhealthyOnTheDefaultPath(unittest.TestCase):
     """#604's liveness check was real but only reachable with
-    SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0, which is NOT the default.
+    FLLIPER_ENABLE_HEALTH_ENDPOINT_GENERATION=0, which is NOT the default.
 
     On a default boot /health goes to the generation path instead, and that
     path returns 200 as soon as ``last_receive_tstamp`` moves -- which any
@@ -316,7 +316,7 @@ class TestADeadRankIsUnhealthyOnTheDefaultPath(unittest.TestCase):
     def _call(self, path: str):
         import asyncio
 
-        from sglang.srt.entrypoints.http_server import health_generate
+        from flliper.srt.entrypoints.http_server import health_generate
 
         request = types.SimpleNamespace(url=types.SimpleNamespace(path=path))
         return asyncio.run(health_generate(request))
@@ -341,7 +341,7 @@ class TestADeadRankIsUnhealthyOnTheDefaultPath(unittest.TestCase):
 
 
 def _global_state_tokenizer_manager():
-    from sglang.srt.entrypoints.http_server import _global_state
+    from flliper.srt.entrypoints.http_server import _global_state
 
     return _global_state.tokenizer_manager
 

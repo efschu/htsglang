@@ -5,9 +5,9 @@ import torch
 import triton
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=5, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -85,7 +85,7 @@ def torch_top_p_renorm_probs(probs, top_p, eps=1e-5):
 
 
 def calculate_diff_top_k_renorm(batch_size, vocab_size, k):
-    """Compare Torch reference and SGLang kernel for top-k renorm correctness."""
+    """Compare Torch reference and fLLiper kernel for top-k renorm correctness."""
     torch.manual_seed(42)
     device = torch.device("cuda")
 
@@ -95,13 +95,13 @@ def calculate_diff_top_k_renorm(batch_size, vocab_size, k):
     top_k_tensor = torch.full((batch_size,), k, device=device, dtype=torch.int32)
 
     torch_output = torch_top_k_renorm_probs(probs, top_k_tensor)
-    sglang_output = sgl_kernel.top_k_renorm_prob(probs, top_k_tensor)
+    flliper_output = sgl_kernel.top_k_renorm_prob(probs, top_k_tensor)
 
-    torch.testing.assert_close(torch_output, sglang_output, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(torch_output, flliper_output, rtol=1e-3, atol=1e-3)
 
 
 def calculate_diff_top_p_renorm(batch_size, vocab_size, p):
-    """Compare Torch reference and SGLang kernel for top-p renorm correctness."""
+    """Compare Torch reference and fLLiper kernel for top-p renorm correctness."""
     torch.manual_seed(42)
     device = torch.device("cuda")
 
@@ -111,9 +111,9 @@ def calculate_diff_top_p_renorm(batch_size, vocab_size, p):
     top_p_tensor = torch.full((batch_size,), p, device=device, dtype=torch.float32)
 
     torch_output = torch_top_p_renorm_probs(probs, top_p_tensor)
-    sglang_output = sgl_kernel.top_p_renorm_prob(probs, top_p_tensor)
+    flliper_output = sgl_kernel.top_p_renorm_prob(probs, top_p_tensor)
 
-    torch.testing.assert_close(torch_output, sglang_output, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(torch_output, flliper_output, rtol=1e-3, atol=1e-3)
 
 
 # Parameter space - simplified for CI
@@ -137,7 +137,7 @@ configs_p = list(itertools.product(batch_size_range, vocab_size_range, p_range))
         x_names=["batch_size", "vocab_size", "k"],
         x_vals=configs_k,
         line_arg="provider",
-        line_vals=["torch", "sglang"],
+        line_vals=["torch", "flliper"],
         line_names=["Torch Reference", "SGL Kernel"],
         styles=[("red", "-"), ("green", "-")],
         ylabel="us",
@@ -159,7 +159,7 @@ def benchmark_top_k_renorm(batch_size, vocab_size, k, provider):
 
     if provider == "torch":
         fn = lambda: torch_top_k_renorm_probs(probs.clone(), top_k_tensor)
-    elif provider == "sglang":
+    elif provider == "flliper":
         fn = lambda: sgl_kernel.top_k_renorm_prob(probs.clone(), top_k_tensor)
 
     return run_benchmark_no_cudagraph(fn)
@@ -170,7 +170,7 @@ def benchmark_top_k_renorm(batch_size, vocab_size, k, provider):
         x_names=["batch_size", "vocab_size", "p"],
         x_vals=configs_p,
         line_arg="provider",
-        line_vals=["torch", "sglang"],
+        line_vals=["torch", "flliper"],
         line_names=["Torch Reference", "SGL Kernel"],
         styles=[("red", "-"), ("blue", "-")],
         ylabel="us",
@@ -188,7 +188,7 @@ def benchmark_top_p_renorm(batch_size, vocab_size, p, provider):
 
     if provider == "torch":
         fn = lambda: torch_top_p_renorm_probs(probs.clone(), top_p_tensor)
-    elif provider == "sglang":
+    elif provider == "flliper":
         fn = lambda: sgl_kernel.top_p_renorm_prob(probs.clone(), top_p_tensor)
 
     return run_benchmark_no_cudagraph(fn)

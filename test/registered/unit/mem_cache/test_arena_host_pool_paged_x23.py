@@ -9,7 +9,7 @@ takes the arena form at ANY page size; only a paged DRAFT pool, a per-key
 sidecar addressed by the KV ids, stays the plain class.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -18,11 +18,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.mem_cache.pool_host.mha import (
+from flliper.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _pool(page_size):
@@ -30,27 +30,27 @@ def _pool(page_size):
 
 
 class TestArenaHostPoolChooser(CustomTestCase):
-    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_ARENA_HOST": "1"})
+    @mock.patch.dict(os.environ, {"FLLIPER_HICACHE_ARENA_HOST": "1"})
     def test_a_paged_kv_pool_takes_the_arena(self):
         """x59: page_size 64 gets the (now paged) arena pool -- one L2."""
-        from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+        from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
 
         self.assertIs(get_mha_host_pool_cls(_pool(64)), ArenaMHAHostPool)
 
-    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_ARENA_HOST": "1"})
+    @mock.patch.dict(os.environ, {"FLLIPER_HICACHE_ARENA_HOST": "1"})
     def test_a_paged_draft_pool_keeps_the_regular_host_pool(self):
         """The paged draft page is a per-key sidecar addressed by the KV
         pool's ids; the arena pool's draft role is token-paged only."""
         self.assertIs(get_mha_host_pool_cls(_pool(64), role="draft"), MHATokenToKVPoolHost)
 
-    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_ARENA_HOST": "1"})
+    @mock.patch.dict(os.environ, {"FLLIPER_HICACHE_ARENA_HOST": "1"})
     def test_a_token_paged_pool_still_gets_the_arena(self):
-        from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+        from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
 
         self.assertIs(get_mha_host_pool_cls(_pool(1)), ArenaMHAHostPool)
         self.assertIs(get_mha_host_pool_cls(_pool(1), role="draft"), ArenaMHAHostPool)
 
-    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_ARENA_HOST": "0"})
+    @mock.patch.dict(os.environ, {"FLLIPER_HICACHE_ARENA_HOST": "0"})
     def test_arena_off_keeps_the_regular_host_pool(self):
         self.assertIs(get_mha_host_pool_cls(_pool(64)), MHATokenToKVPoolHost)
 

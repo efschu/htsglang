@@ -49,7 +49,7 @@ def test_the_shared_constructor_still_adds_a_page():
     """The +1 is the whole reason equality was the wrong invariant. Pinned as a
     fact about the shared constructor, so a future reader does not have to
     re-derive it from a boot log."""
-    from sglang.srt.mem_cache.pool_host import base
+    from flliper.srt.mem_cache.pool_host import base
 
     src = inspect.getsource(base)
     assert "self.page_num = self.size // self.page_size + 1" in src, (
@@ -84,7 +84,7 @@ def _refusal_message(cached_size, primary_size):
     """Drive the real check with two sizes, returning the raised message."""
     import types
 
-    from sglang.srt.mem_cache import kv_cache_builder as kcb
+    from flliper.srt.mem_cache import kv_cache_builder as kcb
 
     class _Algo:
         def is_none(self):
@@ -170,7 +170,7 @@ def test_a_draft_refusal_is_not_reported_as_a_rebind_refusal():
     """W37-C printed '#719 HiCache rebind refused' six times for a TARGET
     rebind that had ALREADY committed -- generation advanced 1..5 and the
     coherence check passed. The draft leg must own its own failure."""
-    from sglang.srt.mem_cache import hicache_phase_binding as binding
+    from flliper.srt.mem_cache import hicache_phase_binding as binding
 
     src = inspect.getsource(binding.rebind_for_cutover)
     assert "rebind_hicache_draft_for_phase" in src
@@ -185,7 +185,7 @@ def test_a_draft_refusal_is_not_reported_as_a_rebind_refusal():
 
 
 def test_the_committed_generation_is_still_returned_on_a_draft_refusal():
-    from sglang.srt.mem_cache import hicache_phase_binding as binding
+    from flliper.srt.mem_cache import hicache_phase_binding as binding
 
     src = inspect.getsource(binding.rebind_for_cutover)
     tail = src[src.index("rebind_hicache_draft_for_phase(scheduler") :]

@@ -4,9 +4,9 @@ Performance tests for single GPU that need H200 (80GB) - FP8 and EAGLE tests.
 
 import unittest
 
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_TARGET_MODEL_EAGLE,

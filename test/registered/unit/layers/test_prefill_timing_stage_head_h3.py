@@ -1,6 +1,6 @@
 """H3 (23.09.): the prefill timing instruments must flush on EVERY pipeline stage.
 
-Bug (black box): with SGLANG_MOE_OFFLOAD_TIMING=1 a PP3 boot logged
+Bug (black box): with FLLIPER_MOE_OFFLOAD_TIMING=1 a PP3 boot logged
 MOE-OFFLOAD-TIMING-PREFILL and ATTN-TIMING-PREFILL on stage 0 only. fn7t
 (19.09.) has 100 such lines, all PP0. The flush waited for "layer 0 again",
 and only stage 0 runs layer 0 -- stage 1 of the Next-Flash P group starts at
@@ -15,7 +15,7 @@ line with all of that stage's layers in it. On the pre-fix code no line is
 emitted at all.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -23,7 +23,7 @@ import logging
 import unittest
 from unittest import mock
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Ev:
@@ -47,7 +47,7 @@ class _Capture(logging.Handler):
 
 class TestStageHead(CustomTestCase):
     def test_learned_head_is_the_first_layer_seen(self):
-        from sglang.srt.layers.prefill_timing import StageHead
+        from flliper.srt.layers.prefill_timing import StageHead
 
         h = StageHead()
         # stage 1 of a 29/11/8 split: layers 29..39, two forwards
@@ -63,7 +63,7 @@ class TestStageHead(CustomTestCase):
 
 class TestWaveTimingFlushesOffStageZero(CustomTestCase):
     def test_moe_prefill_line_on_a_stage_starting_at_layer_29(self):
-        from sglang.srt.layers.moe import expert_offload as eo
+        from flliper.srt.layers.moe import expert_offload as eo
 
         cap = _Capture()
         log = logging.getLogger(eo.__name__)

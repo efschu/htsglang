@@ -57,7 +57,7 @@ from test_gguf_mxfp4_native import (  # noqa: E402  (same directory)
     synthetic_blocks,
 )
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 # #511: TestToleranceInstrument below is hermetic (no CUDA, no wheel), so this
 # file now carries CPU CI weight even though every kernel gate still skips.
@@ -404,7 +404,7 @@ class TestMXFP4MoE(unittest.TestCase):
     def test_moe_mmq_matches_a_per_expert_reference(self):
         from sgl_kernel import ggml_moe_a8, ggml_moe_get_block_size
 
-        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        from flliper.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
             moe_align_block_size,
         )
 

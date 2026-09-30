@@ -15,7 +15,7 @@ sync in front of it grew. The cases pin what the next boot's reading needs:
   switch off emits no PLE-GATHER-HOST line (cost zero).
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -29,18 +29,18 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers import host_contention as hc
-from sglang.srt.layers import prefill_timing as pt
-from sglang.srt.models import qwen4_exp_ple_table as ple
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.layers import host_contention as hc
+from flliper.srt.layers import prefill_timing as pt
+from flliper.srt.models import qwen4_exp_ple_table as ple
+from flliper.test.test_utils import CustomTestCase
 
 _STAT = (
     "cpu  100 20 30 1000 50 5 5 10 0 0\n"
     "cpu0 50 10 15 500 25 2 2 5 0 0\n"
     "intr 12345\n"
 )
-_SELF = "4242 (sglang::sch) (x) R 1 2 3 4 5 6 7 8 9 10 70 30 0 0 20 0 33 0\n"
+_SELF = "4242 (flliper::sch) (x) R 1 2 3 4 5 6 7 8 9 10 70 30 0 0 20 0 33 0\n"
 _PSI = "some avg10=0.00 avg60=0.28 avg300=0.38 total=1543408\nfull avg10=0.00 avg60=0.07 avg300=0.03 total=290955\n"
 _ARC = (
     "13 1 0x01 147 39984 1 2\n"
@@ -59,7 +59,7 @@ class TestParsers(CustomTestCase):
         self.assertEqual(total, busy + 1000 + 50)
 
     def test_self_stat_counts_from_last_paren(self):
-        # comm "(sglang::sch) (x)" holds ") (" -- utime 70 + stime 30
+        # comm "(flliper::sch) (x)" holds ") (" -- utime 70 + stime 30
         self.assertEqual(hc.parse_self_stat(_SELF), 100)
 
     def test_psi_and_arc_and_schedstat(self):
@@ -147,7 +147,7 @@ class TestHostPeriod(CustomTestCase):
         pt._PERIOD.last = None
 
     def _lines(self, on, calls):
-        with envs.SGLANG_MOE_OFFLOAD_TIMING.override(on), self.assertLogs(pt.logger, level=logging.INFO) as cm:
+        with envs.FLLIPER_MOE_OFFLOAD_TIMING.override(on), self.assertLogs(pt.logger, level=logging.INFO) as cm:
             pt.logger.info("sentinel")
             for _ in range(calls):
                 pt.log_ple_gather(262144, 0, 1.1, 32)
@@ -227,7 +227,7 @@ class TestGatherLine(CustomTestCase):
 
     def _run(self, on):
         out = torch.empty((self.ids.numel(), 8), dtype=torch.bfloat16)
-        with envs.SGLANG_MOE_OFFLOAD_TIMING.override(on), self.assertLogs(pt.logger, level=logging.INFO) as cm:
+        with envs.FLLIPER_MOE_OFFLOAD_TIMING.override(on), self.assertLogs(pt.logger, level=logging.INFO) as cm:
             pt.logger.info("sentinel")
             self.g.gather_into(self.ids, out, vocab_start=0, vocab_end=150)
         return out, [r.getMessage() for r in cm.records]

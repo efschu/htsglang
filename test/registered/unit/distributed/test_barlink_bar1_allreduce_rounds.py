@@ -6,7 +6,7 @@ shard 6.67 MiB per rank against a slot of 7.996 MiB. One round, 20 % headroom.
 The tipping point is a payload above ``3 x 8188 KiB``, i.e. **above 2456 tokens
 per batch** -- and above it ``handles()`` said False and the payload fell back
 to the base transport without a single line saying so. ``chunked_prefill_size``
-4096 or 8192, both usual in sglang, would have switched the direct path off in
+4096 or 8192, both usual in flliper, would have switched the direct path off in
 prefill silently.
 
 all_gather and broadcast have had ceil rounds for a while (``ag_plan`` /
@@ -23,13 +23,13 @@ import logging
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
     a2a_rounds,
     ar_plan,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -311,7 +311,7 @@ class TestLoudFallbackNotice(CustomTestCase):
     """
 
     def _comm(self, transport, group="tp:0"):
-        from sglang.srt.distributed.device_communicators.barlink import (
+        from flliper.srt.distributed.device_communicators.barlink import (
             BarlinkCommunicator,
         )
 
@@ -323,7 +323,7 @@ class TestLoudFallbackNotice(CustomTestCase):
         return c
 
     def _select(self, c, op, nbytes):
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         with mock.patch.object(mod, "graph_capture_running", lambda: False):
             return mod.BarlinkCommunicator._select(c, op, nbytes)
@@ -331,10 +331,10 @@ class TestLoudFallbackNotice(CustomTestCase):
     def test_an_uncovered_size_is_announced_with_op_bytes_and_reason(self):
         c = self._comm(_stub())
         with self.assertLogs(
-            "sglang.srt.distributed.device_communicators.barlink", level="WARNING"
-        ) as protokoll:
+            "flliper.srt.distributed.device_communicators.barlink", level="WARNING"
+        ) as log_lines:
             self.assertIsNone(self._select(c, "reduce_scatter", 65536))
-        text = "\n".join(protokoll.output)
+        text = "\n".join(log_lines.output)
         self.assertIn("reduce_scatter", text)
         self.assertIn("65536", text)
         self.assertIn("tp:0", text)
@@ -345,54 +345,54 @@ class TestLoudFallbackNotice(CustomTestCase):
         """The negative control. A notice that always fires is not one."""
         c = self._comm(_stub())
         logger = logging.getLogger(
-            "sglang.srt.distributed.device_communicators.barlink"
+            "flliper.srt.distributed.device_communicators.barlink"
         )
-        with mock.patch.object(logger, "warning") as warnung:
+        with mock.patch.object(logger, "warning") as warning:
             self.assertIsNotNone(self._select(c, "all_reduce", _bytes(2048)))
             self.assertIsNotNone(self._select(c, "all_reduce", _bytes(8192)))
             self.assertIsNotNone(self._select(c, "broadcast", 128))
-        warnung.assert_not_called()
+        warning.assert_not_called()
 
     def test_the_size_that_used_to_fall_through_silently_is_now_covered(self):
         """The original trigger case: 4096-token prefill. No notice,
         because no fallback -- that is the whole point of the rounds."""
         c = self._comm(_stub())
         logger = logging.getLogger(
-            "sglang.srt.distributed.device_communicators.barlink"
+            "flliper.srt.distributed.device_communicators.barlink"
         )
-        with mock.patch.object(logger, "warning") as warnung:
+        with mock.patch.object(logger, "warning") as warning:
             self.assertIsNotNone(self._select(c, "all_reduce", _bytes(4096)))
-        warnung.assert_not_called()
+        warning.assert_not_called()
 
     def test_it_speaks_once_per_op_and_size_class(self):
         """In the hot path the same sizes recur a thousandfold."""
         c = self._comm(_stub())
         logger = logging.getLogger(
-            "sglang.srt.distributed.device_communicators.barlink"
+            "flliper.srt.distributed.device_communicators.barlink"
         )
-        with mock.patch.object(logger, "warning") as warnung:
+        with mock.patch.object(logger, "warning") as warning:
             for _ in range(50):
                 self._select(c, "reduce_scatter", 65536)
-            self.assertEqual(warnung.call_count, 1)
+            self.assertEqual(warning.call_count, 1)
             # A different size class is a new operating point.
             self._select(c, "reduce_scatter", 65536 * 64)
-            self.assertEqual(warnung.call_count, 2)
+            self.assertEqual(warning.call_count, 2)
 
     def test_each_group_speaks_for_itself(self):
         """tp and dcp get differently sized windows -- what fits in one
         need not fit in the other."""
         logger = logging.getLogger(
-            "sglang.srt.distributed.device_communicators.barlink"
+            "flliper.srt.distributed.device_communicators.barlink"
         )
-        with mock.patch.object(logger, "warning") as warnung:
+        with mock.patch.object(logger, "warning") as warning:
             for group in ("tp:0", "dcp:0"):
                 self._select(self._comm(_stub(), group), "reduce_scatter", 65536)
-            self.assertEqual(warnung.call_count, 2)
+            self.assertEqual(warning.call_count, 2)
 
     def test_under_capture_the_bar_still_wins(self):
         """Under capture there is no fallback, hence no notice about one
         either -- it aborts there instead, and that stays that way."""
-        from sglang.srt.distributed.device_communicators import barlink as mod
+        from flliper.srt.distributed.device_communicators import barlink as mod
 
         c = self._comm(_stub())
         with mock.patch.object(mod, "graph_capture_running", lambda: True):
@@ -437,7 +437,7 @@ class TestWhyNot(CustomTestCase):
 
     def test_a_switched_off_op_says_which_switch(self):
         t = _stub(bc_on=False)
-        self.assertIn("SGLANG_BARLINK_BAR1_BC", t.why_not("broadcast", 128))
+        self.assertIn("FLLIPER_BARLINK_BAR1_BC", t.why_not("broadcast", 128))
 
 
 if __name__ == "__main__":

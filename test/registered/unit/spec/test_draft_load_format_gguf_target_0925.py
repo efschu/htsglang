@@ -48,23 +48,23 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-import sglang.srt.configs.load_config as load_config_mod
-import sglang.srt.distributed.parallel_state as parallel_state
-import sglang.srt.model_executor.model_runner as MR
-import sglang.srt.speculative.dflash_draft_kv_producer as dkp
-import sglang.srt.speculative.dflash_worker_v2 as dfw
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.model_loader.loader import (
+import flliper.srt.configs.load_config as load_config_mod
+import flliper.srt.distributed.parallel_state as parallel_state
+import flliper.srt.model_executor.model_runner as MR
+import flliper.srt.speculative.dflash_draft_kv_producer as dkp
+import flliper.srt.speculative.dflash_worker_v2 as dfw
+from flliper.srt.configs.load_config import LoadConfig, LoadFormat
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.model_loader.loader import (
     DefaultModelLoader,
     GGUFModelLoader,
     get_model_loader,
 )
-from sglang.srt.runtime_context import get_context
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.runtime_context import get_context
+from flliper.srt.server_args import ServerArgs
+from flliper.srt.speculative.spec_info import SpeculativeAlgorithm
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -250,7 +250,7 @@ class SpecPath(CustomTestCase):
 
     def test_the_flag_does_not_rewrite_the_targets_load_format(self):
         """The old process-wide override made the TARGET's load_format 'auto'
-        for the rest of the process; every later reader of it (the weg2 wake
+        for the rest of the process; every later reader of it (the pdflip wake
         disk-reload of a .gguf target) then read the draft's format."""
         draft = _DraftDir()
         args = _target_args(draft.path, draft_flag="auto")
@@ -274,7 +274,7 @@ class EagleShape(CustomTestCase):
     straight to TpModelWorker(is_draft_worker=True) -- no draft copy."""
 
     def _build(self, args, **extra):
-        from sglang.srt.managers.tp_worker import TpModelWorker
+        from flliper.srt.managers.tp_worker import TpModelWorker
 
         with _build_scope(args):
             with self.assertRaises(_StopAtLoaderChoice) as cm:

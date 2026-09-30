@@ -7,18 +7,18 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers import cache_controller as manager_cache_controller
-from sglang.srt.managers.cache_controller import CacheOperation as ManagerCacheOperation
-from sglang.srt.managers.cache_controller import (
+from flliper.srt.managers import cache_controller as manager_cache_controller
+from flliper.srt.managers.cache_controller import CacheOperation as ManagerCacheOperation
+from flliper.srt.managers.cache_controller import (
     HiCacheController,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from flliper.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from flliper.srt.mem_cache.hybrid_cache import hybrid_cache_controller
+from flliper.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
 )
-from sglang.srt.mem_cache.memory_pool_host import (
+from flliper.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
     DSAIndexerPoolHost,
@@ -27,15 +27,15 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MambaPoolHost,
     PoolEntry,
 )
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from flliper.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
-MHA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mha"
-MLA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mla"
+MEMORY_POOL_HOST_MODULE = "flliper.srt.mem_cache.memory_pool_host"
+MHA_POOL_HOST_MODULE = "flliper.srt.mem_cache.pool_host.mha"
+MLA_POOL_HOST_MODULE = "flliper.srt.mem_cache.pool_host.mla"
 
 
 def _indices(start: int, end: int) -> torch.Tensor:

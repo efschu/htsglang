@@ -35,7 +35,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.planner.objective import (
+from flliper.srt.planner.objective import (
     EnergyModel,
     Objective,
     Provenance,
@@ -43,8 +43,8 @@ from sglang.srt.planner.objective import (
     boot_energy_anchors,
     energy_per_work,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -61,7 +61,7 @@ class TestBootAnchorSourcing(CustomTestCase):
     def test_measured_rows_win_and_mark_the_rig_measured(self):
         rows = {"uuid-a": _Row(30.0, 300.0), "uuid-b": _Row(90.0, 320.0)}
         with mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value=rows,
         ):
             em, notes = boot_energy_anchors(
@@ -74,10 +74,10 @@ class TestBootAnchorSourcing(CustomTestCase):
         self.assertTrue(all("measured" in n for n in notes))
 
     def test_unmeasured_card_falls_to_the_tdp_estimate_tier(self):
-        from sglang.srt.planner.roofline import IDLE_FRACTION_OF_TDP
+        from flliper.srt.planner.roofline import IDLE_FRACTION_OF_TDP
 
         with mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
             em, notes = boot_energy_anchors(["RTX 5090"], None)
@@ -93,7 +93,7 @@ class TestBootAnchorSourcing(CustomTestCase):
     def test_one_measured_and_one_estimated_card_is_an_estimate_rig(self):
         rows = {"uuid-a": _Row(30.0, 300.0)}
         with mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value=rows,
         ):
             em, _ = boot_energy_anchors(
@@ -105,7 +105,7 @@ class TestBootAnchorSourcing(CustomTestCase):
         # NOT "price the ones we know": a partial rig would rank by whichever
         # cards happened to have data.
         with mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
             em, notes = boot_energy_anchors(["Some Unlisted GPU"], None)
@@ -114,7 +114,7 @@ class TestBootAnchorSourcing(CustomTestCase):
 
     def test_no_cards_is_unpriceable(self):
         with mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
             em, notes = boot_energy_anchors([], None)
@@ -123,7 +123,7 @@ class TestBootAnchorSourcing(CustomTestCase):
 
     def test_a_broken_calibration_file_degrades_to_the_estimate_tier(self):
         with mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             side_effect=OSError("unreadable"),
         ):
             em, _ = boot_energy_anchors(["RTX 5090"], ["uuid-a"])
@@ -160,14 +160,14 @@ class TestBootRefusesRatherThanSubstitute(CustomTestCase):
         )
 
     def test_unpriceable_rig_raises_with_the_named_reason(self):
-        from sglang.srt.uneven_perf import _boot_energy_model
+        from flliper.srt.uneven_perf import _boot_energy_model
 
         # A card the library has no TDP for, and no measured row either.
         with mock.patch(
-            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            "flliper.srt.uneven_perf.get_cached_hardware_profile",
             return_value=self._profile("Some Unlisted GPU"),
         ), mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
             with self.assertRaises(ValueError) as ctx:
@@ -180,13 +180,13 @@ class TestBootRefusesRatherThanSubstitute(CustomTestCase):
         self.assertIn("power calibration", msg)
 
     def test_missing_card_identities_raise(self):
-        from sglang.srt.uneven_perf import _boot_energy_model
+        from flliper.srt.uneven_perf import _boot_energy_model
 
         # An EMPTY profile is the "no per-rank card identities" case: the
         # planner cannot name a single card, which is a planning-path gap
         # rather than a pricing failure, and the two must not read alike.
         with mock.patch(
-            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            "flliper.srt.uneven_perf.get_cached_hardware_profile",
             return_value=({"gpus": {}}, []),
         ):
             with self.assertRaises(ValueError) as ctx:
@@ -196,10 +196,10 @@ class TestBootRefusesRatherThanSubstitute(CustomTestCase):
     def test_an_unreadable_profile_also_raises_the_identity_error(self):
         # Best-effort read: a profile that throws must not propagate a random
         # exception out of the planner, it must land on the named refusal.
-        from sglang.srt.uneven_perf import _boot_energy_model
+        from flliper.srt.uneven_perf import _boot_energy_model
 
         with mock.patch(
-            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            "flliper.srt.uneven_perf.get_cached_hardware_profile",
             side_effect=OSError("unreadable"),
         ):
             with self.assertRaises(ValueError) as ctx:
@@ -207,14 +207,14 @@ class TestBootRefusesRatherThanSubstitute(CustomTestCase):
         self.assertIn("no per-rank card identities", str(ctx.exception))
 
     def test_a_priceable_rig_returns_a_model_and_logs_the_tier(self):
-        from sglang.srt.uneven_perf import _boot_energy_model
+        from flliper.srt.uneven_perf import _boot_energy_model
 
         lines = []
         with mock.patch(
-            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            "flliper.srt.uneven_perf.get_cached_hardware_profile",
             return_value=self._profile("RTX 5090", "RTX 3080 20GB"),
         ), mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
             em = _boot_energy_model(
@@ -229,13 +229,13 @@ class TestBootRefusesRatherThanSubstitute(CustomTestCase):
         # The identity read maps ranks through rank_gpu_id -> cuda_index, so
         # a reordered or partial rank map must be honoured rather than the
         # profile's own ordering being assumed.
-        from sglang.srt.uneven_perf import _boot_energy_model
+        from flliper.srt.uneven_perf import _boot_energy_model
 
         with mock.patch(
-            "sglang.srt.uneven_perf.get_cached_hardware_profile",
+            "flliper.srt.uneven_perf.get_cached_hardware_profile",
             return_value=self._profile("RTX 5090", "RTX 3080 20GB"),
         ), mock.patch(
-            "sglang.srt.planner.power_calibration.load_power_profile",
+            "flliper.srt.planner.power_calibration.load_power_profile",
             return_value={},
         ):
             em = _boot_energy_model(
@@ -248,13 +248,13 @@ class TestBootRefusesRatherThanSubstitute(CustomTestCase):
 
 class TestObjectiveGate(CustomTestCase):
     def test_the_gate_is_off_by_default(self):
-        from sglang.srt.uneven_perf import _objective_is_energy
+        from flliper.srt.uneven_perf import _objective_is_energy
 
         self.assertFalse(_objective_is_energy(SimpleNamespace()))
         self.assertFalse(_objective_is_energy(SimpleNamespace(objective="throughput")))
 
     def test_the_gate_is_on_for_energy(self):
-        from sglang.srt.uneven_perf import _objective_is_energy
+        from flliper.srt.uneven_perf import _objective_is_energy
 
         self.assertTrue(_objective_is_energy(SimpleNamespace(objective="energy")))
         self.assertTrue(
@@ -262,7 +262,7 @@ class TestObjectiveGate(CustomTestCase):
         )
 
     def test_an_unknown_objective_raises_at_the_gate(self):
-        from sglang.srt.uneven_perf import _objective_is_energy
+        from flliper.srt.uneven_perf import _objective_is_energy
 
         with self.assertRaises(ValueError):
             _objective_is_energy(SimpleNamespace(objective="cheap"))
@@ -292,7 +292,7 @@ class TestPerRankTimesRefactor(CustomTestCase):
     """The factored helper must return exactly what the inline loop maxed."""
 
     def _times(self, model, gemm, family=None):
-        from sglang.srt.uneven_perf import PerfCostModel
+        from flliper.srt.uneven_perf import PerfCostModel
 
         return PerfCostModel.per_rank_prefill_compute_times(
             model, [1, 1, 1], gemm, family
@@ -353,7 +353,7 @@ class TestEnergySelectionSemantics(CustomTestCase):
         # The boot loop only prices ADMISSIBLE candidates; this pins the
         # intent as an explicit statement so a later edit that prices
         # inadmissible ones fails review with a test behind it.
-        from sglang.srt import uneven_perf
+        from flliper.srt import uneven_perf
 
         src = uneven_perf.apply_auto_performance.__code__.co_consts
         self.assertTrue(
@@ -379,7 +379,7 @@ class TestDefaultBootPathUnchanged(CustomTestCase):
     def test_throughput_selection_is_still_argmax_gain(self):
         import inspect
 
-        from sglang.srt import uneven_perf
+        from flliper.srt import uneven_perf
 
         text = inspect.getsource(uneven_perf.apply_auto_performance)
         # The throughput branch keeps the original comparison verbatim.
@@ -389,7 +389,7 @@ class TestDefaultBootPathUnchanged(CustomTestCase):
     def test_energy_state_is_inert_without_the_flag(self):
         # energy_model stays None, so the elif is the only reachable branch
         # and the loop behaves exactly as before.
-        from sglang.srt.uneven_perf import _objective_is_energy
+        from flliper.srt.uneven_perf import _objective_is_energy
 
         self.assertFalse(_objective_is_energy(SimpleNamespace()))
         self.assertEqual(math.inf, float("inf"))

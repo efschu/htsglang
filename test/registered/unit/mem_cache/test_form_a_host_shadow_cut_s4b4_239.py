@@ -52,7 +52,7 @@ class _CutRank(H._Rank):
         self.rebound = []
         self.cache_controller.mem_pool_host.arena_read = True  # part 3: workers have the arena
 
-    def _weg2_rebind_host_to_arena(self, node):
+    def _pdflip_rebind_host_to_arena(self, node):
         h = node.hash_value[-1]
         if not all(h in self.arena["written"][o] for o in OWNERS):
             return False
@@ -75,7 +75,7 @@ def _write(arena, owner, depth):
 @pytest.fixture
 def cut(monkeypatch):
     """The token cut is active on every rank (group-uniform by construction)."""
-    from sglang.srt import rank_role
+    from flliper.srt import rank_role
 
     monkeypatch.setattr(rank_role, "form_a_token_cut_active", lambda: True)
     yield
@@ -189,7 +189,7 @@ def test_a_tree_reset_drops_the_waiting_pages(cut):
 def test_without_the_cut_the_pre_part4_path(monkeypatch):
     """Guard: no cut -> R12 as before (TP0 rebinds at its ack, a worker keeps
     its byteless rows, no REBIND on the wire)."""
-    from sglang.srt import rank_role
+    from flliper.srt import rank_role
 
     monkeypatch.setattr(rank_role, "form_a_token_cut_active", lambda: False)
     ranks, arena = _cut_ranks(1)

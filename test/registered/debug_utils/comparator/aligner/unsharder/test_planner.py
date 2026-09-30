@@ -2,7 +2,7 @@ import sys
 
 import pytest
 
-from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.planner import (
     _compute_dependent_axes,
     _is_dependent_axis,
     _is_jointly_determined,
@@ -10,14 +10,14 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.planner import (
     _validate_replicated_axes_orthogonal,
     compute_unsharder_plan,
 )
-from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
     AxisInfo,
     ConcatParams,
     PickParams,
     ReduceSumParams,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, parse_dims
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.debug_utils.comparator.dims_spec import ParallelAxis, parse_dims
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=1, suite="base-c-test-cpu")
@@ -329,7 +329,7 @@ class TestComputeUnsharderPlan:
 
     def test_same_dim_cp_sp_with_thd(self) -> None:
         """t[cp:zigzag,sp] with THD: SP → ConcatParams, CP → CpThdConcatParams."""
-        from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
+        from flliper.srt.debug_utils.comparator.aligner.unsharder.types import (
             CpThdConcatParams,
         )
 

@@ -33,15 +33,15 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import parallel_state
-from sglang.srt.distributed.utils import (
+from flliper.srt.configs.model_config import ModelConfig
+from flliper.srt.distributed import parallel_state
+from flliper.srt.distributed.utils import (
     set_cp_token_ratios,
     set_tp_partition_ratios,
     uneven_dcp_kv_replicated,
 )
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
-from sglang.srt.managers.phase_flip_boot import (
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from flliper.srt.managers.phase_flip_boot import (
     TP_STACK_OVERRIDDEN_FIELDS,
     PhaseFlipBootError,
     PhaseFlipStacks,
@@ -52,7 +52,7 @@ from sglang.srt.managers.phase_flip_boot import (
     parse_flip_vector,
     snapshot_and_free,
 )
-from sglang.srt.model_executor.weights_arena import (
+from flliper.srt.model_executor.weights_arena import (
     allocate_arena,
     arena_image,
     arena_refill,
@@ -61,9 +61,9 @@ from sglang.srt.model_executor.weights_arena import (
     pack_into_arena,
     plan_arena_layout,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -154,7 +154,7 @@ class _StubRunner:
     """Attribute shell for exercising real unbound ModelRunner methods."""
 
     def __new__(cls, enable_flip, is_draft=False, is_tp_stack=False):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from flliper.srt.model_executor.model_runner import ModelRunner
 
         r = ModelRunner.__new__(ModelRunner)
         r.server_args = SimpleNamespace(enable_phase_flip=enable_flip)
@@ -204,7 +204,7 @@ class TestPin2StructuralGraphAsymmetry(CustomTestCase):
         """The TP stack must ride the is_draft_worker secondary-runner
         gates; constructing it without them is refused (mirrors the
         dual-group-lane guard)."""
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from flliper.srt.model_executor.model_runner import ModelRunner
 
         with self.assertRaisesRegex(ValueError, "is_draft_worker=True"):
             ModelRunner(
@@ -440,7 +440,7 @@ class TestPhaseFlipStacksRefill(CustomTestCase):
         # #809/W28: ONE host image, max-sized, holding the RESTING layout --
         # here TP, because the arena below is primed with PP. The flip rotates
         # them, so a round trip must return both sides to exactly this state.
-        from sglang.srt.model_executor.rotation_executor import (
+        from flliper.srt.model_executor.rotation_executor import (
             allocate_rotation_image,
         )
 
@@ -494,7 +494,7 @@ if __name__ == "__main__":
 
 
 class TestTpScopeEnvMask(CustomTestCase):
-    """Pin for the SGLANG_PP_LAYER_PARTITION mask (first real-metal flip
+    """Pin for the FLLIPER_PP_LAYER_PARTITION mask (first real-metal flip
     boot, 2026-08-08): --pp-layer-ratio exports the partition process-wide
     and the TP stack's pp_size=1 model build dies on it in get_pp_indices.
     The scope must hide the variable for the build and restore it for the
@@ -504,29 +504,29 @@ class TestTpScopeEnvMask(CustomTestCase):
         import os
         from unittest import mock
 
-        from sglang.srt.managers import phase_flip_boot as pfb
+        from flliper.srt.managers import phase_flip_boot as pfb
 
         seen = {}
 
         with (
             mock.patch(
-                "sglang.srt.distributed.parallel_state.get_phase_flip_group",
+                "flliper.srt.distributed.parallel_state.get_phase_flip_group",
                 return_value=object(),
             ),
             mock.patch(
-                "sglang.srt.distributed.parallel_state.set_phase_flip_tp_active"
+                "flliper.srt.distributed.parallel_state.set_phase_flip_tp_active"
             ),
         ):
-            with mock.patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": "32,16,16"}):
+            with mock.patch.dict(os.environ, {"FLLIPER_PP_LAYER_PARTITION": "32,16,16"}):
                 try:
                     with pfb.phase_flip_tp_scope(0, 3):
-                        seen["inside"] = os.environ.get("SGLANG_PP_LAYER_PARTITION")
+                        seen["inside"] = os.environ.get("FLLIPER_PP_LAYER_PARTITION")
                 except Exception:
                     # The parallel-context override may refuse stub groups;
                     # the mask/restore contract is what this pin checks and
                     # both sides of it are observable regardless.
                     pass
-                seen["after"] = os.environ.get("SGLANG_PP_LAYER_PARTITION")
+                seen["after"] = os.environ.get("FLLIPER_PP_LAYER_PARTITION")
         if "inside" in seen:
             self.assertIsNone(seen["inside"], "env var visible inside scope")
         self.assertEqual(seen["after"], "32,16,16", "env var not restored")
@@ -542,22 +542,22 @@ class TestFlipTokenVector(CustomTestCase):
     """
 
     def setUp(self):
-        self._saved = os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR")
+        self._saved = os.environ.get("FLLIPER_UNEVEN_TOKEN_VECTOR")
 
     def tearDown(self):
         if self._saved is None:
-            os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
+            os.environ.pop("FLLIPER_UNEVEN_TOKEN_VECTOR", None)
         else:
-            os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = self._saved
+            os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = self._saved
 
     def test_unset_is_the_flip_vector(self):
         """Backward compatibility: unset must change nothing at all."""
-        os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
+        os.environ.pop("FLLIPER_UNEVEN_TOKEN_VECTOR", None)
         args = _flip_args()
         self.assertEqual(parse_flip_token_vector(args), parse_flip_vector(args))
 
     def test_env_overrides_only_the_token_split(self):
-        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "7,39,18"
+        os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = "7,39,18"
         args = _flip_args()
         self.assertEqual(parse_flip_token_vector(args), [7, 39, 18])
         # The weight shard must be untouched -- that is the whole point of
@@ -565,19 +565,19 @@ class TestFlipTokenVector(CustomTestCase):
         self.assertEqual(parse_flip_vector(args), [30, 17, 17])
 
     def test_length_mismatch_refuses(self):
-        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "7,39"
+        os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = "7,39"
         with self.assertRaises(PhaseFlipBootError):
             parse_flip_token_vector(_flip_args())
 
     def test_zero_entry_refuses(self):
         """A rank owning no KV rows while still holding a weight shard is
         not expressible by the owner rule."""
-        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "0,39,18"
+        os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = "0,39,18"
         with self.assertRaises(PhaseFlipBootError):
             parse_flip_token_vector(_flip_args())
 
     def test_garbage_refuses(self):
-        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "7,not-a-number,18"
+        os.environ["FLLIPER_UNEVEN_TOKEN_VECTOR"] = "7,not-a-number,18"
         with self.assertRaises(PhaseFlipBootError):
             parse_flip_token_vector(_flip_args())
 
@@ -594,7 +594,7 @@ class TestStacksCarryBothVectors(CustomTestCase):
     split than the pools were SIZED under, which surfaces as an
     out-of-bounds KV slot id, not as a slow path.
 
-    Regression pin: this diverges only when SGLANG_UNEVEN_TOKEN_VECTOR is
+    Regression pin: this diverges only when FLLIPER_UNEVEN_TOKEN_VECTOR is
     set, so it was unreachable until the token side became overridable.
     """
 
@@ -610,7 +610,7 @@ class TestStacksCarryBothVectors(CustomTestCase):
         a live three-rank group."""
         import inspect
 
-        from sglang.srt.managers import phase_flip_runtime as pfr
+        from flliper.srt.managers import phase_flip_runtime as pfr
 
         src = inspect.getsource(pfr)
         # The owner rule reinstalled at cutover.
@@ -637,14 +637,14 @@ class TestSlotIdSpaceFitsBothPools(CustomTestCase):
     def test_guard_message_names_both_capacities_and_the_consequence(self):
         import inspect
 
-        from sglang.srt.managers import phase_flip_boot as pfb
+        from flliper.srt.managers import phase_flip_boot as pfb
 
         src = inspect.getsource(pfb.build_phase_flip_tp_stack)
         self.assertIn("tp_capacity < pp_capacity", src)
         # The raise must state both numbers and where it would otherwise
         # fail, so a boot refusal is actionable without reading the source.
         self.assertIn("store_kvcache", src)
-        self.assertIn("SGLANG_UNEVEN_TOKEN_VECTOR", src)
+        self.assertIn("FLLIPER_UNEVEN_TOKEN_VECTOR", src)
 
     def test_equal_capacity_is_allowed(self):
         """The bound is >=, not >: an exactly-fitting TP pool is legal."""

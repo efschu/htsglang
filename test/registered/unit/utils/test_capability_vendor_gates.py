@@ -9,7 +9,7 @@ number read in another vendor's namespace fails in the DANGEROUS direction: the
 AMD card sails through the gate and dies later inside a kernel that does not
 exist there, instead of being refused at startup.
 
-The root fix is the helper family in `sglang.srt.utils.common`: helpers that
+The root fix is the helper family in `flliper.srt.utils.common`: helpers that
 carry the vendor IN THEIR NAME and answer False/None off that vendor, so the
 blind comparison is not expressible. These tests pin both halves --
 
@@ -27,7 +27,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.utils import common
+from flliper.srt.utils import common
 
 
 @contextlib.contextmanager
@@ -199,7 +199,7 @@ class TestFixedSitesAskInTheNvidiaNamespace(unittest.TestCase):
     NVIDIA answer is unchanged, the ROCm answer is no longer the collision."""
 
     def test_programmatic_dependent_launch(self):
-        from sglang.srt.layers import fused_qk_rmsnorm_rope_gate as mod
+        from flliper.srt.layers import fused_qk_rmsnorm_rope_gate as mod
 
         with nvidia((9, 0)):
             self.assertTrue(mod._pdl_supported())
@@ -210,7 +210,7 @@ class TestFixedSitesAskInTheNvidiaNamespace(unittest.TestCase):
             self.assertFalse(mod._pdl_supported())
 
     def test_cutedsl_blackwell_gates(self):
-        from sglang.srt.layers.attention.linear.kernels import (
+        from flliper.srt.layers.attention.linear.kernels import (
             gdn_cutedsl,
             kda_cutedsl,
         )
@@ -228,7 +228,7 @@ class TestFixedSitesAskInTheNvidiaNamespace(unittest.TestCase):
                     self.assertFalse(mod._is_blackwell())
 
     def test_marlin_fp8_auto_enable_range(self):
-        from sglang.srt.layers.quantization import fp8_utils
+        from flliper.srt.layers.quantization import fp8_utils
 
         with nvidia((8, 6)):
             self.assertTrue(fp8_utils.can_auto_enable_marlin_fp8())
@@ -239,7 +239,7 @@ class TestFixedSitesAskInTheNvidiaNamespace(unittest.TestCase):
             self.assertFalse(fp8_utils.can_auto_enable_marlin_fp8())
 
     def test_marlin_supported_types_floor(self):
-        from sglang.srt.layers.quantization import marlin_utils
+        from flliper.srt.layers.quantization import marlin_utils
 
         with nvidia((8, 0)):
             self.assertNotEqual(marlin_utils.query_marlin_supported_quant_types(), [])
@@ -250,7 +250,7 @@ class TestFixedSitesAskInTheNvidiaNamespace(unittest.TestCase):
             self.assertEqual(marlin_utils.query_marlin_supported_quant_types(), [])
 
     def test_moe_wna16_awq_floor_does_not_apply_on_rocm(self):
-        from sglang.srt.layers.quantization import moe_wna16
+        from flliper.srt.layers.quantization import moe_wna16
 
         cfg = {"quant_method": "awq", "bits": 4, "desc_act": False}
 
@@ -270,7 +270,7 @@ class TestFixedSitesAskInTheNvidiaNamespace(unittest.TestCase):
     def test_flashattention_v3_refuses_rocm_before_reading_the_number(self):
         """Source order matters: after the number the vendor gate is useless,
         because gfx942's (9, 4) already satisfies `major == 9`."""
-        from sglang.srt.layers.attention import attention_registry
+        from flliper.srt.layers.attention import attention_registry
 
         src = inspect.getsource(attention_registry.create_flashattention_v3_backend)
         vendor_at = src.find("assert not _is_hip")
@@ -281,7 +281,7 @@ class TestFixedSitesAskInTheNvidiaNamespace(unittest.TestCase):
         self.assertIn("no ROCm kernel", src)
 
     def test_dsa_backends_default_in_the_nvidia_namespace(self):
-        from sglang.srt.arg_groups import overrides
+        from flliper.srt.arg_groups import overrides
 
         src = inspect.getsource(overrides._dsa_split_backend_resolution)
         self.assertIn("cuda_sm_at_least(10)", src)

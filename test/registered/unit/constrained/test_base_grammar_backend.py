@@ -1,5 +1,5 @@
 """
-Unit tests for sglang.srt.constrained.base_grammar_backend.
+Unit tests for flliper.srt.constrained.base_grammar_backend.
 
 Test Coverage:
 - GrammarStats: default values, mutable default isolation
@@ -19,7 +19,7 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.constrained.base_grammar_backend import (
+from flliper.srt.constrained.base_grammar_backend import (
     GRAMMAR_BACKEND_REGISTRY,
     BaseGrammarBackend,
     BaseGrammarObject,
@@ -28,7 +28,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
     register_grammar_backend,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 
@@ -289,7 +289,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         # Custom backends return early, no reasoner wrapping applied
         self.assertIs(result, mock_inner)
 
-    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
+    @patch("flliper.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_outlines_backend(self, mock_outlines_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
@@ -300,7 +300,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         mock_outlines_cls.assert_called_once_with("tok", whitespace_pattern=r"\s*")
         self.assertIs(result, mock_backend)
 
-    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    @patch("flliper.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_backend(self, mock_xgrammar_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_xgrammar_cls.return_value = mock_backend
@@ -313,9 +313,9 @@ class TestCreateGrammarBackend(unittest.TestCase):
         )
         self.assertIs(result, mock_backend)
 
-    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    @patch("flliper.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_unsupported_tokenizer_falls_back_to_none(self, mock_xgrammar_cls):
-        from sglang.srt.constrained.xgrammar_backend import TokenizerNotSupportedError
+        from flliper.srt.constrained.xgrammar_backend import TokenizerNotSupportedError
 
         mock_xgrammar_cls.side_effect = TokenizerNotSupportedError(
             "unsupported tokenizer"
@@ -326,7 +326,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(args.grammar_backend, "none")
 
-    @patch("sglang.srt.constrained.llguidance_backend.GuidanceBackend")
+    @patch("flliper.srt.constrained.llguidance_backend.GuidanceBackend")
     def test_llguidance_backend(self, mock_guidance_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_guidance_cls.return_value = mock_backend
@@ -340,10 +340,10 @@ class TestCreateGrammarBackend(unittest.TestCase):
         )
         self.assertIs(result, mock_backend)
 
-    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
+    @patch("flliper.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_reasoner_wrapping_on_builtin_backend(self, mock_outlines_cls):
         """Non-custom backends get wrapped with ReasonerGrammarBackend."""
-        from sglang.srt.constrained.reasoner_grammar_backend import (
+        from flliper.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
@@ -359,7 +359,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         self.assertIsInstance(result, ReasonerGrammarBackend)
         self.assertIs(result.grammar_backend, mock_backend)
 
-    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
+    @patch("flliper.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_no_reasoner_wrapping_without_think_end_id(self, mock_outlines_cls):
         """Without think_end_id passed in, no reasoner wrapping."""
         mock_backend = MagicMock(spec=BaseGrammarBackend)
@@ -370,7 +370,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         result = create_grammar_backend(args, tokenizer, 32000, think_end_id=None)
         self.assertIs(result, mock_backend)
 
-    @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
+    @patch("flliper.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_no_reasoner_wrapping_without_reasoning_parser(self, mock_outlines_cls):
         """Without reasoning_parser, no reasoner wrapping even with think_end_id."""
         mock_backend = MagicMock(spec=BaseGrammarBackend)
@@ -381,7 +381,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         result = create_grammar_backend(args, tokenizer, 32000, think_end_id=42)
         self.assertIs(result, mock_backend)
 
-    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    @patch("flliper.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_eos_none(self, mock_xgrammar_cls):
         """eos_token_ids=None should pass None, not an empty list."""
         mock_xgrammar_cls.return_value = MagicMock(spec=BaseGrammarBackend)

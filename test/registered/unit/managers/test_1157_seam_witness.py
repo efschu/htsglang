@@ -42,8 +42,8 @@ import re
 import types
 import unittest
 
-from sglang.srt.managers import phase_purity
-from sglang.srt.managers.phase_purity import (
+from flliper.srt.managers import phase_purity
+from flliper.srt.managers.phase_purity import (
     SEAM_GRANT_CONSUMED_ATTR,
     SEAM_READMIT_ATTR,
     observe_store_witness,
@@ -51,10 +51,10 @@ from sglang.srt.managers.phase_purity import (
     seam_transport_premise_holds,
     witness_readings,
 )
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.hicache_storage import PrefetchOutcome
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.mem_cache.hicache_storage import PrefetchOutcome
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -267,7 +267,7 @@ class III_AProbedMissBesideAStampIsReadAndMeasured(CustomTestCase):
     def test_the_allowance_is_the_trees_one_chunk_term(self):
         """The allowance is `_prefetch_chunk_tokens` (chunked_prefill_size);
         a stand-in tree without it falls back to the prefetch threshold."""
-        from sglang.srt.managers.phase_purity import _store_witness_allowance
+        from flliper.srt.managers.phase_purity import _store_witness_allowance
 
         self.assertEqual(_store_witness_allowance(_sched([]).tree_cache), CHUNK)
         bare = types.SimpleNamespace(prefetch_threshold=256)

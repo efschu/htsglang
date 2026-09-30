@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """DUAL-TP3PP3: does the union-arena VMM export (cuMemCreate POSIX_FD ->
-cuMemImportFromShareableHandle, the weg2 union_arena_vmm path) work between two
+cuMemImportFromShareableHandle, the pdflip union_arena_vmm path) work between two
 processes on ONE card, with and without MPS?  Owner writes a pattern with
 cuMemsetD32, peer maps the same physical pages and reads them back.  One JSON
 line.  Driver API only (cuda.bindings), no torch, no JIT."""

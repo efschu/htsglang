@@ -8,7 +8,7 @@ are split correctly.
 Regression test for https://github.com/sgl-project/sglang/issues/23051
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -18,8 +18,8 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+from flliper.srt.layers.parameter import PerTensorScaleParameter
+from flliper.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 
 
 def _make_mock_module(output_sizes):

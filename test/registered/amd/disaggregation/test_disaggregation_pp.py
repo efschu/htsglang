@@ -3,12 +3,12 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.server_fixtures.disaggregation_fixture import (
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.few_shot_gsm8k import run_eval
+from flliper.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
     try_cached_model,
@@ -22,14 +22,14 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # set up ROCm env
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
+        os.environ["FLLIPER_USE_AITER"] = "1"
+        rdma_env = os.environ.get("FLLIPER_TEST_RDMA_DEVICE")
 
         if rdma_env:
             cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
             print(f"Found RDMA devices in env: {rdma_env}")
         else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
+            print("FLLIPER_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
         cls.model = try_cached_model("Qwen/Qwen3-8B")
@@ -115,14 +115,14 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
     def setUpClass(cls):
         super().setUpClass()
         # set up ROCm env
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
+        os.environ["FLLIPER_USE_AITER"] = "1"
+        rdma_env = os.environ.get("FLLIPER_TEST_RDMA_DEVICE")
 
         if rdma_env:
             cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
             print(f"Found RDMA devices in env: {rdma_env}")
         else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
+            print("FLLIPER_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
         cls.model = try_cached_model("Qwen/Qwen3-8B")
@@ -209,14 +209,14 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         # set up ROCm env
-        os.environ["SGLANG_USE_AITER"] = "1"
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
+        os.environ["FLLIPER_USE_AITER"] = "1"
+        rdma_env = os.environ.get("FLLIPER_TEST_RDMA_DEVICE")
 
         if rdma_env:
             cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
             print(f"Found RDMA devices in env: {rdma_env}")
         else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
+            print("FLLIPER_TEST_RDMA_DEVICE is not set! Running without RDMA.")
             cls.rdma_devices = []
 
         cls.model = try_cached_model("Qwen/Qwen3-8B")

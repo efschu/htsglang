@@ -5,7 +5,7 @@ direct use keeps refusing by name."""
 
 import pytest
 
-from sglang.srt.form_a_construction import FormAHostOnlyModuleUsed, HostOnlyModule
+from flliper.srt.form_a_construction import FormAHostOnlyModuleUsed, HostOnlyModule
 
 
 def test_introspection_with_a_default_sees_no_attribute():

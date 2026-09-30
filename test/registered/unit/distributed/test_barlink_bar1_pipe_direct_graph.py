@@ -40,7 +40,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
     bc_plan,
     fbase_a2a,
@@ -48,7 +48,7 @@ from sglang.srt.distributed.device_communicators.barlink_bar1 import (
     geometry,
     max_payload,
 )
-from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
+from flliper.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
     RESULT_READY_FAMILY,
     RESULT_EAGER_SLOTS,
     result_slot_split,
@@ -59,15 +59,15 @@ from sglang.srt.distributed.device_communicators.barlink_bar1_pipe_ext import (
     pipe_fbase,
     pipe_flags_extra,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 _PIPE_EXT = (
     Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/distributed/device_communicators/barlink_bar1_pipe_ext.py"
+    / "python/flliper/srt/distributed/device_communicators/barlink_bar1_pipe_ext.py"
 )
 
 
@@ -293,11 +293,11 @@ class Window:
         for z in range(self.world):
             if z == r:
                 continue
-            ueberschrieben = g - self.slack
-            if ueberschrieben > self.consumed[z]:
+            overwritten = g - self.slack
+            if overwritten > self.consumed[z]:
                 raise Violation(
                     f"rank {r} writes generation {g} into rank {z}'s slot "
-                    f"and thereby overwrites generation {ueberschrieben}, "
+                    f"and thereby overwrites generation {overwritten}, "
                     f"which {z} has only consumed up to {self.consumed[z]}"
                 )
             self.content[z] = g
@@ -498,14 +498,14 @@ def _stub(**kw):
 
 def _without_capture():
     return mock.patch(
-        "sglang.srt.distributed.device_communicators.barlink.graph_capture_running",
+        "flliper.srt.distributed.device_communicators.barlink.graph_capture_running",
         lambda: False,
     )
 
 
 def _with_capture():
     return mock.patch(
-        "sglang.srt.distributed.device_communicators.barlink.graph_capture_running",
+        "flliper.srt.distributed.device_communicators.barlink.graph_capture_running",
         lambda: True,
     )
 

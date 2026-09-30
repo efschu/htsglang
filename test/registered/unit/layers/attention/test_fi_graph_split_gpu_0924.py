@@ -37,7 +37,7 @@ import torch
 if not torch.cuda.is_available():  # pragma: no cover - desk
     pytest.skip("needs CUDA", allow_module_level=True)
 
-from sglang.srt.layers.attention import fi_jit_cache_check as J  # noqa: E402
+from flliper.srt.layers.attention import fi_jit_cache_check as J  # noqa: E402
 
 _OK, _LINES = J.check_prefill_modules(("bf16",))  # also mirrors the server's arch flags
 if not _OK:  # pragma: no cover - window hygiene
@@ -45,9 +45,9 @@ if not _OK:  # pragma: no cover - window hygiene
 
 import flashinfer  # noqa: E402
 
-from sglang.srt.layers.attention import fi_graph_split as G  # noqa: E402
-from sglang.srt.layers.attention.fi_prefill_wave_split import fa2_cta_tile_q  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
+from flliper.srt.layers.attention import fi_graph_split as G  # noqa: E402
+from flliper.srt.layers.attention.fi_prefill_wave_split import fa2_cta_tile_q  # noqa: E402
+from flliper.test.ci.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=60, suite="nightly-1-gpu")
 
@@ -92,7 +92,7 @@ def _around(xs, i):
     return xs[max(0, i - 2): i + 3]
 
 
-# Plain unittest.TestCase ON PURPOSE (both classes): sglang's CustomTestCase
+# Plain unittest.TestCase ON PURPOSE (both classes): flliper's CustomTestCase
 # runs every test inside retry(), and the first window run showed nothing but
 # "retry() exceed maximum number of retries" -- the cause stayed in the chained
 # exception the excerpt did not reach.

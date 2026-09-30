@@ -5,9 +5,9 @@ whether the double layout RUNS.
   eval_dual_boot.py <evidence-dir-or-prefix>   (the boot_weg2_<tag>_... files)
 
 Answers, each with the lines it counted:
-1. Did the dual path engage? (launcher WEG2-DUAL*, front WEG2 DUAL-LAYOUT on,
+1. Did the dual path engage? (launcher PDFLIP-DUAL*, front PDFLIP DUAL-LAYOUT on,
    P stage assembled, union OWNER/PEER + bound bytes, D ratios published)
-2. Were there flips? (WEG2-FLIP begin) -- must be 0.
+2. Were there flips? (PDFLIP-FLIP begin) -- must be 0.
 3. Did P prefill WHILE D decoded? Overlap of PP0 prefill seconds with TP0
    decode seconds (1-s buckets), and D's per-round gpu-ms in buckets with and
    without P activity (the price D pays; risk-1 predicted ~2x at P 50 %).
@@ -61,15 +61,15 @@ def main():
     fs = _files(sys.argv[1])
     print("files:", fs)
     pats = {
-        "dual_launch": re.compile(r"WEG2-DUAL"),
-        "front_dual": re.compile(r"WEG2 DUAL-LAYOUT on"),
+        "dual_launch": re.compile(r"PDFLIP-DUAL"),
+        "front_dual": re.compile(r"PDFLIP DUAL-LAYOUT on"),
         "p_stage": re.compile(r"DUAL-TP3PP3 P stage \d+/\d+ assembled"),
         "p_bound": re.compile(r"DUAL-TP3PP3 P: shared part bound"),
-        "union_owner": re.compile(r"WEG2-UNION OWNER"),
-        "union_peer": re.compile(r"WEG2-UNION PEER"),
-        "d_ratios": re.compile(r"WEG2-UNION D ratios published"),
-        "flip": re.compile(r"WEG2-FLIP begin"),
-        "error": re.compile(r"Traceback|REFUSED:|CUDA error|out of memory|OutOfMemory|Weg2Stop|DualShareError|UnionShareError|STOP "),
+        "union_owner": re.compile(r"PDFLIP-UNION OWNER"),
+        "union_peer": re.compile(r"PDFLIP-UNION PEER"),
+        "d_ratios": re.compile(r"PDFLIP-UNION D ratios published"),
+        "flip": re.compile(r"PDFLIP-FLIP begin"),
+        "error": re.compile(r"Traceback|REFUSED:|CUDA error|out of memory|OutOfMemory|PdFlipStop|DualShareError|UnionShareError|STOP "),
         "mps": re.compile(r"MPS"),
         "duty": re.compile(r"duty throttle armed"),
         # unified KV per card (dual1g)
@@ -82,8 +82,8 @@ def main():
         "d_kv_grow": re.compile(r"DUAL-TP3PP3 D-KV GROW"),
         "d_kv_shrink": re.compile(r"DUAL-TP3PP3 D-KV SHRINK"),
         "d_kv_wait": re.compile(r"DUAL-TP3PP3 D-KV GROUP-WAIT"),
-        "p_pause": re.compile(r"WEG2 DUAL P-PAUSE rid"),
-        "p_paused": re.compile(r"WEG2 DUAL P-PAUSED rid"),
+        "p_pause": re.compile(r"PDFLIP DUAL P-PAUSE rid"),
+        "p_paused": re.compile(r"PDFLIP DUAL P-PAUSED rid"),
         "terminate": re.compile(r"terminate called"),
     }
     for k, p in fs.items():

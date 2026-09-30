@@ -28,15 +28,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from sglang.srt.managers import prefetch_ballot
-from sglang.srt.managers.prefetch_ballot import (
+from flliper.srt.managers import prefetch_ballot
+from flliper.srt.managers.prefetch_ballot import (
     PREFETCH_BALLOT_SLOTS,
     build_prefetch_ballot_payload,
     prefetch_ballot_digest,
     prefetch_done_under_ballot,
     unpack_prefetch_ballot,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40)
 

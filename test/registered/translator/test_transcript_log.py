@@ -20,8 +20,8 @@ zero and must get the conversation back whole.
 
 import unittest
 
-from sglang.srt.translator.session import EventKind, Journal, run_conversation
-from sglang.srt.translator.transcript_log import (
+from flliper.srt.translator.session import EventKind, Journal, run_conversation
+from flliper.srt.translator.transcript_log import (
     CONFIDENCE_UNCERTAIN,
     KIND_NOTICE,
     ORIGIN_MANUAL,

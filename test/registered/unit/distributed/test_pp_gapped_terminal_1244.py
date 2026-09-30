@@ -30,9 +30,9 @@ from typing import Dict, FrozenSet, List, Sequence, Tuple
 
 import torch
 
-from sglang.srt.distributed.pp_crossing_schedule import crossing_schedule
-from sglang.srt.distributed.pp_crossing_wire import build_crossing_wire
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.pp_crossing_schedule import crossing_schedule
+from flliper.srt.distributed.pp_crossing_wire import build_crossing_wire
+from flliper.srt.distributed.utils import (
     PP_LAYER_SET_ENV,
     PPLayerSetError,
     parse_pp_layer_sets,

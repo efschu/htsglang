@@ -11,11 +11,11 @@ import tempfile
 import time
 import unittest
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.hicache_spec_storage_common import HiCacheSpecStorageMixin
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.utils import is_hip
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.hicache_spec_storage_common import HiCacheSpecStorageMixin
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=200, stage="extra-a", runner_config="1-gpu-large")
 
@@ -34,7 +34,7 @@ class TestHiCacheSpecFileStorage(HiCacheSpecStorageMixin, CustomTestCase):
 
     @classmethod
     def _get_spec_server_env(cls):
-        return {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+        return {"FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
 
     @classmethod
     def _count_file_storage_pages(cls):

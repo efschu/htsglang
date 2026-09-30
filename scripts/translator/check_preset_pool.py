@@ -55,7 +55,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sglang.srt.translator.speakers import SpeakerRegistryConfig
+from flliper.srt.translator.speakers import SpeakerRegistryConfig
 
 DEFAULT_POOL = Path("/spinning/llm_stuff/translator-models/preset-voices")
 
@@ -103,8 +103,8 @@ def main() -> int:
 
     import soundfile as sf
 
-    from sglang.srt.translator.asr_backends import OnnxSpeakerEmbedder
-    from sglang.srt.translator.backends import AudioChunk
+    from flliper.srt.translator.asr_backends import OnnxSpeakerEmbedder
+    from flliper.srt.translator.backends import AudioChunk
 
     # `retired/` holds voices withdrawn from the pool; they are kept on
     # disk so the decision is reversible, and must not be scored as a class.

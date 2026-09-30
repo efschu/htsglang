@@ -20,7 +20,7 @@ import socket
 import unittest
 from unittest import mock
 
-from sglang.srt.planner.github_share import (
+from flliper.srt.planner.github_share import (
     DEFAULT_REPO,
     MARKER,
     GitHubShareError,
@@ -40,12 +40,12 @@ def _payload(**over):
         "hardware": "1x RTX 5090 + 2x RTX 3080",
         "command": {
             "argv": [
-                "python3", "-m", "sglang.launch_server",
+                "python3", "-m", "flliper.launch_server",
                 "--model-path", MODEL_PATH,
                 "--tokenizer", MODEL_PATH,
                 "--tp", "3",
             ],
-            "env": {"SGLANG_UNEVEN_TOKEN_VECTOR": "33,13,18"},
+            "env": {"FLLIPER_UNEVEN_TOKEN_VECTOR": "33,13,18"},
         },
         "metrics": {"decode_tok_s": 42.5},
     }
@@ -89,7 +89,7 @@ class AbsolutePathTest(unittest.TestCase):
     def test_path_valued_env_is_not_in_the_posted_markdown(self):
         md = build_report(_payload(command={
             "argv": ["python3"],
-            "env": {"SGLANG_MOE_HOTSET_FILE": "/spinning/htsglang/hotset.json"},
+            "env": {"FLLIPER_MOE_HOTSET_FILE": "/spinning/htsglang/hotset.json"},
         }))
         self.assertNotIn("/spinning/htsglang/hotset.json", md)
         self.assertIn("hotset.json", md)
@@ -138,12 +138,12 @@ class SecretInAnyVariableTest(unittest.TestCase):
         md = build_report(_payload(command={
             "argv": ["python3"],
             "env": {"HF_TOKEN": "hf_secretsecretsecret",
-                    "SGLANG_UNEVEN_TOKEN_VECTOR": "33,13,18"},
+                    "FLLIPER_UNEVEN_TOKEN_VECTOR": "33,13,18"},
         }))
         self.assertIn("HF_TOKEN=<redacted>", md)
         self.assertNotIn("hf_secretsecretsecret", md)
         # a tuning knob whose name merely ENDS in a suffix-lookalike stays exact
-        self.assertIn("SGLANG_UNEVEN_TOKEN_VECTOR=33,13,18", md)
+        self.assertIn("FLLIPER_UNEVEN_TOKEN_VECTOR=33,13,18", md)
 
 
 class QualityShotUntouchedTest(unittest.TestCase):

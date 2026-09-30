@@ -1,11 +1,11 @@
-"""E2E test for SGLANG_MM_AVOID_RETOKENIZE on the pre-tokenized VLM path.
+"""E2E test for FLLIPER_MM_AVOID_RETOKENIZE on the pre-tokenized VLM path.
 
 A client may send a multimodal request as input_ids (list[int]) instead of text.
 On that path the server decodes the ids back to text and the HF processor
 re-tokenizes them. If the original ids were non-canonical (decode -> re-encode is
 not identity), that re-tokenization drifts: the reported prompt_tokens changes.
 
-With SGLANG_MM_AVOID_RETOKENIZE ON (default), the server keeps the user's
+With FLLIPER_MM_AVOID_RETOKENIZE ON (default), the server keeps the user's
 original tokens verbatim and only expands the image placeholder, so prompt_tokens
 stays faithful to what the client sent.
 
@@ -26,9 +26,9 @@ import requests
 from PIL import Image
 from transformers import AutoProcessor
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -97,7 +97,7 @@ class TestQwenVLTokenIdRetokenize(CustomTestCase):
                 DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=self.other_args,
-                env={"SGLANG_MM_AVOID_RETOKENIZE": flag},
+                env={"FLLIPER_MM_AVOID_RETOKENIZE": flag},
             )
             try:
                 prompt_tokens[flag] = _prompt_tokens(

@@ -20,7 +20,7 @@ LOG="$DIR/server.log"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONPATH="$WT/python:${PYTHONPATH:-}"
-export SGLANG_OFFLOAD_REGISTER=1
+export FLLIPER_OFFLOAD_REGISTER=1
 
 # The hosting card is resolved, never assumed: the biggest one, found through
 # the same PCI join every other step uses.
@@ -34,7 +34,7 @@ echo "smoke card: cuda:$CUDA_BIG"
 export CUDA_VISIBLE_DEVICES="$CUDA_BIG"
 
 cd "$WT"
-setsid "$VENV/bin/python" -m sglang.launch_server \
+setsid "$VENV/bin/python" -m flliper.launch_server \
     --model-path "$MODEL" \
     --tp-size 1 \
     --context-length 8192 \

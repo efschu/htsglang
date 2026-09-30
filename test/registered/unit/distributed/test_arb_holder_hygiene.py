@@ -34,8 +34,8 @@ import sys
 import tempfile
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -198,9 +198,9 @@ class TestNothingWritesThePathsOnProcessExit(CustomTestCase):
     """
 
     IMPORTS = (
-        "from sglang.srt.planner import comm_suite",
-        "from sglang.srt.workbench import arb",
-        "from sglang.srt.registry import ledger",
+        "from flliper.srt.planner import comm_suite",
+        "from flliper.srt.workbench import arb",
+        "from flliper.srt.registry import ledger",
     )
 
     def test_importing_the_harness_and_exiting_touches_nothing(self):
@@ -233,7 +233,7 @@ class TestThePythonLockPathsAreRedirectable(CustomTestCase):
     def test_the_lock_family_follows_one_env_var(self):
         import importlib
 
-        from sglang.srt.planner import comm_suite
+        from flliper.srt.planner import comm_suite
 
         with tempfile.TemporaryDirectory() as root:
             os.environ["HTSGLANG_CARD_LOCK_ROOT"] = root
@@ -249,7 +249,7 @@ class TestThePythonLockPathsAreRedirectable(CustomTestCase):
     def test_the_production_default_is_still_the_rig_wide_name(self):
         """Five independent tools arbitrate on these exact names; the seam may
         not change what an unconfigured process uses."""
-        from sglang.srt.planner import comm_suite
+        from flliper.srt.planner import comm_suite
 
         self.assertEqual(comm_suite.LOCK_DIR_FMT, "/tmp/gpu-card-{}.lock")
         self.assertEqual(comm_suite.LEGACY_LOCK_DIR, "/tmp/gpu-owner.lock")

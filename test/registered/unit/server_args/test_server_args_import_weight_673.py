@@ -22,9 +22,9 @@ WHAT THESE TESTS PIN, and the honest split between them:
   in a test, where the cost is irrelevant -- and fails if the two diverge.
 * ``test_torch_and_triton_are_not_server_args_fault`` is an ATTRIBUTION pin,
   and it asserts the CURRENT, UNFIXED state on purpose. torch and triton are
-  already in ``sys.modules`` after a bare ``import sglang``, long before
-  server_args is reached: ``sglang/__init__.py:29`` ->
-  ``sglang/srt/utils/__init__.py:2`` -> ``utils/common.py:87`` (torch) and
+  already in ``sys.modules`` after a bare ``import flliper``, long before
+  server_args is reached: ``flliper/__init__.py:29`` ->
+  ``flliper/srt/utils/__init__.py:2`` -> ``utils/common.py:87`` (torch) and
   ``:89`` (triton). So "server_args must not import torch" cannot be asserted
   today by any change to server_args, and pretending otherwise would file a
   green test against a red world. When someone makes the package root lazy,
@@ -37,9 +37,9 @@ import subprocess
 import sys
 import unittest
 
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
-FLA_PACKAGE = "sglang.srt.layers.attention.fla"
+FLA_PACKAGE = "flliper.srt.layers.attention.fla"
 
 
 def _probe(script: str) -> str:
@@ -68,7 +68,7 @@ class TestServerArgsImportWeight(CustomTestCase):
     def test_importing_server_args_does_not_import_fla(self):
         answer = _probe(
             "import sys\n"
-            "import sglang.srt.server_args\n"
+            "import flliper.srt.server_args\n"
             f"pulled = sorted(m for m in sys.modules if m.startswith({FLA_PACKAGE!r}))\n"
             "print(pulled)\n"
         )
@@ -85,8 +85,8 @@ class TestServerArgsImportWeight(CustomTestCase):
         """The containment pin: an inlined constant that drifts is worse than
         the import it replaced, so the duplicate is checked against its
         source."""
-        from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE
-        from sglang.srt.server_args import FLA_CHUNK_SIZE
+        from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE
+        from flliper.srt.server_args import FLA_CHUNK_SIZE
 
         self.assertEqual(
             FLA_CHUNK_SIZE,
@@ -96,9 +96,9 @@ class TestServerArgsImportWeight(CustomTestCase):
             "pinned rather than trusted).",
         )
 
-    def test_a_bare_import_sglang_no_longer_pulls_triton(self):
+    def test_a_bare_import_flliper_no_longer_pulls_triton(self):
         """LADDER RUNG CLIMBED. This rung used to assert that BOTH torch and
-        triton were present after ``import sglang`` -- the honest state at the
+        triton were present after ``import flliper`` -- the honest state at the
         time, since the package root applied the transformers patches eagerly
         and transformers reaches torch._dynamo -> triton.
 
@@ -108,13 +108,13 @@ class TestServerArgsImportWeight(CustomTestCase):
         """
         answer = _probe(
             "import sys\n"
-            "import sglang\n"
+            "import flliper\n"
             "print(sorted(m for m in ('torch', 'triton') if m in sys.modules))\n"
         )
         self.assertEqual(
             answer,
             "['torch']",
-            "a bare `import sglang` pulled triton again -- the transformers "
+            "a bare `import flliper` pulled triton again -- the transformers "
             "patches are supposed to be armed, not applied, so that a process "
             "which never imports transformers never loads a kernel compiler",
         )
@@ -128,7 +128,7 @@ class TestServerArgsImportWeight(CustomTestCase):
         than deleted -- torch is what remains, and it is structural."""
         import pathlib
 
-        import sglang.srt.utils.common as common
+        import flliper.srt.utils.common as common
 
         text = pathlib.Path(common.__file__).read_text()
         self.assertIn("\nimport torch\n", text)

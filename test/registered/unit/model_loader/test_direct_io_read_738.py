@@ -34,12 +34,12 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.model_loader.weight_utils import (
+from flliper.srt.model_loader.weight_utils import (
     _DIRECT_ALIGN,
     _DIRECT_BLOCK,
     read_file_direct,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 
@@ -90,7 +90,7 @@ class TheReadActuallyRequestsDirectIO(unittest.TestCase):
     """
 
     def test_the_file_is_opened_with_O_DIRECT(self):
-        import sglang.srt.model_loader.weight_utils as wu
+        import flliper.srt.model_loader.weight_utils as wu
 
         seen = {}
         real_open = os.open
@@ -131,7 +131,7 @@ class TheFlagRefusesAnInertCombination(unittest.TestCase):
     def test_direct_io_without_disable_mmap_raises(self):
         import types
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = types.SimpleNamespace(
             weight_loader_direct_io=True,
@@ -144,7 +144,7 @@ class TheFlagRefusesAnInertCombination(unittest.TestCase):
     def test_the_pair_together_is_accepted(self):
         import types
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = types.SimpleNamespace(
             weight_loader_direct_io=True,
@@ -155,7 +155,7 @@ class TheFlagRefusesAnInertCombination(unittest.TestCase):
     def test_neither_flag_is_accepted(self):
         import types
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         args = types.SimpleNamespace(
             weight_loader_direct_io=False,

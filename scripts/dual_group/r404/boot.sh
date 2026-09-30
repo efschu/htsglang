@@ -29,7 +29,7 @@
 #            the verdict because it is the same on every boot; the adaptive arm
 #            says whether the policy finds the shape on its own.
 #
-#   NEW INSTRUMENT  SGLANG_LANE_POOL_CHECKSUM=1 makes every arm carry per-round
+#   NEW INSTRUMENT  FLLIPER_LANE_POOL_CHECKSUM=1 makes every arm carry per-round
 #   digests of the committed slot mapping, the committed KV rows and the
 #   committed conv/ssm state. Read two ways (append-only within the arm, and
 #   against the arm's own no-spec reference), a divergence lands on a SURFACE
@@ -78,25 +78,25 @@ load_card_order "$OUT/cards.txt" || exit 1
 claim_cards "#404 window 2: steps=3 captured + checksum"
 trap 'stop_vram_sampler; kill "$(cat $PIDFILE 2>/dev/null)" 2>/dev/null; release_cards "#404b abgebrochen"; exit 1' INT TERM
 start_vram_sampler "$OUT/vram.csv"
-export SGLANG_ACCEPT_POSITION_PROBE=1
-export SGLANG_LANE_MARGIN_PROBE=1
+export FLLIPER_ACCEPT_POSITION_PROBE=1
+export FLLIPER_LANE_MARGIN_PROBE=1
 # The #404 probe. The PATH value is a PREFIX: each lane/rank appends
 # .lane<L>.rank<R>.jsonl, because under TP every rank runs this code with the
 # same environment and one shared file would interleave rounds from processes
 # that are not at the same round.
-export SGLANG_LANE_POOL_CHECKSUM=1
-export SGLANG_LANE_POOL_CHECKSUM_PATH="$OUT/pool_checksum"
+export FLLIPER_LANE_POOL_CHECKSUM=1
+export FLLIPER_LANE_POOL_CHECKSUM_PATH="$OUT/pool_checksum"
 # Per-position digests: narrows a KV difference from "the prefix" to "this
 # token". Costs jsonl size, not device traffic (the host copies are already
 # made), so it rides along.
-export SGLANG_LANE_POOL_CHECKSUM_PER_POS=1
+export FLLIPER_LANE_POOL_CHECKSUM_PER_POS=1
 
 ( while true; do touch "$ARB/holder" 2>/dev/null; sleep 300; done ) &
 HB_PID=$!
 
 cd "$WT" || exit 1
 launch_server "$LOG" "$PIDFILE" \
-  "$VENV/bin/python" -m sglang.launch_server \
+  "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$TARGET" \
   --tokenizer-path "$TARGET_DIR" \
   --tp-size 3 --rank-gpu-id 0,1,2 \

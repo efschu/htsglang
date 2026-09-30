@@ -26,7 +26,7 @@ flipped by a change to someone else's file.
 import asyncio
 import unittest
 
-from sglang.srt.translator.mt import MtConfig, OpenAiMt
+from flliper.srt.translator.mt import MtConfig, OpenAiMt
 
 
 class RecordingTransport:
@@ -133,7 +133,7 @@ class TestThinkingIsAlwaysExplicit(unittest.TestCase):
 
 class TestLauncherWiring(unittest.TestCase):
     def test_the_launcher_default_is_thinking_off(self):
-        from sglang.srt.translator.launch import build_parser
+        from flliper.srt.translator.launch import build_parser
 
         self.assertFalse(build_parser().parse_args([]).mt_thinking)
         self.assertTrue(build_parser().parse_args(["--mt-thinking"]).mt_thinking)

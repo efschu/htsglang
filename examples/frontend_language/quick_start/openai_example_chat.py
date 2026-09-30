@@ -4,7 +4,7 @@ export OPENAI_API_KEY=sk-******
 python3 openai_example_chat.py
 """
 
-import sglang as sgl
+import flliper as sgl
 
 
 @sgl.function

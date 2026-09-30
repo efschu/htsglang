@@ -31,9 +31,9 @@ import unittest
 from itertools import product
 from unittest import mock
 
-from sglang.srt.planner import key_solver as ks
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import key_solver as ks
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=90, suite="base-a-test-cpu")
 
@@ -149,7 +149,7 @@ def _have(path: str) -> bool:
 class _Bf16StateEnv(CustomTestCase):
     """Base class for the cases that reproduce a booted arm.
 
-    Every measured arm below ran with ``SGLANG_MAMBA_SSM_DTYPE=bfloat16``,
+    Every measured arm below ran with ``FLLIPER_MAMBA_SSM_DTYPE=bfloat16``,
     which halves the recurrent-state pool and therefore every capacity number
     in this file. The variable is read from the environment at call time, so
     it has to be set -- but it is scoped to these classes on purpose: setting
@@ -163,7 +163,7 @@ class _Bf16StateEnv(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._env = mock.patch.dict(os.environ, {"SGLANG_MAMBA_SSM_DTYPE": "bfloat16"})
+        cls._env = mock.patch.dict(os.environ, {"FLLIPER_MAMBA_SSM_DTYPE": "bfloat16"})
         cls._env.start()
 
     @classmethod
@@ -484,7 +484,7 @@ class TestRegressionAnchors(_Bf16StateEnv):
         # ~28.5 GiB of weights + draft + pools leave no room for KV on the
         # 5090. The solver must call this unbootable, at any key -- TP=1 has
         # only one, so "any" is the whole space.
-        from sglang.srt.uneven_perf import PlanInputs
+        from flliper.srt.uneven_perf import PlanInputs
 
         budget = 32607 - 3000
         inputs = PlanInputs(
@@ -510,7 +510,7 @@ class TestRegressionAnchors(_Bf16StateEnv):
     def test_gate3_the_same_model_does_boot_at_tp3(self):
         # The other half of the gate: an unbootability verdict that fires on
         # everything is not a verdict.
-        from sglang.srt.uneven_perf import PlanInputs
+        from flliper.srt.uneven_perf import PlanInputs
 
         budgets = [32607 - 3000, 20480 - 2700, 20480 - 2700]
         inputs = PlanInputs(
@@ -551,7 +551,7 @@ class TestAffineModel(_Bf16StateEnv):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        from sglang.srt.uneven_perf import PlanInputs
+        from flliper.srt.uneven_perf import PlanInputs
 
         cls.budgets = [32607 - 3000, 20480 - 2700, 20480 - 2700]
         inputs = PlanInputs(
@@ -618,7 +618,7 @@ class TestAffineModel(_Bf16StateEnv):
         self.assertGreater(coll * 1e3, 1.0)  # milliseconds, not microseconds
 
     def test_collective_is_absent_without_a_pair_matrix(self):
-        from sglang.srt.uneven_perf import PlanInputs
+        from flliper.srt.uneven_perf import PlanInputs
 
         inputs = PlanInputs(
             tp_size=3,
@@ -644,7 +644,7 @@ class TestSolve(_Bf16StateEnv):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        from sglang.srt.uneven_perf import PlanInputs
+        from flliper.srt.uneven_perf import PlanInputs
 
         cls.budgets = [32607 - 3000, 20480 - 2700, 20480 - 2700]
         cls.inputs = PlanInputs(
@@ -1387,7 +1387,7 @@ class TestNestingHull(CustomTestCase):
         # ``dual_group.nesting_failures`` at EVERY unit count -- 67 of 497 for
         # the rig's [6,1,1] -> [6,2] pair, of which the 2 unsplittable counts
         # are why DESIGN #121 records 65.
-        from sglang.srt.distributed.dual_group import (
+        from flliper.srt.distributed.dual_group import (
             NestedGroupPlan,
             NestingProbe,
             nesting_failures,
@@ -1805,7 +1805,7 @@ class TestSolveLanes(_Bf16StateEnv):
     PD_G, PD_B = [0, 2], [29607, 17780]
 
     def _inputs(self, tp, gpus, budgets, mrr):
-        from sglang.srt.uneven_perf import PlanInputs
+        from flliper.srt.uneven_perf import PlanInputs
 
         return PlanInputs(
             tp_size=tp,
@@ -1901,7 +1901,7 @@ class TestSolveLanes(_Bf16StateEnv):
 @unittest.skipUnless(_have(_FP8), f"needs the 27B-FP8 checkpoint at {_FP8}")
 class TestSolverApi(_Bf16StateEnv):
     def setUp(self):
-        from sglang.srt.planner import solver_api
+        from flliper.srt.planner import solver_api
 
         self.api = solver_api
         self._real_probe = solver_api.cached_card_probe

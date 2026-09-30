@@ -107,7 +107,7 @@ class VerifyRound:
     @classmethod
     def from_dump_record(cls, record: dict, request: int = 0) -> "VerifyRound":
         """Build a round from one record written by
-        ``sglang.srt.speculative.spec_verify_dump``.
+        ``flliper.srt.speculative.spec_verify_dump``.
 
         The rows are REORDERED into emitted order via the record's
         ``accepted_rows`` (which come from ``accept_index``, i.e. GLOBAL flat

@@ -1,9 +1,9 @@
 import unittest
 from typing import Any, Dict
 
-from sglang.test.scripted_runtime.context import ScriptedContext
-from sglang.test.scripted_runtime.test_case import ScriptedTestCase
-from sglang.test.scripted_runtime_chunked_helpers import (
+from flliper.test.scripted_runtime.context import ScriptedContext
+from flliper.test.scripted_runtime.test_case import ScriptedTestCase
+from flliper.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
@@ -11,7 +11,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_all_finished,
     run_until_finished,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+from flliper.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
 
 def _pp_engine_kwargs(*, pp_size: int = 2, **overrides: Any) -> Dict[str, Any]:

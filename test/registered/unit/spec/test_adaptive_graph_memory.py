@@ -16,21 +16,21 @@ from unittest import mock
 
 import torch
 
-import sglang.srt.speculative.adaptive_graph_memory as agm
-from sglang.srt.speculative.adaptive_graph_memory import (
+import flliper.srt.speculative.adaptive_graph_memory as agm
+from flliper.srt.speculative.adaptive_graph_memory import (
     AdaptiveGraphMemoryManager,
     resolve_adaptive_graph_memory_mode,
 )
-from sglang.srt.speculative.adaptive_runtime_state import (
+from flliper.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.adaptive_spec_params import (
+from flliper.srt.speculative.adaptive_spec_params import (
     HIGH_ACCEPT_ADAPTIVE_CONFIG,
     AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -532,7 +532,7 @@ class TestStage2ModeResolution(unittest.TestCase):
             os.environ,
             {
                 "PYTORCH_CUDA_ALLOC_CONF": "",
-                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "1",
+                "FLLIPER_MEMORY_SAVER_CUDA_GRAPH": "1",
             },
         ):
             self.assertEqual(
@@ -710,7 +710,7 @@ class TestStage2CapturePools(unittest.TestCase):
 
 class TestStage2IntWorkspaceTagging(unittest.TestCase):
     def _helper(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             _tag_adaptive_int_workspace,
         )
 
@@ -934,7 +934,7 @@ class TestControllerIntegration(unittest.TestCase):
         worker, controller = self._controller("resident")
         with _mock_cuda():
             controller.init_states(cuda_graph_bs=None)
-        with mock.patch.dict(os.environ, {"SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL": "2"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_ADAPTIVE_FORCE_SWAP_INTERVAL": "2"}):
             for _ in range(8):
                 controller.on_verify_complete([3, 3], batch_size=1)
         # candidates [1,2,3]; start 3 -> 1 -> 2 -> 3 -> 1 (every 2nd call)
@@ -997,10 +997,10 @@ class TestLadderReserveDemand(unittest.TestCase):
     """
 
     def _args(self, **overrides):
-        from sglang.srt.model_executor.cuda_graph_config import (
+        from flliper.srt.model_executor.cuda_graph_config import (
             default_cuda_graph_config,
         )
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         kwargs = dict(
             model_path="dummy",
@@ -1029,7 +1029,7 @@ class TestLadderReserveDemand(unittest.TestCase):
         # so it costs nothing beyond what the base capture term charges.
         args = self._args(speculative_adaptive_config=None, speculative_num_steps=1)
         with mock.patch(
-            "sglang.srt.speculative.adaptive_spec_params."
+            "flliper.srt.speculative.adaptive_spec_params."
             "resolve_candidate_steps_from_config",
             return_value=[1],
         ):

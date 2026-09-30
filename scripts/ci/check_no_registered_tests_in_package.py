@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Pre-commit hook: reject CI-registered tests that live inside the importable
-`sglang` package (python/sglang/).
+`flliper` package (python/flliper/).
 
 Registered tests and benchmarks must live under test/registered/ (e.g.
 test/registered/jit/ for JIT kernel tests and test/registered/jit/benchmark/
@@ -33,16 +33,16 @@ _MARKERS = (
 
 
 def main() -> int:
-    # Import ci_register directly to avoid pulling in all of sglang.
+    # Import ci_register directly to avoid pulling in all of flliper.
     spec = importlib.util.spec_from_file_location(
         "ci_register",
-        os.path.join("python", "sglang", "test", "ci", "ci_register.py"),
+        os.path.join("python", "flliper", "test", "ci", "ci_register.py"),
     )
     ci_register = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ci_register)
 
     offenders = []
-    for f in sorted(glob.glob("python/sglang/**/*.py", recursive=True)):
+    for f in sorted(glob.glob("python/flliper/**/*.py", recursive=True)):
         try:
             with open(f, "r", encoding="utf-8") as fh:
                 source = fh.read()
@@ -61,7 +61,7 @@ def main() -> int:
 
     if offenders:
         print(
-            "ERROR: CI-registered test(s)/benchmark(s) found inside the sglang package:"
+            "ERROR: CI-registered test(s)/benchmark(s) found inside the flliper package:"
         )
         print(
             "  Registered tests and benchmarks must live under test/registered/\n"

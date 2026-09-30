@@ -47,8 +47,8 @@ class _Pool:
 
 
 def _run(is_draft_worker, is_draft_model_runner):
-    from sglang.srt.mem_cache import memory_pool
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from flliper.srt.mem_cache import memory_pool
+    from flliper.srt.model_executor.model_runner import ModelRunner
 
     pool = _Pool()
     # The executor type-checks the pool; register the stand-in.

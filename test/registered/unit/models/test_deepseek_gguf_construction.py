@@ -42,11 +42,11 @@ running something wrong -- also pinned here.
 
 import os
 
-# The DSV4 attention module captures SGLANG_OPT_FP8_WO_A_GEMM at import time.
+# The DSV4 attention module captures FLLIPER_OPT_FP8_WO_A_GEMM at import time.
 # It is auto-disabled on every CUDA device below sm100, but this test must be
-# deterministic on the CI host too. Set it before sglang is imported; the
+# deterministic on the CI host too. Set it before flliper is imported; the
 # fp8-on-GGUF refusal is exercised separately by patching the module global.
-os.environ.setdefault("SGLANG_OPT_FP8_WO_A_GEMM", "0")
+os.environ.setdefault("FLLIPER_OPT_FP8_WO_A_GEMM", "0")
 
 import unittest
 from types import SimpleNamespace
@@ -55,11 +55,11 @@ from unittest import mock
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers.quantization.gguf import GGUFConfig
-from sglang.srt.runtime_context import get_context, get_parallel, reset_context
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.quantization.gguf import GGUFConfig
+from flliper.srt.runtime_context import get_context, get_parallel, reset_context
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -76,7 +76,7 @@ def _ensure_dist_initialized() -> None:
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
 
-    from sglang.srt.distributed.parallel_state import (
+    from flliper.srt.distributed.parallel_state import (
         init_distributed_environment,
         initialize_model_parallel,
         model_parallel_is_initialized,
@@ -229,7 +229,7 @@ class TestConstructionUnderGGUF(_ServerArgsFixture):
         # The exact site of the boot failure: deepseek_v2.py DeepseekV2MoE
         # __init__, reached because n_shared_experts=1 and the fused layout is
         # off. Pre-fix: AttributeError on `.weight`.
-        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+        from flliper.srt.models.deepseek_v2 import DeepseekV2MoE
 
         self.server_args.disable_shared_experts_fusion = True
         with torch.device("meta"):
@@ -254,7 +254,7 @@ class TestConstructionUnderGGUF(_ServerArgsFixture):
         # the CPU fused-rope gate) plus the MoE layer.
         from transformers import DeepseekV3Config
 
-        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+        from flliper.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
         config = DeepseekV3Config(**_V3_CONFIG)
         with torch.device("meta"), get_parallel().override(
@@ -277,7 +277,7 @@ class TestConstructionUnderGGUF(_ServerArgsFixture):
         # instantiates the very modules that were broken.
         from transformers import DeepseekV3Config
 
-        from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
+        from flliper.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 
         config = DeepseekV3Config(num_nextn_predict_layers=1, **_V3_CONFIG)
         with torch.device("meta"), get_parallel().override(
@@ -298,8 +298,8 @@ class TestConstructionUnderGGUF(_ServerArgsFixture):
     def test_deepseek_v4_causal_lm_builds(self):
         # The boot target. DeepseekV4DecoderLayer delegates its MoE to
         # deepseek_v2.DeepseekV2MoE, which is where the boot died.
-        from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+        from flliper.srt.configs.deepseek_v4 import DeepSeekV4Config
+        from flliper.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
         config = DeepSeekV4Config(**_V4_CONFIG)
         with torch.device("meta"):
@@ -321,7 +321,7 @@ class TestNonGGUFVerdictsUnchanged(_ServerArgsFixture):
     linear methods and read the flags back."""
 
     def _build(self, quant_method, quant_config):
-        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+        from flliper.srt.models.deepseek_v2 import DeepseekV2MoE
 
         self.server_args.disable_shared_experts_fusion = True
         with torch.device("meta"):
@@ -339,7 +339,7 @@ class TestNonGGUFVerdictsUnchanged(_ServerArgsFixture):
         self.assertFalse(moe.shared_experts_is_fp8)
 
     def test_block_fp8_still_selects_the_fp8_path(self):
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        from flliper.srt.layers.quantization.fp8 import Fp8Config
 
         moe = self._build(
             "fp8",
@@ -355,7 +355,7 @@ class TestNonGGUFVerdictsUnchanged(_ServerArgsFixture):
         self.assertEqual(moe.shared_experts_weight_block_size, [128, 128])
 
     def test_w8a8_int8_still_selects_the_int8_path(self):
-        from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+        from flliper.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
         moe = self._build("w8a8_int8", W8A8Int8Config())
         self.assertEqual(moe.shared_experts.gate_up_proj.weight.dtype, torch.int8)
@@ -381,7 +381,7 @@ class TestDtypeGateNeutrality(CustomTestCase):
         return layer
 
     def test_dense_dtypes_are_reported_unchanged(self):
-        from sglang.srt.models.deepseek_common.utils import dense_weight_dtype
+        from flliper.srt.models.deepseek_common.utils import dense_weight_dtype
 
         for dtype in (
             torch.bfloat16,
@@ -396,7 +396,7 @@ class TestDtypeGateNeutrality(CustomTestCase):
                 self.assertEqual(dense_weight_dtype(layer), dtype)
 
     def test_packed_layers_report_none_where_the_old_code_raised(self):
-        from sglang.srt.models.deepseek_common.utils import dense_weight_dtype
+        from flliper.srt.models.deepseek_common.utils import dense_weight_dtype
 
         # AWQ / GPTQ / GGUF shape: qweight, no weight.
         layer = nn.Module()
@@ -408,7 +408,7 @@ class TestDtypeGateNeutrality(CustomTestCase):
             _ = layer.weight.dtype
 
     def test_none_never_equals_a_real_dtype(self):
-        from sglang.srt.models.deepseek_common.utils import dense_weight_dtype
+        from flliper.srt.models.deepseek_common.utils import dense_weight_dtype
 
         # The gates are all `== <dtype>`, so None must not collide with any
         # of them; this is what makes "packed" mean "general path".
@@ -417,7 +417,7 @@ class TestDtypeGateNeutrality(CustomTestCase):
             self.assertNotEqual(dense_weight_dtype(layer), dtype)
 
     def test_quant_method_name_reads_the_layer_not_the_model(self):
-        from sglang.srt.models.deepseek_common.utils import layer_quant_method_name
+        from flliper.srt.models.deepseek_common.utils import layer_quant_method_name
 
         layer = nn.Module()
         self.assertIsNone(layer_quant_method_name(layer))
@@ -427,7 +427,7 @@ class TestDtypeGateNeutrality(CustomTestCase):
         self.assertEqual(layer_quant_method_name(layer), "fp8")
 
     def test_is_gguf_quant_config_only_matches_gguf(self):
-        from sglang.srt.models.deepseek_common.utils import is_gguf_quant_config
+        from flliper.srt.models.deepseek_common.utils import is_gguf_quant_config
 
         self.assertFalse(is_gguf_quant_config(None))
         for name in ("fp8", "w8a8_int8", "awq", "awq_marlin", "gptq", "moe_wna16"):
@@ -469,7 +469,7 @@ class TestSharedExpertFusionPolicy(_ServerArgsFixture):
         )
 
     def test_v4_gguf_disables_fusion_and_says_why(self):
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+        from flliper.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
         self.server_args.enforce_shared_experts_fusion = False
         model = self._v4_model("gguf")
@@ -478,7 +478,7 @@ class TestSharedExpertFusionPolicy(_ServerArgsFixture):
         self.assertTrue(self.server_args.disable_shared_experts_fusion)
 
     def test_v4_gguf_refuses_enforced_fusion_by_name(self):
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+        from flliper.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
         self.server_args.enforce_shared_experts_fusion = True
         model = self._v4_model("gguf")
@@ -488,7 +488,7 @@ class TestSharedExpertFusionPolicy(_ServerArgsFixture):
         self.assertIn("enforce-shared-experts-fusion", str(ctx.exception))
 
     def test_v4_non_gguf_enforced_fusion_is_unchanged(self):
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+        from flliper.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
         for quant_name in (None, "fp8", "w8a8_int8", "awq", "gptq"):
             with self.subTest(quant=quant_name):
@@ -500,7 +500,7 @@ class TestSharedExpertFusionPolicy(_ServerArgsFixture):
                 self.assertFalse(self.server_args.disable_shared_experts_fusion)
 
     def test_v2_gguf_disables_fusion_even_when_enforced_is_off(self):
-        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+        from flliper.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
         self.server_args.enforce_shared_experts_fusion = False
         model = self._v2_model("gguf")
@@ -509,7 +509,7 @@ class TestSharedExpertFusionPolicy(_ServerArgsFixture):
         self.assertTrue(self.server_args.disable_shared_experts_fusion)
 
     def test_v2_gguf_refuses_enforced_fusion_by_name(self):
-        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+        from flliper.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
         self.server_args.enforce_shared_experts_fusion = True
         model = self._v2_model("gguf")
@@ -518,7 +518,7 @@ class TestSharedExpertFusionPolicy(_ServerArgsFixture):
         self.assertIn("gguf", str(ctx.exception))
 
     def test_v2_non_gguf_enforced_fusion_is_unchanged(self):
-        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+        from flliper.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
         for quant_name in (None, "fp8", "w8a8_int8", "awq", "gptq"):
             with self.subTest(quant=quant_name):
@@ -538,7 +538,7 @@ class TestNamedRefusals(CustomTestCase):
         # w_kc / w_vc are split out of a DENSE kv_b_proj. A GGUF kv_b_proj
         # carries qweight like an AWQ one, so without the refusal it would
         # fall into the AWQ dequantizer and die there on a missing `scales`.
-        from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+        from flliper.srt.models.deepseek_common.deepseek_weight_loader import (
             DeepseekV2WeightLoaderMixin,
         )
 
@@ -566,7 +566,7 @@ class TestNamedRefusals(CustomTestCase):
 
     def test_fp8_wo_a_gemm_refuses_gguf(self):
         # DSV4's fp8 wo_a einsum reads a dense weight plus block scales.
-        from sglang.srt.models import deepseek_v4
+        from flliper.srt.models import deepseek_v4
 
         self.assertFalse(
             deepseek_v4._FP8_WO_A_GEMM,
@@ -577,7 +577,7 @@ class TestNamedRefusals(CustomTestCase):
             saved = get_context()._server_args
             get_context().set_server_args(ServerArgs(model_path="dummy", device="cpu"))
             try:
-                from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+                from flliper.srt.configs.deepseek_v4 import DeepSeekV4Config
 
                 config = DeepSeekV4Config(**_V4_CONFIG)
                 with self.assertRaises(NotImplementedError) as ctx:
@@ -591,12 +591,12 @@ class TestNamedRefusals(CustomTestCase):
                 else:
                     get_context().set_server_args(saved)
         self.assertIn("gguf", str(ctx.exception))
-        self.assertIn("SGLANG_OPT_FP8_WO_A_GEMM", str(ctx.exception))
+        self.assertIn("FLLIPER_OPT_FP8_WO_A_GEMM", str(ctx.exception))
 
     def test_cpu_amx_shared_expert_kernel_refuses_packed_weights(self):
         # forward_cpu hands the two dense shared-expert tensors straight to
         # shared_expert_cpu; there is no packed variant of that kernel.
-        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+        from flliper.srt.models.deepseek_v2 import DeepseekV2MoE
 
         gate_up_proj = nn.Module()
         gate_up_proj.qweight = nn.Parameter(

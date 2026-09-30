@@ -9,7 +9,7 @@ import os
 import tempfile
 from typing import Any, Dict, List
 
-from sglang.test.simple_eval_longbench_v2 import (
+from flliper.test.simple_eval_longbench_v2 import (
     LongBenchV2Eval,
     extract_longbench_v2_answer,
     format_longbench_v2_question,
@@ -290,7 +290,7 @@ def generate_comparison_report() -> None:
     print("  • Official answer extraction patterns: ✓")
     print("  • Context length filtering: ✓")
     print("  • HuggingFace dataset integration: ✓")
-    print("  • SGLang evaluation framework compliance: ✓")
+    print("  • fLLiper evaluation framework compliance: ✓")
 
     print("\n📈 EXPECTED PERFORMANCE RANGE:")
     print("  • Small models (7B): 35-45% accuracy")
@@ -302,7 +302,7 @@ def generate_comparison_report() -> None:
 
     print("\n✨ IMPLEMENTATION HIGHLIGHTS:")
     print("  • Follows official LongBench-v2 evaluation methodology")
-    print("  • Compatible with SGLang's existing evaluation patterns")
+    print("  • Compatible with fLLiper's existing evaluation patterns")
     print("  • Supports multiple data sources (HF, JSON, CSV)")
     print("  • Robust error handling and fallback mechanisms")
     print("  • Comprehensive filtering and configuration options")

@@ -1,7 +1,7 @@
 """KV cell sizing must read the OWNED SET, not the stage's span.
 
 `[start_layer, end_layer)` equals the owned layers only while a stage is a
-contiguous interval. Under `SGLANG_PP_LAYER_SET` it does not, and the hybrid
+contiguous interval. Under `FLLIPER_PP_LAYER_SET` it does not, and the hybrid
 (mambaish) branch of `MemoryPoolConfigurator` was still counting full-attention
 layers by span after the same distinction had already been fixed for
 `num_effective_layers`.
@@ -24,8 +24,8 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -47,7 +47,7 @@ def _effective_full_attn_layers(pp_rank, pp_size, start_layer, end_layer):
     device; the selection under test is pure integer logic over the owned set,
     so it is exercised directly against the same helper the configurator calls.
     """
-    from sglang.srt.distributed.utils import get_pp_layer_set
+    from flliper.srt.distributed.utils import get_pp_layer_set
 
     owned = get_pp_layer_set(NUM_LAYERS, pp_rank, pp_size)
     if owned is not None:
@@ -58,8 +58,8 @@ def _effective_full_attn_layers(pp_rank, pp_size, start_layer, end_layer):
 class TestGappedSetCellSizing(CustomTestCase):
     def setUp(self):
         self._env = dict(os.environ)
-        os.environ["SGLANG_PP_LAYER_SET"] = GAPPED
-        os.environ["SGLANG_PP_CROSSING_WIRE"] = "1"
+        os.environ["FLLIPER_PP_LAYER_SET"] = GAPPED
+        os.environ["FLLIPER_PP_CROSSING_WIRE"] = "1"
 
     def tearDown(self):
         os.environ.clear()
@@ -98,7 +98,7 @@ class TestGappedSetCellSizing(CustomTestCase):
 
     def test_contiguous_path_is_untouched(self):
         """With no layer set the span rule must still be what runs."""
-        os.environ.pop("SGLANG_PP_LAYER_SET")
+        os.environ.pop("FLLIPER_PP_LAYER_SET")
         # Stage 1 of a contiguous [0,32)/[32,64) split.
         got = _effective_full_attn_layers(1, 2, start_layer=32, end_layer=64)
         self.assertEqual(got, [i for i in FULL_ATTN if 32 <= i < 64])
@@ -117,7 +117,7 @@ class TestKvlessStageImposesNoBound(CustomTestCase):
     """
 
     def test_sentinel_is_above_any_real_universe_and_still_allocation_safe(self):
-        from sglang.srt.model_executor.pool_configurator import MemoryPoolConfigurator
+        from flliper.srt.model_executor.pool_configurator import MemoryPoolConfigurator
 
         sentinel = MemoryPoolConfigurator._KVLESS_STAGE_TOKENS
         # The two attention stages of the measured gapped boot solved to
@@ -129,7 +129,7 @@ class TestKvlessStageImposesNoBound(CustomTestCase):
 
     def test_a_zero_cell_never_divides(self):
         """The failure mode this replaces is a ZeroDivisionError at boot."""
-        from sglang.srt.model_executor.pool_configurator import MemoryPoolConfigurator
+        from flliper.srt.model_executor.pool_configurator import MemoryPoolConfigurator
 
         cfg = MemoryPoolConfigurator.__new__(MemoryPoolConfigurator)
         cfg._cell_size = 0

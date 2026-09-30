@@ -8,7 +8,7 @@ THE FINDING. ``LRUFileEvictor.reserve()`` ran the whole cap eviction -- cap down
 THE REPRODUCTION. A store of many small committed pages sits just under its cap; a "backup" thread reserves one
 more page, which crosses the cap; ``os.remove`` is slowed to the rig's per-file cost scaled up, so the run is long.
 The "reset" joins that thread with a bound. Red on the base (the join waits for the whole run), green with
-SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=1 (reserve evicts only its own need, the "l3_evictor" thread finishes
+FLLIPER_HICACHE_FILE_BACKEND_EVICT_OFFPATH=1 (reserve evicts only its own need, the "l3_evictor" thread finishes
 the run). Invariants on both: every page still in the index has its file; every evicted page went through
 on_evict; the directory ends at or below cap x ratio once the background run is done.
 """
@@ -20,15 +20,15 @@ import unittest
 from unittest import mock
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.test.ci.ci_register import register_cpu_ci
 except ImportError:  # pragma: no cover
 
     def register_cpu_ci(*args, **kwargs):
         return None
 
 
-from sglang.srt.mem_cache.storage.file import lru_file_evictor as lfe
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.storage.file import lru_file_evictor as lfe
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -42,8 +42,8 @@ JOIN_BOUND_S = 1.0   # the flush may wait for one page's own need, never for the
 class _Harness:
     def __init__(self, tmpdir: str, offpath: bool):
         self.evicted = []
-        env = {"SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE": "", "SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE": "",
-               "SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "1" if offpath else "0"}
+        env = {"FLLIPER_HICACHE_FILE_BACKEND_MAX_SIZE": "", "FLLIPER_HICACHE_FILE_BACKEND_MIN_FREE_SPACE": "",
+               "FLLIPER_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "1" if offpath else "0"}
         self._env = mock.patch.dict(os.environ, env)
         self._env.start()
         self.ev = lfe.LRUFileEvictor(
@@ -264,7 +264,7 @@ class L3EvictOffpathHoldsTest(CustomTestCase):
                         h.ev.max_size_bytes = int(h.ev._directory_bytes_locked() * 0.5)
                         h.ev._kick_bg_evictor_locked()
                     time.sleep(0.2)
-                    with self.assertRaises(lfe.Weg2L3EvictorPauseRefused):
+                    with self.assertRaises(lfe.PdFlipL3EvictorPauseRefused):
                         h.ev.pause_for_sleep(timeout=0.3)
                     h.ev.pause_background_eviction(timeout=10.0)
             finally:
@@ -303,14 +303,14 @@ class L3EvictOffpathHoldsTest(CustomTestCase):
 class TestEvictOffpathDefault(unittest.TestCase):
     def test_default_is_on_after_metal_proof(self):
         # 29.09. l3cap10 boot proved the path; a proven performance switch is default on (user order).
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        old = os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH", None)
+        old = os.environ.pop("FLLIPER_HICACHE_FILE_BACKEND_EVICT_OFFPATH", None)
         try:
-            self.assertTrue(envs.SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH.get())
+            self.assertTrue(envs.FLLIPER_HICACHE_FILE_BACKEND_EVICT_OFFPATH.get())
         finally:
             if old is not None:
-                os.environ["SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH"] = old
+                os.environ["FLLIPER_HICACHE_FILE_BACKEND_EVICT_OFFPATH"] = old
 
 
 if __name__ == "__main__":

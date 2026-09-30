@@ -15,7 +15,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache.storage.file import hicache_arena as ha
+from flliper.srt.mem_cache.storage.file import hicache_arena as ha
 
 pytestmark = pytest.mark.skipif(
     ha._load_lib() is None, reason="needs gcc"
@@ -96,7 +96,7 @@ def test_a_second_process_reads_what_the_first_wrote(arena):
     assert arena.write(["shared"], [PAGE], [[(0, PAGE)]], [a.data_ptr()]) == [1]
     code = (
         "import os,torch,sys\n"
-        "from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena\n"
+        "from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena\n"
         f"b=ShmArena({arena.path!r},{PAGE},64)\n"
         "o=torch.zeros(4096,dtype=torch.uint8)\n"
         f"st=b.read(['shared'],[{PAGE}],[[(1024,4096)]],[o.data_ptr()])\n"

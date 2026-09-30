@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.performance_test_runner import PerformanceTestParams
-from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from flliper.test.accuracy_test_runner import AccuracyTestParams
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.performance_test_runner import PerformanceTestParams
+from flliper.test.run_combined_tests import run_combined_tests
+from flliper.test.test_utils import ModelLaunchSettings
 
 # Kimi-K2.6 NVFP4 (pure-MLA target, fp8 KV) + DFlash speculative decoding on 8x B200, tp=8.
 register_cuda_ci(est_time=3600, suite="nightly-8-gpu-b200", nightly=True)

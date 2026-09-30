@@ -9,7 +9,7 @@ What they lock down:
   1. the three barlink modules import without creating a CUDA context
      (a ROCm or CPU-only rank must be able to import them),
   2. the feature flag is OFF by default -> the dispatch path is byte-identical
-     to stock sglang,
+     to stock flliper,
   3. the vendor-neutral hinge (_pin_host_memory) selects the runtime of the
      process it is running in, never the other vendor's,
   4. the calibration-persistence stub is rank-uniform (constant),
@@ -31,7 +31,7 @@ import torch.distributed
 _COMM_DIR = (
     pathlib.Path(__file__).resolve().parents[4]
     / "python"
-    / "sglang"
+    / "flliper"
     / "srt"
     / "distributed"
     / "device_communicators"
@@ -41,11 +41,11 @@ _ENVIRON = _COMM_DIR.parents[1] / "environ.py"
 
 
 def _env_defaults():
-    """Read the SGLANG_BARLINK* declarations out of THIS worktree's environ.py.
+    """Read the FLLIPER_BARLINK* declarations out of THIS worktree's environ.py.
 
-    Deliberately source-level rather than `from sglang.srt.environ import
+    Deliberately source-level rather than `from flliper.srt.environ import
     envs`: the venv is editable-installed against a different checkout, and
-    importing sglang initializes CUDA. Both are disqualifying here.
+    importing flliper initializes CUDA. Both are disqualifying here.
     """
     tree = ast.parse(_ENVIRON.read_text())
     cls = next(
@@ -58,7 +58,7 @@ def _env_defaults():
         if not isinstance(node, ast.AnnAssign | ast.Assign):
             continue
         target = node.target if isinstance(node, ast.AnnAssign) else node.targets[0]
-        if not isinstance(target, ast.Name) or not target.id.startswith("SGLANG_BARLINK"):
+        if not isinstance(target, ast.Name) or not target.id.startswith("FLLIPER_BARLINK"):
             continue
         call = node.value
         assert isinstance(call, ast.Call), f"{target.id} is not an Env* declaration"
@@ -67,7 +67,7 @@ def _env_defaults():
 
 
 def _load_standalone(name):
-    """Import an barlink module directly from its file, bypassing the sglang
+    """Import an barlink module directly from its file, bypassing the flliper
     package __init__ (which itself initializes CUDA)."""
     spec = importlib.util.spec_from_file_location(
         f"_barlink_test_{name}", _COMM_DIR / f"{name}.py"
@@ -374,30 +374,30 @@ def test_device_extension_arch_union_keeps_vendors_separate(monkeypatch):
 
 
 def test_flag_is_off_by_default():
-    kind, default = _env_defaults()["SGLANG_BARLINK"]
+    kind, default = _env_defaults()["FLLIPER_BARLINK"]
     assert (kind, default) == ("EnvBool", False), (
-        "SGLANG_BARLINK must default to False -- backward compatibility "
+        "FLLIPER_BARLINK must default to False -- backward compatibility "
         "requires the stock NCCL path when the flag is unset"
     )
 
 
 def test_default_transport_is_device():
-    assert _env_defaults()["SGLANG_BARLINK_TRANSPORT"] == ("EnvStr", "device")
+    assert _env_defaults()["FLLIPER_BARLINK_TRANSPORT"] == ("EnvStr", "device")
     # ... and the module agrees, so env and code cannot drift apart.
     assert _load_standalone("barlink")._TRANSPORT == "device"
 
 
 def test_all_barlink_envs_are_registered():
-    """Every SGLANG_BARLINK* the ported modules read must be declared, so it
+    """Every FLLIPER_BARLINK* the ported modules read must be declared, so it
     shows up in the env dump and cannot be silently misspelled."""
     declared = set(_env_defaults())
     read = set()
     for name in ("barlink", "barlink_shm", "barlink_device", "barlink_host"):
         for node in ast.walk(ast.parse((_COMM_DIR / f"{name}.py").read_text())):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if node.value.startswith("SGLANG_BARLINK"):
+                if node.value.startswith("FLLIPER_BARLINK"):
                     # f-string fragments carry trailing punctuation, e.g.
-                    # f"SGLANG_BARLINK_RSAG_SHARES={override!r} ..." -> keep
+                    # f"FLLIPER_BARLINK_RSAG_SHARES={override!r} ..." -> keep
                     # only the leading identifier.
                     ident = node.value.split("=")[0].split()[0].strip()
                     read.add(ident)
@@ -583,7 +583,7 @@ def test_unsupported_collectives_are_guarded():
     src = _PARALLEL_STATE.read_text()
     for op in _MUST_FAIL_FAST:
         assert f'self._barlink_unsupported("{op}")' in src, (
-            f"{op} has no barlink fail-fast guard -- under SGLANG_BARLINK it "
+            f"{op} has no barlink fail-fast guard -- under FLLIPER_BARLINK it "
             "would silently fall through to NCCL and hang"
         )
 
@@ -625,26 +625,26 @@ def test_construction_is_flag_gated():
     It used to be inlined here. #598 gave it a name because a SECOND reader
     needs it: the VRAM ledger has to answer "does this launch build an NCCL
     communicator at all?" during argument parsing, and a ledger that re-derived
-    `envs.SGLANG_BARLINK.get() and world_size > 1` would keep pricing that term
+    `envs.FLLIPER_BARLINK.get() and world_size > 1` would keep pricing that term
     at 0 after this condition changed. So the assertion moves down one level --
     the gate must BE the shared predicate, and the predicate must still be the
     flag -- rather than being dropped.
     """
-    from sglang.srt.distributed.parallel_state import should_build_barlink
+    from flliper.srt.distributed.parallel_state import should_build_barlink
 
     src = _PARALLEL_STATE.read_text()
     assert "if should_build_barlink(self.world_size):" in src, (
         "barlink must only be constructed when the flag is on"
     )
     assert (
-        "return bool(envs.SGLANG_BARLINK.get()) and world_size > 1"
+        "return bool(envs.FLLIPER_BARLINK.get()) and world_size > 1"
         in inspect.getsource(should_build_barlink)
     ), "should_build_barlink must still be exactly the flag-and-multi-rank gate"
     # The communicator module must not be imported at all when the flag is off.
-    assert src.count("from sglang.srt.distributed.device_communicators.barlink import") == 1
+    assert src.count("from flliper.srt.distributed.device_communicators.barlink import") == 1
     idx_gate = src.index("if should_build_barlink(self.world_size):")
     idx_import = src.index(
-        "from sglang.srt.distributed.device_communicators.barlink import"
+        "from flliper.srt.distributed.device_communicators.barlink import"
     )
     assert idx_import > idx_gate, "the barlink import must sit inside the flag gate"
 
@@ -670,12 +670,12 @@ def test_cpu_transports_are_rejected_while_cuda_graphs_are_on():
     """
     import types as _types
 
-    import sglang.srt.distributed.parallel_state as ps
+    import flliper.srt.distributed.parallel_state as ps
 
     graphs_on = _types.SimpleNamespace(disable_cuda_graph=False)
     graphs_off = _types.SimpleNamespace(disable_cuda_graph=True)
 
-    import sglang.srt.runtime_context as rc
+    import flliper.srt.runtime_context as rc
     orig = rc.get_server_args
     try:
         rc.get_server_args = lambda: graphs_on
@@ -690,7 +690,7 @@ def test_cpu_transports_are_rejected_while_cuda_graphs_are_on():
         # the allowlist and the registry must agree on what "capturable"
         # means -- a transport registered as capturable but unknown to the
         # registry (or vice versa) is how the ucx gap happened
-        from sglang.srt.distributed.device_communicators.barlink import (
+        from flliper.srt.distributed.device_communicators.barlink import (
             TRANSPORT_REGISTRY,
         )
 

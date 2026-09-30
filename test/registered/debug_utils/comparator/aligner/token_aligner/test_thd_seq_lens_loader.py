@@ -6,13 +6,13 @@ import polars as pl
 import pytest
 import torch
 
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.concat_steps.thd_seq_lens_loader import (
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.concat_steps.thd_seq_lens_loader import (
     load_thd_seq_lens_only,
 )
-from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins import (
-    _SGLangPlugin,
+from flliper.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins import (
+    _FlliperPlugin,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
 
@@ -69,7 +69,7 @@ class TestLoadThdSeqLensOnly:
     def test_returns_none_when_no_cp_sharded_names(self, tmp_path: Path) -> None:
         """Plugin detected but cp_sharded_names is empty → returns None."""
 
-        class _NoCpPlugin(_SGLangPlugin):
+        class _NoCpPlugin(_FlliperPlugin):
             @property
             def cp_sharded_names(self) -> frozenset[str]:
                 return frozenset()
@@ -80,27 +80,27 @@ class TestLoadThdSeqLensOnly:
             step=0,
             rank=0,
             value=torch.tensor([3, 5]),
-            meta={"sglang_parallel_info": {"tp_rank": 0, "tp_size": 1}},
+            meta={"flliper_parallel_info": {"tp_rank": 0, "tp_size": 1}},
         )
         df: pl.DataFrame = _make_df_from_filenames([fn])
 
         with patch(
-            "sglang.srt.debug_utils.comparator.aligner.token_aligner.concat_steps.thd_seq_lens_loader._detect_plugin",
+            "flliper.srt.debug_utils.comparator.aligner.token_aligner.concat_steps.thd_seq_lens_loader._detect_plugin",
             return_value=_NoCpPlugin(),
         ):
             result = load_thd_seq_lens_only(dump_path=tmp_path, df=df)
 
         assert result is None
 
-    def test_sglang_extracts_seq_lens(self, tmp_path: Path) -> None:
-        """SGLang format: seq_lens tensor present → extracts per-seq lengths."""
+    def test_flliper_extracts_seq_lens(self, tmp_path: Path) -> None:
+        """fLLiper format: seq_lens tensor present → extracts per-seq lengths."""
         fn: str = _save_pt(
             tmp_path,
             name="seq_lens",
             step=0,
             rank=0,
             value=torch.tensor([3, 5]),
-            meta={"sglang_parallel_info": {"tp_rank": 0, "tp_size": 1}},
+            meta={"flliper_parallel_info": {"tp_rank": 0, "tp_size": 1}},
         )
         df: pl.DataFrame = _make_df_from_filenames([fn])
 
@@ -134,7 +134,7 @@ class TestLoadThdSeqLensOnly:
             step=0,
             rank=0,
             value=torch.tensor([3, 5]),
-            meta={"sglang_parallel_info": {"tp_rank": 0, "tp_size": 1}},
+            meta={"flliper_parallel_info": {"tp_rank": 0, "tp_size": 1}},
         )
         fn1: str = _save_pt(
             tmp_path,
@@ -142,7 +142,7 @@ class TestLoadThdSeqLensOnly:
             step=1,
             rank=0,
             value=torch.tensor([10, 20, 30]),
-            meta={"sglang_parallel_info": {"tp_rank": 0, "tp_size": 1}},
+            meta={"flliper_parallel_info": {"tp_rank": 0, "tp_size": 1}},
         )
         df: pl.DataFrame = _make_df_from_filenames([fn0, fn1])
 

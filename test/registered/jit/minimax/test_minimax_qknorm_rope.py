@@ -1,18 +1,18 @@
 """Correctness for the fused MiniMax-M3 Gemma-RMSNorm + partial NeoX RoPE kernel.
 
 Verifies the in-place fused kernel reproduces GemmaRMSNorm((1+w)) + partial NeoX
-RoPE to the bf16 round-off floor, leaves V untouched, and matches sglang's RoPE
+RoPE to the bf16 round-off floor, leaves V untouched, and matches flliper's RoPE
 convention (cos|sin cache, neox pairs (i, i+rotary_dim/2)).
 """
 
 import pytest
 import torch
 
-from sglang.jit_kernel.minimax_qknorm_rope import (
+from flliper.jit_kernel.minimax_qknorm_rope import (
     minimax_qknorm_rope,
     minimax_qknorm_rope_grouped,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")

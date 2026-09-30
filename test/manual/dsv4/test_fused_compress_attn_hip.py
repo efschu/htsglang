@@ -183,7 +183,7 @@ def _ref_compress(
     ratio: int,
     num_compress: int,
 ) -> torch.Tensor:
-    """Pure-PyTorch reference matching SGLang compress_decode_paged semantics.
+    """Pure-PyTorch reference matching fLLiper compress_decode_paged semantics.
 
     State already has current tokens written (no APE).
     APE is added to ALL K scores at compress time.

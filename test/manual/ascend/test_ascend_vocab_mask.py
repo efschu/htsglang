@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from sglang.srt.constrained import xgrammar_backend as xb
+from flliper.srt.constrained import xgrammar_backend as xb
 
 
 def _pack_mask(allowed_ids, vocab_size, batch_size=1):

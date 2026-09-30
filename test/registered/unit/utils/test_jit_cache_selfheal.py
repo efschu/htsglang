@@ -35,13 +35,13 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 # THE REAL MODULE, imported -- not re-implemented here.
-from sglang.jit_kernel.cache_health import (  # noqa: E402
+from flliper.jit_kernel.cache_health import (  # noqa: E402
     MARKER_BUILDING,
     building_marker,
     entry_state,
@@ -186,7 +186,7 @@ class TestLoadJitWiring(CustomTestCase):
     def test_load_jit_heals_before_building_and_after_a_failed_load(self):
         import inspect
 
-        from sglang.jit_kernel import utils as jit_utils
+        from flliper.jit_kernel import utils as jit_utils
 
         src = inspect.getsource(jit_utils.load_jit)
         self.assertIn("heal_entry", src)
@@ -200,7 +200,7 @@ class TestLoadJitWiring(CustomTestCase):
     def test_the_process_sweep_runs_once_and_is_env_gated(self):
         from unittest import mock
 
-        from sglang.jit_kernel import utils as jit_utils
+        from flliper.jit_kernel import utils as jit_utils
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -208,7 +208,7 @@ class TestLoadJitWiring(CustomTestCase):
 
             def _sweep(env_value):
                 jit_utils._jit_cache_swept = False
-                patches = {"SGLANG_JIT_CACHE_SELFHEAL": env_value}
+                patches = {"FLLIPER_JIT_CACHE_SELFHEAL": env_value}
                 with mock.patch.dict(os.environ, patches, clear=False):
                     with mock.patch.object(
                         jit_utils, "_jit_cache_root", lambda: root
@@ -217,7 +217,7 @@ class TestLoadJitWiring(CustomTestCase):
 
             self.assertEqual(_sweep("0"), [])
             self.assertTrue(
-                dead.is_dir(), "SGLANG_JIT_CACHE_SELFHEAL=0 did not disable the sweep"
+                dead.is_dir(), "FLLIPER_JIT_CACHE_SELFHEAL=0 did not disable the sweep"
             )
             self.assertEqual([Path(p).name for p in _sweep("1")], ["dead"])
             self.assertFalse(dead.exists())
@@ -246,7 +246,7 @@ class TestLoadJitEndToEnd(CustomTestCase):
 
         import tvm_ffi.cpp
 
-        from sglang.jit_kernel import utils as jit_utils
+        from flliper.jit_kernel import utils as jit_utils
 
         def fake_load_inline(module_name, *a, build_directory=None, **kw):
             built.append(module_name)

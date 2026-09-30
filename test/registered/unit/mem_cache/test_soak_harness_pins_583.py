@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 
 _HARNESS = Path("scripts/repro/barlink_launch_failure_583.sh")
-_SRT = Path("python/sglang/srt")
+_SRT = Path("python/flliper/srt")
 
 #: literal -> source file that must contain it verbatim.
 #:

@@ -11,7 +11,7 @@
 #
 # This drives nvidia-smi's own internal loop (-lms), which does not pay process
 # startup per sample, and defaults to 100 ms. The authoritative peak still comes
-# from SGLANG_FORWARD_PEAK_PATH (per rank, per forward, driver-side
+# from FLLIPER_FORWARD_PEAK_PATH (per rank, per forward, driver-side
 # `nvml_free_bytes_min` alongside torch's counter) -- this trace is the shape,
 # forward_peak is the number.
 #

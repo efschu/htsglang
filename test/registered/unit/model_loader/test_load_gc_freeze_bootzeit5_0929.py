@@ -27,11 +27,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import PresplitGcMode, envs
-from sglang.srt.layers.moe import expert_offload as eo
-from sglang.srt.model_loader import load_gc
-from sglang.srt.model_loader import loader as loader_mod
-from sglang.srt.model_loader.load_gc import load_gc_frozen
+from flliper.srt.environ import PresplitGcMode, envs
+from flliper.srt.layers.moe import expert_offload as eo
+from flliper.srt.model_loader import load_gc
+from flliper.srt.model_loader import loader as loader_mod
+from flliper.srt.model_loader.load_gc import load_gc_frozen
 
 
 class _Node:
@@ -62,7 +62,7 @@ class TestDenseLoadIsUntouched(_FreezeCase):
     """27B review (a): a load without the expert presplit freezes nothing."""
 
     def test_no_presplit_means_no_freeze_no_collect_no_sampler(self):
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(True), \
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(True), \
                 mock.patch.object(load_gc.gc, "collect") as collect, \
                 mock.patch.object(load_gc.gc, "freeze") as freeze, \
                 mock.patch.object(load_gc, "_PeakSampler") as sampler:
@@ -76,14 +76,14 @@ class TestDenseLoadIsUntouched(_FreezeCase):
     def test_default_fraction_is_no_presplit(self):
         # The 27B profiles set no resident fraction: the default 1.0 is "no
         # expert offload anywhere", so the loader passes expert_presplit=False.
-        with envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.override("1.0"):
+        with envs.FLLIPER_MOE_RESIDENT_EXPERT_FRACTION.override("1.0"):
             self.assertFalse(load_gc.expert_presplit_runs())
-        with envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.override("0.4"):
+        with envs.FLLIPER_MOE_RESIDENT_EXPERT_FRACTION.override("0.4"):
             self.assertTrue(load_gc.expert_presplit_runs())
 
     def test_unreadable_offload_state_does_not_freeze(self):
         with mock.patch(
-            "sglang.srt.layers.moe.resident_fraction.offload_active",
+            "flliper.srt.layers.moe.resident_fraction.offload_active",
             side_effect=RuntimeError("no context"),
         ):
             self.assertFalse(load_gc.expert_presplit_runs())
@@ -92,7 +92,7 @@ class TestDenseLoadIsUntouched(_FreezeCase):
 class TestFreezeSemantics(_FreezeCase):
     def test_cycles_the_load_creates_are_still_collected(self):
         # The [E] stacks' case: born inside, found by the per-layer collect.
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(True):
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(True):
             with load_gc_frozen(what="test", expert_presplit=True) as frozen:
                 self.assertGreater(frozen, 0)
                 ref = _garbage_cycle(bytearray(1 << 20))
@@ -108,7 +108,7 @@ class TestFreezeSemantics(_FreezeCase):
         # froze" skipped the freeze in every real process.
         gc.collect()
         self.assertGreater(gc.get_freeze_count(), 0)
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(True):
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(True):
             with load_gc_frozen(what="test", expert_presplit=True) as frozen:
                 self.assertIsNotNone(frozen)
                 self.assertGreater(frozen, load_gc._FOREIGN_FREEZE_MIN)
@@ -116,7 +116,7 @@ class TestFreezeSemantics(_FreezeCase):
     def test_garbage_from_before_the_load_is_not_frozen(self):
         # The pre-collect: what is already garbage at the freeze is freed then.
         ref = _garbage_cycle(bytearray(1 << 20))
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(True):
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(True):
             with load_gc_frozen(what="test", expert_presplit=True):
                 self.assertIsNone(ref())
 
@@ -129,7 +129,7 @@ class TestFreezeSemantics(_FreezeCase):
         holder["cycle"].me = holder["cycle"]
         holder["cycle"].t = torch.empty(3 * 2**20, dtype=torch.uint8)
         ref = weakref.ref(holder["cycle"])
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(True), \
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(True), \
                 self.assertLogs(load_gc.logger, level="INFO") as logs:
             with load_gc_frozen(what="test", expert_presplit=True):
                 holder.clear()  # unreachable now, but frozen
@@ -142,8 +142,8 @@ class TestFreezeSemantics(_FreezeCase):
         self.assertGreaterEqual(host, 3.0)
 
     def test_end_line_carries_the_reclaim_cost_per_layer(self):
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(True), \
-                envs.SGLANG_OPT_LOAD_PRESPLIT_GC.override(PresplitGcMode.FULL), \
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(True), \
+                envs.FLLIPER_OPT_LOAD_PRESPLIT_GC.override(PresplitGcMode.FULL), \
                 self.assertLogs(load_gc.logger, level="INFO") as logs:
             with load_gc_frozen(what="test", expert_presplit=True):
                 eo.presplit_host_reclaim()
@@ -153,7 +153,7 @@ class TestFreezeSemantics(_FreezeCase):
         self.assertRegex(end, r"nonreclaim\(anon\+shmem\) start=\S+ peak=\S+ GiB")
 
     def test_an_exception_in_the_load_still_unfreezes(self):
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(True):
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(True):
             with self.assertRaises(RuntimeError):
                 with load_gc_frozen(what="test", expert_presplit=True):
                     raise RuntimeError("load died")
@@ -162,14 +162,14 @@ class TestFreezeSemantics(_FreezeCase):
     def test_someone_elses_freeze_is_left_alone(self):
         gc.freeze()
         theirs = gc.get_freeze_count()
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(True):
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(True):
             with load_gc_frozen(what="test", expert_presplit=True) as frozen:
                 self.assertIsNone(frozen)
         self.assertEqual(gc.get_freeze_count(), theirs)
 
     def test_switch_default_on_and_off_freezes_nothing(self):
-        self.assertTrue(envs.SGLANG_OPT_LOAD_GC_FREEZE.get())
-        with envs.SGLANG_OPT_LOAD_GC_FREEZE.override(False):
+        self.assertTrue(envs.FLLIPER_OPT_LOAD_GC_FREEZE.get())
+        with envs.FLLIPER_OPT_LOAD_GC_FREEZE.override(False):
             with load_gc_frozen(what="test", expert_presplit=True) as frozen:
                 self.assertIsNone(frozen)
                 self.assertLess(gc.get_freeze_count(), load_gc._FOREIGN_FREEZE_MIN)

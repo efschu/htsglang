@@ -42,13 +42,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.disaggregation.decode_hicache_mixin import (
+from flliper.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
     HiCacheRestoreResult,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10)
 
@@ -245,7 +245,7 @@ class TestDefectBRematchLockPairing(unittest.TestCase):
     """B: the admission lock must follow req.last_node across the rematch."""
 
     def _run_until_failed_restore(self):
-        import sglang.srt.disaggregation.decode_hicache_mixin as mod
+        import flliper.srt.disaggregation.decode_hicache_mixin as mod
 
         tree = FakeTreeCache()
         old_node, new_node = FakeNode("old"), FakeNode("new")
@@ -375,7 +375,7 @@ class TestDefectERankDivergence(unittest.TestCase):
                 prealloc = PreallocHarness(tree)
                 prealloc._start_hicache_prefetch(req, pm)
 
-                import sglang.srt.disaggregation.decode_hicache_mixin as mod
+                import flliper.srt.disaggregation.decode_hicache_mixin as mod
 
                 tree.load_back_new_indices = torch.arange(4, dtype=torch.int64)
                 tree.load_back_node = FakeNode(f"restored-{rank}")
@@ -439,7 +439,7 @@ class TestDefectERankDivergence(unittest.TestCase):
 
         tree.check_prefetch_progress = _spy
 
-        import sglang.srt.disaggregation.decode_hicache_mixin as mod
+        import flliper.srt.disaggregation.decode_hicache_mixin as mod
 
         tree.load_back_new_indices = torch.arange(4, dtype=torch.int64)
         tree.load_back_node = FakeNode("restored")

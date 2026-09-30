@@ -53,8 +53,8 @@ mid-turn. Cost then is ~6 min of an idle talker rather than ~6 min of a busy one
 
 ## Identifying the process during a VRAM triage
 
-The standalone path renames itself **`sglang::488-talker-profile-GUEST`** in
-both `/proc/<pid>/comm` (truncated to `sglang::488-tal`) and
+The standalone path renames itself **`flliper::488-talker-profile-GUEST`** in
+both `/proc/<pid>/comm` (truncated to `flliper::488-tal`) and
 `/proc/<pid>/cmdline`, so `ps`, `top`, `py-spy` and `nvidia-smi` all attribute
 it on sight. "GUEST" is deliberate: it answers the second triage question —
 this process is a visitor on a card it does not own, and it is expected to

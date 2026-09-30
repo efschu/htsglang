@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 from warmup_deep_gemm import get_architecture_key, get_config_json
 
-MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "warmup_markers")
+MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "flliper", "warmup_markers")
 HEALTH_POLL_INTERVAL = 10  # seconds between health checks
 SERVER_STARTUP_TIMEOUT = 900  # 15 min max to wait for server ready
 DEFAULT_PORT = 39876
@@ -103,12 +103,12 @@ def kill_server(proc):
             except subprocess.TimeoutExpired:
                 pass
 
-    # sglang's scheduler_TP* and detokenizer workers spawn through
+    # flliper's scheduler_TP* and detokenizer workers spawn through
     # multiprocessing with their own session/process group, so they escape
     # killpg on launch_server and stay alive holding GPU memory after a
     # readiness-timeout or unclean exit. Kill any survivors by name so the
     # next model (or the next CI step) starts with empty GPUs.
-    for pattern in ("sglang::scheduler", "sglang::detokenizer"):
+    for pattern in ("flliper::scheduler", "flliper::detokenizer"):
         try:
             subprocess.run(
                 ["pkill", "-9", "-f", pattern],
@@ -170,7 +170,7 @@ def warmup_one_model(model, tp, port):
     cmd = [
         sys.executable,
         "-m",
-        "sglang.launch_server",
+        "flliper.launch_server",
         "--model-path",
         model,
         "--tp",

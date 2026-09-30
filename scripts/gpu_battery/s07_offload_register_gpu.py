@@ -93,7 +93,7 @@ MEASUREMENT_CLASS_POLICY = ",".join(f"{cls}=ram" for cls, _, _, _ in MEASURED)
 
 # Guard against an exec loop when the probe re-execs itself with the memory
 # saver's preload hook in LD_PRELOAD.
-REEXEC_GUARD_ENV = "SGLANG_S07_TMS_REEXEC"
+REEXEC_GUARD_ENV = "FLLIPER_S07_TMS_REEXEC"
 
 
 def percentile(values, q: float) -> float:
@@ -223,7 +223,7 @@ class _DryRunEnv:
     preload = "not needed (dry-run)"
 
     def __init__(self):
-        from sglang.srt.model_executor.offload_movement import FakeDeviceOps
+        from flliper.srt.model_executor.offload_movement import FakeDeviceOps
 
         self.device_ops = FakeDeviceOps()
         self.device_index = 0
@@ -250,7 +250,7 @@ class _CudaEnv:
     def __init__(self):
         import torch
 
-        from sglang.srt.model_executor.offload_movement import CudaDeviceOps
+        from flliper.srt.model_executor.offload_movement import CudaDeviceOps
 
         self._torch = torch
         if not torch.cuda.is_available():
@@ -287,7 +287,7 @@ class _CudaEnv:
         # only fails at the first region().
         self._saver = None
         try:
-            from sglang.srt.utils.torch_memory_saver_adapter import (
+            from flliper.srt.utils.torch_memory_saver_adapter import (
                 TorchMemorySaverAdapter,
             )
 
@@ -331,8 +331,8 @@ def negative_control(device_ops) -> dict:
     green rows as a correct one. No payload is bound on purpose: the policy
     gate has to refuse BEFORE the movement backend is ever consulted.
     """
-    from sglang.srt.model_executor.offload_movement import RealMovementBackend
-    from sglang.srt.model_executor.offload_register import (
+    from flliper.srt.model_executor.offload_movement import RealMovementBackend
+    from flliper.srt.model_executor.offload_register import (
         OffloadRefused,
         OffloadRegister,
         resolve_class_policies,
@@ -371,17 +371,17 @@ def negative_control(device_ops) -> dict:
 
 def run_probe(env, item_bytes: int, cycles: int) -> dict:
     """Register, bind and cycle one item per class, per route."""
-    from sglang.srt.model_executor.offload_movement import (
+    from flliper.srt.model_executor.offload_movement import (
         RealMovementBackend,
         SuspendPayload,
         TagPayload,
         TensorPayload,
     )
-    from sglang.srt.model_executor.offload_register import (
+    from flliper.srt.model_executor.offload_register import (
         OffloadRegister,
         resolve_class_policies,
     )
-    from sglang.srt.model_executor.offload_sizes import resolve_size_bytes
+    from flliper.srt.model_executor.offload_sizes import resolve_size_bytes
 
     payload = {
         "kind": "offload_register_gpu",

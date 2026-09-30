@@ -3,14 +3,14 @@ import unittest
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
 )
-from sglang.test.test_utils import (
+from flliper.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -70,17 +70,17 @@ class BaseTestSoftWatchdog:
 
 
 class TestSoftWatchdogDetokenizer(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_DETOKENIZER.override(30)
+    env_override = lambda: envs.FLLIPER_TEST_STUCK_DETOKENIZER.override(30)
     expected_message = "DetokenizerManager watchdog timeout"
 
 
 class TestSoftWatchdogTokenizer(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_TOKENIZER.override(30)
+    env_override = lambda: envs.FLLIPER_TEST_STUCK_TOKENIZER.override(30)
     expected_message = "TokenizerManager watchdog timeout"
 
 
 class TestSoftWatchdogSchedulerInit(BaseTestSoftWatchdog, CustomTestCase):
-    env_override = lambda: envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.override(30)
+    env_override = lambda: envs.FLLIPER_TEST_STUCK_SCHEDULER_INIT.override(30)
     expected_message = "Scheduler watchdog timeout"
 
 

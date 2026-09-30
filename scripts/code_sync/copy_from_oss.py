@@ -23,7 +23,7 @@ python3 scripts/copy_from_oss.py
 python3 scripts/copy_from_oss.py --dry-run
 
 # Use a local directory as the source instead of cloning
-python3 scripts/copy_from_oss.py --local-dir ~/projects/sglang
+python3 scripts/copy_from_oss.py --local-dir ~/projects/flliper
 """
 
 import argparse
@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import FOLDER_NAMES, write_github_step_summary  # noqa: E402
 
 # --- Configuration Begin ---
-private_repo = "your-org/sglang-private-repo"
+private_repo = "your-org/flliper-private-repo"
 # --- Configuration End ---
 
 
@@ -217,7 +217,7 @@ def main():
     parser.add_argument(
         "--local-dir",
         type=str,
-        help="Path to local SGLang directory to use instead of cloning from GitHub.",
+        help="Path to local fLLiper directory to use instead of cloning from GitHub.",
     )
     parser.add_argument(
         "--dry-run",

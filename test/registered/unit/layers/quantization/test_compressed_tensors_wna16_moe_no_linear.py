@@ -19,7 +19,7 @@ strategy, group_size 128, symmetric, expert projections targeted by regex or by
 per-layer FQN, with attention / router layers ignored.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -27,14 +27,14 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # WNA16 MoE Marlin (default) and Triton backends are both valid resolutions for
 # this config; only the "no KeyError, correct WNA16 int-N scheme" contract matters.

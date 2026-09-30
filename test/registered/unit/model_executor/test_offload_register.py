@@ -14,7 +14,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.model_executor.offload_register import (
+from flliper.srt.model_executor.offload_register import (
     OFFLOAD_CLASSES,
     ClassPolicy,
     CpuFakeMovementBackend,
@@ -28,8 +28,8 @@ from sglang.srt.model_executor.offload_register import (
     reset_global_register,
     resolve_class_policies,
 )
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -503,20 +503,20 @@ class TestServerArgsParsing(unittest.TestCase):
 
 
 class TestFlagGate(unittest.TestCase):
-    """SGLANG_OFFLOAD_REGISTER off (default) => zero behavior anywhere."""
+    """FLLIPER_OFFLOAD_REGISTER off (default) => zero behavior anywhere."""
 
     def setUp(self):
         reset_global_register()
         self.addCleanup(reset_global_register)
 
     def test_flag_off_means_no_register_and_noop_helpers(self):
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "0"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "0"}):
             self.assertIsNone(get_global_register())
             self.assertIsNone(maybe_register_item("x", "graph_rungs", 10, 1.0))
             maybe_touch_item("x")  # must not raise
 
     def test_flag_on_creates_default_latency_register(self):
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             reg = get_global_register()
             self.assertIsNotNone(reg)
             self.assertEqual(
@@ -529,7 +529,7 @@ class TestFlagGate(unittest.TestCase):
             self.assertEqual(item2.size_bytes, 20)
 
     def test_configure_from_server_args_knobs(self):
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             reg = configure_global_register("capacity", "drafter_heads=resident")
             self.assertIs(get_global_register(), reg)
             self.assertEqual(
@@ -538,14 +538,14 @@ class TestFlagGate(unittest.TestCase):
             self.assertEqual(reg.policies["graph_rungs"], ClassPolicy("ram", 1.0))
 
     def test_workspace_adapter_books_only_when_enabled(self):
-        from sglang.srt.runtime_context import (
+        from flliper.srt.runtime_context import (
             _note_workspace_in_offload_register,
         )
 
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "0"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "0"}):
             _note_workspace_in_offload_register(None, "ws", object(), True)
             self.assertIsNone(get_global_register())
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             _note_workspace_in_offload_register(None, "ws", object(), True)
             reg = get_global_register()
             item = reg.get("lane_workspace/None/ws")
@@ -559,13 +559,13 @@ class TestFlagGate(unittest.TestCase):
     def test_input_buffer_adapter_books_only_when_enabled(self):
         import torch
 
-        from sglang.srt.model_executor.input_buffers import share_input_buffer
+        from flliper.srt.model_executor.input_buffers import share_input_buffer
 
         buf = torch.zeros(8, dtype=torch.int64)
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "0"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "0"}):
             share_input_buffer("test_offload_reg_off", buf)
             self.assertIsNone(get_global_register())
-        with patch.dict(os.environ, {"SGLANG_OFFLOAD_REGISTER": "1"}):
+        with patch.dict(os.environ, {"FLLIPER_OFFLOAD_REGISTER": "1"}):
             share_input_buffer("test_offload_reg_on", buf)
             reg = get_global_register()
             items = reg.items_of_class("lane_workspaces")

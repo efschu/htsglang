@@ -12,7 +12,7 @@
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
@@ -28,7 +28,7 @@
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --dit-layerwise-offload false --tp-size 2",
                     "extra_env": {}
                 }
@@ -44,7 +44,7 @@
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --tp-size 2",
                     "extra_env": {}
                 }
@@ -61,7 +61,7 @@
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --tp-size 2",
                     "extra_env": {}
                 }
@@ -77,7 +77,7 @@
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --tp-size 2",
                     "extra_env": {}
                 }
@@ -94,7 +94,7 @@
             "seed": 42,
             "num_gpus": 4,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }
@@ -112,7 +112,7 @@
             "seed": 42,
             "num_gpus": 1,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup",
                     "extra_env": {}
                 }
@@ -130,7 +130,7 @@
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --pipeline-class-name LTX2TwoStagePipeline --cfg-parallel-size 2",
                     "extra_env": {}
                 }
@@ -146,7 +146,7 @@
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --tp-size 2 --attention-backend fa",
                     "extra_env": {}
                 }
@@ -163,9 +163,9 @@
             "seed": 42,
             "num_gpus": 2,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --tp-size 2",
-                    "extra_env": {"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"}
+                    "extra_env": {"FLLIPER_DISABLE_COSMOS3_GUARDRAILS": "1"}
                 }
             }
         },
@@ -181,7 +181,7 @@
             "seed": 42,
             "num_gpus": 4,
             "frameworks": {
-                "sglang": {
+                "flliper": {
                     "serve_args": "--warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
                 }

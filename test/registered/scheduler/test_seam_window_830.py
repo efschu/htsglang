@@ -34,14 +34,14 @@ import re
 import unittest
 import unittest.mock
 
-from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
-from sglang.srt.managers import phase_flip_runtime as _rt
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+from flliper.srt.managers import phase_flip_runtime as _rt
+from flliper.srt.managers.phase_flip_runtime import (
     PhaseFlipRuntime,
     build_production_flip_cutover,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 from test_phase_flip_protocol import (  # noqa: E402  (sibling harness)
     _ParallelStatePatch,
@@ -67,7 +67,7 @@ def _run_cutover(direction):
         cutover = build_production_flip_cutover(sched)
         with unittest.mock.patch.object(
             __import__(
-                "sglang.srt.managers.phase_flip_runtime", fromlist=["logger"]
+                "flliper.srt.managers.phase_flip_runtime", fromlist=["logger"]
             ).logger,
             "warning",
         ) as warn:

@@ -20,8 +20,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -30,7 +30,7 @@ def _compact_lens_exact(seq_lens, window, page):
     fake_self = SimpleNamespace(
         device=seq_lens.device, draft_window_size=window, page_size=page
     )
-    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+    from flliper.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
     return DFlashWorkerV2._compute_compact_draft_seq_lens(fake_self, seq_lens)
 
@@ -38,7 +38,7 @@ def _compact_lens_exact(seq_lens, window, page):
 def _compact_lens_host(seq_lens, window, page):
     fake_self = SimpleNamespace(draft_window_size=window, page_size=page)
     out = torch.empty(seq_lens.numel(), dtype=torch.int32)
-    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+    from flliper.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
     DFlashWorkerV2._compute_compact_draft_seq_lens_host(fake_self, seq_lens, out)
     return out
@@ -84,7 +84,7 @@ _INTERPRETED_REBUILD = textwrap.dedent(
     import os
     os.environ["TRITON_INTERPRET"] = "1"
     import torch
-    from sglang.kernels.ops.speculative.cache_locs import (
+    from flliper.kernels.ops.speculative.cache_locs import (
         assign_req_to_token_pool_func,
         rebuild_compact_draft_req_to_token_func,
     )
@@ -180,7 +180,7 @@ class TestRebuildCompactDraftReqToTokenInterpreted(CustomTestCase):
 
 class TestHybridNeedsCpuSeqLens(CustomTestCase):
     def _make(self, prefill_flag, decode_flag):
-        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+        from flliper.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
         def backend(flag):
             return SimpleNamespace(needs_cpu_seq_lens=flag)
@@ -201,7 +201,7 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
 
 class TestFilterBatchHostIndices(CustomTestCase):
     def test_host_keep_list_matches_gpu_indices(self):
-        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from flliper.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
         def make():
             info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
@@ -228,8 +228,8 @@ class TestFilterBatchHostIndices(CustomTestCase):
         # spec_info the batch carries; every filter_batch must take it.
         import inspect
 
-        from sglang.srt.speculative.eagle_info import EagleDraftInput
-        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+        from flliper.srt.speculative.eagle_info import EagleDraftInput
+        from flliper.srt.speculative.ngram_info import NgramVerifyInput
 
         for cls in (EagleDraftInput, NgramVerifyInput):
             with self.subTest(cls=cls.__name__):
@@ -252,13 +252,13 @@ class TestSpecTpSyncDivergeBudget(CustomTestCase):
     """#1485 compare = a blocking device read per broadcast; bounded now."""
 
     def _sync(self, rank, budget, rounds):
-        from sglang.srt.environ import envs
-        from sglang.srt.speculative import spec_tp_sync as mod
+        from flliper.srt.environ import envs
+        from flliper.srt.speculative import spec_tp_sync as mod
 
         calls = {"clone": 0}
         orig_clone = torch.Tensor.clone
 
-        with envs.SGLANG_SPEC_TP_DIVERGE_CHECKS.override(budget):
+        with envs.FLLIPER_SPEC_TP_DIVERGE_CHECKS.override(budget):
             group = _FakeGroup(rank)
             sync = mod.SpecTpSync(group)
 
@@ -292,7 +292,7 @@ class TestSpecTpSyncDivergeBudget(CustomTestCase):
 
 class TestDflashSyncTraceUnarmed(CustomTestCase):
     def test_passthrough_without_cuda_or_for_prefill(self):
-        from sglang.srt.speculative.dflash_worker_v2 import _dflash_sync_traced
+        from flliper.srt.speculative.dflash_worker_v2 import _dflash_sync_traced
 
         seen = []
 

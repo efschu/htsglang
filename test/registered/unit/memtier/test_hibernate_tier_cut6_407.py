@@ -39,13 +39,13 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.memtier.bootstrap import NON_PERSISTENT_FS_TYPES
-from sglang.srt.memtier.hibernate_tier import (
+from flliper.srt.memtier.bootstrap import NON_PERSISTENT_FS_TYPES
+from flliper.srt.memtier.hibernate_tier import (
     HibernateDirNotPersistent,
     hibernate_dir_verdict,
     refuse_volatile_hibernate_dir,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestTheVerdict(CustomTestCase):
@@ -122,7 +122,7 @@ class TestServerArgsCallsIt(CustomTestCase):
     def test_the_hibernate_validation_refuses_a_volatile_dir(self):
         import inspect
 
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         src = inspect.getsource(ServerArgs)
         self.assertIn("refuse_volatile_hibernate_dir", src)

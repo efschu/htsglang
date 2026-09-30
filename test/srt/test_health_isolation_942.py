@@ -39,12 +39,12 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..", "..", "python")
 )
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.managers.scheduler import (
+from flliper.srt.constants import HEALTH_CHECK_RID_PREFIX
+from flliper.srt.managers.scheduler import (
     Scheduler,
     _arriving_prefill_tokens,
 )
-from sglang.srt.managers.utils import is_health_check_generate_req
+from flliper.srt.managers.utils import is_health_check_generate_req
 
 
 class _Req:

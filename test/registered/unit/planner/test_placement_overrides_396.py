@@ -20,8 +20,8 @@ Three claims:
 
 import pytest
 
-from sglang.srt.planner.placement import compute_placement_struct
-from sglang.srt.planner.placement_overrides import (
+from flliper.srt.planner.placement import compute_placement_struct
+from flliper.srt.planner.placement_overrides import (
     PlacementOverrideConflict,
     PlacementOverrideError,
     apply_expert_constraints,
@@ -41,7 +41,7 @@ UUID_3080B = "GPU-00000000-0000-0000-0000-000000003081"
 
 
 def _identity():
-    from sglang.srt.registry.nvml import DeviceInfo, identity_map
+    from flliper.srt.registry.nvml import DeviceInfo, identity_map
 
     devices = [
         DeviceInfo(
@@ -316,7 +316,7 @@ def _no_live_nvml(monkeypatch):
     happens to run on. The parse-level tests above inject their own rig; these
     exercise the SOLVE, for which the card check is not the subject.
     """
-    from sglang.srt.planner import placement
+    from flliper.srt.planner import placement
 
     monkeypatch.setattr(placement, "_identity_map_or_none", lambda: None)
 
@@ -362,7 +362,7 @@ def test_planner_refuses_an_unsatisfiable_override():
 
 
 def test_planner_refuses_overrides_with_no_residency_split_to_constrain(monkeypatch):
-    monkeypatch.delenv("SGLANG_MOE_RESIDENT_EXPERT_FRACTION", raising=False)
+    monkeypatch.delenv("FLLIPER_MOE_RESIDENT_EXPERT_FRACTION", raising=False)
     flags = _flags(expert_placement_override=[r"experts\.0\.=cpu"])
     flags.pop("moe_resident_expert_fraction")
     with pytest.raises(PlacementOverrideConflict, match="no resident expert fraction"):

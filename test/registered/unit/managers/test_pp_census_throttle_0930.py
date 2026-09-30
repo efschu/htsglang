@@ -10,7 +10,7 @@ Pinned here:
   * the first line comes at once, a CHANGE comes at once (and names how many lines were held back);
   * the held-back count rides on the emitted line (no extra lines);
   * pure pass counters (#1000 seen/reason counts, #996 admissions/site counts) are not "state";
-  * SGLANG_PP_CENSUS_THROTTLE=0 restores every line;
+  * FLLIPER_PP_CENSUS_THROTTLE=0 restores every line;
   * pp_ring_note itself, driven with a fake holder through the dual13 shape, stays within the bound.
 """
 
@@ -21,7 +21,7 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt.managers import scheduler_pp_mixin as M
+from flliper.srt.managers import scheduler_pp_mixin as M
 
 
 def _holder(rank=1):
@@ -80,12 +80,12 @@ class TestPpRingNoteDual13Shape(unittest.TestCase):
     on every pass (exactly the dual13 P log) -> each marker stays within log2(N)+1 lines."""
 
     def test_livelock_shape(self):
-        from sglang.srt.managers import schedule_batch as SB
+        from flliper.srt.managers import schedule_batch as SB
 
         h = _holder(1)
         out = []
         n_passes = 400
-        with mock.patch.dict(os.environ, {"SGLANG_947_RING_EVERY": "1"}), \
+        with mock.patch.dict(os.environ, {"FLLIPER_947_RING_EVERY": "1"}), \
              mock.patch.object(M.logger, "warning", side_effect=lambda *a: out.append(a[0] % a[1:])), \
              mock.patch.object(M.time, "monotonic", side_effect=[1000.0 + 0.0147 * i for i in range(100000)]):
             for _ in range(n_passes):
@@ -100,7 +100,7 @@ class TestPpRingNoteDual13Shape(unittest.TestCase):
         # a real state change of #998 (a break) goes out at once
         before = sum(1 for l in out if l.startswith("#998"))
         SB._998_BREAKS[0] += 1
-        with mock.patch.dict(os.environ, {"SGLANG_947_RING_EVERY": "1"}), \
+        with mock.patch.dict(os.environ, {"FLLIPER_947_RING_EVERY": "1"}), \
              mock.patch.object(M.logger, "warning", side_effect=lambda *a: out.append(a[0] % a[1:])):
             M.pp_ring_note(h, "admit", False)
         SB._998_BREAKS[0] -= 1

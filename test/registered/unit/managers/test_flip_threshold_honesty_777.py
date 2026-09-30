@@ -31,13 +31,13 @@ the two overstated comments now describe what the code actually does.
 
 import unittest
 
-from sglang.srt.managers import phase_policy as pp
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers import phase_policy as pp
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_LOGGER = "sglang.srt.managers.phase_policy"
+_LOGGER = "flliper.srt.managers.phase_policy"
 
 # The live-boot numbers this task is about, from the module's own comment and
 # from test_flip_cost_calibration_677.py: a 3.2 s seed against 22.5 s flips.

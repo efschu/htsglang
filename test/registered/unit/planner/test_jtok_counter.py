@@ -27,8 +27,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sglang.srt.planner import jtok_counter as jc
-from sglang.srt.planner import self_update as su
+from flliper.srt.planner import jtok_counter as jc
+from flliper.srt.planner import self_update as su
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +369,7 @@ class TestSchemaGuard(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_writes_allowed_on_fresh_data_dir(self):
-        with mock.patch.dict(os.environ, {"SGLANG_PLANNER_DATA_DIR": self.data_dir}):
+        with mock.patch.dict(os.environ, {"FLLIPER_PLANNER_DATA_DIR": self.data_dir}):
             d = jc.jtok_set_enabled(True, path=self.path)
             self.assertTrue(d["ok"])
             self.assertTrue(d["enabled"])
@@ -378,7 +378,7 @@ class TestSchemaGuard(unittest.TestCase):
         os.makedirs(self.data_dir)
         with open(os.path.join(self.data_dir, su.SCHEMA_STAMP_NAME), "w") as f:
             json.dump({"schema_version": su.DATA_SCHEMA_VERSION + 1}, f)
-        with mock.patch.dict(os.environ, {"SGLANG_PLANNER_DATA_DIR": self.data_dir}):
+        with mock.patch.dict(os.environ, {"FLLIPER_PLANNER_DATA_DIR": self.data_dir}):
             d = jc.jtok_set_enabled(True, path=self.path)
             self.assertFalse(d["ok"])
             self.assertIn("schema", d["error"])
@@ -392,7 +392,7 @@ class TestSchemaGuard(unittest.TestCase):
         os.makedirs(self.data_dir)
         with open(os.path.join(self.data_dir, su.SCHEMA_STAMP_NAME), "w") as f:
             json.dump({"schema_version": su.DATA_SCHEMA_VERSION + 1}, f)
-        with mock.patch.dict(os.environ, {"SGLANG_PLANNER_DATA_DIR": self.data_dir}):
+        with mock.patch.dict(os.environ, {"FLLIPER_PLANNER_DATA_DIR": self.data_dir}):
             # jtok_read must succeed (return an empty view) even though writes
             # to this same data dir are guarded off.
             view = jc.jtok_read(path=self.path)

@@ -1,4 +1,4 @@
-"""#192: the SGLANG_DETERMINISTIC_FP8_GEMM gate, tested without a GPU.
+"""#192: the FLLIPER_DETERMINISTIC_FP8_GEMM gate, tested without a GPU.
 
 The numerical claim -- that the flag turns a nondeterministic fp8 linear into a
 bit-identical one -- needs an sm8x card and lives in
@@ -10,7 +10,7 @@ is where the bugs would actually hide, is the ROUTING:
     and sm120 must be untouched, because the defect was measured on Ampere and
     the flag is not a global "no fp8";
   * it must be off by default, so the stock path does not move;
-  * it must beat an explicit SGLANG_FORCE_FP8_MARLIN, otherwise a determinism
+  * it must beat an explicit FLLIPER_FORCE_FP8_MARLIN, otherwise a determinism
     request would silently keep the nondeterministic kernel;
   * and it must PAIR: switching Marlin off has to arm the dequant fallback in
     the same step. On sm8x Marlin is the only fp8 GEMM there is, so a gate that
@@ -24,8 +24,8 @@ any machine including CPU-only CI.
 import unittest
 from unittest import mock
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import fp8_utils as U
+from flliper.srt.environ import envs
+from flliper.srt.layers.quantization import fp8_utils as U
 
 
 def _clear():
@@ -40,8 +40,8 @@ class _Env:
         self.value, self.sm, self.cuda = value, sm, cuda
 
     def __enter__(self):
-        self._old = envs.SGLANG_DETERMINISTIC_FP8_GEMM.get()
-        envs.SGLANG_DETERMINISTIC_FP8_GEMM.set(self.value)
+        self._old = envs.FLLIPER_DETERMINISTIC_FP8_GEMM.get()
+        envs.FLLIPER_DETERMINISTIC_FP8_GEMM.set(self.value)
         _clear()
         self._patches = [
             mock.patch.object(U, "is_cuda", lambda: self.cuda),
@@ -63,7 +63,7 @@ class _Env:
     def __exit__(self, *exc):
         for p in self._patches:
             p.stop()
-        envs.SGLANG_DETERMINISTIC_FP8_GEMM.set(self._old)
+        envs.FLLIPER_DETERMINISTIC_FP8_GEMM.set(self._old)
         _clear()
         return False
 
@@ -162,7 +162,7 @@ class TestLinearMethodRouting(unittest.TestCase):
         _clear()
 
     def _method(self, block):
-        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+        from flliper.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 
         cfg = Fp8Config(
             is_checkpoint_fp8_serialized=True,
@@ -172,7 +172,7 @@ class TestLinearMethodRouting(unittest.TestCase):
         return Fp8LinearMethod(cfg)
 
     def _patched(self, flag, sm, block):
-        from sglang.srt.layers.quantization import fp8 as F
+        from flliper.srt.layers.quantization import fp8 as F
 
         with _Env(flag, sm=sm):
             with mock.patch.object(F, "_is_cuda", True), mock.patch.object(

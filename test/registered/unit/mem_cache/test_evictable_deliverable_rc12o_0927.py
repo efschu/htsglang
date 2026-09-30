@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""ED/EF (27B rc12o b1, PP0 13:56:43Z, weg2-8-62): 'Available full tokens: 149167 (46 + evictable
+"""ED/EF (27B rc12o b1, PP0 13:56:43Z, pdflip-8-62): 'Available full tokens: 149167 (46 + evictable
 149121)' and 'EVICTION UNDER-DELIVERED: asked for 512 tokens, the pool received 0', with no #1421
 BACKUP-REFUSED on PP0 in the whole boot -- no leaf was even tried.
 
@@ -16,7 +16,7 @@ from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.mem_cache import evict_frontier_census as EF  # noqa: E402
+from flliper.srt.mem_cache import evict_frontier_census as EF  # noqa: E402
 
 FULL, MAMBA = 0, 1
 
@@ -55,7 +55,7 @@ def _env(**kv):
 class Deliverable(unittest.TestCase):
     def test_b1_shape_mamba_locked_tail_blocks_its_chain(self):
         c, root = _cache()
-        a = _Node(root, 69096)                 # weg2-8-61's host-backed prefix, unlocked
+        a = _Node(root, 69096)                 # pdflip-8-61's host-backed prefix, unlocked
         b = _Node(a, 80000)                    # further unlocked chain
         tail = _Node(b, 25, mamba_lock=1)      # the anchor node: FULL 0, MAMBA 1
         free_leaf = _Node(root, 5000)          # an ordinary leaf elsewhere
@@ -90,7 +90,7 @@ class Deliverable(unittest.TestCase):
         self.assertEqual(EF.blocked_tokens(c, FULL), 0)
 
     def test_mamba_component_tracks_the_lock_transitions(self):
-        from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
+        from flliper.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
 
         c, root = _cache()
         c.component_evictable_size_ = {FULL: 0, MAMBA: 1}
@@ -108,7 +108,7 @@ class Deliverable(unittest.TestCase):
         self.assertNotIn(id(n), getattr(c, EF.AUX_LOCKED_ATTR))
 
     def test_fundable_extend_reads_the_deliverable_count(self):
-        from sglang.srt.mem_cache import common
+        from flliper.srt.mem_cache import common
 
         class _Tree:  # the deliverable count is read from the CLASS (not a duck-typed getattr)
             token_to_kv_pool_allocator = types.SimpleNamespace(available_size=lambda: 46)
@@ -128,13 +128,13 @@ class Deliverable(unittest.TestCase):
     def test_a_duck_typed_stand_in_falls_back_to_the_reported_count(self):
         from unittest import mock
 
-        from sglang.srt.mem_cache import common
+        from flliper.srt.mem_cache import common
 
         m = mock.MagicMock()  # answers every getattr: must not be read as a count
         self.assertEqual(common.deliverable_evictable_or(m, lambda: 7), 7)
 
     def test_the_adder_budget_reads_it_on_hybrid_ssm(self):
-        from sglang.srt.managers import schedule_policy as sp
+        from flliper.srt.managers import schedule_policy as sp
 
         src = open(sp.__file__).read()
         i = src.index("def rem_total_tokens(self)")
@@ -144,7 +144,7 @@ class Deliverable(unittest.TestCase):
 
 class FrontierRepair(unittest.TestCase):
     def _cache(self, stale=True):
-        from sglang.srt.mem_cache.unified_cache_components.full_component import FullComponent
+        from flliper.srt.mem_cache.unified_cache_components.full_component import FullComponent
 
         c, root = _cache()
         leaf = _Node(root, 600)
@@ -242,7 +242,7 @@ class CostAndRanks(unittest.TestCase):
             self.assertEqual(EF.deliverable_evictable(c, FULL), 1020)
 
     def test_the_scheduler_marks_form_a_workers(self):
-        from sglang.srt.managers import scheduler as S
+        from flliper.srt.managers import scheduler as S
 
         src = open(S.__file__).read()
         i = src.index("adder.form_a_admission_follow = self._form_a_admission_follow_fn()")

@@ -41,13 +41,13 @@ from __future__ import annotations
 
 import unittest
 
-import sglang.srt.distributed.device_communicators.barlink_matrix as matrix_mod
-from sglang.srt.distributed.device_communicators.barlink_matrix import (
+import flliper.srt.distributed.device_communicators.barlink_matrix as matrix_mod
+from flliper.srt.distributed.device_communicators.barlink_matrix import (
     BarlinkConfig,
     Measurement,
     plan_collective,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 # ---------------------------------------------------------------------------

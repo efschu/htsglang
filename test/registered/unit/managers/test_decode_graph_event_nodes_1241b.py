@@ -28,12 +28,12 @@ from __future__ import annotations
 import logging
 import unittest
 
-from sglang.srt.debug_utils.rank_phase_summary import (
+from flliper.srt.debug_utils.rank_phase_summary import (
     parse_rank_batch_line,
     parse_unsplit_line,
 )
-from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
-from sglang.srt.utils.collective_clock import ClockBackend, CollectiveClock
+from flliper.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
+from flliper.srt.utils.collective_clock import ClockBackend, CollectiveClock
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ class GraphEventNodeTest(unittest.TestCase):
         self.h = Harness()
         self.cap = _Capture()
         self.logger = logging.getLogger(
-            "sglang.srt.managers.scheduler_components.decode_round_log"
+            "flliper.srt.managers.scheduler_components.decode_round_log"
         )
         self.logger.addHandler(self.cap)
         self.logger.setLevel(logging.INFO)
@@ -433,7 +433,7 @@ class ConcurrentReplayTest(unittest.TestCase):
         self.h = Harness()
         self.cap = _Capture()
         self.logger = logging.getLogger(
-            "sglang.srt.managers.scheduler_components.decode_round_log"
+            "flliper.srt.managers.scheduler_components.decode_round_log"
         )
         self.logger.addHandler(self.cap)
         self.logger.setLevel(logging.INFO)
@@ -527,7 +527,7 @@ class MultiGraphRoundTest(unittest.TestCase):
         self.h = Harness()
         self.cap = _Capture()
         self.logger = logging.getLogger(
-            "sglang.srt.managers.scheduler_components.decode_round_log"
+            "flliper.srt.managers.scheduler_components.decode_round_log"
         )
         self.logger.addHandler(self.cap)
         self.logger.setLevel(logging.INFO)
@@ -619,7 +619,7 @@ class RunnerGraphKeyTest(unittest.TestCase):
     def _runner_class():
         # Imported inside the test: everything above in this file is
         # torch-free, and the runner module pulls the whole executor chain.
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        from flliper.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )
 
@@ -639,7 +639,7 @@ class RunnerGraphKeyTest(unittest.TestCase):
     def _capture_log(self):
         cap = _Capture()
         logger = logging.getLogger(
-            "sglang.srt.managers.scheduler_components.decode_round_log"
+            "flliper.srt.managers.scheduler_components.decode_round_log"
         )
         logger.addHandler(cap)
         logger.setLevel(logging.INFO)
@@ -684,7 +684,7 @@ class EagerPathUnchangedTest(unittest.TestCase):
         self.h = Harness()
         self.cap = _Capture()
         self.logger = logging.getLogger(
-            "sglang.srt.managers.scheduler_components.decode_round_log"
+            "flliper.srt.managers.scheduler_components.decode_round_log"
         )
         self.logger.addHandler(self.cap)
         self.logger.setLevel(logging.INFO)

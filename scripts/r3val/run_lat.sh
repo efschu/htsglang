@@ -4,7 +4,7 @@
 #
 # Hosts, keys, interpreters and the two source trees come from the environment
 # (RIG1_HOST, RIG1_KEY, RIG2_HOST, RIG2_KEY, RDMA_R1, PVE_MINIFORGE,
-# RIG2_VENV, RIG1_REPO_ROOT, RIG2_SGLANG_SRC); source your local rig env file
+# RIG2_VENV, RIG1_REPO_ROOT, RIG2_FLLIPER_SRC); source your local rig env file
 # first. The fallbacks are placeholders, so an unsourced run fails at the first
 # ssh instead of reaching for some other machine.
 set -u
@@ -24,8 +24,8 @@ PVE_PY="${PVE_MINIFORGE:-<PVE_MINIFORGE>}/bin/python3.12"
 RIG2_PY="${RIG2_VENV:-<RIG2_VENV>}/bin/python"
 PVE_SCRIPT=$R/scripts/r3val/link_lat.py
 RIG2_SCRIPT="${RIG2_R3VAL_SCRIPT:-/root/link_lat.py}"
-COMM=$R/python/sglang/srt/distributed/device_communicators
-RIG2_COMM="${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>}/sglang/srt/distributed/device_communicators"
+COMM=$R/python/flliper/srt/distributed/device_communicators
+RIG2_COMM="${RIG2_FLLIPER_SRC:-<RIG2_FLLIPER_SRC>}/flliper/srt/distributed/device_communicators"
 
 RDMA1="${RDMA_R1:-<RDMA_R1>}"
 case "$MODE" in
@@ -39,7 +39,7 @@ PORT=${PORT:-29577}
 COMMON="MASTER_ADDR=$MASTER MASTER_PORT=$PORT"
 if [ "$MODE" = ucx ]; then
   UCXENV="UCX_TLS=rc,self,sm UCX_IB_GID_INDEX=3"
-  PVE_ENV="$COMMON $UCXENV UCX_NET_DEVICES=rocep4s0f1:1 SGLANG_BARLINK_UCX_LIB=/opt/ucx116/lib/libucp.so.0 GLOO_SOCKET_IFNAME=$PVE_IF"
+  PVE_ENV="$COMMON $UCXENV UCX_NET_DEVICES=rocep4s0f1:1 FLLIPER_BARLINK_UCX_LIB=/opt/ucx116/lib/libucp.so.0 GLOO_SOCKET_IFNAME=$PVE_IF"
   RIG2_ENV="$COMMON $UCXENV UCX_NET_DEVICES=rocep1s0f1:1 GLOO_SOCKET_IFNAME=$RIG2_IF"
   PVE_ARGS="--comm-dir $COMM"
   RIG2_ARGS="--comm-dir $RIG2_COMM"

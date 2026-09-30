@@ -1,8 +1,8 @@
-"""#837: the round-4 seam knobs are FLAGS; their SGLANG_* keys are a bridge.
+"""#837: the round-4 seam knobs are FLAGS; their FLLIPER_* keys are a bridge.
 
 These six knobs arrived with #830 and #834 as environment variables and never
 reached a flag. That was not merely untidy. The #539 boot gate refuses any
-governed SGLANG_* key that the ship capture does not carry, and it carries none
+governed FLLIPER_* key that the ship capture does not carry, and it carries none
 of these -- so the seam shrink was UNREACHABLE from route_a_631_prod_boot.sh,
 and the W13b window that is supposed to attribute it could not have been run
 without editing the boot script. argv is not policed by that gate, which is the
@@ -26,7 +26,7 @@ What has to hold, and why each arm is here rather than implied by the others:
      from a command line. That is the shipped shape of all fourteen
      ``Optional[bool]`` promoted flags, not something this ticket introduced.
      The consequence an operator has to know: to run a W13b gate-OFF segment
-     against a host whose environment already sets SGLANG_SEAM_SHRINK=1, the
+     against a host whose environment already sets FLLIPER_SEAM_SHRINK=1, the
      command line is ``--seam-shrink-prearm-quiesce 0 --seam-shrink-defer-grow
      0`` -- the per-half overrides DO take an explicit 0, and they reach both
      halves. Unsetting the env is the other way.
@@ -57,20 +57,20 @@ import unittest
 import warnings
 from unittest import mock
 
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 # The six promoted knobs: (ServerArgs field, published key).
 SIX = [
-    ("seam_shrink", "SGLANG_SEAM_SHRINK"),
-    ("seam_shrink_prearm_quiesce", "SGLANG_SEAM_SHRINK_PREARM_QUIESCE"),
-    ("seam_shrink_defer_grow", "SGLANG_SEAM_SHRINK_DEFER_GROW"),
-    ("seam_shrink_grow_debt_rounds", "SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS"),
-    ("flip_seam_drain_budget_ms", "SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS"),
-    ("hicache_read_buffers", "SGLANG_HICACHE_READ_BUFFERS"),
+    ("seam_shrink", "FLLIPER_SEAM_SHRINK"),
+    ("seam_shrink_prearm_quiesce", "FLLIPER_SEAM_SHRINK_PREARM_QUIESCE"),
+    ("seam_shrink_defer_grow", "FLLIPER_SEAM_SHRINK_DEFER_GROW"),
+    ("seam_shrink_grow_debt_rounds", "FLLIPER_SEAM_SHRINK_GROW_DEBT_ROUNDS"),
+    ("flip_seam_drain_budget_ms", "FLLIPER_FLIP_SEAM_DRAIN_BUDGET_MS"),
+    ("hicache_read_buffers", "FLLIPER_HICACHE_READ_BUFFERS"),
 ]
 
 # The two per-half attribution overrides, which are tri-states and not bools.
@@ -134,10 +134,10 @@ class TestTheDefaultPathIsUntouched837(unittest.TestCase):
         overwrite one, or every deployment that has not moved moves."""
         ctx = _clean_env()
         try:
-            os.environ["SGLANG_SEAM_SHRINK"] = "preexisting"
+            os.environ["FLLIPER_SEAM_SHRINK"] = "preexisting"
             _publish()  # every one of the six is None
             self.assertEqual(
-                os.environ.get("SGLANG_SEAM_SHRINK"),
+                os.environ.get("FLLIPER_SEAM_SHRINK"),
                 "preexisting",
                 "an unset --seam-shrink overwrote an existing env value",
             )
@@ -176,16 +176,16 @@ class TestTheDefaultPathIsUntouched837(unittest.TestCase):
 class TestSetFlagsReachTheEnvironment837(unittest.TestCase):
     def test_each_set_flag_publishes_its_key(self):
         cases = [
-            (dict(seam_shrink=True), "SGLANG_SEAM_SHRINK", "1"),
+            (dict(seam_shrink=True), "FLLIPER_SEAM_SHRINK", "1"),
             (dict(seam_shrink_prearm_quiesce=1),
-             "SGLANG_SEAM_SHRINK_PREARM_QUIESCE", "1"),
+             "FLLIPER_SEAM_SHRINK_PREARM_QUIESCE", "1"),
             (dict(seam_shrink_defer_grow=0),
-             "SGLANG_SEAM_SHRINK_DEFER_GROW", "0"),
+             "FLLIPER_SEAM_SHRINK_DEFER_GROW", "0"),
             (dict(seam_shrink_grow_debt_rounds=7),
-             "SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS", "7"),
+             "FLLIPER_SEAM_SHRINK_GROW_DEBT_ROUNDS", "7"),
             (dict(flip_seam_drain_budget_ms=250),
-             "SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS", "250"),
-            (dict(hicache_read_buffers=4), "SGLANG_HICACHE_READ_BUFFERS", "4"),
+             "FLLIPER_FLIP_SEAM_DRAIN_BUDGET_MS", "250"),
+            (dict(hicache_read_buffers=4), "FLLIPER_HICACHE_READ_BUFFERS", "4"),
         ]
         for kw, env, expected in cases:
             with self.subTest(env=env):
@@ -210,21 +210,21 @@ class TestSetFlagsReachTheEnvironment837(unittest.TestCase):
         """
         ctx = _clean_env()
         try:
-            os.environ["SGLANG_SEAM_SHRINK"] = "1"
+            os.environ["FLLIPER_SEAM_SHRINK"] = "1"
             _publish(seam_shrink=False)
             self.assertEqual(
-                os.environ.get("SGLANG_SEAM_SHRINK"),
+                os.environ.get("FLLIPER_SEAM_SHRINK"),
                 "0",
                 "--seam-shrink false did not publish '0'",
             )
         finally:
             ctx.stop()
 
-        import sglang.srt.managers.phase_flip_runtime as rt
+        import flliper.srt.managers.phase_flip_runtime as rt
 
         ctx = _clean_env()
         try:
-            os.environ["SGLANG_SEAM_SHRINK"] = "1"
+            os.environ["FLLIPER_SEAM_SHRINK"] = "1"
             _publish(seam_shrink=False)
             self.assertFalse(
                 rt._seam_shrink_master(),
@@ -332,22 +332,22 @@ class TestTheFlagBeatsTheEnv837(unittest.TestCase):
 
         The boot env used to be a captured shell environment plus a heredoc
         plus EXTRA_ENV, and a key written twice resolved as "last one wins" --
-        SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S was 10 in one half and 8 in the
+        FLLIPER_PHASE_POLICY_TP_DECODE_FLOOR_S was 10 in one half and 8 in the
         other and the 10 had been dead the whole time. With the flag
         authoritative, the flag's value is the one that survives.
         """
         cases = [
-            (dict(seam_shrink=False), "SGLANG_SEAM_SHRINK", "1", "0"),
+            (dict(seam_shrink=False), "FLLIPER_SEAM_SHRINK", "1", "0"),
             (dict(seam_shrink_prearm_quiesce=-1),
-             "SGLANG_SEAM_SHRINK_PREARM_QUIESCE", "1", "-1"),
+             "FLLIPER_SEAM_SHRINK_PREARM_QUIESCE", "1", "-1"),
             (dict(seam_shrink_defer_grow=0),
-             "SGLANG_SEAM_SHRINK_DEFER_GROW", "1", "0"),
+             "FLLIPER_SEAM_SHRINK_DEFER_GROW", "1", "0"),
             (dict(seam_shrink_grow_debt_rounds=7),
-             "SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS", "32", "7"),
+             "FLLIPER_SEAM_SHRINK_GROW_DEBT_ROUNDS", "32", "7"),
             (dict(flip_seam_drain_budget_ms=250),
-             "SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS", "1094", "250"),
+             "FLLIPER_FLIP_SEAM_DRAIN_BUDGET_MS", "1094", "250"),
             (dict(hicache_read_buffers=4),
-             "SGLANG_HICACHE_READ_BUFFERS", "0", "4"),
+             "FLLIPER_HICACHE_READ_BUFFERS", "0", "4"),
         ]
         for kw, env, stale, expected in cases:
             with self.subTest(env=env):
@@ -369,20 +369,20 @@ class TestTheEnvBridgeStillWorks837(unittest.TestCase):
     """Nobody's running deployment changes today."""
 
     def test_env_still_resolves_when_the_flag_is_unset(self):
-        import sglang.srt.managers.phase_flip_runtime as rt
-        from sglang.srt.environ import envs
+        import flliper.srt.managers.phase_flip_runtime as rt
+        from flliper.srt.environ import envs
 
         ctx = _clean_env()
         try:
-            os.environ["SGLANG_SEAM_SHRINK"] = "1"
-            os.environ["SGLANG_SEAM_SHRINK_PREARM_QUIESCE"] = "0"
-            os.environ["SGLANG_SEAM_SHRINK_DEFER_GROW"] = "1"
-            os.environ["SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS"] = "7"
-            os.environ["SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS"] = "250"
-            os.environ["SGLANG_HICACHE_READ_BUFFERS"] = "4"
+            os.environ["FLLIPER_SEAM_SHRINK"] = "1"
+            os.environ["FLLIPER_SEAM_SHRINK_PREARM_QUIESCE"] = "0"
+            os.environ["FLLIPER_SEAM_SHRINK_DEFER_GROW"] = "1"
+            os.environ["FLLIPER_SEAM_SHRINK_GROW_DEBT_ROUNDS"] = "7"
+            os.environ["FLLIPER_FLIP_SEAM_DRAIN_BUDGET_MS"] = "250"
+            os.environ["FLLIPER_HICACHE_READ_BUFFERS"] = "4"
             _publish()  # every flag unset; publication must not disturb these
             self.assertTrue(
-                rt._seam_shrink_master(), "SGLANG_SEAM_SHRINK stopped resolving"
+                rt._seam_shrink_master(), "FLLIPER_SEAM_SHRINK stopped resolving"
             )
             self.assertFalse(
                 rt.seam_shrink_prearm_quiesce_enabled(),
@@ -394,7 +394,7 @@ class TestTheEnvBridgeStillWorks837(unittest.TestCase):
             )
             self.assertEqual(7, rt.seam_shrink_grow_debt_rounds())
             self.assertEqual(250, rt.flip_seam_drain_budget_ms())
-            self.assertEqual(4, envs.SGLANG_HICACHE_READ_BUFFERS.get())
+            self.assertEqual(4, envs.FLLIPER_HICACHE_READ_BUFFERS.get())
         finally:
             ctx.stop()
 
@@ -406,8 +406,8 @@ class TestTheEnvBridgeStillWorks837(unittest.TestCase):
         guard permanently stood down. 32 rounds is the #834 ratchet patience.
         0 read buffers is the shipped per-read allocation.
         """
-        import sglang.srt.managers.phase_flip_runtime as rt
-        from sglang.srt.environ import envs
+        import flliper.srt.managers.phase_flip_runtime as rt
+        from flliper.srt.environ import envs
 
         ctx = _clean_env()
         try:
@@ -417,7 +417,7 @@ class TestTheEnvBridgeStillWorks837(unittest.TestCase):
             self.assertFalse(rt.seam_shrink_defer_grow_enabled())
             self.assertEqual(1094, rt.flip_seam_drain_budget_ms())
             self.assertEqual(32, rt.seam_shrink_grow_debt_rounds())
-            self.assertEqual(0, envs.SGLANG_HICACHE_READ_BUFFERS.get())
+            self.assertEqual(0, envs.FLLIPER_HICACHE_READ_BUFFERS.get())
         finally:
             ctx.stop()
 
@@ -430,7 +430,7 @@ class TestPerHalfAttributionEndToEnd837(unittest.TestCase):
         runtime agree. Without this the overrides are a published string that
         nothing was ever observed to obey.
         """
-        import sglang.srt.managers.phase_flip_runtime as rt
+        import flliper.srt.managers.phase_flip_runtime as rt
 
         ctx = _clean_env()
         try:
@@ -453,7 +453,7 @@ class TestPerHalfAttributionEndToEnd837(unittest.TestCase):
     def test_master_off_with_one_half_forced_on(self):
         """The other direction, which is the cheaper half of an attribution
         pair: nothing armed except the half under test."""
-        import sglang.srt.managers.phase_flip_runtime as rt
+        import flliper.srt.managers.phase_flip_runtime as rt
 
         ctx = _clean_env()
         try:
@@ -483,7 +483,7 @@ class TestDeprecationNotices837(unittest.TestCase):
     """
 
     def _warn_for(self, env, preset):
-        from sglang.srt.environ import _warn_deprecated_env_to_cli_flag
+        from flliper.srt.environ import _warn_deprecated_env_to_cli_flag
 
         ctx = _clean_env()
         try:
@@ -524,7 +524,7 @@ class TestDeprecationNotices837(unittest.TestCase):
 
     def test_all_six_notices_are_registered_in_environ(self):
         """The helper is only reached if environ.py calls it for this key."""
-        import sglang.srt.environ as environ_mod
+        import flliper.srt.environ as environ_mod
 
         src = inspect.getsource(environ_mod)
         for field, env in SIX:
@@ -613,7 +613,7 @@ class TestTheSixAreActuallyOnTheCommandLine837(unittest.TestCase):
         """The command line an operator needs and nothing else documents.
 
         There is no ``--no-seam-shrink``, so a gate-OFF segment against a host
-        whose environment sets SGLANG_SEAM_SHRINK=1 is spelled with the two
+        whose environment sets FLLIPER_SEAM_SHRINK=1 is spelled with the two
         per-half zeros. If this ever stops parsing, the W13b control arm loses
         its only argv expression.
         """
@@ -622,12 +622,12 @@ class TestTheSixAreActuallyOnTheCommandLine837(unittest.TestCase):
         )
         self.assertEqual(ns.seam_shrink_prearm_quiesce, 0)
         self.assertEqual(ns.seam_shrink_defer_grow, 0)
-        with mock.patch.dict(os.environ, {"SGLANG_SEAM_SHRINK": "1"}, clear=False):
+        with mock.patch.dict(os.environ, {"FLLIPER_SEAM_SHRINK": "1"}, clear=False):
             _publish(
                 seam_shrink_prearm_quiesce=ns.seam_shrink_prearm_quiesce,
                 seam_shrink_defer_grow=ns.seam_shrink_defer_grow,
             )
-            from sglang.srt.managers import phase_flip_runtime as rt
+            from flliper.srt.managers import phase_flip_runtime as rt
 
             self.assertFalse(rt.seam_shrink_prearm_quiesce_enabled())
             self.assertFalse(rt.seam_shrink_defer_grow_enabled())

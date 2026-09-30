@@ -65,7 +65,7 @@ CHAT_TEMPLATE="${CHAT_TEMPLATE:-$SCRIPT_DIR/dsv4f_chat_template.jinja}"
 ARB_SESSION="${ARB_SESSION:-agent-dsv4f-window}"
 
 # MemAvailable floor. Derived, not desk-picked: the GGUF streaming loader is
-# told to hold up to SGLANG_GGUF_STREAM_TRIM_SOFT_GIB (88) GiB of page cache
+# told to hold up to FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB (88) GiB of page cache
 # and trim back to _TARGET_GIB (78); below SOFT + 8 GiB of headroom the load
 # thrashes instead of streaming. There is no swap on this host, so a shortfall
 # cannot be absorbed.
@@ -101,7 +101,7 @@ preflight() {
     avail_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
     floor_kib=$(( MEM_AVAIL_FLOOR_GIB * 1024 * 1024 ))
     avail_gib=$(( avail_kib / 1024 / 1024 ))
-    [ "$avail_kib" -ge "$floor_kib" ] || die "MemAvailable is ${avail_gib} GiB, floor is ${MEM_AVAIL_FLOOR_GIB} GiB (SGLANG_GGUF_STREAM_TRIM_SOFT_GIB=88 + 8 GiB headroom, no swap on this host). Free page cache or lower MEM_AVAIL_FLOOR_GIB deliberately."
+    [ "$avail_kib" -ge "$floor_kib" ] || die "MemAvailable is ${avail_gib} GiB, floor is ${MEM_AVAIL_FLOOR_GIB} GiB (FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB=88 + 8 GiB headroom, no swap on this host). Free page cache or lower MEM_AVAIL_FLOOR_GIB deliberately."
 
     # --- no compute process on ANY card -----------------------------------
     local apps
@@ -248,7 +248,7 @@ resolve_cards() {
         || die "card identity could not be resolved -- refusing to boot on a guessed index"
 import json, os, sys
 
-from sglang.srt.registry import nvml
+from flliper.srt.registry import nvml
 
 imap = nvml.identity_map(allow_cuda_init=True)
 cards = [
@@ -452,7 +452,7 @@ wait_ready() {
     t0="$(date +%s)"
     for i in $(seq 1 "$max_iters"); do
         # MUST check the HTTP STATUS, not curl's exit code. curl exits 0 for
-        # 4xx/5xx, and sglang binds the port and answers 503 while the engine
+        # 4xx/5xx, and flliper binds the port and answers 503 while the engine
         # is still initialising -- so an exit-code test declares readiness the
         # moment the socket is up. That cost two full ~6 minute loads in this
         # window: the arm was declared ready, every probe was refused against a
@@ -616,30 +616,30 @@ count_log() {
 # /spinning/gpu-battery-results/2026-08-02_394_linkshards/boot394.sh -- the
 # ONLY recipe that has ever served DSV4F on this rig.
 #
-# SGLANG_EXPERT_STATS=1 is armed in EVERY arm because it is free: arm 4
+# FLLIPER_EXPERT_STATS=1 is armed in EVERY arm because it is free: arm 4
 # (#390/#394 expert statistics) is harvested from the other three boots rather
 # than costing a boot of its own.
 # ---------------------------------------------------------------------------
 export_base_env() {
     local arm="${1:?export_base_env needs an arm name}"
     export PYTHONPATH="$WT/python"
-    export SGLANG_MOE_SCRATCH_SLOTS="${SGLANG_MOE_SCRATCH_SLOTS:-6}"   # measured routed top-k is exactly 6
-    export SGLANG_FORWARD_PEAK_PATH="$RUN/peak_$arm"
-    export SGLANG_GGUF_STREAM_TRIM_SOFT_GIB="${SGLANG_GGUF_STREAM_TRIM_SOFT_GIB:-88}"
-    export SGLANG_GGUF_STREAM_TRIM_TARGET_GIB="${SGLANG_GGUF_STREAM_TRIM_TARGET_GIB:-78}"
-    export SGLANG_DSV4_FP4_EXPERTS=0
-    export SGLANG_EXPERT_STATS=1
-    export SGLANG_EXPERT_STATS_PATH="$RUN/expert_stats_$arm"
-    export SGLANG_EXPERT_STATS_INTERVAL_SEC="${SGLANG_EXPERT_STATS_INTERVAL_SEC:-45}"
-    export SGLANG_MOE_STAGING_TRACE=1
-    export SGLANG_OPT_FUSE_WQA_WKV=0
-    export SGLANG_OPT_USE_TOPK_V2=0
+    export FLLIPER_MOE_SCRATCH_SLOTS="${FLLIPER_MOE_SCRATCH_SLOTS:-6}"   # measured routed top-k is exactly 6
+    export FLLIPER_FORWARD_PEAK_PATH="$RUN/peak_$arm"
+    export FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB="${FLLIPER_GGUF_STREAM_TRIM_SOFT_GIB:-88}"
+    export FLLIPER_GGUF_STREAM_TRIM_TARGET_GIB="${FLLIPER_GGUF_STREAM_TRIM_TARGET_GIB:-78}"
+    export FLLIPER_DSV4_FP4_EXPERTS=0
+    export FLLIPER_EXPERT_STATS=1
+    export FLLIPER_EXPERT_STATS_PATH="$RUN/expert_stats_$arm"
+    export FLLIPER_EXPERT_STATS_INTERVAL_SEC="${FLLIPER_EXPERT_STATS_INTERVAL_SEC:-45}"
+    export FLLIPER_MOE_STAGING_TRACE=1
+    export FLLIPER_OPT_FUSE_WQA_WKV=0
+    export FLLIPER_OPT_USE_TOPK_V2=0
     # Refuted / out-of-scope switches, unset explicitly so an inherited
     # environment cannot smuggle them in (TICKET_462 §1).
-    unset SGLANG_MOE_COLD_TIER_SHM || true
-    unset SGLANG_MOE_OFFLOAD_CUDA_GRAPH || true
-    unset SGLANG_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE || true
-    unset SGLANG_MOE_HOT_RESIDENCY || true
+    unset FLLIPER_MOE_COLD_TIER_SHM || true
+    unset FLLIPER_MOE_OFFLOAD_CUDA_GRAPH || true
+    unset FLLIPER_MOE_OFFLOAD_CUDA_GRAPH_UNSAFE || true
+    unset FLLIPER_MOE_HOT_RESIDENCY || true
 }
 
 # The two per-rank vectors are env-overridable: the operator is recomputing

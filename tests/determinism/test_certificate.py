@@ -16,7 +16,7 @@ Three obligations, in the order they matter:
 
 import pytest
 
-from sglang.srt.determinism_certificate import (
+from flliper.srt.determinism_certificate import (
     DETERMINISTIC_BACKEND_MIN_ARCH,
     EXCLUSION_LIBRARY,
     CertificateRefusal,
@@ -116,7 +116,7 @@ def test_refuses_mixed_arch_when_the_rank0_broadcast_is_off():
     with pytest.raises(CertificateRefusal) as exc:
         resolve_certificate(ship_facts(sync_sampled_tokens=False))
     msg = str(exc.value)
-    assert "SGLANG_SYNC_SAMPLED_TOKENS" in msg
+    assert "FLLIPER_SYNC_SAMPLED_TOKENS" in msg
     assert "sm120" in msg and "sm86" in msg
 
 
@@ -229,7 +229,7 @@ def test_guarantee_ordering_is_weakest_wins():
 
 def test_fp8_on_sm8x_arms_the_gemm_env_and_names_the_length_bound():
     cert = resolve_certificate(ship_facts(has_fp8_weights=True))
-    assert cert.forced_env["SGLANG_DETERMINISTIC_FP8_GEMM"] == "1"
+    assert cert.forced_env["FLLIPER_DETERMINISTIC_FP8_GEMM"] == "1"
     assert cert.excluded("fp8_marlin_sm8x")
     exc = EXCLUSION_LIBRARY["fp8_marlin_sm8x"]
     assert "109" in exc.statement and "128" in exc.statement
@@ -241,7 +241,7 @@ def test_fp8_without_an_sm8x_rank_does_not_arm_the_env():
     cert = resolve_certificate(
         ship_facts(rank_archs=(120, 120), tp_size=2, has_fp8_weights=True)
     )
-    assert "SGLANG_DETERMINISTIC_FP8_GEMM" not in cert.forced_env
+    assert "FLLIPER_DETERMINISTIC_FP8_GEMM" not in cert.forced_env
     assert not cert.excluded("fp8_marlin_sm8x")
 
 
@@ -301,7 +301,7 @@ def test_guarantee_statement_pins_the_ship_envelope():
     assert "same boot" in text
     assert "sm120, sm86, sm86" in text
     assert "attention       : flashinfer" in text
-    assert "SGLANG_DETERMINISTIC_FP8_GEMM=1" in text
+    assert "FLLIPER_DETERMINISTIC_FP8_GEMM=1" in text
     assert "NOT COVERED" in text
     # the four exclusions this configuration must confess to, by substance
     assert "kv-session-offload SPILL" in text
@@ -375,8 +375,8 @@ class _ArgsStub:
 
 
 def _run_handler(monkeypatch, stub, archs=SHIP_ARCHS):
-    from sglang.srt import determinism_certificate as dc
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt import determinism_certificate as dc
+    from flliper.srt.server_args import ServerArgs
 
     monkeypatch.setattr(dc, "probe_visible_rank_archs", lambda limit=None: archs)
     ServerArgs._handle_deterministic_hetero(stub)
@@ -402,9 +402,9 @@ def test_handler_is_inert_when_the_flag_is_off(monkeypatch):
 def test_handler_exports_the_fp8_env_for_an_sm8x_group(monkeypatch):
     import os
 
-    monkeypatch.delenv("SGLANG_DETERMINISTIC_FP8_GEMM", raising=False)
+    monkeypatch.delenv("FLLIPER_DETERMINISTIC_FP8_GEMM", raising=False)
     _run_handler(monkeypatch, _ArgsStub(quantization="fp8"))
-    assert os.environ["SGLANG_DETERMINISTIC_FP8_GEMM"] == "1"
+    assert os.environ["FLLIPER_DETERMINISTIC_FP8_GEMM"] == "1"
 
 
 def test_handler_refusal_propagates_out_of_parsing(monkeypatch):
@@ -415,8 +415,8 @@ def test_handler_refusal_propagates_out_of_parsing(monkeypatch):
 def test_radix_supported_list_matches_server_args():
     """The pure core duplicates this list as data; pin it against the original
     so the duplicate cannot drift."""
-    from sglang.srt.determinism_certificate import RADIX_SUPPORTED_BACKENDS
-    from sglang.srt.server_args import (
+    from flliper.srt.determinism_certificate import RADIX_SUPPORTED_BACKENDS
+    from flliper.srt.server_args import (
         RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
     )
 

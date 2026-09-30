@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.managers.admission_limiter import (
+from flliper.srt.managers.admission_limiter import (
     ADMISSION_RELIEF_FEATURE,
     REASON_API,
     REASON_KV_PRESSURE,
@@ -27,12 +27,12 @@ from sglang.srt.managers.admission_limiter import (
     spill_session_cap,
     throttle_before_retract,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_SCHEDULER_PY = _REPO_ROOT / "python" / "sglang" / "srt" / "managers" / "scheduler.py"
+_SCHEDULER_PY = _REPO_ROOT / "python" / "flliper" / "srt" / "managers" / "scheduler.py"
 
 
 class TestAdmissionLimiterConstruction(unittest.TestCase):
@@ -265,11 +265,11 @@ class TestReplicatedPoolUsage(unittest.TestCase):
 
 
 class TestSpillSessionCap(unittest.TestCase):
-    def test_no_limiter_returns_the_configured_regler(self):
+    def test_no_limiter_returns_the_configured_controller(self):
         self.assertEqual(spill_session_cap(5, None), 5)
         self.assertEqual(spill_session_cap(0, None), 0)
 
-    def test_armed_limiter_supplies_a_cap_when_the_regler_is_off(self):
+    def test_armed_limiter_supplies_a_cap_when_the_controller_is_off(self):
         lim = AdmissionLimiter(64, 6, auto=True)
         self.assertEqual(spill_session_cap(0, lim), 6)
 
@@ -343,7 +343,7 @@ class TestPerLaneIsolation(unittest.TestCase):
     def test_dual_group_lane_builds_and_installs_its_own(self):
         # The lane's limiter is lazy and keyed to its own
         # --dual-group-lane-max-requests, and the runtime scope installs it.
-        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+        from flliper.srt.model_executor.dual_group_lane import DualGroupLane
 
         stub = SimpleNamespace(
             _admission_limiter=None,
@@ -363,7 +363,7 @@ class TestPerLaneIsolation(unittest.TestCase):
         src = (
             _REPO_ROOT
             / "python"
-            / "sglang"
+            / "flliper"
             / "srt"
             / "model_executor"
             / "dual_group_lane.py"
@@ -440,7 +440,7 @@ class TestLadderRegistration(unittest.TestCase):
         """#287 user directive: the relief order is a SERVICE-cost order --
         KV-vector flip (service-neutral per #320) < admission lowering
         (turns sessions away) < any data movement (spill/offload)."""
-        from sglang.srt.model_executor.kv_pressure_ladder import (
+        from flliper.srt.model_executor.kv_pressure_ladder import (
             RELIEF_FEATURES,
             RELIEF_ORDER,
         )

@@ -39,8 +39,8 @@ EVERY BOUND IS SOLVED FROM BOOT DIMENSIONING, never a free parameter:
 
 import unittest
 
-from sglang.srt.managers import parked_decode_set as pds
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import parked_decode_set as pds
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

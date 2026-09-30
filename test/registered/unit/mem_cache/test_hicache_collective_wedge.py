@@ -30,13 +30,13 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.unified_radix_cache import (
+from flliper.srt.mem_cache.hicache_storage import PoolName
+from flliper.srt.mem_cache.unified_radix_cache import (
     HiCacheCollectiveError,
     HiCacheCollectiveTimeoutError,
     UnifiedRadixCache,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -114,7 +114,7 @@ class TestBoundedCollective(unittest.TestCase):
         # The error must name the call site so the wedge is diagnosable from
         # the log line alone, without a py-spy stack.
         self.assertIn("drain_storage_control_queues", msg)
-        self.assertIn("SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S", msg)
+        self.assertIn("FLLIPER_HICACHE_COLLECTIVE_TIMEOUT_S", msg)
 
     def test_dead_peer_barrier_raises_named_error(self):
         h = _holder()
@@ -212,9 +212,9 @@ class TestRankUniformCollectiveShape(unittest.TestCase):
         self.assertEqual(got["impl"]["extra_release_counts"], {PoolName.MAMBA: 4})
 
     def test_drain_vector_min_backup_count_when_h74_is_off(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        with envs.SGLANG_WEG2_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
+        with envs.FLLIPER_PDFLIP_ENABLE_LOCAL_BACKUP_ACK_DRAIN.override(False):
             got = self._drain_vector({PoolName.MAMBA: _FakeQueue(4)})
         self.assertEqual(got["impl"]["n_backup"], 2)
 

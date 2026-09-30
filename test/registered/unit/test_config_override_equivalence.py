@@ -19,21 +19,21 @@ That part is decidable at a desk, so it is pinned here rather than deferred to
 a window -- the boot validation is still owed and is on the F4-r4 window list.
 
 The equivalence is asserted against a REAL ServerArgs with declarations
-materialized and ``SGLANG_STRICT_CONFIG_MUTATION=1``, i.e. the exact
+materialized and ``FLLIPER_STRICT_CONFIG_MUTATION=1``, i.e. the exact
 configuration under which a bare assignment is supposed to raise. A test that
 used a stub here would prove nothing about the guard.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.mem_cache.gdn_slot_ladder import PROFILED_SLOTS_ATTR
-from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.environ import envs
+from flliper.srt.mem_cache.gdn_slot_ladder import PROFILED_SLOTS_ATTR
+from flliper.srt.server_args import ServerArgs
+from flliper.test.test_utils import CustomTestCase
 
 # The two fields that moved onto the sanctioned path. The first is a declared
 # dataclass field, the second an ad-hoc attribute -- override() has a different
@@ -53,12 +53,12 @@ class _Strict:
     """Arm the strict mutation guard for the duration of a block."""
 
     def __enter__(self):
-        self.saved = envs.SGLANG_STRICT_CONFIG_MUTATION.get()
-        envs.SGLANG_STRICT_CONFIG_MUTATION.set(True)
+        self.saved = envs.FLLIPER_STRICT_CONFIG_MUTATION.get()
+        envs.FLLIPER_STRICT_CONFIG_MUTATION.set(True)
         return self
 
     def __exit__(self, *exc):
-        envs.SGLANG_STRICT_CONFIG_MUTATION.set(self.saved)
+        envs.FLLIPER_STRICT_CONFIG_MUTATION.set(self.saved)
         return False
 
 

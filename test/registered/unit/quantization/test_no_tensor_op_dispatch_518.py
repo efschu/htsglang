@@ -35,7 +35,7 @@ from pathlib import Path
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -191,7 +191,7 @@ class TestPythonMirrorStillWorks(unittest.TestCase):
     sha256, so a tree carrying #518 can still run a pre-#518 wheel."""
 
     def test_the_mirror_answers_when_the_op_raises(self):
-        from sglang.srt.layers.quantization import gguf as G
+        from flliper.srt.layers.quantization import gguf as G
 
         def _raise(_qtype):
             raise NotImplementedError("no dispatchable fallback (simulated)")

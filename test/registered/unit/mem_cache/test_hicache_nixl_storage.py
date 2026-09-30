@@ -1,6 +1,6 @@
 """Unit tests for the NIXL HiCache storage backend -- no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
@@ -14,8 +14,8 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from flliper.test.test_utils import CustomTestCase
 
 # GUARDED, BECAUSE A COLLECTION ERROR IS NOT ONE RED MODULE (#656, MERGE-R9
 # 12.7). NIXL is an optional backend; ``hicache_nixl`` raises ImportError at
@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 # fix. The dependency is real for two of the classes below and they skip on
 # it; it must not decide whether the directory can be COLLECTED.
 try:
-    from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
+    from flliper.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 
     NIXL_IMPORT_ERROR = None
 except ImportError as _e:  # pragma: no cover -- depends on the host
@@ -38,7 +38,7 @@ requires_nixl = unittest.skipIf(
 )
 
 # Stress tests are opt-in: CI never sets this; set locally to exercise them.
-STRESS_ENABLED = bool(os.environ.get("SGLANG_RUN_NIXL_STRESS"))
+STRESS_ENABLED = bool(os.environ.get("FLLIPER_RUN_NIXL_STRESS"))
 
 
 class MockMemPoolHost:
@@ -549,7 +549,7 @@ class TestNixlDirectIO(CustomTestCase):
         """open_file sets O_DIRECT on the file descriptor when use_direct_io=True."""
         import fcntl
 
-        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+        from flliper.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
 
         fm = NixlFileManager(self.test_dir, use_direct_io=True)
         test_file = os.path.join(self.test_dir, "test_odirect.bin")
@@ -563,7 +563,7 @@ class TestNixlDirectIO(CustomTestCase):
         """open_file does not set O_DIRECT when use_direct_io=False."""
         import fcntl
 
-        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+        from flliper.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
 
         fm = NixlFileManager(self.test_dir, use_direct_io=False)
         test_file = os.path.join(self.test_dir, "test_buffered.bin")
@@ -650,7 +650,7 @@ class TestNixlFileLayout(CustomTestCase):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_route_key_is_stable_and_bucketed(self):
-        from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
+        from flliper.srt.mem_cache.storage.nixl.nixl_routing import (
             BUCKET_HEX_CHARS,
             route_key,
         )
@@ -663,17 +663,17 @@ class TestNixlFileLayout(CustomTestCase):
         self.assertRegex(bucket, rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
 
     def test_route_key_rejects_empty_disk_set(self):
-        from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key
+        from flliper.srt.mem_cache.storage.nixl.nixl_routing import route_key
 
         with self.assertRaises(ValueError):
             route_key("page-123", 0)
 
     def test_file_manager_routes_to_bucketed_base_dir(self):
-        from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
+        from flliper.srt.mem_cache.storage.nixl.nixl_routing import (
             route_disk,
             route_key,
         )
-        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+        from flliper.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
 
         base_dirs = [os.path.join(self.test_dir, f"disk{i}") for i in range(3)]
         fm = NixlFileManager(base_dirs, use_direct_io=False)
@@ -687,7 +687,7 @@ class TestNixlFileLayout(CustomTestCase):
         self.assertEqual(fm.iter_all_base_dirs(), base_dirs)
 
     def test_open_file_creates_bucket_directory(self):
-        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+        from flliper.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
 
         fm = NixlFileManager(self.test_dir, use_direct_io=False)
         file_path = fm.get_file_path("page-123")
@@ -700,7 +700,7 @@ class TestNixlFileLayout(CustomTestCase):
                 os.close(fd)
 
     def test_clear_removes_nested_bucket_files(self):
-        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+        from flliper.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
 
         fm = NixlFileManager(self.test_dir, use_direct_io=False)
         file_path = fm.get_file_path("page-123")

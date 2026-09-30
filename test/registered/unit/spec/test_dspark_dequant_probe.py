@@ -17,12 +17,12 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
+from flliper.srt.speculative.dspark_components.kernels.dspark_draft_model import (
     _dequant_supported,
     _fused_commit_kv_proj_supported,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 

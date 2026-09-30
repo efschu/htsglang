@@ -14,7 +14,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.layers.moe import expert_pool_device as ep
+from flliper.srt.layers.moe import expert_pool_device as ep
 
 # residents 0,1 in rows 0,1; LRU rows 2..7; staging rows 8..13
 E, ROWS, R, S = 10, 14, 2, 6
@@ -128,7 +128,7 @@ def test_an_eager_pass_clears_the_prefetch_marks():
 
 # ---- (b) the prediction helper: global top-k -> this rank's local ids --------
 def _shard_stub(num_experts, lo, hi, generic):
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
     class _Shard:
         _build_expert_shard_topk_remap = FusedMoE._build_expert_shard_topk_remap
@@ -178,11 +178,11 @@ def test_a_rank_that_owns_none_of_the_predicted_experts_prefetches_nothing():
 
 # ---- (c) the switch is off by default ---------------------------------------
 def test_the_switch_is_off_by_default_and_links_nothing():
-    import sglang.srt.layers.moe.expert_offload as eo
-    from sglang.srt.models.qwen2_moe import link_moe_pool_prefetch
+    import flliper.srt.layers.moe.expert_offload as eo
+    from flliper.srt.models.qwen2_moe import link_moe_pool_prefetch
 
     eo._POOL_PREFETCH = None
-    os.environ.pop("SGLANG_MOE_POOL_PREFETCH", None)
+    os.environ.pop("FLLIPER_MOE_POOL_PREFETCH", None)
     assert eo.pool_prefetch_enabled() is False
 
     class _Blk:
@@ -199,14 +199,14 @@ def test_the_switch_is_off_by_default_and_links_nothing():
     assert all(l.mlp.pool_prefetch_next is None for l in layers)
 
     eo._POOL_PREFETCH = None
-    os.environ["SGLANG_MOE_POOL_PREFETCH"] = "1"
+    os.environ["FLLIPER_MOE_POOL_PREFETCH"] = "1"
     try:
         assert eo.pool_prefetch_enabled() is True
         assert link_moe_pool_prefetch(layers) == 2  # last block has no successor
         assert layers[0].mlp.pool_prefetch_next is layers[1].mlp
         assert layers[2].mlp.pool_prefetch_next is None
     finally:
-        os.environ.pop("SGLANG_MOE_POOL_PREFETCH", None)
+        os.environ.pop("FLLIPER_MOE_POOL_PREFETCH", None)
         eo._POOL_PREFETCH = None
 
 
@@ -229,8 +229,8 @@ def test_the_side_stream_reads_the_layers_own_ids_buffer(monkeypatch):
     the main stream before the fork, and only ever the lanes it was given."""
     import torch
 
-    from sglang.srt.layers.moe import expert_offload as eo
-    from sglang.srt.layers.moe import expert_pool_device as ep
+    from flliper.srt.layers.moe import expert_offload as eo
+    from flliper.srt.layers.moe import expert_pool_device as ep
 
     E, W = 12, 8
     pf = ep.allocate_step_buffers("cpu", E, W)
@@ -300,7 +300,7 @@ def test_the_kernel_takes_the_missing_expert_from_the_screened_lanes():
     ``tl.load`` that a racing writer could feed an unscreened value."""
     import inspect
 
-    from sglang.srt.layers.moe import expert_pool_device as ep
+    from flliper.srt.layers.moe import expert_pool_device as ep
 
     src = inspect.getsource(ep._step_kernel)
     assert "expert = tl.load(ids_ptr + i)" not in src

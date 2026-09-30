@@ -8,7 +8,7 @@ import argparse
 
 import pytest
 
-from sglang.srt.managers.kv_session_offload import (
+from flliper.srt.managers.kv_session_offload import (
     SPILL_CLASS_NEVER,
     SPILL_CLASS_NORMAL,
     SPILL_CLASS_PREFERRED,
@@ -181,7 +181,7 @@ def test_blocked_cooldown_composes_with_the_class():
 def _server_args(**kw):
     """``model_path='dummy'`` short-circuits ``__post_init__``, so the
     kv-session-offload handler can be driven in isolation (no GPU, no model)."""
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     return ServerArgs(model_path="dummy", **kw)
 
@@ -217,7 +217,7 @@ def test_valid_default_class_with_the_feature_passes():
 
 def test_server_arg_choices_match_the_canonical_list():
     """The CLI choices and the runtime constant list must not drift apart."""
-    from sglang.srt.server_args import ServerArgs
+    from flliper.srt.server_args import ServerArgs
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
@@ -235,7 +235,7 @@ def test_server_arg_choices_match_the_canonical_list():
 
 
 def test_generate_req_input_carries_the_class_into_batch_items():
-    from sglang.srt.managers.io_struct import GenerateReqInput
+    from flliper.srt.managers.io_struct import GenerateReqInput
 
     obj = GenerateReqInput(text=["a", "b"], spill_class=SPILL_CLASS_NEVER)
     obj.normalize_batch_and_arguments()
@@ -248,8 +248,8 @@ def test_generate_req_input_carries_the_class_into_batch_items():
 def test_tokenizer_manager_applies_the_server_default():
     import types
 
-    from sglang.srt.managers.io_struct import GenerateReqInput
-    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from flliper.srt.managers.io_struct import GenerateReqInput
+    from flliper.srt.managers.tokenizer_manager import TokenizerManager
 
     stub = types.SimpleNamespace(default_spill_class=SPILL_CLASS_PREFERRED)
     obj = GenerateReqInput(text="a")
@@ -264,8 +264,8 @@ def test_tokenizer_manager_applies_the_server_default():
 def test_tokenizer_manager_rejects_an_unknown_class():
     import types
 
-    from sglang.srt.managers.io_struct import GenerateReqInput
-    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from flliper.srt.managers.io_struct import GenerateReqInput
+    from flliper.srt.managers.tokenizer_manager import TokenizerManager
 
     stub = types.SimpleNamespace(default_spill_class=SPILL_CLASS_NORMAL)
     obj = GenerateReqInput(text="a", spill_class="latency-critical")
@@ -276,8 +276,8 @@ def test_tokenizer_manager_rejects_an_unknown_class():
 def test_req_defaults_to_normal():
     """A Req built by any internal path (no spill_class in sight) must land in
     the NORMAL class -- that is what keeps the stock FCFS order intact."""
-    from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.sampling.sampling_params import SamplingParams
+    from flliper.srt.managers.schedule_batch import Req
+    from flliper.srt.sampling.sampling_params import SamplingParams
 
     req = Req(
         rid="r0",

@@ -5,9 +5,9 @@ python -m unittest test_eval_accuracy_large.TestEvalAccuracyLarge.test_mmlu
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.eval_accuracy_kit import HumanEvalMixin, MGSMEnMixin, MMLUMixin
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.kits.eval_accuracy_kit import HumanEvalMixin, MGSMEnMixin, MMLUMixin
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

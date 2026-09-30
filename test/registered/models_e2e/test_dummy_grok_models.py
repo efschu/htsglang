@@ -1,7 +1,7 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase, is_in_ci, run_bench_one_batch
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import CustomTestCase, is_in_ci, run_bench_one_batch
 
 register_cuda_ci(
     est_time=120,

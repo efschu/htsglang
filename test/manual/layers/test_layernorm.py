@@ -4,14 +4,14 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers import layernorm as layernorm_mod
-from sglang.srt.layers.layernorm import (
+from flliper.srt.layers import layernorm as layernorm_mod
+from flliper.srt.layers.layernorm import (
     Gemma3RMSNorm,
     GemmaRMSNorm,
     LayerNorm,
     RMSNorm,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestRMSNorm(CustomTestCase):

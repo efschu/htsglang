@@ -16,13 +16,13 @@ sub-block trap ("a single flat slice delivers the wrong channels"), one axis
 over. ``test_flat_slice_is_wrong`` plants that mistake deliberately.
 """
 
-from sglang.srt.mem_cache.hicache_migrate import (
+from flliper.srt.mem_cache.hicache_migrate import (
     MambaBlobSpec,
     conv_extents,
     layer_extents,
     temporal_extents,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 
 def _spec(num_layers=8, num_heads=8, units=1):

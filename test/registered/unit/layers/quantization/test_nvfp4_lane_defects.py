@@ -23,7 +23,7 @@ Pure functions and mocked device capabilities; no GPU, no server, no
 checkpoint.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -35,39 +35,39 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     ACTIVATION_VEC_ELEMS,
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.srt.layers.linear import _quant_block_aligned_units
-from sglang.srt.layers.moe.expert_offload import (
+from flliper.srt.layers.linear import _quant_block_aligned_units
+from flliper.srt.layers.moe.expert_offload import (
     _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES,
     assert_expert_offload_quant_supported,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
-from sglang.srt.layers.quantization import fp4_utils
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+from flliper.srt.layers.moe.fused_moe_triton.layer import moe_uneven_tp_units
+from flliper.srt.layers.quantization import fp4_utils
+from flliper.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Fp4,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+from flliper.srt.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w4a4_nvfp4 as ct_nvfp4,
 )
-from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
-from sglang.srt.layers.quantization.marlin_utils import (
+from flliper.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+from flliper.srt.layers.quantization.marlin_utils import (
     GPTQ_MARLIN_MIN_THREAD_K,
     GPTQ_MARLIN_MIN_THREAD_N,
     verify_marlin_supports_shape,
 )
-from sglang.srt.layers.quantization.modelopt_quant import (
+from flliper.srt.layers.quantization.modelopt_quant import (
     FP4_GEMM_ALIGNMENT,
     ModelOptFp4Config,
     modelopt_fp4_uneven_tp_block,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 # Qwen3.6-27B geometry, the checkpoint family this whole task is about.
 INTERMEDIATE = 17408
@@ -363,7 +363,7 @@ class TestCtNvfp4MarlinWeightHandover(CustomTestCase):
 
 
 def _mlp_units(intermediate: int, quant_config) -> int:
-    """Mirrors the derivation in sglang.srt.models.qwen2_moe.Qwen2MoeMLP."""
+    """Mirrors the derivation in flliper.srt.models.qwen2_moe.Qwen2MoeMLP."""
     units = intermediate // math.gcd(intermediate, ACTIVATION_VEC_ELEMS)
     return _quant_block_aligned_units(intermediate, units, quant_config, 1)
 
@@ -642,7 +642,7 @@ class TestExpertOffloadNvfp4Guard(CustomTestCase):
         # H68b: the serialized ModelOpt method has a load-time half now (Marlin
         # path) and moved to the CONDITIONAL set -- admitted only on a layer
         # that half staged, refused everywhere else (see the test above).
-        from sglang.srt.layers.moe.expert_offload import (
+        from flliper.srt.layers.moe.expert_offload import (
             _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES,
         )
 

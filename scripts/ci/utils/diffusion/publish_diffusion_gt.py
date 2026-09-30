@@ -50,7 +50,7 @@ else:
 REPO_OWNER = "sgl-project"
 REPO_NAME = "ci-data"
 BRANCH = "main"
-DEFAULT_TARGET_DIR = "diffusion-ci/consistency_gt/sglang_generated"
+DEFAULT_TARGET_DIR = "diffusion-ci/consistency_gt/flliper_generated"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 QUALITY_MAX_SIDE = 256

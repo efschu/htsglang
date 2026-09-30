@@ -59,7 +59,7 @@ SMALL0="${CUDA_SMALL%%,*}"
 
 cd "$WT" || exit 1
 launch_server "$LOG" /tmp/fam2-dense2.pid \
-  "$VENV/bin/python" -m sglang.launch_server \
+  "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$MODEL" \
   --tokenizer-path "$MODEL" \
   --tp-size 2 --rank-gpu-id "$CUDA_BIG,$SMALL0" \

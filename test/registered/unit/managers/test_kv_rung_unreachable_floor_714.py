@@ -53,7 +53,7 @@ class _Rung:
 
 
 def _summary(rung):
-    from sglang.srt.managers.kv_backing_relief import KvBackingRelief
+    from flliper.srt.managers.kv_backing_relief import KvBackingRelief
 
     return KvBackingRelief.last_proposal_summary(rung)
 

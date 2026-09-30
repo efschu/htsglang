@@ -1,4 +1,4 @@
-"""SGLANG_DFLASH_WINDOW_HOLE_MASK (27b-draftwin 26.09.): the DFLASH draft window's
+"""FLLIPER_DFLASH_WINDOW_HOLE_MASK (27b-draftwin 26.09.): the DFLASH draft window's
 hole rows (no draft KV -> hole slot 0) leave the draft softmax.
 
 CPU equivalence tests against a reference of FlashInfer's paged prefill as the
@@ -24,17 +24,17 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.dflash_solo_pool import (
+from flliper.srt.speculative.dflash_solo_pool import (
     DraftKVSlotMapper,
     rebuild_window_rows_sync_free,
 )
-from sglang.srt.speculative.dflash_window_holes import (
+from flliper.srt.speculative.dflash_window_holes import (
     correct_window_hole_attention,
     draft_hole_buffer_rows,
     window_hole_counts_per_token,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -317,14 +317,14 @@ class TestEndToEnd(CustomTestCase):
 
 class TestSwitchAndWorkerStaging(CustomTestCase):
     def test_env_default_off(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        saved = os.environ.pop("SGLANG_DFLASH_WINDOW_HOLE_MASK", None)
+        saved = os.environ.pop("FLLIPER_DFLASH_WINDOW_HOLE_MASK", None)
         try:
-            self.assertFalse(envs.SGLANG_DFLASH_WINDOW_HOLE_MASK.get())
+            self.assertFalse(envs.FLLIPER_DFLASH_WINDOW_HOLE_MASK.get())
         finally:
             if saved is not None:
-                os.environ["SGLANG_DFLASH_WINDOW_HOLE_MASK"] = saved
+                os.environ["FLLIPER_DFLASH_WINDOW_HOLE_MASK"] = saved
 
     def test_buffer_rows(self):
         sa = types.SimpleNamespace(speculative_num_draft_tokens=8)
@@ -333,7 +333,7 @@ class TestSwitchAndWorkerStaging(CustomTestCase):
         self.assertEqual(draft_hole_buffer_rows(3, sa), 96)
 
     def _fake(self, backend, wls):
-        from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+        from flliper.srt.layers.radix_attention import AttentionType, RadixAttention
 
         layers = torch.nn.ModuleList(
             [
@@ -350,7 +350,7 @@ class TestSwitchAndWorkerStaging(CustomTestCase):
         )
 
     def _bind(self, fake):
-        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+        from flliper.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
         fake._window_hole_resolve = types.MethodType(
             DFlashWorkerV2._window_hole_resolve, fake
@@ -401,10 +401,10 @@ class TestBackendHook(CustomTestCase):
     the hole K/V, and the corrected output (fake wrapper = the reference)."""
 
     def test_hook_calls_and_corrects(self):
-        from sglang.srt.layers.attention.flashinfer_backend import (
+        from flliper.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
-        from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+        from flliper.srt.layers.radix_attention import AttentionType, RadixAttention
 
         gen = torch.Generator().manual_seed(9)
         Hq, Hkv, D, block, L, wl = 8, 2, 16, 8, 30, 20

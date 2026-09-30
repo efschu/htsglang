@@ -2,7 +2,7 @@
 
 THE LOOP. Under the shared arena group P's host copy is transit: the store ack
 frees a node's host rows again (``_drain_backup`` ->
-``_weg2_release_chain_piece_host``), and the node is left ``l3_present`` but no
+``_pdflip_release_chain_piece_host``), and the node is left ``l3_present`` but no
 longer ``backuped``. ``write_backup`` enforces the write-through contiguity law
 by backing an un-backed parent up first -- and asked only ``backuped``. So at the
 sleep flush every child backup (and every poll of a refused child) copied the
@@ -17,7 +17,7 @@ every node.
 C2/R-5); the parent law must ask the same question.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -26,10 +26,10 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.test.test_utils import CustomTestCase
 
 from test_unified_radix_cache_unittest import CacheConfig, build_fixture
 

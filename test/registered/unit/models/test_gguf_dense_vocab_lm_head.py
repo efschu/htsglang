@@ -1,4 +1,4 @@
-"""SGLANG_GGUF_DENSE_VOCAB must reach lm_head, not just embed_tokens (#197).
+"""FLLIPER_GGUF_DENSE_VOCAB must reach lm_head, not just embed_tokens (#197).
 
 The flag has two halves and only one of them was wired:
 
@@ -24,8 +24,8 @@ from unittest.mock import patch
 
 import torch.nn as nn
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -69,17 +69,17 @@ def _config():
 
 class GgufDenseVocabLmHeadTest(CustomTestCase):
     def setUp(self):
-        self._saved = os.environ.get("SGLANG_GGUF_DENSE_VOCAB")
-        os.environ.pop("SGLANG_GGUF_DENSE_VOCAB", None)
+        self._saved = os.environ.get("FLLIPER_GGUF_DENSE_VOCAB")
+        os.environ.pop("FLLIPER_GGUF_DENSE_VOCAB", None)
 
     def tearDown(self):
-        os.environ.pop("SGLANG_GGUF_DENSE_VOCAB", None)
+        os.environ.pop("FLLIPER_GGUF_DENSE_VOCAB", None)
         if self._saved is not None:
-            os.environ["SGLANG_GGUF_DENSE_VOCAB"] = self._saved
+            os.environ["FLLIPER_GGUF_DENSE_VOCAB"] = self._saved
 
     def _build(self, quant_name):
         """Run the real __init__ and report the quant_config lm_head got."""
-        from sglang.srt.models import qwen3_vl
+        from flliper.srt.models import qwen3_vl
 
         seen = {}
 
@@ -117,7 +117,7 @@ class GgufDenseVocabLmHeadTest(CustomTestCase):
 
     def test_gguf_dense_vocab_builds_a_dense_lm_head(self):
         """Flag set: the module must drop the quant_config, like the loader."""
-        os.environ["SGLANG_GGUF_DENSE_VOCAB"] = "1"
+        os.environ["FLLIPER_GGUF_DENSE_VOCAB"] = "1"
         self.assertIsNone(
             self._build("gguf"),
             "lm_head was still built with the GGUF quant_config while the "
@@ -126,25 +126,25 @@ class GgufDenseVocabLmHeadTest(CustomTestCase):
 
     def test_flag_matches_the_loader_gate(self):
         """The module gate and the loader gate must be the same predicate."""
-        from sglang.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
+        from flliper.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
 
-        os.environ["SGLANG_GGUF_DENSE_VOCAB"] = "1"
+        os.environ["FLLIPER_GGUF_DENSE_VOCAB"] = "1"
         self.assertTrue(gguf_dense_vocab())
         self.assertIsNone(self._build("gguf"))
 
-        os.environ["SGLANG_GGUF_DENSE_VOCAB"] = "0"
+        os.environ["FLLIPER_GGUF_DENSE_VOCAB"] = "0"
         self.assertFalse(gguf_dense_vocab())
         self.assertIsNotNone(self._build("gguf"))
 
     def test_non_gguf_quantization_is_untouched_by_the_flag(self):
         """Do-no-harm: the flag is GGUF-only, exactly like the embed gate."""
-        os.environ["SGLANG_GGUF_DENSE_VOCAB"] = "1"
+        os.environ["FLLIPER_GGUF_DENSE_VOCAB"] = "1"
         quant_config = self._build("compressed-tensors")
         self.assertIsNotNone(quant_config)
         self.assertEqual(quant_config.get_name(), "compressed-tensors")
 
     def test_unquantized_model_is_untouched_by_the_flag(self):
-        os.environ["SGLANG_GGUF_DENSE_VOCAB"] = "1"
+        os.environ["FLLIPER_GGUF_DENSE_VOCAB"] = "1"
         self.assertIsNone(self._build(None))
 
 

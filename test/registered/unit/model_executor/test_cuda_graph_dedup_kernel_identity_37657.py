@@ -14,17 +14,17 @@ geometry for two nodes and different ``kern``/``func`` handles: before the
 fix the payloads are equal (red), after it they differ (green); a node pair
 that IS the same function still collapses, so dedup keeps working.
 
-Scope note for the fork: ``SGLANG_ENABLE_CUDA_GRAPH_DEDUP`` defaults to False
-and no weg2 launcher sets it, so the 27B boot does not take this path today.
+Scope note for the fork: ``FLLIPER_ENABLE_CUDA_GRAPH_DEDUP`` defaults to False
+and no pdflip launcher sets it, so the 27B boot does not take this path today.
 """
 
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.model_executor.runner_backend import cuda_graph_dedup_mixin as mod
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.runner_backend import cuda_graph_dedup_mixin as mod
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 

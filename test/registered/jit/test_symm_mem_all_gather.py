@@ -25,14 +25,14 @@ import pytest
 import torch
 import torch.distributed as dist
 
-import sglang.srt.distributed.parallel_state as ps
-from sglang.jit_kernel.tests.utils import multigpu_pytest_main
-from sglang.jit_kernel.utils import cache_once, get_ci_test_range
-from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+import flliper.srt.distributed.parallel_state as ps
+from flliper.jit_kernel.tests.utils import multigpu_pytest_main
+from flliper.jit_kernel.utils import cache_once, get_ci_test_range
+from flliper.srt.distributed.device_communicators.triton_symm_mem_ag import (
     all_gather_inner,
     create_state,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 register_cuda_ci(est_time=240, suite="nightly-kernel-8-gpu-h200", nightly=True)

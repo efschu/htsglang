@@ -53,15 +53,15 @@ import unittest
 
 import torch
 
-from sglang.srt.model_executor.dual_group_lane import DualGroupLane
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.model_executor.dual_group_lane import DualGroupLane
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PERTURB = "SGLANG_LANE_PROPOSAL_PERTURB"
+_PERTURB = "FLLIPER_LANE_PROPOSAL_PERTURB"
 
 
 def _load(path, name):
@@ -192,7 +192,7 @@ def _run(
     the duration of the run and removed afterwards -- the hook is off unless a
     test asks for it, in this file as in a boot.
     """
-    _VEHICLE._on(SGLANG_LANE_POOL_CHECKSUM_PER_POS=1)
+    _VEHICLE._on(FLLIPER_LANE_POOL_CHECKSUM_PER_POS=1)
     saved = os.environ.pop(_PERTURB, None)
     if perturb is not None:
         os.environ[_PERTURB] = perturb
@@ -244,7 +244,7 @@ def _preclone_lane_class():
         "..",
         "..",
         "python",
-        "sglang",
+        "flliper",
         "srt",
         "model_executor",
         "dual_group_lane.py",

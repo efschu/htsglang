@@ -23,13 +23,13 @@ sys.path.insert(
     os.path.join(os.path.dirname(__file__), "..", "..", "python"),
 )
 
-from sglang.srt.layers.moe.expert_offload import (  # noqa: E402
+from flliper.srt.layers.moe.expert_offload import (  # noqa: E402
     assert_expert_offload_quant_supported,
 )
 
 
 class _FakeGGUFMoEMethod:
-    """Stand-in for sglang.srt.layers.quantization.gguf.GGUFMoEMethod.
+    """Stand-in for flliper.srt.layers.quantization.gguf.GGUFMoEMethod.
 
     Matched by class name in the guard (to keep expert_offload.py import-
     light), so a same-named fake exercises the exact match path without

@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.benchmark.dspark_sps_profiler import (
+from flliper.benchmark.dspark_sps_profiler import (
     LoadInfo,
     ServerContext,
     SpsRow,
@@ -12,8 +12,8 @@ from sglang.benchmark.dspark_sps_profiler import (
     round_summary_dict,
     validate_sweep_against_server,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

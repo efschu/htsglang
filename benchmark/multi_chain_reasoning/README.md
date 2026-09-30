@@ -5,14 +5,14 @@ wget https://raw.githubusercontent.com/openai/grade-school-math/master/grade_sch
 
 ## Run benchmark
 
-### Benchmark sglang
+### Benchmark flliper
 ```
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000  --schedule-conservativeness 1.3
+python -m flliper.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port 30000  --schedule-conservativeness 1.3
 ```
 
 ```
-python3 bench_sglang.py --num-questions 64
-python3 bench_sglang.py --num-questions 32 --parallel 1
+python3 bench_flliper.py --num-questions 64
+python3 bench_flliper.py --num-questions 32 --parallel 1
 ```
 
 

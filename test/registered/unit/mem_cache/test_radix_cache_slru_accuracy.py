@@ -3,16 +3,16 @@ from array import array
 
 import torch
 
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
-from sglang.test.ci.ci_register import (
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from flliper.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,

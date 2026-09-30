@@ -26,9 +26,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import test_qwen4_exp_ple_admit_h43 as h43  # noqa: E402
 
-from sglang.srt.models import qwen4_exp_ple_admit as adm  # noqa: E402
-from sglang.srt.models import qwen4_exp_ple_prefetch as pf  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+from flliper.srt.models import qwen4_exp_ple_admit as adm  # noqa: E402
+from flliper.srt.models import qwen4_exp_ple_prefetch as pf  # noqa: E402
+from flliper.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -59,11 +59,11 @@ def _warm(r):
 
 
 def test_the_told_offset_admission_is_used_by_the_first_chunk(rig, caplog):
-    """weg2-8-29's shape: store prefix 40 of 190 tokens; the admission at the
+    """pdflip-8-29's shape: store prefix 40 of 190 tokens; the admission at the
     told reads rows 40..190 ahead, the chunk joins it ready and reads nothing."""
     _warm(rig)
     g = torch.Generator().manual_seed(3)
-    w = _req("weg2-8-29", 190, g)
+    w = _req("pdflip-8-29", 190, g)
     assert adm.admit_ple_request(w, rig.chunk, start=40, source="told") == "started"
     a = rig.g._adm
     assert (a.start, a.lead) == (40, pf.PLE_PREFETCH_LEAD_TOKENS)
@@ -84,7 +84,7 @@ def test_intake_with_a_store_read_in_flight_waits_for_the_told(rig):
     w = _req("w", 190, g, _969c_verdict="issued", _prefetch_registered_prefix_len=0)
     assert adm.admit_ple_request(w, rig.chunk) == "skipped:told_pending"
     assert rig.g._adm is None and not rig.g._adm_queue
-    t = _req("t", 190, g, _969c_verdict="declined:weg2_twin_deferred")
+    t = _req("t", 190, g, _969c_verdict="declined:pdflip_twin_deferred")
     assert adm.admit_ple_request(t, rig.chunk) == "skipped:told_pending"
 
 
@@ -117,7 +117,7 @@ def test_a_moved_start_drops_and_the_chunk_is_gathered_as_before(rig, caplog):
 # The told publisher admits at the offset (PP0, both publish forms).
 # --------------------------------------------------------------------------
 
-from sglang.srt.managers import weg2_store_told as told_mod  # noqa: E402
+from flliper.srt.managers import pdflip_store_told as told_mod  # noqa: E402
 
 
 @pytest.mark.parametrize("told,absolute,head,want", [
@@ -130,7 +130,7 @@ def test_the_hook_computes_the_first_chunk_start(told, absolute, head, want):
     with mock.patch.object(adm, "ple_admission_armed", lambda: True), \
             mock.patch.object(adm, "admit_ple_request",
                               lambda req, cs, **kw: calls.append((cs, kw))):
-        sched = SimpleNamespace(chunked_prefill_size=16384, weg2_dormant=False)
+        sched = SimpleNamespace(chunked_prefill_size=16384, pdflip_dormant=False)
         req = SimpleNamespace(rid="r", _prefetch_registered_prefix_len=head)
         told_mod._ple_admit_at_told(sched, req, told, absolute)
     assert calls == [(16384, {"dormant": False, "start": want, "source": "told"})]
@@ -138,7 +138,7 @@ def test_the_hook_computes_the_first_chunk_start(told, absolute, head, want):
 
 @pytest.mark.parametrize("paced", [True, False])
 def test_the_publisher_calls_the_hook_with_pp0s_told(monkeypatch, paced):
-    import test_weg2_store_told_paced_1416e as ring_mod  # the #1416e ring (managers dir)
+    import test_pdflip_store_told_paced_1416e as ring_mod  # the #1416e ring (managers dir)
 
     seen = []
     monkeypatch.setattr(told_mod, "_ple_admit_at_told",

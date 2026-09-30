@@ -19,10 +19,10 @@ import re
 import textwrap
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.model_loader.expert_mapping_index import ExpertMappingIndex
-from sglang.srt.models import qwen4_exp
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from flliper.srt.model_loader.expert_mapping_index import ExpertMappingIndex
+from flliper.srt.models import qwen4_exp
 
 NUM_EXPERTS = 512  # Qwen3.8-Flash-Next
 
@@ -118,10 +118,10 @@ class TestLoadWeightsUsesTheIndex(unittest.TestCase):
         )
 
     def test_switch_is_on_by_default_and_off_keeps_the_scan(self):
-        self.assertTrue(envs.SGLANG_OPT_LOAD_EXPERT_MAPPING_INDEX.get())
+        self.assertTrue(envs.FLLIPER_OPT_LOAD_EXPERT_MAPPING_INDEX.get())
         mapping = _nf_mapping()
         self.assertIsInstance(qwen4_exp._expert_mapping_index(mapping), ExpertMappingIndex)
-        with envs.SGLANG_OPT_LOAD_EXPERT_MAPPING_INDEX.override(False):
+        with envs.FLLIPER_OPT_LOAD_EXPERT_MAPPING_INDEX.override(False):
             self.assertIsNone(qwen4_exp._expert_mapping_index(mapping))
 
     def test_non_fused_branch_iterates_the_candidates(self):

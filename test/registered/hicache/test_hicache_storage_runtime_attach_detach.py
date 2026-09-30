@@ -1,7 +1,7 @@
 """
 E2E check for HiCache storage runtime attach/detach.
 
-This test launches an SGLang server with hierarchical cache enabled but WITHOUT
+This test launches an fLLiper server with hierarchical cache enabled but WITHOUT
 any storage backend at startup, then attaches/detaches a storage backend via the
 HTTP endpoints.
 
@@ -16,9 +16,9 @@ import time
 import unittest
 from urllib import error, request
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
     find_available_port,
     popen_launch_server,
 )
-from sglang.utils import wait_for_http_ready
+from flliper.utils import wait_for_http_ready
 
 register_cuda_ci(est_time=139, stage="base-b", runner_config="2-gpu-large")
 
@@ -57,9 +57,9 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
         cls.env = {
             **os.environ,
             # File backend uses this env var to decide where to store cache pages.
-            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
+            "FLLIPER_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir,
             # Make runs less flaky for CI/dev.
-            "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
+            "FLLIPER_ENABLE_DETERMINISTIC_INFERENCE": "1",
         }
 
     @classmethod
@@ -222,7 +222,7 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             time.sleep(2)
 
         # Phase B: WITH --admin-api-key, must provide Authorization: Bearer <admin_key>.
-        admin_key = "sglang-test-admin-key"
+        admin_key = "flliper-test-admin-key"
         base_url2 = f"http://127.0.0.1:{find_available_port(int(self.base_url.rsplit(':', 1)[1]) + 1)}"
         other_args2 = list(self.other_args) + ["--admin-api-key", admin_key]
         process2 = popen_launch_server(

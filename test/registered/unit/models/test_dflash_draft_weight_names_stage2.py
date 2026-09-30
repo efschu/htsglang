@@ -30,13 +30,13 @@ from unittest.mock import patch
 
 import torch
 
-import sglang.srt.layers.linear as linear_mod
-import sglang.srt.layers.vocab_parallel_embedding as vpe_mod
-from sglang.srt.distributed.utils import set_tp_partition_ratios
-from sglang.srt.models.dflash import DFlash2DraftModel
-from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.layers.linear as linear_mod
+import flliper.srt.layers.vocab_parallel_embedding as vpe_mod
+from flliper.srt.distributed.utils import set_tp_partition_ratios
+from flliper.srt.models.dflash import DFlash2DraftModel
+from flliper.srt.runtime_context import get_context, get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 

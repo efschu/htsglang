@@ -1,6 +1,6 @@
 """Unit tests for DeepEP Waterfill and EPLB updater compatibility."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -11,11 +11,11 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.layers.moe import topk as topk_module
-from sglang.srt.layers.moe.topk import TopKConfig
-from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
-from sglang.srt.runtime_context import get_parallel
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.moe import topk as topk_module
+from flliper.srt.layers.moe.topk import TopKConfig
+from flliper.srt.models.deepseek_v2 import DeepseekV2MoE
+from flliper.srt.runtime_context import get_parallel
+from flliper.test.test_utils import CustomTestCase
 
 
 class _FakeExpertParam(nn.Module):
@@ -27,7 +27,7 @@ class _FakeExpertParam(nn.Module):
         )
         self.correction_bias = nn.Parameter(torch.ones(self.num_local_experts))
         self.global_scale = nn.Parameter(torch.ones(self.num_local_experts))
-        self.global_scale._sglang_require_global_experts = True
+        self.global_scale._flliper_require_global_experts = True
 
 
 class TestDeepEPWaterfillEPLB(CustomTestCase):

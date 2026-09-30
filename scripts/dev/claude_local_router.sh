@@ -72,7 +72,7 @@ done
 echo "claude_local_router: ${MODELS[*]} -> $LOCAL_BASE, everything else -> $UPSTREAM_BASE"
 echo "claude_local_router: listening on http://$HOST:$PORT (stats: /__router/stats)"
 
-exec "$PYTHON" -m sglang.srt.entrypoints.anthropic.router \
+exec "$PYTHON" -m flliper.srt.entrypoints.anthropic.router \
     --host "$HOST" \
     --port "$PORT" \
     --local-base "$LOCAL_BASE" \

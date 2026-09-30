@@ -23,10 +23,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.mem_cache.pool_host import arena_pool as ap
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool, page_dma_runs
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.pool_host import arena_pool as ap
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool, page_dma_runs
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(__file__)
 
@@ -87,7 +87,7 @@ def _dev_pool(rows=32):
 
 
 def _load(p, slots, mode, monkeypatch):
-    monkeypatch.setenv("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", mode)
+    monkeypatch.setenv("FLLIPER_PDFLIP_ARENA_PAGE_LOAD_MODE", mode)
     p._page_mode = None
     p._page_loaded_key = None
     dst = torch.arange(len(slots) * P, dtype=torch.int64) + 3

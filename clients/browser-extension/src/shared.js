@@ -26,7 +26,7 @@
   var CAPABILITIES_PATH = "/v1/video/capabilities";
 
   // These names and their flags must stay identical to CHAIN_PRESETS in
-  // python/sglang/srt/video_enhance/server.py. The contract is checked by
+  // python/flliper/srt/video_enhance/server.py. The contract is checked by
   // test/registered/video_enhance/test_browser_extension.py, which reads both
   // files -- a rename on one side fails that test rather than silently
   // producing requests the server plans differently than the label promised.

@@ -28,7 +28,7 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.mem_ledger.flight_recorder import (
+from flliper.srt.mem_ledger.flight_recorder import (
     MIB,
     arm_process_trace,
     churn_attribution,
@@ -41,8 +41,8 @@ from sglang.srt.mem_ledger.flight_recorder import (
     resident_attribution,
     trace_requested_for_rank,
 )
-from sglang.srt.registry.nvml import pin_resolvable_without_cuda
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.registry.nvml import pin_resolvable_without_cuda
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -235,7 +235,7 @@ class TestChurnCoverage(unittest.TestCase):
 class TestPhaseMarks(unittest.TestCase):
     def test_mark_is_inert_without_its_directory(self):
         env = dict(os.environ)
-        os.environ.pop("SGLANG_VRAM_FLIGHT_DIR", None)
+        os.environ.pop("FLLIPER_VRAM_FLIGHT_DIR", None)
         try:
             self.assertIsNone(mark("process_start"))
         finally:
@@ -244,7 +244,7 @@ class TestPhaseMarks(unittest.TestCase):
 
     def test_arm_is_inert_without_its_env_var(self):
         env = dict(os.environ)
-        os.environ.pop("SGLANG_VRAM_FLIGHT_TRACE", None)
+        os.environ.pop("FLLIPER_VRAM_FLIGHT_TRACE", None)
         try:
             self.assertFalse(arm_process_trace())
         finally:
@@ -277,7 +277,7 @@ class TestPhaseMarks(unittest.TestCase):
         On the reference rig TP0 shares its card with the parent/tokenizer
         process, which is the entire reason the per-PID reading exists.
         """
-        import sglang.srt.mem_ledger.flight_recorder as fr
+        import flliper.srt.mem_ledger.flight_recorder as fr
 
         torch_view, nvml_view = fr._torch_view, fr._nvml_view
         fr._torch_view = lambda _i: {
@@ -382,15 +382,15 @@ class TestServingWiring(unittest.TestCase):
     """
 
     SITES = (
-        "python/sglang/srt/managers/scheduler.py",
-        "python/sglang/srt/model_executor/model_runner.py",
+        "python/flliper/srt/managers/scheduler.py",
+        "python/flliper/srt/model_executor/model_runner.py",
     )
 
     @classmethod
     def setUpClass(cls):
-        import sglang
+        import flliper
 
-        root = os.path.dirname(os.path.dirname(os.path.abspath(sglang.__file__)))
+        root = os.path.dirname(os.path.dirname(os.path.abspath(flliper.__file__)))
         cls.sources = {}
         for rel in cls.SITES:
             path = os.path.join(os.path.dirname(root), rel)
@@ -407,7 +407,7 @@ class TestServingWiring(unittest.TestCase):
         return found
 
     def test_every_declared_boot_phase_has_a_call_site(self):
-        from sglang.srt.mem_ledger.flight_recorder import BOOT_PHASES
+        from flliper.srt.mem_ledger.flight_recorder import BOOT_PHASES
 
         declared = {name for name, _why in BOOT_PHASES}
         self.assertEqual(
@@ -417,7 +417,7 @@ class TestServingWiring(unittest.TestCase):
         )
 
     def test_no_call_site_invents_a_phase(self):
-        from sglang.srt.mem_ledger.flight_recorder import BOOT_PHASES
+        from flliper.srt.mem_ledger.flight_recorder import BOOT_PHASES
 
         declared = {name for name, _why in BOOT_PHASES}
         self.assertEqual(
@@ -429,7 +429,7 @@ class TestServingWiring(unittest.TestCase):
     def test_the_trace_is_armed_before_the_scheduler_is_constructed(self):
         """Order is the whole property: a trace armed after the first
         allocation attributes none of the boot (#602: 3 of 25142 MiB)."""
-        text = self.sources["python/sglang/srt/managers/scheduler.py"]
+        text = self.sources["python/flliper/srt/managers/scheduler.py"]
         arm = text.index("flight_recorder.arm_process_trace(")
         construct = text.index("scheduler = Scheduler(")
         self.assertLess(arm, construct)
@@ -437,8 +437,8 @@ class TestServingWiring(unittest.TestCase):
     def test_the_snapshot_is_dumped_once_per_process_not_per_runner(self):
         """A speculative process runs two runners; a dump at either runner's
         capture_end is missing the other's captured graphs."""
-        runner = self.sources["python/sglang/srt/model_executor/model_runner.py"]
-        scheduler = self.sources["python/sglang/srt/managers/scheduler.py"]
+        runner = self.sources["python/flliper/srt/model_executor/model_runner.py"]
+        scheduler = self.sources["python/flliper/srt/managers/scheduler.py"]
         self.assertNotIn("flight_recorder.dump_trace", runner)
         self.assertIn("flight_recorder.dump_trace", scheduler)
 
@@ -456,17 +456,17 @@ class TestTraceScope(unittest.TestCase):
     def _env(self, value):
         import os as _os
 
-        old = _os.environ.get("SGLANG_VRAM_FLIGHT_TRACE")
+        old = _os.environ.get("FLLIPER_VRAM_FLIGHT_TRACE")
         if value is None:
-            _os.environ.pop("SGLANG_VRAM_FLIGHT_TRACE", None)
+            _os.environ.pop("FLLIPER_VRAM_FLIGHT_TRACE", None)
         else:
-            _os.environ["SGLANG_VRAM_FLIGHT_TRACE"] = value
+            _os.environ["FLLIPER_VRAM_FLIGHT_TRACE"] = value
 
         def restore():
             if old is None:
-                _os.environ.pop("SGLANG_VRAM_FLIGHT_TRACE", None)
+                _os.environ.pop("FLLIPER_VRAM_FLIGHT_TRACE", None)
             else:
-                _os.environ["SGLANG_VRAM_FLIGHT_TRACE"] = old
+                _os.environ["FLLIPER_VRAM_FLIGHT_TRACE"] = old
 
         self.addCleanup(restore)
 
@@ -503,7 +503,7 @@ class TestBootScoping(unittest.TestCase):
     """
 
     def _two_boots(self, directory):
-        import sglang.srt.mem_ledger.flight_recorder as fr
+        import flliper.srt.mem_ledger.flight_recorder as fr
 
         original = fr._boot_id
         try:
@@ -557,7 +557,7 @@ class TestBootScoping(unittest.TestCase):
         """The id comes from the LAUNCHER, so the ranks agree without a
         collective. A per-process uuid would make cross-rank reading
         impossible, which is the opposite of what the id is for."""
-        import sglang.srt.mem_ledger.flight_recorder as fr
+        import flliper.srt.mem_ledger.flight_recorder as fr
 
         original = fr._boot_id
         try:

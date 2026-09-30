@@ -44,13 +44,13 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.srt.distributed.utils import (
+from flliper.srt import uneven_perf
+from flliper.srt.distributed.utils import (
     partition_units,
     resolve_cp_token_ratios,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -338,7 +338,7 @@ class TestPrecedence(PhaseKvCouplingTestCase):
     def test_the_env_vector_wins_over_the_seed(self):
         sa, _log = self.plan(tune="phase-prefill")
         self.assertIsNotNone(sa.rank_kv_capacity_seed)
-        with mock.patch.dict(os.environ, {"SGLANG_UNEVEN_TOKEN_VECTOR": "5,3,3"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_UNEVEN_TOKEN_VECTOR": "5,3,3"}):
             self.assertEqual(resolve_cp_token_ratios(sa), [5, 3, 3])
 
 

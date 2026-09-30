@@ -6,8 +6,8 @@ import torch
 import torch.utils.benchmark as benchmark
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
-from sglang.kernels.ops.attention.decode_attention import decode_attention_fwd
-from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
+from flliper.kernels.ops.attention.decode_attention import decode_attention_fwd
+from flliper.srt.layers.attention.flashinfer_backend import should_use_tensor_core
 
 
 def benchmark_forward(
@@ -36,7 +36,7 @@ def time_fwd(func, *args, **kwargs):
     return time_f[1].mean * 1e6
 
 
-def decode_attention_sglang(
+def decode_attention_flliper(
     q,
     kv_data,
     batch_size,
@@ -303,7 +303,7 @@ def calculate_diff():
         ),
     )
 
-    _, output_sglang = decode_attention_sglang(
+    _, output_flliper = decode_attention_flliper(
         q,
         kv_data,
         batch_size,
@@ -323,18 +323,18 @@ def calculate_diff():
         q, kv_data, batch_size, kv_len, head_num_q, head_num_kv, head_dim, dtype
     )
 
-    print(f"SGLang output={output_sglang}")
+    print(f"fLLiper output={output_flliper}")
     print(f"FlashInfer output={output_flashinfer}")
     print(f"cuDNN output={output_cudnn}")
-    if torch.allclose(output_sglang, output_flashinfer, atol=1e-2, rtol=1e-2):
-        print("✅ SGLang[Triton] and FlashInfer match")
+    if torch.allclose(output_flliper, output_flashinfer, atol=1e-2, rtol=1e-2):
+        print("✅ fLLiper[Triton] and FlashInfer match")
     else:
-        print("❌ SGLang[Triton] and FlashInfer differ")
+        print("❌ fLLiper[Triton] and FlashInfer differ")
 
-    if torch.allclose(output_sglang, output_cudnn, atol=1e-2, rtol=1e-2):
-        print("✅ SGLang[Triton] and cuDNN match")
+    if torch.allclose(output_flliper, output_cudnn, atol=1e-2, rtol=1e-2):
+        print("✅ fLLiper[Triton] and cuDNN match")
     else:
-        print("❌ SGLang[Triton] and cuDNN differ")
+        print("❌ fLLiper[Triton] and cuDNN differ")
 
 
 if __name__ == "__main__":
@@ -373,7 +373,7 @@ if __name__ == "__main__":
             us_cudnn, output_cudnn = decode_attention_cudnn(
                 q, kv_data, batch_size, kv_len, head_num_q, head_num_kv, head_dim, dtype
             )
-            us_sglang, output_sglang = decode_attention_sglang(
+            us_flliper, output_flliper = decode_attention_flliper(
                 q,
                 kv_data,
                 batch_size,
@@ -397,7 +397,7 @@ if __name__ == "__main__":
                 "  ",
                 us_cudnn,
                 "  ",
-                us_sglang,
+                us_flliper,
                 "  ",
                 us_flashinfer,
             )

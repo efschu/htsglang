@@ -5,7 +5,7 @@ python3 offline_batch_inference.py
 
 from urllib.request import urlopen
 
-import sglang as sgl
+import flliper as sgl
 
 
 def load_prompt() -> str:

@@ -59,7 +59,7 @@ PP_ATTN_STAGE_RATIO = [7, 5, 4]
 NUM_HIDDEN_LAYERS = 64
 FULL_ATTENTION_INTERVAL = 4
 
-LAYER_SET_ENV = "SGLANG_PP_LAYER_SET"
+LAYER_SET_ENV = "FLLIPER_PP_LAYER_SET"
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ def derive_layer_set(
     Uses ``derive_pp_layer_split`` -- the same function the server calls -- so
     the set cannot drift from the ratio it is supposed to reproduce.
     """
-    from sglang.srt.distributed.utils import derive_pp_layer_split
+    from flliper.srt.distributed.utils import derive_pp_layer_split
 
     counts = derive_pp_layer_split(
         list(stage_ratio),
@@ -131,7 +131,7 @@ def verify_split_is_contiguous_and_complete(
 def nvml_inventory() -> List[Dict[str, object]]:
     """Physical index -> card, resolved at run time. Never hardcoded."""
     try:
-        from sglang.srt.registry.nvml import identity_map
+        from flliper.srt.registry.nvml import identity_map
 
         return [
             {
@@ -170,7 +170,7 @@ def fire_refusals() -> List[RefusalResult]:
 
     # (1) any layer set + prefill/decode disaggregation -> NotImplementedError
     try:
-        from sglang.srt.distributed.utils import refuse_noncontiguous_layer_descriptor
+        from flliper.srt.distributed.utils import refuse_noncontiguous_layer_descriptor
 
         refuse_noncontiguous_layer_descriptor({3: 0, 7: 1}, "boot_735_step1 probe")
         out.append(
@@ -194,7 +194,7 @@ def fire_refusals() -> List[RefusalResult]:
     try:
         import torch
 
-        from sglang.srt.layers.utils.common import PPMissingLayer
+        from flliper.srt.layers.utils.common import PPMissingLayer
 
         placeholder = PPMissingLayer(unowned_layer_id=42)
         placeholder.forward(torch.zeros(1))
@@ -217,7 +217,7 @@ def fire_refusals() -> List[RefusalResult]:
 
     # (3) a malformed set -> PPLayerSetError naming the layer and stages
     try:
-        from sglang.srt.distributed.utils import PPLayerSetError, parse_pp_layer_sets
+        from flliper.srt.distributed.utils import PPLayerSetError, parse_pp_layer_sets
 
         # Layer 30 omitted: the set covers 63 of 64 layers.
         parse_pp_layer_sets("0-29;31-47;48-63", NUM_HIDDEN_LAYERS, 3)

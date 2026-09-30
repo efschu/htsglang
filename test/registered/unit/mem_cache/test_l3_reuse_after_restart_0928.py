@@ -36,14 +36,14 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import (  # noqa: E402
+from flliper.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import (  # noqa: E402
     HiCacheFile,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -59,8 +59,8 @@ class _KVPage:
 
 
 def _backend(root, l3idx_path, arena_dir, monkeypatch):
-    from sglang.srt.mem_cache.storage.file.l3_index import L3Index
-    from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
+    from flliper.srt.mem_cache.storage.file.l3_index import L3Index
+    from flliper.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
     be = object.__new__(HiCacheFile)
     be.file_path = str(root)
@@ -87,7 +87,7 @@ def _backend(root, l3idx_path, arena_dir, monkeypatch):
     be._l3idx = idx
     be._l3idx_tried = True
     be._evictor.l3_index = idx
-    monkeypatch.setenv("SGLANG_HICACHE_ARENA_DIR", str(arena_dir))
+    monkeypatch.setenv("FLLIPER_HICACHE_ARENA_DIR", str(arena_dir))
     arena_dir.mkdir(parents=True, exist_ok=True)
     be._arenas = {
         KV_TOTAL: ShmArena(str(arena_dir / f"arena-{KV_TOTAL}.bin"), KV_TOTAL, 32),
@@ -99,7 +99,7 @@ def _backend(root, l3idx_path, arena_dir, monkeypatch):
 def _boot(tmp_path, monkeypatch, name):
     """One boot of the group: the persistent store directory is shared by
     every boot, the arena directory (/dev/shm/<boot tag>) is this boot's."""
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     root = tmp_path / "store" / "l3-nextflash-identity"
     root.mkdir(parents=True, exist_ok=True)
     (root / "L3_IDENTITY.json").write_text("{}")
@@ -141,7 +141,7 @@ def test_a_demoted_kv_page_carries_its_qsa_index_to_l3(tmp_path, monkeypatch):
     disk and leaves their QSA index in L2; after the restart the probe finds
     kv=8 and caps the claim at 0 (the rc12z13 shape: kv=399 claimed=47).
     GREEN: the claim is the whole KV prefix."""
-    monkeypatch.setenv("SGLANG_WEG2_L3_WRITE_BEHIND_S", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_S", "0")
     be = _boot(tmp_path, monkeypatch, "boot1")
     hs = _hashes("a")
     _prefill(be, hs)
@@ -158,7 +158,7 @@ def test_a_demoted_kv_page_carries_its_qsa_index_to_l3(tmp_path, monkeypatch):
 def test_a_claim_room_eviction_carries_the_qsa_index_to_l3(tmp_path, monkeypatch):
     """(A) the #257 d claim room: evicting a KV page writes it to L3 first --
     and now its QSA index too. RED on 7b2c6ee5ef: claim 0 after the restart."""
-    monkeypatch.setenv("SGLANG_WEG2_L3_WRITE_BEHIND_S", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_S", "0")
     be = _boot(tmp_path, monkeypatch, "boot1")
     hs = _hashes("b")
     _prefill(be, hs)
@@ -217,7 +217,7 @@ def test_b_write_behind_respects_its_budget_and_catches_up(tmp_path, monkeypatch
 @pytest.fixture(autouse=True)
 def _awake_gate():
     try:
-        from sglang.srt.mem_cache import l3_write_behind as gate
+        from flliper.srt.mem_cache import l3_write_behind as gate
     except ImportError:
         yield
         return
@@ -253,11 +253,11 @@ def test_b_quiet_during_legs_sleep_and_dormancy(tmp_path, monkeypatch):
     """The flip owns the arena and the lanes: a pass writes nothing while a
     leg runs on this rank, after the sleep leg until the wake leg returned,
     and while the scheduler is dormant (W25) -- the existing leg bracket of
-    ``_weg2_group_stop_on_leg_failure`` drives the gate, no clock."""
-    from sglang.srt.managers.scheduler_components.weight_updater import (
-        _weg2_group_stop_on_leg_failure,
+    ``_pdflip_group_stop_on_leg_failure`` drives the gate, no clock."""
+    from flliper.srt.managers.scheduler_components.weight_updater import (
+        _pdflip_group_stop_on_leg_failure,
     )
-    from sglang.srt.mem_cache import l3_write_behind as gate
+    from flliper.srt.mem_cache import l3_write_behind as gate
 
     be = _boot(tmp_path, monkeypatch, "boot1")
     hs = _hashes("f")
@@ -265,20 +265,20 @@ def test_b_quiet_during_legs_sleep_and_dormancy(tmp_path, monkeypatch):
     seen = {}
 
     class _Sched:
-        weg2_dormant = False
+        pdflip_dormant = False
 
     class _Updater:
         scheduler = _Sched()
 
-        def _weg2_leg_failed(self, msg, exc):
+        def _pdflip_leg_failed(self, msg, exc):
             pass
 
-        @_weg2_group_stop_on_leg_failure
+        @_pdflip_group_stop_on_leg_failure
         def release_memory_occupation(self, recv_req):
             seen["in_leg"] = be.l3_write_behind_pass()
             return "released"
 
-        @_weg2_group_stop_on_leg_failure
+        @_pdflip_group_stop_on_leg_failure
         def resume_memory_occupation(self, recv_req):
             seen["in_wake"] = be.l3_write_behind_pass()
             return "resumed"
@@ -290,9 +290,9 @@ def test_b_quiet_during_legs_sleep_and_dormancy(tmp_path, monkeypatch):
     assert asleep["paused"] == "asleep" and asleep["written"] == 0
     assert u.resume_memory_occupation(None) == "resumed"
     assert seen["in_wake"]["paused"] == "leg"
-    u.scheduler.weg2_dormant = True
+    u.scheduler.pdflip_dormant = True
     assert be.l3_write_behind_pass()["paused"] == "dormant"
-    u.scheduler.weg2_dormant = False
+    u.scheduler.pdflip_dormant = False
     awake = be.l3_write_behind_pass()
     assert awake["paused"] is None and awake["written"] == 2 * PAGES
     assert gate.quiet_reason() is None
@@ -348,15 +348,15 @@ def test_b_write_behind_is_armed_only_on_the_persistent_store_owner(tmp_path, mo
     be = _boot(tmp_path, monkeypatch, "boot1")
     assert be._l3_write_behind_start() is False, "a scaffold backend is not armed"
     be._l3wb_armed = True
-    monkeypatch.setenv("SGLANG_WEG2_L3_WRITE_BEHIND_S", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_S", "0")
     assert be._l3_write_behind_start() is False
-    monkeypatch.setenv("SGLANG_WEG2_L3_WRITE_BEHIND_S", "3600")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_WRITE_BEHIND_S", "3600")
     be._evictor._is_storage_owner = False
     assert be._l3_write_behind_start() is False, "PP1/PP2 hold no index"
     be._evictor._is_storage_owner = True
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "0")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "0")
     assert be._l3_write_behind_start() is False, "not a persistent store"
-    monkeypatch.setenv("SGLANG_WEG2_L3_PERSIST", "1")
+    monkeypatch.setenv("FLLIPER_PDFLIP_L3_PERSIST", "1")
     try:
         assert be._l3_write_behind_start() is True
         assert be._l3_write_behind_start() is False, "one thread per backend"

@@ -10,9 +10,9 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest
 import torch
 
-from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHostPool
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.managers.cache_controller import HiCacheController
+from flliper.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHostPool
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -55,7 +55,7 @@ def _recorder(p):
 
 
 def test_kv_pool_id_space_and_in_place_read(tmp_path, monkeypatch):
-    from sglang.srt.mem_cache.pool_host import mha as mha_mod
+    from flliper.srt.mem_cache.pool_host import mha as mha_mod
     staged = []
     monkeypatch.setattr(mha_mod.MHATokenToKVPoolHost, "load_to_device_per_layer",
                         lambda self, dp, hi, di, layer, io: staged.append((hi.tolist(), di.tolist(), layer)))
@@ -153,7 +153,7 @@ def test_controller_resolves_pages_in_place_without_copy(tmp_path):
 
 
 def test_backup_ack_rebinds_staging_rows_to_arena_slots(tmp_path):
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from flliper.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     p, arena = _pool(tmp_path)
     be = _Backend(arena)
@@ -163,23 +163,23 @@ def test_backup_ack_rebinds_staging_rows_to_arena_slots(tmp_path):
                                append_host_mem_release=lambda host_indices, **k: released.append(host_indices.tolist()))
     t = object.__new__(UnifiedRadixCache)
     t.cache_controller = cc; t.page_size = 1
-    from sglang.srt.mem_cache import unified_radix_cache as urc
+    from flliper.srt.mem_cache import unified_radix_cache as urc
     cd = types.SimpleNamespace(host_value=torch.tensor([3, 4]))
     node = types.SimpleNamespace(id=7, hash_value=["n0", "n1"], component_data={urc.BASE_COMPONENT_TYPE: cd})
-    assert t._weg2_rebind_host_to_arena(node) is True
+    assert t._pdflip_rebind_host_to_arena(node) is True
     slots = [s for s, _ in arena.find_slots(["n0_sfx", "n1_sfx"])]
     assert cd.host_value.tolist() == [S + s for s in slots]
     assert released == [[3, 4]], "the staging rows are freed"
     assert arena.evict_candidates(8) == [], "reader references hold the pages"
-    assert t._weg2_rebind_host_to_arena(node) is True, "idempotent on arena rows"
+    assert t._pdflip_rebind_host_to_arena(node) is True, "idempotent on arena rows"
     # a page missing from the arena keeps the old rows (and takes no reference)
     cd2 = types.SimpleNamespace(host_value=torch.tensor([1]))
     node2 = types.SimpleNamespace(id=8, hash_value=["gone"], component_data={urc.BASE_COMPONENT_TYPE: cd2})
-    assert t._weg2_rebind_host_to_arena(node2) is False and cd2.host_value.tolist() == [1]
+    assert t._pdflip_rebind_host_to_arena(node2) is False and cd2.host_value.tolist() == [1]
 
 
 def test_host_pool_group_delegates_the_arena_api(tmp_path):
-    from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+    from flliper.srt.mem_cache.memory_pool_host import HostPoolGroup
 
     p, arena = _pool(tmp_path)
     g = object.__new__(HostPoolGroup)

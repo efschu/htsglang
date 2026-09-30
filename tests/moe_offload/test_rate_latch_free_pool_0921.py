@@ -6,7 +6,7 @@ noted once, never latched."""
 
 import inspect
 
-from sglang.srt.weg2 import host_ledger as hl
+from flliper.srt.pdflip import host_ledger as hl
 
 
 def _feed(latch, free):
@@ -38,7 +38,7 @@ def test_unknown_free_reading_keeps_the_old_rule():
 
 
 def test_both_call_sites_pass_memfree():
-    from sglang.srt.weg2 import front, launcher
+    from flliper.srt.pdflip import front, launcher
 
     assert 'free_gib=pr.get("memfree_gib")' in inspect.getsource(launcher)
     assert 'free_gib=_pr_fast.get("memfree_gib")' in inspect.getsource(front)
@@ -50,13 +50,13 @@ def test_front_stops_only_on_the_latch_verdict():
     FREE-POOL-ABSORBS note right after its first completed flip."""
     import types
 
-    from sglang.srt.weg2 import front as fr
+    from flliper.srt.pdflip import front as fr
 
     calm = types.SimpleNamespace(latched=False)
-    assert fr.latch_line_is_verdict("WEG2-HOST CUSHION-BELOW-FLOOR FREE-POOL-ABSORBS: cushion=0.01", calm) is False
-    assert fr.latch_line_is_verdict("WEG2-HOST CUSHION-BELOW-FLOOR NOT-LATCHED: cushion=0.43", calm) is False
-    assert fr.latch_line_is_verdict("W98 Weg2HostRateLatched: cushion=0.14 GiB BELOW", calm) is True
+    assert fr.latch_line_is_verdict("PDFLIP-HOST CUSHION-BELOW-FLOOR FREE-POOL-ABSORBS: cushion=0.01", calm) is False
+    assert fr.latch_line_is_verdict("PDFLIP-HOST CUSHION-BELOW-FLOOR NOT-LATCHED: cushion=0.43", calm) is False
+    assert fr.latch_line_is_verdict("W98 PdFlipHostRateLatched: cushion=0.14 GiB BELOW", calm) is True
     assert fr.latch_line_is_verdict("anything", types.SimpleNamespace(latched=True)) is True
     src = inspect.getsource(fr.Front)
     assert 'elif _line is not None and not latch_line_is_verdict(_line, rate_latch):' in src
-    assert src.index('not latch_line_is_verdict(_line, rate_latch)') < src.index('self.do_stop("W98 Weg2HostRateLatched", _line)')
+    assert src.index('not latch_line_is_verdict(_line, rate_latch)') < src.index('self.do_stop("W98 PdFlipHostRateLatched", _line)')

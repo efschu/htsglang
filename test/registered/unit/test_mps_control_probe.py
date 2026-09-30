@@ -12,13 +12,13 @@ import subprocess
 import unittest
 from unittest import mock
 
-from sglang.srt.entrypoints.engine import _mps_control_daemon_responsive
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.entrypoints.engine import _mps_control_daemon_responsive
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-_MOD = "sglang.srt.entrypoints.engine"
+_MOD = "flliper.srt.entrypoints.engine"
 
 
 def _completed(returncode=0, stdout="100.0\n"):

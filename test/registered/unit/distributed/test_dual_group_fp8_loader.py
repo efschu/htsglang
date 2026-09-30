@@ -50,12 +50,12 @@ import unittest
 
 import torch
 
-from sglang.srt.distributed.dual_group import derive_nested_plan
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.dual_group import derive_nested_plan
+from flliper.srt.distributed.utils import (
     partition_sizes,
     scoped_tp_partition_ratios,
 )
-from sglang.srt.layers.parameter import (
+from flliper.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -241,7 +241,7 @@ class TestBlockAlignedNestingAxis(unittest.TestCase):
     CHECKPOINT_BLOCK = [128, 128]
 
     def test_the_axis_comes_out_of_the_checkpoint_block_size(self):
-        from sglang.srt.distributed.utils import (
+        from flliper.srt.distributed.utils import (
             ACTIVATION_VEC_ELEMS,
             block_aligned_units,
         )
@@ -254,8 +254,8 @@ class TestBlockAlignedNestingAxis(unittest.TestCase):
         )
 
     def test_layer_construction_and_the_probe_use_the_same_rule(self):
-        from sglang.srt.distributed.utils import block_aligned_units
-        from sglang.srt.layers.linear import _quant_block_aligned_units
+        from flliper.srt.distributed.utils import block_aligned_units
+        from flliper.srt.layers.linear import _quant_block_aligned_units
 
         class _Cfg:
             weight_block_size = TestBlockAlignedNestingAxis.CHECKPOINT_BLOCK
@@ -270,14 +270,14 @@ class TestBlockAlignedNestingAxis(unittest.TestCase):
         )
 
     def test_head_granular_families_are_not_coarsened(self):
-        from sglang.srt.distributed.utils import block_aligned_units
+        from flliper.srt.distributed.utils import block_aligned_units
 
         # 32 kv-head units of 128 elements each: already whole blocks.
         self.assertEqual(block_aligned_units(4096, 32, 128), 32)
 
     def test_the_two_verdicts_genuinely_disagree(self):
         """The reason this is a contract and not a cosmetic refactor."""
-        from sglang.srt.distributed.dual_group import (
+        from flliper.srt.distributed.dual_group import (
             NestedGroupPlan,
             NestingProbe,
             derive_nested_plan,
@@ -304,8 +304,8 @@ class TestBlockAlignedNestingAxis(unittest.TestCase):
         self.assertTrue(nests([1, 1, 1], [1, 3, 11], 136))
 
     def test_gguf_output_axis_is_exempt(self):
-        from sglang.srt.distributed.dual_group import transformer_nesting_probes
-        from sglang.srt.distributed.dual_group import derive_nested_plan
+        from flliper.srt.distributed.dual_group import transformer_nesting_probes
+        from flliper.srt.distributed.dual_group import derive_nested_plan
 
         plan = derive_nested_plan((2, 1, 1))
         probes = transformer_nesting_probes(

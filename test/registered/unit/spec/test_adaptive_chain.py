@@ -7,7 +7,7 @@ and the cost model never reads a clock, so no CUDA is involved anywhere here.
 import math
 import unittest
 
-from sglang.srt.speculative.adaptive_chain import (
+from flliper.srt.speculative.adaptive_chain import (
     DEFAULT_DRAFT_MS,
     DEFAULT_VERIFY_MS,
     AdaptiveChainPolicy,
@@ -17,7 +17,7 @@ from sglang.srt.speculative.adaptive_chain import (
     normalize_survival,
     parse_cost_ms,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -380,7 +380,7 @@ class TestAdaptiveChainPolicy(unittest.TestCase):
 
     def test_log_every_emits_and_does_not_raise(self):
         p = AdaptiveChainPolicy(k_max=2, log_every=2)
-        with self.assertLogs("sglang.srt.speculative.adaptive_chain", "INFO") as cm:
+        with self.assertLogs("flliper.srt.speculative.adaptive_chain", "INFO") as cm:
             p.choose()
             p.choose()
         self.assertTrue(any("[spec-adaptive]" in line for line in cm.output))

@@ -1,6 +1,6 @@
 """Content-identity oracle for the prefill CUDA graph backend.
 
-Drives a running sglang server with a fixed, greedy prompt set and records
+Drives a running flliper server with a fixed, greedy prompt set and records
 the exact completion text plus token-level logprobs. Two recordings can then
 be compared byte-for-byte.
 

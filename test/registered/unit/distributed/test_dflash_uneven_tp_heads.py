@@ -39,17 +39,17 @@ import math
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.distributed.utils import set_tp_partition_ratios
-from sglang.srt.layers.linear import RowParallelLinear
-from sglang.srt.models.dflash import (
+from flliper.srt.distributed.utils import set_tp_partition_ratios
+from flliper.srt.layers.linear import RowParallelLinear
+from flliper.srt.models.dflash import (
     DFlashAttention,
     DFlashDecoderLayer,
     DFlashLagunaAttention,
     DFlashMLP,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.runtime_context import get_context, get_parallel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 

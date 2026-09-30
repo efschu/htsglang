@@ -21,23 +21,23 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.translator.backends import (
+from flliper.srt.translator.backends import (
     AudioChunk,
     FakeAsr,
     FakeEmbedder,
     FakeMt,
     FakeTts,
 )
-from sglang.srt.translator.languages import ConversationLanguages, LanguageMatrix
-from sglang.srt.translator.segmenter import SegmenterConfig
-from sglang.srt.translator.session import (
+from flliper.srt.translator.languages import ConversationLanguages, LanguageMatrix
+from flliper.srt.translator.segmenter import SegmenterConfig
+from flliper.srt.translator.session import (
     EventKind,
     Journal,
     SessionManager,
     TranslatorSession,
     run_conversation,
 )
-from sglang.srt.translator.speakers import SpeakerRegistryConfig
+from flliper.srt.translator.speakers import SpeakerRegistryConfig
 
 RATE = 16000
 FRAME_MS = 20
@@ -97,7 +97,7 @@ class _DriftingEmbedder:
         self._n = 0
 
     async def embed(self, audio):
-        from sglang.srt.translator.speakers import SpeakerEmbedding
+        from flliper.srt.translator.speakers import SpeakerEmbedding
 
         self._n += 1
         vector = np.zeros(8, dtype=np.float32)

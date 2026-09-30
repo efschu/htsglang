@@ -11,9 +11,9 @@ import types
 
 import pytest
 
-from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
-from sglang.srt.mem_cache.canonical_page_store import window_for_layers
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.mem_cache.canonical_kv_page import CanonicalPageSpec
+from flliper.srt.mem_cache.canonical_page_store import window_for_layers
+from flliper.srt.server_args import ServerArgs
 
 CELL_PER_TOKEN = 1088  # Next Flash: 1088 B per token per attention layer (design 2.1)
 
@@ -43,7 +43,7 @@ def test_page_64_is_still_refused_under_weighted_uneven_dcp():
 def test_the_runtime_twin_keys_on_dcp_owner_mode():
     import inspect
 
-    from sglang.srt.managers import cache_controller as cc
+    from flliper.srt.managers import cache_controller as cc
 
     src = inspect.getsource(cc)
     assert "if self.page_size != 1 and self.storage_config.dcp_owner_mode:" in src

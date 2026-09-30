@@ -39,8 +39,8 @@ not report cache usage".
 
 import unittest
 
-from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
-from sglang.srt.entrypoints.anthropic.serving import (
+from flliper.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+from flliper.srt.entrypoints.anthropic.serving import (
     AnthropicServing,
     _anthropic_usage_from_openai,
 )
@@ -211,7 +211,7 @@ class TestTheReasoningInteractionIsMirroredNotInvented(unittest.TestCase):
     def test_the_openai_write_side_still_merges(self):
         import inspect
 
-        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+        from flliper.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 
         src = inspect.getsource(OpenAIServingChat.apply_reasoning_enabled)
         self.assertIn("dict(request.chat_template_kwargs or {})", src)

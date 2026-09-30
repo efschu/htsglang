@@ -15,11 +15,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import sglang.srt.server_args as server_args_module
-from sglang.srt.distributed.utils import resolve_cp_token_ratios
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import flliper.srt.server_args as server_args_module
+from flliper.srt.distributed.utils import resolve_cp_token_ratios
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -31,9 +31,9 @@ FAKE_GPU_MEMORY = {
 }
 
 _UNEVEN_ENVS = (
-    "SGLANG_UNEVEN_DCP",
-    "SGLANG_UNEVEN_DCP_WEIGHTED",
-    "SGLANG_UNEVEN_TOKEN_VECTOR",
+    "FLLIPER_UNEVEN_DCP",
+    "FLLIPER_UNEVEN_DCP_WEIGHTED",
+    "FLLIPER_UNEVEN_TOKEN_VECTOR",
 )
 
 
@@ -153,7 +153,7 @@ class TestValidation(KvRatioTestCase):
 
     def test_dcp_auto_set_without_env(self):
         # Non-'coupled' implies the weighted-DCP path: dcp_size == tp_size
-        # without SGLANG_UNEVEN_DCP/_WEIGHTED.
+        # without FLLIPER_UNEVEN_DCP/_WEIGHTED.
         args = run_handler(self._uneven(rank_kv_ratio="capacity"))
         self.assertEqual(args.dcp_size, 3)
         self.assertTrue(args.uneven_kv_capacity_mode())
@@ -214,7 +214,7 @@ class TestResolvePrecedence(KvRatioTestCase):
     def test_env_wins_over_flag_vector(self):
         args = self._args(rank_kv_ratio=[6, 4, 4])
         with patch.dict(
-            os.environ, {"SGLANG_UNEVEN_TOKEN_VECTOR": "5,3,3"}
+            os.environ, {"FLLIPER_UNEVEN_TOKEN_VECTOR": "5,3,3"}
         ):
             self.assertEqual(
                 resolve_cp_token_ratios(args, checkpoint_size_mib=0),
@@ -261,7 +261,7 @@ class TestResolvePrecedence(KvRatioTestCase):
         args = self._args(
             rank_kv_ratio="capacity", rank_kv_capacity_seed=[16, 23, 25]
         )
-        with patch.dict(os.environ, {"SGLANG_UNEVEN_TOKEN_VECTOR": "5,3,3"}):
+        with patch.dict(os.environ, {"FLLIPER_UNEVEN_TOKEN_VECTOR": "5,3,3"}):
             self.assertEqual(
                 resolve_cp_token_ratios(args, checkpoint_size_mib=0), [5, 3, 3]
             )
@@ -279,7 +279,7 @@ class TestSoloPlannerSeed(KvRatioTestCase):
     Writing the predicted vector into ``rank_kv_ratio`` itself made
     ``uneven_kv_capacity_mode()`` False, which cancelled the post-profiling
     measured install (the boot then only logged the un-actioned
-    'restart with SGLANG_UNEVEN_TOKEN_VECTOR=...' hint)."""
+    'restart with FLLIPER_UNEVEN_TOKEN_VECTOR=...' hint)."""
 
     def test_capacity_mode_survives_the_seed(self):
         args = make_args(rank_kv_ratio="capacity")

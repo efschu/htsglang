@@ -30,9 +30,9 @@ INSTRUMENT rather than in what it watches:
 
 import unittest
 
-from sglang.srt.distributed.collective_census import ROUND_KEY, CollectiveCensus
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.distributed.collective_census import ROUND_KEY, CollectiveCensus
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 
 class _FakeGroup:
@@ -76,7 +76,7 @@ class TestCensusWireDomain(CustomTestCase):
         """
         import inspect
 
-        from sglang.srt.distributed.parallel_state import GroupCoordinator
+        from flliper.srt.distributed.parallel_state import GroupCoordinator
 
         src = inspect.getsource(GroupCoordinator.__init__)
         self.assertIn("self._census_wire", src)
@@ -98,7 +98,7 @@ class TestCensusWireDomain(CustomTestCase):
         """
         import inspect
 
-        import sglang.srt.distributed.parallel_state as ps
+        import flliper.srt.distributed.parallel_state as ps
 
         lines = inspect.getsource(ps).splitlines()
         stray = [

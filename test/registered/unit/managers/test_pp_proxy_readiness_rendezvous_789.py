@@ -82,8 +82,8 @@ import unittest
 import torch
 import torch.distributed as dist
 
-from sglang.srt.managers.phase_flip_counters import CHAN_DICT, PhaseFlipCounters
-from sglang.srt.managers.scheduler_pp_mixin import (
+from flliper.srt.managers.phase_flip_counters import CHAN_DICT, PhaseFlipCounters
+from flliper.srt.managers.scheduler_pp_mixin import (
     ENV_PROXY_READINESS_BUDGET,
     SchedulerPPMixin,
 )

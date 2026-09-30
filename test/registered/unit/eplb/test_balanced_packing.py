@@ -1,6 +1,6 @@
 """Unit tests for balanced_packing — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -8,8 +8,8 @@ import unittest
 
 import torch
 
-from sglang.srt.eplb.eplb_algorithms.deepseek import balanced_packing
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.eplb.eplb_algorithms.deepseek import balanced_packing
+from flliper.test.test_utils import CustomTestCase
 
 
 class TestBalancedPacking(CustomTestCase):

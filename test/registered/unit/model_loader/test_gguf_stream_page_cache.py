@@ -23,7 +23,7 @@ a2) **why not just fadvise** -- ``posix_fadvise(DONTNEED)`` alone, over a range
 b) **byte identity** -- the bytes the loop reads are the same with the advice on
    and off. A read-only shared mapping of an unmodified file re-faults the same
    bytes, so this must hold exactly.
-c) **opt-out** -- ``SGLANG_GGUF_STREAM_DROP_CACHE=0`` restores accumulation.
+c) **opt-out** -- ``FLLIPER_GGUF_STREAM_DROP_CACHE=0`` restores accumulation.
 d) **never advise ahead** -- a contract test on the bookkeeping: no advised byte
    range may overlap an unconsumed tensor's extent, including under out-of-order
    consumption and pages shared between neighbouring tensors.
@@ -43,7 +43,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from sglang.srt.model_loader.gguf_shards import (
+from flliper.srt.model_loader.gguf_shards import (
     ConsumedPageDropper,
     make_stream_page_dropper,
     stream_drop_cache_enabled,
@@ -261,10 +261,10 @@ class TestGgufStreamPageCache(unittest.TestCase):
         self.assertEqual(digest_on, reference.hexdigest())
 
     def test_c_opt_out_restores_accumulation(self) -> None:
-        """(c) SGLANG_GGUF_STREAM_DROP_CACHE=0 hands back a no-op dropper."""
-        previous = os.environ.get("SGLANG_GGUF_STREAM_DROP_CACHE")
+        """(c) FLLIPER_GGUF_STREAM_DROP_CACHE=0 hands back a no-op dropper."""
+        previous = os.environ.get("FLLIPER_GGUF_STREAM_DROP_CACHE")
         try:
-            os.environ["SGLANG_GGUF_STREAM_DROP_CACHE"] = "0"
+            os.environ["FLLIPER_GGUF_STREAM_DROP_CACHE"] = "0"
             self.assertFalse(stream_drop_cache_enabled())
             array = np.memmap(self.path, mode="r")
             try:
@@ -287,13 +287,13 @@ class TestGgufStreamPageCache(unittest.TestCase):
                 "the opt-out did not restore accumulation",
             )
 
-            os.environ["SGLANG_GGUF_STREAM_DROP_CACHE"] = "1"
+            os.environ["FLLIPER_GGUF_STREAM_DROP_CACHE"] = "1"
             self.assertTrue(stream_drop_cache_enabled())
         finally:
             if previous is None:
-                os.environ.pop("SGLANG_GGUF_STREAM_DROP_CACHE", None)
+                os.environ.pop("FLLIPER_GGUF_STREAM_DROP_CACHE", None)
             else:
-                os.environ["SGLANG_GGUF_STREAM_DROP_CACHE"] = previous
+                os.environ["FLLIPER_GGUF_STREAM_DROP_CACHE"] = previous
 
 
 class TestNeverAdviseAhead(unittest.TestCase):
@@ -426,7 +426,7 @@ class TestStreamProgressLine(unittest.TestCase):
     def test_progress_lines_land_before_close(self) -> None:
         dropper = self._dropper(self.STEP)
         with self.assertLogs(
-            "sglang.srt.model_loader.gguf_shards", level="INFO"
+            "flliper.srt.model_loader.gguf_shards", level="INFO"
         ) as captured:
             self._consume_all(dropper)
         lines = self._progress_records(captured.records)
@@ -446,10 +446,10 @@ class TestStreamProgressLine(unittest.TestCase):
         whole stream must produce no in-stream line at all."""
         dropper = self._dropper(1 << 30)
         with self.assertLogs(
-            "sglang.srt.model_loader.gguf_shards", level="INFO"
+            "flliper.srt.model_loader.gguf_shards", level="INFO"
         ) as captured:
             self._consume_all(dropper)
-            logging.getLogger("sglang.srt.model_loader.gguf_shards").info("sentinel")
+            logging.getLogger("flliper.srt.model_loader.gguf_shards").info("sentinel")
         self.assertEqual(self._progress_records(captured.records), [])
 
     def test_the_advised_ranges_are_identical_with_and_without_the_line(
@@ -459,7 +459,7 @@ class TestStreamProgressLine(unittest.TestCase):
         order, same totals."""
         loud = self._dropper(self.STEP)
         quiet = self._dropper(0)
-        with self.assertLogs("sglang.srt.model_loader.gguf_shards", level="INFO"):
+        with self.assertLogs("flliper.srt.model_loader.gguf_shards", level="INFO"):
             self._consume_all(loud)
         self._consume_all(quiet)
         strip = lambda d: [(s, a, b) for s, a, b in d.advised]  # noqa: E731
@@ -487,7 +487,7 @@ class TestRealIteratorReleasesCache(unittest.TestCase):
     def setUp(self) -> None:
         import gguf
 
-        from sglang.srt.model_loader import gguf_shards
+        from flliper.srt.model_loader import gguf_shards
 
         self.tmp = tempfile.mkdtemp(prefix="gguf-stream-e2e-")
         self.addCleanup(self._cleanup)
@@ -524,7 +524,7 @@ class TestRealIteratorReleasesCache(unittest.TestCase):
     def _cleanup(self) -> None:
         import shutil
 
-        from sglang.srt.model_loader import gguf_shards
+        from flliper.srt.model_loader import gguf_shards
 
         gguf_shards._DEFAULT_DROP_BATCH_BYTES = self._saved_batch
         gguf_shards._RESOLVED_CACHE.clear()
@@ -539,10 +539,10 @@ class TestRealIteratorReleasesCache(unittest.TestCase):
             del array
 
     def _run(self, enabled: bool) -> Tuple[List[Tuple[str, bytes]], int, int]:
-        from sglang.srt.model_loader.weight_utils import gguf_quant_weights_iterator
+        from flliper.srt.model_loader.weight_utils import gguf_quant_weights_iterator
 
-        previous = os.environ.get("SGLANG_GGUF_STREAM_DROP_CACHE")
-        os.environ["SGLANG_GGUF_STREAM_DROP_CACHE"] = "1" if enabled else "0"
+        previous = os.environ.get("FLLIPER_GGUF_STREAM_DROP_CACHE")
+        os.environ["FLLIPER_GGUF_STREAM_DROP_CACHE"] = "1" if enabled else "0"
         for part in self.parts:
             drop_whole_file(part)
         try:
@@ -560,9 +560,9 @@ class TestRealIteratorReleasesCache(unittest.TestCase):
             return items, mid_resident, mid_total
         finally:
             if previous is None:
-                os.environ.pop("SGLANG_GGUF_STREAM_DROP_CACHE", None)
+                os.environ.pop("FLLIPER_GGUF_STREAM_DROP_CACHE", None)
             else:
-                os.environ["SGLANG_GGUF_STREAM_DROP_CACHE"] = previous
+                os.environ["FLLIPER_GGUF_STREAM_DROP_CACHE"] = previous
 
     def test_stream_is_byte_identical_and_the_cache_is_released(self) -> None:
         items_on, resident_on, total = self._run(enabled=True)

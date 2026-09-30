@@ -18,7 +18,7 @@ numbers, and each has its own test below:
     (``_pytest/subtests.py:397``, ``f"SUBFAILED{description}"``), so a
     ``SUBFAILED\\s`` pattern misses the line entirely.  Two such lines, and
     113 - 111 = 2.
-  * the PRODUCT's own logger writes ``ERROR    sglang.srt...`` in column 0,
+  * the PRODUCT's own logger writes ``ERROR    flliper.srt...`` in column 0,
     which ``^ERROR\\s+(\\S+)`` reads as a test name.  Seven such lines in the
     captured log.
   * eight collection errors for ONE module (one per xdist worker) collapse
@@ -119,7 +119,7 @@ def test_g0_t2_a_product_logger_line_is_not_taken_as_a_test_name(tmp_path):
     line begins in column 0 exactly like pytest's own summary."""
     log = _write(
         tmp_path,
-        "ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 "
+        "ERROR    flliper.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 "
         "PHASE-FLIP SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (pp_to_tp).\n"
         "ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...\n"
         "1 error in 1.00s\n",

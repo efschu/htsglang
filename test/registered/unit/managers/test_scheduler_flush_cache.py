@@ -1,14 +1,14 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import FlushCacheReqInput
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.flush_wrapper import (
+from flliper.srt.managers.io_struct import FlushCacheReqInput
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
 
@@ -55,7 +55,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         req = FlushCacheReqInput(timeout_s=3.0)
 
         with patch(
-            "sglang.srt.managers.scheduler_components.flush_wrapper.time.monotonic",
+            "flliper.srt.managers.scheduler_components.flush_wrapper.time.monotonic",
             return_value=10.0,
         ):
             output = scheduler.flush_wrapper.handle(req)
@@ -98,7 +98,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler.flush_wrapper._pending = (req, 99.0)
 
         with patch(
-            "sglang.srt.managers.scheduler_components.flush_wrapper.time.monotonic",
+            "flliper.srt.managers.scheduler_components.flush_wrapper.time.monotonic",
             return_value=100.0,
         ):
             scheduler.flush_wrapper.check_pending()
@@ -114,7 +114,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
         scheduler.flush_wrapper._pending = (req, 101.0)
 
         with patch(
-            "sglang.srt.managers.scheduler_components.flush_wrapper.time.monotonic",
+            "flliper.srt.managers.scheduler_components.flush_wrapper.time.monotonic",
             return_value=100.0,
         ):
             scheduler.flush_wrapper.check_pending()

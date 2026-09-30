@@ -8,8 +8,8 @@ import torch
 # ---------------------------------------------------------
 # IMPORT PREBUILT KERNEL
 # ---------------------------------------------------------
-from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.jit_kernel.moe_lora_align import moe_lora_align_block_size
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)

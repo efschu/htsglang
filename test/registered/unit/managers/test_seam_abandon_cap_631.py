@@ -4,7 +4,7 @@
 WHAT THIS FILE PINS, AND WHY IT EXISTS
 
 With `--enable-phase-flip` on and a layer cut whose seam staging does not fit,
-the group re-armed every `SGLANG_PHASE_POLICY_MIN_DWELL_S` forever. Measured
+the group re-armed every `FLLIPER_PHASE_POLICY_MIN_DWELL_S` forever. Measured
 2026-08-12 on the #485 planner cut `[42,11,11]`: rank0 wanted 4881 MiB of
 staging against 4314 MiB spendable, and the group abandoned 185 times in nine
 minutes (555 log lines across three ranks). Every attempt runs the full spill
@@ -33,7 +33,7 @@ claim on the shipped path.
 
 import os
 
-from sglang.srt.managers.phase_flip_runtime import (
+from flliper.srt.managers.phase_flip_runtime import (
     PP_TO_TP,
     SEAM_ABANDON_CAP_GUARD,
     TP_TO_PP,
@@ -50,9 +50,9 @@ class _Env:
     def __init__(self, cap=None, backoff_max=None):
         self.env = {}
         if cap is not None:
-            self.env["SGLANG_SEAM_ABANDON_CAP"] = str(cap)
+            self.env["FLLIPER_SEAM_ABANDON_CAP"] = str(cap)
         if backoff_max is not None:
-            self.env["SGLANG_SEAM_ABANDON_BACKOFF_MAX"] = str(backoff_max)
+            self.env["FLLIPER_SEAM_ABANDON_BACKOFF_MAX"] = str(backoff_max)
 
     def __enter__(self):
         self.old = {k: os.environ.get(k) for k in self.env}

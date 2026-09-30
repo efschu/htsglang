@@ -23,7 +23,7 @@ import subprocess
 import tempfile
 import unittest
 
-from sglang.srt.boot_matrix import sweep
+from flliper.srt.boot_matrix import sweep
 
 
 class TestProvenanceIsCollected(unittest.TestCase):

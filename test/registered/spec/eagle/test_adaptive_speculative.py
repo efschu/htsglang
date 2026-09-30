@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
-from sglang.test.test_utils import (
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.run_eval import run_eval
+from flliper.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -188,8 +188,8 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         # One more decode so the reporter emits a fresh logging interval.
         self._generate(HIGH_ACCEPT_PROMPT)
 
-        steps = self._scrape_metric("sglang:spec_num_steps")
-        draft_tokens = self._scrape_metric("sglang:spec_num_draft_tokens")
+        steps = self._scrape_metric("flliper:spec_num_steps")
+        draft_tokens = self._scrape_metric("flliper:spec_num_draft_tokens")
 
         self.assertIn(steps, {1.0, 3.0}, "spec_num_steps gauge has unexpected value")
         self.assertIn(

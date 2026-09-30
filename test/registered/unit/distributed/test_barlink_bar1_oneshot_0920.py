@@ -14,12 +14,12 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.distributed.device_communicators import barlink_bar1_ext as ext
-from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+from flliper.srt.distributed.device_communicators import barlink_bar1_ext as ext
+from flliper.srt.distributed.device_communicators.barlink_bar1 import (
     BarlinkBar1Transport,
     window_requirement,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="stage-a-cpu")
 
@@ -84,9 +84,9 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(_stub().algorithm_for(2 << 20), "ring")
 
     def test_env_sets_the_cap(self):
-        with mock.patch.dict(os.environ, {"SGLANG_BARLINK_BAR1_ONESHOT_MAX": "8192"}):
+        with mock.patch.dict(os.environ, {"FLLIPER_BARLINK_BAR1_ONESHOT_MAX": "8192"}):
             # the constructor reads the env; emulate the one line it runs
-            t = _stub(oneshot_max=int(os.environ["SGLANG_BARLINK_BAR1_ONESHOT_MAX"]))
+            t = _stub(oneshot_max=int(os.environ["FLLIPER_BARLINK_BAR1_ONESHOT_MAX"]))
         self.assertEqual(t.algorithm_for(8192), "oneshot")
         self.assertEqual(t.algorithm_for(8208), "mesh")
 

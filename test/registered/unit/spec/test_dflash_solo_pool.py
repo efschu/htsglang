@@ -14,13 +14,13 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.dflash_solo_pool import (
+from flliper.srt.speculative.dflash_solo_pool import (
     SOLO_POOL_CAP_ENV,
     DraftKVSlotMapper,
     resolve_dflash_solo_pool_cap,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -164,7 +164,7 @@ class TestConsumptionGate(CustomTestCase):
 
     @staticmethod
     def _frozen(**kw):
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        from flliper.srt.model_executor.model_runner_kv_cache_mixin import (
             ModelRunnerKVCacheMixin,
         )
 
@@ -289,7 +289,7 @@ class TestCapResolution(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Sync-free mode (SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE, window pool, default off)
+# Sync-free mode (FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE, window pool, default off)
 # ---------------------------------------------------------------------------
 
 
@@ -434,14 +434,14 @@ class TestSyncFreeMapperEquivalence(CustomTestCase):
         self.assertEqual(m._free.numel(), m.num_draft_slots - 1)
 
     def test_env_switch_defaults_off(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        old = os.environ.pop("SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE", None)
+        old = os.environ.pop("FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE", None)
         try:
-            self.assertFalse(envs.SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE.get())
+            self.assertFalse(envs.FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE.get())
         finally:
             if old is not None:
-                os.environ["SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE"] = old
+                os.environ["FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE"] = old
 
 
 class TestSyncFreeNeverReadsTheDevice(CustomTestCase):
@@ -468,7 +468,7 @@ class TestSyncFreeNeverReadsTheDevice(CustomTestCase):
         m.translate_read(self._meta(4))  # drains the free on meta, too
 
     def test_window_rows_rebuild_runs_on_meta(self):
-        from sglang.srt.speculative.dflash_solo_pool import (
+        from flliper.srt.speculative.dflash_solo_pool import (
             rebuild_window_rows_sync_free,
         )
 
@@ -496,7 +496,7 @@ class TestWindowRowsSyncFree(CustomTestCase):
     assign chain, per row, and leaves every other column alone."""
 
     def test_matches_the_legacy_chain(self):
-        from sglang.srt.speculative.dflash_solo_pool import (
+        from flliper.srt.speculative.dflash_solo_pool import (
             rebuild_window_rows_sync_free,
         )
 
@@ -551,7 +551,7 @@ class TestWindowRowsSyncFree(CustomTestCase):
             )
 
     def test_bound_wider_than_the_table_is_refused(self):
-        from sglang.srt.speculative.dflash_solo_pool import (
+        from flliper.srt.speculative.dflash_solo_pool import (
             rebuild_window_rows_sync_free,
         )
 
@@ -570,11 +570,11 @@ class TestWindowRowsSyncFree(CustomTestCase):
 
 class TestWorkerArmsSyncFreeOnlyForTheWindowPool(CustomTestCase):
     """_maybe_init_solo_small_pool builds a sync-free mapper exactly when the
-    window pool is on AND SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE=1."""
+    window pool is on AND FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE=1."""
 
     def _init(self, env):
-        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+        from flliper.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from flliper.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
         alloc = object.__new__(TokenToKVPoolAllocator)
         alloc.size = 70000
@@ -590,7 +590,7 @@ class TestWorkerArmsSyncFreeOnlyForTheWindowPool(CustomTestCase):
             server_args=types.SimpleNamespace(max_running_requests=6),
         )
         cfg = types.SimpleNamespace(max_running_requests=6, max_total_num_tokens=70000)
-        keys = ("SGLANG_DFLASH_WINDOW_POOL", "SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE")
+        keys = ("FLLIPER_DFLASH_WINDOW_POOL", "FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE")
         saved = {k: os.environ.get(k) for k in keys}
         try:
             for k in keys:
@@ -605,27 +605,27 @@ class TestWorkerArmsSyncFreeOnlyForTheWindowPool(CustomTestCase):
                     os.environ[k] = v
 
     def test_window_pool_default_stays_legacy(self):
-        m = self._init({"SGLANG_DFLASH_WINDOW_POOL": "1"})
+        m = self._init({"FLLIPER_DFLASH_WINDOW_POOL": "1"})
         self.assertIsNotNone(m)
         self.assertFalse(m.sync_free)
         self.assertEqual(m.num_draft_slots, 1 + (2048 + 8) * 6 * 2)
 
     def test_window_pool_with_switch_is_sync_free(self):
         m = self._init(
-            {"SGLANG_DFLASH_WINDOW_POOL": "1", "SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE": "1"}
+            {"FLLIPER_DFLASH_WINDOW_POOL": "1", "FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE": "1"}
         )
         self.assertIsNotNone(m)
         self.assertTrue(m.sync_free)
 
     def test_switch_without_window_pool_changes_nothing(self):
-        m = self._init({"SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE": "1"})
+        m = self._init({"FLLIPER_DFLASH_WINDOW_POOL_SYNC_FREE": "1"})
         # compact draft cache without the window pool -> no small pool at all
         self.assertIsNone(m)
 
 
 
 # ---------------------------------------------------------------------------
-# Radix-dedup draft-row carry (SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY, default
+# Radix-dedup draft-row carry (FLLIPER_DFLASH_WINDOW_POOL_DEDUP_CARRY, default
 # off): the tree keeps its own slots, frees the request's fresh duplicates;
 # the fresh draft rows move to the kept slots instead of being dropped.
 # ---------------------------------------------------------------------------
@@ -701,7 +701,7 @@ class TestDedupCarry(CustomTestCase):
         self.assertEqual(_state(a), _state(b))
 
     def test_allocator_alias_listener(self):
-        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+        from flliper.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 
         got = []
         alloc = types.SimpleNamespace()
@@ -715,10 +715,10 @@ class TestDedupCarry(CustomTestCase):
         self.assertEqual(got, [([1], [2])])
 
     def test_env_switch_defaults_off(self):
-        from sglang.srt.environ import envs
+        from flliper.srt.environ import envs
 
-        os.environ.pop("SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY", None)
-        self.assertFalse(envs.SGLANG_DFLASH_WINDOW_POOL_DEDUP_CARRY.get())
+        os.environ.pop("FLLIPER_DFLASH_WINDOW_POOL_DEDUP_CARRY", None)
+        self.assertFalse(envs.FLLIPER_DFLASH_WINDOW_POOL_DEDUP_CARRY.get())
 
 
 if __name__ == "__main__":

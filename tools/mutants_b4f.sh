@@ -73,10 +73,10 @@ if before == after:
 PY
 }
 
-CE=python/sglang/srt/weg2/launcher.py
-RT=python/sglang/srt/weg2/host_ledger.py
-T="test/registered/unit/weg2/test_weg2_ring_absent_predicate_1273.py
-test/registered/unit/weg2/test_weg2_sigma_h_off_1327.py"
+CE=python/flliper/srt/pdflip/launcher.py
+RT=python/flliper/srt/pdflip/host_ledger.py
+T="test/registered/unit/pdflip/test_pdflip_ring_absent_predicate_1273.py
+test/registered/unit/pdflip/test_pdflip_sigma_h_off_1327.py"
 
 if [ "${1:-}" = "--selfcheck" ]; then
   PLANT="# MUTANT-HARNESS-SELFCHECK-PLANTED-$$"
@@ -128,7 +128,7 @@ m "M4 the inject arm never reaches the one call site" "$CE" \
   '        ring_absent_by_design=ring_absent_by_design(weight_source, inject_mode),' \
   '        ring_absent_by_design=ring_absent_by_design(weight_source, weight_exchange.INJECT_AUTHORITATIVE),'
 m "M5 main stops handing the flag through" "$CE" \
-  '        inject_mode=ns.weg2_xchg_inject,' \
+  '        inject_mode=ns.pdflip_xchg_inject,' \
   '        inject_mode=weight_exchange.INJECT_AUTHORITATIVE,'
 m "M6 the ledger's contradiction guard is loosened instead" "$RT" \
   '        if ring_bytes or ring_span1_bytes:' \

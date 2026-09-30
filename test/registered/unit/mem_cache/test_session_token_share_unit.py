@@ -8,7 +8,7 @@
   carrying an inconsistent array.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -16,9 +16,9 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.session.session_controller import Session
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.sampling.sampling_params import SamplingParams
+from flliper.srt.session.session_controller import Session
+from flliper.test.test_utils import CustomTestCase
 
 VOCAB = 1 << 20
 

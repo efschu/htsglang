@@ -48,8 +48,8 @@ import ast
 import inspect
 import unittest
 
-from sglang.srt.managers import scheduler as scheduler_mod
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.managers import scheduler as scheduler_mod
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

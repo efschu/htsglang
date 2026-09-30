@@ -16,36 +16,36 @@ log_dir = "/var/log/htsglang"
 allow_worktree = true
 
 # Environment carried from the captured ship process. PYTHONPATH,
-# CUDA_VISIBLE_DEVICES, SGLANG_PHASE_FLIP_INSTANCE and
-# SGLANG_BOOT_COMMIT are deliberately absent: the first two are derived
+# CUDA_VISIBLE_DEVICES, FLLIPER_PHASE_FLIP_INSTANCE and
+# FLLIPER_BOOT_COMMIT are deliberately absent: the first two are derived
 # from [stack].repo and the card list, the last two are per-boot
 # identities synthesized by the orchestrator.
 [env]
 LD_LIBRARY_PATH = ":/usr/local/cuda-12.2/lib64"
-SGLANG_BARLINK = "1"
-SGLANG_BARLINK_BAR1_CAP_CYCLES = "300000000000"
-SGLANG_BARLINK_BAR1_WINDOW_MIB = "24"
-SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0 = "32"
-SGLANG_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0 = "48"
-SGLANG_BARLINK_BAR1_WINDOW_MIB_PP_0 = "96"
-SGLANG_BARLINK_TRANSPORT = "bar1"
-SGLANG_COLLECTIVE_CENSUS_INTERVAL = "50"
-SGLANG_CORRIDOR_FLOOR_MIB = "1536"
-SGLANG_CORRIDOR_REBALANCE = "0"
-SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = "0"
-SGLANG_FLIP_SEAM_CHUNK_MIB = "8"
-SGLANG_KV_BACKING_RELIEF = "1"
-SGLANG_MAMBA_PIN_TRACE = "50"
-SGLANG_MAMBA_SSM_DTYPE = "bfloat16"
-SGLANG_PHASE_POLICY_MIN_DWELL_S = "3"
-SGLANG_PHASE_POLICY_PP_WINDOW_S = "15"
-SGLANG_PHASE_POLICY_TP_DECODE_FLOOR_S = "10"
-SGLANG_SEAM_ENTRY_DELAY_BUDGET = "2"
-SGLANG_SEAM_ENTRY_MARGIN_MIB = "512"
-SGLANG_UNEVEN_DCP = "1"
-SGLANG_UNEVEN_DCP_WEIGHTED = "1"
-SGLANG_UNEVEN_TOKEN_VECTOR = "14,10,8"
-SGLANG_VRAM_FLIGHT_DIR = "/spinning/flight_605"
+FLLIPER_BARLINK = "1"
+FLLIPER_BARLINK_BAR1_CAP_CYCLES = "300000000000"
+FLLIPER_BARLINK_BAR1_WINDOW_MIB = "24"
+FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_DCP_0 = "32"
+FLLIPER_BARLINK_BAR1_WINDOW_MIB_FLIP_TP_0 = "48"
+FLLIPER_BARLINK_BAR1_WINDOW_MIB_PP_0 = "96"
+FLLIPER_BARLINK_TRANSPORT = "bar1"
+FLLIPER_COLLECTIVE_CENSUS_INTERVAL = "50"
+FLLIPER_CORRIDOR_FLOOR_MIB = "1536"
+FLLIPER_CORRIDOR_REBALANCE = "0"
+FLLIPER_ENABLE_TP_MEMORY_INBALANCE_CHECK = "0"
+FLLIPER_FLIP_SEAM_CHUNK_MIB = "8"
+FLLIPER_KV_BACKING_RELIEF = "1"
+FLLIPER_MAMBA_PIN_TRACE = "50"
+FLLIPER_MAMBA_SSM_DTYPE = "bfloat16"
+FLLIPER_PHASE_POLICY_MIN_DWELL_S = "3"
+FLLIPER_PHASE_POLICY_PP_WINDOW_S = "15"
+FLLIPER_PHASE_POLICY_TP_DECODE_FLOOR_S = "10"
+FLLIPER_SEAM_ENTRY_DELAY_BUDGET = "2"
+FLLIPER_SEAM_ENTRY_MARGIN_MIB = "512"
+FLLIPER_UNEVEN_DCP = "1"
+FLLIPER_UNEVEN_DCP_WEIGHTED = "1"
+FLLIPER_UNEVEN_TOKEN_VECTOR = "14,10,8"
+FLLIPER_VRAM_FLIGHT_DIR = "/spinning/flight_605"
 
 # Cards in RANK ORDER, taken from the capture's CUDA_VISIBLE_DEVICES.
 # Addressed by UUID only: NVML index and CUDA ordinal are different
@@ -92,7 +92,7 @@ card_busy_mib = 512
 poll_s = 20
 generation_probe_s = 120
 # Reconciled with the server's own health budget: /health may take
-# SGLANG_HEALTH_CHECK_TIMEOUT (default 20 s). The generation probe is
+# FLLIPER_HEALTH_CHECK_TIMEOUT (default 20 s). The generation probe is
 # a /generate call with its own explicit budget, well clear of it.
 generation_timeout_s = 60
 wedge_confirmations = 3
@@ -109,7 +109,7 @@ ready_timeout_s = 1800
 argv = [
   "/spinning/htsglang-gpu/.venv/bin/python",
   "-m",
-  "sglang.launch_server",
+  "flliper.launch_server",
   "--model-path",
   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-INT8-W8A8-yarn1.5",
   "--trust-remote-code",

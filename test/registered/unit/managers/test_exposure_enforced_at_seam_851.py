@@ -39,7 +39,7 @@ Hermetic: duck-typed rank and rung, no scheduler, no pool, no CUDA.
 
 import unittest
 
-from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
 
 class _Rung:
@@ -68,7 +68,7 @@ class _Rank:
     """The smallest object `_enforce_exposure_at_seam` needs."""
 
     def __init__(self, rung):
-        from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+        from flliper.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
 
         sched = type("S", (), {})()
         setattr(sched, KV_BACKING_RELIEF_ATTR, rung)
@@ -123,7 +123,7 @@ class TestTheSeamEnforcesTheLaw(unittest.TestCase):
             def clamp_exposure_to_backing(self, why):
                 raise RuntimeError("nvml exploded")
 
-        from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+        from flliper.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
 
         rank = type("R", (), {})()
         sched = type("S", (), {})()

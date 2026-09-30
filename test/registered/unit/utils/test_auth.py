@@ -2,14 +2,14 @@
 
 import unittest
 
-from sglang.srt.utils.auth import (
+from flliper.srt.utils.auth import (
     AuthDecision,
     AuthLevel,
     auth_level,
     decide_request_auth,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 

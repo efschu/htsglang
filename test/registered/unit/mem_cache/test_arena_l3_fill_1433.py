@@ -10,8 +10,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 

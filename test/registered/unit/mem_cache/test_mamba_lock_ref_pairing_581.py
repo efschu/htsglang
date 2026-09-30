@@ -59,24 +59,24 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import (
+from flliper.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from flliper.srt.environ import envs
+from flliper.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache, HostLRUList
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache, HostLRUList
+from flliper.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
+from flliper.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=25)
 
@@ -102,7 +102,7 @@ def _build_pools(mamba_size: int, max_num_reqs: int = 8):
         i for i in range(GLOBAL_INTERVAL - 1, NUM_LAYERS, GLOBAL_INTERVAL)
     ]
     mamba_layers = [i for i in range(NUM_LAYERS) if i not in full_attention_layer_ids]
-    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+    with envs.FLLIPER_MAMBA_SSM_DTYPE.override("bfloat16"):
         shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=512,
@@ -894,7 +894,7 @@ class TestMultiTurnRetireReturnsEveryCheckpoint(unittest.TestCase):
 
 
 class TestPinTrace(unittest.TestCase):
-    """SGLANG_MAMBA_PIN_TRACE: the field diagnostic for #581.
+    """FLLIPER_MAMBA_PIN_TRACE: the field diagnostic for #581.
 
     Production gives `mamba_protected` only in the dying breath. This emits
     the pin ledger every N scheduler ticks so a ramp can be attributed to a
@@ -902,13 +902,13 @@ class TestPinTrace(unittest.TestCase):
     """
 
     def test_trace_line_renders_with_the_pin_ledger(self):
-        with envs.SGLANG_MAMBA_PIN_TRACE.override(1):
+        with envs.FLLIPER_MAMBA_PIN_TRACE.override(1):
             tree, allocator, pool = _build_hi(mamba_size=16)
             self.assertEqual(tree._pin_trace_every, 1)
             node = _insert(tree, allocator, pool, list(range(2000, 2032)))
             tree.inc_lock_ref(node)
             with self.assertLogs(
-                "sglang.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
+                "flliper.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
             ) as captured:
                 tree.check_hicache_events()
 
@@ -938,15 +938,15 @@ class TestPinTrace(unittest.TestCase):
         self.assertIn("inc_mamba@test_trace_line_renders_with_the_pin_ledger=1", line)
 
     def test_counters_reset_between_lines(self):
-        with envs.SGLANG_MAMBA_PIN_TRACE.override(1):
+        with envs.FLLIPER_MAMBA_PIN_TRACE.override(1):
             tree, allocator, pool = _build_hi(mamba_size=16)
             _insert(tree, allocator, pool, list(range(2000, 2032)))
             with self.assertLogs(
-                "sglang.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
+                "flliper.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
             ) as first:
                 tree.check_hicache_events()
             with self.assertLogs(
-                "sglang.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
+                "flliper.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
             ) as second:
                 tree.check_hicache_events()
 
@@ -955,10 +955,10 @@ class TestPinTrace(unittest.TestCase):
         self.assertIn("ops[]", line)
 
     def test_interval_throttles_the_line(self):
-        with envs.SGLANG_MAMBA_PIN_TRACE.override(3):
+        with envs.FLLIPER_MAMBA_PIN_TRACE.override(3):
             tree, allocator, pool = _build_hi(mamba_size=16)
             with self.assertLogs(
-                "sglang.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
+                "flliper.srt.mem_cache.hi_mamba_radix_cache", level="INFO"
             ) as captured:
                 for _ in range(6):
                     tree.check_hicache_events()

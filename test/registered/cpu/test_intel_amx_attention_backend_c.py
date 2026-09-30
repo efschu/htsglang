@@ -6,8 +6,8 @@ python3 -m unittest test_intel_amx_attention_backend_2.TestIntelAMXAttnBackendQu
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import (
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8,
     DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE,
     CustomTestCase,

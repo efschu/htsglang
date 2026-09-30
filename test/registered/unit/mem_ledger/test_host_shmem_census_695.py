@@ -2,7 +2,7 @@
 
 The shapes that matter are awkward to produce on demand and easy to record,
 so the parser is fed a fixture written from the real thing: the three
-``sglang::scheduler`` ranks of the 2026-08-12 PP=3 boot, whose 75.0 GiB of
+``flliper::scheduler`` ranks of the 2026-08-12 PP=3 boot, whose 75.0 GiB of
 page-locked ``MAP_SHARED`` memory was invisible to every ledger in the tree.
 
 Three properties are pinned, each one a way the census could be quietly wrong:
@@ -29,7 +29,7 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.mem_ledger.host_shmem import (
+from flliper.srt.mem_ledger.host_shmem import (
     CLASS_ANON_SHARED,
     CLASS_DRIVER,
     CLASS_FILE_SHARED,
@@ -40,7 +40,7 @@ from sglang.srt.mem_ledger.host_shmem import (
     parse_shared_mappings,
     render_host_shmem_line,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -216,7 +216,7 @@ class LiveCollection(unittest.TestCase):
     """
 
     def test_collect_runs_and_is_self_consistent(self):
-        from sglang.srt.mem_ledger.host_shmem import collect_host_shmem_census
+        from flliper.srt.mem_ledger.host_shmem import collect_host_shmem_census
 
         c = collect_host_shmem_census()
         self.assertEqual(c.pid, os.getpid())
@@ -236,7 +236,7 @@ class LiveCollection(unittest.TestCase):
         COLLECTION was not enough; the render and the argument have to be
         covered too.
         """
-        import sglang.srt.mem_ledger.host_shmem as hs
+        import flliper.srt.mem_ledger.host_shmem as hs
 
         original = hs.collect_host_shmem_census
         hs.collect_host_shmem_census = lambda *a, **k: (_ for _ in ()).throw(
@@ -266,7 +266,7 @@ class LiveCollection(unittest.TestCase):
         """The measurement moves when the thing it measures moves."""
         import mmap
 
-        from sglang.srt.mem_ledger.host_shmem import collect_host_shmem_census
+        from flliper.srt.mem_ledger.host_shmem import collect_host_shmem_census
 
         before = collect_host_shmem_census().by_class_pss.get(CLASS_ANON_SHARED, 0)
         size = 64 * MIB

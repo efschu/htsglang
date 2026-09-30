@@ -3,7 +3,7 @@
 """Turn #494 break-cost JSONL into the F2 table, per rank.
 
 Input: one or more ``break_cost.<rank_tag>.jsonl`` files written by
-``srt/utils/break_cost_clock.py`` (``SGLANG_BREAK_COST_PROBE=1``).
+``srt/utils/break_cost_clock.py`` (``FLLIPER_BREAK_COST_PROBE=1``).
 Output: per rank and per break point, the mean cost of ONE crossing and the
 per-step sum over all crossings of that step -- which is the left-hand side of
 ``TICKET_462_f2_and_replay.md`` §3's verdict.

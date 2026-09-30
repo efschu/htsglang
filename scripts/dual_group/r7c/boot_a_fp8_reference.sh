@@ -54,11 +54,11 @@ start_vram_sampler "$OUT/vram.csv"
 
 # Probe ON: this is the whole point of the boot. It is a diagnostic and costs
 # nothing that the comparison cares about (raw counters, no extra forward).
-export SGLANG_ACCEPT_POSITION_PROBE=1
+export FLLIPER_ACCEPT_POSITION_PROBE=1
 
 cd "$WT" || exit 1
 launch_server "$LOG" /tmp/r7c-boot-a.pid \
-  "$VENV/bin/python" -m sglang.launch_server \
+  "$VENV/bin/python" -m flliper.launch_server \
   --model-path "$MODEL_ROOT/Qwen3.6-27B-FP8" \
   --tp-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
   --rank-auto-reserve-mib 3000,2700,2700 \

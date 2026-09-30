@@ -18,10 +18,10 @@ import unittest
 import pytest
 
 try:
-    from sglang.srt.managers.scheduler_components.metrics_reporter import RankPrefillLog
-    from sglang.srt.managers.scheduler_components.pp_bubble import PPBubbleMeter
-    from sglang.srt.utils.collective_clock import CollectiveClock, Slot
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from flliper.srt.managers.scheduler_components.metrics_reporter import RankPrefillLog
+    from flliper.srt.managers.scheduler_components.pp_bubble import PPBubbleMeter
+    from flliper.srt.utils.collective_clock import CollectiveClock, Slot
+    from flliper.test.ci.ci_register import register_cpu_ci
 except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
     pytest.skip(
         f"#249 default-device collection leak broke the import chain: {_import_err}",
@@ -30,7 +30,7 @@ except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-LOGGER_NAME = "sglang.srt.managers.scheduler_components.metrics_reporter"
+LOGGER_NAME = "flliper.srt.managers.scheduler_components.metrics_reporter"
 
 
 class FakeClock:
@@ -289,7 +289,7 @@ class TestTheClassifierIsWiredAtEveryLaunchGuard(unittest.TestCase):
         import ast
         import pathlib
 
-        import sglang.srt.managers.scheduler_pp_mixin as mixin
+        import flliper.srt.managers.scheduler_pp_mixin as mixin
 
         tree = ast.parse(pathlib.Path(mixin.__file__).read_text())
         out = []
@@ -314,7 +314,7 @@ class TestTheClassifierIsWiredAtEveryLaunchGuard(unittest.TestCase):
             self.assertIn("_pp_bubble_note_no_batch", dumped)
 
     def test_the_mixin_forwards_to_the_meter_and_tolerates_no_reporter(self):
-        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+        from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         class FakeLog:
             pass

@@ -1,10 +1,10 @@
 import unittest
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -29,7 +29,7 @@ class TestMixedChunkedPrefill(GSM8KMixin, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
+        with envs.FLLIPER_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

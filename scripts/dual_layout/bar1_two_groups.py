@@ -84,8 +84,8 @@ def worker(rank, a, store):
         torch.cuda.set_device(a.devs[rank])
         dev = torch.device("cuda", a.devs[rank])
         torch.zeros(1, device=dev)
-        from sglang.srt.distributed.device_communicators.barlink_bar1 import BarlinkBar1Transport
-        from sglang.srt.distributed.device_communicators.barlink_matrix_transport import _window_bytes
+        from flliper.srt.distributed.device_communicators.barlink_bar1 import BarlinkBar1Transport
+        from flliper.srt.distributed.device_communicators.barlink_matrix_transport import _window_bytes
 
         extra = []
         if a.windows_mib:

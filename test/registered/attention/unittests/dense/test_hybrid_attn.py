@@ -4,16 +4,16 @@ from pathlib import Path
 
 import torch
 
-from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_flashinfer_available
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from flliper.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from flliper.srt.model_executor.forward_batch_info import ForwardMode
+from flliper.srt.utils import is_flashinfer_available
+from flliper.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.attention_unittest.attention_methods.dense_attention import (
     DENSE_ATOL,
     DENSE_RTOL,
     DenseAttentionCase,

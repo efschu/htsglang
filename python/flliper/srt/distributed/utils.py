@@ -1,0 +1,3062 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/utils.py
+
+# Copyright 2023 The vLLM team.
+# Adapted from
+# https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import contextvars
+import dataclasses
+import logging
+import math
+import os
+import pickle
+import time
+from collections import deque
+from contextlib import contextmanager
+from typing import Any, Deque, Dict, FrozenSet, List, Optional, Sequence, Tuple
+
+import torch
+from torch.distributed import TCPStore
+
+# #901: the single knob-resolution authority. Lives at srt/ level, below both
+# `managers` and `distributed`, so neither has to import the other to share it.
+from flliper.srt import knob_resolution as _knob
+
+logger = logging.getLogger(__name__)
+
+
+def set_global_tcp_store(store: TCPStore) -> None:
+    """Install the shared TCPStore created during distributed initialization;
+    the handle lives on ``ctx.resources``."""
+    from flliper.srt.runtime_context import get_resources
+
+    get_resources().tcp_store = store
+    logger.info("Global TCPStore has been set")
+
+
+def get_global_tcp_store() -> Optional[TCPStore]:
+    """Get the existing global TCPStore.
+
+    This function provides access to the shared TCPStore instance that was
+    created during distributed initialization. All components (like NIXL buffers)
+    should use this same store for coordination.
+
+    Returns:
+        The global TCPStore instance, or None if not initialized yet.
+    """
+    from flliper.srt.runtime_context import get_resources
+
+    store = get_resources().tcp_store
+    if store is None:
+        logger.warning(
+            "Global TCPStore not found. Make sure init_distributed_environment "
+            "was called with a tcp:// init method."
+        )
+    return store
+
+
+def ensure_divisibility(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(
+        numerator, denominator
+    )
+
+
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
+
+
+# ---------------------------------------------------------------------------
+# Uneven tensor-parallel partitioning (--rank-tp-ratio).
+#
+# When a ratio vector like (2, 1, 1) is active, TP rank r owns
+# total * ratio[r] / sum(ratio) of every sharded dimension instead of
+# total / tp_size. Offsets become prefix sums. The ratio vector is
+# process-global state installed once per scheduler process (from
+# server_args.rank_tp_ratio) before the model is built; when unset, all
+# helpers reproduce the classic even split (divide) exactly, so the
+# default path stays unchanged.
+#
+# NAMED FAMILY PLANS (--rank-mlp-ratio / FLLIPER_UNEVEN_MLP_VECTOR): on top
+# of the base vector, individual weight FAMILIES (today: "mlp", the dense
+# MLP intermediate dimension) may carry their own weight vector. Layers
+# opt in by passing tp_family=<name>; families without an installed
+# vector fall back to the base plan, so passing a family is always safe
+# and the base behavior is unchanged. This is the calibration lever for
+# maximizing the KV pool: shifting MLP units between ranks re-balances
+# the per-rank weight bytes without touching attention/KV-head splits.
+# ---------------------------------------------------------------------------
+
+_TP_PARTITION_RATIOS: Optional[list] = None
+_TP_PARTITION_FAMILIES: dict = {}
+
+# CONTEXT-LOCAL OVERLAY over the two process globals above (#274 slice C).
+#
+# The globals stay the process's ONE installed plan (written once at start-up
+# by set_tp_partition_ratios, inherited by every thread). A second group in
+# the same process needs its own vector while it builds, loads or forwards --
+# and once lanes run CONCURRENTLY, a swap of the globals would be read by the
+# other lane's forward. The overlay is a context variable, so it is per-thread
+# by construction: a lane worker thread installs its vector once, and the
+# serving group's thread keeps reading the installed plan.
+#
+# Sentinel-based rather than None-based: None is a MEANINGFUL plan value
+# ("even split"), so "no overlay" needs its own marker.
+_NO_OVERLAY = object()
+_TP_PARTITION_OVERLAY: contextvars.ContextVar = contextvars.ContextVar(
+    "distributed.tp_partition_overlay", default=_NO_OVERLAY
+)
+
+
+#: Does the INSTALLED plan contain ranks of width zero (Form A: the expert
+#: workers own no dense shard at all)? A property of the PLAN, not of the
+#: call site: every layer that splits a dense dimension must agree about it,
+#: and a per-call flag is exactly how two layers come to disagree. Off means
+#: the classic rule -- a zero is a bug, and every rank gets at least one unit.
+_TP_PARTITION_ALLOW_ZERO: bool = False
+
+
+def set_tp_partition_ratios(
+    ratios: Optional[Sequence[int]],
+    families: Optional[dict] = None,
+    allow_zero: bool = False,
+) -> None:
+    """Install the uneven-TP ratio vector for this process (or None).
+
+    `families` optionally maps family names (e.g. "mlp") to their own
+    weight vectors, overriding the base vector for layers constructed
+    with a matching tp_family. Families are only valid together with a
+    base vector and must have the same length; empty/None entries are
+    ignored. Every call replaces the complete plan (base + families).
+
+    `allow_zero` (Form A) admits ranks of width zero into the plan -- the
+    expert workers, which own no dense shard of anything. It is installed
+    WITH the plan so that every dense dimension in the process splits by the
+    same rule; see `tp_partition_sizes`."""
+    global _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES, _TP_PARTITION_ALLOW_ZERO
+    _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES = _normalize_partition_plan(
+        ratios, families, allow_zero
+    )
+    _TP_PARTITION_ALLOW_ZERO = bool(allow_zero)
+
+
+def tp_partition_allows_zero() -> bool:
+    """True when the installed plan admits zero-width ranks (Form A)."""
+    return _TP_PARTITION_ALLOW_ZERO
+
+
+# Families that carry EXPERT weights: a Form A worker (base width zero) owns
+# these and nothing else, so the base plan's zero does not bind them.
+EXPERT_FAMILIES = frozenset({"moe"})
+
+
+def _normalize_partition_plan(
+    ratios: Optional[Sequence[int]],
+    families: Optional[dict] = None,
+    allow_zero: bool = False,
+) -> tuple:
+    """Validate and normalize a (base, families) shard plan; shared by the
+    process-wide setter and the context-local scope."""
+    base = list(ratios) if ratios else None
+    fams: dict = {}
+    if families:
+        for name, vec in families.items():
+            vec = list(vec) if vec else None
+            if not vec:
+                continue
+            if base is None:
+                raise ValueError(
+                    f"Family shard plan {name!r} requires an active base "
+                    "plan (--rank-tp-ratio)."
+                )
+            if len(vec) != len(base):
+                raise ValueError(
+                    f"Family shard plan {name!r} has {len(vec)} entries "
+                    f"but the base plan has {len(base)} "
+                    f"({vec} vs {base})."
+                )
+            floor = 0 if allow_zero else 1
+            if any(not isinstance(w, int) or w < floor for w in vec):
+                raise ValueError(
+                    f"Family shard plan {name!r} entries must be "
+                    + ("non-negative" if allow_zero else "positive")
+                    + f" integers, got {vec}."
+                )
+            if allow_zero and not any(w > 0 for w in vec):
+                raise ValueError(
+                    f"Family shard plan {name!r} is all zeros ({vec}): no "
+                    "rank would own any of this family's weights."
+                )
+            # A family may not hand a shard to a rank the BASE plan gave
+            # width zero -- that rank has no dense weights at all, and a
+            # family vector that disagrees is how one dimension quietly
+            # lands on an expert worker.
+            if allow_zero and base is not None and name not in EXPERT_FAMILIES:
+                # fnFA1 (20.09.): the EXPERT family is exactly what a Form A
+                # worker owns -- a zero dense width with a positive expert
+                # share is the layout, not a stray dimension. Only DENSE
+                # families are bound by the base plan's zero.
+                stray = [
+                    r for r, (b, w) in enumerate(zip(base, vec)) if b == 0 and w > 0
+                ]
+                if stray:
+                    raise ValueError(
+                        f"Family shard plan {name!r} gives rank(s) {stray} a "
+                        f"share ({vec}) that the base plan {base} gave width "
+                        "zero. Under Form A a zero in the base plan means "
+                        "'this rank holds no dense weights'; a family cannot "
+                        "overrule that for one dimension."
+                    )
+            fams[name] = vec
+    return base, fams
+
+
+def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
+    """The active weight vector: the family's own vector when one is
+    installed under `family`, otherwise the base vector (or None).
+
+    Reads the context-local overlay first (a lane's own plan, #274), then
+    the process-installed plan."""
+    overlay = _TP_PARTITION_OVERLAY.get()
+    if overlay is not _NO_OVERLAY:
+        base, fams = overlay
+    else:
+        base, fams = _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES
+    if family is not None:
+        vec = fams.get(family)
+        if vec is not None:
+            return vec
+    return base
+
+
+@contextmanager
+def scoped_tp_partition_ratios(
+    ratios: Optional[Sequence[int]],
+    families: Optional[dict] = None,
+    allow_zero: bool = False,
+):
+    """Install a shard plan for the duration of a block, then restore.
+
+    The plan above is a process global with a bare setter, which is right for
+    the one plan a scheduler process installs at startup. A SECOND group in the
+    same process (the dual-group runtime, #121: a PD lane whose FAST group is
+    nested in the serving group's split) has to build and load its complement
+    shard under ITS OWN vector, and hand the process back unchanged afterwards.
+
+    Doing that without a scope is not merely untidy, it is silently wrong: the
+    only discriminator that decides whether a plan applies is
+    `len(ratios) == tp_size` (see `tp_partition_sizes`, `tp_plan_active`). A
+    2-rank group built while a 3-entry vector is installed does not raise -- it
+    falls back to the EVEN split and loads the wrong units.
+
+    Restores both the base vector and the family vectors, and is nesting-safe.
+
+    Slice C (#274): the scope writes a CONTEXT-LOCAL overlay, not the process
+    globals. Within one thread that is the same observable behavior as before
+    (install, restore); across threads it is the difference between correct
+    and silently wrong -- a lane loading its complement under a 2-entry vector
+    must not make the serving group's concurrent forward read that vector.
+
+    `allow_zero` is scoped with the plan for the same reason it is installed
+    with it (see `set_tp_partition_ratios`): the scope's vector and the
+    zero-admission rule are one plan, and a lane that splits by a different
+    rule than the vector it installed is the #274 failure in a new dress.
+    """
+    global _TP_PARTITION_ALLOW_ZERO
+    token = _TP_PARTITION_OVERLAY.set(
+        _normalize_partition_plan(ratios, families, allow_zero)
+    )
+    previous_allow_zero = _TP_PARTITION_ALLOW_ZERO
+    _TP_PARTITION_ALLOW_ZERO = bool(allow_zero)
+    try:
+        yield
+    finally:
+        _TP_PARTITION_ALLOW_ZERO = previous_allow_zero
+        _TP_PARTITION_OVERLAY.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Uneven decode context parallel (uneven DCP) token-axis split.
+#
+# When --rank-tp-ratio is non-uniform AND dcp_size == tp_size, the KV cache of
+# the full-attention layers is split along the TOKEN axis instead of the head
+# axis: every rank stores the FULL (replicated) kv-heads but only the context
+# tokens it owns. Rank r owns ratio[r] contiguous slots of every virtual block
+# of sum(ratio) tokens (weighted prefix-range owner rule, generalizing the even
+# modulo rule owner==pos%N). The scheduler pool is pinned in VIRTUAL blocks
+# (min over ranks of local_tokens/ratio[r], times sum(ratio)), so the total
+# max_total_num_tokens can far exceed any single rank's local capacity.
+#
+# The token vector is SEPARATE from the weight (head) vector: q/kv heads follow
+# --rank-tp-ratio, but the token split follows this vector (derived from each
+# rank's free KV budget so every card fills up). When all-equal, this collapses
+# to the classic even DCP (modulo) fast path, keeping that path bit-identical.
+# ---------------------------------------------------------------------------
+
+_CP_TOKEN_RATIOS: Optional[list] = None
+
+
+def set_cp_token_ratios(ratios: Optional[Sequence[int]]) -> None:
+    """Install the uneven-DCP token-axis split vector for this process (or
+    None to disable, restoring the even modulo path)."""
+    global _CP_TOKEN_RATIOS
+    _CP_TOKEN_RATIOS = list(ratios) if ratios else None
+
+
+def get_cp_token_ratios() -> Optional[list]:
+    """The installed uneven-DCP token-axis split vector (or None)."""
+    return _CP_TOKEN_RATIOS
+
+
+# ---------------------------------------------------------------------------
+# #797 SEED LIVENESS: the other half of the provenance rule.
+#
+# `--uneven-token-vector-role seed` is not a description of a value, it is a
+# CLAIM ABOUT THE FUTURE: "this vector is a pre-boot estimate that the measured
+# per-rank capacity will supersede in-process, before the pools are built from
+# it." The retracted-provenance gate refuses a vector whose LINEAGE is bad.
+# This gate refuses a boot whose seed claim never came true -- the seed rode
+# all the way into the pools while calling itself provisional.
+#
+# That is not hypothetical: it is exactly the boot this task exists to end.
+# Before the is_draft_pool_worker fix, boot_798_0822_0629 reached three
+# install-capable sizing sites at dcp_size=3 with allow_install=True and
+# role='seed', declined every one on a predicate about the worker's LABEL, and
+# served the seed [29, 19, 16] as if it were a decision. Nothing failed. The
+# advisory printed and was ignored. A logged-but-never-enforced path is the
+# defect class this whole task is about, so the seed claim is enforced here
+# rather than described in a comment.
+#
+# Three signals, because refusing on fewer would refuse correct boots:
+#   armed        -- a seed vector was actually resolved
+#   calibration  -- some site could really have superseded it (dcp_size > 1
+#                   AND allow_install), so "never superseded" means declined,
+#                   not "never had the chance"
+#   superseded   -- an install landed
+# Refuse iff armed AND calibration AND NOT superseded. A genuine draft-pool
+# worker declining its own install does NOT trip this: the target runner in the
+# same process installs and disarms the latch, which is why the latch is
+# process-global and not per-ModelRunner.
+# ---------------------------------------------------------------------------
+
+_SEED_AWAITING: Optional[list] = None
+_SEED_CALIBRATION_REACHED: bool = False
+_SEED_VERDICT_REACHED: bool = False
+_SEED_SUPERSEDED_BY: Optional[list] = None
+
+
+def note_seed_awaiting_supersession(vector: Optional[Sequence[int]]) -> None:
+    """Arm the seed claim: `vector` is provisional and must be superseded."""
+    global _SEED_AWAITING
+    _SEED_AWAITING = list(vector) if vector else None
+
+
+def note_seed_calibration_site(dcp_size: int, allow_install: bool) -> None:
+    """Record that a site which COULD have superseded the seed was reached.
+
+    Without this, a boot that never runs a DCP calibration at all (dcp_size 1
+    everywhere) would be refused for declining an install it was never in a
+    position to make.
+    """
+    global _SEED_CALIBRATION_REACHED
+    if allow_install and dcp_size > 1:
+        _SEED_CALIBRATION_REACHED = True
+
+
+def note_seed_superseded(vector: Optional[Sequence[int]]) -> None:
+    """Disarm the seed claim: the calibration reached a verdict.
+
+    The VERDICT is a separate boolean from the vector it produced, and the
+    disarm keys on the boolean. Encoding "a verdict happened" as "the recorded
+    vector is not None" would make an empty or None vector fail to disarm
+    SILENTLY, and the consequence of a missed disarm here is a refused boot --
+    the gate's dangerous direction. The vector is kept for diagnosis only.
+    """
+    global _SEED_VERDICT_REACHED, _SEED_SUPERSEDED_BY
+    _SEED_VERDICT_REACHED = True
+    _SEED_SUPERSEDED_BY = list(vector) if vector else None
+
+
+def seed_liveness_state() -> tuple:
+    """(awaiting, calibration_reached, verdict_reached, superseded_by).
+
+    The verdict flag is reported separately from the vector it produced,
+    because those are the gate's real inputs: a verdict that recorded no vector
+    still disarms, and a reader that could not tell the two apart would face
+    the same ambiguity the gate itself no longer has.
+    """
+    return (
+        _SEED_AWAITING,
+        _SEED_CALIBRATION_REACHED,
+        _SEED_VERDICT_REACHED,
+        _SEED_SUPERSEDED_BY,
+    )
+
+
+def reset_seed_liveness() -> None:
+    """Clear the latch (test support; a fresh process starts clear anyway)."""
+    global _SEED_AWAITING, _SEED_CALIBRATION_REACHED
+    global _SEED_VERDICT_REACHED, _SEED_SUPERSEDED_BY
+    _SEED_AWAITING = None
+    _SEED_CALIBRATION_REACHED = False
+    _SEED_VERDICT_REACHED = False
+    _SEED_SUPERSEDED_BY = None
+
+
+def assert_seed_superseded() -> None:
+    """Refuse a boot whose seed vector was never superseded.
+
+    Called once, late, after every stack that could size a KV pool has been
+    built -- so that "no install happened" is a finished fact and not a
+    not-yet. Raises rather than warns: a warning here is precisely what the
+    pre-fix boot already emitted, and it changed nothing.
+    """
+    if _SEED_AWAITING is None or not _SEED_CALIBRATION_REACHED:
+        return
+    if _SEED_VERDICT_REACHED:
+        return
+    from flliper.srt.planner.retracted import SeedNotSupersededError
+
+    raise SeedNotSupersededError(
+        "#797 SEED WAS NEVER SUPERSEDED. The KV-token ownership vector "
+        f"{_SEED_AWAITING} was admitted as a SEED "
+        "(--uneven-token-vector-role seed), which declares it a pre-boot "
+        "estimate that the measured per-rank capacity supersedes in-process. "
+        "An install-capable sizing site was reached (dcp_size > 1, "
+        "allow_install=True) and no install landed, so the pools were built "
+        "from the estimate while it was still calling itself provisional. "
+        "This is refused rather than warned about, because the warning is what "
+        "the boot before this gate already printed. Either fix the install "
+        "path so the measured vector lands, or state the vector honestly with "
+        "--uneven-token-vector-role pin, which asserts it and suppresses the "
+        "supersession claim."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Weightless-KV fast lane (Variant C Stage 1).
+#
+# The fast lane DECOUPLES the head/weight partition from the token/KV (DCP)
+# partition entirely. One rank (the "head rank", the fast weight-bearing card,
+# e.g. the 5090 at rank 0) holds ALL attention heads and runs Q/O-proj + FFN +
+# GDN as pure TP=1 (collective-free). The other ranks are WEIGHTLESS: they hold
+# ONLY a token-shard of the KV cache (via the existing _CP_TOKEN_RATIOS token
+# vector) and compute attention over it, contributing ZERO heads.
+#
+# So the per-rank HEAD-count vector is [total, 0, 0, ...] with `total` on the
+# head rank and 0 everywhere else. partition_units() cannot express this (it
+# forces every rank >= 1 unit, the correct rule when every rank bears weights),
+# so the weightless head plan is set DIRECTLY here, independently of
+# --rank-tp-ratio. The token vector stays free to be big on the weightless
+# cards. This separation is the whole point of the fast lane; see
+# variantC_architecture / the Stage-1 design.
+# ---------------------------------------------------------------------------
+
+_WEIGHTLESS_KV_HEAD_RANK: Optional[int] = None
+
+
+def set_weightless_kv_head_rank(head_rank: Optional[int]) -> None:
+    """Enable the weightless-KV fast lane for this process by naming the rank
+    that holds ALL attention heads / all weights (or None to disable, keeping
+    every other path byte-identical). All other DCP ranks are weightless (0
+    heads, KV-token-shard only)."""
+    global _WEIGHTLESS_KV_HEAD_RANK
+    _WEIGHTLESS_KV_HEAD_RANK = head_rank
+
+
+def get_weightless_kv_head_rank() -> Optional[int]:
+    """The rank holding all heads/weights under the weightless-KV fast lane, or
+    None when the fast lane is not active."""
+    return _WEIGHTLESS_KV_HEAD_RANK
+
+
+def weightless_kv_active() -> bool:
+    """True when the weightless-KV fast lane is installed for this process."""
+    return _WEIGHTLESS_KV_HEAD_RANK is not None
+
+
+def is_weightless_head_rank(rank: int) -> bool:
+    """True when the weightless-KV fast lane is active AND `rank` is the head
+    rank (holds the full weights, runs the model TP=1 + the attention dispatch).
+    False on the default path (fast lane off)."""
+    head_rank = _WEIGHTLESS_KV_HEAD_RANK
+    return head_rank is not None and rank == head_rank
+
+
+def weightless_worker_rank(rank: int) -> bool:
+    """True when the weightless-KV fast lane is active AND `rank` is a WEIGHTLESS
+    KV worker (holds ONLY a KV token-shard; runs the stripped attention-only
+    forward; materializes NO layer weights). False on the default path."""
+    head_rank = _WEIGHTLESS_KV_HEAD_RANK
+    return head_rank is not None and rank != head_rank
+
+
+def weightless_head_counts(total: int, world_size: int) -> list:
+    """Per-rank head-count vector for the weightless-KV fast lane: `total` on
+    the head rank, 0 on every weightless rank. E.g. total=24 heads, world=3,
+    head_rank=0 -> [24, 0, 0]. The uneven-DCP collectives already tolerate a
+    0-head shard (cp_all_gather_heads_uneven pads to max(counts); a 0-count
+    rank contributes an empty slice, so the Q all-gather becomes a broadcast
+    from the head rank and the O merge slices the merged output back to the
+    head rank only)."""
+    head_rank = _WEIGHTLESS_KV_HEAD_RANK
+    assert head_rank is not None, "weightless_head_counts() with fast lane off"
+    assert (
+        0 <= head_rank < world_size
+    ), f"weightless head_rank {head_rank} out of range for world {world_size}"
+    return [total if r == head_rank else 0 for r in range(world_size)]
+
+
+def uneven_dcp_active(dcp_size: Optional[int] = None) -> bool:
+    """True when the uneven-DCP token-axis split is in force: a non-uniform
+    token vector is installed. When `dcp_size` is given, the vector must also
+    match it (guards against a stale vector on a differently-sized group).
+    All-equal vectors are NOT uneven -- they use the even modulo fast path."""
+    ratios = _CP_TOKEN_RATIOS
+    if not ratios or len(set(ratios)) == 1:
+        return False
+    if dcp_size is not None and len(ratios) != dcp_size:
+        return False
+    return True
+
+
+def cp_token_split_factor(dcp_size: int) -> int:
+    """The number of token slots per virtual block along the DCP axis.
+
+    Uneven DCP: sum(token ratios) -- the virtual block that the weighted
+    prefix-range owner rule cycles over, and the factor the KV pool / page
+    size is inflated by. Even DCP (uniform or no vector installed): dcp_size,
+    reproducing the classic modulo layout exactly."""
+    if uneven_dcp_active(dcp_size):
+        return sum(_CP_TOKEN_RATIOS)
+    return dcp_size
+
+
+def uneven_dcp_kv_replicated(dcp_size: int) -> bool:
+    """True when the uneven-TP + DCP KV-replication path is in force: DCP spans
+    the whole TP group (dcp_size>1) AND a --rank-tp-ratio base plan is installed
+    (so kv-heads are split UNEVENLY and cannot be head-sharded across the DCP
+    group). Under this path every rank stores the FULL (replicated) kv-heads but
+    only its owned token slots. Covers BOTH the even-modulo (no token vector) and
+    the weighted (token vector installed) owner rules. False -> stock behavior
+    (even head-sharded DCP, or no DCP), keeping those paths bit-identical."""
+    return dcp_size > 1 and get_tp_partition_ratios() is not None
+
+
+def plan_uneven_dcp_kv_replicated(flags, base_plan) -> bool:
+    """PLAN-TIME mirror of :func:`uneven_dcp_kv_replicated` (#503).
+
+    The runtime predicate one function above reads PROCESS state -- the
+    installed ``--rank-tp-ratio`` (``get_tp_partition_ratios()``) and the
+    resolved ``dcp_size``. A planner runs before any of that exists, so it has
+    to answer the same question from the flags it is about to emit. This lives
+    next to the runtime gate deliberately: it is the same statement twice, and
+    two files apart is how the two spellings drift.
+
+    It answers one question only -- **is the KV POOL replicated-heads +
+    token-sharded**. It does NOT say whether the k/v PROJECTIONS are
+    replicated; that is :func:`attn_kv_replicated` (``kv < tp``, strictly),
+    and the two are independent. At 4 kv heads over 3 ranks with uneven DCP
+    the pool is replicated and the projections are not: "the attention write
+    gathers this rank's uneven projection shard up to
+    ``get_total_num_kv_heads()``"
+    (``model_executor/model_runner_kv_cache_mixin.py:2721``). Conflating them
+    is what audit #500-B1 did, and pricing attention WEIGHTS on this predicate
+    would model a layout the #105 ragged-kernel guard refuses at the first
+    forward. Use it for the token axis and the core term; never for the
+    weight split.
+
+    Term for term against ``uneven_dcp_kv_replicated``:
+
+    * ``get_tp_partition_ratios() is not None`` -- a NON-UNIFORM rank ratio
+      plan is installed. An all-equal plan takes the even fast path, so
+      ``len(set(base_plan)) > 1`` is the plan-time spelling.
+    * ``dcp_size > 1`` -- DCP spans the TP group. At plan time that is either
+      an explicit ``dcp_size``, or an explicit KV token vector (which is what
+      ``--rank-kv-ratio <vector>`` installs, and a non-``coupled``
+      ``--rank-kv-ratio`` is exactly what auto-sets ``dcp_size = tp_size``:
+      ``server_args.py:9845-9853``, ``uneven_kv_flag_active()`` at
+      ``server_args.py:8433``).
+
+    ``flags`` is anything carrying those two attributes -- ``ServerArgs``,
+    ``PlacementFlags`` or ``PlanInputs``.
+    """
+    non_uniform = base_plan is not None and len(set(base_plan)) > 1
+    if not non_uniform:
+        return False
+    if flags is None:
+        return False
+    if (getattr(flags, "dcp_size", None) or 0) > 1:
+        return True
+    if getattr(flags, "kv_token_vector", None):
+        return True
+    return False
+
+
+def cp_token_prefix(dcp_size: int) -> list:
+    """Prefix sums of the token ratios: cp_token_prefix()[r] is the first slot
+    index (within a virtual block of cp_token_split_factor tokens) owned by
+    rank r; entry [dcp_size] == the block size. Even DCP -> [0,1,2,...,N]."""
+    if uneven_dcp_active(dcp_size):
+        ratios = _CP_TOKEN_RATIOS
+    else:
+        ratios = [1] * dcp_size
+    out = [0]
+    for r in ratios:
+        out.append(out[-1] + r)
+    return out
+
+
+def uneven_dcp_owner_bounds() -> Optional[tuple]:
+    """(S, lo, hi) of this rank's DCP owner range under the uneven-TP
+    KV-replication path, or None when that path is not in force.
+
+    Under the owner rule a GLOBAL allocator slot L is owned by this rank iff
+    (L % S) in [lo, hi); its physical slot in this rank's COMPACT per-rank KV
+    pool is (L // S) * (hi - lo) + (L % S - lo). Weighted DCP: S = sum(token
+    ratios) with the prefix-range bounds; even-modulo (no token vector):
+    S = dcp_size, [lo, hi) = [rank, rank+1) -- the classic L // dcp_size
+    compaction. HiCache must use exactly this mapping for its device<->host
+    KV transfers: the radix tree stores GLOBAL indices, while the device pool
+    only holds this rank's compact owned slots (see FlashInferAttnBackend
+    uneven_dcp / uneven_dcp_weighted). Indexing the compact pool with raw
+    global indices captures rows that belong to OTHER (usually later) tokens
+    -- time-dependent content, all-zero before those rows are first written
+    (task #60 L3 zero-page corruption)."""
+    from flliper.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    dcp_size = parallel.attn_dcp_size
+    if not uneven_dcp_kv_replicated(dcp_size):
+        return None
+    prefix = cp_token_prefix(dcp_size)
+    lo = prefix[parallel.attn_dcp_rank]
+    hi = prefix[parallel.attn_dcp_rank + 1]
+    return prefix[-1], lo, hi
+
+
+def _shards_missing_against_index(model_path: str, present: set) -> tuple:
+    """``(missing_shard_names, declared_total_bytes)`` from the safetensors index.
+
+    ``([], 0)`` when there is no index to check against -- a single-file
+    checkpoint has no manifest and therefore cannot be short of one.
+    """
+    import json
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return [], 0
+    try:
+        with open(index_path) as f:
+            index = json.load(f)
+    except Exception:
+        return [], 0
+    named = set((index.get("weight_map") or {}).values())
+    if not named:
+        return [], 0
+    declared = int((index.get("metadata") or {}).get("total_size") or 0)
+    return sorted(named - present), declared
+
+
+def _checkpoint_size_mib(model_path: Optional[str]) -> int:
+    """Total on-disk checkpoint size (MiB), 0 if unknown. Deterministic in
+    every process so the derived token vector is identical everywhere.
+
+    Summing whatever ``*.safetensors`` happen to be present is only the size
+    of the checkpoint when those files ARE the checkpoint. A directory that is
+    still downloading answers this question with a smaller model, confidently
+    and without complaint, and the planner anchors every quantized family's
+    bytes/param on the answer.
+
+    Measured 2026-08-14: planning Qwen3.8-27B-INT8 with 4 of 18 shards on disk
+    reported it as SMALLER than the Qwen3.6 checkpoint it replaces, when the
+    complete checkpoint is 4.76 GiB LARGER. Nothing was wrong with any single
+    step; the input was simply never checked.
+
+    So the index -- the checkpoint's own statement of what it consists of --
+    gates the measurement. Complete: measure, as before. Incomplete: say so
+    loudly, and fall back to the declared total, or to 0 ("unknown", which
+    callers already treat as "use the config-derived estimate") when the index
+    declares no total. Never a partial sum presented as a whole.
+    """
+    import glob
+
+    if not model_path:
+        return 0
+    if os.path.isfile(model_path):
+        return os.path.getsize(model_path) // 2**20
+    if not os.path.isdir(model_path):
+        return 0
+    shards = glob.glob(os.path.join(model_path, "*.safetensors"))
+    total = sum(os.path.getsize(f) for f in shards)
+    if total == 0:
+        total = sum(
+            os.path.getsize(f) for f in glob.glob(os.path.join(model_path, "*.gguf"))
+        )
+        return total // 2**20
+
+    missing, declared = _shards_missing_against_index(
+        model_path, {os.path.basename(f) for f in shards}
+    )
+    if missing:
+        logger.warning(
+            "Checkpoint at %s is INCOMPLETE: %d of the %d shards named by "
+            "model.safetensors.index.json are absent (%s%s). The %d MiB "
+            "actually on disk is NOT this model's size; using the index's "
+            "declared total (%d MiB) instead%s. Any plan or token vector "
+            "derived from a partial checkpoint describes a model that does "
+            "not exist.",
+            model_path,
+            len(missing),
+            len(missing) + len(shards),
+            ", ".join(missing[:5]),
+            ", ..." if len(missing) > 5 else "",
+            total // 2**20,
+            declared // 2**20,
+            "" if declared else " (index declares none -> reporting 0/unknown)",
+        )
+        return declared // 2**20
+
+    return total // 2**20
+
+
+#: The three roles a token vector can hold, named once (#1270).
+ROLE_PIN = "pin"
+ROLE_SEED = "seed"
+#: #1270: what a LAUNCHER-DERIVED vector is when nobody declared a role.  It is
+#: NOT a pin: a pin is an assertion an operator made, and it suppresses the
+#: measured install for that reason.  An estimate asserts nothing -- it is this
+#: module's own guess from the pre-boot budgets -- so it must be superseded by
+#: the profiled optimum exactly as a seed is.
+ROLE_ESTIMATE = "estimate"
+
+
+def token_vector_is_declared(server_args) -> bool:
+    """Did ANYONE state a token vector, or did this boot derive one itself?
+
+    #1270, and the whole of the role question turns on it.  "Declared" means an
+    operator (or a launcher) put a VALUE somewhere: the env vector, or a
+    ``--rank-kv-ratio a,b,c`` list.  A MODE string (``capacity`` / ``coupled``
+    / ``speed``) is not a value and does not count -- it asks for a derivation
+    rather than supplying one.
+
+    Env first, for the same reason the role is read env-first: the flip's
+    SECOND stack build does not consult this ServerArgs object, and an env
+    vector is what survives into it.
+    """
+    from flliper.srt.environ import envs as _envs
+
+    if str(_envs.FLLIPER_UNEVEN_TOKEN_VECTOR.get() or "").strip():
+        return True
+    kv_flag = getattr(server_args, "rank_kv_ratio", None)
+    return isinstance(kv_flag, list) and len(kv_flag) > 0
+
+
+def _token_vector_role(server_args) -> str:
+    """``'pin'``, ``'seed'`` or ``'estimate'`` (#797, #1270), read the same way
+    at every gate.
+
+    The env is authoritative because it is what survives into the flip's
+    SECOND stack build, where this ServerArgs object is not the one consulted;
+    the flag is the fallback for a direct call that never published. An EMPTY
+    env value reads as "not stated" and defers to the flag, deliberately: an
+    empty override silently meaning 'pin' is how a stale, blank
+    FLLIPER_UNEVEN_TOKEN_VECTOR entry once rode along unnoticed, and a gate that
+    turns itself off when handed an empty string is the same defect again.
+
+    #1270 -- THE DEFAULT DEPENDS ON WHETHER ANYONE DECLARED A VECTOR.  This
+    used to be a flat ``or "pin"``, and that single word cost boot weg2sb1
+    15.8 % of group D's world pool: with the #1032 removal of the launcher's
+    seed there was no declared vector at all, the derived budget estimate
+    ``[30,17,17]`` inherited the word ``pin``, the pin suppressed the measured
+    install, and the profiled optimum ``[17,7,8]`` was printed as a restart
+    hint nobody could act on (574,336 tokens against rg6's 681,856 on the same
+    rig).  A default is not an assertion.  Only a DECLARED vector defaults to
+    ``pin``; a derived one is an ``estimate`` and arms its own supersession.
+    """
+    from flliper.srt.environ import envs as _envs
+
+    role = str(_envs.FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE.get() or "").strip().lower()
+    if role:
+        return role
+    return token_vector_role_from_args(server_args)
+
+
+def token_vector_role_from_args(server_args) -> str:
+    """The role THIS argv asserts, resolved WITHOUT consulting the role env.
+
+    #1270b -- THE PUBLISHER'S HALF OF THE ROLE, and the reason the #1270 fix
+    was inert on metal.  ``_token_vector_role`` reads the env FIRST and only
+    falls through to the "was anything declared?" rung when the env is empty.
+    In a real process that rung is UNREACHABLE: ``ServerArgs`` carried the
+    literal string ``"pin"`` as the flag's DEFAULT, and
+    ``_publish_promoted_781_flags`` published that default into
+    ``FLLIPER_UNEVEN_TOKEN_VECTOR_ROLE`` unconditionally, so every boot answered
+    its own question with 'pin' before anybody asked it.  Boot weg2sb4s
+    (9f2e58b797) printed ``role='pin'`` and ``active_vector=[30, 17, 17]`` with
+    no vector on its argv at all; the desk test read 'estimate' only because
+    its stub set the flag to ``""``, a value a real ServerArgs never holds.
+
+    So the flag default is now ``None`` -- "nobody said" -- and THIS function
+    is what a process publishes: the role resolved from the argv alone.  A
+    consumer keeps reading :func:`token_vector_role`, which is env-first
+    because the env is what survives into the flip's second stack build.  The
+    two must not be the same function: resolving the value to publish by
+    reading the variable being published is how the default smuggled itself in.
+
+    Call it only AFTER the vector itself has been published (the ``#901``
+    resolution runs one line earlier in ``_publish_promoted_781_flags``), so
+    that "was anything declared?" sees an inherited env vector too -- an
+    ambient vector this argv did not choose is still a declared vector, and a
+    declared vector with no stated role is a ``pin``.
+    """
+    role = str(getattr(server_args, "uneven_token_vector_role", "") or "").strip()
+    if role:
+        return role.lower()
+    return ROLE_PIN if token_vector_is_declared(server_args) else ROLE_ESTIMATE
+
+
+def token_vector_role(server_args) -> str:
+    """Public spelling of :func:`_token_vector_role` -- ONE reader for every
+    gate, in this process and in the flip's second stack."""
+    return _token_vector_role(server_args)
+
+
+def token_vector_arms_measured_install(server_args) -> bool:
+    """Does this boot's token-vector role ASK to be superseded by the measured
+    optimum?  #1270: the one predicate the install gate consults.
+
+    ``seed`` and ``estimate`` both do, for the same reason and with the same
+    force: neither is an assertion about what the pool should be, both are
+    guesses made before the ranks were profiled.  ``pin`` does not -- it is the
+    number the operator chose to serve, and overriding it is the thing the pin
+    exists to prevent.
+
+    Written as a function rather than repeated as ``role == "seed"`` at each
+    gate because it WAS repeated: three separate spellings of the default
+    (``utils`` here, ``ServerArgs.uneven_token_vector_is_seed``, and the
+    mixin's own ``or "pin"``) had to agree, and the mixin's copy is where the
+    estimate lost its install.
+    """
+    return token_vector_role(server_args) in (ROLE_SEED, ROLE_ESTIMATE)
+
+
+def _token_vector_provenance(server_args) -> Optional[str]:
+    """The declared lineage of the token vector, or None when unstated.
+
+    None is a real answer, not a missing one: it ARMS the register's fallback
+    value-match. Same env-over-flag precedence and same empty-is-unstated rule
+    as the role.
+    """
+    from flliper.srt.environ import envs as _envs
+
+    declared = (
+        str(_envs.FLLIPER_UNEVEN_TOKEN_VECTOR_PROVENANCE.get() or "").strip() or None
+    )
+    if declared is None:
+        declared = (
+            str(
+                getattr(server_args, "uneven_token_vector_provenance", "") or ""
+            ).strip()
+            or None
+        )
+    return declared
+
+
+def _refuse_retracted_token_vector(server_args, vector, source: str) -> None:
+    """THE PROVENANCE RULE (#797): an ACTIVE token vector must never originate
+    from a retracted investigation.
+
+    Refuses a PIN outright -- a pinned vector is the number the server serves,
+    and serving on withdrawn evidence is the thing being prevented. A SEED is
+    allowed past this point and warned about instead, because a seed is by
+    definition superseded in-process by the measured optimum before anything
+    runs on it; the promise is checked where it can actually be broken, at the
+    install site, rather than assumed here. A seed that fails to be superseded
+    is refused there.
+
+    So this is not a softened rule for seeds. It is the same rule applied at
+    the moment the vector becomes ACTIVE, which for a pin is now and for a seed
+    is after the calibration has had its chance.
+    """
+    from flliper.srt.planner.retracted import (
+        RetractedProvenanceError,
+        find_retracted_token_vector,
+        token_vector_refusal_text,
+    )
+
+    entry = find_retracted_token_vector(vector, _token_vector_provenance(server_args))
+    if entry is None:
+        return
+    if _token_vector_role(server_args) == "seed":
+        logger.warning(
+            "#797 PROVENANCE: the token vector seeded via %s traces to "
+            "RETRACTED investigation %s. Permitted ONLY because role='seed' "
+            "means this boot's measured per-rank capacity supersedes it before "
+            "anything serves on it. If that install does not happen, the boot "
+            "is refused rather than served on withdrawn evidence. Why %s was "
+            "retracted: %s",
+            source,
+            entry.investigation,
+            entry.investigation,
+            entry.retracted_because,
+        )
+        return
+    raise RetractedProvenanceError(
+        token_vector_refusal_text(
+            entry, vector, f"it is PINNED as the active vector via {source}"
+        )
+    )
+
+
+#: #897: set once the KV-ratio supersession below has been reported, so a
+#: process that resolves the vector more than once (the boot gate calls the
+#: resolver, the phase flip builds a second stack) says it once, not per call.
+#: #901: the authority's shared latch, not a fourth hand-rolled bool.
+_kv_ratio_announcer = _knob.Announcer("distributed.rank_kv_ratio")
+
+
+def reset_kv_ratio_supersession_announcement() -> None:
+    """Forget that the #897 supersession was announced in this process.
+
+    Test hook only. The latch exists so the boot log carries the line once;
+    a suite that drives several boots in one interpreter needs to clear it
+    between them or it would be testing the latch instead of the message.
+    """
+    _kv_ratio_announcer.reset()
+
+
+def _gcd_reduced(vector: Sequence[int]) -> List[int]:
+    """The form ``resolve_cp_token_ratios`` compares and installs."""
+    g = math.gcd(*vector)
+    return [v // g for v in vector]
+
+
+def announce_superseded_rank_kv_ratio(server_args) -> None:
+    """Say that FLLIPER_UNEVEN_TOKEN_VECTOR, not --rank-kv-ratio, decided the
+    KV-token ownership vector (#897).
+
+    THE DEFECT THIS EXISTS TO END. ``resolve_cp_token_ratios`` reads the env
+    vector first and returns on its PRESENCE, not on a comparison with the
+    flag. So a value left behind by an earlier A/B run -- or written into the
+    environment by this process's own KV calibration -- beats an explicit
+    ``--rank-kv-ratio`` without consulting it, and the whole resolver contains
+    no logger call: the operator sees his flag in ``ps`` and in the ServerArgs
+    repr while a different vector sizes every rank's KV pool. Same shape as
+    #894 S5 (``FLLIPER_GGUF_MMQ_DECODE_THRESHOLD``), one module down.
+
+    WHY HERE AND NOT IN THE RESOLVER. ``resolve_cp_token_ratios`` is
+    documented as a DETERMINISTIC PURE FUNCTION of the args, because every
+    rank must derive the same vector for the pool pinning and the owner rule
+    to agree; it has several callers, direct unit calls among them. A logger
+    inside it would fire once per call site and per rank, and would make a
+    function whose contract is "same input, same output, no side effects"
+    carry one. The announcement therefore lives beside the precedence it
+    describes -- in this module, so it cannot drift from the rule -- and is
+    CALLED from the boot-time site that installs the vector
+    (``scheduler.configure_scheduler_process``), once per process.
+
+    WHY NOT #896's ``_flag_or_env`` RECORDER -- AND WHAT #901 CHANGED. That
+    helper resolved one SCALAR knob from ``getattr(server_args, field)``
+    against one env reader and returned the value, from inside
+    ``managers/phase_policy.py``, which sits ABOVE this module. It could not
+    express a five-level vector precedence with gcd reduction, and reusing it
+    would have meant importing ``managers`` from ``distributed``. Both
+    objections were about that helper's LOCATION and SHAPE, not about the
+    idea, so #901 moved the idea into ``srt/knob_resolution`` -- below both
+    modules, importing neither -- and widened it until this case fits:
+
+    * the ladder is a SEQUENCE, so five rungs are not a special case;
+    * a rung's value is opaque, so a list is not a special case;
+    * the equivalence test is a parameter, so ``_gcd_reduced`` plugs in and
+      "6,2 is the same ownership split as 3,1" stays this module's fact;
+    * the announcement is a separate call, so ``resolve_cp_token_ratios``
+      keeps its zero-logger contract (pinned by
+      ``TestTheResolverStaysPure``).
+
+    What did NOT move: the #797 retraction refusal and the seed arming stay
+    here. They are not reporting, they are policy about a specific vector's
+    lineage, and folding them into a general resolver would have made the
+    authority carry one site's semantics.
+
+    WARNING, NOT REFUSAL, decided on the danger direction:
+
+    * The precedence is documented in the flag's own help text ("The
+      environment variable FLLIPER_UNEVEN_TOKEN_VECTOR (explicit vector) takes
+      precedence over this flag") and the env is how the KV calibration feeds
+      its measured optimum back in. Flipping it, or refusing the combination,
+      would change which vector serves -- a bigger change than the one being
+      made, and not this ticket's to make.
+    * Refusing here kills a boot on every process that carries the variable,
+      including the in-process writeback path
+      (``model_runner_kv_cache_mixin`` sets it after profiling). The defect's
+      blast radius is a wrong belief about which vector sized the pools.
+
+    The remedy named in the message is to REMOVE the variable, never to set
+    it empty: server_args.py:5607 records what an empty override already cost
+    once -- FLLIPER_UNEVEN_TOKEN_VECTOR set, then blanked by a later append,
+    uneven token sharding off for a day with nobody aware.
+    """
+    if _kv_ratio_announcer.said:
+        return
+
+    from flliper.srt.environ import envs as _envs
+
+    env_vec = _envs.FLLIPER_UNEVEN_TOKEN_VECTOR.get()
+    if not env_vec:
+        return
+    kv_flag = getattr(server_args, "rank_kv_ratio", None)
+    if kv_flag is None or kv_flag == "coupled":
+        # 'coupled' is the default and asks for exactly the env-gated
+        # behaviour. Nothing the operator chose is being taken away, so
+        # saying it would train readers to skip the line.
+        return
+    dcp_size = getattr(server_args, "dcp_size", 1)
+    if dcp_size <= 1:
+        return
+    try:
+        parsed = [int(x) for x in str(env_vec).split(",") if x.strip() != ""]
+    except ValueError:
+        parsed = []
+    if not parsed or len(parsed) != dcp_size or any(v <= 0 for v in parsed):
+        # Malformed or wrong length: resolve_cp_token_ratios raises on exactly
+        # this, naming the variable and the shape it wants. A second, quieter
+        # report here would only compete with the loud one.
+        return
+    role = _token_vector_role(server_args)
+
+    # #901: the FIVE-LEVEL precedence of `resolve_cp_token_ratios`, declared
+    # rather than re-walked by hand. Rungs 3-5 (the planner's capacity seed,
+    # the budget estimate, the weights fallback) are named so the ladder in
+    # the code is the ladder in the docstring; they are only PRESENT when they
+    # could actually have supplied a vector, and a present rung that resolves
+    # to the same split as the winner is not reported at all.
+    #
+    # The equivalence test is `_gcd_reduced`: 6,2 and 3,1 are the same
+    # ownership split, and a warning that fired on the difference between
+    # them would be noise. That is exactly the kind of site knowledge the
+    # authority takes as a parameter instead of guessing at.
+    seed = getattr(server_args, "rank_kv_capacity_seed", None)
+    resolution = _knob.resolve_knob(
+        [
+            _knob.KnobSource(
+                source=_knob.env_source("FLLIPER_UNEVEN_TOKEN_VECTOR"),
+                value=parsed,
+                present=True,  # non-empty, well-formed, right length: checked above
+                kind=_knob.KIND_ENV,
+                label=f"FLLIPER_UNEVEN_TOKEN_VECTOR={env_vec!r}",
+            ),
+            _knob.KnobSource(
+                source=_knob.flag_source("rank_kv_ratio"),
+                value=kv_flag if isinstance(kv_flag, list) else None,
+                present=isinstance(kv_flag, list) and len(kv_flag) == dcp_size,
+                kind=_knob.KIND_FLAG,
+                label="--rank-kv-ratio %s"
+                % (
+                    ",".join(str(v) for v in kv_flag)
+                    if isinstance(kv_flag, list)
+                    else kv_flag
+                ),
+                cost=(
+                    "that vector is INERT -- the resolver returns on the env "
+                    "variable's presence before the flag is read at all"
+                ),
+            ),
+            _knob.KnobSource(
+                source="the planner's predicted capacity match "
+                "(--rank-kv-capacity-seed)",
+                value=list(seed) if seed else None,
+                present=bool(seed) and len(seed) == dcp_size,
+                kind=_knob.KIND_DERIVED,
+                label="--rank-kv-capacity-seed",
+                cost="the predicted match is skipped",
+            ),
+            # The last two rungs are derived INSIDE the resolver from things
+            # the operator did not write, so losing at them is not a loss to
+            # report -- see KnobSource.reportable. They stay in the ladder so
+            # the ladder in the code is the five-level ladder in the
+            # resolver's docstring, and not a truncated one that reads as if
+            # precedence stopped at the seed.
+            _knob.KnobSource(
+                source="the per-rank free-KV budget estimate",
+                present=True,
+                kind=_knob.KIND_DERIVED,
+                reportable=False,
+            ),
+            _knob.KnobSource(
+                source="the gcd-reduced --rank-tp-ratio weights fallback",
+                present=True,
+                kind=_knob.KIND_DEFAULT,
+                reportable=False,
+            ),
+        ],
+        normalize=lambda v: _gcd_reduced(v) if v else None,
+    )
+
+    winner = _gcd_reduced(parsed)
+    # An all-equal env vector is not installed as a vector at all: the resolver
+    # returns None for it, which IS the even-modulo owner rule. Printing
+    # "installed as 1,1" there would name something no code holds.
+    effective = (
+        "uniform token ownership, the even-modulo owner rule"
+        if len(set(winner)) == 1
+        else "the vector %s" % ",".join(str(v) for v in winner)
+    )
+
+    if isinstance(kv_flag, list):
+        if len(kv_flag) != dcp_size:
+            return
+        if not resolution.lost_anything:
+            # Same vector either way. Never ambiguous, so nothing to report --
+            # a line that also fires when nothing was lost is a line readers
+            # learn to skip.
+            return
+        lost = resolution.top_loser.loss_label()
+        cost = resolution.top_loser.cost
+    else:
+        # A MODE, not a vector: '--rank-kv-ratio capacity|auto' has no value to
+        # compare, so the ladder cannot answer whether it lost -- the fact that
+        # it never ran is the loss. What it costs depends on the role the env
+        # vector carries, which is #797's semantics and stays here.
+        lost = "--rank-kv-ratio %s" % kv_flag
+        if role == "seed":
+            cost = (
+                "the mode's phase-1 estimate is skipped; because the vector "
+                "is role='seed' the measured optimum still supersedes it "
+                "in-process after profiling, so the mode arrives late rather "
+                "than not at all"
+            )
+        else:
+            cost = (
+                "the mode is INERT in both phases -- its phase-1 estimate is "
+                "skipped here, and a role='pin' env vector also suppresses "
+                "the post-profiling measured install "
+                "(model_runner_kv_cache_mixin, `pinned_vector`), so the "
+                "measured optimum is printed as advice and never installed"
+            )
+    # #901: the same skeleton the GGUF site now prints -- ticket, winner,
+    # subject, what this boot actually gets, what did not decide it and what
+    # that costs, the presence rule, and the one remedy. Byte-identical to the
+    # hand-built line #897 shipped; that is the point of migrating onto a
+    # format rather than inventing a fifth one.
+    _kv_ratio_announcer.say(
+        logger,
+        _knob.supersession_line(
+            "897",
+            winner=f"FLLIPER_UNEVEN_TOKEN_VECTOR={env_vec!r}",
+            subject="the uneven-DCP KV-token ownership",
+            effective=f"this boot gets {effective} (role={role!r})",
+            loss=_knob.loss_clause(lost, cost),
+            presence_rule=(
+                "The env override wins on PRESENCE, not on value, so a stale "
+                "vector from an earlier A/B run -- or one this process's own "
+                "KV calibration wrote back -- beats the flag without being "
+                "compared to it."
+            ),
+            remedy=_knob.removal_remedy("FLLIPER_UNEVEN_TOKEN_VECTOR"),
+        ),
+    )
+
+
+def resolve_cp_token_ratios(
+    server_args, checkpoint_size_mib: Optional[int] = None
+) -> Optional[list]:
+    """Token-axis split vector for uneven DCP, derived from the server args.
+
+    Returns None (use even modulo) when no uneven plan applies. Otherwise a
+    small positive-integer vector (gcd-reduced) proportional to each rank's
+    FREE KV budget, so heterogeneous cards each fill up:
+
+        avail[r] = rank_gpu_memory_mib[r]
+                   - checkpoint_size_mib * weight[r] / sum(weights)  (weight bytes)
+                   - _CP_TOKEN_OVERHEAD_MIB                          (context/frag)
+
+    integerized to _CP_TOKEN_UNITS units (>=1 per rank), gcd-reduced so the
+    virtual scheduler block (page_size * sum(ratios)) stays as fine as
+    possible. When no per-rank byte budgets are available, falls back to the
+    gcd-reduced --rank-tp-ratio weights (a simple weights-based split).
+
+    Precedence: FLLIPER_UNEVEN_TOKEN_VECTOR (env) > --rank-kv-ratio a,b,c
+    (explicit pin) > rank_kv_capacity_seed (the planner's predicted match)
+    > budget estimate > weights fallback. --rank-kv-ratio capacity keeps the
+    estimate here (phase 1) and installs the MEASURED optimal vector after
+    the post-weight-load profiling instead (phase 2, see
+    ModelRunnerKVCacheMixin._maybe_suggest_dcp_token_vector).
+
+    That first step wins on the env variable's PRESENCE, never on a
+    comparison with the flag below it. #897: this function stays silent about
+    it -- see ``announce_superseded_rank_kv_ratio`` above, which says it once
+    per process from the boot-time install site, so the rule and its
+    announcement live in one module while this one stays pure.
+
+    Deterministic pure function of the args so every rank computes the same
+    vector (the pool pinning and owner rule must agree across ranks)."""
+    weights = getattr(server_args, "rank_tp_ratio", None)
+    dcp_size = getattr(server_args, "dcp_size", 1)
+    if not weights or dcp_size <= 1 or len(set(weights)) == 1:
+        # HONESTY GUARD (measured): this bail-out runs BEFORE the env vector
+        # is read, so FLLIPER_UNEVEN_TOKEN_VECTOR without a non-uniform
+        # --rank-tp-ratio plan was SILENTLY IGNORED -- the server booted
+        # green, flashinfer's even-DCP no-op served plain TP output, and the
+        # requested token ownership never existed. Every engagement point of
+        # the token-sharded pool (uneven_dcp_kv_replicated, the dcp auto-set,
+        # this resolver) keys on the base plan today, so decoupled token
+        # ownership is NOT reachable through this door; say so instead of
+        # ignoring the ask.
+        #
+        # REACHABILITY (#182): this branch is worth nothing unless a real boot
+        # gets here. configure_scheduler_process used to call the resolver
+        # only when a base plan was installed -- i.e. only when this guard
+        # could not fire -- so the guard held on a direct call and never on a
+        # server. The boot gate now keys on the token vector's own presence;
+        # see the "GUARD REACHABILITY" branch there before narrowing it again.
+        from flliper.srt.environ import envs as _envs
+
+        _env_vec = _envs.FLLIPER_UNEVEN_TOKEN_VECTOR.get()
+        if _env_vec and dcp_size > 1:
+            raise ValueError(
+                f"FLLIPER_UNEVEN_TOKEN_VECTOR={_env_vec!r} is set, but no "
+                "non-uniform --rank-tp-ratio plan is installed. The uneven "
+                "token-ownership machinery only engages under a base shard "
+                "plan (uneven_dcp_kv_replicated keys on it); without one the "
+                "vector would be silently ignored and the server would run "
+                "plain even DCP while looking configured. Install a "
+                "non-uniform --rank-tp-ratio, or unset the vector."
+            )
+        return None
+    if len(weights) != dcp_size:
+        return None
+
+    # Self-calibration override: FLLIPER_UNEVEN_TOKEN_VECTOR wins over the
+    # budget-estimate derivation below. The KV-pool calibration emits it as a
+    # restart hint (measured optimal from the actual per-rank profiled token
+    # capacity); feeding it back here converges the pools to that optimum on
+    # the next boot. Model-type-agnostic (dtype-independent measured capacity).
+    from flliper.srt.environ import envs
+
+    env_vec = envs.FLLIPER_UNEVEN_TOKEN_VECTOR.get()
+    if env_vec:
+        parsed = [int(x) for x in env_vec.split(",") if x.strip() != ""]
+        # #239 S3a: under Form A a zero is a layout (a rank that owns no
+        # token of the full-attention KV -- the optimum puts the host there),
+        # exactly as the zero in --rank-tp-ratio is; elsewhere it stays an
+        # arithmetic accident.
+        floor = 0 if getattr(server_args, "rank_role", None) else 1
+        if (
+            len(parsed) != dcp_size
+            or any(v < floor for v in parsed)
+            or sum(parsed) <= 0
+        ):
+            raise ValueError(
+                f"FLLIPER_UNEVEN_TOKEN_VECTOR must be {dcp_size} "
+                + ("non-negative" if floor == 0 else "positive")
+                + f" integers (one per DCP rank), got {env_vec!r}."
+            )
+        _refuse_retracted_token_vector(
+            server_args, parsed, "FLLIPER_UNEVEN_TOKEN_VECTOR"
+        )
+        if len(set(parsed)) == 1:
+            return None
+        g = math.gcd(*parsed)
+        reduced = [v // g for v in parsed]
+        # #797: a SEED claims it will be superseded in-process. Arm the claim
+        # here, where the estimate actually enters the boot, so that
+        # assert_seed_superseded() can hold the boot to it later. Armed with
+        # the gcd-reduced form because that is the form the install compares
+        # against. A 'pin' asserts its value instead and arms nothing.
+        if _token_vector_role(server_args) == "seed":
+            note_seed_awaiting_supersession(reduced)
+        return reduced
+
+    # Explicit pin via --rank-kv-ratio a,b,c (task #88): the decoupled
+    # KV-token ownership vector, below the env override (family-flag
+    # convention) and above the derivations. Validated + gcd-reduced in
+    # ServerArgs._handle_uneven_tp; an all-equal pin means uniform token
+    # ownership = the even-modulo owner rule (return None).
+    kv_flag = getattr(server_args, "rank_kv_ratio", None)
+    if isinstance(kv_flag, list) and len(kv_flag) == dcp_size:
+        _refuse_retracted_token_vector(server_args, kv_flag, "--rank-kv-ratio")
+        if len(set(kv_flag)) == 1:
+            return None
+        g = math.gcd(*kv_flag)
+        return [v // g for v in kv_flag]
+
+    # Planner phase-1 SEED: the predicted per-rank capacity vector, parked by
+    # apply_auto_performance. Below the explicit pin and the env override,
+    # above the budget estimate -- which the two writers of this field both
+    # have a reason to distrust. Under draft-solo placement (--rank-kv-ratio
+    # capacity) it does not model the host's unsharded draft weights +
+    # globally-sized draft KV pool; under the phase-optimal arms (#435) the
+    # solved MLP vector has moved weight mass off the budget proportion the
+    # estimate assumes, so the boot would size its pool for a vector the plan
+    # never gated. Purely a starting vector where a phase-2 measured install
+    # exists (_maybe_suggest_dcp_token_vector replaces it after profiling in
+    # the derived modes); under 'coupled' it is the boot vector.
+    seed = getattr(server_args, "rank_kv_capacity_seed", None)
+    if isinstance(seed, list) and len(seed) == dcp_size and all(v > 0 for v in seed):
+        if len(set(seed)) == 1:
+            return None
+        g = math.gcd(*seed)
+        return [v // g for v in seed]
+
+    if checkpoint_size_mib is None:
+        checkpoint_size_mib = _checkpoint_size_mib(
+            getattr(server_args, "model_path", None)
+        )
+
+    budgets = getattr(server_args, "rank_gpu_memory_mib", None)
+    if (
+        isinstance(budgets, list)
+        and len(budgets) == len(weights)
+        and checkpoint_size_mib > 0
+    ):
+        total_w = sum(weights)
+        avail = [
+            max(b - checkpoint_size_mib * w / total_w - _CP_TOKEN_OVERHEAD_MIB, 1.0)
+            for b, w in zip(budgets, weights)
+        ]
+        vector = partition_units(_CP_TOKEN_UNITS, [max(int(a), 1) for a in avail])
+        g = math.gcd(*vector)
+        return [v // g for v in vector]
+
+    g = math.gcd(*weights)
+    return [w // g for w in weights]
+
+
+#: Token-vector resolution granularity (units) and the assumed
+#: weight-independent per-rank overhead (CUDA context, fragmentation,
+#: attention scratch) subtracted before the free-memory split.
+_CP_TOKEN_UNITS = 64
+_CP_TOKEN_OVERHEAD_MIB = 1536
+
+
+def _partition_units_raw(units: int, weights: Sequence[int]) -> list:
+    """Largest-remainder split of `units` over ranks proportional to
+    `weights` (the classic behavior; every rank gets >= 1 unit)."""
+    n = len(weights)
+    if units < n:
+        raise ValueError(
+            f"Cannot give each of {n} ranks at least one of {units} units."
+        )
+    total_w = sum(weights)
+    quotas = [units * w / total_w for w in weights]
+    sizes = [int(q) for q in quotas]
+    # Reserve a minimum of one unit per rank before distributing the rest.
+    sizes = [max(s, 1) for s in sizes]
+    remaining = units - sum(sizes)
+    if remaining < 0:
+        # Minimum-1 bumping overshot: take back from the largest shares.
+        for _ in range(-remaining):
+            i = max(range(n), key=lambda r: (sizes[r], -r))
+            sizes[i] -= 1
+        remaining = 0
+    order = sorted(
+        range(n), key=lambda r: (quotas[r] - int(quotas[r]), -r), reverse=True
+    )
+    for k in range(remaining):
+        sizes[order[k % n]] += 1
+    assert sum(sizes) == units and all(s >= 1 for s in sizes)
+    return sizes
+
+
+def _partition_units_with_empty_ranks(
+    units: int, weights: Sequence[int], groups: Optional[int]
+) -> list:
+    """Largest-remainder split that lets a rank with weight 0 own NOTHING.
+
+    The classic split (`_partition_units_raw`) reserves a minimum of one unit
+    per rank and asserts it, so "this rank has no attention head at all" is
+    structurally inexpressible there. Form A (the attention-host layout: one
+    card runs every dense part, the other cards are pure expert workers) is
+    exactly that shape, which is why this is a SEPARATE function behind an
+    explicit `allow_zero` rather than a relaxed assertion in the hot path --
+    an accidental zero in the classic path stays an error.
+
+    Zero-weight ranks are removed, the classic split runs over the rest (so
+    the rounding, the tie-break and the per-rank minimum are byte-identical
+    for the ranks that do own units), and the zeros are put back.
+
+    The kv-group alignment (#116) COMPOSES rather than being refused: an
+    empty rank straddles no kv-head-group boundary, so dropping it before
+    the alignment and putting the zero back afterwards preserves the
+    invariant exactly -- the ranks that do own q packets are aligned among
+    themselves. (Form A slice 2; slice 1 refused this case by name instead,
+    which would have made the layout unbootable at the first attention
+    layer.)
+    """
+    if any(w < 0 for w in weights):
+        raise ValueError(f"partition_units: negative weight in {list(weights)}.")
+    kept = [r for r, w in enumerate(weights) if w > 0]
+    if not kept:
+        raise ValueError(
+            "partition_units(allow_zero=True): the weight vector is all "
+            f"zeros ({list(weights)}) -- no rank would own any of the "
+            f"{units} units."
+        )
+    sub_weights = [weights[k] for k in kept]
+    if groups:
+        sub = _partition_units_kv_aligned(units, sub_weights, groups)
+    else:
+        sub = _partition_units_raw(units, sub_weights)
+    sizes = [0] * len(weights)
+    for i, r in enumerate(kept):
+        sizes[r] = sub[i]
+    return sizes
+
+
+def _balanced_group_lengths(weights: Sequence[int], groups: int, max_len: int) -> list:
+    """Partition the `len(weights)` ranks (in order) into `groups`
+    contiguous non-empty segments, each of length in [1, max_len],
+    minimizing imbalance of per-segment weight sums (each kv-group has
+    the SAME q capacity, so balancing weight sums keeps every rank's
+    q-share ~ its weight). Deterministic: ties break toward the flatter
+    then the lexicographically smaller length vector."""
+    n = len(weights)
+    prefix = [0]
+    for w in weights:
+        prefix.append(prefix[-1] + w)
+    best = [None]  # (key, lengths)
+
+    def rec(start: int, g_left: int, lengths: list) -> None:
+        remaining = n - start
+        if g_left == 0:
+            if remaining == 0:
+                sums, idx = [], 0
+                for L in lengths:
+                    sums.append(prefix[idx + L] - prefix[idx])
+                    idx += L
+                key = (max(sums), tuple(sorted(sums, reverse=True)), tuple(lengths))
+                if best[0] is None or key < best[0][0]:
+                    best[0] = (key, list(lengths))
+            return
+        # Leave >= 1 rank per remaining group and <= max_len each.
+        hi = min(max_len, remaining - (g_left - 1))
+        for L in range(1, hi + 1):
+            if remaining - L > (g_left - 1) * max_len:
+                continue
+            rec(start + L, g_left - 1, lengths + [L])
+
+    rec(0, groups, [])
+    if best[0] is None:
+        raise ValueError(
+            f"kv-aligned split infeasible: {n} ranks into {groups} groups of "
+            f"<= {max_len} units each."
+        )
+    return best[0][1]
+
+
+def _partition_units_kv_aligned(
+    units: int, weights: Sequence[int], groups: int
+) -> list:
+    """kv-boundary-aware q-head split (task #116).
+
+    Under REPLICATED-KV geometry (TP > num_kv_heads) the q heads split in
+    `units` indivisible packets, and the global kv-head groups fall at unit
+    positions that are multiples of `units // groups`. The memory-proportional
+    auto planner (--rank-tp-ratio auto) can otherwise produce a raw split whose
+    per-rank q packets STRADDLE such a boundary, which the #105 current-chunk
+    ragged kernel cannot represent (it fails fast in
+    _replicated_kv_ragged_reindex). This constrains the split so every rank's
+    q packets map cleanly into a single kv-head group.
+
+    Returns the raw largest-remainder split UNCHANGED whenever it is already
+    boundary-aligned (so even splits, kv >= tp, and explicit kv-aligned ratios
+    stay byte-identical); otherwise repairs it by assigning contiguous rank
+    segments to whole kv-groups. When `groups` cannot tile `units` into equal
+    whole-unit blocks (kv**2 does not divide q), alignment is impossible and
+    the raw split is returned (the #105 guard then correctly rejects it)."""
+    sizes = _partition_units_raw(units, weights)
+    n = len(weights)
+    # Alignment only meaningful when the units tile into `groups` equal
+    # whole-unit blocks AND ranks outnumber groups (each rank fits in one
+    # group). Otherwise fall back to the raw split.
+    if groups < 2 or groups >= n or units % groups != 0:
+        return sizes
+    per = units // groups  # units per kv-group (== global GQA group / kv_total)
+    boundaries = [per * k for k in range(1, groups)]
+    seen, c = set(), 0
+    for s in sizes[:-1]:
+        c += s
+        seen.add(c)
+    if all(b in seen for b in boundaries):
+        return sizes  # already aligned -> byte-identical to the raw split
+    lengths = _balanced_group_lengths(weights, groups, per)
+    out, idx = [], 0
+    for L in lengths:
+        out.extend(_partition_units_raw(per, weights[idx : idx + L]))
+        idx += L
+    assert sum(out) == units and all(s >= 1 for s in out)
+    return out
+
+
+def cp_token_context_budget(vector: Sequence[int], capacities: Sequence[int]) -> int:
+    """Global max_total_num_tokens under the weighted owner rule.
+
+    Rank r owns vector[r] of every sum(vector) context tokens, so the unit that
+    every rank can fund is min_r(capacities[r] // vector[r]) and the global
+    budget is that unit times sum(vector). Maximised when the vector is
+    proportional to the capacities -- which is exactly what --rank-kv-ratio
+    capacity installs.
+
+    Form A (F4): a rank with vector[r] == 0 owns no context tokens at all --
+    the attention host holds the whole KV -- so it FUNDS no unit and must be
+    left out of the min() rather than dividing by zero. It is excluded, not
+    asserted against: a zero here used to be impossible and is now a layout.
+    An ALL-zero vector is still a refusal, because then nobody holds the KV.
+    """
+    n = len(vector)
+    assert len(capacities) == n
+    funding = [r for r in range(n) if vector[r] > 0]
+    if not funding:
+        raise ValueError(
+            f"cp_token_context_budget: token vector {list(vector)} gives "
+            "every rank zero context tokens -- no rank would hold the KV "
+            "cache. Under Form A exactly one rank (the attention host) "
+            "holds all of it, so its entry must be positive."
+        )
+    return min(capacities[r] // vector[r] for r in funding) * sum(vector)
+
+
+def cp_token_speed_vector(
+    capacities: Sequence[int],
+    bandwidth_weights: Sequence[int],
+    loose_ctx_percent: float,
+    grain: int = 64,
+    hard_cap: Optional[int] = None,
+) -> tuple:
+    """KV-token ownership vector for --rank-kv-ratio speed.
+
+    THE TRADE-OFF. Two vectors are of interest and they pull in opposite
+    directions on a heterogeneous rig:
+
+      * proportional to CAPACITY  -> maximises max_total_num_tokens, and hands
+        the biggest token share to whichever ranks have the most free VRAM
+        after weights -- typically the WEAK cards.
+      * proportional to BANDWIDTH -> minimises the deep-context part of the
+        decode step, because under DCP each rank runs attention over the tokens
+        it owns and at bs=1 the group waits on the slowest rank.
+
+    This walks the straight line between the two share vectors and returns the
+    most bandwidth-shifted point that still funds the allowed context, i.e. the
+    largest t in [0, 1] with
+
+        budget(partition(t*bw_share + (1-t)*cap_share)) >= floor
+
+    where floor = best_effective_budget * (1 - loose_ctx_percent/100).
+
+    `hard_cap` is the other ceiling on max_total_num_tokens (the hybrid
+    mamba/SWA cap = max_running_requests x context_len, which on hybrid models
+    routinely binds far below the KV-derived budget). It matters because the
+    user-visible quantity is min(kv_budget, hard_cap): while the cap binds, a
+    bandwidth shift costs literally nothing and should be taken in full even at
+    the default loose_ctx_percent=0. Without this the mode would refuse every
+    free gain on exactly the models where the gain is largest.
+
+    Deterministic pure function of its arguments -- every rank derives the same
+    vector from the same all-gathered capacities, which is the invariant the
+    phase-2 install depends on.
+
+    Returns (vector, budget, t) with the vector gcd-reduced."""
+    n = len(capacities)
+    assert len(bandwidth_weights) == n and n > 0
+    assert all(c > 0 for c in capacities) and all(w > 0 for w in bandwidth_weights)
+
+    def effective(vec):
+        b = cp_token_context_budget(vec, capacities)
+        return min(b, hard_cap) if hard_cap else b
+
+    cap_vec = partition_units(grain, list(capacities))
+    floor = int(effective(cap_vec) * (1.0 - float(loose_ctx_percent) / 100.0))
+
+    cap_sum = float(sum(capacities))
+    bw_sum = float(sum(bandwidth_weights))
+    cap_share = [c / cap_sum for c in capacities]
+    bw_share = [w / bw_sum for w in bandwidth_weights]
+
+    best = None
+    for i in range(grain, -1, -1):
+        t = i / float(grain)
+        blend = [t * bw_share[r] + (1.0 - t) * cap_share[r] for r in range(n)]
+        # partition_units takes integer weights; scale the blend up so the
+        # rounding granularity does not swallow small differences.
+        vec = partition_units(grain, [max(1, int(round(x * 10**6))) for x in blend])
+        if any(v <= 0 for v in vec):
+            continue
+        if effective(vec) >= floor:
+            best = (vec, t)
+            break
+    if best is None:  # cap_vec itself always meets its own floor
+        best = (cap_vec, 0.0)
+    vec, t = best
+    g = math.gcd(*vec)
+    vec = [v // g for v in vec]
+    return vec, cp_token_context_budget(vec, capacities), t
+
+
+def partition_units(
+    units: int,
+    weights: Sequence[int],
+    groups: Optional[int] = None,
+    allow_zero: bool = False,
+) -> list:
+    """Split `units` indivisible units over ranks proportionally to
+    `weights` (largest-remainder rounding, every rank gets >= 1 unit).
+
+    Deterministic pure function of (units, weights, groups) so every
+    process computes the identical partition. Ties in the fractional parts
+    are broken toward the lower rank index.
+
+    `groups` (task #116): when set (= num_kv_heads for the Q dimension under
+    the REPLICATED-KV geometry), the split is constrained so no rank's q
+    packets straddle a kv-head-group boundary. It is a NO-OP whenever the raw
+    split is already aligned, so all non-q dimensions (which pass groups=None)
+    and already-aligned q splits stay byte-identical.
+
+    `allow_zero` (Form A) drops the per-rank minimum of one unit for ranks
+    whose weight is 0: they own nothing and the remaining ranks split the
+    units among themselves, byte-identically to a call that never mentioned
+    the empty ranks. OFF by default, because in every existing caller a zero
+    weight is a bug, not a layout."""
+    if allow_zero:
+        return _partition_units_with_empty_ranks(units, weights, groups)
+    if groups:
+        return _partition_units_kv_aligned(units, weights, groups)
+    return _partition_units_raw(units, weights)
+
+
+def partition_sizes(
+    total: int,
+    weights: Sequence[int],
+    units: Optional[int] = None,
+    groups: Optional[int] = None,
+    allow_zero: bool = False,
+) -> list:
+    """Per-rank sizes of a sharded dimension of `total` elements under the
+    weight vector `weights`.
+
+    With `units`, the dimension is treated as `units` indivisible units of
+    `total // units` elements each (e.g. attention heads): the units are
+    distributed by largest-remainder rounding (every rank >= 1 unit) and
+    scaled back to elements, so any positive weights work. `total` must be
+    a multiple of `units`.
+
+    Without `units`, per-rank sizes must be exact: `total` must be
+    divisible by sum(weights); otherwise this raises, naming the offending
+    dimension size. A zero weight already yields size 0 on that path (it is
+    plain proportional arithmetic); `allow_zero` is what extends the same
+    meaning to the UNIT path, where the classic split reserves one unit per
+    rank. See `partition_units`.
+    """
+    if units is not None:
+        if total % units != 0:
+            raise ValueError(
+                f"Dimension of size {total} is not a multiple of its "
+                f"unit count {units}."
+            )
+        scale = total // units
+        return [
+            s * scale
+            for s in partition_units(units, weights, groups, allow_zero=allow_zero)
+        ]
+    if groups:
+        raise ValueError(
+            "partition_sizes: groups (kv-boundary alignment) requires a "
+            "unit count (the q-head packet count); got units=None."
+        )
+    denom = sum(weights)
+    if denom <= 0:
+        # Refusal by name instead of the ZeroDivisionError two lines down.
+        raise ValueError(
+            f"partition_sizes: weight vector {list(weights)} sums to "
+            f"{denom}; no rank could own any of the {total} elements."
+        )
+    if total % denom != 0:
+        raise ValueError(
+            f"Cannot partition dimension of size {total} with weight "
+            f"vector {list(weights)}: {total} is not divisible by "
+            f"sum(weights)={denom}. Choose weights whose sum divides every "
+            "sharded dimension, or pass the dimension's unit count."
+        )
+    unit = total // denom
+    return [unit * w for w in weights]
+
+
+def partition_offsets(
+    total: int, weights: Sequence[int], rank: int, units: Optional[int] = None
+) -> Tuple[int, int]:
+    """(start offset, size) of `rank` in a sharded dimension of `total`
+    elements: the prefix sum over partition_sizes and this rank's share."""
+    sizes = partition_sizes(total, weights, units)
+    return sum(sizes[:rank]), sizes[rank]
+
+
+def tp_partition_sizes(
+    total: int,
+    tp_size: int,
+    units: Optional[int] = None,
+    family: Optional[str] = None,
+    groups: Optional[int] = None,
+) -> list:
+    """Per-rank sizes of a sharded dimension under the process-global
+    shard plan. Without an installed ratio vector (or when this layer runs
+    with its own tp_size, e.g. disable_tp layers use tp_size=1), this is
+    the classic even split via divide(). `family` selects a named family
+    plan (e.g. "mlp") and falls back to the base vector when that family
+    has no own vector installed. `groups` (task #116, Q dimension only)
+    constrains the split to kv-head-group boundaries; None keeps the plain
+    proportional split (byte-identical).
+
+    Zero-width ranks (Form A: the expert workers hold no dense shard of any
+    dimension) are admitted only when the INSTALLED plan says so --
+    `tp_partition_allows_zero()`, set with the vector in
+    `set_tp_partition_ratios`. Reading it here rather than taking it as an
+    argument is the point: every dense dimension in the process then splits
+    by the same rule, and no call site can disagree with the plan."""
+    ratios = get_tp_partition_ratios(family)
+    if not ratios or len(ratios) != tp_size:
+        ensure_divisibility(total, tp_size)
+        return [total // tp_size] * tp_size
+    return partition_sizes(
+        total, ratios, units, groups, allow_zero=tp_partition_allows_zero()
+    )
+
+
+def tp_partition_size(
+    total: int,
+    tp_size: int,
+    rank: int,
+    units: Optional[int] = None,
+    family: Optional[str] = None,
+    groups: Optional[int] = None,
+) -> int:
+    """This rank's size of a sharded dimension under the global plan."""
+    return tp_partition_sizes(total, tp_size, units, family, groups)[rank]
+
+
+def tp_partition_offset(
+    total: int,
+    tp_size: int,
+    rank: int,
+    units: Optional[int] = None,
+    family: Optional[str] = None,
+    groups: Optional[int] = None,
+) -> int:
+    """This rank's start offset (prefix sum) in a sharded dimension."""
+    return sum(tp_partition_sizes(total, tp_size, units, family, groups)[:rank])
+
+
+def tp_vocab_ratios(tp_size: int) -> Optional[list]:
+    """The EXPLICIT vocab family vector (--rank-vocab-ratio /
+    FLLIPER_UNEVEN_VOCAB_VECTOR) when it is active for a group of `tp_size`
+    ranks and non-uniform; None otherwise.
+
+    Deliberately does NOT fall back to the base --rank-tp-ratio vector
+    (unlike get_tp_partition_ratios(family)): the vocab dimension of
+    VocabParallelEmbedding / ParallelLMHead keeps the classic EVEN split
+    under a plain uneven-TP plan ("vocab always even" by design, M22);
+    only the explicit vocab flag opts into the ratio-weighted vocab
+    split (per-rank shard widths ~ memory bandwidth, so the lm_head
+    matvec finishes simultaneously on heterogeneous cards). A uniform
+    vector IS the even split and reports as inactive, keeping the
+    classic path byte-identical.
+    """
+    vec = _TP_PARTITION_FAMILIES.get("vocab")
+    if not vec or len(vec) != tp_size or len(set(vec)) == 1:
+        return None
+    return vec
+
+
+def tp_plan_active(tp_size: int, family: Optional[str] = None) -> bool:
+    """True when an uneven-TP ratio plan is installed AND applies to a
+    layer/group of the given tp_size (disable_tp layers with tp_size=1 and
+    groups of a different size keep the classic even split)."""
+    ratios = get_tp_partition_ratios(family)
+    return bool(ratios) and len(ratios) == tp_size
+
+
+# Widest vector of the jit activation kernels (elementwise/activation.cuh):
+# kMaxVecBytes = 32 bytes on Blackwell -> 16 bf16 elements (the 16-byte
+# path on Ampere gives 8). Uneven shard plans align to the WIDEST vector so
+# one plan is valid on every arch of a potentially mixed rig; which rank
+# lands on which arch is not known at plan/construction time.
+ACTIVATION_VEC_ELEMS = 16
+
+
+def block_aligned_units(total: int, units: Optional[int], block: Optional[int]):
+    """Coarsen an element-granular unit family to whole weight-quant blocks.
+
+    The one rule, in one place: a block-quantized weight (FP8 with
+    ``weight_block_size``, AWQ/GPTQ groups) can only be split where a whole
+    quantization block ends, so a family whose unit is FINER than the block
+    has to be re-expressed in units of ``lcm(unit_elems, block)``.  Families
+    that are already block-multiples (head-granular ones) pass through.
+
+    Both ``_quant_block_aligned_units`` (layer construction) and the lane's
+    nesting probes call this, and they must: a nesting verdict computed on
+    the raw unit count says nothing about a dimension the layers partition
+    in block units.  Those two verdicts genuinely disagree -- for
+    intermediate 17408 with ``weight_block_size [128,128]`` the raw count is
+    1088 and the real one 136, and a swept ratio grid finds both directions
+    of disagreement, including "raw says nested, blocks say not".
+    """
+    if units is None or not block:
+        return units
+    if total % block != 0:
+        # Dimension is not block-quantizable at all -- the quant method's own
+        # skip/validation logic owns this case.
+        return units
+    unit_elems = total // units
+    if unit_elems % block == 0:
+        return units
+    lcm = math.lcm(unit_elems, block)
+    if total % lcm != 0:
+        raise ValueError(
+            f"Cannot align uneven-TP units (unit={unit_elems} elems) of a "
+            f"{total}-wide dimension to the weight quant block {block}."
+        )
+    return total // lcm
+
+
+def assert_activation_aligned_shards(
+    total: int,
+    tp_size: int,
+    units: Optional[int],
+    family: Optional[str] = "mlp",
+    what: str = "MLP intermediate",
+) -> None:
+    """Fail fast at PLAN time (module construction) when any rank's shard
+    of an activation-fed dimension (silu_and_mul / gelu_and_mul input)
+    would violate the jit activation kernel's vector alignment. The kernel
+    itself only raises at the FIRST FORWARD ("hidden size must be divisible
+    by vector size", activation.cuh:168) — long after weights loaded — so
+    an incompatible geometry must be rejected at boot instead (task #82).
+
+    Only active under an installed uneven plan; the classic even-split
+    path keeps its existing (per-arch, runtime) behavior untouched.
+    """
+    if not tp_plan_active(tp_size, family):
+        return
+    sizes = tp_partition_sizes(total, tp_size, units, family)
+    bad = [r for r, s in enumerate(sizes) if s % ACTIVATION_VEC_ELEMS]
+    if bad:
+        raise ValueError(
+            f"Uneven-TP shard plan for the {what} dimension of size {total} "
+            f"(tp_size={tp_size}, units={units}, family={family!r}) yields "
+            f"per-rank shards {sizes}; rank(s) {bad} are not divisible by "
+            f"the activation kernel's widest vector "
+            f"({ACTIVATION_VEC_ELEMS} elements). Pick a shard plan / unit "
+            f"granularity whose per-rank shards are multiples of "
+            f"{ACTIVATION_VEC_ELEMS}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# TP > num_kv_heads (task #62): REPLICATED-KV attention geometry.
+#
+# Under an uneven-TP plan the attention heads are normally split in whole
+# kv-head units (every rank >= 1 whole kv head + its GQA q group). When the
+# model has FEWER kv heads than ranks (e.g. Qwen3.6-35B-A3B global layers:
+# kv=2, TP=3; or Qwen3.6-27B kv=4 at TP=5) that scheme cannot hand each rank
+# a kv head. The affected attention layers then switch to REPLICATED-KV mode:
+#   - ALL kv heads live on EVERY rank (num_kv_local == total). K/V are
+#     RECOMPUTED per rank from byte-identical replicated projection weights
+#     and the identical post-allreduce hidden state — no broadcast, exactly
+#     the semantics of upstream's even tp%kv==0 replication path.
+#   - q heads keep splitting, but in units of kv_total heads (NOT whole GQA
+#     groups): flashinfer requires num_qo % num_kv == 0 per rank, and with
+#     num_kv_local == kv_total that means q_local must be a multiple of
+#     kv_total. E.g. A3B 16q/2kv over TP=3 -> units of 2 -> [6,6,4]
+#     (whole-8er-GQA-group units would force the degenerate [8,8,0]).
+#   - the KV cache is NOT duplicated: the uneven-DCP token-axis sharding
+#     (owner rule + graph-validated LSE merge) keeps per-rank token shards
+#     disjoint, so total capacity stays the sum. The DCP decode/extend paths
+#     already plan the paged wrappers with the FULL head counts, so this
+#     mode is comm-neutral (the per-layer kv-head all-gather in
+#     _dcp_masked_write even becomes a no-op and is skipped).
+# Layers whose kv-head count DOES cover the ranks (e.g. GDN linear-attention
+# heads, or kv>=tp full-attention layers) keep the normal head sharding —
+# geometry is derived per layer from (q_heads, kv_heads, tp_size) with no
+# model special-casing.
+# ---------------------------------------------------------------------------
+
+
+def attn_kv_replicated(tp_size: int, total_num_kv_heads: int) -> bool:
+    """True when attention layers with `total_num_kv_heads` kv heads must run
+    the REPLICATED-KV geometry under the installed uneven-TP plan: fewer kv
+    heads than ranks, so the whole-kv-head-unit split cannot give every rank
+    a kv head. False on the default path (no plan) and whenever kv >= tp
+    (the normal uneven unit split handles kv % tp != 0 fine).
+
+    kv == tp is deliberately EXCLUDED, and a `<` -> `<=` flip was tried and
+    REVERTED on measurement -- do not repeat it. At kv == tp the kv-boundary
+    alignment has groups == ranks, so the only non-straddling q split is the
+    even one (`_partition_units_kv_aligned` returns the raw split at
+    `groups >= n`, and the #105 uniform-GQA ragged kernel then rejects any
+    straddling split at the FIRST FORWARD). Measured on Qwen3.5-2B
+    (q=8/kv=2, TP=2, --rank-tp-ratio 11,21):
+
+      * with `<=`: REPLICATED-KV engaged, q split [2, 6], KV cache
+        duplicated per rank, boot green -- then
+        "ValueError: REPLICATED-KV current-chunk attention (#105): ...
+        q heads (offset 2, 6 heads over 2 local kv slots) straddle a global
+        kv-head boundary" on the first request. Strictly worse.
+      * with `<` (this code): normal mode, even [4, 4] attention split, the
+        non-uniform plan applied to every OTHER dimension, output coherent
+        and token-identical to TP=1, no KV duplication.
+
+    Truly uneven attention at kv == tp needs a ragged kernel that supports
+    per-rank non-uniform GQA mapping (the #169 head-gather family), not a
+    threshold flip."""
+    return tp_plan_active(tp_size) and total_num_kv_heads < tp_size
+
+
+def attn_q_partition_units(
+    total_num_q_heads: int, total_num_kv_heads: int, tp_size: int
+) -> int:
+    """Unit count for partitioning the attention q heads (and everything
+    partitioned proportionally to them: qkv q-block, o_proj input) under an
+    uneven-TP plan.
+
+    Normal mode (kv >= tp): kv heads are the indivisible units — every rank
+    gets whole GQA groups. REPLICATED-KV mode (kv < tp): every rank holds
+    ALL kv heads, so q splits in units of kv_total heads (unit count =
+    q_total // kv_total = the GQA group size), keeping per-rank
+    num_qo % num_kv == 0 for the attention kernels.
+
+    `total_num_q_heads` must be the REAL q-head count (not a fused
+    q+gate slot count) — callers with fused projections pass the real count
+    and scale sizes themselves (the unit COUNT is fusion-invariant)."""
+    if not attn_kv_replicated(tp_size, total_num_kv_heads):
+        # Normal (or default-path) geometry: kv heads as the units. No
+        # divisibility demands here — the default even path never reaches
+        # unit-based partitioning at all.
+        return total_num_kv_heads
+    if total_num_q_heads % total_num_kv_heads != 0:
+        raise ValueError(
+            f"REPLICATED-KV geometry: total_num_q_heads "
+            f"({total_num_q_heads}) must be a multiple of "
+            f"total_num_kv_heads ({total_num_kv_heads})."
+        )
+    units = total_num_q_heads // total_num_kv_heads
+    if units < tp_size:
+        raise ValueError(
+            f"REPLICATED-KV geometry: cannot split {total_num_q_heads} q "
+            f"heads over {tp_size} ranks in units of {total_num_kv_heads} "
+            f"(= kv_total) heads: only {units} units (< {tp_size} ranks). "
+            f"tp_size must not exceed the GQA group size "
+            f"({total_num_q_heads}/{total_num_kv_heads}={units})."
+        )
+    return units
+
+
+def attn_replicated_kv_local_head(
+    total_num_q_heads: int, total_num_kv_heads: int, tp_size: int, tp_rank: int
+) -> Optional[int]:
+    """The ONE kv head this rank's q heads attend to under the REPLICATED-KV
+    geometry (kv < tp, uneven plan), or None when the geometry does not apply.
+
+    fn5i/fn5m 19.09. (Qwen3.8-Flash-Next, 24 q / 2 kv heads, plan [39,13,12]
+    -> q heads 0-11 / 12-17 / 18-23): every rank holds BOTH kv heads, and the
+    attention kernels group LOCALLY (``q_local // (hq_local // hkv)``), so rank
+    0 paired its heads 6-11 with kv head 1 and ranks 1/2 paired their first
+    heads with kv head 0 -- although the model's GQA grouping is
+    ``global_head // (H // KV)`` (0-11 -> kv 0, 12-23 -> kv 1). The DCP
+    head-all-gather decode path computes all 24 heads globally and was right;
+    every rank-local path (the NEXTN draft, the prefix-free prefill) was not.
+    The kv-aligned split (task #116) guarantees a rank never straddles a kv
+    group, so the rank needs exactly this one head; a straddling split is
+    refused by name."""
+    if not tp_plan_active(tp_size) or not attn_kv_replicated(
+        tp_size, total_num_kv_heads
+    ):
+        return None
+    units = attn_q_partition_units(total_num_q_heads, total_num_kv_heads, tp_size)
+    groups = attn_q_partition_groups(total_num_kv_heads, tp_size)
+    sizes = tp_partition_sizes(total_num_q_heads, tp_size, units, None, groups)
+    offset = sum(sizes[:tp_rank])
+    group = total_num_q_heads // total_num_kv_heads
+    first = offset // group
+    last = (offset + sizes[tp_rank] - 1) // group
+    if first != last:
+        raise ValueError(
+            f"REPLICATED-KV geometry: rank {tp_rank} holds q heads "
+            f"{offset}..{offset + sizes[tp_rank] - 1}, which straddle the kv "
+            f"groups {first} and {last} (group size {group}); a rank-local "
+            "attention needs a single kv head per rank."
+        )
+    return first
+
+
+def draft_rank_local_single_kv_head(
+    is_draft_model: bool, total_num_kv_heads: int, tp_size: int
+) -> bool:
+    """Whether a draft model's KV pool holds ONE kv head per rank: the NEXTN
+    draft runs rank-local (its pool is replicated, no DCP), so under the
+    REPLICATED-KV geometry it stores only the kv head its q heads attend to
+    (see attn_replicated_kv_local_head)."""
+    return bool(
+        is_draft_model
+        and tp_plan_active(tp_size)
+        and attn_kv_replicated(tp_size, total_num_kv_heads)
+    )
+
+
+def attn_q_partition_groups(total_num_kv_heads: int, tp_size: int) -> Optional[int]:
+    """kv-group count to pass as `groups` when partitioning the Q dimension
+    (task #116). Returns `total_num_kv_heads` under the REPLICATED-KV
+    geometry (kv < tp), so the q-head split is constrained to never straddle
+    a global kv-head-group boundary (the #105 ragged kernel cannot represent
+    a straddling split). Returns None otherwise — the default/even path and
+    the normal kv >= tp uneven split, where whole-kv-head units already keep
+    every rank inside whole GQA groups, so no alignment constraint applies
+    and the split stays byte-identical.
+
+    This is THE single source of the Q-dimension `groups` value; the QKV q
+    block, the o_proj input, and the attention backends must all derive their
+    `groups` from it so their shards agree (a mismatch would mis-shard
+    o_proj). It is cross-checked at layer construction (q_shard_groups)."""
+    if not attn_kv_replicated(tp_size, total_num_kv_heads):
+        return None
+    return total_num_kv_heads
+
+
+def tp_loaded_shard_start(
+    loaded_full: int,
+    tp_size: Optional[int],
+    rank: int,
+    shard_size: int,
+    units: Optional[int] = None,
+    family: Optional[str] = None,
+    groups: Optional[int] = None,
+) -> int:
+    """Start offset when narrowing a full checkpoint dimension of
+    `loaded_full` elements down to this rank's shard of `shard_size`.
+
+    Even TP (no ratio plan installed, or the plan does not match
+    `tp_size`): `rank * shard_size` -- the classic formula, bit-for-bit
+    the previous behavior. Uneven TP (--rank-tp-ratio): the prefix sum of
+    the per-rank partition sizes (with `units` = the dimension's
+    indivisible unit count, e.g. kv heads); the given `shard_size` must
+    match this rank's partition, which cross-checks the parameter shape
+    against the plan.
+
+    `tp_size=None` means "derive from the plan" (callers such as the
+    parameter-class loaders that only know the rank); with no plan
+    installed this still degrades to `rank * shard_size`. `family`
+    selects a named family plan (falling back to the base vector) and
+    must match the family the owning layer partitioned with.
+    """
+    ratios = get_tp_partition_ratios(family)
+    if not ratios or (tp_size is not None and len(ratios) != tp_size):
+        return rank * shard_size
+    if shard_size == loaded_full:
+        # Fully replicated component: every rank loads the whole
+        # checkpoint dimension.
+        return 0
+    sizes = partition_sizes(loaded_full, ratios, units, groups)
+    if sizes[rank] != shard_size:
+        raise ValueError(
+            f"uneven-TP shard mismatch: expected size {sizes[rank]} for "
+            f"rank {rank} of dimension {loaded_full} under weight vector "
+            f"{list(ratios)} (units={units}, groups={groups}), but the "
+            f"parameter shard has {shard_size}."
+        )
+    return sum(sizes[:rank])
+
+
+def solve_unit_rebalance_multi(
+    free_bytes: Sequence[float],
+    bytes_per_token: Sequence[float],
+    families: dict,
+    min_units: int = 1,
+) -> Tuple[dict, int]:
+    """Maximin solver for the uneven-TP self-calibration over one or
+    more weight FAMILIES (the dense-MLP "mlp" family and the
+    expert-weight "moe" family): find the per-rank unit counts per
+    family that maximize the MINIMUM token capacity.
+
+    `families` maps a family name to (units, bytes_per_unit): rank r
+    currently owns units[r] units of that family; every unit it sheds
+    frees bytes_per_unit[r] weight bytes (measured empirically as the
+    rank's family parameter bytes divided by its unit count), which
+    become KV budget. Rank r's profiled KV byte budget is free_bytes[r]
+    and one KV token costs bytes_per_token[r] (both rank-local —
+    per-token bytes scale with the rank's kv-head share):
+
+        capacity_r = (free[r] + sum_f shed_units_f[r] * bpu_f[r])
+                     / bytes_per_token[r]
+
+    Since the scheduler's single max_total_num_tokens is the MIN over
+    ranks, the objective is maximin. Greedy over single units suffices:
+    the minimum only ever rises when the pinned (capacity-poorest) rank
+    sheds a unit, so iteratively move — in whichever family raises the
+    minimum most — one unit from the pinned rank to the rank that stays
+    capacity-richest after receiving it, as long as the minimum strictly
+    increases. Every rank keeps >= min_units units per family
+    (partition_units requires >= 1 per rank).
+
+    Conservation law: moving weight bytes between ranks leaves
+    sum(free) unchanged, so the achievable maximin is bounded by
+    sum(free) / sum(bytes_per_token) — the pure-TP balance point.
+    Additional families do NOT raise that ceiling; they supply the
+    shiftable weight mass needed to actually reach it (on MoE models
+    the dense-MLP family alone is usually too small).
+
+    Returns (new_units_by_family, projected_min_tokens).
+    """
+    n = len(free_bytes)
+    if n != len(bytes_per_token):
+        raise ValueError(
+            "solve_unit_rebalance: input vectors must have equal length, "
+            f"got {len(free_bytes)}/{len(bytes_per_token)}."
+        )
+    if any(b <= 0 for b in bytes_per_token):
+        raise ValueError(
+            "solve_unit_rebalance: bytes_per_token must be positive; got "
+            f"bytes_per_token={list(bytes_per_token)}."
+        )
+    fams: dict = {}
+    for name, (units, bytes_per_unit) in families.items():
+        if not (n == len(units) == len(bytes_per_unit)):
+            raise ValueError(
+                "solve_unit_rebalance: input vectors must have equal "
+                f"length, got {len(units)}/{len(bytes_per_unit)} for "
+                f"family {name!r} vs {n} ranks."
+            )
+        if any(u < min_units for u in units):
+            raise ValueError(
+                f"solve_unit_rebalance: every rank must own >= "
+                f"{min_units} unit(s) of family {name!r}; got "
+                f"units={list(units)}."
+            )
+        fams[name] = (list(units), list(bytes_per_unit))
+
+    u = {name: list(units) for name, (units, _) in fams.items()}
+
+    def capacity(r: int) -> float:
+        freed = sum((fams[name][0][r] - u[name][r]) * fams[name][1][r] for name in fams)
+        return (free_bytes[r] + freed) / bytes_per_token[r]
+
+    while fams:
+        caps = [capacity(r) for r in range(n)]
+        cur_min = min(caps)
+        donor = min(range(n), key=lambda r: (caps[r], r))
+        # Try a one-unit move in every family; commit the move that
+        # raises the minimum most.
+        best = None  # (new_min, family, receiver)
+        for name in fams:
+            if u[name][donor] <= min_units:
+                continue
+            bpu = fams[name][1]
+            # Receiver: the rank that remains capacity-richest after
+            # taking on the unit's weight bytes (hurts maximin least).
+            receiver = max(
+                (r for r in range(n) if r != donor),
+                key=lambda r: (
+                    (
+                        free_bytes[r]
+                        + sum((fams[f][0][r] - u[f][r]) * fams[f][1][r] for f in fams)
+                        - bpu[r]
+                    )
+                    / bytes_per_token[r],
+                    -r,
+                ),
+            )
+            u[name][donor] -= 1
+            u[name][receiver] += 1
+            new_min = min(capacity(r) for r in range(n))
+            u[name][donor] += 1
+            u[name][receiver] -= 1
+            if new_min > cur_min and (best is None or new_min > best[0]):
+                best = (new_min, name, receiver)
+        if best is None:
+            break
+        _, name, receiver = best
+        u[name][donor] -= 1
+        u[name][receiver] += 1
+
+    projected = int(min(capacity(r) for r in range(n))) if n else 0
+    return u, projected
+
+
+def solve_unit_rebalance(
+    free_bytes: Sequence[float],
+    bytes_per_token: Sequence[float],
+    units: Sequence[int],
+    bytes_per_unit: Sequence[float],
+    min_units: int = 1,
+) -> Tuple[list, int]:
+    """Single-family convenience wrapper around
+    solve_unit_rebalance_multi (see there for the capacity model).
+
+    Returns (new_units, projected_min_tokens)."""
+    new_units, projected = solve_unit_rebalance_multi(
+        free_bytes,
+        bytes_per_token,
+        {"_": (units, bytes_per_unit)},
+        min_units=min_units,
+    )
+    return new_units["_"], projected
+
+
+def suggest_unit_rebalance_multi(
+    free_bytes: Sequence[float],
+    bytes_per_token: Sequence[float],
+    families: dict,
+    imbalance_threshold: float = 1.10,
+) -> Optional[Tuple[dict, int, int]]:
+    """Decide whether shifting family units between uneven-TP ranks
+    would meaningfully raise the (MIN-synced) KV token capacity.
+
+    `families` maps a family name to (units, family_bytes) per rank —
+    the values gathered after rank-local KV profiling (bytes_per_unit is
+    derived as family_bytes / units per rank). Families with degenerate
+    inputs (zero units or zero bytes on any rank) are dropped rather
+    than blocking the calibration of the remaining families.
+
+    Returns None when the capacities are already balanced (max/min <=
+    imbalance_threshold), when nothing can be calibrated, or when the
+    solver finds no strictly better partition. Otherwise returns
+    (new_units_by_family, current_min_tokens, projected_min_tokens);
+    new_units_by_family only contains families whose vector CHANGED.
+    """
+    n = len(free_bytes)
+    if n < 2 or n != len(bytes_per_token):
+        return None
+    if any(f < 0 for f in free_bytes) or any(b <= 0 for b in bytes_per_token):
+        return None
+    usable = {}
+    for name, (units, family_bytes) in families.items():
+        if len(units) != n or len(family_bytes) != n:
+            continue
+        if any(u <= 0 for u in units) or any(b <= 0 for b in family_bytes):
+            continue
+        usable[name] = (
+            list(units),
+            [family_bytes[r] / units[r] for r in range(n)],
+        )
+    if not usable:
+        return None
+    capacities = [free_bytes[r] / bytes_per_token[r] for r in range(n)]
+    cur_min = min(capacities)
+    if cur_min <= 0:
+        return None
+    if max(capacities) / cur_min <= imbalance_threshold:
+        return None
+    new_units, projected = solve_unit_rebalance_multi(
+        free_bytes, bytes_per_token, usable
+    )
+    changed = {name: vec for name, vec in new_units.items() if vec != usable[name][0]}
+    if not changed or projected <= int(cur_min):
+        return None
+    return changed, int(cur_min), projected
+
+
+def suggest_unit_rebalance(
+    free_bytes: Sequence[float],
+    bytes_per_token: Sequence[float],
+    units: Sequence[int],
+    family_bytes: Sequence[float],
+    imbalance_threshold: float = 1.10,
+) -> Optional[Tuple[list, int, int]]:
+    """Single-family convenience wrapper around
+    suggest_unit_rebalance_multi (see there for semantics).
+
+    Returns None or (new_units, current_min_tokens, projected)."""
+    result = suggest_unit_rebalance_multi(
+        free_bytes,
+        bytes_per_token,
+        {"_": (units, family_bytes)},
+        imbalance_threshold=imbalance_threshold,
+    )
+    if result is None:
+        return None
+    changed, cur_min, projected = result
+    return changed["_"], cur_min, projected
+
+
+def split_tensor_along_last_dim(
+    tensor: torch.Tensor,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+) -> Sequence[torch.Tensor]:
+    """Split a tensor along its last dimension.
+
+    Arguments:
+        tensor: input tensor.
+        num_partitions: number of partitions to split the tensor
+        contiguous_split_chunks: If True, make each chunk contiguous
+                                 in memory.
+
+    Returns:
+        A list of Tensors
+    """
+    # Get the size and dimension.
+    last_dim = tensor.dim() - 1
+    last_dim_size = divide(tensor.size()[last_dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
+    # NOTE: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+
+#: Per-stage explicit LAYER SETS, as an alternative to the contiguous
+#: ``FLLIPER_PP_LAYER_PARTITION`` counts. Stages are separated by ``;`` and each
+#: stage is a comma list of ranges and singletons:
+#:
+#:     FLLIPER_PP_LAYER_SET="0-2,4-6,8-10;3,7,11"
+#:
+#: Why this exists: a stage has always been an INTERVAL here
+#: (``start = sum(partitions[:pp_rank])`` below), so a family placement that
+#: puts, say, every linear-attention layer on one card and the interleaved
+#: full-attention layers on others is not expressible at all. That is an
+#: ADDRESSING limit, independent of any transport.
+#:
+#: The count form is untouched and remains the default: with this variable
+#: unset, every code path below is byte-identical to what it was.
+PP_LAYER_SET_ENV = "FLLIPER_PP_LAYER_SET"
+
+#: #753: the mid-loop crossing wire. A gapped layer set is only safe when the
+#: forward loop exchanges activations at every ownership boundary; without the
+#: wire a stage runs its own layers back to back and silently skips the peer's.
+#: Set this only when the wire is actually carrying the crossings.
+PP_CROSSING_WIRE_ENV = "FLLIPER_PP_CROSSING_WIRE"
+
+
+def pp_crossing_wire_enabled() -> bool:
+    """True when the #753 mid-loop crossing wire is switched on."""
+    return os.getenv(PP_CROSSING_WIRE_ENV, "") not in ("", "0", "false", "False")
+
+
+#: #753: the escape hatch for the KNOWN-WRONG gapped forward. Set it to
+#: investigate the defect; it is the only way to reach a gapped forward, and it
+#: says in its own name that what it produces is not to be trusted.
+#:
+#: It lives HERE, beside the layer-set parser, rather than in the scheduler
+#: that raises on it, because two readers need the same condition and only one
+#: of them can import the scheduler: the runtime gate
+#: (``scheduler_pp_mixin._refuse_known_wrong_gapped_forward``) and the LAUNCH
+#: solver, which must not rank a layout the runtime will refuse to serve.
+#: One predicate, one reader of the variable.
+PP_GAPPED_KNOWN_WRONG_ENV = "FLLIPER_PP_GAPPED_ALLOW_KNOWN_WRONG"
+
+
+def pp_gapped_forward_known_wrong_allowed() -> bool:
+    """True when the operator has switched the #753 correctness refusal off."""
+    return os.getenv(PP_GAPPED_KNOWN_WRONG_ENV, "") not in ("", "0", "false", "False")
+
+
+
+class PPLayerSetError(ValueError):
+    """A layer-set map that cannot be used. Always names the offending layers."""
+
+
+def _parse_layer_spec(spec: str) -> List[int]:
+    """One stage's ``0-2,4,7-9`` into a sorted list. Duplicates are kept so the
+    caller can report them rather than silently absorbing them."""
+    out: List[int] = []
+    for piece in spec.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            lo_s, _, hi_s = piece.partition("-")
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError as err:
+                raise PPLayerSetError(
+                    f"{PP_LAYER_SET_ENV}: {piece!r} is not a range of integers"
+                ) from err
+            if hi < lo:
+                raise PPLayerSetError(
+                    f"{PP_LAYER_SET_ENV}: range {piece!r} runs backwards"
+                )
+            out.extend(range(lo, hi + 1))
+        else:
+            try:
+                out.append(int(piece))
+            except ValueError as err:
+                raise PPLayerSetError(
+                    f"{PP_LAYER_SET_ENV}: {piece!r} is not an integer layer id"
+                ) from err
+    return out
+
+
+def parse_pp_layer_sets(
+    raw: str, num_hidden_layers: int, pp_size: int, *, allow_gapped: bool = False
+) -> List[FrozenSet[int]]:
+    """Parse and VALIDATE the per-stage layer sets.
+
+    The validation is the point. A partition that is merely "probably right"
+    produces a model where some layer is computed twice or never, and both are
+    silent: a duplicated layer just costs time, and a missing one is a
+    placeholder pass-through that returns its input unchanged. So every failure
+    below names the exact layers involved.
+
+    CONTIGUITY (#753). A stage may own a NON-CONTIGUOUS set only when the
+    caller passes ``allow_gapped=True``, which is how the mid-loop crossing
+    wire declares it can carry one. The default refuses, and the default is
+    the safe reading rather than the convenient one:
+    ``qwen3_5.py:1466-1518`` exchanges ``pp_proxy_tensors`` ONCE per rank, at
+    the stage boundary. A rank owning ``{2, 4}`` therefore runs layer 2
+    straight into layer 4 with layer 3 -- computed on a peer -- never
+    exchanged. Nothing raises. The model returns fluent, confidently wrong
+    output, which is the failure shape this whole file exists to prevent.
+
+    ``allow_gapped`` deliberately relaxes ONLY contiguity. Coverage, range and
+    single-ownership hold either way: a gapped set is admissible with the wire,
+    a set that loses or duplicates a layer never is.
+    """
+    stages = [seg for seg in raw.split(";")]
+    if len(stages) != pp_size:
+        raise PPLayerSetError(
+            f"{PP_LAYER_SET_ENV}: {len(stages)} stage(s) given but pp_size is "
+            f"{pp_size}. Separate stages with ';'."
+        )
+    parsed = [_parse_layer_spec(seg) for seg in stages]
+
+    seen: Dict[int, int] = {}
+    duplicated: Dict[int, List[int]] = {}
+    for rank, layers in enumerate(parsed):
+        for layer in layers:
+            if layer in seen:
+                duplicated.setdefault(layer, [seen[layer]]).append(rank)
+            else:
+                seen[layer] = rank
+    if duplicated:
+        detail = "; ".join(
+            f"layer {layer} on stages {sorted(set(ranks))}"
+            for layer, ranks in sorted(duplicated.items())
+        )
+        raise PPLayerSetError(
+            f"{PP_LAYER_SET_ENV}: a layer may be owned by exactly one stage, "
+            f"but {detail}. A duplicated layer is computed twice and nothing "
+            f"downstream would say so."
+        )
+
+    out_of_range = sorted(l for l in seen if l < 0 or l >= num_hidden_layers)
+    if out_of_range:
+        raise PPLayerSetError(
+            f"{PP_LAYER_SET_ENV}: layer(s) {out_of_range} are outside "
+            f"[0, {num_hidden_layers})."
+        )
+
+    missing = sorted(set(range(num_hidden_layers)) - set(seen))
+    if missing:
+        raise PPLayerSetError(
+            f"{PP_LAYER_SET_ENV}: layer(s) {missing} are owned by no stage. "
+            f"An unowned layer is a pass-through placeholder at run time, so "
+            f"the model would answer with that layer silently skipped."
+        )
+
+    # #1244 THE PIPELINE'S TWO ENDS. Layer 0's input comes from the embedding
+    # and the final layer's output goes to the head, and BOTH of those live on
+    # a stage chosen by RANK, not by ownership: `qwen3_5.py:1566` gives the
+    # embedding to `pp_group.is_first_rank` and `:1642` gives the final norm
+    # and the head to `pp_group.is_last_rank`. The crossing schedule takes the
+    # matching premise from the other side -- `pp_crossing_schedule.py:112`
+    # iterates `range(num_layers - 1)`, so the final layer's output crosses to
+    # NOBODY, "because its output leaves the pipeline for the head".
+    #
+    # THE HAZARD: those are two independent definitions of "the end of the
+    # model", and only contiguous ownership makes them name the same stage.
+    # A set may put the final layer anywhere. When it lands off the last rank,
+    # that layer's output is computed and then dropped -- the stage-boundary
+    # proxy that would otherwise have carried it is deliberately suppressed on
+    # the gapped path (`scheduler_pp_mixin.py:7765`) -- while the last rank
+    # normalises whatever its own last owned layer produced, i.e. a MID-STACK
+    # activation, and samples from it. Nothing raises: the tail of the model is
+    # silently amputated and the logits are fluent and confidently wrong, which
+    # is the exact failure shape this file exists to prevent.
+    #
+    # The mirror case at layer 0 does raise today (the model's entry branch
+    # refuses a non-first stage with neither a proxy nor a wire-delivered
+    # entry), but it raises on three ranks after the weights have loaded. One
+    # invariant, checked once, at the only place ownership is derived.
+    if num_hidden_layers > 0:
+        terminal = num_hidden_layers - 1
+        ends = []
+        if terminal not in parsed[pp_size - 1]:
+            ends.append(
+                f"the FINAL layer {terminal} is owned by stage "
+                f"{seen[terminal]}, but the final norm and the head live on "
+                f"the last stage ({pp_size - 1}); no crossing carries the "
+                f"final layer's output, so it would be computed and dropped "
+                f"while the last stage sampled from a mid-stack activation"
+            )
+        if 0 not in parsed[0]:
+            ends.append(
+                f"layer 0 is owned by stage {seen[0]}, but the token embedding "
+                f"lives on the first stage (0); that stage has no input to "
+                f"compute layer 0 from and no crossing can deliver one"
+            )
+        if ends:
+            raise PPLayerSetError(
+                f"{PP_LAYER_SET_ENV}: {'; and '.join(ends)}. A pipeline's two "
+                f"ends are fixed by RANK -- the embedding on the first stage, "
+                f"the head on the last -- so the layer set must put layer 0 on "
+                f"stage 0 and layer {terminal} on stage {pp_size - 1}. "
+                f"Contiguous ownership satisfies this by construction, which "
+                f"is why nothing checked it before a set could express "
+                f"otherwise."
+            )
+
+    if not allow_gapped:
+        gapped = []
+        for rank, layers in enumerate(parsed):
+            ordered = sorted(layers)
+            if not ordered:
+                continue
+            holes = sorted(set(range(ordered[0], ordered[-1] + 1)) - set(ordered))
+            if holes:
+                gapped.append((rank, ordered[0], ordered[-1], holes))
+        if gapped:
+            detail = "; ".join(
+                f"stage {rank} spans {lo}-{hi} but does not own "
+                f"{holes if len(holes) <= 8 else holes[:8] + ['...']}"
+                for rank, lo, hi, holes in gapped
+            )
+            raise PPLayerSetError(
+                f"{PP_LAYER_SET_ENV}: a stage's layers must be CONTIGUOUS "
+                f"without the mid-loop crossing wire, but {detail}. #753: the "
+                f"forward loop exchanges pp_proxy_tensors once per rank, at the "
+                f"stage boundary, so the layers this stage does not own are "
+                f"never received -- it would run its own layers back to back "
+                f"and answer fluently with the peer layers silently skipped. "
+                f"Refusing is the only safe reading until the wire lands; the "
+                f"wire enables this by passing allow_gapped=True."
+            )
+
+    return [frozenset(layers) for layers in parsed]
+
+
+def refuse_noncontiguous_layer_descriptor(local_slot_of, where: str) -> None:
+    """Refuse to build a layer descriptor that assumes contiguous ownership.
+
+    Disaggregated transfer describes a stage's layers as a contiguous
+    ``(start, end)`` pair -- either ``start_layer``/``end_layer`` directly, or a
+    start plus a layer COUNT -- and the receiving side slices its buffer lists
+    with it. Under ``FLLIPER_PP_LAYER_SET`` those bounds are ``min(owned)`` and
+    ``max(owned) + 1``, i.e. the SPAN, which for a stage owning
+    ``[35, 39, ..., 63]`` names 29 layers of which 21 are not owned.
+
+    No index translation repairs this: the descriptor has no way to carry a
+    set. A wrong descriptor mismatches KV buffers silently, so the unsupported
+    combination is refused where it is built rather than diagnosed later.
+    Carrying a layer set across the wire is an open design question -- see
+    docs/dev/DESIGN_pp_layer_set.md.
+
+    Passing ``None`` (contiguous ownership) is a no-op.
+    """
+    if local_slot_of is None:
+        return None
+    raise NotImplementedError(
+        f"{where}: disaggregated KV transfer requires contiguous layer "
+        "ownership. The transfer descriptor carries a contiguous layer range, "
+        "which cannot express the non-contiguous set "
+        f"{sorted(local_slot_of)} owned by this stage under "
+        "FLLIPER_PP_LAYER_SET. Use contiguous PP partitioning for "
+        "disaggregated serving."
+    )
+
+
+def get_pp_layer_set(
+    num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> Optional[FrozenSet[int]]:
+    """This stage's owned layer ids, or ``None`` when the set form is unused.
+
+    ``None`` is the default and means "ask ``get_pp_indices``" -- it is what
+    keeps the contiguous path byte-identical.
+    """
+    raw = os.getenv(PP_LAYER_SET_ENV, None)
+    if raw is None or not raw.strip():
+        return None
+    # #754, folded into #753 because it is the SAME resolution seam. The env is
+    # process-wide, but this function is called again by the TP stack during a
+    # phase flip -- with pp_size=1, where a 3-stage string is not merely
+    # inapplicable but invalid, and parse_pp_layer_sets refused it by stage
+    # count ("3 stage(s) given but pp_size is 1"). A single stage owns every
+    # layer, so the set form has nothing to express: answering None hands the
+    # caller back to get_pp_indices, which is the correct contiguous answer
+    # rather than a suppressed error.
+    if pp_size <= 1:
+        return None
+    # #753: a gapped set is admissible only when the crossing wire is on.
+    # The refusal lives in parse_pp_layer_sets and names why.
+    return parse_pp_layer_sets(
+        raw, num_hidden_layers, pp_size, allow_gapped=pp_crossing_wire_enabled()
+    )[pp_rank]
+
+
+def current_stage_layer_set() -> Optional[FrozenSet[int]]:
+    """This stage's owned layer ids, read from the live process group.
+
+    ``None`` on the contiguous path, which is what lets every caller degenerate
+    to the interval arithmetic it replaces. Kept HERE, next to
+    ``get_pp_layer_set``, so ownership has exactly one derivation -- the same
+    argument ``memory_pool._owned_layers_for_pool`` makes and which that
+    function now defers to rather than restating.
+    """
+    raw = os.getenv(PP_LAYER_SET_ENV, None)
+    if raw is None or not raw.strip():
+        # Contiguous path: nothing to resolve, and no reason to touch the
+        # process group at all.
+        return None
+    try:
+        from flliper.srt.distributed import get_pp_group
+    except Exception:  # pragma: no cover - import shape varies in unit tests
+        return None
+    try:
+        group = get_pp_group()
+        num_layers = getattr(group, "num_hidden_layers", None)
+        if num_layers is None:
+            # No caller stamps ``num_hidden_layers`` onto the group object, so
+            # returning None here made the set form UNREACHABLE on metal and
+            # every consumer silently degraded to the span test -- exactly the
+            # 15-vs-0 PP0 arena defect this function exists to prevent
+            # (measured 2026-08-18 17:30: PP0 reserved 22.6 GiB from a
+            # cell_size=0 configurator). The layer count is recoverable from
+            # the set string itself: parse_pp_layer_sets requires the union to
+            # cover [0, N) with no gaps, so N is exactly max(layer) + 1.
+            num_layers = _num_layers_from_layer_set_raw(raw)
+            if num_layers is None:
+                return None
+        return get_pp_layer_set(num_layers, group.rank_in_group, group.world_size)
+    except Exception:  # pragma: no cover - no process group in unit tests
+        return None
+
+
+def _num_layers_from_layer_set_raw(raw: str) -> Optional[int]:
+    """``max(layer) + 1`` over every layer named in a raw layer-set string.
+
+    Exact for every string ``parse_pp_layer_sets`` accepts (full cover of
+    ``[0, N)`` is enforced there); None on anything unparseable, so the caller
+    degrades the same way it would on a missing env.
+    """
+    highest = -1
+    try:
+        for stage in raw.split(";"):
+            for tok in stage.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if "-" in tok:
+                    _, hi = tok.split("-", 1)
+                    highest = max(highest, int(hi))
+                else:
+                    highest = max(highest, int(tok))
+    except ValueError:
+        return None
+    return highest + 1 if highest >= 0 else None
+
+
+def pp_gapped_ownership_active(pp_world_size: int) -> bool:
+    """True when THIS run needs the mid-loop crossing wire to be correct.
+
+    Three conditions, all required: a layer set is configured, the wire is
+    switched on, and at least one stage's ownership is actually non-contiguous.
+    A contiguous set expressed through the set mechanism (DESIGN §9.1 step 1)
+    is deliberately NOT gapped -- it is carried by the ordinary stage-boundary
+    transport, and reporting it as gapped would move it onto a protocol it does
+    not need.
+
+    Callers use this to choose a PROTOCOL, not merely to log, so it answers
+    False on anything it cannot parse: an unreadable set already fails loudly
+    in ``parse_pp_layer_sets`` at model build, and guessing "gapped" here would
+    disable the stage-boundary handoff for a run whose ownership is unknown.
+    """
+    if pp_world_size is None or int(pp_world_size) <= 1:
+        return False
+    if not pp_crossing_wire_enabled():
+        return False
+    raw = os.getenv(PP_LAYER_SET_ENV, None)
+    if raw is None or not raw.strip():
+        return False
+    num_layers = _num_layers_from_layer_set_raw(raw)
+    if num_layers is None:
+        return False
+    try:
+        owned = parse_pp_layer_sets(
+            raw, num_layers, int(pp_world_size), allow_gapped=True
+        )
+    except Exception:  # noqa: BLE001 - see docstring: unparseable is not gapped
+        return False
+    for stage in owned:
+        if not stage:
+            continue
+        lo, hi = min(stage), max(stage)
+        if len(stage) != hi - lo + 1:
+            return True
+    return False
+
+
+#: "not supplied", so that an explicit ``owned=None`` can mean the CONTIGUOUS
+#: path rather than "look it up". A plain None default could not express both.
+_ASK_THE_GROUP = object()
+
+
+def stage_owned_layer_ids(
+    all_attn_layer_ids, start_layer: int, end_layer: int, owned=_ASK_THE_GROUP
+) -> List[int]:
+    """The full-attention layers THIS stage owns. Set-aware.
+
+    THE INTERVAL IS THE SPAN, NOT THE SET, and treating it as the set is the
+    consumer error ``get_pp_indices``' own docstring warns about: under
+    ``FLLIPER_PP_LAYER_SET``, ``start_layer``/``end_layer`` are ``min(owned)``
+    and ``max(owned) + 1``, so for the stage owning ``[35, 39, ..., 63]`` the
+    interval names 29 layers of which 21 belong to someone else.
+
+    MEASURED COST OF GETTING THIS WRONG, gapped boot v6, 2026-08-18 16:03:07Z.
+    The set was
+
+        PP0  0-2,4-6,...,60-62     48 GDN layers, span [0, 63)
+        PP1  3,7,11,15,19,23,27,31  8 full-attention layers
+        PP2  35,39,43,47,51,55,59,63
+
+    so the 16 full-attention layers are 3, 7, ... 63 and PP0 owns NONE of them.
+    The interval test ``0 <= i < 63`` matched FIFTEEN of them on PP0, and the
+    KV VMM arena was reserved for all fifteen:
+
+        PP0  30 buffers -> 22.56 GiB   (logged "reserved=22.6 GiB")
+        PP1  16 buffers -> 12.03 GiB   (logged "reserved=12.0 GiB")
+        PP2  16 buffers -> 12.03 GiB
+
+    On a 32.6 GiB card already holding 27.1 GiB that is 49.70 GiB, and the
+    driver refused the next ``cuMemCreate``. The sizing CHAIN was not at fault
+    and neither was the token count -- all three stages sized from the same
+    754019-token universe. The stage's own configurator had already computed
+    ``cell_size=0`` for PP0, i.e. it agreed PP0 carries no full-attention KV;
+    the pool disagreed by fifteen layers, and the pool is the one that
+    allocates. This function is what makes them agree.
+
+    A stage owning zero full-attention layers is therefore a legitimate,
+    reachable configuration, not an error: it gets an empty list, no KV
+    buffers, and an arena of one granularity page.
+
+    Byte-identical on every contiguous layout -- ``current_stage_layer_set``
+    returns ``None`` there and the interval test below is exact, because span
+    and set coincide.
+
+    ``owned`` is injectable so the resolution can be tested against the
+    specimen's own layer set without a process group; left alone it is read
+    from the live one.
+    """
+    if owned is _ASK_THE_GROUP:
+        owned = current_stage_layer_set()
+    if owned is not None:
+        return [i for i in all_attn_layer_ids if i in owned]
+    return [i for i in all_attn_layer_ids if start_layer <= i < end_layer]
+
+
+def get_pp_indices(
+    num_hidden_layers: int, pp_rank: int, pp_size: int
+) -> Tuple[int, int]:
+    """Try to evenly distribute layers across partitions.
+    If the number of layers is not divisible by the number of partitions,
+    the last N partitions will have one extra layer, where N = remainder.
+    """
+    # partition_list_str can be set to None in flliper
+    partition_list_str = os.getenv("FLLIPER_PP_LAYER_PARTITION", None)
+    if partition_list_str is not None:
+        try:
+            partitions = [int(layer) for layer in partition_list_str.split(",")]
+        except ValueError as err:
+            raise ValueError(
+                "Invalid partition string: {}".format(partition_list_str)
+            ) from err
+        if len(partitions) != pp_size:
+            raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+        if sum(partitions) != num_hidden_layers:
+            raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
+        start_layer = sum(partitions[:pp_rank])
+        end_layer = start_layer + partitions[pp_rank]
+    else:
+        base_layers = num_hidden_layers // pp_size
+        remainder = num_hidden_layers % pp_size
+        # Distribute the extra layers to the last 'remainder' partitions
+        if pp_rank >= pp_size - remainder:
+            partitions_without_extra_layer = pp_size - remainder
+            # This partition gets one extra layer
+            start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
+            end_layer = start_layer + (base_layers + 1)
+        else:
+            # This partition gets only base layers
+            start_layer = pp_rank * base_layers
+            end_layer = start_layer + base_layers
+
+    return (start_layer, end_layer)
+
+
+def derive_pp_layer_split(
+    scores: List[int],
+    is_full_attention: Optional[List[bool]] = None,
+    num_hidden_layers: Optional[int] = None,
+    attn_scores: Optional[List[int]] = None,
+) -> List[int]:
+    """Derive per-stage layer counts from per-stage capability scores
+    (#201 slice 3 item 2, the --pp-stage-ratio planner).
+
+    ``scores`` are relative per-stage weights (analogous to
+    --rank-tp-ratio, but across pipeline stages). The split is contiguous
+    (stage boundaries only), like FLLIPER_PP_LAYER_PARTITION itself.
+
+    Hybrid awareness (the slice-2 finding, DESIGN_201 par. 13d): a hybrid
+    linear+full-attention model splits its KV after FULL-ATTENTION layers,
+    not after layers -- a planner reading num_hidden_layers alone mis-sizes
+    every hybrid. When ``is_full_attention`` marks a genuine hybrid
+    (0 < full < all), each boundary is first targeted proportionally in
+    LAYER space (compute tracks all layers) and then snapped into the
+    layer range that puts the score-proportional number of FULL-ATTENTION
+    layers on each side (KV mass tracks the scores too). For homogeneous
+    models the snap window is the whole axis and the split is the plain
+    proportional rounding.
+
+    ``attn_scores`` (#485) decouples the two families. Without it BOTH
+    targets are derived from ``scores``, so on a period-P hybrid the layer
+    target lands at ``P * target_full`` -- the bottom of the snap window --
+    whenever the cumulative fraction sits near a multiple of ``1/n_full``.
+    That single-number coupling, not the hardware, is why the reachable
+    splits on the 64-layer period-4 reference checkpoint looked quantized to
+    four layers (PROD_BRINGUP_BENCH.md sec. 1e). Passing a separate
+    ``attn_scores`` targets the FULL-ATTENTION mass (KV bytes, attention
+    bandwidth) while ``scores`` continues to target total layer mass
+    (weights, dense compute), so linear/GDN layers can move across a stage
+    boundary at zero KV cost. The two vectors are independent; the snap
+    window still guarantees the attention split is exactly the one
+    ``attn_scores`` asks for.
+
+    Refusals (never a silent even split -- the #202 lesson):
+      * fewer layers than stages;
+      * a hybrid stage that would end with ZERO full-attention layers
+        (its KV pool would be empty; give the stage a larger score or use
+        fewer stages).
+    """
+    if is_full_attention is not None:
+        n_layers = len(is_full_attention)
+        if num_hidden_layers is not None and num_hidden_layers != n_layers:
+            raise ValueError(
+                f"derive_pp_layer_split: num_hidden_layers={num_hidden_layers} "
+                f"disagrees with len(is_full_attention)={n_layers}."
+            )
+    elif num_hidden_layers is not None:
+        n_layers = num_hidden_layers
+        is_full_attention = [True] * n_layers
+    else:
+        raise ValueError(
+            "derive_pp_layer_split needs is_full_attention or num_hidden_layers."
+        )
+    n_stages = len(scores)
+    if n_stages < 1 or any((not isinstance(s, int)) or s < 1 for s in scores):
+        raise ValueError(
+            f"--pp-stage-ratio entries must be positive integers, got {scores}."
+        )
+    if n_layers < n_stages:
+        raise ValueError(
+            f"--pp-stage-ratio: {n_stages} stages cannot split "
+            f"{n_layers} layers (every stage needs at least one)."
+        )
+    if attn_scores is not None:
+        if len(attn_scores) != n_stages:
+            raise ValueError(
+                f"derive_pp_layer_split: attn_scores has {len(attn_scores)} "
+                f"entries but scores has {n_stages}."
+            )
+        if any((not isinstance(s, int)) or s < 1 for s in attn_scores):
+            raise ValueError(
+                f"--pp-attn-stage-ratio entries must be positive integers, "
+                f"got {attn_scores}."
+            )
+    total_score = sum(scores)
+    total_attn_score = sum(attn_scores) if attn_scores is not None else total_score
+    full_positions = [i for i, f in enumerate(is_full_attention) if f]
+    n_full = len(full_positions)
+    hybrid = 0 < n_full < n_layers
+
+    bounds: List[int] = []
+    prev = 0
+    cum_score = 0
+    cum_attn_score = 0
+    for i in range(n_stages - 1):
+        cum_score += scores[i]
+        cum_attn_score += attn_scores[i] if attn_scores is not None else scores[i]
+        target_layers = round(n_layers * cum_score / total_score)
+        if hybrid:
+            # #485: the attention target rides its OWN vector when one is
+            # given, so KV mass and layer mass are independent.
+            target_full = round(n_full * cum_attn_score / total_attn_score)
+            target_full = min(max(target_full, 0), n_full)
+            # All boundaries b with exactly target_full full-attention
+            # layers in [0, b): the window between the target_full-th and
+            # the following full-attention position.
+            lo = full_positions[target_full - 1] + 1 if target_full >= 1 else 0
+            hi = full_positions[target_full] if target_full < n_full else n_layers
+            boundary = min(max(target_layers, lo), hi)
+        else:
+            boundary = target_layers
+        # Contiguity floor/ceiling: at least one layer per stage on both
+        # sides of every boundary.
+        boundary = min(max(boundary, prev + 1), n_layers - (n_stages - 1 - i))
+        bounds.append(boundary)
+        prev = boundary
+    bounds.append(n_layers)
+
+    counts = [bounds[0]] + [bounds[i] - bounds[i - 1] for i in range(1, n_stages)]
+    if hybrid:
+        per_stage_full = []
+        start = 0
+        for count in counts:
+            per_stage_full.append(
+                sum(1 for p in full_positions if start <= p < start + count)
+            )
+            start += count
+        if any(f == 0 for f in per_stage_full):
+            zero_stage = per_stage_full.index(0)
+            raise ValueError(
+                f"--pp-stage-ratio {scores}: the derived split {counts} gives "
+                f"stage {zero_stage} zero of the model's {n_full} "
+                f"full-attention layers -- its KV pool would be empty. A "
+                f"hybrid model splits its KV after FULL-ATTENTION layers "
+                f"(#201 slice 2 finding); give stage {zero_stage} a larger "
+                f"score, use fewer stages, or pass --pp-layer-ratio "
+                f"explicitly."
+            )
+    return counts
+
+
+@dataclasses.dataclass
+class StatelessProcessGroup:
+    """A dataclass to hold a metadata store, and the rank, world_size of the
+    group. Only use it to communicate metadata between processes.
+    For data-plane communication, create NCCL-related objects.
+    """
+
+    rank: int
+    world_size: int
+    store: torch._C._distributed_c10d.Store
+    data_expiration_seconds: int = 3600  # 1 hour
+
+    # dst rank -> counter
+    send_dst_counter: Dict[int, int] = dataclasses.field(default_factory=dict)
+    # src rank -> counter
+    recv_src_counter: Dict[int, int] = dataclasses.field(default_factory=dict)
+    broadcast_send_counter: int = 0
+    broadcast_recv_src_counter: Dict[int, int] = dataclasses.field(default_factory=dict)
+
+    # A deque to store the data entries, with key and timestamp.
+    entries: Deque[Tuple[str, float]] = dataclasses.field(default_factory=deque)
+
+    def __post_init__(self):
+        assert self.rank < self.world_size
+        self.send_dst_counter = {i: 0 for i in range(self.world_size)}
+        self.recv_src_counter = {i: 0 for i in range(self.world_size)}
+        self.broadcast_recv_src_counter = {i: 0 for i in range(self.world_size)}
+
+    def send_obj(self, obj: Any, dst: int):
+        """Send an object to a destination rank."""
+        self.expire_data()
+        key = f"send_to/{dst}/{self.send_dst_counter[dst]}"
+        self.store.set(key, pickle.dumps(obj))
+        self.send_dst_counter[dst] += 1
+        self.entries.append((key, time.perf_counter()))
+
+    def expire_data(self):
+        """Expire data that is older than `data_expiration_seconds` seconds."""
+        while self.entries:
+            # check the oldest entry
+            key, timestamp = self.entries[0]
+            if time.perf_counter() - timestamp > self.data_expiration_seconds:
+                self.store.delete_key(key)
+                self.entries.popleft()
+            else:
+                break
+
+    def recv_obj(self, src: int) -> Any:
+        """Receive an object from a source rank."""
+        obj = pickle.loads(
+            self.store.get(f"send_to/{self.rank}/{self.recv_src_counter[src]}")
+        )
+        self.recv_src_counter[src] += 1
+        return obj
+
+    def broadcast_obj(self, obj: Optional[Any], src: int) -> Any:
+        """Broadcast an object from a source rank to all other ranks.
+        It does not clean up after all ranks have received the object.
+        Use it for limited times, e.g., for initialization.
+        """
+        if self.rank == src:
+            self.expire_data()
+            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
+            self.store.set(key, pickle.dumps(obj))
+            self.broadcast_send_counter += 1
+            self.entries.append((key, time.perf_counter()))
+            return obj
+        else:
+            key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
+            recv_obj = pickle.loads(self.store.get(key))
+            self.broadcast_recv_src_counter[src] += 1
+            return recv_obj
+
+    def all_gather_obj(self, obj: Any) -> list[Any]:
+        """All gather an object from all ranks."""
+        gathered_objs = []
+        for i in range(self.world_size):
+            if i == self.rank:
+                gathered_objs.append(obj)
+                self.broadcast_obj(obj, src=self.rank)
+            else:
+                recv_obj = self.broadcast_obj(None, src=i)
+                gathered_objs.append(recv_obj)
+        return gathered_objs
+
+    def barrier(self):
+        """A barrier to synchronize all ranks."""
+        for i in range(self.world_size):
+            if i == self.rank:
+                self.broadcast_obj(None, src=self.rank)
+            else:
+                self.broadcast_obj(None, src=i)
+
+    @staticmethod
+    def create(
+        host: str,
+        port: int,
+        rank: int,
+        world_size: int,
+        data_expiration_seconds: int = 3600,
+    ) -> "StatelessProcessGroup":
+        """A replacement for `torch.distributed.init_process_group` that does not
+        pollute the global state.
+
+        If we have process A and process B called `torch.distributed.init_process_group`
+        to form a group, and then we want to form another group with process A, B, C,
+        D, it is not possible in PyTorch, because process A and process B have already
+        formed a group, and process C and process D cannot join that group. This
+        function is a workaround for this issue.
+
+        `torch.distributed.init_process_group` is a global call, while this function
+        is a stateless call. It will return a `StatelessProcessGroup` object that can be
+        used for exchanging metadata. With this function, process A and process B
+        can call `StatelessProcessGroup.create` to form a group, and then process A, B,
+        C, and D can call `StatelessProcessGroup.create` to form another group.
+        """  # noqa
+        store = TCPStore(
+            host_name=host,
+            port=port,
+            world_size=world_size,
+            is_master=(rank == 0),
+        )
+
+        return StatelessProcessGroup(
+            rank=rank,
+            world_size=world_size,
+            store=store,
+            data_expiration_seconds=data_expiration_seconds,
+        )

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """DFLASH verify: vocab-parallel argmax instead of the [rows, vocab] logits
-all_gather (SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX, default off).
+all_gather (FLLIPER_DFLASH_VERIFY_VOCAB_ARGMAX, default off).
 
 Pinned on CPU:
 
@@ -32,14 +32,14 @@ from unittest import mock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
-from sglang.srt.layers import logits_processor as lp_mod  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
-from sglang.srt.speculative import dflash_worker_v2 as w  # noqa: E402
+from flliper.srt.layers import logits_processor as lp_mod  # noqa: E402
+from flliper.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from flliper.srt.speculative import dflash_worker_v2 as w  # noqa: E402
 
 
 def _split(full: torch.Tensor, widths, pad_last: int = 0):

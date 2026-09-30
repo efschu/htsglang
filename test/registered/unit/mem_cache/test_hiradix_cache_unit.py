@@ -6,16 +6,16 @@ from array import array
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import BlockStored, StorageMedium
-from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.disaggregation.kv_events import BlockStored, StorageMedium
+from flliper.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from flliper.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from flliper.srt.mem_cache.cache_init_params import CacheInitParams
+from flliper.srt.mem_cache.hiradix_cache import HiRadixCache
+from flliper.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from flliper.srt.mem_cache.radix_cache import RadixKey
+from flliper.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")

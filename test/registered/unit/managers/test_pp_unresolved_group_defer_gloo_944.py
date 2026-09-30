@@ -49,7 +49,7 @@ import unittest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=60)
 
@@ -115,7 +115,7 @@ class _FakeReq:
 
 
 def _make_holder(rank: int, wire: _RingWire, waiting_queue):
-    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+    from flliper.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
     h = types.SimpleNamespace(
         pp_group=wire,
@@ -158,14 +158,14 @@ class _Catcher(logging.Handler):
 def _worker(rank, init_file, out_dir, scenario, mutant, deliver=True):
     """One PP rank. Drives `rounds` full ring laps of ONE rid, where PP1 (and,
     under scenario 'all', every rank) can never resolve it."""
-    from sglang.srt.managers import pp_admission_congruence as pac
-    from sglang.srt.managers import scheduler_pp_mixin as spm_mod
+    from flliper.srt.managers import pp_admission_congruence as pac
+    from flliper.srt.managers import scheduler_pp_mixin as spm_mod
 
     res = {"rank": rank, "ok": False, "error": None}
     warn = _Catcher(logging.WARNING)
     err = _Catcher(logging.ERROR)
-    logging.getLogger("sglang.srt.managers.scheduler_pp_mixin").addHandler(warn)
-    logging.getLogger("sglang.srt.managers.pp_admission_congruence").addHandler(err)
+    logging.getLogger("flliper.srt.managers.scheduler_pp_mixin").addHandler(warn)
+    logging.getLogger("flliper.srt.managers.pp_admission_congruence").addHandler(err)
 
     if mutant:
         # (c) THE ONE EDIT THAT PUTS THE CLASS BACK: the miss goes out in the
@@ -205,8 +205,8 @@ def _worker(rank, init_file, out_dir, scenario, mutant, deliver=True):
             # request object and reads it back, before and after the binding
             # generation moves. Real processes, so "the generation is global"
             # cannot be confused with "I just wrote this object".
-            from sglang.srt.mem_cache import hicache_phase_binding as _hpb
-            from sglang.srt.managers.scheduler_pp_mixin import (
+            from flliper.srt.mem_cache import hicache_phase_binding as _hpb
+            from flliper.srt.managers.scheduler_pp_mixin import (
                 pp_mark_premise_dead,
                 pp_premise_is_dead,
             )
@@ -497,7 +497,7 @@ class FalsifierBCapExhaustionIsLoudNeverAHang(unittest.TestCase):
             )
 
     def test_the_defer_count_is_bounded_by_the_cap(self):
-        from sglang.srt.managers.pp_admission_congruence import UNRESOLVED_DEFER_CAP
+        from flliper.srt.managers.pp_admission_congruence import UNRESOLVED_DEFER_CAP
 
         res = _run("all")
         r0, _, _ = _require_clean(self, res)

@@ -3,12 +3,12 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.send_one import BenchArgs, send_one_prompt
-from sglang.test.test_utils import (
+from flliper.srt.environ import envs
+from flliper.srt.utils import kill_process_tree
+from flliper.test.ci.ci_register import register_amd_ci
+from flliper.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from flliper.test.send_one import BenchArgs, send_one_prompt
+from flliper.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -31,7 +31,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
         # Workaround: AITER custom all-gather corrupts CUDA-graph IPC buffer
         # registration and triggers a decode-time "Memory access fault" on
         # MI35x TP=8. Disable until the AITER-side fix lands (see PR body).
-        envs.SGLANG_USE_AITER_AG.set(False)
+        envs.FLLIPER_USE_AITER_AG.set(False)
 
         other_args = [
             "--tp",
@@ -99,9 +99,9 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
         cls.model = DEEPSEEK_R1_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-        envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
+        envs.FLLIPER_ENABLE_OVERLAP_PLAN_STREAM.set(True)
         # Same AITER custom all-gather workaround as TestDeepseekR1MXFP4 above.
-        envs.SGLANG_USE_AITER_AG.set(False)
+        envs.FLLIPER_USE_AITER_AG.set(False)
 
         other_args = [
             "--tp",

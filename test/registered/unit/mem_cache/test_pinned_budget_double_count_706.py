@@ -38,8 +38,8 @@ needs the credit.
 import unittest
 from unittest import mock
 
-from sglang.srt.mem_cache import pinned_host_budget
-from sglang.srt.mem_cache.pinned_host_budget import (
+from flliper.srt.mem_cache import pinned_host_budget
+from flliper.srt.mem_cache.pinned_host_budget import (
     PINNED_HOST_RESERVE_BYTES,
     PinnedHostPost,
     check_and_register_pinned_post,
@@ -47,7 +47,7 @@ from sglang.srt.mem_cache.pinned_host_budget import (
     joint_pinned_host_error,
     register_pinned_post,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5)
 

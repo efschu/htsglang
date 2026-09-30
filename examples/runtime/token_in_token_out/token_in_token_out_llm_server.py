@@ -7,14 +7,14 @@ python token_in_token_out_llm_server.py
 
 import requests
 
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.test_utils import is_in_ci
-from sglang.utils import terminate_process, wait_for_server
+from flliper.srt.utils.hf_transformers_utils import get_tokenizer
+from flliper.test.test_utils import is_in_ci
+from flliper.utils import terminate_process, wait_for_server
 
 if is_in_ci():
     from docs.backend.patch import launch_server_cmd
 else:
-    from sglang.utils import launch_server_cmd
+    from flliper.utils import launch_server_cmd
 
 
 MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
@@ -23,7 +23,7 @@ MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
 def main():
     # Launch the server
     server_process, port = launch_server_cmd(
-        f"python -m sglang.launch_server --model-path {MODEL_PATH} --skip-tokenizer-init --host 0.0.0.0"
+        f"python -m flliper.launch_server --model-path {MODEL_PATH} --skip-tokenizer-init --host 0.0.0.0"
     )
     wait_for_server(f"http://localhost:{port}", process=server_process)
 

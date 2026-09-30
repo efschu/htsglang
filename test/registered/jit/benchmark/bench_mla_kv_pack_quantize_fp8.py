@@ -8,17 +8,17 @@ import triton
 import triton.language as tl
 import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
+from flliper.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     DEFAULT_QUANTILES,
     get_benchmark_range,
 )
-from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import (
+from flliper.jit_kernel.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8 as hybrid_pack,
 )
-from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from flliper.jit_kernel.utils import is_arch_support_pdl
+from flliper.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
     est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

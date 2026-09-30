@@ -27,10 +27,10 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, IncLockRefResult
-from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.mem_cache.base_prefix_cache import DecLockRefParams, IncLockRefResult
+from flliper.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 from test_mamba_pin_budget_live_773 import (
     _build,
@@ -272,7 +272,7 @@ class TestTheReorderIsReachedFromCacheUnfinishedReq(CustomTestCase):
         # The #755 gate is opt-in; without it the reorder never fires and
         # this class would silently test the pre-port path.
         self._env = mock.patch.dict(
-            os.environ, {"SGLANG_MAMBA_SLOT_REORDER": "1"}, clear=False
+            os.environ, {"FLLIPER_MAMBA_SLOT_REORDER": "1"}, clear=False
         )
         self._env.start()
         self.addCleanup(self._env.stop)
@@ -280,8 +280,8 @@ class TestTheReorderIsReachedFromCacheUnfinishedReq(CustomTestCase):
     def _one_running_req_on_a_full_pool(self, backed: bool, mamba_pool_size: int = 2):
         from array import array
 
-        from sglang.srt.managers.schedule_batch import Req
-        from sglang.srt.sampling.sampling_params import SamplingParams
+        from flliper.srt.managers.schedule_batch import Req
+        from flliper.srt.sampling.sampling_params import SamplingParams
 
         from test_mamba_pin_budget_live_773 import _cache_one_finished_req
 

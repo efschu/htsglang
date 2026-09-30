@@ -1,4 +1,4 @@
-"""CudaGraphBufferRegistry fill contract + SGLANG_POISON_GRAPH_PAD falsifier.
+"""CudaGraphBufferRegistry fill contract + FLLIPER_POISON_GRAPH_PAD falsifier.
 
 #50 campaign round 8: the eager runner's registry buffers showed changed
 hashes between requests. Code audit: eager never pads (load_batch passes
@@ -12,14 +12,14 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+from flliper.srt.environ import envs
+from flliper.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -116,7 +116,7 @@ class TestFillContract(CustomTestCase):
 class TestPoisonGraphPad(CustomTestCase):
     def test_poison_covers_inactive_regions_and_respects_semantics(self):
         reg = _build_registry()
-        with envs.SGLANG_POISON_GRAPH_PAD.override(True):
+        with envs.FLLIPER_POISON_GRAPH_PAD.override(True):
             _fill(reg, raw_bs=2, padded_bs=4, raw_tokens=4, padded_tokens=8)
         ids = reg.get_slot("input_ids").buffer
         self.assertEqual(ids[:4].tolist(), [0, 1, 2, 3])  # head intact
@@ -141,7 +141,7 @@ class TestPoisonGraphPad(CustomTestCase):
             for name in ("input_ids", "positions", "seq_lens"):
                 reg.get_slot(name).buffer.fill_(stale)
             reg.get_slot("hidden_probe").buffer.fill_(float(stale))
-            with envs.SGLANG_POISON_GRAPH_PAD.override(True):
+            with envs.FLLIPER_POISON_GRAPH_PAD.override(True):
                 _fill(reg, raw_bs=2, padded_bs=2, raw_tokens=4, padded_tokens=4)
             bufs.append(
                 [reg.get_slot(n).buffer.clone() for n in reg.slot_names()]

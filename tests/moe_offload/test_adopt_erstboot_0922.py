@@ -8,11 +8,11 @@ Minute auf statt nach der fuenften.
 
 import pytest
 
-from sglang.srt.weg2 import adopt
+from flliper.srt.pdflip import adopt
 
 
 @pytest.fixture(autouse=True)
-def _sauber(monkeypatch):
+def _clean(monkeypatch):
     """Jeder Test startet ohne Adoption und ohne Platzhalter."""
     monkeypatch.delenv(adopt.ADOPT_ENV, raising=False)
     adopt._PLACEHOLDER["pending"] = False
@@ -22,13 +22,13 @@ def _sauber(monkeypatch):
     adopt._PLACEHOLDER["reason"] = ""
 
 
-def test_ohne_flag_keine_adoption():
+def test_without_flag_no_adoption():
     assert adopt.adopt_armed() is False
     assert adopt.store_writes_denied() is False, (
         "ohne Adoption darf der normale Plattenweg schreiben wie immer")
 
 
-def test_der_launcher_liest_sein_argv_der_rang_die_env(monkeypatch):
+def test_launcher_reads_argv_rank_reads_env(monkeypatch):
     """Zwei Leser, eine Antwort -- die Trennung, die S6 Fix E erzwungen hat."""
     assert adopt.adopt_armed(explicit="on") is True
     assert adopt.adopt_armed(explicit="off") is False
@@ -38,7 +38,7 @@ def test_der_launcher_liest_sein_argv_der_rang_die_env(monkeypatch):
 
 # --- Riegel 1: kein dummy-Spill in den GETEILTEN Store -------------------
 
-def test_unter_adoption_schreibt_D_NICHT_in_den_geteilten_store(monkeypatch):
+def test_under_adoption_d_does_not_write_shared_store(monkeypatch):
     """DER GEFAEHRLICHSTE FALL, und er ist still.
 
     Der Host-Store ist EINE Datei je Layer/Attribut fuer beide Gruppen
@@ -51,7 +51,7 @@ def test_unter_adoption_schreibt_D_NICHT_in_den_geteilten_store(monkeypatch):
     assert adopt.store_writes_denied() is True
 
 
-def test_nach_dem_erstflip_darf_D_wieder_schreiben(monkeypatch):
+def test_after_first_flip_d_may_write_again(monkeypatch):
     monkeypatch.setenv(adopt.ADOPT_ENV, "on")
     adopt.arm_placeholder()
     adopt.mark_adopted(filled=34, expected=34)
@@ -61,25 +61,25 @@ def test_nach_dem_erstflip_darf_D_wieder_schreiben(monkeypatch):
 
 # --- Riegel 2: keine Antwort auf Platzhaltern ---------------------------
 
-def test_platzhalter_verweigern_die_generierung():
+def test_placeholders_refuse_generation():
     adopt.arm_placeholder("dummy-load")
-    with pytest.raises(adopt.Weg2AdoptWeightsArePlaceholder) as exc:
+    with pytest.raises(adopt.PdFlipAdoptWeightsArePlaceholder) as exc:
         adopt.refuse_if_placeholder()
     assert adopt.REFUSAL_MARKER in str(exc.value)
 
 
-def test_ein_HALB_gefuellter_inject_loest_den_riegel_NICHT():
+def test_half_filled_inject_does_not_release_guard():
     """Ein halb gefuelltes Modell ist gefaehrlicher als ein leeres --
     es rechnet. Die Halter-Karte sagt, wieviele Tensoren erwartet sind."""
     adopt.arm_placeholder()
     adopt.mark_adopted(filled=33, expected=34)
     assert adopt.weights_are_placeholder() is True
     assert "33 von 34" in adopt.placeholder_reason()
-    with pytest.raises(adopt.Weg2AdoptWeightsArePlaceholder):
+    with pytest.raises(adopt.PdFlipAdoptWeightsArePlaceholder):
         adopt.refuse_if_placeholder()
 
 
-def test_null_erwartete_tensoren_sind_kein_erfolg():
+def test_zero_expected_tensors_is_not_success():
     """Sonst wuerde ein Inject, der GAR NICHTS fand, den Riegel loesen --
     dieselbe Klasse wie NULL-NUR-BEI-ERREICHTEM-EMITTER."""
     adopt.arm_placeholder()
@@ -87,14 +87,14 @@ def test_null_erwartete_tensoren_sind_kein_erfolg():
     assert adopt.weights_are_placeholder() is True
 
 
-def test_vollstaendiger_inject_loest_den_riegel():
+def test_complete_inject_releases_the_guard():
     adopt.arm_placeholder()
     adopt.mark_adopted(filled=34, expected=34)
     assert adopt.weights_are_placeholder() is False
     adopt.refuse_if_placeholder()  # wirft nicht mehr
 
 
-def test_ohne_adoption_ist_nichts_platzhalter():
+def test_without_adoption_nothing_is_placeholder():
     """Der normale Plattenboot darf von alldem nichts merken."""
     assert adopt.weights_are_placeholder() is False
     adopt.refuse_if_placeholder()
@@ -102,7 +102,7 @@ def test_ohne_adoption_ist_nichts_platzhalter():
 
 # --- Der Riegel AM SCHREIBPFAD, nicht nur als Funktion ------------------
 
-def test_write_rows_schreibt_unter_adoption_wirklich_nichts(monkeypatch):
+def test_write_rows_under_adoption_writes_nothing(monkeypatch):
     """Die Naht: der Riegel muss IM Schreibpfad sitzen, nicht daneben.
 
     Genau diese Unterscheidung hat am 22.09. drei Boots gekostet (#106:
@@ -112,18 +112,18 @@ def test_write_rows_schreibt_unter_adoption_wirklich_nichts(monkeypatch):
     """
     import torch
 
-    from sglang.srt.layers.moe import expert_store as es
+    from flliper.srt.layers.moe import expert_store as es
 
     store = torch.zeros((8, 4), dtype=torch.int8)
     src = torch.full((3, 4), 7, dtype=torch.int8)
 
     monkeypatch.setenv(adopt.ADOPT_ENV, "on")
     adopt.arm_placeholder()
-    geschrieben = es.write_rows(store, src, local_ids=[0, 1, 2], lo=0, pad=False)
+    written = es.write_rows(store, src, local_ids=[0, 1, 2], lo=0, pad=False)
     assert store.sum().item() == 0, (
         "unter Adoption darf KEIN Byte in den geteilten Store -- sonst "
         "ueberschreibt D's dummy-Presplit P's echte Experten")
-    assert geschrieben == {}
+    assert written == {}
 
     adopt.mark_adopted(filled=3, expected=3)
     es.write_rows(store, src, local_ids=[0, 1, 2], lo=0, pad=False)
@@ -131,11 +131,11 @@ def test_write_rows_schreibt_unter_adoption_wirklich_nichts(monkeypatch):
         "nach dem Erstflip ist D ein normaler Schreiber")
 
 
-def test_ohne_adoption_schreibt_write_rows_wie_immer():
+def test_without_adoption_write_rows_writes_as_before():
     """Der normale Plattenboot darf von #108 nichts merken."""
     import torch
 
-    from sglang.srt.layers.moe import expert_store as es
+    from flliper.srt.layers.moe import expert_store as es
 
     store = torch.zeros((8, 4), dtype=torch.int8)
     src = torch.full((3, 4), 5, dtype=torch.int8)
@@ -143,7 +143,7 @@ def test_ohne_adoption_schreibt_write_rows_wie_immer():
     assert store.sum().item() > 0
 
 
-def test_argv_d_bekommt_dummy_nur_unter_adoption():
+def test_argv_d_gets_dummy_only_under_adoption():
     """ERSETZT die w52-Fassung, die GRUEN WAR und NICHTS BEWIES.
 
     Sie setzte die Env und rief ``_adopt_load_format_flag()`` ohne
@@ -151,7 +151,7 @@ def test_argv_d_bekommt_dummy_nur_unter_adoption():
     liefert. Der Test gruen, das argv leer, D las von Platte. Jetzt geht
     der Wert als PARAMETER hinein, und der Test prueft den Rueckgabewert.
     """
-    from sglang.srt.weg2 import launcher as lx
+    from flliper.srt.pdflip import launcher as lx
 
     assert lx._adopt_load_format_flag(True) == ["--load-format", "dummy"]
     assert lx._adopt_load_format_flag(False) == []
@@ -159,7 +159,7 @@ def test_argv_d_bekommt_dummy_nur_unter_adoption():
 
 # --- Der TRIGGER: das Flip-Paar vor dem ersten Request ------------------
 
-def test_die_front_faehrt_ein_flip_PAAR_nicht_nur_einen():
+def test_front_runs_a_flip_pair_not_one():
     """P->D holt die Bytes, D->P stellt die Rollen wieder her.
 
     Ohne den zweiten Halbschritt startete das Serving mit vertauschten
@@ -167,18 +167,18 @@ def test_die_front_faehrt_ein_flip_PAAR_nicht_nur_einen():
     """
     import inspect
 
-    from sglang.srt.weg2 import front
+    from flliper.srt.pdflip import front
 
     src = inspect.getsource(front.Front._adopt_first_flip)
     assert src.index('self.flip("P", "D")') < src.index('self.flip("D", "P")'), (
         "erst P->D (Bytes holen), dann D->P (Rollen zurueck)")
 
 
-def test_der_trigger_laeuft_VOR_dem_serving_loop():
+def test_trigger_runs_before_serving_loop():
     """Sonst kaeme der erste Request auf Platzhalter-Gewichten an."""
     import inspect
 
-    from sglang.srt.weg2 import front
+    from flliper.srt.pdflip import front
 
     src = inspect.getsource(front.Front.controller)
     assert "_adopt_first_flip" in src
@@ -186,11 +186,11 @@ def test_der_trigger_laeuft_VOR_dem_serving_loop():
         "der Erstflip gehoert vor die Serving-Schleife")
 
 
-def test_der_trigger_ist_ohne_flag_ein_no_op():
+def test_trigger_without_flag_is_a_no_op():
     """Der normale Boot darf kein zusaetzliches Flip-Paar fahren."""
     import inspect
 
-    from sglang.srt.weg2 import front
+    from flliper.srt.pdflip import front
 
     src = inspect.getsource(front.Front._adopt_first_flip)
     i_guard = src.index("adopt_armed()")
@@ -199,7 +199,7 @@ def test_der_trigger_ist_ohne_flag_ein_no_op():
     assert "return" in src[i_guard:i_flip], "ohne Flag sofort zurueck"
 
 
-def test_kein_try_except_um_das_flip_paar():
+def test_no_try_except_around_flip_pair():
     """Schlaegt die Adoption fehl, MUSS der Boot stehenbleiben.
 
     Ein verschlucktes Scheitern ergaebe einen Boot, der laeuft und auf
@@ -208,37 +208,37 @@ def test_kein_try_except_um_das_flip_paar():
     """
     import inspect
 
-    from sglang.srt.weg2 import front
+    from flliper.srt.pdflip import front
 
     src = inspect.getsource(front.Front._adopt_first_flip)
-    koerper = src[src.index('self.flip("P", "D")'):]
-    assert "except" not in koerper
+    body = src[src.index('self.flip("P", "D")'):]
+    assert "except" not in body
 
 
 # --- Die Kette Inject -> Deckung -> Riegel ------------------------------
 
-def test_die_deckung_wird_dort_festgehalten_wo_sie_bekannt_ist():
+def test_coverage_is_recorded_where_it_is_known():
     """#106 und #107/2 sind daran gescheitert, dass eine Zahl zweimal
     abgeleitet wurde. Die Deckung wird deshalb im Inject GEMERKT und im
     Router nur GELESEN."""
     import inspect
 
-    from sglang.srt.managers.scheduler_components import weight_updater as wu
+    from flliper.srt.managers.scheduler_components import weight_updater as wu
 
-    # `_weg2_xchg_inject_from_peer` ist die Methode, die `plan.descs` und
+    # `_pdflip_xchg_inject_from_peer` ist die Methode, die `plan.descs` und
     # die getragenen `_cdescs` BEIDE in der Hand hat -- nicht
-    # `_weg2_xchg_inject_weights`, das nur der Einstieg ist. Der erste Lauf
+    # `_pdflip_xchg_inject_weights`, das nur der Einstieg ist. Der erste Lauf
     # dieses Tests hat genau diese Verwechslung aufgedeckt.
-    inject = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_xchg_inject_from_peer)
-    assert "_weg2_last_inject_cover" in inject, (
+    inject = inspect.getsource(wu.SchedulerWeightUpdaterManager._pdflip_xchg_inject_from_peer)
+    assert "_pdflip_last_inject_cover" in inject, (
         "die Deckung muss dort festgehalten werden, wo plan.descs und die "
         "getragenen Descriptors beide bekannt sind")
-    cover = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_adopt_cover)
-    assert "_weg2_last_inject_cover" in cover and "plan" not in cover, (
+    cover = inspect.getsource(wu.SchedulerWeightUpdaterManager._pdflip_adopt_cover)
+    assert "_pdflip_last_inject_cover" in cover and "plan" not in cover, (
         "der Leser darf sie NICHT neu ableiten")
 
 
-def test_unermittelbare_deckung_laesst_den_riegel_stehen():
+def test_undeterminable_coverage_keeps_the_guard():
     """`(0, 0)` ist kein Erfolg -- sonst oeffnete ein Inject, der gar
     nichts fand, das Modell fuer Zufallszahlen."""
     adopt.arm_placeholder()
@@ -257,36 +257,36 @@ def test_unermittelbare_deckung_laesst_den_riegel_stehen():
 
 
 def _argv_d_minimal(**kw):
-    from sglang.srt.weg2 import launcher as lx
+    from flliper.srt.pdflip import launcher as lx
 
     return lx.argv_d(
         "py", "/m", [1, 1, 1], 1, 1, lx.RING_FORM_SENTINEL_STORE_CFG, [], **kw
     )
 
 
-def test_argv_d_traegt_dummy_wenn_adoption_armiert():
+def test_argv_d_has_dummy_when_adoption_armed():
     argv = _argv_d_minimal(d_adopt=True)
     assert "--load-format" in argv
     assert argv[argv.index("--load-format") + 1] == "dummy"
 
 
-def test_argv_d_traegt_KEIN_dummy_ohne_adoption():
+def test_argv_d_has_no_dummy_without_adoption():
     assert "dummy" not in _argv_d_minimal(d_adopt=False)
 
 
-def test_argv_d_liest_keine_env(monkeypatch):
+def test_argv_d_reads_no_env(monkeypatch):
     # w52s Wurzel in einem Satz: die Env des LAUNCHER-Prozesses ist nicht
     # die der Kinder. Ein Helfer, der sie liest, gibt im Launcher immer [].
-    monkeypatch.setenv("SGLANG_WEG2_D_ADOPT", "on")
+    monkeypatch.setenv("FLLIPER_PDFLIP_D_ADOPT", "on")
     assert "dummy" not in _argv_d_minimal(d_adopt=False)
-    monkeypatch.delenv("SGLANG_WEG2_D_ADOPT", raising=False)
+    monkeypatch.delenv("FLLIPER_PDFLIP_D_ADOPT", raising=False)
     assert "dummy" in _argv_d_minimal(d_adopt=True)
 
 
-def test_die_produktions_aufrufstelle_gibt_die_entscheidung_mit():
+def test_production_call_site_passes_the_decision():
     import inspect
 
-    from sglang.srt.weg2 import launcher as lx
+    from flliper.srt.pdflip import launcher as lx
 
     src = inspect.getsource(lx)
     bauer = [z for z in src.split("\n") if "argv_d(py, ns.model" in z]

@@ -35,12 +35,12 @@ DEFAULT_TEXT = "Hola, buenos dias. Me alegro mucho de verte otra vez."
 
 
 async def run(args) -> int:
-    from sglang.srt.translator.audio import (
+    from flliper.srt.translator.audio import (
         AudioChunk,
         available_codecs,
         negotiate_codec,
     )
-    from sglang.srt.translator.inprocess_tts import (
+    from flliper.srt.translator.inprocess_tts import (
         InProcessQwen3Tts,
         InProcessTtsConfig,
     )
@@ -194,7 +194,7 @@ def report_speaker_similarity(backend, reference, waveform: np.ndarray) -> None:
         return
     rate = inner.speaker_encoder_sample_rate
 
-    from sglang.srt.translator.qwen3_tts_compat import librosa_resample
+    from flliper.srt.translator.qwen3_tts_compat import librosa_resample
 
     def embed(samples: np.ndarray, source_rate: int):
         resampled = librosa_resample(samples, source_rate, rate)

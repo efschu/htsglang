@@ -35,10 +35,10 @@ import os
 import unittest
 from unittest import mock
 
-from sglang.srt import uneven_perf
-from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import uneven_perf
+from flliper.srt.uneven_perf import PerfCostModel, PlanInputs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 

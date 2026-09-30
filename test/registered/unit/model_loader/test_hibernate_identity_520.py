@@ -42,8 +42,8 @@ import tempfile
 import unittest
 from typing import Dict, Set, Tuple
 
-from sglang.srt import server_args as server_args_mod
-from sglang.srt.arg_groups.overrides import (
+from flliper.srt import server_args as server_args_mod
+from flliper.srt.arg_groups.overrides import (
     IDENTITY_TRANSPARENT_SOURCES,
     SM80_DTYPE_FALLBACK_SOURCE,
     SPEC_TARGET_CONTEXT_LENGTH_SOURCE,
@@ -51,10 +51,10 @@ from sglang.srt.arg_groups.overrides import (
     materialize_declarations,
     resolved_view,
 )
-from sglang.srt.model_loader import hibernate
-from sglang.srt.runtime_context import get_context
-from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.srt.model_loader import hibernate
+from flliper.srt.runtime_context import get_context
+from flliper.srt.server_args import ServerArgs
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -98,7 +98,7 @@ class HibernateIdentity520Test(unittest.TestCase):
     def setUp(self):
         self._orig = server_args_mod.check_gguf_file
         server_args_mod.check_gguf_file = _looks_like_gguf
-        import sglang.srt.utils.hf_transformers_utils as hf_utils
+        import flliper.srt.utils.hf_transformers_utils as hf_utils
 
         self._orig_hf = hf_utils.check_gguf_file
         hf_utils.check_gguf_file = _looks_like_gguf
@@ -233,7 +233,7 @@ class HibernateIdentity520Test(unittest.TestCase):
         test is production code, and it is asked in BOTH directions so an
         always-True stub would fail the sm86 leg.
         """
-        from sglang.srt.model_executor import model_runner as model_runner_mod
+        from flliper.srt.model_executor import model_runner as model_runner_mod
 
         original = model_runner_mod.get_device_capability
         try:
@@ -326,7 +326,7 @@ class HibernateIdentity520Test(unittest.TestCase):
     # -- maintained sibling sweep ----------------------------------------
 
     def test_worker_writers_of_identity_fields_are_all_classified(self):
-        """MAINTAINED sweep (AST over ``python/sglang/srt``), not a by-eye
+        """MAINTAINED sweep (AST over ``python/flliper/srt``), not a by-eye
         list: every call site that writes an identity field through the
         post-resolution mutation point with a literal source must be
         classified -- either identity-transparent (a re-derivation, normalized
@@ -396,7 +396,7 @@ class HibernateIdentity520Test(unittest.TestCase):
 
 _SRT_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(hibernate.__file__)), ""
-)  # .../sglang/srt/
+)  # .../flliper/srt/
 
 # Receivers that are a ServerArgs. get_parallel().override() and the flag
 # groups' override() are a DIFFERENT mutation point (parallel/flag state) and

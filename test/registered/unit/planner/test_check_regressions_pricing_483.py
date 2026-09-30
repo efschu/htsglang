@@ -47,7 +47,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_cost_model_open_items as fx  # noqa: E402  one fixture rig, one place
-from sglang.srt.planner import key_solver as ks  # noqa: E402
+from flliper.srt.planner import key_solver as ks  # noqa: E402
 
 #: ``check_regressions`` picks the geometry off the anchor KEY: this one takes
 #: the #264 branch -- budgets 29607/17780/17780, ranks in cuda order, and the
@@ -83,7 +83,7 @@ def profile():
 
 @pytest.fixture(autouse=True)
 def _mamba_dtype(monkeypatch):
-    monkeypatch.setenv("SGLANG_MAMBA_SSM_DTYPE", "bfloat16")
+    monkeypatch.setenv("FLLIPER_MAMBA_SSM_DTYPE", "bfloat16")
 
 
 def _row(model_dir, hardware_profile):
@@ -99,7 +99,7 @@ def _enc_from(rates, model_dir):
     Same terms in the same order as the function under test; the only degree
     of freedom left is which rate object the three prefill inputs come from.
     """
-    from sglang.srt.uneven_perf import PlanInputs
+    from flliper.srt.uneven_perf import PlanInputs
 
     pi = PlanInputs(
         tp_size=3,
@@ -205,7 +205,7 @@ class TestDecodeUsesTheSameObject:
     again."""
 
     def test_decode_is_priced_through_the_model(self, fp8_checkpoint, profile):
-        from sglang.srt.uneven_perf import PlanInputs
+        from flliper.srt.uneven_perf import PlanInputs
 
         pi = PlanInputs(
             tp_size=3,

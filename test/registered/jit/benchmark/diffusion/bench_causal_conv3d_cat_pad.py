@@ -2,14 +2,14 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.jit_kernel.benchmark import marker
-from sglang.jit_kernel.diffusion.causal_conv3d_cat_pad import (
+from flliper.jit_kernel.benchmark import marker
+from flliper.jit_kernel.diffusion.causal_conv3d_cat_pad import (
     fused_causal_conv3d_cat_pad_cuda,
 )
-from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
+from flliper.jit_kernel.diffusion.triton.causal_conv3d_pad import (
     fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from flliper.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=20,

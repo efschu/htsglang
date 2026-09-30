@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-CI_REGISTER_PATH = REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_register.py"
+CI_REGISTER_PATH = REPO_ROOT / "python" / "flliper" / "test" / "ci" / "ci_register.py"
 HELPER_PATH = REPO_ROOT / "scripts" / "ci" / "utils" / "docker_build_metadata_args.py"
 DOCKERFILE_PATH = REPO_ROOT / "docker" / "Dockerfile"
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "_docker-build-and-publish.yml"
@@ -86,11 +86,11 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         self.assertEqual(
             self.build_args(args),
             {
-                "SGLANG_BUILD_COMMIT": "abcdef1234567890",
-                "SGLANG_BUILD_URL": (
+                "FLLIPER_BUILD_COMMIT": "abcdef1234567890",
+                "FLLIPER_BUILD_URL": (
                     "https://github.com/sgl-project/sglang/actions/runs/1"
                 ),
-                "SGLANG_IMAGE_TAG": "lmsysorg/sglang:v0.6.0",
+                "FLLIPER_IMAGE_TAG": "lmsysorg/sglang:v0.6.0",
             },
         )
 
@@ -108,7 +108,7 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         )
 
         self.assertEqual(
-            self.build_args(args)["SGLANG_IMAGE_TAG"],
+            self.build_args(args)["FLLIPER_IMAGE_TAG"],
             "lmsysorg/sglang-staging:v0.6.0-cu130-runtime",
         )
 
@@ -127,11 +127,11 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         )
 
         self.assertEqual(
-            self.build_args(args)["SGLANG_IMAGE_TAG"],
+            self.build_args(args)["FLLIPER_IMAGE_TAG"],
             "lmsysorg/sglang:nightly-dev-20260429-12345678",
         )
         self.assertEqual(
-            self.build_args(args)["SGLANG_BUILD_COMMIT"],
+            self.build_args(args)["FLLIPER_BUILD_COMMIT"],
             "1234567890abcdef",
         )
 
@@ -146,7 +146,7 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         )
 
         self.assertEqual(
-            self.build_args(args)["SGLANG_IMAGE_TAG"],
+            self.build_args(args)["FLLIPER_IMAGE_TAG"],
             "lmsysorg/sglang:dev-cu13-my-test",
         )
 
@@ -173,19 +173,19 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
 
         for stage in (framework_stage, runtime_stage):
             for expected in (
-                "ARG SGLANG_BUILD_COMMIT=unknown",
-                "ARG SGLANG_BUILD_URL=",
-                "ARG SGLANG_IMAGE_TAG=local/sglang:dev",
-                "SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown}",
-                "SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-}",
-                "SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}",
+                "ARG FLLIPER_BUILD_COMMIT=unknown",
+                "ARG FLLIPER_BUILD_URL=",
+                "ARG FLLIPER_IMAGE_TAG=local/flliper:dev",
+                "FLLIPER_BUILD_COMMIT=${FLLIPER_BUILD_COMMIT:-unknown}",
+                "FLLIPER_BUILD_URL=${FLLIPER_BUILD_URL:-}",
+                "FLLIPER_IMAGE_TAG=${FLLIPER_IMAGE_TAG:-local/flliper:dev}",
                 'org.opencontainers.image.source="https://github.com/sgl-project/sglang"',
-                'org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}"',
-                'org.opencontainers.image.version="${SGLANG_IMAGE_TAG}"',
-                'org.opencontainers.image.url="${SGLANG_BUILD_URL}"',
-                'ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}"',
-                'ai.sglang.build.url="${SGLANG_BUILD_URL}"',
-                'ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"',
+                'org.opencontainers.image.revision="${FLLIPER_BUILD_COMMIT}"',
+                'org.opencontainers.image.version="${FLLIPER_IMAGE_TAG}"',
+                'org.opencontainers.image.url="${FLLIPER_BUILD_URL}"',
+                'ai.flliper.build.commit="${FLLIPER_BUILD_COMMIT}"',
+                'ai.flliper.build.url="${FLLIPER_BUILD_URL}"',
+                'ai.flliper.image.tag="${FLLIPER_IMAGE_TAG}"',
             ):
                 self.assertIn(expected, stage)
 

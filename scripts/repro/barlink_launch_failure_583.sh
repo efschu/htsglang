@@ -73,7 +73,7 @@ BEFORE the window
   1. Announce the window and confirm no other agent holds a GPU claim:
        ls -la /spinning/gpu-arb/
   2. Record what is running, so it can be restored byte-for-byte:
-       ps -o pid,etime,args -C python | grep -F sglang | tee /tmp/583_serving_cmdline.txt
+       ps -o pid,etime,args -C python | grep -F flliper | tee /tmp/583_serving_cmdline.txt
      Keep this file. It is the ONLY record of the exact production flags.
   3. Note the free VRAM on all three cards (the corridor rule: >= 400 MiB free
      on EVERY card after teardown, or the next boot fails for the wrong reason):
@@ -179,7 +179,7 @@ RANK_GPU_MEM="${RANK_GPU_MEM:-27107,16680,16680}"
 # engines, which is the leading trigger hypothesis for the missed deadline.
 # ---------------------------------------------------------------------------
 BOOT=(
-  "$PY" -m sglang.launch_server
+  "$PY" -m flliper.launch_server
   --model-path "$MODEL"
   --served-model-name Qwen3.6-27B-583
   --trust-remote-code
@@ -237,15 +237,15 @@ BOOT=(
   --decode-log-interval 40
 )
 
-export SGLANG_BARLINK=1
+export FLLIPER_BARLINK=1
 # spec + DCP is only permitted on the uneven-hybrid WEIGHTED path, which is
 # what the crash boot ran (rank_tp_ratio=[27107,16680,16680], non-uniform).
 # Without these two, _handle_dcp_validation refuses the combination outright.
-export SGLANG_UNEVEN_DCP=1
-export SGLANG_UNEVEN_DCP_WEIGHTED=1
+export FLLIPER_UNEVEN_DCP=1
+export FLLIPER_UNEVEN_DCP_WEIGHTED=1
 # Do NOT silence the #583 abort check: the whole point of the window is to see
 # the structured DeviceCollectiveAborted instead of a dead context.
-unset SGLANG_BARLINK_BAR1_ABORT_CHECK
+unset FLLIPER_BARLINK_BAR1_ABORT_CHECK
 export PYTHONPATH="$WT/python"
 export PYTHONUNBUFFERED=1
 

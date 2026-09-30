@@ -44,9 +44,9 @@ import types
 import unittest
 from pathlib import Path
 
-from sglang.srt.managers import phase_flip_seam_census as seam_census
-from sglang.srt.planner import pp_cut, transient_census
-from sglang.srt.server_args import ServerArgs
+from flliper.srt.managers import phase_flip_seam_census as seam_census
+from flliper.srt.planner import pp_cut, transient_census
+from flliper.srt.server_args import ServerArgs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_pp_family_cut_485 import _inputs  # noqa: E402
@@ -164,7 +164,7 @@ class TestTheProducerReadsAMeasurementOrRefuses(unittest.TestCase):
         self.assertIn("no measured SEAM staging", msg)
         # And it must name the fix, not merely the fault.
         self.assertIn("--enable-phase-flip", msg)
-        self.assertIn("SGLANG_TRANSIENT_CENSUS", msg)
+        self.assertIn("FLLIPER_TRANSIENT_CENSUS", msg)
 
     def test_a_boot_that_never_flipped_is_refused_too(self):
         # An empty seam table is the signature of a boot that armed the flip
@@ -211,8 +211,8 @@ class TestTheSeamLoadState(unittest.TestCase):
         # the only one that ever mattered -- s50 breached on 1 flip in 86.
         import os
 
-        old = os.environ.get("SGLANG_TRANSIENT_CENSUS_STRIDE")
-        os.environ["SGLANG_TRANSIENT_CENSUS_STRIDE"] = "1000"
+        old = os.environ.get("FLLIPER_TRANSIENT_CENSUS_STRIDE")
+        os.environ["FLLIPER_TRANSIENT_CENSUS_STRIDE"] = "1000"
         try:
             c = transient_census.TransientCensus(0, "5090", 8100 << 20)
             transient_census._CENSUS = c
@@ -221,9 +221,9 @@ class TestTheSeamLoadState(unittest.TestCase):
             self.assertIn(state, c.min_free_bytes)
         finally:
             if old is None:
-                os.environ.pop("SGLANG_TRANSIENT_CENSUS_STRIDE", None)
+                os.environ.pop("FLLIPER_TRANSIENT_CENSUS_STRIDE", None)
             else:
-                os.environ["SGLANG_TRANSIENT_CENSUS_STRIDE"] = old
+                os.environ["FLLIPER_TRANSIENT_CENSUS_STRIDE"] = old
 
     def test_it_keeps_the_MINIMUM_across_flips(self):
         c = transient_census.TransientCensus(0, "5090", 8100 << 20)

@@ -178,7 +178,7 @@ def run(root, prefixes, fork_only=True):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root")
-    ap.add_argument("--paths", default="python/sglang/srt")
+    ap.add_argument("--paths", default="python/flliper/srt")
     ap.add_argument("--any-file", action="store_true")
     a = ap.parse_args()
     hits = run(a.root, [p for p in a.paths.split(",") if p], not a.any_file)

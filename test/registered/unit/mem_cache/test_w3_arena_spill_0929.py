@@ -13,7 +13,7 @@ and on the device, ``l3_present``) -- and the claim finds its room.
 
 Hermetic: the real C arena on a temp file, the real ``alloc_write`` /
 ``complete_write`` / ``_evict_for_claim`` / ``arena_secure_to_disk`` and the
-real ``UnifiedRadixCache._weg2_direct_claim``; pages of 64 B, page_size 1."""
+real ``UnifiedRadixCache._pdflip_direct_claim``; pages of 64 B, page_size 1."""
 
 import os
 import shutil
@@ -24,14 +24,14 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
-from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
-from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (  # noqa: E402
+from flliper.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from flliper.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool  # noqa: E402
+from flliper.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from flliper.srt.mem_cache.unified_cache_components.tree_component import (  # noqa: E402
     ComponentType,
     EvictLayer,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (  # noqa: E402
+from flliper.srt.mem_cache.unified_radix_cache import (  # noqa: E402
     UnifiedRadixCache,
     UnifiedTreeNode,
 )
@@ -148,7 +148,7 @@ def _tree(pool):
     t.cache_controller = types.SimpleNamespace(mem_pool_host=pool, mem_pool_host_draft=None)
     t.refused = []
     t._1421_refused = lambda why, node: t.refused.append(why)
-    t._weg2_direct_pool = lambda: pool
+    t._pdflip_direct_pool = lambda: pool
     return t
 
 
@@ -197,7 +197,7 @@ def test_kvs2_shape_a_full_arena_of_tree_held_pages_frees_nothing_on_its_own(tmp
 
 
 def test_kvs2_shape_the_claim_spills_finished_pages_to_l3_and_gets_its_room(tmp_path):
-    """RED on 424346f693: _weg2_direct_claim refuses (#1421 arena_claim) and
+    """RED on 424346f693: _pdflip_direct_claim refuses (#1421 arena_claim) and
     not one page reaches L3 -- the W3 chain of the kvs2 boot. GREEN: the
     finished pages go to L3 first, the tree hands its references back, the
     claim gets its two slots; the spilled nodes stay in the tree and on the
@@ -205,7 +205,7 @@ def test_kvs2_shape_the_claim_spills_finished_pages_to_l3_and_gets_its_room(tmp_
     p, arena, root, t, nodes = _full_tree(tmp_path)
     dropped_before = getattr(ArenaMHAHostPool, "_257_dropped_without_l3", 0)
     m = _claimer(t)
-    pre = t._weg2_direct_claim(m)
+    pre = t._pdflip_direct_claim(m)
     assert pre is not False, f"claim refused: {t.refused}"
     assert pre is not None and int(pre.numel()) == 2
     spilled = [n for n in nodes if n.component_data[FULL].host_value is None]
@@ -229,7 +229,7 @@ def test_a_page_without_an_l3_copy_is_never_released(tmp_path):
     (never leaves L2 without an L3 copy, #257 (d)); the others spill."""
     p, arena, root, t, nodes = _full_tree(tmp_path, refuse=("a0_sfx",))
     m = _claimer(t)
-    t._weg2_direct_claim(m)
+    t._pdflip_direct_claim(m)
     assert nodes[0].component_data[FULL].host_value is not None
     assert not (root / "a0_sfx.bin").exists()
     assert any(n.component_data[FULL].host_value is None for n in nodes[1:])
@@ -240,7 +240,7 @@ def test_a_pending_write_and_a_host_locked_load_are_not_spilled(tmp_path):
     t.ongoing_write_through[nodes[1].id] = object()
     nodes[2].component_data[FULL].host_lock_ref = 1
     m = _claimer(t)
-    t._weg2_direct_claim(m)
+    t._pdflip_direct_claim(m)
     assert nodes[1].component_data[FULL].host_value is not None
     assert nodes[2].component_data[FULL].host_value is not None
 
@@ -256,7 +256,7 @@ def test_the_claimers_own_chain_and_host_only_nodes_stay(tmp_path):
     chain_parent.children[("b",)] = m
     m.hash_value = ["b0", "b1"]
     m.component_data[FULL].value = torch.arange(2, dtype=torch.int64)
-    t._weg2_direct_claim(m)
+    t._pdflip_direct_claim(m)
     for anc in nodes[:6]:
         if anc is nodes[3]:
             continue

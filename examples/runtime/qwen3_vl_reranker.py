@@ -1,11 +1,11 @@
 """
-Example usage of Qwen3-VL-Reranker with SGLang.
+Example usage of Qwen3-VL-Reranker with fLLiper.
 
 This example demonstrates how to use the Qwen3-VL-Reranker model for multimodal
 reranking tasks, supporting text, images, and videos.
 
 Server Launch:
-    python -m sglang.launch_server \
+    python -m flliper.launch_server \
         --model-path Qwen/Qwen3-VL-Reranker-2B \
         --served-model-name Qwen3-VL-Reranker-2B \
         --trust-remote-code \
@@ -167,7 +167,7 @@ def main():
     except requests.exceptions.ConnectionError:
         print(f"Cannot connect to server at {BASE_URL}")
         print("Please start the server first with:")
-        print("  python -m sglang.launch_server \\")
+        print("  python -m flliper.launch_server \\")
         print("      --model-path Qwen/Qwen3-VL-Reranker-2B \\")
         print("      --served-model-name Qwen3-VL-Reranker-2B \\")
         print("      --trust-remote-code \\")

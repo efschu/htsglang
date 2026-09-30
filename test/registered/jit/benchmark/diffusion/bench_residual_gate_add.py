@@ -4,10 +4,10 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.jit_kernel.diffusion.residual_gate_add import residual_gate_add_cuda
-from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.utils import is_in_ci
+from flliper.jit_kernel.diffusion.residual_gate_add import residual_gate_add_cuda
+from flliper.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.utils import is_in_ci
 
 register_cuda_ci(
     est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"

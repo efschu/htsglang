@@ -39,38 +39,38 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import _bar1_marker_source as _src  # noqa: E402
 from s12_log_analyse import (  # noqa: E402
-    auswerten,
-    belegung,
-    decode_tick_aggregat,
-    im_fenster,
-    kollektiv_bytes,
-    lade_punkte,
-    parse_bar1_geometrie,
+    evaluate,
+    occupancy,
+    decode_tick_aggregate,
+    in_window,
+    collective_bytes,
+    load_points,
+    parse_bar1_geometry,
     parse_decode,
     parse_prefill_rang,
-    punkt_fenster,
+    point_window,
     runden,
-    tabellen,
-    wait_aggregat,
+    tables,
+    wait_aggregate,
 )
 
 # The lines the scheduler and barlink_bar1 really write. Copied verbatim out of
 # /root/battery-bar1/s12.bar1.1.log and s12.grundlinie.8.log.
-ZEILE_PREFILL_BAR1 = (
+ROW_PREFILL_BAR1 = (
     "[2026-07-30 13:34:52 TP0] Prefill rank batch, #new-token: 2048, "
     "#cached-token: 0, #chunks: 1, gpu-ms: 1194.7 (compute 143.6, wait 1051.1)"
 )
-ZEILE_PREFILL_GRUNDLINIE = (
+ROW_PREFILL_BASELINE = (
     "[2026-07-30 13:47:31 TP1] Prefill rank batch, #new-token: 80, "
     "#cached-token: 0, #chunks: 1, gpu-ms: 668.4 (compute 463.5, wait 205.0)"
 )
-ZEILE_DECODE = (
+ROW_DECODE = (
     "[2026-07-30 13:35:13 TP0] Decode batch, #running-req: 1, #full token: 257, "
     "full token usage: 0.00, mamba num: 3, mamba usage: 0.03, accept len: 2.83, "
     "accept rate: 0.61, cuda graph: True, gen throughput (token/s): 93.65, "
     "#queue-req: 0"
 )
-ZEILE_DECODE_WARMUP = (
+ROW_DECODE_WARMUP = (
     "[2026-07-30 13:35:12 TP0] Decode batch, #running-req: 1, #full token: 143, "
     "full token usage: 0.00, mamba num: 3, mamba usage: 0.03, accept len: 3.35, "
     "accept rate: 0.78, cuda graph: True, gen throughput (token/s): 3.37, "
@@ -80,14 +80,14 @@ ZEILE_DECODE_WARMUP = (
 # _bar1_marker_source.py, not retyped -- this used to be the German wording
 # #295 moved the emitter away from, matching only itself and RE_BAR1_SETUP's
 # equally-stale pattern.
-ZEILE_AUFBAU = "[2026-07-30 13:44:02 TP2] " + _src.render_setup_line(
-    dauer_ms=324, peer_targets=2, region_mib=96.0,
+ROW_SETUP = "[2026-07-30 13:44:02 TP2] " + _src.render_setup_line(
+    duration_ms=324, peer_targets=2, region_mib=96.0,
     slots_desc="12 slots (of which 2(R-1) for all_to_all)",
     slot_kib=8188, payload_kib=24564,
 )
 # A line that carries no split, from before #252. It must not parse as a batch
 # with wait 0 -- that would read as "no collective time at all".
-ZEILE_OHNE_SPLIT = (
+LINE_WITHOUT_SPLIT = (
     "[2026-07-30 13:34:52 TP0] Prefill rank batch, #new-token: 2048, "
     "#cached-token: 0, #chunks: 1, gpu-ms: 1194.7"
 )
@@ -97,7 +97,7 @@ def _fixture(name: str) -> str:
     return os.path.join(FIXTURES, name)
 
 
-def _quellen() -> list:
+def _sources() -> list:
     return [
         ("bar1", 1, _fixture("bar1_1.log")),
         ("bar1", 8, _fixture("bar1_8.log")),
@@ -108,8 +108,8 @@ def _quellen() -> list:
 
 @pytest.fixture(scope="module")
 def payload():
-    return auswerten(
-        _quellen(), lade_punkte(_fixture("punkte.jsonl")), hidden=5120, welt=3
+    return evaluate(
+        _sources(), load_points(_fixture("punkte.jsonl")), hidden=5120, welt=3
     )
 
 
@@ -120,9 +120,9 @@ def _w(payload, arm, sessions, rang):
     raise AssertionError(f"kein Aggregat fuer {arm}/{sessions}/TP{rang}")
 
 
-class TestZeilen:
+class TestRows:
     def test_prefill_split_is_read_field_by_field(self):
-        (row,) = parse_prefill_rang([ZEILE_PREFILL_BAR1])
+        (row,) = parse_prefill_rang([ROW_PREFILL_BAR1])
         assert row["rang"] == 0
         assert row["new_token"] == 2048
         assert row["chunks"] == 1
@@ -136,43 +136,43 @@ class TestZeilen:
 
     def test_a_line_without_the_split_is_not_a_batch(self):
         """Silence, not a zero. A pre-#252 log has no wait to report."""
-        assert parse_prefill_rang([ZEILE_OHNE_SPLIT]) == []
+        assert parse_prefill_rang([LINE_WITHOUT_SPLIT]) == []
 
     def test_every_rank_prefix_is_kept_apart(self):
-        rows = parse_prefill_rang([ZEILE_PREFILL_BAR1, ZEILE_PREFILL_GRUNDLINIE])
+        rows = parse_prefill_rang([ROW_PREFILL_BAR1, ROW_PREFILL_BASELINE])
         assert [r["rang"] for r in rows] == [0, 1]
 
     def test_decode_line_carries_accept_and_rate(self):
-        (row,) = parse_decode([ZEILE_DECODE])
+        (row,) = parse_decode([ROW_DECODE])
         assert row["running_req"] == 1
         assert row["accept_len"] == 2.83
         assert row["gen_tok_s"] == 93.65
         assert row["cuda_graph"] is True
 
-    def test_bar1_geometry_is_read_from_the_aufbau_line(self):
-        geo = parse_bar1_geometrie(["irgendwas", ZEILE_AUFBAU])
+    def test_bar1_geometry_is_read_from_the_setup_line(self):
+        geo = parse_bar1_geometry(["irgendwas", ROW_SETUP])
         assert geo["schlitz_kib"] == 8188
         assert geo["max_nutzlast_kib"] == 24564
         assert geo["schlitze"] == 12
         assert geo["region_mib"] == 96.0
 
     def test_a_baseline_log_has_no_geometry(self):
-        assert parse_bar1_geometrie([ZEILE_PREFILL_GRUNDLINIE]) is None
+        assert parse_bar1_geometry([ROW_PREFILL_BASELINE]) is None
 
 
-class TestArithmetik:
+class TestArithmetic:
     def test_collective_size_is_tokens_times_hidden_times_two(self):
-        assert kollektiv_bytes(2048, 5120) == 20971520
+        assert collective_bytes(2048, 5120) == 20971520
 
     def test_a_2048_chunk_needs_exactly_one_round(self):
         """6,67 MiB shard against a 7,996 MiB slot -- one round, with room."""
-        assert runden(kollektiv_bytes(2048, 5120), 8188 * 1024, 3) == 1
+        assert runden(collective_bytes(2048, 5120), 8188 * 1024, 3) == 1
 
     def test_the_tipping_point_is_2457_tokens(self):
         """At welt*slot the payload stops fitting -- and BAR1 stops carrying it
         at all, because handles() says False above max_nutzlast."""
-        assert runden(kollektiv_bytes(2456, 5120), 8188 * 1024, 3) == 1
-        assert runden(kollektiv_bytes(2457, 5120), 8188 * 1024, 3) == 2
+        assert runden(collective_bytes(2456, 5120), 8188 * 1024, 3) == 1
+        assert runden(collective_bytes(2457, 5120), 8188 * 1024, 3) == 2
 
     def test_the_wait_share_is_built_from_sums_not_from_median_ratios(self):
         """A median of per-batch ratios does not add up to a point. Here the
@@ -186,56 +186,56 @@ class TestArithmetik:
                 "new_token": 2048,
             },
         ]
-        agg = wait_aggregat(batches)
+        agg = wait_aggregate(batches)
         assert agg["wait_anteil"] == pytest.approx(910.0 / 1100.0)
         assert agg["new_token_max"] == 2048
-        assert wait_aggregat([]) == {"n": 0}
+        assert wait_aggregate([]) == {"n": 0}
 
     def test_occupancy_over_100_percent_means_batches_overlapped(self):
         b = [
             {"zeit": "2026-07-30 13:34:50", "gpu_ms": 1200.0},
             {"zeit": "2026-07-30 13:34:52", "gpu_ms": 1200.0},
         ]
-        assert belegung(b)["belegung"] == pytest.approx(1.2)
-        assert belegung(b[:1]) == {"batches": 1}
+        assert occupancy(b)["belegung"] == pytest.approx(1.2)
+        assert occupancy(b[:1]) == {"batches": 1}
 
 
-class TestFenster:
+class TestWindow:
     def test_the_point_is_the_last_n_large_batches(self):
         """The warmup logs exactly like the point. Counting from the back with
         the point's own request count is the only boundary the log admits."""
         rows = parse_prefill_rang(open(_fixture("bar1_1.log"), errors="replace"))
         alle_gross = [r for r in rows if r["rang"] == 0 and r["new_token"] >= 1000]
         assert len(alle_gross) == 16  # warmup and point together
-        fenster = punkt_fenster(rows, requests=11)
-        assert len(fenster[0]) == 11
-        assert fenster[0] == alle_gross[-11:]
+        window = point_window(rows, requests=11)
+        assert len(window[0]) == 11
+        assert window[0] == alle_gross[-11:]
 
     def test_small_chunk_remainders_stay_out(self):
         """A 2055-token prompt at chunked_prefill_size=2048 leaves a 7-token
         batch. It is a real collective, but not the point's work."""
         rows = parse_prefill_rang(open(_fixture("bar1_1.log"), errors="replace"))
-        fenster = punkt_fenster(rows, requests=11)
-        assert min(r["new_token"] for r in fenster[0]) >= 1000
+        window = point_window(rows, requests=11)
+        assert min(r["new_token"] for r in window[0]) >= 1000
 
     def test_window_by_wall_clock_widens_by_one_second(self):
         """The scheduler stamps whole seconds; a half-second window would drop
         the tick it was opened for."""
         import datetime
 
-        ticks = parse_decode([ZEILE_DECODE])
+        ticks = parse_decode([ROW_DECODE])
         t = datetime.datetime.strptime("2026-07-30 13:35:13", "%Y-%m-%d %H:%M:%S")
-        mitte = t.timestamp() + 0.4
-        assert im_fenster(ticks, mitte, mitte) == ticks
-        assert im_fenster(ticks, mitte + 600, mitte + 900) == []
+        middle = t.timestamp() + 0.4
+        assert in_window(ticks, middle, middle) == ticks
+        assert in_window(ticks, middle + 600, middle + 900) == []
 
 
 class TestDecodeTicks:
     def test_the_first_tick_of_a_stream_is_dropped(self):
         """3,37 tok/s is the prefill of that request showing up in a decode
         rate. Kept, it halves the median."""
-        ticks = parse_decode([ZEILE_DECODE_WARMUP, ZEILE_DECODE])
-        agg = decode_tick_aggregat(ticks, running_req=1)
+        ticks = parse_decode([ROW_DECODE_WARMUP, ROW_DECODE])
+        agg = decode_tick_aggregate(ticks, running_req=1)
         assert agg["ticks"] == 2
         assert agg["ticks_warmup_verworfen"] == 1
         assert agg["gen_tok_s_median"] == 93.65
@@ -245,14 +245,14 @@ class TestDecodeTicks:
         """The 2026-07-30 run recorded accept: None in all eight points, because
         meta_info is opt-in on the chat endpoint. The scheduler logged it
         anyway."""
-        gemessen = {
+        measured = {
             (d["arm"], d["sessions"], d["running_req"]): d["accept_len_median"]
             for d in payload["decode"]
             if d.get("ticks_gewertet")
         }
-        assert gemessen[("bar1", 1, 16)] == 2.90
-        assert gemessen[("grundlinie", 8, 16)] == 2.80
-        assert all(2.0 < v < 4.0 for v in gemessen.values())
+        assert measured[("bar1", 1, 16)] == 2.90
+        assert measured[("grundlinie", 8, 16)] == 2.80
+        assert all(2.0 < v < 4.0 for v in measured.values())
 
     def test_the_tick_rate_is_not_the_request_rate(self, payload):
         """bs=1 was reported as ~32 tok/s at the request level. The decode loop
@@ -266,11 +266,11 @@ class TestDecodeTicks:
         assert all(70.0 < d["gen_tok_s_median"] < 100.0 for d in bs1)
 
     def test_a_batch_size_that_never_ran_yields_no_aggregate(self):
-        agg = decode_tick_aggregat(parse_decode([ZEILE_DECODE]), running_req=16)
+        agg = decode_tick_aggregate(parse_decode([ROW_DECODE]), running_req=16)
         assert agg == {"ticks": 0, "ticks_gewertet": 0}
 
 
-class TestBefund:
+class TestFinding:
     """The four numbers #293 step 1 stands on."""
 
     def test_compute_is_flat_from_one_to_eight_sessions(self, payload):
@@ -278,9 +278,9 @@ class TestBefund:
         and nothing to do with the transport."""
         for arm in ("bar1", "grundlinie"):
             for rang in (0, 1, 2):
-                eins = _w(payload, arm, 1, rang)["compute_ms_median"]
-                acht = _w(payload, arm, 8, rang)["compute_ms_median"]
-                assert acht / eins < 1.10
+                one = _w(payload, arm, 1, rang)["compute_ms_median"]
+                eight = _w(payload, arm, 8, rang)["compute_ms_median"]
+                assert eight / one < 1.10
 
     def test_bar1_wait_grows_about_twice_as_fast_as_the_baseline(self, payload):
         """The core question, on the compute-critical rank: 652,6 -> 1220,1 ms
@@ -319,30 +319,30 @@ class TestBefund:
     def test_batches_overlap_from_four_sessions_on(self, payload):
         """Over 100 % occupancy is why a per-batch gpu-ms at load is a period
         and not a latency -- the caveat the verdict has to carry."""
-        eins = [g for g in payload["groessen"] if g["sessions"] == 1]
-        acht = [g for g in payload["groessen"] if g["sessions"] == 8]
-        assert all(g["belegung"] > 1.05 for g in acht)
-        assert any(g["belegung"] < 1.05 for g in eins)
+        one = [g for g in payload["groessen"] if g["sessions"] == 1]
+        eight = [g for g in payload["groessen"] if g["sessions"] == 8]
+        assert all(g["belegung"] > 1.05 for g in eight)
+        assert any(g["belegung"] < 1.05 for g in one)
 
 
-class TestBericht:
+class TestReport:
     def test_the_tables_render_and_do_not_judge(self, payload):
-        text = tabellen(payload)
+        text = tables(payload)
         assert "| bar1 | 1 | TP1 | 11 | 547.2 | 652.6 | 1200.7 | 53.8 % |" in text
         assert "20971520" in text
-        for urteil in ("gut", "schlecht", "besser", "Gewinn", "Kontention"):
-            assert urteil not in text
+        for verdict in ("gut", "schlecht", "besser", "Gewinn", "Kontention"):
+            assert verdict not in text
 
     def test_the_cli_runs_hermetically(self, tmp_path):
-        ziel = tmp_path / "analyse.json"
+        target = tmp_path / "analyse.json"
         argv = [sys.executable, os.path.join(BATTERY, "s12_log_analyse.py")]
-        for arm, sessions, pfad in _quellen():
-            argv += ["--log", f"{arm}:{sessions}:{pfad}"]
-        argv += ["--punkte", _fixture("punkte.jsonl"), "--json", str(ziel)]
+        for arm, sessions, file_path in _sources():
+            argv += ["--log", f"{arm}:{sessions}:{file_path}"]
+        argv += ["--punkte", _fixture("punkte.jsonl"), "--json", str(target)]
         p = subprocess.run(argv, capture_output=True, text=True, timeout=120)
         assert p.returncode == 0, p.stderr
         assert "compute/wait je Rang" in p.stdout
-        payload = json.loads(ziel.read_text())
+        payload = json.loads(target.read_text())
         assert payload["bar1_geometrie"]["schlitz_kib"] == 8188
 
     def test_a_malformed_log_spec_fails_loudly(self):
@@ -361,13 +361,13 @@ class TestBericht:
         assert "ARM:SESSIONS:PFAD" in p.stderr
 
 
-class TestHarnessLuecke:
+class TestHarnessGap:
     """The four points of the 2026-07-30 run that the summary got wrong."""
 
     def test_the_run_recorded_no_accept_at_all(self):
         """The gap this fix closes, asserted against the run's own artefacts so
         it cannot be argued away later."""
-        punkte = lade_punkte(_fixture("punkte.jsonl"))
+        punkte = load_points(_fixture("punkte.jsonl"))
         assert punkte
         for p in punkte.values():
             for d in p["decode"]:
@@ -379,12 +379,12 @@ class TestHarnessLuecke:
         window is comparable without a timezone argument."""
         import datetime
 
-        from s12_prefill_kurve import ernte_ticks
+        from s12_prefill_kurve import harvest_ticks
 
         def stempel(s):
             return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
 
-        agg = ernte_ticks(
+        agg = harvest_ticks(
             _fixture("bar1_1.log"),
             stempel("2026-07-30 13:35:12"),
             stempel("2026-07-30 13:35:14"),
@@ -397,14 +397,14 @@ class TestHarnessLuecke:
         assert "ms_pro_token" not in agg
 
     def test_a_missing_server_log_says_so_instead_of_inventing_a_number(self):
-        from s12_prefill_kurve import ernte_ticks
+        from s12_prefill_kurve import harvest_ticks
 
-        agg = ernte_ticks("", 0.0, 1.0, 1)
+        agg = harvest_ticks("", 0.0, 1.0, 1)
         assert agg["tick_fehler"] == "kein Serverlog"
         assert "tick_accept_len_median" not in agg
 
     def test_the_table_names_both_levels(self, tmp_path):
-        from s12_prefill_kurve import tabelle
+        from s12_prefill_kurve import table
 
         payload = {
             "kurven": {"bar1": {"1": 1469.0}, "grundlinie": {}},
@@ -421,23 +421,23 @@ class TestHarnessLuecke:
                 }
             ],
         }
-        text = tabelle(payload)
+        text = table(payload)
         assert "tok/s (Tick)" in text and "tok/s (Anfrage)" in text
         assert "| bar1 | 1 | 93.7 | 10.68 | 2.83 | 1 | 33.2 |" in text
 
     def test_the_table_survives_a_point_without_a_server_log(self):
-        from s12_prefill_kurve import tabelle
+        from s12_prefill_kurve import table
 
         payload = {
             "kurven": {"bar1": {"1": 1469.0}, "grundlinie": {}},
             "verhaeltnis_bar1_zu_grundlinie": {},
             "decode": [{"arm": "bar1", "batch": 1, "decode_tok_s": 33.19}],
         }
-        assert "| bar1 | 1 | None | None | None | None | 33.2 |" in tabelle(payload)
+        assert "| bar1 | 1 | None | None | None | None | 33.2 |" in table(payload)
 
     def test_the_recorded_request_rate_is_half_the_tick_rate(self, payload):
-        punkte = lade_punkte(_fixture("punkte.jsonl"))
-        anfrage = {
+        punkte = load_points(_fixture("punkte.jsonl"))
+        request = {
             (arm, sessions, d["batch"]): d["decode_tok_s"]
             for (arm, sessions), p in punkte.items()
             for d in p["decode"]
@@ -447,5 +447,5 @@ class TestHarnessLuecke:
             for d in payload["decode"]
             if d.get("ticks_gewertet")
         }
-        for schluessel, wert in anfrage.items():
-            assert tick[schluessel] > 2.0 * wert
+        for key, value in request.items():
+            assert tick[key] > 2.0 * value

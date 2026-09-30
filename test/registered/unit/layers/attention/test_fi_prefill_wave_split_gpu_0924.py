@@ -34,7 +34,7 @@ if not torch.cuda.is_available():  # pragma: no cover - desk
 # flags mirrored (flashinfer imported first, then set_cuda_arch -> 12.0a), and
 # ninja -n on a copy of the module's ninja state clean -- else SKIP instead of
 # a JIT build that dies at the 3 GiB test cap. fi_jit_cache_check.py.
-from sglang.srt.layers.attention import fi_jit_cache_check as _jit  # noqa: E402
+from flliper.srt.layers.attention import fi_jit_cache_check as _jit  # noqa: E402
 
 _JIT_OK, _JIT_LINES = _jit.check_prefill_modules(("bf16", "e4m3"))
 if not _JIT_OK:  # pragma: no cover
@@ -42,9 +42,9 @@ if not _JIT_OK:  # pragma: no cover
 
 flashinfer = pytest.importorskip("flashinfer")
 
-from sglang.srt.layers.attention import fi_prefill_wave_split as W  # noqa: E402
-from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
-from sglang.test.test_utils import CustomTestCase  # noqa: E402
+from flliper.srt.layers.attention import fi_prefill_wave_split as W  # noqa: E402
+from flliper.test.ci.ci_register import register_cuda_ci  # noqa: E402
+from flliper.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cuda_ci(est_time=30, suite="nightly-1-gpu")
 

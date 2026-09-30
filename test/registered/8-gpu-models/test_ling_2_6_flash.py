@@ -8,9 +8,9 @@ Runs nightly on the 8-GPU H200 runner with TP=4.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from flliper.test.ci.ci_register import register_cuda_ci
+from flliper.test.kits.eval_accuracy_kit import GSM8KMixin
+from flliper.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=600, suite="nightly-8-gpu-common", nightly=True)
 
@@ -19,7 +19,7 @@ class TestLing26Flash(GSM8KMixin, DefaultServerBase):
     model = "inclusionAI/Ling-2.6-flash"
 
     # Native 128K context (no YaRN) — avoids the
-    # SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN env-var dance and keeps the
+    # FLLIPER_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN env-var dance and keeps the
     # coverage focused on the dispatcher / hybrid-attention path.
     other_args = [
         "--tp-size",

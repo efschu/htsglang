@@ -1,4 +1,4 @@
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -6,9 +6,9 @@ import types
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.managers.scheduler_components.metrics_reporter import (
+from flliper.srt.disaggregation.utils import DisaggregationMode
+from flliper.srt.distributed.parallel_state_wrapper import ParallelState
+from flliper.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
@@ -185,7 +185,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            "flliper.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
             return_value=104.5,
         ):
             self.reporter._emit_forward_pass_metrics(batch)
@@ -237,7 +237,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         batch = self._make_batch()
 
         with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            "flliper.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
             return_value=100.035,
         ):
             self.reporter._emit_forward_pass_metrics(batch, result=None)
@@ -255,7 +255,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         batch = self._make_batch()
 
         with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            "flliper.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
             return_value=101.0,
         ):
             self.reporter._emit_forward_pass_metrics(batch)
@@ -276,7 +276,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         batch = self._make_batch()
 
         with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            "flliper.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
             return_value=101.0,
         ):
             self.reporter._emit_forward_pass_metrics(batch)
@@ -301,7 +301,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         scheduler.enable_kv_cache_events = False
 
         with patch(
-            "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
+            "flliper.srt.observability.forward_pass_metrics._FpmPublisherThread",
             _DummyPublisherThread,
         ):
             reporter = _make_reporter(scheduler)
@@ -329,7 +329,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         scheduler.enable_kv_cache_events = False
 
         with patch(
-            "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
+            "flliper.srt.observability.forward_pass_metrics._FpmPublisherThread",
             _DummyPublisherThread,
         ):
             reporter = _make_reporter(scheduler)

@@ -1,6 +1,6 @@
 """Unit tests for srt/sampling/penaltylib/ — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
@@ -10,19 +10,19 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.sampling.penaltylib.frequency_penalty import (
+from flliper.srt.sampling.penaltylib.frequency_penalty import (
     BatchedFrequencyPenalizer,
 )
-from sglang.srt.sampling.penaltylib.min_new_tokens import (
+from flliper.srt.sampling.penaltylib.min_new_tokens import (
     BatchedMinNewTokensPenalizer,
 )
-from sglang.srt.sampling.penaltylib.orchestrator import (
+from flliper.srt.sampling.penaltylib.orchestrator import (
     BatchedPenalizerOrchestrator,
 )
-from sglang.srt.sampling.penaltylib.presence_penalty import (
+from flliper.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
 DEVICE = "cpu"

@@ -28,7 +28,7 @@ with-no-crash outcome `_entry_for_transfer`'s docstring names.
 import pytest
 import torch
 
-from sglang.srt.mem_cache.memory_pool_host import (
+from flliper.srt.mem_cache.memory_pool_host import (
     StrayHostIndexError,
     _refuse_stray_host_index,
     _split_host_indices_by_binding,

@@ -21,7 +21,7 @@ Modellbau ansetzen und die Post-Repack-Tensoren aus dem Store fuellen.
 import os
 import tempfile
 
-from sglang.srt.layers.moe import expert_store as es
+from flliper.srt.layers.moe import expert_store as es
 
 
 def test_store_has_row_is_conservative(monkeypatch):

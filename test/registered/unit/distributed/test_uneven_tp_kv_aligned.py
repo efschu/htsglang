@@ -14,7 +14,7 @@ import itertools
 import random
 import unittest
 
-from sglang.srt.distributed.utils import (
+from flliper.srt.distributed.utils import (
     _partition_units_raw,
     attn_q_partition_groups,
     partition_sizes,
@@ -22,8 +22,8 @@ from sglang.srt.distributed.utils import (
     set_tp_partition_ratios,
     tp_partition_sizes,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 

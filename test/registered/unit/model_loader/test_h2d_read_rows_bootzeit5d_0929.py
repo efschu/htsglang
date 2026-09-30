@@ -4,7 +4,7 @@ card moves only the rows this rank read.
 
 Metal (z30w-park, [ct-stream-presplit] summed): h2d 3.76 s on D TP0 over 48
 layers while the rank read 29 of 201 expert rows per layer (H2 veto; the
-repack already skips the rest, SGLANG_MOE_REPACK_SKIP_VETOED). The unread rows
+repack already skips the rest, FLLIPER_MOE_REPACK_SKIP_VETOED). The unread rows
 crossed the bus for nothing.
 
 What must hold: every read row arrives byte-identical; the unread rows arrive
@@ -21,9 +21,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe.fused_moe_triton import layer as fl
-from sglang.srt.model_loader import loader as loader_mod
+from flliper.srt.environ import envs
+from flliper.srt.layers.moe.fused_moe_triton import layer as fl
+from flliper.srt.model_loader import loader as loader_mod
 
 
 class TestToDeviceRows(unittest.TestCase):
@@ -124,14 +124,14 @@ class TestPresplitCallEdge(unittest.TestCase):
         layer = fl.FusedMoE.__new__(fl.FusedMoE)
         torch.nn.Module.__init__(layer)
         layer.num_local_experts = 201
-        with mock.patch("sglang.srt.layers.moe.store_adopt.repack_rows",
+        with mock.patch("flliper.srt.layers.moe.store_adopt.repack_rows",
                         return_value=[0, 3, 7]) as rr:
-            with envs.SGLANG_OPT_LOAD_H2D_READ_ROWS.override(True):
+            with envs.FLLIPER_OPT_LOAD_H2D_READ_ROWS.override(True):
                 self.assertEqual(fl.ct_h2d_rows(layer), [0, 3, 7])
             rr.assert_called_once_with(layer, 201)
-            with envs.SGLANG_OPT_LOAD_H2D_READ_ROWS.override(False):
+            with envs.FLLIPER_OPT_LOAD_H2D_READ_ROWS.override(False):
                 self.assertIsNone(fl.ct_h2d_rows(layer))
-        self.assertTrue(envs.SGLANG_OPT_LOAD_H2D_READ_ROWS.get())
+        self.assertTrue(envs.FLLIPER_OPT_LOAD_H2D_READ_ROWS.get())
 
 
 class TestZeroRowsNeverLeaveTheCard(unittest.TestCase):
@@ -152,7 +152,7 @@ class TestZeroRowsNeverLeaveTheCard(unittest.TestCase):
         )
 
     def test_guard_refuses_a_resident_outside_the_cut(self):
-        from sglang.srt.layers.moe import expert_offload as eo
+        from flliper.srt.layers.moe import expert_offload as eo
 
         layer = self._layer(())
         layer._h2d_cut_rows = [0, 1, 2, 5]
@@ -165,11 +165,11 @@ class TestZeroRowsNeverLeaveTheCard(unittest.TestCase):
     def test_what_h2_lets_through_is_always_inside_the_cut(self):
         # Derived across the real functions: the cut (repack_rows) against
         # what filter_store_rows accepts as residents and keeps for writing.
-        from sglang.srt.layers.moe import store_adopt as sa
+        from flliper.srt.layers.moe import store_adopt as sa
 
         vetoed = {101, 103, 104}  # local 2, 4, 5 (pad: local = g - lo + 1)
         layer = self._layer(vetoed)
-        with envs.SGLANG_MOE_REPACK_SKIP_VETOED.override(True):
+        with envs.FLLIPER_MOE_REPACK_SKIP_VETOED.override(True):
             cut = set(sa.repack_rows(layer, 9))
         self.assertEqual(cut, {0, 1, 3, 6, 7, 8})
         rows = {e: e for e in range(1, 9)}  # every local id has a store slot
@@ -184,7 +184,7 @@ class TestZeroRowsNeverLeaveTheCard(unittest.TestCase):
                                      resident_local=[0, 2], lo=100, pad=True)
 
     def test_presplit_checks_before_it_copies_or_writes(self):
-        from sglang.srt.layers.moe import expert_offload as eo
+        from flliper.srt.layers.moe import expert_offload as eo
 
         src = textwrap.dedent(inspect.getsource(eo.presplit_expert_offload_after_repack))
         fn = ast.parse(src).body[0]

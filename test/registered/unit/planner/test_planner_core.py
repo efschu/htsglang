@@ -12,18 +12,18 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.planner import advantage as advantage_mod
-from sglang.srt.planner import capacity as capacity_mod
-from sglang.srt.planner import feasibility as feasibility_mod
-from sglang.srt.planner import hardware as hardware_mod
-from sglang.srt.planner import plan as plan_mod
-from sglang.srt.planner.feasibility import PlanRejected, plan, validate_plan_inputs
-from sglang.srt.planner.hardware import hardware_from_manual, parse_manual_gpu
-from sglang.srt.planner.model import resolve_model_ref
-from sglang.srt.planner.plan import derive_auto_plan
-from sglang.srt.uneven_perf import PlanInputs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.planner import advantage as advantage_mod
+from flliper.srt.planner import capacity as capacity_mod
+from flliper.srt.planner import feasibility as feasibility_mod
+from flliper.srt.planner import hardware as hardware_mod
+from flliper.srt.planner import plan as plan_mod
+from flliper.srt.planner.feasibility import PlanRejected, plan, validate_plan_inputs
+from flliper.srt.planner.hardware import hardware_from_manual, parse_manual_gpu
+from flliper.srt.planner.model import resolve_model_ref
+from flliper.srt.planner.plan import derive_auto_plan
+from flliper.srt.uneven_perf import PlanInputs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -397,7 +397,7 @@ class TestPlanInputsFromServerArgs(CustomTestCase):
     PlanInputs the planner builds (design §2.1/§5)."""
 
     def test_mapping(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         sa = ServerArgs(model_path="dummy")  # short-circuits __post_init__
         sa.tp_size = 3
@@ -414,7 +414,7 @@ class TestPlanInputsFromServerArgs(CustomTestCase):
         self.assertEqual(pi.kv_cache_dtype, "fp8_e4m3")
 
     def test_scalar_budget_expands_per_rank(self):
-        from sglang.srt.server_args import ServerArgs
+        from flliper.srt.server_args import ServerArgs
 
         sa = ServerArgs(model_path="dummy")
         sa.tp_size = 2

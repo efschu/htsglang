@@ -22,7 +22,7 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.kv_reshard import (
+from flliper.srt.managers.kv_reshard import (
     HOLD_ESCALATE_AFTER_S,
     HOLD_REPORT_INTERVAL_S,
     HOLD_STUCK_MARKER,
@@ -30,7 +30,7 @@ from sglang.srt.managers.kv_reshard import (
     KvReshardRuntime,
     logger as reshard_logger,
 )
-from sglang.test.test_utils import CustomTestCase
+from flliper.test.test_utils import CustomTestCase
 
 VECTORS = [(7, 3, 3), (2, 11, 10), (5, 4, 4)]
 #: A third DECLARED target. VECTORS[0] is the CURRENT vector, and arming the

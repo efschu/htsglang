@@ -14,9 +14,9 @@ import types
 import unittest
 from unittest import mock
 
-from sglang.srt import compat_shims as cs
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt import compat_shims as cs
+from flliper.test.ci.ci_register import register_cpu_ci
+from flliper.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -146,7 +146,7 @@ class TestOperatorDir(CustomTestCase):
     SUB = "we" + "g2"
 
     def test_host_paths_keep_the_operator_subdir(self):
-        from sglang.srt.weg2 import admin_key, corridor_budget
+        from flliper.srt.pdflip import admin_key, corridor_budget
 
         self.assertEqual(cs.operator_dir("/g", "a.json"), "/g/" + self.SUB + "/a.json")
         self.assertEqual(admin_key.key_path("/g", "t1"), "/g/" + self.SUB + "/boot_t1.adminkey")
@@ -168,7 +168,7 @@ class TestShmNameFamilies(CustomTestCase):
         self.assertEqual(cs.name_counterparts((self.SUB_OLD + "-seq-", self.SUB_NEW + "-seq-")), ())
 
     def test_the_launcher_sweep_lists_both_spellings(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         own = launcher.SHM_OWN_PREFIXES
         self.assertEqual(len(own), len(set(own)))
@@ -179,7 +179,7 @@ class TestShmNameFamilies(CustomTestCase):
         self.assertIn(self.SUB_NEW + "-seq-", own)
 
     def test_the_semaphore_and_credit_sweeps_see_both_spellings(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         d = tempfile.mkdtemp()
         for tok in (self.SUB_OLD, self.SUB_NEW):
@@ -209,7 +209,7 @@ class TestLegacyFlags(CustomTestCase):
         self.assertEqual(back[:5], argv[:5])
 
     def test_every_flip_flag_of_the_launcher_parses_in_both_spellings(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         opts = [o for a in launcher.build_parser()._actions for o in a.option_strings]
         run = cs.FLAG_TOKENS[0] if cs.running_package() == PKG_OLD else cs.FLAG_TOKENS[1]
@@ -246,7 +246,7 @@ class TestOtherGenerationServers(CustomTestCase):
     ENV_NEW = "FL" "LIPER_" + "PD" "FLIP_" + "BOOT_TOKEN"
 
     def setUp(self):
-        from sglang.srt.weg2 import launcher
+        from flliper.srt.pdflip import launcher
 
         self.launcher = launcher
         run = cs.running_package()
@@ -333,13 +333,13 @@ class TestOtherGenerationServers(CustomTestCase):
             f.write(b"\0" * 16)
         _fake_proc(self.proc, 30, self._server(self.other), {self.env_other: "old1:1:1"})
         lines = []
-        with self.assertRaises(L.Weg2LaunchRefused) as cm:
+        with self.assertRaises(L.PdFlipLaunchRefused) as cm:
             L.shm_residue_sweep(lines.append, "mine", "stamp", dry=True, shm_dir=shm, proc_root=self.proc,
                                 archive_root=tempfile.mkdtemp())
         self.assertIn("pid(s)=[30]", str(cm.exception))
 
     def test_vram_hires_names_the_ranks_of_either_generation(self):
-        from sglang.srt.weg2.tools import vram_hires as vh
+        from flliper.srt.pdflip.tools import vram_hires as vh
 
         for pkg in (PKG_OLD, PKG_NEW):
             m = vh._RX_SCHED.search(pkg + "::scheduler_PP2")
@@ -349,7 +349,7 @@ class TestOtherGenerationServers(CustomTestCase):
 
 class TestEnvBridgeCall(CustomTestCase):
     def test_the_package_hook_calls_the_one_helper_with_the_environment(self):
-        from sglang import _compat_boot
+        from flliper import _compat_boot
 
         seen = []
         stub = types.ModuleType("name_compat_stub")
@@ -363,7 +363,7 @@ class TestEnvBridgeCall(CustomTestCase):
         self.assertIs(seen[1], os.environ)
 
     def test_the_state_dir_is_linked_by_the_entry_points_not_at_import(self):
-        from sglang import _compat_boot
+        from flliper import _compat_boot
 
         with mock.patch.object(cs, "link_legacy_cache_dir") as link:
             _compat_boot.link_state_dir()
@@ -372,7 +372,7 @@ class TestEnvBridgeCall(CustomTestCase):
             self.assertNotIn("link_state_dir()", f.read(), "an import must not write into $HOME")
 
     def test_a_missing_helper_is_an_import_error_not_a_silent_skip(self):
-        from sglang import _compat_boot
+        from flliper import _compat_boot
 
         key = _compat_boot.__name__.rsplit(".", 1)[0] + ".srt.name_compat"
         with mock.patch.dict(sys.modules, {key: None}):
@@ -401,7 +401,7 @@ class TestSurvivesTheMechanicalRename(CustomTestCase):
             return f.read()
 
     def test_shim_files_are_a_fixed_point_of_the_rename(self):
-        from sglang import _compat_boot
+        from flliper import _compat_boot
 
         for mod in (cs, _compat_boot):
             src = self._src(mod)

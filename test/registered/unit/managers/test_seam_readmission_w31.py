@@ -33,15 +33,15 @@ WHAT THIS FILE PINS
     inputs.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from flliper.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import types
 import unittest
 
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.test.test_utils import CustomTestCase
+from flliper.srt.managers.scheduler import Scheduler
+from flliper.test.test_utils import CustomTestCase
 
 
 class _Req:
@@ -140,7 +140,7 @@ class TestEverythingRetractedComesBack(CustomTestCase):
         # 10 counts ONE L5 per cutover; a cutover whose whole population
         # finished() (k+m == 0) printed nothing on 0ad85647cb (the
         # `if population:` guard was an unnamed deviation). RED there.
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         s = _Sched()
         with self.assertLogs(sched_mod.logger, level="INFO") as caught:
@@ -270,7 +270,7 @@ class TestQueueOccupantsAreReissued(CustomTestCase):
         )
 
     def test_the_l5_line_names_both_populations(self):
-        from sglang.srt.managers import scheduler as sched_mod
+        from flliper.srt.managers import scheduler as sched_mod
 
         s = _Sched([_Req("q", 3)])
         with self.assertLogs(sched_mod.logger, level="INFO") as caught:
@@ -288,7 +288,7 @@ class TestTheStampSurvivesTheRoundTrip(CustomTestCase):
         # exemption in the TARGET layout, and that gate reads the stamp off
         # the waiting queue. A re-admission that stripped the stamp would put
         # them back somewhere strict purity still refuses to serve them.
-        from sglang.srt.managers.phase_purity import seam_readmit_candidates
+        from flliper.srt.managers.phase_purity import seam_readmit_candidates
 
         s = _Sched()
         s.readmit_seam_residents([_Req("a", 1), _Req("b", 2)])
@@ -311,7 +311,7 @@ class TestTheSeamActuallyCallsIt(CustomTestCase):
     def test_the_release_site_stashes_what_it_released(self):
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._release_residents_for_cutover)
         self.assertIn("_pending_seam_readmit", src)
@@ -320,7 +320,7 @@ class TestTheSeamActuallyCallsIt(CustomTestCase):
     def test_the_post_cutover_readmit_requeues_the_stash(self):
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._post_cutover_readmit)
         self.assertIn("_pending_seam_readmit", src)
@@ -329,7 +329,7 @@ class TestTheSeamActuallyCallsIt(CustomTestCase):
     def test_the_seam_asserts_retracted_equals_readmitted(self):
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._post_cutover_readmit)
         self.assertIn("RE-ADMISSION MISMATCH", src)
@@ -348,7 +348,7 @@ class TestTheSeamActuallyCallsIt(CustomTestCase):
         # time.
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         release_src = inspect.getsource(
             PhaseFlipRuntime._release_residents_for_cutover
@@ -370,7 +370,7 @@ class TestTheSeamActuallyCallsIt(CustomTestCase):
     def test_the_703_fence_coverage_is_asserted_not_assumed(self):
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._release_residents_for_cutover)
         self.assertIn("_writeback_fence_ms", src)
@@ -383,7 +383,7 @@ class TestOrderAgainstTheLiveUniverse(CustomTestCase):
     def test_consume_runs_before_the_requeue(self):
         import inspect
 
-        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+        from flliper.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         # the consume happens inside `_retract_and_consume`, which is passed
         # to `release_residents_for_cutover` inside the release method; the
