@@ -1367,6 +1367,15 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # X_ROUTED_NEEDS_P (#246b, 30.09., NF y4c ...dauer09300427 front 04:39:57):
+    # a queued request needs P above the X it was ROUTED on, not only above the
+    # live X. weg2-22-37 / 22-38 (4447 / 4191 tokens) were routed LONG on the
+    # X-SOLO band floor X_busy=4096 (D busy), but the ARRIVAL-SEAT step, the
+    # park collect window and the immediate park asked needs_p() against the
+    # live X 4964 -> no candidate, no verdict, no flip: D decoded one stream
+    # with 5 free seats for 128 s (DP-WAIT hold_by=d-work) until it ended.
+    # Off = needs_p() against the live X only, as before.
+    SGLANG_WEG2_ENABLE_X_ROUTED_NEEDS_P = EnvBool(True)
     # #49 rest (FS 26.09., desk/27b-frontspan2-0926 a561991382, inflight half
     # only: #49 itself runs unswitched in the unified tree since S7c): a D leg
     # 2 whose stream has delivered its first content event has PREFILLED its
