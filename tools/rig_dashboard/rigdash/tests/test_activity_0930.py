@@ -236,6 +236,18 @@ class TestIdenticalBurst(unittest.TestCase):
         self.assertEqual(ipcboot.identical_bursts([smp(0, 0, 0, 0), smp(1, 2, 3001, 0)]), [])
 
 
+class TestPrefillRoute(unittest.TestCase):
+    """y5a (d222) front.served = {D: 96, P: 74}: 74 requests through P, 22 direct on D (front.log counted
+    21 / 77 of 98 -- the mirror lags 5 s, so the derived split is labelled and the exact field proposed)."""
+
+    def test_derived_and_exact(self):
+        r = ipcboot.prefill_route({"served": {"D": 96, "P": 74}})
+        self.assertEqual((r["via_p"], r["d_direct"], r["exact"], r["missing"]), (74, 22, False, "front.routes"))
+        r = ipcboot.prefill_route({"routes": {"d_direct": 21, "via_p": 77, "d_drain": 0, "reroute_midstream": 0}})
+        self.assertEqual((r["via_p"], r["d_direct"], r["exact"]), (77, 21, True))
+        self.assertEqual(ipcboot.prefill_route({})["missing"], "front.routes")
+
+
 class TestWhatNone(unittest.TestCase):
     """NF-Operator 30.09.: flip_first_work what="none" (flip without work after it) is never a Flipzeit --
     not in the tiles, the median, the marks' value or the flip tail -- even if flip_time_ms is set."""

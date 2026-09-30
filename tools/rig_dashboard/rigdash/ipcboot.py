@@ -502,6 +502,22 @@ def cache_view(ring, keys, now) -> dict:
     return out
 
 
+def prefill_route(front: dict) -> dict:
+    """Where the prefills ran (Nutzer 30.09.: "wird jeder Prefill zu P geflippt?").  Exact only with
+    the front field ``front.routes`` {d_direct, via_p, d_drain, reroute_midstream} (proposed, writer
+    weg2/front.py at the X-EXACT-ERR via classification); until then derived from ``front.served``:
+    every request through P has one P leg and one D leg, a D-direct request only a D leg, so
+    d_direct = D legs - P legs (mirror every 5 s, reroutes invisible) -- labelled as derived."""
+    r = (front or {}).get("routes")
+    if isinstance(r, dict):
+        return dict(r, src="front.routes", exact=True)
+    sv = (front or {}).get("served")
+    if not isinstance(sv, dict) or sv.get("P") is None or sv.get("D") is None:
+        return {"src": None, "exact": False, "missing": "front.routes"}
+    return {"via_p": sv["P"], "d_direct": max(0, sv["D"] - sv["P"]), "src": "front.served (D − P, abgeleitet)",
+            "exact": False, "missing": "front.routes"}
+
+
 def boot_start(ipc: dict) -> Optional[float]:
     for part in (ipc.get("boot_id") or "").split("-"):
         if len(part) == 16 and part[8] == "T" and part.endswith("Z"):
@@ -635,6 +651,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
         "decode": {g: dv for g in groups if g in ("D", "single")
                    for dv in [decode_view(m, g, front, now)] if dv},
         "totals": totals_view(ring, keys, front, t0, now),
+        "prefill_route": prefill_route(front),
         "cache": cache_view(ring, keys, now),
         "series": series_view(m, now),
         "timeline": timeline_view(m, live, _awake(m, front), now, t0),

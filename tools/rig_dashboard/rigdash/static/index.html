@@ -845,6 +845,16 @@ function cacheHtml(b, now, awake) {
 
 // Release-Kopfzeile (NF-Operator 30.09.): kein Tag, keine REV/Image-SHA, kein Profil-, Zweig- oder
 // Container-Name, keine Startform/Env -- das bleibt der Rig-Ausgabe vorbehalten
+// Prefill-Ort (Nutzer 30.09.: "wird jeder Prefill zu P geflippt?"): exakt nur mit dem Front-Feld
+// state.json front.routes {d_direct, via_p, d_drain, reroute_midstream}; bis dahin aus front.served
+// abgeleitet -- jede Anfrage über P hat genau ein P-Leg und ein D-Leg, eine D-direkte nur ein D-Leg,
+// also direkt auf D = D-Legs − P-Legs (Spiegel alle 5 s, Umleitungen nicht erkennbar)
+function prefillOrt(b) {
+  const r = b.prefill_route || {};
+  if (r.via_p == null) return ["Prefill-Ort (Anfragen)", MISSTAG("front.routes")];
+  const v = `&uuml;ber P ${fmt(r.via_p)} &middot; direkt auf D ${fmt(r.d_direct)}${r.d_drain != null ? " &middot; D-Drain " + fmt(r.d_drain) : ""}${r.reroute_midstream != null ? " &middot; umgeleitet " + fmt(r.reroute_midstream) : ""}`;
+  return ["Prefill-Ort (Anfragen)", r.exact ? `${v} ${ipcTag(r.src)}` : `${v} <span class="muted">(abgeleitet: D-Legs − P-Legs)</span> ${MISSTAG("front.routes (exakt)")}`];
+}
 function relHead(b, ipc, topo) {
   if (!ipc) return topo ? esc(topo) : "";
   return `lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json")}`;
@@ -940,6 +950,7 @@ function bootCard(b, now, binders) {
           ...flipRows,
           ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue"))],
           fr && fr.served ? ["bedient P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/weg2/state")}`] : null,
+          prefillOrt(b),
           ["Fehlerzeilen (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
           fieldIpc(b, "B1") ? ["Flipzeit P&rarr;D (1. Decode-Token) median / letzte", `${fmt(fieldIpc(b, "B1").value.median_ms)} / ${fmt(fieldIpc(b, "B1").value.last_ms)} ms ${ipcTag("flip_first_work")}`] : null,
           fieldIpc(b, "B2") ? ["Flipzeit D&rarr;P (1. P-Arbeit) median / letzte", `${fmt(fieldIpc(b, "B2").value.median_ms)} / ${fmt(fieldIpc(b, "B2").value.last_ms)} ms ${ipcTag("flip_first_work")}`] : null,
