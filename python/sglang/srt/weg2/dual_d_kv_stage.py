@@ -208,8 +208,7 @@ def attach(runner) -> Optional[DKvStage]:
     card = str(torch.cuda.get_device_properties(dev).uuid)
     tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
     ledger = CardKvLedger(ledger_path(tag, card), "D")
-    pool = runner.token_to_kv_pool
-    pools = [pool] + ([pool.full_kv_pool] if hasattr(pool, "full_kv_pool") else [])
+    pools = _pk.stage_pools(runner.token_to_kv_pool)
     actor = DKvStage(list(_D_BORN), ledger, allocator=runner.token_to_kv_pool_allocator, pools=pools,
                      page_size=int(runner.page_size), granule=_sv.granule_for(dev), top_tokens=max_tokens(),
                      sync=lambda: torch.cuda.synchronize(dev))

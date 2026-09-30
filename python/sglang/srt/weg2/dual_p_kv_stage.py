@@ -124,6 +124,20 @@ def born(pool, t, name: str, *, spans=None, granule: Optional[int] = None):
     return t
 
 
+def stage_pools(pool) -> List[object]:
+    """The pools whose stage rows follow the mapping: the MHATokenToKVPool
+    itself, or the inner FA pool of a HybridLinearKVPool (the 27B's
+    token_to_kv_pool; the wrapper has no ``set_stage_backed_rows`` -- metal
+    dgkpwa 30.09. died on exactly that). Same resolution as
+    ``d_seat_vram.bound_stage_tokens``."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+    subs = [pool]
+    if isinstance(pool, HybridLinearKVPool):
+        subs.append(getattr(pool, "full_kv_pool", None))
+    return [s for s in subs if isinstance(s, MHATokenToKVPool)]
+
+
 class PKvStage:
     """This P rank's share of the card pool. ``born``: the registered tensors;
     ``ledger``: its ``CardKvLedger`` (group P); ``pools`` get their backed rows,
@@ -245,8 +259,7 @@ def attach(runner) -> Optional["PKvStage"]:
     card = str(torch.cuda.get_device_properties(dev).uuid)
     tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
     ledger = CardKvLedger(ledger_path(tag, card), "P")
-    pool = runner.token_to_kv_pool
-    pools = [pool] + ([pool.full_kv_pool] if hasattr(pool, "full_kv_pool") else [])
+    pools = stage_pools(runner.token_to_kv_pool)
     actor = PKvStage(list(_P_BORN), ledger, allocator=runner.token_to_kv_pool_allocator, pools=pools,
                      page_size=int(runner.page_size), granule=_sv.granule_for(dev),
                      top_tokens=max_tokens(), sync=lambda: torch.cuda.synchronize(dev))

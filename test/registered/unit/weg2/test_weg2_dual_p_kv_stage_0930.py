@@ -214,3 +214,30 @@ class DualPKvStage(CustomTestCase):
         self.assertEqual(st.release_all(), committed)
         self.assertEqual(K.peek(paths[0]).committed["P"], 0)
 
+
+
+class HybridPoolResolution(CustomTestCase):
+    """Metal dgkpwa (...09300754): 'HybridLinearKVPool' object has no attribute
+    'set_stage_backed_rows' on every rank -- the 27B pool is the hybrid wrapper,
+    the stage rows belong to its inner FA pool (MHATokenToKVPool)."""
+
+    def test_stage_pools_resolve_the_inner_fa_pool(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+        mha = object.__new__(MHATokenToKVPool)
+        hybrid = object.__new__(HybridLinearKVPool)
+        hybrid.full_kv_pool = mha
+        self.assertEqual(S.stage_pools(hybrid), [mha])
+        self.assertEqual(S.stage_pools(mha), [mha])
+
+    def test_move_on_a_hybrid_wrapped_pool_sets_the_inner_rows(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+        mha = object.__new__(MHATokenToKVPool)
+        hybrid = object.__new__(HybridLinearKVPool)
+        hybrid.full_kv_pool = mha
+        geom = S._geom_for(torch.zeros(16448, 512), 16384, 64, "k", ALLOC)
+        st = S.PKvStage([(1, geom)], object(), allocator=object(), pools=S.stage_pools(hybrid), page_size=64,
+                        granule=G, top_tokens=16384, spans=FakeSpans(), engage_cap=lambda *a: None)
+        st._move(4096)
+        self.assertEqual(mha._stage_backed_rows, geom.slots_for(4096))
