@@ -3113,12 +3113,23 @@ class SchedulerWeightUpdaterManager:
             return
         if not st:
             return
+        # PAUSE-MAPS (patch 5): the extent census of the same record
+        from sglang.srt.weg2 import pause_maps as _pm
+
+        maps = None
+        mgetter = getattr(self.memory_saver_adapter, "pause_maps_stats", None)
+        if mgetter is not None:
+            try:
+                maps = mgetter(tag)
+            except Exception:  # noqa: BLE001 -- an instrument never breaks the leg
+                maps = None
         logger.info(
             "WEG2-PAUSE-SUB tag=%s allocs=%d unmaps=%d unmap_ms=%.1f release_ms=%.1f "
-            "native_ms=%.1f pause_ms=%.1f (unmaps = cuMemUnmap calls: stock mappings + "
-            "H95c extents; native_ms = the saver's whole pause call)",
+            "native_ms=%.1f pause_ms=%.1f%s (unmaps = cuMemUnmap calls: stock mappings + "
+            "H95c extents, one per coalesced run under PAUSE-MAPS; native_ms = the "
+            "saver's whole pause call)",
             tag, st["allocations"], st["unmaps"], st["unmap_ms"], st["release_ms"],
-            st["total_ms"], float(pause_ms))
+            st["total_ms"], float(pause_ms), _pm.sub_suffix(maps))
 
     def _weg2_xchg_wake_source_gap(self, tag, *, cdescs_present: bool,
                                    resident_bytes: Optional[int] = None,
@@ -9307,6 +9318,12 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_flip_index_now = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
             except Exception:  # noqa: BLE001 -- the stubs carry no epoch: the counter seq stays
                 pass
+            # PAUSE-MAPS (patch 5): the saver's unmap form for this leg's
+            # pauses -- one cuMemUnmap per contiguous run of H95c extents
+            # (switch on) or per extent (off, the walk call for call).
+            from sglang.srt.weg2 import pause_maps as _weg2_pause_maps
+
+            _weg2_pause_maps.arm(self.memory_saver_adapter)
             # fnFL2 H111b: the pair lanes one tag ahead of the pause
             # (weg2/deposit_lookahead.py); the scope yields None = lockstep.
             with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)), \

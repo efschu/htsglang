@@ -767,6 +767,15 @@ class Envs:
     SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(False)
     # the sleeping group(s) that take it (comma list; default the D->P leg).
     SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
+    # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
+    # the saver's pause releases a span-mapped (H95c) allocation with ONE
+    # cuMemUnmap per contiguous run of extents instead of one per extent.
+    # Measured y4i (WEG2-PAUSE-SUB): 3080 D tag = 10 allocations, 31-64
+    # cuMemUnmap calls, 21-25 ms; the same tag before the first D phase (no
+    # extents, 10 calls) 10.6 ms. False = the per-extent walk, call for call.
+    # Off until metal (the driver may refuse a multi-mapping range: that run
+    # then falls back to the per-extent walk and the line counts it).
+    SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP = EnvBool(False)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.

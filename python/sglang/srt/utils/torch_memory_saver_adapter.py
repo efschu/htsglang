@@ -151,6 +151,12 @@ class TorchMemorySaverAdapter(ABC):
     def pause_stats(self, tag: str):
         raise NotImplementedError
 
+    def pause_maps_stats(self, tag: str):
+        raise NotImplementedError
+
+    def set_pause_coalesce(self, on: bool):
+        raise NotImplementedError
+
     def ring_stats(self):
         raise NotImplementedError
 
@@ -435,6 +441,45 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
                 "unmap_ms": float(unmap_ms.value), "release_ms": float(release_ms.value),
                 "total_ms": float(total_ms.value)}
 
+    def pause_maps_stats(self, tag: str):
+        """PAUSE-MAPS (30.09., patch 5): the extent census of the LAST
+        ``pause`` -- ``{"extents", "runs", "fallbacks", "coalesce"}`` -- or
+        None (a hook without ``tms_pause_maps_stats``, no pause recorded, or
+        the record is another tag's). Contract of :meth:`pause_stats`."""
+        import ctypes
+
+        fn = _weg2_ring_symbol("tms_pause_maps_stats")
+        if fn is None:
+            return None
+        buf = ctypes.create_string_buffer(256)
+        extents = ctypes.c_uint64(0)
+        runs = ctypes.c_uint64(0)
+        fallbacks = ctypes.c_uint64(0)
+        coalesce = ctypes.c_int(0)
+        fn.restype = ctypes.c_uint64
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+                       ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+                       ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int)]
+        seq = int(fn(buf, ctypes.c_size_t(len(buf)), ctypes.byref(extents),
+                     ctypes.byref(runs), ctypes.byref(fallbacks), ctypes.byref(coalesce)))
+        if seq == 0 or buf.value.decode() != tag:
+            return None
+        return {"extents": int(extents.value), "runs": int(runs.value),
+                "fallbacks": int(fallbacks.value), "coalesce": bool(coalesce.value)}
+
+    def set_pause_coalesce(self, on: bool):
+        """PAUSE-MAPS: switch the saver's coalesced unmap; returns the state
+        the saver now holds, or None when the preloaded hook has no
+        ``tms_set_pause_coalesce`` (stock wheel / an older patch set)."""
+        import ctypes
+
+        fn = _weg2_ring_symbol("tms_set_pause_coalesce")
+        if fn is None:
+            return None
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_int]
+        return bool(fn(ctypes.c_int(1 if on else 0)))
+
     def ring_stats(self):
         """C8/C7: the live per-card host-ring counters, or None when this boot
         published no ring (then the stock ``cudaMallocHost`` path is running and
@@ -503,6 +548,12 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         return None
 
     def pause_stats(self, tag: str):
+        return None
+
+    def pause_maps_stats(self, tag: str):
+        return None
+
+    def set_pause_coalesce(self, on: bool):
         return None
 
     def ring_stats(self):
