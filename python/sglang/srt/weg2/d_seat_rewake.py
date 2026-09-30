@@ -74,9 +74,14 @@ class RewakeState:
     idle_rounds: int = 0
     refused: Dict[str, int] = field(default_factory=dict)
     epoch: Optional[str] = None
+    #: the trigger the current free-seat stretch runs under (round / idle)
+    trigger: Optional[str] = None
+    #: the last HELD key (epoch, reason) -- one line per change
+    held: Optional[tuple] = None
     counters: Dict[str, int] = field(default_factory=lambda: {"grow": 0, "shrink": 0,
                                                               "grow_refused": 0, "shrink_refused": 0,
-                                                              "shrink_asked": 0})
+                                                              "shrink_asked": 0, "shrink_idle": 0,
+                                                              "shrink_held": 0})
 
 
 def price_ms(rs: RewakeState, wake_apply_ms: Optional[float]) -> Optional[float]:
@@ -92,6 +97,69 @@ def price_ms(rs: RewakeState, wake_apply_ms: Optional[float]) -> Optional[float]
     if wake_apply_ms is not None:
         return 2.0 * float(wake_apply_ms)
     return None
+
+
+TRIGGER_ROUND = "round"
+TRIGGER_IDLE = "idle"
+#: idle iterations (replicated: the idle state is) between two shrink questions of an EMPTY D --
+#: the idle loop polls up to 50 ms, so ~0.4 s; the collective is allowed there, nothing decodes
+IDLE_ASK_ROUNDS = 8
+
+
+def idle_riegel(sched: Any, st: Any) -> Optional[str]:
+    """The named reason NOT to re-plan now, or None. All inputs replicated (the
+    RPCs and the request lists reach every rank alike), so every rank holds or
+    goes in the same iteration -- the group MIN below is never entered by some.
+
+    * ``dormant``           -- D sleeps (the sleep RPC was processed);
+    * ``flip_park``         -- the front's flip parked D's requests (park_running): the sleep follows;
+    * ``dormant_hold``      -- a dormant hold (#1443) is in force;
+    * ``wake_settle``       -- the post-wake settle (#1471) is still running;
+    * ``wake_legs``         -- a wake has begun but its seat-count leg has not arrived (n not fixed);
+    * ``admission_chunk``   -- a chunked prefill is being admitted."""
+    if getattr(sched, "weg2_dormant", False):
+        return "dormant"
+    if getattr(sched, "weg2_d_parked", None):
+        return "flip_park"
+    if getattr(sched, "weg2_dormant_hold", None):
+        return "dormant_hold"
+    if getattr(sched, "weg2_post_wake_settle", None):
+        return "wake_settle"
+    if st is not None and not getattr(st, "has_n", True):
+        return "wake_legs"
+    if getattr(sched, "chunked_req", None) is not None:
+        return "admission_chunk"
+    return None
+
+
+def highest_used_slot(slot_used) -> int:
+    """The highest slot id in use (0 = none) of the allocator's ledger."""
+    try:
+        idx = slot_used.nonzero()
+        ids = [int(x) for x in (idx.reshape(-1).tolist() if hasattr(idx, "reshape") else idx)]
+    except AttributeError:
+        ids = [i for i, u in enumerate(slot_used) if u]
+    return max(ids) if ids else 0
+
+
+def seats_covering(size: int, cap: int, top_slot: int, lo: int) -> int:
+    """The fewest seats >= ``lo`` whose slot limit covers ``top_slot``."""
+    from sglang.srt.weg2 import d_seat_vram as V
+
+    for m in range(max(1, int(lo)), int(cap)):
+        if V.phase_slot_limit(size, m, cap) >= int(top_slot):
+            return m
+    return int(cap)
+
+
+def _note_held(sched: Any, rs: "RewakeState", st: Any, why: str, n: int, down: int) -> None:
+    """One named line per (epoch, reason) change: a shrink that is due but held."""
+    key = (st.epoch if st is not None else None, why.split(" ")[0])
+    if rs.held == key:
+        return
+    rs.held = key
+    rs.counters["shrink_held"] += 1
+    logger.info("%s SHRINK HELD n=%d (wanted %d) why=%s", MARKER, n, down, why)
 
 
 def grow_target(n: int, cap: int, running: int, waiting: int) -> Optional[int]:
@@ -266,23 +334,41 @@ def tick(sched: Any) -> Optional[str]:
     if down is None or not _stage_ok(down):
         rs.idle_since, rs.idle_rounds = None, 0
         return None
-    now = time.monotonic()
-    if rs.idle_since is None:
-        rs.idle_since, rs.idle_rounds = now, 0
-    rs.idle_rounds += 1
-    if rs.idle_rounds % SHRINK_ASK_ROUNDS:
+    # IDLE (30.09., NF-Operator): an EMPTY D shrinks too -- the idle loop still
+    # iterates (IdleSleeper polls <= 50 ms), and no decode waits for the pause.
+    # Never while a sleep, a flip or a wake is under way or a request is being
+    # admitted (the remap must not race them): the RIEGEL, named.
+    riegel = idle_riegel(sched, st)
+    if riegel is not None:
+        _note_held(sched, rs, st, riegel, n, down)
+        rs.idle_since, rs.idle_rounds = None, 0
         return None
-    # the slots above the new limit must be free: the allocator decides (replicated)
+    trigger = TRIGGER_IDLE if not running else TRIGGER_ROUND
+    now = time.monotonic()
+    if rs.idle_since is None or rs.trigger != trigger:
+        rs.idle_since, rs.idle_rounds, rs.trigger = now, 0, trigger
+    rs.idle_rounds += 1
+    if rs.idle_rounds % (IDLE_ASK_ROUNDS if trigger == TRIGGER_IDLE else SHRINK_ASK_ROUNDS):
+        return None
+    # the slots above the new limit must be free: the allocator decides (replicated).
+    # y4x 16:33:26-36 (D empty, 4 GDN slots held by the tree, mamba usage 0.11):
+    # the all-or-nothing test for n=1 held n=6 silently. Now: the fewest seats
+    # whose limit covers every slot in use -- a partial shrink, named when held.
     pool = V._req_pool(sched)
     allocator = getattr(pool, "mamba_allocator", None)
     if allocator is not None and hasattr(allocator, "slot_used"):
         size = int(getattr(allocator, "size", 0) or 0)
-        lim = V.phase_slot_limit(size, down, cap)
         try:
-            if bool(allocator.slot_used[lim + 1:].any()):
-                return None
+            top = highest_used_slot(allocator.slot_used)
         except Exception:  # noqa: BLE001 -- unreadable ledger: no shrink
+            _note_held(sched, rs, st, "slot_ledger_unreadable", n, down)
             return None
+        fit = seats_covering(size, cap, top, down)
+        if fit >= n:
+            _note_held(sched, rs, st, "slots_held (highest slot in use %d > limit of n=%d; the tree keeps "
+                       "GDN states there)" % (top, n - 1), n, down)
+            return None
+        down = fit
     price = price_ms(rs, getattr(st, "apply_ms", None))
     idle_s = now - rs.idle_since
     rs.counters["shrink_asked"] += 1
@@ -298,10 +384,13 @@ def tick(sched: Any) -> Optional[str]:
         return None
     rs.shrink_ms = ms
     rs.counters["shrink"] += 1
-    rs.idle_since, rs.idle_rounds = None, 0
-    logger.warning("%s SHRINK n=%d->%d running=%d idle_s=%.2f price_ms=%s pause_ms=%.1f (%s) rows_on %s->%s "
-                   "mamba_keep=%s (the free seats' pages went back to expert rows)", MARKER, n, down,
-                   len(running), idle_s, "-" if price is None else "%.1f" % price, ms,
+    if trigger == TRIGGER_IDLE:
+        rs.counters["shrink_idle"] += 1
+    rs.idle_since, rs.idle_rounds, rs.held = None, 0, None
+    logger.warning("%s SHRINK n=%d->%d running=%d trigger=%s idle_ms=%.0f idle_s=%.2f price_ms=%s pause_ms=%.1f "
+                   "(%s) rows_on %s->%s mamba_keep=%s (the free seats' pages went back to expert rows)",
+                   MARKER, n, down, len(running), trigger, idle_s * 1000.0, idle_s,
+                   "-" if price is None else "%.1f" % price, ms,
                    parts_text(V.controller(sched), ms), rows0,
                    getattr(V.controller(sched), "rows_on", None),
                    getattr(V.controller(sched), "mamba_keep", None))
