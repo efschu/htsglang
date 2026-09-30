@@ -30,6 +30,11 @@ def main() -> int:
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--top", type=int, default=196608)
     ap.add_argument("--row-bytes", type=int, default=2048)
+    ap.add_argument("--control", action="store_true",
+                    help="allocate the saver tensor but never trim it: tells whether the exit-time "
+                         "'release_block invalid argument' is trim-specific or the saver's teardown order")
+    ap.add_argument("--explicit-free", action="store_true",
+                    help="free every saver tensor and empty the cache BEFORE interpreter exit (G5)")
     a = ap.parse_args()
     dev = torch.device("cuda", a.device)
     torch.cuda.set_device(dev)
@@ -50,6 +55,14 @@ def main() -> int:
     with saver.region("kv_cache"):
         t = torch.zeros(rows, a.row_bytes // 2, dtype=torch.bfloat16, device=dev)
     ptr0 = t.data_ptr()
+    if a.control:
+        print("CONTROL: saver tensor allocated, never trimmed; exiting now (watch for terminate at exit)")
+        if a.explicit_free:
+            del t
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            print("G5 explicit free before exit -> done")
+        return 0
     info = spans.info(ptr0)
     geom = pk._geom_for(t, a.top, page, "k0", info.size)
     cuts = [geom.slots_for(k) for k in pk.lattice(a.top, step)]
@@ -102,6 +115,16 @@ def main() -> int:
     print("G4 live shrink rc=%d freed_mib=%.0f graph_ok=%s -> %s" % (
         rc, (free_s - free_g) / 2**20, torch.equal(out, val), "PASS" if g4 else "FAIL"))
     ok &= g4
+    if a.explicit_free:
+        # G5: the saver frees its span extents while it is alive (not in the
+        # interpreter's static teardown, where its metadata may already be gone)
+        del graph, t, out, val
+        import gc
+
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        print("G5 explicit free before exit -> done")
     print("UNIFIED-KV GATE", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
