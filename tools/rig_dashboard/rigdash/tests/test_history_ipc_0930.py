@@ -181,7 +181,14 @@ class TestViewPowerSum(unittest.TestCase):
         v = history.view(db, None, "27B", "15m", now=now)
         i = v["t"].index(9900)
         self.assertEqual(v["series"]["gsum.power"][i], 350.0)
-        self.assertEqual(v["series"]["gsum.power"][v["t"].index(9905)], 90.0)     # one card reported: its value, not a gap
+        # 30.09. ~21:10Z (Sprunghaftigkeit): a bucket where one card has no reading is a gap, never the
+        # sum of the others -- that was a 200-400 W drop each time the 5090's NVML second slipped
+        self.assertIsNone(v["series"]["gsum.power"][v["t"].index(9905)])
+        # a slipped second (9901 without g1) holds g1's reading of 9900 (at most 2 s): sum, no dip
+        db.put([("g0.power", 9901, 110.0)])
+        v = history.view(db, None, "27B", "15m", now=now)
+        self.assertEqual(v["series"]["gsum.power"][v["t"].index(9901)], 360.0)
+        self.assertEqual(v["series"]["g1.power"][v["t"].index(9901)], 250.0)
         self.assertEqual(v["src"]["power"], "NVML, Summe aller Karten")
         self.assertNotIn("now_tiles", v["src"])                        # the log "jetzt" tiles are gone
 

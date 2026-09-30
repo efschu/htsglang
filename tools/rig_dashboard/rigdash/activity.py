@@ -179,9 +179,47 @@ def _minus(s: float, e: float, wins) -> List[Tuple[float, float]]:
     return [(x, y) for x, y in parts if y - x > 1e-3]
 
 
+def _bs_of(a: dict, b: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """(time-weighted mean, min, max) batch size of the decode rounds between two records of one rank,
+    from the Δ of ``decode.gpu_ms_by_bs`` {bs: [rounds, ms]} -- every round of the interval by its own
+    duration.  (None, None, None) without the counter (then the caller falls back to decode.running)."""
+    x, y = b.get("by_bs"), a.get("by_bs") or {}
+    if not isinstance(x, dict):
+        return None, None, None
+    num = den = 0.0
+    seen = []
+    for k, v in x.items():
+        try:
+            bs = float(k)
+            n1, ms1 = float(v[0]), float(v[1])
+            p = y.get(k) or (0, 0.0)
+            n0, ms0 = float(p[0]), float(p[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        dn, dms = n1 - n0, ms1 - ms0
+        if dn < 0 or dms < 0:              # the counter restarted
+            dn, dms = n1, ms1
+        if dn > 0 and dms > 0:
+            num += bs * dms
+            den += dms
+            seen.append(bs)
+    if den <= 0:
+        return None, None, None
+    return num / den, min(seen), max(seen)
+
+
 def decode_intervals(ring, keys, g: str, excl) -> List[dict]:
     """Decode work between two samples of the group's first rank, flip windows cut out.  ``steady``
-    = decode also in the sample before and after (a full-speed interval, the per-stream instrument)."""
+    = decode also in the sample before and after (a full-speed interval, the per-stream instrument).
+
+    The honest denominator (Nutzer 30.09. ~21:05Z: "der decode durchsatz ... extrem sprunghaft"):
+    ``busy`` = the seconds of the interval D really decoded.  A steady interval decoded all of its
+    time; the first and the last interval of a stretch hold time before the first / after the last
+    round, so there ``busy`` = the rounds' own time (Δdecode.gpu_ms) scaled by the boot's measured
+    wall/GPU ratio of the steady intervals, capped at the interval.  ``seat_s`` = busy x the mean
+    batch size of its rounds (Δgpu_ms_by_bs, time-weighted; else decode.running) -- the seat-seconds
+    the tokens were produced in, so tokens / seat_s is the rate per stream and seat_s / busy the mean
+    number of seats, both only over the time D decoded (sleep and flips never count as 0 seats)."""
     k0, _ = stage_keys(keys, g)
     if k0 is None:
         return []
@@ -200,10 +238,26 @@ def decode_intervals(ring, keys, g: str, excl) -> List[dict]:
         steady = (0 < i < len(raw) - 1 and raw[i - 1][2] > 0 and raw[i + 1][2] > 0
                   and dur >= 0.8 * (b["ts"] - a["ts"]))
         run = b.get("running") or a.get("running")
+        bs, bmin, bmax = _bs_of(a, b)
+        bsrc = "by_bs" if bs is not None else None
+        if bs is None and run:
+            bs = bmin = bmax = float(run)
+            bsrc = "running"
         out.append({"s": parts[0][0], "e": parts[-1][1], "parts": parts, "dur": dur, "tok": dk,
                     "gpu_ms": _d(b, a, "dgpu"),
                     "run": run, "bs": b.get("last_bs"), "steady": steady,
+                    "bs_mean": bs, "bs_min": bmin, "bs_max": bmax, "bs_src": bsrc,
                     "stream": (dk / dur / run) if steady and run else None})
+    # the wall/GPU ratio of steady decoding: a round's gpu_ms misses the host time between rounds
+    sd = sum(x["dur"] for x in out if x["steady"] and (x["gpu_ms"] or 0) > 0)
+    sg = sum(x["gpu_ms"] / 1000.0 for x in out if x["steady"] and (x["gpu_ms"] or 0) > 0)
+    ratio = min(3.0, max(1.0, sd / sg)) if sg > 0 else 1.0
+    for x in out:
+        if x["steady"] or not (x["gpu_ms"] or 0) > 0:
+            x["busy"] = x["dur"]
+        else:
+            x["busy"] = max(1e-3, min(x["dur"], ratio * x["gpu_ms"] / 1000.0))
+        x["seat_s"] = x["busy"] * x["bs_mean"] if x["bs_mean"] else None
     return out
 
 
@@ -224,6 +278,13 @@ def decode_stretches(iv: List[dict]) -> List[dict]:
     for o in out:
         o["rate"] = o["tok"] / o["dur"] if o["dur"] >= 2.0 else None
     return out
+
+
+def _busy_spans(cs: List[dict]) -> List[dict]:
+    """The time prefill ran: the unique spans its chunks' tokens are spread over (one per burst), so
+    tokens / busy is the burst rate with exactly the denominator the curve used."""
+    seen = sorted({(a, b) for c in cs for a, b in (c.get("parts") or [(c["s"], c["e"])]) if b > a})
+    return [{"s": a, "e": b, "parts": [(a, b)], "w": b - a} for a, b in seen]
 
 
 def spread(items, lo: float, n: int, step: float, key: str = "tok", excl=None) -> List[float]:
@@ -436,9 +497,41 @@ class Model:
         return cur or default
 
     # --- buckets ------------------------------------------------------------
+    def coverage(self, lo: float, n: int, step: float) -> List[float]:
+        """Seconds of each bucket the dashboard watched: the stretch between two consecutive samples
+        at most SAMPLE_GAP_S apart.  The sampler's loop slips (measured on the live service 30.09.
+        ~21:10Z: ~28 % of the 1-s rows held no sample, because a poll took > 1 s under /api/live load),
+        but the work between two samples is placed by the rank clocks (spread), so such a second is
+        observed, not missing -- it was drawn as a gap and broke every curve into pieces."""
+        cov = [0.0] * n
+        hi = lo + n * step
+        for a, b in zip(self.ring, self.ring[1:]):
+            if b["t"] - a["t"] > SAMPLE_GAP_S:
+                continue
+            x, y = max(a["t"], lo), min(b["t"], hi)
+            while x < y:
+                i = int((x - lo) // step)
+                z = min(y, lo + (i + 1) * step)
+                if 0 <= i < n:
+                    cov[i] += z - x
+                x = z
+        for s in self.ring:                      # a lone sample still marks its bucket as seen
+            i = int((s["t"] - lo) // step)
+            if 0 <= i < n and cov[i] <= 0:
+                cov[i] = 1e-3
+        return cov
+
     def buckets(self, lo: float, n: int, step: float) -> Dict[str, List[Optional[float]]]:
-        """Rates (tok/s) and levels per bucket; None where no sample of the boot lies in the bucket."""
-        have = [False] * n
+        """Rates (tok/s) and levels per bucket; None where the dashboard did not watch the boot.
+
+        Next to the wall rates (tokens / bucket, the energy and token accounting) the honest
+        denominators (Nutzer 30.09. ~21:05Z): ``dec_busy`` / ``p_busy`` / ``d_busy`` = the share of the
+        bucket the phase really worked, ``dec_seat`` = seat-seconds per second, ``dec_bs_min/max`` =
+        the smallest / largest batch of its rounds.  Tokens / busy is the rate WHILE working, which
+        stays level across the D-extend and flip pauses instead of dipping to their share of the bucket;
+        stored as shares, the division stays right at every history tier."""
+        cov = self.coverage(lo, n, step)
+        have = [c > 0 for c in cov]
         kv = [[0.0, 0] for _ in range(n)]
         kvp = [[0.0, 0] for _ in range(n)]
         kD, _ = stage_keys(self.keys, self.dec_group) if self.dec_group else (None, None)
@@ -454,31 +547,52 @@ class Model:
                     acc[i][0] += 100.0 * r["kv"]
                     acc[i][1] += 1
         pc = self.pchunks
-        p_tok = spread(pc.get("P", []) + pc.get("single", []), lo, n, step)
+        pcs = pc.get("P", []) + pc.get("single", [])
+        p_tok = spread(pcs, lo, n, step)
         d_tok = spread(pc.get("D", []), lo, n, step)
         dec = spread(self.dec, lo, n, step)
-        cache_p = spread(pc.get("P", []) + pc.get("single", []), lo, n, step, key="cached")
+        cache_p = spread(pcs, lo, n, step, key="cached")
         cache_d = spread(pc.get("D", []), lo, n, step, key="cached")
-        sw = [[0.0, 0.0] for _ in range(n)]
+        p_busy = spread(_busy_spans(pcs), lo, n, step, key="w")
+        d_busy = spread(_busy_spans(pc.get("D", [])), lo, n, step, key="w")
+        dec_busy = spread(self.dec, lo, n, step, key="busy")
+        dec_seat = spread(self.dec, lo, n, step, key="seat_s")
+        bmin: List[Optional[float]] = [None] * n
+        bmax: List[Optional[float]] = [None] * n
         for x in self.dec:
-            if x["stream"] is None:
+            if x.get("bs_min") is None:
                 continue
             for a, b in x["parts"]:
-                while a < b:
-                    i = int((a - lo) // step)
-                    z = min(b, lo + (i + 1) * step)
-                    if 0 <= i < n:
-                        sw[i][0] += x["stream"] * (z - a)
-                        sw[i][1] += z - a
-                    a = z
+                i0, i1 = int((max(a, lo) - lo) // step), int((min(b, lo + n * step) - lo - 1e-9) // step)
+                for i in range(max(0, i0), min(n - 1, i1) + 1):
+                    bmin[i] = x["bs_min"] if bmin[i] is None else min(bmin[i], x["bs_min"])
+                    bmax[i] = x["bs_max"] if bmax[i] is None else max(bmax[i], x["bs_max"])
         out: Dict[str, List[Optional[float]]] = {}
         g = lambda arr: [(v / step) if have[i] else None for i, v in enumerate(arr)]  # noqa: E731
         out["p_tps"], out["d_tps"], out["dec_tps"] = g(p_tok), g(d_tok), g(dec)
         out["tok_comp_p"], out["tok_comp_d"] = out["p_tps"], out["d_tps"]
         out["tok_cache"], out["tok_dcached"] = g(cache_p), g(cache_d)
-        out["stream_tps"] = [(a / b) if b > 0 else None for a, b in sw]
-        out["kv_pct"] = [(a / c) if c else None for a, c in kv]
-        out["kv_p_pct"] = [(a / c) if c else None for a, c in kvp]
+        out["p_busy"], out["d_busy"], out["dec_busy"] = g(p_busy), g(d_busy), g(dec_busy)
+        out["dec_seat"] = g(dec_seat)
+        out["dec_bs_min"], out["dec_bs_max"] = bmin, bmax
+        # rates while working (None = the phase did not work in this bucket: a real gap)
+        rate = lambda tok, busy: [(t / b) if have[i] and b > 1e-6 else None  # noqa: E731
+                                  for i, (t, b) in enumerate(zip(tok, busy))]
+        out["dec_rate"], out["p_rate"], out["d_rate"] = rate(dec, dec_busy), rate(p_tok, p_busy), rate(d_tok, d_busy)
+        out["seats"] = rate(dec_seat, dec_busy)
+        out["stream_tps"] = rate(dec, dec_seat)
+        # levels: the mean of the samples in the bucket; a watched bucket without its own sample
+        # holds the previous one (sample-and-hold, never a gap inside a watched stretch)
+        for name, acc in (("kv_pct", kv), ("kv_p_pct", kvp)):
+            arr, last = [], None
+            for i, (a, c) in enumerate(acc):
+                v = (a / c) if c else (last if have[i] else None)
+                arr.append(v)
+                if c:
+                    last = v
+                elif not have[i]:
+                    last = None
+            out[name] = arr
         out["ipc"] = [1.0 if h else None for h in have]
         # phase share per bucket (0..1 per state): averages stay right at every history tier
         frac = {k: [0.0] * n for k in STATES}

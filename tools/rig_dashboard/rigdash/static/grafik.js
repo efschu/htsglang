@@ -6,7 +6,13 @@
    (:root --s1 … --s7, --surface, --grid, --text-2), hell und dunkel.
    Eine y-Achse je Diagramm (Prefill und Decode getrennt, ihre Größenordnungen sind verschieden).
    Quelle: GET api/history?model=27B|NF&range=… (history.py: rankstats per IPC, NVML, Host-/proc).
-   uPlot 1.6.32 lokal eingebettet (static/uplot.iife.min.js, MIT), kein CDN. */
+   uPlot 1.6.32 lokal eingebettet (static/uplot.iife.min.js, MIT), kein CDN.
+   Zoom (Nutzer 30.09. ~21:05Z): Klicken und Ziehen in einer Grafik zoomt alle (zoom.js, RigZoom); der
+   Verlauf lädt den Bereich dann neu aus SQLite (api/history?from=&to=) im passenden Raster, statt die
+   Punkte des Zeitraums zu strecken. Doppelklick, Esc oder „Zoom zurück“ stellt den vorigen Bereich her.
+   Durchsatz (Nutzer 30.09. ~21:05Z, „extrem sprunghaft“): gezeichnet wird die Rate WÄHREND die Phase
+   rechnete (Tokens / Rechenzeit im Eimer, history.derive_rates); die Wanduhr-Rate inkl. Pausen liegt als
+   ausgeblendete Reihe daneben (Legende anklicken). */
 (function () {
   "use strict";
   const $ = (id) => document.getElementById(id);
@@ -86,14 +92,18 @@
 
   function tiles(d) {
     const t = d.tiles || {}, s = d.src || {};
+    const over = d.zoom ? "im Zoom-Bereich" : `über ${d.range}`;
+    const seatTxt = t.seats_mean == null ? "Sitze: –"
+      : `bei Ø ${fmtN(t.seats_mean, 1)} Sitzen${t.seats_min != null ? ` (${fmtN(t.seats_min, 0)}–${fmtN(t.seats_max, 0)})` : ""}` +
+        (t.stream_mean != null ? ` · im Mittel ${fmtN(t.stream_mean, 1)} tok/s je Stream, Gesamt ≈ ${fmtN(t.stream_mean * t.seats_mean, 0)} tok/s` : "");
     const tierTxt = t.tiers
       ? `Device ${fmtN(t.tiers.device)} · L2 ${fmtN(t.tiers.host)} · L3 ${fmtN(t.tiers.storage)} · ohne Stufe ${fmtN(t.tiers.unassigned)}`
       : "Stufen Device/L2/L3: –";
     const hitPct = t.cache_hit == null ? null : 100 * t.cache_hit;
     const flipAge = t.flip_last_t ? Math.max(0, d.now - t.flip_last_t) : null;
     $("vl-tiles").innerHTML = [
-      tile("Decode je Stream p50", big(fmtN(t.out_p50), "tok/s"), `Median über ${d.range} (5-s-Mittel)`, s.decode),
-      tile("Decode je Stream p90", big(fmtN(t.out_p90), "tok/s"), `90. Perzentil über ${d.range}`, s.decode),
+      tile("Decode je Stream p50", big(fmtN(t.out_p50), "tok/s"), `Median ${over} (${d.step}-s-Eimer) · ${seatTxt}`, s.decode),
+      tile("Decode je Stream p90", big(fmtN(t.out_p90), "tok/s"), `90. Perzentil ${over} · Sitze = Batchgröße der Decode-Runden, nur über die Decode-Zeit gemittelt`, s.seats || s.decode),
       tile("Prefix-Cache-Treffer", gauge(hitPct == null ? null : hitPct / 100, hitPct == null ? "–" : fmtN(hitPct, 1) + " %", C.s1),
         `aus Cache / (Cache + neu gerechnet); Übergabe P→D nie Cache (${t.handoff_share == null ? "–" : fmtN(100 * t.handoff_share, 1) + " %"} der Input-Tokens) · ${tierTxt}`, s.cache),
       tile("Flipzeit P→D", big(t.flip_last_ms == null ? "–" : fmtN(t.flip_last_ms / 1000, 2), "s"),
@@ -149,6 +159,7 @@
     const ctx = u.ctx, { left, top, width, height } = u.bbox, dpr = devicePixelRatio, h = 6 * dpr;
     const xs = data.t, step = data.step || 1;
     const fills = {};
+    ctx.save(); ctx.beginPath(); ctx.rect(left, top, width, height); ctx.clip();
     ctx.save();
     for (let i = 0; i < xs.length; i++) {
       let best = null, bv = 0;
@@ -160,6 +171,7 @@
       ctx.fillRect(Math.max(a, left), top + height - h, Math.min(b, left + width) - Math.max(a, left) + 0.5, h);
       if (best === "idle") { ctx.strokeStyle = C.muted; ctx.lineWidth = 1; ctx.strokeRect(Math.max(a, left) + 0.5, top + height - h + 0.5, Math.min(b, left + width) - Math.max(a, left) - 1, h - 1); }
     }
+    ctx.restore();
     ctx.restore();
   }
 
@@ -236,13 +248,29 @@
   const thin = (label, col, unit) => line(label, col, unit, { width: 1.25, fill: undefined });
   const zeroUp = (min) => (u, a, b) => [0, Math.max(min, (b || 0) * 1.08)];
 
+  // die Zeichenfläche trägt ihren Zeitbereich: zoom.js rechnet das Ziehen darüber in Sekunden um
+  function zoomAttr(u) {
+    const o = u.over;
+    if (!o || u.scales.x.min == null) return;
+    o.dataset.zoomT0 = u.scales.x.min;
+    o.dataset.zoomT1 = u.scales.x.max;
+    if (!o.hasAttribute("tabindex")) {
+      o.setAttribute("tabindex", "0");
+      o.setAttribute("aria-label", "Diagramm: ziehen zoomt alle Grafiken, Doppelklick oder Esc zurück, + / − / Pfeile");
+    }
+  }
+  // alle Diagramme auf dieselbe Zeitachse: der gezeigte Bereich (gezoomt oder der Zeitraum bis jetzt)
+  const xRange = () => (data ? [data.lo != null ? data.lo : data.t[0], data.hi != null ? data.hi : data.now] : [0, 1]);
   function mk(id, opts, rows) {
     const el = $(id);
     if (!el) return null;
     const w = Math.max(240, el.clientWidth - 2);
+    const sc = Object.assign({}, opts.scales || {});
+    sc.x = Object.assign({ time: true, range: () => xRange() }, sc.x || {});
     const u = new uPlot(Object.assign({ width: w, height: 200, legend: { live: true },
-      cursor: { drag: { x: false, y: false }, sync: { key: "rigdash-verlauf" }, points: { size: 7 } },
-      hooks: { draw: [marksDraw, phaseBand, endDots] } }, opts), rows, el);
+      cursor: { drag: { x: false, y: false }, sync: { key: "rigdash-verlauf" }, points: { size: 7 },
+        bind: { dblclick: () => null } },     // Doppelklick = Zoom zurück (zoom.js), nicht uPlots Auto-Bereich
+      hooks: { draw: [marksDraw, phaseBand, endDots, zoomAttr] } }, opts, { scales: sc }), rows, el);
     return u;
   }
 
@@ -259,18 +287,38 @@
     const cards = d.cards || [];
     const pct = (v) => v == null ? "–" : fmtN(v, 0) + " %";
     const tps = (v) => v == null ? "–" : fmtN(v) + " tok/s";
+    const wall = (label, col) => line(label, col, "tok/s", { fill: undefined, width: 1, dash: [3, 3], show: false });
     charts.pre = mk("vl-c-pre", {
       scales: { y: { range: zeroUp(10) } },
       axes: [axisX(), axisY(tps)],
-      series: [{}, line("P-Prefill", C.s1, "tok/s"), line("D-Prefill", C.s2, "tok/s")],
+      series: [{}, line("P-Prefill (während Prefill)", C.s1, "tok/s"), line("D-Prefill (während Prefill)", C.s2, "tok/s"),
+        wall("P Wanduhr inkl. Pausen", C.s1), wall("D Wanduhr inkl. Pausen", C.s2)],
     }, rowsPre(d));
+    // Decode: die Rate WÄHREND D dekodierte (Tokens / Decode-Zeit im Eimer); je Stream und die Sitze mit
+    // demselben Nenner (Nutzer 30.09. ~21:10Z: je Stream nur mit der Zahl der Sitze). Sitze auf der
+    // rechten Achse, gestuft; Schlaf, Flip und Extend zählen nicht als 0 Sitze, sie sind Lücken.
+    const streamVal = (u, v, si, i) => {
+      const S = data.series;
+      const idx = i == null ? lastIdx(u, si) : i;
+      if (idx == null || S["m.stream_tps"][idx] == null) return "–";
+      const st = S["m.stream_tps"][idx], se = S["m.seats"][idx], all = S["m.dec_rate"][idx];
+      return fmtN(st, 1) + " tok/s" + (se != null ? ` bei Ø ${fmtN(se, 1)} Sitzen (Gesamt ≈ ${fmtN(all, 0)} tok/s)` : "");
+    };
+    const seatVal = (u, v, si, i) => {
+      const S = data.series;
+      const idx = i == null ? lastIdx(u, si) : i;
+      if (idx == null || S["m.seats"][idx] == null) return "–";
+      const lo = S["m.seats_min"][idx], hi = S["m.seats_max"][idx];
+      return "Ø " + fmtN(S["m.seats"][idx], 1) + (lo != null && hi != null && lo !== hi ? ` (${fmtN(lo, 0)}–${fmtN(hi, 0)})` : "");
+    };
     charts.dec = mk("vl-c-dec", {
-      scales: { y: { range: zeroUp(10) } },
-      axes: [axisX(), axisY(tps)],
-      series: [{}, line("alle Streams", C.s3, "tok/s"),
-        // je Stream nur, wo D durchgehend dekodierte (Probe mit Decode davor und danach): Punkte + Linie,
-        // keine Überbrückung -- eine gerade Linie über eine Pause wäre ein erfundener Wert
-        line("je Stream (Mittel, nur durchgehender Decode)", C.text, "tok/s", { fill: undefined, width: 1.5, points: { show: true, size: 4, fill: C.text } })],
+      scales: { y: { range: zeroUp(10) }, seats: { range: (u, a, b) => [0, Math.max(4, Math.ceil((b || 0) * 1.15))] } },
+      axes: [axisX(), axisY(tps), Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "seats", side: 1, grid: { show: false }, size: 40, label: "Sitze", labelSize: 14, labelFont: FONT })],
+      series: [{}, line("alle Streams (während Decode)", C.s3, "tok/s"),
+        line("je Stream", C.text, "tok/s", { fill: undefined, width: 1.5, points: { show: true, size: 4, fill: C.text }, value: streamVal }),
+        line("Sitze (Batchgröße, Ø über Decode-Zeit)", C.s4, "", { fill: undefined, width: 1.5, scale: "seats", noDot: true,
+          paths: uPlot.paths && uPlot.paths.stepped ? uPlot.paths.stepped({ align: 1 }) : undefined, value: seatVal }),
+        wall("Wanduhr inkl. Pausen", C.s3)],
     }, rowsDec(d));
     charts.cache = mk("vl-c-cache", {
       scales: { y: { range: zeroUp(10) } },
@@ -288,7 +336,7 @@
       series: [{}, line("D", C.s2, "%"), line("P", C.s1, "%", { fill: undefined, width: 1.5 })],
     }, [d.t, d.series["m.kv_pct"], d.series["m.kv_p_pct"]]);
     charts.flip = mk("vl-c-flip", {
-      scales: { x: { time: true, range: () => [d.t[0], d.now] }, y: { range: zeroUp(1000) } },
+      scales: { y: { range: zeroUp(1000) } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s")],
       series: [{}, line("P→D", C.s1, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s1 }, noDot: true }),
         line("D→P (Decode-Ende → P-Prefill, flip_user_time)", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
@@ -318,8 +366,8 @@
   }
 
   const raw = { v: [[], [], []] };
-  const rowsPre = (d) => [d.t, d.series["m.p_tps"], d.series["m.d_tps"]];
-  const rowsDec = (d) => [d.t, d.series["m.dec_tps"], d.series["m.stream_tps"]];
+  const rowsPre = (d) => [d.t, d.series["m.p_rate"], d.series["m.d_rate"], d.series["m.p_tps"], d.series["m.d_tps"]];
+  const rowsDec = (d) => [d.t, d.series["m.dec_rate"], d.series["m.stream_tps"], d.series["m.seats"], d.series["m.dec_tps"]];
   const rowsHost = (d) => [d.t, d.series["host.cpu"], d.series["host.mem_pct"], d.series["host.bootmem_pct"]];
   const rowsCards = (d, k) => [d.t].concat((d.cards || []).map((c) => d.series["g" + c.index + "." + k] || d.t.map(() => null)));
   const rowsPower = (d) => [d.t, d.series["gsum.power"]].concat(rowsCards(d, "power").slice(1));
@@ -343,7 +391,7 @@
       .sort((a, b) => a.t - b.t);
     return [fl.map((m) => m.t), fl.map((m) => (m.kind === "flip" ? m.v : null)), fl.map((m) => (m.kind === "flip_user" ? m.v : null))];
   }
-  const sigOf = (d) => [d.model, d.range, (d.cards || []).map((c) => cardLabel(c)).join("|")].join("/");
+  const sigOf = (d) => [d.model, d.range, d.zoom ? "z" : "", (d.cards || []).map((c) => cardLabel(c)).join("|")].join("/");
 
   function update(d) {
     if (sigOf(d) !== sig || !charts.pre) { build(d); return; }
@@ -366,7 +414,8 @@
     set("hw-s-host", s.host);
     const err = Object.entries(d.errors || {}).map(([k, v]) => k + ": " + v).join(" · ");
     const nb = (d.marks || []).filter((m) => m.kind === "boot").length;
-    $("vl-note").textContent = `${d.model} · ${d.range} · Raster ${d.step} s · grün = Boot-Start (${nb}), gestrichelt = Boot-Ende, fein = Flip · Punkt = letzter Wert · Speicher ${fmtN(d.db.size_mb, 1)} MB` +
+    const zt = d.zoom && window.RigZoom ? `Zoom ${RigZoom.hms(d.zoom[0])}–${RigZoom.hms(d.zoom[1])} · ` : "";
+    $("vl-note").textContent = `${d.model} · ${zt}${d.zoom ? "" : d.range + " · "}Raster ${d.step} s · ziehen = zoomen, Doppelklick/Esc = zurück · grün = Boot-Start (${nb}), gestrichelt = Boot-Ende, fein = Flip · Punkt = letzter Wert · Speicher ${fmtN(d.db.size_mb, 1)} MB` +
       (err ? " · Fehler: " + err : "");
   }
 
@@ -375,7 +424,9 @@
     if (inflight) { again = again || !!force; return; }
     inflight = true;
     try {
-      const r = await fetch(`api/history?model=${encodeURIComponent(model)}&range=${encodeURIComponent(range)}`, { cache: "no-store" });
+      const z = window.RigZoom && RigZoom.get();
+      const zq = z ? `&from=${z[0].toFixed(3)}&to=${z[1].toFixed(3)}` : "";
+      const r = await fetch(`api/history?model=${encodeURIComponent(model)}&range=${encodeURIComponent(range)}${zq}`, { cache: "no-store" });
       const d = await r.json();
       if (!d.t) throw new Error(d.error || "keine Daten");
       data = d;
@@ -405,4 +456,6 @@
   bar();
   load(true);
   setInterval(() => load(false), 10000);
+  // ein Zoom irgendwo auf der Seite: den Bereich aus SQLite neu laden (feineres Raster), alle Diagramme darauf
+  if (window.RigZoom) RigZoom.on(() => load(true));
 })();

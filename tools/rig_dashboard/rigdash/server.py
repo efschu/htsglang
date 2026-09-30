@@ -34,6 +34,7 @@ STATIC_FILES = {
     "/uplot.min.css": ("uplot.min.css", "text/css; charset=utf-8"),
     "/uplot.LICENSE": ("uplot.LICENSE", "text/plain; charset=utf-8"),
     "/grafik.js": ("grafik.js", "application/javascript; charset=utf-8"),
+    "/zoom.js": ("zoom.js", "application/javascript; charset=utf-8"),
 }
 
 
@@ -50,7 +51,19 @@ def _container_token(name: str) -> str:
     return n.replace("-", "").replace("_", "")
 
 
-def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: float) -> None:
+def parse_zoom(path: str):
+    """``?zoom=<t0>,<t1>`` (unix s) of the page's click-and-drag zoom: the boot cards' curves for that
+    stretch at 1/2/5-s buckets; anything unreadable is no zoom."""
+    from urllib.parse import parse_qs, urlsplit
+    z = (parse_qs(urlsplit(path).query).get("zoom") or [""])[0]
+    try:
+        a, b = (float(x) for x in z.split(","))
+    except ValueError:
+        return None
+    return (a, b) if b - a >= 5 else None
+
+
+def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: float, key: str = "series") -> None:
     """Cut a series where the model really failed, and add tok/s per watt.
 
     Gap = GRUPPE TOT (from the first dead reason on) or the boot has ended
@@ -59,10 +72,11 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
     bucket (mean of the samples); the idle draw of the sleeping group counts,
     because it is really spent.
     """
-    ser = b.get("series")
+    ser = b.get(key)
     if not ser or not ser.get("t"):
         return
     ts = ser["t"]
+    bucket_s = ser.get("step") or bucket_s
     gap_from, reason = None, None
     a = b.get("alarm") or {}
     if a.get("state") == "TOT":
@@ -88,7 +102,7 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
                                        .get(death.get("src"), "Container-tot"))
     keys = [k for k in ser if k.endswith("_tps")]
     if gap_from is not None:
-        for k in keys:
+        for k in keys + [k for k in ser if k.endswith(("_rate", "_seats", "_stream"))]:
             ser[k] = [None if t + bucket_s > gap_from else v for t, v in zip(ts, ser[k])]
         ser["gap_from"], ser["gap_reason"], ser["gap_kind"] = gap_from, reason, kind
         tl = b.get("timeline")
@@ -105,12 +119,22 @@ def finish_series(b: dict, gpu_series: Optional[dict], now: float, bucket_s: flo
                 acc[i][0] += sum(row)
                 acc[i][1] += 1
         power = [(a0 / n) if n else None for a0, n in acc]
+        # nvidia-smi samples every ~2 s: at 1-/2-s buckets (zoom) a bucket without its own sample holds
+        # the previous one for up to 3 s (a level, not a missing value)
+        if bucket_s < 5:
+            last, age = None, 0.0
+            for i, v in enumerate(power):
+                if v is not None:
+                    last, age = v, 0.0
+                elif last is not None and age + bucket_s <= 3.0:
+                    age += bucket_s
+                    power[i] = last
     ser["power_sum_w"] = power
     ser["per_w_60s"] = {}
     for k in keys:
         ser[k + "_per_w"] = [(v / p) if (v is not None and p) else None for v, p in zip(ser[k], power)]
         # mean of the tok/s/W curve over the last 60 s; rest intervals count as 0
-        last = [x for x in ser[k + "_per_w"][-int(60 / bucket_s):] if x is not None]
+        last = [x for x in ser[k + "_per_w"][-max(1, int(60 / bucket_s)):] if x is not None]
         ser["per_w_60s"][k] = (sum(last) / len(last)) if last else None
 
 
@@ -210,10 +234,10 @@ class App:
                              (self.hist_rec.run_forever, "rigdash-history")):
             threading.Thread(target=target, args=(self.stop,), name=name, daemon=True).start()
 
-    def snapshot(self, with_series=True) -> dict:
+    def snapshot(self, with_series=True, zoom=None) -> dict:
         now = time.time()
         sv = self.src.view()
-        boots = self.boots.snapshot(now)
+        boots = self.boots.snapshot(now, zoom=zoom)
         docker = sv.get("docker", {}).get("value")
         attach_containers_ipc(boots, docker)
         fronts = {k: v for k, v in sv.items() if k.startswith("front:")}
@@ -227,6 +251,8 @@ class App:
         gser = self.src.gpu_series() if with_series else None
         for b in boots:
             finish_series(b, gser, now, live.BUCKET_S)
+            if b.get("series_zoom"):
+                finish_series(b, gser, now, live.BUCKET_S, key="series_zoom")
             b["energy"] = self.energy.view(b["stem"], (b.get("totals") or {}).get("boot_wall_s"))
         with self.imgchg_lock:
             images, img_err = self.imgchg.load()
@@ -355,7 +381,8 @@ def make_handler(app: App):
                         return self._send(200, edition_page(fh.read(), app.edition), "text/html; charset=utf-8")
                 if path == "/api/live":
                     series = "noseries" not in self.path
-                    snap = app.snapshot(series)
+                    zoom = parse_zoom(self.path)
+                    snap = app.snapshot(series, zoom)
                     snap["via_proxy"] = self._via_proxy()
                     return self._json(edition_snapshot(snap, app.edition))
                 if path == "/api/history":
@@ -366,7 +393,10 @@ def make_handler(app: App):
                     model = q.get("model", "27B")
                     if model not in history.MODELS:
                         raise ValueError("model muss 27B oder NF sein")
-                    return self._json(history.view(app.hist, app.hist_rec, model, q.get("range", "1h")))
+                    lo_hi = None
+                    if q.get("from") and q.get("to"):
+                        lo_hi = (float(q["from"]), float(q["to"]))     # a zoomed stretch (Klicken und Ziehen)
+                    return self._json(history.view(app.hist, app.hist_rec, model, q.get("range", "1h"), lo_hi=lo_hi))
                 if path in STATIC_FILES:
                     name, ctype = STATIC_FILES[path]
                     with open(os.path.join(STATIC, name), "rb") as fh:

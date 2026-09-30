@@ -265,6 +265,13 @@ def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict
     st = activity.decode_stretches(iv)
     lastst = st[-1] if st else None
     streams = [x["stream"] for x in win if x["stream"] is not None]
+    # per stream and seats with the same denominator: tokens / seat-seconds, seat-seconds / decode
+    # seconds -- only over the time D decoded (Nutzer 30.09. ~21:10Z: sitze mitführen)
+    seat_s = sum(x["seat_s"] for x in sw if x.get("seat_s"))
+    busy_s = sum(x["busy"] for x in sw if x.get("seat_s"))
+    tok_s = sum(x["tok"] for x in sw if x.get("seat_s"))
+    bmin = min((x["bs_min"] for x in sw if x.get("bs_min") is not None), default=None)
+    bmax = max((x["bs_max"] for x in sw if x.get("bs_max") is not None), default=None)
     cur = iv[-1] if iv and now - iv[-1]["e"] <= 3 * SAMPLE_S else None
     best, acc_t, acc_d = None, 0.0, 0.0
     for x in iv:                       # best 3-s stretch of the last 120 s, over decode time only
@@ -286,8 +293,13 @@ def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict
     return {"window_s": WINDOW_S, "gen_tps": (tok / dur) if dur >= 2.0 else None,
             "gen_tps_last": lastst["rate"] if lastst else None, "rows": len(win),
             "last_t": lastst["e"] if lastst else None,
-            "one_s": (cur["tok"] / cur["dur"]) if cur else 0.0, "max3s_120": best,
-            "per_stream": (sum(streams) / len(streams)) if streams else None, "per_stream_n": len(streams),
+            "one_s": (cur["tok"] / cur["busy"]) if cur else 0.0, "max3s_120": best,
+            "per_stream": (tok_s / seat_s) if seat_s > 0 else ((sum(streams) / len(streams)) if streams else None),
+            "per_stream_n": len(streams),
+            "seats_mean": (seat_s / busy_s) if busy_s > 0 else None, "seats_min": bmin, "seats_max": bmax,
+            "seats_src": ("rankstats decode.gpu_ms_by_bs (Δ je Probe, nach Rundenzeit gewichtet)"
+                          if any(x.get("bs_src") == "by_bs" for x in sw) else
+                          "rankstats decode.running" if any(x.get("bs_src") == "running" for x in sw) else None),
             "running": last.get("running"), "last_bs": last.get("last_bs"), "accept_len": last.get("acc_len"),
             "accept_rate": last.get("acc_rate"), "cuda_graph": last.get("cuda_graph"), "full_use": last.get("kv"),
             "queue_req": last.get("queue"), "max_running": last.get("cap_seats"),
@@ -296,17 +308,49 @@ def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict
             "compute_tps": (tok / (gms / 1000.0)) if gms > 0 and dur >= 2.0 else None, "round_ms_by_bs": by_bs}
 
 
-def series_view(m: "activity.Model", now: float) -> dict:
-    n = int(SPAN_S // BUCKET_S)
-    t0 = (now // BUCKET_S) * BUCKET_S - (n - 1) * BUCKET_S
-    b = m.buckets(t0, n, BUCKET_S)
-    out = {"t": [t0 + i * BUCKET_S for i in range(n)]}
+ZOOM_STEPS = (1.0, 2.0, 5.0)
+ZOOM_POINTS = 240
+
+
+def zoom_bucket(span_s: float) -> float:
+    """The finest bucket that keeps a zoomed stretch under ZOOM_POINTS (the ring holds 1-s samples)."""
+    return next((s for s in ZOOM_STEPS if span_s / s <= ZOOM_POINTS), BUCKET_S)
+
+
+def series_view(m: "activity.Model", now: float, zoom: Optional[Tuple[float, float]] = None) -> dict:
+    """15-min curves of the boot card.  ``*_tps`` = tokens / bucket (wall; the tok/s/W and energy
+    figures), ``*_rate`` = tokens / the time the phase worked in the bucket (the curve drawn; Nutzer
+    30.09. ~21:05Z: "decode durchsatz ... nicht durchgehend sondern extrem sprunghaft" -- a D-extend
+    of 2 s in a 5-s bucket halved the wall rate although decode ran at full speed), ``*_seats`` =
+    mean decode seats over the decode time.  ``zoom`` = (t0, t1): that stretch at 1/2/5-s buckets."""
+    if zoom is not None:
+        # the ring holds RING_S: a longer zoomed stretch (dragged in the days-long history) is cut to it
+        zoom = (max(zoom[0], now - RING_S), min(zoom[1], now))
+        if zoom[1] - zoom[0] < 1.0:
+            zoom = (now - 1.0, now)
+        step = zoom_bucket(zoom[1] - zoom[0])
+        t0 = (zoom[0] // step) * step
+        n = max(1, int(math.ceil((min(zoom[1], now) - t0) / step)))
+    else:
+        step = BUCKET_S
+        n = int(SPAN_S // BUCKET_S)
+        t0 = (now // BUCKET_S) * BUCKET_S - (n - 1) * BUCKET_S
+    b = m.buckets(t0, n, step)
+    out = {"t": [t0 + i * step for i in range(n)], "step": step}
+    if zoom is not None:
+        out["zoom"] = [zoom[0], zoom[1]]
     if "P" in m.pchunks or "single" in m.pchunks:
-        out[("P" if "P" in m.pchunks else "single") + "_prefill_tps"] = b["p_tps"]
+        g = "P" if "P" in m.pchunks else "single"
+        out[g + "_prefill_tps"] = b["p_tps"]
+        out[g + "_prefill_rate"] = b["p_rate"]
     if "D" in m.pchunks:
         out["D_prefill_tps"] = b["d_tps"]
+        out["D_prefill_rate"] = b["d_rate"]
     if m.dec_group:
         out[m.dec_group + "_decode_tps"] = b["dec_tps"]
+        out[m.dec_group + "_decode_rate"] = b["dec_rate"]
+        out[m.dec_group + "_decode_seats"] = b["seats"]
+        out[m.dec_group + "_decode_stream"] = b["stream_tps"]
     return out
 
 
@@ -583,7 +627,8 @@ def flip_done_of(ipc: dict) -> List[dict]:
             for e in (ipc.get("ipc_events") or []) if e.get("type") == "flip_done"]
 
 
-def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
+def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
+               zoom: Optional[Tuple[float, float]] = None) -> dict:
     """One boot card from its IPC alone.  Pure over its inputs."""
     ring = list(ring or [])
     keys = set()
@@ -658,6 +703,8 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float) -> dict:
         "prefill_route": prefill_route(front),
         "cache": cache_view(ring, keys, now),
         "series": series_view(m, now),
+        # the zoomed stretch as its own curves; "series" stays the 15 min the tiles' 60-s figures read
+        "series_zoom": series_view(m, now, zoom) if zoom else None,
         "timeline": timeline_view(m, live, _awake(m, front), now, t0),
         "fields": ipcfields.for_page(fields),
         "fields_summary": ipcfields.summary(fields),
@@ -717,7 +764,8 @@ class IpcBoots:
                 self.last_error = "%s: %s" % (type(e).__name__, e)
             stop.wait(max(0.05, SAMPLE_S - (time.time() - t0)))
 
-    def snapshot(self, now: Optional[float] = None, max_boots: int = 10) -> List[dict]:
+    def snapshot(self, now: Optional[float] = None, max_boots: int = 10,
+                 zoom: Optional[Tuple[float, float]] = None) -> List[dict]:
         now = now or time.time()
         with self.ipc.lock:
             items = [(d, st) for d, st in self.ipc._st.items() if st.get("kind") == "boot"]
@@ -731,7 +779,7 @@ class IpcBoots:
             with self.lock:
                 ring = list(self.rings.get(key) or ())
                 rank = self.rank.get(key) or {"rankstats": {}, "rankstate": {}}
-            v = build_view(ipc, ring, rank, None, now)
+            v = build_view(ipc, ring, rank, None, now, zoom)
             line = "27b" if "/27b/" in d else "nf"
             v["primary"] = v["live"] or line not in newest_line
             newest_line.setdefault(line, key)

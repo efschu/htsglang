@@ -401,6 +401,7 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   <!--DEV:END-->
 </main>
 <div class="tip" id="tip"></div>
+<script src="zoom.js"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -441,8 +442,10 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
   const W = 600, H = opt.h || 60, padT = 3, padB = 2;
   const pts = [];
   let max = 0;
-  vals.forEach((v, i) => { if (v != null && isFinite(v)) { pts.push([ts[i], v]); if (v > max) max = v; } });
-  const t1 = tEnd || ts[ts.length - 1], t0 = t1 - 900;
+  // Zoom (zoom.js): the dragged stretch instead of the last 15 min
+  const zd = opt.t0 != null && opt.t1 != null;
+  const t1 = zd ? opt.t1 : (tEnd || ts[ts.length - 1]), t0 = zd ? opt.t0 : t1 - 900;
+  vals.forEach((v, i) => { if (v != null && isFinite(v) && ts[i] >= t0 - 1e-6 && ts[i] <= t1) { pts.push([ts[i], v, i]); if (v > max) max = v; } });
   const x = (t) => W * (t - t0) / (t1 - t0);
   const mag = max > 0 ? Math.pow(10, Math.floor(Math.log10(max))) : 1;
   const nice = max > 0 ? mag * Math.ceil(max / mag) : 1;
@@ -480,13 +483,13 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
   const planned = opt.gapKind === "planned";
   const gap = hasGap ? `<line x1="${x(opt.gapFrom).toFixed(1)}" x2="${x(opt.gapFrom).toFixed(1)}" y1="0" y2="${H}" stroke="${planned ? "var(--muted)" : "var(--bad)"}" stroke-width="2" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>` : "";
   const grid = [0.25, 0.5, 0.75].map((f) => `<line class="grid" x1="0" x2="${W}" y1="${y(nice * f).toFixed(1)}" y2="${y(nice * f).toFixed(1)}" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>`).join("")
-    + [300, 600].map((s) => `<line class="grid" y1="0" y2="${H}" x1="${x(t1 - s).toFixed(1)}" x2="${x(t1 - s).toFixed(1)}" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>`).join("");
+    + [1 / 3, 2 / 3].map((f) => `<line class="grid" y1="0" y2="${H}" x1="${(W * f).toFixed(1)}" x2="${(W * f).toFixed(1)}" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>`).join("");
   const endDot = last && last[0] >= t1 - 3 * step
     ? `<path d="M${x(last[0]).toFixed(1)},${y(last[1]).toFixed(1)}l0,0" stroke="${color}" stroke-width="7" stroke-linecap="round" vector-effect="non-scaling-stroke"/>` : "";
   const endLbl = last && last[0] >= t1 - 3 * step
     ? `<span class="endv" style="top:${Math.max(7, Math.min(H - 7, y(last[1]))).toFixed(0)}px">${fmt(last[1], digits)}</span>` : "";
   const svg = `<div class="sparkbox"><span class="ymax">${fmt(nice, digits)} ${unit}</span>${hasGap ? `<span class="gapmark${planned ? " planned" : ""}">${planned ? "■" : "✕"} ${esc(opt.gapReason || "Ausfall")} ${hhmm(opt.gapFrom)}</span>` : ""}${hasGap ? "" : endLbl}
-    <svg class="spark" id="${svgId}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Verlauf 15 min, ${unit}" style="height:${H}px">
+    <svg class="spark" id="${svgId}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" tabindex="0" data-zoom-t0="${t0}" data-zoom-t1="${t1}" aria-label="Verlauf ${zd ? "Zoom " + hhmm(t0) + " bis " + hhmm(t1) : "15 min"}, ${unit}; ziehen zoomt, Doppelklick oder Esc zurück" style="height:${H}px">
     ${grid}
     <line class="grid" x1="0" x2="${W}" y1="${y(nice)}" y2="${y(nice)}" vector-effect="non-scaling-stroke"/>
     <line class="grid" x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" vector-effect="non-scaling-stroke"/>
@@ -496,7 +499,8 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
     ${endDot}
     ${gap}
     <line class="cross" x1="0" x2="0" y1="0" y2="${H}" stroke="var(--muted)" stroke-width="1" vector-effect="non-scaling-stroke" visibility="hidden"/>
-    </svg>${opt.noAxis ? "" : `<div class="xaxis"><span>−15 min</span><span>−10</span><span>−5</span><span>jetzt</span></div>`}${opt.caption ? `<div class="caption">${opt.caption}</div>` : ""}</div>`;
+    </svg>${opt.noAxis ? "" : zd ? `<div class="xaxis"><span>${hhmm(t0)}</span><span>${hhmm(t0 + (t1 - t0) / 3)}</span><span>${hhmm(t0 + 2 * (t1 - t0) / 3)}</span><span>${hhmm(t1)}</span></div>`
+      : `<div class="xaxis"><span>−15 min</span><span>−10</span><span>−5</span><span>jetzt</span></div>`}${opt.caption ? `<div class="caption">${opt.caption}</div>` : ""}</div>`;
   return {svg, bind: () => {
     const el = document.getElementById(svgId);
     if (!el) return;
@@ -506,9 +510,9 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
       const tx = t0 + (t1 - t0) * (e.clientX - r.left) / r.width;
       let best = null;
       for (const p of pts) if (best == null || Math.abs(p[0] - tx) < Math.abs(best[0] - tx)) best = p;
-      if (!best || Math.abs(best[0] - tx) > 20) { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); return; }
+      if (!best || Math.abs(best[0] - tx) > Math.max(2 * step, (t1 - t0) / 45)) { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); return; }
       cross.setAttribute("x1", x(best[0])); cross.setAttribute("x2", x(best[0])); cross.setAttribute("visibility", "visible");
-      tip.innerHTML = `<b>${fmt(best[1], digits)}</b> ${unit} &middot; ${hhmm(best[0])}${best[1] === 0 ? " &middot; ruht / keine Arbeit" : ""}`;
+      tip.innerHTML = `<b>${fmt(best[1], digits)}</b> ${unit} &middot; ${hhmm(best[0])}${best[1] === 0 ? " &middot; ruht / keine Arbeit" : ""}${opt.tipExtra ? opt.tipExtra(best[2]) : ""}`;
       tip.style.display = "block"; tip.style.left = (e.clientX + 12) + "px"; tip.style.top = (e.clientY - 28) + "px";
     };
     el.onmouseleave = () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); };
@@ -516,16 +520,32 @@ function spark(svgId, ts, vals, color, unit, digits, tEnd, opt) {
 }
 
 // tok/s chart and, under it on the same time grid, tok/s per watt
+// Nutzer 30.09. ~21:05Z ("decode durchsatz … extrem sprunghaft"): the curve is the rate WHILE the phase
+// worked (tokens / the seconds it computed in the bucket, ipcboot *_rate); a bucket without any of its
+// work is a gap, not a dip to its share of the bucket.  tok/s/W below stays tokens / wall (energy).
+// Zoomed (zoom.js): the boot's curves of that stretch at 1/2/5-s buckets (series_zoom).
 function rateCharts(b, key, color, digits, now, binders) {
-  const ser = b.series || {};
+  const z = window.RigZoom && RigZoom.get();
+  const ser = (z && b.series_zoom) || b.series || {};
   if (!ser[key]) return "";
-  const o = {gapFrom: ser.gap_from, gapReason: ser.gap_reason, gapKind: ser.gap_kind};
-  const a = spark(`sp-${b.stem}-${key}`, ser.t, ser[key], color, "tok/s", digits, now, o);
+  const rk = key.replace(/_tps$/, "_rate");
+  const g = key.split("_")[0];
+  const zo = z ? {t0: z[0], t1: z[1]} : {};
+  const o = Object.assign({gapFrom: ser.gap_from, gapReason: ser.gap_reason, gapKind: ser.gap_kind}, zo);
+  const stepTxt = `${fmt(ser.step || 5)}-s-Eimer`;
+  const dec = /_decode_tps$/.test(key);
+  const seats = ser[g + "_decode_seats"], stream = ser[g + "_decode_stream"];
+  const extra = dec ? (i) => (seats && seats[i] != null
+    ? ` &middot; je Stream <b>${fmt(stream[i], 1)}</b> tok/s bei &Oslash; <b>${fmt(seats[i], 1)}</b> Sitzen` : "") +
+      (ser[key][i] != null ? ` <span class="muted">&middot; Wanduhr inkl. Pausen ${fmt(ser[key][i], 1)}</span>` : "")
+    : (i) => (ser[key][i] != null ? ` <span class="muted">&middot; Wanduhr inkl. Pausen ${fmt(ser[key][i], 0)}</span>` : "");
+  const a = spark(`sp-${b.stem}-${key}`, ser.t, ser[rk] || ser[key], color, "tok/s", digits, now,
+    Object.assign({}, o, {tipExtra: extra, caption: ser[rk] ? `tok/s w&auml;hrend ${dec ? "Decode" : "Prefill"} (Tokens / Rechenzeit im ${stepTxt}; L&uuml;cke = Phase ruht)` : ""}));
   binders.push(a.bind);
   let h = a.svg;
   if (ser[key + "_per_w"]) {
     const w = spark(`sp-${b.stem}-${key}-w`, ser.t, ser[key + "_per_w"], color, "tok/s/W", 2, now,
-      Object.assign({}, o, {h: 40, caption: "tok/s pro Watt &middot; Nenner: &Sigma; power.draw aller 3 Karten (nvidia-smi, 5-s-Mittel), inkl. Idle der schlafenden Gruppe"}));
+      Object.assign({}, o, {h: 40, caption: "tok/s pro Watt (Wanduhr) &middot; Nenner: &Sigma; power.draw aller 3 Karten (nvidia-smi, 5-s-Mittel), inkl. Idle der schlafenden Gruppe"}));
     binders.push(w.bind);
     h += w.svg;
   }
@@ -580,8 +600,9 @@ function phaseHtml(b) {
   const tl = b.timeline;
   if (!tl || !tl.segs) return "";
   const single = !(b.prefill || {}).D && !!(b.prefill || {}).single;
-  const span = Math.min(phaseSpanS(), tl.span_s), t1 = tl.t1, t0 = t1 - span;
-  const segs = tl.segs.filter((x) => x.e > t0).map((x) => Object.assign({}, x, {s: Math.max(x.s, t0)}));
+  const z = window.RigZoom && RigZoom.get();
+  const span = z ? z[1] - z[0] : Math.min(phaseSpanS(), tl.span_s), t1 = z ? z[1] : tl.t1, t0 = t1 - span;
+  const segs = tl.segs.filter((x) => x.e > t0 && x.s < t1).map((x) => Object.assign({}, x, {s: Math.max(x.s, t0), e: Math.min(x.e, t1)}));
   const id = "pb-" + b.stem;
   phaseData[id] = {segs, single};
   const pos = (t) => (100 * (t - t0) / span).toFixed(3);
@@ -596,12 +617,13 @@ function phaseHtml(b) {
   let end = b.live ? "jetzt" : "letzte IPC-Probe " + hhmm(t1);
   if (tl.cut_at) end = tl.cut_kind === "planned" ? `<span style="color:var(--text-2)">■ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`
     : `<span style="color:var(--bad)">✕ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`;
-  const ticks = span >= 900 ? ["&minus;15 min", "&minus;10", "&minus;5", end] : ["&minus;5 min", "&minus;2:30", end];
+  const ticks = z ? [hhmm(t0), hhmm(t0 + span / 2), hhmm(t1)]
+    : span >= 900 ? ["&minus;15 min", "&minus;10", "&minus;5", end] : ["&minus;5 min", "&minus;2:30", end];
   const lg = (k) => `<span class="lg"><i class="sw ph-k-${k}"${k === "idle" ? ' style="--ic:var(--muted)"' : ""}></i>${phaseName(k, single)}</span>`;
   return `<div class="phasewrap">
     <div class="ph-head"><b style="color:var(--text)">Phasen</b>${srcOf(b, "D1", "D2", "D3", "D4")} ${PHASE_ORDER.map(lg).join("")}
       <span class="span">${[300, 900].map((v) => `<button type="button" class="${span === v ? "sel" : ""}" onclick="setPhaseSpan(${v})">${v / 60} min</button>`).join("")}</span></div>
-    <div class="phasebar" id="${esc(id)}" role="img" aria-label="Phasenverlauf der letzten ${span / 60} Minuten">${bars}${cut}</div>
+    <div class="phasebar" id="${esc(id)}" role="img" tabindex="0" data-zoom-t0="${t0}" data-zoom-t1="${t1}" aria-label="Phasenverlauf ${z ? "Zoom " + hhmm(t0) + " bis " + hhmm(t1) : "der letzten " + span / 60 + " Minuten"}; ziehen zoomt, Doppelklick oder Esc zurück">${bars}${cut}</div>
     <div class="xaxis">${ticks.map((t) => `<span>${t}</span>`).join("")}</div>
   </div>`;
 }
@@ -734,6 +756,9 @@ function decodeTile(b, g, color, binders, now) {
     <div class="state">${state}</div>
     ${kv([
       ["laufende Anfragen (bs) &middot; je Stream", `${fmt(d.last_bs != null ? d.last_bs : d.running)} &middot; ${per == null ? "—" : fmt(per, 1) + " tok/s"}${d.per_stream_n ? ` <span class="muted">(${d.per_stream_n} Proben mit Decode davor und danach)</span>` : ""}`],
+      // Nutzer 30.09. ~21:10Z: je Stream nur mit der Zahl der Sitze -- beide mit demselben Nenner (Decode-Zeit)
+      ["<span title=\"Sitze = Batchgr&ouml;&szlig;e der Decode-Runden, nach Rundenzeit gewichtet und nur &uuml;ber die Zeit gemittelt, in der D dekodierte (Schlaf, Flip, Extend z&auml;hlen nicht als 0 Sitze). Gesamt = je Stream &times; &Oslash; Sitze.\">je Stream bei &Oslash; Sitzen, 60 s &#9432;</span>",
+        per != null && d.seats_mean != null ? `<b>${fmt(per, 1)}</b> tok/s je Stream bei &Oslash; <b>${fmt(d.seats_mean, 1)}</b> Sitzen${d.seats_min != null ? ` (${fmt(d.seats_min)}&ndash;${fmt(d.seats_max)})` : ""} &middot; Gesamt &asymp; ${fmt(per * d.seats_mean, 0)} tok/s${d.seats_src ? ` <span class="muted">(${esc(d.seats_src)})</span>` : ""}` : "—"],
       d.seats ? ["Sitze dieser D-Phase (front.d_seats)", `${fmt(d.seats.n)} von ${fmt(d.seats.cap)}${d.seats.handoff_n != null ? " &middot; &uuml;bergeben " + fmt(d.seats.handoff_n) : ""} &middot; geparkt ${fmt(d.seats.parked_n)}${d.seats.clamped ? " (gekappt)" : ""}${d.seats.source ? ` <span class="muted">(${esc(d.seats.source)}, n des Wakes)</span>` : ""}`]
         : ["Sitze dieser D-Phase", MISSTAG("front.d_seats (ab Build mit 8654c4e647)")],
       ["accept len &middot; accept rate", `${fmt(d.accept_len, 2)} &middot; ${fmt(d.accept_rate, 2)}`],
@@ -1454,7 +1479,8 @@ async function refresh(force) {
   if (why || inflight) return;
   inflight = true;
   try {
-    const r = await fetch("api/live", {cache: "no-store"});   // relative: works behind the /rigdash/ prefix
+    const z = window.RigZoom && RigZoom.get();
+    const r = await fetch("api/live" + (z ? `?zoom=${z[0].toFixed(3)},${z[1].toFixed(3)}` : ""), {cache: "no-store"});   // relative: works behind the /rigdash/ prefix
     const d = await r.json();
     failures = 0;
     const late = force ? "" : pauseReason();      // the reader may have started while the fetch ran
@@ -1519,6 +1545,7 @@ $("live-pause").addEventListener("change", (e) => {
 });
 refresh(true);
 setInterval(() => refresh(), 2000);
+if (window.RigZoom) RigZoom.on(() => refresh(true));      // zoom.js: all charts follow one zoomed stretch
 if (DEV) {
   refreshLaunch();
   setInterval(() => refreshLaunch(), 15000);

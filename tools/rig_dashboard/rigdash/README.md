@@ -45,6 +45,31 @@ nur mit Decode davor und danach. Verlauf: 1-s-Modellzeilen unter dem Präfix `mi
 werden nicht mehr gezeigt. Flipzeit: P→D `flip_first_work` (ohne `what="none"`), D→P nur `flip_user_time` (ab Build y4z).
 Audit aller Werte: `/spinning/gpu-arb/docs/DASHBOARD-PLAUSI-AUDIT-0930.md`; Tests `tests/test_activity_0930.py`.
 
+## Glatt und ehrlich, Sitze, Zoom (Nutzer 30.09. ~21:05Z / ~21:10Z)
+
+„der decode durchsatz … nicht durchgehend sondern extrem sprunghaft“. Gemessen am Dienst (NF y5i): zwei Ursachen.
+1. **Probenschlupf.** Der 1-s-Sampler läuft unter Last länger als 1 s. Etwa 28 % der 1-s-Zeilen hatten keine eigene Probe
+   und wurden als Lücke geschrieben. Jetzt zählt eine Sekunde als beobachtet, wenn sie zwischen zwei Proben liegt, die höchstens
+   3 s auseinander sind (`Model.coverage`). Die Arbeit darin legen die Rang-Uhren fest. Pegel (KV) halten die letzte Probe,
+   NVML-Reihen im Verlauf höchstens 2 s. Die Summe der Leistung gilt nur über alle Karten, nie über einen Teil davon.
+2. **Wanduhr-Nenner.** Ein 5-s-Eimer mit 2 s D-Extend zeigte den halben Decode-Durchsatz. Gezeichnet wird jetzt die Rate
+   *während* die Phase rechnete (`*_rate` = Tokens / `*_busy`). Decode-Zeit: stetige Proben voll; Anfang und Ende einer Strecke
+   nach Δ`decode.gpu_ms` × gemessenes Wand/GPU-Verhältnis. Ein Eimer ohne diese Arbeit ist eine Lücke. Die Wanduhr-Rate bleibt
+   für tok/s/W, Energie und Tokenzählung und liegt im Verlauf als ausgeblendete Reihe bei.
+   Im Verlauf stehen die Anteile (`dec_busy`, `p_busy`, `d_busy`, `dec_seat`) je 1-s-Zeile. Geteilt wird erst je gezeigtem
+   Eimer, deshalb stimmt es auf jeder Stufe. `dec_bs_min/_max` fassen per MIN/MAX zusammen.
+
+**Sitze** (Nachtrag 21:10Z): Batchgröße der Decode-Runden aus Δ`decode.gpu_ms_by_bs`, nach Rundenzeit gewichtet (sonst `decode.running`).
+Sitze werden nur über die Decode-Zeit gemittelt, Schlaf/Flip/Extend zählen also nicht als 0 Sitze. Je Stream = Tokens / Sitz-Sekunden,
+also gilt Gesamt = je Stream × Ø Sitze exakt.
+
+**Zoom** (`static/zoom.js`, ohne Bibliothek). Ziehen in einer Zeitgrafik (Verlauf, Karten-Verlauf, Kurven der Boot-Karte,
+Phasenleiste) zoomt alle Grafiken auf diesen Bereich. Zurück geht per Doppelklick, per Knopf „Zoom zurück“/„ganz heraus“ in der
+Zoom-Leiste oder per Esc. Auf einer fokussierten Grafik: + / − / ← / → / 0. Touch: waagerecht ziehen.
+Der Verlauf lädt `api/history?from=&to=` im passenden Raster neu (ab ≤ 24 min 1 s). Die Boot-Karte lädt `api/live?zoom=t0,t1`
+mit 1/2/5-s-Eimern (`series_zoom`); die 60-s-Kacheln bleiben auf „jetzt“. Die Kartenbalken oben sind Momentwerte ohne Zeitachse.
+Tests: `tests/test_rates_glatt_0930.py`.
+
 ## Nur IPC, kein Boot-Log (Nutzer 29.09. über 27B; Rüge und Order 30.09.)
 
 „das dashboard soll auch aus der inter prozess kommunikation gespeist werden, nicht aus logs“ -- seit 30.09. ohne Ausnahme:

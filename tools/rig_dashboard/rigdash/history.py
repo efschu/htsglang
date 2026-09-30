@@ -74,6 +74,12 @@ HIST_LAG_S = 20.0           # buckets are written once the last pipeline stage h
 
 # ----------------------------------------------------------------------------- storage
 
+def agg_of(name: str) -> str:
+    """How a series folds into a coarser bucket: rates and levels by their mean (tokens/s over 60 s =
+    tokens in those 60 s / 60); ``*_min`` / ``*_max`` (the batch-size span) by MIN / MAX."""
+    return "MIN" if name.endswith("_min") else "MAX" if name.endswith("_max") else "AVG"
+
+
 class HistoryDB:
     def __init__(self, path: Optional[str], max_mb: int = MAX_MB):
         self.path = path or ":memory:"
@@ -134,6 +140,17 @@ class HistoryDB:
                             (round(float(ts), 3), model, kind, label, v))
 
     # --- compaction, retention, size cap ----------------------------------
+    def _agg_sql(self) -> str:
+        """``CASE`` over the series ids: MIN/MAX for the span series, AVG for the rest (one statement)."""
+        mins = [str(i) for n, i in self._sid.items() if agg_of(n) == "MIN"]
+        maxs = [str(i) for n, i in self._sid.items() if agg_of(n) == "MAX"]
+        parts = []
+        if mins:
+            parts.append("WHEN sid IN (%s) THEN MIN(v)" % ",".join(mins))
+        if maxs:
+            parts.append("WHEN sid IN (%s) THEN MAX(v)" % ",".join(maxs))
+        return ("CASE %s ELSE AVG(v) END" % " ".join(parts)) if parts else "AVG(v)"
+
     def compact(self, now: float) -> dict:
         """p0 -> p1 (10 s) and p1 -> p2 (60 s) for closed buckets; then retention and the size cap.
         The cursors live in meta, so a restart continues where it stopped (INSERT OR REPLACE makes
@@ -149,8 +166,8 @@ class HistoryDB:
                     cur = int((r // step) * step) if r is not None else hi
                 if hi > cur:
                     self.db.execute(
-                        "INSERT OR REPLACE INTO %s(sid, ts, v) SELECT sid, (ts / %d) * %d AS b, AVG(v) FROM %s "
-                        "WHERE ts >= ? AND ts < ? GROUP BY sid, b" % (dst, step, step, src), (cur, hi))
+                        "INSERT OR REPLACE INTO %s(sid, ts, v) SELECT sid, (ts / %d) * %d AS b, %s FROM %s "
+                        "WHERE ts >= ? AND ts < ? GROUP BY sid, b" % (dst, step, step, self._agg_sql(), src), (cur, hi))
                     done[dst] = hi - cur
                     cur = hi
             self.set("cursor." + dst, cur)
@@ -188,8 +205,8 @@ class HistoryDB:
                 b = min(int(math.ceil(hi / step)) * step, int(cur))
                 if a < b:
                     self.db.execute(
-                        "INSERT OR REPLACE INTO %s(sid, ts, v) SELECT sid, (ts / %d) * %d AS bk, AVG(v) FROM %s "
-                        "WHERE sid IN (%s) AND ts >= ? AND ts < ? GROUP BY sid, bk" % (dst, step, step, src, q),
+                        "INSERT OR REPLACE INTO %s(sid, ts, v) SELECT sid, (ts / %d) * %d AS bk, %s FROM %s "
+                        "WHERE sid IN (%s) AND ts >= ? AND ts < ? GROUP BY sid, bk" % (dst, step, step, self._agg_sql(), src, q),
                         (*sids, a, b))
 
     def size_mb(self) -> float:
@@ -230,14 +247,16 @@ class HistoryDB:
             q = ",".join("?" * len(sids))
             acc: Dict[Tuple[int, int], List[float]] = {}
             for table, a, b in self._plan(lo_i, hi_i, k, now):
-                for sid, bkt, s, c in self.db.execute(
-                        "SELECT sid, (ts / %d) * %d AS b, SUM(v), COUNT(*) FROM %s WHERE sid IN (%s) AND ts >= ? "
-                        "AND ts < ? GROUP BY sid, b" % (step, step, table, q), (*sids.keys(), a, b)):
-                    x = acc.setdefault((sid, bkt), [0.0, 0])
+                for sid, bkt, s, c, mn, mx in self.db.execute(
+                        "SELECT sid, (ts / %d) * %d AS b, SUM(v), COUNT(*), MIN(v), MAX(v) FROM %s WHERE sid IN (%s) "
+                        "AND ts >= ? AND ts < ? GROUP BY sid, b" % (step, step, table, q), (*sids.keys(), a, b)):
+                    x = acc.setdefault((sid, bkt), [0.0, 0, mn, mx])
                     x[0] += s
                     x[1] += c
-        for (sid, bkt), (s, c) in acc.items():
-            out[sids[sid]][bkt] = s / c
+                    x[2], x[3] = min(x[2], mn), max(x[3], mx)
+        for (sid, bkt), (s, c, mn, mx) in acc.items():
+            ag = agg_of(sids[sid])
+            out[sids[sid]][bkt] = mn if ag == "MIN" else mx if ag == "MAX" else s / c
         return out
 
     def marks(self, model: str, lo: float, hi: float) -> List[dict]:
@@ -448,7 +467,12 @@ class Recorder:
                     vals = {"p_tps": b["p_tps"][i], "d_tps": b["d_tps"][i], "dec_tps": b["dec_tps"][i],
                             "stream_tps": b["stream_tps"][i], "kv_pct": b["kv_pct"][i], "kv_p_pct": b["kv_p_pct"][i],
                             "tok_cache": (b["tok_cache"][i] or 0.0) + (dc - ho), "tok_comp_p": b["tok_comp_p"][i],
-                            "tok_comp_d": b["tok_comp_d"][i], "tok_handoff": ho, "ipc": 1.0}
+                            "tok_comp_d": b["tok_comp_d"][i], "tok_handoff": ho, "ipc": 1.0,
+                            # the honest denominators (shares of the row): rate while working = tps / busy,
+                            # seats = dec_seat / dec_busy, per stream = dec_tps / dec_seat -- at every tier
+                            "p_busy": b["p_busy"][i], "d_busy": b["d_busy"][i], "dec_busy": b["dec_busy"][i],
+                            "dec_seat": b["dec_seat"][i], "dec_bs_min": b["dec_bs_min"][i],
+                            "dec_bs_max": b["dec_bs_max"][i]}
                     vals.update({"ph_" + k: b["ph_" + k][i] for k in activity.STATES})
                     rows += [(pre + k, ts, v) for k, v in vals.items() if v is not None]
                 self.db.put(rows)
@@ -471,8 +495,11 @@ class Recorder:
         prev = self._tier_prev.get(key)
         self._tier_prev[key] = tiers
         if prev is not None:
-            self.db.put([(SERIES % model + "tier_" + k, ts, (tiers[k] - prev.get(k, 0)) / MODEL_BUCKET_S)  # per loop
-                         for k in tiers if tiers[k] > prev.get(k, 0)])
+            # the loop's delta as a rate over each of its seconds: one row per 5 s summed to 1/5 of the
+            # tokens at the 1-s raster (the tile multiplies by the step)
+            nsec = int(MODEL_BUCKET_S)
+            self.db.put([(SERIES % model + "tier_" + k, ts - j, (tiers[k] - prev.get(k, 0)) / MODEL_BUCKET_S)
+                         for k in tiers if tiers[k] > prev.get(k, 0) for j in range(nsec)])
         self.db.set("src.%s.tiers" % model, "ipc")
 
     def _boot_marks(self, key: str, model: str, ipc: dict) -> None:
@@ -567,11 +594,88 @@ def model_src(ipc_marks: List[Optional[float]]) -> Optional[str]:
     return IPC_LABEL if any(v is not None for v in ipc_marks) else NO_DATA_LABEL
 
 
-def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now: Optional[float] = None) -> dict:
+BUSY_SERIES = ("p_busy", "d_busy", "dec_busy", "dec_seat", "dec_bs_min", "dec_bs_max")
+
+
+def derive_rates(series: Dict[str, List[Optional[float]]]) -> None:
+    """The honest rates from the stored shares, per shown bucket (any tier: both are means over the same
+    rows).  Rows written before the busy series existed (30.09. < ~21:30Z) take the phase share
+    ``ph_dec`` / ``ph_P`` / ``ph_D`` as busy -- the phase bar's decode time, the same data -- and keep
+    their stored per-stream value; they have no seat count."""
+    s = series
+    n = len(s.get("m.dec_tps") or [])
+
+    def busy(k, ph):
+        b, f = s.get("m." + k) or [None] * n, s.get("m.ph_" + ph) or [None] * n
+        return [x if x is not None else y for x, y in zip(b, f)]
+    s["m.dec_rate"] = _ratio(s["m.dec_tps"], busy("dec_busy", "dec"))
+    s["m.p_rate"] = _ratio(s["m.p_tps"], busy("p_busy", "P"))
+    s["m.d_rate"] = _ratio(s["m.d_tps"], busy("d_busy", "D"))
+    s["m.seats"] = _ratio(s.get("m.dec_seat") or [None] * n, s.get("m.dec_busy") or [None] * n)
+    new_stream = _ratio(s["m.dec_tps"], s.get("m.dec_seat") or [None] * n)
+    old = s.get("m.stream_tps") or [None] * n
+    s["m.stream_tps"] = [a if (s.get("m.dec_seat") or [None] * n)[i] is not None else b
+                         for i, (a, b) in enumerate(zip(new_stream, old))]
+    s["m.seats_min"] = list(s.get("m.dec_bs_min") or [None] * n)
+    s["m.seats_max"] = list(s.get("m.dec_bs_max") or [None] * n)
+
+
+def seat_tiles(series) -> dict:
+    """Nutzer 30.09. ~21:10Z: "bei verlauf wo decode je stream steht soll auch die anzahl oder das
+    mittel der sitze" -- over the shown stretch: seats time-weighted over the decode time only,
+    their span, the rate while decoding; per stream = that rate / those seats."""
+    tps, busy, seat = series.get("m.dec_tps") or [], series.get("m.dec_busy") or [], series.get("m.dec_seat") or []
+    rows = [(a, b, c) for a, b, c in zip(tps, busy, seat) if a is not None and b is not None and c is not None]
+    stok = sum(a for a, _, _ in rows)
+    sb = sum(b for _, b, _ in rows)
+    sc = sum(c for _, _, c in rows)
+    mins = [v for v in series.get("m.seats_min") or [] if v is not None]
+    maxs = [v for v in series.get("m.seats_max") or [] if v is not None]
+    return {"seats_mean": (sc / sb) if sb > 1e-6 else None,
+            "seats_min": min(mins) if mins else None, "seats_max": max(maxs) if maxs else None,
+            "dec_rate_mean": (stok / sb) if sb > 1e-6 else None,
+            "stream_mean": (stok / sc) if sc > 1e-6 else None}
+
+
+def _ratio(num: List[Optional[float]], den: List[Optional[float]], eps: float = 1e-6) -> List[Optional[float]]:
+    return [(a / b) if a is not None and b is not None and b > eps else None for a, b in zip(num, den)]
+
+
+def _hold(arr: List[Optional[float]], max_buckets: int) -> None:
+    """A level sampled at a fixed period holds until the next sample, at most ``max_buckets`` rows:
+    the NVML loop slips like the rank sampler (measured 30.09. ~21:10Z: the 1-s raster missed a second
+    of the 5090 every ~10 s), and a missing second is not a missing value."""
+    last, age = None, 0
+    for i, v in enumerate(arr):
+        if v is not None:
+            last, age = v, 0
+        elif last is not None and age < max_buckets:
+            age += 1
+            arr[i] = last
+        else:
+            last = None
+
+
+def zoom_step(span_s: float) -> int:
+    return next((s for s in STEPS if s >= span_s / MAX_POINTS), STEPS[-1])
+
+
+def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now: Optional[float] = None,
+         lo_hi: Optional[Tuple[float, float]] = None) -> dict:
+    """``lo_hi`` = a zoomed stretch (Nutzer 30.09. ~21:05Z: Klicken und Ziehen zoomt): the rows of
+    exactly that stretch, re-read at the step that fits it (1 s from a stretch of 24 min down), not
+    the range's rows stretched."""
     now = now or time.time()
     rng = RANGES.get(range_key, 3600)
-    step = next((s for s in STEPS if s >= rng / MAX_POINTS), STEPS[-1])
     lo = now - rng
+    zoom = None
+    if lo_hi is not None:
+        a, b = float(lo_hi[0]), min(float(lo_hi[1]), now)
+        if b - a >= 10:
+            lo, zoom = a, (a, b)
+            rng = b - a
+    step = zoom_step(rng)
+    hi = zoom[1] if zoom else now
     cards = (rec.cards if rec else None) or db.get("cards", []) or []
     names = []
     for c in cards:
@@ -579,11 +683,11 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     names += ["host.cpu", "host.mem_pct", "host.bootmem_pct", "host.bootmem_gib"]
     mp = SERIES % model
     msr = ["p_tps", "d_tps", "dec_tps", "stream_tps", "kv_pct", "kv_p_pct", "ipc"] + ["tok_" + k for k in cacheacct.CLASSES] \
-        + ["ph_" + k for k in activity.STATES]
+        + ["ph_" + k for k in activity.STATES] + list(BUSY_SERIES)
     names += [mp + k for k in msr] + [mp + "tier_" + k for k in cacheacct.TIERS]
-    data = db.query(names, lo, now, step, now)
+    data = db.query(names, lo, hi, step, now)
     t0 = int(lo // step) * step
-    ts = list(range(t0, int(now) + 1, step))
+    ts = list(range(t0, int(hi) + 1, step))
     series = {}
     for n in names:
         d = data.get(n) or {}
@@ -598,11 +702,16 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
                 elif last is not None and age < 5 - step:
                     age += step
                     arr[i] = last
-    # Leistungsaufnahme (Nutzer 30.09.: "power draw von allen karten gemeinsam"): the sum of the cards
-    # that reported in the bucket; None only when no card did
+    # NVML rows every 1 s: a slipped second holds the previous reading (at most 2 s), no gap
+    if step < 5:
+        for n in [k for k in series if k.startswith("g")]:
+            _hold(series[n], max(1, int(2 // step)))
+    # Leistungsaufnahme (Nutzer 30.09.: "power draw von allen karten gemeinsam"): the sum of ALL cards;
+    # a bucket where one card has no reading is a gap, never the sum of the others (that was a
+    # 200-400 W drop whenever the 5090's second slipped -- the same jump class as the decode curve)
     pw = [series.get("g%d.power" % c["index"]) or [] for c in cards]
-    series["gsum.power"] = [(sum(a[i] for a in pw if i < len(a) and a[i] is not None)
-                             if any(i < len(a) and a[i] is not None for a in pw) else None) for i in range(len(ts))]
+    series["gsum.power"] = [(sum(a[i] for a in pw) if pw and all(i < len(a) and a[i] is not None for a in pw)
+                             else None) for i in range(len(ts))]
     # only what the IPC sampler wrote: rows an older rigdash derived from boot logs (buckets without
     # m.ipc) are not shown -- that part is "keine Daten (vor IPC-Aufzeichnung)", a gap, not a log
     alive = series["m.ipc"]
@@ -610,6 +719,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         if k != "ipc":
             series["m." + k] = [v if alive[i] is not None else None for i, v in enumerate(series["m." + k])]
     src_model = model_src(alive)
+    derive_rates(series)
     # cards: newest first for "now"
     def latest(n):
         arr = series.get(n) or []
@@ -626,7 +736,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     # marks: only those written from IPC (label "<…> ipc"); the ones an older rigdash took from log lines
     # (flip "<dir> log", boot/end without the suffix) are not shown
     marks = []
-    for m in db.marks(model, lo, now):
+    for m in db.marks(model, lo, hi):
         lab = m["label"] or ""
         if not lab.endswith(" ipc"):
             continue
@@ -652,6 +762,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         "flip_last_ms": last_pd["v"] if last_pd else None, "flip_last_t": last_pd["t"] if last_pd else None,
         "flip_median_ms": _pct(flips_pd, 0.5), "flip_n": len(flips_pd),
     }
+    tiles.update(seat_tiles(series))
     thin = [m for m in marks if m["kind"] not in ("flip", "flip_user")] + [m for m in marks if m["kind"] == "flip_user"]
     fl = [m for m in marks if m["kind"] == "flip"]
     if len(fl) > 800:
@@ -659,6 +770,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         fl = [fl[int(i * k)] for i in range(800)]
     return {
         "model": model, "range": range_key, "range_s": rng, "step": step, "t": ts, "now": now,
+        "zoom": list(zoom) if zoom else None, "lo": lo, "hi": hi,
         "series": series, "cards": card_info, "marks": sorted(thin + fl, key=lambda m: m["t"]),
         "marks_total": len(marks), "tiles": tiles,
         "src": {
@@ -667,6 +779,8 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
                      if getattr(rec, "host_where", None) == "proxmox" else "LXC /proc"),
             "roles": "state.json groups.launch",
             "prefill": src_model, "decode": src_model, "kv": src_model, "cache": src_model,
+            "rates": "Tokens / Zeit, in der die Phase arbeitete (dec_busy/p_busy/d_busy); Pausen = Lücke",
+            "seats": "rankstats D decode.gpu_ms_by_bs (Δ je Probe, nach Rundenzeit gewichtet), sonst decode.running",
             "power": "NVML, Summe aller Karten",
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
                             else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
