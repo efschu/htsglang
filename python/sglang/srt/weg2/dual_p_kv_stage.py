@@ -286,7 +286,7 @@ class PKvStage:
         price the WHOLE group's grant (``stage_file``)."""
         return [self.bytes_for(k) - self.bytes_for(0) for k in lattice(self.top, self.step)]
 
-    def map_granted(self, tokens: int) -> None:
+    def map_granted(self, tokens: int, charged: Optional[int] = None) -> None:
         """Adopt a grant PP0 already committed on this card's ledger for this
         rank (the atomic group grant): map, no ledger request. The previous
         commitment of this rank is dropped here -- a grant is always fresh."""
@@ -298,7 +298,11 @@ class PKvStage:
         # on the 5090, the next grant starved on P's own count). A grant still
         # in flight to a follower stays charged in the ledger until adopted,
         # so the ledger never covers less than the mapping.
-        self._committed = int(getattr(self, "_committed", 0) or 0) + (self.bytes_for(want) - self.bytes_for(0))
+        # ``charged``: what PP0 actually took on THIS card for the grant (its own
+        # card: only the difference to its mapping); None = the full unit
+        # (a follower card, charged in full by PP0)
+        add = (self.bytes_for(want) - self.bytes_for(0)) if charged is None else max(0, int(charged))
+        self._committed = int(getattr(self, "_committed", 0) or 0) + add
         if want > self.mapped_tokens:
             self._move(want)
             self.mapped_tokens = want
@@ -397,11 +401,19 @@ def publish_stage(actor: "PKvStage", tag: str, pp_rank: int) -> str:
     return path
 
 
-def group_grant(stages: Sequence[dict], tokens: int, open_ledger) -> int:
+def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optional[dict] = None) -> int:
     """ATOMIC over all P stages (operator order 30.09.: all or none, fixed card
     order against deadlocks): commit each stage's bytes for ``tokens`` on its
     card's ledger; if any card is short, return every grant already taken and
-    answer 0. Returns the granted token level."""
+    answer 0. Returns the granted token level.
+
+    ``covered`` {stage index: bytes}: what that stage's ledger ALREADY covers
+    for its mapping -- only the difference is asked (operator order after
+    dual13: a level the mapping covers never waits). Only PP0's own card is
+    passed: PP0 cannot see a follower's mapping, and a follower may
+    idle-release between this grant and its adoption, so a follower card is
+    charged the full unit and returns the excess on adoption."""
+    covered = covered or {}
     if not stages:
         return 0
     step = int(stages[0]["step"])
@@ -411,7 +423,7 @@ def group_grant(stages: Sequence[dict], tokens: int, open_ledger) -> int:
     order = sorted(range(len(stages)), key=lambda i: str(stages[i]["ledger"]))
     taken = []
     for i in order:
-        need = int(stages[i]["bytes"][k])
+        need = max(0, int(stages[i]["bytes"][k]) - int(covered.get(i, 0)))
         led = open_ledger(stages[i]["ledger"])
         got, _ = led.request(need)
         taken.append((led, got))
@@ -445,10 +457,12 @@ def pp0_grant(sched, req) -> Optional[int]:
             logger.warning("%s PP0 GRANT waits: stage %d has not published its table yet", MARK, r)
             return 0
     tokens = len(getattr(req, "origin_input_ids", None) or ()) + int(actor.page)
-    lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"))
+    own = int(getattr(actor, "_committed", 0) or 0)    # PP0's card: the ledger covers its mapping exactly
+    lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own})
     rid = str(getattr(req, "rid", "?"))[:16]
     if lvl:
-        actor.map_granted(lvl)
+        k = lvl // int(stages[0]["step"])
+        actor.map_granted(lvl, charged=max(0, int(stages[0]["bytes"][k]) - own))
         req._dual_kv_tokens = lvl
         waited = _wait_granted(rid)
         logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards%s", MARK, rid, lvl, pp,
