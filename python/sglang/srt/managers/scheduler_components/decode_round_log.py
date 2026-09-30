@@ -281,6 +281,9 @@ class DecodeRoundLog:
         self.cum_rounds: int = 0
         self.cum_gpu_ms: float = 0.0
         self.cum_by_bs: dict = {}
+        #: DASHBOARD-AUS-IPC (30.09., Inventar FEHLT 6): the batch size of the
+        #: last emitted round (None before the first) -- the decode tile's bs
+        self.last_bs = None
         #: fnFL2 H23: DECODE-ROUND-COST for the first rounds after a Weg-2
         #: wake. Inert until ``arm_wake_census``.
         self.wake_census = WakeRoundCensus(rank=self.rank)
@@ -562,6 +565,7 @@ class DecodeRoundLog:
         self._overhead_gpu_ms += round_ms
         self.cum_rounds += 1
         self.cum_gpu_ms += round_ms
+        self.last_bs = acc.bs
         slot_bs = self.cum_by_bs.get(acc.bs)
         if slot_bs is None:
             self.cum_by_bs[acc.bs] = [1, round_ms]
