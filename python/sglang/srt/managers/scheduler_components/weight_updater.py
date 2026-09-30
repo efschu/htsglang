@@ -10529,6 +10529,17 @@ class SchedulerWeightUpdaterManager:
                 logger.info("WEG2-SEQ lane-release skipped: %r", _rel_exc)
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             _weg2_ph("leg_collects")
+            # TAIL-STAGE-AFTER-LEGS: the other site of TAIL-STAGE-EARLY --
+            # behind the last weight collect, so the staging threads no
+            # longer compete with the collectors (tail_adopt.stage_site).
+            if self.scheduler is not None:
+                try:
+                    from sglang.srt.weg2 import tail_adopt as _ta_late
+
+                    _ta_late.stage_at_wake_begin(self.scheduler, site=_ta_late.SITE_LEGS_END)
+                except Exception as _ta_late_exc:  # noqa: BLE001 -- the post-wake check stages it
+                    logger.warning("WEG2-TAIL-STAGE-EARLY n/a at legs end (%s: %s)",
+                                   type(_ta_late_exc).__name__, _ta_late_exc)
             # fnFL2 v43: THE WEIGHTS-SIDE MIRROR of the graph tag's
             # `_weg2_zero_graph_scratch` above, and for the identical reason.
             # `marlin_make_workspace` registers a semaphore array as a

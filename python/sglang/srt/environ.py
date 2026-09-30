@@ -643,6 +643,16 @@ class Envs:
     # finished store read) median 291 ms (y4l, n=12) / 286 (y4k, n=14), up to
     # 757 at a wake cohort of 6 -- inside flip_first_work. Off until metal.
     SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY = EnvBool(False)
+    # TAIL-STAGE-AFTER-LEGS (30.09., NF y4s/y4s-tse P->D): with TAIL-STAGE-EARLY
+    # on, start that staging after the LAST weight collect (legs end, before
+    # the expert rearm) instead of at the legs' start. Measured y4s-tse vs y4l
+    # at 5-6 seats: the staging threads (part read, digest, pin_memory per
+    # layer) ran beside the collectors -- D collector issue_ms 202-286 ->
+    # 359-1127 ms on TP0, P deposit credit waits 451-584 -> 951-2094 ms, legs
+    # 1522 -> ~2030 ms median; the post-wake gain (TAIL-READY 291 -> 0 ms) is
+    # kept in part, since the staging still starts before the first pass.
+    # Off = the leg-start site of TAIL-STAGE-EARLY, unchanged.
+    SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS = EnvBool(False)
     # WAKE_READ_ARENA_GATE (#248f, 30.09., NF y4b ep18): the #248 hold reads of
     # a wake are issued in hold (arrival) order only while their pages fit in
     # the KV arena together (its slot count -- no reserve); a younger read
