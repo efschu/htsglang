@@ -83,3 +83,15 @@ def test_sampler_restart_keeps_the_ring(tmp_path):
     b = ipcboot.IpcBoots(roots={}, store=st, role="sampler")
     assert b.warm_from_store(now) == 5
     assert [s["t"] for s in b.rings["boot-a"]] == [now - 300 + i for i in range(5)]
+
+
+def test_ttft_series_mean_per_bucket_and_gap():
+    class Fake:
+        def query_range(self, q, start, end, step):
+            assert start == 105 and end == 125 and step == 5
+            if "ttft_ms_sum" in q:
+                return {105: 12000.0, 110: 0.0, 120: 3000.0}
+            return {105: 3.0, 110: 0.0, 120: 1.0}
+    out = vmpush.ttft_series(Fake(), "NF", [100, 105, 110, 115, 120], 5)
+    assert out["mean_ms"] == [4000.0, None, None, 3000.0, None]     # bucket [t, t+5) read at t+5
+    assert out["n"][0] == 3.0 and out["n"][1] is None

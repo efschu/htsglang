@@ -275,6 +275,9 @@ class App:
 
     def history_view(self, model, rng, lo_hi=None) -> dict:
         v = history.view(self.hist, self.hist_rec, model, rng, lo_hi=lo_hi)
+        if self.vm is not None:
+            # Nutzer 01.10.: TTFT mit Verlauf -- aus VictoriaMetrics (PromQL), nicht aus history.sqlite
+            v["ttft"] = vmpush.ttft_series(self.vm, model, v.get("t") or [], int(v.get("step") or 5))
         n = (v.get("held") or {}).get("view_filled") or 0
         self.view_held["total"] += n
         self.view_held["last"] = n

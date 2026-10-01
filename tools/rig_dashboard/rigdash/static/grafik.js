@@ -330,6 +330,15 @@
         line("Übergabe P→D (kein Cache)", C.s4, "tok/s", { fill: undefined, dash: [5, 4], width: 1.5 })],
       bands: [{ series: [2, 1], fill: C.s2 + "66" }, { series: [3, 2], fill: C.s3 + "66" }],
     }, rowsCache(d));
+    // TTFT der Nutzer (Nutzer 01.10.: zentrale Messgroesse, mit Verlauf) aus VictoriaMetrics; Balken je Eimer
+    charts.ttft = mk("vl-c-ttft", {
+      scales: { y: { range: zeroUp(1000) }, n: { range: (u, a, b) => [0, Math.max(4, Math.ceil((b || 0) * 1.2))] } },
+      axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s"),
+        Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "n", side: 1, grid: { show: false }, size: 40, label: "Anfragen", labelSize: 14, labelFont: FONT })],
+      series: [{}, line("TTFT (Mittel je Eimer)", C.s7, "s", { value: valFmt("s", 2, null, 0.001), points: { show: true, size: 4, fill: C.s7 } }),
+        line("Anfragen mit erstem Token im Eimer", C.s4, "", { width: 1.25, fill: undefined, scale: "n", noDot: true,
+          paths: uPlot.paths && uPlot.paths.stepped ? uPlot.paths.stepped({ align: 1 }) : undefined })],
+    }, rowsTtft(d));
     charts.kv = mk("vl-c-kv", {
       scales: { y: { range: [0, 100] } },
       axes: [axisX(), axisY(pct)],
@@ -368,6 +377,7 @@
   const raw = { v: [[], [], []] };
   const rowsPre = (d) => [d.t, d.series["m.p_rate"], d.series["m.d_rate"], d.series["m.p_tps"], d.series["m.d_tps"]];
   const rowsDec = (d) => [d.t, d.series["m.dec_rate"], d.series["m.stream_tps"], d.series["m.seats"], d.series["m.dec_tps"]];
+  const rowsTtft = (d) => { const x = d.ttft || {}; const nul = d.t.map(() => null); return [d.t, x.mean_ms || nul, x.n || nul]; };
   const rowsHost = (d) => [d.t, d.series["host.cpu"], d.series["host.mem_pct"], d.series["host.bootmem_pct"]];
   const rowsCards = (d, k) => [d.t].concat((d.cards || []).map((c) => d.series["g" + c.index + "." + k] || d.t.map(() => null)));
   const rowsPower = (d) => [d.t, d.series["gsum.power"]].concat(rowsCards(d, "power").slice(1));
@@ -397,6 +407,7 @@
     if (sigOf(d) !== sig || !charts.pre) { build(d); return; }
     charts.pre.setData(rowsPre(d));
     charts.dec.setData(rowsDec(d));
+    if (charts.ttft) charts.ttft.setData(rowsTtft(d));
     charts.cache.setData(rowsCache(d));
     charts.kv.setData([d.t, d.series["m.kv_pct"], d.series["m.kv_p_pct"]]);
     charts.flip.setData(rowsFlips(d));
@@ -410,7 +421,7 @@
     const s = d.src || {};
     const set = (id, src) => { const el = $(id); if (el) el.innerHTML = srcBadge(src); };
     set("vl-s-pre", s.prefill); set("vl-s-dec", s.decode); set("vl-s-cache", s.cache); set("vl-s-kv", s.kv);
-    set("vl-s-flip", s.flip); set("hw-s-power", s.power); set("hw-s-temp", s.temp); set("hw-s-clock", s.cards);
+    set("vl-s-flip", s.flip); set("vl-s-ttft", (d.ttft || {}).error ? "VictoriaMetrics: " + d.ttft.error : (d.ttft || {}).src); set("hw-s-power", s.power); set("hw-s-temp", s.temp); set("hw-s-clock", s.cards);
     set("hw-s-host", s.host);
     const err = Object.entries(d.errors || {}).map(([k, v]) => k + ": " + v).join(" · ");
     const nb = (d.marks || []).filter((m) => m.kind === "boot").length;

@@ -204,6 +204,23 @@ class VmClient:
             raise RuntimeError(d.get("error") or "VM query failed")
         return d["data"]["result"]
 
+    def query_range(self, promql: str, start: float, end: float, step: float) -> Dict[int, float]:
+        """{unix_s: value} of the (summed) result of a range query."""
+        from urllib.parse import urlencode
+        q = {"query": promql, "start": "%.3f" % start, "end": "%.3f" % end, "step": "%ds" % max(1, int(step))}
+        with urllib.request.urlopen(self.url + "/api/v1/query_range?" + urlencode(q), timeout=self.timeout) as r:
+            d = json.loads(r.read())
+        if d.get("status") != "success":
+            raise RuntimeError(d.get("error") or "VM query_range failed")
+        out: Dict[int, float] = {}
+        for s in d["data"]["result"]:
+            for t, v in s.get("values") or []:
+                try:
+                    out[int(round(float(t)))] = float(v)
+                except (TypeError, ValueError):
+                    pass
+        return out
+
     def scalar_by(self, promql: str, label: str) -> Dict[str, float]:
         out = {}
         for s in self.query(promql):
@@ -234,3 +251,29 @@ def tiles(client: VmClient) -> dict:
     except Exception as e:  # noqa: BLE001 -- the page says so instead of a number
         out["error"] = "%s: %s" % (type(e).__name__, e)
     return out
+
+
+def ttft_series(client: VmClient, model: str, ts: List[int], step: int) -> dict:
+    """TTFT der Nutzer je Eimer des Verlaufs (history.view ts/step) aus VictoriaMetrics: Mittel der Anfragen,
+    deren erstes Token im Eimer [t, t+step) kam (increase ueber das Fenster, ausgewertet an t+step), und ihre
+    Zahl. Ein Eimer ohne Anfrage ist eine Luecke."""
+    if not ts:
+        return {"mean_ms": [], "n": [], "error": None}
+    # window = bucket (no overlap: MetricsQL increase() also uses the last sample before the window); the
+    # bridge pushes every 5 s, so a finer bucket (zoom) reads a 5-s window
+    w = max(int(step), 5)
+    sel = 'model="%s"' % model
+    try:
+        s = client.query_range("sum(increase(weg2_front_ttft_ms_sum{%s}[%ds]))" % (sel, w), ts[0] + step, ts[-1] + step, step)
+        n = client.query_range("sum(increase(weg2_front_ttft_count{%s}[%ds]))" % (sel, w), ts[0] + step, ts[-1] + step, step)
+    except Exception as e:  # noqa: BLE001 -- the chart says so
+        return {"mean_ms": [None] * len(ts), "n": [None] * len(ts), "error": "%s: %s" % (type(e).__name__, e)}
+    mean, cnt = [], []
+    for t in ts:
+        k = t + step
+        nn, ss = n.get(k), s.get(k)
+        ok = nn is not None and ss is not None and nn >= 0.5
+        mean.append(ss / nn if ok else None)
+        cnt.append(nn if nn is not None and nn >= 0.5 else None)
+    return {"mean_ms": mean, "n": cnt, "error": None, "window_s": w,
+            "src": "VictoriaMetrics weg2_front_ttft_* (state.json front.arrival_seat, LEG2-FIRST-CONTENT)"}
