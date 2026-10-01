@@ -7256,13 +7256,18 @@ class SchedulerWeightUpdaterManager:
                 # "hold" by refilling every held row it owns over H2D from L2
                 # (plan L15-12-PART3-PLAN sec 2).  The ANCHOR GATE (plan sec 8)
                 # runs before anything is even considered: a HoldSpan without
-                # the GDN anchor's L2 identity (anchor_l2_slot absent/None --
-                # every manifest written before C2 records it) cannot be held
-                # here, the anchor state would come back missing and a
-                # half-held tree is worse than the fallback shape.  Until then
-                # this rank votes None, exactly the pre-E2 behaviour.
-                if any(getattr(_sp, "anchor_l2_slot", None) is None
-                       for _sp in m.spans):
+                # the GDN anchor's L2 identity (anchor_l2_slot absent, None
+                # or -1 -- E2b: -1 is the sleep side's explicit "not
+                # recorded"; every manifest written before C2 records it)
+                # cannot be held here, the anchor state would come back
+                # missing or garbage and a half-held tree is worse than the
+                # fallback shape.  Until then this rank votes None, exactly
+                # the pre-E2 behaviour.
+                def _anchor_named(_sp):
+                    _a = getattr(_sp, "anchor_l2_slot", None)
+                    return _a is not None and int(_a) >= 0
+
+                if not all(_anchor_named(_sp) for _sp in m.spans):
                     logger.info("L15-REFILL rank=%d anchors-missing: votes no hold",
                                 rank)
                     return None, rank, 0, True
@@ -7509,8 +7514,41 @@ class SchedulerWeightUpdaterManager:
             if bad:
                 raise l15_refill.L15RefillError(
                     "generation mismatch, drop-eligible rids: %s" % (bad[:4],))
+            # L15-12c-E2b: the GDN anchors travel in the same all-or-nothing
+            # unit: EVERY anchor generation is checked before any copy (KV
+            # included), so a mismatching wake copies nothing at all.
+            # anchor_slot is the span's device anchor row, kept out of the
+            # req clear by the restore's keep_mamba_rows; anchor_l2_slot is
+            # its L2 page (>= 0 here -- the gate did not open without it).
+            tree = getattr(sched, "tree_cache", None)
+            host_mamba = getattr(tree, "mamba_pool_host", None)
+            dev_mamba = getattr(getattr(sched, "req_to_token_pool", None),
+                                "mamba_pool", None)
+            if host_mamba is None or dev_mamba is None:
+                raise LookupError("refill needs the mamba host and device "
+                                  "pools for the anchors")
+            _sg = getattr(host_mamba, "slot_gens", None)
+            if _sg is None:
+                raise LookupError("mamba host pool has no slot_gens yet "
+                                  "(E2a pending) -- cannot verify anchors")
+            a_slots = [int(getattr(_sp, "anchor_l2_slot", -1))
+                       for _sp in m.spans]
+            a_didx = [int(getattr(_sp, "anchor_slot", -1)) for _sp in m.spans]
+            a_gens = [int(getattr(_sp, "anchor_l2_gen", -1)) for _sp in m.spans]
+            if any(s < 0 or d < 0 for s, d in zip(a_slots, a_didx)):
+                raise l15_refill.L15RefillError(
+                    "anchor identity incomplete: l2_slots=%s rows=%s"
+                    % (a_slots, a_didx))
+            if [int(g) for g in _sg(a_slots)] != a_gens:
+                raise l15_refill.L15RefillError(
+                    "anchor generation mismatch, recorded %s" % (a_gens,))
             n = l15_refill.refill(ok, host_pool, device_pool, page_tokens)
-            logger.info("L15-REFILL rank=%d done: %d row(s) from L2", rank, n)
+            host_mamba._load_states_all_layers(
+                dev_mamba,
+                torch.tensor(a_slots, dtype=torch.int64),
+                torch.tensor(a_didx, dtype=torch.int64))
+            logger.info("L15-REFILL rank=%d done: %d KV row(s) + %d anchor(s) "
+                        "from L2", rank, n, len(a_slots))
             return n
         except Exception as exc:  # noqa: BLE001 -- all-or-nothing into the fallback
             logger.info("L15-REFILL rank=%d failed: %s -> fallback", rank, exc)

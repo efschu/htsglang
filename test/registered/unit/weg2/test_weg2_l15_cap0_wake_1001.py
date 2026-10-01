@@ -99,17 +99,41 @@ class _HostPool:
                                 tuple(int(x) for x in didx_t), lanes, mode))
 
 
+class _MambaHostPool:
+    """ArenaMambaPoolHost stand-in (L15-12c-E2b): current anchor generations
+    + recorded _load_states_all_layers calls (arena_mamba_pool.py:562 shape).
+    no_gens simulates the pre-E2a pool without the slot_gens accessor."""
+
+    def __init__(self, gens=None, no_gens=False):
+        self.gens = gens or {}
+        self.gen_calls = []
+        self.load_calls = []
+        if no_gens:
+            self.slot_gens = None  # type: ignore[assignment]
+
+    def slot_gens(self, slots):
+        self.gen_calls.append(tuple(int(x) for x in slots))
+        return [int(self.gens.get(int(s), -1)) for s in slots]
+
+    def _load_states_all_layers(self, device_pool, slots, didx) -> None:
+        self.load_calls.append((device_pool,
+                                tuple(int(x) for x in slots),
+                                tuple(int(x) for x in didx)))
+
+
 class _TreeCache:
-    def __init__(self, host_pool):
+    def __init__(self, host_pool, mamba_host=None):
         self.resets = 0
         self.cache_controller = SimpleNamespace(mem_pool_host=host_pool)
+        if mamba_host is not None:
+            self.mamba_pool_host = mamba_host
 
     def reset(self):
         self.resets += 1
 
 
 class _Sched:
-    def __init__(self, host_pool):
+    def __init__(self, host_pool, mamba_host=None):
         self.tp_size = 2
         self.server_args = SimpleNamespace(tp_size=2, rank_gpu_id=None)
         cell_t = torch.zeros(4, 2, 2)
@@ -119,7 +143,11 @@ class _Sched:
             model_runner=SimpleNamespace(token_to_kv_pool=self.device_pool))
         self.req_to_token_pool = _ReqToTokenPool()
         self.token_to_kv_pool_allocator = _Allocator()
-        self.tree_cache = _TreeCache(host_pool)
+        self.tree_cache = _TreeCache(host_pool, mamba_host)
+        # the device mamba pool the anchor states load into (E2b)
+        self.device_mamba = SimpleNamespace(
+            mamba_cache=SimpleNamespace(temporal=[]))
+        self.req_to_token_pool.mamba_pool = self.device_mamba
         self.base_a = torch.ones(6, 1)
         self.base_b = torch.ones(6, 1)
         outer = SimpleNamespace(
@@ -217,7 +245,8 @@ def test_cap0_gate_open_stashes_marks_and_refills_once(monkeypatch, tmp_path):
     man = _fake_manifest(_SPANS)
     _gate_open(monkeypatch, man)
     host = _HostPool({10: 5, 11: 5})
-    sched = _Sched(host)
+    mamba = _MambaHostPool({9: 5})
+    sched = _Sched(host, mamba)
     fs = _fake_self(sched, 0)
     m, rank, keep, master_on = WU._l15_wake_hold_signal(fs)
     assert (m, rank, keep, master_on) == (man, 0, KEEP, True)
@@ -236,6 +265,11 @@ def test_cap0_gate_open_stashes_marks_and_refills_once(monkeypatch, tmp_path):
     slots, didx, lanes, mode = host.load_calls[0]
     assert slots == (10, 11) and didx == (1, 2)      # compact rows slot//2
     assert lanes is None and mode is None
+    # E2b: the GDN anchor states come back too, ONE call, right slots/didx
+    assert len(mamba.load_calls) == 1
+    dpool, a_slots, a_didx = mamba.load_calls[0]
+    assert a_slots == (9,) and a_didx == (1,)        # anchor_l2_slot -> anchor_slot
+    assert dpool is sched.device_mamba
     assert sched.tree_cache.resets == 0             # no fallback on success
     assert fs._l15_wake_manifest is man             # the hold survives the act
 
@@ -249,7 +283,8 @@ def test_cap0_gen_mismatch_folds_into_fallback(monkeypatch, tmp_path, caplog):
     man = _fake_manifest(_SPANS)
     _gate_open(monkeypatch, man)
     host = _HostPool({10: 7, 11: 5})                # slot 10 was re-claimed
-    sched = _Sched(host)
+    mamba = _MambaHostPool({9: 8})                  # anchor re-claimed too
+    sched = _Sched(host, mamba)
     fs = _fake_self(sched, 0)
     WU._l15_wake_hold_signal(fs)
     WU._weg2_wake_restore_pools(fs)
@@ -293,3 +328,57 @@ def test_cap_positive_unchanged_no_refill_mark(monkeypatch, tmp_path, caplog):
     WU._weg2_wake_restore_pools(fs)
     assert WU._l15_wake_act(fs, sched, "hold", group_ok=True, master_on=True) == 0
     assert sched.tree_cache.cache_controller.mem_pool_host.load_calls == []
+
+
+# ---------------------------------------------------------------------------
+# (5) E2b: the anchor part -- -1 gates closed, gen mismatch / missing
+# accessor fold into the fallback, everything checked before ANY copy
+# ---------------------------------------------------------------------------
+
+def test_cap0_anchor_minus_one_gates_closed(monkeypatch, tmp_path, caplog):
+    _env(monkeypatch, tmp_path, master=True, mib="c1=64")
+    man = _fake_manifest([_span("a", (2, 4), (10, 11), (5, 5), anchor=-1)])
+    _gate_open(monkeypatch, man)
+    sched = _Sched(_HostPool({10: 5, 11: 5}), _MambaHostPool({}))
+    fs = _fake_self(sched, 0)
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        m, rank, keep, master_on = WU._l15_wake_hold_signal(fs)
+    assert (m, rank, keep, master_on) == (None, 0, 0, True)   # votes None
+    assert not fs._l15_wake_refill
+    assert any("anchors-missing" in r.getMessage()
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+
+def test_cap0_anchor_gen_mismatch_folds_into_fallback(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path, master=True, mib="c1=64")
+    man = _fake_manifest(_SPANS)
+    _gate_open(monkeypatch, man)
+    host = _HostPool({10: 5, 11: 5})                 # KV gens fine
+    mamba = _MambaHostPool({9: 8})                   # anchor was re-claimed
+    sched = _Sched(host, mamba)
+    fs = _fake_self(sched, 0)
+    WU._l15_wake_hold_signal(fs)
+    WU._weg2_wake_restore_pools(fs)
+    n = WU._l15_wake_act(fs, sched, "hold", group_ok=True, master_on=True)
+    assert n == 0
+    assert host.load_calls == []                     # no KV copy either
+    assert mamba.load_calls == []                    # every gen checked first
+    assert sched.tree_cache.resets == 1              # folded into fallback
+    assert fs._l15_wake_manifest is None
+
+
+def test_cap0_anchor_gens_accessor_missing_falls_back(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path, master=True, mib="c1=64")
+    man = _fake_manifest(_SPANS)
+    _gate_open(monkeypatch, man)
+    host = _HostPool({10: 5, 11: 5})
+    mamba = _MambaHostPool({9: 5}, no_gens=True)     # pre-E2a pool
+    sched = _Sched(host, mamba)
+    fs = _fake_self(sched, 0)
+    WU._l15_wake_hold_signal(fs)
+    WU._weg2_wake_restore_pools(fs)
+    n = WU._l15_wake_act(fs, sched, "hold", group_ok=True, master_on=True)
+    assert n == 0
+    assert host.load_calls == [] and mamba.load_calls == []
+    assert sched.tree_cache.resets == 1
+    assert fs._l15_wake_manifest is None
