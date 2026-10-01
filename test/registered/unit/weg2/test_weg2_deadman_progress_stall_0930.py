@@ -225,6 +225,92 @@ class TestNonStreamRankWork(unittest.TestCase):
         self.assertIn("LAEUFT WIEDER", SF.deadman_progress(self.d, self.memo, 60, now=1200.0))
 
 
+def _y6d_front(ts, last_token_s, age_s):
+    """NF y6d 08:03:31-08:04:46Z: ONE stream request (weg2-18-47, the user's OpenWebUI answer) on D,
+    served=77 / tokens=2673954 frozen for 75 s -- served and served_tokens count a request at its end.
+    The front's OutstandingBook row carries the token it pushed last (state.json at 08:05:13Z:
+    last_token_s 1.1, age_s 297.2, stream 1, where D)."""
+    fr = _front(1, 62, 15, 1300000, 73954, ts=ts, outstanding_n=1, outstanding_nonstream_n=0)
+    fr["outstanding_stalest"] = [{"rid": "weg2-18-47", "where": "D", "age_s": age_s, "stream": 1,
+                                  "last_token_s": last_token_s, "no_token_s": last_token_s}]
+    return fr
+
+
+class TestY6dSingleStream(unittest.TestCase):
+    """y6d died at 08:04:31Z (HAENGT -> the NF arm's relay wrote stop_request.json, rc 24) while D decoded
+    round 5836 -> 8292 at bs1 (#full token 446272 -> 451136) and the user received the stream."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.d = SF.init(self.root, "nf-y6d-replay", "boot", {})
+        self.memo = os.path.join(self.root, "memo.json")
+        os.makedirs(os.path.join(self.d, "rankstate", "D"), exist_ok=True)
+
+    def ranks(self, k):
+        for t in range(3):
+            with open(os.path.join(self.d, "rankstate", "D", "D.tp%dpp0.rankstats" % t), "w") as f:
+                json.dump({"schema": "weg2.rankstats/1", "progress": {
+                    "fwd_ct": 5836 + 164 * k, "tokens_done": 80000 + 330 * k}}, f)
+
+    def replay(self, *, ranks_move, tokens_move, rankstats=True, t0=1790841811.0):
+        out = []
+        for k, t in enumerate(range(0, 90, 5)):
+            now = t0 + t
+            lt = 0.3 if tokens_move else 0.3 + t               # last token 0.3 s ago, or frozen at t0
+            SF.transition(self.d, "serving" if k == 0 else None,
+                          fields={"front": _y6d_front(round(now, 3), round(lt, 1), round(225.0 + t, 1))})
+            if rankstats:
+                self.ranks(k if ranks_move else 0)
+            out.append(SF.deadman_progress(self.d, self.memo, 60, now=now))
+        return [l for l in out if l]
+
+    def test_y6d_specimen_moving_rank_work_and_stream_tokens_no_stall(self):
+        self.assertEqual(self.replay(ranks_move=True, tokens_move=True), [])
+        self.assertNotIn("progress", SF.read(self.d))
+        self.assertFalse(os.path.exists(os.path.join(self.d, "stop_request.json")))
+
+    def test_stream_tokens_alone_are_progress_without_rankstats(self):
+        # the front's own stamp is a witness even when no rank file is readable
+        self.assertEqual(self.replay(ranks_move=False, tokens_move=True, rankstats=False), [])
+        self.assertIsNone(SF.rank_work(self.d))
+
+    def test_stream_tokens_alone_beat_frozen_rank_files(self):
+        self.assertEqual(self.replay(ranks_move=False, tokens_move=True), [])
+
+    def test_all_witnesses_frozen_is_still_a_stall(self):
+        lines = self.replay(ranks_move=False, tokens_move=False)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("HAENGT", lines[0])
+        self.assertIn("letzter Stream-Token vor", lines[0])
+        rec = SF.read(self.d)["progress"]
+        self.assertEqual(rec["verdict"], "HAENGT")
+        self.assertGreaterEqual(rec["stream_token_age_s"], 60.0)
+
+    def test_a_frozen_front_snapshot_is_no_progress(self):
+        # the front's IPC snapshot stops refreshing: ts and rows stand -> the stamp stands
+        SF.transition(self.d, "serving", fields={"front": _y6d_front(1000.0, 0.3, 225.0)})
+        out = [SF.deadman_progress(self.d, self.memo, 60, now=float(t)) for t in range(1000, 1090, 5)]
+        self.assertEqual(len([l for l in out if l]), 1)
+
+    def test_rounding_jitter_is_no_progress(self):
+        # the same token in snapshots 5 s apart: front.ts (ms) and last_token_s (0.1 s) rounding
+        memo, evs = None, []
+        for k, t in enumerate(range(0, 90, 5)):
+            fr = _y6d_front(1000.0 + t + 0.004 * (k % 2), round(t + 0.04 * (k % 3), 1), 225.0 + t)
+            memo, ev = SF.progress_step(memo, _st("b1", fr), 1000.0 + t, 60.0)
+            evs.append(ev)
+        self.assertEqual([e for e in evs if e], ["HAENGT"])
+        self.assertEqual(evs.index("HAENGT"), 12)        # t=60: the jitter never restarted the clock
+
+    def test_stream_token_ts_reads_only_stream_rows_with_a_token(self):
+        fr = {"ts": 100.0, "outstanding_stalest": [
+            {"stream": 0, "last_token_s": 1.0}, {"stream": 1, "last_token_s": None},
+            {"stream": 1, "last_token_s": 7.5}, {"stream": 1, "last_token_s": 2.5}]}
+        self.assertEqual(SF.stream_token_ts(fr), 97.5)
+        self.assertIsNone(SF.stream_token_ts({"outstanding_stalest": [{"stream": 1, "last_token_s": 1}]}))
+        self.assertIsNone(SF.stream_token_ts({"ts": 5.0}))
+
+
 @unittest.skipUnless(DEADMAN.exists(), "deadman not in the tree")
 class TestDeadmanShell(unittest.TestCase):
     """The deadman's own shell function (extracted and run), and its wiring in the main loop."""
