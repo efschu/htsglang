@@ -13782,6 +13782,20 @@ class Scheduler(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
             str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
         )
+        if os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "") == "1":
+            # DUAL ANCHOR N-1: one line per hand-back -- P's contract (N-1 tokens
+            # computed, anchor at N-1), what D holds and what D must still compute.
+            _fill = getattr(req, "full_untruncated_fill_ids", None)
+            _n = 0 if _fill is None else len(_fill)
+            _pre = getattr(req, "prefix_indices", None)
+            _anc = getattr(req, "state_anchor_depth", None)
+            logger.info(
+                "WEG2 DUAL-HANDBACK rid=%s N=%d p_end=%d d_prefix=%d anchor=%s d_uncached=%d "
+                "verdict=%s (contract: p_end = anchor = d_prefix = N-1, d_uncached = 1)",
+                str(getattr(req, "rid", "?"))[:16], _n, max(0, _n - 1),
+                0 if _pre is None else len(_pre), "-" if _anc is None else int(_anc),
+                uncached, verdict,
+            )
         if verdict == "W31":
             # #1471b (z30m 03:19-03:22, weg2-116-141): three W31s priced the
             # WHOLE prompt right after every rank had read 28096/4352/36800 of

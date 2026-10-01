@@ -13737,6 +13737,10 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
            # Both groups stay awake: rank-side rules that assume the other
            # group sleeps read this (scheduler._weg2_store_short_max_cycles).
            "SGLANG_WEG2_DUAL_LAYOUT": "1",
+           # DUAL ANCHOR N-1 (weg2/dual_anchor_claim.py): the exact bigram
+           # keying in BOTH groups, so P's N-1 anchor node has N-1 units and
+           # D claims it whole (uncached 1 after every hand-back, not 2)
+           "SGLANG_WEG2_BIGRAM_ANCHOR_EXACT": "1",
            # the card KV ledgers' name space: the ranks derive the same path
            # as the front (dual_kv_ledger_paths) from this tag
            "SGLANG_WEG2_DUAL_KV_TAG": str(ns.tag)}

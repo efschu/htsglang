@@ -2219,6 +2219,15 @@ class Req(ReqDllmMixin):
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
+        # DUAL ANCHOR N-1 (weg2/dual_anchor_claim.py): on a dual-layout D rank
+        # with exact bigram keys this is a RAW-token limit of a bigram key, and
+        # N raw tokens are N-1 units -- the KV of tokens [0, N-1) -- so token
+        # N-1 is still forwarded. The upstream N-1 raw limit claimed N-2 units
+        # and left two tokens on D after every P hand-back.
+        from sglang.srt.weg2.dual_anchor_claim import dual_bigram_claim
+
+        if dual_bigram_claim():
+            max_prefix_len = input_len
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
