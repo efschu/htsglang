@@ -5863,6 +5863,10 @@ class Scheduler(
                 ),
             )
         except Exception as e:  # noqa: BLE001
+            from sglang.srt.weg2.dual_d_priority import Weg2DualDRetract
+
+            if isinstance(e, Weg2DualDRetract):
+                raise  # a named stop is never a logged warning
             logger.warning("#888b carrier yield failed: %s", e)
             return 0
 
@@ -17924,6 +17928,10 @@ class Scheduler(
                 if gained:
                     freed_by.append(f"retract({gained})")
             except Exception as e:  # noqa: BLE001
+                from sglang.srt.weg2.dual_d_priority import Weg2DualDRetract
+
+                if isinstance(e, Weg2DualDRetract):
+                    raise  # a named stop is never a logged warning
                 logger.warning("%s rung 3 (retract) failed: %s", self._LADDER_PREFIX, e)
 
         freed = max(0, int(self.uniform_min_avail()) - before)
@@ -17977,6 +17985,12 @@ class Scheduler(
           * the decision to call at all must be group-uniform for the same
             reason.
         """
+        # W-DUAL-D-RETRACT (user decision 01.10.): group D of the dual layout
+        # never retracts a running decode -- a named stop, before anything is
+        # mutated (weg2/dual_d_priority.py). Off the dual layout a no-op.
+        from sglang.srt.weg2.dual_d_priority import refuse_d_retract
+
+        refuse_d_retract(batch, kv_full=kv_full_retract_flag, reason=reason)
         old_available_tokens = self.token_to_kv_pool_allocator.available_size()
         old_ratio = self.new_token_ratio_tracker.current
         mamba_allocator = getattr(

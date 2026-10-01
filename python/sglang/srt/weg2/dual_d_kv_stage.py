@@ -215,6 +215,35 @@ def want_tokens(used: int, incoming: int, air: int, step: int) -> int:
     return _pk.round_up(max(0, int(used)) + max(0, int(incoming)) + max(0, int(air)), int(step))
 
 
+def d_locked_rows(sched, actor) -> int:
+    """The rows D's pool holds that nothing can evict: mapped minus free minus
+    the tree's evictable cache. Counts what the request bookkeeping misses --
+    a #243 hand-off hold, a D-PARK, a retract-retain. Metal gmps7 (D 17:53:00-15):
+    weg2-0-13's #243 hold kept 61625 rows on the device, d_demand did not see
+    them, D shrank 221184 -> 204800 for a waiting P prompt and ran full 10 s later
+    ("KV cache pool is full. Retract requests. #retracted_reqs: 4")."""
+    alloc = getattr(actor, "allocator", None)
+    try:
+        free = int(alloc.available_size())
+    except Exception:  # noqa: BLE001 -- no reading, no extra term (the bookkeeping still counts)
+        return 0
+    ev = 0
+    tree = getattr(sched, "tree_cache", None)
+    if tree is not None:
+        try:
+            ev = int(tree.evictable_size() or 0)
+        except Exception:  # noqa: BLE001
+            ev = 0
+    return max(0, int(actor.mapped_tokens) - free - ev)
+
+
+def want_local_tokens(demand: int, locked: int, air: int, step: int) -> int:
+    """D PRIORITY: the level this rank needs -- the request bookkeeping OR the
+    locked rows, whichever is larger, plus the decode/verify air (the next round
+    of every seat with the draft's tokens, one extend chunk), on the lattice."""
+    return want_tokens(max(int(demand), int(locked)), 0, air, step)
+
+
 def decide(mapped: int, want: int, p_waiting: bool, below_rounds: int, step: int,
            hold: int = SHRINK_HOLD_ROUNDS) -> Tuple[str, int]:
     """REPLICATED, pure: ('grow', want) / ('shrink', target) / ('hold', mapped),
@@ -321,7 +350,7 @@ def tick(sched) -> Optional[str]:
 
     actor.gmin = getattr(sched, "_weg2_group_min_ints", None) or actor.gmin
     demand_local = d_demand(sched)
-    want_local = want_tokens(demand_local, 0, _sv._air(sched), actor.step)
+    want_local = want_local_tokens(demand_local, d_locked_rows(sched, actor), _sv._air(sched), actor.step)
     st = peek(actor.ledger.path)
     p_wait_local = 1 if (st is not None and int(st.demand.get("P", 0)) > 0) else 0
     live_local = int(_pk.max_live_id(actor.allocator, actor.page)) * int(actor.page)
