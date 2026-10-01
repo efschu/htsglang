@@ -1,0 +1,4 @@
+[loaded_idle_spin] 30s  package 15.47 W (RAPL)  amdgpu socket 15.11 W  system CPU busy 6.9 %
+[loaded_idle_spin] threads >= 1 % CPU (top -H, 30s average): 2
+     99.6 %  tid   88226 root     sglang::schedul
+      3.4 %  tid   39278 efeu     Isolated Web Co

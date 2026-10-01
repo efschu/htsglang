@@ -1,0 +1,46 @@
+{
+  "label": "solo_eager",
+  "port": 31671,
+  "peak_tok_per_s": 113.61361481006293,
+  "peak_at_tokens": 2048,
+  "runA": [
+    {
+      "approx_tokens": 2048,
+      "prompt_tokens": 1557,
+      "n": 1,
+      "median_s": 13.778112436004449,
+      "min_s": 13.778112436004449,
+      "tok_per_s": 113.00531964968624,
+      "cached_tokens_total": 0
+    },
+    {
+      "approx_tokens": 8192,
+      "prompt_tokens": 6165,
+      "n": 1,
+      "median_s": 55.79688000999158,
+      "min_s": 55.79688000999158,
+      "tok_per_s": 110.4900488861748,
+      "cached_tokens_total": 0
+    }
+  ],
+  "runA_prime": [
+    {
+      "approx_tokens": 2048,
+      "prompt_tokens": 1556,
+      "n": 1,
+      "median_s": 13.695541705994401,
+      "min_s": 13.695541705994401,
+      "tok_per_s": 113.61361481006293,
+      "cached_tokens_total": 0
+    },
+    {
+      "approx_tokens": 8192,
+      "prompt_tokens": 6165,
+      "n": 1,
+      "median_s": 55.64215882799181,
+      "min_s": 55.64215882799181,
+      "tok_per_s": 110.79728266938815,
+      "cached_tokens_total": 0
+    }
+  ]
+}

@@ -21,9 +21,9 @@ providers:
       - id: qwen38-35b-a3b
         name: Qwen3.8-35B-A3B-Distill Q3_K_M (local iGPU)
         input: [text]
-        # Tracks CTX=32768 in /etc/systemd/system/htsglang-ondemand.service.d/
+        # Tracks CTX=131072 in /etc/systemd/system/htsglang-ondemand.service.d/
         # 50-q38.conf. Raising it here without raising it there truncates.
-        contextWindow: 32768
+        contextWindow: 131072
         maxTokens: 4096
         compat:
           # The block replaces the built-in one wholesale rather than merging,
@@ -40,7 +40,7 @@ providers:
       - id: qwen36-35b-a3b
         name: (old id) same local model as qwen38-35b-a3b
         input: [text]
-        contextWindow: 32768
+        contextWindow: 131072
         maxTokens: 4096
         compat:
           supportsDeveloperRole: false

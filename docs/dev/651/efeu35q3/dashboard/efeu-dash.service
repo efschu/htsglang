@@ -1,0 +1,14 @@
+[Unit]
+Description=efeu-TP14 mini dashboard for the local model (port 31680, idle = no work)
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 /root/efeu35q3/dashboard/efeu_dash.py --port 31680 --host 0.0.0.0
+Restart=on-failure
+Nice=10
+# RAPL energy_uj is root-only; the server only READS sysfs and two local HTTP endpoints.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

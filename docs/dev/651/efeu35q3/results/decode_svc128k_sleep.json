@@ -1,0 +1,26 @@
+{
+  "label": "svc128k_sleep",
+  "port": 31651,
+  "runA": {
+    "tag": "A",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 1.7628201015031664,
+    "gap_median_ms": 46.165340005245525,
+    "gap_p90_ms": 47.585052001522854,
+    "gap_max_ms": 152.5621540058637,
+    "decode_tok_per_s": 21.66127228536333
+  },
+  "runA_prime": {
+    "tag": "A'",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 1.7430346084947814,
+    "gap_median_ms": 46.06770200189203,
+    "gap_p90_ms": 47.233168996172026,
+    "gap_max_ms": 176.50313400372397,
+    "decode_tok_per_s": 21.707182180672465
+  },
+  "noise_floor_pct": 0.2114963376039222,
+  "decode_tok_per_s": 21.707182180672465
+}

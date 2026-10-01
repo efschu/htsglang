@@ -1,0 +1,5 @@
+[loaded_idle_baseline] 30s  package 16.04 W (RAPL)  amdgpu socket 15.70 W  system CPU busy 7.3 %
+[loaded_idle_baseline] threads >= 1 % CPU (top -H, 30s average): 3
+     99.9 %  tid   83981 root     sglang::schedul
+      5.3 %  tid   39278 efeu     Isolated Web Co
+      2.6 %  tid   44892 efeu     RemmRDP:Schnell

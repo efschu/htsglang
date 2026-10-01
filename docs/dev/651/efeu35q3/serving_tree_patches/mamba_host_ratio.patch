@@ -1,0 +1,33 @@
+--- hybrid_pool_assembler.py.orig-efeu	2026-10-01 15:08:31.609956772 +0200
++++ hybrid_pool_assembler.py	2026-10-01 15:08:31.622816926 +0200
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import os
++
+ import logging
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+@@ -548,10 +550,20 @@
+         server_args=server_args,
+         use_mla=use_mla,
+     )
++    # efeu-TP14 2026-10-01: the mamba host pool used to follow --hicache-ratio
++    # alone. With few device mamba slots (--max-mamba-cache-size 4) a small
++    # ratio (0.15, needed to keep the KV host pool inside the pinned budget at
++    # 128k context) gives int(4 * 0.15) = 0 usable slots: nothing is ever
++    # backed up, an evicted device node is DELETED, and the prefix cache never
++    # hits. SGLANG_HICACHE_MAMBA_HOST_RATIO sizes it separately (one GDN state
++    # slot is ~64 MB here); unset = the old coupling.
++    _mamba_host_ratio = float(
++        os.environ.get("SGLANG_HICACHE_MAMBA_HOST_RATIO", server_args.hicache_ratio)
++    )
+     mamba_host_pool = MambaPoolHost(
+         mamba_pool,
+-        server_args.hicache_ratio,
+-        server_args.hicache_size,
++        _mamba_host_ratio,
++        0 if "SGLANG_HICACHE_MAMBA_HOST_RATIO" in os.environ else server_args.hicache_size,
+         allocator_type=server_args.hicache_storage_backend,
+         layout=server_args.hicache_mem_layout,
+     )

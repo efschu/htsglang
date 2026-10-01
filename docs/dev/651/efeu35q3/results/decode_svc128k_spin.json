@@ -1,0 +1,26 @@
+{
+  "label": "svc128k_spin",
+  "port": 31651,
+  "runA": {
+    "tag": "A",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 1.7791024540056242,
+    "gap_median_ms": 45.94130649638828,
+    "gap_p90_ms": 46.96062399307266,
+    "gap_max_ms": 149.97278701048344,
+    "decode_tok_per_s": 21.766903822785622
+  },
+  "runA_prime": {
+    "tag": "A'",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 1.7020542380050756,
+    "gap_median_ms": 46.08216650376562,
+    "gap_p90_ms": 47.20078500395175,
+    "gap_max_ms": 188.01967799663544,
+    "decode_tok_per_s": 21.70036862130353
+  },
+  "noise_floor_pct": 0.3056714084087793,
+  "decode_tok_per_s": 21.766903822785622
+}
