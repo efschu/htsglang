@@ -3719,6 +3719,10 @@ class MoEExpertOffloadCache:
         self._pool_srcs = None
         self._pool_dsts = None
         self._pool_view_holders = []
+        # KV-STAGE warm refill: experts the last seat-row shrink sent to the
+        # store (hottest first) and the rows the grows refilled with them.
+        self._weg2_seat_recall = []
+        self._weg2_seat_warmed = 0
         # Speculative expert prefetch (SGLANG_MOE_POOL_PREFETCH=1, default off):
         # own step buffers, because the gather list the side stream copies from
         # must survive while the real step writes the layer's normal buffers.
@@ -4801,8 +4805,33 @@ class MoEExpertOffloadCache:
         if (device_write and getattr(self, "_resident", None)
                 and not envs.SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS.get()):
             mover = functools.partial(MoEExpertOffloadCache._move_bank_rows, self)
-        return set_seat_rows_on(self._pool_tables, int(k), device_write=device_write,
-                                move_rows=mover)
+        # KV-STAGE warm refill (01.10.): a shrink remembers the experts it sent
+        # to the store (hottest first); the grow that follows hands them their
+        # rows back at once instead of one cold miss each. This method is bound
+        # onto test doubles too (types.MethodType); only a real cache warms.
+        warm = (device_write and isinstance(self, MoEExpertOffloadCache)
+                and envs.SGLANG_WEG2_D_SEAT_WARM_REFILL.get())
+        departed = [] if warm else None
+        old = set_seat_rows_on(self._pool_tables, int(k), device_write=device_write,
+                               move_rows=mover, departed_out=departed)
+        if warm:
+            self._seat_warm_step(int(k), old, departed)
+        return old
+
+    def _seat_warm_step(self, k: int, old: int, departed: List[int]) -> None:
+        """KV-STAGE warm refill: remember on a shrink, refill on a grow. The
+        refill is the miss path's own copy (``warm_lru_local``: free rows,
+        pinned store rows, current stream, between rounds) -- no new VRAM."""
+        recall = self._weg2_seat_recall
+        if k < old:
+            seen = set(departed)
+            self._weg2_seat_recall = (departed + [e for e in recall if e not in seen])[
+                : max(1, int(self.seat_rows)) * 2]
+            return
+        if k > old and recall:
+            filled = self.warm_lru_local(recall, limit=k - old)
+            self._weg2_seat_warmed += filled
+            self._weg2_seat_recall = []
 
     def _move_bank_rows(self, moves) -> None:
         """Copy bank rows ``src -> dst`` in every row buffer the fetch writes

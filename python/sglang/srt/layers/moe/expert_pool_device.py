@@ -368,8 +368,21 @@ def apply_row_moves(tables: PoolTables, moves: Sequence[Tuple[int, int]]) -> Non
             pf[int(d)] = -1
 
 
+def departed_experts(row_key: Sequence[int], row_use: Sequence[int],
+                     hot_after: Sequence[int], *, num_experts: int) -> List[int]:
+    """KV-STAGE warm refill (01.10.): the experts a seat-row shrink sent back
+    to the store -- they owned a row before (``row_key``/``row_use`` taken
+    BEFORE the shrink) and own none after (``hot_after`` -1) -- hottest first
+    (``row_use`` desc). Pure; the grow that follows hands them their rows
+    back before the next miss asks for them."""
+    E = int(num_experts)
+    gone = [(int(u), int(e)) for e, u in zip(row_key, row_use)
+            if 0 <= int(e) < E and int(hot_after[int(e)]) < 0]
+    return [e for _u, e in sorted(gone, key=lambda p: -p[0])]
+
+
 def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,
-                     move_rows=None) -> int:
+                     move_rows=None, departed_out: Optional[List[int]] = None) -> int:
     """H95c: turn the first ``k`` seat rows ON (ordinary free LRU rows) and
     the rest OFF. ``device_write=False`` only records k on the host (the next
     :func:`reinit_pool_tables` -- the wake's rearm -- writes the layout);
@@ -393,6 +406,10 @@ def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,
         tables.pf_row[lo:hi].fill_(-1)
         return old
     lo, hi = base + k, base + old
+    if departed_out is not None:
+        lru = int(tables.lru_start)
+        keys_before = tables.row_key[lru:].cpu().tolist()
+        uses_before = tables.row_use[lru:].cpu().tolist()
     if move_rows is not None:
         # D-MEM-SCHED: the coldest content goes OFF, not the tail's
         moves = coldest_first_moves(
@@ -409,6 +426,9 @@ def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,
         if 0 <= e < E and int(hot[e]) == lo + i:
             hot[e] = -1
     tables.hot_phys.copy_(hot.to(tables.hot_phys.device))
+    if departed_out is not None:
+        departed_out.extend(departed_experts(keys_before, uses_before, hot.tolist(),
+                                             num_experts=E))
     tables.row_key[lo:hi].fill_(SEAT_OFF_KEY)
     tables.row_use[lo:hi].fill_(ROW_USE_NEVER)
     tables.pf_row[lo:hi].fill_(-1)

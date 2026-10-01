@@ -1703,6 +1703,11 @@ class SeatVram:
     def _bank_bytes_copied(self) -> int:
         return sum(int(getattr(c, "_weg2_bank_bytes_copied", 0) or 0) for c in self.caches)
 
+    def warm_rows(self) -> int:
+        """KV-STAGE warm refill: rows the grows refilled with the experts the
+        shrink before sent away (summed over the layers)."""
+        return sum(int(getattr(c, "_weg2_seat_warmed", 0)) for c in self.caches)
+
     def _timed_sync(self) -> None:
         import time
 
@@ -2523,9 +2528,10 @@ def runtime_tick(sched):
     logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s gate_reserve=%d",
                 ms.line(), before, ms.stage, used, incoming, "yes" if ended else "no", floor,
                 step.reason,
-                "" if ctl is None else (" evicted_rows=%d refilled_rows=%d sync_ms=%.1f "
-                                        "bytes_copied=%d copy_ms=%.1f rows_on=%s")
-                % (ctl.evicted_rows, ctl.refilled_rows, ctl.sync_ms, ctl.bytes_copied,
-                   ctl.copy_ms, "-" if applied is None else int(applied.extra_rows)),
+                "" if ctl is None else (" evicted_rows=%d refilled_rows=%d warm_rows=%d "
+                                        "sync_ms=%.1f bytes_copied=%d copy_ms=%.1f rows_on=%s")
+                % (ctl.evicted_rows, ctl.refilled_rows, ctl.warm_rows(), ctl.sync_ms,
+                   ctl.bytes_copied, ctl.copy_ms,
+                   "-" if applied is None else int(applied.extra_rows)),
                 int(reserve))
     return step
