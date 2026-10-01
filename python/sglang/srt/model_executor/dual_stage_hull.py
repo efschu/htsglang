@@ -168,8 +168,18 @@ def build_dual_stage_model(runner, spec: Optional[DualShareSpec] = None):
     if bind is not None:
         # The shared part FIRST, bound at once: the load peak is
         # max(shared part, the rest) instead of the whole stage.
-        parts[local] = _load_lane_part(runner, plan, local, gpu_id=runner.gpu_id)
-        _bind_shared_part(runner, parts[local], bind)
+        # DUAL SHARED PART (gmps9 dkr27bnvfp4dual1mbar1fs10012051): loaded in a
+        # TRANSIENT scope -- outside the weights tag pool, the saver's tracking
+        # off. The bind below replaces every one of its tensors with a view of
+        # D's arena, so the originals are dead, and in the private tag pool they
+        # stayed reserved ('card free 3.35 -> 3.35 GiB', P-PP0 KV budget
+        # refused). In the transient pool the after-load release hands them back.
+        # On the resident arm (no tag pool) the scope is a no-op.
+        from sglang.srt.managers.weg2_memory_saver import transient_load_scope
+
+        with transient_load_scope("dual-share-shared-part") as transient:
+            parts[local] = _load_lane_part(runner, plan, local, gpu_id=runner.gpu_id)
+            _bind_shared_part(runner, parts[local], bind, transient=transient)
     for r in range(plan.fast_size):
         if parts[r] is None:
             parts[r] = _load_lane_part(runner, plan, r, gpu_id=runner.gpu_id)
@@ -191,6 +201,27 @@ def build_dual_stage_model(runner, spec: Optional[DualShareSpec] = None):
         counts["row"], counts["embedding"], counts["lm_head"], counts["composed"],
         fill["aliased"], fill["composed_vec"], fill["buffers"], fill["captured"])
     return hull
+
+
+def assert_dual_p_sleep_tracked(runner) -> bool:
+    """After load, on a dual-share P rank whose weights are NOT resident (it will
+    sleep): the untagged-live riegel (weg2_memory_saver.assert_no_untagged_live).
+    False (no-op) on every other rank."""
+    from sglang.srt.managers.weg2_memory_saver import (
+        assert_no_untagged_live,
+        assert_weights_pool_slack,
+        weights_pool_slack_mib,
+        weights_resident_armed,
+    )
+
+    if not dual_share_armed() or weights_resident_armed() or getattr(runner, "is_draft_worker", False):
+        return False
+    assert_no_untagged_live()
+    slack = assert_weights_pool_slack(weights_pool_slack_mib())
+    logger.info("DUAL-TP3PP3 P: sleep riegels ok -- untagged live 0 (load pools empty after load; shared part "
+                "bound, %.1f MiB of its buffers re-homed under the weights tag); weights tag pools hold %.0f MiB "
+                "of empty segments", float(getattr(runner, "dual_share_rehomed_bytes", 0) or 0) / 2**20, slack)
+    return True
 
 
 def shared_part_named_parameters(runner) -> Dict[str, "object"]:
@@ -255,17 +286,49 @@ def _wait_for_owner(t: _BindTarget) -> None:
                 "shared part now", t.card[-12:], time.perf_counter() - t0)
 
 
-def _bind_shared_part(runner, part, t: _BindTarget) -> None:
+def rehome_survivors(part) -> int:
+    """Inside a :func:`transient_load_scope`: re-allocate every BUFFER of the
+    bound part (rotary caches, norm buffers -- replicated, never in the union
+    image, and aliased by the hull) under the weights tag, so they sleep and
+    wake with it. Returns the bytes re-homed."""
+    from sglang.srt.managers.weg2_memory_saver import back_into_tag_pool
+
+    moved = 0
+    for name, buf in list(part.named_buffers()):
+        if buf is None or buf.device.type == "meta" or buf.numel() == 0:
+            continue
+        parent_name, _, attr = name.rpartition(".")
+        parent = part.get_submodule(parent_name) if parent_name else part
+        with back_into_tag_pool(force=True):
+            fresh = buf.clone()
+        parent._buffers[attr] = fresh
+        moved += fresh.numel() * fresh.element_size()
+    return moved
+
+
+class DualSharedPartKept(RuntimeError):
+    """W-DUAL-SHARED-KEPT: in a transient scope the union bind left tensors of the
+    shared part un-bound; they would live untracked (never sleep)."""
+
+
+def _bind_shared_part(runner, part, t: _BindTarget, transient: bool = False) -> None:
     from sglang.srt.weg2.union_arena import PHASE_P
     from sglang.srt.weg2.union_arena_bind import bind_image
 
     shared, kept = bind_image(part, union_dir=t.union_dir, card=t.card, phase=PHASE_P,
                               device=t.device, timeout_s=60.0, required=True)
+    if transient and kept > 0:
+        raise DualSharedPartKept(
+            "W-DUAL-SHARED-KEPT: the union bind kept %.2f GiB of the shared part's own tensors; loaded in "
+            "the transient scope they would live untracked by the memory saver (no sleep, no host image). "
+            "D's image and this part disagree -- keep P resident (--dual-p-sleep off)" % (kept / 2**30))
     if shared <= 0:
         raise DualShareError(
             "DUAL-TP3PP3: the shared part bound ZERO bytes to D's image -- D's vectors "
             f"({D_TP_RATIO_ENV}/{D_FAMILIES_ENV}) or its post-load processing differ from this "
             "part's; the stage would hold a second copy the plan has no room for")
+    if transient:
+        runner.dual_share_rehomed_bytes = rehome_survivors(part)
     runner.dual_share_bound = True
     logger.info("DUAL-TP3PP3 P: shared part bound %.2f GiB to D's bytes, kept %.2f GiB of its own",
                 shared / 2**30, kept / 2**30)
