@@ -182,6 +182,7 @@ from sglang.srt.managers.scheduler_components.host_round_cost import (
     DecodeHostCost,
 )
 from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+from sglang.srt.weg2 import rank_metrics as _rank_metrics  # TSDB 01.10.
 from sglang.srt.managers.scheduler_components.wake_round_census import (
     WakeRoundCensus,
 )
@@ -572,6 +573,9 @@ class DecodeRoundLog:
         else:
             slot_bs[0] += 1
             slot_bs[1] += round_ms
+        # TSDB (01.10.): weg2_decode_round_seconds{bs} on the group's /metrics --
+        # at this flush (a round boundary), a no-op without server metrics
+        _rank_metrics.observe_decode_round(acc.bs, round_ms / 1000.0)
         if split_known and family_acc:
             # fnFL2 H28: BARLINK-ROUND-CENSUS every N rounds; no-op unless
             # SGLANG_WEG2_AR_ROUND_CENSUS.

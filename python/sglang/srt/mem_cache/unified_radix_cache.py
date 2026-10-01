@@ -37,6 +37,7 @@ from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
+from sglang.srt.weg2 import rank_timing as _rank_timing  # RANK-TIMING: L2 load-back ms
 from sglang.srt.managers.weg2_min_hit import note_min_hit_tokens  # PARK-RETAIN READ
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -10027,6 +10028,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 try:
                     _tok, _bpt, _t0 = _m
                     _ms = float(start_event.elapsed_time(finish_event))
+                    # RANK-TIMING (rankstats cache.loadback_*): the landed events' ms
+                    _rank_timing.note_loadback(_ms, pages=-(-int(_tok) // max(1, int(self.page_size))),
+                                               nbytes=int(_tok) * int(_bpt))
                     logger.info(
                         "WEG2-LOAD-DEVICE tokens=%d mib=%.0f gpu_ms=%.0f wall_ms=%.0f "
                         "GB/s=%.2f (bytes = tokens x 2 x layers x cell on THIS rank; "
