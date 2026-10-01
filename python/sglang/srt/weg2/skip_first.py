@@ -57,6 +57,47 @@ def order(waiting: Sequence, joinable: Callable) -> Tuple[List, FrozenSet[str]]:
     return skips + rest, rids
 
 
+RESULT_NOW_MARK = "WEG2-SKIP-RESULT-NOW"
+_N["now"] = 0
+
+
+def result_now(batch, batch_result) -> bool:
+    """True when the overlap loop should process ``batch``'s result in the
+    iteration that launched it (nf-pd-post 01.10., boot y6o).
+
+    A skip-extend batch runs no target forward -- its tokens are P's -- so
+    deferring its result behind the NEXT batch overlaps nothing; it only
+    holds P's token (the flip's first streamed token) behind the next pass's
+    TP recv broadcast, which waits for the slowest worker's load-back issue
+    (y6o 21:37:57: 188 ms), and behind that pass's launch (21:37:36, the
+    boot's first wake: 531 ms). Read BEFORE the next pass's
+    ``hold_prefill_after_skip`` consumes ``weg2_skip_extend`` -- this runs in
+    the iteration of the launch. Rank-uniform: the flag is the group's agreed
+    skip vote, so every rank processes in the same order. A delayed-sample
+    result (non-spec grammar) keeps the deferred order: its sample is
+    launched after the last batch is processed."""
+    if batch is None or batch_result is None:
+        return False
+    if not getattr(batch, "weg2_skip_extend", False):
+        return False
+    mode = getattr(batch, "forward_mode", None)
+    if mode is None or not mode.is_extend():
+        return False
+    if getattr(batch_result, "delay_sample_func", None) is not None:
+        return False
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_WEG2_ENABLE_SKIP_RESULT_NOW.get():
+        return False
+    _N["now"] += 1
+    n = _N["now"]
+    if n <= 20 or n % 200 == 0:
+        logger.info("%s n=%d bs=%d -- P's token is processed in the pass that launched the "
+                    "skip, not behind the next pass's launch", RESULT_NOW_MARK, n,
+                    len(getattr(batch, "reqs", ()) or ()))
+    return True
+
+
 def hold_prefill_after_skip(last_batch, running_batch) -> bool:
     """True once for the pass right after a skip-extend batch that left
     requests running: that pass runs their decode round (it delivers P's

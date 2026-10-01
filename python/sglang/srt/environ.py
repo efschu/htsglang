@@ -1062,6 +1062,15 @@ class Envs:
     # TAIL_ADOPT; any refusal falls back to E1 (extend [c, N)), then to the
     # page resume. 0 = the H21 form.
     SGLANG_WEG2_TAIL_SKIP_EXTEND = EnvBool(_profile_default("SGLANG_WEG2_TAIL_SKIP_EXTEND", True))
+    # SKIP_RESULT_NOW (nf-pd-post 01.10., y6o): the overlap loop processes a
+    # skip-extend batch's result (P's token) in the iteration that launched
+    # it, instead of after the NEXT batch's launch. The skip runs no target
+    # forward, so there is nothing to overlap; deferred, the first token
+    # waited for the next pass's TP recv broadcast (~175 ms behind the slowest
+    # worker's load-back issue) and that pass's launch (531 ms on a boot's
+    # first wake). Rank-uniform: the skip verdict is the group's vote. 0 =
+    # the deferred order.
+    SGLANG_WEG2_ENABLE_SKIP_RESULT_NOW = EnvBool(True)
     # TAIL_WAIT_MS (H45, metal fnFL2x150/x151): P's PP ranks write their tail
     # parts from background threads; D's vote used to read the part list ONCE
     # at the first prefetch check and fell on a partial manifest (parts=1-2 of
