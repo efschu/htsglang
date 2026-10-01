@@ -771,7 +771,12 @@ class HybridCacheController(BaseHiCacheController):
             # position under this node's key. The next forward now starts
             # only after the snapshot has been read.
             device_module.current_stream().wait_event(finish_event)
-            self._mamba_fence_n = getattr(self, "_mamba_fence_n", 0) + 1
+            n_f = self._mamba_fence_n = getattr(self, "_mamba_fence_n", 0) + 1
+            if n_f <= 8 or (n_f & (n_f - 1)) == 0:
+                # the fence's price is read off the forwards around these
+                # lines (Prefill/Decode rank batch gpu-ms, bubble_ms)
+                logger.info("WEG2-MAMBA-FENCE n=%d (the compute stream waits for this write op's "
+                            "recurrent-state D2H; switch SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE)", n_f)
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
         clock.finish(device=on_card, reason=refusal)
 
