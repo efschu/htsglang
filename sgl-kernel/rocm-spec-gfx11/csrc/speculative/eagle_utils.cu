@@ -15,7 +15,11 @@
  */
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
+// efeu-TP14: the only change to the upstream file. ATen/cuda/CUDAContext.h
+// pulls in hipblaslt headers (not installed on the laptop's ROCm); the stream
+// accessor comes from the same headers the GGUF extension uses.
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/all.h>
 
 #if !defined(USE_ROCM) && !defined(USE_MUSA)
 #include "pytorch_extension_utils.h"

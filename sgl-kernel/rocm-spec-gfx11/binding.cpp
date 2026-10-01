@@ -1,6 +1,6 @@
 // efeu-TP14 2026-10-01: standalone ROCm/gfx1103 build of sgl-kernel's EAGLE /
 // NEXTN tree kernels (build_tree_kernel_efficient, verify_tree_greedy).
-// csrc/speculative/eagle_utils.cu is a VERBATIM copy of the upstream source
+// csrc/speculative/eagle_utils.cu is the upstream source with ONE include swapped (see its head)
 // (sgl-kernel/csrc/speculative/eagle_utils.cu @ 13dc5f2dc7), which upstream
 // setup_rocm.py already compiles for HIP (gfx942/950 only). The kernels use no
 // warp intrinsics, so the port to gfx11 (wave32) is build wiring, not code.

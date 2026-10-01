@@ -4,6 +4,7 @@
 #   A  boot APEX (no spec) :31671  -> probe 8/8 + greedy outputs, decode, prefill
 #   B  boot APEX + MTP k=1 (NEXTN, mtp Q4_0 head) -> greedy identity vs A,
 #      decode, py-spy record of spec steps (sgl_kernel op census)
+#   B2/B3 MTP k=1 / k=3 on the native spec ops (sgl_spec_rocm) -> identity, decode
 #   C  llama.cpp CPU reference on the same APEX file -> compare vs A
 # Gate: runs only after an explicit RELEASE file (night window, operator) AND
 # service up, inflight 0, idle >= 900 s. While the service is down a sentinel
@@ -104,6 +105,29 @@ else
   knocked && exit 0
 fi
 stop_sglang
+
+# --- B2/B3: native spec ops (sgl_spec_rocm, gfx1103 build of upstream
+# eagle_utils.cu) on the import path -> decide_spec_kernel_backend = native.
+# k=1 (steps 1, draft 2) and k=3 (steps 3, draft 4), each with greedy identity
+# vs A and decode tok/s; py-spy census for k=3.
+SPECEXT="GGUF_EXT_DIR=/root/efeu35q3/ext_v2:/root/efeu35q3/spec_rocm"
+for K in 1 3; do
+  if boot mtp${K}native "$SPECEXT" "EXTRA=--speculative-algorithm NEXTN --speculative-draft-model-path $M --speculative-num-steps $K --speculative-eagle-topk 1 --speculative-num-draft-tokens $((K+1))"; then
+    grep -m1 "Spec kernel backend" logs/boot_apex_mtp${K}native.log | cut -c1-160
+    guard $PY probe_q38.py 31671 apex --json $R/probe_apex_mtp${K}native.json || exit 0
+    guard $PY ab18k/greedy_long.py 31671 apex_mtp${K}native $R/greedy_long_apex_mtp${K}native.json apex || exit 0
+    if [ $K = 3 ]; then
+      P=$(pgrep -f "sglang::scheduler" | head -1); [ -z "$P" ] && P=$(pgrep -f "^python -m sglang.launch_server" | head -1)
+      ( py-spy record --pid $P --subprocesses --duration 25 --rate 200 --format raw -o $R/pyspy_apex_mtp3native.txt > /dev/null 2>&1 & )
+    fi
+    guard $PY bench_decode.py --port 31671 --model apex --label apex_mtp${K}native --out $R/decode_apex_mtp${K}native.json || exit 0
+    grep -E "accept len|accept_len|spec" logs/boot_apex_mtp${K}native.log | tail -3 | cut -c1-200
+  else
+    echo "$(date +%T) mtp${K}native boot failed -- see logs/boot_apex_mtp${K}native.log"
+    knocked && exit 0
+  fi
+  stop_sglang
+done
 
 # --- C: llama.cpp CPU reference, same file
 /root/651-p2/llama.cpp/build/bin/llama-server -m $A -ngl 0 --jinja --chat-template-file /root/efeu35q3/hf_apex/chat_template.jinja \

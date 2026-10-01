@@ -1,0 +1,4 @@
+with sgl_spec_rocm on the path (laptop gfx1103, HSA 11.0.0, 21:27): 29 passed in 20.49s
+  test_native_ops_present, test_verify_tree_greedy_upstream_case,
+  test_build_and_verify_match_triton x 27 (topk1 steps1-3, topk2-4 steps2-3; bs 1,2,4; 4 verify trials each)
+without it: 29 failed (ModuleNotFoundError)
