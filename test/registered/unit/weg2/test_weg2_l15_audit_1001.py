@@ -18,6 +18,7 @@ Fixes pinned here:
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.srt.weg2 import l15_bind, l15_shadow
 from sglang.srt.weg2.hot_handover import decide
@@ -37,10 +38,10 @@ def test_rows_split_weighted_parts_sum_and_order():
     assert sum(l15_shadow.rows_split(10, 3, [7, 4, 5])) == 10
 
 
-def _retain_kwargs(reqs, prefix):
+def _retain_kwargs(reqs, prefix, req_to_token):
     return l15_bind.build_retain_kwargs(
         reqs,
-        None,
+        req_to_token,
         caps_rows_by_rank=(0, 0, 0),
         cap_anchor_slots=8,
         prefix=prefix,
@@ -58,19 +59,41 @@ def _retain_kwargs(reqs, prefix):
 
 
 def test_bind_candidate_rows_follow_prefix_widths_not_even_split():
-    req = SimpleNamespace(rid="r1", origin_input_ids=list(range(8)), output_ids=[])
-    kwargs = _retain_kwargs([req], [0, 7, 11, 16])
+    # Prefix [0, 7, 11, 16] (S=16): rank 0 owns residues [0,7), rank 1 [7,11),
+    # rank 2 [11,16). The req's 7 real KV slots (span = seqlen - 1 = 7) are
+    # 1,2,3,4,5 (owned by rank 0), 8 (rank 1) and 12 (rank 2), so the EXACT
+    # per-rank owned count is (5, 1, 1) -- neither the even split (3,2,2) nor
+    # the proportional owner-weighted split (4,1,2).
+    rtt = torch.zeros(1, 8, dtype=torch.int64)
+    rtt[0, :7] = torch.tensor([1, 2, 3, 4, 5, 8, 12], dtype=torch.int64)
+    req = SimpleNamespace(
+        rid="r1",
+        req_pool_idx=0,
+        origin_input_ids=list(range(8)),
+        output_ids=[],
+    )
+    kwargs = _retain_kwargs([req], [0, 7, 11, 16], rtt)
     rows = kwargs["candidates"][0].rows_by_rank
-    # span = seqlen - 1 = 7 -> weighted (4, 1, 2); an even split would be
-    # (3, 2, 2), which under-prices rank 0 (owns 7/16) against its cap.
-    assert rows == (4, 1, 2)
+    assert rows == (5, 1, 1)
 
 
 def test_bind_candidate_rows_zero_share_rank_stays_empty():
-    req = SimpleNamespace(rid="r2", origin_input_ids=list(range(8)), output_ids=[])
-    kwargs = _retain_kwargs([req], [0, 0, 9, 16])
+    # Prefix [0, 0, 9, 16]: rank 0 has width 0 (owns nothing), rank 1 owns
+    # residues [0,9), rank 2 owns [9,16). The 7 real slots 1,2,3,4,5 (rank 1)
+    # and 10,11 (rank 2) yield exactly (0, 5, 2): the zero-share rank stays at
+    # 0 rows and the per-rank counts are the EXACT owned slots.
+    rtt = torch.zeros(1, 8, dtype=torch.int64)
+    rtt[0, :7] = torch.tensor([1, 2, 3, 4, 5, 10, 11], dtype=torch.int64)
+    req = SimpleNamespace(
+        rid="r2",
+        req_pool_idx=0,
+        origin_input_ids=list(range(8)),
+        output_ids=[],
+    )
+    kwargs = _retain_kwargs([req], [0, 0, 9, 16], rtt)
     rows = kwargs["candidates"][0].rows_by_rank
     assert rows[0] == 0
+    assert rows == (0, 5, 2)
     assert sum(rows) == 7
 
 

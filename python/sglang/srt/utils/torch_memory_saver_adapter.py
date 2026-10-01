@@ -166,6 +166,12 @@ class TorchMemorySaverAdapter(ABC):
     def set_keep_spans(self, tensor, row_ranges) -> int:
         raise NotImplementedError
 
+    def alloc_info_ok(self, tensor) -> bool:
+        raise NotImplementedError
+
+    def set_keep_byte_spans(self, base_tensor, byte_ranges) -> int:
+        raise NotImplementedError
+
     @property
     def enabled(self):
         raise NotImplementedError
@@ -360,6 +366,74 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
             ctypes.POINTER(ctypes.c_uint64),
         ]
         return int(fn(ctypes.c_void_p(tensor.data_ptr()), n, lo_arr, hi_arr))
+
+    def set_keep_byte_spans(self, base_tensor, byte_ranges) -> int:
+        """L15-11c: ``set_keep_spans`` for ABSOLUTE byte ranges of ONE base.
+
+        ``base_tensor`` must be the allocation BASE (checked upstream with
+        :meth:`alloc_info_ok`); ``byte_ranges`` are ``(lo, hi)`` byte offsets
+        relative to ``base_tensor.data_ptr()`` -- already offset-shifted from
+        any view that produced them.  tms_set_keep_spans REPLACES the keep set
+        of the allocation, so callers must aggregate every view of a base
+        into ONE call per base.  Returns the C code, or -100 when the running
+        hook has no such symbol.
+        """
+        fn = _weg2_ring_symbol("tms_set_keep_spans")
+        if fn is None:
+            return -100
+        import ctypes
+
+        ranges = sorted((int(lo), int(hi)) for lo, hi in byte_ranges)
+        n = len(ranges)
+        lo_arr = (ctypes.c_uint64 * n)(*(r[0] for r in ranges))
+        hi_arr = (ctypes.c_uint64 * n)(*(r[1] for r in ranges))
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        return int(fn(ctypes.c_void_p(base_tensor.data_ptr()), n, lo_arr, hi_arr))
+
+    def alloc_info_ok(self, tensor) -> bool:
+        """L15-11c: is ``tensor.data_ptr()`` the BASE of a tracked allocation?
+
+        C ``tms_alloc_info`` (entrypoint.cpp:178) returns 0 when the pointer
+        keys an allocation and -1 ("not a base") otherwise.  This matters
+        because ``tms_set_keep_spans`` honours BASE pointers only: a KV buffer
+        that is a sub-view of the pool allocation would have its keep spans
+        silently refused (-1) while the caller believes the hold was armed.
+        Callers must check every buffer BEFORE moving anything.  False when
+        the running hook has no such symbol.
+        """
+        fn = _weg2_ring_symbol("tms_alloc_info")
+        if fn is None:
+            return False
+        import ctypes
+
+        size = ctypes.c_uint64()
+        mapped = ctypes.c_uint64()
+        planned = ctypes.c_uint64()
+        active = ctypes.c_int()
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        return (
+            fn(
+                ctypes.c_void_p(tensor.data_ptr()),
+                ctypes.byref(size),
+                ctypes.byref(mapped),
+                ctypes.byref(planned),
+                ctypes.byref(active),
+            )
+            == 0
+        )
 
     def backed_up_tag_bytes(self):
         """C16 / A1-2: ``{tag: bytes}`` over EVERY tag with a host backup, or None.
@@ -604,6 +678,13 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
     def set_keep_spans(self, tensor, row_ranges) -> int:
         # No saver, nothing can be kept; -100 is the "no symbol" code the
         # caller already handles.
+        return -100
+
+    def alloc_info_ok(self, tensor) -> bool:
+        # No saver -> no tracked allocations; a keep would not stick.
+        return False
+
+    def set_keep_byte_spans(self, base_tensor, byte_ranges) -> int:
         return -100
 
     def backed_up_tag_bytes(self):
