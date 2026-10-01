@@ -74,8 +74,18 @@ def refill_plan(
     cap_rows_by_rank: Sequence[int],
 ) -> List[Tuple[int, int, int]]:
     """Rows rank must refill from L2 as (compact_row, l2_slot, l2_gen).
-    A rank with cap > 0 kept its rows resident -> []. Tokens without an
-    L2 entry are skipped here and counted by count_missing()."""
+
+    Invariant (cap > 0 = resident): ``cap_rows_by_rank[rank] > 0`` means
+    this rank KEPT its rows mapped on the TMS keep spans through the hold,
+    so it owns no gap to refill and the plan is ``[]`` -- even a rank that
+    owns slots. Only a cap-0 rank (TP0, the 5090: held nowhere, refilled
+    from L2) gets a non-empty plan, naming exactly its L2-backed rows. A
+    future PARTIAL-hold variant (a rank that keeps only some of its rows)
+    must change this function: the ``cap > 0 -> []`` shortcut assumes
+    "kept everything", not "kept some".
+
+    Tokens without an L2 entry are skipped here and counted by
+    count_missing()."""
     if cap_rows_by_rank[rank] > 0:
         return []
     plan = []

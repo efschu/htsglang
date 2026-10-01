@@ -14,6 +14,7 @@ import torch
 from sglang.srt.mem_cache.hicache_migrate import MambaBlobSpec
 from sglang.srt.weg2.l15_anchor_plan import (
     AnchorPiece,
+    _dst_key,
     plan_anchor,
     rank_ranges,
     stage_ranges,
@@ -158,3 +159,10 @@ def test_pieces_are_deterministically_ordered():
     key = [(p.dst, p.dst_off) for p in pieces]
     assert key == sorted(key)
     assert all(isinstance(p, AnchorPiece) for p in pieces)
+
+
+def test_dst_key_orders_ranks_numerically():
+    # Two-digit ids must rank by VALUE (tp2 before tp10), and tp* after pp*.
+    assert _dst_key("tp2") == ("tp", 2)
+    assert _dst_key("pp1") == ("pp", 1)
+    assert sorted(["tp10", "tp2", "pp1"], key=_dst_key) == ["pp1", "tp2", "tp10"]

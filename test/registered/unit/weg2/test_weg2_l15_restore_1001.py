@@ -83,6 +83,25 @@ def test_refill_plan_cap_positive_is_empty():
     assert R.refill_plan(m, 1, _PREFIX, (0, 5, 4)) == []
 
 
+def test_refill_plan_cap_positive_resident_even_though_rank_owns_slots():
+    # Pins the refill invariant: cap > 0 == the rank KEPT its rows mapped on
+    # the TMS keep spans, so it refills nothing -- even a rank that owns
+    # slots. rank 1 owns slots 10, 11 (L%8 in [2,4)): with cap 0 it WOULD
+    # refill them, but with cap 5 it kept them resident -> []. The cap-0
+    # sibling rank 0 still plans its owned rows.
+    m = _manifest(_SPANS)
+    # rank 1 owns slots, proven by its cap-0 plan being non-empty:
+    assert R.refill_plan(m, 1, _PREFIX, (0, 0, 0)) == [(3, 103, 9)]
+    # ... yet with cap > 0 it kept them mapped, so it plans nothing:
+    assert R.refill_plan(m, 1, _PREFIX, (0, 5, 4)) == []
+    # while the cap-0 sibling plans its owned rows:
+    assert R.refill_plan(m, 0, _PREFIX, (0, 5, 4)) == [
+        (1, 100, 7),
+        (3, 101, 8),
+        (2, 201, 6),
+    ]
+
+
 def test_refill_plan_owner_rule_other_rank():
     m = _manifest(_SPANS)
     plan = R.refill_plan(m, 1, _PREFIX, (0, 0, 4))

@@ -170,8 +170,21 @@ def _runs(
         t0 = t1
 
 
+def _dst_key(dst: str) -> Tuple[str, int]:
+    """Split ``tp<r>`` / ``pp<s>`` into ``(letters, rank)`` for NUMERIC order.
+
+    Plain string order misranks two-digit ids (``tp10`` < ``tp2`` lexicographically);
+    ranking by ``(letters, int)`` puts ``tp2`` before ``tp10`` while still keeping
+    all ``tp*`` together and all ``pp*`` together.
+    """
+    i = len(dst)
+    while i > 0 and dst[i - 1].isdigit():
+        i -= 1
+    return (dst[:i], int(dst[i:]) if i < len(dst) else 0)
+
+
 def _sort_key(p: RowPiece):
-    return (p.dst, p.dst_rows[0] if p.dst_rows else -1, p.layers)
+    return (_dst_key(p.dst), p.dst_rows[0] if p.dst_rows else -1, p.layers)
 
 
 def plan_d_to_p(

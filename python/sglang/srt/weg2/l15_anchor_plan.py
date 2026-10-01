@@ -115,6 +115,19 @@ def _concat_offsets(ranges: Sequence[Tuple[int, int]]) -> List[int]:
     return out
 
 
+def _dst_key(dst: str) -> Tuple[str, int]:
+    """Split ``tp<r>`` / ``pp<s>`` into ``(letters, rank)`` for NUMERIC order.
+
+    Plain string order misranks two-digit ids (``tp10`` < ``tp2`` lexicographically);
+    ranking by ``(letters, int)`` puts ``tp2`` before ``tp10`` while still keeping
+    all ``tp*`` together and all ``pp*`` together.
+    """
+    i = len(dst)
+    while i > 0 and dst[i - 1].isdigit():
+        i -= 1
+    return (dst[:i], int(dst[i:]) if i < len(dst) else 0)
+
+
 def _intersect(
     a: Sequence[Tuple[int, int]],
     apos: Sequence[int],
@@ -216,5 +229,5 @@ def plan_anchor(
                         route=route,
                     )
                 )
-    pieces.sort(key=lambda p: (p.dst, p.dst_off))
+    pieces.sort(key=lambda p: (_dst_key(p.dst), p.dst_off))
     return pieces
