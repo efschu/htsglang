@@ -329,6 +329,7 @@ class RankStats:
         rec["last_post_wake"] = self.last_post_wake
         rec["stops"] = {"n": self.stops_n, "last": list(self.stops)}
         self._last_cap = rec.get("cap")
+        self._last_rec = rec
         return rec
 
     def write_once(self) -> None:
@@ -347,6 +348,21 @@ class RankStats:
             except Exception:  # noqa: BLE001 -- a lost sample never stops the rank
                 self.failed += 1
             self.sync_capacity()
+            self.sync_metrics()
+
+    def sync_metrics(self) -> None:
+        """TSDB (01.10.): the rank gauges + decode-token delta on the group's
+        /metrics (weg2/rank_metrics.py), from this thread. No metrics on the
+        server (no PROMETHEUS_MULTIPROC_DIR) = nothing."""
+        rec = getattr(self, "_last_rec", None)
+        if rec is None:
+            return
+        try:
+            from sglang.srt.weg2 import rank_metrics
+
+            rank_metrics.on_rankstats(rec, self.tp_rank, self.pp_rank)
+        except Exception:  # noqa: BLE001 -- a metric never stops the rank
+            self.failed += 1
 
     def sync_capacity(self) -> None:
         """C5: a changed pool/seat counter (the KV-stage dial moves

@@ -259,6 +259,103 @@ class BoundedWriter:
                     self._on_error(fn, e)
 
 
+class OutstandingBook:
+    """(Ported 1:1 from the NF front, desk/nf-y6d-anchor-pin-1001; the 27B front
+    uses its arrival stamp for weg2_ttft_seconds, TSDB 01.10.)
+
+    Every open request of the front: its arrival and its last token
+    (state.json ``front.oldest_outstanding_*`` / ``front.outstanding_stalest``).
+
+    y4y 17:05:40Z: two burst requests of the GROW probe ran 300 s without a
+    single token into their timeout while an anchor stream beside them was
+    served -- the progress watcher reads only the served TOTALS, so it stayed
+    silent (Nutzer 30.09.: "outstanding 3, niemand merkts"). One row per
+    request answers it: how old, where, and how long since its last token.
+
+    Data the front already has, in the event loop, no sync: the arrival at the
+    rid's birth, a token = a chunk D streamed for the rid (a non-streamed
+    request shows its first token when it ends), the where from the front's
+    own structures (queue / P / D outstanding / parked, ``flip`` while a flip
+    runs). The rid leaves at the handler's end (the one rid-end site)."""
+
+    #: a row no structure names and whose handler end never came (a test
+    #: double calling the handler unwrapped) is dropped after this long
+    ORPHAN_S = 3600.0
+
+    def __init__(self) -> None:
+        self.arrival: dict = {}
+        self.last_tok: dict = {}
+        #: y5c (30.09., weg2-0-2, 113k non-stream, 235 s): the rids whose client
+        #: asked no stream -- the front forwards D's answer whole at its end,
+        #: so it sees no token in between and has no per-rid IPC source for
+        #: one. Their rows say so (``stream`` 0, ``no_token_s`` None) instead of
+        #: reading "no token for N s" out of a blindness.
+        self.nonstream: set = set()
+
+    def arrive(self, rid, now: float) -> None:
+        self.arrival.setdefault(str(rid), float(now))
+
+    def stream(self, rid, is_stream: bool) -> None:
+        if is_stream:
+            self.nonstream.discard(str(rid))
+        else:
+            self.nonstream.add(str(rid))
+
+    def token(self, rid, now: float) -> None:
+        self.last_tok[str(rid)] = float(now)
+
+    def end(self, rid) -> None:
+        self.arrival.pop(str(rid), None)
+        self.last_tok.pop(str(rid), None)
+        self.nonstream.discard(str(rid))
+
+    def block(self, now: float, queued, p_out, d_out, parked, flipping: bool, top: int = 8) -> dict:
+        """``queued``: (rid, t_arrive) of the front's queue; ``p_out``/``d_out``:
+        the groups' outstanding maps (rid -> leg start); ``parked``: D's parked
+        rids. A booked rid in none of them is between two (routing, a seat
+        wait): ``queue``."""
+        rows = {}
+        for rid in list(self.arrival):
+            rows[rid] = ["queue", self.arrival[rid]]
+        for rid, t in queued:
+            r = str(rid)
+            rows[r] = ["flip" if flipping else "queue", self.arrival.get(r, float(t))]
+        for rid, t in list((p_out or {}).items()):
+            r = str(rid)
+            rows[r] = ["P", self.arrival.get(r, float(t))]
+        park = {str(x) for x in (parked or ())}
+        for rid, t in list((d_out or {}).items()):
+            r = str(rid)
+            rows[r] = ["parked" if r in park else "D", self.arrival.get(r, float(t))]
+        placed = {str(r) for r, _t in queued} | {str(r) for r in (p_out or {})} | {str(r) for r in (d_out or {})}
+        for rid in [r for r in rows if r not in placed and now - rows[r][1] > self.ORPHAN_S]:
+            rows.pop(rid)
+            self.end(rid)
+        entries = []
+        for rid, (where, t) in rows.items():
+            lt = self.last_tok.get(rid)
+            blind = rid in self.nonstream
+            entries.append({"rid": rid, "where": where, "age_s": round(max(0.0, now - t), 1),
+                            "stream": 0 if blind else 1,
+                            "last_token_s": None if lt is None else round(max(0.0, now - lt), 1),
+                            # non-stream: the front cannot see D's tokens -- None, not a stall
+                            "no_token_s": (None if blind else
+                                           round(max(0.0, now - (lt if lt is not None else t)), 1))})
+        oldest = max(entries, key=lambda e: e["age_s"]) if entries else None
+        return {
+            "outstanding_n": len(entries),
+            "outstanding_nonstream_n": sum(1 for e in entries if not e["stream"]),
+            "oldest_outstanding_age_s": oldest["age_s"] if oldest else None,
+            "oldest_outstanding_first_token_s": oldest["last_token_s"] if oldest else None,
+            "oldest_outstanding_rid": oldest["rid"] if oldest else None,
+            "oldest_outstanding_where": oldest["where"] if oldest else None,
+            "oldest_outstanding_stream": oldest["stream"] if oldest else None,
+            "outstanding_stalest": sorted(
+                entries, key=lambda e: -(e["no_token_s"] if e["no_token_s"] is not None else -1.0)
+            )[:max(1, int(top))],
+        }
+
+
 class DpFlipClock:
     """D->P flip time in the USER's definition (FLIPZEIT-VERLAUF-0929.md, Folgepunkt
     30.09.): Decode-Ende -> P-Prefill-Start, i.e. the last D decode round (the park

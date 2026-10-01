@@ -73,6 +73,7 @@ from aiohttp import (
     web,
 )
 
+from sglang.srt.weg2 import front_metrics as _front_metrics  # TSDB: imported off the loop
 from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xsn272
 from sglang.srt.weg2.intake_stall import STALL_MARK as _INTAKE_STALL_MARK  # H91 part C
 
@@ -128,7 +129,10 @@ FORWARD_PATHS = ("/generate", "/v1/completions", "/v1/chat/completions", "/v1/me
 #: passthroughs beside it -- routing it through ``handle_generate`` would
 #: allocate a seat for a request that never generates.
 PASSTHROUGH_POST = ("/v1/messages/count_tokens",)
-PASSTHROUGH_GET = ("/v1/models", "/get_model_info", "/get_server_info", "/model_info", "/metrics")
+PASSTHROUGH_GET = ("/v1/models", "/get_model_info", "/get_server_info", "/model_info")
+#: TSDB (01.10.): /metrics is the front's own route (front_metrics): its weg2_* families
+#: plus P's and D's /metrics relabelled with weg2_group="P"|"D".
+METRICS_PATH = "/metrics"
 CHARS_PER_TOKEN = 3.0  # conservative: over-estimates tokens, never under-prices
 # #1233 zero-remainder: the CARRIER-EXCEEDS route must not UNDER-estimate --
 # measured boot weg2zr1: 80,000 chars of markdown = 30,100 tokens (2.66
@@ -5046,6 +5050,7 @@ class Front:
             late[:8], still[:8], time.time() - t_park)
         # D->P flip time (user definition): D's decodes stopped with this park
         self._ipc_dp_clock().note_park(self.epoch, t_park, (time.time() - t_park) * 1000.0)
+        self._metrics().park_rpc_done(time.time() - t_park)  # TSDB
         return "parked"
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
@@ -6485,6 +6490,81 @@ class Front:
                 on_error=self._ipc_failed)
         w.submit(fn, *args)
 
+    def _ipc_out_book(self):
+        """Every open request's arrival and last token (front_state_ipc.OutstandingBook,
+        NF port): the 27B front reads its arrival for weg2_ttft_seconds."""
+        b = self.__dict__.get("_ipc_out_book_obj")
+        if b is None:
+            from sglang.srt.weg2.front_state_ipc import OutstandingBook
+
+            b = self.__dict__["_ipc_out_book_obj"] = OutstandingBook()
+        return b
+
+    def ipc_out_wrap(self, handler):
+        """The rid-end of the outstanding book (NF port): every return, exception
+        and cancel of the generate handler takes the rid out (the #243 seam's rid)."""
+        import functools
+
+        @functools.wraps(handler)
+        async def _wrapped(request):
+            try:
+                return await handler(request)
+            finally:
+                try:
+                    rid = request.get(_hs.RID_KEY)
+                except Exception:  # noqa: BLE001
+                    rid = None
+                if rid:
+                    self._ipc_out_book().end(rid)
+                    m = self.__dict__.get("_front_metrics")
+                    if m is not None:
+                        m.forget(rid)
+        return _wrapped
+
+    def _metrics(self):
+        """TSDB (01.10.): the front's weg2_* instruments (front_metrics). Read-only
+        observations; the optional push rides the IPC writer thread."""
+        m = self.__dict__.get("_front_metrics")
+        if m is None:
+            m = self.__dict__["_front_metrics"] = _front_metrics.FrontMetrics(submit=self._ipc_submit)
+        return m
+
+    async def handle_metrics(self, request: web.Request) -> web.Response:
+        """TSDB: the front's own weg2_* families + P's and D's /metrics, each
+        relabelled weg2_group="P"|"D" (2 s per group; a failed group reads
+        weg2_group_scrape_ok 0). Never raises: a failure here is counted."""
+        GROUP_SCRAPE_TIMEOUT_S = _front_metrics.GROUP_SCRAPE_TIMEOUT_S
+        m = self._metrics()
+        try:
+            _live = {r for g in self.groups.values() for r in (getattr(g, "outstanding", None) or {})}
+            _pn = getattr(self, "_d_phase_n", None)
+            m.set_gauges(queue_len=len(getattr(self, "queue", ()) or ()),
+                         outstanding=len(_live),
+                         d_seats=int(_pn) if _pn is not None else int(getattr(self, "d_bs", 0) or 0),
+                         d_parked=len(getattr(self, "_d_parked", None) or {}),
+                         awake=getattr(self, "awake", None), groups=tuple(self.groups))
+        except Exception as e:  # noqa: BLE001
+            m._err("gauges_read", e)
+
+        async def _one(name):
+            g = self.groups.get(name)
+            if g is None:
+                return name, None
+            try:
+                async with self.session.get(
+                        f"{g.url}{METRICS_PATH}",
+                        timeout=ClientTimeout(total=GROUP_SCRAPE_TIMEOUT_S)) as r:
+                    if r.status != 200:
+                        return name, None
+                    return name, (await r.read()).decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001 - a down/asleep group reads scrape_ok 0
+                return name, None
+
+        texts = await asyncio.gather(*[_one(n) for n in self.groups])
+        body = m.aggregate(list(texts))
+        return web.Response(body=body.encode(), status=200,
+                            headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
+
     def _ipc_failed(self, fn: Callable[..., Any], e: Exception) -> None:
         logger.warning("WEG2 IPC WRITE FAILED %s: %s: %s", getattr(fn, "__name__", fn),
                        type(e).__name__, e)
@@ -6493,6 +6573,8 @@ class Front:
         """An event of the front into the boot's events.jsonl; no state dir = no-op."""
         from sglang.srt.weg2 import front_state_ipc
 
+        if typ in ("flip_done", "flip_first_work", "flip_user_time"):
+            self._metrics().on_event(typ, data)  # TSDB: counted, never raised
         d = envs.WEG2_STATE_DIR.get() or None
         if d:
             self._ipc_submit(front_state_ipc.publish_event, d, typ, data)
@@ -7126,6 +7208,7 @@ class Front:
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
+        self._ipc_out_book().arrive(rid, time.time())  # NF port: the TTFT clock starts here
         self._sess_note(rid, request, payload)  # SESSION-TRACE
         # UNIFY S7 (27B RC7-X): the arrival time the idle re-grant's quiet
         # window reads ("did anything arrive in the last window").
@@ -8076,6 +8159,7 @@ class Front:
             _dp = self._ipc_dp_clock().first_prefill(p.rid, t0, time.time(), d_prefill_seconds(js))
             if _dp is not None:
                 self._ipc_publish("flip_user_time", _dp)
+            self._metrics().served_leg("P", p.rid, time.time() - t0, pt, ct, 0)  # TSDB
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
         finally:
@@ -8412,10 +8496,13 @@ class Front:
                     # content for this leg. Joined by rid with the
                     # ROUTE-VERDICT line (the arrival), it is the
                     # arrival-to-first-token the agent-load boot measures.
+                    _via = ("d_direct" if pending is None
+                            else "d_single" if single_prefill else "after_p")
                     logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f",
-                                rid, self.epoch, ("d_direct" if pending is None
-                                                 else "d_single" if single_prefill else "after_p"),
-                                (time.time() - t0) * 1000.0)
+                                rid, self.epoch, _via, (time.time() - t0) * 1000.0)
+                    # TSDB: leg-2 first content and the TTFT from the front's arrival stamp
+                    self._metrics().leg2_first_content(
+                        rid, _via, time.time() - t0, self._ipc_out_book().arrival.get(str(rid)))
                     # DASHBOARD-AUS-IPC (a): D's first content after a P->D flip = first decode token.
                     self._ipc_first_work_seen("D", "decode_token", rid)
                 if _has_content and front_span_inflight() and self.spans.agent_span:
@@ -8672,6 +8759,7 @@ class Front:
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
                     self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_stream_tail(bytes(tail)))
+                    self._metrics().served_leg("D", rid, time.time() - t0, pt, ct, comp)  # TSDB
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
@@ -8706,6 +8794,7 @@ class Front:
                 self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_of(js))
                 dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
                                                  mark=_pfc_mark0)
+                self._metrics().served_leg("D", rid, time.time() - t0, pt, ct, comp)  # TSDB
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
@@ -12662,12 +12751,15 @@ def main():
     app.router.add_post("/close_session", front.handle_session_refused)
     for path in PASSTHROUGH_GET:
         app.router.add_get(path, front.handle_passthrough_get)
+    app.router.add_get(METRICS_PATH, front.handle_metrics)  # TSDB: P/D-aggregated
     for path in PASSTHROUGH_POST:
         app.router.add_post(path, front.handle_passthrough_post)
     # #243 seam: the wrapper is the one rid-end site that drops the rid's
     # hand-off marks (weg2/handoff_seam.py:wrap_handler) -- bound once, here,
     # before the routes take the handler.
     front.handle_generate = _hs.wrap_handler(front.handle_generate)
+    # NF port: the outstanding book's rid-end (arrival stamp of weg2_ttft_seconds)
+    front.handle_generate = front.ipc_out_wrap(front.handle_generate)
     # W3-STOP: a STOP answers the handlers in flight (Front.stop_guard).
     front.handle_generate = front.stop_guard(front.handle_generate)
     for path in FORWARD_PATHS:
