@@ -7123,9 +7123,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     f"local={local_len}): a MIN reduce can never do that, so "
                     "the ranks were not all inside this collective."
                 )
-            if group_len < self.prefetch_threshold or _end_decline:
+            # HANDBACK VOTE MIN (gmps7 dkr27bnvfp4dual1mbar1fs10011748, D TP=3,
+            # 17:52:27-17:52:56): the group decides against the SAME smallest
+            # read the local gate uses (`_min_len`: the threshold, or the
+            # caller's `min_tokens` -- a P hand-back, a store-short tail, a
+            # told read). Against the bare threshold every hand-back span below
+            # 256 tokens was `vote_negative` with present=True on all three
+            # ranks (weg2-0-6 need=24, weg2-0-10 need=40) -> W31 -> W50 -> P
+            # ran leg 1 twice -> W53/503. `_min_len` is rank-uniform: it is a
+            # pure function of the request (its told, its store-short tail, its
+            # park) and the group's env, the same on every rank of the group.
+            if group_len < _min_len or _end_decline:
                 # #1068 L1: the group declined (0, or a common span below the
-                # prefetch threshold). Named on every rank, including the one
+                # smallest read worth issuing). Named on every rank, including the one
                 # whose own gate term or anchor exhaustion lowered the vote
                 # (that rank counted its local term above as well; the
                 # attribution order names the local term first).
@@ -7146,8 +7156,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # (`scheduler.py:5268`: "enter the vote carrying nothing"), so its
             # span is 0 and a span check above the threshold return would fire
             # on the most ordinary condition in the system. Past that return
-            # the population is provably clean: `group_len >= prefetch_threshold
-            # > 0` and `local_len` is 0 on any rank that was ineligible or did
+            # the population is provably clean: `group_len >= _min_len >= 1`
+            # (max(1, ...) above) and `local_len` is 0 on any rank that was ineligible or did
             # not allocate, so a MIN at or above the threshold proves EVERY
             # rank was eligible AND allocated. Only real spans are compared.
             span_lo = int(vote[3].item())

@@ -138,6 +138,15 @@ class Weg2DualKvMapShort(RuntimeError):
         self.rc = rc
 
 
+class Weg2DualKvFollowerMapShort(Weg2DualKvMapShort):
+    """DUAL-FOLLOWER-MAP-SHORT: a P follower (PP1/PP2) could not map the group
+    grant PP0 already committed for it (its card physically short). PP0 cannot
+    see a follower's card, so this rank cannot wait the grant away; it stops
+    NAMED (residual risk of the MAP-SHORT WAIT, operator order 01.10.) -- the
+    D-priority stages keep P's grants clear of a short card before it comes to
+    this."""
+
+
 class Weg2DualKvCapBreach(RuntimeError):
     """A free id above the mapped span: the next allocation would write into
     unmapped memory (metal e3hgpw: illegal memory access). Refused by name."""
@@ -320,10 +329,20 @@ class PKvStage:
         # card: only the difference to its mapping); None = the full unit
         # (a follower card, charged in full by PP0)
         add = (self.bytes_for(want) - self.bytes_for(0)) if charged is None else max(0, int(charged))
-        self._committed = int(getattr(self, "_committed", 0) or 0) + add
         if want > self.mapped_tokens:
-            self._move(want)
+            # MAP-SHORT WAIT (gmps7 dkr27bnvfp4dual1mbar1fs10011748, PP0 17:53:16):
+            # the ledger granted 151552 tokens, the card was physically short
+            # (cuMemCreate rc=2) and the raise killed PP0. Map FIRST: on a short
+            # card this rank rolls back to its standing mapping and nothing is
+            # adopted -- the caller (PP0's grant) returns every card's charge and
+            # holds the request, as for a ledger-short card.
+            try:
+                self._move(want)
+            except Weg2DualKvMapShort:
+                self._move(self.mapped_tokens)        # unmap what this rank got; rows/cap back
+                raise
             self.mapped_tokens = want
+        self._committed = int(getattr(self, "_committed", 0) or 0) + add
         keep = self.bytes_for(self.mapped_tokens) - self.bytes_for(0)
         excess = self._committed - keep
         if excess > 0:
@@ -421,10 +440,13 @@ def phys_check(actor, group: str) -> None:
                        dict(st.committed))
         if len(win) >= PHYS_BOOK_AFTER:
             # metal dual15: 628359168 B of card use outside the KV pools stood
-            # for minutes. Persistent = real: book the SMALLEST over of the
-            # window, capped atomically by the gap measured now (the other
-            # process on the card may have booked it already -- never twice).
-            n = led.reconcile(phys, cap=min(win[-PHYS_BOOK_AFTER:]))
+            # for minutes. Persistent = real.
+            # gmps7 (D 17:53:15): the window held 209/477/466 MB, the SMALLEST
+            # (209 MB) was booked and the ledger still over-promised 466 MB a
+            # second later -> PP0's cuMemCreate OOM. Persistence still decides
+            # WHETHER to book; WHAT is booked is the gap measured now
+            # (reconcile re-reads the ledger under its lock -- never twice).
+            n = led.reconcile(phys, cap=over)
             win.clear()
             if n > 0:
                 logger.warning("%s LEDGER-PHYS BOOKED %d B of unbooked card use into the budget (group=%s, "
@@ -501,7 +523,8 @@ def publish_stage(actor: "PKvStage", tag: str, pp_rank: int) -> str:
     return path
 
 
-def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optional[dict] = None) -> int:
+def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optional[dict] = None,
+                taken_out: Optional[list] = None) -> int:
     """ATOMIC over all P stages (operator order 30.09.: all or none, fixed card
     order against deadlocks): commit each stage's bytes for ``tokens`` on its
     card's ledger; if any card is short, return every grant already taken and
@@ -512,7 +535,10 @@ def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optio
     dual13: a level the mapping covers never waits). Only PP0's own card is
     passed: PP0 cannot see a follower's mapping, and a follower may
     idle-release between this grant and its adoption, so a follower card is
-    charged the full unit and returns the excess on adoption."""
+    charged the full unit and returns the excess on adoption.
+
+    ``taken_out``: on a grant, receives the (ledger, bytes) charges taken, so
+    PP0 can return them when its own card is physically short (MAP-SHORT WAIT)."""
     covered = covered or {}
     if not stages:
         return 0
@@ -538,6 +564,8 @@ def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optio
                 if g2:
                     l2.release(g2)
             return 0
+    if taken_out is not None:
+        taken_out.extend(taken)
     return want
 
 
@@ -608,11 +636,28 @@ def pp0_grant(sched, req) -> Optional[int]:
     # level now covers this prompt PLUS every other request holding a grant.
     tokens += live_grant_tokens(sched, req, int(actor.page))
     own = int(getattr(actor, "_committed", 0) or 0)    # PP0's card: the ledger covers its mapping exactly
-    lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own})
+    taken: list = []
+    lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own}, taken_out=taken)
     rid = str(getattr(req, "rid", "?"))[:16]
     if lvl:
         k = lvl // int(stages[0]["step"])
-        actor.map_granted(lvl, charged=max(0, int(stages[0]["bytes"][k]) - own))
+        try:
+            actor.map_granted(lvl, charged=max(0, int(stages[0]["bytes"][k]) - own))
+        except Weg2DualKvMapShort as exc:
+            # MAP-SHORT WAIT: the card ledger promised bytes the card does not
+            # have. Every card's charge goes back, PP0's ledger is reconciled
+            # against cuMemGetInfo (the next grant is priced on what is really
+            # there) and the request is HELD -- a wait, never a rank death.
+            for led, got in taken:
+                if got:
+                    led.release(got)
+            phys = phys_free_bytes()
+            over = actor.ledger.reconcile(phys) if phys is not None else 0
+            logger.warning("%s MAP-SHORT-WAIT rid=%s tokens=%d: %s -- every card's grant returned, PP0's "
+                           "ledger reconciled by -%d B against phys_free=%s; the request is held",
+                           MARK, rid, lvl, exc, int(over), phys)
+            _log_wait(rid, tokens)
+            return 0
         req._dual_kv_tokens = lvl
         waited = _wait_granted(rid)
         logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards%s", MARK, rid, lvl, pp,
@@ -678,7 +723,15 @@ def on_told(sched, item) -> None:
     lvl = int(getattr(item, WIRE_DUAL_KV, 0) or 0)
     actor = _actor(sched)
     if lvl > 0 and actor is not None:
-        actor.map_granted(lvl)
+        try:
+            actor.map_granted(lvl)
+        except Weg2DualKvFollowerMapShort:
+            raise
+        except Weg2DualKvMapShort as exc:
+            raise Weg2DualKvFollowerMapShort(
+                "DUAL-FOLLOWER-MAP-SHORT rid=%s level=%d mapped=%d: %s -- PP0's committed group grant "
+                "cannot be mapped on this follower's card (rolled back to the standing mapping)"
+                % (str(getattr(item, "rid", "?"))[:16], lvl, actor.mapped_tokens, exc)) from exc
 
 
 def with_dual_kv(told, req):
