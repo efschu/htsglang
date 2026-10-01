@@ -2976,6 +2976,15 @@ class PrefillAdder:
                 # dropping its END state; the next pass leads with it
                 # (weg2/skip_first.py). Rank-uniform inputs.
                 return AddReqResult.OTHER
+            from sglang.srt.weg2 import d_twin_pass
+
+            if not tail_adopt.skip_joinable(
+                req, len(req.prefix_indices)
+            ) and d_twin_pass.waits(req, len(req.prefix_indices), self.can_run_list):
+                # ZR-4: a twin in this pass computes these tokens already; this
+                # one waits a pass and matches them from the tree (D only; an
+                # END-state adoption computes nothing and never waits here)
+                return AddReqResult.OTHER
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
