@@ -1472,17 +1472,25 @@ if (DEV) $("launchbox").addEventListener("click", async (e) => {
 if (DEV) $("lf-filter").addEventListener("input", lfApplyFilter);
 // <!--DEV:END-->
 
-let failures = 0, inflight = false;
+let failures = 0, inflight = false, refreshAgain = false;
+// the zoomed stretch a request was made for: an answer for another stretch is never drawn
+const zoomKey = () => { const z = window.RigZoom && RigZoom.get(); return z ? `${z[0].toFixed(3)},${z[1].toFixed(3)}` : ""; };
 async function refresh(force) {
   const why = force ? "" : pauseReason();
   $("pausenote").textContent = why;
-  if (why || inflight) return;
+  if (why) return;
+  // Nutzer 01.10. ("zoom … es passiert einfach nix"): api/live takes 5-8 s, longer than the 2-s tick, so a
+  // poll is almost always in flight when the zoom asks.  A forced refresh is queued behind it, never dropped.
+  if (inflight) { if (force) refreshAgain = true; return; }
   inflight = true;
+  const zk = zoomKey();
+  if (window.RigZoom && RigZoom.loading) RigZoom.loading(!!zk);
   try {
-    const z = window.RigZoom && RigZoom.get();
-    const r = await fetch("api/live" + (z ? `?zoom=${z[0].toFixed(3)},${z[1].toFixed(3)}` : ""), {cache: "no-store"});   // relative: works behind the /rigdash/ prefix
+    const r = await fetch("api/live" + (zk ? `?zoom=${zk}` : ""), {cache: "no-store"});   // relative: works behind the /rigdash/ prefix
     const d = await r.json();
     failures = 0;
+    // the zoom moved while the fetch ran (or was left): this answer is for the old stretch, fetch again
+    if (zoomKey() !== zk) { refreshAgain = true; return; }
     const late = force ? "" : pauseReason();      // the reader may have started while the fetch ran
     if (late) { $("pausenote").textContent = late; return; }
     const anchor = readAnchor();
@@ -1531,6 +1539,8 @@ async function refresh(force) {
     $("sub").textContent = `Dashboard-API nicht erreichbar (${failures}×): ${e}`;
   } finally {
     inflight = false;
+    if (refreshAgain) { refreshAgain = false; refresh(true); }
+    else if (window.RigZoom && RigZoom.loading) RigZoom.loading(false);
   }
 }
 if (DEV) {

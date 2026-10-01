@@ -16,7 +16,7 @@
   const MIN_PX = 6;              // kürzeres Ziehen ist ein Klick (Tipp auf die Phasenleiste bleibt ein Tipp)
   const stack = [];
   const subs = [];
-  let drag = null, eatClick = false;
+  let drag = null, eatClick = false, loadingNow = false;
 
   const p2 = (n) => String(n).padStart(2, "0");
   const hms = (t) => { const d = new Date(t * 1000); return p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds()); };
@@ -40,6 +40,8 @@
     back() { if (stack.length) { stack.pop(); emit(); } },
     reset() { if (stack.length) { stack.length = 0; emit(); } },
     on(fn) { subs.push(fn); },
+    // the page says while the zoomed stretch is being fetched (api/live answers in seconds, not at once)
+    loading(on) { loadingNow = !!on; bar(); },
     // Zeitbereich einer Grafik aus ihren Attributen
     domain(el) {
       const a = parseFloat(el.dataset.zoomT0), b = parseFloat(el.dataset.zoomT1);
@@ -63,7 +65,7 @@
     }
     const z = api.get();
     barEl.hidden = !z;
-    if (z) barEl.querySelector(".zb-txt").textContent = `Zoom ${hms(z[0])} – ${hms(z[1])} (${dur(z[1] - z[0])})` + (stack.length > 1 ? ` · Stufe ${stack.length}` : "");
+    if (z) barEl.querySelector(".zb-txt").textContent = `Zoom ${hms(z[0])} – ${hms(z[1])} (${dur(z[1] - z[0])})` + (stack.length > 1 ? ` · Stufe ${stack.length}` : "") + (loadingNow ? " · lädt …" : "");
   }
 
   // ---------------------------------------------------------------- Ziehen (Maus, Stift, Touch)
