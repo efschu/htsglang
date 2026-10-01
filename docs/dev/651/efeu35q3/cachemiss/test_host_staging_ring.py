@@ -28,12 +28,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
 
 FULL = ComponentType.FULL
+MAMBA = ComponentType.MAMBA
 
 
 class FakeHostPool:
@@ -62,6 +64,7 @@ class FakeCC:
 
     def __init__(self, cap):
         self.mem_pool_host = FakeHostPool(cap)
+        self.mamba_host = FakeHostPool(8)
         self.enable_storage = True
         self.prefetch_tokens_occupied = 0
         self.prefetch_capacity_limit = 1 << 30
@@ -72,6 +75,9 @@ class FakeCC:
         self.extra_host_mem_release_queues = {}
 
     def write(self, device_indices, node_id=None, extra_pools=None):
+        for x in extra_pools or ():
+            if x.name == PoolName.MAMBA and x.device_indices is not None:
+                x.host_indices = self.mamba_host.alloc(len(x.device_indices))
         return self.mem_pool_host.alloc(len(device_indices))
 
     def prefetch_rate_limited(self):
@@ -89,17 +95,71 @@ class HostStagingRingTest(unittest.TestCase):
     def setUp(self):
         os.environ["SGLANG_HICACHE_HOST_STAGING_RING"] = "1"
         with mock.patch.object(urc, "get_device", return_value="cpu"):
-            self.cache, self.alloc, _ = urc.build_fixture(self.cfg)
+            self.cache, self.alloc, self.r2t = urc.build_fixture(self.cfg)
         self.cc = FakeCC(cap=40)
         self.cache.cache_controller = self.cc
         self.cache.components[FULL]._full_kv_pool_host = self.cc.mem_pool_host
+        if MAMBA in self.cache.components:
+            self.cache.components[MAMBA]._mamba_pool_host = self.cc.mamba_host
         self.cache.write_through_threshold = 1 << 30  # backups only when asked
         self.cache.prefetch_threshold = 1
+        self._rid = 0
+        self.dev_total = (
+            self.alloc.available_size()
+            + self.cache.full_evictable_size()
+            + self.cache.full_protected_size()
+        )
+
+    def tearDown(self):
+        # The serving scheduler runs this on every idle tick (invariant
+        # checker); 19:45:27 died here. Every scenario must leave a tree it
+        # accepts.
+        self.cache.sanity_check()
+        # device KV pool balance (the on-idle leak check): every device slot
+        # is free, evictable in the tree, or protected by a lock.
+        total = self.alloc.size
+        if True:
+            self.assertEqual(
+                self.alloc.available_size()
+                + self.cache.full_evictable_size()
+                + self.cache.full_protected_size(),
+                self.dev_total,
+            )
+        # host pool balance: free + held by tree nodes == capacity
+        held = 0
+        stack = [self.cache.root_node]
+        while stack:
+            n = stack.pop()
+            stack.extend(n.children.values())
+            hv = n.component_data[FULL].host_value
+            if n is not self.cache.root_node and hv is not None:
+                held += len(hv)
+        for entry in self.cache.ongoing_prefetch.values():  # staged prefetches
+            held += len(entry[2])
+        self.assertEqual(self.cc.mem_pool_host.available_size() + held, 40)
+        mheld = 0
+        stack = [self.cache.root_node]
+        while stack:
+            n = stack.pop()
+            stack.extend(n.children.values())
+            if n is not self.cache.root_node and MAMBA in self.cache.components:
+                mv = n.component_data[MAMBA].host_value
+                mheld += 0 if mv is None else len(mv)
+        for entry in self.cache.ongoing_prefetch.values():  # staged prefetches
+            for xfers in entry[5].values():
+                for x in xfers:
+                    if x.name == PoolName.MAMBA and x.host_indices is not None:
+                        mheld += len(x.host_indices)
+        self.assertEqual(self.cc.mamba_host.available_size() + mheld, 8)
 
     # -- helpers -----------------------------------------------------------
     def insert(self, tokens):
         v = self.alloc.alloc(len(tokens))
-        self.cache.insert(InsertParams(key=RadixKey(array("q", tokens)), value=v))
+        params = InsertParams(key=RadixKey(array("q", tokens)), value=v)
+        if self.cfg.has_mamba:
+            req = urc.UnifiedRadixCacheSuite._make_req(self, self.r2t)
+            params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
+        self.cache.insert(params)
         m = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         return m.last_device_node
 
@@ -182,6 +242,30 @@ class HostStagingRingTest(unittest.TestCase):
         self.assertNotIn(parent, self.cache.root_node.children.values())
         self.assertEqual(self.cc.mem_pool_host.available_size(), 40)
 
+    def test_19_45_crash_shape_passes_the_idle_sanity_check(self):
+        """backend_185833 19:45:27: the on-idle invariant checker raised
+        'node 22 backed up but parent 21 not backed up' after the ring dropped
+        the parent's host copy and the child was backed up."""
+        toks, nodes = self.chain(1000, 2, 10)
+        parent, child = nodes
+        self.backup(parent)
+        self.cache._drop_resident_host_backups(10, protected=set(), reason="t")
+        self.assertFalse(parent.backuped)
+        self.assertGreater(self.backup(child), 0)  # relaxed parent-first rule
+        self.cache.sanity_check()
+
+    def test_sanity_holds_through_ring_tombstone_lifecycle(self):
+        toks, nodes = self.chain(1000, 2, 10)
+        parent, child = nodes
+        self.backup(parent)
+        self.backup(child)
+        self.cache._drop_resident_host_backups(10, protected={child}, reason="t")
+        self.cache.sanity_check()
+        self.cache.evict(EvictParams(num_tokens=20))
+        self.cache.sanity_check()  # tombstone with a host-only child
+        self.cache.evict_host(10)
+        self.cache.sanity_check()  # tombstone swept
+
     def test_prefetch_drops_off_path_copies_instead_of_host_kv_full(self):
         _, nodes = self.chain(1000, 4, 10)
         for n in nodes:
@@ -212,6 +296,17 @@ class HostStagingRingTest(unittest.TestCase):
         self.cache._drain_storage_control_queues_impl(0, None, 0, None, False)
         self.assertTrue(getattr(nodes[0], "l3_persisted", False))
         self.assertFalse(getattr(nodes[1], "l3_persisted", False))
+
+
+class HostStagingRingMambaTest(HostStagingRingTest):
+    """Same scenarios on the served tree shape (Full KV + GDN/mamba states)."""
+
+    cfg = urc.CacheConfig(
+        page_size=1,
+        kv_size=256,
+        max_context_len=256,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+    )
 
 
 if __name__ == "__main__":

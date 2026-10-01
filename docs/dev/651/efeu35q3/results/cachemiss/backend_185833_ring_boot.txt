@@ -1,0 +1,23 @@
+[2026-10-01 18:59:21] server_args=ServerArgs(model_path='/root/efeu35q3/models/Qwen3.8-35B-A3B-Q3_K_M.gguf', tokenizer_path='/root/efeu35q3/hf', tokenizer_mode='auto', tokenizer_backend='huggingface',
+[2026-10-01 19:01:06] Prefill batch, #new-seq: 1, #new-token: 6, #cached-token: 0, full token usage: 0.00, mamba usage: 0.12, mamba evictable: 0, mamba avail: 14, kv evictable: 0, #running-req: 0, #qu
+[2026-10-01 19:01:09] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 0, full token usage: 0.00, mamba usage: 0.06, mamba evictable: 2, mamba avail: 13, kv evictable: 13, #running-req: 0, #q
+[2026-10-01 19:42:32] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 0, full token usage: 0.00, mamba usage: 0.00, mamba evictable: 3, mamba avail: 13, kv evictable: 14, #running-req: 0, #q
+[2026-10-01 19:42:38] HiCache prefetch success req=9632dacf3415439193593c1580231ec3 completed_local=17920 completed_synced=17920 matched=0 loaded=17920 tail_release=0 occupied=0
+[2026-10-01 19:42:46] Prefill batch, #new-seq: 1, #new-token: 509, #cached-token: 17920, full token usage: 0.14, mamba usage: 0.19, mamba evictable: 3, mamba avail: 10, kv evictable: 14, #running-req:
+[2026-10-01 19:42:54] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 0, full token usage: 0.00, mamba usage: 0.00, mamba evictable: 6, mamba avail: 10, kv evictable: 18452, #running-req: 0,
+[2026-10-01 19:42:58] Prefill batch, #new-seq: 1, #new-token: 178, #cached-token: 0, full token usage: 0.00, mamba usage: 0.12, mamba evictable: 6, mamba avail: 8, kv evictable: 18448, #running-req: 0
+[2026-10-01 19:42:59] Prefill batch, #new-seq: 1, #new-token: 20, #cached-token: 18438, full token usage: 0.14, mamba usage: 0.25, mamba evictable: 6, mamba avail: 6, kv evictable: 14, #running-req: 1
+[2026-10-01 19:43:22] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 0, full token usage: 0.00, mamba usage: 0.00, mamba evictable: 10, mamba avail: 6, kv evictable: 18903, #running-req: 0,
+[2026-10-01 19:43:23] HiCache prefetch skipped: reason=mamba_host_slot len=281
+[2026-10-01 19:43:28] Prefill batch, #new-seq: 1, #new-token: 282, #cached-token: 18438, full token usage: 0.14, mamba usage: 0.12, mamba evictable: 10, mamba avail: 4, kv evictable: 448, #running-req
+[2026-10-01 19:43:38] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 0, full token usage: 0.00, mamba usage: 0.00, mamba evictable: 12, mamba avail: 4, kv evictable: 19248, #running-req: 0,
+[2026-10-01 19:43:39] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=18800 of 20588
+[2026-10-01 19:43:47] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 18800, full token usage: 0.15, mamba usage: 0.12, mamba evictable: 11, mamba avail: 3, kv evictable: 448, #running-req
+[2026-10-01 19:44:04] HiCache host staging: dropped 5 host copies (193 tokens) of device-resident nodes already in L3 for backup; wanted 355, host free 350
+[2026-10-01 19:44:04] Prefill batch, #new-seq: 1, #new-token: 252, #cached-token: 0, full token usage: 0.16, mamba usage: 0.31, mamba evictable: 9, mamba avail: 2, kv evictable: 441, #running-req: 0, 
+[2026-10-01 19:45:17] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 0, full token usage: 0.00, mamba usage: 0.06, mamba evictable: 12, mamba avail: 3, kv evictable: 21210, #running-req: 0,
+[2026-10-01 19:45:18] HiCache host staging: dropped 3 host copies (291 tokens) of device-resident nodes already in L3 for prefetch; wanted 167, host free 640
+[2026-10-01 19:45:26] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 17920, full token usage: 0.14, mamba usage: 0.12, mamba evictable: 11, mamba avail: 3, kv evictable: 3043, #running-re
+[2026-10-01 19:45:26] Prefill batch, #new-seq: 1, #new-token: 5, #cached-token: 0, full token usage: 0.14, mamba usage: 0.19, mamba evictable: 11, mamba avail: 2, kv evictable: 2541, #running-req: 0, 
+[2026-10-01 19:45:27] Sanity check FAILED (1 violations across 20 nodes):
+AssertionError: Sanity check FAILED (1 violations across 20 nodes):

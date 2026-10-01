@@ -54,3 +54,20 @@ efeu-TP14 2026-10-01 -- omp cache miss at 18:14:42 (43464-token turn, 17920 cach
   2 GiB free floor. Verdict: no gain worth the wedge risk; the lever at depth
   is the extend-attention kernel, not the chunk. Anchors: request-end anchors
   are exact regardless of chunk; chunk anchors only matter after divergence.
+
+19:45:27 CRASH (ring on, backend_185833) and correction
+  The on-idle invariant checker (scheduler on_idle -> tree_cache.sanity_check)
+  raised "node 22 backed up but parent 21 not backed up": exactly the state
+  the ring creates on purpose (parent resident + in L3, host copy dropped,
+  child backed up). sanity_check still enforced the upstream rule (it already
+  exempts write_back for this pair); the tombstone state ("dead: no Full
+  device and no Full host") would have tripped it next. My first tests never
+  called sanity_check.  The front door restarted the backend (19:46:28; that
+  boot came up with only 109206 KV tokens); the gated restart with the ring
+  OFF (env 0, preserve_thinking kept) ran at ~20:03, pool 131076 again.
+  Fix: patch_host_staging_ring_sanity.py (resident+l3_persisted parent and
+  ring tombstones accepted; a childless tombstone stays an error). Tests now
+  run sanity_check plus device/host/mamba-host pool balance after EVERY
+  scenario, for Full and Full+Mamba: 20/20 patched, 16/20 fail unpatched
+  (incl. the 19:45 crash shape). Upstream suite on CPU still 635/212 identical.
+  The ring stays OFF in production until a runtime soak in an idle window.
