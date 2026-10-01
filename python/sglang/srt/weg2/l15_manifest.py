@@ -33,7 +33,13 @@ from typing import Optional, Tuple
 class HoldSpan:
     """One held context: its request id, the hold depth, the L1 slots it
     occupies, the anchor slot it is pinned to, and where its suffix lives in
-    L2 (slots plus the generation each L2 slot was written at)."""
+    L2 (slots plus the generation each L2 slot was written at).
+
+    ``anchor_l2_slot``/``anchor_l2_gen`` are the anchor state's L2 identity
+    (mamba arena slot and generation; -1/-1 = absent), recorded at sleep so
+    the cap-0 wake can refill the anchor (L15-12-PART3 sec 8). The
+    fingerprint covers ALL span fields, so the anchor L2 identity is part of
+    the group agreement: ranks that disagree on it fall back together."""
 
     rid: str
     depth: int
@@ -41,6 +47,8 @@ class HoldSpan:
     anchor_slot: int
     l2_slots: Tuple[int, ...]
     l2_gens: Tuple[int, ...]
+    anchor_l2_slot: int = -1
+    anchor_l2_gen: int = -1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,6 +112,8 @@ def _span_to_dict(s: HoldSpan) -> dict:
         "anchor_slot": s.anchor_slot,
         "l2_slots": list(s.l2_slots),
         "l2_gens": list(s.l2_gens),
+        "anchor_l2_slot": s.anchor_l2_slot,
+        "anchor_l2_gen": s.anchor_l2_gen,
     }
 
 
@@ -176,6 +186,9 @@ def from_json(s: str) -> Manifest:
                 anchor_slot=_as_int(sp, "anchor_slot", where),
                 l2_slots=_int_list(sp, "l2_slots", where),
                 l2_gens=_int_list(sp, "l2_gens", where),
+                # L15-12c-E2a: optional -- a pre-E2a record loads as -1/-1
+                anchor_l2_slot=int(sp.get("anchor_l2_slot", -1)),
+                anchor_l2_gen=int(sp.get("anchor_l2_gen", -1)),
             )
         )
     return Manifest(

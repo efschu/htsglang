@@ -264,6 +264,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
     complete_write = ArenaMHAHostPool.complete_write
     abort_write = ArenaMHAHostPool.abort_write
     _slots_of = ArenaMHAHostPool._slots_of
+    # L15-12c-E2a: the anchor's L2 identity reads the same complete census
+    # (self.arena.complete_census); nothing mamba-specific in the body.
+    slot_gens = ArenaMHAHostPool.slot_gens
     # xsn356: the borrowed _claim/complete_write/abort_write call these too
     _pend_mark = ArenaMHAHostPool._pend_mark
     _pend_pop = ArenaMHAHostPool._pend_pop

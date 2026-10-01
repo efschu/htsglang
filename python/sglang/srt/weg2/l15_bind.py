@@ -175,6 +175,42 @@ def chain_host_rows(node) -> Tuple[int, ...]:
     return tuple(rows)
 
 
+def anchor_host_row(node, anchor_slot: int) -> int:
+    """L15-12c-E2a: the host row carrying the req's mamba ANCHOR state.
+
+    Walk last_node -> root; the node whose component_data[ComponentType.
+    MAMBA] device value contains ``anchor_slot`` contributes the first row
+    of its host_value (one state per node, one state per arena slot). The
+    walk starts at the node itself: at sleep the anchor lives in the chain
+    (the same node whose value holds it, host_value its L2 copy). No such
+    node, or one without a host_value (never written to L2), answers -1.
+    Read at BIND time like chain_host_rows: reset_keep nulls host_value
+    on the kept nodes afterwards.
+    """
+    cur = node
+    while cur is not None:
+        try:
+            cd = cur.component_data[ComponentType.MAMBA]
+        except (AttributeError, KeyError, IndexError, TypeError):
+            cd = None  # duck-typed/odd node: keep walking
+        val = getattr(cd, "value", None) if cd is not None else None
+        if val is not None:
+            try:
+                ids = [
+                    int(x)
+                    for x in (val.tolist() if hasattr(val, "tolist") else val)
+                ]
+            except TypeError:  # scalar value: a one-element list
+                ids = [int(val)]
+            if anchor_slot in ids:
+                hv = getattr(cd, "host_value", None)
+                if hv is None or not len(hv):
+                    return -1
+                return int(hv.tolist()[0] if hasattr(hv, "tolist") else hv[0])
+        cur = getattr(cur, "parent", None)
+    return -1
+
+
 def build_retain_kwargs(
     reqs: Iterable,
     req_to_token,
@@ -194,6 +230,7 @@ def build_retain_kwargs(
     log: Callable[[str], None],
     mamba_allocator=None,
     host_pool=None,
+    mamba_host_pool=None,
 ) -> Dict:
     """Assemble the whole retain_at_sleep keyword set from live reqs.
 
@@ -205,6 +242,9 @@ def build_retain_kwargs(
     by_rid = {}
     entries = []
     l2_rows = []  # (rid, chain host rows truncated to the KV span)
+    # L15-12c-E2a: (rid, mamba anchor host row, -1 when absent) -- the
+    # anchor state's L2 identity, snapshot at bind like the KV rows.
+    anchor_rows = []
     for req in reqs:
         rid = str(req.rid)
         by_rid[rid] = req
@@ -241,6 +281,16 @@ def build_retain_kwargs(
             _rows = ()
         if _rows:
             l2_rows.append((rid, _rows))
+        # L15-12c-E2a: the anchor's host row from the chain node that
+        # carries the req's anchor device slot; best-effort (-1 on any
+        # missing piece -- the anchor columns then read (-1, -1)).
+        try:
+            anchor_rows.append(
+                (rid, anchor_host_row(node_of_req(req),
+                                      anchor_slot_of_req(req)))
+            )
+        except ValueError:
+            anchor_rows.append((rid, -1))
         _owned = tuple(owner_of(s, prefix) for s in _slots)
         _n = len(prefix) - 1
         entries.append(
@@ -296,6 +346,33 @@ def build_retain_kwargs(
                 tuple(int(gen_of.get(s, -1)) for s in per),
             )
 
+    # L15-12c-E2a: anchor host row -> (mamba arena slot, generation). One
+    # state per slot: slot = row - staging_rows; a row below staging_rows
+    # is staging-only -> (-1, -1), as is any row without a pool to ask.
+    # The pool is the kwarg (tests) or the live one on the bound
+    # reset_keep's cache_controller: ``mamba_pool_host``, the controller-
+    # side name of the component's _mamba_pool_host
+    # (hybrid_pool_assembler._COMPONENT_HOST_ATTR).
+    mpool = mamba_host_pool
+    if mpool is None:
+        _mc = getattr(getattr(reset_keep, "__self__", None),
+                      "cache_controller", None)
+        mpool = getattr(_mc, "mamba_pool_host", None)
+    anchor_l2_by_rid: Dict[str, Tuple[int, int]] = {}
+    if anchor_rows and mpool is not None:
+        _ms = int(getattr(mpool, "staging_rows", 0))
+        _slot_row = {rid: (r - _ms if r >= _ms else -1)
+                     for rid, r in anchor_rows}
+        _want = sorted({s for s in _slot_row.values() if s >= 0})
+        _agen: Dict[int, int] = {}
+        if _want:
+            for s, g in zip(_want, mpool.slot_gens(_want)):
+                _agen[int(s)] = int(g)
+        for rid, s in _slot_row.items():
+            anchor_l2_by_rid[rid] = (
+                s, int(_agen.get(s, -1)) if s >= 0 else -1
+            )
+
     def node_of(rid: str):
         return node_of_req(by_rid[rid])
 
@@ -316,6 +393,8 @@ def build_retain_kwargs(
         "slots_of": slots_of,
         "anchor_slot_of": anchor_slot_of,
         "l2_of": l2_of,
+        # L15-12c-E2a: the anchor's L2 identity, (-1, -1) when absent.
+        "anchor_l2_of": lambda rid: anchor_l2_by_rid.get(rid, (-1, -1)),
         "caps_rows_by_rank": caps_rows_by_rank,
         "cap_anchor_slots": cap_anchor_slots,
         "prefix": prefix,

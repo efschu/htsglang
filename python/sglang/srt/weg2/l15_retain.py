@@ -203,6 +203,12 @@ def _owner_rows(prefix: Sequence[int], rank: int) -> Callable[[int], Optional[in
     return owner_rows
 
 
+def _no_anchor_l2(rid: str) -> Tuple[int, int]:
+    """Default anchor_l2_of: no anchor L2 identity recorded (-1, -1) --
+    the pre-E2a behaviour for callers that do not supply the callable."""
+    return (-1, -1)
+
+
 def retain_at_sleep(
     *,
     candidates: Iterable,
@@ -210,6 +216,7 @@ def retain_at_sleep(
     slots_of: Callable[[str], Sequence[int]],
     anchor_slot_of: Callable[[str], int],
     l2_of: Callable[[str], Tuple[Sequence[int], Sequence[int]]],
+    anchor_l2_of: Callable[[str], Tuple[int, int]] = _no_anchor_l2,
     rewrite_tree: Callable[
         [object, Dict[int, int], Dict[int, int], set], None
     ],
@@ -344,6 +351,9 @@ def retain_at_sleep(
             anchor_slot=new_anchors[rid],
             l2_slots=tuple(int(x) for x in l2_of(rid)[0]),
             l2_gens=tuple(int(x) for x in l2_of(rid)[1]),
+            # L15-12c-E2a: the anchor's L2 identity for the cap-0 wake
+            anchor_l2_slot=int(anchor_l2_of(rid)[0]),
+            anchor_l2_gen=int(anchor_l2_of(rid)[1]),
         )
         for rid in hs.rids
     )
