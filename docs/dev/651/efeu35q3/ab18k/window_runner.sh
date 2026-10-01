@@ -36,6 +36,8 @@ run_guarded() {  # run "$@" in its own process group; kill it on a knock
 echo "=== window_runner start $(date -Is)"
 # the staged production config is applied first (apply_when_quiet.sh)
 until grep -q "APPLY DONE" logs/apply_when_quiet.log 2>/dev/null; do sleep 30; done
+# and after the single prompt-logprob probe (it needs the service UP)
+until grep -q "probe done" results/logprob_tiling_probe.txt 2>/dev/null; do sleep 30; done
 until quiet; do sleep 30; done
 echo "$(date +%T) quiet window: $(st)"
 rm -f $KNOCK
