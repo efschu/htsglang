@@ -151,6 +151,25 @@ def _read_stages_line(operation, total_ms: float) -> None:
     except Exception:  # noqa: BLE001 -- an instrument never breaks a read
         pass
 
+def _note_l3_read(controller, operation) -> None:
+    """RANK-TIMING (rankstats ``cache.l3`` / ``cache.prefetch``): one store read
+    at its end -- read ms (the read's own clock), issue -> end ms, pages landed,
+    bytes (pages x the host pool's bytes per token). The aux thread's own
+    stamps; an instrument never breaks a read."""
+    try:
+        from sglang.srt.weg2 import rank_timing as _rank_timing  # stdlib only
+
+        tok = int(operation.completed_tokens)
+        ps = max(1, int(controller.page_size))
+        spt = int(getattr(controller.mem_pool_host, "size_per_token", 0) or 0)
+        _rank_timing.note_l3_read(
+            (operation.read_end_time - operation.read_start_time) * 1000.0,
+            pages=tok // ps, nbytes=tok * spt,
+            prefetch_ms=(operation.read_end_time - float(operation.start_time)) * 1000.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 device_module = get_device_module()
 
 
@@ -4039,6 +4058,7 @@ class HiCacheController:
                 self._page_transfer(operation)
                 operation.read_end_time = time.monotonic()
                 _read_stages_line(operation, (operation.read_end_time - operation.read_start_time) * 1000.0)
+                _note_l3_read(self, operation)  # RANK-TIMING: rankstats cache.l3 / prefetch
                 # #257: what the read did not take, the probe gives back
                 _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-end")
                 # operation terminated by controller, release pre-allocated memory

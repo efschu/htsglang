@@ -1509,10 +1509,19 @@ class MambaPool:
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
 
-    def reset_state(self):
+    def reset_state(self, keep_rows: int = 0):
         """Return every device buffer of the pool to its freshly-initialized
         (all-zero) contents: conv/temporal states, spec intermediate caches,
         GDN ReplaySSM rings and their per-slot write cursors.
+
+        ``keep_rows`` (L15-11b, the D-rank sleep flush): when > 0, the held
+        rows ``[0, keep_rows)`` of every SLOT-AXIS buffer keep their bytes
+        and only slots ``[keep_rows:)`` are zeroed. The hold set is compacted
+        into mamba slots ``[1, A_H)`` (slot 0 is padding, never held), so the
+        caller passes ``keep_rows = A_H`` and spares the anchors plus padding.
+        ``keep_rows == 0`` (default) is today's byte-identical full-zero
+        path. Buffers keyed by request/spec row (spec intermediates, the S2
+        spec-ring cursors) have no slot axis and are always zeroed in full.
 
         Used by the idle-time cache flush: freeing the slots alone is not
         enough — recycled slots whose per-slot metadata (most notably
@@ -1529,22 +1538,43 @@ class MambaPool:
         nondeterministically, which is worse than not resetting at all).
         """
         self._sync_device()
+        # Slot-axis spares for the sleep flush: keep_rows <= 0 -> identity,
+        # i.e. today's byte-identical zeroing. The slot axis is dim 1 for the
+        # (layers, slots, ...) state tensors and dim 0 for the 1-D per-slot
+        # cursors.
+        def _keep1(t: torch.Tensor) -> torch.Tensor:
+            return t if keep_rows <= 0 else t[keep_rows:]
+
+        def _keep2(t: torch.Tensor) -> torch.Tensor:
+            return t if keep_rows <= 0 else t[:, keep_rows:]
+
         raw = getattr(self, "_raw", None)
         if raw is not None:
-            # Envelope layout: conv/temporal are views into one byte buffer.
-            raw.zero_()
+            if keep_rows <= 0:
+                # Envelope layout: conv/temporal are views into one byte buffer.
+                raw.zero_()
+            else:
+                # Envelope: the held rows live in the SAME byte buffer, so
+                # zero the per-slot views for slots [keep_rows:) only -- a
+                # raw.zero_() here would wipe the anchors the flush must keep.
+                for conv in self.mamba_cache.conv:
+                    _keep2(conv).zero_()
+                _keep2(self.mamba_cache.temporal).zero_()
         else:
             for conv in self.mamba_cache.conv:
-                conv.zero_()
+                _keep2(conv).zero_()
             # H95c (weg2/d_seat_vram.py): in a D phase of n < cap seats only
             # slots [0, keep) of every layer have pages behind them; a zero_()
             # over the whole tensor would write into the unmapped tail (the
             # CAMPAIGN (a) fault). None = every slot mapped (the stock path).
             _seat_keep = getattr(self, "_weg2_seat_keep", None)
             if _seat_keep is None:
-                self.mamba_cache.temporal.zero_()
+                _keep2(self.mamba_cache.temporal).zero_()
             else:
-                self.mamba_cache.temporal[:, : int(_seat_keep)].zero_()
+                # keep_rows and the seat cap intersect: never zero a held row,
+                # never write past the mapped tail (an empty slice is a no-op
+                # when keep_rows >= seat cap).
+                self.mamba_cache.temporal[:, keep_rows : int(_seat_keep)].zero_()
         for name in (
             "replayssm_d",
             "replayssm_k",
@@ -1554,7 +1584,8 @@ class MambaPool:
         ):
             t = getattr(self.mamba_cache, name, None)
             if t is not None:
-                t.zero_()
+                # (layers, slots, ...) ring buffers: slot axis dim 1.
+                _keep2(t).zero_()
         if isinstance(self.mamba_cache, self.SpeculativeState):
             # None under the ReplaySSM spec ring (not allocated)
             if self.mamba_cache.intermediate_ssm is not None:
@@ -1570,7 +1601,8 @@ class MambaPool:
             ):
                 t.zero_()
         if self.replayssm_write_pos is not None:
-            self.replayssm_write_pos.zero_()
+            # Per-slot write cursors (1-D, slot axis dim 0).
+            _keep1(self.replayssm_write_pos).zero_()
         # 27B ReplaySSM package (S2): the spec ring's request-row cursors
         for name in (
             "replayssm_spec_write_pos",
@@ -2868,7 +2900,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # #991: the stamp describes the slot, so it dies with it.
         req.mamba_slot_acquired_this_admission = False
 
-    def clear(self):
+    def clear(self, keep_mamba_rows: int = 0):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
@@ -2877,7 +2909,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # intermediates): freed slot ids get recycled, and any surviving
         # per-slot metadata would make a flushed server behave differently
         # from a freshly started one.
-        self.mamba_pool.reset_state()
+        #
+        # keep_mamba_rows > 0 (L15-11b, the D-rank sleep flush): spare the
+        # held mamba rows [0, keep_mamba_rows) so the compacted anchors
+        # (weg2/l15_retain.py, slots [1, A_H), slot 0 = padding) survive the
+        # flush. Default 0 = today's byte-identical full reset.
+        if keep_mamba_rows > 0:
+            logger.info("L15-KEEP mamba reset kept rows [0, %d)", keep_mamba_rows)
+        self.mamba_pool.reset_state(keep_rows=keep_mamba_rows)
         self.short_conv_pool.clear()
         self.ngram_pool.clear()
         # The int8 checkpoint pool holds radix-cached states in its own slots; a

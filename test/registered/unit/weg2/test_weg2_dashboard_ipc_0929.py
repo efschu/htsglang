@@ -112,7 +112,9 @@ class TestFirstWorkClock(CustomTestCase):
         self.assertIsNone(c.seen("D", "decode_token", "r0", 5.0))  # nothing armed
         c.arm(3, "P", "D", 100.0)
         self.assertIsNone(c.seen("P", "p_leg1_dispatch", "r1", 100.5))  # the sleeping group
-        ev = c.seen("D", "decode_token", "r2", 102.25)
+        # 01.10.: before `done`, D content counts only for a leg 2 dispatched in
+        # this flip (test_weg2_front_dash_ipc_1001: a stale chunk does not)
+        ev = c.seen("D", "decode_token", "r2", 102.25, leg2_dispatch_ts=100.2)
         self.assertEqual((ev["epoch"], ev["dir"], ev["flip_time_ms"], ev["rid"]), (3, "P>D", 2250, "r2"))
         self.assertEqual(ev["clock"], "time.time front")
         self.assertIsNone(c.seen("D", "decode_token", "r3", 103.0))  # once per flip

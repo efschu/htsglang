@@ -37,6 +37,7 @@ from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
+from sglang.srt.weg2 import rank_timing as _rank_timing  # RANK-TIMING: L2 load-back ms
 from sglang.srt.managers.weg2_min_hit import note_min_hit_tokens  # PARK-RETAIN READ
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1460,6 +1461,91 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def reset(self) -> None:
         self._reset_full()
+
+    def reset_keep(self, keep_nodes) -> None:
+        """Partial tree reset (AP L15-06, tree half of the L1.5 hold).
+
+        ``keep_nodes`` are tree nodes (typically each request's last node).
+        The new tree contains exactly the union of the chains
+        root -> kept node, re-attached to the fresh root as the SAME node
+        objects; everything else is dropped. With an empty iterable this is
+        ``_reset_full`` verbatim.
+
+        Pure tree bookkeeping: NO KV/Mamba pool memory is freed here, for
+        kept nodes nor for dropped ones. THE CALLER MUST KEEP THE SLOTS OF
+        THE KEPT NODES ALLOCATED IN THE ALLOCATOR (wired in L15-11); the
+        dropped nodes' device indices are handed back by the caller's own
+        release path, exactly as with ``reset()``. Host arena references of
+        the old tree -- including the kept chains' host copies -- are
+        released as in ``_reset_full`` -- but the release SKIPS host-locked
+        or write-pending nodes and does not clear their ``host_value``, so
+        ``reset_keep`` itself nulls ``host_value`` and
+        ``write_through_pending_id`` on every kept node: after the call the
+        kept chains are device-only (``backuped`` False) and no stale ack can
+        land on a dead pending entry. A kept node the release skipped keeps
+        its arena reference unreturned; that is acceptable and is logged by
+        the reset as #1424e. Kept nodes are unlocked (lock_ref 0 for every
+        component) so no request holds them across a sleep.
+        """
+        keep = [n for n in keep_nodes if n is not self.root_node]
+        if not keep:
+            self._reset_full()
+            return
+        # Union of the chains root -> kept node, root excluded. Identity
+        # membership: nodes are unique objects and the walk stops at the
+        # first ancestor already collected (chains share their prefixes).
+        keep_set: set[UnifiedTreeNode] = set()
+        for node in keep:
+            cur = node
+            while (
+                cur is not None
+                and cur is not self.root_node
+                and cur not in keep_set
+            ):
+                keep_set.add(cur)
+                cur = cur.parent
+        # Everything _reset_full does for the tree: prefetch pins, host
+        # arena values, deferred publish/cap state, counters, fresh root
+        # (lock_ref 1), empty LRU lists and leaf sets, zeroed sizes.
+        self._reset_full()
+        root = self.root_node
+        for node in keep_set:
+            for cd in node.component_data:
+                cd.lock_ref = 0
+                cd.host_lock_ref = 0
+                # _release_host_values_before_reset (inside _reset_full above)
+                # gives the arena rows back but never clears host_value, so
+                # without this the kept node would still read backuped=True at
+                # a released/reused row -- a device eviction would keep the
+                # stale pointer and a load-back would read foreign KV.
+                cd.host_value = None
+            # Its ack would land on a dead pending entry.
+            if node.write_through_pending_id is not None:
+                node.write_through_pending_id = None
+            # Drop every child not on a kept chain, then re-file the
+            # top-level nodes under the new root (their old parent -- the
+            # old root -- is gone; deeper parents are kept objects already
+            # wired through the surviving children dicts).
+            node.children = {
+                k: c for k, c in node.children.items() if c in keep_set
+            }
+            if node.parent is None or node.parent not in keep_set:
+                node.parent = root
+                root.children[node.key.child_key(self.page_size)] = node
+        # Sizes from the surviving device values; protected stays 0 (all
+        # kept nodes were unlocked above).
+        for ct in self.tree_components:
+            total = 0
+            for node in keep_set:
+                value = node.component_data[ct].value
+                if value is not None:
+                    total += len(value)
+            self.component_evictable_size_[ct] = total
+        for node in keep_set:
+            self._for_each_component_lru(
+                node, UnifiedLRUList.insert_mru, skip_existing=True
+            )
+            self._update_evictable_leaf_sets(node)
 
     def weg2_node_depth(self, node) -> int:
         """Token depth at the END of ``node`` (its key plus every ancestor's)
@@ -8334,6 +8420,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 (_bytes / (_read_ms / 1000.0) / 1e9) if _read_ms > 0 else -1.0,
                 int(insert_result.prefix_len), int(loaded_from_storage),
             )
+            # L15-02b: if this req was in the last sleep's shadow hold set, price
+            # the load-back it would have saved. Log-only, never raises.
+            try:
+                from sglang.srt.weg2 import l15_shadow
+
+                if l15_shadow.shadow_on(os.environ):
+                    _l15_line = l15_shadow.LEDGER.note_load(req_id, _ms, _read_ms)
+                    if _l15_line is not None:
+                        logger.info("%s", _l15_line)
+            except Exception:  # noqa: BLE001 - shadow must never break a load-back
+                pass
         except Exception as _ie:  # noqa: BLE001 -- an instrument never kills the prefetch
             # xsn289: 27 prefetch successes on D, 0 WEG2-LOAD-DEVICE lines and
             # this branch silent at DEBUG -- an instrument that fails must SAY
@@ -9931,6 +10028,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 try:
                     _tok, _bpt, _t0 = _m
                     _ms = float(start_event.elapsed_time(finish_event))
+                    # RANK-TIMING (rankstats cache.loadback_*): the landed events' ms
+                    _rank_timing.note_loadback(_ms, pages=-(-int(_tok) // max(1, int(self.page_size))),
+                                               nbytes=int(_tok) * int(_bpt))
                     logger.info(
                         "WEG2-LOAD-DEVICE tokens=%d mib=%.0f gpu_ms=%.0f wall_ms=%.0f "
                         "GB/s=%.2f (bytes = tokens x 2 x layers x cell on THIS rank; "

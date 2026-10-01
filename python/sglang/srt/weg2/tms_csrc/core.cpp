@@ -38,7 +38,14 @@ static uint64_t weg2_plan_bytes(const AllocationMetadata& md) {
 
 static uint64_t weg2_mapped_bytes(const AllocationMetadata& md) {
     if (md.state != AllocationState::ACTIVE) {
-        return 0;
+        // L15-13a: a PAUSED allocation's kept spans stay physically mapped
+        // (patch 6).  Report the staying extents' bytes; a stock or keep-less
+        // pause leaves weg2_extents empty, so this still reads 0, as before.
+        uint64_t staying = 0;
+        for (size_t i = 0; i < md.weg2_extents.size(); ++i) {
+            staying += (uint64_t) md.weg2_extents[i].size;
+        }
+        return staying;
     }
     if (md.weg2_extents.empty()) {
         return (uint64_t) md.size;
@@ -99,6 +106,40 @@ static CUresult weg2_map_ranges(void* ptr, const AllocationMetadata& md,
         out->push_back(Weg2SpanExtent{off, len, h});
     }
     return CUDA_SUCCESS;
+}
+
+//: PATCH 6: the parts of ``want`` (sorted, disjoint) that the disjoint extents
+//: in ``have`` do not cover -- the very walk set_spans has always used for its
+//: apply-now gaps; resume uses it for the kept-extent gaps.
+static std::vector<std::pair<size_t, size_t>> weg2_gaps_not_covered(
+    const std::vector<std::pair<size_t, size_t>>& want,
+    const std::vector<Weg2SpanExtent>& have) {
+    std::vector<std::pair<size_t, size_t>> gaps;
+    for (size_t k = 0; k < want.size(); ++k) {
+        size_t cur = want[k].first;
+        while (cur < want[k].second) {
+            size_t next_start = want[k].second;
+            size_t covered_to = cur;
+            for (size_t i = 0; i < have.size(); ++i) {
+                size_t s = have[i].offset;
+                size_t e2 = have[i].offset + have[i].size;
+                if (s <= cur && e2 > cur) {
+                    covered_to = e2;
+                    break;
+                }
+                if (s > cur && s < next_start) {
+                    next_start = s;
+                }
+            }
+            if (covered_to > cur) {
+                cur = covered_to;
+                continue;
+            }
+            gaps.push_back(std::make_pair(cur, next_start));
+            cur = next_start;
+        }
+    }
+    return gaps;
 }
 #endif
 
@@ -244,6 +285,26 @@ uint64_t TorchMemorySaver::tag_bytes(const std::string& tag) {
     return total;
 }
 
+// L15-13a -- the PHYSICAL bytes mapped NOW for a tag: unlike tag_bytes above
+// ("mapped now or planned for the next resume", the H95c seat budget), kept
+// spans of a PAUSED allocation count here.
+uint64_t TorchMemorySaver::tag_mapped_bytes(const std::string& tag) {
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    uint64_t total = 0;
+    for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
+        if (tag.empty() || it->second.tag == tag) {
+#if defined(USE_CUDA)
+            total += weg2_mapped_bytes(it->second);
+#else
+            total += it->second.state == AllocationState::ACTIVE
+                         ? static_cast<uint64_t>(it->second.size)
+                         : 0;
+#endif
+        }
+    }
+    return total;
+}
+
 int TorchMemorySaver::backed_up_tag_bytes(char* out, size_t len) {
     if (out == nullptr || len == 0) {
         return -1;
@@ -356,34 +417,50 @@ int TorchMemorySaver::set_spans(void* ptr, size_t n, const uint64_t* lo, const u
         }
     }
     // the parts of ``want`` no kept extent covers (extents are disjoint)
-    std::vector<std::pair<size_t, size_t>> gaps;
-    for (size_t k = 0; k < want.size(); ++k) {
-        size_t cur = want[k].first;
-        while (cur < want[k].second) {
-            size_t next_start = want[k].second;
-            size_t covered_to = cur;
-            for (size_t i = 0; i < kept.size(); ++i) {
-                size_t s = kept[i].offset;
-                size_t e2 = kept[i].offset + kept[i].size;
-                if (s <= cur && e2 > cur) {
-                    covered_to = e2;
-                    break;
-                }
-                if (s > cur && s < next_start) {
-                    next_start = s;
-                }
-            }
-            if (covered_to > cur) {
-                cur = covered_to;
-                continue;
-            }
-            gaps.push_back(std::make_pair(cur, next_start));
-            cur = next_start;
-        }
-    }
+    std::vector<std::pair<size_t, size_t>> gaps = weg2_gaps_not_covered(want, kept);
     md.weg2_extents = kept;
     CUresult rc = weg2_map_ranges(ptr, md, gaps, &md.weg2_extents);
     return rc == CUDA_SUCCESS ? 0 : (int) rc;
+#else
+    #error "USE_PLATFORM is not set"
+#endif
+}
+
+// PATCH 6 (KEEP SPANS): the keep set is stored, never applied here -- a
+// mapping change belongs to the next pause/resume.  The MiB->fraction-free
+// ranges are validated exactly like a set_spans plan (aligned, sorted,
+// disjoint, inside the allocation); n == 0 CLEARS the keep set (= patch-5
+// pause/resume).  No implicit extra retention beyond what the user set.
+int TorchMemorySaver::set_keep_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi) {
+#if defined(USE_ROCM)
+    return -5;
+#elif defined(USE_CUDA)
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    auto it = allocation_metadata_.find(ptr);
+    if (it == allocation_metadata_.end()) {
+        return -1;
+    }
+    AllocationMetadata& md = it->second;
+    if (md.enable_cpu_backup) {
+        return -2;
+    }
+    size_t g = 0;
+    if (weg2_granularity(md.device, &g) != CUDA_SUCCESS || g == 0) {
+        return -4;
+    }
+    std::vector<std::pair<size_t, size_t>> keep;
+    size_t prev_hi = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t a = (size_t) lo[i];
+        size_t b = (size_t) hi[i];
+        if (b <= a || a % g != 0 || b % g != 0 || b > md.size || (i > 0 && a < prev_hi)) {
+            return -3;
+        }
+        keep.push_back(std::make_pair(a, b));
+        prev_hi = b;
+    }
+    md.weg2_keep = keep;
+    return 0;
 #else
     #error "USE_PLATFORM is not set"
 #endif
@@ -586,21 +663,45 @@ void TorchMemorySaver::pause(const std::string& tag) {
         weg2_pause_sub.allocations += 1;
         if (metadata.weg2_extents.empty()) {
             CURESULT_CHECK(timed_unmap_release(ptr, metadata.size, metadata.allocHandle, &weg2_pause_sub));
-        } else if (pause_coalesce_) {
-            // PAUSE-MAPS: one cuMemUnmap per contiguous run of extents.
-            CUresult first = unmap_extents_coalesced(ptr, metadata.weg2_extents, &weg2_pause_sub);
-            metadata.weg2_extents.clear();
-            CURESULT_CHECK(first);
         } else {
-            // H95c: every extent of a span-mapped allocation goes back.
-            weg2_pause_sub.extents += (uint64_t) metadata.weg2_extents.size();
-            CUresult first = CUDA_SUCCESS;
+            // PATCH 6 (KEEP SPANS): an extent WHOLLY inside a keep range stays
+            // mapped and unreleased -- only the extents that go reach the two
+            // patch-5 branches below, so an EMPTY keep set (going == all,
+            // staying == none) makes the same calls in the same order as
+            // before.  A kept extent survives PAUSED with its handle; resume
+            // maps the plan's gaps around it.
+            std::vector<Weg2SpanExtent> staying;
+            std::vector<Weg2SpanExtent> going;
             for (size_t i = 0; i < metadata.weg2_extents.size(); ++i) {
                 const Weg2SpanExtent& e = metadata.weg2_extents[i];
-                CUresult rc = timed_unmap_release((char*) ptr + e.offset, e.size, e.handle, &weg2_pause_sub);
-                if (rc != CUDA_SUCCESS && first == CUDA_SUCCESS) first = rc;
+                bool kept = false;
+                for (size_t k = 0; k < metadata.weg2_keep.size(); ++k) {
+                    if (e.offset >= metadata.weg2_keep[k].first &&
+                        e.offset + e.size <= metadata.weg2_keep[k].second) {
+                        kept = true;
+                        break;
+                    }
+                }
+                if (kept) {
+                    staying.push_back(e);
+                } else {
+                    going.push_back(e);
+                }
             }
-            metadata.weg2_extents.clear();
+            CUresult first = CUDA_SUCCESS;
+            if (pause_coalesce_) {
+                // PAUSE-MAPS: one cuMemUnmap per contiguous run of going extents.
+                first = unmap_extents_coalesced(ptr, going, &weg2_pause_sub);
+            } else {
+                // H95c: every going extent of a span-mapped allocation goes back.
+                weg2_pause_sub.extents += (uint64_t) going.size();
+                for (size_t i = 0; i < going.size(); ++i) {
+                    const Weg2SpanExtent& e = going[i];
+                    CUresult rc = timed_unmap_release((char*) ptr + e.offset, e.size, e.handle, &weg2_pause_sub);
+                    if (rc != CUDA_SUCCESS && first == CUDA_SUCCESS) first = rc;
+                }
+            }
+            metadata.weg2_extents = staying;
             CURESULT_CHECK(first);
         }
 
@@ -672,8 +773,16 @@ int TorchMemorySaver::resume(const std::string& tag) {
 
         // H95c (patch 3): an allocation with a span plan maps exactly its plan,
         // one handle per range; the rest of its VA stays reserved and empty.
+        // PATCH 6 (KEEP SPANS): extents the pause kept mapped are NOT re-mapped
+        // (their handle and bytes survive); only the plan's gaps they do not
+        // cover get fresh pages.  Without kept extents this is exactly patch 5.
         if (!metadata.weg2_plan.empty()) {
-            CUresult span_rc = weg2_map_ranges(ptr, metadata, metadata.weg2_plan, &metadata.weg2_extents);
+            const bool weg2_had_kept = !metadata.weg2_extents.empty();
+            std::vector<std::pair<size_t, size_t>> weg2_to_map = metadata.weg2_plan;
+            if (weg2_had_kept) {
+                weg2_to_map = weg2_gaps_not_covered(metadata.weg2_plan, metadata.weg2_extents);
+            }
+            CUresult span_rc = weg2_map_ranges(ptr, metadata, weg2_to_map, &metadata.weg2_extents);
             if (span_rc != CUDA_SUCCESS) {
                 uint64_t weg2_rolled = 0;
                 for (size_t r = 0; r < m; ++r) {
@@ -693,6 +802,12 @@ int TorchMemorySaver::resume(const std::string& tag) {
                           << " tag_bytes=" << weg2_leg_bytes
                           << " -- every allocation of the tag is PAUSED again" << std::endl;
                 return (int) span_rc;
+            }
+            if (weg2_had_kept) {
+                // PATCH 6: kept extents and freshly mapped gaps interleave;
+                // restore the documented extent order (sorted by offset).
+                std::sort(metadata.weg2_extents.begin(), metadata.weg2_extents.end(),
+                          [](const Weg2SpanExtent& a, const Weg2SpanExtent& b) { return a.offset < b.offset; });
             }
             metadata.state = AllocationState::ACTIVE;
             continue;
