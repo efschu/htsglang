@@ -8336,6 +8336,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=insert_result,
                 pool_storage_result=operation.pool_storage_result,
             )
+        # ANCHOR-PIN (z30y15, P PP0 04:21:39Z, weg2-12-56): the #1417 pin above
+        # ran BEFORE this commit, when the chain's end node carried no mamba
+        # host value yet -- its mamba lock was skipped, and the anchor the
+        # commit just attached sat unlocked on the mamba host LRU. One mamba
+        # arena eviction later (#1427 ARENA-DROP, 112-slot arena) the prefix
+        # had no state: told-fidelity sent told=0, P re-prefilled 16383
+        # tokens. Re-taking the pin now locks the anchor with its chain until
+        # the admission pops it (same release as the KV pin).
+        if str(req_id) in (getattr(self, "_prefetch_span_pins", None) or {}):
+            self._pin_prefetched_span(
+                req_id, insert_result.inserted_host_node, last_host_node
+            )
 
         # #841: the matched head was never adopted (the tree already had it),
         # and when the contiguous-backup law declined the insert the fetched
