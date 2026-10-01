@@ -21,12 +21,29 @@ Interface (used by weg2/rpc_stall_watchdog.py; NF's weg2/tag_stall_sentinel.py c
 "Timeout (...)" + every thread's stack (its own thread left out); if the work still runs after
 ``repeat_s`` more seconds, one "Second dump" follows (``repeat_s <= 0``: none). ``dump_stacks`` is
 the formatter on its own. Writes and the caller's close are serialised by ``s.lock``.
+
+What the sampler can and cannot say (y6b, review cda5a88fee F1-F5), all on the monotonic clock:
+
+* ``first_late_ms`` -- how far past its deadline the FIRST dump started (None: no dump). The sampler
+  stamps it itself when it holds the GIL; the dump file's mtime is the LAST write (a Python stall
+  that outlives timeout+repeat_s read as ~8000 ms "late" from mtime) and lives on the wall clock (an
+  NTP step moved it by the step).
+* ``missed(s)`` -- the deadline passed, no dump was written. A stall that held the GIL in C until
+  the guarded work ENDED gives the sampler the GIL only after ``disarm`` set ``stop``: it wakes,
+  sees ``stop`` and leaves. The caller names it (duration from ``overdue_ms``); before y6b the file
+  was removed and nothing was logged.
+* A dump after a C stall shows the stacks AFTER the GIL came back -- the stalled C frame has
+  already returned. It names the duration, not the frame.
+* A GIL that is NEVER released (a C call wedged for good) gives no dump and no ``disarm``: the
+  caller's file stays at its header line. A header-only file is that verdict (or a dead process),
+  for whoever reads it next.
 """
 
 from __future__ import annotations
 
 import sys
 import threading
+import time
 import traceback
 from typing import Optional
 
@@ -49,7 +66,8 @@ def dump_stacks(fh, title: str, skip_ident: Optional[int] = None) -> None:
 
 
 class Sampler:
-    __slots__ = ("fh", "timeout_s", "repeat_s", "stop", "lock", "thread", "dumps")
+    __slots__ = ("fh", "timeout_s", "repeat_s", "stop", "lock", "thread", "dumps", "armed_mono",
+                 "first_late_ms")
 
     def __init__(self, fh, timeout_s: float, repeat_s: float = REPEAT_S):
         self.fh = fh
@@ -59,6 +77,13 @@ class Sampler:
         self.lock = threading.Lock()
         self.thread: Optional[threading.Thread] = None
         self.dumps = 0
+        self.armed_mono = time.monotonic()
+        self.first_late_ms: Optional[float] = None
+
+    def overdue_ms(self, now_mono: Optional[float] = None) -> float:
+        """How far past the first deadline ``now`` is (monotonic; <= 0: not yet due)."""
+        now = time.monotonic() if now_mono is None else now_mono
+        return (now - self.armed_mono - self.timeout_s) * 1000.0
 
     def _run(self) -> None:
         me = threading.get_ident()
@@ -73,6 +98,8 @@ class Sampler:
                 if self.stop.is_set() or getattr(self.fh, "closed", False):
                     return
                 try:
+                    if self.dumps == 0:
+                        self.first_late_ms = max(0.0, self.overdue_ms())
                     dump_stacks(self.fh, title, skip_ident=me)
                     self.dumps += 1
                 except Exception as exc:  # noqa: BLE001 -- an instrument never breaks the work
@@ -98,3 +125,9 @@ def disarm(s: Optional[Sampler], join_s: float = JOIN_S) -> None:
     s.stop.set()
     if s.thread is not None:
         s.thread.join(join_s)
+
+
+def missed(s: Optional[Sampler], ended_mono: Optional[float] = None) -> bool:
+    """After ``disarm``: the guarded work ended (``ended_mono``, default now) past the first
+    deadline and no dump was written (see the module text)."""
+    return s is not None and s.dumps == 0 and s.overdue_ms(ended_mono) >= 0.0

@@ -115,3 +115,74 @@ def test_a_gil_held_stall_is_named_by_late_ms(tmp_path, caplog):
     assert fired is not None and threading.active_count() >= 1
     line = next(m for m in caplog.messages if "TAG-STALL-SENTINEL fired" in m)
     assert "late_ms=" in line
+
+
+# ------------------------------------------------------------------ y6b
+# Review cda5a88fee: F1 a stall that held the GIL until the tag ended left no
+# evidence (the sampler woke to `stop`, the file was removed, nothing logged);
+# F2 late_ms came from the file's mtime = the LAST write (a repeat dump read as
+# ~8000 ms "late"), on the wall clock; F4 a GIL never released left a
+# header-only file nobody named; F7 a failed arm leaked the fd and the file.
+
+
+def test_y6b_a_stall_the_sampler_never_saw_is_named_not_removed(tmp_path, caplog):
+    import logging
+
+    ts = _sentinel()
+    with caplog.at_level(logging.WARNING):
+        armed = ts.arm("weights_2", rank=0, group="P", directory=str(tmp_path), timeout=0.2)
+        # the sampler woke only to `stop` -- what a GIL held in C until the tag's
+        # end leaves it (it gets the GIL after disarm set the event)
+        armed.sampler.stop.set()
+        armed.sampler.thread.join(1.0)
+        time.sleep(0.4)
+        fired = ts.disarm(armed)
+    assert fired is not None and os.path.exists(fired), "kept, not removed"
+    line = next(m for m in caplog.messages if "TAG-STALL-SENTINEL fired" in m)
+    assert "dump=missed" in line and "late_ms=" in line
+    assert "No dump" in open(fired).read()
+
+
+def test_y6b_late_ms_is_the_first_dump_not_the_last_write(tmp_path):
+    from sglang.srt.weg2 import stall_sampler
+
+    fh = open(tmp_path / "s.txt", "w")
+    fh.write("hdr\n")
+    s = stall_sampler.arm(fh, 0.2, repeat_s=0.3)
+    t0 = time.time()
+    time.sleep(0.8)                                 # a pure-Python tag: both dumps fire on time
+    stall_sampler.disarm(s)
+    fh.close()
+    assert s.dumps == 2
+    assert s.first_late_ms is not None and s.first_late_ms < 150, s.first_late_ms
+    mtime_late_ms = (os.stat(tmp_path / "s.txt").st_mtime - (t0 + 0.2)) * 1000
+    assert mtime_late_ms > 250, "the old reading: the repeat dump's mtime"
+    assert not stall_sampler.missed(s)
+
+
+def test_y6b_a_header_only_file_is_named_unreleased(tmp_path):
+    ts = _sentinel()
+    now = time.time()
+    old = tmp_path / "weg2_tagstall_P_r0_weights_0_1.txt"
+    old.write_text("%s group=P rank=0 tag=weights_0 armed_unix=%.3f timeout_s=1.500 pid=4242\n"
+                   % (ts.MARKER, now - 60))
+    fired = tmp_path / "weg2_tagstall_P_r0_weights_1_2.txt"
+    fired.write_text("%s group=P rank=0 tag=weights_1 armed_unix=%.3f timeout_s=1.500 pid=4242\n"
+                     "Timeout (1.5 s): ...\n" % (ts.MARKER, now - 60))
+    fresh = tmp_path / "weg2_tagstall_P_r0_weights_2_3.txt"
+    fresh.write_text("%s group=P rank=0 tag=weights_2 armed_unix=%.3f timeout_s=1.500 pid=4242\n"
+                     % (ts.MARKER, now))
+    rows = ts.unreleased(str(tmp_path), now_unix=now)
+    assert [r[0] for r in rows] == [str(old)], "header only AND past its timeout"
+    assert rows[0][3] == 4242
+
+
+def test_y6b_a_failed_arm_leaves_no_file(tmp_path, monkeypatch):
+    from sglang.srt.weg2 import stall_sampler
+
+    def boom(*a, **k):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(stall_sampler, "arm", boom)
+    assert _sentinel().arm("weights_0", rank=0, group="P", directory=str(tmp_path), timeout=0.2) is None
+    assert os.listdir(tmp_path) == []
