@@ -164,25 +164,36 @@ class Proxy:
         st = StreamState(body)
 
         async def keepalive():
-            await resp.write(b": waiting for backend\n\n")
+            await _write(resp, b": waiting for backend\n\n")
 
         for attempt in range(self.cfg.max_resumes + 1):
-            ids = await self.wait_backend(keepalive)
-            if not ids:
-                await _sse(resp, {"error": {"message": "no backend within hold time"}})
-                break
+            try:
+                ids = await self.wait_backend(keepalive)
+                if not ids:
+                    await _sse(resp, {"error": {"message": "no backend within hold time"}})
+                    break
+            except ClientGone as e:
+                log.info("stream %s: client gone while holding (%s)", st.id, e)
+                return resp
             req_body = st.request_body(ids[0])
             if attempt:
                 log.info("resume %s attempt %d: %d chars content, %d chars reasoning", st.id, attempt,
                          len(st.content), len(st.reasoning))
             try:
                 done = await self._pump(req_body, st, resp)
+            except ClientGone as e:
+                # 01.10.: a closed client used to count as a backend break -> 6 resumes against a dead socket.
+                log.info("stream %s: client gone (%s), not resuming", st.id, e)
+                return resp
             except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
                 log.warning("stream %s broke (%s)", st.id, e)
                 done = False
             if done:
                 break
-        await resp.write(b"data: [DONE]\n\n")
+        try:
+            await _write(resp, b"data: [DONE]\n\n")
+        except ClientGone:
+            pass
         return resp
 
     async def _pump(self, req_body: dict, st: "StreamState", resp) -> bool:
@@ -276,8 +287,19 @@ class StreamState:
         return chunk, fin
 
 
+class ClientGone(Exception):
+    """The downstream client closed its connection; nothing is left to resume for."""
+
+
+async def _write(resp, data: bytes) -> None:
+    try:
+        await resp.write(data)
+    except (ConnectionError, aiohttp.ClientConnectionResetError) as e:
+        raise ClientGone(str(e)) from e
+
+
 async def _sse(resp, obj: dict) -> None:
-    await resp.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+    await _write(resp, b"data: " + json.dumps(obj).encode() + b"\n\n")
 
 
 def build_app(cfg: Cfg) -> web.Application:

@@ -201,3 +201,25 @@ def test_models_survive_backend_gone(tmp_path):
             await brun.cleanup()
         return {m["id"]: m["live"] for m in data}
     assert asyncio.run(go()) == {"rig-auto": False, "Fake-27B": False}
+
+
+def test_client_gone_is_not_resumed(tmp_path):
+    """01.10.: a client closing its socket mid-stream is no backend break (it used to trigger 6 resumes)."""
+    async def go():
+        b = FakeBackend()
+        brun, bport = await _serve(b.app())
+        cfg = owui_proxy.Cfg("http://127.0.0.1:%d" % bport, 10, 0.2, 0.1, str(tmp_path / "m.json"), 4)
+        prun, pport = await _serve(owui_proxy.build_app(cfg))
+        try:
+            async with aiohttp.ClientSession() as s:
+                body = {"model": "x", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+                async with s.post("http://127.0.0.1:%d/v1/chat/completions" % pport, json=body) as r:
+                    async for line in r.content:
+                        if line.startswith(b"data:"):
+                            break          # first chunk seen, then the client hangs up
+            await asyncio.sleep(0.5)
+        finally:
+            await prun.cleanup()
+            await brun.cleanup()
+        return b.requests
+    assert len(asyncio.run(go())) == 1
