@@ -247,6 +247,7 @@ from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stag
 from sglang.srt.weg2 import d_transient_lend as _weg2_d_transient_lend  # D-TRANSIENT-LEND
 from sglang.srt.weg2 import d_seat_rewake as _weg2_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
 from sglang.srt.weg2 import skip_first as _weg2_skip_first  # E2 in a mixed wake cohort
+from sglang.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from sglang.srt.weg2 import short_read as _weg2_short_read  # held short wake reads
 from sglang.srt.weg2 import tail_adopt as _weg2_tail_adopt
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
@@ -18438,6 +18439,10 @@ class Scheduler(
         divergence must crash the group at the single site that owns the
         decision -- not be compensated for here, one rank at a time.
         """
+        # nf-pd-post: a deferred #639 ballot is decided before any forward
+        # that can enter a collective (a skip batch runs none)
+        if _prefix_lens_check.has_deferred() and not getattr(batch, "weg2_skip_extend", False):
+            _prefix_lens_check.resolve_deferred()
         return self._run_batch_forward(batch, pp_proxy_tensors)
 
     def _run_batch_forward(
@@ -19107,6 +19112,10 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
+        # nf-pd-post: a skip batch's #639 ballot is decided after its result
+        # (P's token) went out (layers/dcp/prefix_lens_check.resolve_deferred)
+        if _prefix_lens_check.has_deferred():
+            _prefix_lens_check.resolve_deferred()
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:

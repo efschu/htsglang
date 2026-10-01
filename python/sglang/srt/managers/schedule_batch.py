@@ -3749,7 +3749,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert_prefix_lens_rank_uniform,
         )
 
-        assert_prefix_lens_rank_uniform(prefix_lens)
+        # nf-pd-post: a skip-extend batch runs no target forward; its ballot
+        # is issued here and decided after its result (prefix_lens_check)
+        assert_prefix_lens_rank_uniform(prefix_lens, defer=self.weg2_skip_extend)
         extend_lens = [r.extend_range.length for r in reqs]
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(

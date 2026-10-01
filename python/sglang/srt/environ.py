@@ -1071,6 +1071,13 @@ class Envs:
     # first wake). Rank-uniform: the skip verdict is the group's vote. 0 =
     # the deferred order.
     SGLANG_WEG2_ENABLE_SKIP_RESULT_NOW = EnvBool(True)
+    # DCP_PREFIX_LENS_DEFER_SKIP (nf-pd-post 01.10., y6o): the #639 prefix-lens
+    # ballot of a skip-extend batch (no target forward) is issued in
+    # prepare_for_extend as before but DECIDED after the batch's result, at the
+    # latest before the next forward (layers/dcp/prefix_lens_check.py). TP0
+    # waited there for TP1's load-back issue (prepare_ms 240-295) before it could
+    # stream P's token. Read once at import. 0 = decide in prepare.
+    SGLANG_DCP_PREFIX_LENS_DEFER_SKIP = EnvBool(True)
     # TAIL_WAIT_MS (H45, metal fnFL2x150/x151): P's PP ranks write their tail
     # parts from background threads; D's vote used to read the part list ONCE
     # at the first prefetch check and fell on a partial manifest (parts=1-2 of
