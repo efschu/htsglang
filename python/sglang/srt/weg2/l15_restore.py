@@ -15,6 +15,7 @@ Before the first admission, ``sample_rows`` picks a deterministic subset
 to compare against L2; ``check_line`` and ``restore_line`` format it.
 """
 
+import dataclasses
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from sglang.srt.weg2.l15_manifest import Manifest, decide, read_and_clear
@@ -164,3 +165,82 @@ def l15_fp_reduce(
     if not ints:
         return None, False
     return (min(ints), max(ints)), (len(ints) != len(votes))
+
+
+@dataclasses.dataclass(frozen=True)
+class GroupCheck:
+    """ONE group decision from the wake's sample-check votes (L15-12c-E1).
+
+    Field values are order-independent aggregates of the gathered vote
+    list, so every rank that passes the same list computes an equal
+    GroupCheck (group-uniformity, same discipline as l15_fp_reduce)."""
+
+    refuse: bool
+    drop_rids: Tuple[str, ...]
+    fp_mixed: bool
+    verdict: str
+    bad_ranks: Tuple[int, ...]
+
+
+def check_vote(
+    fp: Optional[int], ok: int, bad: int, missing: int,
+    drop_rids: Sequence[str],
+) -> Tuple[Optional[int], int, int, int, Tuple[str, ...]]:
+    """Per-rank payload for the wake's check gather (plan section 4):
+    plain ints plus a sorted tuple of str rids -- picklable and
+    deterministic, so the gathered list replays identically everywhere."""
+    return (
+        None if fp is None else int(fp),
+        int(ok), int(bad), int(missing),
+        tuple(sorted({str(r) for r in drop_rids})),
+    )
+
+
+def group_check(votes: Sequence[Optional[tuple]]) -> GroupCheck:
+    """Reduce one vote per rank (None = that rank had no hold; else a
+    check_vote tuple) into the single group decision (plan section 4):
+
+      * bad > 0 on ANY rank -> the whole group refuses (F11 "mismatch =
+        stop"), the group stays DORMANT together;
+      * drop_rids is the sorted UNION over all ranks -- dropped on all
+        ranks together, never rank-local;
+      * fp_mixed: the fingerprints disagree, or some ranks hold and others
+        do not (l15_fp_reduce's split-hold rule) -> "fallback";
+      * verdict order: refuse > fallback > hold (any rank held) > none.
+
+    Pure over the vote list; sorting every aggregate makes the result
+    identical for any order of the same votes."""
+    bad_ranks = tuple(
+        i for i, v in enumerate(votes) if v is not None and int(v[2]) > 0
+    )
+    drops = set()
+    fps = []
+    for v in votes:
+        if v is None:
+            fps.append(None)
+        else:
+            fps.append(v[0])
+            drops.update(v[4])
+    present = {f for f in fps if f is not None}
+    fp_mixed = len(present) > 1 or (bool(present) and any(f is None for f in fps))
+    held = any(f is not None for f in fps)
+    if bad_ranks:
+        verdict = "refuse"
+    elif fp_mixed:
+        verdict = "fallback"
+    elif held:
+        verdict = "hold"
+    else:
+        verdict = "none"
+    return GroupCheck(
+        refuse=bool(bad_ranks), drop_rids=tuple(sorted(drops)),
+        fp_mixed=fp_mixed, verdict=verdict, bad_ranks=bad_ranks,
+    )
+
+
+def refusal_message(gc: GroupCheck, epoch: int) -> str:
+    """The named refusal -- one string every rank raises identically after
+    the gather (F11): identical inputs give identical text by construction."""
+    return "L15-CHECK REFUSED epoch=%d bad_ranks=%s" % (
+        epoch, ",".join(str(i) for i in gc.bad_ranks),
+    )
