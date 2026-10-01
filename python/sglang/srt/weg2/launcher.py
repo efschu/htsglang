@@ -13761,11 +13761,25 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
     return env
 
 
+class Weg2DualPSleepShareRefused(SystemExit):
+    """W-DUAL-P-SLEEP-SHARE: --dual-p-sleep on with --dual-share. Not resident, P's
+    weights load inside the memory-saver's private MemPool; the union bind frees
+    P's own copies there and a private pool never returns them (gmps9 boot death,
+    P-PP0 'per-rank budget leaves no GPU memory for the KV cache')."""
+
+
 def dual_p_sleep_armed(ns) -> bool:
-    """D PRIORITY stage 2 is armed: dual layout + unified KV + --dual-p-sleep on."""
-    return (bool(getattr(ns, "dual_layout", False)) and bool(getattr(ns, "dual_share", False))
-            and str(getattr(ns, "dual_unified_kv", "off")) == "on"
-            and str(getattr(ns, "dual_p_sleep", "on")) == "on")
+    """D PRIORITY stage 2 is armed: dual layout + unified KV + --dual-p-sleep on.
+    Under --dual-share it is REFUSED by name (:class:`Weg2DualPSleepShareRefused`)."""
+    on = (bool(getattr(ns, "dual_layout", False))
+          and str(getattr(ns, "dual_unified_kv", "off")) == "on"
+          and str(getattr(ns, "dual_p_sleep", "off")) == "on")
+    if on and bool(getattr(ns, "dual_share", False)):
+        raise Weg2DualPSleepShareRefused(
+            "W-DUAL-P-SLEEP-SHARE: --dual-p-sleep on with --dual-share -- P's weights would load inside the "
+            "memory-saver's private MemPool and the union bind's freed copies would stay reserved there "
+            "(gmps9: 'card free 3.35 -> 3.35 GiB', P-PP0 KV budget refused). Use --dual-p-sleep off (default).")
+    return on
 
 
 def apply_dual_p_sleep(ns, spec_p, log) -> bool:
@@ -21100,8 +21114,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "(risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs "
                          "~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. "
                          "100 = no limit.")
-    ap.add_argument("--dual-p-sleep", choices=("off", "on"), default="on",
-                    help="DUAL-TP3PP3 with --dual-unified-kv on: D PRIORITY stage 2 (user decision 01.10.) -- "
+    ap.add_argument("--dual-p-sleep", choices=("off", "on"), default="off",
+                    help="DEFAULT OFF since gmps9 (dkr27bnvfp4dual1mbar1fs10012051, P-PP0 init_memory_pool: 'per-rank "
+                         "budget leaves no GPU memory for the KV cache'): 'on' loads P's weights inside the "
+                         "memory-saver's private MemPool (not resident), and the --dual-share union bind frees P's "
+                         "own copies into that pool, which empty_cache never returns ('WEG2-UNION PEER ... card free "
+                         "3.35 -> 3.35 GiB', resident gmps7: 3.31 -> 11.74 GiB). 'on' together with --dual-share is "
+                         "therefore REFUSED at launch (W-DUAL-P-SLEEP-SHARE) until P's union-bound part loads outside "
+                         "the pool. "
+                         "DUAL-TP3PP3 with --dual-unified-kv on: D PRIORITY stage 2 (user decision 01.10.) -- "
                          "when D is still short after P stopped and released its KV, P sleeps and parks its "
                          "weights in host RAM (P boots with --enable-weights-cpu-backup and NOT resident; the "
                          "vendored torch_memory_saver allocates the host image at the pause and frees it after "

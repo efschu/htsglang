@@ -322,23 +322,28 @@ def test_p_sleep_and_wake_use_their_own_epochs_and_leave_the_flip_alone():
 def test_the_launcher_arms_stage_2_only_in_the_dual_unified_form(monkeypatch):
     from sglang.srt.weg2 import launcher as L
 
-    on = types.SimpleNamespace(dual_layout=True, dual_share=True, dual_unified_kv="on", dual_p_sleep="on",
-                               tag="t")
+    # gmps9: default OFF, and 'on' under --dual-share is a named refusal (P's weights in the private
+    # memory-saver pool keep the union bind's freed copies reserved -> P-PP0 KV budget refused)
+    assert L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]).dual_p_sleep == "off"
+    share_on = types.SimpleNamespace(dual_layout=True, dual_share=True, dual_unified_kv="on", dual_p_sleep="on",
+                                     tag="t")
+    with pytest.raises(L.Weg2DualPSleepShareRefused, match="W-DUAL-P-SLEEP-SHARE"):
+        L.dual_p_sleep_armed(share_on)
+    share_off = types.SimpleNamespace(**{**vars(share_on), "dual_p_sleep": "off"})
+    assert not L.dual_p_sleep_armed(share_off) and L.dual_p_sleep_argv(share_off, ["--x"]) == ["--x"]
+    assert "SGLANG_WEG2_WEIGHTS_RESIDENT" not in L.dual_share_env(share_off, "P")
+    assert L.dual_p_sleep_front_env(share_off, 4120) == {}
+    on = types.SimpleNamespace(dual_layout=True, dual_share=False, dual_unified_kv="on", dual_p_sleep="on", tag="t")
     assert L.dual_p_sleep_armed(on)
     assert "--enable-weights-cpu-backup" in L.dual_p_sleep_argv(on, ["--x"])
-    assert L.dual_share_env(on, "P")["SGLANG_WEG2_WEIGHTS_RESIDENT"] == "0"
-    assert "SGLANG_WEG2_WEIGHTS_RESIDENT" not in L.dual_share_env(on, "D")
     assert L.dual_p_sleep_front_env(on, 4120) == {DP.P_SLEEP_ENV: "1", "SGLANG_WEG2_DUAL_D_AIR_TOKENS": "4120"}
-    off = types.SimpleNamespace(**{**vars(on), "dual_p_sleep": "off"})
-    assert not L.dual_p_sleep_armed(off) and L.dual_p_sleep_argv(off, ["--x"]) == ["--x"]
-    assert L.dual_p_sleep_front_env(off, 4120) == {}
     assert L.dual_d_air_tokens(6) == 4096 + 6 * 4
 
 
 def test_apply_dual_p_sleep_pops_the_host_ring_and_adds_the_backup():
     from sglang.srt.weg2 import launcher as L
 
-    on = types.SimpleNamespace(dual_layout=True, dual_share=True, dual_unified_kv="on", dual_p_sleep="on")
+    on = types.SimpleNamespace(dual_layout=True, dual_share=False, dual_unified_kv="on", dual_p_sleep="on")
     spec = types.SimpleNamespace(argv=["--a"], env={"TMS_HOST_RING_DIR": "/r", "TMS_HOST_RING_MAP": "m", "X": "1"})
     logs = []
     assert L.apply_dual_p_sleep(on, spec, logs.append)
