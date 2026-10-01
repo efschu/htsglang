@@ -1380,15 +1380,23 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
     entry = _AGREED.pop(str(req.rid), None)
     if entry is None:
         return None
+    out, path = _plan_adopt_entry(entry, req, prefix_len, batch_empty)
+    _handback(req, entry, prefix_len, out, path)
+    return out
+
+
+def _plan_adopt_entry(entry: Agreed, req, prefix_len: int, batch_empty: bool):
+    """``plan_adopt``'s decision for a request with an agreed entry: (the
+    entry or None, the path the HANDBACK line names)."""
     if not entry.agreed:
         _log_ready(entry.staged, "skipped:group_vote", waited_ms=entry.waited_ms)
-        return None
+        return None, "extend:group_vote"
     park = _is_park(entry.staged)
     why = uniform_refusal(entry.staged.spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids),
                           req.extra_key, prefix_len, park=park, end_only=not entry.staged.e1)
     if why:
         _log_ready(entry.staged, f"skipped:{why}", waited_ms=entry.waited_ms)
-        return None
+        return None, f"extend:{why}"
     if entry.skip:
         why = skip_refusal(entry, req, batch_empty)
         if why:
@@ -1398,10 +1406,30 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
                 # skip_refusal is rank-uniform)
                 entry.staged.drop_end()
                 _log_ready(entry.staged, f"skipped:end_only:{why}", waited_ms=entry.waited_ms)
-                return None
+                return None, f"extend:end_only:{why}"
             entry.skip, entry.skip_note = False, f"admission:{why}"
             entry.staged.drop_end()
-    return entry
+            return entry, f"e1:{why}"
+        return entry, "skip"
+    return entry, "e1"
+
+
+def _handback(req, entry: Agreed, prefix_len: int, out, path: str) -> None:
+    """HANDBACK line (weg2/handback_claim.py): what D holds and what its target
+    forward computes for this hand-off. Never a gate."""
+    try:
+        from sglang.srt.weg2.handback_claim import handback_line
+
+        n = int(entry.staged.spec.n_tokens)
+        if out is None:
+            d_prefix = int(prefix_len)
+        elif out.skip:
+            d_prefix = n
+        else:
+            d_prefix = int(entry.staged.spec.cut)
+        handback_line(req.rid, n, d_prefix, max(0, n - d_prefix), path)
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        pass
 
 
 def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[Optional[int], bool]:

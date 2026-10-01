@@ -7657,6 +7657,7 @@ class Scheduler(
         # xsn328/329: read with P's handed-over page keys (#1442) -- D's own
         # hashes of the same prompt matched P's for the first 64 tokens only,
         # so the dormant hold's re-reads answered zero until the wake.
+        _weg2_hb_handoff = False  # HANDBACK: P's #1442 chain present for this rid
         try:
             if new_input_tokens and isinstance(req.rid, str) and req.rid.startswith("weg2-"):
                 from sglang.srt.managers import cache_controller as _cc
@@ -7670,6 +7671,7 @@ class Scheduler(
                 # reads the file (weg2_store_told, handoff_keys.adopt_pp0_decision);
                 # the tree's own reader is told so through WEG2_HANDOFF_OFF.
                 _hd = resolve_chain(req, _ho.read)
+                _weg2_hb_handoff = bool(_hd)
                 if getattr(req, _HK_OFF, False):
                     _cc.WEG2_HANDOFF_OFF[req.rid] = True
                     while len(_cc.WEG2_HANDOFF_OFF) > 4096:
@@ -7706,6 +7708,14 @@ class Scheduler(
         # TS (y4a death 03:36:24): a read bounded by a told is prescribed --
         # the #915 threshold does not refuse it (follower need 64 < 256).
         _tail_min = weg2_store_told.told_read_min_tokens(limit_tokens, _tail_min)
+        # HANDBACK (NF 12 boots: 33x '#915 PREFETCH REFUSED vote_negative
+        # need=64..255 keys=handoff', D prefilled P's pages again): a hand-off
+        # read is read whatever its length (weg2/handback_claim.py).
+        from sglang.srt.weg2.handback_claim import handback_min_tokens
+
+        _hb_min = handback_min_tokens(has_handoff=_weg2_hb_handoff)
+        if _hb_min is not None:
+            _tail_min = _hb_min if _tail_min is None else min(int(_tail_min), int(_hb_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
         if group_decides:
