@@ -548,6 +548,39 @@ def only_nonstream(front: dict) -> bool:
         return False
 
 
+#: Two snapshots of the SAME token stamp differ by the rounding of front.ts (ms) and
+#: last_token_s (0.1 s); a real new token moves the stamp by the time between two checks.
+STREAM_TOKEN_EPS_S = 0.5
+
+
+def stream_token_ts(front: dict) -> Optional[float]:
+    """NF y6d (01.10. 08:03:31-08:04:46Z): the newest token the front pushed to an open STREAM
+    request, as an absolute time (``front.ts - last_token_s``), from the front's own OutstandingBook
+    rows (``front.outstanding_stalest``, stamped per chunk D streams for the rid). One long stream
+    (weg2-18-47, 5 min, bs1 decode at ~65 tok/s) moves neither ``served`` nor ``served_tokens``
+    (both count a request at its END) -- this stamp moves with every chunk the user receives.
+    None = no witness (no stream row with a token, an image without the field, no front.ts).
+    A front whose IPC snapshot stops refreshing keeps ``ts`` and the rows -> the stamp stands
+    still, so a hung front never reads as progress."""
+    try:
+        ts = float(front.get("ts"))
+    except (TypeError, ValueError):
+        return None
+    best = None
+    for row in front.get("outstanding_stalest") or ():
+        if not isinstance(row, dict) or not row.get("stream"):
+            continue
+        lt = row.get("last_token_s")
+        if lt is None:
+            continue
+        try:
+            v = ts - float(lt)
+        except (TypeError, ValueError):
+            continue
+        best = v if best is None or v > best else best
+    return best
+
+
 def progress_step(memo, st: dict, now: float, stall_s: float, work: Optional[int] = None):
     """Ein Schritt des Riegels, rein (kein I/O). ``memo`` = der Merker des vorigen Schritts
     (None beim ersten). Rückgabe ``(memo_neu, ereignis)``, ereignis None | "HAENGT" | "LAEUFT".
@@ -558,22 +591,31 @@ def progress_step(memo, st: dict, now: float, stall_s: float, work: Optional[int
     3562 -> 4262 bei bs5-6, served/served_tokens bewegen sich erst am Ende eines Requests ->
     wieder ein gesunder Boot per Stop-Datei abgeschossen. Die Rang-Arbeit zählt deshalb bei
     outstanding > 0 IMMER, nicht nur bei Nicht-Stream. Steht sie, bleibt der Stall echt. HAENGT einmal beim Eintritt, LAEUFT beim
-    Austritt (nur im selben Boot)."""
+    Austritt (nur im selben Boot).
+    NF y6d (01.10. 08:04:31Z): a second witness, the front's own stream token stamp
+    (:func:`stream_token_ts`) -- a newer token pushed to an open stream request is progress
+    the user sees. Stall = served, served_tokens, rank work AND stream tokens all standing."""
     boot = st.get("boot_id")
     lc = (st.get("lifecycle") or {}).get("state")
     fr = st.get("front") or {}
     key = progress_key(fr)
     out = int(fr.get("outstanding") or 0)
+    tok = stream_token_ts(fr)
     m = dict(memo or {})
     prev_work = m.get("work")
     work_moved = work is not None and prev_work is not None and int(work) != int(prev_work)
-    if (not m or m.get("boot") != boot or m.get("key") != key or work_moved or out <= 0
+    prev_tok = m.get("tok")
+    tok_moved = (tok is not None and prev_tok is not None
+                 and float(tok) > float(prev_tok) + STREAM_TOKEN_EPS_S)
+    if (not m or m.get("boot") != boot or m.get("key") != key or work_moved or tok_moved or out <= 0
             or lc not in PROGRESS_LIVE):
         ev = "LAEUFT" if (m.get("stalled") and m.get("boot") == boot) else None
         since = m.get("since")
-        return {"boot": boot, "key": key, "since": now, "stalled": False, "work": work,
+        return {"boot": boot, "key": key, "since": now, "stalled": False, "work": work, "tok": tok,
                 "stalled_for": (now - float(since if since is not None else now)) if ev else 0.0}, ev
     m["work"] = work
+    if tok is not None and (prev_tok is None or float(tok) > float(prev_tok)):
+        m["tok"] = tok  # newest stamp only: rounding jitter (< EPS) never creeps it forward
     if not m.get("stalled") and now - float(m["since"]) >= float(stall_s):
         m["stalled"] = True
         return m, "HAENGT"
@@ -604,6 +646,8 @@ def deadman_progress(d: str, memo_path: str, stall_s: float = PROGRESS_STALL_S_D
             "queue": fr.get("queue"), "awake": fr.get("awake"), "front_state": fr.get("state"),
             "served": new["key"][0], "tokens": new["key"][1],
             "nonstream_only": only_nonstream(fr), "rank_work": work}
+    tok = stream_token_ts(fr)
+    base["stream_token_age_s"] = None if tok is None else round(max(0.0, now - tok), 1)
     stamp = time.strftime("%H:%M:%SZ", time.gmtime(now))
     if ev == "HAENGT":
         rec = {"verdict": "HAENGT", "since_ts": round(float(new["since"]), 3), **base}
@@ -612,6 +656,8 @@ def deadman_progress(d: str, memo_path: str, stall_s: float = PROGRESS_STALL_S_D
                 f"state={base['front_state']}: kein Fortschritt seit {now - float(new['since']):.0f} s "
                 f"(served={base['served']} tokens={base['tokens']}"
                 + (f", Rang-Arbeit {work} steht" if work is not None else ", keine Rang-Arbeit lesbar")
+                + (f", letzter Stream-Token vor {base['stream_token_age_s']:.0f} s" if tok is not None
+                   else ", kein Stream-Token sichtbar")
                 + f", Schwelle {float(stall_s):.0f} s) -- Zustand, KEIN Stop")
     else:
         rec = {"verdict": "LAEUFT", "stalled_for_s": round(float(new["stalled_for"]), 1), **base}
