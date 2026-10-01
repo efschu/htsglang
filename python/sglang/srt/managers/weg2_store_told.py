@@ -1421,6 +1421,26 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
         )
 
 
+def _pop_credit_keep_pin(tree, rid: str) -> int:
+    """TOLD-PIN (N1 dkr27browauthoritybar1fs10010740, PP1 07:46:10Z, rid
+    weg2-10-16): the told admission consumes this rank's loaded count, but the
+    request is often NOT seated in that visit (``H91 STORE-TOLD KEPT``: the
+    verdict stands, the adder admits it in a later pass). The plain
+    ``pop_prefetch_loaded_tokens`` also released the #1417 span pin -- and
+    with it the recurrent anchor the read brought (ANCHOR-PIN 341d089831) --
+    so between the visits the anchor was evictable: PP1 then found
+    ``#928 REFUSING resume ... match_tokens=17406 best_value_len=0``, local=0
+    against PP0's scheduled 17406, waited 19 s (#1175) and stopped the group
+    (#968 PREFIX MATERIALISATION SHORTFALL). The credit is popped here; the
+    pin stays until the request leaves the queue (``p_intake.settle_told``
+    releases it with the kept verdict) or the read is aborted."""
+    pins = getattr(tree, "_prefetch_span_pins", None)
+    if not pins or str(rid) not in pins:
+        return int(tree.pop_prefetch_loaded_tokens(rid) or 0)
+    (getattr(tree, "_weg2_dormant_done", None) or {}).pop(str(rid), None)
+    return int(tree.prefetch_loaded_tokens_by_reqid.pop(rid, 0) or 0)
+
+
 def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional[int]:
     """The admission gate on every rank. ``None`` = skip this pass (verdict
     outstanding). Otherwise this rank's loaded credit, after its completed
@@ -1471,7 +1491,7 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         # TW: an absolute twin told -- this rank's own prefix is the head its
         # registration matched plus the span its read completed.
         own = _twin.registered_head(req) + int(own)
-    credit = int(tree.pop_prefetch_loaded_tokens(rid) or 0)
+    credit = _pop_credit_keep_pin(tree, rid)
     told_map.pop(rid, None)
     if own != told:
         raise Weg2StoreToldMismatch(

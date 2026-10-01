@@ -499,7 +499,40 @@ def own_prefix(scheduler, req, rid: str, told: int) -> int:
     own = int(_st._completed_prefix(scheduler.tree_cache, rid))
     if _is_follower_twin(scheduler, rid):
         own += _twin.registered_head(req)
-    return own
+    return _resumable_own(scheduler, req, rid, own)
+
+
+def _resumable_own(scheduler, req, rid: str, own: int) -> int:
+    """ACK-RESUMABLE (N1 dkr27browauthoritybar1fs10010740, PP1 07:46:10Z,
+    weg2-10-16): a follower's read can complete the told KV span while its
+    tree holds no recurrent state at that depth -- PP1 acked 17406 and then
+    refused its own resume (``#928 ... best_value_len=0``), so PP0 admitted at
+    told and the group died in #968 after a 19 s #1175 wait. The ack names
+    what this rank's admission can actually RESUME from (the told-fidelity
+    probe, the #928 rule read-only): KV without an anchor at its end acks
+    less than told, and PP0 answers told=0 for EVERY rank (PF) -- a
+    rank-agreed re-prefill instead of a group death. No probe = no verdict
+    (the KV count stands, as before)."""
+    if own <= 0:
+        return own
+    try:
+        from sglang.srt.managers import weg2_told_fidelity as _tf
+
+        res = _tf.pp0_admissible(scheduler, req, int(own))
+    except Exception:  # noqa: BLE001 - a probe never breaks the ack
+        return own
+    if res is None or int(res) >= own:
+        return own
+    n = _bump(scheduler, "_pf_ack_unresumable_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-ACK UNRESUMABLE rank pp=%s rid=%s kv=%d resumable=%d (n=%d): this "
+            "rank's read completed the KV span but its tree cannot resume there (no "
+            "recurrent state at the end) -- the ack says so and PP0 answers told=0 for "
+            "every rank instead of admitting a prefix this rank cannot materialise",
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(res), n,
+        )
+    return int(res)
 
 
 def _progress_free(tree) -> bool:

@@ -162,8 +162,17 @@ def settle_told(scheduler, waiting_queue: Iterable[Any]) -> int:
         return 0
     queued = {id(r) for r in waiting_queue}
     gone = [rid for rid, e in kept.items() if id(e.req) not in queued]
+    tree = getattr(scheduler, "tree_cache", None)
+    unpin = getattr(tree, "_unpin_prefetched_span", None)
     for rid in gone:
         kept.pop(rid, None)
+        if callable(unpin):
+            # TOLD-PIN: the admission kept the #1417 pin (anchor included)
+            # while the verdict stood; the request left the queue, the pin goes
+            try:
+                unpin(rid)
+            except Exception:  # noqa: BLE001 - bookkeeping, never a gate
+                pass
     return len(gone)
 
 
