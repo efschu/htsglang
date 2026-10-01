@@ -32,12 +32,47 @@ from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 import torch
 
+from sglang.srt.weg2.l15_manifest import Manifest
+from sglang.srt.weg2.l15_restore import (
+    _compact_row,
+    _l2_source,
+    _owned_tokens,
+    refill_plan,
+)
+
 
 class L15RefillError(RuntimeError):
     """Refill could not be performed as one whole operation.
 
     The caller folds this into the wake's gather as a bad vote; a partial
     copy is never reported as success."""
+
+
+def refill_plan_laned(
+    m: Manifest, rank: int, prefix: Sequence[int],
+    cap_rows_by_rank: Sequence[int],
+) -> List[Tuple[int, int, int, int]]:
+    """refill_plan's rows, tagged with the L2 page lane, as 4-tuples.
+
+    ``(compact_row, l2_slot, l2_gen, lane)`` for exactly the rows and in the
+    order l15_restore.refill_plan yields them -- same ownership walk
+    (``_owned_tokens``), same L2 source resolution (``_l2_source``), same
+    row addressing (``_compact_row``), same cap>0 shortcut -- plus the lane
+    that refill_plan drops because it only carries 3-tuples. The lane is
+    ``span.l2_lanes[i]`` at the token's own index i in the span (parallel to
+    l2_slots/l2_gens, the P1 contract), or -1 when the record carries no
+    lane for that token: an old record (l2_lanes == ()), a P == 1 form, or a
+    l2_lanes shorter than the span (the tail). -1 means "no lane recorded",
+    which the P>1 loader (_refill_pgt) refuses named -- it never guesses."""
+    if cap_rows_by_rank[rank] > 0:
+        return []
+    plan = []
+    for span, i, slot in _owned_tokens(m, rank, prefix):
+        src = _l2_source(span, i)
+        if src is not None:
+            lane = span.l2_lanes[i] if i < len(span.l2_lanes) else -1
+            plan.append((_compact_row(prefix, rank, slot), src[0], src[1], lane))
+    return plan
 
 
 def gen_check(
