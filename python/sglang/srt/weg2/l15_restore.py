@@ -122,3 +122,29 @@ def restore_line(
         "refill_rows=%d missing=%d"
         % (epoch, verdict, rows, refill_rows, missing)
     )
+
+
+def l15_fp_reduce(
+    votes: Sequence[Optional[int]],
+) -> Tuple[Optional[Tuple[int, int]], bool]:
+    """Reduce the group's per-rank manifest fingerprints (L15-12 part 2).
+
+    ``votes`` is one entry per rank of the group: an int fingerprint when that
+    rank read its sleep manifest, ``None`` when it held nothing (master off,
+    or the manifest was absent / its owning process died).
+
+    Returns ``(minmax, mixed)`` where:
+      * ``minmax`` is ``(min, max)`` over the int votes, or ``None`` when no
+        rank had a fingerprint (the group holds nothing).
+      * ``mixed`` is True when some ranks had an int and at least one had
+        ``None``: the group disagrees on whether a hold exists at all, which
+        the wake site maps to "fallback" (a split hold cannot be kept whole).
+
+    Pure over the vote list (no I/O, no process group) so it is unit-testable
+    and its result is group-uniform: every rank passes the same ``gathered``
+    list and therefore computes the same ``(minmax, mixed)``.
+    """
+    ints = [v for v in votes if isinstance(v, int) and not isinstance(v, bool)]
+    if not ints:
+        return None, False
+    return (min(ints), max(ints)), (len(ints) != len(votes))
