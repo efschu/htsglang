@@ -13,6 +13,12 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:9100"]
         labels: {host: ct999}
+  # Proxmox-Host (Host-RAM, ZFS-ARC, PSI): node_exporter als einzelnes Binary auf 192.168.0.11:9100
+  # (deploy/vm/node-exporter-proxmox.service), kein Router-/Container-Eingriff
+  - job_name: node-proxmox
+    static_configs:
+      - targets: ["192.168.0.11:9100"]
+        labels: {host: proxmox}
   # Karten per NVML (utkuozdemir/nvidia_gpu_exporter, nvml-Variante: kein nvidia-smi-Fork)
   - job_name: gpu
     static_configs:
