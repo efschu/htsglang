@@ -14,6 +14,7 @@ Routes
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -24,7 +25,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, history, imagechanges, ipcboot, launchview, live, redact, sampler, sources, weg2line
+from . import energy, features, health, history, imagechanges, ipcboot, launchview, live, redact, sampler, sources, vmpush, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -204,6 +205,8 @@ class App:
                    "--docker-host-prefix", args.docker_host_prefix or "", "--gpuq", args.gpuq]
             for ep in args.front or []:
                 cmd += ["--front", ep]
+            if getattr(args, "vm_url", ""):
+                cmd += ["--vm-url", args.vm_url]
             self.sup = sampler.Supervisor(cmd, env=env, store=self.ring_store)
         else:
             self.boots = ipcboot.IpcBoots()
@@ -232,6 +235,9 @@ class App:
         self.t0 = time.time()
         self.version = _version()
         self.edition = getattr(args, "edition", "rig") or "rig"
+        # Nutzer-Order 01.10. ~07:40Z: rigdash liest die Zeitreihen per PromQL aus VictoriaMetrics
+        self.vm = vmpush.VmClient(args.vm_url) if getattr(args, "vm_url", "") else None
+        self.live_cache = LiveCache(lambda: self.snapshot(True, None))
 
     def energy_loop(self, stop: threading.Event):
         """Every 5 s: account the closed 5-s intervals of every live boot (energy.py); which class
@@ -312,9 +318,81 @@ class App:
             "energy_error": getattr(self, "energy_error", None),
             "image_changes": imagechanges.view(boots, images, img_err, self.imgchg.path),
             "features": features.attach_current(self.features.view(), boots, sv.get("gpus")),
+            "vm": vmpush.tiles(self.vm) if self.vm is not None else None,
             "windows": {"rate_s": live.WINDOW_S, "bucket_s": live.BUCKET_S, "history_s": live.HISTORY_S,
                         "live_s": live.LIVE_S},
         }
+
+
+#: Nutzer 01.10. ("vollkommen buggy", api/live 5,2 s nach 8,5 h): /api/live was computed per request -- every
+#: open page (and the external proxy) recomputed all boots every 2 s, 0,4-1 s CPU each under the GIL, so the
+#: server ran at 100 % CPU with 3 pages open.  Now one computation per LIVE_TTL_S is shared by all readers.
+LIVE_TTL_S = 1.0
+#: what the "Letzte Boots" table reads of a boot that is not shown as a card (lean page payload)
+LEAN_KEEP = ("stem", "meta", "age_s", "live", "primary", "first_t", "last_log_t", "flip_count", "totals",
+             "alarm", "container", "end", "stop_count", "error_count")
+
+
+def lean_boot(b: dict) -> dict:
+    """A boot the page lists only as a table row: no curves, no fields, no timeline (the bulk of /api/live)."""
+    out = {k: b.get(k) for k in LEAN_KEEP if k in b}
+    out["prefill"] = {g: {"last_burst": {"tps": ((v or {}).get("last_burst") or {}).get("tps")}}
+                      for g, v in (b.get("prefill") or {}).items()}
+    out["decode"] = {g: {"gen_tps_last": (v or {}).get("gen_tps_last")} for g, v in (b.get("decode") or {}).items()}
+    ipc = b.get("ipc") or {}
+    out["ipc"] = {k: ipc.get(k) for k in ("lifecycle", "terminal", "model", "tag", "boot_id", "cause") if k in ipc}
+    out["lean"] = True
+    return out
+
+
+def shown_boots(boots: list) -> list:
+    """Same rule as the page: live (or container running), else the primary boot."""
+    live = [b for b in boots if b.get("live") or ((b.get("container") or {}).get("State") == "running")]
+    return live or [b for b in boots if b.get("primary")][:1]
+
+
+def lean_snapshot(snap: dict, with_dev: bool) -> dict:
+    out = dict(snap)
+    shown = {id(b) for b in shown_boots(snap.get("boots") or [])}
+    out["boots"] = [b if id(b) in shown else lean_boot(b) for b in snap.get("boots") or []]
+    if not with_dev:
+        for k in ("features", "image_changes"):
+            out.pop(k, None)
+    out["lean"] = True
+    return out
+
+
+class LiveCache:
+    """One /api/live computation per LIVE_TTL_S for every reader; the encoded variants are cached too."""
+
+    def __init__(self, compute, ttl: float = LIVE_TTL_S):
+        self.compute, self.ttl = compute, ttl
+        self.lock = threading.Lock()
+        self.t = 0.0
+        self.snap = None
+        self.enc: dict = {}
+        self.stats = {"computed": 0, "served": 0, "last_ms": None}
+
+    def get(self, variant: str, make, gz: bool = False) -> bytes:
+        with self.lock:                    # one computes, the others wait for its result instead of computing too
+            now = time.time()
+            if self.snap is None or now - self.t >= self.ttl:
+                t0 = time.time()
+                self.snap = self.compute()
+                self.t = time.time()
+                self.enc = {}
+                self.stats["computed"] += 1
+                self.stats["last_ms"] = round(1000 * (self.t - t0), 1)
+            body = self.enc.get(variant)
+            if body is None:
+                body = self.enc[variant] = make(self.snap)
+            if gz:
+                z = self.enc.get(variant + "z")
+                if z is None:
+                    z = self.enc[variant + "z"] = gzip.compress(body, 5)
+                body = z
+            self.stats["served"] += 1
+            return body
 
 
 EDITIONS = ("rig", "release")
@@ -378,11 +456,13 @@ def make_handler(app: App):
         def log_message(self, fmt, *a):  # quiet; journald gets errors only
             pass
 
-        def _send(self, code, body, ctype):
+        def _send(self, code, body, ctype, gzip_=False):
             if isinstance(body, str):
                 body = body.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if gzip_:
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -423,9 +503,23 @@ def make_handler(app: App):
                 if path == "/api/live":
                     series = "noseries" not in self.path
                     zoom = parse_zoom(self.path)
-                    snap = app.snapshot(series, zoom)
-                    snap["via_proxy"] = self._via_proxy()
-                    return self._json(edition_snapshot(snap, app.edition))
+                    if zoom is not None or not series:
+                        snap = app.snapshot(series, zoom)          # a zoomed stretch: its own computation
+                        snap["via_proxy"] = self._via_proxy()
+                        return self._json(edition_snapshot(snap, app.edition))
+                    from urllib.parse import parse_qs, urlsplit
+                    q = parse_qs(urlsplit(self.path).query)
+                    lean = (q.get("lean") or ["0"])[0] == "1"
+                    dev = (q.get("dev") or ["1"])[0] == "1"
+                    via = self._via_proxy()
+                    variant = "%d%d%d" % (lean, dev, via)
+
+                    def make(snap, lean=lean, dev=dev, via=via):
+                        x = dict(lean_snapshot(snap, dev) if lean else snap, via_proxy=via)
+                        return redact.guard(json.dumps(edition_snapshot(x, app.edition), default=str)).encode("utf-8")
+                    gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                    body = app.live_cache.get(variant, make, gz)
+                    return self._send(200, body, "application/json", gzip_=gz)
                 if path == "/api/history":
                     # DASHBOARD-GRAFIKEN: tiles + series + marks of one model over one range
                     from urllib.parse import parse_qs, urlsplit
@@ -468,6 +562,7 @@ def make_handler(app: App):
                     smp = app.sampler_status()
                     return self._json({"ok": True, "version": app.version,
                                        "uptime_s": round(time.time() - app.t0, 1),
+                                       "live_cache": app.live_cache.stats,
                                        # the sampler's own process, and the emergency fills ("held", target 0)
                                        "sampler": smp, "held": {"sampler": smp.get("held"), "view_filled": app.view_held}})
                 return self._send(404, "not found", "text/plain")
@@ -493,6 +588,8 @@ def main(argv=None):
     ap.add_argument("--front", action="append", default=[],
                     help="weg2 front base URL to read /weg2/state from (repeatable)")
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
+    ap.add_argument("--vm-url", default=os.environ.get("RIGDASH_VM_URL", vmpush.DEFAULT_URL),
+                    help="VictoriaMetrics (PromQL lesen; der Probennehmer schreibt die IPC dorthin); '' = aus")
     ap.add_argument("--sampler", choices=("prozess", "thread"), default=None,
                     help="prozess = the readings in their own process (default with --state-dir); thread = in this one")
     ap.add_argument("--state-dir", default="", help="keeps the card history and history.sqlite (the panels' days)")

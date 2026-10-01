@@ -1,0 +1,73 @@
+"""VictoriaMetrics-Anbindung und geteilter /api/live-Schnappschuss (Nutzer-Orders 01.10.)."""
+
+import threading
+import time
+
+from rigdash import server, vmpush
+
+
+def _ipc():
+    return {"boot_id": "nfh91xyz-boot-20261001T064831Z-2025", "terminal": False,
+            "front": {"served": {"P": 3, "D": 9}, "awake": "D", "queue": [1, 2],
+                      "served_tokens": {"D": {"prompt": 100, "cached": 80, "completion": 7, "n": 9}},
+                      "arrival_seat": {"ttft_n": 4, "ttft_ms_sum": 8000, "ttft_ms_max": 3100}},
+            "flip_first_work": [{"dir": "P>D", "flip_begin_ts": 100.0, "flip_time_ms": 2100.0},
+                                {"dir": "P>D", "flip_begin_ts": 200.0, "flip_time_ms": 900.0, "what": "none"},
+                                {"dir": "D>P", "flip_begin_ts": 300.0, "flip_time_ms": 1500.0}],
+            "flip_user_time": [{"start_ts": 301.0, "flip_user_ms": 3700.0}]}
+
+
+def test_short_boot_is_one_label_per_boot():
+    assert vmpush.short_boot("nfh91abc-boot-20261001T064831Z-2025") == "boot-20261001T064831Z-2025"
+
+
+def test_lines_carry_ttft_counters_and_no_rid():
+    rank = {"D.tp0pp0": {"decode": {"tokens": 50, "running": 2}, "sched": {"full_token_usage": 0.4}}}
+    ls = vmpush.lines_for_boot(_ipc(), rank, "NF", 1_000)
+    txt = "\n".join(ls)
+    assert 'weg2_front_ttft_count{boot="boot-20261001T064831Z-2025",model="NF"} 4.0 1000' in ls
+    assert 'weg2_front_ttft_ms_sum{boot="boot-20261001T064831Z-2025",model="NF"} 8000.0 1000' in ls
+    assert 'weg2_front_queue{boot="boot-20261001T064831Z-2025",model="NF"} 2.0 1000' in ls
+    assert 'weg2_rank_decode_tokens_total{boot="boot-20261001T064831Z-2025",group="D",model="NF",rank="tp0pp0"} 50.0 1000' in ls
+    assert "rid" not in txt and "weg2-" not in txt
+
+
+def test_flip_points_at_flip_time_without_what_none_and_only_new():
+    pts, newest = vmpush.flip_points(_ipc(), "NF", 0.0)
+    assert len(pts) == 3                       # 2 flip_first_work with value + 1 flip_user_time
+    assert any(p.endswith(" 2100.0 100000") for p in pts)
+    assert not any(" 900.0 " in p for p in pts)
+    assert newest == 301.0
+    pts2, _ = vmpush.flip_points(_ipc(), "NF", newest)
+    assert pts2 == []
+
+
+def test_live_cache_computes_once_for_concurrent_readers():
+    n = {"c": 0}
+
+    def compute():
+        n["c"] += 1
+        time.sleep(0.05)
+        return {"t": time.time()}
+    c = server.LiveCache(compute, ttl=5.0)
+    out = []
+    th = [threading.Thread(target=lambda: out.append(c.get("v", lambda s: b"x"))) for _ in range(8)]
+    [t.start() for t in th]
+    [t.join() for t in th]
+    assert n["c"] == 1 and out == [b"x"] * 8
+    import gzip
+    assert gzip.decompress(c.get("v", lambda s: b"x", gz=True)) == b"x"
+
+
+def test_lean_snapshot_keeps_shown_boot_whole_and_strips_rows():
+    live = {"stem": "a", "live": True, "series": {"t": [1]}, "timeline": {}, "fields": {"A1": 1}}
+    old = {"stem": "b", "live": False, "primary": False, "series": {"t": [1]}, "timeline": {"segs": []},
+           "fields": {"A1": 1}, "prefill": {"P": {"last_burst": {"tps": 5.0}, "now": {}}}, "totals": {"p_new": 3},
+           "ipc": {"lifecycle": "stopped_clean", "launch": {"P": {}}}}
+    snap = {"boots": [live, old], "features": {"x": 1}, "image_changes": {}}
+    lean = server.lean_snapshot(snap, with_dev=False)
+    assert lean["boots"][0] is live
+    row = lean["boots"][1]
+    assert "series" not in row and "fields" not in row and "launch" not in row["ipc"]
+    assert row["prefill"]["P"]["last_burst"]["tps"] == 5.0 and row["totals"] == {"p_new": 3}
+    assert "features" not in lean and "features" in server.lean_snapshot(snap, with_dev=True)

@@ -321,6 +321,7 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   <!-- Oberer Teil: Geschwindigkeit, Effizienz, Statistik (auch in der veröffentlichten fLLiper-Ausgabe) -->
   <div class="chips" id="chips"></div>
   <div class="cardstrip" id="cardstrip"></div>
+  <div class="vtiles" id="vmtiles" aria-label="aus VictoriaMetrics"></div>
   <div id="boots"></div>
   <section class="card" id="verlauf" aria-label="Verlauf je Modell">
     <div class="vl-bar"><h2>Verlauf</h2><span class="seg" id="vl-model"></span><span class="seg" id="vl-range"></span>
@@ -1237,6 +1238,29 @@ function historyHtml(boots, now) {
 }
 
 // <!--DEV:END-->
+// Nutzer-Order 01.10. ~07:40Z: die Zeitreihen liegen in VictoriaMetrics; diese Kacheln lesen per PromQL daraus.
+// TTFT = Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), als IPC-Zähler
+// state.json front.arrival_seat.ttft_* vom Probennehmer nach VM geschrieben (vmpush.py).
+const sec = (ms) => ms == null || !isFinite(ms) ? "—" : fmt(ms / 1000, ms < 10000 ? 2 : 1);
+function vmHtml(d) {
+  const v = d.vm;
+  if (!v) return "";
+  const vmsrc = `<span class="ipcsrc" title="${esc(v.src || "")}">VictoriaMetrics</span>`;
+  if (v.error) return `<div class="vtile"><div class="vt-h">TTFT</div><div class="vt-big" style="font-size:16px;color:var(--bad)">VictoriaMetrics nicht lesbar</div><div class="vt-f"><span class="vt-sub">${esc(v.error)}</span></div></div>`;
+  const models = ["NF", "27B"];
+  const t = (m) => {
+    const m5 = (v.ttft_mean_5m_ms || {})[m], n5 = (v.ttft_n_5m || {})[m];
+    const mb = (v.ttft_mean_boot_ms || {})[m], mx = (v.ttft_max_boot_ms || {})[m];
+    const any = m5 != null || mb != null;
+    const miss = m === "27B" ? "27B-Front: kein arrival_seat.ttft_* (Schreiber front.py _asr.note_ms, nur NF-Linie)" : "kein laufender Boot";
+    return `<div class="vtile" id="vm-ttft-${m}"><div class="vt-h">TTFT ${m} &middot; &Oslash; 5 min</div>
+      <div class="vt-big num">${any ? (m5 != null ? sec(m5) : "—") + "<small>s</small>" : `<span style="font-size:14px;color:var(--muted)">${esc(miss)}</span>`}</div>
+      <div class="vt-f"><span class="vt-sub">${any ? `${n5 != null ? fmt(n5) + " Anfragen in 5 min &middot; " : ""}seit Boot &Oslash; ${sec(mb)} s &middot; max ${sec(mx)} s` : ""}</span>${vmsrc}</div></div>`;
+  };
+  return models.map(t).join("") + `<div class="vtile" id="vm-power"><div class="vt-h">Leistung alle Karten</div>
+    <div class="vt-big num">${fmt(v.power_sum_w)}<small>W</small></div><div class="vt-f"><span class="vt-sub">nvidia_gpu_exporter (NVML)</span>${vmsrc}</div></div>`;
+}
+
 function chipsHtml(d) {
   const out = [];
   const src = [["Karten", d.gpus], ["Docker", d.docker], ["gpuq", d.gpuq]];
@@ -1313,7 +1337,7 @@ function holdAnchor(chain) {
   }
   return 0;
 }
-const RESERVED = ["chips", "cardstrip", "boots", "prod", "feat", "imgchg", "gpus", "containers", "gpuq", "history"];
+const RESERVED = ["chips", "cardstrip", "vmtiles", "boots", "prod", "feat", "imgchg", "gpus", "containers", "gpuq", "history"];
 function reserveHeights() {
   for (const id of RESERVED) {
     const el = $(id);
@@ -1472,7 +1496,7 @@ if (DEV) $("launchbox").addEventListener("click", async (e) => {
 if (DEV) $("lf-filter").addEventListener("input", lfApplyFilter);
 // <!--DEV:END-->
 
-let failures = 0, inflight = false, refreshAgain = false;
+let failures = 0, inflight = false, refreshAgain = false, devTick = 0, devData = null;
 // the zoomed stretch a request was made for: an answer for another stretch is never drawn
 const zoomKey = () => { const z = window.RigZoom && RigZoom.get(); return z ? `${z[0].toFixed(3)},${z[1].toFixed(3)}` : ""; };
 async function refresh(force) {
@@ -1486,8 +1510,15 @@ async function refresh(force) {
   const zk = zoomKey();
   if (window.RigZoom && RigZoom.loading) RigZoom.loading(!!zk);
   try {
-    const r = await fetch("api/live" + (zk ? `?zoom=${zk}` : ""), {cache: "no-store"});   // relative: works behind the /rigdash/ prefix
+    // Nutzer 01.10. ("vollkommen buggy"): the lean page payload (boots that are only table rows without
+    // curves/fields) and the slow development part (features, image changes) only every 8th poll
+    const wantDev = DEV && (force || !devData || devTick % 8 === 0);
+    devTick++;
+    const r = await fetch("api/live" + (zk ? `?zoom=${zk}` : `?lean=1&dev=${wantDev ? 1 : 0}`), {cache: "no-store"});   // relative: works behind the /rigdash/ prefix
     const d = await r.json();
+    const freshDev = !!d.features || !!d.image_changes;
+    if (freshDev) devData = {features: d.features, image_changes: d.image_changes};
+    else if (devData) Object.assign(d, devData);
     failures = 0;
     // the zoom moved while the fetch ran (or was left): this answer is for the old stretch, fetch again
     if (zoomKey() !== zk) { refreshAgain = true; return; }
@@ -1509,15 +1540,18 @@ async function refresh(force) {
     morph($("boots"), smpBanner + banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
       : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Zustand (state.json) der letzten 6 h gefunden.</div></section>`));
     if (DEV) {
-      morph($("prod"), prodHtml(d));
-      morph($("feat"), featHtml(d));
-      morph($("imgchg"), imgChgHtml(d));
+      if (freshDev || force) {
+        morph($("prod"), prodHtml(d));
+        morph($("feat"), featHtml(d));
+        morph($("imgchg"), imgChgHtml(d));
+      }
       morph($("containers"), containersHtml(d));
       morph($("gpuq"), gpuqHtml(d));
       morph($("history"), historyHtml(d.boots.filter((b) => !shown.includes(b)), now));
     }
     morph($("gpus"), gpusHtml(d, binders));
     morph($("chips"), chipsHtml(d));
+    morph($("vmtiles"), vmHtml(d));
     // compact card strip at the top: the load at a glance, also on a phone
     morph($("cardstrip"), ((d.gpus || {}).value || []).map((c) => `<div><b>${esc(c.name.replace("NVIDIA GeForce ", ""))}</b>
       <span class="num">${fmt(c["power.draw"])} W &middot; ${fmt(c["memory.used"] / 1024, 1)}/${fmt(c["memory.total"] / 1024, 0)} GiB &middot; ${fmt(c["utilization.gpu"])} %</span>

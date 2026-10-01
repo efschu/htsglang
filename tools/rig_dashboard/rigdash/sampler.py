@@ -159,7 +159,7 @@ class Supervisor:
         alive = p is not None and p.poll() is None
         age = (now - beat["t"]) if beat.get("t") else None
         ok = alive and age is not None and age <= BEAT_STALE_S and beat.get("pid") == p.pid
-        return {"mode": "prozess", "ok": ok, "alive": alive, "pid": p.pid if p else None, "server_pid": os.getpid(),
+        return {"mode": "prozess", "ok": ok, "vmpush": beat.get("vmpush"), "alive": alive, "pid": p.pid if p else None, "server_pid": os.getpid(),
                 "restarts": self.restarts, "last_exit": self.last_exit, "beat_age_s": round(age, 2) if age is not None else None,
                 "held": beat.get("held"), "errors": beat.get("errors") or {},
                 "why": None if ok else ("Probennehmer-Prozess läuft nicht" if not alive else
@@ -175,8 +175,9 @@ def main(argv=None) -> int:
     ap.add_argument("--docker-host-prefix", default="")
     ap.add_argument("--front", action="append", default=[])
     ap.add_argument("--gpuq", default="http://127.0.0.1:8770")
+    ap.add_argument("--vm-url", default="", help="VictoriaMetrics: the IPC goes there too (vmpush.Bridge); '' = off")
     args = ap.parse_args(argv)
-    from . import energy, live, sources
+    from . import energy, live, sources, vmpush
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
     signal.signal(signal.SIGINT, lambda *a: stop.set())
@@ -186,6 +187,10 @@ def main(argv=None) -> int:
     rec = history.Recorder(db, boots, shlex.split(args.docker_ssh) if args.docker_ssh else [])
     threading.Thread(target=boots.run_forever, args=(stop,), name="sampler-ipc", daemon=True).start()
     threading.Thread(target=rec.run_forever, args=(stop,), name="sampler-hist", daemon=True).start()
+    # Nutzer-Order 01.10. ~07:40Z: die Zeitreihen gehen dauerhaft nach VictoriaMetrics (IPC, nie ein Log)
+    bridge = vmpush.Bridge(boots, args.vm_url) if args.vm_url else None
+    if bridge is not None:
+        threading.Thread(target=bridge.run_forever, args=(stop,), name="sampler-vmpush", daemon=True).start()
     # the page's other readings (30.09. ~22Z): cards/PCIe via NVML, docker, gpuq, fronts, and the energy book
     ssh = shlex.split(args.docker_ssh) if args.docker_ssh else []
     src = sources.Sources({"gpu_period": 1.0, "docker_ssh": ssh, "docker_host_prefix": args.docker_host_prefix,
@@ -230,8 +235,11 @@ def main(argv=None) -> int:
         if args.parent_pid and os.getppid() != args.parent_pid:
             break                                   # the web server is gone: never a second writer
         try:
+            vm_err = {"vmpush": bridge.last["error"]} if bridge is not None and bridge.last.get("error") else {}
             store.set("beat", {"t": time.time(), "pid": os.getpid(), "held": rec.held_view(),
-                               "errors": dict(rec.errors, **errs, **({"ipc": boots.last_error} if boots.last_error else {}))})
+                               "vmpush": bridge.last if bridge is not None else None,
+                               "errors": dict(rec.errors, **errs, **vm_err,
+                                              **({"ipc": boots.last_error} if boots.last_error else {}))})
         except Exception as e:  # noqa: BLE001 -- the beat must not kill the sampler
             print("beat: %s" % e, file=sys.stderr, flush=True)
         stop.wait(1.0)
