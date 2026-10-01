@@ -3742,6 +3742,9 @@ class MoEExpertOffloadCache:
         # phase seat count (weg2/d_seat_vram.py); 0 = the bank of H95 B. Set
         # by the presplit that allocated the [R+C+X] buffer.
         self.seat_rows = int(getattr(layer, "_weg2_seat_rows", 0) or 0)
+        # D-TRANSIENT-LEND: of the seat rows, the virtual head only a lend
+        # turns ON (never a capture floor, never a stage cell)
+        self.seat_lend_head = int(getattr(layer, "_weg2_seat_lend_head", 0) or 0)
         # #251c: the seat rows the step being CAPTURED may count as ON (set by
         # pool_waves per captured forward; 0 = the live count)
         self._pool_capture_on = 0
@@ -4771,6 +4774,9 @@ class MoEExpertOffloadCache:
         ids may count on (``d_seat_vram.capture_floor_rows``); 0 on a layer
         without seat rows or without a KV stage form."""
         seat_rows = int(getattr(self, "seat_rows", 0) or 0)
+        # D-TRANSIENT-LEND: the lend head is never ON at the wake -- the
+        # captured waves may not count it
+        seat_rows -= int(getattr(self, "seat_lend_head", 0) or 0)
         if seat_rows <= 0:
             return 0
         from sglang.srt.weg2 import d_seat_vram as _dsv
