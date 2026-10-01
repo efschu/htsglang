@@ -11711,6 +11711,12 @@ class SchedulerPPMixin:
                     _duty_ev1 = self.device_module.Event(enable_timing=True)
                     _duty_ev1.record(self.device_module.current_stream())
                     self._dual_duty_pending = (_duty_ev0, _duty_ev1)
+                # DUAL-TP3PP3 gang window (weg2/dual_duty.py GangGate): the last
+                # P stage publishes each forward's completion (daemon thread
+                # waits on the event) so PP0 knows when the pipeline is empty.
+                _gang_pub = getattr(self, "_dual_gang_pub", None)
+                if _gang_pub is not None:
+                    _gang_pub.submit(event.synchronize)
                 if _gap is not None:
                     _gap_host["launch"] = float(getattr(self, "_1466_run_ms", 0.0) or 0.0)
                     # spans opened INSIDE this launch (fi_plan: flashinfer's
@@ -12108,13 +12114,27 @@ def _dual_duty_throttle(sched):
     t = getattr(sched, "_dual_duty_obj", False)
     if t is False:
         t = None
-        if sched.pp_group.is_first_rank:
-            from sglang.srt.weg2.dual_duty import DutyThrottle
+        from sglang.srt.weg2 import dual_duty as _dd
 
-            t = DutyThrottle.from_env()
-            if t is not None:
-                logger.info("DUAL-TP3PP3 P duty throttle armed: duty=%.2f signal=%s",
-                            t.duty, t.path)
+        gang = _dd.gang_chunks_from_env()
+        if sched.pp_group.is_first_rank:
+            if gang:
+                t = _dd.GangGate.from_env()
+                if t is not None:
+                    logger.info("DUAL-TP3PP3 P gang window armed: duty=%.2f chunks=%d signal=%s done=%s",
+                                t.duty, t.chunks, t.path, t.done_path)
+            else:
+                t = _dd.DutyThrottle.from_env()
+                if t is not None:
+                    logger.info("DUAL-TP3PP3 P duty throttle armed: duty=%.2f signal=%s",
+                                t.duty, t.path)
+        elif (gang and sched.pp_group.is_last_rank
+              and getattr(sched, "_dual_gang_pub", None) is None
+              and _dd.GangGate.from_env() is not None):
+            sched._dual_gang_pub = _dd.GangDonePublisher(
+                _dd.gang_done_path(os.environ[_dd.DBUSY_FILE_ENV].strip()))
+            logger.info("DUAL-TP3PP3 P gang window: last stage publishes completions to %s",
+                        sched._dual_gang_pub.path)
         sched._dual_duty_obj = t
     if t is not None:
         pend = getattr(sched, "_dual_duty_pending", None)
