@@ -1,0 +1,43 @@
+DIFF dtype=torch.float32 M=1 tile=1 max|d|=2.384e-06
+DIFF dtype=torch.float32 M=1 tile=37 max|d|=1.848e-06
+same dtype=torch.float32 M=1 tile=512
+same dtype=torch.float32 M=1 tile=4096
+same dtype=torch.float32 M=1 tile=8192
+same dtype=torch.float32 M=1 tile=16384
+same dtype=torch.float32 M=1 tile=40000
+DIFF dtype=torch.float32 M=7 tile=1 max|d|=2.623e-06
+DIFF dtype=torch.float32 M=7 tile=37 max|d|=2.503e-06
+same dtype=torch.float32 M=7 tile=512
+same dtype=torch.float32 M=7 tile=4096
+same dtype=torch.float32 M=7 tile=8192
+same dtype=torch.float32 M=7 tile=16384
+same dtype=torch.float32 M=7 tile=40000
+DIFF dtype=torch.float32 M=64 tile=1 max|d|=3.338e-06
+DIFF dtype=torch.float32 M=64 tile=37 max|d|=2.623e-06
+same dtype=torch.float32 M=64 tile=512
+same dtype=torch.float32 M=64 tile=4096
+same dtype=torch.float32 M=64 tile=8192
+same dtype=torch.float32 M=64 tile=16384
+same dtype=torch.float32 M=64 tile=40000
+DIFF dtype=torch.bfloat16 M=1 tile=1 max|d|=9.766e-04
+same dtype=torch.bfloat16 M=1 tile=37
+same dtype=torch.bfloat16 M=1 tile=512
+same dtype=torch.bfloat16 M=1 tile=4096
+same dtype=torch.bfloat16 M=1 tile=8192
+same dtype=torch.bfloat16 M=1 tile=16384
+same dtype=torch.bfloat16 M=1 tile=40000
+DIFF dtype=torch.bfloat16 M=7 tile=1 max|d|=7.812e-03
+same dtype=torch.bfloat16 M=7 tile=37
+same dtype=torch.bfloat16 M=7 tile=512
+same dtype=torch.bfloat16 M=7 tile=4096
+same dtype=torch.bfloat16 M=7 tile=8192
+same dtype=torch.bfloat16 M=7 tile=16384
+same dtype=torch.bfloat16 M=7 tile=40000
+DIFF dtype=torch.bfloat16 M=64 tile=1 max|d|=7.812e-03
+same dtype=torch.bfloat16 M=64 tile=37
+same dtype=torch.bfloat16 M=64 tile=512
+same dtype=torch.bfloat16 M=64 tile=4096
+same dtype=torch.bfloat16 M=64 tile=8192
+same dtype=torch.bfloat16 M=64 tile=16384
+same dtype=torch.bfloat16 M=64 tile=40000
+NOT bitwise
