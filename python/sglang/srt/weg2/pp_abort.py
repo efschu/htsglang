@@ -118,3 +118,35 @@ def pp0_idle_in_vote(slots) -> bool:
         return any(int(r) == 0 and int(i) == 1 for r, i, *_ in (slots or ()))
     except Exception:  # noqa: BLE001 - an unreadable slot is not an idle PP0
         return False
+
+
+def follower_waiting_abort_verdict(rid: str, scheduled_extents, misses: int, *, laps: int,
+                                   pp0_drained: bool, admitted: bool, in_waiting: bool):
+    """#1180-W (dual1m gmps4 ...10011614, 16:19:24Z, weg2-0-9): an abort for a
+    request a FOLLOWER still holds in its waiting queue while PP0 had already
+    admitted it. PP0 took it as a chunked abort (xsn324, two more chunks), PP1
+    popped it from its queue at receipt -- and then PP0's frame for slot 0
+    named weg2-0-9: #1180 ROW DEFER PAST ITS LAP CAP, PP1 dead. A follower
+    therefore holds a waiting-queue abort until PP0's forwarded schedule
+    decides it. ``(verdict, misses)``:
+
+      ``chunked`` -- this rank has admitted it meanwhile (PP0's frame named it):
+                     the chunked abort path takes over (row authority / xsn324);
+      ``gone``    -- no longer in the waiting queue and not admitted: nothing left;
+      ``pop``     -- PP0 voted idle (#1268 lap), or ``laps`` frames in a row named
+                     other rids but not this one: PP0 popped it at receipt, pop it;
+      ``keep``    -- no frame this pass, or the frame names it (it is admitted
+                     this pass): wait.
+    """
+    if admitted:
+        return "chunked", misses
+    if not in_waiting:
+        return "gone", misses
+    if pp0_drained:
+        return "pop", misses
+    if not scheduled_extents:
+        return "keep", misses
+    if str(rid) in scheduled_extents:
+        return "keep", 0
+    misses = int(misses) + 1
+    return ("pop" if misses >= max(1, int(laps)) else "keep"), misses

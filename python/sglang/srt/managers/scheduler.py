@@ -7627,6 +7627,17 @@ class Scheduler(
         # TS (y4a death 03:36:24): a read bounded by a told is prescribed --
         # the #915 threshold does not refuse it (follower need 64 < 256).
         _tail_min = weg2_store_told.told_read_min_tokens(limit_tokens, _tail_min)
+        # DUAL HAND-BACK (gmps4 ...10011614, weg2-0-7 N=25): in the dual layout
+        # every D request is a P hand-back, and P published its N-1 anchor
+        # (END-ANCHOR units=24/24) -- the #915 threshold (256) refused the read
+        # ("vote_negative need=24"), D matched 0, uncached 25 -> W31/W50 ->
+        # re-route through P -> the same refusal again. A hand-back is read
+        # whatever its length.
+        from sglang.srt.weg2.dual_anchor_claim import dual_handback_min_tokens
+
+        _hb_min = dual_handback_min_tokens()
+        if _hb_min is not None:
+            _tail_min = _hb_min if _tail_min is None else min(int(_tail_min), int(_hb_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
         _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
         if group_decides:
@@ -9792,6 +9803,69 @@ class Scheduler(
             n, rid[:16], span, len(getattr(req, "origin_input_ids", ()) or ()),
         )
 
+    def _weg2_defer_waiting_abort(self, recv_req) -> bool:
+        """#1180-W: True = this follower holds the abort of a waiting-queue
+        request until PP0's forwarded schedule decides it. Only a PP follower
+        whose group is not pass-aligned (row authority True / unknown); never
+        for abort_all; never twice for a rid this method itself releases."""
+        ps = getattr(self, "ps", None)
+        if int(getattr(ps, "pp_size", 1) or 1) <= 1 or int(getattr(ps, "pp_rank", 0) or 0) <= 0:
+            return False
+        if getattr(recv_req, "abort_all", False):
+            return False
+        rid = str(getattr(recv_req, "rid", "") or "")
+        force = self.__dict__.setdefault("_weg2_force_waiting_abort", set())
+        if not rid or rid in force:
+            force.discard(rid)
+            return False
+        from sglang.srt.weg2.pp_abort import row_authority_of
+
+        if row_authority_of(self) is False:
+            return False  # pass-aligned request wire: applied at receipt (#791C-NF)
+        held = [r for r in self.waiting_queue if str(r.rid).startswith(rid)]
+        if not held:
+            return False
+        pend = self.__dict__.setdefault("_weg2_pending_waiting_aborts", {})
+        for r in held:
+            pend[str(r.rid)] = [recv_req, 0]
+            logger.info(
+                "WEG2-PP-WAITING-ABORT held rid=%s pp_rank=%s: still in this follower's "
+                "waiting queue -- applied when PP0's forwarded schedule decides it (#1180-W)",
+                r.rid, getattr(ps, "pp_rank", 0))
+        return True
+
+    def _weg2_process_waiting_aborts(self) -> None:
+        """#1180-W: once per scheduling pass, before the plan."""
+        pend = getattr(self, "_weg2_pending_waiting_aborts", None)
+        if not pend:
+            return
+        from sglang.srt.weg2.pp_abort import follower_waiting_abort_verdict
+
+        try:
+            sched = self._pp_scheduled_extents()
+        except Exception:  # noqa: BLE001 -- no frame readable = no frame this pass
+            sched = None
+        drained = bool(getattr(self, "_791c_pp0_drained", False))
+        laps = int(getattr(self.ps, "pp_size", 1) or 1)
+        for rid, ent in list(pend.items()):
+            recv_req, misses = ent
+            ch = self.chunked_req
+            admitted = ch is not None and str(ch.rid) == rid
+            in_wait = any(str(r.rid) == rid for r in self.waiting_queue)
+            verdict, misses = follower_waiting_abort_verdict(
+                rid, sched, misses, laps=laps, pp0_drained=drained,
+                admitted=admitted, in_waiting=in_wait)
+            if verdict == "keep":
+                ent[1] = misses
+                continue
+            del pend[rid]
+            logger.info("WEG2-PP-WAITING-ABORT %s rid=%s pp_rank=%s misses=%d (#1180-W)",
+                        verdict, rid, getattr(self.ps, "pp_rank", 0), misses)
+            if verdict in ("chunked", "pop"):
+                self._weg2_force_waiting_abort.add(rid)
+                self._abort_request_now(AbortReq(rid=rid, finished_reason=getattr(
+                    recv_req, "finished_reason", None)))
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
@@ -9806,6 +9880,7 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        self._weg2_process_waiting_aborts()
         req = self._pending_chunked_abort_req
         if req is None:
             return
@@ -21411,6 +21486,10 @@ class Scheduler(
                 )
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        # #1180-W: a follower holds a waiting-queue abort until PP0's forwarded
+        # schedule decides it (weg2.pp_abort.follower_waiting_abort_verdict).
+        if self._weg2_defer_waiting_abort(recv_req):
+            return
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
