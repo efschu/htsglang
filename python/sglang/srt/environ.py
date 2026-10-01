@@ -895,6 +895,13 @@ class Envs:
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).
     SGLANG_WEG2_PARK_STUCK_PHASES = EnvInt(3)
+    # TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's
+    # optional Influx-line push of one `weg2_req` point per finished request
+    # to VictoriaMetrics (e.g. http://192.168.0.88:8428/write), bundled ~2 s in
+    # the front's IPC writer thread. Unset = no push (default). The model tag
+    # of every point (e.g. NF / 27B).
+    SGLANG_WEG2_METRICS_PUSH_URL = EnvStr(None)
+    SGLANG_WEG2_METRICS_MODEL = EnvStr(None)
     # RW-FINISH (#287, 30.09., NF y4k): the resume warm runs to the end instead
     # of being cancelled at the first decode (14/14 wakes: warm_layers=8
     # skipped_cancel=40; window-1 decode wall 38.4 ms vs 27-28.5 steady). The

@@ -105,6 +105,9 @@ from sglang.srt.weg2 import p_read_overlap as _ro  # RO: P computes while a stor
 from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
 from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
 from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
+# DASHBOARD-IPC 01.10. (stdlib only, imported HERE: no first import on the loop, weg2rc2)
+from sglang.srt.weg2 import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
+from sglang.srt.weg2 import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
 
 logger = logging.getLogger("weg2.front")
 
@@ -4272,6 +4275,7 @@ class Front:
         for r in lapsed:
             self._d_parked.pop(r, None)
         if lapsed:
+            Front._rb_resume(self, lapsed, "lapsed")  # DASHBOARD-IPC: D re-queued them (part B)
             self.counters["d_parked_lapsed"] += len(lapsed)
             logger.warning("WEG2 PARK-LAPSED epoch=%d n=%d rids=%s -- parked %.0f s ago and no sleep "
                            "followed; D re-queued them (part B) and the front counts them as "
@@ -4911,6 +4915,9 @@ class Front:
         # comes no later than D's re-queue. The stamp is written only for the
         # rids D confirms: a failed/unsupported park writes none (withdrawn).
         t_park = time.time()
+        # DASHBOARD-IPC: the D->P flip's Vorlauf starts with its park RPC (front.flip)
+        if Front._flip_phase(self).vorlauf("D>P", f"park:{body['reason']}", t_park):
+            Front._ipc_live_kick(self)
         try:
             code, text = await self.rpc(D, phase_policy.PARK_PATH, body, phase_policy.PARK_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001 -- a failed park falls back, never kills the phase
@@ -4952,6 +4959,9 @@ class Front:
         _ps = getattr(self, "_park_stuck", None)  # #287 NEED0 (c): the streak, as IPC
         if _ps is not None:
             _ps().note_park(known + late)
+        for r in known + late:  # DASHBOARD-IPC: one `park` event per episode (at its resume)
+            Front._req_book(self).park(r, t_park, f"wait_bound:{body['reason']}", self.epoch)
+        Front._rb_changed(self)
         self.counters["d_parked"] += len(known) + len(late)
         self.counters["d_parked_in_flight"] += len(late)
         still = self._flip_ledger(D)
@@ -5654,6 +5664,8 @@ class Front:
                 or p.fut.done()):
             return False
         st = _hs.status(p.rid)
+        if int(st.get("page_size") or 0) > 0:  # DASHBOARD-IPC: request_done kv_pages / park pages
+            Front._req_book(self).page_size = int(st["page_size"])
         x = int(self.tp_prefill_max_tokens)
         prompt = int(p.leg1_prompt_tokens or 0) or int(p.est_prompt)
         terms = _hs.lost_terms(st, prompt, x)
@@ -5721,6 +5733,7 @@ class Front:
             m[rid] = sess
             while len(m) > 4096:
                 m.pop(next(iter(m)))
+            Front._req_book(self).session(rid, sess)  # DASHBOARD-IPC: session_id + turn
             logger.info("WEG2 SESSION rid=%s sess=%s src=%s", rid, sess or "-", src)
         except Exception:  # noqa: BLE001 -- an instrument, never the route
             pass
@@ -6242,6 +6255,9 @@ class Front:
         _fw_none = _fwc.flush("front_stop") if _fwc is not None else None
         if _fw_none is not None:  # FEHLT 3: the last flip's woken group never worked
             self._ipc_publish("flip_first_work", _fw_none)
+        if self.__dict__.get("_flip_phase_obj") is not None:  # DASHBOARD-IPC: no flip after a STOP
+            self._flip_phase_obj.abort(time.time(), "front_stop")
+            Front._ipc_live_kick(self)
         for p in list(self.queue) + list(self._ready_for_d):
             if not p.fut.done():
                 p.fut.set_exception(self.stop)
@@ -6320,6 +6336,8 @@ class Front:
 
     def _refuse_flip_in_stop(self, src: str, dst: str, when: str) -> None:
         self.counters["flip_refused_stop"] += 1
+        Front._flip_phase(self).abort(time.time(), f"refused_stop:{when}")  # DASHBOARD-IPC
+        Front._ipc_live_kick(self)
         logger.error(
             "WEG2-FLIP REFUSED-STOP epoch=%s sleep=%s wake=%s (%s): the front is in STOP "
             "(%s) -- a named teardown is final, no flip after it",
@@ -6371,11 +6389,128 @@ class Front:
         """The woken group's first work after a flip -> one ``flip_first_work`` event
         (the flip time from the front's one clock). Cheap when nothing is armed."""
         c = self.__dict__.get("_ipc_fw_clock")
-        if c is None:
+        if c is None or not c.waits_for(group):  # per D chunk: one compare while nothing is armed
             return
-        ev = c.seen(group, what, rid, time.time())
+        # DASHBOARD-IPC 01.10.: D content before `done` is this flip's work only
+        # for a leg 2 dispatched in this flip (FirstWorkClock.seen)
+        _l2 = Front._req_book(self).leg2_dispatch_of(rid) if group == "D" and rid is not None else None
+        now = time.time()
+        ev = c.seen(group, what, rid, now, leg2_dispatch_ts=_l2)
         if ev is not None:
             self._ipc_publish("flip_first_work", ev)
+            Front._flip_phase(self).first_work(now, what)
+            Front._ipc_live_kick(self)
+
+    # ---------------- DASHBOARD-IPC 01.10.: phase live, TTFT per via, sessions ----------------
+    def _req_book(self):
+        """Every request's timeline (weg2/front_requests.RequestBook)."""
+        b = self.__dict__.get("_req_book_obj")
+        if b is None:
+            b = self.__dict__["_req_book_obj"] = _frq.RequestBook(time.time())
+        return b
+
+    def _flip_phase(self):
+        """``front.flip`` (weg2/front_requests.FlipPhase)."""
+        fp = self.__dict__.get("_flip_phase_obj")
+        if fp is None:
+            fp = self.__dict__["_flip_phase_obj"] = _frq.FlipPhase()
+        return fp
+
+    def _rb_changed(self) -> None:
+        """After a book mutation on the loop: D's activity changed -> one live write."""
+        b = self.__dict__.get("_req_book_obj")
+        if b is not None and b.activity is not self.__dict__.get("_ipc_live_act"):
+            Front._ipc_live_kick(self)
+
+    def _ipc_live_kick(self) -> None:
+        """``front.flip`` / ``front.d_activity`` now, not at the next 5 s beat:
+        ONE coalesced write in the IPC thread (a write already queued reads the
+        newest snapshot when it runs). Never a write on the loop or the flip."""
+        if self.__dict__.get("_ipc_live_pending"):
+            return
+        d = envs.WEG2_STATE_DIR.get() or None
+        if not d:
+            return
+        self.__dict__["_ipc_live_pending"] = True
+        Front._ipc_submit(self, functools.partial(Front._ipc_live_write, self), d)
+
+    def _ipc_live_write(self, d: str) -> None:
+        """Runs in the IPC thread: both snapshots are replaced (never mutated) on
+        the loop, so each read here is one consistent value."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        self.__dict__["_ipc_live_pending"] = False
+        b = Front._req_book(self)
+        self.__dict__["_ipc_live_act"] = b.activity
+        front_state_ipc.publish_front_fields(
+            d, {"flip": Front._flip_phase(self).snap, "d_activity": b.activity_block()})
+
+    def _rb_publish_park(self, ev: Optional[dict]) -> None:
+        if ev is not None:
+            self._ipc_publish("park", ev)
+
+    def _rb_resume(self, rids, why: str) -> None:
+        """The parks of ``rids`` end (D runs them again): one ``park`` event each."""
+        b = self.__dict__.get("_req_book_obj")
+        if b is None:
+            return
+        now = time.time()
+        for r in list(rids):
+            Front._rb_publish_park(self, b.resume(r, now, why, getattr(self, "epoch", 0)))
+        Front._rb_changed(self)
+
+    def _rb_done(self, rid: str, status: Any) -> None:
+        """The handler's end: ``request_done`` (+ the ``park`` of a park still
+        open) into events.jsonl, and the optional ``weg2_req`` push."""
+        b = self.__dict__.get("_req_book_obj")
+        if b is None:
+            return
+        common = (self.__dict__.get("_sess_prev") or {}).get(str(rid))
+        rec, park_ev = b.done(rid, time.time(), status, getattr(self, "epoch", 0), common)
+        Front._rb_publish_park(self, park_ev)
+        if rec is None:
+            return
+        self._ipc_publish("request_done", rec)
+        Front._rb_changed(self)
+        if envs.SGLANG_WEG2_METRICS_PUSH_URL.get():
+            Front._ipc_submit(self, functools.partial(Front._ipc_req_push, self), rec)
+
+    def _ipc_pusher(self):
+        """TSDB-DELTA 1c: the Influx pusher (env set), its writes in the IPC thread."""
+        p = self.__dict__.get("_ipc_pusher_obj")
+        if p is None:
+            url = envs.SGLANG_WEG2_METRICS_PUSH_URL.get()
+            if not url:
+                return None
+            p = self.__dict__["_ipc_pusher_obj"] = _fmet.InfluxPusher(url, submit=functools.partial(Front._ipc_submit, self))
+        return p
+
+    def _ipc_req_push(self, rec: dict) -> None:
+        """Runs in the IPC thread: one ``weg2_req`` line, bundled ~2 s."""
+        p = Front._ipc_pusher(self)
+        if p is None:
+            return
+        tags, fields = _frq.influx_req_fields(rec)
+        tags["model"] = envs.SGLANG_WEG2_METRICS_MODEL.get() or None
+        ts = rec.get("end_ts")
+        p.add(_fmet.influx_line("weg2_req", tags, fields,
+                          ts_ns=int(float(ts) * 1e9) if ts is not None else None))
+        p.maybe_flush()
+
+    def _flip_vorlauf_reason(self, src: str, dst: str) -> str:
+        """Why this flip was decided, from the front's own state at ``flip()``."""
+        # getattr: partial test fronts (as the rest of the flip path)
+        queue = getattr(self, "queue", None)
+        if src == "D":
+            return "backlog" if queue else "idle"
+        D = (getattr(self, "groups", None) or {}).get("D")
+        if getattr(self, "_ready_for_d", None):
+            return "handoff"
+        if getattr(self, "_d_parked", None):
+            return "parked"
+        if D is not None and getattr(self, "dormant_admit", False) and D.outstanding:
+            return "dormant_held"
+        return "p_phase_end" if queue else "idle"
 
     def _ipc_out_book(self):
         """Every open request's arrival and last token (front_state_ipc.OutstandingBook)."""
@@ -6393,8 +6528,17 @@ class Front:
 
         @functools.wraps(handler)
         async def _wrapped(request):
+            status: Any = None
             try:
-                return await handler(request)
+                resp = await handler(request)
+                status = getattr(resp, "status", None)
+                return resp
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
+            except BaseException as e:
+                status = f"error:{type(e).__name__}"
+                raise
             finally:
                 try:
                     rid = request.get(_hs.RID_KEY)
@@ -6402,6 +6546,10 @@ class Front:
                     rid = None
                 if rid:
                     self._ipc_out_book().end(rid)
+                    try:  # DASHBOARD-IPC: request_done (+ an open park) -- never the answer's fault
+                        Front._rb_done(self, rid, status)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("WEG2 request_done not built rid=%s: %s: %s", rid, type(e).__name__, e)
         return _wrapped
 
     def _park_stuck(self):
@@ -6452,9 +6600,23 @@ class Front:
         w = self.__dict__.get("_ipc_writer")
         out["ipc"] = {"queue": w.depth() if w else 0, "max": w.maxlen if w else None,
                       "dropped": w.dropped if w else 0, "failed": w.failed if w else 0}
+        # DASHBOARD-IPC 01.10.: the phase live, TTFT per via with its parts, the book
+        _rb = Front._req_book(self)
+        out["flip"] = Front._flip_phase(self).snap
+        out["d_activity"] = _rb.activity_block()
+        out["ttft_by_via"] = _rb.ttft_block()
+        _fwc = self.__dict__.get("_ipc_fw_clock")
+        _push = self.__dict__.get("_ipc_pusher_obj")
+        out["request_book"] = {
+            "open": len(_rb.rows), "dropped": _rb.dropped, "page_size": _rb.page_size,
+            "first_work_stale_skipped": _fwc.stale_skipped if _fwc is not None else 0,
+            "push": (None if _push is None else
+                     {"points": _push.points, "dropped": _push.dropped, "errors": _push.errors,
+                      "writes": _push.writes})}
         if _asr.enabled():
             # ARRIVAL-SEAT: the rule's verdict counters (state.json front.arrival_seat)
             out["arrival_seat"] = _asr.state_block(self.counters, self._asr_st()["waiters"], True)
+            out["arrival_seat"]["ttft_by_via"] = out["ttft_by_via"]  # the dashboard seat's wish (4.)
         # FEHLT 8 (30.09., DASHBOARD-AUS-IPC-INVENTAR): the prefill site per request,
         # exact -- rigdash derived it from the leg counts (5 s behind, blind to reroutes)
         out["routes"] = routes_block(self.counters, getattr(self, "_route_x_live", None))
@@ -6513,7 +6675,7 @@ class Front:
                 tiers[k] += int(cached_tier.get(k) or 0)
 
     def _ipc_note_served_d(self, pending: Any, prompt: int, cached: int, completion: int,
-                           cached_tier: Optional[Dict[str, int]]) -> None:
+                           cached_tier: Optional[Dict[str, int]], rid: Optional[str] = None) -> None:
         """Leg 2's served row, and -- when P's leg 1 ran for THIS rid -- the same
         numbers again under ``D_after_P`` (RANKSTATS-S3 "DASHBOARD-GRAFIKEN" Feld 1):
         D's ``cached`` there is the P->D hand-off, not a cache hit made before the
@@ -6527,6 +6689,9 @@ class Front:
         self.counters[_rc] = self.counters.get(_rc, 0) + 1
         if pending is not None and pending.leg1_ran:
             self._ipc_note_served("D_after_P", prompt, cached, completion, cached_tier)
+        if rid is not None:  # DASHBOARD-IPC: request_done's D numbers
+            Front._req_book(self).d_served(rid, prompt, cached, completion, cached_tier,
+                                      handoff=bool(pending is not None and pending.leg1_ran))
 
     async def ipc_front_writer(self, period_s: float = 5.0) -> None:
         """(b) every ``period_s``: the front's keys into state.json `front` through
@@ -6549,6 +6714,9 @@ class Front:
                 logger.debug("WEG2 IPC front fields not built: %s: %s", type(e).__name__, e)
                 continue
             self._ipc_submit(front_state_ipc.publish_front_fields, d, fields)
+            _p = self.__dict__.get("_ipc_pusher_obj")
+            if _p is not None:  # TSDB 1c: the last points of a quiet minute go out too
+                _p.maybe_flush()
 
     def _publish_stop_state(self, name: str, detail: str, state_before: str) -> None:
         """IPC §2.2 (user law: control never over log lines): the STOP into the
@@ -7028,6 +7196,7 @@ class Front:
         rid = f"weg2-{self.epoch}-{self._rid}"
         _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
         self._ipc_out_book().arrive(rid, time.time())  # state.json front.oldest_outstanding_*
+        Front._req_book(self).arrive(rid, time.time(), self.epoch)  # DASHBOARD-IPC: request_done / TTFT
         if _asr.enabled():
             self._asr_arrival_note(rid)  # NF-STAU: the TTFT clocks start here
         self._sess_note(rid, request, payload)  # SESSION-TRACE
@@ -7082,6 +7251,8 @@ class Front:
         # y5c: a non-stream rid shows the front no token before its end -- the
         # IPC rows say so (stream 0) instead of a stall they cannot see
         self._ipc_out_book().stream(rid, stream)
+        Front._req_book(self).stream(rid, stream)
+        Front._req_book(self).est_prompt(rid, est_prompt)
         self._park_stuck().note_stream(rid, stream)
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
         if _xx is not None:
@@ -8063,6 +8234,7 @@ class Front:
         if lapsed:
             for r in lapsed:
                 st["parked"].pop(r, None)
+            Front._rb_resume(self, lapsed, "lapsed")  # DASHBOARD-IPC
             logger.info("%s PARKED-CLEAR n=%d why=lapsed rids=%s", _asr.MARKER, len(lapsed), lapsed[:4])
         bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
         live_q = [p for p in self.queue if not p.fut.done()]
@@ -8350,6 +8522,8 @@ class Front:
         st[key + "_t"] = now
         if verdict == phase_policy.PARK_PARKED and victim in rids:
             st["parked"][victim] = now
+            Front._req_book(self).park(victim, now, f"arrival_seat:{reason}", self.epoch)  # DASHBOARD-IPC
+            Front._rb_changed(self)
             st[key + "_cooldown"] = float(park_cooldown)
             for s in list(getattr(self, "_d_seats_live", ()) or ()):
                 if s.rid == victim:
@@ -8671,6 +8845,7 @@ class Front:
             payload.pop("max_completion_tokens", None)
         g.outstanding[p.rid] = time.time()
         t0 = time.time()
+        Front._req_book(self).leg1_dispatch(p.rid, t0)  # DASHBOARD-IPC: queue_ms ends, p_prefill starts
 
         async def _post() -> Tuple[int, bytes]:
             async with self.session.post(f"{g.url}{p.path}", json=with_cached_tier_ask(payload, p.path)) as resp:
@@ -8725,6 +8900,10 @@ class Front:
             # refuses at admission, before P's prefill is spent.
             g.served += 1
             self._ipc_note_served("P", pt, ct, 0, cached_tier_of(js))
+            # DASHBOARD-IPC: leg 1's end (P's end for the P->D flip time) and its numbers
+            _t1 = time.time()
+            Front._req_book(self).leg1_done(p.rid, _t1, pt, ct, cached_tier_of(js), d_prefill_seconds(js))
+            Front._ipc_first_work_clock(self).note_p_end(_t1)
             # D->P flip time (user definition): the first leg 1 after a D->P flip
             # names P's prefill start -- its end minus P's own prefill time
             _dp = self._ipc_dp_clock().first_prefill(p.rid, t0, time.time(), d_prefill_seconds(js))
@@ -8866,6 +9045,8 @@ class Front:
         _solo_adm0 = self._d_admissions
         _solo_entry = len(g.outstanding) == 1
         t0 = time.time()
+        Front._req_book(self).leg2_dispatch(rid, t0)  # DASHBOARD-IPC: d_first_token starts, D prefills
+        Front._rb_changed(self)
         # UNIFY S7 (27B Review V (3)): the X this rid's SHORT grant was decided
         # on (None for a BATCH / re-granted / re-queued leg 2, or switch off).
         _x_grant = self._x_grants.pop(rid, None)
@@ -9070,10 +9251,13 @@ class Front:
                     if _t_arr is not None:
                         _ttft = max(0.0, (time.time() - _t_arr) * 1000.0)
                         _asr.note_ms(self.counters, "ttft", _ttft)
+                    _via = ("d_direct" if pending is None
+                            else "d_single" if single_prefill else "after_p")
                     logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f ttft_ms=%.0f",
-                                rid, self.epoch, ("d_direct" if pending is None
-                                                 else "d_single" if single_prefill else "after_p"),
-                                (time.time() - t0) * 1000.0, _ttft)
+                                rid, self.epoch, _via, (time.time() - t0) * 1000.0, _ttft)
+                    # DASHBOARD-IPC: the TTFT per via and its parts (front.ttft_by_via)
+                    Front._req_book(self).first_token(rid, time.time(), _via)
+                    Front._rb_changed(self)
                     # DASHBOARD-AUS-IPC (a): D's first content after a P->D flip = first decode token.
                     self._ipc_first_work_seen("D", "decode_token", rid)
                 if _has_content and front_span_inflight() and self.spans.agent_span:
@@ -9332,7 +9516,8 @@ class Front:
                                                  resumable_depth=_depth)
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
-                    self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_stream_tail(bytes(tail)))
+                    self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_stream_tail(bytes(tail)), rid=rid)
+                    Front._req_book(self).d_prefill_s(rid, dterms.get("prefill_s"))
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
@@ -9364,9 +9549,10 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
-                self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_of(js))
+                self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_of(js), rid=rid)
                 dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
                                                  mark=_pfc_mark0)
+                Front._req_book(self).d_prefill_s(rid, dterms.get("prefill_s"))
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
@@ -9484,6 +9670,8 @@ class Front:
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         finally:
             g.outstanding.pop(rid, None)
+            Front._req_book(self).leg2_end(rid, time.time())  # DASHBOARD-IPC: front.d_activity
+            Front._rb_changed(self)
             # H91 part C: a parked request that ends (served, aborted, failed)
             # is no longer parked either.
             (getattr(self, "_d_parked", None) or {}).pop(rid, None)
@@ -10553,6 +10741,9 @@ class Front:
         if getattr(self, "state", None) == "STOP":
             self._refuse_flip_in_stop(src, dst, "before the flip")
             return
+        # DASHBOARD-IPC (front.flip): the decision -- a D->P park RPC already opened it
+        if Front._flip_phase(self).vorlauf(f"{src}>{dst}", Front._flip_vorlauf_reason(self, src, dst), time.time()):
+            Front._ipc_live_kick(self)
         # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
         _ic = getattr(self, "_idle_clock", None)
         if _ic is not None:
@@ -10580,6 +10771,8 @@ class Front:
         self._ipc_publish("flip_begin", {"epoch_before": self.epoch, "sleep": src, "wake": dst,
                                          "flip_begin_ts": round(t_flip0, 3)})
         _fw_none = self._ipc_first_work_clock().arm(self.epoch + 1, src, dst, t_flip0)
+        Front._flip_phase(self).layer(f"{src}>{dst}", t_flip0, Front._flip_vorlauf_reason(self, src, dst))
+        Front._ipc_live_kick(self)
         if src == "D" and dst == "P":
             _live = [q.t_arrive for q in self.queue if getattr(q, "fut", None) is None or not q.fut.done()]
             self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
@@ -11082,6 +11275,10 @@ class Front:
             _h91_parked.clear()
         if dst == "D":
             self._asr_clear_parked("flip-to-D")  # NF-STAU: D resumed every park
+            # DASHBOARD-IPC: every park the front booked ends with D awake again
+            _rb = self.__dict__.get("_req_book_obj")
+            if _rb is not None:
+                Front._rb_resume(self, _rb.parked(), "flip_to_d")
         # 27B flipfast F3: after a D->P flip the controller that awaits it starts
         # P's drain at once instead of one tick later (no-op with the switch off).
         # NOT after P->D: nothing on D waits for the controller there (leg 2 is
@@ -11152,6 +11349,8 @@ class Front:
         self._ipc_publish("flip_done", _fsi.flip_done_payload(rec, t_flip0))
         self._ipc_first_work_clock().done(time.time())  # FEHLT 3: pairs with one flip_first_work
         self._ipc_dp_clock().done(time.time())
+        Front._flip_phase(self).done(time.time())  # DASHBOARD-IPC: Layer -> Nachlauf
+        Front._ipc_live_kick(self)
         if dc_off_path:
             _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))
             self._dc_tasks.add(_t)
