@@ -533,6 +533,11 @@ class PoolLayout:
     host_row: Any
     row_key: Any
     row_use: Any
+    # H95c: the seat rows ON when the layout was BUILT (None: no seat rows).
+    # :func:`apply_pool_layout` writes the seat block from the LIVE count, so
+    # a layout that waited (H31b) cannot turn back on a row a live shrink
+    # switched off in between.
+    seat_on: Optional[int] = None
 
 
 def pool_layout_tensors(tables: PoolTables, hot_slot_of: Dict[int, int],
@@ -563,12 +568,40 @@ def pool_layout_tensors(tables: PoolTables, hot_slot_of: Dict[int, int],
     return PoolLayout(
         hot_phys=hot.to(dev),
         host_row=torch.tensor(list(host_row), dtype=torch.int32).to(dev),
-        row_key=key.to(dev), row_use=use.to(dev))
+        row_key=key.to(dev), row_use=use.to(dev),
+        seat_on=int(tables.seat_on) if tables.seat_rows else None)
+
+
+def _stamp_seat_block(tables: PoolTables) -> None:
+    """The seat block [seat_base, seat_base + X) from the LIVE ``seat_on``:
+    a row ON that a layout carries as OFF becomes free, every row OFF becomes
+    OFF (key/use/pf_row) and no expert points at it. Device ops only.
+
+    xid13 kvh 01.10. (D TP0 17:03:20Z): the H31b full layout was built at the
+    wake's rearm with 74 rows ON, a live KV-stage shrink switched rows 70..73
+    OFF (pages released), and the layout landed ~30 ms later and wrote those
+    four rows back as FREE. A free row is the step's first victim; ~100
+    rounds later the LRU reached row 70 and pool_copy stored into its
+    unmapped tail (Xid 13, MMU fault on a write)."""
+    if not tables.seat_rows:
+        return
+    base, X, k = int(tables.seat_base), int(tables.seat_rows), int(tables.seat_on)
+    on_key = tables.row_key[base:base + k]
+    stale = on_key == SEAT_OFF_KEY
+    tables.row_use[base:base + k].masked_fill_(stale, 0)
+    on_key.masked_fill_(stale, -1)
+    tables.row_key[base + k:base + X].fill_(SEAT_OFF_KEY)
+    tables.row_use[base + k:base + X].fill_(ROW_USE_NEVER)
+    tables.pf_row[base + k:base + X].fill_(-1)
+    hot = tables.hot_phys
+    hot.masked_fill_((hot >= base + k) & (hot < base + X), -1)
 
 
 def apply_pool_layout(tables: PoolTables, layout: PoolLayout) -> None:
     """Write ``layout`` into the tables IN PLACE and reset every counter --
-    device ops only, stream-ordered on the current stream."""
+    device ops only, stream-ordered on the current stream. The seat block
+    follows the live ``seat_on``, not the one the layout was built at
+    (:func:`_stamp_seat_block`)."""
     import torch
 
     dev = tables.hot_phys.device
@@ -576,6 +609,7 @@ def apply_pool_layout(tables: PoolTables, layout: PoolLayout) -> None:
     tables.host_row.copy_(layout.host_row)
     tables.row_key.copy_(layout.row_key)
     tables.row_use.copy_(layout.row_use)
+    _stamp_seat_block(tables)
     tables.clock.fill_(0)
     tables.gate.fill_(1)
     tables.error.fill_(0)

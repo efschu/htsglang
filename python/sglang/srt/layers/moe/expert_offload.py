@@ -5584,19 +5584,29 @@ class MoEExpertOffloadCache:
         deferred_rows_fill().land(self)
         return True
 
-    def _promote_deferred(self) -> None:
-        """Das volle Layout in die Tabellen (laufender Strom, geraeteintern)."""
+    def _promote_deferred(self):
+        """Das volle Layout in die Tabellen (laufender Strom, geraeteintern).
+        Gibt ``(built_on, now_on)`` zurueck, wenn eine Live-Aenderung der
+        Sitzzeilen zwischen Rearm und Landung lag (xid13 kvh 01.10.: das
+        Layout traegt den Sitzblock seines Rearms, ``apply_pool_layout``
+        schreibt ihn aus dem lebenden Stand), sonst None."""
         from sglang.srt.layers.moe.expert_pool_device import apply_pool_layout
 
         d = self._deferred_rows
         if d is None:
-            return
+            return None
+        moved = None
         if d.full is not None:
+            built_on = getattr(d.full, "seat_on", None)
+            now_on = int(self._pool_tables.seat_on)
+            if built_on is not None and int(built_on) != now_on:
+                moved = (int(built_on), now_on)
             apply_pool_layout(self._pool_tables, d.full)
         self._scratch_holds.clear()
         if self._pool_pf_buffers is not None:
             self._pool_pf_armed = False
         self._deferred_rows = None
+        return moved
 
     def prepare_breakable(self, topk_ids, bridge, stage=None):
         """#462 breakable route: the EAGER pre-replay phase, in one call.
@@ -7191,6 +7201,9 @@ class DeferredRowsFill:
         self.by_tick = 0
         self.by_eager = 0
         self.ticks = 0
+        # xid13 kvh: layers whose full layout landed after a live seat-row change
+        self.seat_moved = 0
+        self.seat_moved_on = None
 
     def _ops(self):
         if self._ops_arg == "cuda":
@@ -7263,7 +7276,10 @@ class DeferredRowsFill:
         if ev is not None and ops is not None:
             ops.current_waits(ev)
         rows = int(cache._deferred_rows.rows)
-        cache._promote_deferred()
+        moved = cache._promote_deferred()
+        if moved is not None:
+            self.seat_moved += 1
+            self.seat_moved_on = moved
         self.pending.remove(cache)
         self.rows_landed += rows
         if how == "tick":
@@ -7279,6 +7295,12 @@ class DeferredRowsFill:
                 self.by_tick, self.by_eager, self.ticks,
                 "n/a" if self.t_start is None else "%.0f" % ((now - self.t_start) * 1000),
                 (now - (self.t_rearm or now)) * 1000)
+            if self.seat_moved:
+                logger.info(
+                    "%s SEAT-RESTAMP layers=%d rows_on %d->%d (the full layouts were built "
+                    "at the rearm, a live seat-row change came before they landed; the seat "
+                    "block follows the live count, OFF rows stay OFF)", self.LINE,
+                    self.seat_moved, self.seat_moved_on[0], self.seat_moved_on[1])
             self.reset()
 
     def land(self, cache) -> None:
