@@ -1,0 +1,52 @@
+# oh-my-pi model registry for this laptop.
+#
+# There is exactly one provider and it is local: the on-demand htsglang service
+# on 127.0.0.1. No cloud account, no external key, nothing leaves the machine.
+#
+# apiKey is a placeholder: the server is bound to 127.0.0.1 and runs no
+# authentication, but omp expects the field to exist.
+#
+# 2026-10-01: the service now serves Qwen3.8-35B-A3B-Distill (Q3_K_M) on the
+# GPU with decode graphs (~20 tok/s) and a persistent prefix cache on disk, so
+# the ~17k-token agent system prompt is computed once and reloaded in seconds
+# after the model was parked. The server answers to either id below; both ids
+# reach the SAME model (whatever /root/efeu35q3/switch_model.sh selected).
+providers:
+  local:
+    baseUrl: http://127.0.0.1:31651/v1
+    api: openai-completions
+    apiKey: "local-no-auth"
+    authHeader: true
+    models:
+      - id: qwen38-35b-a3b
+        name: Qwen3.8-35B-A3B-Distill Q3_K_M (local iGPU)
+        input: [text]
+        # Tracks CTX=32768 in /etc/systemd/system/htsglang-ondemand.service.d/
+        # 50-q38.conf. Raising it here without raising it there truncates.
+        contextWindow: 32768
+        maxTokens: 4096
+        compat:
+          # The block replaces the built-in one wholesale rather than merging,
+          # so every field this server needs has to be named here.
+          supportsDeveloperRole: false
+          supportsReasoningEffort: false
+          maxTokensField: max_tokens
+          supportsToolChoice: true
+          # Thinking off by default: the Distill opens every answer with a
+          # <think> block otherwise, which for a coding assistant is latency.
+          extraBody:
+            chat_template_kwargs:
+              enable_thinking: false
+      - id: qwen36-35b-a3b
+        name: (old id) same local model as qwen38-35b-a3b
+        input: [text]
+        contextWindow: 32768
+        maxTokens: 4096
+        compat:
+          supportsDeveloperRole: false
+          supportsReasoningEffort: false
+          maxTokensField: max_tokens
+          supportsToolChoice: true
+          extraBody:
+            chat_template_kwargs:
+              enable_thinking: false

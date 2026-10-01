@@ -24,6 +24,8 @@ import random
 import time
 import urllib.request
 
+MAX_TOKENS = 4
+
 WORDS = ("def class return import self value result config request handler "
          "error check index buffer stream token layer weight cache tensor "
          "shape batch page block state flush write read open close parse "
@@ -48,7 +50,7 @@ def fixed_system_prompt(approx_tokens: int, seed: int) -> str:
 
 
 def stream_ttft(base, model, messages, timeout):
-    body = {"model": model, "messages": messages, "temperature": 0.0, "max_tokens": 4,
+    body = {"model": model, "messages": messages, "temperature": 0.0, "max_tokens": MAX_TOKENS,
             "stream": True, "stream_options": {"include_usage": True},
             "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(f"{base}/v1/chat/completions", data=json.dumps(body).encode(),
@@ -86,7 +88,10 @@ def main():
     ap.add_argument("--steps", default="session1,turn2,session2")
     ap.add_argument("--out", default="prefix_reuse.jsonl")
     ap.add_argument("--timeout", type=float, default=3600)
+    ap.add_argument("--max-tokens", type=int, default=4)
     a = ap.parse_args()
+    global MAX_TOKENS
+    MAX_TOKENS = a.max_tokens
     base = f"http://127.0.0.1:{a.port}"
     S = fixed_system_prompt(a.sys_tokens, a.seed)
     q1 = "List the tools whose name contains the word cache. Answer briefly."

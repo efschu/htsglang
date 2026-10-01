@@ -1,0 +1,46 @@
+{
+  "label": "kt128_cp512",
+  "port": 31671,
+  "peak_tok_per_s": 157.98452719370553,
+  "peak_at_tokens": 2048,
+  "runA": [
+    {
+      "approx_tokens": 512,
+      "prompt_tokens": 404,
+      "n": 5,
+      "median_s": 2.836167393994401,
+      "min_s": 2.797157271998003,
+      "tok_per_s": 142.44575297476166,
+      "cached_tokens_total": 0
+    },
+    {
+      "approx_tokens": 2048,
+      "prompt_tokens": 1555.0,
+      "n": 2,
+      "median_s": 10.077047627994034,
+      "min_s": 9.947001296997769,
+      "tok_per_s": 154.31106980979337,
+      "cached_tokens_total": 0
+    }
+  ],
+  "runA_prime": [
+    {
+      "approx_tokens": 512,
+      "prompt_tokens": 405,
+      "n": 5,
+      "median_s": 2.8333497590065235,
+      "min_s": 2.7466069299989613,
+      "tok_per_s": 142.94034780302164,
+      "cached_tokens_total": 0
+    },
+    {
+      "approx_tokens": 2048,
+      "prompt_tokens": 1556.0,
+      "n": 2,
+      "median_s": 9.849065776499629,
+      "min_s": 9.681194787001004,
+      "tok_per_s": 157.98452719370553,
+      "cached_tokens_total": 0
+    }
+  ]
+}

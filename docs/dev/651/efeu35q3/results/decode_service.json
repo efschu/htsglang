@@ -1,0 +1,26 @@
+{
+  "label": "service",
+  "port": 31651,
+  "runA": {
+    "tag": "A",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 1.6922327334978036,
+    "gap_median_ms": 50.46948549716035,
+    "gap_p90_ms": 51.45333999826107,
+    "gap_max_ms": 74.52176899823826,
+    "decode_tok_per_s": 19.81395273102724
+  },
+  "runA_prime": {
+    "tag": "A'",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 1.693381982993742,
+    "gap_median_ms": 50.58805349835893,
+    "gap_p90_ms": 51.86809900624212,
+    "gap_max_ms": 76.73461799276993,
+    "decode_tok_per_s": 19.76751289773266
+  },
+  "noise_floor_pct": 0.2343794492951233,
+  "decode_tok_per_s": 19.81395273102724
+}

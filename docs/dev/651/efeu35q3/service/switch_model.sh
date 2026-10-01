@@ -13,6 +13,13 @@ case "${1:-}" in
   q4)  [ -f "$D/50-q38.conf" ] && mv "$D/50-q38.conf" "$D/50-q38.conf.disabled" ;;
   *) echo "usage: $0 [q38|q4]"; exit 2 ;;
 esac
+# The coding agent's context window must match the served --context-length
+# (q38: 32768, q4/kt: 16384), so its model registry follows the switch.
+OMP=/home/efeu/.omp/agent/models.yml
+if [ -f "$OMP.$1" ]; then
+  install -o efeu -g efeu -m 0644 "$OMP.$1" "$OMP"
+  echo "omp registry: $OMP.$1"
+fi
 systemctl daemon-reload
 systemctl restart htsglang-ondemand
 sleep 2

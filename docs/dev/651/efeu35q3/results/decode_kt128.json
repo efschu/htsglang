@@ -1,0 +1,26 @@
+{
+  "label": "kt128",
+  "port": 31671,
+  "runA": {
+    "tag": "A",
+    "requests": 2,
+    "tokens_timed": 252,
+    "ttft_median_s": 0.7056387795018964,
+    "gap_median_ms": 83.9169074970414,
+    "gap_p90_ms": 126.32246100110933,
+    "gap_max_ms": 143.74892599880695,
+    "decode_tok_per_s": 11.91654971359921
+  },
+  "runA_prime": {
+    "tag": "A'",
+    "requests": 2,
+    "tokens_timed": 252,
+    "ttft_median_s": 0.6313381415020558,
+    "gap_median_ms": 83.7936805037316,
+    "gap_p90_ms": 99.65200298756827,
+    "gap_max_ms": 135.05092699779198,
+    "decode_tok_per_s": 11.934074192569533
+  },
+  "noise_floor_pct": 0.14684405918335947,
+  "decode_tok_per_s": 11.934074192569533
+}
