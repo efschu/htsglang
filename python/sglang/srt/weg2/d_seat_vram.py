@@ -150,6 +150,64 @@ def extra_rows_for_rank(rank: int, raw: Optional[str] = None) -> int:
     return vals[rank] if 0 <= int(rank) < len(vals) else 0
 
 
+def lend_on() -> bool:
+    """D-TRANSIENT-LEND (weg2/d_transient_lend.py): the switch AND the elastic
+    rows (its diagnostic stop stops the lend too)."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_D_TRANSIENT_LEND.get()) and elastic_on()
+
+
+def lend_armed() -> bool:
+    """The lend can run: switched on AND the launcher wrote the floor (the
+    near-OOM edge it lends down to). Without the floor the bank keeps its
+    lattice and nothing is lent -- byte-identical to before."""
+    if not lend_on():
+        return False
+    from sglang.srt.environ import envs
+
+    return bool(str(envs.SGLANG_WEG2_D_LEND_FLOOR_MIB.get() or "").strip())
+
+
+def lend_head_rows_for_rank(rank: int, raw: Optional[str] = None) -> int:
+    """``SGLANG_WEG2_D_LEND_HEAD_ROWS`` for one MoE TP rank (one value = every
+    rank); 0 unless the lend is armed (``lend_armed``)."""
+    if raw is None:
+        if not lend_armed():
+            return 0
+        from sglang.srt.environ import envs
+
+        raw = envs.SGLANG_WEG2_D_LEND_HEAD_ROWS.get() or ""
+    return extra_rows_for_rank(rank, raw)
+
+
+def lend_floor_mib_for_rank(rank: int, raw: Optional[str] = None) -> Optional[float]:
+    """The near-OOM edge of this D rank (``SGLANG_WEG2_D_LEND_FLOOR_MIB``),
+    None when the launcher wrote none -- no lend then, nothing is guessed."""
+    if raw is None:
+        from sglang.srt.environ import envs
+
+        raw = envs.SGLANG_WEG2_D_LEND_FLOOR_MIB.get()
+    parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    if not parts:
+        return None
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if len(vals) == 1:
+        return vals[0]
+    return vals[rank] if 0 <= int(rank) < len(vals) else None
+
+
+def lend_lattice(x_max: int, step: int) -> Tuple[int, ...]:
+    """The row counts a lend may end at: every ``step`` rows and the top."""
+    x_max, step = int(x_max), int(step)
+    if x_max <= 0 or step <= 0:
+        return ()
+    return tuple(sorted(set(range(step, x_max + 1, step)) | {x_max}))
+
+
 # ---------------------------------------------------------------------------
 # the pure arithmetic (shared by the runtime and the planner's seat table)
 # ---------------------------------------------------------------------------
@@ -1185,7 +1243,8 @@ def presplit_seat_rows(layer) -> int:
         return 0
     if str(os.environ.get(POOL_GRAPH_MODE_ENV, "")).strip().lower() != "pool":
         return 0
-    x = extra_rows_for_rank(int(getattr(layer, "moe_tp_rank", 0) or 0))
+    rank = int(getattr(layer, "moe_tp_rank", 0) or 0)
+    x = extra_rows_for_rank(rank)
     if x <= 0:
         return 0
     if not tms().available:
@@ -1194,7 +1253,14 @@ def presplit_seat_rows(layer) -> int:
             "saver has no span map (tms_set_spans, tms_csrc patch 3) -- the bank stays "
             "at its cap form, no seat rows", LINE_MARK, x)
         return 0
-    return int(x)
+    # D-TRANSIENT-LEND: a virtual head above the planner's seat rows (VA only);
+    # the capture floor and the stage cells never count it (seat_lend_head)
+    head = lend_head_rows_for_rank(rank)
+    try:
+        layer._weg2_seat_lend_head = int(head)
+    except AttributeError:  # a slotted test double: no head
+        head = 0
+    return int(x) + int(head)
 
 
 def seat_expert_buffer(*, rows: int, extra: int, tail: Tuple[int, ...], dtype, device,
@@ -1339,20 +1405,34 @@ class SeatVram:
     copy_ms: float = 0.0
     #: D-SEAT-REWAKE: the last live re-seat's pause in parts (ms)
     last_reseat_parts: Dict[str, float] = field(default_factory=dict)
+    #: D-TRANSIENT-LEND: the virtual head above the planner's seat rows (VA
+    #: only, never in a cell), the bank's top, the rows ON a lend started
+    #: from (None = nothing lent) and the rows lent / given back in total
+    lend_head: int = 0
+    x_max: int = 0
+    lent_from: Optional[int] = None
+    lent_rows: int = 0
+    returned_rows: int = 0
     #: the last span plan set on each managed allocation; after its tag's
     #: resume or a live apply it IS the saver's extents (one per range)
     spans_by_ptr: Dict[int, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
 
     def __post_init__(self):
         x_max = min((int(getattr(c, "seat_rows", 0)) for c in self.caches), default=0)
+        # D-TRANSIENT-LEND: the head is VA for a lend only -- the phase table
+        # and the stage cells see the planner's rows (byte-identical form)
+        head = min((int(getattr(c, "seat_lend_head", 0) or 0) for c in self.caches), default=0)
+        self.lend_head = max(0, min(int(head), x_max))
+        self.x_max = int(x_max)
+        x_cells = x_max - self.lend_head
         self.rows = seat_vram_rows(
             [m.geom for m in self.slot_tensors], [m.geom for m in self.row_tensors],
-            cap=self.cap, pool_size=self.pool_size, extra_max=x_max, granule=self.granule)
+            cap=self.cap, pool_size=self.pool_size, extra_max=x_cells, granule=self.granule)
         if self.form is not None and self.kv_tensors:
             self.cells = stage_vram_cells(
                 [m.geom for m in self.slot_tensors], [m.geom for m in self.row_tensors],
                 [m.geom for m in self.kv_tensors], cap=self.cap, pool_size=self.pool_size,
-                extra_max=x_max, stage_tokens=self.form.tokens,
+                extra_max=x_cells, stage_tokens=self.form.tokens,
                 boot_rows_on=self.form.rows_on, granule=self.granule)
             check_form_against_cells(self.form, self.cells, self.cap)
         # F5 (27B 28.09.): a rank with its own stage rows but no KV cells is
@@ -1364,6 +1444,12 @@ class SeatVram:
             ks.add(int(c.extra_rows))
             if int(c.rows_full) >= 0:
                 ks.add(int(c.rows_full))
+        if lend_armed():
+            # D-TRANSIENT-LEND: a lend ends on the lattice, so it and its
+            # return release whole cells only (S1-Wisch) from any phase's k
+            from sglang.srt.environ import envs
+
+            ks.update(lend_lattice(x_max, int(envs.SGLANG_WEG2_D_LEND_STEP_ROWS.get())))
         self.row_cut_ks = tuple(sorted(k for k in ks if 0 <= k <= max(0, x_max)))
         # the extents the birth trims left (seat_expert_buffer: the cap form's
         # rows; kv_stage_born: stage S0), both one range per span, no cuts
@@ -1622,6 +1708,7 @@ class SeatVram:
             else:
                 self.refilled_rows += k - int(self.rows_on)
         self.rows_on = k
+        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
         applied = PhaseApplied(
             n=n, extra_rows=k,
             mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep, self.granule))
@@ -1712,6 +1799,86 @@ class SeatVram:
         torch.cuda.synchronize()
         self.sync_ms += (time.perf_counter() - t0) * 1000.0
 
+    def _bank_bytes_at(self, k: int) -> int:
+        """The bytes the bank's pages hold with ``k`` seat rows ON."""
+        return sum(span_bytes(self.bank_spans(m, k)) for m in self.row_tensors)
+
+    def _bank_live(self) -> bool:
+        return any((lambda i: i is not None and i.active)(self.spans.info(m.ptr))
+                   for m in self.row_tensors)
+
+    def lend_target(self, budget_bytes: int) -> int:
+        """D-TRANSIENT-LEND: the largest lattice k above ``rows_on`` whose bank
+        pages cost at most ``budget_bytes`` more than now; ``rows_on`` when no
+        step fits (pure arithmetic, no CUDA)."""
+        base = int(self.rows_on)
+        have = self._bank_bytes_at(base)
+        best = base
+        for c in self.row_cut_ks:
+            if c <= base or c > int(self.x_max):
+                continue
+            if self._bank_bytes_at(c) - have <= int(budget_bytes):
+                best = int(c)
+        return best
+
+    def lend(self, budget_bytes: int) -> int:
+        """D-TRANSIENT-LEND (user law 10:20Z): card bytes free between two
+        extends become expert rows. Only a LIVE bank of an applied phase
+        lends; the rows grow like every grow of this class -- map first, then
+        ON (no sync, no kernel reads a moved byte), halved if the card says
+        no (``_grow_bank_elastic``). The phase cell is not touched: the lend
+        rides above it until ``unlend`` or the next phase move. Returns the
+        rows added."""
+        if self.applied is None or not self.row_tensors or not self._bank_live():
+            return 0
+        base = int(self.rows_on)
+        want = self.lend_target(budget_bytes)
+        if want <= base:
+            return 0
+        plans = [(m, self.bank_spans(m, want), True) for m in self.row_tensors]
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        k = self._grow_bank_elastic(plans, want, census)
+        for cache in self.caches:
+            cache.set_seat_rows_on(k, device_write=True)
+        if k > base:
+            if self.lent_from is None:
+                self.lent_from = base
+            self.refilled_rows += k - base
+            self.lent_rows += k - base
+        self.rows_on = int(k)
+        applied = self.applied
+        log_live_spans(census, n=applied.n, stage=applied.stage, rows_from=base,
+                       rows_to=int(k), mamba_keep=self.mamba_keep, order="lend")
+        return int(k) - base
+
+    def unlend(self) -> int:
+        """D-TRANSIENT-LEND: the lent rows go back before anything that needs
+        the bytes (an extend, a stage move): rows OFF coldest first, sync,
+        then the cells above the phase's k are released (whole lattice cells,
+        S1-Wisch). Returns the rows given back."""
+        if self.lent_from is None:
+            return 0
+        base = int(self.lent_from)
+        cur = int(self.rows_on)
+        self.lent_from = None
+        if cur <= base:
+            return 0
+        live = self._bank_live()
+        plans = [(m, self.bank_spans(m, base), live) for m in self.row_tensors]
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
+        self._rows_off_live(base, live)
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        self._set_bank_plans(plans, census)
+        self.evicted_rows += cur - base
+        self.returned_rows += cur - base
+        self.rows_on = base
+        applied = self.applied
+        log_live_spans(census, n=applied.n if applied is not None else 0,
+                       stage=applied.stage if applied is not None else None,
+                       rows_from=cur, rows_to=base, mamba_keep=self.mamba_keep, order="return")
+        return cur - base
+
     def apply(self, n: int) -> PhaseApplied:
         """The pages of a phase of ``n`` seats (``n`` = cap: the cap form).
         Called BEFORE the saver resumes the tag of a paused allocation (its
@@ -1759,6 +1926,7 @@ class SeatVram:
         log_live_spans(census, n=n, stage=None, rows_from=int(self.rows_on), rows_to=int(k),
                        mamba_keep=self.mamba_keep)
         self.rows_on = int(k)
+        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
         applied = PhaseApplied(
             n=n, extra_rows=int(k),
             mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep, self.granule))
@@ -1869,6 +2037,7 @@ class SeatVram:
         elif k > rows_from:
             self.refilled_rows += k - rows_from
         self.rows_on = int(k)
+        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
         log_live_spans(census, n=n, stage=stage, rows_from=rows_from, rows_to=int(k),
                        mamba_keep=self.mamba_keep, order="bank-first" if grow else "mamba-first")
         prev = self.applied

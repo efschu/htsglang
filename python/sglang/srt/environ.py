@@ -3182,6 +3182,28 @@ class Envs:
     #   coldest kept rows first (weg2/d_mem_sched.py). ON by default; this is
     #   the diagnosis-only emergency stop, not a feature switch.
     SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS = EnvBool(False)
+    # D-TRANSIENT-LEND (01.10., user law "free VRAM is always experts"): between
+    #   two extends D's statically booked transient (corridor floor above the
+    #   near-OOM edge, awake overshoot, extend activation, the KV share the
+    #   stage does not map) sits free on the card -- fqnsdm 01.10.: 1.7-2.0 GiB
+    #   NVML-free per rank for ~95 % of D's time. It is lent as extra LRU
+    #   expert rows after SETTLE decode rounds and returned (rows OFF coldest
+    #   first, sync, unmap) before the next extend / stage move / wake
+    #   (weg2/d_transient_lend.py). ON by default; off = byte-identical.
+    SGLANG_WEG2_D_TRANSIENT_LEND = EnvBool(True)
+    #   The near-OOM edge per D rank (MiB, "767,700,701"): the launcher writes
+    #   the card ledger's floor beside SGLANG_WEG2_EXTEND_TRIM_MIB. Unset = no
+    #   lend (nothing is guessed).
+    SGLANG_WEG2_D_LEND_FLOOR_MIB = EnvStr(None)
+    #   Virtual seat rows a lend may take above the rank's own seat rows (VA
+    #   only: unmapped rows cost no byte), per rank or one value; only ranks
+    #   that already have seat rows get them.
+    SGLANG_WEG2_D_LEND_HEAD_ROWS = EnvStr("16")
+    #   The lend lattice: the bank's plans are cut every STEP rows so a lend
+    #   and its return release whole cells only (S1-Wisch).
+    SGLANG_WEG2_D_LEND_STEP_ROWS = EnvInt(4)
+    #   Decode rounds in a row before a lend (a burst of extends lends nothing).
+    SGLANG_WEG2_D_LEND_SETTLE_ROUNDS = EnvInt(8)
     # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
     #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
     #   books S0; the KV between the floor and S0 is born unmapped and funds

@@ -13588,6 +13588,12 @@ def d_extend_trim_env(ledger, fits, growth_mib: Optional[Sequence[Optional[float
     return _et.launcher_thresholds(ledger.floor_mib, [act[r] for r in range(n)], growth_mib)
 
 
+def d_lend_floor_env(ledger) -> str:
+    """D-TRANSIENT-LEND: ``SGLANG_WEG2_D_LEND_FLOOR_MIB`` = the card ledger's
+    near-OOM floor per rank (MiB, rounded up)."""
+    return ",".join(str(int(math.ceil(float(f)))) for f in ledger.floor_mib)
+
+
 D_ONLY_LABEL = "D(d-only, expectation)"
 
 
@@ -18470,6 +18476,16 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                       if _growth is not None else "floor + gebuchte Aktivierung je Rang")
             log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-TRIM SGLANG_WEG2_EXTEND_TRIM_MIB={_trim} "
                 f"({_gtext}; darunter leert D vor dem Extend den Allokator-Cache)")
+        # D-TRANSIENT-LEND: the near-OOM edge per rank, down to which D lends
+        # its booked transient as expert rows between extends; a value named
+        # in --env-d wins
+        _env_d = getattr(ns, "env_d", "") or ""
+        if "SGLANG_WEG2_D_LEND_FLOOR_MIB" not in parse_group_env(_env_d):
+            _lend = d_lend_floor_env(_ledger)
+            ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_D_LEND_FLOOR_MIB", _lend)
+            log(f"{D_RANK_SOLVE_MARKER} {label} TRANSIENT-LEND SGLANG_WEG2_D_LEND_FLOOR_MIB={_lend} "
+                f"(Karten-Boden je Rang; zwischen zwei Extends werden die Bytes darueber "
+                f"Expertenzeilen, vor dem Extend zurueckgegeben)")
         # rc12g: the extend chunk follows the card after the trim
         # (WEG2-EXTEND-STUECKELUNG); a value named in --env-d wins.
         _rate, _rate_src = d_extend_growth_per_row_record(ns.profile)
