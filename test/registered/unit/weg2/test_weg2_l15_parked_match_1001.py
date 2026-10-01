@@ -52,6 +52,13 @@ class _FakeTree:
         self.calls = []
 
     def match_prefix(self, params):
+        # the real tree compares keys with RadixKey.match, which asserts the
+        # SAME container type as the stored keys: array('q') (N3h 22:52Z:
+        # AssertionError (array.array, list) on a list key)
+        from array import array as _array
+
+        tid = params.key.token_ids
+        assert isinstance(tid, _array) and tid.typecode == "q", (type(tid), getattr(tid, "typecode", None))
         self.calls.append(params)
         n = len(params.key.token_ids)
         slots, node = self.by_len[n]
