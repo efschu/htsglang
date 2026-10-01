@@ -20062,6 +20062,11 @@ class Scheduler(
                             kv_buffers=_kv,
                             mamba_buffers=_mb,
                             allocator=self.token_to_kv_pool_allocator,
+                            # L15-FIX-DUPKW: the builder puts mamba_allocator
+                            # into the returned kwargs dict; passing it here
+                            # AND at retain_at_sleep was the boot killer
+                            # ("multiple values for keyword argument").
+                            mamba_allocator=_l15_mba,
                             reset_keep=self.tree_cache.reset_keep,
                             set_keep=_set_keep_collect,
                             # L15-12c-C: per-(group, rank) manifest file -- the
@@ -20108,7 +20113,9 @@ class Scheduler(
             _l15_res = None
             if _l15_kwargs is not None:
                 _l15_res = l15_retain.retain_at_sleep(
-                    mamba_allocator=_l15_mba,
+                    # L15-FIX-DUPKW: mamba_allocator travels inside
+                    # **_l15_kwargs (build_retain_kwargs always emits it);
+                    # an explicit copy here duplicated the keyword.
                     # L15-11d: step (4) remaps the REAL tree component
                     # values (the old fake kv_slots/anchor_slot writes were
                     # never read); shared visited set is owned by retain.
