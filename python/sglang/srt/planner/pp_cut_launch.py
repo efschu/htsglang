@@ -68,7 +68,7 @@ away, and its row is printed on every boot that does not take it.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.planner.pp_cut import (
     LAYER_FAMILY_ATTENTION,
@@ -964,6 +964,9 @@ def solve_launch_cut(
     pool_floor: Optional[int] = None,
     pool_floor_from_cut: Optional[Sequence[int]] = None,
     depth_profile: Optional[Sequence[Tuple[float, float]]] = None,
+    stage_model: Optional[Any] = None,
+    chunk_mix: Optional[Sequence[Tuple[int, int, str, float]]] = None,
+    stage_model_provenance: str = "",
 ) -> CutDecision:
     """Choose the layer + attention cut, for ``objective``, among the feasible.
 
@@ -1006,6 +1009,21 @@ def solve_launch_cut(
     ladder) is priced on its own chunks -- see
     ``planner.pgap_stage_fit.depth_profile``. The printed depth is the
     profile's weighted mean.
+
+    ``stage_model`` + ``chunk_mix`` (27B line, PP-COST 01.10., default None =
+    unchanged): every candidate is priced by the per-layer-type, per-card
+    model (``weg2.p_stage_model.LayerCostModel``, calibrated from the rank
+    lines) as the MEAN ms per chunk over the chunk mix of the predecessor boot
+    -- per chunk (width, prefix, graph/eager) the bottleneck stage, weighted
+    by how often that boot ran it (``p_stage_model.weighted_makespan``). That
+    replaces ``family_cost`` and the design prefix for the TIME axis; the
+    pool, the crossings and every floor stay as they are. Why: the
+    family/GEMM-rate model ranked 44,10,10 ahead of 43,11,10 by 4.9 % while
+    the rank lines of 19 + 36 boots measure the reverse (+4.5 % for 43,11,10
+    with the 44,10,10 boots' own chunk mix): it scales attention with the
+    5090:3080 GEMM ratio (~4:1, measured 2-4:1 for a full-attention layer)
+    and prices only the configured chunk at one depth, while the deep prefill
+    runs in 512-token chunks.
     """
     n_stages = len(incumbent_layers)
     total_layers = len(layer_families)
@@ -1087,6 +1105,18 @@ def solve_launch_cut(
     profile_w = sum(w for _, w in profile)
     if profile:
         depth = int(round(sum(d * w for d, w in profile) / profile_w))
+    use_stage_model = stage_model is not None and bool(chunk_mix)
+    if use_stage_model:
+        from sglang.srt.weg2 import p_stage_model as _psm
+
+        _mix_w = sum(float(n) for _w, _p, _m, n in chunk_mix)
+        depth = int(round(sum(float(p) * float(n) for _w, p, _m, n in chunk_mix) / _mix_w))
+        cost_provenance = (
+            "cost=STAGE MODEL (per layer type and card, calibrated from the rank lines; %s) "
+            "weighted over the predecessor boot's chunk mix (%d chunks, %d (width, depth, mode) cells, "
+            "mean prefix %d); family/card-rate terms below only order the enumeration: %s"
+            % (stage_model_provenance or "p_stage_model", int(_mix_w), len(chunk_mix), depth,
+               cost_provenance))
     pair_ms: Mapping[Tuple[int, int], float] = per_pair_crossing_ms or {}
     unpriced: List[str] = []
 
@@ -1103,7 +1133,17 @@ def solve_launch_cut(
             )
         except ValueError:
             return None
-        if family_cost is None:
+        if use_stage_model:
+            makespan = float(_psm.weighted_makespan(
+                stage_model, counts, chunk_mix, attn=attn, serial=(kind == "gapped")))
+            try:
+                cp = crossing_price(owned, int(total_layers), pair_ms)
+            except UnpricedCrossing as exc:
+                unpriced.append("%s layers=%s attn=%s: %s" % (
+                    kind, ",".join(str(n) for n in counts), ",".join(str(a) for a in attn), exc))
+                return None
+            cross, n_cross = cp.ms, cp.crossings
+        elif family_cost is None:
             if fallback_ms is None:
                 return None
             makespan, cross, n_cross = float(fallback_ms), 0.0, 0
@@ -1165,7 +1205,7 @@ def solve_launch_cut(
     # id by every admissible split. That is the family the contiguous
     # enumeration cannot reach at all, and the user's 0/8/8 and 4/6/6 both
     # live in it.
-    if enumerate_gapped and family_cost is not None:
+    if enumerate_gapped and (family_cost is not None or use_stage_model):
         n_attn_total = sum(1 for f in layer_families if f == LAYER_FAMILY_ATTENTION)
         for gdn_stage in range(n_stages):
             for split in enumerate_gapped_splits(n_attn_total, n_stages, gdn_stage):

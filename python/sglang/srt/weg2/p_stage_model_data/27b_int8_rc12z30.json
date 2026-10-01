@@ -1,0 +1,105 @@
+{
+ "cards": {
+  "RTX3080": {
+   "attn": {
+    "eager": [
+     [
+      1024,
+      0.69995
+     ],
+     [
+      2048,
+      0.67595
+     ]
+    ],
+    "graph": [
+     [
+      512,
+      0.67599
+     ]
+    ]
+   },
+   "gemm_ms": {
+    "eager": [
+     [
+      1024,
+      6.7042
+     ],
+     [
+      2048,
+      14.7922
+     ]
+    ],
+    "graph": [
+     [
+      512,
+      3.1223
+     ]
+    ]
+   },
+   "last_fixed_ms": {
+    "graph": [
+     [
+      512,
+      3.167
+     ]
+    ]
+   },
+   "name": "RTX3080"
+  },
+  "RTX5090": {
+   "attn": {
+    "eager": [
+     [
+      1024,
+      0.21348
+     ],
+     [
+      2048,
+      0.18116
+     ]
+    ],
+    "graph": [
+     [
+      512,
+      0.2816
+     ]
+    ]
+   },
+   "gemm_ms": {
+    "eager": [
+     [
+      1024,
+      1.8311
+     ],
+     [
+      2048,
+      3.472
+     ]
+    ],
+    "graph": [
+     [
+      512,
+      0.9221
+     ]
+    ]
+   },
+   "name": "RTX5090"
+  }
+ },
+ "layer_layout": {
+  "n_layers": 64,
+  "offset": 3,
+  "period": 4
+ },
+ "power_limit_w": {
+  "RTX3080": 230.0,
+  "RTX5090": 400.0
+ },
+ "source": "rank-line fit (p_stage_model.fit_model_from_logs, prefix = #1469 RETAIN token_ids_len - #new-token) of boot_weg2_dkr27browauthoritybar1w109290020_bb82fbcb68_0929_002107.P.log cut 43,11,10 | boot_weg2_dkr27browauthoritybar1fs10010415_86d80796e0_1001_041510.P.log cut 44,10,10 | boot_weg2_dkr27browauthoritybar1fs10011251_86bf423f70_1001_125148.P.log cut 44,10,10 | boot_weg2_dkr27browauthoritybar1fs10011917_e9a1bee605_1001_191751.P.log cut 44,10,10 | boot_weg2_dkr27browauthoritybar1fs10012013_4b49f9824f_1001_201330.P.log cut 44,10,10 || cut 43,11,10: PP0 w512 graph a=39.52 s=2.8121 n=360; PP0 w1024 eager a=78.08 s=2.2212 n=63; PP1 w512 graph a=35.22 s=2.0104 n=368; PP1 w1024 eager a=75.03 s=2.1171 n=52; PP2 w512 graph a=34.25 s=2.0363 n=362; PP2 w1024 eager a=66.14 s=2.1832 n=34 || cut 44,10,10: PP0 w512 graph a=40.70 s=3.1011 n=1014; PP0 w1024 eager a=81.21 s=2.2697 n=325; PP0 w2048 eager a=152.77 s=1.9928 n=36; PP1 w512 graph a=30.26 s=1.3498 n=941; PP1 w1024 eager a=66.22 s=1.3002 n=213; PP1 w2048 eager a=153.44 s=1.3000 n=19; PP2 w512 graph a=34.53 s=2.0386 n=965; PP2 w1024 eager a=67.36 s=2.0657 n=212; PP2 w2048 eager a=142.41 s=2.0625 n=20 || notes: RTX5090 graph: first fixed term not separable or negative at some width -- folded into the per-layer rate at every graph width; RTX5090 eager: first fixed term not separable or negative at some width -- folded into the per-layer rate at every eager width; RTX3080 eager: last fixed term not separable or negative at some width -- folded into the per-layer rate at every eager width",
+ "stage_cards": [
+  "RTX5090",
+  "RTX3080",
+  "RTX3080"
+ ]
+}
