@@ -19801,7 +19801,12 @@ class Scheduler(
             _l15_mba = None
             try:
                 from sglang.srt.weg2 import (
-                    l15_bind, l15_manifest, l15_plan, l15_retain, l15_shadow
+                    l15_bind,
+                    l15_keep_arm,
+                    l15_manifest,
+                    l15_plan,
+                    l15_retain,
+                    l15_shadow,
                 )
 
                 if l15_plan.master_on(os.environ) and (
@@ -19997,15 +20002,25 @@ class Scheduler(
                 if _l15_res is not None:
                     # The keep spans are the one thing retain_at_sleep
                     # itself could not persist (it collects per view); one
-                    # adapter call per base, rc != 0 raises.
-                    for _b, _ranges in _keep_by_base.values():
-                        _rc = _ad.set_keep_byte_spans(_b, _ranges)
-                        if _rc != 0:
-                            raise RuntimeError(
-                                f"L15-RETAIN set_keep_byte_spans rc={_rc}: the "
-                                f"buffers are moved but NOT kept "
-                                f"(base={_b.data_ptr()})"
-                            )
+                    # adapter call per base. L15-12c-F2: a failing arm must
+                    # NOT raise here -- the rows have moved and the
+                    # manifest is written; raising left that manifest
+                    # claiming a hold while the pause discarded the pages
+                    # (garbage KV at the wake). The helper discards this
+                    # rank's manifest, clears the already-armed bases, logs
+                    # once and returns False; dropping _l15_res then makes
+                    # the sleep finish as the plain flush below, so this
+                    # rank votes None at the wake while its peers vote a
+                    # fingerprint -> mixed verdict -> group fallback
+                    # (the existing rule; no wake-side code here).
+                    if not l15_keep_arm.arm_keep_spans(
+                        _ad,
+                        _keep_by_base,
+                        _l15_kwargs["manifest_path"],
+                        rank=_l15_rank,
+                        log=logger.warning,
+                    ):
+                        _l15_res = None
             self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None

@@ -154,10 +154,11 @@ def test_flush_retains_only_behind_master_and_in_result_branch():
     # The fallback catch covers the SETUP only; the call sits after it.
     assert src.index("L15-RETAIN failed before the move") < src.index(call)
     # Per-base aggregation: the collector sits before the call, the real
-    # keep calls (set_keep_byte_spans, one per allocation base) go out
-    # AFTER it, and the mamba views come from the pool's mamba_cache.
+    # keep calls (L15-12c-F2: l15_keep_arm.arm_keep_spans, one adapter
+    # call per allocation base inside the helper) go out AFTER it, and
+    # the mamba views come from the pool's mamba_cache.
     assert src.index("_keep_by_base") < src.index(call), "collector pre-move"
-    assert src.index("set_keep_byte_spans") > src.index(call), (
+    assert src.index("l15_keep_arm.arm_keep_spans") > src.index(call), (
         "keep spans are applied per base only after a retain result"
     )
     assert '"mamba_cache"' in src, "mamba views sourced from the pool cache"
