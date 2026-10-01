@@ -13752,7 +13752,65 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
         env["SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS"] = str(int(getattr(ns, "dual_d_kv_max_tokens", 0) or 0))
     if group == "P":
         env["SGLANG_WEG2_DUAL_SHARE"] = "1"
+    if group == "P" and dual_p_sleep_armed(ns):
+        # D PRIORITY stage 2: P's weights are NOT resident (the resident arm
+        # refuses any weights release by name); D stays resident, D never sleeps
+        from sglang.srt.managers.weg2_memory_saver import WEIGHTS_RESIDENT_ENV
+
+        env[WEIGHTS_RESIDENT_ENV] = "0"
     return env
+
+
+def dual_p_sleep_armed(ns) -> bool:
+    """D PRIORITY stage 2 is armed: dual layout + unified KV + --dual-p-sleep on."""
+    return (bool(getattr(ns, "dual_layout", False)) and bool(getattr(ns, "dual_share", False))
+            and str(getattr(ns, "dual_unified_kv", "off")) == "on"
+            and str(getattr(ns, "dual_p_sleep", "on")) == "on")
+
+
+def apply_dual_p_sleep(ns, spec_p, log) -> bool:
+    """D PRIORITY stage 2 on P's spec: the weights CPU backup, never through the
+    host ring (a resting pinned pool would be a permanent host image). The
+    not-resident env comes with dual_share_env(ns, "P")."""
+    if not dual_p_sleep_armed(ns):
+        return False
+    spec_p.argv = dual_p_sleep_argv(ns, spec_p.argv)
+    for _k in ("TMS_HOST_RING_DIR", "TMS_HOST_RING_MAP", "TMS_HOST_RING_EPOCH", "TMS_HOST_RING_FORM"):
+        spec_p.env.pop(_k, None)
+    log("WEG2-DUAL-P-SLEEP armed: P --enable-weights-cpu-backup, weights not resident, no host ring "
+        "(image allocated at the pause, freed after the restore)")
+    return True
+
+
+def dual_p_sleep_argv(ns, argv_p) -> List[str]:
+    """P's argv with the weights CPU backup when stage 2 is armed (P only; the
+    host ring stays absent for P -- dual_p_sleep_env pops it -- so the image is
+    the stock per-pause pinned block, freed after the restore)."""
+    argv_p = list(argv_p)
+    if dual_p_sleep_armed(ns) and "--enable-weights-cpu-backup" not in argv_p:
+        argv_p.append("--enable-weights-cpu-backup")
+    return argv_p
+
+
+#: D's verify tokens per seat and round on the 27B dual (DFlash: the draft's
+#: block plus the bonus token); the look-ahead's per-seat term
+DUAL_D_VERIFY_TOKENS = 4
+
+
+def dual_d_air_tokens(d_bs: int, chunk: int = CHUNKED_PREFILL_TOKENS,
+                      verify: int = DUAL_D_VERIFY_TOKENS) -> int:
+    """D's look-ahead in tokens (d_mem_sched.air_tokens): one extend chunk plus
+    one decode round of every seat with the draft's tokens."""
+    return int(chunk) + max(1, int(d_bs)) * max(1, int(verify))
+
+
+def dual_p_sleep_front_env(ns, d_air_tokens: int) -> Dict[str, str]:
+    """The front's capability switch and D's look-ahead in tokens."""
+    if not dual_p_sleep_armed(ns):
+        return {}
+    from sglang.srt.weg2 import dual_d_priority as _ddp
+
+    return {_ddp.P_SLEEP_ENV: "1", "SGLANG_WEG2_DUAL_D_AIR_TOKENS": str(int(d_air_tokens))}
 
 
 def dual_p_cut_from_argv(argv) -> str:
@@ -21042,6 +21100,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "(risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs "
                          "~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. "
                          "100 = no limit.")
+    ap.add_argument("--dual-p-sleep", choices=("off", "on"), default="on",
+                    help="DUAL-TP3PP3 with --dual-unified-kv on: D PRIORITY stage 2 (user decision 01.10.) -- "
+                         "when D is still short after P stopped and released its KV, P sleeps and parks its "
+                         "weights in host RAM (P boots with --enable-weights-cpu-backup and NOT resident; the "
+                         "vendored torch_memory_saver allocates the host image at the pause and frees it after "
+                         "the restore, tms_csrc/core.cpp -- no resting image, KEIN-DAUER-HOSTRAM). off = stage 1 "
+                         "only, the front prints 'stage=2 unavailable (weights resident)'.")
     ap.add_argument("--dual-unified-kv", choices=("off", "on"), default="off",
                     help="DUAL-TP3PP3: one KV pool per card shared by P and D at runtime (user orders "
                          "30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P maps KV only while it "
@@ -25311,6 +25376,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     f"p_free_reads_{ns.tag}")
         spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
+    apply_dual_p_sleep(ns, spec_p, log)  # D PRIORITY stage 2 (dual unified KV only)
     ns._dual_mps_env = start_dual_mps(ns, log, dry)
     spec_p.env.update(ns._dual_mps_env)
     spec_p.env.update(dual_p_sm_env(ns))
@@ -25893,6 +25959,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
+    # D PRIORITY stage 2: the front's capability + D's look-ahead (one extend
+    # chunk + one decode round of every seat with the draft's tokens)
+    fenv.update(dual_p_sleep_front_env(ns, dual_d_air_tokens(d_bs)))
     # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
     # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
     #

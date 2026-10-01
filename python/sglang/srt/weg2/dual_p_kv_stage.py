@@ -482,6 +482,8 @@ def attach(runner) -> Optional["PKvStage"]:
     actor = PKvStage(list(_P_BORN), ledger, allocator=runner.token_to_kv_pool_allocator, pools=pools,
                      page_size=int(runner.page_size), granule=_sv.granule_for(dev),
                      top_tokens=max_tokens(), sync=lambda: torch.cuda.synchronize(dev))
+    # D PRIORITY stage 2: the weights image this rank parks in host RAM at a sleep
+    actor.weights_bytes = int(float(getattr(runner, "weight_load_mem_usage", 0) or 0) * (1 << 30))
     boot = int(getattr(runner, "_dual_p_boot_tokens", 0) or 0)
     boot_bytes = actor.bytes_for(boot) - actor.bytes_for(0)
     ledger.contribute(boot_bytes, committed=0)
@@ -518,7 +520,9 @@ def publish_stage(actor: "PKvStage", tag: str, pp_rank: int) -> str:
     tmp = "%s.%d.tmp" % (path, os.getpid())
     with open(tmp, "w") as f:
         json.dump({"ledger": actor.ledger.path, "step": actor.step, "top": actor.top,
-                   "bytes": actor.table()}, f)
+                   "bytes": actor.table(),
+                   # D PRIORITY stage 2: this rank's weights image (the host peak of a sleep)
+                   "weights_bytes": int(getattr(actor, "weights_bytes", 0) or 0)}, f)
     os.replace(tmp, path)
     return path
 
@@ -716,6 +720,60 @@ def _wait_granted(rid: str):
     if not _WAITS:
         _CENSUS.update(next=0.0, iv=1.0, waits=0)
     return (e[3], _now() - e[0]) if e else None
+
+
+class Weg2DualPWakeShort(RuntimeError):
+    """W-DUAL-P-WAKE-SHORT: P was told to wake but the card pool cannot give
+    back the bytes P lent it at its sleep (D committed into them). The front's
+    hysteresis wakes P only when they are free; this is the named stop for the
+    case it cannot see."""
+
+
+def _sleep_armed(sched):
+    if str(os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() != "1":
+        return None
+    if str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip().upper() != "P":
+        return None
+    return _actor(sched)
+
+
+def sleep_phys_before(sched) -> Optional[int]:
+    """D PRIORITY stage 2, P's sleep leg: cuMemGetInfo before the release (dual P
+    only, else None -- the stock leg is untouched)."""
+    return phys_free_bytes() if _sleep_armed(sched) is not None else None
+
+
+def sleep_lend(sched, phys_before: Optional[int]) -> int:
+    """After P's sleep leg released its weights: lend the freed bytes to the card
+    pool (D's KV may grow into them while P sleeps)."""
+    actor = _sleep_armed(sched)
+    if actor is None or phys_before is None:
+        return 0
+    after = phys_free_bytes()
+    if after is None:
+        return 0
+    freed = max(0, int(after) - int(phys_before))
+    if freed:
+        actor.ledger.lend(freed)
+    actor._sleep_lent = int(getattr(actor, "_sleep_lent", 0) or 0) + freed
+    logger.warning("%s SLEEP-LEND freed=%d B -> the card pool while P sleeps (weights parked in host RAM, "
+                   "freed at the wake)", MARK, freed)
+    return freed
+
+
+def wake_reclaim(sched) -> int:
+    """Before P's wake maps its weights: take the loan back, or stop named."""
+    actor = _sleep_armed(sched)
+    lent = int(getattr(actor, "_sleep_lent", 0) or 0) if actor is not None else 0
+    if lent <= 0:
+        return 0
+    if not actor.ledger.reclaim(lent):
+        raise Weg2DualPWakeShort(
+            "W-DUAL-P-WAKE-SHORT: P's wake needs back the %d B it lent the card pool at its sleep, the pool "
+            "has %d B free -- D committed into the loan" % (lent, int(actor.ledger.state().free)))
+    actor._sleep_lent = 0
+    logger.warning("%s WAKE-RECLAIM %d B back from the card pool before P maps its weights", MARK, lent)
+    return lent
 
 
 def on_told(sched, item) -> None:
