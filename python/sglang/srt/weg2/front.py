@@ -7916,14 +7916,13 @@ class Front:
             granted.pop(r, None)
         return (len(running) + max(0, self._handoff_in_flight()) + len(ready) + len(granted), int(n))
 
-    async def _arrival_seat_kv_reading(self) -> Optional[Dict[str, Any]]:
-        """D's free KV (``/server_info`` internal_states[0].weg2_kv), at most 1 s
-        old; None when D does not publish it (the seat plan alone decides)."""
+    async def _arrival_seat_kv_fetch(self, gen: int) -> Optional[Dict[str, Any]]:
+        """One ``/server_info`` read of D's free KV. It lands in the cache only
+        while no KV park invalidated the readings since it was asked for
+        (``gen``): a read D answered before the park would describe the room
+        the park has just changed."""
         st = self._asr_st()
-        now = time.time()
-        cached = st.get("kv")
-        if cached is not None and now - cached[0] <= 1.0:
-            return cached[1]
+        t0 = time.time()
         got = None
         try:
             async with self.session.get(f"{self.groups['D'].url}/server_info",
@@ -7936,8 +7935,56 @@ class Front:
                             break
         except Exception:  # noqa: BLE001 -- no reading: the seat count decides
             got = None
-        st["kv"] = (now, got)
+        if int(st.get("kv_gen", 0)) == int(gen):
+            st["kv"] = (t0, got)
         return got
+
+    def _asr_kv_invalidate(self) -> None:
+        """The next KV test reads D afresh (and waits for it): after a KV park."""
+        st = self._asr_st()
+        st["kv"] = None
+        st["kv_gen"] = int(st.get("kv_gen", 0)) + 1
+
+    async def _arrival_seat_kv_reading(self) -> Optional[Dict[str, Any]]:
+        """D's free KV (``/server_info`` internal_states[0].weg2_kv), at most 1 s
+        old; None when D does not publish it (the seat plan alone decides).
+
+        KV READ BUDGET (01.10., NF D->P flip bfpgwv): D answers /server_info
+        only at its scheduler pass boundary -- a D prefill pass runs 3-6.6 s
+        there -- and the park RPC of the flip_now this reading decides waits
+        for a boundary too. Awaited in the controller tick, the read put the
+        park one whole D pass later (weg2-14-90: `kv=unread` after the 2.0 s
+        timeout at 18:36:46.07, D's pass had ended at 45.64, the park waited
+        for the next one: rpc 5.14 s). An older reading is refreshed in the
+        background; the tick waits for it at most the budget and otherwise
+        decides on the last reading D gave (the refresh lands for the next
+        tick). No reading at all (boot, or after a KV park) waits as before."""
+        st = self._asr_st()
+        now = time.time()
+        cached = st.get("kv")
+        if cached is not None and now - cached[0] <= 1.0:
+            return cached[1]
+        gen = int(st.get("kv_gen", 0))
+        pending = st.get("kv_task")
+        if pending is None or pending[0] != gen or pending[1].done():
+            pending = (gen, asyncio.ensure_future(self._arrival_seat_kv_fetch(gen)))
+            st["kv_task"] = pending
+        task = pending[1]
+        if cached is None:
+            return await asyncio.shield(task)
+        budget = _asr.kv_read_budget_s()
+        if not task.done() and budget > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+            except asyncio.TimeoutError:
+                pass
+        if task.done():
+            got = task.result()
+            if int(st.get("kv_gen", 0)) == gen:
+                return got
+        self.counters["arrival_seat_kv_stale"] += 1
+        st["kv_stale_ms"] = int(round((now - cached[0]) * 1000.0))
+        return cached[1]
 
     async def _arrival_seat_fits(self, est_prompt: int, max_tokens: Optional[int],
                                  rid: Optional[str] = None,
@@ -7986,6 +8033,10 @@ class Front:
             why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
                 why, int(est_prompt or 0), shared, decode, reserve, clip)
         st = self._asr_st()
+        stale_ms = st.pop("kv_stale_ms", None)
+        if stale_ms is not None:
+            why = "%s kv_age_ms=%d (D inside a pass: the last reading decides, its refresh lands next tick)" % (
+                why, stale_ms)
         st["need_terms"] = (shared, decode, reserve)
         return fits, why, deficit
 
@@ -8025,7 +8076,7 @@ class Front:
                                             park_cooldown=_asr.KV_PARK_COOLDOWN_S)
         if got is not None:
             self.counters["arrival_seat_kv_displace"] += 1
-            st["kv"] = None  # the next KV test reads D after the park
+            self._asr_kv_invalidate()  # the next KV test reads D after the park
             logger.warning("%s KV-DISPLACE rid=%s head=%s deficit=%d younger_tokens_lb=%d -- the head's KV "
                            "does not fit a free seat: the youngest decode that arrived after it parks at "
                            "its round boundary (span retained) and the head takes the room (#246)",

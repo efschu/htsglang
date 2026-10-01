@@ -3852,6 +3852,16 @@ class Envs:
     # stays its own under the AGE PLAN), is never rerouted. Name ordered by
     # the operator (no ENABLE verb); default on: a stability fix.
     SGLANG_WEG2_ARRIVAL_MIN_DWELL = EnvBool(True)
+    # ARRIVAL-SEAT KV reading budget (NF D->P flip, 01.10. bfpgwv): how long
+    # the controller tick waits for a FRESH /server_info from D before it
+    # decides on the last reading it has. D answers /server_info only at its
+    # scheduler pass boundary, and so does the park RPC that follows a
+    # flip_now -- a blocking read put the park one whole D pass later (6 of
+    # the 6 bfpgwv D->P flips over 4 s: `kv=unread` after the 2.0 s timeout,
+    # park RPC 1.0-5.1 s). The refresh keeps running in the background and
+    # lands for the next tick; no reading at all (boot, after a KV park)
+    # still waits for D as before. Seconds; 0 = never wait for a refresh.
+    SGLANG_WEG2_ARRIVAL_KV_READ_BUDGET_S = EnvFloat(0.05)
     # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
     # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
     # solo r_D probe never fired under load). X is re-solved from D's measured

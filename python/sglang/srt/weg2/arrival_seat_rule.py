@@ -70,7 +70,28 @@ COUNTERS = (
     # MIN-DWELL (30.09., y5c): flip_now verdicts held because the decodes
     # resumed this D phase had not yet decoded one flip round trip
     "arrival_seat_min_dwell_hold",
+    # KV READ BUDGET (01.10., NF D->P flip): KV tests decided on the last
+    # reading because D's /server_info did not answer within the budget (D
+    # inside a pass) -- the refresh lands for the next tick
+    "arrival_seat_kv_stale",
 )
+
+
+def kv_read_budget_s(env=None) -> float:
+    """How long a KV test waits for a FRESH ``/server_info`` reading from D
+    before it decides on the last one (SGLANG_WEG2_ARRIVAL_KV_READ_BUDGET_S,
+    default 0.05 s). D answers only at its scheduler pass boundary -- the same
+    boundary the park RPC of a flip_now waits for -- so a blocking read
+    serialised two boundaries in front of every D->P flip. Never negative."""
+    if env is not None:
+        raw = env.get("SGLANG_WEG2_ARRIVAL_KV_READ_BUDGET_S")
+        try:
+            return max(0.0, float(raw)) if raw not in (None, "") else 0.05
+        except (TypeError, ValueError):
+            return 0.05
+    from sglang.srt.environ import envs
+
+    return max(0.0, float(envs.SGLANG_WEG2_ARRIVAL_KV_READ_BUDGET_S.get()))
 
 
 def enabled(env=None) -> bool:
