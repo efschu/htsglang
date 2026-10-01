@@ -1,0 +1,14 @@
+[Unit]
+Description=Grafana (Verlaeufe aus VictoriaMetrics, LAN :3000, anonym lesend)
+After=network-online.target victoria-metrics.service
+
+[Service]
+WorkingDirectory=/opt/grafana
+ExecStart=/opt/grafana/bin/grafana server --homepath=/opt/grafana --config=/etc/grafana-rig/custom.ini
+Restart=always
+RestartSec=5
+Nice=5
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
