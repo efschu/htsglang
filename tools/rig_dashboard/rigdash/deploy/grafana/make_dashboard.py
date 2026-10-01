@@ -12,7 +12,7 @@ _id = [0]
 
 
 def panel(title, targets, unit="short", x=0, y=0, w=12, h=8, desc="", draw="line", stack=False, decimals=None,
-          kind="timeseries", min0=True):
+          kind="timeseries", min0=True, interval=None):
     _id[0] += 1
     fc = {"unit": unit, "custom": {"drawStyle": draw, "lineWidth": 1 if draw == "line" else 0, "fillOpacity": 12,
                                    "pointSize": 6, "showPoints": "always" if draw == "points" else "never",
@@ -27,6 +27,8 @@ def panel(title, targets, unit="short", x=0, y=0, w=12, h=8, desc="", draw="line
          "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean", "max"]},
                      "tooltip": {"mode": "multi", "sort": "desc"}},
          "targets": [dict({"datasource": DS, "refId": chr(65 + i)}, **t) for i, t in enumerate(targets)]}
+    if interval:
+        p["interval"] = interval
     if kind == "stat":
         p["options"] = {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
                         "colorMode": "none", "graphMode": "area", "textMode": "value_and_name"}
@@ -43,16 +45,19 @@ def row(title, y):
             "panels": []}
 
 
-TTFT_MEAN = ("sum by (model) (increase(weg2_front_ttft_ms_sum{model=~\"$model\"}[$__rate_interval])) / "
-             "sum by (model) (increase(weg2_front_ttft_count{model=~\"$model\"}[$__rate_interval])) / 1000")
+# Nutzer 01.10. (Nachtrag): TTFT und Flipzeit sind Einzelereignisse -> Punkte, keine Linien. Bis die Front je
+# Anfrage einen Punkt liefert (weg2_req, Feldwunsch), ist ein Punkt = die Anfragen eines 5-s-Takts der Bruecke.
+TTFT_MEAN = ("sum by (model) (increase(weg2_front_ttft_ms_sum{model=~\"$model\"}[5s])) / "
+             "(sum by (model) (increase(weg2_front_ttft_count{model=~\"$model\"}[5s])) > 0) / 1000")
 GPU_NAME = "* on (uuid) group_left (name, index) nvidia_smi_gpu_info"
 
 panels = [
     row("Nutzer-Latenz", 0),
-    panel("TTFT der Nutzer (Ø je Intervall)", [t(TTFT_MEAN, "{{model}}")], "s", 0, 1, 12, 8,
+    panel("TTFT der Nutzer (Punkt je 5-s-Takt)", [t(TTFT_MEAN, "{{model}}")], "s", 0, 1, 12, 8,
           "Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), IPC-Zähler "
           "state.json front.arrival_seat.ttft_* (NF). Mittel der Anfragen, deren erstes Token im Intervall kam. "
-          "27B: fehlt bis zum Image mit weg2_ttft_seconds (TSDB-Delta 01.10.)."),
+          "27B: fehlt bis zum Image mit weg2_ttft_seconds (TSDB-Delta 01.10.). Über P / direkt D getrennt: "
+          "fehlt in IPC (front.arrival_seat.ttft_by_via).", draw="points", interval="5s"),
     panel("TTFT max seit Boot / Anfragen je min", [
         t("max by (model) (weg2_front_ttft_ms_max{model=~\"$model\"}) / 1000", "max {{model}}"),
     ], "s", 12, 1, 6, 8, "state.json front.arrival_seat.ttft_ms_max"),
@@ -60,10 +65,11 @@ panels = [
         t("sum by (model) (rate(weg2_front_served_total{group=\"D\",model=~\"$model\"}[$__rate_interval])) * 60", "{{model}}")],
         "short", 18, 1, 6, 8, "state.json front.served.D"),
     panel("Flipzeit (je Flip)", [
-        t("max by (model) (weg2_flip_time_ms{dir=\"P>D\",model=~\"$model\"}) / 1000", "P→D {{model}}"),
-        t("max by (model) (weg2_flip_user_ms{model=~\"$model\"}) / 1000", "D→P {{model}}")],
-        "s", 0, 9, 12, 8, "P→D: P-Ende -> erstes Decode-Token (events.jsonl flip_first_work); "
-        "D→P: Decode-Ende -> P-Prefill-Start (flip_user_time). Ein Punkt je Flip, zum Zeitpunkt des Flips.", draw="points"),
+        t("max by (model, dir) (weg2_flip_user_view_ms{part=\"total\",model=~\"$model\"}) / 1000", "{{dir}} {{model}}"),
+        t("max by (model, dir) (weg2_flip_user_view_ms{part=\"layer\",model=~\"$model\"}) / 1000", "Layer-Tausch {{dir}} {{model}}")],
+        "s", 0, 9, 12, 8, "Nutzersicht (01.10.): P→D = P-Ende -> erstes Decode auf D (Rang-Segmente), "
+        "D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=vorlauf|layer|nachlauf|d_extend. "
+        "Ein Punkt je Flip zum flip_begin; Leerlauf-Flips ohne Wert.", draw="points"),
     panel("Upstream-TTFT des D-Beins (nicht Nutzer-TTFT)", [
         t("histogram_quantile(0.5, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))", "p50"),
         t("histogram_quantile(0.9, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))", "p90")],

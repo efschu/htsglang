@@ -149,6 +149,7 @@ class Bridge:
     def __init__(self, boots, url: str = DEFAULT_URL):
         self.boots, self.url = boots, url
         self.flip_seen: Dict[str, float] = {}
+        self.view_done: set = set()
         self.last: dict = {"t": None, "lines": 0, "error": None}
 
     def tick(self, now: Optional[float] = None) -> int:
@@ -167,6 +168,14 @@ class Bridge:
                 self.flip_seen[key] = 0.0
             pts, self.flip_seen[key] = flip_points(ipc, model, self.flip_seen[key])
             lines += pts
+            try:      # Flipzeit in Nutzersicht (Vorlauf/Layer/Nachlauf) aus den Rang-Segmenten des Rings
+                from . import ipcboot
+                m = b.model(key)
+                if m is not None and m.ring:
+                    segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc))["segs"]
+                    lines += flip_view_points(ipcboot.flip_views(segs, ipc, now), model, short_boot(key), self.view_done)
+            except Exception as e:  # noqa: BLE001 -- one boot's view never stops the push
+                self.last["flip_view_error"] = "%s: %s" % (type(e).__name__, e)
             if ipc.get("terminal"):
                 continue
             with b.lock:
@@ -221,6 +230,24 @@ class VmClient:
                     pass
         return out
 
+    def query_range_by(self, promql: str, start: float, end: float, step: float, label: str) -> Dict[str, Dict[int, float]]:
+        """{label value: {unix_s: value}} of a range query."""
+        from urllib.parse import urlencode
+        q = {"query": promql, "start": "%.3f" % start, "end": "%.3f" % end, "step": "%ds" % max(1, int(step))}
+        with urllib.request.urlopen(self.url + "/api/v1/query_range?" + urlencode(q), timeout=self.timeout) as r:
+            d = json.loads(r.read())
+        if d.get("status") != "success":
+            raise RuntimeError(d.get("error") or "VM query_range failed")
+        out: Dict[str, Dict[int, float]] = {}
+        for ser in d["data"]["result"]:
+            k = (ser.get("metric") or {}).get(label, "")
+            for t, v in ser.get("values") or []:
+                try:
+                    out.setdefault(k, {})[int(round(float(t)))] = float(v)
+                except (TypeError, ValueError):
+                    pass
+        return out
+
     def scalar_by(self, promql: str, label: str) -> Dict[str, float]:
         out = {}
         for s in self.query(promql):
@@ -248,6 +275,7 @@ def tiles(client: VmClient) -> dict:
     try:
         for k, (q, lab) in TILE_QUERIES.items():
             out[k] = client.scalar_by(q, lab) if lab else next(iter(client.scalar_by(q, "").values()), None)
+        out["ttft_last"] = ttft_last(client)
     except Exception as e:  # noqa: BLE001 -- the page says so instead of a number
         out["error"] = "%s: %s" % (type(e).__name__, e)
     return out
@@ -277,3 +305,43 @@ def ttft_series(client: VmClient, model: str, ts: List[int], step: int) -> dict:
         cnt.append(nn if nn is not None and nn >= 0.5 else None)
     return {"mean_ms": mean, "n": cnt, "error": None, "window_s": w,
             "src": "VictoriaMetrics weg2_front_ttft_* (state.json front.arrival_seat, LEG2-FIRST-CONTENT)"}
+
+
+def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -> List[str]:
+    """Flipzeit in Nutzersicht (ipcboot.flip_views) als Punkte zum flip_begin: weg2_flip_user_view_ms{dir,part}
+    mit part = total|vorlauf|layer|nachlauf|d_extend; nur gemessene Flips (kind ok), jeder einmal."""
+    out = []
+    for x in views:
+        if x.get("kind") != "ok" or x.get("total_ms") is None or x.get("begin") is None:
+            continue
+        key = (boot, round(float(x["begin"]), 3))
+        if key in done_keys:
+            continue
+        done_keys.add(key)
+        ts = int(float(x["begin"]) * 1000)
+        for part, k in (("total", "total_ms"), ("vorlauf", "vorlauf_ms"), ("layer", "layer_ms"),
+                        ("nachlauf", "nachlauf_ms"), ("d_extend", "nachlauf_d_extend_ms")):
+            v = x.get(k)
+            if v is not None:
+                out.append("weg2_flip_user_view_ms%s %s %d" % (_lbl({"model": model, "boot": boot, "dir": x["dir"], "part": part}),
+                                                              repr(float(v)), ts))
+    return out
+
+
+def ttft_last(client: "VmClient", now: Optional[float] = None, span_s: int = 900) -> Dict[str, dict]:
+    """Der LETZTE TTFT-Wert je Modell aus den 5-s-Proben der Bruecke: der juengste Takt mit Zuwachs von
+    ttft_count; bei genau einer Anfrage im Takt ist es ihr exakter Wert, sonst das Mittel dieser n (gesagt)."""
+    import time as _t
+    now = now or _t.time()
+    s = client.query_range_by("sum by (model) (weg2_front_ttft_ms_sum)", now - span_s, now, 5, "model")
+    n = client.query_range_by("sum by (model) (weg2_front_ttft_count)", now - span_s, now, 5, "model")
+    out = {}
+    for m, cs in n.items():
+        ss = s.get(m) or {}
+        ts = sorted(cs)
+        for a, b in zip(reversed(ts[:-1]), reversed(ts[1:])):
+            dn = cs[b] - cs[a]
+            if dn >= 0.5 and a in ss and b in ss:
+                out[m] = {"ms": (ss[b] - ss[a]) / dn, "n": int(round(dn)), "t": b, "exact": round(dn) == 1}
+                break
+    return out

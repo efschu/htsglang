@@ -50,8 +50,8 @@
   {
    "id": 2,
    "type": "timeseries",
-   "title": "TTFT der Nutzer (Ø je Intervall)",
-   "description": "Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), IPC-Zähler state.json front.arrival_seat.ttft_* (NF). Mittel der Anfragen, deren erstes Token im Intervall kam. 27B: fehlt bis zum Image mit weg2_ttft_seconds (TSDB-Delta 01.10.).",
+   "title": "TTFT der Nutzer (Punkt je 5-s-Takt)",
+   "description": "Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), IPC-Zähler state.json front.arrival_seat.ttft_* (NF). Mittel der Anfragen, deren erstes Token im Intervall kam. 27B: fehlt bis zum Image mit weg2_ttft_seconds (TSDB-Delta 01.10.). Über P / direkt D getrennt: fehlt in IPC (front.arrival_seat.ttft_by_via).",
    "datasource": {
     "type": "prometheus",
     "uid": "vm"
@@ -66,11 +66,11 @@
     "defaults": {
      "unit": "s",
      "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
+      "drawStyle": "points",
+      "lineWidth": 0,
       "fillOpacity": 12,
       "pointSize": 6,
-      "showPoints": "never",
+      "showPoints": "always",
       "spanNulls": false,
       "stacking": {
        "mode": "none"
@@ -102,10 +102,11 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "sum by (model) (increase(weg2_front_ttft_ms_sum{model=~\"$model\"}[$__rate_interval])) / sum by (model) (increase(weg2_front_ttft_count{model=~\"$model\"}[$__rate_interval])) / 1000",
+     "expr": "sum by (model) (increase(weg2_front_ttft_ms_sum{model=~\"$model\"}[5s])) / (sum by (model) (increase(weg2_front_ttft_count{model=~\"$model\"}[5s])) > 0) / 1000",
      "legendFormat": "{{model}}"
     }
-   ]
+   ],
+   "interval": "5s"
   },
   {
    "id": 3,
@@ -231,7 +232,7 @@
    "id": 5,
    "type": "timeseries",
    "title": "Flipzeit (je Flip)",
-   "description": "P→D: P-Ende -> erstes Decode-Token (events.jsonl flip_first_work); D→P: Decode-Ende -> P-Prefill-Start (flip_user_time). Ein Punkt je Flip, zum Zeitpunkt des Flips.",
+   "description": "Nutzersicht (01.10.): P→D = P-Ende -> erstes Decode auf D (Rang-Segmente), D→P = Decode-Ende -> P-Prefill-Start (flip_user_time); Teile part=vorlauf|layer|nachlauf|d_extend. Ein Punkt je Flip zum flip_begin; Leerlauf-Flips ohne Wert.",
    "datasource": {
     "type": "prometheus",
     "uid": "vm"
@@ -282,8 +283,8 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model) (weg2_flip_time_ms{dir=\"P>D\",model=~\"$model\"}) / 1000",
-     "legendFormat": "P→D {{model}}"
+     "expr": "max by (model, dir) (weg2_flip_user_view_ms{part=\"total\",model=~\"$model\"}) / 1000",
+     "legendFormat": "{{dir}} {{model}}"
     },
     {
      "datasource": {
@@ -291,8 +292,8 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "max by (model) (weg2_flip_user_ms{model=~\"$model\"}) / 1000",
-     "legendFormat": "D→P {{model}}"
+     "expr": "max by (model, dir) (weg2_flip_user_view_ms{part=\"layer\",model=~\"$model\"}) / 1000",
+     "legendFormat": "Layer-Tausch {{dir}} {{model}}"
     }
    ]
   },

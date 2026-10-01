@@ -335,8 +335,9 @@
       scales: { y: { range: zeroUp(1000) }, n: { range: (u, a, b) => [0, Math.max(4, Math.ceil((b || 0) * 1.2))] } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s"),
         Object.assign(axisY((v) => v == null ? "" : fmtN(v, 0)), { scale: "n", side: 1, grid: { show: false }, size: 40, label: "Anfragen", labelSize: 14, labelFont: FONT })],
-      series: [{}, line("TTFT (Mittel je Eimer)", C.s7, "s", { value: valFmt("s", 2, null, 0.001), points: { show: true, size: 4, fill: C.s7 } }),
-        line("Anfragen mit erstem Token im Eimer", C.s4, "", { width: 1.25, fill: undefined, scale: "n", noDot: true,
+      series: [{}, line("TTFT je Takt (Punkt = Anfragen mit erstem Token im Eimer, Mittel)", C.s7, "s", { value: valFmt("s", 2, null, 0.001),
+          width: 0, fill: undefined, noDot: true, paths: () => null, points: { show: true, size: 7, fill: C.s7 } }),
+        line("Anfragen mit erstem Token im Eimer (Hilfslinie, Klick blendet ein)", C.s4, "", { width: 1, fill: undefined, scale: "n", noDot: true, show: false,
           paths: uPlot.paths && uPlot.paths.stepped ? uPlot.paths.stepped({ align: 1 }) : undefined })],
     }, rowsTtft(d));
     charts.kv = mk("vl-c-kv", {
@@ -397,9 +398,12 @@
   // Flipzeit nach Nutzerdefinition, nie flip_total: P→D = flip_first_work (P-Ende → erstes Decode-Token),
   // D→P = flip_user_time (Decode-Ende → P-Prefill-Start, ab Build y4z); ohne flip_user_time keine D→P-Punkte
   function rowsFlips(d) {
-    const fl = (d.marks || []).filter((m) => m.v != null && ((m.kind === "flip" && m.label === "P>D") || m.kind === "flip_user"))
+    // P→D in Nutzersicht (flip_pd_user, Rang-Segmente) wo vorhanden; ältere Flips aus flip_first_work
+    const hasUser = (d.marks || []).some((m) => m.kind === "flip_pd_user" && m.v != null);
+    const isPd = (m) => hasUser ? m.kind === "flip_pd_user" : (m.kind === "flip" && m.label === "P>D");
+    const fl = (d.marks || []).filter((m) => m.v != null && (isPd(m) || m.kind === "flip_user"))
       .sort((a, b) => a.t - b.t);
-    return [fl.map((m) => m.t), fl.map((m) => (m.kind === "flip" ? m.v : null)), fl.map((m) => (m.kind === "flip_user" ? m.v : null))];
+    return [fl.map((m) => m.t), fl.map((m) => (isPd(m) ? m.v : null)), fl.map((m) => (m.kind === "flip_user" ? m.v : null))];
   }
   const sigOf = (d) => [d.model, d.range, d.zoom ? "z" : "", (d.cards || []).map((c) => cardLabel(c)).join("|")].join("/");
 

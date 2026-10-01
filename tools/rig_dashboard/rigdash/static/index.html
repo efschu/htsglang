@@ -339,6 +339,14 @@ details.fold[open] { padding-bottom: 12px; }
 .kpi.hl { border-color: color-mix(in srgb, var(--s7) 55%, var(--line)); box-shadow: inset 3px 0 0 var(--s7); }
 .kpi.on .v { color: var(--c, var(--text)); }
 .kpi.ok .v { color: var(--good); } .kpi.bad .v { color: var(--bad); } .kpi.warn .v { color: var(--warn); }
+.phnow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 15px; margin: -2px 0 10px; }
+.phnow i.sw { width: 22px; height: 14px; border-radius: 3px; display: inline-block; }
+.phnow .sub { color: var(--text-2); font-size: 13px; }
+.phnow .since { font-weight: 650; }
+.phnow.flip b { color: var(--s7); }
+.kpi.wide { grid-column: span 2; }
+.kpi .s .miss { color: var(--warn); }
+@media (max-width: 760px) { .kpi.wide { grid-column: 1 / -1; } }
 .ovline { font-size: 13px; color: var(--text-2); padding: 8px 12px; border: 1px dashed var(--line); border-radius: 8px; }
 .gpuqstrip { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12.5px; margin: 0 0 12px; }
 .gpuqstrip b { color: var(--text); }
@@ -385,6 +393,7 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
   <button type="button" role="tab" data-tab="ueberblick">Überblick</button>
   <button type="button" role="tab" data-tab="boots">Boots</button>
   <button type="button" role="tab" data-tab="verlauf">Verlauf</button>
+  <button type="button" role="tab" data-tab="sitzungen">Sitzungen</button>
   <button type="button" role="tab" data-tab="karten">Karten</button>
   <!--DEV:BEGIN-->
   <button type="button" role="tab" data-tab="entwicklung">Entwicklung <span class="cnt" id="tab-dev-cnt"></span></button>
@@ -416,6 +425,12 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
       <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; P&rarr;D: P-Ende &rarr; erstes Decode-Token &middot; D&rarr;P: Decode-Ende &rarr; P-Prefill-Start (flip_user_time, ab Build y4z)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
     </div>
     <div class="vl-grafana" id="vl-grafana"></div>
+  </section>
+  </div>
+  <div class="tab" id="tab-sitzungen" role="tabpanel" hidden>
+  <section class="card" id="sess-card">
+    <h2>Sitzungen <span class="muted">je Konversation bzw. Agentensitzung mit mehreren Turns (Nutzer 01.10. ~08:30Z)</span></h2>
+    <div id="sessions"></div>
   </section>
   </div>
   <div class="tab" id="tab-karten" role="tabpanel" hidden>
@@ -1069,7 +1084,13 @@ function bootCard(b, now, binders) {
         <div class="big num">${fmt(fieldIpc(b, "B4") ? fieldIpc(b, "B4").value.n : b.flip_count)}<small>Flips</small></div>
         <div class="state">${lastFlip ? `letzter ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} vor ${ago(now - lastFlip.t)}` : "noch kein Flip"}</div>
         ${kv([
-          ...flipRows.map((r) => r && [r[0], r[1], "keep"]),
+          ...["P>D", "D>P"].map((dir) => {
+            const fl = ((b.flip_last || {})[dir]) || {}, x = fl.last;
+            return [`<b>Flipzeit ${dir.replace(">", "&rarr;")}</b> (Nutzersicht, letzte)`, x
+              ? `<b>${sec(x.total_ms)} s</b> = Vorlauf ${sec(x.vorlauf_ms)} + Layer ${sec(x.layer_ms)} + Nachlauf ${sec(x.nachlauf_ms)}${x.nachlauf_d_extend_ms ? ` (D-Extend ${sec(x.nachlauf_d_extend_ms)})` : ""} <span class="muted">&middot; Median ${sec(fl.median)} &middot; n=${fl.n}${fl.idle_n ? " &middot; Leerlauf-Flips " + fl.idle_n : ""}</span>`
+              : "—", "keep"];
+          }),
+          ...flipRows,
           ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue")), "keep"],
           fr && fr.served ? ["bedient P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/weg2/state")}`] : null,
           prefillOrt(b),
@@ -1397,6 +1418,32 @@ function rateOfPrefill(p, now) {
   if (p.last_burst && p.last_burst.wall_tps != null) return [p.last_burst.wall_tps, p.last_t ? `letzter Schub vor ${ago(now - p.last_t)}` : "letzter Schub"];
   return [null, p.last_t ? `ruht seit ${ago(now - p.last_t)}` : "noch kein Chunk"];
 }
+// Phase jetzt (Nutzer 01.10. ~08:20Z: "gerade beim Flippen sieht der Server aus, als würde nichts passieren"):
+// ipcboot.phase_now; der Sekundenzähler läuft im Browser je Sekunde weiter (tickSince), ohne Neuzeichnen
+const PH_CLS = {P: "ph-k-P", single: "ph-k-P", D: "ph-k-D", dec: "ph-k-dec", idle: "ph-k-idle", unknown: "ph-k-unknown"};
+function phaseNowHtml(b, now) {
+  const p = b.phase_now;
+  if (!p) return "";
+  const cls = p.k === "flip" ? (p.dir === "D>P" ? "ph-k-flip_dp" : "ph-k-flip_pd") : (PH_CLS[p.k] || "ph-k-unknown");
+  const since = p.since != null ? `<span class="since num" data-since="${p.since}" data-now="${now}">${dur(Math.max(0, now - p.since))}</span>` : "";
+  const fl = p.k === "flip" && p.flip_since != null && p.flip_since !== p.since
+    ? ` <span class="muted">&middot; Flip seit <span class="since num" data-since="${p.flip_since}" data-now="${now}">${dur(Math.max(0, now - p.flip_since))}</span></span>` : "";
+  return `<div class="phnow${p.k === "flip" ? " flip" : ""}" title="Quelle: events.jsonl (Flip) + Rang-Segmente (rankstats), Auflösung ~1 s">`
+    + `<i class="sw ${cls}"></i><b>${esc(p.label)}</b>${p.sub ? ` <span class="sub">${esc(p.sub)}</span>` : ""} ${since}${fl}</div>`;
+}
+function flipKpi(b, dir, now) {
+  const fl = ((b.flip_last || {})[dir]) || {};
+  const x = fl.last;
+  const ms = (v) => v == null ? "–" : sec(v);
+  const parts = x ? `Vorlauf ${ms(x.vorlauf_ms)} &middot; Layer-Tausch ${ms(x.layer_ms)} &middot; Nachlauf ${ms(x.nachlauf_ms)}${x.nachlauf_d_extend_ms ? ` (davon D-Extend ${ms(x.nachlauf_d_extend_ms)})` : ""} s` : "";
+  const sub = [x ? parts : (b.flip_count ? "noch kein gemessener Flip im 16-min-Ring" : "noch kein Flip"),
+    x ? `<span class="muted">${ago(now - x.begin)} her &middot; Median ${sec(fl.median)} s &middot; p90 ${sec(fl.p90)} s &middot; n=${fl.n}</span>` : null,
+    fl.idle_n ? `<span class="muted">Leerlauf-Flips (ohne wartende Arbeit): ${fl.idle_n}, nicht gezählt</span>` : null,
+    fl.front_early_n ? `<span class="muted x">Front-Ereignis vor Flip-Ende: ${fl.front_early_n}× (dort zeigte die Front &lt; 1 s)</span>` : null].filter(Boolean).join("<br>");
+  return kpi(`Flipzeit ${dir.replace(">", "&rarr;")} &middot; letzte`, x ? sec(x.total_ms) : null, "s", sub, "wide", dir === "P>D" ? "var(--s7)" : "var(--s5)",
+    dir === "P>D" ? "P-Ende (letzter P-Chunk) → erstes Decode-Token auf D (Rang-Segmente); flip_first_work der Front kam oft vor flip_done"
+      : "Decode-Ende → erster P-Prefill-Start (events flip_user_time mit parts)");
+}
 function ovCard(b, d, now) {
   const a = b.alarm || {}, st = a.state, ipc = b.ipc || {};
   const fr = b.front || {};
@@ -1409,14 +1456,22 @@ function ovCard(b, d, now) {
     + (b.live && ipc.lifecycle && ipc.lifecycle !== "serving" ? `<span class="chip warn">${esc(ipc.lifecycle)}</span>` : "")
     + (awake ? `<span class="badge phase">wach: ${esc(awake)}${b.live && fr.state && fr.state !== "serving" ? " &middot; " + esc(fr.state) : ""}</span>` : "")
     + `<span class="when">${lineOf(b)}${b.first_t ? ` &middot; Boot seit ${ago(now - b.first_t)}` : ""}</span></div>`;
-  // TTFT: Mittel der letzten 5 min (VictoriaMetrics), sonst seit Boot
-  const tv = ttft.m5 != null ? ttft.m5 : ttft.mb;
-  const tK = ttft.m5 != null ? "TTFT &middot; &Oslash; 5 min" : "TTFT &middot; &Oslash; seit Boot";
-  const tSub = ttft.missing && tv == null ? "" : [ttft.n5 != null && ttft.m5 != null ? `${fmt(ttft.n5)} Anfr. in 5 min` : null,
-    ttft.mb != null && ttft.m5 != null ? `seit Boot &Oslash; ${sec(ttft.mb)} s` : null, ttft.mx != null ? `max ${sec(ttft.mx)} s` : null,
-    ttft.n != null && ttft.m5 == null ? `n=${fmt(ttft.n)}` : null].filter(Boolean).join(" &middot; ");
-  const tKpi = kpi(tK, tv != null ? sec(tv) : (ttft.missing ? {na: ttft.missing} : null), "s", tSub, "hl", "var(--s7)",
-    "Ankunft an der Front → erster Inhalt von D (LEG2-FIRST-CONTENT); Quelle " + (ttft.src || "–"));
+  // TTFT (Nutzer 01.10. ~08:20Z): der LETZTE Wert fett, Ø 5 min und n klein; Weg (über P / direkt D) und
+  // Zerlegung nur, soweit die IPC sie trägt -- sonst "fehlt in IPC" mit dem Feld
+  const tl = ((d.vm || {}).ttft_last || {})[lineOf(b)];
+  const tv = tl ? tl.ms : (ttft.m5 != null ? ttft.m5 : ttft.mb);
+  const tK = tl ? "TTFT &middot; letzte Anfrage" : ttft.m5 != null ? "TTFT &middot; &Oslash; 5 min" : "TTFT &middot; &Oslash; seit Boot";
+  const as = ((ipc.front || {}).arrival_seat) || {};
+  const rt = b.prefill_route || {};
+  const tSub = ttft.missing && tv == null ? "" : [
+    tl ? `${tl.exact ? "" : "Mittel von " + tl.n + " im 5-s-Takt, "}${ago(now - tl.t)} her` : null,
+    ttft.m5 != null ? `&Oslash; 5 min ${sec(ttft.m5)} s (n=${fmt(ttft.n5)})` : null,
+    ttft.mb != null ? `seit Boot &Oslash; ${sec(ttft.mb)} s, max ${sec(ttft.mx)} s, n=${fmt(ttft.n)}` : null,
+    as.verdict_n ? `davon Ankunft&rarr;Sitz-Entscheidung &Oslash; ${sec(as.verdict_ms_sum / as.verdict_n)} s` : null,
+    rt.via_p != null ? `Anfragen über P ${fmt(rt.via_p)} &middot; direkt D ${fmt(rt.d_direct)}` : null,
+    `<span class="miss">über P / direkt D getrennt: fehlt in IPC (front.arrival_seat.ttft_by_via)</span>`].filter(Boolean).join("<br>");
+  const tKpi = kpi(tK, tv != null ? sec(tv) : (ttft.missing ? {na: ttft.missing} : null), "s", tSub, "hl wide", "var(--s7)",
+    "Ankunft an der Front → erster Inhalt von D (LEG2-FIRST-CONTENT), beide Wege gemischt; Quelle " + (ttft.src || "–"));
   // Decode
   const dd = (b.decode || {}).D || (b.decode || {}).single;
   let dv = null, dl = "";
@@ -1437,15 +1492,8 @@ function ovCard(b, d, now) {
     return kpi(label + " tok/s", v != null ? fmt(v) : null, "", l, pre[g] && pre[g].one_s > 0 ? "on" : "", color);
   };
   const pKpis = pre.single && !pre.P ? pk("single", "Prefill", "var(--s1)") : pk("P", "P-Prefill", "var(--s1)") + pk("D", "D-Prefill", "var(--s2)");
-  // Flipzeit
-  const ft = b.flip_times || {}, pd = ft["P>D"] || {}, dp = ft["D>P"] || {};
-  const byTotal = ft.headline === "flip_total";
-  const med = (x) => byTotal ? x.layer_median : (x.n ? x.median : x.layer_median);
-  const lst = (x) => byTotal ? x.layer_newest : (x.n ? x.last : x.layer_newest);
-  const fKpi = kpi("Flipzeit P&rarr;D &middot; Median", med(pd) != null ? sec(med(pd)) : null, "s",
-    [lst(pd) != null ? `letzte ${sec(lst(pd))} s` : (b.flip_count ? null : "noch kein Flip"), med(dp) != null ? `D&rarr;P Median ${sec(med(dp))} s` : null,
-      b.flip_count ? `${fmt(b.flip_count)} Flips` : null].filter(Boolean).join(" &middot; "), "", "var(--s7)",
-    byTotal ? "27B-Historie: flip_total (Layer-Tausch)" : "P→D: P-Ende → erstes Decode-Token (flip_first_work); D→P: Decode-Ende → P-Prefill-Start");
+  // Flipzeit in Nutzersicht (Nutzer 01.10. ~08:20Z): letzte je Richtung FETT, Vorlauf/Layer-Tausch/Nachlauf
+  const fKpi = ["P>D", "D>P"].map((dir) => flipKpi(b, dir, now)).join("");
   // Warteschlange
   const fq = (ipc.front || {});
   const q = fr.queue != null ? fr.queue : (b.queue ? b.queue.queue : null);
@@ -1462,7 +1510,7 @@ function ovCard(b, d, now) {
     (a.reasons || []).length ? esc((a.reasons[0] || {}).text || "").slice(0, 80) : null].filter(Boolean).join(" &middot; "),
     st === "TOT" || st === "HAENGT" ? "bad" : st === "WARNUNG" ? "warn" : st === "GESTOPPT" ? "" : "ok");
   return `<section class="ovcard ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : b.live ? "" : "off"}" id="ov-${esc(b.stem)}">${head}
-    <div class="kpis">${tKpi}${dKpi}${pKpis}${fKpi}${qKpi}${hKpi}</div>${phaseHtml(b, "ovpb-")}</section>`;
+    ${phaseNowHtml(b, now)}<div class="kpis">${tKpi}${dKpi}${pKpis}${fKpi}${qKpi}${hKpi}</div>${phaseHtml(b, "ovpb-")}</section>`;
 }
 // <!--DEV:BEGIN-->  (gpuq: nur Rig-Ausgabe)
 function gpuqStrip(d) {
@@ -1477,6 +1525,25 @@ function gpuqStrip(d) {
     + (next.length ? ` <span class="muted">&middot; danach: ${next.map(one).join(" &middot; ")}</span>` : "") + `</div>`;
 }
 // <!--DEV:END-->
+// Sitzungen (Nutzer 01.10. ~08:30Z): die Front kennt die Sitzung (SESSION-TRACE sess=<10-hex>), schreibt sie aber
+// nur ins Log -- die IPC trägt je Request heute nur die offenen Anfragen (front.outstanding_stalest). Gezeigt wird,
+// was da ist; der Rest steht als Feldliste da, nie aus dem Log.
+const SESS_FIELDS = ["session_id (SESSION-TRACE sess, 10 hex)", "turn", "via (after_p | d_direct | d_single)", "ttft_ms", "queue_ms",
+  "prefill_ms + prefill_tokens (neu, je Gruppe)", "cached_tokens je Quelle (device / host / storage / told)", "common_prefix (SESSION-PREFIX)",
+  "decode_tokens + decode_ms", "context_tokens / kv_pages", "parks / resumes", "Flip-Epochen während der Anfrage", "status, wall_s"];
+function sessionsHtml(d, shown, now) {
+  const rows = shown.flatMap((b) => {
+    const f = ((b.ipc || {}).front) || {};
+    return (f.outstanding_stalest || []).map((e) => Object.assign({model: lineOf(b)}, e));
+  });
+  const tbl = rows.length ? `<div class="tablewrap"><table><tr><th>Modell</th><th>rid</th><th>wo</th><th class="num">Alter</th><th class="num">letztes Token vor</th><th>Stream</th></tr>`
+    + rows.map((e) => `<tr><td>${esc(e.model)}</td><td class="mono">${esc(e.rid)}</td><td>${esc(e.where)}</td><td class="num">${ago(e.age_s)}</td><td class="num">${e.last_token_s == null ? "—" : ago(e.last_token_s)}</td><td>${e.stream ? "ja" : "nein"}</td></tr>`).join("") + `</table></div>`
+    : `<div class="muted">keine offene Anfrage</div>`;
+  return `<div class="stand warn"><b>Sitzungsübersicht fehlt in IPC.</b> Die Front kennt die Sitzung je Anfrage (SESSION-TRACE, Kopf X-Claude-Code-Session-Id
+    bzw. metadata.user_id, als 10-hex-Hash), schreibt sie aber nur in ihr Log. Gebraucht wird je Anfrage ein Ereignis bzw. VM-Punkt
+    <span class="mono">weg2_req</span> (Sitzung als Label, rid als Feld) mit: ${SESS_FIELDS.map(esc).join(" &middot; ")}.</div>
+    <h3 style="font-size:13px;margin:10px 0 6px">Offene Anfragen jetzt <span class="muted">state.json front.outstanding_stalest (IPC)</span></h3>${tbl}`;
+}
 function overviewHtml(d, shown, now) {
   const lines = new Set(shown.map(lineOf));
   const rest = ["NF", "27B"].filter((m) => !lines.has(m)).map((m) => {
@@ -1871,6 +1938,7 @@ async function refresh(force) {
     }
     if (DEV) devBadge(d);
     if (curTab === "karten") put("gpus", gpusHtml(d, binders));
+    if (curTab === "sitzungen") put("sessions", sessionsHtml(d, shown, now));
     put("chips", chipsHtml(d));
     // behind the public proxy the LAN-only services are not reachable: hide their links, say so once
     document.querySelectorAll("a.lan").forEach((a) => { a.style.display = d.via_proxy ? "none" : ""; });
@@ -1912,7 +1980,16 @@ $("live-pause").addEventListener("change", (e) => {
   if (!e.target.checked) refresh(true); else $("pausenote").textContent = pauseReason();
 });
 setTab(curTab, true);
-setInterval(() => refresh(), 2000);
+setInterval(() => refresh(), 1000);      // Nutzer 01.10.: Phase/Flip ≤ 1 s (api/live kommt aus dem LiveCache)
+// Sekundenzähler der Phase: läuft im Browser weiter, zwischen zwei Abfragen ohne Neuzeichnen
+const clockSkew = {v: 0};
+setInterval(() => {
+  document.querySelectorAll(".since[data-since]").forEach((el) => {
+    const t0 = +el.dataset.since, n0 = +el.dataset.now;
+    if (!el._born || el._n0 !== n0) { el._born = performance.now(); el._n0 = n0; }
+    el.textContent = dur(Math.max(0, n0 - t0 + (performance.now() - el._born) / 1000));
+  });
+}, 250);
 if (window.RigZoom) RigZoom.on(() => refresh(true));      // zoom.js: all charts follow one zoomed stretch
 if (DEV) {
   refreshLaunch();

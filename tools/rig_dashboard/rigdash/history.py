@@ -551,6 +551,7 @@ class Recorder:
                 m = boots.model(key)
                 if m is None or not m.ring:
                     continue
+                self._mark_flip_views(key, model, ipc, m, now)
                 first_t, last_t = m.ring[0]["t"], m.ring[-1]["t"]
                 cur = self.db.get("hcur." + key)
                 lo = int(((cur if cur is not None else first_t) // step) * step)
@@ -647,6 +648,18 @@ class Recorder:
             if u.get("flip_user_ms") is not None and u.get("start_ts") is not None:
                 self.db.mark(u["start_ts"], model, "flip_user", "D>P ipc", u["flip_user_ms"])
         self._flips_done[key + "#ut"] = len(ut)
+
+    def _mark_flip_views(self, key: str, model: str, ipc: dict, m, now: float) -> None:
+        """Nutzer 01.10. ~08:20Z: P->D-Flipzeit in Nutzersicht (P-Ende -> erstes Decode auf D, aus den Rang-
+        Segmenten), nicht das Front-Ereignis flip_first_work, das in 3-12 Flips je Boot vor flip_done kam.
+        Eine Marke je gemessenem Flip (kind flip_pd_user), Wert = Gesamtzeit; Teile im Label."""
+        from . import ipcboot
+        segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc))["segs"]
+        for x in ipcboot.flip_views(segs, ipc, now):
+            if x["dir"] != "P>D" or x.get("kind") != "ok" or x.get("total_ms") is None:
+                continue
+            parts = "v=%d l=%d n=%d" % tuple(int(round(x.get(k) or 0)) for k in ("vorlauf_ms", "layer_ms", "nachlauf_ms"))
+            self.db.mark(x["begin"], model, "flip_pd_user", "P>D %s ipc" % parts, x["total_ms"])
 
     # --- loop ----------------------------------------------------------------
     def publish(self, now: Optional[float] = None) -> None:
@@ -868,8 +881,11 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             continue
         m["label"] = lab[:-4]
         marks.append(m)
-    flips_pd = [m["v"] for m in marks if m["kind"] == "flip" and m["label"] == "P>D" and m["v"] is not None]
-    last_pd = next((m for m in reversed(marks) if m["kind"] == "flip" and m["label"] == "P>D" and m["v"] is not None), None)
+    user_pd = [m for m in marks if m["kind"] == "flip_pd_user" and m["v"] is not None]
+    old_pd = [m for m in marks if m["kind"] == "flip" and m["label"] == "P>D" and m["v"] is not None]
+    pd_src = user_pd if user_pd else old_pd
+    flips_pd = [m["v"] for m in pd_src]
+    last_pd = pd_src[-1] if pd_src else None
     roles = {m: (db.get("roles." + m) or {}) for m in MODELS}
     card_info = [dict(c, roles={m: roles[m].get(c["uuid"], []) for m in MODELS}) for c in cards]
     tiles = {
@@ -889,7 +905,8 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         "flip_median_ms": _pct(flips_pd, 0.5), "flip_n": len(flips_pd),
     }
     tiles.update(seat_tiles(series))
-    thin = [m for m in marks if m["kind"] not in ("flip", "flip_user")] + [m for m in marks if m["kind"] == "flip_user"]
+    thin = [m for m in marks if m["kind"] not in ("flip", "flip_user", "flip_pd_user")] + \
+        [m for m in marks if m["kind"] in ("flip_user", "flip_pd_user")]
     fl = [m for m in marks if m["kind"] == "flip"]
     if len(fl) > 800:
         k = len(fl) / 800.0
@@ -911,7 +928,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             "power": "NVML, Summe aller Karten",
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
                             else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
-            "flip": "events.jsonl flip_first_work (P→D) + flip_user_time (D→P)",
+            "flip": "P→D: Rang-Segmente (P-Ende → erstes Decode auf D, flip_pd_user; ältere Flips flip_first_work) · D→P: flip_user_time",
             "marks": "state.json (Boot-ID, lifecycle) + events.jsonl flip_first_work",
         },
         "errors": dict(rec.errors) if rec else dict((db.get("rec.state") or {}).get("errors") or {}),
