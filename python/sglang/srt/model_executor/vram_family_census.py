@@ -145,40 +145,130 @@ def shared_with(named, peer: Optional[torch.nn.Module]):
     waren Zuordnungen, keine Messungen, und beide habe ich an einem Tag
     behauptet und zurueckgenommen.
 
-    ``data_ptr()`` entscheidet es: dieselbe Adresse = dasselbe Byte.
+    Die Adresse entscheidet es: ein Tensor, dessen Bytes ganz in den Bytes
+    eines Peer-Tensors liegen, ist dasselbe Byte. Bereich statt
+    ``data_ptr``-Gleichheit, weil der Draft auch eine Sicht in einen
+    Ziel-Tensor halten kann; Bereich statt Storage, weil die Gewichts-Arena
+    EIN Storage fuer viele Tensoren ist (Ziel UND Draft-eigene Experten).
     ``None`` (kein Peer bekannt) -> leer, dann sagt die Zeile wie bisher
     nichts ueber Teilen aus, aber sie BEHAUPTET auch nichts.
     """
+    _own, geteilt, bytes_ = split_shared(named, peer)
+    return geteilt, bytes_
+
+
+def _peer_spans(peer):
+    spans = []
+    for _n, t in list(peer.named_parameters()) + list(peer.named_buffers()):
+        if t is None or not t.numel():
+            continue
+        lo = int(t.data_ptr())
+        spans.append((lo, lo + t.numel() * t.element_size()))
+    spans.sort()
+    return spans
+
+
+def split_shared(named, peer: Optional[torch.nn.Module]):
+    """(eigene (name, tensor), geteilt je Familie, geteilte Bytes): ein
+    Tensor ist geteilt, wenn sein Adressbereich ganz in dem eines
+    Peer-Tensors liegt. Kein Peer oder kaputter Peer -> alles eigen."""
+    import bisect
+
+    named = list(named)
     if peer is None:
-        return {}, 0
+        return named, {}, 0
     try:
-        peer_ptrs = {
-            t.data_ptr()
-            for _n, t in (list(peer.named_parameters()) + list(peer.named_buffers()))
-            if t is not None and t.numel()
-        }
+        spans = _peer_spans(peer)
     except Exception:  # noqa: BLE001 -- ein Zensus toetet nie einen Boot
-        return {}, 0
-    geteilt, bytes_ = {}, 0
+        return named, {}, 0
+    starts = [lo for lo, _hi in spans]
+    # running max of the span ends, so one bisect answers "inside ANY span
+    # that starts at or below lo" even when spans overlap or nest
+    reach, best = [], 0
+    for _lo, hi in spans:
+        best = max(best, hi)
+        reach.append(best)
+    own, geteilt, bytes_, seen = [], {}, 0, set()
     for n, t in named:
         try:
-            if t is None or not t.numel() or t.data_ptr() not in peer_ptrs:
+            if t is None or not t.numel():
+                own.append((n, t))
                 continue
+            lo = int(t.data_ptr())
+            b = t.numel() * t.element_size()
+            i = bisect.bisect_right(starts, lo) - 1
+            inside = i >= 0 and reach[i] >= lo + b
         except Exception:  # noqa: BLE001
+            own.append((n, t))
             continue
-        b = t.numel() * t.element_size()
+        if not inside:
+            own.append((n, t))
+            continue
+        if (lo, b) in seen:  # a tied alias of a byte already counted
+            continue
+        seen.add((lo, b))
         geteilt[family_of(n)] = geteilt.get(family_of(n), 0) + b
         bytes_ += b
-    return geteilt, bytes_
+    return own, geteilt, bytes_
+
+
+#: The main (non-draft) model of THIS process, registered by its own census
+#: line. The ModelRunner of a draft holds no reference to its target
+#: (is_draft_worker is a bare flag), but both models live in one process
+#: on one card: the target's census runs first (its pools are built before
+#: the draft worker exists), so the draft's census finds it here. A weak
+#: reference -- the census never keeps a model alive.
+_TARGET_REF = None
+
+
+def _resolve_peer(model, tag: str, peer):
+    """The explicit peer wins; a ``-draft`` tag falls back to the
+    registered target of this process; any other tag registers ``model``
+    as that target."""
+    global _TARGET_REF
+    import weakref
+
+    if peer is not None:
+        return peer
+    if str(tag).endswith("-draft"):
+        target = _TARGET_REF() if _TARGET_REF is not None else None
+        return target if target is not None and target is not model else None
+    try:
+        _TARGET_REF = weakref.ref(model)
+    except TypeError:  # not weak-referenceable (a test double): no registry
+        pass
+    return None
+
+
+def census_parts(model, tag: str, peer=None, cuda_only: bool = True):
+    """(own bytes per family, own total, shared per family, shared bytes,
+    peer known): what the census line reports. Shared bytes are the
+    peer's, so they are NOT in the own total."""
+    named = list(model.named_parameters()) + list(model.named_buffers())
+    peer = _resolve_peer(model, tag, peer)
+    own, geteilt, geteilt_bytes = split_shared(named, peer)
+    if cuda_only:
+        geteilt, geteilt_bytes = _cuda_only(named, peer, geteilt, geteilt_bytes)
+    fam = census(own, cuda_only=cuda_only)
+    return fam, sum(fam.values()), geteilt, geteilt_bytes, peer is not None
+
+
+def _cuda_only(named, peer, geteilt, geteilt_bytes):
+    """Shared bytes counted like the census counts: device tensors only."""
+    if not geteilt_bytes:
+        return geteilt, geteilt_bytes
+    dev = [(n, t) for n, t in named if t is not None and getattr(t, "is_cuda", False)]
+    _own, g, b = split_shared(dev, peer)
+    return g, b
 
 
 def log_vram_family_census(
     model: torch.nn.Module, tag: str, where: str,
     peer: Optional[torch.nn.Module] = None,
 ) -> Dict[str, int]:
-    named = list(model.named_parameters()) + list(model.named_buffers())
-    fam = census(named)
-    total = sum(fam.values())
+    fam, total, _geteilt, _geteilt_bytes, _peer_known = census_parts(
+        model, tag, peer
+    )
     parts = ", ".join(
         f"{k} {v / 2**30:.2f}" for k, v in sorted(fam.items(), key=lambda kv: -kv[1])
     )
@@ -187,17 +277,16 @@ def log_vram_family_census(
         reserved = torch.cuda.memory_reserved() / 2**30
     except Exception:  # noqa: BLE001
         alloc = reserved = float("nan")
-    _geteilt, _geteilt_bytes = shared_with(named, peer)
     _teil = (
-        " | GETEILT mit dem Peer (#161, data_ptr-identisch, also NICHT "
-        "zweimal auf der Karte): %.2f GiB = {%s} -- EIGEN bleiben %.2f GiB"
+        " | shared_with_target %.2f GiB = {%s} (#161: address-identical with "
+        "the target's tensors, NOT on the card twice, excluded from the "
+        "model tensors above)"
         % (
             _geteilt_bytes / 2**30,
             ", ".join(f"{k} {v / 2**30:.2f}" for k, v in
                       sorted(_geteilt.items(), key=lambda kv: -kv[1])),
-            (total - _geteilt_bytes) / 2**30,
         )
-        if _geteilt_bytes
+        if _peer_known
         else (" | geteilt: KEIN Peer uebergeben, diese Zeile sagt nichts "
               "darueber, welche Bytes zweimal liegen (#161)")
     )
