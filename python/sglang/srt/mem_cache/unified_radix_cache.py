@@ -7386,9 +7386,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     f"local={local_len}): a MIN reduce can never do that, so "
                     "the ranks were not all inside this collective."
                 )
-            if group_len < self.prefetch_threshold or _end_decline:
+            # y6l: the group prices the read with the same minimum as the
+            # local gate (`_min_len`: prefetch_threshold, or the caller's
+            # min_tokens). Against the bare threshold every hand-back read
+            # below 256 declined here as vote_negative with every rank
+            # present (D TP=3, 27B need=24/40), so 1160d65e1d's min_tokens=1
+            # never reached the store.
+            if group_len < _min_len or _end_decline:
                 # #1068 L1: the group declined (0, or a common span below the
-                # prefetch threshold). Named on every rank, including the one
+                # read's minimum). Named on every rank, including the one
                 # whose own gate term or anchor exhaustion lowered the vote
                 # (that rank counted its local term above as well; the
                 # attribution order names the local term first).
@@ -7409,9 +7415,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # (`scheduler.py:5268`: "enter the vote carrying nothing"), so its
             # span is 0 and a span check above the threshold return would fire
             # on the most ordinary condition in the system. Past that return
-            # the population is provably clean: `group_len >= prefetch_threshold
-            # > 0` and `local_len` is 0 on any rank that was ineligible or did
-            # not allocate, so a MIN at or above the threshold proves EVERY
+            # the population is provably clean: `group_len >= _min_len >= 1`
+            # and `local_len` is 0 on any rank that was ineligible or did
+            # not allocate, so a MIN at or above the minimum proves EVERY
             # rank was eligible AND allocated. Only real spans are compared.
             span_lo = int(vote[3].item())
             span_hi = -int(vote[4].item())
