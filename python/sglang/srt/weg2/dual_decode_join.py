@@ -47,6 +47,13 @@ def join_enabled(env=None) -> bool:
     return str(e.get(JOIN_ENV, "0") or "0").strip().lower() not in ("0", "", "false", "no", "off")
 
 
+def _n(req: Any, field: str) -> int:
+    """len() of a sequence field, 0 when absent -- never ``x or ()``, which
+    raises on a multi-element tensor (dual1g W17, ead403b7ab)."""
+    v = getattr(req, field, None)
+    return 0 if v is None else int(len(v))
+
+
 @dataclass(frozen=True)
 class JoinVerdict:
     verdict: str
@@ -68,10 +75,10 @@ def join_verdict(req: Any, *, dual_layout: bool, spec_is_dflash: bool, prefix_le
         return JoinVerdict(EXTEND, "switch off")
     if not dual_layout:
         return JoinVerdict(EXTEND, "not the dual layout")
-    n = len(getattr(req, "origin_input_ids", None) or ())
+    n = _n(req, "origin_input_ids")
     if n < 2:
         return JoinVerdict(EXTEND, f"prompt of {n} token(s): nothing for P to have prefilled")
-    out = len(getattr(req, "output_ids", None) or ())
+    out = _n(req, "output_ids")
     if out:
         return JoinVerdict(REFUSE, f"carries {out} output token(s) -- a resumed/retracted request "
                                    f"is not a fresh P hand-off")
@@ -104,11 +111,12 @@ class JoinState:
 
 
 def join_state(req: Any, prefix_len: int) -> JoinState:
-    ids = list(getattr(req, "origin_input_ids", None) or ())
+    _ids = getattr(req, "origin_input_ids", None)
+    ids = [] if _ids is None else list(_ids)
     n = len(ids)
-    if n - int(prefix_len) != 1 or getattr(req, "output_ids", None):
+    if n - int(prefix_len) != 1 or _n(req, "output_ids"):
         raise ValueError(f"join_state for a request that may not join (n={n} prefix={prefix_len} "
-                         f"outputs={len(getattr(req, 'output_ids', None) or ())})")
+                         f"outputs={_n(req, "output_ids")})")
     already = int(getattr(req, "already_computed", 0) or 0)
     return JoinState(committed_kv=n - 1, pending_token=int(ids[-1]),
                      cached_tokens_add=max(0, int(prefix_len) - already), seqlen=n)
@@ -124,3 +132,115 @@ def apply_join_accounting(req: Any, state: JoinState) -> None:
     req.cached_tokens_device = int(getattr(req, "cached_tokens_device", 0) or 0) + state.cached_tokens_add
     req.already_computed = state.committed_kv
     setattr(req, "_weg2_decode_joined", True)
+
+
+# ---------------------------------------------------------------------------
+# Step 2: the scheduler side (torch, imported lazily so the riegel above stays
+# importable without a GPU stack).
+# ---------------------------------------------------------------------------
+DUAL_LAYOUT_ENV = "SGLANG_WEG2_DUAL_LAYOUT"
+
+
+def dual_layout_rank(env=None) -> bool:
+    """The launcher sets SGLANG_WEG2_DUAL_LAYOUT=1 on every rank of both groups."""
+    e = os.environ if env is None else env
+    return str(e.get(DUAL_LAYOUT_ENV, "") or "").strip() == "1"
+
+
+def _prefix_len(req) -> int:
+    # never `x or ()` on a tensor: an empty prefix_indices tensor raised on every
+    # D rank in dual1g (ead403b7ab, W17) -- len() of what is there, 0 for None
+    p = getattr(req, "prefix_indices", None)
+    return 0 if p is None else int(len(p))
+
+
+def split_join_reqs(can_run_list, *, spec_is_dflash: bool, exclude=(), enabled=None, env=None):
+    """``(join, rest, fallbacks)``: which admitted requests join the decode batch.
+
+    ``fallbacks`` are ``(req, reason)`` of requests the dual layout would have
+    joined but cannot -- they stay on the extend path (they carry at most the
+    one anchor token here: ef9b3a899c's X=1 refused every larger remainder at
+    D's X gate before admission) and are named in the log by the caller.
+    """
+    on = join_enabled(env) if enabled is None else bool(enabled)
+    if not on:
+        return [], list(can_run_list), []
+    dual = dual_layout_rank(env)
+    join, rest, fallbacks = [], [], []
+    excl = {id(x) for x in (exclude or ())}
+    for req in can_run_list:
+        if id(req) in excl:
+            rest.append(req)
+            continue
+        v = join_verdict(req, dual_layout=dual, spec_is_dflash=spec_is_dflash,
+                         prefix_len=_prefix_len(req), enabled=True)
+        if v.verdict == JOIN:
+            join.append(req)
+        else:
+            rest.append(req)
+            if v.verdict == REFUSE:
+                fallbacks.append((req, v.reason))
+    return join, rest, fallbacks
+
+
+def convert_to_joined(batch, future_map, enable_overlap: bool) -> None:
+    """Turn a PREPARED extend batch of join requests into decode-ready state,
+    WITHOUT a forward.
+
+    ``prepare_for_extend`` already did everything the extend path does before
+    its forward -- the req_to_token rows of the prefix, the Mamba slot from
+    P's anchor, one KV slot for the pending token at position N-1 (written by
+    the next round), the usage accounting (cached_tokens += prefix,
+    already_computed) -- so the numbers match the extend path exactly. What
+    the skipped forward would have produced is replaced by the decode
+    invariant: committed KV = N-1, pending input = prompt[N-1], no output
+    token. The DFlash draft input is the shape ``_make_next_draft_input_prefill``
+    builds after an extend, with N-1 and the prompt token instead of N and a
+    sampled token; under overlap it is published/stashed into the future map
+    under the request's pool index exactly like a prebuilt PD-decode batch.
+    """
+    import torch
+
+    from sglang.srt.managers.overlap_utils import RelayPayload
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+
+    lens, bonus = [], []
+    for req in batch.reqs:
+        st = join_state(req, _prefix_len(req))
+        req.kv_committed_len = st.committed_kv
+        req._kvc_src = "decode_join"
+        setattr(req, "_weg2_decode_joined", True)
+        lens.append(st.committed_kv)
+        bonus.append(st.pending_token)
+    dev = batch.device
+    batch.seq_lens = torch.tensor(lens, dtype=torch.int64, device=dev)
+    batch.seq_lens_cpu = torch.tensor(lens, dtype=torch.int64)
+    batch.orig_seq_lens = torch.tensor(lens, dtype=torch.int32, device=dev)
+    batch.seq_lens_sum = int(sum(lens))
+    batch.forward_mode = ForwardMode.DECODE
+    batch.input_ids = None
+    batch.out_cache_loc = None
+    batch.mamba_track_indices = None
+    batch.mamba_track_mask = None
+    batch.mamba_track_seqlens = None
+    spec = make_draft_input_v2(
+        bonus_tokens=torch.tensor(bonus, dtype=torch.int64, device=dev),
+        new_seq_lens=batch.seq_lens,
+    )
+    if enable_overlap:
+        spec.future_indices = batch.req_pool_indices
+        future_map.publish(spec.future_indices, batch.seq_lens)
+        future_map.stash(spec.future_indices, RelayPayload.from_draft_input(spec))
+    batch.spec_info = spec
+
+
+def merge_joined(running_batch, joined: list):
+    """Merge the ready join batches into the running batch (the hisparse
+    staging->decode transition's shape). Returns the running batch."""
+    for jb in joined:
+        if running_batch is None or running_batch.is_empty():
+            running_batch = jb
+        else:
+            running_batch.merge_batch(jb)
+    return running_batch

@@ -11782,6 +11782,15 @@ class Scheduler(
                 running_batch.hisparse_coordinator = self.hisparse_coordinator
             # Reset batch_is_full so the scheduler can schedule more prefills.
             running_batch.batch_is_full = False
+        # DUAL-TP3PP3 stage 2: decode-join batches prepared at the last
+        # admission enter the running batch here, before it forms its round
+        # (the same place and shape as the hisparse staging->decode merge).
+        _jr = getattr(self, "_weg2_join_ready", None)
+        if _jr:
+            from sglang.srt.weg2 import dual_decode_join as _ddj
+
+            self._weg2_join_ready = []
+            running_batch = _ddj.merge_joined(running_batch, _jr)
 
         if (
             not self.enable_hisparse
@@ -17468,6 +17477,30 @@ class Scheduler(
             )
 
         _wk_t2 = time.perf_counter()  # admission done
+        # DUAL-TP3PP3 stage 2 (weg2/dual_decode_join.py, SGLANG_WEG2_DUAL_DECODE_JOIN,
+        # default off): a P-prefilled request with only the N-1 anchor token
+        # outstanding joins the running decode batch WITHOUT an extend forward
+        # (that forward stopped D's decode 208-446 gpu-ms per admission, metal
+        # dual1m). Prepared here like any extend, converted, merged at the next
+        # get_next_batch_to_run.
+        _ddj = None
+        if self.draft_worker is not None and self.spec_algorithm.is_dflash():
+            from sglang.srt.weg2 import dual_decode_join as _ddj
+
+            if not _ddj.join_enabled():
+                _ddj = None  # switch off: the list below is not touched at all
+        if _ddj is not None:
+            _join, can_run_list, _fallbacks = _ddj.split_join_reqs(
+                can_run_list, spec_is_dflash=True,
+                exclude=([self.chunked_req] if self.chunked_req is not None else [])
+                + list(_tails_in_batch or ()) + list(getattr(self, "anchor_tails", None) or ()))
+            for _req, _why in _fallbacks:
+                logger.warning("WEG2 DECODE-JOIN FALLBACK rid=%s -> extend: %s",
+                               str(getattr(_req, "rid", "?"))[:16], _why)
+            if _join:
+                self._weg2_build_join_batch(_join)
+            if not can_run_list:
+                return None, running_batch
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
@@ -17595,6 +17628,40 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _weg2_build_join_batch(self, reqs) -> None:
+        """DUAL-TP3PP3 stage 2: prepare ``reqs`` exactly like an extend batch
+        (slots, prefix rows, Mamba anchor, accounting, draft-cold arming), then
+        convert them to decode-ready state without a forward; merged into the
+        running batch at the next get_next_batch_to_run."""
+        from sglang.srt.managers.phase_flip_draft_bootstrap import (
+            arm_draft_cold_for_admission,
+        )
+        from sglang.srt.weg2 import dual_decode_join as _ddj
+
+        set_time_batch(reqs, "set_forward_entry_time")
+        jb = ScheduleBatch.init_new(
+            reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        jb.prepare_for_extend()
+        arm_draft_cold_for_admission(self, jb)
+        _ddj.convert_to_joined(jb, self.future_map, self.enable_overlap)
+        if not hasattr(self, "_weg2_join_ready"):
+            self._weg2_join_ready = []
+        self._weg2_join_ready.append(jb)
+        logger.info(
+            "WEG2 DECODE-JOIN n=%d rids=%s committed=%s: P-prefilled, joined the "
+            "decode batch without an extend forward (the anchor token is computed "
+            "by the next round)",
+            len(reqs), [str(getattr(r, "rid", "?"))[:16] for r in reqs[:8]],
+            [int(r.kv_committed_len) for r in reqs[:8]],
+        )
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
