@@ -56,9 +56,11 @@ CANDIDATES = (
 CAPS_ROWS_BY_RANK = (4, 10)
 CAP_ANCHOR_SLOTS = 5
 SLOTS_OF = {"r_seat": (1, 2, 4, 6, 3, 9), "r_parked": (7,)}
-ANCHOR_SLOT_OF = {"r_seat": 4, "r_parked": 0}
+# L15-11b: no anchor may sit on padding slot 0 (dummy write target for
+# padded tokens); r_parked's anchor is 5, not the original 0.
+ANCHOR_SLOT_OF = {"r_seat": 4, "r_parked": 5}
 # expected plan under PREFIX:
-#   L_H=8, rows_by_rank=(4,4), moves=((9,5),), A_H=2, anchor moves=((4,1),)
+#   L_H=8, rows_by_rank=(4,4), moves=((9,5),), A_H=3, anchor moves=((4,1),(5,2))
 RESERVED = {1, 2, 3, 4, 5, 6, 7}
 FREE_AFTER = [8, 9, 10, 11, 12, 13, 14, 15, 16]
 
@@ -185,7 +187,7 @@ def test_step_order_select_moves_nodes_reset_clear_reserve_setkeep_manifest(tmp_
 
     res = l15_retain.retain_at_sleep(**sc["kwargs"])
     assert res is not None
-    assert res.a_h == 2
+    assert res.a_h == 3
     order = [e for e in events if e in (
         "select", "moves", "nodes", "reset_keep", "clear", "reserve",
         "set_keep", "manifest")]
@@ -197,7 +199,7 @@ def test_step_order_select_moves_nodes_reset_clear_reserve_setkeep_manifest(tmp_
         "set_keep", "manifest",
     ], collapsed
     assert res.manifest.epoch == EPOCH and res.manifest.pid == PID
-    assert res.manifest.anchor_slots == 2
+    assert res.manifest.anchor_slots == 3
 
 
 
@@ -215,14 +217,16 @@ def test_rows_land_at_new_slots_reserved_leave_free_pages_manifest_roundtrips(
         src, dst = owner(int(old_slot)), owner(int(new_slot))
         assert src is not None and dst is not None
         assert torch.equal(sc["kv_buf"][dst], _marker(src + 1, 3)[src])
-    # anchor moves are not owner-sharded: mamba row 4 -> row 1, row 0 stays
+    # anchor moves are not owner-sharded: mamba rows 4 -> 1 and 5 -> 2; the
+    # reserved padding row 0 stays untouched (L15-11b)
     assert torch.equal(sc["mamba_buf"][1], _marker(5, 2)[4])
+    assert torch.equal(sc["mamba_buf"][2], _marker(6, 2)[5])
     assert torch.equal(sc["mamba_buf"][0], _marker(1, 2)[0])
     # kept nodes were rewritten to the plan's new slots / new anchors
     for rid, node in sc["nodes"].items():
         assert node.kv_slots == tuple(res.plan.new_slots[rid])
     assert sc["nodes"]["r_seat"].anchor_slot == 1  # 4 squeezed to 1
-    assert sc["nodes"]["r_parked"].anchor_slot == 0
+    assert sc["nodes"]["r_parked"].anchor_slot == 2  # 5 squeezed to 2
 
     # reserved slots left free_pages; the rest keeps its order
     free = sc["alloc"].free_pages.tolist()
@@ -249,7 +253,7 @@ def test_rows_land_at_new_slots_reserved_leave_free_pages_manifest_roundtrips(
     line = sc["log_lines"][-1]
     m = re.fullmatch(
         r"L15-RETAIN epoch=77 n=2 rows_by_rank=(?P<rows>[\d,]+) "
-        r"l_h=(?P<lh>\d+) anchors=2 fp=(?P<fp>-?\d+)", line)
+        r"l_h=(?P<lh>\d+) anchors=3 fp=(?P<fp>-?\d+)", line)
     assert m is not None, line
     assert m.group("rows") == ",".join(str(x) for x in res.plan.rows_by_rank)
     assert m.group("lh") == str(res.plan.l_h)
