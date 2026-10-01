@@ -176,7 +176,9 @@ def test_an_evicting_writer_drops_the_unpaired_kv_page_with_its_index(tmp_path, 
     _prefill_with_gap(be, hs)
     kv = be._arenas[KV_TOTAL]
     if writer == "evict_clock":
-        assert be._arena_evict_to_disk(kv, 64) == PAGES - 1
+        # EVICT-KEEP: the clock takes at most an eighth of the 32-slot arena
+        # (4); the round that must take all 8 pages says so with ``need``
+        assert be._arena_evict_to_disk(kv, 64, need=PAGES) == PAGES - 1
     else:
         cands = kv.evict_candidates(64)
         assert len(cands) == PAGES

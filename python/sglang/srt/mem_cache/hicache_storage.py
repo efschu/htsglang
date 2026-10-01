@@ -3577,11 +3577,29 @@ class HiCacheFile(HiCacheStorage):
         the pool that owns this arena) stay on the keep list: (i) up to
         ``want`` unkept pages; (ii) only when those fall short of ``need``
         (default ``want``), kept pages in hold order -- the rid read last
-        first, each chain from its tail (``evict_ordered``)."""
+        first, each chain from its tail (``evict_ordered``).
+
+        EVICT-KEEP (Port von 27B 3f7378473f; z30y12 23:35:32, P PP0
+        ``ARENA-EVICT n=11 want=256``; NF y5l P PP0 ``ARENA-EVICT n=1..3
+        want=256``): die Aufrufer setzen ``want`` auf mindestens 256, die
+        MAMBA-Arena hat 112 Slots. Mit ``need`` = ``want`` raeumte Stufe (i)
+        jede ungehaltene Seite und Stufe (ii) danach die gehaltenen Anker
+        (``ARENA-REF-CENSUS slots=112 complete=0``; die D-Park-Resumes wachten
+        ohne Anker auf, W31, 381k Tokens zurueck an P). Darum: ``want``
+        hoechstens ein Achtel der Arena (FULL/Draft unveraendert, MAMBA 14);
+        ein ausdrueckliches ``need`` (der echte Bedarf eines Fills) hebt
+        ``want`` wieder darauf, sonst ist ``need`` das gekappte ``want``."""
+        slots = int(getattr(arena, "slots", 0) or 0)
+        if slots > 0:
+            want = min(int(want), max(1, slots // 8))
+        if need is None:
+            need = int(want)
+        else:
+            want = max(int(want), int(need))
         _en = getattr(type(self), "_evict_log_n", 0) + 1
         type(self)._evict_log_n = _en
         if _en <= 16 or _en % 64 == 0:
-            logger.info("ARENA-EVICT n=%d want=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want))
+            logger.info("ARENA-EVICT n=%d want=%d need=%d slots=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want), int(need), slots)
         pins = getattr(self, "pins", None)
         keep = []
         if pins is not None:
@@ -3589,7 +3607,7 @@ class HiCacheFile(HiCacheStorage):
                 keep = list(getattr(pins, "pinned_stems", lambda: [])())
             except Exception:  # noqa: BLE001
                 keep = []
-        cands = self._arena_evict_candidates(arena, int(want), int(want if need is None else need), keep)
+        cands = self._arena_evict_candidates(arena, int(want), int(need), keep)
         if not cands:
             return 0
         moved = self.arena_secure_to_disk(arena, cands, writer="evict_clock")["written"]

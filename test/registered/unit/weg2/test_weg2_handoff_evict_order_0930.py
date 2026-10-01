@@ -226,8 +226,9 @@ def test_victim_order_last_read_first_tail_first_shared_key_with_the_earlier():
 
 def test_no_bound_pool_is_the_pins_only_clock(tmp_path):
     """No keep order for an arena (P's hermetic arenas, the mamba blob without
-    a bound pool): the clock takes ``want`` in slot order, as before."""
-    kv = ShmArena(str(tmp_path / "plain.bin"), SB, 4)
+    a bound pool): the clock takes ``want`` in slot order, as before.
+    EVICT-KEEP: 16 slots, so the eighth-of-the-arena cap (2) is not the bound."""
+    kv = ShmArena(str(tmp_path / "plain.bin"), SB, 16)
     root = tmp_path / "l3"
     root.mkdir()
     store = _Store(str(root))
