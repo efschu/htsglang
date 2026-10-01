@@ -7375,9 +7375,9 @@ class Front:
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
+        Front._req_book(self).arrive(rid, time.time(), self.epoch)  # DASHBOARD-IPC
+        self._sess_note(rid, request, payload)  # SESSION-TRACE (after the book's row: session/turn)
         self._ipc_out_book().arrive(rid, time.time())  # NF port: the TTFT clock starts here
-        Front._req_book(self).arrive(rid, time.time(), self.epoch)  # DASHBOARD-IPC: request_done / TTFT
-        self._sess_note(rid, request, payload)  # SESSION-TRACE
         # UNIFY S7 (27B RC7-X): the arrival time the idle re-grant's quiet
         # window reads ("did anything arrive in the last window").
         self._x_last_arrival = time.time()
