@@ -2966,6 +2966,16 @@ class PrefillAdder:
                 # at THIS prefix (the matched page anchor) -- anything else
                 # would run its extend in a batch whose forward is skipped
                 return AddReqResult.OTHER
+            if tail_adopt.skip_waits(
+                req, len(req.prefix_indices),
+                skip_taken=self.weg2_skip_extend_taken,
+                batch_nonempty=bool(self.can_run_list),
+            ):
+                # ZR-3, the mirror of H24c: an END-state request in front of a
+                # batch that already runs a forward waits one pass instead of
+                # dropping its END state; the next pass leads with it
+                # (weg2/skip_first.py). Rank-uniform inputs.
+                return AddReqResult.OTHER
 
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:

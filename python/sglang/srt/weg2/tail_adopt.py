@@ -1526,6 +1526,31 @@ def skip_joinable(req, prefix_len: Optional[int] = None) -> bool:
     return not skip_refusal(entry, req, batch_empty=True)
 
 
+SKIP_WAIT_MARK = "WEG2-TAIL-SKIP-WAIT"
+_SKIP_WAIT_N = [0]
+
+
+def skip_waits(req, prefix_len: int, *, skip_taken: bool, batch_nonempty: bool) -> bool:
+    """ZR-3 (01.10., the mirror of H24c): True when ``req`` would take the END
+    state at ``prefix_len`` but the batch already runs a forward -- it then
+    waits a pass with its agreed entry intact (no pop, no drop) instead of
+    ``plan_adopt`` dropping the END state ('end_only:batch_not_empty', metal
+    y6h weg2-4-15: N=41464, 56 tokens computed again from the page anchor
+    41408). The next pass leads with it (``skip_first.order``). Rank-uniform:
+    the batch and the group's agreed vote."""
+    if skip_taken or not batch_nonempty:
+        return False
+    if not skip_joinable(req, prefix_len):
+        return False
+    _SKIP_WAIT_N[0] += 1
+    n = _SKIP_WAIT_N[0]
+    if n <= 20 or n % 200 == 0:
+        logger.info("%s rid=%s prefix=%d n=%d (END state kept: the batch already runs a forward, the "
+                    "next pass leads with the skip -- 0 tokens computed again)", SKIP_WAIT_MARK, req.rid,
+                    int(prefix_len), n)
+    return True
+
+
 def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
     """Admission commit (the request is going into this batch): one page,
     the prefix grows by its first ``rows`` slots, the holding rank queues the
