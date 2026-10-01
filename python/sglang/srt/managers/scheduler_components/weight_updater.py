@@ -7463,6 +7463,32 @@ class SchedulerWeightUpdaterManager:
         self._l15_wake_manifest = None
         return dropped
 
+    def _l15_decide_wake_verdict(self, wake_on: bool, fp, *, epoch: int):
+        """L15-12c-E1X (plan sec 9): the ONE decision source for the
+        keep-or-fallback-drop verdict at wake.  ``wake_on`` False -> return
+        None and touch NO collective (byte-identical master-off wake).
+        ``wake_on`` True -> EVERY rank must call this at this one list
+        position (xsn410: no rank may skip a collective); a no-hold rank
+        passes fp=None (vote None) but still participates.  The collective
+        is l15_wake_check.decide over the tp cpu group the fence uses.
+        L15CheckRefused CANNOT fire yet: bad is always 0 until the sample
+        check lands (next AP).  A failing collective PROPAGATES, like the
+        fence's own gather -- it is never caught per rank."""
+        if not wake_on:
+            return None
+        from sglang.srt.weg2 import l15_restore, l15_wake_check
+        # missing=0 for now: group_check decides on fp/bad/drop_rids only;
+        # the real count_missing lands with the sample-check AP.
+        vote = (l15_restore.check_vote(fp, 0, 0, 0, ())
+                if fp is not None else None)
+        world_group = getattr(self.scheduler, "world_group", None)
+        cpu_group = (getattr(world_group, "cpu_group", None)
+                     if world_group is not None else None)
+        world = (torch.distributed.get_world_size(group=cpu_group)
+                 if cpu_group is not None else 1)
+        return l15_wake_check.decide(
+            vote, group=cpu_group, world=world, epoch=epoch).verdict
+
     def _l15_wake_act(self, sched, verdict: str, *, group_ok: bool,
                       master_on: bool) -> int:
         """L15-12c-B: the fence tail's single-branch ACT on the group
@@ -11446,8 +11472,26 @@ class SchedulerWeightUpdaterManager:
                     _l15_min = _l15_max = _l15_fp
                 else:
                     _l15_min = _l15_max = None
-                _l15_v = ("fallback" if report.get("l15_fp_mixed")
-                          else l15_restore.verdict(_l15_fp, _l15_min, _l15_max))
+                _l15_fence_v = ("fallback" if report.get("l15_fp_mixed")
+                                else l15_restore.verdict(_l15_fp, _l15_min,
+                                                         _l15_max))
+                # L15-12c-E1X (plan sec 9): the wake verdict is now decided by
+                # the group's decide() collective -- the ONE decision source.
+                # The fence-tail fingerprint reduction above is KEPT for now
+                # (the fence still needs it to build the report) and logged
+                # alongside so the first boot shows the two agree.  EVERY rank
+                # of the group runs this at this one list position (xsn410:
+                # a rank that skips the collective splits the group); a rank
+                # with no hold votes None.  L15CheckRefused cannot fire yet
+                # (bad is always 0 until the sample check lands, next AP).  A
+                # failing collective PROPAGATES like the fence's own gather --
+                # never caught per rank here.
+                _l15_v = self._l15_decide_wake_verdict(
+                    _l15_wake, _l15_fp,
+                    epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
+                logger.info("L15-DECIDE epoch=%d verdict=%s fence_verdict=%s",
+                            int(_l15_m.epoch) if _l15_m is not None else 0,
+                            _l15_v, _l15_fence_v)
                 if _weg2_kv_refusal:
                     # L15-12c-B (W114): a refused kv resume on ANY rank
                     # defers the whole group's L15 action.  The restore_line
