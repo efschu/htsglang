@@ -36,6 +36,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _release_fill_claims(arena, claims, reason: str) -> None:
+    """L3FILL-JOIN: give back ``(slot, gen)`` claims the L3 fill took but will
+    not complete. ``release_claims`` (#1427r) frees a slot only when this
+    writer was its sole claimant; a slot another rank joined -- or already
+    completed -- stays theirs. A hermetic arena double without it frees."""
+    if not claims:
+        return
+    rel = getattr(arena, "release_claims", None)
+    if callable(rel):
+        rel([int(s) for s, _ in claims], [int(g) for _, g in claims], reason=reason)
+    else:
+        _free_named(arena, [s for s, _ in claims], reason)
+
+
 def _free_named(arena, slots, reason: str) -> None:
     """#1427s: ARENA-FREE with a named reason (hicache_arena.free_named;
     imported here, the storage.file package imports this module)."""
@@ -3196,7 +3210,21 @@ class HiCacheFile(HiCacheStorage):
         ``prefix=True`` (EG review of L3-FAST, (a)): the stems are a PREFIX
         walk -- nothing past the first page that can not be had (not on disk,
         or a claim that yields no slot) is claimed or read; claims already
-        taken past it are freed unread. The answer for those stems is None."""
+        taken past it are released unread. The answer for those stems is None.
+
+        L3FILL-JOIN (z30y14, 01.10.): a claim answered status 1 is a JOIN --
+        another rank of the group is filling the SAME canonical page from the
+        same disk file right now (arena.c: "join: write your extents, then
+        complete"). It is read and completed here like a fresh claim (the
+        whole page, byte-identical to what the other writer reads; whoever
+        completes second gets status 2 = usable). Before, a join was a MISS
+        that ended the prefix: PP1 and PP2 filled the same 88 pages at the
+        same second (ARENA-EVICT need=88 on both), each stopped at the
+        other's first claim (5 and 12 pages read, 59/55 freed as
+        l3fill_past_prefix) and the ranks reached 95684 / 95716 tokens for
+        PP0's told 97631 -> #1400 STORE-TOLD MISMATCH. The join's open writer
+        was also never resolved. Claims given back unread go through
+        ``release_claims`` (#1427r): a slot another rank joined stays theirs."""
         n = len(stems)
         out = [None] * n
         if n == 0:
@@ -3217,6 +3245,7 @@ class HiCacheFile(HiCacheStorage):
         else:
             cand = [(i, st) for i, st in enumerate(stems) if st in on_disk]
         todo = []
+        joined = set()  # L3FILL-JOIN: stem indices whose claim joined another writer's
         if cand:
             claims = arena.claim_slots([st for _, st in cand], [int(total_bytes)] * len(cand))
             full = []
@@ -3225,6 +3254,9 @@ class HiCacheFile(HiCacheStorage):
                     out[i] = slot          # raced in by someone else: complete, usable
                 elif status == 0:
                     todo.append((i, slot, gen, st))
+                elif status == 1 and slot >= 0:
+                    todo.append((i, slot, gen, st))  # L3FILL-JOIN: read + complete it too
+                    joined.add(i)
                 elif status == 4:
                     full.append((i, st))
             if full:
@@ -3236,6 +3268,9 @@ class HiCacheFile(HiCacheStorage):
                         full, arena.claim_slots([st for _, st in full], [int(total_bytes)] * len(full))):
                     if status == 0:
                         todo.append((i, slot, gen, st))
+                    elif status == 1 and slot >= 0:
+                        todo.append((i, slot, gen, st))  # L3FILL-JOIN
+                        joined.add(i)
                     elif status == 2:
                         out[i] = slot
         if prefix and todo:
@@ -3244,9 +3279,9 @@ class HiCacheFile(HiCacheStorage):
             todo.sort(key=lambda t: t[0])
             _mine = {t[0] for t in todo}
             _stop = next((i for i, _st in cand if out[i] is None and i not in _mine), n)
-            _past = [t[1] for t in todo if t[0] > _stop]
+            _past = [(t[1], t[2]) for t in todo if t[0] > _stop]
             if _past:
-                _free_named(arena, _past, "l3fill_past_prefix")
+                _release_fill_claims(arena, _past, "l3fill_past_prefix")
                 todo = [t for t in todo if t[0] < _stop]
             for i, _st in cand:
                 if i > _stop:
@@ -3259,7 +3294,10 @@ class HiCacheFile(HiCacheStorage):
         ptrs = [arena.slot_ptr(slot) for _, slot, _, _ in todo]
         rc, threads = l3_read_pages_parallel(pio, paths, int(total_bytes), ptrs)
         ok = [k for k, r in enumerate(rc) if r == 0]
-        bad = [todo[k][1] for k, r in enumerate(rc) if r != 0]
+        # a failed read still holds its claim (fresh or joined): released, so a
+        # slot another rank joined stays theirs (#1427r)
+        unread = [(todo[k][1], todo[k][2]) for k, r in enumerate(rc) if r != 0]
+        bad = []
         filled = 0
         if ok:
             cs = arena.complete_slots([todo[k][1] for k in ok], [todo[k][2] for k in ok],
@@ -3268,8 +3306,12 @@ class HiCacheFile(HiCacheStorage):
                 if c in (1, 2):
                     out[todo[k][0]] = todo[k][1]
                     filled += 1
-                else:
+                elif todo[k][0] not in joined:
                     bad.append(todo[k][1])
+                # a JOIN refused at completion (3 recycled / 4 freed by its
+                # owner / 5 overflow, writer resolved in C): not ours to free
+        if unread:
+            _release_fill_claims(arena, unread, "l3fill_read_failed")
         if bad:
             _free_named(arena, bad, "l3fill_complete_refused")
         k = getattr(self, "_1433_n", 0) + 1
@@ -3277,8 +3319,8 @@ class HiCacheFile(HiCacheStorage):
         if k <= 8 or k % 256 == 0:
             ms = (time.perf_counter() - t0) * 1000.0
             logger.info("#1433 L3->L2 fill: %d of %d pages read from disk into the arena (n=%d) threads=%d "
-                        "ms=%.0f pages_per_s=%.0f", filled, len(todo), k, threads, ms,
-                        filled / max(1e-6, ms / 1000.0))
+                        "ms=%.0f pages_per_s=%.0f joined=%d", filled, len(todo), k, threads, ms,
+                        filled / max(1e-6, ms / 1000.0), len(joined))
         return out
 
     def register_keep_pool(self, arena, pool) -> None:
