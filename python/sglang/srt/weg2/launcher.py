@@ -13335,6 +13335,79 @@ def apply_profile_torch_cache_cap_default(ns) -> Optional[str]:
             f"{TORCH_CACHE_CAP_ENV}=0 = the uncapped form)")
 
 
+#: LEISTUNGSSCHALTER (user rule 29.09.): the marker of the line naming the
+#: registry row's per-group switch defaults written into --env-p/--env-d.
+GROUP_SWITCH_DEFAULTS_MARKER = "WEG2-LEISTUNGSSCHALTER"
+
+
+def apply_profile_group_switch_defaults(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """LEISTUNGSSCHALTER (user rule 29.09. ~10:15Z: proven on metal -> default
+    on in the code): the registry row's ``group_switch_defaults`` (weg2/form.py)
+    into ``ns.env_p`` / ``ns.env_d``. A key that group's env already states,
+    or that the launcher's own environment carries (an operator export, which
+    build_env hands every group), is left alone -- an explicit value always
+    wins, =0 turns the switch off. Written INTO the group env so every reader
+    (the D solve, the ranks; build_env applies --env-* last) sees ONE value.
+    Returns the line naming what was written, or None (qwen27b: nothing)."""
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    rows = dict(getattr(row, "group_switch_defaults", None) or {}) if row is not None else {}
+    if not rows:
+        return None
+    env_os = canonical_env(dict(os.environ if environ is None else environ))
+    wrote: List[str] = []
+    for group, attr in (("P", "env_p"), ("D", "env_d")):
+        spec = str(getattr(ns, attr, "") or "")
+        stated = parse_group_env(spec)
+        for key, val in rows.get(group, {}).items():
+            if key in stated or key in env_os:
+                continue
+            spec = set_group_env(spec, key, str(val))
+            wrote.append(f"{group}:{key}={val}")
+        setattr(ns, attr, spec)
+    if not wrote:
+        return None
+    return (f"{GROUP_SWITCH_DEFAULTS_MARKER} registry {row.id} (default on after the metal proof; "
+            f"a stated --env-p/--env-d or exported value wins): " + " ".join(wrote))
+
+
+def apply_profile_d_kv_token_cut_default(ns, argv_words: Sequence[str]) -> Optional[str]:
+    """#239 LEISTUNGSSCHALTER: an UNSET ``--d-kv-token-cut`` takes the registry
+    row's ``d_kv_token_cut`` (nextflash ``owned``; qwen27b ``off``). Applied
+    BEFORE the form is resolved (the kv axis derives from the flag), and only
+    where the boot can run the cut -- else the code default ``off`` stays:
+    D states Form A worker roles (``derive_kv`` refuses the cut without them),
+    no other ``--form-kv`` is stated, and a flip boot has its host tier and at
+    most one operator-named KV stage (``refuse_flip_under_token_cut``). Returns
+    the line naming the default, or None."""
+    if getattr(ns, "teardown", False):
+        return None
+    if weg2_form.flag_given(argv_words, "--d-kv-token-cut"):
+        return None
+    if str(getattr(ns, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
+           or weg2_form.KV_TOKEN_CUT_OFF) != weg2_form.KV_TOKEN_CUT_OFF:
+        return None
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    want = str(getattr(row, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
+               or weg2_form.KV_TOKEN_CUT_OFF) if row is not None else weg2_form.KV_TOKEN_CUT_OFF
+    if want == weg2_form.KV_TOKEN_CUT_OFF:
+        return None
+    stated_kv = getattr(ns, "form_kv", None)
+    if stated_kv and stated_kv != "qsa_forma_dcp":
+        return None
+    roles = weg2_form.flag_values(shlex.split(str(getattr(ns, "extra_d", "") or "")), "--rank-role")
+    if not roles or "worker" not in [r.strip() for r in roles[-1].split(",")]:
+        return None
+    if not getattr(ns, "d_only", False):
+        if getattr(ns, "weg2_disable_hicache", False):
+            return None
+        stages = d_kv_stage_tokens_named(ns)
+        if stages is not None and len(stages) != 1:
+            return None
+    ns.d_kv_token_cut = want
+    return (f"{KV_TOKEN_CUT_MARKER} registry {row.id}: --d-kv-token-cut {want} "
+            "(default on after the metal proof; --d-kv-token-cut off = the uncut Form A)")
+
+
 #: PR (30.09.): group D's paired miss record is ON by default -- the records
 #: root of the line under the evidence dir (``<root>/<model_id>/owned_miss``,
 #: layers.moe.pool_miss_cost.record_dir_for). --env-d
@@ -22638,6 +22711,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _p0_line = apply_profile_torch_cache_cap_default(ns)  # WEG2-ALLOC-OVERHANG
     if _p0_line:
         print(_p0_line, flush=True)
+    if not ns.teardown:
+        # LEISTUNGSSCHALTER (user rule 29.09.): the row's per-group switch
+        # defaults and its --d-kv-token-cut, before any reader of --env-* or
+        # of the kv axis (resolve_form below).
+        _ls_line = apply_profile_group_switch_defaults(ns)
+        if _ls_line:
+            print(_ls_line, flush=True)
+        _cut_line = apply_profile_d_kv_token_cut_default(
+            ns, list(sys.argv[1:] if argv is None else argv))
+        if _cut_line:
+            print(_cut_line, flush=True)
     _miss_rec_line = apply_owned_miss_record_default(ns)  # PR: paired miss record
     if _miss_rec_line:
         print(_miss_rec_line, flush=True)

@@ -1118,6 +1118,8 @@ class Envs:
     # or 0 for them, a refused skip is the page resume. N % page == 0 keeps
     # the cut (the fold would track the anchor at N, one token too deep).
     # False = the H24 form, byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_ENABLE_P_TAIL_FOLD = EnvBool(False)
     # TAIL KEEP (fnFL2 H63b, set on BOTH groups): the tail-part store
     # (<arena dir>/handoff, tmpfs = host RAM) as a bounded buffer between P
@@ -1133,6 +1135,8 @@ class Envs:
     # Bound: max(KEEP_MIB, capture_keep() x one rid's parts) plus the parts
     # being written; one 97k rid (PP0+PP1+PP2) is 56.9 MiB folded (H63),
     # 113.8 MiB not (x166).
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_TAIL_KEEP_MIB = EnvInt(0)
     # TAIL READ MMAP (Kriech-Sitz 29.09., z30w-park): a D rank reads a tail
     # part with torch.load(mmap=True) -- the tensors are views of the part
@@ -1157,6 +1161,8 @@ class Envs:
     # n-gram hash and short conv at the resume point). Rows are only written
     # and installed on the rank that runs the PLE layer. False = the H24/H63b
     # form, byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_PLE_STATE_HANDOFF = EnvBool(False)
     # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
     # the prompt into the hand-off dir (<SGLANG_HICACHE_ARENA_DIR>/handoff):
@@ -1445,6 +1451,8 @@ class Envs:
     # stay on the HMM path. LOG_EVERY rounds per PLE-DECODE-PREAD line. Off =
     # the captured kernel reads every row through HMM (the pre-H40 graph).
     SGLANG_QWEN4_PLE_DECODE_PREAD = EnvBool(True)
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_QWEN4_PLE_DECODE_PREAD_PROCS = EnvInt(4)
     SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS = EnvInt(4)
     SGLANG_QWEN4_PLE_DECODE_PREAD_BUDGET_MS = EnvFloat(8.0)
@@ -1458,6 +1466,8 @@ class Envs:
     # the host's event wait + hash + pread (x168: gpu_gap_ple 1.7 ms per
     # round, all three cards idle) off the device's critical path. Off = the
     # H40 order and the H40 kernel, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY = EnvBool(False)
     # fnFL2 H73 (D, verify rounds): the pread WORKERS stage the round on their
     # own. The verify's windows are posted by the device into a mailbox of the
@@ -1470,12 +1480,16 @@ class Envs:
     # start at the draft's end instead of after the verify replay returned.
     # Implies the gated kernel; supersedes BEHIND_REPLAY (no hook). Off = the
     # H40/H69 paths, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_PLE_STAGE_AUTONOMOUS = EnvBool(False)
     # fnFL2 H73 (with AUTONOMOUS): the NEXT round's first verify token is this
     # round's bonus -- after the accept its window [committed history | bonus]
     # is posted as well, and the workers read those rows (16 per request)
     # while the draft extend and the next draft run; the verify round then
     # keeps every row whose id is already staged. Off = only the verify post.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_PLE_STAGE_BONUS_EARLY = EnvBool(False)
     # fnFL2 H69b (Form A only, D's host): build the PLE n-gram table with the
     # full vocabulary (enable_tp=False), as F13 does for embed_tokens. Without
@@ -1485,6 +1499,8 @@ class Envs:
     # (x168: kernel_rows/rows 33.4 %). A correctness fix: it changes D's
     # numerics back to P's model and triples D's staged PLE rows per round
     # (21 -> 64 at bs 1). Off = the pre-H69b layout, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB = EnvBool(False)
     # H68d (models/qwen4_exp_ple_fp8.py): how the PLE gathers read an fp8
     # (float8_e4m3fn) table -- the nvidia NVFP4 export's PLE is fp8, and Triton
@@ -2237,6 +2253,8 @@ class Envs:
     SGLANG_UNEVEN_MOE_VECTOR = EnvStr(None)
     # WP3a: shard MoE experts by INDEX (whole experts per rank, pad expert at
     # local 0) under an uneven plan for non-GGUF quant paths too.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_UNEVEN_MOE_EXPERT_SHARD = EnvBool(False)
     # WP8 expert lookahead (slotstream +11 % decode): a MoE block runs the
     # router of the block N steps AHEAD on its own stream and that block's
@@ -3468,6 +3486,8 @@ class Envs:
     # 256 codes. Grammar [smXX:]MODE[;...] (MODE exp2|bits|ptx), an arch group
     # wins over a generic one, e.g. "sm86:ptx" moves only the 3080 stages.
     # Empty = exp2 (default; the kernel compiles to the same SASS as before).
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_QSA_FP8_DECODE = EnvStr("")
     # QSA prefix-free prefill launch (fnFL2 H65, F2 of H58, same file): the
     # first chunk of a prompt and every short prefill run _sparse_gqa_prefill
@@ -3482,6 +3502,8 @@ class Envs:
     # instead of the torch chain, whose int64 top-k copy, gather, full_like and
     # where hold ~0.57 GB per full-attention layer of a 16k chunk above the
     # 134-MB rows. Same rows, bit-identical attention. False = torch chain.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_QSA_ROWS_FUSED_EAGER = EnvBool(False)
 
     # Torch Compile
@@ -3705,6 +3727,8 @@ class Envs:
     # publish_park_end); the resume is then E2's skip (no tail extend, ~2 s
     # expert pass on NF-D). Needs SGLANG_WEG2_TAIL_SKIP_EXTEND; refused by
     # name under uneven DCP / the token cut. Off = the park byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_ENABLE_D_PARK_END = EnvBool(False)
     # PARK-COLLECT-WINDOW (29.09., NF z30w-park 08:31-08:46: 21 immediate parks
     # in 15 min, 37 parked streams, park->resume median 8.4 s / p90 17.8 s --
@@ -3809,6 +3833,8 @@ class Envs:
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
     # their compact slots and the QSA pending ring -- instead of refusing it,
     # so the group votes 2 and the extend is skipped again. Off = the refusal.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_ENABLE_CUT_WORKER_END = EnvBool(False)
     # Fix B (weg2/p_row_authority.py): the #631 row form on group P
     # (ModelProfile.p_row_authority: qwen27b on since the agent-load proof

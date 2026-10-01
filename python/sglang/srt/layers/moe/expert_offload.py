@@ -4130,7 +4130,8 @@ class MoEExpertOffloadCache:
             if not nan_guard_on():
                 return
             import os
-            if os.environ.get("SGLANG_NAN_GUARD_WAVE", "1").strip() in ("0", "off"):
+            # LEISTUNGSSCHALTER class (d) (01.10.): a diagnostic, default OFF -- =1 arms it
+            if os.environ.get("SGLANG_NAN_GUARD_WAVE", "0").strip() in ("", "0", "off"):
                 return  # the per-slice .item() completes each GEMM before the next fetch -- hides a race
             import torch
             hs = getattr(combine_out, "hidden_states", combine_out)
@@ -4160,7 +4161,8 @@ class MoEExpertOffloadCache:
             if not nan_guard_on():
                 return
             import os
-            if os.environ.get("SGLANG_NAN_GUARD_FETCH", "1").strip() in ("0", "off"):
+            # LEISTUNGSSCHALTER class (d) (01.10.): a diagnostic, default OFF -- =1 arms it
+            if os.environ.get("SGLANG_NAN_GUARD_FETCH", "0").strip() in ("", "0", "off"):
                 return  # the per-fetch check joins copy and compute -- a race hides behind it
             import torch
             slots = [int(sl) for _e, sl in fetch_plan]
