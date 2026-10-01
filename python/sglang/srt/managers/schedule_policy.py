@@ -138,7 +138,8 @@ def note_second_continuation_refused(req, site: str) -> int:
     if n <= 3 or n % 1000 == 0:
         logger.info(
             "[#967] SECOND CONTINUATION REFUSED rid=%s site=%s: a resident "
-            "chunked request is still outstanding, so this FRESH request is "
+            "chunked request is still outstanding (or one was minted earlier "
+            "in this pass, #996), so this FRESH request is "
             "left for a later pass rather than minted as a second "
             "continuation (#959). Nothing of it has run, so no progress is "
             "lost and no double prefill is incurred; it is admitted as soon "
@@ -2386,7 +2387,10 @@ class PrefillAdder:
             # The precedent is `_add_scheduled_req`'s `carried_chunk` flag,
             # which already refuses to announce a NEW chunked req for exactly
             # this reason and names this assert while doing it.
-            if self.chunked_req_outstanding:
+            # #996: a mint earlier in this pass occupies the single field as
+            # much as the resident continuation does (a P-FORK-CUT chunk
+            # leaves `rem_chunk_tokens` behind, see add_one_req).
+            if self.chunked_req_outstanding or self.new_chunked_req is not None:
                 # #967: count and name it -- see note_second_continuation_refused.
                 note_second_continuation_refused(req, "add_one_req_ignore_eos")
                 return AddReqResult.OTHER
@@ -3153,7 +3157,19 @@ class PrefillAdder:
                     len(req.prefix_indices),
                     len(req.prefix_indices) + trunc_len,
                 )
-                if self.chunked_req_outstanding and not _trunc_tail:
+                # #996 (NF y6s 50fa5c42d1, 01.10. 22:27:29, all three P
+                # ranks): the resident continuation is not the only occupant
+                # of the single field -- a mint EARLIER IN THIS PASS is the
+                # other, and only the end-anchor branch above asked for it. A
+                # truncation that stops short of `rem_chunk_tokens` leaves
+                # chunk budget behind and the loop goes on: P-FORK-CUT cut
+                # weg2-0-1 at its told fork ([8704, 16640) of a 16384 chunk,
+                # 8448 left), weg2-0-3 then truncated to those 8448 and hit
+                # `_mint_chunked`. Same refusal as the resident case: the
+                # second request is fresh and waits one pass.
+                if (
+                    self.chunked_req_outstanding or self.new_chunked_req is not None
+                ) and not _trunc_tail:
                     # #967: same guard, second mint site, same instrument.
                     note_second_continuation_refused(req, "add_one_req")
                     return AddReqResult.OTHER
