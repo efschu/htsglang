@@ -567,8 +567,12 @@ def progress_step(memo, st: dict, now: float, stall_s: float, work: Optional[int
     m = dict(memo or {})
     prev_work = m.get("work")
     work_moved = work is not None and prev_work is not None and int(work) != int(prev_work)
+    # Dual-model (01.10.): requests waiting for a SLEEPING model are bounded by the
+    # arbiter (T_max + one switch), not a stall. Only a front that writes
+    # ``model_state`` can take this branch; single-model boots never do.
+    model_asleep = fr.get("model_state") not in (None, "awake")
     if (not m or m.get("boot") != boot or m.get("key") != key or work_moved or out <= 0
-            or lc not in PROGRESS_LIVE):
+            or lc not in PROGRESS_LIVE or model_asleep):
         ev = "LAEUFT" if (m.get("stalled") and m.get("boot") == boot) else None
         since = m.get("since")
         return {"boot": boot, "key": key, "since": now, "stalled": False, "work": work,
