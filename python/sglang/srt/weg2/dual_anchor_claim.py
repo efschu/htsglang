@@ -44,3 +44,15 @@ def dual_bigram_claim(env=None) -> bool:
     return (BIGRAM_EXACT_TREE[0]
             and (e.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip() == "1"
             and (e.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() == "D")
+
+
+def dual_handback_min_tokens(env=None):
+    """1 on a group-D rank of the dual layout -- every D request there is a P
+    hand-back and is read from the store whatever its length (the #915
+    prefetch threshold of 256 tokens refused N=25 hand-backs: D matched 0 and
+    W31 re-routed them through P in a loop) -- else None (the tree's threshold)."""
+    e = os.environ if env is None else env
+    if ((e.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip() == "1"
+            and (e.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() == "D"):
+        return 1
+    return None
