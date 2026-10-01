@@ -1,0 +1,64 @@
+{
+  "label": "cp512_balanced",
+  "port": 31671,
+  "peak_tok_per_s": 114.00103967687035,
+  "peak_at_tokens": 2048,
+  "runA": [
+    {
+      "approx_tokens": 512,
+      "prompt_tokens": 403.0,
+      "n": 4,
+      "median_s": 3.6668205009991652,
+      "min_s": 3.600935253998614,
+      "tok_per_s": 109.90447988664492,
+      "cached_tokens_total": 0
+    },
+    {
+      "approx_tokens": 2048,
+      "prompt_tokens": 1559,
+      "n": 1,
+      "median_s": 13.67531387800409,
+      "min_s": 13.67531387800409,
+      "tok_per_s": 114.00103967687035,
+      "cached_tokens_total": 0
+    },
+    {
+      "approx_tokens": 8192,
+      "prompt_tokens": 6166,
+      "n": 1,
+      "median_s": 55.39443336801196,
+      "min_s": 55.39443336801196,
+      "tok_per_s": 111.3108235810679,
+      "cached_tokens_total": 0
+    }
+  ],
+  "runA_prime": [
+    {
+      "approx_tokens": 512,
+      "prompt_tokens": 403.5,
+      "n": 4,
+      "median_s": 3.6249503344952245,
+      "min_s": 3.6037489180016564,
+      "tok_per_s": 111.31186989247054,
+      "cached_tokens_total": 0
+    },
+    {
+      "approx_tokens": 2048,
+      "prompt_tokens": 1560,
+      "n": 1,
+      "median_s": 13.784430888001225,
+      "min_s": 13.784430888001225,
+      "tok_per_s": 113.17115756718802,
+      "cached_tokens_total": 0
+    },
+    {
+      "approx_tokens": 8192,
+      "prompt_tokens": 6162,
+      "n": 1,
+      "median_s": 55.30688669899246,
+      "min_s": 55.30688669899246,
+      "tok_per_s": 111.41469657362317,
+      "cached_tokens_total": 0
+    }
+  ]
+}

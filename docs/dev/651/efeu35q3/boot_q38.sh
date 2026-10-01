@@ -52,7 +52,12 @@ GUARD_STRICT=${GUARD_STRICT:-1} GUARD_NRUNS=${GUARD_NRUNS:-10} GUARD_REQUIRE=${G
 
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-256}
 python /root/651-p2/scripts/wedge_policy.py "$CHUNKED_PREFILL" || {
-  if [ "${WEDGE_POLICY_MEASURE:-0}" = "1" ]; then
+  if [ "$CHUNKED_PREFILL" -le "${WEDGE_CP_MEASURED:-256}" ]; then
+    # WEDGE_CP_MEASURED: the largest chunk measured clean ON THIS checkpoint
+    # and extension build (01.10.: cp512, 2 sweeps + an 11-min 8k soak, 0 GPU
+    # resets). The policy's 256 cap stays the default for everything else.
+    echo "WEDGE-POLICY: cp=$CHUNKED_PREFILL allowed by WEDGE_CP_MEASURED=${WEDGE_CP_MEASURED}"
+  elif [ "${WEDGE_POLICY_MEASURE:-0}" = "1" ]; then
     # Measurement boots only: the policy's premise (bf16 GEMM M=1024 wedges at
     # ~3 % free GTT) predates the true16 fix and the 4+ GiB headroom of this
     # checkpoint; the chunk-size envelope is re-measured with dmesg watched.

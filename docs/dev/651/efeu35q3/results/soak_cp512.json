@@ -1,0 +1,28 @@
+{
+  "label": "soak_cp512",
+  "port": 31671,
+  "peak_tok_per_s": 111.58731379266038,
+  "peak_at_tokens": 8192,
+  "runA": [
+    {
+      "approx_tokens": 8192,
+      "prompt_tokens": 6164.5,
+      "n": 6,
+      "median_s": 55.24373506700067,
+      "min_s": 55.11231726700498,
+      "tok_per_s": 111.58731379266038,
+      "cached_tokens_total": 0
+    }
+  ],
+  "runA_prime": [
+    {
+      "approx_tokens": 8192,
+      "prompt_tokens": 6163.0,
+      "n": 6,
+      "median_s": 55.345473832509015,
+      "min_s": 55.14319923899893,
+      "tok_per_s": 111.35508603017789,
+      "cached_tokens_total": 0
+    }
+  ]
+}
