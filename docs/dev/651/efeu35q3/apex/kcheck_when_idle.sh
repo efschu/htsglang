@@ -16,9 +16,9 @@ run() {  # $1 label, rest args
   local L=$1; shift
   until quiet; do sleep 30; done
   echo "=== $L $(date -Is) $(st)" >> results/apex/kcheck_$L.txt
-  nice -n 5 $PY apex/apex_kernel_check.py "$@" >> results/apex/kcheck_$L.txt 2>&1
+  systemd-run --scope -q -p MemoryMax=4G nice -n 10 $PY apex/apex_kernel_check.py "$@" >> results/apex/kcheck_$L.txt 2>&1
   echo "=== rc=$? $(date -Is)" >> results/apex/kcheck_$L.txt
 }
 run quiet $A $M
-run ddr5load --types Q5_K,IQ3_XXS,Q3_K --runs 20 --load 6 $A
+# ddr5load run REMOVED: its 6 hogs caused the 21:16 global OOM (user session killed)
 echo "KCHECK DONE $(date -Is)" >> results/apex/kcheck_done.txt

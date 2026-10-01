@@ -6,8 +6,10 @@
 #      decode, py-spy record of spec steps (sgl_kernel op census)
 #   B2/B3 MTP k=1 / k=3 on the native spec ops (sgl_spec_rocm) -> identity, decode
 #   C  llama.cpp CPU reference on the same APEX file -> compare vs A
-# Gate: runs only after an explicit RELEASE file (night window, operator) AND
-# service up, inflight 0, idle >= 900 s. While the service is down a sentinel
+# Gate: runs only after an explicit RELEASE file (set ONLY by the operator) AND
+# service up, inflight 0, idle >= 900 s AND no login session of user 1000
+# (desktop/tty) AND MemAvailable >= 8 GiB once the service is stopped
+# (01.10. 21:16: a global OOM from my DDR5 hogs killed the user's GNOME session). While the service is down a sentinel
 # on :31651 answers 503; a POST (a real request -- GET health probes and the
 # dashboard do not count) is a knock: the measurement aborts at once and the
 # trap brings the service back.
@@ -62,10 +64,26 @@ stop_sglang() { pkill -f "^python -m sglang.launch_server"; sleep 8; }
 echo "=== apex_window armed $(date -Is)"
 until [ -e $RELEASE ]; do sleep 60; done
 until quiet; do sleep 30; done
+# HARD GATE 1: no session of user 1000 (any class=user session: seat, tty, ssh)
+U1000=$(loginctl list-sessions --no-legend | awk '$2==1000' | while read sid _; do
+  [ "$(loginctl show-session "$sid" -p Class --value)" = "user" ] && echo "$sid"; done)
+if [ -n "$U1000" ]; then
+  echo "$(date +%T) ABORT: user 1000 session(s) active: $(echo $U1000) -- window not started"
+  exit 0
+fi
 echo "$(date +%T) quiet window: $(st)"
 rm -f $KNOCK
 trap restore EXIT INT TERM
 systemctl stop htsglang-ondemand
+# HARD GATE 2: MemAvailable >= 8 GiB with the service stopped (APEX needs ~14.7 GiB
+# of the shared RAM; below 8 GiB free the box is too close to a global OOM)
+sleep 5
+MA=$(awk '/^MemAvailable/ {print $2}' /proc/meminfo)
+if [ "$MA" -lt $((8 * 1024 * 1024)) ]; then
+  echo "$(date +%T) ABORT: MemAvailable $((MA/1024)) MiB < 8 GiB after service stop -- restoring"
+  exit 0
+fi
+echo "$(date +%T) MemAvailable $((MA/1024)) MiB (service stopped)"
 python3 - <<'PY' &
 import http.server, pathlib
 class H(http.server.BaseHTTPRequestHandler):

@@ -14,8 +14,8 @@ with fixed inputs, against the numpy gguf dequantize oracle (float64):
   moe_vec@T=8          ggml_moe_a8_vec       (MoE decode / IQ prefill)
 clean = all runs byte-identical AND rel err < TOL AND all finite.
 
---load N   : run N CPU memory-bandwidth hogs (numpy streaming copies) during
-             the measurement (the "Q5_K under DDR5 load" case).
+--load N   : DISABLED (refuses). The 21:16 run with 6 hogs caused a global
+             OOM that killed the user's desktop session.
 --runs R   : runs per op (default 8).
 Gate: refuses to start (and stops between ops) when the live service on
 :31651 has inflight > 0 -- the iGPU is the user's.
@@ -101,6 +101,11 @@ def main():
     ap.add_argument("--load", type=int, default=0)
     ap.add_argument("--types", default="")
     a = ap.parse_args()
+    if a.load:
+        # 01.10. 21:16: 6 hogs (~1 GB anon each) beside the 17 GB service drove the
+        # laptop into a global OOM that killed the user's GNOME session. Never again.
+        print("REFUSED: --load (memory-bandwidth hogs) is disabled on this machine")
+        return 4
     if service_busy():
         print("REFUSED: live service has inflight > 0")
         return 3
