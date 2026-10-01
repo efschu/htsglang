@@ -73,6 +73,10 @@ PORT=${PORT:-31661}
 CTX=${CTX:-32768}
 
 MAMBASLOTS=${MAMBASLOTS:-4}
+# MAXRUN > 1 raises the hybrid KV cap to MAXRUN x (CTX + 4); MAXTOTAL keeps the
+# KV pool at the size the RAM budget was computed for (one full context).
+MAXTOTAL_ARGS=()
+[ -n "${MAXTOTAL:-}" ] && MAXTOTAL_ARGS=(--max-total-tokens "$MAXTOTAL")
 MAMBA_ARGS=()
 [ -n "$MAMBASLOTS" ] && MAMBA_ARGS=(--max-mamba-cache-size "$MAMBASLOTS")
 
@@ -120,7 +124,7 @@ CMD=(python -m sglang.launch_server \
   --device cuda \
   --tp-size 1 \
   --context-length "$CTX" \
-  --max-running-requests 1 \
+  --max-running-requests "${MAXRUN:-1}" \
   --attention-backend triton \
   --sampling-backend pytorch \
   --mamba-radix-cache-strategy no_buffer \
@@ -128,6 +132,7 @@ CMD=(python -m sglang.launch_server \
   --page-size 1 \
   --mem-fraction-static "$MEMFRAC" \
   "${MAMBA_ARGS[@]}" \
+  "${MAXTOTAL_ARGS[@]}" \
   --chunked-prefill-size "$CHUNKED_PREFILL" \
   "${GRAPH_ARGS[@]}" \
   "${HICACHE_ARGS[@]}" \
