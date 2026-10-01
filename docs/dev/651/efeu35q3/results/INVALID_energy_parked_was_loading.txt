@@ -1,0 +1,7 @@
+[parked] 30s  package 14.84 W (RAPL)  amdgpu socket 14.42 W  system CPU busy 7.9 %
+[parked] threads >= 1 % CPU (top -H, 30s average): 5
+     87.9 %  tid   93166 root     python
+      3.2 %  tid   44892 efeu     RemmRDP:Schnell
+      3.1 %  tid   39278 efeu     Isolated Web Co
+      1.1 %  tid   89969 efeu     omp
+      1.1 %  tid   89950 efeu     nvtop

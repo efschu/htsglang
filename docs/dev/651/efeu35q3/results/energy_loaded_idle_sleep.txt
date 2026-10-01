@@ -1,0 +1,8 @@
+[loaded_idle_sleep] 30s  package 4.20 W (RAPL)  amdgpu socket 3.79 W  system CPU busy 2.0 %
+[loaded_idle_sleep] threads >= 1 % CPU (top -H, 30s average): 6
+      3.7 %  tid   39278 efeu     Isolated Web Co
+      2.6 %  tid   90435 root     sglang::schedul
+      2.6 %  tid   44892 efeu     RemmRDP:Schnell
+      2.0 %  tid     122 root     kcompactd0
+      1.6 %  tid    8251 efeu     remmina
+      1.3 %  tid   89950 efeu     nvtop

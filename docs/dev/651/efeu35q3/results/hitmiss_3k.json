@@ -1,0 +1,50 @@
+{
+ "sys_tokens": 3000,
+ "turns": [
+  {
+   "turn": 1,
+   "q": "Name three tools from the list that take a str argument. Answer as a short list.",
+   "hit": "- tool_0000_import_index\n- tool_0001_self_list\n- tool_0002_read_check",
+   "miss": "- tool_0004_index_string\n- tool_0006_cache_path\n- tool_0008_dict_path",
+   "identical": false,
+   "prompt_tokens": [
+    3595,
+    3595
+   ],
+   "seconds": [
+    36.1,
+    36.4
+   ]
+  },
+  {
+   "turn": 2,
+   "q": "Kannst du auch Deutsch? Antworte in zwei Sätzen.",
+   "hit": "Ja, ich kann Deutsch. Ich kann dir gerne auf Deutsch antworten.",
+   "miss": "Ja, ich kann Deutsch. Ich kann dir gerne auf Deutsch antworten.",
+   "identical": true,
+   "prompt_tokens": [
+    3648,
+    3648
+   ],
+   "seconds": [
+    36.2,
+    35.9
+   ]
+  },
+  {
+   "turn": 3,
+   "q": "Now explain in one sentence what the first tool you named probably does.",
+   "hit": "The first tool, `tool_0000_import_index`, likely imports a module or class from a given path and returns the result of that import operation.",
+   "miss": "The first tool, `tool_0000_import_index`, likely imports a module or class from a given path and returns the result of that import operation.",
+   "identical": true,
+   "prompt_tokens": [
+    3687,
+    3687
+   ],
+   "seconds": [
+    37.4,
+    37.4
+   ]
+  }
+ ]
+}

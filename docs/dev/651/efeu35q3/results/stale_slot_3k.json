@@ -1,0 +1,26 @@
+[
+ [
+  "1 X cold salt a",
+  "- tool_0000_stream_open\n- tool_0001_write_file\n- tool_0002_return_def"
+ ],
+ [
+  "2 Y cold salt b",
+  "- tool_0000_return_page\n- tool_0001_result_tensor\n- tool_0002_page_flush"
+ ],
+ [
+  "3 X cold salt c",
+  "- tool_0000_stream_open\n- tool_0001_write_file\n- tool_0002_return_def"
+ ],
+ [
+  "4 X unsalted (cold)",
+  "- tool_0000_stream_open\n- tool_0001_write_file\n- tool_0002_return_def"
+ ],
+ [
+  "5 X unsalted (hit)",
+  "- tool_0000_stream_open\n- tool_0001_write_file\n- tool_0002_return_def"
+ ],
+ [
+  "6 X unsalted after churn",
+  "- tool_0000_stream_open\n- tool_0001_write_file\n- tool_0002_return_def"
+ ]
+]

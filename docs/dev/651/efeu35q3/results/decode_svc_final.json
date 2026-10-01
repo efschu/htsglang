@@ -1,0 +1,26 @@
+{
+  "label": "svc_final",
+  "port": 31651,
+  "runA": {
+    "tag": "A",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 1.7996386644954327,
+    "gap_median_ms": 44.51766350393882,
+    "gap_p90_ms": 47.08923099678941,
+    "gap_max_ms": 99.22524500871077,
+    "decode_tok_per_s": 22.462993816185396
+  },
+  "runA_prime": {
+    "tag": "A'",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 1.7499257225063047,
+    "gap_median_ms": 46.13302700454369,
+    "gap_p90_ms": 47.721951006678864,
+    "gap_max_ms": 94.34961399529129,
+    "decode_tok_per_s": 21.676444511250235
+  },
+  "noise_floor_pct": 3.501533728636045,
+  "decode_tok_per_s": 22.462993816185396
+}
