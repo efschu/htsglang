@@ -219,9 +219,11 @@ class PrefixLensDetectorTest(CustomTestCase):
         from sglang.srt.managers.schedule_batch import ScheduleBatch
 
         src = inspect.getsource(ScheduleBatch.prepare_for_extend)
-        self.assertIn("assert_prefix_lens_rank_uniform(prefix_lens)", src)
+        # nf-pd-post 01.10.: the call carries ``defer=`` (a skip batch's
+        # ballot is decided after its forward-less pass) -- still AT the vector
+        self.assertIn("assert_prefix_lens_rank_uniform(prefix_lens, defer=", src)
         vector_at = src.index("prefix_lens = [len(r.prefix_indices) for r in reqs]")
-        check_at = src.index("assert_prefix_lens_rank_uniform(prefix_lens)")
+        check_at = src.index("assert_prefix_lens_rank_uniform(prefix_lens")
         self.assertLess(vector_at, check_at)
 
     def test_the_predicate_this_protects_still_reads_that_vector(self):
