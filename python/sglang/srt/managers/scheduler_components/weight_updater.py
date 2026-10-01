@@ -7250,6 +7250,22 @@ class SchedulerWeightUpdaterManager:
                         type(exc).__name__, exc)
             return None, None, 0, True
 
+    def _l15_fence_manifest(self, manifest_path):
+        """L15-12c-B F11: the fence's manifest read.  The wake restore has
+        ALREADY read-and-unlinked this wake's record at
+        :meth:`_l15_wake_hold_signal` (cap>0 ranks stash it on
+        _l15_wake_manifest); a second load_for_wake on the same path always
+        returns None and would pin _l15_fp to None, so the part-2 verdict
+        could never come out "hold".  The stashed record wins; only a rank
+        that did not consume it (cap 0, no pool) asks the file -- and finds
+        it absent, which votes None -> mixed -> fallback (plan sec 6)."""
+        m = self._l15_wake_manifest
+        if m is not None:
+            return m
+        from sglang.srt.weg2 import l15_restore
+
+        return l15_restore.load_for_wake(manifest_path)
+
     def _l15_flush_zero_kv_bounded(self, sched, keep_rows: int) -> int:
         """L15-12c-A: the SGLANG_FLUSH_ZERO_KV scrub with the hold prefix
         kept: zero only rows >= keep_rows.  The held rows are the compact
@@ -7301,14 +7317,23 @@ class SchedulerWeightUpdaterManager:
         bufs = []
         try:
             for pool in sched._kv_pools_for_flush():
-                for name in ("k_buffer", "v_buffer", "kv_buffer"):
-                    t = getattr(pool, name, None)
-                    if t is None:
-                        continue
-                    if isinstance(t, torch.Tensor):
-                        bufs.append(t)
-                    else:
-                        bufs.extend(t)
+                # F10: the flush entry can be a HybridLinearKVPool (27B),
+                # whose buffers live on the sub-pools -- same walk as
+                # _l15_flush_zero_kv_bounded.
+                pools = [pool]
+                for attr in ("full_kv_pool", "swa_kv_pool"):
+                    sub = getattr(pool, attr, None)
+                    if sub is not None:
+                        pools.append(sub)
+                for p in pools:
+                    for name in ("k_buffer", "v_buffer", "kv_buffer"):
+                        t = getattr(p, name, None)
+                        if t is None:
+                            continue
+                        if isinstance(t, torch.Tensor):
+                            bufs.append(t)
+                        else:
+                            bufs.extend(t)
             mc = getattr(
                 getattr(sched.req_to_token_pool, "mamba_pool", None),
                 "mamba_cache", None)
@@ -7342,6 +7367,57 @@ class SchedulerWeightUpdaterManager:
             logger.info("L15-WAKE-RESTORE TMS keep set cleared on %d "
                         "base(s) after resume", cleared)
         return cleared
+
+    def _l15_fallback_drop(self, sched) -> int:
+        """L15-12c-B: the group verdict "fallback" ACTS (plan part 3 sec 3):
+        today's empty-tree wake shape WITHOUT the re-reservation --
+        tree_cache.reset() + req_to_token_pool.clear() (full, no keep; the
+        flush shape has no separate mamba allocator, the mamba rows go with
+        the req clear) + token_to_kv_pool_allocator.clear() + the TMS
+        keep-set clear.  Ranks that kept nothing experience the plain flush;
+        ranks that kept something drop the held bytes -- acceptable because
+        L2 stayed the authority (every row was published before the sleep).
+        Idempotent: the pools converge to the same state under a repeat and
+        the stashed manifest is consumed on the first pass.  NO collective
+        inside -- the uniformity comes from the gather that decided the
+        verdict, and the danger (xsn410) is entering the drop unevenly, so
+        this runs at one list position behind the group flag.  Returns the
+        number of held slots dropped (0 when nothing was held)."""
+        if sched is None:
+            return 0
+        m = self._l15_wake_manifest
+        dropped = 0
+        if m is not None:
+            try:
+                dropped = len({int(s) for sp in m.spans
+                               for s in sp.slots} - {0})
+            except Exception:  # noqa: BLE001 -- the log value must not decide the path
+                dropped = 0
+        try:
+            sched.tree_cache.reset()
+            sched.req_to_token_pool.clear()
+            sched.token_to_kv_pool_allocator.clear()
+            self._l15_clear_tms_keep_spans(sched)
+        except Exception as exc:  # noqa: BLE001 -- never split the group at the tail
+            logger.warning("L15-RESTORE fallback drop failed (%s: %s)",
+                           type(exc).__name__, exc)
+        self._l15_wake_manifest = None
+        return dropped
+
+    def _l15_wake_act(self, sched, verdict: str, *, group_ok: bool,
+                      master_on: bool) -> int:
+        """L15-12c-B: the fence tail's single-branch ACT on the group
+        verdict.  Master off -> zero new calls (byte-identical wake).  A
+        refused sibling (W114) defers EVERY rank: nothing is restored,
+        refilled or dropped here and the hold stays armed -- touching the
+        still-paused pool of a refused rank is the xsn408 fault class, never
+        the price of a cleanup.  "hold" and "none" drop nothing (the "hold"
+        refill is AP L15-12c-D's copy); returns slots dropped."""
+        if not master_on or not group_ok:
+            return 0
+        if verdict == "fallback":
+            return self._l15_fallback_drop(sched)
+        return 0
 
     def _weg2_wake_restore_pools(self) -> bool:
         """#1455: Scheduler.flush_cache minus tree_cache.reset(): the pool
@@ -11158,7 +11234,10 @@ class SchedulerWeightUpdaterManager:
                     # SAME path the sleep side (scheduler.py retain hook)
                     # wrote, one record per rank of this group. load_for_wake
                     # reads AND clears it (one sleep-wake pair per record).
-                    _l15_m = l15_restore.load_for_wake(
+                    # F11: the wake restore already consumed the file for
+                    # cap>0 ranks -- take the stashed record, do NOT
+                    # load_for_wake a second time (it would always be None).
+                    _l15_m = self._l15_fence_manifest(
                         l15_manifest.manifest_path(
                             self._weg2_group_name(), self._weg2_rank(),
                             os.environ))
@@ -11207,6 +11286,12 @@ class SchedulerWeightUpdaterManager:
                     _l15_min = _l15_max = None
                 _l15_v = ("fallback" if report.get("l15_fp_mixed")
                           else l15_restore.verdict(_l15_fp, _l15_min, _l15_max))
+                if _weg2_kv_refusal:
+                    # L15-12c-B (W114): a refused kv resume on ANY rank
+                    # defers the whole group's L15 action.  The restore_line
+                    # below names it (verdict=deferred); nothing is dropped
+                    # this wake and the hold stays armed for the next.
+                    _l15_v = "deferred"
                 _l15_refill = 0
                 _l15_missing = 0
                 if _l15_v == "hold" and _l15_m is not None:
@@ -11270,11 +11355,24 @@ class SchedulerWeightUpdaterManager:
                     except Exception as _exc:  # noqa: BLE001 -- plan only
                         logger.info("L15-WAKE refill plan skipped "
                                     "(%s: %s)", type(_exc).__name__, _exc)
+                # L15-12c-B: the group-uniform ACT, at ONE list position on
+                # every rank (same branch, no collective inside; the group
+                # flag is the xsn409-uniform kv verdict of this wake).
+                _l15_dropped = self._l15_wake_act(
+                    self.scheduler, _l15_v,
+                    group_ok=not _weg2_kv_refusal, master_on=_l15_wake)
+                if _l15_v == "fallback":
+                    logger.info("L15-RESTORE verdict=fallback dropped=%d "
+                                "slots", _l15_dropped)
                 logger.info("%s", l15_restore.restore_line(
                     int(_l15_m.epoch) if _l15_m is not None else 0,
                     _l15_v,
                     tuple(_l15_m.rows_by_rank) if _l15_m is not None else (),
                     _l15_refill, _l15_missing))
+                # F11: the fence has consumed the record (fingerprint,
+                # verdict, action -- the file was unlinked at the hold
+                # signal); the stash does not survive into the next wake.
+                self._l15_wake_manifest = None
         if store_failure and not report:
             # The fence did not gather: no memory saver, no cpu group, or
             # world <= 1. A single-rank engine cannot disagree with itself, so

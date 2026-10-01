@@ -88,14 +88,26 @@ def test_resume_fence_passes_l15_fp_only_behind_master_gate():
     # also compared elsewhere in the method).
     grp = src.find('weg2_memory_saver_on and self._weg2_group_name() == "D"')
     gate = src.find("l15_plan.master_on(os.environ)")
-    read = src.find("load_for_wake(")
+    # F11 (01.10.): the fence read moved into _l15_fence_manifest -- the
+    # wake restore already read-and-unlinked the record, so the fence takes
+    # the stashed self._l15_wake_manifest and only falls back to
+    # load_for_wake when it is not set.  The helper must keep BOTH sides.
+    read = src.find("self._l15_fence_manifest(")
     assign = src.find("_l15_fp = int(")
     for name, pos in (("D-group gate", grp), ("master_on gate", gate),
-                      ("load_for_wake read", read), ("fingerprint assign", assign)):
+                      ("fence manifest read", read),
+                      ("fingerprint assign", assign)):
         assert pos != -1, f"missing: {name}"
     assert init < grp < gate < read < assign < fence, (
         "the manifest read/assign must sit behind the D-group and "
         "master_on gates, and the fence call after the assign")
+    helper = text[text.find("def _l15_fence_manifest"):]
+    helper = helper[:helper.find("\n    def ")]
+    assert helper, "def _l15_fence_manifest not found"
+    assert "m = self._l15_wake_manifest" in helper, (
+        "fence manifest read does not take the stashed record first")
+    assert "load_for_wake(manifest_path)" in helper, (
+        "fence manifest read does not fall back to the file")
 
 
 def _three_rank_manifest():

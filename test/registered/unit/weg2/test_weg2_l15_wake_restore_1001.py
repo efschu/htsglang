@@ -188,10 +188,13 @@ def test_hold_path_keeps_mamba_rows_reserves_held_slots_bounds_scrub_clears_keep
     assert bool((sched.kv_held[KEEP:] == 0).all())
 
     # TMS keep set cleared exactly once per distinct allocation base
-    # (base_a via two views, base_b once), each with the EMPTY span set.
-    assert [s for _, s in sched.adapter.calls] == [(), ()]
+    # (base_a via two views, base_b once) AND the hybrid full_kv_pool's
+    # held base (F10, 01.10.: the sub-pool buffers must be reached too),
+    # each with the EMPTY span set.
+    assert [s for _, s in sched.adapter.calls] == [(), (), ()]
     assert {b for b, _ in sched.adapter.calls} == {sched.base_a.data_ptr(),
-                                                   sched.base_b.data_ptr()}
+                                                   sched.base_b.data_ptr(),
+                                                   sched.kv_held.data_ptr()}
 
     # the fallback path's full scrub did NOT run, the manifest was consumed
     # (read-and-clear), and it is stashed for the fence / AP-B.
@@ -218,8 +221,9 @@ def test_master_on_without_manifest_runs_the_old_sequence(monkeypatch, tmp_path)
     assert sched.flush_calls == [1]
     free = {int(x) for x in sched.token_to_kv_pool_allocator.free_pages.tolist()}
     assert free == set(range(1, SIZE + 1))
-    # master on: the sleep-armed keep set is cleared on the fallback too...
-    assert [s for _, s in sched.adapter.calls] == [(), ()]
+    # master on: the sleep-armed keep set is cleared on the fallback too
+    # (base_a, base_b and, F10, the hybrid full_kv_pool's held base)...
+    assert [s for _, s in sched.adapter.calls] == [(), (), ()]
     # ...and the (absent) manifest is stashed for the fence.
     assert fs._l15_wake_manifest is None
 
