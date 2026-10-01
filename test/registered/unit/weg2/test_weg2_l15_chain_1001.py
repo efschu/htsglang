@@ -369,3 +369,129 @@ def test_f2_failing_keep_arm_manifest_gone_group_fallback(monkeypatch, tmp_path)
     free = {int(x) for x in sched1.token_to_kv_pool_allocator.free_pages.tolist()}
     assert free == set(range(1, ALLOC_SIZE + 1))
     assert sched1.req_to_token_pool.clear_calls[-1] == ((), {})
+
+
+# ---------------------------------------------------------------------------
+# PART 3 (L15-INT3): the E1X decide wiring on the REAL env the next boot
+# uses -- SGLANG_WEG2_L15=1, SGLANG_WEG2_L15_MIB="c1=7616,c2=1792", REFILL
+# unset. The 27B cell (32768 B/row) makes caps_from_env (0, 243712, 57344):
+# rank 0 (card 0, unnamed) holds nothing; ranks 1/2 sleep their manifests.
+# At wake EVERY rank runs _l15_decide_wake_verdict (ONE all_gather_object
+# over scheduler.world_group.cpu_group, the same group object everywhere,
+# xsn410); mixed votes -> "fallback" on every rank -> the drop frees all
+# pools. Unanimous fingerprints -> "hold".
+# ---------------------------------------------------------------------------
+
+from sglang.srt.weg2 import l15_shadow  # noqa: E402
+
+CELL_27B = 32768                       # bytes per token row, 27B geometry
+REAL_MIB = "c1=7616,c2=1792"           # the boot-1926 card plan
+CAPS_27B = (0, 243712, 57344)          # 7616/32768, 1792/32768 rows
+
+
+def _env_real(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path, mib=REAL_MIB)
+    monkeypatch.delenv("SGLANG_WEG2_L15_REFILL", raising=False)
+
+
+def _sleep_cap_ranks(tmp_path):
+    """Sleep on the two cap>0 ranks with the REAL caps; rank 0 holds nothing
+    (cap 0 -> it never retains, no manifest exists at its path)."""
+    for r in (1, 2):
+        path = l15_manifest.manifest_path("D", r, os.environ)
+        res, _p, _a, _n = _retain_rank(tmp_path, r, caps=CAPS_27B,
+                                       manifest_name=path, pid=os.getpid())
+        assert res is not None, f"sleep skipped on rank {r}"
+
+
+def _wake_ranks():
+    """Three fake D ranks on the SAME cpu group object: rank 0 only runs the
+    hold signal (no manifest -> votes None); ranks 1/2 restore and hold."""
+    grp = object()  # one identity: the group every gather must see
+    fss, scheds = [], []
+    for r in range(3):
+        sched = _sched()
+        # the 27B cell: one row of K and of V at 16384 B each.
+        t = torch.zeros(1, 8, 1024, dtype=torch.bfloat16)
+        sched.tp_worker.model_runner.token_to_kv_pool = SimpleNamespace(
+            k_buffer=[t], v_buffer=[t])
+        sched.world_group = SimpleNamespace(cpu_group=grp)
+        fs = _fake_self(sched, r)
+        if r == 0:
+            assert WU._l15_wake_hold_signal(fs) == (None, 0, 0, True)
+        else:
+            assert WU._weg2_wake_restore_pools(fs) is True
+            assert fs.flushed == []
+        fss.append(fs)
+        scheds.append(sched)
+    return grp, fss, scheds
+
+
+def _fake_gather(monkeypatch, votes, calls):
+    import torch.distributed as dist
+
+    def _fake(gathered, obj, group=None, **kw):
+        calls.append((group, obj))
+        gathered[:] = list(votes)
+
+    monkeypatch.setattr(dist, "all_gather_object", _fake)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: len(votes))
+
+
+def test_real_env_caps_and_mixed_votes_fallback_frees_all_pools(
+        monkeypatch, tmp_path):
+    _env_real(monkeypatch, tmp_path)
+    # The env the next boot ships with, on the 27B cell: rank 0 caps to 0.
+    assert l15_shadow.caps_from_env(os.environ, 3, [CELL_27B] * 3,
+                                    [0, 1, 2]) == CAPS_27B
+    _sleep_cap_ranks(tmp_path)
+    grp, fss, scheds = _wake_ranks()
+    assert l15_shadow.cell_bytes_from(
+        scheds[1].tp_worker.model_runner.token_to_kv_pool) == CELL_27B
+
+    fps = [None,
+           l15_manifest.fingerprint(fss[1]._l15_wake_manifest),
+           l15_manifest.fingerprint(fss[2]._l15_wake_manifest)]
+    assert fps[1] == fps[2] is not None  # F7: identical holds
+    held = [None, _hold_votes(fss[1]), _hold_votes(fss[2])]
+    assert held[1] is not None and held[2] is not None
+    assert held[1][1] == held[2][1] == 2  # both spans of the F7 hold
+    # The vote each rank sends: decide builds it from the fp (missing=0).
+    votes = [None] + [l15_restore.check_vote(fps[r], 0, 0, 0, ())
+                      for r in (1, 2)]
+
+    calls = []
+    _fake_gather(monkeypatch, votes, calls)
+    verdicts = [WU._l15_decide_wake_verdict(fss[r], True, fps[r], epoch=EPOCH)
+                for r in range(3)]
+    assert verdicts == ["fallback", "fallback", "fallback"]
+    # xsn410: exactly one gather per rank, each on the SAME group object,
+    # each carrying that rank's OWN vote.
+    assert [g for g, _o in calls] == [grp, grp, grp]
+    assert [o for _g, o in calls] == votes
+
+    for r in range(3):
+        dropped = WU._l15_wake_act(fss[r], scheds[r], "fallback",
+                                   group_ok=True, master_on=True)
+        assert dropped == (0 if r == 0 else len(HELD_SLOTS))
+    for sched in scheds:
+        free = {int(x) for x in sched.token_to_kv_pool_allocator.free_pages.tolist()}
+        assert free == set(range(1, ALLOC_SIZE + 1)), "every pool must be free"
+        assert sched.tree_cache.resets == 1
+        assert sched.req_to_token_pool.clear_calls[-1] == ((), {})
+
+
+def test_unanimous_fingerprints_every_rank_holds(monkeypatch, tmp_path):
+    # REFILL-on shape simulated at the vote: rank 0 carries the same
+    # fingerprint -> no rank falls back, the group holds together.
+    _env_real(monkeypatch, tmp_path)
+    _sleep_cap_ranks(tmp_path)
+    grp, fss, scheds = _wake_ranks()
+    fp = l15_manifest.fingerprint(fss[1]._l15_wake_manifest)
+    votes = [l15_restore.check_vote(fp, 0, 0, 0, ())] * 3
+    calls = []
+    _fake_gather(monkeypatch, votes, calls)
+    for r in range(3):
+        assert WU._l15_decide_wake_verdict(fss[r], True, fp, epoch=EPOCH) \
+            == "hold"
+    assert [g for g, _o in calls] == [grp, grp, grp]
