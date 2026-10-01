@@ -1,0 +1,33 @@
+[2026-10-01 20:04:24] server_args=ServerArgs(model_path='/root/efeu35q3/models/Qwen3.8-35B-A3B-Q3_K_M.gguf', tokenizer_path='/root/efeu35q3/hf', tokenizer_mode=
+[2026-10-01 20:06:10] Prefill batch, #new-seq: 1, #new-token: 6, #cached-token: 0, pending=0
+[2026-10-01 20:06:18] HiCache prefetch success req=04a2a560559949c8a629ad6faa6808d3 completed_local=17920 completed_synced=17920 matched=0 loaded=17920 tail_rel
+[2026-10-01 20:06:25] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 17920, pending=13
+[2026-10-01 20:06:25] Prefill batch, #new-seq: 1, #new-token: 13, #cached-token: 0, pending=0
+[2026-10-01 20:06:39] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 18505, pending=3101
+[2026-10-01 20:07:32] Prefill batch, #new-seq: 1, #new-token: 29, #cached-token: 0, pending=0
+[2026-10-01 20:08:40] HiCache prefetch skipped: reason=host_kv_full len=525 host_free=126
+[2026-10-01 20:08:50] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 17920, pending=14
+[2026-10-01 20:08:51] Prefill batch, #new-seq: 1, #new-token: 14, #cached-token: 0, pending=0
+[2026-10-01 20:09:11] HiCache prefetch skipped: reason=host_kv_full len=15448 host_free=46
+[2026-10-01 20:09:21] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 18507, pending=14937
+[2026-10-01 20:14:32] Prefill batch, #new-seq: 1, #new-token: 89, #cached-token: 0, pending=0
+[2026-10-01 20:17:24] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=33956 of 34456
+[2026-10-01 20:17:36] Prefill batch, #new-seq: 1, #new-token: 500, #cached-token: 33956, pending=0
+[2026-10-01 20:17:42] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=34505 of 34925
+[2026-10-01 20:17:52] Prefill batch, #new-seq: 1, #new-token: 420, #cached-token: 34505, pending=0
+[2026-10-01 20:18:25] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=34925 of 35155
+[2026-10-01 20:18:31] Prefill batch, #new-seq: 1, #new-token: 230, #cached-token: 34925, pending=0
+[2026-10-01 20:18:46] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=35224 of 37311
+[2026-10-01 20:18:58] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 35224, pending=1575
+[2026-10-01 20:19:36] Prefill batch, #new-seq: 1, #new-token: 39, #cached-token: 0, pending=0
+[2026-10-01 20:19:49] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=37378 of 39343
+[2026-10-01 20:20:01] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 37378, pending=1453
+[2026-10-01 20:20:37] Prefill batch, #new-seq: 1, #new-token: 429, #cached-token: 0, pending=0
+[2026-10-01 20:20:49] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=39403 of 41555
+[2026-10-01 20:21:01] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 39403, pending=1640
+[2026-10-01 20:21:43] Prefill batch, #new-seq: 1, #new-token: 104, #cached-token: 0, pending=0
+[2026-10-01 20:21:57] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=41622 of 43929
+[2026-10-01 20:22:09] Prefill batch, #new-seq: 1, #new-token: 512, #cached-token: 41622, pending=1795
+[2026-10-01 20:22:56] Prefill batch, #new-seq: 1, #new-token: 259, #cached-token: 0, pending=0
+[2026-10-01 20:26:59] HiCache prefetch skipped: reason=last_host_node_not_backuped matched=43943 of 44116
+[2026-10-01 20:27:04] Prefill batch, #new-seq: 1, #new-token: 173, #cached-token: 43943, pending=0

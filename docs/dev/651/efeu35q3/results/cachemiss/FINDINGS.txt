@@ -106,3 +106,15 @@ identical result set on v2 and pristine (4/10 both). Only ungated difference:
 the l3_persisted attribute (set on storage ack / L3 insert / split, read only
 by the gated drop). v1+sanity file kept as logs/urc_v1sanity_replaced_2025.py.
 The running process (20:03) still holds v1 (ring=0) until its next restart.
+
+preserve_thinking PROOF (passive, backend_200341, ring=0)
+  New user messages on a long chain after a tool loop (omp history.db ids
+  59/60, session 01a0f88e):
+    20:17:23 "welche usb geräte sind angeschlossen?"  -> matched 33956 of 34456
+             (500 new tokens; 20:17:36 #cached-token 33956)
+    20:18:24 "suche im internet ..."                 -> matched 34925 of 35155
+             (230 new)
+  Before (18:14:42, same situation, no preserve_thinking): 17920 of 43464,
+  then 25.5k cold (~6 min). Tool turns in between keep matching near the full
+  chain (35224/37311, 37378/39343, 39403/41555, 41622/43929, 43943/44116);
+  the gap per turn is the new tool result plus the model's own last output.
