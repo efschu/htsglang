@@ -129,16 +129,22 @@ class CompactPlan:
 
 
 def compact_plan(
-    held: Mapping[str, Sequence[int]], prefix: Sequence[int]
+    held: Mapping[str, Sequence[int]],
+    prefix: Sequence[int],
+    reserved: Sequence[int] = (),
 ) -> CompactPlan:
     """Plan the compaction of ``held`` (rid -> global slots, token order).
 
     All slots across all requests must be distinct. ``need_by_rank`` is the
     per-class count of held slots, ``L_H = hold_prefix(need)``; see the module
-    docstring for the move rule.
+    docstring for the move rule. ``reserved`` (e.g. padding slot 0, the dummy
+    write target for padded tokens) counts toward its owner's need, is never
+    a compaction target and is not part of ``moves``/``new_slots``; the
+    default ``()`` reproduces the pre-L15-11b behaviour exactly.
     """
     s = _check_prefix(prefix)
     n_ranks = len(prefix) - 1
+    reserved_set = {int(x) for x in reserved}
 
     need = [0] * n_ranks
     held_all: set = set()
@@ -152,6 +158,8 @@ def compact_plan(
                 )
             held_all.add(slot)
             need[owner_of(slot, prefix)] += 1
+    for slot in reserved_set:
+        need[owner_of(slot, prefix)] += 1
 
     l_h = hold_prefix(need, prefix)
     blocks = l_h // s
@@ -162,7 +170,7 @@ def compact_plan(
     # Free slots of each class inside [0, l_h), ascending (scanning ascending).
     free_by_rank: list = [[] for _ in range(n_ranks)]
     for slot in range(l_h):
-        if slot not in held_all:
+        if slot not in held_all and slot not in reserved_set:
             free_by_rank[owner_of(slot, prefix)].append(slot)
 
     # Sources at or above l_h, per class; paired ascending with the targets.
@@ -198,14 +206,19 @@ def compact_plan(
 
 def anchor_plan(
     anchor_slots: Mapping[str, int],
+    reserved: Sequence[int] = (),
 ) -> Tuple[int, Tuple[Tuple[int, int], ...]]:
     """Squeeze the GDN state slots of the held requests to ``[0, A_H)``.
 
-    ``A_H = len(anchor_slots)``; slots already below ``A_H`` stay, the others
-    take the free targets of ``[0, A_H)`` in ascending order with the sources
-    taken in ascending order (moves sorted by old slot). Returns
-    ``(A_H, moves)``; the staying slots plus the targets are exactly
-    ``range(A_H)``.
+    ``A_H = len(anchor_slots) + len(reserved)``; slots already below ``A_H``
+    stay, the others take the free targets of ``[0, A_H)`` in ascending order
+    with the sources taken in ascending order (moves sorted by old slot).
+    Returns ``(A_H, moves)``; the staying slots plus the targets are exactly
+    ``range(A_H)`` minus ``reserved``. ``reserved`` (padding slot 0, the dummy
+    write target for padded tokens) stays where it is and never becomes a
+    target; an anchor already sitting on a reserved slot is a ValueError --
+    the hold must never land there. The default ``()`` reproduces the
+    pre-L15-11b behaviour exactly.
     """
     seen: Dict[int, str] = {}
     for rid, slot in anchor_slots.items():
@@ -218,9 +231,17 @@ def anchor_plan(
             )
         seen[slot] = rid
 
-    a_h = len(anchor_slots)
+    reserved_set = {int(x) for x in reserved}
+    hit = sorted(reserved_set & set(seen))
+    if hit:
+        raise ValueError(
+            f"anchor slot(s) {hit} sit on a reserved slot (padding slot 0 is "
+            "the dummy write target for padded tokens); a held anchor must "
+            "never land there"
+        )
+    a_h = len(anchor_slots) + len(reserved_set)
     staying = {slot for slot in seen if slot < a_h}
-    free = [x for x in range(a_h) if x not in staying]
+    free = [x for x in range(a_h) if x not in staying and x not in reserved_set]
     srcs = sorted(slot for slot in seen if slot >= a_h)
     # len(srcs) == a_h - len(staying) == len(free) holds by construction.
     moves = tuple(sorted(zip(srcs, free)))

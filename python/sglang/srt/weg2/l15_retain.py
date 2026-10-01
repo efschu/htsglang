@@ -8,9 +8,14 @@ the allocator is told which slots stay taken, and the TMS keep windows plus a
 manifest publish the result. The scheduler owns WHEN this runs; the real
 device bindings (node attributes, ``reset_keep``, ``set_keep``) are injected
 callables -- the one-line scheduler hook is AP L15-11b.
-OPEN for L15-11b (not built here): the MAMBA pool allocator also needs its
-own ``clear()`` followed by taking the anchors' compacted slots ``[0, A_H)``
-out of its free list; today only the KV token allocator is re-armed.
+OPEN for L15-11b (not built here): HybridReqToTokenPool.clear()
+(mem_cache/memory_pool.py ~2871) calls mamba_pool.reset_state(), which zeroes
+EVERY mamba slot including the held anchors -- the real sleep path must skip
+reset_state for ``[0, A_H)`` when a hold exists.
+OPEN for L15-11b (pool-side keep_rows is in): the caller of
+retain_at_sleep must flush via HybridReqToTokenPool.clear(keep_mamba_rows=A_H) so the held rows [0, A_H) survive the mamba reset (the scheduler hook making that call is still open).
+OPEN for L15-11b (not here): the scheduler hook with the actual
+node_of/reset_keep/set_keep bindings.
 
 The DANGER DIRECTION is a wrong step order: moving buffers after the
 allocator/tracing was re-armed, or resetting the keep set before the rows
@@ -52,11 +57,19 @@ from sglang.srt.weg2.l15_manifest import write as manifest_write
 from sglang.srt.weg2.l15_policy import HoldSet, select_hold
 
 __all__ = [
+    "PAD_SLOTS",
     "RetainResult",
     "apply_moves",
+    "reserve_mamba_slots",
     "reserve_slots",
     "retain_at_sleep",
 ]
+
+# Slot 0 (KV and mamba alike) is the dummy write target for padded tokens:
+# both clear() sites hand out arange(1, size+1) -- mamba.py
+# MambaSlotAllocator.clear() and token.py TokenToKVPoolAllocator.clear().
+# A real hold must never land on it; it stays inside the keep window harmlessly.
+PAD_SLOTS = (0,)
 
 
 def reserve_slots(allocator, slots: Sequence[int]) -> int:
@@ -94,6 +107,42 @@ def reserve_slots(allocator, slots: Sequence[int]) -> int:
         )
     take = torch.tensor(distinct, dtype=free.dtype, device=free.device)
     allocator.free_pages = free[~torch.isin(free, take)]
+    return len(distinct)
+
+
+def reserve_mamba_slots(mamba_allocator, slots: Sequence[int]) -> int:
+    """Carve ``slots`` out of a freshly cleared mamba allocator's free_slots.
+
+    The caller runs ``mamba_allocator.clear()`` first (free_slots becomes
+    ``arange(1, size + 1)``, int64, padding slot 0 never in it); this then
+    removes exactly the requested slots -- the held anchors' compacted slots
+    -- keeping the order of the remaining entries, and returns how many were
+    removed. A slot that is not free (already taken, or padding slot 0, or
+    requested twice) is a ValueError: handing it out again would overwrite
+    the held GDN state.
+    """
+    wanted = [int(s) for s in slots]
+    if not wanted:
+        return 0
+    counts = Counter(wanted)
+    dupes = sorted(s for s, c in counts.items() if c > 1)
+    if dupes:
+        raise ValueError(
+            f"reserve_mamba_slots: slot(s) {dupes} requested twice; a slot "
+            "can be reserved once"
+        )
+    distinct = sorted(counts)
+    free = mamba_allocator.free_slots
+    free_set = set(int(x) for x in free.tolist())
+    missing = [s for s in distinct if s not in free_set]
+    if missing:
+        raise ValueError(
+            f"reserve_mamba_slots: slot(s) {missing} are not free "
+            f"(free_slots holds {len(free_set)} entries, {len(distinct)} "
+            "requested)"
+        )
+    take = torch.tensor(distinct, dtype=torch.int64, device=free.device)
+    mamba_allocator.free_slots = free[~torch.isin(free, take)]
     return len(distinct)
 
 
@@ -170,6 +219,7 @@ def retain_at_sleep(
     kv_buffers,
     mamba_buffers,
     allocator,
+    mamba_allocator=None,
     reset_keep: Callable[[list], None],
     set_keep: Callable[[object, Tuple[Tuple[int, int], ...]], None],
     manifest_path: str,
@@ -200,10 +250,16 @@ def retain_at_sleep(
         if not hs.rids:
             log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold")
             return None
-        # (2) where the survivors land
-        plan = compact_plan({rid: slots_of(rid) for rid in hs.rids}, prefix)
+        # (2) where the survivors land; PAD_SLOTS (padding slot 0, the dummy
+        # write target for padded tokens) is never a compaction target.
+        plan = compact_plan(
+            {rid: slots_of(rid) for rid in hs.rids},
+            prefix,
+            reserved=PAD_SLOTS,
+        )
         a_h, anchor_moves = anchor_plan(
-            {rid: anchor_slot_of(rid) for rid in hs.rids}
+            {rid: anchor_slot_of(rid) for rid in hs.rids},
+            reserved=PAD_SLOTS,
         )
     except Exception as exc:  # noqa: BLE001 - benign skip, nothing touched yet
         log(f"L15-RETAIN skipped reason={type(exc).__name__}: {exc}")
@@ -231,10 +287,21 @@ def retain_at_sleep(
     # (5) partial tree reset over exactly the kept nodes
     reset_keep(nodes)
 
-    # (6) re-arm the allocator, then take back the held prefix slots
+    # (6) re-arm the allocator, then take back the held prefix slots; the
+    # padding slot is never free after clear() and is not a held slot, so it
+    # never goes to reserve_slots. A given mamba_allocator is re-armed the
+    # same way for the held anchors' compacted slots.
     allocator.clear()
-    new_all = sorted({int(s) for rid in hs.rids for s in plan.new_slots[rid]})
+    new_all = sorted(
+        {int(s) for rid in hs.rids for s in plan.new_slots[rid]}
+        - set(PAD_SLOTS)
+    )
     reserve_slots(allocator, new_all)
+    if mamba_allocator is not None:
+        mamba_allocator.clear()
+        reserve_mamba_slots(
+            mamba_allocator, sorted({int(a) for a in new_anchors.values()})
+        )
 
     # (7) keep windows: kv rows [0, rows_by_rank[rank]), mamba rows [0, A_H)
     kv_range = ((0, int(plan.rows_by_rank[rank])),)

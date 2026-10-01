@@ -177,3 +177,20 @@ def post_line(p: L15Post) -> str:
     """The boot line, one per card: what is held there and what it cost."""
     return (f"L15-POST card={p.card} mib={p.mib} src={p.src} "
             f"experts_rows_traded={p.experts_rows_traded}")
+
+
+def residue_without_hold(residue_mib: int, held_mib: Optional[int]) -> int:
+    """L15-13c: strip the L1.5 hold out of a D dormant-residue measurement.
+
+    With the L1.5 hold on, D's kv_cache keeps its held rows mapped while
+    asleep, so the residue NVML reads at D's sleep already contains the hold.
+    The planner ALSO subtracts the hold as its own ``l15`` post (L15-01b,
+    ``budgets_from_dc``); a record that keeps the hold would be charged twice
+    on the next launch.  ``held_mib`` is the per-card kv_cache bytes still
+    mapped at sleep (``tms_tag_mapped_bytes`` via the adapter's
+    ``tag_mapped_bytes``), converted to MiB.  ``None`` (master off, no
+    adapter, or no entry for the card) leaves the residue untouched.
+    """
+    if held_mib is None:
+        return residue_mib
+    return max(0, residue_mib - int(held_mib))

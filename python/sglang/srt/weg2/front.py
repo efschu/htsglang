@@ -100,6 +100,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import l15_plan  # L15-13c: D's residue record excludes the hold
 from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock lock
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
@@ -641,6 +642,30 @@ def anchors_lost(body: str) -> List[int]:
         except (TypeError, ValueError):
             continue
     return sorted(set(out))
+
+
+def l15_held_mib_from_body(body: str) -> Optional[Dict[str, int]]:
+    """L15-13c part 2: the release leg's answer's ``l15_held_mib`` -- the
+    kv_cache bytes still MAPPED per card after the pause (the L1.5 keep-
+    spans), ``{card uuid: MiB}`` (weight_updater / io_struct).  None when
+    the answer carries none or is not this tree's JSON -- the dormant-image
+    record then keeps the residue as measured, exactly as before part 2."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    held = payload.get("l15_held_mib")
+    if not isinstance(held, dict) or not held:
+        return None
+    out: Dict[str, int] = {}
+    for k, v in held.items():
+        try:
+            out[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out or None
 
 
 def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
@@ -6147,15 +6172,19 @@ class Front:
         return task
 
     def _first_sleep_reading(self, S: Group, src: str,
-                             shmem_before: Optional[int]) -> Tuple[Dict[str, int], Optional[dict]]:
+                             shmem_before: Optional[int],
+                             l15_held_mib: Optional[Dict[str, int]] = None,
+                             ) -> Tuple[Dict[str, int], Optional[dict]]:
         """The residue reading of ``src``'s FIRST sleep, as the flip took it
         inline: ``ps`` + ``nvidia-smi`` + the dormant-image sample -- minus
         the sidecar append, which the caller hands to the writer (H78).
         Runs in a worker thread; the flip awaits it, so W19 and the sample
-        keep their place in the flip."""
+        keep their place in the flip.  ``l15_held_mib`` (L15-13c part 2) is
+        the D sleep reply's per-card held kv_cache MiB, off the caller's
+        leg body; None keeps the record as measured."""
         pids = _session_pids(S.sid) if S.sid else set()
         dc = _nvml_process_mib(pids) if pids else {}
-        rec = self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc, persist=False)
+        rec = self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc, persist=False, l15_held_mib=l15_held_mib)
         return dc, rec
 
     async def cleanup(self, app):
@@ -8078,6 +8107,31 @@ class Front:
                 self._ipc_publish("flip_user_time", _dp)
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
+            # L15-18 (L3-RETURN stage 2): say whether this prompt's prefix
+            # was known BEFORE this boot, so monitor M2's L3-RETURN check
+            # does not count never-seen prompts as MISS. Gated on
+            # SGLANG_WEG2_PREFIX_FP_PATH: unset -> no line, no file, no cost.
+            # No token ids exist at this point of leg1 (the payload carries
+            # the text), so the source here is p.text, named as src=text.
+            _fp_path = os.environ.get("SGLANG_WEG2_PREFIX_FP_PATH")
+            if _fp_path:
+                try:
+                    from sglang.srt.weg2.prefix_fp import PrefixSeen, fingerprint
+                    _ps = getattr(self, "_prefix_seen", None)
+                    if _ps is None:
+                        _ps = self._prefix_seen = PrefixSeen(_fp_path)
+                        self._prefix_fp_adds = 0
+                    _fp = fingerprint(p.text)
+                    logger.info(
+                        "WEG2-PREFIX-FP rid=%s fp=%s n=%d src=text seen_before_boot=%d",
+                        p.rid, _fp, min(len(p.text), 4096 * 4),
+                        1 if _ps.seen_before(_fp) else 0)
+                    _ps.add(_fp)
+                    self._prefix_fp_adds += 1
+                    if self._prefix_fp_adds % 16 == 0:
+                        _ps.save()
+                except Exception:  # never raise from the serving path
+                    pass
         finally:
             g.outstanding.pop(p.rid, None)
 
@@ -9662,6 +9716,7 @@ class Front:
 
     def sample_dormant_image(self, group: str, shmem_before: Optional[int],
                              vram_residue_mib: Optional[Dict[str, int]] = None,
+                             l15_held_mib: Optional[Dict[str, int]] = None,
                              persist: bool = True) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
 
@@ -9683,6 +9738,27 @@ class Front:
         weight_tags = (
             host_ledger.WEIGHT_TAGS_P_BYTES if group == "P" else host_ledger.WEIGHT_TAGS_D_BYTES
         ) / host_ledger.GIB
+        # L15-13c: the record must not contain the L1.5 hold.  The next
+        # launch prices D's measured residue per card (launcher's
+        # dormant_other) AND subtracts the hold again as the planner's
+        # own l15 post (L15-01b); keeping the hold here would charge it
+        # twice.  l15_held_mib is the per-card kv_cache bytes still
+        # mapped at sleep (tms_tag_mapped_bytes via the adapter's
+        # tag_mapped_bytes, MiB); absent entry / master off = unchanged.
+        if (
+            group == "D"
+            and vram_residue_mib
+            and l15_held_mib is not None
+            and l15_plan.master_on(os.environ)
+        ):
+            vram_residue_mib = dict(vram_residue_mib)
+            for uuid in list(vram_residue_mib):
+                _r = int(vram_residue_mib[uuid])
+                _h = l15_held_mib.get(uuid)
+                _w = l15_plan.residue_without_hold(_r, None if _h is None else int(_h))
+                if _w != _r:
+                    vram_residue_mib[uuid] = _w
+                    logger.info("L15-RESIDUE record=%d held=%d written=%d uuid=%s", _r, _h, _w, uuid)
         rec = host_ledger.dormant_image_sample(
             group=group,
             shmem_before_bytes=shmem_before,
@@ -10106,6 +10182,14 @@ class Front:
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
             return
+        # L15-13c part 2: the sleep reply carries the kv_cache MiB the group
+        # still keeps MAPPED per card (the L1.5 keep-spans, weight_updater).
+        # Capture it HERE -- ``body`` is the sleep answer only until the wake
+        # leg reassigns it -- so both dormant-image stamp sites below can
+        # subtract the hold from the residue instead of the next launch
+        # charging it twice.  Only D runs the L1.5 hold; any other source
+        # keeps the record as measured (parser returns None on no field).
+        _l15_held = l15_held_mib_from_body(body) if src == "D" else None
         family = list(self.weights_tags)
         # #1233 fix 4 ON THE RING FORM.  The tight-card-first order survives the
         # move to gathered legs (C9); the serial per-tag RPC loop it used to
@@ -10360,7 +10444,7 @@ class Front:
             # the flip AWAITS it -- the gate keeps its place, the loop is free
             # (x172-x175: 51-63 ms of ps + nvidia-smi + /proc on the loop). The
             # sidecar append (79-94 ms of JSON) goes to the writer, off the flip.
-            dc, _img = await asyncio.to_thread(self._first_sleep_reading, S, src, shmem_before)
+            dc, _img = await asyncio.to_thread(self._first_sleep_reading, S, src, shmem_before, _l15_held)
             if _img is not None and self.measured_record:
                 self._sidecar_submit(self._persist_dormant_image, _img)
         else:
@@ -10369,7 +10453,7 @@ class Front:
             # #1444: the device residue rides in the dormant-image record, so the
             # NEXT boot prices this form's MEASURED residue instead of the xsn14
             # constant (launcher.dc_residue_from_record).
-            self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc)
+            self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc, l15_held_mib=_l15_held)
         if not dc_off_path:
             for uuid, mib in sorted(dc.items()):
                 logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
