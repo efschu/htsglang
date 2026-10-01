@@ -4953,7 +4953,16 @@ class SchedulerWeightUpdaterManager:
         if str(os.environ.get("SGLANG_WEG2_WAKE_KV_FIRST", "1")).strip().lower() in ("0", "false", "no", "off"):
             return False
         try:
-            need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+            from sglang.srt.weg2.wake_kv import kv_resume_need_bytes
+            # L15-13d: need = the bytes the resume will actually map
+            # (plan - mapped_now).  A paused kv_cache keeps its spans mapped,
+            # so sizing by the full plan demanded them twice.  Mapped figure
+            # unreadable (method absent, symbol absent, probe failed) ->
+            # need == plan, byte-identical to the pre-13d decision.
+            _mfn = getattr(self, "_weg2_tag_mapped_bytes", None)
+            _mapped = _mfn(GPU_MEMORY_TYPE_KV_CACHE) if callable(_mfn) else None
+            need = kv_resume_need_bytes(
+                int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0), _mapped)
             free = self._weg2_free_bytes()
             floor = int(self._weg2_corridor_floor_bytes() or 0)
         except Exception as exc:  # noqa: BLE001 -- no probe, old order
@@ -10379,10 +10388,20 @@ class SchedulerWeightUpdaterManager:
                             not in ("0", "false", "no", "off")):
                         try:
                             from sglang.srt.weg2.wake_kv import kv_mid_ok as _kv_mid_ok
+                            from sglang.srt.weg2.wake_kv import kv_resume_need_bytes as _kv_need_fn
                             _ti_mid = list(weights_tags).index(tag)
                             _rest = list(weights_tags)[_ti_mid + 1:]
                             _rest_need = sum(int(tag_bytes.get(t, 0) or 0) for t in _rest)
-                            _kv_need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+                            # L15-13d: size by the bytes the resume will actually
+                            # map (plan - mapped_now); a paused kv_cache keeps its
+                            # spans mapped, so the full plan demanded them twice.
+                            # Mapped figure unreadable (method absent, symbol
+                            # absent, probe failed) -> need == plan, as before.
+                            _mfn = getattr(self, "_weg2_tag_mapped_bytes", None)
+                            _mapped = _mfn(GPU_MEMORY_TYPE_KV_CACHE) if callable(_mfn) else None
+                            _kv_need = _kv_need_fn(
+                                int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0),
+                                _mapped)
                             _free_mid = self._weg2_free_bytes()
                             _floor_mid = int(self._weg2_corridor_floor_bytes() or 0)
                             _mid_ok = _kv_mid_ok(_free_mid, _floor_mid, _kv_need, _rest_need)
