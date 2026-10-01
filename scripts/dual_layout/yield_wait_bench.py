@@ -46,6 +46,54 @@ extern "C" __global__ void mark(volatile unsigned *done, unsigned tag) {
 MODES = ("spin", "wait", "host")
 
 
+def preload_nvrtc_builtins():
+    """libnvrtc.so.13 (nvidia/cu13/lib, loaded by cuda-python) dlopens
+    libnvrtc-builtins.so.13.0 by bare name at compile time; that directory is on
+    no loader path, so the compile failed with NVRTC_ERROR_BUILTIN_OPERATION_FAILURE
+    (window tatcwj, yieldwait_tatcwj_10011227). Load it RTLD_GLOBAL from the
+    directory of the libnvrtc this process uses (soname match then succeeds).
+    Returns the path loaded, or None if no candidate exists."""
+    import glob
+    import os
+    import site
+
+    roots = []
+    try:
+        import nvidia  # namespace package of the CUDA wheels
+
+        roots += list(getattr(nvidia, "__path__", []))
+    except ImportError:
+        pass
+    roots += [os.path.join(d, "nvidia") for d in site.getsitepackages()]
+    for root in roots:
+        for sub in ("cu13/lib", "cuda_nvrtc/lib"):
+            hits = sorted(glob.glob(os.path.join(root, sub, "libnvrtc-builtins.so.13*")))
+            hits = [h for h in hits if ".alt." not in h]
+            if hits:
+                ctypes.CDLL(hits[0], mode=ctypes.RTLD_GLOBAL)
+                return hits[0]
+    return None
+
+
+def compile_cubin(arch: str) -> bytes:
+    """NVRTC-compile SRC for ``arch`` (e.g. 'sm_86'); no GPU needed."""
+    from cuda.bindings import nvrtc
+
+    preload_nvrtc_builtins()
+    prog = _ck(nvrtc.nvrtcCreateProgram(SRC.encode(), b"yw.cu", 0, [], []))
+    opts = [f"--gpu-architecture={arch}".encode()]
+    r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
+    if int(r[0]) != 0:
+        n = _ck(nvrtc.nvrtcGetProgramLogSize(prog))
+        log = b" " * n
+        nvrtc.nvrtcGetProgramLog(prog, log)
+        raise RuntimeError("nvrtc: " + log.decode(errors="replace"))
+    n = _ck(nvrtc.nvrtcGetCUBINSize(prog))
+    cubin = b" " * n
+    _ck(nvrtc.nvrtcGetCUBIN(prog, cubin))
+    return cubin
+
+
 def summarize(lat_us):
     """p50/p90/p99/max of a latency list in microseconds (pure)."""
     if not lat_us:
@@ -65,7 +113,6 @@ def _ck(res):
 
 def run_d(a):
     from cuda.bindings import driver as cu
-    from cuda.bindings import nvrtc
 
     _ck(cu.cuInit(0))
     dev = _ck(cu.cuDeviceGet(a.dev))
@@ -73,17 +120,7 @@ def run_d(a):
     _ck(cu.cuCtxSetCurrent(ctx))
     major = _ck(cu.cuDeviceGetAttribute(cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev))
     minor = _ck(cu.cuDeviceGetAttribute(cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev))
-    prog = _ck(nvrtc.nvrtcCreateProgram(SRC.encode(), b"yw.cu", 0, [], []))
-    opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
-    r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
-    if int(r[0]) != 0:
-        n = _ck(nvrtc.nvrtcGetProgramLogSize(prog))
-        log = b" " * n
-        nvrtc.nvrtcGetProgramLog(prog, log)
-        raise RuntimeError("nvrtc: " + log.decode(errors="replace"))
-    n = _ck(nvrtc.nvrtcGetCUBINSize(prog))
-    cubin = b" " * n
-    _ck(nvrtc.nvrtcGetCUBIN(prog, cubin))
+    cubin = compile_cubin(f"sm_{major}{minor}")
     mod = _ck(cu.cuModuleLoadData(cubin))
     k_spin = _ck(cu.cuModuleGetFunction(mod, b"spin"))
     k_mark = _ck(cu.cuModuleGetFunction(mod, b"mark"))

@@ -51,3 +51,16 @@ class YieldWaitBench(CustomTestCase):
         src = inspect.getsource(_load().run_d)
         self.assertIn("CU_STREAM_WAIT_VALUE_GEQ", src)
         self.assertIn("want = i + 1", src)
+
+    def test_nvrtc_compiles_without_gpu(self):
+        # window tatcwj: libnvrtc-builtins.so.13.0 was not found by libnvrtc.so.13
+        # (NVRTC_ERROR_BUILTIN_OPERATION_FAILURE). The compile needs no GPU.
+        try:
+            import cuda.bindings.nvrtc  # noqa: F401
+        except ImportError:
+            self.skipTest("cuda-python not installed")
+        m = _load()
+        for arch in ("sm_86", "sm_120"):
+            cubin = m.compile_cubin(arch)
+            self.assertGreater(len(cubin), 100)
+            self.assertEqual(cubin[:4], b"\x7fELF")
