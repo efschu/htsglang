@@ -518,6 +518,12 @@ def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optio
         return 0
     step = int(stages[0]["step"])
     top = min(int(s["top"]) for s in stages)
+    # NOTE (GRANT-SUM 1cd3c5ac00): ``tokens`` is the SUM of every held request's
+    # tokens (live_grant_tokens), and min(top, ...) caps it at the stage top
+    # (--dual-p-kv-max-tokens, 196608 on the 27B dual). Above top the level does
+    # NOT cover the sum any more -- the normal admission (the SF load-back room,
+    # the allocator) and ACK-ROOM (weg2_told_fallback._room_own) carry that case.
+    # The sum is a sizing, never a guarantee.
     want = min(top, round_up(tokens, step))
     k = want // step
     order = sorted(range(len(stages)), key=lambda i: str(stages[i]["ledger"]))
