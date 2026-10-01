@@ -242,7 +242,8 @@ def plan_p_to_d(
     Chunk tokens ``[a, b)`` of P stage ``stage``; token ``i`` lands at D
     global slot ``e0 + i``, so its owner is the rank the owner rule names
     for that slot -- "P guesses nothing". The P-side row is ``i`` itself
-    (the PP layout stores dense: pool row == slot id == chunk index), the
+    (the PP layout stores dense: pool row == slot id == GLOBAL token index,
+    i.e. ``i`` itself, 0-based within the chunk only when ``a == 0``), the
     D-side row the compact row from ``dcp_weighted_write_slots``. With
     ``tp0_skip`` the blocks bound for rank 0 carry ``route="skip"``: TP0's
     rows are filled from L2 at the wake (plan 2.1) and the lane plan must

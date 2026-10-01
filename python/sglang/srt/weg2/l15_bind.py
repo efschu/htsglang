@@ -44,7 +44,9 @@ def slots_of_req(req, req_to_token) -> Tuple[int, ...]:
 
 
 def anchor_slot_of_req(req) -> int:
-    """The req's mamba anchor slot; 0/None mean no anchor to hold."""
+    """The req's mamba anchor slot; a missing (None) or padding (0) anchor
+    raises -- one req without a holdable anchor skips the whole retain round
+    (benign: this runs before step 3, nothing is touched yet)."""
     idx = getattr(req, "mamba_pool_idx", None)
     rid = getattr(req, "rid", "?")
     if idx is None:
@@ -61,7 +63,8 @@ def anchor_slot_of_req(req) -> int:
 
 
 def node_of_req(req):
-    """The req's radix-tree node; None means nothing to keep."""
+    """The req's radix-tree node; a missing (None) node raises -- the retain
+    round skips (benign, pre-step-3: nothing is touched yet)."""
     node = getattr(req, "last_node", None)
     if node is None:
         raise ValueError(f"req {getattr(req, 'rid', '?')!r} has no last_node")
@@ -95,6 +98,12 @@ def build_retain_kwargs(
     l15_last_active) until the hook lands.
     """
     n_ranks = max(int(len(prefix)) - 1, 1)
+    # Rows follow the owner-weighted token vector (the prefix widths), not an
+    # even split: mirroring the L15 shadow hook, which passes
+    # get_cp_token_ratios(). An even split under-prices a 7/16-owned rank
+    # against its cap and over-admits past the compact keep window (OOM class).
+    # A malformed/empty vector falls back to the even split inside rows_split.
+    ratios = [int(prefix[i + 1]) - int(prefix[i]) for i in range(len(prefix) - 1)]
     by_rid = {}
     entries = []
     for req in reqs:
@@ -110,7 +119,7 @@ def build_retain_kwargs(
                 "last_active": float(
                     getattr(req, "l15_last_active", 0.0) or 0.0
                 ),
-                "rows_by_rank": rows_split(span, n_ranks),
+                "rows_by_rank": rows_split(span, n_ranks, ratios),
                 "anchor_depth": span,
                 "kv_depth": span,
             }

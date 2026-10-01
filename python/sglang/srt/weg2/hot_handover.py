@@ -81,8 +81,9 @@ def decide(candidates: Sequence[Mapping], p_free_rows: int) -> Optional[Handover
     """Pick the handover for THIS flip, or ``None`` to fall back.
 
     ``candidates`` is the front's list of follow-up prefill(s) for P, dicts
-    ``{rid, hot_in_d, prefix_tokens, anchor_depth}``. First candidate in INPUT
-    order wins, and only when all three hold:
+    ``{rid, hot_in_d, prefix_tokens, anchor_depth}``. The first candidate (in
+    INPUT order) whose three conditions all hold wins; a candidate failing any
+    condition is skipped and the next one is tried:
 
     * ``hot_in_d`` -- its KV is resident on the D side;
     * ``anchor_depth == prefix_tokens`` -- F3: never KV without its anchor at

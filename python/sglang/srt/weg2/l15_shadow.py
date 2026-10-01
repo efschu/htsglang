@@ -163,7 +163,10 @@ def rows_split(
         return tuple(base + (1 if i < rem else 0) for i in range(n))
     total = sum(vec)
     base = [(t * v) // total for v in vec]
-    for i in range(t - sum(base)):  # remainder < n, ranks in order
+    # remainder < #{ranks with share > 0}: a zero-share rank (the NF form's
+    # rank 0) owns no slot under the owner rule, so the remainder must skip
+    # it -- handing it a row would price a hold on a rank that cannot hold.
+    for i in [j for j in range(n) if vec[j] > 0][: t - sum(base)]:
         base[i] += 1
     return tuple(base)
 
