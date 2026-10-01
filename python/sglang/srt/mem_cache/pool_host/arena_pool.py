@@ -36,6 +36,13 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.pool_host.arena_lane_dma import (
+    LaneDmaFailed,
+    lane_stage_pages,
+    load_owner_lanes,
+    owner_lane_geometry,
+)
 from sglang.srt.mem_cache.pool_host.base import NO_KV_RANK_TOKENS
 from sglang.srt.mem_cache.storage.file.hicache_arena import free_named
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -1122,6 +1129,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # F22: (load key, leading rows the layer-0 whole-page load took) of the
         # owner load in flight -- layers 1.. gather only the rest
         self._owner_loaded: Optional[tuple] = None
+        # y6o (01.10.): set after a refused 2D copy -- the owner loadback takes
+        # whole pages from then on (named once in the log)
+        self._lane_dma_off = False
         self.arena_k_ptrs = None
         self.arena_v_ptrs = None
 
@@ -1636,6 +1646,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             # pages) -- below the 2 x rows x cell device temporaries per layer
             # the gather it replaces allocated (TP1 kvdemand: 2 x 109 MB)
             B = max(16, B // 4)
+        if lanes is not None:
+            # y6o (01.10.): only the owned lanes cross the link
+            done = self._owner_lane_load(device_pool, slots, device_indices, lanes, B, mode)
+            if done >= n:
+                return
+            if done:
+                slots, device_indices = slots[done:], device_indices[done * int(lanes.numel()):]
+                n = int(slots.numel())
         m = int(lanes.numel()) if lanes is not None else _psz(self)
         _lanes_dev = lanes.to(device=dev, dtype=torch.int64) if lanes is not None else None
         H, D = int(self.head_num), int(self.head_dim)
@@ -1751,6 +1769,64 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if n_log <= 8 or n_log % 64 == 0 or _timing:
             logger.info("WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d mode=%s%s (whole pages, layers split on device)",
                         n_log, n, n, B, n * pb, mode, _wall)
+
+    def _owner_lane_load(self, device_pool, slots, device_indices, lanes, B: int, mode) -> int:
+        """y6o (01.10.): the owner loadback of a Form-A worker with only its
+        owned lanes crossing the link (``arena_lane_dma``): one
+        cudaMemcpy2DAsync per run of consecutive slots into a compact stage of
+        the whole-page stage's bytes, then the per-layer lane scatter.
+
+        MEASURED (y6o, NF P->D): the whole-page form copied 3601 pages = 2.83
+        GB per worker after the wake although TP1 owns 40/64 and TP2 24/64
+        lanes; TP1 on the x4 link ~440 ms of DMA, TP0 waits on it in the first
+        collectives. Owned lanes only: TP1 1.77 GB, TP2 1.06 GB.
+
+        Returns the leading pages it loaded (all layers); 0 = none, the caller
+        loads whole pages. Only "dma" (registered arena); a layout or lane set
+        without the 2D-row form, the switch off, or a refused copy keep the
+        whole-page load -- the last for the rest of this pool's life."""
+        mode = mode or getattr(self, "_page_mode", None) or _arena_page_load_mode(self._page_bytes)
+        if mode != "dma" or self._lane_dma_off or not envs.SGLANG_WEG2_ARENA_OWNER_LANE_DMA.get():
+            return 0
+        H, D = int(self.head_num), int(self.head_dim)
+        geom = owner_lane_geometry(lanes=lanes, page_tokens=_psz(self), cell=H * D * self.dtype.itemsize,
+                                   k_offs_b=self._k_offs_b, v_offs_b=self._v_offs_b,
+                                   page_bytes=self._page_bytes)
+        if geom is None:
+            self._lane_dma_off = True
+            logger.warning("WEG2-ARENA-LANE-DMA off: lanes %s / page layout have no 2D-row form; "
+                           "whole pages from now on", lanes.tolist())
+            return 0
+        n = int(slots.numel())
+        _t0 = time.perf_counter()
+        try:
+            st = load_owner_lanes(page_view=self._page_view, piece_pages=self._dma_piece_pages,
+                                  slots=slots, device_indices=device_indices,
+                                  k_buffers=device_pool.k_buffer, v_buffers=device_pool.v_buffer,
+                                  geom=geom, stage_pages=lane_stage_pages(whole_stage_pages=B, geom=geom),
+                                  runs_of=page_dma_runs)
+        except LaneDmaFailed as exc:
+            self._lane_dma_off = True
+            logger.warning("WEG2-ARENA-LANE-DMA failed after %d of %d pages (%s); whole pages "
+                           "for the rest and from now on", exc.done, n, exc)
+            return exc.done
+        global _PAGE_LOAD_N
+        _PAGE_LOAD_N += 1
+        _timing = _arena_page_load_timing()
+        _wall = ""
+        if _timing and st.bytes and device_pool.k_buffer[0].device.type == "cuda":
+            torch.cuda.current_stream(device_pool.k_buffer[0].device).synchronize()
+            _ms = (time.perf_counter() - _t0) * 1000.0
+            _wall = f" wall_ms={_ms:.0f} GB/s={st.bytes / max(_ms, 1e-3) / 1e6:.2f}"
+        if _PAGE_LOAD_N <= 8 or _PAGE_LOAD_N % 64 == 0 or _timing:
+            logger.info(
+                "WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d mode=dma lane_dma=2d "
+                "owner_lanes=%d/%d whole_bytes=%d copies=%d kernels=%d blocks=%d width=%d spitch=%d "
+                "cpu_issue_ms=%.0f%s (owned lanes only, layers split on device)",
+                _PAGE_LOAD_N, n * geom.lanes_per_page, n, st.stage_pages, st.bytes,
+                geom.lanes_per_page, _psz(self), n * geom.page_bytes, st.copies, st.kernels,
+                st.blocks, geom.width, geom.spitch, st.cpu_ms, _wall)
+        return n
 
     def pin_slots(self, slots) -> int:
         """Register the slots' pages (contiguous runs in one call each) that

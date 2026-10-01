@@ -579,6 +579,14 @@ class Envs:
     # p0 waited 115/139 ms). 0 = the pool of the 2026-09-18 form. Resumes and
     # VRAM are unchanged by it.
     SGLANG_WEG2_WAKE_COLLECT_SPARE = EnvInt(1)
+    # ARENA_OWNER_LANE_DMA (01.10., NF y6o P->D): a Form-A worker's owner
+    # loadback after the wake ("dma" mode, registered arena) copies only the
+    # lanes the rank owns -- one cudaMemcpy2DAsync per run of consecutive
+    # slots (src pitch = owner split x cell, width = owned run x cell) into a
+    # compact device stage -- instead of whole pages (y6o: 3601 pages = 2.83
+    # GB per worker, TP1 owns 40/64 lanes, TP2 24/64). Same stage bytes, same
+    # loaded KV bytes; =0 restores the whole-page load for an A/B.
+    SGLANG_WEG2_ARENA_OWNER_LANE_DMA = EnvBool(True)
     # WAKE_RUNAHEAD_ANY (30.09., NF y4k/y4l P->D, weg2/wake_runahead.py): the
     # run-ahead bound waits for ANY collect in flight to finish instead of the
     # OLDEST (a slow 3080 source's band held D TP1/TP2's resume of PP0's next
