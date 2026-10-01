@@ -796,7 +796,12 @@ PROFILES: Dict[str, ModelProfile] = {
         idle_layout="pp",
         x_split=True,
         store_short_tail=True,
-        bigram_anchor_exact=False,
+        # HANDBACK N-1 (01.10., user: "den anker fix koennen alle brauchen"):
+        # the exact keying for the 27B too -- a node of k units = KV of k
+        # tokens = state after k tokens, so P's N-1 anchor node is claimed
+        # whole and D computes one token after every hand-back (was 2). The
+        # L3 store identity carries it (launcher L3_ANCHOR_KEYING_PROFILES).
+        bigram_anchor_exact=True,
         warm_min_dwell=False,
         agent_span=True,
         standard_form=False,

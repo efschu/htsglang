@@ -146,6 +146,19 @@ def prefetch_namespace(*, anchor_extra_key, request_extra_key):
     return request_extra_key if request_extra_key is not None else anchor_extra_key
 
 
+def _ids_with_tail(ids, tail):
+    """``ids`` + the P-TRIM held-back ``tail``, same container type (RadixKey
+    asserts array('q') where the tree passes arrays; an array needs its
+    typecode, so ``type(ids)(...)`` would not do)."""
+    from array import array as _array
+
+    if isinstance(ids, _array):
+        out = _array(ids.typecode, ids)
+        out.extend(int(t) for t in tail)
+        return out
+    return list(ids) + [int(t) for t in tail]
+
+
 def bigram_anchor_ids(fill_ids, full_ids):
     """The ids the exact key reads its next token from.
 
@@ -2752,6 +2765,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # fnFL2x76: the retention key may take one token beyond the retained
         # KV (`bigram_anchor_key`); `token_ids` itself is truncated below.
         token_ids_full = token_ids
+        # DUAL ANCHOR N-1 (01.10., metal dual1m ...10011503): a P-TRIM request
+        # committed exactly its N-1 prompt tokens and holds the prompt's last
+        # token back; the exact bigram key's "one more token" must be THAT
+        # token, not the sampled leg-1 output (which follows in output_ids and
+        # is no prompt token). Without it the exact form had no next token and
+        # fell back to N-2 units -- D claimed N-2, uncached=2, X=1 refused (W50).
+        _tail = getattr(req, _P_TRIM_ATTR, None)
+        if _tail is not None and kv_committed_len >= len(req.origin_input_ids):
+            token_ids_full = _ids_with_tail(req.origin_input_ids[:kv_committed_len], _tail)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
@@ -5624,7 +5646,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # forms.
         _trim_tail = getattr(req, _P_TRIM_ATTR, None)
         _trim = len(_trim_tail) if _trim_tail is not None else 0
-        tokens = len(token_ids) + _trim
+        # the caller passes the key ids, which for a trimmed request already
+        # carry the held-back tail (DUAL ANCHOR N-1); the prompt the client
+        # sent is origin + tail either way
+        tokens = (len(req.origin_input_ids) + _trim) if _trim else len(token_ids)
         # CLAIM ANCHOR (dynpf-Praefix 0929): where group P tracks the hand-back
         # anchor at the store reader's claim (80fa726f31), the probe asks for
         # THAT depth -- the deepest a reader of this prompt claims -- and the
@@ -5648,9 +5673,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # RadixKey asserts the array('q') type of `token_ids` (boot weg2zr1:
             # a list raised at the probe); slicing keeps the type.
             if _trim:
-                probe = RadixKey(
-                    token_ids, req.extra_key, is_bigram=self.is_eagle
-                ).page_aligned(self.page_size)
+                # N-1 prompt tokens committed; under the exact keying the key
+                # takes the held-back prompt token as its next token (N-1
+                # units), under the upstream keying this is RadixKey(ids[:N-1])
+                # exactly as before (N-2 units).
+                _full = _ids_with_tail(req.origin_input_ids, _trim_tail)
+                probe = bigram_anchor_key(
+                    _full, tokens - _trim, req.extra_key,
+                    is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
+                    page_size=self.page_size,
+                )
             else:
                 # W123/#241 (rc12z10 weg2-2-12 N=9537, rc12u weg2-6-18 N=23361):
                 # the N-1 node was inserted with the EXACT bigram key
@@ -10636,6 +10668,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             v = bool(self.is_eagle and ComponentType.MAMBA in self.components
                      and envs.SGLANG_WEG2_BIGRAM_ANCHOR_EXACT.get())
             self.__dict__["_weg2_bigram_anchor_exact"] = v
+            from sglang.srt.weg2.handback_claim import note_tree as _dac_note
+
+            _dac_note(bool(v))  # HANDBACK N-1: D's claim reads this
         return v
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
