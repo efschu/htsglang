@@ -552,10 +552,12 @@ def progress_step(memo, st: dict, now: float, stall_s: float, work: Optional[int
     """Ein Schritt des Riegels, rein (kein I/O). ``memo`` = der Merker des vorigen Schritts
     (None beim ersten). Rückgabe ``(memo_neu, ereignis)``, ereignis None | "HAENGT" | "LAEUFT".
     Zurückgesetzt wird bei: anderem boot_id, Zustand nicht serving/flipping, outstanding == 0,
-    Bewegung von served/served_tokens -- und, NUR wenn alle offenen Requests Nicht-Stream sind
-    (:func:`only_nonstream`), Bewegung der Rang-Arbeit ``work`` (:func:`rank_work`; y5c: zwei
-    Nicht-Stream-Requests, D decodierte bs2 weiter, served stand 61 s -> falscher Stall-Tod).
-    Steht die Rang-Arbeit, bleibt der Stall echt. HAENGT einmal beim Eintritt, LAEUFT beim
+    Bewegung von served/served_tokens -- und Bewegung der Rang-Arbeit ``work`` (:func:`rank_work`).
+    y5c: zwei Nicht-Stream-Requests, D decodierte bs2 weiter, served stand 61 s -> falscher
+    Stall-Tod. NF y6b (01.10. 03:38:57Z): sechs lange STREAM-Antworten, D decodierte Runde
+    3562 -> 4262 bei bs5-6, served/served_tokens bewegen sich erst am Ende eines Requests ->
+    wieder ein gesunder Boot per Stop-Datei abgeschossen. Die Rang-Arbeit zählt deshalb bei
+    outstanding > 0 IMMER, nicht nur bei Nicht-Stream. Steht sie, bleibt der Stall echt. HAENGT einmal beim Eintritt, LAEUFT beim
     Austritt (nur im selben Boot)."""
     boot = st.get("boot_id")
     lc = (st.get("lifecycle") or {}).get("state")
@@ -564,8 +566,7 @@ def progress_step(memo, st: dict, now: float, stall_s: float, work: Optional[int
     out = int(fr.get("outstanding") or 0)
     m = dict(memo or {})
     prev_work = m.get("work")
-    work_moved = (only_nonstream(fr) and work is not None and prev_work is not None
-                  and int(work) != int(prev_work))
+    work_moved = work is not None and prev_work is not None and int(work) != int(prev_work)
     if (not m or m.get("boot") != boot or m.get("key") != key or work_moved or out <= 0
             or lc not in PROGRESS_LIVE):
         ev = "LAEUFT" if (m.get("stalled") and m.get("boot") == boot) else None
@@ -592,8 +593,8 @@ def deadman_progress(d: str, memo_path: str, stall_s: float = PROGRESS_STALL_S_D
     except (OSError, ValueError):
         memo = None
     fr = st.get("front") or {}
-    # Rang-Arbeit nur lesen, wenn sie zählen darf (alle offenen Requests Nicht-Stream)
-    work = rank_work(d) if only_nonstream(fr) else None
+    # Rang-Arbeit zählt bei jedem offenen Request (Stream wie Nicht-Stream, NF y6b)
+    work = rank_work(d) if int(fr.get("outstanding") or 0) > 0 else None
     new, ev = progress_step(memo, st, now, stall_s, work=work)
     write_json_atomic(memo_path, new)
     if ev is None:
@@ -610,7 +611,7 @@ def deadman_progress(d: str, memo_path: str, stall_s: float = PROGRESS_STALL_S_D
                 f"by_group={base['outstanding_by_group']} queue={base['queue']} awake={base['awake']} "
                 f"state={base['front_state']}: kein Fortschritt seit {now - float(new['since']):.0f} s "
                 f"(served={base['served']} tokens={base['tokens']}"
-                + (f", nur Nicht-Stream, Rang-Arbeit {work} steht" if base["nonstream_only"] else "")
+                + (f", Rang-Arbeit {work} steht" if work is not None else ", keine Rang-Arbeit lesbar")
                 + f", Schwelle {float(stall_s):.0f} s) -- Zustand, KEIN Stop")
     else:
         rec = {"verdict": "LAEUFT", "stalled_for_s": round(float(new["stalled_for"]), 1), **base}
