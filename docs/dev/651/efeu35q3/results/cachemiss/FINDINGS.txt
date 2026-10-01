@@ -94,3 +94,15 @@ until a test reproduces the break red on v1 and green on the fix)
   ring drop and no crash; backend_200341 (ring=0) no Sanity/Traceback.
   "parent 63" came from my CPU unit test of the first sanity variant, not
   from any service build.
+
+20:2x on-disk service tree set to pristine + v2 (operator order; files only,
+no restart, ring stays 0): unified_radix_cache.py sha256 5dd1677bb4a1020d..,
+scheduler.py 2124b33b4e8c7331.. (= pristine) -- byte-identical to the tested
+/tmp trees; laptop .orig-efeu-ring copies == the tested pristine bytes
+(dedf7ff6.. / 2124b33b..). Ring=0 equivalence: upstream suite with
+SGLANG_HICACHE_HOST_STAGING_RING=0 v2 635/212 == pristine; scheduler-facing
+ring tests with RING_UNDER_TEST=0 (write_backup / prefetch paths) give the
+identical result set on v2 and pristine (4/10 both). Only ungated difference:
+the l3_persisted attribute (set on storage ack / L3 insert / split, read only
+by the gated drop). v1+sanity file kept as logs/urc_v1sanity_replaced_2025.py.
+The running process (20:03) still holds v1 (ring=0) until its next restart.

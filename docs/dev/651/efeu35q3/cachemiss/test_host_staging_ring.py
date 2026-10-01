@@ -93,7 +93,11 @@ class HostStagingRingTest(unittest.TestCase):
     cfg = urc.CacheConfig(page_size=1, kv_size=256, max_context_len=256)
 
     def setUp(self):
-        os.environ["SGLANG_HICACHE_HOST_STAGING_RING"] = "1"
+        # RING_UNDER_TEST=0 runs the scheduler-facing tests with the ring OFF
+        # (they must then match the pristine tree's results).
+        os.environ["SGLANG_HICACHE_HOST_STAGING_RING"] = os.environ.get(
+            "RING_UNDER_TEST", "1"
+        )
         with mock.patch.object(urc, "get_device", return_value="cpu"):
             self.cache, self.alloc, self.r2t = urc.build_fixture(self.cfg)
         self.cc = FakeCC(cap=40)
