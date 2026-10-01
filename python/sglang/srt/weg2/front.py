@@ -8079,6 +8079,31 @@ class Front:
                 self._ipc_publish("flip_user_time", _dp)
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
+            # L15-18 (L3-RETURN stage 2): say whether this prompt's prefix
+            # was known BEFORE this boot, so monitor M2's L3-RETURN check
+            # does not count never-seen prompts as MISS. Gated on
+            # SGLANG_WEG2_PREFIX_FP_PATH: unset -> no line, no file, no cost.
+            # No token ids exist at this point of leg1 (the payload carries
+            # the text), so the source here is p.text, named as src=text.
+            _fp_path = os.environ.get("SGLANG_WEG2_PREFIX_FP_PATH")
+            if _fp_path:
+                try:
+                    from sglang.srt.weg2.prefix_fp import PrefixSeen, fingerprint
+                    _ps = getattr(self, "_prefix_seen", None)
+                    if _ps is None:
+                        _ps = self._prefix_seen = PrefixSeen(_fp_path)
+                        self._prefix_fp_adds = 0
+                    _fp = fingerprint(p.text)
+                    logger.info(
+                        "WEG2-PREFIX-FP rid=%s fp=%s n=%d src=text seen_before_boot=%d",
+                        p.rid, _fp, min(len(p.text), 4096 * 4),
+                        1 if _ps.seen_before(_fp) else 0)
+                    _ps.add(_fp)
+                    self._prefix_fp_adds += 1
+                    if self._prefix_fp_adds % 16 == 0:
+                        _ps.save()
+                except Exception:  # never raise from the serving path
+                    pass
         finally:
             g.outstanding.pop(p.rid, None)
 
