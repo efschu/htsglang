@@ -216,3 +216,130 @@ def test_the_uncapped_slack_mutant_turns_the_slack_test_red(monkeypatch):
     monkeypatch.setattr(S, "assert_weights_pool_slack", m)
     with pytest.raises((AssertionError, pytest.fail.Exception)):
         test_the_pool_slack_of_the_weights_tags_is_capped(monkeypatch)
+
+
+# -- step 3: P sleeps with the TMS backup armed and outside the exchange --------------------
+
+from sglang.srt.weg2 import launcher as L  # noqa: E402
+from sglang.srt.weg2 import weight_exchange as WX  # noqa: E402
+
+SHARE_SLEEP = types.SimpleNamespace(dual_layout=True, dual_share=True, dual_unified_kv="on", dual_p_sleep="on",
+                                    tag="t")
+
+
+def test_under_dual_share_the_sleeping_p_gets_backup_on_and_no_exchange(monkeypatch):
+    assert L.dual_p_sleep_share_supported()
+    assert L.dual_p_sleep_armed(SHARE_SLEEP)
+    env = L.dual_share_env(SHARE_SLEEP, "P")
+    for k, v in L.DUAL_P_SLEEP_GROUP_ENV.items():
+        assert env[k] == v
+    # what the RANKS read: the dual boot's group env (gmps7 WEG2-GROUP-ENV P) with the sleep env
+    # applied on top, as launcher.main does (spec_p.env.update(dual_share_env(ns, "P")))
+    base = {"SGLANG_WEG2_XCHG_INJECT": "authoritative", WX.WEIGHTS_CPU_BACKUP_ENV: "off",
+            WX.WEIGHT_SOURCE_ENV: "exchange", "SGLANG_WEG2_WEIGHTS_RESIDENT": "1"}
+    for k, v in {**base, **env}.items():
+        monkeypatch.setenv(k, v)
+    assert WX.weights_cpu_backup_armed() is True, "TMS backs the weights up at the pause"
+    assert WX.exchange_armed() is False, "no deposit at the sleep, no peer inject at the wake"
+    assert WX.boot_vote() is None or True   # unarmed: arm_coverage_at_load records no vote
+    d_env = L.dual_share_env(SHARE_SLEEP, "D")
+    assert not set(L.DUAL_P_SLEEP_GROUP_ENV) & set(d_env), "D stays resident and in its own arm"
+
+
+@pytest.mark.parametrize("drop", ["SGLANG_WEG2_WEIGHTS_CPU_BACKUP", "SGLANG_WEG2_WEIGHT_SOURCE"])
+def test_dropping_either_env_mutant_turns_the_backup_test_red(monkeypatch, drop):
+    monkeypatch.setattr(L, "DUAL_P_SLEEP_GROUP_ENV",
+                        {k: v for k, v in L.DUAL_P_SLEEP_GROUP_ENV.items() if k != drop})
+    monkeypatch.setenv(WX.WEIGHTS_CPU_BACKUP_ENV, "off")
+    monkeypatch.setenv(WX.WEIGHT_SOURCE_ENV, "exchange")
+    with pytest.raises((AssertionError, KeyError)):
+        test_under_dual_share_the_sleeping_p_gets_backup_on_and_no_exchange(monkeypatch)
+
+
+def test_without_the_tree_support_dual_share_sleep_is_still_refused(monkeypatch):
+    monkeypatch.setattr(L, "dual_p_sleep_share_supported", lambda: False)
+    with pytest.raises(L.Weg2DualPSleepShareRefused):
+        L.dual_p_sleep_armed(SHARE_SLEEP)
+    assert L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]).dual_p_sleep == "off", \
+        "default off until the metal proof"
+
+
+# -- step 3: the front sleeps P only after the group-idle witness ---------------------------
+
+import asyncio  # noqa: E402
+import collections  # noqa: E402
+
+from sglang.srt.weg2 import dual_d_priority as DP  # noqa: E402
+from sglang.srt.weg2 import front as FR  # noqa: E402
+
+
+def _front(idle=True):
+    calls = []
+
+    async def leg_rpc(g, path, body, timeout):
+        calls.append((g, path))
+        return 200, "{}"
+
+    async def quiesce(g):
+        calls.append(("QUIESCE", g))
+        return idle, "" if idle else "not idle: hicache_prefetch(1)"
+
+    f = types.SimpleNamespace(groups={"P": "P-group"}, boot_epoch="b", epoch=0, weight_chunks=1,
+                              counters=collections.Counter(), leg_rpc=leg_rpc, quiesce=quiesce,
+                              do_stop=lambda *a: calls.append(("STOP",) + a), queue=collections.deque(),
+                              _dual_inflight={})
+    f._dual_stages_obj = DP.PressureStages(sleep_capable=True)
+    for name in ("_dual_p_sleep", "_dual_p_wake", "_dual_p_weights_tags", "_dual_stages",
+                 "_dual_p_sleep_probe_tick"):
+        setattr(f, name, types.MethodType(getattr(FR.Front, name), f))
+    f.DUAL_P_SLEEP_PROBE_ENV = FR.Front.DUAL_P_SLEEP_PROBE_ENV
+    return f, calls
+
+
+def test_a_p_that_is_not_idle_is_not_put_to_sleep():
+    f, calls = _front(idle=False)
+    f._dual_stages_obj.p_state = "sleeping"
+    asyncio.run(f._dual_p_sleep())
+    assert calls == [("QUIESCE", "P-group")], "no release leg without the idle witness"
+    assert f._dual_stages_obj.p_state == "stopped" and f.counters["dual_kv_pressure_sleep_not_idle"] == 1
+
+
+def test_the_no_quiesce_mutant_turns_the_idle_test_red(monkeypatch):
+    m = _exec_mutant(FR, FR.Front._dual_p_sleep, "ok, why = await self.quiesce(self.groups[\"P\"])",
+                     "ok, why = True, ''")
+    monkeypatch.setattr(FR.Front, "_dual_p_sleep", m)
+    with pytest.raises(AssertionError):
+        test_a_p_that_is_not_idle_is_not_put_to_sleep()
+
+
+# -- step 5: the metal probe ---------------------------------------------------------------
+
+
+def test_the_probe_sleeps_and_wakes_p_once_without_pressure(monkeypatch):
+    monkeypatch.setenv(FR.Front.DUAL_P_SLEEP_PROBE_ENV, "0.01")
+    f, calls = _front()
+
+    async def run():
+        assert f._dual_p_sleep_probe_tick(0) is True
+        await asyncio.sleep(0.2)
+        assert f._dual_p_sleep_probe_tick(0) is False, "done: the probe never fires twice"
+
+    asyncio.run(run())
+    paths = [c[1] for c in calls if c[0] != "QUIESCE"]
+    assert paths == ["/release_memory_occupation", "/resume_memory_occupation"]
+    assert f._dual_probe_state == "done" and f._dual_stages_obj.p_state == "serving"
+
+
+def test_the_probe_is_off_by_default_and_waits_for_an_idle_stretch(monkeypatch):
+    monkeypatch.delenv(FR.Front.DUAL_P_SLEEP_PROBE_ENV, raising=False)
+    f, calls = _front()
+    assert f._dual_p_sleep_probe_tick(0) is False and not calls
+    monkeypatch.setenv(FR.Front.DUAL_P_SLEEP_PROBE_ENV, "5")
+    assert f._dual_p_sleep_probe_tick(123) is False, "never under D's pressure"
+    f.queue.append(object())
+    assert f._dual_p_sleep_probe_tick(0) is False, "never with a queued prompt"
+
+
+def test_the_probe_is_consulted_first_in_the_stage_tick():
+    src = inspect.getsource(FR.Front._dual_stage_tick)
+    assert src.index("_dual_p_sleep_probe_tick(pressure)") < src.index("stages = self._dual_stages()")

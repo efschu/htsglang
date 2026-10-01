@@ -11271,9 +11271,56 @@ class Front:
         return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
                 "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights}
 
+    #: env: the metal probe of stage 2 (one sleep + wake of P in the first idle
+    #: stretch, no pressure needed) -- seconds P stays asleep; unset/0 = off
+    DUAL_P_SLEEP_PROBE_ENV = "SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S"
+
+    def _dual_p_sleep_probe_tick(self, pressure: int) -> bool:
+        """STAGE-2 PROBE (default off): once, in the first stretch where D presses
+        nothing, the queue is empty and no leg 1 runs, P sleeps (the same leg as
+        stage 2) and wakes after SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S seconds. Proves
+        the sleep/wake on metal without waiting for real KV pressure. True while
+        the probe owns P."""
+        try:
+            hold_s = float(os.environ.get(self.DUAL_P_SLEEP_PROBE_ENV, "") or 0.0)
+        except ValueError:
+            hold_s = 0.0
+        if hold_s <= 0.0:
+            return False
+        st = self._dual_stages()
+        state = getattr(self, "_dual_probe_state", "armed")
+        if state == "armed":
+            if (pressure > 0 or self.queue or self._dual_inflight or st.p_state != "serving"
+                    or not st.sleep_capable):
+                return False
+            self._dual_probe_state = "sleeping"
+            st.p_state = "sleeping"
+            self.counters["dual_kv_pressure_probe"] += 1
+            logger.warning("WEG2 DUAL-KV-PRESSURE stage=probe p_state=sleeping hold_s=%.0f -- the stage-2 metal "
+                           "probe: P sleeps once without pressure and wakes after the hold", hold_s)
+            loop = asyncio.get_running_loop()
+
+            async def _probe():
+                await self._dual_p_sleep()
+                if st.p_state != "sleeping":       # the sleep was refused (P not idle): re-arm
+                    self._dual_probe_state = "armed"
+                    st.p_state = "serving"
+                    return
+                await asyncio.sleep(hold_s)
+                await self._dual_p_wake()
+                st.p_state = "serving"
+                self._dual_probe_state = "done"
+                logger.warning("WEG2 DUAL-KV-PRESSURE stage=probe p_state=serving -- probe done")
+
+            loop.create_task(_probe())
+            return True
+        return state == "sleeping"
+
     def _dual_stage_tick(self, pressure: int) -> None:
         from sglang.srt.weg2 import dual_d_priority as _ddp
 
+        if self._dual_p_sleep_probe_tick(pressure):
+            return
         stages = self._dual_stages()
         try:
             rd = self._dual_p_stage_reading()
@@ -11312,6 +11359,18 @@ class Front:
         untouched."""
         n = int(getattr(self, "_dual_p_sleep_n", 0) or 0) + 1
         self._dual_p_sleep_n = n
+        # the same group-idle witness the flip takes before a sleep (the release
+        # asserts an idle server on every rank; a stage-1 P can still hold an
+        # in-flight hand-off write or prefetch)
+        ok, why = await self.quiesce(self.groups["P"])
+        if not ok:
+            self.counters["dual_kv_pressure_sleep_not_idle"] += 1
+            logger.warning("WEG2 DUAL-KV-PRESSURE stage=2 refused p_not_idle leg=%d: %s -- P stays stopped "
+                           "(stage 1), the next tick asks again", n, str(why)[:300])
+            st = getattr(self, "_dual_stages_obj", None)
+            if st is not None:
+                st.p_state = "stopped"
+            return
         tags = [KV_TAG] + self._dual_p_weights_tags()
         code, body = await self.leg_rpc(self.groups["P"], "/release_memory_occupation",
                                         {"tags": tags, "epoch": credit_epoch(self.boot_epoch, "dps%d" % n)},

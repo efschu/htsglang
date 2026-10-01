@@ -298,9 +298,13 @@ def _front():
         calls.append((g, path, body))
         return 200, "{}"
 
+    async def quiesce(g):
+        calls.append(("QUIESCE", g))
+        return True, ""
+
     f = types.SimpleNamespace(groups={"P": "P-group", "D": "D-group"}, boot_epoch="b42", epoch=7,
                               weight_chunks=2, counters=collections.Counter(), leg_rpc=leg_rpc,
-                              do_stop=lambda *a: calls.append(("STOP",) + a))
+                              do_stop=lambda *a: calls.append(("STOP",) + a), quiesce=quiesce)
     for name in ("_dual_p_sleep", "_dual_p_wake", "_dual_p_weights_tags"):
         setattr(f, name, types.MethodType(getattr(FR.Front, name), f))
     return f, calls
@@ -310,7 +314,8 @@ def test_p_sleep_and_wake_use_their_own_epochs_and_leave_the_flip_alone():
     f, calls = _front()
     asyncio.run(f._dual_p_sleep())
     asyncio.run(f._dual_p_wake())
-    (g1, p1, b1), (g2, p2, b2) = calls
+    assert calls[0] == ("QUIESCE", "P-group"), "the group-idle witness comes before the sleep leg"
+    (g1, p1, b1), (g2, p2, b2) = calls[1:]
     assert (g1, p1) == ("P-group", "/release_memory_occupation") and (g2, p2) == ("P-group", "/resume_memory_occupation")
     assert b1["tags"][0] == FR.KV_TAG and b2["tags"][-1] == FR.KV_TAG     # KV first to sleep, last to wake
     assert set(b1["tags"][1:]) == set(FR.weights_family_tags(2)) == set(b2["tags"][:-1])
@@ -327,8 +332,10 @@ def test_the_launcher_arms_stage_2_only_in_the_dual_unified_form(monkeypatch):
     assert L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]).dual_p_sleep == "off"
     share_on = types.SimpleNamespace(dual_layout=True, dual_share=True, dual_unified_kv="on", dual_p_sleep="on",
                                      tag="t")
+    monkeypatch.setattr(L, "dual_p_sleep_share_supported", lambda: False)   # a tree without steps 1-3
     with pytest.raises(L.Weg2DualPSleepShareRefused, match="W-DUAL-P-SLEEP-SHARE"):
         L.dual_p_sleep_armed(share_on)
+    monkeypatch.undo()
     share_off = types.SimpleNamespace(**{**vars(share_on), "dual_p_sleep": "off"})
     assert not L.dual_p_sleep_armed(share_off) and L.dual_p_sleep_argv(share_off, ["--x"]) == ["--x"]
     assert "SGLANG_WEG2_WEIGHTS_RESIDENT" not in L.dual_share_env(share_off, "P")

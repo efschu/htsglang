@@ -13754,10 +13754,9 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
         env["SGLANG_WEG2_DUAL_SHARE"] = "1"
     if group == "P" and dual_p_sleep_armed(ns):
         # D PRIORITY stage 2: P's weights are NOT resident (the resident arm
-        # refuses any weights release by name); D stays resident, D never sleeps
-        from sglang.srt.managers.weg2_memory_saver import WEIGHTS_RESIDENT_ENV
-
-        env[WEIGHTS_RESIDENT_ENV] = "0"
+        # refuses any weights release by name), backed up by TMS at the pause,
+        # and outside the exchange; D stays resident, D never sleeps
+        env.update(DUAL_P_SLEEP_GROUP_ENV)
     return env
 
 
@@ -13768,13 +13767,36 @@ class Weg2DualPSleepShareRefused(SystemExit):
     P-PP0 'per-rank budget leaves no GPU memory for the KV cache')."""
 
 
+def dual_p_sleep_share_supported() -> bool:
+    """Steps 1-3 of P's sleep under --dual-share are in this tree: the shared part
+    loads in a transient scope (weg2_memory_saver.transient_load_scope) and the
+    untagged-live riegel guards it."""
+    from sglang.srt.managers import weg2_memory_saver as _ms
+
+    return hasattr(_ms, "transient_load_scope") and hasattr(_ms, "assert_no_untagged_live")
+
+
+#: DUAL P SLEEP: the env group P sleeps under (dual layout, unified KV, --dual-p-sleep
+#: on). The physical TMS backup of the weights is gated by
+#: weight_exchange.weights_cpu_backup_armed() -- the ENV, not the argv bit -- and the
+#: dual boots ship 'off' (gmps7 WEG2-GROUP-ENV P: SGLANG_WEG2_WEIGHTS_CPU_BACKUP=off):
+#: a sleep would wake to undefined weights. And with the exchange armed
+#: (SGLANG_WEG2_WEIGHT_SOURCE=exchange, inject authoritative) the sleep leg would
+#: deposit for a peer flip and the wake inject from one; the dual layout never flips.
+DUAL_P_SLEEP_GROUP_ENV = {
+    "SGLANG_WEG2_WEIGHTS_RESIDENT": "0",
+    "SGLANG_WEG2_WEIGHTS_CPU_BACKUP": "on",
+    "SGLANG_WEG2_WEIGHT_SOURCE": "ring",
+}
+
+
 def dual_p_sleep_armed(ns) -> bool:
     """D PRIORITY stage 2 is armed: dual layout + unified KV + --dual-p-sleep on.
     Under --dual-share it is REFUSED by name (:class:`Weg2DualPSleepShareRefused`)."""
     on = (bool(getattr(ns, "dual_layout", False))
           and str(getattr(ns, "dual_unified_kv", "off")) == "on"
           and str(getattr(ns, "dual_p_sleep", "off")) == "on")
-    if on and bool(getattr(ns, "dual_share", False)):
+    if on and bool(getattr(ns, "dual_share", False)) and not dual_p_sleep_share_supported():
         raise Weg2DualPSleepShareRefused(
             "W-DUAL-P-SLEEP-SHARE: --dual-p-sleep on with --dual-share -- P's weights would load inside the "
             "memory-saver's private MemPool and the union bind's freed copies would stay reserved there "
