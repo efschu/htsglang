@@ -119,6 +119,13 @@ public:
     //: is the saver's own metadata, which is the only place that fact exists.
     //: Returns the number of tags written, or -1 when ``len`` is too small.
     int backed_up_tag_bytes(char* out, size_t len);
+    //: Dual-model model image (01.10.): the allocations of ``tag`` as
+    //: (device pointer, size, mapped bytes, active) rows, sorted by pointer, so a
+    //: model sleep can copy every byte of a weights tag to a file and its wake can
+    //: copy them back into the SAME VAs. Writes at most ``max`` rows; returns the
+    //: total row count (a caller seeing count > max retries with a bigger buffer).
+    int tag_allocations(const std::string& tag, uint64_t* ptrs, uint64_t* sizes,
+                        uint64_t* mapped, int* active, size_t max);
     //: C7: the live ring counters of this rank's card, or false when this boot
     //: published no ring.
     bool ring_stats(HostRingStats* out, std::string* card_uuid);

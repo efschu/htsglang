@@ -156,6 +156,14 @@ int tms_set_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi, i
     return TorchMemorySaver::instance().set_spans(ptr, n, lo, hi, now != 0);
 }
 
+// Dual-model model image: every allocation of ``tag`` (sorted by pointer).
+// Returns the total row count; at most ``max`` rows are written.
+int tms_tag_allocations(const char* tag, uint64_t* ptrs, uint64_t* sizes, uint64_t* mapped,
+                        int* active, size_t max) {
+    std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
+    return TorchMemorySaver::instance().tag_allocations(tag_str, ptrs, sizes, mapped, active, max);
+}
+
 int tms_alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, uint64_t* planned, int* active) {
     return TorchMemorySaver::instance().alloc_info(ptr, size, mapped, planned, active);
 }

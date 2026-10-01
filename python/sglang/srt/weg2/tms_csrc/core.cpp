@@ -244,6 +244,31 @@ uint64_t TorchMemorySaver::tag_bytes(const std::string& tag) {
     return total;
 }
 
+int TorchMemorySaver::tag_allocations(const std::string& tag, uint64_t* ptrs, uint64_t* sizes,
+                                      uint64_t* mapped, int* active, size_t max) {
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    std::vector<std::pair<uint64_t, const AllocationMetadata*>> rows;
+    for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
+        if (it->second.tag == tag) {
+            rows.emplace_back(reinterpret_cast<uint64_t>(it->first), &it->second);
+        }
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (size_t i = 0; i < rows.size() && i < max; ++i) {
+        const AllocationMetadata& md = *rows[i].second;
+        if (ptrs != nullptr) ptrs[i] = rows[i].first;
+        if (sizes != nullptr) sizes[i] = static_cast<uint64_t>(md.size);
+#if defined(USE_CUDA)
+        if (mapped != nullptr) mapped[i] = weg2_mapped_bytes(md);
+#else
+        if (mapped != nullptr) mapped[i] = static_cast<uint64_t>(md.size);
+#endif
+        if (active != nullptr) active[i] = (md.state == AllocationState::ACTIVE) ? 1 : 0;
+    }
+    return static_cast<int>(rows.size());
+}
+
 int TorchMemorySaver::backed_up_tag_bytes(char* out, size_t len) {
     if (out == nullptr || len == 0) {
         return -1;
