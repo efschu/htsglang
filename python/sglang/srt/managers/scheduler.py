@@ -19800,7 +19800,9 @@ class Scheduler(
             _l15_kwargs = None
             _l15_mba = None
             try:
-                from sglang.srt.weg2 import l15_bind, l15_plan, l15_retain, l15_shadow
+                from sglang.srt.weg2 import (
+                    l15_bind, l15_manifest, l15_plan, l15_retain, l15_shadow
+                )
 
                 if l15_plan.master_on(os.environ) and (
                     getattr(self, "weg2_d_parked", None) is not None
@@ -19924,13 +19926,16 @@ class Scheduler(
                                 for lo, hi in spans
                             )
 
+                        _l15_rank = int(
+                            getattr(getattr(self, "ps", None), "tp_rank", 0) or 0
+                        )
                         _l15_kwargs = l15_bind.build_retain_kwargs(
                             _reqs,
                             getattr(self.req_to_token_pool, "req_to_token", None),
                             caps_rows_by_rank=_caps,
                             cap_anchor_slots=len(_reqs),
                             prefix=_prefix,
-                            rank=int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
+                            rank=_l15_rank,
                             epoch=int(getattr(self, "_weg2_vote_epoch", 0) or 0),
                             pid=os.getpid(),
                             kv_buffers=_kv,
@@ -19938,8 +19943,12 @@ class Scheduler(
                             allocator=self.token_to_kv_pool_allocator,
                             reset_keep=self.tree_cache.reset_keep,
                             set_keep=_set_keep_collect,
-                            manifest_path=os.environ.get("SGLANG_WEG2_L15_MANIFEST", "")
-                            or "/tmp/weg2_l15_manifest.json",
+                            # L15-12c-C: per-(group, rank) manifest file -- the
+                            # group is "D" (the wake reads it under the "D"
+                            # gate) and the rank is the same tp_rank the
+                            # rank= kwarg above uses.
+                            manifest_path=l15_manifest.manifest_path(
+                                "D", _l15_rank, os.environ),
                             log=logger.info,
                         )
             except Exception as exc:  # noqa: BLE001 - pre-move setup only

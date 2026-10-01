@@ -10959,9 +10959,14 @@ class SchedulerWeightUpdaterManager:
                 try:
                     from sglang.srt.weg2 import l15_manifest, l15_restore
 
+                    # L15-12c-C: the per-(group, rank) manifest file -- the
+                    # SAME path the sleep side (scheduler.py retain hook)
+                    # wrote, one record per rank of this group. load_for_wake
+                    # reads AND clears it (one sleep-wake pair per record).
                     _l15_m = l15_restore.load_for_wake(
-                        os.environ.get("SGLANG_WEG2_L15_MANIFEST", "")
-                        or "/tmp/weg2_l15_manifest.json")
+                        l15_manifest.manifest_path(
+                            self._weg2_group_name(), self._weg2_rank(),
+                            os.environ))
                     if _l15_m is not None:
                         _l15_fp = int(l15_manifest.fingerprint(_l15_m))
                 except Exception as _exc:  # noqa: BLE001 -- no manifest, no hold

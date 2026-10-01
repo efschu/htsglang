@@ -17,17 +17,23 @@ to compare against L2; ``check_line`` and ``restore_line`` format it.
 
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from sglang.srt.weg2.l15_manifest import Manifest, decide, read
+from sglang.srt.weg2.l15_manifest import Manifest, decide, read_and_clear
 
 
 def load_for_wake(
     path: str, pid_alive: Optional[Callable[[int], bool]] = None
 ) -> Optional[Manifest]:
     """Manifest written by this rank's sleep, or None when nothing is
-    held (absent file, or owning pid dead -> reaped by the read)."""
+    held (absent file, or owning pid dead -> reaped by the read).
+
+    READ-AND-CLEAR: the manifest's lifetime is one sleep-wake pair, so the
+    file is unlinked as soon as it is read -- a stale record from an earlier
+    sleep cannot re-vote at this wake or any later one, and that
+    consumption is what makes the absent wake-epoch comparison moot (only
+    this sleep's record can ever be what the wake reads)."""
     if pid_alive is None:
-        return read(path)
-    return read(path, pid_alive=pid_alive)
+        return read_and_clear(path)
+    return read_and_clear(path, pid_alive=pid_alive)
 
 
 def verdict(

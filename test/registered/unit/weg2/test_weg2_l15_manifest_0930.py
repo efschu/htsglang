@@ -23,7 +23,9 @@ from sglang.srt.weg2.l15_manifest import (
     decide,
     fingerprint,
     from_json,
+    manifest_path,
     read,
+    read_and_clear,
     to_json,
     write,
 )
@@ -117,3 +119,98 @@ def test_from_json_bad_span_slot_names_field() -> None:
     )
     with pytest.raises(ValueError, match="slots"):
         from_json(broken)
+
+
+# --- L15-12c-C: per-(group, rank) manifest path + read-and-clear ---------
+
+def test_manifest_path_two_ranks_two_files() -> None:
+    # The defect: ONE file for all ranks made co-located ranks overwrite
+    # each other at sleep and read the same record at wake -> identical
+    # fingerprint -> a FALSE "hold" agreement. Two ranks -> two distinct
+    # paths (and distinct groups too).
+    p0 = manifest_path("D", 0, {})
+    p1 = manifest_path("D", 1, {})
+    assert p0 == "/tmp/weg2_l15_manifest.D.0.json"
+    assert p1 == "/tmp/weg2_l15_manifest.D.1.json"
+    assert p0 != p1
+    assert manifest_path("P", 0, {}) == "/tmp/weg2_l15_manifest.P.0.json"
+    assert manifest_path("P", 0, {}) != p0
+    # None/absent env both fall back to the per-rank default.
+    assert manifest_path("D", 2, None) == "/tmp/weg2_l15_manifest.D.2.json"
+    assert manifest_path("D", 2, {}) == "/tmp/weg2_l15_manifest.D.2.json"
+
+
+def test_manifest_path_env_prefix_and_directory() -> None:
+    # SGLANG_WEG2_L15_MANIFEST, when set, is a prefix (or a directory when
+    # it ends with a separator); the per-rank suffix is still appended in
+    # both forms, so ranks never collide under the override either.
+    assert manifest_path(
+        "D", 2, {"SGLANG_WEG2_L15_MANIFEST": "/tmp/manual"}
+    ) == "/tmp/manual.D.2.json"
+    assert manifest_path(
+        "D", 2, {"SGLANG_WEG2_L15_MANIFEST": "/tmp/manual/"}
+    ) == "/tmp/manual/weg2_l15_manifest.D.2.json"
+    assert manifest_path(
+        "P", 0, {"SGLANG_WEG2_L15_MANIFEST": "/tmp/manual"}
+    ) == "/tmp/manual.P.0.json"
+
+
+def test_read_and_clear_consumes_record(tmp_path) -> None:
+    # The wake is the only reader and it must CONSUME: a stale manifest
+    # from an earlier sleep must not be able to re-vote at the next wake.
+    path = str(tmp_path / "m.json")
+    m = _manifest()
+    write(path, m)
+    # First read returns the manifest and removes the file...
+    assert read_and_clear(path) == m
+    assert not os.path.exists(path), "consumed record must be unlinked"
+    # ...so a second read (e.g. a duplicate wake) finds nothing -> None.
+    assert read_and_clear(path) is None, "second read must give None"
+
+
+def test_read_and_clear_keeps_pid_reap(tmp_path) -> None:
+    # A dead owner's record is still reaped (removed + None) on the first
+    # read -- read-and-clear must not regress the pid-reap behaviour.
+    path = str(tmp_path / "m.json")
+    write(path, _manifest())
+    assert read_and_clear(path, pid_alive=lambda pid: False) is None
+    assert not os.path.exists(path)
+
+
+def test_load_for_wake_reads_and_clears(tmp_path) -> None:
+    # DEFECT 2 acceptance: the wake-side loader consumes the record, so a
+    # stale manifest from an earlier sleep cannot vote again.
+    from sglang.srt.weg2 import l15_restore
+
+    path = str(tmp_path / "m.json")
+    write(path, _manifest())
+    m = l15_restore.load_for_wake(path)
+    assert m is not None and m.epoch == 7
+    assert not os.path.exists(path)
+    assert l15_restore.load_for_wake(path) is None
+
+
+def test_source_both_sites_use_manifest_path() -> None:
+    # Source check: the SLEEP site (scheduler retain hook) and the WAKE site
+    # (weight_updater resume) both derive the manifest path through
+    # l15_manifest.manifest_path -- the old one-file-for-all-ranks default
+    # (and the misspelled "l115" variant of it) is gone from both.
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parents[4]
+    sched = (repo / "python" / "sglang" / "srt" / "managers"
+             / "scheduler.py").read_text()
+    wu = (repo / "python" / "sglang" / "srt" / "managers"
+          / "scheduler_components" / "weight_updater.py").read_text()
+    assert "l15_manifest.manifest_path(" in sched, (
+        "the sleep site does not derive its manifest path via "
+        "l15_manifest.manifest_path")
+    assert "l15_manifest.manifest_path(" in wu, (
+        "the wake site does not derive its manifest path via "
+        "l15_manifest.manifest_path")
+    for name, text in (("scheduler.py", sched), ("weight_updater.py", wu)):
+        assert '"/tmp/weg2_l15_manifest.json"' not in text, (
+            f"{name} still carries the one-file-for-all-ranks default")
+        assert '"/tmp/weg2_l115_manifest.json"' not in text, (
+            f"{name} still carries the misspelled default")
+
