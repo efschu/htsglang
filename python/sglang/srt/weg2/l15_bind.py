@@ -79,6 +79,8 @@ def match_parked(req, tree_cache):
     device node and the node's mamba checkpoint slot. Raises ValueError when
     nothing usable is on the device (the rid is then skipped like any other
     unholdable req)."""
+    from array import array
+
     from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
@@ -91,7 +93,9 @@ def match_parked(req, tree_cache):
         raise ValueError(f"parked req {rid!r} has no token span")
     res = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(token_ids=toks[:span],
+            # array('q'): the tree's stored keys are array('q') and
+            # RadixKey.match asserts the same container type (N3h 22:52Z).
+            key=RadixKey(token_ids=array("q", toks[:span]),
                          extra_key=getattr(req, "extra_key", None)),
             cow_mamba=False,
         )
