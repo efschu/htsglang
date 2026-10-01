@@ -118,13 +118,25 @@ def marker_tail(text: str, marker: str) -> Optional[str]:
 
 _LEG = "SG" "LANG_"  # the legacy env prefix, split for the rename (module doc)
 _LEG_SUB = _LEG + "WE" "G2_"
+_LEG_OPT_SUB = _LEG + "OPT_" + "WE" "G2_"
 
 #: (legacy, renamed) env prefix pairs, the more specific first: the subsystem
-#: family ``<LEGACY>_<OLD>_X <-> FLLIPER_PDFLIP_X`` (RENAME_PLAN 8.1) before the
-#: generic ``<LEGACY>_X <-> FLLIPER_X`` (RENAME_PLAN 4.1). ``SGL_*`` (upstream
-#: legacy aliases) and the product prefix ``HT...`` belong to neither family.
+#: families ``<LEGACY>_<OLD>_X <-> FLLIPER_PDFLIP_X`` (RENAME_PLAN 8.1) and
+#: ``<LEGACY>_OPT_<OLD>_X <-> FLLIPER_OPT_PDFLIP_X`` before the generic
+#: ``<LEGACY>_X <-> FLLIPER_X`` (RENAME_PLAN 4.1). ``SGL_*`` (upstream legacy
+#: aliases) and the product prefix ``HT...`` belong to neither family.
+#:
+#: ORDER MATTERS: :func:`_env_family` and ``compat_shims.env_name_variants``
+#: take the FIRST pair whose prefix (either side) starts the name. The rename
+#: rewrites the subsystem token inside every env name, so the renamed tree
+#: reads ``FLLIPER_OPT_PDFLIP_*`` (D_SEAT_VRAM, DRAFT_PARK_EXACT_PIN,
+#: TAIL_READ_MMAP); without the OPT pair the generic one folded the legacy
+#: ``<LEGACY>_OPT_<OLD>_*`` onto ``FLLIPER_OPT_<OLD>_*``, a name nobody reads,
+#: and an override in the old spelling never arrived (NF release montage,
+#: 01.10.). The OPT pair must stay ahead of the generic one.
 ENV_PREFIX_PAIRS: Tuple[Tuple[str, str], ...] = (
     (_LEG_SUB, "FLLIPER_PDFLIP_"),
+    (_LEG_OPT_SUB, "FLLIPER_OPT_PDFLIP_"),
     (_LEG, "FLLIPER_"),
 )
 
