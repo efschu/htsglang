@@ -31,7 +31,7 @@ covers several adjacent cuMemMap mappings in one call (the CUDA samples'
 multi-device mmap frees its striped range exactly so). Every handle is
 still released one by one (cuMemRelease is host bookkeeping, 1-3 ms per tag).
 
-THE FORM: switch ``SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP`` (default off =
+THE FORM: switch ``SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP`` (default ON since 02adfaadee; off =
 the patch-4 walk, call for call). On: :func:`arm` sets the saver's flag
 (``tms_set_pause_coalesce``) before every sleep leg; the saver sorts an
 allocation's extents, cuts them into runs of back-to-back extents and unmaps

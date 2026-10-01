@@ -12,7 +12,7 @@ byte on the SAME cards; D's expert banks are H95c span maps, one handle per
 lattice cell). The pause cannot be made cheaper from Python; it can leave
 the chain.
 
-THE FORM (switch ``SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP``, default off =
+THE FORM (switch ``SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP``, default ON since 02adfaadee; off =
 the per-tag chain byte for byte; groups ``SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS``,
 default ``D``):
 
