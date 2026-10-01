@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fLLiper Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="mark.svg">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f2; --surface: #fcfcfb; --surface-2: #efeeea; --line: #dcdad4;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #7b7a75;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --good: #008300; --warn: #b77a00; --bad: #d03b3a;
+  --bar: #2a78d6; --bar-bg: #e4e3de; --grid: rgba(11,11,11,0.07);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111110; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
+    --text: #ffffff; --text-2: #c3c2b7; --muted: #8d8c85;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    --good: #3fb950; --warn: #d9a400; --bad: #e66767;
+    --bar: #3987e5; --bar-bg: #2c2c29; --grid: rgba(255,255,255,0.07);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111110; --surface: #1a1a19; --surface-2: #232321; --line: #34332f;
+  --text: #ffffff; --text-2: #c3c2b7; --muted: #8d8c85;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+  --good: #3fb950; --warn: #d9a400; --bad: #e66767;
+  --bar: #3987e5; --bar-bg: #2c2c29; --grid: rgba(255,255,255,0.07);
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.num { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 12px 16px;
+  border-bottom: 1px solid var(--line); background: var(--surface); }
+header img { height: 28px; width: 28px; display: block; }
+header h1 { font-size: 18px; margin: 0; font-weight: 650; }
+header .sub { color: var(--text-2); font-size: 13px; }
+header .right { margin-left: auto; color: var(--muted); font-size: 12px; }
+main { padding: 12px 16px 40px; max-width: 1300px; margin: 0 auto; }
+section { margin: 0 0 14px; }
+h2 { font-size: 14px; font-weight: 650; margin: 18px 0 8px; color: var(--text-2); }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  font-weight: 600; font-size: 13px; border: 1px solid var(--line); background: var(--surface-2); }
+.pill .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.pill.bereit .dot { background: var(--good); } .pill.bootet .dot { background: var(--warn); }
+.pill.gestoert .dot, .pill.tot .dot { background: var(--bad); }
+.srv { display: flex; flex-wrap: wrap; gap: 6px 28px; align-items: baseline; }
+.srv .k { color: var(--muted); font-size: 12px; margin-right: 6px; }
+.srv .err { color: var(--bad); font-size: 13px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-height: 92px; }
+.tile .lab { color: var(--text-2); font-size: 12px; }
+.tile .val { font-size: 28px; font-weight: 650; line-height: 1.2; }
+.tile .val small { font-size: 14px; font-weight: 500; color: var(--text-2); margin-left: 3px; }
+.tile .foot { color: var(--muted); font-size: 12px; }
+.tile.hero { grid-column: span 2; }
+.tile.hero .val { font-size: 40px; }
+.tile.hero .pair { display: flex; gap: 28px; align-items: baseline; flex-wrap: wrap; }
+.tile.hero .pair .q { color: var(--text-2); font-size: 12px; display: block; }
+@media (max-width: 460px) { .tile.hero { grid-column: span 1; } .tile.hero .val { font-size: 32px; } }
+.meter { height: 8px; background: var(--bar-bg); border-radius: 4px; overflow: hidden; margin: 6px 0 2px; }
+.meter > i { display: block; height: 100%; background: var(--bar); border-radius: 4px; }
+.gpus { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.gpu .name { font-weight: 600; } .gpu .row { display: flex; justify-content: space-between; font-size: 13px; }
+.gpu .row .k { color: var(--text-2); }
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }
+.chart { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px 6px; position: relative; }
+.chart .ttl { font-size: 13px; font-weight: 600; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.chart .ttl .unit { color: var(--muted); font-weight: 400; font-size: 12px; }
+.legend { display: inline-flex; gap: 10px; font-size: 12px; color: var(--text-2); font-weight: 400; }
+.legend i { display: inline-block; width: 12px; height: 2px; vertical-align: middle; margin-right: 4px; border-radius: 1px; }
+svg.plot { width: 100%; height: 150px; display: block; overflow: visible; }
+svg.plot .grid { stroke: var(--grid); stroke-width: 1; }
+svg.plot text { fill: var(--muted); font-size: 10px; font-family: system-ui, sans-serif; }
+svg.plot .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg.plot .cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px; white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,.12); display: none; z-index: 2; }
+.tip .k { color: var(--text-2); }
+.span { display: inline-flex; gap: 4px; margin-left: 8px; }
+.span button { font: inherit; font-size: 12px; padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--text-2); cursor: pointer; }
+.span button[aria-pressed="true"] { background: var(--surface-2); color: var(--text); font-weight: 600; }
+.empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+footer { color: var(--muted); font-size: 12px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<header>
+  <img src="mark.svg" alt="">
+  <h1 id="title">fLLiper Dashboard</h1>
+  <span class="pill" id="pill"><span class="dot"></span><span id="pill-text">verbinde ...</span></span>
+  <span class="sub" id="hdr-model"></span>
+  <span class="right" id="hdr-sample"></span>
+</header>
+<main>
+  <section class="card srv" id="server">
+    <span><span class="k">Modell</span><b id="s-model">-</b></span>
+    <span><span class="k">Kontext</span><span class="num" id="s-ctx">-</span></span>
+    <span><span class="k">Bereit seit</span><span class="num" id="s-since">-</span></span>
+    <span><span class="k">Laufzeit</span><span class="num" id="s-uptime">-</span></span>
+    <span class="err" id="s-err"></span>
+  </section>
+
+  <section>
+    <div class="tiles">
+      <div class="tile hero" id="t-ttft">
+        <div class="lab">Zeit bis zum ersten Token (TTFT), letzte 5 min</div>
+        <div class="pair">
+          <div><span class="q">Median (p50)</span><span class="val num" id="ttft-p50">-</span></div>
+          <div><span class="q">p90</span><span class="val num" id="ttft-p90">-</span></div>
+        </div>
+        <div class="foot" id="ttft-foot">-</div>
+      </div>
+      <div class="tile"><div class="lab">Decode</div><div class="val num" id="dec">-</div><div class="foot">erzeugte Token je Sekunde</div></div>
+      <div class="tile"><div class="lab">Prefill</div><div class="val num" id="pre">-</div><div class="foot" id="pre-foot">neu berechnete Prompt-Token je Sekunde</div></div>
+      <div class="tile"><div class="lab">Anfragen</div><div class="val num" id="req">-</div><div class="foot" id="req-foot">laufend / wartend</div></div>
+      <div class="tile"><div class="lab">KV-Cache belegt</div><div class="val num" id="kv">-</div>
+        <div class="meter"><i id="kv-bar" style="width:0"></i></div><div class="foot num" id="kv-foot"></div></div>
+    </div>
+  </section>
+
+  <h2>Grafikkarten</h2>
+  <section class="gpus" id="gpus"><div class="empty">noch keine Daten</div></section>
+
+  <h2>Verlauf <span class="span" role="group" aria-label="Zeitraum">
+    <button data-s="900" aria-pressed="false">15 min</button><button data-s="3600" aria-pressed="true">1 h</button></span></h2>
+  <section class="charts" id="charts"></section>
+
+  <footer id="foot">Nur lesend: Werte aus den Endpunkten des Servers (/health, /metrics, /v1/models) und den Karten (NVML).
+    Der Verlauf liegt im Speicher dieses Dashboards (höchstens 1 h) und beginnt mit seinem Start.</footer>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const NF = (d) => new Intl.NumberFormat("de-DE", {maximumFractionDigits: d, minimumFractionDigits: d});
+const fmt = (v, d = 0) => (v === null || v === undefined || !isFinite(v)) ? "-" : NF(d).format(v);
+const STATUS_CLS = {bereit: "bereit", bootet: "bootet", gestoert: "gestoert", tot: "tot"};
+let SPAN = 3600;
+
+function secs(s) {
+  if (s === null || s === undefined || !isFinite(s)) return "-";
+  if (s < 1) return fmt(s * 1000, 0) + " ms";
+  if (s < 10) return fmt(s, 2) + " s";
+  return fmt(s, 1) + " s";
+}
+function dur(s) {
+  if (!s || !isFinite(s)) return "-";
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return (d ? d + " d " : "") + (d || h ? h + " h " : "") + m + " min";
+}
+function clock(t) { return t ? new Date(t * 1000).toLocaleTimeString("de-DE", {hour: "2-digit", minute: "2-digit"}) : "-"; }
+function tps(v) { return v === null || v === undefined ? "-" : fmt(v, v < 100 ? 1 : 0); }
+function setVal(el, txt, unit) { el.innerHTML = ""; el.append(txt); if (unit && txt !== "-") { const s = document.createElement("small"); s.textContent = unit; el.append(s); } }
+
+function renderNow(d) {
+  const s = d.server || {};
+  const pill = $("pill");
+  pill.className = "pill " + (STATUS_CLS[s.status] || "");
+  $("pill-text").textContent = s.status_text || "-";
+  $("s-model").textContent = s.model || "-";
+  $("hdr-model").textContent = s.model || "";
+  $("s-ctx").textContent = s.context_len ? fmt(s.context_len) + " Token" : "-";
+  $("s-since").textContent = s.ready_since ? clock(s.ready_since) : "-";
+  $("s-uptime").textContent = s.uptime_s ? dur(s.uptime_s) : "-";
+  $("s-err").textContent = s.error || "";
+  const t = d.ttft || {};
+  $("ttft-p50").textContent = secs(t.p50_5m_s);
+  $("ttft-p90").textContent = secs(t.p90_5m_s);
+  $("ttft-foot").textContent = (t.n_5m ? t.n_5m + " Anfragen in 5 min" : "keine Anfrage in den letzten 5 min") +
+    (t.n_1h ? " · 1 h: p50 " + secs(t.p50_1h_s) + ", p90 " + secs(t.p90_1h_s) + " (" + t.n_1h + ")" : "") +
+    (t.basis ? " · " + t.basis : "");
+  const th = d.throughput || {};
+  setVal($("dec"), tps(th.decode_tps), " tok/s");
+  setVal($("pre"), tps(th.prefill_tps), " tok/s");
+  $("pre-foot").textContent = "neu berechnete Prompt-Token je Sekunde" +
+    (th.cache_hit_pct !== null && th.cache_hit_pct !== undefined ? " · Cache-Treffer " + fmt(th.cache_hit_pct, 0) + " %" : "");
+  const r = d.requests || {};
+  $("req").textContent = fmt(r.running) + " / " + fmt(r.waiting);
+  const kv = d.kv || {};
+  setVal($("kv"), fmt(kv.used_pct, 1), " %");
+  $("kv-bar").style.width = (kv.used_pct ? Math.min(100, kv.used_pct) : 0) + "%";
+  $("kv-foot").textContent = kv.total_tokens ? "Kapazität " + fmt(kv.total_tokens) + " Token" : "";
+  renderGpus(d.gpus || [], d.gpu_error);
+  const sm = d.sample || {};
+  $("hdr-sample").textContent = sm.t ? "Stand " + new Date(sm.t * 1000).toLocaleTimeString("de-DE") + (sm.period_s ? " · alle " + fmt(sm.period_s) + " s" : "") : "";
+}
+
+function renderGpus(gs, err) {
+  const box = $("gpus");
+  if (!gs.length) { box.innerHTML = ""; const e = document.createElement("div"); e.className = "empty"; e.textContent = err || "keine Karten sichtbar"; box.append(e); return; }
+  box.innerHTML = "";
+  for (const g of gs) {
+    const c = document.createElement("div"); c.className = "card gpu";
+    const pct = g.mem_total_mib ? 100 * g.mem_used_mib / g.mem_total_mib : null;
+    c.innerHTML = '<div class="name"></div>' +
+      '<div class="row"><span class="k">VRAM</span><span class="num v-mem"></span></div><div class="meter"><i></i></div>' +
+      '<div class="row"><span class="k">Last</span><span class="num v-util"></span></div>' +
+      '<div class="row"><span class="k">Leistung</span><span class="num v-pow"></span></div>' +
+      '<div class="row"><span class="k">Temperatur</span><span class="num v-temp"></span></div>';
+    c.querySelector(".name").textContent = "GPU " + g.index + (g.name ? " · " + g.name : "");
+    c.querySelector(".v-mem").textContent = g.mem_used_mib !== null ? fmt(g.mem_used_mib / 1024, 1) + " / " + fmt(g.mem_total_mib / 1024, 1) + " GiB" : "-";
+    c.querySelector(".meter > i").style.width = (pct || 0) + "%";
+    c.querySelector(".v-util").textContent = fmt(g.util_pct) + " %";
+    c.querySelector(".v-pow").textContent = fmt(g.power_w) + (g.power_limit_w ? " / " + fmt(g.power_limit_w) : "") + " W";
+    c.querySelector(".v-temp").textContent = fmt(g.temp_c) + " °C";
+    box.append(c);
+  }
+}
+
+// --- charts: one measure per chart (no second axis), hover crosshair + tooltip ---------------------
+const COLORS = ["--s1", "--s2", "--s3"];
+const cssv = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function chart(box, title, unit, ts, series, fmtv) {
+  const wrap = document.createElement("div"); wrap.className = "chart";
+  const ttl = document.createElement("div"); ttl.className = "ttl"; ttl.textContent = title;
+  const u = document.createElement("span"); u.className = "unit"; u.textContent = unit; ttl.append(u);
+  if (series.length > 1) {
+    const lg = document.createElement("span"); lg.className = "legend";
+    series.forEach((s, i) => { const e = document.createElement("span"); const sw = document.createElement("i");
+      sw.style.background = cssv(COLORS[i % 3]); e.append(sw, s.name); lg.append(e); });
+    ttl.append(lg);
+  }
+  wrap.append(ttl); box.append(wrap);
+  const W = Math.max(260, wrap.clientWidth - 20), H = 150, L = 44, R = 8, T = 8, B = 20;
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg"); svg.setAttribute("class", "plot");
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", title);
+  const vals = series.flatMap(s => s.data).filter(v => v !== null && isFinite(v));
+  // the ring starts with this dashboard: until it holds the chosen span, the axis starts at its first point
+  const now = Date.now() / 1000, x1 = now;
+  const x0 = Math.max(now - SPAN, Math.min(ts.length ? ts[0] : now, now - 300));
+  let ymax = vals.length ? Math.max(...vals) : 1; if (ymax <= 0) ymax = 1; ymax *= 1.1;
+  const X = (t) => L + (W - L - R) * (t - x0) / (x1 - x0), Y = (v) => T + (H - T - B) * (1 - v / ymax);
+  for (let i = 0; i <= 3; i++) {
+    const v = ymax * i / 3, y = Y(v);
+    const g = document.createElementNS(NS, "line"); g.setAttribute("class", "grid");
+    g.setAttribute("x1", L); g.setAttribute("x2", W - R); g.setAttribute("y1", y); g.setAttribute("y2", y); svg.append(g);
+    const tx = document.createElementNS(NS, "text"); tx.setAttribute("x", L - 4); tx.setAttribute("y", y + 3);
+    tx.setAttribute("text-anchor", "end"); tx.textContent = fmtv(v, true); svg.append(tx);
+  }
+  for (const f of [0, 0.5, 1]) {
+    const t = x0 + f * (x1 - x0), tx = document.createElementNS(NS, "text");
+    tx.setAttribute("x", X(t)); tx.setAttribute("y", H - 4); tx.setAttribute("text-anchor", f === 0 ? "start" : f === 1 ? "end" : "middle");
+    tx.textContent = clock(t); svg.append(tx);
+  }
+  series.forEach((s, i) => {
+    let d = "", pen = false;
+    for (let k = 0; k < ts.length; k++) {
+      const v = s.data[k];
+      if (v === null || !isFinite(v) || ts[k] < x0) { pen = false; continue; }
+      d += (pen ? "L" : "M") + X(ts[k]).toFixed(1) + " " + Y(v).toFixed(1); pen = true;
+    }
+    const p = document.createElementNS(NS, "path"); p.setAttribute("class", "ln"); p.setAttribute("d", d);
+    p.setAttribute("stroke", cssv(COLORS[i % 3])); p.setAttribute("vector-effect", "non-scaling-stroke"); svg.append(p);
+  });
+  if (!vals.length) {
+    const tx = document.createElementNS(NS, "text"); tx.setAttribute("x", (L + W) / 2); tx.setAttribute("y", H / 2);
+    tx.setAttribute("text-anchor", "middle"); tx.textContent = "noch keine Werte"; svg.append(tx);
+  }
+  const cross = document.createElementNS(NS, "line"); cross.setAttribute("class", "cross");
+  cross.setAttribute("y1", T); cross.setAttribute("y2", H - B); cross.style.display = "none"; svg.append(cross);
+  const tip = document.createElement("div"); tip.className = "tip";
+  svg.addEventListener("mousemove", (ev) => {
+    if (!ts.length) return;
+    const r = svg.getBoundingClientRect(), fx = (ev.clientX - r.left) / r.width * W;
+    const t = x0 + (fx - L) / (W - L - R) * (x1 - x0);
+    let best = 0, bd = Infinity; for (let k = 0; k < ts.length; k++) { const dd = Math.abs(ts[k] - t); if (dd < bd) { bd = dd; best = k; } }
+    cross.setAttribute("x1", X(ts[best])); cross.setAttribute("x2", X(ts[best])); cross.style.display = "";
+    tip.innerHTML = ""; const hd = document.createElement("div"); hd.className = "k";
+    hd.textContent = new Date(ts[best] * 1000).toLocaleTimeString("de-DE"); tip.append(hd);
+    series.forEach((s) => { const row = document.createElement("div"); row.textContent = (series.length > 1 ? s.name + ": " : "") + fmtv(s.data[best], false) + " " + unit; tip.append(row); });
+    tip.style.display = "block";
+    const px = ev.clientX - wrap.getBoundingClientRect().left;
+    tip.style.left = Math.min(px + 12, wrap.clientWidth - tip.offsetWidth - 4) + "px"; tip.style.top = "26px";
+  });
+  svg.addEventListener("mouseleave", () => { cross.style.display = "none"; tip.style.display = "none"; });
+  wrap.append(svg, tip);
+}
+
+let LASTH = null;
+window.addEventListener("resize", () => { if (LASTH) renderHistory(LASTH); });
+function renderHistory(h) {
+  LASTH = h;
+  const box = $("charts"); box.innerHTML = "";
+  const t = h.t || [];
+  const n0 = (v, ax) => fmt(v, ax ? 0 : (v < 100 ? 1 : 0));
+  const sec = (v, ax) => v === null || v === undefined ? "-" : (ax ? fmt(v, v < 10 ? 1 : 0) : fmt(v, 2));
+  chart(box, "TTFT", "s", t, [{name: "p50", data: h.ttft_p50_s || []}, {name: "p90", data: h.ttft_p90_s || []}], sec);
+  chart(box, "Decode", "tok/s", t, [{name: "Decode", data: h.decode_tps || []}], n0);
+  chart(box, "Prefill", "tok/s", t, [{name: "Prefill", data: h.prefill_tps || []}], n0);
+  chart(box, "Anfragen", "", t, [{name: "laufend", data: h.running || []}, {name: "wartend", data: h.waiting || []}], (v) => fmt(v));
+  chart(box, "KV-Cache belegt", "%", t, [{name: "KV", data: h.kv_pct || []}], (v) => fmt(v));
+  const g = h.gpus || {}, names = (g.names || []).map((n, i) => "GPU " + i);
+  const per = (k, s) => (g[k] || []).map((d, i) => ({name: names[i] || ("GPU " + i), data: s ? d.map(v => v === null ? null : v / s) : d}));
+  chart(box, "GPU-Last", "%", t, per("util_pct"), (v) => fmt(v));
+  chart(box, "VRAM belegt", "GiB", t, per("mem_used_mib", 1024), (v, ax) => fmt(v, ax ? 0 : 1));
+  chart(box, "Leistung", "W", t, per("power_w"), (v) => fmt(v));
+  chart(box, "Temperatur", "°C", t, per("temp_c"), (v) => fmt(v));
+}
+
+async function getJSON(u) { const r = await fetch(u, {cache: "no-store"}); if (!r.ok) throw new Error(r.status); return r.json(); }
+let tick = 0;
+async function refresh() {
+  if (document.visibilityState === "hidden") return;
+  try { renderNow(await getJSON("api/now")); } catch (e) { $("pill").className = "pill tot"; $("pill-text").textContent = "Dashboard nicht erreichbar"; }
+  if (tick++ % 3 === 0) { try { renderHistory(await getJSON("api/history?s=" + SPAN)); } catch (e) { /* next round */ } }
+}
+document.querySelectorAll(".span button").forEach((b) => b.addEventListener("click", () => {
+  SPAN = +b.dataset.s; document.querySelectorAll(".span button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+  tick = 0; refresh();
+}));
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { tick = 0; refresh(); } });
+refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>
