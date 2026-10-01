@@ -19894,7 +19894,14 @@ class Scheduler(
             _l15_kwargs = None
             _l15_mba = None
             try:
-                from sglang.srt.weg2 import l15_bind, l15_plan, l15_retain, l15_shadow
+                from sglang.srt.weg2 import (
+                    l15_bind,
+                    l15_keep_arm,
+                    l15_manifest,
+                    l15_plan,
+                    l15_retain,
+                    l15_shadow,
+                )
 
                 if l15_plan.master_on(os.environ) and (
                     getattr(self, "weg2_d_parked", None) is not None
@@ -20018,13 +20025,16 @@ class Scheduler(
                                 for lo, hi in spans
                             )
 
+                        _l15_rank = int(
+                            getattr(getattr(self, "ps", None), "tp_rank", 0) or 0
+                        )
                         _l15_kwargs = l15_bind.build_retain_kwargs(
                             _reqs,
                             getattr(self.req_to_token_pool, "req_to_token", None),
                             caps_rows_by_rank=_caps,
                             cap_anchor_slots=len(_reqs),
                             prefix=_prefix,
-                            rank=int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
+                            rank=_l15_rank,
                             epoch=int(getattr(self, "_weg2_vote_epoch", 0) or 0),
                             pid=os.getpid(),
                             kv_buffers=_kv,
@@ -20032,10 +20042,40 @@ class Scheduler(
                             allocator=self.token_to_kv_pool_allocator,
                             reset_keep=self.tree_cache.reset_keep,
                             set_keep=_set_keep_collect,
-                            manifest_path=os.environ.get("SGLANG_WEG2_L15_MANIFEST", "")
-                            or "/tmp/weg2_l15_manifest.json",
+                            # L15-12c-C: per-(group, rank) manifest file -- the
+                            # group is "D" (the wake reads it under the "D"
+                            # gate) and the rank is the same tp_rank the
+                            # rank= kwarg above uses.
+                            manifest_path=l15_manifest.manifest_path(
+                                "D", _l15_rank, os.environ),
                             log=logger.info,
                         )
+                        # L15-12c-C2: alignment probe -- chain host rows vs
+                        # the seqlen-1 KV span; the first L15=1 boot confirms
+                        # whether the snapshot ever exceeds the span.
+                        for _r in _reqs:
+                            try:
+                                logger.info(
+                                    "L15-L2-ALIGN rid=%s chain_rows=%d kv_span=%d",
+                                    getattr(_r, "rid", "?"),
+                                    len(l15_bind.chain_host_rows(
+                                        l15_bind.node_of_req(_r)
+                                    )),
+                                    len(l15_bind.slots_of_req(
+                                        _r,
+                                        getattr(
+                                            self.req_to_token_pool,
+                                            "req_to_token",
+                                            None,
+                                        ),
+                                    )),
+                                )
+                            except Exception as _exc:  # noqa: BLE001
+                                logger.info(
+                                    "L15-L2-ALIGN rid=%s probe failed: %s",
+                                    getattr(_r, "rid", "?"),
+                                    _exc,
+                                )
             except Exception as exc:  # noqa: BLE001 - pre-move setup only
                 logger.warning(
                     "L15-RETAIN failed before the move (flushing as today): %s: %s",
@@ -20046,20 +20086,35 @@ class Scheduler(
             _l15_res = None
             if _l15_kwargs is not None:
                 _l15_res = l15_retain.retain_at_sleep(
-                    mamba_allocator=_l15_mba, **_l15_kwargs
+                    mamba_allocator=_l15_mba,
+                    # L15-11d: step (4) remaps the REAL tree component
+                    # values (the old fake kv_slots/anchor_slot writes were
+                    # never read); shared visited set is owned by retain.
+                    rewrite_tree=l15_bind.rewrite_tree_chain,
+                    **_l15_kwargs
                 )
                 if _l15_res is not None:
                     # The keep spans are the one thing retain_at_sleep
                     # itself could not persist (it collects per view); one
-                    # adapter call per base, rc != 0 raises.
-                    for _b, _ranges in _keep_by_base.values():
-                        _rc = _ad.set_keep_byte_spans(_b, _ranges)
-                        if _rc != 0:
-                            raise RuntimeError(
-                                f"L15-RETAIN set_keep_byte_spans rc={_rc}: the "
-                                f"buffers are moved but NOT kept "
-                                f"(base={_b.data_ptr()})"
-                            )
+                    # adapter call per base. L15-12c-F2: a failing arm must
+                    # NOT raise here -- the rows have moved and the
+                    # manifest is written; raising left that manifest
+                    # claiming a hold while the pause discarded the pages
+                    # (garbage KV at the wake). The helper discards this
+                    # rank's manifest, clears the already-armed bases, logs
+                    # once and returns False; dropping _l15_res then makes
+                    # the sleep finish as the plain flush below, so this
+                    # rank votes None at the wake while its peers vote a
+                    # fingerprint -> mixed verdict -> group fallback
+                    # (the existing rule; no wake-side code here).
+                    if not l15_keep_arm.arm_keep_spans(
+                        _ad,
+                        _keep_by_base,
+                        _l15_kwargs["manifest_path"],
+                        rank=_l15_rank,
+                        log=logger.warning,
+                    ):
+                        _l15_res = None
             self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None

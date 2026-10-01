@@ -33,7 +33,13 @@ from typing import Optional, Tuple
 class HoldSpan:
     """One held context: its request id, the hold depth, the L1 slots it
     occupies, the anchor slot it is pinned to, and where its suffix lives in
-    L2 (slots plus the generation each L2 slot was written at)."""
+    L2 (slots plus the generation each L2 slot was written at).
+
+    ``anchor_l2_slot``/``anchor_l2_gen`` are the anchor state's L2 identity
+    (mamba arena slot and generation; -1/-1 = absent), recorded at sleep so
+    the cap-0 wake can refill the anchor (L15-12-PART3 sec 8). The
+    fingerprint covers ALL span fields, so the anchor L2 identity is part of
+    the group agreement: ranks that disagree on it fall back together."""
 
     rid: str
     depth: int
@@ -41,6 +47,8 @@ class HoldSpan:
     anchor_slot: int
     l2_slots: Tuple[int, ...]
     l2_gens: Tuple[int, ...]
+    anchor_l2_slot: int = -1
+    anchor_l2_gen: int = -1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,6 +80,30 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def manifest_path(group: str, rank: int, env) -> str:
+    """The per-(group, rank) manifest file.
+
+    Co-located ranks on one host must each own a SEPARATE file: with one
+    shared default they overwrite each other's record at sleep, and at
+    wake they all read the SAME file -> identical fingerprint -> a FALSE
+    "hold" agreement (the group votes on one rank's content). When
+    ``SGLANG_WEG2_L15_MANIFEST`` is set it is a directory (when it ends
+    with a path separator) or a path prefix; otherwise the default is
+    ``/tmp/weg2_l15_manifest.<group>.<rank>.json``.
+    """
+    override = ""
+    if env:
+        try:
+            override = env.get("SGLANG_WEG2_L15_MANIFEST", "") or ""
+        except AttributeError:  # pragma: no cover - non-mapping guard
+            override = ""
+    if not override:
+        return "/tmp/weg2_l15_manifest.%s.%d.json" % (group, rank)
+    if override.endswith(os.sep):
+        return override + "weg2_l15_manifest.%s.%d.json" % (group, rank)
+    return "%s.%s.%d.json" % (override, group, rank)
+
+
 def _span_to_dict(s: HoldSpan) -> dict:
     return {
         "rid": s.rid,
@@ -80,6 +112,8 @@ def _span_to_dict(s: HoldSpan) -> dict:
         "anchor_slot": s.anchor_slot,
         "l2_slots": list(s.l2_slots),
         "l2_gens": list(s.l2_gens),
+        "anchor_l2_slot": s.anchor_l2_slot,
+        "anchor_l2_gen": s.anchor_l2_gen,
     }
 
 
@@ -152,6 +186,9 @@ def from_json(s: str) -> Manifest:
                 anchor_slot=_as_int(sp, "anchor_slot", where),
                 l2_slots=_int_list(sp, "l2_slots", where),
                 l2_gens=_int_list(sp, "l2_gens", where),
+                # L15-12c-E2a: optional -- a pre-E2a record loads as -1/-1
+                anchor_l2_slot=int(sp.get("anchor_l2_slot", -1)),
+                anchor_l2_gen=int(sp.get("anchor_l2_gen", -1)),
             )
         )
     return Manifest(
@@ -195,6 +232,27 @@ def read(path: str, pid_alive=_pid_alive) -> Optional[Manifest]:
         except FileNotFoundError:
             pass
         return None
+    return m
+
+
+def read_and_clear(path: str, pid_alive=_pid_alive) -> Optional[Manifest]:
+    """read() plus the unlink of the consumed record.
+
+    The manifest's lifetime is ONE sleep-wake pair: the wake is the only
+    reader, and a record left on disk would let a LATER wake re-vote on a
+    stale record from an earlier sleep. That consumption is also what makes
+    the missing wake-epoch comparison moot (the wake never compares its own
+    epoch against the manifest's): by construction the wake reads only the
+    record its own sleep wrote, and that record is gone after the vote.
+    ``read`` already unlinks a dead-pid record (and returns None); this
+    unlinks the valid one too, so a second read gives None.
+    """
+    m = read(path, pid_alive)
+    if m is not None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:  # pragma: no cover - concurrent consumer
+            pass
     return m
 
 

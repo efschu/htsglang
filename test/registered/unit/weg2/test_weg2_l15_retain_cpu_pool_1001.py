@@ -152,9 +152,19 @@ class FakeAllocator:
 
 
 class FakeNode:
+    # FAKE NODE: real UnifiedTreeNode has no kv_slots/anchor_slot -- see
+    # test_weg2_l15_tree_rewrite_1001.py
+
     def __init__(self):
         self.kv_slots = ()
         self.anchor_slot = -1
+
+
+def _rewrite_recorder(node, kv_map, anchor_map, visited):
+    # L15-11d recorder standing in for l15_bind.rewrite_tree_chain: the
+    # fake node only captures the maps (the real rewrite is pinned in
+    # test_weg2_l15_tree_rewrite_1001.py).
+    node.rewritten = (dict(kv_map), dict(anchor_map))
 
 
 def _drive(tmp_path, pool):
@@ -171,6 +181,7 @@ def _drive(tmp_path, pool):
         slots_of=lambda rid: SLOTS_OF[rid],
         anchor_slot_of=lambda rid: ANCHOR_SLOT_OF[rid],
         l2_of=lambda rid: ((201, 202), (5, 6)),
+        rewrite_tree=_rewrite_recorder,
         caps_rows_by_rank=CAPS_ROWS_BY_RANK,
         cap_anchor_slots=CAP_ANCHOR_SLOTS,
         prefix=PREFIX,
@@ -239,9 +250,11 @@ def test_retain_lands_held_anchor_markers_in_real_pool(tmp_path):
     # kv move (9,5): owner rows 4 -> 2 on this rank, in both kv buffers
     for buf in sc["kv_buffers"]:
         assert torch.equal(buf[2], _kv_marker(6, 3)[4])
-    # nodes rewritten; set_keep seen on every buffer exactly once
-    assert sc["nodes"]["r_seat"].anchor_slot == 1
-    assert sc["nodes"]["r_parked"].anchor_slot == 2
+    # nodes rewritten: the recorder received the global anchor squeeze map
+    # 5 -> 1, 6 -> 2 (identical for every held chain); set_keep seen on
+    # every buffer exactly once
+    assert sc["nodes"]["r_seat"].rewritten[1] == {5: 1, 6: 2}
+    assert sc["nodes"]["r_parked"].rewritten[1] == {5: 1, 6: 2}
     assert len(sc["reset_calls"]) == 1 and len(sc["reset_calls"][0]) == 2
     by_target = {}
     for buf_id, spans in sc["keep_calls"]:

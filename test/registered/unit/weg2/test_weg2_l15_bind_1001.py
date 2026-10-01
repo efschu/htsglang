@@ -53,6 +53,15 @@ def _req_to_token():
     return rtt
 
 
+def _rewrite_recorder(node, kv_map, anchor_map, visited):
+    # L15-11d recorder standing in for l15_bind.rewrite_tree_chain: the
+    # fake node only captures the maps (the real rewrite is pinned in
+    # test_weg2_l15_tree_rewrite_1001.py). The scheduler hook passes the
+    # real callable next to **kwargs; build_retain_kwargs does not return
+    # it, so the caller supplies it here too.
+    node.rewritten = (dict(kv_map), dict(anchor_map))
+
+
 def test_slots_of_req_returns_token_order_ints():
     req = _req("r_seat", 0, 4, 2, 4, object(), "seat", 2.0)
     slots = slots_of_req(req, _req_to_token())
@@ -117,7 +126,11 @@ def test_build_retain_kwargs_drives_retain_at_sleep_end_to_end(tmp_path):
     rt = _load_retain_test_module()
     sc = rt.make_scenario(tmp_path, [])
     kwargs = dict(sc["kwargs"])
-    for key in ("candidates", "node_of", "slots_of", "anchor_slot_of", "l2_of"):
+    # build_retain_kwargs owns the req-derived keys and takes a fixed
+    # signature; rewrite_tree belongs to the caller (the scheduler passes
+    # it next to **kwargs), so drop it from the builder kwargs here.
+    for key in ("candidates", "node_of", "slots_of", "anchor_slot_of",
+                "l2_of", "rewrite_tree"):
         kwargs.pop(key)
     node_a = rt.FakeNode([])
     node_b = rt.FakeNode([])
@@ -127,7 +140,7 @@ def test_build_retain_kwargs_drives_retain_at_sleep_end_to_end(tmp_path):
     ]
     bound = build_retain_kwargs(reqs, _req_to_token(), **kwargs)
     assert bound["l2_of"]("r_seat") == ((), ())
-    result = l15_retain.retain_at_sleep(**bound)
+    result = l15_retain.retain_at_sleep(rewrite_tree=_rewrite_recorder, **bound)
     assert isinstance(result, l15_retain.RetainResult)
     assert len(result.keep_nodes) == 2
     assert any(n is node_a for n in result.keep_nodes)
