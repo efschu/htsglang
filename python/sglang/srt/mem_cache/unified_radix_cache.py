@@ -4529,6 +4529,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if _pre is False:
             return 0
+        if _pre is None and kv_only_if_mamba_refused:
+            self._weg2_byteless_worker_kv_only(node, comp_xfers)
         if ComponentType.MAMBA not in comp_xfers and sidecar_xfers:
             # P-FUND: the claim dropped the anchor; a sidecar indexed by it
             # has no source rows either.
@@ -4903,6 +4905,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _weg2_shadow_anchor_room(self, mxfer) -> bool:
         pool = self.cache_controller.mem_pool_host.get_pool(PoolName.MAMBA)
         return int(pool.available_size()) >= len(mxfer.device_indices)
+
+    def _weg2_byteless_worker_kv_only(self, node, comp_xfers) -> None:
+        """y6h-kvh (01.10. 15:27:56Z, token vector 64,0,0 = Form A dcp 1): a
+        Form A worker that owns NO KV rows has no KV arena either (store
+        FormAWorkerNullStorage), so its backups take the staging path, where
+        the anchor needs a row of the byteless R12 shadow mamba pool. With
+        that pool full and its host eviction refused by R12 the controller
+        returned None ('#1421 BACKUP-REFUSED why=write_none:?'), every device
+        leaf refused, 'MAMBA-EVICT NO-PROGRESS', and TP1/TP2 died in
+        alloc_req_slots at mamba_available=2/38 while TP0 (P-FUND KV-only on
+        its arena) still had room. The direct path's M1s rule, applied here:
+        under eviction a full shadow pool goes KV-only; R12 reconciles the
+        anchor ('short')."""
+        if _r12.role() != "worker":
+            return
+        group = getattr(self.cache_controller, "mem_pool_host", None)
+        names = getattr(group, "entry_map", None) or {}
+        if PoolName.MAMBA not in names:
+            return
+        pool = group.get_pool(PoolName.MAMBA)
+        if pool is None or hasattr(pool, "arena_resolve_reads"):
+            return
+        for ct, xfers in list(comp_xfers.items()):
+            for x in xfers:
+                if x.name == PoolName.MAMBA and x.host_indices is None and x.device_indices is not None:
+                    if int(pool.available_size()) < len(x.device_indices):
+                        comp_xfers.pop(ct, None)
+                        self._pfund_note_kv_only(node)
+                    return
 
     def _weg2_mamba_pool(self):
         cc = self.cache_controller
