@@ -180,6 +180,18 @@ def build_dual_stage_model(runner, spec: Optional[DualShareSpec] = None):
         with transient_load_scope("dual-share-shared-part") as transient:
             parts[local] = _load_lane_part(runner, plan, local, gpu_id=runner.gpu_id)
             _bind_shared_part(runner, parts[local], bind, transient=transient)
+        if transient:
+            # gmps11: the dead copies go back to the driver NOW, before the
+            # stage's other parts load (they met 'card free 3.46 GiB' and TMS
+            # cu_mem_create OOM otherwise); a survivor the bind and the re-home
+            # missed is a stop right here, not an OOM three parts later
+            from sglang.srt.managers.weg2_memory_saver import (
+                assert_no_untagged_live,
+                release_load_pools_midregion,
+            )
+
+            runner.dual_share_released_gib = release_load_pools_midregion("dual-share-shared-part-bound")
+            assert_no_untagged_live(tolerance_mib=untagged_tolerance_mib())
     for r in range(plan.fast_size):
         if parts[r] is None:
             parts[r] = _load_lane_part(runner, plan, r, gpu_id=runner.gpu_id)

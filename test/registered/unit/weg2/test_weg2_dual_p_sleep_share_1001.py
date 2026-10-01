@@ -433,3 +433,83 @@ def test_the_no_backup_check_mutant_turns_the_backup_test_red(monkeypatch):
     monkeypatch.setattr(H, "assert_dual_p_sleep_tracked", m)
     with pytest.raises((AssertionError, pytest.fail.Exception)):
         test_without_the_weights_cpu_backup_a_sleeping_p_is_a_named_stop(monkeypatch)
+
+
+# -- gmps11: the shared part's dead copies go back BEFORE the other parts load ---------------
+
+
+def _fake_routing(monkeypatch, primary=True, tag=True):
+    import torch.cuda.memory as tcm
+
+    events = []
+    monkeypatch.setattr(tcm, "_cuda_endAllocateToPool", lambda d, p: events.append(("end", p)), raising=False)
+    monkeypatch.setattr(tcm, "_cuda_beginAllocateCurrentThreadToPool", lambda d, p: events.append(("begin", p)),
+                        raising=False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    pools = ([types.SimpleNamespace(id="prim")] if primary else []) + ([types.SimpleNamespace(id="tag")] if tag else [])
+    monkeypatch.setattr(S, "_active_routing_pools", lambda: list(pools))
+    region = types.SimpleNamespace(on=True)
+    cdll = types.SimpleNamespace(tms_set_interesting_region=lambda v: events.append(("region", v)))
+    monkeypatch.setattr(S, "_tms_cdll_in_region", lambda: cdll)
+    monkeypatch.setattr(S, "_STEPPED_OUT_POOLS", [])
+    monkeypatch.setattr(S, "_TRANSIENT_ONLY", [])
+    monkeypatch.setattr(S, "_LAST_KEPT_LIVE_MIB", {})
+    monkeypatch.setattr(S, "_KEPT_TRANSIENT_POOLS", [])
+    return events
+
+
+def test_the_mid_region_release_ends_all_routing_deletes_and_reenters_in_order(monkeypatch):
+    events = _fake_routing(monkeypatch)
+    deleted = []
+
+    def fake_release(kind, reason, routing_ended=False):
+        assert routing_ended, "the deletion runs with the routing ENDED"
+        assert [e for e in events if e[0] == "end"] == [("end", "tag"), ("end", "prim")]
+        assert ("region", False) in events
+        deleted.append(kind)
+        return 7.71 if kind == "load" else 0.0
+
+    monkeypatch.setattr(S, "_release_one_load_pool", fake_release)
+    assert S.release_load_pools_midregion("dual-share-shared-part-bound") == pytest.approx(7.71)
+    assert deleted == ["ckpt", "load"]
+    assert events[-3:] == [("region", True), ("begin", "prim"), ("begin", "tag")], events
+
+
+def test_the_mid_region_release_refuses_inside_a_stepped_out_block(monkeypatch):
+    _fake_routing(monkeypatch)
+    monkeypatch.setattr(S, "_STEPPED_OUT_POOLS", [object()])
+    assert S.release_load_pools_midregion("x") == 0.0
+
+
+def test_the_release_guard_is_bypassed_only_with_the_routing_ended(monkeypatch):
+    pool = types.SimpleNamespace(id=1)
+    monkeypatch.setattr(S, "_LOAD_TRANSIENT_POOL", pool)
+    monkeypatch.setattr(S, "_ACTIVE_TAG_POOL", object())          # a tag pool is open
+    monkeypatch.setattr(S, "_STEPPED_OUT_POOLS", [])
+    monkeypatch.setattr(S, "_tms_cdll_in_region", lambda: object())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert S._release_one_load_pool("load", "x") == 0.0 and S._LOAD_TRANSIENT_POOL is pool  # refused
+    monkeypatch.setattr(S, "_pool_has_live_blocks", lambda p, r: True)
+    monkeypatch.setattr(S, "_pool_live_mib", lambda p: 2.0)
+    monkeypatch.setattr(S, "_LAST_KEPT_LIVE_MIB", {"load": 1.0})
+    monkeypatch.setattr(S, "_KEPT_TRANSIENT_POOLS", [])
+    assert S._release_one_load_pool("load", "x", routing_ended=True) == 0.0
+    assert S._LAST_KEPT_LIVE_MIB == {"load": 3.0}, "kept live bytes accumulate over the releases of one load"
+
+
+def test_the_shared_part_is_released_and_checked_before_the_other_parts_load():
+    src = inspect.getsource(H.build_dual_stage_model)
+    i = src.index('_bind_shared_part(runner, parts[local], bind, transient=transient)')
+    j = src.index('release_load_pools_midregion("dual-share-shared-part-bound")')
+    k = src.index('assert_no_untagged_live(tolerance_mib=untagged_tolerance_mib())')
+    loop = src.index('for r in range(plan.fast_size):')
+    assert i < j < k < loop, "release + riegel sit between the bind and the loads of the other parts"
+
+
+def test_the_no_mid_region_release_mutant_turns_the_order_test_red(monkeypatch):
+    src = inspect.getsource(H.build_dual_stage_model)
+    mut = src.replace('release_load_pools_midregion("dual-share-shared-part-bound")', "0.0")
+    monkeypatch.setattr(inspect, "getsource", lambda obj: mut if obj is H.build_dual_stage_model else src)
+    with pytest.raises((AssertionError, ValueError)):
+        test_the_shared_part_is_released_and_checked_before_the_other_parts_load()

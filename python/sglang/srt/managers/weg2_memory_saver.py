@@ -3862,7 +3862,7 @@ def release_load_transient_pool(reason: str = "") -> float:
     return freed + _release_one_load_pool("load", reason)
 
 
-def _release_one_load_pool(kind: str, reason: str) -> float:
+def _release_one_load_pool(kind: str, reason: str, routing_ended: bool = False) -> float:
     global _LOAD_TRANSIENT_POOL, _LOAD_CKPT_POOL
     pool = _LOAD_CKPT_POOL if kind == "ckpt" else _LOAD_TRANSIENT_POOL
     if pool is None:
@@ -3870,9 +3870,8 @@ def _release_one_load_pool(kind: str, reason: str) -> float:
     import torch
 
     if (
-        _ACTIVE_TAG_POOL is not None
+        (not routing_ended and (_ACTIVE_TAG_POOL is not None or _tms_cdll_in_region() is not None))
         or _STEPPED_OUT_POOLS
-        or _tms_cdll_in_region() is not None
         or torch.cuda.is_current_stream_capturing()
     ):
         logger.warning(
@@ -3887,9 +3886,11 @@ def _release_one_load_pool(kind: str, reason: str) -> float:
         _LOAD_TRANSIENT_POOL = None
     if _pool_has_live_blocks(pool, f"{reason or '?'} pool={kind}"):
         _KEPT_TRANSIENT_POOLS.append(pool)
-        _LAST_KEPT_LIVE_MIB[kind] = _pool_live_mib(pool)
+        # cumulative over the releases of one load (a mid-region release and the
+        # after-load one): a kept pool stays kept, its live bytes never vanish
+        # from the riegel because a later, clean pool was released
+        _LAST_KEPT_LIVE_MIB[kind] = _LAST_KEPT_LIVE_MIB.get(kind, 0.0) + _pool_live_mib(pool)
         return 0.0
-    _LAST_KEPT_LIVE_MIB.pop(kind, None)
     before = torch.cuda.memory_reserved()
     del pool
     torch.cuda.empty_cache()
@@ -3928,6 +3929,70 @@ def _pool_live_mib(pool: Any) -> float:
         ) / 2**20
     except Exception:  # noqa: BLE001 -- unknown: a riegel reads it as live
         return float("inf")
+
+
+def _active_routing_pools() -> List[Any]:
+    """The private pools the current thread allocates into, outermost first:
+    torch_memory_saver's primary pool while its region is open, then the active
+    weights tag pool."""
+    pools: List[Any] = []
+    try:
+        import torch_memory_saver as _tms  # noqa: WPS433
+
+        impl = _tms.torch_memory_saver._impl
+        if impl is not None and impl._binary_wrapper.cdll.tms_get_interesting_region():
+            prim = getattr(impl, "_primary_mem_pool", None)
+            if prim is not None:
+                pools.append(prim)
+    except Exception:  # noqa: BLE001 -- no saver: no primary routing
+        pass
+    if _ACTIVE_TAG_POOL is not None:
+        pools.append(_ACTIVE_TAG_POOL)
+    return pools
+
+
+def release_load_pools_midregion(reason: str) -> float:
+    """Hand the load pools back to the driver INSIDE the weights region.
+
+    gmps11 (dkr27bnvfp4dual1mpsleepbar1fs10012335, PP0 23:38:30): the dual shared
+    part's 7.71 GiB of dead copies (bound to D's arena, left in the load pool by
+    the transient scope) stayed reserved until the AFTER-load release, so the
+    next part of the stage met 'card free 3.46 GiB' and TMS cu_mem_create failed
+    (out of memory) -- reported first by the BAR1 abort poll as W113 'unknown
+    parameter type'. A pool can only be deleted while no pool routing is active
+    on the thread (the destructor asserts it), so this ENDS the routing for the
+    deletion -- torch_memory_saver's primary pool and the active tag pool, with
+    the saver's tracking off -- and re-enters both, in order, afterwards.
+    Refused (0.0) inside a stepped-out block, where a caller still routes to a
+    pool of its own."""
+    if _STEPPED_OUT_POOLS or _TRANSIENT_ONLY:
+        logger.warning("WEG2-TAG-POOL mid-region release REFUSED reason=%s -- inside a stepped-out block",
+                       reason or "?")
+        return 0.0
+    import torch
+    from torch.cuda.memory import (
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+    )
+
+    routed = _active_routing_pools()
+    cdll = _tms_cdll_in_region()
+    device_index = torch.cuda.current_device()
+    for p in reversed(routed):
+        _cuda_endAllocateToPool(device_index, p.id)
+    if cdll is not None:
+        cdll.tms_set_interesting_region(False)
+    try:
+        freed = (_release_one_load_pool("ckpt", reason, routing_ended=True)
+                 + _release_one_load_pool("load", reason, routing_ended=True))
+    finally:
+        if cdll is not None:
+            cdll.tms_set_interesting_region(True)
+        for p in routed:
+            _cuda_beginAllocateCurrentThreadToPool(device_index, p.id)
+    logger.info("WEG2-TAG-POOL mid-region release reason=%s freed_gib=%.2f (routing of %d pool(s) ended for "
+                "the deletion and re-entered)", reason or "?", freed, len(routed))
+    return freed
 
 
 class Weg2DualPUntagged(RuntimeError):
