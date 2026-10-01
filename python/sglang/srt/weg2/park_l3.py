@@ -332,10 +332,19 @@ def chain_of(tree, req) -> list:
     return [k for part in reversed(parts) for k in part]
 
 
+#: PARK-TIMING (01.10., z30y13): the last :func:`mark_parked` call's split on
+#: this rank -- ``chain_ms`` (the tree walk of every span), ``write_ms`` (the
+#: mark files), ``keys`` (page keys written). Read by park_running's
+#: ``WEG2-D-PARK TIMING`` line; zeros where this rank writes nothing (tp_rank
+#: != 0, switch off). Instrument only: nothing branches on it.
+LAST_MARK_STATS = {"chain_ms": 0.0, "write_ms": 0.0, "keys": 0}
+
+
 def mark_parked(sched, reqs) -> int:
     """The flip park (``park_running``, after the retraction's insert): keep
     every parked request's span by ORDER until D takes it again. Written by
     the attention rank 0 (one writer; every rank would write the same)."""
+    LAST_MARK_STATS.update(chain_ms=0.0, write_ms=0.0, keys=0)
     if not enabled() or not _group_d():
         return 0
     if int(getattr(sched, "tp_rank", 0) or 0) != 0:
@@ -345,10 +354,13 @@ def mark_parked(sched, reqs) -> int:
     tree = getattr(sched, "tree_cache", None)
     page = int(getattr(tree, "page_size", 1) or 1)
     n = 0
+    chain_s = write_s = 0.0
+    keys = 0
     for req in reqs or ():
         rid = str(getattr(req, "rid", "") or "")
         if not rid:
             continue
+        t0 = time.monotonic()
         try:
             chain = chain_of(tree, req) if tree is not None else []
         except Exception:  # noqa: BLE001 - an unreadable span keeps nothing (named)
@@ -358,8 +370,15 @@ def mark_parked(sched, reqs) -> int:
             from sglang.srt.weg2.handoff_keys import CHAIN_ATTR
 
             chain = list(getattr(req, CHAIN_ATTR, None) or [])
-        if _hp.mark_park(rid, chain, page):
+        t1 = time.monotonic()
+        marked = _hp.mark_park(rid, chain, page)
+        t2 = time.monotonic()
+        chain_s += t1 - t0
+        write_s += t2 - t1
+        if marked:
             n += 1
+            keys += len(chain)
             logger.info("#248 PARK-MARK rid=%s pages=%d (kept by order, no reference over the flip)",
                         rid[:12], len(chain))
+    LAST_MARK_STATS.update(chain_ms=chain_s * 1e3, write_ms=write_s * 1e3, keys=keys)
     return n

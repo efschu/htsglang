@@ -92,6 +92,68 @@ def rearm_window_draft_cold(sched, reqs) -> int:
     return n
 
 
+def _park_clock() -> float:
+    """PARK-TIMING's clock (monotonic; one indirection so a test can drive it)."""
+    return time.monotonic()
+
+
+def _host_free_slots(sched) -> Optional[int]:
+    """Free slots of the host KV pool behind D's tree (None = no host tier or
+    unreadable). PARK-TIMING reads it around the retraction: the slots the
+    forced write-through took there."""
+    try:
+        pool = sched.tree_cache.cache_controller.mem_pool_host
+        return int(pool.available_size())
+    except Exception:  # noqa: BLE001 - an instrument never breaks the park
+        return None
+
+
+def _host_bytes_per_slot(sched) -> int:
+    try:
+        return int(sched.tree_cache.cache_controller.mem_pool_host.size_per_token)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _log_park_timing(sched, epoch: int, laps: dict, *, total_s: float, coll_s: float,
+                     running, retracted, resumable, host_before, host_after) -> None:
+    """PARK-TIMING (01.10., z30y11-13: the park RPC 0.57-1.84 s ahead of every
+    D->P flip, equal on all ranks): ONE line per park per rank, the same
+    fields on every rank. ``coll_ms`` is the #59b tp-min reduce -- on a rank
+    other than TP0 it is mostly the wait for TP0's #248 mark chain (TP0 alone
+    writes the marks), so ``mark_ms`` on TP0 and ``coll_ms`` on TP1/TP2 read
+    together. ``rest_ms`` = the list building between the steps and the tail
+    (read clamp, the park line). Instrument only: nothing branches on it."""
+    from sglang.srt.weg2 import park_l3
+
+    ms = {k: v * 1e3 for k, v in laps.items()}
+    probe_ms = max(0.0, ms.get("depth", 0.0) - coll_s * 1e3)
+    rest_ms = ms.get("order", 0.0) + ms.get("tail", 0.0)
+    page = int(getattr(sched, "page_size", 1) or 1)
+    seq = sum(len(getattr(r, "origin_input_ids", None) or ()) + len(getattr(r, "output_ids", None) or ())
+              for r in running)
+    res_tokens = sum(int(v) for v in (resumable or {}).values())
+    mark = park_l3.LAST_MARK_STATS
+    if host_before is not None and host_after is not None:
+        wt_slots = host_before - host_after
+        wt_host, wt_bytes = str(wt_slots), str(wt_slots * _host_bytes_per_slot(sched))
+    else:
+        wt_host = wt_bytes = "na"
+    ps = getattr(sched, "ps", None)
+    rank = int(getattr(ps, "tp_rank", getattr(sched, "tp_rank", 0)) or 0)
+    logger.info(
+        "WEG2-D-PARK TIMING epoch=%d rank=%d total_ms=%.1f land_ms=%.1f draft_ms=%.1f "
+        "retract_ms=%.1f note_ms=%.1f mark_ms=%.1f mark_chain_ms=%.1f mark_write_ms=%.1f "
+        "mark_keys=%d probe_ms=%.1f coll_ms=%.1f rest_ms=%.1f running=%d retracted=%d "
+        "seq_tokens=%d resumable_tokens=%d pages=%d page_size=%d wt_host_slots=%s wt_bytes=%s",
+        epoch, rank, total_s * 1e3, ms.get("land", 0.0), ms.get("draft", 0.0),
+        ms.get("retract", 0.0), ms.get("note", 0.0), ms.get("mark", 0.0),
+        float(mark.get("chain_ms", 0.0)), float(mark.get("write_ms", 0.0)), int(mark.get("keys", 0)),
+        probe_ms, coll_s * 1e3, rest_ms, len(running), len(retracted),
+        seq, res_tokens, res_tokens // max(1, page), page, wt_host, wt_bytes,
+    )
+
+
 def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     """Retract every running D request RETAINING its span (KV, the node's
     GDN/Mamba anchor, the draft rows) with a forced host write-through -- the
@@ -132,6 +194,16 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
             success=False, parked=[], epoch=epoch,
             message="W-PARK refused: anchor tails present (a P-group structure) -- nothing parked",
         )
+    # PARK-TIMING: contiguous laps from here to the park line (_log_park_timing)
+    laps: dict = {}
+    t_start = t_lap = _park_clock()
+
+    def _lap(name: str) -> None:
+        nonlocal t_lap
+        t = _park_clock()
+        laps[name] = laps.get(name, 0.0) + (t - t_lap)
+        t_lap = t
+
     if sched.enable_overlap and sched.last_batch and sched.result_queue:
         tmp_batch, tmp_result = sched.result_queue.popleft()
         sched.process_batch_result(tmp_batch, tmp_result)
@@ -148,6 +220,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     if not sched.running_batch.is_empty():
         sched.running_batch.filter_batch()
         running = list(sched.running_batch.reqs)
+    _lap("land")
     for req in running:
         setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
         # PARK-RETAIN READ: the retraction's insert stamps what it retains;
@@ -162,10 +235,14 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     # F4 (#259 4c): the END state of each running request as a park tail part,
     # gathered before the retraction hands its slots to the tree.
     _park_end(sched, running)
+    _lap("draft")
+    host_before = _host_free_slots(sched)
     retracted = (
         sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
         if running else []
     )
+    host_after = _host_free_slots(sched)
+    _lap("retract")
     sched.running_batch.batch_is_full = False
     sched.chunked_req = None
     now = time.monotonic()
@@ -186,6 +263,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         # retraction just retained (the KV above the mamba track was freed).
         if d_park_read.stamp_parked(req) is not None:
             logger.info("WEG2-D-PARK RETAINED rid=%s %s", str(req.rid)[:12], d_park_read.describe(req))
+    _lap("note")
     queued = list(sched.waiting_queue)
     sched.waiting_queue = []
     # PARK-SETTLE (28.09., 27B park boot 27.09. 10:24:34, rid weg2-58-201): a
@@ -209,12 +287,14 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + settle + queued)
     # #248: every parked request is kept by ORDER over the flip -- the
     # sleep's reset gives its references back, the hold reads it at the wake
+    _lap("order")
     try:
         from sglang.srt.weg2 import park_l3
 
         park_l3.mark_parked(sched, sched.weg2_d_parked)
     except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
         logger.warning("#248 PARK-MARK failed", exc_info=True)
+    _lap("mark")
     # H91c2: park_tick's awake requeue is the net for a sleep that never comes
     # after THIS park, so its clock starts now for every request the park
     # holds. A request decode pressure parked earlier kept its older stamp and
@@ -233,11 +313,24 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     held = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is None]
     # #59b: the depth each parked request resumes from, after the retraction
     # above retained its span (every rank parks the same list).
+    _lap("order")
+    coll_s = [0.0]
+
+    def _timed_tp_min(values):
+        # the default reduce (weg2_resumable_depth._tp_min), timed: PARK-TIMING coll_ms
+        c0 = _park_clock()
+        try:
+            return weg2_resumable_depth._tp_min(values)
+        finally:
+            coll_s[0] += _park_clock() - c0
+
     resumable = weg2_resumable_depth.park_depths(
         getattr(sched, "tree_cache", None),
         [r for r in sched.weg2_d_parked if d_seats.park_site(r) is not None],
         getattr(sched, "ps", None),
+        reduce_min=_timed_tp_min,
     )
+    _lap("depth")
     # PARK-READ = RESUMABLE: the read of a request this park retracted ends at
     # the depth it resumes from, not at the tombstoned KV above the anchor
     # (d_park_read.clamp_to_resumable). Group-uniform: #59b's depths are.
@@ -258,6 +351,11 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         [str(r.rid)[:12] for r in settle], late_hold,
         (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed
          if rearmed else ""),
+    )
+    _lap("tail")
+    _log_park_timing(
+        sched, epoch, laps, total_s=t_lap - t_start, coll_s=coll_s[0], running=running,
+        retracted=retracted, resumable=resumable, host_before=host_before, host_after=host_after,
     )
     return Weg2ParkRunningReqOutput(
         success=True, parked=rids, held=held, epoch=epoch, late_hold=late_hold,
