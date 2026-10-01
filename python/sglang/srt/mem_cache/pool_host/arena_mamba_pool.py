@@ -152,6 +152,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 return False
             self.bind(arena, int(blob.total_bytes), parts)
             self._backend = storage_backend
+            _reg = getattr(storage_backend, "register_keep_pool", None)
+            if callable(_reg):  # EVICT-KEEP: the clock evict passes over the parked anchors
+                _reg(arena, self)
             return True
         except Exception as exc:  # noqa: BLE001 - loud, never silent
             logger.error("#1427 mamba arena host pool bind failed: %r", exc)

@@ -3281,13 +3281,46 @@ class HiCacheFile(HiCacheStorage):
                         filled / max(1e-6, ms / 1000.0))
         return out
 
+    def register_keep_pool(self, arena, pool) -> None:
+        """EVICT-KEEP: the host pool bound to ``arena`` -- its #243/#248 keep
+        (``handoff_pending.keep_for``) is what :meth:`_arena_evict_to_disk`
+        passes over, as the claim path (``_evict_for_claim``) always did."""
+        pools = self.__dict__.setdefault("_weg2_keep_pools", {})
+        pools[id(arena)] = pool
+
+    def _arena_evict_keep_lo(self, arena):
+        pool = (self.__dict__.get("_weg2_keep_pools") or {}).get(id(arena))
+        if pool is None:
+            return None
+        try:
+            from sglang.srt.weg2 import handoff_pending as _hp
+
+            keep = _hp.keep_for(pool)
+            return keep.keys if len(keep) else None
+        except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+            logger.warning("EVICT-KEEP keep list unavailable", exc_info=True)
+            return None
+
     def _arena_evict_to_disk(self, arena, want: int) -> int:
         """Move up to `want` complete, unreferenced, unpinned pages from the
-        arena to the disk store (the cold tier), then free their slots."""
+        arena to the disk store (the cold tier), then free their slots.
+
+        EVICT-KEEP (z30y12 23:35:32, P PP0 ``ARENA-EVICT n=11 want=256``): the
+        callers floor ``want`` at 256 slots, and the MAMBA arena has 112 -- one
+        round emptied it (``ARENA-REF-CENSUS arena-78446592.bin slots=112
+        complete=0`` 3 s later, D's ``park_kept=6/12`` -> ``0/12``). The six
+        D-parked requests woke with KV but no anchor (``#904 match-census
+        refusers=MambaComponent``), the X gate priced them whole (W31) and
+        381k tokens went back to P. So: at most an eighth of the arena per
+        round, and the #243/#248 kept pages (hand-offs, D parks) are passed
+        over like on the claim path."""
+        slots = int(getattr(arena, "slots", 0) or 0)
+        if slots > 0:
+            want = min(int(want), max(1, slots // 8))
         _en = getattr(type(self), "_evict_log_n", 0) + 1
         type(self)._evict_log_n = _en
         if _en <= 16 or _en % 64 == 0:
-            logger.info("ARENA-EVICT n=%d want=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want))
+            logger.info("ARENA-EVICT n=%d want=%d slots=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want), slots)
         pins = getattr(self, "pins", None)
         keep = []
         if pins is not None:
@@ -3295,7 +3328,7 @@ class HiCacheFile(HiCacheStorage):
                 keep = list(getattr(pins, "pinned_stems", lambda: [])())
             except Exception:  # noqa: BLE001
                 keep = []
-        cands = arena.evict_candidates(want, keep_stems=keep)
+        cands = arena.evict_candidates(want, keep_stems=keep, keep_lo=self._arena_evict_keep_lo(arena))
         if not cands:
             return 0
         moved = self.arena_secure_to_disk(arena, cands)["written"]

@@ -1148,6 +1148,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 owner_rows = storage_backend._kv_owner_rows
             self.bind(arena, window, role=role, owner_rows=owner_rows)
             self._backend = storage_backend
+            _reg = getattr(storage_backend, "register_keep_pool", None)
+            if callable(_reg):  # EVICT-KEEP: the clock evict passes over this pool's keep
+                _reg(arena, self)
             return True
         except Exception as exc:  # noqa: BLE001 - loud, never silent
             logger.error("#1424 arena host pool bind failed (role=%s): %r", role, exc)
