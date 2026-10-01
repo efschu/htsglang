@@ -4227,6 +4227,7 @@ class SchedulerWeightUpdaterManager:
         failure: str = "",
         per_tag: Optional[Dict[str, List[float]]] = None,
         leg_ms: float = 0.0,
+        l15_held: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """:meth:`_weg2_group_fence_impl`, plus the marker that stops re-entry.
 
@@ -4240,7 +4241,8 @@ class SchedulerWeightUpdaterManager:
         self.weg2_fence_raised = False
         try:
             return self._weg2_group_fence_impl(
-                what, ok=ok, failure=failure, per_tag=per_tag, leg_ms=leg_ms
+                what, ok=ok, failure=failure, per_tag=per_tag, leg_ms=leg_ms,
+                l15_held=l15_held,
             )
         except BaseException:
             self.weg2_fence_raised = True
@@ -4254,6 +4256,7 @@ class SchedulerWeightUpdaterManager:
         failure: str = "",
         per_tag: Optional[Dict[str, List[float]]] = None,
         leg_ms: float = 0.0,
+        l15_held: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """Every rank of the group joins here before the owner rank answers.
 
@@ -4385,6 +4388,12 @@ class SchedulerWeightUpdaterManager:
             "waves_published": wx.waves_digest(wx.published_waves() or ()),
             "waves_planned": wx.waves_digest(wx.planned_waves() or ()),
         }
+        # L15-13c part 2: the same gather carries this rank's held kv_cache
+        # bytes (the L1.5 keep-spans, {card uuid: MiB}).  The key is ADDED
+        # ONLY when the caller read one (master on, keep present), so with
+        # the master off the gathered payload is byte-identical to before.
+        if l15_held is not None:
+            mine["l15_held"] = dict(l15_held)
         gathered: List[Optional[Dict[str, Any]]] = [None] * world
         torch.distributed.all_gather_object(gathered, mine, group=cpu_group)
         votes = [v for v in gathered if isinstance(v, dict)]
@@ -4436,7 +4445,18 @@ class SchedulerWeightUpdaterManager:
             )
         )
         lost = sorted({int(d) for v in votes for d in (v.get("anchors_lost") or ())})
-        return {"per_tag": merged, "critical_path": critical, "anchors_lost": lost}
+        # L15-13c part 2: per-card union of the ranks' held kv_cache bytes;
+        # ranks co-located on one card sum to that card's held total.  No
+        # rank carried one (master off): the key is absent -> None downstream.
+        held: Dict[str, int] = {}
+        for v in votes:
+            for _uuid, _mib in (v.get("l15_held") or {}).items():
+                try:
+                    held[str(_uuid)] = held.get(str(_uuid), 0) + int(_mib)
+                except (TypeError, ValueError):
+                    continue
+        return {"per_tag": merged, "critical_path": critical, "anchors_lost": lost,
+                "l15_held_mib": held or None}
 
     def _weg2_anchors_lost_for(self, what: str) -> List[int]:
         return _weg2_anchors_lost_for_leg(self, what)
@@ -9611,6 +9631,28 @@ class SchedulerWeightUpdaterManager:
         self._weg2_join_store_rescan("release")
         store_failure = self.weg2_store_rescan_failure
         self.weg2_store_rescan_failure = ""
+        # L15-13c part 2: the kv_cache bytes THIS rank still keeps MAPPED
+        # after the pause (the L1.5 keep-spans, L15-13a/b), tagged with this
+        # rank's card uuid, so the fence's own gather carries them and the
+        # front can subtract the hold from the dormant-residue record
+        # instead of the next launch charging it twice (planner l15 post).
+        # Master off: nothing is read, the gather payload grows no key --
+        # the leg stays byte-identical.
+        _l15_held: Optional[Dict[str, int]] = None
+        if weg2_memory_saver_on:
+            from sglang.srt.weg2 import l15_plan
+
+            if l15_plan.master_on(os.environ):
+                try:
+                    _mapped = self._weg2_tag_mapped_bytes(GPU_MEMORY_TYPE_KV_CACHE)
+                    if isinstance(_mapped, int) and _mapped > 0:
+                        _uuid = str(torch.cuda.get_device_properties(
+                            torch.cuda.current_device()).uuid)
+                        _l15_held = {_uuid: _mapped >> 20}
+                except Exception as _exc:  # noqa: BLE001 -- no probe, no harm
+                    logger.info("L15-HELD skipped (%s: %s)",
+                                type(_exc).__name__, _exc)
+                    _l15_held = None
         report: Dict[str, Any] = {}
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(
@@ -9619,6 +9661,7 @@ class SchedulerWeightUpdaterManager:
                 failure=store_failure,
                 per_tag=weg2_per_tag,
                 leg_ms=weg2_leg_ms,
+                l15_held=_l15_held,
             )
         if store_failure and not report:
             raise Weg2WakeRefused(store_failure)
@@ -9646,6 +9689,12 @@ class SchedulerWeightUpdaterManager:
             if weg2_memory_saver_on
             else None,
             anchors_lost=(report.get("anchors_lost") or None)
+            if weg2_memory_saver_on
+            else None,
+            # L15-13c part 2: same fallback rule as per_tag -- the gathered
+            # reduction when there was a group, else this rank's own reading;
+            # None when the master is off or nothing stayed mapped.
+            l15_held_mib=(report.get("l15_held_mib") or _l15_held or None)
             if weg2_memory_saver_on
             else None,
         ))
