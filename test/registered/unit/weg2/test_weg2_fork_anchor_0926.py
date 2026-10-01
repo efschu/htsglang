@@ -148,6 +148,9 @@ def group_p(monkeypatch):
     monkeypatch.setenv(_F.FORM_ENV, _F.Weg2Form(
         arch="dense", experts="none", draft="dflash", p_draft="none", kv="paged_dcp",
         flip="family", vision="off", profile="qwen27b", model="m").env_value())
+    # HANDBACK N-1 (fe5c55041b): the 27B row is exact now; this test pins the
+    # UPSTREAM keying its specimens were measured under, explicitly
+    monkeypatch.setenv("SGLANG_WEG2_BIGRAM_ANCHOR_EXACT", "0")
     monkeypatch.setattr(urc, "_WEG2_END_ANCHOR", True)
     return monkeypatch
 

@@ -6713,6 +6713,13 @@ def l3_persist_enabled(env=None) -> bool:
 #: a new directory instead of a MixedGenerationError on a reused one.
 L3_PERSIST_GENERATION = "706"
 L3_IDENTITY_FILE = "L3_IDENTITY.json"
+#: HANDBACK N-1 (01.10.): profiles whose anchor keying switched to the exact
+#: bigram form. Their L3 identity names it, so a store written under the
+#: upstream keying -- whose persisted Mamba anchors at k units carry the state
+#: after k+1 tokens -- becomes a new directory instead of a silently wrong
+#: anchor (the page KV keys themselves are unchanged). NF ran the exact form
+#: already; its identity and directory stay byte for byte.
+L3_ANCHOR_KEYING_PROFILES = {"qwen27b": "exact-n1"}
 #: YaRN x2: how the runtime applies a rope override (hf_transformers.config.
 #: apply_model_override_args, nested sub-config merge). Bump when that changes.
 L3_ROPE_APPLY = "merge-v1"
@@ -6796,6 +6803,9 @@ def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
         "vision": str(vision or ""),
         "generation": L3_PERSIST_GENERATION,
     }
+    _keying = L3_ANCHOR_KEYING_PROFILES.get(str(profile or ""))
+    if _keying:
+        ident["anchor_keying"] = _keying
     # YaRN x2 (28.09.): the rope the pages were rotated with, by name -- the
     # override's rope/position part (rope_scaling, rope_parameters,
     # max_position_embeddings; top level and text_config), canonical, and the
