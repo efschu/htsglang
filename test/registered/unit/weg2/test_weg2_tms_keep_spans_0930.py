@@ -292,3 +292,70 @@ def test_paused_without_keep_reads_zero(lib):
     assert _mapped(lib, p) == 0
     assert lib.tms_tag_mapped_bytes(b"l15kf") == 0
     assert _resume(lib, "l15kf") == 0
+
+
+def _info(lib, p):
+    size = ctypes.c_uint64()
+    mapped = ctypes.c_uint64()
+    planned = ctypes.c_uint64()
+    active = ctypes.c_int()
+    rc = lib.tms_alloc_info(ctypes.c_void_p(p), ctypes.byref(size), ctypes.byref(mapped),
+                            ctypes.byref(planned), ctypes.byref(active))
+    assert rc == 0
+    return (int(size.value), int(mapped.value), int(planned.value), int(active.value))
+
+
+def test_keep_span_accounting_consistent_over_a_cycle(lib):
+    """L15-D4: end-to-end accounting over ONE full cycle -- active, paused
+    with a keep span, resumed, paused again with the keep cleared.  At every
+    point the three readers of "physical bytes mapped NOW" agree:
+    tms_tag_mapped_bytes == alloc_info's mapped == the mock driver's mapped
+    bytes of THIS allocation (a difference against the global mock counter,
+    the mock is module-wide).  While paused, tms_tag_bytes keeps the H95c
+    seat semantics and equals alloc_info's planned."""
+    g0 = lib.mock_mapped_bytes()                    # mapped bytes NOT from my allocation
+    p = _lattice(lib, "l15kg")
+    tag = b"l15kg"
+    plan = 12 * MIB                                 # spans [0,4) [4,6) [6,8) [10,14) MiB
+    keep = 6 * MIB                                  # extents 0-1 survive the pause
+
+    def snap():
+        size, mapped, planned, active = _info(lib, p)
+        return (size, mapped, planned, active,
+                lib.tms_tag_bytes(tag), lib.tms_tag_mapped_bytes(tag),
+                lib.mock_mapped_bytes() - g0)
+
+    # (1) active before the pause: the whole plan mapped, all readers agree.
+    size, mapped, planned, active, tag_bytes, tag_mapped, mock_mapped = snap()
+    assert size == 16 * MIB and mapped == plan and planned == plan and active == 1
+    assert tag_bytes == tag_mapped == mock_mapped == plan
+
+    # (2) paused with the keep span: the kept 6 MiB stay mapped and are
+    # counted by every reader; the seat budget still answers the full plan.
+    assert _set_keep(lib, p, [(0, keep)]) == 0
+    assert _pause_unmaps(lib, "l15kg") == 2         # extents 2-3 only
+    size, mapped, planned, active, tag_bytes, tag_mapped, mock_mapped = snap()
+    assert size == 16 * MIB and active == 0
+    assert mapped == tag_mapped == mock_mapped == keep
+    assert planned == plan and tag_bytes == planned  # H95c semantics while paused
+    kept_handles = _handles(lib, p)[:2]              # extents 0-1 are the kept ones
+    assert all(v > 0 for v in kept_handles)
+
+    # (3) resume: the plan is mapped again in full (16 MiB is the allocation
+    # size; the span plan maps 12 MiB of it) and the kept extents carry
+    # their ORIGINAL handles -- the gaps came back with fresh ones.
+    assert _resume(lib, "l15kg") == 0
+    size, mapped, planned, active, tag_bytes, tag_mapped, mock_mapped = snap()
+    assert size == 16 * MIB and active == 1
+    assert mapped == tag_mapped == mock_mapped == plan
+    assert tag_bytes == plan
+    assert _handles(lib, p)[:2] == kept_handles     # kept handles survived
+
+    # (4) keep cleared, paused again: the patch-5 walk -- nothing stays
+    # mapped, yet the seat budget still names the resume plan.
+    assert _set_keep(lib, p, []) == 0
+    assert _pause_unmaps(lib, "l15kg") == 4         # all four extents go
+    size, mapped, planned, active, tag_bytes, tag_mapped, mock_mapped = snap()
+    assert size == 16 * MIB and active == 0
+    assert mapped == tag_mapped == mock_mapped == 0
+    assert planned == plan and tag_bytes == planned
