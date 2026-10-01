@@ -422,6 +422,7 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
       <div class="vp"><h3><span>Decode-Durchsatz <span class="muted">tok/s &middot; alle Streams und je Stream</span></span><span id="vl-s-dec"></span></h3><div class="u" id="vl-c-dec"></div></div>
       <div class="vp"><h3><span>Input-Tokens: aus Cache / neu gerechnet <span class="muted">tok/s, gestapelt &middot; Übergabe P&rarr;D gestrichelt, nie Cache</span></span><span id="vl-s-cache"></span></h3><div class="u" id="vl-c-cache"></div></div>
       <div class="vp"><h3><span>KV-Cache-Belegung <span class="muted">% der KV-Token je Gruppe</span></span><span id="vl-s-kv"></span></h3><div class="u" id="vl-c-kv"></div></div>
+      <div class="vp w2"><h3><span>PCIe RX / TX je Karte <span class="muted">GB/s &middot; RX durchgezogen, TX gestrichelt &middot; NVML im 1-s-Takt, aus VictoriaMetrics</span></span><span id="hw-s-pcie"></span></h3><div class="u" id="hw-c-pcie"></div></div>
       <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; P&rarr;D: P-Ende &rarr; erstes Decode-Token &middot; D&rarr;P: Decode-Ende &rarr; P-Prefill-Start (flip_user_time, ab Build y4z)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
     </div>
     <div class="vl-grafana" id="vl-grafana"></div>
@@ -442,6 +443,7 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
       <div class="vp w2"><h3><span>Leistungsaufnahme (Power draw) <span class="muted">W &middot; Summe aller Karten, darunter je Karte</span></span><span id="hw-s-power"></span></h3><div class="u" id="hw-c-power"></div></div>
       <div class="vp"><h3><span>GPU-Temperatur <span class="muted">&deg;C &middot; Kern (Hotspot per NVML nicht lesbar)</span></span><span id="hw-s-temp"></span></h3><div class="u" id="hw-c-temp"></div></div>
       <div class="vp"><h3><span>SM-Takt <span class="muted">MHz</span></span><span id="hw-s-clock"></span></h3><div class="u" id="hw-c-clock"></div></div>
+      <div class="vp x"><h3><span>Speichertakt <span class="muted">MHz &middot; NVML CLOCK_MEM</span></span><span id="hw-s-memclk"></span></h3><div class="u" id="hw-c-memclk"></div></div>
       <div class="vp w2"><h3><span>Host: CPU &amp; Speicher <span class="muted">%</span></span><span id="hw-s-host"></span></h3><div class="u" id="hw-c-host"></div></div>
     </div>
   </section>
@@ -1155,7 +1157,9 @@ function gpusHtml(d, binders) {
       <div class="name">${esc(c.name.replace("NVIDIA GeForce ", ""))} <span>nvml ${c.index} &middot; ${fmt(c["temperature.gpu"])} &deg;C &middot; ${fmt(c["clocks.sm"])} MHz</span></div>
       <div class="meter">Leistung <b class="num">${fmt(pw)} / ${fmt(pl)} W</b><div class="bar"><b style="width:${pl ? Math.min(100, 100 * pw / pl) : 0}%"></b></div></div>
       <div class="meter">VRAM <b class="num">${fmt(mu / 1024, 1)} / ${fmt(mt / 1024, 1)} GiB</b> &middot; Last ${fmt(c["utilization.gpu"])} %<div class="bar"><b style="width:${mt ? Math.min(100, 100 * mu / mt) : 0}%"></b></div></div>
-      <div class="meter">PCIe &Oslash; 2 s <b class="num">RX ${fmt(rx, 1)} &middot; TX ${fmt(tx, 1)} MB/s</b></div>
+      <div class="meter">PCIe &Oslash; 3 s <b class="num">RX ${fmt(rx, 1)} &middot; TX ${fmt(tx, 1)} MB/s</b>
+        &middot; Speichertakt <b class="num">${fmt(c["clocks.mem"])} MHz</b><span class="x"> / max ${fmt(c["clocks.max.mem"])}</span>
+        <div class="x" style="font-size:11.5px">Link Gen ${fmt(c["pcie.link.gen.current"])}/${fmt(c["pcie.link.gen.max"])} &middot; x${fmt(c["pcie.link.width.current"])}/x${fmt(c["pcie.link.width.max"])} <span class="muted">(aktuell/max, NVML; im Leerlauf schaltet der Link herunter)</span></div></div>
     </div>`;
   }).join("");
 }

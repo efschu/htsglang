@@ -95,3 +95,28 @@ def test_ttft_series_mean_per_bucket_and_gap():
     out = vmpush.ttft_series(Fake(), "NF", [100, 105, 110, 115, 120], 5)
     assert out["mean_ms"] == [4000.0, None, None, 3000.0, None]     # bucket [t, t+5) read at t+5
     assert out["n"][0] == 3.0 and out["n"][1] is None
+
+
+def test_pcie_series_gb_per_bucket_and_pcie_points_from_samples(monkeypatch):
+    class Fake:
+        def query_range_by(self, q, start, end, step, label):
+            assert "weg2_gpu_pcie_bytes_per_second" in q and start == 15 and step == 5
+            return {"0": {15: 1.5, 20: 0.25}, "2": {20: 3.0}}
+    out = vmpush.pcie_series(Fake(), [10, 15], 5)
+    assert out["series"]["g0.rx"] == [1.5, 0.25] and out["series"]["g2.tx"] == [None, 3.0]
+
+    class Ipc:
+        lock = threading.Lock()
+        _st, _ev = {}, {}
+
+    class Boots:
+        ipc = Ipc()
+        lock = threading.Lock()
+        rank = {}
+    br = vmpush.Bridge(Boots(), "http://127.0.0.1:1")
+    br.pcie_source = lambda: [(100.0, [(2000.0, 1000.0)])]
+    sent = []
+    monkeypatch.setattr(vmpush, "push", lambda lines, url: sent.extend(lines) or len(sent))
+    br.tick(101.0)
+    assert 'weg2_gpu_pcie_bytes_per_second{dir="rx",gpu="0"} 2000000.0 100000' in sent
+    assert br.pcie_t == 100.0

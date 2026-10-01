@@ -107,6 +107,16 @@ panels = [
     panel("GPU-Last / VRAM belegt", [t("nvidia_smi_utilization_gpu_ratio * 100 " + GPU_NAME, "Last nvml {{index}}"),
                                      t("nvidia_smi_memory_used_bytes / nvidia_smi_memory_total_bytes * 100 " + GPU_NAME, "VRAM nvml {{index}}")],
           "percent", 0, 43, 12, 8),
+    panel("PCIe RX / TX je Karte", [
+        t("max by (gpu) (avg_over_time(weg2_gpu_pcie_bytes_per_second{dir=\"rx\"}[$__interval]))", "RX nvml {{gpu}}"),
+        t("max by (gpu) (avg_over_time(weg2_gpu_pcie_bytes_per_second{dir=\"tx\"}[$__interval]))", "TX nvml {{gpu}}")],
+        "Bps", 0, 60, 12, 8, "nvmlDeviceGetPcieThroughput im 1-s-Takt des rigdash-Probennehmers (KB/s -> B/s)"),
+    panel("Speichertakt und PCIe-Link", [
+        t("nvidia_smi_clocks_current_memory_clock_hz / 1e6 " + GPU_NAME, "Speichertakt nvml {{index}}"),
+        t("nvidia_smi_clocks_max_memory_clock_hz / 1e6 " + GPU_NAME, "max nvml {{index}}"),
+        t("nvidia_smi_pcie_link_gen_current " + GPU_NAME, "Link-Gen nvml {{index}}"),
+        t("nvidia_smi_pcie_link_width_current " + GPU_NAME, "Link-Breite nvml {{index}}")],
+        "short", 12, 60, 12, 8, "nvidia_gpu_exporter (NVML); Takt in MHz, Link aktuell (im Leerlauf heruntergeschaltet)"),
     panel("Proxmox-Host: RAM verfügbar und ZFS-ARC", [
         t("node_memory_MemAvailable_bytes{host=\"proxmox\"}", "MemAvailable"),
         t("node_zfs_arc_size{host=\"proxmox\"}", "ZFS-ARC"),

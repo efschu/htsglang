@@ -186,7 +186,9 @@ class Sources:
         self.samplers: Dict[str, Sampler] = {
             "gpus": Sampler("gpus", cfg.get("gpu_period", 2.0), self.sample_gpus),
             "gpuq": Sampler("gpuq", cfg.get("gpuq_period", 15.0), self.sample_gpuq),
-            "pcie": Sampler("pcie", cfg.get("pcie_period", 0.25), self.sample_pcie),
+            # Nutzer 01.10. ~09:00Z: nvmlDeviceGetPcieThroughput kostet ~20 ms je Aufruf (6 je Takt) -- im Takt des
+            # Probennehmers (1 s), nicht 4x je Sekunde; eigener Faden, verzoegert die anderen Proben nicht
+            "pcie": Sampler("pcie", cfg.get("pcie_period", 1.0), self.sample_pcie),
         }
         if ssh:
             self.samplers["docker"] = Sampler("docker", cfg.get("docker_period", 20.0), self.sample_docker)
@@ -196,7 +198,7 @@ class Sources:
                 (lambda ep=ep: http_json(ep.rstrip("/") + "/weg2/state", 3.0)))
         self.gpu_hist = collections.deque(maxlen=int(15 * 60 / cfg.get("gpu_period", 2.0)) + 5)
         # ~10 s of PCIe samples at the 0.25-s period (the mean uses the last 2 s)
-        self.pcie_hist = collections.deque(maxlen=int(10.0 / cfg.get("pcie_period", 0.25)))
+        self.pcie_hist = collections.deque(maxlen=int(30.0 / cfg.get("pcie_period", 1.0)))
         self._nvml_ready = False
         self._e_prev: Dict[int, tuple] = {}
         self.lock = threading.Lock()
@@ -266,6 +268,9 @@ class Sources:
                 return fn(*a)
             except Exception:
                 return None
+        def rdx(fn_name, *a):          # optional NVML calls (an older pynvml or a test double may lack them)
+            fn = getattr(n, fn_name, None)
+            return rd(fn, *a) if fn is not None else None
         out = []
         for i in range(n.nvmlDeviceGetCount()):
             h = n.nvmlDeviceGetHandleByIndex(i)
@@ -293,6 +298,12 @@ class Sources:
                         "utilization.gpu": u.gpu if u is not None else None,
                         "temperature.gpu": rd(n.nvmlDeviceGetTemperature, h, n.NVML_TEMPERATURE_GPU),
                         "clocks.sm": rd(n.nvmlDeviceGetClockInfo, h, n.NVML_CLOCK_SM),
+                        "clocks.mem": rdx("nvmlDeviceGetClockInfo", h, getattr(n, "NVML_CLOCK_MEM", 2)),
+                        "clocks.max.mem": rdx("nvmlDeviceGetMaxClockInfo", h, getattr(n, "NVML_CLOCK_MEM", 2)),
+                        "pcie.link.gen.current": rdx("nvmlDeviceGetCurrPcieLinkGeneration", h),
+                        "pcie.link.gen.max": rdx("nvmlDeviceGetMaxPcieLinkGeneration", h),
+                        "pcie.link.width.current": rdx("nvmlDeviceGetCurrPcieLinkWidth", h),
+                        "pcie.link.width.max": rdx("nvmlDeviceGetMaxPcieLinkWidth", h),
                         "power_src": "nvml-energie" if prev is not None and e is not None else "nvml-moment"})
         return out
 
@@ -313,7 +324,7 @@ class Sources:
         with self.lock:
             self.pcie_hist.append((now, row))
             hist = list(self.pcie_hist)
-        return pcie_mean(hist, now, 2.0)
+        return pcie_mean(hist, now, 3.0)
 
     def sample_docker(self):
         ssh = self.cfg["docker_ssh"]

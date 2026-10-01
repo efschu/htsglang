@@ -278,6 +278,7 @@ class App:
         if self.vm is not None:
             # Nutzer 01.10.: TTFT mit Verlauf -- aus VictoriaMetrics (PromQL), nicht aus history.sqlite
             v["ttft"] = vmpush.ttft_series(self.vm, model, v.get("t") or [], int(v.get("step") or 5))
+            v["pcie"] = vmpush.pcie_series(self.vm, v.get("t") or [], int(v.get("step") or 5))
         n = (v.get("held") or {}).get("view_filled") or 0
         self.view_held["total"] += n
         self.view_held["last"] = n

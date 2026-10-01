@@ -156,6 +156,8 @@ class Bridge:
         self.boots, self.url = boots, url
         self.flip_seen: Dict[str, float] = {}
         self.view_done: set = set()
+        self.pcie_source = None
+        self.pcie_t = 0.0
         self.last: dict = {"t": None, "lines": 0, "error": None}
 
     def tick(self, now: Optional[float] = None) -> int:
@@ -187,6 +189,15 @@ class Bridge:
             with b.lock:
                 rank = (b.rank.get(key) or {}).get("rankstats") or {}
             lines += lines_for_boot(ipc, rank, model, int(now * 1000))
+        if self.pcie_source is not None:
+            for t, row in self.pcie_source():
+                if t <= self.pcie_t:
+                    continue
+                for i, (rx, tx) in enumerate(row):
+                    for d, v in (("rx", rx), ("tx", tx)):
+                        if v is not None:      # KB/s from NVML -> bytes/s
+                            lines.append("weg2_gpu_pcie_bytes_per_second%s %s %d" % (_lbl({"gpu": str(i), "dir": d}), repr(float(v) * 1000.0), int(t * 1000)))
+                self.pcie_t = max(self.pcie_t, t)
         n = push(lines, self.url)
         self.last = {"t": now, "lines": n, "error": None}
         return n
@@ -351,3 +362,22 @@ def ttft_last(client: "VmClient", now: Optional[float] = None, span_s: int = 900
                 out[m] = {"ms": (ss[b] - ss[a]) / dn, "n": int(round(dn)), "t": b, "exact": round(dn) == 1}
                 break
     return out
+
+
+def pcie_series(client: VmClient, ts: List[int], step: int) -> dict:
+    """PCIe RX/TX je Karte in GB/s je Eimer des Verlaufs aus VictoriaMetrics (Nutzer 01.10. ~09:00Z: Quelle VM):
+    Mittel der 1-s-Proben im Eimer [t, t+step), ausgewertet am Eimerende.  {"g0.rx": [...], "g0.tx": [...], ...}."""
+    if not ts:
+        return {"series": {}, "error": None}
+    w = max(int(step), 2)
+    try:
+        out = {}
+        for d in ("rx", "tx"):
+            got = client.query_range_by("avg by (gpu) (avg_over_time(weg2_gpu_pcie_bytes_per_second{dir=\"%s\"}[%ds])) / 1e9" % (d, w),
+                                        ts[0] + step, ts[-1] + step, step, "gpu")
+            for g, vals in got.items():
+                out["g%s.%s" % (g, d)] = [vals.get(t + step) for t in ts]
+        return {"series": out, "error": None, "src": "VictoriaMetrics weg2_gpu_pcie_bytes_per_second (NVML im 1-s-Takt)"}
+    except Exception as e:  # noqa: BLE001
+        return {"series": {}, "error": "%s: %s" % (type(e).__name__, e)}
+

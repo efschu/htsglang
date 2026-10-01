@@ -366,6 +366,17 @@
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v, 0) + " MHz")],
       series: [{}].concat(cards.map((c, i) => thin(cardLabel(c), cardCol(i), "MHz"))),
     }, rowsCards(d, "clock"));
+    // Nutzer 01.10. ~09:00Z: PCIe RX (durchgezogen) / TX (gestrichelt) je Karte und Speichertakt (Expertenansicht)
+    charts.pcie = mk("hw-c-pcie", {
+      scales: { y: { range: zeroUp(0.5) } },
+      axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v, v < 1 ? 2 : 1) + " GB/s")],
+      series: [{}].concat(cards.map((c, i) => line("RX " + cardLabel(c), cardCol(i), "GB/s", { width: 1.5, fill: undefined, value: valFmt("GB/s", 2) })))
+        .concat(cards.map((c, i) => line("TX " + cardLabel(c), cardCol(i), "GB/s", { width: 1.25, fill: undefined, dash: [4, 3], value: valFmt("GB/s", 2) }))),
+    }, rowsPcie(d));
+    charts.memclk = mk("hw-c-memclk", {
+      axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v, 0) + " MHz")],
+      series: [{}].concat(cards.map((c, i) => thin(cardLabel(c), cardCol(i), "MHz"))),
+    }, rowsCards(d, "memclock"));
     charts.host = mk("hw-c-host", {
       scales: { y: { range: [0, 100] } },
       axes: [axisX(), axisY(pct)],
@@ -381,6 +392,10 @@
   const rowsTtft = (d) => { const x = d.ttft || {}; const nul = d.t.map(() => null); return [d.t, x.mean_ms || nul, x.n || nul]; };
   const rowsHost = (d) => [d.t, d.series["host.cpu"], d.series["host.mem_pct"], d.series["host.bootmem_pct"]];
   const rowsCards = (d, k) => [d.t].concat((d.cards || []).map((c) => d.series["g" + c.index + "." + k] || d.t.map(() => null)));
+  const rowsPcie = (d) => {
+    const S = ((d.pcie || {}).series) || {}, nul = d.t.map(() => null);
+    return [d.t].concat((d.cards || []).map((c) => S["g" + c.index + ".rx"] || nul), (d.cards || []).map((c) => S["g" + c.index + ".tx"] || nul));
+  };
   const rowsPower = (d) => [d.t, d.series["gsum.power"]].concat(rowsCards(d, "power").slice(1));
   function rowsCache(d) {
     const s = d.series, n = d.t.length;
@@ -418,6 +433,8 @@
     charts.power.setData(rowsPower(d));
     charts.temp.setData(rowsCards(d, "temp"));
     charts.clock.setData(rowsCards(d, "clock"));
+    if (charts.pcie) charts.pcie.setData(rowsPcie(d));
+    if (charts.memclk) charts.memclk.setData(rowsCards(d, "memclock"));
     charts.host.setData(rowsHost(d));
   }
 
@@ -426,7 +443,7 @@
     const set = (id, src) => { const el = $(id); if (el) el.innerHTML = srcBadge(src); };
     set("vl-s-pre", s.prefill); set("vl-s-dec", s.decode); set("vl-s-cache", s.cache); set("vl-s-kv", s.kv);
     set("vl-s-flip", s.flip); set("vl-s-ttft", (d.ttft || {}).error ? "VictoriaMetrics: " + d.ttft.error : (d.ttft || {}).src); set("hw-s-power", s.power); set("hw-s-temp", s.temp); set("hw-s-clock", s.cards);
-    set("hw-s-host", s.host);
+    set("hw-s-host", s.host); set("hw-s-pcie", (d.pcie || {}).error ? "VictoriaMetrics: " + d.pcie.error : (d.pcie || {}).src); set("hw-s-memclk", "NVML");
     const err = Object.entries(d.errors || {}).map(([k, v]) => k + ": " + v).join(" · ");
     const nb = (d.marks || []).filter((m) => m.kind === "boot").length;
     const zt = d.zoom && window.RigZoom ? `Zoom ${RigZoom.hms(d.zoom[0])}–${RigZoom.hms(d.zoom[1])} · ` : "";

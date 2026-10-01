@@ -420,7 +420,8 @@ class Recorder:
             t_read = time.time()
             e = rd(n.nvmlDeviceGetTotalEnergyConsumption, h)          # mJ since driver load: a counter
             lv = [(p + "temp", rd(n.nvmlDeviceGetTemperature, h, n.NVML_TEMPERATURE_GPU)),
-                  (p + "clock", rd(n.nvmlDeviceGetClockInfo, h, n.NVML_CLOCK_SM))]
+                  (p + "clock", rd(n.nvmlDeviceGetClockInfo, h, n.NVML_CLOCK_SM)),
+                  (p + "memclock", rd(n.nvmlDeviceGetClockInfo, h, getattr(n, "NVML_CLOCK_MEM", 2)))]
             u = rd(n.nvmlDeviceGetUtilizationRates, h)
             lv.append((p + "util", u.gpu if u is not None else None))
             m = rd(n.nvmlDeviceGetMemoryInfo, h)
@@ -816,7 +817,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     cards = (rec.cards if rec else None) or db.get("cards", []) or []
     names = []
     for c in cards:
-        names += ["g%d.%s" % (c["index"], k) for k in ("temp", "power", "clock", "util", "mem")]
+        names += ["g%d.%s" % (c["index"], k) for k in ("temp", "power", "clock", "util", "mem", "memclock")]
     names += ["host.cpu", "host.mem_pct", "host.bootmem_pct", "host.bootmem_gib"]
     mp = SERIES % model
     msr = ["p_tps", "d_tps", "dec_tps", "stream_tps", "kv_pct", "kv_p_pct", "ipc"] + ["tok_" + k for k in cacheacct.CLASSES] \

@@ -197,6 +197,8 @@ def main(argv=None) -> int:
     src = sources.Sources({"gpu_period": 1.0, "docker_ssh": ssh, "docker_host_prefix": args.docker_host_prefix,
                            "weg2_fronts": args.front, "gpuq": args.gpuq, "state_dir": args.state_dir})
     threading.Thread(target=src.run_forever, args=(stop,), name="sampler-sources", daemon=True).start()
+    if bridge is not None:
+        bridge.pcie_source = lambda: list(src.pcie_hist)
     book = energy.EnergyBook(args.state_dir, live.BUCKET_S)
     errs: Dict[str, str] = {}
 
