@@ -150,7 +150,9 @@ def test_3_any_d_content_after_the_flip_is_first_work():
 
     src = inspect.getsource(front_mod.Front.leg2)
     i = src.index("async def _write_client(chunk: bytes)")
-    assert 'self._ipc_first_work_seen("D", "decode_token", rid)' in src[i:i + 500]
+    # FW-PING (01.10.): the chunk goes along -- D's keepalive ping is no work
+    assert 'self._ipc_first_work_seen("D", "decode_token", rid,' in src[i:i + 600]
+    assert "chunk=chunk, path=request.path)" in src[i:i + 700]
     # 27B (flip time = P end -> first decode token): a 503 D streams (state
     # refusal, the stream branch forwards r.status) is no decode token -- the same
     # status-200 guard the leg's first-content site has

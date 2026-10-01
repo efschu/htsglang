@@ -113,6 +113,69 @@ class TestFirstWorkStale(CustomTestCase):
         self.assertEqual((ev["p_end_ts"], ev["p_end_source"], ev["flip_user_ms"]), (None, "flip_begin", 3000))
 
 
+#: FW-PING (NF fqnsdm 01.10.): D's keepalives and envelope, and two work chunks
+_PING = b'event: ping\ndata: {"type": "ping"}\n\n'
+_OAI_KEEPALIVE = b": keepalive\n\n"
+_MSG_START = (b'event: message_start\ndata: {"type": "message_start", "message": '
+              b'{"id": "msg_1", "usage": {"input_tokens": 0}}}\n\n')
+_DELTA = (b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": 0, '
+          b'"delta": {"type": "text_delta", "text": "Hi"}}\n\n')
+_STOP = b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+
+
+def _d_chunk(f, rid, chunk, path="/v1/messages"):
+    """What leg 2's ``_write_client`` does with each D chunk it writes. Base
+    1d3e0cd940 handed the hook no chunk (any 200 chunk counted) -- that form is
+    the fallback, so a hook that loses the chunk again is red here."""
+    try:
+        f._ipc_first_work_seen("D", "decode_token", rid, chunk=chunk, path=path)
+    except TypeError:
+        f._ipc_first_work_seen("D", "decode_token", rid)
+
+
+class TestFirstWorkNoPing(CustomTestCase):
+    """FW-PING: a keepalive is never the flip's first work (P->D flips 28/30 on
+    NF fqnsdm read 5.3 s from the 5 s ping of a stream parked in a long extend;
+    D's first decode round came 0.4-0.5 s after done)."""
+
+    def _armed_done(self):
+        f = _front()
+        pub = []
+        f._ipc_publish = lambda typ, data: pub.append((typ, data))
+        f._ipc_live_kick = lambda: None
+        t0 = time.time()
+        f._ipc_first_work_clock().note_p_end(t0 - 0.01)
+        f._ipc_first_work_clock().arm(28, "P", "D", t0)
+        f._ipc_first_work_clock().done(t0 + 0.2)
+        return f, pub
+
+    def test_ping_and_envelope_are_not_first_work_the_delta_is(self):
+        f, pub = self._armed_done()
+        for ch, path in ((_PING, "/v1/messages"), (_MSG_START, "/v1/messages"),
+                         (_OAI_KEEPALIVE, "/v1/chat/completions")):
+            _d_chunk(f, "weg2-28-4", ch, path)
+        self.assertEqual([p for p in pub if p[0] == "flip_first_work"], [])
+        _d_chunk(f, "weg2-28-4", _PING + _DELTA)
+        fw = [p[1] for p in pub if p[0] == "flip_first_work"]
+        self.assertEqual(len(fw), 1)
+        self.assertEqual((fw[0]["epoch"], fw[0]["rid"], fw[0]["before_done"]), (28, "weg2-28-4", False))
+
+    def test_the_end_of_the_answer_counts(self):
+        f, pub = self._armed_done()
+        _d_chunk(f, "weg2-28-5", _STOP)
+        self.assertEqual(len([p for p in pub if p[0] == "flip_first_work"]), 1)
+
+    def test_chunk_is_work_per_wire(self):
+        w = front_mod.stream_chunk_is_work
+        self.assertFalse(w(_PING, "/v1/messages"))
+        self.assertFalse(w(_MSG_START, "/v1/messages"))
+        self.assertFalse(w(_OAI_KEEPALIVE, "/v1/chat/completions"))
+        self.assertFalse(w(b"", "/v1/messages"))
+        self.assertTrue(w(_DELTA, "/v1/messages"))
+        self.assertTrue(w(_STOP, "/v1/messages"))
+        self.assertTrue(w(b'data: {"choices": [{"delta": {"content": "x"}}]}\n\n', "/v1/chat/completions"))
+
+
 class TestFlipPhase(CustomTestCase):
     def test_vorlauf_layer_nachlauf_and_last(self):
         from sglang.srt.weg2.front_requests import FlipPhase
