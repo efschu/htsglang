@@ -36,6 +36,10 @@ _KW = dict(
     ring_bytes=int(30.4 * GIB), ring_span1_bytes=int(15.0 * GIB),
     cg_current_bytes=int(9.0 * GIB), reclaimable_bytes=int(3.0 * GIB),
     cg_ceiling_bytes=int(123.78 * GIB), s_gb_d=4,
+    # 2026-10-01 (reap mark follows a finite memory.max, NF 81c5826004): this is
+    # the CT999 host without a Docker cap -- it names the lxcfs fallback and
+    # keeps grading against the recorded 95.90 watermark, as the boot did.
+    cg_ceiling_source="lxcfs MemTotal FALLBACK (CT999 specimen, no Docker cap)",
 )
 
 
