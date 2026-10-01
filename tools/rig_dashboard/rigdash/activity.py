@@ -547,8 +547,15 @@ class Model:
             if not 0 <= i < n:
                 continue
             have[i] = sampled[i] = True
-            for key, acc in ((kD, kv), (kP, kvp)):
+            # flip layout (Nutzer 01.10.): the group that sleeps holds no KV on its cards, so its
+            # curve drops to 0 while the other layout runs; a sleeping rank's rankstats still carry
+            # its last value.  The dual layout has no flips (no wakes), both groups stay as read.
+            awake = self.awake_at(s["t"]) if self.wakes else None
+            for key, acc, grp in ((kD, kv, self.dec_group), (kP, kvp, "P")):
                 r = s["r"].get(key) if key else None
+                if awake is not None and grp != awake and key:
+                    acc[i][1] += 1
+                    continue
                 if r and r.get("kv") is not None:
                     acc[i][0] += 100.0 * r["kv"]
                     acc[i][1] += 1

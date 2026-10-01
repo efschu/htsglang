@@ -275,5 +275,28 @@ class TestWhatNone(unittest.TestCase):
         self.assertEqual((f["n"], f["last_ms"]), (1, 2500.0))
 
 
+class TestKvSleepingGroup(unittest.TestCase):
+    """Nutzer 01.10.: in the P<->D flip layout the sleeping group's KV curve drops to 0 while the other
+    layout runs; in the PD dual layout (no flips) both curves stay as read."""
+
+    def _kv(self, flip_done):
+        m = activity.Model(ring_until(60.0), flip_done, FIRST_WORK if flip_done else [])
+        b = m.buckets(0.0, 60, 1.0)
+        return b["kv_pct"], b["kv_p_pct"]
+
+    def test_flip_layout_sleeping_group_is_zero(self):
+        kv_d, kv_p = self._kv(FLIP_DONE)
+        self.assertEqual(kv_d[15], 0.0)            # D sleeps during the P burst
+        self.assertAlmostEqual(kv_p[15], 25.0)
+        self.assertEqual(kv_p[40], 0.0)            # P sleeps while D decodes
+        self.assertAlmostEqual(kv_d[40], 60.0)
+
+    def test_dual_layout_keeps_both(self):
+        kv_d, kv_p = self._kv([])
+        self.assertAlmostEqual(kv_d[15], 10.0)
+        self.assertAlmostEqual(kv_p[40], 25.0)
+        self.assertAlmostEqual(kv_d[40], 60.0)
+
+
 if __name__ == "__main__":
     unittest.main()
