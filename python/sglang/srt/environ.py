@@ -3114,6 +3114,17 @@ class Envs:
     # solve reads RECORD from K paired forwards per rank, else the seed.
     # Unset = off: one None test per fetch.
     SGLANG_WEG2_OWNED_MISS_RECORD = EnvStr(None)
+    # Owned cut from the profiles (user 01.10. ~19:05Z: the expert split on D
+    # comes from the planner, not from a hand vector in the profile). The
+    # owned solve weights its round over the decode batch-size mix the line
+    # runs, "<bs>:<weight>,..." (unset = the measured default bs1 0.107 / bs2
+    # 0.446 / bs3 0.447 of y6k -dres 01.10.; "bs1" = the old bs1-only solve).
+    SGLANG_WEG2_OWNED_BS_WEIGHTS = EnvStr(None)
+    # Form-A base of the owned solve: "derive" (default) = the planner derives
+    # the ownership that minimises the weighted round, the profile's
+    # --rank-moe-ratio only seeds the search; "stated" = the stated vector is
+    # the base (the old hand base, explicit override).
+    SGLANG_WEG2_OWNED_BASE = EnvStr("derive")
     # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
     # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
     # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the
