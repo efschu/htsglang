@@ -3064,6 +3064,19 @@ class Envs:
     # rows holding the same bytes). False: every eager forward plans on the
     # host as before. Rank-local choice, no collective inside the MoE.
     SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP = EnvBool(True)
+    # y6o (01.10.): the host-planned eager forward (D's extend of more ids
+    # than the device step takes) republishes each layer's pool tables
+    # (check_pool_error + sync_tables, device reads) right after that layer's
+    # waves -- a drain of the stream at EVERY MoE layer, so the next layer's
+    # attention is launched only after this layer's experts finished
+    # (y6m slot 2 py-spy: check_pool_error 18.8 % of D TP0). True: inside a
+    # model forward the per-layer republish is queued and run once at the end
+    # of the layer loop (eager_pool_sync_scope), in layer order, before the
+    # forward returns -- a sticky pool error still stops the forward by layer
+    # name before its output is used. Outside such a scope (any other caller)
+    # the republish runs at once as before. False: per layer as before.
+    # Rank-local, no collective.
+    SGLANG_OPT_MOE_POOL_DEFER_EAGER_SYNC = EnvBool(True)
     # Metal instrument for SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP: the first N
     # device-planned eager forwards PER LAYER also run the plain host plan
     # (history-free, H107 off: every spill expert fetched fresh from the host

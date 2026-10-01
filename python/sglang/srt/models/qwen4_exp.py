@@ -2375,28 +2375,35 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
             int(hidden_states.shape[0]),
         )
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            _hap.checkpoint("layer", layer=i)
-            if i + 1 < self.end_layer:
-                next_ple = getattr(self.layers[i + 1], "ple", None)
-                if next_ple is not None:
-                    next_ple.start_prefetch(ple_batch, forward_batch)
-                    # the pread gather blocks the host here (PLE-GATHER-PREFILL)
-                    fwd_mark("ple")
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                    ple_batch=ple_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
-                )
+        # y6o: the host-planned eager MoE layers republish their pool tables
+        # (device reads) once at the end of this loop, not after each layer --
+        # a sticky pool error still raises here, naming its layer, before the
+        # hidden states leave the forward.
+        from sglang.srt.layers.moe.expert_offload import eager_pool_sync_scope
+
+        with eager_pool_sync_scope():
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                _hap.checkpoint("layer", layer=i)
+                if i + 1 < self.end_layer:
+                    next_ple = getattr(self.layers[i + 1], "ple", None)
+                    if next_ple is not None:
+                        next_ple.start_prefetch(ple_batch, forward_batch)
+                        # the pread gather blocks the host here (PLE-GATHER-PREFILL)
+                        fwd_mark("ple")
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                        ple_batch=ple_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
 
         if ple_batch is not None:
             _commit_ple_batch(ple_batch, forward_batch)

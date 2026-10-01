@@ -5270,9 +5270,24 @@ class MoEExpertOffloadCache:
 
     def sync_pool_from_host(self):
         """After that eager forward: the device tables take the host's truth
-        for the LRU rows run_waves wrote; the rest of the LRU region is free."""
+        for the LRU rows run_waves wrote; the rest of the LRU region is free.
+        Inside an ``eager_pool_sync_scope`` (y6o) the republish is queued and
+        runs at the end of the model's layer loop instead of draining the
+        stream here."""
         if not self._pool_ready:
             return
+        # H107: a row the pass READ an expert from keeps it and is stamped as
+        # used, exactly like a row it wrote (one owner per expert holds: a hit
+        # row is never written in the same pass)
+        holds = dict(self._eager_lru_used)
+        holds.update(self._scratch_holds)
+        if _EAGER_SYNC.defer(self, holds, len(self._scratch_holds)):
+            return
+        self._finish_pool_sync(holds, len(self._scratch_holds))
+
+    def _finish_pool_sync(self, holds, n_scratch: int):
+        """The republish itself (device reads): the sticky error, the reports,
+        and ``sync_tables`` over ``holds`` (row -> expert of the eager pass)."""
         import logging
 
         from sglang.srt.layers.moe.expert_pool_device import (
@@ -5298,12 +5313,7 @@ class MoEExpertOffloadCache:
         from sglang.srt.environ import envs
 
         keep = envs.SGLANG_OPT_MOE_POOL_KEEP_LRU.get()
-        resume_warm().note_eager_sync(lid, len(self._scratch_holds))  # RW instrument
-        # H107: a row the pass READ an expert from keeps it and is stamped as
-        # used, exactly like a row it wrote (one owner per expert holds: a hit
-        # row is never written in the same pass)
-        holds = dict(self._eager_lru_used)
-        holds.update(self._scratch_holds)
+        resume_warm().note_eager_sync(lid, n_scratch)  # RW instrument
         report = sync_tables(self._pool_tables, holds, keep_unwritten=keep)
         if lid in (0, 23, 47):
             # Beweiszeile #104 + SGLANG_OPT_MOE_POOL_KEEP_LRU: wie viel Decode-
@@ -5316,7 +5326,7 @@ class MoEExpertOffloadCache:
                 "MoE expert pool layer %s sync: eager pass wrote %d rows, LRU owns "
                 "%d of %d rows after the sync, %d twin rows freed (keep_lru=%s, "
                 "one owner per expert, #104)",
-                lid, len(self._scratch_holds), report.owned,
+                lid, n_scratch, report.owned,
                 t.pool_rows - t.lru_start, report.twins_freed, keep,
             )
 
@@ -7788,6 +7798,80 @@ def deferred_rows_fill() -> DeferredRowsFill:
     if _DEFERRED_ROWS_FILL is None:
         _DEFERRED_ROWS_FILL = DeferredRowsFill()
     return _DEFERRED_ROWS_FILL
+
+
+class EagerPoolSyncQueue(threading.local):
+    """y6o: the per-layer republish of the host-planned eager forward
+    (``sync_pool_from_host``: sticky pool error, reports, ``sync_tables`` --
+    device reads, i.e. a drain of the stream) queued for the end of the model
+    forward instead of after every MoE layer, so layer L+1's launches overlap
+    layer L's experts. ``scope()`` opens the window (the model's layer loop);
+    leaving it runs the queue in layer order -- also on an exception, so the
+    tables are never left unpublished. Outside a scope, or with
+    SGLANG_OPT_MOE_POOL_DEFER_EAGER_SYNC=0, ``defer`` declines and the caller
+    republishes at once. Per thread: only the forward's own thread defers."""
+
+    def __init__(self):
+        self.depth = 0
+        self.pending: List[tuple] = []
+
+    def defer(self, cache, holds, n_scratch: int) -> bool:
+        if self.depth <= 0:
+            return False
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_OPT_MOE_POOL_DEFER_EAGER_SYNC.get():
+            return False
+        if any(c is cache for c, _, _ in self.pending):
+            # the same layer twice in one scope: its first pass must be
+            # published before its tables are planned on again
+            self.flush()
+        self.pending.append((cache, holds, n_scratch))
+        return True
+
+    def flush(self):
+        """Run the queued republishes in layer order; the first sticky pool
+        error raises (its layer is in the text) and the rest are dropped."""
+        pending, self.pending = self.pending, []
+        for cache, holds, n_scratch in pending:
+            cache._finish_pool_sync(holds, n_scratch)
+
+    def scope(self):
+        return _EagerPoolSyncScope(self)
+
+
+class _EagerPoolSyncScope:
+    def __init__(self, queue: EagerPoolSyncQueue):
+        self.queue = queue
+
+    def __enter__(self):
+        self.queue.depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.queue.depth -= 1
+        if self.queue.depth == 0:
+            if exc_type is None:
+                self.queue.flush()
+            else:
+                # the forward already failed: still publish, but never let a
+                # second error replace the first
+                try:
+                    self.queue.flush()
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "eager pool sync after a failed forward"
+                    )
+        return False
+
+
+_EAGER_SYNC = EagerPoolSyncQueue()
+
+
+def eager_pool_sync_scope():
+    """Context manager for a model's layer loop: the eager pool republish of
+    every MoE layer inside it runs once, in layer order, when it closes."""
+    return _EAGER_SYNC.scope()
 
 
 def deferred_rows_tick(batch) -> None:
