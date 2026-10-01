@@ -342,7 +342,7 @@ def test_the_span_cap_sits_where_the_span_is_cut():
 
     src = inspect.getsource(S.Scheduler._prefetch_kvcache)
     a = src.index("_match_end = req._compute_max_prefix_len(")
-    b = src.index("_match_end = _weg2_fork_match_end(req, _match_end)")
+    b = src.index("_match_end = _weg2_fork_match_end(")
     c = src.index("_new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]")
     assert a < b < c
 

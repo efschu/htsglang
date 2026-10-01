@@ -306,7 +306,7 @@ def test_cache_finished_req_stamps_the_span_it_retained(monkeypatch, anchor):
 
 def test_wiring_scheduler_caps_the_span_after_the_fork_cap_and_lowers_the_floor():
     sch = _read("managers", "scheduler.py")
-    fork = sch.index("_match_end = _weg2_fork_match_end(req, _match_end)")
+    fork = sch.index("_match_end = _weg2_fork_match_end(")
     park = sch.index("_match_end = _weg2_park_read.park_match_end(req, _match_end)")
     span = sch.index("_new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]")
     assert fork < park < span

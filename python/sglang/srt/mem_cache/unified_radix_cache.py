@@ -6733,6 +6733,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         min_tokens: Optional[int] = None,
         span_base: Optional[int] = None,
         extra_key: Optional[str] = None,
+        key_base: Optional[int] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -7439,7 +7440,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _total = _keys  # chain length in pages == P's inserted page count
                 _ids = _ho.read_ids(str(req_id))
                 _ntok = len(_ids) if _ids else None
-                _off = (int(_ntok) - int(prefetch_length)) // int(self.page_size) if _ntok is not None else None
+                # HANDOFF-KEY OFFSET (N3c 10012013): from the span's absolute
+                # start, never "ids minus span" (weg2.handoff_keys.span_key_offset)
+                from sglang.srt.weg2.handoff_keys import span_key_offset as _span_key_offset
+                _off = _span_key_offset(key_base, _ntok, int(prefetch_length), int(self.page_size))
                 if _off is not None and 0 <= _off < len(_total):
                     # partial coverage is fine (P's list is one page short of the ids)
                     operation.weg2_page_keys = list(_total[_off:_off + _pages])

@@ -794,16 +794,30 @@ def _weg2_fork_anchor_on_consumer() -> bool:
     return (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "P"
 
 
-def _weg2_fork_match_end(req, match_end: int) -> int:
+def _weg2_fork_match_end(req, match_end: int, exact_bigram: bool = False) -> int:
     """FORK ANCHOR: the end of ``req``'s store-read span -- ``match_end``
     unchanged unless the switch is on, this is not group P, and the prompt's
     fork cut lies below it (then the cut: a fork-cut P leg wrote exactly
-    that far). Counted once per power of two."""
+    that far). Counted once per power of two.
+
+    ``exact_bigram`` (the tree keys bigrams AND takes the exact N-1 form,
+    ``UnifiedRadixCache.bigram_anchor_exact``): the span takes ONE MORE token,
+    the held-back fork token itself. A bigram key of n tokens has n-1 units,
+    so a span ending at the fork F asked F-1 units -- but P keyed its leg
+    with the held-back token as the last unit's partner (exact form: F units
+    for F committed tokens, ``HANDOFF page_keys=F``) and its end anchor sits
+    on that last unit. Measured (N3c 10012013): every hand-off read asked one
+    key short of its own end anchor (``FETCH CAP keys=40131``, anchor on key
+    40131 of 40132) and D recomputed from the previous grid anchor (lost
+    2585-4053). ``fork_cut`` guarantees F <= N-2, so F+1 still leaves D the
+    generation prompt to extend."""
     if not _weg2_fork_anchor_on_consumer():
         return match_end
     fork = _weg2_fork.fork_cut_of_req(req)
     if fork is None or fork >= match_end:
         return match_end
+    if exact_bigram:
+        fork = min(int(fork) + 1, int(match_end))
     n = globals().get("_WEG2_FORK_SPAN_N", 0) + 1
     globals()["_WEG2_FORK_SPAN_N"] = n
     if n & (n - 1) == 0:
@@ -7455,7 +7469,11 @@ class Scheduler(
         # leg-2 read then lands complete (no #1324 store-short deferral, no
         # extra pass after the wake). Pure function of the prompt ids and the
         # env: the same span on every rank. Group P keeps its span.
-        _match_end = _weg2_fork_match_end(req, _match_end)
+        _match_end = _weg2_fork_match_end(
+            req, _match_end,
+            exact_bigram=bool(getattr(self.tree_cache, "is_eagle", False))
+            and bool(getattr(self.tree_cache, "bigram_anchor_exact", False)),
+        )
         # PARK-RETAIN READ (weg2/d_park_read.py, SGLANG_WEG2_PARK_READ_CAP,
         # default on): a flip-parked request reads back exactly what its park
         # retained -- the KV above the mamba track point was freed, never
@@ -7653,6 +7671,9 @@ class Scheduler(
                 # HP1: the span's absolute start, so a Form A group votes ENDS
                 # (the rest of the tree ignores it off Form A).
                 span_base=int(_matched_len),
+                # #1442: P's handed-over chain is sliced at the span's
+                # absolute start (the fallback key list of the tree)
+                key_base=int(_matched_len),
                 **_tail_kw,
             )
             # H99: on a Form A expert worker the span bookkeeping is the host's
@@ -7665,6 +7686,7 @@ class Scheduler(
                 new_input_tokens,
                 last_hash,
                 prefix_keys,
+                key_base=int(_matched_len),
                 **_tail_kw,
             )
 

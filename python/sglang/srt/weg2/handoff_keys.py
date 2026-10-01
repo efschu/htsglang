@@ -27,6 +27,28 @@ def keys_for_span(page_keys: Optional[Sequence[str]], matched_len: int, n_tokens
     return [str(k) for k in page_keys[p0:p0 + n_pages]]
 
 
+def span_key_offset(key_base: Optional[int], n_ids: Optional[int], span_len: int,
+                    page_size: int = 1) -> Optional[int]:
+    """Index of the first handed-over key of a store-read span (pages).
+
+    The chain is indexed from the request start, so the span's keys start at
+    the span's ABSOLUTE start ``key_base`` (the caller's matched prefix) --
+    the same ``p0`` :func:`keys_for_span` slices at. Without it, the legacy
+    derivation "ids minus span" (correct only when the span runs to the very
+    end of the ids). It does not when P hands over all N ids of a request it
+    trimmed (fork: 5 more, N-1 trim: 1 more), when the span is a bigram key
+    (one unit short of its tokens) or when the host pool truncated it --
+    measured offset=36870 for a span starting at 36864 (N3c 10012013), and
+    D placed P's KV and end-anchor state 6 positions early."""
+    if page_size <= 0:
+        return None
+    if key_base is not None:
+        return int(key_base) // int(page_size)
+    if n_ids is None:
+        return None
+    return (int(n_ids) - int(span_len)) // int(page_size)
+
+
 def first_mismatch(a: Sequence[str], b: Sequence[str]) -> Optional[int]:
     for i, (x, y) in enumerate(zip(a, b)):
         if x != y:
