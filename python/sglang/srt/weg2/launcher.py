@@ -21003,9 +21003,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "--rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged "
                          "when D is sized from P's plan instead of P's measurement.")
     ap.add_argument("--dual-p-duty", type=float, default=1.0,
-                    help="DUAL-TP3PP3: the share of wall time P's first stage may compute while D holds "
-                         "decodes (weg2/dual_duty.py; the latency guard WITHOUT MPS). 1.0 = off. The front "
-                         "publishes D's busy bit, P's PP0 idles t_fwd*(1-duty)/duty after each forward.")
+                    help="DUAL-TP3PP3 PAUSE ALLOWANCE (Pausenzulassung), DEFAULT 0 = 1.0 = no pause: P and D "
+                         "run at once and share every card, only physics limits them (user decision 01.10.). "
+                         "Below 1.0 P MAY pause while D holds decodes: the share of wall time P's first stage "
+                         "may compute (weg2/dual_duty.py). Plain form: PP0 idles t_fwd*(1-duty)/duty after "
+                         "each forward. With env SGLANG_WEG2_DUAL_P_GANG_CHUNKS=K (gang window): PP0 runs K "
+                         "chunks, waits for the pipeline to drain, then holds so D is alone on all cards.")
     ap.add_argument("--dual-p-sm-pct", type=int, default=100,
                     help="DUAL-TP3PP3 with --dual-mps on: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for group P, "
                          "i.e. the share of SMs P's kernels may occupy while D decodes. MEASURED 29.09. "
