@@ -12,7 +12,9 @@ OPEN for L15-11b (not built here): HybridReqToTokenPool.clear()
 (mem_cache/memory_pool.py ~2871) calls mamba_pool.reset_state(), which zeroes
 EVERY mamba slot including the held anchors -- the real sleep path must skip
 reset_state for ``[0, A_H)`` when a hold exists.
-OPEN for L15-11b (not built here): the scheduler hook with the real
+OPEN for L15-11b (pool-side keep_rows is in): the caller of
+retain_at_sleep must flush via HybridReqToTokenPool.clear(keep_mamba_rows=A_H) so the held rows [0, A_H) survive the mamba reset (the scheduler hook making that call is still open).
+OPEN for L15-11b (not here): the scheduler hook with the actual
 node_of/reset_keep/set_keep bindings.
 
 The DANGER DIRECTION is a wrong step order: moving buffers after the
