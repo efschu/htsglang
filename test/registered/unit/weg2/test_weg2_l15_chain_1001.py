@@ -112,7 +112,8 @@ def _recorder(node, kv_map, anchor_map, visited):
     node.rewritten = (dict(kv_map), dict(anchor_map))
 
 
-def _retain_rank(tmp_path, rank, caps=(4, 4, 4), manifest_name=None, mamba=None):
+def _retain_rank(tmp_path, rank, caps=(4, 4, 4), manifest_name=None, mamba=None,
+                 pid=PID):
     """One rank's sleep: retain_at_sleep against fresh per-rank fakes."""
     pool = mamba if mamba is not None else _build_pool()
     alloc = FakeAllocator()
@@ -130,7 +131,7 @@ def _retain_rank(tmp_path, rank, caps=(4, 4, 4), manifest_name=None, mamba=None)
         prefix=PREFIX,
         rank=rank,
         epoch=EPOCH,
-        pid=PID,
+        pid=pid,
         kv_buffers=[torch.zeros(8, 3), torch.zeros(8, 3)],
         mamba_buffers=_mamba_views(pool),
         allocator=alloc,
@@ -182,3 +183,189 @@ def test_sleep_writes_per_rank_manifests_f7_shape(tmp_path):
     # Mamba allocator: the two compact anchor rows are carved out.
     free = set(_pool1.mamba_allocator.free_slots.tolist())
     assert 1 not in free
+
+
+# ---------------------------------------------------------------------------
+# PART 2: the wake half -- hold signal, group verdict, fallback drop.
+# Fake-self style from test_weg2_l15_wake_restore_1001 / cap0_wake; the
+# manifests are the REAL ones written by the sleep step above.
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from sglang.srt.managers.scheduler_components import weight_updater as wu  # noqa: E402
+from sglang.srt.weg2 import l15_restore  # noqa: E402
+
+WU = wu.SchedulerWeightUpdaterManager
+ALLOC_SIZE = 16
+HELD_SLOTS = {1, 2, 3, 4, 5}  # span union of the part-1 geometry (no pad 0)
+A_H = 2                       # anchor region: shared anchor image 1 + pad 0
+
+
+class _Pool:
+    def __init__(self):
+        self.clear_calls = []
+
+    def clear(self, *a, **k):
+        self.clear_calls.append((a, k))
+
+
+class _Alloc:
+    def __init__(self):
+        self.size = ALLOC_SIZE
+        self.free_pages = torch.arange(1, self.size + 1, dtype=torch.int64)
+        self.clears = 0
+
+    def clear(self):
+        self.clears += 1
+        self.free_pages = torch.arange(1, self.size + 1, dtype=torch.int64)
+
+
+class _Tree:
+    def __init__(self):
+        self.resets = 0
+
+    def reset(self):
+        self.resets += 1
+
+
+def _sched():
+    # tp_worker.model_runner.token_to_kv_pool must exist: the hold signal
+    # derives the planner cap via l15_shadow.cell_bytes_from(pool) and
+    # returns "no signal" (None) when the pool is missing.
+    cell_t = torch.zeros(4, 2, 2)
+    sched = SimpleNamespace(
+        tp_size=3,
+        server_args=SimpleNamespace(tp_size=3, rank_gpu_id=None),
+        tp_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                token_to_kv_pool=SimpleNamespace(k_buffer=[cell_t],
+                                                 v_buffer=[cell_t]))),
+        req_to_token_pool=_Pool(),
+        token_to_kv_pool_allocator=_Alloc(),
+        tree_cache=_Tree(),
+        memory_saver_adapter=SimpleNamespace(set_keep_byte_spans=lambda b, s: None),
+    )
+    return sched
+
+
+def _fake_self(sched, rank):
+    fs = SimpleNamespace()
+    fs.scheduler = sched
+    fs._l15_wake_manifest = None
+    fs._l15_wake_refill = False
+    fs._weg2_group_name = lambda: "D"
+    fs._weg2_rank = lambda: rank
+    fs._l15_wake_hold_signal = lambda: WU._l15_wake_hold_signal(fs)
+    fs._l15_flush_zero_kv_bounded = lambda s, k: None
+    fs._l15_clear_tms_keep_spans = lambda s: None
+    fs._l15_fallback_drop = lambda s: WU._l15_fallback_drop(fs, s)
+    fs._l15_wake_act = lambda s, v, **kw: WU._l15_wake_act(fs, s, v, **kw)
+    fs.flushed = []
+    fs.flush_cache = lambda: fs.flushed.append(1) or False
+    return fs
+
+
+def _env(monkeypatch, tmp_path, mib):
+    monkeypatch.setenv("SGLANG_WEG2_L15", "1")
+    monkeypatch.setenv("SGLANG_WEG2_L15_MIB", mib)
+    monkeypatch.setenv("SGLANG_WEG2_L15_MANIFEST", str(tmp_path) + os.sep)
+
+
+def _sleep_all(tmp_path, ranks, pid):
+    """Sleep on the given ranks; real manifests land at manifest_path(D, r)."""
+    for r in ranks:
+        path = l15_manifest.manifest_path("D", r, os.environ)
+        res, _p, _a, _n = _retain_rank(tmp_path, r, manifest_name=path, pid=pid)
+        assert res is not None, f"sleep skipped on rank {r}"
+
+
+def _hold_votes(fs):
+    m = fs._l15_wake_manifest
+    if m is None:
+        return None
+    fp = l15_manifest.fingerprint(m)
+    return l15_restore.check_vote(fp, len(m.spans), 0, 0, ())
+
+
+def test_wake_cap0_votes_none_group_fallback_frees_every_pool(monkeypatch, tmp_path):
+    # STEP 3 (brief): sleep on all 3 ranks; at wake rank 0 has planner cap 0
+    # (no c0 in the MIB env) and its manifest lacks anchor identity -> the
+    # anchor gate closes and the hold signal votes None; the cap>0 ranks keep
+    # (free_pages lacks the held slots, mamba rows [1, A_H) stay); the group
+    # sees a mixed fp -> verdict "fallback" -> the drop frees EVERY pool.
+    _env(monkeypatch, tmp_path, mib="c1=64,c2=64")
+    pid = os.getpid()
+    _sleep_all(tmp_path, (0, 1, 2), pid)
+
+    # cap>0 ranks 1 and 2: the hold path survives the restore.
+    keep_ranks = {}
+    for r in (1, 2):
+        sched = _sched()
+        fs = _fake_self(sched, r)
+        assert WU._weg2_wake_restore_pools(fs) is True
+        assert fs.flushed == []
+        # mamba anchors [0, A_H) survive: keep_mamba_rows == anchor_slots.
+        assert sched.req_to_token_pool.clear_calls == [
+            ((), {"keep_mamba_rows": A_H})
+        ]
+        free = {int(x) for x in sched.token_to_kv_pool_allocator.free_pages.tolist()}
+        assert not free & HELD_SLOTS, "held slots must stay out of free_pages"
+        keep_ranks[r] = (sched, fs)
+
+    # cap-0 rank 0: anchor gate closed -> votes None, pools untouched.
+    sched0 = _sched()
+    fs0 = _fake_self(sched0, 0)
+    m, rank, keep, master_on = WU._l15_wake_hold_signal(fs0)
+    assert (m, rank, keep, master_on) == (None, 0, 0, True)
+    assert sched0.token_to_kv_pool_allocator.clears == 0
+
+    # The group decision on the real votes: mixed (None vs fp) -> fallback.
+    votes = [None, _hold_votes(keep_ranks[1][1]), _hold_votes(keep_ranks[2][1])]
+    gc = l15_restore.group_check(votes)
+    assert gc.verdict == "fallback"
+
+    # The act on EVERY rank: fallback drop, then all pools fully free.
+    assert WU._l15_wake_act(fs0, sched0, "fallback", group_ok=True,
+                            master_on=True) == 0
+    for r in (1, 2):
+        sched, fs = keep_ranks[r]
+        dropped = WU._l15_wake_act(fs, sched, "fallback", group_ok=True,
+                                   master_on=True)
+        assert dropped == len(HELD_SLOTS)
+    for sched in (sched0, keep_ranks[1][0], keep_ranks[2][0]):
+        free = {int(x) for x in sched.token_to_kv_pool_allocator.free_pages.tolist()}
+        assert free == set(range(1, ALLOC_SIZE + 1)), "every pool must be free"
+        assert sched.tree_cache.resets == 1
+        # the last req clear ran WITHOUT a keep (the hold was dropped).
+        assert sched.req_to_token_pool.clear_calls[-1] == ((), {})
+
+
+def test_f2_failing_keep_arm_manifest_gone_group_fallback(monkeypatch, tmp_path):
+    # STEP 4 (brief): rank 2's keep-arm failed at sleep (F2) -> its manifest
+    # is gone; rank 0 is cap-0. Nobody keeps anything at the end.
+    _env(monkeypatch, tmp_path, mib="c1=64")
+    pid = os.getpid()
+    _sleep_all(tmp_path, (0, 1), pid)  # rank 2 never published (keep-arm failed)
+
+    sched1 = _sched()
+    fs1 = _fake_self(sched1, 1)
+    assert WU._weg2_wake_restore_pools(fs1) is True
+    free = {int(x) for x in sched1.token_to_kv_pool_allocator.free_pages.tolist()}
+    assert not free & HELD_SLOTS
+
+    fs_missing = _fake_self(_sched(), 2)
+    m2 = WU._l15_wake_hold_signal(fs_missing)[0]
+    assert m2 is None, "a rank whose keep-arm failed has no manifest to vote"
+
+    gc = l15_restore.group_check([None, _hold_votes(fs1), None])
+    assert gc.verdict == "fallback"
+
+    WU._l15_wake_act(fs_missing, fs_missing.scheduler, "fallback",
+                     group_ok=True, master_on=True)
+    assert WU._l15_wake_act(fs1, sched1, "fallback", group_ok=True,
+                            master_on=True) == len(HELD_SLOTS)
+    free = {int(x) for x in sched1.token_to_kv_pool_allocator.free_pages.tolist()}
+    assert free == set(range(1, ALLOC_SIZE + 1))
+    assert sched1.req_to_token_pool.clear_calls[-1] == ((), {})
