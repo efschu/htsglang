@@ -250,3 +250,17 @@ Alle Zahlen bs1, ein Request, Energieprofil **balanced** (wenn nicht anders gena
   4. Decode-Graph auf dem Pfad ohne kt aufnehmen.
 
 ### 12.5 Ergebnisse unter Ruhebedingung (werden nachgetragen)
+- 15:10–17:11 Betrieb nach Nutzer-Orders, nur mit Gate, kein Neustart bei Nutzerlast:
+  - 128k-Kontext.
+  - Mamba-Host-Pool getrennt dimensioniert; vorher 0 Slots, damit 0 Treffer.
+  - 16 Geräte-Mamba-Slots, MAXRUN 2.
+  - MAMBA-SNAPSHOT-FENCE.
+  - Energie: SGLANG_IDLE_BLOCKING_POLL, Leerlauf 15,5 → 3,5 W, Decode unverändert.
+  - Host-KV 0,3 und benannte Prefetch-Skip-Logzeilen.
+  - Dashboard :31680.
+  - omp-Prompt-Mitschnitt: Datum und cwd stehen bei 98,5 %; ~16,5k Token sind über alle Sitzungen gleich.
+- Hit vs Miss (cache_salt): Treffer sind kohärent. Abweichungen sind späte Wortkipper, kalt gegen kalt kippt genauso. out_proj-Permutation per CPU als exakt bewiesen.
+- Offen:
+  - Nachweis eines Präfix-Treffers aus dem nächsten echten omp-Turn (passiv beobachtet).
+  - 18k-A/B (Hebel an/aus, llama.cpp) und PP2 (llama.cpp HIP -ngl): nur im Ruhefenster ≥15 min (ab18k/window_runner.sh, Sentinel, trap).
+  - KV-Pool 121705 statt 131076 seit Host-KV 0,3.
