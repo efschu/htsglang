@@ -336,8 +336,12 @@ def retain_at_sleep(
     # (9) the one line
     fp = fingerprint(manifest)
     rows_fmt = ",".join(str(x) for x in manifest.rows_by_rank)
+    # keep_rows_by_rank: this is the manifest's per-rank KEEP capacity
+    # (plan.rows_by_rank = blocks*ratio_r), not the admitted rows of the
+    # HoldSet -- printed under its own key so the two never clash in the log.
     log(
-        f"L15-RETAIN epoch={epoch} n={len(hs.rids)} rows_by_rank={rows_fmt} "
+        f"L15-RETAIN epoch={epoch} n={len(hs.rids)} "
+        f"keep_rows_by_rank={rows_fmt} "
         f"l_h={plan.l_h} anchors={a_h} fp={fp}"
     )
     return RetainResult(

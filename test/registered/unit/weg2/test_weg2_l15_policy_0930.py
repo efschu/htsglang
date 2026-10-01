@@ -120,6 +120,24 @@ def test_anchorless_excluded():
     assert hs.anchors == 1
 
 
+def test_anchor_cap_full_excluded_as_anchor_full():
+    # Row caps have room but cap_anchor_slots is 1: the first candidate is
+    # admitted, the second FITS in rows yet is excluded with "anchor_full"
+    # (audit item 10), not "no_room". Row-cap exclusions keep "no_room".
+    cands = [
+        cand("a", "seat", 90.0, [10, 10], 1, 1),
+        cand("b", "seat", 80.0, [10, 10], 1, 1),
+        cand("c", "seat", 70.0, [200, 0], 1, 1),
+    ]
+    hs = select_hold(cands, [100, 100], 1)
+    assert hs.rids == ("a",), hs.rids
+    assert ("b", "anchor_full") in hs.excluded
+    assert ("b", "no_room") not in hs.excluded
+    assert ("c", "no_room") in hs.excluded
+    assert hs.rows_by_rank == (10, 10)
+    assert hs.anchors == 1
+
+
 def test_determinism_under_permutation():
     # 20 permutations of the same candidate list from one fixed seed must
     # all produce the identical HoldSet. A single Random(42) instance is used

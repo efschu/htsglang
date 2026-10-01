@@ -19732,6 +19732,9 @@ class Scheduler(
                         _tok = len(getattr(_req, "origin_input_ids", []) or []) + len(
                             getattr(_req, "output_ids", []) or []
                         )
+                        # span = seqlen - 1: the last token has no KV yet
+                        # (l15_bind, schedule_batch.py:2821)
+                        _span = max(_tok - 1, 0)
                         _entries.append(
                             {
                                 "rid": getattr(_req, "rid", None),
@@ -19740,26 +19743,29 @@ class Scheduler(
                                 # rows follow the DCP token vector (or even),
                                 # not "whole request on rank 0"
                                 "rows_by_rank": list(
-                                    l15_shadow.rows_split(_tok, _tp, _ratios)
+                                    l15_shadow.rows_split(_span, _tp, _ratios)
                                 ),
-                                "anchor_depth": _tok,
-                                "kv_depth": _tok,
+                                "anchor_depth": _span,
+                                "kv_depth": _span,
                             }
                         )
                     for _req in (getattr(self, "weg2_d_parked", None) or []):
                         _tok = len(getattr(_req, "origin_input_ids", []) or []) + len(
                             getattr(_req, "output_ids", []) or []
                         )
+                        # span = seqlen - 1: the last token has no KV yet
+                        # (l15_bind, schedule_batch.py:2821)
+                        _span = max(_tok - 1, 0)
                         _entries.append(
                             {
                                 "rid": getattr(_req, "rid", None),
                                 "kind": "parked",
                                 "last_active": 0.0,
                                 "rows_by_rank": list(
-                                    l15_shadow.rows_split(_tok, _tp, _ratios)
+                                    l15_shadow.rows_split(_span, _tp, _ratios)
                                 ),
-                                "anchor_depth": _tok,
-                                "kv_depth": _tok,
+                                "anchor_depth": _span,
+                                "kv_depth": _span,
                             }
                         )
                     _mr = getattr(getattr(self, "tp_worker", None), "model_runner", None)
@@ -19785,17 +19791,198 @@ class Scheduler(
                     l15_shadow.LEDGER.note_sleep(_hs)
             except Exception as exc:  # noqa: BLE001 - shadow must never block flush
                 logger.warning("L15-SHADOW select failed (ignored): %s: %s", type(exc).__name__, exc)
+            # [L1.5 RETAIN] L15-11c: hold the priced KV prefix across this
+            # sleep flush at D instead of dropping it. Master switch
+            # SGLANG_WEG2_L15; off means the untouched flush below. Only the
+            # SETUP is wrapped: retain_at_sleep returns None for a benign
+            # skip (run today's flush) but from its step 3 on it re-raises,
+            # and that must propagate -- the buffers are half-moved by then.
+            _l15_kwargs = None
+            _l15_mba = None
+            try:
+                from sglang.srt.weg2 import l15_bind, l15_plan, l15_retain, l15_shadow
+
+                if l15_plan.master_on(os.environ) and (
+                    getattr(self, "weg2_d_parked", None) is not None
+                ):
+                    _tp = int(
+                        getattr(self, "tp_size", 0)
+                        or getattr(getattr(self, "server_args", None), "tp_size", 1)
+                        or 1
+                    )
+                    try:
+                        from sglang.srt.distributed.utils import get_cp_token_ratios
+
+                        _ratios = get_cp_token_ratios()
+                    except Exception:  # noqa: BLE001 - even split is the fallback
+                        _ratios = None
+                    _v = (
+                        [int(x) for x in _ratios]
+                        if _ratios is not None
+                        and len(_ratios) == _tp
+                        and all(int(x) > 0 for x in _ratios)
+                        else [1] * _tp
+                    )
+                    _prefix = [0]
+                    for _x in _v:
+                        _prefix.append(_prefix[-1] + _x)
+                    _mr = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+                    # N1 (dkr27browauthoritybar1fs10011036): the 27B pool is a
+                    # HybridLinearKVPool whose K/V live on .full_kv_pool -- read
+                    # from the wrapper, _kv was EMPTY and retain would compact
+                    # the node slots while no KV byte moved (silent wrong KV).
+                    _pool = l15_shadow.kv_pool_of(getattr(_mr, "token_to_kv_pool", None))
+                    _kv = [t for t in l15_shadow.kv_buffers_of(_pool) if isinstance(t, torch.Tensor)]
+                    if not _kv:
+                        logger.warning(
+                            "L15-RETAIN skipped reason=no-kv-buffers: the KV pool "
+                            "has no k_buffer/v_buffer (wrapper not unwrapped?), "
+                            "nothing to retain"
+                        )
+                    _l15_mba = getattr(self.req_to_token_pool, "mamba_allocator", None)
+                    # The GDN state lives in the pool's mamba_cache, NOT in
+                    # the allocator: conv (a list of per-layer tensors) and
+                    # temporal, each (num_layers, slots, ...). The per-layer
+                    # VIEW is what moves -- dim 0 = slots (memory_pool.py
+                    # clear_slots indexes t[:, idx]).
+                    _mamba_cache = getattr(
+                        getattr(self.req_to_token_pool, "mamba_pool", None),
+                        "mamba_cache",
+                        None,
+                    )
+                    _conv = getattr(_mamba_cache, "conv", None)
+                    _temp = getattr(_mamba_cache, "temporal", None)
+                    _mb = []
+                    for _c in _conv or []:
+                        _mb.extend(_c[i] for i in range(int(_c.shape[0])))
+                    if _temp is not None:
+                        _mb.extend(_temp[i] for i in range(int(_temp.shape[0])))
+                    if not _mb:
+                        # L15-11c: no mamba bytes to retain (the pool lacks a
+                        # non-empty mamba_cache). Retain would still compact the
+                        # anchor PLAN and rewrite node.anchor_slot while zero
+                        # mamba bytes move -> held anchors point at stale state.
+                        # Treat it exactly like the not-a-base case below: log +
+                        # skip the retain (today's flush), no silent success.
+                        logger.warning(
+                            "L15-RETAIN skipped reason=no-mamba-state: the "
+                            "pool mamba_cache is missing or empty, nothing to "
+                            "retain"
+                        )
+                    _ad = self.memory_saver_adapter
+                    # tms_set_keep_spans honours allocation BASES only (-1 =
+                    # not a base, and retain_at_sleep ignores the code). A
+                    # sub-view buffer would lose the hold SILENTLY while the
+                    # manifest says it was armed -- so check now, pre-move:
+                    # any not-a-base means today's flush, nothing moved.
+                    # tms_set_keep_spans acts on ALLOCATION BASES and the
+                    # per-layer KV/mamba buffers are views of a few big
+                    # buffers -- gate on the distinct bases (dedup by
+                    # data_ptr), not on every view.
+                    _bases = []
+                    _seen_b = set()
+                    for _t in _kv + _mb:
+                        _b = _t._base if _t._base is not None else _t
+                        if _b.data_ptr() not in _seen_b:
+                            _seen_b.add(_b.data_ptr())
+                            _bases.append(_b)
+                    _base_ok = all(_ad.alloc_info_ok(_b) for _b in _bases)
+                    if not _base_ok:
+                        logger.warning(
+                            "L15-RETAIN skipped reason=not-a-base: a "
+                            "KV/mamba buffer data_ptr is not a tracked "
+                            "allocation base (tms_alloc_info)"
+                        )
+                    _reqs = list(
+                        getattr(getattr(self, "running_batch", None), "reqs", None) or []
+                    ) + list(getattr(self, "weg2_d_parked", None) or [])
+                    _rgid = getattr(getattr(self, "server_args", None), "rank_gpu_id", None)
+                    _cards = (
+                        list(_rgid)
+                        if isinstance(_rgid, (list, tuple)) and len(_rgid) == _tp
+                        else list(range(_tp))
+                    )
+                    _caps = l15_shadow.caps_from_env(
+                        os.environ, _tp, [l15_shadow.cell_bytes_from(_pool)] * _tp, _cards
+                    )
+                    if _base_ok and _mb and _kv:
+                        # set_keep here only COLLECTs byte ranges per
+                        # allocation base: tms_set_keep_spans REPLACES the
+                        # base's keep set, so the real calls go out AFTER
+                        # retain returns -- one call per base, all ranges
+                        # (rc != 0 raises: the rows have moved by then).
+                        _keep_by_base = {}
+
+                        def _set_keep_collect(buf, spans):
+                            _b = buf._base if buf._base is not None else buf
+                            _key = _b.data_ptr()
+                            _off = buf.data_ptr() - _b.data_ptr()
+                            _unit = int(buf.stride(0)) * int(buf.element_size())
+                            _keep_by_base.setdefault(_key, (_b, []))
+                            _keep_by_base[_key][1].extend(
+                                (_off + int(lo) * _unit, _off + int(hi) * _unit)
+                                for lo, hi in spans
+                            )
+
+                        _l15_kwargs = l15_bind.build_retain_kwargs(
+                            _reqs,
+                            getattr(self.req_to_token_pool, "req_to_token", None),
+                            caps_rows_by_rank=_caps,
+                            cap_anchor_slots=len(_reqs),
+                            prefix=_prefix,
+                            rank=int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
+                            epoch=int(getattr(self, "_weg2_vote_epoch", 0) or 0),
+                            pid=os.getpid(),
+                            kv_buffers=_kv,
+                            mamba_buffers=_mb,
+                            allocator=self.token_to_kv_pool_allocator,
+                            reset_keep=self.tree_cache.reset_keep,
+                            set_keep=_set_keep_collect,
+                            manifest_path=os.environ.get("SGLANG_WEG2_L15_MANIFEST", "")
+                            or "/tmp/weg2_l15_manifest.json",
+                            log=logger.info,
+                        )
+            except Exception as exc:  # noqa: BLE001 - pre-move setup only
+                logger.warning(
+                    "L15-RETAIN failed before the move (flushing as today): %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                _l15_kwargs = None
+            _l15_res = None
+            if _l15_kwargs is not None:
+                _l15_res = l15_retain.retain_at_sleep(
+                    mamba_allocator=_l15_mba, **_l15_kwargs
+                )
+                if _l15_res is not None:
+                    # The keep spans are the one thing retain_at_sleep
+                    # itself could not persist (it collects per view); one
+                    # adapter call per base, rc != 0 raises.
+                    for _b, _ranges in _keep_by_base.values():
+                        _rc = _ad.set_keep_byte_spans(_b, _ranges)
+                        if _rc != 0:
+                            raise RuntimeError(
+                                f"L15-RETAIN set_keep_byte_spans rc={_rc}: the "
+                                f"buffers are moved but NOT kept "
+                                f"(base={_b.data_ptr()})"
+                            )
             self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
-            if self._flush_zero_kv_wanted(zero_kv):
-                # Default part of the flush (opt-out env): the post-flush
-                # state must equal a fresh boot, whose pools are torch.zeros.
-                # #1457: the Weg-2 sleep leg opts out (pages are discarded).
-                self._flush_zero_kv_buffers()
+            if _l15_res is not None:
+                # Retain ran reset_keep and re-armed both allocators; only
+                # the req rows go, keeping the compacted mamba anchors. The
+                # zeroing would destroy the held pages, so it is skipped.
+                self.req_to_token_pool.clear(keep_mamba_rows=_l15_res.a_h)
+            else:
+                self.tree_cache.reset()
+                self.req_to_token_pool.clear()
+                self.token_to_kv_pool_allocator.clear()
+                if self._flush_zero_kv_wanted(zero_kv):
+                    # Default part of the flush (opt-out env): the post-flush
+                    # state must equal a fresh boot, whose pools are torch.zeros.
+                    # #1457: the Weg-2 sleep leg opts out (pages are discarded).
+                    self._flush_zero_kv_buffers()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
 

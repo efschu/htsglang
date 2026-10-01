@@ -74,8 +74,18 @@ def refill_plan(
     cap_rows_by_rank: Sequence[int],
 ) -> List[Tuple[int, int, int]]:
     """Rows rank must refill from L2 as (compact_row, l2_slot, l2_gen).
-    A rank with cap > 0 kept its rows resident -> []. Tokens without an
-    L2 entry are skipped here and counted by count_missing()."""
+
+    Invariant (cap > 0 = resident): ``cap_rows_by_rank[rank] > 0`` means
+    this rank KEPT its rows mapped on the TMS keep spans through the hold,
+    so it owns no gap to refill and the plan is ``[]`` -- even a rank that
+    owns slots. Only a cap-0 rank (TP0, the 5090: held nowhere, refilled
+    from L2) gets a non-empty plan, naming exactly its L2-backed rows. A
+    future PARTIAL-hold variant (a rank that keeps only some of its rows)
+    must change this function: the ``cap > 0 -> []`` shortcut assumes
+    "kept everything", not "kept some".
+
+    Tokens without an L2 entry are skipped here and counted by
+    count_missing()."""
     if cap_rows_by_rank[rank] > 0:
         return []
     plan = []
@@ -113,9 +123,38 @@ def restore_line(
     epoch: int, verdict: str, rows_by_rank: Sequence[int],
     refill_rows: int, missing: int,
 ) -> str:
+    # rows_by_rank is the manifest's per-rank KEEP capacity (not the
+    # admitted rows of a HoldSet); printed as keep_rows_by_rank so the
+    # two never clash under the same log key.
     rows = ",".join(str(x) for x in rows_by_rank)
     return (
-        "L15-RESTORE epoch=%d verdict=%s rows_by_rank=%s "
+        "L15-RESTORE epoch=%d verdict=%s keep_rows_by_rank=%s "
         "refill_rows=%d missing=%d"
         % (epoch, verdict, rows, refill_rows, missing)
     )
+
+
+def l15_fp_reduce(
+    votes: Sequence[Optional[int]],
+) -> Tuple[Optional[Tuple[int, int]], bool]:
+    """Reduce the group's per-rank manifest fingerprints (L15-12 part 2).
+
+    ``votes`` is one entry per rank of the group: an int fingerprint when that
+    rank read its sleep manifest, ``None`` when it held nothing (master off,
+    or the manifest was absent / its owning process died).
+
+    Returns ``(minmax, mixed)`` where:
+      * ``minmax`` is ``(min, max)`` over the int votes, or ``None`` when no
+        rank had a fingerprint (the group holds nothing).
+      * ``mixed`` is True when some ranks had an int and at least one had
+        ``None``: the group disagrees on whether a hold exists at all, which
+        the wake site maps to "fallback" (a split hold cannot be kept whole).
+
+    Pure over the vote list (no I/O, no process group) so it is unit-testable
+    and its result is group-uniform: every rank passes the same ``gathered``
+    list and therefore computes the same ``(minmax, mixed)``.
+    """
+    ints = [v for v in votes if isinstance(v, int) and not isinstance(v, bool)]
+    if not ints:
+        return None, False
+    return (min(ints), max(ints)), (len(ints) != len(votes))

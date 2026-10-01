@@ -132,3 +132,32 @@ def test_build_retain_kwargs_drives_retain_at_sleep_end_to_end(tmp_path):
     assert len(result.keep_nodes) == 2
     assert any(n is node_a for n in result.keep_nodes)
     assert any(n is node_b for n in result.keep_nodes)
+
+
+def test_rows_by_rank_is_the_exact_owned_count(tmp_path):
+    # Prefix [0, 1, 7]: rank 0 owns residue 0 only, rank 1 owns 1..6. The
+    # req's 6 slots [1, 2, 4, 6, 3, 9] are all owned by rank 1: exact rows
+    # (0, 6). The old proportional estimate rows_split(6, 2, ratios=[1, 6])
+    # gave (1, 5) -- over-owning rank 0 by one row against its cap (audit
+    # item 11: compact_plan reserves by the exact count).
+    req = _req("r1", 0, 3, 4, 1, object(), "served", 0.0)
+    kw = build_retain_kwargs(
+        [req],
+        _req_to_token(),
+        caps_rows_by_rank=(100, 100),
+        cap_anchor_slots=10,
+        prefix=[0, 1, 7],
+        rank=0,
+        epoch=1,
+        pid=1,
+        kv_buffers=[],
+        mamba_buffers=[],
+        allocator=None,
+        reset_keep=lambda _ns: None,
+        set_keep=lambda _b, _s: None,
+        manifest_path=str(tmp_path / "m.json"),
+        log=lambda _msg: None,
+    )
+    assert kw["candidates"][0].rows_by_rank == (0, 6), (
+        "rows_by_rank must be the exact owned count, not a proportional split"
+    )

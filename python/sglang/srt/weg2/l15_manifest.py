@@ -47,7 +47,11 @@ class HoldSpan:
 class Manifest:
     """A rank's whole L1.5 hold state at one epoch, as published for the
     group. ``rows_by_rank`` is the per-rank row budget and ``anchor_slots``
-    the anchor region size -- both part of the group agreement."""
+    the anchor region size -- both part of the group agreement.
+    ``rows_by_rank`` is the per-rank KEEP capacity (blocks*ratio_r from the
+    compact plan), NOT the admitted rows -- ``l15_policy.HoldSet.rows_by_rank``
+    carries the latter, and the L15-RETAIN/L15-RESTORE log lines print this
+    field as ``keep_rows_by_rank``."""
 
     epoch: int
     pid: int
@@ -97,6 +101,29 @@ def _require(obj: dict, field: str, where: str) -> None:
         raise ValueError(f"malformed L1.5 manifest: {where} missing field {field!r}")
 
 
+def _as_int(obj: dict, field: str, where: str) -> int:
+    """Return ``int(obj[field])``; on a non-integer value raise ValueError
+    naming where and the field -- the from_json docstring promise. For a
+    list element the caller passes the element name (``'slots[0]'``) with a
+    single-element view of the list."""
+    value = obj[field]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: field {field!r} is not an integer: {value!r}") from None
+
+
+def _int_list(obj: dict, field: str, where: str) -> Tuple[int, ...]:
+    """Int-coerce every element of the list obj[field]; a non-integer
+    element raises naming it as ``field[i]``."""
+    raw = obj[field]
+    if not isinstance(raw, list):
+        raise ValueError(f"malformed L1.5 manifest: {where} field {field!r} is not a list")
+    return tuple(
+        _as_int({f"{field}[{i}]": x}, f"{field}[{i}]", where) for i, x in enumerate(raw)
+    )
+
+
 def from_json(s: str) -> Manifest:
     """Inverse of :func:`to_json`. A malformed record raises ValueError
     naming the offending field."""
@@ -120,19 +147,19 @@ def from_json(s: str) -> Manifest:
         spans.append(
             HoldSpan(
                 rid=str(sp["rid"]),
-                depth=int(sp["depth"]),
-                slots=tuple(int(x) for x in sp["slots"]),
-                anchor_slot=int(sp["anchor_slot"]),
-                l2_slots=tuple(int(x) for x in sp["l2_slots"]),
-                l2_gens=tuple(int(x) for x in sp["l2_gens"]),
+                depth=_as_int(sp, "depth", where),
+                slots=_int_list(sp, "slots", where),
+                anchor_slot=_as_int(sp, "anchor_slot", where),
+                l2_slots=_int_list(sp, "l2_slots", where),
+                l2_gens=_int_list(sp, "l2_gens", where),
             )
         )
     return Manifest(
-        epoch=int(obj["epoch"]),
-        pid=int(obj["pid"]),
+        epoch=_as_int(obj, "epoch", "record"),
+        pid=_as_int(obj, "pid", "record"),
         spans=tuple(spans),
-        rows_by_rank=tuple(int(x) for x in obj["rows_by_rank"]),
-        anchor_slots=int(obj["anchor_slots"]),
+        rows_by_rank=_int_list(obj, "rows_by_rank", "record"),
+        anchor_slots=_as_int(obj, "anchor_slots", "record"),
     )
 
 

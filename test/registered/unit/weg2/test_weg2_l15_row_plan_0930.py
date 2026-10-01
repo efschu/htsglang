@@ -28,6 +28,7 @@ import torch
 from sglang.srt.layers.dcp.owner import dcp_weighted_write_slots
 from sglang.srt.weg2.l15_row_plan import (
     RowPiece,
+    _dst_key,
     owner_prefix,
     owned_rows,
     plan_d_to_p,
@@ -227,6 +228,13 @@ def test_deterministic_order_by_dst_then_first_dst_row():
     assert run1 == run2
     keys = [(p.dst, p.dst_rows[0]) for p in run1]
     assert keys == sorted(keys)
+
+
+def test_dst_key_orders_ranks_numerically():
+    # Two-digit ids must rank by VALUE (tp2 before tp10), and tp* after pp*.
+    assert _dst_key("tp2") == ("tp", 2)
+    assert _dst_key("pp1") == ("pp", 1)
+    assert sorted(["tp10", "tp2", "pp1"], key=_dst_key) == ["pp1", "tp2", "tp10"]
 
 
 def test_rowpiece_is_frozen_dataclass_of_tuples():

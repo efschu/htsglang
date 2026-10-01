@@ -10,7 +10,8 @@ not wired yet; the manifest's l2 columns stay empty until that lands.
 
 from typing import Callable, Dict, Iterable, Tuple
 
-from sglang.srt.weg2.l15_shadow import candidates_from, rows_split
+from sglang.srt.weg2.l15_compact import owner_of
+from sglang.srt.weg2.l15_shadow import candidates_from
 
 
 def _seq_len(req) -> int:
@@ -44,7 +45,9 @@ def slots_of_req(req, req_to_token) -> Tuple[int, ...]:
 
 
 def anchor_slot_of_req(req) -> int:
-    """The req's mamba anchor slot; 0/None mean no anchor to hold."""
+    """The req's mamba anchor slot; a missing (None) or padding (0) anchor
+    raises -- one req without a holdable anchor skips the whole retain round
+    (benign: this runs before step 3, nothing is touched yet)."""
     idx = getattr(req, "mamba_pool_idx", None)
     rid = getattr(req, "rid", "?")
     if idx is None:
@@ -61,7 +64,8 @@ def anchor_slot_of_req(req) -> int:
 
 
 def node_of_req(req):
-    """The req's radix-tree node; None means nothing to keep."""
+    """The req's radix-tree node; a missing (None) node raises -- the retain
+    round skips (benign, pre-step-3: nothing is touched yet)."""
     node = getattr(req, "last_node", None)
     if node is None:
         raise ValueError(f"req {getattr(req, 'rid', '?')!r} has no last_node")
@@ -89,12 +93,11 @@ def build_retain_kwargs(
 ) -> Dict:
     """Assemble the whole retain_at_sleep keyword set from live reqs.
 
-    Geometry mirrors the L15 shadow hook: rows split over n_ranks =
-    len(prefix) - 1, anchor_depth = kv_depth = seqlen - 1 (the last token
-    has no KV yet); kind/last_active are duck-typed (l15_kind /
-    l15_last_active) until the hook lands.
+    Geometry: rows_by_rank = the EXACT per-rank owned count of the real
+    slots (l15_compact.owner_of over slots_of_req); anchor_depth = kv_depth
+    = seqlen - 1 (the last token has no KV yet); kind/last_active are
+    duck-typed (l15_kind / l15_last_active) until the hook lands.
     """
-    n_ranks = max(int(len(prefix)) - 1, 1)
     by_rid = {}
     entries = []
     for req in reqs:
@@ -103,6 +106,14 @@ def build_retain_kwargs(
         seq_len = _seq_len(req)
         # KV exists for seqlen - 1 tokens only (schedule_batch.py:2821).
         span = max(seq_len - 1, 0)
+        # rows_by_rank = the EXACT owned count of the req's real slots
+        # (owner_of over slots_of_req), not a proportional estimate:
+        # retain admits against caps with these rows, while compact_plan
+        # reserves by the exact owned count -- a proportional split can
+        # over-admit past a cap on the rounding residue (audit item 11).
+        _slots = slots_of_req(req, req_to_token)
+        _owned = tuple(owner_of(s, prefix) for s in _slots)
+        _n = len(prefix) - 1
         entries.append(
             {
                 "rid": rid,
@@ -110,7 +121,9 @@ def build_retain_kwargs(
                 "last_active": float(
                     getattr(req, "l15_last_active", 0.0) or 0.0
                 ),
-                "rows_by_rank": rows_split(span, n_ranks),
+                "rows_by_rank": tuple(
+                    sum(1 for o in _owned if o == r) for r in range(_n)
+                ),
                 "anchor_depth": span,
                 "kv_depth": span,
             }

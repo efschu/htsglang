@@ -7,6 +7,8 @@ Covers the five acceptance points of the task:
      l2_gen, a changed slot and a changed rows_by_rank
   4. agree/decide: equal fingerprints -> "hold", unequal -> "fallback"
   5. from_json of a record missing "spans" raises ValueError naming "spans"
+  6. from_json of a non-integer field value raises ValueError naming the
+     field ("epoch", "slots[0]")
 """
 
 import dataclasses
@@ -95,4 +97,23 @@ def test_agree_and_decide() -> None:
 def test_from_json_missing_spans_names_field() -> None:
     broken = '{"anchor_slots": 8, "epoch": 7, "pid": 1, "rows_by_rank": []}'
     with pytest.raises(ValueError, match="spans"):
+        from_json(broken)
+
+
+def test_from_json_bad_epoch_names_field() -> None:
+    broken = (
+        '{"anchor_slots": 8, "epoch": "abc", "pid": 1, '
+        '"rows_by_rank": [128], "spans": []}'
+    )
+    with pytest.raises(ValueError, match="epoch"):
+        from_json(broken)
+
+
+def test_from_json_bad_span_slot_names_field() -> None:
+    broken = (
+        '{"anchor_slots": 8, "epoch": 7, "pid": 1, "rows_by_rank": [128], '
+        '"spans": [{"rid": "a", "depth": 1, "slots": ["x"], "anchor_slot": 0, '
+        '"l2_slots": [], "l2_gens": []}]}'
+    )
+    with pytest.raises(ValueError, match="slots"):
         from_json(broken)

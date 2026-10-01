@@ -107,25 +107,59 @@ def caps_from_env(
     return tuple(caps)
 
 
+def kv_pool_of(pool: Any) -> Any:
+    """The pool that owns the KV ``k_buffer``/``v_buffer``: a hybrid wrapper
+    (``HybridLinearKVPool``, the 27B FA+GDN pool) keeps them on
+    ``.full_kv_pool`` and has no ``k_buffer`` of its own (N1 boot
+    dkr27browauthoritybar1fs10011036: every L15-SHADOW line cap=0,0,0 although
+    SGLANG_WEG2_L15_MIB=c1=7616,c2=1792 reached the D ranks). Same unwrap as
+    dual_p_kv_stage.stage_pools."""
+    inner = getattr(pool, "full_kv_pool", None)
+    return inner if inner is not None else pool
+
+
+def kv_buffers_of(pool: Any) -> List[Any]:
+    """Every per-layer K and V tensor of the (unwrapped) pool, K first; [] when
+    the pool has none (the L15 retain then must not plan a KV move)."""
+    p = kv_pool_of(pool)
+    out: List[Any] = []
+    for lst in (getattr(p, "k_buffer", None), getattr(p, "v_buffer", None)):
+        for t in (lst or ()):
+            if hasattr(t, "data_ptr") and hasattr(t, "numel"):
+                out.append(t)
+    return out
+
+
 def cell_bytes_from(pool: Any) -> int:
     """Bytes of KV held per one token row on this rank (0 when unknowable).
 
-    ``k_buffer``/``v_buffer`` are per-layer tensor lists; on paged layouts a
-    row holds ``_kv_tokens_per_row`` token slots, so divide. Any failure means
-    "cannot price" -> 0 (the shadow caps to 0, i.e. "not held here"), never a
-    raised exception on the hot path.
+    ``k_buffer``/``v_buffer`` are per-layer tensor lists of shape (rows,
+    heads, head_dim); one token's K+V bytes = sum over the layers of one ROW
+    of K and of V. On paged layouts a row holds ``_kv_tokens_per_row`` token
+    slots, so divide. A hybrid pool is unwrapped (``kv_pool_of``). Any failure
+    means "cannot price" -> 0 (the shadow caps to 0, i.e. "not held here"),
+    never a raised exception on the hot path.
+
+    (N1 fix: the earlier form multiplied the WHOLE layer tensor's numel, i.e.
+    the full pool's bytes, so even an unwrapped pool priced a cell of
+    gigabytes and every cap came out 0.)
     """
     try:
-        ks = getattr(pool, "k_buffer", None)
-        vs = getattr(pool, "v_buffer", None)
+        p = kv_pool_of(pool)
+        ks = getattr(p, "k_buffer", None)
+        vs = getattr(p, "v_buffer", None)
         if not ks or not vs or len(ks) != len(vs):
             return 0
-        t = ks[0]
-        if not hasattr(t, "numel"):
-            return 0
-        per_token = 2 * len(ks) * int(t.numel()) * int(t.element_size())
-        tpr = int(getattr(pool, "_kv_tokens_per_row", 1) or 1)
-        return int(per_token // tpr)
+        total = 0
+        for t in list(ks) + list(vs):
+            if not hasattr(t, "numel") or not getattr(t, "shape", None):
+                return 0
+            rows = int(t.shape[0])
+            if rows <= 0:
+                return 0
+            total += (int(t.numel()) // rows) * int(t.element_size())
+        tpr = int(getattr(p, "_kv_tokens_per_row", 1) or 1)
+        return int(total // tpr)
     except Exception:  # noqa: BLE001 - estimate only, never break the flush
         return 0
 
@@ -163,7 +197,10 @@ def rows_split(
         return tuple(base + (1 if i < rem else 0) for i in range(n))
     total = sum(vec)
     base = [(t * v) // total for v in vec]
-    for i in range(t - sum(base)):  # remainder < n, ranks in order
+    # remainder < #{ranks with share > 0}: a zero-share rank (the NF form's
+    # rank 0) owns no slot under the owner rule, so the remainder must skip
+    # it -- handing it a row would price a hold on a rank that cannot hold.
+    for i in [j for j in range(n) if vec[j] > 0][: t - sum(base)]:
         base[i] += 1
     return tuple(base)
 
