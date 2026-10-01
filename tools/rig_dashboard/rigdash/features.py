@@ -61,6 +61,8 @@ class FeatureFile:
         self.features: list = []
         self.produkt: list = []
         self.boot_overrides: dict = {}
+        self.updated_utc: Optional[str] = None
+        self.mtime: Optional[float] = None
         self.error: Optional[str] = None
 
     def load(self):
@@ -82,6 +84,8 @@ class FeatureFile:
                 self.produkt = [x for x in prod if isinstance(x, dict)] if isinstance(prod, list) else []
                 ov = d.get("boot_overrides")
                 self.boot_overrides = ov if isinstance(ov, dict) else {}
+                self.updated_utc = d.get("updated_utc") if isinstance(d.get("updated_utc"), str) else None
+                self.mtime = st.st_mtime
             except (OSError, ValueError) as e:
                 self.error = "%s: %s" % (type(e).__name__, e)   # keep the last good content
             self._sig = sig
@@ -212,6 +216,73 @@ def in_image(repo: str, rev: str, zweige: list, line: Optional[LineIndex]) -> di
     if missing and len(missing) == len([z for z in zweige if (z or {}).get("sha")]):
         return {"state": "unbekannt", "detail": "Commit(s) fehlen lokal: " + ", ".join(missing)}
     return {"state": "nein", "detail": "weder Vorfahr noch patch-/subject-gleich auf " + rev}
+
+
+# --------------------------------------------------------------------------- Stand (Nutzer 01.10.)
+# "Die Features-Soll/Ist-Liste und die Bausteinliste sind ewig nicht aktualisiert ... sorge dafür, dass sie
+# künftig nicht wieder veralten": der Stand der Datei wird angezeigt und gegen den letzten Boot und die Uhr
+# geprüft, und die Commits der Image-Linie, die in keinem Baustein stehen, rechnet rigdash selbst aus git.
+STAND_WARN_H = 12.0
+STAND_BAD_H = 24.0
+NEW_COMMITS_H = 48
+
+
+def newest_ist(produkt: list) -> Optional[str]:
+    best, best_ts = None, None
+    for p in produkt or []:
+        for x in (p.get("ist") or {}).values():
+            ts = belegt_ts((x or {}).get("belegt_am")) if isinstance(x, dict) else None
+            if ts is not None and (best_ts is None or ts > best_ts):
+                best, best_ts = x.get("belegt_am"), ts
+    return best
+
+
+def stand_view(file: "FeatureFile", boot_starts: dict, now: Optional[float] = None) -> dict:
+    """How old the list is, and whether a boot ran after its last entry (yellow > STAND_WARN_H or a newer boot,
+    red > STAND_BAD_H).  The timestamp is the file's own ``updated_utc``, else its mtime."""
+    now = now or time.time()
+    upd = belegt_ts(file.updated_utc) if file.updated_utc else None
+    t = upd if upd is not None else file.mtime
+    age_h = (now - t) / 3600.0 if t else None
+    newer = {m: ts for m, ts in (boot_starts or {}).items() if ts and t and ts > t}
+    level = ("bad" if age_h is not None and age_h > STAND_BAD_H else
+             "warn" if (age_h is not None and age_h > STAND_WARN_H) or newer else "ok")
+    return {"updated_utc": file.updated_utc, "t": t, "age_h": round(age_h, 1) if age_h is not None else None,
+            "newest_ist": newest_ist(file.produkt), "boots_after": newer, "level": level,
+            "warn_h": STAND_WARN_H, "bad_h": STAND_BAD_H}
+
+
+def new_commits(repo: str, rev: str, feats: list, im: dict, hours: int = NEW_COMMITS_H, limit: int = 40) -> dict:
+    """Commits on the image rev of the last ``hours`` that no Baustein names: not a ``zweige`` sha (prefix), not the
+    line commit a Baustein was matched to by patch-id/subject (``im_image.line_sha``)."""
+    if not rev:
+        return {"rev": rev, "commits": [], "error": "kein Image-Rev"}
+    out = _git(repo, "log", "--no-merges", "--since=%d hours ago" % hours, "--format=%H%x00%ct%x00%s", rev)
+    if out.returncode != 0:
+        return {"rev": rev, "commits": [], "error": out.stderr.decode(errors="replace").strip()[:200]}
+    known = set()
+    for f in feats:
+        for z in f.get("zweige") or []:
+            sha = (z or {}).get("sha") if isinstance(z, dict) else None
+            if sha:
+                known.add(sha[:10])
+    for v in (im or {}).values():
+        if isinstance(v, dict):
+            for k in ("sha", "line_sha"):
+                if v.get(k):
+                    known.add(str(v[k])[:10])
+    rows = []
+    for line in out.stdout.decode(errors="replace").splitlines():
+        h, _, rest = line.partition("\x00")
+        ct, _, subj = rest.partition("\x00")
+        if h[:10] in known:
+            continue
+        try:
+            t = int(ct)
+        except ValueError:
+            t = None
+        rows.append({"sha": h[:10], "t": t, "subject": _clean(subj)})
+    return {"rev": rev, "hours": hours, "commits": rows[:limit], "n": len(rows)}
 
 
 # --------------------------------------------------------------------------- aktiv
@@ -893,11 +964,25 @@ class Features:
                     "aus_begruendung": _clean(f.get("aus_begruendung")),
                     "image_aber_aus": im.get("state") == "ja" and ak.get("state") in ("aus", "teilweise"),
                 })
-            models.append({"model": model, "boot": bv, "features": rows, "git_s": (hit or {}).get("s")})
+            nc = None
+            if hit is not None and rev:
+                key = ("new", model, rev, sig, int(time.time() // 600))      # git once per 10 min and rev
+                with self._lock:
+                    nc = self._cache.get(key)
+                if nc is None:
+                    try:
+                        nc = new_commits(self.repo, rev, mine, imc)
+                    except (OSError, subprocess.SubprocessError) as e:
+                        nc = {"rev": rev, "commits": [], "error": "git: %s" % e}
+                    with self._lock:
+                        self._cache = {k: v for k, v in self._cache.items() if not (k[0] == "new" and k[1] == model)}
+                        self._cache[key] = nc
+            models.append({"model": model, "boot": bv, "features": rows, "git_s": (hit or {}).get("s"), "new_commits": nc})
         bs = {m["model"]: {r["id"]: r for r in m["features"]} for m in models}
         problems += validate_produkt(self.file.produkt, {f.get("id") for f in feats})
         problems += unassigned_bausteine(self.file.produkt, {f.get("id") for f in feats})
-        return {"path": self.file.path, "error": err, "problems": sorted(set(problems)), "models": models,
+        stand = stand_view(self.file, {m["model"]: (m["boot"] or {}).get("start_ts") for m in models})
+        return {"path": self.file.path, "error": err, "problems": sorted(set(problems)), "models": models, "stand": stand,
                 "produkt": produkt_view(self.file.produkt, bs,
                                         {m["model"]: (m["boot"] or {}).get("start_ts") for m in models}),
                 "kreuz_achsen": [{"key": k, "name": n} for k, n in KREUZ_ACHSEN]}

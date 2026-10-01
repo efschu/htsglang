@@ -454,8 +454,12 @@
   if (lgEl) lgEl.innerHTML = "<b style=\"color:var(--text)\">Band unter den Diagrammen = Phase:</b>" + PH.map((k) =>
     `<span class="lg" style="display:inline-flex;align-items:center;gap:4px"><i class="ph-k-${k}" style="display:inline-block;width:18px;height:11px;border-radius:2px${k === "idle" ? ";--ic:var(--muted)" : ""}"></i>${PH_NAME[k]}</span>`).join("");
   bar();
-  load(true);
-  setInterval(() => load(false), 10000);
+  // Tabs (Nutzer 01.10.): Verlauf und Karten liegen in eigenen Tabs; versteckt wird nicht geladen, beim Zeigen
+  // sofort geladen und auf die echte Breite neu gebaut (uPlot misst die Breite beim Bauen)
+  const visible = () => { const a = $("verlauf"), b = $("gpus-card"); return (a && a.offsetParent !== null) || (b && b.offsetParent !== null); };
+  window.RigGrafik = { show() { sig = ""; load(true); } };
+  if (visible()) load(true);
+  setInterval(() => { if (visible()) load(false); }, 10000);
   // ein Zoom irgendwo auf der Seite: den Bereich aus SQLite neu laden (feineres Raster), alle Diagramme darauf
   if (window.RigZoom) RigZoom.on(() => load(true));
 })();

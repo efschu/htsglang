@@ -296,6 +296,67 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .sparkbox .endv { position: absolute; right: 0; transform: translateY(-50%); font-size: 11px; font-weight: 650; color: var(--text);
   background: var(--surface); padding: 0 3px; border-radius: 3px; pointer-events: none; font-variant-numeric: tabular-nums; }
 .spark .area { stroke: none; }
+/* ---- Tabs, Expertenansicht, Überblick (Nutzer 01.10. ~07:20Z: "Bedienung absolut miserabel", Tabs und
+   einklappbare Bereiche; fast alle Messwerte hinter eine Expertenansicht; nichts kürzen) ---- */
+.tabbar { display: flex; flex-wrap: wrap; gap: 0 2px; padding: 0 16px; background: var(--surface);
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 6; }
+.tabbar button { font: inherit; font-size: 14px; padding: 9px 14px 7px; border: 0; border-bottom: 3px solid transparent;
+  background: none; color: var(--text-2); cursor: pointer; }
+.tabbar button:hover { color: var(--text); }
+.tabbar button.sel { color: var(--text); border-bottom-color: var(--s1); font-weight: 650; }
+.tabbar .cnt:not(:empty) { font-size: 11px; font-weight: 650; padding: 0 6px; border-radius: 9px; margin-left: 4px;
+  background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--text); }
+.tabbar .cnt.bad:not(:empty) { background: color-mix(in srgb, var(--bad) 25%, transparent); }
+.tab[hidden] { display: none !important; }
+body:not(.expert) .x { display: none !important; }
+body:not(.expert) .ipcsrc, body:not(.expert) .logsrc { display: none; }
+body:not(.expert) .kv > div:not(.keep) { display: none; }
+body:not(.expert) .kv:not(:has(> div.keep)) { display: none; }
+details.fold { padding: 0; }
+details.fold > summary { list-style: none; padding: 12px 14px; cursor: pointer; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary h2 { display: inline; margin: 0; }
+details.fold > summary::before { content: "\25B8"; display: inline-block; width: 1.1em; color: var(--muted); transition: transform .15s; }
+details.fold[open] > summary::before { transform: rotate(90deg); }
+details.fold > :not(summary) { margin-left: 14px; margin-right: 14px; }
+details.fold[open] { padding-bottom: 12px; }
+.ov { display: grid; gap: 12px; margin-bottom: 12px; }
+.ovcard { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; min-width: 0; }
+.ovcard.dead { border: 3px solid var(--alarm-dead); } .ovcard.hang { border: 3px solid var(--alarm-hang); }
+.ovcard.off { opacity: .8; }
+.ovhead { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 10px; }
+.ovhead .model { font-size: 17px; font-weight: 650; overflow-wrap: anywhere; }
+.ovhead .when { color: var(--muted); font-size: 12px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.kpi { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px 7px; min-width: 0; background: var(--surface); }
+.kpi .k { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 5px; }
+.kpi .k i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex: none; }
+.kpi .v { font-size: 28px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.2; white-space: nowrap; }
+.kpi .v small { font-size: 13px; font-weight: 400; color: var(--text-2); margin-left: 3px; }
+.kpi .v.na { font-size: 14px; font-weight: 500; color: var(--muted); white-space: normal; line-height: 1.3; padding: 6px 0 3px; }
+.kpi .s { font-size: 11.5px; color: var(--muted); min-height: 1.3em; overflow-wrap: anywhere; }
+.kpi.hl { border-color: color-mix(in srgb, var(--s7) 55%, var(--line)); box-shadow: inset 3px 0 0 var(--s7); }
+.kpi.on .v { color: var(--c, var(--text)); }
+.kpi.ok .v { color: var(--good); } .kpi.bad .v { color: var(--bad); } .kpi.warn .v { color: var(--warn); }
+.ovline { font-size: 13px; color: var(--text-2); padding: 8px 12px; border: 1px dashed var(--line); border-radius: 8px; }
+.gpuqstrip { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12.5px; margin: 0 0 12px; }
+.gpuqstrip b { color: var(--text); }
+.ovcard .phasewrap { margin: 12px 0 0; }
+.vl-grafana { margin-top: 10px; font-size: 12.5px; color: var(--text-2); }
+details.fold-sub { margin: 4px 0; } details.fold-sub > summary { font-size: 13px; color: var(--text); }
+/* Handy (01.10.): lange Tags/Quellen im Boot-Kopf schoben die Seite auf 847 px */
+section.card .muted, section.card .mono { overflow-wrap: anywhere; }
+section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap: anywhere; }
+.stand { font-size: 12.5px; padding: 8px 10px; border-radius: 8px; margin: 0 0 10px; border: 1px solid var(--line); background: var(--surface-2); }
+.stand.warn { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, var(--surface)); }
+.stand.bad { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, var(--surface)); }
+@media (max-width: 760px) {
+  .tabbar { padding: 0 6px; overflow-x: auto; flex-wrap: nowrap; }
+  .tabbar button { padding: 8px 10px 6px; font-size: 13px; white-space: nowrap; }
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpi .v { font-size: 22px; }
+}
 </style>
 </head>
 <body>
@@ -306,6 +367,7 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
   </a>
   <h1 id="title">Rig-Dashboard</h1>
   <span class="sub" id="sub">verbinde&hellip;</span>
+  <label class="livebox" title="Expertenansicht (Nutzer 01.10.): alle Messdetails, Quellen und Instrumente; gemerkt in diesem Browser"><input type="checkbox" id="expert"> Expertenansicht</label>
   <label class="livebox"><input type="checkbox" id="live-pause"> Live-Update pausieren <span class="note" id="pausenote"></span></label>
   <nav>
     <!--DEV:BEGIN-->
@@ -314,15 +376,32 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
     <a id="plannerlink" class="lan" href="#" target="_blank" rel="noopener">Planer (Tafeln, Wizard)</a>
     <span id="lannote" class="muted" style="display:none">Planer, GPU-Fensterplan, Startzeile: nur im LAN</span>
     <!--DEV:END-->
+    <a id="grafanalink" class="lan" href="#" target="_blank" rel="noopener" title="Verläufe aus VictoriaMetrics (nur im LAN)">Grafana</a>
     <a href="api/live" target="_blank" rel="noopener">JSON</a>
   </nav>
 </header>
+<!-- Tabs (Nutzer 01.10.: "Tabs und einklappbare Bereiche, eine schlaue Ordnung"); Auswahl in localStorage und #hash -->
+<nav class="tabbar" id="tabbar" role="tablist" aria-label="Bereiche">
+  <button type="button" role="tab" data-tab="ueberblick">Überblick</button>
+  <button type="button" role="tab" data-tab="boots">Boots</button>
+  <button type="button" role="tab" data-tab="verlauf">Verlauf</button>
+  <button type="button" role="tab" data-tab="karten">Karten</button>
+  <!--DEV:BEGIN-->
+  <button type="button" role="tab" data-tab="entwicklung">Entwicklung <span class="cnt" id="tab-dev-cnt"></span></button>
+  <!--DEV:END-->
+</nav>
 <main>
   <!-- Oberer Teil: Geschwindigkeit, Effizienz, Statistik (auch in der veröffentlichten fLLiper-Ausgabe) -->
-  <div class="chips" id="chips"></div>
-  <div class="cardstrip" id="cardstrip"></div>
-  <div class="vtiles" id="vmtiles" aria-label="aus VictoriaMetrics"></div>
+  <div class="chips x" id="chips"></div>
+  <div class="tab" id="tab-ueberblick" role="tabpanel">
+    <div id="overview"></div>
+    <div class="cardstrip" id="cardstrip"></div>
+    <div class="vtiles x" id="vmtiles" aria-label="aus VictoriaMetrics"></div>
+  </div>
+  <div class="tab" id="tab-boots" role="tabpanel" hidden>
   <div id="boots"></div>
+  </div>
+  <div class="tab" id="tab-verlauf" role="tabpanel" hidden>
   <section class="card" id="verlauf" aria-label="Verlauf je Modell">
     <div class="vl-bar"><h2>Verlauf</h2><span class="seg" id="vl-model"></span><span class="seg" id="vl-range"></span>
       <span class="vl-note" id="vl-note">lade&hellip;</span></div>
@@ -335,7 +414,10 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
       <div class="vp"><h3><span>KV-Cache-Belegung <span class="muted">% der KV-Token je Gruppe</span></span><span id="vl-s-kv"></span></h3><div class="u" id="vl-c-kv"></div></div>
       <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; P&rarr;D: P-Ende &rarr; erstes Decode-Token &middot; D&rarr;P: Decode-Ende &rarr; P-Prefill-Start (flip_user_time, ab Build y4z)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
     </div>
+    <div class="vl-grafana" id="vl-grafana"></div>
   </section>
+  </div>
+  <div class="tab" id="tab-karten" role="tabpanel" hidden>
   <section class="card" id="gpus-card">
     <h2>Karten <span class="muted">NVML &middot; jetzt und Verlauf (Zeitraum wie oben)</span></h2>
     <div class="vtiles" id="hw-tiles"></div>
@@ -347,8 +429,51 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
       <div class="vp w2"><h3><span>Host: CPU &amp; Speicher <span class="muted">%</span></span><span id="hw-s-host"></span></h3><div class="u" id="hw-c-host"></div></div>
     </div>
   </section>
-  <section class="card note">
-    <h2>Instrumente</h2>
+  </div>
+  <!--DEV:BEGIN-->
+  <div class="tab" id="tab-entwicklung" role="tabpanel" hidden>
+  <div class="devhead" id="dev-head"><h2>Entwicklungsstand</h2><span class="muted">nur im Rig-Dashboard; die veröffentlichte fLLiper-Ausgabe (<span class="mono">--edition release</span>) liefert diesen Teil nicht aus &middot; Bereiche auf-/zuklappen, der Zustand bleibt gemerkt</span></div>
+  <details class="card fold" id="launch-card">
+    <summary><h2>Startflags &amp; ENV <span class="muted">je Modell, laufender bzw. letzter Boot &middot; Container / Front / P / D &middot; P&harr;D-Vergleich</span><span class="ipcsrc" title="state.json: groups.{P,D}.launch, launch.front, launch.container">state.json</span></h2></summary>
+    <div class="lf-tools">
+      <input type="search" id="lf-filter" placeholder="Filter über alle Flags und ENV (Name oder Wert)" autocomplete="off">
+      <span class="lf-legend lf"><span class="d-differ">P&ne;D</span><span class="d-onlyp">nur P</span><span class="d-onlyd">nur D</span></span>
+      <span class="muted" id="lf-note"></span>
+    </div>
+    <div id="launchbox"></div>
+  </details>
+  <details class="card fold" id="prod-card" open>
+    <summary><h2>Features Soll/Ist <span class="muted">Produkt-Features je Modell: Soll (messbar) &middot; Ist nur mit Beleg, sonst &bdquo;unbelegt&ldquo; &middot; <span class="stale-key">gelb</span> = Beleg &auml;lter als der letzte Boot des Modells, neu messen &middot; Wert im aktuellen Boot aus live.py/state.json &middot; Bausteine = Commits/Fixes darunter</span></h2></summary>
+    <div id="prod-stand"></div>
+    <div id="prod"></div>
+  </details>
+  <details class="card fold" id="feat-card">
+    <summary><h2>Bausteine <span class="muted">Commits/Fixes je Modell: je Modell: fertig &middot; im Image (git-Vorfahr / patch-id / Betreff gegen die Image-REV, hier gerechnet) &middot; aktiv (state.json launch, sonst Profil) &middot; Gewinn &middot; Begr&uuml;ndung wenn aus</span>
+      </h2></summary>
+    <label class="muted" style="font-size:12px;display:block;margin:-4px 0 8px"><input type="checkbox" id="feat-only-off"> nur &bdquo;im Image, aber aus&ldquo;</label>
+    <div id="feat-new"></div>
+    <div id="feat"></div>
+  </details>
+  <details class="card fold" id="imgchg-card">
+    <summary><h2>Image-&Auml;nderungen <span class="muted">was das laufende Boot-Image je Sitz gegen&uuml;ber seinem Vorg&auml;nger tr&auml;gt, erwartete Wirkung und Stand am Metall</span></h2></summary>
+    <div id="imgchg"></div>
+  </details>
+  <details class="card fold" id="fold-gpuq" open>
+    <summary><h2>GPU-Fensterplan <span class="muted">gpuq, laufende und wartende Fenster</span></h2></summary>
+    <div id="gpuq" class="tablewrap"></div>
+  </details>
+  <details class="card fold" id="fold-history" open>
+    <summary><h2>Letzte Boots <span class="muted">aus den state-Ordnern der letzten 6 h: Kopf, Lebenszyklus, Stopp-Ursache und Zahlen aus state.json, events.jsonl und rankstats</span><span class="ipcsrc">IPC</span></h2></summary>
+    <div id="history" class="tablewrap"></div>
+  </details>
+  <details class="card fold" id="fold-containers">
+    <summary><h2>Container <span class="muted">Docker auf dem Proxmox-Host (htsglang-*)</span></h2></summary>
+    <div id="containers" class="tablewrap"></div>
+  </details>
+  </div>
+  <!--DEV:END-->
+  <details class="card note fold" id="fold-instrumente">
+    <summary><h2>Instrumente <span class="muted">woher die Zahlen kommen</span></h2></summary>
     <p>Alle Zahlen oben kommen aus der Inter-Prozess-Kommunikation, kein Boot-Protokoll wird gelesen (NF-Operator 30.09.):
     je Boot <span class="mono">state.json</span>, <span class="mono">events.jsonl</span> und je Rang
     <span class="mono">rankstate/&lt;G&gt;/*.rankstats</span> (kumulative Z&auml;hler, vom Rang alle ~1 s geschrieben);
@@ -361,45 +486,13 @@ tr.feat-off td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
     mit Arbeit (Leerlauf-Proben z&auml;hlen nicht); <b>jetzt</b> = die letzte Probe.</p>
     <p><b>Decode tok/s</b> = &Delta;<span class="mono">decode.tokens</span> (TP0) / &Delta;ts &uuml;ber die Proben mit Arbeit;
     <b>je Stream</b> = das durch <span class="mono">decode.running</span>; Rechenrate = &Delta;decode.tokens / &Delta;<span class="mono">decode.gpu_ms</span>.</p>
-    <p>Das Dashboard schickt keinem Modell eine Anfrage au&szlig;er <span class="mono">GET /weg2/state</span> alle 10 s.</p>
-  </section>
-  <!--DEV:BEGIN-->
-  <div class="devhead" id="dev-head"><h2>Entwicklungsstand</h2><span class="muted">nur im Rig-Dashboard; die veröffentlichte fLLiper-Ausgabe (<span class="mono">--edition release</span>) liefert diesen Teil nicht aus</span></div>
-  <section class="card" id="launch-card">
-    <h2>Startflags &amp; ENV <span class="muted">je Modell, laufender bzw. letzter Boot &middot; Container / Front / P / D &middot; P&harr;D-Vergleich</span><span class="ipcsrc" title="state.json: groups.{P,D}.launch, launch.front, launch.container">state.json</span></h2>
-    <div class="lf-tools">
-      <input type="search" id="lf-filter" placeholder="Filter über alle Flags und ENV (Name oder Wert)" autocomplete="off">
-      <span class="lf-legend lf"><span class="d-differ">P&ne;D</span><span class="d-onlyp">nur P</span><span class="d-onlyd">nur D</span></span>
-      <span class="muted" id="lf-note"></span>
-    </div>
-    <div id="launchbox"></div>
-  </section>
-  <section class="card" id="prod-card">
-    <h2>Features Soll/Ist <span class="muted">Produkt-Features je Modell: Soll (messbar) &middot; Ist nur mit Beleg, sonst &bdquo;unbelegt&ldquo; &middot; <span class="stale-key">gelb</span> = Beleg &auml;lter als der letzte Boot des Modells, neu messen &middot; Wert im aktuellen Boot aus live.py/state.json &middot; Bausteine = Commits/Fixes darunter</span></h2>
-    <div id="prod"></div>
-  </section>
-  <section class="card" id="feat-card">
-    <h2>Bausteine <span class="muted">Commits/Fixes je Modell: je Modell: fertig &middot; im Image (git-Vorfahr / patch-id / Betreff gegen die Image-REV, hier gerechnet) &middot; aktiv (state.json launch, sonst Profil) &middot; Gewinn &middot; Begr&uuml;ndung wenn aus</span>
-      <label class="muted" style="font-size:12px;float:right"><input type="checkbox" id="feat-only-off"> nur &bdquo;im Image, aber aus&ldquo;</label></h2>
-    <div id="feat"></div>
-  </section>
-  <section class="card" id="imgchg-card">
-    <h2>Image-&Auml;nderungen <span class="muted">was das laufende Boot-Image je Sitz gegen&uuml;ber seinem Vorg&auml;nger tr&auml;gt, erwartete Wirkung und Stand am Metall</span></h2>
-    <div id="imgchg"></div>
-  </section>
-  <section class="card">
-    <h2>Container <span class="muted">Docker auf dem Proxmox-Host (htsglang-*)</span></h2>
-    <div id="containers" class="tablewrap"></div>
-  </section>
-  <section class="card">
-    <h2>GPU-Fensterplan <span class="muted">gpuq, laufende und wartende Fenster</span></h2>
-    <div id="gpuq" class="tablewrap"></div>
-  </section>
-  <section class="card">
-    <h2>Letzte Boots <span class="muted">aus den state-Ordnern der letzten 6 h: Kopf, Lebenszyklus, Stopp-Ursache und Zahlen aus state.json, events.jsonl und rankstats</span><span class="ipcsrc">IPC</span></h2>
-    <div id="history" class="tablewrap"></div>
-  </section>
-  <!--DEV:END-->
+    <p>Das Dashboard schickt keinem Modell eine Anfrage au&szlig;er <span class="mono">GET /weg2/state</span> alle 10 s.
+    VictoriaMetrics (:8428) holt <span class="mono">/metrics</span> der Front alle 15 s (Nutzer-Order 01.10.: Zeitreihen-DB).</p>
+    <p><b>TTFT</b> = Ankunft an der Front &rarr; erster Inhalt von D (<span class="mono">LEG2-FIRST-CONTENT</span>), als IPC-Z&auml;hler
+    <span class="mono">state.json front.arrival_seat.ttft_*</span> (NF-Front); der Probennehmer schreibt ihn nach VictoriaMetrics
+    (<span class="mono">weg2_front_ttft_*</span>), die Kachel liest per PromQL. Die 27B-Front hat ihn bis zum Image mit
+    <span class="mono">weg2_ttft_seconds</span> nicht.</p>
+  </details>
 </main>
 <div class="tip" id="tip"></div>
 <script src="zoom.js"></script>
@@ -548,7 +641,7 @@ function rateCharts(b, key, color, digits, now, binders) {
     const w = spark(`sp-${b.stem}-${key}-w`, ser.t, ser[key + "_per_w"], color, "tok/s/W", 2, now,
       Object.assign({}, o, {h: 40, caption: "tok/s pro Watt (Wanduhr) &middot; Nenner: &Sigma; power.draw aller 3 Karten (nvidia-smi, 5-s-Mittel), inkl. Idle der schlafenden Gruppe"}));
     binders.push(w.bind);
-    h += w.svg;
+    h += `<div class="x">${w.svg}</div>`;
   }
   return h;
 }
@@ -597,14 +690,14 @@ function phaseTip(x, single) {
   if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; l&auml;uft" : ""}`;
   return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok${x.running ? " &middot; l&auml;uft" : ""}`;
 }
-function phaseHtml(b) {
+function phaseHtml(b, pre) {
   const tl = b.timeline;
   if (!tl || !tl.segs) return "";
   const single = !(b.prefill || {}).D && !!(b.prefill || {}).single;
   const z = window.RigZoom && RigZoom.get();
   const span = z ? z[1] - z[0] : Math.min(phaseSpanS(), tl.span_s), t1 = z ? z[1] : tl.t1, t0 = t1 - span;
   const segs = tl.segs.filter((x) => x.e > t0 && x.s < t1).map((x) => Object.assign({}, x, {s: Math.max(x.s, t0), e: Math.min(x.e, t1)}));
-  const id = "pb-" + b.stem;
+  const id = (pre || "pb-") + b.stem;
   phaseData[id] = {segs, single};
   const pos = (t) => (100 * (t - t0) / span).toFixed(3);
   const bars = segs.map((x, i) => {
@@ -706,7 +799,7 @@ function bigPair(lbl60, v60, one, digits, extra, max3, L) {
     max: "max 3 s", maxT: "höchste 3-s-Rate der letzten 120 s, nur über Decode-Zeit"};
   const on = one > 0;
   return `<div class="bigrow ${on ? "on" : "off"}" title="${L.oneT}"><span class="bl">${L.one}</span><span class="big num">${fmt(one, digits)}<small>tok/s</small></span>${extra || ""}</div>
-    <div class="bigrow" title="${L.maxT}"><span class="bl">${L.max}</span><span class="big num">${max3 == null ? "–" : fmt(max3, digits) + "<small>tok/s</small>"}</span></div>
+    <div class="bigrow x" title="${L.maxT}"><span class="bl">${L.max}</span><span class="big num">${max3 == null ? "–" : fmt(max3, digits) + "<small>tok/s</small>"}</span></div>
     <div class="bigrow"><span class="bl">${lbl60}</span><span class="big num">${v60 == null ? "–" : fmt(v60, digits) + "<small>tok/s</small>"}</span></div>`;
 }
 const PREFILL_L = {one: "Rate laufender Schub", oneT: "Tokens des laufenden Schubs / (jetzt letztes Chunk-Ende − Start seines ersten Chunks); ein Chunk zählt über die Sekunden, in denen er rechnete (prefill.last t/gpu_ms), nie in der Probe, in der sein Zähler sprang; 0 = die Phase rechnet gerade nicht",
@@ -756,7 +849,7 @@ function decodeTile(b, g, color, binders, now) {
     ${bigPair(active ? "Wanduhr 60 s" : "letzter Wert", v, one, 1, bsBadge(d, one > 0), d.max3s_120)}
     <div class="state">${state}</div>
     ${kv([
-      ["laufende Anfragen (bs) &middot; je Stream", `${fmt(d.last_bs != null ? d.last_bs : d.running)} &middot; ${per == null ? "—" : fmt(per, 1) + " tok/s"}${d.per_stream_n ? ` <span class="muted">(${d.per_stream_n} Proben mit Decode davor und danach)</span>` : ""}`],
+      ["laufende Anfragen (bs) &middot; je Stream", `${fmt(d.last_bs != null ? d.last_bs : d.running)} &middot; ${per == null ? "—" : fmt(per, 1) + " tok/s"}${d.per_stream_n ? ` <span class="muted x">(${d.per_stream_n} Proben mit Decode davor und danach)</span>` : ""}`, "keep"],
       // Nutzer 30.09. ~21:10Z: je Stream nur mit der Zahl der Sitze -- beide mit demselben Nenner (Decode-Zeit)
       ["<span title=\"Sitze = Batchgr&ouml;&szlig;e der Decode-Runden, nach Rundenzeit gewichtet und nur &uuml;ber die Zeit gemittelt, in der D dekodierte (Schlaf, Flip, Extend z&auml;hlen nicht als 0 Sitze). Gesamt = je Stream &times; &Oslash; Sitze.\">je Stream bei &Oslash; Sitzen, 60 s &#9432;</span>",
         per != null && d.seats_mean != null ? `<b>${fmt(per, 1)}</b> tok/s je Stream bei &Oslash; <b>${fmt(d.seats_mean, 1)}</b> Sitzen${d.seats_min != null ? ` (${fmt(d.seats_min)}&ndash;${fmt(d.seats_max)})` : ""} &middot; Gesamt &asymp; ${fmt(per * d.seats_mean, 0)} tok/s${d.seats_src ? ` <span class="muted">(${esc(d.seats_src)})</span>` : ""}` : "—"],
@@ -960,7 +1053,7 @@ function bootCard(b, now, binders) {
       ${c ? `<span class="chip ${c.State !== "running" ? "bad" : /unhealthy/.test(c.Status || "") ? "warn" : "ok"}">${DEV ? esc(c.Names) : "Container"} &middot; ${esc(c.Status)}</span>` : `<span class="chip warn">kein laufender Container zu diesem Boot</span>`}
       ${health.length && !plannedStopped(b) ? `<span class="chip bad">Gruppe ${health.map((h) => esc(h.group)).join(", ")} tot (front.groups)${srcOf(b, "A12")}</span>` : ""}
     </div>
-    <div class="muted" style="font-size:12px;margin:-6px 0 10px">
+    <div class="muted x" style="font-size:12px;margin:-6px 0 10px">
       ${!DEV ? relHead(b, ipc, topo) : `<span class="mono">${esc(m.tag || b.stem)}</span>${ipc
         ? ` &middot; REV ${esc(ipc.rev)} &middot; Profil ${esc(ipc.profile)} &middot; ${esc(ipc.image)} &middot; lifecycle <b>${esc(ipc.lifecycle)}</b>${ipc.cause && ipc.cause.code ? " (" + esc(ipc.cause.code) + ")" : ""}${topo ? " &middot; " + esc(topo) : ""} ${ipcTag("state.json " + (ipc.boot_id || ""))}`
         : `${m.sha ? " &middot; Baum " + esc(m.sha) : ""}${topo ? " &middot; " + esc(topo) : ""}${LOGSRC}`}`}${fieldIpc(b, "A4") ? " &middot; " + esc(Object.entries(fieldIpc(b, "A4").value).map(([g, f]) => g + ": " + (f && typeof f === "object" ? (f.describe || Object.entries(f).map(([k, v]) => k + "=" + (typeof v === "object" ? JSON.stringify(v) : v)).join(" ")) : f)).join(" | ")) + " " + ipcTag("state.json groups.form") : m.form ? " &middot; " + esc(m.form) + srcOf(b, "A4") : ""}
@@ -975,8 +1068,8 @@ function bootCard(b, now, binders) {
         <div class="big num">${fmt(fieldIpc(b, "B4") ? fieldIpc(b, "B4").value.n : b.flip_count)}<small>Flips</small></div>
         <div class="state">${lastFlip ? `letzter ${esc(lastFlip.slept)}→${esc(lastFlip.woke)} vor ${ago(now - lastFlip.t)}` : "noch kein Flip"}</div>
         ${kv([
-          ...flipRows,
-          ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue"))],
+          ...flipRows.map((r) => r && [r[0], r[1], "keep"]),
+          ["Warteschlange Front", fmt(q) + (fr ? " " + ipcTag(fr.src || "/weg2/state") : MISSTAG("front.queue")), "keep"],
           fr && fr.served ? ["bedient P / D", `${fmt((fr.served || {}).P)} / ${fmt((fr.served || {}).D)} ${ipcTag(fr.src || "/weg2/state")}`] : null,
           prefillOrt(b),
           ["Fehlerzeilen (ERROR)", fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count) + " " + srcOf(b, "A13")],
@@ -988,10 +1081,10 @@ function bootCard(b, now, binders) {
         ${flipHtml}${flipHtml ? `<div class="muted" style="font-size:11px">letzte ${recent.length} Flips, Höhe = ${byTotal ? ins.flip_total : ins.first_token} &middot; <span style="color:var(--s1)">■</span> P→D <span style="color:var(--s2)">■</span> D→P</div>` : ""}
       </div>
     </div>
-    ${cacheHtml(b, now, awake)}
-    ${!DEV ? "" : ipc && Object.keys(ipc.launch || {}).length ? `<details id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform je Gruppe (argv + Schalter-Env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
+    <div class="x">${cacheHtml(b, now, awake)}</div>
+    ${!DEV ? "" : ipc && Object.keys(ipc.launch || {}).length ? `<details class="x" id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform je Gruppe (argv + Schalter-Env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
       : ""}
-    ${errs.length ? `<details id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count)})${srcOf(b, "A13")}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
+    ${errs.length ? `<details class="x" id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count)})${srcOf(b, "A13")}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}
   </section>`;
 }
 
@@ -1141,7 +1234,7 @@ function prodHtml(d) {
   const achsen = fv.kreuz_achsen || [];
   const nStale = fv.produkt.reduce((n, p) => n + PROD_MODELS.filter((m) => (p.ist[m] || {}).veraltet).length, 0);
   return `<div class="muted" style="margin:-4px 0 8px">${fv.produkt.length} Features &middot; ${nStale} Ist-Zellen veraltet (Beleg &auml;lter als der letzte Boot)</div><div class="tablewrap"><table class="prod">
-    <tr><th>#</th><th>Feature</th><th>Soll</th><th>Ist 27B</th><th>Ist NF</th><th>Soll erreicht?</th><th>Status</th><th>Beleg</th><th>Wert im aktuellen Boot</th><th>Bausteine</th></tr>`
+    <tr><th>#</th><th>Feature</th><th>Soll</th><th>Ist 27B</th><th>Ist NF</th><th>Soll erreicht?</th><th>Status</th><th class="x">Beleg</th><th>Wert im aktuellen Boot</th><th>Bausteine</th></tr>`
     + fv.produkt.map((p) => {
       const ist = p.ist || {};
       const st = PROD_MODELS.map((m) => {
@@ -1161,9 +1254,46 @@ function prodHtml(d) {
         p.marker ? `<details id="pr-${esc(p.id)}"><summary>Instrument-Marker</summary>${Object.entries(p.marker).map(([m, x]) => `<div class="am"><b>${m}:</b> ${esc(x.marker)} &middot; ${Object.entries(x.je_format || {}).map(([f, v]) => esc(f + ": " + v)).join(" &middot; ")}</div>`).join("")}</details>` : "",
       ].join("");
       return `<tr><td class="mono">${esc(p.nr || "")}</td><td><b>${esc(p.titel)}</b></td><td class="soll">${esc(p.soll)}</td>
-        <td class="ist">${prodIst(ist["27B"] || {})}</td><td class="ist">${prodIst(ist.NF || {})}</td><td>${erc}</td><td>${st}</td><td class="bel">${bel}</td><td class="akt">${akt}</td><td>${prodBausteine(p)}</td></tr>`
+        <td class="ist">${prodIst(ist["27B"] || {})}</td><td class="ist">${prodIst(ist.NF || {})}</td><td>${erc}</td><td>${st}</td><td class="bel x">${bel}</td><td class="akt">${akt}</td><td>${prodBausteine(p)}</td></tr>`
         + (extra ? `<tr><td></td><td colspan="9">${extra}</td></tr>` : "");
     }).join("") + `</table></div>`;
+}
+// Stand der Liste (Nutzer 01.10.: "ewig nicht aktualisiert ... künftig nicht wieder veralten"): Alter von
+// features.json gegen Uhr und letzten Boot, gelb ab 12 h oder wenn danach gebootet wurde, rot ab 24 h
+function standHtml(d) {
+  const st = (d.features || {}).stand;
+  if (!st) return "";
+  const after = Object.entries(st.boots_after || {}).map(([m, t]) => `${m}-Boot ${hhmm(t)}`).join(", ");
+  const msg = st.level === "bad" ? `veraltet: seit ${fmt(st.age_h, 1)} h nicht gepflegt`
+    : st.level === "warn" ? (after ? `nach dem letzten Eintrag gebootet: ${after}` : `seit ${fmt(st.age_h, 1)} h nicht gepflegt`) : "aktuell";
+  return `<div class="stand ${st.level === "ok" ? "" : st.level}"><b>Stand features.json:</b> ${esc(st.updated_utc || "—")} (vor ${fmt(st.age_h, 1)} h) &middot; `
+    + `jüngster Ist-Beleg ${esc(st.newest_ist || "—")} &middot; <b>${msg}</b>`
+    + ` <span class="muted">&middot; pflegen mit <span class="mono">features_update.py</span> (README: Features Soll/Ist); gelb ab ${fmt(st.warn_h)} h oder nach einem neueren Boot, rot ab ${fmt(st.bad_h)} h</span></div>`;
+}
+// Commits der Image-Linie (letzte 48 h), die in keinem Baustein stehen -- aus git gerechnet, nicht gepflegt
+function featNewHtml(d) {
+  const ms = ((d.features || {}).models || []).filter((m) => m.new_commits);
+  if (!ms.length) return "";
+  return ms.map((m) => {
+    const nc = m.new_commits;
+    if (nc.error) return `<div class="muted" style="font-size:12px">${esc(m.model)}: neue Commits nicht lesbar (${esc(nc.error)})</div>`;
+    const n = nc.n || 0;
+    return `<details class="fold-sub" id="newc-${esc(m.model)}"${n ? "" : ""}><summary><b>${esc(m.model)}</b>: ${n ? `<span style="color:var(--warn);font-weight:650">${fmt(n)} Commits der Image-Linie (${fmt(nc.hours)} h) ohne Baustein</span>` : "alle Commits der Image-Linie der letzten " + fmt(nc.hours) + " h stehen in Bausteinen"} <span class="muted mono">REV ${esc((nc.rev || "").slice(0, 10))}</span></summary>`
+      + (n ? `<div class="tablewrap"><table><tr><th>Commit</th><th>wann</th><th>Betreff</th></tr>${(nc.commits || []).map((c) => `<tr><td class="mono">${esc(c.sha)}</td><td class="num">${c.t ? hhmm(c.t) + " " + new Date(c.t * 1000).toLocaleDateString("de-DE", {day: "2-digit", month: "2-digit"}) : ""}</td><td>${esc(c.subject)}</td></tr>`).join("")}</table></div>`
+        + `<div class="muted" style="font-size:11.5px;margin:4px 0 8px">eintragen: <span class="mono">python3 /opt/rigdash/current/rigdash/features_update.py set --id … --zweig &lt;branch&gt;=&lt;sha&gt;</span> (oder <span class="mono">add-zweig</span>, wenn es ein Pick eines vorhandenen Bausteins ist)</div>` : "")
+      + `</details>`;
+  }).join("");
+}
+function devBadge(d) {
+  const el = $("tab-dev-cnt");
+  const fv = d.features;
+  if (!el || !fv) return;
+  const n = (fv.models || []).reduce((a, m) => a + ((m.new_commits || {}).n || 0), 0);
+  const st = (fv.stand || {}).level;
+  const txt = st && st !== "ok" ? (st === "bad" ? "veraltet" : "Stand?") + (n ? " · " + n : "") : (n ? String(n) : "");
+  if (el.textContent !== txt) el.textContent = txt;
+  el.classList.toggle("bad", st === "bad");
+  el.title = `features.json: ${st || "?"}; ${n} Commits der Image-Linie ohne Baustein`;
 }
 function featHtml(d) {
   const fv = d.features;
@@ -1238,10 +1368,130 @@ function historyHtml(boots, now) {
 }
 
 // <!--DEV:END-->
+// ---------------------------------------------------------------- Überblick (Nutzer 01.10. ~07:20Z)
+// Je Modell auf einen Blick: läuft was, welches Modell, TTFT, Decode tok/s, Prefill tok/s, Flipzeit, Tode/Hänger,
+// Fenster. Jede Zahl ist dieselbe wie im Boots-Tab (gleiche Felder), nur ohne die Messdetails.
+const lineOf = (b) => /27b/i.test(`${(b.meta || {}).tag || ""} ${b.stem || ""} ${((b.ipc || {}).dir) || ""}`) ? "27B" : "NF";
+const sec = (ms) => ms == null || !isFinite(ms) ? "—" : fmt(ms / 1000, ms < 10000 ? 2 : 1);
+function ttftOf(b, d) {
+  const m = lineOf(b), v = d.vm || {};
+  const a = ((b.ipc || {}).front || (b.front || {})).arrival_seat || null;
+  const r = {m5: (v.ttft_mean_5m_ms || {})[m], n5: (v.ttft_n_5m || {})[m], mb: (v.ttft_mean_boot_ms || {})[m],
+    mx: (v.ttft_max_boot_ms || {})[m], src: v.error ? null : "VictoriaMetrics", n: a ? a.ttft_n : null};
+  if (r.mb == null && a && a.ttft_n) { r.mb = a.ttft_ms_sum / a.ttft_n; r.mx = a.ttft_ms_max; r.src = "state.json"; }
+  if (!a || a.ttft_n == null)
+    r.missing = m === "27B" ? "27B-Front liefert keine TTFT (bis zum Image mit weg2_ttft_seconds, TSDB-Delta 01.10.)"
+      : "front.arrival_seat.ttft_* fehlt in IPC";
+  return r;
+}
+function kpi(k, v, unit, sub, cls, color, title) {
+  const na = typeof v === "object" && v && v.na;
+  return `<div class="kpi ${cls || ""}"${color ? ` style="--c:${color}"` : ""}${title ? ` title="${esc(title)}"` : ""}><div class="k">${color ? `<i style="background:${color}"></i>` : ""}${k}</div>`
+    + `<div class="v${na || v == null ? " na" : ""}">${na ? esc(v.na) : v == null ? "—" : v + (unit ? `<small>${unit}</small>` : "")}</div><div class="s">${sub || ""}</div></div>`;
+}
+function rateOfPrefill(p, now) {
+  if (!p) return [null, ""];
+  if (p.one_s > 0) return [p.one_s, "laufender Schub"];
+  if (p.now && p.now.wall_tps != null) return [p.now.wall_tps, "Schübe 60 s"];
+  if (p.last_burst && p.last_burst.wall_tps != null) return [p.last_burst.wall_tps, p.last_t ? `letzter Schub vor ${ago(now - p.last_t)}` : "letzter Schub"];
+  return [null, p.last_t ? `ruht seit ${ago(now - p.last_t)}` : "noch kein Chunk"];
+}
+function ovCard(b, d, now) {
+  const a = b.alarm || {}, st = a.state, ipc = b.ipc || {};
+  const fr = b.front || {};
+  const awake = fr.awake || (b.awake ? b.awake.awake : null);
+  const ttft = ttftOf(b, d);
+  const head = `<div class="ovhead"><span class="model">${esc(ipc.model || (b.meta || {}).model || b.stem)}</span>`
+    + (plannedStopped(b) ? `<span class="badge stopped">■ gestoppt (geplant)</span>`
+      : ipc.terminal ? `<span class="badge ${ipc.lifecycle === "dead" ? "dead" : "stopped"}">■ ${esc(ipc.lifecycle)}</span>`
+      : `<span class="badge ${b.live ? "live" : "dead"}">${b.live ? "LIVE" : "keine IPC-Probe seit " + ago(b.age_s)}</span>`)
+    + (b.live && ipc.lifecycle && ipc.lifecycle !== "serving" ? `<span class="chip warn">${esc(ipc.lifecycle)}</span>` : "")
+    + (awake ? `<span class="badge phase">wach: ${esc(awake)}${b.live && fr.state && fr.state !== "serving" ? " &middot; " + esc(fr.state) : ""}</span>` : "")
+    + `<span class="when">${lineOf(b)}${b.first_t ? ` &middot; Boot seit ${ago(now - b.first_t)}` : ""}</span></div>`;
+  // TTFT: Mittel der letzten 5 min (VictoriaMetrics), sonst seit Boot
+  const tv = ttft.m5 != null ? ttft.m5 : ttft.mb;
+  const tK = ttft.m5 != null ? "TTFT &middot; &Oslash; 5 min" : "TTFT &middot; &Oslash; seit Boot";
+  const tSub = ttft.missing && tv == null ? "" : [ttft.n5 != null && ttft.m5 != null ? `${fmt(ttft.n5)} Anfr. in 5 min` : null,
+    ttft.mb != null && ttft.m5 != null ? `seit Boot &Oslash; ${sec(ttft.mb)} s` : null, ttft.mx != null ? `max ${sec(ttft.mx)} s` : null,
+    ttft.n != null && ttft.m5 == null ? `n=${fmt(ttft.n)}` : null].filter(Boolean).join(" &middot; ");
+  const tKpi = kpi(tK, tv != null ? sec(tv) : (ttft.missing ? {na: ttft.missing} : null), "s", tSub, "hl", "var(--s7)",
+    "Ankunft an der Front → erster Inhalt von D (LEG2-FIRST-CONTENT); Quelle " + (ttft.src || "–"));
+  // Decode
+  const dd = (b.decode || {}).D || (b.decode || {}).single;
+  let dv = null, dl = "";
+  if (dd) {
+    if (dd.one_s > 0) { dv = dd.one_s; dl = "jetzt"; }
+    else if (dd.gen_tps != null) { dv = dd.gen_tps; dl = "&Oslash; 60 s"; }
+    else if (dd.gen_tps_last != null) { dv = dd.gen_tps_last; dl = "letzter Wert"; }
+  }
+  const bs = dd ? (dd.round_bs && dd.round_bs.bs != null ? dd.round_bs.bs : (dd.last_bs != null ? dd.last_bs : dd.running)) : null;
+  const dKpi = kpi("Decode tok/s", dv != null ? fmt(dv, 1) : (dd ? null : {na: "kein Decode-Rang"}), "",
+    [dl, dd && dd.per_stream != null ? `je Stream ${fmt(dd.per_stream, 1)}` : null,
+      dd && dd.seats_mean != null ? `Ø ${fmt(dd.seats_mean, 1)} Sitze` : null, bs != null ? `bs ${fmt(bs)}` : null].filter(Boolean).join(" &middot; "),
+    dd && dd.one_s > 0 ? "on" : "", "var(--s3)");
+  // Prefill P und D (bzw. eine Gruppe)
+  const pre = b.prefill || {};
+  const pk = (g, label, color) => {
+    const [v, l] = rateOfPrefill(pre[g], now);
+    return kpi(label + " tok/s", v != null ? fmt(v) : null, "", l, pre[g] && pre[g].one_s > 0 ? "on" : "", color);
+  };
+  const pKpis = pre.single && !pre.P ? pk("single", "Prefill", "var(--s1)") : pk("P", "P-Prefill", "var(--s1)") + pk("D", "D-Prefill", "var(--s2)");
+  // Flipzeit
+  const ft = b.flip_times || {}, pd = ft["P>D"] || {}, dp = ft["D>P"] || {};
+  const byTotal = ft.headline === "flip_total";
+  const med = (x) => byTotal ? x.layer_median : (x.n ? x.median : x.layer_median);
+  const lst = (x) => byTotal ? x.layer_newest : (x.n ? x.last : x.layer_newest);
+  const fKpi = kpi("Flipzeit P&rarr;D &middot; Median", med(pd) != null ? sec(med(pd)) : null, "s",
+    [lst(pd) != null ? `letzte ${sec(lst(pd))} s` : (b.flip_count ? null : "noch kein Flip"), med(dp) != null ? `D&rarr;P Median ${sec(med(dp))} s` : null,
+      b.flip_count ? `${fmt(b.flip_count)} Flips` : null].filter(Boolean).join(" &middot; "), "", "var(--s7)",
+    byTotal ? "27B-Historie: flip_total (Layer-Tausch)" : "P→D: P-Ende → erstes Decode-Token (flip_first_work); D→P: Decode-Ende → P-Prefill-Start");
+  // Warteschlange
+  const fq = (ipc.front || {});
+  const q = fr.queue != null ? fr.queue : (b.queue ? b.queue.queue : null);
+  const qKpi = kpi("Warteschlange", q != null ? fmt(Array.isArray(q) ? q.length : q) : null, "",
+    [fq.outstanding_n != null ? `offen ${fmt(fq.outstanding_n)}` : null,
+      fq.oldest_outstanding_age_s != null && fq.outstanding_n ? `älteste ${ago(fq.oldest_outstanding_age_s)}` : null,
+      fr.served ? `bedient ${fmt((fr.served || {}).D)}` : null].filter(Boolean).join(" &middot; "));
+  // Tode / Hänger
+  const a14 = fieldIpc(b, "A14") ? fieldIpc(b, "A14").value : null;
+  const nStop = a14 ? a14.length : (b.stop_count || 0);
+  const nErr = fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count;
+  const hv = st === "TOT" ? "TOT" : st === "HAENGT" ? "HÄNGT" : st === "GESTOPPT" ? "gestoppt" : st === "WARNUNG" ? "Warnung" : "keine";
+  const hKpi = kpi("Tode / Hänger", hv, "", [`Rang-Stopps ${fmt(nStop)}`, `Fehlerzeilen ${fmt(nErr)}`,
+    (a.reasons || []).length ? esc((a.reasons[0] || {}).text || "").slice(0, 80) : null].filter(Boolean).join(" &middot; "),
+    st === "TOT" || st === "HAENGT" ? "bad" : st === "WARNUNG" ? "warn" : st === "GESTOPPT" ? "" : "ok");
+  return `<section class="ovcard ${st === "TOT" ? "dead" : st === "HAENGT" ? "hang" : b.live ? "" : "off"}" id="ov-${esc(b.stem)}">${head}
+    <div class="kpis">${tKpi}${dKpi}${pKpis}${fKpi}${qKpi}${hKpi}</div>${phaseHtml(b, "ovpb-")}</section>`;
+}
+// <!--DEV:BEGIN-->  (gpuq: nur Rig-Ausgabe)
+function gpuqStrip(d) {
+  const v = (d.gpuq || {}).value;
+  if (!v) return "";
+  const bk = v.bookings || [];
+  const hm = (x) => ((x || {}).local || "").slice(11, 16);
+  const run = bk.filter((x) => x.state === "running"), next = bk.filter((x) => x.state !== "running").slice(0, 2);
+  const one = (x) => `<b>${esc(x.owner)}</b> Karten ${esc((x.cards || []).join(","))}${x.mib ? " (" + fmt(x.mib) + " MiB)" : ""} ${hm(x.start)}&ndash;${hm(x.end)}`;
+  return `<div class="gpuqstrip" id="ov-gpuq" title="gpuq-Fensterplan (http://&lt;host&gt;:8770/)"><span class="chip ${run.length ? "ok" : ""}">GPU-Fenster</span>`
+    + (run.length ? run.map((x) => `<span>jetzt: ${one(x)}</span>`).join(" ") : `<span class="muted">kein laufendes Fenster</span>`)
+    + (next.length ? ` <span class="muted">&middot; danach: ${next.map(one).join(" &middot; ")}</span>` : "") + `</div>`;
+}
+// <!--DEV:END-->
+function overviewHtml(d, shown, now) {
+  const lines = new Set(shown.map(lineOf));
+  const rest = ["NF", "27B"].filter((m) => !lines.has(m)).map((m) => {
+    const b = (d.boots || []).find((x) => lineOf(x) === m);
+    if (!b) return `<div class="ovline" id="ovl-${m}"><b>${m}</b> &middot; kein Boot in den letzten 6 h</div>`;
+    const ipc = b.ipc || {};
+    return `<div class="ovline" id="ovl-${m}"><b>${m}</b> &middot; kein Boot live &middot; zuletzt ${esc(ipc.model || (b.meta || {}).model || "")} `
+      + `${esc(ipc.lifecycle || (plannedStopped(b) ? "gestoppt (geplant)" : ""))}${b.age_s != null ? " vor " + ago(b.age_s) : ""}</div>`;
+  });
+  const g = typeof gpuqStrip === "function" ? gpuqStrip(d) : "";
+  return g + `<div class="ov">${shown.map((b) => ovCard(b, d, now)).join("")}${rest.join("")}</div>`;
+}
+
 // Nutzer-Order 01.10. ~07:40Z: die Zeitreihen liegen in VictoriaMetrics; diese Kacheln lesen per PromQL daraus.
 // TTFT = Ankunft an der Front -> erster Inhalt von D (front.py LEG2-FIRST-CONTENT), als IPC-Zähler
 // state.json front.arrival_seat.ttft_* vom Probennehmer nach VM geschrieben (vmpush.py).
-const sec = (ms) => ms == null || !isFinite(ms) ? "—" : fmt(ms / 1000, ms < 10000 ? 2 : 1);
 function vmHtml(d) {
   const v = d.vm;
   if (!v) return "";
@@ -1337,7 +1587,7 @@ function holdAnchor(chain) {
   }
   return 0;
 }
-const RESERVED = ["chips", "cardstrip", "vmtiles", "boots", "prod", "feat", "imgchg", "gpus", "containers", "gpuq", "history"];
+const RESERVED = ["chips", "overview", "cardstrip", "vmtiles", "boots", "prod", "feat", "imgchg", "gpus", "containers", "gpuq", "history"];
 function reserveHeights() {
   for (const id of RESERVED) {
     const el = $(id);
@@ -1348,18 +1598,75 @@ function reserveHeights() {
 }
 function releaseHeight(box) { if (box) { box._minH = 0; box.style.minHeight = ""; } }
 document.addEventListener("toggle", (e) => releaseHeight(e.target.closest && e.target.closest(RESERVED.map((i) => "#" + i).join(","))), true);
-const PAUSE_AFTER_INPUT_MS = 10000;
+// Nutzer 01.10. ("vollkommen buggy"): 10 s Stillstand nach jedem Scrollen/Tippen und danach ein Sprung wirkten
+// wie ein Fehler.  Jetzt wartet das Neuzeichnen nur, solange der Finger/die Maus wirklich scrollt (1,2 s), der
+// Leseanker (holdAnchor) hält die Position; dazu Markierung, ein festgehaltener Tooltip und der Schalter.
+const PAUSE_AFTER_INPUT_MS = 1200;
 let lastInput = -Infinity;
 const noteInput = () => { lastInput = performance.now(); };
-["wheel", "touchstart", "touchmove", "keydown", "pointerdown"].forEach((t) => window.addEventListener(t, noteInput, {passive: true, capture: true}));
+["wheel", "touchmove"].forEach((t) => window.addEventListener(t, noteInput, {passive: true, capture: true}));
 window.addEventListener("scroll", () => { if (performance.now() > selfScrollUntil) noteInput(); }, {passive: true});
 function pauseReason() {
   if ($("live-pause").checked) return "pausiert (Schalter)";
   const sel = document.getSelection();
   if (sel && !sel.isCollapsed && sel.toString().trim()) return "pausiert, solange markiert ist";
-  const left = PAUSE_AFTER_INPUT_MS - (performance.now() - lastInput);
-  return left > 0 ? `pausiert beim Lesen, noch ${Math.ceil(left / 1000)} s` : "";
+  if (tapPinned) return "pausiert, solange der Hinweis offen ist";
+  return performance.now() - lastInput < PAUSE_AFTER_INPUT_MS ? "…" : "";
 }
+// ---------------------------------------------------------------- Tabs und Expertenansicht (Nutzer 01.10.)
+const TABS = [...document.querySelectorAll("#tabbar button[data-tab]")].map((b) => b.dataset.tab);
+let curTab = "ueberblick";
+try {
+  const h = (location.hash.match(/t=([a-z]+)/) || [])[1];
+  curTab = TABS.includes(h) ? h : (TABS.includes(localStorage.getItem("rigdash.tab")) ? localStorage.getItem("rigdash.tab") : "ueberblick");
+} catch (e) { curTab = "ueberblick"; }
+const lastHtml = {};
+// a section whose new HTML equals the drawn one is not touched (no layout, no flicker)
+function put(id, html) {
+  const el = $(id);
+  if (!el || lastHtml[id] === html) return false;
+  lastHtml[id] = html;
+  morph(el, html);
+  return true;
+}
+function setTab(t, fromHash) {
+  if (!TABS.includes(t)) t = "ueberblick";
+  curTab = t;
+  document.querySelectorAll("#tabbar button[data-tab]").forEach((b) => {
+    const on = b.dataset.tab === t;
+    b.classList.toggle("sel", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  TABS.forEach((x) => { const el = $("tab-" + x); if (el) el.hidden = x !== t; });
+  try { localStorage.setItem("rigdash.tab", t); } catch (e) { /* private window */ }
+  if (!fromHash) history.replaceState(null, "", "#t=" + t);
+  if ((t === "verlauf" || t === "karten") && window.RigGrafik) window.RigGrafik.show();
+  refresh(true);
+}
+document.querySelectorAll("#tabbar button[data-tab]").forEach((b) => { b.onclick = () => setTab(b.dataset.tab); });
+window.addEventListener("hashchange", () => { const h = (location.hash.match(/t=([a-z]+)/) || [])[1]; if (h && h !== curTab) setTab(h, true); });
+let expert = false;
+try { expert = localStorage.getItem("rigdash.expert") === "1"; } catch (e) { expert = false; }
+document.body.classList.toggle("expert", expert);
+$("expert").checked = expert;
+$("expert").addEventListener("change", (e) => {
+  expert = e.target.checked;
+  document.body.classList.toggle("expert", expert);
+  try { localStorage.setItem("rigdash.expert", expert ? "1" : "0"); } catch (err) { /* private window */ }
+  RESERVED.forEach((id) => releaseHeight($(id)));
+  fitPhaseLabels();
+});
+// einklappbare Bereiche: offen/zu je id gemerkt
+const FOLD_KEY = "rigdash.fold";
+let foldState = {};
+try { foldState = JSON.parse(localStorage.getItem(FOLD_KEY) || "{}"); } catch (e) { foldState = {}; }
+document.querySelectorAll("details.fold[id]").forEach((d) => {
+  if (d.id in foldState) d.open = !!foldState[d.id];
+  d.addEventListener("toggle", () => {
+    foldState[d.id] = d.open;
+    try { localStorage.setItem(FOLD_KEY, JSON.stringify(foldState)); } catch (e) { /* private window */ }
+  });
+});
 
 // <!--DEV:BEGIN-->  (Startflags: nur Rig-Ausgabe)
 // ---------------------------------------------------------------- Startflags (launchview.py)
@@ -1537,25 +1844,33 @@ async function refresh(force) {
     const smp = d.sampler || {};
     const smpBanner = smp.ok === false ? `<section class="card" id="sampler-banner" style="border-color:var(--bad)"><b style="color:var(--bad)">${esc(smp.why || "Probennehmer steht")}</b>
       <span class="muted">&middot; Kurven und Verlauf bekommen keine neuen Proben${smp.restarts ? ` &middot; ${fmt(smp.restarts)}&times; neu gestartet` : ""}${smp.last_exit ? ` &middot; zuletzt beendet mit Code ${esc(smp.last_exit.code)}` : ""} &middot; der Webserver startet ihn neu</span></section>` : "";
-    morph($("boots"), smpBanner + banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
-      : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Zustand (state.json) der letzten 6 h gefunden.</div></section>`));
-    if (DEV) {
-      if (freshDev || force) {
-        morph($("prod"), prodHtml(d));
-        morph($("feat"), featHtml(d));
-        morph($("imgchg"), imgChgHtml(d));
-      }
-      morph($("containers"), containersHtml(d));
-      morph($("gpuq"), gpuqHtml(d));
-      morph($("history"), historyHtml(d.boots.filter((b) => !shown.includes(b)), now));
-    }
-    morph($("gpus"), gpusHtml(d, binders));
-    morph($("chips"), chipsHtml(d));
-    morph($("vmtiles"), vmHtml(d));
-    // compact card strip at the top: the load at a glance, also on a phone
-    morph($("cardstrip"), ((d.gpus || {}).value || []).map((c) => `<div><b>${esc(c.name.replace("NVIDIA GeForce ", ""))}</b>
+    // Nutzer 01.10.: nur der sichtbare Tab wird gezeichnet, ein unveränderter Abschnitt nicht angefasst
+    if (curTab === "ueberblick") {
+      put("overview", smpBanner + overviewHtml(d, shown, now));
+      put("vmtiles", vmHtml(d));
+      // compact card strip: the load at a glance, also on a phone
+      put("cardstrip", ((d.gpus || {}).value || []).map((c) => `<div><b>${esc(c.name.replace("NVIDIA GeForce ", ""))}</b>
       <span class="num">${fmt(c["power.draw"])} W &middot; ${fmt(c["memory.used"] / 1024, 1)}/${fmt(c["memory.total"] / 1024, 0)} GiB &middot; ${fmt(c["utilization.gpu"])} %</span>
       <div class="bar"><i style="width:${c["power.limit"] ? Math.min(100, 100 * c["power.draw"] / c["power.limit"]) : 0}%"></i></div></div>`).join(""));
+    }
+    if (curTab === "boots")
+      put("boots", smpBanner + banner + (shown.length ? shown.map((b) => bootCard(b, now, binders)).join("")
+        : `<section class="card" id="boots-none"><div class="muted">Kein Boot-Zustand (state.json) der letzten 6 h gefunden.</div></section>`));
+    if (DEV && curTab === "entwicklung") {
+      if (freshDev || force || lastHtml.prod == null) {
+        put("prod-stand", standHtml(d));
+        put("prod", prodHtml(d));
+        put("feat-new", featNewHtml(d));
+        put("feat", featHtml(d));
+        put("imgchg", imgChgHtml(d));
+      }
+      put("containers", containersHtml(d));
+      put("gpuq", gpuqHtml(d));
+      put("history", historyHtml(d.boots.filter((b) => !shown.includes(b)), now));
+    }
+    if (DEV) devBadge(d);
+    if (curTab === "karten") put("gpus", gpusHtml(d, binders));
+    put("chips", chipsHtml(d));
     // behind the public proxy the LAN-only services are not reachable: hide their links, say so once
     document.querySelectorAll("a.lan").forEach((a) => { a.style.display = d.via_proxy ? "none" : ""; });
     if ($("lannote")) $("lannote").style.display = d.via_proxy ? "" : "none";
@@ -1577,6 +1892,8 @@ async function refresh(force) {
     else if (window.RigZoom && RigZoom.loading) RigZoom.loading(false);
   }
 }
+$("grafanalink").href = `${location.protocol}//${location.hostname}:3000/d/rig-verlauf/rig-verlauf`;
+if ($("vl-grafana")) $("vl-grafana").innerHTML = `Längere Zeiträume, freie Zeitwahl und PromQL-Auswertungen: <a class="lan" href="${location.protocol}//${location.hostname}:3000/d/rig-verlauf/rig-verlauf" target="_blank" rel="noopener">Grafana &bdquo;Rig – Verlauf&ldquo;</a> (VictoriaMetrics, nur im LAN)`;
 if (DEV) {
 $("gpuqlink").href = `${location.protocol}//${location.hostname}:8770/`;
 $("plannerlink").href = `${location.protocol}//${location.hostname}:8780/`;
@@ -1593,7 +1910,7 @@ $("live-pause").addEventListener("change", (e) => {
   try { localStorage.setItem("rigdash-live-pause", e.target.checked ? "1" : "0"); } catch (err) { /* no storage */ }
   if (!e.target.checked) refresh(true); else $("pausenote").textContent = pauseReason();
 });
-refresh(true);
+setTab(curTab, true);
 setInterval(() => refresh(), 2000);
 if (window.RigZoom) RigZoom.on(() => refresh(true));      // zoom.js: all charts follow one zoomed stretch
 if (DEV) {
