@@ -4149,6 +4149,10 @@ class Scheduler(
             _stage_sync(f"result-{tmp_batch.forward_mode.name}")
             _h58_span("result_ms", _h58_t0)
 
+        # nf-pd-post: the last batch's result was processed in the iteration
+        # that launched it (weg2/skip_first.result_now) -- nothing to pop for it.
+        last_result_done = False
+
         while True:
             if self.gracefully_exit:
                 break
@@ -4188,7 +4192,8 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                if not last_result_done:
+                    pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -4226,11 +4231,17 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not last_result_done:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            # nf-pd-post: a skip-extend batch (no target forward) is processed
+            # now -- P's token streams before the next pass's TP recv and launch.
+            last_result_done = _weg2_skip_first.result_now(batch, batch_result)
+            while last_result_done and self.result_queue:  # FIFO up to this batch
+                pop_and_process()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
