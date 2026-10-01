@@ -163,6 +163,9 @@ class TorchMemorySaverAdapter(ABC):
     def ring_stats(self):
         raise NotImplementedError
 
+    def set_keep_spans(self, tensor, row_ranges) -> int:
+        raise NotImplementedError
+
     @property
     def enabled(self):
         raise NotImplementedError
@@ -326,6 +329,37 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         fn.restype = ctypes.c_uint64
         fn.argtypes = [ctypes.c_char_p]
         return int(fn(tag.encode()))
+
+    def set_keep_spans(self, tensor, row_ranges) -> int:
+        """L15-11c: tell the saver which byte ranges of ``tensor`` a paused tag
+        must KEEP mapped (C ``tms_set_keep_spans``, entrypoint.cpp:174).
+
+        ``row_ranges`` are ``(lo_row, hi_row)`` pairs in units of the tensor's
+        first dimension; they convert to byte offsets relative to the
+        allocation base via ``stride(0) * element_size()`` -- the C ABI takes
+        byte ranges relative to the base pointer, nothing row-shaped.
+        Returns the C code (0 ok, negative codes: -1 not a base, -2
+        cpu-backed, -3 malformed), or -100 when the running hook carries no
+        such symbol; the caller treats -100 as "this saver cannot keep".
+        """
+        fn = _weg2_ring_symbol("tms_set_keep_spans")
+        if fn is None:
+            return -100
+        import ctypes
+
+        unit = int(tensor.stride(0)) * int(tensor.element_size())
+        rows = sorted((int(lo), int(hi)) for lo, hi in row_ranges)
+        n = len(rows)
+        lo_arr = (ctypes.c_uint64 * n)(*(r[0] * unit for r in rows))
+        hi_arr = (ctypes.c_uint64 * n)(*(r[1] * unit for r in rows))
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        return int(fn(ctypes.c_void_p(tensor.data_ptr()), n, lo_arr, hi_arr))
 
     def backed_up_tag_bytes(self):
         """C16 / A1-2: ``{tag: bytes}`` over EVERY tag with a host backup, or None.
@@ -566,6 +600,11 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     def tag_mapped_bytes(self, tag: str):
         return None
+
+    def set_keep_spans(self, tensor, row_ranges) -> int:
+        # No saver, nothing can be kept; -100 is the "no symbol" code the
+        # caller already handles.
+        return -100
 
     def backed_up_tag_bytes(self):
         return None
