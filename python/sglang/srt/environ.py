@@ -855,6 +855,12 @@ class Envs:
     # flip_first_work median 1757 (y4k) / 1588 ms (y4l) against 2002 (y4i) --
     # on by default since (user law: a proven switch is on); off via env.
     SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(True)
+    # MAMBA-SNAPSHOT-FENCE (N2, 01.10., hybrid_cache_controller.start_writing):
+    # a write op carrying a recurrent-state (mamba) transfer makes the compute
+    # stream wait for the op's finish event, so no later forward can mutate the
+    # state rows before the async D2H snapshot has read them. KV rows are
+    # append-only and are not fenced. False = the old unordered tail.
+    SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE = EnvBool(True)
     # the sleeping group(s) that take it (comma list; default the D->P leg).
     SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):

@@ -132,6 +132,29 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _mamba_snapshot_fence_needed(pool_transfers) -> bool:
+    """MAMBA-SNAPSHOT-FENCE (N2): does this write op snapshot recurrent state
+    (a MAMBA pool transfer with rows)? Switch SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE."""
+    if not pool_transfers:
+        return False
+    try:
+        from sglang.srt.environ import envs
+
+        if not bool(envs.SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE.get()):
+            return False
+    except Exception:  # noqa: BLE001 - an unreadable switch keeps the fence
+        pass
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+
+    for t in pool_transfers:
+        if getattr(t, "name", None) != PoolName.MAMBA:
+            continue
+        idx = getattr(t, "device_indices", None)
+        if idx is not None and hasattr(idx, "numel") and int(idx.numel()) > 0:
+            return True
+    return False
+
+
 def _host_pool_covers_layer(host_pool, layer_id: int) -> bool:
     """Does this host tier hold GLOBAL layer `layer_id`? Membership, not a count.
 
@@ -749,6 +772,17 @@ class HybridCacheController(BaseHiCacheController):
             self._record_transfer_indices_on_stream(
                 self.write_stream, kv_host_indices, kv_device_indices
             )
+        if _mamba_snapshot_fence_needed(resolved_pool_transfers):
+            # MAMBA-SNAPSHOT-FENCE: the recurrent state is MUTABLE in place (a
+            # KV row is append-only). The write stream waits for the compute
+            # stream at issue (start_event), but nothing made the compute
+            # stream wait for the copy: a forward launched after this issue
+            # could change the state rows while the async D2H still reads
+            # them, and the arena / L3 would hold a plausible state of ANOTHER
+            # position under this node's key. The next forward now starts
+            # only after the snapshot has been read.
+            device_module.current_stream().wait_event(finish_event)
+            self._mamba_fence_n = getattr(self, "_mamba_fence_n", 0) + 1
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
         clock.finish(device=on_card, reason=refusal)
 
