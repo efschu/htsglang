@@ -63,8 +63,16 @@ class _FakeEvent:
 
 
 class _BusyStream:
+    waits = 0
+
     def query(self):
         return False   # the forward is still in flight
+
+    def wait_event(self, event):
+        # MAMBA-SNAPSHOT-FENCE (N2): the op carries a MAMBA transfer, so the
+        # compute stream waits for its finish event -- a GPU-side order, no
+        # host read of the card indices
+        _BusyStream.waits += 1
 
 
 class _FakeDeviceModule:

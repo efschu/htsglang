@@ -70,7 +70,9 @@ L3_CSUM_MIN_BYTES = 1 << 20
 
 
 def l3_csum_on() -> bool:
-    return os.environ.get("SGLANG_WEG2_L3_BLOB_CSUM", "1").strip().lower() not in ("0", "false", "no", "off")
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_L3_BLOB_CSUM.get())
 
 
 def _crc32_of(view) -> int:
