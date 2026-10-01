@@ -8308,6 +8308,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 (_bytes / (_read_ms / 1000.0) / 1e9) if _read_ms > 0 else -1.0,
                 int(insert_result.prefix_len), int(loaded_from_storage),
             )
+            # L15-02b: if this req was in the last sleep's shadow hold set, price
+            # the load-back it would have saved. Log-only, never raises.
+            try:
+                from sglang.srt.weg2 import l15_shadow
+
+                if l15_shadow.shadow_on(os.environ):
+                    _l15_line = l15_shadow.LEDGER.note_load(req_id, _ms, _read_ms)
+                    if _l15_line is not None:
+                        logger.info("%s", _l15_line)
+            except Exception:  # noqa: BLE001 - shadow must never break a load-back
+                pass
         except Exception as _ie:  # noqa: BLE001 -- an instrument never kills the prefetch
             # xsn289: 27 prefetch successes on D, 0 WEG2-LOAD-DEVICE lines and
             # this branch silent at DEBUG -- an instrument that fails must SAY

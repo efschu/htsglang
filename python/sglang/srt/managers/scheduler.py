@@ -19706,6 +19706,85 @@ class Scheduler(
             # blockers -- x169: hicache_backup(5) on PP1/PP2 in the same
             # second, D's store read short by 11776 tokens.  Join them first.
             self._weg2_join_store_writes_before_reset()
+            # [L1.5 SHADOW] Log-only shadow pricing of a hypothetical L1.5
+            # hold set at this sleep flush (no behaviour change).
+            try:
+                from sglang.srt.weg2 import l15_policy, l15_shadow
+
+                if l15_shadow.shadow_on(os.environ):
+                    _tp = int(
+                        getattr(self, "tp_size", 0)
+                        or getattr(getattr(self, "server_args", None), "tp_size", 1)
+                        or 1
+                    )
+                    try:
+                        from sglang.srt.distributed.utils import (
+                            get_cp_token_ratios,
+                        )
+
+                        _ratios = get_cp_token_ratios()
+                    except Exception:  # noqa: BLE001 - even split is the fallback
+                        _ratios = None
+                    _split = "ratios" if _ratios else "even"
+                    _rb = getattr(self, "running_batch", None)
+                    _entries = []
+                    for _req in (getattr(_rb, "reqs", None) or []):
+                        _tok = len(getattr(_req, "origin_input_ids", []) or []) + len(
+                            getattr(_req, "output_ids", []) or []
+                        )
+                        _entries.append(
+                            {
+                                "rid": getattr(_req, "rid", None),
+                                "kind": "seat",
+                                "last_active": 0.0,
+                                # rows follow the DCP token vector (or even),
+                                # not "whole request on rank 0"
+                                "rows_by_rank": list(
+                                    l15_shadow.rows_split(_tok, _tp, _ratios)
+                                ),
+                                "anchor_depth": _tok,
+                                "kv_depth": _tok,
+                            }
+                        )
+                    for _req in (getattr(self, "weg2_d_parked", None) or []):
+                        _tok = len(getattr(_req, "origin_input_ids", []) or []) + len(
+                            getattr(_req, "output_ids", []) or []
+                        )
+                        _entries.append(
+                            {
+                                "rid": getattr(_req, "rid", None),
+                                "kind": "parked",
+                                "last_active": 0.0,
+                                "rows_by_rank": list(
+                                    l15_shadow.rows_split(_tok, _tp, _ratios)
+                                ),
+                                "anchor_depth": _tok,
+                                "kv_depth": _tok,
+                            }
+                        )
+                    _mr = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+                    _cell = l15_shadow.cell_bytes_from(getattr(_mr, "token_to_kv_pool", None))
+                    _rgid = getattr(getattr(self, "server_args", None), "rank_gpu_id", None)
+                    _cards = (
+                        list(_rgid)
+                        if isinstance(_rgid, (list, tuple)) and len(_rgid) == _tp
+                        else list(range(_tp))
+                    )
+                    _caps = l15_shadow.caps_from_env(os.environ, _tp, [_cell] * _tp, _cards)
+                    _hs = l15_policy.select_hold(
+                        l15_shadow.candidates_from(_entries), _caps, len(_entries)
+                    )
+                    logger.info(
+                        "%s split=%s card_map=%s",
+                        l15_policy.shadow_line(
+                            int(getattr(self, "_weg2_vote_epoch", 0) or 0), _hs, _caps
+                        ),
+                        _split,
+                        _cards,
+                    )
+                    l15_shadow.LEDGER.note_sleep(_hs)
+            except Exception as exc:  # noqa: BLE001 - shadow must never block flush
+                logger.warning("L15-SHADOW select failed (ignored): %s: %s", type(exc).__name__, exc)
             self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None
