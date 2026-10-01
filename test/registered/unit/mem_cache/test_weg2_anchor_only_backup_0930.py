@@ -238,3 +238,97 @@ def test_a_host_backed_kv_still_commits_the_anchor_into_the_tree():
     _sweep(cache, _ArenaRef())
     assert int(node.component_data[MC].host_value[0]) == 1000
     assert not getattr(node, "weg2_anchor_secured", False)
+
+
+# ------------------------------------------------------------------ y6b
+# Review a54a22e54d F1: the ack hands the write's reference back (the tree holds
+# none), so the anchor's slot is a clock candidate. The clock writes it to L3
+# before it frees it (#257 (d)) -- but `weg2_anchor_secured` was set once and
+# never cleared: a slot that left L2 with NO L3 copy (dropped_without_l3) stayed
+# "secured", the sweep never rewrote the still-present device anchor and the
+# ANCHOR-LOST probe never counted it. The mark now holds only while the bytes do
+# (ArenaMambaPoolHost.anchor_held: a COMPLETE slot or an L3 copy).
+
+class _ArenaHeld(_ArenaRef):
+    def __init__(self, room=True):
+        super().__init__(room)
+        self.gone = set()        # last-page hashes whose slot left L2 with no L3 copy
+        self.asked = []
+
+    def anchor_held(self, last_hash):
+        self.asked.append(last_hash)
+        return last_hash not in self.gone
+
+
+def _secured_heads():
+    cache, heads = _y5d_tree()
+    arena = _ArenaHeld()
+    _sweep(cache, arena)
+    with mock.patch.object(UnifiedRadixCache, "_weg2_mamba_pool", lambda self: arena), \
+            mock.patch.object(UnifiedRadixCache, "_weg2_release_inner_anchor", lambda self, n, mp: None):
+        for h in heads:
+            assert cache._weg2_direct_complete(h) is True
+            ow = cache.ongoing_write_through.pop(h.id)    # the rest of the ack (writing_check)
+            if ow.lock_params is not None:
+                cache.dec_lock_ref(h, ow.lock_params)
+            h.write_through_pending_id = None
+    assert all(h.weg2_anchor_secured for h in heads)
+    return cache, heads, arena
+
+
+def _probe(cache, arena):
+    with mock.patch.object(UnifiedRadixCache, "_weg2_mamba_pool", lambda self: arena):
+        return [d for d, _ in cache.weg2_unbacked_anchors()]
+
+
+def test_y6b_a_secured_anchor_whose_bytes_are_gone_is_counted_and_written_again():
+    cache, heads, arena = _secured_heads()
+    assert 64 not in _probe(cache, arena), "bytes held: secured, nothing lost"
+    lost = heads[0]
+    arena.gone.add(lost.hash_value[-1])        # the clock freed it, the L3 write was lost
+    assert _probe(cache, arena).count(64) == 1, "ANCHOR-LOST names the anchor (stuck mark on cb3aa0c2da)"
+    assert lost.weg2_anchor_secured is False and heads[1].weg2_anchor_secured is True
+    n_before = len(cache.cache_controller.writes)
+    stats = _sweep(cache, arena)
+    assert stats.get("anchor_only") == 1 and len(cache.cache_controller.writes) == n_before + 1, \
+        "the sweep writes the device anchor again"
+    assert cache.cache_controller.writes[-1][1] == lost.id
+    cache.sanity_check()
+
+
+def test_y6b_an_anchor_with_an_l3_copy_stays_secured_and_is_not_rewritten():
+    cache, heads, arena = _secured_heads()   # anchor_held answers True: arena slot or L3 copy
+    n_before = len(cache.cache_controller.writes)
+    _sweep(cache, arena)
+    assert len(cache.cache_controller.writes) == n_before and all(h.weg2_anchor_secured for h in heads)
+    assert {h.hash_value[-1] for h in heads} <= set(arena.asked), "the mark is checked, not trusted"
+
+
+def test_y6b_a_pool_that_cannot_tell_keeps_the_mark():
+    cache, heads = _y5d_tree()
+    arena = _ArenaRef()                       # no anchor_held: the old behaviour
+    _sweep(cache, arena)
+    with mock.patch.object(UnifiedRadixCache, "_weg2_mamba_pool", lambda self: arena), \
+            mock.patch.object(UnifiedRadixCache, "_weg2_release_inner_anchor", lambda self, n, mp: None):
+        for h in heads:
+            cache._weg2_direct_complete(h)
+    assert 64 not in _probe(cache, arena) and all(h.weg2_anchor_secured for h in heads)
+
+
+def test_y6b_anchor_held_reads_the_arena_then_the_l3_index():
+    from types import SimpleNamespace
+
+    from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
+
+    states = {"s:a": (3, 2), "s:b": (4, 1)}        # a COMPLETE, b CLAIMED (not readable)
+    disk = {"s:c"}
+    arena = SimpleNamespace(find_slots=lambda stems: [states.get(s, (-1, 0)) for s in stems])
+    backend = SimpleNamespace(_stat_stems=lambda stems: {s: 1 for s in stems if s in disk})
+    pool = SimpleNamespace(arena=arena, _backend=backend, _stems=lambda hs: ["s:" + h for h in hs])
+    held = lambda h: ArenaMambaPoolHost.anchor_held(pool, h)  # noqa: E731
+    assert held("a") is True, "COMPLETE slot"
+    assert held("b") is False, "a CLAIMED slot is not the anchor's bytes"
+    assert held("c") is True, "freed by the clock WITH an L3 copy (#257 (d))"
+    assert held("d") is False, "freed with no copy: dropped_without_l3"
+    pool.arena = None
+    assert held("a") is None, "unbound: cannot tell"

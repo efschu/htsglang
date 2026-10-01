@@ -291,6 +291,27 @@ class ArenaMambaPoolHost(MambaPoolHost):
             return None
         return torch.tensor([self.staging_rows + s for s in slots], dtype=torch.int64)
 
+    def anchor_held(self, last_hash) -> Optional[bool]:
+        """y6b (review a54a22e54d F1): does the anchor written under
+        ``last_hash`` still have its bytes somewhere -- a COMPLETE arena slot,
+        or an L3 copy (the clock evict writes one before it frees an
+        unreferenced slot, #257 (d); a copy it could not write is ``lost``)?
+        A detached anchor-only write (KV only in the store) hands its reference
+        back at the ack, so its slot is a clock candidate from then on; this is
+        how the tree learns that a ``weg2_anchor_secured`` mark no longer holds.
+        One C lookup; the L3 index (#1459) only when the arena misses. None =
+        cannot tell (unbound pool, backend without a stat)."""
+        if self.arena is None or self._backend is None or last_hash is None:
+            return None
+        stem = self._stems([last_hash])[0]
+        slot, state = self.arena.find_slots([stem])[0]
+        if slot >= 0 and state == 2:
+            return True
+        stat = getattr(self._backend, "_stat_stems", None)
+        if not callable(stat):
+            return None
+        return stem in stat([stem])
+
     # -- fnFL2 H19: anchor displacement -----------------------------------------------
     def settled_anchor_slots(self, host_value: Optional[torch.Tensor]) -> Optional[list]:
         """The arena slots of a node's mamba host value when this rank's write

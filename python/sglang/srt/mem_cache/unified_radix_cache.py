@@ -1488,7 +1488,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             if cd is None or cd.value is None or cd.host_value is not None:
                 continue
-            if getattr(node, "weg2_anchor_secured", False) or (_det and getattr(node, "id", None) in _det):
+            if (_det and getattr(node, "id", None) in _det) or self._weg2_anchor_secured_holds(node):
                 continue    # ANCHOR-ONLY (KV in the store): its arena slot carries it (or its write is in flight)
             out.append((self.weg2_node_depth(node), getattr(node, "weg2_anchor_rid", None)))
         out.sort()
@@ -4690,7 +4690,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if node.write_through_pending_id is not None:
             return False
-        if getattr(node, "weg2_anchor_secured", False):
+        if self._weg2_anchor_secured_holds(node):
             return False    # KV-in-store anchor already in the arena (not in the tree)
         if ComponentType.MAMBA not in self.tree_components:
             return False
@@ -4698,6 +4698,43 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         cd = node.component_data[ComponentType.MAMBA]
         return cd.value is not None and cd.host_value is None and bool(node.hash_value)
+
+    def _weg2_anchor_secured_holds(self, node: UnifiedTreeNode) -> bool:
+        """y6b (review a54a22e54d F1): ``weg2_anchor_secured`` was set once at
+        the ack and never cleared. The ack hands the write's reference back
+        (the tree holds none), so the slot is a clock candidate; the clock
+        writes it to L3 before it frees it (#257 (d)), but a copy that write
+        could not make (``dropped_without_l3``) left the mark standing -- the
+        sweep never rewrote the anchor and ANCHOR-LOST never counted it, while
+        the device anchor it could have been rewritten from was still there.
+
+        The mark now holds only while the bytes do: a COMPLETE arena slot or an
+        L3 copy (``ArenaMambaPoolHost.anchor_held``). Gone -> the mark is
+        cleared and named (ANCHOR-SECURED-LOST); the next sweep writes the
+        anchor again. A pool that cannot tell keeps the mark (as before)."""
+        if not getattr(node, "weg2_anchor_secured", False):
+            return False
+        mp = self._weg2_mamba_pool()
+        probe = getattr(mp, "anchor_held", None)
+        if not callable(probe) or not node.hash_value:
+            return True
+        try:
+            held = probe(node.hash_value[-1])
+        except Exception as exc:  # noqa: BLE001 - loud; an unreadable answer keeps the mark
+            logger.warning("WEG2 ANCHOR-SECURED probe raised: %r", exc)
+            return True
+        if held is None or held:
+            return True
+        node.weg2_anchor_secured = False
+        n = getattr(UnifiedRadixCache, "_weg2_anchor_secured_lost_n", 0) + 1
+        UnifiedRadixCache._weg2_anchor_secured_lost_n = n
+        if n <= 16 or n % 64 == 0:
+            logger.warning(
+                "WEG2 ANCHOR-SECURED-LOST n=%d node=%s depth=%d (anchor-only slot gone with no L3 copy; "
+                "the mark is cleared -- the sweep writes the device anchor again, ANCHOR-LOST counts it)",
+                n, node.id, self.weg2_node_depth(node),
+            )
+        return False
 
     def write_backup_anchor_only(self, node: UnifiedTreeNode) -> int:
         """ANCHOR-ONLY BACKUP (NF y5a 30.09.): copy ONLY the node's Mamba anchor
