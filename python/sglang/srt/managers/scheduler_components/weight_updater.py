@@ -4556,7 +4556,7 @@ class SchedulerWeightUpdaterManager:
             "(instrument: os.scandir + os.stat over the store, charged at "
             "max(st_blocks*512, st_size) -- the #410 unit, not apparent size) "
             "in %.0f ms (mode %s: journal = only the lines written since the "
-            "last wake, walk = the whole directory)",
+            "last wake, walk = the whole directory) owner=%s",
             census.get("indexed_entries", 0),
             census.get("seen_entries", 0),
             census.get("indexed_bytes", 0),
@@ -4567,6 +4567,12 @@ class SchedulerWeightUpdaterManager:
             census.get("staging_bytes", 0),
             (time.perf_counter() - t0) * 1000,
             census.get("mode", "walk"),
+            # z30y14: a NON-owner (PP1/PP2, TP1/TP2) never walks -- it reprints
+            # its ATTACH-time census at every wake (frozen file count, sibling
+            # 0 B). That is no stale read view: page presence comes from the
+            # shared #1459 L3 stem index the owner maintains for every rank.
+            "yes" if getattr(getattr(backend, "_evictor", None), "_eviction_enabled", True)
+            else "no (attach-time census reprinted, no walk; reads ask the shared #1459 L3 index)",
         )
 
     def _weg2_drain_hicache_before_sleep(
