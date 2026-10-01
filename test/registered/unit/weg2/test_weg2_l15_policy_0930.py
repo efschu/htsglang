@@ -86,6 +86,25 @@ def test_cap_zero_rank_never_blocks():
     assert hs.excluded == ()
 
 
+def test_full_capped_rank_blocks_further_candidates():
+    # Regression (lead review 2026-09-30): the "not held here" decision must
+    # use the ORIGINAL cap (cap 0 = 5090 / TP0), never the remaining capacity:
+    # a capped rank that is exactly full (rem == 0) still blocks.
+    cands = [
+        cand("a", "seat", 2.0, [5, 10, 2], 100, 100),
+        cand("b", "seat", 1.0, [5, 3, 2], 100, 100),
+    ]
+    caps = [0, 10, 10]
+    hs = select_hold(cands, caps, 10)
+    assert hs.rids == ("a",), hs.rids
+    assert ("b", "no_room") in hs.excluded
+    # Rank 1 is exactly at its cap, and no capped rank exceeds its cap.
+    assert hs.rows_by_rank[1] == 10, hs.rows_by_rank
+    for r, cap in enumerate(caps):
+        if cap > 0:
+            assert hs.rows_by_rank[r] <= cap, (r, hs.rows_by_rank, caps)
+
+
 def test_anchorless_excluded():
     # anchor_depth != kv_depth -> excluded up front with reason "anchorless"
     # (not "no_room"), even though it would have fit.
@@ -122,7 +141,12 @@ def test_determinism_under_permutation():
     for _ in range(20):
         shuffled = base[:]
         rng.shuffle(shuffled)
-        hs = select_hold(shuffled, [100, 100], 25)
+        caps = [100, 100]
+        hs = select_hold(shuffled, caps, 25)
+        # Invariant: no capped rank ever exceeds its cap.
+        for r, cap in enumerate(caps):
+            if cap > 0:
+                assert hs.rows_by_rank[r] <= cap, (r, hs.rows_by_rank, caps)
         if first is None:
             first = hs
         else:

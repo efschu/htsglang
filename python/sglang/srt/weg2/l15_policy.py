@@ -81,9 +81,14 @@ def select_hold(
     for c in ordered:
         fits = True
         for r, rows in enumerate(c.rows_by_rank):
-            # Cap-0 rank (the 5090 / TP0 rank) is filled from L2 at the wake,
-            # so it never blocks admission.
-            if rem[r] > 0 and rows > rem[r]:
+            # "Not held here" is decided by the ORIGINAL cap, never by the
+            # remaining capacity: cap 0 (the 5090 / TP0 rank, refilled from
+            # L2 at the wake) does not block, but a capped rank that is
+            # exactly full (rem == 0) DOES block -- skipping on rem == 0
+            # would over-admit past the cap and OOM on metal.
+            if cap_rows_by_rank[r] == 0:
+                continue
+            if rows > rem[r]:
                 fits = False
                 break
         if fits and len(admitted) < cap_anchor_slots:
