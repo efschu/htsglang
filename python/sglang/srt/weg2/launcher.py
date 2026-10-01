@@ -3939,6 +3939,24 @@ def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int,
 SHORT_DRAIN_ABOVE_X_NAME = "W153 Weg2ShortDrainAboveX"
 
 
+def dual_x_tokens(ns) -> Optional[int]:
+    """DUAL-TP3PP3 (user decision 01.10.): D's X in the dual layout, or None outside it.
+
+    Metal dual1m (...10011343, 13:47Z): the front still routed SHORT (uncached <= X=12288)
+    straight to D in the dual layout -- 39 "SHORT -> D", D X-GATE admitted 2..3957 uncached
+    tokens and a 2185-token extend stalled D's decode ~2.5 s. In the dual layout P prefills
+    everything: X = 1 + --dual-d-prefill-tokens (default 0), the 1 being the N-1 anchor
+    token D's first step computes. Bypasses resolve_x's floor (--chunked-prefill-size) on
+    purpose: that floor is a flip-design break-even, and the dual layout never flips."""
+    if not getattr(ns, "dual_layout", False):
+        return None
+    allowance = int(getattr(ns, "dual_d_prefill_tokens", 0) or 0)
+    if allowance < 0:
+        raise SystemExit(f"--dual-d-prefill-tokens {allowance} < 0: the D prefill allowance "
+                         f"counts tokens beyond the N-1 anchor token; 0 = none")
+    return 1 + allowance
+
+
 def refuse_short_drain_above_x(n_tokens: int, x_tokens: int, x_provenance: str) -> None:
     """LAW 4 SUMMED OVER A DRAIN, at launch (RC2 review, L1).
 
@@ -21002,6 +21020,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="DUAL-TP3PP3 --dual-share: what P holds on a card outside its "
                          "--rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged "
                          "when D is sized from P's plan instead of P's measurement.")
+    ap.add_argument("--dual-d-prefill-tokens", type=int, default=0,
+                    help="DUAL-TP3PP3 D PREFILL ALLOWANCE, DEFAULT 0 (user decision 01.10.: in the dual "
+                         "layout EVERY prefill runs on P, D only decodes). D's X (its W31 riegel and the "
+                         "front's route bound) becomes 1 + this value: the 1 is the N-1 anchor convention "
+                         "(P holds the last prompt token back, D's first step computes it), anything "
+                         "larger goes to P and a larger remainder at D is refused by name (W31 -> P), "
+                         "never silently recomputed. Ignored outside --dual-layout; replaces "
+                         "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.")
     ap.add_argument("--dual-p-duty", type=float, default=1.0,
                     help="DUAL-TP3PP3: the share of wall time P's first stage may compute while D holds "
                          "decodes (weg2/dual_duty.py; the latency guard WITHOUT MPS). 1.0 = off. The front "
@@ -23374,6 +23400,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # H84: D's riegel and the front's live-X ceiling, one number (0 = off).
     d_x_tokens, front_x_ceiling, x_ceiling_line = resolve_x_ceiling(
         ns.x_ceiling_tokens, x_tokens, getattr(ns, "x_busy_tokens", None))
+    _dual_x = dual_x_tokens(ns)
+    if _dual_x is not None:
+        x_tokens = d_x_tokens = _dual_x
+        front_x_ceiling = 0
+        x_provenance = (f"X={_dual_x} source=DUAL (--dual-d-prefill-tokens "
+                        f"{int(getattr(ns, 'dual_d_prefill_tokens', 0) or 0)}: every prefill on P, D "
+                        f"computes at most the N-1 anchor token; was {x_seed.provenance})")
+        x_ceiling_line = (f"X CEILING: off in the dual layout -- group D --tp-prefill-max-tokens "
+                          f"{_dual_x}, front --tp-prefill-max-tokens {_dual_x}: any larger remainder "
+                          f"routes to P, and D refuses one by name (W31 -> P)")
+        if int(ns.d_short_drain_tokens or 0) > 0:
+            log(f"WEG2-DUAL --d-short-drain-tokens {ns.d_short_drain_tokens} -> 0 (a flip-design "
+                f"idle drain onto D; in the dual layout D prefills nothing)")
+            ns.d_short_drain_tokens = 0
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
     if int(ns.d_short_drain_tokens or 0) < 0 or (ns.d_hold_s is not None and float(ns.d_hold_s) < 0):
