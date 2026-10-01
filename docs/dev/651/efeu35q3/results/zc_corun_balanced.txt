@@ -1,0 +1,12 @@
+== OMP threads 8
+gpu-only  GPU   82.9 GB/s  CPU    0.0 GB/s  total   82.9 GB/s
+cpu-only  GPU    0.0 GB/s  CPU   58.8 GB/s  total   58.8 GB/s
+both      GPU   54.3 GB/s  CPU   24.8 GB/s  total   79.1 GB/s
+== OMP threads 4
+gpu-only  GPU   81.9 GB/s  CPU    0.0 GB/s  total   81.9 GB/s
+cpu-only  GPU    0.0 GB/s  CPU   58.1 GB/s  total   58.1 GB/s
+both      GPU   54.1 GB/s  CPU   24.5 GB/s  total   78.6 GB/s
+== OMP threads 2
+gpu-only  GPU   81.4 GB/s  CPU    0.0 GB/s  total   81.4 GB/s
+cpu-only  GPU    0.0 GB/s  CPU   58.2 GB/s  total   58.2 GB/s
+both      GPU   53.9 GB/s  CPU   22.6 GB/s  total   76.4 GB/s

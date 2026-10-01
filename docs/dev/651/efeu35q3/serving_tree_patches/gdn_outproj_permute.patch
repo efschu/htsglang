@@ -1,0 +1,173 @@
+--- model_loader/gguf_qwen35.py.orig-efeu	2026-10-01 14:26:17.541188299 +0200
++++ model_loader/gguf_qwen35.py	2026-10-01 14:26:25.160297858 +0200
+@@ -61,6 +61,28 @@
+     """
+     return os.environ.get("SGLANG_GGUF_DENSE_VOCAB", "0") == "1"
+ 
++
++def gguf_gdn_outproj_permute() -> bool:
++    """efeu-TP14 2026-10-01: keep a block-MISALIGNED GDN out_proj QUANTIZED.
++
++    llama.cpp stores the GDN value heads in "tiled" order; sglang wants them
++    grouped, and every other GDN tensor is un-tiled at load. For out_proj the
++    v heads are its INPUT columns, and a K-quant block (256) spans two
++    128-wide heads, so the columns cannot be permuted inside the packed bytes.
++    The old answer dequantized the whole matrix to dense bf16 at load: on
++    Qwen3.8-35B-A3B Q3_K_M that is 30 x 2048 x 4096 x 2 B = 503 MB read per
++    decoded token instead of 108 MB packed (~25 % of the decode bytes).
++
++    Default (True): leave the weight packed in TILED column order and permute
++    the ACTIVATION instead (Qwen3_5GatedDeltaNet gathers its 4096-wide input to
++    out_proj into tiled order, see finalize_gguf_out_proj_perm). Exact: a
++    column permutation of W equals the inverse permutation of x.
++    ``SGLANG_GGUF_GDN_OUTPROJ_PERMUTE=0`` restores the dense path. Single
++    attention-TP rank only (the gather crosses TP shards); the model refuses
++    otherwise.
++    """
++    return os.environ.get("SGLANG_GGUF_GDN_OUTPROJ_PERMUTE", "1") == "1"
++
+ # HF model_type -> GGUF arch name (values as in gguf.MODEL_ARCH_NAMES).
+ _MODEL_TYPE_TO_GGUF_ARCH = {
+     "qwen3_5": "qwen35",
+@@ -453,7 +475,9 @@
+                 continue
+             gt = types.get(gname)
+             if gt in unq_types or (
+-                gt is not None and self._out_proj_dequant_needed(int(gt))
++                gt is not None
++                and self._out_proj_dequant_needed(int(gt))
++                and not gguf_gdn_outproj_permute()
+             ):
+                 prefixes.add(hf[: -len(".weight")])
+ 
+@@ -658,7 +682,10 @@
+                 qtype = int(weight.item())
+                 qweight_types[name.removesuffix("_type")] = qtype
+                 if name.endswith("linear_attn.out_proj.qweight_type") and (
+-                    self._out_proj_dequant_needed(qtype)
++                    (
++                        self._out_proj_dequant_needed(qtype)
++                        and not gguf_gdn_outproj_permute()
++                    )
+                     or self._is_dense_gguf_type(qtype)
+                 ):
+                     # Layer is loaded unquantized (block-misaligned quant that we
+@@ -686,6 +713,11 @@
+                         self.config.torch_dtype
+                     )
+                     continue
++                if self._out_proj_dequant_needed(qtype) and gguf_gdn_outproj_permute():
++                    # efeu-TP14: keep it packed, in llama.cpp's TILED column
++                    # order; the model permutes the activation instead.
++                    yield name, weight
++                    continue
+                 if self._out_proj_dequant_needed(qtype):
+                     # Block-misaligned quantized out_proj (e.g. K-quant block 256
+                     # with head_v_dim 128): dequantize, then element-wise un-tile.
+--- models/qwen3_5.py.orig-efeu	2026-10-01 14:26:17.544188342 +0200
++++ models/qwen3_5.py	2026-10-01 14:26:25.388301137 +0200
+@@ -167,6 +167,15 @@
+     )
+ 
+ 
++def _finalize_gdn_out_proj_perms(model: nn.Module) -> None:
++    """efeu-TP14: after weight loading, arm every GDN layer's out_proj input
++    permutation (no-op unless a GGUF out_proj was left packed in tiled order).
++    Runs before CUDA-graph capture, so the gather is part of the graph."""
++    for m in model.modules():
++        if isinstance(m, Qwen3_5GatedDeltaNet):
++            m.finalize_gguf_out_proj_perm()
++
++
+ class Qwen3_5GatedDeltaNet(nn.Module):
+     def __init__(
+         self,
+@@ -358,6 +367,47 @@
+             # k-head units, matching the in_proj/conv1d split.
+             tp_units=self.gdn_tp_units,
+         )
++        # efeu-TP14: set by finalize_gguf_out_proj_perm() after loading when
++        # the GGUF adapter left out_proj packed in llama.cpp's tiled column
++        # order (gguf_gdn_outproj_permute); None = no permutation.
++        self._out_proj_in_perm: Optional[torch.Tensor] = None
++
++    def finalize_gguf_out_proj_perm(self) -> None:
++        """Arm the activation permutation for a tiled, packed GGUF out_proj.
++
++        Invariant (gguf_qwen35.py): a GGUF out_proj whose quant block does not
++        divide head_v_dim can only be QUANTIZED here if the adapter left it in
++        TILED column order (otherwise it is dense or the adapter refused).
++        _undo_v_tiling maps grouped column j to tiled column idx[j]; therefore
++        W_grouped @ x == W_tiled @ x[..., inv] with inv = argsort(idx).
++        """
++        self._out_proj_in_perm = None
++        qt = getattr(self.out_proj, "qweight_type", None)
++        wt = getattr(qt, "weight_type", None) if qt is not None else None
++        if wt is None or self.num_k_heads == self.num_v_heads:
++            return
++        import gguf as _gguf
++
++        try:
++            block = _gguf.GGML_QUANT_SIZES[_gguf.GGMLQuantizationType(int(wt))][0]
++        except (KeyError, ValueError):
++            return
++        if self.head_v_dim % block == 0:
++            return
++        if self.attn_tp_size != 1:
++            raise ValueError(
++                "GGUF GDN out_proj left packed in tiled order needs attention TP 1; "
++                "set SGLANG_GGUF_GDN_OUTPROJ_PERMUTE=0 to dequantize it instead."
++            )
++        vpk = self.num_v_heads // self.num_k_heads
++        idx = (
++            torch.arange(self.value_dim)
++            .view(vpk, self.num_k_heads, self.head_v_dim)
++            .permute(1, 0, 2)
++            .reshape(-1)
++        )
++        dev = self.out_proj.qweight.device
++        self._out_proj_in_perm = torch.argsort(idx).to(dev)
+ 
+     @staticmethod
+     def _override_weight_loader(param, loader):
+@@ -633,6 +683,8 @@
+         core_attn_out = self.norm(core_attn_out, z)
+         core_attn_out = core_attn_out.reshape(z_shape_og)
+         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
++        if self._out_proj_in_perm is not None:
++            core_attn_out = core_attn_out.index_select(-1, self._out_proj_in_perm)
+ 
+         output, _ = self.out_proj(core_attn_out)
+         return output
+@@ -1597,6 +1649,7 @@
+                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 weight_loader(param, loaded_weight)
+             loaded_params.add(name)
++        _finalize_gdn_out_proj_perms(self)
+         return loaded_params
+ 
+     @classmethod
+@@ -1815,6 +1868,7 @@
+                         logger.warning(f"Parameter {name} not found in params_dict")
+             loaded_params.add(name)
+ 
++        _finalize_gdn_out_proj_perms(self)
+         return loaded_params
+ 
+ 
+@@ -1971,6 +2025,7 @@
+                     )
+                     weight_loader(param_lm_head, loaded_weight)
+             loaded_params.add(name)
++        _finalize_gdn_out_proj_perms(self)
+         return loaded_params
+ 
+ 
+@@ -2348,6 +2403,7 @@
+             }
+         )
+ 
++        _finalize_gdn_out_proj_perms(self)
+         return loaded_params
+ 
+     @property
