@@ -2611,6 +2611,107 @@ def _group_room_below(sched, alloc, tokens: int, need: int) -> bool:
     return bool(int(gmin([ok])[0]))
 
 
+#: NF y6k 01.10.: the re-check census line (one per FLOOR_CHECK_EVERY ticks)
+FLOOR_CHECK_MARK = "WEG2 D-MEM-SCHED FLOOR-CHECK"
+FLOOR_CHECK_EVERY = 512
+_SLACK_CAP = 1 << 40
+
+
+def _recheck_max() -> int:
+    from sglang.srt.environ import envs
+
+    try:
+        return max(1, int(envs.SGLANG_WEG2_D_MEM_RECHECK_ROUNDS.get()))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _floor_room_state(ms) -> dict:
+    """The re-check bookkeeping rides on the (replicated) machine: a new wake
+    epoch builds a new machine and so starts from fresh reads."""
+    fr = getattr(ms, "_weg2_floor_room", None)
+    if fr is None:
+        fr = {"floor": None, "room": None, "lifted_since": False, "ticks": 0,
+              "floor_reads": 0, "floor_cached": 0, "room_reads": 0, "room_cached": 0}
+        ms._weg2_floor_room = fr
+    return fr
+
+
+def _floor_for_shrink(sched, ms, fr, ended: bool) -> int:
+    """The floor ``MemSched.step`` asks for -- only on a path that shrinks.
+
+    NF y6k 01.10.: a pending shrink re-read the group floor every decode
+    round (max_live_page copies the free lists device->host = a sync of the
+    decode stream, plus one group collective): 32 % of the D-TP0 scheduler,
+    host gap 9 ms/round. While the SAME shrink stays pending the floor can
+    only FALL (new pages go below the pending cap, which sits below the
+    floor), so the last read is an upper bound and blocks nothing it should
+    not. It is re-read after 1, 2, 4, ... up to SGLANG_WEG2_D_MEM_RECHECK_ROUNDS
+    rounds (all inputs replicated: the round count, the pending stage), and at
+    once on an end event. While the cap is lifted to the stage (pages may go
+    above the old floor) the cached rounds answer with the mapped stage
+    itself: no shrink, never one below a live page."""
+    k = _recheck_max()
+    rnd = int(getattr(ms, "_round", 0))
+    c = fr.get("floor")
+    if (k > 1 and not ended and ms.pending is not None and c is not None
+            and c["pending"] == ms.pending and rnd < c["next"]):
+        fr["floor_cached"] += 1
+        if fr.get("lifted_since"):
+            return int(ms.stage_tokens[ms.stage])
+        return int(c["value"])
+    value = int(_group_floor_tokens(sched))
+    fr["floor_reads"] += 1
+    gap = 1
+    if c is not None and c["pending"] == ms.pending and c["value"] == value:
+        gap = min(k, max(1, int(c["gap"]) * 2))
+    fr["floor"] = {"pending": ms.pending, "value": value, "next": rnd + gap, "gap": gap}
+    fr["lifted_since"] = bool(getattr(ms, "_cap_lifted", False))
+    return value
+
+
+def _room_ok(sched, ms, fr, alloc, cap_tokens: int, need: int, incoming: int,
+             n_running: int, page: int) -> bool:
+    """``_group_room_below`` with the same replicated re-check: a pure decode
+    round (no incoming) under an unchanged pending cap reuses the last group
+    verdict while the group's MIN slack (free tokens below the cap minus the
+    need) cannot have been used up -- each running request takes at most
+    ceil(r * R / page) new pages in r rounds of R tokens (R = verify tokens
+    + 1). A new demand, a new running set or a new cap re-reads at once."""
+    k = _recheck_max()
+    rnd = int(getattr(ms, "_round", 0))
+    key = (ms.pending, int(cap_tokens), int(need), int(n_running))
+    c = fr.get("room")
+    if k > 1 and int(incoming) <= 0 and c is not None and c["key"] == key and rnd < c["next"]:
+        fr["room_cached"] += 1
+        return bool(c["ok"])
+    room = free_tokens_below(alloc, cap_tokens, _page_size(sched))
+    slack = _SLACK_CAP if room is None else min(_SLACK_CAP, int(room) - int(need))
+    ok_local = 1 if slack >= 0 else 0
+    gmin = getattr(sched, "_weg2_group_min_ints", None)
+    res = [ok_local, slack] if gmin is None else list(gmin([ok_local, slack]))
+    fr["room_reads"] += 1
+    ok = bool(int(res[0]))
+    min_slack = int(res[1]) if len(res) > 1 else 0
+    gap = 0
+    if ok and min_slack > 0:
+        pg = max(1, int(page))
+        args = getattr(sched, "server_args", None)
+        per_round = max(1, int(getattr(args, "speculative_num_draft_tokens", 0) or 1)) + 1
+        n = max(1, int(n_running))
+        pages_each = min_slack // (n * pg)          # new pages each request may still take
+        safe = (pages_each * pg) // per_round        # rounds before any could need more
+        prev = c["gap"] if (c is not None and c["key"] == key) else 0
+        gap = min(k, safe, max(1, int(prev) * 2))
+    elif not ok:
+        # a lift keeps the cap at the mapped stage (more room, not less):
+        # re-read on the same back-off, the lift ends on a fresh verdict
+        prev = c["gap"] if (c is not None and c["key"] == key) else 0
+        gap = min(k, max(1, int(prev) * 2))
+    fr["room"] = {"key": key, "ok": ok, "next": rnd + gap, "gap": max(1, gap)}
+    return ok
+
+
 #: 27B 29.09.: iterations the tick left at its first checks (P, the 27B, a
 #: D without stage form) -- no collective, no sync, no allocation there
 TICK_NOOP_ATTR = "_weg2_d_mem_tick_noop"
@@ -2664,11 +2765,20 @@ def runtime_tick(sched):
     reserve = _agree_reserve(sched, admissible, admission_reserve(sched, running, admissible))
     ended = ms._rids is not None and bool(ms._rids - rids)
     ms._rids = rids
-    floor = 0
-    if ms.pending is not None or ms.shrink_candidate(used, incoming + reserve):
-        floor = _group_floor_tokens(sched)
+    fr = _floor_room_state(ms)
+    fr["ticks"] += 1
+    floor_box = [0]
+
+    def _floor():
+        floor_box[0] = _floor_for_shrink(sched, ms, fr, ended)
+        return floor_box[0]
+
     before, pending_before = ms.stage, ms.pending
-    step = ms.step(used, incoming + reserve, ended=ended, floor_tokens=floor)
+    # the floor is asked for only on a path that shrinks (MemSched calls it)
+    step = ms.step(used, incoming + reserve, ended=ended, floor_tokens=_floor)
+    floor = floor_box[0]
+    if step.changed:
+        fr["floor"] = fr["room"] = None
     alloc = _kv_allocator(sched)
     page = _page_size(sched)
     # NF1d 09291811 (z30y3f): a pending shrink caps new pages below the wanted
@@ -2688,8 +2798,21 @@ def runtime_tick(sched):
         chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
         first = min(int(incoming), chunk) if chunk > 0 else int(incoming)
         need = first + len(rids) * max(1, page)
-        lifted = not _group_room_below(sched, alloc, tokens[ms.pending], need)
+        lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need, incoming,
+                              len(rids), page)
     ms._cap_lifted = lifted
+    if lifted:
+        fr["lifted_since"] = True
+    elif lifted_before:
+        fr["floor"] = None                      # the lift ended: read the floor afresh
+    if fr["ticks"] % FLOOR_CHECK_EVERY == 0:
+        logger.info(
+            "%s ticks=%d floor_reads=%d floor_cached=%d room_reads=%d room_cached=%d "
+            "collectives=%d pending=S%s lifted=%s recheck_max=%d",
+            FLOOR_CHECK_MARK, fr["ticks"], fr["floor_reads"], fr["floor_cached"],
+            fr["room_reads"], fr["room_cached"], fr["floor_reads"] + fr["room_reads"],
+            "-" if ms.pending is None else ms.pending, "yes" if lifted else "no",
+            _recheck_max())
     if not step.changed:
         if lifted != lifted_before and alloc is not None:
             want = ms.stage if lifted else ms.pending

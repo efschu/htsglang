@@ -3182,6 +3182,15 @@ class Envs:
     #   coldest kept rows first (weg2/d_mem_sched.py). ON by default; this is
     #   the diagnosis-only emergency stop, not a feature switch.
     SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS = EnvBool(False)
+    # D-MEM-SCHED floor/room re-check (01.10., NF y6k: 32 % of the D-TP0
+    #   scheduler in max_live_page, a device sync + a group collective every
+    #   decode round under a pending shrink; host gap 9 ms/round vs 2.9 in
+    #   x176). While a shrink stays pending and nothing replicated changed,
+    #   the floor and the room below the cap are re-read after 1, 2, 4, ...
+    #   up to this many rounds (an end event, a lift or a demand change
+    #   re-reads at once; the room re-reads before decode can use up its
+    #   slack). 1 = every round (the old behaviour).
+    SGLANG_WEG2_D_MEM_RECHECK_ROUNDS = EnvInt(64)
     # KV-STAGE warm refill (01.10., y6h: 179 shrinks, 178 on an end event, 72
     #   of 109 grows within 5 s after one): a seat-row shrink remembers the
     #   experts it sent to the store, hottest first; the next grow refills its
