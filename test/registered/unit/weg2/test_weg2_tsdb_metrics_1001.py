@@ -78,14 +78,25 @@ def test_no_env_no_push():
 
 
 def test_push_rides_the_writer_with_rid_as_field():
+    """The weg2_req point comes from request_done (DASHBOARD-IPC) through the
+    ONE pusher of the TSDB front metrics; rid is a field, never a tag."""
+    from sglang.srt.weg2 import front as F
+
     m, calls = _metrics(**{fm.PUSH_URL_ENV: "http://vm:8428/write", fm.MODEL_ENV: "27B"})
     m.pusher.every_s = 0.0
-    m.leg2_first_content("weg2-3-9", "after_p", 0.5, arrival_ts=100.0, now=101.25)
+    stub = types.SimpleNamespace(_front_metrics=m)
+    stub._metrics = types.MethodType(F.Front._metrics, stub)
+    assert F.Front._ipc_pusher(stub) is m.pusher
     m.served_leg("D", "weg2-3-9", 2.0, 1000, 900, 50)
+    assert calls == []                       # nothing pushed per leg
+    F.Front._ipc_req_push(stub, {"rid": "weg2-3-9", "via": "after_p", "status": 200,
+                                 "ttft_ms": 1250.0, "end_ts": 1.0})
     assert calls, "the write is handed to the writer"
     fn, (lines,) = calls[-1]
-    assert lines[-1].startswith("weg2_req,group=D,model=27B,via=after_p ")
+    assert lines[-1].startswith("weg2_req,")
     assert 'rid="weg2-3-9"' in lines[-1] and "ttft_ms=1250.0" in lines[-1]
+    head = lines[-1].split(" ")[0]
+    assert "rid" not in head and "via=after_p" in head
 
 
 # --- front metrics --------------------------------------------------------------------------

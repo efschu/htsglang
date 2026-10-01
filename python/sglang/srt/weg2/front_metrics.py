@@ -234,13 +234,20 @@ def meta_of(text: str) -> set:
 class FrontMetrics:
     def __init__(self, *, submit: Optional[Callable[..., None]] = None,
                  environ: Optional[Dict[str, str]] = None) -> None:
-        env = os.environ if environ is None else environ
-        self.model = (env.get(MODEL_ENV, "") or "").strip() or None
+        if environ is None:
+            # the registered switches (environ.py: one switch, overridable in tests)
+            from sglang.srt.environ import envs
+
+            model_raw = envs.SGLANG_WEG2_METRICS_MODEL.get()
+            url_raw = envs.SGLANG_WEG2_METRICS_PUSH_URL.get()
+        else:
+            model_raw, url_raw = environ.get(MODEL_ENV), environ.get(PUSH_URL_ENV)
+        self.model = (model_raw or "").strip() or None
         self.prom = _prom()
         self.errors: Dict[str, int] = collections.Counter()
         self._req: Dict[str, Dict[str, float]] = {}
         self.registry = None
-        url = (env.get(PUSH_URL_ENV, "") or "").strip()
+        url = (url_raw or "").strip()
         self.pusher: Optional[InfluxPusher] = (
             InfluxPusher(url, submit=submit) if url and submit is not None else None)
         if self.prom is None:
@@ -331,11 +338,10 @@ class FrontMetrics:
                     if v:
                         self.tokens.labels(group=group, kind=kind).inc(max(0, int(v)))
             if group == "D":
-                rec = self._req.pop(str(rid), {})
-                self._push("weg2_req", {"group": group, "via": rec.get("via")},
-                           {"rid": str(rid), "ttft_ms": rec.get("ttft_ms"), "leg2_ms": rec.get("leg2_ms"),
-                            "wall_s": round(float(wall_s), 3), "prompt": int(prompt),
-                            "cached": int(cached), "completion": int(completion)})
+                # the weg2_req POINT is the front's request_done (DASHBOARD-IPC, NF
+                # front_requests.influx_req_fields) -- one point per finished request,
+                # written through this module's pusher; nothing pushed per leg here
+                self._req.pop(str(rid), None)
         except Exception as e:  # noqa: BLE001
             self._err("served_leg", e)
 

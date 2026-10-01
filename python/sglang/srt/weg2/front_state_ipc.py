@@ -459,8 +459,37 @@ class FirstWorkClock:
     #: marks take every non-null ``flip_time_ms``.
     NONE = "none"
 
+    # DASHBOARD-IPC 01.10. (NF + 27B, 3-12 per boot): a P->D ``decode_token``
+    # fired 0.02-0.99 s after ``flip_begin`` -- long before D was awake --
+    # because ANY chunk of ANY open D stream counted, e.g. a wait-bound-parked
+    # stream of an earlier D phase (NF 01.10. 05:27:47.638 epoch 26:
+    # weg2-18-137, dispatched in epoch 18, fired 153 ms after the begin; done
+    # came at +2.2 s). D content before ``done`` now counts only for a leg 2
+    # dispatched at or after this flip's begin -- the hand-off, which the
+    # dormant admit sends DURING the flip (05:08:13: weg2-3-10 D-ADMIT 64 ms
+    # after the begin, first token 2.9 s after P's end; a rule "dispatched
+    # after done" would drop exactly the flip it defines). From ``done`` on,
+    # D is awake and any content is its work.
+
     def __init__(self) -> None:
         self._armed: Optional[dict] = None
+        #: the end of P's last leg 1 and the last flip's done (front clock)
+        self._p_end: Optional[float] = None
+        self._last_done: float = float("-inf")
+        #: D chunks refused as a flip's first work (stale, before done), boot total
+        self.stale_skipped = 0
+
+    def waits_for(self, group: str) -> bool:
+        """An armed flip whose woken group is ``group`` (cheap: per D chunk)."""
+        a = self._armed
+        return a is not None and a["wake"] == group
+
+    def note_p_end(self, now: float) -> None:
+        """P served a leg 1 (its end is P's end when it was the phase's last)."""
+        self._p_end = float(now)
+        a = self._armed
+        if a is not None and a["wake"] == "D" and a.get("done_ts") is None:
+            a["p_end_ts"] = max(float(a.get("p_end_ts") or now), float(now))
 
     def arm(self, epoch: int, sleep: str, wake: str, flip_begin_ts: float) -> Optional[dict]:
         """Arm the new flip; returns the ``none`` event of the previous flip when
@@ -468,10 +497,14 @@ class FirstWorkClock:
         prev = self.flush("next_flip_before_work")
         self._armed = {"epoch": int(epoch), "dir": f"{sleep}>{wake}", "wake": wake,
                        "flip_begin_ts": float(flip_begin_ts)}
+        if wake == "D" and self._p_end is not None and self._p_end >= self._last_done:
+            # P's last leg 1 in the P phase this flip ends
+            self._armed["p_end_ts"] = self._p_end
         return prev
 
     def done(self, now: float) -> None:
         """The armed flip reached ``done`` (its ``flip_done`` was published)."""
+        self._last_done = float(now)
         if self._armed is not None:
             self._armed["done_ts"] = float(now)
 
@@ -487,12 +520,34 @@ class FirstWorkClock:
                 "flip_total_ms": round((a["done_ts"] - a["flip_begin_ts"]) * 1000.0),
                 "what": self.NONE, "reason": reason, "rid": None, "clock": "time.time front"}
 
-    def seen(self, group: str, what: str, rid: Optional[str], now: float) -> Optional[dict]:
+    def seen(self, group: str, what: str, rid: Optional[str], now: float,
+             leg2_dispatch_ts: Optional[float] = None) -> Optional[dict]:
+        """The woken group worked: the event, or None. For D, ``leg2_dispatch_ts``
+        is the rid's leg-2 dispatch (front clock; None = unknown): content
+        before ``done`` counts only for a leg 2 dispatched in this flip."""
         a = self._armed
         if a is None or a["wake"] != group:
             return None
+        if group == "D" and a.get("done_ts") is None and (
+                leg2_dispatch_ts is None or float(leg2_dispatch_ts) < a["flip_begin_ts"]):
+            a["stale_skipped"] = int(a.get("stale_skipped", 0)) + 1
+            self.stale_skipped += 1
+            return None
         self._armed = None
-        return {"epoch": a["epoch"], "dir": a["dir"], "flip_begin_ts": round(a["flip_begin_ts"], 3),
-                "first_work_ts": round(float(now), 3),
-                "flip_time_ms": round((float(now) - a["flip_begin_ts"]) * 1000.0),
-                "what": what, "rid": rid, "clock": "time.time front"}
+        ev = {"epoch": a["epoch"], "dir": a["dir"], "flip_begin_ts": round(a["flip_begin_ts"], 3),
+              "first_work_ts": round(float(now), 3),
+              "flip_time_ms": round((float(now) - a["flip_begin_ts"]) * 1000.0),
+              "what": what, "rid": rid, "clock": "time.time front",
+              "done_ts": None if a.get("done_ts") is None else round(a["done_ts"], 3),
+              "before_done": a.get("done_ts") is None,
+              "stale_skipped": int(a.get("stale_skipped", 0))}
+        if group == "D":
+            # the user's P->D flip time (29.09.): P end -> first decode token
+            p_end = a.get("p_end_ts")
+            start = float(p_end) if p_end is not None else a["flip_begin_ts"]
+            ev.update({"leg2_dispatch_ts": (None if leg2_dispatch_ts is None
+                                            else round(float(leg2_dispatch_ts), 3)),
+                       "p_end_ts": None if p_end is None else round(float(p_end), 3),
+                       "p_end_source": "p_leg1_end" if p_end is not None else "flip_begin",
+                       "flip_user_ms": round((float(now) - start) * 1000.0)})
+        return ev

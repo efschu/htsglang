@@ -818,6 +818,13 @@ class Envs:
     SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(True)
     # the groups both parts apply to (comma list; default the D->P sleeper)
     SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
+    # TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's
+    # optional Influx-line push to VictoriaMetrics (e.g.
+    # http://192.168.0.88:8428/write), bundled ~2 s in the front's IPC writer
+    # thread. Unset = no push (default). The model tag of every point (e.g. NF /
+    # 27B). Read by weg2/front_metrics.py (registered here, one switch).
+    SGLANG_WEG2_METRICS_PUSH_URL = EnvStr(None)
+    SGLANG_WEG2_METRICS_MODEL = EnvStr(None)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.
