@@ -13496,6 +13496,50 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
     return ms, src
 
 
+def d_owned_miss_ms_rank(ns, *, env_d: Mapping[str, str], n: int
+                         ) -> Tuple[Optional[Tuple[float, ...]], str]:
+    """01.10. (owned cut from the profiles): the cost per missed expert row
+    of EVERY D rank from its own paired records (each card at its own link:
+    NF D TP1 = NVML0 3080 x4, TP2 = NVML2 3080 x8 -- the (host, worker) pair
+    of :func:`d_owned_miss_ms` pools both 3080s into one worker cost).
+    ``(None, "")`` without a full window on every rank."""
+    from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+    from sglang.srt.planner import expert_residency as _er
+
+    model = str(getattr(ns, "model", "") or "")
+    root = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip()
+    if not root:
+        return None, ""
+    got = _er.owned_miss_per_rank_from_records(
+        _er.read_owned_miss_rank_records(_miss_cost.record_dir_for(root, model)),
+        n=int(n), model=model)
+    if got is None:
+        return None, ""
+    return got
+
+
+def d_owned_heat_records(ns, *, env_d: Mapping[str, str]) -> Tuple[List[dict], str]:
+    """01.10. (owned cut from the profiles): the #276 heat records of group
+    D's ``SGLANG_DEBUG_MOE_HEAT`` directory -- the owned solve's non-resident
+    demand (``plan_d_residency`` maps them to a routed-lane share per global
+    expert). The directory is the line's per-checkpoint heat directory (the
+    profile names it); ``([], "")`` when it is unset."""
+    import glob
+    import json as _json
+
+    root = str(env_d.get("SGLANG_DEBUG_MOE_HEAT", "") or "").strip()
+    if not root or not os.path.isdir(root):
+        return [], ""
+    recs = []
+    for path in sorted(glob.glob(os.path.join(root, "moe_heat_*.json"))):
+        try:
+            with open(path) as fh:
+                recs.append(_json.load(fh))
+        except (OSError, ValueError):
+            continue
+    return recs, root
+
+
 def d_overshoot_record(profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
     """``D_OVERSHOOT_MIB`` (peak - budget, the qwen27b record), or ``(None, "")``
     for a profile that prices D's awake excess as ``D_AWAKE_REST_MIB`` instead
@@ -18237,6 +18281,13 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     elif _miss_src:
         log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
             f"Saat -- {_miss_src}")
+    # 01.10.: the same records per rank -- each card at its own link
+    _miss_rank, _miss_rank_src = d_owned_miss_ms_rank(ns, env_d=_env_d, n=n)
+    _heat_recs, _heat_root = d_owned_heat_records(ns, env_d=_env_d)
+    if _miss_rank is not None:
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN JE RANG (01.10.): "
+            f"{'/'.join('%.4f' % x for x in _miss_rank)} ms je Zeile (TP0..TP{n - 1}) "
+            f"aus {_miss_rank_src}")
     # #239: the token cut of the full-attention KV (None = off, byte-identical)
     _kv_cut = d_kv_token_cut(ns)
     _pinned = getattr(ns, "_d_map_form", None)
@@ -18290,6 +18341,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             derive_waves=_derive_waves,
             owned_miss_ms=_miss_ms,
             owned_miss_source=_miss_src,
+            owned_miss_ms_rank=_miss_rank,
+            owned_miss_rank_source=_miss_rank_src,
+            owned_heat_records=_heat_recs,
+            owned_heat_source=_heat_root,
             **_kv_cut_kw,
         )
         if _ledger is not None and plan.refusal is not None and plan.fits:
@@ -18329,6 +18384,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     derive_waves=_derive_waves,
                     owned_miss_ms=_miss_ms,
                     owned_miss_source=_miss_src,
+                    owned_miss_ms_rank=_miss_rank,
+                    owned_miss_rank_source=_miss_rank_src,
+                    owned_heat_records=_heat_recs,
+                    owned_heat_source=_heat_root,
                     **_kv_cut_kw,
                 )
         if d_stated_seats(ns) is not None:
@@ -18422,6 +18481,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             derive_waves=_derive_waves,
             owned_miss_ms=_miss_ms,
             owned_miss_source=_miss_src,
+            owned_miss_ms_rank=_miss_rank,
+            owned_miss_rank_source=_miss_rank_src,
+            owned_heat_records=_heat_recs,
+            owned_heat_source=_heat_root,
             **_seat_cut_kw,
     ), label):
         log(_ln)

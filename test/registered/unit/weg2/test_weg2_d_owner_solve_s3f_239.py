@@ -190,8 +190,11 @@ def test_the_attention_post_follows_the_share_and_the_merge_is_on_every_rank():
 
 def test_the_solve_and_the_record_carry_the_attention_post():
     src = inspect.getsource(er.solve_owned_cut)
-    assert "owned_round_ms(fits, shares=sh, merged=True, **kw)" in src
-    assert "merged=False" in src
+    # 01.10.: T_r per batch size -- the cut form merges, Form A does not
+    assert "owned_round_ms(fits, shares=shares, merged=merged," in src
+    assert "_by_bs(fits, sh, True, rat)" in src
+    assert ("base_by = _by_bs(base_fits, tuple(1 if r == host else 0 for r in "
+            "range(len(base))), False,") in src
     plan_src = inspect.getsource(er.plan_d_residency)
     for key in ('"attn_ms_per_row"', '"lse_ms_per_layer"', '"attn_source"', '"fa_layers"'):
         assert key in plan_src
