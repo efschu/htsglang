@@ -203,6 +203,24 @@ def build_dual_stage_model(runner, spec: Optional[DualShareSpec] = None):
     return hull
 
 
+class DualPSleepNoBackup(RuntimeError):
+    """W-DUAL-P-NO-BACKUP: a sleeping dual P rank without the weights CPU backup."""
+
+
+#: env: what the untagged-live riegel tolerates (MiB), default 0 -- a NAMED
+#: allowance for a real load transient, never a blind margin (the riegel line
+#: prints what is left per rank)
+UNTAGGED_TOL_ENV = "SGLANG_WEG2_DUAL_P_UNTAGGED_TOL_MIB"
+
+
+def untagged_tolerance_mib(env: Optional[Mapping[str, str]] = None) -> float:
+    e = os.environ if env is None else env
+    try:
+        return max(0.0, float(e.get(UNTAGGED_TOL_ENV, "") or 0.0))
+    except ValueError:
+        return 0.0
+
+
 def assert_dual_p_sleep_tracked(runner) -> bool:
     """After load, on a dual-share P rank whose weights are NOT resident (it will
     sleep): the untagged-live riegel (weg2_memory_saver.assert_no_untagged_live).
@@ -216,11 +234,30 @@ def assert_dual_p_sleep_tracked(runner) -> bool:
 
     if not dual_share_armed() or weights_resident_armed() or getattr(runner, "is_draft_worker", False):
         return False
-    assert_no_untagged_live()
+    from sglang.srt.managers import weg2_memory_saver as _ms
+    from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
+
+    # The re-homed kernel state must come back WITH ITS CONTENT: a Marlin workspace
+    # is the kernels' lock array (marlin_template.h barrier_acquire spins until
+    # the lock equals the slice count, starting from 0; the last slice resets it
+    # to 0), so a wake that mapped fresh, undefined pages would hang the first
+    # GEMM. TMS restores the pre-pause bytes (zeros at an idle pause) only with
+    # the weights CPU backup armed.
+    if not weights_cpu_backup_armed():
+        raise DualPSleepNoBackup(
+            "W-DUAL-P-NO-BACKUP: this P rank will sleep (weights not resident) but the weights CPU backup is "
+            "not armed (SGLANG_WEG2_WEIGHTS_CPU_BACKUP) -- the weights and the re-homed kernel state (Marlin "
+            "lock workspaces) would wake undefined")
+    left = sum(_ms._LAST_KEPT_LIVE_MIB.values())
+    tol = untagged_tolerance_mib()
+    assert_no_untagged_live(tolerance_mib=tol)
     slack = assert_weights_pool_slack(weights_pool_slack_mib())
-    logger.info("DUAL-TP3PP3 P: sleep riegels ok -- untagged live 0 (load pools empty after load; shared part "
-                "bound, %.1f MiB of its buffers re-homed under the weights tag); weights tag pools hold %.0f MiB "
-                "of empty segments", float(getattr(runner, "dual_share_rehomed_bytes", 0) or 0) / 2**20, slack)
+    moved = dict(getattr(runner, "dual_share_rehomed", None) or {})
+    logger.info("DUAL-TP3PP3 P: sleep riegels ok -- untagged live %.2f MiB left in the load pools (tolerance %.0f "
+                "MiB, %s); shared part bound, re-homed under the weights tag: buffers %.1f KiB, attributes %.1f "
+                "KiB (kernel state outside the parameter registry, e.g. Marlin workspaces); weights tag pools "
+                "hold %.0f MiB of empty segments", left, tol, UNTAGGED_TOL_ENV,
+                moved.get("buffers", 0) / 2**10, moved.get("attributes", 0) / 2**10, slack)
     return True
 
 
@@ -286,23 +323,85 @@ def _wait_for_owner(t: _BindTarget) -> None:
                 "shared part now", t.card[-12:], time.perf_counter() - t0)
 
 
-def rehome_survivors(part) -> int:
-    """Inside a :func:`transient_load_scope`: re-allocate every BUFFER of the
-    bound part (rotary caches, norm buffers -- replicated, never in the union
-    image, and aliased by the hull) under the weights tag, so they sleep and
-    wake with it. Returns the bytes re-homed."""
+def _arena_ranges() -> List[Tuple[int, int]]:
+    """(base, end) of every union arena this process attached (D's VMM images):
+    tensors living there are D's bytes, never re-homed."""
+    try:
+        from sglang.srt.weg2.union_arena_bind import _ATTACHED
+    except Exception:  # noqa: BLE001 -- no union module: nothing attached
+        return []
+    out = []
+    for arena in list(_ATTACHED.values()):
+        base, size = int(getattr(arena, "base", 0) or 0), int(getattr(arena, "total_bytes", 0) or 0)
+        if base and size:
+            out.append((base, base + size))
+    return out
+
+
+def rehome_survivors(part, arena_ranges: Optional[List[Tuple[int, int]]] = None,
+                     device_types: Tuple[str, ...] = ("cuda",)) -> Dict[str, int]:
+    """Inside a :func:`transient_load_scope`: re-allocate under the weights tag
+    every device tensor of the bound part that is NOT a view of D's arena, so it
+    sleeps and wakes with P:
+
+    * BUFFERS (rotary caches, norm buffers -- replicated, never in the union
+      image, aliased by the hull);
+    * plain tensor ATTRIBUTES of its modules (``vars(module)``): kernel state the
+      quant schemes keep outside the parameter/buffer registry -- the Marlin
+      ``layer.workspace`` (marlin_utils_fp8.py / marlin_utils_fp4.py /
+      nvfp4_marlin_inplace.py), gmps10 (dkr27bnvfp4dual1mpsleepbar1fs10012202):
+      PP1 0.2 / PP2 0.1 MiB left live in the load pool -> W-DUAL-P-UNTAGGED.
+
+    Tensors sharing one storage get ONE clone (views re-taken on it); a tensor
+    whose storage lies in an attached arena, or is a parameter's (bound to the
+    arena), is left alone. Returns bytes re-homed by kind."""
     from sglang.srt.managers.weg2_memory_saver import back_into_tag_pool
 
-    moved = 0
+    ranges = _arena_ranges() if arena_ranges is None else arena_ranges
+    param_storages = {int(p.untyped_storage().data_ptr()) for p in part.parameters()}
+    clones: Dict[int, "object"] = {}
+    moved = {"buffers": 0, "attributes": 0}
+
+    def in_arena(ptr: int) -> bool:
+        return any(lo <= ptr < hi for lo, hi in ranges)
+
+    def rehome(t, kind):
+        import torch
+
+        st = t.untyped_storage()
+        sptr = int(st.data_ptr())
+        if sptr == 0 or in_arena(sptr) or sptr in param_storages:
+            return None
+        fresh_st = clones.get(sptr)
+        if fresh_st is None:
+            src = torch.empty(0, dtype=torch.uint8, device=t.device).set_(st)
+            with back_into_tag_pool(force=True):
+                fresh_st = src.clone()
+            clones[sptr] = fresh_st
+            moved[kind] += int(st.nbytes())
+        out = torch.empty(0, dtype=t.dtype, device=t.device)
+        out.set_(fresh_st.untyped_storage(), t.storage_offset(), t.size(), t.stride())
+        return out
+
+    import torch
+
     for name, buf in list(part.named_buffers()):
-        if buf is None or buf.device.type == "meta" or buf.numel() == 0:
+        if buf is None or buf.device.type not in device_types or buf.numel() == 0:
             continue
         parent_name, _, attr = name.rpartition(".")
         parent = part.get_submodule(parent_name) if parent_name else part
-        with back_into_tag_pool(force=True):
-            fresh = buf.clone()
-        parent._buffers[attr] = fresh
-        moved += fresh.numel() * fresh.element_size()
+        fresh = rehome(buf, "buffers")
+        if fresh is not None:
+            parent._buffers[attr] = fresh
+    for module in part.modules():
+        for attr, val in list(vars(module).items()):
+            if attr in ("_parameters", "_buffers") or not isinstance(val, torch.Tensor):
+                continue
+            if isinstance(val, torch.nn.Parameter) or val.device.type not in device_types or val.numel() == 0:
+                continue
+            fresh = rehome(val, "attributes")
+            if fresh is not None:
+                object.__setattr__(module, attr, fresh)
     return moved
 
 
@@ -328,7 +427,9 @@ def _bind_shared_part(runner, part, t: _BindTarget, transient: bool = False) -> 
             f"({D_TP_RATIO_ENV}/{D_FAMILIES_ENV}) or its post-load processing differ from this "
             "part's; the stage would hold a second copy the plan has no room for")
     if transient:
-        runner.dual_share_rehomed_bytes = rehome_survivors(part)
+        moved = rehome_survivors(part)
+        runner.dual_share_rehomed = moved
+        runner.dual_share_rehomed_bytes = sum(moved.values())
     runner.dual_share_bound = True
     logger.info("DUAL-TP3PP3 P: shared part bound %.2f GiB to D's bytes, kept %.2f GiB of its own",
                 shared / 2**30, kept / 2**30)

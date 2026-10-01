@@ -94,6 +94,15 @@ def test_the_shared_part_loads_and_binds_inside_the_transient_scope():
     assert "parts[local] = _load_lane_part(" in blk and "_bind_shared_part(runner, parts[local], bind, transient=transient)" in blk
 
 
+def _rehome_cpu(part):
+    return H.rehome_survivors.__wrapped__(part) if hasattr(H.rehome_survivors, "__wrapped__") else \
+        _ORIG_REHOME(part, arena_ranges=[], device_types=("cpu",))
+
+
+_ORIG_REHOME = H.rehome_survivors
+H._rehome_cpu = _rehome_cpu
+
+
 class _Part(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -120,9 +129,51 @@ def test_a_bind_that_keeps_own_tensors_in_the_scope_is_a_named_stop(monkeypatch)
 
 
 def test_the_bound_parts_buffers_are_rehomed(monkeypatch):
+    monkeypatch.setattr(H, "rehome_survivors", lambda part, **kw: H.__dict__["_rehome_cpu"](part))
     runner, part, old = _bind(monkeypatch, kept=0)
     assert part.cos is not old and torch.equal(part.cos, old)
-    assert runner.dual_share_rehomed_bytes == 3 * 4 and runner.dual_share_bound
+    assert runner.dual_share_rehomed == {"buffers": 12, "attributes": 0} and runner.dual_share_bound
+    assert runner.dual_share_rehomed_bytes == 12
+
+
+class _MarlinLin(torch.nn.Module):
+    """a quantized linear as the schemes leave it: a parameter (bound to the arena by the
+    union bind), a plain tensor ATTRIBUTE (the Marlin lock workspace) and a second attribute
+    VIEWING the first one's storage"""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(4))
+        self.workspace = torch.zeros(68, dtype=torch.int32)          # 3080: 68 SMs
+        self.workspace_view = self.workspace[4:8]
+        self.weight_alias = self.weight.data[:2]                     # a view of a bound parameter
+
+
+def test_attribute_kernel_state_is_rehomed_once_per_storage_and_params_stay():
+    m = _MarlinLin()
+    old_ws, old_param = m.workspace, m.weight
+    moved = H.rehome_survivors(m, arena_ranges=[], device_types=("cpu",))
+    assert moved == {"buffers": 0, "attributes": 68 * 4}, moved            # one clone for both views
+    assert m.workspace is not old_ws and torch.equal(m.workspace, old_ws)
+    assert m.workspace_view.untyped_storage().data_ptr() == m.workspace.untyped_storage().data_ptr()
+    assert m.workspace_view.storage_offset() == 4 and torch.equal(m.workspace_view, old_ws[4:8])
+    assert m.weight is old_param, "a bound parameter is D's arena view: never re-homed"
+    assert m.weight_alias.untyped_storage().data_ptr() == old_param.untyped_storage().data_ptr()
+
+
+def test_a_tensor_inside_an_attached_arena_is_left_alone():
+    m = _MarlinLin()
+    old = m.workspace
+    ptr = old.untyped_storage().data_ptr()
+    moved = H.rehome_survivors(m, arena_ranges=[(ptr, ptr + 4096)], device_types=("cpu",))
+    assert moved["attributes"] == 0 and m.workspace is old
+
+
+def test_the_no_attribute_walk_mutant_turns_the_workspace_test_red(monkeypatch):
+    m = _exec_mutant(H, H.rehome_survivors, "for module in part.modules():", "for module in ():")
+    monkeypatch.setattr(H, "rehome_survivors", m)
+    with pytest.raises(AssertionError):
+        test_attribute_kernel_state_is_rehomed_once_per_storage_and_params_stay()
 
 
 def test_the_no_kept_check_mutant_turns_the_kept_test_red(monkeypatch):
@@ -166,7 +217,9 @@ def _tracked(monkeypatch, env, kept):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(S, "_LAST_KEPT_LIVE_MIB", dict(kept))
     monkeypatch.setattr(S, "weights_pool_slack_mib", lambda *a, **kw: {"weights": 10.0})
-    return H.assert_dual_p_sleep_tracked(types.SimpleNamespace(dual_share_rehomed_bytes=0))
+    monkeypatch.setenv("SGLANG_WEG2_WEIGHTS_CPU_BACKUP", env.get("SGLANG_WEG2_WEIGHTS_CPU_BACKUP", "on"))
+    return H.assert_dual_p_sleep_tracked(types.SimpleNamespace(
+        dual_share_rehomed={"buffers": 12, "attributes": 272}, dual_share_rehomed_bytes=284))
 
 
 SLEEPING_P = {"SGLANG_WEG2_DUAL_SHARE": "1", "SGLANG_WEG2_GROUP": "P", S.WEIGHTS_RESIDENT_ENV: "0"}
@@ -343,3 +396,40 @@ def test_the_probe_is_off_by_default_and_waits_for_an_idle_stretch(monkeypatch):
 def test_the_probe_is_consulted_first_in_the_stage_tick():
     src = inspect.getsource(FR.Front._dual_stage_tick)
     assert src.index("_dual_p_sleep_probe_tick(pressure)") < src.index("stages = self._dual_stages()")
+
+
+
+# -- the gmps10 follow-up: tolerance env, instrument, backup riegel ---------------------------
+
+
+def test_the_untagged_tolerance_is_a_named_env_with_default_zero(monkeypatch):
+    monkeypatch.delenv(H.UNTAGGED_TOL_ENV, raising=False)
+    assert H.untagged_tolerance_mib() == 0.0
+    with pytest.raises(S.Weg2DualPUntagged):
+        _tracked(monkeypatch, SLEEPING_P, {"load": 0.1})                 # gmps10 PP2, default: a stop
+    monkeypatch.setenv(H.UNTAGGED_TOL_ENV, "1")
+    assert _tracked(monkeypatch, SLEEPING_P, {"load": 0.1}) is True        # named allowance
+
+
+def test_the_riegel_line_names_what_was_rehomed_and_what_is_left(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv(H.UNTAGGED_TOL_ENV, "1")
+    with caplog.at_level(logging.INFO, logger=H.logger.name):
+        _tracked(monkeypatch, SLEEPING_P, {"load": 0.25})
+    line = [r.getMessage() for r in caplog.records if "sleep riegels ok" in r.getMessage()][-1]
+    assert "untagged live 0.25 MiB left" in line and "tolerance 1 MiB" in line
+    assert "buffers 0.0 KiB" in line and "attributes 0.3 KiB" in line      # 12 B / 272 B
+    assert "Marlin workspaces" in line
+
+
+def test_without_the_weights_cpu_backup_a_sleeping_p_is_a_named_stop(monkeypatch):
+    with pytest.raises(H.DualPSleepNoBackup, match="W-DUAL-P-NO-BACKUP"):
+        _tracked(monkeypatch, {**SLEEPING_P, "SGLANG_WEG2_WEIGHTS_CPU_BACKUP": "off"}, {})
+
+
+def test_the_no_backup_check_mutant_turns_the_backup_test_red(monkeypatch):
+    m = _exec_mutant(H, H.assert_dual_p_sleep_tracked, "if not weights_cpu_backup_armed():", "if False:")
+    monkeypatch.setattr(H, "assert_dual_p_sleep_tracked", m)
+    with pytest.raises((AssertionError, pytest.fail.Exception)):
+        test_without_the_weights_cpu_backup_a_sleeping_p_is_a_named_stop(monkeypatch)
