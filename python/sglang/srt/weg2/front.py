@@ -100,6 +100,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import l15_plan  # L15-13c: D's residue record excludes the hold
 from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock lock
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
@@ -9662,6 +9663,7 @@ class Front:
 
     def sample_dormant_image(self, group: str, shmem_before: Optional[int],
                              vram_residue_mib: Optional[Dict[str, int]] = None,
+                             l15_held_mib: Optional[Dict[str, int]] = None,
                              persist: bool = True) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
 
@@ -9683,6 +9685,27 @@ class Front:
         weight_tags = (
             host_ledger.WEIGHT_TAGS_P_BYTES if group == "P" else host_ledger.WEIGHT_TAGS_D_BYTES
         ) / host_ledger.GIB
+        # L15-13c: the record must not contain the L1.5 hold.  The next
+        # launch prices D's measured residue per card (launcher's
+        # dormant_other) AND subtracts the hold again as the planner's
+        # own l15 post (L15-01b); keeping the hold here would charge it
+        # twice.  l15_held_mib is the per-card kv_cache bytes still
+        # mapped at sleep (tms_tag_mapped_bytes via the adapter's
+        # tag_mapped_bytes, MiB); absent entry / master off = unchanged.
+        if (
+            group == "D"
+            and vram_residue_mib
+            and l15_held_mib is not None
+            and l15_plan.master_on(os.environ)
+        ):
+            vram_residue_mib = dict(vram_residue_mib)
+            for uuid in list(vram_residue_mib):
+                _r = int(vram_residue_mib[uuid])
+                _h = l15_held_mib.get(uuid)
+                _w = l15_plan.residue_without_hold(_r, None if _h is None else int(_h))
+                if _w != _r:
+                    vram_residue_mib[uuid] = _w
+                    logger.info("L15-RESIDUE record=%d held=%d written=%d uuid=%s", _r, _h, _w, uuid)
         rec = host_ledger.dormant_image_sample(
             group=group,
             shmem_before_bytes=shmem_before,
