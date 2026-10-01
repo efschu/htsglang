@@ -1483,7 +1483,7 @@ function ovCard(b, d, now) {
   const bs = dd ? (dd.round_bs && dd.round_bs.bs != null ? dd.round_bs.bs : (dd.last_bs != null ? dd.last_bs : dd.running)) : null;
   const dKpi = kpi("Decode tok/s", dv != null ? fmt(dv, 1) : (dd ? null : {na: "kein Decode-Rang"}), "",
     [dl, dd && dd.per_stream != null ? `je Stream ${fmt(dd.per_stream, 1)}` : null,
-      dd && dd.seats_mean != null ? `Ø ${fmt(dd.seats_mean, 1)} Sitze` : null, bs != null ? `bs ${fmt(bs)}` : null].filter(Boolean).join(" &middot; "),
+      dd && dd.seats_mean != null ? `Ø ${fmt(dd.seats_mean, 1)} Sitze` : null, bs != null ? `<b>bs ${fmt(bs)}</b>` : null].filter(Boolean).join(" &middot; "),
     dd && dd.one_s > 0 ? "on" : "", "var(--s3)");
   // Prefill P und D (bzw. eine Gruppe)
   const pre = b.prefill || {};
