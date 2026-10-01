@@ -60,6 +60,79 @@ def slots_of_req(req, req_to_token) -> Tuple[int, ...]:
     return slots
 
 
+def match_parked(req, tree_cache):
+    """L15-FIX-PARKED: the held span of a PARKED req, from the radix tree.
+
+    The D park retracts every running req with retain=True
+    (d_park_runtime.park_running -> retract_all -> release_req ->
+    release_kv_cache(is_insert=True) + reset_for_retract): the computed span
+    is INSERTED into the tree and the req keeps no device handle -- its
+    req_to_token row is released (req_pool_idx None), prefix_indices is
+    empty, last_node and mamba_pool_idx are None (N3f 01.10. 22:21Z: the
+    shadow planned n=2 from token counts, retain skipped both rids "no
+    req_pool_idx"). The KV indices are still on the device in the tree, so
+    they are read back by one match of the req's own tokens (seqlen - 1, the
+    last token has no KV yet) with cow_mamba=False (no mamba slot is
+    allocated; the match only refreshes LRU/access time).
+
+    Returns (slots, node, anchor): the matched device KV indices, the last
+    device node and the node's mamba checkpoint slot. Raises ValueError when
+    nothing usable is on the device (the rid is then skipped like any other
+    unholdable req)."""
+    from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    rid = getattr(req, "rid", "?")
+    toks = list(getattr(req, "origin_input_ids", None) or ()) + list(
+        getattr(req, "output_ids", None) or ()
+    )
+    span = max(len(toks) - 1, 0)
+    if span == 0:
+        raise ValueError(f"parked req {rid!r} has no token span")
+    res = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(token_ids=toks[:span],
+                         extra_key=getattr(req, "extra_key", None)),
+            cow_mamba=False,
+        )
+    )
+    di = getattr(res, "device_indices", None)
+    slots = tuple(int(x) for x in (di.tolist() if hasattr(di, "tolist") else (di or ())))
+    node = getattr(res, "last_device_node", None)
+    if not slots or node is None:
+        raise ValueError(f"parked req {rid!r}: no device span in the tree")
+    if 0 in slots:
+        raise ValueError(f"parked req {rid!r}: padding slot 0 inside the matched span")
+    try:
+        mv = node.component_data[ComponentType.MAMBA].value
+    except (AttributeError, KeyError, IndexError, TypeError):
+        mv = None
+    if mv is None or len(mv) == 0:
+        raise ValueError(f"parked req {rid!r}: matched node has no mamba checkpoint")
+    anchor = int(mv.tolist()[0] if hasattr(mv, "tolist") else mv[0])
+    if anchor == 0:
+        raise ValueError(f"parked req {rid!r}: matched anchor is padding slot 0")
+    return slots, node, anchor
+
+
+def sleep_epoch(sched) -> int:
+    """L15-FIX-EPOCH: the epoch a D sleep's retain round is stamped with.
+
+    `_weg2_vote_epoch` is PP0's idle-vote counter and never moves on D (N3f:
+    every D sleep logged epoch=0). The front's flip index rides on the
+    release request (`<boot>.<flip>`, weight_updater._weg2_flip_index_of);
+    release_memory_occupation stashes it as `_l15_sleep_flip` right before
+    its flush. Group-uniform (one front number per flip); falls back to the
+    old counter when absent."""
+    flip = getattr(sched, "_l15_sleep_flip", None)
+    try:
+        if flip is not None and int(flip) >= 0:
+            return int(flip)
+    except (TypeError, ValueError):
+        pass
+    return int(getattr(sched, "_weg2_vote_epoch", 0) or 0)
+
+
 def anchor_slot_of_req(req) -> int:
     """The req's mamba anchor slot; a missing (None) or padding (0) anchor
     raises -- one req without a holdable anchor skips the whole retain round
@@ -240,6 +313,7 @@ def build_retain_kwargs(
     mamba_allocator=None,
     host_pool=None,
     mamba_host_pool=None,
+    tree_cache=None,
 ) -> Dict:
     """Assemble the whole retain_at_sleep keyword set from live reqs.
 
@@ -255,21 +329,31 @@ def build_retain_kwargs(
     # anchor state's L2 identity, snapshot at bind like the KV rows.
     anchor_rows = []
     skipped = []  # L15-FIX-NOIDX: (rid, reason) of reqs that cannot be held
+    parked_by_rid = {}  # L15-FIX-PARKED: rid -> (slots, node, anchor)
     for req in reqs:
         rid = str(req.rid)
         # L15-FIX-NOIDX: a req without a holdable token span (no
         # req_to_token row, or the padding slot inside its span) is skipped
         # per rid -- before this fix its error escaped and the whole round
         # flushed (N3c: 21/21 sleeps "failed before the move").
+        _pk = None  # L15-FIX-PARKED: (slots, node, anchor) of a parked req
         try:
-            _slots = slots_of_req(req, req_to_token)
+            if (getattr(req, "req_pool_idx", None) is None
+                    and tree_cache is not None):
+                _pk = match_parked(req, tree_cache)
+                _slots = _pk[0]
+            else:
+                _slots = slots_of_req(req, req_to_token)
         except ValueError as exc:
             skipped.append((rid, str(exc)))
             continue
         by_rid[rid] = req
+        if _pk is not None:
+            parked_by_rid[rid] = _pk
         seq_len = _seq_len(req)
-        # KV exists for seqlen - 1 tokens only (schedule_batch.py:2821).
-        span = max(seq_len - 1, 0)
+        # KV exists for seqlen - 1 tokens only (schedule_batch.py:2821); a
+        # parked req holds exactly what its tree match returned.
+        span = len(_slots) if _pk is not None else max(seq_len - 1, 0)
         # rows_by_rank = the EXACT owned count of the req's real slots
         # (owner_of over slots_of_req), not a proportional estimate:
         # retain admits against caps with these rows, while compact_plan
@@ -279,7 +363,7 @@ def build_retain_kwargs(
         # host_value later); a node missing its last_node skips l2 (retain
         # skips the whole round for that rid anyway).
         try:
-            _node = node_of_req(req)
+            _node = _pk[1] if _pk is not None else node_of_req(req)
             # L15-12c-F9: hard gate BEFORE anything is assembled -- a tree
             # with a third radix component (SWA or other) would keep
             # un-remapped, un-kept state on the kept nodes. RuntimeError,
@@ -304,7 +388,8 @@ def build_retain_kwargs(
         # missing piece -- the anchor columns then read (-1, -1)).
         try:
             anchor_rows.append(
-                (rid, anchor_host_row(node_of_req(req),
+                (rid, anchor_host_row(_pk[1], _pk[2]) if _pk is not None
+                 else anchor_host_row(node_of_req(req),
                                       anchor_slot_of_req(req)))
             )
         except ValueError:
@@ -410,12 +495,18 @@ def build_retain_kwargs(
             )
 
     def node_of(rid: str):
+        if rid in parked_by_rid:
+            return parked_by_rid[rid][1]
         return node_of_req(by_rid[rid])
 
     def slots_of(rid: str) -> Tuple[int, ...]:
+        if rid in parked_by_rid:
+            return parked_by_rid[rid][0]
         return slots_of_req(by_rid[rid], req_to_token)
 
     def anchor_slot_of(rid: str) -> int:
+        if rid in parked_by_rid:
+            return parked_by_rid[rid][2]
         return anchor_slot_of_req(by_rid[rid])
 
     def l2_of(rid: str) -> Tuple[Tuple, Tuple]:

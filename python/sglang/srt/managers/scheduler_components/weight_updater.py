@@ -9664,6 +9664,11 @@ class SchedulerWeightUpdaterManager:
             if _pls is not None:
                 _pls.on_sleep()
                 logger.info("%s", _pls.census_line())
+            # L15-FIX-EPOCH: hand the front's flip index to the L1.5 retain
+            # hook in flush_cache (D has no other group-uniform counter).
+            if self.scheduler is not None:
+                self.scheduler._l15_sleep_flip = _weg2_flip_index_of(
+                    getattr(recv_req, "epoch", None))
             self.flush_cache(zero_kv=False)
             # AH (--p-attn-head-split): the helper mirror lives in this region;
             # reset the split rule and drain the helper before it is unmapped,
