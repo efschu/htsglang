@@ -2546,7 +2546,7 @@ class HostPoolGroup:
         for transfer in pool_transfers or []:
             entry = self._entry_for_transfer(transfer, "backup")
             entry.host_pool.backup_from_device_all_layer(
-                entry.device_pool,
+                getattr(transfer, "_snapshot_pool", None) or entry.device_pool,
                 transfer.host_indices,
                 transfer.device_indices,
                 io_backend,
@@ -2592,8 +2592,40 @@ class HostPoolGroup:
         for transfer in pool_transfers or []:
             entry = self._entry_for_transfer(transfer, "backup")
             entry.host_pool.backup_from_device_indices(
-                entry.device_pool, transfer.host_indices, transfer.device_indices
+                getattr(transfer, "_snapshot_pool", None) or entry.device_pool,
+                transfer.host_indices, transfer.device_indices
             )
+
+    def snapshot_mamba_transfers(self, pool_transfers):
+        """MAMBA-SNAPSHOT-STAGE (N2): stage every MAMBA transfer of a write op
+        on the current stream (``snapshot_rows`` of its host pool). Returns
+        ``(transfers, tokens)`` -- the op's transfers with the MAMBA ones
+        reading the staging copy (``_snapshot_pool``, staging indices) -- or
+        None when any MAMBA transfer cannot be staged (the caller fences)."""
+        import dataclasses
+
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        out, tokens, staged = [], [], False
+        for t in pool_transfers or []:
+            if getattr(t, "name", None) != PoolName.MAMBA or t.device_indices is None \
+                    or int(t.device_indices.numel()) == 0:
+                out.append(t)
+                continue
+            entry = self.entry_map.get(t.name)
+            snap = getattr(getattr(entry, "host_pool", None), "snapshot_rows", None)
+            if entry is None or not callable(snap):
+                return None
+            res = snap(entry.device_pool, t.host_indices, t.device_indices)
+            if res is None:
+                return None
+            shim, idx, tok = res
+            nt = dataclasses.replace(t, device_indices=idx)
+            nt._snapshot_pool = shim
+            out.append(nt)
+            tokens.append((entry.host_pool, tok))
+            staged = True
+        return (out, tokens) if staged else None
 
 
 class DSAIndexerPoolHost(HostKVCache):

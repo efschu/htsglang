@@ -722,6 +722,17 @@ class HybridCacheController(BaseHiCacheController):
         kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
             host_indices, device_indices
         )
+        # MAMBA-SNAPSHOT-STAGE (N2): a write op that snapshots recurrent state
+        # first copies the rows D2D into a staging buffer ON THIS (compute)
+        # stream -- ordered before start_event, so the write stream reads the
+        # staging copy, and no later forward waits for the D2H. An op that
+        # cannot be staged keeps the fence below.
+        snap_tokens = None
+        if _mamba_snapshot_fence_needed(resolved_pool_transfers):
+            stage = getattr(self.mem_pool_host, "snapshot_mamba_transfers", None)
+            staged = stage(resolved_pool_transfers) if callable(stage) else None
+            if staged is not None:
+                resolved_pool_transfers, snap_tokens = staged
         start_event = device_module.Event()
         finish_event = device_module.Event()
         start_event.record()
@@ -761,7 +772,10 @@ class HybridCacheController(BaseHiCacheController):
             self._record_transfer_indices_on_stream(
                 self.write_stream, kv_host_indices, kv_device_indices
             )
-        if _mamba_snapshot_fence_needed(resolved_pool_transfers):
+        if snap_tokens is not None:
+            for host_pool, tok in snap_tokens:
+                host_pool.snapshot_release(tok, finish_event)
+        elif _mamba_snapshot_fence_needed(resolved_pool_transfers):
             # MAMBA-SNAPSHOT-FENCE: the recurrent state is MUTABLE in place (a
             # KV row is append-only). The write stream waits for the compute
             # stream at issue (start_event), but nothing made the compute

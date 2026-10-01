@@ -460,6 +460,79 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     view.index_copy_(0, slots, srcc[:, ch0:ch0 + n].contiguous())
         return self._backup_rest(device_pool, host_indices, device_indices, io_backend, is_arena)
 
+    # -- MAMBA-SNAPSHOT-STAGE (N2, 01.10.): the fence without the wait --------------
+    #: staging slots of the ring; a slot is reused only after the write op that
+    #: read it has finished (its finish event), so two ops in a row never wait
+    SNAPSHOT_RING = 2
+
+    def snapshot_rows(self, device_pool, host_indices, device_indices):
+        """D2D snapshot of the state rows a write op is about to copy to the
+        arena, ON THE CURRENT (compute) STREAM, into a private staging buffer:
+        ``(shim_pool, staging_indices, token)``, or None when this op cannot be
+        staged (arena unbound, a staging/non-pending host row, PLE side states)
+        -- the caller then keeps the MAMBA-SNAPSHOT-FENCE.
+
+        Why: the fence made the compute stream wait for the whole async D2H of
+        the state (P PP0, N2 boot 10011623: a 512-token chunk 190 ms instead of
+        90, bubble up to 190 ms, P prefill -26 %). The snapshot is what the
+        fence protected -- the state as of the issue point, before any later
+        forward on the compute stream can change the rows -- taken by a device
+        copy that is ordered on the compute stream like any kernel (~0.1 ms for
+        a blob share), after which the D2H reads the staging buffer at leisure.
+        The staging buffer has stable addresses per ring slot, so the write
+        kernel's pointer plan is built once per slot."""
+        if self.arena is None or device_indices is None or int(device_indices.numel()) == 0:
+            return None
+        if ple_state.enabled():
+            return None
+        try:
+            hi, is_arena = self._split(host_indices)
+            if not bool(is_arena.all()):
+                return None
+            if any(int(r) - self.staging_rows not in self._pending for r in hi.tolist()):
+                return None
+            mc = device_pool.mamba_cache
+            temporal = mc.temporal
+            conv = mc.conv[0]
+        except Exception:  # noqa: BLE001 - an unstageable op keeps the fence
+            return None
+        dev = temporal.device
+        didx = device_indices.to(device=dev, dtype=torch.int64, non_blocking=True)
+        n = int(didx.numel())
+        ring = self.__dict__.setdefault("_snap_ring", [dict(t=None, c=None, n=0, ev=None)
+                                                       for _ in range(self.SNAPSHOT_RING)])
+        k = self.__dict__.get("_snap_next", 0) % len(ring)
+        self._snap_next = k + 1
+        slot = ring[k]
+        cur = torch.cuda.current_stream(dev) if dev.type == "cuda" else None
+        if slot["ev"] is not None and cur is not None:
+            cur.wait_event(slot["ev"])     # only waits when this slot's D2H is still running
+        if slot["n"] != n or slot["t"] is None:
+            slot["t"] = torch.empty((temporal.shape[0], n) + tuple(temporal.shape[2:]),
+                                    dtype=temporal.dtype, device=dev)
+            slot["c"] = torch.empty((conv.shape[0], n) + tuple(conv.shape[2:]),
+                                    dtype=conv.dtype, device=dev)
+            slot["n"] = n
+        torch.index_select(temporal, 1, didx, out=slot["t"])
+        torch.index_select(conv, 1, didx, out=slot["c"])
+        slot["ev"] = None
+        from types import SimpleNamespace
+
+        shim = SimpleNamespace(mamba_cache=SimpleNamespace(temporal=slot["t"], conv=[slot["c"]]))
+        n_s = self.__dict__.get("_snap_n", 0) + 1
+        self._snap_n = n_s
+        if n_s <= 8 or (n_s & (n_s - 1)) == 0:
+            logger.info("WEG2-MAMBA-SNAPSHOT n=%d states=%d slot=%d (D2D snapshot on the compute "
+                        "stream; the arena D2H reads the staging copy, the compute stream does not "
+                        "wait for it)", n_s, n, k)
+        return shim, torch.arange(n, device=dev, dtype=torch.int64), k
+
+    def snapshot_release(self, token, finish_event) -> None:
+        """The write op that read staging slot ``token`` finishes at ``finish_event``."""
+        ring = self.__dict__.get("_snap_ring")
+        if ring is not None and token is not None:
+            ring[int(token) % len(ring)]["ev"] = finish_event
+
     def _mamba_write_kernel(self, device_pool, slots, didx_d, dev) -> bool:
         """xsn351 (py-spy PP0): the per-layer `.to("cpu")` + index_copy_ of the
         node's mamba state ran SYNCHRONOUSLY in the scheduler thread (~30 ms
@@ -479,8 +552,11 @@ class ArenaMambaPoolHost(MambaPoolHost):
             # indices * stride -- so they are built ONCE per pool/device layout
             # and kept on the card; per node only slots and didx cross.
             key = (int(temporal.data_ptr()), int(conv.data_ptr()), str(dev))
-            plan = getattr(self, "_mamba_kern_plan", None)
-            if plan is None or plan[0] != key:
+            # MAMBA-SNAPSHOT-STAGE: one plan per source (the live pool and each
+            # staging slot), so alternating sources never rebuild (and sync)
+            plans = self.__dict__.setdefault("_mamba_kern_plans", {})
+            plan = plans.get(key)
+            if plan is None:
                 L = int(self.num_mamba_layers)
                 e_t = int(self.temporal_dtype.itemsize)
                 e_c = int(self.conv_dtype.itemsize)
@@ -509,7 +585,11 @@ class ArenaMambaPoolHost(MambaPoolHost):
                                    torch.tensor(dps, dtype=torch.uint64).to(dev),
                                    torch.tensor(sps, dtype=torch.uint64).to(dev)))
                 torch.cuda.synchronize(dev)
-                plan = self._mamba_kern_plan = (key, groups, len(pieces))
+                plan = (key, groups, len(pieces))
+                if len(plans) >= 8:
+                    plans.clear()
+                plans[key] = plan
+                self._mamba_kern_plan = plan
             _, groups, n_pieces = plan
             pieces = [None] * n_pieces
             slots_d = slots.to(dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
