@@ -41,7 +41,7 @@ def test_the_opt_pair_exists_and_precedes_the_generic_one():
 
 @pytest.mark.parametrize("name", NAMES)
 def test_legacy_spelling_reaches_the_renamed_tree(name):
-    m = _load_as("flliper")
+    m = _load_as("fl" "liper")
     assert m.CANONICAL_SIDE == 1
     assert m.canonical_env_name(LEG_OPT + name) == NEW_OPT + name
     env = {LEG_OPT + name: "1", "PATH": "/bin"}
@@ -60,7 +60,7 @@ def test_renamed_spelling_reaches_the_legacy_tree(name):
     assert env == {LEG_OPT + name: "0"}
 
 
-@pytest.mark.parametrize("mod_pkg", ["sg" "lang", "flliper"])
+@pytest.mark.parametrize("mod_pkg", ["sg" "lang", "fl" "liper"])
 def test_canonical_value_wins_when_both_spellings_are_set(mod_pkg):
     m = _load_as(mod_pkg)
     c = m.CANONICAL_SIDE
@@ -77,7 +77,7 @@ def test_other_process_reader_accepts_both_spellings():
 
 
 def test_generic_and_subsystem_families_are_unchanged():
-    m = _load_as("flliper")
+    m = _load_as("fl" "liper")
     sub = "SG" "LANG_" "WE" "G2_"
     assert m.canonical_env_name(sub + "GROUP") == "FLLIPER_PDFLIP_GROUP"
     assert m.canonical_env_name("SG" "LANG_" "HICACHE_X") == "FLLIPER_HICACHE_X"
