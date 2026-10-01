@@ -107,6 +107,13 @@ def lib(tmp_path_factory):
     lib.tms_set_keep_spans.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64),
                                        ctypes.POINTER(ctypes.c_uint64)]
     lib.tms_set_pause_coalesce.argtypes = [ctypes.c_int]
+    lib.tms_tag_bytes.argtypes = [ctypes.c_char_p]
+    lib.tms_tag_bytes.restype = ctypes.c_uint64
+    lib.tms_tag_mapped_bytes.argtypes = [ctypes.c_char_p]
+    lib.tms_tag_mapped_bytes.restype = ctypes.c_uint64
+    lib.tms_alloc_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64),
+                                   ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+                                   ctypes.POINTER(ctypes.c_int)]
     lib.mock_live_bytes.restype = ctypes.c_size_t
     lib.mock_mapped_bytes.restype = ctypes.c_size_t
     lib.mock_unmap_calls.restype = ctypes.c_long
@@ -240,3 +247,48 @@ def test_keep_span_refusals(lib):
     assert _set_keep(lib, p, [(8 * MIB, 9 * MIB), (0, 4 * MIB)]) == -3    # refused mid-call
     assert _pause_unmaps(lib, "l15kd") == 2                    # the valid keep still holds
     assert _resume(lib, "l15kd") == 0
+
+
+def _mapped(lib, p):
+    size = ctypes.c_uint64()
+    mapped = ctypes.c_uint64()
+    planned = ctypes.c_uint64()
+    active = ctypes.c_int()
+    rc = lib.tms_alloc_info(ctypes.c_void_p(p), ctypes.byref(size), ctypes.byref(mapped),
+                            ctypes.byref(planned), ctypes.byref(active))
+    assert rc == 0
+    return int(mapped.value)
+
+
+def test_paused_keep_spans_count_as_mapped(lib):
+    """L15-13a: a paused allocation that holds KEEP SPANS reports the kept
+    bytes as mapped -- alloc_info's mapped and tms_tag_mapped_bytes answer
+    "physical bytes mapped NOW" -- while tms_tag_bytes keeps its H95c seat
+    semantics (mapped now or planned for the next resume)."""
+    p = _lattice(lib, "l15ke")
+    mapped_active = _mapped(lib, p)
+    plan = lib.tms_tag_bytes(b"l15ke")
+    print(f"[l15-13a] ACTIVE: mapped={mapped_active} tag_bytes={plan} "
+          f"tag_mapped={lib.tms_tag_mapped_bytes(b'l15ke')}")
+    assert mapped_active == 12 * MIB and plan == 12 * MIB
+    assert _set_keep(lib, p, [(0, 6 * MIB)]) == 0
+    _pause_unmaps(lib, "l15ke")
+    mapped_paused = _mapped(lib, p)
+    print(f"[l15-13a] PAUSED: mapped={mapped_paused} tag_bytes={lib.tms_tag_bytes(b'l15ke')} "
+          f"tag_mapped={lib.tms_tag_mapped_bytes(b'l15ke')}")
+    assert mapped_paused == 6 * MIB
+    assert lib.tms_tag_mapped_bytes(b"l15ke") == 6 * MIB
+    assert lib.tms_tag_bytes(b"l15ke") == plan        # unchanged: the resume plan
+    assert _resume(lib, "l15ke") == 0
+    assert _mapped(lib, p) == mapped_active
+
+
+def test_paused_without_keep_reads_zero(lib):
+    """L15-13a: a paused allocation with an EMPTY keep set keeps reading zero
+    mapped -- byte-identical to the pre-fix accounting for keep-less paths."""
+    p = _lattice(lib, "l15kf")
+    assert _set_keep(lib, p, []) == 0
+    _pause_unmaps(lib, "l15kf")
+    assert _mapped(lib, p) == 0
+    assert lib.tms_tag_mapped_bytes(b"l15kf") == 0
+    assert _resume(lib, "l15kf") == 0

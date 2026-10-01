@@ -126,6 +126,10 @@ public:
     //: co-located processes, so RssShmem collapses to ~0 and a per-process sum
     //: double-counts (spec R8).
     uint64_t tag_bytes(const std::string& tag);
+    //: L15-13a: the PHYSICAL bytes mapped NOW for this tag -- the kept spans
+    //: of a PAUSED allocation count.  ``tag_bytes`` above keeps its H95c seat
+    //: semantics ("mapped now or planned for the next resume").
+    uint64_t tag_mapped_bytes(const std::string& tag);
     //: C16 / A1-2, FIX 1 round 1: ``<tag>=<bytes>,...`` over EVERY tag that has
     //: at least one allocation with ``enable_cpu_backup``, summing only those
     //: allocations.  ``tag_bytes`` cannot answer this question -- it counts a

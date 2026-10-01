@@ -38,7 +38,14 @@ static uint64_t weg2_plan_bytes(const AllocationMetadata& md) {
 
 static uint64_t weg2_mapped_bytes(const AllocationMetadata& md) {
     if (md.state != AllocationState::ACTIVE) {
-        return 0;
+        // L15-13a: a PAUSED allocation's kept spans stay physically mapped
+        // (patch 6).  Report the staying extents' bytes; a stock or keep-less
+        // pause leaves weg2_extents empty, so this still reads 0, as before.
+        uint64_t staying = 0;
+        for (size_t i = 0; i < md.weg2_extents.size(); ++i) {
+            staying += (uint64_t) md.weg2_extents[i].size;
+        }
+        return staying;
     }
     if (md.weg2_extents.empty()) {
         return (uint64_t) md.size;
@@ -272,6 +279,26 @@ uint64_t TorchMemorySaver::tag_bytes(const std::string& tag) {
                          : weg2_plan_bytes(md);
 #else
             total += static_cast<uint64_t>(it->second.size);
+#endif
+        }
+    }
+    return total;
+}
+
+// L15-13a -- the PHYSICAL bytes mapped NOW for a tag: unlike tag_bytes above
+// ("mapped now or planned for the next resume", the H95c seat budget), kept
+// spans of a PAUSED allocation count here.
+uint64_t TorchMemorySaver::tag_mapped_bytes(const std::string& tag) {
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    uint64_t total = 0;
+    for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
+        if (tag.empty() || it->second.tag == tag) {
+#if defined(USE_CUDA)
+            total += weg2_mapped_bytes(it->second);
+#else
+            total += it->second.state == AllocationState::ACTIVE
+                         ? static_cast<uint64_t>(it->second.size)
+                         : 0;
 #endif
         }
     }

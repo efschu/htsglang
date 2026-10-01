@@ -146,6 +146,14 @@ uint64_t tms_tag_bytes(const char* tag) {
     return TorchMemorySaver::instance().tag_bytes(tag_str);
 }
 
+// L15-13a -- PHYSICAL bytes mapped NOW for this tag: kept spans of a paused
+// allocation count (the L1.5 hold).  tms_tag_bytes above stays "mapped now or
+// planned for the next resume" (the H95c seat budget depends on it).
+uint64_t tms_tag_mapped_bytes(const char* tag) {
+    std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
+    return TorchMemorySaver::instance().tag_mapped_bytes(tag_str);
+}
+
 // H95c (patch 3) -- THE SPAN MAP.  The D phase's seat count decides how many
 // Mamba/GDN slots and how many expert LRU rows are backed; both live in TMS
 // allocations whose VA (and therefore every captured CUDA graph) stays fixed.
