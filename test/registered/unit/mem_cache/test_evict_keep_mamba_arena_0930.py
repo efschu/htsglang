@@ -83,3 +83,57 @@ def test_an_unregistered_arena_still_evicts_within_the_cap(env):
     env.be._arena_evict_to_disk(env.arena, 256)
     left = _complete(env.arena, [f"p{i}.sfx" for i in range(SLOTS)])
     assert freed_before == SLOTS and 0 < SLOTS - left <= max(1, SLOTS // 8)
+
+
+# -- need (NF cb3aa0c2da's semantics) ------------------------------------------
+TOTAL = 4096
+
+
+def _fill_backend(root):
+    be = object.__new__(HiCacheFile)
+
+    def _path(stem):
+        return os.path.join(root, stem + ".bin")
+
+    be._existing_path = _path
+    be._stat_stems = lambda stems: {s: os.path.getsize(_path(s)) for s in stems if os.path.exists(_path(s))}
+    be.arena_secure_to_disk = lambda a, cands: {"on_disk": len(cands), "written": 0, "lost": 0}
+    return be
+
+
+def test_an_l3_fill_larger_than_the_cap_gets_all_its_slots(tmp_path):
+    """A full 8-slot arena (cap = 1 per round) and an L3 fill of 3 pages on
+    disk: the fill's ``need=len(full)`` lifts the cap, every page lands."""
+    root = tmp_path / "store"
+    root.mkdir()
+    want = ["l3a", "l3b", "l3c"]
+    for st in want:
+        (root / f"{st}.bin").write_bytes(b"\x5a" * TOTAL)
+    arena = ShmArena(str(tmp_path / "kv.bin"), TOTAL, 8)
+    try:
+        for i in range(8):                                   # full, all unreferenced
+            (s, stt, g), = arena.claim_slots([f"old{i}"], [TOTAL])
+            assert stt == 0 and arena.complete_slots([s], [g], [(0, TOTAL)]) == [1]
+        out = HiCacheFile.arena_fill_from_disk(_fill_backend(str(root)), arena, want, TOTAL)
+        assert all(o is not None for o in out), f"the cap cut the fill: {out}"
+        assert [st for (_s, st) in arena.find_slots(want)] == [2, 2, 2]
+    finally:
+        arena.close()
+
+
+def test_without_need_the_cap_stands_and_an_explicit_need_lifts_it(env):
+    """The need edge itself: no need -> at most slots//8 (1 here); need=3 -> 3,
+    and the parked anchor stays kept either way."""
+    pool = _kv_pool(env.arena, env.store)
+    chain = ["aA", "aB", "aC"]
+    parked_stems = pool._stems(chain)
+    _publish(env.arena, parked_stems)
+    others = [f"other{i}.sfx" for i in range(SLOTS - len(chain))]
+    _publish(env.arena, others)
+    assert hp.mark_park(PARKED, chain, P)
+    env.be.register_keep_pool(env.arena, pool)
+    env.be._arena_evict_to_disk(env.arena, 256)
+    assert _complete(env.arena, others) == len(others) - 1, "no need: the eighth"
+    env.be._arena_evict_to_disk(env.arena, 256, need=3)
+    assert _complete(env.arena, others) == len(others) - 4, "need=3 lifted the cap"
+    assert _complete(env.arena, parked_stems) == 3

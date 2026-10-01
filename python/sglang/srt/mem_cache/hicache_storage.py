@@ -3229,7 +3229,7 @@ class HiCacheFile(HiCacheStorage):
                     full.append((i, st))
             if full:
                 try:
-                    self._arena_evict_to_disk(arena, max(256, len(full)))
+                    self._arena_evict_to_disk(arena, max(256, len(full)), need=len(full))
                 except Exception:  # noqa: BLE001
                     pass
                 for (i, st), (slot, status, gen) in zip(
@@ -3301,7 +3301,7 @@ class HiCacheFile(HiCacheStorage):
             logger.warning("EVICT-KEEP keep list unavailable", exc_info=True)
             return None
 
-    def _arena_evict_to_disk(self, arena, want: int) -> int:
+    def _arena_evict_to_disk(self, arena, want: int, need: Optional[int] = None) -> int:
         """Move up to `want` complete, unreferenced, unpinned pages from the
         arena to the disk store (the cold tier), then free their slots.
 
@@ -3313,14 +3313,23 @@ class HiCacheFile(HiCacheStorage):
         refusers=MambaComponent``), the X gate priced them whole (W31) and
         381k tokens went back to P. So: at most an eighth of the arena per
         round, and the #243/#248 kept pages (hand-offs, D parks) are passed
-        over like on the claim path."""
+        over like on the claim path.
+
+        ``need`` (NF cb3aa0c2da's semantics): the real demand of the caller --
+        the L3 fill passes ``len(full)``. It lifts the capped ``want`` back to
+        itself, so a large fill is never cut by the eighth; without it the cap
+        stands (``need`` is then the capped ``want``)."""
         slots = int(getattr(arena, "slots", 0) or 0)
         if slots > 0:
             want = min(int(want), max(1, slots // 8))
+        if need is None:
+            need = int(want)
+        else:
+            want = max(int(want), int(need))
         _en = getattr(type(self), "_evict_log_n", 0) + 1
         type(self)._evict_log_n = _en
         if _en <= 16 or _en % 64 == 0:
-            logger.info("ARENA-EVICT n=%d want=%d slots=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want), slots)
+            logger.info("ARENA-EVICT n=%d want=%d need=%d slots=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want), int(need), slots)
         pins = getattr(self, "pins", None)
         keep = []
         if pins is not None:
