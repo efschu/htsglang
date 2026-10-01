@@ -654,12 +654,255 @@ def card_costs_from_fit(lines: Dict[Tuple[int, int, str], WidthLine], counts: Se
     return out
 
 
+# -- PP-CUT CALIBRATION FROM THE RANK LINES (27B, 01.10.) ----------------------
+#
+# The #PGAP fit above reads the prefix as the sum of a rid's earlier extends
+# (#969N ADMIT). On the current 27B line most chunks start behind a STORE or
+# radix hit (#cached-token > 0, hand-backs, re-reads), whose tokens are no
+# extend, so that prefix is short and the 512-graph intercept comes out at
+# 113-168 ms instead of ~40 (desk run on boots 09290020 / 10011917). The rank
+# line plus the '#1469 RETAIN ... token_ids_len' line of the SAME rank that
+# follows it carries the chunk's real position: token_ids_len - #new-token.
+# That is the instrument M2 (l15_speed_monitor) bins by, and the one the
+# PP-cut solver is calibrated on here.
+
+_RANK_LINE_RE = re.compile(
+    r"PP(\d+)\] Prefill rank batch, #new-token: (\d+), #cached-token: (\d+), "
+    r"#chunks: (\d+), gpu-ms: ([\d.]+)")
+_RETAIN_RE = re.compile(r"PP(\d+)\] #1469 RETAIN rid=\S+ is_finished=\S+ token_ids_len=(\d+)")
+_CUT_RE = re.compile(r"pp_layer_ratio=\[([\d, ]+)\]")
+
+
+def samples_from_rank_lines(lines: Iterable[str], graph_buckets: Optional[Sequence[int]] = None
+                            ) -> List[WidthSample]:
+    """One sample per 'Prefill rank batch' line joined to the next '#1469
+    RETAIN' line of the same rank (prefix = token_ids_len - #new-token; an
+    unpaired rank line is dropped, never guessed). ``bs`` = #chunks; ``mode``
+    as in :func:`samples_from_lines` (graph when the width fits the largest
+    captured bucket)."""
+    pend: Dict[int, Tuple[int, int, float]] = {}
+    raw: List[Tuple[int, int, int, float, int]] = []
+    buckets = list(graph_buckets) if graph_buckets is not None else None
+    seen_buckets: List[int] = []
+    for ln in lines:
+        if "Prefill rank batch" in ln:
+            m = _RANK_LINE_RE.search(ln)
+            if m:
+                pend[int(m.group(1))] = (int(m.group(2)), int(m.group(4)), float(m.group(5)))
+        elif "#1469 RETAIN" in ln:
+            m = _RETAIN_RE.search(ln)
+            if m and int(m.group(1)) in pend:
+                rank = int(m.group(1))
+                w, bs, g = pend.pop(rank)
+                prefix = int(m.group(2)) - w
+                if prefix >= 0 and g > 0:
+                    raw.append((rank, w, prefix, g, bs))
+        elif "PREFILL-GRAPH captured" in ln and not seen_buckets:
+            m = _BUCKETS_RE.search(ln)
+            if m:
+                seen_buckets = [int(x) for x in m.group(1).split(",") if x.strip()]
+    if buckets is None:
+        buckets = seen_buckets
+    top = max(buckets) if buckets else 0
+    return [WidthSample(r, w, p, g, 0.0, bs, MODE_GRAPH if (top and w <= top) else MODE_EAGER)
+            for (r, w, p, g, bs) in raw]
+
+
+def cut_of_lines(lines: Iterable[str]) -> Optional[Tuple[int, ...]]:
+    """The P cut a boot ran, from its server_args line ('pp_layer_ratio=[43, 11, 10]')."""
+    for ln in lines:
+        if "pp_layer_ratio=[" in ln:
+            m = _CUT_RE.search(ln)
+            if m:
+                return tuple(int(x) for x in m.group(1).split(",") if x.strip())
+    return None
+
+
+def _solve_small(rows: Sequence[Sequence[float]], ys: Sequence[float]) -> Optional[List[float]]:
+    """Least squares by the normal equations for <= 3 unknowns; None when the
+    system is singular (an unknown the cuts do not separate)."""
+    k = len(rows[0])
+    a = [[sum(r[i] * r[j] for r in rows) for j in range(k)] for i in range(k)]
+    b = [sum(r[i] * y for r, y in zip(rows, ys)) for i in range(k)]
+    for c in range(k):
+        piv = max(range(c, k), key=lambda i: abs(a[i][c]))
+        scale = max(1.0, max(abs(x) for row in a for x in row))
+        if abs(a[piv][c]) <= 1e-9 * scale:
+            return None
+        a[c], a[piv] = a[piv], a[c]
+        b[c], b[piv] = b[piv], b[c]
+        for i in range(k):
+            if i != c:
+                f = a[i][c] / a[c][c]
+                a[i] = [x - f * y for x, y in zip(a[i], a[c])]
+                b[i] -= f * b[c]
+    return [b[i] / a[i][i] for i in range(k)]
+
+
+def card_costs_from_cuts(fits: Sequence[Tuple[Sequence[int], Sequence[int], Dict[Tuple[int, int, str], WidthLine]]],
+                         stage_cards: Sequence[str]) -> Tuple[Dict[str, CardCost], List[str]]:
+    """Per-card curves from the width lines of SEVERAL cuts, solved jointly.
+
+    Per card, width and mode, over every (cut, stage of that card):
+      intercept  a = n * gemm + [first_fixed if stage 0] + [last_fixed if last stage]
+      slope      s = A * attn          (A = the stage's attention layers)
+    ``attn`` is the least-squares ratio sum(A*s)/sum(A^2). The intercept
+    system is solved jointly. A fixed term is kept for a (card, mode) only
+    when it is separable AND non-negative at EVERY width of that mode;
+    otherwise it is FOLDED into the per-layer rate at every width of that mode
+    (the single-cut rule of :func:`card_costs_from_fit`), so the curves of one
+    mode stay one consistent shape -- a fixed term from one width extended to
+    another would price the other width with a constant nobody measured there
+    (desk run 01.10.: a -56.6 ms 1024-eager 'first fixed' extended to 2048
+    priced the 5090 stage at 278 ms against 396 measured). Folding is named
+    in the notes. A width/mode not measured on every stage of the card in a
+    cut is skipped for that cut."""
+    S = len(stage_cards)
+    out: Dict[str, CardCost] = {}
+    notes: List[str] = []
+    keys = sorted({(w, m) for _c, _a, lines in fits for (_, w, m) in lines})
+    for name in dict.fromkeys(stage_cards):
+        stages = [r for r, c in enumerate(stage_cards) if c == name]
+        per_mode: Dict[str, List[Tuple[int, List[Tuple[int, int, int, float, float]]]]] = {}
+        for (w, mode) in keys:
+            pts = []  # (stage, n, A, a_ms, s)
+            for counts, attn, lines in fits:
+                if all((r, w, mode) in lines for r in stages):
+                    for r in stages:
+                        ln = lines[(r, w, mode)]
+                        pts.append((r, int(counts[r]), int(attn[r]), ln.a_ms, ln.s))
+            if pts:
+                per_mode.setdefault(mode, []).append((w, pts))
+
+        def solve(pts, cols):
+            rows = [[float(n) if c == "n" else (1.0 if (c == "first" and r == 0) or
+                                                 (c == "last" and r == S - 1) else 0.0)
+                     for c in cols] for r, n, _A, _a, _s in pts]
+            sol = _solve_small(rows, [a for _r, _n, _A, a, _s in pts])
+            return None if sol is None else dict(zip(cols, sol))
+
+        gemm: Dict[str, List[Tuple[int, float]]] = {}
+        att: Dict[str, List[Tuple[int, float]]] = {}
+        first: Dict[str, List[Tuple[int, float]]] = {}
+        last: Dict[str, List[Tuple[int, float]]] = {}
+        for mode, widths in per_mode.items():
+            cols = ["n"]
+            if 0 in stages:
+                cols.append("first")
+            if S - 1 in stages and S - 1 != 0:
+                cols.append("last")
+            while len(cols) > 1:
+                bad = None
+                for w, pts in widths:
+                    sol = solve(pts, cols)
+                    if sol is None:
+                        bad = cols[-1]
+                        break
+                    neg = [c for c in cols[1:] if sol[c] < 0.0]
+                    if neg:
+                        bad = neg[0]
+                        break
+                if bad is None:
+                    break
+                cols.remove(bad)
+                notes.append(f"{name} {mode}: {bad} fixed term not separable or negative at some width "
+                             f"-- folded into the per-layer rate at every {mode} width")
+            for w, pts in widths:
+                sol = solve(pts, cols)
+                if sol is None:
+                    continue
+                den = sum(A * A for _r, _n, A, _a, _s in pts)
+                k_attn = sum(A * s for _r, _n, A, _a, s in pts) / den if den > 0 else 0.0
+                gemm.setdefault(mode, []).append((w, round(sol["n"], 4)))
+                att.setdefault(mode, []).append((w, round(k_attn, 5)))
+                if "first" in sol:
+                    first.setdefault(mode, []).append((w, round(sol["first"], 3)))
+                if "last" in sol:
+                    last.setdefault(mode, []).append((w, round(sol["last"], 3)))
+        if not gemm:
+            raise StageModelError(f"card {name}: no width is measured on all of its stages {stages} in any cut")
+        out[name] = CardCost(name, gemm, att, first, last)
+    return out, notes
+
+
+def fit_model_from_logs(logs: Sequence[str], stage_cards: Sequence[str], layer_types: Sequence[str],
+                        power_limit_w: Optional[Dict[str, float]] = None,
+                        widths: Sequence[int] = (512, 1024, 2048, 4096)) -> LayerCostModel:
+    """A :class:`LayerCostModel` from the rank lines of P logs (one cut each,
+    read off the log); logs of the same cut are pooled. The source names every
+    log, its cut and the per-(rank, width, mode) lines."""
+    by_cut: Dict[Tuple[int, ...], List[WidthSample]] = {}
+    srcs: List[str] = []
+    for path in logs:
+        with open(path, errors="replace") as fh:
+            lines = fh.readlines()
+        cut = cut_of_lines(lines)
+        if cut is None or len(cut) != len(stage_cards):
+            raise StageModelError(f"{path}: no {len(stage_cards)}-stage pp_layer_ratio in its server_args")
+        by_cut.setdefault(cut, []).extend(samples_from_rank_lines(lines))
+        srcs.append(f"{path.rsplit('/', 1)[-1]} cut {','.join(map(str, cut))}")
+    probe = LayerCostModel({c: CardCost(c, {MODE_GRAPH: [(512, 1.0)]}, {MODE_GRAPH: [(512, 0.0)]})
+                            for c in stage_cards}, tuple(stage_cards), tuple(layer_types))
+    fits = []
+    detail: List[str] = []
+    for cut, samples in sorted(by_cut.items()):
+        lines = fit_width_lines(samples, widths=widths)
+        fits.append((cut, probe.attn_counts(cut), lines))
+        detail.append("cut %s: %s" % (",".join(map(str, cut)), "; ".join(
+            "PP%d w%d %s a=%.2f s=%.4f n=%d" % (r, w, m, v.a_ms, v.s, v.n) for (r, w, m), v in sorted(lines.items()))))
+    cards, notes = card_costs_from_cuts(fits, stage_cards)
+    source = ("rank-line fit (p_stage_model.fit_model_from_logs, prefix = #1469 RETAIN token_ids_len - "
+              "#new-token) of " + " | ".join(srcs) + " || " + " || ".join(detail)
+              + ((" || notes: " + "; ".join(notes)) if notes else ""))
+    return LayerCostModel(cards, tuple(stage_cards), tuple(layer_types), source,
+                          power_limit_w=dict(power_limit_w or {}))
+
+
+#: chunk-mix bins of the PP-cut objective (tokens of prefix per bin)
+MIX_BIN_TOKENS = 8192
+
+
+def chunk_mix_from_samples(samples: Sequence[WidthSample], rank: int = 0,
+                           bin_tokens: int = MIX_BIN_TOKENS) -> Tuple[Tuple[int, int, str, float], ...]:
+    """The workload a boot ran, as (width, prefix bin centre, mode, count)
+    over one rank's chunks (every stage runs the same chunks). The PP-cut
+    objective weights each candidate's per-chunk bottleneck with it."""
+    mix: Dict[Tuple[int, int, str], int] = {}
+    for s in samples:
+        if s.rank != rank:
+            continue
+        key = (int(s.width), (int(s.prefix) // bin_tokens) * bin_tokens + bin_tokens // 2, s.mode)
+        mix[key] = mix.get(key, 0) + 1
+    return tuple((w, p, m, float(n)) for (w, p, m), n in sorted(mix.items()))
+
+
+def weighted_makespan(model: LayerCostModel, counts: Sequence[int],
+                      mix: Sequence[Tuple[int, int, str, float]],
+                      attn: Optional[Sequence[int]] = None, serial: bool = False) -> float:
+    """Mean ms per chunk of the cut ``counts`` over the chunk mix: per chunk the
+    bottleneck stage (max over stages; ``serial`` = their sum, a gapped map),
+    weighted by the mix counts. A mode the model has no curve for is priced
+    as the measured one (:class:`CardCost` falls back)."""
+    tot = wsum = 0.0
+    a = attn if attn is not None else model.attn_counts(counts)
+    for w, p, mode, n in mix:
+        if n <= 0:
+            continue
+        per = [model.stage_ms(counts, r, int(w), int(p), mode, attn=a) for r in range(model.n_stages)]
+        tot += float(n) * (sum(per) if serial else max(per))
+        wsum += float(n)
+    if wsum <= 0:
+        raise StageModelError("empty chunk mix")
+    return tot / wsum
+
+
 __all__ = [
     "MODE_GRAPH", "MODE_EAGER", "MODES", "FULL_ATTENTION", "StageModelError", "CardCost",
     "LayerCostModel", "RungResult", "WidthSample", "WidthLine", "curve_linear", "curve_flat",
     "attn_work", "layer_types_every", "load_model", "contiguous_cuts", "plan_for", "busy_ms",
     "evaluate_cut", "mix_score", "drifting_cut_makespan", "best_drifting_makespan", "samples_from_lines", "fit_width_lines",
-    "card_costs_from_fit", "check_power",
+    "card_costs_from_fit", "check_power", "samples_from_rank_lines", "cut_of_lines",
+    "card_costs_from_cuts", "fit_model_from_logs", "chunk_mix_from_samples", "weighted_makespan",
 ]
 
 
@@ -712,10 +955,51 @@ def check_power(model: LayerCostModel, current: Dict[str, Optional[float]], law:
         source=f"{model.source} +powerscale:law={law},{tag} ({_pl.MODEL_LABEL})"), lines
 
 
+def fit_main(argv: Sequence[str]) -> int:
+    """``python -m sglang.srt.weg2.p_stage_model fit P_LOG [P_LOG ...] --out MODEL.json``:
+    a :class:`LayerCostModel` from the rank lines of P logs (several cuts
+    solve the per-layer rate and the fixed terms jointly)."""
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="p_stage_model fit", description=fit_main.__doc__)
+    ap.add_argument("logs", nargs="+")
+    ap.add_argument("--stage-cards", default="RTX5090,RTX3080,RTX3080")
+    ap.add_argument("--layers", type=int, default=64)
+    ap.add_argument("--period", type=int, default=4)
+    ap.add_argument("--offset", type=int, default=3)
+    ap.add_argument("--power-w", default="RTX5090=400,RTX3080=230",
+                    help="the calibration limit per card class the logs ran under")
+    ap.add_argument("--out", default="")
+    a = ap.parse_args(list(argv))
+    power = {}
+    for item in filter(None, a.power_w.split(",")):
+        k, _, v = item.partition("=")
+        power[k.strip()] = float(v)
+    model = fit_model_from_logs(a.logs, tuple(a.stage_cards.split(",")),
+                                layer_types_every(a.layers, a.period, a.offset), power)
+    doc = model.to_json()
+    doc.pop("layer_types", None)
+    doc["layer_layout"] = {"n_layers": a.layers, "period": a.period, "offset": a.offset}
+    text = json.dumps(doc, indent=1, sort_keys=True) + "\n"
+    if a.out:
+        with open(a.out, "w") as fh:
+            fh.write(text)
+    else:
+        print(text, end="")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """``python -m sglang.srt.weg2.p_stage_model MODEL.json --cut 41,12,11 [--out F]``:
-    write the cut's ``--p-chunk-model`` JSON (stdout without --out)."""
+    write the cut's ``--p-chunk-model`` JSON (stdout without --out).
+    ``... p_stage_model fit LOG ...``: see :func:`fit_main`."""
     import argparse
+
+    import sys as _sys
+
+    _args = list(_sys.argv[1:] if argv is None else argv)
+    if _args and _args[0] == "fit":
+        return fit_main(_args[1:])
 
     import sys
 
@@ -731,7 +1015,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="rescale the compute terms on a > 5%% power-limit mismatch (a MODEL; default off)")
     ap.add_argument("--power-scale-exponent", type=float, default=None,
                     help=f"alpha of --power-scale power (default {_pl.DEFAULT_EXPONENT:.4f})")
-    a = ap.parse_args(argv)
+    a = ap.parse_args(_args)
     model = load_model(a.model)
     current: Dict[str, Optional[float]] = {}
     if a.current_power_w:

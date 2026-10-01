@@ -4643,6 +4643,55 @@ CALIBRATION_PREFIX_TOKENS = 4096
 #: is what makes the optimum a FUNCTION of the design prefix rather than a
 #: constant, and it is cited to its record rather than written as a literal.
 ATTN_ANCHOR_MS = 400.0
+#: PP-COST (01.10.): the stage model the 27B INT8 P cut is priced on under
+#: --pp-cut-stage-model auto (rank-line fit of 09290020 cut 43,11,10 and four
+#: 44,10,10 boots of 01.10., weg2/p_stage_model_data/)
+PP_CUT_STAGE_MODEL_27B_INT8 = "27b_int8_rc12z30"
+
+
+def resolve_pp_cut_stage_model(arg: str, profile: Optional[str], model: str):
+    """(LayerCostModel, provenance) for --pp-cut-stage-model, or (None, why)."""
+    from sglang.srt.weg2 import p_stage_model as _psm
+
+    arg = str(arg or "").strip()
+    if arg in ("", "off"):
+        return None, "--pp-cut-stage-model off"
+    if arg == "auto":
+        fmt = weg2_form.format_of(profile, model)
+        if str(profile or "") != PROFILE_QWEN27B or fmt != "int8":
+            return None, ("--pp-cut-stage-model auto: no stage model for profile %r format %r (only "
+                          "qwen27b/int8 is calibrated) -- previous pricing" % (profile, fmt or "?"))
+        arg = PP_CUT_STAGE_MODEL_27B_INT8
+    path = arg if arg.endswith(".json") or os.sep in arg else os.path.join(
+        os.path.dirname(os.path.abspath(_psm.__file__)), "p_stage_model_data", arg + ".json")
+    model_obj = _psm.load_model(path)
+    return model_obj, "%s (%s)" % (os.path.basename(path), model_obj.source[:160])
+
+
+def pp_cut_chunk_mix(log_path: Optional[str], fallback_width: int, fallback_prefix: int,
+                     graph_bucket: int):
+    """(chunk mix, provenance): the predecessor boot's PP0 chunks as
+    (width, prefix bin, mode, count); without a readable log ONE cell, the
+    configured chunk at the design prefix, named as such."""
+    from sglang.srt.weg2 import p_stage_model as _psm
+
+    if log_path:
+        try:
+            with open(log_path, errors="replace") as fh:
+                mix = _psm.chunk_mix_from_samples(_psm.samples_from_rank_lines(fh))
+        except OSError as exc:
+            mix, why = (), "unreadable (%s)" % exc
+        else:
+            why = "no paired PP0 rank line"
+        if mix:
+            return mix, "MEASURED chunk mix of %s (%d PP0 chunks, %d cells)" % (
+                log_path, int(sum(n for *_x, n in mix)), len(mix))
+    else:
+        why = "no predecessor P log"
+    mode = _psm.MODE_GRAPH if (graph_bucket and int(fallback_width) <= int(graph_bucket)) else _psm.MODE_EAGER
+    return ((int(fallback_width), int(fallback_prefix), mode, 1.0),), (
+        "FALLBACK chunk mix: %s -- one cell, the configured chunk %d at the design prefix %d (%s)"
+        % (why, int(fallback_width), int(fallback_prefix), mode))
 ATTN_ANCHOR_PREFIX_TOKENS = 262144
 
 #: DESIGN DEPTH FALLBACK. When no boot log carries a prefill census the design
@@ -20489,7 +20538,31 @@ def solve_p_cut(
     model_pool = p_prefill_graph_vram_gate(
         ns, model_pool, _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else None,
         families, pool_floor, log)
+    # PP-COST (01.10.): the stage model over the predecessor boot's chunk mix.
+    _stage_model, _stage_prov = resolve_pp_cut_stage_model(
+        str(getattr(ns, "pp_cut_stage_model", "off")), getattr(ns, "profile", None), model)
+    _chunk_mix = None
+    if _stage_model is not None:
+        from sglang.srt.weg2 import p_stage_model as _psm
+        from sglang.srt.weg2 import power_limit as _plim
+
+        _current = {}
+        for _c, _w in zip(cards, _power_now):
+            if _w is not None:
+                _current.setdefault(_plim.card_class(_c.name), float(_w))
+        _stage_model, _plines = _psm.check_power(_stage_model, _current)
+        for _ln in _plines:
+            log("PP-CUT STAGE MODEL " + _ln)
+        _chunk_mix, _mix_prov = pp_cut_chunk_mix(
+            design_src, int(chunk_tokens), int(design_prefix), int(p_prefill_graph_bucket()))
+        log("PP-CUT STAGE MODEL (--pp-cut-stage-model): %s; %s -- every candidate's makespan below is the "
+            "mean ms per chunk over that mix (per chunk the bottleneck stage)" % (_stage_prov, _mix_prov))
+    else:
+        log("PP-CUT STAGE MODEL off: %s" % _stage_prov)
     decision = _cut.solve_launch_cut(
+        stage_model=_stage_model,
+        chunk_mix=_chunk_mix,
+        stage_model_provenance=_stage_prov,
         layer_families=families,
         incumbent_layers=incumbent,
         measured_ms_per_layer=ms,
@@ -22491,6 +22564,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--pp-cut-stage-fit-stale-ok", action="store_true",
         help="Only with --pp-cut-stage-fit: price with a fit whose card or "
              "power limit differs from this boot's metal (default: W40).")
+    ap.add_argument(
+        "--pp-cut-stage-model", default="auto", metavar="auto|off|NAME|PATH",
+        help="PP-COST (27B line, 01.10.): the TIME axis of the P cut solver is priced by the "
+             "per-layer-type, per-card stage model (weg2/p_stage_model.py, calibrated from the "
+             "'Prefill rank batch' + '#1469 RETAIN' lines) over the CHUNK MIX of the predecessor "
+             "boot (the same P log the design prefix comes from, --pp-cut-design-prefix-from), "
+             "instead of the card-rate/family split at one design prefix. 'auto' (default) = "
+             f"profile qwen27b on its int8 checkpoint -> {PP_CUT_STAGE_MODEL_27B_INT8}; any other "
+             "profile/format -> off. 'off' = the previous pricing, byte-identical. NAME = a file "
+             "under weg2/p_stage_model_data/ (without .json), PATH = a JSON. Why: the old pricing "
+             "ranked 44,10,10 ahead of 43,11,10 while the rank lines measure 43,11,10 +4.5 %% faster "
+             "with +15 %% P pool.")
     ap.add_argument(
         "--pp-cut-depth-profile", default="", metavar="ladder:N,N,...|fit",
         help="27B line, default off (unset = price every cut at the single "
