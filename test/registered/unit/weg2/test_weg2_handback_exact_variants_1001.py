@@ -270,3 +270,50 @@ def test_the_n_minus_2_mutant_turns_every_exact_test_red(exact, tmp_path, case, 
     _MUTANTS[mutant](exact)
     with pytest.raises(AssertionError):
         case[1](exact, tmp_path)
+
+
+# -- COLD FIRST CLAIM (D boots with --skip-server-warmup) ----------------------------
+#: BIGRAM_EXACT_TREE is the process-wide note D's claim reads; a fresh D process holds
+#: False until its tree has noted its keying. When that note came only from the lazy
+#: accessor (first cache_*_req / match validator), the first hand-back claim -- computed
+#: BEFORE its own match_prefix -- read the flag cold and claimed N-1 raw tokens, which on
+#: the exact tree ends inside P's N-1 node: D resumed at 0 (a full D re-prefill).
+
+
+def _cold_d_first_claim(mp):
+    p = PT._fixture(True)                   # P: the trimmed request, the N-1 node
+    PT._prefill_trimmed(p)
+    HC.BIGRAM_EXACT_TREE[0] = False         # a fresh D process: nothing noted yet
+    PT._fixture(True)                       # D constructs its tree -- no insert, no match
+    _as_d(mp)
+    try:
+        claim = _d_claim_len(PT.N)
+        depth = len(p.cache.match_prefix(MatchPrefixParams(key=PT._key(p, PT.PROMPT[:claim]))).device_indices)
+    finally:
+        _as_p(mp)
+    return claim, depth
+
+
+def test_the_first_handback_claim_on_a_freshly_built_tree_claims_n_minus_1_units(exact):
+    claim, depth = _cold_d_first_claim(exact)
+    assert claim == PT.N, "N raw tokens = N-1 exact units, before any match_prefix"
+    assert depth == PT.N - 1, "the first hand-back resumes at N-1, no D re-prefill"
+
+
+def _mutant_lazy_note(mp):
+    """the keying is noted lazily again: construction leaves the flag untouched"""
+    orig = urc.UnifiedRadixCache.__init__
+
+    def lazy_init(self, *a, **kw):
+        was = HC.BIGRAM_EXACT_TREE[0]
+        orig(self, *a, **kw)
+        self.__dict__.pop("_weg2_bigram_anchor_exact", None)
+        HC.BIGRAM_EXACT_TREE[0] = was
+
+    mp.setattr(urc.UnifiedRadixCache, "__init__", lazy_init)
+
+
+def test_the_lazy_note_mutant_turns_the_cold_first_claim_red(exact):
+    _mutant_lazy_note(exact)
+    with pytest.raises(AssertionError):
+        test_the_first_handback_claim_on_a_freshly_built_tree_claims_n_minus_1_units(exact)

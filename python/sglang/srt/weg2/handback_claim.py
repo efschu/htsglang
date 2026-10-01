@@ -33,7 +33,9 @@ from __future__ import annotations
 import os
 
 #: set by UnifiedRadixCache when this process's tree resolves to bigram keys
-#: with the exact keying (bigram_anchor_exact True)
+#: with the exact keying (bigram_anchor_exact True) -- AT CONSTRUCTION of the tree:
+#: the claim reads it before the request's own match_prefix, so a note left to the
+#: first match read it cold on the first hand-back after a warmup-less boot
 BIGRAM_EXACT_TREE = [False]
 
 

@@ -1139,6 +1139,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # evictable checkpoints were sitting in the tree.
         if hasattr(self.req_to_token_pool, "bind_tree_cache"):
             self.req_to_token_pool.bind_tree_cache(self)
+        # HANDBACK N-1 COLD FIRST CLAIM: note the keying NOW, not at the first
+        # cache_*_req / match validator. D's claim (`Req._compute_max_prefix_len`
+        # -> `handback_bigram_claim`) runs BEFORE the request's own match_prefix,
+        # and the launcher boots with --skip-server-warmup, so a lazily noted
+        # flag was still False for the first hand-back on every D rank: N-1 raw
+        # tokens on the exact tree ended inside P's N-1 node and D resumed at 0
+        # (a full D re-prefill). Reading the property here caches it once per
+        # tree (the keying must not change under a live tree) and calls note_tree.
+        _ = self.bigram_anchor_exact
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
         self._log_mamba_floor_posture()
 
