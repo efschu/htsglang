@@ -28,8 +28,10 @@ scrape_configs:
   # Heute reicht die Front /metrics an die WACHE Gruppe durch (front.py PASSTHROUGH_GET), also
   # sglang:* von P ODER D. Mit dem Front-Commit "weg2 /metrics" (Liste an 27B, 01.10.) kommen P und D
   # gleichzeitig mit Label weg2_group und die weg2_*-Metriken der Front dazu.
+  # Ziel-Label heisst scrape_via, nicht via: die Front exportiert weg2_ttft_seconds{via=after_p|d_direct|
+  # d_single}, ein Ziel-Label "via" ueberschrieb das und verlor die TTFT-Aufteilung (27B-Abnahme 01.10.).
   - job_name: weg2-front
     scrape_interval: 15s      # schont die Front: ein GET je 15 s, durchgereicht an die wache Gruppe
     static_configs:
       - targets: ["127.0.0.1:30030"]
-        labels: {via: tunnel30030}
+        labels: {scrape_via: tunnel30030}
