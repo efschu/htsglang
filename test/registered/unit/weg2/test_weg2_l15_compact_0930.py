@@ -232,9 +232,14 @@ def test_compact_plan_rows_bounds():
             assert _row(x, P27, r) < plan.rows_by_rank[r]
 
 
-def test_compact_plan_rejects_duplicate_slots():
+def test_compact_plan_duplicate_rules():
+    # F7 rule: a slot held by TWO rids is a shared radix prefix -- planned
+    # once, and both rids map through the same entry. A slot repeated
+    # INSIDE one rid's own list is corruption and still raises.
+    plan = compact_plan({"a": [3, 19], "b": [19, 20]}, P27)
+    assert plan.new_slots["a"][1] == plan.new_slots["b"][0]
     with pytest.raises(ValueError, match="19"):
-        compact_plan({"a": [3, 19], "b": [19, 20]}, P27)
+        compact_plan({"a": [3, 19, 19]}, P27)
 
 
 def test_compact_plan_rejects_held_slot_on_reserved_slot():
@@ -276,9 +281,12 @@ def test_anchor_plan_basic():
     assert moves == tuple(sorted(moves))
 
 
-def test_anchor_plan_rejects_duplicates():
-    with pytest.raises(ValueError):
-        anchor_plan({"a": 4, "b": 4})
+def test_anchor_plan_shared_anchor_allowed():
+    # F7: two rids ending on the same radix node share the anchor slot; it
+    # is planned ONCE (one unique anchor -> A_H = 1), not an error.
+    a_h, moves = anchor_plan({"a": 4, "b": 4})
+    assert a_h == 1
+    assert moves == ((4, 0),)
 
 
 # --------------------------------------------------------------------------

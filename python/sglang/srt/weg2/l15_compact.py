@@ -21,7 +21,9 @@ calls), how the held slots compact into that prefix:
   each class in ascending order and the sources in ascending old-slot order,
   with ``moves`` sorted by old slot;
 * :func:`anchor_plan` does the same squeeze for the GDN state slots of the
-  held requests: they compact to ``[0, A_H)`` with ``A_H = len(anchor_slots)``.
+  held requests: they compact to ``[0, A_H)`` where ``A_H`` is the number of
+  UNIQUE anchor slots (a radix node shared by several rids contributes one)
+  plus ``len(reserved)``.
 
 The compact pool row of a global slot (what the per-rank KV buffer addresses)
 is ``(L // S) * ratio_r + (L % S - prefix[r])``; ``CompactPlan.rows_by_rank``
@@ -135,9 +137,13 @@ def compact_plan(
 ) -> CompactPlan:
     """Plan the compaction of ``held`` (rid -> global slots, token order).
 
-    All slots across all requests must be distinct. ``need_by_rank`` is the
-    per-class count of held slots, ``L_H = hold_prefix(need)``; see the module
-    docstring for the move rule. ``reserved`` (e.g. padding slot 0, the dummy
+    A slot may be held by several requests (a shared radix prefix) and is
+    then planned ONCE -- counted once in ``need``, given one new slot, and
+    every rid that holds it maps through the same ``moves`` entry. A slot
+    repeated INSIDE one request's own list is a ValueError (corruption, not
+    sharing). ``need_by_rank`` is the per-class count of UNIQUE held slots,
+    ``L_H = hold_prefix(need)``; see the module docstring for the move rule.
+    ``reserved`` (e.g. padding slot 0, the dummy
     write target for padded tokens) counts toward its owner's need, is never
     a compaction target and is not part of ``moves``/``new_slots``; a held
     slot that is also reserved is a ValueError naming the slot (the same
@@ -151,13 +157,20 @@ def compact_plan(
     need = [0] * n_ranks
     held_all: set = set()
     for rid, slots in held.items():
+        rid_seen: set = set()
         for slot in slots:
             slot = int(slot)
-            if slot in held_all:
+            if slot in rid_seen:
                 raise ValueError(
-                    f"slot {slot} is held twice (request {rid!r}); held slots "
-                    "must be all distinct"
+                    f"slot {slot} appears twice inside the held list of "
+                    f"request {rid!r}; one request holding a slot twice is "
+                    "corruption, not a shared prefix"
                 )
+            rid_seen.add(slot)
+            if slot in held_all:
+                # F7: shared with another request -- planned and counted
+                # once; every holder maps through the same moves entry.
+                continue
             held_all.add(slot)
             need[owner_of(slot, prefix)] += 1
     hit = sorted(reserved_set & held_all)
@@ -222,25 +235,30 @@ def anchor_plan(
 ) -> Tuple[int, Tuple[Tuple[int, int], ...]]:
     """Squeeze the GDN state slots of the held requests to ``[0, A_H)``.
 
-    ``A_H = len(anchor_slots) + len(reserved)``; slots already below ``A_H``
-    stay, the others take the free targets of ``[0, A_H)`` in ascending order
-    with the sources taken in ascending order (moves sorted by old slot).
-    Returns ``(A_H, moves)``; the staying slots plus the targets are exactly
-    ``range(A_H)`` minus ``reserved``. ``reserved`` (padding slot 0, the dummy
-    write target for padded tokens) stays where it is and never becomes a
-    target; an anchor already sitting on a reserved slot is a ValueError --
-    the hold must never land there. The default ``()`` reproduces the
-    pre-L15-11b behaviour exactly.
+    Several rids ending on one radix node share the SAME anchor slot, so the
+    squeeze is a function of the SLOT: a slot held by several rids is planned
+    ONCE and ``A_H`` counts UNIQUE anchor slots (``len(set(slots))``), not
+    rids. ``A_H = <unique anchor slots> + len(reserved)``; slots already
+    below ``A_H`` stay, the others take the free targets of ``[0, A_H)`` in
+    ascending order with the sources taken in ascending order (moves sorted
+    by old slot). Returns ``(A_H, moves)``; the staying slots plus the targets
+    are exactly ``range(A_H)`` minus ``reserved``. ``reserved`` (padding slot
+    0, the dummy write target for padded tokens) stays where it is and never
+    becomes a target; an anchor already sitting on a reserved slot is a
+    ValueError -- the hold must never land there. The default ``()``
+    reproduces the pre-L15-11b behaviour exactly.
     """
+    # F7: a shared radix node gives several rids the SAME mamba anchor slot.
+    # The squeeze is a function of the SLOT, so a slot held by several rids is
+    # planned ONCE; ``seen`` therefore keys on the unique slot and the shared
+    # rids are skipped (not an error). A negative slot is still rejected.
     seen: Dict[int, str] = {}
     for rid, slot in anchor_slots.items():
         slot = int(slot)
         if slot < 0:
             raise ValueError(f"anchor slot of {rid!r} is negative: {slot}")
         if slot in seen:
-            raise ValueError(
-                f"anchor slot {slot} is held by both {seen[slot]!r} and {rid!r}"
-            )
+            continue
         seen[slot] = rid
 
     reserved_set = {int(x) for x in reserved}
@@ -251,7 +269,9 @@ def anchor_plan(
             "the dummy write target for padded tokens); a held anchor must "
             "never land there"
         )
-    a_h = len(anchor_slots) + len(reserved_set)
+    # ``seen`` holds the UNIQUE anchor slots (F7: shared rids skipped above),
+    # so A_H counts physical mamba slots, not rids.
+    a_h = len(seen) + len(reserved_set)
     staying = {slot for slot in seen if slot < a_h}
     free = [x for x in range(a_h) if x not in staying and x not in reserved_set]
     srcs = sorted(slot for slot in seen if slot >= a_h)
