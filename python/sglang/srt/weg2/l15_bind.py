@@ -4,8 +4,10 @@ Duck-typed adapter layer (getattr with defaults, no scheduler import, no
 torch.cuda): translates Req-shaped objects into the callables that
 l15_retain.retain_at_sleep expects, so tests can use SimpleNamespace fakes.
 
-OPEN (L15-11c part 2): l2_of returns ((), ()) -- the L2 eviction ring is
-not wired yet; the manifest's l2 columns stay empty until that lands.
+L15-12c-C2: l2_of yields (slot, gen) per held token -- the host rows of
+the radix chain are SNAPSHOTTED at bind time (reset_keep nulls host_value
+on kept nodes), mapped to arena page slots, with the generation read once
+from the arena census (ArenaMHAHostPool.slot_gens).
 """
 
 from typing import Callable, Dict, Iterable, Optional, Tuple
@@ -77,6 +79,32 @@ def node_of_req(req):
     return node
 
 
+def chain_host_rows(node) -> Tuple[int, ...]:
+    """L15-12c-C2: the host rows of the radix chain root -> node, in token
+    order. The walk goes last_node -> root; each node contributes its
+    component_data[ComponentType.FULL].host_value (the host row ids of its
+    own tokens); a node without a host_value (write-pending, or never
+    backed up) contributes nothing. Must be read at BIND time: reset_keep
+    nulls host_value on the kept nodes (unified_radix_cache.py).
+    """
+    chunks = []
+    cur = node
+    while cur is not None:
+        try:
+            cd = cur.component_data[ComponentType.FULL]
+        except (AttributeError, KeyError, IndexError, TypeError):
+            cd = None  # duck-typed: a fake/odd node contributes no rows
+        hv = getattr(cd, "host_value", None) if cd is not None else None
+        if hv is not None and len(hv):
+            vals = hv.tolist() if hasattr(hv, "tolist") else hv
+            chunks.append([int(x) for x in vals])
+        cur = getattr(cur, "parent", None)
+    rows: list = []
+    for chunk in reversed(chunks):
+        rows.extend(chunk)
+    return tuple(rows)
+
+
 def build_retain_kwargs(
     reqs: Iterable,
     req_to_token,
@@ -95,6 +123,7 @@ def build_retain_kwargs(
     manifest_path: str,
     log: Callable[[str], None],
     mamba_allocator=None,
+    host_pool=None,
 ) -> Dict:
     """Assemble the whole retain_at_sleep keyword set from live reqs.
 
@@ -105,6 +134,7 @@ def build_retain_kwargs(
     """
     by_rid = {}
     entries = []
+    l2_rows = []  # (rid, chain host rows truncated to the KV span)
     for req in reqs:
         rid = str(req.rid)
         by_rid[rid] = req
@@ -117,6 +147,15 @@ def build_retain_kwargs(
         # reserves by the exact owned count -- a proportional split can
         # over-admit past a cap on the rounding residue (audit item 11).
         _slots = slots_of_req(req, req_to_token)
+        # L15-12c-C2: snapshot the chain's host rows NOW (reset_keep nulls
+        # host_value later); a node missing its last_node skips l2 (retain
+        # skips the whole round for that rid anyway).
+        try:
+            _rows = chain_host_rows(node_of_req(req))[: len(_slots)]
+        except ValueError:
+            _rows = ()
+        if _rows:
+            l2_rows.append((rid, _rows))
         _owned = tuple(owner_of(s, prefix) for s in _slots)
         _n = len(prefix) - 1
         entries.append(
@@ -135,6 +174,43 @@ def build_retain_kwargs(
         )
     candidates = candidates_from(entries)
 
+    # L15-12c-C2: host row -> (arena page slot, generation). The pool is the
+    # kwarg (tests) or the live one reached through the bound reset_keep
+    # (scheduler passes tree_cache.reset_keep -> cache_controller.mem_pool_host).
+    # Host ids: [0, S) staging rows (no L2 copy -> -1), [S, S + A*P) arena
+    # token ids, slot = (row - S) // P (P == 1 is the 27B form); the draft
+    # role maps rows through row_slot instead. Gens come from ONE census.
+    pool = host_pool
+    if pool is None:
+        _rc = getattr(reset_keep, "__self__", None)
+        pool = getattr(getattr(_rc, "cache_controller", None), "mem_pool_host", None)
+    l2_by_rid: Dict[str, Tuple[Tuple, Tuple]] = {}
+    if pool is not None and l2_rows:
+        _s = int(getattr(pool, "staging_rows", 0))
+        _p = max(1, int(getattr(pool, "_arena_page_tokens", 1)))
+        _row_slot = getattr(pool, "row_slot", None)
+        _slot_of = {}
+        for rid, rows in l2_rows:
+            per = []
+            for r in rows:
+                if r < _s:
+                    per.append(-1)
+                elif _row_slot is not None:
+                    per.append(int(_row_slot.get(r, -1)))
+                else:
+                    per.append((r - _s) // _p)
+            _slot_of[rid] = per
+        uniq = sorted({s for per in _slot_of.values() for s in per if s >= 0})
+        gen_of = {}
+        if uniq:
+            for s, g in zip(uniq, pool.slot_gens(uniq)):
+                gen_of[int(s)] = int(g)
+        for rid, per in _slot_of.items():
+            l2_by_rid[rid] = (
+                tuple(per),
+                tuple(int(gen_of.get(s, -1)) for s in per),
+            )
+
     def node_of(rid: str):
         return node_of_req(by_rid[rid])
 
@@ -145,8 +221,9 @@ def build_retain_kwargs(
         return anchor_slot_of_req(by_rid[rid])
 
     def l2_of(rid: str) -> Tuple[Tuple, Tuple]:
-        # OPEN (L15-11c part 2): wire to the L2 eviction ring.
-        return ((), ())
+        # L15-12c-C2: the bind-time snapshot mapped above; ((), ()) keeps the
+        # old empty columns when no host pool could be reached.
+        return l2_by_rid.get(rid, ((), ()))
 
     return {
         "candidates": candidates,

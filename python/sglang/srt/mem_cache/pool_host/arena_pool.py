@@ -1784,6 +1784,23 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pinned[idx] = True
         return n
 
+    def slot_gens(self, slots) -> list:
+        """L15-12c-C2: the generation of each arena slot, from ONE COMPLETE
+        census (ShmArena.complete_census). Slots that are not COMPLETE (absent,
+        partial, placeholder ids) answer -1. The value is only meaningful at
+        read time -- a re-claim bumps the generation, and a bump between bind
+        and wake is exactly the F1 case the wake's generation check handles."""
+        want = [int(s) for s in slots]
+        if self.arena is None:
+            return [-1] * len(want)
+        try:
+            cs, cg, _klo, _khi = self.arena.complete_census()
+        except Exception as exc:  # noqa: BLE001 -- census unavailable: no gens
+            logger.info("#1424 slot_gens census failed: %r", exc)
+            return [-1] * len(want)
+        gens = {int(s): int(g) for s, g in zip(cs.tolist(), cg.tolist())}
+        return [int(gens.get(s, -1)) for s in want]
+
     def _transfer(self, device_pool, k_src, v_src, src_idx, dst_idx, layer_id) -> None:
         if not getattr(self, "can_use_jit", False):
             raise RuntimeError("#1424 the arena host pool needs the JIT hicache transfer kernel")

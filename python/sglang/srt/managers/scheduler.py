@@ -19951,6 +19951,32 @@ class Scheduler(
                                 "D", _l15_rank, os.environ),
                             log=logger.info,
                         )
+                        # L15-12c-C2: alignment probe -- chain host rows vs
+                        # the seqlen-1 KV span; the first L15=1 boot confirms
+                        # whether the snapshot ever exceeds the span.
+                        for _r in _reqs:
+                            try:
+                                logger.info(
+                                    "L15-L2-ALIGN rid=%s chain_rows=%d kv_span=%d",
+                                    getattr(_r, "rid", "?"),
+                                    len(l15_bind.chain_host_rows(
+                                        l15_bind.node_of_req(_r)
+                                    )),
+                                    len(l15_bind.slots_of_req(
+                                        _r,
+                                        getattr(
+                                            self.req_to_token_pool,
+                                            "req_to_token",
+                                            None,
+                                        ),
+                                    )),
+                                )
+                            except Exception as _exc:  # noqa: BLE001
+                                logger.info(
+                                    "L15-L2-ALIGN rid=%s probe failed: %s",
+                                    getattr(_r, "rid", "?"),
+                                    _exc,
+                                )
             except Exception as exc:  # noqa: BLE001 - pre-move setup only
                 logger.warning(
                     "L15-RETAIN failed before the move (flushing as today): %s: %s",
