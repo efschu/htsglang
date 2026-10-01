@@ -4850,8 +4850,8 @@ class MoEExpertOffloadCache:
                 : max(1, int(self.seat_rows)) * 2]
             return
         if k > old and recall:
-            filled = self.warm_lru_local(recall, limit=k - old)
-            self._weg2_seat_warmed += filled
+            warmed_rows = self.warm_lru_local(recall, limit=k - old)
+            self._weg2_seat_warmed += warmed_rows
             self._weg2_seat_recall = []
 
     def _move_bank_rows(self, moves) -> None:
