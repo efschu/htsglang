@@ -7489,6 +7489,34 @@ class SchedulerWeightUpdaterManager:
         return l15_wake_check.decide(
             vote, group=cpu_group, world=world, epoch=epoch).verdict
 
+    def _l15_optimistic_refill(self) -> bool:
+        """L15-OPT (operator order 01.10 ~20:45Z, L15-WIRE2-NOTES sec 1):
+        the OPTIMISTIC cap-0 refill that runs BEFORE the group decide() so
+        the sample check (next AP) can verify live rows.  Reached only when
+        the wake hold signal set the refill mark -- that mark already
+        encodes SGLANG_WEG2_L15_REFILL=1 and "this rank is the refill rank"
+        -- and a manifest is stashed.  REFILL=0: the mark is never set, the
+        helper returns False and touches nothing (byte-identical boot 1).
+        The mark is consumed here, so the act after decide() KEEPS or DROPS
+        but never refills a second time.  A refill FAILURE must not drop per
+        rank (xsn409: the drop is the group's act): the helper returns True,
+        which flips this rank's decide() vote to None at the fence tail,
+        and the group fallback drop erases every row the failed attempt may
+        have landed.  Returns True only on such a failure."""
+        if not self._l15_wake_refill or self._l15_wake_manifest is None:
+            return False
+        sched = self.scheduler
+        if sched is None:
+            return False
+        self._l15_wake_refill = False
+        try:
+            self._l15_do_refill(sched, optimistic=True)
+        except Exception as exc:  # noqa: BLE001 -- vote None, never drop here
+            logger.info("L15-OPT optimistic refill failed (%s: %s) -> vote None",
+                        type(exc).__name__, exc)
+            return True
+        return False
+
     def _l15_wake_act(self, sched, verdict: str, *, group_ok: bool,
                       master_on: bool) -> int:
         """L15-12c-B: the fence tail's single-branch ACT on the group
@@ -7509,7 +7537,7 @@ class SchedulerWeightUpdaterManager:
             return self._l15_do_refill(sched)
         return 0
 
-    def _l15_do_refill(self, sched) -> int:
+    def _l15_do_refill(self, sched, optimistic: bool = False) -> int:
         """L15-12c-E2: refill this cap-0 rank's owned held rows from L2
         (plan L15-12-PART3-PLAN sec 2), ACTED only behind the group verdict
         "hold".  The hold-aware restore ran first: the held slots are
@@ -7603,7 +7631,14 @@ class SchedulerWeightUpdaterManager:
                         "from L2", rank, n, len(a_slots))
             return n
         except Exception as exc:  # noqa: BLE001 -- all-or-nothing into the fallback
-            logger.info("L15-REFILL rank=%d failed: %s -> fallback", rank, exc)
+            logger.info("L15-REFILL rank=%d failed: %s -> %s", rank, exc,
+                         "vote None (optimistic)" if optimistic else "fallback")
+            if optimistic:
+                # L15-OPT: the pre-decide attempt must never drop per rank
+                # (xsn409: the drop is the group's act).  Reraise so
+                # _l15_optimistic_refill flips this rank's vote to None; the
+                # group fallback drop then erases whatever landed.
+                raise
             self._l15_fallback_drop(sched)
             return 0
 
@@ -11491,9 +11526,25 @@ class SchedulerWeightUpdaterManager:
                 # (bad is always 0 until the sample check lands, next AP).  A
                 # failing collective PROPAGATES like the fence's own gather --
                 # never caught per rank here.
-                _l15_v = self._l15_decide_wake_verdict(
-                    _l15_wake, _l15_fp,
-                    epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
+                # L15-OPT (operator order 01.10 ~20:45Z, L15-WIRE2-NOTES
+                # sec 1): attempt the cap-0 rank's refill BEFORE decide so
+                # the sample check (next AP) sees LIVE rows instead of the
+                # post-drop emptiness that makes the fingerprint reduction
+                # degenerate (min==max==fp -> spurious "hold").  No-op unless
+                # this rank is THE refill rank and SGLANG_WEG2_L15_REFILL=1
+                # (the wake mark already encodes both).  On failure this rank
+                # votes None -> the group falls back to a uniform drop, which
+                # erases the partial refill (xsn409: the drop stays a GROUP act,
+                # never per-rank).  The mark is consumed, so the post-decide act
+                # keeps or drops but never refills a second time.
+                if self._l15_optimistic_refill():
+                    _l15_v = self._l15_decide_wake_verdict(
+                        _l15_wake, None,
+                        epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
+                else:
+                    _l15_v = self._l15_decide_wake_verdict(
+                        _l15_wake, _l15_fp,
+                        epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
                 logger.info("L15-DECIDE epoch=%d verdict=%s fence_verdict=%s",
                             int(_l15_m.epoch) if _l15_m is not None else 0,
                             _l15_v, _l15_fence_v)
