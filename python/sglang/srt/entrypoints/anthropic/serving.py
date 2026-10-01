@@ -895,32 +895,11 @@ class AnthropicServing:
                     "emitted to the client"
                 )
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
-        else:
-            # Anthropic semantics: extended thinking is OFF BY DEFAULT. An
-            # absent ``thinking`` field means the same as
-            # ``{"type":"disabled"}`` — it is NOT "leave the server default
-            # alone". Without this branch a boot carrying
-            # ``--reasoning-parser qwen3`` answers every plain request with a
-            # leading ``thinking`` block that eats the whole ``max_tokens``
-            # budget, so a Claude Code tool round trip never gets emitted.
-            #
-            # This DELIBERATELY overrides the server-level reasoning-parser
-            # default, and only on the Anthropic front: the OpenAI front
-            # reads its own ``chat_template_kwargs``/``reasoning_effort``
-            # and never passes through here, so its behaviour is unchanged.
-            try:
-                self.openai_serving_chat.apply_reasoning_enabled(chat_request, False)
-            except ValueError as e:
-                # An always-on reasoning parser cannot be disabled. Explicit
-                # ``{"type":"disabled"}`` still surfaces that as a 400 (the
-                # caller asked for something the model cannot do), but an
-                # ABSENT field is not a request — refusing here would 400
-                # every plain message on such a model. Warn and serve.
-                logger.warning(
-                    "Anthropic default thinking-off could not be applied: %s "
-                    "— serving with the model's reasoning default instead",
-                    e,
-                )
+        # An ABSENT ``thinking`` field leaves the server's reasoning default
+        # (chat template + --chat-template-default-kwargs) alone, exactly as
+        # upstream sglang does: the front forwards what the request asks for
+        # and invents nothing (user rule 01.10.: the serving answers like
+        # plain sglang). The former fork branch forced reasoning OFF here.
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
         # ``reasoning_effort`` knob.

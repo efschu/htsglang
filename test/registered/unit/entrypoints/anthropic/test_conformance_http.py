@@ -251,38 +251,28 @@ class _FrontTestCase(unittest.TestCase):
         return body
 
 
-# ---------- G1: extended thinking defaults to OFF ----------
+# ---------- G1: an absent thinking field leaves the server default (upstream) ----------
 
 
-class TestThinkingDefaultsOff(_FrontTestCase):
-    def test_absent_thinking_disables_reasoning(self):
-        """No ``thinking`` field must disable reasoning for THIS request.
+class TestThinkingAbsentIsServerDefault(_FrontTestCase):
+    """User rule 01.10.: the serving answers like plain sglang. Upstream's
+    /v1/messages touches the reasoning toggle only when the request carries
+    ``thinking``; an absent field leaves the chat template's default (and the
+    --chat-template-default-kwargs) alone. The fork used to force it OFF."""
 
-        Pre-change the front only touched the toggle when ``thinking`` was
-        present, so a boot with ``--reasoning-parser qwen3`` answered every
-        plain Claude Code request with a thinking block that consumed the
-        whole max_tokens budget.
-        """
+    def test_absent_thinking_does_not_touch_the_toggle(self):
         fake = _FakeChat(response=_completion())
-        client = self._client(fake)
-
-        resp = client.post("/v1/messages", json=self._body())
-
+        resp = self._client(fake).post("/v1/messages", json=self._body())
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(fake.apply_reasoning_calls, [False])
+        self.assertEqual(fake.apply_reasoning_calls, [])
 
-    def test_absent_thinking_matches_explicit_disabled(self):
-        """Absent and ``{"type":"disabled"}`` produce the SAME toggle call."""
-        absent = _FakeChat(response=_completion())
-        self._client(absent).post("/v1/messages", json=self._body())
-
-        explicit = _FakeChat(response=_completion())
-        self._client(explicit).post(
+    def test_explicit_disabled_still_turns_reasoning_off(self):
+        fake = _FakeChat(response=_completion())
+        resp = self._client(fake).post(
             "/v1/messages", json=self._body(thinking={"type": "disabled"})
         )
-
-        self.assertEqual(absent.apply_reasoning_calls, explicit.apply_reasoning_calls)
-        self.assertEqual(absent.apply_reasoning_calls, [False])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(fake.apply_reasoning_calls, [False])
 
     def test_explicit_enabled_still_turns_reasoning_on(self):
         fake = _FakeChat(response=_completion())
@@ -293,23 +283,20 @@ class TestThinkingDefaultsOff(_FrontTestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(fake.apply_reasoning_calls, [True])
 
-    def test_always_on_model_still_serves_plain_requests(self):
-        """The default-off override must not 400 an always-on reasoning model.
-
-        This is the one deliberate divergence from "absent == disabled":
-        an explicit ``{"type":"disabled"}`` is a request the model cannot
-        honour and still raises, but an ABSENT field is not a request.
-        """
+    def test_always_on_model_serves_plain_requests_without_a_toggle(self):
         fake = _FakeChat(response=_completion(), reasoning_always_on=True)
-        client = self._client(fake)
-
-        with self.assertLogs(
-            "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
-        ) as log:
-            resp = client.post("/v1/messages", json=self._body())
-
+        resp = self._client(fake).post("/v1/messages", json=self._body())
         self.assertEqual(resp.status_code, 200)
-        self.assertTrue(any("thinking-off" in line for line in log.output))
+        self.assertEqual(fake.apply_reasoning_calls, [])
+
+    def test_source_has_no_default_off_branch(self):
+        import inspect
+
+        from sglang.srt.entrypoints.anthropic import serving as S
+
+        src = inspect.getsource(S.AnthropicServing._convert_to_chat_completion_request)
+        self.assertNotIn("default thinking-off", src)
+        self.assertNotIn("apply_reasoning_enabled(chat_request, False)", src)
 
 
 # ---------- G2: unknown content blocks degrade per block ----------
