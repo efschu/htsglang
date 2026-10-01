@@ -334,7 +334,7 @@ class App:
 LIVE_TTL_S = 1.0
 #: what the "Letzte Boots" table reads of a boot that is not shown as a card (lean page payload)
 LEAN_KEEP = ("stem", "meta", "age_s", "live", "primary", "first_t", "last_log_t", "flip_count", "totals",
-             "alarm", "container", "end", "stop_count", "error_count")
+             "alarm", "container", "end", "stop_count", "error_count", "boot_s", "dur_s")
 
 
 def lean_boot(b: dict) -> dict:

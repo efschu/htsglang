@@ -785,6 +785,16 @@ def model_of(ipc: dict, ring) -> "activity.Model":
                           list(ipc.get("flip_user_time") or []), life)
 
 
+def life_view(ipc: dict, t0: Optional[float], sig: Optional[float]) -> dict:
+    """boot_s = Boot-Start (boot_id) -> serving_since_ts; dur_s = Boot-Start -> Ende (lifecycle_since eines
+    terminalen Boots, sonst das juengste IPC-Lebenszeichen).  None, wo eine Uhr fehlt."""
+    ready = ipc.get("serving_since_ts")
+    end_t = ipc.get("lifecycle_since") if ipc.get("terminal") else sig
+    end_t = end_t or sig
+    return {"boot_s": round(ready - t0, 1) if t0 and ready and ready >= t0 else None,
+            "dur_s": round(end_t - t0, 1) if t0 and end_t and end_t >= t0 else None}
+
+
 def flip_done_of(ipc: dict) -> List[dict]:
     return [dict(e.get("data") or {}, t=(e.get("data") or {}).get("t") or e.get("ts"))
             for e in (ipc.get("ipc_events") or []) if e.get("type") == "flip_done"]
@@ -874,6 +884,8 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
         "fields_summary": ipcfields.summary(fields),
         "end": stops.classify_ipc(ipc),
     }
+    # Nutzer 01.10.: Dauer und Bootzeit je Boot in "Letzte Boots"
+    v.update(life_view(ipc, t0, sig))
     # Nutzer 01.10. ~08:20Z: Flipzeit in Nutzersicht mit Vorlauf/Layer-Tausch/Nachlauf, und die Phase jetzt
     fv = flip_views(v["timeline"]["segs"], ipc, now)
     v["flip_views"] = fv[-24:]
