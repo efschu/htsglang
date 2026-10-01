@@ -167,7 +167,9 @@ class TestCacheFromTheCounters(CustomTestCase):
         self.assertEqual(c["loadback_tok"], (base["loadback_tok"] or 0) + 4096)
         self.assertEqual(c["mamba_resume_n"], base["mamba_resume_n"] + 1)
         self.assertEqual(c["store_incomplete_n"], 3)
-        self.assertEqual(c["prefetch"]["landed"], base["prefetch"]["landed"] + 1)
+        # RANK-TIMING 01.10.: the #1068 deferral's "landed" gate is deferred_landed;
+        # prefetch.landed counts store reads that landed a page (test_weg2_rank_timing_1001)
+        self.assertEqual(c["prefetch"]["deferred_landed"], base["prefetch"]["deferred_landed"] + 1)
         self.assertEqual(c["prefetch"]["deferred"], base["prefetch"]["deferred"] + 1)
 
 
