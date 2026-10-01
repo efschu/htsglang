@@ -4188,7 +4188,49 @@ class HiCacheFile(HiCacheStorage):
                 logger.info("#1472 READ-TRACE n=%d asked=%d readable=%d arena_hits=%d first_missing=%s why=%s arena_dir=%s",
                             _n, len(stems), len(out), len(in_arena), _first_missing[0][:48], _first_missing[1],
                             bool(self._arena_dir()))
+                _ok = set(out)
+                self._log_claim_open(_n, [s for s in rest if s not in _ok])
         return out
+
+    #: ZR-1: ARENA-CLAIM-OPEN looks at this many unreadable stems per short
+    #: read and names at most CLAIM_OPEN_LINES of them
+    CLAIM_OPEN_SCAN = 64
+    CLAIM_OPEN_LINES = 4
+
+    def _log_claim_open(self, n: int, missing: List[str]) -> None:
+        """ZR-1 (y6h weg2-4-14: READ-TRACE asked=24 readable=21, 3 pages
+        CLAIMED for good): a short read names the writer census of every
+        unreadable page that is CLAIMED in the arena -- who claimed it, who
+        joined, who merged extents, how much of the page is covered and how
+        many slots hold the same key (> 1 is the split ZR-1 closed in
+        arena.c claim_slot). An instrument: it never raises, never gates."""
+        if not missing or not self._arena_dir():
+            return
+        try:
+            from sglang.srt.mem_cache.storage.file.hicache_arena import claim_open_text
+
+            by_total: dict = {}
+            for stem in missing[: self.CLAIM_OPEN_SCAN]:
+                total = self._canonical_total_for_stem(stem)
+                if total is not None:
+                    by_total.setdefault(int(total), []).append(stem)
+            shown = 0
+            for total, group in by_total.items():
+                arena = self._arena_for(total)
+                if arena is None or not hasattr(arena, "claim_census"):
+                    continue
+                claimed = [(stem, slot) for stem, (slot, st) in zip(group, arena.find_slots(group))
+                           if slot >= 0 and st == 1]
+                if not claimed:
+                    continue
+                rows = arena.claim_census([slot for _, slot in claimed[: self.CLAIM_OPEN_LINES - shown]])
+                for (stem, _), row in zip(claimed, rows):
+                    logger.info("ARENA-CLAIM-OPEN n=%d %s", n, claim_open_text(stem, row))
+                    shown += 1
+                if shown >= self.CLAIM_OPEN_LINES:
+                    return
+        except Exception as exc:  # noqa: BLE001 - an instrument never raises
+            logger.info("ARENA-CLAIM-OPEN n=%d failed: %r", n, exc)
 
     def _canonical_total_for_stem(self, stem: str) -> Optional[int]:
         """The canonical width a stem's file must have to be readable, or None."""
