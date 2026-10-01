@@ -1,0 +1,60 @@
+--- pool_host/mha.py.orig-efeu	2026-10-01 13:19:17.282535925 +0200
++++ pool_host/mha.py	2026-10-01 13:19:17.295046335 +0200
+@@ -71,13 +71,13 @@
+         _has_sgl_kvcacheio = True
+     except ImportError:
+         transfer_kv_all_layer = None
+-        transfer_kv_all_layer_direct_lf_pf = None
++        from sglang.srt.mem_cache.kvcacheio_torch import transfer_kv_all_layer_direct_lf_pf  # efeu-TP14: torch fallback, no sgl_kernel on this ROCm host
+         transfer_kv_all_layer_lf_pf = None
+         transfer_kv_all_layer_lf_ph = None
+         transfer_kv_all_layer_mla_lf_pf = None
+-        transfer_kv_direct = None
++        from sglang.srt.mem_cache.kvcacheio_torch import transfer_kv_direct  # efeu-TP14: torch fallback, no sgl_kernel on this ROCm host
+         transfer_kv_per_layer = None
+-        transfer_kv_per_layer_direct_pf_lf = None
++        from sglang.srt.mem_cache.kvcacheio_torch import transfer_kv_per_layer_direct_pf_lf  # efeu-TP14: torch fallback, no sgl_kernel on this ROCm host
+         transfer_kv_per_layer_mla = None
+         transfer_kv_per_layer_mla_pf_lf = None
+         transfer_kv_per_layer_pf_lf = None
+--- memory_pool_host.py.orig-efeu	2026-10-01 13:19:17.312059582 +0200
++++ memory_pool_host.py	2026-10-01 13:19:17.322467232 +0200
+@@ -53,11 +53,11 @@
+ 
+         _has_sgl_kvcacheio = True
+     except ImportError:
+-        transfer_kv_all_layer_direct_lf_pf = None
++        from sglang.srt.mem_cache.kvcacheio_torch import transfer_kv_all_layer_direct_lf_pf  # efeu-TP14: torch fallback, no sgl_kernel on this ROCm host
+         transfer_kv_all_layer_mla = None
+         transfer_kv_all_layer_mla_lf_pf = None
+-        transfer_kv_direct = None
+-        transfer_kv_per_layer_direct_pf_lf = None
++        from sglang.srt.mem_cache.kvcacheio_torch import transfer_kv_direct  # efeu-TP14: torch fallback, no sgl_kernel on this ROCm host
++        from sglang.srt.mem_cache.kvcacheio_torch import transfer_kv_per_layer_direct_pf_lf  # efeu-TP14: torch fallback, no sgl_kernel on this ROCm host
+         transfer_kv_per_layer_mla = None
+         transfer_kv_per_layer_mla_pf_lf = None
+ 
+--- /root/651-p2/sglang_src/python/sglang/srt/layers/moe/kt_ep_wrapper.py	2026-08-09 03:18:34.092367905 +0200
++++ kt_ep_wrapper.py	2026-10-01 13:36:16.204776789 +0200
+@@ -203,7 +203,20 @@
+         # bytes) so the GGUF parameter machinery sees a well-formed layer. It is
+         # never read: apply() returns the CPU result directly.
+         self.num_gpu_experts = 1 if self.kt_all_cpu else kt_config.num_gpu_experts
+-        if not self.kt_all_cpu and type(gpu_method).__name__ == "GGUFMoEMethod":
++        # efeu-TP14 2026-10-01: the rocm-gguf-gfx11 build (marker op
++        # ggml_rocm_true16_safe) makes ggml_moe_a8_vec contribute 0 for an
++        # expert id < 0, which is exactly the missing skip semantics below.
++        try:
++            from sglang.srt.layers.quantization.gguf import (
++                _rocm_gguf_ext_true16_safe as _gguf_vec_skips_negative_ids,
++            )
++        except ImportError:
++            _gguf_vec_skips_negative_ids = lambda: False  # noqa: E731
++        if (
++            not self.kt_all_cpu
++            and type(gpu_method).__name__ == "GGUFMoEMethod"
++            and not _gguf_vec_skips_negative_ids()
++        ):
+             raise ValueError(
+                 "--kt-num-gpu-experts must be 0 with --quantization gguf: the "
+                 "GGUF decode kernel ggml_moe_a8_vec has no skip semantics for "
