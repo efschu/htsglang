@@ -422,6 +422,27 @@ COPY_SERIAL = "serial"
 COPY_SM = "sm"
 
 
+#: 01.10. (y6k legs): the collector's pipelining. LAG = it syncs and frees
+#: one batch behind like the depositor (ring >= 3); PREPLAN = its copy list
+#: and pointer probes are built for the whole tag before the first credit.
+ENV_COLLECT_LAG = "SGLANG_WEG2_BAR1_COLLECT_LAG"
+ENV_COLLECT_PREPLAN = "SGLANG_WEG2_BAR1_COLLECT_PREPLAN"
+_SEQ_MARK = "\x00seq\x00"
+
+
+def _env_on(name: str, env: Optional[_Map[str, str]] = None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(name, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def collect_lag_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_COLLECT_LAG, env)
+
+
+def collect_preplan_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_COLLECT_PREPLAN, env)
+
+
 def parallel_copy_on() -> bool:
     from sglang.srt.environ import envs
     return bool(envs.SGLANG_WEG2_LANE_PARALLEL_COPY.get())
@@ -1414,11 +1435,25 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={seq} bytes={total} "
         f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring} credits={via}")
     nb = len(batches)
-    lag = (1 if role == "src" else 0) if int(ring) >= 3 else 0
+    # 01.10. (y6k, credit_ms 50 % of the P->D deposit time): the collector now
+    # syncs one behind as well. Safe for ring >= 3: a depositor at batch h waits
+    # free(h - ring) <= h - 3, and a collector at full(h - 2) has freed h - 3.
+    lag = (1 if (role == "src" or collect_lag_on()) else 0) if int(ring) >= 3 else 0
     from sglang.srt.weg2 import weight_exchange_transport as tp
 
     probe = tp.dst_pointer_probe(ops) if role == "dst" else None
     probed: set = set()
+    # 01.10.: the collector's per-piece work (no-write filter, the x33 pointer
+    # probe, the address arithmetic) is done for the whole tag here, before the
+    # plan arrives -- measured issue_ms up to 140 ms of a 151-ms collect
+    # (TP0 p4 11-weights_14) while its depositor sat 598 ms in credit_ms.
+    pre = None
+    pre_why = ""
+    prep_s = 0.0
+    if role == "dst" and collect_preplan_on():
+        tp0 = time.perf_counter()
+        pre, pre_why = _collect_plan(batches, descs, _nw, probe, probed, lane_key, tp)
+        prep_s = time.perf_counter() - tp0
     plan = [[[str(getattr(descs[pc.desc_index], "param_name", "?")),
               str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
              for pc in b.pieces] for b in batches]
@@ -1600,6 +1635,20 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             if got is None:
                 return (f"bar1 collect lane={lane_key} seq={seq}: no 'full' for batch {g} "
                         f"within {budget_s:.0f} s (depositor gone or stuck)")
+            if pre is not None:
+                for kind, dst, soff, a, b, c in pre[g]:
+                    if kind == tp.FLAT:
+                        ops.memcpy_async(dst, sbase + soff, a, stream)
+                    else:
+                        ops.memcpy2d_async(dst, a, sbase + soff, b, b, c, stream)
+                clk.issue += time.perf_counter() - ti
+                if pre_why and g == len(pre) - 1:
+                    # the refused piece's batch: everything before it is out,
+                    # the refused destination never touched (fnFL2x33)
+                    return pre_why.replace(_SEQ_MARK, str(seq))
+                if g >= lag:
+                    _finish(g - lag)
+                continue
             for piece in batch.pieces:
                 desc = descs[piece.desc_index]
                 name = str(getattr(desc, "param_name", "?"))
@@ -1678,5 +1727,42 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"batches={nb} bytes={total} total_ms={total_s * 1000:.0f} "
         f"wait_ms={clk.credit * 1000:.0f} copy_sync_ms={clk.sync * 1000:.0f} "
         f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
-        f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f}")
+        f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
+        f"lag={lag} prep_ms={prep_s * 1000:.0f}")
     return ""
+
+
+def _collect_plan(batches, descs, no_write, probe, probed, lane_key, tp):
+    """The collector's copy list for the whole tag, built before its first
+    credit: per batch ``(kind, dst, slot_off, a, b, c)`` -- FLAT: a = nbytes;
+    STRIDED2D: a = dpitch, b = run_bytes, c = rows. No-write units are
+    dropped, every destination is probed once (fnFL2x33). Returns
+    (plan, "") or, on a refused piece, (plan cut AT that piece, refusal):
+    the last row holds the pieces of its batch before it, so the collector
+    copies exactly what the per-piece path copied and then refuses. The
+    refusal carries ``_SEQ_MARK`` for the caller's seq."""
+    out = []
+    for g, batch in enumerate(batches):
+        row = []
+        out.append(row)
+        for piece in batch.pieces:
+            desc = descs[piece.desc_index]
+            name = str(getattr(desc, "param_name", "?"))
+            tag = str(getattr(desc, "tag", "") or "")
+            if (tag, name) in no_write or name in no_write:
+                continue
+            if desc.dst_ptr is None:
+                return out, (f"bar1 collect lane={lane_key} batch {g}: desc {name!r} "
+                             f"carries no dst_ptr")
+            _why = tp.refuse_unmapped_dst(probe, probed, dst=int(desc.dst_ptr),
+                                          lane_key=lane_key, i=piece.desc_index,
+                                          name=name, tag=tag)
+            if _why:
+                return out, f"bar1 seq={_SEQ_MARK} batch {g}: {_why}"
+            dst = int(desc.dst_ptr) + int(piece.dst_off)
+            if piece.kind == tp.FLAT:
+                row.append((tp.FLAT, dst, int(piece.slot_off), int(piece.nbytes), 0, 0))
+            else:
+                row.append((piece.kind, dst, int(piece.slot_off), int(piece.dpitch),
+                            int(piece.run_bytes), int(piece.rows)))
+    return out, ""
