@@ -38,6 +38,14 @@ An admission never reads while the H32 ring has a read in flight, and an
 admission read in flight is joined before H32 submits anything
 (``PlePreadProcs`` carries one read at a time).
 
+THE HINT'S WINDOW (1001). The front's hint does not know where P's first
+chunk will start (PP0's told does, ~150 ms before the forward), so it reads
+the prompt's last ``chunk_size`` tokens (:func:`ple_hint_start`); a later
+exact admission (told, intake) whose chunk lies inside that window RE-KEYS it
+(:meth:`PleAdmitPrefetchGather._rekey`: the chunk's rows are used at their
+offset in the slot, ``_Pending.off``) instead of dropping it, and exact
+admissions wait ahead of hints.
+
 ``SGLANG_QWEN4_PLE_PREFETCH_ADMIT=0`` keeps H32 exactly as it was (two slots,
 no admission). Off on group D (its leg-2 requests arrive with the prefix
 cached; a first-chunk read from token 0 would be read for nothing).
@@ -74,7 +82,7 @@ _BATCH: tuple = ()
 class _Admission:
     __slots__ = (
         "rid", "tokens", "t_admit", "source", "dormant", "ids", "vocab",
-        "seq", "t_submit", "read_s", "joined", "orphan", "start", "lead",
+        "seq", "t_submit", "read_s", "joined", "orphan", "start", "lead", "row_off",
     )
 
     def __init__(self, rid: str, tokens: torch.Tensor, t_admit: float, source: str, dormant: bool,
@@ -93,6 +101,8 @@ class _Admission:
         self.read_s = 0.0
         self.joined = False
         self.orphan = False
+        #: the first row of ``ids`` in the admission slot (a re-keyed window)
+        self.row_off = 0
 
 
 # --------------------------------------------------------------------------
@@ -169,13 +179,35 @@ def admit_ple_request(
 
 def admit_ple_hint(rid: str, input_ids, chunk_size: Optional[int], *, dormant: bool = False) -> Optional[str]:
     """The front's hint (``PlePrefetchHintReqInput``): the same as an intake,
-    for a request that has not reached this scheduler yet."""
+    for a request that has not reached this scheduler yet -- but reading the
+    prompt's TAIL window (:func:`ple_hint_start`), not its first chunk."""
     if not _SINKS or not input_ids:
         return None
+    start = ple_hint_start(len(input_ids), chunk_size)
     verdict = None
     for sink in list(_SINKS):
-        verdict = sink.admit(str(rid), input_ids, chunk_size, dormant=dormant, source="hint")
+        verdict = sink.admit(str(rid), input_ids, chunk_size, dormant=dormant, source="hint", start=start)
     return verdict
+
+
+def ple_hint_start(n: int, chunk_size: Optional[int]) -> int:
+    """Where the hint's read window starts: the last ``chunk_size`` tokens.
+
+    1001 (NF bfpgwv ...dauer10011823 and three later boots): 0 of 69 hinted
+    requests ever used their hint. Every one was read from token 0, and P's first
+    chunk after a D->P flip starts behind the store prefix PP0's told names
+    (``told ... start=84544`` for a 94234-token prompt) -- the hint was then
+    dropped (logged as ``tokens_differ``), its 262144 rows read for nothing,
+    and the told's own read started ~150 ms before the forward
+    (``ready=no``). The hint cannot know the told; the store prefix of an
+    agent turn reaches into the last chunk (52 of 65 hinted requests: the
+    rest behind the told was shorter than one chunk), so the tail window
+    holds the real first chunk and the told RE-KEYS the read
+    (:meth:`PleAdmitPrefetchGather._rekey`). A prompt of at most one chunk
+    reads it whole, exactly as before."""
+    n = int(n)
+    size = int(chunk_size) if chunk_size and int(chunk_size) > 0 else n
+    return max(0, n - size)
 
 
 def drop_ple_admission(rid: Optional[str], *, abort_all: bool = False, reason: str = "abort") -> int:
@@ -204,7 +236,7 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
         self._hash_warm = False
         self._lock = threading.RLock()
         self.stats.update({"admits": 0, "admit_started": 0, "admit_used": 0,
-                           "admit_dropped": 0, "admit_settle_s": 0.0})
+                           "admit_dropped": 0, "admit_settle_s": 0.0, "admit_rekeyed": 0})
         _SINKS.append(self)
 
     # -- parent hooks ----------------------------------------------------------
@@ -351,18 +383,30 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
             if known.start == start and torch.equal(known.tokens, tokens):
                 logger.info("PLE-PREFETCH admit rid=%s confirmed source=%s (admitted by %s)", rid, source, known.source)
                 return "confirmed"
-            self.drop(rid, abort_all=False, reason="tokens_differ")
+            if self._rekey(known, start, lead, tokens, source):
+                return "rekeyed"
+            # 1001: a different start was logged as tokens_differ -- the
+            # hint's token-0 window against the told's offset, every time
+            self.drop(rid, abort_all=False, reason="tokens_differ" if known.start == start else "start_moved")
         if self._last_vocab is None or not self._hash_ready():
             logger.info("PLE-PREFETCH admit rid=%s skipped: no prefill gather in this process yet "
                         "(hash constants and vocab range unknown)", rid)
             return "skipped:cold"
         w = self._ensure_workers()
         self._pump(w)  # stale admissions leave first
+        if len(self._adm_queue) >= PLE_ADMIT_QUEUE_MAX and source != "hint":
+            # an exact admission (its forward is next) displaces the newest
+            # waiting hint (a request that is still to come)
+            hints = [r for r, a in self._adm_queue.items() if a.source == "hint"]
+            if hints:
+                self._adm_queue.pop(hints[-1])
+                self._log_drop(hints[-1], "displaced_by_exact")
         if len(self._adm_queue) >= PLE_ADMIT_QUEUE_MAX:
             logger.info("PLE-PREFETCH admit rid=%s skipped: %d admissions already waiting", rid, len(self._adm_queue))
             return "skipped:queue_full"
         adm = _Admission(rid, tokens, _clock(), source, dormant, start=start, lead=lead)
         self._adm_queue[rid] = adm
+        self._exact_first()
         self._pump(w)
         if self._adm is adm:
             return "started"
@@ -372,6 +416,58 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
                         rid, source, int(adm.dormant), int(tokens.numel()) - lead, start)
             return "queued"
         return "skipped:small"
+
+    def _rekey(self, known: _Admission, start: int, lead: int, tokens: torch.Tensor, source: str) -> bool:
+        """1001: the chunk an exact admission names (told / intake) lies inside
+        the window ``known`` already read (or is reading) -- the hint's tail
+        window. Its rows stay where they are: ``ids`` becomes the chunk's
+        slice of the window and ``row_off`` its first row in the slot, so the
+        forward's join compares and copies exactly the chunk's rows. Only for
+        a read that was started; the tokens of the chunk (with its lead, so
+        every n-gram context) must equal the window's. No re-read, no copy."""
+        if known.ids is None or known.seq is None or known.orphan:
+            return False
+        base = known.start - known.lead  # absolute index of known.tokens[0]
+        s0 = start - lead
+        end = s0 + int(tokens.numel())
+        known_end = base + int(known.tokens.numel())
+        if start < known.start or s0 < base or end > known_end or end <= start:
+            return False
+        if not torch.equal(known.tokens[s0 - base: end - base], tokens):
+            return False
+        span = known_end - known.start
+        rows = int(known.ids.numel())
+        if span <= 0 or rows % span:
+            return False
+        per = rows // span
+        off, cnt = (start - known.start) * per, (end - start) * per
+        if cnt < self.min_rows:
+            return False  # what _start skips as small
+        old = known.start
+        known.ids = known.ids[off: off + cnt]
+        known.row_off += off
+        known.start, known.lead, known.tokens = start, lead, tokens
+        self.stats["admit_rekeyed"] += 1
+        logger.info(
+            "PLE-PREFETCH admit rid=%s rekeyed source=%s (admitted by %s) start=%d->%d rows=%d row_off=%d "
+            "ready=%s: the chunk lies inside the read window, its rows are used where they are",
+            known.rid, source, known.source, old, start, cnt, known.row_off,
+            "yes" if known.joined or (self._workers is not None and self._workers.ready(known.seq)) else "no",
+        )
+        return True
+
+    def _exact_first(self) -> None:
+        """Waiting admissions in reading order: exact ones (intake, told --
+        their forward is next) before hints (requests still to come), each
+        group in arrival order. bfpgwv 19:12:21: weg2-42-307's told waited
+        behind weg2-42-308's hint, was served before its read started and
+        gathered cold (ready=none wait_ms=817.3)."""
+        q = self._adm_queue
+        if any(a.source == "hint" for a in q.values()):
+            items = list(q.items())
+            q.clear()
+            q.update([kv for kv in items if kv[1].source != "hint"])
+            q.update([kv for kv in items if kv[1].source == "hint"])
 
     def _pump(self, w) -> None:
         """Start the oldest waiting admission if the admission slot is free
@@ -453,15 +549,15 @@ class PleAdmitPrefetchGather(_pf.PlePrefetchGather):
             if first[1] == adm.start and self._pending is None and adm.vocab == self._last_vocab:
                 self._adm = None
                 ready = adm.joined or w.ready(adm.seq)
-                self._pending = _pf._Pending(adm.seq, PLE_ADMIT_SLOT, adm.ids, adm.vocab)
+                self._pending = _pf._Pending(adm.seq, PLE_ADMIT_SLOT, adm.ids, adm.vocab, adm.row_off)
                 self.stats["admit_used"] += 1
                 now = _clock()
                 logger.info(
                     "PLE-PREFETCH admit rid=%s rows=%d queued_ms_before_forward=%.1f "
-                    "read_started_ms_before_forward=%.1f ready=%s source=%s dormant=%d",
+                    "read_started_ms_before_forward=%.1f ready=%s source=%s dormant=%d row_off=%d",
                     adm.rid, int(adm.ids.numel()), (now - adm.t_admit) * 1000.0,
                     (now - adm.t_submit) * 1000.0, "yes" if ready else "no",
-                    adm.source, int(adm.dormant),
+                    adm.source, int(adm.dormant), adm.row_off,
                 )
                 return
             reason = ("cached_prefix" if first[1] > adm.start else "start_moved") if first[1] != adm.start else (
