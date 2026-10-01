@@ -439,11 +439,22 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     parked = list(getattr(sched, "weg2_d_parked", None) or [])
     if not parked:
         return 0
-    sched._weg2_d_park_slept = True
     if not hold_armed:
+        # the list stays parked over the sleep: the first awake pass re-queues it
+        sched._weg2_d_park_slept = True
         logger.info("WEG2-D-PARK hold: SGLANG_WEG2_DORMANT_ADMIT off -- %d parked request(s) "
                     "wait for the wake", len(parked))
         return 0
+    # DRAIN-W50 (z30y12 epoch 51, 19.6 s drain): the hold takes the WHOLE list,
+    # nothing stays parked for park_tick to re-queue -- so no "slept" mark. Set
+    # here before, it outlived the list (park_tick returns early on an empty
+    # one and never cleared it): the phase's FIRST W50 midstream hold
+    # (resume_via_p.keep_on_d, rid weg2-35-112 23:35:46) was re-queued in the
+    # same pass, re-admitted on D and decoded to its end (19.2 s) while the
+    # front, told it was held, sat in quiesce. Metal: 6 of 6 first-after-wake
+    # W50 holds of that boot were re-queued at once, the second one of a phase
+    # (weg2-62-182) held.
+    sched._weg2_d_park_slept = False
     sched.weg2_d_parked = []
     for req in parked:
         # PARK-SETTLE: held over the sleep, a folded settle request is hold work
