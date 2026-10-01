@@ -33,7 +33,7 @@ Environment=MEMFRAC=0.92
 # 16 GDN state slots x 75 MB (measured: 4 slots = 0.29 GB ssm + 0.01 GB conv) =
 # 1.2 GB: 2 running requests x (active + ping-pong) + 12 prefix anchors, so omp side
 # requests (title etc.) no longer evict the main conversation's anchor (01.10. 15:31).
-Environment=MAMBASLOTS=16
+Environment=MAMBASLOTS=8
 # Two concurrent requests (omp title request beside the main turn); the KV pool
 # stays at one full context -- the RAM budget was computed for that.
 Environment=MAXRUN=2
@@ -65,7 +65,7 @@ Environment=HICACHE_RATIO=0.15
 # 13:59 acceptance hit with (16896 cached tokens).
 # 0.25 = 4 host slots (0.3 GB pinned): swap reached 4.1 GB with 0.5 under test load
 # (operator rule: lower the host ratio, not the 16 device slots).
-Environment=SGLANG_HICACHE_MAMBA_HOST_RATIO=0.5
+Environment=SGLANG_HICACHE_MAMBA_HOST_RATIO=1.5
 # ENERGY (user: nothing may spin while idle on a laptop). Measured loaded and
 # idle: the scheduler thread busy-polls at 99.6 % CPU, package 15.5 W. The
 # sleep-on-idle mechanism (IdleSleeper, zmq poll with a timeout ladder) is the

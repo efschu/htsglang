@@ -136,6 +136,12 @@ def sample():
                                 ("request_process", "chunked_prefill", "prefill_forward")) / c) if c else None
         s["kv"] = {"token_usage": met.get("sglang:num_used_tokens", 0) / max(1.0, met.get("sglang:max_total_num_tokens", 1)),
                    "running": met.get("sglang:num_running_reqs"),
+                   # prefix cache content (the log's "usage" figures EXCLUDE these)
+                   "mamba_evictable": met.get("sglang:mamba_evictable_tokens"),
+                   "mamba_available": met.get("sglang:mamba_available_tokens"),
+                   "kv_evictable": met.get("sglang:kv_evictable_tokens"),
+                   "host_used": met.get("sglang:hicache_host_used_tokens"),
+                   "host_total": met.get("sglang:hicache_host_total_tokens"),
                    "queued": met.get("sglang:num_queue_reqs"), "cache_hit_rate": met.get("sglang:cache_hit_rate"),
                    "gen_throughput": met.get("sglang:gen_throughput")}
     return s
@@ -166,6 +172,7 @@ card("Decode",f(r.decode_tok_s)+" tok/s",`gen_throughput ${f(kv.gen_throughput)}
 card("Prefill",f(r.prefill_tok_s)+" tok/s","Prompt-Token je s (letztes Intervall)")+
 card("TTFT",f(r.ttft_s_interval??s.ttft_mean_s,2)+" s",(r.ttft_s_interval!=null?"letztes Intervall":"Mittel seit Laden")+" · Server-seitig, ohne Warteschlange")+
 card("KV-Belegung",kv.token_usage==null?"–":f(100*kv.token_usage)+" %",`KV-Plätze ${sv.kv_tokens??"–"} · Cache-Treffer ${kv.cache_hit_rate==null?"–":f(100*kv.cache_hit_rate)+" %"}`)+
+card("Präfix-Cache",(kv.kv_evictable==null?"–":f(kv.kv_evictable,0))+" Token",`Mamba-Anker Gerät ${kv.mamba_evictable??"–"} (frei ${kv.mamba_available??"–"}) · Host-KV ${kv.host_used??"–"}/${kv.host_total??"–"}`)+
 card("Paket (CPU+iGPU)",f(s.package_w)+" W",`amdgpu Socket ${f(s.gpu?.socket_w)} W · Profil ${s.profile}`)+
 card("iGPU",f(s.gpu?.busy_pct,0)+" %",`${f(s.gpu?.temp_c,0)} °C · ${s.gpu?.sclk||"–"}`)+
 card("CPU",f(s.cpu?.busy_pct)+" %",`${f(s.cpu?.temp_c,0)} °C`)+
