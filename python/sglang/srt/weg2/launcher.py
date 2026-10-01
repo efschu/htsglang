@@ -18493,6 +18493,16 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         raise Weg2LaunchRefused(plan.refusal)
     _lru_add = getattr(ns, "_d_kv_stage_lru_raise", None)
     ns._d_kv_stage_lru_raise = None
+    _own_add = {r: int(k) for r, k in enumerate(getattr(plan, "owned_scratch_raise", ()) or ())
+                if int(k) > 0}
+    if _own_add:
+        # 01.10. (y6n): the owned solve's wave floor needs these scratch rows
+        # (rows from resident to scratch, FR_D already solved with them) --
+        # the same raise-and-solve-again as the #251c LRU floor
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM GRENZEN: Wellenboden braucht Scratch "
+            + ", ".join("rang%d +%d" % (r, k) for r, k in sorted(_own_add.items())))
+        _lru_add = {r: max(int((_lru_add or {}).get(r, 0)), int(_own_add.get(r, 0)))
+                    for r in set(_lru_add or {}) | set(_own_add)}
     if _lru_add:
         # (3) 29.09.: a KV rank's LRU falls below its measured peak at an
         # allowed stage -- raise its scratch and solve again, so the planner

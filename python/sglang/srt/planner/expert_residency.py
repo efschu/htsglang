@@ -1227,6 +1227,17 @@ class OwnedCut(msgspec.Struct, frozen=True, kw_only=True):
     bs_weights: Tuple[Tuple[int, float], ...] = ()
     objective_ms: float = 0.0
     base_objective_ms: float = 0.0
+    #: 01.10. (y6n, Koordinator): candidates the hard limits refused (pool
+    #: step, wave floor at the wave cap, top KV stage -- :func:`owned_wave_floor`),
+    #: the limits they were held to, and whether the solve kept the base
+    #: ownership because the best other one gained less than ``switch_gain``
+    guard_refused: int = 0
+    guard: Tuple[Tuple[str, object], ...] = ()
+    stayed: bool = False
+    best_other_objective_ms: float = 0.0
+    #: scratch rows per rank the chosen form needs on top of the given ones
+    #: for the wave floor (:func:`owned_scratch_raise`); empty = none
+    scratch_raise: Tuple[int, ...] = ()
 
 
 def owned_miss_rows(fit: "DRankResidency", *, num_experts: int, ids_per_step: int) -> float:
@@ -1448,6 +1459,11 @@ def solve_owned_cut(
     miss_ms_rank: Optional[Sequence[float]] = None,
     x1_bs: Sequence[int] = OWNED_X1_BS,
     heat: Optional[Sequence[float]] = None,
+    seats_cap: int = 0,
+    waves_cap: int = 0,
+    stage_tokens: int = 0,
+    stage_row_bytes: int = 0,
+    switch_gain: float = 0.0,
 ) -> OwnedCut:
     """#239 S3f: ownership, token cut and FR_D in one solve.
 
@@ -1477,6 +1493,14 @@ def solve_owned_cut(
     ``x1_bs`` ("nothing slows bs1/bs2"). ``miss_ms_rank`` prices each rank at
     its own card's measured cost per missed row. Without both the solve is
     the bs1 solve as before.
+
+    01.10. (y6n, Koordinator): with ``seats_cap`` and ``waves_cap`` every
+    candidate must hold :func:`owned_wave_floor` -- the pool step and the
+    wave floor at the line's wave cap with the top KV stage
+    (``stage_tokens`` above S0 at ``stage_row_bytes`` per stage row) mapped;
+    a form that needs more waves or a lower top stage is not tragbar. With
+    ``switch_gain`` > 0 the solve keeps the base ownership unless the best
+    other one is more than that fraction faster (weighted round).
     """
     base = tuple(int(x) for x in base_ratios)
     if bs_weights:
@@ -1497,7 +1521,8 @@ def solve_owned_cut(
             E, S = int(f.local_experts), int(f.scratch_rows)
             frac = largest_fraction_for_rows(local_experts=E, scratch_rows=S, max_rows=rows)
             out.append(_EdgeFit(rank=f.rank, local_experts=E, scratch_rows=S,
-                                ceiling_max_rows=rows, ceiling_fraction=frac))
+                                ceiling_max_rows=rows, ceiling_fraction=frac,
+                                trim_cell=_edge_trim_cell(f, host)))
         return tuple(out)
 
     n = len(base)
@@ -1560,9 +1585,21 @@ def solve_owned_cut(
                 memo[k] = (f, {b: by[b][i] for b in _bss})
         return [memo[k] for k in keys]
 
+    guard_on = int(seats_cap) > 0 and int(waves_cap) > 0
+    guard_refused = 0
+
+    def _raise_of(fits):
+        return owned_scratch_raise(
+            fits, ids_cap=int(ids_per_step) * int(seats_cap), waves=int(waves_cap),
+            stage_tokens=int(stage_tokens), stage_row_bytes=int(stage_row_bytes))
+
     def _verdict(fits, by):
+        nonlocal guard_refused
         if any(f.ceiling_fraction is None or f.ceiling_max_rows < f.scratch_rows + 2
                for f in fits):
+            return None
+        if guard_on and _raise_of(fits) is None:
+            guard_refused += 1
             return None
         x1 = not any(by[b][w] > base_by[b][w] + 1e-9 for b in _x1_bss for w in workers)
         if not x1 and not forced and x1_scope != "round":
@@ -1607,24 +1644,60 @@ def solve_owned_cut(
             best = (exact_key, rat, sh, fits, by)
         if best is not None and best[0][:3] <= key[:3]:
             break  # no later estimate can beat the exact best
+    stayed = False
+    other_obj = 0.0
+    if best is not None and float(switch_gain) > 0 and tuple(best[1]) != base:
+        # the best form that keeps the base ownership (any cut): the vector
+        # moves only for more than switch_gain of the weighted round
+        stay = None
+        for key in ranked:
+            if tuple(key[4]) != base:
+                continue
+            fits_s, by_s = _exact(key[4], key[5])
+            x1_s = _verdict(fits_s, by_s)
+            if x1_s is None:
+                continue
+            k_s = _key(x1_s, by_s, key[3], key[4], key[5])
+            if k_s[0] > best[0][0]:
+                continue  # x1 lost: never trade x1 for staying
+            stay = (k_s, key[4], key[5], fits_s, by_s)
+            break
+        if stay is not None:
+            other_obj = _objective(best[4])
+            if other_obj > _objective(stay[4]) * (1.0 - float(switch_gain)):
+                best, stayed = stay, True
     elapsed = _time.monotonic() - t0
     _bs_rec = tuple(_bsw) if bs_weights else ()
     _base_by_t = tuple((b, tuple(base_by[b])) for b in _bss)
+    _guard = ((("seats", int(seats_cap)), ("waves", int(waves_cap)),
+               ("stage_tokens", int(stage_tokens)), ("stage_row_bytes", int(stage_row_bytes)))
+              if guard_on else ())
     if best is None:
         return OwnedCut(ratios=(), cut=(), fractions=(), fits=(), round_ms=(),
                         base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=0,
                         solves=solves, elapsed_s=round(elapsed, 2),
                         base_round_ms_by_bs=_base_by_t, bs_weights=_bs_rec,
-                        base_objective_ms=_objective(base_by))
+                        base_objective_ms=_objective(base_by), guard_refused=guard_refused,
+                        guard=_guard)
     key, rat, sh, fits, by = best
     fr = tuple(float(f.ceiling_fraction) for f in fits)
+    raise_ = _raise_of(fits) if guard_on else None
+    if raise_ is not None and any(raise_):
+        # the rows stay, the split moves: FR_D at the edge with the raised
+        # scratch (the miss model prices rows, not the split -- T_r unchanged)
+        fr = tuple(float(largest_fraction_for_rows(
+            local_experts=int(f.local_experts), scratch_rows=int(f.scratch_rows) + int(a),
+            max_rows=int(f.ceiling_max_rows)) or 0.0) for f, a in zip(fits, raise_))
     return OwnedCut(ratios=tuple(rat), cut=tuple(sh), fractions=fr, fits=(), round_ms=by[1],
                     base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=feas,
                     forced=forced, x1_ok=key[0] == 0, solves=solves,
                     elapsed_s=round(elapsed, 2),
                     round_ms_by_bs=tuple((b, tuple(by[b])) for b in _bss),
                     base_round_ms_by_bs=_base_by_t, bs_weights=_bs_rec,
-                    objective_ms=_objective(by), base_objective_ms=_objective(base_by))
+                    objective_ms=_objective(by), base_objective_ms=_objective(base_by),
+                    guard_refused=guard_refused, guard=_guard, stayed=stayed,
+                    best_other_objective_ms=other_obj,
+                    scratch_raise=tuple(raise_) if raise_ is not None and any(raise_) else ())
 
 
 class OwnedBase(msgspec.Struct, frozen=True, kw_only=True):
@@ -1760,6 +1833,118 @@ class _EdgeFit(NamedTuple):
     scratch_rows: int
     ceiling_max_rows: int
     ceiling_fraction: Optional[float]
+    #: bytes per global token a KV stage above S0 maps on this rank
+    #: (:func:`kv_stage_trim_cell`; 0 = no KV here)
+    trim_cell: int = 0
+
+
+def _edge_trim_cell(fit, host: int) -> int:
+    """:func:`kv_stage_trim_cell` for a budget fit that may not carry the KV
+    fields (the owned solve's test edges): 0 then."""
+    if int(fit.rank) == int(host):
+        return int(getattr(fit, "kv_cell_bytes", 0) or 0)
+    return int(getattr(fit, "kv_stage_cell_bytes", 0) or 0)
+
+
+#: 01.10. (y6n): the gain the owned solve needs over the base ownership
+#: before it moves the vector -- 3 % of the binding (weighted) miss time; a
+#: smaller gain is inside the boot-to-boot spread and keeps the base
+OWNED_SWITCH_GAIN = 0.03
+
+
+def owned_wave_floor(
+    fits: Sequence["_EdgeFit"], *, ids_cap: int, waves: int, stage_tokens: int = 0,
+    stage_row_bytes: int = 0,
+) -> Tuple[str, ...]:
+    """01.10. (y6n, Koordinator): the hard limits of a D form the owned solve
+    may pick, ONE formula with the launcher's #239 S3g floor
+    (``launcher.rank_wave_floor`` over ``kv_stage_table``): at the seat cap a
+    captured step routes D_r = min(ids_cap, E - R) ids over the rank's rows at
+    the TOP KV stage, C_r - ceil(stage_tokens x trim_cell / stage_row), in at
+    most ``waves`` waves (the H95 cap the line runs, not a raised one). A rank
+    without KV keeps its whole scratch (the H95 pool step, D <= W x C). The
+    stage rows below the top cancel (the floor rows fund themselves), so the
+    top stage alone decides whether every seat count reaches it.
+
+    y6n (desk/nf-y6n-1001 @ b0bf738b39, dry run 20:18Z): 190,127,171 / cut
+    0,52,12 gave TP1 E 134, R 64, C 44, trim cell 9984 B -> 21 rows at
+    524288 tokens, D 70 > 2 x 21: four waves and the top stage 7 (262144
+    tokens) for the whole group. Returns one entry per breaking rank."""
+    out = []
+    for f in fits:
+        E, C = int(f.local_experts), int(f.scratch_rows)
+        R = max(int(f.ceiling_max_rows) - C, 0)
+        d = min(int(ids_cap), max(E - R, 0))
+        cell = int(getattr(f, "trim_cell", 0) or 0)
+        stage = (-(-int(stage_tokens) * cell // int(stage_row_bytes))
+                 if cell > 0 and int(stage_tokens) > 0 and int(stage_row_bytes) > 0 else 0)
+        cap = C - stage
+        if cap <= 0 or d > int(waves) * cap:
+            out.append("rang%d D %d > %d x (%d - %d Stufenzeilen) = %d"
+                       % (int(f.rank), d, int(waves), C, stage, int(waves) * max(cap, 0)))
+    return tuple(out)
+
+
+def owned_scratch_raise(
+    fits: Sequence["_EdgeFit"], *, ids_cap: int, waves: int, stage_tokens: int = 0,
+    stage_row_bytes: int = 0,
+) -> Optional[Tuple[int, ...]]:
+    """01.10. (y6n): the scratch each rank needs so that :func:`owned_wave_floor`
+    holds at its edge -- the rows stay (budget and card fix ``R + S``), the
+    split moves from resident to scratch, as the #251c LRU floor does
+    (``launcher`` "der Planer senkt FR_D, die Zeilen gehen von resident nach
+    Scratch"). Per rank the smallest C >= the given scratch with
+    min(ids_cap, E - rows + C) <= W x (C - stage rows), i.e.
+    C >= min(ceil((E - rows + W x stage) / (W - 1)), stage + ceil(ids_cap / W));
+    returns the raise per rank (0 = holds as given), None when a rank cannot
+    hold it with R >= 0 (the form is not tragbar at this wave cap)."""
+    W = int(waves)
+    out = []
+    for f in fits:
+        E, C, rows = int(f.local_experts), int(f.scratch_rows), int(f.ceiling_max_rows)
+        cell = int(getattr(f, "trim_cell", 0) or 0)
+        stage = (-(-int(stage_tokens) * cell // int(stage_row_bytes))
+                 if cell > 0 and int(stage_tokens) > 0 and int(stage_row_bytes) > 0 else 0)
+        gap = E - rows
+        c2 = stage + -(-int(ids_cap) // max(W, 1))
+        if W > 1:
+            c1 = -(-(gap + W * stage) // (W - 1))
+        else:
+            c1 = 0 if gap + stage <= 0 else c2
+        need = max(C, min(c1, c2), stage + 1)
+        if need > rows or need > E:
+            return None
+        out.append(need - C)
+    return tuple(out)
+
+
+def owned_form_limits(env_d: Mapping[str, str], *, text_cfg: Mapping[str, object], terms,
+                      seats: Optional[int], kv_tokens: int, rank_tp_ratio: str,
+                      n_ranks: int) -> Dict[str, int]:
+    """01.10. (y6n): the hard limits :func:`solve_owned_cut` holds every
+    candidate to, from what the line runs: the seat cap, the H95 wave cap of
+    --env-d (``SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES``, the derived 2 on
+    nextflash -- never a raised one), and with the H95c seat VRAM armed the
+    top KV stage (S0 + S0 x the last stage step, ``kv_stage_group``'s
+    default) at the stage row the runtime unmaps (expert row minus its
+    scales, :func:`seat_vram_form`)."""
+    out = {"seats_cap": int(seats or 1), "waves_cap": int(pool_overflow_waves(env_d or {}))}
+    armed = str((env_d or {}).get("SGLANG_OPT_WEG2_D_SEAT_VRAM", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+    row = float(getattr(terms, "expert_layer_weight_bytes", 0.0) or 0.0) / max(
+        1, int(getattr(terms, "num_experts", 0) or 0))
+    if armed and row > 0:
+        form = seat_vram_form(text_cfg, ssm_dtype=None, rank_tp_ratio=str(rank_tp_ratio or ""),
+                              n_ranks=int(n_ranks), expert_row_bytes=row,
+                              moe_layers=int(terms.n_layers))
+        small = int(form.small_row_bytes) if form is not None else 0
+        out["stage_tokens"] = int(round(int(kv_tokens) * float(KV_STAGE_TOP_STEP)))
+        out["stage_row_bytes"] = (int(round(row)) - small) * int(terms.n_layers)
+    return out
+
+
+#: the last stage step of ``kv_stage_group`` (S0 x (1 + 1.0) = the top stage)
+KV_STAGE_TOP_STEP = 1.0
 
 
 def solve_d_rank_residency(
@@ -2584,6 +2769,10 @@ class DResidencyPlan(msgspec.Struct, frozen=True, kw_only=True):
     solved_owner_ratio: Tuple[int, ...] = ()
     #: #239 S3f: vorher/nachher fuer den Record (leer = kein owned-Solve).
     owner_record: Tuple[Tuple[str, object], ...] = ()
+    #: 01.10. (y6n): Scratch-Zeilen je Rang, die die geloeste Form fuer den
+    #: Wellenboden ueber dem gegebenen Scratch braucht (leer = keine); der
+    #: Launcher hebt SGLANG_MOE_SCRATCH_SLOTS und loest neu (#251c-Weg)
+    owned_scratch_raise: Tuple[int, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -4051,6 +4240,7 @@ def plan_d_residency(
     solved_fr: Tuple[float, ...] = ()
     solved_cut: Tuple[int, ...] = ()
     solved_owner: Tuple[int, ...] = ()
+    solved_raise: Tuple[int, ...] = ()
     owner_record: Tuple[Tuple[str, object], ...] = ()
     owner_refusal: Optional[str] = None
     _owned, _forced_shares = owned_cut_request(kv_token_shares)
@@ -4143,12 +4333,40 @@ def plan_d_residency(
                        (" ".join("bs%d %.3f" % (b, w) for b, w in _bs_w) if _bs_w else "nur bs1"),
                        _bs_src, _heat_src),
                 )
-        sol = solve_owned_cut(
-            lambda rat, sh: _solve(sh, None, rat), base_rat, host,
-            num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
-            ids_per_step=ids, miss_ms=_miss_ms, card_rows=_card_rows, fa_layers=fa_layers,
-            rows_per_round=int(verify), forced_shares=_forced_shares,
-            x1_scope=_x1_scope, bs_weights=_bs_w, miss_ms_rank=_miss_rank, heat=_heat)
+        _lim = owned_form_limits(env_d, text_cfg=text_cfg, terms=terms, seats=seats,
+                                 kv_tokens=int(kv_tokens), rank_tp_ratio=rank_tp_ratio,
+                                 n_ranks=len(base_rat))
+
+        def _owned_from(b):
+            return solve_owned_cut(
+                lambda rat, sh: _solve(sh, None, rat), b, host,
+                num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
+                ids_per_step=ids, miss_ms=_miss_ms, card_rows=_card_rows, fa_layers=fa_layers,
+                rows_per_round=int(verify), forced_shares=_forced_shares,
+                x1_scope=_x1_scope, bs_weights=_bs_w, miss_ms_rank=_miss_rank, heat=_heat,
+                switch_gain=OWNED_SWITCH_GAIN, **_lim)
+
+        sol = _owned_from(base_rat)
+        if tuple(int(x) for x in base_rat) != tuple(int(x) for x in _stated_base):
+            # 01.10. (y6n, Koordinator): the derived base wins only when its
+            # FINAL form beats the stated base's final form by more than
+            # OWNED_SWITCH_GAIN of the weighted round -- otherwise the
+            # profile's vector stays (y6n: derive 157,151,180 ended at 134.60
+            # ms against 127.15 from 183,137,168)
+            sol_st = _owned_from(_stated_base)
+            if sol_st.feasible and (not sol.feasible or sol.objective_ms > sol_st.objective_ms
+                                    * (1.0 - OWNED_SWITCH_GAIN)):
+                _base_lines = _base_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM BASIS (01.10.): die abgeleitete Basis %s "
+                    "endet bei %s ms gegen %.2f ms aus --rank-moe-ratio %s (Schwelle %.0f %%) "
+                    "-- Basis bleibt die gesetzte"
+                    % (marker, label, ",".join(str(x) for x in base_rat),
+                       "%.2f" % sol.objective_ms if sol.feasible else "keiner tragbaren Form",
+                       sol_st.objective_ms, ",".join(str(x) for x in _stated_base),
+                       100.0 * OWNED_SWITCH_GAIN),
+                )
+                sol = sol_st
+                base_rat = list(_stated_base)
         owner_record = (
             ("base_ratios", list(sol.base_ratios)),
             ("base_round_ms", [round(x, 3) for x in sol.base_round_ms]),
@@ -4185,10 +4403,15 @@ def plan_d_residency(
             ("objective_ms", round(sol.objective_ms, 3)),
             ("routing", _heat_src),
             ("base_objective_ms", round(sol.base_objective_ms, 3)),
+            ("limits", dict(sol.guard) or None),
+            ("limits_refused", sol.guard_refused),
+            ("stayed_on_base", sol.stayed),
+            ("scratch_raise", list(sol.scratch_raise) or None),
         )
         if sol.feasible:
             ratios = [float(x) for x in sol.ratios]
             solved_owner = tuple(sol.ratios)
+            solved_raise = tuple(sol.scratch_raise)
             solved_fr = tuple(sol.fractions)
             kv_token_shares = tuple(sol.cut)
             solved_cut = tuple(sol.cut)
@@ -4219,6 +4442,24 @@ def plan_d_residency(
                    int(kv_tokens)),
             )
             cut_lines = _base_lines + cut_lines
+            if sol.guard or sol.stayed:
+                _g = dict(sol.guard)
+                cut_lines = cut_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM GRENZEN (01.10., y6n): %s%s"
+                    % (marker, label,
+                       ("Pool-Schritt + Wellenboden bei %d Sitzen, hoechstens %d Wellen, "
+                        "oberste KV-Stufe +%d Token (Stufenzeile %.1f MiB) hart im Solve -- "
+                        "%d Kandidaten verworfen%s" % (
+                            _g.get("seats", 0), _g.get("waves", 0), _g.get("stage_tokens", 0),
+                            _g.get("stage_row_bytes", 0) / MIB, sol.guard_refused,
+                            ("; Scratch je Rang +%s (Zeilen von resident nach Scratch, FR_D oben "
+                             "schon damit)" % list(sol.scratch_raise))
+                            if sol.scratch_raise else ""))
+                       if _g else "ohne harte Grenzen",
+                       ("; Eigentum bleibt %s: beste andere Form %.2f ms gegen %.2f (< %.0f %%)"
+                        % (",".join(str(x) for x in sol.ratios), sol.best_other_objective_ms,
+                           sol.objective_ms, 100.0 * OWNED_SWITCH_GAIN)) if sol.stayed else ""),
+                )
             if sol.bs_weights:
                 cut_lines = cut_lines + (
                     "%s FRACTION-SOLVE %s D-EIGENTUM T_r JE BS (01.10.): %s -- Form A %s; "
@@ -4251,7 +4492,9 @@ def plan_d_residency(
                 "eines Workers gegen Form A (%s ms)"
                 % (marker, label, sol.candidates, ",".join(str(x) for x in sol.base_ratios),
                    OWNED_RATIO_STEP, OWNED_SHARE_STEP,
-                   ["%.2f" % x for x in sol.base_round_ms]))
+                   ["%.2f" % x for x in sol.base_round_ms])
+                + (" -- %d davon an den harten Grenzen verworfen (%s)"
+                   % (sol.guard_refused, dict(sol.guard)) if sol.guard_refused else ""))
             # the derived base is printed even when no cut form carries
             cut_lines = _base_lines
             kv_token_shares = None
@@ -4431,6 +4674,7 @@ def plan_d_residency(
             kv_token_cut=solved_cut,
             solved_owner_ratio=solved_owner,
             owner_record=owner_record,
+            owned_scratch_raise=solved_raise,
         )
     card_lines, cards, card_refusal = _plan_d_card(
         fits=fits,
@@ -4468,6 +4712,7 @@ def plan_d_residency(
         kv_token_cut=solved_cut,
         solved_owner_ratio=solved_owner,
         owner_record=owner_record,
+        owned_scratch_raise=solved_raise,
     )
 
 
