@@ -1526,6 +1526,38 @@ def skip_joinable(req, prefix_len: Optional[int] = None) -> bool:
     return not skip_refusal(entry, req, batch_empty=True)
 
 
+WINDOW_WAIT_MARK = "WEG2-TAIL-WINDOW-WAIT"
+_WINDOW_WAIT_N = [0]
+
+
+def window_above_delivered(req) -> bool:
+    """ZR-2 (01.10.): True when the group agreed a tail for ``req`` whose page
+    anchor lies ABOVE what its store read delivered -- settling the short read
+    now (D prefills the remainder) would throw the agreed END window away and
+    compute [delivered, N) again. Metal y6h weg2-4-14: delivered 67840, agreed
+    window [69824, 71448], '#1471 SETTLE-TAIL ... remainder=3612' released it
+    at the wake, the admission refused the tail ('prefix:67840!in[69824,71448]')
+    and extended 3612. The settle waits for the re-read instead (bounded by the
+    settle clock as before). Rank-uniform: ``_AGREED`` is the group's answer and
+    the delivered prefix is the synced one."""
+    entry = _AGREED.get(str(getattr(req, "rid", "")))
+    if entry is None or not entry.agreed:
+        return False
+    delivered = getattr(req, "_weg2_store_delivered", None)
+    if delivered is None:
+        return False
+    page_prefix = int(entry.staged.spec.page_prefix)
+    if int(delivered) >= page_prefix:
+        return False
+    _WINDOW_WAIT_N[0] += 1
+    n = _WINDOW_WAIT_N[0]
+    if n <= 20 or n % 200 == 0:
+        logger.info("%s rid=%s delivered=%d page_prefix=%d n=%d (an agreed END window above the short "
+                    "read: the settle waits for the re-read instead of computing [%d, N) again)",
+                    WINDOW_WAIT_MARK, req.rid, int(delivered), page_prefix, n, int(delivered))
+    return True
+
+
 SKIP_WAIT_MARK = "WEG2-TAIL-SKIP-WAIT"
 _SKIP_WAIT_N = [0]
 

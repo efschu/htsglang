@@ -1227,6 +1227,10 @@ def _weg2_store_tail_settles(sched, req) -> bool:
     before -- over X (weg2xsn229, 4095 of 98210) the request waits for its read."""
     if not _weg2_store_short_tail_on():
         return False
+    from sglang.srt.weg2 import tail_adopt as _ta_zr2
+
+    if _ta_zr2.window_above_delivered(req):
+        return False  # ZR-2: an agreed END window lies above the short read -- wait for the re-read
     from sglang.srt.weg2 import settle_writer as _sw
 
     if _sw.budget_pending(req):
