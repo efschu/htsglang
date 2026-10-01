@@ -27,8 +27,11 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sched.h>
+#include <signal.h>
 
-#define A_MAGIC 0x41524e4132363931ULL /* "ARNA2691" */
+#define A_MAGIC 0x41524e4132363932ULL /* "ARNA2692" -- ZR-1: SlotHeader carries the writer census */
 #define S_FREE 0u
 #define S_CLAIMED 1u
 #define S_COMPLETE 2u
@@ -51,7 +54,13 @@ typedef struct {
     _Atomic uint64_t clock_hand;
     _Atomic uint64_t n_complete;
     _Atomic uint64_t n_claimed;
-    uint8_t pad[64 - 8 * 11 % 64];
+    /* ZR-1 (y6h 15:36:33): the index takes ONE writer at a time (pid of the
+     * holder, 0 = free) -- see claim_slot. The steal count is the guard's
+     * name: a holder that died inside the critical section. */
+    _Atomic uint32_t index_lock;
+    uint32_t index_lock_pad;
+    _Atomic uint64_t index_lock_steals;
+    uint8_t pad[64 - 8 * 13 % 64];
 } ArenaHeader;
 
 typedef struct { uint64_t lo, hi; } Ival;
@@ -72,6 +81,14 @@ typedef struct {
     uint32_t owner_pid;          /* L3FILL-JOINED (30.09.): pid of the fresh claimant of this generation */
     uint32_t owner_role;         /* its role (arena_set_claim_role; 0 other, 1 l3fill, 2 host-write) */
     _Atomic uint32_t progress_ms; /* ms of the fresh claim or the last MERGE -- a join never moves it */
+    /* ZR-1: the writer census of this generation -- the fresh claimant's
+     * writer tag (arena_set_writer_tag), the tags that joined it and the tags
+     * that merged extents (bit per tag), so a page that never completes names
+     * the writer whose extents are missing */
+    uint32_t owner_tag;
+    _Atomic uint32_t joined_mask;
+    _Atomic uint32_t merged_mask;
+    uint32_t census_pad;
     char stem[192];            /* the store stem, so ANY rank can evict this page to disk */
     Ival ivals[];              /* cap_ivals entries, sorted, disjoint */
 } SlotHeader;
@@ -239,6 +256,68 @@ static int quarantine_release(uint8_t *base, uint64_t slot) {
 static __thread uint32_t tl_claim_role = 0;
 void arena_set_claim_role(uint32_t role) { tl_claim_role = role; }
 
+/* ZR-1: the writer tag of THIS process (process-wide -- every thread of a
+ * rank writes for the same rank), stamped into the census of every slot it
+ * claims, joins or merges. 31 = untagged. */
+static uint32_t g_writer_tag = 31;
+void arena_set_writer_tag(uint32_t tag) { g_writer_tag = tag & 31u; }
+static inline uint32_t writer_bit(void) { return 1u << (g_writer_tag & 31u); }
+
+/* ZR-1 (NF y6h D 15:36:33, weg2-4-14 pages 1067..): ONE index writer at a
+ * time. The index cell of a key was published in two steps -- the key by CAS,
+ * the slot id by a store after it -- and a claimer that lost the CAS moved on
+ * to the NEXT cell. Three D ranks publish the same node at the same moment
+ * (the idle publish is group-synchronous), so a second claimer of the same key
+ * either read the key with the previous occupant's slot id (the 'stale cell'
+ * branch took the cell over) or skipped the cell it had just lost and put the
+ * key into the next empty one. Either way the key got TWO claimed slots, the
+ * writers of one page split between them -- TP1's token rows in one, TP2's in
+ * the other -- and NEITHER slot ever covered the page: CLAIMED for good
+ * (y6h: claimed=6 = 3 pages x 2 slots, census [(1, 3), ...], the read of a
+ * 1091-page prefix stopped at 1067). Measured on the base: 3 processes x 4096
+ * stems, 27 of 30 rounds left duplicates. Every write of an index cell now
+ * runs under this lock; the slot id is stored BEFORE the key becomes visible,
+ * so a lock-free reader (find_slot) never sees a key with a foreign slot. The
+ * lock word is the holder's pid; the only release that is not the holder's
+ * own is the guard below (a holder pid that no longer exists), and it is
+ * counted, never silent. */
+static void index_lock(ArenaHeader *h) {
+    uint32_t me = (uint32_t)getpid();
+    for (uint64_t spins = 1;; spins++) {
+        uint32_t expect = 0;
+        if (atomic_compare_exchange_weak(&h->index_lock, &expect, me)) return;
+        if ((spins & 1023u) == 0) {
+            if (expect != 0 && expect != me && kill((pid_t)expect, 0) == -1 && errno == ESRCH
+                && atomic_compare_exchange_strong(&h->index_lock, &expect, me)) {
+                atomic_fetch_add(&h->index_lock_steals, 1);
+                return;
+            }
+            sched_yield();
+        }
+    }
+}
+static inline void index_unlock(ArenaHeader *h) { atomic_store(&h->index_lock, 0u); }
+
+/* tombstone the index cell of `slot` (key klo) -- only the cell that points
+ * at THIS slot, under the index lock */
+static void index_unlink(uint8_t *base, uint64_t klo, uint64_t slot) {
+    ArenaHeader *h = hdr(base);
+    _Atomic uint64_t *keys = index_keys(base);
+    _Atomic uint32_t *islots = index_slots(base);
+    uint64_t mask = h->index_cap - 1;
+    uint64_t j = mix64(klo) & mask;
+    index_lock(h);
+    for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
+        uint64_t k = atomic_load(&keys[j]);
+        if (k == 0) break;
+        if (k == klo && atomic_load(&islots[j]) == (uint32_t)slot) {
+            atomic_store(&keys[j], TOMB);
+            break;
+        }
+    }
+    index_unlock(h);
+}
+
 /* claim a FREE slot for key (index entry published); -1 = arena full */
 static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t total, int *fresh) {
     ArenaHeader *h = hdr(base);
@@ -275,11 +354,19 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             sh->owner_pid = (uint32_t)getpid();
             sh->owner_role = tl_claim_role;
             atomic_store(&sh->progress_ms, mono_ms());
-            /* publish in the index */
+            /* ZR-1: the census of this generation starts with its claimant */
+            sh->owner_tag = g_writer_tag;
+            atomic_store(&sh->joined_mask, 0u);
+            atomic_store(&sh->merged_mask, 0u);
+            /* publish in the index (ZR-1: under the index lock; the whole
+             * probe chain is read first -- a key published further down by
+             * another writer is JOINED, never published twice) */
             _Atomic uint64_t *keys = index_keys(base);
             _Atomic uint32_t *slots = index_slots(base);
             uint64_t mask = h->index_cap - 1;
             uint64_t i = mix64(klo) & mask;
+            int64_t free_cell = -1;
+            index_lock(h);
             for (uint64_t m = 0; m < h->index_cap; m++, i = (i + 1) & mask) {
                 uint64_t k = atomic_load(&keys[i]);
                 if (k == klo) {
@@ -287,7 +374,8 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
                     SlotHeader *oh = slot_hdr(base, other);
                     uint32_t ost = atomic_load(&oh->state);
                     if (oh->key_lo == klo && oh->key_hi == khi && (ost == S_CLAIMED || ost == S_COMPLETE)) {
-                        /* another writer published this key concurrently: yield our slot */
+                        /* another writer published this key: yield our slot */
+                        index_unlock(h);
                         atomic_store(&sh->state, S_FREE);
                         return (int64_t)other;
                     }
@@ -297,21 +385,28 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
                      * does not own (ARENA-COMPLETE LOST 'recycled under the writer'). */
                     atomic_store(&slots[i], (uint32_t)s);
                     atomic_fetch_add(&h->n_claimed, 1);
+                    index_unlock(h);
                     if (fresh) *fresh = 1;
                     return (int64_t)s;
                 }
-                if (k == 0 || k == TOMB) {
-                    uint64_t expect_k = k;
-                    if (atomic_compare_exchange_strong(&keys[i], &expect_k, klo)) {
-                        atomic_store(&slots[i], (uint32_t)s);
-                        atomic_fetch_add(&h->n_claimed, 1);
-                        if (fresh) *fresh = 1;
-                        return (int64_t)s;
-                    }
-                    /* lost the race for this cell: re-read it */
-                    m--; continue;
+                if (k == TOMB) {
+                    if (free_cell < 0) free_cell = (int64_t)i;
+                    continue;
+                }
+                if (k == 0) {
+                    if (free_cell < 0) free_cell = (int64_t)i;
+                    break;
                 }
             }
+            if (free_cell >= 0) {
+                atomic_store(&slots[free_cell], (uint32_t)s);
+                atomic_store(&keys[free_cell], klo);   /* visible together with its slot */
+                atomic_fetch_add(&h->n_claimed, 1);
+                index_unlock(h);
+                if (fresh) *fresh = 1;
+                return (int64_t)s;
+            }
+            index_unlock(h);
             atomic_store(&sh->state, S_FREE);
             return -1; /* index full */
         }
@@ -396,6 +491,7 @@ int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         int mr = merge_ivals(sh, k, ext_off + e, ext_len + e, total);
         int overflow = mr < 0, full = mr > 0;
         if (overflow) { status[i] = 3; e += k; continue; }
+        atomic_fetch_or(&sh->merged_mask, writer_bit());   /* ZR-1 census */
         if (full) {
             uint32_t expect = S_CLAIMED;
             if (atomic_compare_exchange_strong(&sh->state, &expect, S_COMPLETE)) {
@@ -504,15 +600,8 @@ int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint
         uint32_t expect = S_COMPLETE;
         if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
         if (atomic_load(&sh->refcount) != 0) { atomic_store(&sh->state, S_COMPLETE); continue; }
-        /* unlink from the index */
-        _Atomic uint64_t *keys = index_keys(base);
-        uint64_t mask = h->index_cap - 1;
-        uint64_t i = mix64(sh->key_lo) & mask;
-        for (uint64_t m = 0; m < h->index_cap; m++, i = (i + 1) & mask) {
-            uint64_t k = atomic_load(&keys[i]);
-            if (k == 0) break;
-            if (k == sh->key_lo) { atomic_store(&keys[i], TOMB); break; }
-        }
+        /* unlink from the index (ZR-1: the cell of THIS slot, under the index lock) */
+        index_unlink(base, sh->key_lo, s);
         atomic_fetch_sub(&h->n_complete, 1);
         slots[got] = (int64_t)s;
         klo[got] = sh->key_lo;
@@ -613,6 +702,7 @@ int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
             sh->stem[sl] = 0;
         }
         atomic_fetch_add(&sh->writers, W_CLAIM + 1u);   /* #231: an open direct writer */
+        if (!fresh) atomic_fetch_or(&sh->joined_mask, writer_bit());   /* ZR-1 census */
         atomic_store(&sh->touched_ms, mono_ms());
         status[i] = fresh ? 0 : 1;
         ok++;
@@ -653,6 +743,7 @@ int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int
         if (mr < 0) { writer_done(sh); status[i] = 5; continue; }
         atomic_store(&sh->touched_ms, mono_ms());
         atomic_store(&sh->progress_ms, mono_ms());   /* L3FILL-JOINED: bytes arrived */
+        atomic_fetch_or(&sh->merged_mask, writer_bit());   /* ZR-1 census */
         writer_done(sh);
         if (mr == 0) { status[i] = 0; ok++; continue; }
         uint32_t expect = S_CLAIMED;
@@ -851,18 +942,7 @@ void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
          * else the next claim of this key finds a stale cell and is handed
          * a slot it does not own. */
         if (prev != S_EVICTING && sh->key_lo != 0) {
-            _Atomic uint64_t *keys = index_keys(base);
-            _Atomic uint32_t *islots = index_slots(base);
-            uint64_t mask = h->index_cap - 1;
-            uint64_t j = mix64(sh->key_lo) & mask;
-            for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
-                uint64_t k = atomic_load(&keys[j]);
-                if (k == 0) break;
-                if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
-                    atomic_store(&keys[j], TOMB);
-                    break;
-                }
-            }
+            index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
         }
         sh->key_lo = 0; sh->key_hi = 0;
         sh->generation++;  /* #1427: a late arena_complete on this slot is refused */
@@ -893,18 +973,7 @@ int64_t arena_drop_unreferenced(uint8_t *base, int64_t n, const int64_t *slots, 
         uint32_t expect = S_COMPLETE;
         if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
         if (atomic_load(&sh->refcount) != 0) { atomic_store(&sh->state, S_COMPLETE); continue; }
-        _Atomic uint64_t *keys = index_keys(base);
-        _Atomic uint32_t *islots = index_slots(base);
-        uint64_t mask = h->index_cap - 1;
-        uint64_t j = mix64(sh->key_lo) & mask;
-        for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
-            uint64_t k = atomic_load(&keys[j]);
-            if (k == 0) break;
-            if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
-                atomic_store(&keys[j], TOMB);
-                break;
-            }
-        }
+        index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
         atomic_fetch_sub(&h->n_complete, 1);
         arena_free_slots(base, 1, &slots[i]);
         out[i] = 1;
@@ -978,18 +1047,7 @@ int64_t arena_reap_partial(uint8_t *base, int64_t min_age_ms, int64_t *out, int6
             atomic_store(&sh->state, S_CLAIMED);
             continue;
         }
-        _Atomic uint64_t *keys = index_keys(base);
-        _Atomic uint32_t *islots = index_slots(base);
-        uint64_t mask = h->index_cap - 1;
-        uint64_t j = mix64(sh->key_lo) & mask;
-        for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
-            uint64_t k = atomic_load(&keys[j]);
-            if (k == 0) break;
-            if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)s) {
-                atomic_store(&keys[j], TOMB);
-                break;
-            }
-        }
+        index_unlink(base, sh->key_lo, (uint64_t)s);
         sh->key_lo = 0; sh->key_hi = 0;
         sh->n_ivals = 0;
         sh->generation++;
@@ -1029,18 +1087,7 @@ static int free_if_abandoned(uint8_t *base, uint64_t slot) {
         atomic_store(&sh->state, S_CLAIMED);
         return 0;
     }
-    _Atomic uint64_t *keys = index_keys(base);
-    _Atomic uint32_t *islots = index_slots(base);
-    uint64_t mask = h->index_cap - 1;
-    uint64_t j = mix64(sh->key_lo) & mask;
-    for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
-        uint64_t k = atomic_load(&keys[j]);
-        if (k == 0) break;
-        if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slot) {
-            atomic_store(&keys[j], TOMB);
-            break;
-        }
-    }
+    index_unlink(base, sh->key_lo, (uint64_t)slot);
     sh->key_lo = 0; sh->key_hi = 0;
     sh->n_ivals = 0;
     sh->generation++;
@@ -1116,18 +1163,7 @@ int64_t arena_release_claims(uint8_t *base, int64_t n, const int64_t *slots, con
             else status[i] = 1;
             continue;
         }
-        _Atomic uint64_t *keys = index_keys(base);
-        _Atomic uint32_t *islots = index_slots(base);
-        uint64_t mask = h->index_cap - 1;
-        uint64_t j = mix64(sh->key_lo) & mask;
-        for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
-            uint64_t k = atomic_load(&keys[j]);
-            if (k == 0) break;
-            if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
-                atomic_store(&keys[j], TOMB);
-                break;
-            }
-        }
+        index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
         sh->key_lo = 0; sh->key_hi = 0;
         sh->n_ivals = 0;
         sh->generation++;
@@ -1335,6 +1371,63 @@ int64_t arena_claim_info(uint8_t *base, int64_t n, const int64_t *slots, int64_t
     return got;
 }
 
+/* ZR-1: the writer census of each slot, CENSUS_W values per slot:
+ * [generation, state, owner_pid, owner_role, owner_tag, joined_mask,
+ *  merged_mask, open writers, claims, merged intervals, covered bytes,
+ *  total bytes, slots holding the same key (CLAIMED or COMPLETE, this one
+ *  included -- more than 1 is the split ZR-1 closed), age_ms since the last
+ *  claim or merge]. A slot out of range answers generation -1. */
+#define CENSUS_W 14
+int64_t arena_claim_census(uint8_t *base, int64_t n, const int64_t *slots, int64_t *out) {
+    ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
+    int64_t got = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t *o = out + i * CENSUS_W;
+        for (int c = 0; c < CENSUS_W; c++) o[c] = 0;
+        o[0] = -1;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        uint32_t w = atomic_load(&sh->writers);
+        uint64_t covered = 0;
+        while (atomic_exchange(&sh->lock, 1)) { /* spin */ }
+        uint32_t niv = sh->n_ivals;
+        for (uint32_t a = 0; a < niv && a < sh->cap_ivals; a++) covered += sh->ivals[a].hi - sh->ivals[a].lo;
+        atomic_store(&sh->lock, 0);
+        int64_t same = 0;
+        uint64_t klo = sh->key_lo, khi = sh->key_hi;
+        if (klo != 0 || khi != 0) {
+            for (uint64_t t = 0; t < h->slots; t++) {
+                SlotHeader *oh = slot_hdr(base, t);
+                uint32_t st = atomic_load(&oh->state);
+                if ((st == S_CLAIMED || st == S_COMPLETE) && oh->key_lo == klo && oh->key_hi == khi) same++;
+            }
+        }
+        o[0] = (int64_t)sh->generation;
+        o[1] = (int64_t)atomic_load(&sh->state);
+        o[2] = (int64_t)sh->owner_pid;
+        o[3] = (int64_t)sh->owner_role;
+        o[4] = (int64_t)sh->owner_tag;
+        o[5] = (int64_t)atomic_load(&sh->joined_mask);
+        o[6] = (int64_t)atomic_load(&sh->merged_mask);
+        o[7] = (int64_t)(w & W_OPEN);
+        o[8] = (int64_t)(w >> 16);
+        o[9] = (int64_t)niv;
+        o[10] = (int64_t)covered;
+        o[11] = (int64_t)sh->total_bytes;
+        o[12] = same;
+        o[13] = (int64_t)(uint32_t)(now - atomic_load(&sh->progress_ms));
+        got++;
+    }
+    return got;
+}
+
+/* ZR-1: index-lock steals so far (the guard's count: a holder pid that had
+ * died inside the critical section) */
+int64_t arena_index_lock_steals(uint8_t *base) {
+    return (int64_t)atomic_load(&hdr(base)->index_lock_steals);
+}
+
 /* the oldest CLAIMED slot (longest without byte progress):
  * out = [slot, age_ms, pid, role, generation, open writers, claimed count,
  * slots in state >= 4]. Returns the claimed count (-1 slot when none). */
@@ -1400,18 +1493,7 @@ int64_t arena_quarantine_stale(uint8_t *base, int64_t n, const int64_t *slots, c
             atomic_store(&sh->state, S_CLAIMED);   /* moved under us: leave it */
             continue;
         }
-        _Atomic uint64_t *keys = index_keys(base);
-        _Atomic uint32_t *islots = index_slots(base);
-        uint64_t mask = h->index_cap - 1;
-        uint64_t j = mix64(sh->key_lo) & mask;
-        for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
-            uint64_t k = atomic_load(&keys[j]);
-            if (k == 0) break;
-            if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
-                atomic_store(&keys[j], TOMB);
-                break;
-            }
-        }
+        index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
         sh->key_lo = 0; sh->key_hi = 0;
         atomic_store(&sh->touched_ms, now);   /* quarantine start, for the backstop */
         quarantine_release(base, (uint64_t)slots[i]);   /* nobody open: free at once */
