@@ -272,7 +272,9 @@ def test_tick_grows_the_stage_for_the_queue_head(tick_env):
     assert st.changed and st.stage > 0
     phase = getattr(sched, dsv.PHASE_ATTR)
     assert phase.stage == st.stage and phase.stage_tokens == grid[st.stage]
-    assert caps == [grid[st.stage]] and votes == []    # growth asks no collective
+    # growth asks no floor collective; the one vote is the reserve agreement
+    # over the queued head (y6h 10011531, rank-local new_token_ratio)
+    assert caps == [grid[st.stage]] and [len(v) for v in votes] == [1] and votes[0][0] < 0
 
 
 def test_tick_shrinks_in_the_next_round_after_a_finish(tick_env):

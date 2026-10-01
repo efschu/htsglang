@@ -2266,8 +2266,9 @@ def admission_reserve(sched, running, admissible) -> int:
     weg2-41-100 ended 4 s later. ep58 02:58:12 the same at S5 with two free
     seats (63071 > 59392, 8,1 s). S7..S9 were on the ladder (S7 at 02:52:15).
     Zero with nothing queued: a reservation never moves an expert row on its
-    own. Inputs are request fields and the scheduler's ratio -- the same on
-    every D rank."""
+    own. Inputs are request fields and the scheduler's ratio. The ratio is
+    RANK-LOCAL (y6h 10011531, see :func:`_agree_reserve`), so the caller
+    agrees the result over the group before the machine steps on it."""
     if not admissible:
         return 0
     clip = _clip_max_new()
@@ -2275,6 +2276,42 @@ def admission_reserve(sched, running, admissible) -> int:
     ratio = _new_token_ratio(sched)
     run = sum(int(math.ceil(_req_max_new(r, clip) * ratio)) for r in running)
     return run + sum(_req_max_new(r, clip) + page for r in admissible)
+
+
+#: y6h 10011531: the group's reservation differed from this rank's
+RESERVE_AGREE_MARK = "WEG2 D-MEM-SCHED RESERVE-AGREE"
+_RESERVE_AGREE_N = [0]
+
+
+def _agree_reserve(sched, admissible, reserve: int) -> int:
+    """The gate reservation as ONE group number: MAX over the D ranks.
+
+    NF y6h 10011531 (01.10. 16:07:53): ``new_token_ratio`` is rank-local --
+    TP0 priced the queue at 4964, TP1/TP2 at 6592 for the same requests, so
+    the replicated machine split: TP0 S6->S7 ("grow to hold 261597"), the
+    workers S6->S8 ("grow to hold 263225"). From there the ranks took
+    different control paths and every D rank wedged at 16:07:56 in the
+    ``drain_retired_prefetch`` all_reduce (outstanding=4, no token, until the
+    VORSTOPP). MAX is the gate's own direction: the rank that charges more
+    is the one whose admission would refuse.
+
+    Entered only with something queued (``admissible`` is a request list,
+    the same on every D rank), so a decode round with an empty queue pays no
+    collective."""
+    if not admissible:
+        return int(reserve)
+    gmin = getattr(sched, "_weg2_group_min_ints", None)
+    if gmin is None:
+        return int(reserve)
+    agreed = -int(gmin([-int(reserve)])[0])
+    if agreed != int(reserve):
+        _RESERVE_AGREE_N[0] += 1
+        n = _RESERVE_AGREE_N[0]
+        if n <= 20 or n % 200 == 0:
+            logger.info("%s n=%d local=%d group=%d ratio=%.4f -- the reservation the stage "
+                        "machine steps on is the group's, not this rank's",
+                        RESERVE_AGREE_MARK, n, int(reserve), agreed, _new_token_ratio(sched))
+    return agreed
 
 
 def kv_ladder_reading(sched) -> Optional[Dict[str, int]]:
@@ -2450,7 +2487,7 @@ def runtime_tick(sched):
     rids = frozenset(getattr(r, "rid", id(r)) for r in running)
     # NF y3z ep44/ep58 (30.09.): the machine grows for what the GATE charges,
     # not for the bare census -- else it holds a stage the gate refuses in
-    reserve = admission_reserve(sched, running, admissible)
+    reserve = _agree_reserve(sched, admissible, admission_reserve(sched, running, admissible))
     ended = ms._rids is not None and bool(ms._rids - rids)
     ms._rids = rids
     floor = 0
