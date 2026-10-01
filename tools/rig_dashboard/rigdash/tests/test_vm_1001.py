@@ -71,3 +71,15 @@ def test_lean_snapshot_keeps_shown_boot_whole_and_strips_rows():
     assert "series" not in row and "fields" not in row and "launch" not in row["ipc"]
     assert row["prefill"]["P"]["last_burst"]["tps"] == 5.0 and row["totals"] == {"p_new": 3}
     assert "features" not in lean and "features" in server.lean_snapshot(snap, with_dev=True)
+
+
+def test_sampler_restart_keeps_the_ring(tmp_path):
+    """01.10.: a deploy restarts the sampler; its first append must not wipe the 16-min ring of the store."""
+    from rigdash import ipcboot, sampler
+    st = sampler.RingStore(str(tmp_path / "ring.sqlite"))
+    now = time.time()
+    st.append([("boot-a", now - 300 + i, {"t": now - 300 + i, "r": {}, "front": {}}) for i in range(5)],
+              {"boot-a": now - 300})
+    b = ipcboot.IpcBoots(roots={}, store=st, role="sampler")
+    assert b.warm_from_store(now) == 5
+    assert [s["t"] for s in b.rings["boot-a"]] == [now - 300 + i for i in range(5)]

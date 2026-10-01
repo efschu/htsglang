@@ -184,6 +184,7 @@ def main(argv=None) -> int:
     store = RingStore(os.path.join(args.state_dir, RING_FILE))
     db = history.HistoryDB(os.path.join(args.state_dir, "history.sqlite"))
     boots = ipcboot.IpcBoots(store=store, role="sampler")
+    boots.warm_from_store()          # a restart (deploy) keeps the 16-min ring instead of wiping it
     rec = history.Recorder(db, boots, shlex.split(args.docker_ssh) if args.docker_ssh else [])
     threading.Thread(target=boots.run_forever, args=(stop,), name="sampler-ipc", daemon=True).start()
     threading.Thread(target=rec.run_forever, args=(stop,), name="sampler-hist", daemon=True).start()

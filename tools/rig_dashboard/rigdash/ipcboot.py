@@ -735,6 +735,20 @@ class IpcBoots:
         self.rates = ipcfields.Rates()
         self.last_error: Optional[str] = None
 
+    def warm_from_store(self, now: Optional[float] = None) -> int:
+        """Sampler start (01.10.: every deploy restarts the sampler, and its first append deleted the 16-min ring
+        the store still held -- the phase bar showed 10 min "keine IPC-Probe" after each deploy): take the
+        store's samples of the last RING_S back into the writer's ring before the first poll."""
+        if self.store is None or self.role != "sampler":
+            return 0
+        now = now or time.time()
+        n = 0
+        with self.lock:
+            for k, t, samp in self.store.since(now - RING_S):
+                self.rings.setdefault(k, deque()).append(samp)
+                n += 1
+        return n
+
     def poll(self, now: Optional[float] = None) -> None:
         now = now or time.time()
         self.ipc.poll(now)
