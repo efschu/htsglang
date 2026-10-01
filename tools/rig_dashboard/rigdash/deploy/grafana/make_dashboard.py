@@ -90,6 +90,14 @@ panels = [
     panel("KV-Belegung", [
         t("max by (model, group) (weg2_rank_kv_usage_ratio{model=~\"$model\"}) * 100", "{{group}} {{model}}")],
         "percent", 12, 26, 12, 8, "rankstats sched.full_token_usage"),
+    row("Speicherstufen (Zaehler; Dauer/Bytes je Ereignis fehlen in IPC, Feldliste 01.10.)", 51),
+    panel("L2 Host-Arena: Load-back Token/s und Mamba-Resumes/min", [
+        t("sum by (model, group) (rate(weg2_rank_l2_loadback_tokens_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))", "Load-back Tok/s {{group}} {{model}}"),
+        t("sum by (model, group) (rate(weg2_rank_mamba_resume_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60", "Mamba-Resumes/min {{group}} {{model}}")],
+        "short", 0, 52, 12, 8, "rankstats.cache.loadback_tok / mamba_resume_n, erster Rang je Gruppe"),
+    panel("L3 Store: Prefetch je Ausgang /min", [
+        t("sum by (model, group, outcome) (rate(weg2_rank_l3_prefetch_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60", "{{outcome}} {{group}} {{model}}")],
+        "short", 12, 52, 12, 8, "rankstats.cache.prefetch.*; L1,5: noch keine Daten (Stufe im Bau)"),
     row("Karten und Host", 34),
     panel("Leistungsaufnahme", [t("sum(nvidia_smi_power_draw_watts)", "Summe"),
                                 t("nvidia_smi_power_draw_watts " + GPU_NAME, "nvml {{index}} {{name}}")],

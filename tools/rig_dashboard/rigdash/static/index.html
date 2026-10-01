@@ -790,6 +790,36 @@ document.addEventListener("click", (e) => { if (!e.target.closest(".phasebar")) 
 let fitTimer = null;
 window.addEventListener("resize", () => { clearTimeout(fitTimer); fitTimer = setTimeout(fitPhaseLabels, 100); });
 
+// Speicherstufen und PLE (Nutzer 01.10. ~08:45Z, Expertenansicht): was rankstats.cache je Rang heute führt
+// (Zähler), und je Stufe die Felder, die für Dauer/Bytes/Rate/Verteilung fehlen -- L1,5 als Platzhalter.
+const TIER_MISSING = {
+  ple: "rankstats.ple.{prefill,decode}.{n, ms_sum, ms_max, last_ms, hit_n, miss_n, wait_ms_sum, bytes} + recent[[t, ms, hit, miss]]",
+  l2: "rankstats.cache.loadback_{ms_sum, ms_max, pages, bytes} + last{t, ms, pages, bytes} + recent[…]",
+  l3: "rankstats.cache.l3.{read_n, read_ms_sum, read_ms_max, read_pages, read_bytes, last, recent} + prefetch.{ms_sum, ms_max, bytes}",
+  l15: "rankstats.cache.l15.{kv_pages, anchors, bytes, hit_n, hit_tokens, p2p_read_n, p2p_read_ms_sum, p2p_bytes, evict_n}",
+};
+function tiersHtml(b) {
+  const f = fieldIpc(b, "E2");
+  const ranks = f && f.value ? Object.entries(f.value).filter(([, v]) => v) : [];
+  const ring = b.series || {};
+  const miss = (k) => `<div class="miss" style="font-size:11.5px">fehlt in IPC: <span class="mono">${esc(TIER_MISSING[k])}</span></div>`;
+  const rows = ranks.map(([r, v]) => {
+    const pf = v.prefetch || {};
+    return `<tr><td class="mono">${esc(r)}</td><td class="num">${fmt(v.loadback_n)}</td><td class="num">${fmt(v.loadback_tok)}</td>`
+      + `<td class="num">${fmt(v.mamba_resume_n)}</td><td class="num">${fmt(v.store_incomplete_n)}${v.store_incomplete_deliverable ? ` <span class="muted">(${fmt(v.store_incomplete_delivered)}/${fmt(v.store_incomplete_deliverable)})</span>` : ""}</td>`
+      + `<td class="num">${["attempted", "issued", "landed", "refused", "expired", "timeout"].map((k) => fmt(pf[k])).join(" / ")}</td></tr>`;
+  }).join("");
+  const tile = (title, body) => `<div class="tile"><div class="label">${title}</div>${body}</div>`;
+  return `<div class="x" style="margin-top:12px"><h3 style="font-size:13px;margin:4px 0 6px">Speicherstufen und PLE <span class="muted">je Rang, P und D getrennt &middot; Zähler seit Boot aus rankstats.cache (IPC) &middot; Einzelereignisse werden Punkte, sobald die Rang-IPC sie trägt</span></h3>
+    <div class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-bottom:8px">
+      ${tile("L1,5 &middot; Brach-VRAM 3080 (KV + Anker, P2P)", `<div class="big" style="font-size:16px;color:var(--muted)">noch keine Daten</div><div class="state">Stufe im Bau (L1,5-Lead); Kachel füllt sich, sobald rankstats sie trägt</div>${miss("l15")}`)}
+      ${tile("L2 &middot; Host-Arena: Load-back", `<div class="state">Anzahl und Token je Rang in der Tabelle; Dauer, Seiten, Bytes und Rate je Load-back:</div>${miss("l2")}`)}
+      ${tile("L3 &middot; Store/Disk: Read und Prefetch", `<div class="state">unvollständige Lesungen und Prefetch-Zensus je Rang in der Tabelle; Dauer, Bytes und Rate je Read/Prefetch:</div>${miss("l3")}`)}
+      ${tile("PLE &middot; Per-Layer-Embedding Gather / pread-Stage", `<div class="state">je Prefill-Chunk und je Decode-Runde, P und D getrennt (Verteilung, letzte Werte, Hit/Miss, Wartezeit):</div>${miss("ple")}`)}
+    </div>
+    ${rows ? `<div class="tablewrap"><table><tr><th>Rang ${ipcTag(f.ipc_src)}</th><th class="num">L2 Load-back n</th><th class="num">L2 Load-back Tok</th><th class="num">Mamba-Resume n</th><th class="num">L3 unvollständig n (geliefert/lieferbar)</th><th class="num">Prefetch versucht / ausgegeben / gelandet / abgelehnt / abgelaufen / timeout</th></tr>${rows}</table></div>` : `<div class="muted">rankstats.cache fehlt in diesem Boot</div>`}
+  </div>`;
+}
 // E2 prefetch census per rank (rankstats.cache.prefetch): deferred = #1068 DEFERRED, refused = #915 REFUSED,
 // timeout = #1157 REAPED -- the log's PREFETCH TIMEOUT line is the one config line, never a timeout
 function prefetchRows(b) {
@@ -1104,6 +1134,7 @@ function bootCard(b, now, binders) {
       </div>
     </div>
     <div class="x">${cacheHtml(b, now, awake)}</div>
+    ${tiersHtml(b)}
     ${!DEV ? "" : ipc && Object.keys(ipc.launch || {}).length ? `<details class="x" id="launch-${esc(b.stem)}" style="margin-top:10px"><summary>Startform je Gruppe (argv + Schalter-Env) ${ipcTag("state.json groups.launch")}</summary><div class="launch mono">${Object.entries(ipc.launch).map(([g, l]) => `<div><b>${esc(g)}</b> ${esc((l.argv || []).join(" "))}</div>${Object.entries(l.env || {}).map(([k, v]) => `<div>&nbsp;&nbsp;${esc(k)}=${esc(v)}</div>`).join("")}`).join("")}</div></details>`
       : ""}
     ${errs.length ? `<details class="x" id="err-${esc(b.stem)}" style="margin-top:10px"><summary>letzte Fehlerzeilen (${fmt(fieldIpc(b, "A13") ? fieldIpc(b, "A13").value.n : b.error_count)})${srcOf(b, "A13")}</summary>${errs.map((e) => `<div class="err mono">${hhmm(e.t)} [${esc(e.group)}] ${esc(e.text)}</div>`).join("")}</details>` : ""}

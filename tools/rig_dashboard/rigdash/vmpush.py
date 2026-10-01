@@ -107,6 +107,12 @@ def lines_for_boot(ipc: dict, rankstats: Dict[str, dict], model: str, now_ms: in
         for sec, field, name in RANK_FIELDS:
             blk = rec.get(sec) if isinstance(rec.get(sec), dict) else {}
             put("weg2_rank_" + name, blk.get(field), ex)
+        cache = rec.get("cache") if isinstance(rec.get("cache"), dict) else {}
+        for k in ("store_incomplete_delivered", "store_incomplete_deliverable", "mamba_tok"):
+            put("weg2_rank_cache_%s_total" % k, cache.get(k), ex)
+        pf = cache.get("prefetch") if isinstance(cache.get("prefetch"), dict) else {}
+        for k, v in pf.items():          # L3 prefetch census (attempted/issued/landed/refused/expired/timeout ...)
+            put("weg2_rank_l3_prefetch_total", v, dict(ex, outcome=k))
     return out
 
 

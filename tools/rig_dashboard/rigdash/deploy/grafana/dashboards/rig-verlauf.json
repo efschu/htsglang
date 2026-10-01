@@ -640,6 +640,148 @@
   {
    "id": 12,
    "type": "row",
+   "title": "Speicherstufen (Zaehler; Dauer/Bytes je Ereignis fehlen in IPC, Feldliste 01.10.)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 51,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "L2 Host-Arena: Load-back Token/s und Mamba-Resumes/min",
+   "description": "rankstats.cache.loadback_tok / mamba_resume_n, erster Rang je Gruppe",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 52,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum by (model, group) (rate(weg2_rank_l2_loadback_tokens_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "Load-back Tok/s {{group}} {{model}}"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "B",
+     "expr": "sum by (model, group) (rate(weg2_rank_mamba_resume_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "legendFormat": "Mamba-Resumes/min {{group}} {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "L3 Store: Prefetch je Ausgang /min",
+   "description": "rankstats.cache.prefetch.*; L1,5: noch keine Daten (Stufe im Bau)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 52,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 12,
+      "pointSize": 6,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "mean",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "refId": "A",
+     "expr": "sum by (model, group, outcome) (rate(weg2_rank_l3_prefetch_total{rank=\"tp0pp0\",model=~\"$model\"}[$__rate_interval])) * 60",
+     "legendFormat": "{{outcome}} {{group}} {{model}}"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "type": "row",
    "title": "Karten und Host",
    "collapsed": false,
    "gridPos": {
@@ -651,7 +793,7 @@
    "panels": []
   },
   {
-   "id": 13,
+   "id": 16,
    "type": "timeseries",
    "title": "Leistungsaufnahme",
    "description": "nvidia_gpu_exporter (NVML)",
@@ -720,7 +862,7 @@
    ]
   },
   {
-   "id": 14,
+   "id": 17,
    "type": "timeseries",
    "title": "GPU-Temperatur",
    "description": "",
@@ -779,7 +921,7 @@
    ]
   },
   {
-   "id": 15,
+   "id": 18,
    "type": "timeseries",
    "title": "GPU-Last / VRAM belegt",
    "description": "",
@@ -848,7 +990,7 @@
    ]
   },
   {
-   "id": 16,
+   "id": 19,
    "type": "timeseries",
    "title": "Proxmox-Host: RAM verfügbar und ZFS-ARC",
    "description": "node_exporter auf dem Proxmox-Host (192.168.0.11:9100)",
