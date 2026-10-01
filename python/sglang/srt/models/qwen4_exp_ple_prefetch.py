@@ -57,6 +57,7 @@ from typing import Callable, List, NamedTuple, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.weg2 import rank_timing as _rank_timing  # RANK-TIMING: rankstats ple.prefill
 
 logger = logging.getLogger(__name__)
 
@@ -787,6 +788,10 @@ class PlePrefetchGather:
         self.stats["hit_rows"] += hit
         self.stats["read_rows"] += int(miss.numel())
         self.stats["wait_s"] += wait_s
+        # RANK-TIMING: the chunk's PLE (host wall; hit = rows the prefetch had ready)
+        _rank_timing.note_ple("prefill", wall * 1000.0, hit=hit, miss=int(miss.numel()),
+                              wait_ms=wait_s * 1000.0,
+                              nbytes=int(miss.numel()) * int(self._table.row_bytes))
         logger.info(
             "PLE-PREFETCH chunk=%d rows=%d ready=%s wait_ms=%.1f gather_ms=%.1f "
             "hit_rows=%d read_rows=%d host_ms=%.1f next=%s procs=%d",

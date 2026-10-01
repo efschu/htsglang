@@ -402,6 +402,12 @@ class PleCheckpointPreadGather:
         self.stats["rows"] += n
         self.stats["zero_rows"] += n - nv
         self.stats["seconds"] += dt
+        # RANK-TIMING (rankstats ple.prefill): the serial pread gather -- the
+        # forward waits on all of it; every valid row is read (no hit)
+        from sglang.srt.weg2 import rank_timing as _rank_timing  # stdlib only
+
+        _rank_timing.note_ple("prefill", dt * 1000.0, hit=0, miss=nv, wait_ms=dt * 1000.0,
+                              nbytes=nv * self._row_bytes)
         log_ple_gather(n, n - nv, dt, self._workers)
         if timed:
             log_ple_gather_host(

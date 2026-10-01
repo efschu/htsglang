@@ -144,6 +144,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.weg2 import rank_timing as _rank_timing  # RANK-TIMING: rankstats ple.decode
 from sglang.srt.managers.scheduler_components.decode_host_split import (
     note_span as _h58_span,
 )
@@ -1110,6 +1111,10 @@ class PleDecodeStager:
         self.stats["hit"] += hit
         self.stats["late"] += late
         self.stats["wait_s"] += wait_s
+        # RANK-TIMING (rankstats ple.decode): the host gap this round waits;
+        # hit = rows staged within the budget, miss = the rest (read via HMM)
+        _rank_timing.note_ple("decode", wait_s * 1000.0, hit=hit, miss=n - hit,
+                              wait_ms=wait_s * 1000.0, nbytes=hit * self._rb)
         if win["rounds"] >= self._log_every:
             self._log_window(w.n_procs)
 
@@ -1160,6 +1165,9 @@ class PleDecodeStager:
             win["wait_max_s"] = max(win["wait_max_s"], post_s)
             self.stats["rounds"] += 1
             self.stats["rows"] += n
+            # RANK-TIMING (ple.decode): the H73 post's host ms (the workers stage
+            # behind it; their hit/miss is the device counter, not known here)
+            _rank_timing.note_ple("decode", post_s * 1000.0, wait_ms=post_s * 1000.0)
             if log_due:
                 self._log_window_auto(workers)
         return True
