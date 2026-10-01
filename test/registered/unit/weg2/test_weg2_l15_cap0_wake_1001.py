@@ -202,6 +202,9 @@ def _env(monkeypatch, tmp_path, master, mib):
         monkeypatch.setenv("SGLANG_WEG2_L15_MIB", mib)
     monkeypatch.setenv("SGLANG_WEG2_L15_MANIFEST", str(tmp_path) + os.sep)
     monkeypatch.delenv("SGLANG_FLUSH_ZERO_KV", raising=False)  # default on
+    # L15-12c-SW: this file pins the E2/E2b gate, i.e. the switch-ON
+    # behaviour; REFILL defaults to 0 (the kill switch), so pin it on here.
+    monkeypatch.setenv("SGLANG_WEG2_L15_REFILL", "1")
 
 
 # (rank 0, tp 2: even slots are rank 0's; compact row = slot // 2)

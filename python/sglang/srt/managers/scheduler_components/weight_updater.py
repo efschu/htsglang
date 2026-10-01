@@ -204,6 +204,24 @@ from sglang.srt.weg2 import rpc_stall_watchdog as _rpc_stall  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _l15_refill_on(env) -> bool:
+    """L15-12c-SW: the cap-0 refill kill switch, SGLANG_WEG2_L15_REFILL.
+
+    Default OFF: the remote head must never carry an open TP0 gate without
+    a switch (operator order 01.10. ~19:10Z). Same parsing as the l15_plan
+    switches ("1"/"true"/"on" = on, case/blanks tolerated; absent or "0" =
+    off); a read failure means OFF -- the safe shape is today's fallback.
+    Boot ladder: boot 1 with L15=1 and REFILL=0 (TP0 falls back), boot 2
+    with REFILL=1 only after a green boot 1; the default flips to 1 after
+    the metal proof."""
+    try:
+        from sglang.srt.weg2 import l15_plan
+
+        return l15_plan._switch(env, "SGLANG_WEG2_L15_REFILL")
+    except Exception:  # noqa: BLE001 -- unreadable switch: off (fallback)
+        return False
+
+
 def _weg2_exc_note(exc: BaseException, *, limit: int = 120) -> str:
     """``Type: message @ file:line`` for a SWALLOWED exception (#1328).
 
@@ -7251,6 +7269,14 @@ class SchedulerWeightUpdaterManager:
                 os.environ, tp, [l15_shadow.cell_bytes_from(pool)] * tp, cards)
             cap = int(caps[rank]) if 0 <= rank < len(caps) else 0
             if cap <= 0:
+                # L15-12c-SW: kill switch BEFORE the anchor gate -- OFF votes
+                # None even when every span carries the anchor L2 identity
+                # (the boot-1 shape: master on, TP0 still falls back).
+                if not _l15_refill_on(os.environ):
+                    logger.info("L15-REFILL rank=%d off "
+                                "(SGLANG_WEG2_L15_REFILL=0): votes no hold",
+                                rank)
+                    return None, rank, 0, True
                 # L15-12c-E2: this rank kept NOTHING mapped through the sleep
                 # (cap 0; TP0 on the big card).  It can still honour a group
                 # "hold" by refilling every held row it owns over H2D from L2
