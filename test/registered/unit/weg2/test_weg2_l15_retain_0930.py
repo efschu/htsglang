@@ -82,6 +82,8 @@ class FakeAllocator:
 
 
 class FakeNode:
+    # FAKE NODE: real UnifiedTreeNode has no kv_slots/anchor_slot -- see
+    # test_weg2_l15_tree_rewrite_1001.py
     """Stands in for a UnifiedRadixCache node: the two attributes L15-11b
     rewrites. kv_slots is assigned once (the rewrite), so a first-set guard
     records the rewrite event without double-counting the init assignment."""
@@ -123,12 +125,22 @@ def make_scenario(tmp_path, events, reset_keep=None, slots_of=None):
 
     path = str(tmp_path / "l15_manifest.json")
     log_lines = []
+
+    def rewrite_tree(node, kv_map, anchor_map, visited):
+        # L15-11d recorder standing in for l15_bind.rewrite_tree_chain:
+        # the real tree's component values are remapped by the callable;
+        # the fake node only captures the maps (see
+        # test_weg2_l15_tree_rewrite_1001.py).
+        events.append("nodes")
+        node.rewritten = (dict(kv_map), dict(anchor_map))
+
     kwargs = dict(
         candidates=list(CANDIDATES),
         node_of=lambda rid: nodes[rid],
         slots_of=slots_of or (lambda rid: SLOTS_OF[rid]),
         anchor_slot_of=lambda rid: ANCHOR_SLOT_OF[rid],
         l2_of=lambda rid: ((201, 202), (5, 6)),
+        rewrite_tree=rewrite_tree,
         caps_rows_by_rank=CAPS_ROWS_BY_RANK,
         cap_anchor_slots=CAP_ANCHOR_SLOTS,
         prefix=PREFIX,
@@ -222,11 +234,16 @@ def test_rows_land_at_new_slots_reserved_leave_free_pages_manifest_roundtrips(
     assert torch.equal(sc["mamba_buf"][1], _marker(5, 2)[4])
     assert torch.equal(sc["mamba_buf"][2], _marker(6, 2)[5])
     assert torch.equal(sc["mamba_buf"][0], _marker(1, 2)[0])
-    # kept nodes were rewritten to the plan's new slots / new anchors
+    # kept chains were rewritten: the recorder (step 4, L15-11d) received
+    # the global old->new maps; a slot absent from the map stayed where it
+    # was. Unmapped old slots keep their number, moved ones land on the
+    # plan's new slots for that rid.
     for rid, node in sc["nodes"].items():
-        assert node.kv_slots == tuple(res.plan.new_slots[rid])
-    assert sc["nodes"]["r_seat"].anchor_slot == 1  # 4 squeezed to 1
-    assert sc["nodes"]["r_parked"].anchor_slot == 2  # 5 squeezed to 2
+        got_kv, got_anchor = node.rewritten
+        for old, new in zip(SLOTS_OF[rid], res.plan.new_slots[rid]):
+            assert got_kv.get(int(old), int(old)) == int(new)
+    assert sc["nodes"]["r_seat"].rewritten[1][4] == 1  # 4 squeezed to 1
+    assert sc["nodes"]["r_parked"].rewritten[1][5] == 2  # 5 squeezed to 2
 
     # reserved slots left free_pages; the rest keeps its order
     free = sc["alloc"].free_pages.tolist()

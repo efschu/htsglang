@@ -19961,7 +19961,12 @@ class Scheduler(
             _l15_res = None
             if _l15_kwargs is not None:
                 _l15_res = l15_retain.retain_at_sleep(
-                    mamba_allocator=_l15_mba, **_l15_kwargs
+                    mamba_allocator=_l15_mba,
+                    # L15-11d: step (4) remaps the REAL tree component
+                    # values (the old fake kv_slots/anchor_slot writes were
+                    # never read); shared visited set is owned by retain.
+                    rewrite_tree=l15_bind.rewrite_tree_chain,
+                    **_l15_kwargs
                 )
                 if _l15_res is not None:
                     # The keep spans are the one thing retain_at_sleep

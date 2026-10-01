@@ -34,6 +34,13 @@ from weg2.test_weg2_l15_retain_0930 import (  # noqa: E402 - module-level fakes
 PREFIX2 = (0, 2, 4)
 
 
+def _rewrite_recorder(node, kv_map, anchor_map, visited):
+    # L15-11d recorder standing in for l15_bind.rewrite_tree_chain: the
+    # fake node only captures the maps (the real rewrite is pinned in
+    # test_weg2_l15_tree_rewrite_1001.py).
+    node.rewritten = (dict(kv_map), dict(anchor_map))
+
+
 class FakeMambaAllocator:
     """Mirrors MambaSlotAllocator.clear(): free_slots = arange(1, size + 1),
     int64, slot 0 reserved for padded tokens and never handed out."""
@@ -113,6 +120,7 @@ def test_retain_at_sleep_end_to_end_avoids_slot0_and_rearms_mamba(tmp_path):
         slots_of=lambda rid: {"r_seat": (5, 6), "r_parked": (13,)}[rid],
         anchor_slot_of=lambda rid: {"r_seat": 4, "r_parked": 9}[rid],
         l2_of=lambda rid: ((201, 202), (5, 6)),
+        rewrite_tree=_rewrite_recorder,
         caps_rows_by_rank=CAPS_ROWS_BY_RANK,
         cap_anchor_slots=CAP_ANCHOR_SLOTS,
         prefix=PREFIX2,
@@ -142,8 +150,10 @@ def test_retain_at_sleep_end_to_end_avoids_slot0_and_rearms_mamba(tmp_path):
     }
     # anchors squeezed to [0, A_H) around the reserved slot; A_H covers it
     assert res.a_h == 3
-    assert nodes["r_seat"].anchor_slot == 1
-    assert nodes["r_parked"].anchor_slot == 2
+    # the recorder (step 4) received the squeeze around the reserved slot:
+    # 4 -> 1 and 9 -> 2, never onto slot 0
+    assert nodes["r_seat"].rewritten[1][4] == 1
+    assert nodes["r_parked"].rewritten[1][9] == 2
     # mamba re-arm: 0 never in free_slots, held anchors removed, rest stays
     mfree = mamba_alloc.free_slots.tolist()
     assert mfree == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]

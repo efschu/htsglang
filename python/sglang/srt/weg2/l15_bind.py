@@ -8,8 +8,13 @@ OPEN (L15-11c part 2): l2_of returns ((), ()) -- the L2 eviction ring is
 not wired yet; the manifest's l2 columns stay empty until that lands.
 """
 
-from typing import Callable, Dict, Iterable, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
+import torch
+
+from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    ComponentType,
+)
 from sglang.srt.weg2.l15_compact import owner_of
 from sglang.srt.weg2.l15_shadow import candidates_from
 
@@ -164,3 +169,67 @@ def build_retain_kwargs(
         "manifest_path": manifest_path,
         "log": log,
     }
+
+
+def _remap_slots(value, slot_map: Dict[int, int]):
+    """Element-wise old->new slot remap of a component value tensor.
+
+    Single pass, so a chained map (a -> b, b -> c) can never double-apply:
+    every element is read once and mapped once. ``None``, empty and
+    non-tensor values (the root node carries a bare list) pass through; a
+    slot missing from the map was not moved and stays put. dtype and
+    device are preserved via ``empty_like``.
+    """
+    if value is None or not torch.is_tensor(value) or value.numel() == 0:
+        return value
+    out = torch.empty_like(value.flatten())
+    flat = value.flatten()
+    for i in range(flat.numel()):
+        old = int(flat[i])
+        out[i] = slot_map.get(old, old)
+    return out.reshape(value.shape)
+
+
+def rewrite_tree_chain(
+    node,
+    kv_map: Dict[int, int],
+    anchor_map: Dict[int, int],
+    visited: Optional[set] = None,
+) -> None:
+    """L15-11d: make a REAL UnifiedTreeNode chain follow a finished retain
+    round, whose KV rows and mamba anchor slots have moved (l15_compact).
+
+    The old step (4) of retain_at_sleep wrote ``node.kv_slots`` /
+    ``node.anchor_slot`` attributes that exist only on the unit-test fakes;
+    the real UnifiedTreeNode has neither field, so the write was silently
+    accepted and never read -- the next prefix hit would have read foreign
+    KV. On the real tree a request's KV indices live in
+    ``component_data[ComponentType.FULL].value`` of EVERY node on the
+    chain root -> req.last_node (each node holds the slot indices of its
+    own tokens), and the GDN anchor slot lives in the mamba component's
+    value on the anchor node; both are remapped here, element-wise,
+    keeping dtype/device.
+
+    ``visited`` is a set of built-in ``id(node)`` shared across ALL held
+    requests of one retain call (UnifiedTreeNode.id is an int counter,
+    NOT the identity). Chains share prefixes, so without it a shared
+    prefix node would be remapped once per request that extends it; with
+    it, every node is remapped exactly once. ``None`` builds a private
+    set (a single standalone call).
+
+    The scheduler hook passes this as ``rewrite_tree=``; unit tests pass
+    a recorder with the same (node, kv_map, anchor_map, visited) shape.
+    """
+    if visited is None:
+        visited = set()
+    cur = node
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        cur.component_data[ComponentType.FULL].value = _remap_slots(
+            cur.component_data[ComponentType.FULL].value, kv_map
+        )
+        if len(cur.component_data) > int(ComponentType.MAMBA):
+            cur.component_data[ComponentType.MAMBA].value = _remap_slots(
+                cur.component_data[ComponentType.MAMBA].value, anchor_map
+            )
+        cur = getattr(cur, "parent", None)

@@ -210,6 +210,9 @@ def retain_at_sleep(
     slots_of: Callable[[str], Sequence[int]],
     anchor_slot_of: Callable[[str], int],
     l2_of: Callable[[str], Tuple[Sequence[int], Sequence[int]]],
+    rewrite_tree: Callable[
+        [object, Dict[int, int], Dict[int, int], set], None
+    ],
     caps_rows_by_rank: Sequence[int],
     cap_anchor_slots: int,
     prefix: Sequence[int],
@@ -237,6 +240,16 @@ def retain_at_sleep(
     the tree cache and the TMS (L15-03/L15-06); the real binding is the
     L15-11b scheduler hook. ``l2_of(rid)`` yields the suffix's
     ``(l2_slots, l2_gens)`` for the manifest.
+
+    ``rewrite_tree(node, kv_map, anchor_map, visited)`` is the injected
+    rewrite of the REAL tree (L15-11d): the old step (4) wrote
+    kv_slots/anchor_slot attributes that only the unit-test fakes have;
+    the real UnifiedTreeNode carries the KV indices in
+    component_data[FULL].value of every chain node and the anchor slot in
+    the mamba value, so the remap has to touch those. ``visited`` is a
+    set shared across the held requests of this call so a shared prefix
+    chain is remapped exactly once (id(node) -- UnifiedTreeNode.id is an
+    int counter, not the identity).
     """
     # Materialise once: select_hold (step 1) and the cand_depth map (step 8)
     # both walk ``candidates``. A generator argument would be exhausted after
@@ -276,13 +289,23 @@ def retain_at_sleep(
     apply_moves(kv_buffers, plan.moves, _owner_rows(prefix, rank))
     apply_moves(mamba_buffers, anchor_moves, lambda slot: int(slot))
 
-    # (4) the tree nodes follow the plan
+    # (4) the tree nodes follow the plan. The injected rewrite_tree remaps
+    # the REAL UnifiedTreeNode component values (L15-11d): the old code
+    # wrote kv_slots/anchor_slot attributes that only the unit-test fakes
+    # have -- on the real tree the write was silently accepted and never
+    # read, and the next prefix hit would have picked up foreign KV.
+    # kv_map/anchor_map carry GLOBAL old->new slots; ``visited`` is shared
+    # across the held requests so a shared prefix chain is remapped once.
+    kv_map = {int(old): int(new) for old, new in plan.moves}
+    visited: set = set()
+    seen_last: set = set()
     nodes = []
     for rid in hs.rids:
         node = node_of(rid)
-        node.kv_slots = tuple(plan.new_slots[rid])
-        node.anchor_slot = new_anchors[rid]
         nodes.append(node)
+        if id(node) not in seen_last:
+            seen_last.add(id(node))
+            rewrite_tree(node, kv_map, anchor_map, visited)
 
     # (5) partial tree reset over exactly the kept nodes
     reset_keep(nodes)
