@@ -49,6 +49,10 @@ class HoldSpan:
     l2_gens: Tuple[int, ...]
     anchor_l2_slot: int = -1
     anchor_l2_gen: int = -1
+    # L15-12c-P1: the lane each held token occupies inside its L2 page
+    # (one per l2_slots entry; -1 = staging/no lane, () on P == 1 forms
+    # and on records written before P1). Refill's P>1 path needs it.
+    l2_lanes: Tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,6 +118,7 @@ def _span_to_dict(s: HoldSpan) -> dict:
         "l2_gens": list(s.l2_gens),
         "anchor_l2_slot": s.anchor_l2_slot,
         "anchor_l2_gen": s.anchor_l2_gen,
+        "l2_lanes": list(s.l2_lanes),
     }
 
 
@@ -189,6 +194,8 @@ def from_json(s: str) -> Manifest:
                 # L15-12c-E2a: optional -- a pre-E2a record loads as -1/-1
                 anchor_l2_slot=int(sp.get("anchor_l2_slot", -1)),
                 anchor_l2_gen=int(sp.get("anchor_l2_gen", -1)),
+                # L15-12c-P1: optional -- a pre-P1 record loads as ()
+                l2_lanes=tuple(int(x) for x in sp.get("l2_lanes", ())),
             )
         )
     return Manifest(

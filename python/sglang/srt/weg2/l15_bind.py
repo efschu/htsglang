@@ -320,21 +320,33 @@ def build_retain_kwargs(
         _rc = getattr(reset_keep, "__self__", None)
         pool = getattr(getattr(_rc, "cache_controller", None), "mem_pool_host", None)
     l2_by_rid: Dict[str, Tuple[Tuple, Tuple]] = {}
+    l2_lanes_by_rid: Dict[str, Tuple[int, ...]] = {}
     if pool is not None and l2_rows:
         _s = int(getattr(pool, "staging_rows", 0))
         _p = max(1, int(getattr(pool, "_arena_page_tokens", 1)))
         _row_slot = getattr(pool, "row_slot", None)
         _slot_of = {}
+        # L15-12c-P1: the lane inside the arena page, lane = (row - S) % P,
+        # recorded next to the slot = (row - S) // P. Staging rows: lane -1.
+        # The row_slot map (draft role) is not page-addressed: lane 0 at
+        # P == 1 (the only lane), unknown (-1) at P > 1.
+        _lane_of = {}
         for rid, rows in l2_rows:
             per = []
+            lanes = []
             for r in rows:
                 if r < _s:
                     per.append(-1)
+                    lanes.append(-1)
                 elif _row_slot is not None:
                     per.append(int(_row_slot.get(r, -1)))
+                    lanes.append(0 if _p == 1 else -1)
                 else:
-                    per.append((r - _s) // _p)
+                    off = r - _s
+                    per.append(off // _p)
+                    lanes.append(off % _p)
             _slot_of[rid] = per
+            _lane_of[rid] = lanes
         uniq = sorted({s for per in _slot_of.values() for s in per if s >= 0})
         gen_of = {}
         if uniq:
@@ -345,6 +357,7 @@ def build_retain_kwargs(
                 tuple(per),
                 tuple(int(gen_of.get(s, -1)) for s in per),
             )
+            l2_lanes_by_rid[rid] = tuple(_lane_of[rid])
 
     # L15-12c-E2a: anchor host row -> (mamba arena slot, generation). One
     # state per slot: slot = row - staging_rows; a row below staging_rows
@@ -387,12 +400,19 @@ def build_retain_kwargs(
         # old empty columns when no host pool could be reached.
         return l2_by_rid.get(rid, ((), ()))
 
+    def l2_lanes_of(rid: str) -> Tuple[int, ...]:
+        # L15-12c-P1: the lane inside each held token's L2 page (parallel to
+        # l2_of's slots; -1 = staging). () when the pool was unreachable or
+        # the rid is unknown -- retain keeps the empty column.
+        return l2_lanes_by_rid.get(rid, ())
+
     return {
         "candidates": candidates,
         "node_of": node_of,
         "slots_of": slots_of,
         "anchor_slot_of": anchor_slot_of,
         "l2_of": l2_of,
+        "l2_lanes_of": l2_lanes_of,
         # L15-12c-E2a: the anchor's L2 identity, (-1, -1) when absent.
         "anchor_l2_of": lambda rid: anchor_l2_by_rid.get(rid, (-1, -1)),
         "caps_rows_by_rank": caps_rows_by_rank,
