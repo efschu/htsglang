@@ -1,0 +1,58 @@
+{
+ "variant": {
+  "HSA": "11.0.0",
+  "module": "/root/efeu35q3/ext_gfx11-generic/sglang_gguf_rocm.cpython-312-x86_64-linux-gnu.so"
+ },
+ "types": {
+  "Q3_K": {
+   "tensor": "token_embd.weight",
+   "elems": 2097152,
+   "launches": 20,
+   "bad_launches": 0,
+   "bad_elems_total": 0,
+   "bad_frac": 0.0,
+   "worst": 0.0,
+   "nonfinite": 0
+  },
+  "Q4_K": {
+   "tensor": "blk.2.attn_qkv.weight",
+   "elems": 2097152,
+   "launches": 20,
+   "bad_launches": 0,
+   "bad_elems_total": 0,
+   "bad_frac": 0.0,
+   "worst": 0.0,
+   "nonfinite": 0
+  },
+  "Q5_K": {
+   "tensor": "blk.0.attn_qkv.weight",
+   "elems": 2097152,
+   "launches": 20,
+   "bad_launches": 0,
+   "bad_elems_total": 0,
+   "bad_frac": 0.0,
+   "worst": 0.0,
+   "nonfinite": 0
+  },
+  "Q6_K": {
+   "tensor": "output.weight",
+   "elems": 2097152,
+   "launches": 20,
+   "bad_launches": 0,
+   "bad_elems_total": 0,
+   "bad_frac": 0.0,
+   "worst": 0.0,
+   "nonfinite": 0
+  },
+  "Q8_0": {
+   "tensor": "blk.40.attn_k.weight",
+   "elems": 1048576,
+   "launches": 20,
+   "bad_launches": 0,
+   "bad_elems_total": 0,
+   "bad_frac": 0.0,
+   "worst": 0.0,
+   "nonfinite": 0
+  }
+ }
+}

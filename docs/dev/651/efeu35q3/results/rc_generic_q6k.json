@@ -1,0 +1,40 @@
+{
+ "variant": {
+  "module_file": "/root/efeu35q3/ext_gfx11-generic/sglang_gguf_rocm.cpython-312-x86_64-linux-gnu.so",
+  "HSA_OVERRIDE_GFX_VERSION": "11.0.0",
+  "gcnArchName": "gfx1100",
+  "sclk_level": "auto"
+ },
+ "type": "Q6_K",
+ "rows": 4096,
+ "cols": 2048,
+ "ops": {
+  "dequant": {
+   "launches": 100,
+   "bad_launches": 0,
+   "consensus_vs_oracle": 6.175041198730469e-05,
+   "faults": [],
+   "n_fault_runs": 0,
+   "run_len_hist": {},
+   "wall_s": 341.8733742237091
+  },
+  "mmvq": {
+   "n": 25,
+   "nondet_launches": 0,
+   "worst_abs": 0.0017835713064187075,
+   "rel": 0.005259507692824514
+  },
+  "mmq": {
+   "n": 25,
+   "nondet_launches": 0,
+   "worst_abs": 0.0025944747162895965,
+   "rel": 0.0056782827574339695
+  },
+  "moe_vec": {
+   "n": 25,
+   "nondet_launches": 0,
+   "worst_abs": 0.0019486890045357086,
+   "rel": 0.0057928317880879
+  }
+ }
+}

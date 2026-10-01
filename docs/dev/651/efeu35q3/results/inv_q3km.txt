@@ -1,0 +1,99 @@
+gguf v3, 753 tensors, 52 kv
+  general.architecture = qwen35moe
+  general.base_model.0.name = Qwen3.6 35B A3B
+  general.base_model.0.organization = Qwen
+  general.base_model.0.repo_url = https://huggingface.co/Qwen/Qwen3.6-35B-A3B
+  general.base_model.count = 1
+  general.file_type = 12
+  general.languages = ['en']
+  general.license = apache-2.0
+  general.name = Ours
+  general.quantization_version = 2
+  general.sampling.temp = 1.0
+  general.sampling.top_k = 20
+  general.sampling.top_p = 0.949999988079071
+  general.size_label = 256x2.6B
+  general.tags = ['empero-ai', 'qwen3.6', 'qwen3.8', 'distillation', 'reasoning', 'function-calling', 'moe', 'sft', 'text-generation']
+  general.type = model
+  quantize.imatrix.chunks_count = 129
+  quantize.imatrix.dataset = /workspace/calib.txt
+  quantize.imatrix.entries_count = 510
+  quantize.imatrix.file = /workspace/gguf/imatrix.dat
+  qwen35moe.attention.head_count = 16
+  qwen35moe.attention.head_count_kv = 2
+  qwen35moe.attention.key_length = 256
+  qwen35moe.attention.layer_norm_rms_epsilon = 9.999999974752427e-07
+  qwen35moe.attention.recurrent_layers = {'__array_len__': 41, 'head': [True, True, True, False]}
+  qwen35moe.attention.value_length = 256
+  qwen35moe.block_count = 41
+  qwen35moe.context_length = 262144
+  qwen35moe.embedding_length = 2048
+  qwen35moe.expert_count = 256
+  qwen35moe.expert_feed_forward_length = 512
+  qwen35moe.expert_shared_feed_forward_length = 512
+  qwen35moe.expert_used_count = 8
+  qwen35moe.full_attention_interval = 4
+  qwen35moe.nextn_predict_layers = 1
+  qwen35moe.rope.dimension_count = 64
+  qwen35moe.rope.dimension_sections = [11, 11, 10, 0]
+  qwen35moe.rope.freq_base = 10000000.0
+  qwen35moe.ssm.conv_kernel = 4
+  qwen35moe.ssm.group_count = 16
+  qwen35moe.ssm.inner_size = 4096
+  qwen35moe.ssm.state_size = 128
+  qwen35moe.ssm.time_step_rank = 32
+  tokenizer.chat_template = {%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content...(+7644)
+  tokenizer.ggml.bos_token_id = 248044
+  tokenizer.ggml.eos_token_id = 248046
+  tokenizer.ggml.model = gpt2
+  tokenizer.ggml.padding_token_id = 248044
+  tokenizer.ggml.pre = qwen35
+type histogram: F32=310, Q3_K=301, Q4_K=124, Q5_K=6, Q6_K=1, Q8_0=11
+per-role types (layers):
+  attn_gate.weight                   Q3_K    30 layers 
+  attn_k.weight                      Q3_K    10 layers [3, 7, 11, 15, 19, 23, 27, 31, 35, 39] 
+  attn_k.weight                      Q8_0    1 layers [40] 
+  attn_k_norm.weight                 F32     11 layers [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 40] 
+  attn_norm.weight                   F32     41 layers 
+  attn_output.weight                 Q4_K    10 layers [3, 7, 11, 15, 19, 23, 27, 31, 35, 39] 
+  attn_output.weight                 Q8_0    1 layers [40] 
+  attn_q.weight                      Q3_K    10 layers [3, 7, 11, 15, 19, 23, 27, 31, 35, 39] 
+  attn_q.weight                      Q8_0    1 layers [40] 
+  attn_q_norm.weight                 F32     11 layers [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 40] 
+  attn_qkv.weight                    Q4_K    28 layers 
+  attn_qkv.weight                    Q5_K    2 layers [0, 1] RISK gfx1103: rare per-launch errors
+  attn_v.weight                      Q4_K    10 layers [3, 7, 11, 15, 19, 23, 27, 31, 35, 39] 
+  attn_v.weight                      Q8_0    1 layers [40] 
+  ffn_down_exps.weight               Q4_K    38 layers 
+  ffn_down_exps.weight               Q5_K    2 layers [0, 1] RISK gfx1103: rare per-launch errors
+  ffn_down_exps.weight               Q8_0    1 layers [40] 
+  ffn_down_shexp.weight              Q4_K    38 layers 
+  ffn_down_shexp.weight              Q5_K    2 layers [0, 1] RISK gfx1103: rare per-launch errors
+  ffn_down_shexp.weight              Q8_0    1 layers [40] 
+  ffn_gate_exps.weight               Q3_K    40 layers 
+  ffn_gate_exps.weight               Q8_0    1 layers [40] 
+  ffn_gate_inp.weight                F32     41 layers 
+  ffn_gate_inp_shexp.weight          F32     41 layers 
+  ffn_gate_shexp.weight              Q3_K    40 layers 
+  ffn_gate_shexp.weight              Q8_0    1 layers [40] 
+  ffn_up_exps.weight                 Q3_K    40 layers 
+  ffn_up_exps.weight                 Q8_0    1 layers [40] 
+  ffn_up_shexp.weight                Q3_K    40 layers 
+  ffn_up_shexp.weight                Q8_0    1 layers [40] 
+  nextn.eh_proj.weight               Q8_0    1 layers [40] 
+  nextn.enorm.weight                 F32     1 layers [40] 
+  nextn.hnorm.weight                 F32     1 layers [40] 
+  nextn.shared_head_norm.weight      F32     1 layers [40] 
+  output.weight                      Q6_K    global UNSAFE gfx1103: nondet WRONG -> requant Q8_0
+  output_norm.weight                 F32     global 
+  post_attention_norm.weight         F32     41 layers 
+  ssm_a                              F32     30 layers 
+  ssm_alpha.weight                   Q3_K    30 layers 
+  ssm_beta.weight                    Q3_K    30 layers 
+  ssm_conv1d.weight                  F32     30 layers 
+  ssm_dt.bias                        F32     30 layers 
+  ssm_norm.weight                    F32     30 layers 
+  ssm_out.weight                     Q3_K    30 layers 
+  token_embd.weight                  Q3_K    global 

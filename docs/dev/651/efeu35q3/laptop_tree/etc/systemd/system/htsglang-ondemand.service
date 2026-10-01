@@ -1,0 +1,50 @@
+[Unit]
+# #651: on-demand htsglang for the laptop.
+#
+# The unit is up from boot, but the MODEL is not: the front door loads it on
+# the first real request and parks it once the machine goes quiet. That is the
+# whole point -- a resident model costs 22.7 GiB of this machine's 29.5 GiB,
+# so "always ready" and "usable laptop" are mutually exclusive here.
+Description=htsglang on-demand front door (#651)
+Documentation=file:/root/651-p2/README-ondemand.md
+After=network-online.target var-lib-hicache.mount
+Wants=network-online.target
+# Not Requires=: the HiCache disk tier is an optimisation. If that mount is
+# missing the model still serves, just without a persistent prefix cache, and
+# refusing to start the assistant over a cold cache would be the wrong trade.
+After=local-fs.target
+
+[Service]
+Type=exec
+ExecStart=/root/lh/venv/bin/python /root/651-p2/scripts/htsglang_ondemand.py
+
+# The idle window before the model is parked. This is the knob the user is
+# most likely to change: raise it if reloads feel intrusive, lower it to get
+# the RAM back sooner. It costs a cold load (~2.5 min) to be wrong downward
+# and 22.7 GiB of RAM to be wrong upward.
+Environment=HTSGLANG_IDLE_PARK_SECONDS=60
+Environment=HTSGLANG_LISTEN_PORT=31651
+Environment=HTSGLANG_BACKEND_PORT=31661
+Environment=HTSGLANG_BOOT_SCRIPT=/root/651-p2/scripts/boot_ondemand.sh
+Environment=HTSGLANG_WAKE_TIMEOUT_SECONDS=900
+
+# The front door itself must never touch the GPU: it only starts and stops the
+# process that does. Without this a stray torch import in the supervisor would
+# create a HIP context and permanently hold GTT that the model needs.
+Environment=CUDA_VISIBLE_DEVICES=""
+
+Restart=always
+RestartSec=5
+
+# The supervisor signals the backend by PROCESS GROUP, so systemd must not
+# also try to clean up the tree -- KillMode=mixed would race the supervisor's
+# own park and can leave a half-dead server holding the GPU.
+KillMode=control-group
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=htsglang-ondemand
+
+[Install]
+WantedBy=multi-user.target

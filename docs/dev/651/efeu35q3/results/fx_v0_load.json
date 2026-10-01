@@ -1,0 +1,47 @@
+{
+ "launches": 40,
+ "faulty_launches": 40,
+ "wrong_elems": 2201060,
+ "H_perm": 14667,
+ "H_neigh": 107,
+ "H_raw": 0,
+ "H_prev": 2074795,
+ "unexplained": 112055,
+ "xor_popcount_hist": {
+  "1": 2127550,
+  "6": 10829,
+  "8": 13492,
+  "9": 11318,
+  "7": 13822,
+  "4": 2075,
+  "10": 7721,
+  "12": 1628,
+  "5": 5964,
+  "3": 1306,
+  "13": 482,
+  "11": 4148,
+  "14": 88,
+  "2": 624,
+  "15": 13
+ },
+ "nonfinite": 16128,
+ "blocks_hit": {
+  "996": 1105,
+  "1428": 1105,
+  "1444": 1095,
+  "1484": 1095,
+  "1004": 1080,
+  "1420": 1080,
+  "1436": 1080,
+  "1452": 1080,
+  "1460": 1080,
+  "1468": 1080
+ },
+ "consensus_vs_oracle_maxabs": 6.103515625e-05,
+ "n_blocks_hit": 9299,
+ "variant": {
+  "HSA": "11.0.0",
+  "module": "/root/lh/venv/lib/python3.12/site-packages/sglang_gguf_rocm.cpython-312-x86_64-linux-gnu.so",
+  "fresh_input": false
+ }
+}
