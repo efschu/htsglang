@@ -522,7 +522,7 @@ def _resumable_own(scheduler, req, rid: str, own: int) -> int:
     except Exception:  # noqa: BLE001 - a probe never breaks the ack
         return own
     if res is None or int(res) >= own:
-        return own
+        return _room_own(scheduler, req, rid, own)
     n = _bump(scheduler, "_pf_ack_unresumable_n")
     if n <= 32 or n % _LOG_EVERY == 0:
         logger.warning(
@@ -533,6 +533,63 @@ def _resumable_own(scheduler, req, rid: str, own: int) -> int:
             getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(res), n,
         )
     return int(res)
+
+
+def _loadback_rows(scheduler, req, told: int) -> Optional[int]:
+    """Rows this rank's admission must load back to hold ``told``: the matched
+    depth that is HOST-only (the device part is held already). None = no probe."""
+    try:
+        tree = getattr(scheduler, "tree_cache", None)
+        match = getattr(tree, "match_prefix", None)
+        ids = getattr(req, "full_untruncated_fill_ids", None)
+        if ids is None or len(ids) == 0:
+            ids = getattr(req, "origin_input_ids", None)
+        if tree is None or not callable(match) or ids is None or len(ids) == 0:
+            return None
+        from sglang.srt.managers.weg2_store_told import _probe_key
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+
+        key, _bigram = _probe_key(scheduler, req, ids, int(told))
+        mr = match(MatchPrefixParams(key=key))
+        _di = getattr(mr, "device_indices", None)
+        dev = 0 if _di is None else int(_di.numel() if hasattr(_di, "numel") else len(_di))
+        return max(0, min(int(told), dev + int(getattr(mr, "host_hit_length", 0) or 0)) - dev)
+    except Exception:  # noqa: BLE001 - a probe never breaks the ack
+        return None
+
+
+def _room_own(scheduler, req, rid: str, own: int) -> int:
+    """ACK-ROOM (dual1k dkr27bnvfp4dual1kbar1fs10010950, PP1 09:55:20Z, rid
+    weg2-0-10, a fork twin): the follower's read reproduced told=16383 and its
+    tree could resume there (host KV + anchor), but the head was HOST-only on
+    this rank (PP0/PP2 held it on the device) and the load-back found no room:
+    ``SF LOADBACK-ROOM PP-RESIDUAL kv_tokens=12288 avail=1717 evictable=0`` --
+    a concurrent 61440-token prefill held the pool. PP0 had admitted at told,
+    so #968 followed at once. The ack names 0 when this rank cannot hold the
+    told's load-back even with every evictable row freed: PP0 answers told=0
+    for EVERY rank (a rank-agreed re-prefill, chunked from 0) instead of a
+    group death. Read-only (nothing evicted here); no probe = no verdict."""
+    rows = _loadback_rows(scheduler, req, own)
+    if not rows:
+        return own
+    try:
+        tree = scheduler.tree_cache
+        alloc = getattr(tree, "token_to_kv_pool_allocator", None)
+        room = int(alloc.available_size()) + int(tree.evictable_size())
+    except Exception:  # noqa: BLE001 - no allocator readable: no verdict
+        return own
+    if room >= int(rows):
+        return own
+    n = _bump(scheduler, "_pf_ack_no_room_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-ACK NO-ROOM rank pp=%s rid=%s told=%d loadback_rows=%d room=%d (n=%d): "
+            "this rank holds the told span on its HOST only and cannot load it back even "
+            "with every evictable row freed -- the ack says 0 and PP0 answers told=0 for "
+            "every rank instead of an SF LOADBACK-ROOM residual and #968 after PP0 admitted",
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(rows), room, n,
+        )
+    return 0
 
 
 def _progress_free(tree) -> bool:
