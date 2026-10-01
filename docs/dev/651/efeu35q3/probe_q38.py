@@ -63,22 +63,27 @@ def run_round(label):
     return outs, passed
 
 
-res = {}
-print(f"=== round 1 (port {PORT}, model {MODEL}) ===")
-o1, p1 = run_round("round 1")
-print("=== round 2 ===")
-o2, p2 = run_round("round 2")
-res.update(round1=p1, round2=p2, rounds_identical=o1 == o2, outputs=o1)
-print("=== 8x identical greedy with logprobs ===")
-runs = [chat("Explain in two sentences what a hash map is.", 64, True) for _ in range(8)]
-texts = {r[0] for r in runs}
-lps = {json.dumps(r[1]) for r in runs}
-res.update(det8_texts_distinct=len(texts), det8_logprob_sets_distinct=len(lps), det8_text=runs[0][0])
-print(f"  distinct texts {len(texts)}/8, distinct logprob vectors {len(lps)}/8")
-print(f"  text: {' '.join(runs[0][0].split())[:160]}")
-ok = p1 == len(PROBES) and p2 == len(PROBES) and o1 == o2 and len(texts) == 1 and len(lps) == 1
-res["verdict"] = "COHERENT" if ok else "NOT COHERENT"
-print("VERDICT:", res["verdict"])
-if OUT:
-    json.dump(res, open(OUT, "w"), indent=1)
-sys.exit(0 if ok else 1)
+def main():
+    res = {}
+    print(f"=== round 1 (port {PORT}, model {MODEL}) ===")
+    o1, p1 = run_round("round 1")
+    print("=== round 2 ===")
+    o2, p2 = run_round("round 2")
+    res.update(round1=p1, round2=p2, rounds_identical=o1 == o2, outputs=o1)
+    print("=== 8x identical greedy with logprobs ===")
+    runs = [chat("Explain in two sentences what a hash map is.", 64, True) for _ in range(8)]
+    texts = {r[0] for r in runs}
+    lps = {json.dumps(r[1]) for r in runs}
+    res.update(det8_texts_distinct=len(texts), det8_logprob_sets_distinct=len(lps), det8_text=runs[0][0])
+    print(f"  distinct texts {len(texts)}/8, distinct logprob vectors {len(lps)}/8")
+    print(f"  text: {' '.join(runs[0][0].split())[:160]}")
+    ok = p1 == len(PROBES) and p2 == len(PROBES) and o1 == o2 and len(texts) == 1 and len(lps) == 1
+    res["verdict"] = "COHERENT" if ok else "NOT COHERENT"
+    print("VERDICT:", res["verdict"])
+    if OUT:
+        json.dump(res, open(OUT, "w"), indent=1)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

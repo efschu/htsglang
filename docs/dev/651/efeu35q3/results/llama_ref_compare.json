@@ -1,0 +1,87 @@
+{
+ "exact": 6,
+ "n": 9,
+ "rows": [
+  {
+   "prompt": "What is the capital of France? Answer with one word.",
+   "exact": true,
+   "common_chars": 5,
+   "common_tokens": 1,
+   "ref_tokens": 1,
+   "llama": "Paris",
+   "sglang": "Paris"
+  },
+  {
+   "prompt": "What is 14 * 3? Reply with just the number.",
+   "exact": true,
+   "common_chars": 2,
+   "common_tokens": 2,
+   "ref_tokens": 2,
+   "llama": "42",
+   "sglang": "42"
+  },
+  {
+   "prompt": "What is 31 * 7? Reply with just the number.",
+   "exact": true,
+   "common_chars": 3,
+   "common_tokens": 3,
+   "ref_tokens": 3,
+   "llama": "217",
+   "sglang": "217"
+  },
+  {
+   "prompt": "Which planet is known as the Red Planet? One word.",
+   "exact": true,
+   "common_chars": 4,
+   "common_tokens": 2,
+   "ref_tokens": 2,
+   "llama": "Mars",
+   "sglang": "Mars"
+  },
+  {
+   "prompt": "Complete the sequence with one number: 2, 4, 8, 16, ",
+   "exact": false,
+   "common_chars": 117,
+   "common_tokens": 34,
+   "ref_tokens": 84,
+   "llama": "The next number in the sequence is **32**.\n\n**Reasoning:**\nEach number is double the previous one (powers of 2):\n- $2 = 2^1$\n- $4 = 2^2$\n- $8 = 2^3$\n- $16 = 2^4$\n- **$32 = 2^5$**",
+   "sglang": "The next number in the sequence is **32**.\n\n**Reasoning:**\nEach number is double the previous one (powers of 2):\n- $2^1 = 2$\n- $2^2 = 4$\n- $2^3 = 8$\n- $2^4 = 16$\n- $2^5 = 32$"
+  },
+  {
+   "prompt": "In one short sentence: why does ice float on water?",
+   "exact": false,
+   "common_chars": 30,
+   "common_tokens": 6,
+   "ref_tokens": 17,
+   "llama": "Ice floats on water because its solid crystalline structure is less dense than liquid water.",
+   "sglang": "Ice floats on water because it is less dense than liquid water."
+  },
+  {
+   "prompt": "Write a Python expression that reverses the string s. Reply with code only.",
+   "exact": true,
+   "common_chars": 7,
+   "common_tokens": 4,
+   "ref_tokens": 4,
+   "llama": "s[::-1]",
+   "sglang": "s[::-1]"
+  },
+  {
+   "prompt": "What is 17 * 23? Reply with just the number.",
+   "exact": true,
+   "common_chars": 3,
+   "common_tokens": 3,
+   "ref_tokens": 3,
+   "llama": "391",
+   "sglang": "391"
+  },
+  {
+   "prompt": "Explain in two sentences what a hash map is.",
+   "exact": false,
+   "common_chars": 104,
+   "common_tokens": 22,
+   "ref_tokens": 44,
+   "llama": "A hash map is a data structure that stores key-value pairs by using a hash function to compute an index for each key. This allows for efficient insertion, deletion, and lookup operations, typically in constant time on average.",
+   "sglang": "A hash map is a data structure that stores key-value pairs by using a hash function to compute an index into an array of buckets. This allows for efficient insertion, deletion, and lookup operations, typically achieving average time complexity of O(1)."
+  }
+ ]
+}

@@ -1,0 +1,26 @@
+{
+  "label": "graphs_balanced",
+  "port": 31671,
+  "runA": {
+    "tag": "A",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 0.6813721769940457,
+    "gap_median_ms": 49.492753998492844,
+    "gap_p90_ms": 50.47301600279752,
+    "gap_max_ms": 103.8189999962924,
+    "decode_tok_per_s": 20.20497788485264
+  },
+  "runA_prime": {
+    "tag": "A'",
+    "requests": 2,
+    "tokens_timed": 508,
+    "ttft_median_s": 0.6373517980027827,
+    "gap_median_ms": 49.868996007717215,
+    "gap_p90_ms": 51.196275002439506,
+    "gap_max_ms": 104.27407400857192,
+    "decode_tok_per_s": 20.052539253953505
+  },
+  "noise_floor_pct": 0.7544607658957885,
+  "decode_tok_per_s": 20.20497788485264
+}
