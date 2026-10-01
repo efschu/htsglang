@@ -1304,9 +1304,10 @@ def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "")
     The recorded mark (:data:`OBSERVED_REAP_NONRECLAIM_BYTES`, 95.90) is the
     CT999 HOST reap point: global OOM, ``memory.max`` reads ``max``. Inside a
     finite cgroup the kernel reclaims and then OOM-kills at ``memory.max``
-    first, so the mark is the smaller of the two -- 84.00 in the Docker form
-    (``--memory 84g``), where every run-peak verdict priced against 95.90
-    funded 11.90 GiB the cgroup never had.
+    first, so inside a finite cgroup the mark IS ``memory.max`` -- 84.00 in
+    the Docker form (``--memory 84g``), 105.00 under the user's 2026-10-01
+    order (``--memory 105g``). The 95.90 constant is the fallback for a run
+    without a finite cgroup ceiling only.
 
     ``ceiling_source`` is :func:`resolve_cg_ceiling`'s own label: its lxcfs
     ``MemTotal`` FALLBACK is not a ceiling (CT999, 118 GiB) and keeps the
@@ -1318,7 +1319,13 @@ def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "")
         return const
     if ceiling_source and not ceiling_source.startswith("cgroup memory.max"):
         return const
-    return min(const, float(ceiling_bytes) / GIB)
+    # 2026-10-01 ~10:20Z user order ("trage 105gb ein", Docker containers
+    # get 105 GB): a finite cgroup memory.max IS the operator's chosen bound,
+    # so the mark follows it. The CT999 constant (95.90) only applies when no
+    # finite cgroup ceiling exists; min(const, ceiling) let the old host mark
+    # bind below a raised container cap (y6f W21 x3: predicted 97.0, measured
+    # peaks that day 87-90 GiB).
+    return float(ceiling_bytes) / GIB
 
 
 #: 29.09.: the line that names a derived runtime latch.
@@ -1859,7 +1866,7 @@ def watermark_breach_verdict(
     but ``own_pids`` no longer participates in the arithmetic.
     """
     m = margin if margin is not None else resolve_margin()
-    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    w = watermark_gib if watermark_gib is not None else reap_mark_gib()
     # #1269 FIX 4: the RUNTIME bound, which carries no model-error term. This
     # call grades a MEASUREMENT; the residual reserves for how wrong a
     # PREDICTION can be, and the measurement has already realised that error.
@@ -6197,7 +6204,7 @@ def _advisory_line(arm: Arm, chosen: bool, watermark_gib: Optional[float] = None
     # 29.09.: the mark `choose` graded against (reap_mark_gib), not the CT999
     # constant -- the advisory must say ABOVE where the refusal does.
     if watermark_gib is None:
-        watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+        watermark_gib = reap_mark_gib()
     predicted = arm.predicted_run_peak_gib()
     subject = "this arm" if chosen else f"the most frugal arm (S={arm.s_gb} M={arm.m_mib})"
     if predicted is None:

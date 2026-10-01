@@ -32,6 +32,10 @@ _KW = dict(
     ring_bytes=int(30.4 * GIB), ring_span1_bytes=int(15.0 * GIB),
     cg_current_bytes=int(9.0 * GIB), reclaimable_bytes=int(3.0 * GIB),
     cg_ceiling_bytes=int(123.78 * GIB), s_gb_d=4,
+    # 2026-10-01: a finite cgroup memory.max is now the reap mark itself; this
+    # specimen is the CT999 host without a Docker cap, so it names the lxcfs
+    # fallback and keeps grading against the recorded 95.90 watermark.
+    cg_ceiling_source="lxcfs MemTotal FALLBACK (CT999 specimen, no Docker cap)",
 )
 
 
@@ -150,7 +154,8 @@ class SizingIsUntouched1360(CustomTestCase):
         arm, _h, _l = _choose(deviation_reason="r", riegel_gib=93.0)
         plain = hl.price(
             int(123.78 * GIB), int(110.0 * GIB), 1, 150,
-            flip_ratchet=hl.resolve_flip_ratchet_gib(None), **_KW,
+            flip_ratchet=hl.resolve_flip_ratchet_gib(None),
+            **{k: v for k, v in _KW.items() if k != "cg_ceiling_source"},
         )
         skip = {"run_origin_source", "base_source", "flip_ratchet_source",
                 "launch_worst_case_margin_source"}

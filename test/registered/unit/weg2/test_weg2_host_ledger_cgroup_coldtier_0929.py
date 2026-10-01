@@ -76,8 +76,10 @@ class TestReapMark(CustomTestCase):
         # the front reads memory.max directly (no label): same rule
         self.assertAlmostEqual(host_ledger.reap_mark_gib(84 * GIB), 84.0, places=6)
 
-    def test_a_ceiling_above_the_host_mark_does_not_raise_it(self):
-        self.assertAlmostEqual(host_ledger.reap_mark_gib(200 * GIB, "cgroup memory.max"), CONST, places=6)
+    def test_a_finite_ceiling_above_the_host_mark_is_the_mark(self):
+        # 2026-10-01 user order ("trage 105gb ein"): the operator's Docker
+        # --memory is the bound; the 95.90 CT999 mark no longer caps it.
+        self.assertAlmostEqual(host_ledger.reap_mark_gib(200 * GIB, "cgroup memory.max"), 200.0, places=6)
 
 
 class TestChooseUnderMemoryMax(CustomTestCase):
