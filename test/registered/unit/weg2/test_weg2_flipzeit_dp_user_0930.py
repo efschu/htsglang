@@ -50,12 +50,31 @@ def test_the_park_rpc_starts_the_span_and_p_prefill_ends_it():
 def test_without_a_park_the_last_served_leg2_is_the_decode_end():
     c = fsi.DpFlipClock()
     c.note_d_served(50.0)
-    c.begin(3, 60.0, oldest_waiter_ts=None)
+    c.begin(3, 60.0, oldest_waiter_ts=58.0)
     c.done(62.0)
     ev = c.first_prefill("r", 62.1, 64.0, None)              # P's body carried no prefill time
     assert (ev["start_source"], ev["prefill_start_source"], ev["flip_user_ms"]) == \
-        ("last_d_served", "leg1_dispatch", 12100)
-    assert ev["parts"]["park_rpc_ms"] is None
+        ("oldest_waiter_arrival", "leg1_dispatch", 4100)
+    assert ev["parts"]["park_rpc_ms"] is None and ev["idle_flip"] is False
+    c.begin(5, 70.0, oldest_waiter_ts=40.0)                  # the waiter came first: D's served leg 2 starts it
+    c.done(71.0)
+    ev = c.first_prefill("r2", 71.1, 72.0, None)
+    assert (ev["start_source"], ev["flip_user_ms"]) == ("last_d_served", 21100)
+
+
+def test_an_idle_flip_starts_at_the_first_dispatch_not_at_the_decode_end():
+    # z30y14 epoch 4->5 (01.10. 02:44): the idle-layout swap began with outstanding=0 queue=0
+    # at 02:44:28.9, done 02:44:30.8; the first leg 1 came 26 s later (02:44:56.3, wall 2.56 s).
+    # The old clock read decode end -> P prefill start = 37.4 s, and M2 alarmed FLIP-SLOW.
+    c = fsi.DpFlipClock()
+    c.note_d_served(1000.0)
+    c.begin(4, 1010.9, oldest_waiter_ts=None)                # nobody waits for this flip
+    c.done(1012.8)
+    ev = c.first_prefill("weg2-5-5", t_dispatch=1038.3, t_end=1040.8, p_prefill_s=2.4)
+    assert ev["idle_flip"] is True
+    assert ev["start_source"] == "first_dispatch_after_idle_flip"
+    assert ev["flip_user_ms"] == 100                          # 1038.3 -> 1038.4: P's own queue only
+    assert ev["parts"]["pre_begin_ms"] is None                # the user came after the flip
 
 
 def test_the_span_starts_no_earlier_than_the_oldest_waiter():

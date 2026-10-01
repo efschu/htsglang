@@ -295,7 +295,12 @@ class DpFlipClock:
             end, src = float(flip_begin_ts), "flip_begin"
         if oldest_waiter_ts is not None and float(oldest_waiter_ts) > end:
             end, src = float(oldest_waiter_ts), "oldest_waiter_arrival"
+        # IDLE-FLIP (z30y14 epoch 5, 37.4 s): a flip with no waiter at its begin and
+        # no park before it is the idle-layout swap -- nobody waits for it, the first
+        # request arrives later. Its user clock then starts at that request's dispatch, never at
+        # the decode end, else the idle gap reads as flip time.
         self._armed = {"epoch": int(epoch_before) + 1, "start_ts": end, "start_source": src,
+                       "idle_flip": oldest_waiter_ts is None and park is None,
                        "flip_begin_ts": float(flip_begin_ts),
                        "park_rpc_ms": (None if park is None else park.get("rpc_ms")), "done_ts": None}
         self._park = None
@@ -316,15 +321,20 @@ class DpFlipClock:
         else:
             start, src = float(t_dispatch), "leg1_dispatch"
         done = a["done_ts"] if a["done_ts"] is not None else start
+        idle = bool(a.get("idle_flip"))
+        pre_begin_start = a["start_ts"]
+        if idle and float(t_dispatch) > a["start_ts"]:
+            a["start_ts"], a["start_source"] = float(t_dispatch), "first_dispatch_after_idle_flip"
+            pre_begin_start = None  # the user arrived after the flip: no pre-begin wait
 
         def ms(x, y):
             return None if x is None or y is None else round((float(y) - float(x)) * 1000.0)
-        return {"epoch": a["epoch"], "dir": "D>P", "rid": rid,
+        return {"epoch": a["epoch"], "dir": "D>P", "rid": rid, "idle_flip": idle,
                 "start_ts": round(a["start_ts"], 3), "start_source": a["start_source"],
                 "prefill_start_ts": round(start, 3), "prefill_start_source": src,
                 "flip_user_ms": ms(a["start_ts"], start),
                 "parts": {"park_rpc_ms": (None if a["park_rpc_ms"] is None else round(float(a["park_rpc_ms"]))),
-                          "pre_begin_ms": ms(a["start_ts"], a["flip_begin_ts"]),
+                          "pre_begin_ms": ms(pre_begin_start, a["flip_begin_ts"]),
                           "legs_ms": ms(a["flip_begin_ts"], done),
                           "first_chunk_ms": ms(done, start)},
                 "definition": "Decode-Ende -> P-Prefill-Start", "clock": "time.time front"}
