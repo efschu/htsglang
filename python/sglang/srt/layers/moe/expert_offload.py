@@ -4754,6 +4754,21 @@ class MoEExpertOffloadCache:
         C = pool_row_capacity(t, getattr(self, "_pool_capture_on", 0))
         need = pool_waves_for(int(n_ids), t.num_experts, resident_count(t), C)
         waves = min(need, cap)
+        if need > cap and int(getattr(self, "seat_rows", 0) or 0) > 0:
+            # y6n (01.10. 21:07:02, TP2): the step refuses this capture right
+            # after ('Step ids exceed the LRU rows plus the staging rows') --
+            # name the rank's own numbers once, the ones the launcher's
+            # WELLENBODEN (#239 S3g) had to price: C = LRU + staging + the
+            # capture floor of the seat rows (#251 CAPTURE-FLOOR, the top stage)
+            logging.getLogger(__name__).error(
+                "MoE expert pool layer %s (H95/#251c) CAPTURE-SHORT: demand min(ids, E-R)=%d "
+                "> %d wave(s) x C=%d (C counts %d capture-floor row(s) ON of %d seat rows, "
+                "lend head %d) for a captured step of %d ids -- the launcher's wave floor "
+                "priced more rows ON at the top KV stage than this rank's cells fund",
+                getattr(self.layer, "layer_id", None),
+                step_row_demand(int(n_ids), t.num_experts, resident_count(t)), cap, C,
+                int(getattr(self, "_pool_capture_on", 0) or 0), int(self.seat_rows),
+                int(getattr(self, "seat_lend_head", 0) or 0), int(n_ids))
         if self._pool_waves_seen.get(int(n_ids)) != waves:
             self._pool_waves_seen[int(n_ids)] = waves
             lid = getattr(self.layer, "layer_id", None)

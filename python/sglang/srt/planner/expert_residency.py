@@ -1463,6 +1463,7 @@ def solve_owned_cut(
     waves_cap: int = 0,
     stage_tokens: int = 0,
     stage_row_bytes: int = 0,
+    stage_floor_tokens: int = 0,
     switch_gain: float = 0.0,
 ) -> OwnedCut:
     """#239 S3f: ownership, token cut and FR_D in one solve.
@@ -1591,7 +1592,8 @@ def solve_owned_cut(
     def _raise_of(fits):
         return owned_scratch_raise(
             fits, ids_cap=int(ids_per_step) * int(seats_cap), waves=int(waves_cap),
-            stage_tokens=int(stage_tokens), stage_row_bytes=int(stage_row_bytes))
+            stage_tokens=int(stage_tokens), stage_row_bytes=int(stage_row_bytes),
+            stage_floor_tokens=int(stage_floor_tokens))
 
     def _verdict(fits, by):
         nonlocal guard_refused
@@ -1671,6 +1673,8 @@ def solve_owned_cut(
     _base_by_t = tuple((b, tuple(base_by[b])) for b in _bss)
     _guard = ((("seats", int(seats_cap)), ("waves", int(waves_cap)),
                ("stage_tokens", int(stage_tokens)), ("stage_row_bytes", int(stage_row_bytes)))
+              + ((("stage_floor_tokens", int(stage_floor_tokens)),)
+                 if int(stage_floor_tokens) > 0 else ())
               if guard_on else ())
     if best is None:
         return OwnedCut(ratios=(), cut=(), fractions=(), fits=(), round_ms=(),
@@ -1854,7 +1858,7 @@ OWNED_SWITCH_GAIN = 0.03
 
 def owned_wave_floor(
     fits: Sequence["_EdgeFit"], *, ids_cap: int, waves: int, stage_tokens: int = 0,
-    stage_row_bytes: int = 0,
+    stage_row_bytes: int = 0, stage_floor_tokens: int = 0,
 ) -> Tuple[str, ...]:
     """01.10. (y6n, Koordinator): the hard limits of a D form the owned solve
     may pick, ONE formula with the launcher's #239 S3g floor
@@ -1863,8 +1867,11 @@ def owned_wave_floor(
     the TOP KV stage, C_r - ceil(stage_tokens x trim_cell / stage_row), in at
     most ``waves`` waves (the H95 cap the line runs, not a raised one). A rank
     without KV keeps its whole scratch (the H95 pool step, D <= W x C). The
-    stage rows below the top cancel (the floor rows fund themselves), so the
-    top stage alone decides whether every seat count reaches it.
+    top stage alone decides whether every seat count reaches it; with a floor
+    ladder (``stage_floor_tokens`` = the KV span between the floor and S0, born
+    unmapped) its rows count from the floor minus the rows that span funds
+    (:func:`kv_stage_net_rows`) -- the floor rows do NOT fully fund themselves
+    when the span is not whole rows (y6n 01.10. 21:07:02, TP2: 12 rows, not 11).
 
     y6n (desk/nf-y6n-1001 @ b0bf738b39, dry run 20:18Z): 190,127,171 / cut
     0,52,12 gave TP1 E 134, R 64, C 44, trim cell 9984 B -> 21 rows at
@@ -1876,8 +1883,8 @@ def owned_wave_floor(
         R = max(int(f.ceiling_max_rows) - C, 0)
         d = min(int(ids_cap), max(E - R, 0))
         cell = int(getattr(f, "trim_cell", 0) or 0)
-        stage = (-(-int(stage_tokens) * cell // int(stage_row_bytes))
-                 if cell > 0 and int(stage_tokens) > 0 and int(stage_row_bytes) > 0 else 0)
+        stage = kv_stage_net_rows(int(stage_tokens), int(stage_floor_tokens), cell,
+                                  int(stage_row_bytes)) if int(stage_tokens) > 0 else 0
         cap = C - stage
         if cap <= 0 or d > int(waves) * cap:
             out.append("rang%d D %d > %d x (%d - %d Stufenzeilen) = %d"
@@ -1887,7 +1894,7 @@ def owned_wave_floor(
 
 def owned_scratch_raise(
     fits: Sequence["_EdgeFit"], *, ids_cap: int, waves: int, stage_tokens: int = 0,
-    stage_row_bytes: int = 0,
+    stage_row_bytes: int = 0, stage_floor_tokens: int = 0,
 ) -> Optional[Tuple[int, ...]]:
     """01.10. (y6n): the scratch each rank needs so that :func:`owned_wave_floor`
     holds at its edge -- the rows stay (budget and card fix ``R + S``), the
@@ -1903,8 +1910,8 @@ def owned_scratch_raise(
     for f in fits:
         E, C, rows = int(f.local_experts), int(f.scratch_rows), int(f.ceiling_max_rows)
         cell = int(getattr(f, "trim_cell", 0) or 0)
-        stage = (-(-int(stage_tokens) * cell // int(stage_row_bytes))
-                 if cell > 0 and int(stage_tokens) > 0 and int(stage_row_bytes) > 0 else 0)
+        stage = kv_stage_net_rows(int(stage_tokens), int(stage_floor_tokens), cell,
+                                  int(stage_row_bytes)) if int(stage_tokens) > 0 else 0
         gap = E - rows
         c2 = stage + -(-int(ids_cap) // max(W, 1))
         if W > 1:
@@ -1940,7 +1947,27 @@ def owned_form_limits(env_d: Mapping[str, str], *, text_cfg: Mapping[str, object
         small = int(form.small_row_bytes) if form is not None else 0
         out["stage_tokens"] = int(round(int(kv_tokens) * float(KV_STAGE_TOP_STEP)))
         out["stage_row_bytes"] = (int(round(row)) - small) * int(terms.n_layers)
+        # 01.10. (y6n): the floor ladder below S0 (kv_stage_table's floor_tokens):
+        # its unmapped span funds rounded-down rows, the top stage's rows count
+        # from the floor -- as the launcher's table and the rank's cells do
+        fl = owned_stage_floor_tokens(env_d)
+        if 0 < fl < int(kv_tokens):
+            out["stage_floor_tokens"] = int(kv_tokens) - fl
     return out
+
+
+def owned_stage_floor_tokens(env_d: Mapping[str, str]) -> int:
+    """SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS of the D group's env, else the
+    environ default (the launcher's ``d_kv_stage_floor_tokens``)."""
+    raw = (env_d or {}).get("SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS")
+    if raw is None:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS.get() or 0))
+    try:
+        return max(0, int(float(str(raw).strip() or 0)))
+    except ValueError:
+        return 0
 
 
 #: the last stage step of ``kv_stage_group`` (S0 x (1 + 1.0) = the top stage)
@@ -3603,6 +3630,32 @@ class KvStageTable(msgspec.Struct, frozen=True, kw_only=True):
         return tuple(w - t for w, t in zip(self.capture_waves(max_by_seats), self.waves))
 
 
+def kv_stage_rows_from(span_tokens: int, cell_bytes: int, row_bytes: int) -> int:
+    """#251c: the stage rows a KV span of ``span_tokens`` above the BORN stage
+    unmaps -- ``ceil(span x cell / row)``, one ceil over the whole span from
+    the born stage (the floor when one is set), exactly the rank's
+    ``stage_vram_cells`` arithmetic (the budget is the born form). 0 without a
+    span, a cell or a row."""
+    if int(span_tokens) <= 0 or int(cell_bytes) <= 0 or int(row_bytes) <= 0:
+        return 0
+    return -(-int(span_tokens) * int(cell_bytes) // int(row_bytes))
+
+
+def kv_stage_net_rows(stage_tokens: int, floor_span_tokens: int, cell_bytes: int,
+                      row_bytes: int) -> int:
+    """#251c, 01.10. (y6n): the rows a rank's scratch gives up for the KV of
+    the stage ``stage_tokens`` above S0 when ``floor_span_tokens`` of KV below
+    S0 are born unmapped (the floor ladder): the stage rows from the floor
+    (:func:`kv_stage_rows_from`) minus the rows the unmapped span funds
+    (rounded DOWN, ``KvStageTable.low_rows``). Without a floor the plain
+    ``ceil(stage x cell / row)``; with one it is that or one more -- the
+    remainder the rounded-down low rows leave unfunded."""
+    fs = max(0, int(floor_span_tokens))
+    total = kv_stage_rows_from(int(stage_tokens) + fs, cell_bytes, row_bytes)
+    low = (fs * int(cell_bytes) // int(row_bytes)) if fs and int(row_bytes) > 0 else 0
+    return max(0, int(total) - int(low))
+
+
 def kv_stage_table(
     rows: Sequence[SeatTableRow], form: SeatVramForm, *, kv_cell_bytes: int, kv_tokens: int,
     local_experts: int, verify_tokens: int, top_k: int, host_rank: int = 0,
@@ -3647,15 +3700,22 @@ def kv_stage_table(
     # floor's granularity (floor, 2 x floor, ... < S0). The booked plan still
     # prices S0's KV; the KV between the floor and S0 is born unmapped and its
     # bytes fund ``low`` more expert rows (rounded DOWN: never a byte more than
-    # the unmapped KV). The stage rows count from the floor, so S0 and every
-    # stage above it keep exactly today's rows (capture floor and waves unchanged).
+    # the unmapped KV). The stage rows count from the floor -- the born form the
+    # rank's cells are measured against (``d_seat_vram.stage_vram_cells``: the
+    # budget is the boot form at tokens[0] with ``rows`` ON), ONE ceil over the
+    # whole span (``kv_stage_rows_from``). S0 and every stage above keep
+    # today's rows wherever the floor span is whole rows; where it is not, the
+    # remainder the rounded-down ``low`` left unfunded costs that stage one
+    # row (y6n 01.10. 21:07:02, TP2: low 8 of 8.96 + ceil(10.24) = 19 counted,
+    # ceil(19.2) = 20 cut at the top -> the cell funded 0 rows, the table 1,
+    # the capture C 46 x 2 waves < 93 ids).
     fl = int(floor_tokens or 0)
     below = tuple(range(fl, t0, fl)) if 0 < fl < t0 else ()
     cell = int(kv_cell_bytes)
     low = ((t0 - below[0]) * cell // row_bytes) if below else 0
     tokens = below + up
-    stage_rows = tuple(low - ((t0 - t) * cell // row_bytes) for t in below) + tuple(
-        low + -(-(t - t0) * cell // row_bytes) for t in up)
+    stage_rows = tuple(kv_stage_rows_from(int(t) - int(tokens[0]), cell, row_bytes)
+                       for t in tokens)
     S = int(stage_rows[-1]) + 1
     if C + low - S <= max(1, int(staging_rows)):
         return _none(
@@ -3804,13 +3864,18 @@ def describe_kv_stage_residency(group: KvStageGroup, *, marker: str, label: str)
     out = []
     for t in group.tables:
         space = (int(t.tokens[-1]) - int(t.tokens[0])) * int(t.kv_cell_bytes) / MIB
+        low = int(getattr(t, "low_rows", 0) or 0)
         out.append(
             "%s FRACTION-SOLVE %s D-KV-STUFEN RESIDENZ (#239 S3g) rang%d: %d Stufenzeilen "
             "(%.1f MiB) sind in S0 Experten-Zeilen der Bank (Scratch %d -> %d, Sitzzeilen +%d, "
-            "kein neues Byte) fuer den ungemappten Stufenraum %.1f MiB (Trim-Zelle %d B/Tok x "
+            "%s) fuer den ungemappten Stufenraum %.1f MiB (Trim-Zelle %d B/Tok x "
             "%d Tok); S1..S%d schneiden %s davon am Wake ab (H95c-Zeilenschaltung) -- GERECHNET"
             % (marker, label, int(t.host_rank), int(t.rows), int(t.rows) * float(t.row_mib),
-               int(t.scratch), int(t.scratch) - int(t.rows), int(t.rows), space,
+               # the scratch the rank is given: the low rows are NEW bank rows
+               # (their KV below S0 is born unmapped), only the rest leaves it
+               int(t.scratch), int(t.scratch) - (int(t.rows) - low), int(t.rows),
+               ("%d davon neu aus dem ungemappten KV unter S0" % low) if low
+               else "kein neues Byte", space,
                int(t.kv_cell_bytes), int(t.tokens[-1]) - int(t.tokens[0]),
                len(t.tokens) - 1, list(t.stage_rows[1:])))
     return tuple(out)

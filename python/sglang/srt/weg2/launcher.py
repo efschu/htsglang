@@ -2927,9 +2927,15 @@ def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int
             after.append(c)
             on.append(0)
             continue
-        after.append(c - int(t.rows))
+        # the scratch the rank RUNS (SGLANG_MOE_SCRATCH_SLOTS as written:
+        # the low rows a floor ladder funds are NEW bank rows, only the rest
+        # leaves the scratch) = its 'C=LRU+staging'; on = its capture floor,
+        # the rows of the cap's top stage -- the two numbers the rank's H95
+        # line prints (y6n TP2: 46 + 0, where the old split read 38 + 9)
+        a = c - (int(t.rows) - int(getattr(t, "low_rows", 0) or 0))
+        after.append(a)
         j = min(int(max_by[cap - 1]), len(t.tokens) - 1)
-        on.append(int(t.capacity[cap - 1][j]) - (c - int(t.rows)))
+        on.append(int(t.capacity[cap - 1][j]) - a)
     lines, bad = rank_wave_floor(demand, after, on, int(waves_cap))
     # the smaller batches of a KV rank: its floor can sit lower (a stage the
     # cap never takes) -- the table's per-batch waves, the same floor rule

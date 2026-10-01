@@ -6,7 +6,10 @@ the stage ladder starts at the floor (floor, 2 x floor, ... < S0, then S0 and th
 stages above as today): the KV between the floor and S0 is born unmapped and its
 bytes fund expert rows (rounded down); the wake takes the stage holding its KNOWN
 tokens, the D-MEM-SCHED tick grows it between rounds. S0 and every stage above
-keep exactly today's rows, so the capture floor and the waves do not move.
+keep today's rows where the floor span is whole rows; 01.10. (y6n): where it is
+not, the rounded-down low rows leave a remainder the stage must still cut -- the
+rank's cells count every stage from the born floor in ONE ceil, so does the
+table (at most one row less ON than today, never one row more than the rank).
 """
 
 import os
@@ -44,11 +47,18 @@ def test_the_floor_ladder_funds_rows_and_keeps_s0_and_above():
     assert new.low_rows == (262144 - FLOOR) * 14143 // int(112.5 * 2**20) == 27
     assert new.low_rows * 112.5 * 2**20 <= (262144 - FLOOR) * 14143
     s0 = new.tokens.index(262144)
-    # S0 and every stage above: exactly today's stage rows and capacities
-    assert tuple(r - new.low_rows for r in new.stage_rows[s0:]) == old.stage_rows
+    # every stage counts from the born floor in ONE ceil -- the rank's cells
+    # (y6n 01.10.: low 8 + ceil 11 = 19 promised one row the cell did not fund)
+    row = int(112.5 * 2**20)
+    assert new.stage_rows == tuple(-(-(t - FLOOR) * 14143 // row) for t in new.tokens)
+    # S0 and above: today's rows, or one less where the floor remainder (27.5
+    # rows of KV, 27 funded) is still to cut -- here S0 and S1, the top is exact
+    for r_new, r_old in zip(new.stage_rows[s0:], old.stage_rows):
+        assert r_new - new.low_rows in (r_old, r_old + 1)
+    assert [r - new.low_rows for r in new.stage_rows[s0:]] == [1, 17, 32]
     assert new.rows == old.rows + new.low_rows
     for caps_new, caps_old in zip(new.capacity, old.capacity):
-        assert caps_new[s0:] == caps_old
+        assert [o - c for c, o in zip(caps_new[s0:], caps_old)] == [1, 1, 0]
         # below S0 the phase has MORE rows ON
         assert all(c >= caps_old[0] for c in caps_new[:s0])
     assert new.capacity[0][0] == old.capacity[0][0] + new.low_rows
