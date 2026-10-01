@@ -2904,6 +2904,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
+        if keep_mamba_rows > 1:
+            # L15-11c: clear() above re-armed free_slots = arange(1, size+1)
+            # and would hand the compacted anchors retain_at_sleep just
+            # reserved (l15_retain.py step 6, reserve_mamba_slots over
+            # [1, A_H)) to the next request -- the BYTES were kept by
+            # reset_state but the ALLOCATION bookkeeping forgot them. Carve
+            # the same rows back out. Slot 0 is padding and never in
+            # free_slots, so the range starts at 1. Lazy import: same
+            # pattern as weg2_p_overlap in allocator/mamba.py; the l15_*
+            # chain imports nothing from mem_cache (cycle checked).
+            from sglang.srt.weg2.l15_retain import reserve_mamba_slots
+
+            reserve_mamba_slots(self.mamba_allocator, range(1, keep_mamba_rows))
         # A flush must also reset the mamba pool's device-side state
         # (conv/temporal, ReplaySSM rings + write cursors, spec
         # intermediates): freed slot ids get recycled, and any surviving
