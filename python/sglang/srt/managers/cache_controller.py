@@ -187,6 +187,18 @@ def _l3_rank_identity_or_none(server_args):
     except Exception:  # noqa: BLE001
         return None
 
+def _l3_rank_format_or_none(server_args):
+    """L3-FORMAT (N2): the persistent store's byte-layout record, or None."""
+    if server_args is None:
+        return None
+    try:
+        from sglang.srt.mem_cache.hicache_storage import l3_rank_format
+
+        return l3_rank_format(server_args)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -2157,6 +2169,7 @@ class HiCacheController:
             model_name=model_name,
             model_identity_hash=model_identity_hash,
             l3_rank_identity=_l3_rank_identity_or_none(server_args),
+            l3_rank_format=_l3_rank_format_or_none(server_args),
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,

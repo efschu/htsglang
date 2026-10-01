@@ -50,6 +50,62 @@ def _release_fill_claims(arena, claims, reason: str) -> None:
         _free_named(arena, [s for s, _ in claims], reason)
 
 
+#: arena.c slot states (hicache_arena.STATE_*), named here to keep the copy
+#: paths free of a storage.file import at module load
+_ARENA_STATE_COMPLETE = 2
+_ARENA_STATE_EVICTING = 3
+
+#: L3-CSUM (N2, 01.10.): a BLOB (an arena slot class above 1 MiB -- the mamba
+#: anchor, 78 MB on 27B) carries a CRC32 sidecar: computed from the slot at
+#: its disk copy (pinned, generation-checked after the write), verified when
+#: an L3 fill reads it back into the arena. A mismatch is a NAMED miss
+#: (``L3-CSUM MISMATCH``): the claim is released, the request recomputes, and
+#: the bad file is moved aside (``.csumbad706``, never deleted) so the
+#: recomputed page can be written again. A blob without a sidecar (written
+#: before N2) is read as before and counted. KV pages (32 KB, millions) carry
+#: none: one sidecar inode per page would double the store's file count.
+L3_CSUM_SUFFIX = ".crc706"
+L3_CSUM_BAD_SUFFIX = ".csumbad706"
+L3_CSUM_MIN_BYTES = 1 << 20
+
+
+def l3_csum_on() -> bool:
+    return os.environ.get("SGLANG_WEG2_L3_BLOB_CSUM", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _crc32_of(view) -> int:
+    import zlib
+
+    return zlib.crc32(view) & 0xFFFFFFFF
+
+
+def l3_csum_write(final_path: str, crc: int, total: int) -> bool:
+    """The sidecar of a published blob, atomically (tmp + rename)."""
+    side = final_path + L3_CSUM_SUFFIX
+    tmp = f"{side}.w{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps({"crc32": int(crc), "total": int(total)}))
+        os.replace(tmp, side)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def l3_csum_read(final_path: str):
+    """(crc32, total) of a blob's sidecar, or None (no sidecar / unreadable)."""
+    try:
+        with open(final_path + L3_CSUM_SUFFIX) as f:
+            d = json.loads(f.read())
+        return int(d["crc32"]), int(d["total"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _free_named(arena, slots, reason: str) -> None:
     """#1427s: ARENA-FREE with a named reason (hicache_arena.free_named;
     imported here, the storage.file package imports this module)."""
@@ -193,6 +249,51 @@ def l3_rank_identity(server_args: Any) -> dict:
     }
 
 
+#: L3-FORMAT (N2, 01.10.): the generation of the persisted BYTE LAYOUT -- the
+#: canonical KV page (cells, K/V order, page size) and the mamba blob
+#: (temporal-then-conv, layer-major, the conv sub-block cut of
+#: hicache_migrate.conv_extents). Bump it in the commit that changes either
+#: layout: the next boot then refuses the old store by name (W165 format)
+#: instead of reading old bytes as new ones. Deliberately NOT an image rev --
+#: an image that does not touch the layout keeps the store.
+L3_FORMAT_GENERATION = 1
+
+
+def _model_cfg_value(server_args: Any, name: str) -> str:
+    """``name`` from the model's config.json (top level, then text_config);
+    '' when absent or unreadable."""
+    try:
+        model = str(getattr(server_args, "model_path", "") or "")
+        path = os.path.join(model, "config.json") if os.path.isdir(model) else ""
+        if not path or not os.path.isfile(path):
+            return ""
+        with open(path) as f:
+            cfg = json.load(f)
+        for d in (cfg, cfg.get("text_config") or {}):
+            if isinstance(d, dict) and d.get(name) is not None:
+                return str(d[name])
+    except (OSError, ValueError):
+        return ""
+    return ""
+
+
+def l3_rank_format(server_args: Any) -> dict:
+    """L3-FORMAT: what the persisted bytes MEAN, shared by every group of a
+    store (P writes what D reads): the layout generation, the KV cell dtype
+    and page size, the recurrent-state dtype (resolved from the model config
+    when the flag is unset) and the model dtype (the conv state's). Group
+    specifics that do not change the stored bytes (ReplaySSM, uneven ratios
+    -- the ratios are in every key) are left out."""
+    ssm = str(getattr(server_args, "mamba_ssm_dtype", "") or "") or _model_cfg_value(server_args, "mamba_ssm_dtype")
+    return {
+        "format_gen": int(L3_FORMAT_GENERATION),
+        "kv_cache_dtype": str(getattr(server_args, "kv_cache_dtype", "") or "auto").lower(),
+        "page_size": int(getattr(server_args, "page_size", 1) or 1),
+        "mamba_ssm_dtype": (ssm or "auto").lower(),
+        "dtype": str(getattr(server_args, "dtype", "") or "auto").lower(),
+    }
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -264,6 +365,10 @@ class HiCacheStorageConfig:
     #: (``canonical_page_store.owner_row_window``). None keeps the page-1
     #: owner form (whole pages, one owner each) and every other path as is.
     canonical_kv_owner_rows: Optional[tuple] = None
+    #: L3-FORMAT (N2): the byte-layout record of the persistent store, shared
+    #: by all groups (see l3_rank_format). None checks nothing. Last field:
+    #: no positional constructor moves.
+    l3_rank_format: Optional[dict] = None
 
 
 @dataclass
@@ -1333,6 +1438,7 @@ class HiCacheFile(HiCacheStorage):
         # L3P (N3/N4): refuse a persistent store whose recorded rank identity
         # differs, BEFORE the evictor adopts a single page of it.
         self._l3p_check_rank_identity(storage_config)
+        self._l3p_check_rank_format(storage_config)
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
@@ -1454,6 +1560,55 @@ class HiCacheFile(HiCacheStorage):
             f"{ident!r}. Two identities never share an L3 store (user 2026-09-27). "
             f"The launcher's directory identity did not separate them -- move the "
             f"directory aside or set SGLANG_WEG2_L3_PERSIST=0.")
+
+    def _l3p_check_rank_format(self, storage_config) -> None:
+        """L3-FORMAT (N2, 01.10.): ``L3_FORMAT.json`` -- ONE record per store,
+        for every group, because P writes the bytes D reads. Same protocol as
+        the rank identity (tmp file + link(2): the first rank records, every
+        rank compares); a store written before this record existed gets it
+        from the first rank that arrives -- its bytes ARE generation 1, the
+        layout this record was introduced with. A mismatch is W165 by name:
+        never read old bytes as a new layout."""
+        fmt = getattr(storage_config, "l3_rank_format", None)
+        if not fmt or not self._l3p_persistent_dir():
+            return
+        path = os.path.join(self.file_path, "L3_FORMAT.json")
+        body = json.dumps(fmt, sort_keys=True)
+        tmp = f"{path}.w{os.getpid()}"
+        try:
+            with open(tmp, "w") as f:
+                f.write(body)
+            try:
+                os.link(tmp, path)
+                logger.info("L3-FORMAT recorded %s", body)
+                return
+            except FileExistsError:
+                pass
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        have = None
+        for _ in range(50):
+            try:
+                with open(path) as f:
+                    txt = f.read()
+                if txt:
+                    have = json.loads(txt)
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.1)
+        if have == fmt:
+            return
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2L3IdentityMismatch
+
+        raise Weg2L3IdentityMismatch(
+            f"W165 Weg2L3IdentityMismatch (format): persistent L3 store {self.file_path!r} holds "
+            f"bytes of format {have!r}; this rank writes and reads {fmt!r}. A changed byte layout "
+            f"(L3_FORMAT_GENERATION, KV dtype/page size, recurrent-state dtype) never reads the old "
+            f"bytes -- move the directory aside or set SGLANG_WEG2_L3_PERSIST=0.")
 
     def _l3p_register_suffixes(self, shared_keys: bool) -> None:
         """L3P N1: ``L3_SUFFIXES.<group>.json`` = the suffixes this group's
@@ -2955,7 +3110,8 @@ class HiCacheFile(HiCacheStorage):
         tot = {"arenas": 0, "complete": 0, "new": 0, "on_disk": 0, "written": 0,
                "pending": 0, "refused": 0, "bytes": 0, "paused": None,
                "sliced": False, "deferred": 0, "slices": 0, "slice_max_ms": 0.0,
-               "slice_max_stems": 0, "last_slice_at_ms": 0.0, "stat_ms": 0.0, "stat_cpu_ms": 0.0, "cont": bool(cont)}
+               "slice_max_stems": 0, "last_slice_at_ms": 0.0, "stat_ms": 0.0, "stat_cpu_ms": 0.0, "cont": bool(cont),
+               "torn": 0}
         t0 = time.perf_counter()
         c0 = time.thread_time()
         deadline = (t0 + slice_s) if slice_s > 0 else None
@@ -3069,7 +3225,14 @@ class HiCacheFile(HiCacheStorage):
                             stop_all = True
                             break
                     sub = todo[off:off + chunk]
-                    ok = arena.pin_complete(slots[sub], klo[sub], khi[sub])
+                    # ARENA-COPY-GEN: the pin, the post-copy check and the
+                    # unpin are bound to the census generation (an arena
+                    # without them -- a hermetic double -- keeps the key pin)
+                    gen_bound = callable(getattr(arena, "pin_complete_gen", None))
+                    if gen_bound:
+                        ok = arena.pin_complete_gen(slots[sub], gens[sub], klo[sub], khi[sub])
+                    else:
+                        ok = arena.pin_complete(slots[sub], klo[sub], khi[sub])
                     pinned = sub[ok]
                     batch = []
                     try:
@@ -3088,12 +3251,33 @@ class HiCacheFile(HiCacheStorage):
                             self._ensure_shard_dir(path)
                             batch.append((i, stem, path))
                         if batch:
+                            # L3-CSUM: a blob's CRC from the pinned slot,
+                            # taken BEFORE the write; the generation check
+                            # after it proves the bytes did not move between
+                            crcs = None
+                            if total >= L3_CSUM_MIN_BYTES and l3_csum_on():
+                                crcs = [_crc32_of(arena.slot_view(int(slots[b[0]]), total)) for b in batch]
                             statuses = pio.write_pages(
                                 [b[2] for b in batch], [total] * len(batch),
                                 [((0, total),)] * len(batch),
                                 [int(arena.slot_ptr(int(slots[b[0]]))) for b in batch], fsync,
                             )
-                            for (i, stem, _path), st in zip(batch, statuses):
+                            still = None
+                            if gen_bound:
+                                bi = np.asarray([b[0] for b in batch], dtype=np.int64)
+                                still = arena.slots_still(slots[bi], klo[bi], khi[bi],
+                                                          _ARENA_STATE_COMPLETE, gens=gens[bi])
+                            for k_b, ((i, stem, _path), st) in enumerate(zip(batch, statuses)):
+                                if still is not None and not bool(still[k_b]):
+                                    # the slot moved under the copy (freed +
+                                    # re-claimed): the file may hold another
+                                    # page -- unpublish what THIS pass wrote,
+                                    # never mark the page secured
+                                    self._l3_unpublish_torn(stem, _path, st, "write_behind")
+                                    tot["torn"] += 1
+                                    continue
+                                if st == 0 and crcs is not None:
+                                    l3_csum_write(_path, crcs[k_b], total)
                                 if st in (0, 2):
                                     self._evictor.commit(stem)
                                     sec_gen[slots[i]] = gens[i]
@@ -3105,7 +3289,10 @@ class HiCacheFile(HiCacheStorage):
                                     self._evictor.abort(stem)
                                     tot["pending"] += 1
                     finally:
-                        arena.unpin(slots[pinned])
+                        if gen_bound:
+                            arena.unpin_gen(slots[pinned], gens[pinned])
+                        else:
+                            arena.unpin(slots[pinned])
                     if refused:
                         tot["refused"] += 1
                         tot["pending"] += int(todo.shape[0]) - off - len(batch)
@@ -3138,7 +3325,9 @@ class HiCacheFile(HiCacheStorage):
         tot["ms"] = (time.perf_counter() - t0) * 1e3
         tot["cpu_ms"] = (time.thread_time() - c0) * 1e3
         over = slice_s > 0 and tot["ms"] > 4.0 * slice_s * 1e3
-        if tot["written"] or tot["refused"] or tot["sliced"] or over:
+        if tot["torn"]:
+            self._l3wb_torn = getattr(self, "_l3wb_torn", 0) + tot["torn"]
+        if tot["written"] or tot["refused"] or tot["sliced"] or over or tot["torn"]:
             k = getattr(self, "_l3wb_logged", 0) + 1
             self._l3wb_logged = k
             if k <= 32 or k % 64 == 0 or tot["refused"] or over:
@@ -3147,7 +3336,7 @@ class HiCacheFile(HiCacheStorage):
                     "arenas=%d complete=%d new=%d on_disk=%d pending=%d refused=%d "
                     "paused=%s written_total=%d budget=%s slice_ms=%.0f slices=%d "
                     "slice_max_ms=%.1f slice_max_stems=%d stat_ms=%.1f stat_cpu_ms=%.1f "
-                    "deferred=%d cont=%d sliced_total=%d (L2 pages copied to the persistent L3 "
+                    "deferred=%d cont=%d sliced_total=%d torn=%d torn_total=%d (L2 pages copied to the persistent L3 "
                     "without a free; budget=hit: the pass stopped at a slice edge and continues "
                     "after the yield, deferred stems are NOT dropped)",
                     n, tot["written"], tot["bytes"], tot["ms"], tot["cpu_ms"],
@@ -3156,9 +3345,73 @@ class HiCacheFile(HiCacheStorage):
                     ("hit" if tot["sliced"] else ("OVER" if over else "ok")) if slice_s > 0 else "off",
                     slice_s * 1e3, tot["slices"], tot["slice_max_ms"], tot["slice_max_stems"],
                     tot["stat_ms"], tot["stat_cpu_ms"], tot["deferred"], int(bool(cont)),
-                    getattr(self, "_l3wb_sliced_n", 0),
+                    getattr(self, "_l3wb_sliced_n", 0), tot["torn"], getattr(self, "_l3wb_torn", 0),
                 )
         return tot
+
+    def _l3_csum_verify(self, arena, slot: int, stem: str, path: str, total: int) -> bool:
+        """L3-CSUM: the blob just read into ``slot`` against its sidecar.
+        True = verified, or no sidecar (pre-N2 blob, counted). False = a
+        MISMATCH: named, the file moved aside (``.csumbad706`` -- kept, never
+        deleted) so the recomputed blob can be written again."""
+        side = l3_csum_read(path) if path else None
+        if side is None:
+            self._l3_csum_legacy = getattr(self, "_l3_csum_legacy", 0) + 1
+            return True
+        want_crc, want_total = side
+        got = _crc32_of(arena.slot_view(int(slot), int(total))) if want_total == int(total) else None
+        if got == want_crc:
+            self._l3_csum_ok = getattr(self, "_l3_csum_ok", 0) + 1
+            return True
+        n = getattr(type(self), "_l3_csum_bad_n", 0) + 1
+        type(self)._l3_csum_bad_n = n
+        moved = False
+        try:
+            os.replace(path, path + L3_CSUM_BAD_SUFFIX)
+            os.replace(path + L3_CSUM_SUFFIX, path + L3_CSUM_BAD_SUFFIX + L3_CSUM_SUFFIX)
+            moved = True
+            idx = getattr(self._evictor, "l3_index", None)
+            if idx is not None:
+                idx.remove([stem])
+        except Exception:  # noqa: BLE001 - the miss stands either way
+            pass
+        logger.warning("L3-CSUM MISMATCH n=%d stem=%s crc=%s want=%08x total=%d want_total=%d moved_aside=%s "
+                       "(a persisted blob whose bytes are not the bytes written: a named MISS, the request "
+                       "recomputes)", n, stem, ("%08x" % got) if got is not None else "-", want_crc,
+                       int(total), want_total, moved)
+        return False
+
+    def _l3_unpublish_torn(self, stem: str, path: str, status: int, site: str) -> None:
+        """ARENA-COPY-GEN: a copy whose slot moved during the write. What THIS
+        copy published (pageio status 0: renamed into place; 1: a partial with
+        its marker) is removed -- a clean miss, recomputed by the next reader
+        -- and its evictor reservation aborted; a file that already existed
+        (status 2) was not written from this slot and stays. Named, counted."""
+        try:
+            if status in (0, 1):
+                from sglang.srt.mem_cache.canonical_page_store import marker_path, part_path
+
+                for p in (path, part_path(path), marker_path(path), path + L3_CSUM_SUFFIX):
+                    try:
+                        os.unlink(p)
+                    except FileNotFoundError:
+                        pass
+                idx = getattr(self._evictor, "l3_index", None)
+                if idx is not None:
+                    try:
+                        idx.remove([stem])
+                    except Exception:  # noqa: BLE001 - the index heals on its next scan
+                        pass
+            self._evictor.abort(stem)
+        except Exception as exc:  # noqa: BLE001 - loud: a torn file left behind is named
+            logger.warning("L3-COPY-TORN unpublish failed site=%s stem=%s (%s: %s)",
+                           site, stem, type(exc).__name__, exc)
+        n = getattr(type(self), "_l3_torn_n", 0) + 1
+        type(self)._l3_torn_n = n
+        if n <= 16 or (n & (n - 1)) == 0:
+            logger.warning("L3-COPY-TORN n=%d site=%s stem=%s status=%d (the arena slot was freed and "
+                           "re-claimed during its disk copy: the file is unpublished, a clean miss -- "
+                           "never another page's bytes under this stem)", n, site, stem, int(status))
 
     def _arena_note_disk_home(self, arena, suffixed: str) -> None:
         """#1410: this blob's home is the DISK tier from now on (this process)."""
@@ -3293,6 +3546,12 @@ class HiCacheFile(HiCacheStorage):
         paths = [self._existing_path(st) for _, _, _, st in todo]
         ptrs = [arena.slot_ptr(slot) for _, slot, _, _ in todo]
         rc, threads = l3_read_pages_parallel(pio, paths, int(total_bytes), ptrs)
+        rc = list(rc)
+        if int(total_bytes) >= L3_CSUM_MIN_BYTES and l3_csum_on():
+            for k, r in enumerate(rc):
+                if r == 0 and not self._l3_csum_verify(arena, todo[k][1], todo[k][3], paths[k],
+                                                       int(total_bytes)):
+                    rc[k] = -1   # L3-CSUM: a named miss -- released below like a failed read
         ok = [k for k, r in enumerate(rc) if r == 0]
         # a failed read still holds its claim (fresh or joined): released, so a
         # slot another rank joined stays theirs (#1427r)
@@ -3403,7 +3662,7 @@ class HiCacheFile(HiCacheStorage):
         COMPLETE pages with no disk copy (#1427 stage i, 49 unlogged drops on
         PP0 between 06:17:41 and 06:22:29); the probe had counted them, the
         read found neither slot nor file and ended at page 219 of 813."""
-        out = {"on_disk": 0, "written": 0, "lost": 0}
+        out = {"on_disk": 0, "written": 0, "lost": 0, "torn": 0}
         if not cands:
             return out
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
@@ -3444,15 +3703,43 @@ class HiCacheFile(HiCacheStorage):
                 out["lost"] += 1
                 continue
             self._ensure_shard_dir(path)
-            todo.append((stem, slot, total, path))
+            todo.append((stem, slot, total, path, lo, hi))
         if todo and pio is not None:
+            crcs = [None] * len(todo)
+            if l3_csum_on() and callable(getattr(arena, "slot_view", None)):
+                for k_t, t in enumerate(todo):
+                    if int(t[2]) >= L3_CSUM_MIN_BYTES:
+                        crcs[k_t] = _crc32_of(arena.slot_view(int(t[1]), int(t[2])))
             statuses = pio.write_pages(
                 [t[3] for t in todo], [int(t[2]) for t in todo],
                 [((0, int(t[2])),) for t in todo],
                 [int(arena._lib.arena_slot_ptr(arena._base, int(t[1]))) for t in todo],
                 canonical_fsync_default(),
             )
-            for (stem, slot, total, path), st in zip(todo, statuses):
+            # ARENA-COPY-GEN: an EVICTING candidate (key known) must still be
+            # EVICTING under its key after the copy -- otherwise something
+            # freed and re-claimed it during the write and the file may hold
+            # another page. A pinned COMPLETE candidate (#257 ii passes no
+            # key, the W3 spill key 0/0) is held by its reference and is not
+            # judged here.
+            still = [True] * len(todo)
+            judged = [k for k, t in enumerate(todo) if t[4] and t[5]]
+            checker = getattr(arena, "slots_still", None)
+            if judged and callable(checker):
+                import numpy as np
+                ok = checker(np.asarray([todo[k][1] for k in judged], dtype=np.int64),
+                             np.asarray([int(todo[k][4]) for k in judged], dtype=np.uint64),
+                             np.asarray([int(todo[k][5]) for k in judged], dtype=np.uint64),
+                             _ARENA_STATE_EVICTING)
+                for k, good in zip(judged, ok):
+                    still[k] = bool(good)
+            for k_t, ((stem, slot, total, path, _lo, _hi), st) in enumerate(zip(todo, statuses)):
+                if not still[k_t]:
+                    self._l3_unpublish_torn(stem, path, st, "evict")
+                    out["torn"] += 1
+                    continue
+                if st == 0 and crcs[k_t] is not None:
+                    l3_csum_write(path, crcs[k_t], int(total))
                 if st in (0, 1, 2):
                     self._evictor.commit(stem)
                     out["written"] += 1
@@ -3460,7 +3747,7 @@ class HiCacheFile(HiCacheStorage):
                     self._evictor.abort(stem)
                     out["lost"] += 1
         elif todo:
-            for stem, slot, total, path in todo:
+            for stem, slot, total, path, _lo, _hi in todo:
                 self._evictor.abort(stem)
             out["lost"] += len(todo)
         # L3-REUSE 0928: the KV page's L3 copy carries its QSA index sibling.
