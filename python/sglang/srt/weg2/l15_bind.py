@@ -36,6 +36,15 @@ def slots_of_req(req, req_to_token) -> Tuple[int, ...]:
     offload_kv_cache, reads the same span). A 0 INSIDE the span is the
     padding slot (freed/never-written row): raise.
     """
+    # L15-FIX-NOIDX: a req whose req_to_token row was already released has
+    # req_pool_idx None (N3c 01.10.: int(None) raised a TypeError that killed
+    # every retain round). ValueError = "this rid cannot be held", which
+    # build_retain_kwargs skips per rid.
+    if getattr(req, "req_pool_idx", None) is None:
+        raise ValueError(
+            f"req {getattr(req, 'rid', '?')!r} has no req_pool_idx "
+            "(its req_to_token row is released)"
+        )
     row = int(req.req_pool_idx)
     n = max(_seq_len(req) - 1, 0)
     span = req_to_token[row, :n]
@@ -245,8 +254,18 @@ def build_retain_kwargs(
     # L15-12c-E2a: (rid, mamba anchor host row, -1 when absent) -- the
     # anchor state's L2 identity, snapshot at bind like the KV rows.
     anchor_rows = []
+    skipped = []  # L15-FIX-NOIDX: (rid, reason) of reqs that cannot be held
     for req in reqs:
         rid = str(req.rid)
+        # L15-FIX-NOIDX: a req without a holdable token span (no
+        # req_to_token row, or the padding slot inside its span) is skipped
+        # per rid -- before this fix its error escaped and the whole round
+        # flushed (N3c: 21/21 sleeps "failed before the move").
+        try:
+            _slots = slots_of_req(req, req_to_token)
+        except ValueError as exc:
+            skipped.append((rid, str(exc)))
+            continue
         by_rid[rid] = req
         seq_len = _seq_len(req)
         # KV exists for seqlen - 1 tokens only (schedule_batch.py:2821).
@@ -256,7 +275,6 @@ def build_retain_kwargs(
         # retain admits against caps with these rows, while compact_plan
         # reserves by the exact owned count -- a proportional split can
         # over-admit past a cap on the rounding residue (audit item 11).
-        _slots = slots_of_req(req, req_to_token)
         # L15-12c-C2: snapshot the chain's host rows NOW (reset_keep nulls
         # host_value later); a node missing its last_node skips l2 (retain
         # skips the whole round for that rid anyway).
@@ -306,6 +324,11 @@ def build_retain_kwargs(
                 "anchor_depth": span,
                 "kv_depth": span,
             }
+        )
+    if skipped:
+        log(
+            "L15-RETAIN skipped %d req(s) without a holdable span: %s"
+            % (len(skipped), "; ".join("%s (%s)" % (r, why) for r, why in skipped[:4]))
         )
     candidates = candidates_from(entries)
 
