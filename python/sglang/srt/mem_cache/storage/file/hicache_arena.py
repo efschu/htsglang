@@ -219,6 +219,75 @@ def _note_free(reason: str, slots) -> None:
                     reason, n, (list(slots)[:4] if n else []), k, cnt[1], caller)
 
 
+#: ZR-1 (port of NF cfecb699df): the writer tag of this process in the slot
+#: census (arena.c arena_set_writer_tag): P rank r -> r, D rank r -> 8 + r,
+#: any other -> 16 + r, 31 = not known yet (stamped until the rank is)
+WRITER_TAG_UNKNOWN = 31
+_writer_tag: Optional[int] = None
+#: this line keeps no claim roles (NF's L3FILL-JOINED series does); the census
+#: answers role 0
+CLAIM_ROLES = {0: "other"}
+
+
+def _rank_writer_tag() -> Optional[int]:
+    """This process's census tag, or None while its rank is not known."""
+    try:
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return None
+        rank = int(dist.get_rank())
+    except Exception:  # noqa: BLE001 - a tag is bookkeeping, never a gate
+        return None
+    group = os.environ.get("SGLANG_WEG2_GROUP", "").strip().upper()
+    base = 0 if group == "P" else 8 if group == "D" else 16
+    return min(base + rank, 30)
+
+
+def ensure_writer_tag(lib, tag: Optional[int] = None) -> None:
+    """ZR-1: stamp this process's writer tag once its rank is known (an
+    explicit ``tag`` wins -- tests and single-process tools)."""
+    global _writer_tag
+    if tag is not None:
+        _writer_tag = int(tag)
+        lib.arena_set_writer_tag(_writer_tag)
+        return
+    if _writer_tag is not None:
+        return
+    t = _rank_writer_tag()
+    if t is None:
+        return
+    _writer_tag = t
+    lib.arena_set_writer_tag(t)
+
+
+def writer_tag_text(tag: int) -> str:
+    tag = int(tag)
+    if tag == WRITER_TAG_UNKNOWN:
+        return "?"
+    if tag < 8:
+        return "P%d" % tag
+    if tag < 16:
+        return "D%d" % (tag - 8)
+    return "R%d" % (tag - 16)
+
+
+def writer_tags_text(mask: int) -> str:
+    """``P0+D1+D2`` for a census bit mask (tag per bit), ``-`` for none."""
+    names = [writer_tag_text(t) for t in range(32) if mask & (1 << t)]
+    return "+".join(names) if names else "-"
+
+
+def claim_open_text(stem: str, row: dict) -> str:
+    """ZR-1 ``ARENA-CLAIM-OPEN`` body of one census row."""
+    return ("slot=%d stem=%s gen=%d claimed_by=%s joined=%s merged=%s open=%d claims=%d "
+            "covered=%d/%d ivals=%d same_key_slots=%d age_ms=%d pid=%d role=%s state=%d" % (
+                row["slot"], stem[:64], row["gen"], writer_tag_text(row["owner_tag"]),
+                writer_tags_text(row["joined"]), writer_tags_text(row["merged"]), row["open"],
+                row["claims"], row["covered"], row["total"], row["ivals"], row["same_key_slots"],
+                row["age_ms"], row["pid"], CLAIM_ROLES.get(row["role"], str(row["role"])), row["state"]))
+
+
 def free_named(arena, slots, reason: str) -> None:
     """#1427s: ``arena.free_slots(slots, reason=reason)`` for every caller; a
     hermetic fake arena without the keyword frees as before."""
@@ -334,6 +403,13 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_pin_complete_gen.argtypes = [p_u8, i64, p_i64, p_i64, p_u64, p_u64, p_i8]
             lib.arena_unpin_gen.restype = i64
             lib.arena_unpin_gen.argtypes = [p_u8, i64, p_i64, p_i64]
+            # ZR-1 (port of NF cfecb699df): index lock + writer census
+            lib.arena_set_writer_tag.restype = None
+            lib.arena_set_writer_tag.argtypes = [ctypes.c_uint32]
+            lib.arena_claim_census.restype = i64
+            lib.arena_claim_census.argtypes = [p_u8, i64, p_i64, p_i64]
+            lib.arena_index_lock_steals.restype = i64
+            lib.arena_index_lock_steals.argtypes = [p_u8]
             lib.arena_slots_still.restype = i64
             lib.arena_slots_still.argtypes = [p_u8, i64, p_i64, p_i64, p_u64, p_u64, ctypes.c_int32, p_i8]
             _lib = lib
@@ -460,6 +536,7 @@ class ShmArena:
         c_pay = (ctypes.c_void_p * n)(*[int(p) for p in payload_ptrs])
         c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
         st = (ctypes.c_int8 * n)()
+        ensure_writer_tag(self._lib)
         self._lib.arena_write(self._base, n, lo, hi, c_tot, n_ext, c_off, c_len, c_pay, c_stems, st)
         return list(st)
 
@@ -636,6 +713,7 @@ class ShmArena:
         st = (ctypes.c_int8 * n)()
         # xsn350: keys hashed in C (arena_claim_stems); the Python key128 per
         # stem was ~30 ms per 4096-page node in the scheduler thread.
+        ensure_writer_tag(self._lib)
         rc = self._lib.arena_claim_stems(self._base, n, c_stems, c_tot, slots, gens, st)
         if rc < 0:
             lo, hi = self._keys(stems)
@@ -655,6 +733,7 @@ class ShmArena:
         p_slots = slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
         p_gens = gens.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
         p_st = st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
+        ensure_writer_tag(self._lib)
         rc = self._lib.arena_claim_stems(self._base, n, c_stems, c_tot, p_slots, p_gens, p_st)
         if rc < 0:
             lo, hi = self._keys(stems)
@@ -899,6 +978,31 @@ class ShmArena:
         if freed:
             _note_free(reason, freed)
         return out
+
+    #: ZR-1: values per slot of arena_claim_census (arena.c CENSUS_W)
+    _CENSUS_KEYS = ("gen", "state", "pid", "role", "owner_tag", "joined", "merged", "open",
+                    "claims", "ivals", "covered", "total", "same_key_slots", "age_ms")
+
+    def claim_census(self, slots: Sequence[int]) -> list:
+        """ZR-1: the writer census of each slot as a dict (``_CENSUS_KEYS`` +
+        ``slot``); a slot out of range answers gen -1."""
+        n = len(slots)
+        if n == 0:
+            return []
+        w = len(self._CENSUS_KEYS)
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        out = (ctypes.c_int64 * (n * w))()
+        self._lib.arena_claim_census(self._base, n, c_sl, out)
+        rows = []
+        for i in range(n):
+            row = {k: int(out[i * w + c]) for c, k in enumerate(self._CENSUS_KEYS)}
+            row["slot"] = int(slots[i])
+            rows.append(row)
+        return rows
+
+    def index_lock_steals(self) -> int:
+        """ZR-1: how often the index lock was taken over from a dead holder."""
+        return int(self._lib.arena_index_lock_steals(self._base))
 
     def stats(self) -> dict:
         out = (ctypes.c_int64 * 4)()
