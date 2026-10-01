@@ -427,8 +427,12 @@ class ModelProfile:
     #: #49 rest: SGLANG_WEG2_FRONT_SPAN_INFLIGHT (front; effective only with
     #: ``agent_span``).
     front_span_inflight: bool
-    #: PF: SGLANG_WEG2_TOLD_GROUP_FALLBACK -- a field only, OFF on both rows:
-    #: unproven on metal (operator 26.09.).
+    #: PF: SGLANG_WEG2_TOLD_GROUP_FALLBACK (weg2_told_fallback). qwen27b ON
+    #: since z30y14 (01.10. 03:15:38Z, image 02adfaadee: PP1 died in #1400
+    #: STORE-TOLD MISMATCH told=97631 own=93858 -- the P ranks' store views
+    #: differ, a short follower read is a fact no wait closes, and PF is the
+    #: only rank-agreed answer to it: told=0 for every rank). nextflash off
+    #: until the NF seat releases it with a boot tag.
     told_group_fallback: bool
     vision: str
     context_tokens: int
@@ -796,14 +800,21 @@ PROFILES: Dict[str, ModelProfile] = {
         warm_min_dwell=False,
         agent_span=True,
         standard_form=False,
-        # RG 26.09.: on as proven by dkr27brc10bar1agent09261821 (rc11a);
-        # PF stays off (unproven on metal).
+        # RG 26.09.: on as proven by dkr27brc10bar1agent09261821 (rc11a).
         inline_system_in_place=True,
         told_probe_tree_key=True,
         told_paced=True,
         p_twin_defer=True,
         front_span_inflight=True,
-        told_group_fallback=False,
+        # PF ON (z30y14, 01.10. 03:15:38Z): rid weg2-64-273, PP0 read 97631
+        # (l3fill 1888 from the #706 canonical store only PP0 indexes), PP1
+        # 95684 -> #257 anchor 93858, PP2 95716; the followers' reads ENDED
+        # short (#1157 REAPED 2.09 s of 97 s), so the paced told's window /
+        # idle admit put told=97631 on the wire and PP1 refused by name. With
+        # PF, PP0 admits only on the followers' acks and answers own != told
+        # with told=0 for EVERY rank (re-prefill, never a split, never a death).
+        # Not yet seen on metal: the first boot must show PF TOLD-OPEN lines.
+        told_group_fallback=True,
         vision="transient",
         context_tokens=262144,
         # OPERATOR 26.09. (UN4): the 27B-RC9 records count on this tree as a

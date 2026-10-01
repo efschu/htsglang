@@ -2,8 +2,8 @@
 dkr27brc10bar1agent09261821 (image rc11a, 26.09. 18:21-18:56Z) proved on
 metal -- 108 requests, flips 0.23/request (before 1.35), wasted prefill ~7 %
 (before 48 %), 0 group deaths, ENV-IM-RANG all five = 1 on P, D and the front
--- are MODEL PROFILE fields (weg2/form.py PREFIX_SWITCHES), plus PF as a field
-only (off, unproven on metal). qwen27b on; nextflash since HS 27.09. TK, PACED
+-- are MODEL PROFILE fields (weg2/form.py PREFIX_SWITCHES), plus PF (qwen27b
+on since z30y14, 01.10.; nextflash off). qwen27b on; nextflash since HS 27.09. TK, PACED
 and TW on (NF3), MZ and #49 off until the NF seat releases them. An explicitly
 set env wins. P, D (build_env) and the front
 (its env) get one value; MZ must be equal on P and D. No form: off.
@@ -68,9 +68,9 @@ def test_the_registry_rows():
     q, n = FM.PROFILES["qwen27b"], FM.PROFILES["nextflash"]
     assert tuple(e for _f, e in FM.PREFIX_SWITCHES) == ALL
     for fld, env in FM.PREFIX_SWITCHES:
-        assert getattr(q, fld) is (env != PF), env
+        assert getattr(q, fld) is True, env  # PF on since z30y14 (01.10.)
         assert getattr(n, fld) is _nf_on(env), env
-        assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][env] is (env != PF), env
+        assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][env] is True, env
         assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][env] is _nf_on(env), env
     assert FM.PREFIX_SWITCH_P_EQ_D == (MZ,)
 
@@ -81,7 +81,8 @@ def test_state_per_profile(clean, profile, want):
         on, src = FM.prefix_switch_state(name, {}, profile)
         assert on is (want or (profile == "nextflash" and _nf_on(name))), name
         assert src == (f"profile {profile}" if profile else "no form (code default off)")
-    assert FM.prefix_switch_state(PF, {}, "qwen27b") == (False, "profile qwen27b")
+    assert FM.prefix_switch_state(PF, {}, "qwen27b") == (True, "profile qwen27b")
+    assert FM.prefix_switch_state(PF, {}, "nextflash") == (False, "profile nextflash")
 
 
 def test_state_reads_the_published_form(clean):
@@ -130,8 +131,8 @@ def test_blank_env_is_unset():
 def test_publish_writes_only_on_values():
     q = {}
     rows = FM.publish_prefix_switches(q, "qwen27b")
-    assert q == {n: "1" for n in FIVE}
-    assert [(n, on) for n, on, _ in rows] == [(n, n != PF) for n in ALL]
+    assert q == {n: "1" for n in ALL}
+    assert [(n, on) for n, on, _ in rows] == [(n, True) for n in ALL]
     nf = {"X": "y"}
     FM.publish_prefix_switches(nf, "nextflash")
     assert nf == dict({"X": "y"}, **{n: "1" for n in NF3})  # only the on rows are written
@@ -149,7 +150,7 @@ def test_the_line_names_value_and_source():
     assert line.startswith("WEG2-PREFIX-SWITCHES ")
     assert "SGLANG_WEG2_TOLD_PACED=1 (profile qwen27b)" in line
     assert "SGLANG_WEG2_P_TWIN_DEFER=0 (env SGLANG_WEG2_P_TWIN_DEFER=0)" in line
-    assert f"{PF}=0 (profile qwen27b)" in line
+    assert f"{PF}=1 (profile qwen27b)" in line
 
 
 # --- P, D and front get one value ------------------------------------------------------------
@@ -158,9 +159,8 @@ def test_the_line_names_value_and_source():
 @pytest.mark.parametrize("group", ["P", "D"])
 def test_build_env_27b_carries_the_five(clean, group):
     env = _build(group, "qwen27b")
-    for n in FIVE:
+    for n in ALL:
         assert env.get(n) == "1", (group, n)
-    assert PF not in env
 
 
 @pytest.mark.parametrize("group", ["P", "D"])
@@ -181,7 +181,7 @@ def test_build_env_27b_differs_by_exactly_the_five(clean):
     for g, env in with_rows.items():
         without = _build(g, "qwen27b")
         added = {k: v for k, v in env.items() if k not in without}
-        assert added == {n: "1" for n in FIVE}, g
+        assert added == {n: "1" for n in ALL}, g
         assert {k: v for k, v in env.items() if k in without} == without, g
 
 
@@ -281,7 +281,7 @@ def test_profile_docker_owns_the_switches():
     n = {f.key: f.value for f in PD.registry_facts("nextflash", "int4-mixed")}
     for name in FIVE:
         assert q[f"_form {name}"] == "1" and n[f"_form {name}"] == ("1" if _nf_on(name) else "0")
-    assert q[f"_form {PF}"] == "0" and n[f"_form {PF}"] == "0"
+    assert q[f"_form {PF}"] == "1" and n[f"_form {PF}"] == "0"
     # a profile that drops the lines is registry-only, one that states 0 is a DIFF
     rows = PD.compare(PD.registry_facts("qwen27b", "int8"), {})
     assert ("_form SGLANG_WEG2_TOLD_PACED", "1", "-", "registry-only") in rows
@@ -317,7 +317,7 @@ def test_rank_readers_follow_the_profile(clean, profile, want):
         clean.setenv(FM.FORM_ENV, _form(profile).env_value())
     nf = profile == "nextflash"
     for name, read in _readers().items():
-        assert read() is ((want and name != PF) or (nf and _nf_on(name))), (profile, name)
+        assert read() is (want or (nf and _nf_on(name))), (profile, name)
     # TK brings the absolute told along (its rank default follows TREE_KEY)
     assert st._absolute_armed() is (want or nf)
 
