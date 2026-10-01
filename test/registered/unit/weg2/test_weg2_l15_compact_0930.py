@@ -237,6 +237,19 @@ def test_compact_plan_rejects_duplicate_slots():
         compact_plan({"a": [3, 19], "b": [19, 20]}, P27)
 
 
+def test_compact_plan_rejects_held_slot_on_reserved_slot():
+    # L1.5 audit item 9 (symmetry with anchor_plan): a held slot on a
+    # reserved slot (padding slot 0) is a ValueError naming the slot, not
+    # a silent double-count of its owner's need.
+    with pytest.raises(ValueError, match=r"held slot\(s\) \[0\]"):
+        compact_plan({"a": [0, 3, 19]}, P27, reserved=(0,))
+    with pytest.raises(ValueError, match=r"held slot\(s\) \[0, 7\]"):
+        compact_plan({"a": [0, 7]}, PNF, reserved=(0, 7))
+    # Disjoint held and reserved still plans fine (pre-existing behaviour).
+    plan = compact_plan({"a": [3, 4]}, P27, reserved=(0,))
+    assert plan.moves == ()
+
+
 def test_compact_plan_nf_prefix_zero_ratio_rank_unreachable():
     # (e) via the plan: under NF no held slot can be of class 0, so the plan
     # always succeeds for the two live ranks; the ValueError path of

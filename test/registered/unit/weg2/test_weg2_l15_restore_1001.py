@@ -115,6 +115,6 @@ def test_check_line_and_restore_line_formats():
         R.check_line(2, 40, 1, 3) == "L15-CHECK rank=2 ok=40 bad=1 missing=3"
     )
     assert R.restore_line(7, "hold", (2, 2, 4), 5, 1) == (
-        "L15-RESTORE epoch=7 verdict=hold rows_by_rank=2,2,4 "
+        "L15-RESTORE epoch=7 verdict=hold keep_rows_by_rank=2,2,4 "
         "refill_rows=5 missing=1"
     )

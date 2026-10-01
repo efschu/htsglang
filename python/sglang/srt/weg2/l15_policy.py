@@ -14,7 +14,9 @@ Policy (see docs/L15-PLAN-0930.md rule 2.2):
 - Admit greedily in that order while every rank r keeps sum(rows) <=
   cap_rows_by_rank[r] and anchors <= cap_anchor_slots (one anchor slot per
   admitted request). A candidate that does not fit is skipped with reason
-  "no_room"; later smaller candidates may still fit.
+  "no_room"; a candidate that fits in rows but is turned away because the
+  anchor cap is full is skipped with reason "anchor_full"; later smaller
+  candidates may still fit.
 - A rank whose cap is 0 (the 5090 / TP0 rank) does NOT block: its rows are
   filled from L2 at the wake, so cap 0 means "not held here", not "no room"
   -- only ranks with cap > 0 are checked. HoldSet.rows_by_rank still sums the
@@ -95,6 +97,10 @@ def select_hold(
             admitted.append(c)
             for r, rows in enumerate(c.rows_by_rank):
                 rem[r] -= rows
+        elif fits:
+            # Fits in rows but the anchor cap is full: a distinct reason
+            # (audit item 10) keeps the log unambiguous vs row-cap "no_room".
+            excluded[c.rid] = (c.rid, "anchor_full")
         else:
             excluded[c.rid] = (c.rid, "no_room")
 

@@ -47,7 +47,11 @@ class HoldSpan:
 class Manifest:
     """A rank's whole L1.5 hold state at one epoch, as published for the
     group. ``rows_by_rank`` is the per-rank row budget and ``anchor_slots``
-    the anchor region size -- both part of the group agreement."""
+    the anchor region size -- both part of the group agreement.
+    ``rows_by_rank`` is the per-rank KEEP capacity (blocks*ratio_r from the
+    compact plan), NOT the admitted rows -- ``l15_policy.HoldSet.rows_by_rank``
+    carries the latter, and the L15-RETAIN/L15-RESTORE log lines print this
+    field as ``keep_rows_by_rank``."""
 
     epoch: int
     pid: int

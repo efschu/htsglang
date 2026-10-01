@@ -252,7 +252,7 @@ def test_rows_land_at_new_slots_reserved_leave_free_pages_manifest_roundtrips(
     # the one log line carries exactly that fingerprint
     line = sc["log_lines"][-1]
     m = re.fullmatch(
-        r"L15-RETAIN epoch=77 n=2 rows_by_rank=(?P<rows>[\d,]+) "
+        r"L15-RETAIN epoch=77 n=2 keep_rows_by_rank=(?P<rows>[\d,]+) "
         r"l_h=(?P<lh>\d+) anchors=3 fp=(?P<fp>-?\d+)", line)
     assert m is not None, line
     assert m.group("rows") == ",".join(str(x) for x in res.plan.rows_by_rank)

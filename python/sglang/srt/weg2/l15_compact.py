@@ -139,8 +139,10 @@ def compact_plan(
     per-class count of held slots, ``L_H = hold_prefix(need)``; see the module
     docstring for the move rule. ``reserved`` (e.g. padding slot 0, the dummy
     write target for padded tokens) counts toward its owner's need, is never
-    a compaction target and is not part of ``moves``/``new_slots``; the
-    default ``()`` reproduces the pre-L15-11b behaviour exactly.
+    a compaction target and is not part of ``moves``/``new_slots``; a held
+    slot that is also reserved is a ValueError naming the slot (the same
+    rule ``anchor_plan`` enforces for anchors). The default ``()``
+    reproduces the pre-L15-11b behaviour exactly.
     """
     s = _check_prefix(prefix)
     n_ranks = len(prefix) - 1
@@ -158,6 +160,16 @@ def compact_plan(
                 )
             held_all.add(slot)
             need[owner_of(slot, prefix)] += 1
+    hit = sorted(reserved_set & held_all)
+    if hit:
+        # Symmetry with anchor_plan: a held anchor on a reserved slot is a
+        # ValueError; a held KV slot must fail the same way, not silently
+        # double-count its owner's need in the loop below.
+        raise ValueError(
+            f"held slot(s) {hit} sit on a reserved slot (padding slot 0 is "
+            "the dummy write target for padded tokens); a held slot must "
+            "never land there"
+        )
     for slot in reserved_set:
         need[owner_of(slot, prefix)] += 1
 

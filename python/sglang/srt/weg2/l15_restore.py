@@ -113,9 +113,12 @@ def restore_line(
     epoch: int, verdict: str, rows_by_rank: Sequence[int],
     refill_rows: int, missing: int,
 ) -> str:
+    # rows_by_rank is the manifest's per-rank KEEP capacity (not the
+    # admitted rows of a HoldSet); printed as keep_rows_by_rank so the
+    # two never clash under the same log key.
     rows = ",".join(str(x) for x in rows_by_rank)
     return (
-        "L15-RESTORE epoch=%d verdict=%s rows_by_rank=%s "
+        "L15-RESTORE epoch=%d verdict=%s keep_rows_by_rank=%s "
         "refill_rows=%d missing=%d"
         % (epoch, verdict, rows, refill_rows, missing)
     )
