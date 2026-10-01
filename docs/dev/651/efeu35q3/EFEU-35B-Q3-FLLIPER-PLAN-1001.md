@@ -202,3 +202,51 @@ Alle Zahlen bs1, ein Request, Energieprofil **balanced** (wenn nicht anders gena
 4. cp1024 nicht gemessen (erwartet +3 %).
 5. Kalt-Prefill mit HiCache 92 tok/s @20k gegen 111 tok/s @6k ohne: Anteil Schreib-Overhead vs. lange Attention nicht getrennt.
 6. omp-Prompt-Layout (Verzeichnis früh im Systemprompt) bricht sitzungsübergreifende Wiederverwendung.
+
+---
+## 12. Korrektur nach Nutzer-Einwand 01.10. 12:20Z: „Es gibt keinen Flip, nur das Wiederverwenden der Bytes“
+
+**Zurückgezogen:** §11.5. Das Kostenmodell rechnete 6,6 GB Umzug je Richtung, ~13,5 s und eine Schwelle von ~11k Token und unterstellte damit Kopien. Auf dieser APU stimmt das nicht; Messungen unten.
+
+### 12.1 Zero-Copy gemessen (zerocopy/zc_bench.hip, zc_corun.hip; 2 GiB; balanced)
+| Allokation | iGPU liest | CPU liest | gleiche Adresse |
+|---|---|---|---|
+| hipMalloc (GTT) | 87,4 GB/s | — (nicht CPU-abgebildet) | — |
+| hipHostMalloc kohärent | 85,3 | 59,5 | ja |
+| hipHostMalloc nicht-kohärent | 84,9 | 59,5 | ja |
+| malloc + hipHostRegister | 83,8 | 59,5 | ja |
+| hipMallocManaged | 86,0 | 59,5 | ja |
+- Folgerung: Die iGPU liest einmal gehaltene, CPU-sichtbare Gewichte mit 96–98 % ihrer Bandbreite, die CPU dieselben Bytes mit voller CPU-Bandbreite. Ein P/D-Wechsel muss also KEIN Byte bewegen.
+- Ko-Lauf auf einem Puffer: iGPU allein 82,9 GB/s, CPU allein 58,8 GB/s, beide zusammen 54,3 + 24,8 = **79,1 GB/s** (< iGPU allein). Eine CPU-Stufe bringt Rechenleistung, aber keine Bandbreite.
+- Heutiger Ist-Fehler, durch Messung belegt: kt LLAMAFILE kopiert alle Experten in eigenen Anon-Speicher (12,9 GB RSS). Deshalb starb kt32 (224 GPU- / 32 CPU-Experten) am OOM-Killer. Die Doppelhaltung ist ein Defekt der heutigen Integration, keine Physik.
+
+### 12.2 Messungen TP2-Form (iGPU + CPU rechnen DIESELBE Schicht; Experten-Teilung über kt) und CPU-Referenz
+| Form | Prefill 2k | Prefill 6k | Decode bs1 | Kohärenz |
+|---|---|---|---|---|
+| iGPU solo, Graphen (Dienstform, out_proj-Hebel) | 111,8 / 112,5 | 110,6 / 110,7 | **21,50 / 21,56** | 8/8 |
+| iGPU solo, eager | 113,0 / 113,6 | 110,5 / 110,8 | 17,59 / 17,70 | 8/8 |
+| TP2-Experten 128/128 (kt, eager, Baum vor dem Hebel) | **154,3 / 158,0** | — | 11,92 / 11,93 | 8/8 |
+| TP2-Experten 224/32 | OOM (kt-Doppelkopie) | | | |
+| llama.cpp nur CPU (8 Threads), gleiche Datei | 82,8 / 81,5 (1,5k) | 74,0 / 75,4 (4,6k) | **23,5 / 23,2** | (Referenz) |
+- TP2 für P: zahlt (+37 % bei 2k), obwohl die geteilte TDP mitspielt. Der Gewinn kommt aus der MoE-Hälfte: Die MoE-MMQ der iGPU ist bei 512 Token × 8 / 256 Experten ≈ 16 Token je Experte ineffizient, die CPU nimmt ihr genau diesen Teil ab.
+- TP2 für D: verliert, 11,9 gegen 17,6 tok/s eager bzw. 21,5 mit Graphen. Ursachen: zwei Host-Synchronisationen je Schicht ohne Graphen; zusätzliche Bandbreite gibt es nicht (12.1).
+- CPU allein dekodiert mit 23,3 tok/s schneller als unsere iGPU (21,5). Der iGPU-Decode ist nicht bandbreitengebunden: ~18 ms von 46 ms sind Bytes, der Rest ist Kernel-/Launch-Overhead.
+
+### 12.3 PP2 (Stufe iGPU, Stufe CPU): Stand und Physik
+- Unser Baum fährt PP bei einer Anfrage sequentiell, ohne Chunk-Überlappung (#651: Dense-Vehikel 0,69x an der 1:1-Teilung). Für den 35B fehlen im Laptop-Baum außerdem pp-device-map, GDN auf der CPU (Referenz existiert: transformers `torch_chunk_gated_delta_rule`) und GGUF-Dense auf der CPU.
+- Physik mit gemessenen Raten, Obergrenze mit llama.cpp-CPU-Kerneln: iGPU 0,223 ms je Token und Schicht (112 tok/s), CPU 0,305 ms (82 tok/s).
+  - Sequentiell (bs1): T(k) = (40−k)·0,223 + k·0,305. Jede CPU-Schicht macht es langsamer; k=8 ergibt 0,93x.
+  - Ideal überlappt: Gleichgewicht bei k≈17, ~194 tok/s ohne Kontention. Mit der gemessenen Ko-Lauf-Steuer und dem bs1-Sequenzzwang praktisch nicht erreichbar.
+- Messfahrzeug: llama.cpp mit HIP (gfx1100, ohne real-true16) und `-ngl k` ist genau PP2 iGPU+CPU auf dieser Datei. Gemessen wird nur, wenn der Nutzerdienst ≥ 15 min ruht (`pp2/pp2_when_idle.sh`, bricht bei jedem Request sofort ab). Ergebnis in 12.5.
+
+### 12.4 Urteil P/D (ohne Bytebewegung)
+- **D:** iGPU solo mit Graphen (21,5 tok/s). CPU solo (llama.cpp 23,3) wäre +8 %, aber zweite Laufzeit, Desktop-CPU belegt, KV-/Mamba-Format-Übergabe nötig. Kein Wechsel lohnt das.
+- **P:** iGPU + CPU-Experten gleichzeitig (TP2 über die MoE, +37 %).
+- Wechsel = nur Rollenzuordnung. Alle Experten EINMAL in CPU-sichtbarem, GPU-gemapptem Speicher (hipHostMalloc oder hipHostRegister; iGPU −2…−4 % Bandbreite). P setzt die Masken-Schwelle auf N<256: die CPU rechnet Experten ≥N direkt aus denselben Bytes. D setzt die Schwelle auf 256: reiner GPU-Pfad, Decode-Graph unverändert. Kosten: ein Integer je Phase, 0 Bytes.
+- Bau-Voraussetzungen (erst nach diesem Urteil):
+  1. kt-kernel aus Quelle mit „externe Gewichte“ (Zeiger aus MOEConfig verwenden statt kopieren);
+  2. Experten-Stapel der GGUF-MoE in hipHostMalloc-Speicher laden;
+  3. Masken-Schwelle je Forward-Modus statt fest beim Boot;
+  4. Decode-Graph auf dem Pfad ohne kt aufnehmen.
+
+### 12.5 Ergebnisse unter Ruhebedingung (werden nachgetragen)
