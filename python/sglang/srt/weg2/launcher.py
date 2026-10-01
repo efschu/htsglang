@@ -23813,6 +23813,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ns.profile, l15_base, l15_peaks, os.environ)
             for post in l15_posts:
                 log(l15_plan.post_line(post))
+            # L15-NOCAP (N3f): armed with nothing to hold is a launch error,
+            # not a boot window spent on cap=0 (N3c/N3e).
+            _nocap = l15_plan.refuse_no_caps(l15_posts, os.environ)
+            if _nocap is not None:
+                raise Weg2LaunchRefused(_nocap)
         else:
             log(f"L15-POST skipped profile={ns.profile}")
     budgets_p = budgets_from_dc(

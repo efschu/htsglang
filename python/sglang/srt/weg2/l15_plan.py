@@ -41,6 +41,7 @@ LINE_NEXTFLASH = "nextflash"
 
 #: refusal code: L1.5 and the hot handover are refused on --dual-layout in V1
 DUAL_REFUSAL_CODE = "W-L15-DUAL"
+NOCAP_REFUSAL_CODE = "W-L15-NOCAP"
 
 
 def _switch(env: Mapping[str, str], key: str) -> bool:
@@ -171,6 +172,24 @@ def refuse_dual(argv: Sequence[str], env: Mapping[str, str]) -> Optional[str]:
             "KV ledger already shares that room) and the hot handover has no flip to hand "
             "over across. Turn the switch off or run without --dual-layout; refusing to "
             "boot a launch whose L1.5 would silently do nothing.")
+
+
+def refuse_no_caps(posts: Sequence[L15Post], env: Mapping[str, str]) -> Optional[str]:
+    """The no-cap refusal (N3f): with the master on, a launch whose every card
+    holds 0 MiB can never retain a single row -- N3c (10012013) and N3e
+    (10012112) ran exactly that (SGLANG_WEG2_L15=1 without
+    SGLANG_WEG2_L15_MIB: every post UNMEASURED 0, every D cap 0) and spent a
+    whole boot window. Refused BY NAME with the fix in the text; master off
+    or any card > 0 -> None."""
+    if not master_on(env):
+        return None
+    if any(int(p.mib) > 0 for p in posts):
+        return None
+    srcs = ",".join(sorted({p.src for p in posts})) or "none"
+    return (f"{NOCAP_REFUSAL_CODE}: {L15_MASTER_ENV}=1 but every card's L1.5 post is 0 MiB "
+            f"(src={srcs}; {L15_MIB_ENV}={env.get(L15_MIB_ENV)!r}) -- this boot could never hold a "
+            "single row. Set the per-card override, card = budget ordinal (c0 = the 5090), e.g. "
+            f"{L15_MIB_ENV}=\"c1=7616,c2=1792\", or turn {L15_MASTER_ENV} off.")
 
 
 def post_line(p: L15Post) -> str:
