@@ -1,5 +1,40 @@
 # rigdash — Pflegehinweise
 
+## Zeitreihen-DB, Tabs, Expertenansicht (Nutzer 01.10., Konzept `/spinning/gpu-arb/docs/DASHBOARD-REDESIGN-1001.md`)
+
+**VictoriaMetrics** (Order 01.10. ~07:40Z) ist die Zeitreihen-DB des Rigs. Sie läuft auf CT999 unter `:8428`, dazu
+`node_exporter` (CT999 und Proxmox-Host 192.168.0.11:9100) und `nvidia_gpu_exporter` (NVML). Grafana läuft daneben
+unter `:3000` mit der Tafel „Rig – Verlauf“. Installiert wird mit `deploy/vm/install_vm.sh` bzw.
+`deploy/grafana/install_grafana.sh`, beide idempotent. Units und `scrape.yml` liegen im Repo.
+
+- Der Probennehmer schreibt die IPC alle 5 s nach VM (`vmpush.Bridge`): `weg2_front_*`, `weg2_rank_*` und
+  `weg2_flip_*`, die Flips zum Zeitpunkt des Flips. Labels sind `model`, `boot`, `group`, `rank`, `dir`, `kind`. **Nie eine rid als Label.**
+- Der rigdash liest per PromQL (`vmpush.VmClient`):
+  - die TTFT-Kacheln (`/api/live` → `vm`),
+  - den TTFT-Verlauf (`/api/history` → `ttft`).
+- Neue Größen kommen als Metrik nach VM, nicht als neue Spalte in `history.sqlite` und nie aus einem Log.
+- Die Grafana-Tafel ändert man in `deploy/grafana/make_dashboard.py` und danach mit `install_grafana.sh`.
+  In der Grafana-Oberfläche lässt sie sich nicht ändern (`allowUiUpdates: false`).
+
+**`/api/live` einmal je Sekunde für alle** (`server.LiveCache`):
+
+- `?lean=1` liefert Boots, die nur eine Tabellenzeile sind, ohne Kurven.
+- `?dev=0` lässt Features und Image-Änderungen weg.
+- Die Antwort geht gzip-komprimiert.
+- Eine Zoom-Anfrage rechnet für sich allein.
+
+**Seite:**
+
+- Tabs: Überblick (Vorgabe), Boots, Verlauf, Karten, Entwicklung (nur Rig-Ausgabe).
+- Gezeichnet wird nur der sichtbare Tab. Ein Abschnitt mit unverändertem HTML wird nicht angefasst (`put()`).
+- Die **Expertenansicht** (`body.expert`) zeigt alles mit Klasse `x`, alle kv-Zeilen der Kacheln und die Quell-Plaketten. Die Standardansicht zeigt nur kv-Zeilen mit Klasse `keep`.
+- **Regel für neue Messwerte:** Sie kommen mit `x` (bzw. ohne `keep`) in die Expertenansicht, nie ungefragt in den Standard (Memory `dashboard-redesign-ttft-tabs-expert-1001`).
+- Im Überblick steht je Modell die Kennzahlzeile: TTFT, Decode, Prefill P/D, Flipzeit, Warteschlange, Tode/Hänger.
+
+**Feature-Liste aktuell halten:** Der Tab „Entwicklung“ zeigt den Stand von `features.json`. Er ist gelb ab 12 h oder
+wenn danach gebootet wurde, rot ab 24 h. Darunter stehen die **Commits der Image-Linie (48 h) ohne Baustein**,
+aus git gerechnet (`features.new_commits`). Der Zähler steht im Tab-Titel. Eintragen wie unten mit `features_update.py`.
+
 ## Flipzeit (Nutzer-Korrektur 29.09.)
 
 Flipzeit = `WEG2-FLIP begin` → erstes Decode-Token (P→D) bzw. erste PP0-`Prefill batch` (D→P);
