@@ -3182,6 +3182,12 @@ class Envs:
     #   coldest kept rows first (weg2/d_mem_sched.py). ON by default; this is
     #   the diagnosis-only emergency stop, not a feature switch.
     SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS = EnvBool(False)
+    # KV-STAGE warm refill (01.10., y6h: 179 shrinks, 178 on an end event, 72
+    #   of 109 grows within 5 s after one): a seat-row shrink remembers the
+    #   experts it sent to the store, hottest first; the next grow refills its
+    #   freed rows with them at once (the miss path's copy, no new VRAM)
+    #   instead of letting each one miss cold. False = byte-identical lazy fill.
+    SGLANG_WEG2_D_SEAT_WARM_REFILL = EnvBool(True)
     # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
     #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
     #   books S0; the KV between the floor and S0 is born unmapped and funds
