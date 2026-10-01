@@ -608,6 +608,13 @@ class SchedulerWeightUpdaterManager:
     #: AP-B fallback; None outside an L15 wake with a record (the slots guard
     #: catches an undeclared write only on the path that writes it).
     _l15_wake_manifest: Any = None
+    #: L15-12c-E2: True on a cap-0 D rank whose wake record passed the ANCHOR
+    #: GATE (every span names its GDN anchor's L2 identity): this rank holds
+    #: nothing itself but refills its owned rows from L2 when the group
+    #: verdict is "hold".  Set by :meth:`_l15_wake_hold_signal` (reset at its
+    #: head, so it never survives into a wake that did not mark it), acted
+    #: on by :meth:`_l15_wake_act`, folded into the fallback on any failure.
+    _l15_wake_refill: bool = False
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -7200,6 +7207,9 @@ class SchedulerWeightUpdaterManager:
         ``rows_by_rank[rank]``.  Master off -> ``(None, None, 0, False)``
         (byte-identical restore)."""
         sched = self.scheduler
+        # L15-12c-E2: a per-wake mark -- reset at the head so it can never
+        # survive into a wake whose signal did not set it.
+        self._l15_wake_refill = False
         if sched is None:
             return None, None, 0, False
         try:
@@ -7241,7 +7251,25 @@ class SchedulerWeightUpdaterManager:
                 os.environ, tp, [l15_shadow.cell_bytes_from(pool)] * tp, cards)
             cap = int(caps[rank]) if 0 <= rank < len(caps) else 0
             if cap <= 0:
-                return None, rank, 0, True
+                # L15-12c-E2: this rank kept NOTHING mapped through the sleep
+                # (cap 0; TP0 on the big card).  It can still honour a group
+                # "hold" by refilling every held row it owns over H2D from L2
+                # (plan L15-12-PART3-PLAN sec 2).  The ANCHOR GATE (plan sec 8)
+                # runs before anything is even considered: a HoldSpan without
+                # the GDN anchor's L2 identity (anchor_l2_slot absent/None --
+                # every manifest written before C2 records it) cannot be held
+                # here, the anchor state would come back missing and a
+                # half-held tree is worse than the fallback shape.  Until then
+                # this rank votes None, exactly the pre-E2 behaviour.
+                if any(getattr(_sp, "anchor_l2_slot", None) is None
+                       for _sp in m.spans):
+                    logger.info("L15-REFILL rank=%d anchors-missing: votes no hold",
+                                rank)
+                    return None, rank, 0, True
+                self._l15_wake_refill = True
+                keep_rows = (int(m.rows_by_rank[rank])
+                              if 0 <= rank < len(m.rows_by_rank) else 0)
+                return m, rank, keep_rows, True
             keep_rows = (int(m.rows_by_rank[rank])
                           if 0 <= rank < len(m.rows_by_rank) else 0)
             return m, rank, keep_rows, True
@@ -7417,7 +7445,77 @@ class SchedulerWeightUpdaterManager:
             return 0
         if verdict == "fallback":
             return self._l15_fallback_drop(sched)
+        if verdict == "hold" and self._l15_wake_refill:
+            # L15-12c-E2: the cap-0 rank's refill ACT.  Runs only on the
+            # group-uniform "hold" verdict, behind the hold-aware restore
+            # that already re-reserved every held destination row.
+            return self._l15_do_refill(sched)
         return 0
+
+    def _l15_do_refill(self, sched) -> int:
+        """L15-12c-E2: refill this cap-0 rank's owned held rows from L2
+        (plan L15-12-PART3-PLAN sec 2), ACTED only behind the group verdict
+        "hold".  The hold-aware restore ran first: the held slots are
+        re-reserved (reserve_slots + keep_mamba_rows), so no admission can
+        take a destination row mid-copy.  The plan is rebuilt from the
+        stashed manifest with the same token prefix the fence's plan line
+        used (local read, no collective); rows carry their span's rid so a
+        generation mismatch drops the WHOLE request, never a partial one
+        (l15_refill.gen_check).  ALL-OR-NOTHING: any dropped rid or any
+        refill failure folds the whole attempt into the group fallback drop
+        -- a half-filled hold is never kept.  Returns rows copied (0 when
+        it fell back).  P>1: l15_refill.refill refuses by itself (OPEN C2).
+        """
+        from sglang.srt.weg2 import l15_refill, l15_restore
+
+        m = self._l15_wake_manifest
+        rank = self._weg2_rank()
+        try:
+            if m is None:
+                raise LookupError("refill rank without a stashed manifest")
+            tp = int(getattr(sched, "tp_size", 0)
+                     or getattr(getattr(sched, "server_args", None), "tp_size", 1)
+                     or 1)
+            from sglang.srt.distributed.utils import get_cp_token_ratios
+
+            _ratios = get_cp_token_ratios()
+            _vw = ([int(x) for x in _ratios]
+                   if _ratios is not None and len(_ratios) == tp
+                   and all(int(x) > 0 for x in _ratios) else [1] * tp)
+            prefix = [0]
+            for _x in _vw:
+                prefix.append(prefix[-1] + _x)
+            mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+            device_pool = getattr(mr, "token_to_kv_pool", None)
+            host_pool = getattr(
+                getattr(getattr(sched, "tree_cache", None),
+                        "cache_controller", None), "mem_pool_host", None)
+            if device_pool is None or host_pool is None:
+                raise LookupError("refill needs the device KV pool and the "
+                                  "L2 host pool")
+            page_tokens = max(1, int(getattr(host_pool, "_arena_page_tokens", 1)))
+            # rid-tagged 4-tuples (rid, compact_row, l2_slot, l2_gen): the
+            # rid is what makes a generation mismatch drop a whole request.
+            plan = []
+            for span, i, slot in l15_restore._owned_tokens(m, rank, prefix):
+                src = l15_restore._l2_source(span, i)
+                if src is not None:
+                    plan.append((str(span.rid),
+                                 l15_restore._compact_row(prefix, rank, slot),
+                                 int(src[0]), int(src[1])))
+            if not plan:
+                return 0
+            ok, bad = l15_refill.gen_check(plan, host_pool)
+            if bad:
+                raise l15_refill.L15RefillError(
+                    "generation mismatch, drop-eligible rids: %s" % (bad[:4],))
+            n = l15_refill.refill(ok, host_pool, device_pool, page_tokens)
+            logger.info("L15-REFILL rank=%d done: %d row(s) from L2", rank, n)
+            return n
+        except Exception as exc:  # noqa: BLE001 -- all-or-nothing into the fallback
+            logger.info("L15-REFILL rank=%d failed: %s -> fallback", rank, exc)
+            self._l15_fallback_drop(sched)
+            return 0
 
     def _weg2_wake_restore_pools(self) -> bool:
         """#1455: Scheduler.flush_cache minus tree_cache.reset(): the pool
@@ -11373,6 +11471,8 @@ class SchedulerWeightUpdaterManager:
                 # verdict, action -- the file was unlinked at the hold
                 # signal); the stash does not survive into the next wake.
                 self._l15_wake_manifest = None
+                # L15-12c-E2: the refill mark dies with the record too.
+                self._l15_wake_refill = False
         if store_failure and not report:
             # The fence did not gather: no memory saver, no cpu group, or
             # world <= 1. A single-rank engine cannot disagree with itself, so
