@@ -1,0 +1,61 @@
+=== quiet 2026-10-01T21:16:00+02:00 {"state": "up", "pid": 145955, "inflight": 0, "idle_seconds": 885.6, "idle_park_seconds": 1000000000.0, "loads": 1, "parks": 0, "last_load_seconds": 151.3, "backend_log": "/root/651-p2/logs/backend_200341.log", "kv_tokens": 131076}
+/root/efeu35q3/apex/apex_kernel_check.py:125: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:213.)
+  W = torch.from_numpy(raw).cuda()
+/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory
+# IQ3_XXS: Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf:blk.10.ffn_down_exps.weight 512x512 (core expert)
+IQ3_XXS  dequant    clean    det=True rel=3.88e-04 nonfin=0
+IQ3_XXS  mmvq@1     clean    det=True rel=5.42e-03 nonfin=0
+IQ3_XXS  mmvq@2     clean    det=True rel=5.56e-03 nonfin=0
+IQ3_XXS  mmvq@4     clean    det=True rel=5.80e-03 nonfin=0
+IQ3_XXS  mmvq@8     clean    det=True rel=6.22e-03 nonfin=0
+IQ3_XXS  mmq@16     n/a (no kernel; never routed) det=False rel=4.62e+03 nonfin=0
+IQ3_XXS  moe_vec@8  clean    det=True rel=6.39e-03 nonfin=0
+# Q3_K: Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf:token_embd.weight 512x2048
+Q3_K     dequant    clean    det=True rel=1.19e-04 nonfin=0
+Q3_K     mmvq@1     clean    det=True rel=4.43e-03 nonfin=0
+Q3_K     mmvq@2     clean    det=True rel=5.74e-03 nonfin=0
+Q3_K     mmvq@4     clean    det=True rel=6.01e-03 nonfin=0
+Q3_K     mmvq@8     clean    det=True rel=4.85e-03 nonfin=0
+Q3_K     mmq@16     clean    det=True rel=5.23e-03 nonfin=0
+Q3_K     moe_vec@8  clean    det=True rel=5.95e-03 nonfin=0
+Q3_K     moe_a8@8   clean    det=True rel=5.95e-03 nonfin=0
+# Q4_0: mtp-Qwen3.8-35B-A3B-Distill-Q4_0.gguf:token_embd.weight 512x2048
+Q4_0     dequant    clean    det=True rel=0.00e+00 nonfin=0
+Q4_0     mmvq@1     clean    det=True rel=1.31e-02 nonfin=0
+Q4_0     mmvq@2     clean    det=True rel=1.48e-02 nonfin=0
+Q4_0     mmvq@4     clean    det=True rel=1.51e-02 nonfin=0
+Q4_0     mmvq@8     clean    det=True rel=1.44e-02 nonfin=0
+Q4_0     mmq@16     clean    det=True rel=1.92e-02 nonfin=0
+Q4_0     moe_vec@8  clean    det=True rel=1.29e-02 nonfin=0
+Q4_0     moe_a8@8   clean    det=True rel=1.29e-02 nonfin=0
+# Q5_K: Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf:blk.0.ffn_down_shexp.weight 512x512
+Q5_K     dequant    clean    det=True rel=5.85e-04 nonfin=0
+Q5_K     mmvq@1     clean    det=True rel=5.10e-03 nonfin=0
+Q5_K     mmvq@2     clean    det=True rel=4.78e-03 nonfin=0
+Q5_K     mmvq@4     clean    det=True rel=6.54e-03 nonfin=0
+Q5_K     mmvq@8     clean    det=True rel=5.97e-03 nonfin=0
+Q5_K     mmq@16     clean    det=True rel=1.21e-02 nonfin=0
+Q5_K     moe_vec@8  clean    det=True rel=7.78e-03 nonfin=0
+Q5_K     moe_a8@8   clean    det=True rel=1.41e-02 nonfin=0
+# Q6_K: Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf:output.weight 512x2048
+Q6_K     dequant    clean    det=True rel=2.41e-04 nonfin=0
+Q6_K     mmvq@1     clean    det=True rel=4.45e-03 nonfin=0
+Q6_K     mmvq@2     clean    det=True rel=6.34e-03 nonfin=0
+Q6_K     mmvq@4     clean    det=True rel=5.48e-03 nonfin=0
+Q6_K     mmvq@8     clean    det=True rel=4.43e-03 nonfin=0
+Q6_K     mmq@16     clean    det=True rel=6.14e-03 nonfin=0
+Q6_K     moe_vec@8  clean    det=True rel=5.17e-03 nonfin=0
+Q6_K     moe_a8@8   clean    det=True rel=5.17e-03 nonfin=0
+# Q8_0: Qwen3.8-35B-A3B-Distill.APEX-I-MiniPlus-V2.1-Abliterated.gguf:blk.0.attn_gate.weight 512x2048
+Q8_0     dequant    clean    det=True rel=2.98e-04 nonfin=0
+Q8_0     mmvq@1     clean    det=True rel=3.70e-03 nonfin=0
+Q8_0     mmvq@2     clean    det=True rel=5.36e-03 nonfin=0
+Q8_0     mmvq@4     clean    det=True rel=5.37e-03 nonfin=0
+Q8_0     mmvq@8     clean    det=True rel=4.15e-03 nonfin=0
+Q8_0     mmq@16     clean    det=True rel=4.81e-03 nonfin=0
+Q8_0     moe_vec@8  clean    det=True rel=5.24e-03 nonfin=0
+Q8_0     moe_a8@8   clean    det=True rel=5.24e-03 nonfin=0
+
+load hogs: 0, runs/op: 8
+SERVED-PATH BROKEN: none
+=== rc=0 2026-10-01T21:16:20+02:00

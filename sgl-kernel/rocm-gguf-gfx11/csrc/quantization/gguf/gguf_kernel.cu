@@ -372,6 +372,9 @@ torch::Tensor ggml_mul_mat_a8(
             row,
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_mul_mat_a8: no kernel for GGML type ", type,
+                    " (efeu-TP14: returned uninitialised memory before)");
     }
   });
   return Y;
@@ -607,6 +610,9 @@ torch::Tensor ggml_moe_a8(
             sorted_token_ids.sizes()[0],
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "ggml_moe_a8: no kernel for GGML type ", type,
+                    " (efeu-TP14: returned uninitialised memory before)");
     }
   });
   return Y;
