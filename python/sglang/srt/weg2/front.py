@@ -9925,6 +9925,24 @@ class Front:
         if src == "D" and dst == "P":
             _live = [q.t_arrive for q in self.queue if getattr(q, "fut", None) is None or not q.fut.done()]
             self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
+            # L15-02b: one shadow line at the D->P hot-handover flip begin.
+            try:
+                import itertools
+
+                from sglang.srt.weg2 import l15_shadow
+
+                if l15_shadow.shadow_on(os.environ):
+                    logger.info(
+                        "HOT-HANDOVER-SHADOW epoch=%d waiting=%d rids=%s",
+                        self.epoch, len(self.queue),
+                        # self.queue is a deque: slice it not, islice it
+                        [
+                            getattr(q, "rid", None)
+                            for q in itertools.islice(self.queue, 8)
+                        ],
+                    )
+            except Exception:  # noqa: BLE001 - shadow must never block a flip
+                pass
         if _fw_none is not None:  # FEHLT 3: the previous flip's woken group never worked
             self._ipc_publish("flip_first_work", _fw_none)
         # H91 part C rule 2: the wake message to D carries the hand-off count

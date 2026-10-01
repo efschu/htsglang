@@ -142,6 +142,9 @@ class TorchMemorySaverAdapter(ABC):
     def tag_bytes(self, tag: str):
         raise NotImplementedError
 
+    def tag_mapped_bytes(self, tag: str):
+        raise NotImplementedError
+
     def backed_up_tag_bytes(self):
         raise NotImplementedError
 
@@ -296,6 +299,26 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         fall back to RssShmem when this returns None -- report the absence.
         """
         fn = _weg2_ring_symbol("tms_tag_bytes")
+        if fn is None:
+            return None
+        import ctypes
+
+        fn.restype = ctypes.c_uint64
+        fn.argtypes = [ctypes.c_char_p]
+        return int(fn(tag.encode()))
+
+    def tag_mapped_bytes(self, tag: str):
+        """L15-13b: bytes physically mapped NOW for ``tag`` (C ``tms_tag_mapped_bytes``), or None.
+
+        Unlike :meth:`tag_bytes` (the full plan, incl. spans TMS keeps mapped
+        while paused), this counts only the physical pages present, so a paused
+        tag reports its kept-span resident bytes. The wake fit check subtracts
+        this from the plan so resident bytes are charged against the card's
+        free VRAM once, not twice (see :func:`sglang.srt.weg2.wake_kv.kv_resume_need_bytes`).
+        None means the running hook has no such symbol (older C / stock wheel);
+        the caller then falls back to the full plan.
+        """
+        fn = _weg2_ring_symbol("tms_tag_mapped_bytes")
         if fn is None:
             return None
         import ctypes
@@ -539,6 +562,9 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     def tag_bytes(self, tag: str):
+        return None
+
+    def tag_mapped_bytes(self, tag: str):
         return None
 
     def backed_up_tag_bytes(self):

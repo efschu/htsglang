@@ -111,6 +111,7 @@ from sglang.srt.weg2 import (
     checkpoint_census,
     corridor_budget,
     host_ledger,
+    l15_plan,
     ring_table,
     seam_digest,
     weight_exchange,
@@ -13641,6 +13642,13 @@ def resolve_dual_layout(ns) -> None:
                 "DUAL-TP3PP3: --dual-mps on needs --dual-layout (MPS only pays when both groups "
                 "run kernels at the same time)")
         return
+    # L15-01b: L1.5 (and the hot handover) need a SLEEPING P group; the dual
+    # layout keeps both groups awake, so refuse the combination BY NAME before
+    # any launch. refuse_dual names the armed switch; a silent off would let a
+    # boot believe L1.5 holds what it does not.
+    l15_msg = l15_plan.refuse_dual(["--dual-layout"], os.environ)
+    if l15_msg is not None:
+        raise Weg2LaunchRefused(l15_msg)
     if str(getattr(ns, "dual_mps", "off")) == "on" and os.environ.get(DUAL_MPS_OPT_IN_ENV, "").strip() != "1":
         raise Weg2DualLayoutRefused(
             "DUAL-TP3PP3: --dual-mps on is refused -- MEASURED to wedge both groups: repro v2 "
@@ -13919,6 +13927,7 @@ def budgets_from_dc(
     terms_out: Optional[List[Dict[str, object]]] = None,
     booked_rest_mib: Optional[Sequence[Optional[int]]] = None,
     booked_rest_provenance: str = "",
+    l15_mib: Optional[Sequence[int]] = None,
 ) -> List[int]:
     """Per card the budget of group ``label``; ``terms_out`` (a list) receives
     the terms per card in order, for the #145 card ledger (rc12c: the card
@@ -13932,8 +13941,22 @@ def budgets_from_dc(
     builtin awake overshoot, a budget-relative overshoot and the awake rest of
     the form are what it replaces -- no reserve is charged beside it. A
     ``None`` entry is UNMEASURED: that card keeps the terms below, and its
-    line says so by name."""
+    line says so by name.
+
+    ``l15_mib`` (L15-01b, weg2/l15_plan.py): the L1.5 post per card, in the
+    SAME order as ``cards``. Where given, each card's budget subtracts its
+    post BEFORE the ``// 8 * 8`` rounding, the term dict gains an ``l15`` key,
+    and the budget line carries a ``- l15 {mib} (L1.5 post)`` suffix. ``None``
+    (the L1.5 master switch off) leaves the pass byte-identical: no term, no
+    suffix.
+    """
     out = []
+    l15_given = l15_mib is not None
+    l15_vec: List[int] = [None] * len(cards) if not l15_given else [int(v) for v in l15_mib]
+    if l15_given and len(l15_vec) != len(cards):
+        raise Weg2LaunchRefused(
+            f"L15-01b: {len(l15_vec)} L1.5 posts for {len(cards)} cards -- a partial "
+            "vector never prices a card it never saw")
     # #1257c: ONE derivation, per card, for the group this budget is for.
     # ``user_reserve_by_card`` is the operator's external headroom (default 0);
     # it RAISES the floor and therefore lowers the budget by exactly as much,
@@ -13965,12 +13988,15 @@ def budgets_from_dc(
             rest_b = int(booked[i])
             grow = int(dormant_growth_mib[i]) if dormant_growth_mib is not None else 0
             carve = int(getattr(c, "reserved_mib", 0) or 0)
-            b = ((c.total_mib - carve - dc_mib[c.uuid] - grow - rest_b) // 8) * 8
+            l15_i = 0 if not l15_given else int(l15_vec[i])
+            b = ((c.total_mib - carve - dc_mib[c.uuid] - grow - rest_b - l15_i) // 8) * 8
             out.append(b)
             _terms_seen.append(dict(
                 total=int(c.total_mib), carve=carve, floor=0,
                 dormant=int(dc_mib[c.uuid]) + grow, growth=grow, awake=rest_b,
                 awake_source=f"{_budget_rest.SOURCE_RECORD} {booked_rest_provenance}".strip()))
+            if l15_given:
+                _terms_seen[-1]["l15"] = l15_i
             if terms_out is not None:
                 terms_out.append({k: v for k, v in _terms_seen[-1].items() if k != "growth"})
             _res = int((user_reserve_by_card or {}).get(c.uuid, 0))
@@ -13980,6 +14006,7 @@ def budgets_from_dc(
                 f"{b} MiB = total {c.total_mib} - driver_carve {carve} (NVML reserved) "
                 f"- dormant_other {dc_mib[c.uuid]}"
                 + (f" - served_dormant_growth {grow} ({dormant_growth_provenance})" if grow else "")
+                + (f" - l15 {l15_i} (L1.5 post)" if l15_given else "")
                 + f" - awake_rest_booked {rest_b} ({_budget_rest.SOURCE_RECORD} "
                 f"{booked_rest_provenance}; replaces corridor floor transient "
                 f"{int(cf.mib)} (source={cf.source}), user reserve {_res}, awake_overshoot "
@@ -14021,7 +14048,8 @@ def budgets_from_dc(
         carve = (int(getattr(c, "reserved_mib", 0) or 0)
                  if charge_driver_carve and int(c.total_mib) >= int(driver_carve_min_total_mib or 0) else 0)
         awake = int(rest) if rest is not None else 0
-        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake
+        l15_i = 0 if not l15_given else int(l15_vec[i])
+        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake - l15_i
         b = (b // 8) * 8
         out.append(b)
         _terms_seen.append(dict(
@@ -14033,6 +14061,8 @@ def budgets_from_dc(
                 else f"awake_overshoot {awake_builtin}"
                 + (f" + measured_awake_overshoot {over}" if over else "")),
         ))
+        if l15_given:
+            _terms_seen[-1]["l15"] = l15_i
         if terms_out is not None:
             terms_out.append({k: v for k, v in _terms_seen[-1].items() if k != "growth"})
         log(
@@ -14047,6 +14077,7 @@ def budgets_from_dc(
             + (f" - measured_awake_overshoot {over} ({overshoot_provenance})" if over else "")
             + (f" - awake_rest {awake} (D_AWAKE_REST_MIB, measured against the booked "
                f"form, not the budget; {awake_rest_provenance})" if rest is not None else "")
+            + (f" - l15 {l15_i} (L1.5 post)" if l15_given else "")
             + " MiB"
         )
         log(cf.line)
@@ -23664,6 +23695,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     vram_view().note_asleep("D", cards, dc_expect_d,
                             "MODEL(dc_expect_d: D reserve = record or census + margin + slack)")
+    # L15-01b: the L1.5 post, gated on the master switch; off = byte-identical
+    # to today. The post sizes against the PRE-post budget (the pure layer
+    # prices budget minus the measured P awake peak), so the first pass is
+    # today's pass without l15 and the second pass is what ships.
+    l15_posts = None
+    if l15_plan.master_on(os.environ):
+        if ns.profile in (weg2_form.PROFILE_QWEN27B, weg2_form.PROFILE_NEXTFLASH):
+            l15_base = budgets_from_dc(
+                cards, dc_expect_d, log, "P",
+                overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
+                overshoot_provenance=_pconst_boots("P_OVERSHOOT_MIB", ns.profile) or "boot weg2ls2b2",
+                user_reserve_by_card=user_reserve_by_card,
+            )
+            try:
+                l15_peaks = list(_pconst("P_AWAKE_PEAK_MIB", ns.profile))
+            except KeyError:
+                # UNMEASURED: the pure layer prices a missing peak as a 0 post,
+                # never an estimate.
+                l15_peaks = [None] * len(cards)
+            l15_posts = l15_plan.resolve_posts(
+                ns.profile, l15_base, l15_peaks, os.environ)
+            for post in l15_posts:
+                log(l15_plan.post_line(post))
+        else:
+            log(f"L15-POST skipped profile={ns.profile}")
     budgets_p = budgets_from_dc(
         cards, dc_expect_d, log, "P", overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
         # #240: whose measurement the line charges -- the profile's own record
@@ -23671,6 +23727,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # every profile.
         overshoot_provenance=_pconst_boots("P_OVERSHOOT_MIB", ns.profile) or "boot weg2ls2b2",
         user_reserve_by_card=user_reserve_by_card,
+        l15_mib=[p.mib for p in l15_posts] if l15_posts is not None else None,
     )
     state.budgets["P"] = budgets_p
     # Same TRAIN 2 MERGE FIX as at ``form_argv_p`` below: everything past the

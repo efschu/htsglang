@@ -1557,6 +1557,27 @@ class SchedulerWeightUpdaterManager:
             return 0
         return int(value or 0)
 
+    def _weg2_tag_mapped_bytes(self, tag: str) -> Optional[int]:
+        """L15-13b: bytes physically mapped NOW for one tag, or None.
+
+        Twin of :meth:`_weg2_tag_bytes` (the full plan).  With TMS keep spans
+        (L15-13a, b172a12a6a) a paused kv_cache keeps its held rows mapped, so
+        ``tms_tag_bytes`` counts them into the plan against the card's free
+        budget at wake; this reads the resident subset so the fit check can
+        subtract it.  None means the running hook has no such symbol (older C
+        / stock wheel): the caller then maps the whole plan, the pre-L15-13b
+        behaviour.  A 0 is a real answer: nothing is mapped.
+        """
+        adapter = getattr(self, "memory_saver_adapter", None)
+        getter = getattr(adapter, "tag_mapped_bytes", None)
+        if getter is None:
+            return None
+        try:
+            value = getter(tag)
+        except Exception:  # noqa: BLE001
+            return None
+        return None if value is None else int(value)
+
     def _weg2_tag_resident_bytes(self, tag: str) -> Optional[int]:
         """The saver's OWN byte sum for ``tag`` as a THREE-VALUED reading:
         ``None`` when the saver cannot answer (no adapter, no ``tms_tag_bytes``
@@ -9728,7 +9749,10 @@ class SchedulerWeightUpdaterManager:
             from sglang.srt.utils.torch_memory_saver_adapter import (
                 Weg2TmsResumeRefused,
             )
-            from sglang.srt.weg2.wake_kv import kv_resume_fit_refusal
+            from sglang.srt.weg2.wake_kv import (
+                kv_resume_fit_refusal,
+                kv_resume_need_bytes,
+            )
 
             # #1491: the census BEFORE the resume, on every wake. This is the
             # reading that did not exist: `stage=release` runs at the SLEEP,
@@ -9743,13 +9767,27 @@ class SchedulerWeightUpdaterManager:
 
             _kv_need = None
             _kv_free = None
+            _kv_mapped = None
             try:
                 _kv_need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+                _kv_mapped = self._weg2_tag_mapped_bytes(GPU_MEMORY_TYPE_KV_CACHE)
                 _kv_free = self._weg2_free_bytes()
                 _kv_floor = int(self._weg2_corridor_floor_bytes() or 0)
             except Exception as _exc:  # noqa: BLE001 -- no probe, no refusal
                 logger.info("WEG2-WAKE-KV-FIT skipped (%s: %s)", type(_exc).__name__, _exc)
                 _kv_floor = 0
+            # L15-13b: count only the bytes the resume will actually map.  With
+            # TMS keep spans (L15-13a, b172a12a6a) a paused kv_cache keeps its
+            # held rows mapped, so tms_tag_bytes (the plan) demands them twice
+            # against the card's free budget -- a false "cannot fit" at every
+            # wake with a hold.  need = plan - mapped; no keep, or no symbol
+            # (mapped None): need == plan, byte-identical to the old check.
+            _kv_plan = _kv_need
+            _kv_need = kv_resume_need_bytes(_kv_need, _kv_mapped)
+            if isinstance(_kv_mapped, int) and _kv_mapped > 0 and _kv_plan is not None:
+                logger.info(
+                    "L15-WAKE-NEED tag=kv_cache plan=%d mapped=%d need=%d",
+                    _kv_plan, _kv_mapped, int(_kv_need or 0))
             _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
             if _unfit is not None and _kv_free is not None:
                 # z30y7: the sleeper's leg runs concurrently and may still be

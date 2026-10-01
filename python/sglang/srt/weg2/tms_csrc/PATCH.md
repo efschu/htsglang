@@ -1,4 +1,4 @@
-# Vendored torch_memory_saver 0.0.9.post1 csrc (MIT, fzyzcjy) with FIVE patches
+# Vendored torch_memory_saver 0.0.9.post1 csrc (MIT, fzyzcjy) with SIX patches
 
 Source: the PyPI sdist `torch_memory_saver-0.0.9.post1.tar.gz` (the version
 installed in /spinning/htsglang-gpu/.venv, a binary wheel that ships no csrc).
@@ -105,3 +105,25 @@ the flag off: patch 4 call for call.  New entrypoint
 ~0.1-1 ms per call; the lattice must stay (a live shrink keeps only whole
 extents), the number of calls need not.  Desk proof against the mock driver:
 `test_weg2_pause_maps_0930.py`.
+
+## Patch 6 -- KEEP SPANS, ranges that survive the pause (01.10., AP L15-03)
+
+`core.{h,cpp}` and `entrypoint.cpp` changed.  L1.5 holds D's KV prefix through
+the P phase (plan 2.2/5): the sleeping D rank must not drop the pages of its
+kept ranges while it pauses everything else.  `tms_set_keep_spans(ptr, n, lo,
+hi)` stores one allocation's KEEP set (granularity aligned, sorted, disjoint,
+inside the allocation; `n == 0` clears it; refusals as `set_spans`: -1 not a
+base, -2 cpu-backed, -3 malformed, -4/-5 as before).  `pause` pass 3 splits a
+span-mapped allocation's extents: one WHOLLY inside a keep range stays in
+`weg2_extents`, mapped and unreleased (handle and bytes survive PAUSED);
+everything else reaches the two patch-5 branches as `going` only -- coalesced
+runs and the one-by-one walk see the non-kept extents and nothing else, and
+an EMPTY keep set is the patch-5 call sequence unchanged.  `resume` maps only
+the plan's gaps no kept extent covers (the `set_spans` apply-now gap walk,
+factored into `weg2_gaps_not_covered`), keeps the kept extents' handles, and
+restores the sorted order.  Stock (whole-mapping) allocations ignore the keep
+set; the keep is per-allocation, so a paused tag can hold some allocations
+fully and others empty.  Why: the D->P flip must not pay the KV prefix's
+store/restore round trip -- the pages stay.  Desk proof against the mock
+driver: `test_weg2_tms_keep_spans_0930.py` (handle identity stands in for
+content, the mock cannot hold bytes; empty-keep golden = patch-5 counts).
