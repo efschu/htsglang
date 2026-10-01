@@ -189,23 +189,29 @@ class TestNonStreamRankWork(unittest.TestCase):
         lines = self.replay([False, False], moving=False)
         self.assertEqual(len(lines), 1)
         self.assertIn("HAENGT", lines[0])
-        self.assertIn("nur Nicht-Stream", lines[0])
+        self.assertIn("Rang-Arbeit", lines[0])
         self.assertEqual(SF.read(self.d)["progress"]["verdict"], "HAENGT")
 
-    def test_a_stream_request_open_keeps_the_old_rule(self):
-        # one stream request among them: its chunks would move served_tokens -- rank work is not read
-        lines = self.replay([False, True], moving=True)
+    def test_y6b_six_stream_requests_with_moving_rank_work_do_not_stall(self):
+        # NF y6b 01.10. 03:37:50Z: six long STREAM answers, D decoded round 3562 -> 4262 at bs5-6,
+        # served/served_tokens move only when a request ends -> the old rule (rank work only for
+        # non-stream) stopped a healthy boot. Rank work now counts for every open request.
+        self.assertEqual(self.replay([True] * 6, moving=True), [])
+        self.assertNotIn("progress", SF.read(self.d))
+
+    def test_stream_requests_with_frozen_rank_work_still_stall(self):
+        lines = self.replay([True] * 6, moving=False)
         self.assertEqual(len(lines), 1)
         self.assertIn("HAENGT", lines[0])
 
-    def test_front_without_the_field_keeps_the_old_rule(self):
+    def test_front_without_the_field_counts_rank_work_too(self):
         fr = _front(2, 131, 42, 2512000, 61234)                  # a y5c image: no stream info
         SF.transition(self.d, "serving", fields={"front": fr})
         out = []
         for i, t in enumerate(range(1000, 1130, 10)):
             self.ranks(100000 + 8 * i, 5000 + 4 * i)
             out.append(SF.deadman_progress(self.d, self.memo, 60, now=float(t)))
-        self.assertEqual(len([l for l in out if l]), 1)
+        self.assertEqual([l for l in out if l], [])
 
     def test_no_rankstats_no_witness(self):
         SF.transition(self.d, "serving", fields={"front": _ns_front([False, False])})
