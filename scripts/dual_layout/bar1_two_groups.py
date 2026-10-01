@@ -110,6 +110,9 @@ def worker(rank, a, store):
         if not all(res["proof"].values()):
             raise RuntimeError(f"byte proof failed: {res['proof']}")
         n = a.size // 4
+        # which kernel variant this size gets (>= grid_from = cooperative full-card grid)
+        res["grid_from"] = int(t.grid_from)
+        res["grid"] = bool(a.size >= int(t.grid_from))
         res["handles"] = bool(t.handles("all_reduce", a.size))
         if not res["handles"]:
             raise RuntimeError(f"handles(all_reduce, {a.size}) -> False")
