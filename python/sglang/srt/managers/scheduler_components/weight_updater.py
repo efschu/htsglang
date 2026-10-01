@@ -603,6 +603,11 @@ class SchedulerWeightUpdaterManager:
     #: lesson above: y4j-po (30.09. 10:42:44Z) died on AttributeError in the
     #: assignment on all three D ranks at the first sleep with the switch on.
     _weg2_resident_prefetch: Any = None
+    #: L15-12c-A: this rank's just-consumed L1.5 hold manifest, read at the D
+    #: wake by :meth:`_l15_wake_hold_signal` and stashed here for the fence /
+    #: AP-B fallback; None outside an L15 wake with a record (the slots guard
+    #: catches an undeclared write only on the path that writes it).
+    _l15_wake_manifest: Any = None
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -7184,6 +7189,160 @@ class SchedulerWeightUpdaterManager:
             logger.warning("WEG2 CARRIER-HOLD wake release raised %s: %s", type(exc).__name__, exc)
             return 0
 
+    def _l15_wake_hold_signal(self) -> tuple:
+        """L15-12c-A: LOCAL pre-fence hold signal for the D wake ->
+        ``(manifest, rank, keep_rows, master_on)``.  ``manifest`` is this
+        rank's just-consumed L1.5 record (``load_for_wake`` reads and
+        unlinks it: one sleep-wake pair per record); non-None only when the
+        master is on, the group is D, the record exists and this rank's
+        planner cap (caps_from_env, same derivation as the sleep hook /
+        wake fence) is > 0.  ``keep_rows`` = the held compact prefix
+        ``rows_by_rank[rank]``.  Master off -> ``(None, None, 0, False)``
+        (byte-identical restore)."""
+        sched = self.scheduler
+        if sched is None:
+            return None, None, 0, False
+        try:
+            from sglang.srt.weg2 import l15_plan
+
+            master = l15_plan.master_on(os.environ)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("L15-WAKE-RESTORE master switch read failed (%s: %s)",
+                        type(exc).__name__, exc)
+            return None, None, 0, False
+        if not master:
+            return None, None, 0, False
+        try:
+            from sglang.srt.weg2 import l15_manifest, l15_restore
+
+            if self._weg2_group_name() != "D":
+                return None, None, 0, True
+            rank = self._weg2_rank()
+            if rank < 0:
+                return None, None, 0, True
+            m = l15_restore.load_for_wake(
+                l15_manifest.manifest_path(self._weg2_group_name(), rank, os.environ)
+            )
+            if m is None:
+                return None, rank, 0, True
+            tp = int(getattr(sched, "tp_size", 0)
+                     or getattr(getattr(sched, "server_args", None), "tp_size", 1)
+                     or 1)
+            mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+            pool = getattr(mr, "token_to_kv_pool", None)
+            if pool is None:
+                return None, rank, 0, True
+            rgid = getattr(getattr(sched, "server_args", None), "rank_gpu_id", None)
+            cards = (list(rgid) if isinstance(rgid, (list, tuple))
+                     and len(rgid) == tp else list(range(tp)))
+            from sglang.srt.weg2 import l15_shadow
+
+            caps = l15_shadow.caps_from_env(
+                os.environ, tp, [l15_shadow.cell_bytes_from(pool)] * tp, cards)
+            cap = int(caps[rank]) if 0 <= rank < len(caps) else 0
+            if cap <= 0:
+                return None, rank, 0, True
+            keep_rows = (int(m.rows_by_rank[rank])
+                          if 0 <= rank < len(m.rows_by_rank) else 0)
+            return m, rank, keep_rows, True
+        except Exception as exc:  # noqa: BLE001 -- no signal: today's restore
+            logger.info("L15-WAKE-RESTORE hold signal unavailable (%s: %s)",
+                        type(exc).__name__, exc)
+            return None, None, 0, True
+
+    def _l15_flush_zero_kv_bounded(self, sched, keep_rows: int) -> int:
+        """L15-12c-A: the SGLANG_FLUSH_ZERO_KV scrub with the hold prefix
+        kept: zero only rows >= keep_rows.  The held rows are the compact
+        prefix [0, keep_rows) (l15_compact); the gap rows are freshly
+        mapped pages, so the sleep leg already opted out of scrubbing them
+        for the same reason.  Same pool set and backing / safe-zero-row
+        rules as Scheduler._flush_zero_kv_buffers."""
+        from sglang.srt.platforms import current_platform
+
+        zeroed = 0
+        for pool in sched._kv_pools_for_flush():
+            if not getattr(pool, "backing_is_resident", True):
+                continue
+            pools = [pool]
+            for attr in ("full_kv_pool", "swa_kv_pool"):
+                sub = getattr(pool, attr, None)
+                if sub is not None:
+                    pools.append(sub)
+            for p in pools:
+                limit = getattr(p, "safe_zero_rows", None)
+                for name in ("k_buffer", "v_buffer", "kv_buffer"):
+                    bufs = getattr(p, name, None)
+                    if bufs is None:
+                        continue
+                    if isinstance(bufs, torch.Tensor):
+                        bufs = [bufs]
+                    for t in bufs:
+                        rows = int(t.shape[0])
+                        hi = rows if limit is None else min(rows, int(limit))
+                        lo = min(int(keep_rows), hi)
+                        if hi > lo:
+                            t[lo:hi].zero_()
+                        zeroed += 1
+        current_platform.synchronize()
+        return zeroed
+
+    def _l15_clear_tms_keep_spans(self, sched) -> int:
+        """L15-12c-A: after this wake's resume has consumed the sleep-armed
+        TMS keep spans, replace each base's keep set with the empty set
+        (patch-5 sequence) -- one call per allocation base.  The keep set
+        lives on the ALLOCATION (patch 6); pause/resume do not clear it, so
+        a stale set would pin rows a later pause no longer holds.  Bases via
+        the same kv/mamba buffer walk as the scheduler retain hook (dedup
+        by base data_ptr).  Cleanup, not the move: failures are logged.
+        Returns the bases cleared."""
+        ad = getattr(sched, "memory_saver_adapter", None)
+        if ad is None:
+            return 0
+        bufs = []
+        try:
+            for pool in sched._kv_pools_for_flush():
+                for name in ("k_buffer", "v_buffer", "kv_buffer"):
+                    t = getattr(pool, name, None)
+                    if t is None:
+                        continue
+                    if isinstance(t, torch.Tensor):
+                        bufs.append(t)
+                    else:
+                        bufs.extend(t)
+            mc = getattr(
+                getattr(sched.req_to_token_pool, "mamba_pool", None),
+                "mamba_cache", None)
+            for c in getattr(mc, "conv", None) or []:
+                bufs.extend(c[i] for i in range(int(c.shape[0])))
+            temp = getattr(mc, "temporal", None)
+            if temp is not None:
+                bufs.extend(temp[i] for i in range(int(temp.shape[0])))
+        except Exception as exc:  # noqa: BLE001
+            logger.info("L15-WAKE-RESTORE keep-set clear: buffer walk failed "
+                        "(%s: %s)", type(exc).__name__, exc)
+            return 0
+        cleared = 0
+        seen = set()
+        for t in bufs:
+            b = getattr(t, "_base", None)
+            b = b if b is not None else t
+            key = b.data_ptr()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if not ad.alloc_info_ok(b):
+                    continue
+                ad.set_keep_byte_spans(b, ())
+                cleared += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.info("L15-WAKE-RESTORE keep-set clear failed for base "
+                            "%d (%s: %s)", key, type(exc).__name__, exc)
+        if cleared:
+            logger.info("L15-WAKE-RESTORE TMS keep set cleared on %d "
+                        "base(s) after resume", cleared)
+        return cleared
+
     def _weg2_wake_restore_pools(self) -> bool:
         """#1455: Scheduler.flush_cache minus tree_cache.reset(): the pool
         state the remap left undefined is restored, the radix tree with the
@@ -7192,6 +7351,38 @@ class SchedulerWeightUpdaterManager:
         if sched is None:
             return False
         try:
+            _l15_m, _l15_rank, _l15_keep, _l15_master_on = self._l15_wake_hold_signal()
+            if _l15_master_on:
+                self._l15_wake_manifest = _l15_m
+            if _l15_m is not None:
+                # Hold-aware (AP-A): the radix tree was reduced to the held
+                # chains at sleep; keep the KV rows and the mamba anchors
+                # those chains point at out of the reset.  Local signal only
+                # -- the fence verdict is computed later, and the AP-B
+                # fallback reset undoes this idempotently.
+                from sglang.srt.weg2 import l15_retain
+
+                held = sorted({int(s) for _sp in _l15_m.spans for s in _sp.slots} - {0})
+                sched.req_to_token_pool.clear(keep_mamba_rows=int(_l15_m.anchor_slots))
+                sched.token_to_kv_pool_allocator.clear()
+                l15_retain.reserve_slots(sched.token_to_kv_pool_allocator, held)
+                try:
+                    from sglang.srt.environ import envs as _envs  # noqa: PLC0415
+                    if _envs.SGLANG_FLUSH_ZERO_KV.get():
+                        self._l15_flush_zero_kv_bounded(sched, _l15_keep)
+                except Exception:  # noqa: BLE001
+                    pass
+                if getattr(sched, "draft_worker", None):
+                    sched.draft_worker.clear_cache_pool()
+                self._l15_clear_tms_keep_spans(sched)
+                logger.info(
+                    "WEG2-WAKE-RESTORE L15 hold-aware (rank %d): %d slot(s) "
+                    "re-reserved, mamba rows [0,%d) kept, KV scrub bounded "
+                    "to rows>=%d", _l15_rank, len(held),
+                    int(_l15_m.anchor_slots), _l15_keep)
+                return True
+            # No local hold (master off / no manifest / cap 0): today's
+            # restore, byte-identical.
             sched.req_to_token_pool.clear()
             sched.token_to_kv_pool_allocator.clear()
             try:
@@ -7202,6 +7393,10 @@ class SchedulerWeightUpdaterManager:
                 pass
             if getattr(sched, "draft_worker", None):
                 sched.draft_worker.clear_cache_pool()
+            if _l15_master_on:
+                # AP-A: clear the sleep-armed keep set on every L15 wake
+                # (hold and fallback); master off stays byte-identical.
+                self._l15_clear_tms_keep_spans(sched)
             logger.info("WEG2-WAKE-RESTORE pools cleared, radix tree KEPT (#1455: the hold's prefetch survives the wake)")
             return True
         except Exception as exc:  # noqa: BLE001 -- fall back to the full flush, never leave pools undefined
