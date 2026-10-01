@@ -1006,6 +1006,34 @@ def resume_tail(req) -> int:
     return int(ntok) if cap is None else max(0, int(ntok) - int(cap))
 
 
+def realised_resume_tail(sched, req, head_inputs) -> int:
+    """F3b (01.10., y6h 10011531): the tail the resume will REALLY extend.
+
+    The park's read cap is a promise, not a measurement. At the wake the read
+    can come back short and the prefix demoted (``#1036 PREFIX DEMOTED``,
+    ``#1028B FETCH CAP lost``): weg2-26-124 had a park tail of 1 token
+    (``SETTLE-TAIL tail=1``) and extended 4138 (``X-GATE uncached=4138``,
+    5.5 s eager pass); F3 kept it in the first pass and the hand-off
+    weg2-28-127 (7 tokens) got its first token 11.9 s after P's end.
+
+    So the tail is the larger of the promise and the GROUP's priced extent --
+    the same ``weg2_uncached_extent`` term X-GATE prices on this pass, from
+    #823's MIN-reduced match (replicated). Without a group match on a
+    multi-rank group the extent is rank-local, so the promise alone decides
+    (the verdict stays group-uniform)."""
+    tail = resume_tail(req)
+    extent = getattr(sched, "weg2_uncached_extent", None)
+    if extent is None:
+        return tail
+    tp_size = int(getattr(getattr(sched, "ps", None), "tp_size", 1) or 1)
+    if tp_size > 1:
+        from sglang.srt.managers import tp_head_congruence
+
+        if tp_head_congruence.group_match_for(head_inputs, str(req.rid)) is None:
+            return tail
+    return max(tail, int(extent(req, head_inputs)))
+
+
 def decode_first_facts(sched, running_batch) -> Optional["d_seats.DecodeFirst"]:
     """F3's replicated inputs for this pass, or None (switch off, no wake yet)."""
     if not d_seats.decode_first_enabled():
@@ -1016,8 +1044,9 @@ def decode_first_facts(sched, running_batch) -> Optional["d_seats.DecodeFirst"]:
     from sglang.srt.environ import envs
 
     settle = list(getattr(sched, "weg2_post_wake_settle", None) or [])
+    head_inputs = getattr(sched, "_pp_head_inputs_this_pass", None)
     tails = {
-        str(r.rid): resume_tail(r)
+        str(r.rid): realised_resume_tail(sched, r, head_inputs)
         for r in sched.waiting_queue if d_seats.park_site(r) == d_seats.SITE_FLIP
     }
     return d_seats.DecodeFirst(

@@ -120,6 +120,63 @@ def test_nothing_else_to_run_never_idles_for_the_resume():
     assert gate.skip(p, admitted=[]) is None
 
 
+def _sched_priced(waiting, extents, *, tp_size=1, group=None):
+    """A scheduler whose X-GATE term prices ``extents[rid]`` (the realised
+    uncached extent of this pass) and whose #823 reduce published ``group``."""
+    s = _sched(waiting)
+    s.weg2_uncached_extent = lambda req, head_inputs: extents[str(req.rid)]
+    s.ps = types.SimpleNamespace(tp_size=tp_size)
+    s._pp_head_inputs_this_pass = group
+    return s
+
+
+def test_f3b_a_demoted_resume_is_priced_by_its_realised_extent():
+    """y6h 10011531 15:54:16: weg2-26-124's park promised a 1-token tail
+    (SETTLE-TAIL tail=1), the read came back demoted and the resume extended
+    4138 tokens (X-GATE uncached=4138, HOST-ANON-PASS 5455 ms); the hand-off
+    weg2-28-127 (7 tokens) waited behind it -> first token 11.9 s after P end.
+    RED on 281c3d1ff2: the park tail alone keeps the resume in the first pass
+    and the hand-off is skipped as weg2_d_park_first."""
+    p = _req("weg2-26-124", 1, parked=True, tokens=130, resumable=129)   # promise: tail 1
+    h = _req("weg2-28-127", 5)
+    s = _sched_priced([p, h], {"weg2-26-124": 4138, "weg2-28-127": 7})
+    gate = d_park_runtime.admission(s, _running())
+    assert gate.skip(p, admitted=[]) == "weg2_d_park_decode_first"
+    assert gate.skip(h, admitted=[]) is None
+
+
+def test_f3b_multi_rank_without_group_match_keeps_the_promise():
+    """No #823 match for the rid on a 3-rank group: the extent would be
+    rank-local, so the verdict falls back to the park's promise (uniform)."""
+    p = _req("weg2-26-124", 1, parked=True, tokens=130, resumable=129)
+    h = _req("weg2-28-127", 5)
+    s = _sched_priced([p, h], {"weg2-26-124": 4138, "weg2-28-127": 7}, tp_size=3, group=None)
+    gate = d_park_runtime.admission(s, _running())
+    assert gate.skip(p, admitted=[]) is None
+    assert gate.skip(h, admitted=[]) == "weg2_d_park_first"
+
+
+def test_f3b_multi_rank_with_group_match_uses_the_group_extent(monkeypatch):
+    from sglang.srt.managers import tp_head_congruence
+
+    monkeypatch.setattr(tp_head_congruence, "group_match_for",
+                        lambda head_inputs, rid: 0 if head_inputs == "pass" else None)
+    p = _req("weg2-26-124", 1, parked=True, tokens=130, resumable=129)
+    h = _req("weg2-28-127", 5)
+    s = _sched_priced([p, h], {"weg2-26-124": 4138, "weg2-28-127": 7}, tp_size=3, group="pass")
+    gate = d_park_runtime.admission(s, _running())
+    assert gate.skip(p, admitted=[]) == "weg2_d_park_decode_first"
+    assert gate.skip(h, admitted=[]) is None
+
+
+def test_f3b_a_real_short_tail_still_rides_the_first_pass():
+    p = _req("weg2-26-120", 1, parked=True, tokens=130, resumable=124)   # tail 6
+    h = _req("weg2-28-127", 5)
+    s = _sched_priced([p, h], {"weg2-26-120": 6, "weg2-28-127": 7})
+    gate = d_park_runtime.admission(s, _running())
+    assert gate.skip(p, admitted=[]) is None
+
+
 def test_switch_off_is_the_park_first_gate(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_ENABLE_D_DECODE_FIRST", "0")
     p = _req("weg2-1-19", 1, parked=True)
