@@ -788,7 +788,7 @@ class Envs:
     # 23/31) and pause_ms is 26-28 ms per tag on the 3080 D ranks (5090: 6)
     # with sync_ms=0 -- 465-517 ms per leg. Inert while H111b runs the leg.
     # False = the per-tag chain, byte for byte. Off until the first series.
-    SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(False)
+    SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(True)
     # the sleeping group(s) that take it (comma list; default the D->P leg).
     SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
@@ -799,14 +799,14 @@ class Envs:
     # extents, 10 calls) 10.6 ms. False = the per-extent walk, call for call.
     # Off until metal (the driver may refuse a multi-mapping range: that run
     # then falls back to the per-extent walk and the line counts it).
-    SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP = EnvBool(False)
+    SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP = EnvBool(True)
     # B1 (30.09., NF y4i, managers/weg2_flush_nonblock.py): the HiCache
     # publish leaves the D->P flip's quiesce. Measured: the first quiesce
     # /flush_cache refused in 11/12 flips (hicache_backup), FLUSH-PUBLISH
     # waited 32-166 ms, begin -> quiesce done median 98 ms; D was idle
     # 137-333 ms before each flip. (1) D-IDLE-PUBLISH: the bubble publisher's
     # sweep from Scheduler.on_idle (nothing running/waiting, not dormant).
-    SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH = EnvBool(False)
+    SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH = EnvBool(True)
     # nodes per idle pass (the sweep's max_issue). 1: a request that lands
     # during a pass waits at most one node's issue (y4i: ~23-48 ms per node
     # incl. arena claim + mamba write); the idle loop takes the next node
@@ -815,7 +815,7 @@ class Envs:
     # (2) FLUSH-QUIESCE-NONBLOCK: the quiesce answers "quiesced" when the only
     # blockers on every rank are the group's own write-throughs / store
     # writes; the sleep leg's group drain + #1470 flush reset before the pause.
-    SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(False)
+    SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(True)
     # the groups both parts apply to (comma list; default the D->P sleeper)
     SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
@@ -1453,7 +1453,7 @@ class Envs:
     # store presence, so a follow-up turn on that prefix prices its real rest
     # and stays on D. Line 'WEG2 P-ANCHOR-PRESENCE'. Off = no record (#1324:
     # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
-    SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(False)
+    SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(True)
     # RPC-STALL-WATCHDOG (30.09., hauenh P->D epoch 6: D TP0 silent 6 s inside the wake RPC):
     # faulthandler's C watchdog writes every thread's stack into its own file per rank when a sleep
     # (release) or wake (resume) RPC outlives this many seconds (weg2/rpc_stall_watchdog.py). A normal

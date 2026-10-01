@@ -90,11 +90,11 @@ def _sched(tree, *, blockers=("hicache_backup(1)",), group_idle=False, running=0
 
 # ---- the switches ------------------------------------------------------------------
 
-def test_switches_default_off():
+def test_switches_default_on():  # release 01.10.: default ON after metal (z30y11..13)
     from sglang.srt.environ import envs
 
-    assert envs.SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH.get() is False
-    assert envs.SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK.get() is False
+    assert envs.SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH.get() is True
+    assert envs.SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK.get() is True
     assert envs.SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS.get() == "D"
     assert envs.SGLANG_WEG2_D_IDLE_PUBLISH_MAX_ISSUE.get() == 1
 
@@ -172,6 +172,7 @@ def _flush(s, tp=True):
 
 def test_flush_base_drains_and_refuses(monkeypatch):
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK", "0")  # base path = switch explicitly off
     tree = _Tree(sweeps=[{"unbacked": 1, "issued": 1, "pending": 1}, {"unbacked": 0}])
     s = _sched(tree)
     assert _flush(s) is False                 # the y4i 400: hicache_backup(1)

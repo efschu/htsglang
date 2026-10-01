@@ -195,10 +195,10 @@ def test_k1_finish_replaces_the_anchor_with_the_measurement():
     assert f.tspans.pending(full, epoch=None)[1] == 29952
 
 
-def test_k1_switch_default_off_and_wired_at_first_content():
+def test_k1_switch_default_on_and_wired_at_first_content():  # release 01.10.: default ON
     import inspect
 
-    assert F.envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get() is False
+    assert F.envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get() is True
     src = inspect.getsource(F.Front.leg2)
     assert "envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get()" in src
     assert "self._p_anchor_presence(rid, text, pending)" in src

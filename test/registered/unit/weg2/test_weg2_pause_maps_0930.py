@@ -228,10 +228,10 @@ def test_unsorted_extents_after_a_live_grow_are_one_run(lib):
 
 # ---- (2) the switch -------------------------------------------------------------------
 
-def test_switch_default_off():
+def test_switch_default_on():  # release 01.10.: default ON (no-op on 27B-D)
     from sglang.srt.environ import envs
 
-    assert envs.SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP.get() is False
+    assert envs.SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP.get() is True
 
 
 def test_arm_pushes_the_switch_and_names_a_missing_hook(monkeypatch, caplog):
