@@ -64,6 +64,12 @@ struct AllocationMetadata {
     // is never touched -- a captured CUDA graph keeps its addresses; only the
     // physical pages behind the unplanned ranges are absent.
     std::vector<std::pair<size_t, size_t>> weg2_plan;
+    // PATCH 6 (KEEP SPANS): the byte ranges a pause must NOT unmap/release
+    // (granularity aligned, sorted, disjoint, inside the allocation); EMPTY =
+    // no keep = exactly the patch-5 behaviour.  Meaningful on span-mapped
+    // allocations only (``weg2_extents`` non-empty); a wholly covered extent
+    // stays in ``weg2_extents`` across the pause.
+    std::vector<std::pair<size_t, size_t>> weg2_keep;
 #if defined(USE_CUDA)
     //: the CURRENT mapping of a span-mapped allocation (one handle per
     //: extent); EMPTY while ACTIVE = the stock whole mapping under allocHandle.
@@ -97,6 +103,16 @@ public:
     //: else the CUresult of the failing map (the extents mapped by THIS call
     //: are rolled back, the rest of the allocation is left as it was).
     int set_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi, bool now);
+    //: PATCH 6 (KEEP SPANS): the KEEP set of one allocation (``ptr`` must be an
+    //: allocation BASE).  ``n`` ranges ``[lo[i], hi[i])``, granularity aligned,
+    //: sorted and disjoint, inside the allocation; ``n == 0`` clears the keep
+    //: set.  A pause keeps every extent WHOLLY inside a keep range (mapped and
+    //: unreleased, bytes intact), everything else goes the patch-5 way; the
+    //: resume maps only the plan's gaps no kept extent covers.  An EMPTY keep
+    //: set is exactly the patch-5 pause/resume.  Returns 0; -1 not an
+    //: allocation base; -2 a cpu-backed allocation; -3 a malformed set; -4 the
+    //: granularity could not be read; -5 ROCm.
+    int set_keep_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi);
     //: H95c: 0 when ``ptr`` is an allocation base, then its VA ``size``, the
     //: bytes mapped NOW (0 while paused), the bytes the next resume maps, and
     //: ``active`` (1 ACTIVE, 0 PAUSED); -1 otherwise.  Any pointer may be null.

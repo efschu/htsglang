@@ -156,6 +156,17 @@ int tms_set_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi, i
     return TorchMemorySaver::instance().set_spans(ptr, n, lo, hi, now != 0);
 }
 
+// PATCH 6 (01.10.) -- THE KEEP SPANS.  L1.5 holds D's KV prefix through the P
+// phase (plan 2.2/5): ``tms_set_keep_spans`` marks the byte ranges of ONE
+// allocation (``ptr`` an allocation BASE) whose pages the next pause must not
+// unmap or release -- kept extents survive PAUSED with their handle and their
+// bytes, and the resume maps only the plan's gaps around them.  ``n == 0``
+// clears the keep set (= exactly the patch-5 pause/resume).  Codes: core.h
+// ``set_keep_spans`` (-1 not a base, -2 cpu-backed, -3 malformed, -4/ -5).
+int tms_set_keep_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi) {
+    return TorchMemorySaver::instance().set_keep_spans(ptr, n, lo, hi);
+}
+
 int tms_alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, uint64_t* planned, int* active) {
     return TorchMemorySaver::instance().alloc_info(ptr, size, mapped, planned, active);
 }
