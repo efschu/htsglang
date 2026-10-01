@@ -1,0 +1,19 @@
+{
+ "round1": 8,
+ "round2": 8,
+ "rounds_identical": true,
+ "outputs": [
+  "Paris",
+  "42",
+  "217",
+  "Mars",
+  "The sequence is: **2, 4, 8, 16, ?**\n\nEach number is double the previous one:\n\n- 2 \u00d7 2 = 4\n- 4 \u00d7 2 = 8\n- 8 \u00d7 2 = 16\n\nFollowing this pattern, the next number is:\n\n**16 \u00d7 2 = 32**\n\nThe completed sequence is: **2, 4, 8, ",
+  "Ice floats on water because it is less dense than liquid water.",
+  "s[::-1]",
+  "391"
+ ],
+ "det8_texts_distinct": 1,
+ "det8_logprob_sets_distinct": 1,
+ "det8_text": "A hash map is a data structure that stores key-value pairs by using a hash function to compute an index into an array of buckets. This allows for efficient average-case time complexity of O(1) for insertion, deletion, and lookup operations.",
+ "verdict": "COHERENT"
+}
