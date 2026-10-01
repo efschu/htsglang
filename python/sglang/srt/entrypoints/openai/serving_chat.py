@@ -23,7 +23,11 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import (
+    chat_encoding,
+    encoding_dsv4,
+    encoding_dsv32,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -1811,6 +1815,25 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.reasoning_effort != "none"
         ):
             request.skip_special_tokens = False
+
+    def supports_native_reasoning_history(self) -> bool:
+        """Whether the chat encoder takes history as ``reasoning_content`` rather
+        than via :meth:`wrap_reasoning_history`; see
+        :func:`chat_encoding.spec_owns_reasoning_history` for why.
+
+        Fork extension: on the HF chat-template path (no custom spec) the answer
+        is also yes when the loaded template renders ``reasoning_content``
+        itself (:func:`chat_encoding.template_owns_reasoning_history`), so
+        ``/v1/messages`` hands the template the same messages as an equivalent
+        ``/v1/chat/completions`` request would.
+        """
+        spec = self.chat_encoding_spec
+        if chat_encoding.spec_owns_reasoning_history(spec):
+            return True
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        return chat_encoding.template_owns_reasoning_history(
+            getattr(tokenizer, "chat_template", None)
+        )
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.
