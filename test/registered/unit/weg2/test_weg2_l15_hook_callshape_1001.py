@@ -45,6 +45,8 @@ _FAKE_KW = {
     "mamba_allocator": None,
     "host_pool": None,
     "mamba_host_pool": None,
+    # L15-FIX-PARKED: the hook passes the radix tree for parked reqs
+    "tree_cache": None,
 }
 
 

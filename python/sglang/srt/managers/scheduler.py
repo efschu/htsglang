@@ -19826,6 +19826,7 @@ class Scheduler(
             # hold set at this sleep flush (no behaviour change).
             try:
                 from sglang.srt.weg2 import l15_policy, l15_shadow
+                from sglang.srt.weg2 import l15_bind as l15_bind_e
 
                 if l15_shadow.shadow_on(os.environ):
                     _tp = int(
@@ -19899,7 +19900,7 @@ class Scheduler(
                     logger.info(
                         "%s split=%s card_map=%s",
                         l15_policy.shadow_line(
-                            int(getattr(self, "_weg2_vote_epoch", 0) or 0), _hs, _caps
+                            l15_bind_e.sleep_epoch(self), _hs, _caps
                         ),
                         _split,
                         _cards,
@@ -20057,7 +20058,9 @@ class Scheduler(
                             cap_anchor_slots=len(_reqs),
                             prefix=_prefix,
                             rank=_l15_rank,
-                            epoch=int(getattr(self, "_weg2_vote_epoch", 0) or 0),
+                            # L15-FIX-EPOCH: the front's flip index, not
+                            # PP0's vote counter (always 0 on D).
+                            epoch=l15_bind.sleep_epoch(self),
                             pid=os.getpid(),
                             kv_buffers=_kv,
                             mamba_buffers=_mb,
@@ -20067,6 +20070,10 @@ class Scheduler(
                             # AND at retain_at_sleep was the boot killer
                             # ("multiple values for keyword argument").
                             mamba_allocator=_l15_mba,
+                            # L15-FIX-PARKED: a parked req (D park retract,
+                            # req_to_token row released) is matched in the
+                            # tree it was inserted into.
+                            tree_cache=self.tree_cache,
                             reset_keep=self.tree_cache.reset_keep,
                             set_keep=_set_keep_collect,
                             # L15-12c-C: per-(group, rank) manifest file -- the
