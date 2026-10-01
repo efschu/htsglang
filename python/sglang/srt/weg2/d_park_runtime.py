@@ -33,6 +33,7 @@ from typing import Optional
 
 from sglang.srt.managers import weg2_resumable_depth
 from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield
+from sglang.srt.weg2 import handback_claim as _hb
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     for req in retracted:
         d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=epoch, now=now)
         sched._969ad_note_retract(req, "weg2_park_running")
+        _hb.note_origin(req.rid, _hb.ORIGIN_PARK)  # ZR: the resume computes 0 tokens again
         # STALE-DELIVERED (b23 10:23:15, weg2-24-100): a flip park opens a NEW
         # read cycle. The #1324 stamp of the previous cycle's read (79103) made
         # the #1471 wake settle release a request whose THIS-cycle read had

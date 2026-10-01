@@ -1222,6 +1222,16 @@ def local_vote(rid: str) -> int:
     return 1 if job.box[0].e1 else 0
 
 
+def _note_defect_why(rid: str, why: str) -> None:
+    """ZR instrument: why an origin request's tail cannot be taken."""
+    try:
+        from sglang.srt.weg2.handback_claim import note_why
+
+        note_why(rid, why)
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        pass
+
+
 def agree(rid: str, group_vote: int) -> None:
     """After the MIN: remember the group's answer for the admission."""
     job = _JOBS.pop(rid, None)
@@ -1240,6 +1250,7 @@ def agree(rid: str, group_vote: int) -> None:
         # voted 0: the manifest never completed inside the bound, or the read
         # was still running after STAGE_JOIN_S -- named at the admission
         why = "stage_unfinished" if job.thread is not None else f"parts_{job.state}:{job.have}/{job.want}"
+        _note_defect_why(rid, "no_parts" if not job.headers else why)
         if not job.headers:
             logger.info(
                 "WEG2-TAIL-READY rid=%s parts=0/? verdict=no_parts adopt=skipped:no_parts end=absent "
@@ -1379,6 +1390,7 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
         return None
     entry = _AGREED.pop(str(req.rid), None)
     if entry is None:
+        _defect_without_tail(req, prefix_len)
         return None
     out, path = _plan_adopt_entry(entry, req, prefix_len, batch_empty)
     _handback(req, entry, prefix_len, out, path)
@@ -1412,6 +1424,17 @@ def _plan_adopt_entry(entry: Agreed, req, prefix_len: int, batch_empty: bool):
             return entry, f"e1:{why}"
         return entry, "skip"
     return entry, "e1"
+
+
+def _defect_without_tail(req, prefix_len: int) -> None:
+    """ZR instrument: a P hand-off or a D park admitted with no agreed tail
+    computes everything from ``prefix_len`` again (WEG2-HANDBACK-DEFECT)."""
+    try:
+        from sglang.srt.weg2.handback_claim import admission_without_tail
+
+        admission_without_tail(req.rid, len(req.full_untruncated_fill_ids), int(prefix_len))
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        pass
 
 
 def _handback(req, entry: Agreed, prefix_len: int, out, path: str) -> None:

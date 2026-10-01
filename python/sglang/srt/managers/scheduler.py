@@ -7672,6 +7672,10 @@ class Scheduler(
                 # the tree's own reader is told so through WEG2_HANDOFF_OFF.
                 _hd = resolve_chain(req, _ho.read)
                 _weg2_hb_handoff = bool(_hd)
+                if _weg2_hb_handoff:  # ZR: a P hand-off comes back with 0 tokens computed again
+                    from sglang.srt.weg2.handback_claim import ORIGIN_HANDOFF, note_origin
+
+                    note_origin(req.rid, ORIGIN_HANDOFF)
                 if getattr(req, _HK_OFF, False):
                     _cc.WEG2_HANDOFF_OFF[req.rid] = True
                     while len(_cc.WEG2_HANDOFF_OFF) > 4096:
