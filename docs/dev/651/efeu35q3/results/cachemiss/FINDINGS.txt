@@ -1,0 +1,56 @@
+efeu-TP14 2026-10-01 -- omp cache miss at 18:14:42 (43464-token turn, 17920 cached)
+
+(a) WHERE THE PROMPT DIVERGES (passive: omp session -> served chat template)
+  omp_render_diverge.py rebuilds every request of session 01a0f7eb from
+  ~efeu/.omp/agent/sessions/-tmp/*.jsonl and renders it with /root/efeu35q3/hf.
+  Calibration: prompt_tokens(log) - rendered_len = 18052..18053 for the
+  requests at 18:11:31, 18:11:50, 18:12:47, 18:14:42 -> reconstruction exact.
+  18:14:42 (new user message "Linux (Am50-AM5A ...) - was soll das sein?"):
+    diverges at rel 19641 = abs 37694, '<think>\n\n</think>\n\n<tool_call>' -> '<tool_call>'
+  Cause: the Qwen3.6/3.8 template renders <think></think> only for assistant
+  messages AFTER the last user query. A new user message re-renders the whole
+  previous tool loop without it. omp stores no reasoning, so the block is
+  always empty, but its tokens still change. The same happened at 16:01:12Z
+  (rel 284 -> abs 18337; restart turn: L3 gave the anchor at 17920).
+  With preserve_thinking=true every user turn is append-only (only the
+  generation tail differs, as always).
+  Device side: kv evictable 43460 at 18:14:42 (the KV of the whole previous
+  chain was on the device), match 17920 -> no GDN anchor in (17920, 37694];
+  the chunk anchor 37376 (used 18:11:38) had been evicted from the 16 slots.
+  Both together; fix: --chat-template-default-kwargs {"preserve_thinking":true}.
+
+(b) host_kv_full / L3 starvation (server bug)
+  The 19662-token host pool held write-through copies of DEVICE-RESIDENT nodes
+  (upstream evict_host only frees host leaves already evicted from the device).
+  Consequences in backend_180118 (18:04-18:24):
+    * prefetch 18:14:43: reason=host_kv_full len=25544 host_free=199
+    * write_backup returned 0 for everything new -> L3 got 1037 tokens
+      (find /var/lib/hicache/kv -newermt 18:00: 1037 x 20480-byte pages, all
+      18:09:28) while the chat grew to 43k.
+  Fix: patch_host_staging_ring.py (host = staging ring for L3): host copies
+  of nodes that are on the device AND acked in L3 are dropped LRU-first when a
+  backup or a prefetch needs room; parent-first backup invariant accepts a
+  resident persisted parent; a not-backed-up node with host-only children is
+  tombstoned instead of unlinked; scheduler accepts a resident persisted node
+  as prefetch anchor. Env SGLANG_HICACHE_HOST_STAGING_RING=0 = upstream.
+  Tests: test_host_staging_ring.py 8/8 on the patched tree, 6/8 FAIL on the
+  unpatched tree (the falsifier); upstream suite test_unified_radix_cache_
+  unittest.py on CPU: 635 passed / 212 not (device-only) -- identical sets
+  before and after the patch.
+  Not built: a second prefetch round for a remainder larger than the host pool
+  (after a restart a 43k chain loads <= 19.6k from L3 per request, the rest is
+  prefilled); with the ring the next turn's L3/host path is complete again.
+
+(c) bigger prefill chunks at 20-40k depth -- not tested on the live service
+  ms per 512-token chunk by depth (backend_180118, rank gpu-ms):
+    15-20k 7115 | 20-25k 7585 | 25-30k 8470 | 30-35k 8758 | 35-40k 8840 | 40-45k 9121
+  shallow (prefill_cp512 bench): ~3.6-4.6 s.  The depth term (~+0.08 ms per
+  token of depth per chunk, ~3.4 s/chunk at 40k) is the triton extend
+  attention; its total FLOPs do not depend on the chunk size. Chunk size only
+  acts on the depth-independent MoE/GEMM part: measured 256 -> 512 = +6.8 %
+  (8k prefill 59.1 s -> 55.4 s); 512 -> 1024 bounded to ~+3 % of ~60 % = ~2 %
+  at 30k depth. M=1024 bf16 GEMM is the MEASURED gfx1103 MES-wedge trigger
+  (wedge_policy.py; GPU reset kills the service), and the box runs below the
+  2 GiB free floor. Verdict: no gain worth the wedge risk; the lever at depth
+  is the extend-attention kernel, not the chunk. Anchors: request-end anchors
+  are exact regardless of chunk; chunk anchors only matter after divergence.

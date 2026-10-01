@@ -1,0 +1,26 @@
+== preserve_thinking=0
+14:43:40 user: msgs 1 rel_len 26
+14:44:20 user: msgs 1 rel_len 33 DIVERGES at rel 12 (prev len 26): prev[12:+6]='hi, erzähl einen w' new='welche gpu hat dieses system'
+14:45:10 user: msgs 3 rel_len 286 DIVERGES at rel 31 (prev len 33): prev[31:+6]='<think>\n' new='**GPU auf diesem System:**'
+14:45:25 tool: msgs 5 rel_len 2597 DIVERGES at rel 285 (prev len 286): prev[285:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+14:46:02 tool: msgs 7 rel_len 5339 DIVERGES at rel 2596 (prev len 2597): prev[2596:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+14:46:45 tool: msgs 9 rel_len 18675 DIVERGES at rel 5338 (prev len 5339): prev[5338:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+16:01:12 user: msgs 11 rel_len 19277 DIVERGES at rel 284 (prev len 18675): prev[284:+6]='<think>\n\n</think>\n\n<tool_call>\n' new='<tool_call>\n<function=web'
+16:07:27 user: msgs 12 rel_len 19286 DIVERGES at rel 19273 (prev len 19277): prev[19273:+6]='assistant\n<think>\n' new='user\nfür die iGPU'
+16:11:30 user: msgs 14 rel_len 19643 DIVERGES at rel 19284 (prev len 19286): prev[19284:+6]='<think>\n' new='Jawort.\n\n##'
+16:11:49 tool: msgs 16 rel_len 22121 DIVERGES at rel 19642 (prev len 19643): prev[19642:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+16:12:46 tool: msgs 18 rel_len 25256 DIVERGES at rel 22120 (prev len 22121): prev[22120:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+16:14:42 user: msgs 20 rel_len 25412 DIVERGES at rel 19641 (prev len 25256): prev[19641:+6]='<think>\n\n</think>\n\n<tool_call>\n' new='<tool_call>\n<function=web'
+== preserve_thinking=1
+14:43:40 user: msgs 1 rel_len 26
+14:44:20 user: msgs 1 rel_len 33 DIVERGES at rel 12 (prev len 26): prev[12:+6]='hi, erzähl einen w' new='welche gpu hat dieses system'
+14:45:10 user: msgs 3 rel_len 290 DIVERGES at rel 32 (prev len 33): prev[32:+6]='\n' new='\n\n</think>\n\n**GPU auf'
+14:45:25 tool: msgs 5 rel_len 2601 DIVERGES at rel 289 (prev len 290): prev[289:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+14:46:02 tool: msgs 7 rel_len 5343 DIVERGES at rel 2600 (prev len 2601): prev[2600:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+14:46:45 tool: msgs 9 rel_len 18679 DIVERGES at rel 5342 (prev len 5343): prev[5342:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+16:01:12 user: msgs 11 rel_len 19297 DIVERGES at rel 18678 (prev len 18679): prev[18678:+6]='\n' new='\n\n</think>\n\nJawort'
+16:07:27 user: msgs 12 rel_len 19306 DIVERGES at rel 19293 (prev len 19297): prev[19293:+6]='assistant\n<think>\n' new='user\nfür die iGPU'
+16:11:30 user: msgs 14 rel_len 19667 DIVERGES at rel 19305 (prev len 19306): prev[19305:+6]='\n' new='\n\n</think>\n\nJawort'
+16:11:49 tool: msgs 16 rel_len 22145 DIVERGES at rel 19666 (prev len 19667): prev[19666:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+16:12:46 tool: msgs 18 rel_len 25280 DIVERGES at rel 22144 (prev len 22145): prev[22144:+6]='\n' new='\n\n</think>\n\n<tool_call>\n<'
+16:14:42 user: msgs 20 rel_len 25448 DIVERGES at rel 25279 (prev len 25280): prev[25279:+6]='\n' new='\n\n</think>\n\n## 1'
