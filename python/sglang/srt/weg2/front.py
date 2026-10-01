@@ -2316,6 +2316,18 @@ def stream_has_content(head: Optional[bytes], path: str) -> bool:
     return b"data:" in head
 
 
+def stream_chunk_is_work(chunk: Optional[bytes], path: str) -> bool:
+    """FW-PING (NF fqnsdm 01.10.): does a leg-2 chunk carry D's WORK -- token
+    content (:func:`stream_has_content`) or the end of the answer
+    (:func:`stream_finish_seen`)? A keepalive is not work: D's Anthropic adapter
+    sends ``event: ping`` after 5 s of silence (anthropic/serving.py
+    PING_INTERVAL_SECONDS), an OpenAI-wire keepalive is a ``:`` comment line,
+    the ``message_start`` envelope precedes D's prefill. Measured: P->D flips
+    28/30 read first_work 5.3 s from the ping of a stream parked in a long
+    extend, while D's first decode round came 0.4-0.5 s after done."""
+    return stream_has_content(chunk, path) or (bool(chunk) and stream_finish_seen(chunk))
+
+
 def inband_error_before_content(head: Optional[bytes], path: str) -> Optional[str]:
     """EB (NF rc12q 16:26:57, weg2-14-52): D answered a streamed leg 2 with a
     NAMED error before any content -- there ``W88 Weg2StoreLoadNotProgressing
@@ -6661,11 +6673,16 @@ class Front:
             c = self.__dict__["_ipc_dp_clk"] = front_state_ipc.DpFlipClock()
         return c
 
-    def _ipc_first_work_seen(self, group: str, what: str, rid: Optional[str]) -> None:
+    def _ipc_first_work_seen(self, group: str, what: str, rid: Optional[str],
+                             chunk: Optional[bytes] = None, path: str = "") -> None:
         """The woken group's first work after a flip -> one ``flip_first_work`` event
-        (the flip time from the front's one clock). Cheap when nothing is armed."""
+        (the flip time from the front's one clock). Cheap when nothing is armed.
+        ``chunk`` given (a D stream chunk): only a chunk that carries work counts,
+        never a keepalive (FW-PING, :func:`stream_chunk_is_work`)."""
         c = self.__dict__.get("_ipc_fw_clock")
         if c is None or not c.waits_for(group):  # per D chunk: one compare while nothing is armed
+            return
+        if chunk is not None and not stream_chunk_is_work(chunk, path):
             return
         # DASHBOARD-IPC 01.10.: D content before `done` is this flip's work only
         # for a leg 2 dispatched in this flip (FirstWorkClock.seen)
@@ -8836,8 +8853,10 @@ class Front:
                         if chunk and r.status == 200:
                             # FEHLT 3: ANY D content after a P->D flip is its first
                             # work -- a resumed stream too, not only a new leg's
-                            # first chunk (one dict read while nothing is armed); 200 only
-                            self._ipc_first_work_seen("D", "decode_token", rid)
+                            # first chunk (one dict read while nothing is armed); 200 only.
+                            # FW-PING: content or the end only, never D's keepalive ping
+                            self._ipc_first_work_seen("D", "decode_token", rid,
+                                                      chunk=chunk, path=request.path)
                         try:
                             await resp.write(chunk)
                         except ConnectionError as e:
