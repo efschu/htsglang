@@ -29,8 +29,8 @@ export OMP_NUM_THREADS=${OMP_NUM_THREADS:-12}
 export SGLANG_NUM_THREADS=${SGLANG_NUM_THREADS:-12}
 
 source /root/lh/venv/bin/activate
-GGUF_EXT_DIR=${GGUF_EXT_DIR:-/root/efeu35q3/ext_gfx1100_fake16}
-SGL_SRC=${SGL_SRC:-/root/651-p2/sglang_src/python}
+GGUF_EXT_DIR=${GGUF_EXT_DIR:-/root/efeu35q3/ext_v2}
+SGL_SRC=${SGL_SRC:-/root/efeu35q3/sglang_src/python}
 export PYTHONPATH="$GGUF_EXT_DIR:$SGL_SRC"
 if [ -d /opt/ktk ]; then
   export PYTHONPATH="$PYTHONPATH:/opt/ktk"

@@ -1,0 +1,49 @@
+--- docs/dev/651/efeu35q3/laptop_tree/sglang/srt/layers/quantization/gguf.py	2026-08-08 11:50:24.000000000 +0000
++++ /tmp/efeu_gguf.py	2026-10-01 10:28:20.207684302 +0000
+@@ -388,7 +388,32 @@
+ #: fused_mul_mat_gguf's MMQ branch.
+ _DEQUANT_EXCLUDED_NEEDS_MMQ: frozenset = frozenset()
+ 
+-if _is_hip:
++
++def _rocm_gguf_ext_true16_safe() -> bool:
++    """efeu-TP14 2026-10-01: ROOT CAUSE of the Q6_K entry above, found.
++
++    The standalone ROCm extension built by clang 21 used real-true16 codegen:
++    a D16 load into one half of a VGPR raced a VALU write to the other half,
++    and the write was lost when the load returned inside that window (Q6_K
++    dequantize: ``global_load_d16_b16 v0`` outstanding while
++    ``v_lshlrev_b16 v0.h`` executes). A build with ``-real-true16`` is
++    deterministic on every type, and exports the marker op
++    ``ggml_rocm_true16_safe``. With that build loaded the containment is not
++    needed; with an older build it stays exactly as it was.
++    """
++    try:
++        import sglang_gguf_rocm as _ext
++    except ImportError:
++        return False
++    return hasattr(_ext, "ggml_rocm_true16_safe")
++
++
++if _is_hip and _rocm_gguf_ext_true16_safe():
++    logger.info(
++        "GGUF ROCm extension is a non-true16 build (ggml_rocm_true16_safe): "
++        "Q6_K dequant containment not applied"
++    )
++elif _is_hip:
+     DEQUANT_TYPES = DEQUANT_TYPES - ROCM_BROKEN_DEQUANT_TYPES
+     # Only the types that actually HAVE an MMQ kernel can be rescued this way;
+     # one without would still hit the NotImplementedError, which is the honest
+@@ -1406,7 +1431,11 @@
+         is dense from then on. The broken kernel is never re-admitted; it is
+         simply not the thing doing the work.
+         """
+-        if not _is_hip:
++        if not _is_hip or _rocm_gguf_ext_true16_safe():
++            # efeu-TP14: with a non-true16 extension the GPU kernels are
++            # correct for Q6_K, so the layer stays QUANTIZED (a Q6_K lm_head
++            # of 248320 x 2048 is 417 MB packed vs 1017 MB dense bf16, read
++            # once per decoded token).
+             return
+         qweight_type = layer.qweight_type.weight_type
+         if qweight_type not in ROCM_BROKEN_DEQUANT_TYPES:
