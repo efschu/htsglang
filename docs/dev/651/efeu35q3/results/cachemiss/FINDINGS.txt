@@ -71,3 +71,26 @@ efeu-TP14 2026-10-01 -- omp cache miss at 18:14:42 (43464-token turn, 17920 cach
   scenario, for Full and Full+Mamba: 20/20 patched, 16/20 fail unpatched
   (incl. the 19:45 crash shape). Upstream suite on CPU still 635/212 identical.
   The ring stays OFF in production until a runtime soak in an idle window.
+
+v2 (operator order 20:15: drop only leaf-first, keep the invariant; ring OFF
+until a test reproduces the break red on v1 and green on the fix)
+  patch_host_staging_ring_v2.py: applies to the PRISTINE files; a host copy is
+  dropped only if no child is backed up (leaf-first, parent considered after
+  its child); write_backup protects the node + all ancestors; prefetch
+  protects its own path + the anchor's ancestors. write_backup's parent-first
+  rule, _evict_device_leaf, sanity_check and the scheduler are untouched.
+  patch_host_staging_ring_sanity.py (relaxing sanity_check) is SUPERSEDED.
+  test_host_staging_ring.py (Full and Full+Mamba, sanity_check + explicit
+  parent-first walk + device/host/mamba-host pool balance after every test):
+    pristine 6/18 (ring tests red, baselines green)
+    v1 (the 19:45 build) red; test_crash_shape_19_45 on Full+Mamba raises
+       "node 10 backed up but parent 9 not backed up" -- the 19:45:27 message
+    v2 18/18
+  Upstream unified radix suite on CPU: v2 635/212 == pristine.
+  Documented limit of v2: a single path longer than the host pool is still
+  staged only up to the host size.
+  Where things ran: the 19:45:27 crash = backend_185833 (v1, ring=1);
+  backend_194628 (front-door restart, still ring=1) ran 19:46-20:03 with one
+  ring drop and no crash; backend_200341 (ring=0) no Sanity/Traceback.
+  "parent 63" came from my CPU unit test of the first sanity variant, not
+  from any service build.

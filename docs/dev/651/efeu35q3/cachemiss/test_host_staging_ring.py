@@ -180,6 +180,48 @@ class HostStagingRingTest(unittest.TestCase):
         return toks, nodes
 
     # -- tests -------------------------------------------------------------
+    def assert_parent_first(self):
+        """The upstream invariant v1 broke: a backed-up node's parent is
+        backed up (root excepted). Checked explicitly, independent of
+        sanity_check, after every ring action."""
+        stack = [self.cache.root_node]
+        while stack:
+            n = stack.pop()
+            stack.extend(n.children.values())
+            if n is self.cache.root_node or n.parent is self.cache.root_node:
+                continue
+            if n.backuped:
+                self.assertTrue(
+                    n.parent.backuped,
+                    f"node {n.id} backed up but parent {n.parent.id} not",
+                )
+
+    def test_crash_shape_19_45(self):
+        """backend_185833 19:45:27: the ring dropped the host copy of a
+        resident parent while its child was not yet backed up; the child's
+        backup was then accepted without the parent -> on-idle sanity_check
+        raised 'node 22 backed up but parent 21 not backed up'.
+        v1: red. v2: the child's backup re-stages the parent first."""
+        toks, nodes = self.chain(1000, 2, 10)
+        parent, child = nodes
+        self.backup(parent)
+        self.cache._drop_resident_host_backups(10, protected=set(), reason="t")
+        self.assertFalse(parent.backuped)  # it was a leaf among backed-up nodes
+        self.assertGreater(self.backup(child), 0)
+        self.assert_parent_first()
+        self.cache.sanity_check()
+
+    def test_never_drops_a_parent_whose_child_is_backed_up(self):
+        toks, nodes = self.chain(1000, 3, 10)
+        for n in nodes:
+            self.backup(n)
+        self.cache._drop_resident_host_backups(10, protected=set(), reason="t")
+        self.assertEqual([n.backuped for n in nodes], [True, True, False])
+        self.assert_parent_first()
+        self.cache._drop_resident_host_backups(20, protected=set(), reason="t")
+        self.assertEqual([n.backuped for n in nodes], [False, False, False])
+        self.assert_parent_first()
+
     def test_full_host_of_resident_copies_blocks_backup_without_the_ring(self):
         os.environ["SGLANG_HICACHE_HOST_STAGING_RING"] = "0"
         _, nodes = self.chain(1000, 4, 10)  # 40 tokens = host capacity
@@ -189,15 +231,16 @@ class HostStagingRingTest(unittest.TestCase):
         other = self.insert(list(range(5000, 5010)))
         self.assertEqual(self.cache.write_backup(other), 0)  # upstream: L3 starves
 
-    def test_ring_drops_persisted_resident_copies_lru_first(self):
-        _, nodes = self.chain(1000, 4, 10)
-        for n in nodes:
+    def test_ring_frees_another_branch_leaf_first(self):
+        _, a = self.chain(1000, 2, 10)  # old branch, 20 tokens
+        _, b = self.chain(3000, 2, 10)  # newer branch, 20 tokens -> host full
+        for n in a + b:
             self.backup(n)
-        other = self.insert(list(range(5000, 5010)))
-        self.assertEqual(self.cache.write_backup(other), 10)
-        dropped = [n for n in nodes if not n.backuped]
-        self.assertEqual(len(dropped), 1)
-        self.assertFalse(dropped[0].evicted)  # still on the device
+        new = self.insert(list(range(5000, 5010)))
+        self.assertEqual(self.cache.write_backup(new), 10)
+        self.assertEqual([n.backuped for n in a], [True, False])  # LRU leaf
+        self.assertTrue(all(n.backuped for n in b))
+        self.assert_parent_first()
 
     def test_unpersisted_or_locked_copies_are_never_dropped(self):
         _, nodes = self.chain(1000, 4, 10)
@@ -211,60 +254,20 @@ class HostStagingRingTest(unittest.TestCase):
         self.assertEqual(self.cache.write_backup(other), 0)
         self.cache.dec_lock_ref(nodes[-1], lock.to_dec_params())
         self.assertEqual(self.cache.write_backup(other), 10)
+        self.assert_parent_first()
 
-    def test_long_path_tail_can_be_staged_past_host_capacity(self):
+    def test_active_path_is_protected_documented_limit(self):
+        """One path longer than the host pool: its ancestors are protected,
+        so the tail cannot be staged past the host size (backup returns 0,
+        nothing is broken)."""
         toks, nodes = self.chain(1000, 4, 10)
         for n in nodes:
             self.backup(n)
-        staged = 0
-        for i in range(4):  # the conversation grows by 4 x 10 more tokens
-            toks = toks + list(range(2000 + i * 10, 2010 + i * 10))
-            tail = self.insert(toks)
-            staged += self.backup(tail)
-        self.assertEqual(staged, 40)  # 80-token path through a 40-token host
-
-    def test_tombstone_keeps_host_only_children_reachable_for_cleanup(self):
-        toks, nodes = self.chain(1000, 2, 10)
-        parent, child = nodes
-        self.backup(parent)
-        self.backup(child)
-        # drop the parent's host copy (resident + persisted), child keeps its own
-        self.cache._drop_resident_host_backups(10, protected={child}, reason="t")
-        self.assertFalse(parent.backuped)
-        self.assertTrue(child.backuped)
-        self.cache.evict(EvictParams(num_tokens=20))
-        self.assertTrue(child.evicted and child.backuped)  # demoted to host
-        self.assertTrue(parent.evicted and not parent.backuped)  # tombstone
-        self.assertIs(child.parent, parent)
-        self.assertIn(parent, parent.parent.children.values())
-        # host eviction of the child sweeps the tombstone away
-        self.cache.evict_host(10)
-        self.assertNotIn(parent, self.cache.root_node.children.values())
-        self.assertEqual(self.cc.mem_pool_host.available_size(), 40)
-
-    def test_19_45_crash_shape_passes_the_idle_sanity_check(self):
-        """backend_185833 19:45:27: the on-idle invariant checker raised
-        'node 22 backed up but parent 21 not backed up' after the ring dropped
-        the parent's host copy and the child was backed up."""
-        toks, nodes = self.chain(1000, 2, 10)
-        parent, child = nodes
-        self.backup(parent)
-        self.cache._drop_resident_host_backups(10, protected=set(), reason="t")
-        self.assertFalse(parent.backuped)
-        self.assertGreater(self.backup(child), 0)  # relaxed parent-first rule
-        self.cache.sanity_check()
-
-    def test_sanity_holds_through_ring_tombstone_lifecycle(self):
-        toks, nodes = self.chain(1000, 2, 10)
-        parent, child = nodes
-        self.backup(parent)
-        self.backup(child)
-        self.cache._drop_resident_host_backups(10, protected={child}, reason="t")
-        self.cache.sanity_check()
-        self.cache.evict(EvictParams(num_tokens=20))
-        self.cache.sanity_check()  # tombstone with a host-only child
-        self.cache.evict_host(10)
-        self.cache.sanity_check()  # tombstone swept
+        toks = toks + list(range(2000, 2010))
+        tail = self.insert(toks)
+        self.assertEqual(self.backup(tail), 0)
+        self.assertTrue(all(n.backuped for n in nodes))
+        self.assert_parent_first()
 
     def test_prefetch_drops_off_path_copies_instead_of_host_kv_full(self):
         _, nodes = self.chain(1000, 4, 10)
@@ -274,16 +277,17 @@ class HostStagingRingTest(unittest.TestCase):
         new = array("q", range(7000, 7030))
         self.cache.prefetch_from_storage("r1", self.cache.root_node, new)
         self.assertEqual(self.cc.prefetched, [("r1", 30)])
+        self.assert_parent_first()
 
     def test_prefetch_never_drops_its_own_path(self):
         toks, nodes = self.chain(1000, 4, 10)
         for n in nodes:
             self.backup(n)
         self.cache.enable_storage = True
-        # request continues the cached path from nodes[0]: nodes[1..3] are on it
         self.cache.prefetch_from_storage("r2", nodes[0], array("q", toks[10:] + [9, 9]))
-        for n in nodes[1:]:
+        for n in nodes:
             self.assertTrue(n.backuped)
+        self.assert_parent_first()
 
     def test_storage_ack_marks_persisted_only_when_complete(self):
         _, nodes = self.chain(1000, 2, 10)
