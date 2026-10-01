@@ -240,6 +240,10 @@ namespace cg = cooperative_groups;
 // Kernel variants, unchanged from the probe.
 #define K_1BLK   0
 #define K_GRID 1
+// K_SPLIT (01.10.): the mesh/ring all-reduce as a SEQUENCE of normal launches -- multi-block
+// copy/reduce phases, single-thread flag waits -- so no block ever waits for another resident
+// block (no cooperative launch, no grid.sync). See the K_SPLIT section above gridSize.
+#define K_SPLIT 2
 // Flag load mode. LA_MMIO is the only genuine cache bypass and the probe's
 // default (run field uncachedLeseart = LA_MMIO).
 #define LA_CV    0
@@ -1543,6 +1547,288 @@ static int gridSize(const void *fn, int threads, int n4)
     return g;
 }
 
+// ---------------------------------------------------------------------------
+// K_SPLIT -- multi-block WITHOUT co-residency (01.10.2026, dual layout under MPS)
+//
+// WHY. The cooperative 'grid' variant needs every block resident at once
+// (grid.sync between phases). Under MPS two groups share one server context
+// without time-slice preemption: a spin block of the other group keeps a
+// full-card cooperative grid from starting, and the spins of both groups form
+// a wait cycle across the cards (repro scjhru S1 / tatcwj C1: rounds of 2-62 s,
+// broken only by capCycles). grid_threshold_default therefore turns the grid
+// off under MPS -- and the 1blk fallback costs +35 % solo at 40 MiB (tatcwj
+// F3solo: 13.3 vs 9.9 ms).
+//
+// WHAT. The same mesh/ring protocol, cut at every grid barrier into separate
+// launches on one stream: the payload phases (send, reduce, take over) run
+// multi-block like 'grid', every flag wait runs in a ONE-THREAD kernel. The
+// stream order replaces grid.sync; no block waits for another block, so no
+// co-residency is ever demanded and the MPS cycle cannot form. Kernel
+// boundaries order the per-thread __threadfence_system() of a payload phase
+// before the next phase's flag write, exactly as fence + grid barrier did.
+//
+// ABORT. The abort word (ctl word 1) is reset by the begin kernel; a wait that
+// gives up writes ctlStatus (2 = entry ack, 1 = payload), advances roundDev as
+// the fused kernels do, and sets the abort word; every later phase of the same
+// call returns at its first instruction. The round is read from roundDev,
+// which only the finish kernel (or the aborting wait) advances, so every
+// phase of one call sees the same round.
+// ---------------------------------------------------------------------------
+struct SplitFlags {
+    int          n;
+    u64         *to[BARLINK_BAR1_MAX_RANKS];
+    const u64   *from[BARLINK_BAR1_MAX_RANKS];
+    const uint4 *flushPtr[BARLINK_BAR1_MAX_RANKS];
+    int          flushLen[BARLINK_BAR1_MAX_RANKS];
+};
+
+struct SplitReduce {
+    const uint4 *in;
+    uint4       *out;
+    const uint4 *recv[BARLINK_BAR1_MAX_RANKS];
+    int          n4;
+};
+
+__device__ __forceinline__ bool splitAborted(const Bar1Args &A)
+{
+    return *(volatile unsigned int *)A.abortDev != 0u;
+}
+
+__device__ __forceinline__ void splitAbort(const Bar1Args &A, unsigned int status, u64 round)
+{
+    *A.ctlStatus = status;
+    writeRound(A, round);
+    *(volatile unsigned int *)A.abortDev = 1u;
+    __threadfence_system();
+}
+
+template<int LA>
+__global__ void bar1_split_begin(Bar1Args A, int mesh)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    *(volatile unsigned int *)A.abortDev = 0u;
+    __threadfence();
+    if (!mesh) return;
+    const u64 round = *(const volatile u64 *)A.roundDev + 1ull;
+    const u64 prev = *(const volatile u64 *)A.lastRoundDev;
+    long long t0 = clock64();
+    unsigned int probeCounter = 0u;
+    while (prev != 0ull) {
+        bool allAcked = true;
+        for (int s = 0; s < A.R; ++s) {
+            if (s == A.rank) continue;
+            if (readFlag<LA>(A.ackFrom[s]) < prev) { allAcked = false; break; }
+        }
+        if (allAcked) return;
+        if ((u64)(clock64() - t0) > A.capCycles) { splitAbort(A, 2u, round); return; }
+        if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+            && *(const volatile unsigned int *)A.abortHost != 0u) { splitAbort(A, 2u, round); return; }
+    }
+}
+
+__global__ void bar1_split_copy(Bar1Args A, const uint4 *src, uint4 *dst, int n4)
+{
+    if (splitAborted(A)) return;
+    sendPhase(src, dst, n4, (int)(blockIdx.x * blockDim.x + threadIdx.x),
+              (int)(gridDim.x * blockDim.x));
+    __threadfence_system();
+}
+
+template<int LA, int FLUSH>
+__global__ void bar1_split_flagwait(Bar1Args A, SplitFlags F)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (splitAborted(A)) return;
+    const u64 round = *(const volatile u64 *)A.roundDev + 1ull;
+    for (int i = 0; i < F.n; ++i) {
+        if (FLUSH) readFlush(F.flushPtr[i], F.flushLen[i]);
+        writeU64(F.to[i], round);
+    }
+    __threadfence_system();
+    long long t0 = clock64();
+    unsigned int probeCounter = 0u;
+    for (;;) {
+        bool allArrived = true;
+        for (int i = 0; i < F.n; ++i) {
+            if (readFlag<LA>(F.from[i]) != round) { allArrived = false; break; }
+        }
+        if (allArrived) break;
+        if ((u64)(clock64() - t0) > A.capCycles) { splitAbort(A, 1u, round); return; }
+        if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+            && *(const volatile unsigned int *)A.abortHost != 0u) { splitAbort(A, 1u, round); return; }
+    }
+    __threadfence_system();
+}
+
+template<typename T>
+__global__ void bar1_split_reduce(Bar1Args A, SplitReduce Rd)
+{
+    if (splitAborted(A)) return;
+    __shared__ const uint4 *sRecv[BARLINK_BAR1_MAX_RANKS];
+    if (threadIdx.x == 0)
+        for (int z = 0; z < A.R; ++z) sRecv[z] = Rd.recv[z];
+    __syncthreads();
+    reduceNPhase<T>(Rd.in, Rd.out, sRecv, A.R, A.rank, Rd.n4,
+                    (int)(blockIdx.x * blockDim.x + threadIdx.x), (int)(gridDim.x * blockDim.x));
+}
+
+template<typename T>
+__global__ void bar1_split_ringadd(Bar1Args A, const uint4 *in, uint4 *out, const uint4 *recv, int n4)
+{
+    if (splitAborted(A)) return;
+    ringAdd<T>(in, out, recv, n4, (int)(blockIdx.x * blockDim.x + threadIdx.x),
+               (int)(gridDim.x * blockDim.x));
+}
+
+__global__ void bar1_split_take(Bar1Args A, uint4 *out, const uint4 *recv, int n4)
+{
+    if (splitAborted(A)) return;
+    takeOverPhase(out, recv, n4, (int)(blockIdx.x * blockDim.x + threadIdx.x),
+                  (int)(gridDim.x * blockDim.x));
+}
+
+__global__ void bar1_split_finish(Bar1Args A, int mesh)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (splitAborted(A)) return;
+    const u64 round = *(const volatile u64 *)A.roundDev + 1ull;
+    if (mesh) {
+        for (int z = 0; z < A.R; ++z) {
+            if (z == A.rank) continue;
+            writeU64(A.ackTo[z], round);
+        }
+        __threadfence_system();
+        *(volatile u64 *)A.lastRoundDev = round;
+    }
+    writeRound(A, round);
+}
+
+// Host: the launch sequence. Pure host arithmetic decides every pointer and
+// length (the same chunkBounds the fused kernels use), so the sequence is
+// identical on every rank and identical on every graph replay.
+static int splitGrid(const void *fn, int threads, int n4)
+{
+    return gridSize(fn, threads, n4 < 1 ? 1 : n4);
+}
+
+#define BARLINK_SPLIT_CK(what)                                                     \
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "barlink-bar1 split: " what " launch failed")
+
+template<typename T, int LA, int FL>
+static void startSplitT(int algo, Bar1Args &A, int threads, cudaStream_t stream)
+{
+    const int R = A.R, r = A.rank, n4 = A.n4;
+    const int mesh = (algo == 0) ? 1 : 0;
+    bar1_split_begin<LA><<<1, 32, 0, stream>>>(A, mesh);
+    BARLINK_SPLIT_CK("begin");
+    const void *fcopy = (const void *)bar1_split_copy;
+    const void *ftake = (const void *)bar1_split_take;
+    auto copy = [&](const uint4 *src, uint4 *dst, int len) {
+        bar1_split_copy<<<splitGrid(fcopy, threads, len), threads, 0, stream>>>(A, src, dst, len);
+        BARLINK_SPLIT_CK("copy");
+    };
+    auto take = [&](uint4 *out, const uint4 *recv, int len) {
+        bar1_split_take<<<splitGrid(ftake, threads, len), threads, 0, stream>>>(A, out, recv, len);
+        BARLINK_SPLIT_CK("take");
+    };
+    auto wait = [&](SplitFlags &F) {
+        bar1_split_flagwait<LA, FL><<<1, 32, 0, stream>>>(A, F);
+        BARLINK_SPLIT_CK("flagwait");
+    };
+    if (mesh) {
+        int offR, lenR;
+        chunkBounds(n4, r, R, &offR, &lenR);
+        SplitFlags F;
+        memset(&F, 0, sizeof(F));
+        for (int z = 0; z < R; ++z) {
+            if (z == r) continue;
+            int off, len;
+            chunkBounds(n4, z, R, &off, &len);
+            copy(A.in + off, A.nzSendRS[z], len);
+            F.to[F.n] = A.nzFlagTo[0][z];
+            F.from[F.n] = A.nzFlagFrom[0][z];
+            F.flushPtr[F.n] = A.nzSendRS[z];
+            F.flushLen[F.n] = len;
+            ++F.n;
+        }
+        wait(F);
+        SplitReduce Rd;
+        memset(&Rd, 0, sizeof(Rd));
+        Rd.in = A.in + offR;
+        Rd.out = A.out + offR;
+        Rd.n4 = lenR;
+        for (int z = 0; z < R; ++z) Rd.recv[z] = A.nzRecvRS[z];
+        const void *fred = (const void *)bar1_split_reduce<T>;
+        bar1_split_reduce<T><<<splitGrid(fred, threads, lenR), threads, 0, stream>>>(A, Rd);
+        BARLINK_SPLIT_CK("reduce");
+        SplitFlags G;
+        memset(&G, 0, sizeof(G));
+        for (int z = 0; z < R; ++z) {
+            if (z == r) continue;
+            copy(A.out + offR, A.nzSendAG[z], lenR);
+            G.to[G.n] = A.nzFlagTo[1][z];
+            G.from[G.n] = A.nzFlagFrom[1][z];
+            G.flushPtr[G.n] = A.nzSendAG[z];
+            G.flushLen[G.n] = lenR;
+            ++G.n;
+        }
+        wait(G);
+        for (int s = 0; s < R; ++s) {
+            if (s == r) continue;
+            int off, len;
+            chunkBounds(n4, s, R, &off, &len);
+            take(A.out + off, A.nzRecvAG[s], len);
+        }
+    } else {
+        for (int s = 0; s < R - 1; ++s) {
+            const int cs = (r - s + 2 * R) % R, cr = (r - s - 1 + 2 * R) % R;
+            int offS, lenS, offE, lenE;
+            chunkBounds(n4, cs, R, &offS, &lenS);
+            chunkBounds(n4, cr, R, &offE, &lenE);
+            const uint4 *source = (s == 0) ? (A.in + offS) : (const uint4 *)(A.out + offS);
+            copy(source, A.rgSend[s], lenS);
+            SplitFlags F;
+            memset(&F, 0, sizeof(F));
+            F.n = 1; F.to[0] = A.rgFlagTo[s]; F.from[0] = A.rgFlagFrom[s];
+            F.flushPtr[0] = A.rgSend[s]; F.flushLen[0] = lenS;
+            wait(F);
+            const void *fadd = (const void *)bar1_split_ringadd<T>;
+            bar1_split_ringadd<T><<<splitGrid(fadd, threads, lenE), threads, 0, stream>>>(
+                A, A.in + offE, A.out + offE, A.rgRecv[s], lenE);
+            BARLINK_SPLIT_CK("ringadd");
+        }
+        for (int s = 0; s < R - 1; ++s) {
+            const int sl = (R - 1) + s;
+            const int cs = (r + 1 - s + 2 * R) % R, cr = (r - s + 2 * R) % R;
+            int offS, lenS, offE, lenE;
+            chunkBounds(n4, cs, R, &offS, &lenS);
+            chunkBounds(n4, cr, R, &offE, &lenE);
+            copy((const uint4 *)(A.out + offS), A.rgSend[sl], lenS);
+            SplitFlags F;
+            memset(&F, 0, sizeof(F));
+            F.n = 1; F.to[0] = A.rgFlagTo[sl]; F.from[0] = A.rgFlagFrom[sl];
+            F.flushPtr[0] = A.rgSend[sl]; F.flushLen[0] = lenS;
+            wait(F);
+            take(A.out + offE, A.rgRecv[sl], lenE);
+        }
+    }
+    bar1_split_finish<<<1, 32, 0, stream>>>(A, mesh);
+    BARLINK_SPLIT_CK("finish");
+}
+
+template<typename T>
+static void startSplit(int algo, int la, int read_flush, Bar1Args &A, int threads, cudaStream_t stream)
+{
+    if (la == LA_MMIO) {
+        if (read_flush) startSplitT<T, LA_MMIO, 1>(algo, A, threads, stream);
+        else            startSplitT<T, LA_MMIO, 0>(algo, A, threads, stream);
+    } else {
+        if (read_flush) startSplitT<T, LA_CV, 1>(algo, A, threads, stream);
+        else            startSplitT<T, LA_CV, 0>(algo, A, threads, stream);
+    }
+}
+#undef BARLINK_SPLIT_CK
+
 // Launches the chosen kernel. Flag load mode, read flush, and barrier kind
 // are template arguments -- no branch is left over in the wait loops.
 template<typename T>
@@ -1580,6 +1866,12 @@ static void start(int algo, int kernel_variant, int la, int read_flush, Bar1Args
         }                                                                      \
     } while (0)
 
+    // K_SPLIT: mesh and ring only; oneshot has a single wait and stays on its
+    // 1blk kernel (the launch macro treats every non-K_GRID variant as 1blk).
+    if (kernel_variant == K_SPLIT && (algo == 0 || algo == 1)) {
+        startSplit<T>(algo, la, read_flush, A, threads, stream);
+        return;
+    }
     if (algo == 0)      BARLINK_BAR1_SELECT(bar1_mesh_kernel);
     else if (algo == 2) BARLINK_BAR1_SELECT(bar1_oneshot_kernel);
     else                BARLINK_BAR1_SELECT(bar1_ring_kernel);

@@ -552,6 +552,27 @@ def grid_threshold_default(env=None) -> int:
     return 4 << 20
 
 
+def split_variant_default(env=None):
+    """``(on, from_bytes)`` for the K_SPLIT all_reduce variant (default OFF).
+
+    K_SPLIT runs the mesh/ring all_reduce as a sequence of normal launches:
+    multi-block payload phases, single-thread flag waits -- multi-block
+    bandwidth without the co-residency demand of the cooperative grid, so it
+    is safe under MPS where the grid is not (tatcwj C1 wedge). Motive: the
+    1blk fallback under MPS costs +35 % solo at 40 MiB (tatcwj F3solo 13.3
+    vs 9.9 ms). ``SGLANG_BARLINK_BAR1_SPLIT=1`` switches it on;
+    ``SGLANG_BARLINK_BAR1_SPLIT_FROM`` (default 4 MiB) is the payload size
+    from which it replaces 1blk. Where the grid applies (size >= grid
+    threshold) the grid still wins.
+    """
+    import os as _os
+
+    env = _os.environ if env is None else env
+    on = str(env.get("SGLANG_BARLINK_BAR1_SPLIT", "0") or "0").strip() not in _OFF
+    raw = str(env.get("SGLANG_BARLINK_BAR1_SPLIT_FROM", "") or "").strip()
+    return on, (int(raw) if raw else (4 << 20))
+
+
 def graph_grid_default(env=None) -> bool:
     """May the cooperative launch fire WHILE a graph is being captured?
 
@@ -2223,6 +2244,7 @@ class BarlinkBar1Transport:
         # off unless the threshold is set explicitly -- see
         # grid_threshold_default (repro scjhru S1, metal ndktv4).
         self.grid_from = grid_threshold_default()
+        self.split_on, self.split_from = split_variant_default()
         if self.grid_from >= _MPS_NO_GRID and not _MPS_GRID_REPORTED[0]:
             _MPS_GRID_REPORTED[0] = True
             logger.info(
@@ -4069,6 +4091,15 @@ class BarlinkBar1Transport:
         hang.
         """
         if moved < threshold:
+            # K_SPLIT (2): mesh/ring all_reduce as normal multi-block launches
+            # with single-thread flag waits -- multi-block without the
+            # co-residency the cooperative grid demands. Only where the
+            # grid is off (an MPS client, grid_threshold_default) or below
+            # an explicit grid threshold, only for all_reduce, only with
+            # SGLANG_BARLINK_BAR1_SPLIT=1 (default off).
+            if (where == "all_reduce" and getattr(self, "split_on", False)
+                    and moved >= int(getattr(self, "split_from", 1 << 62))):
+                return 2
             return 0
         if self.graph_grid:
             return 1

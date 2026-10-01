@@ -113,6 +113,12 @@ def worker(rank, a, store):
         # which kernel variant this size gets (>= grid_from = cooperative full-card grid)
         res["grid_from"] = int(t.grid_from)
         res["grid"] = bool(a.size >= int(t.grid_from))
+        # the variant and algorithm this size actually gets (0 1blk, 1 grid, 2 K_SPLIT)
+        try:
+            res["variant"] = int(t._kernel(a.size, t.grid_from, "all_reduce"))
+            res["algo"] = str(t.algorithm_for(a.size))
+        except Exception as e:  # noqa: BLE001 -- a probe of the choice, never fatal
+            res["variant"] = f"err {type(e).__name__}"
         res["handles"] = bool(t.handles("all_reduce", a.size))
         if not res["handles"]:
             raise RuntimeError(f"handles(all_reduce, {a.size}) -> False")
