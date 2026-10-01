@@ -79,13 +79,67 @@ def node_of_req(req):
     return node
 
 
+class L15UnsupportedTreeError(RuntimeError):
+    """L15-12c-F9 hard gate: the radix tree carries a component that the
+    L1.5 retain/compact/rewrite chain does not remap (anything beyond
+    FULL+MAMBA). The scheduler hook catches it pre-move and flushes."""
+
+
+_L15_TREE_COMPONENTS = (ComponentType.FULL, ComponentType.MAMBA)
+
+
+def _unsupported_components(node) -> list:
+    """Component types on this node that L1.5 retain cannot remap.
+
+    component_data is a FIXED-length list (one ComponentData per
+    ComponentType, unified_radix_cache.py:435), so an unused SWA slot
+    EXISTS without the tree using SWA: the registered tuple
+    node.tree_components is authoritative on the real tree; duck-typed
+    fakes without it fall back to scanning the non-FULL/MAMBA slots for
+    carried data (a value or host_value set means the component is live).
+    """
+    found = []
+    reg = getattr(node, "tree_components", None)
+    if reg is not None:
+        for ct in reg:
+            if ct not in _L15_TREE_COMPONENTS:
+                found.append(ct)
+        return found
+    cds = getattr(node, "component_data", None)
+    if cds is None:
+        return found
+    for ct in ComponentType:
+        if ct in _L15_TREE_COMPONENTS:
+            continue
+        try:
+            cd = cds[ct]
+        except (IndexError, KeyError, TypeError):
+            continue
+        if cd is not None and (
+            getattr(cd, "value", None) is not None
+            or getattr(cd, "host_value", None) is not None
+        ):
+            found.append(ct)
+    return found
+
+
 def chain_host_rows(node) -> Tuple[int, ...]:
     """L15-12c-C2: the host rows of the radix chain root -> node, in token
     order. The walk goes last_node -> root; each node contributes its
     component_data[ComponentType.FULL].host_value (the host row ids of its
-    own tokens); a node without a host_value (write-pending, or never
-    backed up) contributes nothing. Must be read at BIND time: reset_keep
-    nulls host_value on the kept nodes (unified_radix_cache.py).
+    own tokens). Must be read at BIND time: reset_keep nulls host_value on
+    the kept nodes (unified_radix_cache.py).
+
+    L15-12c-F4: a node WITHOUT a host_value (write-pending, or never backed
+    up) keeps its token POSITIONS: it contributes len(its tokens)
+    placeholders -1, so a hole mid-chain does not shift every later node's
+    rows onto the wrong token positions (l2_of would then map tokens to a
+    foreign (slot, gen)). The -1 rows map to (slot, gen) = (-1, -1) in
+    build_retain_kwargs (row < staging_rows), and the wake's gen check
+    drops those tokens. Token count: the node's own component value (its
+    device slot ids), else its radix key; if NEITHER exists (odd fake
+    node), fall back to the old positional skip -- nothing sensible to
+    count.
     """
     chunks = []
     cur = node
@@ -98,6 +152,22 @@ def chain_host_rows(node) -> Tuple[int, ...]:
         if hv is not None and len(hv):
             vals = hv.tolist() if hasattr(hv, "tolist") else hv
             chunks.append([int(x) for x in vals])
+        else:
+            n_tok = None
+            val = getattr(cd, "value", None) if cd is not None else None
+            if val is not None:
+                try:
+                    n_tok = len(val)
+                except TypeError:  # scalar/unsized value
+                    n_tok = None
+            if not n_tok:  # value missing or empty: fall back to the key
+                try:
+                    n_tok = len(cur.key)
+                except (AttributeError, TypeError):  # no key or key=None
+                    n_tok = None
+            if n_tok:
+                chunks.append([-1] * n_tok)
+            # else: no host rows, no token count -> old positional skip
         cur = getattr(cur, "parent", None)
     rows: list = []
     for chunk in reversed(chunks):
@@ -151,7 +221,22 @@ def build_retain_kwargs(
         # host_value later); a node missing its last_node skips l2 (retain
         # skips the whole round for that rid anyway).
         try:
-            _rows = chain_host_rows(node_of_req(req))[: len(_slots)]
+            _node = node_of_req(req)
+            # L15-12c-F9: hard gate BEFORE anything is assembled -- a tree
+            # with a third radix component (SWA or other) would keep
+            # un-remapped, un-kept state on the kept nodes. RuntimeError,
+            # so the ValueError skip below cannot swallow it; the hook
+            # catches it pre-move and flushes as today.
+            _extra = _unsupported_components(_node)
+            if _extra:
+                _names = "/".join(getattr(ct, "name", str(ct)) for ct in _extra)
+                raise L15UnsupportedTreeError(
+                    f"req {rid!r}: radix tree carries unsupported "
+                    f"component(s) {_names}; L1.5 retain supports "
+                    "FULL+MAMBA trees only (27B/NF); SWA or other "
+                    "components -> no retain"
+                )
+            _rows = chain_host_rows(_node)[: len(_slots)]
         except ValueError:
             _rows = ()
         if _rows:
