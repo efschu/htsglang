@@ -170,3 +170,37 @@ def test_front_shadow_block_reads_the_deque_with_islice():
     block = src[i : i + 600]
     assert "islice" in block
     assert "self.queue[:8]" not in block
+
+
+# --- N1 (dkr27browauthoritybar1fs10011036): cap=0,0,0 on the hybrid pool ----------------
+
+
+def _hybrid_pool(layers=2, rows=1024, heads=4, dim=8):
+    from types import SimpleNamespace
+
+    import torch
+
+    inner = SimpleNamespace(
+        k_buffer=[torch.zeros(rows, heads, dim, dtype=torch.float16) for _ in range(layers)],
+        v_buffer=[torch.zeros(rows, heads, dim, dtype=torch.float16) for _ in range(layers)],
+    )
+    return SimpleNamespace(full_kv_pool=inner)  # HybridLinearKVPool: no k_buffer of its own
+
+
+def test_cell_bytes_unwraps_the_hybrid_pool_and_prices_one_token():
+    """RED on 5ab4b12b28: 0 for the wrapper (no k_buffer), and the inner pool
+    priced the WHOLE layer tensor (rows x heads x dim) instead of one row."""
+    from sglang.srt.weg2.l15_shadow import cell_bytes_from
+
+    pool = _hybrid_pool(layers=2, rows=1024, heads=4, dim=8)
+    # one token: 2 layers x (K + V) x 4 heads x 8 dims x 2 bytes = 256
+    assert cell_bytes_from(pool) == 256
+    assert cell_bytes_from(pool.full_kv_pool) == 256
+
+
+def test_caps_from_the_n1_env_are_nonzero_on_the_named_cards():
+    from sglang.srt.weg2.l15_shadow import caps_from_env, cell_bytes_from
+
+    cell = cell_bytes_from(_hybrid_pool())
+    caps = caps_from_env({"SGLANG_WEG2_L15_MIB": "c1=7616,c2=1792"}, 3, [cell] * 3)
+    assert caps[0] == 0 and caps[1] == 7616 * 2**20 // cell and caps[2] == 1792 * 2**20 // cell

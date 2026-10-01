@@ -19827,17 +19827,18 @@ class Scheduler(
                     for _x in _v:
                         _prefix.append(_prefix[-1] + _x)
                     _mr = getattr(getattr(self, "tp_worker", None), "model_runner", None)
-                    _pool = getattr(_mr, "token_to_kv_pool", None)
-                    _kv = [
-                        t
-                        for _lst in (
-                            getattr(_pool, "k_buffer", None),
-                            getattr(_pool, "v_buffer", None),
+                    # N1 (dkr27browauthoritybar1fs10011036): the 27B pool is a
+                    # HybridLinearKVPool whose K/V live on .full_kv_pool -- read
+                    # from the wrapper, _kv was EMPTY and retain would compact
+                    # the node slots while no KV byte moved (silent wrong KV).
+                    _pool = l15_shadow.kv_pool_of(getattr(_mr, "token_to_kv_pool", None))
+                    _kv = [t for t in l15_shadow.kv_buffers_of(_pool) if isinstance(t, torch.Tensor)]
+                    if not _kv:
+                        logger.warning(
+                            "L15-RETAIN skipped reason=no-kv-buffers: the KV pool "
+                            "has no k_buffer/v_buffer (wrapper not unwrapped?), "
+                            "nothing to retain"
                         )
-                        if _lst
-                        for t in _lst
-                        if isinstance(t, torch.Tensor)
-                    ]
                     _l15_mba = getattr(self.req_to_token_pool, "mamba_allocator", None)
                     # The GDN state lives in the pool's mamba_cache, NOT in
                     # the allocator: conv (a list of per-layer tensors) and
@@ -19904,7 +19905,7 @@ class Scheduler(
                     _caps = l15_shadow.caps_from_env(
                         os.environ, _tp, [l15_shadow.cell_bytes_from(_pool)] * _tp, _cards
                     )
-                    if _base_ok and _mb:
+                    if _base_ok and _mb and _kv:
                         # set_keep here only COLLECTs byte ranges per
                         # allocation base: tms_set_keep_spans REPLACES the
                         # base's keep set, so the real calls go out AFTER

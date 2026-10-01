@@ -196,3 +196,27 @@ def test_retain_set_keep_names_a_defined_function():
     assert targets, "the retain hook must pass a set_keep callable"
     for name in targets:
         assert f"def {name}(" in hook, f"set_keep={name} is not defined in the retain hook"
+
+
+def test_retain_hook_reads_the_kv_buffers_through_the_hybrid_wrapper():
+    """N1 (dkr27browauthoritybar1fs10011036): on HybridLinearKVPool the hook's
+    _kv came out EMPTY (k_buffer lives on .full_kv_pool) -- retain would have
+    compacted node slots while no KV byte moved. RED on 5ab4b12b28 (no helper;
+    the inline read of the wrapper found nothing)."""
+    import inspect
+    from types import SimpleNamespace
+
+    from sglang.srt.managers import scheduler as S
+    from sglang.srt.weg2 import l15_shadow
+
+    inner = SimpleNamespace(k_buffer=[torch.zeros(4, 2), torch.zeros(4, 2)],
+                            v_buffer=[torch.zeros(4, 2), torch.zeros(4, 2)])
+    hybrid = SimpleNamespace(full_kv_pool=inner)
+    kv = l15_shadow.kv_buffers_of(hybrid)
+    assert len(kv) == 4 and kv[0] is inner.k_buffer[0] and kv[2] is inner.v_buffer[0]
+    assert l15_shadow.kv_pool_of(hybrid) is inner and l15_shadow.kv_pool_of(inner) is inner
+    assert l15_shadow.kv_buffers_of(SimpleNamespace()) == []
+    src = inspect.getsource(S)
+    assert "l15_shadow.kv_buffers_of(_pool)" in src
+    assert "L15-RETAIN skipped reason=no-kv-buffers" in src
+    assert "if _base_ok and _mb and _kv:" in src
