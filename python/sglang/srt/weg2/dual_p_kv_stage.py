@@ -535,6 +535,42 @@ def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optio
     return want
 
 
+def live_grant_tokens(sched, req, page: int = 1) -> int:
+    """GRANT-SUM: tokens of every OTHER request on PP0 that holds a group grant
+    and still occupies (or will occupy) rows -- the running batches, the chunked
+    request, the queue and the store hold. Rank-uniform facts (the requests are
+    the same on every stage), deduplicated by rid; a finished request is in
+    none of these and its cached rows are evictable."""
+    seen = {str(getattr(req, "rid", ""))}
+    total = 0
+
+    def _take(r) -> None:
+        nonlocal total
+        if r is None:
+            return
+        rid = str(getattr(r, "rid", ""))
+        if not rid or rid in seen or not int(getattr(r, "_dual_kv_tokens", 0) or 0):
+            return
+        if getattr(r, "finished", None) and callable(r.finished) and r.finished():
+            return
+        seen.add(rid)
+        ids = getattr(r, "origin_input_ids", None)
+        total += (0 if ids is None else len(ids)) + int(page)
+
+    batches = list(getattr(sched, "running_mbs", None) or ())
+    batches.append(getattr(sched, "running_batch", None))
+    batches.append(getattr(sched, "cur_batch", None))
+    for b in batches:
+        for r in list(getattr(b, "reqs", None) or ()):
+            _take(r)
+    _take(getattr(sched, "chunked_req", None))
+    for r in list(getattr(sched, "waiting_queue", None) or ()):
+        _take(r)
+    for r in list((getattr(sched, "_weg2_store_held", None) or {}).values()):
+        _take(r)
+    return total
+
+
 def pp0_grant(sched, req) -> Optional[int]:
     """PP0 only: the atomic group grant for ``req``'s prompt. None = not armed
     here (no actor / not PP0); 0 = a card is short (hold the request); else the
@@ -558,6 +594,13 @@ def pp0_grant(sched, req) -> Optional[int]:
             return 0
     _ids = getattr(req, "origin_input_ids", None)
     tokens = (0 if _ids is None else len(_ids)) + int(actor.page)   # never `x or ()` on a tensor
+    # GRANT-SUM (dual1k 09:55:20Z, weg2-0-10): the mapping is ONE high-water
+    # level shared by every request P holds -- a grant sized for this prompt
+    # alone (20480) left the 61440 level of the concurrent weg2-0-9 prefill as
+    # the whole pool, PP1 had to load back the twin head it held on the host
+    # only and found avail=1717 (SF LOADBACK-ROOM PP-RESIDUAL) -> #968. The
+    # level now covers this prompt PLUS every other request holding a grant.
+    tokens += live_grant_tokens(sched, req, int(actor.page))
     own = int(getattr(actor, "_committed", 0) or 0)    # PP0's card: the ledger covers its mapping exactly
     lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own})
     rid = str(getattr(req, "rid", "?"))[:16]
