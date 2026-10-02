@@ -112,6 +112,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import split_host_state_pools
 from sglang.srt.mem_cache import hicache_write_path
 from sglang.srt.mem_cache.hybrid_cache import mamba_load_dedup as _mld
+from sglang.srt.weg2 import first_fwd_timing as _fft
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -923,6 +924,7 @@ class HybridCacheController(BaseHiCacheController):
             # load path the 27B/NF hybrid UnifiedRadixCache actually runs.
             for fence_stream in self._load_fence_streams():
                 self.load_stream.wait_stream(fence_stream)
+            _fft.on_load(self.load_stream, "begin")   # DP-NACHLAUF WEG2-FIRST-FWD-TIMING
             for i in range(self.mem_pool_host.transfer_layer_domain):
                 _sl_a = time.perf_counter()
                 self.mem_pool_host.load_to_device_per_layer(
@@ -964,6 +966,7 @@ class HybridCacheController(BaseHiCacheController):
             self._record_transfer_indices_on_stream(
                 self.load_stream, kv_host_indices, kv_device_indices
             )
+            _fft.on_load(self.load_stream, "end")
         if _dups:
             _mld.note(_dups, _dup_layers)
         self.ack_load_queue.append(
