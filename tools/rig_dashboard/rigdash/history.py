@@ -655,7 +655,8 @@ class Recorder:
         Segmenten), nicht das Front-Ereignis flip_first_work, das in 3-12 Flips je Boot vor flip_done kam.
         Eine Marke je gemessenem Flip (kind flip_pd_user), Wert = Gesamtzeit; Teile im Label."""
         from . import ipcboot
-        segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc))["segs"]
+        segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc),
+                                     detail=False)["segs"]
         for x in ipcboot.flip_views(segs, ipc, now):
             if x["dir"] != "P>D" or x.get("kind") != "ok" or x.get("total_ms") is None:
                 continue

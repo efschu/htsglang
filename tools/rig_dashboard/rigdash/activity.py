@@ -124,7 +124,8 @@ def chunks(ring, keys, g: str) -> List[dict]:
         cnt = b.get("pchunks")
         el = next((t for c, t in last_recs if cnt is not None and c >= cnt), None) if kl != k0 else e0
         out.append({"s": s, "e0": e0, "e": max(e0, el if el is not None else e0), "tok": tok,
-                    "cached": _d(b, a, "pcached") or 0.0, "n": n, "comp_ms": _d(b, a, "pcomp") or 0.0, "g": g})
+                    "cached": _d(b, a, "pcached") or 0.0, "n": n, "comp_ms": _d(b, a, "pcomp") or 0.0, "g": g,
+                    "ext": b.get("plast_ext")})
     out.sort(key=lambda c: c["e0"])
     # bursts and the spread intervals
     burst: List[dict] = []
@@ -154,12 +155,197 @@ def bursts(cs: List[dict]) -> List[dict]:
             b["tok"] += c["tok"]
             b["n"] += c["n"]
             b["cached"] += c["cached"]
+            b["cs"].append(c)
         else:
-            out.append({"s": c["s"], "e": c["e"], "tok": c["tok"], "n": c["n"], "cached": c["cached"]})
+            out.append({"s": c["s"], "e": c["e"], "tok": c["tok"], "n": c["n"], "cached": c["cached"], "cs": [c]})
     for b in out:
         b["wall_s"] = b["e"] - b["s"]
         b["rate"] = b["tok"] / b["wall_s"] if b["tok"] >= MIN_RATE_TOK and b["wall_s"] > 0 else None
     return out
+
+
+# ----------------------------------------------------------------------------- Tiefe je Prefill / Decode
+# Nutzer 02.10. ~12:04Z: "nicht nur wie viele token sondern (token x - y, tok new)" -- the P prefill rate falls with
+# the context depth (27B N5a: 73k tokens from depth 4k ran 10,8k -> 4,1k tok/s, 130k tokens from depth 77824 only
+# 4,3k -> 2,4k tok/s), so every prefill shows x = start depth (prefix), y = end depth, n = new tokens, and the
+# rate at its start and end.  Sources, best first:
+#   1. rankstats prefill.last.ext [[rid, start, end]] per chunk (the #969 EXTENT; port seat, 02.10.);
+#   2. events request_done prefill.<G> {cached, prompt, tokens} of the requests whose prefill ended in the burst
+#      (exact per rid, but only once the request is DONE);
+#   3. rankstats prefill.cached_tokens: #cached-token is the prefix of a request's FIRST chunk (later chunks of a
+#      chunked prefill add 0, schedule_policy add_chunked_req), so the burst's delta is the start depth of the
+#      request(s) that began in it.
+EDGE_SHARE = 0.15      # tok/s at the start / end of a prefill: over the first / last 15 % of its tokens
+REQ_END_TOL_S = (0.5, 3.0)   # a request_done prefill end may lie this far before / after the burst
+
+
+def edge_rates(b: dict) -> Tuple[Optional[float], Optional[float]]:
+    """(tok/s over the first EDGE_SHARE of the burst's tokens, tok/s over the last EDGE_SHARE), on the first
+    stage's chunk clock (prefill.last t): start = tokens / (end of the k-th chunk - start of the first),
+    end = tokens / (end of the last chunk - end of the chunk before the last group).  None below three chunk
+    records or MIN_RATE_TOK tokens (no slope to read)."""
+    cs = sorted(b.get("cs") or [], key=lambda c: c["e0"])
+    n = b.get("tok") or 0.0
+    if len(cs) < 3 or n < MIN_RATE_TOK:
+        return None, None
+    want = max(EDGE_SHARE * n, 1.0)
+    acc, k = 0.0, 0
+    while k < len(cs) - 1 and acc < want:
+        acc += cs[k]["tok"]
+        k += 1
+    t0 = min(c["s"] for c in cs)
+    start = acc / (cs[k - 1]["e0"] - t0) if cs[k - 1]["e0"] > t0 else None
+    acc2, j = 0.0, len(cs)
+    while j > 1 and acc2 < want:
+        j -= 1
+        acc2 += cs[j]["tok"]
+    span = cs[-1]["e0"] - cs[j - 1]["e0"]
+    end = acc2 / span if span > 0 else None
+    return start, end
+
+
+def _req_prefill(r: dict, g: str) -> Tuple[Optional[float], Optional[dict]]:
+    """(time the request's prefill on group g ended, request_done prefill.<G>) or (None, None).  P: the
+    front's leg-1 end (p_leg1_end_ts, else arrival + queue + p_prefill = the leg-1 window, front_requests
+    ttft_parts); D: the first content (D's prefill ends with the first token)."""
+    pre = r.get("prefill") if isinstance(r.get("prefill"), dict) else {}
+    keys = ("P",) if g == "P" else ("D",) if g == "D" else ("P", "D")
+    for k in keys:
+        x = pre.get(k)
+        if not isinstance(x, dict) or not x.get("tokens") or x.get("prompt") is None:
+            continue
+        if k == "P":
+            t = r.get("p_leg1_end_ts")
+            if t is None and r.get("arrival_ts") is not None and r.get("p_prefill_ms") is not None:
+                t = float(r["arrival_ts"]) + float(r.get("queue_ms") or 0) / 1000.0 + float(r["p_prefill_ms"]) / 1000.0
+        else:
+            t = r.get("first_token_ts")
+        if t is not None:
+            return float(t), x
+    return None, None
+
+
+def prefill_depth(b: dict, done: Optional[List[dict]] = None, g: str = "P") -> dict:
+    """Token x-y (n neu) of one prefill burst, with the rate at its start and end (module note above).
+    ``reqs`` = per request {rid, x, y, n} where the source names requests; ``exact`` = x/y are the requests'
+    own depths (sources 1 and 2 with matching token sums), not the burst's summed prefix."""
+    n = int(round(b.get("tok") or 0))
+    out = {"n": n, "x": None, "y": None, "src": None, "exact": False, "reqs": []}
+    ts, te = edge_rates(b)
+    out["tps_start"], out["tps_end"] = ts, te
+    ext: Dict[str, List[int]] = {}
+    for c in sorted(b.get("cs") or [], key=lambda c: c["e0"]):
+        for rid, s0, e0 in (c.get("ext") or ()):
+            lo_hi = ext.setdefault(rid, [s0, e0])
+            lo_hi[0], lo_hi[1] = min(lo_hi[0], s0), max(lo_hi[1], e0)
+    if ext:
+        reqs = [{"rid": r, "x": v[0], "y": v[1], "n": v[1] - v[0]} for r, v in ext.items()]
+        if len(reqs) == 1 and n > 0:
+            # a sample shows only the NEWEST chunk's extent: with one request the burst's own token count
+            # reaches back to its true start
+            r = reqs[0]
+            r["x"] = max(0, min(r["x"], r["y"] - n))
+            r["n"] = r["y"] - r["x"]
+        out.update(x=min(r["x"] for r in reqs), y=max(r["y"] for r in reqs), reqs=reqs, exact=True,
+                   src="rankstats prefill.last.ext (#969 EXTENT je Chunk)")
+        return out
+    lo, hi = b["s"] - REQ_END_TOL_S[0], b["e"] + REQ_END_TOL_S[1]
+    reqs = []
+    for r in done or ():
+        t, x = _req_prefill(r, g)
+        if t is not None and lo <= t <= hi:
+            reqs.append({"rid": r.get("rid"), "x": int(x.get("cached") or 0), "y": int(x["prompt"]),
+                         "n": int(x.get("tokens") or 0), "t": t})
+    if reqs:
+        reqs.sort(key=lambda r: r["t"])
+        tot = sum(r["n"] for r in reqs)
+        out.update(x=min(r["x"] for r in reqs), y=max(r["y"] for r in reqs), reqs=reqs,
+                   exact=abs(tot - n) <= max(64, 0.02 * n),
+                   src="events request_done (prefill.%s cached/prompt/tokens)" % ("D" if g == "D" else "P"))
+        return out
+    c = int(round(b.get("cached") or 0))
+    out.update(x=c, y=c + n, src="rankstats prefill.cached_tokens (Präfix am ersten Chunk der Anfrage)")
+    return out
+
+
+def decode_by_bs(iv: List[dict], s: float, e: float) -> List[dict]:
+    """Decode of [s, e] per batch size: tokens / decode seconds at that bs (the group's tok/s) and per seat.
+    Only sample intervals whose rounds all ran at one bs (decode.gpu_ms_by_bs delta, else decode.running) are
+    told apart; the rest is "mix" (their mean bs named).  Each interval counts with its share inside [s, e]."""
+    acc: Dict[object, Dict[str, float]] = {}
+    for x in iv:
+        ov = sum(max(0.0, min(y, e) - max(a, s)) for a, y in x.get("parts") or [(x["s"], x["e"])])
+        if ov <= 0 or x["dur"] <= 0:
+            continue
+        f = min(1.0, ov / x["dur"])
+        pure = x.get("bs_min") is not None and x.get("bs_min") == x.get("bs_max")
+        key = int(x["bs_min"]) if pure else "mix"
+        a = acc.setdefault(key, {"tok": 0.0, "busy": 0.0, "seat_s": 0.0})
+        a["tok"] += x["tok"] * f
+        a["busy"] += x["busy"] * f
+        a["seat_s"] += (x.get("seat_s") or 0.0) * f
+    out = []
+    for k, a in acc.items():
+        if a["busy"] <= 0 or a["tok"] <= 0:
+            continue
+        tps = a["tok"] / a["busy"]
+        out.append({"bs": k, "tps": tps, "per_slot": (a["tok"] / a["seat_s"]) if a["seat_s"] > 0 else None,
+                    "bs_mean": (a["seat_s"] / a["busy"]) if a["seat_s"] > 0 else None,
+                    "busy_s": a["busy"], "tok": a["tok"]})
+    out.sort(key=lambda r: (r["bs"] == "mix", r["bs"] if r["bs"] != "mix" else 0))
+    return out
+
+
+def decode_reqs(ring, key: Optional[str], s: float, e: float, done: Optional[List[dict]] = None) -> Tuple[List[dict], Optional[str]]:
+    """Per request in the decode stretch [s, e]: Token x-y (n neu) and its tok/s.  (rows, src).
+    1. rankstats decode.reqs [[rid, prompt, out]] of the samples around [s, e] (exact; port seat 02.10.):
+       x = prompt + out at the segment's start, y at its end, n = the out delta, tok/s = n / rank-clock span;
+    2. else events request_done of the requests whose decode [first_token_ts, end_ts] overlaps [s, e]:
+       the request's own mean rate (decode_tokens / its decode wall time, parks included) laid linearly over
+       its decode -- an estimate, and a request still running is not there yet."""
+    seen: Dict[str, List[Tuple[float, int, int]]] = {}
+    seen_field = False
+    if key is not None:
+        for smp in ring or ():
+            r = smp["r"].get(key)
+            if not r or r.get("ts") is None or r.get("dreqs") is None:
+                continue
+            seen_field = True
+            if not (s - 1.5 <= r["ts"] <= e + 1.5):
+                continue
+            for rid, p, o in r["dreqs"]:
+                seen.setdefault(rid, []).append((r["ts"], p, o))
+    if seen_field:
+        rows = []
+        for rid, xs in seen.items():
+            # the depth at the segment's edges: the newest sample at or before s, the first at or after e
+            # (the 1-s raster), else the first / last sample inside
+            t0, p0, o0 = max((x for x in xs if x[0] <= s), default=xs[0], key=lambda x: x[0])
+            t1, p1, o1 = min((x for x in xs if x[0] >= e), default=xs[-1], key=lambda x: x[0])
+            n = max(0, o1 - o0)
+            rows.append({"rid": rid, "x": p0 + o0, "y": p1 + o1, "n": n,
+                         "tps": (n / (t1 - t0)) if t1 - t0 >= 0.5 else None, "est": False})
+        rows.sort(key=lambda r: -r["y"])
+        return rows, "rankstats decode.reqs (je Probe)"
+    rows = []
+    for r in done or ():
+        ft, end, dt = r.get("first_token_ts"), r.get("end_ts"), r.get("decode_tokens")
+        if ft is None or end is None or not dt or end <= ft or end <= s or ft >= e:
+            continue
+        ft, end, dt = float(ft), float(end), int(dt)
+        ctx = r.get("context_tokens")
+        p0 = int(ctx) - dt if ctx else None
+        if p0 is None or p0 < 0:
+            pre = r.get("prefill") if isinstance(r.get("prefill"), dict) else {}
+            px = pre.get("D") or pre.get("P") or {}
+            p0 = int(px.get("prompt") or 0)
+        rate = dt / (end - ft)
+        x = p0 + rate * (max(s, ft) - ft)
+        y = p0 + rate * (min(e, end) - ft)
+        rows.append({"rid": r.get("rid"), "x": int(round(x)), "y": int(round(y)), "n": int(round(y - x)),
+                     "tps": rate, "est": True})
+    rows.sort(key=lambda r: -r["y"])
+    return rows, ("events request_done (Ø der Anfrage, linear über ihre Decode-Zeit)" if rows else None)
 
 
 def flip_windows(flip_done: List[dict]) -> List[Tuple[float, float]]:

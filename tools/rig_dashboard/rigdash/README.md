@@ -105,6 +105,18 @@ Der Verlauf lädt `api/history?from=&to=` im passenden Raster neu (ab ≤ 24 min
 mit 1/2/5-s-Eimern (`series_zoom`); die 60-s-Kacheln bleiben auf „jetzt“. Die Kartenbalken oben sind Momentwerte ohne Zeitachse.
 Tests: `tests/test_rates_glatt_0930.py`.
 
+## Tiefe beim Hover: „Token x–y (n neu)“ (Nutzer 02.10. ~12:04Z / ~12:15Z)
+
+Der Prefill-Durchsatz fällt mit der Kontexttiefe, darum zeigt jedes Prefill-Segment der Phasenleiste (und der letzte Schub
+der Prefill-Kachel, die P→D-Flipzeile „nach Prefill …“) x = Start-Tiefe (Präfix), y = End-Tiefe, n = neu gerechnete Token,
+dazu tok/s über die ersten und letzten 15 % der Token (`activity.prefill_depth`). Quellen, beste zuerst: rankstats
+`prefill.last.ext` [[rid, start, end]] je Chunk; events `request_done` `prefill.{P,D}` (rid-genau, aber erst am Anfrageende);
+sonst Δ`prefill.cached_tokens` des Schubs (#cached-token steht nur am ersten Chunk einer Anfrage). Ein Decode-Segment zeigt
+tok/s je Batchgröße (Proben mit nur einer bs, Δ`gpu_ms_by_bs`) und je Anfrage Token x–y (n neu) mit tok/s: aus rankstats
+`decode.reqs` [[rid, prompt, out]] je Probe, sonst geschätzt aus `request_done` (Ø der Anfrage, linear). `prefill.last.ext`
+und `decode.reqs` baut der Port-Sitz (02.10.); bis dahin greifen die Rückfälle. Texte DE/EN im Block `DEPTH-BEGIN` von
+`static/index.html`. Tests: `tests/test_depth_1002.py`.
+
 ## Probennehmer im eigenen Prozess, Zähler statt Momentproben (Nutzer 30.09. ~21:40Z)
 
 „der probenehmer sollte doch nicht an zu viel last scheitern? der sollte das doch irgendwie parallel davon tun können?“
