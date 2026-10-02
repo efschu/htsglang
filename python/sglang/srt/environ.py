@@ -1355,6 +1355,16 @@ class Envs:
     # it is funded at the same step. Only the order changes: no reservation,
     # the planner's W126 riegel asks without it. 0 = the given order is kept.
     SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT = EnvBool(True)
+    # FLIP_ORDER_LOCKSTEP (02.10., NF y7o D->P ep3/9/11/13): after the credit
+    # order, the FIRST claim of every waker stands behind the co-located
+    # sleeper pauses that fund it (weg2/wake_credit.lockstep_claims). y7o's
+    # PP2 weights_14 (4014 MiB) stood at position 3: D TP2 had published
+    # 4292, 406 staged -> balance 3885, and the next TP2 pause (weights_10,
+    # deposit to PP1) waited on PP1, PP1 on TP1, TP1 on PP2 -- a three-rank
+    # convoy, 0.9-1.3 s on each P rank's first big tag. Only the order moves:
+    # no reserve, no expert cap, no floor change; an order whose first claims
+    # are funded stays byte-identical. D->P only. 0 = order as before.
+    SGLANG_WEG2_ENABLE_FLIP_ORDER_LOCKSTEP = EnvBool(True)
     # PD_TIMED_ORDER (H34, fnFL2x141): the planner times the P->D wake per card
     # in ms (weg2/wake_credit_pd.py) and recommends a rearrangement of the
     # tightest card's own P bands when the credit wait there lengthens the leg

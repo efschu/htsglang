@@ -9641,6 +9641,24 @@ class SchedulerWeightUpdaterManager:
         finally:
             if _b1 is not None:
                 _b1.clear_credit_wait()
+        # y7o (02.10.): the FIRST claimed tag of this leg names what the
+        # co-located sleeper had published when it was granted -- the metal
+        # proof of the front's WEG2-LEG-ORDER (wake_credit.lockstep_claims):
+        # via=counter means the published balance covered it, no card path.
+        try:
+            if getattr(self, "_weg2_leg_order_epoch", None) != epoch:
+                self._weg2_leg_order_epoch = epoch
+                _st = credit.read() or {}
+                logger.info(
+                    "WEG2-LEG-ORDER card=%s first_claim=%s paused_first=%s waited_ms=%.0f "
+                    "via=%s published_mib=%d need_mib=%d",
+                    self._weg2_card_uuid() or "unknown", tag,
+                    ",".join(str(t) for t in _st.get("tags", [])) or "-",
+                    float(rec.get("waited_s", 0.0)) * 1000,
+                    "counter" if int(rec.get("available_bytes", 0) or 0) >= 0 else "card-overdraw",
+                    int(_st.get("credit_bytes", 0) or 0) // MIB_, int(need_bytes) // MIB_)
+        except Exception:  # noqa: BLE001 -- an instrument, never a gate
+            pass
         # xsn323: remember the tightest point of these legs. The kv-first gate
         # of the NEXT wake reads it: kv_cache resumed before the legs must not
         # eat the free space the legs' tags need (5090: free 9028 MiB at

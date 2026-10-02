@@ -3243,10 +3243,23 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
     # promise and the front's order are the same question.
     search = bool(envs.SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH.get()
                   or (plan or {}).get(_wc.SEARCH_KEY))
+    _double = not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get()
+    # y7o (02.10.): D->P only -- the first claim of each P stage behind the
+    # co-located D pauses that fund it (wake_credit.lockstep_claims).
+    _lockstep = ("%s->%s" % (src, dst) == "D->P"
+                 and envs.SGLANG_WEG2_ENABLE_FLIP_ORDER_LOCKSTEP.get())
     new, note = _wc.front_order(
         order, table, free_mib=free, floor_mib=floors,
-        double_staging=not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get(), search=search,
-        least_deficit=envs.SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT.get())
+        double_staging=_double, search=search,
+        least_deficit=envs.SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT.get(),
+        lockstep_first=_lockstep)
+    if _lockstep:
+        try:
+            for _line in _wc.front_leg_order_lines(new, table, free_mib=free, floor_mib=floors,
+                                                   double_staging=_double):
+                logger.info("%s src=%s", _line, src)
+        except Exception as exc:  # noqa: BLE001 -- an instrument, never the order
+            logger.warning("WEG2-LEG-ORDER n/a (%s: %s)", type(exc).__name__, exc)
     return new, why + ", " + note
 
 
