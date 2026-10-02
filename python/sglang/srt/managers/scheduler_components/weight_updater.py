@@ -7752,6 +7752,20 @@ class SchedulerWeightUpdaterManager:
                            exc)
             return "fallback"
 
+    def _l15_preload_after_act(self, tags) -> bool:
+        """DP-NACHLAUF: WAKE-PRELOAD waits for the L15 act on an L15 D kv
+        wake. Group-uniform terms only (group name, the call's tags, the
+        master env) -- never this rank's manifest, which a cap-0 rank does
+        not stash: a per-rank skip before the preload's group vote would
+        hang the siblings in it."""
+        try:
+            from sglang.srt.weg2 import l15_plan
+
+            return bool(self._weg2_group_name() == "D" and self._l15_wake_rpc(tags)
+                        and l15_plan.master_on(os.environ))
+        except Exception:  # noqa: BLE001 -- uniform failure: no L15 -> preload as before
+            return False
+
     def _l15_wake_act(self, sched, verdict: str, *, group_ok: bool,
                       master_on: bool) -> int:
         """L15-12c-B: the fence tail's single-branch ACT on the group
@@ -10894,7 +10908,9 @@ class SchedulerWeightUpdaterManager:
                 try:
                     from sglang.srt.weg2 import wake_preload as _wpl
 
-                    _wpl.run(self, l15_hold_aware=getattr(self, "_l15_wake_manifest", None) is not None)
+                    # group-uniform (the per-rank manifest was not): an L15 D kv
+                    # wake defers the preload to after the L15 act (below)
+                    _wpl.run(self, l15_hold_aware=self._l15_preload_after_act(tags))
                 except Exception as _wpl_exc:  # noqa: BLE001 -- the first pass loads as before
                     if "RANKS DISAGREE" in str(_wpl_exc):
                         raise  # ranks never disagree: stop by name
@@ -12161,6 +12177,20 @@ class SchedulerWeightUpdaterManager:
                     except Exception as exc:  # noqa: BLE001 -- deposits are optional
                         logger.warning("L15-DEPOSIT-ADOPT failed (%s: %s)",
                                        type(exc).__name__, exc)
+                # DP-NACHLAUF WAKE-PRELOAD on L15 wakes: AFTER the act (l15-lead:
+                # hold rows reserved / fallback drop done -- no L15 path touches
+                # the pools after it); the held requests are still in the hold
+                # (their release runs after this reply). Group-uniform gate.
+                if self._l15_preload_after_act(tags) and not _weg2_kv_refusal:
+                    try:
+                        from sglang.srt.weg2 import wake_preload as _wpl
+
+                        _wpl.run(self, l15_hold_aware=False, site="after_l15_act")
+                    except Exception as _wpl_exc:  # noqa: BLE001 -- the first pass loads as before
+                        if "RANKS DISAGREE" in str(_wpl_exc):
+                            raise  # ranks never disagree: stop by name
+                        logger.info("WEG2-WAKE-PRELOAD after L15 act failed (%s: %s)",
+                                    type(_wpl_exc).__name__, _wpl_exc)
                 if _l15_v == "fallback":
                     logger.info("L15-RESTORE verdict=fallback dropped=%d "
                                 "slots", _l15_dropped)
