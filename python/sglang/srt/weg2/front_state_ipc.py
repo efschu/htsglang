@@ -24,7 +24,7 @@ import glob
 import json
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sglang.srt.weg2 import state_file
 
@@ -402,21 +402,62 @@ class DpFlipClock:
                        "park_rpc_ms": (None if park is None else park.get("rpc_ms")), "done_ts": None}
         self._park = None
 
-    def done(self, now: float) -> None:
+    def done(self, now: float, beacon_snap: Optional[Dict[int, Tuple[int, int, int]]] = None) -> None:
+        """``beacon_snap`` (PDFLIP-E): P's progress beacons at the flip's done,
+        ``{pid: (forward_ct, t_start_ns, t_done_ns)}``; None = no beacon reading."""
         if self._armed is not None and self._armed["done_ts"] is None:
             self._armed["done_ts"] = float(now)
+            self._armed["beacon_snap"] = dict(beacon_snap) if beacon_snap else None
+            self._armed["beacon_first"] = {}
+
+    def waits_for_beacon(self) -> bool:
+        a = self._armed
+        return bool(a is not None and a.get("beacon_snap") and a.get("pp_last_ts") is None)
+
+    def note_beacon(self, cur: Dict[int, Tuple[int, int, int]]) -> Optional[float]:
+        """PDFLIP-E (user order 02.10.: D->P ends when ALL PP stages began P's
+        first forward, never at the leg-1 dispatch): fold one beacon reading in.
+        A rank whose forward_ct rose past its done snapshot began its first
+        forward after the flip at ``t_start`` (exact while the rise is 1; a
+        wider rise between two readings is marked approximate). Once every rank
+        of the snapshot rose: the LAST of those starts = the last PP stage's
+        first forward = the D->P end. Returns it (s) once known."""
+        a = self._armed
+        if a is None or not a.get("beacon_snap"):
+            return None
+        if a.get("pp_last_ts") is not None:
+            return a["pp_last_ts"]
+        first = a.setdefault("beacon_first", {})
+        for pid, (ct0, _ts0, _td0) in a["beacon_snap"].items():
+            if pid in first:
+                continue
+            row = cur.get(pid)
+            if row is None or int(row[0]) <= int(ct0):
+                continue
+            first[pid] = (float(row[1]) / 1e9, int(row[0]) - int(ct0) > 1)
+        if len(first) == len(a["beacon_snap"]):
+            a["pp_last_ts"] = max(t for t, _ in first.values())
+            a["pp_last_approx"] = any(ap for _, ap in first.values())
+        return a.get("pp_last_ts")
 
     def first_prefill(self, rid: Optional[str], t_dispatch: float, t_end: float,
                       p_prefill_s: Optional[float]) -> Optional[dict]:
-        """The first leg 1 after the flip finished: the event, or None."""
+        """The first leg 1 after the flip finished: the event, or None.
+
+        PDFLIP-E: P's prefill start is the last PP stage's first forward
+        (``note_beacon``) -- ``prefill_start_source="pp_last_forward"``. Without
+        that reading the end is MISSING (``prefill_start_ts`` None, no
+        ``flip_user_ms``): never the leg-1 dispatch (user: "DIE FALSCHE, ZU
+        KLEINE ZAHL MUSS UEBERALL WEG")."""
         a = self._armed
         if a is None:
             return None
         self._armed = None
-        if p_prefill_s is not None and p_prefill_s > 0:
-            start, src = max(float(t_dispatch), float(t_end) - float(p_prefill_s)), "leg1_end_minus_p_prefill_s"
+        if a.get("pp_last_ts") is not None:
+            start = max(float(a["pp_last_ts"]), float(a["done_ts"] or a["pp_last_ts"]))
+            src = "pp_last_forward" + ("_approx" if a.get("pp_last_approx") else "")
         else:
-            start, src = float(t_dispatch), "leg1_dispatch"
+            start, src = None, "missing"
         done = a["done_ts"] if a["done_ts"] is not None else start
         idle = bool(a.get("idle_flip"))
         pre_begin_start = a["start_ts"]
@@ -428,7 +469,9 @@ class DpFlipClock:
             return None if x is None or y is None else round((float(y) - float(x)) * 1000.0)
         return {"epoch": a["epoch"], "dir": "D>P", "rid": rid, "idle_flip": idle,
                 "start_ts": round(a["start_ts"], 3), "start_source": a["start_source"],
-                "prefill_start_ts": round(start, 3), "prefill_start_source": src,
+                "prefill_start_ts": None if start is None else round(start, 3),
+                "prefill_start_source": src,
+                "leg1_dispatch_ts": round(float(t_dispatch), 3),
                 "flip_user_ms": ms(a["start_ts"], start),
                 "parts": {"park_rpc_ms": (None if a["park_rpc_ms"] is None else round(float(a["park_rpc_ms"]))),
                           "pre_begin_ms": ms(pre_begin_start, a["flip_begin_ts"]),
@@ -502,6 +545,18 @@ class FirstWorkClock:
             self._armed["p_end_ts"] = self._p_end
         return prev
 
+    #: PDFLIP-E (NF rule, 02.10.): D cannot emit before its layers are back; a
+    #: D content up to this long before the kv wake answered still counts
+    AWAKE_SLACK_S = 0.3
+
+    def note_awake(self, ts: float) -> None:
+        """PDFLIP-E: the woken D's kv wake answered (its layers are back) --
+        from here D content before ``done`` is this flip's first decode token
+        (NF y7l: D decodes during wake-kv/dc, before done)."""
+        a = self._armed
+        if a is not None and a["wake"] == "D":
+            a["awake_ts"] = float(ts)
+
     def done(self, now: float) -> None:
         """The armed flip reached ``done`` (its ``flip_done`` was published)."""
         self._last_done = float(now)
@@ -528,8 +583,13 @@ class FirstWorkClock:
         a = self._armed
         if a is None or a["wake"] != group:
             return None
+        _awake = a.get("awake_ts")
         if group == "D" and a.get("done_ts") is None and (
-                leg2_dispatch_ts is None or float(leg2_dispatch_ts) < a["flip_begin_ts"]):
+                # PDFLIP-E (NF rule): with D's kv wake known, its content counts from the
+                # wake on (minus a slack) whatever leg 2 it belongs to, never before;
+                (float(now) < float(_awake) - self.AWAKE_SLACK_S) if _awake is not None
+                # without it, the 01.10. rule: only a leg 2 dispatched in this flip
+                else (leg2_dispatch_ts is None or float(leg2_dispatch_ts) < a["flip_begin_ts"])):
             a["stale_skipped"] = int(a.get("stale_skipped", 0)) + 1
             self.stale_skipped += 1
             return None

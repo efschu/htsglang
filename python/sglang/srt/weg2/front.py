@@ -6750,6 +6750,48 @@ class Front:
             c = self.__dict__["_ipc_dp_clk"] = front_state_ipc.DpFlipClock()
         return c
 
+    def _p_beacons(self) -> Optional[Dict[int, Tuple[int, int, int]]]:
+        """PDFLIP-E: P's live ranks' progress beacons {pid: (forward_ct,
+        t_start_ns, t_done_ns)}; None when the beacon is off or unreadable."""
+        try:
+            from sglang.srt.weg2 import progress_beacon as _fp
+
+            if not _fp.enabled():
+                return None
+            d = _fp.beacon_dir(getattr(self, "tag", "") or "")
+            g = self.groups.get("P")
+            if not d or g is None or not g.sid:
+                return None
+            return _fp.read_group(d, "P", g.sid) or None
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the flip
+            return None
+
+    async def _watch_pp_last_forward(self, period_s: float = 0.01, bound_s: float = 120.0) -> None:
+        """PDFLIP-E: poll P's beacons until every rank began its first forward
+        after the D->P flip (the last of them = the D->P end) or the bound."""
+        clk = self._ipc_dp_clock()
+        t_end = time.time() + bound_s
+        while clk.waits_for_beacon() and time.time() < t_end:
+            cur = await asyncio.to_thread(Front._p_beacons, self)
+            if cur:
+                ts = clk.note_beacon(cur)
+                if ts is not None:
+                    Front._ipc_first_work_at(self, "P", "p_last_stage_forward", None, float(ts))
+                    return
+            await asyncio.sleep(period_s)
+
+    def _ipc_first_work_at(self, group: str, what: str, rid: Optional[str], ts: float) -> None:
+        """PDFLIP-E: the woken group's first work at a MEASURED time ``ts`` (P's
+        last-stage forward start from the beacon), not at the call's now."""
+        c = self.__dict__.get("_ipc_fw_clock")
+        if c is None or not c.waits_for(group):
+            return
+        ev = c.seen(group, what, rid, float(ts))
+        if ev is not None:
+            self._ipc_publish("flip_first_work", ev)
+            Front._flip_phase(self).first_work(float(ts), what)
+            Front._ipc_live_kick(self)
+
     def _ipc_first_work_seen(self, group: str, what: str, rid: Optional[str],
                              chunk: Optional[bytes] = None, path: str = "") -> None:
         """The woken group's first work after a flip -> one ``flip_first_work`` event
@@ -8334,7 +8376,8 @@ class Front:
         today's unbounded await. getattr: partial test fronts have no flag.
         """
         # DASHBOARD-AUS-IPC (a): the first leg 1 dispatched after a D->P flip.
-        self._ipc_first_work_seen("P", "p_leg1_dispatch", getattr(p, "rid", None))
+        # PDFLIP-E (user order 02.10.): P's first work is the LAST P stage's first
+        # forward (Front._watch_pp_last_forward), never the leg-1 dispatch.
         bound = float(getattr(self, "p_leg1_stall_s", 0.0) or 0.0)
         if bound <= 0:
             return await post
@@ -8488,7 +8531,10 @@ class Front:
             Front._ipc_first_work_clock(self).note_p_end(_t1)
             # D->P flip time (user definition): the first leg 1 after a D->P flip
             # names P's prefill start -- its end minus P's own prefill time
-            _dp = self._ipc_dp_clock().first_prefill(p.rid, t0, time.time(), d_prefill_seconds(js))
+            _dpc = self._ipc_dp_clock()
+            if _dpc.waits_for_beacon():  # PDFLIP-E: a last reading before the event
+                _dpc.note_beacon(Front._p_beacons(self) or {})
+            _dp = _dpc.first_prefill(p.rid, t0, time.time(), d_prefill_seconds(js))
             if _dp is not None:
                 self._ipc_publish("flip_user_time", _dp)
             self._metrics().served_leg("P", p.rid, time.time() - t0, pt, ct, 0)  # TSDB
@@ -10854,6 +10900,9 @@ class Front:
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
             return
+        if dst == "D":
+            # PDFLIP-E (NF rule): D's layers are back -- its first decode token may come before done
+            Front._ipc_first_work_clock(self).note_awake(t_w)
         # #1455: the residue measurement (NVML + host image) runs AFTER the wake answered -- it is
         # instrumentation, not a precondition; ~250 ms off the critical path.
         # 27B flipfast F1: and once nothing gates on it any more, OFF the flip
@@ -11011,7 +11060,14 @@ class Front:
         from sglang.srt.weg2 import front_state_ipc as _fsi
         self._ipc_publish("flip_done", _fsi.flip_done_payload(rec, t_flip0))
         self._ipc_first_work_clock().done(time.time())  # FEHLT 3: pairs with one flip_first_work
-        self._ipc_dp_clock().done(time.time())
+        # PDFLIP-E: the D->P flip ends at the last P stage's first forward -- P's
+        # progress beacons at done, then a 10 ms watch until every rank rose.
+        _bsnap = Front._p_beacons(self) if (src == "D" and dst == "P") else None
+        self._ipc_dp_clock().done(time.time(), beacon_snap=_bsnap)
+        if _bsnap:
+            _bt = asyncio.get_running_loop().create_task(Front._watch_pp_last_forward(self))
+            self._dc_tasks.add(_bt)
+            _bt.add_done_callback(self._dc_tasks.discard)
         Front._flip_phase(self).done(time.time())  # DASHBOARD-IPC: Layer -> Nachlauf
         Front._ipc_live_kick(self)
         if dc_off_path:
