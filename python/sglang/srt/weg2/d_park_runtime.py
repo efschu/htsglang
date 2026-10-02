@@ -135,9 +135,22 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
             success=False, parked=[], epoch=epoch,
             message="W-PARK refused: anchor tails present (a P-group structure) -- nothing parked",
         )
+    # FLIPCYCLE H3 (02.10.): the park's own phases on the scheduler thread
+    # (y6z dispatch_ms 142-591, ~110 ms per parked request; floor ~30 ms: the
+    # END-state D2H of ~65 MB per request). One line per park, TP0 reads it.
+    _pt = [time.perf_counter()]
+    _pk: list = []
+
+    def _ph(name):
+        now = time.perf_counter()
+        _pk.append((name, (now - _pt[0]) * 1000.0))
+        _pt[0] = now
+
+    _t_park0 = _pt[0]
     if sched.enable_overlap and sched.last_batch and sched.result_queue:
         tmp_batch, tmp_result = sched.result_queue.popleft()
         sched.process_batch_result(tmp_batch, tmp_result)
+    _ph("result")
     last = sched.last_batch
     if last and last.forward_mode.is_extend():
         last.filter_batch(chunked_req_to_exclude=[])
@@ -158,18 +171,22 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         setattr(req, d_park_read.RETAINED_ATTR, None)
     # H91d: the draft rows have no host twin (tier off) -- copy them off
     # BEFORE the retraction hands the slots to the tree (d_park_draft).
+    _ph("filter")
     d_park_draft.save_parked(sched, running, site=d_seats.SITE_FLIP)
+    _ph("draft")
     # 27B PARK: a DFlash window pool carries nothing; the resume is a fresh
     # hand-off's admission (rearm_window_draft_cold). MTP pools: no-op.
     rearmed = rearm_window_draft_cold(sched, running)
     # F4 (#259 4c): the END state of each running request as a park tail part,
     # gathered before the retraction hands its slots to the tree.
     _park_end(sched, running)
+    _ph("end")
     park_hold_yield.begin(getattr(sched, "tree_cache", None))
     retracted = (
         sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
         if running else []
     )
+    _ph("retract")
     sched.running_batch.batch_is_full = False
     sched.chunked_req = None
     now = time.monotonic()
@@ -212,10 +229,12 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         for req in settle:
             setattr(req, FROM_SETTLE_ATTR, True)
     sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + settle + queued)
+    _ph("mark")
     # HY: a retained span whose backup the full arena refused takes the
     # L3-copied pages of a held (not running) request -- one group vote, then
     # the give-back and the backup again on every rank, or nothing moves
     park_hold_yield.settle(sched, retracted=retracted, parked=sched.weg2_d_parked)
+    _ph("yield")
     # #248: every parked request is kept by ORDER over the flip -- the
     # sleep's reset gives its references back, the hold reads it at the wake
     try:
@@ -242,11 +261,13 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     held = [str(r.rid) for r in sched.weg2_d_parked if d_seats.park_site(r) is None]
     # #59b: the depth each parked request resumes from, after the retraction
     # above retained its span (every rank parks the same list).
+    _ph("l3mark")
     resumable = weg2_resumable_depth.park_depths(
         getattr(sched, "tree_cache", None),
         [r for r in sched.weg2_d_parked if d_seats.park_site(r) is not None],
         getattr(sched, "ps", None),
     )
+    _ph("depth")
     # PARK-READ = RESUMABLE: the read of a request this park retracted ends at
     # the depth it resumes from, not at the tombstoned KV above the anchor
     # (d_park_read.clamp_to_resumable). Group-uniform: #59b's depths are.
@@ -259,6 +280,11 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
             ) is not None:
                 logger.info("WEG2-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
                             str(req.rid)[:12], before, d_park_read.describe(req))
+    _ph("clamp")
+    logger.info("WEG2-FLIPCYCLE stage=park epoch=%d n=%d ms=%.0f floor_ms=%d sub=%s (H3: the park's "
+                "phases on the scheduler thread; floor = the END-state D2H)", epoch, len(retracted),
+                (time.perf_counter() - _t_park0) * 1000.0, 30 * max(1, len(retracted)) // 3 or 10,
+                ",".join("%s:%.0f" % kv for kv in _pk))
     logger.info(
         "WEG2-D-PARK park_running epoch=%d reason=%s: %d running retracted (span retained, "
         "forced host write-through), parked=%s queued-behind=%s settle-folded=%s late_hold=%s -- "

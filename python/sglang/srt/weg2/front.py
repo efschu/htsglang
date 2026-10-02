@@ -11984,6 +11984,20 @@ class Front:
             logger.info("WEG2-FLIP-TIMELINE epoch=%d slept=%s woke=%s ms-from-begin: %s done@%.0f "
                         "(stage@t = the moment that stage BEGAN; the D readmission continues on D after done)",
                         self.epoch, src, dst, _parts, (self.t_awake - _b) * 1000)
+            # FLIPCYCLE (02.10.): each serial stage with its physics floor, one
+            # line per stage (FLIPZYKLUS-PHYSIK-NF-1002.md): software stages 0,
+            # the legs the x4 link's bytes / rate (SGLANG_WEG2_FLIPCYCLE_LEGS_FLOOR_MS)
+            _ends = [k for k in _order if k in _m] + ["done"]
+            _at = dict(_m)
+            _at["done"] = self.t_awake
+            _legs_floor = int(envs.SGLANG_WEG2_FLIPCYCLE_LEGS_FLOOR_MS.get())
+            for _i, _k in enumerate(_ends[:-1]):
+                _ms = (_at[_ends[_i + 1]] - _at[_k]) * 1000
+                logger.info("WEG2-FLIPCYCLE stage=%s dir=%s>%s epoch=%d ms=%.0f floor_ms=%d",
+                            {"gathered-legs": "legs"}.get(_k, _k), src, dst, self.epoch, _ms,
+                            _legs_floor if _k == "gathered-legs" else 0)
+            logger.info("WEG2-FLIPCYCLE stage=total dir=%s>%s epoch=%d ms=%.0f floor_ms=%d",
+                        src, dst, self.epoch, (self.t_awake - _b) * 1000, _legs_floor)
         except Exception:  # noqa: BLE001 -- a timeline never breaks a flip
             pass
         _dp_drain_end = self._flip_marks.get("quiesce")  # R28: drain(S) returned here
