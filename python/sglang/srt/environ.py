@@ -4082,6 +4082,14 @@ class Envs:
     # a queued request that needs P); P stays awake ("WEG2 MANUAL-FLIP RETURN-SKIP
     # reason=..."). 0 = the round trip always returns to D, as before.
     SGLANG_WEG2_MANUAL_FLIP_RETURN_SKIP = EnvBool(True)
+    # K7-DWELL idle skip on the classic D-branch (27B 02.10., N5j 13:50:12-15; the
+    # NF ARRIVAL-SEAT form cd12370e30 covered only the seat path): the D->P
+    # min-dwell only holds while D has work (running decodes, a hand-off in
+    # flight or ready_for_d); an idle D flips at once -- MIN-DWELL
+    # overridden_by=d_idle. Without it a DONE-KICK pass on an idle D held for
+    # the derived dwell and the flip came one 0.2 s tick later.
+    # 0 = the dwell holds an idle D as before.
+    SGLANG_WEG2_K7_DWELL_IDLE_SKIP = EnvBool(True)
     # GC-GUARD (02.10., N5q epoch 4: 'WEG2-FRONT GC-PAUSE generation=2 ms=92
     # collected=0' between the P>D done and the D>P begin): the front never lets
     # CPython start a generation-2 pass on its own; the due pass runs when no flip
