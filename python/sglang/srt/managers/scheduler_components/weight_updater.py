@@ -9648,14 +9648,6 @@ class SchedulerWeightUpdaterManager:
         
         if replay is not None:
             return replay
-        # DP-NACHLAUF: the last decode rounds reach the log before the sleep,
-        # not after the next wake (DecodeRoundLog.drain_blocking)
-        try:
-            _drl = getattr(getattr(self.scheduler, "metrics_reporter", None), "decode_round_log", None)
-            if _drl is not None:
-                _drl.drain_blocking()
-        except Exception:  # noqa: BLE001 -- a log drain never breaks the sleep
-            pass
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}
