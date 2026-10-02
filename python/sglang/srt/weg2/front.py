@@ -690,6 +690,23 @@ def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
     return gone
 
 
+#: PARK-HANDBACK: the reason of a held record the park hands back to P.
+PARK_HANDBACK_REASON = "park_handback"
+
+
+def park_held_rids(body: str) -> List[str]:
+    """D's park answer: the rids it holds UNSTARTED (``held``: queued, never
+    admitted -- no park site); [] when absent or unreadable."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return []
+    held = payload.get("held") if isinstance(payload, dict) else None
+    if not isinstance(held, list):
+        return []
+    return [str(r) for r in held if isinstance(r, str)]
+
+
 def park_resumable_depths(body: str) -> Dict[str, int]:
     """#59b: ``{rid: depth}`` of D's park answer (``weg2_resumable_depth``,
     http_server ``/weg2/park_running``); {} when absent or unreadable."""
@@ -2002,7 +2019,7 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
                       carrier_max: int, carrier_exact: bool = False) -> str:
     """#1290: WHICH ROUTE CAN SERVE THIS REQUEST -- decided ONCE, up front.
 
-    Returns one of ``short`` / ``long`` / ``carrier_single`` / ``none``.
+    Returns one of ``short`` / ``long`` / ``none`` (``carrier_single`` is deleted, law 02.10.).
 
     THE TWO BOUNDS ASK DIFFERENT QUESTIONS OF DIFFERENT TOKEN BASES, and
     conflating them is the defect this function exists to end:
@@ -2085,10 +2102,15 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
     # ruling ("exemption + 413 band stay until A is proven on metal"). It is
     # not introduced by this commit and it is not hidden by it.
     if not fits_carrier:
-        # The store cannot be read into D, so the two-leg route is out: only a
-        # single prefill on D could serve it -- and only if D can prefill it.
-        if fits_d_prefill:
-            return "carrier_single"
+        # LAW (user 02.10. ~07:55Z): P's KV stages (262k, 524k YaRN, 786k)
+        # always cover D's maximum decode session, so no prompt is ever D's
+        # to prefill for a capacity reason -- the CARRIER-EXCEEDS route
+        # ("carrier_single", one prefill on D) is deleted; above the carrier
+        # the two-leg P route serves it and the window loop streams it (the
+        # launcher refuses a boot whose carrier or P stage is below D's
+        # session, P-COVERS-D-SESSION). Measured: 0 routes on all 12 NF boots
+        # of 02.10. (carrier 373536 > 262144).
+        return "long"
         # A TERMINAL REFUSAL MAY NOT REST ON AN ESTIMATE (#1290, round 2).
         # `carrier_est` is `len(text) / CARRIER_CHARS_PER_TOKEN` whenever the
         # front has no EXACT prompt-token count for this text -- and it never
@@ -3232,7 +3254,10 @@ class Pending:
     est_uncached: int = 0
     span_known: bool = False
     leg1_prompt_tokens: int = 0
-    skip_leg1: bool = False  # #1233 route CARRIER-EXCEEDS: one prefill on D, no leg 1
+    #: no leg 1: an SK SHORT kept in a D phase (its D admission prefills it).
+    #: The CARRIER-EXCEEDS route that set it is deleted (law 02.10.: P's KV
+    #: stages cover D's max session); a P drain gives it a leg 1 back.
+    skip_leg1: bool = False
     leg1_done: bool = False
     #: weg2xsn272: P refused this leg 1 as WEG2-INTAKE-STALL (its pool cannot
     #: admit the request while it keeps the backlog for D); requeued at the
@@ -5014,6 +5039,8 @@ class Front:
         unknown = [r for r in rids if r not in D.outstanding]
         # X-CREDIT-INFLIGHT-1002: the park's #59b depths cap in-flight presence.
         self._d_inflight_park(park_resumable_depths(text))
+        # PARK-HANDBACK: prefill D holds unstarted goes to P's batch
+        self._park_handback(park_held_rids(text) + [r for r in self._flip_ledger(D) if r not in rids])
         # H91c3-2: a hand-off already in ``D.outstanding`` whose leg 2 had not
         # reached D's scheduler when the park came (tokenizer / HTTP pipe) is
         # in neither of D's lists. A D that answers ``late_hold`` holds every
@@ -5758,14 +5785,18 @@ class Front:
             return False
         credit, uncached, over_x = terms
         noted = self.__dict__.setdefault("_hl_noted", set())
-        if not over_x:
+        # P-BATCH-ALL (user 02.10.): a lost hand-off is an error case -- its
+        # prefill goes back to P's batch (the next P drain), not to a D
+        # prefill, whatever its size. Only a SECOND loss under X stays on D
+        # (bounded: no third P leg, no terminal for a tail D may compute).
+        if not over_x and p.handoff_lost_reroutes >= 1:
             if p.rid not in noted:
                 noted.add(p.rid)
                 self.counters["handoff_lost_kept_d"] += 1
                 logger.warning(
                     "WEG2 HANDOFF-LOST-KEPT rid=%s first_lost_page=%d page_size=%d credit=%d "
-                    "uncached=%d X=%d reroutes=%d where=%s -- D prefills the lost tail itself "
-                    "(<= X, law 4)", p.rid, st["first_lost_page"], st["page_size"], credit,
+                    "uncached=%d X=%d reroutes=%d where=%s -- lost a second time: D prefills the "
+                    "lost tail itself (<= X, law 4; bounded, no third P leg)", p.rid, st["first_lost_page"], st["page_size"], credit,
                     uncached, x, p.handoff_lost_reroutes, where)
             return False
         if p.handoff_lost_reroutes >= 1:
@@ -5798,10 +5829,11 @@ class Front:
         self.counters["handoff_lost_reroutes"] += 1
         logger.warning(
             "WEG2 HANDOFF-LOST-REROUTE rid=%s first_lost_page=%d credit=%d path=fresh-P "
-            "(uncached=%d > X=%d, page_size=%d pages=%d where=%s waited_s=%.1f) -- the hand-off "
-            "was lost while the rid waited for a D seat; leg 1 runs again on P",
-            p.rid, st["first_lost_page"], credit, uncached, x, st["page_size"], st["pages"],
-            where, max(0.0, time.time() - p.t_arrive))
+            "(uncached=%d %s X=%d, page_size=%d pages=%d where=%s waited_s=%.1f) -- the hand-off "
+            "was lost while the rid waited for a D seat; leg 1 runs again on P (P's batch, "
+            "never a D prefill)",
+            p.rid, st["first_lost_page"], credit, uncached, ">" if over_x else "<=", x,
+            st["page_size"], st["pages"], where, max(0.0, time.time() - p.t_arrive))
         # The oldest request: back at the HEAD, as an intake stall is (law 2).
         self.queue.appendleft(p)
         self._dp_mark(p, "reroute")  # R28
@@ -5946,12 +5978,90 @@ class Front:
         self._x_exact_reprice_queue("p_anchor")
         return anchor
 
+    def _park_handback(self, rids: Sequence[str]) -> List[str]:
+        """PARK-HANDBACK (user 02.10.: while P is awake every prefill is P's):
+        a D-prefill leg (no P leg 1, ``_d_prefill_legs``) that D holds
+        UNSTARTED at a park -- its ``held`` list, or a leg the front sent that
+        D's park lists nowhere (in the pipe, the late hold) -- and whose stream
+        is still in the lookahead (nothing committed to the client) is handed
+        back: the lookahead ends (ROS stop), the leg closes (D's hold aborts,
+        d_park_runtime.park_abort) and the request joins P's queue; it reaches
+        D under E2 (HANDBACK d_compute=0). y6x weg2-12-39: posted 0.6 s before
+        PARK-IMMEDIATE, held ('in_flight_held'), D prefilled 954 tokens after
+        the flip. A committed stream or a non-stream leg stays held (named)."""
+        legs = self.__dict__.get("_d_prefill_legs") or {}
+        if not rids or not legs:
+            return []
+        self._rvp_state()
+        look = getattr(self, "_leg2_lookahead", set())
+        out = []
+        for rid in dict.fromkeys(str(r) for r in rids):
+            if rid not in legs:
+                continue
+            if rid not in look:
+                self.counters["park_handback_committed"] += 1
+                logger.warning("WEG2 PARK-HANDBACK rid=%s kept=committed (D holds a D-prefill leg "
+                               "unstarted but its stream is committed or not streamed -- it stays "
+                               "held, D prefills it after the flip)", rid)
+                continue
+            self._rvp_requeue[rid] = {"rid": rid, "reason": PARK_HANDBACK_REASON,
+                                      "d_extent": int(self._front_price.get(rid, 0) or 0),
+                                      "x": int(self.tp_prefill_max_tokens)}
+            self.counters["park_handback"] += 1
+            out.append(rid)
+            logger.info("WEG2 PARK-HANDBACK rid=%s epoch=%d (D held this prefill unstarted at the "
+                        "park; its leg closes and P's batch takes it -- D gets it under E2, "
+                        "d_compute=0)", rid, self.epoch)
+        return out
+
+    async def _requeue_park_handback(self, request: web.Request, rid: str, payload: dict, text: str,
+                                     stream: bool, pending: Optional["Pending"],
+                                     seat: Optional["Seat"]) -> web.StreamResponse:
+        """PARK-HANDBACK: the closed leg's request joins P's queue as a normal
+        leg 1 (no X refusal: no W50 / x_requeues count), then its leg 2 again."""
+        p = pending
+        if p is None:
+            _n_hb = len(text) // int(CHARS_PER_TOKEN) + 1
+            if getattr(self, "x_exact", False) and getattr(self, "ftok", None) is not None:
+                _ids_hb = self.ftok.ids_for(text)
+                if _ids_hb is not None:
+                    _n_hb = int(_ids_hb.size)
+            p = Pending(rid, request.path, payload, text, time.time(),
+                        asyncio.get_event_loop().create_future(),
+                        est_prompt=_n_hb, est_uncached=_n_hb, span_known=False)
+        else:
+            p.fut = asyncio.get_event_loop().create_future()
+            p.t_arrive = time.time()
+        if seat is not None:
+            seat.release("park_handback")
+        # one path per rid (ROS-1P, NF rc12p: a closed leg alone left D's park
+        # standing): D drops its hold by name before P's leg 1 reuses the rid
+        try:
+            code, body = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+        except Exception as e:  # noqa: BLE001 -- the closed leg is the fallback abort
+            code, body = 0, f"{type(e).__name__}: {e}"
+        logger.info("WEG2 PARK-HANDBACK rid=%s abort_on_d=%s %s -> P's batch", rid, code,
+                    str(body)[:120])
+        p.seat = None
+        self._to_p_batch(p, "park_handback")
+        p.d_eligible = False
+        self.queue.append(p)
+        self._dp_mark(p, "reroute")  # R28
+        self._kick_controller("arrival")
+        try:
+            await p.fut
+        except Weg2Stop as e:
+            return web.json_response({"error": str(e)}, status=503)
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
+        self._mark_posted(p)
+        return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
+
     def _to_p_batch(self, p: "Pending", where: str) -> None:
         """P-BATCH-ALL: ``p`` gets a normal leg 1 on P (no D prefill)."""
         was = ("short_kept" if getattr(p, "short_kept", False)
                else "d_direct" if getattr(p, "d_direct", False) else "queued")
-        if getattr(p, "short_kept", False):
-            p.skip_leg1 = False
+        p.skip_leg1 = False
         p.short_kept = False
         p.d_direct = False
         p.leg1_done = False
@@ -7699,39 +7809,8 @@ class Front:
                  "x_tokens": self.tp_prefill_max_tokens,
                  "carrier_est": carrier_est,
                  "carrier_max": self.carrier_max_tokens})
-        if route == "carrier_single":
-            self.counters["route_carrier_exceeds"] += 1
-            logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill carrier_est=%d (%s) > carrier_max=%d "
-                           "est_prompt=%d exact=%s "
-                           "(group D host staging pool bound: the store cannot be read into D for a prompt this long; "
-                           "ONE prefill on D, no leg 1, no double prefill; uncached=%d vs X=%d, checked #1290)",
-                           rid, carrier_est,
-                           "exact" if exact is not None else "ESTIMATE from chars, never terminal",
-                           self.carrier_max_tokens, est_prompt, exact,
-                           remainder, self.tp_prefill_max_tokens)
-            if self.awake == "D" and self.admit_d and self.state == "serving":
-                seat = await self._acquire_short_seat(rid, carrier_est)
-                if seat is not None:
-                    self._log_admit(rid, source="short", t_arrive=time.time())
-                    self._arm_client_watch(request, rid)  # H102
-                    return await self.leg2(request, rid, payload, text, stream, pending=None,
-                                           single_prefill=True, seat=seat)
-            fut = asyncio.get_event_loop().create_future()
-            p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
-                        est_uncached=remainder, span_known=known,
-                        skip_leg1=True, store_span_est=store_span)
-            self.queue.append(p)
-            self._dp_mark(p, "carrier")  # R28
-            self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
-            self._arm_client_watch(request, rid, p)  # H102
-            try:
-                await fut
-            except Weg2Stop as e:
-                return web.json_response({"error": str(e)}, status=503)
-            except Exception as e:  # noqa: BLE001
-                return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
-            self._mark_posted(p)
-            return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
+        # CARRIER-EXCEEDS (one prefill on D, no leg 1) is deleted -- law 02.10.:
+        # P's KV stages cover D's max session; serviceable_route never names it.
         short_ok = route == "short"
         # L10 (C9): the front's X verdict, LABELLED as the estimate it is --
         # price_remainder is len(text)/3.0 minus an LRU prefix guess, with no
@@ -9411,6 +9490,10 @@ class Front:
                    pending: Optional[Pending], single_prefill: bool = False,
                    seat: Optional[Seat] = None) -> web.StreamResponse:
         g = self.groups["D"]
+        # PARK-HANDBACK: a leg whose prefill D would run (no P leg 1); a park
+        # hands it back to P while D holds it unstarted (finally drops it)
+        if (pending is None or getattr(pending, "d_direct", False)) and not single_prefill:
+            self.__dict__.setdefault("_d_prefill_legs", {})[rid] = time.time()
         if (envs.SGLANG_WEG2_ENABLE_CLIENT_GONE_ABORT.get() and client_gone(request)
                 and not response_complete(request)):
             # H102 (#58): the client left before its leg 2 was posted (a SHORT
@@ -9579,6 +9662,12 @@ class Front:
                         first_chunk, _refused = None, False
                     finally:
                         _ros_rec = self._ros_lookahead_end(rid) if _ros_stop is not None else None
+                    if _ros_rec is not None and _ros_rec.get("reason") == PARK_HANDBACK_REASON:
+                        # PARK-HANDBACK: D held this unstarted prefill at a park;
+                        # closing this leg aborts D's hold, P's batch takes it
+                        g.outstanding.pop(rid, None)
+                        return await self._requeue_park_handback(
+                            request, rid, payload, text, stream, pending, seat)
                     if _ros_rec is not None:
                         # held while uncommitted (also when the lookahead ended
                         # in the same tick): the refusal D would have sent.
@@ -10068,6 +10157,7 @@ class Front:
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         finally:
             g.outstanding.pop(rid, None)
+            (self.__dict__.get("_d_prefill_legs") or {}).pop(rid, None)  # PARK-HANDBACK
             self._d_inflight_end(rid)  # X-CREDIT-INFLIGHT-1002
             Front._req_book(self).leg2_end(rid, time.time())  # DASHBOARD-IPC: front.d_activity
             Front._rb_changed(self)
@@ -12953,12 +13043,10 @@ class Front:
                     self.p_pool_tokens,
                     min(self.p_concurrency + _ahead, self.p_phase_max_requests or (self.p_concurrency + _ahead)))
                 async def one(p: Pending) -> Pending:
-                    if getattr(p, "short_kept", False):
-                        # P-BATCH-ALL: P is awake -- a kept SHORT is prefilled here
+                    if getattr(p, "short_kept", False) or p.skip_leg1:
+                        # P-BATCH-ALL: P is awake -- every prefill is P's (a
+                        # kept SHORT; no CARRIER-EXCEEDS skip any more, law 02.10.)
                         self._to_p_batch(p, "drain")
-                    if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
-                        p.leg1_done = True
-                        return p
                     async with sem:
                         if p.client_gone:  # H102: its client left while it waited for a P slot
                             return p

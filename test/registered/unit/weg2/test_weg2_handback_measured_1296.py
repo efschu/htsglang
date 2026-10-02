@@ -461,13 +461,13 @@ def test_mutant_arm_d_a_carrier_exceeds_arrival_never_ran_a_leg_one():
                                    idle_layout="D") as h:
             h.d.refuse_real_for["ce"] = 9
             status, text = await asyncio.wait_for(h.post("ce", chars=BODY_CHARS), 30.0)
-            assert status == 503, (status, text[:400])
-            assert "W35 Weg2XReQueueLoop" in text, text[:400]
-            assert h.front.counters["route_carrier_exceeds"] == 1
+            # Law 02.10. (P's KV stages cover D's max session): the
+            # CARRIER-EXCEEDS route is deleted -- the arrival takes P's leg 1;
+            # over this harness's tiny carrier the refusal is the named W52.
+            assert h.front.counters["route_carrier_exceeds"] == 0
+            assert h.p.gen_marks.count("ce") >= 1, ("P ran its leg 1", h.p.gen_marks)
+            assert status in (413, 503), (status, text[:400])
             assert h.front.counters.get("W53_Weg2StoreHandbackFailed", 0) == 0
-            assert h.front.counters["W35_Weg2XReQueueLoop"] == 1
-            assert h.p.gen_marks.count("ce") == 0, (
-                "CARRIER-EXCEEDS runs no leg 1 at all", h.p.gen_marks)
 
     asyncio.run(body())
 
@@ -480,7 +480,9 @@ def test_mutant_arm_d_served_on_the_re_offer_is_still_served():
         async with MeasuredHarness(p_cpt=SALAD_CPT, d_cpt=SALAD_CPT,
                                    awake="P", p_concurrency=2, d_bs=4,
                                    tp_prefill_max_tokens=5000,
-                                   carrier_max_tokens=1000,
+                                   # law 02.10.: the carrier holds D's session
+                                   # (P-COVERS-D-SESSION); below it W52 refuses
+                                   carrier_max_tokens=10 ** 6,
                                    flip_min_work_tokens=1,
                                    idle_layout="D") as h:
             h.d.refuse_real_for["cf"] = 1

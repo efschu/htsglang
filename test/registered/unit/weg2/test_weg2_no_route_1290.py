@@ -113,11 +113,12 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
                               SB5F_CARRIER_MAX),
             "short")
 
-    def test_over_carrier_but_within_x_is_still_a_d_single_prefill(self):
-        """The route CARRIER-EXCEEDS was built for, and it stays."""
+    def test_over_carrier_but_within_x_takes_the_p_route(self):
+        """Law 02.10. (P's KV stages cover D's max session): the
+        CARRIER-EXCEEDS D single prefill is deleted -- P serves it."""
         self.assertEqual(
             serviceable_route(9000, SB5F_CARRIER_EST, SB5F_X, SB5F_CARRIER_MAX),
-            "carrier_single")
+            "long")
 
     def test_a_terminal_refusal_may_not_rest_on_an_estimate(self):
         """ROUND 2. `carrier_est` is `len(text)/CARRIER_CHARS_PER_TOKEN`
@@ -176,7 +177,7 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
         self.assertEqual(serviceable_route(100, SB5F_CARRIER_MAX, SB5F_X,
                                            SB5F_CARRIER_MAX), "short")
         self.assertEqual(serviceable_route(100, SB5F_CARRIER_MAX + 1, SB5F_X,
-                                           SB5F_CARRIER_MAX), "carrier_single")
+                                           SB5F_CARRIER_MAX), "long")  # law 02.10.
 
 
 class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
@@ -246,17 +247,17 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         # interchangeable; it is one of them leaving the decision.
         #
         # The witness therefore moves to a point where BOTH bounds still
-        # decide: uncached 9,000 (under X, so D can prefill it) with a carrier
-        # estimate of 28,000 (over the bound). Correct -> `carrier_single`;
-        # swapped -> `long`. Still different, still for the original reason.
-        swapped = serviceable_route(SB5F_CARRIER_EST, 9000,
+        # decide: uncached 9,000 (under X) with a carrier estimate of 20,000
+        # (under the bound). Correct -> `short`; swapped (20,000 uncached over
+        # X) -> `long`. (Law 02.10. deleted `carrier_single`, the old witness.)
+        swapped = serviceable_route(20000, 9000,
                                     SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True)
-        correct = serviceable_route(9000, SB5F_CARRIER_EST,
+        correct = serviceable_route(9000, 20000,
                                     SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True)
         self.assertNotEqual(swapped, correct,
                             "if the bases were interchangeable this ticket "
                             "would not exist -- they are not")
-        self.assertEqual(correct, "carrier_single")
+        self.assertEqual(correct, "short")
         self.assertEqual(swapped, "long")
         # and at the sb5f point the carrier has left the decision, which is
         # asserted so a future reader does not read the moved witness as a
@@ -347,8 +348,10 @@ class TheRefusalIsTerminalNamedAndFourXX(CustomTestCase):
     def test_the_refusal_is_taken_before_any_route_branch(self):
         """Terminal AT ADMISSION: nothing may be queued or seated first."""
         src = inspect.getsource(Front.handle_generate)
+        self.assertNotIn('route == "carrier_single":', src,
+                         "law 02.10.: the CARRIER-EXCEEDS branch is deleted")
         self.assertLess(
-            src.find('route == "none"'), src.find('route == "carrier_single"'),
+            src.find('route == "none"'), src.find('short_ok = route == "short"'),
             "the no-route refusal must precede every routing branch")
         self.assertLess(
             src.find('route == "none"'), src.find("self.queue.append"),

@@ -109,9 +109,10 @@ class Wiring(unittest.TestCase):
 
     def test_p_drain_gives_a_kept_short_its_leg1(self):
         # P-BATCH-ALL (02.10.): P is awake -- a kept SHORT is prefilled on P;
-        # only CARRIER-EXCEEDS still skips leg 1
+        # law 02.10.: CARRIER-EXCEEDS is deleted -- no skip of leg 1 in a P drain at all
         a = self.src.index('self._to_p_batch(p, "drain")')
-        self.assertLess(a, self.src.index("if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once"))
+        self.assertNotIn("if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once", self.src)
+        self.assertGreater(a, 0)
 
 
 if __name__ == "__main__":

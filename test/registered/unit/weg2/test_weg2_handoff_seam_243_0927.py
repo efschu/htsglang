@@ -109,8 +109,22 @@ class Check(unittest.TestCase):
         self.assertEqual((f.marks, f.kicks, f.counters["handoff_lost_reroutes"]),
                          ([("weg2-12-39", "reroute")], ["arrival"], 1))
 
-    def test_lost_under_x_stays_for_d_and_is_named_once(self):
+    def test_first_loss_under_x_goes_to_ps_batch_not_a_d_prefill(self):
+        # P-BATCH-ALL (user 02.10.): a lost hand-off is an error case -- its
+        # prefill goes back to P's batch whatever its size
         f, p = _front(), _p()
+        with _Fake({"weg2-12-39": LOST_UNDER}) as fk, self.assertLogs(F.logger, level="WARNING") as cap:
+            self.assertTrue(f._hl_check(p, "sweep"))
+        self.assertEqual(fk.drops, [("weg2-12-39", "reroute_fresh")])
+        self.assertEqual((list(f.queue), p.leg1_done, p.d_direct, p.handoff_lost_reroutes,
+                          p.est_uncached), ([p], False, False, 1, 6202))
+        self.assertIn("WEG2 HANDOFF-LOST-REROUTE rid=weg2-12-39 first_lost_page=1100 credit=70400 "
+                      "path=fresh-P (uncached=6202 <= X=12288", cap.output[0])
+        self.assertFalse(any("HANDOFF-LOST-KEPT" in line for line in cap.output))
+
+    def test_second_loss_under_x_is_kept_and_named_once(self):
+        f, p = _front(), _p()
+        p.handoff_lost_reroutes = 1
         with _Fake({"weg2-12-39": LOST_UNDER}) as fk, self.assertLogs(F.logger, level="WARNING") as cap:
             self.assertFalse(f._hl_check(p, "sweep"))
             self.assertFalse(f._hl_check(p, "admit"))
