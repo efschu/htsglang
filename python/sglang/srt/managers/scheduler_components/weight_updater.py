@@ -8974,6 +8974,14 @@ class SchedulerWeightUpdaterManager:
         # state the first attempt left it, and refusing there would turn a safe
         # no-op into a group death.
         self._weg2_raise_pending_seam_refusal()  # #1450
+        # DP-NACHLAUF: the last decode rounds reach the log before the sleep,
+        # not after the next wake (DecodeRoundLog.drain_blocking; log only)
+        try:
+            _drl = getattr(getattr(self.scheduler, "metrics_reporter", None), "decode_round_log", None)
+            if _drl is not None:
+                _drl.drain_blocking()
+        except Exception:  # noqa: BLE001 -- a log drain never breaks the sleep
+            pass
         replay = self._weg2_leg_replay("release", recv_req)
         _weg2_ph_t = [time.perf_counter()]
         _weg2_ph_l = []
