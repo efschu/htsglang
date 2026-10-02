@@ -124,7 +124,7 @@ def _card_key(name: str, total_mib: Optional[int] = None, cc=None) -> str:
         return card_key({"name": name, "total_mib": int(total_mib), "cc": cc})
     total = f"{int(total_mib)}MiB" if total_mib else "?MiB"
     sm = f"sm{int(cc[0])}{int(cc[1])}" if cc is not None else "sm?"
-    return f"{model_name(name)}/{total}/{sm}"
+    return f"{model_name(name).replace(' ', '')}/{total}/{sm}"
 
 
 @dataclasses.dataclass(frozen=True)

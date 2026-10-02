@@ -217,9 +217,9 @@ class TestUncalibratedCatalogueMiss(CustomTestCase):
         msg = str(cm.exception)
         self.assertIsInstance(cm.exception, KeyError)
         self.assertIn("UNCALIBRATED", msg)
-        self.assertIn("RTX PRO 6000 Blackwell/?MiB/sm?", msg)
+        self.assertIn("RTXPRO6000Blackwell/?MiB/sm?", msg)
         self.assertIn("python -m sglang.srt.planner.card_rate_pass --run", msg)
-        self.assertEqual(cm.exception.card_key, "RTX PRO 6000 Blackwell/?MiB/sm?")
+        self.assertEqual(cm.exception.card_key, "RTXPRO6000Blackwell/?MiB/sm?")
 
     def test_resolve_names_the_measured_total(self):
         lib = cl.CardLibrary()
@@ -248,7 +248,7 @@ class TestPowerLimitRatesOnForeignCards(CustomTestCase):
         )
         self.assertIn("keine Raten fuer", line)
         self.assertIn("HW-UNCALIBRATED", line)
-        self.assertIn("RTX 3090/24576MiB/sm86", line)
+        self.assertIn("RTX3090/24576MiB/sm86", line)
         self.assertNotIn("empfohlen", line)
 
     def test_the_reference_cards_get_no_uncalibrated_note(self):

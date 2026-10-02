@@ -1,0 +1,168 @@
+{
+ "attn_anchor_stage": 1,
+ "cvd": "GPU-31d7ef41,GPU-5c648f96,GPU-62dbbae1",
+ "dc_expect_mib": [
+  1848,
+  1442,
+  1442
+ ],
+ "dc_measured_d_mib": {
+  "exchange": [
+   3084,
+   2588,
+   2588
+  ],
+  "serving": [
+   2228,
+   1922,
+   1922
+  ]
+ },
+ "nextflash": {
+  "budget_charges_driver_carve": true,
+  "budget_lines": [
+   "budget D group=D ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 28368 MiB = total 32607 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 1320 - served_dormant_growth 482 (WEG2-DORMANT-SERVED record) - driver_carve 518 (NVML reserved) - measured_awake_overshoot 489 (boot weg2ls4b1) MiB",
+   "budget D group=D ordinal=1 nvml_idx=0 NVIDIA GeForce RTX 3080: 17336 MiB = total 20480 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 712 - served_dormant_growth 572 (WEG2-DORMANT-SERVED record) - driver_carve 425 (NVML reserved) MiB",
+   "budget D group=D ordinal=2 nvml_idx=2 NVIDIA GeForce RTX 3080: 17544 MiB = total 20480 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 696 - served_dormant_growth 384 (WEG2-DORMANT-SERVED record) - driver_carve 425 (NVML reserved) MiB"
+  ],
+  "budgets_d": [
+   28368,
+   17336,
+   17544
+  ],
+  "d_awake_rest": [
+   [
+    2672,
+    null,
+    null
+   ],
+   "boot dkrnfh91bar1dauer09262249,dkrnfh91bar1dauer09262302,dkrnfh91bar1dauer09270007,dkrnfh91bar1dauer09270103,dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2arrwretadhmlefrwfpfopwhctsesrwtswbar1dauer09301740"
+  ],
+  "driver_carve_min_total_mib": 0,
+  "l15_posts": [
+   [
+    0,
+    0,
+    "OVERRIDE-UNNAMED",
+    0
+   ],
+   [
+    1,
+    7616,
+    "OVERRIDE",
+    0
+   ],
+   [
+    2,
+    1792,
+    "OVERRIDE",
+    0
+   ]
+  ],
+  "pp_cut_stage_model_auto": [
+   false,
+   "-"
+  ]
+ },
+ "order_nvml": [
+  1,
+  0,
+  2
+ ],
+ "order_uuid": [
+  "GPU-31d7ef41",
+  "GPU-5c648f96",
+  "GPU-62dbbae1"
+ ],
+ "p_chunk_model_power_limits": [
+  [
+   400.0,
+   230.0,
+   230.0
+  ],
+  "builtin rig limits (nvidia-smi power.limit 24.09. 18:55Z and 26.09. (row 27): 5090 400 W, 3080 230 W; boots in between did not record the limit (weg2/power_limit.RIG_POWER_LIMIT_W_0924))"
+ ],
+ "p_stage_card_classes": [
+  "RTX5090",
+  "RTX3080",
+  "RTX3080"
+ ],
+ "planner_match_calibration": {
+  "None": null,
+  "awq": {
+   "label": "awq (MATRIX_PLAN 3.3, 886080 ctx)",
+   "reserve": "1500",
+   "tokvec": [
+    31,
+    15,
+    18
+   ]
+  },
+  "fp8": {
+   "label": "fp8 (MATRIX_PLAN 3.3, battery-stable to 530944 ctx)",
+   "reserve": "3000,2200,2200",
+   "tokvec": [
+    33,
+    13,
+    18
+   ]
+  }
+ },
+ "planner_rig_has_sm86": true,
+ "qwen27b": {
+  "budget_charges_driver_carve": true,
+  "budget_lines": [
+   "budget D group=D ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 28848 MiB = total 32607 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 1320 - driver_carve 518 (NVML reserved) - measured_awake_overshoot 489 (boot weg2ls4b1) MiB",
+   "budget D group=D ordinal=1 nvml_idx=0 NVIDIA GeForce RTX 3080: 18336 MiB = total 20480 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 712 MiB",
+   "budget D group=D ordinal=2 nvml_idx=2 NVIDIA GeForce RTX 3080: 18352 MiB = total 20480 - corridor 1428 (floor 1024 source=UNMEASURED-FALLBACK reserve=0 + awake_overshoot 404) - dormant_other 696 MiB"
+  ],
+  "budgets_d": [
+   28848,
+   18336,
+   18352
+  ],
+  "d_awake_rest": [
+   null,
+   ""
+  ],
+  "driver_carve_min_total_mib": 32000,
+  "l15_posts": [
+   [
+    0,
+    0,
+    "OVERRIDE-UNNAMED",
+    0
+   ],
+   [
+    1,
+    7616,
+    "OVERRIDE",
+    0
+   ],
+   [
+    2,
+    1792,
+    "OVERRIDE",
+    0
+   ]
+  ],
+  "pp_cut_stage_model_auto": [
+   true,
+   "27b_int8_rc12z30.json (rank-line fit (p_stage_model.fit_model_from_logs, prefix = #1469 RETAIN token_ids_len - #new-token) of boot_weg2_dkr27browauthoritybar1w109290020_bb82fbcb68_092)"
+  ]
+ },
+ "xchg_dormant_for_card": [
+  [
+   2228,
+   "CONSTANT launcher.DC_MEASURED_D_5090_MIB = 2228 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed WEG2-DC reading"
+  ],
+  [
+   1922,
+   "CONSTANT launcher.DC_MEASURED_D_3080_MIB = 1922 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed WEG2-DC reading"
+  ],
+  [
+   1922,
+   "CONSTANT launcher.DC_MEASURED_D_3080_MIB = 1922 MiB, MEASURED on boot weg2ls1b2 (NVML per-process at group D's first sleep, NEXTN draft + TP decode graphs resident); boot stem logged no uuid-keyed WEG2-DC reading"
+  ]
+ ]
+}
