@@ -830,6 +830,49 @@ def _weg2_reset_census_defer_s() -> float:
         return 5.0
 
 
+#: ORPHAN-OWN (02.10., N6d: WEG2-TREE-RESET-SUB orphans=7-9 ms on PP0, 12.2 on
+#: PP1/PP2): the #1424g give-back computed held - named over EVERY slot of the
+#: arena (zeros + clone + subtract + clamp + nonzero over 720896 slots per pool)
+#: although only the slots this process holds a reference on can be orphans. It
+#: now reads those slots once (nonzero of the ledger), counts the holders' names
+#: on them only, and returns at once when this process holds nothing. Same
+#: answer (orphan = max(held - named, 0) is 0 wherever held is 0).
+#: 0 = the dense form, as before.
+WEG2_ORPHAN_OWN_ENV = "SGLANG_WEG2_ORPHAN_OWN_SLOTS"
+
+
+def _weg2_orphan_own_on() -> bool:
+    return str(os.environ.get(WEG2_ORPHAN_OWN_ENV, "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+class _Weg2NamedSlots:
+    """ORPHAN-OWN: stands where the dense ``named`` tensor stands for
+    ``_weg2_name_holders`` -- collects the named slots instead of adding
+    them into a tensor the size of the arena."""
+
+    def __init__(self, n: int):
+        self.n = int(n)
+        self.parts: list = []
+
+    def numel(self) -> int:
+        return self.n
+
+    def index_add_(self, dim, index, source) -> "_Weg2NamedSlots":
+        self.parts.append(index.reshape(-1).to(torch.int64))
+        return self
+
+    def counts_at(self, own: "torch.Tensor") -> "torch.Tensor":
+        """Names per slot of ``own`` (sorted ascending, as nonzero returns it)."""
+        k = int(own.numel())
+        if not self.parts or k == 0:
+            return torch.zeros(k, dtype=torch.int64)
+        cat = torch.cat(self.parts)
+        pos = torch.searchsorted(own, cat).clamp(max=k - 1)
+        hit = own[pos] == cat
+        return torch.bincount(pos[hit], minlength=k).to(torch.int64)
+
+
 def _weg2_carrier_hold_on() -> bool:
     """H81: does the flip's reset hold the phase's END anchors (see
     `UnifiedRadixCache._weg2_carrier_rotate`)? Group P of a weg2 boot, only
@@ -1899,16 +1942,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             led = getattr(arena, "_ledger", None)
             if led is None:
                 continue
-            named = torch.zeros(int(led.held.numel()), dtype=torch.int64)
-            for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
-                tree._weg2_name_holders(arena, named)
-            with led.lock:
-                held = led.held.to(torch.int64).clone()
-            orphan = (held - named).clamp_min(0)
-            slots = torch.nonzero(orphan).reshape(-1)
-            if slots.numel() == 0:
-                continue
-            multi = torch.repeat_interleave(slots, orphan[slots])
+            if _weg2_orphan_own_on():
+                # ORPHAN-OWN: only the slots this process references can be orphans
+                with led.lock:
+                    if not bool(led.held.any()):
+                        continue
+                named_s = _Weg2NamedSlots(int(led.held.numel()))
+                for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
+                    tree._weg2_name_holders(arena, named_s)
+                with led.lock:
+                    own = torch.nonzero(led.held).reshape(-1)
+                    held_own = led.held[own].to(torch.int64)
+                orphan_own = (held_own - named_s.counts_at(own)).clamp_min(0)
+                hit = orphan_own > 0
+                slots = own[hit]
+                if slots.numel() == 0:
+                    continue
+                multi = torch.repeat_interleave(slots, orphan_own[hit])
+            else:
+                named = torch.zeros(int(led.held.numel()), dtype=torch.int64)
+                for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
+                    tree._weg2_name_holders(arena, named)
+                with led.lock:
+                    held = led.held.to(torch.int64).clone()
+                orphan = (held - named).clamp_min(0)
+                slots = torch.nonzero(orphan).reshape(-1)
+                if slots.numel() == 0:
+                    continue
+                multi = torch.repeat_interleave(slots, orphan[slots])
             given = int(arena.ref_slots_np(multi.numpy(), -1))
             done[ct] = int(done.get(ct, 0)) + given
             total += given
