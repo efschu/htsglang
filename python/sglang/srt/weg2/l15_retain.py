@@ -41,6 +41,8 @@ there (memory rules: raenge-nie-uneins, no silent half states).
 
 from __future__ import annotations
 
+import dataclasses
+
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -82,32 +84,31 @@ def reserve_slots(allocator, slots: Sequence[int]) -> int:
     free (busy, or the padded slot 0, or requested twice) is a ValueError --
     reserving around it would double-book memory against the hold.
     """
-    wanted = [int(s) for s in slots]
-    if not wanted:
+    # L15-FLIPCOST (N4a: retain step "alloc" 284-319 ms): vectorised -- the
+    # old form built a Python set over every free page (~1M) per sleep.
+    free = allocator.free_pages
+    want = (slots if torch.is_tensor(slots)
+            else torch.as_tensor(list(slots), dtype=torch.int64)).to(free.dtype).reshape(-1)
+    if want.numel() == 0:
         return 0
-    # Counter keeps the dupe scan linear: a real hold is tens of thousands of
-    # slots and this runs inside D's sleep, where wanted.count(s) per distinct
-    # slot would be O(n^2) (~4e9 ops for a single 64k-token request).
-    counts = Counter(wanted)
-    dupes = sorted(s for s, c in counts.items() if c > 1)
-    if dupes:
+    uniq, counts = torch.unique(want, return_counts=True)
+    if bool((counts > 1).any()):
+        dupes = sorted(int(x) for x in uniq[counts > 1].tolist())
         raise ValueError(
             f"reserve_slots: slot(s) {dupes} requested twice; a slot can be "
             "reserved once"
         )
-    distinct = sorted(counts)
-    free = allocator.free_pages
-    free_set = set(int(x) for x in free.tolist())
-    missing = [s for s in distinct if s not in free_set]
-    if missing:
+    uniq_d = uniq.to(free.device)
+    present = torch.isin(uniq_d, free)
+    if not bool(present.all()):
+        missing = sorted(int(x) for x in uniq_d[~present].tolist())
         raise ValueError(
             f"reserve_slots: slot(s) {missing} are not free "
-            f"(free_pages holds {len(free_set)} entries, {len(distinct)} "
+            f"(free_pages holds {int(free.numel())} entries, {int(uniq.numel())} "
             "requested)"
         )
-    take = torch.tensor(distinct, dtype=free.dtype, device=free.device)
-    allocator.free_pages = free[~torch.isin(free, take)]
-    return len(distinct)
+    allocator.free_pages = free[~torch.isin(free, uniq_d)]
+    return int(uniq.numel())
 
 
 def reserve_mamba_slots(mamba_allocator, slots: Sequence[int]) -> int:
@@ -143,6 +144,14 @@ def reserve_mamba_slots(mamba_allocator, slots: Sequence[int]) -> int:
         )
     take = torch.tensor(distinct, dtype=torch.int64, device=free.device)
     mamba_allocator.free_slots = free[~torch.isin(free, take)]
+    # L15-MAMBA-LEDGER: the #924 ownership ledger must see the reserved
+    # slots as USED. Carving them out of free_slots alone left slot_used
+    # False, so the first legitimate release of a held/adopted anchor (node
+    # eviction, request finish) was refused as a double free
+    # (MambaSlotDoubleFree raises -> rank death).
+    used = getattr(mamba_allocator, "slot_used", None)
+    if used is not None:
+        used[take.to(used.device)] = True
     return len(distinct)
 
 
@@ -272,6 +281,17 @@ def retain_at_sleep(
     # step 1, and step 8 would then KeyError AFTER the buffers already moved --
     # a half state that must re-raise, not masquerade as a benign skip.
     candidates = list(candidates)
+    # L15-FLIPCOST: per-step wall clock, printed on the L15-RETAIN line
+    import time as _time
+    _t = [_time.perf_counter()]
+    _ms: list = []
+
+    def _lap(name: str) -> None:
+        now = _time.perf_counter()
+        _ms.append("%s:%.0f" % (name, (now - _t[0]) * 1000.0))
+        _t[0] = now
+
+    _t0 = _t[0]
 
     # (1) who stays
     try:
@@ -286,6 +306,37 @@ def retain_at_sleep(
             prefix,
             reserved=PAD_SLOTS,
         )
+        # L15-FIX-KEEP-OVER-CAP (N3y 08:41:52Z TP2: keep-arm FAILED
+        # not-split-or-outside-hold with keep_rows 68820 > cap 57344): the
+        # compacted keep capacity is a WHOLE number of blocks on every rank
+        # (rows = blocks * ratio_r, L_H driven by the rank with the largest
+        # need/ratio), so a set select_hold admitted by summed rows can still
+        # overrun a capped rank's hold region. Drop the lowest-priority held
+        # request until every capped rank's keep fits its cap.
+        trimmed = []
+        while hs.rids and any(
+                int(caps_rows_by_rank[r]) > 0
+                and int(plan.rows_by_rank[r]) > int(caps_rows_by_rank[r])
+                for r in range(len(plan.rows_by_rank))):
+            trimmed.append(hs.rids[-1])
+            keep_rids = hs.rids[:-1]
+            _rows = {c.rid: c.rows_by_rank for c in candidates}
+            hs = dataclasses.replace(
+                hs, rids=keep_rids, anchors=len(keep_rids),
+                rows_by_rank=tuple(
+                    sum(int(_rows[x][r]) for x in keep_rids)
+                    for r in range(len(hs.rows_by_rank))),
+                excluded=tuple(hs.excluded) + ((trimmed[-1], "keep_over_cap"),))
+            if not keep_rids:
+                break
+            plan = compact_plan({rid: slots_of(rid) for rid in hs.rids},
+                                prefix, reserved=PAD_SLOTS)
+        if trimmed:
+            log(f"L15-RETAIN trimmed n={len(trimmed)} rids={trimmed} "
+                f"(compacted keep rows over a capped rank's hold region)")
+        if not hs.rids:
+            log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold (all trimmed)")
+            return None
         a_h, anchor_moves = anchor_plan(
             {rid: anchor_slot_of(rid) for rid in hs.rids},
             reserved=PAD_SLOTS,
@@ -300,11 +351,13 @@ def retain_at_sleep(
         for rid in hs.rids
     }
 
+    _lap("plan")
     # (3) rows land in the compact buffers: kv rows of THIS rank, every rank
     # applies the anchor moves (mamba slots are not owner-sharded)
     apply_moves(kv_buffers, plan.moves, _owner_rows(prefix, rank))
     apply_moves(mamba_buffers, anchor_moves, lambda slot: int(slot))
 
+    _lap("moves")
     # (4) the tree nodes follow the plan. The injected rewrite_tree remaps
     # the REAL UnifiedTreeNode component values (L15-11d): the old code
     # wrote kv_slots/anchor_slot attributes that only the unit-test fakes
@@ -338,6 +391,7 @@ def retain_at_sleep(
     # hook passes no callable, no reference is taken (byte-identical). The
     # slot list is the bind-time l2_of/anchor_l2_of snapshot -- the same
     # values step (8) publishes into the manifest.
+    _lap("rewrite")
     if hold_l2_refs is not None:
         kv_l2: list = []
         anchor_l2: list = []
@@ -346,18 +400,22 @@ def retain_at_sleep(
             anchor_l2.append(int(anchor_l2_of(rid)[0]))
         hold_l2_refs(kv_l2, anchor_l2)
 
+    _lap("hostlock")
     # (5) partial tree reset over exactly the kept nodes
     reset_keep(nodes)
+    _lap("reset")
 
     # (6) re-arm the allocator, then take back the held prefix slots; the
     # padding slot is never free after clear() and is not a held slot, so it
     # never goes to reserve_slots. A given mamba_allocator is re-armed the
     # same way for the held anchors' compacted slots.
     allocator.clear()
-    new_all = sorted(
-        {int(s) for rid in hs.rids for s in plan.new_slots[rid]}
-        - set(PAD_SLOTS)
-    )
+    import numpy as _np
+
+    _cat = _np.concatenate([_np.asarray(plan.new_slots[rid], dtype=_np.int64)
+                            for rid in hs.rids]) if hs.rids else _np.zeros(0, _np.int64)
+    _u = _np.unique(_cat)
+    new_all = _u[~_np.isin(_u, _np.asarray(sorted(PAD_SLOTS), dtype=_np.int64))].tolist()
     reserve_slots(allocator, new_all)
     if mamba_allocator is not None:
         mamba_allocator.clear()
@@ -365,6 +423,7 @@ def retain_at_sleep(
             mamba_allocator, sorted({int(a) for a in new_anchors.values()})
         )
 
+    _lap("alloc")
     # (7) keep windows: kv rows [0, rows_by_rank[rank]), mamba rows [0, A_H).
     # L15-FIX-CAP0-KEEP (N3l 02:29:56Z: TP0 kept 555 MB with cap 0): a rank
     # whose cap is 0 (the 5090 / TP0) is "not held here" -- select_hold does
@@ -380,6 +439,7 @@ def retain_at_sleep(
     for buf in mamba_buffers:
         set_keep(buf, mamba_range)
 
+    _lap("keep")
     # (8) publish the hold for the group agreement
     cand_depth = {c.rid: int(c.kv_depth) for c in candidates}
     spans = tuple(
@@ -409,6 +469,7 @@ def retain_at_sleep(
 
     # (9) the one line
     fp = fingerprint(manifest)
+    _lap("manifest")
     rows_fmt = ",".join(str(x) for x in manifest.rows_by_rank)
     # keep_rows_by_rank: this is the manifest's per-rank KEEP capacity
     # (plan.rows_by_rank = blocks*ratio_r), not the admitted rows of the
@@ -416,7 +477,8 @@ def retain_at_sleep(
     log(
         f"L15-RETAIN epoch={epoch} n={len(hs.rids)} "
         f"keep_rows_by_rank={rows_fmt} "
-        f"l_h={plan.l_h} anchors={a_h} fp={fp}"
+        f"l_h={plan.l_h} anchors={a_h} fp={fp} "
+        f"ms={(_time.perf_counter() - _t0) * 1000.0:.0f} steps={','.join(_ms)}"
     )
     return RetainResult(
         hold=hs, plan=plan, a_h=a_h, manifest=manifest, keep_nodes=nodes

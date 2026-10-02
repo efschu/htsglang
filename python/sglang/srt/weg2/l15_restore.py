@@ -315,3 +315,42 @@ def refusal_message(gc: GroupCheck, epoch: int) -> str:
     return "L15-CHECK REFUSED epoch=%d bad_ranks=%s" % (
         epoch, ",".join(str(i) for i in gc.bad_ranks),
     )
+
+
+def owned_held_rows(m: Manifest, rank: int, prefix: Sequence[int]) -> int:
+    """Distinct held slots of ``m`` this rank owns (shared prefixes once)."""
+    s = int(prefix[-1])
+    lo, hi = int(prefix[rank]), int(prefix[rank + 1])
+    seen = set()
+    for sp in m.spans:
+        for slot in sp.slots:
+            if lo <= int(slot) % s < hi:
+                seen.add(int(slot))
+    return len(seen)
+
+
+def hostbytes_line(m: Optional[Manifest], rank: int, prefix: Sequence[int],
+                   cap_rows: int, cell_bytes: int, anchor_bytes: int,
+                   verdict: str, epoch: int, parked: bool = False) -> str:
+    """L15-HOSTBYTES (user law 02.10.: with L15 the flip must move FEWER host
+    bytes): per rank and wake, the bytes that did NOT cross the host because
+    they stayed on the card (h2d_saved: KV rows + anchor shares of a capped
+    rank on verdict hold), the bytes still loaded from L2 (h2d_refill: the
+    cap-0 rank's owned held rows), and d2h_saved (the sleep's write-through
+    of held rows -- still issued today, so 0)."""
+    rows = owned_held_rows(m, rank, prefix) if m is not None else 0
+    anchors = len({int(sp.anchor_slot) for sp in m.spans}) if m is not None else 0
+    kv = rows * int(cell_bytes)
+    an = anchors * int(anchor_bytes)
+    keep = verdict == "hold"
+    if int(cap_rows) > 0:
+        saved, refill = (kv + an if keep else 0), 0
+    elif parked:
+        # L15-16: the cap-0 rank's KV came back card to card, anchors from L2
+        saved, refill = (kv if keep else 0), (an if keep else 0)
+    else:
+        saved, refill = 0, (kv + an if keep else 0)
+    return ("L15-HOSTBYTES flip=%d rank=%d verdict=%s rows=%d anchors=%d "
+            "h2d_saved=%d h2d_refill=%d d2h_saved=0 parked=%d"
+            % (int(epoch), int(rank), verdict, rows, anchors, saved, refill,
+               int(bool(parked))))

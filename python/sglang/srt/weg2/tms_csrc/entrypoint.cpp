@@ -181,6 +181,12 @@ int tms_export_extent(void* ptr, uint64_t offset, int* fd, uint64_t* size) {
     return TorchMemorySaver::instance().export_extent(ptr, offset, fd, size);
 }
 
+// L15-EXTENTS: the span extents of a base (offset, size), for the hold share
+// and the keep arm's check against the saver's truth.  Codes: core.h.
+int tms_list_extents(void* ptr, size_t cap, uint64_t* offs, uint64_t* sizes) {
+    return TorchMemorySaver::instance().list_extents(ptr, cap, offs, sizes);
+}
+
 int tms_alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, uint64_t* planned, int* active) {
     return TorchMemorySaver::instance().alloc_info(ptr, size, mapped, planned, active);
 }

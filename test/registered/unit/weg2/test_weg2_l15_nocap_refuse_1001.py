@@ -14,7 +14,7 @@ from sglang.srt.weg2.l15_plan import L15Post
 
 
 def _posts(*mibs):
-    return [L15Post(card=i, mib=m, src="X", experts_rows_traded=0)
+    return [L15Post(card=i, mib=m, src="X")
             for i, m in enumerate(mibs)]
 
 

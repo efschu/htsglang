@@ -267,10 +267,28 @@ def fingerprint(m: Manifest) -> int:
     """Signed int64 over the canonical serialization WITHOUT ``pid`` (the
     same content from two processes must agree). Stable under span order;
     changes when any slot, generation, depth or rows_by_rank changes."""
-    obj = json.loads(to_json(m))
-    obj.pop("pid", None)
-    payload = json.dumps(obj, sort_keys=True).encode()
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=True)
+    # L15-FLIPCOST (N4a: retain step "manifest" 170-182 ms, most of it this
+    # JSON round trip over ~1M ints): the same content, hashed as a small
+    # canonical JSON head plus every span's int lists as little-endian int64
+    # bytes, spans in rid order. Every rank runs this same code, so ranks
+    # still agree exactly when their records agree.
+    import numpy as np
+
+    h = hashlib.sha256()
+    head = {"epoch": int(m.epoch), "rows_by_rank": [int(x) for x in m.rows_by_rank],
+            "anchor_slots": int(m.anchor_slots), "n_spans": len(m.spans)}
+    h.update(json.dumps(head, sort_keys=True).encode())
+    for sp in sorted(m.spans, key=lambda x: x.rid):
+        h.update(json.dumps({"rid": sp.rid, "depth": int(sp.depth),
+                             "anchor_slot": int(sp.anchor_slot),
+                             "anchor_l2_slot": int(sp.anchor_l2_slot),
+                             "anchor_l2_gen": int(sp.anchor_l2_gen),
+                             "lens": [len(sp.slots), len(sp.l2_slots),
+                                      len(sp.l2_gens), len(sp.l2_lanes)]},
+                            sort_keys=True).encode())
+        for arr in (sp.slots, sp.l2_slots, sp.l2_gens, sp.l2_lanes):
+            h.update(np.asarray(arr, dtype="<i8").tobytes())
+    return int.from_bytes(h.digest()[:8], "big", signed=True)
 
 
 def agree(min_fp: int, max_fp: int) -> bool:

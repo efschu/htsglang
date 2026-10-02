@@ -23852,8 +23852,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # prices budget minus the measured P awake peak), so the first pass is
     # today's pass without l15 and the second pass is what ships.
     l15_posts = None
+    # L15-27B-ONLY (user correction 2026-10-02): no L1.5 on any other line
+    _not27b = l15_plan.refuse_not_27b(ns.profile, os.environ)
+    if _not27b is not None:
+        raise Weg2LaunchRefused(_not27b)
     if l15_plan.master_on(os.environ):
-        if ns.profile in (weg2_form.PROFILE_QWEN27B, weg2_form.PROFILE_NEXTFLASH):
+        if ns.profile == weg2_form.PROFILE_QWEN27B:
             l15_base = budgets_from_dc(
                 cards, dc_expect_d, log, "P",
                 overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),

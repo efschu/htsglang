@@ -491,31 +491,42 @@ def build_retain_kwargs(
         # The row_slot map (draft role) is not page-addressed: lane 0 at
         # P == 1 (the only lane), unknown (-1) at P > 1.
         _lane_of = {}
+        import numpy as _np
+
         for rid, rows in l2_rows:
+            if _row_slot is None:
+                # L15-FLIPCOST (N4a bind 330-370 ms): vectorised, same rule
+                _r = _np.asarray(rows, dtype=_np.int64)
+                _off = _r - _s
+                _stg = _r < _s
+                _per = _np.where(_stg, -1, _off // _p)
+                _ln = _np.where(_stg, -1, _off % _p)
+                _slot_of[rid] = _per.tolist()
+                _lane_of[rid] = _ln.tolist()
+                continue
             per = []
             lanes = []
             for r in rows:
                 if r < _s:
                     per.append(-1)
                     lanes.append(-1)
-                elif _row_slot is not None:
+                else:
                     per.append(int(_row_slot.get(r, -1)))
                     lanes.append(0 if _p == 1 else -1)
-                else:
-                    off = r - _s
-                    per.append(off // _p)
-                    lanes.append(off % _p)
             _slot_of[rid] = per
             _lane_of[rid] = lanes
-        uniq = sorted({s for per in _slot_of.values() for s in per if s >= 0})
+        _all = (_np.concatenate([_np.asarray(v, dtype=_np.int64) for v in _slot_of.values()])
+                if _slot_of else _np.zeros(0, dtype=_np.int64))
+        uniq = _np.unique(_all[_all >= 0]).tolist()
         gen_of = {}
         if uniq:
             for s, g in zip(uniq, _slot_gens_or_minus_one(pool, uniq, log, "kv")):
                 gen_of[int(s)] = int(g)
         for rid, per in _slot_of.items():
+            _g = gen_of.get
             l2_by_rid[rid] = (
                 tuple(per),
-                tuple(int(gen_of.get(s, -1)) for s in per),
+                tuple([_g(s, -1) for s in per]),
             )
             l2_lanes_by_rid[rid] = tuple(_lane_of[rid])
 
@@ -625,12 +636,16 @@ def _remap_slots(value, slot_map: Dict[int, int]):
     """
     if value is None or not torch.is_tensor(value) or value.numel() == 0:
         return value
-    out = torch.empty_like(value.flatten())
-    flat = value.flatten()
-    for i in range(flat.numel()):
-        old = int(flat[i])
-        out[i] = slot_map.get(old, old)
-    return out.reshape(value.shape)
+    # L15-FLIPCOST (N3y: D->P flip 7-12 s instead of 2.4 s): the old loop
+    # read and wrote ONE element per step -- on a CUDA value that is a
+    # device sync plus a kernel per token (~250k tokens per sleep, ~4 s on
+    # TP1 between L15-L2-ALIGN and L15-HOSTLOCK). One D2H, the dict map on
+    # host, one H2D.
+    vals = value.flatten().tolist()
+    get = slot_map.get
+    mapped = [get(v, v) for v in vals]
+    return torch.tensor(mapped, dtype=value.dtype,
+                        device=value.device).reshape(value.shape)
 
 
 def rewrite_tree_chain(
