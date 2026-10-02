@@ -211,6 +211,11 @@ def _unsupported_components(node) -> list:
 
 
 def chain_host_rows(node) -> Tuple[int, ...]:
+    """The host rows of the chain (see :func:`chain_host_rows_ex`)."""
+    return chain_host_rows_ex(node)[0]
+
+
+def chain_host_rows_ex(node) -> Tuple[Tuple[int, ...], Tuple[Optional[int], ...]]:
     """L15-12c-C2: the host rows of the radix chain root -> node, in token
     order. The walk goes last_node -> root; each node contributes its
     component_data[ComponentType.FULL].host_value (the host row ids of its
@@ -229,6 +234,7 @@ def chain_host_rows(node) -> Tuple[int, ...]:
     count.
     """
     chunks = []
+    recs = []
     cur = node
     while cur is not None:
         try:
@@ -236,9 +242,18 @@ def chain_host_rows(node) -> Tuple[int, ...]:
         except (AttributeError, KeyError, IndexError, TypeError):
             cd = None  # duck-typed: a fake/odd node contributes no rows
         hv = getattr(cd, "host_value", None) if cd is not None else None
+        sh = getattr(cur, "_weg2_l2_shadow", None)
         if hv is not None and len(hv):
             vals = hv.tolist() if hasattr(hv, "tolist") else hv
             chunks.append([int(x) for x in vals])
+            recs.append([None] * len(vals))
+        elif (sh is not None and len(sh) == 2 and len(sh[0]) == len(sh[1])
+              and len(sh[0]) == _node_tokens(cd, cur)):
+            # L15-L2-SHADOW: the #248 release dropped this node's KV host rows
+            # but recorded them with their arena generation -- adopted here,
+            # the caller keeps a row only where the slot still has that gen
+            chunks.append([int(x) for x in sh[0]])
+            recs.append([int(g) for g in sh[1]])
         else:
             n_tok = None
             val = getattr(cd, "value", None) if cd is not None else None
@@ -254,12 +269,28 @@ def chain_host_rows(node) -> Tuple[int, ...]:
                     n_tok = None
             if n_tok:
                 chunks.append([-1] * n_tok)
+                recs.append([None] * n_tok)
             # else: no host rows, no token count -> old positional skip
         cur = getattr(cur, "parent", None)
     rows: list = []
-    for chunk in reversed(chunks):
+    rec: list = []
+    for chunk, rc in zip(reversed(chunks), reversed(recs)):
         rows.extend(chunk)
-    return tuple(rows)
+        rec.extend(rc)
+    return tuple(rows), tuple(rec)
+
+
+def _node_tokens(cd, node) -> int:
+    """The node's own token count: its device value, else its radix key."""
+    for v in (getattr(cd, "value", None) if cd is not None else None,
+              getattr(node, "key", None)):
+        if v is None:
+            continue
+        try:
+            return len(v)
+        except TypeError:
+            continue
+    return -1
 
 
 def anchor_host_row(node, anchor_slot: int) -> int:
@@ -398,6 +429,7 @@ def build_retain_kwargs(
     by_rid = {}
     entries = []
     l2_rows = []  # (rid, chain host rows truncated to the KV span)
+    shadow_gens: Dict[str, Tuple] = {}  # L15-L2-SHADOW: rid -> recorded gen per token
     # L15-12c-E2a: (rid, mamba anchor host row, -1 when absent) -- the
     # anchor state's L2 identity, snapshot at bind like the KV rows.
     anchor_rows = []
@@ -451,11 +483,14 @@ def build_retain_kwargs(
                     "FULL+MAMBA trees only (27B/NF); SWA or other "
                     "components -> no retain"
                 )
-            _rows = chain_host_rows(_node)[: len(_slots)]
+            _rows, _rec = chain_host_rows_ex(_node)
+            _rows, _rec = _rows[: len(_slots)], _rec[: len(_slots)]
         except ValueError:
-            _rows = ()
+            _rows, _rec = (), ()
         if _rows:
             l2_rows.append((rid, _rows))
+            if any(g is not None for g in _rec):
+                shadow_gens[rid] = _rec
         # L15-12c-E2a: the anchor's host row from the chain node that
         # carries the req's anchor device slot; best-effort (-1 on any
         # missing piece -- the anchor columns then read (-1, -1)).
@@ -544,10 +579,26 @@ def build_retain_kwargs(
                 gen_of[int(s)] = int(g)
         for rid, per in _slot_of.items():
             _g = gen_of.get
-            l2_by_rid[rid] = (
-                tuple(per),
-                tuple([_g(s, -1) for s in per]),
-            )
+            gens = [_g(s, -1) for s in per]
+            rec = shadow_gens.get(rid)
+            if rec is not None:
+                # L15-L2-SHADOW: a shadow row counts only while its slot still
+                # carries the generation recorded at the #248 release (the
+                # page P wrote and D loaded); a re-claimed slot is unbacked
+                per = list(per)
+                live = shadow = valid = 0
+                for i, r in enumerate(rec):
+                    if r is None:
+                        live += 1
+                        continue
+                    shadow += 1
+                    if per[i] >= 0 and int(gens[i]) >= 0 and int(gens[i]) == int(r):
+                        valid += 1
+                    else:
+                        per[i], gens[i] = -1, -1
+                log("L15-L2-SHADOW-ADOPT rid=%s tokens=%d live=%d shadow=%d valid=%d stale=%d"
+                    % (rid, len(per), live, shadow, valid, shadow - valid))
+            l2_by_rid[rid] = (tuple(per), tuple(gens))
             l2_lanes_by_rid[rid] = tuple(_lane_of[rid])
 
     # L15-12c-E2a: anchor host row -> (mamba arena slot, generation). One
