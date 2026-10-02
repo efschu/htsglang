@@ -553,6 +553,12 @@ class PpChainReceiver:
             _dt = (time.time() - _t0) * 1000
             if _dt >= 50.0:  # #1460: a blocking chain receive that waited
                 logger.info("%s #1460 CHAIN-RECV blocked %.0f ms absorbed=%d t=%.3f", LOG_PREFIX, _dt, absorbed, time.time())
+                try:  # PDFLIP-L: the sleep's WEG2-SLEEP-SUB names this wait (instrument only)
+                    from sglang.srt.weg2 import flush_sub_timing as _fst
+
+                    _fst.note_chain_blocked(_dt)
+                except Exception:  # noqa: BLE001
+                    pass
             absorbed += 1
         return self.inbox.popleft()
 

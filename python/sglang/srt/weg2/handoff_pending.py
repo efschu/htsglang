@@ -552,6 +552,32 @@ def note_evicted(pool, cands: Iterable, keep: Keep, need: int = 0) -> int:
     return len(per)
 
 
+def _complete_count(pool, arena, rec) -> int:
+    """PDFLIP-L (02.10.2026): how many of ``rec``'s kept stems are COMPLETE
+    in ``arena``. This runs on the scheduler thread inside every tree reset
+    (ARENA-REF-HOLDERS at=reset), i.e. inside every sleep flush. With 27B's
+    page_size=1 a kept key is a TOKEN: P kept 90691 keys at every reset of
+    N3u 1002_072908, D 117304-416824 -- and ``find_slots`` (one encode per
+    stem, a tuple list, a Python sum) cost 125-134 ms for 90691 on CPU, the
+    PP1/PP2 kv-release p50 154/165 ms and D's 330-634 ms (NF: 3231 keys,
+    2 ms). The stems of one record never change (the record is replaced when
+    its mark changes), so the ctypes array is encoded once per record and the
+    count is one C lookup plus a numpy sum: same number, ~22 ms for 90691."""
+    enc_fn = getattr(arena, "encode_stems", None)
+    find = getattr(arena, "find_states_encoded", None)
+    if enc_fn is None or find is None:
+        return sum(1 for _, st in arena.find_slots(rec[2]) if int(st) == 2)
+    cache = pool.__dict__.setdefault("_weg2_hp_census_enc", {})
+    hit = cache.get(id(rec))
+    if hit is None or hit[0] is not rec:
+        hit = (rec, enc_fn(rec[2]))
+        cache[id(rec)] = hit
+        live = {id(r[1]) for r in (pool.__dict__.get("_weg2_hp_rid_keys") or {}).values()}
+        for k in [k for k in cache if k not in live]:
+            cache.pop(k, None)
+    return int((find(hit[1]) == 2).sum())
+
+
 def census(pool) -> str:
     """HOLDERS-line fields for ``pool``: this pool's kept keys still COMPLETE
     in the arena, and every process's reference-pinned complete slots."""
@@ -571,7 +597,7 @@ def census(pool) -> str:
             c[1] += len(rec[2])
             c[2] += 1
             if arena is not None and rec[2]:
-                c[0] += sum(1 for _, st in arena.find_slots(rec[2]) if int(st) == 2)
+                c[0] += _complete_count(pool, arena, rec)
         pinned = complete = "-"
         if arena is not None and hasattr(arena, "ref_census"):
             pinned, _refs, complete = arena.ref_census()

@@ -645,9 +645,16 @@ class Envs:
     # 0.60 s, z30x2-kvdemand 0.35 s; x178 (read during the flip) 0. The
     # reference exists from the wake's first RPC on -- P has drained by then
     # (the front drains before the sleep/wake pair), so #248's measured fault
-    # (a reference over P's whole phase) stays closed. Model-neutral; off
-    # until the first boot series, then default on.
-    SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(False)
+    # (a reference over P's whole phase) stays closed. Model-neutral.
+    # DEFAULT ON (02.10., 27B P->D seat): NF ran it since 09300726 (60+ boots,
+    # nf-int4.env:340, #248 WAKE-READ-EARLY issued= 99x, WEG2-WAKE-COHORT
+    # wake_to_last_decode_ms 476-579 ms); the 27B left it unset and paid for it
+    # on every P->D flip -- N3u 1002_072908: read_early=0 on 19/19 wakes, the
+    # release issued the reads 160-550 ms after the resume reply, the reads
+    # queued 0.6-2.1 s, SETTLE held_after_wake_s p50 1.4 s, wake_to_last_decode
+    # p50 2.49 s = the bulk of the 2.8 s P->D nachlauf. =0 restores the
+    # release-time read byte for byte.
+    SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(True)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing
