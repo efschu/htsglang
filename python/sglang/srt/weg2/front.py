@@ -9506,7 +9506,8 @@ class Front:
                         p, fits, v = q, True, _asr.FLIP_NOW
                         why = "%s; backfill past head %s (%s, waited %.1f s)" % (why2, head.rid, why, head_wait)
                         break
-        if v == _asr.FLIP_NOW and self._asr_min_dwell_held(p, D, now):
+        if v == _asr.FLIP_NOW and (self._asr_min_dwell_held(p, D, now)
+                                   or Front._asr_k7_dwell_held(self, p, now)):
             return False, not self.admit_d, None
         if v == _asr.FLIP_NOW:
             if st["flip_rid"] != p.rid:
@@ -9531,6 +9532,32 @@ class Front:
                         "the next free seat in arrival order", _asr.MARKER, p.rid, v, why_wait,
                         int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
         return False, not self.admit_d, None
+
+    def _asr_k7_dwell_held(self, p: "Pending", now: float) -> bool:
+        """PDFLIP-B on NF: the ARRIVAL-SEAT flip_now passes K7's derived
+        min-dwell BEFORE it parks D -- as 27B's _immediate_park_due does -- so
+        MIN-DWELL's ``overridden_by=park`` (admission closed by this phase's own
+        park) is never a flip below the dwell. Without it the park fired at any
+        awake time and the override let the flip through after the 2 s fairness
+        floor (27B N5d: overridden_by=fairness after 6.6 s awake, need 12.6 s).
+        True = hold: D keeps decoding, the arrival keeps its place. Off with
+        SGLANG_WEG2_X_BAND_FOLLOWS_PRICE=0 (or no flip log: a test double)."""
+        if not hasattr(self, "flip_log") or not Front._x_excursion_band_off(self):
+            return False
+        need, prov = Front._derived_min_dwell_ms(self, "D", "P")
+        awake_ms = (float(now) - float(self.t_awake)) * 1000.0
+        if awake_ms >= need:
+            return False
+        self._park_dwell_held_t = time.time()  # DP-WAIT (#1416i): hold_by=min-dwell
+        st = self._asr_st()
+        if st.get("k7_dwell_told") != (p.rid, self.epoch):
+            st["k7_dwell_told"] = (p.rid, self.epoch)
+            self.counters["arrival_seat_k7_dwell_hold"] += 1
+            logger.info("%s K7-DWELL hold rid=%s awake_ms=%d min_dwell_ms=%d provenance=%s epoch=%d -- "
+                        "PDFLIP-B: the flip to P waits for the derived min-dwell before the park; D keeps "
+                        "decoding, the arrival keeps its place and seat", _asr.MARKER, p.rid,
+                        int(awake_ms), int(need), prov, self.epoch)
+        return True
 
     def _asr_min_dwell_held(self, p: "Pending", D: "Group", now: float) -> bool:
         """ARRIVAL-SEAT MIN-DWELL (NF-Operator 30.09., y5c 19:17-19:21Z:
@@ -9660,7 +9687,8 @@ class Front:
             v = _asr.verdict(True if plan else free, True if plan else fits_kv,
                              int(getattr(q, "est_uncached", 0) or 0),
                              min(x_tok, _x_p) if _x_p > 0 else x_tok)
-            if v == _asr.FLIP_NOW and self._asr_min_dwell_held(q, self.groups["D"], now):
+            if v == _asr.FLIP_NOW and (self._asr_min_dwell_held(q, self.groups["D"], now)
+                                       or Front._asr_k7_dwell_held(self, q, now)):
                 return False, not self.admit_d, None    # MIN-DWELL: it keeps its place and seat
             if v == _asr.FLIP_NOW:
                 if st["flip_rid"] != q.rid:
