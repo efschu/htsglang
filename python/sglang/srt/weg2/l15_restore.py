@@ -87,7 +87,55 @@ def _l2_source(span, i: int) -> Optional[Tuple[int, int]]:
     return None
 
 
+#: L15-PLAN-CACHE (N6k: the wake's refill plan + sample rebuilt owned_l2_rows
+#: from the manifest on the resume RPC -- ~80 ms per 47k / ~230 ms per 133k
+#: held tokens per call, on TP0's path that every peer's fence waits for).
+#: One entry: (fingerprint, rank, prefix) -> rows; warmed at the sleep.
+_PLAN_CACHE: dict = {}
+
+
+def _plan_key(m: Manifest, rank: int, prefix: Sequence[int]):
+    from sglang.srt.weg2.l15_manifest import fingerprint
+
+    return (int(fingerprint(m)), int(rank), tuple(int(x) for x in prefix))
+
+
 def owned_l2_rows(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
+    """Cached :func:`owned_l2_rows_uncached` (same manifest content, rank and
+    prefix -> the same rows; the rows are immutable tuples)."""
+    try:
+        key = _plan_key(m, rank, prefix)
+    except Exception:  # noqa: BLE001 -- an odd manifest: compute directly
+        return owned_l2_rows_uncached(m, rank, prefix)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        return list(hit)
+    rows = owned_l2_rows_uncached(m, rank, prefix)
+    _PLAN_CACHE.clear()
+    _PLAN_CACHE[key] = tuple(rows)
+    return rows
+
+
+def warm_plan_async(m: Manifest, rank: int, prefix: Sequence[int]) -> None:
+    """Build the wake's plan in a daemon thread after the sleep (P's phase
+    lasts seconds; the wake then finds it cached). Never raises."""
+    import threading
+
+    def _run():
+        try:
+            owned_l2_rows(m, rank, prefix)
+        except Exception:  # noqa: BLE001 -- the wake computes it then
+            pass
+
+    try:
+        threading.Thread(target=_run, name="l15-plan-warm", daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def owned_l2_rows_uncached(
     m: Manifest, rank: int, prefix: Sequence[int],
 ) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
     """Every L2-backed row this rank must refill, ONCE per compact row.
