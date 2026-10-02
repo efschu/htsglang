@@ -8158,10 +8158,16 @@ class Front:
         # was 1.7x D's own prefill cap, which D then refused by construction.
         # The verdict names the two bases so a reader never has to work out
         # which number each bound was compared against.
-        # X-K-FLIP: the X this arrival is routed on amortises the round trip
-        # over the flip it would take -- itself plus the riders queued for P
-        # now -- not over the boot's mean P phase (switch off: the X in force).
-        _x_arrival = self._x_for_flip(1 + self._x_riders(), rid, "route")
+        # X-K-FLIP x PDFLIP-X, split by ROLE (coordinator decision 02.10.):
+        # (a) an arrival that would TRIGGER the flip pays the whole round trip:
+        #     it is routed on the X in force (the undivided excursion price),
+        #     the same X as alone, whatever else waits;
+        # (b) an arrival that RIDES a flip already decided (a queued request
+        #     needs P) or running (P awake / the flip to P under way) finds the
+        #     flip cost sunk: X-K-FLIP amortises the round trip over the flip's
+        #     riders (_x_for_flip, itself + the riders queued for P now).
+        _x_rides = Front._x_flip_decided(self)
+        _x_arrival = self._x_for_flip(1 + self._x_riders() if _x_rides else 1, rid, "route")
         route = serviceable_route(remainder, carrier_est,
                                   _x_arrival,
                                   self.carrier_max_tokens,
@@ -12997,6 +13003,21 @@ class Front:
                 continue
             n += 1
         return n
+
+    def _x_flip_decided(self) -> bool:
+        """X-K-FLIP x PDFLIP-X role split: is a flip to P already decided or
+        running, so that a new arrival RIDES it (True) rather than triggering
+        it (False)? Running: P awake, or the flip under way with P as its
+        destination. Decided: a queued request already needs P (the immediate
+        park's own trigger, phase_policy.needs_p against the X in force)."""
+        if getattr(self, "awake", "D") == "P":
+            return True
+        if getattr(self, "state", "") == "flipping" and getattr(self, "_flip_dst", None) == "P":
+            return True
+        live = [q for q in (getattr(self, "queue", None) or ())
+                if not (getattr(q, "fut", None) is not None and q.fut.done())
+                and not getattr(q, "d_direct", False)]
+        return phase_policy.immediate_park_trigger(live, int(self.tp_prefill_max_tokens)) is not None
 
     def _x_for_flip(self, k_flip: int, rid: str = "", site: str = "") -> int:
         """X-K-FLIP: the X of a flip that carries ``k_flip`` requests -- the

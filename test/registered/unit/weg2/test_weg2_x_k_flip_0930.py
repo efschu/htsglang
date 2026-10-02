@@ -64,7 +64,9 @@ def _queued(rid, uncached, done=False):
 
 
 def _route(ns, uncached):
-    x = ns._x_for_flip(1 + ns._x_riders(), "weg2-x", "route")
+    # the route's own rule (RELEASE-INTEG role split): riders count only when the flip is decided
+    rides = F.Front._x_flip_decided(ns)
+    x = ns._x_for_flip(1 + ns._x_riders() if rides else 1, "weg2-x", "route")
     return F.serviceable_route(uncached, uncached, x, 373536), x
 
 
@@ -138,7 +140,42 @@ def test_riders_never_raise_x_above_the_lone_request():
 
 def test_the_arrival_is_routed_on_the_flip_x():
     src = inspect.getsource(F.Front)
-    i = src.index("_x_arrival = self._x_for_flip(1 + self._x_riders(), rid, \"route\")")
+    i = src.index("_x_arrival = self._x_for_flip(1 + self._x_riders() if _x_rides else 1, rid, \"route\")")
     j = src.index("route = serviceable_route(remainder, carrier_est,\n                                  _x_arrival,", i)
     k = src.index("x_route = _x_arrival", j)
     assert i < j < k
+
+
+# ---- RELEASE-INTEG 1002: X-K-FLIP x PDFLIP-X split by role (coordinator decision 02.10.) --------
+
+def test_a_trigger_with_k_riders_gets_the_same_x_as_alone():
+    """(a) Nothing queued needs P (k waiting SHORTs, each <= X): this arrival would TRIGGER the
+    flip and pays the whole round trip -- the X in force, the same as alone."""
+    shorts = [_queued(f"weg2-s-{i}", 1500) for i in range(3)]
+    ns_k, ns_1 = _front(queue=shorts), _front()
+    with envs.SGLANG_WEG2_X_K_FLIP.override(True), envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), \
+            envs.SGLANG_WEG2_X_COST_MAX_STEP.override(10.0):
+        F.Front._resolve_x_cost_line(ns_k)
+        F.Front._resolve_x_cost_line(ns_1)
+        assert not F.Front._x_flip_decided(ns_k) and ns_k._x_riders() == 3
+        assert _route(ns_k, 2900)[1] == _route(ns_1, 2900)[1] == int(ns_1.tp_prefill_max_tokens)
+
+
+def test_a_rider_of_a_decided_flip_gets_the_amortised_x():
+    """(b) A queued request already needs P (the flip is decided): the arrival rides it, the flip
+    cost is sunk -- X-K-FLIP's amortised X, below the lone X."""
+    riders = [_queued(f"weg2-9-{i}", 6000) for i in range(3)]
+    ns = _front(queue=riders)
+    with envs.SGLANG_WEG2_X_K_FLIP.override(True), envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), \
+            envs.SGLANG_WEG2_X_COST_MAX_STEP.override(10.0):
+        x1 = F.Front._resolve_x_cost_line(ns)
+        assert F.Front._x_flip_decided(ns)
+        assert _route(ns, 2900)[1] == ns._x_for_flip(4) < x1
+
+
+def test_a_running_flip_to_p_makes_every_arrival_a_rider():
+    ns = _front(queue=[_queued("q", 1500)])
+    ns.state, ns._flip_dst = "flipping", "P"
+    assert F.Front._x_flip_decided(ns)
+    ns.state, ns._flip_dst = "flipping", "D"
+    assert not F.Front._x_flip_decided(ns)
