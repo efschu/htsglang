@@ -913,6 +913,11 @@ class Envs:
     # flip is foreseeable; its park would wait the whole 1.2-3.8 s D pass). It
     # rides P's batch. Off = the D pass runs and the park waits behind it.
     SGLANG_WEG2_ENABLE_D_DIRECT_YIELD = EnvBool(True)
+    # FLIPCYCLE H2 (02.10., expert_offload.DeferredRowsFill.tick): P's first
+    # extend after the wake waits only for EACH layer's own deferred extra rows
+    # (land_deferred_rows before that layer's MoE), not for all of them before
+    # the forward starts. Off = the whole forward waits (y6z: 0.3-1.0 s on PP0).
+    SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.

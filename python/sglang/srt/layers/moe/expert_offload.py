@@ -7235,6 +7235,7 @@ class DeferredRowsFill:
         # xid13 kvh: layers whose full layout landed after a live seat-row change
         self.seat_moved = 0
         self.seat_moved_on = None
+        self.per_layer_told = False
 
     def _ops(self):
         if self._ops_arg == "cuda":
@@ -7360,8 +7361,32 @@ class DeferredRowsFill:
             late = [c for c in early if id(c) not in self.events]
             if late:
                 self._issue(late)
-            for cache in early:
-                self._promote(cache, "tick")
+            if is_decode or not per_layer_landing():
+                for cache in early:
+                    self._promote(cache, "tick")
+            else:
+                # FLIPCYCLE H2 (02.10.): an EXTEND forward lands each early layer
+                # right before its own MoE (run_waves / run_eager_pool call
+                # land_deferred_rows -> land -> the forward stream waits THAT
+                # layer's event only). Layer 0 computes while the rows of the
+                # later layers still stream; the old form made the whole forward
+                # wait for every layer (y6z P-PP0 0.3-1.0 s, PP1 ~0.36 s, PLE
+                # gather 743 ms behind it). The layers whose rows already landed
+                # are promoted here; a decode (graph replay, no land) keeps the
+                # full wait above.
+                ready = [c for c in early
+                         if self.events.get(id(c)) is None or bool(self.events[id(c)].query())]
+                for cache in ready:
+                    self._promote(cache, "tick")
+                if self.pending and not self.per_layer_told:
+                    self.per_layer_told = True
+                    logger.info("WEG2-FLIPCYCLE stage=rearm_wait ms=0 floor_ms=0 mode=per_layer "
+                                "layers_open=%d rows_open=%d since_start_ms=%.0f (H2: the first "
+                                "extend after the wake no longer waits for every layer's extra "
+                                "rows; each layer waits for its own)", len(self.pending),
+                                self.rows_pending(),
+                                (self._clock() - (self.t_start or self._clock())) * 1000)
+                return
             if not self.pending:
                 return
         if not self.started:
@@ -7394,6 +7419,13 @@ class DeferredRowsFill:
 
 
 _DEFERRED_ROWS_FILL: Optional[DeferredRowsFill] = None
+
+
+def per_layer_landing() -> bool:
+    """FLIPCYCLE H2 switch (SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER)."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER.get())
 
 
 # ---------------------------------------------------------------------------
