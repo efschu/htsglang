@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.pool_host import arena_mamba_pool as amp  # noqa: E402
 def test_the_split_before_the_early_return_is_timed():
     src = inspect.getsource(amp.ArenaMambaPoolHost.load_to_device_per_layer)
     i_pre = src.index('_subp["pre"]')
-    i_key = src.index("if layer_id != 0 and self._state_loaded_key == key:")
+    i_key = src.index("if layer_id != 0 and _state_key_loaded(self, key):")
     assert src.index("_tpre = time.perf_counter()") < src.index("hi, is_arena = self._split(host_indices)") < i_pre < i_key
     assert '_subp["pre_n"]' in src
 

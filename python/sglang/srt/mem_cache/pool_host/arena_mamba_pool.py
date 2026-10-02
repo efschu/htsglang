@@ -63,6 +63,48 @@ def mamba_rest_device_rows_on(env=None) -> bool:
     return str(env.get(ENV_MAMBA_REST_DEVICE_ROWS, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+#: DP-NACHLAUF 02.10. (N5p b6a6a5c08d, every 27B boot of the day): one
+#: start_loading carries TWO mamba transfers on this pool (``WEG2-ARENA-STATE-
+#: LOAD n=1``/``n=2`` per load, ``mamba.pre_n=66`` = 2 x 33 layers). The single
+#: ``_state_loaded_key`` held only the LAST layer-0 key, so on every layer > 0
+#: both transfers missed it and ran the per-layer path -- ``device_indices
+#: .cpu()`` (a host wait on the load stream, queued behind the KV H2D) and
+#: pageable copies: PP0 ``mamba=206`` against 9 ms of timed sub-stages,
+#: growing with the KV tokens at ~7 GB/s (2164 tok 52 ms ... 77824 tok 218 ms).
+#: Every key whose layer-0 state load ran is remembered (the last 8). Unset =
+#: on; 0/false/no/off = the single key.
+ENV_MAMBA_STATE_KEYS = "SGLANG_WEG2_MAMBA_STATE_KEYS"
+
+
+def mamba_state_keys_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_MAMBA_STATE_KEYS, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _state_key_loaded(pool, key) -> bool:
+    if getattr(pool, "_state_loaded_key", None) == key:
+        return True
+    return mamba_state_keys_on() and key in (getattr(pool, "_state_loaded_keys", None) or ())
+
+
+def _state_key_note(pool, key) -> None:
+    pool._state_loaded_key = key
+    keys = getattr(pool, "_state_loaded_keys", None)
+    if keys is None:
+        keys = pool._state_loaded_keys = []
+    if key in keys:
+        keys.remove(key)
+    keys.append(key)
+    del keys[:-8]
+
+
+def _state_key_drop(pool, key) -> None:
+    pool._state_loaded_key = None
+    keys = getattr(pool, "_state_loaded_keys", None)
+    if keys and key in keys:
+        keys.remove(key)
+
+
 def _load_sub(pool) -> dict:
     """H2D phase 1 (a): CPU ms of the mamba state load's sub-stages, summed
     over one start_loading; the hybrid host pool folds them into the
@@ -237,6 +279,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         self._slot_view = _buf_all[data_off:data_off + A * slot_bytes].view(A, slot_bytes)
         self._state_stage = None
         self._state_loaded_key = None
+        self._state_loaded_keys = []
         self._layout = {"L": L, "t_shape": t_shape, "conv_shape": conv_shape, "width": width,
                         "t_ext": [(int(t_ext[l][0]), int(t_ext[l][1])) for l in range(L)],
                         "c_ext": [[(int(c_ext[3 * l + j][0]), int(c_ext[3 * l + j][1])) for j in range(3)] for l in range(L)]}
@@ -789,7 +832,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         _subp["pre_n"] = _subp.get("pre_n", 0.0) + 1.0
         if _arena_state_load_on() and getattr(self, "_slot_view", None) is not None:
             key = (id(host_indices), id(device_indices), int(host_indices.numel()), int(device_indices.numel()))
-            if layer_id != 0 and self._state_loaded_key == key:
+            if layer_id != 0 and _state_key_loaded(self, key):
                 rest = (~is_arena).nonzero(as_tuple=True)[0]
                 if rest.numel():
                     _trest = time.perf_counter()
@@ -816,7 +859,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
                         _didx = device_indices.cpu()[sel]
                     _sub["select"] = _sub.get("select", 0.0) + (time.perf_counter() - _ts) * 1000.0
                     self._load_states_all_layers(device_pool, slots, _didx)
-                    self._state_loaded_key = key
+                    _state_key_note(self, key)
                     if ple_state.enabled():
                         # H63c: the anchors' PLE side states into the same
                         # targets, on the load stream (before the PLE read's join);
@@ -836,7 +879,18 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     return
                 except Exception as exc:  # noqa: BLE001 -- one named fallback to the per-layer path
                     logger.warning("WEG2-ARENA-STATE-LOAD failed (%s: %s); per-layer path", type(exc).__name__, exc)
-                    self._state_loaded_key = None
+                    _state_key_drop(self, key)
+        # DP-NACHLAUF: the per-layer path (host waits) -- on the line as
+        # mamba.perlayer / perlayer_n, so a key miss can never hide again
+        _tpl = time.perf_counter()
+        try:
+            self._load_layer_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend, sel, slots, is_arena)
+        finally:
+            _subp = _load_sub(self)
+            _subp["perlayer"] = _subp.get("perlayer", 0.0) + (time.perf_counter() - _tpl) * 1000.0
+            _subp["perlayer_n"] = _subp.get("perlayer_n", 0.0) + 1.0
+
+    def _load_layer_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend, sel, slots, is_arena):
         dst_t = device_pool.mamba_cache.temporal[layer_id]
         dev = dst_t.device
         didx = device_indices.cpu()[sel].to(dev)
