@@ -20330,9 +20330,16 @@ class Scheduler(
                 except Exception as exc:  # noqa: BLE001 -- cleanup only
                     logger.warning("L15-KEEP-CLEAR at=sleep failed (%s: %s)",
                                    type(exc).__name__, exc)
+                _l15_pr0 = time.perf_counter()
                 self.tree_cache.reset()
                 self.req_to_token_pool.clear()
                 self.token_to_kv_pool_allocator.clear()
+                if len(_l15_tt) > 1:
+                    # L15-FLIPCOST: the plain flush's own reset+clear -- the
+                    # comparison for retain's reset/alloc steps
+                    logger.info("L15-PLAIN-RESET rank=%d ms=%.0f",
+                                int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
+                                (time.perf_counter() - _l15_pr0) * 1000.0)
                 if self._flush_zero_kv_wanted(zero_kv):
                     # Default part of the flush (opt-out env): the post-flush
                     # state must equal a fresh boot, whose pools are torch.zeros.
