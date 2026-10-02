@@ -1659,6 +1659,64 @@ def _weg2_parked_owned_prefetch_of(sched) -> frozenset:
         return frozenset()
 
 
+#: DP-NACHLAUF 02.10. (N5u fcf0366fdb, every P>D): the sleep path reset P's
+#: pools TWICE -- the front's quiesce /flush_cache (rpc_flush alloc_clear 37-66
+#: ms) and, milliseconds later, the kv release's own flush (release_flush
+#: alloc_clear 30-52 ms) on a group that ran nothing in between. The release
+#: flush (zero_kv=False) skips the tree/pool reset when this rank's last reset
+#: is still current: no forward since, nothing waiting or running, the tree
+#: as the reset left it. Rank-local (the #1268 idle verdict is voted before the reset either
+#: way). Unset = on; 0/false/no/off = the release always resets.
+_WEG2_RELEASE_DEDUP_ENV = "SGLANG_WEG2_RELEASE_FLUSH_DEDUP"
+
+
+def _weg2_release_dedup_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(_WEG2_RELEASE_DEDUP_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _weg2_tree_sig(tree):
+    """What a reset leaves (the #243 hand-off chain may stay): sizes + root fan-out."""
+    root = getattr(tree, "root_node", None)
+    return (int(tree.evictable_size() or 0), int(tree.protected_size() or 0),
+            len(getattr(root, "children", None) or ()) if root is not None else -1)
+
+
+def _weg2_note_reset(sched) -> None:
+    try:
+        sched._weg2_last_reset_fwd = int(getattr(sched, "forward_ct", -1))
+        sched._weg2_last_reset_sig = _weg2_tree_sig(sched.tree_cache)
+    except Exception:  # noqa: BLE001
+        sched._weg2_last_reset_fwd = None
+
+
+def _weg2_release_reset_redundant(sched, zero_kv) -> bool:
+    """True only for the release flush (zero_kv is False) right after a
+    reset nothing has touched since."""
+    if zero_kv is not False or not _weg2_release_dedup_on():
+        return False
+    try:
+        last = getattr(sched, "_weg2_last_reset_fwd", None)
+        if last is None or int(last) != int(getattr(sched, "forward_ct", -2)):
+            return False
+        if list(getattr(sched, "waiting_queue", None) or []):
+            return False
+        rb = getattr(sched, "running_batch", None)
+        if rb is not None and hasattr(rb, "is_empty") and not rb.is_empty():
+            return False
+        if _weg2_tree_sig(sched.tree_cache) != getattr(sched, "_weg2_last_reset_sig", None):
+            return False
+    except Exception:  # noqa: BLE001 -- any doubt: reset as before
+        return False
+    n = getattr(sched, "_weg2_release_dedup_n", 0) + 1
+    sched._weg2_release_dedup_n = n
+    if n <= 8 or n % 64 == 0:
+        logger.info("WEG2-RELEASE-FLUSH-DEDUP n=%d fwd=%s: the quiesce flush's reset is current (no forward, "
+                    "tree as reset, empty queues) -- the release leg skips the second reset (%s=0 restores it)",
+                    n, getattr(sched, "forward_ct", "?"), _WEG2_RELEASE_DEDUP_ENV)
+    return True
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -3264,6 +3322,8 @@ class Scheduler(
             # z30j: PP0 decides a forwarded flush once; followers follow it.
             park_forwarded=lambda req: _weg2_flush_verdict.follower_park(self, req),
             on_decided=lambda req, ok, detail: _weg2_flush_verdict.pp0_record(self, req, ok, detail),
+            # QUIESCE-PENDING: the refused verdict's text names a PENDING lap
+            refusal_detail=lambda: getattr(self, "_weg2_last_flush_refusal", "") or "",
         )
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
@@ -20198,6 +20258,7 @@ class Scheduler(
         from sglang.srt.weg2 import flush_sub_timing as _weg2_flush_sub
 
         _fsub = _weg2_flush_sub.begin_flush(zero_kv)
+        self._weg2_last_flush_refusal = ""  # QUIESCE-PENDING: only THIS flush's refusal names a lap
         if (
             self.enable_hierarchical_cache
             and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
@@ -20829,27 +20890,39 @@ class Scheduler(
                                    type(exc).__name__, exc)
                 _fsub.mark("l15_tail")
                 _l15_pr0 = time.perf_counter()
-                # PARK-READ-DETACH (L15 boot dac8b62b8c 14:43:49): the reset may hand the
-                # open store reads of D's park list to a background reaper instead of
-                # joining them -- PDFLIP-A's exempt set names them, read before the tree
-                # reset forgets ongoing_prefetch.
-                _prd_cc = getattr(self.tree_cache, "cache_controller", None)
-                if _prd_cc is not None:
-                    _prd_cc._weg2_reset_detach_rids = _weg2_parked_owned_prefetch_of(self)
-                try:
-                    self.tree_cache.reset()
-                    self.req_to_token_pool.clear()
-                    self.token_to_kv_pool_allocator.clear()
-                finally:
+                if _weg2_release_reset_redundant(self, zero_kv):
+                    # DP-NACHLAUF RELEASE-FLUSH-DEDUP: the quiesce /flush_cache
+                    # reset this rank moments ago and it ran nothing since --
+                    # the release leg's second reset is skipped (rank-local;
+                    # the #1268 verdict above is unchanged)
+                    _fsub.mark("tree_reset")
+                    _fsub.mark("req_pool_clear")
+                    _fsub.mark("alloc_clear")
+                else:
+                    # PARK-READ-DETACH (L15 boot dac8b62b8c 14:43:49): the reset may hand the
+                    # open store reads of D's park list to a background reaper instead of
+                    # joining them -- PDFLIP-A's exempt set names them, read before the tree
+                    # reset forgets ongoing_prefetch.
+                    _prd_cc = getattr(self.tree_cache, "cache_controller", None)
                     if _prd_cc is not None:
-                        _prd_cc._weg2_reset_detach_rids = None
-                if len(_l15_tt) > 1:
-                    # L15-FLIPCOST: the plain flush's own reset+clear -- the
-                    # comparison for retain's reset/alloc steps
-                    logger.info("L15-PLAIN-RESET rank=%d ms=%.0f",
-                                int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
-                                (time.perf_counter() - _l15_pr0) * 1000.0)
-                _fsub.mark("alloc_clear")  # PDFLIP-L: outside L15-PLAIN-RESET
+                        _prd_cc._weg2_reset_detach_rids = _weg2_parked_owned_prefetch_of(self)
+                    try:
+                        self.tree_cache.reset()
+                        _fsub.mark("tree_reset")
+                        self.req_to_token_pool.clear()
+                        _fsub.mark("req_pool_clear")
+                        self.token_to_kv_pool_allocator.clear()
+                    finally:
+                        if _prd_cc is not None:
+                            _prd_cc._weg2_reset_detach_rids = None
+                    _weg2_note_reset(self)
+                    if len(_l15_tt) > 1:
+                        # L15-FLIPCOST: the plain flush's own reset+clear -- the
+                        # comparison for retain's reset/alloc steps
+                        logger.info("L15-PLAIN-RESET rank=%d ms=%.0f",
+                                    int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
+                                    (time.perf_counter() - _l15_pr0) * 1000.0)
+                    _fsub.mark("alloc_clear")  # PDFLIP-L: outside L15-PLAIN-RESET
                 if self._flush_zero_kv_wanted(zero_kv):
                     # Default part of the flush (opt-out env): the post-flush
                     # state must equal a fresh boot, whose pools are torch.zeros.
@@ -20892,6 +20965,8 @@ class Scheduler(
                 f"| #1268 group verdict: {verdict_detail}"
             )
             success = False
+            # QUIESCE-PENDING: the flush wrapper names a PENDING lap in the answer
+            self._weg2_last_flush_refusal = str(verdict_detail or "")
             _weg2_flush_sub.end_flush(_fsub, "refused")
         return success
 

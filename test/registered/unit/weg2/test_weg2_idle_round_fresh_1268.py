@@ -173,6 +173,11 @@ def build_p_group(clock):
     pp0._weg2_join_store_writes_before_reset = (
         Scheduler._weg2_join_store_writes_before_reset.__get__(pp0)
     )
+    # ANCHOR-LOST (1479290c1e): the real flush records the device-only Mamba
+    # anchors its reset drops; bound real -- the fake tree has no
+    # weg2_unbacked_anchors, so it is a no-op here (before: AttributeError on
+    # every 200 path of this harness, 9 red in this file and H111).
+    pp0._weg2_note_lost_anchors = Scheduler._weg2_note_lost_anchors.__get__(pp0)
     pp0.flush_cache = Scheduler.flush_cache.__get__(pp0)
     wrapper = SchedulerFlushWrapper(
         # the RPC's own call (tp_group_verdict=True); empty_cache off only so
