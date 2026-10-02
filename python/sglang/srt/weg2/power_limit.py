@@ -94,7 +94,11 @@ class PowerLimitError(ValueError):
 
 
 def card_class(name: str) -> str:
-    """'NVIDIA GeForce RTX 5090' -> 'RTX5090' (the key the model JSONs use)."""
+    """'NVIDIA GeForce RTX 5090' -> 'RTX5090': the NAME label a rank's
+    POWER-LIMIT log line carries. HW-GENERIC 1002: record matching uses the
+    calibration class (:func:`weg2.card_identity.class_label`, see
+    :func:`read_current`), which also tells a 10 GB from a 20 GB RTX 3080;
+    this label stays the log token."""
     s = str(name or "")
     m = re.search(r"(RTX|GTX|TITAN|A|H|L|B)\s*(\d{3,4}\w*)", s)
     if m:
@@ -353,8 +357,17 @@ def read_current() -> Dict[str, Tuple[float, str]]:
     """``{uuid: (power_limit_w, card class)}`` of every card from NVML. The
     only I/O here; tests replace it. Raises when NVML cannot answer."""
     from sglang.srt.registry import nvml as _nvml
+    from sglang.srt.weg2 import card_identity as _ci
 
-    return {p.uuid: (p.power_limit_w, card_class(p.name)) for p in _nvml.power_snapshot()}
+    # HW-GENERIC 1002: the class a power RECORD is matched against is the
+    # card's CALIBRATION class (model + arch + VRAM tier), not its name: a
+    # 10 GB RTX 3080 must not match a record of the 20 GB class. Joined by
+    # UUID with the device list; a card the list does not know keeps the
+    # name label (it then matches only a record of exactly that label).
+    devs = {d.uuid: d for d in _nvml.list_devices()}
+    return {p.uuid: (p.power_limit_w,
+                     _ci.class_label(devs[p.uuid]) if p.uuid in devs else card_class(p.name))
+            for p in _nvml.power_snapshot()}
 
 
 __all__ = [
