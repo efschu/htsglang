@@ -1467,11 +1467,13 @@ async def weg2_ple_prefetch_hint(raw_request: Request):
     is coming; tokenized here as its POST will be, the PP0 scheduler starts the
     PLE read of its first chunk now (weg2/ple_admit_hint.py). Always 200 when
     well-formed; a pure prefetch."""
-    from sglang.srt.weg2.ple_admit_hint import build_ple_prefetch_hint
+    from sglang.srt.weg2.ple_admit_hint import build_ple_prefetch_hint_off_loop
 
     tm = _global_state.tokenizer_manager
     try:
-        hint = await build_ple_prefetch_hint(
+        # FLIP-LEGS 02.10.: tokenized in a worker thread -- the group's wake
+        # RPC must never queue behind a long prompt's tokenization (N5a ep7)
+        hint, _ms, _off = await build_ple_prefetch_hint_off_loop(
             await raw_request.json(),
             serving_chat=raw_request.app.state.openai_serving_chat,
             serving_completion=raw_request.app.state.openai_serving_completion,
@@ -1481,6 +1483,9 @@ async def weg2_ple_prefetch_hint(raw_request: Request):
         )
     except Exception as e:
         return _create_error_response(e)
+    logger.info("WEG2-PLE-HINT-BUILD rid=%s tokens=%s ms=%.0f off_loop=%s",
+                getattr(hint, "rid", "-"), len(getattr(hint, "input_ids", None) or ()),
+                _ms, "yes" if _off else "no")
     if hint is None:
         return ORJSONResponse({"hinted": False}, status_code=200)
     tm._dispatch_to_scheduler(hint)

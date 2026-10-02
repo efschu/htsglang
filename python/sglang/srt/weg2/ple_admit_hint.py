@@ -79,7 +79,47 @@ def ple_hint_body(path: str, payload: dict) -> Optional[dict]:
 # ---------------------------------------------------------------- P side
 
 
-async def build_ple_prefetch_hint(
+#: FLIP-LEGS 02.10.: the hint is tokenized in a worker thread, never on P's
+#: HTTP event loop. N5a ep7 (b49f0282c2 1002_114540): a hint for a 110k-token
+#: prompt held P's loop 1366 ms (`WEG2 PLE-HINT ... ms=1366`) and P's resume
+#: RPC for the D->P flip reached PP0 720 ms after the front issued it (every
+#: other D->P flip of N4p/N4q/N5a: 1-3 ms) -- the flip's legs 2036 ms against
+#: ~1400. Unset = on; 0/false/no/off = tokenized on the loop as before.
+OFF_LOOP_ENV = "SGLANG_WEG2_PLE_HINT_OFF_LOOP"
+
+
+def hint_off_loop_on(env=None) -> bool:
+    import os
+
+    env = os.environ if env is None else env
+    return str(env.get(OFF_LOOP_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+async def build_ple_prefetch_hint_off_loop(body: dict, **kwargs):
+    """``(hint_or_None, ms, off_loop)``: :func:`build_ple_prefetch_hint_sync`
+    in a worker thread (switch on) so the event loop keeps taking the
+    group's control RPCs -- the wake among them -- while a long prompt is
+    tokenized. A hint is a prefetch: arriving after the wake costs its gain
+    at most, never the wake."""
+    import asyncio
+    import time as _time
+
+    t0 = _time.perf_counter()
+    if hint_off_loop_on():
+        hint = await asyncio.to_thread(build_ple_prefetch_hint_sync, body, **kwargs)
+        off = True
+    else:
+        hint = build_ple_prefetch_hint_sync(body, **kwargs)
+        off = False
+    return hint, (_time.perf_counter() - t0) * 1000.0, off
+
+
+async def build_ple_prefetch_hint(body: dict, **kwargs):
+    """The original coroutine form (the work inside is synchronous)."""
+    return build_ple_prefetch_hint_sync(body, **kwargs)
+
+
+def build_ple_prefetch_hint_sync(
     body: dict,
     *,
     serving_chat: Any,
