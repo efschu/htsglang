@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # H91c3-3: imported with this module (the front imports it before its loop),
 # never lazily from `d_phase_seats` -- d_seats is stdlib-only at import time.
@@ -242,6 +242,38 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
                    x_routed=int(getattr(p, "x_routed", 0) or 0)):
             return p
     return None
+
+
+#: the park reason D logs for a POST /weg2/flip under the immediate park
+PARK_REASON_MANUAL = "manual-flip"
+
+
+def seat_free(taken: int, seats: int) -> bool:
+    """PARK-SEAT-FREE (NF arrival_seat_rule.seat_free): one more parallel
+    decode fits D's seat count."""
+    return int(seats) > 0 and int(taken) < int(seats)
+
+
+def resumed_min_dwell_hold(resumed_t: Mapping[str, float], running: Iterable[str], now: float,
+                           need_s: Optional[float]) -> Optional[Tuple[str, float]]:
+    """PARK-SEAT-FREE MIN-DWELL (NF arrival_seat_rule.min_dwell_hold, NF y5c
+    30.09.: weg2-0-2 parked 6x, its client gone at 235 s): the resumed running
+    decode with the SHORTEST dwell and that dwell while it is below ``need_s``
+    (the measured flip round trip) -> the seat-free park waits; else None.
+    ``need_s`` None/<= 0 (unmeasured) never holds -- no constant."""
+    if need_s is None or float(need_s) <= 0.0:
+        return None
+    worst = None
+    for rid in running:
+        t = resumed_t.get(rid)
+        if t is None:
+            continue
+        dwell = max(0.0, float(now) - float(t))
+        if worst is None or dwell < worst[1]:
+            worst = (rid, dwell)
+    if worst is None or worst[1] >= float(need_s):
+        return None
+    return worst
 
 
 def immediate_park_dwell_ok(awake_s: float, min_dwell_ms: float, floor_ms: float) -> bool:

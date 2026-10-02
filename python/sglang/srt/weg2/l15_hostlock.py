@@ -100,3 +100,27 @@ def release_wake_refs(kv_pool, mamba_pool, held: Tuple[Sequence[int], ...],
     gave += len(_ref_pool(mamba_pool, _distinct(an), -1, log,
                           "anchor-wake-release"))
     return gave
+
+
+def rearm_sink(get: Callable[[], object], put: Callable[[object], None],
+               pools: Callable[[], Tuple[object, object]],
+               log: Callable[[str], None]) -> Callable[[object], None]:
+    """L15-FIX-HOSTLOCK-REARM: the hold-record sink of the sleep hook.
+
+    The retain hook fires on EVERY flush while D is parked; N3o (02.10.
+    05:48:44/50) ran it twice in one sleep (the flip's pre-sleep flush, then
+    the release RPC's flush). Each retain pins its held L2 slots; the wake
+    releases ONE record. So a new record supersedes the previous one: store
+    the new record, THEN release the old one (the new refs are already taken,
+    the shared slots never drop to 0 in between). A ``None`` record (a retain
+    that pinned nothing) also releases the previous record.
+    """
+    def _sink(rec) -> None:
+        prev = get()
+        put(rec)
+        if prev:
+            kv, mb = pools()
+            n = release_wake_refs(kv, mb, prev, log)
+            log("L15-HOSTLOCK superseded record released (%d ref(s)) -- a "
+                "second retain in this sleep re-pinned the hold" % n)
+    return _sink

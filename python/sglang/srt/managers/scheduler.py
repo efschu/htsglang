@@ -20289,6 +20289,7 @@ class Scheduler(
             try:
                 from sglang.srt.weg2 import (
                     l15_bind,
+                    l15_hostlock,
                     l15_keep_arm,
                     l15_manifest,
                     l15_plan,
@@ -20458,8 +20459,13 @@ class Scheduler(
                             # sink means "master on": the arena refs the
                             # sleep pins are recorded here and released by
                             # the wake act (_l15_wake_act / fallback drop).
-                            hold_sink=lambda _rec: setattr(
-                                self, "_l15_host_hold", _rec),
+                            hold_sink=l15_hostlock.rearm_sink(
+                                get=lambda: getattr(self, "_l15_host_hold", None),
+                                put=lambda _rec: setattr(
+                                    self, "_l15_host_hold", _rec),
+                                pools=lambda: l15_bind.live_host_pools(
+                                    self.tree_cache),
+                                log=logger.info),
                         )
                         # L15-12c-C2: alignment probe -- chain host rows vs
                         # the seqlen-1 KV span; the first L15=1 boot confirms

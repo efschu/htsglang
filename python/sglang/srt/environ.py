@@ -3940,6 +3940,18 @@ class Envs:
     # the immediate park byte for byte.
     # WINDOW_S: a fixed timer x instead of the measured price (override only).
     SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW = EnvBool(False)
+    # PARK-SEAT-FREE (27B flip layout, 02.10.; N3o ...10020544: the collect
+    # window held P-bound arrivals 20-46 s while D ran 1-4 of its 6 seats --
+    # DP-WAIT hold_by=d-work, p90 60 s; NF prefills after ~2 s). The NF
+    # ARRIVAL-SEAT rule's case (a), user 29.09. ~19:40Z, ported minimal: with
+    # the collect window on, a P-bound queue head while a D seat is FREE
+    # (running + hand-offs + ready_for_d < --d-bs) parks at once -- no collect
+    # window -- behind the immediate park's own dwell and NF's MIN-DWELL (a
+    # decode D resumed this phase first decodes one measured round trip). No
+    # seat free: the collect window decides as before. Not ported: NF's KV
+    # ladder test, the youngest/KV displacement, the AGE plan. Off = the
+    # collect window byte for byte.
+    SGLANG_WEG2_ENABLE_PARK_SEAT_FREE = EnvBool(False)
     SGLANG_WEG2_PARK_COLLECT_WINDOW_S = EnvFloat(None)
     SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS = EnvInt(0)
     # PARK-WINDOW-GATE (27B decision 29.09. ~13:55Z, F22 audit: the park RPC

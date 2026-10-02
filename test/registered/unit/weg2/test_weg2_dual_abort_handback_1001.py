@@ -128,10 +128,14 @@ class DualAbortHandback(CustomTestCase):
         self.assertIsNone(C.dual_handback_min_tokens({}))
 
     def test_wiring(self):
+        # RELEASE-HEAD 1002: the base calls the hooks through the class
+        # (bare-namespace harnesses, #791c) and reads the hand-back minimum
+        # through handback_claim (27B fe5c55041b, covers the dual layout)
         now = inspect.getsource(S.Scheduler._abort_request_now)
-        self.assertLess(now.index("self._weg2_defer_waiting_abort(recv_req)"),
+        self.assertLess(now.index("_weg2_defer_waiting_abort(self, recv_req)"),
                         now.index("for i, req in enumerate(self.waiting_queue):"))
         pend = inspect.getsource(S.Scheduler.process_pending_chunked_abort)
-        self.assertLess(pend.index("self._weg2_process_waiting_aborts()"),
+        self.assertLess(pend.index("_weg2_process_waiting_aborts(self)"),
                         pend.index("req = self._pending_chunked_abort_req"))
-        self.assertIn("dual_handback_min_tokens()", inspect.getsource(S.Scheduler._prefetch_kvcache))
+        self.assertIn("handback_min_tokens(has_handoff=_weg2_hb_handoff)",
+                      inspect.getsource(S.Scheduler._prefetch_kvcache))

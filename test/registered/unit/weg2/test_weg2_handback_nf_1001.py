@@ -124,7 +124,12 @@ def test_nf_d_claim_stays_upstream(monkeypatch):
     # 27B fe5c55041b widens an exact-bigram D to N raw tokens; NF keeps N-1
     # (P's CLAIM ANCHOR floor_page(N-2) is filed for exactly this claim)
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.weg2 import form
 
+    # RELEASE-HEAD 1002: the 27B claim is in this tree too, gated by the
+    # profile (handback_claim_n) -- the NF form names its profile
+    monkeypatch.setattr(form, "current_form", lambda environ=None: SimpleNamespace(profile="nextflash"))
+    monkeypatch.delenv("SGLANG_WEG2_HANDBACK_CLAIM_N", raising=False)
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
     monkeypatch.setenv("SGLANG_WEG2_BIGRAM_ANCHOR_EXACT", "1")
     me = SimpleNamespace(return_logprob=False, logprob_start_len=-1)

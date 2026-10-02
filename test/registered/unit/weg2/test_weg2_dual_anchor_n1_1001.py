@@ -123,4 +123,5 @@ class DualAnchorN1(CustomTestCase):
         self.assertIn("token_ids_full = _ids_with_tail(req.origin_input_ids[:kv_committed_len], _tail)", src)
         self.assertIn("_dac_note(bool(v))", src)
         self.assertIn('"SGLANG_WEG2_BIGRAM_ANCHOR_EXACT": "1"', inspect.getsource(L.dual_share_env))
-        self.assertIn("if dual_bigram_claim():", inspect.getsource(Req._compute_max_prefix_len))
+        # RELEASE-HEAD 1002: the claim goes through handback_claim (flip + dual)
+        self.assertIn("if handback_bigram_claim():", inspect.getsource(Req._compute_max_prefix_len))
