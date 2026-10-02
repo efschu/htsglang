@@ -20708,9 +20708,10 @@ class Scheduler(
             # otherwise the armed ranks give it back and flush plain too.
             try:
                 if _l15_agree_on and _l15_pre_why is None:
+                    _l15_rk, _l15_pfx = _l15_sa2.rank_prefix(self)
                     _l15_post = _l15_sa2.agree(
                         _l15_sa2.post_vote(_l15_res, l15_shadow.own_cap_rows(
-                            self, os.environ)),
+                            self, os.environ), prefix=_l15_pfx, rank=_l15_rk),
                         _l15_gather)
                     if _l15_post is not None:
                         if _l15_res is not None:

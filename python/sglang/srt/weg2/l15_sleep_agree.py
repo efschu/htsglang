@@ -25,7 +25,7 @@ Two host gathers over D's group, both at positions every D rank reaches:
 from __future__ import annotations
 
 import os
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
 
 def gather_for(sched) -> Callable[[object], List[object]]:
@@ -66,7 +66,8 @@ def agree(why: Optional[str], gather) -> Optional[str]:
     return None if not bad else str(bad[0])
 
 
-def post_vote(res, cap_rows: int) -> Optional[str]:
+def post_vote(res, cap_rows: int, prefix: Optional[Sequence[int]] = None,
+              rank: Optional[int] = None) -> Optional[str]:
     """This rank's POST vote: None when its round armed AND it will be able
     to honour the hold at the wake. A cap-0 rank refills from L2, which
     needs every held span's END anchor L2 identity -- without it the wake
@@ -81,7 +82,45 @@ def post_vote(res, cap_rows: int) -> Optional[str]:
                    if int(getattr(sp, "anchor_l2_slot", -1)) < 0]
         if missing:
             return "cap-0 rank: END anchor without L2 identity for %s" % missing[:4]
+        # L15-UNBACKED-REFUSE (N5n 14:44:17, dac8b62b8c): a LONG freshly handed
+        # over from P sat on D with ~2% of its chain written back to L2
+        # (L15-HOSTLOCK slots=2304 for 133k held tokens); the cap-0 rank's wake
+        # refill then had 1006 rows to load of ~47k owned, and the hold was
+        # paid (480 ms) and dropped at the wake (4.2 s to the first token). A
+        # cap-0 rank keeps NOTHING on its card -- every owned held token must
+        # come back from L2, so one token without an L2 source means the hold
+        # cannot be honoured: refuse it HERE (every rank then flushes plain)
+        # rather than wait for the write-through inside the flip.
+        if prefix is not None and rank is not None:
+            from sglang.srt.weg2 import l15_restore
+
+            m = getattr(res, "manifest", None)
+            if m is not None:
+                miss = int(l15_restore.count_missing(m, int(rank), list(prefix)))
+                if miss:
+                    return ("cap-0 rank: %d owned held token(s) without an L2 "
+                            "source (unbacked chain, refill impossible)" % miss)
     return None
+
+
+def rank_prefix(sched) -> Tuple[int, List[int]]:
+    """(tp_rank, cumulative CP token-ratio prefix) the restore plans use."""
+    tp = int(getattr(sched, "tp_size", 0) or getattr(
+        getattr(sched, "server_args", None), "tp_size", 1) or 1)
+    rank = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0)
+    try:
+        from sglang.srt.distributed.utils import get_cp_token_ratios
+
+        ratios = get_cp_token_ratios()
+    except Exception:  # noqa: BLE001 -- no CP ratios: even split
+        ratios = None
+    vw = ([int(x) for x in ratios]
+          if ratios is not None and len(ratios) == tp
+          and all(int(x) > 0 for x in ratios) else [1] * tp)
+    prefix = [0]
+    for x in vw:
+        prefix.append(prefix[-1] + x)
+    return rank, prefix
 
 
 def undo_armed(sched, manifest_path: str, log) -> None:
