@@ -10847,6 +10847,13 @@ class SchedulerWeightUpdaterManager:
                         "W26 Weg2WakeInvariantRefused: flush_cache() refused after resume(kv_cache) "
                         "(the group is not idle?) -- the pools hold recycled pages, serving on them is unsafe"
                     )
+                # DP-NACHLAUF WEG2-FIRST-FWD-TIMING: the next forwards are timed
+                try:
+                    from sglang.srt.weg2 import first_fwd_timing as _fft
+
+                    _fft.arm("kv_resume")
+                except Exception:  # noqa: BLE001 -- an instrument never breaks the wake
+                    pass
                 # DP-NACHLAUF WAKE-PRELOAD: the held requests' prefix H2D starts
                 # here, after the re-zero and before the reply (group-voted)
                 try:
