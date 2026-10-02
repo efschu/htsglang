@@ -131,6 +131,8 @@ ZEROFILL = "ZEROFILL"
 
 #: CUDA constants, spelled once.
 CUDA_MEMCPY_DEFAULT = 4
+#: cudaErrorNotReady -- cudaStreamQuery on a stream with work still queued.
+CUDA_ERROR_NOT_READY = 600
 CUDA_HOST_REGISTER_PORTABLE = 0x01
 CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 1
 CUDA_IPC_HANDLE_SIZE = 64
@@ -682,6 +684,15 @@ class DeviceOps:
         """The strided form of :meth:`memcpy_async_held`."""
         self.memcpy2d_async(dst, dpitch, src, spitch, width, height, stream)
 
+    def stream_done_held(self, stream: int) -> Optional[bool]:
+        """FLIP-LEGS 02.10.: has ``stream`` drained? Asked WITHOUT releasing
+        the GIL (``cudaStreamQuery`` never blocks). True = done, the caller
+        may skip its blocking synchronize (and the GIL round trip that comes
+        with it); False = not yet; None = unknown or an error -- the caller
+        synchronizes as before and that call reports the error. Default:
+        None (always synchronize)."""
+        return None
+
     # -- host pinning -----------------------------------------------------
     def host_register(self, ptr: int, nbytes: int, flags: int) -> None:
         raise NotImplementedError
@@ -846,6 +857,8 @@ class CudartDeviceOps(DeviceOps):
         held = ctypes.PyDLL(self.path)
         held.cudaMemcpyAsync.argtypes = list(lib.cudaMemcpyAsync.argtypes)
         held.cudaMemcpy2DAsync.argtypes = list(lib.cudaMemcpy2DAsync.argtypes)
+        held.cudaStreamQuery.argtypes = [ctypes.c_void_p]
+        held.cudaGetLastError.argtypes = []
         self.lib_held = held
 
     def _check(self, rc: int, what: str) -> None:
@@ -940,6 +953,18 @@ class CudartDeviceOps(DeviceOps):
                                             ctypes.c_void_p(stream)),
             "cudaMemcpy2DAsync",
         )
+
+    def stream_done_held(self, stream: int) -> Optional[bool]:
+        rc = int(self.lib_held.cudaStreamQuery(ctypes.c_void_p(stream)))
+        if rc == 0:
+            return True
+        if rc == CUDA_ERROR_NOT_READY:
+            # not an error, but the runtime latches it as the last error --
+            # cleared here, as torch's event/stream queries do, so no later
+            # cudaGetLastError poll reads it as a failure (#1378 xsn71)
+            self.lib_held.cudaGetLastError()
+            return False
+        return None   # a real error: the caller's blocking synchronize reports it
 
     def memcpy2d_async(self, dst: int, dpitch: int, src: int, spitch: int,
                        width: int, height: int, stream: int) -> None:

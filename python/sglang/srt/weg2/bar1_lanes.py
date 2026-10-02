@@ -431,6 +431,17 @@ ENV_COLLECT_PREPLAN = "SGLANG_WEG2_BAR1_COLLECT_PREPLAN"
 #: device memory) is issued through the GIL-holding entry points
 #: (DeviceOps.memcpy_async_held). Unset = on; 0/false/no/off = CDLL as before.
 ENV_COLLECT_HOLD_GIL = "SGLANG_WEG2_BAR1_COLLECT_HOLD_GIL"
+#: FLIP-LEGS 02.10. (same mechanism, the depositor's side): its copies into the
+#: peer's BAR1 window (device -> the peer window, registered IO memory with a
+#: device pointer -- an async DMA queue-and-return). The host spill path and
+#: the backlog feed stay on CDLL. Unset = on; 0/false/no/off = CDLL.
+ENV_DEPOSIT_HOLD_GIL = "SGLANG_WEG2_BAR1_DEPOSIT_HOLD_GIL"
+#: FLIP-LEGS 02.10.: before each per-batch synchronize the lane asks
+#: cudaStreamQuery WITHOUT releasing the GIL; a drained stream (the one-behind
+#: sync usually finds its batch done) skips the blocking call and its GIL round
+#: trip. A busy stream still synchronizes, blocking, GIL released -- a
+#: synchronizing call never holds the GIL. Unset = on; 0/false/no/off = off.
+ENV_SYNC_QUERY_HELD = "SGLANG_WEG2_LANE_SYNC_QUERY_HELD"
 _SEQ_MARK = "\x00seq\x00"
 
 
@@ -449,6 +460,28 @@ def collect_preplan_on(env: Optional[_Map[str, str]] = None) -> bool:
 
 def collect_hold_gil_on(env: Optional[_Map[str, str]] = None) -> bool:
     return _env_on(ENV_COLLECT_HOLD_GIL, env)
+
+
+def deposit_hold_gil_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_DEPOSIT_HOLD_GIL, env)
+
+
+def sync_query_held_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_SYNC_QUERY_HELD, env)
+
+
+def deposit_copiers(ops, env: Optional[_Map[str, str]] = None):
+    """FLIP-LEGS 02.10.: (memcpy, memcpy2d, mode) for the depositor's plain
+    (copy-engine) path into the peer window -- see :func:`collect_copiers`."""
+    held = bool(getattr(ops, "held_gil", False)) and deposit_hold_gil_on(env)
+    if held:
+        return ops.memcpy_async_held, ops.memcpy2d_async_held, "held"
+    return ops.memcpy_async, ops.memcpy2d_async, "released"
+
+
+def sync_query_mode(ops, env: Optional[_Map[str, str]] = None) -> bool:
+    """FLIP-LEGS 02.10.: may the lane ask the stream before it synchronizes?"""
+    return callable(getattr(ops, "stream_done_held", None)) and sync_query_held_on(env)
 
 
 def collect_copiers(ops, env: Optional[_Map[str, str]] = None):
@@ -1281,9 +1314,12 @@ class LaneClock:
     enqueue of the copies, ``send_ms`` the credit sends.
     """
 
-    __slots__ = ("credit", "issue", "sync", "sync_cpu", "max_sync", "send")
+    __slots__ = ("credit", "issue", "sync", "sync_cpu", "max_sync", "send",
+                 "syncs", "sync_skipped")
 
     def __init__(self) -> None:
+        self.syncs = 0          # FLIP-LEGS: per-batch syncs asked for ...
+        self.sync_skipped = 0   # ... and how many found the stream drained
         self.credit = 0.0
         self.issue = 0.0
         self.sync = 0.0
@@ -1303,9 +1339,14 @@ class LaneClock:
                 f"max_sync_ms={self.max_sync * ms:.1f} send_ms={self.send * ms:.0f}")
 
 
-def timed_sync(ops, stream, clock: LaneClock) -> None:
+def timed_sync(ops, stream, clock: LaneClock, query: bool = False) -> None:
     tc, cc = time.perf_counter(), time.thread_time()
-    ops.synchronize(stream)
+    clock.syncs += 1
+    if query and ops.stream_done_held(stream) is True:
+        # FLIP-LEGS: drained already -- no blocking call, no GIL round trip
+        clock.sync_skipped += 1
+    else:
+        ops.synchronize(stream)
     clock.add_sync(wall_s=time.perf_counter() - tc, cpu_s=time.thread_time() - cc)
 
 
@@ -1451,10 +1492,13 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     # window (local D2D) and stays on memcpy.
     if role == "src":
         cmode, copier, cwhy = deposit_copy_mode(ops, device)
-        out_cp, out_cp2d, gil_mode = ops.memcpy_async, ops.memcpy2d_async, ""
+        out_cp, out_cp2d, gil_mode = deposit_copiers(ops)
+        if copier is not None:
+            gil_mode = "sm-copier"   # H22: the SM copier issues; not this switch
     else:
         cmode, copier, cwhy = COPY_SERIAL, None, ""
         out_cp, out_cp2d, gil_mode = collect_copiers(ops)
+    sync_q = sync_query_mode(ops)
     cblocks = sm_blocks() if copier is not None else 0
     slow = 0          # this tag's bytes that could not take the 16-B SM path
     t0 = time.perf_counter()
@@ -1605,7 +1649,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                         f"({len(plan)}) -- the two plans disagree")
 
         def _finish(g):
-            timed_sync(ops, streams[ring_slot(g, ring)], clk)
+            timed_sync(ops, streams[ring_slot(g, ring)], clk, query=sync_q)
             ts = time.perf_counter()
             cred.send("full" if role == "src" else "free", g)
             clk.send += time.perf_counter() - ts
@@ -1647,10 +1691,10 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                                 int(piece.run_bytes), int(piece.rows), stream,
                                 blocks=cblocks) or 0)
                     elif piece.kind == tp.FLAT:
-                        ops.memcpy_async(dst, src, int(piece.nbytes), stream)
+                        out_cp(dst, src, int(piece.nbytes), stream)
                     else:
-                        ops.memcpy2d_async(dst, int(piece.run_bytes), src, int(piece.spitch),
-                                           int(piece.run_bytes), int(piece.rows), stream)
+                        out_cp2d(dst, int(piece.run_bytes), src, int(piece.spitch),
+                                 int(piece.run_bytes), int(piece.rows), stream)
                 clk.issue += time.perf_counter() - ti
                 if g >= lag:
                     _finish(g - lag)
@@ -1757,7 +1801,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
         f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
         f"lag={lag} prep_ms={prep_s * 1000:.0f}"
-        + (f" issue_gil={gil_mode}" if gil_mode else ""))
+        + (f" issue_gil={gil_mode}" if gil_mode else "")
+        + f" sync_query={'held' if sync_q else 'off'} sync_skipped={clk.sync_skipped}/{clk.syncs}")
     return ""
 
 
