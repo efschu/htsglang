@@ -8772,6 +8772,9 @@ class Front:
         # announced to the SHORTs priced beside it -- from HERE, before the
         # BOOT-START HOLD, so arrivals one hold releases are priced as a group.
         _pb_fut = Front._pb_register(self, rid, remainder) if self.x_exact else None
+        # EARLY-FLIP: D idle and a chars/3 price far over X -> the D->P flip begins
+        # NOW, beside the count and the probe below; it awaits this verdict
+        _ef = Front._early_flip_maybe(self, rid, remainder) if self.x_exact else None
         # X-EXACT: the count replaces the chars/3 figures (off: never entered).
         _xx = None
         if self.x_exact:
@@ -8913,6 +8916,10 @@ class Front:
             len(text),
         )
         Front._pb_resolve(self, rid, _pb_fut, route, remainder)  # PRICE-BARRIER: the verdict, for the SHORTs waiting on it
+        if _ef is not None:
+            # EARLY-FLIP: the verdict for the flip already under way; not LONG ->
+            # its abort settles (D serving again) before this request is routed
+            await Front._early_flip_verdict(self, _ef, route, rid)
         if route == "none":
             # TERMINAL AT ADMISSION, and 4xx only when the request provably
             # does not fit this server (`refusal_status`: an EXACT count over
@@ -9358,6 +9365,123 @@ class Front:
                     len(moved), total, x_idle, self._x_band_floor(),
                     [p.rid for p in moved][:8], max(0.0, now - min(p.t_arrive for p in moved)))
         return "moved"
+
+    # -- EARLY-FLIP (02.10.) -----------------------------------------------------------
+    def _early_flip_maybe(self, rid: str, est_uncached: int):
+        """EARLY-FLIP: begin the D->P flip now for ``rid`` -- only with D idle and a
+        chars/3 price >= the factor x X; returns the handle the verdict resolves,
+        or None (the old path: the flip waits for the verdict)."""
+        try:
+            if not envs.SGLANG_WEG2_EARLY_FLIP.get():
+                return None
+            x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+            factor = float(envs.SGLANG_WEG2_EARLY_FLIP_X_FACTOR.get())
+            if x <= 0 or int(est_uncached or 0) < factor * x:
+                return None
+            if (getattr(self, "dual_layout", False) or self.awake != "D" or self.state != "serving"
+                    or not self.admit_d or getattr(self, "_flip_open", False)
+                    or self.__dict__.get("_early_flip_open") is not None):
+                return None
+            D = self.groups["D"]
+            if (self.queue or self._ready_for_d or self._flip_ledger(D) or D.outstanding
+                    or self._handoff_in_flight()):
+                return None  # D IDLE only: nothing to park, nothing handed over
+        except Exception:  # noqa: BLE001 -- a partial front: the old path
+            return None
+        from types import SimpleNamespace
+
+        loop = asyncio.get_running_loop()
+        h = SimpleNamespace(rid=rid, gate=loop.create_future(), t_begin=time.time(),
+                                  t_verdict=None, task=None, est=int(est_uncached), x=x)
+        self.__dict__["_early_gate"] = h
+        self.__dict__["_early_flip_open"] = h
+        self.counters["early_flip_begin"] += 1
+        logger.info("WEG2-EARLY-FLIP begin rid=%s est_uncached=%d X=%d factor=%.1f (D idle; drain + "
+                    "quiesce run beside the count and the probe, the first sleep RPC waits for the "
+                    "verdict; SGLANG_WEG2_EARLY_FLIP)", rid, int(est_uncached), x, factor)
+        h.task = asyncio.ensure_future(self.flip("D", "P"))
+        h.task.add_done_callback(lambda _t, h=h: self.__dict__.get("_early_flip_open") is h
+                                 and self.__dict__.pop("_early_flip_open", None))
+        me = asyncio.current_task()
+        if me is not None:
+            # a handler that ends before its verdict (client gone, refusal, error)
+            me.add_done_callback(lambda _t, h=h: h.gate.done() or h.gate.set_result(False))
+        return h
+
+    async def _early_flip_verdict(self, h, route: str, rid: str) -> None:
+        """EARLY-FLIP: resolve the flip's gate with this arrival's verdict; not
+        LONG -> wait until the aborted flip has handed D back (bounded)."""
+        long_ = route == "long"
+        if not h.gate.done():
+            h.t_verdict = time.time()
+            h.gate.set_result(bool(long_))
+        if long_ or h.task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(h.task),
+                                   envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0 + 5.0)
+        except Exception as e:  # noqa: BLE001 -- the route below reads whatever state is left
+            logger.warning("WEG2-EARLY-FLIP rid=%s: the aborted flip did not settle: %r", rid, e)
+
+    async def _early_flip_gate(self, h, t_flip0: float) -> bool:
+        """EARLY-FLIP, inside the flip after the quiesce: the verdict, then the
+        same economics and MIN-DWELL the controller asks -- True = go on."""
+        t_wait0 = time.time()
+        try:
+            go = bool(await asyncio.wait_for(asyncio.shield(h.gate),
+                                             envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0 + 1.0))
+        except asyncio.TimeoutError:
+            h.why = "verdict-timeout"
+            return False
+        h.why = "verdict-not-long"
+        if not go:
+            return False
+        if not self._flip_economics_ok(False):
+            h.why = "economics-hold"
+            return False
+        if not self._dwell_ok("D", "P", False, work_exhausted=True, oldest_wait_s=0.0):
+            h.why = "min-dwell-hold"
+            return False
+        now = time.time()
+        t_v = h.t_verdict or now
+        saved_ms = (min(t_v, t_wait0) - t_flip0) * 1000.0
+        self.counters["early_flip_go"] += 1
+        logger.info("WEG2-EARLY-FLIP go rid=%s epoch=%d verdict_after_begin_ms=%.0f gate_wait_ms=%.0f "
+                    "saved_ms=%.0f (drain + quiesce done before the verdict existed)", h.rid, self.epoch,
+                    (t_v - t_flip0) * 1000.0, (now - t_wait0) * 1000.0, saved_ms)
+        # DP-NACHLAUF: the trigger was queued after the begin -- its leg 1 goes to
+        # the dormant P now, as the begin would have posted it
+        if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
+            for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
+                _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
+                self.counters["leg1_early"] += 1
+                logger.info("WEG2 LEG1-EARLY rid=%s epoch=%d (posted at the EARLY-FLIP go, before "
+                            "the first sleep RPC)", _ep.rid, self.epoch)
+        return True
+
+    def _early_flip_abort(self, h, src: str, dst: str) -> None:
+        """EARLY-FLIP: nothing slept -- D is awake and serving again, the flip's
+        bookkeeping is closed as if it had not begun (no epoch, no done)."""
+        now = time.time()
+        self._enter_state("serving")
+        self._flip_dst = None
+        try:
+            self._flip_cushion_close()
+        except Exception:  # noqa: BLE001 -- an instrument
+            pass
+        self._flip_t0 = None
+        self._flip_stage = "none"
+        self._flip_marks = {}
+        for clk in (self._ipc_dp_clock(), self._ipc_first_work_clock()):
+            if hasattr(clk, "_armed"):
+                clk._armed = None
+        Front._flip_phase(self).abort(now, "early-flip-" + str(getattr(h, "why", "abort")))
+        Front._ipc_live_kick(self)
+        self.counters["early_flip_abort"] += 1
+        logger.warning("WEG2-EARLY-FLIP abort rid=%s epoch=%d why=%s after_ms=%.0f -- no sleep RPC went "
+                       "out: D stays awake and serves (its quiesce flushed the radix; the prefix comes "
+                       "back from L2/L3)", h.rid, self.epoch, getattr(h, "why", "?"),
+                       (now - h.t_begin) * 1000.0)
 
     # -- PRICE-BARRIER (02.10., N5x 16:23:41) ---------------------------------------
     #: an arrival whose chars/3 uncached price is above this share of X is a LONG
@@ -12650,6 +12774,9 @@ class Front:
         if _ic is not None:
             await _ic.before_flip()
         S, D = self.groups[src], self.groups[dst]
+        # EARLY-FLIP: this D->P flip began before its trigger's verdict (see
+        # _early_flip_maybe); it awaits that verdict before the first sleep RPC
+        _early = self.__dict__.pop("_early_gate", None) if (src, dst) == ("D", "P") else None
         if not self._enter_state("flipping"):
             # the STOP landed while the clock unlock was awaited
             self._refuse_flip_in_stop(src, dst, "during the clock unlock")
@@ -12854,6 +12981,12 @@ class Front:
                          f"{wv}: front ledger {sorted(S.outstanding)} vs group({src}) "
                          f"flush_cache (reduced over every rank, #1268) -> {msg[:400]!r}")
             return
+        if _early is not None:
+            # EARLY-FLIP: drain + quiesce ran beside the trigger's pricing; nothing
+            # has slept yet -- the verdict decides whether the first sleep RPC goes
+            if not await Front._early_flip_gate(self, _early, t_flip0):
+                Front._early_flip_abort(self, _early, src, dst)
+                return
         t_q = time.time()
         # 3. THE GATHERED LEGS (C9, spec Amendment A1-1).  src.pause(kv_cache)
         # first, then ONE /release_memory_occupation to S and ONE
