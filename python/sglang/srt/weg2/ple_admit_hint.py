@@ -65,15 +65,28 @@ def ple_hint_skip_reason(path: str, payload: Any) -> Optional[str]:
     return None
 
 
-def ple_hint_body(path: str, payload: dict) -> Optional[dict]:
+def ple_hint_body(path: str, payload: dict, start_hint: Optional[int] = None) -> Optional[dict]:
     """The hint body: the leg-1 path and payload (the payload is the one leg 1
-    will POST: same rid, ``max_tokens`` 1, no stream)."""
+    will POST: same rid, ``max_tokens`` 1, no stream), plus ``start_hint`` --
+    the front's store span of the request (P's first chunk starts there, see
+    ``qwen4_exp_ple_admit.ple_hint_start``) when the front knows it."""
     if ple_hint_skip_reason(path, payload) is not None:
         return None
     body = dict(payload)
     body.pop("stream", None)
     body.pop("stream_options", None)
-    return {"path": path, "payload": body}
+    out = {"path": path, "payload": body}
+    if start_hint is not None and int(start_hint) >= 0:
+        out["start_hint"] = int(start_hint)
+    return out
+
+
+def ple_hint_span(*, span_known: bool, store_span_est: int) -> Optional[int]:
+    """The ``start_hint`` the front sends for a queued request: its store span
+    when the route priced it (``span_known``), else None (P reads the tail)."""
+    if not span_known:
+        return None
+    return max(0, int(store_span_est or 0))
 
 
 # ---------------------------------------------------------------- P side
@@ -136,4 +149,10 @@ async def build_ple_prefetch_hint(
             ids = encode(text)
     if ids and isinstance(ids[0], list):  # a batch is not a leg 1
         return None
-    return PlePrefetchHintReqInput(rid=str(rid), input_ids=[int(t) for t in ids])
+    start_hint = body.get("start_hint")
+    try:
+        start_hint = -1 if start_hint is None else int(start_hint)
+    except (TypeError, ValueError):
+        start_hint = -1
+    return PlePrefetchHintReqInput(rid=str(rid), input_ids=[int(t) for t in ids],
+                                   start_hint=start_hint)

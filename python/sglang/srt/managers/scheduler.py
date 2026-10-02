@@ -8149,6 +8149,8 @@ class Scheduler(
             recv_req.input_ids,
             self.chunked_prefill_size,
             dormant=bool(getattr(self, "weg2_dormant", False)),
+            start_hint=getattr(recv_req, "start_hint", -1),
+            page_size=int(getattr(self, "page_size", 1) or 1),
         )
 
     def readmit_seam_residents(

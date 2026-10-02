@@ -8444,12 +8444,17 @@ class Front:
             HINT_PATH,
             ple_hint_body,
             ple_hint_skip_reason,
+            ple_hint_span,
             ple_hint_wanted,
         )
 
         if not ple_hint_wanted(awake=self.awake, skip_leg1=p.skip_leg1):
             return
-        body = ple_hint_body(p.path, p.payload)
+        # 02.10. (NF y7l): P's first chunk starts at the store span the route
+        # priced (PP0's told) -- the hint reads THAT window, not the tail
+        span = ple_hint_span(span_known=bool(getattr(p, "span_known", False)),
+                             store_span_est=int(getattr(p, "store_span_est", 0) or 0))
+        body = ple_hint_body(p.path, p.payload, start_hint=span)
         g = self.groups.get("P")
         if body is None or g is None or self.session is None:
             # NF z30k: a wanted hint that is not sent is counted by name -- the
@@ -8467,8 +8472,9 @@ class Front:
             t0 = time.time()
             try:  # rpc: the admin bearer token rides along (#1275)
                 code, _ = await self.rpc(g, HINT_PATH, body, 30)
-                logger.info("WEG2 PLE-HINT rid=%s awake=%s status=%d ms=%.0f",
-                            p.rid, self.awake, code, (time.time() - t0) * 1000.0)
+                logger.info("WEG2 PLE-HINT rid=%s awake=%s status=%d ms=%.0f start_hint=%s",
+                            p.rid, self.awake, code, (time.time() - t0) * 1000.0,
+                            "tail" if span is None else span)
             except Exception as e:  # noqa: BLE001 -- a lost hint costs the gain only
                 logger.info("WEG2 PLE-HINT rid=%s failed: %r", p.rid, e)
 
