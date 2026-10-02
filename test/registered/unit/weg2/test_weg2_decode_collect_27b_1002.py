@@ -39,10 +39,13 @@ def _front(waits_s, uncached=_LONG, running=2, **kw):
     fn, ns = H._front(running=running, waits_s=waits_s, awake_s=60.0, uncached=uncached, **kw)
     for q in ns.queue:
         q.fut = types.SimpleNamespace(done=lambda: False)
-    ns.awake, ns.state = "D", "serving"
+    ns.awake, ns.state, ns.admit_d = "D", "serving", True
+    for q in ns.queue:
+        q.d_eligible, q.intake_stalled, q.reroutes = False, False, 0  # not SHORT-routed
     ns.groups = {"D": types.SimpleNamespace(outstanding={})}
-    for name in ("_decode_collect", "_dc_st", "_dc_window_s", "_dc_decoding"):
-        setattr(ns, name, types.MethodType(getattr(F.Front, name), ns))
+    for name in ("_decode_collect", "_dc_st", "_dc_window_s", "_dc_decoding", "_dc_hand_to_d"):
+        if hasattr(F.Front, name):  # _dc_hand_to_d: absent on a7bcf2c08f (red there by assertion)
+            setattr(ns, name, types.MethodType(getattr(F.Front, name), ns))
     return fn, ns
 
 
@@ -86,6 +89,40 @@ def test_a_set_at_most_x_at_d_check_goes_to_d():
     assert ns.counters["decode_collect_release_D"] == 1
     assert ns.counters["decode_collect_release_P"] == 0
     assert ns._dc_state["route"] == "D"
+    # follow-up (coordinator 02.10.): route D hands the whole set to D NOW --
+    # also entries that were not SHORT-routed (d_eligible False), D still decoding
+    assert [q.rid for q in ns._ready_for_d] == ["weg2-16-39", "weg2-16-40"]
+    assert all(q.d_direct for q in ns._ready_for_d) and ns.queue == []
+    assert ns.counters["decode_collect_to_d"] == 2
+
+
+def test_route_d_moves_a_budget_refused_short_while_d_decodes():
+    """Red on a7bcf2c08f: a SHORT that D's #915 budget refused is queued with
+    d_eligible False -- no hand-off took it (X-IDLE-REGRANT / D-SHORT-DRAIN need
+    an idle D or d_eligible), so route D left it queued until D went idle."""
+    fn, ns = _front([7.8], uncached=3000)
+    assert fn(ns, None, time.time()) is None
+    assert ns._flip_ledger(None), "D still decodes"
+    assert [q.rid for q in ns._ready_for_d] == ["weg2-16-39"] and ns.queue == []
+    assert ns.counters["decode_collect_release_D"] == 1
+
+
+def test_a_band_request_is_p_bound_while_d_decodes():
+    """x_deferred (over X_busy, the X in force while D decodes; needs_p/PK2)
+    makes the set P-bound: no D hand-off at 7.5 s, it collects on to 15 s."""
+    fn, ns = _front([7.8], uncached=3000)
+    ns.queue[0].x_deferred = True
+    assert fn(ns, None, time.time()) is None
+    assert list(ns._ready_for_d) == [] and len(ns.queue) == 1
+    assert ns.counters["decode_collect_dcheck_hold"] == 1
+
+
+def test_route_d_leaves_an_intake_stalled_entry():
+    fn, ns = _front([7.8, 1.0], uncached=1000)
+    ns.queue[1].intake_stalled = True
+    assert fn(ns, None, time.time()) is None
+    assert [q.rid for q in ns._ready_for_d] == ["weg2-16-39"]
+    assert [q.rid for q in ns.queue] == ["weg2-16-40"]
 
 
 def test_a_set_at_most_x_before_d_check_still_holds():
@@ -102,6 +139,7 @@ def test_zero_is_the_old_path(monkeypatch):
     assert got is not None, "PARK-NO-DWELL parks at once, as before"
     assert ns.counters["park_no_dwell"] == 1
     assert "_dc_state" not in ns.__dict__
+    assert list(ns._ready_for_d) == []
 
 
 def test_an_idle_d_is_not_held():
