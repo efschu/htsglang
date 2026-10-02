@@ -139,3 +139,226 @@ def progress(prev: Dict[int, Tuple[int, int, int]], cur: Dict[int, Tuple[int, in
         if ts > td and (now_ns - ts) < bound_s * 1e9:
             return f"in forward {ct} for {(now_ns - ts) / 1e9:.1f}s (pid {pid})"
     return None
+
+
+# ---------------------------------------------------------------------------
+# FLIPZEIT D>P END (user order 02.10., NF + 27B identical names): FLIPZEIT runs
+# from the last token of the outgoing phase to the first token of the incoming
+# one ("... zu erstes Token Decode oder PREFILL BATCH BEGINN"). For D>P the end
+# is the BEGIN OF THE FIRST FORWARD ON THE FIRST P PIPELINE STAGE (PP0) after
+# the wake -- not the leg-1 dispatch, and not the last stage either: PP0 ->
+# PP1 -> PP2 of the first chunk is pipeline fill, i.e. prefill compute (y7l:
+# ~6.5 s from PP0's start to PP2's), not flip. Source: this beacon's
+# ``t_start_ns`` of the PP0 rank at its first ``forward_ct`` rise after
+# ``flip_done`` (``prefill_start_source="pp_first_forward"``). The PP-last
+# rank's first rise is read alongside (``pp_last_start_ts``) so the pipeline
+# fill can be shown as prefill. Unavailable -> ``"missing"`` and no timestamp.
+# There is NO fallback (never the leg-1 dispatch, never leg-1 end minus P's
+# own prefill time).
+# ---------------------------------------------------------------------------
+
+SOURCE_PP_FIRST = "pp_first_forward"
+SOURCE_MISSING = "missing"
+#: the probe stops polling after this long without a rise (an idle-layout flip
+#: waits for its first request; 30 min is far past any phase dwell)
+PP_PROBE_TIMEOUT_S = 1800.0
+#: poll period of the probe thread. A P stage's forward of a prefill chunk
+#: lasts tens of ms to seconds; a reading that comes later than ONE forward
+#: shows as a forward_ct jump > 1 and is reported ``missing`` (late_read),
+#: never as a value.
+PP_PROBE_POLL_S = 0.002
+#: the two stages the probe reads
+STAGES = ("first", "last")
+
+
+def pp_rank_of(pid: int) -> Optional[int]:
+    """The pipeline stage of a scheduler rank from its process title
+    (``sglang::scheduler[_DPd][_PPd][_TPd]...``, scheduler.run_scheduler_process
+    sets it): the ``PP`` index, ``0`` when the title carries none (pp_size 1),
+    None when the pid is no scheduler or its title is unreadable."""
+    import re
+
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+            raw = fh.read(4096).replace(b"\0", b" ").decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    m = re.search(r"sglang::scheduler(\S*)", raw)
+    if m is None:
+        return None
+    pp = re.search(r"_PP(\d+)", m.group(1))
+    return int(pp.group(1)) if pp else 0
+
+
+def pp_stage_pids(beacons: Dict[int, Tuple[int, int, int]],
+                  pp_of: Callable[[int], Optional[int]] = pp_rank_of
+                  ) -> Tuple[Dict[str, Dict[int, int]], Optional[str]]:
+    """``({"first": {pid: pp}, "last": {pid: pp}}, None)`` -- the ranks (all TP
+    ranks) of the group's FIRST and LAST pipeline stage (the same with
+    pp_size 1) -- else ``({}, reason)``. One rank of unknown stage makes both
+    unknown: that rank could be exactly the first or the last stage."""
+    if not beacons:
+        return {}, "no_beacon"
+    stages: Dict[int, int] = {}
+    for pid in beacons:
+        r = pp_of(int(pid))
+        if r is None:
+            return {}, f"pp_rank_unknown pid={pid}"
+        stages[int(pid)] = int(r)
+    lo, hi = min(stages.values()), max(stages.values())
+    return {"first": {pid: r for pid, r in stages.items() if r == lo},
+            "last": {pid: r for pid, r in stages.items() if r == hi}}, None
+
+
+def first_rise(baseline: Dict[int, int], cur: Dict[int, Tuple[int, int, int]]) -> Optional[dict]:
+    """One stage's first forward after the baseline: ``{ts, pid, ct}``
+    (``ts`` = that rank's ``t_start_ns`` in seconds), ``{missing: reason}`` when
+    the reading came after a later forward already overwrote the first one's
+    start (forward_ct rose by more than one), None while no rank rose."""
+    best = None
+    late = None
+    for pid, base in baseline.items():
+        c = cur.get(pid)
+        if c is None or c[0] <= base:
+            continue
+        ct, ts, _td = c
+        if ct - base > 1:
+            late = late or f"late_read pid={pid} forward_ct {base}->{ct}"
+            continue
+        if best is None or ts < best["ts_ns"]:
+            best = {"ts_ns": int(ts), "pid": int(pid), "ct": int(ct)}
+    if best is not None:
+        return {"ts": best["ts_ns"] / 1e9, "pid": best["pid"], "ct": best["ct"]}
+    if late is not None:
+        return {"missing": late}
+    return None
+
+
+def _read_one(path: str) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(_SIZE)
+        return struct.unpack(_FMT, raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class PpForwardProbe:
+    """Built at a D->P ``flip_done``: the baseline ``forward_ct`` of the woken
+    group's FIRST and LAST pipeline stage. :meth:`start` runs a daemon thread
+    that reads their beacon files every :data:`PP_PROBE_POLL_S` until both
+    stages rose (or :meth:`stop`, or the timeout) and calls
+    ``on_result(stage, result)`` once per stage -- ``{ts, pid, ct, pp_rank}``
+    or ``{missing: reason}``. ``results["first"]`` is the D->P flip's end.
+    :meth:`poll` reads once synchronously. Never raises."""
+
+    def __init__(self, directory: str, group: str, sid: int, *,
+                 session_of: Optional[Callable[[int], Optional[int]]] = None,
+                 pp_of: Callable[[int], Optional[int]] = pp_rank_of,
+                 poll_s: float = PP_PROBE_POLL_S, timeout_s: float = PP_PROBE_TIMEOUT_S) -> None:
+        import threading
+
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self.results: Dict[str, Optional[dict]] = {s: None for s in STAGES}
+        self.on_result: Optional[Callable[[str, dict], None]] = None
+        self.baseline: Dict[str, Dict[int, int]] = {s: {} for s in STAGES}
+        self.stages: Dict[str, Dict[int, int]] = {s: {} for s in STAGES}
+        self.paths: Dict[int, str] = {}
+        self.poll_s, self.timeout_s = float(poll_s), float(timeout_s)
+        self._thread = None
+        try:
+            if not enabled():
+                self._set_all({"missing": f"beacon_off {ENV}=0"})
+                return
+            if not directory:
+                self._set_all({"missing": "no_beacon_dir"})
+                return
+            cur = read_group(directory, group, sid, session_of)
+            stages, why = pp_stage_pids(cur, pp_of)
+            if why is not None:
+                self._set_all({"missing": why})
+                return
+            self.stages = stages
+            for s in STAGES:
+                self.baseline[s] = {pid: cur[pid][0] for pid in stages[s]}
+                for pid in stages[s]:
+                    self.paths[pid] = os.path.join(directory, f"{group}-pid{pid}.bin")
+        except Exception as e:  # noqa: BLE001 -- an instrument never breaks a flip
+            self._set_all({"missing": f"probe_error {type(e).__name__}"})
+
+    @property
+    def result(self) -> Optional[dict]:
+        """The D->P end: the FIRST stage's reading."""
+        return self.results["first"]
+
+    def done(self) -> bool:
+        return all(self.results[s] is not None for s in STAGES)
+
+    def _set(self, stage: str, res: dict) -> bool:
+        with self._lock:
+            if self.results[stage] is not None:
+                return False
+            if "pid" in res:
+                res = dict(res, pp_rank=self.stages[stage].get(res["pid"]))
+            self.results[stage] = res
+            cb = self.on_result
+        if cb is not None:
+            try:
+                cb(stage, res)
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+    def _set_all(self, res: dict) -> None:
+        for s in STAGES:
+            self._set(s, dict(res))
+
+    def poll(self) -> Dict[str, Optional[dict]]:
+        """One reading now; the results so far."""
+        if not self.done():
+            cur: Dict[int, Tuple[int, int, int]] = {}
+            for pid, path in self.paths.items():
+                r = _read_one(path)
+                if r is not None and int(r[3]) == int(pid):
+                    cur[pid] = (int(r[0]), int(r[1]), int(r[2]))
+            for s in STAGES:
+                if self.results[s] is None:
+                    res = first_rise(self.baseline[s], cur)
+                    if res is not None:
+                        self._set(s, res)
+        return dict(self.results)
+
+    def start(self, on_result: Optional[Callable[[str, dict], None]] = None) -> None:
+        import threading
+
+        with self._lock:
+            self.on_result = on_result
+            have = {s: r for s, r in self.results.items() if r is not None}
+        if on_result is not None:
+            for s in STAGES:  # already resolved (missing at once): report here, in order
+                if s in have:
+                    try:
+                        on_result(s, have[s])
+                    except Exception:  # noqa: BLE001
+                        pass
+        if self.done():
+            return
+        self._thread = threading.Thread(target=self._run, name="weg2-pp-forward", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        t_end = time.monotonic() + self.timeout_s
+        while not self._stop.is_set():
+            self.poll()
+            if self.done():
+                return
+            if time.monotonic() >= t_end:
+                self._set_all({"missing": f"timeout {self.timeout_s:.0f}s"})
+                return
+            self._stop.wait(self.poll_s)
+
+    def stop(self, reason: str) -> None:
+        """No more polling; a stage without a reading resolves ``missing``."""
+        self._stop.set()
+        self._set_all({"missing": reason})

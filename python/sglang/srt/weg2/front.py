@@ -7114,6 +7114,7 @@ class Front:
         self.state = "STOP"
         self.counters["stop"] += 1
         logger.error("WEG2 STOP %s -- %s", name, detail)
+        Front._dp_ppfwd_stop(self, "front_stop")  # FLIPZEIT D>P: an open reading ends missing
         _fwc = self.__dict__.get("_ipc_fw_clock")
         _fw_none = _fwc.flush("front_stop") if _fwc is not None else None
         if _fw_none is not None:  # FEHLT 3: the last flip's woken group never worked
@@ -7264,10 +7265,152 @@ class Front:
         _l2 = Front._req_book(self).leg2_dispatch_of(rid) if group == "D" and rid is not None else None
         now = time.time()
         ev = c.seen(group, what, rid, now, leg2_dispatch_ts=_l2)
+        if ev is not None and group == "P":
+            # FLIPZEIT D>P (02.10.): the dispatch only arms the reading; the
+            # event and the flip phase's end wait for PP0's first forward
+            Front._dp_ppfwd_first_work(self, ev)
+            return
         if ev is not None:
             self._ipc_publish("flip_first_work", ev)
             Front._flip_phase(self).first_work(now, what)
             Front._ipc_live_kick(self)
+
+    # ---------------- FLIPZEIT D>P END (user order 02.10.) ----------------
+    # FLIPZEIT = last token of the outgoing phase -> first token of the incoming
+    # one ("... zu erstes Token Decode oder PREFILL BATCH BEGINN"). For D->P the
+    # end is the BEGIN OF THE FIRST FORWARD ON THE FIRST P PIPELINE STAGE (PP0)
+    # after the wake: the PP0 rank's progress beacon
+    # (<arena>/progress/P-pid<pid>.bin, t_start_ns) at its first forward_ct rise
+    # after flip_done. It ends flip_user_time (prefill_start_ts,
+    # prefill_start_source="pp_first_forward"), the D->P flip_first_work and the
+    # front's flip phase (front.flip Nachlauf). The PP-last stage's first
+    # forward rides along as flip_user_time.pp_last_start_ts (the pipeline fill
+    # is prefill). Unavailable -> "missing" and no value; NEVER the leg-1
+    # dispatch. Log marker: WEG2-FLIP-PPFWD.
+    def _dp_ppfwd_arm(self) -> None:
+        """At a D->P ``flip_done``: read the woken group P's first/last-stage
+        baseline and start the probe thread. Never raises (an instrument never
+        breaks a flip)."""
+        from sglang.srt.weg2 import progress_beacon as _fp
+
+        _old = self.__dict__.pop("_dp_ppfwd", None)  # a pending first work is THIS flip's: kept
+        if _old is not None:
+            _old.stop("rearmed")
+        try:
+            g = (getattr(self, "groups", None) or {}).get("P")
+            name = getattr(g, "name", None) or "P"
+            sid = int(getattr(g, "sid", 0) or 0)
+            d = _fp.beacon_dir(getattr(self, "tag", "") or "") if _fp.enabled() else ""
+            probe = _fp.PpForwardProbe(d, name, sid)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("WEG2-FLIP-PPFWD epoch=%d stage=first prefill_start_source=missing "
+                           "reason=probe_error %s: %s", int(getattr(self, "epoch", 0) or 0), type(e).__name__, e)
+            ev = self.__dict__.pop("_dp_ppfwd_pending", None)
+            if ev is not None:
+                Front._dp_ppfwd_publish(self, ev, {"missing": f"probe_error {type(e).__name__}"})
+            return
+        probe.epoch = int(getattr(self, "epoch", 0) or 0)
+        probe.t_done = time.time()
+        self.__dict__["_dp_ppfwd"] = probe
+        if probe.result is None:
+            logger.info("WEG2-FLIP-PPFWD armed epoch=%d group=%s pp_first=%s pp_last=%s baseline_forward_ct=%s",
+                        probe.epoch, name, dict(probe.stages["first"]), dict(probe.stages["last"]),
+                        {**probe.baseline["first"], **probe.baseline["last"]})
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        def _cb(stage, res, _probe=probe):  # the probe thread (or here, already resolved)
+            if loop is not None and not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(Front._dp_ppfwd_resolved, self, _probe, stage)
+                except RuntimeError:
+                    pass
+
+        probe.start(_cb)
+
+    def _dp_ppfwd_log(self, probe, stage: str) -> None:
+        logged = probe.__dict__.setdefault("_logged", set())
+        r = probe.results.get(stage)
+        if stage in logged or r is None:
+            return
+        logged.add(stage)
+        if r.get("ts") is None:
+            logger.warning("WEG2-FLIP-PPFWD epoch=%d stage=%s %s=missing reason=%s%s", probe.epoch, stage,
+                           "prefill_start_source" if stage == "first" else "pp_last_start",
+                           r.get("missing"),
+                           " (no D->P flip time; never the leg-1 dispatch)" if stage == "first" else "")
+        elif stage == "first":
+            logger.info("WEG2-FLIP-PPFWD epoch=%d stage=first prefill_start_source=pp_first_forward "
+                        "prefill_start_ts=%.3f pid=%s pp_rank=%s forward_ct=%s done_to_forward_ms=%d",
+                        probe.epoch, r["ts"], r.get("pid"), r.get("pp_rank"), r.get("ct"),
+                        round((r["ts"] - probe.t_done) * 1000.0))
+        else:
+            f = probe.results.get("first") or {}
+            logger.info("WEG2-FLIP-PPFWD epoch=%d stage=last pp_last_start_ts=%.3f pid=%s pp_rank=%s "
+                        "forward_ct=%s pp_fill_ms=%s", probe.epoch, r["ts"], r.get("pid"), r.get("pp_rank"),
+                        r.get("ct"), "-" if f.get("ts") is None else round((r["ts"] - f["ts"]) * 1000.0))
+
+    def _dp_ppfwd_resolved(self, probe, stage: str = "first") -> None:
+        """On the loop: a stage has its reading -- for the FIRST stage (the end)
+        a waiting D->P ``flip_first_work`` is published and the flip phase closes."""
+        if self.__dict__.get("_dp_ppfwd") is not probe:
+            return
+        Front._dp_ppfwd_log(self, probe, stage)
+        if stage != "first":
+            return
+        ev = self.__dict__.pop("_dp_ppfwd_pending", None)
+        if ev is not None:
+            Front._dp_ppfwd_publish(self, ev, probe.result)
+
+    def _dp_ppfwd_publish(self, ev: dict, res: Optional[dict]) -> None:
+        from sglang.srt.weg2 import front_state_ipc as _fsi
+
+        out = _fsi.FirstWorkClock.dp_end(ev, res)
+        self._ipc_publish("flip_first_work", out)
+        Front._flip_phase(self).first_work(time.time(), out.get("what"), at=out.get("prefill_start_ts"))
+        Front._ipc_live_kick(self)
+
+    def _dp_ppfwd_first_work(self, ev: dict) -> None:
+        """The first leg 1 after a D->P flip was dispatched: publish its
+        ``flip_first_work`` once PP0's forward is read (now, if it is)."""
+        probe = self.__dict__.get("_dp_ppfwd")
+        if probe is not None and probe.result is not None:
+            Front._dp_ppfwd_log(self, probe, "first")
+            Front._dp_ppfwd_publish(self, ev, probe.result)
+            return
+        # before `done` (no probe yet) or the forward not yet seen: wait for it
+        self.__dict__["_dp_ppfwd_pending"] = ev
+
+    def _dp_ppfwd_settle(self) -> Tuple[Optional[dict], Optional[dict]]:
+        """At the first leg 1's end: ``(first, last)`` stage readings (one more
+        read now). A leg 1 P served with no rise seen is ``missing`` -- not a value."""
+        probe = self.__dict__.get("_dp_ppfwd")
+        if probe is None:
+            res = {"missing": "no_probe"}  # the flip never reached done, or the probe failed
+            ev = self.__dict__.pop("_dp_ppfwd_pending", None)
+            if ev is not None:
+                Front._dp_ppfwd_publish(self, ev, res)
+            return res, dict(res)
+        probe.poll()
+        if not probe.done():
+            probe.stop("no_rise_by_leg1_end")
+        for stage in ("first", "last"):
+            Front._dp_ppfwd_resolved(self, probe, stage)
+        return probe.results["first"], probe.results["last"]
+
+    def _dp_ppfwd_stop(self, reason: str) -> None:
+        """No more reading for the last D->P flip (next flip, STOP): an open
+        probe ends ``missing``; a waiting ``flip_first_work`` is published."""
+        probe = self.__dict__.pop("_dp_ppfwd", None)
+        ev = self.__dict__.pop("_dp_ppfwd_pending", None)
+        if probe is not None:
+            probe.stop(reason)
+            for stage in ("first", "last"):
+                Front._dp_ppfwd_log(self, probe, stage)
+        if ev is not None:
+            Front._dp_ppfwd_publish(self, ev, probe.result if probe is not None else {"missing": reason})
 
     # ---------------- DASHBOARD-IPC 01.10.: phase live, TTFT per via, sessions ----------------
     def _req_book(self):
@@ -9890,11 +10033,17 @@ class Front:
             _t1 = time.time()
             Front._req_book(self).leg1_done(p.rid, _t1, pt, ct, cached_tier_of(js), d_prefill_seconds(js))
             Front._ipc_first_work_clock(self).note_p_end(_t1)
-            # D->P flip time (user definition): the first leg 1 after a D->P flip
-            # names P's prefill start -- its end minus P's own prefill time
-            _dp = self._ipc_dp_clock().first_prefill(p.rid, t0, time.time(), d_prefill_seconds(js))
-            if _dp is not None:
-                self._ipc_publish("flip_user_time", _dp)
+            # D->P flip time (user definition, 02.10.): the first leg 1 after a
+            # D->P flip publishes it; its END is the begin of the first forward
+            # on the FIRST P pipeline stage (PP0) after `done` (progress beacon;
+            # the PP-last stage's start rides along as pp_last_start_ts) --
+            # `missing` without that reading, never this leg's dispatch or
+            # its end minus P's prefill time.
+            _dpc = self._ipc_dp_clock()
+            if _dpc.armed():
+                _dp = _dpc.first_prefill(p.rid, t0, *Front._dp_ppfwd_settle(self))
+                if _dp is not None:
+                    self._ipc_publish("flip_user_time", _dp)
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
             # USAGE-TRUE: every P leg of the rid (re-route, X-REQUEUE, park
@@ -12041,6 +12190,8 @@ class Front:
         # `done`: with the tail overlap D can stream before the front logs `done`).
         self._ipc_publish("flip_begin", {"epoch_before": self.epoch, "sleep": src, "wake": dst,
                                          "flip_begin_ts": round(t_flip0, 3)})
+        # FLIPZEIT D>P (02.10.): the previous D->P flip's PP reading ends here
+        Front._dp_ppfwd_stop(self, "next_flip_before_forward")
         _fw_none = self._ipc_first_work_clock().arm(self.epoch + 1, src, dst, t_flip0)
         Front._flip_phase(self).layer(f"{src}>{dst}", t_flip0, Front._flip_vorlauf_reason(self, src, dst))
         Front._ipc_live_kick(self)
@@ -12656,6 +12807,8 @@ class Front:
         self._ipc_first_work_clock().done(time.time())  # FEHLT 3: pairs with one flip_first_work
         self._ipc_dp_clock().done(time.time())
         Front._flip_phase(self).done(time.time())  # DASHBOARD-IPC: Layer -> Nachlauf
+        if src == "D" and dst == "P":
+            Front._dp_ppfwd_arm(self)  # FLIPZEIT D>P: P's first stage's first forward from here
         Front._ipc_live_kick(self)
         if dc_off_path:
             _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))

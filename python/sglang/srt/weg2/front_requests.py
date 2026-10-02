@@ -53,6 +53,10 @@ def _r3(x: Optional[float]) -> Optional[float]:
     return None if x is None else round(float(x), 3)
 
 
+#: FlipPhase.first_work: "the work began now"
+_NOW = object()
+
+
 class FlipPhase:
     """``front.flip`` = {phase, dir, since_ts, begin_ts, reason, ...}.
 
@@ -60,7 +64,8 @@ class FlipPhase:
       into ``flip()``) to ``WEG2-FLIP begin``;
     * ``layer``: begin -> ``flip_done`` (the layer swap);
     * ``nachlauf``: done -> the woken group's first work (P->D: the first
-      decode token; D->P: the first P prefill), the ``flip_first_work`` event;
+      decode token; D->P: the begin of the first forward on the last P
+      pipeline stage after ``done``, 02.10.), the ``flip_first_work`` event;
     * ``null``: no flip open. ``last`` keeps the previous flip's three spans.
 
     A first work that comes before ``done`` (the D wake leg ended before the
@@ -103,7 +108,7 @@ class FlipPhase:
         if self.snap["phase"] in ("vorlauf", "layer"):
             return False
         self._set(phase="vorlauf", dir=direction, since_ts=_r3(now), decision_ts=_r3(now),
-                  begin_ts=None, done_ts=None, reason=reason, first_work_ts=None)
+                  begin_ts=None, done_ts=None, reason=reason, first_work_ts=None, first_work_seen=False)
         return True
 
     def layer(self, direction: str, now: float, reason: str) -> None:
@@ -112,7 +117,7 @@ class FlipPhase:
         self._set(phase="layer", dir=direction, since_ts=_r3(now), begin_ts=_r3(now),
                   decision_ts=s["decision_ts"] if same else _r3(now),
                   reason=(s["reason"] if same and s["reason"] else reason),
-                  done_ts=None, first_work_ts=None)
+                  done_ts=None, first_work_ts=None, first_work_seen=False)
         self._hist_close(now, aborted=True)  # a flip never closed ends at the next one
         start = s["decision_ts"] if same and s["decision_ts"] is not None else now
         self.hist.append({"dir": direction, "start": float(min(start, now)), "begin": float(now),
@@ -122,18 +127,23 @@ class FlipPhase:
         self._hist_close(now, aborted=False)
         if self.snap["phase"] != "layer":
             return
-        if self.snap.get("first_work_ts") is not None:
-            self._close(self.snap["first_work_ts"], now, now)
+        if self.snap.get("first_work_seen") or self.snap.get("first_work_ts") is not None:
+            self._close(self.snap.get("first_work_ts"), now, now)
             return
         self._set(phase="nachlauf", since_ts=_r3(now), done_ts=_r3(now))
 
-    def first_work(self, now: float, what: Optional[str] = None) -> None:
+    def first_work(self, now: float, what: Optional[str] = None, at: Any = _NOW) -> None:
+        """The woken group worked. ``at`` = when the work began, if not ``now``
+        (D->P, 02.10.: the begin of the first forward on the last P pipeline
+        stage); ``at=None`` = that reading is missing -- the flip closes with
+        no Nachlauf value, never with the time this call came."""
+        fw = now if at is _NOW else at
         ph = self.snap["phase"]
         if ph == "layer":
-            self._set(first_work_ts=_r3(now), first_work_what=what)
+            self._set(first_work_ts=_r3(fw), first_work_seen=True, first_work_what=what)
         elif ph == "nachlauf":
             self._set(first_work_what=what)
-            self._close(now, self.snap["done_ts"], now)
+            self._close(fw, self.snap["done_ts"], now)
 
     def abort(self, now: float, why: str) -> None:
         """A flip refused / a STOP: no flip open any more (``last`` says why)."""
@@ -147,14 +157,14 @@ class FlipPhase:
         self.snap = {"phase": None, "dir": None, "since_ts": _r3(now), "begin_ts": None, "reason": None,
                      "decision_ts": None, "done_ts": None, "last": last}
 
-    def _close(self, fw: float, done: Optional[float], now: float) -> None:
+    def _close(self, fw: Optional[float], done: Optional[float], now: float) -> None:
         s = self.snap
         last = {"dir": s["dir"], "reason": s["reason"], "decision_ts": s["decision_ts"],
                 "begin_ts": s["begin_ts"], "done_ts": _r3(done), "first_work_ts": _r3(fw),
                 "first_work_what": s.get("first_work_what"),
                 "vorlauf_ms": _ms(s["decision_ts"], s["begin_ts"]),
                 "layer_ms": _ms(s["begin_ts"], done),
-                "nachlauf_ms": max(0, _ms(done, fw) or 0) if done is not None else None,
+                "nachlauf_ms": max(0, _ms(done, fw)) if done is not None and fw is not None else None,
                 "decision_to_first_work_ms": _ms(s["decision_ts"], fw)}
         self.snap = {"phase": None, "dir": None, "since_ts": _r3(now), "begin_ts": None, "reason": None,
                      "decision_ts": None, "done_ts": None, "last": last}

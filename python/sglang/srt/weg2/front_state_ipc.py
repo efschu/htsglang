@@ -353,16 +353,36 @@ class OutstandingBook:
         }
 
 
+def pp_prefill_start(pp_first: Optional[dict]) -> Tuple[Optional[float], str, Optional[str]]:
+    """``(prefill_start_ts, prefill_start_source, missing_reason)`` of a D->P
+    flip from the FIRST P pipeline stage's reading (progress_beacon.PpForwardProbe)
+    -- ``(ts, "pp_first_forward", None)`` or ``(None, "missing", reason)``.
+    There is no third source."""
+    if pp_first and pp_first.get("ts") is not None:
+        return float(pp_first["ts"]), "pp_first_forward", None
+    reason = (pp_first or {}).get("missing") or "no_probe"
+    return None, "missing", str(reason)
+
+
 class DpFlipClock:
     """D->P flip time in the USER's definition (FLIPZEIT-VERLAUF-0929.md, Folgepunkt
     30.09.): Decode-Ende -> P-Prefill-Start, i.e. the last D decode round (the park
     RPC's send when D's decodes were parked for this flip, else D's last served
     leg 2), no earlier than the arrival of the oldest waiter -> the start of P's
-    first prefill (leg 1's end minus P's own prefill time ``weg2_prefill_s``; the
-    leg-1 dispatch when P's body does not carry it -- named as the source).
+    first prefill.
 
-    ``flip_first_work`` stays as it is (flip begin -> first dispatch); this is
-    ONE ``flip_user_time`` event per D->P flip that reached a first leg 1, with
+    THE END (user order 02.10., NF + 27B identical names: "... zu erstes Token
+    Decode oder PREFILL BATCH BEGINN"): the BEGIN OF THE FIRST FORWARD ON THE
+    FIRST P PIPELINE STAGE (PP0) after the wake -- the PP0 rank's progress-beacon
+    ``t_start_ns`` at its first ``forward_ct`` rise after ``flip_done``
+    (weg2/progress_beacon.PpForwardProbe): ``prefill_start_source=
+    "pp_first_forward"``. Without that reading ``prefill_start_source="missing"``,
+    ``prefill_start_ts`` None and no flip time -- NEVER the leg-1 dispatch (the
+    old ``leg1_dispatch`` / ``leg1_end_minus_p_prefill_s`` sources are gone).
+    The PP-last stage's first forward rides along as ``pp_last_start_ts``
+    (``pp_fill_ms`` = the pipeline fill, prefill compute -- not in the flip).
+
+    This is ONE ``flip_user_time`` event per D->P flip that reached a first leg 1, with
     the parts: ``park_rpc_ms`` (the park RPC before the begin), ``pre_begin_ms``
     (decode end -> flip begin), ``legs_ms`` (begin -> done), ``first_chunk_ms``
     (done -> P prefill start). One clock: time.time() of the front."""
@@ -403,18 +423,24 @@ class DpFlipClock:
         if self._armed is not None and self._armed["done_ts"] is None:
             self._armed["done_ts"] = float(now)
 
-    def first_prefill(self, rid: Optional[str], t_dispatch: float, t_end: float,
-                      p_prefill_s: Optional[float]) -> Optional[dict]:
-        """The first leg 1 after the flip finished: the event, or None."""
+    def armed(self) -> bool:
+        """A D->P flip waits for its first leg 1."""
+        return self._armed is not None
+
+    def first_prefill(self, rid: Optional[str], t_dispatch: float,
+                      pp_first: Optional[dict], pp_last: Optional[dict] = None) -> Optional[dict]:
+        """The first leg 1 after the flip finished: the event, or None.
+
+        ``pp_first`` / ``pp_last`` = the probe's reading of the first / last P
+        pipeline stage (``{ts, pid, ct, pp_rank}`` or ``{missing: reason}``;
+        None = no probe)."""
         a = self._armed
         if a is None:
             return None
         self._armed = None
-        if p_prefill_s is not None and p_prefill_s > 0:
-            start, src = max(float(t_dispatch), float(t_end) - float(p_prefill_s)), "leg1_end_minus_p_prefill_s"
-        else:
-            start, src = float(t_dispatch), "leg1_dispatch"
-        done = a["done_ts"] if a["done_ts"] is not None else start
+        start, src, missing = pp_prefill_start(pp_first)
+        last_ts = None if not pp_last or pp_last.get("ts") is None else float(pp_last["ts"])
+        done = a["done_ts"]
         idle = bool(a.get("idle_flip"))
         pre_begin_start = a["start_ts"]
         if idle and float(t_dispatch) > a["start_ts"]:
@@ -423,15 +449,28 @@ class DpFlipClock:
 
         def ms(x, y):
             return None if x is None or y is None else round((float(y) - float(x)) * 1000.0)
+        pf = pp_first or {}
         return {"epoch": a["epoch"], "dir": "D>P", "rid": rid, "idle_flip": idle,
                 "start_ts": round(a["start_ts"], 3), "start_source": a["start_source"],
-                "prefill_start_ts": round(start, 3), "prefill_start_source": src,
+                "prefill_start_ts": None if start is None else round(start, 3),
+                "prefill_start_source": src,
+                "prefill_start_missing": missing,
+                "prefill_start_pid": pf.get("pid"), "prefill_start_pp_rank": pf.get("pp_rank"),
+                "prefill_start_forward_ct": pf.get("ct"),
+                # the pipeline fill (PP0 start -> PP-last start) is prefill, not flip
+                "pp_last_start_ts": None if last_ts is None else round(last_ts, 3),
+                "pp_last_start_missing": (None if last_ts is not None
+                                          else str((pp_last or {}).get("missing") or "no_probe")),
+                "pp_last_start_pp_rank": (pp_last or {}).get("pp_rank"),
+                "pp_fill_ms": ms(start, last_ts),
+                "leg1_dispatch_ts": round(float(t_dispatch), 3),
                 "flip_user_ms": ms(a["start_ts"], start),
                 "parts": {"park_rpc_ms": (None if a["park_rpc_ms"] is None else round(float(a["park_rpc_ms"]))),
                           "pre_begin_ms": ms(pre_begin_start, a["flip_begin_ts"]),
                           "legs_ms": ms(a["flip_begin_ts"], done),
                           "first_chunk_ms": ms(done, start)},
-                "definition": "Decode-Ende -> P-Prefill-Start", "clock": "time.time front"}
+                "definition": "Decode-Ende -> Beginn erster Forward der ersten P-PP-Stufe (PP0)",
+                "clock": "time.time front; prefill_start_ts / pp_last_start_ts = time.time_ns of the rank (same host)"}
 
 
 class FirstWorkClock:
@@ -516,6 +555,24 @@ class FirstWorkClock:
                 "first_work_ts": None, "flip_time_ms": None,
                 "flip_total_ms": round((a["done_ts"] - a["flip_begin_ts"]) * 1000.0),
                 "what": self.NONE, "reason": reason, "rid": None, "clock": "time.time front"}
+
+    @staticmethod
+    def dp_end(ev: dict, pp_first: Optional[dict]) -> dict:
+        """A D->P ``flip_first_work`` with the user's end (02.10.): the begin of
+        the first forward on the FIRST P pipeline stage (``prefill_start_ts``,
+        ``prefill_start_source="pp_first_forward"``) -- ``first_work_ts`` and
+        ``flip_time_ms`` follow it; the dispatch that armed the reading stays
+        only as ``leg1_dispatch_ts``. Without the reading: source ``missing``,
+        ``first_work_ts`` / ``flip_time_ms`` None, never the dispatch."""
+        start, src, missing = pp_prefill_start(pp_first)
+        out = dict(ev)
+        out.update({"leg1_dispatch_ts": ev.get("first_work_ts"),
+                    "prefill_start_ts": None if start is None else round(start, 3),
+                    "prefill_start_source": src, "prefill_start_missing": missing,
+                    "first_work_ts": None if start is None else round(start, 3),
+                    "flip_time_ms": (None if start is None else
+                                     round((start - float(ev["flip_begin_ts"])) * 1000.0))})
+        return out
 
     def seen(self, group: str, what: str, rid: Optional[str], now: float,
              leg2_dispatch_ts: Optional[float] = None) -> Optional[dict]:
