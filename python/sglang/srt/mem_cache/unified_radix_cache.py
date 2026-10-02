@@ -6529,6 +6529,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None or self.disable:
             return stats
         from sglang.srt.weg2 import retain_publish as _rp
+        # FLIPCYCLE H6 (02.10.): the sweep's own split -- the tree walk against
+        # the write_backup issue -- so the flip's quiesce (y6z D flush dispatch
+        # 113-333 ms) names which one it pays.
+        _t_sweep0 = time.perf_counter()
+        _issue_s = 0.0
+        _walked = 0
         self._weg2_sweep_last_refusal = None
         queue = list(first or []) + ([] if chain_only else [self.root_node])   # xsn344: the retain's own chain first
         while queue:
@@ -6545,6 +6551,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
             for child in list(node.children.values()):
                 queue.append(child)
+            _walked += 1
             # #1317 C2/R-5: `l3_present` joins `backuped` as a skip reason.
             # Without it, every node whose host rows the windowed store read
             # recycled reads as un-backed here and is re-written through
@@ -6603,16 +6610,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if callable(_adm) and not _adm(node):
                 stats["skipped_pending"] += 1
                 continue
+            _t_iss = time.perf_counter()
             try:
                 got = self.write_backup(node)
             except Exception as e:  # noqa: BLE001 -- the sweep must not kill the flush
                 logger.warning("WEG2 PUBLISH-SWEEP write_backup raised on node %s: %s: %s",
                                getattr(node, "id", "?"), type(e).__name__, e)
                 got = 0
+            _issue_s += time.perf_counter() - _t_iss
             if got > 0:
                 stats["issued"] += 1
             else:
                 stats["refused"] += 1
+        stats["walked"] = _walked
+        stats["issue_ms"] = round(_issue_s * 1000.0, 1)
+        stats["sweep_ms"] = round((time.perf_counter() - _t_sweep0) * 1000.0, 1)
         if clock is not None:
             stats["ms"] = round(clock.elapsed_ms())
         stats["pending"] = len(self.ongoing_write_through) + len(getattr(self, "ongoing_backup", {}) or {})
@@ -6633,10 +6645,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "WEG2 PUBLISH-SWEEP n=%d unbacked=%d issued=%d refused=%d skipped_pending=%d "
                 "in_flight_after=%d pins=%d/%d draft_issued=%d draft_refused=%d "
                 "(denominator: un-backed device nodes at this flush poll; the draft terms are "
-                "the controller's CUMULATIVE L3 draft write counts, #1233 C18)",
+                "the controller's CUMULATIVE L3 draft write counts, #1233 C18) "
+                "walked=%d sweep_ms=%.1f issue_ms=%.1f",
                 n, stats["unbacked"], stats["issued"], stats["refused"], stats["skipped_pending"],
                 stats["pending"], self._mamba_pins_held(), self._mamba_pin_budget,
                 stats["draft_issued"], stats["draft_refused"],
+                stats["walked"], stats["sweep_ms"], stats["issue_ms"],
             )
         return stats
 

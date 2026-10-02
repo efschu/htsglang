@@ -11004,7 +11004,9 @@ class SchedulerWeightUpdaterManager:
         # must be the GROUP's, because the resume half now carries a collective --
         # one rank on "early" beside a sibling on "late" would deadlock there.
         _sub_t0 = time.perf_counter()
-        _fundable = (self._weg2_wake_kv_first_ok(tags) if _kv_in else False)
+        # FLIPCYCLE H6: a fused weights+kv call asks for the late site only
+        _fundable = (self._weg2_wake_kv_first_ok(tags)
+                     if _kv_in and not getattr(recv_req, "kv_late", None) else False)
         if _kv_in:
             _fundable = self._weg2_kv_group_all(_fundable, "WAKE-KV-FIRST fundable")
         _weg2_sub_t("kv_plan_vote", _sub_t0)
