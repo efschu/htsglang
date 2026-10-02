@@ -287,6 +287,80 @@ def forget_rid_leftovers(tree, rid: str) -> bool:
     return bool(dropped)
 
 
+#: DP-NACHLAUF 02.10. (N5d D->P epoch 25, weg2-24-93): a follower registered
+#: its store read only after PP0's terminated read was published as the told --
+#: PP0 queue 1333 ms + read 206 ms, THEN PP1/PP2 queue ~495 ms + read ~176 ms,
+#: serialised down the pipe before the first prefill forward. With this switch a
+#: follower registers its own read AT INTAKE, beside PP0's; the told stays the
+#: authority for the depth (it caps or confirms, it no longer starts the read):
+#: own == told -> admitted as before; own > told -> the rank holds more than
+#: told (SATISFIED, the match is capped at told, as #1400 xsn141); own < told
+#: -> the told-limited read of #1400 is registered then, as before. A rank that
+#: cannot reach told refuses by name exactly as before (RAENGE-NIE-UNEINS).
+#: "over" is SATISFIED only for an ABSOLUTE told (twin / TK absolute: the
+#: follower's own head is added, the quantities are comparable); a span-relative
+#: told the early read overshot meets #1400's own MISMATCH refusal, by name.
+#: Not with the paced form, the PF follower fallback or dual-share.
+#: DEFAULT OFF: sixteen #1400 desk tests pin the told-first order (among them a
+#: relative-told refusal the early read must not turn into an admission); arm
+#: with SGLANG_WEG2_FOLLOWER_EARLY_READ=1 once a window has shown
+#: FOLLOWER-EARLY-SETTLE ... -> equal on every follower.
+ENV_FOLLOWER_EARLY_READ = "SGLANG_WEG2_FOLLOWER_EARLY_READ"
+
+
+def follower_early_read_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_FOLLOWER_EARLY_READ, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _early_reads(scheduler) -> Dict[str, float]:
+    d = getattr(scheduler, "_weg2_follower_early", None)
+    if d is None:
+        d = scheduler._weg2_follower_early = {}
+    return d
+
+
+def _follower_early_allowed(scheduler) -> bool:
+    # ABSOLUTE tolds only (TK, SGLANG_WEG2_TOLD_ABSOLUTE): the follower's own
+    # head + span is then the quantity PP0's told names, so an overshooting
+    # early read is SATISFIED at told instead of a span-relative MISMATCH
+    return (follower_early_read_on() and _absolute_armed()
+            and not getattr(scheduler, "_weg2_told_paced_on", False)
+            and getattr(scheduler, "_weg2_fb_follower", None) is None
+            and os.environ.get("SGLANG_WEG2_DUAL_SHARE", "").strip() != "1")
+
+
+def follower_early_settle(scheduler, req, told: int, own: int, absolute: bool = False) -> str:
+    """The told against a follower's EARLY read (own completed prefix):
+    ``"equal"`` (admit as #1400 does), ``"over"`` (absolute told only: this
+    rank holds more than told -- SATISFIED at told, its credit popped),
+    ``"refuse"`` (a span-relative told the read overshot: #1400's MISMATCH
+    refusal follows in the admission), ``"short"`` (register the #1400
+    told-limited read now; the admission then waits for it)."""
+    rid = _rid(req)
+    tree = scheduler.tree_cache
+    if int(own) == int(told):
+        return "equal"
+    if int(own) > int(told) and not absolute:
+        return "refuse"
+    if int(own) > int(told):
+        try:
+            _pop_credit_keep_pin(tree, rid)
+        except Exception:  # noqa: BLE001
+            pass
+        satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
+        if satisfied is None:
+            satisfied = scheduler._weg2_store_told_satisfied = {}
+        satisfied[rid] = int(told)
+        return "over"
+    try:
+        _pop_credit_keep_pin(tree, rid)
+    except Exception:  # noqa: BLE001
+        pass
+    _follower_register(scheduler, req, told, early=False)
+    return "short"
+
+
 def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     """The intake step. PP0: register as today and hold. Follower: hold only;
     the registration happens in :func:`follower_absorb` with PP0's told."""
@@ -334,6 +408,17 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
         # order, but a re-queued request can find its told already stored):
         # register now with the told span.
         return _follower_register(scheduler, req, told)
+    if _follower_early_allowed(scheduler):
+        # DP-NACHLAUF: the follower's own read starts now, beside PP0's
+        _ev = scheduler._prefetch_kvcache(req)
+        if str(_ev).startswith("issued"):
+            _early_reads(scheduler)[rid] = time.monotonic()
+        n = getattr(scheduler, "_weg2_follower_early_n", 0) + 1
+        scheduler._weg2_follower_early_n = n
+        if _log_due(n):
+            logger.info("#1400 FOLLOWER-EARLY-READ rid=%s verdict=%s pp=%s (n=%d): the store read "
+                        "starts at intake, beside PP0's; the told caps or confirms it",
+                        _rt(rid), _ev, scheduler.ps.pp_rank, n)
     held[rid] = req
     note_gate(GATE_HELD)
     return f"declined:{GATE_HELD}"
@@ -381,7 +466,13 @@ def prefix_cap_tokens(tree, told: int) -> int:
     return follower_limit_tokens(tree, told)
 
 
-def _follower_register(scheduler, req, told: int) -> str:
+def _follower_register(scheduler, req, told: int, early: bool = True) -> str:
+    if early:
+        # DP-NACHLAUF: an early read of this rid is in flight or done -- the
+        # told settles against it at admission instead of starting a read
+        if _early_reads(scheduler).pop(_rid(req), None) is not None:
+            req._weg2_early_told = int(told)
+            return "early:own_read"
     if getattr(scheduler, "_weg2_fb_follower", None) is not None:
         # PF: whatever this registration's outcome (issued, satisfied,
         # declined), its read state is what PP0's fallback asked for.
@@ -1447,6 +1538,25 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         req._weg2_prefix_cap = prefix_cap_tokens(tree, told)
     except Exception:  # noqa: BLE001
         pass
+    if getattr(req, "_weg2_early_told", None) is not None:
+        # DP-NACHLAUF: settle the follower's early read against the told
+        req._weg2_early_told = None
+        _dl = time.monotonic() + WAIT_CAP_S
+        while not tree.check_prefetch_progress(rid):
+            if time.monotonic() > _dl:
+                break   # the wait below names the stuck read
+            time.sleep(0.002)
+        _own = _completed_prefix(tree, rid)
+        _tst = getattr(scheduler, getattr(_twin, "_ATTR", "_weg2_twin_state"), None)
+        _abs = bool(_tst) and str(rid) in (getattr(_tst, "twin_follower", None) or {})
+        if _abs:
+            _own = _twin.registered_head(req) + int(_own)
+        _how = follower_early_settle(scheduler, req, told, _own, absolute=_abs)
+        n = getattr(scheduler, "_weg2_follower_early_settled", 0) + 1
+        scheduler._weg2_follower_early_settled = n
+        if _log_due(n) or _how != "equal":
+            logger.info("#1400 FOLLOWER-EARLY-SETTLE rid=%s pp=%s told=%d own=%d -> %s (n=%d)",
+                        _rt(rid), scheduler.ps.pp_rank, int(told), int(_own), _how, n)
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None) or {}
     if rid in satisfied:
         # registered nothing because it already held the span (see
