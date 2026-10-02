@@ -567,6 +567,24 @@ def tier_split_of(obj: Any) -> Optional[Dict[str, int]]:
     return None
 
 
+def trim_tiers(tiers: Dict[str, int], target: int) -> Dict[str, int]:
+    """A flipped request's tier split (P's, summing to P's cached count) made
+    to sum to the client's corrected cached count ``target``: the excess is
+    removed deepest tier first -- l3, then l2, then device -- and no tier
+    goes below 0 (user 02.10.). A split already at or below ``target`` is
+    left as it is: a tier is never raised (that would be a guess)."""
+    out = dict(tiers)
+    excess = sum(out.values()) - max(0, int(target))
+    for key in ("cached_l3", "cached_l2", "cached_device"):
+        if excess <= 0:
+            break
+        if key in out:
+            cut = min(out[key], excess)
+            out[key] -= cut
+            excess -= cut
+    return out
+
+
 def tier_split_stream_tail(tail: bytes) -> Optional[Dict[str, int]]:
     """:func:`tier_split_of` of the LAST streamed event that carries it."""
     if b"cached_tokens_details" not in tail:
