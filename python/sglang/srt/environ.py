@@ -4068,6 +4068,11 @@ class Envs:
     # divided by k; k samples skip manual-flip phases. Model-neutral (NF shares
     # the solver). 0 = the ski price (warm legs + resume) / k, byte for byte.
     SGLANG_WEG2_X_EXCURSION_PRICE = EnvBool(True)
+    # PDFLIP-B (02.10., N5d ping-pong): with the excursion price the X-SOLO band
+    # floor (X_busy / start X) and FLIP-ECONOMICS' threshold follow the live X;
+    # a park-closed admission is labelled "park", not "fairness", in MIN-DWELL.
+    # 0 = the band floor and the threshold as before.
+    SGLANG_WEG2_X_BAND_FOLLOWS_PRICE = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
