@@ -13114,8 +13114,40 @@ class Front:
             await self._wait_bound_park(None, cause=phase_policy.PARK_REASON_MANUAL)
         await self.flip(src, dst)
         if self.awake == "P" and self.state == "serving":
-            await self.flip("P", "D")
+            skip = Front._manual_return_skip_reason(self)
+            if skip is not None:
+                # MANUAL-FLIP RETURN-SKIP (L15 boot dac8b62b8c 14:43:03.794: LONG
+                # weg2-2-4, 133401 uncached, arrived during the probe's D->P half;
+                # the return P->D ran at 03.935 with queue=1 and the LONG got its
+                # own D->P 2.2 s later). P work waits: P stays awake, the
+                # controller serves it and flips back on its own.
+                self.counters["manual_flip_return_skip"] += 1
+                logger.info("WEG2 MANUAL-FLIP RETURN-SKIP reason=%s epoch=%d queue=%d -- P-bound work waits: "
+                            "P stays awake, no return half", skip, int(self.epoch), len(self.queue))
+                self._kick_controller("manual_return_skip")
+            else:
+                await self.flip("P", "D")
         return web.json_response(self.state_dict())
+
+    def _manual_return_skip_reason(self) -> Optional[str]:
+        """MANUAL-FLIP RETURN-SKIP: why the manual round trip's return half P->D
+        is skipped, or None (it runs as before). P-bound work = a request P holds
+        (P's outstanding ledger) or a queued request that needs P -- the immediate
+        park's own reader (:func:`phase_policy.immediate_park_trigger`, LONG /
+        BATCH / p_only / requeued over X). Switch
+        SGLANG_WEG2_MANUAL_FLIP_RETURN_SKIP (default on)."""
+        if not envs.SGLANG_WEG2_MANUAL_FLIP_RETURN_SKIP.get():
+            return None
+        P = (getattr(self, "groups", None) or {}).get("P")
+        n_out = len(getattr(P, "outstanding", None) or ()) if P is not None else 0
+        if n_out:
+            return f"p_outstanding n={n_out}"
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        q = phase_policy.immediate_park_trigger(getattr(self, "queue", None) or (), x)
+        if q is not None:
+            return (f"queue_p rid={getattr(q, 'rid', '-')} "
+                    f"uncached={int(getattr(q, 'est_uncached', 0) or 0)} x={x}")
+        return None
 
     def _manual_flip_refusal(self) -> Optional[str]:
         """#1493: the two readings behind :func:`manual_flip_residency_refusal`.
