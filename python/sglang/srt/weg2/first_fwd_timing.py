@@ -129,6 +129,14 @@ def on_set_consumer(index) -> None:
         S.cur = None
 
 
+class _NoWait:
+    def wait(self, threshold):
+        return None
+
+
+NO_WAIT = _NoWait()
+
+
 def timed_wait(loading_event, threshold: int) -> None:
     """``LayerDoneCounter.wait_until`` while a record is open."""
     rec = S.cur
@@ -175,11 +183,22 @@ def summarize(rec) -> Optional[str]:
     fw = lb.elapsed_time(first_pre) if (lb is not None and first_pre is not None) else float("nan")
     rs = le.elapsed_time(last_post) if (le is not None and last_post is not None) else float("nan")
     span = first_pre.elapsed_time(last_post) if (first_pre is not None and last_post is not None) else 0.0
+    # DP-NACHLAUF (N6a: load_wait ~2 ms, waited_span ~300 ms): per-layer device
+    # time = the gap from layer l's resume to layer l+1's first KV access
+    # (attention or GDN + MLP + its collectives), grouped by layer class
+    gaps = {order[i]: layers[order[i]][1].elapsed_time(layers[order[i + 1]][0]) for i in range(len(order) - 1)}
+    fa = [g for l, g in gaps.items() if l % 4 == 3]
+    ot = [g for l, g in gaps.items() if l % 4 != 3]
+    gtop = sorted(gaps.items(), key=lambda kv: -kv[1])[:6]
+    prof = "gap_sum_ms=%.1f full_attn(L%%4==3)[n=%d sum=%.1f mean=%.2f] other[n=%d sum=%.1f mean=%.2f] gap_top=%s" % (
+        sum(gaps.values()), len(fa), sum(fa), (sum(fa) / len(fa)) if fa else 0.0,
+        len(ot), sum(ot), (sum(ot) / len(ot)) if ot else 0.0,
+        ",".join("L%d:%.1f" % (l, g) for l, g in gtop))
     return ("WEG2-FIRST-FWD-TIMING wake=%d fwd=%d consumer=%d layers=%d load_wait_ms=%.1f max_wait_ms=%.1f@L%d "
             "top=%s h2d_ms=%.1f first_wait_after_h2d_begin_ms=%.1f resume_after_h2d_end_ms=%.1f "
-            "waited_span_ms=%.1f (device events; the collectives' waits are on the Prefill rank batch line)"
+            "waited_span_ms=%.1f %s (device events; the collectives' waits are on the Prefill rank batch line)"
             % (rec["wake"], rec["fwd"], rec["consumer"], len(layers), total, mx[1], mx[0],
-               ",".join("L%d:%.1f" % (t, w) for t, w in top), h2d, fw, rs, span))
+               ",".join("L%d:%.1f" % (t, w) for t, w in top), h2d, fw, rs, span, prof))
 
 
 def harvest() -> int:

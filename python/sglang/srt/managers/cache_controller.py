@@ -270,10 +270,13 @@ class LayerDoneCounter:
         _fft.on_set_consumer(index)
 
     def wait_until(self, threshold: int):
-        if self.consumer_index < 0:
-            return
         from sglang.srt.weg2 import first_fwd_timing as _fft
 
+        if self.consumer_index < 0:
+            if _fft.S.cur is not None:
+                # DP-NACHLAUF: no producer -- still mark the layer (per-layer profile)
+                _fft.timed_wait(_fft.NO_WAIT, threshold)
+            return
         if _fft.S.cur is not None:
             _fft.timed_wait(self.events[self.consumer_index], threshold)
             return
