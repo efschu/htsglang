@@ -49,3 +49,16 @@ def test_front_deposits_follow_the_published_epoch(tmp_path):
         "epoch": 4, "e_start": 48, "n": 30, "anchor_row": 2}
     publish(6, 64, 200)                                # D slept again
     assert fd.assign("b", 30) == (64, 30, 2)           # fresh book
+
+
+def test_region_is_read_from_a_capped_rank_when_rank0_publishes_none(tmp_path):
+    import json
+
+    from sglang.srt.weg2.l15_deposit import read_region
+
+    (tmp_path / "D.2.json").write_text(json.dumps(
+        {"epoch": 9, "deposit": {"e0": 16, "e1": 64, "a0": 2, "a1": 5,
+                                 "skip_ranks": [0]}}))
+    (tmp_path / "D.1.json").write_text(json.dumps({"epoch": 9}))
+    ep, reg = read_region(str(tmp_path))
+    assert ep == 9 and (reg.e0, reg.e1, reg.skip_ranks) == (16, 64, (0,))

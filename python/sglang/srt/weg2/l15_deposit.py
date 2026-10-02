@@ -84,16 +84,27 @@ class DepositBook:
 # -- front side: the rid-keyed deposit hint --------------------------------
 
 def read_region(share_dir: str):
-    """(epoch, DepositRegion) from D rank 0's published descriptor, or None."""
+    """(epoch, DepositRegion) from the first published D descriptor that
+    carries a deposit region (a cap-0 rank publishes none), or None."""
     import json
     import os
+    import re
 
     try:
-        with open(os.path.join(share_dir, "D.0.json")) as fh:
-            d = json.load(fh)
-    except (FileNotFoundError, ValueError):
+        names = os.listdir(share_dir)
+    except FileNotFoundError:
         return None
-    dep = d.get("deposit")
+    d, dep = None, None
+    for r in sorted(int(m.group(1)) for m in
+                    (re.fullmatch(r"D\.(\d+)\.json", x) for x in names) if m):
+        try:
+            with open(os.path.join(share_dir, "D.%d.json" % r)) as fh:
+                d = json.load(fh)
+        except (FileNotFoundError, ValueError):
+            continue
+        dep = d.get("deposit")
+        if dep:
+            break
     if not dep:
         return None
     return int(d.get("epoch", 0)), DepositRegion(
