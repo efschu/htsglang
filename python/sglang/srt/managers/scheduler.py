@@ -20531,20 +20531,25 @@ class Scheduler(
         So the set is "every KV pool that currently holds pages", not "the
         scheduler's pool".
         """
-        from sglang.srt.mem_cache.memory_pool import zero_kv_data_buffers
+        from sglang.srt.mem_cache.memory_pool import zero_kv_data_buffers, zero_wide_stats_take
 
         zeroed = 0
         skipped = 0
+        zero_wide_stats_take()
+        _t0 = time.perf_counter()
         for pool in self._kv_pools_for_flush():
             if not getattr(pool, "backing_is_resident", True):
                 skipped += 1
                 continue
             zeroed += zero_kv_data_buffers(pool)
         current_platform.synchronize()
+        _zs = zero_wide_stats_take()
         logger.info(
-            "flush: zeroed %d KV data buffers (%d unbacked layout(s) skipped)",
+            "flush: zeroed %d KV data buffers (%d unbacked layout(s) skipped) "
+            "wide=%d narrow=%d bytes=%d ms=%.1f (DP-NACHLAUF SGLANG_WEG2_ZERO_WIDE)",
             zeroed,
             skipped,
+            _zs["wide"], _zs["narrow"], _zs["bytes"], (time.perf_counter() - _t0) * 1000.0,
         )
 
     def _kv_pools_for_flush(self):

@@ -1532,7 +1532,8 @@ class MambaPool:
         raw = getattr(self, "_raw", None)
         if raw is not None:
             # Envelope layout: conv/temporal are views into one byte buffer.
-            raw.zero_()
+            # DP-NACHLAUF: through a wide view (zero_wide_, same bytes)
+            zero_wide_(raw)
         else:
             for conv in self.mamba_cache.conv:
                 conv.zero_()
@@ -3042,6 +3043,51 @@ def _kv_stage_born(pool, t: torch.Tensor, name: str) -> torch.Tensor:
     return t
 
 
+#: DP-NACHLAUF 02.10. (N5m/N5p/N5q, EVERY D wake): the wake restore's re-zero
+#: cost TP0 85-95 ms and TP1/TP2 169-189 ms (5090/3080 = the bandwidth ratio,
+#: so device-bound) for ~8-10 GB per rank -- ~100 / ~46 GB/s, a few percent of
+#: what the cards write. The fill ran element-wise over fp8 (KV) and uint8
+#: (mamba envelope) tensors: one byte per element. A contiguous buffer is
+#: zeroed through an int64 view of the same bytes instead (8x fewer elements,
+#: identical result); a strided or odd-sized one keeps the plain zero_() and is
+#: counted, so a strided layout cannot hide. Unset = on; 0/false/no/off = the
+#: per-dtype zero_() everywhere.
+ZERO_WIDE_ENV = "SGLANG_WEG2_ZERO_WIDE"
+_ZERO_WIDE_STATS = {"wide": 0, "narrow": 0, "bytes": 0}
+
+
+def zero_wide_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ZERO_WIDE_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def zero_wide_(t: torch.Tensor) -> bool:
+    """Zero ``t`` in place; True when it went through a wide (int64/int32)
+    view of its bytes, False when the plain ``zero_()`` ran."""
+    n = int(t.numel()) * int(t.element_size())
+    _ZERO_WIDE_STATS["bytes"] += n
+    if n and zero_wide_on() and t.is_contiguous():
+        for wide in (torch.int64, torch.int32):
+            w = wide.itemsize if hasattr(wide, "itemsize") else torch.empty((), dtype=wide).element_size()
+            if n % w == 0 and t.data_ptr() % w == 0 and t.element_size() < w:
+                try:
+                    t.reshape(-1).view(torch.uint8).view(wide).zero_()
+                    _ZERO_WIDE_STATS["wide"] += 1
+                    return True
+                except RuntimeError:
+                    break
+    t.zero_()
+    _ZERO_WIDE_STATS["narrow"] += 1
+    return False
+
+
+def zero_wide_stats_take() -> dict:
+    out = dict(_ZERO_WIDE_STATS)
+    for k in _ZERO_WIDE_STATS:
+        _ZERO_WIDE_STATS[k] = 0
+    return out
+
+
 def zero_kv_data_buffers(kvcache) -> int:
     """Zero the KV data buffers of ``kvcache`` (and its sub-pools) in place;
     returns the number of buffers zeroed.
@@ -3080,9 +3126,9 @@ def zero_kv_data_buffers(kvcache) -> int:
                 bufs = [bufs]
             for t in bufs:
                 if limit is None:
-                    t.zero_()
+                    zero_wide_(t)
                 else:
-                    t[: int(limit)].zero_()
+                    zero_wide_(t[: int(limit)])
                 zeroed += 1
     return zeroed
 
