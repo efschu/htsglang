@@ -928,6 +928,9 @@ class Envs:
     # FLIPCYCLE H1 (02.10., weg2/front.drain): a flip whose ledger is already
     # empty (D->P after the park) skips the drain's blocking progress read.
     SGLANG_WEG2_ENABLE_DRAIN_EMPTY_SKIP = EnvBool(True)
+    # FLIPCYCLE marker (02.10.): the legs' physics floor printed beside the
+    # measured stage (x4 link: ~6.6 GB each way / 6.6 GB/s; H111c says 1250).
+    SGLANG_WEG2_FLIPCYCLE_LEGS_FLOOR_MS = EnvInt(1000)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.
