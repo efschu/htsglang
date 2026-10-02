@@ -69,6 +69,29 @@ class FlipPhase:
     def __init__(self) -> None:
         self.snap: Dict[str, Any] = {"phase": None, "dir": None, "since_ts": None, "begin_ts": None,
                                      "reason": None, "decision_ts": None, "done_ts": None, "last": None}
+        #: USAGE-DETAILS (02.10.): every flip's window on the loop -- {dir,
+        #: start (decision), begin, done (None = open), aborted}; bounded.
+        #: Read by the front's per-request usage details only.
+        self.hist: "collections.deque[Dict[str, Any]]" = collections.deque(maxlen=256)
+
+    def _hist_close(self, now: float, aborted: bool) -> None:
+        if self.hist and self.hist[-1]["done"] is None:
+            self.hist[-1]["done"] = float(now)
+            self.hist[-1]["aborted"] = bool(aborted)
+
+    def windows(self, since: float, now: float):
+        """[(start, end)] of the flips whose window reaches ``since`` or later
+        (an open one ends ``now``)."""
+        out = []
+        for f in self.hist:
+            end = f["done"] if f["done"] is not None else now
+            if end >= since:
+                out.append((f["start"], end))
+        return out
+
+    def begun(self, since: float, until: float) -> int:
+        """Flips (not aborted) whose begin lies in ``[since, until]``."""
+        return sum(1 for f in self.hist if not f["aborted"] and since <= f["begin"] <= until)
 
     def _set(self, **kw: Any) -> None:
         s = dict(self.snap)
@@ -90,8 +113,13 @@ class FlipPhase:
                   decision_ts=s["decision_ts"] if same else _r3(now),
                   reason=(s["reason"] if same and s["reason"] else reason),
                   done_ts=None, first_work_ts=None)
+        self._hist_close(now, aborted=True)  # a flip never closed ends at the next one
+        start = s["decision_ts"] if same and s["decision_ts"] is not None else now
+        self.hist.append({"dir": direction, "start": float(min(start, now)), "begin": float(now),
+                          "done": None, "aborted": False})
 
     def done(self, now: float) -> None:
+        self._hist_close(now, aborted=False)
         if self.snap["phase"] != "layer":
             return
         if self.snap.get("first_work_ts") is not None:
@@ -112,6 +140,8 @@ class FlipPhase:
         s = self.snap
         if s["phase"] is None:
             return
+        if s["phase"] == "layer":
+            self._hist_close(now, aborted=True)
         last = {"dir": s["dir"], "reason": s["reason"], "aborted": why, "phase_at_abort": s["phase"],
                 "decision_ts": s["decision_ts"], "begin_ts": s["begin_ts"], "done_ts": s["done_ts"]}
         self.snap = {"phase": None, "dir": None, "since_ts": _r3(now), "begin_ts": None, "reason": None,
@@ -318,6 +348,17 @@ class RequestBook:
     def parked(self) -> Iterable[str]:
         return list(self.parked_open)
 
+    def park_windows_of(self, rid: Any, now: float):
+        """USAGE-DETAILS: [(start, end)] of every park of ``rid`` (an open one
+        ends ``now``)."""
+        row = self._row(rid)
+        if row is None:
+            return []
+        out = list(row.get("park_windows") or ())
+        if row["park_open"] is not None:
+            out.append((float(row["park_open"][0]), float(now)))
+        return out
+
     def resume(self, rid: Any, now: float, why: str, epoch: int) -> Optional[Dict[str, Any]]:
         """The rid's open park ends: the ``park`` event, or None (none open)."""
         row = self._row(rid)
@@ -328,6 +369,9 @@ class RequestBook:
         self.parked_open.discard(row["rid"])
         row["resumes"] += 1
         row["park_ms"] += max(0.0, (float(now) - t) * 1000.0)
+        wins = row.setdefault("park_windows", [])  # USAGE-DETAILS: the rid's park windows
+        if len(wins) < 64:
+            wins.append((float(t), float(now)))
         self._activity(now)
         return self._park_event(row, t, float(now), reason, ep, why, epoch)
 

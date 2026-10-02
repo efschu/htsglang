@@ -12,7 +12,9 @@ THE LAW PINNED HERE.
 * OpenAI non-stream body and the stream's usage chunk; Anthropic non-stream
   ``usage`` and the stream's ``message_delta`` (``cache_read_input_tokens`` =
   true cached, ``input_tokens`` = prompt - cached);
-* a request without a P leg is relayed byte for byte;
+* a request without a P leg is relayed byte for byte (apart from the
+  additive ``usage.total_tokens_details`` member of the USAGE-DETAILS order,
+  stripped here and pinned in ``test_weg2_usage_details_1002``);
 * the internal presence witness keeps D's RAW cached count;
 * one ``WEG2-USAGE-TRUE`` line per corrected request.
 
@@ -227,6 +229,18 @@ async def _run(path: str, d_answer, stream: bool, p_legs=((PROMPT, P_CACHED),)):
     return front, got
 
 
+def _no_details(got: bytes) -> bytes:
+    """``got`` without the USAGE-DETAILS member the front appends to the final
+    usage (the second 02.10. order: additive, D's bytes otherwise as they are)."""
+    key = b',"total_tokens_details":'
+    i = got.find(key)
+    if i < 0:
+        return got
+    from sglang.srt.weg2 import usage_true as UT
+
+    return got[:i] + got[UT._value_end(got, i + len(key)):]
+
+
 def _raw_presence(front):
     e = front.spans.entries.get(hashlib.sha1(TEXT.encode()).hexdigest())
     return None if e is None else int(e[1])
@@ -254,7 +268,7 @@ def test_openai_nonstream_flipped_reports_true_cached(caplog):
     assert u["prompt_tokens_details"]["cached_tokens"] == TRUE_CACHED == 3990
     assert (u["prompt_tokens"], u["completion_tokens"], u["total_tokens"]) == (PROMPT, OUT, PROMPT + OUT)
     # nothing else changed: the body is D's with the one number swapped
-    assert got == _oa_body().replace(b'"cached_tokens": 19990', b'"cached_tokens": 3990')
+    assert _no_details(got) == _oa_body().replace(b'"cached_tokens": 19990', b'"cached_tokens": 3990')
     assert _raw_presence(front) == D_CACHED  # internal bookkeeping on D's RAW numbers
     m = _marker(caplog)
     assert len(m) == 1
@@ -272,7 +286,7 @@ def test_openai_stream_final_usage_chunk_reports_true_cached(caplog):
     assert usage[0]["prompt_tokens"] == PROMPT and usage[0]["total_tokens"] == PROMPT + OUT
     # every content chunk passes byte for byte
     raw = b"".join(_oa_stream())
-    assert got == raw.replace(b'"cached_tokens":19990', b'"cached_tokens":3990')
+    assert _no_details(got) == raw.replace(b'"cached_tokens":19990', b'"cached_tokens":3990')
     assert _raw_presence(front) == D_CACHED
     assert len(_marker(caplog)) == 1
 
@@ -307,14 +321,14 @@ def test_anthropic_stream_message_delta_reports_true_cached(caplog):
 def test_d_only_passthrough_is_byte_identical(caplog):
     caplog.set_level(logging.INFO, logger="weg2.front")
     _f, got = asyncio.run(_run("/v1/chat/completions", _oa_body(), False, p_legs=()))
-    assert got == _oa_body()
+    assert _no_details(got) == _oa_body()
     _f, got = asyncio.run(_run("/v1/chat/completions", _oa_stream(), True, p_legs=()))
-    assert got == b"".join(_oa_stream())
+    assert _no_details(got) == b"".join(_oa_stream())
     frames = _anth_stream()
     _f, got = asyncio.run(_run("/v1/messages", frames, True, p_legs=()))
-    assert got == b"".join(frames)
+    assert _no_details(got) == b"".join(frames)
     _f, got = asyncio.run(_run("/v1/messages", _anth_body(), False, p_legs=()))
-    assert got == _anth_body()
+    assert _no_details(got) == _anth_body()
     assert _marker(caplog) == []
 
 
