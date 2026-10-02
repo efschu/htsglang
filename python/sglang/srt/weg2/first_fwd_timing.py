@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -177,6 +180,13 @@ def dcp_mark(layer_id: int, name: str) -> None:
         ev = S.event_factory()
         ev.record()
         d[name] = ev
+        # DP-NACHLAUF (N6i: merge_scatter 132-157 ms over 16 layers with no
+        # visible sync): the HOST clock beside the device event -- host ~= device
+        # = the GPU idles on launches (launch- / GIL-bound); device >> host = the
+        # device itself waits
+        rec.setdefault("dcp_host", {}).setdefault(int(layer_id), {})[name] = time.perf_counter()
+        if name == "enter" and "threads" not in rec:
+            rec["threads"] = threading.active_count()
     except Exception:  # noqa: BLE001 -- an instrument never breaks the attention
         pass
 
@@ -195,8 +205,18 @@ def _dcp_summary(rec) -> str:
             tot[b] = tot.get(b, 0.0) + marks[a].elapsed_time(marks[b])
     if not n:
         return " dcp[layers=0]"
+    host = {}
+    for lid, hm in (rec.get("dcp_host") or {}).items():
+        if not all(k in hm for k in DCP_MARKS):
+            continue
+        for a, b in zip(DCP_MARKS, DCP_MARKS[1:]):
+            host[b] = host.get(b, 0.0) + (hm[b] - hm[a]) * 1000.0
     return (" dcp[layers=%d ragged_cur=%.1f q_gather_wait=%.1f prefix_kernel=%.1f merge_scatter=%.1f ms]"
-            % (n, tot.get("cur", 0.0), tot.get("q_ready", 0.0), tot.get("prefix", 0.0), tot.get("exit", 0.0)))
+            " dcp_host[ragged_cur=%.1f q_gather_wait=%.1f prefix_kernel=%.1f merge_scatter=%.1f ms threads=%s "
+            "switchinterval_ms=%.1f]"
+            % (n, tot.get("cur", 0.0), tot.get("q_ready", 0.0), tot.get("prefix", 0.0), tot.get("exit", 0.0),
+               host.get("cur", 0.0), host.get("q_ready", 0.0), host.get("prefix", 0.0), host.get("exit", 0.0),
+               rec.get("threads"), sys.getswitchinterval() * 1000.0))
 
 
 def _done(ev) -> bool:

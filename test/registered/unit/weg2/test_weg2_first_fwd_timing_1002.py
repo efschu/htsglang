@@ -152,6 +152,7 @@ def test_dcp_substeps_are_summed(monkeypatch, caplog):
         fft.on_set_consumer(-1)
     line = next(r.getMessage() for r in caplog.records if "WEG2-FIRST-FWD-TIMING" in r.getMessage())
     assert "dcp[layers=2 ragged_cur=2.0 q_gather_wait=4.0 prefix_kernel=8.0 merge_scatter=6.0 ms]" in line
+    assert "dcp_host[" in line and "threads=" in line and "switchinterval_ms=" in line
 
 
 def test_dcp_marks_wired_in_both_schedules():
