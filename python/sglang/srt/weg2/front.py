@@ -83,6 +83,12 @@ def _ft_mm_expand(*args):
     return mm_expand(*args)
 
 
+def _ft_mm_d_cached(*args):
+    from sglang.srt.weg2.front_tokens import mm_d_cached
+
+    return mm_d_cached(*args)
+
+
 def _ft_mm_learn(*args):
     from sglang.srt.weg2.front_tokens import mm_learn
 
@@ -5926,13 +5932,19 @@ class Front:
         self.counters["x_exact_priced"] += 1
         mm_cached = False
         mm_tag = ""
+        d_reach = d_floor = 0
         if mm is not None:
-            covered = sum(1 for e in mm.ends if int(e) <= int(credit))
+            # IMAGE-CACHED-1002: an image is cached for D only inside what D's
+            # OWN admission covers -- the credit, never past D's page floor of
+            # the prompt (D computes [floor, n) itself, front_tokens.mm_d_reach)
+            covered, d_reach, d_floor = _ft_mm_d_cached(mm.ends, int(credit), int(c.n),
+                                                         self._d_page_size())
             mm_cached = covered == mm.n_images
             self.counters["x_exact_mm_priced"] += 1
             if mm_cached:
                 self.counters["x_exact_mm_cached"] += 1
-            mm_tag = " mm=1 mm_cached=%d/%d image_end=%d" % (covered, mm.n_images, mm.image_end)
+            mm_tag = " d_reach=%d mm=1 mm_cached=%d/%d image_end=%d" % (
+                d_reach, covered, mm.n_images, mm.image_end)
         logger.info("WEG2 X-EXACT-PRICE rid=%s pending=%d tokens=%d credit=%d src=%s known=%d "
                     "(EXACT: D's tokenizer+template, minus the MEASURED cached-on-D token prefix) "
                     "chars3_uncached=%d chars3_prompt=%d delta=%+d count_ms=%.1f wait_ms=%.1f "
@@ -5944,7 +5956,35 @@ class Front:
 
         return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
                                mm=mm is not None, mm_cached=mm_cached,
-                               image_end=(mm.image_end if mm is not None else 0))
+                               image_end=(mm.image_end if mm is not None else 0),
+                               d_reach=d_reach, d_floor=d_floor)
+
+    def _d_page_size(self) -> int:
+        """IMAGE-CACHED-1002: the groups' KV page size (their server info: NF 64,
+        27B 1) -- the grain of D's admission prefix. Unknown (info not read yet)
+        = 1, i.e. no floor beyond the one computed token (the pre-1002 price)."""
+        info = self.__dict__.get("_store_probe_info") or {}
+        try:
+            page = int(info.get("page_size") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        return page if page > 0 else 1
+
+    def _w102_image_uncached(self, rid: str, xx: Any) -> str:
+        """IMAGE-CACHED-1002: name WHY an exactly priced image request is not
+        served from D's prefix (the W102 rule then sends it to P): ``floor`` --
+        the image ends inside the page D's own admission recomputes, so no
+        credit and no anchor can serve it on D (NF page 64, y7n weg2-2-6:
+        128 tokens, image_end=110, floor 64); ``credit`` -- the measured /
+        store prefix stops inside or before the image."""
+        why = "floor" if int(xx.d_floor) < int(xx.image_end) else "credit"
+        self.counters["w102_image_uncached_" + why] += 1
+        logger.info(
+            "W102 Weg2VisionStage rid=%s image-uncached why=%s image_end=%d d_reach=%d "
+            "(credit=%d src=%s, D admission floor=%d of n=%d at page=%d): D would compute "
+            "image positions -> P", rid, why, int(xx.image_end), int(xx.d_reach),
+            int(xx.credit), xx.src, int(xx.d_floor), int(xx.n), self._d_page_size())
+        return why
 
     # -- CONTEXT-GATE ---------------------------------------------------------------------
     # y7i (e7a70285bd), front log ..._1002_111831.front.log, 11:32-11:33Z: an
@@ -6085,13 +6125,18 @@ class Front:
             if ids is None:
                 continue
             new, _credit, _known, src = self.tspans.pending(ids, epoch=epoch)
-            if p.p_only and int(getattr(p, "mm_image_end", 0) or 0) > 0 \
-                    and int(_credit) >= int(p.mm_image_end):
+            # IMAGE-CACHED-1002: cached for D only inside D's own admission reach
+            _n_mm, _reach, _floor = (_ft_mm_d_cached([int(p.mm_image_end)], int(_credit),
+                                                     int(ids.size), self._d_page_size())
+                                     if p.p_only and int(getattr(p, "mm_image_end", 0) or 0) > 0
+                                     else (0, 0, 0))
+            if _n_mm:
                 p.p_only = False
                 self.counters["x_exact_mm_reprice_cached"] += 1
                 logger.info("W102 Weg2VisionStage rid=%s image-cached at reprice (why=%s credit=%d "
-                            ">= image_end=%d src=%s): priced as text, no flip of its own",
-                            p.rid, why, int(_credit), int(p.mm_image_end), src)
+                            ">= image_end=%d src=%s): priced as text, no flip of its own "
+                            "d_reach=%d floor=%d",
+                            p.rid, why, int(_credit), int(p.mm_image_end), src, _reach, _floor)
             old = int(p.est_uncached)
             if new == old:
                 continue
@@ -8366,9 +8411,13 @@ class Front:
             self.counters["w102_image_cached"] += 1
             logger.info(
                 "W102 Weg2VisionStage rid=%s image-cached (credit=%d >= image_end=%d) -- "
-                "route %s stands: no tower, priced as text", rid, int(_xx.credit),
-                int(_xx.image_end), route)
-        elif _verdict == VERDICT_STAGE and route != "none" and route != "long":
+                "route %s stands: no tower, priced as text d_reach=%d floor=%d",
+                rid, int(_xx.credit), int(_xx.image_end), route,
+                int(_xx.d_reach), int(_xx.d_floor))
+        elif _verdict == VERDICT_STAGE and _xx is not None and getattr(_xx, "mm", False):
+            # IMAGE-CACHED-1002: the uncached verdict names its why before the rule
+            self._w102_image_uncached(rid, _xx)
+        if _verdict == VERDICT_STAGE and not _mm_cached and route != "none" and route != "long":
             logger.info(
                 "W102 Weg2VisionStage rid=%s -- route %s -> long (P): an image "
                 "request is prefilled on P by rule; its embeddings are "

@@ -296,6 +296,39 @@ def mm_expand(compact: np.ndarray, image_token_id: Optional[int], keys: Sequence
                        n_images=len(keys), ends=ends)
 
 
+def mm_d_reach(credit: int, n_tokens: int, page: int = ANCHOR_PAGE) -> Tuple[int, int]:
+    """IMAGE-CACHED-1002: ``(reach, floor)`` -- how far D's own admission of an
+    ``n_tokens`` prompt can cover it from its prefix, and the admission floor
+    that bounds it whatever the credit says.
+
+    The credit is a presence witness (a D finish, a store anchor), not D's
+    admission: D matches at most ``n - 1`` tokens (``_compute_max_prefix_len``,
+    one token is always computed for the logits), aligned DOWN to the groups'
+    KV page. ``floor`` is that page floor; every position at or above it D
+    computes itself. An image ending above ``floor`` can therefore never be
+    served by D (no tower): D would compute image positions -- vision_d_guard
+    refuses it (W123) and the request re-routes through P after a wasted D
+    admission.
+
+    y7n weg2-2-6 (NF, page 64, 02.10. 13:39:05): the same 128-token image
+    request again, image_end=110, floor = page_floor(127) = 64 -- D recomputes
+    [64, 128) whatever anchor it holds; P is the only server of it. N5j
+    weg2-18-24 (27B, page 1, 13:52:40): floor 127 >= 110, D served it from its
+    prefix (cached_tokens=127) without a flip."""
+    page = max(1, int(page))
+    floor = max(0, int(n_tokens) - 1) // page * page
+    return max(0, min(int(credit), floor)), floor
+
+
+def mm_d_cached(ends: Sequence[int], credit: int, n_tokens: int,
+                page: int = ANCHOR_PAGE) -> Tuple[int, int, int]:
+    """IMAGE-CACHED-1002: ``(covered, reach, floor)`` -- the images (by their
+    one-past-end positions ``ends``) D can take from its prefix without ever
+    computing one of their positions (:func:`mm_d_reach`)."""
+    reach, floor = mm_d_reach(credit, n_tokens, page)
+    return sum(1 for e in ends if int(e) <= reach), reach, floor
+
+
 def mm_learn(n_compact: int, keys: Sequence[str], ktok: Dict[str, int],
              realised: int) -> Optional[Tuple[str, int]]:
     """K of the ONE image of ``keys`` the front does not know yet, from the

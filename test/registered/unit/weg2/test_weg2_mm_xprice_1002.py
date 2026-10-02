@@ -192,7 +192,10 @@ def test_both_forcing_sites_spare_a_cached_image():
     src = inspect.getsource(F)
     assert "_mm_cached = bool(_xx is not None and getattr(_xx, \"mm_cached\", False))" in src
     assert "p_only=_verdict == VERDICT_STAGE and not _mm_cached" in src
-    assert "elif _verdict == VERDICT_STAGE and route != \"none\" and route != \"long\":" in src
+    # IMAGE-CACHED-1002: the forcing branch is no longer an elif of the
+    # cached one (an uncached verdict names its why first)
+    assert ("if _verdict == VERDICT_STAGE and not _mm_cached and route != \"none\" "
+            "and route != \"long\":") in src
 
 
 # ---- P: no tower for a cached image ---------------------------------------------------
