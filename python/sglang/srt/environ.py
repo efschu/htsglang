@@ -1380,6 +1380,19 @@ class Envs:
     # one lane takes of the card's SMs; the metal probe
     # (probe_lanes_parallel.py) sweeps it.
     SGLANG_WEG2_LANE_SM_COPY_BLOCKS = EnvInt(64)
+    # BAR1_SPILL_GRACE_S (W109b, NF y6u 01.10. epochs 2->3 and 4->5): the age
+    # a blocked BAR1 depositor demands of every edge of a waker credit cycle
+    # through its own deposit before it spills the rest of the tag to host
+    # memory. Until 02.10. it was a third of the waker's W109 grace (1.0 s)
+    # plus a 0.5 s poll on top of the 0.5 s `blocked` flag delay: y6u's two
+    # cycled D->P wakes (sleeper1 weights_15 -> waker2, sleeper2 weights_11 ->
+    # waker1) sat 1.6-1.9 s in deposit before the spill, 3.40/3.46 s gathered
+    # legs against 1.31-1.45 s in the four uncycled ones. The chain is a
+    # deadlock by construction (each waker's credit can only come from the
+    # sleeper that is blocked on the other waker), so the grace only covers
+    # flag-read skew. The waker's W109 refusal keeps its own grace
+    # (SGLANG_WEG2_BAR1_CYCLE_GRACE_S, 3 s).
+    SGLANG_WEG2_BAR1_SPILL_GRACE_S = EnvFloat(0.1)
     # Weg-2 load (H39, fnFL2x141-x145): the dense Marlin linears
     # (compressed_tensors_wNa16: GDN/attention/shared-expert 6->8 bit, HC
     # mixer, PLE, lm_head) keep their checkpoint-format tensors and the whole
