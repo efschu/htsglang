@@ -38,6 +38,7 @@ from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import tail_adopt, tail_handoff
 from sglang.srt.weg2 import short_read as _weg2_short_read
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
+from sglang.srt.weg2 import park_retract_laps as _prl  # FLIP-EDGE 2: park retract sub-laps
 from sglang.srt.weg2 import rank_timing as _rank_timing  # RANK-TIMING: L2 load-back ms
 from sglang.srt.managers.weg2_min_hit import note_min_hit_tokens  # PARK-RETAIN READ
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -2748,6 +2749,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _l15_dep.on_chunk(req, final=True)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
+        _prl.mark("head")
         # P-HOST-OVERLAP: a chunk publish still deferred goes out before the
         # finish path publishes its own node, so the chain keeps parents first.
         # Nothing is deferred unless SGLANG_WEG2_P_HOST_OVERLAP=1 (the only
@@ -2782,6 +2784,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._weg2_turn_insert(req, is_insert=is_insert)
 
         kv_committed_len = req.pop_committed_kv_cache()
+        _prl.mark("turn")
         # #969L: THE VALUE AT THE PARK INSERT. §S proved this insert IS reached
         # for a retracted request (is_insert=True, skip=False) and that nothing
         # declines it (#991=0, #969H EMPTY=0), which leaves only a ZERO-LENGTH
@@ -2823,6 +2826,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
+        _prl.mark("commit")
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         # fnFL2x76: the retention key may take one token beyond the retained
         # KV (`bigram_anchor_key`); `token_ids` itself is truncated below.
@@ -2842,6 +2846,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = None
         insert_params = None
+        _prl.mark("ids")
 
         if is_insert:
             insert_params = InsertParams(
@@ -2873,12 +2878,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # None and never truncated), and the publish behind the free read
             # 97792 rows for a cut of 97840 (x169: "WEG2-TAIL-PUBLISH refused",
             # D no_parts).  No capture armed = a no-op (tail_handoff).
+            _prl.mark("prepare")
             tail_handoff.publish_rows(
                 req, kv_indices, self.token_to_kv_pool_allocator, f"pp{self.pp_rank}-{os.getpid()}",
                 req_to_token_pool=self.req_to_token_pool, n_parts=self.pp_size,
             )
 
             # Truncate if needed
+            _prl.mark("rows")
             if effective_cache_len < len(token_ids):
                 free_start = max(effective_cache_len, req.cache_protected_len)
                 # #935: THE FINISHED PATH TRUSTS cache_protected_len AND NEVER
@@ -2912,6 +2919,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
+            _prl.mark("trim")
             radix_key = bigram_anchor_key(
                 token_ids_full, len(token_ids), req.extra_key,
                 is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
@@ -2928,10 +2936,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # KV tail above the component cap that was just freed.
             setattr(req, _weg2_park_read.RETAINED_ATTR, _weg2_park_read.retained_raw_tokens(radix_key))
             self._weg2_cap_tail = None
+            _prl.mark("key")
             result = self.insert(insert_params)
+            _prl.mark("insert")
 
             # Free unaligned tail (the tail hand-off above has its rows)
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            _prl.mark("free")
             if _WEG2_END_ANCHOR:
                 # fnFL2 H63d: the probe asks for the anchor at or below N-1 of
                 # the PROMPT, not of the retained key -- on the truncated ids
@@ -2941,12 +2952,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # 27B line (24.09.): the per-path cap runs AFTER the #1481 mark, so
             # the hand-back anchor N-1 is already exempt when the final node's
             # insert pushes the path over the bound.
+            _prl.mark("anchor")
             self._weg2_cap_after_insert()
+            _prl.mark("cap")
             self._weg2_handoff_write(req, radix_key)
+            _prl.mark("handoff")
             self._weg2_publish_at_retain(req, radix_key)
+            _prl.mark("publish")
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
+        _prl.mark("release_free")
         finish_dec_params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
         # #811: an anchor pin already released at the write-through ack must
         # not be decremented a second time here. Covers retraction too --
@@ -2958,11 +2974,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
+        _prl.mark("dec")
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+        _prl.mark("cleanup")
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
@@ -6960,7 +6978,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 or node.hit_count >= self.write_through_threshold
             )
         ):
-            self.write_backup(node)
+            if _prl.armed():  # FLIP-EDGE 2: the write-through issue, nested in "insert"
+                _t0 = time.perf_counter()
+                self.write_backup(node)
+                _prl.acc("wb", time.perf_counter() - _t0)
+            else:
+                self.write_backup(node)
 
     @staticmethod
     def _plain_sidecar_transfers(transfers, registered_pools) -> list:
