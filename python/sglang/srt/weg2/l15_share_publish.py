@@ -222,6 +222,24 @@ def publish_for_sched(sched, manifest, env, log) -> Optional["SharePublisher"]:
         prefix.append(prefix[-1] + int(x))
     desc = build_descriptor(epoch=int(manifest.epoch), rank=rank, prefix=prefix,
                             bases=bases, spans=manifest.spans)
+    # L15-14b: the deposit region a running P prefill may write into
+    try:
+        from sglang.srt.weg2 import l15_deposit
+
+        tp = len(prefix) - 1
+        rgid = getattr(getattr(sched, "server_args", None), "rank_gpu_id", None)
+        cards = (list(rgid) if isinstance(rgid, (list, tuple)) and len(rgid) == tp
+                 else list(range(tp)))
+        caps = l15_shadow.caps_from_env(
+            env, tp, [l15_shadow.cell_bytes_from(pool)] * tp, cards)
+        reg = l15_deposit.deposit_region(
+            list(manifest.rows_by_rank), prefix, caps,
+            int(manifest.anchor_slots), l15_keep_split.anchor_cap(env))
+        if reg is not None:
+            desc["deposit"] = {"e0": reg.e0, "e1": reg.e1, "a0": reg.a0,
+                               "a1": reg.a1, "skip_ranks": list(reg.skip_ranks)}
+    except Exception as exc:  # noqa: BLE001 -- no deposit, the share stays
+        log("L15-DEPOSIT region refused (%s: %s)" % (type(exc).__name__, exc))
     pub = SharePublisher(share_dir(env), rank, desc, fds)
     pub.start()
     log("L15-SHARE published rank=%d bases=%d fds=%d spans=%d"

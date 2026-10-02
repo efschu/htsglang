@@ -29,3 +29,23 @@ def test_book_hands_out_contiguous_ranges_and_anchor_rows_until_full():
     assert book.assign("b", 30) is None              # 78+30 > 100
     assert book.assign("c", 22) == (78, 22, 4)
     assert book.assign("d", 1) is None               # region full
+
+
+def test_front_deposits_follow_the_published_epoch(tmp_path):
+    import json
+
+    from sglang.srt.weg2.l15_deposit import FrontDeposits, read_deposit_hint
+
+    def publish(epoch, e0, e1):
+        (tmp_path / "D.0.json").write_text(json.dumps(
+            {"epoch": epoch, "deposit": {"e0": e0, "e1": e1, "a0": 2, "a1": 6,
+                                         "skip_ranks": [0]}}))
+
+    fd = FrontDeposits(str(tmp_path))
+    assert fd.assign("x", 10) is None                  # nothing published
+    publish(4, 48, 100)
+    assert fd.assign("a", 30) == (48, 30, 2)
+    assert read_deposit_hint(str(tmp_path), "a") == {
+        "epoch": 4, "e_start": 48, "n": 30, "anchor_row": 2}
+    publish(6, 64, 200)                                # D slept again
+    assert fd.assign("b", 30) == (64, 30, 2)           # fresh book

@@ -79,3 +79,70 @@ class DepositBook:
         self._anchor += 1
         self.assigned[rid] = got
         return got
+
+
+# -- front side: the rid-keyed deposit hint --------------------------------
+
+def read_region(share_dir: str):
+    """(epoch, DepositRegion) from D rank 0's published descriptor, or None."""
+    import json
+    import os
+
+    try:
+        with open(os.path.join(share_dir, "D.0.json")) as fh:
+            d = json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return None
+    dep = d.get("deposit")
+    if not dep:
+        return None
+    return int(d.get("epoch", 0)), DepositRegion(
+        int(dep["e0"]), int(dep["e1"]), int(dep["a0"]), int(dep["a1"]),
+        tuple(int(x) for x in dep.get("skip_ranks", ())))
+
+
+def write_deposit_hint(share_dir: str, rid: str, epoch: int,
+                       got: Tuple[int, int, int]) -> None:
+    import json
+    import os
+
+    path = os.path.join(share_dir, "dep.%s.json" % rid)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"epoch": int(epoch), "e_start": int(got[0]),
+                   "n": int(got[1]), "anchor_row": int(got[2])}, fh)
+    os.replace(tmp, path)
+
+
+def read_deposit_hint(share_dir: str, rid: str) -> Optional[dict]:
+    import json
+    import os
+
+    try:
+        with open(os.path.join(share_dir, "dep.%s.json" % rid)) as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+class FrontDeposits:
+    """The front's book across D sleeps: a new D epoch (a new published
+    region) starts a new book; the old assignments are void (D's next wake
+    only adopts spans of the epoch it held)."""
+
+    def __init__(self, share_dir: str):
+        self.share_dir = share_dir
+        self._epoch = None
+        self._book: Optional[DepositBook] = None
+
+    def assign(self, rid: str, n_tokens: int) -> Optional[Tuple[int, int, int]]:
+        got = read_region(self.share_dir)
+        if got is None:
+            return None
+        epoch, region = got
+        if epoch != self._epoch:
+            self._epoch, self._book = epoch, DepositBook(region)
+        a = self._book.assign(rid, n_tokens)
+        if a is not None:
+            write_deposit_hint(self.share_dir, rid, epoch, a)
+        return a

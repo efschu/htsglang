@@ -8407,6 +8407,25 @@ class Front:
                                 p.rid, _prev[0], int(_prev[1]))
             except Exception:  # noqa: BLE001 -- a hint, never the route
                 _hot_dir = None
+        # L15-14b: the phase-2 deposit -- every P request gets a slot range in
+        # D's published deposit region (rid-keyed hint, all stages read it);
+        # opt-in, a full region or no region simply means today's path.
+        if os.environ.get("SGLANG_WEG2_L15_DEPOSIT", "0") == "1":
+            try:
+                from sglang.srt.weg2 import l15_deposit as _l15_dep
+                from sglang.srt.weg2 import l15_share_publish as _l15_sp
+
+                _fd = self.__dict__.get("_l15_deposits")
+                if _fd is None:
+                    _fd = self._l15_deposits = _l15_dep.FrontDeposits(
+                        _l15_sp.share_dir(os.environ))
+                _n = int(p.est_prompt or 0)
+                _got = _fd.assign(p.rid, _n) if _n > 0 else None
+                if _got is not None:
+                    logger.info("L15-DEPOSIT-ASSIGN rid=%s e_start=%d n=%d anchor_row=%d",
+                                p.rid, _got[0], _got[1], _got[2])
+            except Exception:  # noqa: BLE001 -- a hint, never the route
+                pass
 
         async def _post() -> Tuple[int, bytes]:
             try:
