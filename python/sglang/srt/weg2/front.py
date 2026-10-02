@@ -5952,6 +5952,16 @@ class Front:
             sprev[str(rid)] = (str(prev_rid), int(common))
             while len(sprev) > 4096:
                 sprev.popitem(last=False)
+            # L15-10d: the common prefix's token ids, for the wake-mode hot
+            # hint (P adopts the prefix before the request reaches it);
+            # bounded, compact, only when L15's hot share is on
+            if common > 0 and os.environ.get("SGLANG_WEG2_L15_HOT_SHARE", "0") == "1":
+                from array import array as _arr
+
+                sids = self.__dict__.setdefault("_sess_ids", collections.OrderedDict())
+                sids[str(rid)] = _arr("q", [int(t) for t in list(ids)[: int(common)]])
+                while len(sids) > 64:
+                    sids.popitem(last=False)
             logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=%s common=%d prompt=%d "
                         "prev_prompt=%d (front token ids: where this prompt leaves the session's "
                         "previous one)", rid, sess, prev_rid, common, len(ids), prev_len)
@@ -8396,6 +8406,8 @@ class Front:
                 from sglang.srt.weg2 import l15_share_publish as _l15_sp
 
                 _prev = (self.__dict__.get("_sess_prev") or {}).get(p.rid)
+                if _l15_sa.at_wake(os.environ):
+                    _prev = None     # wake mode: the hint went out at the flip
                 _d = self.groups.get("D")
                 _live = (set(_d.outstanding) if _d is not None else set()) | set(
                     getattr(self, "_d_parked", None) or {})
@@ -10416,6 +10428,35 @@ class Front:
         if src == "D" and dst == "P":
             _live = [q.t_arrive for q in self.queue if getattr(q, "fut", None) is None or not q.fut.done()]
             self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
+            # L15-10d: wake-mode hot hints -- every queued follow-up whose
+            # session's previous rid is live on D gets a hint WITH its prefix
+            # token ids now, before P's wake: P's stages take the prefix from
+            # D's hold inside their kv resume (no admission-time verdict wait)
+            self._l15_wake_hints = []
+            if os.environ.get("SGLANG_WEG2_L15_HOT_SHARE", "0") == "1":
+                try:
+                    from sglang.srt.weg2 import l15_share_admit as _l15_sa
+                    from sglang.srt.weg2 import l15_share_publish as _l15_sp
+
+                    if _l15_sa.at_wake(os.environ):
+                        _hdir = _l15_sp.share_dir(os.environ)
+                        _sprev = self.__dict__.get("_sess_prev") or {}
+                        _sids = self.__dict__.get("_sess_ids") or {}
+                        _dl = set(S.outstanding) | set(getattr(self, "_d_parked", None) or {})
+                        for _q in list(self.queue):
+                            _r = str(getattr(_q, "rid", ""))
+                            _pv = _sprev.get(_r)
+                            _ids = _sids.get(_r)
+                            if (_pv and str(_pv[0]) in _dl and int(_pv[1]) > 0
+                                    and _ids is not None and len(_ids) >= int(_pv[1])):
+                                _l15_sa.write_hot_hint(_hdir, _r, str(_pv[0]), int(_pv[1]),
+                                                       ids=list(_ids)[: int(_pv[1])])
+                                self._l15_wake_hints.append(_r)
+                        if self._l15_wake_hints:
+                            logger.info("HOT-HANDOVER-HINT at=wake n=%d rids=%s",
+                                        len(self._l15_wake_hints), self._l15_wake_hints[:8])
+                except Exception:  # noqa: BLE001 -- a hint, never the route
+                    pass
             # L15-02b: one shadow line at the D->P hot-handover flip begin.
             try:
                 import itertools
@@ -10856,6 +10897,19 @@ class Front:
                                             RPC_TIMEOUT_S)  # #1428: retryable, see the sleep leg
         t_w = time.time()
         wake_ms += (t_w - t0) * 1000
+        # L15-10d: P's stages took the hot prefixes inside that resume -- the
+        # wake-mode hints and their verdict files go now
+        _l15_wh = self.__dict__.get("_l15_wake_hints") or []
+        if _l15_wh:
+            try:
+                from sglang.srt.weg2 import l15_share_admit as _l15_sa
+                from sglang.srt.weg2 import l15_share_publish as _l15_sp
+
+                for _r in _l15_wh:
+                    _l15_sa.reap_hot_hint(_l15_sp.share_dir(os.environ), _r)
+            except Exception:  # noqa: BLE001 -- the sweep catches leftovers
+                pass
+            self._l15_wake_hints = []
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
             return

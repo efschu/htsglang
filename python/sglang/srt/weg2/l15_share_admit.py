@@ -38,15 +38,48 @@ def hot_hint(directory: str, rid: str) -> Optional[dict]:
     return h
 
 
-def write_hot_hint(directory: str, rid: str, prev_rid: str, n: int) -> None:
-    """Front side, before leg 1 of a hot follow-up."""
+def write_hot_hint(directory: str, rid: str, prev_rid: str, n: int,
+                   ids: Optional[Sequence[int]] = None) -> None:
+    """Front side: before leg 1 of a hot follow-up (admission mode), or at
+    the D->P flip's begin with the prefix's token ``ids`` (wake mode: P
+    adopts the prefix in its resume RPC, before the request exists there)."""
     os.makedirs(directory, exist_ok=True)
     sweep_stale(directory)
     path = os.path.join(directory, "hot.%s.json" % rid)
     tmp = path + ".tmp"
+    body = {"prev_rid": str(prev_rid), "n": int(n)}
+    if ids is not None:
+        import base64
+        from array import array
+
+        body["ids_b64"] = base64.b64encode(
+            array("q", [int(t) for t in ids]).tobytes()).decode()
     with open(tmp, "w") as fh:
-        json.dump({"prev_rid": str(prev_rid), "n": int(n)}, fh)
+        json.dump(body, fh)
     os.replace(tmp, path)
+
+
+def hint_ids(hint: dict) -> Optional[list]:
+    """The prefix token ids a wake-mode hint carries (None without)."""
+    text = hint.get("ids_b64")
+    if not text:
+        return None
+    import base64
+    from array import array
+
+    a = array("q")
+    a.frombytes(base64.b64decode(text))
+    return list(a)
+
+
+WAKE_ENV = "SGLANG_WEG2_L15_HOT_AT_WAKE"
+
+
+def at_wake(env) -> bool:
+    """Take mode: at P's wake (default) or at admission (=0). The wake runs
+    with every P stage inside the same fenced resume RPC, so the verdict
+    wait cannot stall a stage's admission behind a busy pipeline."""
+    return str(env.get(WAKE_ENV, "1")).strip() != "0"
 
 
 def reap_hot_hint(directory: str, rid: str) -> None:
@@ -466,6 +499,8 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
 
     directory = l15_share_publish.share_dir(env)
     rid = str(getattr(req, "rid", ""))
+    if at_wake(env):
+        return None      # the prefix was adopted (or refused) at P's wake
     hint = hot_hint(directory, rid)
     if hint is None:
         return None
@@ -515,3 +550,85 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
             cap0=[int(r) for r in d0.get("cap0", ())], l2=l2, verdict=verdict)
     finally:
         mapper.close()
+
+
+def take_all_at_wake(sched, env, log) -> int:
+    """L15-10d: every hot hint of this D->P flip, taken in P's resume RPC
+    (kv_cache leg, after the kv resume) on every P stage in rid order; one
+    verdict per rid (the stages are inside the same fenced RPC, so they
+    meet within milliseconds). Returns the prefixes adopted by this stage.
+    Never raises: a refusal is named, today's store read serves."""
+    import re
+
+    from sglang.srt.weg2 import l15_bind, l15_share_publish
+    from sglang.srt.weg2.l15_hold_share import HoldMapper, L15ShareError
+
+    directory = l15_share_publish.share_dir(env)
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return 0
+    rids = sorted(m.group(1) for m in (re.fullmatch(r"hot\.(.+)\.json", x)
+                                        for x in names) if m)
+    if not rids:
+        return 0
+    stage = int(getattr(sched, "pp_rank", 0) or 0)
+    n_stages = int(getattr(sched, "pp_size", 1) or 1)
+    tmo = verdict_timeout_s(env)
+
+    def verdict_for(rid):
+        def verdict(ok: bool) -> str:
+            import time as _t
+
+            t0 = _t.perf_counter()
+            v = stage_verdict(directory, rid, stage, n_stages, ok, tmo)
+            log("HOT-HANDOVER-VERDICT rid=%s stage=%d/%d mine=%s verdict=%s wait_ms=%.0f at=wake"
+                % (rid, stage, n_stages, "ok" if ok else "fail", v,
+                   (_t.perf_counter() - t0) * 1000.0))
+            return v
+        return verdict
+
+    try:
+        d0 = _first_share(directory, l15_share_publish.fetch_share)
+        g = stage_geometry(sched, d0)
+    except L15ShareError as exc:
+        d0, g = None, "share: %s" % exc
+    if isinstance(g, str):
+        for rid in rids:
+            verdict_for(rid)(False)
+        log("HOT-HANDOVER at=wake: %d hint(s) refused (%s)" % (len(rids), g))
+        return 0
+    host_pool, host_mamba = l15_bind.live_host_pools(g.tree_cache)
+    mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    l2 = L2Loader(host_pool, getattr(mr, "token_to_kv_pool", None), host_mamba,
+                  getattr(g.req_to_token_pool, "mamba_pool", None))
+    adopted = 0
+    for rid in rids:
+        hint = hot_hint(directory, rid)
+        ids = hint_ids(hint) if hint is not None else None
+        if hint is None or ids is None:
+            verdict_for(rid)(False)
+            log("HOT-HANDOVER rid=%s at=wake fallback=hint without token ids" % rid)
+            continue
+        mapper = HoldMapper(g.dev)
+        try:
+            why = admit(
+                rid=rid, token_ids=ids, hint=hint,
+                fetch=lambda r: mapper.fetch(
+                    lambda q: l15_share_publish.fetch_share(directory, q), r),
+                n_d_ranks=g.n_d, kv_alloc=g.kv_alloc, mamba_alloc=g.mamba_alloc,
+                tree_cache=g.tree_cache, stage_att_layers=sorted(g.p_buffers),
+                p_buffers=g.p_buffers, spec=g.spec, stage_linear=g.stage_linear,
+                p_temporal=g.p_temporal, p_conv=g.p_conv, map_extent=mapper,
+                log=log, cap0=[int(r) for r in d0.get("cap0", ())], l2=l2,
+                verdict=verdict_for(rid))
+        except Exception as exc:  # noqa: BLE001 -- the store read serves
+            why = "%s: %s" % (type(exc).__name__, exc)
+            verdict_for(rid)(False)   # no-op when this stage already voted
+        finally:
+            mapper.close()
+        if why is None:
+            adopted += 1
+        else:
+            log("HOT-HANDOVER rid=%s at=wake fallback=%s" % (rid, why))
+    return adopted

@@ -226,6 +226,10 @@ def _l15_drop_retained_tree(sched, rank) -> bool:
     return True
 
 
+#: L15-10d: the tag whose resume closes P's wake (hot take at wake)
+KV_CACHE_TAG_FOR_L15 = "kv_cache"
+
+
 def _l15_refill_on(env) -> bool:
     """L15-12c-SW: the cap-0 refill kill switch, SGLANG_WEG2_L15_REFILL.
 
@@ -11956,6 +11960,24 @@ class SchedulerWeightUpdaterManager:
             # world <= 1. A single-rank engine cannot disagree with itself, so
             # here -- and only here -- the local raise IS the group-wide stop.
             raise Weg2WakeRefused(store_failure)
+
+        # L15-10d: the hot follow-ups' prefixes are taken from D's hold HERE,
+        # in P's kv_cache resume, on every P stage inside this one fenced RPC
+        # (default SGLANG_WEG2_L15_HOT_AT_WAKE=1): no stage's admission ever
+        # waits for a verdict behind a busy pipeline.
+        if (weg2_memory_saver_on and KV_CACHE_TAG_FOR_L15 in (tags or ())
+                and self._weg2_group_name() == "P"
+                and os.environ.get("SGLANG_WEG2_L15_HOT_SHARE", "0") == "1"):
+            try:
+                from sglang.srt.weg2 import l15_share_admit as _l15_sa
+                if _l15_sa.at_wake(os.environ):
+                    _l15_n = _l15_sa.take_all_at_wake(self.scheduler, os.environ,
+                                                      logger.info)
+                    if _l15_n:
+                        logger.info("HOT-HANDOVER at=wake adopted=%d", _l15_n)
+            except Exception as exc:  # noqa: BLE001 -- the store read serves
+                logger.warning("HOT-HANDOVER at=wake failed (%s: %s)",
+                               type(exc).__name__, exc)
 
         return self._weg2_leg_commit("resume", recv_req, ResumeMemoryOccupationReqOutput(
             per_tag=(report.get("per_tag") or weg2_per_tag or None)
