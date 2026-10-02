@@ -364,6 +364,9 @@ class FrontTokens:
         #: CONTEXT-GATE: the group's --context-length, else the checkpoint's
         self.context_len: Optional[int] = None
         self.load_s = 0.0
+        #: FRONT-PREWARM: the dummy render + encode at the end of the load
+        self.warm_ms = 0.0
+        self.warm_why = ""
 
     # -- loading -------------------------------------------------------------
     def load(self, server_args: Dict[str, Any], is_multimodal: bool = False) -> None:
@@ -420,6 +423,33 @@ class FrontTokens:
             self.state = "failed"
             self.why = f"{type(e).__name__}: {e}"
             self.load_s = time.time() - t0
+            return
+        if envs.SGLANG_WEG2_FRONT_TOKENIZER_PREWARM.get():
+            self.warm()
+
+    #: FRONT-PREWARM: one request per chat path, rendered and encoded at load
+    WARM_PAYLOADS = (
+        ("/v1/chat/completions", {"model": "warm", "max_tokens": 1,
+                                  "messages": [{"role": "user", "content": "warm"}]}),
+        ("/v1/messages", {"model": "warm", "max_tokens": 1,
+                          "messages": [{"role": "user", "content": "warm"}]}),
+    )
+
+    def warm(self) -> None:
+        """FRONT-PREWARM: render and encode one request per chat path once, at
+        the end of the load (worker thread), so the first arrival does not pay
+        the template compile and the encoder's first call (NF y7y weg2-0-1:
+        count_ms=142.3 for 25 tokens; weg2-2-3 later 9.7 for 2711). Nothing is
+        remembered; a failure is named in ``warm_why`` and changes nothing."""
+        t0 = time.perf_counter()
+        why = []
+        for path, payload in self.WARM_PAYLOADS:
+            try:
+                self._count(path, payload)
+            except Exception as e:  # noqa: BLE001 -- named, the load stands
+                why.append(f"{path} {type(e).__name__}: {str(e)[:80]}")
+        self.warm_ms = (time.perf_counter() - t0) * 1000.0
+        self.warm_why = "; ".join(why)
 
     # -- counting ------------------------------------------------------------
     def count(self, path: str, payload: Dict[str, Any]) -> Count:
