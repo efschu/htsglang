@@ -5943,6 +5943,10 @@ class Front:
             self.counters["l3_index_credit_tokens"] += int(l3)
             if tier == "l2_arena":
                 self.counters["l2_arena_credit"] += 1
+        if mm is not None:
+            # MM-PERSIST-1002: the image pages are keyed by the group's pad
+            # value, which the probe above cannot ask -- a restored anchor can
+            self._mm_persist_credit(rid, c.ids, mm_keys, mm, l3)
         # the epoch is read AFTER the count: a flip during it ends the held credit
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
         pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
@@ -5989,6 +5993,61 @@ class Front:
         except (TypeError, ValueError):
             page = 0
         return page if page > 0 else 1
+
+    #: VISION-LOAD-WARM-1002: a warm read finished this recently is not repeated
+    VISION_WARM_FRESH_S = 10.0
+
+    def _vision_warm(self, rid: str) -> str:
+        """VISION-LOAD-WARM-1002: read the tower's checkpoint extent BUFFERED in
+        a front thread, so the host cache (ZFS ARC) holds it when P's PP0 stage
+        loads the tower after the flip (``read_into(cached_first=True)``:
+        warm 87-100 ms against 270 ms O_DIRECT for the NF 856 MiB extent,
+        measured at the desk). Before the prefill, synchronous to nothing: the
+        stage reads O_DIRECT whatever the cache does not hold whole. Returns
+        what it did (``started`` | ``busy`` | ``fresh`` | ``off`` | ``no_model``)."""
+        if not envs.SGLANG_WEG2_ENABLE_VISION_LOAD_WARM.get():
+            return "off"
+        st = self.__dict__.setdefault("_vision_warm_state", {"busy": False, "t": None})
+        if st["busy"]:
+            return "busy"
+        if st["t"] is not None and time.monotonic() - st["t"] < self.VISION_WARM_FRESH_S:
+            return "fresh"
+        info = self.__dict__.get("_store_probe_info") or {}
+        model_dir = str(info.get("model_path") or "")
+        if not model_dir or not os.path.isdir(model_dir):
+            if not st.get("named"):
+                st["named"] = True
+                logger.info("W102 Weg2VisionStage VISION-WARM rid=%s n/a: no model dir from the "
+                            "group's server info yet (%r) -- the stage reads O_DIRECT", rid, model_dir)
+            return "no_model"
+        st["busy"] = True
+        import threading
+
+        def _job() -> None:
+            t0 = time.monotonic()
+            try:
+                from sglang.srt.planner.vision_stage_load import find_tower_shard, is_vision_weight
+                from sglang.srt.weg2 import vision_rank_stage as vrs
+
+                shard, tensors, _hit = vrs.tower_index(model_dir, find_tower_shard, is_vision_weight)
+                lo, hi = vrs.tensors_extent(tensors)
+                n = vrs.warm_host_cache(shard, lo, hi)
+                self.counters["vision_warm"] += 1
+                logger.info("W102 Weg2VisionStage VISION-WARM rid=%s read_mib=%.1f ms=%.0f "
+                            "threads=%d shard=%s (the tower extent is in the host cache for "
+                            "P's stage, which reads it RWF_NOWAIT before O_DIRECT)",
+                            rid, n / (1 << 20), (time.monotonic() - t0) * 1e3,
+                            vrs.WARM_THREADS, os.path.basename(shard))
+            except Exception as e:  # noqa: BLE001 -- the stage reads O_DIRECT, named
+                self.counters["vision_warm_failed"] += 1
+                logger.warning("W102 Weg2VisionStage VISION-WARM rid=%s FAILED %s: %s (the stage "
+                               "reads O_DIRECT)", rid, type(e).__name__, str(e)[:200])
+            finally:
+                st["t"] = time.monotonic()
+                st["busy"] = False
+
+        threading.Thread(target=_job, name="weg2-vision-warm", daemon=True).start()
+        return "started"
 
     def _w102_image_uncached(self, rid: str, xx: Any) -> str:
         """IMAGE-CACHED-1002: name WHY an exactly priced image request is not
@@ -6068,8 +6127,49 @@ class Front:
 
     # -- MM-XPRICE (front_tokens): image token counts as the groups realised them --------
     def _mm_ktok(self) -> Dict[str, int]:
-        """image key -> its token count, learned from served legs (front-local)."""
-        return self.__dict__.setdefault("_mm_ktok_map", {})
+        """image key -> its token count, learned from served legs (front-local).
+        MM-PERSIST-1002: seeded once from the store's table (earlier boots)."""
+        m = self.__dict__.get("_mm_ktok_map")
+        if m is None:
+            m = self.__dict__["_mm_ktok_map"] = {}
+            pers = self._mm_persist()
+            if pers is not None:
+                m.update(pers.ktok())
+        return m
+
+    def _mm_persist(self) -> Any:
+        """MM-PERSIST-1002: the image table of the store directory
+        (weg2/front_mm_persist.py), opened once; None when switched off."""
+        if "_mm_persist_obj" in self.__dict__:
+            return self.__dict__["_mm_persist_obj"]
+        pers = None
+        if envs.SGLANG_WEG2_ENABLE_FRONT_MM_PERSIST.get():
+            from sglang.srt.weg2.front_mm_persist import MMPersist
+
+            pers = MMPersist.open(str(getattr(self, "store_dir", "") or ""))
+            n_anchors = sum(len(r["anchors"]) for r in pers.images.values())
+            logger.info("WEG2 MM-PERSIST opened %s: %s images=%d anchors=%d (image token counts "
+                        "and store anchors of image prompts from earlier boots; an anchor is "
+                        "credited only while the live store proves the pages before the image)",
+                        pers.path or "-", pers.why, len(pers.images), n_anchors)
+        self.__dict__["_mm_persist_obj"] = pers
+        return pers
+
+    def _mm_persist_flush(self) -> None:
+        """Write the table when it changed -- in the front tokenizer's worker
+        thread (FIFO with the pricing; a few KB of JSON), never on the loop."""
+        pers = self.__dict__.get("_mm_persist_obj")
+        snap = pers.snapshot() if pers is not None else None
+        if snap is None:
+            return
+        from sglang.srt.weg2.front_mm_persist import write_snapshot
+
+        ft = getattr(self, "ftok", None)
+        ex = getattr(ft, "executor", None)
+        if ex is None:
+            write_snapshot(*snap)
+        else:
+            ex.submit(write_snapshot, *snap)
 
     def _mm_note_rid(self, rid: str, compact: Any, keys: Sequence[str]) -> None:
         if not keys:
@@ -6097,15 +6197,26 @@ class Front:
         if info is None or ft is None:
             return
         compact, keys = info
-        got = _ft_mm_learn(int(compact.size), keys, self._mm_ktok(), int(realised or 0))
+        ktok = self._mm_ktok()
+        relearn = ""
+        if (int(realised or 0) > 0 and len(set(keys)) == 1 and keys[0] in ktok
+                and int(compact.size) - len(keys) + len(keys) * int(ktok[keys[0]]) != int(realised)):
+            # MM-PERSIST-1002: a KNOWN count the group contradicts (a restored
+            # one from another processor setting) is learned again, not kept
+            relearn = " relearned_from=%d" % int(ktok[keys[0]])
+            ktok = {k: v for k, v in ktok.items() if k != keys[0]}
+        got = _ft_mm_learn(int(compact.size), keys, ktok, int(realised or 0))
         if got is not None:
             key, k = got
             self._mm_ktok()[key] = int(k)
             self.counters["x_exact_mm_learned"] += 1
+            pers = self._mm_persist()
+            if pers is not None and pers.note_k(key, int(k)):
+                self._mm_persist_flush()
             logger.info("WEG2 X-EXACT-MM-LEARN rid=%s image=%s tokens=%d realised=%d compact=%d "
-                        "images=%d (the image's token count as P served it; later requests "
+                        "images=%d%s (the image's token count as P served it; later requests "
                         "carrying it are priced exactly)", rid, key[:12], int(k), int(realised),
-                        int(compact.size), len(keys))
+                        int(compact.size), len(keys), relearn)
         if ft.ids_for(text) is None:
             exp = self._mm_ids(rid)
             if exp is not None:
@@ -6899,7 +7010,9 @@ class Front:
                 n += 1
                 tokens += anchor
                 rids.append(f"{rid}:{anchor}")
+                self._mm_persist_anchor(rid, ids, anchor)
         served.clear()
+        self._mm_persist_flush()
         self.counters["store_presence"] += n
         self.counters["store_presence_tokens"] += tokens
         if n:
@@ -6908,6 +7021,58 @@ class Front:
                         "priced as src=store_anchor)", n, self.epoch, rids[:16])
             self._x_exact_reprice_queue("store_presence")
         return n
+
+    def _mm_persist_anchor(self, rid: str, ids: Any, depth: int) -> None:
+        """MM-PERSIST-1002: P's flush published ``ids[:depth]`` of an image
+        request to the store -- kept for the next boot when the anchor covers
+        its last image (a shallower one the L3-INDEX probe proves anyway)."""
+        info = (self.__dict__.get("_mm_rid_info") or {}).get(rid)
+        if info is None:
+            return
+        pers = self._mm_persist()
+        exp = self._mm_ids(rid)
+        if pers is None or exp is None or int(depth) < int(exp.image_end):
+            return
+        if pers.note_anchor(info[1], ids, int(depth)):
+            self.counters["mm_persist_anchors"] += 1
+            logger.info("WEG2 MM-PERSIST anchor rid=%s images=%s depth=%d image_end=%d (the store "
+                        "holds this image prompt to the depth; kept for the next boot)",
+                        rid, [k[:12] for k in info[1]], int(depth), int(exp.image_end))
+
+    def _mm_persist_credit(self, rid: str, ids: Any, keys: Sequence[str], mm: Any,
+                           store_depth: int) -> int:
+        """MM-PERSIST-1002: the depth a restored anchor credits ``ids`` (front
+        ids of an image prompt), recorded as a store depth (src=mm_persist);
+        0 = none. Only past the request's last image (a shallower prefix the
+        L3-INDEX probe prices itself) and only while the live store still
+        proves every full page before the first image."""
+        pers = self._mm_persist()
+        if pers is None or not keys or getattr(self, "store_probe", None) is None:
+            return 0
+        depth = pers.credit(keys, ids)
+        if depth < int(mm.image_end):
+            return 0
+        from sglang.srt.weg2.front_mm_persist import preimage_verified
+
+        ok, need = preimage_verified(int(store_depth), int(mm.first_image), self._d_page_size())
+        if not ok:
+            self.counters["mm_persist_refuted"] += 1
+            logger.info("WEG2 MM-PERSIST-CREDIT rid=%s REFUSED depth=%d: the store proves %d of the "
+                        "%d tokens before the first image (pages evicted -- no credit, and the "
+                        "image's anchors are dropped)", rid, depth, int(store_depth), need)
+            if pers.drop_anchors(keys):
+                self._mm_persist_flush()
+            return 0
+        got = self.tspans.record_store_depth(ids, depth, source="mm_persist")
+        if got > 0:
+            self.counters["mm_persist_credit"] += 1
+            self.counters["mm_persist_credit_tokens"] += int(got)
+            logger.info("WEG2 MM-PERSIST-CREDIT rid=%s depth=%d image_end=%d first_image=%d "
+                        "store_preimage=%d/%d images=%s (an earlier boot's P flush published this "
+                        "image prompt to the store; credited as a store depth, src=mm_persist)",
+                        rid, got, int(mm.image_end), int(mm.first_image), int(store_depth),
+                        need, [k[:12] for k in keys])
+        return got
 
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
                         held_epoch: Optional[int], resumable_depth: Optional[int] = None,
@@ -8420,6 +8585,9 @@ class Front:
                 "PP0 of the group runs the transient tower before its admission "
                 "and attaches precomputed_embeddings before the prefill",
                 f"weg2-{self.epoch}-{self._rid + 1}", int(_img))
+            # VISION-LOAD-WARM-1002: the tower extent into the host cache NOW,
+            # while the request is priced and the D->P flip runs
+            self._vision_warm(f"weg2-{self.epoch}-{self._rid + 1}")
         elif _verdict != VERDICT_ROUTE and _verdict != VERDICT_REFUSE_EMBEDS:
             # #1356 THE REFUSAL IS LOGGED, NOT ONLY RETURNED. Without this line
             # W101 existed solely in the caller's response body: `grep W101

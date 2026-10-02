@@ -1707,6 +1707,24 @@ class Envs:
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
+    # MM-PERSIST-1002 (y7t weg2-10-10: the first image after a restart was
+    # priced by chars/3, routed LONG and flipped D->P for 23 new tokens, the
+    # image KV in the persistent L3 store): the front keeps the learned image
+    # token counts and the store anchors of image prompts in
+    # <store dir>/WEG2_FRONT_MM.json and reloads them at start. Off = the
+    # RAM-only table of the boot, as before.
+    SGLANG_WEG2_ENABLE_FRONT_MM_PERSIST = EnvBool(True)
+    # VISION-LOAD-WARM-1002: an image arrival warms the host cache (ZFS ARC)
+    # with the tower's checkpoint extent in a front thread (during the D->P
+    # flip, before the prefill); P's PP0 stage reads each chunk from that cache
+    # when it holds it whole (RWF_NOWAIT), else O_DIRECT as before. Off = the
+    # pure O_DIRECT read.
+    SGLANG_WEG2_ENABLE_VISION_LOAD_WARM = EnvBool(True)
+    # VISION-GC-SKIP-1002: the vision stage's teardown skips the full
+    # gc.collect (389-448 ms of the 398-459 ms teardown on y7o/y7t) when
+    # every tensor of the stripped tower is already dead (weak references);
+    # one alive, or a failed stage, still collects. Off = always collect.
+    SGLANG_WEG2_ENABLE_VISION_GC_SKIP = EnvBool(True)
     # RG 26.09.: the told/twin prefix switches as registry fields (weg2/form.py
     # PREFIX_SWITCHES; their readers in managers/weg2_store_told.py,
     # weg2/p_twin_defer.py and managers/weg2_told_fallback.py take the same

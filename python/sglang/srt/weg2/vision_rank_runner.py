@@ -52,6 +52,7 @@ import gc
 import logging
 import os
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -614,6 +615,15 @@ class StageOutcome:
     #: 27B review of H125e: the wait for PP0's last forward before a tower in
     #: free VRAM (None: not asked -- the tower sat on the KV tail)
     sync_ms: Optional[float] = None
+    #: VISION-GC-SKIP-1002: "skipped" (every tower tensor dead after the
+    #: strip) | "full" (gc.collect ran) | "" (nothing built); the tensors
+    #: still alive after the strip, before any gc
+    gc_mode: str = ""
+    gc_alive: int = 0
+    #: VISION-LOAD-WARM-1002: bytes the read took from the host cache, and
+    #: whether the tower's index came from the per-rank cache
+    cached_bytes: int = 0
+    index_cached: bool = False
 
 
 def wait_pp0_forward(scheduler, clock: Callable[[], float] = time.perf_counter) -> float:
@@ -748,9 +758,10 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             w0 = _enter("load")
             views = vrs.place_parameters(module, vrs.SlabAllocator(segments))
             segments = None
-            shard = find_tower_shard(model_dir)
-            plan = vrs.plan_checkpoint_into(
-                views, vrs.checkpoint_tensors(shard, is_vision_weight), _tower_name)
+            # VISION-LOAD-WARM-1002: the 47-shard index + header once per rank
+            shard, ck_tensors, out.index_cached = vrs.tower_index(
+                model_dir, find_tower_shard, is_vision_weight)
+            plan = vrs.plan_checkpoint_into(views, ck_tensors, _tower_name)
             src = source if source is not None else vrs.disk_source(shard)
             if src.kind == vrs.SOURCE_RAM and not os.path.exists(src.path):
                 # the image left (a cleaned /dev/shm): staged again, named, and
@@ -766,8 +777,9 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
             own_streams.append(_stream_id(stream))
             rep = vrs.read_into(src.path, vrs.shift_plan(plan, src.shift), stream=stream,
-                                direct=src.direct)
+                                direct=src.direct, cached_first=load_warm_on())
             out.read_bytes, out.direct = rep.bytes_read, rep.direct
+            out.cached_bytes = rep.cached_bytes
             out.legs_ms["load"] = (clock() - t0) * 1e3
             out.legs_wall["load"] = (w0, time.time())
             leg, t0 = "encode", clock()
@@ -796,15 +808,25 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     finally:
         t0 = clock()
         w0 = _enter("teardown")
+        # VISION-GC-SKIP-1002: every tensor the tower held, weakly -- the full
+        # gc.collect below runs only when one of them is still alive after
+        # the strip (a cycle or a traceback holds it)
+        refs = [] if slab is None else [weakref.ref(slab)]
+        refs.extend(weakref.ref(v) for v in (views or {}).values() if isinstance(v, torch.Tensor))
         views = plan = rows = segments = slab = None
         if module is not None:
-            _strip_module(module)
+            refs.extend(_strip_module(module))
         module = None
         for key in set(rope_factory._ROPE_DICT) - rope_keys:
             rope_factory._ROPE_DICT.pop(key, None)
         _tg = clock()
         if touched:
-            gc.collect()
+            out.gc_alive = sum(1 for r in refs if r() is not None)
+            if out.ok and out.gc_alive == 0 and gc_skip_on():
+                out.gc_mode = "skipped"
+            else:
+                gc.collect()
+                out.gc_mode = "full"
         _ts = clock()
         if on_card and touched:
             # The encode ran on this stream and the read's copies are already
@@ -838,15 +860,50 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     return out
 
 
-def _strip_module(module: torch.nn.Module) -> None:
-    """Drop every parameter (the views) and buffer (the rope cache) the
-    tower holds; the module object itself may live on in a cycle
-    (graph_runners -> module) until ``gc.collect``, empty."""
+def _strip_module(module: torch.nn.Module) -> List["weakref.ref"]:
+    """Drop every parameter (the views), buffer (the rope cache) and plain
+    tensor attribute the tower holds; the module object itself may live on
+    in a cycle (graph_runners -> module) until a gc, empty. Returns a weak
+    reference to each tensor dropped (VISION-GC-SKIP-1002: all dead = no
+    tensor of the tower survives, the full ``gc.collect`` is not needed)."""
+    refs: List[weakref.ref] = []
+
+    def _drop(t: Any) -> None:
+        if isinstance(t, torch.Tensor):
+            try:
+                refs.append(weakref.ref(t))
+            except TypeError:  # pragma: no cover -- every torch.Tensor is weakref-able
+                pass
+
     for mod in list(module.modules()):
         for name in list(mod._parameters):
+            _drop(mod._parameters[name])
             mod._parameters[name] = None
         for name in list(mod._buffers):
+            _drop(mod._buffers[name])
             mod._buffers[name] = None
+        for name, val in list(vars(mod).items()):
+            if isinstance(val, torch.Tensor):
+                _drop(val)
+                setattr(mod, name, None)
+    return refs
+
+
+def gc_skip_on() -> bool:
+    """VISION-GC-SKIP-1002 (default on): the teardown skips the full
+    ``gc.collect`` when every tensor of the tower is already dead."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ENABLE_VISION_GC_SKIP.get())
+
+
+def load_warm_on() -> bool:
+    """VISION-LOAD-WARM-1002 (default on): the front warms the host cache with
+    the tower extent at an image arrival; the stage reads each chunk from that
+    cache when it holds it whole (``RWF_NOWAIT``), else O_DIRECT as before."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ENABLE_VISION_LOAD_WARM.get())
 
 
 def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
@@ -874,6 +931,11 @@ def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
         line += " encode_split_ms=(%s) teardown_split_ms=(%s)" % (
             ", ".join(f"{k} {v:.0f}" for k, v in out.encode_ms.items()),
             ", ".join(f"{k} {v:.0f}" for k, v in out.teardown_ms.items()))
+    if out.gc_mode or out.read_bytes:
+        # VISION-GC-SKIP-1002 / VISION-LOAD-WARM-1002
+        line += (f" gc={out.gc_mode or 'none'} gc_alive={out.gc_alive} "
+                 f"read_cached_mib={out.cached_bytes / vrs.MIB:.1f} "
+                 f"index={'cached' if out.index_cached else 'parsed'}")
     if out.ok:
         logger.info("%s %s rids=%s", W_STAGE_OK, line, list(rids))
     else:
