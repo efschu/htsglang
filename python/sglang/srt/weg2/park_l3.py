@@ -565,6 +565,59 @@ def after_release(reqs) -> None:
             pass
 
 
+#: L15-L2-SHADOW: the node attribute carrying (host rows, arena gens) of the KV
+#: host rows a load-back release dropped -- the page stays COMPLETE in L2
+L2_SHADOW_ATTR = "_weg2_l2_shadow"
+
+
+def _l15_shadow_on() -> bool:
+    """L15-L2-SHADOW is recorded only under the L1.5 master switch (the env is
+    the group's: every D rank alike) and SGLANG_WEG2_L15_L2_SHADOW (default on)."""
+    try:
+        from sglang.srt.weg2 import l15_plan
+
+        if not l15_plan.master_on(os.environ):
+            return False
+        return str(os.environ.get("SGLANG_WEG2_L15_L2_SHADOW", "1")).strip() != "0"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def record_l2_shadow(pool, shadowed) -> int:
+    """L15-L2-SHADOW (N5n 14:44:07, dac8b62b8c): the #248 release drops the KV
+    host rows of a freshly loaded span (P's prefill pages, read from the shared
+    arena) to free their references -- the pages stay COMPLETE in L2, but the
+    node forgets where. A LONG handed over from P then reached the L1.5 sleep
+    with ~2% of its chain "backed" (L15-HOSTLOCK slots=2304 of 133k tokens) and
+    the cap-0 refill had nothing to load. Remember, per released node, its host
+    rows and the arena generation of each row's slot at THIS moment (one
+    census for the whole release); l15_bind adopts them at the sleep only where
+    the slot still carries that generation (a re-claim bumps it). Rank-local:
+    every D rank runs its own release on its own shard's arena. Returns the
+    rows recorded; never raises."""
+    try:
+        s0 = int(getattr(pool, "staging_rows", 0))
+        p = max(1, int(getattr(pool, "_arena_page_tokens", 1)))
+        want = sorted({(r - s0) // p for _n, rs in shadowed for r in rs if r >= s0})
+        gens = dict(zip(want, pool.slot_gens(want))) if want else {}
+        total = 0
+        for nd, rs in shadowed:
+            g = tuple(int(gens.get((r - s0) // p, -1)) if r >= s0 else -1 for r in rs)
+            setattr(nd, L2_SHADOW_ATTR, (tuple(rs), g))
+            total += len(rs)
+        if total:
+            k = getattr(pool, "_l15_shadow_n", 0) + 1
+            pool._l15_shadow_n = k
+            if k <= 8 or k % 64 == 0:
+                logger.info("L15-L2-SHADOW recorded nodes=%d rows=%d slots=%d (the released KV host "
+                            "rows' L2 identity, adopted by the L1.5 bind where the generation still "
+                            "matches) n=%d", len(shadowed), total, len(want), k)
+        return total
+    except Exception as exc:  # noqa: BLE001 -- the shadow is optional
+        logger.info("L15-L2-SHADOW record failed (%s: %s)", type(exc).__name__, exc)
+        return 0
+
+
 def release_loaded_host(tree, node) -> int:
     """#248 + #249: a load-back finished -- the span from ``node`` up is on
     the device. Its KV host rows held arena references (rc12s 17:33:41: a
@@ -605,6 +658,8 @@ def release_loaded_host(tree, node) -> int:
     aux = [c for c in tree._components_tuple if c.component_type != BASE_COMPONENT_TYPE]
     root = tree.root_node
     n, rows, kept = 0, 0, 0
+    shadow = _l15_shadow_on()
+    shadowed: list = []
     while node is not None and node is not root:
         cd = node.component_data[BASE_COMPONENT_TYPE]
         if (cd.host_value is not None and cd.value is not None and not getattr(node, "evicted", False)
@@ -613,6 +668,9 @@ def release_loaded_host(tree, node) -> int:
             if any(node.component_data[c.component_type].value is None for c in aux_host):
                 kept += 1  # an aux state lives on the host only: the node keeps its host life
             else:
+                if shadow:
+                    hv = cd.host_value
+                    shadowed.append((node, [int(x) for x in (hv.tolist() if hasattr(hv, "tolist") else hv)]))
                 for c in aux_host:  # aux first: never an aux host row without the KV row
                     tree._evict_component_and_detach_lru(node, c, target=EvictLayer.HOST, tracker=None)
                 _, hf = tree._evict_component_and_detach_lru(node, comp, target=EvictLayer.HOST, tracker=None)
@@ -622,6 +680,8 @@ def release_loaded_host(tree, node) -> int:
                 if role == "host":
                     _r12.record_state(tree, node, why="248-loaded")
         node = node.parent
+    if shadowed:
+        record_l2_shadow(pools[BASE_COMPONENT_TYPE], shadowed)
     if n:
         k = getattr(tree, "_248_release_n", 0) + 1
         tree._248_release_n = k
