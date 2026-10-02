@@ -104,6 +104,36 @@ from sglang.srt.utils.common import Range, get_device_module, is_xpu
 logger = logging.getLogger(__name__)
 
 
+#: DP-NACHLAUF 02.10. (N5d D->P epoch 25: PP0 PASS-STALL input_ms=303 with
+#: every named intake term ~0, PP1/PP2 other_ms=378 -- whole passes nobody
+#: named, between P's first store read and its first prefill forward): the
+#: pass's own segment clock. ``_pp_seg(self, name)`` stamps the end of a named
+#: segment; the PASS-STALL line prints ``segs[name=ms,...] seg_t0=<epoch s>``
+#: for the pass it reports. Instrument only, never raises.
+def _pp_seg(self, name: str) -> None:
+    try:
+        lst = self.__dict__.get("_pp_segs")
+        if lst is None:
+            lst = self.__dict__["_pp_segs"] = []
+        lst.append((name, time.perf_counter()))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pp_segs_text(segs, t_end: float, top: int = 6) -> str:
+    """``name=ms`` of each segment (time since the previous mark), the
+    largest ``top`` first; ``rest`` = the last mark to the pass end."""
+    if not segs:
+        return ""
+    parts, prev = [], segs[0][1]
+    for name, t in segs[1:]:
+        parts.append((name, (t - prev) * 1000.0))
+        prev = t
+    parts.append(("rest", (t_end - prev) * 1000.0))
+    parts.sort(key=lambda x: -x[1])
+    return ",".join("%s=%.0f" % (n, ms) for n, ms in parts[:max(1, int(top))])
+
+
 from sglang.srt.managers.weg2_pass_timer import read_ms as _pt_read
 from sglang.srt.managers import weg2_p_overlap as _pov
 
@@ -4427,6 +4457,11 @@ class SchedulerPPMixin:
                     _1466_now = time.perf_counter()
                     _1466_prev = getattr(self, "_1466_pass_t", None)
                     self._1466_pass_t = _1466_now
+                    # DP-NACHLAUF: the previous pass's segment clock, then a fresh one
+                    _pp_segs_prev = self.__dict__.get("_pp_segs") or []
+                    _pp_seg_t0 = self.__dict__.get("_pp_seg_t0_wall")
+                    self.__dict__["_pp_segs"] = [("start", _1466_now)]
+                    self.__dict__["_pp_seg_t0_wall"] = time.time()
                     _1466_run = _pt_read(self, "_1466_run_ms")
                     _1466_recv = _pt_read(self, "_1466_recv_ms")
                     _1466_input = _pt_read(self, "_1466_input_ms")
@@ -4449,11 +4484,12 @@ class SchedulerPPMixin:
                         if _1466_pass - _1466_run >= 300.0:
                             logger.info(
                                 "#1466 PASS-STALL pp_rank=%s slot=%d pass_ms=%.0f fwd_ms=%.0f "
-                                "recv_ms=%.0f input_ms=%.0f schedule_ms=%.0f proxy_recv_ms=%.0f commit_ms=%.0f process_ms=%.0f other_ms=%.0f input[%s] t=%.3f",
+                                "recv_ms=%.0f input_ms=%.0f schedule_ms=%.0f proxy_recv_ms=%.0f commit_ms=%.0f process_ms=%.0f other_ms=%.0f input[%s] t=%.3f segs[%s] seg_t0=%.3f",
                                 getattr(getattr(self, "ps", None), "pp_rank", "?"), mb_id,
                                 _1466_pass, _1466_run, _1466_recv, _1466_input, _1466_sched, _1466_prx, _1466_cmt, _1466_proc,
                                 _1466_pass - _1466_run - _1466_recv - _1466_input - _1466_sched - _1466_prx - _1466_cmt - _1466_proc,
-                                _1475, time.time())
+                                _1475, time.time(), _pp_segs_text(_pp_segs_prev, _1466_now),
+                                float(_pp_seg_t0 or 0.0))
                     try:
                         self._1463_recv_ms = 0.0
                         self._1463_commit_ms = 0.0
@@ -4632,7 +4668,9 @@ class SchedulerPPMixin:
                 # then `#973 RING COMMIT TIMEOUT` after 120s in
                 # `_pp_drain_due_sends -> _pp_join_comm_work -> bounded_wait`.
                 # One lap each, then the ring stops.
+                _pp_seg(self, "recv")
                 self._pp_forward_and_process_input_requests(recv_reqs)
+                _pp_seg(self, "input")
                 # #791 PP ADMISSION UNIFORMITY. Consume THIS pass's inbound
                 # admission decision before this rank derives its own batch,
                 # so the admission loop below (scheduler.py's
@@ -4789,6 +4827,7 @@ class SchedulerPPMixin:
                 # agree on. See `_pp_void_own_batch` (the incoming-wire twin
                 # was deleted with the void relay, #1072).
                 self._pp_note_chunked_req_before_admission(mb_id)
+                _pp_seg(self, "pre_admission")
                 # #947 THE RING SITE, and the whole reason this instrument
                 # exists. This line runs on EVERY iteration of the PP body --
                 # voided ones included -- and `get_next_batch_to_run` directly
@@ -5173,7 +5212,9 @@ class SchedulerPPMixin:
                 # not the consequence of this rank's own decision. Placed
                 # before #798 for that reason alone; it acts on nothing.
                 _1000_upstream_moved_on(self, mb_id)
+                _pp_seg(self, "admission_ring")
                 self._pp_void_pass_without_upstream_launch(mb_id)
+                _pp_seg(self, "void_check")
 
                 # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
                 # pass's admission decision HERE, immediately after
@@ -5361,7 +5402,9 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                _pp_seg(self, "launch_proxy")
                 self._pp_commit_comm_work(self.send_proxy_work)
+                _pp_seg(self, "commit_proxy")
                 # #1019: WHY IS THE PASS NOT LAUNCHED. The batch is provably in
                 # a slot (#1009 names mb_id=0 holding a batch whose pass has
                 # not run) and this guard is the only thing between it and
@@ -6402,6 +6445,7 @@ class SchedulerPPMixin:
         # follower's slot are already on the object when the arc carries it.
         # Nothing here blocks: see `_weg2_vote_pass_hook`.
         self._weg2_vote_pass_hook(recv_reqs)
+        _pp_seg(self, "in.vote_hook")
 
         # #631 REQ-TRACE (bounded): the check-2 wedge's open question is
         # where a relayed request dies between the consumed chain hop and
@@ -6478,13 +6522,16 @@ class SchedulerPPMixin:
             # not before it" move for the OUTPUT channel. This is that
             # fix for the REQUEST-CHAIN channel, and it is not gated to
             # the gapped layout: the hazard is not gapped-specific.
+            _pp_seg(self, "in.trace")
             self._pp_commit_comm_work(self.send_req_work)
+            _pp_seg(self, "in.commit_send")
             # #1400: PP0 puts its store verdicts on this pass's wire BEFORE
             # it can admit them (weg2_store_told module docstring). The
             # dispatched list below stays `recv_reqs`.
             _wire_reqs = recv_reqs
             if weg2_store_told.armed(self) and weg2_store_told.is_pp0(self):
                 _wire_reqs = weg2_store_told.pp0_publish(self, recv_reqs)
+                _pp_seg(self, "in.told_publish")
                 # RO: the rids P can only skip (held/paced) for the front's
                 # dispatch cap -- bookkeeping, nothing on the wire changes.
                 from sglang.srt.weg2 import p_read_overlap as _ro
@@ -6517,6 +6564,7 @@ class SchedulerPPMixin:
                     _wire_reqs,
                     async_send=True,
                 )
+            _pp_seg(self, "in.send")
             # NOTE: no blocking commit here, deliberately. Committing the
             # arm-carrying send in-pass is corpse B' (boot 13): this rank
             # blocked in _pp_commit_comm_work while its peers sat in the
@@ -6530,6 +6578,7 @@ class SchedulerPPMixin:
         # leaves `recv_reqs` before dispatch on EVERY rank -- it is a lap, not
         # a request, and `process_input_requests` has no handler for it.
         recv_reqs = self._weg2_vote_after_forward(recv_reqs)
+        _pp_seg(self, "in.vote_after")
         # z30j: a follower applies PP0's flush verdicts (already forwarded
         # onward above) to the flushes it parked, before this pass's dispatch.
         if not self.pp_group.is_first_rank:
@@ -6550,10 +6599,12 @@ class SchedulerPPMixin:
         # wire) and registers its held requests with the told span.
         if weg2_store_told.armed(self) and not weg2_store_told.is_pp0(self):
             recv_reqs = weg2_store_told.follower_absorb(self, recv_reqs)
+        _pp_seg(self, "in.absorb")
 
         # (i): arm in this same pass; the flip hook at the end of this
         # microbatch iteration then joins without an intervening recv.
         self.process_input_requests(recv_reqs)
+        _pp_seg(self, "in.process")
 
     # ------------------------------------------------------------------
     # #1268 fix 1c: the idle vote travels home on the ring lap
