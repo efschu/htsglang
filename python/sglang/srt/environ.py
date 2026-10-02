@@ -1535,7 +1535,12 @@ class Envs:
     # 113 ms D2H on D TP0's pre-loop gated P PP0's first claim and TP1/TP2's
     # first deposits (~150 ms BAR1 wait each) in every D->P flip. 27B parks no
     # draft (draft_park=0). False = the D2H on every park, byte for byte.
-    SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED = EnvBool(True)
+    # DEFAULT OFF (y7v2 A/B 02.10.): with the skip D's sleep starts ~120 ms
+    # earlier, its first deposits stall on P collectors still in their own
+    # credit wait (D TP2 weights_0 deposit 838-868 ms vs 206-270 ms, P first
+    # claims 787-1788 ms vs 143-562 ms) and the D->P layer grew 2,06-2,26 s
+    # -> 3,52-3,76 s. On only once that credit cycle is broken.
+    SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED = EnvBool(False)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
