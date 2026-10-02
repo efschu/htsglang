@@ -20803,14 +20803,26 @@ class Scheduler(
                         logger.info("L15-KEEP-CLEAR at=sleep rank=%d bases=%d",
                                     int(getattr(getattr(self, "ps", None),
                                                 "tp_rank", 0) or 0), int(_n))
-                        # L15-FIX-KEEP-SPLIT (N3t): the pause keeps only span
-                        # extents; split the hold bases NOW, while the pools
-                        # are reset and their content does not matter.
+                except Exception as exc:  # noqa: BLE001 -- cleanup only
+                    logger.warning("L15-KEEP-CLEAR at=sleep failed (%s: %s)",
+                                   type(exc).__name__, exc)
+                # L15-FIX-KEEP-SPLIT (N3t): the pause keeps only span extents;
+                # split the hold bases while the pools are reset and their
+                # content does not matter. L15-SPLIT-EARLY (N5n 14:43:49: the
+                # split ran in the first sleep WITH parked requests, inside a
+                # user flip): every plain D flush under L1.5 splits, parked or
+                # not -- the first D sleep of the boot (the acceptance probe's)
+                # pays it once; ensure_split skips an already split base.
+                try:
+                    from sglang.srt.weg2 import l15_plan as _l15_pl2
+                    if _l15_pl2.master_on(os.environ) and (
+                            (os.environ.get("SGLANG_WEG2_GROUP", "") or "")
+                            .strip().upper() == "D"):
                         from sglang.srt.weg2 import l15_keep_split as _l15_ks
                         _l15_ks.ensure_split_for_sched(self, os.environ,
                                                        logger.info)
-                except Exception as exc:  # noqa: BLE001 -- cleanup only
-                    logger.warning("L15-KEEP-CLEAR at=sleep failed (%s: %s)",
+                except Exception as exc:  # noqa: BLE001 -- the hold just waits
+                    logger.warning("L15-KEEP-SPLIT at=sleep failed (%s: %s)",
                                    type(exc).__name__, exc)
                 _fsub.mark("l15_tail")
                 _l15_pr0 = time.perf_counter()
