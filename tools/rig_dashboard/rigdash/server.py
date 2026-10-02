@@ -237,7 +237,24 @@ class App:
         self.edition = getattr(args, "edition", "rig") or "rig"
         # Nutzer-Order 01.10. ~07:40Z: rigdash liest die Zeitreihen per PromQL aus VictoriaMetrics
         self.vm = vmpush.VmClient(args.vm_url) if getattr(args, "vm_url", "") else None
+        self.vm_boot_cache: dict = {}         # stem -> (fetched_t, vmpush.boot_rates) of finished boots
         self.live_cache = LiveCache(lambda: self.snapshot(True, None))
+
+    def vm_boot(self, b: dict, now: float) -> Optional[dict]:
+        """A finished boot's whole-boot prefill / decode out of VictoriaMetrics (Nutzer 02.10.: "Letzte Boots" showed no
+        tok/s once the boot left the 16-min ring).  Refetched each minute for 30 min after the end (the sampler's
+        last sums land seconds after it), then kept."""
+        if self.vm is None or b.get("live"):
+            return None
+        hit = self.vm_boot_cache.get(b["stem"])
+        if hit is not None and (now - hit[0] < 60.0 or (b.get("age_s") or 0) > 1800.0):
+            return hit[1]
+        try:
+            v = vmpush.boot_rates(self.vm, b["stem"])
+        except Exception as e:  # noqa: BLE001 -- VM down must not empty the page
+            v = {"prefill": {}, "decode": None, "error": "%s: %s" % (type(e).__name__, e)}
+        self.vm_boot_cache[b["stem"]] = (now, v)
+        return v
 
     def energy_loop(self, stop: threading.Event):
         """Every 5 s: account the closed 5-s intervals of every live boot (energy.py); which class
@@ -304,6 +321,7 @@ class App:
             if b.get("series_zoom"):
                 finish_series(b, gser, now, live.BUCKET_S, key="series_zoom")
             b["energy"] = self.energy.view(b["stem"], (b.get("totals") or {}).get("boot_wall_s"))
+            b["vm_boot"] = self.vm_boot(b, now)
         with self.imgchg_lock:
             images, img_err = self.imgchg.load()
         return {
@@ -334,7 +352,7 @@ class App:
 LIVE_TTL_S = 1.0
 #: what the "Letzte Boots" table reads of a boot that is not shown as a card (lean page payload)
 LEAN_KEEP = ("stem", "meta", "age_s", "live", "primary", "first_t", "last_log_t", "flip_count", "totals",
-             "alarm", "container", "end", "stop_count", "error_count", "boot_s", "dur_s")
+             "alarm", "container", "end", "stop_count", "error_count", "boot_s", "dur_s", "vm_boot")
 
 
 def lean_boot(b: dict) -> dict:

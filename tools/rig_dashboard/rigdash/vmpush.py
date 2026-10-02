@@ -156,6 +156,8 @@ class Bridge:
         self.boots, self.url = boots, url
         self.flip_seen: Dict[str, float] = {}
         self.view_done: set = set()
+        self.dec_sums: Dict[str, dict] = {}     # boot -> whole-boot decode sums (decode_sums_add)
+        self.reader = VmClient(url)
         self.pcie_source = None
         self.pcie_t = 0.0
         self.last: dict = {"t": None, "lines": 0, "error": None}
@@ -182,6 +184,8 @@ class Bridge:
                 if m is not None and m.ring:
                     segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc))["segs"]
                     lines += flip_view_points(ipcboot.flip_views(segs, ipc, now), model, short_boot(key), self.view_done)
+                if m is not None and m.dec:
+                    lines += self._decode_sum_lines(key, m.dec, model, now - 3 * ipcboot.SAMPLE_S, now)
             except Exception as e:  # noqa: BLE001 -- one boot's view never stops the push
                 self.last["flip_view_error"] = "%s: %s" % (type(e).__name__, e)
             if ipc.get("terminal"):
@@ -201,6 +205,15 @@ class Bridge:
         n = push(lines, self.url)
         self.last = {"t": now, "lines": n, "error": None}
         return n
+
+    def _decode_sum_lines(self, key: str, intervals: List[dict], model: str, settled_before: float, now: float) -> List[str]:
+        boot = short_boot(key)
+        sums = self.dec_sums.get(key)
+        if sums is None:          # first sight (also after a sampler restart): continue what VM already holds
+            sums = decode_sums_seed(self.reader, boot)
+        sums = decode_sums_add(sums, intervals, settled_before)
+        self.dec_sums[key] = sums
+        return decode_sum_lines(sums, model, boot, int(now * 1000))
 
     def run_forever(self, stop) -> None:
         while not stop.is_set():
@@ -263,6 +276,19 @@ class VmClient:
                     out.setdefault(k, {})[int(round(float(t)))] = float(v)
                 except (TypeError, ValueError):
                     pass
+        return out
+
+    def raw(self, selector: str, span_s: int) -> List[Tuple[dict, List[Tuple[float, float]]]]:
+        """The stored samples of every series a selector names over the last span_s (range-vector query)."""
+        out = []
+        for s in self.query("%s[%ds]" % (selector, int(span_s))):
+            pts = []
+            for t, v in s.get("values") or []:
+                try:
+                    pts.append((float(t), float(v)))
+                except (TypeError, ValueError):
+                    pass
+            out.append((s.get("metric") or {}, pts))
         return out
 
     def scalar_by(self, promql: str, label: str) -> Dict[str, float]:
@@ -343,6 +369,97 @@ def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -
                 out.append("weg2_flip_user_view_ms%s %s %d" % (_lbl({"model": model, "boot": boot, "dir": x["dir"], "part": part}),
                                                               repr(float(v)), ts))
     return out
+
+
+# ----------------------------------------------------------------------------- whole-boot figures (Letzte Boots)
+# Nutzer 02.10.: "Letzte Boots" showed no prefill / decode tok/s once a boot fell out of the 16-min ring.  Decode:
+# the sampler adds every settled steady interval of its own 1-s ring ONCE into per-boot sums and pushes them (the
+# 5-s rank samples are too coarse -- a 5-s interval holds idle seconds, y6y read 84 instead of 119,5 tok/s).
+# Prefill: the rank counters, new tokens / compute seconds of the group's slowest rank, over the whole boot.
+
+#: per-boot decode sums -> metric (fields of activity.decode_intervals; seat_s/busy only where the seats are known)
+BOOT_DECODE_FIELDS = (("tok", "weg2_boot_decode_tokens_total"), ("dur", "weg2_boot_decode_seconds_total"),
+                      ("seat_s", "weg2_boot_decode_seat_seconds_total"), ("busy", "weg2_boot_decode_busy_seconds_total"),
+                      ("last_e", "weg2_boot_decode_settled_ts"))
+#: below this many new tokens a group's prefill rate is noise (activity.MIN_RATE_TOK)
+BOOT_RATE_MIN_TOK = 1024
+
+
+def decode_sums_add(sums: dict, intervals: List[dict], settled_before: float) -> dict:
+    """The sums after adding the steady intervals that ended after sums['last_e'] and before settled_before (an
+    interval's ``steady`` needs its successor, so the newest ones wait).  Pure: returns a new dict."""
+    out = dict(sums)
+    for x in sorted(intervals, key=lambda x: x["e"]):
+        if x["e"] <= out["last_e"] or x["e"] > settled_before:
+            continue
+        if x["steady"]:
+            out["tok"] += x["tok"]
+            out["dur"] += x["dur"]
+            if x.get("seat_s"):
+                out["seat_s"] += x["seat_s"]
+                out["busy"] += x["busy"]
+        out["last_e"] = x["e"]
+    return out
+
+
+def decode_sums_empty() -> dict:
+    return {f: 0.0 for f, _ in BOOT_DECODE_FIELDS}
+
+
+def decode_sum_lines(sums: dict, model: str, boot: str, ts_ms: int) -> List[str]:
+    lbl = _lbl({"model": model, "boot": boot})
+    return ["%s%s %s %d" % (name, lbl, repr(float(sums[f])), ts_ms) for f, name in BOOT_DECODE_FIELDS]
+
+
+def decode_sums_seed(client: "VmClient", boot: str, span_s: int = 12 * 3600) -> dict:
+    """The sums VictoriaMetrics already holds for a boot (sampler restart: a deploy must not count twice or restart
+    at zero).  Every field is a running total, so its largest stored value is the last one."""
+    out = decode_sums_empty()
+    for f, name in BOOT_DECODE_FIELDS:
+        for _met, pts in client.raw('%s{boot="%s"}' % (name, boot), span_s):
+            out[f] = max([out[f]] + [v for _, v in pts])
+    return out
+
+
+def boot_rates_from(series: Dict[Tuple[str, str, str], List[Tuple[float, float]]]) -> dict:
+    """Whole-boot rates of one finished boot.  series: (metric, group, rank) -> [(t, v)].  Pure, unit-tested.
+
+    prefill[g].tps -- new tokens / compute seconds of the group's slowest rank (the stage that sets the pace).
+    decode -- the sampler's sums: tokens / decode seconds over the steady intervals, seats = seat-s / busy-s."""
+    def last(m, g="", r=""):
+        return max((v for _, v in series.get((m, g, r)) or []), default=None)
+
+    prefill = {}
+    for g in sorted({g for (m, g, _) in series if m == "weg2_rank_prefill_new_tokens_total"}):
+        rows = []
+        for (m, gg, r) in series:
+            if m != "weg2_rank_prefill_new_tokens_total" or gg != g:
+                continue
+            tok, ms = last(m, g, r), last("weg2_rank_prefill_compute_ms_total", g, r)
+            if tok and ms and tok >= BOOT_RATE_MIN_TOK:
+                rows.append((tok / (ms / 1000.0), tok, ms / 1000.0, r))
+        if rows:
+            tps, tok, sec, r = min(rows)
+            prefill[g] = {"tps": tps, "tokens": tok, "compute_s": sec, "rank": r}
+    s = {f: last(name) for f, name in BOOT_DECODE_FIELDS}
+    decode = None
+    if s["dur"]:
+        decode = {"gen_tps_boot": (s["tok"] / s["dur"]) if s["dur"] >= 2.0 else None, "boot_decode_s": s["dur"],
+                  "tokens": s["tok"], "seats_boot": (s["seat_s"] / s["busy"]) if s["busy"] else None}
+    return {"prefill": prefill, "decode": decode,
+            "src": "VictoriaMetrics: Prefill weg2_rank_prefill_* (Rechenzeit, langsamster Rang), "
+                   "Decode weg2_boot_decode_* (1-s-Ring des Samplers, stetige Intervalle, ganzer Boot)"}
+
+
+def boot_rates(client: "VmClient", boot_id: str, span_s: int = 12 * 3600) -> dict:
+    """boot_rates_from over what VictoriaMetrics holds for one boot (label boot = short_boot)."""
+    sel = 'boot="%s"' % short_boot(boot_id)
+    series: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
+    names = ["weg2_rank_prefill_new_tokens_total", "weg2_rank_prefill_compute_ms_total"] + [n for _, n in BOOT_DECODE_FIELDS]
+    for m in names:
+        for met, pts in client.raw("%s{%s}" % (m, sel), span_s):
+            series[(m, met.get("group", ""), met.get("rank", ""))] = pts
+    return boot_rates_from(series)
 
 
 def ttft_last(client: "VmClient", now: Optional[float] = None, span_s: int = 900) -> Dict[str, dict]:
