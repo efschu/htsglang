@@ -23880,6 +23880,56 @@ def prefix_switches_announce(ns, boot_form, environ: Optional[Mapping[str, str]]
     return weg2_form.prefix_switches_line(rows)
 
 
+def l15_mib_by_card_identity(ns, cards: List[Card], log,
+                             environ: Optional[Dict[str, str]] = None) -> None:
+    """HW-GENERIC 1002 (L15): SGLANG_WEG2_L15_MIB keyed by CARD IDENTITY.
+
+    Resolves the value's card keys (``GPU-<uuid>=``, ``pci:<bus id>=``,
+    ``nvml<i>=``, or the legacy budget ordinal ``c<i>=``) ONCE against the
+    ordered ``cards`` (``l15_plan.resolve_l15_mib``) and hands the ranks the
+    canonical ordinal form: rewritten in ``environ`` (default ``os.environ``,
+    which ``build_env`` copies for P and D and ``resolve_posts`` reads) and in
+    ``--env-p`` / ``--env-d`` (applied last by ``build_env``) when they carry
+    the key. An ordinal-only value is left byte-identical. One
+    ``L15-MIB-CARDS`` line per source names key -> ordinal -> card; a bad key
+    is refused BY NAME (W-L15-CARDKEY). With the master on, a cap-0 rank
+    count other than one prints ``L15-CAP0`` (a warning: D rank i sits on
+    ordinal i, ``--rank-gpu-id 0,1,2``)."""
+    env = os.environ if environ is None else environ
+    key = l15_plan.L15_MIB_ENV
+    sources = [("env", env.get(key))]
+    groups = {a: parse_group_env(getattr(ns, a, "") or "") for a in ("env_p", "env_d")}
+    sources += [(a, g[key]) for a, g in groups.items() if key in g]
+    for src, raw in sources:
+        if raw is None:
+            continue
+        pci = {}
+        if "pci:" in str(raw).lower():
+            # the launcher Card carries no bus id; the registry's NVML reader does
+            pci = {d.uuid: d.pci_bus_id for d in nvml_registry.list_devices()}
+        try:
+            res = l15_plan.resolve_l15_mib(raw, cards, pci)
+        except ValueError as exc:
+            raise Weg2LaunchRefused(f"{exc} (source {src})") from exc
+        if res.mode == "auto":
+            continue
+        log(l15_plan.mib_cards_line(res, cards, src))
+        if res.rewritten and src == "env":
+            env[key] = res.value
+        elif res.rewritten:
+            setattr(ns, src, set_group_env(getattr(ns, src, ""), key, res.value))
+    # the value the D ranks run: --env-d (applied last) over the launcher env
+    d_env = dict(env)
+    d_env.update({k: v for k, v in parse_group_env(getattr(ns, "env_d", "") or "").items()
+                  if k in (key, l15_plan.L15_MASTER_ENV)})
+    if l15_plan.master_on(d_env):
+        from sglang.srt.weg2 import l15_shadow
+
+        line = l15_shadow.cap0_line(l15_shadow.cap0_ranks(d_env, len(cards)))
+        if line is not None:
+            log(line)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _ACTIVE_BOOT_STATE
     # #1248: unclaimed until a BootState exists below -- a stale pointer from
@@ -24580,6 +24630,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # to today. The post sizes against the PRE-post budget (the pure layer
     # prices budget minus the measured P awake peak), so the first pass is
     # today's pass without l15 and the second pass is what ships.
+    # HW-GENERIC 1002: card-identity keys -> the ordinal form, ONCE, before
+    # resolve_posts reads it and before build_env hands it to the ranks.
+    l15_mib_by_card_identity(ns, cards, log)
     l15_posts = None
     # L15-27B-ONLY (user correction 2026-10-02): no L1.5 on any other line
     _not27b = l15_plan.refuse_not_27b(ns.profile, os.environ)
@@ -24605,7 +24658,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 log(l15_plan.post_line(post))
             # L15-NOCAP (N3f): armed with nothing to hold is a launch error,
             # not a boot window spent on cap=0 (N3c/N3e).
-            _nocap = l15_plan.refuse_no_caps(l15_posts, os.environ)
+            _nocap = l15_plan.refuse_no_caps(l15_posts, os.environ, cards)
             if _nocap is not None:
                 raise Weg2LaunchRefused(_nocap)
         else:
