@@ -399,6 +399,14 @@ class TokenSpans:
         #: below its end anchor), recorded with the P-anchor witness; beside the entry like
         #: :attr:`published`. :meth:`pending` credits the deepest one on the new text's shared path.
         self.inner: Dict[str, Tuple[int, ...]] = {}
+        #: SEQ-HASH (02.10.): prompt key -> (prompt ids, [(depth, hash)]) -- D's
+        #: resumable anchors on the request's WHOLE sequence (prompt + output),
+        #: each with the hash of that sequence up to the depth (finish / park).
+        self.seq_marks: "collections.OrderedDict[str, Tuple[np.ndarray, List[Tuple[int, str]]]]" = \
+            collections.OrderedDict()
+        #: STORE-PRESENCE (NF ba76adffe2, ported 02.10.): key -> label of an entry recorded as a
+        #: store anchor (P's END-ANCHOR published by P's sleep flush); a finish reading replaces it.
+        self.store_keys: Dict[str, str] = {}
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -425,6 +433,7 @@ class TokenSpans:
         key = self._key(ids)
         self.entries.pop(key, None)
         self.depth_caps.pop(key, None)
+        self.store_keys.pop(key, None)  # STORE-PRESENCE: D's finish reading replaces the label
         # #49 L2: a NEW D reading of this text supersedes its published depth -- a W31 refusal's small
         # cached_tokens retracts an over-credit here, D itself being the witness
         self.published.pop(key, None)
@@ -460,7 +469,8 @@ class TokenSpans:
         return max(0, int(n)) // self.anchor_page * self.anchor_page
 
     def record_store_anchor(self, ids: Optional[np.ndarray], prompt_tokens: int = 0,
-                            inner: Optional[Sequence[int]] = None, inner_keep: int = 0) -> int:
+                            inner: Optional[Sequence[int]] = None, inner_keep: int = 0,
+                            source: Optional[str] = None) -> int:
         """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE):
         P's END-ANCHOR of ``ids`` is in the store and D resumed from it -- the
         caller calls this only at the first content of an ``after_p`` leg 2,
@@ -480,6 +490,9 @@ class TokenSpans:
             return 0
         key = self._key(ids)
         old = self.entries.pop(key, None)
+        if source:
+            # STORE-PRESENCE: the witness label pending() names (a finish reading replaces it)
+            self.store_keys[key] = str(source)
         if old is None:
             self.entries[key] = (ids, anchor, 0, None)
             self.depth_caps[key] = anchor
@@ -528,6 +541,45 @@ class TokenSpans:
                 n += 1
         return n, gained
 
+    def record_store_depth(self, ids: Optional[np.ndarray], depth: int,
+                           source: str = "l3_index") -> int:
+        """L3-INDEX PRICE (02.10.): the shared store holds ``ids``' leading
+        pages with an anchor at ``depth`` (``front_store.StorePresence``:
+        page keys as P/D read them, KV + every all-pages component, the
+        trailing mamba blob at the last page). Credited like a store anchor
+        -- beyond the epoch, a store fact -- but at the PAGE depth the store
+        proves, not at the prompt's page floor: a page prefix of an earlier,
+        longer prompt is a credit too (y7d weg2-2-19: P hit 30016 of 30076).
+        An entry that already credits at least ``depth`` stands untouched;
+        otherwise its credit and #59 cap are raised to it. A finish reading
+        replaces it (:meth:`record_presence`). Returns the depth recorded
+        (0 = none)."""
+        if ids is None or ids.size == 0:
+            return 0
+        depth = min(int(depth), int(ids.size))
+        if depth <= 0:
+            return 0
+        key = self._key(ids)
+        old = self.entries.get(key)
+        if old is not None:
+            cap = self.depth_caps.get(key)
+            have = int(old[1]) if cap is None else min(int(old[1]), int(cap))
+            if have >= depth:
+                return 0
+        self.entries.pop(key, None)
+        self.store_keys[key] = str(source)
+        if old is None:
+            self.entries[key] = (ids, depth, 0, None)
+            self.depth_caps[key] = depth
+        else:
+            oids, ct, pt, held = old
+            self.entries[key] = (oids, max(int(ct), depth), pt, held)
+            cap = self.depth_caps.get(key)
+            if cap is not None and int(cap) < depth:
+                self.depth_caps[key] = depth
+        self._stamp(key)
+        return depth
+
     def _stamp(self, key: str) -> None:
         self.seq += 1
         self.entry_seq[key] = self.seq
@@ -540,6 +592,56 @@ class TokenSpans:
             self.published.pop(old_key, None)
             self.inner.pop(old_key, None)
             self.entry_seq.pop(old_key, None)
+            self.store_keys.pop(old_key, None)
+
+    # -- SEQ-HASH (02.10.) ------------------------------------------------------
+    def record_seq(self, ids: Optional[np.ndarray], depth: int, digest: str) -> bool:
+        """D named an anchor at ``depth`` on the sequence that starts with the
+        prompt ``ids`` and continues with D's own output, plus the hash of that
+        sequence up to ``depth`` (managers/weg2_seq_hash.py). Only a depth PAST
+        the prompt adds anything (inside the prompt the token LCP prices it)."""
+        if ids is None or ids.size == 0 or int(depth) <= int(ids.size) or not digest:
+            return False
+        key = self._key(ids)
+        _ids, marks = self.seq_marks.pop(key, (ids, []))
+        marks = [m for m in marks if m[0] != int(depth)] + [(int(depth), str(digest))]
+        marks.sort(key=lambda m: -m[0])
+        self.seq_marks[key] = (ids, marks[:8])
+        while len(self.seq_marks) > self.cap:
+            self.seq_marks.popitem(last=False)
+        return True
+
+    def seq_credit(self, ids: np.ndarray) -> Tuple[int, Optional[int]]:
+        """(credit, prompt length of the matched sequence): the deepest seq mark
+        whose prompt ``ids`` extends and whose hash equals ``ids`` hashed to
+        that depth. (0, None) = none."""
+        from sglang.srt.managers import weg2_seq_hash as _sh
+
+        best, plen = 0, None
+        for pids, marks in self.seq_marks.values():
+            n = int(pids.size)
+            if ids.size <= n or token_lcp(pids, ids) < n:
+                continue  # it does not extend that prompt
+            for depth, digest in marks:
+                if depth <= best or depth > ids.size:
+                    continue
+                if _sh.digest(ids, depth) == digest:
+                    best, plen = depth, n
+                    break
+        return best, plen
+
+    def drop_seq_depths(self, lost) -> int:
+        """ANCHOR-LOST: forget the seq marks at depths a flush dropped."""
+        lost = {int(d) for d in lost or ()}
+        n = 0
+        for key, (pids, marks) in list(self.seq_marks.items()):
+            keep = [m for m in marks if m[0] not in lost]
+            n += len(marks) - len(keep)
+            if keep:
+                self.seq_marks[key] = (pids, keep)
+            else:
+                self.seq_marks.pop(key, None)
+        return n
 
     def record_inflight(self, ids: Optional[np.ndarray], held_epoch: Optional[int]) -> None:
         if ids is None or ids.size == 0 or held_epoch is None:
@@ -603,5 +705,12 @@ class TokenSpans:
                     credit = int(on_path[-1])  # #49 L3: the deepest inner anchor on the shared path
             if credit > best:
                 best = credit
-                src = "d_served_epoch" if held and credit > ct else "d_leg2_cached"
+                src = ("d_served_epoch" if held and credit > ct
+                       else self.store_keys.get(key, "d_leg2_cached"))
+        if self.seq_marks and since_seq is None:
+            # SEQ-HASH: a prompt that extends a previous turn's GENERATED tokens (27B port: not
+            # for an SK-X fresh-confirmation read -- a seq mark is no D evidence after the void)
+            seq, _plen = self.seq_credit(ids)
+            if seq > best:
+                best, src, known = seq, "d_seq_anchor", True
         return max(0, int(ids.size) - best), best, known, src

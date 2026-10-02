@@ -680,7 +680,8 @@ def test_b2c_every_l_line_the_spec_names_is_present_with_its_denominators():
                                            "p_concurrency=", "passes=", "queue_at_exit="]),
         "L2": (front_src, "WEG2 D-ADMIT rid=", ["seat=", "rank=", "oldest_wait_s=", "source="]),
         "L3": (front_src, "WEG2 D-REFILL", ["freed_by=", "seats_free=", "queued_d="]),
-        "L4": (front_src, "WEG2 SHORT-BEHIND-P", ["epoch=", "n=", "oldest_wait_s="]),
+        # P-BATCH-ALL (02.10.): SHORT arrivals in a P phase join P's batch
+        "L4": (front_src, "WEG2 SHORT-TO-P", ["epoch=", "n=", "oldest_wait_s="]),
         "L5": (front_src, "WEG2 LATE-BATCH", ["deferred_to_epoch="]),
         "L9": (sched_src, "WEG2 X-GATE", ["uncached=", "X=", "replicated_term=", "verdict="]),
         "L10": (front_src, "WEG2 X-ROUTE", ["est_uncached=", "X=", "ESTIMATE"]),

@@ -9197,6 +9197,63 @@ def _argv_scalar(extra: str, flag: str):
     return gefunden
 
 
+#: P-COVERS-D-SESSION (user law 02.10. ~07:55Z): the boot-refusal marker.
+P_COVERS_D_SESSION_MARK = "P-COVERS-D-SESSION"
+
+
+def d_session_tokens(extra_d: str, max_kv_per_request: int) -> int:
+    """D's maximum decode session: the ``--max-kv-per-request`` group D runs
+    with (its ``--extra-d`` value wins, argparse keeps the last)."""
+    raw = _argv_scalar(extra_d, "--max-kv-per-request")
+    try:
+        return int(raw) if raw is not None else int(max_kv_per_request)
+    except (TypeError, ValueError):
+        return int(max_kv_per_request)
+
+
+def p_covers_d_session(argv_p_shipped: Sequence[str], d_session: int) -> Tuple[bool, str]:
+    """LAW (user 02.10. ~07:55Z): "kann nie passieren, weil P ja bis 262k
+    prefillen kann und eine einzelne D session nur maximal 262k haben kann.
+    das selbe gilt fuer yarn ... deswegen ja die stufen in P". P's KV stage
+    (its ``--max-total-tokens`` pool) and its per-request cap
+    (``--max-kv-per-request``) must each hold D's maximum session, so no
+    request is ever D's to prefill for a capacity reason (the CARRIER-EXCEEDS
+    route is deleted). Returns ``(ok, line)``; a term the shipped P argv does
+    not name is printed as unnamed, never assumed."""
+    d = int(d_session)
+    cap = _last_flag_value(argv_p_shipped, "--max-kv-per-request")
+    pool = _last_flag_value(argv_p_shipped, "--max-total-tokens")
+    short = []
+    for name, raw in (("P --max-kv-per-request", cap), ("P --max-total-tokens (KV stage)", pool)):
+        if raw is None:
+            continue
+        try:
+            if int(raw) < d:
+                short.append(f"{name}={int(raw)} < D session {d}")
+        except ValueError:
+            continue
+    line = (f"{P_COVERS_D_SESSION_MARK} D session (--max-kv-per-request)={d} "
+            f"P cap={cap if cap is not None else 'unnamed'} "
+            f"P stage pool={pool if pool is not None else 'unnamed'}")
+    if short:
+        return False, (line + " REFUSED: " + "; ".join(short) + " -- P must prefill every "
+                       "request D can hold (no D prefill for capacity, law 02.10.); raise P's "
+                       "stage (YaRN 524k / 786k) or lower D's --max-kv-per-request")
+    return True, line + " ok"
+
+
+def carrier_covers_d_session(carrier_max: int, d_session: int) -> Tuple[bool, str]:
+    """LAW 02.10. (second half): the carrier (D's host staging read, the
+    window loop's transit) must hold D's maximum session too -- below it the
+    front's W52 would refuse a prompt D can hold. Returns ``(ok, line)``."""
+    c, d = int(carrier_max), int(d_session)
+    line = f"{P_COVERS_D_SESSION_MARK} carrier_max={c} D session={d}"
+    if c > 0 and c < d:
+        return False, (line + " REFUSED: the carrier is below D's session -- raise D's L2 "
+                       "(it is derived from --max-kv-per-request) or lower --max-kv-per-request")
+    return True, line + " ok"
+
+
 def yarn_context_tokens(override_json) -> Optional[int]:
     """YaRN x2 (27.09.): the context a YaRN rope override stretches the model
     to -- ``original_max_position_embeddings x factor`` of a ``rope_type``
@@ -25275,6 +25332,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"WEG2-P-FORM CONFIRMED key={shipped_key} on the argv actually shipped "
         f"(the ring was gated on this same key before the host-ledger arm "
         f"existed; the sentinel terms are proven inert, not assumed to be)")
+    # P-COVERS-D-SESSION (law 02.10.): a named refusal, never a D prefill
+    _cov_ok, _cov_line = p_covers_d_session(
+        shipped_argv_p, d_session_tokens(ns.extra_d, max_kv_per_request))
+    log(_cov_line)
+    if not _cov_ok:
+        raise Weg2LaunchRefused(_cov_line)
     spec_p = GroupSpec("P", PORT_P, transport_argv(shipped_argv_p, ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     log(w38_armed_line(spec_p.argv))
@@ -25294,8 +25357,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "zero-remainder: group P holds the last token of every prefill back into its own chunk (SGLANG_WEG2_END_ANCHOR=1) so the GDN anchor D resumes from sits at N-1; "
         "costs P one 1-token pass per request and serialises whole-fit prompts behind the one chunked request per pass",
         "zero-remainder: /flush_cache publishes un-backed nodes before the idle witness on both groups (SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1); the quiesce then waits for those backups",
-        "zero-remainder: a BATCH prompt longer than group D's host staging pool can carry (launcher-measured from D's log, x0.9 prefetch bound) is served by ONE prefill on D "
-        "(front route CARRIER-EXCEEDS, no leg 1) -- served and single-prefill, but NOT a zero-remainder leg 2; the windowed prefetch that would lift it is the next round",
+        # y7d (9bdfe50185) still declared the deleted CARRIER-EXCEEDS route here
+        # ("served by ONE prefill on D, no leg 1"); 9bdfe50185 removed it.
+        "zero-remainder: no D single-prefill route -- every BATCH prompt takes P's leg 1 (CARRIER-EXCEEDS deleted, P-COVERS-D-SESSION law 02.10.); "
+        "a boot whose P prefill stages do not cover D's session is refused by name above, never served by a D prefill",
         "zero-remainder: BATCH streams are priced post hoc via stream_options.include_usage (one standard trailing usage chunk reaches the client)",
     ]
     log(early_read_provenance())
@@ -25872,6 +25937,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"group D is awake and serving -- SHORT is four conjuncts, so while D sleeps a sub-floor prompt "
             f"queues to BATCH and round-trips as well")
     state.carrier_max_tokens = carrier_max_tokens
+    if not hicache_disabled:
+        # P-COVERS-D-SESSION (law 02.10.): the measured carrier holds D's session
+        # too (no capacity route to a D prefill exists any more)
+        _cc_ok, _cc_line = carrier_covers_d_session(
+            carrier_max_tokens, d_session_tokens(ns.extra_d, int(ns.max_kv_per_request
+                                                                or CONTEXT_LENGTH_TOKENS)))
+        log(_cc_line)
+        if not _cc_ok:
+            raise Weg2LaunchRefused(_cc_line)
     log(f"D-ADMIT STORE-READ GATE (FIX 4, round 4): the budget is group D's OWN #915 reading "
         f"(available/occupied/limit via /server_info hicache_prefetch), not a launcher-derived "
         f"proxy; front --d-admit-max-tokens "
@@ -26006,6 +26080,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
+    # L3-INDEX PRICE (02.10.): the front asks the shared L3 stem index with the
+    # groups' own page-key scheme and arena dir (group_env's values, so the
+    # credit is what P/D read).
+    if ns.hicache_bigram_keys:
+        fenv["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
+    else:
+        fenv.pop("SGLANG_HICACHE_BIGRAM_KEYS", None)
+    fenv.setdefault("SGLANG_HICACHE_ARENA_DIR", f"/dev/shm/weg2-arena-{ns.tag}")
     # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
     # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
     #

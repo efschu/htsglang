@@ -526,6 +526,10 @@ class SglExt(BaseModel):
     # #49 L3: the inner mamba anchor depths a Weg-2 P prefill donated (meta_info
     # weg2_anchor_depths), read by the front on P's leg 1.
     weg2_anchor_depths: Optional[List[int]] = None
+    # SEQ-HASH (02.10.): "<depth>:<hash>" of the whole sequence (prompt +
+    # output) up to weg2_resumable_depth (managers/weg2_seq_hash.py); the front
+    # credits a follow-up that extends this sequence to there.
+    weg2_seq_hash: Optional[str] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

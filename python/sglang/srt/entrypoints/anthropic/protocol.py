@@ -66,6 +66,8 @@ class AnthropicSglExt(BaseModel):
     #: #49 L3: a Weg-2 P prefill's inner mamba anchor depths (the OpenAI wire's
     #: ``sglext.weg2_anchor_depths``), read by the front on P's leg 1.
     weg2_anchor_depths: Optional[list[int]] = None
+    #: SEQ-HASH (02.10.): the sequence mark beside the resumable depth.
+    weg2_seq_hash: Optional[str] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------
