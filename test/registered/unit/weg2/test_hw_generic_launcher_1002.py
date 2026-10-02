@@ -141,15 +141,26 @@ class SyntheticInventories(unittest.TestCase):
                 self.assertIn("--d-nontorch-mib", msg)
                 self.assertIn("card_rate_pass --run", msg)
 
-    def test_a_profile_that_names_its_own_inventory_passes(self):
-        """The path a foreign rig takes once calibrated: its profile declares
-        the inventory its vectors were measured on."""
+    def test_a_profile_naming_a_foreign_inventory_does_not_unlock_reference_records(self):
+        """A profile written for 3x3090 (``--profile-inventory``) passes the
+        VECTOR check -- and is still refused, by name, because this tree's
+        measured records were taken on the reference rig: naming an
+        inventory never makes another inventory's measurements hold."""
         o = L.order_cards(list(SYNTHETIC["3x3090"]))
         sig = ",".join(CI.inventory_signature(o))
         self.assertEqual(sig, "RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86,RTX3090/24576MiB/sm86")
-        line = L.inventory_check_line(ns_for("qwen27b", "--profile-inventory", sig), o)
+        with self.assertRaises(L.Weg2LaunchRefused) as cm:
+            L.inventory_check_line(ns_for("qwen27b", "--profile-inventory", sig), o)
+        msg = str(cm.exception)
+        self.assertIn("measured records", msg)
+        self.assertNotIn("vectors (--profile-inventory)", msg)  # the vector check passed
+        self.assertIn("D_OVERSHOOT_MIB", msg)
+
+    def test_reference_rig_with_explicit_profile_inventory_passes_both_checks(self):
+        o = L.order_cards(rig())
+        line = L.inventory_check_line(ns_for("nextflash", "--profile-inventory", "RTX5090,RTX3080,RTX3080"), o)
         self.assertIn("MATCH", line)
-        self.assertIn("--profile-inventory", line)
+        self.assertIn("vectors: --profile-inventory", line)
 
     def test_w19_residue_is_never_borrowed(self):
         for name in ("3x3090", "3x5090", "pro6000+2xa6000", "5090+2x3080-10GB"):
@@ -269,6 +280,37 @@ class ArchAndCountGates(unittest.TestCase):
             with self.assertRaises(L.Weg2LaunchRefused) as cm:
                 L.order_cards(cards)
             self.assertTrue(str(cm.exception).startswith("HW-COUNT"), str(cm.exception))
+
+
+class Stage2TopologyEnabling(unittest.TestCase):
+    """S2 (enabling refactor): the argv sizes and the rank map come from the
+    topology of the card count; N = 3 is byte-identical, N != 3 is refused
+    BY NAME with what still assumes three ranks."""
+
+    def test_n3_is_the_release_argv(self):
+        from sglang.srt.weg2 import topology as T
+
+        t = T.plan_topology(3)
+        self.assertEqual((t.p_tp, t.p_pp, t.d_tp, t.d_pp, t.host_ordinal), (1, 3, 3, 1, 0))
+        self.assertEqual(T.rank_gpu_id_csv(L.WEG2_CARD_COUNT), "0,1,2")
+        src = open(L.__file__).read()
+        self.assertNotIn('"--pp-size", "3"', src)
+        self.assertNotIn('"--tp-size", "3"', src)
+        self.assertNotIn('"--rank-gpu-id", "0,1,2"', src)
+
+    def test_unproven_counts_are_refused_with_the_blockers(self):
+        from sglang.srt.weg2 import topology as T
+
+        for n in (2, 4, 8):
+            t = T.release_topology(n)
+            self.assertEqual((t.p_pp, t.d_tp), (n, n))
+            self.assertFalse(t.proven)
+            with self.assertRaises(T.TopologyRefused) as cm:
+                T.plan_topology(n)
+            self.assertIn("BAR1 group windows", str(cm.exception))
+        for n in (1, 9):
+            with self.assertRaises(T.TopologyRefused):
+                T.release_topology(n)
 
 
 if __name__ == "__main__":
