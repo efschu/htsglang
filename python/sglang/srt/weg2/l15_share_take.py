@@ -65,10 +65,13 @@ def take_kv(shares: Mapping[int, Tuple[dict, Sequence[int]]], *, rid: str, n: in
             stage_layers: Sequence[int],
             p_buffers: Mapping[int, Tuple[torch.Tensor, torch.Tensor]],
             p_rows: Sequence[int],
-            map_extent: Callable[[int, int], torch.Tensor]) -> int:
+            map_extent: Callable[[int, int], torch.Tensor],
+            skip_ranks: Sequence[int] = ()) -> int:
     """Copy the prefix's KV cells for this stage's layers into ``p_rows``.
     ``shares``: D rank -> (descriptor, fds); ``p_buffers``: global attention
-    layer -> (k, v) of this stage. Returns cells copied."""
+    layer -> (k, v) of this stage. ``skip_ranks`` (the cap-0 ranks, which
+    hold nothing) contribute no piece -- their tokens come from L2 (the
+    caller). Returns cells copied."""
     from sglang.srt.weg2.l15_handover_copy import apply_row_pieces
     from sglang.srt.weg2.l15_row_plan import plan_d_to_p
 
@@ -79,13 +82,15 @@ def take_kv(shares: Mapping[int, Tuple[dict, Sequence[int]]], *, rid: str, n: in
     any_desc = next(iter(descs.values()))
     prefix = [int(x) for x in any_desc["prefix"]]
     R = len(prefix) - 1
-    if set(range(R)) - set(shares):
+    skip = {int(x) for x in skip_ranks}
+    if set(range(R)) - set(shares) - skip:
         raise L15TakeError("hold share missing for D rank(s) %s"
-                           % sorted(set(range(R)) - set(shares)))
+                           % sorted(set(range(R)) - set(shares) - skip))
     k0 = next(iter(p_buffers.values()))[0]
     row_bytes = int(k0[0].numel() * k0.element_size())
-    pieces = plan_d_to_p(slots, prefix, [list(stage_layers)], [0], [0] * R,
-                         0, row_bytes, 1 << 62)
+    pieces = [p for p in plan_d_to_p(slots, prefix, [list(stage_layers)], [0],
+                                     [0] * R, 0, row_bytes, 1 << 62)
+              if int(p.src[2:]) not in skip]
     # map + view everything FIRST (all-or-nothing before any write)
     src_by_rank: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = {}
     for r in range(R):
