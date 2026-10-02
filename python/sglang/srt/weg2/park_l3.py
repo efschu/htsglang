@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ def _report_marks(cache, req, marks, t0: float) -> None:
         pass
 
 
-def issue_deferred_reads(sched, hold) -> list:
+def issue_deferred_reads(sched, hold, max_n: Optional[int] = None) -> list:
     """``#1443 DORMANT-RELEASE``: issue the store read of every held request
     whose intake only looked it up, in hold order. Every rank runs this at
     the same point of the resume with the same hold (the intake order is
@@ -152,6 +153,8 @@ def issue_deferred_reads(sched, hold) -> list:
     out = []
     cache = getattr(sched, "tree_cache", None)
     for req in list(hold or ()):
+        if max_n is not None and len(out) >= int(max_n):
+            break
         if not deferred(req):
             continue
         setattr(req, DEFER_ATTR, False)
@@ -204,7 +207,17 @@ def issued(req) -> bool:
     return bool(getattr(req, ISSUED_ATTR, False))
 
 
-def issue_reads_at_wake_begin(sched) -> list:
+def spread_enabled() -> bool:
+    """PDFLIP-S: the early reads one per weight tag, beside the collects."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_WAKE_READ_EARLY_SPREAD.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def issue_reads_at_wake_begin(sched, max_n: Optional[int] = None) -> list:
     """F22 (29.09.): the deferred hold reads at the START of the weight legs.
 
     MEASURED (marker audit x178 / z30w-park / z30x2-kvdemand): the #248 read
@@ -222,8 +235,8 @@ def issue_reads_at_wake_begin(sched) -> list:
     hold = getattr(sched, "weg2_dormant_hold", None) or []
     if not hold:
         return []
-    out = issue_deferred_reads(sched, hold)
-    if out:
+    out = issue_deferred_reads(sched, hold, max_n=max_n)
+    if out and max_n is None and not spread_enabled():
         logger.info("#248 WAKE-READ-EARLY issued=%d at the weight legs' start (F22: the read runs "
                     "beside the legs, the settle finds it complete)", len(out))
     return out

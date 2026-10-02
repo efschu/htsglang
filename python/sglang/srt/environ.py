@@ -655,6 +655,14 @@ class Envs:
     # p50 2.49 s = the bulk of the 2.8 s P->D nachlauf. =0 restores the
     # release-time read byte for byte.
     SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(True)
+    # WAKE_READ_EARLY_SPREAD (PDFLIP-S, 02.10.): the early hold reads are not
+    # registered all at once before the first resume (WEG2-WAKE-TAIL read_early
+    # p50 89 ms / max 319 in N4p, p50 301 / max 789 in N4f -- P's depositors
+    # wait for D's first collect meanwhile), but one per weight tag, right after
+    # that tag's collect went to the worker, the rest after the last tag:
+    # beside the collects, still early. Same hold order on every rank, no other
+    # collective in the loop. 0 = all at the legs' start (d1e5da09dc).
+    SGLANG_WEG2_WAKE_READ_EARLY_SPREAD = EnvBool(True)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing
