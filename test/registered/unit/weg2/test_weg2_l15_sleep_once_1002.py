@@ -74,7 +74,7 @@ def test_restamp_writes_the_flip_epoch_and_keeps_the_rest(tmp_path):
     p = str(tmp_path / "m.json")
     l15_manifest.write(p, _m(0))
     got = l15_sleep_once.restamp(p, 2)
-    back = l15_manifest.from_json(open(p).read())
+    back = l15_manifest.from_bytes(open(p, "rb").read())
     assert back.epoch == 2 and got.epoch == 2
     assert back.spans == _m(0).spans and back.rows_by_rank == (3,)
 

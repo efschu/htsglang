@@ -1513,6 +1513,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not keep:
             self._reset_full()
             return
+        # L15-FLIPCOST-3: the reset step of the D sleep on its own clocks
+        _t0 = time.perf_counter()
         # Union of the chains root -> kept node, root excluded. Identity
         # membership: nodes are unique objects and the walk stops at the
         # first ancestor already collected (chains share their prefixes).
@@ -1529,7 +1531,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Everything _reset_full does for the tree: prefetch pins, host
         # arena values, deferred publish/cap state, counters, fresh root
         # (lock_ref 1), empty LRU lists and leaf sets, zeroed sizes.
+        _t1 = time.perf_counter()
         self._reset_full()
+        _t2 = time.perf_counter()
         root = self.root_node
         for node in keep_set:
             for cd in node.component_data:
@@ -1563,11 +1567,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if value is not None:
                     total += len(value)
             self.component_evictable_size_[ct] = total
+        _t3 = time.perf_counter()
         for node in keep_set:
             self._for_each_component_lru(
                 node, UnifiedLRUList.insert_mru, skip_existing=True
             )
             self._update_evictable_leaf_sets(node)
+        _t4 = time.perf_counter()
+        logger.info(
+            "L15-RESET-KEEP kept_nodes=%d walk_ms=%.0f reset_full_ms=%.0f "
+            "reattach_ms=%.0f lru_ms=%.0f total_ms=%.0f", len(keep_set),
+            (_t1 - _t0) * 1e3, (_t2 - _t1) * 1e3, (_t3 - _t2) * 1e3,
+            (_t4 - _t3) * 1e3, (_t4 - _t0) * 1e3)
 
     def weg2_node_depth(self, node) -> int:
         """Token depth at the END of ``node`` (its key plus every ancestor's)
