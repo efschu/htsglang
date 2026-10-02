@@ -62,7 +62,10 @@ __all__ = [
     "SEED_CARDS",
     "CardLibrary",
     "CardCapacityMismatch",
+    "UncalibratedCard",
     "CAPACITY_TOLERANCE_FRAC",
+    "seed_card",
+    "seed_arch",
     "compose_rig",
 ]
 
@@ -82,6 +85,46 @@ class CardCapacityMismatch(LookupError):
     otherwise: a wrong VRAM total does not announce itself, it flows into
     feasibility and packing and returns as a plan that does not fit.
     """
+
+
+class UncalibratedCard(KeyError):
+    """A card name with no catalogue entry: the card is UNCALIBRATED.
+
+    HW-GENERIC 1002: named, so a caller on a foreign rig reads WHAT is missing
+    and HOW to measure it, instead of a bare ``KeyError``. Subclasses
+    ``KeyError`` so every existing ``except KeyError`` caller keeps working.
+    No entry is borrowed from a "similar" card.
+
+    ``card_key`` is ``weg2.card_identity.card_key`` of the card as far as the
+    caller knows it (``"<model>/<total>MiB/sm<cc>"``; ``?`` for a part the
+    lookup was not given)."""
+
+    def __init__(self, name: str, card_key: str, known: Sequence[str]):
+        self.name = str(name)
+        self.card_key = str(card_key)
+        self.known = tuple(known)
+        super().__init__(
+            f"unknown GPU profile {self.name!r}: UNCALIBRATED card "
+            f"(card_key {self.card_key}) -- no catalogue entry of that name. "
+            f"Measure it on the rig that holds it: `python -m "
+            f"sglang.srt.planner.card_rate_pass --run` (adds the measured "
+            f"variant to the card-rate library). Known: {', '.join(self.known)}"
+        )
+
+    def __str__(self) -> str:  # KeyError would repr-quote the message
+        return self.args[0] if self.args else ""
+
+
+def _card_key(name: str, total_mib: Optional[int] = None, cc=None) -> str:
+    """``card_identity.card_key`` of what the caller knows; ``?`` for the
+    parts it does not (a name-only lookup carries no total and no cc)."""
+    from sglang.srt.weg2.card_identity import card_key, model_name
+
+    if total_mib and cc is not None:
+        return card_key({"name": name, "total_mib": int(total_mib), "cc": cc})
+    total = f"{int(total_mib)}MiB" if total_mib else "?MiB"
+    sm = f"sm{int(cc[0])}{int(cc[1])}" if cc is not None else "sm?"
+    return f"{model_name(name)}/{total}/{sm}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -146,6 +189,7 @@ class CardSpec:
             free_mib=None,
             pcie_gen=self.pcie_gen,
             pcie_width=self.pcie_width,
+            cc=_arch_cc(self.sm_arch),
         )
 
 
@@ -225,6 +269,39 @@ def _canonical(name: str) -> str:
     return " ".join(text.split())
 
 
+def _arch_cc(sm_arch: Optional[str]):
+    """``"sm86"`` -> ``(8, 6)``, ``"sm120"`` -> ``(12, 0)``; None for a
+    missing or non-NVIDIA arch tag (``"cdna3"``)."""
+    text = str(sm_arch or "").strip().lower()
+    if not text.startswith("sm"):
+        return None
+    digits = text[2:].lstrip("_").rstrip("af")
+    if not digits.isdigit() or len(digits) < 2:
+        return None
+    major, minor = divmod(int(digits), 10)
+    return (major, minor)
+
+
+_SEED_BY_KEY: Dict[str, CardSpec] = {}
+
+
+def seed_card(name: str) -> Optional[CardSpec]:
+    """The ``SEED_CARDS`` entry whose canonical name EQUALS ``name``'s
+    (vendor words dropped, case/space-insensitive), or None. Never a
+    substring or prefix match: "A10" is not "A100", "RTX 5090 D" is not
+    "RTX 5090"."""
+    if not _SEED_BY_KEY:
+        for p in SEED_CARDS.values():
+            _SEED_BY_KEY[_canonical(p.name)] = p
+    return _SEED_BY_KEY.get(_canonical(name))
+
+
+def seed_arch(name: str) -> Optional[str]:
+    """The ``sm_arch`` of :func:`seed_card` (``"sm86"`` ...), or None."""
+    p = seed_card(name)
+    return p.sm_arch if p is not None else None
+
+
 class CardLibrary:
     """A catalog of ``CardSpec``s keyed by card name, seeded from
     ``SEED_CARDS`` and grown from submitted RESULTS fingerprints (§2.7).
@@ -252,9 +329,7 @@ class CardLibrary:
         """
         key = _canonical(name)
         if key not in self._by_key:
-            raise KeyError(
-                f"unknown GPU profile {name!r}. Known: {', '.join(self.names())}"
-            )
+            raise UncalibratedCard(name, _card_key(name), self.names())
         return self._by_key[key]
 
     def has(self, name: str) -> bool:
@@ -317,8 +392,8 @@ class CardLibrary:
         """
         candidates = self.variants(name)
         if not candidates:
-            raise KeyError(
-                f"unknown GPU profile {name!r}. Known: {', '.join(self.names())}"
+            raise UncalibratedCard(
+                name, _card_key(name, total_mib), self.names()
             )
         measured = [c for c in candidates if c.source == "measured"]
         if measured:
