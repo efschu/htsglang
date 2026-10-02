@@ -5670,22 +5670,25 @@ def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
 POSITIONAL_VECTOR_FLAGS = (
     "d_foreign_context_mib", "d_nontorch_mib", "pp_stage_ratio", "pp_attn_stage_ratio",
     "pp_cut_expert_device_fraction", "pp_cut_expert_lru_rows", "user_reserve_mib",
+    "d_reserve_mib", "pp_cut_reserve_mib", "d_reshard_presets", "p_barlink_bar1_window_mib",
 )
 POSITIONAL_VECTOR_TOKENS = (
     "--rank-role", "--rank-tp-ratio", "--rank-moe-ratio", "--rank-moe-resident-fraction",
     "--rank-user-reserve-mib", "--rank-gpu-memory-mib", "--pp-stage-ratio",
     "--pp-attn-stage-ratio", "SGLANG_MOE_SCRATCH_SLOTS=", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION=",
-    "SGLANG_WEG2_L15_MIB=",
+    "SGLANG_WEG2_L15_MIB=", "SGLANG_WEG2_EXTEND_TRIM_MIB=",
 )
 
 
 def positional_inputs_present(ns) -> List[str]:
-    """The positional per-card inputs this launch carries (flag dests that are
-    set + vector tokens found in --extra-p/-d and --env-p/-d)."""
+    """The positional per-card inputs this launch carries (flag dests set to
+    something other than their parser default + vector tokens found in
+    --extra-p/-d and --env-p/-d)."""
     out: List[str] = []
+    defaults = build_parser().parse_args(["--tree", "/", "--tag", "x"])
     for dest in POSITIONAL_VECTOR_FLAGS:
         v = getattr(ns, dest, None)
-        if v not in (None, "", [], ()):
+        if v not in (None, "", [], ()) and v != getattr(defaults, dest, None):
             out.append("--" + dest.replace("_", "-"))
     blob = " ".join(str(getattr(ns, k, "") or "") for k in ("extra_p", "extra_d", "env_p", "env_d"))
     for tok in POSITIONAL_VECTOR_TOKENS:

@@ -116,7 +116,7 @@ def test_reference_rig_json_rows(run_cli):
     rows = json.loads(out)
     assert [r["nvml_index"] for r in rows] == [1, 0, 2]
     assert [r["class"] for r in rows] == ["RTX5090", "RTX3080", "RTX3080"]
-    assert rows[0]["key"] == "RTX 5090/32607MiB/sm120"
+    assert rows[0]["key"] == "RTX5090/32607MiB/sm120"
 
 
 def test_3x3090_uncalibrated_with_inventory(run_cli):
@@ -124,8 +124,8 @@ def test_3x3090_uncalibrated_with_inventory(run_cli):
     assert rc == 4, out
     msg = _named(out, "HW-UNCALIBRATED:")
     assert "[RTX5090, RTX3080, RTX3080]" in msg
-    assert "ordinal 0: live RTX 3090/24576MiB/sm86 vs calibrated RTX5090" in msg
-    assert "ordinal 2: live RTX 3090/24576MiB/sm86 vs calibrated RTX3080" in msg
+    assert "ordinal 0: live RTX3090/24576MiB/sm86 vs calibrated RTX5090" in msg
+    assert "ordinal 2: live RTX3090/24576MiB/sm86 vs calibrated RTX3080" in msg
     # the card table is printed before the refusal (the entrypoint logs it)
     assert len(_ordinal_rows(out)) == 3
 
@@ -152,8 +152,8 @@ def test_pro6000_two_a6000_uncalibrated_biggest_first(run_cli):
     assert "RTX PRO 6000 Blackwell" in rows[0] and "sm120" in rows[0]
     assert "RTX A6000" in rows[1] and "RTX A6000" in rows[2]
     msg = _named(out, "HW-UNCALIBRATED:")
-    assert "RTX PRO 6000 Blackwell Workstation Edition/97887MiB/sm120 vs calibrated RTX5090" in msg
-    assert "RTX A6000/49140MiB/sm86 vs calibrated RTX3080" in msg
+    assert "RTXPRO6000BlackwellWorkstationEdition/97887MiB/sm120 vs calibrated RTX5090" in msg
+    assert "RTXA6000/49140MiB/sm86 vs calibrated RTX3080" in msg
 
 
 def test_sm89_card_refused_by_arch_before_count(run_cli):
@@ -179,7 +179,7 @@ def test_10g_rtx3080_is_not_the_20g_class(run_cli):
     rc, out = run_cli("rig_10g_3080", "--expect-count", "3", "--inventory", REF_INV)
     assert rc == 4, out
     msg = _named(out, "HW-UNCALIBRATED:")
-    assert "RTX 3080/10240MiB/sm86" in msg
+    assert "RTX3080/10240MiB/sm86" in msg
 
 
 def test_unreported_compute_capability_refused_by_name(run_cli):

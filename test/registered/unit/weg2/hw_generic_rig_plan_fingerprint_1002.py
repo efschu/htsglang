@@ -81,6 +81,12 @@ def fingerprint():
     # P chunk model calibration power limits (builtin record, by stage class)
     fp["p_chunk_model_power_limits"] = list(L.p_chunk_model_power_limits("builtin-int8", 3))
     fp["p_stage_card_classes"] = list(L.P_STAGE_CARD_CLASSES)
+    # planner presets: sm86 detection and the reference-rig calibration gate
+    from sglang.srt.planner import flags as PF
+
+    gpus = [{"name": c.name, "total_mib": c.total_mib, "memory_mib": c.total_mib} for c in cards]
+    fp["planner_rig_has_sm86"] = bool(PF.rig_has_sm86(gpus))
+    fp["planner_match_calibration"] = {str(q): PF._match_calibration(gpus, q) for q in ("fp8", "awq", None)}
 
     for prof in PROFILES:
         pf = fp.setdefault(prof, {})
