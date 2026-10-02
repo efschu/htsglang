@@ -20214,6 +20214,21 @@ class Scheduler(
                 # the req rows go, keeping the compacted mamba anchors. The
                 # zeroing would destroy the held pages, so it is skipped.
                 self.req_to_token_pool.clear(keep_mamba_rows=_l15_res.a_h)
+            # L15-10 S4n-d: publish the armed hold for the waking P (hot
+            # handover), opt-in; a previous sleep's share is closed first.
+            if _l15_res is not None and os.environ.get(
+                    "SGLANG_WEG2_L15_HOT_SHARE", "0") == "1":
+                try:
+                    from sglang.srt.weg2 import l15_share_publish as _l15_sp
+                    _old = getattr(self, "_l15_share_pub", None)
+                    if _old is not None and _old is not _l15_reuse:
+                        _old.close()
+                    if _l15_reuse is None or getattr(self, "_l15_share_pub", None) is None:
+                        self._l15_share_pub = _l15_sp.publish_for_sched(
+                            self, _l15_res.manifest, os.environ, logger.info)
+                except Exception as exc:  # noqa: BLE001 -- share is optional
+                    logger.warning("L15-SHARE publish failed (%s: %s)",
+                                   type(exc).__name__, exc)
             # L15-SLEEP1X: remember an ARMED round -- with the token of the
             # pools AFTER the req-row clear, i.e. exactly the state the next
             # flush of this sleep will see -- so that flush reuses it; any

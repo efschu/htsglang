@@ -7391,6 +7391,16 @@ class SchedulerWeightUpdaterManager:
         the same kv/mamba buffer walk as the scheduler retain hook (dedup
         by base data_ptr).  Cleanup, not the move: failures are logged.
         Returns the bases cleared."""
+        # L15-10 S4n-d: the hold ends here -- stop sharing it with P (close
+        # the published descriptor, socket and fds; P's imports keep their
+        # own references until P drops them).
+        _pub = getattr(sched, "_l15_share_pub", None)
+        if _pub is not None:
+            try:
+                _pub.close()
+            except Exception:  # noqa: BLE001 -- cleanup only
+                pass
+            sched._l15_share_pub = None
         ad = getattr(sched, "memory_saver_adapter", None)
         if ad is None:
             return 0

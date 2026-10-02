@@ -36,7 +36,10 @@ def build_descriptor(*, epoch: int, rank: int, prefix: Sequence[int],
                      bases: Sequence[dict], spans) -> dict:
     """``bases``: [{role, layer, view_off, unit, extents: [[off, size]...]}]
     in the order their fds are sent; ``spans``: manifest HoldSpans."""
-    n_fds = sum(len(b["extents"]) for b in bases)
+    n_fds = (1 + max((int(e[2]) for b in bases for e in b["extents"]
+                      if len(e) > 2), default=-1)) if any(
+        len(e) > 2 for b in bases for e in b["extents"]) else sum(
+        len(b["extents"]) for b in bases)
     return {
         "epoch": int(epoch), "rank": int(rank), "pid": os.getpid(),
         "prefix": [int(x) for x in prefix],
@@ -140,3 +143,78 @@ def fetch_share(directory: str, rank: int, timeout_s: float = 5.0):
         raise L15ShareError("hold share of D rank %d: %r" % (rank, exc)) from exc
     finally:
         s.close()
+
+
+def publish_for_sched(sched, manifest, env, log) -> Optional["SharePublisher"]:
+    """D side, after a successful keep arm: publish this rank's hold for the
+    waking P (SGLANG_WEG2_L15_HOT_SHARE=1). Bases: the pool's k_buffer[i]
+    (role k, layer i), v_buffer[i] (role v), mamba temporal[i] and conv[0][i]
+    -- exactly the views the retain hook armed; extents: the split hold
+    extents (l15_keep_split). Any refusal: a named line, no share."""
+    import torch
+
+    from sglang.srt.weg2 import l15_keep_split, l15_shadow
+    from sglang.srt.weg2.l15_hold_share import L15ShareError, export_hold_extents
+
+    mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    pool = l15_shadow.kv_pool_of(getattr(mr, "token_to_kv_pool", None))
+    views = []  # (role, layer, tensor)
+    for role, lst in (("k", getattr(pool, "k_buffer", None)),
+                      ("v", getattr(pool, "v_buffer", None))):
+        for i, t in enumerate(lst or ()):
+            if isinstance(t, torch.Tensor):
+                views.append((role, i, t))
+    mc = getattr(getattr(getattr(sched, "req_to_token_pool", None),
+                         "mamba_pool", None), "mamba_cache", None)
+    temp = getattr(mc, "temporal", None)
+    if temp is not None:
+        views += [("mamba_temporal", i, temp[i]) for i in range(int(temp.shape[0]))]
+    for c, ct in enumerate(getattr(mc, "conv", None) or []):
+        views += [("mamba_conv%d" % c, i, ct[i]) for i in range(int(ct.shape[0]))]
+    bases, fds = [], []
+    exported = {}  # base ptr -> [(off, size, fd_index)] -- one export per base
+    try:
+        for role, layer, t in views:
+            b = t._base if t._base is not None else t
+            ptr = int(b.data_ptr())
+            holds = l15_keep_split._HOLD.get(ptr)
+            if not holds:
+                raise L15ShareError("%s layer %d: base not split" % (role, layer))
+            if ptr not in exported:
+                got = export_hold_extents(ptr, holds)
+                exported[ptr] = []
+                for o, sz, f in got:
+                    exported[ptr].append((o, sz, len(fds)))
+                    fds.append(f)
+            off = int(t.data_ptr()) - ptr
+            unit = int(t.stride(0)) * int(t.element_size())
+            vend = off + int(t.numel()) * int(t.element_size())
+            # only the base's hold extents inside this view, with their fd
+            # index (views of one base share the fds)
+            ext = [[o, sz, i] for o, sz, i in exported[ptr]
+                   if o < vend and o + sz > off]
+            bases.append({"role": role, "layer": layer, "view_off": off,
+                          "unit": unit, "extents": ext})
+    except Exception as exc:  # noqa: BLE001 -- no share, the hold stays
+        for f in fds:
+            try:
+                os.close(f)
+            except OSError:
+                pass
+        log("L15-SHARE refused (%s: %s) -- P reads the store as today"
+            % (type(exc).__name__, exc))
+        return None
+    rank = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0)
+    from sglang.srt.distributed.utils import get_cp_token_ratios
+
+    ratios = get_cp_token_ratios() or [1]
+    prefix = [0]
+    for x in ratios:
+        prefix.append(prefix[-1] + int(x))
+    desc = build_descriptor(epoch=int(manifest.epoch), rank=rank, prefix=prefix,
+                            bases=bases, spans=manifest.spans)
+    pub = SharePublisher(share_dir(env), rank, desc, fds)
+    pub.start()
+    log("L15-SHARE published rank=%d bases=%d fds=%d spans=%d"
+        % (rank, len(bases), len(fds), len(manifest.spans)))
+    return pub

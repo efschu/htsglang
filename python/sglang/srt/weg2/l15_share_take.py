@@ -51,10 +51,11 @@ def _view_rows(mapped: Dict[int, torch.Tensor], base: dict, fd_index0: int,
         raise L15TakeError("layer %s %s: D row %d bytes != P row %d bytes"
                            % (base.get("layer"), base.get("role"), unit, row_bytes))
     lo, hi = off, off + rows_needed * unit
-    for i, (eo, es) in enumerate(base["extents"]):
-        eo, es = int(eo), int(es)
+    for i, e in enumerate(base["extents"]):
+        eo, es = int(e[0]), int(e[1])
+        key = int(e[2]) if len(e) > 2 else fd_index0 + i
         if eo <= lo and hi <= eo + es:
-            t = mapped[fd_index0 + i]
+            t = mapped[key]
             return t[lo - eo: lo - eo + rows_needed * unit].view(rows_needed, unit)
     raise L15TakeError("layer %s %s: rows [0,%d) not inside one hold extent"
                        % (base.get("layer"), base.get("role"), rows_needed))
@@ -99,9 +100,10 @@ def take_kv(shares: Mapping[int, Tuple[dict, Sequence[int]]], *, rid: str, n: in
         for b in d["bases"]:
             n_ext = len(b["extents"])
             if b.get("role") in ("k", "v") and int(b.get("layer", -1)) in stage_layers:
-                for i, (eo, es) in enumerate(b["extents"]):
-                    if idx + i not in mapped:
-                        mapped[idx + i] = map_extent(int(fds[idx + i]), int(es))
+                for i, e in enumerate(b["extents"]):
+                    key = int(e[2]) if len(e) > 2 else idx + i
+                    if key not in mapped:
+                        mapped[key] = map_extent(int(fds[key]), int(e[1]))
                 views[(int(b["layer"]), b["role"])] = _view_rows(
                     mapped, b, idx, row_bytes, need)
             idx += n_ext
@@ -133,10 +135,10 @@ def _rows_of(mapped_or_tensor, base: dict, fd_index0: int, row: int,
     """Bytes of row ``row`` of one published mamba (layer) view."""
     off, unit = int(base["view_off"]), int(base["unit"])
     lo, hi = off + row * unit, off + (row + 1) * unit
-    for i, (eo, es) in enumerate(base["extents"]):
-        eo, es = int(eo), int(es)
+    for i, e in enumerate(base["extents"]):
+        eo, es = int(e[0]), int(e[1])
         if eo <= lo and hi <= eo + es:
-            key = fd_index0 + i
+            key = int(e[2]) if len(e) > 2 else fd_index0 + i
             if key not in mapped_or_tensor:
                 mapped_or_tensor[key] = map_extent(int(fds[key]), es)
             return mapped_or_tensor[key][lo - eo:hi - eo]
