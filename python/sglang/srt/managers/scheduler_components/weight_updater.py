@@ -7463,7 +7463,8 @@ class SchedulerWeightUpdaterManager:
         self._l15_wake_manifest = None
         return dropped
 
-    def _l15_decide_wake_verdict(self, wake_on: bool, fp, *, epoch: int):
+    def _l15_decide_wake_verdict(self, wake_on: bool, fp, check=None,
+                                 *, epoch: int):
         """L15-12c-E1X (plan sec 9): the ONE decision source for the
         keep-or-fallback-drop verdict at wake.  ``wake_on`` False -> return
         None and touch NO collective (byte-identical master-off wake).
@@ -7471,15 +7472,16 @@ class SchedulerWeightUpdaterManager:
         position (xsn410: no rank may skip a collective); a no-hold rank
         passes fp=None (vote None) but still participates.  The collective
         is l15_wake_check.decide over the tp cpu group the fence uses.
-        L15CheckRefused CANNOT fire yet: bad is always 0 until the sample
-        check lands (next AP).  A failing collective PROPAGATES, like the
-        fence's own gather -- it is never caught per rank."""
+        L15-W2C: ``check`` is this rank's (ok, bad, missing) sample-check
+        result (None -> zeros: a rank without a manifest votes on fp
+        alone).  bad > 0 on ANY rank -> decide() raises L15CheckRefused on
+        EVERY rank; like the fence's own gather, a refusal or a failing
+        collective PROPAGATES -- it is never caught per rank."""
         if not wake_on:
             return None
         from sglang.srt.weg2 import l15_restore, l15_wake_check
-        # missing=0 for now: group_check decides on fp/bad/drop_rids only;
-        # the real count_missing lands with the sample-check AP.
-        vote = (l15_restore.check_vote(fp, 0, 0, 0, ())
+        ok, bad, missing = check if check is not None else (0, 0, 0)
+        vote = (l15_restore.check_vote(fp, ok, bad, missing, ())
                 if fp is not None else None)
         world_group = getattr(self.scheduler, "world_group", None)
         cpu_group = (getattr(world_group, "cpu_group", None)
@@ -7516,6 +7518,74 @@ class SchedulerWeightUpdaterManager:
                         type(exc).__name__, exc)
             return True
         return False
+
+    def _l15_wake_sample_check(self):
+        """L15-W2C (L15-WIRE2-NOTES sec 1/2/4): sample-verify this rank's
+        rows at wake, between the optimistic refill and decide().  cap>0
+        ranks sample the HELD rows, the cap-0 rank the REFILLED ones --
+        the same owned-with-L2-source set, rid-tagged 4-tuples.  Returns
+        (ok, bad, missing), or None when this rank holds no manifest (it
+        still votes None, xsn410).  Any raise that is not the sampled
+        mismatch itself folds into an all-bad vote (0, k_or_len, missing)
+        -- the gather is never skipped.  One-shot scratch, freed always."""
+        from sglang.srt.weg2 import (l15_bind, l15_check, l15_restore,
+                                     l15_scratch)
+        m = self._l15_wake_manifest
+        if m is None:
+            return None
+        k = 64
+        rank = self._weg2_rank()
+        sched = self.scheduler
+        plan, scratch = [], None
+        try:
+            tp = int(getattr(sched, "tp_size", 0)
+                     or getattr(getattr(sched, "server_args", None),
+                                "tp_size", 1) or 1)
+            from sglang.srt.distributed.utils import get_cp_token_ratios
+            _ratios = get_cp_token_ratios()
+            _vw = ([int(x) for x in _ratios]
+                   if _ratios is not None and len(_ratios) == tp
+                   and all(int(x) > 0 for x in _ratios) else [1] * tp)
+            prefix = [0]
+            for _x in _vw:
+                prefix.append(prefix[-1] + _x)
+            for span, i, slot in l15_restore._owned_tokens(m, rank, prefix):
+                src = l15_restore._l2_source(span, i)
+                if src is not None:
+                    plan.append((str(span.rid),
+                                 l15_restore._compact_row(prefix, rank, slot),
+                                 int(src[0]), int(src[1])))
+            device_pool = getattr(getattr(getattr(sched, "tp_worker", None),
+                                          "model_runner", None),
+                                  "token_to_kv_pool", None)
+            host_pool = l15_bind.live_host_pools(
+                getattr(sched, "tree_cache", None))[0]
+            if device_pool is None or host_pool is None:
+                raise LookupError("sample check needs the device KV pool "
+                                  "and the L2 host pool")
+            page_tokens = max(1, int(getattr(host_pool, "_arena_page_tokens",
+                                             1)))
+            scratch = l15_scratch.make_scratch_pool(device_pool, k)
+            try:
+                ok, bad, missing = l15_check.sample_check(
+                    plan, host_pool, device_pool, scratch, page_tokens, k=k)
+            finally:
+                scratch.free()
+            logger.info(l15_restore.check_line(rank, ok, bad, missing))
+            return (ok, bad, missing)
+        except Exception as exc:  # noqa: BLE001 -- never skip the gather
+            logger.info("L15-CHECK rank=%d failed (%s: %s) -> all-bad vote",
+                        rank, type(exc).__name__, exc)
+            return (0, min(k, len(plan)) if plan else k, 0)
+
+    def _l15_wake_check_and_decide(self, wake_on: bool, fp, *, epoch: int):
+        """L15-W2C fence-tail entry: master off -> None with NO sample
+        call and NO collective; otherwise sample-check first, then the
+        one decide() collective carrying (ok, bad, missing)."""
+        if not wake_on:
+            return None
+        return self._l15_decide_wake_verdict(
+            wake_on, fp, self._l15_wake_sample_check(), epoch=epoch)
 
     def _l15_wake_act(self, sched, verdict: str, *, group_ok: bool,
                       master_on: bool) -> int:
@@ -11538,11 +11608,11 @@ class SchedulerWeightUpdaterManager:
                 # never per-rank).  The mark is consumed, so the post-decide act
                 # keeps or drops but never refills a second time.
                 if self._l15_optimistic_refill():
-                    _l15_v = self._l15_decide_wake_verdict(
+                    _l15_v = self._l15_wake_check_and_decide(
                         _l15_wake, None,
                         epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
                 else:
-                    _l15_v = self._l15_decide_wake_verdict(
+                    _l15_v = self._l15_wake_check_and_decide(
                         _l15_wake, _l15_fp,
                         epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
                 logger.info("L15-DECIDE epoch=%d verdict=%s fence_verdict=%s",
