@@ -82,6 +82,8 @@ def test_records_layers_h2d_and_logs(monkeypatch, caplog):
     assert "max_wait_ms=" in line and "first_wait_after_h2d_begin_ms=50.0" in line
     # 10 + 50 + 75 ms of stall (the repeated layer-0 wait adds no record)
     assert "load_wait_ms=135.0" in line and "max_wait_ms=75.0@L2" in line
+    # per-layer device time between layers: L0 resume 0.060 -> L1 pre 0.070, L1 0.120 -> L2 0.125
+    assert "gap_sum_ms=15.0" in line and "gap_top=L0:10.0,L1:5.0" in line
 
 
 def test_n_per_wake_and_pending_until_done(monkeypatch, caplog):
@@ -116,8 +118,22 @@ def test_wiring():
 
     wsrc = inspect.getsource(cc.LayerDoneCounter.wait_until)
     assert "if _fft.S.cur is not None:" in wsrc and "_fft.timed_wait(" in wsrc
+    assert "_fft.timed_wait(_fft.NO_WAIT, threshold)" in wsrc
     assert "_fft.on_set_consumer(index)" in inspect.getsource(cc.LayerDoneCounter.set_consumer)
     usrc = inspect.getsource(wu)
     assert usrc.index('_fft.arm("kv_resume")') < usrc.index("_wpl.run(self, l15_hold_aware=")
     ssrc = inspect.getsource(hcc.HybridCacheController.start_loading)
     assert ssrc.index('_fft.on_load(self.load_stream, "begin")') < ssrc.index('_fft.on_load(self.load_stream, "end")')
+
+
+def test_no_producer_forward_still_gets_a_layer_profile(monkeypatch, caplog):
+    clk = _setup(monkeypatch)
+    fft.arm("kv_resume")
+    fft.on_set_consumer(-1)
+    for layer in range(4):
+        fft.timed_wait(fft.NO_WAIT, layer)
+        clk.t += 0.010 if layer != 3 else 0.0
+    with caplog.at_level(logging.INFO):
+        fft.on_set_consumer(-1)
+    line = next(r.getMessage() for r in caplog.records if "WEG2-FIRST-FWD-TIMING" in r.getMessage())
+    assert "consumer=-1 layers=4 load_wait_ms=0.0" in line and "gap_sum_ms=30.0" in line
