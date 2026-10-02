@@ -798,6 +798,12 @@ class SchedulerWeightUpdaterManager:
     _weg2_kv_resumed_epoch: object = None  # Wake-Parallel: flip epoch whose kv_cache tms resume (the RESUME half) already ran
     _weg2_leg_min_free_mib: object = None  # xsn323: the LOWEST card-free (MiB) seen at a tag claim of this rank's last wake legs
     _weg2_leg_min_free_epoch: object = None  # the epoch that minimum belongs to (reset at the first claim of a new epoch)
+    #: y7o WEG2-LEG-ORDER: flip epoch whose first claim was logged (resp. whose
+    #: 'n/a' line was). FIELDS, not ad-hoc attributes -- slots=True: y7t logged
+    #: 0 LEG-ORDER lines because the assignment itself raised, and y7u died on
+    #: all ranks when the 'n/a' branch assigned the second one.
+    _weg2_leg_order_epoch: object = None
+    _weg2_leg_order_na_epoch: object = None
     _weg2_graph_deferred: bool = False    # Wake-Parallel: cuda_graph resume deferred to the weights call
     _weg2_weights_epoch_done: object = None  # Wake-Parallel: flip epoch whose weight legs are collected
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
