@@ -1391,6 +1391,7 @@ class BarlinkCommunicator:
         input_: torch.Tensor,
         output_split_sizes=None,
         input_split_sizes=None,
+        largest_block_rows=None,
     ) -> torch.Tensor:
         """``torch.distributed.all_to_all_single`` over barlink.
 
@@ -1497,6 +1498,20 @@ class BarlinkCommunicator:
                 largest_block = max(send_bytes + recv_bytes)
             elif matrix is not None:
                 largest_block = max(max(row) for row in matrix) * row_bytes
+            elif largest_block_rows is not None:
+                # DP-NACHLAUF 02.10. (N6k: the DCP merge's host time 184-195 ms
+                # against 116-119 device over 16 layers): the CALLER knows the
+                # group-wide largest block from replicated data (the uneven
+                # DCP merge: max(head_counts) rows) -- no gloo group_max, a
+                # host rendezvous of every rank on every call. Rank-uniform by
+                # the caller's contract; a hint below this rank's own block is
+                # a caller bug and raises (never a silent per-rank fallback).
+                largest_block = int(largest_block_rows) * row_bytes
+                if max(send_bytes + recv_bytes) > largest_block:
+                    raise ValueError(
+                        f"all_to_all_single: largest_block_rows={largest_block_rows} "
+                        f"is below this rank's own block "
+                        f"({max(send_bytes + recv_bytes) // max(1, row_bytes)} rows)")
             else:
                 largest_block = _group_max(
                     max(send_bytes + recv_bytes), self.cpu_group,

@@ -425,6 +425,52 @@ def lse_merge_fused() -> bool:
 LSE_FUSED_TAIL = 4
 
 
+#: DP-NACHLAUF 02.10. (N6k 3e0b2cd3a3, D's first P>D extend: merge_scatter
+#: host 105-195 ms vs device 110-119 over 16 full-attention layers -- host-
+#: bound): every uneven merge passed BOTH split lists, so barlink derived the
+#: slot decision from a gloo group_max -- a CPU rendezvous of all ranks per
+#: call. The merge knows the group-wide largest block itself (max(head_counts)
+#: rows, replicated) and hands it over. Unset = on; 0/false/no/off = the
+#: group_max as before.
+A2A_BLOCK_HINT_ENV = "SGLANG_DCP_A2A_BLOCK_HINT"
+_A2A_HINT = {"on": None, "cls": {}, "said": False}
+
+
+def a2a_block_hint_on() -> bool:
+    if _A2A_HINT["on"] is None:
+        import os
+
+        v = str(os.environ.get(A2A_BLOCK_HINT_ENV, "1") or "1").strip().lower()
+        _A2A_HINT["on"] = v not in ("0", "false", "no", "off")
+    return bool(_A2A_HINT["on"])
+
+
+def _a2a_v(cp_group, recv, send, output_split_sizes, input_split_sizes, block_rows):
+    """The merge's uneven all_to_all, with the largest-block hint when the
+    group's class takes it (cached per class -- equal on every rank)."""
+    cls = type(cp_group)
+    ok = _A2A_HINT["cls"].get(cls)
+    if ok is None:
+        import inspect as _inspect
+
+        try:
+            ok = "largest_block_rows" in _inspect.signature(cls.all_to_all_single_v).parameters
+        except (TypeError, ValueError, AttributeError):
+            ok = False
+        _A2A_HINT["cls"][cls] = ok
+    if ok and a2a_block_hint_on():
+        if not _A2A_HINT["said"]:
+            _A2A_HINT["said"] = True
+            logger.info("DCP-A2A-BLOCK-HINT on: the uneven merge's a2a hands its group-wide largest block "
+                        "(max head count) to the transport -- no gloo group_max per call (%s=0 restores it)",
+                        A2A_BLOCK_HINT_ENV)
+        return cp_group.all_to_all_single_v(
+            recv, send, output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes, largest_block_rows=int(block_rows))
+    return cp_group.all_to_all_single_v(
+        recv, send, output_split_sizes=output_split_sizes, input_split_sizes=input_split_sizes)
+
+
 def _cp_lse_a2a_fused_body(cp_attn_out, cp_attn_lse, cp_group, counts, return_lse):
     """The a2a merge with the LSE all-gather folded into the all_to_all.
 
@@ -448,9 +494,7 @@ def _cp_lse_a2a_fused_body(cp_attn_out, cp_attn_lse, cp_group, counts, return_ls
     send[:, :, dim].copy_(cp_attn_lse.to(torch.float32).transpose(0, 1))
     recv = torch.empty((world * mine, tokens, dim + tail), dtype=torch.float32,
                        device=cp_attn_out.device)
-    cp_group.all_to_all_single_v(
-        recv, send, output_split_sizes=[mine] * world, input_split_sizes=counts
-    )
+    _a2a_v(cp_group, recv, send, [mine] * world, counts, max(counts))
     _ng("merge.a2a_send", send, cp_group, allow_neg_inf=True)
     _ng("merge.a2a_recv", recv, cp_group, allow_neg_inf=True)
     r4 = recv.view(world, mine, tokens, dim + tail)
@@ -571,9 +615,7 @@ def cp_lse_ag_out_a2a_mha_uneven(
     # head-major so that axis 0 (the only axis the a2a splits) is the head axis
     send = out.transpose(0, 1).contiguous().to(wire_dtype)  # [H_total, tokens, D]
     recv = torch.empty((world * mine, tokens, dim), dtype=wire_dtype, device=out.device)
-    cp_group.all_to_all_single_v(
-        recv, send, output_split_sizes=[mine] * world, input_split_sizes=counts
-    )
+    _a2a_v(cp_group, recv, send, [mine] * world, counts, max(counts))
     _ng("merge.a2a_send", send, cp_group)
     _ng("merge.a2a_recv", recv, cp_group)
     merged = recv.view(world, mine, tokens, dim).to(torch.float32).sum(dim=0)

@@ -1893,6 +1893,7 @@ class GroupCoordinator:
         input: torch.Tensor,
         output_split_sizes: Optional[List[int]] = None,
         input_split_sizes: Optional[List[int]] = None,
+        largest_block_rows: Optional[int] = None,
     ) -> torch.Tensor:
         """all_to_all_single with uneven split sizes (rows, not bytes).
 
@@ -1913,7 +1914,8 @@ class GroupCoordinator:
             # See all_reduce for why this re-enters.
             with _COLLECTIVE_CLOCK.span(self._clock_family_all_to_all):
                 return self.all_to_all_single_v(
-                    output, input, output_split_sizes, input_split_sizes
+                    output, input, output_split_sizes, input_split_sizes,
+                    largest_block_rows=largest_block_rows,
                 )
         # Same family as the even form: what the census compares is how many
         # times each rank entered this wire family, and a rank that skips an
@@ -1924,6 +1926,13 @@ class GroupCoordinator:
             output.copy_(input)
             return output
         if self.barlink_comm is not None:
+            # DP-NACHLAUF: a caller-known group-wide largest block skips
+            # barlink's gloo group_max (largest_block_rows; None = as before)
+            if largest_block_rows is not None:
+                return self.barlink_comm.all_to_all_single(
+                    output, input, output_split_sizes, input_split_sizes,
+                    largest_block_rows=largest_block_rows,
+                )
             return self.barlink_comm.all_to_all_single(
                 output, input, output_split_sizes, input_split_sizes
             )
