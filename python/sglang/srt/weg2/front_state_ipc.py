@@ -259,6 +259,100 @@ class BoundedWriter:
                     self._on_error(fn, e)
 
 
+class OutstandingBook:
+    """Every open request of the front: its arrival and its last token
+    (state.json ``front.oldest_outstanding_*`` / ``front.outstanding_stalest``).
+
+    y4y 17:05:40Z: two burst requests of the GROW probe ran 300 s without a
+    single token into their timeout while an anchor stream beside them was
+    served -- the progress watcher reads only the served TOTALS, so it stayed
+    silent (Nutzer 30.09.: "outstanding 3, niemand merkts"). One row per
+    request answers it: how old, where, and how long since its last token.
+
+    Data the front already has, in the event loop, no sync: the arrival at the
+    rid's birth, a token = a chunk D streamed for the rid (a non-streamed
+    request shows its first token when it ends), the where from the front's
+    own structures (queue / P / D outstanding / parked, ``flip`` while a flip
+    runs). The rid leaves at the handler's end (the one rid-end site)."""
+
+    #: a row no structure names and whose handler end never came (a test
+    #: double calling the handler unwrapped) is dropped after this long
+    ORPHAN_S = 3600.0
+
+    def __init__(self) -> None:
+        self.arrival: dict = {}
+        self.last_tok: dict = {}
+        #: y5c (30.09., weg2-0-2, 113k non-stream, 235 s): the rids whose client
+        #: asked no stream -- the front forwards D's answer whole at its end,
+        #: so it sees no token in between and has no per-rid IPC source for
+        #: one. Their rows say so (``stream`` 0, ``no_token_s`` None) instead of
+        #: reading "no token for N s" out of a blindness.
+        self.nonstream: set = set()
+
+    def arrive(self, rid, now: float) -> None:
+        self.arrival.setdefault(str(rid), float(now))
+
+    def stream(self, rid, is_stream: bool) -> None:
+        if is_stream:
+            self.nonstream.discard(str(rid))
+        else:
+            self.nonstream.add(str(rid))
+
+    def token(self, rid, now: float) -> None:
+        self.last_tok[str(rid)] = float(now)
+
+    def end(self, rid) -> None:
+        self.arrival.pop(str(rid), None)
+        self.last_tok.pop(str(rid), None)
+        self.nonstream.discard(str(rid))
+
+    def block(self, now: float, queued, p_out, d_out, parked, flipping: bool, top: int = 8) -> dict:
+        """``queued``: (rid, t_arrive) of the front's queue; ``p_out``/``d_out``:
+        the groups' outstanding maps (rid -> leg start); ``parked``: D's parked
+        rids. A booked rid in none of them is between two (routing, a seat
+        wait): ``queue``."""
+        rows = {}
+        for rid in list(self.arrival):
+            rows[rid] = ["queue", self.arrival[rid]]
+        for rid, t in queued:
+            r = str(rid)
+            rows[r] = ["flip" if flipping else "queue", self.arrival.get(r, float(t))]
+        for rid, t in list((p_out or {}).items()):
+            r = str(rid)
+            rows[r] = ["P", self.arrival.get(r, float(t))]
+        park = {str(x) for x in (parked or ())}
+        for rid, t in list((d_out or {}).items()):
+            r = str(rid)
+            rows[r] = ["parked" if r in park else "D", self.arrival.get(r, float(t))]
+        placed = {str(r) for r, _t in queued} | {str(r) for r in (p_out or {})} | {str(r) for r in (d_out or {})}
+        for rid in [r for r in rows if r not in placed and now - rows[r][1] > self.ORPHAN_S]:
+            rows.pop(rid)
+            self.end(rid)
+        entries = []
+        for rid, (where, t) in rows.items():
+            lt = self.last_tok.get(rid)
+            blind = rid in self.nonstream
+            entries.append({"rid": rid, "where": where, "age_s": round(max(0.0, now - t), 1),
+                            "stream": 0 if blind else 1,
+                            "last_token_s": None if lt is None else round(max(0.0, now - lt), 1),
+                            # non-stream: the front cannot see D's tokens -- None, not a stall
+                            "no_token_s": (None if blind else
+                                           round(max(0.0, now - (lt if lt is not None else t)), 1))})
+        oldest = max(entries, key=lambda e: e["age_s"]) if entries else None
+        return {
+            "outstanding_n": len(entries),
+            "outstanding_nonstream_n": sum(1 for e in entries if not e["stream"]),
+            "oldest_outstanding_age_s": oldest["age_s"] if oldest else None,
+            "oldest_outstanding_first_token_s": oldest["last_token_s"] if oldest else None,
+            "oldest_outstanding_rid": oldest["rid"] if oldest else None,
+            "oldest_outstanding_where": oldest["where"] if oldest else None,
+            "oldest_outstanding_stream": oldest["stream"] if oldest else None,
+            "outstanding_stalest": sorted(
+                entries, key=lambda e: -(e["no_token_s"] if e["no_token_s"] is not None else -1.0)
+            )[:max(1, int(top))],
+        }
+
+
 class DpFlipClock:
     """D->P flip time in the USER's definition (FLIPZEIT-VERLAUF-0929.md, Folgepunkt
     30.09.): Decode-Ende -> P-Prefill-Start, i.e. the last D decode round (the park
@@ -362,8 +456,37 @@ class FirstWorkClock:
     #: marks take every non-null ``flip_time_ms``.
     NONE = "none"
 
+    # DASHBOARD-IPC 01.10. (NF + 27B, 3-12 per boot): a P->D ``decode_token``
+    # fired 0.02-0.99 s after ``flip_begin`` -- long before D was awake --
+    # because ANY chunk of ANY open D stream counted, e.g. a wait-bound-parked
+    # stream of an earlier D phase (NF 01.10. 05:27:47.638 epoch 26:
+    # weg2-18-137, dispatched in epoch 18, fired 153 ms after the begin; done
+    # came at +2.2 s). D content before ``done`` now counts only for a leg 2
+    # dispatched at or after this flip's begin -- the hand-off, which the
+    # dormant admit sends DURING the flip (05:08:13: weg2-3-10 D-ADMIT 64 ms
+    # after the begin, first token 2.9 s after P's end; a rule "dispatched
+    # after done" would drop exactly the flip it defines). From ``done`` on,
+    # D is awake and any content is its work.
+
     def __init__(self) -> None:
         self._armed: Optional[dict] = None
+        #: the end of P's last leg 1 and the last flip's done (front clock)
+        self._p_end: Optional[float] = None
+        self._last_done: float = float("-inf")
+        #: D chunks refused as a flip's first work (stale, before done), boot total
+        self.stale_skipped = 0
+
+    def waits_for(self, group: str) -> bool:
+        """An armed flip whose woken group is ``group`` (cheap: per D chunk)."""
+        a = self._armed
+        return a is not None and a["wake"] == group
+
+    def note_p_end(self, now: float) -> None:
+        """P served a leg 1 (its end is P's end when it was the phase's last)."""
+        self._p_end = float(now)
+        a = self._armed
+        if a is not None and a["wake"] == "D" and a.get("done_ts") is None:
+            a["p_end_ts"] = max(float(a.get("p_end_ts") or now), float(now))
 
     def arm(self, epoch: int, sleep: str, wake: str, flip_begin_ts: float) -> Optional[dict]:
         """Arm the new flip; returns the ``none`` event of the previous flip when
@@ -371,10 +494,14 @@ class FirstWorkClock:
         prev = self.flush("next_flip_before_work")
         self._armed = {"epoch": int(epoch), "dir": f"{sleep}>{wake}", "wake": wake,
                        "flip_begin_ts": float(flip_begin_ts)}
+        if wake == "D" and self._p_end is not None and self._p_end >= self._last_done:
+            # P's last leg 1 in the P phase this flip ends
+            self._armed["p_end_ts"] = self._p_end
         return prev
 
     def done(self, now: float) -> None:
         """The armed flip reached ``done`` (its ``flip_done`` was published)."""
+        self._last_done = float(now)
         if self._armed is not None:
             self._armed["done_ts"] = float(now)
 
@@ -390,12 +517,34 @@ class FirstWorkClock:
                 "flip_total_ms": round((a["done_ts"] - a["flip_begin_ts"]) * 1000.0),
                 "what": self.NONE, "reason": reason, "rid": None, "clock": "time.time front"}
 
-    def seen(self, group: str, what: str, rid: Optional[str], now: float) -> Optional[dict]:
+    def seen(self, group: str, what: str, rid: Optional[str], now: float,
+             leg2_dispatch_ts: Optional[float] = None) -> Optional[dict]:
+        """The woken group worked: the event, or None. For D, ``leg2_dispatch_ts``
+        is the rid's leg-2 dispatch (front clock; None = unknown): content
+        before ``done`` counts only for a leg 2 dispatched in this flip."""
         a = self._armed
         if a is None or a["wake"] != group:
             return None
+        if group == "D" and a.get("done_ts") is None and (
+                leg2_dispatch_ts is None or float(leg2_dispatch_ts) < a["flip_begin_ts"]):
+            a["stale_skipped"] = int(a.get("stale_skipped", 0)) + 1
+            self.stale_skipped += 1
+            return None
         self._armed = None
-        return {"epoch": a["epoch"], "dir": a["dir"], "flip_begin_ts": round(a["flip_begin_ts"], 3),
-                "first_work_ts": round(float(now), 3),
-                "flip_time_ms": round((float(now) - a["flip_begin_ts"]) * 1000.0),
-                "what": what, "rid": rid, "clock": "time.time front"}
+        ev = {"epoch": a["epoch"], "dir": a["dir"], "flip_begin_ts": round(a["flip_begin_ts"], 3),
+              "first_work_ts": round(float(now), 3),
+              "flip_time_ms": round((float(now) - a["flip_begin_ts"]) * 1000.0),
+              "what": what, "rid": rid, "clock": "time.time front",
+              "done_ts": None if a.get("done_ts") is None else round(a["done_ts"], 3),
+              "before_done": a.get("done_ts") is None,
+              "stale_skipped": int(a.get("stale_skipped", 0))}
+        if group == "D":
+            # the user's P->D flip time (29.09.): P end -> first decode token
+            p_end = a.get("p_end_ts")
+            start = float(p_end) if p_end is not None else a["flip_begin_ts"]
+            ev.update({"leg2_dispatch_ts": (None if leg2_dispatch_ts is None
+                                            else round(float(leg2_dispatch_ts), 3)),
+                       "p_end_ts": None if p_end is None else round(float(p_end), 3),
+                       "p_end_source": "p_leg1_end" if p_end is not None else "flip_begin",
+                       "flip_user_ms": round((float(now) - start) * 1000.0)})
+        return ev

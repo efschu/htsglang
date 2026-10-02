@@ -35,6 +35,18 @@ RankState reader and the W7/W10 gate never see it):
             issued, attempted, defer_refused, timeout} (the #988 / #1324 /
             #915 / #1157 counters as they are; mamba_tok = the summed depths of
             the MAMBA-HOST-RESUME acceptances)
+            RANK-TIMING (01.10., weg2/rank_timing.py), each key only once seen:
+            loadback_ms_sum/_max/_pages/_bytes/_count/_last/_recent (L2 ->
+            device, the load's landed events), l3{read_n, read_ms_sum,
+            read_ms_max, read_pages, read_bytes, last, recent} (store reads),
+            prefetch.{ms_sum, ms_max, bytes, last_ms, reads, landed,
+            landed_pages, empty}, l15{...} (only once an L1,5 stage wrote it).
+            prefetch.landed = store reads that LANDED >= 1 page; it was the
+            #1068 deferral's "deferred prefetch registered later" count (0 on
+            every boot without a deferral) -- that one is deferred_landed now
+  ple       RANK-TIMING: prefill / decode {n, ms_sum, ms_max, last_ms, last_t,
+            hit_n, miss_n, wait_ms_sum, bytes}, recent[[t, ms, hit, miss,
+            phase]]; absent on a rank that gathered no PLE row
   errors    n, last[8]{t, logger, level, exc, text}  (ERROR/CRITICAL records)
   last_post_wake  the latest WEG2-POST-WAKE-PASS census as a dict, or null
   stops     n, last[8]{t, reason, code, exc, ticket, text}: the scheduler's
@@ -60,6 +72,8 @@ import re
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
+
+from sglang.srt.weg2 import rank_timing
 
 SCHEMA = "weg2.rankstats/1"
 SUFFIX = ".rankstats"
@@ -127,7 +141,7 @@ def _prefill_block(mr) -> Optional[Dict[str, Any]]:
     if not isinstance(cum, dict):
         return None
     out = dict(cum)
-    for k in ("gpu_ms", "split_ms", "compute_ms", "wait_ms", "bubble_ms"):
+    for k in ("gpu_ms", "split_ms", "compute_ms", "wait_ms", "bubble_ms", "own_ms", "compute_only_ms"):
         if isinstance(out.get(k), float):
             out[k] = round(out[k], 1)
     return out
@@ -198,15 +212,21 @@ def _cache_block(scheduler) -> Dict[str, Any]:
         out["prefetch"] = {
             "attempted": counts.get("attempted", 0),
             "issued": counts.get("issued", 0),
-            "landed": counts.get("landed", 0),
+            # RANK-TIMING (01.10.): `landed` is the store reads that landed a
+            # page (rank_timing, below); the #1068 deferral count keeps its name
+            "landed": 0,
+            "deferred_landed": counts.get("landed", 0),
             "deferred": counts.get("deferred", 0),
             "defer_refused": counts.get("defer_refused", 0),
             "expired": counts.get("defer_expired", 0),
             "refused": sum(int(counts.get(k, 0)) for k in declines),
             "timeout": None if tree is None else int(getattr(tree, "_1157_reaped_n", 0) or 0),
         }
+        out["prefetch"].update(rank_timing.prefetch_fields())
     except Exception:  # noqa: BLE001 -- a missing module reads as unknown
         pass
+    # RANK-TIMING (01.10.): durations, pages and bytes of L2 load-backs and L3 reads
+    out.update(rank_timing.cache_fields())
     return out
 
 
@@ -245,7 +265,14 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
                   "park_window_hold_max_ms": int(getattr(scheduler, "_weg2_park_window_hold_max_ms", 0) or 0)},
         "cap": {"kv_tokens": getattr(scheduler, "max_total_num_tokens", None),
                 "seats": getattr(scheduler, "max_running_requests", None)},
+        **_ple_entry(),
     }
+
+
+def _ple_entry() -> Dict[str, Any]:
+    """RANK-TIMING: ``ple`` only on a rank that gathered PLE rows."""
+    b = rank_timing.ple_block()
+    return {} if b is None else {"ple": b}
 
 
 def _park_window_left_ms(scheduler, now: Optional[float] = None):

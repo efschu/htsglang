@@ -113,6 +113,7 @@ from __future__ import annotations
 
 import logging
 import math
+import queue
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -439,9 +440,9 @@ def _stage_e1(headers: List[th.TailHeader], held: HeldShapes, check_digest: bool
             st.verdict = why
             return st
     pin = torch.cuda.is_available()
-    if pin:
-        fa = {g: tuple(t.pin_memory() for t in ts) for g, ts in fa.items()}
-        gdn = {g: tuple(t.pin_memory() for t in ts) for g, ts in gdn.items()}
+    if pin or _arena_scope()[0] is not None:
+        fa = {g: tuple(_pin(t, pin) for t in ts) for g, ts in fa.items()}
+        gdn = {g: tuple(_pin(t, pin) for t in ts) for g, ts in gdn.items()}
     st.fa, st.gdn = fa, gdn
     if check_digest and held.owner is None:
         st.readback = _readback_buffers(fa, gdn, {}, None, pin)
@@ -614,7 +615,29 @@ def _end_shape_refusal(end: th.EndHeader, held: HeldShapes, fa, gdn, ring, ropes
 
 
 def _pin(t: torch.Tensor, pin: bool) -> torch.Tensor:
+    """The staged copy of ``t``: under TAIL-STAGE-WORKER a span of the rank's
+    arena (pinned once), else ``pin_memory()`` as before (counted fallback
+    when the arena has no room)."""
+    arena, rid = _arena_scope()
+    if arena is not None:
+        v = arena.take(rid, t.shape, t.dtype)
+        if v is not None:
+            v.copy_(t)
+            return v
+        _WORKER_STATS["fallback"] += 1
     return t.pin_memory() if pin else t
+
+
+def _pin_empty(shape, pin: bool) -> torch.Tensor:
+    """A host buffer of uint8 ``shape`` (the readback target): from the arena
+    under the worker, else a fresh (pinned) tensor."""
+    arena, rid = _arena_scope()
+    if arena is not None:
+        v = arena.take(rid, shape, torch.uint8)
+        if v is not None:
+            return v
+        _WORKER_STATS["fallback"] += 1
+    return torch.empty(shape, dtype=torch.uint8, pin_memory=pin)
 
 
 def _readback_buffers(fa, gdn, ring, rope, pin: bool) -> Dict[str, Tuple[torch.Tensor, ...]]:
@@ -624,7 +647,7 @@ def _readback_buffers(fa, gdn, ring, rope, pin: bool) -> Dict[str, Tuple[torch.T
     if rope is not None:
         src["rope"] = (rope,)
     return {
-        k: tuple(torch.empty(_as_bytes(t).shape, dtype=torch.uint8, pin_memory=pin) for t in ts)
+        k: tuple(_pin_empty(_as_bytes(t).shape, pin) for t in ts)
         for k, ts in src.items()
     }
 
@@ -692,6 +715,291 @@ def _candidate(rid: str) -> bool:
     return adopt_enabled() and rid.startswith("weg2-") and bool(th._dir()) and not _WEG2_END_ANCHOR
 
 
+# -- TAIL-STAGE-WORKER (30.09.) ---------------------------------------------------------
+#: one line per drained worker batch (= per wake): jobs, the worker's own clock
+#: split into read / digest / copy, the scheduler thread's submit cost, the
+#: arena's occupancy and where the digest ran
+WORKER_LINE = "WEG2-TAIL-STAGE-WORKER"
+#: the arena's host bytes, named like the other host posts (not in the arm sum)
+LEDGER_LINE = "WEG2-HOST-LEDGER TAIL-STAGE-ARENA"
+ARENA_ALIGN = 4096
+_MIB = float(1 << 20)
+
+
+def stage_worker_enabled() -> bool:
+    """SGLANG_WEG2_TAIL_STAGE_WORKER (TAIL-STAGE-WORKER, 30.09.)."""
+    try:
+        return bool(envs.SGLANG_WEG2_TAIL_STAGE_WORKER.get())
+    except Exception:  # noqa: BLE001 -- an unknown switch is off
+        return False
+
+
+_TLS = threading.local()
+_WORKER_STATS: Dict[str, int] = {"fallback": 0}
+
+
+def _arena_scope():
+    """(arena, rid) while the worker stages a rid on this thread, else (None, None)."""
+    return getattr(_TLS, "arena", None), getattr(_TLS, "rid", None)
+
+
+def _nbytes(spec: RowSpec, rows: int) -> int:
+    return int(rows) * math.prod(spec.shape) * torch.empty((), dtype=_dtype_of(spec.dtype)).element_size()
+
+
+def _dtype_of(name: str) -> torch.dtype:
+    return getattr(torch, str(name).replace("torch.", ""))
+
+
+def rid_bytes(held: HeldShapes, page_size: int, verify: bool) -> int:
+    """The pinned bytes one rid's staging takes on this rank, from the form:
+    E1 rows (< one page) and END rows (< two pages) of every held attention
+    layer (K, V, the QSA groups at 1/ratio), the GDN state twice (E1 + END),
+    the open QSA group's ring rows and RoPE row; twice again with the
+    readback buffers of the verify. Rounded per tensor to the arena's
+    alignment."""
+    page = max(1, int(page_size))
+    total, tensors = 0, 0
+    for rows in held.fa.values():
+        for j, spec in enumerate(rows):
+            n = 3 * page if j < 2 else -(-3 * page // max(1, held.qsa_ratio or 1))
+            total += _nbytes(spec, n)
+            tensors += 2
+    for rows in held.gdn.values():
+        for spec in rows:
+            total += 2 * _nbytes(spec, 1)
+            tensors += 2
+    ratio = max(held.qsa_ratio, held.ring_ratio, 1)
+    for spec in held.ring.values():
+        total += _nbytes(spec, ratio)
+        tensors += 1
+    if held.rope is not None:
+        total += _nbytes(held.rope, ratio)
+        tensors += 1
+    total += tensors * ARENA_ALIGN
+    return total * (2 if verify else 1)
+
+
+class PinArena:
+    """ONE pinned host buffer, taken in aligned spans per rid (first fit) and
+    given back per rid -- no pin_memory() per tensor. ``take`` returns None
+    when no span fits (the caller then pins as before, counted)."""
+
+    def __init__(self, nbytes: int, pin: bool = True):
+        self.nbytes = int(max(0, nbytes))
+        self.buf = torch.empty(self.nbytes, dtype=torch.uint8, pin_memory=pin) if self.nbytes else None
+        self._lock = threading.Lock()
+        self._free: List[Tuple[int, int]] = [(0, self.nbytes)] if self.nbytes else []
+        self._spans: Dict[str, List[Tuple[int, int]]] = {}
+        self.peak = 0
+
+    def used(self) -> int:
+        with self._lock:
+            return sum(n for spans in self._spans.values() for _o, n in spans)
+
+    def owners(self) -> List[str]:
+        with self._lock:
+            return list(self._spans)
+
+    def take(self, rid, shape, dtype) -> Optional[torch.Tensor]:
+        shape = tuple(int(x) for x in shape)
+        esize = torch.empty((), dtype=dtype).element_size()
+        n = math.prod(shape) * esize
+        if n == 0:
+            return torch.empty(shape, dtype=dtype)
+        need = -(-n // ARENA_ALIGN) * ARENA_ALIGN
+        with self._lock:
+            for i, (off, size) in enumerate(self._free):
+                if size >= need:
+                    if size == need:
+                        self._free.pop(i)
+                    else:
+                        self._free[i] = (off + need, size - need)
+                    self._spans.setdefault(str(rid), []).append((off, need))
+                    used = sum(m for spans in self._spans.values() for _o, m in spans)
+                    self.peak = max(self.peak, used)
+                    break
+            else:
+                return None
+        return self.buf[off:off + n].view(dtype).view(shape)
+
+    def release(self, rid) -> int:
+        with self._lock:
+            spans = self._spans.pop(str(rid), [])
+            if not spans:
+                return 0
+            free = sorted(self._free + spans)
+            merged: List[Tuple[int, int]] = []
+            for off, size in free:
+                if merged and merged[-1][0] + merged[-1][1] == off:
+                    merged[-1] = (merged[-1][0], merged[-1][1] + size)
+                else:
+                    merged.append((off, size))
+            self._free = merged
+            return sum(n for _o, n in spans)
+
+
+class _Handle:
+    """What ``_Job.thread`` holds under the worker: join / is_alive of ONE job."""
+
+    def __init__(self):
+        self._done = threading.Event()
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        self._done.wait(timeout)
+
+    def is_alive(self) -> bool:
+        return not self._done.is_set()
+
+
+#: rids whose adopted rows are still in flight to the device (verify thread)
+_VERIFYING: Dict[str, int] = {}
+_VERIFYING_LOCK = threading.Lock()
+
+
+def _live_rids() -> set:
+    live = set(_JOBS) | set(_AGREED) | set(SKIP_PLANS)
+    live |= {str(i.spec.rid) for i in PENDING_INSTALLS}
+    with _VERIFYING_LOCK:
+        live |= set(_VERIFYING)
+    return live
+
+
+class StageWorker:
+    """ONE long-lived thread per rank with a queue: the rids are staged one
+    after another (no thread per rid), into the rank's pinned arena."""
+
+    def __init__(self, seats: Optional[int] = None, pin: Optional[bool] = None):
+        self.q: "queue.Queue" = queue.Queue()
+        self.thread: Optional[threading.Thread] = None
+        self.arena: Optional[PinArena] = None
+        self.seats = seats
+        self.pin = torch.cuda.is_available() if pin is None else bool(pin)
+        self.current: Optional[str] = None
+        self._lock = threading.Lock()
+        self._batch = self._fresh()
+
+    @staticmethod
+    def _fresh() -> Dict[str, float]:
+        return {"jobs": 0, "work_ms": 0.0, "read_ms": 0.0, "digest_ms": 0.0, "wait_ms_max": 0.0,
+                "submit_ms": 0.0, "released_mib": 0.0}
+
+    def prepare(self, held: HeldShapes, page_size: int, verify: bool, seats: Optional[int] = None) -> PinArena:
+        """The arena, pinned once (boot, or the first job): seats x rid_bytes."""
+        with self._lock:
+            if self.arena is None:
+                n = max(1, int(seats or self.seats or 6))
+                per = rid_bytes(held, page_size, verify)
+                t = time.perf_counter()
+                self.arena = PinArena(n * per, pin=self.pin)
+                logger.info(
+                    "%s bytes=%d mib=%.1f seats=%d per_rid_mib=%.1f page=%d verify=%s pin_ms=%.1f -- pinned "
+                    "once, reused by every staging of this rank (der Posten 'tail_stage_arena'; nicht in der "
+                    "Arm-Summe)", LEDGER_LINE, self.arena.nbytes, self.arena.nbytes / _MIB, n, per / _MIB,
+                    int(page_size), bool(verify), (time.perf_counter() - t) * 1000.0)
+            return self.arena
+
+    def reclaim(self) -> int:
+        """Give back the spans of every rid nothing holds any more (dropped,
+        evicted, never applied, or verified); the rid in work stays."""
+        if self.arena is None:
+            return 0
+        live = _live_rids()
+        if self.current is not None:
+            live.add(self.current)
+        freed = 0
+        for rid in self.arena.owners():
+            if rid not in live:
+                freed += self.arena.release(rid)
+        self._batch["released_mib"] += freed / _MIB
+        return freed
+
+    def submit(self, rid, box, headers, held, verify, device, page_size: int = 0) -> _Handle:
+        t = time.perf_counter()
+        self.reclaim()
+        h = _Handle()
+        self.q.put((str(rid), box, headers, held, bool(verify), device, int(page_size), h, time.perf_counter()))
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._run, daemon=True, name="weg2-tail-stage-worker")
+            self.thread.start()
+        self._batch["submit_ms"] += (time.perf_counter() - t) * 1000.0
+        return h
+
+    def _run(self) -> None:
+        while True:
+            rid, box, headers, held, verify, device, page_size, h, t_sub = self.q.get()
+            t0 = time.perf_counter()
+            self._batch["wait_ms_max"] = max(self._batch["wait_ms_max"], (t0 - t_sub) * 1000.0)
+            self.current = rid
+            try:
+                ctx = torch.cuda.device(device) if (device is not None and self.pin) else th._null_ctx()
+                with ctx:
+                    arena = self.prepare(held, page_size, verify)
+                    arena.release(rid)  # a re-stage of a rid starts clean
+                    _TLS.arena, _TLS.rid = arena, rid
+                    th.stage_clock_reset()
+                    _stage_into(box, headers, held, verify, device)
+                    read_ms, digest_ms = th.stage_clock()
+                    self._batch["read_ms"] += read_ms
+                    self._batch["digest_ms"] += digest_ms
+            except Exception as exc:  # noqa: BLE001 -- a failed staging is a 0 vote, named
+                logger.warning("%s rid=%s raised %s: %s", WORKER_LINE, rid, type(exc).__name__, exc)
+                if not box:
+                    box.append(Staged(spec=headers[0].spec, headers=list(headers),
+                                      verdict=f"stage_raised:{type(exc).__name__}"))
+            finally:
+                _TLS.arena, _TLS.rid = None, None
+                self.current = None
+                self._batch["jobs"] += 1
+                self._batch["work_ms"] += (time.perf_counter() - t0) * 1000.0
+                h._done.set()
+            if self.q.empty():
+                self._log_batch()
+
+    def _log_batch(self) -> None:
+        b, self._batch = self._batch, self._fresh()
+        a = self.arena
+        work, read, dig = b["work_ms"], b["read_ms"], b["digest_ms"]
+        logger.info(
+            "%s jobs=%d worker_issue_ms=%.1f work_ms=%.1f read_ms=%.1f digest_ms=%.1f copy_ms=%.1f "
+            "queue_wait_ms_max=%.1f arena_used_mib=%.1f of %.1f peak_mib=%.1f released_mib=%.1f fallback=%d "
+            "digest=worker:pre-verdict (serial, one thread per rank; worker_issue = the scheduler thread's "
+            "submit cost; copy = work - read - digest: the copies into the pinned arena and the checks)",
+            WORKER_LINE, int(b["jobs"]), b["submit_ms"], work, read, dig, max(0.0, work - read - dig),
+            b["wait_ms_max"], (a.used() if a else 0) / _MIB, (a.nbytes if a else 0) / _MIB,
+            (a.peak if a else 0) / _MIB, b["released_mib"], _WORKER_STATS["fallback"])
+
+
+_STAGE_WORKER: List[Optional[StageWorker]] = [None]
+
+
+def _worker() -> StageWorker:
+    if _STAGE_WORKER[0] is None:
+        _STAGE_WORKER[0] = StageWorker()
+    return _STAGE_WORKER[0]
+
+
+def prepare_arena(model_runner, server_args) -> Optional[int]:
+    """Boot (D model worker init): pin the rank's arena once, from the form --
+    D's seat cap (--max-running-requests) x ``rid_bytes`` of the layers this
+    rank holds. None when the worker is off or this is not an adopting rank.
+    Never raises."""
+    try:
+        from sglang.srt.managers.schedule_policy import _WEG2_END_ANCHOR
+
+        if not stage_worker_enabled() or not adopt_enabled() or _WEG2_END_ANCHOR:
+            return None
+        held = held_shapes(model_runner.token_to_kv_pool, model_runner.req_to_token_pool)
+        seats = int(getattr(server_args, "max_running_requests", 0) or 0) or None
+        arena = _worker().prepare(held, int(getattr(server_args, "page_size", 1) or 1), verify_enabled(),
+                                  seats=seats)
+        return arena.nbytes
+    except Exception as exc:  # noqa: BLE001 -- the first job pins it then
+        logger.warning("%s boot pin n/a (%s: %s) -- the first staging pins it", LEDGER_LINE,
+                       type(exc).__name__, exc)
+        return None
+
+
 def _stage_into(box: List[Staged], headers, held: HeldShapes, check_digest: bool, device: Optional[int]) -> None:
     try:
         # pin on the rank's own card context, never a fresh one on device 0
@@ -736,11 +1044,129 @@ def stage(rid: str, tree_cache) -> None:
             return
         held = held_shapes(tree_cache.token_to_kv_pool_allocator.get_kvcache(), tree_cache.req_to_token_pool)
         device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        if stage_worker_enabled():
+            # TAIL-STAGE-WORKER: one queue, one long-lived thread per rank
+            job.thread = _worker().submit(rid, job.box, headers, held, verify_enabled(), device,
+                                          page_size=int(getattr(tree_cache, "page_size", 0) or 0))
+            return
         job.thread = threading.Thread(target=_stage_into, args=(job.box, headers, held, verify_enabled(), device),
                                       daemon=True, name="weg2-tail-stage")
         job.thread.start()
     except Exception as exc:  # noqa: BLE001 -- no staging = a 0 vote
         logger.warning("WEG2-TAIL stage refused rid=%s (%s: %s)", rid, type(exc).__name__, exc)
+
+
+def stage_early_enabled() -> bool:
+    """SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY (TAIL-STAGE-EARLY, 30.09.)."""
+    try:
+        return bool(envs.SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY.get())
+    except Exception:  # noqa: BLE001 -- an unknown switch is off
+        return False
+
+
+def stage_early(rids, tree_cache) -> Dict[str, str]:
+    """TAIL-STAGE-EARLY (30.09., NF y4k/y4l P->D): at the START of D's weight
+    legs, start the tail staging of the dormant hold's requests -- the same
+    background read :func:`stage` starts at the first prefetch check after
+    the wake, only ~1.5 s earlier, beside the legs (host-only: part files,
+    digests, pinned buffers; ``held_shapes`` reads pool shapes, no bytes).
+
+    MEASURED (y4l 12 / y4k 14 P->D flips, D TP0 ``WEG2-TAIL-READY
+    waited_ms``): the H45 hold kept each hand-off's FINISHED store read from
+    terminating until its staging was done -- median 291 / 286 ms, 549-757 ms
+    at a wake cohort of 4-6; it sits between the kv resume and the first
+    pass, i.e. inside flip_first_work (P end -> first decode token).
+
+    Only a COMPLETE manifest starts a job here: a partial or absent one
+    leaves no job behind, so the first check after the wake creates it
+    exactly as before (its ``t_first`` bound unchanged). A job that exists
+    already is left alone. Rank-uniform: every rank calls this at the same
+    point of the same RPC with the same hold. Never raises. Returns rid ->
+    verdict (``started`` / ``exists`` / ``manifest_<state>`` / ``not_candidate``
+    / ``refused:<why>``)."""
+    out: Dict[str, str] = {}
+    for rid in rids:
+        rid = str(rid)
+        try:
+            if rid in _JOBS:
+                out[rid] = "exists"
+                continue
+            if not _candidate(rid):
+                out[rid] = "not_candidate"
+                continue
+            headers = th.headers_for(rid)
+            state, have, want = th.manifest_state(headers)
+            if state not in _STAGE_STATES:
+                out[rid] = f"manifest_{state}"
+                continue
+            stage(rid, tree_cache)  # the one staging entry: job + thread, as after the wake
+            job = _JOBS.get(rid)
+            out[rid] = "started" if job is not None and job.thread is not None else "refused:no_thread"
+        except Exception as exc:  # noqa: BLE001 -- the post-wake check stages what is left
+            out[rid] = f"refused:{type(exc).__name__}"
+    return out
+
+
+def stage_after_legs_enabled() -> bool:
+    """SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS (TAIL-STAGE-AFTER-LEGS, 30.09.)."""
+    try:
+        return bool(envs.SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS.get())
+    except Exception:  # noqa: BLE001 -- an unknown switch is off
+        return False
+
+
+#: the two call sites of the wake leg (weight_updater): beside WAKE-READ-EARLY
+#: at the legs' start, and behind the last weight collect (legs end)
+SITE_LEG_BEGIN = "leg_begin"
+SITE_LEGS_END = "legs_end"
+
+
+def stage_site() -> str:
+    """Where TAIL-STAGE-EARLY starts the staging: the legs' start (default),
+    or their end under SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS.
+
+    MEASURED (y4s-tse vs y4l, P>D at 5-6 seats, D TP0/P PP0 WEG2-BAR1
+    lane-time): staged at the legs' start, the per-rid staging threads (part
+    read, digest, ``pin_memory`` per layer) ran beside the collectors; the
+    collectors' issue_ms rose 202-286 -> 359-1127 ms, their credits came back
+    late, P's deposit lanes waited 951-2094 ms on credit (y4l 451-584) and the
+    legs grew ~1522 -> ~2030 ms, while the copies themselves did not slow
+    (copy_sync_ms 674 -> 573 on P PP0 p0). Behind the last collect the
+    staging still starts before the kv resume and the first pass."""
+    return SITE_LEGS_END if stage_after_legs_enabled() else SITE_LEG_BEGIN
+
+
+def stage_at_wake_begin(sched, site: str = SITE_LEG_BEGIN) -> Optional[Dict[str, str]]:
+    """The wake leg's call (weight_updater): the dormant hold's rids through
+    :func:`stage_early`, one line per wake. ``site`` names the call site; only
+    the one :func:`stage_site` selects acts, so exactly one of the two calls
+    stages per wake. None when off, at the other site, or nothing is held.
+    Never raises."""
+    try:
+        if not stage_early_enabled() or not adopt_enabled():
+            return None
+        if site != stage_site():
+            return None
+        hold = getattr(sched, "weg2_dormant_hold", None) or []
+        rids = [str(getattr(r, "rid", "")) for r in hold if getattr(r, "rid", None)]
+        if not rids:
+            return None
+        t0 = time.perf_counter()
+        out = stage_early(rids, sched.tree_cache)
+        if all(v == "not_candidate" for v in out.values()):
+            return out  # group P (it publishes, never adopts): nothing to say
+        started = sum(1 for v in out.values() if v == "started")
+        logger.info(
+            "WEG2-TAIL-STAGE-EARLY held=%d started=%d issue_ms=%.1f verdicts=%s site=%s (E2 tail "
+            "staging from the weight legs' %s; a partial manifest is staged by the first post-wake check)",
+            len(rids), started, (time.perf_counter() - t0) * 1000.0,
+            ",".join(f"{k}:{v}" for k, v in out.items()), site,
+            "end" if site == SITE_LEGS_END else "start",
+        )
+        return out
+    except Exception as exc:  # noqa: BLE001 -- the post-wake check stages what is left
+        logger.warning("WEG2-TAIL-STAGE-EARLY n/a (%s: %s)", type(exc).__name__, exc)
+        return None
 
 
 def vote_hold(rid: str) -> int:
@@ -796,6 +1222,16 @@ def local_vote(rid: str) -> int:
     return 1 if job.box[0].e1 else 0
 
 
+def _note_defect_why(rid: str, why: str) -> None:
+    """ZR instrument: why an origin request's tail cannot be taken."""
+    try:
+        from sglang.srt.weg2.handback_claim import note_why
+
+        note_why(rid, why)
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        pass
+
+
 def agree(rid: str, group_vote: int) -> None:
     """After the MIN: remember the group's answer for the admission."""
     job = _JOBS.pop(rid, None)
@@ -814,6 +1250,7 @@ def agree(rid: str, group_vote: int) -> None:
         # voted 0: the manifest never completed inside the bound, or the read
         # was still running after STAGE_JOIN_S -- named at the admission
         why = "stage_unfinished" if job.thread is not None else f"parts_{job.state}:{job.have}/{job.want}"
+        _note_defect_why(rid, "no_parts" if not job.headers else why)
         if not job.headers:
             logger.info(
                 "WEG2-TAIL-READY rid=%s parts=0/? verdict=no_parts adopt=skipped:no_parts end=absent "
@@ -847,28 +1284,54 @@ def _is_park(staged) -> bool:
 
 
 def adopt_ids(req, park: bool):
-    """The token ids a tail keys on: P's prompt, or (F4) the tokens a parked
-    D request had consumed -- its prompt and all output but the last."""
-    return th.park_ids(req) if park else req.origin_input_ids
+    """The token ids a tail keys on -- exactly the context the publisher's
+    END state consumed: (F4) the tokens a parked D request had consumed, its
+    prompt and all output but the last; otherwise the context P PREFILLED,
+    i.e. D's prompt plus every token D had already decoded. For a fresh
+    hand-off that is the prompt alone (no output yet); for a RESUME-VIA-P leg
+    it is ``resume_via_p.context_ids`` -- ``origin + output`` -- which P took
+    as ITS prompt. TAIL-NTOK (y3r 09292330 weg2-38-53 / weg2-48-71, the two
+    W50-REROUTE path=midstream legs with output): keyed on the prompt alone,
+    D counted 131770 / 108536 against P's 131774 / 109167 (the 4 / 631
+    tokens D had decoded before the reroute), refused
+    ``skipped:n_tokens`` and re-ran the 2-3 token tail as a real 2.1 s
+    extend; the two ``held-uncommitted`` legs (no output) adopted."""
+    if park:
+        return th.park_ids(req)
+    out = getattr(req, "output_ids", None)
+    return list(req.origin_input_ids) + list(out) if out else req.origin_input_ids
 
 
 def uniform_refusal(spec: th.TailSpec, ids, fill_len: int, extra_key, prefix_len: int,
-                    park: bool = False) -> str:
+                    park: bool = False, end_only: bool = False) -> str:
     """'' when the admission may take the tail; otherwise why not. Every
     input is identical on every rank of the group (the extend length the
     group runs is decided HERE). F4 (``park``): the fill still carries the
     last sampled token (N + 1), and the resume may re-enter anywhere in the
-    park's row window [page_prefix, cut) -- the rows below the re-entry are
-    the prefix's own, written again with the same bytes."""
+    park's row window [page_prefix, cut] -- the rows below the re-entry are
+    the prefix's own, written again with the same bytes. PARK-ANCHOR: the
+    cut itself included -- a D-direct extend whose track sat AT the cut (y3r
+    09292330 weg2-24-28, 103936 -> 104001, anchor 104000 = c) re-enters
+    there, and the END state still spares the extend [c, N)
+    (``adopt=skipped:prefix:104000!in[103488,104000)`` ran it: 3 tokens, one
+    1.5 s expert pass that the H24c skip batch of a sibling paid too)."""
     want_fill = spec.n_tokens + 1 if park else spec.n_tokens
-    if len(ids) != spec.n_tokens or fill_len != want_fill:
+    if fill_len != want_fill:
         return f"n_tokens:{fill_len}!={want_fill}"
+    if len(ids) != spec.n_tokens:
+        # TAIL-NTOK: name the term that failed -- the old joint check printed
+        # fill vs want (``n_tokens:131774!=131774``) for a refusal of the ids
+        return f"n_tokens:ids{len(ids)}!={spec.n_tokens}"
     if park:
-        if not (spec.page_prefix <= int(prefix_len) < spec.cut):
-            return f"prefix:{int(prefix_len)}!in[{spec.page_prefix},{spec.cut})"
+        if not (spec.page_prefix <= int(prefix_len) <= spec.cut):
+            return f"prefix:{int(prefix_len)}!in[{spec.page_prefix},{spec.cut}]"
     elif int(prefix_len) != spec.page_prefix:
         return f"prefix:{int(prefix_len)}!={spec.page_prefix}"
-    if not (0 < spec.rows and spec.extend >= 1):
+    # TAIL_FOLD_SHORT: an END-only part (H63 fold, no E1 payload) may have no
+    # row below the cut (c on the page boundary, N % page in 1..grain) -- the
+    # END section [page_prefix, N) is the whole hand-off (y3r: 23 of 53
+    # prompts had no part and paid a 0.6-2.4 s extend of 1-65 tokens)
+    if not ((0 < spec.rows or (end_only and spec.rows == 0)) and spec.extend >= 1):
         return "geometry"
     if th.tail_key(ids, spec.cut, extra_key) != spec.key:
         return "key_mismatch"
@@ -927,16 +1390,25 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
         return None
     entry = _AGREED.pop(str(req.rid), None)
     if entry is None:
+        _defect_without_tail(req, prefix_len)
         return None
+    out, path = _plan_adopt_entry(entry, req, prefix_len, batch_empty)
+    _handback(req, entry, prefix_len, out, path)
+    return out
+
+
+def _plan_adopt_entry(entry: Agreed, req, prefix_len: int, batch_empty: bool):
+    """``plan_adopt``'s decision for a request with an agreed entry: (the
+    entry or None, the path the HANDBACK line names)."""
     if not entry.agreed:
         _log_ready(entry.staged, "skipped:group_vote", waited_ms=entry.waited_ms)
-        return None
+        return None, "extend:group_vote"
     park = _is_park(entry.staged)
     why = uniform_refusal(entry.staged.spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids),
-                          req.extra_key, prefix_len, park=park)
+                          req.extra_key, prefix_len, park=park, end_only=not entry.staged.e1)
     if why:
         _log_ready(entry.staged, f"skipped:{why}", waited_ms=entry.waited_ms)
-        return None
+        return None, f"extend:{why}"
     if entry.skip:
         why = skip_refusal(entry, req, batch_empty)
         if why:
@@ -946,10 +1418,41 @@ def plan_adopt(req, prefix_len: int, batch_empty: bool = True) -> Optional[Agree
                 # skip_refusal is rank-uniform)
                 entry.staged.drop_end()
                 _log_ready(entry.staged, f"skipped:end_only:{why}", waited_ms=entry.waited_ms)
-                return None
+                return None, f"extend:end_only:{why}"
             entry.skip, entry.skip_note = False, f"admission:{why}"
             entry.staged.drop_end()
-    return entry
+            return entry, f"e1:{why}"
+        return entry, "skip"
+    return entry, "e1"
+
+
+def _defect_without_tail(req, prefix_len: int) -> None:
+    """ZR instrument: a P hand-off or a D park admitted with no agreed tail
+    computes everything from ``prefix_len`` again (WEG2-HANDBACK-DEFECT)."""
+    try:
+        from sglang.srt.weg2.handback_claim import admission_without_tail
+
+        admission_without_tail(req.rid, len(req.full_untruncated_fill_ids), int(prefix_len))
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        pass
+
+
+def _handback(req, entry: Agreed, prefix_len: int, out, path: str) -> None:
+    """HANDBACK line (weg2/handback_claim.py): what D holds and what its target
+    forward computes for this hand-off. Never a gate."""
+    try:
+        from sglang.srt.weg2.handback_claim import handback_line
+
+        n = int(entry.staged.spec.n_tokens)
+        if out is None:
+            d_prefix = int(prefix_len)
+        elif out.skip:
+            d_prefix = n
+        else:
+            d_prefix = int(entry.staged.spec.cut)
+        handback_line(req.rid, n, d_prefix, max(0, n - d_prefix), path)
+    except Exception:  # noqa: BLE001 -- an instrument, never a gate
+        pass
 
 
 def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[Optional[int], bool]:
@@ -971,7 +1474,7 @@ def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[O
         return None, False
     park = _is_park(entry.staged)
     if uniform_refusal(entry.staged.spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids),
-                       req.extra_key, prefix_len, park=park):
+                       req.extra_key, prefix_len, park=park, end_only=not entry.staged.e1):
         return None, False
     spec = entry.staged.spec
     if entry.skip:
@@ -981,6 +1484,24 @@ def peek_target_start(req, prefix_len: int, batch_empty: bool = True) -> Tuple[O
         wait = why == "batch_not_empty"
         return (spec.cut if entry.staged.e1 else None), wait
     return spec.cut, False
+
+
+def peek_compute_tokens(req, prefix_len: int, batch_empty: bool = True) -> Optional[int]:
+    """cold-round1: the tokens the TARGET forward computes if the admission
+    takes the agreed tail now -- 0 under the E2 skip (no target forward),
+    ``fill - c`` under E1 -- WITHOUT taking the answer (no pop, no log).
+    None = the tail is not taken (the extend runs [prefix, fill)). The adder
+    fits THIS against the prefill chunk: a corridor-narrowed chunk (64 right
+    after a wake) must not send a resume whose tail makes its forward empty
+    into the chunked branch, which never takes a tail. Rank-uniform inputs,
+    exactly as ``peek_target_start``."""
+    start, _wait = peek_target_start(req, prefix_len, batch_empty)
+    if start is None:
+        return None
+    entry = _AGREED[str(req.rid)]
+    if entry.skip and start == entry.staged.spec.n_tokens:
+        return 0
+    return max(0, len(req.full_untruncated_fill_ids) - int(start))
 
 
 def skip_joinable(req, prefix_len: Optional[int] = None) -> bool:
@@ -1000,9 +1521,66 @@ def skip_joinable(req, prefix_len: Optional[int] = None) -> bool:
     at = spec.page_prefix if prefix_len is None else int(prefix_len)
     park = _is_park(entry.staged)
     if uniform_refusal(spec, adopt_ids(req, park), len(req.full_untruncated_fill_ids), req.extra_key, at,
-                       park=park):
+                       park=park, end_only=not entry.staged.e1):
         return False
     return not skip_refusal(entry, req, batch_empty=True)
+
+
+WINDOW_WAIT_MARK = "WEG2-TAIL-WINDOW-WAIT"
+_WINDOW_WAIT_N = [0]
+
+
+def window_above_delivered(req) -> bool:
+    """ZR-2 (01.10.): True when the group agreed a tail for ``req`` whose page
+    anchor lies ABOVE what its store read delivered -- settling the short read
+    now (D prefills the remainder) would throw the agreed END window away and
+    compute [delivered, N) again. Metal y6h weg2-4-14: delivered 67840, agreed
+    window [69824, 71448], '#1471 SETTLE-TAIL ... remainder=3612' released it
+    at the wake, the admission refused the tail ('prefix:67840!in[69824,71448]')
+    and extended 3612. The settle waits for the re-read instead (bounded by the
+    settle clock as before). Rank-uniform: ``_AGREED`` is the group's answer and
+    the delivered prefix is the synced one."""
+    entry = _AGREED.get(str(getattr(req, "rid", "")))
+    if entry is None or not entry.agreed:
+        return False
+    delivered = getattr(req, "_weg2_store_delivered", None)
+    if delivered is None:
+        return False
+    page_prefix = int(entry.staged.spec.page_prefix)
+    if int(delivered) >= page_prefix:
+        return False
+    _WINDOW_WAIT_N[0] += 1
+    n = _WINDOW_WAIT_N[0]
+    if n <= 20 or n % 200 == 0:
+        logger.info("%s rid=%s delivered=%d page_prefix=%d n=%d (an agreed END window above the short "
+                    "read: the settle waits for the re-read instead of computing [%d, N) again)",
+                    WINDOW_WAIT_MARK, req.rid, int(delivered), page_prefix, n, int(delivered))
+    return True
+
+
+SKIP_WAIT_MARK = "WEG2-TAIL-SKIP-WAIT"
+_SKIP_WAIT_N = [0]
+
+
+def skip_waits(req, prefix_len: int, *, skip_taken: bool, batch_nonempty: bool) -> bool:
+    """ZR-3 (01.10., the mirror of H24c): True when ``req`` would take the END
+    state at ``prefix_len`` but the batch already runs a forward -- it then
+    waits a pass with its agreed entry intact (no pop, no drop) instead of
+    ``plan_adopt`` dropping the END state ('end_only:batch_not_empty', metal
+    y6h weg2-4-15: N=41464, 56 tokens computed again from the page anchor
+    41408). The next pass leads with it (``skip_first.order``). Rank-uniform:
+    the batch and the group's agreed vote."""
+    if skip_taken or not batch_nonempty:
+        return False
+    if not skip_joinable(req, prefix_len):
+        return False
+    _SKIP_WAIT_N[0] += 1
+    n = _SKIP_WAIT_N[0]
+    if n <= 20 or n % 200 == 0:
+        logger.info("%s rid=%s prefix=%d n=%d (END state kept: the batch already runs a forward, the "
+                    "next pass leads with the skip -- 0 tokens computed again)", SKIP_WAIT_MARK, req.rid,
+                    int(prefix_len), n)
+    return True
 
 
 def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
@@ -1030,7 +1608,9 @@ def commit_adopt(req, entry: Agreed, tree_cache, page_size: int) -> int:
 def _ple_line(req, rows, why: str, path: str, at: int, result: str) -> None:
     """H63c: D's WEG2-PLE-STATE line -- the digest P printed for the same
     rid/path/position, and whether the history is the prompt's own tokens."""
-    ids = list(getattr(req, "origin_input_ids", None) or [])
+    # the history the state consumed: prompt + output (a RESUME-VIA-P leg's
+    # P prompt, TAIL-NTOK; a park's window ends at N <= this length)
+    ids = list(getattr(req, "origin_input_ids", None) or []) + list(getattr(req, "output_ids", None) or [])
     ctx = ple_state.ctx_tokens(rows)
     expect = ids[max(0, int(at) - len(ctx)):int(at)] if ctx else []
     ple_state.log_state(
@@ -1170,9 +1750,10 @@ def _commit_skip(req, entry: Agreed, tree_cache, page_size: int) -> int:
     # re-enters at page_prefix (one page); F4's park anywhere in its window
     need = spec.cut - len(req.prefix_indices)
     page_size = int(page_size)
-    page = alloc_token_slots(tree_cache, -(-need // page_size) * page_size)
-    rows = page[:need].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
-    req.prefix_indices = torch.cat([req.prefix_indices, rows])
+    if need > 0:  # PARK-ANCHOR: a park resume AT the cut grows nothing
+        page = alloc_token_slots(tree_cache, -(-need // page_size) * page_size)
+        rows = page[:need].to(dtype=req.prefix_indices.dtype, device=req.prefix_indices.device)
+        req.prefix_indices = torch.cat([req.prefix_indices, rows])
     if _is_park(st):
         # F4: the parked request's last sampled token comes back as the
         # skip's token -- take it off now so the batch is [c, N) over the
@@ -1399,9 +1980,16 @@ def _install_step(inst: Install, layer_id: int) -> None:
 
 def _finish(inst: Install, verify: bool) -> None:
     event = None
-    if verify and torch.cuda.is_available() and inst.rows.is_cuda:
+    worker = stage_worker_enabled()
+    if (verify or worker) and torch.cuda.is_available() and inst.rows.is_cuda:
+        # TAIL-STAGE-WORKER: the arena span is given back only after the
+        # copies out of it completed -- the verify thread waits on this event
+        # (off the forward stream; the decode path never waits)
         event = torch.cuda.Event()
         event.record()
+    if worker:
+        with _VERIFYING_LOCK:
+            _VERIFYING[str(inst.spec.rid)] = _VERIFYING.get(str(inst.spec.rid), 0) + 1
     threading.Thread(target=_verify_and_log, args=(inst, verify, event), daemon=True,
                      name="weg2-tail-verify").start()
 
@@ -1479,6 +2067,7 @@ def _verify_and_log(inst: Install, verify: bool, event) -> None:
         dig = readback_digest(inst) if verify else "off"
     except Exception as exc:  # noqa: BLE001 -- an instrument, named
         dig = f"verify_raised:{type(exc).__name__}"
+    _release_verified(str(inst.spec.rid))
     rows = inst.spec.n_tokens - inst.spec.page_prefix if inst.end else inst.spec.rows
     _log_adopt(inst.spec, fa_rows=rows, fa_layers=len(inst.fa_dst), gdn_layers=len(inst.gdn_dst),
                digest=dig, ms=(time.perf_counter() - inst.t0) * 1000.0, issue_ms=inst.issue_ms, end=inst.end)
@@ -1495,3 +2084,20 @@ def _log_adopt(spec: th.TailSpec, fa_rows: int, fa_layers: int, gdn_layers: int,
         spec.rid, spec.page_prefix, rows, state_at, extend, fa_rows, fa_layers, gdn_layers,
         digest, ms, issue_ms,
     )
+
+
+def _release_verified(rid: str) -> None:
+    """TAIL-STAGE-WORKER: the rid's copies landed and its readback was read --
+    its arena spans go back (a second install of the same rid keeps them)."""
+    with _VERIFYING_LOCK:
+        n = _VERIFYING.get(rid, 0)
+        if n <= 0:
+            return
+        if n > 1:
+            _VERIFYING[rid] = n - 1
+            return
+        _VERIFYING.pop(rid, None)
+    w = _STAGE_WORKER[0]
+    if w is not None and w.arena is not None and rid not in _JOBS and rid not in _AGREED \
+            and rid not in SKIP_PLANS and rid != w.current:
+        w.arena.release(rid)

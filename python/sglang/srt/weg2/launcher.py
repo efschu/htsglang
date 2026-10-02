@@ -2229,6 +2229,23 @@ def d_reshard_env() -> Dict[str, str]:
 D_GC_FREEZE_DEFAULT = "off"
 
 
+def apply_p_gc_warn_default(ns) -> Optional[str]:
+    """30.09. (NF y3z ep52: PP0 stood still 5.4 s process-wide at the first
+    tag of P's sleep; a gen-2 GC is one candidate): group P's schedulers arm
+    the GC warning at 0.5 s by default -- ``SGLANG_WEG2_GC_WARN_SECS`` into
+    ``ns.env_p`` unless --env-p states it (=0 turns it off). Returns the line
+    naming it, or None."""
+    from sglang.srt.weg2 import gc_instrument as _gci
+
+    env_p = str(getattr(ns, "env_p", "") or "")
+    if _gci.WARN_ENV in parse_group_env(env_p):
+        return None
+    ns.env_p = set_group_env(env_p, _gci.WARN_ENV, f"{_gci.P_GC_WARN_DEFAULT_S:g}")
+    return (f"WEG2-GC P warn: --env-p {_gci.WARN_ENV}={_gci.P_GC_WARN_DEFAULT_S:g} (every P "
+            f"scheduler logs a GC collection over {_gci.P_GC_WARN_DEFAULT_S:g} s after boot; "
+            f"--env-p {_gci.WARN_ENV}=0 = off)")
+
+
 def d_gc_env(ns) -> Dict[str, str]:
     from sglang.srt.weg2 import gc_instrument as _gci
 
@@ -2976,9 +2993,15 @@ def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int
             after.append(c)
             on.append(0)
             continue
-        after.append(c - int(t.rows))
+        # the scratch the rank RUNS (SGLANG_MOE_SCRATCH_SLOTS as written:
+        # the low rows a floor ladder funds are NEW bank rows, only the rest
+        # leaves the scratch) = its 'C=LRU+staging'; on = its capture floor,
+        # the rows of the cap's top stage -- the two numbers the rank's H95
+        # line prints (y6n TP2: 46 + 0, where the old split read 38 + 9)
+        a = c - (int(t.rows) - int(getattr(t, "low_rows", 0) or 0))
+        after.append(a)
         j = min(int(max_by[cap - 1]), len(t.tokens) - 1)
-        on.append(int(t.capacity[cap - 1][j]) - (c - int(t.rows)))
+        on.append(int(t.capacity[cap - 1][j]) - a)
     lines, bad = rank_wave_floor(demand, after, on, int(waves_cap))
     # the smaller batches of a KV rank: its floor can sit lower (a stage the
     # cap never takes) -- the table's per-batch waves, the same floor rule
@@ -13384,6 +13407,111 @@ def apply_profile_torch_cache_cap_default(ns) -> Optional[str]:
             f"{TORCH_CACHE_CAP_ENV}=0 = the uncapped form)")
 
 
+#: LEISTUNGSSCHALTER (user rule 29.09.): the marker of the line naming the
+#: registry row's per-group switch defaults written into --env-p/--env-d.
+GROUP_SWITCH_DEFAULTS_MARKER = "WEG2-LEISTUNGSSCHALTER"
+
+
+def apply_profile_group_switch_defaults(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """LEISTUNGSSCHALTER (user rule 29.09. ~10:15Z: proven on metal -> default
+    on in the code): the registry row's ``group_switch_defaults`` (weg2/form.py)
+    into ``ns.env_p`` / ``ns.env_d``. A key that group's env already states,
+    or that the launcher's own environment carries (an operator export, which
+    build_env hands every group), is left alone -- an explicit value always
+    wins, =0 turns the switch off. Written INTO the group env so every reader
+    (the D solve, the ranks; build_env applies --env-* last) sees ONE value.
+    Returns the line naming what was written, or None (qwen27b: nothing)."""
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    rows = dict(getattr(row, "group_switch_defaults", None) or {}) if row is not None else {}
+    if not rows:
+        return None
+    env_os = canonical_env(dict(os.environ if environ is None else environ))
+    wrote: List[str] = []
+    for group, attr in (("P", "env_p"), ("D", "env_d")):
+        spec = str(getattr(ns, attr, "") or "")
+        stated = parse_group_env(spec)
+        for key, val in rows.get(group, {}).items():
+            if key in stated or key in env_os:
+                continue
+            spec = set_group_env(spec, key, str(val))
+            wrote.append(f"{group}:{key}={val}")
+        setattr(ns, attr, spec)
+    if not wrote:
+        return None
+    return (f"{GROUP_SWITCH_DEFAULTS_MARKER} registry {row.id} (default on after the metal proof; "
+            f"a stated --env-p/--env-d or exported value wins): " + " ".join(wrote))
+
+
+def apply_profile_d_kv_token_cut_default(ns, argv_words: Sequence[str]) -> Optional[str]:
+    """#239 LEISTUNGSSCHALTER: an UNSET ``--d-kv-token-cut`` takes the registry
+    row's ``d_kv_token_cut`` (nextflash ``owned``; qwen27b ``off``). Applied
+    BEFORE the form is resolved (the kv axis derives from the flag), and only
+    where the boot can run the cut -- else the code default ``off`` stays:
+    D states Form A worker roles (``derive_kv`` refuses the cut without them),
+    no other ``--form-kv`` is stated, and a flip boot has its host tier and at
+    most one operator-named KV stage (``refuse_flip_under_token_cut``). Returns
+    the line naming the default, or None."""
+    if getattr(ns, "teardown", False):
+        return None
+    if weg2_form.flag_given(argv_words, "--d-kv-token-cut"):
+        return None
+    if str(getattr(ns, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
+           or weg2_form.KV_TOKEN_CUT_OFF) != weg2_form.KV_TOKEN_CUT_OFF:
+        return None
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    want = str(getattr(row, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
+               or weg2_form.KV_TOKEN_CUT_OFF) if row is not None else weg2_form.KV_TOKEN_CUT_OFF
+    if want == weg2_form.KV_TOKEN_CUT_OFF:
+        return None
+    stated_kv = getattr(ns, "form_kv", None)
+    if stated_kv and stated_kv != "qsa_forma_dcp":
+        return None
+    roles = weg2_form.flag_values(shlex.split(str(getattr(ns, "extra_d", "") or "")), "--rank-role")
+    if not roles or "worker" not in [r.strip() for r in roles[-1].split(",")]:
+        return None
+    if not getattr(ns, "d_only", False):
+        if getattr(ns, "weg2_disable_hicache", False):
+            return None
+        stages = d_kv_stage_tokens_named(ns)
+        if stages is not None and len(stages) != 1:
+            return None
+    ns.d_kv_token_cut = want
+    return (f"{KV_TOKEN_CUT_MARKER} registry {row.id}: --d-kv-token-cut {want} "
+            "(default on after the metal proof; --d-kv-token-cut off = the uncut Form A)")
+
+
+#: PR (30.09.): group D's paired miss record is ON by default -- the records
+#: root of the line under the evidence dir (``<root>/<model_id>/owned_miss``,
+#: layers.moe.pool_miss_cost.record_dir_for). --env-d
+#: SGLANG_WEG2_OWNED_MISS_RECORD=<dir> names another root; an empty value
+#: turns it off.
+OWNED_MISS_RECORD_ENV = "SGLANG_WEG2_OWNED_MISS_RECORD"
+
+
+def owned_miss_record_root() -> str:
+    return os.path.join(EVIDENCE_DIR, "records", "weg2")
+
+
+def apply_owned_miss_record_default(ns) -> Optional[str]:
+    """PR: ``SGLANG_WEG2_OWNED_MISS_RECORD`` into ``ns.env_d`` unless --env-d
+    states it (every reader -- the D ranks, ``d_owned_miss_ms`` -- sees ONE
+    value). Returns the line naming it, or None."""
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if OWNED_MISS_RECORD_ENV in parse_group_env(env_d):
+        return None
+    root = owned_miss_record_root()
+    ns.env_d = set_group_env(env_d, OWNED_MISS_RECORD_ENV, root)
+    return (f"D-EIGENTUM MISS-RECORD (#239 S3f, PR): --env-d {OWNED_MISS_RECORD_ENV}={root} "
+            f"(D ranks write paired prefill miss records at their sleep; the owned solve reads "
+            f"them as RECORD from K={_owned_miss_min_paired()} paired forwards per rank)")
+
+
+def _owned_miss_min_paired() -> int:
+    from sglang.srt.planner import expert_residency as _er
+
+    return int(_er.OWNED_MISS_MIN_PAIRED_FORWARDS)
+
+
 def d_fixed_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
     """``D_FIXED_MIB`` of the profile (the #145 fixed post measured on the
     form that runs today), or ``(None, "")`` -- the builtin reference stands."""
@@ -13435,8 +13563,53 @@ def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
         rank_records=_er.read_owned_miss_rank_records(rank_dir), host=int(host),
         model=model, builtin=builtin, builtin_source=builtin_src)
     if tier == _er.OWNED_MISS_UNMEASURED:
-        return None, ""
+        # PR: the seed stays -- the line still names a too-young RECORD's count
+        return None, src if "RECORD zu jung" in src else ""
     return ms, src
+
+
+def d_owned_miss_ms_rank(ns, *, env_d: Mapping[str, str], n: int
+                         ) -> Tuple[Optional[Tuple[float, ...]], str]:
+    """01.10. (owned cut from the profiles): the cost per missed expert row
+    of EVERY D rank from its own paired records (each card at its own link:
+    NF D TP1 = NVML0 3080 x4, TP2 = NVML2 3080 x8 -- the (host, worker) pair
+    of :func:`d_owned_miss_ms` pools both 3080s into one worker cost).
+    ``(None, "")`` without a full window on every rank."""
+    from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+    from sglang.srt.planner import expert_residency as _er
+
+    model = str(getattr(ns, "model", "") or "")
+    root = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip()
+    if not root:
+        return None, ""
+    got = _er.owned_miss_per_rank_from_records(
+        _er.read_owned_miss_rank_records(_miss_cost.record_dir_for(root, model)),
+        n=int(n), model=model)
+    if got is None:
+        return None, ""
+    return got
+
+
+def d_owned_heat_records(ns, *, env_d: Mapping[str, str]) -> Tuple[List[dict], str]:
+    """01.10. (owned cut from the profiles): the #276 heat records of group
+    D's ``SGLANG_DEBUG_MOE_HEAT`` directory -- the owned solve's non-resident
+    demand (``plan_d_residency`` maps them to a routed-lane share per global
+    expert). The directory is the line's per-checkpoint heat directory (the
+    profile names it); ``([], "")`` when it is unset."""
+    import glob
+    import json as _json
+
+    root = str(env_d.get("SGLANG_DEBUG_MOE_HEAT", "") or "").strip()
+    if not root or not os.path.isdir(root):
+        return [], ""
+    recs = []
+    for path in sorted(glob.glob(os.path.join(root, "moe_heat_*.json"))):
+        try:
+            with open(path) as fh:
+                recs.append(_json.load(fh))
+        except (OSError, ValueError):
+            continue
+    return recs, root
 
 
 def d_overshoot_record(profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
@@ -13529,6 +13702,12 @@ def d_extend_trim_env(ledger, fits, growth_mib: Optional[Sequence[Optional[float
     if growth_mib is not None and len(growth_mib) != n:
         growth_mib = None
     return _et.launcher_thresholds(ledger.floor_mib, [act[r] for r in range(n)], growth_mib)
+
+
+def d_lend_floor_env(ledger) -> str:
+    """D-TRANSIENT-LEND: ``SGLANG_WEG2_D_LEND_FLOOR_MIB`` = the card ledger's
+    near-OOM floor per rank (MiB, rounded up)."""
+    return ",".join(str(int(math.ceil(float(f)))) for f in ledger.floor_mib)
 
 
 D_ONLY_LABEL = "D(d-only, expectation)"
@@ -16658,6 +16837,17 @@ def fork_anchor_env(token: Optional[int], p_trim: bool) -> Dict[str, str]:
     return {_fa.TOKEN_ENV: str(int(token))}
 
 
+def turn_anchor_env(token: Optional[int]) -> Dict[str, str]:
+    """``--turn-anchor-token``: group P's environment for the TURN ANCHOR
+    (weg2/turn_anchor.py; {} when off -- the byte-identity guarantee). Group
+    D reads nothing new: the anchor is a regular store node at a page."""
+    if token is None:
+        return {}
+    if int(token) <= 0:
+        raise SystemExit(f"--turn-anchor-token must be a positive token id, got {token}")
+    return {"SGLANG_WEG2_TURN_ANCHOR_TOKEN": str(int(token))}
+
+
 def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
     """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
 
@@ -18484,6 +18674,16 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
             f"{_miss_ms[0]:g}/{_miss_ms[1]:g} ms je Zeile (Host/Worker) aus {_miss_src} "
             f"statt der Saat")
+    elif _miss_src:
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
+            f"Saat -- {_miss_src}")
+    # 01.10.: the same records per rank -- each card at its own link
+    _miss_rank, _miss_rank_src = d_owned_miss_ms_rank(ns, env_d=_env_d, n=n)
+    _heat_recs, _heat_root = d_owned_heat_records(ns, env_d=_env_d)
+    if _miss_rank is not None:
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN JE RANG (01.10.): "
+            f"{'/'.join('%.4f' % x for x in _miss_rank)} ms je Zeile (TP0..TP{n - 1}) "
+            f"aus {_miss_rank_src}")
     # #239: the token cut of the full-attention KV (None = off, byte-identical)
     _kv_cut = d_kv_token_cut(ns)
     _pinned = getattr(ns, "_d_map_form", None)
@@ -18537,6 +18737,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             derive_waves=_derive_waves,
             owned_miss_ms=_miss_ms,
             owned_miss_source=_miss_src,
+            owned_miss_ms_rank=_miss_rank,
+            owned_miss_rank_source=_miss_rank_src,
+            owned_heat_records=_heat_recs,
+            owned_heat_source=_heat_root,
             **_kv_cut_kw,
         )
         if _ledger is not None and plan.refusal is not None and plan.fits:
@@ -18576,6 +18780,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     derive_waves=_derive_waves,
                     owned_miss_ms=_miss_ms,
                     owned_miss_source=_miss_src,
+                    owned_miss_ms_rank=_miss_rank,
+                    owned_miss_rank_source=_miss_rank_src,
+                    owned_heat_records=_heat_recs,
+                    owned_heat_source=_heat_root,
                     **_kv_cut_kw,
                 )
         if d_stated_seats(ns) is not None:
@@ -18669,6 +18877,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             derive_waves=_derive_waves,
             owned_miss_ms=_miss_ms,
             owned_miss_source=_miss_src,
+            owned_miss_ms_rank=_miss_rank,
+            owned_miss_rank_source=_miss_rank_src,
+            owned_heat_records=_heat_recs,
+            owned_heat_source=_heat_root,
             **_seat_cut_kw,
     ), label):
         log(_ln)
@@ -18677,6 +18889,16 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         raise Weg2LaunchRefused(plan.refusal)
     _lru_add = getattr(ns, "_d_kv_stage_lru_raise", None)
     ns._d_kv_stage_lru_raise = None
+    _own_add = {r: int(k) for r, k in enumerate(getattr(plan, "owned_scratch_raise", ()) or ())
+                if int(k) > 0}
+    if _own_add:
+        # 01.10. (y6n): the owned solve's wave floor needs these scratch rows
+        # (rows from resident to scratch, FR_D already solved with them) --
+        # the same raise-and-solve-again as the #251c LRU floor
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM GRENZEN: Wellenboden braucht Scratch "
+            + ", ".join("rang%d +%d" % (r, k) for r, k in sorted(_own_add.items())))
+        _lru_add = {r: max(int((_lru_add or {}).get(r, 0)), int(_own_add.get(r, 0)))
+                    for r in set(_lru_add or {}) | set(_own_add)}
     if _lru_add:
         # (3) 29.09.: a KV rank's LRU falls below its measured peak at an
         # allowed stage -- raise its scratch and solve again, so the planner
@@ -18723,6 +18945,16 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                       if _growth is not None else "floor + gebuchte Aktivierung je Rang")
             log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-TRIM SGLANG_WEG2_EXTEND_TRIM_MIB={_trim} "
                 f"({_gtext}; darunter leert D vor dem Extend den Allokator-Cache)")
+        # D-TRANSIENT-LEND: the near-OOM edge per rank, down to which D lends
+        # its booked transient as expert rows between extends; a value named
+        # in --env-d wins
+        _env_d = getattr(ns, "env_d", "") or ""
+        if "SGLANG_WEG2_D_LEND_FLOOR_MIB" not in parse_group_env(_env_d):
+            _lend = d_lend_floor_env(_ledger)
+            ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_D_LEND_FLOOR_MIB", _lend)
+            log(f"{D_RANK_SOLVE_MARKER} {label} TRANSIENT-LEND SGLANG_WEG2_D_LEND_FLOOR_MIB={_lend} "
+                f"(Karten-Boden je Rang; zwischen zwei Extends werden die Bytes darueber "
+                f"Expertenzeilen, vor dem Extend zurueckgegeben)")
         # rc12g: the extend chunk follows the card after the trim
         # (WEG2-EXTEND-STUECKELUNG); a value named in --env-d wins.
         _rate, _rate_src = d_extend_growth_per_row_record(ns.profile)
@@ -21663,6 +21895,16 @@ def build_parser() -> argparse.ArgumentParser:
              "SGLANG_WEG2_FORK_ANCHOR_TOKEN to both groups; default off = argv and "
              "env byte-identical.")
     ap.add_argument(
+        "--turn-anchor-token", type=int, default=None, metavar="ID",
+        help="TURN ANCHOR (NF, weg2/turn_anchor.py): the chat template's turn-start "
+             "token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Group P then "
+             "also snapshots the recurrent state where the prompt's LAST message "
+             "starts (a second extend track in the same forward, no extra forward) "
+             "and inserts it as an anchor -- where the next turn and a client's side "
+             "request fork (y3m weg2-50-71: FETCH CAP lost=16 pages behind the "
+             "END anchor). Adds SGLANG_WEG2_TURN_ANCHOR_TOKEN to group P only; "
+             "default off = argv and env byte-identical.")
+    ap.add_argument(
         "--fp8-uniform-marlin", action="store_true",
         help="27B line, an FP8 checkpoint (Qwen/Qwen3.8-27B-FP8, block 128x128) on "
              "the flip: force the Marlin FP8 kernel on EVERY rank of both groups "
@@ -23018,6 +23260,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # H91b/H95: the Next-Flash form's own D seat bound (6, dynamic 1..6 per
     # phase) and its pool waves, before anything reads --d-bs or --env-d.
     apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
+    _p_gc_line = apply_p_gc_warn_default(ns)  # NF y3z ep52: gen-2 GC on P named
+    if _p_gc_line:
+        print(_p_gc_line, flush=True)
     _h95_waves_line = apply_profile_d_pool_waves_default(ns)
     if _h95_waves_line:
         print(_h95_waves_line, flush=True)
@@ -23027,6 +23272,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _p0_line = apply_profile_torch_cache_cap_default(ns)  # WEG2-ALLOC-OVERHANG
     if _p0_line:
         print(_p0_line, flush=True)
+    if not ns.teardown:
+        # LEISTUNGSSCHALTER (user rule 29.09.): the row's per-group switch
+        # defaults and its --d-kv-token-cut, before any reader of --env-* or
+        # of the kv axis (resolve_form below).
+        _ls_line = apply_profile_group_switch_defaults(ns)
+        if _ls_line:
+            print(_ls_line, flush=True)
+        _cut_line = apply_profile_d_kv_token_cut_default(
+            ns, list(sys.argv[1:] if argv is None else argv))
+        if _cut_line:
+            print(_cut_line, flush=True)
+    _miss_rec_line = apply_owned_miss_record_default(ns)  # PR: paired miss record
+    if _miss_rec_line:
+        print(_miss_rec_line, flush=True)
     if not ns.teardown:
         _park_split = d_park_split_refusal(ns)  # 27B park (RV B5): front and D must agree
         if _park_split:
@@ -24801,6 +25060,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _fork_env = fork_anchor_env(getattr(ns, "fork_anchor_token", None),
                                 bool(getattr(ns, "p_trim_end_anchor", False)))
     env_p.update(_fork_env)
+    # TURN ANCHOR (weg2/turn_anchor.py): {} when off; group P only.
+    _turn_env = turn_anchor_env(getattr(ns, "turn_anchor_token", None))
+    env_p.update(_turn_env)
+    if _turn_env:
+        log("WEG2 TURN-ANCHOR: on (--turn-anchor-token %s) -- group P snapshots the "
+            "recurrent state where a prompt's last message starts as a second extend "
+            "track and inserts it as its own anchor (rank lines 'WEG2 TURN-ANCHOR "
+            "TRACK', 'WEG2 TURN-ANCHOR INSERT')" % ns.turn_anchor_token)
     if _fork_env:
         log("WEG2 FORK-ANCHOR: on (--fork-anchor-token %s) -- group P cuts a leg-1 "
             "prompt before its generation prompt, group D reads the store up to the "

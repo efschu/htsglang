@@ -28,7 +28,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 PREFILL_KEYS = {"chunks", "new_tokens", "cached_tokens", "gpu_ms", "split_ms",
-                "compute_ms", "wait_ms", "bubble_ms", "last"}
+                "compute_ms", "wait_ms", "bubble_ms", "last",
+                "own_ms", "compute_only_ms", "own_n"}  # 30.09. FEHLT 7
 DECODE_KEYS = {"rounds", "gpu_ms", "gpu_ms_by_bs", "tokens", "running",
                "accept_len_ewma", "accept_rate_ewma", "cuda_graph",
                "last_bs"}  # 30.09. FEHLT 6
@@ -166,7 +167,9 @@ class TestCacheFromTheCounters(CustomTestCase):
         self.assertEqual(c["loadback_tok"], (base["loadback_tok"] or 0) + 4096)
         self.assertEqual(c["mamba_resume_n"], base["mamba_resume_n"] + 1)
         self.assertEqual(c["store_incomplete_n"], 3)
-        self.assertEqual(c["prefetch"]["landed"], base["prefetch"]["landed"] + 1)
+        # RANK-TIMING 01.10.: the #1068 deferral's "landed" gate is deferred_landed;
+        # prefetch.landed counts store reads that landed a page (test_weg2_rank_timing_1001)
+        self.assertEqual(c["prefetch"]["deferred_landed"], base["prefetch"]["deferred_landed"] + 1)
         self.assertEqual(c["prefetch"]["deferred"], base["prefetch"]["deferred"] + 1)
 
 

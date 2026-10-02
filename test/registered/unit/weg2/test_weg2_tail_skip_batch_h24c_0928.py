@@ -179,7 +179,8 @@ def test_commit_checks_the_matched_prefix_and_plans_as_empty():
     plan = src.index("_tail = tail_adopt.plan_adopt(")
     assert gate < plan
     assert "batch_empty=not self.can_run_list or self.weg2_skip_extend_taken" in src[plan:plan + 200]
-    assert "input_tokens > self.rem_chunk_tokens" in src[src.rindex("if self.weg2_skip_extend_taken", 0, gate):gate]
+    # cold-round1: the chunk test reads what the forward computes (fit_tokens)
+    assert "fit_tokens > self.rem_chunk_tokens" in src[src.rindex("if self.weg2_skip_extend_taken", 0, gate):gate]
 
 
 # -------------------------------------------------------------- the worker

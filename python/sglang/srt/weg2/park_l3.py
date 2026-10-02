@@ -49,6 +49,15 @@ logger = logging.getLogger(__name__)
 DEFER_ATTR = "_weg2_248_read_at_wake"
 #: the wake issued the deferred read (the settle release cleans up after it)
 ISSUED_ATTR = "_weg2_248_read_issued"
+#: #248f: the read waits for arena room (older hold reads of this wake hold it)
+CAPWAIT_ATTR = "_weg2_248f_capacity_wait"
+CAPWAIT_MARK = "#248f WAKE-READ CAPACITY-WAIT"
+CAPISSUE_MARK = "#248f WAKE-READ CAPACITY-ISSUE"
+#: #248f: the pages an issued hold read asked for, and the wake it ran in --
+#: a released request keeps its arena references until its admission loads
+#: it (``release_loaded_host``), so it counts while it waits in the queue.
+PAGES_ATTR = "_weg2_248f_pages"
+WAKE_ATTR = "_weg2_248f_wake"
 
 
 def enabled() -> bool:
@@ -140,6 +149,84 @@ def _report_marks(cache, req, marks, t0: float) -> None:
                     ("total", "pre", "bind", "alloc", "query", "collective", "post")))
     except Exception:  # noqa: BLE001 -- an instrument never breaks the release
         pass
+def arena_gate_on() -> bool:
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_ENABLE_WAKE_READ_ARENA_GATE.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _arena_page_tokens(sched) -> int:
+    """Tokens per KV arena page (the controller's page: one arena slot)."""
+    cc = getattr(getattr(sched, "tree_cache", None), "cache_controller", None)
+    for v in (getattr(cc, "page_size", None), getattr(sched, "page_size", None)):
+        try:
+            if v is not None and int(v) > 0:
+                return int(v)
+        except (TypeError, ValueError):
+            continue
+    return 1
+
+
+def arena_capacity(sched):
+    """#248f: the KV arena's slot count (one arena file shared by every rank,
+    so the same number everywhere), or None when no arena is bound here --
+    then nothing is gated."""
+    cc = getattr(getattr(sched, "tree_cache", None), "cache_controller", None)
+    pool = getattr(cc, "mem_pool_host", None)
+    arena = getattr(pool, "arena", None)
+    try:
+        slots = int(getattr(arena, "slots", 0) or 0)
+    except (TypeError, ValueError):
+        slots = 0
+    return slots if slots > 0 else None
+
+
+def read_pages(sched, req) -> int:
+    """#248f: the arena pages a hold read of ``req`` asks for -- its tokens
+    (prompt + output) in arena pages. Request fields only: the same number on
+    every rank."""
+    n = len(getattr(req, "origin_input_ids", None) or ()) + len(getattr(req, "output_ids", None) or ())
+    page = _arena_page_tokens(sched)
+    return -(-int(n) // page) if n > 0 else 0
+
+
+def capacity_waiting(req) -> bool:
+    return bool(getattr(req, CAPWAIT_ATTR, False)) and deferred(req)
+
+
+def _wake_key(sched):
+    """#248f: the wake a hold read belongs to -- ``_weg2_wake_seq`` counts up at
+    the release (``_weg2_release_dormant_hold``); a read issued before it (F22's
+    early read, still dormant) belongs to the wake about to be counted."""
+    seq = getattr(sched, "_weg2_wake_seq", None)
+    if seq is None:
+        return None
+    return int(seq) + (1 if getattr(sched, "weg2_dormant", False) else 0)
+
+
+def _in_flight_pages(sched, reqs) -> int:
+    """Pages of this wake's hold reads that still hold the arena: issued and
+    still in the hold / settle, or released to the waiting queue and not yet
+    admitted (the admission's load-back releases the references). Replicated:
+    the settle, the hold and the queue's hold-released requests are the
+    group's, the pages are request lengths."""
+    seen, total = set(), 0
+    for r in reqs or ():
+        if issued(r) and not capacity_waiting(r):
+            seen.add(id(r))
+            total += read_pages(sched, r)
+    wake = _wake_key(sched)
+    for r in list(getattr(sched, "waiting_queue", None) or ()):
+        if id(r) in seen:
+            continue
+        pages = int(getattr(r, PAGES_ATTR, 0) or 0)
+        if pages > 0 and getattr(r, WAKE_ATTR, None) == wake:
+            seen.add(id(r))
+            total += pages
+    return total
 
 
 def issue_deferred_reads(sched, hold) -> list:
@@ -148,10 +235,90 @@ def issue_deferred_reads(sched, hold) -> list:
     the same point of the resume with the same hold (the intake order is
     the group's), so the reads' collectives line up. Returns the requests
     whose read was issued -- the release parks them in the #1471 settle
-    until the read is complete."""
-    out = []
+    until the read is complete.
+
+    #248f (30.09., NF y4b ep18): only as many as fit in the KV arena
+    TOGETHER, oldest first. y4b 03:51:37: weg2-0-4 (1412 pages), weg2-14-27
+    (1728) and weg2-16-29 (3841) = 6981 pages against 6485 slots -- the L3
+    fills of 16-29 found the arena full and ``#248e ORDERED-EVICT site=l3fill``
+    took 449 of 16-29's OWN kept pages (the read-order victim is the last-read
+    rid), 33 fills were refused, and 16-29 needed 4 re-reads (held 4.5 s after
+    the wake). Now the first read that would overrun the arena waits by name
+    (``#248f WAKE-READ CAPACITY-WAIT``) and every younger one with it (no
+    overtaking: arrival order); the settle issues them as the older reads
+    leave it (:func:`issue_capacity_waiters`). The first read is always issued
+    (a lone read larger than the arena reads as before). Capacity = the slot
+    count, no reserve; nothing here runs in a decode or a flip leg. Every
+    input is replicated (request lengths, hold order, the shared arena's
+    geometry), so every rank decides alike."""
+    reqs = [r for r in list(hold or ()) if deferred(r)]
+    if not reqs:
+        return []
+    cap = arena_capacity(sched) if arena_gate_on() else None
+    if cap is None:
+        return _issue(sched, reqs)
+    in_flight = _in_flight_pages(sched, hold)
+    go, wait = [], []
+    for req in reqs:
+        need = read_pages(sched, req)
+        if wait or (in_flight > 0 and in_flight + need > cap):
+            setattr(req, CAPWAIT_ATTR, True)
+            wait.append(req)
+            continue
+        setattr(req, CAPWAIT_ATTR, False)
+        in_flight += need
+        go.append(req)
+    out = _issue(sched, go)
+    if wait:
+        logger.info("%s n=%d waiting=%s in_flight_pages=%d arena_slots=%d (the older hold reads of "
+                    "this wake hold the arena: these wait parked in the #1471 settle, oldest "
+                    "first, instead of reading short and evicting their own kept pages)",
+                    CAPWAIT_MARK, len(wait), [(str(r.rid)[:12], read_pages(sched, r)) for r in wait],
+                    in_flight, cap)
+    return out
+
+
+def issue_capacity_waiters(sched, settle) -> list:
+    """#248f: from the #1471 settle tick (every rank, every pass, same list):
+    issue the waiting hold reads, oldest first, as far as the arena holds
+    them beside the issued reads still in the settle or released and not yet
+    admitted (queued: their load-back has not freed the arena yet). Returns those issued;
+    their settle clock restarts now (waiting is not reading)."""
+    waiters = [r for r in list(settle or ()) if capacity_waiting(r)]
+    if not waiters:
+        return []
+    cap = arena_capacity(sched) if arena_gate_on() else None
+    in_flight = _in_flight_pages(sched, settle)
+    go = []
+    for req in waiters:
+        need = read_pages(sched, req)
+        if cap is not None and in_flight > 0 and in_flight + need > cap:
+            break
+        in_flight += need
+        go.append(req)
+    if not go:
+        return []
+    for req in go:
+        setattr(req, CAPWAIT_ATTR, False)
+    out = _issue(sched, go)
+    now = time.monotonic()
+    for req in go:
+        req._1471_since = now
+    logger.info("%s n=%d rids=%s in_flight_pages=%d arena_slots=%s still_waiting=%d (an older hold read "
+                "was admitted and freed its arena room: the next ones in arrival order read now)",
+                CAPISSUE_MARK, len(go), [(str(r.rid)[:12], read_pages(sched, r)) for r in go],
+                in_flight, cap, len(waiters) - len(go))
+    return out
+
+
+def _issue(sched, reqs) -> list:
+    """The #248 store read of each request, in the given order (unchanged)."""
+    from sglang.srt.weg2 import settle_writer as _sw
+
+    out, refused = [], []
+    now = time.monotonic()
     cache = getattr(sched, "tree_cache", None)
-    for req in list(hold or ()):
+    for req in list(reqs or ()):
         if not deferred(req):
             continue
         setattr(req, DEFER_ATTR, False)
@@ -162,15 +329,43 @@ def issue_deferred_reads(sched, hold) -> list:
         finally:
             _report_marks(cache, req, marks, t0)
         req._969c_verdict = verdict
+        # NW (30.09.): a refusal of the host budget is "not read yet" -- the #1471
+        # settle keeps it parked and re-reads once the budget has room.
+        if _sw.note_read_verdict(req, verdict, now, tree=getattr(sched, "tree_cache", None)):
+            refused.append((req, verdict))
         apply = getattr(sched, "_apply_prefetch_deferral", None)
         if apply is not None:
             apply(req, verdict, site="wake-248")
         setattr(req, ISSUED_ATTR, True)
+        setattr(req, PAGES_ATTR, read_pages(sched, req))
+        setattr(req, WAKE_ATTR, _wake_key(sched))
         out.append(req)
     if out:
         logger.info("#248 WAKE-READ issued=%d %s (the hold read runs now: reference and pin at the wake, "
                     "the device load at admission)", len(out), [str(r.rid)[:12] for r in out])
+    if refused:
+        logger.warning("#1471b WAKE-READ BUDGET-REFUSED n=%d %s -- the host budget had no room for "
+                       "these reads (the earlier hold reads hold it); they stay parked in the settle "
+                       "and are re-read once it frees, never decided 'no writer' on a read that did "
+                       "not run", len(refused), [(str(r.rid)[:12], v) for r, v in refused])
     return out
+
+
+def note_hold_order(hold) -> None:
+    """#248e: every rid of the dormant hold, in hold order, to the keep order
+    (group D, the switch on; a no-op otherwise). Called right before each
+    :func:`issue_deferred_reads` (the release's and the F22 early one): the
+    hold order is also the order the kept pages leave the arena -- the L3
+    fills of this wake take the last-read rid's tail first, never the head
+    of an earlier read (``handoff_pending.victim_order``)."""
+    if not enabled() or not _group_d():
+        return
+    try:
+        from sglang.srt.weg2 import handoff_pending as _hp
+
+        _hp.note_read_order([str(getattr(r, "rid", "") or "") for r in (hold or ())])
+    except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
+        logger.warning("#248e hold order not noted", exc_info=True)
 
 
 def early_enabled() -> bool:
@@ -204,6 +399,7 @@ def issue_reads_at_wake_begin(sched) -> list:
     hold = getattr(sched, "weg2_dormant_hold", None) or []
     if not hold:
         return []
+    note_hold_order(hold)
     out = issue_deferred_reads(sched, hold)
     if out:
         logger.info("#248 WAKE-READ-EARLY issued=%d at the weight legs' start (F22: the read runs "

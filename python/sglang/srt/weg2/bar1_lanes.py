@@ -72,9 +72,11 @@ ENV_SMALL_BAR_GROUPS = "SGLANG_WEG2_BAR1_SMALL_BAR_GROUPS"
 ENV_CYCLE_GRACE_S = "SGLANG_WEG2_BAR1_CYCLE_GRACE_S"
 SLOW_WAIT_S = 0.5     # a credit wait longer than this posts a `blocked` flag
 #: W109b (rc12z4 flip 22): how often a blocked depositor asks whether its wait
-#: closes a credit cycle, and the edge age it acts at -- a third of the
-#: waker's W109 grace, so the sleeper spills before the waker would refuse.
-SPILL_TICK_S = 0.5
+#: closes a credit cycle. The edge age it acts at is ``spill_grace_s()``.
+#: 0.5 -> 0.1 s on 02.10. (NF y6u, see SGLANG_WEG2_BAR1_SPILL_GRACE_S): the
+#: question is two directory reads of the flag tree, the wait it rides on
+#: already polls every 20 us.
+SPILL_TICK_S = 0.1
 BIG_BAR_MIN = 4 << 30      # a BAR1 at least this large holds the big slot ring
 MODE_BAR1 = "bar1"
 MODE_HOST = "host"
@@ -372,18 +374,27 @@ class SocketCredits:
 
     def _read(self, n: int, timeout_s: float) -> Optional[bytes]:
         buf = b""
-        deadline = time.monotonic() + float(timeout_s)
-        k = 0
+        t_wait0 = time.monotonic()
+        deadline = t_wait0 + float(timeout_s)
+        slow_sent = False
+        # W109b (02.10., NF y6u): a depositor's wait asks its cycle question
+        # every SPILL_TICK_S -- with the old 0.5-s socket slice the metal path
+        # (credits=sock) asked only every 0.5 s whatever SPILL_TICK_S said.
+        # Waits without a tick question keep the 0.5-s slice.
+        slice_s = SPILL_TICK_S if self.on_tick is not None else 0.5
         while len(buf) < n:
             left = deadline - time.monotonic()
             if left <= 0:
                 return None
-            self.sock.settimeout(min(left, 0.5))
+            self.sock.settimeout(min(left, slice_s))
             try:
                 chunk = self.sock.recv(n - len(buf))
             except socket.timeout:
-                k += 1
-                if k == 1 and self.on_slow is not None:
+                # the `blocked` flag still goes up after SLOW_WAIT_S (0.5 s,
+                # the first 0.5-s slice before), not after the shorter slice
+                if (not slow_sent and self.on_slow is not None
+                        and time.monotonic() - t_wait0 >= SLOW_WAIT_S - 1e-3):
+                    slow_sent = True
                     self.on_slow()
                 # W109b: only between frames -- a half-read frame is never dropped
                 if not buf and self.on_tick is not None and self.on_tick():
@@ -420,6 +431,27 @@ COPY_SERIAL = "serial"
 #: The SM copy kernel (weg2/lane_sm_copy.py): each lane's stores go out on its
 #: own streams in parallel.
 COPY_SM = "sm"
+
+
+#: 01.10. (y6k legs): the collector's pipelining. LAG = it syncs and frees
+#: one batch behind like the depositor (ring >= 3); PREPLAN = its copy list
+#: and pointer probes are built for the whole tag before the first credit.
+ENV_COLLECT_LAG = "SGLANG_WEG2_BAR1_COLLECT_LAG"
+ENV_COLLECT_PREPLAN = "SGLANG_WEG2_BAR1_COLLECT_PREPLAN"
+_SEQ_MARK = "\x00seq\x00"
+
+
+def _env_on(name: str, env: Optional[_Map[str, str]] = None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(name, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def collect_lag_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_COLLECT_LAG, env)
+
+
+def collect_preplan_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_COLLECT_PREPLAN, env)
 
 
 def parallel_copy_on() -> bool:
@@ -517,6 +549,20 @@ def cycle_grace_s(env: Optional[_Map[str, str]] = None) -> float:
         return max(0.5, float(env.get(ENV_CYCLE_GRACE_S, "3")))
     except ValueError:
         return 3.0
+
+
+def spill_grace_s() -> float:
+    """W109b: the edge age at which a blocked depositor spills (its half of
+    the cycle). Its own knob since 02.10. (NF y6u): until then a third of the
+    waker's W109 grace (1.0 s at the default 3 s), which put 1.6-1.9 s of
+    deposit stall on every cycled D->P wake. Never above the old value, never
+    below 0.05 s (flag-read skew between the two groups' processes)."""
+    from sglang.srt.environ import envs
+    try:
+        g = float(envs.SGLANG_WEG2_BAR1_SPILL_GRACE_S.get())
+    except (TypeError, ValueError):
+        g = 0.1
+    return min(max(0.5, cycle_grace_s() / 3.0), max(0.05, g))
 
 
 def credit_cycle(me: int, waits: dict, blocked: dict, grace_s: float, now: float):
@@ -760,9 +806,10 @@ class Bar1Lanes:
         """The waker credit cycle one of whose edges is THIS rank's blocked
         deposit, or None. Read from the depositor's side: the wakers are the
         other group, the blocked flags are the ones this group posted into
-        it. ``grace_s`` defaults to a third of the waker's W109 grace -- the
-        sleeper has to act (``_spill_rest``) before the waker refuses."""
-        g = (max(0.5, cycle_grace_s() / 3.0) if grace_s is None else float(grace_s))
+        it. ``grace_s`` defaults to :func:`spill_grace_s` -- the sleeper has
+        to act (``_spill_rest``) long before the waker refuses, and the chain
+        cannot dissolve on its own, so it acts as soon as the flags agree."""
+        g = spill_grace_s() if grace_s is None else float(grace_s)
         other = other_group(self.group)
         waits = self.read_credit_waits(other)
         blocked = self.read_blocked(other)
@@ -1414,11 +1461,25 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={seq} bytes={total} "
         f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring} credits={via}")
     nb = len(batches)
-    lag = (1 if role == "src" else 0) if int(ring) >= 3 else 0
+    # 01.10. (y6k, credit_ms 50 % of the P->D deposit time): the collector now
+    # syncs one behind as well. Safe for ring >= 3: a depositor at batch h waits
+    # free(h - ring) <= h - 3, and a collector at full(h - 2) has freed h - 3.
+    lag = (1 if (role == "src" or collect_lag_on()) else 0) if int(ring) >= 3 else 0
     from sglang.srt.weg2 import weight_exchange_transport as tp
 
     probe = tp.dst_pointer_probe(ops) if role == "dst" else None
     probed: set = set()
+    # 01.10.: the collector's per-piece work (no-write filter, the x33 pointer
+    # probe, the address arithmetic) is done for the whole tag here, before the
+    # plan arrives -- measured issue_ms up to 140 ms of a 151-ms collect
+    # (TP0 p4 11-weights_14) while its depositor sat 598 ms in credit_ms.
+    pre = None
+    pre_why = ""
+    prep_s = 0.0
+    if role == "dst" and collect_preplan_on():
+        tp0 = time.perf_counter()
+        pre, pre_why = _collect_plan(batches, descs, _nw, probe, probed, lane_key, tp)
+        prep_s = time.perf_counter() - tp0
     plan = [[[str(getattr(descs[pc.desc_index], "param_name", "?")),
               str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
              for pc in b.pieces] for b in batches]
@@ -1600,6 +1661,20 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             if got is None:
                 return (f"bar1 collect lane={lane_key} seq={seq}: no 'full' for batch {g} "
                         f"within {budget_s:.0f} s (depositor gone or stuck)")
+            if pre is not None:
+                for kind, dst, soff, a, b, c in pre[g]:
+                    if kind == tp.FLAT:
+                        ops.memcpy_async(dst, sbase + soff, a, stream)
+                    else:
+                        ops.memcpy2d_async(dst, a, sbase + soff, b, b, c, stream)
+                clk.issue += time.perf_counter() - ti
+                if pre_why and g == len(pre) - 1:
+                    # the refused piece's batch: everything before it is out,
+                    # the refused destination never touched (fnFL2x33)
+                    return pre_why.replace(_SEQ_MARK, str(seq))
+                if g >= lag:
+                    _finish(g - lag)
+                continue
             for piece in batch.pieces:
                 desc = descs[piece.desc_index]
                 name = str(getattr(desc, "param_name", "?"))
@@ -1678,5 +1753,42 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"batches={nb} bytes={total} total_ms={total_s * 1000:.0f} "
         f"wait_ms={clk.credit * 1000:.0f} copy_sync_ms={clk.sync * 1000:.0f} "
         f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
-        f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f}")
+        f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
+        f"lag={lag} prep_ms={prep_s * 1000:.0f}")
     return ""
+
+
+def _collect_plan(batches, descs, no_write, probe, probed, lane_key, tp):
+    """The collector's copy list for the whole tag, built before its first
+    credit: per batch ``(kind, dst, slot_off, a, b, c)`` -- FLAT: a = nbytes;
+    STRIDED2D: a = dpitch, b = run_bytes, c = rows. No-write units are
+    dropped, every destination is probed once (fnFL2x33). Returns
+    (plan, "") or, on a refused piece, (plan cut AT that piece, refusal):
+    the last row holds the pieces of its batch before it, so the collector
+    copies exactly what the per-piece path copied and then refuses. The
+    refusal carries ``_SEQ_MARK`` for the caller's seq."""
+    out = []
+    for g, batch in enumerate(batches):
+        row = []
+        out.append(row)
+        for piece in batch.pieces:
+            desc = descs[piece.desc_index]
+            name = str(getattr(desc, "param_name", "?"))
+            tag = str(getattr(desc, "tag", "") or "")
+            if (tag, name) in no_write or name in no_write:
+                continue
+            if desc.dst_ptr is None:
+                return out, (f"bar1 collect lane={lane_key} batch {g}: desc {name!r} "
+                             f"carries no dst_ptr")
+            _why = tp.refuse_unmapped_dst(probe, probed, dst=int(desc.dst_ptr),
+                                          lane_key=lane_key, i=piece.desc_index,
+                                          name=name, tag=tag)
+            if _why:
+                return out, f"bar1 seq={_SEQ_MARK} batch {g}: {_why}"
+            dst = int(desc.dst_ptr) + int(piece.dst_off)
+            if piece.kind == tp.FLAT:
+                row.append((tp.FLAT, dst, int(piece.slot_off), int(piece.nbytes), 0, 0))
+            else:
+                row.append((piece.kind, dst, int(piece.slot_off), int(piece.dpitch),
+                            int(piece.run_bytes), int(piece.rows)))
+    return out, ""

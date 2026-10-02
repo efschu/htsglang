@@ -11,14 +11,17 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import json
+import re
 import unittest
 import uuid
 from http import HTTPStatus
+from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
 
+from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
@@ -33,6 +36,9 @@ from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+# Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
+_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32")
 
 
 class _MockTokenizerManager:
@@ -1272,6 +1278,60 @@ class ServingChatTestCase(unittest.TestCase):
         tm.tokenizer.chat_template = None
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
+
+    def test_custom_encoders_own_reasoning_history(self):
+        """Every custom encoding spec takes reasoning history natively.
+
+        The alternative splices a detector's markers into content, which an
+        encoder that frames its own channels turns into visible raw markers.
+        A new spec must not silently default to that path.
+        """
+        for spec in _ALL_CHAT_ENCODING_SPECS:
+            with self.subTest(chat_encoding_spec=spec):
+                self.chat.chat_encoding_spec = spec
+                self.assertTrue(self.chat.supports_native_reasoning_history())
+
+        # The HF chat-template path keeps the wrap-into-content behaviour.
+        self.chat.chat_encoding_spec = None
+        self.assertFalse(self.chat.supports_native_reasoning_history())
+
+    def test_hf_template_rendering_reasoning_content_owns_history(self):
+        """Fork: an HF template that renders ``reasoning_content`` takes the
+        Anthropic thinking history natively, so /v1/messages hands it the same
+        messages as /v1/chat/completions; any other template keeps the wrap."""
+        self.chat.chat_encoding_spec = None
+        tok = self.chat.tokenizer_manager.tokenizer
+        saved = tok.chat_template
+        try:
+            tok.chat_template = (
+                "{% for m in messages %}{{ m.reasoning_content }}{% endfor %}"
+            )
+            self.assertTrue(self.chat.supports_native_reasoning_history())
+            tok.chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}"
+            self.assertFalse(self.chat.supports_native_reasoning_history())
+            tok.chat_template = None
+            self.assertFalse(self.chat.supports_native_reasoning_history())
+        finally:
+            tok.chat_template = saved
+
+    def test_template_owns_reasoning_history_named_templates(self):
+        f = chat_encoding.template_owns_reasoning_history
+        self.assertTrue(f({"default": "x reasoning_content", "tool_use": "reasoning_content"}))
+        self.assertFalse(f({"default": "x reasoning_content", "tool_use": "content"}))
+        self.assertFalse(f({}))
+        self.assertFalse(f(Mock()))
+
+    def test_all_chat_encoding_specs_are_enumerated(self):
+        """Guard the spec list this file asserts capabilities over."""
+        source = Path(chat_encoding.__file__).read_text()
+        returned = set(
+            re.findall(
+                r'^\s+return "(\w+)"$',
+                source[source.index("def resolve_chat_encoding_spec") :],
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
 
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):

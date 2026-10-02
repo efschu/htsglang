@@ -269,8 +269,10 @@ class TheWiring(unittest.TestCase):
     def test_the_eager_path_never_waits_and_the_leg_copies_nothing(self):
         import inspect
 
-        eager = inspect.getsource(eo.MoEExpertOffloadCache.run_eager_pool)
-        self.assertIn("resume_warm().eager_reached(self)", eager)
+        # both eager routes (host plan and the D-Mini-Extend device step)
+        for path in ("_run_eager_host_plan", "_run_eager_device_step"):
+            eager = inspect.getsource(getattr(eo.MoEExpertOffloadCache, path))
+            self.assertIn("resume_warm().eager_reached(self)", eager, path)
         from sglang.srt.managers.scheduler_components import weight_updater as wu
 
         rel = inspect.getsource(wu.SchedulerWeightUpdaterManager.release_memory_occupation)

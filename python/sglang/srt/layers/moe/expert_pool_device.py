@@ -368,8 +368,21 @@ def apply_row_moves(tables: PoolTables, moves: Sequence[Tuple[int, int]]) -> Non
             pf[int(d)] = -1
 
 
+def departed_experts(row_key: Sequence[int], row_use: Sequence[int],
+                     hot_after: Sequence[int], *, num_experts: int) -> List[int]:
+    """KV-STAGE warm refill (01.10.): the experts a seat-row shrink sent back
+    to the store -- they owned a row before (``row_key``/``row_use`` taken
+    BEFORE the shrink) and own none after (``hot_after`` -1) -- hottest first
+    (``row_use`` desc). Pure; the grow that follows hands them their rows
+    back before the next miss asks for them."""
+    E = int(num_experts)
+    gone = [(int(u), int(e)) for e, u in zip(row_key, row_use)
+            if 0 <= int(e) < E and int(hot_after[int(e)]) < 0]
+    return [e for _u, e in sorted(gone, key=lambda p: -p[0])]
+
+
 def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,
-                     move_rows=None) -> int:
+                     move_rows=None, departed_out: Optional[List[int]] = None) -> int:
     """H95c: turn the first ``k`` seat rows ON (ordinary free LRU rows) and
     the rest OFF. ``device_write=False`` only records k on the host (the next
     :func:`reinit_pool_tables` -- the wake's rearm -- writes the layout);
@@ -393,6 +406,10 @@ def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,
         tables.pf_row[lo:hi].fill_(-1)
         return old
     lo, hi = base + k, base + old
+    if departed_out is not None:
+        lru = int(tables.lru_start)
+        keys_before = tables.row_key[lru:].cpu().tolist()
+        uses_before = tables.row_use[lru:].cpu().tolist()
     if move_rows is not None:
         # D-MEM-SCHED: the coldest content goes OFF, not the tail's
         moves = coldest_first_moves(
@@ -409,6 +426,9 @@ def set_seat_rows_on(tables: PoolTables, k: int, *, device_write: bool = True,
         if 0 <= e < E and int(hot[e]) == lo + i:
             hot[e] = -1
     tables.hot_phys.copy_(hot.to(tables.hot_phys.device))
+    if departed_out is not None:
+        departed_out.extend(departed_experts(keys_before, uses_before, hot.tolist(),
+                                             num_experts=E))
     tables.row_key[lo:hi].fill_(SEAT_OFF_KEY)
     tables.row_use[lo:hi].fill_(ROW_USE_NEVER)
     tables.pf_row[lo:hi].fill_(-1)
@@ -513,6 +533,11 @@ class PoolLayout:
     host_row: Any
     row_key: Any
     row_use: Any
+    # H95c: the seat rows ON when the layout was BUILT (None: no seat rows).
+    # :func:`apply_pool_layout` writes the seat block from the LIVE count, so
+    # a layout that waited (H31b) cannot turn back on a row a live shrink
+    # switched off in between.
+    seat_on: Optional[int] = None
 
 
 def pool_layout_tensors(tables: PoolTables, hot_slot_of: Dict[int, int],
@@ -543,12 +568,40 @@ def pool_layout_tensors(tables: PoolTables, hot_slot_of: Dict[int, int],
     return PoolLayout(
         hot_phys=hot.to(dev),
         host_row=torch.tensor(list(host_row), dtype=torch.int32).to(dev),
-        row_key=key.to(dev), row_use=use.to(dev))
+        row_key=key.to(dev), row_use=use.to(dev),
+        seat_on=int(tables.seat_on) if tables.seat_rows else None)
+
+
+def _stamp_seat_block(tables: PoolTables) -> None:
+    """The seat block [seat_base, seat_base + X) from the LIVE ``seat_on``:
+    a row ON that a layout carries as OFF becomes free, every row OFF becomes
+    OFF (key/use/pf_row) and no expert points at it. Device ops only.
+
+    xid13 kvh 01.10. (D TP0 17:03:20Z): the H31b full layout was built at the
+    wake's rearm with 74 rows ON, a live KV-stage shrink switched rows 70..73
+    OFF (pages released), and the layout landed ~30 ms later and wrote those
+    four rows back as FREE. A free row is the step's first victim; ~100
+    rounds later the LRU reached row 70 and pool_copy stored into its
+    unmapped tail (Xid 13, MMU fault on a write)."""
+    if not tables.seat_rows:
+        return
+    base, X, k = int(tables.seat_base), int(tables.seat_rows), int(tables.seat_on)
+    on_key = tables.row_key[base:base + k]
+    stale = on_key == SEAT_OFF_KEY
+    tables.row_use[base:base + k].masked_fill_(stale, 0)
+    on_key.masked_fill_(stale, -1)
+    tables.row_key[base + k:base + X].fill_(SEAT_OFF_KEY)
+    tables.row_use[base + k:base + X].fill_(ROW_USE_NEVER)
+    tables.pf_row[base + k:base + X].fill_(-1)
+    hot = tables.hot_phys
+    hot.masked_fill_((hot >= base + k) & (hot < base + X), -1)
 
 
 def apply_pool_layout(tables: PoolTables, layout: PoolLayout) -> None:
     """Write ``layout`` into the tables IN PLACE and reset every counter --
-    device ops only, stream-ordered on the current stream."""
+    device ops only, stream-ordered on the current stream. The seat block
+    follows the live ``seat_on``, not the one the layout was built at
+    (:func:`_stamp_seat_block`)."""
     import torch
 
     dev = tables.hot_phys.device
@@ -556,6 +609,7 @@ def apply_pool_layout(tables: PoolTables, layout: PoolLayout) -> None:
     tables.host_row.copy_(layout.host_row)
     tables.row_key.copy_(layout.row_key)
     tables.row_use.copy_(layout.row_use)
+    _stamp_seat_block(tables)
     tables.clock.fill_(0)
     tables.gate.fill_(1)
     tables.error.fill_(0)
@@ -592,6 +646,37 @@ class SyncReport(msgspec.Struct, frozen=True):
 
     owned: int
     twins_freed: int
+
+
+class PoolRowKeyOutOfRange(RuntimeError):
+    """W-POOL-KEY: a row the eager sync would treat as an expert's holds a key
+    outside [-1, E) and is no OFF seat row."""
+
+
+def _check_row_keys(key, lo: int, rows: int, E: int, off, lru_holds, skip=None) -> None:
+    """y4u (D TP1 15:18:30Z): ``hot[old]`` with old = SEAT_OFF_KEY outside the
+    OFF seat block -- a row RW-FINISH had reserved for an in-flight warm copy
+    (``reserve_warm_rows``) and the eager pass then wrote -- raised a bare
+    IndexError. The eager sync may only take rows whose key is free (-1) or an
+    expert; any other key outside the OFF seat rows stops by name, with the
+    row, the key and whether the eager pass wrote it. ``skip(r)``: a row the
+    sync leaves as it is (keep: an unwritten row keeps its reservation)."""
+    for r in range(lo, rows):
+        if off is not None and off[0] <= r < off[1]:
+            continue
+        if skip is not None and skip(r):
+            continue
+        k = int(key[r])
+        if -1 <= k < E:
+            continue
+        raise PoolRowKeyOutOfRange(
+            "W-POOL-KEY: row %d holds key %d outside [-1, %d) and is no OFF seat row%s -- %s; "
+            "the eager sync would read it as an expert (the tables are not moved)" % (
+                r, k, E, "" if off is None else " (OFF rows %d..%d)" % (off[0], off[1] - 1),
+                "the eager pass WROTE it (two writers on one bank row: an RW-FINISH warm copy "
+                "reserved it, SEAT_OFF_KEY)" if r in lru_holds and k == SEAT_OFF_KEY else
+                "a reservation (SEAT_OFF_KEY) the eager pass reached" if k == SEAT_OFF_KEY
+                else "an unknown writer"))
 
 
 def sync_tables(
@@ -638,6 +723,8 @@ def sync_tables(
     rows = int(key.shape[0])
     written = {r for r in lru_holds if lo <= r < rows}
     off = seat_off_range(tables)
+    _check_row_keys(key, lo, rows, E, off, lru_holds,
+                    skip=(lambda r: r < hi and r not in written) if keep_unwritten else None)
     for r in range(lo, rows):
         # staging rows are never owned; a written LRU row loses its old expert;
         # without keep every LRU row is cleared
@@ -731,6 +818,72 @@ def seed_lru_rows(tables: PoolTables, experts: Sequence[int],
         tables.row_key.copy_(key.to(dev))
         tables.row_use.copy_(use.to(dev))
     return pairs
+
+
+def plan_warm_rows(tables: PoolTables, experts: Sequence[int],
+                   limit: int = 0) -> List[Tuple[int, int, int]]:
+    """RW-FINISH (#287, 30.09.): ``seed_lru_rows``'s choice WITHOUT writing it:
+    ``(host_row, bank_row, expert)`` triples for FREE LRU rows, most wanted
+    first. Only rows below the seat block (H95c: a seat row may be switched
+    OFF -- unmapped -- inside the phase, so no copy may target it). Host reads
+    of the tables: call it where the device is idle (the RW tick's gate)."""
+    E, lo, hi = tables.num_experts, int(tables.lru_start), int(tables.pool_rows)
+    if tables.seat_rows:
+        hi = min(hi, int(tables.seat_base))
+    hot = tables.hot_phys.cpu()
+    key = tables.row_key.cpu()
+    host_row = tables.host_row.cpu()
+    free = [r for r in range(lo, hi) if int(key[r]) < 0]
+    out: List[Tuple[int, int, int]] = []
+    seen = set()
+    for e in experts:
+        e = int(e)
+        if limit > 0 and len(out) >= limit:
+            break
+        if not free:
+            break
+        if e in seen or not 0 <= e < E:
+            continue
+        seen.add(e)
+        if int(host_row[e]) < 0 or int(hot[e]) >= 0:
+            continue
+        out.append((int(host_row[e]), free.pop(0), e))
+    return out
+
+
+def reserve_warm_rows(tables: PoolTables, rows) -> None:
+    """RW-FINISH: the rows a warm copy targets become OFF rows until it lands
+    (``row_key`` = SEAT_OFF_KEY, ``row_use`` = NEVER: never free, never a
+    victim, never routed -- the H95c contract above). Device writes on the
+    current stream; no host read."""
+    tables.row_key.index_fill_(0, rows, SEAT_OFF_KEY)
+    tables.row_use.index_fill_(0, rows, ROW_USE_NEVER)
+
+
+def release_warm_rows(tables: PoolTables, rows) -> None:
+    """RW-FINISH: give reserved rows back as free rows (key -1, use 0 -- the
+    layout's free value). Device writes on the current stream."""
+    tables.row_key.index_fill_(0, rows, -1)
+    tables.row_use.index_fill_(0, rows, 0)
+
+
+def commit_warm_rows(tables: PoolTables, experts, rows) -> None:
+    """RW-FINISH: the landed rows become their experts' rows -- ON THE DEVICE,
+    no host read. An expert that a step made hot elsewhere meanwhile keeps its
+    row; the warm row is freed (the bijection ``row_key[r] == e`` iff
+    ``hot_phys[e] == r`` holds either way). The clock is the device clock."""
+    import torch
+
+    hot = tables.hot_phys
+    cur = hot.index_select(0, experts)
+    ok = cur < 0
+    hot.index_copy_(0, experts, torch.where(ok, rows.to(hot.dtype), cur))
+    key = tables.row_key
+    new_key = torch.where(ok, experts.to(key.dtype), torch.full_like(experts, -1).to(key.dtype))
+    key.index_copy_(0, rows, new_key)
+    use = tables.row_use
+    clk = tables.clock.reshape(-1)[:1].to(use.dtype).expand(rows.numel())
+    use.index_copy_(0, rows, torch.where(ok, clk, torch.zeros_like(clk)))
 
 
 def bijection_breaks(tables: PoolTables) -> int:

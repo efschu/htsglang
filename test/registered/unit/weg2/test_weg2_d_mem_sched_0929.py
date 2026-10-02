@@ -272,7 +272,9 @@ def test_tick_grows_the_stage_for_the_queue_head(tick_env):
     assert st.changed and st.stage > 0
     phase = getattr(sched, dsv.PHASE_ATTR)
     assert phase.stage == st.stage and phase.stage_tokens == grid[st.stage]
-    assert caps == [grid[st.stage]] and votes == []    # growth asks no collective
+    # growth asks no floor collective; the one vote is the reserve agreement
+    # over the queued head (y6h 10011531, rank-local new_token_ratio)
+    assert caps == [grid[st.stage]] and [len(v) for v in votes] == [1] and votes[0][0] < 0
 
 
 def test_tick_shrinks_in_the_next_round_after_a_finish(tick_env):
@@ -334,7 +336,12 @@ def test_the_scheduler_runs_the_tick_after_the_ack_flush():
     from sglang.srt.managers import scheduler
 
     src = inspect.getsource(scheduler.Scheduler.get_next_batch_to_run)
-    assert src.index("flush_write_through_acks()") < src.index("_weg2_d_seat_vram.runtime_tick(self)")
+    # 30.09. D-SEAT-REWAKE: the stage tick runs inside the ONE round-boundary
+    # step (the seat re-plan first, the stage tick when the seats did not move)
+    assert src.index("flush_write_through_acks()") < src.index("_weg2_d_seat_rewake.round_boundary(self)")
+    from sglang.srt.weg2 import d_seat_rewake
+
+    assert "V.runtime_tick(sched)" in inspect.getsource(d_seat_rewake.round_boundary)
 
 
 # --- 27B conditions to f499865784 --------------------------------------------------

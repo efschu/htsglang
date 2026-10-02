@@ -110,7 +110,10 @@ class TestLiveCensus(CustomTestCase):
             "/proc/11/comm": "sglang::schedul\n", "/proc/11/cmdline": "sglang::scheduler_TP0",
             "/proc/11/smaps_rollup": "Pss_Anon:     2097152 kB\n", "/proc/11/smaps": SMAPS,
         }
-        c = hc.sample_live(store_dir="/mnt/nf-experts/fnFL2", reader=lambda p: files[p])
+        # 30.09. CENSUS-KLASSE: the tmpfs walk sees an empty tree here (the
+        # store file is not on this box: it falls back to its mapping's Pss)
+        with mock.patch("os.walk", lambda root: iter(())):
+            c = hc.sample_live(store_dir="/mnt/nf-experts/fnFL2", reader=lambda p: files[p])
         self.assertAlmostEqual(c["roles_anon_gib"]["front"], 1.0, places=3)
         self.assertAlmostEqual(c["roles_anon_gib"]["rank"], 2.0, places=3)
         self.assertAlmostEqual(c["shm_classes_gib"]["store"], 349525 / 1048576, places=3)

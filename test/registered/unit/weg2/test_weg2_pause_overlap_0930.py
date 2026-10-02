@@ -43,9 +43,11 @@ MIB = 1 << 20
 
 # ---- (2) the overlap rule --------------------------------------------------------
 
-def test_switch_default_on_and_groups():  # release 01.10.: default ON
+def test_switch_default_on_after_metal_and_groups():
+    # y4k + y4l metal: on by default; "off" stays an env value
     assert envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.get() is True
     assert envs.SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS.get() == "D"
+    assert po.overlap_on("D") is True
     with envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.override(False):
         assert po.overlap_on("D") is False
     with envs.SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP.override(True):
@@ -319,10 +321,7 @@ def test_the_sleep_loop_is_wired():
     assert "self._weg2_pause_overlap_scope(recv_req, weights_tags, _h111b) as _po:" in body
     # the join before the deposit, the pause+credit order inside the step
     assert body.index("_po.before_deposit(tag)") < body.index("_t_dep0 = time.perf_counter()")
-    # 27B port (30.09.): the 27B tree has no TAG-STALL-SENTINEL (NF y3z), so the
-    # step ends at the submit instead of at _tag_stall.disarm.
-    _end = body.index("_po.submit(tag, _weg2_pause_step)")
-    step = body[body.index("def _weg2_pause_step("):body.index("\n", _end + 40) + 1]
+    step = body[body.index("def _weg2_pause_step("):body.index("_tag_stall.disarm(_stall)")]
     assert step.index("self.memory_saver_adapter.pause(tag)") < step.index("credit.publish(tag")
     assert "self._weg2_pause_sub_line(tag, weg2_per_tag[tag][1])" in step
     assert "if _po is None:\n                        _t_prev_end = _weg2_pause_step()" in step
@@ -350,8 +349,7 @@ def test_pause_sub_line(caplog):
 # ---- (3) the reader's what-if --------------------------------------------------------
 
 def test_reader_what_if_pause_overlap():
-    # 27B port: dp_stage_legs is NF's D->P leg reader (bcb4180cd8), not on the 27B line.
-    dsl = pytest.importorskip("sglang.srt.weg2.tools.dp_stage_legs")
+    from sglang.srt.weg2.tools import dp_stage_legs as dsl
 
     T0 = 1000.0
     order = ("a", "b", "c")

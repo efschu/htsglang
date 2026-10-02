@@ -396,6 +396,27 @@ class MambaSlotAllocator:
         self._split_phase_withheld(self.free_slots)
         return True
 
+    def claim_free_slots(self, ids: torch.Tensor) -> bool:
+        """D-SEAT-REWAKE COMPACT (weg2/d_seat_compact.py): take exactly these
+        FREE slots off the free list -- the destinations of a tree state's
+        move below the phase's limit. False, and nothing changed, when one of
+        them is in use or not on the free list (withheld, or not free)."""
+        if ids.numel() == 0:
+            return True
+        self._drain_double_free_checks(wait=True)
+        ids = ids.to(device=self.free_slots.device, dtype=torch.int64).reshape(-1)
+        if int(ids.unique().numel()) != int(ids.numel()):
+            return False
+        if bool(self.slot_used[ids].any()):
+            return False
+        on_list = torch.isin(self.free_slots, ids)
+        if int(on_list.sum()) != int(ids.numel()):
+            return False
+        self.free_slots = self.free_slots[~on_list]
+        self.slot_used.index_fill_(0, ids, True)
+        self._note_slot_event(ids, "ALLOC")
+        return True
+
     @property
     def phase_limit(self) -> Optional[int]:
         return getattr(self, "_phase_limit", None)

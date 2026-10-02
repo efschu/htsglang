@@ -174,6 +174,7 @@ def park_read_min_tokens(req) -> Optional[int]:
 #: read started, on ONE pass (weg2-126-148: no_progress_passes=1).
 READ_CYCLE_ATTRS = (
     "_weg2_store_delivered",
+    "_weg2_store_deliverable",
     "_weg2_best_delivered",
     "_weg2_progress_terms",
     "_weg2_no_progress_passes",

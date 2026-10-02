@@ -384,8 +384,75 @@ def search_order(order: Sequence[str], cards: Sequence[WakeCard], *,
     return cur + tail, run, moves
 
 
+def _greedy_order(order: Sequence[str], cards: Sequence[WakeCard], *,
+                  pinned_tail: Sequence[str] = PINNED_TAIL,
+                  **sim) -> Tuple[Optional[List[str]], Optional[WakeRun], str]:
+    """Der gierige Praefix-Bau von :func:`credit_order`: ``(ordnung, lauf, "")``
+    wenn die fertige Ordnung VOLL durchlaeuft, sonst ``(None, None, warum)``."""
+    order = list(order)
+    tail = [t for t in order if t in set(pinned_tail)]
+    prefix: List[str] = []
+    rest = [t for t in order if t not in set(pinned_tail)]
+    while rest:
+        pick = None
+        for cand in rest:
+            if simulate(prefix + [cand], cards, **sim).complete:
+                pick = cand
+                break
+        if pick is None:
+            return None, None, ("credit order: NO order funds the wake (stuck after %s of %d "
+                                "tags) -- given order kept" % (len(prefix), len(order)))
+        prefix.append(pick)
+        rest.remove(pick)
+    prefix += tail
+    full = simulate(prefix, cards, **sim)
+    if full.complete:
+        return prefix, full, ""
+    return None, None, ("credit order: the greedy order %s still ends in a cycle under "
+                        "run-ahead staging -- given order kept" % prefix)
+
+
+#: LEAST-DEFICIT (02.10., NF y6u D->P 2->3 / 4->5): the uniform free uplift
+#: per card, in MiB, at which :func:`least_deficit_order` asks again whether
+#: SOME order is funded. A question to the model, never a reservation: the
+#: uplift is not booked anywhere and the order is all that leaves.
+LEAST_DEFICIT_UPLIFT_MIB = (256, 512, 1024, 1536, 2048, 3072, 4096)
+
+
+def least_deficit_order(order: Sequence[str], cards: Sequence[WakeCard], *,
+                        pinned_tail: Sequence[str] = PINNED_TAIL,
+                        uplifts: Sequence[float] = LEAST_DEFICIT_UPLIFT_MIB,
+                        **sim) -> Optional[Tuple[List[str], float]]:
+    """Wenn KEINE Ordnung am gemessenen ``free`` traegt: die Ordnung, die mit
+    dem kleinsten gleichmaessigen Aufschlag je Karte traegt -- oder None.
+
+    y6u (01.10. 23:47:31Z, driver_free {0: 1281, 1: 2212, 2: 1269}): der
+    gierige Bau fand am gemessenen free nichts, die gegebene Ordnung blieb
+    stehen -- und lief auf dem Metall genau in ihren Zyklus (sleeper1
+    weights_15 -> waker2, sleeper2 weights_11 -> waker1; W109b-Spill nach
+    1,5-1,9 s Deposit-Stall). Das Modell ist dort pessimistisch (die
+    Tag-Tabelle des Planers kennt die Groesse der D-Tags vom Boot-Anfang,
+    nicht die gewachsene, siehe ``front_order``), also ist "keine traegt"
+    keine Aussage ueber das Metall -- wohl aber, WELCHE Ordnung dem Tragen am
+    naechsten ist: die gegebene erst ab +2048..3072 MiB, die umgestellte ab
+    +512. Diese Funktion gibt die Ordnung zurueck, die am frueheren Aufschlag
+    traegt; traegt die GEGEBENE an derselben Stufe, bleibt sie (die bewiesene
+    Form behaelt ihren Pfad), ebenso wenn bis zur letzten Stufe keine traegt.
+    Rueckgabe ``(ordnung, aufschlag_mib)``."""
+    order = list(order)
+    for up in uplifts:
+        lifted = [replace(wc, free_mib=float(wc.free_mib) + float(up)) for wc in cards]
+        if simulate(order, lifted, **sim).complete:
+            return None
+        found, _run, _why = _greedy_order(order, lifted, pinned_tail=pinned_tail, **sim)
+        if found is not None:
+            return (found, float(up)) if found != order else None
+    return None
+
+
 def credit_order(order: Sequence[str], cards: Sequence[WakeCard], *,
                  pinned_tail: Sequence[str] = PINNED_TAIL, search: bool = False,
+                 least_deficit: bool = False,
                  **sim) -> Tuple[List[str], WakeRun, str]:
     """Eine Ordnung, in der immer ein Waker Kredit hat -- oder die gegebene.
 
@@ -404,48 +471,44 @@ def credit_order(order: Sequence[str], cards: Sequence[WakeCard], *,
     Simulationen weiter; erst wenn auch die keine traegt, bleibt die gegebene
     stehen. Planer-Riegel (``verdict_lines``) und Front (``front_order``)
     rufen beide diese Funktion -- dieselbe Frage an beiden Seiten der Naht.
+
+    ``least_deficit`` (02.10., SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT, nur die
+    Front): traegt auch danach keine Ordnung, nicht die gegebene stehen
+    lassen, wenn :func:`least_deficit_order` eine findet, die dem Tragen
+    naeher ist. Der Lauf bleibt der am GEMESSENEN free (unvollstaendig, der
+    W126-Text der Front bleibt); der Riegel des Planers fragt ohne.
     """
     order = list(order)
     base = simulate(order, cards, **sim)
     if base.complete:
         return order, base, "credit order: the given order funds every wake step (unchanged)"
-    tail = [t for t in order if t in set(pinned_tail)]
-    prefix: List[str] = []
-    rest = [t for t in order if t not in set(pinned_tail)]
-    greedy_why = ""
-    while rest:
-        pick = None
-        for cand in rest:
-            if simulate(prefix + [cand], cards, **sim).complete:
-                pick = cand
-                break
-        if pick is None:
-            greedy_why = ("credit order: NO order funds the wake (stuck after %s of %d tags) -- "
-                          "given order kept" % (len(prefix), len(order)))
-            break
-        prefix.append(pick)
-        rest.remove(pick)
-    if not greedy_why:
-        prefix += tail
-        full = simulate(prefix, cards, **sim)
-        if full.complete:
-            return prefix, full, (
-                "credit order: the given order ends in a credit cycle %s; reordered so every "
-                "wake step is funded" % _chain_text(base.chain))
-        greedy_why = ("credit order: the greedy order %s still ends in a cycle under run-ahead "
-                      "staging -- given order kept" % prefix)
-    if not search:
-        return order, base, greedy_why
-    found, run, moved = search_order(order, cards, pinned_tail=pinned_tail, **sim)
-    if not run.complete:
-        return order, base, greedy_why.replace(
+    found, full, greedy_why = _greedy_order(order, cards, pinned_tail=pinned_tail, **sim)
+    if found is not None and full is not None:
+        return found, full, (
+            "credit order: the given order ends in a credit cycle %s; reordered so every "
+            "wake step is funded" % _chain_text(base.chain))
+    if search:
+        found, run, moved = search_order(order, cards, pinned_tail=pinned_tail, **sim)
+        if run.complete:
+            return found, run, (
+                "credit order: the given order ends in a credit cycle %s; the greedy prefix build "
+                "found none (prefixes know no sleeper run-ahead), the full-simulation search (H54) "
+                "funds every wake step after %d single-tag move(s)"
+                % (_chain_text(base.chain), moved))
+        greedy_why = greedy_why.replace(
             " -- given order kept",
             "; the full-simulation search (H54) found none either -- given order kept")
-    return found, run, (
-        "credit order: the given order ends in a credit cycle %s; the greedy prefix build "
-        "found none (prefixes know no sleeper run-ahead), the full-simulation search (H54) "
-        "funds every wake step after %d single-tag move(s)"
-        % (_chain_text(base.chain), moved))
+    if least_deficit:
+        ld = least_deficit_order(order, cards, pinned_tail=pinned_tail, **sim)
+        if ld is not None:
+            new, up = ld
+            return new, simulate(new, cards, **sim), greedy_why.replace(
+                " -- given order kept",
+                "; LEAST-DEFICIT: this order is funded from +%d MiB free per card on, the given "
+                "order (%s at the measured free) not at that uplift -- reordered instead of "
+                "keeping the given order (y6u: kept, it cycled and W109b spilled after 1.5-1.9 s)"
+                % (int(up), _chain_text(base.chain)))
+    return order, base, greedy_why
 
 
 def _chain_text(chain: Sequence[Tuple[int, int, str]]) -> str:
@@ -1003,7 +1066,8 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
 
 def front_order(pause_order: Sequence[str], plan_cards: Sequence[Mapping[str, object]], *,
                 free_mib: Mapping[int, float], floor_mib: Mapping[int, float],
-                double_staging: bool, search: bool = False) -> Tuple[List[str], str]:
+                double_staging: bool, search: bool = False,
+                least_deficit: bool = False) -> Tuple[List[str], str]:
     """Die Front: die Kredit-Ordnung fuer DIESEN Flip, gegen die live
     gemessenen ``free``/Floors und die Tag-Tabelle des Planers. ``search``:
     wie im Riegel (H54), die Suche ueber volle Simulationen nach dem gierigen
@@ -1029,7 +1093,7 @@ def front_order(pause_order: Sequence[str], plan_cards: Sequence[Mapping[str, ob
     if unknown:
         return list(pause_order), "credit order SKIPPED: tags %s not in the plan table" % unknown
     order, run, why = credit_order(pause_order, cards, double_staging=double_staging,
-                                   search=search)
+                                   search=search, least_deficit=least_deficit)
     by = {wc.card: wc for wc in cards}
     detail = " | ".join(card_line(by[cs.card], cs) for cs in run.cards)
     if not run.complete:

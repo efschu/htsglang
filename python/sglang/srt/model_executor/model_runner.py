@@ -5794,7 +5794,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             pp_proxy_tensors=pp_proxy_tensors,
                         )
                     return ModelRunnerOutput(logits_output=None, can_run_graph=True)
-                with self._decode_round_segment("decode", graphed=False):
+                # WI (NF y3u-y3z: "Prefill rank timing DISABLED ... drifted -9"
+                # on TP1/TP2 of every boot): the worker's eager prefill is
+                # bracketed by the per-rank prefill timer like the host's
+                # (the eager runner / PCG sites), so its line pairs 1:1.
+                rank_ctx = (
+                    self.prefill_rank_timer.wrap(metadata={"category": "extend"})
+                    if self.prefill_rank_timer
+                    and forward_batch.forward_mode.is_plain_prefill()
+                    else contextlib.nullcontext()
+                )
+                with self._decode_round_segment("decode", graphed=False), rank_ctx:
                     return self._forward_form_a_worker(forward_batch)
 
             mode_check = (

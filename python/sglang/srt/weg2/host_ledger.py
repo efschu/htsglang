@@ -1304,9 +1304,10 @@ def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "")
     The recorded mark (:data:`OBSERVED_REAP_NONRECLAIM_BYTES`, 95.90) is the
     CT999 HOST reap point: global OOM, ``memory.max`` reads ``max``. Inside a
     finite cgroup the kernel reclaims and then OOM-kills at ``memory.max``
-    first, so the mark is the smaller of the two -- 84.00 in the Docker form
-    (``--memory 84g``), where every run-peak verdict priced against 95.90
-    funded 11.90 GiB the cgroup never had.
+    first, so inside a finite cgroup the mark IS ``memory.max`` -- 84.00 in
+    the Docker form (``--memory 84g``), 105.00 under the user's 2026-10-01
+    order (``--memory 105g``). The 95.90 constant is the fallback for a run
+    without a finite cgroup ceiling only.
 
     ``ceiling_source`` is :func:`resolve_cg_ceiling`'s own label: its lxcfs
     ``MemTotal`` FALLBACK is not a ceiling (CT999, 118 GiB) and keeps the
@@ -1318,7 +1319,13 @@ def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "")
         return const
     if ceiling_source and not ceiling_source.startswith("cgroup memory.max"):
         return const
-    return min(const, float(ceiling_bytes) / GIB)
+    # 2026-10-01 ~10:20Z user order ("trage 105gb ein", Docker containers
+    # get 105 GB): a finite cgroup memory.max IS the operator's chosen bound,
+    # so the mark follows it. The CT999 constant (95.90) only applies when no
+    # finite cgroup ceiling exists; min(const, ceiling) let the old host mark
+    # bind below a raised container cap (y6f W21 x3: predicted 97.0, measured
+    # peaks that day 87-90 GiB).
+    return float(ceiling_bytes) / GIB
 
 
 #: 29.09.: the line that names a derived runtime latch.
@@ -1859,7 +1866,7 @@ def watermark_breach_verdict(
     but ``own_pids`` no longer participates in the arithmetic.
     """
     m = margin if margin is not None else resolve_margin()
-    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    w = watermark_gib if watermark_gib is not None else reap_mark_gib()
     # #1269 FIX 4: the RUNTIME bound, which carries no model-error term. This
     # call grades a MEASUREMENT; the residual reserves for how wrong a
     # PREDICTION can be, and the measurement has already realised that error.
@@ -3032,10 +3039,43 @@ def _shm_total_trim_gib(terms: Mapping[str, object], c: Mapping[str, object],
     claimed = (_t("cold_tier_shm_gib") + _t("arena_gib") + arena_excess + _t("l3_index_gib")
                + _t("seq_ring_gib") + _t("arena_sidecar_gib") + _t("arena_handoff_gib")
                + small_in_rest + unposted)
-    cap = (float(tot)
-           + max(0.0, _t("cold_tier_shm_gib") - float(c.get("shm_total_store_gib") or 0.0))
-           + max(0.0, _t("arena_gib") - float(c.get("shm_total_arena_gib") or 0.0)))
+    cap = _shm_claim_cap_gib(terms, c, arena_excess)
     return min(unposted, max(0.0, claimed - cap))
+
+
+def shm_rest_gib(c: Mapping[str, object]) -> Optional[float]:
+    """30.09. LEDGER-FIXPOINT: the measured shmem OUTSIDE the store and the
+    arena at one instant, GiB -- ``shm_rest_max_gib`` of the record (the max
+    of that difference over the samples), else the difference at the record's
+    peak-of-the-SUM instant (``shm_total_max - store@ - arena@``, the same
+    sample). None without a total."""
+    rest = c.get("shm_rest_max_gib")
+    if rest is not None:
+        return max(0.0, float(rest))
+    tot = c.get("shm_total_max_gib")
+    if tot is None:
+        return None
+    return max(0.0, float(tot) - float(c.get("shm_total_store_gib") or 0.0)
+               - float(c.get("shm_total_arena_gib") or 0.0))
+
+
+def _shm_claim_cap_gib(terms: Mapping[str, object], c: Mapping[str, object],
+                       arena_excess: float) -> float:
+    """30.09. LEDGER-FIXPOINT (y4m W87, 12:29Z/12:32Z): the shmem ceiling of
+    this arm's claim = what ONE measured instant held OUTSIDE the store and the
+    arena, plus THIS arm's own store and arena (price, plus the measured arena
+    excess). Before: the instant's whole total, plus the arm's store/arena only
+    where they EXCEEDED the instant's -- a smaller store was never credited, so
+    the record's all-time total (60.14 GiB at 08:34:06Z with a 43.96 GiB store)
+    was charged to y4m's 38.97 GiB store as 4.99 GiB of phantom ``unposted``
+    shmem (run peak 90.03 -> the cushion floor refused against a 90.44 bound).
+    Signed, the same checkpoint and form give the same charge whatever the
+    arm's store is: a fixpoint, not a ratchet."""
+    def _t(k: str) -> float:
+        return float(terms.get(k, 0.0) or 0.0)
+
+    rest = shm_rest_gib(c) or 0.0
+    return rest + _t("cold_tier_shm_gib") + _t("arena_gib") + float(arena_excess)
 
 
 def _charge_terms_priced(
@@ -6164,7 +6204,7 @@ def _advisory_line(arm: Arm, chosen: bool, watermark_gib: Optional[float] = None
     # 29.09.: the mark `choose` graded against (reap_mark_gib), not the CT999
     # constant -- the advisory must say ABOVE where the refusal does.
     if watermark_gib is None:
-        watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+        watermark_gib = reap_mark_gib()
     predicted = arm.predicted_run_peak_gib()
     subject = "this arm" if chosen else f"the most frugal arm (S={arm.s_gb} M={arm.m_mib})"
     if predicted is None:

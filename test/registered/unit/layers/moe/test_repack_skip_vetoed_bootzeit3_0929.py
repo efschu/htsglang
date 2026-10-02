@@ -35,8 +35,16 @@ def _window(lo, pad):
                       return_value=(lo, pad))
 
 
-def test_off_by_default_means_all_rows(monkeypatch):
+def test_on_by_default_release_without_instrument_profile(monkeypatch):
+    """30.09.: the switch reached the ranks only through the instrument profile,
+    so a release boot (HTSGLANG_INSTRUMENTS=0) silently repacked every row again."""
     monkeypatch.delenv("SGLANG_MOE_REPACK_SKIP_VETOED", raising=False)
+    with _window(6, True):
+        assert sa.repack_rows(_layer({8, 10, 11}), 7) == [0, 1, 2, 4]
+
+
+def test_off_means_all_rows(monkeypatch):
+    monkeypatch.setenv("SGLANG_MOE_REPACK_SKIP_VETOED", "0")
     with _window(6, True):
         assert sa.repack_rows(_layer({8, 10, 11}), 7) is None
 

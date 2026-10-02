@@ -36,6 +36,13 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.pool_host.arena_lane_dma import (
+    LaneDmaFailed,
+    lane_stage_pages,
+    load_owner_lanes,
+    owner_lane_geometry,
+)
 from sglang.srt.mem_cache.pool_host.base import NO_KV_RANK_TOKENS
 from sglang.srt.mem_cache.storage.file.hicache_arena import free_named
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -612,9 +619,30 @@ def _release_fresh(arena, slots, gens, site: str) -> None:
                 _RELEASE_N[1])
 
 
-_COMPLETE_LOST = {3: 0, 4: 0, 5: 0}  # arena_complete status -> slots lost, process-wide
+_COMPLETE_LOST = {3: 0, 4: 0, 5: 0, 6: 0}  # arena_complete status -> slots lost, process-wide
 _COMPLETE_LOST_CALLS = [0]
 _LOST_NAMES = {3: "recycled", 4: "not_claimed", 5: "overflow"}
+
+
+def _host_write_claim(arena, stems, totals):
+    """L3FILL-JOINED (30.09.): the direct host writes (write-through, park)
+    claim with the host-write role, so a JOIN names them; a fake arena
+    without the keyword claims as before."""
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ROLE_HOST_WRITE
+
+    try:
+        return arena.claim_slots(stems, totals, role=ROLE_HOST_WRITE)
+    except TypeError:
+        return arena.claim_slots(stems, totals)
+
+
+def _host_write_claim_np(arena, stems, totals):
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ROLE_HOST_WRITE
+
+    try:
+        return arena.claim_slots_np(stems, totals, role=ROLE_HOST_WRITE)
+    except TypeError:
+        return arena.claim_slots_np(stems, totals)
 
 
 def _note_complete_lost(st, slots, site: str) -> int:
@@ -640,10 +668,11 @@ def _note_complete_lost(st, slots, site: str) -> int:
     k = _COMPLETE_LOST_CALLS[0]
     if k <= 8 or (k & (k - 1)) == 0 or 5 in by:
         (logger.error if 5 in by else logger.warning)(
-            "#1427 ARENA-COMPLETE LOST site=%s recycled=%d not_claimed=%d overflow=%d slots=%s "
-            "calls=%d totals=recycled:%d,not_claimed:%d,overflow:%d",
-            site, by.get(3, 0), by.get(4, 0), by.get(5, 0), bad[:4], k,
-            _COMPLETE_LOST[3], _COMPLETE_LOST[4], _COMPLETE_LOST[5])
+            "#1427 ARENA-COMPLETE LOST site=%s recycled=%d not_claimed=%d overflow=%d "
+            "stale_reaped=%d slots=%s calls=%d "
+            "totals=recycled:%d,not_claimed:%d,overflow:%d,stale_reaped:%d",
+            site, by.get(3, 0), by.get(4, 0), by.get(5, 0), by.get(6, 0), bad[:4], k,
+            _COMPLETE_LOST[3], _COMPLETE_LOST[4], _COMPLETE_LOST[5], _COMPLETE_LOST[6])
     return len(bad)
 
 
@@ -1118,6 +1147,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # F22: (load key, leading rows the layer-0 whole-page load took) of the
         # owner load in flight -- layers 1.. gather only the rest
         self._owner_loaded: Optional[tuple] = None
+        # y6o (01.10.): set after a refused 2D copy -- the owner loadback takes
+        # whole pages from then on (named once in the log)
+        self._lane_dma_off = False
         self.arena_k_ptrs = None
         self.arena_v_ptrs = None
 
@@ -1328,6 +1360,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         except Exception as exc:  # noqa: BLE001 -- a warm-up never refuses a bind
             logger.info("#task3 arena load JIT warm-up skipped: %r", exc)
         self.arena = arena
+        if role == "kv":
+            _handoff_pending.bind_arena(self, arena)  # #248e: the clock evict finds the order
         self.arena_slots = A
         self._pending_mask = torch.zeros(int(A), dtype=torch.bool)
         self._pending_gen = torch.zeros(int(A), dtype=torch.int64)     # xsn359: generation per pending slot
@@ -1633,6 +1667,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             # pages) -- below the 2 x rows x cell device temporaries per layer
             # the gather it replaces allocated (TP1 kvdemand: 2 x 109 MB)
             B = max(16, B // 4)
+        if lanes is not None:
+            # y6o (01.10.): only the owned lanes cross the link
+            done = self._owner_lane_load(device_pool, slots, device_indices, lanes, B, mode)
+            if done >= n:
+                return
+            if done:
+                slots, device_indices = slots[done:], device_indices[done * int(lanes.numel()):]
+                n = int(slots.numel())
         m = int(lanes.numel()) if lanes is not None else _psz(self)
         _lanes_dev = lanes.to(device=dev, dtype=torch.int64) if lanes is not None else None
         H, D = int(self.head_num), int(self.head_dim)
@@ -1749,6 +1791,64 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             logger.info("WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d mode=%s%s (whole pages, layers split on device)",
                         n_log, n, n, B, n * pb, mode, _wall)
 
+    def _owner_lane_load(self, device_pool, slots, device_indices, lanes, B: int, mode) -> int:
+        """y6o (01.10.): the owner loadback of a Form-A worker with only its
+        owned lanes crossing the link (``arena_lane_dma``): one
+        cudaMemcpy2DAsync per run of consecutive slots into a compact stage of
+        the whole-page stage's bytes, then the per-layer lane scatter.
+
+        MEASURED (y6o, NF P->D): the whole-page form copied 3601 pages = 2.83
+        GB per worker after the wake although TP1 owns 40/64 and TP2 24/64
+        lanes; TP1 on the x4 link ~440 ms of DMA, TP0 waits on it in the first
+        collectives. Owned lanes only: TP1 1.77 GB, TP2 1.06 GB.
+
+        Returns the leading pages it loaded (all layers); 0 = none, the caller
+        loads whole pages. Only "dma" (registered arena); a layout or lane set
+        without the 2D-row form, the switch off, or a refused copy keep the
+        whole-page load -- the last for the rest of this pool's life."""
+        mode = mode or getattr(self, "_page_mode", None) or _arena_page_load_mode(self._page_bytes)
+        if mode != "dma" or self._lane_dma_off or not envs.SGLANG_WEG2_ARENA_OWNER_LANE_DMA.get():
+            return 0
+        H, D = int(self.head_num), int(self.head_dim)
+        geom = owner_lane_geometry(lanes=lanes, page_tokens=_psz(self), cell=H * D * self.dtype.itemsize,
+                                   k_offs_b=self._k_offs_b, v_offs_b=self._v_offs_b,
+                                   page_bytes=self._page_bytes)
+        if geom is None:
+            self._lane_dma_off = True
+            logger.warning("WEG2-ARENA-LANE-DMA off: lanes %s / page layout have no 2D-row form; "
+                           "whole pages from now on", lanes.tolist())
+            return 0
+        n = int(slots.numel())
+        _t0 = time.perf_counter()
+        try:
+            st = load_owner_lanes(page_view=self._page_view, piece_pages=self._dma_piece_pages,
+                                  slots=slots, device_indices=device_indices,
+                                  k_buffers=device_pool.k_buffer, v_buffers=device_pool.v_buffer,
+                                  geom=geom, stage_pages=lane_stage_pages(whole_stage_pages=B, geom=geom),
+                                  runs_of=page_dma_runs)
+        except LaneDmaFailed as exc:
+            self._lane_dma_off = True
+            logger.warning("WEG2-ARENA-LANE-DMA failed after %d of %d pages (%s); whole pages "
+                           "for the rest and from now on", exc.done, n, exc)
+            return exc.done
+        global _PAGE_LOAD_N
+        _PAGE_LOAD_N += 1
+        _timing = _arena_page_load_timing()
+        _wall = ""
+        if _timing and st.bytes and device_pool.k_buffer[0].device.type == "cuda":
+            torch.cuda.current_stream(device_pool.k_buffer[0].device).synchronize()
+            _ms = (time.perf_counter() - _t0) * 1000.0
+            _wall = f" wall_ms={_ms:.0f} GB/s={st.bytes / max(_ms, 1e-3) / 1e6:.2f}"
+        if _PAGE_LOAD_N <= 8 or _PAGE_LOAD_N % 64 == 0 or _timing:
+            logger.info(
+                "WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d mode=dma lane_dma=2d "
+                "owner_lanes=%d/%d whole_bytes=%d copies=%d kernels=%d blocks=%d width=%d spitch=%d "
+                "cpu_issue_ms=%.0f%s (owned lanes only, layers split on device)",
+                _PAGE_LOAD_N, n * geom.lanes_per_page, n, st.stage_pages, st.bytes,
+                geom.lanes_per_page, _psz(self), n * geom.page_bytes, st.copies, st.kernels,
+                st.blocks, geom.width, geom.spitch, st.cpu_ms, _wall)
+        return n
+
     def pin_slots(self, slots) -> int:
         """Register the slots' pages (contiguous runs in one call each) that
         are not registered yet in this process. Returns the number of slots
@@ -1863,7 +1963,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         pending state as mask/gen/fresh tensors, no per-slot Python."""
         import numpy as np
         arena = self.arena
-        slots, st, gens = arena.claim_slots_np(stems, totals)
+        slots, st, gens = _host_write_claim_np(arena, stems, totals)
         _cn = getattr(ArenaMHAHostPool, "_1427_claim_n", 0) + 1
         ArenaMHAHostPool._1427_claim_n = _cn
         if _cn <= 12 or _cn % 512 == 0:
@@ -1886,7 +1986,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 self._evict_for_claim(arena, int((st == 4).sum()),
                                       claim_stem=stems[0] if stems else None)
                 redo = np.nonzero(st == 4)[0]
-                s2, st2, g2 = arena.claim_slots_np([stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
+                s2, st2, g2 = _host_write_claim_np(arena, [stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
                 slots[redo] = s2; st[redo] = st2; gens[redo] = g2
                 if bool((st2 == 2).any()):
                     arena.ref_slots(s2[st2 == 2].tolist(), +1)
@@ -2079,6 +2179,18 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         need = int(need)
         if need <= 0:
             return 0
+        # OS (NF y3w, KV arena 6485 slots, complete 6472 at 01:38:21): orphan
+        # claims first -- CLAIMED slots no writer can still come to hold no
+        # page anybody can read, so they are the cheapest room there is (no
+        # I/O, nothing lost); before this the KV arena never reaped them
+        # (#231 ran for the mamba arena only) and a claim evicted kept pages
+        # while 753 orphans sat beside them. The mamba anchor arena keeps
+        # #231's order (its COMPLETE unreferenced slots first, the reap only
+        # for what they miss, below).
+        reaped0 = [] if getattr(self, "_weg2_reaps_orphan_claims", False) else _reap_orphan_claims(arena)
+        need -= len(reaped0)
+        if need <= 0:
+            return len(reaped0)
         try:
             keep = _handoff_pending.keep_for(self)
         except Exception:  # noqa: BLE001 - the order is an improvement, never a wall
@@ -2094,14 +2206,20 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 if len(cands) < need:
                     # (ii) #248: kept, WITH an L3 copy -- freed without I/O,
                     # the copy is the page (arena_fill_from_disk reads it back)
+                    # #248e: in hold order -- the rid read last first, each
+                    # chain from its tail, never the head of the next read
                     copied = _handoff_pending.copied_mask(self, keep)
                     if copied.any():
-                        mid = arena.evict_candidates(need - len(cands), keep_lo=keep.keys[~copied])
+                        mid = _handoff_pending.evict_ordered(arena, keep, need - len(cands),
+                                                             eligible=copied, site="claim_ii")
                         stages[1] = len(mid)
                         cands += list(mid)
                 if len(cands) < need:
-                    # (iii) kept, WITHOUT a copy: lost, by name
-                    last = arena.evict_candidates(need - len(cands))
+                    # (iii) kept, WITHOUT a copy: lost, by name -- in the same
+                    # order; the keep-less clock only for what the order misses
+                    last = _handoff_pending.evict_ordered(arena, keep, need - len(cands), site="claim_iii")
+                    if len(last) < need - len(cands):
+                        last = list(last) + list(arena.evict_candidates(need - len(cands) - len(last)))
                     if last:
                         stages[2] = len(last)
                         _handoff_pending.note_evicted(self, last, keep, need=need)
@@ -2130,7 +2248,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         stems.pop((c[1], c[2]), None)
         except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
             logger.warning("#1427 ARENA-DROP failed: %r", exc)
-            return 0
+            return len(reaped0)
         reaped = (_reap_orphan_claims(arena)
                   if len(cands) < need and getattr(self, "_weg2_reaps_orphan_claims", False) else [])
         k = getattr(ArenaMHAHostPool, "_1427_drop_n", 0) + 1
@@ -2163,7 +2281,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         l3_state[0], l3_state[1], l3_state[2],
                         ArenaMHAHostPool._257_written_to_l3,
                         ArenaMHAHostPool._257_dropped_without_l3)
-        return len(cands) + len(reaped)
+        return len(cands) + len(reaped) + len(reaped0)
 
     def _claim(self, stems):
         """Claim (or join, or find complete) one slot per stem. Returns the
@@ -2174,7 +2292,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         totals = [self._page_bytes] * len(stems)
         if self._pending_mask is not None:
             return self._claim_np(stems, totals)
-        got = arena.claim_slots(stems, totals)
+        got = _host_write_claim(arena, stems, totals)
         # xsn327: D's dormant re-reads never find P's pages -- name what P claims
         # (full stem incl. suffix) so the reader's stem can be compared by eye.
         _cn = getattr(ArenaMHAHostPool, "_1427_claim_n", 0) + 1
@@ -2195,7 +2313,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 self._evict_for_claim(arena, sum(1 for _, st, _ in got if st == 4),
                                       claim_stem=stems[0] if stems else None)
                 redo = [i for i, (_, st, _) in enumerate(got) if st == 4]
-                again = arena.claim_slots([stems[i] for i in redo], [self._page_bytes] * len(redo))
+                again = _host_write_claim(arena, [stems[i] for i in redo], [self._page_bytes] * len(redo))
                 for i, g in zip(redo, again):
                     got[i] = g
                 late = [g[0] for g in again if g[1] == 2]

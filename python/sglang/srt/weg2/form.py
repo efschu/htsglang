@@ -638,6 +638,22 @@ class ModelProfile:
     #: nextflash capacity (the launcher refuses bandwidth for NF).
     d_token_placement: str = "capacity"
     d_token_placement_formats: Tuple[str, ...] = ()
+    #: LEISTUNGSSCHALTER (user rule 29.09. ~10:15Z: proven on metal -> default
+    #: on in the code; "Profilzeile ist kein Ersatz"): per-GROUP rank switches
+    #: whose value differs between P and D, or that are sizes, with the value
+    #: the metal ran. The launcher writes each one into ``--env-p`` /
+    #: ``--env-d`` unless that group's env or the launcher's own environment
+    #: already states it (an explicit value always wins; launcher
+    #: ``apply_profile_group_switch_defaults``), so the D solve and the ranks
+    #: read ONE value -- the torch_cache_cap / H95 pattern. {} = none (the
+    #: qwen27b row: its groups stay byte-identical).
+    group_switch_defaults: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    #: #239 --d-kv-token-cut: the launcher's DEFAULT for an unset flag on this
+    #: row (launcher ``apply_profile_d_kv_token_cut_default``, applied before
+    #: the form is resolved, and only where the boot can run it: Form A worker
+    #: roles on D, no other --form-kv stated, a flip boot with a host tier).
+    #: ``off`` = the code default (qwen27b).
+    d_kv_token_cut: str = "off"
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -721,6 +737,57 @@ _NEXTFLASH_CONSTANTS: Dict[str, Measured] = _constants_from_records(PROFILE_NEXT
 
 #: the rig's checkpoint directory (the registry's checkpoint/draft paths)
 _MC = "/spinning/llm_stuff/club-3090/models-cache/"
+
+#: LEISTUNGSSCHALTER NF class (a) (user rule 29.09. ~10:15Z, inventory
+#: /spinning/gpu-arb/docs/LEISTUNGSSCHALTER-INVENTAR-0929.md "(a) belegt"):
+#: per group, the value the running NF profile (nf-h91-dpr-sa-vis-adopt-st-cut-
+#: vsync-odx-2b-swr-e2cut-z30y2-arr-wre-ta-dh-ml-ef-rwf-pfo-pw-hc-tse-srw-tsw-
+#: dres.env) gave each group -- the row :attr:`ModelProfile.group_switch_defaults`
+#: of nextflash. Every reader below is an NF-only path (QSA attention, PLE,
+#: Form A, expert offload, the MTP tail hand-off) or reached only through this
+#: row; the qwen27b row carries none.
+#:   P_TAIL_FOLD (H63/H63d) x177 burst 22.80 s (x176 27.01 s, -16 %), P only.
+#:   TAIL_KEEP_MIB 512 (H63b) x177, P+D (the inventory names 512 for nextflash).
+#:   PLE_STATE_HANDOFF (H63c) x177 digest P==D installed=yes, P+D.
+#:   QSA_FP8_DECODE=ptx + QSA_ROWS_FUSED_EAGER (H65) x170 bit-identical, P 97k
+#:     25.37 s (x169 27.14 s), P only (as the arm ran).
+#:   FORCE_QSA_ROWS_CONFIG inf=64/8/2 (H65) x170 P only. D's arm line
+#:     (sm120:32=32/8/2,...,inf=64/8/2) IS the built-in sm120 table
+#:     (sparse_attn._SM120_ROWS_CONFIGS, H101) -- not repeated here.
+#:   PLE_STAGE_AUTONOMOUS/_BEHIND_REPLAY/_BONUS_EARLY + PLE decode pread
+#:     PROCS/THREADS 8 (H73) x176 code 121.6/130.1 tok/s (x172 104.5/114.6), D.
+#:   FORM_A_PLE_FULL_VOCAB (H69b) x172 PLE hit 2048/2048 (correctness), D.
+#:   UNEVEN_MOE_EXPERT_SHARD -- the NF form (F2, uneven experts), P+D.
+#:   HC_MIXER_INT8 (#46) census fn7l 1.19 GiB BF16 mixer per rank -> INT8, P+D.
+#:   WEIGHT_LOADER_COALESCE_MIB 32 z30o3 boot 280 s (z30n 300 s), P+D (only
+#:     the pread stream reads it).
+#:   D_PARK_END (F4) z30w-park flip time median 7.06 -> 5.13 s, D.
+#:   CUT_WORKER_END (F4b) z30u part A 2.01 s under the cut, D.
+_NF_LS_BOTH: Dict[str, str] = {
+    "SGLANG_WEG2_TAIL_KEEP_MIB": "512",
+    "SGLANG_WEG2_PLE_STATE_HANDOFF": "1",
+    "SGLANG_UNEVEN_MOE_EXPERT_SHARD": "1",
+    "SGLANG_HC_MIXER_INT8": "1",
+    "SGLANG_WEIGHT_LOADER_COALESCE_MIB": "32",
+}
+NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
+    "P": dict(_NF_LS_BOTH, **{
+        "SGLANG_WEG2_ENABLE_P_TAIL_FOLD": "1",
+        "SGLANG_FORCE_QSA_ROWS_CONFIG": "inf=64/8/2",
+        "SGLANG_WEG2_QSA_FP8_DECODE": "ptx",
+        "SGLANG_WEG2_QSA_ROWS_FUSED_EAGER": "1",
+    }),
+    "D": dict(_NF_LS_BOTH, **{
+        "SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB": "1",
+        "SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY": "1",
+        "SGLANG_WEG2_PLE_STAGE_AUTONOMOUS": "1",
+        "SGLANG_WEG2_PLE_STAGE_BONUS_EARLY": "1",
+        "SGLANG_QWEN4_PLE_DECODE_PREAD_PROCS": "8",
+        "SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS": "8",
+        "SGLANG_WEG2_ENABLE_CUT_WORKER_END": "1",
+        "SGLANG_WEG2_ENABLE_D_PARK_END": "1",
+    }),
+}
 
 
 PROFILES: Dict[str, ModelProfile] = {
@@ -955,9 +1022,17 @@ PROFILES: Dict[str, ModelProfile] = {
         # NF P49: off until the NF seat releases #49 with a boot tag
         agent_span=False,
         standard_form=True,
-        # RG 26.09.: off until the NF seat releases them with a boot tag (the
-        # NF group env stays byte-identical).
-        inline_system_in_place=False,
+        # NF-MZ (29.09., y3m boot ...dauer09292136, 375f44975e): released.
+        # Claude Code 2.1.280 sends role:"system" (api_system) messages
+        # mid-conversation -- mcp_instructions_delta + auto_mode arrive once
+        # the MCP servers are connected, i.e. right before turn 2. Hoisted
+        # into the head system turn they re-render every token behind the
+        # system text: SESSION-PREFIX weg2-2-8 common=3844 of 14970 and
+        # weg2-2-9 common=3861 of 18699 (= the head segment minus
+        # "<|im_end|>\n"; X-EXACT reused=11124/14836 = every later segment
+        # byte-equal), P cached 0 on both. Rendered in place, turn N stays a
+        # token prefix of turn N+1. P, D and the front take the row alike.
+        inline_system_in_place=True,
         # NF-TK (HS 27.09., NF rc12t 09271756: 0 of 41 P legs cached -- every
         # P read with loaded>0 was clamped to told=0 by "#1416 STORE-TOLD
         # ANCHOR-CLAMP ... anchored=0", because with TK off the clamp hashed
@@ -1008,6 +1083,13 @@ PROFILES: Dict[str, ModelProfile] = {
         front_exact_tokens=True,
         # rc12b OOM: the D budget books the driver carve (NF seat, 27.09.).
         budget_charges_driver_carve=True,
+        # LEISTUNGSSCHALTER NF (a) (LEISTUNGSSCHALTER-INVENTAR-0929.md): the
+        # values of the running profile nf-h91-...-tsw-dres (NF_ENV_P_FORM /
+        # NF_ENV_D_FORM / NF_ENV_D, _form), per group as they ran.
+        group_switch_defaults=NEXTFLASH_GROUP_SWITCH_DEFAULTS,
+        # #239 uneven-DCP-KV (user 28.09.: release feature): z30m-z30w and
+        # every NF flip boot since run --d-kv-token-cut owned (z30w 112 flips).
+        d_kv_token_cut="owned",
     ),
 }
 
