@@ -90,6 +90,12 @@ def _on():
 
 
 # ------------------------------------------------------------ (2) PARK-SEAT-FREE
+
+@pytest.fixture(autouse=True)
+def _park_dwell_rules(monkeypatch):
+    # PARK-NO-DWELL (02.10.) removes the dwell/collect hold this file pins: the old rule, explicitly
+    monkeypatch.setenv("SGLANG_WEG2_PARK_NO_DWELL", "0")
+
 def test_red_a_free_seat_parks_now_instead_of_collecting(caplog):
     """N3o epoch 16 05:53:39: weg2-16-39 (uncached 6472 > X 3797), running=2 of 6,
     round trip 11.37 s -> base: HOLD (price 22.7 s, fired 20.2 s later)."""

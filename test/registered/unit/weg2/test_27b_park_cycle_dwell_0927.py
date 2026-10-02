@@ -26,6 +26,8 @@ def _env(monkeypatch):
     monkeypatch.delenv(pp.PARK_CYCLE_DWELL_ENV, raising=False)
     # these pin the WAKE clock; the decode clock (PARK-DECODE-DWELL) has its own file
     monkeypatch.setenv(pp.PARK_DECODE_DWELL_ENV, "0")
+    # PARK-NO-DWELL (02.10.) removes the dwell this file pins: the old rule, explicitly
+    monkeypatch.setenv("SGLANG_WEG2_PARK_NO_DWELL", "0")
 
 
 def test_the_cycle_price_applies_only_to_a_resumed_phase_and_the_switch():

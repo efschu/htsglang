@@ -1718,6 +1718,15 @@ class Envs:
     # time (bounded by SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS). Marker 'WEG2
     # PRICE-BARRIER'. 0 = the SHORT takes its D seat at once, as before.
     SGLANG_WEG2_PRICE_BARRIER = EnvBool(True)
+    # PARK-NO-DWELL (user 02.10.: an arriving request is prefilled AT ONCE, no
+    # grace for running decodes; N6d ..._ec4d492f58 epoch 4: 'WEG2
+    # PARK-IMMEDIATE-DWELL awake_ms=310 min_dwell_ms=1974 floor_ms=2000' held the
+    # LONG weg2-4-6 142 ms until D's 2-token SHORT had finished): the immediate
+    # park of D's running decodes for a queued request over X fires at once --
+    # no K7 min-dwell, no park-cycle/decode dwell, no collect window, no fairness
+    # floor -- and the D->P MIN-DWELL after that park does not hold either.
+    # Marker 'WEG2 PARK-NO-DWELL'. 0 = the dwell rules as before.
+    SGLANG_WEG2_PARK_NO_DWELL = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
@@ -4036,8 +4045,10 @@ class Envs:
     # use (live warm legs > record of this checkpoint x form; unmeasured =
     # no hold, named). The arrival waits in arrival order meanwhile (its seat
     # stays its own under the AGE PLAN), is never rerouted. Name ordered by
-    # the operator (no ENABLE verb); default on: a stability fix.
-    SGLANG_WEG2_ARRIVAL_MIN_DWELL = EnvBool(True)
+    # the operator (no ENABLE verb). DEFAULT OFF since 02.10. (user rule: an
+    # arriving request is prefilled at once, no grace for running decodes; NF:
+    # DP-WAIT hold_s=1.6-1.9 hold_by=d-work+min-dwell). 1 = the hold again.
+    SGLANG_WEG2_ARRIVAL_MIN_DWELL = EnvBool(False)
     # ARRIVAL-SEAT KV reading budget (NF D->P flip, 01.10. bfpgwv): how long
     # the controller tick waits for a FRESH /server_info from D before it
     # decides on the last reading it has. D answers /server_info only at its

@@ -336,10 +336,12 @@ def kv_fits(need: int, kv_reading: Optional[Mapping]) -> Tuple[bool, str]:
 
 
 def min_dwell_enabled(env=None) -> bool:
-    """MIN-DWELL switch (SGLANG_WEG2_ARRIVAL_MIN_DWELL, default on)."""
+    """MIN-DWELL switch (SGLANG_WEG2_ARRIVAL_MIN_DWELL, default OFF since 02.10.:
+    an arriving request is prefilled at once). With an explicit ``env`` an unset
+    value reads as the default too."""
     if env is not None:
         raw = str(env.get("SGLANG_WEG2_ARRIVAL_MIN_DWELL", "") or "").strip().lower()
-        return raw not in ("0", "false", "no", "off")
+        return raw in ("1", "true", "yes", "on")
     from sglang.srt.environ import envs
 
     return bool(envs.SGLANG_WEG2_ARRIVAL_MIN_DWELL.get())

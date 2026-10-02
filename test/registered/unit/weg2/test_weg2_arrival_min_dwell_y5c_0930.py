@@ -72,7 +72,10 @@ def _park4_front(monkeypatch, dwell_s, age_plan=True, switch=None):
     monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "1")
     monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN", "1" if age_plan else "0")
     if switch is None:
-        monkeypatch.delenv("SGLANG_WEG2_ARRIVAL_MIN_DWELL", raising=False)  # default on
+        # ARRIVAL-MIN-DWELL-OFF (02.10.): the hold is opt-in now -- these tests pin it on
+        monkeypatch.setenv("SGLANG_WEG2_ARRIVAL_MIN_DWELL", "1")
+    elif switch == "default":
+        monkeypatch.delenv("SGLANG_WEG2_ARRIVAL_MIN_DWELL", raising=False)
     else:
         monkeypatch.setenv("SGLANG_WEG2_ARRIVAL_MIN_DWELL", switch)
     running = ["weg2-0-2", "weg2-6-12", "weg2-6-13"]
@@ -118,6 +121,15 @@ def test_parks_past_one_round_trip_flip_as_before(monkeypatch):
         f, p, now = _park4_front(monkeypatch, dwell)
         assert asyncio.run(f._arrival_seat_step(f.groups["D"], now)) == (True, True, p), dwell
         assert f.counters["arrival_seat_min_dwell_hold"] == 0
+
+
+def test_red_the_default_is_off_the_arrival_flips_at_once(monkeypatch):
+    """User rule 02.10.: an arriving request is prefilled AT ONCE -- NF found this
+    hold (DP-WAIT hold_s=1.6-1.9, hold_by=d-work+min-dwell); default off now."""
+    f, p, now = _park4_front(monkeypatch, 1.097, switch="default")
+    assert asr.min_dwell_enabled() is False
+    assert asyncio.run(f._arrival_seat_step(f.groups["D"], now)) == (True, True, p)
+    assert f.counters["arrival_seat_min_dwell_hold"] == 0
 
 
 def test_switch_off_is_todays_flip(monkeypatch):

@@ -84,6 +84,12 @@ def _replay(fx, ski: bool, dt: float = 0.1):
                                  holds=holds, ttft=sorted(ttft), dwell=dwell)
 
 
+
+@pytest.fixture(autouse=True)
+def _park_dwell_rules(monkeypatch):
+    # PARK-NO-DWELL (02.10.) removes the dwell/collect hold this file pins: the old rule, explicitly
+    monkeypatch.setenv("SGLANG_WEG2_PARK_NO_DWELL", "0")
+
 def test_policy_timer_override_opens_at_the_crossing_and_closes_after_x():
     # one request barely over X (NF 08:33:14 epoch 6: 6396 uncached, 3 running)
     kw = dict(timer=True)
