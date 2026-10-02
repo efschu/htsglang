@@ -147,7 +147,8 @@ def test_red_n5x_boot_start_pair_goes_to_p_as_a_group_and_d_does_no_extend(caplo
     assert f.counters["price_barrier_to_p"] == 1
     lines = _lines(caplog)
     assert any("outcome=to_p" in l and "siblings=1" in l for l in lines), lines
-    assert any("outcome=to_p sibling=" in l and "sibling_uncached=74148" in l for l in lines), lines
+    assert any("outcome=to_p sibling=" in l and "sibling_uncached=74148" in l and "waited_ms=" in l
+               for l in lines), lines
     assert sum(1 for r in caplog.records if r.getMessage().startswith("WEG2 X-EXACT-HOLD")) == 2
 
 
@@ -166,6 +167,10 @@ def test_a_sibling_that_ends_short_costs_at_most_its_count_time(caplog):
     waited = float(line[0].split("waited_ms=")[1].split()[0])
     assert waited <= 200 + 80, f"waited {waited} ms -- more than the sibling's count time"
     assert f.counters["price_barrier_to_p"] == 0
+    # waited_ms is printed on every SHORT -> D line (user 02.10.: no grace, the wait named)
+    d_lines = [r.getMessage() for r in caplog.records if "SHORT -> D" in r.getMessage()]
+    assert len(d_lines) == 2 and all("price_barrier_waited_ms=" in l for l in d_lines), d_lines
+    assert any("price_barrier_waited_ms=0" in l for l in d_lines), d_lines  # the sibling itself
 
 
 def test_nothing_in_flight_costs_nothing(caplog):
