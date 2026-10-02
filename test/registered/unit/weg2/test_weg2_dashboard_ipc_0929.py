@@ -167,7 +167,7 @@ class TestFrontWrites(CustomTestCase):
             await f.flip("D", "P")
             await f._leg1_bounded(p, post())
             await f._leg1_bounded(p, post())
-            await asyncio.sleep(0.15)   # PDFLIP-E: the beacon watch sees P's last stage forward
+            await asyncio.sleep(0.15)   # PDFLIP-E: the beacon watch sees PP0's first forward
 
         # PDFLIP-E: P's beacon at done, then its first forward -- D->P's first work is that
         # forward (p_last_stage_forward), never the leg-1 dispatch
@@ -190,7 +190,7 @@ class TestFrontWrites(CustomTestCase):
         self.assertEqual(done[0]["data"]["flip_begin_ts"], ts)
         w = fw[0]["data"]
         self.assertEqual((w["dir"], w["what"], w["rid"], w["flip_begin_ts"]),
-                         ("D>P", "p_last_stage_forward", None, ts))
+                         ("D>P", "p_first_stage_forward", None, ts))
         self.assertEqual(w["epoch"], done[0]["data"]["epoch"])
         self.assertGreaterEqual(w["flip_time_ms"], 0)
         self.assertNotIn("chunks", done[0]["data"])

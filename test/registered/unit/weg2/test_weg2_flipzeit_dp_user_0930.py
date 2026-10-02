@@ -47,7 +47,7 @@ def test_the_park_rpc_starts_the_span_and_p_prefill_ends_it():
     _done_and_forward(c, 103.2, 103.5)
     ev = c.first_prefill("weg2-6-1", t_dispatch=103.25, t_end=106.0, p_prefill_s=2.5)
     assert (ev["epoch"], ev["dir"], ev["start_source"], ev["prefill_start_source"]) == \
-        (6, "D>P", "park_rpc_sent", "pp_last_forward")
+        (6, "D>P", "park_rpc_sent", "pp_first_forward")
     assert ev["flip_user_ms"] == 3500                        # 100.0 -> 103.5
     assert ev["parts"] == {"park_rpc_ms": 660, "pre_begin_ms": 700, "legs_ms": 2500, "first_chunk_ms": 300}
     assert c.first_prefill("weg2-6-2", 107.0, 108.0, 0.5) is None   # one per flip
@@ -60,7 +60,7 @@ def test_without_a_park_the_last_served_leg2_is_the_decode_end():
     _done_and_forward(c, 62.0, 62.1)
     ev = c.first_prefill("r", 62.1, 64.0, None)              # P's body carried no prefill time
     assert (ev["start_source"], ev["prefill_start_source"], ev["flip_user_ms"]) == \
-        ("oldest_waiter_arrival", "pp_last_forward", 4100)
+        ("oldest_waiter_arrival", "pp_first_forward", 4100)
     assert ev["parts"]["park_rpc_ms"] is None and ev["idle_flip"] is False
     c.begin(5, 70.0, oldest_waiter_ts=40.0)                  # the waiter came first: D's served leg 2 starts it
     _done_and_forward(c, 71.0, 71.1)

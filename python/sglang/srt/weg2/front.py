@@ -7665,13 +7665,15 @@ class Front:
         after the D->P flip (the last of them = the D->P end) or the bound."""
         clk = self._ipc_dp_clock()
         t_end = time.time() + bound_s
+        fired = False
         while clk.waits_for_beacon() and time.time() < t_end:
             cur = await asyncio.to_thread(Front._p_beacons, self)
             if cur:
                 ts = clk.note_beacon(cur)
-                if ts is not None:
-                    Front._ipc_first_work_at(self, "P", "p_last_stage_forward", None, float(ts))
-                    return
+                if ts is not None and not fired:
+                    # PDFLIP-E2: the prefill batch begins at PP0's first forward
+                    Front._ipc_first_work_at(self, "P", "p_first_stage_forward", None, float(ts))
+                    fired = True
             await asyncio.sleep(period_s)
 
     def _ipc_first_work_at(self, group: str, what: str, rid: Optional[str], ts: float) -> None:
@@ -10125,8 +10127,8 @@ class Front:
         today's unbounded await. getattr: partial test fronts have no flag.
         """
         # DASHBOARD-AUS-IPC (a): the first leg 1 dispatched after a D->P flip.
-        # PDFLIP-E (user order 02.10.): P's first work is the LAST P stage's first
-        # forward (Front._watch_pp_last_forward), never the leg-1 dispatch.
+        # PDFLIP-E2 (user order 02.10.): P's first work is PP0's first forward
+        # after the flip (Front._watch_pp_last_forward), never the leg-1 dispatch.
         bound = float(getattr(self, "p_leg1_stall_s", 0.0) or 0.0)
         if bound <= 0:
             return await post
