@@ -16,9 +16,11 @@ rank (at the wake it votes None while peers vote a fingerprint -> mixed
 Hermetic: fake adapter, real manifest file under tmp_path, no GPU.
 """
 
+import json
 import os
 from types import SimpleNamespace
 
+from sglang.srt.weg2 import l15_keep_arm, l15_manifest, l15_restore
 from sglang.srt.weg2.l15_keep_arm import arm_keep_spans
 
 
@@ -104,6 +106,87 @@ def test_failing_clear_is_best_effort(tmp_path):
     assert not os.path.exists(mpath)
     assert (1, ()) in ad.calls
     assert len(logs) == 1
+
+
+class _OsShim:
+    """os replacement for l15_keep_arm: unlink always raises unlink_exc (the
+    F-B corner -- an OSError other than FileNotFoundError, e.g. EACCES on
+    the directory); when write_fails, the os.open of the in-place rewrite
+    raises EROFS as well. Everything else delegates to the real os, so the
+    fsync/fdopen of a succeeding rewrite are real."""
+
+    def __init__(self, unlink_exc, write_fails=False):
+        self._unlink_exc = unlink_exc
+        self._write_fails = write_fails
+
+    def unlink(self, path):
+        raise self._unlink_exc
+
+    def open(self, path, flags, mode=0o644):
+        if self._write_fails:
+            raise OSError(30, "Read-only file system")
+        return os.open(path, flags, mode)
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+def test_unlink_failure_invalidates_for_the_wake(tmp_path, monkeypatch):
+    # F-B: os.unlink raising PermissionError must NOT leave the manifest
+    # claiming a hold. The failure path rewrites the file IN PLACE with a
+    # dead-pid tombstone, and the WAKE loader (l15_restore.load_for_wake ->
+    # read_and_clear -> read) refuses it: returns None (the no-hold vote,
+    # exactly as a real discard) and removes the file.
+    mpath = _manifest(tmp_path)
+    monkeypatch.setattr(
+        l15_keep_arm, "os", _OsShim(PermissionError(13, "Permission denied"))
+    )
+    ad = _Ad(fail_on=2)
+    logs = []
+    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=1, log=logs.append, granule=1)
+    assert ok is False
+    # the file survived the failing unlink but is no longer a hold record:
+    assert os.path.exists(mpath)
+    rec = json.loads(open(mpath).read())
+    assert rec["pid"] == 0  # the dead-pid tombstone
+    # the wake refuses it:
+    assert l15_restore.load_for_wake(mpath) is None
+    assert not os.path.exists(mpath)  # reaped by the read
+    assert len(logs) == 1
+    assert "manifest invalidated" in logs[0]
+
+
+def test_double_failure_is_named_but_never_raises(tmp_path, monkeypatch):
+    # F-B corner: unlink AND the in-place rewrite both fail. Raising here
+    # would leave flush_cache with no handler (the scheduler dispatcher
+    # does not catch -> SIGQUIT on that rank while peers finish the sleep)
+    # and split the rank group, so the contract stays no-raise: the FAILED
+    # line NAMES that the stale record could not be neutralised.
+    mpath = _manifest(tmp_path)
+    monkeypatch.setattr(
+        l15_keep_arm, "os",
+        _OsShim(PermissionError(13, "Permission denied"), write_fails=True),
+    )
+    ad = _Ad(fail_on=2)
+    logs = []
+    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=2, log=logs.append, granule=1)
+    assert ok is False  # no raise: the plain flush still runs on this rank
+    assert os.path.exists(mpath)
+    assert len(logs) == 1
+    assert "NOT invalidated" in logs[0]
+
+
+def test_clear_failure_is_counted_in_the_failed_line(tmp_path):
+    # F-C: a raising () clear is still best effort (no raise, no second
+    # log line) but must be COUNTED -- the FAILED line may not silently
+    # claim "holds nothing" while a base may still keep pages pinned.
+    mpath = _manifest(tmp_path)
+    ad = _Ad(fail_on=2, clear_raises=True)
+    logs = []
+    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=4, log=logs.append, granule=1)
+    assert ok is False
+    assert len(logs) == 1
+    assert "clears_failed=1" in logs[0]
 
 
 def test_arm_success_keeps_manifest_and_logs_nothing(tmp_path):
