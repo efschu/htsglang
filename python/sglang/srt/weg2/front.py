@@ -11249,12 +11249,14 @@ class Front:
             free = int(st.free) if free is None else min(free, int(st.free))
         tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
         grant, per_tok, weights, step_tok = 0, 0.0, 0, 0
+        stages = []
         for r in range(3):
             try:
                 with open(_pk.stage_file(tag, r)) as f:
                     t = json.load(f)
             except (OSError, ValueError):
                 continue
+            stages.append(t)
             step_b = int((t.get("bytes") or [0, 0])[1] if len(t.get("bytes") or []) > 1 else 0)
             grant = max(grant, step_b)
             per_tok = max(per_tok, step_b / max(1, int(t.get("step") or 1)))
@@ -11268,8 +11270,21 @@ class Front:
             air_tok = int(os.environ.get("SGLANG_WEG2_DUAL_D_AIR_TOKENS", "") or step_tok)
         except ValueError:
             air_tok = step_tok
+        # the wake from sleep, PER CARD: that card's free against its loan + one P
+        # grant step + D's look-ahead, each priced in that stage's own bytes/token
+        card_room = []
+        for t in stages:
+            st = peek(str(t.get("ledger", "")))
+            if st is None:
+                card_room = None
+                break
+            b = t.get("bytes") or [0, 0]
+            step_b = int(b[1]) if len(b) > 1 else 0
+            tok_b = step_b / max(1, int(t.get("step") or 1))
+            card_room.append((int(st.free), int(t.get("lent") or 0) + step_b + int(air_tok * tok_b)))
         return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
-                "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights}
+                "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights,
+                "card_room": card_room if stages else None}
 
     #: env: the metal probe of stage 2 (one sleep + wake of P in the first idle
     #: stretch, no pressure needed) -- seconds P stays asleep; unset/0 = off

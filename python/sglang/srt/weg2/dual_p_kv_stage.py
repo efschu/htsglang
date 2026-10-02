@@ -522,7 +522,10 @@ def publish_stage(actor: "PKvStage", tag: str, pp_rank: int) -> str:
         json.dump({"ledger": actor.ledger.path, "step": actor.step, "top": actor.top,
                    "bytes": actor.table(),
                    # D PRIORITY stage 2: this rank's weights image (the host peak of a sleep)
-                   "weights_bytes": int(getattr(actor, "weights_bytes", 0) or 0)}, f)
+                   "weights_bytes": int(getattr(actor, "weights_bytes", 0) or 0),
+                   # D PRIORITY stage 2: what this rank lent its card pool while asleep (0
+                   # awake) -- the front's wake check is per card: free >= lent + grant + air
+                   "lent": int(getattr(actor, "_sleep_lent", 0) or 0)}, f)
     os.replace(tmp, path)
     return path
 
@@ -756,9 +759,21 @@ def sleep_lend(sched, phys_before: Optional[int]) -> int:
     if freed:
         actor.ledger.lend(freed)
     actor._sleep_lent = int(getattr(actor, "_sleep_lent", 0) or 0) + freed
+    _republish_stage(sched, actor)
     logger.warning("%s SLEEP-LEND freed=%d B -> the card pool while P sleeps (weights parked in host RAM, "
                    "freed at the wake)", MARK, freed)
     return freed
+
+
+def _republish_stage(sched, actor) -> None:
+    """The stage file again, with the current loan (the front reads it per card)."""
+    try:
+        runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+        pp_rank = int(getattr(runner, "pp_rank", 0) or 0)
+        tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
+        publish_stage(actor, tag, pp_rank)
+    except Exception as exc:  # noqa: BLE001 -- the front then waits on the old file: P stays asleep, never wrong
+        logger.warning("%s stage file not republished after the loan changed: %r", MARK, exc)
 
 
 def wake_reclaim(sched) -> int:
@@ -772,6 +787,7 @@ def wake_reclaim(sched) -> int:
             "W-DUAL-P-WAKE-SHORT: P's wake needs back the %d B it lent the card pool at its sleep, the pool "
             "has %d B free -- D committed into the loan" % (lent, int(actor.ledger.state().free)))
     actor._sleep_lent = 0
+    _republish_stage(sched, actor)
     logger.warning("%s WAKE-RECLAIM %d B back from the card pool before P maps its weights", MARK, lent)
     return lent
 

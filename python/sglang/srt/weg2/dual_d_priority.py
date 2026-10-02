@@ -18,7 +18,7 @@ This module holds the D-side tripwire (no retract in the dual layout).
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 MARK = "W-DUAL-D-RETRACT"
 
@@ -106,7 +106,13 @@ class PressureStages:
 
     def tick(self, *, pressure: int, p_committed: int, free_min: int, p_grant_bytes: int,
              d_air_bytes: int, seats_done: int, weights_bytes: int = 0,
-             host_ok: bool = True) -> Tuple[Optional[str], Optional[str]]:
+             host_ok: bool = True,
+             card_room: Optional[Sequence[Tuple[int, int]]] = None) -> Tuple[Optional[str], Optional[str]]:
+        """``card_room``: per card (free bytes, bytes the wake needs there = that
+        card's loan + one P grant step + D's look-ahead). The wake from sleep is
+        judged PER CARD -- the loan sits on each card separately (gmps12: 7.96 /
+        3.22 / 3.51 GB), and a total against the tightest card's free can never
+        hold on a 3080 (budget 6.4 GB). Without it, the old total formula."""
         pressure, p_committed, free_min = int(pressure), int(p_committed), int(free_min)
         if self.p_state == "serving":
             if pressure > 0:
@@ -146,8 +152,11 @@ class PressureStages:
                 return "resume", self._line("resume", 0, free_min)
             return None, None
         # sleeping
-        if (pressure <= 0 and int(seats_done) > self._seat_mark
-                and free_min >= int(weights_bytes) + int(p_grant_bytes) + int(d_air_bytes)):
+        if card_room is not None:
+            room_ok = bool(card_room) and all(int(f) >= int(n) for f, n in card_room)
+        else:
+            room_ok = free_min >= int(weights_bytes) + int(p_grant_bytes) + int(d_air_bytes)
+        if pressure <= 0 and int(seats_done) > self._seat_mark and room_ok:
             self.p_state = "serving"
             self.counts["wake"] += 1
             return "wake", self._line("resume", 0, free_min, " from=sleep")
