@@ -231,6 +231,7 @@ async def _until(pred, timeout: float = 10.0, tick: float = 0.02) -> bool:
 
 
 # ------------------------------------------------------------- T1, law 1
+@pytest.mark.usefixtures("_pdflip_band_off")
 def test_t1_p_drains_the_whole_backlog_before_the_flip_at_p_concurrency():
     """T1: 16 queued at --p-concurrency 4 -> all 16 prefilled BEFORE the
     first flip(P,D), at most 4 leg-1 POSTs in flight, mid-drain arrivals
@@ -548,6 +549,7 @@ def test_t9b2_a_pending_store_read_DEFERS_it_never_refuses_it():
     assert Scheduler._weg2_store_read_is_pending(sched, req_c) is False
 
 
+@pytest.mark.usefixtures("_pdflip_band_off")
 def test_t9c_the_front_requeues_a_w31_once_and_then_raises_w35():
     """T9 front half: a W31 body re-joins route BATCH exactly once; a second
     W31 on the same rid is W35 by name, never a third pass."""
@@ -1545,3 +1547,10 @@ def test_g3_the_launcher_states_the_carrierless_pp_arm_at_launch_from_the_argv_i
     # WIRED, not merely written (desk-written-never-executed): main logs it.
     main_src = inspect.getsource(launcher_mod.main)
     assert "log(w38_armed_line(spec_p.argv))" in main_src
+
+
+@pytest.fixture
+def _pdflip_band_off(monkeypatch):
+    """PDFLIP-B: this test documents the X-SOLO band / explicit flip-min-work form
+    (SGLANG_WEG2_X_BAND_FOLLOWS_PRICE=0); the live-X form is test_pdflip_band_follows_price_1002."""
+    monkeypatch.setenv("SGLANG_WEG2_X_BAND_FOLLOWS_PRICE", "0")
