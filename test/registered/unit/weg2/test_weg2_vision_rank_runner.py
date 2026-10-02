@@ -511,7 +511,9 @@ def test_async_holds_the_lease_over_two_passes_and_gives_it_back_after_attach(tm
     runs; the admission sees those pages as used (they are out of the free
     list), the image request is held out, other work is admitted in the same
     pass; after the attach the lease goes back and the request is admitted."""
-    monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    # VISION-SYNC LAW (user 02.10.): async is off by default; the async code
+    # stays and is exercised with the switch stated on.
+    monkeypatch.setenv(vrr.VISION_ASYNC_ENV, "1")
     _write_model(tmp_path)
     pool = _ManualPool()
     monkeypatch.setattr(vrr, "_async_pool", lambda: pool)
@@ -544,6 +546,29 @@ def test_async_off_is_the_synchronous_stage(tmp_path, monkeypatch, stage_calls):
     s = _pass_sched([_req("img", [_Item(4)])])
     assert vrr.vision_rank_pass(s) == []
     assert calls == [["img"]] and not vrr.vision_async_inflight(s)
+
+
+def test_vision_sync_law_unset_is_the_synchronous_stage_even_where_async_is_admissible(
+        tmp_path, monkeypatch, stage_calls):
+    """VISION-SYNC LAW (user 02.10. ~08:00Z, both lines): vision runs ONLY
+    synchronously, before the real prefill. Red on 0e1967fd36: the code default
+    was async ON, and a single-stage group (async admissible) held the image out
+    of the pass on a KV-tail lease. Now unset = the synchronous stage."""
+    calls, _ = stage_calls
+    monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
+    assert vrr.vision_async_on() is False
+    assert vrr.vision_async_on({}) is False and vrr.vision_async_on({vrr.VISION_ASYNC_ENV: ""}) is False
+    assert vrr.vision_async_on({vrr.VISION_ASYNC_ENV: "1"}) is True   # the code stays reachable
+    _write_model(tmp_path)
+    pool = _ManualPool()
+    monkeypatch.setattr(vrr, "_async_pool", lambda: pool)
+    monkeypatch.setattr(vrr, "build_tower_meta", _build())
+    monkeypatch.setattr(vrr, "_rank_device", lambda: torch.device("cpu"))
+    s, _ = _async_sched(tmp_path, [_req("img", [_Item(4)]), _req("txt")])
+    assert vrr.vision_async_admissible(s)[0]           # single stage: async WOULD be admissible
+    assert vrr.vision_rank_pass(s) == []               # nothing held across a pass
+    assert calls == [["img"]] and not vrr.vision_async_inflight(s) and pool.jobs == []
 
 
 def test_a_group_with_a_lease_is_never_idle():
@@ -581,7 +606,9 @@ def test_async_is_not_taken_where_the_followers_plan_for_themselves(tmp_path, mo
     import logging
 
     calls, _ = stage_calls
-    monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    # VISION-SYNC LAW (user 02.10.): async is off by default; the async code
+    # stays and is exercised with the switch stated on.
+    monkeypatch.setenv(vrr.VISION_ASYNC_ENV, "1")
     monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
     s, pool = _pp3_async_sched(tmp_path, monkeypatch)
     with caplog.at_level(logging.WARNING, logger=vrr.logger.name):
@@ -593,9 +620,27 @@ def test_async_is_not_taken_where_the_followers_plan_for_themselves(tmp_path, mo
     assert len(said) == 1 and "pp_size=3" in said[0]
 
 
-def test_async_on_the_row_form_needs_its_own_term(tmp_path, monkeypatch, stage_calls):
+@pytest.mark.parametrize("row_only", [False, True])
+def test_vision_sync_law_the_27b_and_nf_p_stage_stays_what_it_was(tmp_path, monkeypatch,
+                                                                   stage_calls, row_only):
+    """Identity guard (green on 0e1967fd36 AND after): a PP0 of a 3-stage P --
+    the 27B's (row form on, p_row_authority) and NF's (row form off) -- with
+    no switch set stages synchronously and admits in the same pass, exactly as
+    before the VISION-SYNC LAW made it structural. Before, it got there through
+    the async gate's refusal (one W102b line); now async is off outright."""
     calls, _ = stage_calls
     monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
+    s, pool = _pp3_async_sched(tmp_path, monkeypatch, row_only=row_only)
+    assert vrr.vision_rank_pass(s) == []                 # nothing held out of the pass
+    assert calls == [["img"]] and not vrr.vision_async_inflight(s) and pool.jobs == []
+
+
+def test_async_on_the_row_form_needs_its_own_term(tmp_path, monkeypatch, stage_calls):
+    calls, _ = stage_calls
+    # VISION-SYNC LAW (user 02.10.): async is off by default; the async code
+    # stays and is exercised with the switch stated on.
+    monkeypatch.setenv(vrr.VISION_ASYNC_ENV, "1")
     monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
     s, pool = _pp3_async_sched(tmp_path, monkeypatch, row_only=True)
     assert vrr.vision_rank_pass(s) == [] and calls == [["img"]]     # term off: synchronous

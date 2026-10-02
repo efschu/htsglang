@@ -955,10 +955,10 @@ def vision_flip_urgent(env=None) -> bool:
     serve (an image under ``--weg2-vision transient``, see ``Pending.p_only``)
     satisfies the D->P flip-economics latch on its own. Default off = the
     pre-xsn438 latch, under which such a request waits for X* of text or for
-    the fairness switch (weg2xsn438: 45 s)."""
-    src = os.environ if env is None else env
-    raw = src.get(VISION_FLIP_URGENT_ENV, "0")
-    return str(raw if raw is not None else "0").strip().lower() in ("1", "true", "yes", "on")
+    the fairness switch (weg2xsn438: 45 s). Unset or blank: the published
+    form's registry row (SCHALTER-HALBPORT 1002: nextflash on; off for a row
+    that states nothing and without a form)."""
+    return _env_switch_on_or_profile(VISION_FLIP_URGENT_ENV, env)
 
 
 #: verdicts of :func:`vision_verdict`
@@ -3739,6 +3739,21 @@ def _env_switch_on(name: str) -> bool:
     return str(os.environ.get(name, "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_switch_on_or_profile(name: str, env=None) -> bool:
+    """An explicitly set switch keeps its parse (1/true/yes/on); unset or blank
+    takes the published form's registry row (weg2/form.py
+    PROFILE_SWITCH_DEFAULTS -- SCHALTER-HALBPORT 1002: nextflash DC_OFF_PATH,
+    CTL_KICK_*, VISION_FLIP_URGENT on), off without a form or for a row that
+    states nothing."""
+    src = os.environ if env is None else env
+    raw = src.get(name)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    from sglang.srt.weg2.form import profile_switch_default
+
+    return bool(profile_switch_default(name, False, src))
+
+
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
@@ -4084,8 +4099,8 @@ class Front:
         # 27B flipfast: read ONCE, like every other front switch; the startup
         # line names all three (flipfast_line), so a boot's log says which ran.
         self._kick_on: Dict[str, bool] = {
-            why: _env_switch_on(env) for why, env in CTL_KICK_REASONS.items()}
-        self._dc_off_path = _env_switch_on(DC_OFF_PATH_ENV)
+            why: _env_switch_on_or_profile(env) for why, env in CTL_KICK_REASONS.items()}
+        self._dc_off_path = _env_switch_on_or_profile(DC_OFF_PATH_ENV)
         # The kick event is created lazily in the running loop (_ctl_evt), so a
         # Front built outside a loop -- the unit tests, main() -- binds nothing.
         self._ctl_evt_obj: Optional[asyncio.Event] = None
@@ -12352,6 +12367,15 @@ class Front:
             return
         self.counters[f"ctl_kick_{why}"] += 1
         evt.set()
+        # the metal proof of the kick switches (27B LS12 da8464b9f0), since the
+        # counters live only in /weg2/state -- one line per reason at 1, 2, 4,
+        # 8 ... kicks. Both switches off: never reached, no line.
+        k = int(self.counters[f"ctl_kick_{why}"])
+        if k & (k - 1) == 0:
+            logger.info("WEG2-FLIPFAST kick why=%s n=%d kicked=%d held_ready_for_d=%d "
+                        "(the controller woke before its %.2f s tick)", why, k,
+                        int(self.counters["ctl_kicked"]),
+                        int(self.counters["ctl_kick_held_ready_for_d"]), CTL_TICK_S)
 
     async def _ctl_wait(self) -> None:
         """The controller's tick. Both kick switches off: ``asyncio.sleep(CTL_TICK_S)``,

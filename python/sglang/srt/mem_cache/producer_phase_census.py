@@ -298,7 +298,24 @@ def census_o1_evict_armed() -> bool:
     is process-local; every rank of a group gets the same launcher env)."""
     global _o1_evict
     if _o1_evict is None:
-        _o1_evict = (os.environ.get(ENV_O1_EVICT, "0") or "0").strip() == "1"
+        raw = (os.environ.get(ENV_O1_EVICT, "") or "").strip()
+        if raw:
+            _o1_evict = raw == "1"
+        else:
+            # SCHALTER-HALBPORT 1002: unset/blank takes the published form's
+            # registry row (weg2/form.py ModelProfile.census_o1_evict:
+            # nextflash on; qwen27b states nothing -> off; no form: off).
+            from sglang.srt.weg2.form import profile_switch_default
+
+            _o1_evict = bool(profile_switch_default(ENV_O1_EVICT, False))
+        if _o1_evict:
+            # the switch reached the rank (once per process; the cap line below
+            # comes only when a ledger reaches its cap). Off: no line.
+            import logging
+
+            logging.getLogger(__name__).info(
+                "KR CENSUS-O1-EVICT armed: a census ledger at its cap evicts its oldest "
+                "key in O(1) (%s=%s)", ENV_O1_EVICT, raw or "profile")
     return _o1_evict
 
 

@@ -49,8 +49,14 @@ PROFILE_D = {
     "SGLANG_WEG2_ENABLE_D_PARK_END": "1",
     "SGLANG_HC_MIXER_INT8": "1",
     "SGLANG_WEIGHT_LOADER_COALESCE_MIB": "32",
+    # SCHALTER-HALBPORT 1002: nf-int4.env NF_ENV_D_FORM (D only)
+    "SGLANG_WEG2_STORE_SHORT_TAIL": "1",
 }
-FORM_A_D = "--max-total-tokens 262144 --rank-role host,worker,worker --rank-tp-ratio 1,0,0"
+#: a per-group value that overrides the row's form-wide default on ONE group
+#: (the row's global value is what the other group runs): STORE_SHORT_TAIL, row
+#: off (= P), D on (SCHALTER-HALBPORT 1002).
+GROUP_OVER_GLOBAL = {"SGLANG_WEG2_STORE_SHORT_TAIL": ("D", False)}
+FORM_A_D ="--max-total-tokens 262144 --rank-role host,worker,worker --rank-tp-ratio 1,0,0"
 
 
 def _ns(profile, env_p="", env_d="", extra_d=FORM_A_D, **kw):
@@ -82,7 +88,13 @@ class TestRegistryRows(CustomTestCase):
         none of the per-group switches is in PROFILE_SWITCH_DEFAULTS."""
         for pid in F.PROFILES:
             got = set(F.PROFILE_SWITCH_DEFAULTS[pid])
-            self.assertFalse(got & (set(PROFILE_P) | set(PROFILE_D)), pid)
+            self.assertFalse(got & (set(PROFILE_P) | set(PROFILE_D)) - set(GROUP_OVER_GLOBAL), pid)
+        # the one deliberate override: the row's global value is what the
+        # group that does not state it runs
+        groups = F.PROFILES[F.PROFILE_NEXTFLASH].group_switch_defaults
+        for name, (group, global_value) in GROUP_OVER_GLOBAL.items():
+            self.assertIs(F.PROFILE_SWITCH_DEFAULTS[F.PROFILE_NEXTFLASH][name], global_value)
+            self.assertEqual([g for g in groups if name in groups[g]], [group])
 
 
 class TestLauncherGroupDefaults(CustomTestCase):

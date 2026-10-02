@@ -91,7 +91,10 @@ def test_hg_bundle_is_one_registry_field():
     assert FM.PROFILES["nextflash"].d_hostgap_levers is False
     for name in HG:
         assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][name] is True
-        assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][name] is False
+        # SCHALTER-HALBPORT 1002: NF states CANON_ORDER alone (bar1_canon_order,
+        # the rank-bit-equality fix); the two DFLASH-only levers stay off.
+        assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][name] is (
+            name == "SGLANG_BARLINK_BAR1_CANON_ORDER")
 
 
 @pytest.mark.parametrize("name", HG)
@@ -109,6 +112,8 @@ def test_hg_bundle_default(clean, name, profile, explicit, want):
     _as(clean, profile)
     if explicit is not None:
         clean.setenv(name, explicit)
+    if (profile, explicit, name) == ("nextflash", None, "SGLANG_BARLINK_BAR1_CANON_ORDER"):
+        want = True   # SCHALTER-HALBPORT 1002: the NF row states CANON_ORDER on
     assert _hg_readers()[name]() is want
     assert getattr(envs, name).get() is want
 

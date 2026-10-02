@@ -320,6 +320,27 @@ HG_SWITCHES: Tuple[str, ...] = (
 #: the one of them P and D must run identically (Befund M: the rendered
 #: prompt, hence the prefix keys, differ otherwise)
 PREFIX_SWITCH_P_EQ_D: Tuple[str, ...] = ("SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE",)
+#: SCHALTER-HALBPORT 1002 (/spinning/gpu-arb/docs/SCHALTER-HALBPORT-AUDIT-1002.md):
+#: env switches a row states as its DEFAULT, field -> the env name(s) it sets
+#: (:meth:`ModelProfile.switch_defaults`). A field left ``None`` states nothing:
+#: the switch keeps the code default (or what another field derives, e.g. the
+#: HG bundle for CANON_ORDER) and the row's :data:`PROFILE_SWITCH_DEFAULTS`
+#: carry no key for it -- the qwen27b row states none of them and stays byte-
+#: identical. The readers take the row's value when the env is unset or blank
+#: (an explicit value always wins), on P, D and the front alike (all three
+#: carry the published form).
+STATED_SWITCHES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("p_anchor_presence", ("SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE",)),
+    ("admission_wedge_recovery_s", ("SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS",)),
+    ("hicache_load_async_index", ("SGLANG_HICACHE_LOAD_ASYNC_INDEX",)),
+    ("vision_flip_urgent", ("SGLANG_WEG2_VISION_FLIP_URGENT",)),
+    ("bar1_canon_order", ("SGLANG_BARLINK_BAR1_CANON_ORDER",)),
+    ("vram_peak_fast_read", ("SGLANG_VRAM_PEAK_FAST_READ",)),
+    ("front_dc_off_path", ("SGLANG_WEG2_DC_OFF_PATH",)),
+    ("front_quiesce_fast", ("SGLANG_WEG2_QUIESCE_FAST",)),
+    ("front_ctl_kick", ("SGLANG_WEG2_CTL_KICK_ARRIVAL", "SGLANG_WEG2_CTL_KICK_AFTER_FLIP")),
+    ("census_o1_evict", ("SGLANG_WEG2_CENSUS_O1_EVICT",)),
+)
 
 
 @dataclass(frozen=True)
@@ -559,6 +580,39 @@ class ModelProfile:
     #: roles on D, no other --form-kv stated, a flip boot with a host tier).
     #: ``off`` = the code default (qwen27b).
     d_kv_token_cut: str = "off"
+    #: SCHALTER-HALBPORT 1002: the row's ``vision`` is the launcher's DEFAULT for
+    #: an unset ``--weg2-vision`` (``launcher.apply_profile_vision_default``,
+    #: before the form is resolved). nextflash on: every NF boot runs
+    #: ``transient`` (nf-int4.env:229). qwen27b off: its profiles state the flag
+    #: (27b.env transient, 27b-gguf off); the row stays byte-identical.
+    vision_arg_default: bool = False
+    #: SCHALTER-HALBPORT 1002, :data:`STATED_SWITCHES` (``None`` = not stated by
+    #: this row, the code default stands):
+    #: K1 SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE (front) -- 'WEG2 P-ANCHOR-PRESENCE'.
+    p_anchor_presence: Optional[bool] = None
+    #: SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS (ranks) -- 'ADMISSION-WEDGE
+    #: recovery armed after 2.0s'.
+    admission_wedge_recovery_s: Optional[float] = None
+    #: SGLANG_HICACHE_LOAD_ASYNC_INDEX (P and D ranks) -- 'HICACHE-LOAD-ASYNC-INDEX
+    #: armed', WEG2-START-LOADING mamba.idx=0.
+    hicache_load_async_index: Optional[bool] = None
+    #: SGLANG_WEG2_VISION_FLIP_URGENT (front) -- 'WEG2 VISION-FLIP-URGENT on'.
+    vision_flip_urgent: Optional[bool] = None
+    #: SGLANG_BARLINK_BAR1_CANON_ORDER alone (ranks), over the value the HG
+    #: bundle derives -- 'oneshot all_reduce in canonical rank order'.
+    bar1_canon_order: Optional[bool] = None
+    #: SGLANG_VRAM_PEAK_FAST_READ (ranks) -- 'VRAM-PEAK-FAST-READ armed'.
+    vram_peak_fast_read: Optional[bool] = None
+    #: SGLANG_WEG2_DC_OFF_PATH (front) -- 'WEG2-FLIPFAST ... dc_off_path=on',
+    #: 'WEG2-DC-OFFPATH epoch='.
+    front_dc_off_path: Optional[bool] = None
+    #: SGLANG_WEG2_QUIESCE_FAST (front and P ranks) -- 'WEG2-QUIESCE-FAST group='.
+    front_quiesce_fast: Optional[bool] = None
+    #: SGLANG_WEG2_CTL_KICK_ARRIVAL + _AFTER_FLIP (front) -- 'WEG2-FLIPFAST
+    #: kick_arrival=on kick_after_flip=on', 'WEG2-FLIPFAST kick why='.
+    front_ctl_kick: Optional[bool] = None
+    #: SGLANG_WEG2_CENSUS_O1_EVICT (ranks) -- 'KR CENSUS-O1-EVICT armed'.
+    census_o1_evict: Optional[bool] = None
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -583,6 +637,13 @@ class ModelProfile:
         out["SGLANG_WEG2_FRONT_EXACT_TOKENS"] = bool(self.front_exact_tokens)
         for env_name in HG_SWITCHES:
             out[env_name] = bool(self.d_hostgap_levers)
+        # SCHALTER-HALBPORT 1002: only what the row states (None adds no key).
+        for fld, env_names in STATED_SWITCHES:
+            val = getattr(self, fld)
+            if val is None:
+                continue
+            for env_name in env_names:
+                out[env_name] = val if isinstance(val, bool) else float(val)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -674,6 +735,11 @@ NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
         "SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS": "8",
         "SGLANG_WEG2_ENABLE_CUT_WORKER_END": "1",
         "SGLANG_WEG2_ENABLE_D_PARK_END": "1",
+        # SCHALTER-HALBPORT 1002 (audit section 6): the row's store_short_tail
+        # is off, but every NF boot runs it on D (nf-int4.env NF_ENV_D_FORM) and
+        # off on P (0x W88 on NF-P in 10 boots: no need shown) -- per group here,
+        # so the profile line can go.
+        "SGLANG_WEG2_STORE_SHORT_TAIL": "1",
     }),
 }
 
@@ -913,7 +979,10 @@ PROFILES: Dict[str, ModelProfile] = {
         p_twin_defer=True,
         front_span_inflight=False,
         told_group_fallback=False,
-        vision="off",
+        # SCHALTER-HALBPORT 1002 (audit section 6): every NF boot runs
+        # --weg2-vision transient (nf-int4.env:229); the row said off. It is the
+        # launcher default for an unset flag (vision_arg_default below).
+        vision="transient",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form", "power_limit")),
         early_read_flags=False,
@@ -955,6 +1024,43 @@ PROFILES: Dict[str, ModelProfile] = {
         # #239 uneven-DCP-KV (user 28.09.: release feature): z30m-z30w and
         # every NF flip boot since run --d-kv-token-cut owned (z30w 112 flips).
         d_kv_token_cut="owned",
+        # SCHALTER-HALBPORT 1002 (NF seat, 02.10.; audit SCHALTER-HALBPORT-
+        # AUDIT-1002.md): switches NF ran only through profile lines, or not at
+        # all although nothing in NF's form argues against them. An explicit
+        # env still wins (=0 turns one off).
+        vision_arg_default=True,
+        # K1 (audit 2.2): built on NF evidence (a59c95ae36, z30u: 77 LONG
+        # follow-ups prefilled < 2k on P, 69 on exactly one P END-ANCHOR
+        # depth), released only on the 27B line (02adfaadee: z30y11-13, 0
+        # deaths, W50-REROUTE 0). Front-only; the credit is the max of the
+        # entry's readings (TokenSpans.record_store_anchor), not added to the
+        # d_inflight / d_served credit.
+        p_anchor_presence=True,
+        # audit 2.5: NF y6o ...10012132 D: 'ADMISSION-WEDGE ... NO first token
+        # for 121.0s', recovery only after the 60 s default on top of the
+        # 20 s alarm. 27B LS12 hauenh ran 2.0 (armed P3/D3, never fired).
+        admission_wedge_recovery_s=2.0,
+        # audit 2.6 + section 6: NF-D ran it (nf-int4.env NF_ENV_D_FORM,
+        # mamba.idx=0); NF-P 10020634 START-LOADING mamba.idx p90 795 ms, max
+        # 1034 ms, 31.6 s scheduler time per boot. Same bytes, same rows, same
+        # stream order -- only the host wait goes (arena_pool.load_index_async).
+        hicache_load_async_index=True,
+        # audit 2.7: NF boots --weg2-vision transient; a P-only request
+        # (image) satisfies the D->P flip-economics latch on its own.
+        vision_flip_urgent=True,
+        # audit 2.9: the BAR1 oneshot sums 0..R-1 on every rank (bit-equal
+        # ranks); same reads, no extra barrier (reduceNPhaseCanon). The other
+        # two HG switches stay off on NF (DFLASH worker only).
+        bar1_canon_order=True,
+        # audit 2.11: the allocator peak read without memory_stats()' flatten.
+        vram_peak_fast_read=True,
+        # audit section 6: NF ran these only through nf-int4.env _form lines
+        # (DC_OFF_PATH :270, QUIESCE_FAST :273, CTL_KICK_* :268-269,
+        # CENSUS_O1_EVICT :276, KR e17bd548b5).
+        front_dc_off_path=True,
+        front_quiesce_fast=True,
+        front_ctl_kick=True,
+        census_o1_evict=True,
     ),
 }
 
@@ -987,6 +1093,8 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: SGLANG_WEG2_D_PARK_IMMEDIATE (``d_park_immediate``, 27B park 26.09.).
 #: SGLANG_WEG2_FRONT_EXACT_TOKENS (``front_exact_tokens``, X-EXACT 26.09.).
 #: :data:`HG_SWITCHES` (``d_hostgap_levers``, 27B row 24h, on 29.09.).
+#: :data:`STATED_SWITCHES` (SCHALTER-HALBPORT 1002; only a row that states one
+#: carries its key -- nextflash).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }

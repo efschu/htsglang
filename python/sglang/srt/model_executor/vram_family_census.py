@@ -514,10 +514,26 @@ def _max_allocated_bytes(cuda) -> int:
         if envs.SGLANG_VRAM_PEAK_FAST_READ.get():
             try:
                 stats = torch._C._cuda_memoryStats(torch.cuda.current_device())
-                return int(stats["allocated_bytes"]["all"]["peak"])
-            except Exception:  # noqa: BLE001 -- fall back to the public read
-                pass
+                peak = int(stats["allocated_bytes"]["all"]["peak"])
+                _fast_read_note("armed", "first read %d MiB" % (peak >> 20))
+                return peak
+            except Exception as e:  # noqa: BLE001 -- fall back to the public read
+                _fast_read_note("fallback", repr(e))
     return cuda.max_memory_allocated()
+
+
+#: the metal proof of SGLANG_VRAM_PEAK_FAST_READ (27B LS12 da8464b9f0). One
+#: line per process and outcome -- "armed" at the first fast read, "fallback"
+#: at the first public read it had to take instead. Off: never called, no line.
+_FAST_READ_SEEN: set = set()
+
+
+def _fast_read_note(outcome: str, detail: str) -> None:
+    if outcome in _FAST_READ_SEEN:
+        return
+    _FAST_READ_SEEN.add(outcome)
+    logger.info("VRAM-PEAK-FAST-READ %s: %s (SGLANG_VRAM_PEAK_FAST_READ on; allocator peak "
+                "read from the nested stats dict, no memory_stats() flatten)", outcome, detail)
 
 
 def _peak_state(runner):
