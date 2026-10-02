@@ -5982,6 +5982,16 @@ class Front:
                         "this prompt)",
                         rid, d.tier, d.tokens, d.pages, d.l3_pages, d.kv_pages, int(ids.size), d.ms,
                         getattr(d, "form", "list"), int(getattr(d, "asked", 0)))
+        elif int(ids.size) > int(getattr(self, "tp_prefill_max_tokens", 0) or 0) > 0:
+            # PRESENCE-ZERO (02.10., N6i weg2-0-2: no presence line, read as "the
+            # probe never ran"): a prompt over X that the store holds NOTHING of
+            # says so -- the probe ran, the answer was 0 (pages / anchors named).
+            self.counters["l3_index_zero"] += 1
+            logger.info("WEG2 L3-INDEX-PRESENCE rid=%s tier=none depth=0 kv_pages=%d tokens=%d probe_ms=%.1f "
+                        "probe=%s asked=%d (the probe ran: the shared L2/L3 store holds no anchored "
+                        "leading page of this prompt -- a credit it gets later is not the store's)",
+                        rid, int(getattr(d, "kv_pages", 0)), int(ids.size), d.ms,
+                        getattr(d, "form", "list"), int(getattr(d, "asked", 0)))
         return int(d.tokens), str(d.tier)
 
     async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
