@@ -1901,8 +1901,26 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         except Exception as exc:  # noqa: BLE001 -- census unavailable: no gens
             logger.info("#1424 slot_gens census failed: %r", exc)
             return [-1] * len(want)
-        gens = {int(s): int(g) for s, g in zip(cs.tolist(), cg.tolist())}
-        return [int(gens.get(s, -1)) for s in want]
+        # L15-GENS-VEC (N6k: L15-WAKE-TIMING refill_ms 246-763 against a 64-66 ms
+        # refill DMA; every held wake's TP0 critical path and its peers' fence
+        # wait): the per-call Python dict over the whole COMPLETE census
+        # (~370k slots) went; one numpy scatter into a slot-indexed table, one
+        # gather of the wanted slots. Same answer, -1 for absent/out of range.
+        import numpy as np
+
+        if not want:
+            return []
+        n = int(getattr(self.arena, "slots", 0) or 0)
+        if cs.size:
+            n = max(n, int(cs.max()) + 1)
+        table = np.full(max(n, 1), -1, dtype=np.int64)
+        if cs.size:
+            table[np.asarray(cs, dtype=np.int64)] = np.asarray(cg, dtype=np.int64)
+        w = np.asarray(want, dtype=np.int64)
+        ok = (w >= 0) & (w < table.shape[0])
+        out = np.full(w.shape[0], -1, dtype=np.int64)
+        out[ok] = table[w[ok]]
+        return out.tolist()
 
     def _transfer(self, device_pool, k_src, v_src, src_idx, dst_idx, layer_id) -> None:
         if not getattr(self, "can_use_jit", False):

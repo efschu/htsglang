@@ -20691,6 +20691,16 @@ class Scheduler(
                                 l15_bind.live_host_pools(self.tree_cache)[0])
                     except Exception as exc:  # noqa: BLE001 -- diagnostics only
                         logger.info("L15-CHECK-SNAP skipped (%s: %s)", type(exc).__name__, exc)
+                    # L15-PLAN-CACHE: the wake's refill/sample plan, built
+                    # during P's phase instead of on the resume RPC
+                    try:
+                        from sglang.srt.weg2 import l15_restore as _l15_rs4
+                        from sglang.srt.weg2 import l15_sleep_agree as _l15_sa4
+                        _l15_rk4, _l15_pf4 = _l15_sa4.rank_prefix(self)
+                        _l15_rs4.warm_plan_async(getattr(_l15_res, "manifest", None),
+                                                 _l15_rk4, _l15_pf4)
+                    except Exception:  # noqa: BLE001 -- the wake builds it then
+                        pass
                 if _l15_res is not None:
                     # The keep spans are the one thing retain_at_sleep
                     # itself could not persist (it collects per view); one
