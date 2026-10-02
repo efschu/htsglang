@@ -32,7 +32,7 @@ import time
 from typing import Optional
 
 from sglang.srt.managers import weg2_resumable_depth
-from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield
+from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_split
 from sglang.srt.weg2 import handback_claim as _hb
 
 logger = logging.getLogger(__name__)
@@ -182,8 +182,14 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _park_end(sched, running)
     _ph("end")
     park_hold_yield.begin(getattr(sched, "tree_cache", None))
+    # PARK-RETRACT-SPLIT: the retract phase split per request (release /
+    # write-through backup / controller write / rest), one line per park
     retracted = (
-        sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
+        park_retract_split.run_split(
+            getattr(sched, "tree_cache", None),
+            lambda: sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True),
+            epoch,
+        )
         if running else []
     )
     _ph("retract")

@@ -1736,6 +1736,12 @@ class Envs:
     # floor -- and the D->P MIN-DWELL after that park does not hold either.
     # Marker 'WEG2 PARK-NO-DWELL'. 0 = the dwell rules as before.
     SGLANG_WEG2_PARK_NO_DWELL = EnvBool(True)
+    # PARK-RETRACT-SPLIT (02.10., y7y FLIPCYCLE stage=park retract 34-277 ms):
+    # one 'WEG2-PARK-RETRACT-SPLIT' line per flip park splits the retract phase
+    # into each request's cache_finished_req, the write_backup calls inside it
+    # and their cache_controller.write -- wall clock only, no device sync, the
+    # wrappers live for the retract alone. 0 = the park as before.
+    SGLANG_WEG2_PARK_RETRACT_SPLIT = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
