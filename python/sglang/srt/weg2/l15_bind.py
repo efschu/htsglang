@@ -577,6 +577,10 @@ def build_retain_kwargs(
         if uniq:
             for s, g in zip(uniq, _slot_gens_or_minus_one(pool, uniq, log, "kv")):
                 gen_of[int(s)] = int(g)
+        import os as _os
+
+        _require_complete = str(_os.environ.get(
+            "SGLANG_WEG2_L15_L2_REQUIRE_COMPLETE", "1")).strip() != "0"
         for rid, per in _slot_of.items():
             _g = gen_of.get
             gens = [_g(s, -1) for s in per]
@@ -598,6 +602,22 @@ def build_retain_kwargs(
                         per[i], gens[i] = -1, -1
                 log("L15-L2-SHADOW-ADOPT rid=%s tokens=%d live=%d shadow=%d valid=%d stale=%d"
                     % (rid, len(per), live, shadow, valid, shadow - valid))
+            if _require_complete:
+                # L15-L2-REQUIRE-COMPLETE: a slot the bind's census does not
+                # see COMPLETE (gen -1: the write-through of a just decoded
+                # tail page still in flight, or a partial page) is no L2
+                # source -- the wake would load an unfinished page into the
+                # sample / the refill. Unbacked instead (the cap-0 rank's POST
+                # vote then refuses a hold it could not refill).
+                per = list(per)
+                _inc = 0
+                for i, (sl, g) in enumerate(zip(per, gens)):
+                    if int(sl) >= 0 and int(g) < 0:
+                        per[i], gens[i] = -1, -1
+                        _inc += 1
+                if _inc:
+                    log("L15-L2-INCOMPLETE rid=%s rows=%d of %d (slot not COMPLETE at the bind: "
+                        "no L2 source)" % (rid, _inc, len(per)))
             l2_by_rid[rid] = (tuple(per), tuple(gens))
             l2_lanes_by_rid[rid] = tuple(_lane_of[rid])
 
