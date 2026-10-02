@@ -5939,6 +5939,7 @@ class Front:
                     "reused=%d encoded=%d%s",
                     rid, pending, c.n, credit, src, int(known), est_uncached, est_prompt,
                     est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded, mm_tag)
+        self._prefix_diverge(rid, c.ids, pending, credit, src, l3)
         from types import SimpleNamespace
 
         return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
@@ -6291,6 +6292,53 @@ class Front:
             logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=%s common=%d prompt=%d "
                         "prev_prompt=%d (front token ids: where this prompt leaves the session's "
                         "previous one)", rid, sess, prev_rid, common, len(ids), prev_len)
+        except Exception:  # noqa: BLE001 -- an instrument, never the price
+            pass
+
+    def _prefix_diverge(self, rid: str, ids, pending: int, credit: int, src: str,
+                        l3: int) -> None:
+        """PREFIX-DIVERGE (NF y7l 99d1977a63, 02.10.): where a priced prompt
+        leaves the earlier prompt it shares the longest token prefix with,
+        against the credit the store/D gave it -- on every arrival that
+        prefills more than X (a P leg), the one line that tells "the client
+        sent a different prefix" (``client_diverged``) from "a prefix an
+        earlier prompt had was not readable" (``store_short``).
+
+        y7l, by hand from the store journal: weg2-4-18 (pending 71949)
+        left weg2-2-7 inside its first 3328 tokens, weg2-8-20 (pending 87034)
+        left weg2-6-19 at 78208; the first page each P read missed was born
+        8-18 s later by the request's own prefill. Front-only, sessionless,
+        never a price input; an instrument never raises."""
+        try:
+            rp = self.__dict__.get("_recent_prompts")
+            if rp is None:
+                from sglang.srt.weg2.front_tokens import RecentPrompts
+
+                rp = self._recent_prompts = RecentPrompts()
+            if ids is None or int(ids.size) == 0:
+                return
+            x = int(getattr(self, "tp_prefill_max_tokens", 0) or 4096)
+            if int(pending) > x:
+                from sglang.srt.weg2.front_tokens import reprefill_verdict
+
+                page = int(getattr(getattr(self, "tspans", None), "anchor_page", 0) or 64)
+                lcp, prev_rid, prev_len, prev_t = rp.best(ids, exclude_rid=str(rid))
+                verdict, lost = reprefill_verdict(int(credit), lcp, page)
+                self.counters["prefix_diverge_" + verdict] += 1
+                self.counters["prefix_diverge_" + verdict + "_tokens"] += int(lost)
+                age = (time.time() - prev_t) if prev_t is not None else -1.0
+                (logger.warning if verdict == "store_short" else logger.info)(
+                    "WEG2 PREFIX-DIVERGE rid=%s verdict=%s prompt=%d credit=%d src=%s l3=%d "
+                    "pending=%d best_prev=%s prev_prompt=%d prev_age_s=%.1f common=%d "
+                    "common_page=%d lost=%d (front token ids against the last %d priced "
+                    "prompts: client_diverged = no earlier prompt shares more than the credit, "
+                    "the client changed its text at token `common`; store_short = an earlier "
+                    "prompt shares `common` but the store/D credited only `credit` -- pages "
+                    "lost or not yet written, or no Mamba anchor in between)",
+                    rid, verdict, int(ids.size), int(credit), src, int(l3), int(pending),
+                    prev_rid or "-", int(prev_len), age, int(lcp), int(lcp) // page * page,
+                    int(lost), rp.cap)
+            rp.note(str(rid), ids)
         except Exception:  # noqa: BLE001 -- an instrument, never the price
             pass
 

@@ -487,6 +487,67 @@ def divergence_credit(raw: int, ct: int, cap: Optional[int], lcp: int) -> int:
     return 0
 
 
+class RecentPrompts:
+    """PREFIX-DIVERGE (NF y7l 99d1977a63, 02.10.): the exact ids of the last
+    ``cap`` prompts this front priced, sessionless (Open WebUI sends no
+    session id, so SESSION-PREFIX is silent for it).
+
+    It answers the question the operator asked of y7l by hand ("80k
+    re-prefilled for no reason instead of taken from the cache"): how far
+    does this prompt agree, token for token, with ANY earlier prompt? On y7l
+    the answer was "not far": weg2-4-18 left every earlier prompt inside its
+    first 3328 tokens and weg2-8-20 left weg2-6-19 at 78208 -- the store
+    journal shows every page those reads missed was first written seconds
+    AFTER the miss, by the request's own prefill, and none of this boot's
+    pages was ever evicted. A client-side divergence, not a lost prefix."""
+
+    def __init__(self, cap: int = IDS_CAP):
+        self.cap = max(1, int(cap))
+        # rid -> (ids, time noted)
+        self.items: "collections.OrderedDict[str, Tuple[np.ndarray, float]]" = \
+            collections.OrderedDict()
+
+    def note(self, rid: str, ids: Optional[np.ndarray], now: Optional[float] = None) -> None:
+        if ids is None or int(ids.size) == 0:
+            return
+        self.items.pop(str(rid), None)
+        self.items[str(rid)] = (ids, time.time() if now is None else float(now))
+        while len(self.items) > self.cap:
+            self.items.popitem(last=False)
+
+    def best(self, ids: np.ndarray, exclude_rid: Optional[str] = None
+             ) -> Tuple[int, Optional[str], int, Optional[float]]:
+        """``(lcp, prev_rid, prev_len, prev_t)`` of the earlier prompt that
+        shares the longest token prefix with ``ids`` (lcp 0, None when none)."""
+        best_lcp, best_rid, best_len, best_t = 0, None, 0, None
+        for rid, (eids, t) in self.items.items():
+            if rid == exclude_rid:
+                continue
+            lcp = token_lcp(eids, ids)
+            if lcp > best_lcp:
+                best_lcp, best_rid, best_len, best_t = lcp, rid, int(eids.size), t
+        return best_lcp, best_rid, best_len, best_t
+
+
+def reprefill_verdict(credit: int, best_lcp: int, page: int = ANCHOR_PAGE) -> Tuple[str, int]:
+    """PREFIX-DIVERGE: ``(verdict, tokens)`` for a priced prompt whose
+    store/D credit is ``credit`` and whose longest token prefix with an
+    earlier prompt is ``best_lcp``.
+
+    * ``client_diverged`` (tokens 0): the credit reaches the page floor of
+      everything an earlier prompt shares -- the rest is text no earlier
+      prompt had, nothing could have been read;
+    * ``store_short`` (tokens = shared page floor - credit): an earlier prompt
+      shares more than the credit. Either its pages are gone from L2/L3, were
+      not written yet, or (hybrid) no Mamba anchor lies between the credit
+      and the divergence -- the line to look at, never a price input."""
+    page = max(1, int(page))
+    shared = max(0, int(best_lcp)) // page * page
+    if shared <= int(credit):
+        return "client_diverged", 0
+    return "store_short", shared - int(credit)
+
+
 class TokenSpans:
     """The MEASURED cached-on-D prefixes in TOKENS -- :class:`SpanLRU`'s
     semantics (#1324 presence witness, #49 held epoch, a measured zero
