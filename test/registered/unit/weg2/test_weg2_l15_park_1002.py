@@ -230,3 +230,26 @@ def test_refused_kv_resume_never_touches_the_pools(monkeypatch, tmp_path):
     back = _run_ranks(lambda r: P.park_back_at_wake(scheds[r], env, lambda s: None,
                                                     epoch=5, group_ok=False))
     assert back == [False] * 3 and w.calls == calls
+
+
+def test_blocks_are_cut_to_the_chunk_size_and_still_byte_exact():
+    pieces, _ = P.park_plan(keep_rows=[12, 5, 6], caps=[0, 15, 30])
+    w = _World(3)
+    bufs = {0: _bufs(0, fill=11), 1: _bufs(1), 2: _bufs(2)}
+    orig0 = [b.clone() for b in bufs[0]]
+    env = {"SGLANG_WEG2_L15_PARK_CHUNK_MIB": "1"}
+    assert P.chunk_rows(4, env) == (1 << 20) // 4
+    # 1 MiB per block with 4-byte rows would be one block; force 5-row blocks
+    import unittest.mock as um
+    with um.patch.object(P, "chunk_rows", lambda rb, e=None: 5):
+        th = [threading.Thread(target=P.run_park,
+                               args=("out", pieces, r, 3, bufs[r], w.a2a_for(r), env))
+              for r in range(3)]
+        [t.start() for t in th]
+        [t.join() for t in th]
+    for p in pieces:
+        for L in range(2):
+            assert torch.equal(bufs[p.dst][L][p.dst_row:p.dst_row + p.rows],
+                               orig0[L][p.src_row:p.src_row + p.rows])
+    expect = sum(-(-p.rows // 5) for p in pieces) * 2
+    assert w.calls == expect
