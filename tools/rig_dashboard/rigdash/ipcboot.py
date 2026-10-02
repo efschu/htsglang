@@ -619,6 +619,47 @@ def flip_partition(start: float, end: float, begin: float, flip_ms, done, lo: Op
     return p
 
 
+#: the D>P Vorlauf, split on the time axis (Summe = vorlauf_ms; Nutzer 02.10. ~18:25Z via NF: Leerlauf ohne Request
+#: darf echte Halte nicht verdecken -- total bleibt die Flipzeit ab D's letztem Token, nur der Vorlauf wird benannt)
+VOR_PARTS = ("leer_ms", "halt_ms", "park_ms", "vor_rest_ms")
+
+#: a D>P start read from D's log is final once D logged a round after flip_done (27B N6i: TP0 wrote rounds 285-331
+#: of 18:14:46-47 only at 18:15:28, after the next wake -- read at 18:14:5x the start was 1,58 s too early); after
+#: this long without a later round the row is taken as it is
+PROVISIONAL_MAX_S = 900.0
+
+
+def vorlauf_split(start: float, vorlauf_ms: float, arrival: Optional[float], park_sent: Optional[float],
+                  park_ms, segs: Optional[List[dict]] = None) -> dict:
+    """D>P: [start, start + vorlauf] = leer + halt + park + vor_rest, in time order (running max, every part >= 0):
+
+      leer      start -> arrival: D's last token until the request that needs P arrived at the front -- no request
+                was waiting for P yet (D may still have been busy: ``leer_d_prefill_ms`` = davon D-Prefill-Segmente
+                im Rang-Takt); 0 when the request was already waiting before D's last token
+      halt      arrival -> park RPC sent (or -> flip_begin without a park): holds, MIN-DWELL, pricing, seat verdict
+      park      park RPC sent -> acknowledged (flip_user_time parts.park_rpc_ms): D finishing its running pass
+      vor_rest  park ack -> flip_begin
+
+    Without an arrival the split is unknown (all None): never a guessed part."""
+    out = {k: None for k in VOR_PARTS}
+    out["leer_d_prefill_ms"] = None
+    if arrival is None or vorlauf_ms is None:
+        return out
+    b = start + float(vorlauf_ms) / 1000.0
+
+    def clip(x):
+        return min(max(float(x), start), b)
+
+    a = clip(arrival)
+    ps = max(a, clip(park_sent)) if park_sent is not None else b
+    pa = max(ps, clip(park_sent + float(park_ms) / 1000.0)) if park_sent is not None and park_ms is not None else ps
+    out.update(leer_ms=(a - start) * 1000.0, halt_ms=(ps - a) * 1000.0, park_ms=(pa - ps) * 1000.0,
+               vor_rest_ms=(b - pa) * 1000.0)
+    busy = sum(max(0.0, min(x["e"], a) - max(x["s"], start)) for x in segs or () if x.get("k") == "D")
+    out["leer_d_prefill_ms"] = busy * 1000.0
+    return out
+
+
 #: flip_first_work kinds that stamp D's first token after a P>D flip: the streamed first decode token, and
 #: (27B PDFLIP-E3 a0d03e9321, non-streaming requests) the end of D's first forward read from its beacon
 PD_END_WHATS = ("decode_token", "d_first_forward_done", "d_first_forward_done_approx")
@@ -666,7 +707,7 @@ def _round_last(rounds, t_from: Optional[float], t_to: float):
     return best
 
 
-def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO) -> List[dict]:
+def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO, arrivals=AUTO) -> List[dict]:
     """One row per flip of the ring window, newest last (Nutzer 02.10., FLIPZEIT fuer beide Richtungen und
     beide Modelle): total_ms = vom LETZTEN Token der abgebenden Phase bis zum ERSTEN Token der annehmenden,
     das ist DIE Flipzeit und die einzige.
@@ -696,6 +737,11 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
             d_rounds = grouplog.decode_rounds(ipc)
         except OSError:
             d_rounds = None
+    if arrivals is AUTO:
+        try:
+            arrivals = grouplog.front_arrivals(ipc)
+        except OSError:
+            arrivals = None
     evs = ipc.get("ipc_events") or []
     begins = sorted(((e.get("data") or {}).get("flip_begin_ts") or e.get("ts"), e.get("data") or {})
                     for e in evs if e.get("type") == "flip_begin")
@@ -726,6 +772,8 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
         flip_ms = fd.get("flip_ms")
         row = {"dir": d, "begin": b, "done": t_done, "kind": "offen", "total_ms": None, "start": None, "end": None,
                "vorlauf_ms": None, "layer_ms": None, "wake_kv_dc_ms": None, "nachlauf_ms": None, "rest_ms": None,
+               "leer_ms": None, "halt_ms": None, "park_ms": None, "vor_rest_ms": None, "leer_d_prefill_ms": None,
+               "arrival": None, "provisional": False,
                "nachlauf_d_extend_ms": None, "end_res_ms": None, "missing": None}
         f = fw.get(key) or {}
         if t_done is None:
@@ -801,6 +849,20 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
             p = (u or {}).get("parts") or {}
             if p.get("park_rpc_ms") is not None:
                 row["park_rpc_ms"] = p.get("park_rpc_ms")
+            # the Vorlauf split: arrival of the request that triggered the flip (front WEG2 SESSION of its rid; else
+            # the pricing verdict the front stamps as oldest_waiter_arrival), the park RPC from flip_user_time
+            rid = (u or {}).get("rid")
+            if rid:
+                row["rid"] = rid
+            if rid and arrivals and rid in arrivals:
+                dp_arrival, row["arrival_src"] = float(arrivals[rid]), "front WEG2 SESSION rid=%s" % rid
+            elif (u or {}).get("start_source") == "oldest_waiter_arrival" and u.get("start_ts") is not None:
+                dp_arrival = float(u["start_ts"])
+                row["arrival_src"] = "flip_user_time oldest_waiter_arrival (Preisverdikt)"
+            else:
+                dp_arrival = None
+            dp_park = (float(u["start_ts"]), p.get("park_rpc_ms")) \
+                if (u or {}).get("start_source") == "park_rpc_sent" and u.get("start_ts") is not None else (None, None)
             if (u or {}).get("pp_last_start_ts") is not None:
                 row["pp_last_start"] = float(u["pp_last_start_ts"])
             # the first forward starts after flip_begin and after P's leg-1 dispatch
@@ -826,6 +888,14 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None, d_rounds=AUTO
         if start is not None and end is not None:
             row.update(flip_partition(start, end, b, flip_ms, t_done, e_lo))
             row["start"], row["end"] = start, end
+            if d == "D>P":
+                row["arrival"] = dp_arrival
+                row.update(vorlauf_split(start, row["vorlauf_ms"], dp_arrival, dp_park[0], dp_park[1], segs))
+                # D's log may write its rounds late (27B: only at the next wake); the start is final once a later
+                # round is in the log, or after PROVISIONAL_MAX_S
+                if d_rounds is not None and now - float(t_done) < PROVISIONAL_MAX_S \
+                        and not any(o > float(t_done) for o, _ in d_rounds):
+                    row["provisional"] = True
             row["end_res_ms"] = (end - e_lo) * 1000.0 if e_lo is not None else 0.0
             if d == "P>D":
                 ext = sum(max(0.0, min(x["e"], end) - max(x["s"], t_done)) for x in segs
@@ -872,7 +942,8 @@ def flip_times_of(views: List[dict]) -> dict:
                   "missing": nw.get("missing") if nw.get("kind") == "fehlt" else None,
                   "missing_n": x["missing_n"], "no_work": x["idle_n"]}
     out["recent"] = [{"t": x["begin"], "dir": x["dir"], "ms": x["total_ms"], "kind": x["kind"], "missing": x.get("missing"),
-                      "parts": {k: x.get(k) for k in PARTS}, "state": x["kind"], "src": "ipc"}
+                      "parts": {k: x.get(k) for k in PARTS + VOR_PARTS}, "provisional": x.get("provisional"),
+                      "state": x["kind"], "src": "ipc"}
                      for x in views if x["kind"] in ("ok", "fehlt")][-24:]
     return out
 

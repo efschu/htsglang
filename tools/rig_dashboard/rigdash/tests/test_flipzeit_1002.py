@@ -163,7 +163,9 @@ class FlipzeitPD(unittest.TestCase):
 
 class FlipzeitPush(unittest.TestCase):
     def test_vm_gets_only_the_total_and_its_parts(self):
-        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, _ring(), d_rounds=D_ROUNDS)[0]
+        # D's log has a round of the next phase: the D>P start is final (a provisional one stays out of VM)
+        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, _ring(), d_rounds=D_ROUNDS + [(T + 58.0, T + 58.03)],
+                               arrivals={})[0]
         lines = vmpush.flip_view_points([x], "NF", "068d", set())
         parts = sorted(l.split('part="')[1].split('"')[0] for l in lines)
         self.assertEqual(parts, ["layer", "nachlauf", "rest", "total", "vorlauf", "wake_kv_dc"])

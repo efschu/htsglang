@@ -34,9 +34,9 @@ READ_CHUNK = 8 * 1024 * 1024
 MANIFEST_ENV = "SGLANG_WEIGHT_LOADER_SHARED_CACHE_MANIFEST"   # .../evidence/<stem>.shared_cache, both models
 
 
-def d_log_path(ipc: dict) -> Optional[str]:
-    """The boot's D log on this host: ``<line>/evidence/<stem>.D.log`` next to ``<line>/state/<boot_id>``.  The
-    stem comes from the launcher's shared-cache manifest path (D or P env), else from the launcher tag."""
+def _log_path(ipc: dict, suffix: str, pattern: str) -> Optional[str]:
+    """The boot's group log on this host: ``<line>/evidence/<stem><suffix>`` next to ``<line>/state/<boot_id>``.
+    The stem comes from the launcher's shared-cache manifest path (D or P env), else from the launcher tag."""
     d = ipc.get("dir")
     if not d:
         return None
@@ -45,15 +45,25 @@ def d_log_path(ipc: dict) -> Optional[str]:
         env = (((ipc.get("launch") or {}).get(g) or {}).get("env") or {})
         m = env.get(MANIFEST_ENV)
         if m and m.endswith(".shared_cache"):
-            p = os.path.join(ev, os.path.basename(m)[:-len(".shared_cache")] + ".D.log")
+            p = os.path.join(ev, os.path.basename(m)[:-len(".shared_cache")] + suffix)
             if os.path.exists(p):
                 return p
     tag = ipc.get("tag")
     if tag:
-        cands = glob.glob(os.path.join(ev, "boot_weg2_%s_*.D.log" % tag))
+        cands = glob.glob(os.path.join(ev, pattern % tag))
         if cands:
             return max(cands, key=lambda p: os.path.getmtime(p))
     return None
+
+
+def d_log_path(ipc: dict) -> Optional[str]:
+    """The boot's D log on this host (``<stem>.D.log``)."""
+    return _log_path(ipc, ".D.log", "boot_weg2_%s_*.D.log")
+
+
+def front_log_path(ipc: dict) -> Optional[str]:
+    """The boot's front log on this host (``<stem>.front.log``)."""
+    return _log_path(ipc, ".front.log", "boot_weg2_%s_*.front.log")
 
 
 class DecodeRounds:
@@ -120,3 +130,73 @@ def decode_rounds(ipc: dict) -> Optional[List[Tuple[float, float]]]:
                 _READERS.pop(next(iter(_READERS)))        # the oldest reader goes
             r = _READERS[p] = DecodeRounds(p)
     return list(r.poll())
+
+
+# Arrival of a request at the front (Nutzer 02.10. ~18:25Z via NF: the D>P Vorlauf is split into "leer ohne Request"
+# (D's last token -> arrival of the request that needs P), "halt" (arrival -> park RPC / flip_begin) and "park").
+# The front stamps ``WEG2 SESSION rid=<rid>`` on every request it accepts, before pricing; the IPC event
+# flip_user_time names the rid that triggered the flip but carries no arrival stamp (only the park-RPC send, or the
+# pricing verdict as ``oldest_waiter_arrival``).  Only the line prefix (frozen parse.RE_PREFIX / parse_ts) and the
+# rid token are read.  IPC follow-up: flip_user_time.arrival_ts at the front, then this reader falls.
+SESSION_MARK = b"WEG2 SESSION rid="
+MAX_ARRIVALS = 200000         # rids kept per log (first stamp wins)
+
+
+class FrontArrivals:
+    """rid -> first ``WEG2 SESSION`` time of one front log."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.off = 0
+        self.tail = b""
+        self.first: Dict[str, float] = {}
+        self.lock = threading.Lock()
+
+    def poll(self) -> Dict[str, float]:
+        with self.lock:
+            try:
+                size = os.path.getsize(self.path)
+            except OSError:
+                return self.first
+            if size < self.off:                       # rewritten: start over
+                self.off, self.tail, self.first = 0, b"", {}
+            if size > self.off:
+                with open(self.path, "rb") as fh:
+                    fh.seek(self.off)
+                    while self.off < size:
+                        buf = fh.read(min(READ_CHUNK, size - self.off))
+                        if not buf:
+                            break
+                        self.off += len(buf)
+                        lines = (self.tail + buf).split(b"\n")
+                        self.tail = lines.pop()
+                        for ln in lines:
+                            if SESSION_MARK in ln:
+                                self._add(ln)
+            return self.first
+
+    def _add(self, ln: bytes) -> None:
+        txt = ln.decode("utf-8", "replace")
+        m = parse.RE_PREFIX.match(txt)
+        if not m:
+            return
+        rid = txt.split("WEG2 SESSION rid=", 1)[1].split(" ", 1)[0].strip()
+        if rid and rid not in self.first and len(self.first) < MAX_ARRIVALS:
+            self.first[rid] = parse.parse_ts(m)
+
+
+_FRONT: Dict[str, FrontArrivals] = {}
+
+
+def front_arrivals(ipc: dict) -> Optional[Dict[str, float]]:
+    """The boot's request arrivals at the front, rid -> epoch s; None when its front log is not found here."""
+    p = front_log_path(ipc)
+    if p is None:
+        return None
+    with _LOCK:
+        r = _FRONT.get(p)
+        if r is None:
+            if len(_FRONT) >= MAX_READERS:
+                _FRONT.pop(next(iter(_FRONT)))
+            r = _FRONT[p] = FrontArrivals(p)
+    return dict(r.poll())

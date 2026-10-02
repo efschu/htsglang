@@ -165,7 +165,10 @@ class TestStaticScan(unittest.TestCase):
                     v = node.value
                     if name == "stops.py" and v in ("abnahme_cu130.log",):
                         continue     # HarnessLogs (not started by the server); constant kept for its tests
-                    if name == "grouplog.py" and v in (".D.log", "boot_weg2_%s_*.D.log"):
+                    if name == "grouplog.py" and v in (".D.log", "boot_weg2_%s_*.D.log", ".front.log",
+                                                       "boot_weg2_%s_*.front.log"):
+                        # .front.log: Nutzer 02.10. ~18:25Z via NF, Vorlauf-Zerlegung -- Ankunft des Requests
+                        # (WEG2 SESSION rid=); IPC-Nachfolger flip_user_time.arrival_ts, dann faellt der Leser
                         continue     # Nutzer 02.10. ~17:50Z: Flipzeit-Endpunkte = D's eigene Decode-Runden (TP0
                                      # 'Decode rank batch' t:); rankstats hat keine Rundenzeit -- IPC-Nachfolger
                                      # decode.last_t beim Rang-Schreiber, dann faellt dieser eine Leser

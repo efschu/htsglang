@@ -649,9 +649,11 @@ class Recorder:
         segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc),
                                      detail=False)["segs"]
         for x in ipcboot.flip_views(segs, ipc, now, m.ring):
-            if x.get("kind") != "ok" or x.get("total_ms") is None:
+            if x.get("kind") != "ok" or x.get("total_ms") is None or x.get("provisional"):
                 continue
             parts = "v=%d l=%d w=%d n=%d r=%d" % tuple(int(round(x.get(k) or 0)) for k in ipcboot.PARTS)
+            if x.get("leer_ms") is not None:
+                parts += " (leer=%d halt=%d park=%d vr=%d)" % tuple(int(round(x.get(k) or 0)) for k in ipcboot.VOR_PARTS)
             self.db.mark(x["begin"], model, "flip_t2t", "%s %s ipc" % (x["dir"], parts), x["total_ms"])
 
     # --- loop ----------------------------------------------------------------

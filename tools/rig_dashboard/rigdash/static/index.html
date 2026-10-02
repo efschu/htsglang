@@ -1501,7 +1501,14 @@ const FLIP_DEF = {"P>D": "Ende des letzten P-Prefill-Chunks → erstes Decode-To
 function flipParts(x) {
   if (!x || x.total_ms == null) return "";
   const p = (k, v) => `${k} ${sec(v)}`;
+  // D>P: der Vorlauf benannt (Summe = Vorlauf): leer = D's letztes Token bis zur Ankunft des Requests, der P braucht
+  // (davon D-Prefill im Rang-Takt), halt = Ankunft bis Park/flip_begin, park = Park-RPC, Rest bis flip_begin
+  const vor = x.leer_ms != null
+    ? ` <span class="muted">(Vorlauf = leer ohne Request ${sec(x.leer_ms)}${x.leer_d_prefill_ms ? `, davon D-Prefill ${sec(x.leer_d_prefill_ms)}` : ""} + Halt ${sec(x.halt_ms)} + Park ${sec(x.park_ms)} + Rest ${sec(x.vor_rest_ms)})</span>`
+    : (x.dir === "D>P" ? ` <span class="muted">(Vorlauf-Zerlegung fehlt: keine Ankunft des Requests)</span>` : "");
   return `Teile: ${p("Vorlauf", x.vorlauf_ms)} + ${p("Layer-Tausch", x.layer_ms)} + ${p("Wake-KV/DC", x.wake_kv_dc_ms)} + ${p("Nachlauf", x.nachlauf_ms)} + ${p("Rest", x.rest_ms)} = ${sec(x.total_ms)} s`
+    + vor
+    + (x.provisional ? ` <span class="muted">(vorläufig: D's Log hat seine letzten Runden noch nicht geschrieben)</span>` : "")
     + (x.end_res_ms ? ` <span class="muted">(Rest = Rang-Takt ${fmt(x.end_res_ms)} ms: Ende liegt dort)</span>` : "")
     + (x.nachlauf_d_extend_ms ? ` <span class="muted">(im Nachlauf D-Extend ${sec(x.nachlauf_d_extend_ms)} s)</span>` : "");
 }
