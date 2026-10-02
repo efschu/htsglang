@@ -227,6 +227,22 @@ def quiesce_poll_s() -> Tuple[float, bool]:
     return max(1, int(envs.SGLANG_WEG2_QUIESCE_FAST_POLL_MS.get())) / 1000.0, True
 
 
+#: QUIESCE-PENDING (02.10.): the words of PP0's answer while its idle vote is
+#: on the ring (Scheduler.group_idle_verdict, #1268) -- undecided, not idle.
+QUIESCE_PENDING_MARK = "GROUP VERDICT PENDING"
+
+
+def quiesce_pending_poll_s(poll_s: float, fast: bool) -> Optional[float]:
+    """QUIESCE-PENDING: the re-poll interval after a PENDING answer, or None
+    (the poll interval stays). Armed only where PP0 never re-wants a lap still
+    on the ring (H111 fast form or SGLANG_WEG2_IDLE_VOTE_NO_REWANT), so a poll
+    during the lap reads it, never spoils it; never longer than ``poll_s``."""
+    ms = int(envs.SGLANG_WEG2_QUIESCE_PENDING_POLL_MS.get() or 0)
+    if ms <= 0 or not (fast or envs.SGLANG_WEG2_IDLE_VOTE_NO_REWANT.get()):
+        return None
+    return min(float(poll_s), ms / 1000.0)
+
+
 #: fnFL2 v22: how long the quiesce waits for /health_generate proxies the
 #: front forwarded before the flip began (a 1-token generate, ~1 s warm; the
 #: cold-JIT first probe took 2 min on D -- that one the bound lets run out
@@ -12160,11 +12176,21 @@ class Front:
                 "proxy(ies) before the flush (fnFL2 v22)", g.name, waited[0], waited[1]
             )
         poll_s, fast = quiesce_poll_s()
+        pending_s = quiesce_pending_poll_s(poll_s, fast)
         polls = 0
+        pending_polls = 0
+        t_pending = None
         while time.time() - t0 < QUIESCE_DEADLINE_S:
             code, body = await self.rpc(g, "/flush_cache", None, 60)
             polls += 1
             if code == 200:
+                if pending_polls:
+                    logger.info(
+                        "WEG2-QUIESCE-PENDING group=%s pending_polls=%d interval_ms=%.0f "
+                        "first_pending_to_200_ms=%.0f (the idle vote was on the ring: re-polled "
+                        "after %.0f ms instead of %.0f, SGLANG_WEG2_QUIESCE_PENDING_POLL_MS)",
+                        g.name, pending_polls, pending_s * 1000.0,
+                        (time.time() - t_pending) * 1000.0, pending_s * 1000.0, poll_s * 1000.0)
                 if fast:
                     logger.info(
                         "WEG2-QUIESCE-FAST group=%s polls=%d ms=%.0f interval_ms=%.0f "
@@ -12174,6 +12200,15 @@ class Front:
                         poll_s * 1000.0)
                 return True, body
             last = body
+            if pending_s is not None and QUIESCE_PENDING_MARK in str(body or ""):
+                # QUIESCE-PENDING: the lap is on the ring -- its landing is read by
+                # the next poll, so that poll goes out at once (#1268 unchanged:
+                # undecided stays not idle, only a 200 ends this loop)
+                pending_polls += 1
+                if t_pending is None:
+                    t_pending = time.time()
+                await asyncio.sleep(pending_s)
+                continue
             await asyncio.sleep(poll_s)  # #1455: the P flush RPC answers in ~5 ms; 500 ms poll cost ~1 s per flip
         return False, last
 
