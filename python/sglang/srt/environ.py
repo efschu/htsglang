@@ -851,6 +851,14 @@ class Envs:
     SGLANG_HICACHE_LOAD_ASYNC_INDEX = EnvBool(
         _profile_default("SGLANG_HICACHE_LOAD_ASYNC_INDEX", False))
     SGLANG_WEG2_CENSUS_O1_EVICT = EnvBool(_profile_default("SGLANG_WEG2_CENSUS_O1_EVICT", False))
+    # QUIESCE-PENDING (02.10., N5t epoch 11 ..._012d1a161a_1002_153611: PP2's last
+    # PASS-TAIL 51.319, the idle lap home ~51.327, the next poll only at 51.335 --
+    # the 10 ms interval after a 'GROUP VERDICT PENDING' answer): while PP0 says
+    # the idle vote is ON THE RING the front re-polls after this many ms instead
+    # of the poll interval (never longer than it). Safe only with PP0's no-re-want
+    # guard (H111 / SGLANG_WEG2_IDLE_VOTE_NO_REWANT): a poll during the lap never
+    # stamps a second one. Marker 'WEG2-QUIESCE-PENDING'. 0 = the interval, as before.
+    SGLANG_WEG2_QUIESCE_PENDING_POLL_MS = EnvInt(1)
     # IDLE_VOTE_NO_REWANT (27B rc12z21 park boot dkr27bparkdraftbar1w109281421,
     # flip epoch=5 14:28:08-14:29:38): the H111 guard ALONE, without the fast
     # poll. 27B profiles never set QUIESCE_FAST, so every poll (50 ms) that

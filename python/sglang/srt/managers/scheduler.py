@@ -3278,6 +3278,8 @@ class Scheduler(
             # z30j: PP0 decides a forwarded flush once; followers follow it.
             park_forwarded=lambda req: _weg2_flush_verdict.follower_park(self, req),
             on_decided=lambda req, ok, detail: _weg2_flush_verdict.pp0_record(self, req, ok, detail),
+            # QUIESCE-PENDING: the refused verdict's text names a PENDING lap
+            refusal_detail=lambda: getattr(self, "_weg2_last_flush_refusal", "") or "",
         )
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
@@ -19908,6 +19910,7 @@ class Scheduler(
         # node is un-backed, join the write-throughs (bounded by the existing
         # write-back drain), then reset.  SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=0
         # restores the old form.
+        self._weg2_last_flush_refusal = ""  # QUIESCE-PENDING: only THIS flush's refusal names a lap
         if (
             self.enable_hierarchical_cache
             and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
@@ -20040,6 +20043,8 @@ class Scheduler(
                 f"| #1268 group verdict: {verdict_detail}"
             )
             success = False
+            # QUIESCE-PENDING: the flush wrapper names a PENDING lap in the answer
+            self._weg2_last_flush_refusal = str(verdict_detail or "")
         return success
 
     def _weg2_join_store_writes_before_reset(self) -> None:
