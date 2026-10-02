@@ -110,11 +110,11 @@ class FlipzeitDP(unittest.TestCase):
         self.assertIn("forward_ct", ft["D>P"]["missing"])
 
 
-def _ipc_pd(first_work=11.063):
+def _ipc_pd(first_work=11.063, what="decode_token"):
     ev = [_ev("flip_begin", T + 8.465, flip_begin_ts=T + 8.461, sleep="P", wake="D", epoch_before=1),
           _ev("flip_done", T + 12.96, flip_begin_ts=T + 8.461, t=T + 12.9572518, flip_ms=2427, epoch=2, sleep="P", wake="D")]
     fw = [{"dir": "P>D", "flip_begin_ts": T + 8.461, "first_work_ts": T + first_work, "flip_time_ms": 2601,
-           "flip_user_ms": 2602, "p_end_ts": T + 8.46, "p_end_source": "p_leg1_end", "what": "decode_token", "epoch": 2}]
+           "flip_user_ms": 2602, "p_end_ts": T + 8.46, "p_end_source": "p_leg1_end", "what": what, "epoch": 2}]
     return {"ipc_events": ev, "flip_first_work": fw, "flip_user_time": []}
 
 
@@ -137,6 +137,15 @@ class FlipzeitPD(unittest.TestCase):
         self.assertAlmostEqual(x["wake_kv_dc_ms"], 175, delta=1)          # clipped at the first token
         self.assertEqual(x["nachlauf_ms"], 0.0)
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)
+
+    def test_pd_non_streaming_d_first_forward_is_the_exact_end(self):
+        # 27B PDFLIP-E3 a0d03e9321: a non-streaming request stamps D's first forward from its beacon
+        for what in ("d_first_forward_done", "d_first_forward_done_approx"):
+            x = ipcboot.flip_views(SEGS, _ipc_pd(what=what), T + 60.0, _ring_pd())[0]
+            self.assertEqual(x["kind"], "ok")
+            self.assertIn(what, x["end_src"])
+            self.assertAlmostEqual(x["total_ms"], 2603, delta=1)
+            self.assertEqual(x["rest_ms"], 0.0)
 
     def test_pd_early_fire_before_layers_falls_back_to_d_rank_counters(self):
         # the NF y6d class: a "decode_token" 0,1 s after flip_begin -- D's layers are not back yet

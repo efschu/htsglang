@@ -615,6 +615,10 @@ def flip_partition(start: float, end: float, begin: float, flip_ms, done, lo: Op
     return p
 
 
+#: flip_first_work kinds that stamp D's first token after a P>D flip: the streamed first decode token, and
+#: (27B PDFLIP-E3 a0d03e9321, non-streaming requests) the end of D's first forward read from its beacon
+PD_END_WHATS = ("decode_token", "d_first_forward_done", "d_first_forward_done_approx")
+
 #: the endpoint fields, named where the page says "fehlt (Feld X)"
 F_PD_START = "flip_first_work.p_end_ts (P>D, Front) / P-Rang-Segment"
 F_PD_END = "flip_first_work.first_work_ts what=decode_token / rankstats D decode.tokens im Ring"
@@ -701,10 +705,10 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None) -> List[dict]
             # D cannot emit before its layers are back: the floor is flip_begin + flip_ms (0,3 s tolerance); it
             # rejects the NF y6d early-fire class (+0,02..0,99 s after begin), not D's real tokens during wake-kv/dc
             floor = (b + float(flip_ms) / 1000.0 if flip_ms is not None else t_done) - 0.3
-            fwt = f.get("first_work_ts") if f.get("what") == "decode_token" else None
+            fwt = f.get("first_work_ts") if f.get("what") in PD_END_WHATS else None
             if fwt is not None and floor <= float(fwt) <= horizon + 0.5:
                 end = float(fwt)
-                row["end_src"] = "front flip_first_work.first_work_ts (decode_token)"
+                row["end_src"] = "front flip_first_work.first_work_ts (%s)" % f.get("what")
             else:
                 r = _rank_first_rise(ring, d_first, ("dtok", "rounds", "pnew"), floor, horizon)
                 if r is not None:
