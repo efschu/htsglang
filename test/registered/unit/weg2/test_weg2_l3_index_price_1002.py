@@ -103,6 +103,13 @@ def store(tmp_path):
 
 # ---- the probe ------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _no_early_flip(monkeypatch):
+    # EARLY-FLIP (02.10.) would begin a D->P flip for these big arrivals on an
+    # idle D; this file tests the pricing in isolation, on the path without it
+    monkeypatch.setenv("SGLANG_WEG2_EARLY_FLIP", "0")
+
 def test_the_front_keys_pages_exactly_as_the_tree_writes_them():
     ids = _ids(5000)
     assert FS.bigram_page_hasher(ids, PAGE, True) == _tree_page_hashes(ids)
