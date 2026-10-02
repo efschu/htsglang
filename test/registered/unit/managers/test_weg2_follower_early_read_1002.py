@@ -67,9 +67,11 @@ def _arm(monkeypatch, on=True):
     monkeypatch.delenv("SGLANG_WEG2_DUAL_SHARE", raising=False)
 
 
-def test_switch_default_off():
-    assert not m.follower_early_read_on({})
+def test_switch_default_on():
+    # default ON since 02.10. (metal N5t..N6e); "0" restores the told-first order
+    assert m.follower_early_read_on({})
     assert m.follower_early_read_on({m.ENV_FOLLOWER_EARLY_READ: "1"})
+    assert not m.follower_early_read_on({m.ENV_FOLLOWER_EARLY_READ: "0"})
 
 
 def test_armed_follower_registers_at_intake_and_holds(monkeypatch):

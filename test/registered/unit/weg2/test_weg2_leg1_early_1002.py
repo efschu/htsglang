@@ -27,8 +27,10 @@ def _p(rid, **kw):
     return SimpleNamespace(**d)
 
 
-def test_switch_default_off():
-    assert not F.leg1_early_on({})
+def test_switch_default_on():
+    # default ON since 02.10. (metal N5q..N6e); "0" disarms it
+    assert F.leg1_early_on({})
+    assert not F.leg1_early_on({F.LEG1_EARLY_ENV: "0"})
     for on in ("1", "true", "yes", "on"):
         assert F.leg1_early_on({F.LEG1_EARLY_ENV: on})
 

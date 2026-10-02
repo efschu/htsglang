@@ -307,16 +307,15 @@ def forget_rid_leftovers(tree, rid: str) -> bool:
 #: ``weg2_told_fallback.follower_pump``): equal / over(absolute) ack told at
 #: once, short registers the told-limited read and acks when it ends, a
 #: relative overshoot acks its own count and PF answers told=0 by name.
-#: DEFAULT OFF: sixteen #1400 desk tests pin the told-first order (among them a
-#: relative-told refusal the early read must not turn into an admission); arm
-#: with SGLANG_WEG2_FOLLOWER_EARLY_READ=1 once a window has shown
-#: FOLLOWER-EARLY-SETTLE ... -> equal on every follower.
+#: DEFAULT ON since 02.10. (metal N5t..N6e: FOLLOWER-EARLY-SETTLE at=ack on every
+#: follower, TOLD-ACKED 0.46 -> 0.02-0.05 s); SGLANG_WEG2_FOLLOWER_EARLY_READ=0
+#: restores the told-first order the #1400 desk tests pin.
 ENV_FOLLOWER_EARLY_READ = "SGLANG_WEG2_FOLLOWER_EARLY_READ"
 
 
 def follower_early_read_on(env=None) -> bool:
     env = os.environ if env is None else env
-    return str(env.get(ENV_FOLLOWER_EARLY_READ, "") or "").strip().lower() in ("1", "true", "yes", "on")
+    return str(env.get(ENV_FOLLOWER_EARLY_READ, "1") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _early_reads(scheduler) -> Dict[str, float]:
