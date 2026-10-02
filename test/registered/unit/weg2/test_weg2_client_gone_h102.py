@@ -260,8 +260,9 @@ def test_p_slot_wait_hang_up_skips_leg1():
     # the drain's `one` reads the flag before it POSTs leg 1
     src = open(fr.__file__).read()
     i = src.index("async def one(p: Pending) -> Pending:")
-    blk = src[i:i + 700]
+    blk = src[i:i + 1200]   # DP-NACHLAUF 02.10.: the early-leg await sits between them
     assert blk.index("if p.client_gone:") < blk.index("await self.leg1(p)")
+    assert blk.index("if p.client_gone:") < blk.index("await _early")
     j = src.index("def _on_leg1_done(p: Pending)")
     assert "if p.client_gone:" in src[j:j + 500]
 
