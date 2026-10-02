@@ -2779,7 +2779,10 @@ class HiCacheController:
             # N2 (spec section 12): the restart helper does not touch the
             # instrument counter, so it is zeroed here with the pipeline.
             self.prefetch_tokens_occupied = 0
+            _t_start = time.perf_counter()
             self._start_storage_threads()
+            # TREE-RESET-SUB: the restart's own share of the tree reset (instrument)
+            self._weg2_last_start_ms = (time.perf_counter() - _t_start) * 1000.0
 
     def write(
         self,
