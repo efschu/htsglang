@@ -184,6 +184,37 @@ def _file(profile: str, records_dir: str) -> Tuple[Tuple[Record, ...], Tuple[str
     return recs, borrow
 
 
+@lru_cache(maxsize=None)
+def inventory_of(profile: str, records_dir: str = RECORDS_DIR) -> Optional[Tuple[str, ...]]:
+    """HW-GENERIC 1002: the card inventory (calibration-class labels in card
+    order, weg2/card_identity.py) the profile's POSITIONAL records were
+    measured on -- the file's top-level ``inventory``; None = not declared
+    (or no file). A positional record holds only for its inventory."""
+    path = os.path.join(records_dir, f"{profile}.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except OSError:
+        return None
+    except ValueError as exc:
+        raise RecordError(f"{path}: not JSON ({exc})")
+    inv = data.get("inventory") if isinstance(data, dict) else None
+    if inv in (None, []):
+        return None
+    if not isinstance(inv, list) or not all(isinstance(x, str) and x for x in inv):
+        raise RecordError(f"{path}: inventory must be a list of card-class labels, got {inv!r}")
+    return tuple(inv)
+
+
+def is_positional(value, n_cards: int) -> bool:
+    """A per-card vector of ``n_cards`` entries (a list, or a 'a,b,c' string)."""
+    if isinstance(value, (list, tuple)):
+        return len(value) == int(n_cards)
+    if isinstance(value, str) and "," in value:
+        return len(value.split(",")) == int(n_cards)
+    return False
+
+
 def own_records(profile: str, records_dir: str = RECORDS_DIR) -> Tuple[Record, ...]:
     """The records measured on ``profile``'s checkpoint (its own file)."""
     return _file(str(profile), records_dir)[0]
@@ -367,6 +398,6 @@ def log_power_by_class(lines) -> Dict[str, float]:
 __all__ = [
     "RECORDS_DIR", "POWER_TOLERANCE", "KINDS", "POWER_MATCH", "POWER_MISMATCH", "POWER_UNKNOWN",
     "CUT_MATCH", "CUT_MISMATCH", "CUT_UNKNOWN", "CUT_NEUTRAL", "RecordError", "Record", "Selected",
-    "parse_record", "own_records", "borrow_of", "records", "constants_of", "power_verdict",
+    "parse_record", "inventory_of", "is_positional", "own_records", "borrow_of", "records", "constants_of", "power_verdict",
     "cut_verdict", "select", "current_power_by_class", "log_power_by_class",
 ]

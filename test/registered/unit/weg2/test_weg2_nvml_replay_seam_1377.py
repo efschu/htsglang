@@ -34,11 +34,14 @@ from sglang.test.test_utils import CustomTestCase
 
 CARDS = [
     {"index": 0, "uuid": "GPU-aaa", "name": "NVIDIA GeForce RTX 5090",
-     "total_bytes": 34191769600, "reserved_bytes": 0, "pci_bus_id": "0:1:0"},
+     "total_bytes": 34191769600, "reserved_bytes": 0, "pci_bus_id": "0:1:0",
+     "cc_major": 12, "cc_minor": 0},
     {"index": 1, "uuid": "GPU-bbb", "name": "NVIDIA GeForce RTX 3080",
-     "total_bytes": 21474836480, "reserved_bytes": 0, "pci_bus_id": "0:2:0"},
+     "total_bytes": 21474836480, "reserved_bytes": 0, "pci_bus_id": "0:2:0",
+     "cc_major": 8, "cc_minor": 6},
     {"index": 2, "uuid": "GPU-ccc", "name": "NVIDIA GeForce RTX 3080",
-     "total_bytes": 21474836480, "reserved_bytes": 0, "pci_bus_id": "0:3:0"},
+     "total_bytes": 21474836480, "reserved_bytes": 0, "pci_bus_id": "0:3:0",
+     "cc_major": 8, "cc_minor": 6},
 ]
 
 

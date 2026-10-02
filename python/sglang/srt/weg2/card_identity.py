@@ -17,7 +17,7 @@ What this module replaces (f7099c0cbd / 3fe878018d):
 THE THREE NOTIONS, kept apart on purpose:
 
 1. :func:`card_key` -- what the card IS: model + NVML total + compute
-   capability (``"RTX 3090/24576MiB/sm86"``). Two boards with one key are
+   capability (``"RTX3090/24576MiB/sm86"``). Two boards with one key are
    the same calibration subject. Model is the NVML name with the vendor
    words dropped, compared EXACTLY (no substring: "A10" is not "A100").
 2. :func:`calibration_class` -- which MEASURED class the card belongs to, or
@@ -184,9 +184,10 @@ def _sm(cc: Optional[Tuple[int, int]]) -> str:
 
 
 def card_key(card) -> str:
-    """What the card IS: ``"<model>/<total>MiB/sm<cc>"``."""
+    """What the card IS: ``"<model>/<total>MiB/sm<cc>"``, spaces dropped from
+    the model so the key is one log token (``card=RTX3090/24576MiB/sm86``)."""
     p = props_of(card)
-    return f"{model_name(p.name)}/{p.total_mib}MiB/{_sm(p.cc)}"
+    return f"{model_name(p.name).replace(' ', '')}/{p.total_mib}MiB/{_sm(p.cc)}"
 
 
 def calibration_class(card) -> Optional[str]:
@@ -194,15 +195,18 @@ def calibration_class(card) -> Optional[str]:
 
     Model (exact), compute capability (exact) and NVML total (within
     :data:`TOTAL_TOLERANCE`) must all agree. A card WITHOUT a reported cc
-    never reached a boot (:func:`arch_gate` refuses it at ``resolve_cards``);
-    it is a hand-built object (desk test, offline tool) and is matched on
-    model + VRAM tier alone -- still exact, still tier-aware."""
+    (or total) never reached a boot (:func:`arch_gate` refuses it at
+    ``resolve_cards``; NVML always states the total); it is a hand-built
+    object (desk test, offline tool) and is matched on what it states --
+    the model always exactly, never as a substring."""
     p = props_of(card)
     model = model_name(p.name).lower()
     for cls in CALIBRATED_CLASSES:
         if (model == cls.model.lower()
                 and (p.cc is None or tuple(p.cc) == tuple(cls.cc))
-                and abs(p.total_mib - cls.total_mib) <= cls.total_mib * TOTAL_TOLERANCE):
+                # total 0 = not stated (a hand-built stand-in; NVML always states it)
+                and (not p.total_mib
+                     or abs(p.total_mib - cls.total_mib) <= cls.total_mib * TOTAL_TOLERANCE)):
             return cls.label
     return None
 
