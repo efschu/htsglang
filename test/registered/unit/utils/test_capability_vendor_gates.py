@@ -233,7 +233,21 @@ class TestFixedSitesAskInTheNvidiaNamespace(unittest.TestCase):
         with nvidia((8, 6)):
             self.assertTrue(fp8_utils.can_auto_enable_marlin_fp8())
         with nvidia((8, 9)):
-            self.assertFalse(fp8_utils.can_auto_enable_marlin_fp8())
+            # SM89-DURCHSPIEL-1002: on 8.9 the answer is the WHEEL's -- the
+            # FP8-Marlin fallback arms when the installed sgl_kernel carries
+            # no sm_89 SASS (the CUTLASS Sm89 branch in the 86;120a wheel is
+            # a brkpt stub), and the native CUTLASS path stays when it does.
+            fp8_utils.can_auto_enable_marlin_fp8.cache_clear()
+            from sglang.srt.utils import wheel_sass
+
+            with mock.patch.object(fp8_utils, "wheel_carries_sass", lambda cc: False), \
+                 mock.patch.object(wheel_sass, "sgl_kernel_sass_archs",
+                                   lambda cc: frozenset({86, 120})):
+                self.assertTrue(fp8_utils.can_auto_enable_marlin_fp8())
+            fp8_utils.can_auto_enable_marlin_fp8.cache_clear()
+            with mock.patch.object(fp8_utils, "wheel_carries_sass", lambda cc: True):
+                self.assertFalse(fp8_utils.can_auto_enable_marlin_fp8())
+            fp8_utils.can_auto_enable_marlin_fp8.cache_clear()
         # gfx803 reports (8, 0) and would land inside the sm80..88 range.
         with rocm("gfx803", (8, 0)):
             self.assertFalse(fp8_utils.can_auto_enable_marlin_fp8())

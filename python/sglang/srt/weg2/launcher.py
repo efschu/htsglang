@@ -5633,7 +5633,9 @@ def resolve_cards() -> List[Card]:
     ]
     # HW-GENERIC 1002: THE arch gate, once, at the one card-list producer --
     # every boot path (main, p_stage_power_current, xchg_census) reads its
-    # cards here. sm_86 / sm_120 only; anything else refused BY NAME.
+    # cards here. sm_86 / sm_89 / sm_120 pass (sm_89 UNCALIBRATED: it reaches
+    # the named HW-UNCALIBRATED path in inventory_check_line, not a borrow);
+    # anything else refused BY NAME (SM89-DURCHSPIEL-1002).
     try:
         card_identity.arch_gate(cards)
     except card_identity.CardInventoryRefused as exc:
