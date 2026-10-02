@@ -186,6 +186,64 @@ def issued(req) -> bool:
     return bool(getattr(req, ISSUED_ATTR, False))
 
 
+def l15_agreed_held_rids(sched, gather=None) -> set:
+    """The rids of the L1.5 hold IF every D rank predicts the same hold
+    (its manifest present, same fingerprint, and it will vote for it: a
+    capped rank, or a cap-0 rank with REFILL on and every anchor named);
+    else the empty set. ONE host all_gather over the group the wake's
+    decide uses; master off -> empty set, no collective."""
+    import os as _os
+
+    try:
+        from sglang.srt.weg2 import l15_plan
+    except Exception:  # noqa: BLE001
+        return set()
+    if not l15_plan.master_on(_os.environ):
+        return set()
+    vote = None
+    try:
+        from sglang.srt.weg2 import l15_manifest, l15_shadow
+
+        rank = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0)
+        m = l15_manifest.read(l15_manifest.manifest_path("D", rank, _os.environ))
+        if m is not None:
+            mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+            pool = getattr(mr, "token_to_kv_pool", None)
+            tp = int(getattr(sched, "tp_size", 0) or getattr(
+                getattr(sched, "server_args", None), "tp_size", 1) or 1)
+            rg = getattr(getattr(sched, "server_args", None), "rank_gpu_id", None)
+            cards = (list(rg) if isinstance(rg, (list, tuple)) and len(rg) == tp
+                     else list(range(tp)))
+            caps = l15_shadow.caps_from_env(
+                _os.environ, tp, [l15_shadow.cell_bytes_from(pool)] * tp, cards)
+            cap = int(caps[rank]) if rank < len(caps) else 0
+            refill = l15_plan._switch(_os.environ, "SGLANG_WEG2_L15_REFILL")
+            anchors = all(int(getattr(sp, "anchor_l2_slot", -1)) >= 0 for sp in m.spans)
+            if cap > 0 or (refill and anchors):
+                vote = (int(l15_manifest.fingerprint(m)),
+                        sorted(str(sp.rid) for sp in m.spans))
+    except Exception as exc:  # noqa: BLE001 -- vote None, still gather
+        logger.info("L15-READ-EARLY-FILTER vote skipped (%s: %s)", type(exc).__name__, exc)
+        vote = None
+    if gather is None:
+        import torch
+
+        wg = getattr(sched, "world_group", None)
+        grp = getattr(wg, "cpu_group", None) if wg is not None else None
+        world = torch.distributed.get_world_size(group=grp) if grp is not None else 1
+
+        def gather(v):
+            if grp is None or world <= 1:
+                return [v]
+            out = [None] * world
+            torch.distributed.all_gather_object(out, v, group=grp)
+            return out
+    votes = gather(vote)
+    if votes and votes[0] is not None and all(v == votes[0] for v in votes):
+        return set(votes[0][1])
+    return set()
+
+
 def issue_reads_at_wake_begin(sched) -> list:
     """F22 (29.09.): the deferred hold reads at the START of the weight legs.
 
@@ -204,6 +262,16 @@ def issue_reads_at_wake_begin(sched) -> list:
     hold = getattr(sched, "weg2_dormant_hold", None) or []
     if not hold:
         return []
+    # L15-READ-EARLY-FILTER: the rids the whole group will keep on the card
+    # (L1.5 hold) need no store read now -- skipped only when EVERY rank
+    # predicts the same hold (one host gather); otherwise no filter
+    # (duplicate I/O, never a split read set).
+    held = l15_agreed_held_rids(sched)
+    if held:
+        kept = [r for r in hold if str(getattr(r, "rid", "")) not in held]
+        logger.info("L15-READ-EARLY-FILTER skipped=%d of %d (held on the card by "
+                    "the whole group)", len(hold) - len(kept), len(hold))
+        hold = kept
     out = issue_deferred_reads(sched, hold)
     if out:
         logger.info("#248 WAKE-READ-EARLY issued=%d at the weight legs' start (F22: the read runs "
