@@ -119,3 +119,59 @@ def test_red_d_content_before_its_wake_is_still_refused():
     c.note_awake(102.4)
     assert c.seen("D", "decode_token", "r", 102.0, leg2_dispatch_ts=100.1) is None   # > 0.3 s early
     assert c.seen("D", "decode_token", "r", 102.2, leg2_dispatch_ts=100.1) is not None
+
+
+# ---- PDFLIP-E3 (N5f d332c46c88, the FIRST flips after the boot) ---------------------
+
+def test_red_an_empty_beacon_reading_at_the_first_dp_done_is_a_zero_baseline():
+    """N5f 13:30:08: P had run no forward since the boot -> no beacon file at done; the
+    first D->P had no exact end (rigdash fell back to the 1-s rank raster)."""
+    c = _clock({})
+    assert c.waits_for_beacon()
+    assert c.note_beacon({}) is None
+    assert c.note_beacon({21: (1, int(103.4 * NS), 0), 22: (2, int(103.9 * NS), 0)}) == 103.4
+    assert not c.waits_for_beacon()                      # the end is known; no rank count to wait for
+    ev = c.first_prefill("weg2-0-2", 101.95, 110.0, 6.9)
+    assert ev["prefill_start_source"] == "pp_first_forward" and ev["prefill_start_ts"] == 103.4
+    assert ev["pp_last_start_ts"] is None
+
+
+def test_red_the_front_reads_an_empty_p_beacon_dir_as_a_reading_not_as_off(monkeypatch):
+    import types as _t
+
+    from sglang.srt.weg2 import front as F
+    from sglang.srt.weg2 import progress_beacon as fp
+
+    monkeypatch.setattr(fp, "enabled", lambda env=None: True)
+    monkeypatch.setattr(fp, "beacon_dir", lambda tag="", env=None: "/nonexistent-beacons")
+    ns = _t.SimpleNamespace(tag="t", groups={"P": _t.SimpleNamespace(sid=4242), "D": _t.SimpleNamespace(sid=4243)})
+    assert F.Front._p_beacons(ns) == {}
+    assert F.Front._group_beacons(ns, "D") == {}
+
+
+def test_red_pd_first_token_from_d_beacons_when_no_stream_chunk_came(monkeypatch):
+    """N5f 13:30:17: non-stream requests -> no D chunk the front could time; D's first
+    forward after done ends at its t_done = the first token."""
+    import asyncio
+    import types as _t
+
+    from sglang.srt.weg2 import front as F
+
+    fw = fsi.FirstWorkClock()
+    fw.arm(2, "P", "D", 100.0)
+    fw.done(102.5)
+    pub = []
+    reads = iter([{7: (10, 90 * NS, 91 * NS)},                        # nothing yet
+                  {7: (11, int(102.6 * NS), 91 * NS)},                 # first forward running
+                  {7: (11, int(102.6 * NS), int(103.05 * NS))}])       # ...and done
+    ns = _t.SimpleNamespace(_ipc_fw_clock=fw)
+    ns._ipc_first_work_clock = lambda: fw
+    ns._ipc_publish = lambda typ, data: pub.append((typ, data))
+    monkeypatch.setattr(F.Front, "_group_beacons", staticmethod(lambda self, g: next(reads)))
+    monkeypatch.setattr(F.Front, "_flip_phase",
+                        staticmethod(lambda self: _t.SimpleNamespace(first_work=lambda ts, what: None)))
+    monkeypatch.setattr(F.Front, "_ipc_live_kick", staticmethod(lambda self: None))
+    asyncio.run(F.Front._watch_d_first_forward(ns, {7: (10, 90 * NS, 91 * NS)}, 102.5, period_s=0.0))
+    assert pub and pub[0][0] == "flip_first_work"
+    ev = pub[0][1]
+    assert ev["what"] == "d_first_forward_done" and ev["first_work_ts"] == 103.05
