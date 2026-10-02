@@ -125,3 +125,26 @@ def test_the_backward_anchor_scan_equals_the_forward_answer(store):
     pr = store.probe()
     assert pr.depth(p).tokens == 8192
     assert pr._deepest(h, 11000, "mamba") == 8191 and pr._deepest(h, 100, "mamba") == -1
+
+
+# ---- BOOT-START HOLD (NF a105d38905) with the 27B bound ------------------------------------
+
+def test_the_boot_start_hold_is_bounded(caplog):
+    import asyncio
+    import collections
+    import logging
+
+    from sglang.srt.weg2 import front as F
+
+    caplog.set_level(logging.INFO)
+    f = object.__new__(F.Front)
+    f.counters = collections.Counter()
+    f.ftok = types.SimpleNamespace(state="loading")
+    f.X_EXACT_HOLD_MAX_S = 0.05  # a load that never ends (no group answers its server info)
+
+    async def go():
+        await f._x_exact_await_tokenizer("weg2-0-1")
+
+    asyncio.run(asyncio.wait_for(go(), 5))
+    assert f.counters["x_exact_hold_timeout"] == 1
+    assert any("WEG2 X-EXACT-HOLD rid=weg2-0-1 TIMEOUT" in m for m in caplog.messages)

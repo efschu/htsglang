@@ -397,13 +397,16 @@ def test_the_measured_d_prefix_is_subtracted(caplog):
     assert _route(f2, _payload(100)) == "short"  # exactly X pending
 
 
-def test_not_ready_falls_back_to_the_estimate_by_name(caplog):
+def test_a_failed_load_falls_back_to_the_estimate_by_name(caplog):
+    """BOOT-START HOLD (y7d): only a load that ENDED without a tokenizer
+    falls back to chars/3 -- by name; a loading one holds the decision
+    (test_weg2_l3_index_price_1002)."""
     f = _front(True)
-    f.ftok.state = "loading"
+    f.ftok.state = "failed"
     with caplog.at_level(logging.INFO, logger="weg2.front"):
         assert _route(f, _payload(3 * X + 600)) == "long"  # chars/3 decides
     msgs = [r.getMessage() for r in caplog.records]
-    assert any(m.startswith("WEG2 X-EXACT-FALLBACK") and "reason=tokenizer_loading" in m
+    assert any(m.startswith("WEG2 X-EXACT-FALLBACK") and "reason=tokenizer_failed" in m
                for m in msgs)
     assert f.counters["x_exact_fallback"] == 1
 

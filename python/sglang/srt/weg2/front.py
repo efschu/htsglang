@@ -5742,15 +5742,65 @@ class Front:
                     time.monotonic() - t0)
 
     # -- X-EXACT (user 26.09. ~19:00Z): exact pending tokens ------------------
+    def _x_exact_ready_event(self) -> asyncio.Event:
+        """BOOT-START HOLD: set once the front tokenizer's load ENDED (ready or
+        failed); created lazily in the running loop."""
+        evt = self.__dict__.get("_x_exact_ready_evt")
+        if evt is None:
+            evt = self.__dict__["_x_exact_ready_evt"] = asyncio.Event()
+        return evt
+
     async def _x_exact_boot(self) -> None:
+        """BOOT-START HOLD (y7d 08:57:43, weg2-0-2..0-4 priced by chars/3 with
+        ``reason=tokenizer_loading`` and flipped for 24..170 real tokens): the
+        load runs, and whatever its end, the route decisions held behind it
+        are released (:meth:`_x_exact_await_tokenizer`)."""
+        try:
+            await self._x_exact_boot_load()
+        finally:
+            self._x_exact_ready_event().set()
+
+    #: BOOT-START HOLD bound (27B port): a load measured 7-10 s; past this the arrival is priced
+    #: by the named fallback rather than held for a load that may never end
+    X_EXACT_HOLD_MAX_S = 60.0
+
+    async def _x_exact_await_tokenizer(self, rid: str) -> None:
+        """BOOT-START HOLD: an arrival while the front tokenizer is still
+        loading waits for it -- the ROUTE DECISION waits, the request is
+        accepted and nothing else in the front does. It is never priced by
+        chars/3 because the tokenizer was loading (a failed load still falls
+        back by name: ``reason=tokenizer_failed``). Costs a boot's first
+        arrivals the rest of the ~10 s load; a chars/3 LONG costs them a flip
+        pair."""
+        ft = self.ftok
+        if ft is None or ft.state not in ("unloaded", "loading"):
+            return
+        t0 = time.monotonic()
+        self.counters["x_exact_held"] += 1
+        try:
+            await asyncio.wait_for(self._x_exact_ready_event().wait(), timeout=self.X_EXACT_HOLD_MAX_S)
+        except asyncio.TimeoutError:
+            # 27B port: the load waits for a group's /get_server_info without a bound; a hold
+            # without one could keep a client forever -- past the bound the arrival is priced
+            # as before (X-EXACT-FALLBACK reason=tokenizer_loading), named
+            self.counters["x_exact_hold_timeout"] += 1
+            logger.warning("WEG2 X-EXACT-HOLD rid=%s TIMEOUT after %.0f s state=%s -- the tokenizer load "
+                           "has not ended; priced without it (named fallback)", rid,
+                           time.monotonic() - t0, ft.state)
+            return
+        logger.info("WEG2 X-EXACT-HOLD rid=%s waited_ms=%.0f state=%s (the route decision waited "
+                    "for the front tokenizer; a boot-start arrival is never priced by chars/3 "
+                    "because the tokenizer was loading)", rid, (time.monotonic() - t0) * 1000.0,
+                    ft.state)
+
+    async def _x_exact_boot_load(self) -> None:
         """Load D's rendering stack into the front, off the event loop.
 
         The tokenizer path and every rendering setting come from a group's own
         ``/get_server_info`` (the same server args its tokenizer manager
         runs), so there is one source for the profile's tokenizer: the group.
         Startup only: retried every 5 s until a group answers, then never
-        again. Until READY every request is priced by chars/3 and says so
-        (``X-EXACT-FALLBACK reason=tokenizer_loading``)."""
+        again. Until READY every route decision waits (BOOT-START HOLD)."""
         t0 = time.monotonic()
         tries = 0
         info: Dict[str, Any] = {}
@@ -5882,6 +5932,7 @@ class Front:
         """The exact pricing of one arrival, or None (then the chars/3 figures
         stand, and the line below says why). Runs the count in the front
         tokenizer's worker thread; the event loop only awaits it."""
+        await self._x_exact_await_tokenizer(rid)
         ft = self.ftok
         reason = None
         if ft is None or ft.state != "ready":

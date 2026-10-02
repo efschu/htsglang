@@ -283,5 +283,114 @@ def test_wiring():
     assert i < src.index("pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)")
     assert 'self.tspans.record_store_depth(c.ids, l3, source="l3_index")' in src
     assert "await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)" \
-        in inspect.getsource(F.Front._x_exact_boot)
+        in inspect.getsource(F.Front._x_exact_boot_load)
     assert '"l3_index": int(self.counters["l3_index_credit"])' in inspect.getsource(F.Front.state_dict)
+
+
+# ---- BOOT-START HOLD: the route decision waits for the tokenizer ----------------------
+
+class _Req:
+    def __init__(self, payload, path="/v1/messages"):
+        self._p = payload
+        self.path = path
+
+    async def json(self):
+        return self._p
+
+
+class _LoadingTokens(_Tok):
+    """Loading at the first arrival; records the state every count saw."""
+    state = "loading"
+
+    def __init__(self, ids):
+        from concurrent.futures import ThreadPoolExecutor
+
+        super().__init__(ids)
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.states_at_count = []
+
+    def count(self, path, payload):
+        self.states_at_count.append(self.state)
+        return super().count(path, payload)
+
+
+def _boot_front(probe, ids):
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_WEG2_FRONT_EXACT_TOKENS.override(True):
+        f = F.Front(prefill="http://p", decode="http://d", awake="D", tag="bootstart",
+                    store_dir="/tmp", prefill_sid=0, decode_sid=0, dc_reserve={}, w_s=45.0,
+                    weight_chunks=2, tp_prefill_max_tokens=X, flip_min_work_tokens=X)
+    f.state = "serving"
+    f.routed = []
+
+    async def seat(rid, est, refused=None):
+        return 1
+
+    async def leg2(request, rid, payload, text, stream, pending=None, **kw):
+        f.routed.append(("short", rid))
+        return F.web.json_response({})
+
+    async def solo(rid, rem):
+        return True
+
+    f._acquire_short_seat = seat
+    f.leg2 = leg2
+    f._x_solo_admits = solo
+    f._kick_controller = lambda *a, **k: None
+    f.ftok = _LoadingTokens(ids)
+    f.store_probe = probe
+    return f
+
+
+def test_y7d_boot_start_request_waits_for_the_tokenizer_then_prices_short_on_l3(store, caplog):
+    """y7d 08:57:43: weg2-0-2 arrived 0.8 s after 'WEG2-FRONT up', was priced
+    115213 by chars/3 (reason=tokenizer_loading, presence_src=none), LONG, flip
+    pair -- P hit 111232 of 111256 from the persistent L3. Now: held until the
+    tokenizer is ready, then exact and credited by the store: SHORT."""
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    prev = _ids(111256)
+    h = _tree_page_hashes(prev)
+    store.write(h, mamba=[len(h) - 1])
+    f = _boot_front(store.probe(), _ids(111256))
+    payload = {"model": "m", "max_tokens": 10,
+               "messages": [{"role": "user", "content": "a" * 345637}]}
+
+    async def go():
+        t = asyncio.create_task(f.handle_generate(_Req(payload)))
+        await asyncio.sleep(0.2)
+        held = not t.done() and not f.routed and not f.counters["route_long"]
+        f.ftok.state = "ready"  # the load finished
+        f._x_exact_ready_event().set()
+        await asyncio.sleep(0.3)
+        if not t.done():
+            t.cancel()
+        return held
+
+    assert asyncio.run(go()), "the route decision waited while the tokenizer loaded"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert not any("tokenizer_loading" in m for m in msgs)
+    assert f.ftok.states_at_count == ["ready"], "never counted/priced while loading"
+    assert any(m.startswith("WEG2 X-EXACT-HOLD rid=weg2-0-1 ") for m in msgs)
+    price = [m for m in msgs if m.startswith("WEG2 X-EXACT-PRICE")]
+    assert len(price) == 1 and "pending=24 tokens=111256 credit=111232 src=l3_index" in price[0]
+    verdict = [m for m in msgs if m.startswith("WEG2 ROUTE-VERDICT")][0]
+    assert "verdict=short uncached=24 " in verdict and "presence_src=l3_index" in verdict
+    assert f.routed == [("short", "weg2-0-1")] and not f.counters["route_long"]
+
+
+def test_the_boot_task_releases_the_hold_even_when_the_load_fails():
+    async def go():
+        f = object.__new__(F.Front)
+
+        async def boom():
+            raise RuntimeError("no group answered")
+
+        f._x_exact_boot_load = boom
+        try:
+            await f._x_exact_boot()
+        except RuntimeError:
+            pass
+        return f._x_exact_ready_event().is_set()
+
+    assert asyncio.run(go())
