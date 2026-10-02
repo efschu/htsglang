@@ -174,10 +174,28 @@ def issue_deferred_reads(sched, hold) -> list:
 
 
 def early_enabled() -> bool:
+    """F22 WAKE-READ-EARLY -- never under L1.5 (PDFLIP-P, 02.10.).
+
+    N4f 1002_110321 (L15 on, early read on by default since d1e5da09dc):
+    11:11:19 ``#248 WAKE-READ-EARLY issued=3`` for D's parked rids, 11:11:21
+    ``HiCache prefetch success req=weg2-10-16 loaded=203826`` -- then the kv
+    wake's L15 path (``L15-REFILL anchors-missing: votes no hold``, ``L15-RESTORE
+    no hold kept``) RESET the tree (``#1427 ARENA-REF RESET-RELEASE
+    released=203827``, ``HOST-POOL CLEAR``) and the read was gone: ``X-GATE
+    rid=weg2-10-16 uncached=206952 verdict=W31``, W50-REROUTE of 2 parked rids
+    to P, a D->P flip 4 s after the P->D -- the ping-pong. The release-time
+    read (issued after that reset) survives it. Until the L15 wake keeps a
+    completed hold read (or skips the L15-held rids rank-uniformly, l15-lead),
+    the master switch turns the early read off on every rank alike (the env
+    is the group's). Reads only L15's switch, no L15 code changes."""
     try:
         from sglang.srt.environ import envs
 
-        return bool(envs.SGLANG_WEG2_ENABLE_WAKE_READ_EARLY.get())
+        if not bool(envs.SGLANG_WEG2_ENABLE_WAKE_READ_EARLY.get()):
+            return False
+        from sglang.srt.weg2 import l15_plan
+
+        return not l15_plan.master_on(os.environ)
     except Exception:  # noqa: BLE001
         return False
 

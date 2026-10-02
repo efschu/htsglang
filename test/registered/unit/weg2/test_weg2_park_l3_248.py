@@ -540,6 +540,28 @@ def test_red_pdflip_f22_default_on_reads_beside_the_legs(env):
     assert s.weg2_post_wake_settle == []
 
 
+def test_red_pdflip_early_read_is_off_under_l15(env):
+    """N4f 1002_110321 (L15 on): the early read completed during the legs, the kv
+    wake's L15 path then RESET the tree (#1427 RESET-RELEASE released=203827)
+    and weg2-10-16 met X-GATE uncached=206952 W31 -> reroute to P -> ping-pong.
+    Under the L15 master switch the read stays at the release (after that
+    reset), on every rank alike. RED on e34d3eea16."""
+    env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    env.mp.setenv("SGLANG_WEG2_L15", "1")
+    reads = []
+    tree = _Tree()
+    s = _wake_sched(tree, reads)
+    a = _req(PARKED)
+    park_l3.defer_hold_read(s, a)
+    s.weg2_dormant_hold = [a]
+    assert park_l3.early_enabled() is False
+    assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == []
+    Scheduler._weg2_release_dormant_hold(s)
+    assert reads == [PARKED]
+    env.mp.setenv("SGLANG_WEG2_L15", "0")
+    assert park_l3.early_enabled() is True
+
+
 def test_f22_switch_off_reads_at_the_release_as_before(env):
     """Off (=0, the pre-default form): the legs' start issues nothing, the
     release reads as on 895559fed2."""
