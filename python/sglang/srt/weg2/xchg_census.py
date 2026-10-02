@@ -243,30 +243,27 @@ def dormant_for_card(card: object, readings: Dict[str, Dict[str, int]], stem: st
             f"group's sleep), peak per group {detail} MiB; the LARGER is "
             f"charged (group {best}) because one field states both ranks"
         )
-    # (b) the boot-named MEASURED constants.  The model has to be NAMED by one
-    # of them: the launcher's own `"5090" in c.name else <3080>` is a
-    # two-board inventory assumption, true of this rig and not a measurement
-    # of a third card, so an unrecognised board refuses instead of borrowing
-    # the 3080's number.
-    if "5090" in name:
-        return launcher.DC_MEASURED_D_5090_MIB, (
-            "CONSTANT launcher.DC_MEASURED_D_5090_MIB = "
-            f"{launcher.DC_MEASURED_D_5090_MIB} MiB, MEASURED on boot weg2ls1b2 "
-            "(NVML per-process at group D's first sleep, NEXTN draft + TP decode "
-            f"graphs resident); boot {stem} logged no uuid-keyed WEG2-DC reading"
-        )
-    if "3080" in name:
-        return launcher.DC_MEASURED_D_3080_MIB, (
-            "CONSTANT launcher.DC_MEASURED_D_3080_MIB = "
-            f"{launcher.DC_MEASURED_D_3080_MIB} MiB, MEASURED on boot weg2ls1b2 "
+    # (b) the boot-named MEASURED constants.  The card has to belong to the
+    # CALIBRATION CLASS one of them was measured on (HW-GENERIC 1002:
+    # weg2/card_identity.py -- model + arch + VRAM tier, never a name
+    # substring), so an unrecognised board refuses instead of borrowing.
+    from sglang.srt.weg2 import card_identity as _ci
+
+    sel = launcher.DC_MEASURED_D_BY_CLASS.get(_ci.calibration_class(card) or "")
+    if sel is not None:
+        const_name = sel[0]
+        return getattr(launcher, const_name), (
+            f"CONSTANT launcher.{const_name} = "
+            f"{getattr(launcher, const_name)} MiB, MEASURED on boot weg2ls1b2 "
             "(NVML per-process at group D's first sleep, NEXTN draft + TP decode "
             f"graphs resident); boot {stem} logged no uuid-keyed WEG2-DC reading"
         )
     raise _refuse(
         f"card {uuid} ({name!r}) has no dormant-residue source: boot {stem} "
         "logged no uuid-keyed WEG2-DC reading for it, and no boot-named "
-        "MEASURED constant covers this board (launcher.DC_MEASURED_D_* names "
-        "the 5090 and the 3080 of this rig's inventory only).  There is no "
+        "MEASURED constant covers this board's class ("
+        f"{_ci.card_key(card)}; launcher.DC_MEASURED_D_* covers "
+        + ", ".join(sorted(launcher.DC_MEASURED_D_BY_CLASS)) + " only).  There is no "
         "default: solve() counts this term TWICE, so a guessed value moves the "
         "predicted peak by twice its error in the direction that arms."
     )

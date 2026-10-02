@@ -1,6 +1,12 @@
 {
  "profile": "qwen27b",
  "what": "Measured records of the Qwen3.8-27B profile (UNIFY_PLAN Schritt 9). The scalar rows were the _QWEN27B_CONSTANTS literals in weg2/form.py (values unchanged); P_CHUNK_BUILTIN was launcher P_CHUNK_BUILTIN_INT8; D_SPEED_* were the literals of weg2/d_reshard _rc9_*_calib. A record holds only for its power limit and (per-stage tables) its P cut.",
+ "inventory": [
+  "RTX5090",
+  "RTX3080",
+  "RTX3080"
+ ],
+ "inventory_why": "HW-GENERIC 1002: the card inventory (weg2/card_identity.py calibration classes, card order = order_cards) every POSITIONAL record below was measured on -- the reference rig nvml1 RTX 5090 32607 MiB sm120, nvml0/nvml2 RTX 3080 20480 MiB sm86. A launch on other cards is refused HW-UNCALIBRATED instead of borrowing them.",
  "records": [
   {
    "name": "DC_MEASURED_D_5090_MIB",
