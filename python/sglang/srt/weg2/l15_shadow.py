@@ -92,8 +92,11 @@ def caps_from_env(
 
     rows_r = floor(mib_c * 2**20 / cell_bytes_r) where c is the physical card
     rank r sits on (``card_of_rank``; None = identity, i.e. rank index is the
-    card index). A rank whose card is not named (or the whole env is
-    auto/absent) gets cap 0 ("not held here", per l15_policy). Caps come back
+    card index). ``c`` is the budget ordinal: the ranks only ever see the
+    ordinal form -- card-identity keys are rewritten into it by the launcher
+    (``l15_plan.resolve_l15_mib``). A rank whose card is not named (or the
+    whole env is auto/absent) gets cap 0 ("not held here", per l15_policy);
+    zero, one or several ranks may be cap 0 (``cap0_ranks``). Caps come back
     in the rank order the caller gave (index = position in
     *cell_bytes_by_rank*).
     """
@@ -105,6 +108,31 @@ def caps_from_env(
         cell = int(cell_bytes_by_rank[rank])
         caps.append((mib * _MIB) // cell if cell > 0 and mib > 0 else 0)
     return tuple(caps)
+
+
+def cap0_ranks(
+    env: Mapping[str, str],
+    n_ranks: int,
+    card_of_rank: Optional[Sequence[int]] = None,
+) -> Tuple[int, ...]:
+    """The ranks whose cap ``caps_from_env`` makes 0 -- "not held here",
+    refilled from L2 at the wake -- for any positive cell size (a MiB figure
+    > 0 always prices >= 1 row at one byte per row). HW-GENERIC 1002: which
+    ranks those are follows from the per-card MiB and the rank->card map
+    alone, so another inventory may yield none or several."""
+    caps = caps_from_env(env, n_ranks, [1] * int(n_ranks), card_of_rank)
+    return tuple(r for r, c in enumerate(caps) if c == 0)
+
+
+def cap0_line(ranks: Sequence[int]) -> Optional[str]:
+    """The launcher warning when the cap-0 rank count is not exactly one:
+    the code treats every cap-0 rank as a refill rank, but metal only ever
+    ran exactly one. None for exactly one (the proven shape)."""
+    ranks = tuple(int(r) for r in ranks)
+    if len(ranks) == 1:
+        return None
+    return (f"L15-CAP0 ranks={','.join(str(r) for r in ranks) or '-'} "
+            "(metal-proven only for exactly one cap-0 rank)")
 
 
 def kv_pool_of(pool: Any) -> Any:

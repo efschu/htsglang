@@ -17,10 +17,12 @@ Policy (see docs/L15-PLAN-0930.md rule 2.2):
   "no_room"; a candidate that fits in rows but is turned away because the
   anchor cap is full is skipped with reason "anchor_full"; later smaller
   candidates may still fit.
-- A rank whose cap is 0 (the 5090 / TP0 rank) does NOT block: its rows are
-  filled from L2 at the wake, so cap 0 means "not held here", not "no room"
-  -- only ranks with cap > 0 are checked. HoldSet.rows_by_rank still sums the
-  admitted rows for cap-0 ranks (they are part of the sum).
+- The rank(s) whose cap is 0 do NOT block: their rows are filled from L2 at
+  the wake, so cap 0 means "not held here", not "no room" -- only ranks with
+  cap > 0 are checked. HoldSet.rows_by_rank still sums the admitted rows for
+  cap-0 ranks (they are part of the sum). Which ranks are cap 0 follows from
+  the per-card caps alone (none, one or several; on the reference rig it is
+  the one rank on the biggest card).
 """
 
 from __future__ import annotations
@@ -84,8 +86,8 @@ def select_hold(
         fits = True
         for r, rows in enumerate(c.rows_by_rank):
             # "Not held here" is decided by the ORIGINAL cap, never by the
-            # remaining capacity: cap 0 (the 5090 / TP0 rank, refilled from
-            # L2 at the wake) does not block, but a capped rank that is
+            # remaining capacity: cap 0 (the rank(s) whose cap is 0, refilled
+            # from L2 at the wake) does not block, but a capped rank that is
             # exactly full (rem == 0) DOES block -- skipping on rem == 0
             # would over-admit past the cap and OOM on metal.
             if cap_rows_by_rank[r] == 0:
