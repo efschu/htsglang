@@ -86,6 +86,25 @@ def test_gap_under_another_requests_d_prefill_counts_as_prefill_d():
     assert (n, causes["prefill_d"], unnamed) == (1, 1, [])
 
 
+def test_prefill_d_gap_counts_only_the_neighbour_prefill_overlap():
+    # y8a weg2-20-79 (02.10. 18:35:50-18:36:40): D decoded 2741 tokens while the
+    # stream stayed silent 49.8 s (tool call built); two neighbour D prefills
+    # (weg2-20-80 2.37 s, weg2-20-81 4.09 s) fell into it. Booked was 49.8 s of
+    # prefill_d sleep and decode_s 0.59 -- the sleep is the prefills' 6.46 s.
+    ts = _steady(0.0, 20) + _steady(50.2, 20)
+    adm = [(10.42, 12.79), (17.46, 21.55), (11.0, 12.0)]  # the last one nests
+    n, s, causes, unnamed = UT.attribute_gaps(_clock(ts), [], [], adm)
+    assert (n, causes, unnamed) == (1, {"flip": 0, "prefill_d": 1, "park": 0}, [])
+    assert abs(s - (2.37 + 4.09)) < 1e-6
+
+
+def test_prefill_d_overlap_is_clipped_to_the_gap():
+    ts = _steady(100.0, 20) + _steady(101.0, 20)  # gap 100.38 -> 101.0
+    n, s, causes, _u = UT.attribute_gaps(_clock(ts), [], [], [(99.0, 100.5)])
+    assert (n, causes["prefill_d"]) == (1, 1)
+    assert abs(s - (100.5 - 100.38)) < 1e-6
+
+
 def test_flip_takes_precedence_over_park_and_prefill():
     ts = _steady(100.0, 20) + _steady(101.0, 20)
     _n, _s, causes, _u = UT.attribute_gaps(_clock(ts), [(100.5, 100.6)], [(100.4, 100.9)],

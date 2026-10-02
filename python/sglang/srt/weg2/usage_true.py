@@ -500,7 +500,15 @@ def attribute_gaps(clock: TokenClock, flip_w: Sequence[Window], park_w: Sequence
     GAP_FLOOR_S)`` AND overlaps a known cause window -- a flip (decision ->
     done), a park/hold of this rid, another request's prefill admission on D
     -- in that order of precedence. A long gap without a cause is returned in
-    ``unnamed`` (the caller logs it), never counted."""
+    ``unnamed`` (the caller logs it), never counted.
+
+    A flip or this rid's own park stops its decode for the whole gap, so the
+    whole gap is the sleep. Another request's D prefill does not: it only
+    holds D's decode rounds while it runs, so a ``prefill_d`` gap counts only
+    its overlap with those prefill windows (y8a weg2-20-79: D decoded 2741
+    tokens in 50 s, the Anthropic stream stayed silent while a tool call was
+    built, two neighbour prefills of 2.4 + 4.1 s fell into the silence, and
+    the whole 49.8 s was booked as sleep -- decode_s 0.59, decode_tps 4641)."""
     thr = max(GAP_MEDIAN_X * clock.median(), GAP_FLOOR_S)
     causes = {c: 0 for c in CAUSES}
     n, total, unnamed = 0, 0.0, []
@@ -518,8 +526,18 @@ def attribute_gaps(clock: TokenClock, flip_w: Sequence[Window], park_w: Sequence
             continue
         causes[cause] += 1
         n += 1
-        total += b - a
+        total += _covered(a, b, prefill_w) if cause == "prefill_d" else b - a
     return n, total, causes, unnamed
+
+
+def _covered(a: float, b: float, wins: Sequence[Window]) -> float:
+    """Seconds of ``[a, b]`` covered by the union of ``wins``."""
+    total, end = 0.0, a
+    for s, e in sorted((max(s, a), min(e, b)) for s, e in wins if s < b and e > a):
+        if e > end:
+            total += e - max(s, end)
+            end = e
+    return total
 
 
 def attribute_windows(t_from: float, t_to: float, flip_w: Sequence[Window],
