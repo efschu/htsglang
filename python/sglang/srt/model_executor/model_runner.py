@@ -2926,6 +2926,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         detach_from_model(self.model)
         release_load_transient_pool(reason="after-load")
+        # DUAL P SLEEP under --dual-share (weights not resident): the hard
+        # riegel -- no live device memory the saver does not track (it would
+        # survive the sleep). A no-op on every other rank.
+        from sglang.srt.model_executor.dual_stage_hull import assert_dual_p_sleep_tracked
+
+        assert_dual_p_sleep_tracked(self)
         # #1273 S2 (spec section 6/S2): arm the exchange for this rank at the
         # END OF WEIGHT LOADING -- every weight page this runner will ever hold
         # exists now and nothing has been paused yet.  A no-op under the

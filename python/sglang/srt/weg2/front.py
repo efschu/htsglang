@@ -3409,6 +3409,8 @@ class Seat:
         if _ps is not None:
             _ps().done(self.rid)  # #287 NEED0 (c): the rid left D
         self.front.counters["d_seat_released"] += 1
+        if freed_by == "leg2_finished":
+            self.front.counters["d_seat_done"] += 1  # D PRIORITY: a seat that DECODED to its end
         # L3: the "wenn ein slot frei wird, wird nachgezogen" instrument.
         logger.info(
             "WEG2 D-REFILL rid=%s freed_by=%s seats_free=%d queued_d=%d",
@@ -3806,6 +3808,18 @@ def leg1_aborted(js: Any, prompt_tokens: int) -> bool:
     except Exception:  # noqa: BLE001 -- a strange body is judged by its tokens
         pass
     return int(prompt_tokens or 0) <= 0
+
+
+def _mem_available_bytes() -> int:
+    """/proc/meminfo MemAvailable in bytes (0 when unreadable: a sleep is then refused)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
 
 
 def _dual_p_pressures(paths) -> List[int]:
@@ -12543,6 +12557,8 @@ class Front:
         # AFTER "a pass is still running -> return", and a leg 1 in flight IS
         # a running pass. The pressure is read first, every tick.
         pressure = self._dual_pressure_tick() if self.dual_kv_ledgers else 0
+        if self.dual_kv_ledgers:
+            self._dual_stage_tick(pressure)                 # D PRIORITY: stage 1 -> 2 -> resume
         if pressure > 0:
             self._dual_pause_inflight(pressure)
         t = self._dual_task
@@ -12565,11 +12581,220 @@ class Front:
             return
         if self.dual_kv_ledgers and self._dual_resume_held():
             return  # a paused request waits until every P stage released and D stopped growing
+        if self.dual_kv_ledgers and self._dual_p_held_by_stage():
+            return  # D PRIORITY: P stopped or asleep until the hysteresis lets it back
         self.counters["dual_passes"] += 1
         self._dual_task = asyncio.get_running_loop().create_task(pass_fn())
 
     #: seconds between two unchanged pressure-reader lines (the instrument)
     DUAL_PRESSURE_LOG_S = 30.0
+
+    # -- D PRIORITY UNDER KV PRESSURE (user decision 01.10.) -------------------
+    # "davor muss P aufhören zu prefillen und seinen kv freigeben und wenn es
+    # dann immer noch nicht reicht, muss P schlafen und seine gewichte im
+    # systemram parken ... wenn ein sitz fertig decoded hat wird sein platz ja
+    # frei und P kann zurückkehren". The decision is weg2/dual_d_priority.
+    # PressureStages (pure); this is its reading and its actuators.
+
+    def _dual_stages(self):
+        st = getattr(self, "_dual_stages_obj", None)
+        if st is None:
+            from sglang.srt.weg2 import dual_d_priority as _ddp
+
+            try:
+                after = int(os.environ.get(_ddp.SLEEP_AFTER_TICKS_ENV, "") or _ddp.SLEEP_AFTER_TICKS_DEFAULT)
+            except ValueError:
+                after = _ddp.SLEEP_AFTER_TICKS_DEFAULT
+            st = self._dual_stages_obj = _ddp.PressureStages(_ddp.p_sleep_capable(), after)
+        return st
+
+    def _dual_p_stage_reading(self) -> dict:
+        """One reading of the cards and of P's stage tables: P's committed bytes
+        (sum), the tightest card's free bytes, one P grant step and D's
+        look-ahead in bytes, P's weights image (the host peak of a sleep)."""
+        import json
+
+        from sglang.srt.weg2 import dual_p_kv_stage as _pk
+        from sglang.srt.weg2.card_kv_ledger import peek
+
+        committed, free, d_short = 0, None, 0
+        for pth in self.dual_kv_ledgers:
+            st = peek(pth)
+            if st is None:
+                continue
+            committed += int(st.committed["P"])
+            free = int(st.free) if free is None else min(free, int(st.free))
+            # D's unmet request on this card (card_kv_ledger.request: need - grant)
+            d_short = max(d_short, int(st.demand.get("D", 0) or 0))
+        tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
+        grant, per_tok, weights, step_tok = 0, 0.0, 0, 0
+        stages = []
+        for r in range(3):
+            try:
+                with open(_pk.stage_file(tag, r)) as f:
+                    t = json.load(f)
+            except (OSError, ValueError):
+                continue
+            stages.append(t)
+            step_b = int((t.get("bytes") or [0, 0])[1] if len(t.get("bytes") or []) > 1 else 0)
+            grant = max(grant, step_b)
+            per_tok = max(per_tok, step_b / max(1, int(t.get("step") or 1)))
+            step_tok = max(step_tok, int(t.get("step") or 0))
+            weights += int(t.get("weights_bytes") or 0)
+        # D's look-ahead: one extend chunk plus one decode round of every seat with
+        # the draft's tokens (d_mem_sched.air_tokens), from the launcher
+        # (SGLANG_WEG2_DUAL_D_AIR_TOKENS); without it one P lattice step (4096 >=
+        # 1600 + 6 x 4 on the 27B dual), priced at P's bytes per token
+        try:
+            air_tok = int(os.environ.get("SGLANG_WEG2_DUAL_D_AIR_TOKENS", "") or step_tok)
+        except ValueError:
+            air_tok = step_tok
+        # the wake from sleep, PER CARD: that card's free against its loan + one P
+        # grant step + D's look-ahead, each priced in that stage's own bytes/token
+        card_room = []
+        for t in stages:
+            st = peek(str(t.get("ledger", "")))
+            if st is None:
+                card_room = None
+                break
+            b = t.get("bytes") or [0, 0]
+            step_b = int(b[1]) if len(b) > 1 else 0
+            tok_b = step_b / max(1, int(t.get("step") or 1))
+            card_room.append((int(st.free), int(t.get("lent") or 0) + step_b + int(air_tok * tok_b)))
+        return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
+                "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights,
+                "card_room": card_room if stages else None, "d_short": d_short}
+
+    #: env: the metal probe of stage 2 (one sleep + wake of P in the first idle
+    #: stretch, no pressure needed) -- seconds P stays asleep; unset/0 = off
+    DUAL_P_SLEEP_PROBE_ENV = "SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S"
+
+    def _dual_p_sleep_probe_tick(self, pressure: int) -> bool:
+        """STAGE-2 PROBE (default off): once, in the first stretch where D presses
+        nothing, the queue is empty and no leg 1 runs, P sleeps (the same leg as
+        stage 2) and wakes after SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S seconds. Proves
+        the sleep/wake on metal without waiting for real KV pressure. True while
+        the probe owns P."""
+        try:
+            hold_s = float(os.environ.get(self.DUAL_P_SLEEP_PROBE_ENV, "") or 0.0)
+        except ValueError:
+            hold_s = 0.0
+        if hold_s <= 0.0:
+            return False
+        st = self._dual_stages()
+        state = getattr(self, "_dual_probe_state", "armed")
+        if state == "armed":
+            if (pressure > 0 or self.queue or self._dual_inflight or st.p_state != "serving"
+                    or not st.sleep_capable):
+                return False
+            self._dual_probe_state = "sleeping"
+            st.p_state = "sleeping"
+            self.counters["dual_kv_pressure_probe"] += 1
+            logger.warning("WEG2 DUAL-KV-PRESSURE stage=probe p_state=sleeping hold_s=%.0f -- the stage-2 metal "
+                           "probe: P sleeps once without pressure and wakes after the hold", hold_s)
+            loop = asyncio.get_running_loop()
+
+            async def _probe():
+                await self._dual_p_sleep()
+                if st.p_state != "sleeping":       # the sleep was refused (P not idle): re-arm
+                    self._dual_probe_state = "armed"
+                    st.p_state = "serving"
+                    return
+                await asyncio.sleep(hold_s)
+                await self._dual_p_wake()
+                st.p_state = "serving"
+                self._dual_probe_state = "done"
+                logger.warning("WEG2 DUAL-KV-PRESSURE stage=probe p_state=serving -- probe done")
+
+            loop.create_task(_probe())
+            return True
+        return state == "sleeping"
+
+    def _dual_stage_tick(self, pressure: int) -> None:
+        from sglang.srt.weg2 import dual_d_priority as _ddp
+
+        if self._dual_p_sleep_probe_tick(pressure):
+            return
+        stages = self._dual_stages()
+        try:
+            rd = self._dual_p_stage_reading()
+        except Exception as exc:  # noqa: BLE001 -- a failed reading keeps the stage, never acts on a guess
+            logger.warning("WEG2 DUAL-KV-PRESSURE reading failed: %r", exc)
+            return
+        # D PRIORITY: the stages read D's SHORTFALL, not only the ledger's pressure on
+        # P. card_kv_ledger.arbitrate caps that pressure at what P still commits, so
+        # it reads 0 the moment stage 1 is complete (P released everything) although
+        # D is still short -- stage 2 ("P released everything AND the pressure held")
+        # could never fire, and P would never sleep under real pressure (gmps12 only
+        # proved the sleep through the probe). D's unmet request (ledger demand[D],
+        # set by every short request, cleared once D fits) keeps the ladder going.
+        d_short = int(rd.pop("d_short", 0) or 0)
+        pressure = max(int(pressure), d_short)
+        host_ok = True
+        if stages.p_state == "stopped" and stages.sleep_capable and pressure > 0:
+            host_ok = _ddp.host_allows_sleep(_mem_available_bytes(), rd["weights_bytes"])
+        action, line = stages.tick(pressure=pressure, seats_done=int(self.counters.get("d_seat_done", 0)),
+                                   host_ok=host_ok, **rd)
+        if line:
+            logger.warning("%s", line)
+        if action is None:
+            return
+        self.counters["dual_kv_pressure_%s" % {"stop": "stage1", "sleep": "stage2", "resume": "resume",
+                                               "wake": "wake"}[action]] += 1
+        if action == "sleep":
+            asyncio.get_running_loop().create_task(self._dual_p_sleep())
+        elif action == "wake":
+            asyncio.get_running_loop().create_task(self._dual_p_wake())
+
+    def _dual_p_held_by_stage(self) -> bool:
+        st = getattr(self, "_dual_stages_obj", None)
+        return st is not None and st.p_state != "serving"
+
+    def _dual_p_weights_tags(self) -> List[str]:
+        return list(weights_family_tags(int(getattr(self, "weight_chunks", 1) or 1)))
+
+    async def _dual_p_sleep(self) -> None:
+        """Stage 2: P parks its weights in host RAM (the torch_memory_saver CPU
+        backup of the vendored hook: allocated at the pause, freed after the
+        restore -- tms_csrc/core.cpp) and its KV pool; the bytes go to the card
+        pool on every P rank (dual_p_kv_stage.sleep_lend). Its OWN epoch sequence
+        ('dps<n>'), never the flip's: the flip counters and the W94 ratchet stay
+        untouched."""
+        n = int(getattr(self, "_dual_p_sleep_n", 0) or 0) + 1
+        self._dual_p_sleep_n = n
+        # the same group-idle witness the flip takes before a sleep (the release
+        # asserts an idle server on every rank; a stage-1 P can still hold an
+        # in-flight hand-off write or prefetch)
+        ok, why = await self.quiesce(self.groups["P"])
+        if not ok:
+            self.counters["dual_kv_pressure_sleep_not_idle"] += 1
+            logger.warning("WEG2 DUAL-KV-PRESSURE stage=2 refused p_not_idle leg=%d: %s -- P stays stopped "
+                           "(stage 1), the next tick asks again", n, str(why)[:300])
+            st = getattr(self, "_dual_stages_obj", None)
+            if st is not None:
+                st.p_state = "stopped"
+            return
+        tags = [KV_TAG] + self._dual_p_weights_tags()
+        code, body = await self.leg_rpc(self.groups["P"], "/release_memory_occupation",
+                                        {"tags": tags, "epoch": credit_epoch(self.boot_epoch, "dps%d" % n)},
+                                        RPC_TIMEOUT_S)
+        if code != 200:
+            self.do_stop("W-DUAL-P-SLEEP Weg2DualPSleepRefused",
+                         f"P's sleep leg {n} failed HTTP {code}: {body[:400]!r} -- VRAM state undefined")
+            return
+        logger.warning("WEG2 DUAL-KV-PRESSURE stage=2 p_state=sleeping leg=%d tags=%d done", n, len(tags))
+
+    async def _dual_p_wake(self) -> None:
+        n = int(getattr(self, "_dual_p_sleep_n", 0) or 0)
+        tags = self._dual_p_weights_tags() + [KV_TAG]
+        code, body = await self.leg_rpc(self.groups["P"], "/resume_memory_occupation",
+                                        {"tags": tags, "epoch": credit_epoch(self.boot_epoch, "dpw%d" % n)},
+                                        RPC_TIMEOUT_S)
+        if code != 200:
+            self.do_stop("W-DUAL-P-WAKE Weg2DualPWakeRefused",
+                         f"P's wake leg {n} failed HTTP {code}: {body[:400]!r} -- VRAM state undefined")
+            return
+        logger.warning("WEG2 DUAL-KV-PRESSURE stage=resume p_state=serving leg=%d tags=%d done", n, len(tags))
 
     def _dual_pressure_tick(self) -> int:
         """Read every card ledger's pressure on P; one instrument line on every
@@ -12610,6 +12835,8 @@ class Front:
         gates (before a NEW pass) never saw it -- 0 RESUME-WAIT lines."""
         if _dual_p_pressure(self.dual_kv_ledgers) > 0:
             return True
+        if self._dual_p_held_by_stage():
+            return True  # D PRIORITY: P stopped or asleep until the hysteresis lets it back
         return self._dual_resume_held()
 
     def _dual_resume_held(self) -> bool:

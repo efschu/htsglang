@@ -3862,7 +3862,7 @@ def release_load_transient_pool(reason: str = "") -> float:
     return freed + _release_one_load_pool("load", reason)
 
 
-def _release_one_load_pool(kind: str, reason: str) -> float:
+def _release_one_load_pool(kind: str, reason: str, routing_ended: bool = False) -> float:
     global _LOAD_TRANSIENT_POOL, _LOAD_CKPT_POOL
     pool = _LOAD_CKPT_POOL if kind == "ckpt" else _LOAD_TRANSIENT_POOL
     if pool is None:
@@ -3870,9 +3870,8 @@ def _release_one_load_pool(kind: str, reason: str) -> float:
     import torch
 
     if (
-        _ACTIVE_TAG_POOL is not None
+        (not routing_ended and (_ACTIVE_TAG_POOL is not None or _tms_cdll_in_region() is not None))
         or _STEPPED_OUT_POOLS
-        or _tms_cdll_in_region() is not None
         or torch.cuda.is_current_stream_capturing()
     ):
         logger.warning(
@@ -3887,6 +3886,10 @@ def _release_one_load_pool(kind: str, reason: str) -> float:
         _LOAD_TRANSIENT_POOL = None
     if _pool_has_live_blocks(pool, f"{reason or '?'} pool={kind}"):
         _KEPT_TRANSIENT_POOLS.append(pool)
+        # cumulative over the releases of one load (a mid-region release and the
+        # after-load one): a kept pool stays kept, its live bytes never vanish
+        # from the riegel because a later, clean pool was released
+        _LAST_KEPT_LIVE_MIB[kind] = _LAST_KEPT_LIVE_MIB.get(kind, 0.0) + _pool_live_mib(pool)
         return 0.0
     before = torch.cuda.memory_reserved()
     del pool
@@ -3912,6 +3915,145 @@ _LOAD_POOL_WHAT = {
         "post-load repack (H39: they were dead blocks of the tag pools)"
     ),
 }
+
+
+def _pool_live_mib(pool: Any) -> float:
+    import torch
+
+    try:
+        return sum(
+            b["size"]
+            for s in torch.cuda.memory_snapshot(pool.id)
+            for b in s["blocks"]
+            if str(b.get("state", "")).startswith("active")
+        ) / 2**20
+    except Exception:  # noqa: BLE001 -- unknown: a riegel reads it as live
+        return float("inf")
+
+
+def _active_routing_pools() -> List[Any]:
+    """The private pools the current thread allocates into, outermost first:
+    torch_memory_saver's primary pool while its region is open, then the active
+    weights tag pool."""
+    pools: List[Any] = []
+    try:
+        import torch_memory_saver as _tms  # noqa: WPS433
+
+        impl = _tms.torch_memory_saver._impl
+        if impl is not None and impl._binary_wrapper.cdll.tms_get_interesting_region():
+            prim = getattr(impl, "_primary_mem_pool", None)
+            if prim is not None:
+                pools.append(prim)
+    except Exception:  # noqa: BLE001 -- no saver: no primary routing
+        pass
+    if _ACTIVE_TAG_POOL is not None:
+        pools.append(_ACTIVE_TAG_POOL)
+    return pools
+
+
+def release_load_pools_midregion(reason: str) -> float:
+    """Hand the load pools back to the driver INSIDE the weights region.
+
+    gmps11 (dkr27bnvfp4dual1mpsleepbar1fs10012335, PP0 23:38:30): the dual shared
+    part's 7.71 GiB of dead copies (bound to D's arena, left in the load pool by
+    the transient scope) stayed reserved until the AFTER-load release, so the
+    next part of the stage met 'card free 3.46 GiB' and TMS cu_mem_create failed
+    (out of memory) -- reported first by the BAR1 abort poll as W113 'unknown
+    parameter type'. A pool can only be deleted while no pool routing is active
+    on the thread (the destructor asserts it), so this ENDS the routing for the
+    deletion -- torch_memory_saver's primary pool and the active tag pool, with
+    the saver's tracking off -- and re-enters both, in order, afterwards.
+    Refused (0.0) inside a stepped-out block, where a caller still routes to a
+    pool of its own."""
+    if _STEPPED_OUT_POOLS or _TRANSIENT_ONLY:
+        logger.warning("WEG2-TAG-POOL mid-region release REFUSED reason=%s -- inside a stepped-out block",
+                       reason or "?")
+        return 0.0
+    import torch
+    from torch.cuda.memory import (
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+    )
+
+    routed = _active_routing_pools()
+    cdll = _tms_cdll_in_region()
+    device_index = torch.cuda.current_device()
+    for p in reversed(routed):
+        _cuda_endAllocateToPool(device_index, p.id)
+    if cdll is not None:
+        cdll.tms_set_interesting_region(False)
+    try:
+        freed = (_release_one_load_pool("ckpt", reason, routing_ended=True)
+                 + _release_one_load_pool("load", reason, routing_ended=True))
+    finally:
+        if cdll is not None:
+            cdll.tms_set_interesting_region(True)
+        for p in routed:
+            _cuda_beginAllocateCurrentThreadToPool(device_index, p.id)
+    logger.info("WEG2-TAG-POOL mid-region release reason=%s freed_gib=%.2f (routing of %d pool(s) ended for "
+                "the deletion and re-entered)", reason or "?", freed, len(routed))
+    return freed
+
+
+class Weg2DualPUntagged(RuntimeError):
+    """W-DUAL-P-UNTAGGED: a P rank of the dual layout that will SLEEP (weights not
+    resident) holds live device memory the saver does not track -- it would
+    survive the sleep (no host image, no VRAM freed, the card ledger's loan
+    wrong). Measured as the live blocks left in the load pools after load."""
+
+
+def assert_no_untagged_live(kept_mib: Optional[Dict[str, float]] = None,
+                            tolerance_mib: float = 0.0) -> None:
+    """The hard riegel: nothing untracked may live after load (dual P sleep)."""
+    kept = dict(_LAST_KEPT_LIVE_MIB if kept_mib is None else kept_mib)
+    live = sum(kept.values())
+    if live > tolerance_mib:
+        raise Weg2DualPUntagged(
+            "W-DUAL-P-UNTAGGED: %.1f MiB of live device memory is untracked by the memory saver after "
+            "load (%s) -- it would survive P's sleep; re-home it with back_into_tag_pool(force=True) or "
+            "keep P resident (--dual-p-sleep off)" % (live, ", ".join(
+                "%s=%.1f MiB" % kv for kv in sorted(kept.items()))))
+
+
+class Weg2DualPPoolSlack(RuntimeError):
+    """W-DUAL-P-POOL-SLACK: the weights tag pools of a sleeping dual P rank hold
+    more empty (inactive) segment bytes after load than the cap. A private pool
+    never returns them to the driver: they are KV the card does not get, and the
+    sleep pauses and backs them up as if they were weights."""
+
+
+#: env: the cap of the summed inactive bytes of the weights tag pools after load
+#: on a sleeping dual P rank (MiB). gmps9 PP0 held 3.25 GiB there (the freed
+#: copies of the bound shared part); a pool's ordinary fragmentation measured
+#: 0.01-0.16 GiB per tag (PP1/PP2 of the same boot).
+DUAL_P_POOL_SLACK_MAX_ENV = "SGLANG_WEG2_DUAL_P_POOL_SLACK_MAX_MIB"
+DUAL_P_POOL_SLACK_MAX_MIB_DEFAULT = 1024.0
+
+
+def weights_pool_slack_mib(occupancy: Optional[Callable[[str], Optional[dict]]] = None,
+                           tags: Optional[Sequence[str]] = None) -> Dict[str, float]:
+    """inactive MiB per weights-family tag pool (``tag_pool_occupancy``)."""
+    occ_fn = occupancy or tag_pool_occupancy
+    out: Dict[str, float] = {}
+    for t in sorted(tags if tags is not None else _TAG_MEM_POOLS):
+        if not is_weights_family_tag(t):
+            continue
+        occ = occ_fn(t)
+        if occ is not None:
+            out[t] = float(occ.get("inactive_gib", 0.0)) * 1024.0
+    return out
+
+
+def assert_weights_pool_slack(slack_mib: Dict[str, float], cap_mib: Optional[float] = None) -> float:
+    cap = float(os.environ.get(DUAL_P_POOL_SLACK_MAX_ENV, DUAL_P_POOL_SLACK_MAX_MIB_DEFAULT)
+                if cap_mib is None else cap_mib)
+    total = sum(slack_mib.values())
+    if total > cap:
+        raise Weg2DualPPoolSlack(
+            "W-DUAL-P-POOL-SLACK: the weights tag pools hold %.0f MiB of empty segments after load (cap %.0f "
+            "MiB, %s=...): %s" % (total, cap, DUAL_P_POOL_SLACK_MAX_ENV, ", ".join(
+                "%s=%.0f" % kv for kv in sorted(slack_mib.items()) if kv[1] >= 1.0)))
+    return total
 
 
 def _pool_has_live_blocks(pool: Any, reason: str) -> bool:
@@ -3945,8 +4087,41 @@ def _pool_has_live_blocks(pool: Any, reason: str) -> bool:
 _STEPPED_OUT_POOLS: List[Any] = []
 
 
+#: DUAL SHARED PART (27B dual, 01.10.): depth of :func:`transient_load_scope`.
+#: Inside it EVERYTHING is transient -- the union bind replaces every tensor the
+#: shared part's load produced with a view of D's arena -- so a nested
+#: :func:`back_into_tag_pool` (the repack survivors of modelopt/fp8/compressed
+#: tensors) stays in the transient pool instead of re-entering the tag pool.
+_TRANSIENT_ONLY: List[str] = []
+
+#: live bytes the last after-load release found left in a load pool (MiB, by
+#: pool kind) -- the 'untagged live bytes' a hard riegel reads
+_LAST_KEPT_LIVE_MIB: Dict[str, float] = {}
+
+
 @contextmanager
-def back_into_tag_pool() -> Iterator[bool]:
+def transient_load_scope(reason: str) -> Iterator[bool]:
+    """Load a block whose every tensor is about to be REPLACED (the dual shared
+    part, bound to D's union arena right after): outside the tag pool, with the
+    saver's tracking off, and with every nested ``back_into_tag_pool`` kept in
+    the transient pool too. What survives the block -- a tensor nobody rebound --
+    is untracked live memory, left in the load pool, and the after-load release
+    keeps that pool and records it (:data:`_LAST_KEPT_LIVE_MIB`). A caller that
+    must keep something re-homes it with ``back_into_tag_pool(force=True)``.
+    Outside a tag pool (the resident arm) this is a no-op and yields False."""
+    with outside_tag_pool(reason=reason) as stepped:
+        if not stepped:
+            yield False
+            return
+        _TRANSIENT_ONLY.append(reason)
+        try:
+            yield True
+        finally:
+            _TRANSIENT_ONLY.pop()
+
+
+@contextmanager
+def back_into_tag_pool(force: bool = False) -> Iterator[bool]:
     """Inside an :func:`outside_tag_pool` block: allocate in the tag pool again.
 
     For the SURVIVORS of a transient block -- the tensors that stay on the card
@@ -3961,11 +4136,13 @@ def back_into_tag_pool() -> Iterator[bool]:
     never 0).  With the repack outside the pool and only the resident buffers
     born back inside it, the pool holds exactly what stays.
 
-    Outside any stepped-out block this is a no-op and yields False.
+    Outside any stepped-out block this is a no-op and yields False; inside a
+    :func:`transient_load_scope` too, unless ``force`` (the caller re-homes a
+    tensor that must stay).
     """
     import torch
 
-    if not _STEPPED_OUT_POOLS:
+    if not _STEPPED_OUT_POOLS or (_TRANSIENT_ONLY and not force):
         yield False
         return
     from torch.cuda.memory import (

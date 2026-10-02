@@ -250,6 +250,8 @@ from sglang.srt.weg2 import skip_first as _weg2_skip_first  # E2 in a mixed wake
 from sglang.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
 from sglang.srt.weg2 import short_read as _weg2_short_read  # held short wake reads
 from sglang.srt.weg2 import tail_adopt as _weg2_tail_adopt
+from sglang.srt.weg2 import dual_d_priority as _weg2_dual_d_priority  # D HOLD FOR GROW (dual D)
+from sglang.srt.weg2 import dual_handback_defer as _weg2_hbd  # D-HANDBACK-DEFER (dual D)
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -5944,6 +5946,10 @@ class Scheduler(
                 ),
             )
         except Exception as e:  # noqa: BLE001
+            from sglang.srt.weg2.dual_d_priority import Weg2DualDRetract
+
+            if isinstance(e, Weg2DualDRetract):
+                raise  # a named stop is never a logged warning
             logger.warning("#888b carrier yield failed: %s", e)
             return 0
 
@@ -12051,6 +12057,15 @@ class Scheduler(
                 running_batch.hisparse_coordinator = self.hisparse_coordinator
             # Reset batch_is_full so the scheduler can schedule more prefills.
             running_batch.batch_is_full = False
+        # DUAL-TP3PP3 stage 2: decode-join batches prepared at the last
+        # admission enter the running batch here, before it forms its round
+        # (the same place and shape as the hisparse staging->decode merge).
+        _jr = getattr(self, "_weg2_join_ready", None)
+        if _jr:
+            from sglang.srt.weg2 import dual_decode_join as _ddj
+
+            self._weg2_join_ready = []
+            running_batch = _ddj.merge_joined(running_batch, _jr)
 
         if (
             not self.enable_hisparse
@@ -12708,6 +12723,8 @@ class Scheduler(
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
+                if _weg2_dual_d_priority.take_hold_for_grow(running_batch):
+                    ret = None  # D HOLD FOR GROW: no decode this iteration
             else:
                 ret = None
             # maybe_take_tick keeps its cadence gate, now read as PCIe
@@ -12764,6 +12781,8 @@ class Scheduler(
                 else:
                     running_batch = self.update_running_batch(running_batch)
                     ret = running_batch if not running_batch.is_empty() else None
+                    if _weg2_dual_d_priority.take_hold_for_grow(running_batch):
+                        ret = None  # D HOLD FOR GROW: no decode this iteration
             else:
                 ret = None
 
@@ -13572,6 +13591,18 @@ class Scheduler(
             return False
         if getattr(req, "prefetch_deferred", None) is not None:
             return True
+        # D-HANDBACK-DEFER (dual D): a hand-back whose tail P has not made
+        # readable yet votes pending until its read is issued, inside the
+        # length-priced bound (weg2/dual_handback_defer.py).
+        if getattr(req, _weg2_hbd.MARK_ATTR, None) is not None:
+            try:
+                _hb_bound = float(self._deferred_prefetch_bound_s(len(
+                    getattr(req, "full_untruncated_fill_ids", None)
+                    or getattr(req, "origin_input_ids", None) or ())))
+            except Exception:  # noqa: BLE001 - an unpriceable bound is not a wait
+                _hb_bound = 0.0
+            if _weg2_hbd.pending(req, _hb_bound):
+                return True
         ongoing = getattr(getattr(self, "tree_cache", None), "ongoing_prefetch", None)
         try:
             return bool(ongoing) and rid in ongoing
@@ -15618,6 +15649,9 @@ class Scheduler(
         # beyond what the intake path already carries.
         if self.enable_hicache_storage:
             self._retry_deferred_prefetches()
+            # D-HANDBACK-DEFER (dual D): re-issue the store read of the deferred
+            # hand-backs (pass-counted back-off, rank-identical set and order)
+            _weg2_hbd.retry(self)
         prefetch_verdicts = self.__dict__.pop("_pass_prefetch_verdicts", None)
         if prefetch_verdicts is None:
             prefetch_verdicts = self._drain_prefetch_progress()
@@ -16962,9 +16996,19 @@ class Scheduler(
                 _note_skip("weg2_x_defer", req.rid)
                 continue
             if self._weg2_x_refuses(req, _head_inputs):
+                # D-HANDBACK-DEFER (dual D): the first W31 of a hand-back is a
+                # defer -- P's tail may simply not be readable yet; the refusal
+                # would make P prefill it a second time. The W31 is the group's
+                # verdict, so the mark lands on every rank in the same pass.
+                if _weg2_hbd.armed() and _weg2_hbd.begin(
+                    req, int(self.weg2_uncached_extent(req, _head_inputs))
+                ):
+                    _note_skip("weg2_handback_defer", req.rid)
+                    continue
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
                 continue
+            _weg2_hbd.note_admit(req)
             # PARK-WINDOW-GATE (29.09.): while the front's collect window is
             # open, no extend whose forward ends after its deadline -- the park
             # must not wait for it. Inert without a window (every term replicated).
@@ -17812,6 +17856,30 @@ class Scheduler(
             )
 
         _wk_t2 = time.perf_counter()  # admission done
+        # DUAL-TP3PP3 stage 2 (weg2/dual_decode_join.py, SGLANG_WEG2_DUAL_DECODE_JOIN,
+        # default off): a P-prefilled request with only the N-1 anchor token
+        # outstanding joins the running decode batch WITHOUT an extend forward
+        # (that forward stopped D's decode 208-446 gpu-ms per admission, metal
+        # dual1m). Prepared here like any extend, converted, merged at the next
+        # get_next_batch_to_run.
+        _ddj = None
+        if self.draft_worker is not None and self.spec_algorithm.is_dflash():
+            from sglang.srt.weg2 import dual_decode_join as _ddj
+
+            if not _ddj.join_enabled():
+                _ddj = None  # switch off: the list below is not touched at all
+        if _ddj is not None:
+            _join, can_run_list, _fallbacks = _ddj.split_join_reqs(
+                can_run_list, spec_is_dflash=True,
+                exclude=([self.chunked_req] if self.chunked_req is not None else [])
+                + list(_tails_in_batch or ()) + list(getattr(self, "anchor_tails", None) or ()))
+            for _req, _why in _fallbacks:
+                logger.warning("WEG2 DECODE-JOIN FALLBACK rid=%s -> extend: %s",
+                               str(getattr(_req, "rid", "?"))[:16], _why)
+            if _join:
+                self._weg2_build_join_batch(_join)
+            if not can_run_list:
+                return None, running_batch
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
@@ -17945,6 +18013,40 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _weg2_build_join_batch(self, reqs) -> None:
+        """DUAL-TP3PP3 stage 2: prepare ``reqs`` exactly like an extend batch
+        (slots, prefix rows, Mamba anchor, accounting, draft-cold arming), then
+        convert them to decode-ready state without a forward; merged into the
+        running batch at the next get_next_batch_to_run."""
+        from sglang.srt.managers.phase_flip_draft_bootstrap import (
+            arm_draft_cold_for_admission,
+        )
+        from sglang.srt.weg2 import dual_decode_join as _ddj
+
+        set_time_batch(reqs, "set_forward_entry_time")
+        jb = ScheduleBatch.init_new(
+            reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        jb.prepare_for_extend()
+        arm_draft_cold_for_admission(self, jb)
+        _ddj.convert_to_joined(jb, self.future_map, self.enable_overlap)
+        if not hasattr(self, "_weg2_join_ready"):
+            self._weg2_join_ready = []
+        self._weg2_join_ready.append(jb)
+        logger.info(
+            "WEG2 DECODE-JOIN n=%d rids=%s committed=%s: P-prefilled, joined the "
+            "decode batch without an extend forward (the anchor token is computed "
+            "by the next round)",
+            len(reqs), [str(getattr(r, "rid", "?"))[:16] for r in reqs[:8]],
+            [int(r.kv_committed_len) for r in reqs[:8]],
+        )
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -18118,6 +18220,10 @@ class Scheduler(
                 if gained:
                     freed_by.append(f"retract({gained})")
             except Exception as e:  # noqa: BLE001
+                from sglang.srt.weg2.dual_d_priority import Weg2DualDRetract
+
+                if isinstance(e, Weg2DualDRetract):
+                    raise  # a named stop is never a logged warning
                 logger.warning("%s rung 3 (retract) failed: %s", self._LADDER_PREFIX, e)
 
         freed = max(0, int(self.uniform_min_avail()) - before)
@@ -18171,6 +18277,12 @@ class Scheduler(
           * the decision to call at all must be group-uniform for the same
             reason.
         """
+        # W-DUAL-D-RETRACT (user decision 01.10.): group D of the dual layout
+        # never retracts a running decode -- a named stop, before anything is
+        # mutated (weg2/dual_d_priority.py). Off the dual layout a no-op.
+        from sglang.srt.weg2.dual_d_priority import refuse_d_retract
+
+        refuse_d_retract(batch, kv_full=kv_full_retract_flag, reason=reason)
         old_available_tokens = self.token_to_kv_pool_allocator.available_size()
         old_ratio = self.new_token_ratio_tracker.current
         mamba_allocator = getattr(
@@ -18382,6 +18494,21 @@ class Scheduler(
             num_tokens_next = batch.new_tokens_required_next_decode()
             evict_from_tree_cache(self.tree_cache, num_tokens_next)
             kv_full_retract_flag = self.uniform_min_avail() < num_tokens_next
+        # D HOLD FOR GROW (dual layout, group D; user rule: D never retracts a running
+        # decode). The flag above is group-uniform; instead of the retract D grows
+        # on the spot, or -- when the card ledger is short (its request pressed P,
+        # stage 1 then stage 2) -- holds the batch for THIS iteration and asks again
+        # in the next one. Only a hold past SGLANG_WEG2_DUAL_D_HOLD_MAX_S falls
+        # through to the retract's named stop (W-DUAL-D-RETRACT). Off the dual D
+        # this is one env read on an already-full round, nothing else.
+        if kv_full_retract_flag and _weg2_dual_d_priority.d_retract_forbidden():
+            _hold = _weg2_dual_d_priority.grow_or_hold(self, batch, num_tokens_next)
+            if _hold == "go":
+                kv_full_retract_flag = False
+            elif _hold == "hold":
+                return batch  # marked: the callers skip the decode, the batch stays
+        elif getattr(self, "_weg2_d_hold", None) is not None:
+            _weg2_dual_d_priority.end_hold(self, "fits")
         # #797, EXAMINED AND DELIBERATELY NOT CHANGED. This decision and the
         # loop bound below are RANK-LOCAL on a TP=1/PP=3 boot -- not by
         # oversight, but because `_update_uniform_pool_budget` reduces on

@@ -9648,6 +9648,11 @@ class SchedulerWeightUpdaterManager:
         
         if replay is not None:
             return replay
+        # D PRIORITY stage 2 (dual P only, else None): the device's free bytes
+        # before the leg, so the bytes it frees can be lent to the card pool.
+        from sglang.srt.weg2 import dual_p_kv_stage as _dpk_sleep
+
+        _weg2_dual_phys0 = _dpk_sleep.sleep_phys_before(self.scheduler)
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}
@@ -10361,6 +10366,7 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001
             pass
 
+        _dpk_sleep.sleep_lend(self.scheduler, _weg2_dual_phys0)  # D PRIORITY stage 2 (dual P only)
         # C17: the group's answer carries what the group moved.  ``per_tag``
         # falls back to THIS rank's own numbers when there was no group to
         # gather over (a single-rank engine), and is None on the stock path so
@@ -10412,6 +10418,10 @@ class SchedulerWeightUpdaterManager:
 
         if replay is not None:
             return replay
+        # D PRIORITY stage 2 (dual P only): the loan back before anything maps
+        from sglang.srt.weg2 import dual_p_kv_stage as _dpk_wake
+
+        _dpk_wake.wake_reclaim(self.scheduler)
         if self.scheduler is not None:
             self.scheduler._weg2_resume_t0 = time.perf_counter()  # RW instrument: the leg's start
         # KRIT3 (weg2/resume_via_p.py): a resume is a wake -- P ran in between;

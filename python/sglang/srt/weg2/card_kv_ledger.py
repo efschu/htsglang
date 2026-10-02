@@ -260,6 +260,30 @@ class CardKvLedger:
             assert sum(st.committed.values()) <= st.budget, "I1 violated"
             return grant, pressure
 
+    def lend(self, nbytes: int) -> int:
+        """D PRIORITY stage 2: this group's process freed ``nbytes`` of NON-KV
+        device memory (P's weights parked in host RAM) -- they join the card's
+        pool for as long as the process sleeps. Unlike ``contribute`` (a boot
+        sizing, net of what the other group released) this is a plain loan."""
+        n = max(0, int(nbytes))
+        with self._locked() as st:
+            st.budget += n
+            st.contrib[self.group] += n
+            return n
+
+    def reclaim(self, nbytes: int) -> bool:
+        """The loan back, before the process maps its weights again: only when
+        the pool's free bytes cover it (nobody committed into the loan) --
+        False otherwise, nothing changed (the caller waits or stops named)."""
+        n = max(0, int(nbytes))
+        with self._locked() as st:
+            if st.free < n:
+                return False
+            st.budget -= n
+            st.contrib[self.group] = max(0, st.contrib[self.group] - n)
+            assert sum(st.committed.values()) <= st.budget, "I1 violated"
+            return True
+
     def release(self, nbytes: int) -> int:
         """Return ``nbytes`` this group decommitted; clears pressure it answered."""
         with self._locked() as st:

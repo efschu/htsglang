@@ -3963,6 +3963,24 @@ def resolve_x_ceiling(ceiling_flag: Optional[int], x_tokens: int,
 SHORT_DRAIN_ABOVE_X_NAME = "W153 Weg2ShortDrainAboveX"
 
 
+def dual_x_tokens(ns) -> Optional[int]:
+    """DUAL-TP3PP3 (user decision 01.10.): D's X in the dual layout, or None outside it.
+
+    Metal dual1m (...10011343, 13:47Z): the front still routed SHORT (uncached <= X=12288)
+    straight to D in the dual layout -- 39 "SHORT -> D", D X-GATE admitted 2..3957 uncached
+    tokens and a 2185-token extend stalled D's decode ~2.5 s. In the dual layout P prefills
+    everything: X = 1 + --dual-d-prefill-tokens (default 0), the 1 being the N-1 anchor
+    token D's first step computes. Bypasses resolve_x's floor (--chunked-prefill-size) on
+    purpose: that floor is a flip-design break-even, and the dual layout never flips."""
+    if not getattr(ns, "dual_layout", False):
+        return None
+    allowance = int(getattr(ns, "dual_d_prefill_tokens", 0) or 0)
+    if allowance < 0:
+        raise SystemExit(f"--dual-d-prefill-tokens {allowance} < 0: the D prefill allowance "
+                         f"counts tokens beyond the N-1 anchor token; 0 = none")
+    return 1 + allowance
+
+
 def refuse_short_drain_above_x(n_tokens: int, x_tokens: int, x_provenance: str) -> None:
     """LAW 4 SUMMED OVER A DRAIN, at launch (RC2 review, L1).
 
@@ -13965,6 +13983,10 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
            # Both groups stay awake: rank-side rules that assume the other
            # group sleeps read this (scheduler._weg2_store_short_max_cycles).
            "SGLANG_WEG2_DUAL_LAYOUT": "1",
+           # DUAL ANCHOR N-1 (weg2/dual_anchor_claim.py): the exact bigram
+           # keying in BOTH groups, so P's N-1 anchor node has N-1 units and
+           # D claims it whole (uncached 1 after every hand-back, not 2)
+           "SGLANG_WEG2_BIGRAM_ANCHOR_EXACT": "1",
            # the card KV ledgers' name space: the ranks derive the same path
            # as the front (dual_kv_ledger_paths) from this tag
            "SGLANG_WEG2_DUAL_KV_TAG": str(ns.tag)}
@@ -13976,7 +13998,118 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
         env["SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS"] = str(int(getattr(ns, "dual_d_kv_max_tokens", 0) or 0))
     if group == "P":
         env["SGLANG_WEG2_DUAL_SHARE"] = "1"
+    if group == "P" and dual_p_sleep_armed(ns):
+        # D PRIORITY stage 2: P's weights are NOT resident (the resident arm
+        # refuses any weights release by name), backed up by TMS at the pause,
+        # and outside the exchange; D stays resident, D never sleeps
+        env.update(DUAL_P_SLEEP_GROUP_ENV)
     return env
+
+
+class Weg2DualPSleepShareRefused(SystemExit):
+    """W-DUAL-P-SLEEP-SHARE: --dual-p-sleep on with --dual-share. Not resident, P's
+    weights load inside the memory-saver's private MemPool; the union bind frees
+    P's own copies there and a private pool never returns them (gmps9 boot death,
+    P-PP0 'per-rank budget leaves no GPU memory for the KV cache')."""
+
+
+def dual_p_sleep_share_supported() -> bool:
+    """Steps 1-3 of P's sleep under --dual-share are in this tree: the shared part
+    loads in a transient scope (weg2_memory_saver.transient_load_scope) and the
+    untagged-live riegel guards it."""
+    from sglang.srt.managers import weg2_memory_saver as _ms
+
+    return hasattr(_ms, "transient_load_scope") and hasattr(_ms, "assert_no_untagged_live")
+
+
+#: DUAL P SLEEP: the env group P sleeps under (dual layout, unified KV, --dual-p-sleep
+#: on). The physical TMS backup of the weights is gated by
+#: weight_exchange.weights_cpu_backup_armed() -- the ENV, not the argv bit -- and the
+#: dual boots ship 'off' (gmps7 WEG2-GROUP-ENV P: SGLANG_WEG2_WEIGHTS_CPU_BACKUP=off):
+#: a sleep would wake to undefined weights. And with the exchange armed
+#: (SGLANG_WEG2_WEIGHT_SOURCE=exchange, inject authoritative) the sleep leg would
+#: deposit for a peer flip and the wake inject from one; the dual layout never flips.
+DUAL_P_SLEEP_GROUP_ENV = {
+    "SGLANG_WEG2_WEIGHTS_RESIDENT": "0",
+    "SGLANG_WEG2_WEIGHTS_CPU_BACKUP": "on",
+    "SGLANG_WEG2_WEIGHT_SOURCE": "ring",
+}
+
+
+def dual_p_sleep_choice(ns) -> str:
+    """'on' / 'off': --dual-p-sleep as given, or its DEFAULT -- on when
+    --dual-share is set (the dual-share sleep is metal-proven: gmps12, SLEEP-LEND
+    7958691840 / 3219128320 / 3508535296 B and WAKE-RECLAIM on all three P
+    stages), off otherwise. The metal probe (SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S) is
+    never part of the default."""
+    v = getattr(ns, "dual_p_sleep", None)
+    if v is None:
+        return "on" if bool(getattr(ns, "dual_share", False)) else "off"
+    return str(v)
+
+
+def dual_p_sleep_armed(ns) -> bool:
+    """D PRIORITY stage 2 is armed: dual layout + unified KV + --dual-p-sleep on
+    (explicit, or the default under --dual-share: :func:`dual_p_sleep_choice`).
+    An explicit 'on' under --dual-share in a tree without the transient load is
+    REFUSED by name (:class:`Weg2DualPSleepShareRefused`); the DEFAULT there
+    stays off instead."""
+    on = (bool(getattr(ns, "dual_layout", False))
+          and str(getattr(ns, "dual_unified_kv", "off")) == "on"
+          and dual_p_sleep_choice(ns) == "on")
+    if on and bool(getattr(ns, "dual_share", False)) and not dual_p_sleep_share_supported():
+        if getattr(ns, "dual_p_sleep", None) is None:
+            return False
+        raise Weg2DualPSleepShareRefused(
+            "W-DUAL-P-SLEEP-SHARE: --dual-p-sleep on with --dual-share -- P's weights would load inside the "
+            "memory-saver's private MemPool and the union bind's freed copies would stay reserved there "
+            "(gmps9: 'card free 3.35 -> 3.35 GiB', P-PP0 KV budget refused). Use --dual-p-sleep off (default).")
+    return on
+
+
+def apply_dual_p_sleep(ns, spec_p, log) -> bool:
+    """D PRIORITY stage 2 on P's spec: the weights CPU backup, never through the
+    host ring (a resting pinned pool would be a permanent host image). The
+    not-resident env comes with dual_share_env(ns, "P")."""
+    if not dual_p_sleep_armed(ns):
+        return False
+    spec_p.argv = dual_p_sleep_argv(ns, spec_p.argv)
+    for _k in ("TMS_HOST_RING_DIR", "TMS_HOST_RING_MAP", "TMS_HOST_RING_EPOCH", "TMS_HOST_RING_FORM"):
+        spec_p.env.pop(_k, None)
+    log("WEG2-DUAL-P-SLEEP armed: P --enable-weights-cpu-backup, weights not resident, no host ring "
+        "(image allocated at the pause, freed after the restore)")
+    return True
+
+
+def dual_p_sleep_argv(ns, argv_p) -> List[str]:
+    """P's argv with the weights CPU backup when stage 2 is armed (P only; the
+    host ring stays absent for P -- dual_p_sleep_env pops it -- so the image is
+    the stock per-pause pinned block, freed after the restore)."""
+    argv_p = list(argv_p)
+    if dual_p_sleep_armed(ns) and "--enable-weights-cpu-backup" not in argv_p:
+        argv_p.append("--enable-weights-cpu-backup")
+    return argv_p
+
+
+#: D's verify tokens per seat and round on the 27B dual (DFlash: the draft's
+#: block plus the bonus token); the look-ahead's per-seat term
+DUAL_D_VERIFY_TOKENS = 4
+
+
+def dual_d_air_tokens(d_bs: int, chunk: int = CHUNKED_PREFILL_TOKENS,
+                      verify: int = DUAL_D_VERIFY_TOKENS) -> int:
+    """D's look-ahead in tokens (d_mem_sched.air_tokens): one extend chunk plus
+    one decode round of every seat with the draft's tokens."""
+    return int(chunk) + max(1, int(d_bs)) * max(1, int(verify))
+
+
+def dual_p_sleep_front_env(ns, d_air_tokens: int) -> Dict[str, str]:
+    """The front's capability switch and D's look-ahead in tokens."""
+    if not dual_p_sleep_armed(ns):
+        return {}
+    from sglang.srt.weg2 import dual_d_priority as _ddp
+
+    return {_ddp.P_SLEEP_ENV: "1", "SGLANG_WEG2_DUAL_D_AIR_TOKENS": str(int(d_air_tokens))}
 
 
 def dual_p_cut_from_argv(argv) -> str:
@@ -21348,6 +21481,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="DUAL-TP3PP3 --dual-share: what P holds on a card outside its "
                          "--rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged "
                          "when D is sized from P's plan instead of P's measurement.")
+    ap.add_argument("--dual-d-prefill-tokens", type=int, default=0,
+                    help="DUAL-TP3PP3 D PREFILL ALLOWANCE, DEFAULT 0 (user decision 01.10.: in the dual "
+                         "layout EVERY prefill runs on P, D only decodes). D's X (its W31 riegel and the "
+                         "front's route bound) becomes 1 + this value: the 1 is the N-1 anchor convention "
+                         "(P holds the last prompt token back, D's first step computes it), anything "
+                         "larger goes to P and a larger remainder at D is refused by name (W31 -> P), "
+                         "never silently recomputed. Ignored outside --dual-layout; replaces "
+                         "--tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.")
     ap.add_argument("--dual-p-duty", type=float, default=1.0,
                     help="DUAL-TP3PP3: the share of wall time P's first stage may compute while D holds "
                          "decodes (weg2/dual_duty.py; the latency guard WITHOUT MPS). 1.0 = off. The front "
@@ -21358,6 +21499,24 @@ def build_parser() -> argparse.ArgumentParser:
                          "(risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs "
                          "~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. "
                          "100 = no limit.")
+    ap.add_argument("--dual-p-sleep", choices=("off", "on"), default=None,
+                    help="DEFAULT: ON with --dual-share, OFF otherwise (since gmps12, "
+                         "dkr27bnvfp4dual1mpsleepbar1fs10020008: P slept and woke under --dual-share on all three "
+                         "stages, SLEEP-LEND/WAKE-RECLAIM; the metal probe SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S stays "
+                         "off by default). History: "
+                         "default off since gmps9 (dkr27bnvfp4dual1mbar1fs10012051, P-PP0 init_memory_pool: 'per-rank "
+                         "budget leaves no GPU memory for the KV cache'): 'on' loads P's weights inside the "
+                         "memory-saver's private MemPool (not resident), and the --dual-share union bind frees P's "
+                         "own copies into that pool, which empty_cache never returns ('WEG2-UNION PEER ... card free "
+                         "3.35 -> 3.35 GiB', resident gmps7: 3.31 -> 11.74 GiB). 'on' together with --dual-share is "
+                         "therefore REFUSED at launch (W-DUAL-P-SLEEP-SHARE) until P's union-bound part loads outside "
+                         "the pool. "
+                         "DUAL-TP3PP3 with --dual-unified-kv on: D PRIORITY stage 2 (user decision 01.10.) -- "
+                         "when D is still short after P stopped and released its KV, P sleeps and parks its "
+                         "weights in host RAM (P boots with --enable-weights-cpu-backup and NOT resident; the "
+                         "vendored torch_memory_saver allocates the host image at the pause and frees it after "
+                         "the restore, tms_csrc/core.cpp -- no resting image, KEIN-DAUER-HOSTRAM). off = stage 1 "
+                         "only, the front prints 'stage=2 unavailable (weights resident)'.")
     ap.add_argument("--dual-unified-kv", choices=("off", "on"), default="off",
                     help="DUAL-TP3PP3: one KV pool per card shared by P and D at runtime (user orders "
                          "30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P maps KV only while it "
@@ -23759,6 +23918,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # H84: D's riegel and the front's live-X ceiling, one number (0 = off).
     d_x_tokens, front_x_ceiling, x_ceiling_line = resolve_x_ceiling(
         ns.x_ceiling_tokens, x_tokens, getattr(ns, "x_busy_tokens", None))
+    _dual_x = dual_x_tokens(ns)
+    if _dual_x is not None:
+        x_tokens = d_x_tokens = _dual_x
+        front_x_ceiling = 0
+        x_provenance = (f"X={_dual_x} source=DUAL (--dual-d-prefill-tokens "
+                        f"{int(getattr(ns, 'dual_d_prefill_tokens', 0) or 0)}: every prefill on P, D "
+                        f"computes at most the N-1 anchor token; was {x_seed.provenance})")
+        x_ceiling_line = (f"X CEILING: off in the dual layout -- group D --tp-prefill-max-tokens "
+                          f"{_dual_x}, front --tp-prefill-max-tokens {_dual_x}: any larger remainder "
+                          f"routes to P, and D refuses one by name (W31 -> P)")
+        if int(ns.d_short_drain_tokens or 0) > 0:
+            log(f"WEG2-DUAL --d-short-drain-tokens {ns.d_short_drain_tokens} -> 0 (a flip-design "
+                f"idle drain onto D; in the dual layout D prefills nothing)")
+            ns.d_short_drain_tokens = 0
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
     if int(ns.d_short_drain_tokens or 0) < 0 or (ns.d_hold_s is not None and float(ns.d_hold_s) < 0):
@@ -25691,6 +25864,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                     f"p_free_reads_{ns.tag}")
         spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
+    apply_dual_p_sleep(ns, spec_p, log)  # D PRIORITY stage 2 (dual unified KV only)
     ns._dual_mps_env = start_dual_mps(ns, log, dry)
     spec_p.env.update(ns._dual_mps_env)
     spec_p.env.update(dual_p_sm_env(ns))
@@ -26273,6 +26447,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
+    # D PRIORITY stage 2: the front's capability + D's look-ahead (one extend
+    # chunk + one decode round of every seat with the draft's tokens)
+    fenv.update(dual_p_sleep_front_env(ns, dual_d_air_tokens(d_bs)))
     # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
     # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
     #
