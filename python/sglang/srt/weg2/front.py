@@ -689,6 +689,9 @@ def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
     lost = {int(d) for d in depths or () if int(d) > 0}
     if not lost or spans is None:
         return []
+    _drop_seq = getattr(spans, "drop_seq_depths", None)  # SEQ-HASH (02.10.)
+    if callable(_drop_seq):
+        _drop_seq(lost)
     entries = getattr(spans, "entries", None)
     caps = getattr(spans, "depth_caps", None)
     if entries is None or caps is None:
@@ -1542,6 +1545,54 @@ def anchor_depths_of(body: Any) -> tuple:
             except (TypeError, ValueError):
                 return ()
     return ()
+
+
+def d_seq_mark(body: Any) -> Optional[str]:
+    """SEQ-HASH (02.10.): D's ``weg2_seq_hash`` mark for this leg 2, or None
+    (``meta_info`` on ``/generate``, ``sglext`` on both chat wires)."""
+    if not isinstance(body, dict):
+        return None
+    for holder in (body.get("meta_info"), body.get("sglext")):
+        if isinstance(holder, dict) and isinstance(holder.get("weg2_seq_hash"), str):
+            return holder["weg2_seq_hash"]
+    return None
+
+
+def d_seq_mark_stream_tail(tail: bytes) -> Optional[str]:
+    """:func:`d_seq_mark` of the last streamed chunk that carries it."""
+    for raw in reversed(tail.split(b"\n")):
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]" or b"weg2_seq_hash" not in data:
+            continue
+        try:
+            js = json.loads(data)
+        except Exception:  # noqa: BLE001
+            continue
+        got = d_seq_mark(js)
+        if got is None and isinstance(js, dict):
+            # Anthropic: the sglext rides inside the message_delta / message
+            for k in ("message", "delta"):
+                got = d_seq_mark(js.get(k)) if isinstance(js.get(k), dict) else None
+                if got:
+                    break
+        if got is not None:
+            return got
+    return None
+
+
+def park_seq_marks(body: str) -> Dict[str, str]:
+    """SEQ-HASH: ``{rid: mark}`` of D's park answer ({} when absent)."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return {}
+    got = payload.get("weg2_seq_hash") if isinstance(payload, dict) else None
+    if not isinstance(got, dict):
+        return {}
+    return {str(k): v for k, v in got.items() if isinstance(v, str)}
 
 
 def d_resumable_depth_stream_tail(tail: bytes) -> Optional[int]:
@@ -5173,6 +5224,8 @@ class Front:
             return "failed"
         known = [r for r in rids if r in D.outstanding]
         unknown = [r for r in rids if r not in D.outstanding]
+        # SEQ-HASH (NF 02ddfc4906): the parked legs' sequence marks at their #59b depths
+        self._seq_park(park_seq_marks(text))
         # PARK-HANDBACK (NF 9bdfe50185): prefill D holds unstarted goes to P's batch. 27B port: a
         # handed-back rid is NOT also counted parked (its leg closes, P's batch takes it) -- no
         # double effect with the park ledger / PARK-RESUME below.
@@ -6150,6 +6203,37 @@ class Front:
                         "epoch now credits the #59 depth D witnessed for it, never its prompt; a later D "
                         "reading below it retracts it)", done_epoch, n, gained)
             self._x_exact_reprice_queue("d_epoch_publish")
+
+    def _seq_record(self, rid: str, ids: Any, mark: Optional[str], where: str) -> bool:
+        """SEQ-HASH (02.10.): record D's sequence mark of ``rid`` (prompt ``ids``)."""
+        from sglang.srt.managers import weg2_seq_hash as _sh
+
+        ts = getattr(self, "tspans", None)
+        got = _sh.parse(mark)
+        if ts is None or ids is None or got is None:
+            return False
+        depth, digest = got
+        if not ts.record_seq(ids, depth, digest):
+            return False
+        self.counters["seq_marks"] += 1
+        logger.info("WEG2 SEQ-MARK rid=%s where=%s depth=%d prompt=%d past_prompt=%d (D's anchor on "
+                    "prompt + output; a follow-up extending this sequence is credited to it)",
+                    rid, where, depth, int(ids.size), depth - int(ids.size))
+        return True
+
+    def _seq_park(self, marks: Dict[str, str]) -> int:
+        """SEQ-HASH: the park answer's marks for the legs it parked."""
+        if not marks or not getattr(self, "x_exact", False) or getattr(self, "ftok", None) is None:
+            return 0
+        texts = self.__dict__.get("_leg2_text") or {}
+        n = 0
+        for rid, mark in marks.items():
+            text = texts.get(rid)
+            if text is None:
+                continue
+            n += int(self._seq_record(rid, self.ftok.ids_for(text), mark, "park"))
+        if n:
+            self._x_exact_reprice_queue("seq_mark")
         return n
 
     def _park_handback(self, rids: Sequence[str]) -> List[str]:
@@ -6392,7 +6476,8 @@ class Front:
         return n
 
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
-                        held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
+                        held_epoch: Optional[int], resumable_depth: Optional[int] = None,
+                        seq_mark: Optional[str] = None) -> None:
         """D leg 2 finished: feed the token spans with D's MEASURED reading and
         log the residual error of this request's exact price. NO BAND: the
         error is printed, never folded back into the routing bound."""
@@ -6401,6 +6486,7 @@ class Front:
         clamped_tokens = self.tspans.own_text_clamped_tokens
         self.tspans.record_presence(ids, ct, prompt_tokens=pt,
                                     held_epoch=held_epoch, resumable_depth=resumable_depth)
+        self._seq_record(rid, ids, seq_mark, "finish")  # SEQ-HASH (02.10.)
         if self.tspans.own_text_clamps != clamps:
             # PREFILL-EINBRUCH-0929 K2: a parked + resumed leg 2 counts its
             # decoded tokens as prompt; the entry credits its own end anchor.
@@ -8873,6 +8959,10 @@ class Front:
         # hands it back to P while D holds it unstarted (finally drops it)
         if (pending is None or getattr(pending, "d_direct", False)) and not single_prefill:
             self.__dict__.setdefault("_d_prefill_legs", {})[rid] = time.time()
+        _lt = self.__dict__.setdefault("_leg2_text", collections.OrderedDict())  # SEQ-HASH
+        _lt[rid] = text
+        while len(_lt) > 512:
+            _lt.popitem(last=False)
         if (envs.SGLANG_WEG2_ENABLE_CLIENT_GONE_ABORT.get() and client_gone(request)
                 and not response_complete(request)):
             # H102 (#58): the client left before its leg 2 was posted (a SHORT
@@ -9368,7 +9458,8 @@ class Front:
                         if self.x_exact:
                             self._x_exact_record(rid, text, pt, ct, pending,
                                                  (self.epoch if _held else None),
-                                                 resumable_depth=_depth)
+                                                 resumable_depth=_depth,
+                                                 seq_mark=d_seq_mark_stream_tail(bytes(tail)))
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
                     self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_stream_tail(bytes(tail)), rid=rid)
@@ -9473,7 +9564,8 @@ class Front:
                     if self.x_exact:
                         self._x_exact_record(rid, text, pt, ct, pending,
                                              (self.epoch if _held else None),
-                                             resumable_depth=_depth)
+                                             resumable_depth=_depth,
+                                             seq_mark=d_seq_mark(js))
                 if r.status == 200 and pending is not None and verdict == "reroute":
                     self.counters["reroute"] += 1
                     pending.reroutes += 1
@@ -10865,6 +10957,11 @@ class Front:
         # charging it twice.  Only D runs the L1.5 hold; any other source
         # keeps the record as measured (parser returns None on no field).
         _l15_held = l15_held_mib_from_body(body) if src == "D" else None
+        # ANCHOR-LOST (y6z 08:24:41): the KV release leg runs the flush that drops
+        # un-backed anchors, so ITS answer carries them (the group fence reads the
+        # ledger once and clears it) -- the family leg's answer came back empty
+        # and the front retracted nothing (13 lost on D, 0 PRESENCE-ANCHOR-LOST).
+        _kv_lost = anchors_lost(body)
         family = list(self.weights_tags)
         # #1233 fix 4 ON THE RING FORM.  The tight-card-first order survives the
         # move to gathered legs (C9); the serial per-tag RPC loop it used to
@@ -11036,11 +11133,12 @@ class Front:
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
         w_done, w_per_tag, w_crit = completed_tags(w_body)
+        _lost_all = sorted(set(anchors_lost(s_body)) | set(_kv_lost))
         if src == "D":
-            self._retract_lost_anchors(anchors_lost(s_body))
+            self._retract_lost_anchors(_lost_all)
         elif src == "P" and s_code == 200:
             # STORE-PRESENCE: P's flush published its END-ANCHORs (L2/L3, shared)
-            self._p_flush_store_presence(anchors_lost(s_body))
+            self._p_flush_store_presence(_lost_all)
         sleep_ms += s_ms
         wake_ms += w_ms
         if s_code != 200 or w_code != 200:

@@ -161,4 +161,7 @@ def test_the_flip_reads_the_sleeper_answer_when_d_sleeps():
 
     src = inspect.getsource(fr.Front.flip)
     i = src.index("s_done, s_per_tag, s_crit = completed_tags(s_body)")
-    assert 'if src == "D":\n            self._retract_lost_anchors(anchors_lost(s_body))' in src[i:i + 400]
+    # D-NORECOMPUTE (b) 02.10.: the KV release leg's answer (which runs the
+    # flush that drops the anchors) is read too -- y6z: 13 lost on D, 0 retracted
+    assert "_lost_all = sorted(set(anchors_lost(s_body)) | set(_kv_lost))" in src[i:i + 400]
+    assert 'if src == "D":\n            self._retract_lost_anchors(_lost_all)' in src[i:i + 500]

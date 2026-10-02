@@ -409,7 +409,26 @@ class TokenizerControlMixin:
         them after the next wake, oldest first. The HTTP streams of the
         parked requests stay open -- nothing is aborted here."""
         self.auto_create_handle_loop()
-        return (await self.weg2_park_running_communicator(obj))[0]
+        out = (await self.weg2_park_running_communicator(obj))[0]
+        # SEQ-HASH (02.10.): each parked request's sequence mark at its #59b depth
+        # (prompt + the output ids this process has seen), off the scheduler
+        try:
+            from sglang.srt.managers import weg2_seq_hash as _sh
+
+            marks = {}
+            for rid, depth in (getattr(out, "weg2_resumable_depth", None) or {}).items():
+                st = self.rid_to_state.get(rid)
+                if st is None or int(depth) <= 0:
+                    continue
+                m = _sh.mark(_sh.sequence(st.prompt_token_ids or getattr(st, "weg2_prompt_ids", None),
+                                          st.output_ids), int(depth))
+                if m:
+                    marks[str(rid)] = m
+            if marks:
+                out.weg2_seq_hash = marks
+        except Exception:  # noqa: BLE001 -- the park answer never fails on a mark
+            pass
+        return out
 
     async def clear_hicache_storage(self: TokenizerManager, force: bool = False) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage (``force``: also a persistent L3 store)."""
