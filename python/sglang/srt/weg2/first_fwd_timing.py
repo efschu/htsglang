@@ -79,6 +79,10 @@ class _State:
         self.load: Optional[Dict[str, Any]] = None
         self.event_factory: Callable[[], Any] = _cuda_event
         self.available: Callable[[], bool] = _cuda_ok
+        # L15-FWD-INST: the held wake (L1.5 hold kept) and the GIL sampler
+        self.held_wake = -1
+        self.held_next = False
+        self.sampler: Optional["_Sampler"] = None
 
 
 S = _State()
@@ -92,6 +96,78 @@ def arm(tag: str = "") -> None:
     S.wake += 1
     S.fwd = 0
     S.load = None
+    if S.held_next:
+        S.held_wake = S.wake
+        S.held_next = False
+
+
+def mark_held() -> None:
+    """L15-FWD-INST: this wake keeps an L1.5 hold (called at the hold-aware
+    restore, before or after :func:`arm` of the same wake)."""
+    if armed() and S.fwd == 0 and S.cur is None:
+        S.held_wake = S.wake
+        S.held_next = False
+    else:
+        S.held_next = True
+
+
+GIL_ENV = "SGLANG_WEG2_FIRST_FWD_GIL"
+
+
+def gil_mode(env=None) -> str:
+    """'held' (default: the first forward after a held wake), 'all' (the first
+    forward after every wake) or 'off'."""
+    env = os.environ if env is None else env
+    v = str(env.get(GIL_ENV, "held") or "held").strip().lower()
+    return v if v in ("held", "all") else "off"
+
+
+class _Sampler:
+    """L15-FWD-INST GIL sampler: a daemon thread wakes every ``period_s`` and
+    reads the scheduler thread's innermost frame. Its own lateness beyond the
+    period is GIL wait (a thread holding the GIL delays the sampler as it
+    delays the scheduler's launches); the innermost frames name where the
+    scheduler thread stands."""
+
+    def __init__(self, tid: int, period_s: float = 0.002, cap: int = 4000):
+        self.tid, self.period, self.cap = tid, period_s, cap
+        self.lags: List[float] = []
+        self.funcs: Dict[str, int] = {}
+        self.stop_ev = threading.Event()
+        self.t = threading.Thread(target=self._run, name="weg2-fwd-gil", daemon=True)
+
+    def start(self):
+        self.t.start()
+        return self
+
+    def _run(self):
+        last = time.perf_counter()
+        while not self.stop_ev.is_set() and len(self.lags) < self.cap:
+            time.sleep(self.period)
+            now = time.perf_counter()
+            self.lags.append(max(0.0, (now - last) - self.period))
+            last = now
+            try:
+                fr = sys._current_frames().get(self.tid)
+                if fr is not None:
+                    key = "%s:%s" % (os.path.basename(fr.f_code.co_filename), fr.f_code.co_name)
+                    self.funcs[key] = self.funcs.get(key, 0) + 1
+            except Exception:  # noqa: BLE001
+                pass
+
+    def stop(self) -> str:
+        self.stop_ev.set()
+        try:
+            self.t.join(timeout=0.1)
+        except Exception:  # noqa: BLE001
+            pass
+        lags = sorted(self.lags)
+        n = len(lags)
+        p90 = lags[int(0.9 * (n - 1))] * 1000.0 if n else 0.0
+        top = sorted(self.funcs.items(), key=lambda kv: -kv[1])[:4]
+        return ("gil[samples=%d lag_sum_ms=%.1f lag_p90_ms=%.2f lag_max_ms=%.1f top=%s]"
+                % (n, sum(lags) * 1000.0, p90, (lags[-1] * 1000.0) if n else 0.0,
+                   ",".join("%s:%d" % kv for kv in top)))
 
 
 def armed() -> bool:
@@ -118,6 +194,9 @@ def on_set_consumer(index) -> None:
     open a new one while armed."""
     try:
         if S.cur is not None:
+            if S.sampler is not None:
+                S.cur["gil"] = S.sampler.stop()
+                S.sampler = None
             S.pending.append(S.cur)
             S.cur = None
             del S.pending[:-MAX_PENDING]
@@ -126,8 +205,15 @@ def on_set_consumer(index) -> None:
             S.left -= 1
             S.fwd += 1
             S.cur = {"wake": S.wake, "fwd": S.fwd, "consumer": int(index if index is not None else -1),
-                     "layers": {}, "load": S.load}
+                     "layers": {}, "load": S.load, "host": {},
+                     "held": int(S.held_wake == S.wake)}
             S.load = None
+            mode = gil_mode()
+            if S.fwd == 1 and (mode == "all" or (mode == "held" and S.cur["held"])):
+                try:
+                    S.sampler = _Sampler(threading.get_ident()).start()
+                except Exception:  # noqa: BLE001
+                    S.sampler = None
     except Exception:  # noqa: BLE001
         S.cur = None
 
@@ -149,6 +235,7 @@ def timed_wait(loading_event, threshold: int) -> None:
     try:
         pre = S.event_factory()
         pre.record()
+        rec.setdefault("host", {})[threshold] = time.perf_counter()
     except Exception:  # noqa: BLE001
         loading_event.wait(threshold)
         return
@@ -252,6 +339,17 @@ def summarize(rec) -> Optional[str]:
     fa = [g for l, g in gaps.items() if l % 4 == 3]
     ot = [g for l, g in gaps.items() if l % 4 != 3]
     gtop = sorted(gaps.items(), key=lambda kv: -kv[1])[:6]
+    # L15-FWD-INST: the HOST gap beside the device gap per layer class --
+    # host ~= device = launch-/GIL-bound (the GPU idles on the CPU), device >>
+    # host = the device itself waits (copy contention, collectives)
+    hs = rec.get("host") or {}
+    hg = {order[i]: (hs[order[i + 1]] - hs[order[i]]) * 1000.0
+          for i in range(len(order) - 1) if order[i] in hs and order[i + 1] in hs}
+    hfa = [g for l, g in hg.items() if l % 4 == 3]
+    hot = [g for l, g in hg.items() if l % 4 != 3]
+    host_prof = " host[full_attn sum=%.1f other sum=%.1f mean=%.2f] held=%d%s" % (
+        sum(hfa), sum(hot), (sum(hot) / len(hot)) if hot else 0.0, int(rec.get("held", 0)),
+        (" " + rec["gil"]) if rec.get("gil") else "")
     prof = "gap_sum_ms=%.1f full_attn(L%%4==3)[n=%d sum=%.1f mean=%.2f] other[n=%d sum=%.1f mean=%.2f] gap_top=%s" % (
         sum(gaps.values()), len(fa), sum(fa), (sum(fa) / len(fa)) if fa else 0.0,
         len(ot), sum(ot), (sum(ot) / len(ot)) if ot else 0.0,
@@ -260,7 +358,8 @@ def summarize(rec) -> Optional[str]:
             "top=%s h2d_ms=%.1f first_wait_after_h2d_begin_ms=%.1f resume_after_h2d_end_ms=%.1f "
             "waited_span_ms=%.1f %s%s (device events; the collectives' waits are on the Prefill rank batch line)"
             % (rec["wake"], rec["fwd"], rec["consumer"], len(layers), total, mx[1], mx[0],
-               ",".join("L%d:%.1f" % (t, w) for t, w in top), h2d, fw, rs, span, prof, _dcp_summary(rec)))
+               ",".join("L%d:%.1f" % (t, w) for t, w in top), h2d, fw, rs, span, prof + host_prof,
+               _dcp_summary(rec)))
 
 
 def harvest() -> int:
