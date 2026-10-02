@@ -610,6 +610,28 @@ class ShmArena:
                                    st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
         return slots, st
 
+    @staticmethod
+    def encode_stems(stems: Sequence[str]):
+        """PDFLIP-L: the ctypes stem array ``find_states_encoded`` takes --
+        built once and reused by a caller whose stem list does not change
+        (the kept keys of a hand-off / park, census at every reset)."""
+        n = len(stems)
+        return (ctypes.c_char_p * max(n, 1))(*[s.encode("utf-8") for s in stems]), n
+
+    def find_states_encoded(self, enc):
+        """PDFLIP-L: int8 state per stem of an ``encode_stems`` array (2 =
+        COMPLETE), hashed in C; no per-stem encode, no tuple list."""
+        import numpy as np
+        c_stems, n = enc
+        st = np.empty((n,), dtype=np.int8)
+        if n == 0:
+            return st
+        slots = np.empty((n,), dtype=np.int64)
+        self._lib.arena_find_stems(self._base, n, c_stems,
+                                   slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                   st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return st
+
     def ref_slots_np(self, slots, delta: int) -> int:
         """ref_slots over a numpy int64 array (zero-copy pointer)."""
         import numpy as np

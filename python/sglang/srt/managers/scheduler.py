@@ -19767,6 +19767,10 @@ class Scheduler(
         # node is un-backed, join the write-throughs (bounded by the existing
         # write-back drain), then reset.  SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=0
         # restores the old form.
+        # PDFLIP-L: segment clock of this flush (instrument only, WEG2-SLEEP-SUB).
+        from sglang.srt.weg2 import flush_sub_timing as _weg2_flush_sub
+
+        _fsub = _weg2_flush_sub.begin_flush(zero_kv)
         if (
             self.enable_hierarchical_cache
             and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
@@ -19817,9 +19821,11 @@ class Scheduler(
                     (time.perf_counter() - _t0) * 1000.0,
                     " -- B1 NONBLOCK: issued, not joined here; the sleep leg drains them "
                     "before its reset" if _b1_nowait else "")
+        _fsub.mark("sweep")
         group_idle, verdict_detail = self.group_idle_verdict(
             tp_group_verdict=tp_group_verdict
         )
+        _fsub.mark("verdict")
         # B1 (weg2_flush_nonblock part 2): a quiesce whose only blockers are
         # the group's own publish answers "quiesced" and keeps the tree; the
         # sleep leg drains, publishes, joins and resets before the kv pause.
@@ -19828,6 +19834,7 @@ class Scheduler(
         )
         if _b1_quiesced is not None:
             logger.info("%s | #1268 group verdict: %s", _b1_quiesced, verdict_detail)
+            _weg2_flush_sub.end_flush(_fsub, "b1_quiesced")
             return True
         if group_idle:
             # fnFL2 H63d (#1470b): the reset below restarts the storage
@@ -19838,6 +19845,7 @@ class Scheduler(
             # blockers -- x169: hicache_backup(5) on PP1/PP2 in the same
             # second, D's store read short by 11776 tokens.  Join them first.
             self._weg2_join_store_writes_before_reset()
+            _fsub.mark("store_join")
             # [L1.5 SHADOW] Log-only shadow pricing of a hypothetical L1.5
             # hold set at this sleep flush (no behaviour change).
             try:
@@ -20222,7 +20230,9 @@ class Scheduler(
                             int(_b.data_ptr()), _r),
                     ):
                         _l15_res = None
+            _fsub.mark("l15")
             self._weg2_note_lost_anchors()
+            _fsub.mark("anchors")
             self.cur_batch_for_debug = None
             self.last_batch = None
             if _l15_res is not None:
@@ -20286,29 +20296,39 @@ class Scheduler(
                 except Exception as exc:  # noqa: BLE001 -- cleanup only
                     logger.warning("L15-KEEP-CLEAR at=sleep failed (%s: %s)",
                                    type(exc).__name__, exc)
+                _fsub.mark("l15_tail")
                 self.tree_cache.reset()
+                _fsub.mark("tree_reset")
                 self.req_to_token_pool.clear()
+                _fsub.mark("req_pool_clear")
                 self.token_to_kv_pool_allocator.clear()
+                _fsub.mark("alloc_clear")
                 if self._flush_zero_kv_wanted(zero_kv):
                     # Default part of the flush (opt-out env): the post-flush
                     # state must equal a fresh boot, whose pools are torch.zeros.
                     # #1457: the Weg-2 sleep leg opts out (pages are discarded).
                     self._flush_zero_kv_buffers()
+                _fsub.mark("zero_kv")
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
+            _fsub.mark("grammar_metrics")
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
+            _fsub.mark("draft")
 
             if empty_cache:
                 current_platform.empty_cache()
+            _fsub.mark("empty_cache")
             if envs.SGLANG_FLUSH_SCRUB_FREE_MEMORY.get():
                 self._flush_scrub_free_memory()
+            _fsub.mark("scrub")
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
             success = True
+            _weg2_flush_sub.end_flush(_fsub, "passed" if _l15_res is None else "passed_l15")
         else:
             # NAME THE CLAUSE, not just the verdict (#631/#656). The wedged
             # instance of 2026-08-10 refused this flush while the metrics
@@ -20325,6 +20345,7 @@ class Scheduler(
                 f"| #1268 group verdict: {verdict_detail}"
             )
             success = False
+            _weg2_flush_sub.end_flush(_fsub, "refused")
         return success
 
     def _weg2_join_store_writes_before_reset(self) -> None:

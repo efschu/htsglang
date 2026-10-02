@@ -9817,8 +9817,13 @@ class SchedulerWeightUpdaterManager:
             self.weg2_sleep_before = sleep_acceptance_census(tags=tags)
         weg2_before_census = self.weg2_sleep_before
         t_rpc0 = time.perf_counter()
+        # PDFLIP-L: segment clock of the kv release (instrument only, WEG2-SLEEP-SUB).
+        from sglang.srt.weg2 import flush_sub_timing as _weg2_flush_sub
+
+        _kvsub = None
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            _kvsub = _weg2_flush_sub.FlushClock("kv")
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -9861,7 +9866,9 @@ class SchedulerWeightUpdaterManager:
             if self.scheduler is not None:
                 self.scheduler._l15_sleep_flip = _weg2_flip_index_of(
                     getattr(recv_req, "epoch", None))
+            _kvsub.mark("pre")
             self.flush_cache(zero_kv=False)
+            _kvsub.mark("flush")
             # AH (--p-attn-head-split): the helper mirror lives in this region;
             # reset the split rule and drain the helper before it is unmapped,
             # so no request ever continues on a mirror from before the flip.
@@ -9869,11 +9876,14 @@ class SchedulerWeightUpdaterManager:
 
             if _ah_split.runtime() is not None:
                 _ah_split.runtime().on_kv_release()
+            _kvsub.mark("ah")
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            _kvsub.mark("kv_pause")
             if _pls is not None and _pls.modules:
                 # the swing weights sleep with the KV pool (their own tag,
                 # outside the exchanged family); refilled from home on wake
                 self.memory_saver_adapter.pause(_pls_rt.SWING_WEIGHTS_TAG)
+            _kvsub.mark("swing")
             _weg2_ph("kv_pause")
             # W25 Weg2DormantRefused (S1 boot killer K2): from this statement
             # on the req-index / KV / mamba pools are unmapped, so the
@@ -10245,7 +10255,24 @@ class SchedulerWeightUpdaterManager:
                 (time.perf_counter() - t_graph) * 1000,
             )
 
+        if _kvsub is not None:
+            _kvsub.mark("to_graph")
         torch.get_device_module().synchronize()
+        if _kvsub is not None:
+            _kvsub.mark("sync")
+            _kvsub.path = "kv"
+            try:
+                from sglang.srt.managers.weg2_memory_saver import weg2_group_name as _wgn
+
+                _grp = _wgn() or "-"
+            except Exception:  # noqa: BLE001 -- the instrument never breaks the release
+                _grp = "-"
+            _weg2_flush_sub.emit_sleep_line(
+                _grp,
+                int(getattr(self.scheduler, "pp_rank", 0) or 0),
+                int(getattr(self.scheduler, "tp_rank", 0) or 0),
+                _kvsub,
+            )
         sleep_complete = WEG2_SLEEP_TAGS.issubset(self.offload_tags)
         if weg2_memory_saver_on and not sleep_complete:
             # A chunk RPC of an interleaved sleep: the census (whole-process
