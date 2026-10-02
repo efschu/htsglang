@@ -903,6 +903,11 @@ class Envs:
     SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE = EnvBool(True)
     # the sleeping group(s) that take it (comma list; default the D->P leg).
     SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
+    # FLIPCYCLE H5 (02.10., weg2/front._p_drain_pool cap_exempt): past the P
+    # phase cap (H91 part C rule 1) a queued SHORT still rides P's batch; off =
+    # the cap strands it and D prefills it after the P->D flip (y6z ep 2,
+    # weg2-1-7: 2.03 s with every seat stalled). Design law E2: on.
+    SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.
