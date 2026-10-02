@@ -300,7 +300,13 @@ def forget_rid_leftovers(tree, rid: str) -> bool:
 #: "over" is SATISFIED only for an ABSOLUTE told (twin / TK absolute: the
 #: follower's own head is added, the quantities are comparable); a span-relative
 #: told the early read overshot meets #1400's own MISMATCH refusal, by name.
-#: Not with the paced form, the PF follower fallback or dual-share.
+#: Not with dual-share. N5p (b6a6a5c08d, armed, 0 FOLLOWER-EARLY-READ lines):
+#: the 27B form runs the paced told with the PF group fallback, which this
+#: gate excluded -- since then the early read is settled against the paced
+#: read-ahead where the PF ack is formed (``follower_early_settle_now`` from
+#: ``weg2_told_fallback.follower_pump``): equal / over(absolute) ack told at
+#: once, short registers the told-limited read and acks when it ends, a
+#: relative overshoot acks its own count and PF answers told=0 by name.
 #: DEFAULT OFF: sixteen #1400 desk tests pin the told-first order (among them a
 #: relative-told refusal the early read must not turn into an admission); arm
 #: with SGLANG_WEG2_FOLLOWER_EARLY_READ=1 once a window has shown
@@ -325,9 +331,29 @@ def _follower_early_allowed(scheduler) -> bool:
     # head + span is then the quantity PP0's told names, so an overshooting
     # early read is SATISFIED at told instead of a span-relative MISMATCH
     return (follower_early_read_on() and _absolute_armed()
-            and not getattr(scheduler, "_weg2_told_paced_on", False)
-            and getattr(scheduler, "_weg2_fb_follower", None) is None
             and os.environ.get("SGLANG_WEG2_DUAL_SHARE", "").strip() != "1")
+
+
+def follower_early_settle_now(scheduler, req, rid: str, told: int) -> bool:
+    """DP-NACHLAUF (N5p): the paced/PF form settles the follower's terminated
+    early read when its ack is formed, not at the Admit (the Admit only comes
+    after the acks). True = ack now (equal / over / refuse: the ack then names
+    the count and PP0 decides); False = ``short``: the told-limited read was
+    registered, the ack follows when it terminates."""
+    req._weg2_early_told = None
+    tree = scheduler.tree_cache
+    own = int(_completed_prefix(tree, rid) or 0)
+    tst = getattr(scheduler, getattr(_twin, "_ATTR", "_weg2_twin_state"), None)
+    absolute = bool(tst) and str(rid) in (getattr(tst, "twin_follower", None) or {})
+    if absolute:
+        own = _twin.registered_head(req) + own
+    how = follower_early_settle(scheduler, req, told, own, absolute=absolute)
+    n = getattr(scheduler, "_weg2_follower_early_settled", 0) + 1
+    scheduler._weg2_follower_early_settled = n
+    if _log_due(n) or how != "equal":
+        logger.info("#1400 FOLLOWER-EARLY-SETTLE rid=%s pp=%s told=%d own=%d -> %s at=ack (n=%d)",
+                    _rt(rid), scheduler.ps.pp_rank, int(told), int(own), how, n)
+    return how != "short"
 
 
 def follower_early_settle(scheduler, req, told: int, own: int, absolute: bool = False) -> str:
@@ -472,6 +498,9 @@ def _follower_register(scheduler, req, told: int, early: bool = True) -> str:
         # told settles against it at admission instead of starting a read
         if _early_reads(scheduler).pop(_rid(req), None) is not None:
             req._weg2_early_told = int(told)
+            if getattr(scheduler, "_weg2_fb_follower", None) is not None:
+                # PF: the ack reports this read (settled at the ack, N5p)
+                _fb.follower_note_registered(scheduler, req)
             return "early:own_read"
     if getattr(scheduler, "_weg2_fb_follower", None) is not None:
         # PF: whatever this registration's outcome (issued, satisfied,

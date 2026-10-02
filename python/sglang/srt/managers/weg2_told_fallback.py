@@ -621,6 +621,12 @@ def follower_pump(scheduler) -> None:
             break  # a collective here would be the #580 class; the Frist decides
         if not tree.check_prefetch_progress(rid):
             continue
+        if getattr(st.registered[rid], "_weg2_early_told", None) is not None:
+            # DP-NACHLAUF (N5p): an early read -- settle it against told first
+            from sglang.srt.managers import weg2_store_told as _st
+
+            if not _st.follower_early_settle_now(scheduler, st.registered[rid], rid, told):
+                continue  # short: the told-limited read acks when it ends
         req = st.registered.pop(rid)
         st.expect.pop(rid, None)
         st.outbox.append((rid, own_prefix(scheduler, req, rid, told)))
