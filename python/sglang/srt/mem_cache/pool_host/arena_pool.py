@@ -1801,8 +1801,24 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         except Exception as exc:  # noqa: BLE001 -- census unavailable: no gens
             logger.info("#1424 slot_gens census failed: %r", exc)
             return [-1] * len(want)
-        gens = {int(s): int(g) for s, g in zip(cs.tolist(), cg.tolist())}
-        return [int(gens.get(s, -1)) for s in want]
+        # L15-FLIPCOST-5 (27B L15 boot 18:54: TP0's wake refill 763 ms of
+        # which the page loads took 64 ms): the census has ~300k COMPLETE
+        # slots; a Python dict over all of them per call cost most of the
+        # rest. One sort + searchsorted, same answer (-1 = not COMPLETE).
+        import numpy as np
+
+        cs = np.asarray(cs, dtype=np.int64)
+        cg = np.asarray(cg, dtype=np.int64)
+        if not want:
+            return []
+        if cs.size == 0:
+            return [-1] * len(want)
+        order = np.argsort(cs, kind="stable")
+        cs_s, cg_s = cs[order], cg[order]
+        w = np.asarray(want, dtype=np.int64)
+        idx = np.clip(np.searchsorted(cs_s, w), 0, cs_s.size - 1)
+        hit = cs_s[idx] == w
+        return np.where(hit, cg_s[idx], -1).astype(np.int64).tolist()
 
     def _transfer(self, device_pool, k_src, v_src, src_idx, dst_idx, layer_id) -> None:
         if not getattr(self, "can_use_jit", False):
