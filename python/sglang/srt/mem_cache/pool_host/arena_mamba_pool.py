@@ -736,19 +736,31 @@ class ArenaMambaPoolHost(MambaPoolHost):
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend="direct"):
         if self.arena is None or host_indices.numel() == 0:
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
+        # DP-NACHLAUF 02.10. (N5d WEG2-START-LOADING mamba=345 ms against
+        # timed sub-stages idx 0 + issue 2 + select 0 + split 7): the split of
+        # the host rows into arena / staging, run on EVERY layer call before
+        # the layer>0 early return -- `pre` (summed), `pre_n` calls. Instrument.
+        _tpre = time.perf_counter()
         hi, is_arena = self._split(host_indices)
         if not bool(is_arena.any()):
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
         sel = is_arena.nonzero(as_tuple=True)[0]
         slots = hi[sel] - self.staging_rows
+        _subp = _load_sub(self)
+        _subp["pre"] = _subp.get("pre", 0.0) + (time.perf_counter() - _tpre) * 1000.0
+        _subp["pre_n"] = _subp.get("pre_n", 0.0) + 1.0
         if _arena_state_load_on() and getattr(self, "_slot_view", None) is not None:
             key = (id(host_indices), id(device_indices), int(host_indices.numel()), int(device_indices.numel()))
             if layer_id != 0 and self._state_loaded_key == key:
                 rest = (~is_arena).nonzero(as_tuple=True)[0]
                 if rest.numel():
+                    _trest = time.perf_counter()
                     super().load_to_device_per_layer(
                         device_pool, host_indices[rest.to(host_indices.device)],
                         device_indices[rest.to(device_indices.device)], layer_id, io_backend)
+                    # DP-NACHLAUF: the staging (non-arena) rows' per-layer copies
+                    _subp["rest"] = _subp.get("rest", 0.0) + (time.perf_counter() - _trest) * 1000.0
+                    _subp["rest_rows"] = float(rest.numel())
                 return  # every layer came with the state load at layer 0
             if layer_id == 0:
                 try:
@@ -775,9 +787,12 @@ class ArenaMambaPoolHost(MambaPoolHost):
                         _sub["ple"] = _sub.get("ple", 0.0) + (time.perf_counter() - _tp) * 1000.0
                     rest = (~is_arena).nonzero(as_tuple=True)[0]
                     if rest.numel():
+                        _trest = time.perf_counter()
                         super().load_to_device_per_layer(
                             device_pool, host_indices[rest.to(host_indices.device)],
                             device_indices[rest.to(device_indices.device)], layer_id, io_backend)
+                        _subp["rest"] = _subp.get("rest", 0.0) + (time.perf_counter() - _trest) * 1000.0
+                        _subp["rest_rows"] = float(rest.numel())
                     return
                 except Exception as exc:  # noqa: BLE001 -- one named fallback to the per-layer path
                     logger.warning("WEG2-ARENA-STATE-LOAD failed (%s: %s); per-layer path", type(exc).__name__, exc)
