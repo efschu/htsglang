@@ -6420,7 +6420,13 @@ def move_kv_cache_native(
             v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
-@triton.jit
+# ``N`` (rows written this forward) is a runtime scalar, not a constexpr: as a
+# constexpr every distinct extend length compiled/loaded its own variant on the
+# hot path (y8a D: 91 cold loads on TP0 in ~15 min, each opening a barlink JIT
+# cold-build window). It only bounds ``pid``; the grid is already ``(N,)``.
+# do_not_specialize also drops Triton's ==1 / %16 integer specialization, so a
+# single kernel serves every length.
+@triton.jit(do_not_specialize=["N"])
 def masked_set_kv_buffer_kernel(
     k_ptr,
     v_ptr,
@@ -6429,7 +6435,7 @@ def masked_set_kv_buffer_kernel(
     loc_ptr,
     mask_ptr,
     bound,
-    N: tl.constexpr,
+    N,
     H: tl.constexpr,
     D: tl.constexpr,
     CHUNK: tl.constexpr,
