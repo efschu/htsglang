@@ -51,6 +51,38 @@ def _grp(key: str) -> str:
     return key.split(".", 1)[0]
 
 
+def _ext_rows(x) -> Optional[list]:
+    """``prefill.last.ext`` = [[rid, start, end], ...] (start = prefix depth before the chunk, end = start +
+    computed tokens; the ``#969 EXTENT`` of the chunk) -> the same rows, checked; None without the field."""
+    if not isinstance(x, (list, tuple)):
+        return None
+    out = []
+    for r in list(x)[:16]:
+        try:
+            rid, s, e = str(r[0]), int(r[1]), int(r[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 0 <= s <= e:
+            out.append([rid, s, e])
+    return out or None
+
+
+def _dreq_rows(x) -> Optional[list]:
+    """``decode.reqs`` = [[rid, prompt, out], ...] of the running decode batch (depth = prompt + out) -> checked
+    rows; None without the field ([] = the field is there and the batch is empty)."""
+    if not isinstance(x, (list, tuple)):
+        return None
+    out = []
+    for r in list(x)[:32]:
+        try:
+            rid, p, o = str(r[0]), int(r[1]), int(r[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if p >= 0 and o >= 0:
+            out.append([rid, p, o])
+    return out
+
+
 def compact(rec: dict) -> dict:
     """The counters of one rankstats record the view needs (cumulative ones and levels)."""
     pre = rec.get("prefill") if isinstance(rec.get("prefill"), dict) else {}
@@ -79,6 +111,10 @@ def compact(rec: dict) -> dict:
         "plast_new": _n((pre.get("last") or {}).get("new")) if isinstance(pre.get("last"), dict) else None,
         "plast_own": _n((pre.get("last") or {}).get("own_ms")) if isinstance(pre.get("last"), dict) else None,
         "plast_conly": _n((pre.get("last") or {}).get("compute_only_ms")) if isinstance(pre.get("last"), dict) else None,
+        # Nutzer 02.10. ~12:04Z ("token x - y, tok new"): the depth of the newest chunk(s) and the running decode
+        # requests -- fields the port seat adds (prefill.last.ext, decode.reqs); None on older builds
+        "plast_ext": _ext_rows((pre.get("last") or {}).get("ext")) if isinstance(pre.get("last"), dict) else None,
+        "dreqs": _dreq_rows(dec.get("reqs")),
         "last_bs": _n(dec.get("last_bs")),
         "si_del": _n(cache.get("store_incomplete_delivered")), "si_deliv": _n(cache.get("store_incomplete_deliverable")),
         "dtok": first(_n(dec.get("tokens")), _n(tok.get("decode_total"))),
@@ -246,7 +282,7 @@ def _burst_dict(ring, keys, g, b) -> dict:
             "t0": b["s"], "t1": b["e"]}
 
 
-def prefill_view(m: "activity.Model", g: str, now: float) -> Optional[dict]:
+def prefill_view(m: "activity.Model", g: str, now: float, done: Optional[List[dict]] = None) -> Optional[dict]:
     """Prefill tile.  Rates only over the time the chunks ran (activity.py): the running or last burst
     (P-Ende wall clock: first chunk's start on the first stage -> last chunk's end on the last stage),
     the best burst of the ring, and the chunks that ended in the last 60 s."""
@@ -273,7 +309,8 @@ def prefill_view(m: "activity.Model", g: str, now: float) -> Optional[dict]:
                      "tps_gpu": min((r["tps"] for r in _rank_gpu_rates(m.ring, m.keys, g, now - WINDOW_S, now).values()),
                                     default=None) if wtok >= activity.MIN_RATE_TOK else None}
                     if wb else None),
-            "last_burst": _burst_dict(m.ring, m.keys, g, last) if last else None,
+            "last_burst": dict(_burst_dict(m.ring, m.keys, g, last), depth=_depth_round(activity.prefill_depth(last, done, g)))
+                          if last else None,
             "last_t": last["e"] if last else None, "queue": lastrec.get("queue"), "pending_tok": lastrec.get("pending"),
             "instrument": "Chunks zur Rechenzeit (prefill.last t/gpu_ms), Schub = erster Chunk-Start PP0 bis letztes Chunk-Ende letzte Stufe"}
 
@@ -419,7 +456,51 @@ def vis_annotate(x: dict, spans) -> None:
         x["vis_live"] = r.get("leg")
 
 
-def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t0: Optional[float] = None) -> dict:
+def _depth_round(d: dict) -> dict:
+    """prefill_depth / decode rows for the page: whole tokens, rates to 0.1."""
+    out = dict(d)
+    for k in ("tps_start", "tps_end"):
+        if out.get(k) is not None:
+            out[k] = round(out[k], 1)
+    out["reqs"] = [{k: (round(v, 1) if k == "tps" and v is not None else v) for k, v in r.items() if k != "t"}
+                   for r in d.get("reqs") or []]
+    return out
+
+
+def _attach_detail(m: "activity.Model", segs: List[dict], done: Optional[List[dict]]) -> None:
+    """Nutzer 02.10. ~12:04Z/~12:15Z (hover): a prefill segment carries Token x-y (n neu) and its rate at start
+    and end (activity.prefill_depth, of the burst it shows); a decode segment its tok/s per batch size and per
+    request Token x-y (n neu) with tok/s (activity.decode_by_bs / decode_reqs)."""
+    bursts = {"P": activity.bursts(m.pchunks.get("P", []) + m.pchunks.get("single", [])),
+              "D": activity.bursts(m.pchunks.get("D", []))}
+    grp = {"P": "P" if "P" in m.pchunks else "single", "D": "D"}
+    cache: Dict[Tuple[str, int], dict] = {}
+    dk, _ = activity.stage_keys(m.keys, m.dec_group) if m.dec_group else (None, None)
+    for x in segs:
+        if x["k"] in ("P", "D"):
+            best, ov = None, 0.0
+            for i, b in enumerate(bursts[x["k"]]):
+                o = min(b["e"], x["e"]) - max(b["s"], x["s"])
+                if o > ov:
+                    best, ov = i, o
+            if best is None:
+                continue
+            ck = (x["k"], best)
+            if ck not in cache:
+                cache[ck] = _depth_round(activity.prefill_depth(bursts[x["k"]][best], done, grp[x["k"]]))
+                cache[ck]["t0"], cache[ck]["t1"] = bursts[x["k"]][best]["s"], bursts[x["k"]][best]["e"]
+            x["depth"] = cache[ck]
+        elif x["k"] == "dec":
+            x["by_bs"] = [{k: (round(v, 1) if isinstance(v, float) else v) for k, v in r.items()}
+                          for r in activity.decode_by_bs(m.dec, x["s"], x["e"])]
+            rows, src = activity.decode_reqs(m.ring, dk, x["s"], x["e"], done)
+            x["reqs"] = [dict(r, tps=None if r["tps"] is None else round(r["tps"], 1)) for r in rows[:12]]
+            x["reqs_n"] = len(rows)
+            x["reqs_src"] = src
+
+
+def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t0: Optional[float] = None,
+                  done: Optional[List[dict]] = None, detail: bool = True) -> dict:
     """Phase bar = the data-backed segments of activity.Model (Nutzer 30.09.: idle, flip and tail must
     be told apart).  Time inside the window that no sample covers is "unknown" (rigdash did not watch),
     never idle and never flip; before the boot's start nothing is drawn."""
@@ -447,6 +528,8 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
         out.append({"s": prev, "e": end, "k": "unknown", "why": "noch keine zweite IPC-Probe"})
     if live and out and (out[-1]["k"] in ("P", "D", "dec") or out[-1].get("vis_live")):
         out[-1]["running"] = True
+    if detail:
+        _attach_detail(m, out, done)
     if live:
         for x in out[-2:]:
             if x["k"] == "unknown" and x["e"] >= end - 1.5 and (x.get("why") or "").startswith("Rang-Zähler"):
@@ -604,6 +687,11 @@ def flip_views(segs: List[dict], ipc: dict, now: float) -> List[dict]:
                     row["p_end_src"] = "front p_leg1_end"
             if p_end is not None:
                 row["vorlauf_ms"] = max(0.0, (b - p_end) * 1000.0)
+                # Nutzer 02.10.: which prefill the flip followed -- Token x-y (n neu) of the P segment that ended last
+                pseg = max((x for x in segs if x["k"] in ("P", "single") and x.get("depth") and x["s"] < b + 0.3
+                            and x["e"] > p_lo), key=lambda x: x["e"], default=None)
+                if pseg is not None:
+                    row["p_depth"] = {k: pseg["depth"].get(k) for k in ("x", "y", "n", "exact", "src", "tps_start", "tps_end")}
             if first is not None:
                 row["nachlauf_ms"] = max(0.0, (first - t_done) * 1000.0)
                 ext = sum(max(0.0, min(x["e"], first) - max(x["s"], t_done)) for x in segs
@@ -946,6 +1034,9 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
     a14 = (fields.get("A14") or {}).get("value") or []
     b6 = (fields.get("B6") or {}).get("value") or {}
     t0 = boot_start(ipc)
+    # the requests whose end lies in the ring (a prefill or decode in the ring ended no earlier than that)
+    ring_lo = ring[0]["t"] if ring else now
+    done = [r for r in (ipc.get("request_done") or []) if (r.get("end_ts") or 0) >= ring_lo - 1.0]
     v = {
         "stem": ipc.get("boot_id") or ipc.get("dir"),
         "meta": {"tag": tag, "model": model, "topology": ipc.get("topology"), "sha": ipc.get("rev"),
@@ -971,7 +1062,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
         "last_activity": last_act,
         "last_activity_any": max([t for t in last_act.values() if t] or [0]) or None,
         "prefill": {g: pv for g in groups if g in ("P", "D", "single")
-                    for pv in [prefill_view(m, g, now)] if pv},
+                    for pv in [prefill_view(m, g, now, done)] if pv},
         "decode": {g: dv for g in groups if g in ("D", "single")
                    for dv in [decode_view(m, g, front, now)] if dv},
         "totals": totals_view(ring, keys, front, t0, now),
@@ -980,7 +1071,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
         "series": series_view(m, now),
         # the zoomed stretch as its own curves; "series" stays the 15 min the tiles' 60-s figures read
         "series_zoom": series_view(m, now, zoom) if zoom else None,
-        "timeline": timeline_view(m, live, _awake(m, front), now, t0),
+        "timeline": timeline_view(m, live, _awake(m, front), now, t0, done),
         "fields": ipcfields.for_page(fields),
         "phase_now": None,
         "fields_summary": ipcfields.summary(fields),
@@ -993,7 +1084,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
     v["flip_views"] = fv[-24:]
     v["flip_last"] = flip_last(fv)
     v["phase_now"] = phase_now(v["timeline"]["segs"], ipc, front, fv, live, now)
-    view_ipc = {k: x for k, x in ipc.items() if k not in ("ipc_events", "flip_first_work", "flip_user_time")}
+    view_ipc = {k: x for k, x in ipc.items() if k not in ("ipc_events", "flip_first_work", "flip_user_time", "request_done")}
     v["ipc"] = view_ipc
     return v
 

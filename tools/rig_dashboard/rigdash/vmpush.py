@@ -182,7 +182,8 @@ class Bridge:
                 from . import ipcboot
                 m = b.model(key)
                 if m is not None and m.ring:
-                    segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc))["segs"]
+                    segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc),
+                                                  detail=False)["segs"]
                     lines += flip_view_points(ipcboot.flip_views(segs, ipc, now), model, short_boot(key), self.view_done)
                 if m is not None and m.dec:
                     lines += self._decode_sum_lines(key, m.dec, model, now - 3 * ipcboot.SAMPLE_S, now)

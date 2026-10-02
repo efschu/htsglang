@@ -38,6 +38,9 @@ EVENTS_KEEP = 2000
 # flip_first_work (front's own clock, ms): kept apart from `rows` so a long boot's flip
 # times are not pushed out by the other event types' window.
 FIRST_WORK_KEEP = 5000
+# request_done (front, one per finished request): Token x-y (n neu) per rid for the prefill/decode hover
+# (Nutzer 02.10. ~12:04Z); ~1,2 kB each
+REQ_DONE_KEEP = 2000
 
 
 def _read_json(path: str) -> Optional[dict]:
@@ -107,6 +110,7 @@ class _Events:
         self.rows: List[dict] = []
         self.first_work: List[dict] = []
         self.user_time: List[dict] = []
+        self.req_done: List[dict] = []
         self.counts: Dict[str, int] = {}
 
     def poll(self):
@@ -137,9 +141,12 @@ class _Events:
                 self.first_work.append(e["data"])
             if t == "flip_user_time" and isinstance(e.get("data"), dict):
                 self.user_time.append(dict(e["data"], ts=e.get("ts")))
+            if t == "request_done" and isinstance(e.get("data"), dict):
+                self.req_done.append(e["data"])
         del self.rows[:-EVENTS_KEEP]
         del self.first_work[:-FIRST_WORK_KEEP]
         del self.user_time[:-FIRST_WORK_KEEP]
+        del self.req_done[:-REQ_DONE_KEEP]
 
 
 def boot_view(d: str, st: dict, ev: Optional[_Events], now: float) -> dict:
@@ -186,6 +193,8 @@ def boot_view(d: str, st: dict, ev: Optional[_Events], now: float) -> dict:
         "flip_first_work": list(ev.first_work) if ev else [],
         # D>P Flipzeit nach Nutzerdefinition (Decode-Ende -> P-Prefill-Start), ab Build y4z (53977b2b67)
         "flip_user_time": list(ev.user_time) if ev else [],
+        # Token x-y (n neu) per rid (request_done prefill.{P,D}, decode_tokens, first_token_ts/end_ts)
+        "request_done": list(ev.req_done) if ev else [],
     }
 
 

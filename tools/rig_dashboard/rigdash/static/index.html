@@ -706,6 +706,62 @@ function setPhaseSpan(v) {
 }
 const dur = (s) => s < 90 ? fmt(s, s < 10 ? 1 : 0) + " s" : fmt(s / 60, 1) + " min";
 function phaseName(k, single) { return single && k === "P" ? "Prefill" : (PHASE[k] || [k])[0]; }
+/* DEPTH-BEGIN -- Nutzer 02.10. ~12:04Z/~12:15Z: beim Hover nicht nur wie viele Token, sondern
+   "Token x–y (n neu)" (x = Start-Tiefe/Präfix, y = End-Tiefe, n = neu gerechnet) und tok/s am Anfang/Ende;
+   beim Decode tok/s je Batchgröße und je Anfrage Token x–y (n neu). Texte DE/EN (i18nLang, sobald die
+   Umschaltung da ist; sonst Deutsch). tests/test_depth_1002.py führt diesen Block in node aus. */
+const DEPTH_I18N = {
+  tok: {de: "Token", en: "Tokens"},
+  neu: {de: "neu", en: "new"},
+  anfang: {de: "Anfang", en: "start"},
+  ende: {de: "Ende", en: "end"},
+  quelle: {de: "Quelle", en: "source"},
+  prefix: {de: "x = Summe der Präfixe der im Schub begonnenen Anfragen (#cached-token am ersten Chunk), bis rankstats prefill.last.ext da ist",
+           en: "x = sum of the prefixes of the requests that began in this burst (#cached-token of the first chunk), until rankstats prefill.last.ext is there"},
+  teil: {de: "die zugeordneten Anfragen decken den Schub nicht ganz", en: "the matched requests do not cover the whole burst"},
+  jebs: {de: "je Batchgröße", en: "per batch size"},
+  jeplatz: {de: "je Platz", en: "per slot"},
+  gemischt: {de: "gemischt", en: "mixed"},
+  jeanfrage: {de: "je Anfrage", en: "per request"},
+  geschaetzt: {de: "geschätzt", en: "estimated"},
+  weitere: {de: "weitere", en: "more"},
+  keineanfr: {de: "je Anfrage: fehlt in IPC (rankstats decode.reqs); request_done kommt erst am Anfrageende",
+              en: "per request: missing in IPC (rankstats decode.reqs); request_done only arrives when the request ends"},
+  nachprefill: {de: "nach Prefill", en: "after prefill"},
+};
+const dt = (k) => {
+  const e = DEPTH_I18N[k] || {};
+  let l = "de";
+  try { if (typeof window !== "undefined" && typeof window.i18nLang === "function") l = window.i18nLang() || "de"; } catch (err) { l = "de"; }
+  return e[l] || e.de || k;
+};
+const tokRange = (x, y, n) => `${dt("tok")} ${fmt(x)}&ndash;${fmt(y)} (${fmt(n)} ${dt("neu")})`;
+function depthTip(d) {
+  if (!d || d.n == null || d.x == null) return "";
+  let h = `<br><b>${tokRange(d.x, d.y, d.n)}</b>`;
+  if (d.tps_start != null || d.tps_end != null) h += ` &middot; <b>${fmt(d.tps_start)} &rarr; ${fmt(d.tps_end)}</b> tok/s <span class="muted">(${dt("anfang")} &rarr; ${dt("ende")})</span>`;
+  const rq = d.reqs || [];
+  if (rq.length === 1 && rq[0].rid) h += ` <span class="muted mono">${esc(rq[0].rid)}</span>`;
+  if (rq.length > 1) h += "<br>" + rq.slice(0, 6).map((r) => `<span class="mono">${esc(r.rid)}</span> ${tokRange(r.x, r.y, r.n)}`).join("<br>")
+    + (rq.length > 6 ? `<br>+${rq.length - 6} ${dt("weitere")}` : "");
+  const note = d.exact ? "" : (String(d.src || "").startsWith("rankstats prefill.cached") ? dt("prefix") : dt("teil"));
+  return h + `<br><span class="muted">${dt("quelle")}: ${esc(d.src || "")}${note ? " &middot; " + note : ""}</span>`;
+}
+function decodeDetailTip(x) {
+  let h = "";
+  const bb = x.by_bs || [];
+  if (bb.length) h += `<br><b>${dt("jebs")}</b>:<br>` + bb.map((r) => `bs ${r.bs === "mix" ? dt("gemischt") + (r.bs_mean != null ? " &Oslash;" + fmt(r.bs_mean, 1) : "") : r.bs}: <b>${fmt(r.tps, 1)}</b> tok/s`
+    + `${r.per_slot != null ? ` &middot; ${fmt(r.per_slot, 1)} ${dt("jeplatz")}` : ""} <span class="muted">(${fmt(r.busy_s, 0)} s)</span>`).join("<br>");
+  const rq = x.reqs || [];
+  if (rq.length) {
+    h += `<br><b>${dt("jeanfrage")}</b>${rq.some((r) => r.est) ? ` <span class="muted">(${dt("geschaetzt")})</span>` : ""}:<br>`
+      + rq.map((r) => `<span class="mono">${esc(r.rid)}</span> ${tokRange(r.x, r.y, r.n)}${r.tps != null ? ` &middot; <b>${fmt(r.tps, 1)}</b> tok/s` : ""}`).join("<br>")
+      + (x.reqs_n > rq.length ? `<br>+${x.reqs_n - rq.length} ${dt("weitere")}` : "");
+  } else if (x.reqs && !x.reqs_src) h += `<br><span class="muted">${dt("keineanfr")}</span>`;
+  if (x.reqs_src) h += `<br><span class="muted">${dt("quelle")}: ${esc(x.reqs_src)}</span>`;
+  return h;
+}
+/* DEPTH-END */
 function phaseTip(x, single) {
   const when = `${hhmm(x.s)}&ndash;${x.running ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
   if (x.k === "flip_pd" || x.k === "flip_dp") return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}<br>${when} <span class="muted">flip_begin bis flip_done (events.jsonl, Front-Uhr)</span>`;
@@ -721,8 +777,8 @@ function phaseTip(x, single) {
   if (x.k === "off") return `<b>aus/l&auml;dt/tot</b> &middot; ${esc(x.why || "")}<br>${when} <span class="muted">state.json lifecycle</span>`;
   if (x.k === "unknown") return `<b>unbekannt</b> &middot; ${esc(x.why || "keinem Zustand zuordenbar")}<br>${when}`;
   const nm = phaseName(x.k, single);
-  if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; l&auml;uft" : ""}`;
-  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok${x.running ? " &middot; l&auml;uft" : ""}`;
+  if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; l&auml;uft" : ""}${decodeDetailTip(x)}`;
+  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok${x.running ? " &middot; l&auml;uft" : ""}${depthTip(x.depth)}`;
 }
 function phaseHtml(b, pre) {
   const tl = b.timeline;
@@ -892,6 +948,7 @@ function prefillTile(b, g, color, label, binders, now) {
       ["Rechenrate je Rang (compute-ms)", ranks || "—"],
       [active ? "Tokens / Chunks, 60 s" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
       ["mittl. Chunk &middot; aus Cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
+      lb && lb.depth && lb.depth.x != null ? [`letzter Schub: Tiefe`, `${tokRange(lb.depth.x, lb.depth.y, lb.depth.n)}${lb.depth.tps_start != null ? ` &middot; ${fmt(lb.depth.tps_start)} &rarr; ${fmt(lb.depth.tps_end)} tok/s` : ""}`] : null,
       active ? ["Durchsatz Wandzeit (Tokens / " + Math.round(p.window_s) + " s, mit Pausen)", fmt(n.tokens / p.window_s)] : null,
       ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
       ["&Oslash; tok/s/W &middot; 60 s (Kurvenmittel, Ruhe = 0)", fmt(((b.series || {}).per_w_60s || {})[g + "_prefill_tps"], 2)],
@@ -1136,6 +1193,7 @@ function bootCard(b, now, binders) {
             const fl = ((b.flip_last || {})[dir]) || {}, x = fl.last;
             return [`<b>Flipzeit ${dir.replace(">", "&rarr;")}</b> (Nutzersicht, letzte)`, x
               ? `<b>${sec(x.total_ms)} s</b> = Vorlauf ${sec(x.vorlauf_ms)} + Layer ${sec(x.layer_ms)} + Nachlauf ${sec(x.nachlauf_ms)}${x.nachlauf_d_extend_ms ? ` (D-Extend ${sec(x.nachlauf_d_extend_ms)})` : ""} <span class="muted">&middot; Median ${sec(fl.median)} &middot; n=${fl.n}${fl.idle_n ? " &middot; Leerlauf-Flips " + fl.idle_n : ""}</span>`
+                + (x.p_depth && x.p_depth.x != null ? `<br><span class="muted">${dt("nachprefill")} ${tokRange(x.p_depth.x, x.p_depth.y, x.p_depth.n)}</span>` : "")
               : "—", "keep"];
           }),
           ...flipRows,
