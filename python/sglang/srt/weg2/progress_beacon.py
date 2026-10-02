@@ -267,6 +267,9 @@ class PpForwardProbe:
         self.paths: Dict[int, str] = {}
         self.poll_s, self.timeout_s = float(poll_s), float(timeout_s)
         self._thread = None
+        #: PDFLIP-E3: (directory, group, sid, session_of, pp_of) while the done
+        #: reading was EMPTY -- each poll rescans for the ranks' first files
+        self._rescan = None
         try:
             if not enabled():
                 self._set_all({"missing": f"beacon_off {ENV}=0"})
@@ -274,7 +277,19 @@ class PpForwardProbe:
             if not directory:
                 self._set_all({"missing": "no_beacon_dir"})
                 return
+            if not sid:   # no session to read the ranks of: unreadable, not an empty reading
+                self._set_all({"missing": "no_beacon"})
+                return
             cur = read_group(directory, group, sid, session_of)
+            if not cur:
+                # PDFLIP-E3 (NF y7n epoch=1 reason=no_beacon; 27B N5f 13:30:08): before
+                # P's first wake no P rank has run a forward, so no beacon file exists
+                # at done. An empty reading is a baseline of forward_ct 0 -- every PP0
+                # file that appears is that rank's first forward (the end). The last
+                # stage needs the known rank set: on an empty baseline it is missing.
+                self._rescan = (directory, group, sid, session_of, pp_of)
+                self._set("last", {"missing": "empty_baseline"})
+                return
             stages, why = pp_stage_pids(cur, pp_of)
             if why is not None:
                 self._set_all({"missing": why})
@@ -316,7 +331,9 @@ class PpForwardProbe:
 
     def poll(self) -> Dict[str, Optional[dict]]:
         """One reading now; the results so far."""
-        if not self.done():
+        if not self.done() and self._rescan is not None:
+            self._poll_rescan()
+        elif not self.done():
             cur: Dict[int, Tuple[int, int, int]] = {}
             for pid, path in self.paths.items():
                 r = _read_one(path)
@@ -328,6 +345,34 @@ class PpForwardProbe:
                     if res is not None:
                         self._set(s, res)
         return dict(self.results)
+
+    def _poll_rescan(self) -> None:
+        """PDFLIP-E3: the empty-baseline reading -- the group's files now; each
+        new rank of pipeline stage 0 joins the first stage at forward_ct 0."""
+        directory, group, sid, session_of, pp_of = self._rescan
+        try:
+            cur = read_group(directory, group, sid, session_of)
+        except Exception:  # noqa: BLE001
+            return
+        first = dict(self.stages["first"])
+        other = self.__dict__.setdefault("_rescan_other", set())   # ranks of a later stage
+        for pid in cur:
+            pid = int(pid)
+            if pid in first or pid in other:
+                continue
+            r = pp_of(pid)
+            if r == 0:
+                first[pid] = 0
+            elif r is not None:   # unknown (None): read again on the next poll
+                other.add(pid)
+        if len(first) != len(self.stages["first"]):
+            # new dicts, never mutated in place (poll() also runs on the front's loop)
+            self.stages = dict(self.stages, first=first)
+            self.baseline = dict(self.baseline, first={pid: 0 for pid in first})
+        if self.results["first"] is None and first:
+            res = first_rise(self.baseline["first"], cur)
+            if res is not None:
+                self._set("first", res)
 
     def start(self, on_result: Optional[Callable[[str, dict], None]] = None) -> None:
         import threading

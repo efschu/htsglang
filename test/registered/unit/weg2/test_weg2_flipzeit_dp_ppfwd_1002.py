@@ -134,10 +134,97 @@ def test_the_probe_thread_reports_pp0_as_the_end_and_pp_last_alongside_once_each
 def test_no_beacon_is_missing_at_once():
     p = fp.PpForwardProbe("", "P", 77)
     assert p.results == {"first": {"missing": "no_beacon_dir"}, "last": {"missing": "no_beacon_dir"}}
+    # PDFLIP-E3: an EMPTY reading (P never ran a forward since the boot) is a zero
+    # baseline, not "no beacon": the end stays open, only the last stage is missing
     p = fp.PpForwardProbe(tempfile.mkdtemp(), "P", 77, session_of=lambda pid: 77)
-    assert p.result == {"missing": "no_beacon"} and p.done()
+    assert p.result is None and p.results["last"] == {"missing": "empty_baseline"} and not p.done()
+    p.stop("x")
+    assert p.result == {"missing": "x"}
     with mock.patch.dict(os.environ, {fp.ENV: "0"}):
         assert fp.PpForwardProbe("/x", "P", 77).result["missing"].startswith("beacon_off")
+
+
+# ---- PDFLIP-E3 (27B a0d03e9321, NF y7n epoch=1 reason=no_beacon): the FIRST flips after the boot
+
+def test_red_an_empty_beacon_reading_at_the_first_dp_done_is_a_zero_baseline():
+    """y7n epoch=1: P had run no forward since the boot -> no beacon file at done; the first
+    D->P had no exact end. Every PP0 file that appears is that rank's first forward."""
+    d = tempfile.mkdtemp(prefix="ppfwd-e3-")
+    stages = {201: 0, 202: 0, 203: 2}
+    got = []
+    probe = fp.PpForwardProbe(d, "P", 77, session_of=lambda pid: 77, pp_of=stages.get, poll_s=0.001)
+    assert probe.result is None and probe.results["last"] == {"missing": "empty_baseline"}
+    probe.start(lambda stage, res: got.append((stage, res)))
+    assert got == [("last", {"missing": "empty_baseline"})]       # reported at once, in order
+    _beat(d, "P", 203, 1, 3_000_000_000)                           # not stage 0: never the end
+    time.sleep(0.03)
+    assert probe.result is None
+    _beat(d, "P", 202, 1, 5_500_000_000)                           # PP0 TP1 begins
+    _beat(d, "P", 201, 1, 5_400_000_000)                           # PP0 TP0 began earlier
+    deadline = time.time() + 2.0
+    while time.time() < deadline and len(got) < 2:
+        time.sleep(0.005)
+    probe.stop("x")
+    assert got[1][0] == "first" and got[1][1]["ts"] in (5.4, 5.5) and got[1][1]["pp_rank"] == 0
+    # a synchronous read with both files present takes the earliest start
+    q = fp.PpForwardProbe(tempfile.mkdtemp(prefix="ppfwd-e3b-"), "P", 77, session_of=lambda pid: 77,
+                          pp_of=stages.get)
+    _beat(q._rescan[0], "P", 202, 1, 5_500_000_000)
+    _beat(q._rescan[0], "P", 201, 1, 5_400_000_000)
+    assert q.poll()["first"] == {"ts": 5.4, "pid": 201, "ct": 1, "pp_rank": 0}
+    # a first reading after a SECOND forward stays missing, never a value
+    r = fp.PpForwardProbe(tempfile.mkdtemp(prefix="ppfwd-e3c-"), "P", 77, session_of=lambda pid: 77,
+                          pp_of=stages.get)
+    _beat(r._rescan[0], "P", 201, 2, 9_000_000_000)
+    assert r.poll()["first"] == {"missing": "late_read pid=201 forward_ct 0->2"}
+
+
+def test_red_the_front_reads_an_empty_d_beacon_dir_as_a_reading_not_as_off(monkeypatch):
+    monkeypatch.setattr(fp, "enabled", lambda env=None: True)
+    monkeypatch.setattr(fp, "beacon_dir", lambda tag="", env=None: "/nonexistent-beacons")
+    ns = SimpleNamespace(tag="t", groups={"P": SimpleNamespace(sid=4242), "D": SimpleNamespace(sid=4243)})
+    assert front_mod.Front._group_beacons(ns, "D") == {}
+    monkeypatch.setattr(fp, "enabled", lambda env=None: False)
+    assert front_mod.Front._group_beacons(ns, "D") is None
+
+
+def test_red_pd_first_token_from_d_beacons_when_no_stream_chunk_came(monkeypatch):
+    """27B N5f 13:30:17: non-stream requests -> no D chunk the front could time; D's first
+    forward after done ends at its t_done = the first token."""
+    NS = 1_000_000_000
+    fw = fsi.FirstWorkClock()
+    fw.arm(2, "P", "D", 100.0)
+    fw.done(102.5)
+    pub, phase = [], []
+    reads = iter([{7: (10, 90 * NS, 91 * NS)},                        # nothing yet
+                  {7: (11, int(102.6 * NS), 91 * NS)},                 # first forward running
+                  {7: (11, int(102.6 * NS), int(103.05 * NS))}])       # ...and done
+    ns = SimpleNamespace(_ipc_fw_clock=fw)
+    ns._ipc_first_work_clock = lambda: fw
+    ns._ipc_publish = lambda typ, data: pub.append((typ, data))
+    monkeypatch.setattr(front_mod.Front, "_group_beacons", staticmethod(lambda self, g: next(reads)))
+    monkeypatch.setattr(front_mod.Front, "_flip_phase", staticmethod(lambda self: SimpleNamespace(
+        first_work=lambda now, what, at=None: phase.append((what, at)))))
+    monkeypatch.setattr(front_mod.Front, "_ipc_live_kick", staticmethod(lambda self: None))
+    asyncio.run(front_mod.Front._watch_d_first_forward(ns, {7: (10, 90 * NS, 91 * NS)}, 102.5, period_s=0.0))
+    assert pub and pub[0][0] == "flip_first_work"
+    ev = pub[0][1]
+    assert ev["what"] == "d_first_forward_done" and ev["first_work_ts"] == 103.05
+    assert phase == [("d_first_forward_done", 103.05)]          # the flip phase closes at the measured end
+    assert not fw.waits_for("D")
+
+
+def test_a_streamed_d_chunk_wins_over_the_d_beacon_watch(monkeypatch):
+    fw = fsi.FirstWorkClock()
+    fw.arm(3, "P", "D", 200.0)
+    fw.done(202.0)
+    fw.seen("D", "decode_token", "r", 202.1)                         # the stream came first
+    calls = []
+    monkeypatch.setattr(front_mod.Front, "_group_beacons",
+                        staticmethod(lambda self, g: calls.append(g) or {}))
+    ns = SimpleNamespace(_ipc_fw_clock=fw, _ipc_first_work_clock=lambda: fw)
+    asyncio.run(front_mod.Front._watch_d_first_forward(ns, {}, 202.0, period_s=0.0))
+    assert calls == []
 
 
 # ---------------------------------------------------------------- the clocks

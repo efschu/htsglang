@@ -7297,6 +7297,66 @@ class Front:
             c = self.__dict__["_ipc_dp_clk"] = front_state_ipc.DpFlipClock()
         return c
 
+    def _group_beacons(self, group: str) -> Optional[Dict[int, Tuple[int, int, int]]]:
+        """PDFLIP-E3: ``group``'s progress beacons (None = off / unreadable;
+        {} = readable, no rank has run a forward yet)."""
+        try:
+            from sglang.srt.weg2 import progress_beacon as _fp
+
+            if not _fp.enabled():
+                return None
+            d = _fp.beacon_dir(getattr(self, "tag", "") or "")
+            g = self.groups.get(group)
+            if not d or g is None or not g.sid:
+                return None
+            return _fp.read_group(d, group, g.sid)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the flip
+            return None
+
+    async def _watch_d_first_forward(self, snap: Dict[int, Tuple[int, int, int]], t_done: float,
+                                     period_s: float = 0.01, bound_s: float = 120.0) -> None:
+        """PDFLIP-E3: P->D first decode token from D's beacons -- the end of D's
+        first forward after the flip (its forward_ct rose and t_done passed
+        t_start: that forward's tokens are out; baseline = the reading at awake,
+        else at done). Only while the stream clock
+        still waits (a streamed chunk wins); the earliest rank counts."""
+        clk = self._ipc_first_work_clock()
+        t_end = time.time() + bound_s
+        while clk.waits_for("D") and time.time() < t_end:
+            cur = await asyncio.to_thread(Front._group_beacons, self, "D") or {}
+            best = None
+            approx = False
+            for pid, (ct, ts, td) in cur.items():
+                ct0, _ts0, td0 = (int(v) for v in snap.get(pid, (0, 0, 0)))
+                # beat_done sits in process_batch_result: a t_done newer than the done
+                # reading after forward_ct rose = the first result (token) out of D.
+                # Under the overlap loop that done is stamped with forward_ct+1, so a
+                # rise of 2 is still the first result; more means a poll was missed.
+                if int(ct) <= ct0 or int(td) <= max(td0, 0):
+                    continue
+                t = float(td) / 1e9
+                if int(ct) - ct0 > 2:
+                    t, approx = max(min(t, float(ts) / 1e9), t_done), True
+                best = t if best is None else min(best, t)
+            if best is not None:
+                Front._ipc_first_work_at(self, "D", "d_first_forward_done" + ("_approx" if approx else ""),
+                                         None, max(best, t_done))
+                return
+            await asyncio.sleep(period_s)
+
+    def _ipc_first_work_at(self, group: str, what: str, rid: Optional[str], ts: float) -> None:
+        """PDFLIP-E3: the woken D's first work at a MEASURED time ``ts`` (its
+        first forward's end from the beacon), not at the call's now. D only:
+        the D->P end is the PpForwardProbe's (FLIPZEIT D>P, _dp_ppfwd_*)."""
+        c = self.__dict__.get("_ipc_fw_clock")
+        if c is None or not c.waits_for(group):
+            return
+        ev = c.seen(group, what, rid, float(ts))
+        if ev is not None:
+            self._ipc_publish("flip_first_work", ev)
+            Front._flip_phase(self).first_work(time.time(), what, at=float(ts))
+            Front._ipc_live_kick(self)
+
     def _ipc_first_work_seen(self, group: str, what: str, rid: Optional[str],
                              chunk: Optional[bytes] = None, path: str = "") -> None:
         """The woken group's first work after a flip -> one ``flip_first_work`` event
@@ -12744,6 +12804,9 @@ class Front:
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
             return
+        if dst == "D":
+            # PDFLIP-E3: D's beacons at awake -- its first result may land before done
+            self.__dict__["_pd_dsnap"] = (Front._group_beacons(self, "D"), float(t_w))
         # #1455: the residue measurement (NVML + host image) runs AFTER the wake answered -- it is
         # instrumentation, not a precondition; ~250 ms off the critical path.
         # 27B flipfast F1: and once nothing gates on it any more, OFF the flip
@@ -12917,6 +12980,17 @@ class Front:
         self._ipc_publish("flip_done", _fsi.flip_done_payload(rec, t_flip0))
         self._ipc_first_work_clock().done(time.time())  # FEHLT 3: pairs with one flip_first_work
         self._ipc_dp_clock().done(time.time())
+        if src == "P" and dst == "D":
+            # PDFLIP-E3 (N5f first P->D 13:30:17: non-stream requests, no D chunk the
+            # front could time): D's first forward after done from D's beacons
+            _dsnap, _dt0 = self.__dict__.pop("_pd_dsnap", None) or (None, 0.0)
+            if _dsnap is None or time.time() - _dt0 > 300.0:   # none / left over from an aborted flip
+                _dsnap, _dt0 = Front._group_beacons(self, "D"), time.time()
+            if _dsnap is not None:
+                _dt = asyncio.get_running_loop().create_task(
+                    Front._watch_d_first_forward(self, _dsnap, _dt0))
+                self._dc_tasks.add(_dt)
+                _dt.add_done_callback(self._dc_tasks.discard)
         Front._flip_phase(self).done(time.time())  # DASHBOARD-IPC: Layer -> Nachlauf
         if src == "D" and dst == "P":
             Front._dp_ppfwd_arm(self)  # FLIPZEIT D>P: P's first stage's first forward from here
