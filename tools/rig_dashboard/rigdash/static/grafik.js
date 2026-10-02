@@ -366,13 +366,24 @@
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v, 0) + " MHz")],
       series: [{}].concat(cards.map((c, i) => thin(cardLabel(c), cardCol(i), "MHz"))),
     }, rowsCards(d, "clock"));
-    // Nutzer 01.10. ~09:00Z: PCIe RX (durchgezogen) / TX (gestrichelt) je Karte und Speichertakt (Expertenansicht)
+    // Nutzer 01.10. ~09:00Z: PCIe RX (durchgezogen) / TX (gestrichelt) je Karte und Speichertakt (Expertenansicht).
+    // Nutzer 02.10.: Legende EINE Zeile je Karte "RX x GB/s · TX y GB/s" -- die TX-Reihen zeichnen weiter, ihre
+    // Legendenzeilen sind versteckt, und ein Klick auf die Kartenzeile blendet RX und TX gemeinsam ein/aus
+    const nc = cards.length;
+    const pcieVal = (u, v, si, i) => {
+      const at = (s) => { const idx = i == null ? lastIdx(u, s) : i; return idx == null ? null : u.data[s][idx]; };
+      const rx = at(si), tx = at(si + nc);
+      return rx == null && tx == null ? "–" : "RX " + (rx == null ? "–" : fmtN(rx, 2)) + " · TX " + (tx == null ? "–" : fmtN(tx, 2)) + " GB/s";
+    };
     charts.pcie = mk("hw-c-pcie", {
       scales: { y: { range: zeroUp(0.5) } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v, v < 1 ? 2 : 1) + " GB/s")],
-      series: [{}].concat(cards.map((c, i) => line("RX " + cardLabel(c), cardCol(i), "GB/s", { width: 1.5, fill: undefined, value: valFmt("GB/s", 2) })))
-        .concat(cards.map((c, i) => line("TX " + cardLabel(c), cardCol(i), "GB/s", { width: 1.25, fill: undefined, dash: [4, 3], value: valFmt("GB/s", 2) }))),
+      series: [{}].concat(cards.map((c, i) => line(cardLabel(c), cardCol(i), "GB/s", { width: 1.5, fill: undefined, value: pcieVal })))
+        .concat(cards.map((c, i) => line("TX " + cardLabel(c), cardCol(i), "GB/s", { width: 1.25, fill: undefined, dash: [4, 3] }))),
+      hooks: { draw: [marksDraw, phaseBand, endDots, zoomAttr],
+        setSeries: [(u, si, o) => { if (si != null && si >= 1 && si <= nc && o && "show" in o && u.series[si + nc].show !== o.show) u.setSeries(si + nc, { show: o.show }); }] },
     }, rowsPcie(d));
+    if (charts.pcie) charts.pcie.root.querySelectorAll(".u-legend .u-series").forEach((tr, k) => { if (k > nc) tr.style.display = "none"; });
     charts.memclk = mk("hw-c-memclk", {
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v, 0) + " MHz")],
       series: [{}].concat(cards.map((c, i) => thin(cardLabel(c), cardCol(i), "MHz"))),
