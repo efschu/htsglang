@@ -210,11 +210,94 @@ def arm_ram_source(model_dir: str, env: Optional[Dict[str, str]] = None,
 
 
 def unstaged_items(req) -> List[Any]:
+    if getattr(req, "_weg2_vision_skip", False):
+        return []  # W102 SKIP: every image position is inside the admitted prefix
     mm = getattr(req, "multimodal_inputs", None)
     items = getattr(mm, "mm_items", None) or []
     return [it for it in items
             if getattr(it, "precomputed_embeddings", None) is None
             and getattr(it, "feature", None) is not None]
+
+
+# ---------------------------------------------------------------------------
+# W102 SKIP (MM-XPRICE, 02.10.): no tower for an image the prefix already holds
+# ---------------------------------------------------------------------------
+# y7h-noH4 P log, 10:55:03: ``W102 Weg2VisionStage run=2 rank=PP0 ...
+# legs_ms=(build 55, load 478, encode 20, attach 0, teardown 413)`` for
+# weg2-1-5, whose image positions lay inside the 73088 prefix P read from the
+# store (P leg 1: prompt 73112, cached 73088). The encoder skips an item whose
+# positions all lie in the prefix (mm_utils ``_get_chunked_prefill_embedding``:
+# ``offset_end < prefix_length``) -- loading the tower for it is ~1 s of PP0
+# for nothing. The prefix PP0 admits on a store-told group is the told
+# (#1400/#1419: every rank admits exactly told); without the told protocol it
+# is the rank's own match. A request whose told is still outstanding but whose
+# own match already covers the image waits one pass for it instead of staging:
+# the admission cannot take it before its told anyway.
+
+W_STAGE_SKIP = "W102 Weg2VisionStage SKIP"
+SKIP, WAIT, STAGE = "skip", "wait", "stage"
+
+
+def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:
+    """(verdict, covered, source): ``skip`` when every image position of
+    ``req`` lies inside the prefix this group admits it with, ``wait`` while a
+    store-told is outstanding and the rank's own match covers the image,
+    ``stage`` otherwise."""
+    from sglang.srt.weg2.vision_d_guard import image_end
+
+    end = image_end(req)
+    if not end:
+        return STAGE, 0, "none"
+    local = (len(getattr(req, "prefix_indices", None) or ())
+             + int(getattr(req, "host_hit_length", 0) or 0))
+    if getattr(scheduler, "_weg2_store_told_armed", False):
+        told = (getattr(scheduler, "_weg2_store_told", None) or {}).get(req.rid)
+        if told is not None:
+            return (SKIP if int(told) >= end else STAGE), int(told), "told"
+        if local >= end:
+            return WAIT, local, "local"
+        return STAGE, local, "local"
+    return (SKIP if local >= end else STAGE), local, "local"
+
+
+def skip_cached(scheduler, pending: Sequence[Any]) -> Tuple[List[Any], List[Any]]:
+    """Split ``pending`` (unstaged image requests on PP0) into (to stage, to
+    hold one pass); a request every image position of which is covered is
+    marked skipped and leaves both."""
+    from sglang.srt.weg2.vision_d_guard import image_end
+
+    stage, wait = [], []
+    for r in pending:
+        v, covered, src = stage_skip_verdict(scheduler, r)
+        if v == SKIP:
+            r._weg2_vision_skip = True
+            scheduler._weg2_vision_skips = getattr(scheduler, "_weg2_vision_skips", 0) + 1
+            logger.info("%s rid=%s reason=image-cached covered=%d src=%s image_end=%d (no tower: "
+                        "every image position lies in the prefix this group admits)",
+                        W_STAGE_SKIP, r.rid, covered, src, image_end(r))
+        elif v == WAIT:
+            wait.append(r)
+        else:
+            stage.append(r)
+    return stage, wait
+
+
+def skip_still_covered(scheduler, req) -> bool:
+    """The admission's belt for a skipped request (PP0, after its match):
+    False -- and the skip withdrawn, so the next pass stages it -- when the
+    prefix it is admitted with no longer covers an image position."""
+    from sglang.srt.weg2.vision_d_guard import image_end
+
+    end = image_end(req)
+    covered = (len(getattr(req, "prefix_indices", None) or ())
+               + int(getattr(req, "host_hit_length", 0) or 0))
+    if covered >= end:
+        return True
+    req._weg2_vision_skip = False
+    logger.warning("%s-REFUTED rid=%s covered=%d image_end=%d (the admitted prefix ends before "
+                   "an image position: the tower is staged in the next pass)",
+                   W_STAGE_SKIP, req.rid, covered, end)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1074,6 +1157,11 @@ def vision_rank_pass(scheduler) -> List[Tuple[int, Any]]:
         refused.intersection_update({r.rid for r in wq})  # an aborted rid leaves the set
     pending = [r for r in wq if r.rid not in refused and unstaged_items(r)]
     held = [r for r in wq if r.rid in refused]
+    if pending:
+        # W102 SKIP: a cached image needs no tower; one whose told is still
+        # outstanding but locally covered waits a pass for it
+        pending, waiting = skip_cached(scheduler, pending)
+        held = waiting + held
     if pending and inflight is not None:
         # (d) a stage is in flight: every unstaged image waits (the one in
         # flight and any new one -- the next stage takes those); everything
