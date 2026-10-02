@@ -311,28 +311,38 @@ def adopt_deposits(*, directory: str, epoch: int, rank: int,
     rank must call it (the gather is unconditional)."""
     from sglang.srt.weg2 import l15_p_adopt
 
-    deps, refused = load_deposits(directory, epoch, att_layers, n_linear)
+    try:
+        deps, refused = load_deposits(directory, epoch, att_layers, n_linear)
+    except Exception as exc:  # noqa: BLE001 -- vote empty, still gather
+        log("L15-DEPOSIT-ADOPT records unreadable (%s: %s)" % (type(exc).__name__, exc))
+        deps, refused = [], {}
     for rid, why in refused.items():
         log("L15-DEPOSIT-REFUSED rid=%s reason=%s" % (rid, why))
     spans, toks, my_ok = {}, {}, []
     for dep in deps:
-        t = read_tokens(directory, dep.rid)
-        why = "no token ids" if t is None else None
-        if why is None:
-            sp = span_for(dep, t, match, host_pool, host_mamba, log)
-            if isinstance(sp, str):
-                why = sp
-            else:
-                spans[dep.rid], toks[dep.rid] = sp, t
-        if why is None:
-            why = rows_free(dep, kv_alloc, mamba_alloc)
+        try:
+            t = read_tokens(directory, dep.rid)
+            why = "no token ids" if t is None else None
+            if why is None:
+                sp = span_for(dep, t, match, host_pool, host_mamba, log)
+                if isinstance(sp, str):
+                    why = sp
+                else:
+                    spans[dep.rid], toks[dep.rid] = sp, t
+            if why is None:
+                why = rows_free(dep, kv_alloc, mamba_alloc)
+        except Exception as exc:  # noqa: BLE001 -- this rid only; the gather must run
+            why = "%s: %s" % (type(exc).__name__, exc)
         if why is not None:
             log("L15-DEPOSIT-REFUSED rid=%s rank=%d reason=%s" % (dep.rid, rank, why))
             spans.pop(dep.rid, None)
     mine = [spans[d.rid] for d in deps if d.rid in spans and rank in d.skip_ranks]
-    failed = refill_skipped(mine, rank, prefix, host_pool=host_pool,
-                            device_pool=device_pool, host_mamba=host_mamba,
-                            dev_mamba=dev_mamba, log=log) if mine else {}
+    try:
+        failed = refill_skipped(mine, rank, prefix, host_pool=host_pool,
+                                device_pool=device_pool, host_mamba=host_mamba,
+                                dev_mamba=dev_mamba, log=log) if mine else {}
+    except Exception as exc:  # noqa: BLE001 -- nothing of this rank's adopted
+        failed = {sp.rid: "%s: %s" % (type(exc).__name__, exc) for sp in mine}
     for rid, why in failed.items():
         log("L15-DEPOSIT-REFUSED rid=%s rank=%d reason=refill: %s" % (rid, rank, why))
     my_ok = [rid for rid in spans if rid not in failed]
@@ -374,3 +384,58 @@ def clear_epoch_files(directory: str, listdir: Callable = os.listdir) -> int:
             except FileNotFoundError:
                 pass
     return n
+
+
+def adopt_for_sched(sched, env, log, *, epoch: int, gather) -> List[str]:
+    """D wake entry (every D rank, behind the group verdict "hold"): the live
+    geometry, then :func:`adopt_deposits`, then this epoch's files go. Never
+    raises before the gather (a failure votes an empty set); a refused adopt
+    of an AGREED rid is the one loud error (ranks diverged)."""
+    from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.weg2 import l15_bind, l15_share_publish
+
+    directory = l15_share_publish.share_dir(env)
+    try:
+        tree = getattr(sched, "tree_cache", None)
+        mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+        wrapper = getattr(mr, "token_to_kv_pool", None)
+        amap = getattr(wrapper, "full_attention_layer_id_mapping", None) or {}
+        rtp = getattr(sched, "req_to_token_pool", None)
+        n_linear = len(getattr(rtp, "mamba_map", None) or {})
+        from sglang.srt.distributed.utils import get_cp_token_ratios
+
+        ratios = get_cp_token_ratios() or [1]
+        prefix = [0]
+        for x in ratios:
+            prefix.append(prefix[-1] + int(x))
+        rank = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0)
+        host_pool, host_mamba = l15_bind.live_host_pools(tree)
+
+        def match(ids):
+            res = tree.match_prefix(MatchPrefixParams(key=RadixKey(
+                token_ids=list(ids), extra_key=None,
+                is_bigram=getattr(tree, "is_eagle", False))))
+            got = len(res.device_indices) + int(res.host_hit_length or 0)
+            return res.best_match_node, got
+
+        ready = True
+    except Exception as exc:  # noqa: BLE001 -- vote empty, still gather
+        log("L15-DEPOSIT-ADOPT geometry unavailable (%s: %s) -- votes none"
+            % (type(exc).__name__, exc))
+        ready = False
+    if not ready:
+        agree([], gather)
+        return []
+    try:
+        adopted = adopt_deposits(
+            directory=directory, epoch=int(epoch), rank=rank, prefix=prefix,
+            att_layers=sorted(int(g) for g in amap), n_linear=n_linear,
+            match=match, tree_cache=tree,
+            kv_alloc=getattr(sched, "token_to_kv_pool_allocator", None),
+            mamba_alloc=getattr(rtp, "mamba_allocator", None),
+            host_pool=host_pool, device_pool=wrapper, host_mamba=host_mamba,
+            dev_mamba=getattr(rtp, "mamba_pool", None), gather=gather, log=log)
+    finally:
+        clear_epoch_files(directory)
+    return adopted

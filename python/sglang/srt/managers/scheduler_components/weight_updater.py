@@ -11857,6 +11857,35 @@ class SchedulerWeightUpdaterManager:
                 _l15_dropped = self._l15_wake_act(
                     self.scheduler, _l15_v,
                     group_ok=not _weg2_kv_refusal, master_on=_l15_wake)
+                # L15-14e: the complete phase-2 deposits become device nodes
+                # (opt-in SGLANG_WEG2_L15_DEPOSIT=1), behind the uniform hold
+                # verdict, on every D rank at this one position (one gather)
+                if (_l15_v == "hold" and not _weg2_kv_refusal
+                        and os.environ.get("SGLANG_WEG2_L15_DEPOSIT", "0") == "1"):
+                    try:
+                        from sglang.srt.weg2 import l15_deposit_adopt as _l15_da
+                        _l15_wg = getattr(self.scheduler, "world_group", None)
+                        _l15_cg = (getattr(_l15_wg, "cpu_group", None)
+                                   if _l15_wg is not None else None)
+                        _l15_ww = (torch.distributed.get_world_size(group=_l15_cg)
+                                   if _l15_cg is not None else 1)
+
+                        def _l15_gather(_v):
+                            if _l15_cg is None or _l15_ww <= 1:
+                                return [_v]
+                            _o = [None] * _l15_ww
+                            torch.distributed.all_gather_object(_o, _v, group=_l15_cg)
+                            return _o
+
+                        _l15_da.adopt_for_sched(
+                            self.scheduler, os.environ, logger.info,
+                            epoch=int(_l15_m.epoch) if _l15_m is not None else -1,
+                            gather=_l15_gather)
+                    except RuntimeError:
+                        raise   # an agreed rid refused on one rank: ranks diverged
+                    except Exception as exc:  # noqa: BLE001 -- deposits are optional
+                        logger.warning("L15-DEPOSIT-ADOPT failed (%s: %s)",
+                                       type(exc).__name__, exc)
                 if _l15_v == "fallback":
                     logger.info("L15-RESTORE verdict=fallback dropped=%d "
                                 "slots", _l15_dropped)
