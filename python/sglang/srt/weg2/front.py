@@ -1691,6 +1691,39 @@ LEG1_INPUT_IDS_ENV = "SGLANG_WEG2_LEG1_INPUT_IDS"
 _LEG1_IDS_FROM = ("/v1/chat/completions", "/v1/messages", "/generate")
 
 
+#: DP-NACHLAUF 02.10. (N5d D->P epoch 25: leg 1 dispatched at the flip's done,
+#: PP0's store prefetch then queued 1333 ms + read 206 ms + harvest 73 ms, the
+#: followers' reads came later still -- all of it after the wake): at a D->P
+#: flip's BEGIN the front posts leg 1 of the queue head (up to p_concurrency)
+#: to the DORMANT P. P accepts and holds it (#1443 DORMANT-HOLD, the path D's
+#: leg 2 takes on every P->D flip): tokenised ids and the store prefetch run on
+#: P's prefetch threads while the weight legs run; the wake releases the held
+#: request and only the device load is left. The P drain awaits the leg it
+#: finds in flight instead of posting it again. Default OFF (the P-side hold
+#: has not run on the metal yet); SGLANG_WEG2_LEG1_EARLY=1 arms it.
+LEG1_EARLY_ENV = "SGLANG_WEG2_LEG1_EARLY"
+
+
+def leg1_early_on(env: Optional[Mapping[str, str]] = None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(LEG1_EARLY_ENV, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def leg1_early_candidates(queue, limit: int) -> list:
+    """The queue head the P drain would dispatch first (at most ``limit``):
+    a leg 1 to run (not CARRIER-EXCEEDS, not D-direct), its client still
+    there, none already in flight."""
+    out = []
+    for p in list(queue):
+        if len(out) >= max(0, int(limit)):
+            break
+        if (getattr(p, "skip_leg1", False) or getattr(p, "d_direct", False)
+                or getattr(p, "client_gone", False) or getattr(p, "_leg1_early", None) is not None):
+            continue
+        out.append(p)
+    return out
+
+
 def leg1_input_ids_on(env: Optional[Mapping[str, str]] = None) -> bool:
     env = os.environ if env is None else env
     return str(env.get(LEG1_INPUT_IDS_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
@@ -12401,6 +12434,14 @@ class Front:
                                         len(self._l15_wake_hints), self._l15_wake_hints[:8])
                 except Exception:  # noqa: BLE001 -- a hint, never the route
                     pass
+            # DP-NACHLAUF: leg 1 of the queue head goes to the dormant P now
+            if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
+                for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
+                    _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
+                    self.counters["leg1_early"] += 1
+                    logger.info("WEG2 LEG1-EARLY rid=%s epoch=%d (posted at the D->P flip's begin; "
+                                "P holds it dormant, its store prefetch runs beside the legs)",
+                                _ep.rid, self.epoch)
             # L15-02b: one shadow line at the D->P hot-handover flip begin.
             try:
                 import itertools
@@ -14591,7 +14632,12 @@ class Front:
                     try:
                         if self.dual_kv_ledgers:
                             self._dual_inflight[p.rid] = p
-                        await self.leg1(p)
+                        _early = getattr(p, "_leg1_early", None)
+                        if _early is not None:
+                            # DP-NACHLAUF: posted at the flip's begin -- await it
+                            await _early
+                        else:
+                            await self.leg1(p)
                     except Exception as e:  # noqa: BLE001
                         if p.client_gone:  # H102: aborted on P for a client that left
                             self.counters["leg1_client_gone"] += 1
