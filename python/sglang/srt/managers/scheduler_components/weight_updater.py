@@ -11704,7 +11704,11 @@ class SchedulerWeightUpdaterManager:
                 # erases the partial refill (xsn409: the drop stays a GROUP act,
                 # never per-rank).  The mark is consumed, so the post-decide act
                 # keeps or drops but never refills a second time.
-                if self._l15_optimistic_refill():
+                # L15-FLIPCOST: the wake's L15 steps on their own clocks
+                _l15_wt0 = time.perf_counter()
+                _l15_opt_failed = self._l15_optimistic_refill()
+                _l15_wt1 = time.perf_counter()
+                if _l15_opt_failed:
                     _l15_v = self._l15_wake_check_and_decide(
                         _l15_wake, None,
                         epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
@@ -11712,6 +11716,7 @@ class SchedulerWeightUpdaterManager:
                     _l15_v = self._l15_wake_check_and_decide(
                         _l15_wake, _l15_fp,
                         epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
+                _l15_wt2 = time.perf_counter()
                 logger.info("L15-DECIDE epoch=%d verdict=%s fence_verdict=%s",
                             int(_l15_m.epoch) if _l15_m is not None else 0,
                             _l15_v, _l15_fence_v)
@@ -11798,6 +11803,56 @@ class SchedulerWeightUpdaterManager:
                     _l15_v,
                     tuple(_l15_m.rows_by_rank) if _l15_m is not None else (),
                     _l15_refill, _l15_missing))
+                _l15_wt3 = time.perf_counter()
+                logger.info(
+                    "L15-WAKE-TIMING rank=%d verdict=%s refill_ms=%.0f "
+                    "check_decide_ms=%.0f act_ms=%.0f total_ms=%.0f",
+                    self._weg2_rank(), _l15_v, (_l15_wt1 - _l15_wt0) * 1000.0,
+                    (_l15_wt2 - _l15_wt1) * 1000.0, (_l15_wt3 - _l15_wt2) * 1000.0,
+                    (_l15_wt3 - _l15_wt0) * 1000.0)
+                try:
+                    from sglang.srt.weg2 import l15_shadow as _l15_sh
+                    _l15_hs = self.scheduler
+                    _l15_hmr = getattr(getattr(_l15_hs, "tp_worker", None),
+                                       "model_runner", None)
+                    _l15_hpool = getattr(_l15_hmr, "token_to_kv_pool", None)
+                    _l15_htp = int(getattr(_l15_hs, "tp_size", 0) or getattr(
+                        getattr(_l15_hs, "server_args", None), "tp_size", 1) or 1)
+                    from sglang.srt.distributed.utils import (
+                        get_cp_token_ratios as _l15_hr,
+                    )
+                    _l15_hrat = _l15_hr() or [1] * _l15_htp
+                    _l15_hpre = [0]
+                    for _x in _l15_hrat:
+                        _l15_hpre.append(_l15_hpre[-1] + int(_x))
+                    _l15_hcell = _l15_sh.cell_bytes_from(_l15_hpool)
+                    _l15_hrgid = getattr(getattr(_l15_hs, "server_args", None),
+                                         "rank_gpu_id", None)
+                    _l15_hcards = (list(_l15_hrgid)
+                                   if isinstance(_l15_hrgid, (list, tuple))
+                                   and len(_l15_hrgid) == _l15_htp
+                                   else list(range(_l15_htp)))
+                    _l15_hcaps = _l15_sh.caps_from_env(
+                        os.environ, _l15_htp, [_l15_hcell] * _l15_htp, _l15_hcards)
+                    _l15_hrtp = getattr(_l15_hs, "req_to_token_pool", None)
+                    _l15_hmc = getattr(getattr(_l15_hrtp, "mamba_pool", None),
+                                       "mamba_cache", None)
+                    _l15_hab = 0
+                    if _l15_hmc is not None:
+                        # one anchor slot's bytes on this rank, all layers
+                        _l15_hab = sum(
+                            int(t[:, 0].numel()) * int(t.element_size())
+                            for t in [_l15_hmc.temporal]
+                            + list(getattr(_l15_hmc, "conv", []) or []))
+                    _l15_hrk = self._weg2_rank()
+                    logger.info("%s", l15_restore.hostbytes_line(
+                        _l15_m, _l15_hrk, _l15_hpre,
+                        _l15_hcaps[_l15_hrk] if _l15_hrk < len(_l15_hcaps) else 0,
+                        _l15_hcell, _l15_hab, str(_l15_v),
+                        int(_l15_m.epoch) if _l15_m is not None else 0))
+                except Exception as _exc:  # noqa: BLE001 -- instrument only
+                    logger.info("L15-HOSTBYTES skipped (%s: %s)",
+                                type(_exc).__name__, _exc)
                 # F11: the fence has consumed the record (fingerprint,
                 # verdict, action -- the file was unlinked at the hold
                 # signal); the stash does not survive into the next wake.
