@@ -2007,6 +2007,11 @@ class HiMambaRadixCache(MambaRadixCache):
         log_metrics: bool,
     ):
         cc = self.cache_controller
+        if getattr(cc, "weg2_reset_reaper_alive", lambda: False)() is True:
+            # PARK-READ-DETACH: a detached reset's old pipeline is still ending;
+            # its control queues name slots of the cleared pool and are discarded
+            # with it at the restart -- never drained into a reallocated slot.
+            return
 
         def _drain_queue(q, limit: Optional[int]):
             drained = 0

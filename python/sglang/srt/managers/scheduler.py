@@ -20313,12 +20313,23 @@ class Scheduler(
                     logger.warning("L15-KEEP-CLEAR at=sleep failed (%s: %s)",
                                    type(exc).__name__, exc)
                 _fsub.mark("l15_tail")
-                self.tree_cache.reset()
-                _fsub.mark("tree_reset")
-                self.req_to_token_pool.clear()
-                _fsub.mark("req_pool_clear")
-                self.token_to_kv_pool_allocator.clear()
-                _fsub.mark("alloc_clear")
+                # PARK-READ-DETACH (L15 boot dac8b62b8c 14:43:49): the reset may hand the
+                # open store reads of D's park list to a background reaper instead of
+                # joining them -- PDFLIP-A's exempt set names them, read before the tree
+                # reset forgets ongoing_prefetch.
+                _prd_cc = getattr(self.tree_cache, "cache_controller", None)
+                if _prd_cc is not None:
+                    _prd_cc._weg2_reset_detach_rids = _weg2_parked_owned_prefetch_of(self)
+                try:
+                    self.tree_cache.reset()
+                    _fsub.mark("tree_reset")
+                    self.req_to_token_pool.clear()
+                    _fsub.mark("req_pool_clear")
+                    self.token_to_kv_pool_allocator.clear()
+                    _fsub.mark("alloc_clear")
+                finally:
+                    if _prd_cc is not None:
+                        _prd_cc._weg2_reset_detach_rids = None
                 if self._flush_zero_kv_wanted(zero_kv):
                     # Default part of the flush (opt-out env): the post-flush
                     # state must equal a fresh boot, whose pools are torch.zeros.
