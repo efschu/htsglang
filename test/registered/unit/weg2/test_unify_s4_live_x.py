@@ -151,6 +151,7 @@ def test_resolve_x_flag_wins_whatever_the_filter(tmp_path):
 
 
 # --------------------------------------------------------- the band floor
+@pytest.mark.usefixtures("_pdflip_band_off")
 def test_band_floor_is_the_start_x_unless_x_busy_is_given():
     assert _front().x_busy_tokens is None
     f = _band_front()
@@ -163,6 +164,7 @@ def test_band_floor_is_the_start_x_unless_x_busy_is_given():
     assert f._x_band_floor() == 7500  # never above the X in force
 
 
+@pytest.mark.usefixtures("_pdflip_band_off")
 def test_x_busy_lowers_the_band_floor_a_busy_d_sends_the_band_to_p():
     """27B X_busy=2048: a 3000-token SHORT is a band request now; with D busy
     it routes LONG on the band floor instead of halting D's decode."""
@@ -173,6 +175,7 @@ def test_x_busy_lowers_the_band_floor_a_busy_d_sends_the_band_to_p():
     assert f.on_d == [] and f.counters["route_long"] == 1 and f.counters["x_solo_p"] == 1
 
 
+@pytest.mark.usefixtures("_pdflip_band_off")
 def test_without_x_busy_the_same_request_takes_no_window():
     """Unset: 3000 <= start X is no band request -- SHORT at once, no X-SOLO
     decision (the NF H84 behaviour, byte for byte); with X_busy=2048 the same
@@ -184,3 +187,10 @@ def test_without_x_busy_the_same_request_takes_no_window():
     f.x_busy_tokens = 2048
     asyncio.run(_drive(f, [3000]))
     assert f.on_d == ["weg2-0-1"] and f.counters["x_solo_d"] == 1
+
+
+@pytest.fixture
+def _pdflip_band_off(monkeypatch):
+    """PDFLIP-B: this test documents the X-SOLO band / explicit flip-min-work form
+    (SGLANG_WEG2_X_BAND_FOLLOWS_PRICE=0); the live-X form is test_pdflip_band_follows_price_1002."""
+    monkeypatch.setenv("SGLANG_WEG2_X_BAND_FOLLOWS_PRICE", "0")

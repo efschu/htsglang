@@ -8542,9 +8542,37 @@ class Front:
 
     def _x_band_floor(self) -> int:
         """UNIFY S4: the X-SOLO band's floor as applied -- ``--x-busy-tokens``
-        (27B X_busy), else the start X (H84), never above the X in force."""
+        (27B X_busy), else the start X (H84), never above the X in force.
+
+        PDFLIP-B (N5d 1002_124821, 7 of 7 D->P flips by 12:56 PARK-IMMEDIATE
+        over-x at est_uncached 1942-18825): with the excursion price on
+        (SGLANG_WEG2_X_EXCURSION_PRICE, X-COST-LINE) the live X already prices
+        what a D-direct prefill costs against the excursion -- and an excursion
+        stops D's running decodes too, for a whole flip pair plus P compute. A
+        band floor under it (4096, the start X) routed 7.7k-token turns to P
+        whenever D decoded anything (X-SOLO verdict=p reason=d_outstanding=2,
+        X_live=10674) and fired the immediate park for them: a flip pair every
+        ~10 s. So the floor IS the live X there (no band)."""
+        if Front._x_excursion_band_off(self):
+            return max(0, int(self.tp_prefill_max_tokens))
         xb = self.x_start_tokens if getattr(self, "x_busy_tokens", None) is None else self.x_busy_tokens
         return max(0, min(int(xb), int(self.tp_prefill_max_tokens)))
+
+    def _x_excursion_band_off(self) -> bool:
+        """PDFLIP-B: the band floor follows the live X (helper shared with NF).
+
+        NF (cherry-pick of 98b8168d66): this line has no
+        SGLANG_WEG2_X_EXCURSION_PRICE -- its X-COST-LINE price is the ski price
+        (the measured warm D->P + P->D legs + the resume, else the record of
+        this form), i.e. the round trip both directions, so the switch reads as
+        on where it does not exist."""
+        try:
+            _exc = getattr(envs, "SGLANG_WEG2_X_EXCURSION_PRICE", None)
+            return bool((_exc is None or _exc.get())
+                        and envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get()
+                        and envs.SGLANG_WEG2_X_BAND_FOLLOWS_PRICE.get())
+        except Exception:  # noqa: BLE001
+            return False
 
     def _x_solo_busy(self) -> Optional[str]:
         """H84: None when the system is otherwise EMPTY, else what is in it.
@@ -12839,7 +12867,13 @@ class Front:
         need, prov = self._derived_min_dwell_ms(src, dst)
         awake_ms = (time.time() - self.t_awake) * 1000.0
         overridden = "none"
-        if fairness_fired:
+        if fairness_fired and getattr(self, "_park_attempt_epoch", None) == self.epoch \
+                and Front._x_excursion_band_off(self):
+            # PDFLIP-B: admission was closed by this phase's own park, whose trigger
+            # already passed the derived min-dwell (_immediate_park_due) -- not a
+            # fairness wait (N5d: overridden_by=fairness with oldest_wait_s=0.0)
+            overridden = "park"
+        elif fairness_fired:
             overridden = "fairness"
         elif work_exhausted and self.w_s > 0 and oldest_wait_s >= self.w_s:
             overridden = "work"
@@ -13273,6 +13307,10 @@ class Front:
         queued_uncached = sum(int(p.est_uncached) for p in self.queue)
         queued_tokens = sum(int(p.est_prompt) for p in self.queue)
         threshold = self.flip_min_work_tokens
+        if Front._x_excursion_band_off(self):
+            # PDFLIP-B: the line says "X*" -- under the excursion price it IS the
+            # live X (N5d printed threshold=4096 beside X=10674)
+            threshold = max(int(threshold), int(self.tp_prefill_max_tokens))
         # xsn438: WORK D CAN NEVER DO IS NOT PRICED AGAINST D DOING IT. X*
         # amortises 2*flip_s against the alternative of D prefilling the
         # queued work itself (law 4). Text queued on D's watch has that

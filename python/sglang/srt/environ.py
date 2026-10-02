@@ -4034,6 +4034,14 @@ class Envs:
     # would take (1 + requests queued for P now). The mean stays display-only.
     # Default on for the NF freeze (y5c): the routing rule itself, not a tuning.
     SGLANG_WEG2_X_K_FLIP = EnvBool(True)
+    # PDFLIP-B (02.10., 27B N5d ping-pong; NF cherry-pick of 98b8168d66): the
+    # X-SOLO band floor (X_busy / start X) and FLIP-ECONOMICS' threshold follow
+    # the live X -- X* of the measured round trip (X-COST-LINE price; the 27B
+    # line prices it with SGLANG_WEG2_X_EXCURSION_PRICE, NF with the ski price:
+    # warm D->P + P->D legs + resume); a park-closed admission is labelled
+    # "park", not "fairness", in MIN-DWELL (NF: the ARRIVAL-SEAT trigger passes
+    # K7's min-dwell first). 0 = the band floor and the threshold as before.
+    SGLANG_WEG2_X_BAND_FOLLOWS_PRICE = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
