@@ -8856,8 +8856,13 @@ class SchedulerWeightUpdaterManager:
                     float(rec.get("waited_s", 0.0)) * 1000,
                     "counter" if int(rec.get("available_bytes", 0) or 0) >= 0 else "card-overdraw",
                     int(_st.get("credit_bytes", 0) or 0) // MIB_, int(need_bytes) // MIB_)
-        except Exception:  # noqa: BLE001 -- an instrument, never a gate
-            pass
+        except Exception as _lo_exc:  # noqa: BLE001 -- an instrument, never a gate
+            # LAYER-REST-1002: y7t carried 0 of these lines on 18 legs and the
+            # bare `pass` said nothing about why -- name it, once per leg.
+            if getattr(self, "_weg2_leg_order_na_epoch", None) != epoch:
+                self._weg2_leg_order_na_epoch = epoch
+                logger.info("WEG2-LEG-ORDER n/a tag=%s (%s: %s)", tag,
+                            type(_lo_exc).__name__, _lo_exc)
         # xsn323: remember the tightest point of these legs. The kv-first gate
         # of the NEXT wake reads it: kv_cache resumed before the legs must not
         # eat the free space the legs' tags need (5090: free 9028 MiB at

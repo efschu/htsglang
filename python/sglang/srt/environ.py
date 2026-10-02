@@ -1529,6 +1529,13 @@ class Envs:
     # image -> 2048 MiB block on D-TP0, 525 MiB of host RAM no ledger post
     # books. False = the torch.empty form, byte for byte.
     SGLANG_OPT_WEG2_DRAFT_PARK_EXACT_PIN = EnvBool(False)
+    # LAYER-REST-1002 (NF y7t D->P): the park skips its D2H when a device
+    # digest (int64 sum per MiB) equals the digest of the image's last D2H --
+    # the draft is static and every wake wrote the image back. y7t: the
+    # 113 ms D2H on D TP0's pre-loop gated P PP0's first claim and TP1/TP2's
+    # first deposits (~150 ms BAR1 wait each) in every D->P flip. 27B parks no
+    # draft (draft_park=0). False = the D2H on every park, byte for byte.
+    SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED = EnvBool(True)
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
