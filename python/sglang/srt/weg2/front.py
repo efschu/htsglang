@@ -125,6 +125,7 @@ from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock 
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
+from sglang.srt.weg2 import front_gc_guard as _gcg  # GC-GUARD 02.10.
 from sglang.srt.weg2 import arrival_seat_rule as _asr  # ARRIVAL-SEAT (user 29.09.)
 from sglang.srt.weg2 import p_read_overlap as _ro  # RO: P computes while a store read runs
 from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
@@ -524,9 +525,13 @@ def install_gc_pause_probe(threshold_ms: float = GC_PAUSE_LOG_MS) -> Callable[[s
             return
         ms = (time.perf_counter() - t0) * 1000.0
         if ms >= threshold_ms:
-            logger.warning("WEG2-FRONT GC-PAUSE generation=2 ms=%.0f collected=%s frozen=%d -- the event "
-                           "loop was held that long; a front whose module heap is frozen (H78) should "
-                           "not print this line", ms, info.get("collected"), gc.get_freeze_count())
+            # GC-GUARD: trigger=guard is the guard's own pass in a quiet moment;
+            # trigger=auto with the guard armed is a pass CPython (or a library's
+            # gc.collect()) started by itself -- the line to look at.
+            logger.warning("WEG2-FRONT GC-PAUSE generation=2 ms=%.0f collected=%s frozen=%d trigger=%s -- "
+                           "the event loop was held that long; a front whose module heap is frozen "
+                           "(H78) should not print this line", ms, info.get("collected"),
+                           gc.get_freeze_count(), "guard" if _gcg.guard_collecting() else "auto")
 
     gc.callbacks.append(_probe)
     return _probe
@@ -4019,6 +4024,10 @@ def dc_image_off_flip_on(env: Optional[Mapping[str, str]] = None) -> bool:
 CTL_TICK_S = 0.2
 #: The reasons a kick may name -- one per switch, refused by name otherwise.
 CTL_KICK_REASONS = {"arrival": CTL_KICK_ARRIVAL_ENV, "after_flip": CTL_KICK_AFTER_FLIP_ENV}
+#: DONE-KICK (02.10.): the third reason. Its switch is an environ.py default (on),
+#: not a form-registry row, so it lives beside ``_kick_on`` (``_kick_done_queued``).
+CTL_KICK_DONE_QUEUED = "done_queued"
+CTL_KICK_DONE_QUEUED_ENV = "SGLANG_WEG2_CTL_KICK_DONE_QUEUED"
 
 
 def _env_switch_on(name: str) -> bool:
@@ -4455,6 +4464,8 @@ class Front:
         self._kick_on: Dict[str, bool] = {
             # LS12 rest (30.09.): unset/blank takes the registry row (qwen27b front_ctl_kick on)
             why: _env_switch_on_or_profile(env) for why, env in CTL_KICK_REASONS.items()}
+        # DONE-KICK (02.10.): default on (environ.py), read once like the others.
+        self._kick_done_queued = bool(envs.SGLANG_WEG2_CTL_KICK_DONE_QUEUED.get())
         self._dc_off_path = _env_switch_on_or_profile(DC_OFF_PATH_ENV)
         # The kick event is created lazily in the running loop (_ctl_evt), so a
         # Front built outside a loop -- the unit tests, main() -- binds nothing.
@@ -5915,6 +5926,18 @@ class Front:
         # H78: a full GC pass holds the loop ~220 ms in this heap; the launcher
         # prewarm freezes the module heap, and this names any pass still slow.
         app["gc_pause_probe"] = install_gc_pause_probe()
+        # GC-GUARD (02.10., N5q epoch 4: a 92 ms full pass between the P>D done and
+        # the D>P begin): no automatic generation-2 pass; the due one runs where no
+        # flip and no queued verdict waits, and the warm-up end freezes again.
+        if envs.SGLANG_WEG2_FRONT_GC_GUARD.get():
+            _g = _gcg.GcGuard(max_defer_s=envs.SGLANG_WEG2_FRONT_GC_MAX_DEFER_S.get())
+            if _g.arm():
+                self._gc_guard_obj = _g
+                app["gc_guard"] = asyncio.create_task(self.gc_guard_sampler())
+                app["gc_warm_freeze"] = asyncio.create_task(self._gc_warm_freeze(app))
+        else:
+            logger.info("WEG2-FRONT GC-GUARD armed=0 reason=switch-off (SGLANG_WEG2_FRONT_GC_GUARD=0: "
+                        "CPython's own schedule, as before)")
         logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound, 0 = off) "
                     "carrier_max_tokens=%d p_concurrency=%d d_bs=%d X=%d flip_min_work_tokens=%d "
                     "idle_layout=%s min_dwell_ms=%s drain_deadline_s=%.0f d_admit_max_tokens=%d "
@@ -5934,6 +5957,41 @@ class Front:
         logger.info("%s", front_span_inflight_line())
         # 27B idle policy: the resting layout and the two hold/drain settings.
         logger.info("%s", self.idle_policy_line())
+
+    #: GC-GUARD: the startup tasks whose objects the warm-up freeze takes along.
+    GC_WARM_TASKS = ("launcher_prewarm", "flip_imports_prewarm", "sidecar_prewarm", "x_exact")
+
+    def _gc_critical(self) -> Tuple[bool, bool]:
+        """GC-GUARD: (critical, flipping). Critical = a flip is open or a queued
+        verdict waits for one -- the moments the D>P Vorlauf is made of."""
+        flipping = getattr(self, "state", None) == "flipping"
+        return flipping or bool(getattr(self, "queue", None)), flipping
+
+    async def gc_guard_sampler(self) -> None:
+        """GC-GUARD: ask the guard every POLL_S whether the due full pass may run now."""
+        g = self.__dict__.get("_gc_guard_obj")
+        if g is None:
+            return
+        told = False
+        while True:
+            await asyncio.sleep(_gcg.POLL_S)
+            try:
+                critical, flipping = Front._gc_critical(self)
+                g.step(critical, flipping)
+            except Exception as e:  # noqa: BLE001 -- an instrument-grade helper never kills the front
+                if not told:
+                    told = True
+                    logger.warning("WEG2-FRONT GC-GUARD step failed: %r (the guard keeps trying)", e)
+
+    async def _gc_warm_freeze(self, app) -> None:
+        """GC-GUARD: once every warm-up task ended (ready or failed), freeze what
+        it built -- the H78 freeze ran before the X-EXACT stack was loaded."""
+        g = self.__dict__.get("_gc_guard_obj")
+        tasks = [app[k] for k in self.GC_WARM_TASKS if app.get(k) is not None]
+        if tasks:
+            await asyncio.wait(tasks)
+        if g is not None:
+            g.warm_freeze("+".join(k for k in self.GC_WARM_TASKS if app.get(k) is not None) or "startup")
 
     async def _prewarm_launcher_import(self) -> None:
         """H75: import ``sglang.srt.weg2.launcher`` off the event loop.
@@ -7317,6 +7375,13 @@ class Front:
         probe = app.get("gc_pause_probe")
         if probe is not None and probe in gc.callbacks:
             gc.callbacks.remove(probe)
+        for k in ("gc_guard", "gc_warm_freeze"):  # GC-GUARD
+            t = app.get(k)
+            if t:
+                t.cancel()
+        _g = self.__dict__.get("_gc_guard_obj")
+        if _g is not None:
+            _g.disarm()
         if self.session:
             await self.session.close()
 
@@ -12454,6 +12519,12 @@ class Front:
         self._flip_stage = "drain"
         self._flip_marks["drain"] = time.time()
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
+        _dk = self.__dict__.pop("_done_kick_at", None)
+        if _dk is not None and src == "D" and _dk[0] == self.epoch:
+            # DONE-KICK: how long the done -> begin took (the controller's pass,
+            # whatever latch held it) -- the instrument of the fix.
+            logger.info("WEG2-FLIP DONE-KICK begin epoch=%d done_to_begin_ms=%.0f queue=%d",
+                        self.epoch, (t_flip0 - _dk[1]) * 1000.0, len(self.queue))
         # DASHBOARD-AUS-IPC (a): the begin as a record (IPC thread, not on the flip).
         # The woken group's first work is timed from here (armed at the begin, not at
         # `done`: with the tail overlap D can stream before the front logs `done`).
@@ -13094,6 +13165,14 @@ class Front:
         # the admitter for requests still in _ready_for_d.
         if dst == "P":
             self._kick_controller("after_flip")
+        elif Front._done_kick_due(self):
+            # DONE-KICK (02.10., N5q epoch 4): P-bound work queued while this
+            # P->D flip ran (its arrival kick was spent on a controller pass that
+            # saw state=flipping). Wake the controller now: the D-branch decision
+            # -- economics, MIN-DWELL, fairness, the hand-off window -- runs
+            # unchanged, only not one 0.2 s tick later. Held like the arrival
+            # kick while prefilled requests wait in _ready_for_d.
+            Front._done_kick(self, dst)
         # #1262 tier 3: the flip is closed, so there is nothing open to stall.
         self._flip_t0 = None
         self._flip_stage = "none"
@@ -14433,11 +14512,13 @@ class Front:
         """The three switches as one line, printed at startup."""
         on = lambda b: "on" if b else "off"  # noqa: E731
         return ("WEG2-FLIPFAST kick_arrival=%s kick_after_flip=%s dc_off_path=%s tick_s=%.2f "
-                "(%s / %s / %s; off = the controller sleeps its full tick and the post-wake "
+                "kick_done_queued=%s "
+                "(%s / %s / %s / %s; off = the controller sleeps its full tick and the post-wake "
                 "residue reading runs on the flip, exactly as before)" % (
                     on(self._kick_on["arrival"]), on(self._kick_on["after_flip"]),
-                    on(self._dc_off_path), CTL_TICK_S,
-                    CTL_KICK_ARRIVAL_ENV, CTL_KICK_AFTER_FLIP_ENV, DC_OFF_PATH_ENV))
+                    on(self._dc_off_path), CTL_TICK_S, on(getattr(self, "_kick_done_queued", False)),
+                    CTL_KICK_ARRIVAL_ENV, CTL_KICK_AFTER_FLIP_ENV, DC_OFF_PATH_ENV,
+                    CTL_KICK_DONE_QUEUED_ENV))
 
     def _ctl_evt(self) -> asyncio.Event:
         loop = asyncio.get_running_loop()
@@ -14457,13 +14538,17 @@ class Front:
         would not have run -- every latch (economics, dwell, fairness, the
         hand-off window) is evaluated exactly as on a tick.
         """
-        if why not in CTL_KICK_REASONS:
-            raise ValueError(f"unknown controller kick reason {why!r}; known: {sorted(CTL_KICK_REASONS)}")
+        if why not in CTL_KICK_REASONS and why != CTL_KICK_DONE_QUEUED:
+            raise ValueError(f"unknown controller kick reason {why!r}; known: "
+                             f"{sorted(set(CTL_KICK_REASONS) | {CTL_KICK_DONE_QUEUED})}")
         # getattr: a Front assembled without __init__ (the unit tests' partial
         # fronts) has no switches -- that is the default path, a no-op.
-        if not (getattr(self, "_kick_on", None) or {}).get(why):
+        if why == CTL_KICK_DONE_QUEUED:
+            if not getattr(self, "_kick_done_queued", False):
+                return
+        elif not (getattr(self, "_kick_on", None) or {}).get(why):
             return
-        if why == "arrival" and getattr(self, "_ready_for_d", None):
+        if why in ("arrival", CTL_KICK_DONE_QUEUED) and getattr(self, "_ready_for_d", None):
             # Prefilled requests still wait for a D seat. The D->P decision does
             # not read _ready_for_d (only D.outstanding + the hand-off window),
             # so an early pass could flip D away before d_admitter's next 50 ms
@@ -14486,12 +14571,32 @@ class Front:
                         int(self.counters["ctl_kicked"]),
                         int(self.counters["ctl_kick_held_ready_for_d"]), CTL_TICK_S)
 
+    def _done_kick_due(self) -> bool:
+        """DONE-KICK: a P->D flip closes with P-bound work queued and the switch on."""
+        if not getattr(self, "_kick_done_queued", False):
+            return False
+        return bool(getattr(self, "queue", None)) and getattr(self, "state", None) == "serving"
+
+    def _done_kick(self, dst: str) -> None:
+        """DONE-KICK: name it, remember the done stamp for the begin line, kick."""
+        held0 = int(self.counters.get("ctl_kick_held_ready_for_d", 0))
+        self._kick_controller(CTL_KICK_DONE_QUEUED)
+        held = int(self.counters.get("ctl_kick_held_ready_for_d", 0)) > held0
+        q = self.queue
+        if not held:
+            self.__dict__["_done_kick_at"] = (int(self.epoch), time.time())
+        logger.info("WEG2-FLIP DONE-KICK epoch=%d woke=%s queue=%d head=%s held_ready_for_d=%d "
+                    "(P-bound work queued during the flip: the controller decides now, not at "
+                    "its next %.2f s tick; economics and MIN-DWELL unchanged)",
+                    int(self.epoch), dst, len(q), getattr(q[0], "rid", "-") if q else "-",
+                    int(held), CTL_TICK_S)
+
     async def _ctl_wait(self) -> None:
         """The controller's tick. Both kick switches off: ``asyncio.sleep(CTL_TICK_S)``,
         today's path. Either on: the same bound, ended early by a kick; a kick
         set while the controller was busy ends the next wait at once."""
         kick_on = getattr(self, "_kick_on", None) or {}
-        if not (kick_on.get("arrival") or kick_on.get("after_flip")):
+        if not (any(kick_on.values()) or getattr(self, "_kick_done_queued", False)):
             await asyncio.sleep(CTL_TICK_S)
             return
         evt = self._ctl_evt()
@@ -15465,7 +15570,11 @@ class Front:
                 self.counters["manual_flip_return_skip"] += 1
                 logger.info("WEG2 MANUAL-FLIP RETURN-SKIP reason=%s epoch=%d queue=%d -- P-bound work waits: "
                             "P stays awake, no return half", skip, int(self.epoch), len(self.queue))
-                self._kick_controller("manual_return_skip")
+                # DONE-KICK 02.10.: "manual_return_skip" was no known reason --
+                # _kick_controller refused it with a ValueError AFTER the flip
+                # (the POST answered 500); P's drain is the after_flip kick's job
+                # (flip("D","P") above already set it; a repeat is a no-op).
+                self._kick_controller("after_flip")
             else:
                 await self.flip("P", "D")
         return web.json_response(self.state_dict())
