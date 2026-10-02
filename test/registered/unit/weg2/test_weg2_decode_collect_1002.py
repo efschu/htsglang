@@ -135,3 +135,39 @@ def test_a_short_beside_a_p_bound_arrival_rides_the_flip(monkeypatch):
     f.queue = [_pending("big", 16448, time.time())]
     assert asyncio.run(f._acquire_short_seat("short", 500, uncached=500)) is None
     assert f.counters["decode_collect_release_P"] == 1
+
+
+def test_route_d_hands_a_budget_refused_short_to_d_while_d_decodes(monkeypatch):
+    """27B 7a19cae42a ported: on route=D the whole collected set <= X goes to
+    D's admission line at once -- also an entry the QUEUED-SHORT path skips
+    (d_eligible False: D's budget refused it, or a CARRIER). Base: it stayed
+    queued until D went idle."""
+    _on(monkeypatch)
+    f = _front(running=["a"], n=6, kv={"available": 400000, "evictable": 0})
+    now = time.time()
+    f.t_awake = now - 60.0
+    s = _pending("s1", 800, now - 8.0)
+    s.d_eligible = False
+    f.queue = [s]
+    wait_fired, _fair, immediate = asyncio.run(f._arrival_seat_step(f.groups["D"], now))
+    assert (wait_fired, immediate) == (False, None), "no flip for a set <= X"
+    assert f.counters["decode_collect_release_D"] == 1
+    assert f._ready_for_d == [s] and s.d_direct is True
+    assert s not in f.queue
+    assert f.counters["decode_collect_to_d"] == 1
+
+
+def test_route_d_leaves_p_only_and_requeued_entries_queued(monkeypatch):
+    """Negative branch of the hand-off: a p_only or re-queued entry of the
+    released set never moves to D, only the plain one does."""
+    _on(monkeypatch)
+    f = _front(running=["a"], n=6, kv={"available": 400000, "evictable": 0})
+    now = time.time()
+    po, rq, ok = _pending("po", 300, now - 9.0), _pending("rq", 300, now - 8.5), _pending("ok", 300, now - 8.0)
+    po.p_only, rq.x_requeues = True, 1
+    f.queue = [ok, rq, po]
+    f._dc_st().update(rel_rids=["po", "rq", "ok"])
+    assert f._dc_hand_to_d(now) == 1
+    assert f._ready_for_d == [ok] and ok.d_direct is True
+    assert f.queue == [rq, po], "p_only / re-queued stay with the queue"
+    assert f.counters["decode_collect_to_d"] == 1

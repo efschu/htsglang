@@ -4957,6 +4957,9 @@ class Front:
             dc = self._decode_collect(now)
             if dc == "hold":
                 return None
+            if dc == "D":
+                self._dc_hand_to_d(now)  # the small set: D prefills it now
+                return None
             if dc == "P":
                 live = [q for q in self.queue if not q.fut.done()]
                 return min(live, key=lambda q: float(q.t_arrive)) if live else None
@@ -9809,7 +9812,8 @@ class Front:
             route = "P"  # user ~19:13Z: "ansonsten wartet er auf die 15er grenze und flippt"
         else:
             route = "P" if (p_bound or tokens > x_tok) else "D"
-        st.update(route=route, t_rel=now, t_open=None, shorts={}, wid=st["wid"] + 1)
+        st.update(route=route, t_rel=now, t_open=None, shorts={}, wid=st["wid"] + 1,
+                  rel_rids=[p.rid for p in fresh])  # route D: the set _dc_hand_to_d moves
         self.counters["decode_collect_release_" + route] += 1
         logger.info("WEG2 DECODE-COLLECT release n=%d tokens=%d X=%d waited_s=%.1f route=%s stage=%s p_bound=%s "
                     "epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, self.epoch)
@@ -9841,6 +9845,50 @@ class Front:
                 return None
             await asyncio.sleep(0.05)
         return "D"
+
+    def _dc_hand_to_d(self, now: float) -> int:
+        """DECODE-COLLECT route D (user ~19:12Z: D prefills "die kleine menge
+        angefallene token" at once): every queued entry of the released set --
+        SHORT or not (band / x_deferred, budget-refused SHORT), each and their
+        sum <= X by the release -- goes to D's admission line now, while D
+        decodes on; no wait for an idle D (X-IDLE-REGRANT / D-SHORT-DRAIN).
+        The SHORTs held on the seat path take their own seats. Returns the
+        number moved."""
+        st = self._dc_st()
+        rel = set(st.pop("rel_rids", None) or ())
+        if not rel or not (self.awake == "D" and self.state == "serving" and self.admit_d):
+            return 0
+        x = int(self.tp_prefill_max_tokens)
+
+        def _g(p, k, d=None):  # partial test doubles
+            return getattr(p, k, d)
+        cands = sorted((p for p in self.queue if p.rid in rel and not p.fut.done()),
+                       key=lambda p: float(_g(p, "t_arrive", now) or now))
+        moved, total = [], 0
+        for p in cands:
+            u = int(_g(p, "est_uncached", 0) or 0)
+            if (_g(p, "p_only", False) or _g(p, "intake_stalled", False) or _g(p, "leg1_done", False)
+                    or _g(p, "reroutes", 0) or _g(p, "x_requeues", 0) or u < 0 or total + u > x):
+                continue
+            total += u
+            moved.append(p)
+        for p in moved:
+            try:
+                self.queue.remove(p)
+            except ValueError:
+                continue
+            p.d_direct = True
+            if _g(p, "x_deferred", False) and hasattr(self, "_usage_route_note"):
+                self._usage_route_note(p.rid, "x_short", self.epoch)  # USAGE: served on D after all
+            self._ready_for_d.append(p)
+        if moved:
+            if hasattr(self, "_sync_batch_gate"):
+                self._sync_batch_gate()
+            self.counters["decode_collect_to_d"] += len(moved)
+            logger.info("WEG2 DECODE-COLLECT to-d n=%d tokens=%d X=%d rids=%s epoch=%d -- route=D: the "
+                        "collected set goes to D's admission line now, D decodes on", len(moved), total,
+                        x, [p.rid for p in moved][:8], self.epoch)
+        return len(moved)
 
     def _asr_st(self) -> dict:
         return self.__dict__.setdefault("_asr_state", {
@@ -10346,6 +10394,8 @@ class Front:
         dc = self._decode_collect(now, live_q) if _decode_collect_window_s() > 0.0 else None
         if dc == "hold":
             return False, not self.admit_d, None  # DECODE-COLLECT: no flip, no D seat yet
+        if dc == "D":
+            self._dc_hand_to_d(now)  # route D: the non-SHORTs <= X too, not only d_eligible
         if dc == "P":
             if not live_q:
                 return False, not self.admit_d, None  # the released SHORTs are on their way to the queue
