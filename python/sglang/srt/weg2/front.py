@@ -5773,7 +5773,11 @@ class Front:
         arrivals the rest of the ~10 s load; a chars/3 LONG costs them a flip
         pair."""
         ft = self.ftok
-        if ft is None or ft.state not in ("unloaded", "loading"):
+        # 27B port: only while the load RUNS ('loading': a group's server args are in hand, the
+        # tokenizer loads -- 7.5 s measured, the whole boot-start window of b6a878f145 / N3y).
+        # 'unloaded' = no group answered /get_server_info yet (a front beside groups that are
+        # not up, the aiohttp test doubles): no load is running that could end the hold.
+        if ft is None or ft.state != "loading":
             return
         t0 = time.monotonic()
         self.counters["x_exact_held"] += 1
