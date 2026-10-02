@@ -356,7 +356,12 @@ class LimitStamp:
 #: Die drei Karten dieses Rigs, wie jeder NF-Boot sie druckt (``NVML -> CUDA
 #: ordinal map``, fnFL2x148/x160/x162/x163 identisch): Ordinal 0 = P-Stufe 0 =
 #: die 5090, dann die 3080 nach NVML-Nummer.
-RIG_5090 = ("GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d", 1, "NVIDIA GeForce RTX 5090")
+#: HW-GENERIC 1002: these are the PROVENANCE of the reference rig's measured
+#: stamps, keyed by physical UUID on purpose -- every consumer
+#: (:func:`stamp_verdict`, :func:`rates_for`) compares by UUID, so another rig
+#: (even one of the same calibration classes) gets ``REFERENZ UNDATIERT`` /
+#: no rates plus the named HW-UNCALIBRATED note, never a borrowed rate.
+RIG_5090 =("GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d", 1, "NVIDIA GeForce RTX 5090")
 RIG_3080_NVML0 = (
     "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
     0,
@@ -910,6 +915,38 @@ def _stage_limits_text(
     return " ".join(out)
 
 
+def _foreign_cards_note(
+    stage_cards: Sequence[object], rates: Sequence[StageRates]
+) -> str:
+    """HW-GENERIC 1002: when the stage cards are not the cards ANY rate set
+    was measured on (UUID per stage -- the stamps are per physical card, so a
+    rate set is never carried to another card, not even one of the same
+    class), say so by name: the miss is UNCALIBRATED hardware, not a moved
+    power limit. Empty when some rate set names exactly these cards."""
+    uuids = [str(getattr(c, "uuid", "") or "") for c in stage_cards]
+    if any([st.uuid for st in r.stamps] == uuids for r in rates):
+        return ""
+    try:
+        from sglang.srt.weg2.card_identity import CODE_UNCALIBRATED, class_label
+
+        labels = ", ".join(class_label(c) for c in stage_cards)
+    except Exception:  # noqa: BLE001 -- the note is advisory, the line never refuses
+        CODE_UNCALIBRATED, labels = "HW-UNCALIBRATED", "?"
+    return (
+        " %s: the stage rates were measured on other cards (%s); this boot's stages "
+        "run on [%s]. No rate is carried over to them; measure them on this rig "
+        "(pinned-cut boot, then `python -m sglang.srt.planner.power_limit --p-log ... "
+        "--launch-log ...`)."
+        % (
+            CODE_UNCALIBRATED,
+            "; ".join(
+                "%s: %s" % (r.name, ",".join(st.uuid for st in r.stamps)) for r in rates
+            ),
+            labels,
+        )
+    )
+
+
 def rates_for(
     reading: Optional[PowerReading],
     stage_cards: Sequence[object],
@@ -975,7 +1012,7 @@ def rate_cut_line(
             "%s: keine Raten fuer %s%s, %s. Gemessen sind: %s. Raten fuer ein neues Limit: "
             "einen Boot mit gepinntem Schnitt fahren, dann `python -m "
             "sglang.srt.planner.power_limit --p-log <P.log> --launch-log <front.log>` und den "
-            "Satz in power_limit.STAGE_RATES eintragen."
+            "Satz in power_limit.STAGE_RATES eintragen.%s"
             % (
                 head,
                 now,
@@ -985,6 +1022,7 @@ def rate_cut_line(
                     "%s bei %s (%s)" % (r.name, _stamps_text(r.stamps), r.source)
                     for r in own
                 ),
+                _foreign_cards_note(stage_cards, own),
             )
         )
     per_layer = match.ms_per_layer()

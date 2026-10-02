@@ -82,6 +82,9 @@ __all__ = [
     "model_quant_kind",
     "model_max_context",
     "rig_has_sm86",
+    "rig_sm86_verdict",
+    "gpu_cc",
+    "UnknownGpuArch",
     "find_draft_models",
 ]
 
@@ -271,46 +274,133 @@ def model_quant_kind(model_cfg: Optional[dict]) -> Optional[str]:
     return None
 
 
-#: GPU-name fragments that identify sm86 (Ampere GA10x) cards. fp8_e4m3 KV is
-#: NOT supported on sm86 — any hit forces kv-cache-dtype fp8_e5m2.
-_SM86_NAME_FRAGMENTS = (
-    "rtx 30",
-    "rtx30",
-    "a10",
-    "a16",
-    "a40",
-    "a2 ",
-    "rtx a2000",
-    "rtx a4000",
-    "rtx a4500",
-    "rtx a5000",
-    "rtx a5500",
-    "rtx a6000",
-)
+#: The compute capability whose cards cannot run fp8_e4m3 KV (Ampere GA10x).
+#: Any such card in the rig forces kv-cache-dtype fp8_e5m2.
+SM86 = (8, 6)
+
+
+class UnknownGpuArch(ValueError):
+    """The compute capability of a card could not be established.
+
+    HW-GENERIC 1002: the arch is decided from the compute capability -- an
+    explicit field on the descriptor (NVML ``nvmlDeviceGetCudaComputeCapability``
+    via ``registry.nvml.DeviceInfo`` / ``hardware.GpuDescriptor.cc``), else the
+    EXACT ``card_library.SEED_CARDS`` entry of the card's name. A name that is
+    in neither is UNKNOWN, by name -- never a substring guess ("a10" also
+    matches "A100", which is sm80)."""
+
+    def __init__(self, cards: Sequence[str]):
+        self.cards = tuple(cards)
+        super().__init__(
+            "HW-ARCH-UNKNOWN: compute capability not known for "
+            + ", ".join(repr(c) for c in self.cards)
+            + " (no cc/compute_capability field on the descriptor and no exact "
+            "card_library seed entry for the name). Read the inventory from NVML "
+            "(hardware_from_nvml carries the cc), or declare it ('NAME:MIB:sm86' / "
+            "a 'cc' field in --hardware-json)."
+        )
+
+    def __str__(self) -> str:  # a ValueError, not a KeyError: no repr quoting
+        return self.args[0] if self.args else ""
+
+
+def _parse_cc(value) -> Optional[Tuple[int, int]]:
+    """``(major, minor)`` from the spellings a descriptor may carry: a
+    ``(8, 6)`` pair, ``"8.6"`` / ``8.6``, ``"sm86"`` / ``"sm_86"`` /
+    ``"sm_120a"`` / ``86`` / ``120``. None when it is none of them."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (tuple, list)):
+        if len(value) != 2:
+            return None
+        try:
+            return (int(value[0]), int(value[1]))
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, float):
+        major = int(value)
+        return (major, int(round((value - major) * 10)))
+    if isinstance(value, int):
+        return divmod(int(value), 10) if value >= 10 else None
+    text = str(value).strip().lower()
+    m = re.fullmatch(r"(\d+)\.(\d)", text)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    m = re.fullmatch(r"(?:sm_?|compute_)?(\d{2,3})[af]?", text)
+    if m:
+        major, minor = divmod(int(m.group(1)), 10)
+        return (major, minor)
+    return None
+
+
+def _explicit_gpu_cc(g) -> Optional[Tuple[int, int]]:
+    """The compute capability a descriptor DECLARES (``cc``,
+    ``compute_capability``, ``cc_major``+``cc_minor`` or ``sm``), or None."""
+
+    def _get(key):
+        if isinstance(g, dict):
+            return g.get(key)
+        return getattr(g, key, None)
+
+    for key in ("cc", "compute_capability"):
+        cc = _parse_cc(_get(key))
+        if cc is not None:
+            return cc
+    major, minor = _get("cc_major"), _get("cc_minor")
+    if major is not None and minor is not None:
+        try:
+            return (int(major), int(minor))
+        except (TypeError, ValueError):
+            pass
+    return _parse_cc(_get("sm"))
+
+
+def gpu_cc(g) -> Optional[Tuple[int, int]]:
+    """The card's compute capability: the declared one, else the arch of the
+    card_library seed entry whose canonical name EQUALS this card's (vendor
+    words dropped, never a substring); None when neither answers."""
+    cc = _explicit_gpu_cc(g)
+    if cc is not None:
+        return cc
+    name = str((g.get("name") if isinstance(g, dict) else getattr(g, "name", "")) or "")
+    if not name.strip():
+        return None
+    try:
+        from sglang.srt.planner.card_library import seed_arch
+
+        return _parse_cc(seed_arch(name))
+    except Exception:  # noqa: BLE001 -- a broken catalogue is "unknown", not a guess
+        return None
+
+
+def rig_sm86_verdict(gpus: Sequence) -> Tuple[Optional[bool], Tuple[str, ...]]:
+    """``(has_sm86, unknown_cards)``: ``True`` when a card is KNOWN to be sm86,
+    ``False`` when every card's arch is known and none is, ``None`` when no
+    card is known sm86 but at least one card's arch is unknown (those are
+    named in ``unknown_cards``)."""
+    unknown: List[str] = []
+    for i, g in enumerate(gpus or ()):
+        cc = gpu_cc(g)
+        if cc is None:
+            name = str((g.get("name") if isinstance(g, dict) else getattr(g, "name", "")) or "")
+            unknown.append(name or f"gpu{i}")
+            continue
+        if tuple(cc) == SM86:
+            return True, tuple(unknown)
+    if unknown:
+        return None, tuple(unknown)
+    return False, ()
 
 
 def rig_has_sm86(gpus: Sequence) -> bool:
-    """True when any GPU in the rig is (or looks like) an sm86 card. Uses an
-    explicit ``sm`` / ``compute_capability`` field when present, else a
-    conservative name match (RTX 30xx / Ampere workstation cards)."""
-    for g in gpus or ():
-        if isinstance(g, dict):
-            sm = g.get("sm") or g.get("compute_capability")
-            name = str(g.get("name") or "")
-        else:
-            sm = getattr(g, "sm", None) or getattr(g, "compute_capability", None)
-            name = str(getattr(g, "name", "") or "")
-        if sm is not None:
-            try:
-                if int(float(str(sm).replace("sm_", "").replace("8.6", "86"))) == 86:
-                    return True
-                continue
-            except (TypeError, ValueError):
-                pass
-        low = name.lower()
-        if any(f in low for f in _SM86_NAME_FRAGMENTS):
-            return True
-    return False
+    """True when any GPU in the rig is an sm86 card, decided from the compute
+    capability (:func:`gpu_cc`). Raises :class:`UnknownGpuArch` when no card
+    is known sm86 and some card's arch is unknown -- the answer would be a
+    guess. Callers that can act on "unknown" use :func:`rig_sm86_verdict`."""
+    has, unknown = rig_sm86_verdict(gpus)
+    if has is None:
+        raise UnknownGpuArch(unknown)
+    return bool(has)
 
 
 # ===========================================================================
@@ -2017,12 +2107,14 @@ def _gpu_flops(g) -> float:
         if v:
             return float(v)
     try:
-        from sglang.srt.planner.card_library import SEED_CARDS
+        from sglang.srt.planner.card_library import seed_card
 
-        low = name.lower()
-        for p in SEED_CARDS.values():
-            if p.name.lower() in low or low in p.name.lower():
-                return float(p.peak_gemm_tflops_fp16 or 0.0)
+        # EXACT canonical name (HW-GENERIC 1002): the old two-way substring
+        # match gave every card whose name is contained in a seed name (an
+        # empty name, a synthetic "A") that seed card's peak.
+        p = seed_card(name)
+        if p is not None:
+            return float(p.peak_gemm_tflops_fp16 or 0.0)
     except Exception:
         pass
     return 0.0
@@ -2622,7 +2714,7 @@ def _seam_shrink_planner_default(
 # (the 5090, most free VRAM) owns the LARGEST KV share (33) and the biggest
 # reserve (3000); ranks 1/2 are the two 3080s. The NVML/nvidia-smi inventory
 # order ([3080, 5090, 3080] on that box) has NO bearing on rank order, which
-# is why the gate below matches the rig by NAME MULTISET, order-insensitive:
+# is why the gate below matches the rig by CLASS MULTISET, order-insensitive:
 # any listing order of exactly one 5090 + two 3080s is the same physical rig
 # and gets the same rank-space vectors. Any other rig gets no calibration
 # (the caller falls back to a derived estimate and says so) -- never remap
@@ -2637,52 +2729,77 @@ def _seam_shrink_planner_default(
 # twice the memory, which is a boot-time OOM rather than a calibration.
 # ---------------------------------------------------------------------------
 
-#: NVML totals (MiB) of the calibrated rig, in the same NAME order the gate
-#: counts: the 5090 first, then the two 20 GB 3080s.
-_CALIBRATED_RIG_TOTALS_MIB = {"5090": 32607, "3080": 20480}
+# The calibrated rig as a MULTISET of calibration classes
+# (``weg2.card_identity.REFERENCE_INVENTORY``: one ``RTX5090`` + two
+# ``RTX3080``). Class membership is ``card_identity.calibration_class``: model
+# name EXACT (vendor words dropped -- "RTX 5090 D" is not "RTX 5090"), compute
+# capability exact when the descriptor declares one, and the VRAM tier within
+# ``card_identity.TOTAL_TOLERANCE`` of the measured NVML total (32607 / 20480).
+# This gate is DELIBERATE: the vectors exist for the reference rig only, every
+# other inventory gets None and the derived estimate (HW-GENERIC 1002).
+def _calibrated_rig_classes() -> Dict[str, int]:
+    from sglang.srt.weg2.card_identity import REFERENCE_INVENTORY
+
+    out: Dict[str, int] = {}
+    for label in REFERENCE_INVENTORY:
+        out[label] = out.get(label, 0) + 1
+    return out
+
 
 #: How far a card's NVML total may sit from the calibrated one and still count
 #: as the same card. NVML totals of nominally identical cards differ by a few
 #: MiB (ECC state, driver version, vBIOS), so an exact match would reject the
 #: reference rig itself on a driver upgrade; a whole VRAM tier is far outside
-#: this band (10240 vs 20480 is 100 % away).
+#: this band (10240 vs 20480 is 100 % away). The band card_identity applies
+#: (``TOTAL_TOLERANCE``) is the same 5 %; kept here as the documented name.
 _CALIBRATED_RIG_TOTAL_TOLERANCE = 0.05
+
+
+def _calibration_props(g):
+    """The ``card_identity.CardProps`` of a planner card (dict or
+    descriptor), with the compute capability the descriptor DECLARES (any of
+    the spellings :func:`_explicit_gpu_cc` reads) -- never one looked up by
+    name, so a card without a declared cc is matched on model + VRAM tier."""
+    from sglang.srt.weg2.card_identity import CardProps
+
+    if isinstance(g, dict):
+        name, total, idx = g.get("name"), g.get("total_mib"), g.get("index")
+        uuid = g.get("uuid")
+    else:
+        name = getattr(g, "name", "")
+        total = getattr(g, "total_mib", 0)
+        idx = getattr(g, "index", None)
+        uuid = getattr(g, "uuid", None)
+    return CardProps(
+        nvml_index=int(idx) if idx is not None else -1,
+        uuid=str(uuid or ""),
+        name=str(name or ""),
+        total_mib=int(total or 0),
+        cc=_explicit_gpu_cc(g),
+    )
 
 
 def _match_calibration(gpus: Sequence, quant: Optional[str]) -> Optional[dict]:
     """A measured calibration for this exact rig shape + checkpoint quant, or
     None (callers must then fall back to a derived estimate AND say so).
 
-    The gate is ORDER-INSENSITIVE (exact name multiset: one 5090 + two
-    3080s): inventory listing order is NVML/detect order, while the vectors
-    are rank-space (cuda order) -- see the block comment above. It is also
-    TOTAL-SENSITIVE: a card whose NVML total is a different VRAM tier from
-    the calibrated one is a different card for budget purposes, whatever its
-    model name says."""
-    names = [n.lower() for n in _gpu_names(gpus)]
-    totals = _gpu_totals(gpus)
+    The gate is ORDER-INSENSITIVE (multiset of calibration classes: one
+    ``RTX5090`` + two ``RTX3080``): inventory listing order is NVML/detect
+    order, while the vectors are rank-space (cuda order) -- see the block
+    comment above. It is also TOTAL-SENSITIVE: a card whose NVML total is a
+    different VRAM tier from the calibrated one is not in the class
+    (``card_identity.calibration_class``), whatever its model name says; a card
+    without a total (manual/offline spec) is in no class -- refused, not
+    assumed."""
+    from sglang.srt.weg2.card_identity import calibration_class
 
-    def _totals_match() -> bool:
-        if len(totals) != len(names):
-            return False
-        for name, total in zip(names, totals):
-            for key, want in _CALIBRATED_RIG_TOTALS_MIB.items():
-                if key in name:
-                    if not total:
-                        # No total to check against: the inventory is a manual
-                        # or offline spec. Refuse rather than assume -- the
-                        # whole point of the check is not to guess a budget.
-                        return False
-                    if abs(total - want) > want * _CALIBRATED_RIG_TOTAL_TOLERANCE:
-                        return False
-        return True
-
-    if (
-        len(names) == 3
-        and sum(1 for n in names if "5090" in n) == 1
-        and sum(1 for n in names if "3080" in n) == 2
-        and _totals_match()
-    ):
+    classes: Dict[str, int] = {}
+    for g in gpus or ():
+        label = calibration_class(_calibration_props(g))
+        if label is None:
+            return None
+        classes[label] = classes.get(label, 0) + 1
+    if classes == _calibrated_rig_classes():
         if quant == "fp8":
             return {
                 "tokvec": [33, 13, 18],
@@ -2909,7 +3026,11 @@ def profiles(
     heterogeneous = len(set(totals)) > 1
     hybrid = model_is_hybrid(model_cfg)
     quant = model_quant_kind(model_cfg)
-    sm86 = rig_has_sm86(gpus)
+    # HW-GENERIC 1002: decided from the compute capability. An UNKNOWN arch
+    # is not "no sm86": it takes the dtype every supported arch runs (e5m2)
+    # and the preset says why, by card name.
+    sm86_verdict, arch_unknown = rig_sm86_verdict(gpus)
+    sm86 = sm86_verdict is True
     cat = catalog()
     # first (best-ranked) matching local draft model, for checkpoints WITHOUT
     # their own MTP head (find_draft_models output; EAGLE3 candidates first).
@@ -3041,16 +3162,30 @@ def profiles(
         # card is in the rig; e4m3 only on an sm86-free rig.
         cur = s.get("kv_cache_dtype")
         if cur in (None, "auto"):
-            s["kv_cache_dtype"] = "fp8_e5m2" if sm86 else "fp8_e4m3"
-            info.append(
-                "KV cache dtype "
-                + s["kv_cache_dtype"]
-                + (
+            s["kv_cache_dtype"] = (
+                "fp8_e5m2" if (sm86 or sm86_verdict is None) else "fp8_e4m3"
+            )
+            if sm86:
+                why = (
                     " (sm86/RTX-3080-class card present: e4m3 KV is "
                     "unsupported on sm86)."
-                    if sm86
-                    else " (no sm86 card detected)."
                 )
+            elif sm86_verdict is None:
+                why = (
+                    " (compute capability UNKNOWN for "
+                    + ", ".join(repr(n) for n in arch_unknown)
+                    + ": e5m2 runs on every supported arch, e4m3 not on "
+                    "sm86 -- declare the cc to allow e4m3)."
+                )
+            else:
+                why = " (no sm86 card detected)."
+            info.append("KV cache dtype " + s["kv_cache_dtype"] + why)
+        elif sm86_verdict is None and cur == "fp8_e4m3":
+            info.append(
+                "kv-cache-dtype fp8_e4m3 kept as given, but the compute "
+                "capability of "
+                + ", ".join(repr(n) for n in arch_unknown)
+                + " is UNKNOWN: e4m3 KV does not run on an sm86 card."
             )
         elif sm86 and cur == "fp8_e4m3":
             s["kv_cache_dtype"] = "fp8_e5m2"
