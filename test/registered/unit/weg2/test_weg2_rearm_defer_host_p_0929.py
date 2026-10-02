@@ -171,7 +171,10 @@ def test_rows_issue_at_start_and_the_first_extend_waits_them(ops):
     fill.start(why="behind the rearm, before the next forward")
     assert len(ops.events) == 1 and ops.waited == []  # issued, nobody waited
     assert c._deferred_rows is not None
-    eo.deferred_rows_tick(_extend())  # P's first forward: an extend
+    # FLIPCYCLE H2 (02.10.): the whole-forward wait is the switch-off form;
+    # per layer it is test_weg2_flipcycle_rearm_per_layer_1002
+    with envs.SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER.override(False):
+        eo.deferred_rows_tick(_extend())  # P's first forward: an extend
     assert ops.waited == ops.events  # stream wait, no host wait
     assert c._deferred_rows is None and not fill.pending
     assert _rows_digest(c) == _rows_digest(_serial())
@@ -199,7 +202,8 @@ def test_a_pool_layer_under_host_mode_lands_at_the_first_extend(ops):
     c = _cache(pool=True)
     c.rearm_after_wake(defer=HOST)
     eo.deferred_rows_fill().start()
-    eo.deferred_rows_tick(_extend())
+    with envs.SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER.override(False):
+        eo.deferred_rows_tick(_extend())
     assert c._deferred_rows is None and not eo.deferred_rows_fill().pending
     ref = _serial(pool=True)
     assert _rows_digest(c) == _rows_digest(ref)
