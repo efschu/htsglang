@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""L3-INDEX PRICE (02.10.): the X credit of an arrival is the page-granular
+"""L3-INDEX / L2-ARENA PRICE (02.10.): the X credit of an arrival is the page-granular
 STORE prefix of its exact token ids -- asked with the key P and D read with.
 
 METAL, boot y7d (9bdfe50185, front log ..._1002_085437.front.log):
@@ -35,11 +35,16 @@ The stems carry the store's GROUP-WIDE suffix (``L3_SUFFIXES.<group>.json``,
 the suffix every group of the shared-key store scans: geometry-neutral KV,
 mamba and QSA pages, #706). No common suffix = no shared-key store = no credit.
 
-WHAT IS NOT CREDITED: a page only in the L2 arena and not yet in L3 (the
-write-behind copies L2 to L3 every 2 s; P's sleep flush publishes before the
-flip). Under-crediting costs a P leg; over-crediting costs the request and
-every decode a reroute parks -- the reader stats/opens, never trusts the index,
-and D's X gate stays the backstop.
+L2 TOO (L2-ARENA PRICE, 02.10., law "L2/L3 are shared, no context only on D
+or P"): a page COMPLETE in any shared host arena under the arena dir counts
+like an L3 one -- the union ``batch_exists_v2`` reads, arena first. The L3
+write-behind lags L2 by minutes on metal (27B N4a 'L3-REUSE WRITE-BEHIND ...
+deferred=86750'), so an in-boot prefix is often L2-only when priced. The
+depth names the tier it needs (``l2_arena`` when L3 alone proves less).
+
+Over-crediting costs the request and every decode a reroute parks -- the
+reader still finds an evicted page missing, and D's X gate stays the
+backstop; under-crediting costs a P leg.
 """
 
 from __future__ import annotations
@@ -71,7 +76,11 @@ class Depth(msgspec.Struct, frozen=True):
     kv_pages: int
     pages: int
     ms: float
-
+    #: the tier the depth needs: "l3_index" when L3 alone proves it, else
+    #: "l2_arena" (pages / anchor COMPLETE only in the shared host arena)
+    tier: str = "none"
+    #: the depth L3 alone proves (pages)
+    l3_pages: int = 0
 
 def shared_suffix(store_dir: str) -> Tuple[Optional[str], str]:
     """The suffix every group of the shared-key store scans (the group-wide,
@@ -137,11 +146,21 @@ def bigram_page_hasher(ids: np.ndarray, page_size: int, bigram: bool) -> List[st
 
 
 class StorePresence:
-    """The page-granular store depth of a token sequence (see the module note)."""
+    """The page-granular store depth of a token sequence (see the module note).
+
+    TWO TIERS, ONE QUESTION (L2-ARENA PRICE, 02.10., law "L2/L3 are shared"):
+    a page is present when its stem is COMPLETE in any shared host arena
+    under ``arena_dir`` (L2, ``arena_find_stems``) or listed by the L3 stem
+    index -- exactly the union ``batch_exists_v2`` reads (arena first, disk
+    for the rest). The L3 write-behind lags L2 by minutes on metal (27B N4a
+    'L3-REUSE WRITE-BEHIND ... deferred=86750'), so an in-boot prefix is
+    often L2-only when it is priced. Both tiers are JOINED, never created:
+    an arena or index that does not exist yet is looked for again later."""
 
     def __init__(self, index, suffix: str, page_size: int, bigram: bool,
                  all_pages: Sequence[str] = (), trailing: Sequence[str] = (),
-                 hasher: Callable[[np.ndarray, int, bool], List[str]] = bigram_page_hasher):
+                 hasher: Callable[[np.ndarray, int, bool], List[str]] = bigram_page_hasher,
+                 arena_dir: str = "", index_path: str = ""):
         self.index = index
         self.suffix = str(suffix)
         self.page_size = max(1, int(page_size))
@@ -149,43 +168,100 @@ class StorePresence:
         self.all_pages = tuple(sorted(all_pages))
         self.trailing = tuple(sorted(trailing))
         self.hasher = hasher
+        self.arena_dir = str(arena_dir or "")
+        self.index_path = str(index_path or "")
+        self.arenas: Dict[str, object] = {}
 
     def describe(self) -> str:
         return (f"suffix={self.suffix} page={self.page_size} bigram={int(self.bigram)} "
-                f"all_pages={list(self.all_pages)} trailing={list(self.trailing)}")
+                f"all_pages={list(self.all_pages)} trailing={list(self.trailing)} "
+                f"l3_index={'joined' if self.index is not None else 'absent'} "
+                f"l2_arenas={len(self.arenas)} arena_dir={self.arena_dir or '-'}")
+
+    # -- the two tiers --------------------------------------------------------
+    def _rejoin(self) -> None:
+        """Join the tiers that appeared since (arenas are created lazily, per
+        page width, by the first rank that uses one). One glob of the arena
+        dir per probe; a failed join is a failed open(2), nothing more."""
+        if self.index is None and self.index_path:
+            try:
+                from sglang.srt.mem_cache.storage.file.l3_index import L3Index
+
+                self.index = L3Index(self.index_path, create=False)
+            except Exception:  # noqa: BLE001 -- not there yet: asked again later
+                self.index = None
+        if not self.arena_dir:
+            return
+        for path in sorted(glob.glob(os.path.join(self.arena_dir, "arena-*.bin"))):
+            if path in self.arenas:
+                continue
+            try:
+                from sglang.srt.mem_cache.storage.file.hicache_arena import ArenaView
+
+                self.arenas[path] = ArenaView(path)
+            except Exception:  # noqa: BLE001 -- not initialised yet: asked again later
+                continue
+
+    def _ask(self, stems: List[str], memo: Dict[str, Tuple[bool, bool]]) -> None:
+        """(in L3, COMPLETE in L2) per stem into ``memo``."""
+        todo = [s for s in stems if s not in memo]
+        if not todo:
+            return
+        l3 = self.index.has(todo) if self.index is not None else [False] * len(todo)
+        l2 = [False] * len(todo)
+        for arena in self.arenas.values():
+            for i, st in enumerate(arena.find_states(todo)):
+                if st == 2:
+                    l2[i] = True
+        for s, a, b in zip(todo, l3, l2):
+            memo[s] = (bool(a), bool(b))
 
     def _stem(self, h: str, comp: Optional[str]) -> str:
         return f"{h}{self.suffix}" if comp is None else f"{h}.{comp}{self.suffix}"
 
-    def _leading(self, hashes: Sequence[str], comp: Optional[str]) -> int:
+    def _leading(self, hashes: Sequence[str], comp: Optional[str], memo, tiers) -> int:
         n = 0
         for off in range(0, len(hashes), CHUNK):
-            got = self.index.has([self._stem(h, comp) for h in hashes[off:off + CHUNK]])
-            hit = next((i for i, p in enumerate(got) if not p), len(got))
+            stems = [self._stem(h, comp) for h in hashes[off:off + CHUNK]]
+            self._ask(stems, memo)
+            hit = next((i for i, s in enumerate(stems) if not any(memo[s][t] for t in tiers)),
+                       len(stems))
             n += hit
-            if hit < len(got):
+            if hit < len(stems):
                 break
         return n
+
+    def _pages(self, hashes: Sequence[str], memo, tiers) -> Tuple[int, int]:
+        """(anchored pages, leading KV pages) over the tiers ``tiers``
+        (0 = L3, 1 = L2): the KV run, cut by every all-pages pool, ended at
+        the deepest page carrying every trailing pool's blob."""
+        kv = self._leading(hashes, None, memo, tiers)
+        pages = kv
+        for comp in self.all_pages:
+            if pages <= 0:
+                break
+            pages = min(pages, self._leading(hashes[:pages], comp, memo, tiers))
+        for comp in self.trailing:
+            if pages <= 0:
+                break
+            stems = [self._stem(h, comp) for h in hashes[:pages]]
+            self._ask(stems, memo)
+            pages = 1 + max((i for i, s in enumerate(stems) if any(memo[s][t] for t in tiers)),
+                            default=-1)
+        return pages, kv
 
     def depth(self, ids: Optional[np.ndarray]) -> Depth:
         t0 = time.perf_counter()
         if ids is None or ids.size == 0:
             return Depth(tokens=0, kv_pages=0, pages=0, ms=0.0)
+        self._rejoin()
         hashes = self.hasher(ids, self.page_size, self.bigram)
-        kv = self._leading(hashes, None)
-        pages = kv
-        for comp in self.all_pages:
-            if pages <= 0:
-                break
-            pages = min(pages, self._leading(hashes[:pages], comp))
-        for comp in self.trailing:
-            if pages <= 0:
-                break
-            got = self.index.has([self._stem(h, comp) for h in hashes[:pages]])
-            last = max((i for i, p in enumerate(got) if p), default=-1)
-            pages = last + 1
+        memo: Dict[str, Tuple[bool, bool]] = {}
+        pages, kv = self._pages(hashes, memo, (0, 1))
+        l3_pages = self._pages(hashes[:pages], memo, (0,))[0] if pages > 0 else 0
+        tier = "none" if pages <= 0 else ("l3_index" if l3_pages >= pages else "l2_arena")
         return Depth(tokens=int(pages) * self.page_size, kv_pages=int(kv), pages=int(pages),
-                     ms=(time.perf_counter() - t0) * 1000.0)
+                     ms=(time.perf_counter() - t0) * 1000.0, tier=tier, l3_pages=int(l3_pages))
 
 
 def l3_index_path(arena_dir: str) -> str:
@@ -195,29 +271,25 @@ def l3_index_path(arena_dir: str) -> str:
 
 def open_store_presence(store_dir: str, arena_dir: str, page_size: int, bigram: bool,
                         hybrid: bool) -> Tuple[Optional[StorePresence], str]:
-    """``(probe, provenance)`` or ``(None, why)``. Joins the EXISTING index the
-    ranks opened (never creates it: the creator seeds it from the snapshot)."""
+    """``(probe, provenance)`` or ``(None, why)``. JOINS the L3 index and the
+    host arenas the ranks created (never creates either: the index creator
+    seeds it from the snapshot, an arena's creator sets its geometry); a tier
+    not there yet is joined when it appears."""
     if not store_dir or not os.path.isdir(store_dir):
         return None, f"no store directory ({store_dir!r})"
     if not arena_dir:
-        return None, "no arena dir (SGLANG_HICACHE_ARENA_DIR empty): no shared L3 index"
+        return None, "no arena dir (SGLANG_HICACHE_ARENA_DIR empty): no shared L2/L3 index"
     suffix, why = shared_suffix(store_dir)
     if suffix is None:
         return None, why
-    path = l3_index_path(arena_dir)
-    try:
-        from sglang.srt.mem_cache.storage.file.l3_index import L3Index
-
-        index = L3Index(path, create=False)
-    except FileNotFoundError:
-        return None, f"no L3 index at {path} yet (no rank opened it)"
-    except Exception as e:  # noqa: BLE001 -- no index, no credit, named
-        return None, f"L3 index {path} n/a ({type(e).__name__}: {e})"
     comps = store_components(store_dir, suffix)
     trailing = sorted(c for c in comps if c in TRAILING_COMPONENTS)
     if hybrid and "mamba" not in trailing:
         trailing.append("mamba")  # a hybrid group resumes only at an anchor
     all_pages = sorted(c for c in comps
                        if c not in TRAILING_COMPONENTS and not c.startswith(PRESENCE_ONLY_PREFIX))
-    probe = StorePresence(index, suffix, page_size, bigram, all_pages=all_pages, trailing=trailing)
-    return probe, f"index={path} entries={index.count()} {why} {probe.describe()}"
+    probe = StorePresence(None, suffix, page_size, bigram, all_pages=all_pages, trailing=trailing,
+                          arena_dir=arena_dir, index_path=l3_index_path(arena_dir))
+    probe._rejoin()
+    entries = probe.index.count() if probe.index is not None else 0
+    return probe, f"index={probe.index_path} entries={entries} {why} {probe.describe()}"

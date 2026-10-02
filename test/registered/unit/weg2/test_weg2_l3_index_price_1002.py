@@ -167,8 +167,10 @@ def test_the_front_never_creates_the_index(tmp_path):
         json.dump({"suffixes": [SFX]}, f)
     arena = os.path.join(str(tmp_path), "weg2-arena-x")
     probe, why = FS.open_store_presence(d, arena, PAGE, True, True)
-    assert probe is None and "no L3 index" in why
-    assert not os.path.exists(FS.l3_index_path(arena))
+    assert probe is not None and probe.index is None and "l3_index=absent" in why
+    assert probe.depth(_ids(3000)).tokens == 0
+    assert not os.path.exists(FS.l3_index_path(arena)), "joined only, never created"
+    assert not os.path.exists(arena)
 
 
 def test_no_shared_suffix_no_credit(tmp_path):
@@ -228,7 +230,8 @@ def test_front_prices_a_boot_start_request_short_on_the_l3_prefix(store, caplog)
     assert xx.pending <= X, "SHORT"
     assert any(m.startswith("WEG2 X-EXACT-PRICE rid=weg2-0-2 pending=24 tokens=111256 credit=111232 "
                             "src=l3_index") for m in caplog.messages)
-    assert any("WEG2 L3-INDEX-PRESENCE rid=weg2-0-2 depth=111232" in m for m in caplog.messages)
+    assert any("WEG2 L3-INDEX-PRESENCE rid=weg2-0-2 tier=l3_index depth=111232" in m
+               for m in caplog.messages)
     assert f.counters["l3_index_credit"] == 1
 
 
@@ -279,9 +282,9 @@ def test_wiring():
     import inspect
 
     src = inspect.getsource(F.Front._x_exact_price)
-    i = src.index("l3 = await self._store_probe_depth(")
+    i = src.index("l3, tier = await self._store_probe_depth(")
     assert i < src.index("pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)")
-    assert 'self.tspans.record_store_depth(c.ids, l3, source="l3_index")' in src
+    assert 'self.tspans.record_store_depth(c.ids, l3, source=tier)' in src
     assert "await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)" \
         in inspect.getsource(F.Front._x_exact_boot_load)
     assert '"l3_index": int(self.counters["l3_index_credit"])' in inspect.getsource(F.Front.state_dict)
@@ -412,3 +415,112 @@ def test_the_launcher_no_longer_declares_the_carrier_route():
     assert "CARRIER-EXCEEDS, no leg 1" not in block
     assert "is served by ONE prefill on D" not in block
     assert "every BATCH prompt takes P's leg 1" in block
+
+
+# ---- L2-ARENA PRICE: pages COMPLETE only in the shared host arena -----------------------
+
+SLOT = 64
+
+
+def _arena(store, width=SLOT, slots=16384):
+    """The shared host arena a rank creates (one file per page width)."""
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+
+    os.makedirs(store.arena, exist_ok=True)
+    return ShmArena(os.path.join(store.arena, f"arena-{width}.bin"), width, slots)
+
+
+def _complete(arena, stems):
+    import ctypes
+
+    buf = (ctypes.c_char * SLOT)()
+    st = arena.write(list(stems), [SLOT] * len(stems), [((0, SLOT),)] * len(stems),
+                     [ctypes.addressof(buf)] * len(stems))
+    assert set(st) <= {1, 2}, st
+
+
+def _l2_write(store, arena, hashes, kv=None, mamba=()):
+    kv = range(len(hashes)) if kv is None else kv
+    _complete(arena, [f"{hashes[i]}{SFX}" for i in kv])
+    _complete(arena, [f"{hashes[i]}.qsa_indexer{SFX}" for i in kv])
+    _complete(arena, [f"{hashes[i]}.mamba{SFX}" for i in mamba])
+
+
+def test_y7d_weg2_2_19_an_l2_only_in_boot_page_prefix_is_priced_short(store, caplog):
+    """y7d 09:01:20 weg2-2-19: 'X-EXACT-PRICE pending=30076 credit=0 src=none',
+    LONG, flip pair, P hit 30016 of 30076. The longer request's pages were
+    written this boot; the L3 write-behind lags L2 by minutes (27B N4a
+    'deferred=86750'), so at pricing time they are COMPLETE in the shared
+    host arena only. Credited from L2 -- SHORT, src=l2_arena."""
+    caplog.set_level(logging.INFO)
+    probe = store.probe()  # boot start: the arena does not exist yet
+    arena = _arena(store)  # a rank creates it later, lazily
+    longer = _ids(52000, seed=3)
+    h = _tree_page_hashes(longer)
+    _l2_write(store, arena, h, mamba=[468, len(h) - 1])
+    cur = np.concatenate([longer[:30040], _ids(36, seed=9)])
+    d = probe.depth(cur)
+    assert (d.tokens, d.tier, d.l3_pages) == (30016, "l2_arena", 0)
+    f = _front(probe, cur)
+    xx = asyncio.run(f._x_exact_price("weg2-2-19", "/v1/messages", {"m": 1}, "2-19", 30076, 30076))
+    assert (xx.pending, xx.credit, xx.src) == (60, 30016, "l2_arena") and xx.pending <= X
+    msgs = caplog.messages
+    assert any(m.startswith("WEG2 X-EXACT-PRICE rid=weg2-2-19 pending=60 tokens=30076 credit=30016 "
+                            "src=l2_arena") for m in msgs)
+    assert any("WEG2 L3-INDEX-PRESENCE rid=weg2-2-19 tier=l2_arena depth=30016" in m for m in msgs)
+    assert f.counters["l2_arena_credit"] == 1
+
+
+def test_the_two_tiers_are_one_union_per_page(store):
+    """KV pages 0..299 already in L3, 300.. only in L2, the anchor only in L2:
+    the run is the union (what batch_exists_v2 reads, arena first); L3 alone
+    proves 200 pages (its own anchor), so the depth needs L2."""
+    arena = _arena(store)
+    p = _ids(30000, seed=11)
+    h = _tree_page_hashes(p)
+    store.write(h[:300], mamba=[199])
+    _l2_write(store, arena, h, kv=range(300, len(h)), mamba=[400])
+    d = store.probe().depth(p)
+    assert (d.pages, d.l3_pages, d.tier) == (401, 200, "l2_arena")
+    _complete(arena, [f"{h[i]}.mamba{SFX}" for i in (199,)])  # already in L3: no change
+    assert store.probe().depth(p).tier == "l2_arena"
+
+
+def test_an_l3_proven_depth_is_named_l3_index(store):
+    arena = _arena(store)
+    p = _ids(9000, seed=12)
+    h = _tree_page_hashes(p)
+    store.write(h, mamba=[len(h) - 1])
+    _l2_write(store, arena, h[:50], mamba=[49])  # L2 holds a shallower copy
+    d = store.probe().depth(p)
+    assert (d.pages, d.tier) == (len(h), "l3_index")
+
+
+def test_a_claimed_not_complete_l2_page_is_no_credit(store):
+    import ctypes
+
+    arena = _arena(store)
+    p = _ids(5000, seed=13)
+    h = _tree_page_hashes(p)
+    _l2_write(store, arena, h, kv=range(10), mamba=[9])
+    stem = f"{h[10]}{SFX}"
+    rows = arena.claim_slots([stem], [SLOT])  # a writer claimed page 10, bytes not landed
+    assert rows and rows[0][1] == 0
+    _complete(arena, [f"{h[i]}{SFX}" for i in range(11, len(h))])
+    _complete(arena, [f"{h[i]}.qsa_indexer{SFX}" for i in range(10, len(h))])
+    _complete(arena, [f"{h[len(h) - 1]}.mamba{SFX}"])
+    assert store.probe().depth(p).pages == 10, "CLAIMED is not COMPLETE: the run stops at 10"
+    del ctypes
+
+
+def test_the_arena_view_never_creates_or_initialises(tmp_path):
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ArenaView
+
+    path = str(tmp_path / "arena-64.bin")
+    with pytest.raises(FileNotFoundError):
+        ArenaView(path)
+    assert not os.path.exists(path)
+    open(path, "wb").close()  # a rank between create and init
+    with pytest.raises(RuntimeError):
+        ArenaView(path)
+    assert os.path.getsize(path) == 0, "untouched"
