@@ -1635,6 +1635,14 @@ class HiCacheController:
         never on isinstance against the base class, which saw none of them
         and terminated nothing on the serving path (review round 4, B1).
         """
+        ops = self._inflight_prefetch_ops()
+        for op in ops:
+            op.mark_terminate()
+        return len(ops)
+
+    def _inflight_prefetch_ops(self) -> list:
+        """The distinct prefetch operations ``_terminate_inflight_prefetch``
+        terminates (its four places, read without dequeuing)."""
         seen: dict[int, object] = {}
 
         def take(op) -> None:
@@ -1658,9 +1666,135 @@ class HiCacheController:
         take(getattr(self, "_prefetch_io_current", None))
         for op in list((getattr(self, "_prefetch_io_inflight", None) or {}).values()):
             take(op)  # WAKE-PARALLEL: every aux thread's operation
-        for op in seen.values():
-            op.mark_terminate()
-        return len(seen)
+        return list(seen.values())
+
+    # ------------------------------------------------------------------
+    # PARK-READ-DETACH (02.10., L15 boot dac8b62b8c D 14:43:49-51): the sleep
+    # flush's reset joined the store probe of the PARKED weg2-6-6 (133k keys,
+    # one batch_exists_v2 over the span, no batch boundary inside) --
+    # '#1068 RESET JOIN terminated_ops=1 joined_s=1.29' (TP0) / 0.94 (TP1),
+    # 'WEG2-SLEEP-SUB alloc_clear=1414', D flush_cache 1820 of the flip's
+    # drain+quiesce 1866 ms. The read is terminated as before, but its thread
+    # is joined by a reaper in the background, which also restarts the
+    # pipeline; the flush goes on at once.
+    #
+    # Only while nothing can collide: every in-flight operation belongs to a
+    # parked request (the scheduler names them, PDFLIP-A's exempt set), no
+    # store->host page transfer is in flight (the prefetch thread's probe is
+    # the only thing left: it reads the store, never a host page -- a
+    # terminated operation pins nothing, #257, and transfers nothing, #1068),
+    # and after a short grace join only the prefetch thread is still alive.
+    # Until the reaper is done: the storage-control drains of the radix caches
+    # skip their round (a release the old thread queues names slots the reset
+    # just freed -- it is discarded with the queue at the restart, never freed
+    # into a reallocated slot), and prefetch()/write_storage()/a second stop
+    # wait for it (an operation queued into the old pipeline would be drained
+    # terminated and its revoke lost). Switch SGLANG_WEG2_PARK_READ_DETACH.
+    # ------------------------------------------------------------------
+
+    #: grace of the short join before the reset decides to detach (per thread)
+    PARK_READ_DETACH_GRACE_S = 0.05
+
+    def weg2_reset_reaper_alive(self) -> bool:
+        r = getattr(self, "_weg2_reset_reaper", None)
+        return r is not None and r.is_alive()
+
+    def weg2_await_reset_reaper(self, why: str) -> None:
+        """Wait for a detached reset's reaper (bounded); a no-op otherwise."""
+        r = getattr(self, "_weg2_reset_reaper", None)
+        if r is None or not r.is_alive() or r is threading.current_thread():
+            return
+        t0 = time.monotonic()
+        r.join(timeout=STORAGE_THREAD_JOIN_BOUND_S + 1.0)
+        logger.info("#1068 PARK-READ-DETACH await why=%s waited_ms=%.0f alive=%s",
+                    why, (time.monotonic() - t0) * 1000.0, r.is_alive())
+
+    def _weg2_park_read_detach_rids(self):
+        """The parked rids whose open reads may be detached, or None (join as before)."""
+        try:
+            from sglang.srt.environ import envs as _envs
+
+            if not _envs.SGLANG_WEG2_PARK_READ_DETACH.get():
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        rids = getattr(self, "_weg2_reset_detach_rids", None)
+        if not rids or not getattr(self, "enable_storage", False):
+            return None
+        ops = self._inflight_prefetch_ops()
+        if not ops or any(str(getattr(o, "request_id", "")) not in rids for o in ops):
+            return None
+        if getattr(self, "_prefetch_io_inflight", None) or getattr(self, "_prefetch_io_current", None) is not None:
+            return None
+        buf = getattr(self, "prefetch_buffer", None)
+        if buf is not None and not buf.empty():
+            return None
+        return frozenset(str(getattr(o, "request_id", "")) for o in ops)
+
+    def _weg2_stop_storage_threads_detached(self, rids) -> Optional[StorageStopResult]:
+        """PARK-READ-DETACH: stop + terminate as ``_stop_storage_threads`` does,
+        short grace joins, then hand the still-running prefetch thread to a
+        reaper. None = not detachable after all; the caller then joins as before
+        (the stop event is set and the operations terminated -- the regular
+        helper repeats both idempotently)."""
+        t0 = time.monotonic()
+        self.storage_stop_event.set()
+        terminated_ops = self._terminate_inflight_prefetch()
+        try:
+            self.prefetch_queue.put_nowait(None)
+            self.backup_queue.put_nowait(None)
+            for _ in range(max(1, len(getattr(self, "prefetch_io_aux_threads", None) or ()))):
+                self.prefetch_buffer.put_nowait(None)
+        except Exception:  # noqa: BLE001
+            pass
+        threads = []
+        if hasattr(self, "prefetch_thread"):
+            threads.append(("prefetch", self.prefetch_thread))
+        if hasattr(self, "backup_thread"):
+            threads.append(("backup", self.backup_thread))
+        for _k, _t in enumerate(list(getattr(self, "prefetch_io_aux_threads", None) or ())):
+            threads.append(("prefetch_io_aux" if _k == 0 else f"prefetch_io_aux{_k}", _t))
+        for role, t in threads:
+            if role != "prefetch":
+                t.join(timeout=self.PARK_READ_DETACH_GRACE_S)
+        if hasattr(self, "prefetch_thread"):
+            self.prefetch_thread.join(timeout=self.PARK_READ_DETACH_GRACE_S)
+        alive = [role for role, t in threads if t.is_alive()]
+        if not alive:
+            return StorageStopResult([r for r, _ in threads], terminated_ops,
+                                     self._prefetch_drained_after_stop + self._prefetch_io_drained_after_stop,
+                                     time.monotonic() - t0)
+        if alive != ["prefetch"] or getattr(self, "_prefetch_io_inflight", None):
+            return None
+        old = self.prefetch_thread
+        t_detach = time.monotonic()
+
+        def _reap() -> None:
+            old.join(timeout=STORAGE_THREAD_JOIN_BOUND_S)
+            if old.is_alive():
+                self._stop_group_from_thread(RuntimeError(
+                    "#1068 PARK-READ-DETACH: the detached prefetch thread is still alive %.1f s after "
+                    "the stop (rids=%s) -- a torn storage pipeline" % (STORAGE_THREAD_JOIN_BOUND_S, sorted(rids))))
+                return
+            # the old pipeline's control queues: whatever the old thread queued names
+            # slots of the cleared pool (never freed into a reallocated slot)
+            for q in [getattr(self, "host_mem_release_queue", None), getattr(self, "prefetch_revoke_queue", None)] + \
+                    list((getattr(self, "extra_host_mem_release_queues", None) or {}).values()):
+                if q is not None:
+                    with q.mutex:
+                        q.queue.clear()
+            self.storage_stop_event.clear()
+            if self.enable_storage:
+                self.prefetch_tokens_occupied = 0
+                self._start_storage_threads()
+            logger.info("#1068 PARK-READ-DETACH reaped rids=%s joined_bg_s=%.2f (the detached store probe "
+                        "ended; pipeline restarted off the flush)", sorted(r[:12] for r in rids),
+                        time.monotonic() - t_detach)
+
+        self._weg2_reset_reaper = threading.Thread(target=_reap, daemon=True, name="hicache-reset-reaper")
+        self._weg2_reset_reaper.start()
+        self.counters_park_read_detach = getattr(self, "counters_park_read_detach", 0) + 1
+        return StorageStopResult([r for r, _ in threads], terminated_ops, 0, time.monotonic() - t0)
 
     def _stop_storage_threads(self) -> StorageStopResult:
         """Stop the storage prefetch/backup/io-aux threads: terminate every
@@ -1703,6 +1837,7 @@ class HiCacheController:
         the cutover path must let that RuntimeError propagate (see
         ``phase_flip_runtime.drop_prefix_tree_returning_rows``).
         """
+        self.weg2_await_reset_reaper("stop")  # PARK-READ-DETACH: never two pipelines
         t0 = time.monotonic()
         # Always request stop. This is safe even when storage is already disabled,
         # and makes detach truly idempotent (previous partial detach may have left
@@ -2586,7 +2721,31 @@ class HiCacheController:
         prints the ONE line that names the bound, the joined thread roles,
         the terminated and drained operation counts and the seconds spent.
         """
-        stop = self._stop_storage_threads()
+        if self.weg2_reset_reaper_alive():
+            # PARK-READ-DETACH: a detached reset of this sleep is still joining;
+            # its reaper restarts the pipeline. Only the scheduler-side queues here.
+            self.write_queue.clear()
+            self.load_queue.clear()
+            self.ack_write_queue.clear()
+            self.ack_load_queue.clear()
+            logger.info("#1068 RESET MERGED into the pending PARK-READ-DETACH reaper (no second join)")
+            return
+        _rids = self._weg2_park_read_detach_rids()
+        stop = self._weg2_stop_storage_threads_detached(_rids) if _rids else None
+        if stop is not None and self.weg2_reset_reaper_alive():
+            logger.info(
+                "#1068 RESET JOIN bound_s=%d threads=%s terminated_ops=%d drained_ops=%d "
+                "joined_s=%.2f detached=prefetch rids=%s -- PARK-READ-DETACH: the parked read is "
+                "terminated, its thread joined in the background",
+                int(STORAGE_THREAD_JOIN_BOUND_S), stop.threads, stop.terminated_ops,
+                stop.drained_ops, stop.joined_s, sorted(r[:12] for r in _rids))
+            self.write_queue.clear()
+            self.load_queue.clear()
+            self.ack_write_queue.clear()
+            self.ack_load_queue.clear()
+            return
+        if stop is None:
+            stop = self._stop_storage_threads()
         logger.info(
             "#1068 RESET JOIN bound_s=%d threads=%s terminated_ops=%d "
             "drained_ops=%d joined_s=%.2f",
@@ -3625,6 +3784,7 @@ class HiCacheController:
         """
         Prefetch KV caches from storage backend to host memory.
         """
+        self.weg2_await_reset_reaper("prefetch")  # PARK-READ-DETACH
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
@@ -4728,6 +4888,7 @@ class HiCacheController:
         """
         Write KV caches from host memory to storage backend.
         """
+        self.weg2_await_reset_reaper("write_storage")  # PARK-READ-DETACH
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )

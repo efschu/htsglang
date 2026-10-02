@@ -4095,6 +4095,14 @@ class Envs:
     # a queued request that needs P); P stays awake ("WEG2 MANUAL-FLIP RETURN-SKIP
     # reason=..."). 0 = the round trip always returns to D, as before.
     SGLANG_WEG2_MANUAL_FLIP_RETURN_SKIP = EnvBool(True)
+    # PARK-READ-DETACH (02.10., L15 boot dac8b62b8c D 14:43:49: '#1068 RESET JOIN
+    # terminated_ops=1 joined_s=1.29', 'WEG2-SLEEP-SUB alloc_clear=1414'): the sleep
+    # flush's reset terminates the open store reads of D's park list and joins their
+    # thread in a background reaper (which restarts the pipeline) instead of
+    # synchronously -- only while no store->host page transfer is in flight. Marker
+    # '#1068 RESET JOIN ... detached=prefetch' / '#1068 PARK-READ-DETACH reaped'.
+    # 0 = the reset joins as before.
+    SGLANG_WEG2_PARK_READ_DETACH = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at

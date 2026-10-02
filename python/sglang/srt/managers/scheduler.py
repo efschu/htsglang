@@ -20827,9 +20827,20 @@ class Scheduler(
                                    type(exc).__name__, exc)
                 _fsub.mark("l15_tail")
                 _l15_pr0 = time.perf_counter()
-                self.tree_cache.reset()
-                self.req_to_token_pool.clear()
-                self.token_to_kv_pool_allocator.clear()
+                # PARK-READ-DETACH (L15 boot dac8b62b8c 14:43:49): the reset may hand the
+                # open store reads of D's park list to a background reaper instead of
+                # joining them -- PDFLIP-A's exempt set names them, read before the tree
+                # reset forgets ongoing_prefetch.
+                _prd_cc = getattr(self.tree_cache, "cache_controller", None)
+                if _prd_cc is not None:
+                    _prd_cc._weg2_reset_detach_rids = _weg2_parked_owned_prefetch_of(self)
+                try:
+                    self.tree_cache.reset()
+                    self.req_to_token_pool.clear()
+                    self.token_to_kv_pool_allocator.clear()
+                finally:
+                    if _prd_cc is not None:
+                        _prd_cc._weg2_reset_detach_rids = None
                 if len(_l15_tt) > 1:
                     # L15-FLIPCOST: the plain flush's own reset+clear -- the
                     # comparison for retain's reset/alloc steps

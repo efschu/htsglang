@@ -9515,6 +9515,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rest stays queued (see hicache_drain_budget). None = drain the agreed
         counts whole, the unchanged path."""
         cc = self.cache_controller
+        if getattr(cc, "weg2_reset_reaper_alive", lambda: False)() is True:
+            # PARK-READ-DETACH: a detached reset's old pipeline is still ending;
+            # its control queues name slots of the cleared pool and are discarded
+            # with it at the restart -- never drained into a reallocated slot.
+            return
         # SGLANG_HICACHE_ROUND_TIMING: part times of this round (None = off).
         _parts = getattr(self, "_hc_parts", None)
 

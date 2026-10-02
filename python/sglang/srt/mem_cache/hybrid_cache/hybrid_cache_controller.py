@@ -629,7 +629,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def reset(self):
         super().reset()
-        if self.enable_storage:
+        if self.enable_storage and not self.weg2_reset_reaper_alive():
             self.host_mem_release_queue.queue.clear()
             for release_queue in self.extra_host_mem_release_queues.values():
                 release_queue.queue.clear()
@@ -1022,6 +1022,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
+        self.weg2_await_reset_reaper("prefetch")  # PARK-READ-DETACH
         operation = PrefetchOperation(
             request_id,
             host_indices,
@@ -1046,6 +1047,7 @@ class HybridCacheController(BaseHiCacheController):
         """``sidecar_only`` (fnFL2x62): the KV pages are already in the store
         (direct-written arena slots); only ``extra_pools`` are persisted and
         the operation acks as complete for every token."""
+        self.weg2_await_reset_reaper("write_storage")  # PARK-READ-DETACH
         operation = StorageOperation(
             host_indices,
             token_ids,
