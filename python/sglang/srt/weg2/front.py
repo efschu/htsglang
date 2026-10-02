@@ -75,6 +75,25 @@ from aiohttp import (
 
 from sglang.srt.weg2 import front_metrics as _front_metrics  # TSDB: imported off the loop
 from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xsn272
+
+
+# MM-XPRICE: front_tokens is imported lazily here as everywhere in this module
+def _ft_mm_expand(*args):
+    from sglang.srt.weg2.front_tokens import mm_expand
+
+    return mm_expand(*args)
+
+
+def _ft_mm_learn(*args):
+    from sglang.srt.weg2.front_tokens import mm_learn
+
+    return mm_learn(*args)
+
+
+def _FtCount(**kw):
+    from sglang.srt.weg2.front_tokens import Count
+
+    return Count(**kw)
 from sglang.srt.weg2.intake_stall import STALL_MARK as _INTAKE_STALL_MARK  # H91 part C
 
 #: weg2xsn291: the least a woken group keeps the cards even when fairness or
@@ -3412,6 +3431,10 @@ class Pending:
     #: could take it. Read by ``_flip_economics_ok`` under
     #: SGLANG_WEG2_VISION_FLIP_URGENT.
     p_only: bool = False
+    #: MM-XPRICE: one past the image positions in the front's exact ids (0 =
+    #: no image or not priced exactly); a P-only request whose store credit
+    #: reaches it is re-priced as text (``_x_exact_reprice_queue``).
+    mm_image_end: int = 0
     #: R28: the arrival snapshot of a request queued while D was awake, i.e.
     #: one that waits for a D->P flip; printed once as ``WEG2 DP-WAIT`` at
     #: the ``WEG2-FLIP done`` that ends the wait, then cleared. Instrument
@@ -5943,6 +5966,7 @@ class Front:
             info.get("tool_call_parser"), int(is_mm),
             int(bool(envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.get())), ft.why, ft.load_s)
         self._store_probe_info = info
+        Front._context_gate_announce(self)
         await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)
 
     #: L3-INDEX PRICE: a probe that could not open is retried at most this often
@@ -6026,18 +6050,44 @@ class Front:
         reason = None
         if ft is None or ft.state != "ready":
             reason = "tokenizer_" + (ft.state if ft is not None else "none")
-        elif multimodal:
-            reason = "multimodal"  # image/video/embeds: D's mm processor expands them
+        elif multimodal and not (isinstance(payload, dict)
+                                 and path in ("/v1/messages", "/v1/chat/completions")
+                                 and getattr(ft, "image_token_id", None) is not None
+                                 and hasattr(ft, "count_mm")):
+            # image/video/embeds outside the chat paths: D's mm processor expands them
+            reason = "multimodal"
         elif not isinstance(payload, dict) or path not in ("/v1/messages", "/v1/chat/completions",
                                                                "/generate"):
             reason = "path"
         c = None
+        mm = None
+        mm_keys: List[str] = []
         t0 = time.monotonic()
         if reason is None:
             try:
-                c = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(ft.executor, ft.count, path, payload),
+                got = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        ft.executor, ft.count_mm if multimodal else ft.count, path, payload),
                     timeout=envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0)
+                if multimodal:
+                    # MM-XPRICE (front_tokens): the compact render, expanded with
+                    # each image's REALISED token count -- or the fallback below
+                    # when an image was never served (its tower must run anyway)
+                    c0, mm_keys = got
+                    self._mm_note_rid(rid, c0.ids, mm_keys)
+                    # CONTEXT-GATE: the compact render is a LOWER bound of the prompt
+                    lb = self.__dict__.setdefault("_x_exact_lb", collections.OrderedDict())
+                    lb[rid] = int(c0.n)
+                    while len(lb) > 1024:
+                        lb.popitem(last=False)
+                    mm = _ft_mm_expand(c0.ids, ft.image_token_id, mm_keys, self._mm_ktok())
+                    if mm is None:
+                        reason = "multimodal-unseen-image"
+                    else:
+                        c = _FtCount(n=int(mm.ids.size), ids=mm.ids, ms=c0.ms,
+                                     reused=c0.reused, encoded=c0.encoded)
+                else:
+                    c = got
             except asyncio.TimeoutError:
                 reason = "timeout"
             except Exception as e:  # noqa: BLE001 -- the estimate stands, named
@@ -6047,16 +6097,23 @@ class Front:
             self.counters["x_exact_fallback"] += 1
             self._x_exact_note_fallback(rid, reason)
             logger.info("WEG2 X-EXACT-FALLBACK rid=%s reason=%s est_uncached=%d est_prompt=%d "
-                        "(chars/3 estimate stands for this request) wait_ms=%.1f",
-                        rid, reason, est_uncached, est_prompt, wait_ms)
+                        "(chars/3 estimate stands for this request) wait_ms=%.1f%s",
+                        rid, reason, est_uncached, est_prompt, wait_ms,
+                        (" images=%d known=%d (MM-XPRICE: an image's token count is learned "
+                         "from the first group leg that serves it)"
+                         % (len(mm_keys), sum(1 for k in mm_keys if k in self._mm_ktok())))
+                        if reason == "multimodal-unseen-image" else "")
             return None
         ft.remember(text, c.ids)
         self._sess_prefix(rid, c.ids)  # SESSION-TRACE
         # L3-INDEX PRICE (y7d weg2-0-2 / 2-19): the page-granular store prefix
         # of these exact ids, earlier boots and this one -- a store fact like
         # P's END-ANCHOR, recorded before the measured prefix is read.
+        # MM-XPRICE: the store's page keys hold the REAL ids -- an image
+        # request is probed only up to its first image (surrogates beyond)
         l3, tier = await self._store_probe_depth(
-            rid, c.ids, envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
+            rid, c.ids if mm is None else c.ids[: mm.first_image],
+            envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
             - (time.monotonic() - t0))
         if l3 > 0 and self.tspans.record_store_depth(c.ids, l3, source=tier) > 0:
             self.counters["l3_index_credit"] += 1
@@ -6070,15 +6127,152 @@ class Front:
         while len(self._x_exact_rid) > 4096:
             self._x_exact_rid.popitem(last=False)
         self.counters["x_exact_priced"] += 1
+        mm_cached = False
+        mm_tag = ""
+        if mm is not None:
+            covered = sum(1 for e in mm.ends if int(e) <= int(credit))
+            mm_cached = covered == mm.n_images
+            self.counters["x_exact_mm_priced"] += 1
+            if mm_cached:
+                self.counters["x_exact_mm_cached"] += 1
+            mm_tag = " mm=1 mm_cached=%d/%d image_end=%d" % (covered, mm.n_images, mm.image_end)
         logger.info("WEG2 X-EXACT-PRICE rid=%s pending=%d tokens=%d credit=%d src=%s known=%d "
                     "(EXACT: D's tokenizer+template, minus the MEASURED cached-on-D token prefix) "
                     "chars3_uncached=%d chars3_prompt=%d delta=%+d count_ms=%.1f wait_ms=%.1f "
-                    "reused=%d encoded=%d",
+                    "reused=%d encoded=%d%s",
                     rid, pending, c.n, credit, src, int(known), est_uncached, est_prompt,
-                    est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded)
+                    est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded, mm_tag)
         from types import SimpleNamespace
 
-        return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src)
+        return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
+                               mm=mm is not None, mm_cached=mm_cached,
+                               image_end=(mm.image_end if mm is not None else 0))
+
+    # -- CONTEXT-GATE ---------------------------------------------------------------------
+    # y7i (e7a70285bd), front log ..._1002_111831.front.log, 11:32-11:33Z: an
+    # OpenWebUI request priced est_prompt=365462 by chars/3 (a base64 image inside
+    # a TEXT field, tokenized as text) was routed LONG, flipped D->P, P answered
+    # 400 "The input (358446 tokens) is longer than the model's context length
+    # (262144 tokens)", and the client retried every ~12 s with a new rid
+    # (weg2-14-50, 15-51, 17-52, ...): a flip pair each, and D's running
+    # weg2-14-48 parked (PARK-IMMEDIATE) and resumed every time.
+
+    #: chars/3 over-counts up to +60 % (X-EXACT module note) -- a chars/3 ESTIMATE
+    #: refuses only past this factor; an exact count (or its lower bound) at once
+    CONTEXT_GATE_EST_MARGIN = 1.6
+    #: base64 tokenizes at ~chars/3 (y7i: est 365462, P 358446) -- an estimate made
+    #: of an inline data URI is close to the real count
+    CONTEXT_GATE_DATAURI_MARGIN = 1.15
+    _DATAURI_RE = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+    def _context_len(self) -> int:
+        """The groups' context length: their server info, else the checkpoint's."""
+        info = self.__dict__.get("_store_probe_info") or {}
+        v = info.get("context_length")
+        if isinstance(v, int) and v > 0:
+            return v
+        v = getattr(getattr(self, "ftok", None), "context_len", None)
+        return int(v) if isinstance(v, int) and v > 0 else 0
+
+    def _context_gate_announce(self) -> int:
+        """CONTEXT-GATE at the tokenizer's READY: one line naming the limit it refuses
+        against -- or, LOUDLY, that it has none (27B integration, coordinator 02.10.: an
+        absent limit must never let over-context requests pass silently; they would flip
+        and park for a 400 from P, the N5a weg2-13-15 / 15-17 class)."""
+        ctx = Front._context_len(self)
+        if ctx > 0:
+            logger.info("WEG2 CONTEXT-GATE armed ctx=%d (an over-context request is answered 400 "
+                        "before any route, seat, flip or park)", ctx)
+        else:
+            self.counters["context_gate_unarmed"] += 1
+            logger.error("WEG2 CONTEXT-GATE UNARMED: neither the groups' context_length "
+                         "(/get_server_info) nor the checkpoint's max_position_embeddings is known "
+                         "-- over-context requests are NOT refused at the front; they take a flip "
+                         "and P answers 400")
+        return ctx
+
+    def _context_gate(self, rid: str, text: str, xx: Any, est_prompt: int):
+        """400 for a request the groups would refuse as over-context, else None."""
+        uri_chars = 0
+        if "data:image/" in text:
+            uris = self._DATAURI_RE.findall(text)
+            uri_chars = sum(len(u) for u in uris)
+            if uri_chars:
+                self.counters["inline_datauri"] += 1
+                logger.info("WEG2 INLINE-DATAURI rid=%s chars=%d uris=%d (a base64 image inside a "
+                            "TEXT field: the groups tokenize it as text, never as an image)",
+                            rid, uri_chars, len(uris))
+        lb = (self.__dict__.get("_x_exact_lb") or {}).pop(rid, None)
+        ctx = self._context_len()
+        if ctx <= 0:
+            if not self.counters.get("context_gate_unarmed_req"):
+                logger.error("WEG2 CONTEXT-GATE UNARMED rid=%s est=%d: no context limit known -- "
+                             "not refused at the front (named once)", rid, int(est_prompt))
+            self.counters["context_gate_unarmed_req"] += 1
+            return None
+        if xx is not None:
+            tokens, how, limit = int(xx.n), "exact", ctx
+        elif lb:
+            tokens, how, limit = int(lb), "exact-lower-bound", ctx
+        else:
+            margin = (self.CONTEXT_GATE_DATAURI_MARGIN if uri_chars * 2 > len(text)
+                      else self.CONTEXT_GATE_EST_MARGIN)
+            tokens, how, limit = int(est_prompt), "chars3", int(ctx * margin)
+        if tokens <= limit:
+            return None
+        self.counters["context_gate_refused"] += 1
+        logger.warning("WEG2 CONTEXT-GATE REFUSED rid=%s tokens=%d ctx=%d by=%s (400 before any "
+                       "route, seat, flip or park -- the groups refuse it anyway)",
+                       rid, tokens, ctx, how)
+        return web.json_response({"error": {
+            "message": (f"The input ({tokens} tokens) is longer than the model's context "
+                        f"length ({ctx} tokens)."),
+            "type": "BadRequestError", "param": None, "code": 400}}, status=400)
+
+    # -- MM-XPRICE (front_tokens): image token counts as the groups realised them --------
+    def _mm_ktok(self) -> Dict[str, int]:
+        """image key -> its token count, learned from served legs (front-local)."""
+        return self.__dict__.setdefault("_mm_ktok_map", {})
+
+    def _mm_note_rid(self, rid: str, compact: Any, keys: Sequence[str]) -> None:
+        if not keys:
+            return
+        od = self.__dict__.setdefault("_mm_rid_info", collections.OrderedDict())
+        od[rid] = (compact, list(keys))
+        while len(od) > 1024:
+            od.popitem(last=False)
+
+    def _mm_ids(self, rid: str) -> Any:
+        """The expansion of a noted image request, None while an image's K is unknown."""
+        info = (self.__dict__.get("_mm_rid_info") or {}).get(rid)
+        ft = getattr(self, "ftok", None)
+        if info is None or ft is None:
+            return None
+        return _ft_mm_expand(info[0], getattr(ft, "image_token_id", None), info[1], self._mm_ktok())
+
+    def _mm_learn(self, rid: str, text: str, realised: int) -> None:
+        """A P leg 1 of an image request served ``realised`` prompt tokens (P's
+        prompt, never a resumed D reading): the one image of it the front did
+        not know has K = the rest. The request's ids are remembered from then
+        on, so P's END-ANCHOR and every later presence record price it."""
+        info = (self.__dict__.get("_mm_rid_info") or {}).get(rid)
+        ft = getattr(self, "ftok", None)
+        if info is None or ft is None:
+            return
+        compact, keys = info
+        got = _ft_mm_learn(int(compact.size), keys, self._mm_ktok(), int(realised or 0))
+        if got is not None:
+            key, k = got
+            self._mm_ktok()[key] = int(k)
+            self.counters["x_exact_mm_learned"] += 1
+            logger.info("WEG2 X-EXACT-MM-LEARN rid=%s image=%s tokens=%d realised=%d compact=%d "
+                        "images=%d (the image's token count as P served it; later requests "
+                        "carrying it are priced exactly)", rid, key[:12], int(k), int(realised),
+                        int(compact.size), len(keys))
+        if ft.ids_for(text) is None:
+            exp = self._mm_ids(rid)
+            if exp is not None:
+                ft.remember(text, exp.ids)
 
     def _x_exact_reprice_queue(self, why: str) -> int:
         """Re-price every queued request whose price can still move, against
@@ -6099,12 +6293,28 @@ class Front:
         x = int(self.tp_prefill_max_tokens)
         n = 0
         for p in self.queue:
-            if (p.leg1_done or p.skip_leg1 or p.p_only or p.x_requeues):
+            # MM-XPRICE: a P-only image request is re-priced too -- the store
+            # may hold its image now (STORE-PRESENCE of the leg that served it)
+            mm_rid = p.p_only and p.rid in (self.__dict__.get("_mm_rid_info") or {})
+            if (p.leg1_done or p.skip_leg1 or (p.p_only and not mm_rid) or p.x_requeues):
                 continue
             ids = self.ftok.ids_for(p.text)
+            if ids is None and mm_rid:
+                exp = self._mm_ids(p.rid)
+                if exp is not None:
+                    self.ftok.remember(p.text, exp.ids)
+                    p.mm_image_end = int(exp.image_end)
+                    ids = exp.ids
             if ids is None:
                 continue
             new, _credit, _known, src = self.tspans.pending(ids, epoch=epoch)
+            if p.p_only and int(getattr(p, "mm_image_end", 0) or 0) > 0 \
+                    and int(_credit) >= int(p.mm_image_end):
+                p.p_only = False
+                self.counters["x_exact_mm_reprice_cached"] += 1
+                logger.info("W102 Weg2VisionStage rid=%s image-cached at reprice (why=%s credit=%d "
+                            ">= image_end=%d src=%s): priced as text, no flip of its own",
+                            p.rid, why, int(_credit), int(p.mm_image_end), src)
             old = int(p.est_uncached)
             if new == old:
                 continue
@@ -6648,9 +6858,12 @@ class Front:
         END-ANCHOR is in the shared store once P's sleep flush publishes (see
         :meth:`_p_flush_store_presence`). Behind the K1 switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE
         -- the same fact (P's END-ANCHOR is a store presence), witnessed one flush earlier than
-        K1's first content."""
-        if (not getattr(self, "x_exact", False) or getattr(self, "tspans", None) is None
-                or getattr(self, "dual_layout", False)  # no P sleep flush in the dual layout
+        K1's first content. An image request's token count is learned here first (MM-XPRICE, NF
+        210cdee46b: its ids exist from then on) -- whatever the K1 switch / layout."""
+        if not getattr(self, "x_exact", False) or getattr(self, "tspans", None) is None:
+            return
+        self._mm_learn(rid, text, prompt_tokens)
+        if (getattr(self, "dual_layout", False)  # no P sleep flush in the dual layout
                 or not envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get()):
             return
         served = self.__dict__.setdefault("_p_phase_served", collections.OrderedDict())
@@ -8259,6 +8472,11 @@ class Front:
             if _xx is not None:
                 remainder, est_prompt, known = _xx.pending, _xx.n, _xx.known
                 store_span, presence_src = _xx.credit, _xx.src
+        # CONTEXT-GATE (y7i e7a70285bd, 11:32-11:33Z): an over-context request
+        # is answered 400 HERE -- before any verdict, seat, flip or park.
+        _ctx_refusal = self._context_gate(rid, text, _xx, est_prompt)
+        if _ctx_refusal is not None:
+            return _ctx_refusal
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
@@ -8310,7 +8528,19 @@ class Front:
         # `none` is NOT overridden: a request that fits nowhere still fits
         # nowhere, and saying otherwise would turn an honest admission refusal
         # into a late failure deep in P.
-        if _verdict == VERDICT_STAGE and route != "none" and route != "long":
+        # MM-XPRICE (y7h-noH4 weg2-1-5 / weg2-4-18): an image whose every
+        # position the shared store already holds needs no tower and no P
+        # prefill -- it is priced and routed like text. D admits it only with
+        # the image inside its covered prefix (vision_d_guard, W123 + reroute
+        # through P otherwise).
+        _mm_cached = bool(_xx is not None and getattr(_xx, "mm_cached", False))
+        if _verdict == VERDICT_STAGE and _mm_cached:
+            self.counters["w102_image_cached"] += 1
+            logger.info(
+                "W102 Weg2VisionStage rid=%s image-cached (credit=%d >= image_end=%d) -- "
+                "route %s stands: no tower, priced as text", rid, int(_xx.credit),
+                int(_xx.image_end), route)
+        elif _verdict == VERDICT_STAGE and route != "none" and route != "long":
             logger.info(
                 "W102 Weg2VisionStage rid=%s -- route %s -> long (P): an image "
                 "request is prefilled on P by rule; its embeddings are "
@@ -8496,7 +8726,8 @@ class Front:
                     skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch),
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
-                    p_only=_verdict == VERDICT_STAGE,
+                    p_only=_verdict == VERDICT_STAGE and not _mm_cached,
+                    mm_image_end=(int(getattr(_xx, "image_end", 0) or 0) if _xx is not None else 0),
                     # UNIFY S7 (27B RC7-X): queued by the busy/idle split, not by the phase.
                     x_deferred=_x_band_deferred and not short_refused,
                     # #246b: needs P above the X it was routed on (ARRIVAL-SEAT)

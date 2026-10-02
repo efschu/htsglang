@@ -17082,6 +17082,14 @@ class Scheduler(
                     _note_skip("weg2_vision_refused", req.rid)
                     _v_refused.append(req)
                     continue
+            # W102 SKIP (P, PP0): a request staged without a tower because its
+            # images lay in the prefix -- admitted only while that still holds
+            if getattr(req, "_weg2_vision_skip", False):
+                from sglang.srt.weg2.vision_rank_runner import skip_still_covered
+
+                if not skip_still_covered(self, req):
+                    _note_skip("weg2_vision_skip_refuted", req.rid)
+                    continue
 
             # #791 PP ADMISSION UNIFORMITY. Every PP stage independently
             # re-derives its own admission verdict from its own local radix
