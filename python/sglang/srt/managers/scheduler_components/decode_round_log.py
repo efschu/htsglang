@@ -455,6 +455,44 @@ class DecodeRoundLog:
             self._pending.pop(round_id)
             self._emit(acc, results)
 
+    #: DP-NACHLAUF 02.10. (N6i f501e462d0, 27B D): rounds 285-331 (18:14:46-47)
+    #: reached the log only at 18:15:28, after the NEXT wake -- flush() is
+    #: query-only, the last rounds' events were not yet readable at the last
+    #: idle flush, and a sleeping group runs no more rounds or idle ticks.
+    #: drain_blocking() is called at the head of the sleep leg (the group is
+    #: quiesced, so the device sync costs nothing): retire the open round,
+    #: wait for the device, emit everything pending. Unset = on; 0/false/no/
+    #: off = no drain (the lines follow at the next activity, as before).
+    DRAIN_AT_SLEEP_ENV = "SGLANG_WEG2_DECODE_LOG_DRAIN_AT_SLEEP"
+
+    def drain_blocking(self, sync=None) -> int:
+        """Emit every pending round now; returns how many were emitted."""
+        import os as _os
+
+        if str(_os.environ.get(self.DRAIN_AT_SLEEP_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+            return 0
+        self._retire_open()
+        if not self._pending:
+            return 0
+        before = len(self._pending)
+        if sync is None:
+            try:
+                import torch
+
+                sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+            except Exception:  # noqa: BLE001
+                sync = lambda: None  # noqa: E731
+        try:
+            sync()
+        except Exception:  # noqa: BLE001 -- the drain never breaks the sleep
+            pass
+        self.flush()
+        n = before - len(self._pending)
+        if n:
+            logger.info("DECODE-ROUND-LOG drained n=%d left=%d at=sleep (%s=0 restores the lazy flush)",
+                        n, len(self._pending), self.DRAIN_AT_SLEEP_ENV)
+        return n
+
     def _snapshot_pending(self) -> None:
         """#1302. Take the reading of every round that cannot be READ yet.
 
