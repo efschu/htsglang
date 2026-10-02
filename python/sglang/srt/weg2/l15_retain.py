@@ -401,6 +401,14 @@ def retain_at_sleep(
         for rid in hs.rids:
             kv_l2.extend(int(x) for x in l2_of(rid)[0])
             anchor_l2.append(int(anchor_l2_of(rid)[0]))
+        # L15-HOSTLOCK-COVER (N5n: slots=2304 pinned for 133k held tokens --
+        # the chain was barely written back to L2): held tokens against the
+        # tokens with an L2 source, per rank, beside the pin line.
+        _backed = sum(1 for x in kv_l2 if int(x) >= 0)
+        log(f"L15-HOSTLOCK-COVER epoch={epoch} tokens={len(kv_l2)} "
+            f"backed={_backed} unbacked={len(kv_l2) - _backed} "
+            f"distinct_slots={len({int(x) for x in kv_l2 if int(x) >= 0})} "
+            f"rids={len(hs.rids)}")
         hold_l2_refs(kv_l2, anchor_l2)
 
     _lap("hostlock")
