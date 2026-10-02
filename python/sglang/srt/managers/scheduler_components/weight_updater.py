@@ -665,6 +665,9 @@ class SchedulerWeightUpdaterManager:
     # L15-16 PARK: the parked rows came back at this wake (the cap-0 rank
     # then refills only its anchors from L2)
     _l15_park_back_ok: bool = False
+    # L15-FIX-CAP0-CHECK: this wake's cap-0 refill landed (gen-checked); the
+    # sample check of this rank then votes clean without re-reading L2
+    _l15_refill_done: bool = False
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -7266,6 +7269,7 @@ class SchedulerWeightUpdaterManager:
         # L15-12c-E2: a per-wake mark -- reset at the head so it can never
         # survive into a wake whose signal did not set it.
         self._l15_wake_refill = False
+        self._l15_refill_done = False
         if sched is None:
             return None, None, 0, False
         try:
@@ -7628,6 +7632,15 @@ class SchedulerWeightUpdaterManager:
             return None
         k = 64
         rank = self._weg2_rank()
+        if getattr(self, "_l15_refill_done", False) and os.environ.get(
+                "SGLANG_WEG2_L15_CAP0_SAMPLE", "0") != "1":
+            # L15-FIX-CAP0-CHECK: this rank's rows were just copied from L2
+            # under a generation check (refill raised otherwise); re-reading
+            # 64 of them from L2 compares L2 with itself. Vote clean.
+            self._l15_refill_done = False
+            logger.info("L15-CHECK rank=%d cap-0: refilled rows are gen-checked, "
+                        "sample skipped", rank)
+            return (0, 0, 0)
         sched = self.scheduler
         plan, scratch = [], None
         try:
@@ -7813,13 +7826,30 @@ class SchedulerWeightUpdaterManager:
             if [int(g) for g in _sg(a_slots)] != a_gens:
                 raise l15_refill.L15RefillError(
                     "anchor generation mismatch, recorded %s" % (a_gens,))
-            n = l15_refill.refill(ok, host_pool, device_pool, page_tokens) if ok else 0
+            _rf_mode = l15_refill.refill_mode()
+            _rf_t0 = time.perf_counter()
+            n = (l15_refill.refill(ok, host_pool, device_pool, page_tokens,
+                                   mode=_rf_mode) if ok else 0)
             host_mamba._load_states_all_layers(
                 dev_mamba,
                 torch.tensor(a_slots, dtype=torch.int64),
                 torch.tensor(a_didx, dtype=torch.int64))
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
+            _rf_s = max(1e-9, time.perf_counter() - _rf_t0)
+            try:
+                from sglang.srt.weg2 import l15_shadow as _l15_shr
+                _rf_bytes = int(n) * int(_l15_shr.cell_bytes_from(device_pool))
+            except Exception:  # noqa: BLE001 -- instrument only
+                _rf_bytes = 0
+            # L15-FIX-CAP0-CHECK: rows copied from L2 under a generation check
+            # need no sample re-read against L2 -- the wake check of THIS
+            # rank votes from the gen check (a refill failure raised above)
+            self._l15_refill_done = True
             logger.info("L15-REFILL rank=%d done: %d KV row(s) + %d anchor(s) "
-                        "from L2", rank, n, len(a_slots))
+                        "from L2 mode=%s refill_ms=%.0f refill_GBps=%.2f bytes=%d",
+                        rank, n, len(a_slots), _rf_mode or "pool-default",
+                        _rf_s * 1000.0, _rf_bytes / _rf_s / 1e9, _rf_bytes)
             return n
         except Exception as exc:  # noqa: BLE001 -- all-or-nothing into the fallback
             logger.info("L15-REFILL rank=%d failed: %s -> %s", rank, exc,

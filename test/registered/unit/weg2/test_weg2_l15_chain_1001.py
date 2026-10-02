@@ -689,10 +689,13 @@ def test_refill1_chain_holds_and_the_act_never_refills_again(
         assert WU._l15_wake_check_and_decide(fss[r], True, fps[r],
                                              epoch=EPOCH) == "hold"
     # Real sample plans: distinct owned-with-L2 rows per rank (slot%3
-    # classes), shared prefix rows sampled ONCE (L15-DEDUPE): rank 0 row
-    # 12 (both spans), rank 1 rows 10,13, rank 2 rows 11,14.
-    assert seen == [1, 2, 2]
-    assert [o for _g, o in calls] == [v, v, v]   # the REAL votes agree
+    # classes), shared prefix rows sampled ONCE (L15-DEDUPE): rank 1 rows
+    # 10,13, rank 2 rows 11,14. L15-FIX-CAP0-CHECK: rank 0's rows were just
+    # copied from L2 under the generation check -- no sample re-read; it
+    # votes the same fingerprint with a clean (0, 0, 0) check.
+    assert seen == [2, 2]
+    v0 = l15_restore.check_vote(fps[0], 0, 0, 0, ())
+    assert [o for _g, o in calls] == [v0, v, v]   # same fp, nobody bad
     for r in range(3):
         assert WU._l15_wake_act(fss[r], scheds[r], "hold",
                                 group_ok=True, master_on=True) == 0
