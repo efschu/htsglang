@@ -7801,6 +7801,16 @@ class SchedulerWeightUpdaterManager:
 
         m = self._l15_wake_manifest
         rank = self._weg2_rank()
+        # L15-REFILL-STEPS: where the refill's wall time goes (N6k: refill_ms
+        # 763/252/246 with a 64-ms page DMA)
+        _rt = [time.perf_counter()]
+        _rlap: list = []
+
+        def _rmark(name):
+            _n = time.perf_counter()
+            _rlap.append("%s:%.0f" % (name, (_n - _rt[0]) * 1000.0))
+            _rt[0] = _n
+
         try:
             if m is None:
                 raise LookupError("refill rank without a stashed manifest")
@@ -7836,7 +7846,9 @@ class SchedulerWeightUpdaterManager:
             # shared-prefix rows ONCE, tagged with the FULL tuple of the
             # sharing rids so one generation mismatch drops every sharing
             # request whole (l15_restore.rid_tagged_plan).
+            _rmark("setup")
             plan = l15_restore.rid_tagged_plan(m, rank, prefix)
+            _rmark("plan")
             # L15-16 PARK: the KV rows came back card to card -- only the
             # anchors are loaded from L2 below
             parked = bool(getattr(self, "_l15_park_back_ok", False))
@@ -7845,6 +7857,7 @@ class SchedulerWeightUpdaterManager:
             if not plan and not parked:
                 return 0
             ok, bad = (l15_refill.gen_check(plan, host_pool) if plan else ([], []))
+            _rmark("gen")
             if bad:
                 raise l15_refill.L15RefillError(
                     "generation mismatch, drop-eligible rids: %s" % (bad[:4],))
@@ -7874,6 +7887,7 @@ class SchedulerWeightUpdaterManager:
             if [int(g) for g in _sg(a_slots)] != a_gens:
                 raise l15_refill.L15RefillError(
                     "anchor generation mismatch, recorded %s" % (a_gens,))
+            _rmark("anchor_gen")
             _rf_mode = l15_refill.refill_mode()
             _rf_t0 = time.perf_counter()
             n = (l15_refill.refill(ok, host_pool, device_pool, page_tokens,
@@ -7894,10 +7908,13 @@ class SchedulerWeightUpdaterManager:
             # need no sample re-read against L2 -- the wake check of THIS
             # rank votes from the gen check (a refill failure raised above)
             self._l15_refill_done = True
+            _rmark("load")
             logger.info("L15-REFILL rank=%d done: %d KV row(s) + %d anchor(s) "
-                        "from L2 mode=%s refill_ms=%.0f refill_GBps=%.2f bytes=%d",
+                        "from L2 mode=%s refill_ms=%.0f refill_GBps=%.2f bytes=%d "
+                        "steps=%s",
                         rank, n, len(a_slots), _rf_mode or "pool-default",
-                        _rf_s * 1000.0, _rf_bytes / _rf_s / 1e9, _rf_bytes)
+                        _rf_s * 1000.0, _rf_bytes / _rf_s / 1e9, _rf_bytes,
+                        ",".join(_rlap))
             return n
         except Exception as exc:  # noqa: BLE001 -- all-or-nothing into the fallback
             logger.info("L15-REFILL rank=%d failed: %s -> %s", rank, exc,
