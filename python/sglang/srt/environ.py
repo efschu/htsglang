@@ -1744,6 +1744,18 @@ class Envs:
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
+    # FRONT-PREWARM (NF y7y 17:41:47, weg2-0-1 'X-EXACT-HOLD waited_ms=4594';
+    # every NF boot of 02.10. held its first arrivals 3.7-7.6 s, 27B N6i 8.5 s:
+    # the front was up 3 s after group D, its tokenizer stack ~8 s later):
+    # /weg2/state reports ``state=warming`` until the X-EXACT load ended (the
+    # tokenizer stack ready AND the L3 presence probe opened) or
+    # X_EXACT_HOLD_MAX_S since the front's start passed, so a host that waits
+    # for ``serving`` sends its first request into a warm front. The load also
+    # ends with one dummy render + encode per chat path (the first count took
+    # 142 ms for 25 tokens, a warm one 10 ms for 2711). The front's own state,
+    # its /health and every route decision are unchanged; a client that does
+    # not wait is held exactly as before. 0 = serving at once, no warm render.
+    SGLANG_WEG2_FRONT_TOKENIZER_PREWARM = EnvBool(True)
     # RG 26.09.: the told/twin prefix switches as registry fields (weg2/form.py
     # PREFIX_SWITCHES; their readers in managers/weg2_store_told.py,
     # weg2/p_twin_defer.py and managers/weg2_told_fallback.py take the same

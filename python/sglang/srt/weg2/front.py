@@ -4253,6 +4253,8 @@ class Front:
         # cached-on-D TOKEN prefix (weg2/front_tokens.py). Off = chars/3 pricing,
         # byte for byte; nothing below is constructed or imported then.
         self.x_exact = bool(envs.SGLANG_WEG2_FRONT_EXACT_TOKENS.get())
+        #: FRONT-PREWARM: the front's start, the clock of the ``warming`` bound
+        self._x_exact_t0 = time.monotonic()
         self.ftok = None
         self.tspans = None
         #: rid -> (pending priced, tokens counted, witness) for X-EXACT-ERR
@@ -6062,6 +6064,34 @@ class Front:
             await self._x_exact_boot_load()
         finally:
             self._x_exact_ready_event().set()
+            if envs.SGLANG_WEG2_FRONT_TOKENIZER_PREWARM.get():
+                ft = self.__dict__.get("ftok")
+                t0 = self.__dict__.get("_x_exact_t0")
+                logger.info(
+                    "WEG2 FRONT-PREWARM done after %.1f s state=%s load_s=%.1f warm_ms=%.0f%s "
+                    "probe=%s -- /weg2/state reports serving from now: a host waiting for it "
+                    "sends its first request into a warm front (tokenizer stack loaded, L3 "
+                    "presence probe open), no X-EXACT-HOLD",
+                    (time.monotonic() - t0) if t0 is not None else -1.0,
+                    getattr(ft, "state", "none"), float(getattr(ft, "load_s", 0.0) or 0.0),
+                    float(getattr(ft, "warm_ms", 0.0) or 0.0),
+                    (" warm_failed=" + ft.warm_why) if getattr(ft, "warm_why", "") else "",
+                    "open" if self.__dict__.get("store_probe") is not None
+                    else self.__dict__.get("_store_probe_why", "not opened"))
+
+    def _reported_state(self) -> str:
+        """FRONT-PREWARM: what /weg2/state calls the front. ``warming`` while the
+        boot's X-EXACT load runs (tokenizer stack + L3 presence probe) and the
+        X_EXACT_HOLD_MAX_S bound since the front's start has not passed; else
+        the front's own state, which this never changes."""
+        if (self.state == "serving" and self.__dict__.get("x_exact")
+                and envs.SGLANG_WEG2_FRONT_TOKENIZER_PREWARM.get()):
+            evt = self.__dict__.get("_x_exact_ready_evt")
+            t0 = self.__dict__.get("_x_exact_t0")
+            if not (evt is not None and evt.is_set()) and t0 is not None \
+                    and time.monotonic() - t0 < self.X_EXACT_HOLD_MAX_S:
+                return "warming"
+        return self.state
 
     async def _x_exact_await_tokenizer(self, rid: str) -> None:
         """BOOT-START HOLD: an arrival while the front tokenizer is still
@@ -8346,7 +8376,8 @@ class Front:
 
     def state_dict(self) -> dict:
         return {
-            "tag": self.tag, "state": self.state, "awake": self.awake, "epoch": self.epoch,
+            "tag": self.tag, "state": self._reported_state(), "awake": self.awake,
+            "epoch": self.epoch,
             "stop": str(self.stop) if self.stop else None, "admit_d": self.admit_d,
             "queue": len(self.queue),
             "outstanding": {g.name: len(g.outstanding) for g in self.groups.values()},
