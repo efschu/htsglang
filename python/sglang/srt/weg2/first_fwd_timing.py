@@ -158,6 +158,47 @@ def timed_wait(loading_event, threshold: int) -> None:
         pass
 
 
+#: DP-NACHLAUF (N6d: the full-attention layers carry the handback extend's
+#: extra): the DCP extend's sub-steps per layer, on the current stream --
+#: enter -> cur (ragged current chunk) -> q_ready (q-head gather joined) ->
+#: prefix (paged prefix kernel) -> exit (LSE merge collectives + scatter +
+#: final merge, joined).
+DCP_MARKS = ("enter", "cur", "q_ready", "prefix", "exit")
+
+
+def dcp_mark(layer_id: int, name: str) -> None:
+    rec = S.cur
+    if rec is None:
+        return
+    try:
+        d = rec.setdefault("dcp", {}).setdefault(int(layer_id), {})
+        if name in d:
+            return
+        ev = S.event_factory()
+        ev.record()
+        d[name] = ev
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the attention
+        pass
+
+
+def _dcp_summary(rec) -> str:
+    dcp = rec.get("dcp") or {}
+    if not dcp:
+        return ""
+    tot = {}
+    n = 0
+    for lid, marks in dcp.items():
+        if not all(k in marks for k in DCP_MARKS):
+            continue
+        n += 1
+        for a, b in zip(DCP_MARKS, DCP_MARKS[1:]):
+            tot[b] = tot.get(b, 0.0) + marks[a].elapsed_time(marks[b])
+    if not n:
+        return " dcp[layers=0]"
+    return (" dcp[layers=%d ragged_cur=%.1f q_gather_wait=%.1f prefix_kernel=%.1f merge_scatter=%.1f ms]"
+            % (n, tot.get("cur", 0.0), tot.get("q_ready", 0.0), tot.get("prefix", 0.0), tot.get("exit", 0.0)))
+
+
 def _done(ev) -> bool:
     try:
         return bool(ev.query())
@@ -170,6 +211,7 @@ def summarize(rec) -> Optional[str]:
     load = rec.get("load") or {}
     lb, le = load.get("begin"), load.get("end")
     evs = [e for pair in layers.values() for e in pair] + [e for e in (lb, le) if e is not None]
+    evs += [e for marks in (rec.get("dcp") or {}).values() for e in marks.values()]
     if evs and not all(_done(e) for e in evs):
         return None
     waits = {t: pre.elapsed_time(post) for t, (pre, post) in layers.items()}
@@ -196,9 +238,9 @@ def summarize(rec) -> Optional[str]:
         ",".join("L%d:%.1f" % (l, g) for l, g in gtop))
     return ("WEG2-FIRST-FWD-TIMING wake=%d fwd=%d consumer=%d layers=%d load_wait_ms=%.1f max_wait_ms=%.1f@L%d "
             "top=%s h2d_ms=%.1f first_wait_after_h2d_begin_ms=%.1f resume_after_h2d_end_ms=%.1f "
-            "waited_span_ms=%.1f %s (device events; the collectives' waits are on the Prefill rank batch line)"
+            "waited_span_ms=%.1f %s%s (device events; the collectives' waits are on the Prefill rank batch line)"
             % (rec["wake"], rec["fwd"], rec["consumer"], len(layers), total, mx[1], mx[0],
-               ",".join("L%d:%.1f" % (t, w) for t, w in top), h2d, fw, rs, span, prof))
+               ",".join("L%d:%.1f" % (t, w) for t, w in top), h2d, fw, rs, span, prof, _dcp_summary(rec)))
 
 
 def harvest() -> int:

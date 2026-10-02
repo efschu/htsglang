@@ -137,3 +137,28 @@ def test_no_producer_forward_still_gets_a_layer_profile(monkeypatch, caplog):
         fft.on_set_consumer(-1)
     line = next(r.getMessage() for r in caplog.records if "WEG2-FIRST-FWD-TIMING" in r.getMessage())
     assert "consumer=-1 layers=4 load_wait_ms=0.0" in line and "gap_sum_ms=30.0" in line
+
+
+def test_dcp_substeps_are_summed(monkeypatch, caplog):
+    clk = _setup(monkeypatch)
+    fft.arm("kv_resume")
+    fft.on_set_consumer(1)
+    for lid in (3, 7):
+        for name, dt in zip(fft.DCP_MARKS, (0.0, 0.001, 0.002, 0.004, 0.003)):
+            clk.t += dt
+            fft.dcp_mark(lid, name)
+        fft.dcp_mark(lid, "exit")                 # a repeated mark is ignored
+    with caplog.at_level(logging.INFO):
+        fft.on_set_consumer(-1)
+    line = next(r.getMessage() for r in caplog.records if "WEG2-FIRST-FWD-TIMING" in r.getMessage())
+    assert "dcp[layers=2 ragged_cur=2.0 q_gather_wait=4.0 prefix_kernel=8.0 merge_scatter=6.0 ms]" in line
+
+
+def test_dcp_marks_wired_in_both_schedules():
+    from sglang.srt.layers.attention import flashinfer_backend as fb
+
+    src = inspect.getsource(fb.FlashInferAttnBackend._forward_extend_dcp)
+    for name in fft.DCP_MARKS:
+        assert '_fft.dcp_mark(layer.layer_id, "%s")' % name in src
+    assert src.count('_fft.dcp_mark(layer.layer_id, "prefix")') == 2
+    assert src.count('_fft.dcp_mark(layer.layer_id, "exit")') == 2

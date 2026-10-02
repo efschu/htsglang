@@ -62,6 +62,7 @@ from sglang.srt.layers.dcp.lockstep import (
     weightless_has_prefix,
 )
 from sglang.srt.layers.dcp.owner import build_dcp_weighted_kv_indices_sync_free
+from sglang.srt.weg2 import first_fwd_timing as _fft  # DP-NACHLAUF DCP sub-steps
 from sglang.srt.layers.dcp.verify_preplan import (
     DcpVerifyPrebuilt,
     HostPlanMeta,
@@ -6708,6 +6709,7 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         group = get_parallel().dcp_group
         do_write = k is not None and save_kv_cache
+        _fft.dcp_mark(layer.layer_id, "enter")  # DP-NACHLAUF WEG2-FIRST-FWD-TIMING
 
         causal = (
             not layer.is_cross_attention
@@ -6752,6 +6754,7 @@ class FlashInferAttnBackend(AttentionBackend):
             o_cur, lse_cur = self._dcp_ragged_current(
                 q_local, k, v, layer, causal, logits_soft_cap
             )
+            _fft.dcp_mark(layer.layer_id, "cur")
             if not has_prefix:
                 if do_write and _scatter_late:
                     self._dcp_write_scatter(
@@ -6768,6 +6771,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 q_full = cp_all_gather_heads_uneven(
                     q_local, group, self.dcp_q_head_counts
                 )
+            _fft.dcp_mark(layer.layer_id, "q_ready")
             if self._sess_verify_active():
                 # C4 (spec-in-spill-tick): this rank's committed prefix lives on
                 # host (kv-session-offload spill) -- stream it blockwise via the
@@ -6797,6 +6801,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     k_scale=layer.k_scale_float,
                     v_scale=layer.v_scale_float,
                 )
+            _fft.dcp_mark(layer.layer_id, "prefix")
             o_pre, lse_pre = _dcp_uneven_merge(
                 o_pre_raw,
                 lse_pre_raw,
@@ -6813,9 +6818,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 self._dcp_write_scatter(
                     layer, forward_batch, cache_loc, k_full_seq, v_full_seq
                 )
-            return self._dcp_extend_final_merge(
+            _o_fin = self._dcp_extend_final_merge(
                 q, layer, o_cur, lse_cur, o_pre, lse_pre
             )
+            _fft.dcp_mark(layer.layer_id, "exit")
+            return _o_fin
 
         # ================= OVERLAPPED SCHEDULING (#128) =================
         # Two-lane schedule. The per-layer collective ISSUE ORDER on the DCP
@@ -6858,6 +6865,7 @@ class FlashInferAttnBackend(AttentionBackend):
         o_cur, lse_cur = self._dcp_ragged_current(
             q_local, k, v, layer, causal, logits_soft_cap
         )
+        _fft.dcp_mark(layer.layer_id, "cur")
         if not has_prefix:
             # Join, then scatter the (gathered) kv into this rank's owned
             # slots before returning -- same cache state as the sequential
@@ -6871,6 +6879,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # main lane waits for B (and transitively A) before the paged read.
         if not _reorder_only:
             cur_stream.wait_stream(comm_stream)
+        _fft.dcp_mark(layer.layer_id, "q_ready")
         if self._sess_verify_active():
             # C4 (spec-in-spill-tick): host-resident committed prefix -> the
             # multi-row NON-CAUSAL verify twin over the session spill region.
@@ -6901,6 +6910,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+        _fft.dcp_mark(layer.layer_id, "prefix")
         # comm lane: C (LSE all-gather) + merge math + D (out all-reduce) --
         # unchanged function, unchanged reduction order, just issued on the
         # comm stream so the main lane can scatter-write concurrently.
@@ -6937,7 +6947,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # allocations (k_full/v_full/q_full/o_pre/lse_pre) are consumed by
         # the main lane after joins; their blocks only become reusable for
         # the comm lane at the NEXT fork, which waits on the main lane.
-        return self._dcp_extend_final_merge(q, layer, o_cur, lse_cur, o_pre, lse_pre)
+        _o_fin = self._dcp_extend_final_merge(q, layer, o_cur, lse_cur, o_pre, lse_pre)
+        _fft.dcp_mark(layer.layer_id, "exit")
+        return _o_fin
 
     def _dcp_debug_overlap_probe(self, layer, forward_batch, cache_loc, force_prefix):
         """Diagnostic (#128): report any intersection between this layer's
