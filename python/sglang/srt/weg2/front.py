@@ -8937,6 +8937,9 @@ class Front:
         # showed the number. Instrument-text-lies, class A.
         self._note_front_price(rid, remainder)  # RESUME-VIA-P: the W50-REROUTE line's front_price
         self._route_x_live = int(x_route)  # FEHLT 8: the X the last ROUTE-VERDICT decided with
+        # USAGE-DETAILS: x_short = SHORT only by the live X above the band floor
+        self._usage_route_note(rid, "x_short" if route == "short" and remainder > _x_floor else route,
+                               self.epoch)
         logger.info(
             "WEG2 ROUTE-VERDICT rid=%s verdict=%s uncached=%d (base for X=%d, "
             "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the MEASURED "
@@ -9397,6 +9400,8 @@ class Front:
         self.queue.clear()
         for p in moved:
             p.d_direct = True
+            if p.x_deferred:  # USAGE-DETAILS: the band request is served on D after all
+                self._usage_route_note(p.rid, "x_short", self.epoch)
             self._ready_for_d.append(p)
         self._sync_batch_gate()
         self.counters["x_idle_regrant_requests"] += len(moved)
@@ -10869,7 +10874,10 @@ class Front:
             # USAGE-TRUE: every P leg of the rid (re-route, X-REQUEUE, park
             # hand-back, RESUME-VIA-P alike) adds what P really computed; leg 2
             # corrects the client's cached count with it.
-            self._p_leg_note(p.rid, pt, ct)
+            self._p_leg_note(p.rid, pt, ct, _ut.tier_split_of(js))
+            # USAGE-DETAILS: a rid that went through P is served LONG (a
+            # re-route of a SHORT verdict included), from this epoch on
+            self._usage_route_note(p.rid, "long", self.epoch, keep_same=True)
             # STORE-PRESENCE (NF ba76adffe2): ids for a fallback-priced rid NOW (before P's sleep
             # flush, not only at its leg 2), and P's END-ANCHOR noted for the flush
             await self._x_exact_backfill(p.rid, p.path, p.payload, p.text)
@@ -10955,14 +10963,140 @@ class Front:
         self.counters["p_prefix_tokens_reused"] += max(0, int(leg1_cached_tokens))
 
     # -- USAGE-TRUE (weg2/usage_true.py) -------------------------------------
-    def _p_leg_note(self, rid: str, prompt_tokens: int, cached_tokens: int) -> None:
+    def _p_leg_note(self, rid: str, prompt_tokens: int, cached_tokens: int,
+                    tiers: Optional[Dict[str, int]] = None) -> None:
         """One P leg of ``rid`` ran: add what P computed (prompt - cached).
-        Bounded; an entry ends with the client relay of its leg 2."""
+        ``tiers``: the tier split P reported for its cache hit (the last P
+        leg's wins). Bounded; an entry ends with the client relay of leg 2."""
         led = self.__dict__.setdefault("_p_legs_computed", collections.OrderedDict())
-        n, legs = led.pop(rid, (0, 0))
-        led[rid] = (n + max(0, int(prompt_tokens or 0) - int(cached_tokens or 0)), legs + 1)
+        n, legs, _tiers = led.pop(rid, (0, 0, None))
+        led[rid] = (n + max(0, int(prompt_tokens or 0) - int(cached_tokens or 0)), legs + 1, tiers)
         while len(led) > 4096:
             led.popitem(last=False)
+
+    def _p_leg_tiers(self, rid: str) -> Optional[Dict[str, int]]:
+        led = self.__dict__.get("_p_legs_computed")
+        e = led.get(rid) if led else None
+        return None if e is None else e[2]
+
+    # -- USAGE-DETAILS (weg2/usage_true.py) -----------------------------------
+    def _usage_route_note(self, rid: str, route: str, epoch: int, keep_same: bool = False) -> None:
+        """The route of ``rid`` as its last verdict named it, with that
+        verdict's epoch (``keep_same``: an unchanged route keeps its epoch)."""
+        d = self.__dict__.setdefault("_usage_route", collections.OrderedDict())
+        cur = d.get(rid)
+        if keep_same and cur is not None and cur[0] == route:
+            return
+        d.pop(rid, None)
+        d[rid] = (str(route), int(epoch))
+        while len(d) > 4096:
+            d.popitem(last=False)
+
+    def _d_admit_open(self, rid: str, t0: float) -> list:
+        """A leg 2 is admitted to D: its prefill window opens (closed at its
+        first content, else at its end) -- another stream's gap that overlaps
+        it is a ``prefill_d`` interruption."""
+        h = self.__dict__.get("_d_admit_hist")
+        if h is None:
+            h = self.__dict__["_d_admit_hist"] = collections.deque(maxlen=512)
+        e = [str(rid), float(t0), None]
+        h.append(e)
+        return e
+
+    def _usage_details(self, rid: str, stream: bool, obj: dict, reading, p_computed: Optional[int],
+                       t_leg2: float, clock: Optional["_ut.TokenClock"] = None,
+                       tiers: Optional[Dict[str, int]] = None,
+                       reasoning_text: str = "",
+                       first_content: Optional[Tuple[Optional[float], Optional[float]]] = None,
+                       ) -> Dict[str, Dict[str, Any]]:
+        """``usage.total_tokens_details`` (+ the tier split, the reasoning
+        count) of one client answer; logs ``WEG2-USAGE-DETAILS`` once.
+
+        ``flips``: flips begun between the arrival and now (the last token).
+        ``sleep`` / ``sleep_s`` / ``sleep_causes``: the decode's interruptions
+        -- on a stream the token gaps :func:`usage_true.attribute_gaps` names,
+        on a body the flip/park windows overlapping the leg. Never-measured
+        values are omitted, never guessed."""
+        now = time.time()
+        book = Front._req_book(self)
+        row = book._row(rid)
+        arr = row.get("arrival_ts") if row else None
+        since = arr if arr is not None else t_leg2
+        fp = Front._flip_phase(self)
+        flip_w = fp.windows(since, now)
+        park_w = book.park_windows_of(rid, now)
+        det: Dict[str, Any] = {"flips": fp.begun(since, now)}
+        if stream:
+            adm = [(e[1], e[2] if e[2] is not None else now)
+                   for e in (self.__dict__.get("_d_admit_hist") or ())
+                   if e[0] != rid and (e[2] is None or e[2] >= since)]
+            n, s, causes, unnamed = _ut.attribute_gaps(clock or _ut.TokenClock(), flip_w, park_w, adm)
+            for ms in unnamed:
+                self.counters["usage_gap_unnamed"] += 1
+                logger.info("WEG2-USAGE-GAP-UNNAMED rid=%s ms=%d", rid, ms)
+        else:
+            n, s, causes = _ut.attribute_windows(t_leg2, now, flip_w, park_w)
+        det["sleep"], det["sleep_s"], det["sleep_causes"] = int(n), round(float(s), 3), causes
+        if row is not None and arr is not None and row.get("first_dispatch_ts") is not None:
+            det["queue_s"] = round(max(0.0, float(row["first_dispatch_ts"]) - float(arr)), 3)
+        if stream:
+            # the LEG2-FIRST-CONTENT clock (its arrival when it had one)
+            t_fc, a_fc = first_content if first_content is not None else (None, None)
+            if t_fc is None and clock is not None:
+                t_fc = clock.first
+            a_fc = a_fc if a_fc is not None else arr
+            if t_fc is not None and a_fc is not None:
+                det["ttft_s"] = round(max(0.0, float(t_fc) - float(a_fc)), 3)
+        det["p_computed"] = int(p_computed or 0)
+        det["d_computed"] = int(reading[3]) if reading else 0
+        decode_s = None
+        if stream and clock is not None and clock.first is not None:
+            decode_s = max(0.0, (clock.last - clock.first) - s)
+        elif not stream:
+            ps = d_prefill_seconds(obj)
+            if ps is not None:
+                decode_s = max(0.0, (now - t_leg2) - ps - s)
+        if decode_s is not None:
+            det["decode_s"] = round(decode_s, 3)
+            comp = _ut.completion_of(obj)
+            if decode_s > 0 and comp:
+                det["decode_tps"] = round(comp / decode_s, 2)
+        for holder in (obj.get("meta_info"), obj.get("sglext")):
+            if isinstance(holder, dict) and holder.get("spec_accept_length") is not None:
+                try:
+                    det["spec_accept"] = round(float(holder["spec_accept_length"]), 3)
+                except (TypeError, ValueError):
+                    pass
+                break
+        route = (self.__dict__.get("_usage_route") or {}).get(rid)
+        if route is not None:
+            det["route"], det["route_epoch"] = route[0], route[1]
+        adds: Dict[str, Dict[str, Any]] = {"total_tokens_details": det}
+        anth = _ut.wire_of(obj) == "anthropic"
+        if tiers:
+            if anth:
+                det.update(tiers)  # no standard object on the Anthropic wire
+            else:
+                adds["prompt_tokens_details"] = dict(tiers)
+        u = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+        ctd = u.get("completion_tokens_details")
+        have = (isinstance(ctd, dict) and ctd.get("reasoning_tokens")) or u.get("reasoning_tokens")
+        tok = getattr(getattr(self, "ftok", None), "_tok", None)
+        if not have and reasoning_text and tok is not None:
+            try:
+                nr = len(tok.encode(reasoning_text, add_special_tokens=False))
+            except Exception:  # noqa: BLE001 -- an instrument never breaks serving
+                nr = None
+            if nr is not None:
+                if anth:
+                    det["reasoning_tokens"] = nr
+                else:
+                    adds["completion_tokens_details"] = {"reasoning_tokens": nr}
+        self.counters["usage_details"] += 1
+        logger.info("WEG2-USAGE-DETAILS rid=%s %s%s", rid, _ut.details_log_fields(det),
+                    "".join(f" {k}.{mk}={mv}" for k, m in adds.items()
+                            if k != "total_tokens_details" for mk, mv in m.items()))
+        return adds
 
     def _p_leg_computed(self, rid: str) -> Optional[int]:
         """Tokens P computed for ``rid`` over all its P legs; None = no P leg
@@ -11074,6 +11208,7 @@ class Front:
         t0 = time.time()
         Front._req_book(self).leg2_dispatch(rid, t0)  # DASHBOARD-IPC: d_first_token starts, D prefills
         Front._rb_changed(self)
+        _adm = self._d_admit_open(rid, t0)  # USAGE-DETAILS: D's prefill window for this leg
         # UNIFY S7 (27B Review V (3)): the X this rid's SHORT grant was decided
         # on (None for a BATCH / re-granted / re-queued leg 2, or switch off).
         _x_grant = self._x_grants.pop(rid, None)
@@ -11275,13 +11410,16 @@ class Front:
                             headers={"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)})
                 _has_content = (stream and r.status == 200 and early_body is None
                                 and stream_has_content(first_chunk, request.path))
+                _fc: Dict[str, Optional[float]] = {"t": None, "arr": None}  # USAGE-DETAILS: ttft_s
                 if _has_content:
+                    _adm[2] = time.time()  # USAGE-DETAILS: D's prefill of this leg is done
                     # #49 rest, INSTRUMENT (routing unchanged): D's first
                     # content for this leg. Joined by rid with the
                     # ROUTE-VERDICT line (the arrival), it is the
                     # arrival-to-first-token the agent-load boot measures.
                     # NF-STAU: arrival -> first token (the user's TTFT), IPC too
                     _t_arr = self._asr_arrival_of(rid, pop=True)
+                    _fc["t"], _fc["arr"] = time.time(), _t_arr
                     _ttft = -1.0
                     if _t_arr is not None:
                         _ttft = max(0.0, (time.time() - _t_arr) * 1000.0)
@@ -11396,21 +11534,37 @@ class Front:
                     # stream or, RESUME-VIA-P, during it) the client's copy of
                     # every usage event carries the prefill really computed; the
                     # tail and the usage reader above keep D's raw bytes.
-                    usage_fix: Dict[str, Any] = {"c": None, "p": None, "open": True}
+                    usage_fix: Dict[str, Any] = {"c": None, "p": None, "open": True, "det": None}
+                    # USAGE-DETAILS: the client API wires carry the detail
+                    # object on their final usage; /generate only the fix.
+                    _det_on = request.path in CACHED_TIER_ASK_PATHS and r.status == 200
+                    _tclock = _ut.TokenClock()
+                    _want_rsn = getattr(getattr(self, "ftok", None), "_tok", None) is not None
+
+                    def _details(obj: dict, reading) -> Dict[str, Dict[str, Any]]:
+                        _pc = usage_fix["p"]
+                        tiers = (self._p_leg_tiers(rid) if _pc is not None
+                                 else _ut.tier_split_stream_tail(bytes(tail)))
+                        _rs = usage_fix["c"].reasoning if usage_fix["c"] is not None else None
+                        usage_fix["det"] = self._usage_details(
+                            rid, True, obj, reading, _pc, t0, _tclock, tiers,
+                            "".join(_rs or ()), (_fc["t"], _fc["arr"]))
+                        return usage_fix["det"]
 
                     async def _emit(chunk: bytes) -> None:
                         p_now = self._p_leg_computed(rid) if usage_fix["open"] else None
-                        if usage_fix["c"] is None and p_now is None:
+                        if usage_fix["c"] is None and p_now is None and not _det_on:
                             await _write_client(chunk)  # no P leg: D's bytes as they are
                             return
                         if not usage_fix["open"]:
                             await _write_client(chunk)  # after D's end (TN): as is
                             return
                         if usage_fix["c"] is None:
-                            usage_fix["c"] = _ut.StreamCorrector()
+                            usage_fix["c"] = _ut.StreamCorrector(want_reasoning=_det_on and _want_rsn)
                         if p_now is not None:
                             usage_fix["p"] = p_now
-                        chunk = usage_fix["c"].feed(chunk, usage_fix["p"])
+                        chunk = usage_fix["c"].feed(chunk, usage_fix["p"],
+                                                    _details if _det_on and usage_fix["det"] is None else None)
                         if chunk:
                             await _write_client(chunk)
 
@@ -11437,6 +11591,8 @@ class Front:
                     async def _push(chunk: bytes) -> None:
                         if anth is not None:
                             anth.feed(chunk)
+                        if usage_fix["open"] and stream_has_content(chunk, request.path):
+                            _tclock.note(time.time())  # USAGE-DETAILS: the token stream's gaps
                         _scan_from = max(0, len(tail) - 64)
                         tail.extend(chunk)
                         if not client_io["finished"] and stream_finish_seen(bytes(tail[_scan_from:])):
@@ -11500,7 +11656,8 @@ class Front:
                         await _emit(strip_cached_tier(bytes(tier_carry), request.path, True))
                     tier_carry = None  # D has ended: anything pushed after this (TN) goes out as is
                     if usage_fix["c"] is not None and not client_io["gone"]:
-                        _uc_rest = usage_fix["c"].flush(usage_fix["p"])
+                        _uc_rest = usage_fix["c"].flush(
+                            usage_fix["p"], _details if _det_on and usage_fix["det"] is None else None)
                         if _uc_rest:
                             await _write_client(_uc_rest)
                     usage_fix["open"] = False  # USAGE-TRUE: D has ended, TN goes out as is
@@ -11593,6 +11750,14 @@ class Front:
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"],
                                 self._sess_tag(rid))
+                    if _det_on and usage_fix["det"] is None and priced:
+                        # USAGE-DETAILS: no usage event reached the client (none
+                        # asked for, or it left) -- the line is still written
+                        _rd = _ut.true_cached(pt, ct, usage_fix["p"] or 0)
+                        self._usage_details(
+                            rid, True, {"usage": {"prompt_tokens": pt, "completion_tokens": comp}},
+                            (pt, ct, _rd[0], _rd[1]), usage_fix["p"], t0, _tclock,
+                            None, "", (_fc["t"], _fc["arr"]))
                     self._usage_true_done(rid, usage_fix["c"].reading if usage_fix["c"] is not None else None,
                                           usage_fix["p"])
                     # UNIFY S4 (H85): the streamed leg samples r_D too (it never did).
@@ -11737,10 +11902,18 @@ class Front:
                     body = strip_cached_tier(body, request.path, False)
                 if r.status == 200:
                     # USAGE-TRUE: the client's copy carries the prefill really
-                    # computed (P legs + D); D-only = no P leg = these bytes.
+                    # computed (P legs + D); USAGE-DETAILS: the client API
+                    # wires carry the detail object on their usage.
                     _pc = self._p_leg_computed(rid)
-                    if _pc is not None:
-                        body, _ut_reading = _ut.correct_doc(body, _pc)
+                    _ut_det = None
+                    if request.path in CACHED_TIER_ASK_PATHS:
+                        _tiers = self._p_leg_tiers(rid) if _pc is not None else _ut.tier_split_of(js)
+
+                        def _ut_det(obj, reading, _tiers=_tiers):
+                            return self._usage_details(rid, False, obj, reading, _pc, t0, None, _tiers,
+                                                       _ut._reasoning_piece(obj))
+                    if _pc is not None or _ut_det is not None:
+                        body, _ut_reading = _ut.correct_doc(body, _pc, _ut_det, stream=False)
                         self._usage_true_done(rid, _ut_reading, _pc)
                 return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Weg2Stop:
@@ -11750,6 +11923,8 @@ class Front:
             logger.error("WEG2 leg2 rid=%s failed: %s: %s", rid, type(e).__name__, e)
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         finally:
+            if _adm[2] is None:
+                _adm[2] = time.time()  # USAGE-DETAILS: a leg without content ends its window here
             g.outstanding.pop(rid, None)
             (self.__dict__.get("_d_prefill_legs") or {}).pop(rid, None)  # PARK-HANDBACK
             Front._req_book(self).leg2_end(rid, time.time())  # DASHBOARD-IPC: front.d_activity
