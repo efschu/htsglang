@@ -234,6 +234,7 @@ from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
+from sglang.srt.weg2 import wake_preload as _weg2_wake_preload  # DP-NACHLAUF WAKE-PRELOAD
 from sglang.srt.weg2 import flush_verdict as _weg2_flush_verdict  # z30j PP0 flush verdict
 from sglang.srt.managers import weg2_flush_nonblock as _weg2_flush_nonblock  # B1 (30.09.)
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
@@ -17986,8 +17987,9 @@ class Scheduler(
         _wk_t2b = time.perf_counter()  # ScheduleBatch.init_new done (Task #3 split)
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
+            # DP-NACHLAUF: a WAKE-PRELOAD producer is consumed by the first batch
+            new_batch.hicache_consumer_index = _weg2_wake_preload.consumer_index(
+                self.tree_cache, self.tree_cache.ready_to_load_host_cache()
             )
 
         _wk_t3 = time.perf_counter()  # init_new done

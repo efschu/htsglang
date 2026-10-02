@@ -10847,6 +10847,16 @@ class SchedulerWeightUpdaterManager:
                         "W26 Weg2WakeInvariantRefused: flush_cache() refused after resume(kv_cache) "
                         "(the group is not idle?) -- the pools hold recycled pages, serving on them is unsafe"
                     )
+                # DP-NACHLAUF WAKE-PRELOAD: the held requests' prefix H2D starts
+                # here, after the re-zero and before the reply (group-voted)
+                try:
+                    from sglang.srt.weg2 import wake_preload as _wpl
+
+                    _wpl.run(self, l15_hold_aware=getattr(self, "_l15_wake_manifest", None) is not None)
+                except Exception as _wpl_exc:  # noqa: BLE001 -- the first pass loads as before
+                    if "RANKS DISAGREE" in str(_wpl_exc):
+                        raise  # ranks never disagree: stop by name
+                    logger.info("WEG2-WAKE-PRELOAD failed (%s: %s)", type(_wpl_exc).__name__, _wpl_exc)
         def _weg2_kv_clear_part():
             # Wake-Parallel: DORMANT cleared, hold release, store rescan, disagg
             # queues -- only once the weights are resumed (the late site).
