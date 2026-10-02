@@ -11,9 +11,14 @@ no scheduler import.
 
 from __future__ import annotations
 
+import logging
 from typing import Sequence, Tuple
 
+import torch
+
 from sglang.srt.weg2 import l15_restore, l15_sample, l15_wake_check
+
+logger = logging.getLogger(__name__)
 
 
 def sample_check(
@@ -57,4 +62,45 @@ def sample_check(
     device = l15_sample.read_rows(live_pool, [int(t[1]) for t in sampled])
     source = l15_sample.read_rows(scratch_pool, scratch)
     ok, bad = l15_wake_check.sample_rows_equal(device, source)
+    if bad:
+        try:
+            logger.warning("%s", check_diag(device, source, sampled))
+        except Exception as exc:  # noqa: BLE001 -- diagnostics only
+            logger.warning("L15-CHECK-DIAG failed: %r", exc)
     return (ok, bad, missing)
+
+
+def check_diag(device_rows, l2_rows, sampled) -> str:
+    """L15-CHECK-DIAG: classify the bad sampled rows. For each L2 row that
+    differs from its own live row, look for an EQUAL live row elsewhere in
+    the sample: found -> misaligned (offset j - i recorded), an all-zero L2
+    row -> zero, else -> foreign. First bad row's identity is printed."""
+    n = min(len(device_rows), len(l2_rows))
+    misaligned, zero, foreign = 0, 0, 0
+    offsets = set()
+    first = None
+    for i in range(n):
+        if torch.equal(device_rows[i], l2_rows[i]):
+            continue
+        if first is None:
+            first = i
+        hit = next((j for j in range(n) if j != i
+                    and torch.equal(device_rows[j], l2_rows[i])), None)
+        if hit is not None:
+            misaligned += 1
+            offsets.add(hit - i)
+        elif not bool(torch.any(l2_rows[i] != 0)):
+            zero += 1
+        else:
+            foreign += 1
+    bad = misaligned + zero + foreign
+    who = ""
+    if first is not None:
+        t = sampled[first]
+        dv, lv = device_rows[first].float(), l2_rows[first].float()
+        who = (" first=(rid=%s row=%s l2_slot=%s gen=%s live_absmax=%.4g "
+               "l2_absmax=%.4g)" % (t[0], t[1], t[2], t[3],
+                                    float(dv.abs().max()) if dv.numel() else 0.0,
+                                    float(lv.abs().max()) if lv.numel() else 0.0))
+    return ("L15-CHECK-DIAG bad=%d misaligned=%d offsets=%s zero=%d foreign=%d%s"
+            % (bad, misaligned, sorted(offsets)[:6], zero, foreign, who))
