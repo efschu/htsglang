@@ -495,7 +495,12 @@ def flip_views(segs: List[dict], ipc: dict, now: float) -> List[dict]:
     ut = list(ipc.get("flip_user_time") or [])
     lo = segs[0]["s"] if segs else now
     out = []
+    prev_done = None   # the previous flip's done: P cannot have ended a chunk before it was woken
     for i, (b, bd) in enumerate(begins):
+        if i > 0:
+            pb = begins[i - 1][0]
+            pdn = (done.get(round(float(pb), 2)) or {}).get("t") if pb is not None else None
+            prev_done = pdn if pdn is not None else pb
         if b is None or b < lo:
             continue
         nxt = begins[i + 1][0] if i + 1 < len(begins) else None
@@ -517,7 +522,11 @@ def flip_views(segs: List[dict], ipc: dict, now: float) -> List[dict]:
             continue
         horizon = min(nxt if nxt is not None else now, t_done + FLIP_IDLE_S)
         if d == "P>D":
-            p_end = _seg_last_end(segs, ("P", "single"), b + 0.3, b - FLIP_IDLE_S)
+            # Vorlauf-Artefakt (N3u 07:33:29/:39 11,3/21,0 s, N4p 09:58:14 17,2 s): after the acceptance
+            # probe's manual D->P (POST /weg2/flip) P did no work and flipped back -- the search reached
+            # back past that D->P to the P chunk of the phase BEFORE it. Bounded by the previous flip's done.
+            p_lo = b - FLIP_IDLE_S if prev_done is None else max(b - FLIP_IDLE_S, float(prev_done))
+            p_end = _seg_last_end(segs, ("P", "single"), b + 0.3, p_lo)
             first = _seg_first(segs, ("dec",), t_done - 0.3, horizon)
             if p_end is not None:
                 row["vorlauf_ms"] = max(0.0, (b - p_end) * 1000.0)
