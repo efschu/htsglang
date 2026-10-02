@@ -512,18 +512,21 @@ import logging  # noqa: E402
 
 from sglang.srt.weg2 import l15_check as l15_check_mod  # noqa: E402
 
-# Distinct l2 slots per rid: two rids claiming ONE L2 page row would trip
-# l15_refill.refill's duplicate-slot guard (the shared KV slot 3 keeps the
-# same destination compact row; only its L2 source rows differ per rid).
+# Shared prefix rows carry the IDENTICAL l2 identity in both spans -- that
+# is what chain_host_rows actually records: both walks pass the same radix
+# nodes, so the same node's host slot/generation appears in both spans
+# (L15-DEDUPE; the pre-dedupe fixture here gave the shared rows per-rid
+# distinct sources, a shape no real manifest can have, solely to dodge the
+# old duplicate-slot guard). Only the spans' own tail rows differ.
 REFILL_L2 = {
     "sa": ((201, 202, 203, 204), (5, 6, 7, 8)),
-    "sb": ((205, 206, 207, 208), (5, 6, 7, 8)),
+    "sb": ((201, 202, 203, 208), (5, 6, 7, 8)),
 }
 REFILL_ANCHOR_L2 = (31, 3)
-REFILL_KV_GENS = {201: 5, 202: 6, 203: 7, 204: 8,
-                  205: 5, 206: 6, 207: 7, 208: 8}
-# rank 0 owns slot 3 (index 2 of both spans) -> the KV load is exactly:
-REFILL_KV_CALL = ([203, 207], [1, 1])
+REFILL_KV_GENS = {201: 5, 202: 6, 203: 7, 204: 8, 208: 8}
+# rank 0 owns slot 3 (index 2 of both spans): the shared row is refilled
+# ONCE (L15-DEDUPE) -> the KV load is exactly:
+REFILL_KV_CALL = ([203], [1])
 REFILL_ANCHOR_CALL = ([31, 31], [1, 1])   # both spans share anchor 31 -> row 1
 
 
@@ -685,8 +688,10 @@ def test_refill1_chain_holds_and_the_act_never_refills_again(
     for r in range(3):
         assert WU._l15_wake_check_and_decide(fss[r], True, fps[r],
                                              epoch=EPOCH) == "hold"
-    # Real sample plans: owned-with-L2 tokens per rank (slot%3 classes).
-    assert seen == [2, 3, 3]
+    # Real sample plans: distinct owned-with-L2 rows per rank (slot%3
+    # classes), shared prefix rows sampled ONCE (L15-DEDUPE): rank 0 row
+    # 12 (both spans), rank 1 rows 10,13, rank 2 rows 11,14.
+    assert seen == [1, 2, 2]
     assert [o for _g, o in calls] == [v, v, v]   # the REAL votes agree
     for r in range(3):
         assert WU._l15_wake_act(fss[r], scheds[r], "hold",

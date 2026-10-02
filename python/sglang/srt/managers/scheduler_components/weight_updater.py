@@ -7582,12 +7582,12 @@ class SchedulerWeightUpdaterManager:
             prefix = [0]
             for _x in _vw:
                 prefix.append(prefix[-1] + _x)
-            for span, i, slot in l15_restore._owned_tokens(m, rank, prefix):
-                src = l15_restore._l2_source(span, i)
-                if src is not None:
-                    plan.append((str(span.rid),
-                                 l15_restore._compact_row(prefix, rank, slot),
-                                 int(src[0]), int(src[1])))
+            # L15-DEDUPE: shared-prefix rows planned ONCE; the rid tag is
+            # display-only here (l15_sample.sample_plan str()-es it) and a
+            # duplicate would only waste sample slots.
+            plan = [(str(rids[0]), row, slot, gen)
+                    for row, slot, gen, _lane, rids in
+                    l15_restore.owned_l2_rows(m, rank, prefix)]
             device_pool = getattr(getattr(getattr(sched, "tp_worker", None),
                                           "model_runner", None),
                                   "token_to_kv_pool", None)
@@ -7695,15 +7695,11 @@ class SchedulerWeightUpdaterManager:
                 raise LookupError("refill needs the device KV pool and the "
                                   "L2 host pool")
             page_tokens = max(1, int(getattr(host_pool, "_arena_page_tokens", 1)))
-            # rid-tagged 4-tuples (rid, compact_row, l2_slot, l2_gen): the
-            # rid is what makes a generation mismatch drop a whole request.
-            plan = []
-            for span, i, slot in l15_restore._owned_tokens(m, rank, prefix):
-                src = l15_restore._l2_source(span, i)
-                if src is not None:
-                    plan.append((str(span.rid),
-                                 l15_restore._compact_row(prefix, rank, slot),
-                                 int(src[0]), int(src[1])))
+            # rid-tagged plan (L15-DEDUPE): one entry per distinct row,
+            # shared-prefix rows ONCE, tagged with the FULL tuple of the
+            # sharing rids so one generation mismatch drops every sharing
+            # request whole (l15_restore.rid_tagged_plan).
+            plan = l15_restore.rid_tagged_plan(m, rank, prefix)
             if not plan:
                 return 0
             ok, bad = l15_refill.gen_check(plan, host_pool)

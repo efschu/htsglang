@@ -5,11 +5,12 @@ manifest-derived refill plan into ONE generation-checked, page-grouped
 bulk H2D through ArenaMHAHostPool._load_pages_all_layers. The wiring into
 the wake (weight_updater) is a later step.
 
-Plan entries are 4-tuples ``(rid, compact_row, l2_slot, l2_gen)`` as
-produced from the manifest (l15_restore.refill_plan yields
-(compact_row, l2_slot, l2_gen); the wiring tags each row with the span's
-rid -- the rid is what makes a generation mismatch drop a WHOLE request,
-never a partial one).
+Plan entries are 4-tuples ``(rids, compact_row, l2_slot, l2_gen)`` (5 with
+the lane, P > 1) as produced from the manifest by
+l15_restore.rid_tagged_plan: one entry per distinct compact row -- shared
+prefix rows are carried ONCE with the tuple of every rid sharing them
+(L15-DEDUPE), so the copy loads each L2 row once and a generation
+mismatch still drops every sharing request WHOLE, never a partial one.
 
 OPEN (plan L15-12-PART3-PLAN section 8): the manifest (l15_manifest.
 HoldSpan) carries no L2 identity for the GDN anchor -- ``anchor_slot`` is
@@ -33,19 +34,20 @@ from typing import Dict, Iterable, List, Sequence, Set, Tuple
 import torch
 
 from sglang.srt.weg2.l15_manifest import Manifest
-from sglang.srt.weg2.l15_restore import (
-    _compact_row,
-    _l2_source,
-    _owned_tokens,
+from sglang.srt.weg2.l15_restore import (  # noqa: F401 -- L15RefillError re-exported
+    L15RefillError,
+    owned_l2_rows,
     refill_plan,
 )
 
 
-class L15RefillError(RuntimeError):
-    """Refill could not be performed as one whole operation.
-
-    The caller folds this into the wake's gather as a bad vote; a partial
-    copy is never reported as success."""
+def _rid_tag(tag) -> Tuple[str, ...]:
+    """The rid set a plan entry carries: a plain str tag (single rid) or
+    the tuple of EVERY rid sharing the row (l15_restore.owned_l2_rows).
+    gen_check drops whole requests per rid, so a mismatch marks them all."""
+    if isinstance(tag, str):
+        return (tag,)
+    return tuple(str(t) for t in tag)
 
 
 def refill_plan_laned(
@@ -55,24 +57,21 @@ def refill_plan_laned(
     """refill_plan's rows, tagged with the L2 page lane, as 4-tuples.
 
     ``(compact_row, l2_slot, l2_gen, lane)`` for exactly the rows and in the
-    order l15_restore.refill_plan yields them -- same ownership walk
-    (``_owned_tokens``), same L2 source resolution (``_l2_source``), same
-    row addressing (``_compact_row``), same cap>0 shortcut -- plus the lane
-    that refill_plan drops because it only carries 3-tuples. The lane is
-    ``span.l2_lanes[i]`` at the token's own index i in the span (parallel to
-    l2_slots/l2_gens, the P1 contract), or -1 when the record carries no
-    lane for that token: an old record (l2_lanes == ()), a P == 1 form, or a
+    order l15_restore.refill_plan yields them -- both ride the SAME dedupe
+    (``l15_restore.owned_l2_rows``: one entry per distinct compact row,
+    shared-prefix visits collapsed, conflicting visits refused) and the
+    same cap>0 shortcut -- plus the lane that refill_plan drops because it
+    only carries 3-tuples. The lane is ``span.l2_lanes[i]`` at the token's
+    own index i in the span (parallel to l2_slots/l2_gens, the P1 contract;
+    the shared row's first visit provides it -- sharing spans record the
+    same lane or the dedupe refuses), or -1 when the record carries no lane
+    for that token: an old record (l2_lanes == ()), a P == 1 form, or a
     l2_lanes shorter than the span (the tail). -1 means "no lane recorded",
     which the P>1 loader (_refill_pgt) refuses named -- it never guesses."""
     if cap_rows_by_rank[rank] > 0:
         return []
-    plan = []
-    for span, i, slot in _owned_tokens(m, rank, prefix):
-        src = _l2_source(span, i)
-        if src is not None:
-            lane = span.l2_lanes[i] if i < len(span.l2_lanes) else -1
-            plan.append((_compact_row(prefix, rank, slot), src[0], src[1], lane))
-    return plan
+    return [(row, slot, gen, lane)
+            for row, slot, gen, lane, _rids in owned_l2_rows(m, rank, prefix)]
 
 
 def gen_check(
@@ -84,7 +83,10 @@ def gen_check(
     or whose recorded l2_gen differs from the arena's current generation
     (incl. -1 = not COMPLETE) marks its WHOLE rid as dropped -- a token
     whose L2 row was re-claimed is foreign, and a half-refilled request is
-    worse than a missing one. ok_rows keeps the plan's entry order."""
+    worse than a missing one. The entry's rid tag may be a str or the
+    tuple of every rid sharing the row (owned_l2_rows): a mismatch drops
+    ALL of them whole, never just the first. ok_rows keeps the plan's
+    entry order; an entry survives only when NONE of its rids was dropped."""
     rows = list(plan)
     # Unique real slots for the ONE census call, in first-appearance order.
     unique: List[int] = []
@@ -100,11 +102,11 @@ def gen_check(
     gens: Dict[int, int] = dict(zip(unique, (int(g) for g in current)))
     bad: Set[str] = set()
     for entry in rows:
-        rid, slot, gen = entry[0], entry[2], entry[3]
+        slot, gen = entry[2], entry[3]
         cur = -1 if slot < 0 else gens.get(slot, -1)
         if cur != int(gen):
-            bad.add(rid)
-    ok = [r for r in rows if r[0] not in bad]
+            bad.update(_rid_tag(entry[0]))
+    ok = [r for r in rows if not (bad & set(_rid_tag(r[0])))]
     return ok, sorted(bad)
 
 
