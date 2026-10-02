@@ -254,3 +254,18 @@ def test_the_tree_records_a_park_backup_the_arena_refused():
     tree._1421_refused("mamba_pin", node)
     tree._1421_refused("arena_claim", node)
     assert tree._weg2_park_track == {7: node}
+
+
+
+def test_flip_edge_a_clean_park_never_stats_the_held_spans(tmp_path, monkeypatch):
+    """FLIP-EDGE (N5d epoch 8, 12:52:29): nothing refused -> one vote, NO held_facts (it stat'ed
+    169224 L3 stems of the held weg2-6-10: rest_ms=1099 on every rank, verdict clean)."""
+    tree, _park_node = _setup(tmp_path, on_disk_n=HELD)
+    from sglang.srt.weg2 import park_hold_yield as hy
+
+    calls = []
+    monkeypatch.setattr(hy, "held_facts", lambda t, rid: calls.append(rid) or (0, 0))
+    hy.begin(tree)
+    parked = [types.SimpleNamespace(rid="weg2-14-25")]
+    assert hy.settle(types.SimpleNamespace(tree_cache=tree), retracted=[], parked=parked) == "clean"
+    assert calls == [] and tree.votes == 1
