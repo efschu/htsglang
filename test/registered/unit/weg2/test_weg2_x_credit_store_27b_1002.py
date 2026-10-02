@@ -211,3 +211,15 @@ def test_weg2_6_10_leaves_0_4_before_its_anchor_and_stays_long():
     ids_6_10 = _extend(ids_0_4[:45244], 45434 - 45244)      # reused=45244 < END-ANCHOR 45248
     pending, credit, _k, _src = f.tspans.pending(ids_6_10, epoch=None)
     assert credit == 0 and pending == 45434 > 3991, "no over-credit past the divergence (PX)"
+
+
+def test_the_reprice_line_names_short_now(caplog):
+    caplog.set_level(logging.INFO)
+    f, _ids = _b6a_28_45()
+    f.awake = "D"
+    f.tp_prefill_max_tokens = 8452
+    f.queue.append(_queued(f, "weg2-28-45", "28-45", 4971))
+    f._p_leg1_store_note("weg2-26-43", "26-43", 55607)
+    f._p_flush_store_presence([])
+    line = [m for m in caplog.messages if "X-EXACT-REPRICE rid=weg2-28-45" in m][0]
+    assert "est_uncached 4971 -> 209 X=8452 crossed=no src=store_anchor" in line and "short_now=1" in line

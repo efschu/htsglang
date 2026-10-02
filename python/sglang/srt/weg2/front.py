@@ -5901,11 +5901,12 @@ class Front:
                 _short_now = True
                 self.counters["x_exact_reprice_short"] += 1
             logger.info("WEG2 X-EXACT-REPRICE rid=%s why=%s est_uncached %d -> %d X=%d "
-                        "crossed=%s src=%s epoch=%s (queued request re-priced against the "
-                        "current measured cached-on-D prefix; routing flags unchanged)",
+                        "crossed=%s src=%s epoch=%s short_now=%d (queued request re-priced against "
+                        "the current measured cached-on-D prefix; routing flags unchanged unless "
+                        "short_now=1: a LONG now <= X is d_eligible)",
                         p.rid, why, old, new, x,
                         ("down" if old > x >= new else "up" if new > x >= old else "no"),
-                        src, epoch)
+                        src, epoch, int(_short_now))
         return n
 
     def _sk_admission_reprice(self, p: "Pending") -> bool:
@@ -6203,6 +6204,7 @@ class Front:
                         "epoch now credits the #59 depth D witnessed for it, never its prompt; a later D "
                         "reading below it retracts it)", done_epoch, n, gained)
             self._x_exact_reprice_queue("d_epoch_publish")
+        return n
 
     def _seq_record(self, rid: str, ids: Any, mark: Optional[str], where: str) -> bool:
         """SEQ-HASH (02.10.): record D's sequence mark of ``rid`` (prompt ``ids``)."""
