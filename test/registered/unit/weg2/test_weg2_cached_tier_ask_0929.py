@@ -140,6 +140,31 @@ def d_bytes(path: str, stream: bool, asked: bool, depth) -> bytes:
     return _openai_stream(path, asked, depth) if stream else _openai_body(path, asked, depth)
 
 
+def _no_usage_details(got: bytes) -> bytes:
+    """The client bytes without the USAGE-DETAILS members (02.10.: an additive
+    ``usage.total_tokens_details`` on the final usage, and on the OpenAI wire
+    the tier split D reported as ``prompt_tokens_details.cached_device`` /
+    ``cached_l2`` / ``cached_l3``); everything else must be D's own bytes."""
+    from sglang.srt.weg2 import usage_true as UT
+
+    for key in (b',"total_tokens_details":', b',"cached_device":', b',"cached_l2":',
+                b',"cached_l3":'):
+        while True:
+            i = got.find(key)
+            if i < 0:
+                break
+            got = got[:i] + got[UT._value_end(got, i + len(key)):]
+    return got
+
+
+def test_usage_details_ride_on_the_final_usage_only():
+    """The members stripped above are there -- and only on the final usage."""
+    for path in PATHS:
+        got, _st, _ = asyncio.run(_leg(path, True, False, 7, after_p=True))
+        assert got.count(b'"total_tokens_details":') == 1, path
+        assert _no_usage_details(got) == d_bytes(path, True, False, 7)
+
+
 def _fake_d(depth, seen: list, piece: int = 0) -> web.Application:
     async def handle(request: web.Request) -> web.StreamResponse:
         payload = await request.json()
@@ -215,7 +240,7 @@ CASES = [(p, s, depth) for p in PATHS for s in (False, True) for depth in (None,
 def test_red_first_client_bytes_identical_and_cached_tier_counted(path, stream, depth):
     got, st, seen = asyncio.run(_leg(path, stream, False, depth, after_p=True))
     assert seen[0].get("return_cached_tokens_details") is True           # the internal hop asked
-    assert got == d_bytes(path, stream, False, depth)                    # the client: as if never asked
+    assert _no_usage_details(got) == d_bytes(path, stream, False, depth)                    # the client: as if never asked
     assert b"cached_tokens_details" not in got
     assert st["D"]["cached_tier"] == TIER
     assert st["D_after_P"]["cached_tier"] == TIER
@@ -226,14 +251,14 @@ def test_events_torn_across_reads_are_stripped_whole(path):
     """D's sglext / message_delta event split over several reads: the front
     strips it only once it is complete, the client bytes stay D's unasked ones."""
     got, st, _ = asyncio.run(_leg(path, True, False, 7, after_p=False, piece=13))
-    assert got == d_bytes(path, True, False, 7)
+    assert _no_usage_details(got) == d_bytes(path, True, False, 7)
     assert st["D"]["cached_tier"] == TIER
 
 
 @pytest.mark.parametrize("path,stream", [(p, s) for p in PATHS for s in (False, True)])
 def test_a_client_that_asked_keeps_the_detail(path, stream):
     got, st, _ = asyncio.run(_leg(path, stream, True, 7, after_p=False))
-    assert got == d_bytes(path, stream, True, 7)
+    assert _no_usage_details(got) == d_bytes(path, stream, True, 7)
     assert b"cached_tokens_details" in got
     assert st["D"]["cached_tier"] == TIER
 
