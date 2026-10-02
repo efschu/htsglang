@@ -190,6 +190,28 @@ def _await_fill_joins(arena, stems, joined, wait_ms: int) -> dict:
     return done
 
 
+def _finish_fill_joins(arena, stems, cand, out, joined, wait_ms: int, prefix: bool) -> None:
+    """L3FILL-JOIN (27B z30y14) on the NF form: the bounded wait for the
+    JOINED stems, run after the fill read and completed its own claims, then
+    the prefix answer. A stem whose holder completed inside the wait is read
+    from L2; the first stem still missing ends the prefix. This fill's own
+    pages past that stem are already COMPLETE and stay in the L2,
+    unreferenced -- another follower may be waiting for exactly those (freeing
+    them was the other half of the divergence); only the answer is None."""
+    if prefix:
+        # only the joins before the first miss that no wait can resolve matter
+        _pend = {int(j[0]) for j in joined}
+        _gap = next((i for i, _st in cand if out[i] is None and i not in _pend), len(out))
+        joined = [j for j in joined if int(j[0]) < _gap]
+    for i, s_ in _await_fill_joins(arena, stems, joined, wait_ms).items():
+        out[i] = s_
+    if prefix:
+        _stop = next((i for i, _st in cand if out[i] is None), len(out))
+        for i, _st in cand:
+            if i > _stop:
+                out[i] = None
+
+
 _STALE_REAP_N = [0, 0]   # reaps, stems re-claimed
 _LATE_COMPLETE_N = [0, 0]   # lines, slots whose late completion was refused
 #: quarantined slots whose old writer never resolved are freed after this many
@@ -3495,26 +3517,38 @@ class HiCacheFile(HiCacheStorage):
                         out[i] = slot
                     elif status == 1:
                         joined.append((i, slot, gen))
+        _join_wait = 0
         if joined:
             # NF (y3w): a join is a claim another writer is still filling; this
             # fill writes nothing into it, so its open-writer mark goes at once
             # -- left behind, the slot could never be reaped nor complete
             _unclaim_fill_joins(arena, joined)
-            # L3FILL-JOINED (2): wait (bounded, prefetch io thread only) for the
-            # other writer instead of ending the prefix at its page
-            _waited = _await_fill_joins(arena, stems, joined, fill_join_wait_ms())
-            for i, s_ in _waited.items():
-                out[i] = s_
-            joined = [j for j in joined if int(j[0]) not in _waited]
             # L3FILL-JOINED (3): a holder with no byte for the stale bound loses
             # the stem; this fill claims it fresh and reads it from disk
-            todo.extend(_reap_stale_live_joins(arena, stems, joined, int(total_bytes)))
+            _reaped = _reap_stale_live_joins(arena, stems, joined, int(total_bytes))
+            todo.extend(_reaped)
+            _rx = {int(t[0]) for t in _reaped}
+            joined = [j for j in joined if int(j[0]) not in _rx]
+            # L3FILL-JOINED (2): wait (bounded, prefetch io thread only) for the
+            # other writer instead of ending the prefix at its page.
+            # L3FILL-JOIN (27B z30y14, 01.10. 03:15:36, PP1/PP2): the wait runs
+            # AFTER this fill read and completed its own claims
+            # (_finish_fill_joins below). Two followers filling the same pages
+            # interleave their claims (arena_claim takes one stem at a time):
+            # each holds fresh claims the other joined. Waiting before reading,
+            # both spent the bound on the other's unread pages and both ended
+            # at the other's first claim -- "#1433 5 of 5" / "12 of 12",
+            # #1400 STORE-TOLD MISMATCH. Reading first, every claim a fill
+            # waits for is being read by its holder.
+            _join_wait = fill_join_wait_ms() if joined else 0
+        _pend = {int(j[0]) for j in joined} if _join_wait else set()
         if prefix and todo:
             # (a): the first stem that neither raced in complete nor got a
-            # claim ends the prefix -- its successors are not read
+            # claim ends the prefix -- its successors are not read. A join the
+            # wait below may still resolve does not end it here.
             todo.sort(key=lambda t: t[0])
             _mine = {t[0] for t in todo}
-            _stop = next((i for i, _st in cand if out[i] is None and i not in _mine), n)
+            _stop = next((i for i, _st in cand if out[i] is None and i not in _mine and i not in _pend), n)
             _past = [t[1] for t in todo if t[0] > _stop]
             if _past:
                 _free_named(arena, _past, "l3fill_past_prefix")
@@ -3523,6 +3557,8 @@ class HiCacheFile(HiCacheStorage):
                 if i > _stop:
                     out[i] = None
         if not todo:
+            if _pend:
+                _finish_fill_joins(arena, stems, cand, out, joined, _join_wait, prefix)
             return out
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
         pio = _load_pageio()
@@ -3559,6 +3595,8 @@ class HiCacheFile(HiCacheStorage):
             logger.info("#1433 L3->L2 fill: %d of %d pages read from disk into the arena (n=%d) threads=%d "
                         "ms=%.0f pages_per_s=%.0f", filled, len(todo), k, threads, ms,
                         filled / max(1e-6, ms / 1000.0))
+        if _pend:
+            _finish_fill_joins(arena, stems, cand, out, joined, _join_wait, prefix)
         return out
 
     def _arena_evict_to_disk(self, arena, want: int, need: Optional[int] = None) -> int:
