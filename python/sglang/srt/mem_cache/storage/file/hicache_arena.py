@@ -1015,3 +1015,55 @@ class ShmArena:
             self._mm.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+#: arena.c A_MAGIC ("ARNA2692"): the header word of an initialised arena
+ARENA_MAGIC = 0x41524E4132363932
+
+
+class ArenaView:
+    """L2-ARENA PRICE (02.10.): a LOOKUP-ONLY join of an EXISTING arena file
+    (the front's presence probe). Never creates, sizes or initialises the
+    file, never takes a reference, starts no census: the geometry is read from
+    the creator's header, and an arena whose magic is not set yet is refused
+    (the caller asks again later). Only ``find_states`` -- arena.c's
+    ``arena_find_stems``, the same C lookup ``batch_exists_v2`` asks."""
+
+    def __init__(self, path: str):
+        import struct
+
+        lib = _load_lib()
+        if lib is None:
+            raise RuntimeError("arena helper unavailable")
+        self._lib = lib
+        self.path = path
+        fd = os.open(path, os.O_RDWR)
+        try:
+            size = os.fstat(fd).st_size
+            head = os.pread(fd, 24, 0)
+            if len(head) < 24:
+                raise RuntimeError(f"{path}: no arena header yet")
+            magic, slots, slot_bytes = struct.unpack("<QQQ", head)
+            if magic != ARENA_MAGIC:
+                raise RuntimeError(f"{path}: arena not initialised yet")
+            out = (ctypes.c_int64 * 6)()
+            total = int(lib.arena_layout(int(slots), int(slot_bytes), out))
+            if total <= 0 or total > size:
+                raise RuntimeError(f"{path}: header geometry {slots} x {slot_bytes} "
+                                   f"does not fit the file ({size} bytes)")
+            self.slots, self.slot_bytes, self.file_bytes = int(slots), int(slot_bytes), total
+            self._mm = mmap.mmap(fd, total, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        finally:
+            os.close(fd)
+        self._base = ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(self._mm)))
+
+    def find_states(self, stems: Sequence[str]) -> list[int]:
+        """0 absent/free, 1 claimed, 2 COMPLETE -- per stem, hashed in C."""
+        n = len(stems)
+        if n == 0:
+            return []
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = (ctypes.c_int64 * n)()
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
+        return list(st)

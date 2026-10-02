@@ -124,7 +124,9 @@ def test_the_backward_anchor_scan_equals_the_forward_answer(store):
     store.write(h, kv_upto=11000, mamba=[100, 4095, 8191, 11500])  # 11500 lies past the KV run
     pr = store.probe()
     assert pr.depth(p).tokens == 8192
-    assert pr._deepest(h, 11000, "mamba") == 8191 and pr._deepest(h, 100, "mamba") == -1
+    memo = {}
+    assert pr._deepest(h, 11000, "mamba", memo, (0, 1)) == 8191
+    assert pr._deepest(h, 100, "mamba", memo, (0, 1)) == -1
 
 
 # ---- BOOT-START HOLD (NF a105d38905) with the 27B bound ------------------------------------
@@ -148,3 +150,54 @@ def test_the_boot_start_hold_is_bounded(caplog):
     asyncio.run(asyncio.wait_for(go(), 5))
     assert f.counters["x_exact_hold_timeout"] == 1
     assert any("WEG2 X-EXACT-HOLD rid=weg2-0-1 TIMEOUT" in m for m in caplog.messages)
+
+
+# ---- L2-ARENA PRICE (NF 0d65279f70) on the 27B arenas ---------------------------------------
+# 27B D log: 'arena=/dev/shm/weg2-arena-<tag>/arena-32768.bin' (KV, one token page) and
+# '.../arena-78446592.bin' (mamba states) -- two arena files the probe joins by glob.
+
+def _arena27(store, width, slots):
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+
+    os.makedirs(store.arena, exist_ok=True)
+    return ShmArena(os.path.join(store.arena, f"arena-{width}.bin"), width, slots)
+
+
+def _complete27(arena, stems, width):
+    import ctypes
+
+    buf = (ctypes.c_char * width)()
+    for off in range(0, len(stems), 4096):
+        part = stems[off:off + 4096]
+        st = arena.write(part, [width] * len(part), [((0, width),)] * len(part),
+                         [ctypes.addressof(buf)] * len(part))
+        assert set(st) <= {1, 2}, st
+
+
+def test_b6a_weg2_28_45_prefix_complete_in_the_l2_arena_rest_le_x_is_short(store):
+    """b6a878f145 weg2-28-45 (07:39:11.692, D phase, X=4096): priced 4971 > X, the flip ran and P
+    computed 159 of 55761 on a 55602 hit -- weg2-26-43's prompt (55607) P had prefilled 4.7 s
+    before: its pages and its END-ANCHOR (P-TRIM 55607 -> 55602) sat in the shared host arena,
+    the L3 write-behind not yet through. L2 alone proves the prefix -> SHORT, src=l2_arena."""
+    ids_26_43 = _ids(55607, seed=26)
+    h = FS.bigram_page_hasher(ids_26_43, PAGE, True)
+    kv = _arena27(store, 64, 60000)
+    mamba = _arena27(store, 128, 64)
+    _complete27(kv, [f"{x}{SFX}" for x in h], 64)
+    _complete27(mamba, [f"{h[55602 - 1]}.mamba{SFX}"], 128)
+    ids_28_45 = np.concatenate([ids_26_43, _ids(55761 - 55607, seed=28)])
+    d = store.probe().depth(ids_28_45)
+    assert (d.tokens, d.tier, d.l3_pages) == (55602, "l2_arena", 0)
+    assert 55761 - d.tokens == 159 <= 4096, "SHORT -- P computed exactly 159"
+
+
+def test_l2_and_l3_union_per_page_on_page_one(store):
+    p = _ids(9000, seed=31)
+    h = FS.bigram_page_hasher(p, PAGE, True)
+    store.write(h, kv_upto=5000, mamba=[4095])           # L3: 5000 pages, anchor at 4096
+    kv = _arena27(store, 64, 12000)
+    mamba = _arena27(store, 128, 64)
+    _complete27(kv, [f"{x}{SFX}" for x in h[5000:]], 64)  # L2: the rest of the KV
+    _complete27(mamba, [f"{h[8191]}.mamba{SFX}"], 128)
+    d = store.probe().depth(p)
+    assert (d.tokens, d.l3_pages, d.tier) == (8192, 4096, "l2_arena")
