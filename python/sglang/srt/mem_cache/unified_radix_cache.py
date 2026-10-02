@@ -769,6 +769,24 @@ from sglang.srt.weg2.p_trim_end_anchor import (  # noqa: E402
 )
 
 
+#: CENSUS-DEFER (02.10., N6d ..._ec4d492f58: WEG2-TREE-RESET-SUB census=19-24 ms
+#: of a 34-48 ms tree reset on every P rank, inside the P>D quiesce): the
+#: at=reset ARENA-REF-HOLDERS census -- an instrument, no branch reads it --
+#: runs this many seconds after the reset in a one-shot timer thread, not in the
+#: flush. The flip (~2.5 s) is over by then and the group sleeps; the census
+#: already tolerates a scheduler moving under it (snapshot=torn, the 60 s census
+#: thread runs the same walk). The line names deferred_s. 0 = in the reset, as before.
+WEG2_RESET_CENSUS_DEFER_ENV = "SGLANG_WEG2_RESET_CENSUS_DEFER_S"
+
+
+def _weg2_reset_census_defer_s() -> float:
+    raw = os.environ.get(WEG2_RESET_CENSUS_DEFER_ENV, "")
+    try:
+        return max(0.0, float(raw)) if str(raw).strip() else 5.0
+    except ValueError:
+        return 5.0
+
+
 def _weg2_carrier_hold_on() -> bool:
     """H81: does the flip's reset hold the phase's END anchors (see
     `UnifiedRadixCache._weg2_carrier_rotate`)? Group P of a weg2 boot, only
@@ -1924,14 +1942,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 + f"{_hp.census(pool)}")
         return "; ".join(lines) or None
 
-    def _weg2_log_holder_census(self, where: str) -> None:
+    def _weg2_log_holder_census(self, where: str, deferred_s: float = 0.0) -> None:
+        if where == "reset" and not deferred_s:
+            defer = _weg2_reset_census_defer_s()
+            if defer > 0:
+                # CENSUS-DEFER: the newest reset's census replaces a pending one
+                old = self.__dict__.get("_weg2_census_timer")
+                if old is not None:
+                    old.cancel()
+                t = threading.Timer(defer, self._weg2_log_holder_census, args=(where, defer))
+                t.daemon = True
+                t.name = "weg2-reset-census"
+                self._weg2_census_timer = t
+                t.start()
+                return
+        if deferred_s:
+            try:  # CENSUS-DEFER: an arena unmapped since the reset is never read
+                if any(getattr(getattr(p.arena, "_mm", None), "closed", False)
+                       for p in self._weg2_arena_pools().values()):
+                    return
+            except Exception:  # noqa: BLE001 - an instrument never raises
+                return
         try:
             line = self.weg2_arena_holder_census()
         except Exception as exc:  # noqa: BLE001 - an instrument never breaks a reset
             line = f"failed={exc!r}"
         if line:
-            logger.info("ARENA-REF-HOLDERS at=%s %s (#1424e: gap = own_held - sum, this "
-                        "process's references no class names)", where, line)
+            logger.info("ARENA-REF-HOLDERS at=%s %s%s (#1424e: gap = own_held - sum, this "
+                        "process's references no class names)", where, line,
+                        " deferred_s=%.1f" % deferred_s if deferred_s else "")
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
