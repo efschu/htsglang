@@ -237,6 +237,8 @@ def retain_at_sleep(
     mamba_buffers,
     allocator,
     mamba_allocator=None,
+    hold_l2_refs: Optional[
+        Callable[[Sequence[int], Sequence[int]], None]] = None,
     reset_keep: Callable[[list], None],
     set_keep: Callable[[object, Tuple[Tuple[int, int], ...]], None],
     manifest_path: str,
@@ -325,6 +327,24 @@ def retain_at_sleep(
         if id(node) not in seen_last:
             seen_last.add(id(node))
             rewrite_tree(node, kv_map, hold_anchor_map, visited)
+
+    # L15-HOSTLOCK (LCHOST defect 2): BEFORE reset_keep (whose _reset_full
+    # hands every kept chain's arena references back -- kept chains never
+    # carry host_lock_ref) pin this rank's held L2 slots once, in this
+    # rank's own host pools: a rank's l2_slots are its OWN shard's arena
+    # slots, so cap-0 ranks take refs too -- TP0 is exactly the rank that
+    # refills from L2 at the wake. The wake act gives them back (hold: after
+    # the refill copied; fallback: in the drop). Master off: the scheduler
+    # hook passes no callable, no reference is taken (byte-identical). The
+    # slot list is the bind-time l2_of/anchor_l2_of snapshot -- the same
+    # values step (8) publishes into the manifest.
+    if hold_l2_refs is not None:
+        kv_l2: list = []
+        anchor_l2: list = []
+        for rid in hs.rids:
+            kv_l2.extend(int(x) for x in l2_of(rid)[0])
+            anchor_l2.append(int(anchor_l2_of(rid)[0]))
+        hold_l2_refs(kv_l2, anchor_l2)
 
     # (5) partial tree reset over exactly the kept nodes
     reset_keep(nodes)

@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
 from sglang.srt.weg2.l15_compact import owner_of
+from sglang.srt.weg2.l15_hostlock import hold_sleep_refs
 from sglang.srt.weg2.l15_shadow import candidates_from
 
 
@@ -366,6 +367,7 @@ def build_retain_kwargs(
     host_pool=None,
     mamba_host_pool=None,
     tree_cache=None,
+    hold_sink: Optional[Callable[[tuple], None]] = None,
 ) -> Dict:
     """Assemble the whole retain_at_sleep keyword set from live reqs.
 
@@ -568,6 +570,22 @@ def build_retain_kwargs(
         # the rid is unknown -- retain keeps the empty column.
         return l2_lanes_by_rid.get(rid, ())
 
+    # L15-HOSTLOCK (LCHOST defect 2): pin this rank's held L2 slots in its
+    # OWN host pools' arena before retain's step (5) reset_keep hands the
+    # kept chains' references back; the record of what was pinned goes to
+    # hold_sink (the scheduler) so the wake act can release it. No hold_sink
+    # (master off / hook unwired) -> no callable -> no reference taken.
+    _hold_kv = pool if pool is not None else _live_kv
+    _hold_mamba = mpool
+
+    def _hold_l2_refs(kv_slots, anchor_slots):
+        rec = hold_sleep_refs(_hold_kv, _hold_mamba, kv_slots, anchor_slots,
+                              log)
+        if rec is not None:
+            hold_sink(rec)
+
+    hold_l2_refs = _hold_l2_refs if hold_sink is not None else None
+
     return {
         "candidates": candidates,
         "node_of": node_of,
@@ -577,6 +595,8 @@ def build_retain_kwargs(
         "l2_lanes_of": l2_lanes_of,
         # L15-12c-E2a: the anchor's L2 identity, (-1, -1) when absent.
         "anchor_l2_of": lambda rid: anchor_l2_by_rid.get(rid, (-1, -1)),
+        # L15-HOSTLOCK: None unless the hook passed a hold_sink (master on).
+        "hold_l2_refs": hold_l2_refs,
         "caps_rows_by_rank": caps_rows_by_rank,
         "cap_anchor_slots": cap_anchor_slots,
         "prefix": prefix,

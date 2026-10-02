@@ -7427,6 +7427,33 @@ class SchedulerWeightUpdaterManager:
                         "base(s) after resume", cleared)
         return cleared
 
+    def _l15_release_host_hold_refs(self, sched) -> int:
+        """L15-HOSTLOCK: give the sleep's L2 arena refs back (LCHOST defect 2
+        partner). The sleep hook recorded what it pinned on
+        ``sched._l15_host_hold``; the wake act calls this AFTER its act
+        (hold: once the refill copied; fallback: at the end of the drop).
+        The record is cleared FIRST, so a repeat call is a no-op and the
+        ledger-protected arena never sees a double release from here. A
+        deferred (refused) wake never calls it: the hold stays armed. Only
+        the recorded slots are released; a lost record (crash between sleep
+        and wake) is reclaimed when the next boot recreates the arena --
+        stated in l15_hostlock's docstring."""
+        held = (getattr(sched, "_l15_host_hold", None)
+                if sched is not None else None)
+        if not held:
+            return 0
+        sched._l15_host_hold = None
+        try:
+            from sglang.srt.weg2 import l15_bind, l15_hostlock
+            kv, mamba = l15_bind.live_host_pools(sched.tree_cache)
+            return l15_hostlock.release_wake_refs(kv, mamba, held,
+                                                  lambda m: logger.info(m))
+        except Exception as exc:  # noqa: BLE001 - cleanup never splits group
+            logger.warning("L15-HOSTLOCK wake release failed (%s: %s) -- the "
+                           "refs stay on the arena until the next boot "
+                           "recreates it", type(exc).__name__, exc)
+            return 0
+
     def _l15_fallback_drop(self, sched) -> int:
         """L15-12c-B: the group verdict "fallback" ACTS (plan part 3 sec 3):
         today's empty-tree wake shape WITHOUT the re-reservation --
@@ -7461,6 +7488,12 @@ class SchedulerWeightUpdaterManager:
             logger.warning("L15-RESTORE fallback drop failed (%s: %s)",
                            type(exc).__name__, exc)
         self._l15_wake_manifest = None
+        # L15-HOSTLOCK: the fallback act is done -- the dropped hold needs no
+        # L2 protection anymore, hand the sleep's arena refs back. getattr
+        # style: pre-HOSTLOCK test stubs without the helper keep working.
+        rel = getattr(self, "_l15_release_host_hold_refs", None)
+        if rel is not None:
+            rel(sched)
         return dropped
 
     def _l15_decide_wake_verdict(self, wake_on: bool, fp, check=None,
@@ -7604,7 +7637,18 @@ class SchedulerWeightUpdaterManager:
             # L15-12c-E2: the cap-0 rank's refill ACT.  Runs only on the
             # group-uniform "hold" verdict, behind the hold-aware restore
             # that already re-reserved every held destination row.
-            return self._l15_do_refill(sched)
+            n = self._l15_do_refill(sched)
+            # L15-HOSTLOCK: the refill copied (or its failure already ran the
+            # fallback drop, which released) -- hand the sleep's refs back.
+            rel = getattr(self, "_l15_release_host_hold_refs", None)
+            if rel is not None:
+                rel(sched)
+            return n
+        # L15-HOSTLOCK: acted "hold" with cap>0 (the rows never left VRAM) or
+        # "none" -- the decision is behind us, release what the sleep pinned.
+        rel = getattr(self, "_l15_release_host_hold_refs", None)
+        if rel is not None:
+            rel(sched)
         return 0
 
     def _l15_do_refill(self, sched, optimistic: bool = False) -> int:
