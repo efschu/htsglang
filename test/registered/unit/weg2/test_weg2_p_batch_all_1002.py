@@ -122,7 +122,7 @@ def test_prefill_queued_for_d_at_the_d_to_p_flip_goes_to_p(caplog):
     kept = _pending("kept", 9.0, skip_leg1=True, short_kept=True, d_direct=True)   # SHORT-KEPT
     drained = _pending("drained", 7.0, d_direct=True)                            # D-SHORT-DRAIN
     prefilled = _pending("handoff", 8.0, leg1_done=True)                         # P did leg 1
-    carrier = _pending("carrier", 6.0, skip_leg1=True, leg1_done=True)           # CARRIER-EXCEEDS
+    carrier = _pending("carrier", 6.0, skip_leg1=True, leg1_done=True)           # P leg 1 done
     queued_kept = _pending("qkept", 5.0, skip_leg1=True, short_kept=True)        # D-phase fall-through
     later = _pending("later", 1.0)
     f._ready_for_d.extend([kept, prefilled, drained, carrier])
@@ -146,8 +146,9 @@ def test_the_p_drain_sweeps_before_it_dispatches_and_gives_a_kept_short_its_leg1
     assert src.index("self._dual_pump(_p_drain_pass)") < call
     i = src.index("async def _p_drain_pass() -> int:")
     blk = src[i:i + 20000]
-    a = blk.index('if getattr(p, "short_kept", False) and not self.dual_layout:')
-    assert a < blk.index("if p.skip_leg1:  # route CARRIER-EXCEEDS")
+    a = blk.index('if (getattr(p, "short_kept", False) or p.skip_leg1) and not self.dual_layout:')
+    assert a < blk.index("async with sem:")
+    assert a < blk.index("if p.skip_leg1:  # DUAL-TP3PP3 only (27B port)")
     assert 'self._to_p_batch(p, "drain")' in blk[a:a + 300]
 
 

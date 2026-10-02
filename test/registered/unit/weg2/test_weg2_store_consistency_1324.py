@@ -197,7 +197,8 @@ def test_the_route_verdict_names_the_presence_witness():
 
 def test_above_the_carrier_cap_is_still_refused_at_admission():
     """M7: the over-cap 413 is law and is untouched by this build."""
-    assert serviceable_route(50, 300000, SN6S_X, SN6S_CARRIER_MAX) == "carrier_single"
+    # law 02.10.: no D single prefill above the carrier any more (P route)
+    assert serviceable_route(50, 300000, SN6S_X, SN6S_CARRIER_MAX) == "long"
     assert serviceable_route(300000, 300000, SN6S_X, SN6S_CARRIER_MAX) == "long"
 
 
