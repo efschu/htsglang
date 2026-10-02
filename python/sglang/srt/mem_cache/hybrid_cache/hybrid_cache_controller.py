@@ -259,6 +259,10 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        #: DP-NACHLAUF 02.10.: the queue stamps (managers.cache_controller.
+        #: prefetch_queue_parts) -- N5m printed queue_parts with every stage
+        #: '-': this hybrid operation never carried them.
+        self.stage_times: dict = {}
         super().__init__(
             host_indices,
             token_ids,
@@ -1079,6 +1083,9 @@ class HybridCacheController(BaseHiCacheController):
         own_hashes = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
+        _st = getattr(operation, "stage_times", None)
+        if _st is not None:
+            _st["hashed"] = time.monotonic()
         from sglang.srt.managers import cache_controller as _cc_mod
         from sglang.srt.weg2.handoff_keys import first_mismatch as _first_mismatch
         _hk = _cc_mod.WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id) or getattr(operation, "weg2_page_keys", None)
