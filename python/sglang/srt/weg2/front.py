@@ -83,6 +83,13 @@ def _ft_mm_expand(*args):
     return mm_expand(*args)
 
 
+def _dt():
+    """PREFIX-DIVERGE-TEXT helpers (lazy, like front_tokens)."""
+    from sglang.srt.weg2 import front_diverge_text
+
+    return front_diverge_text
+
+
 def _ft_mm_learn(*args):
     from sglang.srt.weg2.front_tokens import mm_learn
 
@@ -5939,7 +5946,7 @@ class Front:
                     "reused=%d encoded=%d%s",
                     rid, pending, c.n, credit, src, int(known), est_uncached, est_prompt,
                     est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded, mm_tag)
-        self._prefix_diverge(rid, c.ids, pending, credit, src, l3)
+        self._prefix_diverge(rid, c.ids, pending, credit, src, l3, payload=payload)
         from types import SimpleNamespace
 
         return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
@@ -6296,7 +6303,7 @@ class Front:
             pass
 
     def _prefix_diverge(self, rid: str, ids, pending: int, credit: int, src: str,
-                        l3: int) -> None:
+                        l3: int, payload: Any = None) -> None:
         """PREFIX-DIVERGE (NF y7l 99d1977a63, 02.10.): where a priced prompt
         leaves the earlier prompt it shares the longest token prefix with,
         against the credit the store/D gave it -- on every arrival that
@@ -6338,9 +6345,83 @@ class Front:
                     rid, verdict, int(ids.size), int(credit), src, int(l3), int(pending),
                     prev_rid or "-", int(prev_len), age, int(lcp), int(lcp) // page * page,
                     int(lost), rp.cap)
+                # PREFIX-DIVERGE-TEXT: only where an earlier prompt shares at least a
+                # page (a new conversation has nothing to compare)
+                if (prev_rid is not None and int(lcp) >= page
+                        and max(int(lost), int(pending)) > _dt().MIN_TOKENS):
+                    try:
+                        self._prefix_diverge_text(rid, ids, prev_rid, int(lcp), payload)
+                    except Exception:  # noqa: BLE001 -- an instrument, never the price
+                        pass
             rp.note(str(rid), ids)
+            self._prefix_diverge_digest(rid, payload)
         except Exception:  # noqa: BLE001 -- an instrument, never the price
             pass
+
+    def _ft_worker(self, fn) -> None:
+        """Run ``fn`` in the front tokenizer's worker (FIFO behind the counts,
+        so a digest noted earlier is there for a later job); inline when the
+        tokenizer has no executor (desk tests)."""
+        ex = self.ftok.executor
+        if ex is None:
+            fn()
+        else:
+            ex.submit(fn)
+
+    def _prefix_diverge_digest(self, rid: str, payload: Any) -> None:
+        """PREFIX-DIVERGE-TEXT: the message digest of this request, beside its
+        ids (the hashing runs in the worker; the loop only snapshots the
+        message list and the render knobs)."""
+        if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+            return
+        msgs = list(payload["messages"])
+        knobs = {k: payload[k] for k in _dt().RENDER_KNOBS if k in payload}
+        rp = self._recent_prompts
+
+        def job():
+            try:
+                rp.note_meta(str(rid), _dt().payload_digest(msgs, knobs))
+            except Exception:  # noqa: BLE001 -- an instrument
+                pass
+
+        self._ft_worker(job)
+
+    def _prefix_diverge_text(self, rid: str, ids, prev_rid: str, common: int,
+                             payload: Any) -> None:
+        """PREFIX-DIVERGE-TEXT (NF y7n cad1bf38f9, 02.10.): one line with the
+        decoded text of both prompts around ``common``, the segment / message
+        it falls into and the client payloads compared message by message --
+        "the client sent a different history" vs "our render of the same
+        history differs" (see front_diverge_text). Worker thread, logged when
+        done; never raises, never a price input."""
+        rp = self._recent_prompts
+        prev = rp.items.get(str(prev_rid))
+        tok = self.ftok._tok
+        if prev is None or tok is None:
+            return
+        prev_ids = prev[0]
+        msgs = list(payload["messages"]) if isinstance(payload, dict) and \
+            isinstance(payload.get("messages"), list) else None
+        knobs = ({k: payload[k] for k in _dt().RENDER_KNOBS if k in payload}
+                 if msgs is not None else None)
+
+        def job():
+            try:
+                cur_meta = _dt().payload_digest(msgs, knobs) if msgs is not None else None
+                body = _dt().diverge_text_line(
+                    tok=tok, rid=str(rid), prev_rid=str(prev_rid), prev_ids=prev_ids,
+                    cur_ids=ids, common=int(common), cur_messages=msgs,
+                    prev_meta=rp.meta.get(str(prev_rid)), cur_meta=cur_meta)
+                self.counters["prefix_diverge_text"] += 1
+                logger.info("WEG2 PREFIX-DIVERGE-TEXT %s (front ids decoded around `common`; "
+                            "hint: client_changed = a client message/knob at or before the "
+                            "divergence differs, render_only = identical messages rendered to "
+                            "different tokens)", body)
+            except Exception as e:  # noqa: BLE001 -- an instrument, named
+                logger.info("WEG2 PREFIX-DIVERGE-TEXT rid=%s FAILED %s: %s", rid,
+                            type(e).__name__, str(e)[:160])
+
+        self._ft_worker(job)
 
     def _hl_sweep(self) -> int:
         """#243 seam: every controller pass reads the hand-off state of every
