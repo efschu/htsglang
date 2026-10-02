@@ -199,6 +199,8 @@ class SyntheticInventories(unittest.TestCase):
         for c in SYNTHETIC["3x3090"]:
             self.assertTrue(L.driver_carve_charged(c, 32000))
 
+    @unittest.skipUnless(hasattr(L, "resolve_pp_cut_stage_model"),
+                         "PP-COST stage model (27B release 01.10.) is not on the NF y7 line")
     def test_stage_model_is_not_picked_for_foreign_cards(self):
         from sglang.srt.weg2 import form as F
 
