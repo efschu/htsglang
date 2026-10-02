@@ -13414,6 +13414,33 @@ def apply_profile_d_kv_token_cut_default(ns, argv_words: Sequence[str]) -> Optio
             "(default on after the metal proof; --d-kv-token-cut off = the uncut Form A)")
 
 
+#: SCHALTER-HALBPORT 1002: the line naming a --weg2-vision the registry row set
+VISION_DEFAULT_MARKER = "WEG2-VISION-DEFAULT"
+
+
+def apply_profile_vision_default(ns, argv_words: Sequence[str]) -> Optional[str]:
+    """SCHALTER-HALBPORT 1002: an UNSET ``--weg2-vision`` takes the registry
+    row's ``vision`` where the row says so (``vision_arg_default``: nextflash
+    ``transient``, as every NF boot ran it, nf-int4.env:229). qwen27b states
+    nothing here (its profiles give the flag), so its parser default ``off``
+    stands. Applied BEFORE the form is resolved (the vision axis reads the
+    flag). A given flag always wins. Returns the line naming the default, or
+    None."""
+    if getattr(ns, "teardown", False) or weg2_form.flag_given(argv_words, "--weg2-vision"):
+        return None
+    if str(getattr(ns, "weg2_vision", VISION_OFF) or VISION_OFF) != VISION_OFF:
+        return None
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    if row is None or not getattr(row, "vision_arg_default", False):
+        return None
+    want = str(row.vision or VISION_OFF)
+    if want == VISION_OFF or want not in VISION_CHOICES:
+        return None
+    ns.weg2_vision = want
+    return (f"{VISION_DEFAULT_MARKER} registry {row.id}: --weg2-vision {want} "
+            "(the row's vision; a given --weg2-vision wins)")
+
+
 #: PR (30.09.): group D's paired miss record is ON by default -- the records
 #: root of the line under the evidence dir (``<root>/<model_id>/owned_miss``,
 #: layers.moe.pool_miss_cost.record_dir_for). --env-d
@@ -22708,6 +22735,43 @@ def d_park_split_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Opt
             "SGLANG_WEG2_D_PARK_IMMEDIATE off" % (front_src, d_src))
 
 
+#: VISION-SYNC LAW (user 02.10. ~08:00Z, both lines): the switches that would
+#: let a vision stage outlive its pass (weg2/vision_rank_runner: the async
+#: stage and its PP0 row term). Either one ON is refused at launch, by name.
+VISION_ASYNC_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_WEG2_VISION_ASYNC",
+    "SGLANG_WEG2_P_ROW_VISION_ASYNC",
+)
+VISION_SYNC_LAW = (
+    "VISION-SYNC LAW (user 02.10. ~08:00Z, both lines): vision runs ONLY synchronously, BEFORE "
+    "the real prefill; spare VRAM goes to MoE experts (NF) and to the L15 cache (27B), never "
+    "to a vision tower that sits there across passes")
+
+
+def vision_async_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """VISION-SYNC LAW: the refusal line when :data:`VISION_ASYNC_SWITCHES` are
+    set ON in the launcher's own environment (which build_env and the front
+    inherit) or in ``--env-p`` / ``--env-d``; None when every one is unset or
+    off (an explicit 0/false/no/off is the law's own value and passes). Any
+    spelling of a switch's rename family counts."""
+    env = dict(os.environ if environ is None else environ)
+    scopes = (
+        ("launcher env", env),
+        ("--env-p", parse_group_env(str(getattr(ns, "env_p", "") or ""))),
+        ("--env-d", parse_group_env(str(getattr(ns, "env_d", "") or ""))),
+    )
+    hits: List[str] = []
+    for where, scope in scopes:
+        for name in VISION_ASYNC_SWITCHES:
+            raw = weg2_form._explicit_env(scope, name)
+            if raw is not None and raw.lower() not in ("0", "false", "no", "off"):
+                hits.append(f"{where} {name}={raw}")
+    if not hits:
+        return None
+    return ("WEG2 VISION-ASYNC refused: %s -- %s. Unset it (the code default is the synchronous "
+            "stage) or set it 0" % (", ".join(hits), VISION_SYNC_LAW))
+
+
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
     """H91b/H95 (Nutzer-Design 25.09.): ``--profile nextflash`` without an
     explicit ``--d-bs`` runs D with up to ``DEFAULT_D_BS_NEXTFLASH`` (6) seats
@@ -22817,6 +22881,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns, list(sys.argv[1:] if argv is None else argv))
         if _cut_line:
             print(_cut_line, flush=True)
+        _vis_default_line = apply_profile_vision_default(
+            ns, list(sys.argv[1:] if argv is None else argv))
+        if _vis_default_line:
+            print(_vis_default_line, flush=True)
     _miss_rec_line = apply_owned_miss_record_default(ns)  # PR: paired miss record
     if _miss_rec_line:
         print(_miss_rec_line, flush=True)
@@ -22825,6 +22893,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if _park_split:
             print(_park_split, flush=True)
             raise SystemExit(_park_split)
+        _vis_async = vision_async_refusal(ns)  # VISION-SYNC LAW (user 02.10.)
+        if _vis_async:
+            print(_vis_async, flush=True)
+            raise SystemExit(_vis_async)
     # VRAM-VERTRAG M1: the profile's hand pins, read before any solver
     # publishes into --extra-*/--env-* (every one is planner debt: OVERRIDE)
     from sglang.srt.weg2 import vram_plan_view as _vpv

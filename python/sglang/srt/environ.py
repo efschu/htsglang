@@ -44,6 +44,15 @@ def _mamba_carrier_hold_default() -> bool:
     return _profile_default("SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD", True)()
 
 
+def _admission_wedge_recovery_default():
+    """SCHALTER-HALBPORT 1002: SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS's default
+    when unset -- the seconds the published form's profile states (weg2/form.py
+    ModelProfile.admission_wedge_recovery_s: nextflash 2.0), else the env's own
+    unset sentinel -1 (= the 60 s code default), unchanged in type."""
+    val = _profile_default("SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS", None)()
+    return -1 if val is None else float(val)
+
+
 @functools.lru_cache(maxsize=1)
 def _default_hip() -> bool:
     """Lazy ROCm/HIP detection for platform-conditional env defaults.
@@ -351,7 +360,9 @@ class Envs:
     # allocator peak straight from torch's nested stats dict instead of the
     # flattened memory_stats() -- the same number without the Python flatten
     # (~0.7 ms per DFLASH round on D). Off = torch.cuda.max_memory_allocated().
-    SGLANG_VRAM_PEAK_FAST_READ = EnvBool(False)
+    # Default per profile (ModelProfile.vram_peak_fast_read, SCHALTER-HALBPORT
+    # 1002): nextflash on; off for qwen27b (its profiles set it) and no form.
+    SGLANG_VRAM_PEAK_FAST_READ = EnvBool(_profile_default("SGLANG_VRAM_PEAK_FAST_READ", False))
     # INT8 W8A8 small-M GEMM on sm_120 (27b-int8tri 26.09.): route
     # CompressedTensorsW8A8Int8.apply_weights through the Triton kernel with
     # exact int32 split-K (layers/quantization/int8_sm120_triton.py) when the
@@ -817,8 +828,29 @@ class Envs:
     # the launcher hands its own environment to the front and to every rank
     # (build_env / fenv = dict(os.environ)), so export it in the arm.
     # False = the 50 ms poll and the unconditional want, byte-identical.
-    SGLANG_WEG2_QUIESCE_FAST = EnvBool(False)
+    # Default per profile (weg2/form.py ModelProfile.front_quiesce_fast,
+    # SCHALTER-HALBPORT 1002): nextflash on (every NF boot set it); off for
+    # qwen27b and without a form.
+    SGLANG_WEG2_QUIESCE_FAST = EnvBool(_profile_default("SGLANG_WEG2_QUIESCE_FAST", False))
     SGLANG_WEG2_QUIESCE_FAST_POLL_MS = EnvInt(10)
+    # SCHALTER-HALBPORT 1002: the registry's entries for switches whose readers
+    # keep their own parse of an explicit value and take the same profile
+    # default when unset (weg2/form.py STATED_SWITCHES; nextflash on, off for
+    # qwen27b and without a form): the front's flipfast pair
+    # (weg2/front._env_switch_on_or_profile: CTL_KICK_ARRIVAL/_AFTER_FLIP, F2/F3;
+    # DC_OFF_PATH, F1), the D->P latch for P-only requests (front
+    # vision_flip_urgent, xsn438), the load-back's async index copies
+    # (mem_cache/pool_host/arena_pool.load_index_async) and the census O(1)
+    # FIFO eviction (mem_cache/producer_phase_census.census_o1_evict_armed, KR).
+    SGLANG_WEG2_CTL_KICK_ARRIVAL = EnvBool(_profile_default("SGLANG_WEG2_CTL_KICK_ARRIVAL", False))
+    SGLANG_WEG2_CTL_KICK_AFTER_FLIP = EnvBool(
+        _profile_default("SGLANG_WEG2_CTL_KICK_AFTER_FLIP", False))
+    SGLANG_WEG2_DC_OFF_PATH = EnvBool(_profile_default("SGLANG_WEG2_DC_OFF_PATH", False))
+    SGLANG_WEG2_VISION_FLIP_URGENT = EnvBool(
+        _profile_default("SGLANG_WEG2_VISION_FLIP_URGENT", False))
+    SGLANG_HICACHE_LOAD_ASYNC_INDEX = EnvBool(
+        _profile_default("SGLANG_HICACHE_LOAD_ASYNC_INDEX", False))
+    SGLANG_WEG2_CENSUS_O1_EVICT = EnvBool(_profile_default("SGLANG_WEG2_CENSUS_O1_EVICT", False))
     # IDLE_VOTE_NO_REWANT (27B rc12z21 park boot dkr27bparkdraftbar1w109281421,
     # flip epoch=5 14:28:08-14:29:38): the H111 guard ALONE, without the fast
     # poll. 27B profiles never set QUIESCE_FAST, so every poll (50 ms) that
@@ -1695,7 +1727,11 @@ class Envs:
     # store presence, so a follow-up turn on that prefix prices its real rest
     # and stays on D. Line 'WEG2 P-ANCHOR-PRESENCE'. Off = no record (#1324:
     # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
-    SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(False)
+    # Default per profile (ModelProfile.p_anchor_presence, SCHALTER-HALBPORT
+    # 1002): nextflash on (built on NF z30u evidence, a59c95ae36); off for
+    # qwen27b on this tree and without a form.
+    SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(
+        _profile_default("SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE", False))
     # X-CREDIT-INFLIGHT-1002 (Weg-2 front, X-EXACT): at the first content of
     # ANY D leg 2 (after_p, d_direct, d_single, a drained SHORT) the prompt's
     # page-floor anchor is recorded as a D presence of that in-flight leg
@@ -2120,8 +2156,10 @@ class Envs:
     # persist, on top of the report threshold, before the watchdog fires ONE
     # forced-admission recovery attempt for that episode. See
     # ADMISSION_WEDGE_RECOVERY_SECONDS in invariant_checker.py for the
-    # default's derivation and rationale.
-    SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(-1)
+    # default's derivation and rationale. Default per profile
+    # (ModelProfile.admission_wedge_recovery_s, SCHALTER-HALBPORT 1002):
+    # nextflash 2.0; -1 (= the 60 s code default) for qwen27b and no form.
+    SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS = EnvFloat(_admission_wedge_recovery_default)
 
     # #788: per-rank admission-verdict trace. OFF by default -- it exists to
     # convert a MECHANISM proof into a captured value on one instrumented

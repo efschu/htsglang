@@ -819,11 +819,18 @@ VISION_ASYNC_ENV = "SGLANG_WEG2_VISION_ASYNC"
 
 
 def vision_async_on(env: Optional[Dict[str, str]] = None) -> bool:
-    """(d) default ON: the tower's read + encode run on a worker thread and
-    their own CUDA stream while the scheduler keeps passing; ``0`` = the
-    synchronous stage of H125e byte for byte."""
+    """(d) ``1``: the tower's read + encode run on a worker thread and their own
+    CUDA stream while the scheduler keeps passing (a KV-tail lease held across
+    passes). Default OFF for every profile -- VISION-SYNC LAW (user 02.10.
+    ~08:00Z, both lines): vision runs ONLY synchronously, BEFORE the real
+    prefill; spare VRAM goes to MoE experts (NF) and the L15 cache (27B), never
+    to a vision tower that sits there across passes. Until then the stage was
+    synchronous only because :func:`vision_async_admissible` refused without
+    SGLANG_WEG2_P_ROW_VISION_ASYNC; the launcher now refuses either switch on
+    (``launcher.vision_async_refusal``). Unset/``0`` = the synchronous stage
+    of H125e byte for byte. The async code stays (not reachable by default)."""
     e = os.environ if env is None else env
-    return str(e.get(VISION_ASYNC_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+    return str(e.get(VISION_ASYNC_ENV, "0")).strip().lower() not in ("", "0", "false", "no", "off")
 
 
 #: the async stage withholds an image request on PP0 for several passes; that

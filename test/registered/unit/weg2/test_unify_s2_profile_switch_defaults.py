@@ -77,9 +77,14 @@ def test_the_rank_gate_reads_the_resolved_switch(clean):
 def test_every_profile_names_every_switch_and_each_has_one_environ_entry():
     from sglang.srt import environ as env_mod
 
+    from sglang.srt.weg2.form import STATED_SWITCHES
+
     names = {n for d in PROFILE_SWITCH_DEFAULTS.values() for n in d}
+    # SCHALTER-HALBPORT 1002: a STATED switch is carried only by the rows that
+    # state it (unstated = the code default; the qwen27b row stays byte-identical)
+    stated = {e for _, envs_ in STATED_SWITCHES for e in envs_}
     for prof, d in PROFILE_SWITCH_DEFAULTS.items():
-        assert set(d) == names, prof
+        assert set(d) - stated == names - stated, prof
     tree = ast.parse(inspect.getsource(env_mod))
     for name in names:
         hits = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Assign)
