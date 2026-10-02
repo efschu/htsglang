@@ -35,6 +35,15 @@ from test_weg2_arrival_seat_rule_0929 import X, _front, _on, _pending  # noqa: E
 from sglang.srt.weg2 import arrival_seat_rule as asr  # noqa: E402
 from sglang.srt.weg2 import phase_policy  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _pbound_flip_now_off(monkeypatch):
+    """These tests pin the seat/KV verdict and the dwell holds for requests that
+    need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
+    covering it as the switch-off path."""
+    monkeypatch.setenv("SGLANG_WEG2_PBOUND_FLIP_NOW", "0")
+
+
 # y3m 22:03:44: stage free 54016, ladder 524288 with ~77k used
 LADDER_READING = {"available": 30000, "evictable": 24016, "capacity": 524288,
                   "ladder_ceiling": 524288, "ladder_stage": 131072, "ladder_used": 77000}

@@ -1736,6 +1736,15 @@ class Envs:
     # floor -- and the D->P MIN-DWELL after that park does not hold either.
     # Marker 'WEG2 PARK-NO-DWELL'. 0 = the dwell rules as before.
     SGLANG_WEG2_PARK_NO_DWELL = EnvBool(True)
+    # PBOUND-FLIP-NOW (user law 02.10. "Request kommt = sofort Prefill"; y8a
+    # weg2-10-22: an image request, P-only by the vision rule, waited 229 s on
+    # 'ARRIVAL-SEAT verdict=wait_seat why=kv' while 17 younger requests were
+    # admitted to D): under ARRIVAL-SEAT the oldest queued request that needs P
+    # flips D->P at once -- no D seat/KV test (P prefills it; D's seat is the
+    # P->D re-admission's business), no K7/MIN-DWELL hold -- and no younger
+    # request is admitted to D past it. Marker 'PBOUND-FLIP-NOW' /
+    # 'PBOUND-STALL'. 0 = the seat/KV verdict as before.
+    SGLANG_WEG2_PBOUND_FLIP_NOW = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")

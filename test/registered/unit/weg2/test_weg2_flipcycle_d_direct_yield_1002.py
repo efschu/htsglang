@@ -12,6 +12,16 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import front
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pbound_flip_now_off(monkeypatch):
+    """These tests pin the seat/KV verdict and the dwell holds for requests that
+    need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
+    covering it as the switch-off path."""
+    monkeypatch.setenv("SGLANG_WEG2_PBOUND_FLIP_NOW", "0")
+
 
 
 def _f(cands, fits=None):
