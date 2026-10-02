@@ -129,6 +129,7 @@ from sglang.srt.weg2 import front_gc_guard as _gcg  # GC-GUARD 02.10.
 from sglang.srt.weg2 import arrival_seat_rule as _asr  # ARRIVAL-SEAT (user 29.09.)
 from sglang.srt.weg2 import p_read_overlap as _ro  # RO: P computes while a store read runs
 from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
+from sglang.srt.weg2 import usage_true as _ut  # USAGE-TRUE: the client sees the prefill really computed
 from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
 from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
 # DASHBOARD-IPC 01.10. (stdlib only, imported HERE: no first import on the loop, weg2rc2)
@@ -10865,6 +10866,10 @@ class Front:
             self._metrics().served_leg("P", p.rid, time.time() - t0, pt, ct, 0)  # TSDB
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
+            # USAGE-TRUE: every P leg of the rid (re-route, X-REQUEUE, park
+            # hand-back, RESUME-VIA-P alike) adds what P really computed; leg 2
+            # corrects the client's cached count with it.
+            self._p_leg_note(p.rid, pt, ct)
             # STORE-PRESENCE (NF ba76adffe2): ids for a fallback-priced rid NOW (before P's sleep
             # flush, not only at its leg 2), and P's END-ANCHOR noted for the flush
             await self._x_exact_backfill(p.rid, p.path, p.payload, p.text)
@@ -10948,6 +10953,37 @@ class Front:
         self.counters["p_prefill_requests"] += 1
         self.counters["p_prefix_tokens_in_store"] += max(0, int(p.store_span_est))
         self.counters["p_prefix_tokens_reused"] += max(0, int(leg1_cached_tokens))
+
+    # -- USAGE-TRUE (weg2/usage_true.py) -------------------------------------
+    def _p_leg_note(self, rid: str, prompt_tokens: int, cached_tokens: int) -> None:
+        """One P leg of ``rid`` ran: add what P computed (prompt - cached).
+        Bounded; an entry ends with the client relay of its leg 2."""
+        led = self.__dict__.setdefault("_p_legs_computed", collections.OrderedDict())
+        n, legs = led.pop(rid, (0, 0))
+        led[rid] = (n + max(0, int(prompt_tokens or 0) - int(cached_tokens or 0)), legs + 1)
+        while len(led) > 4096:
+            led.popitem(last=False)
+
+    def _p_leg_computed(self, rid: str) -> Optional[int]:
+        """Tokens P computed for ``rid`` over all its P legs; None = no P leg
+        ran (the client relay is then byte-identical)."""
+        led = self.__dict__.get("_p_legs_computed")
+        e = led.get(rid) if led else None
+        return None if e is None else int(e[0])
+
+    def _usage_true_done(self, rid: str, reading: Optional[Tuple[int, int, int, int]],
+                         p_computed: Optional[int]) -> None:
+        """The client relay of ``rid`` ended: one WEG2-USAGE-TRUE line when a
+        P leg ran and a usage reading went out; the ledger entry ends."""
+        led = self.__dict__.get("_p_legs_computed")
+        e = led.pop(rid, None) if led else None
+        if p_computed is None or reading is None:
+            return
+        prompt, d_cached, cached_client, d_computed = reading
+        self.counters["usage_true_corrected"] += 1
+        logger.info("WEG2-USAGE-TRUE rid=%s prompt=%d p_computed=%d d_computed=%d cached_client=%d "
+                    "(was %d) p_legs=%d", rid, prompt, int(p_computed), d_computed, cached_client,
+                    d_cached, int(e[1]) if e else 0)
 
     def _note_exact(self, text: str, prompt_tokens: int) -> None:
         if prompt_tokens <= 0:
@@ -11356,6 +11392,27 @@ class Front:
                     # timing is unchanged: the finish event still leaves before
                     # D's usage.
                     tier_carry: Optional[bytearray] = bytearray() if _strip_tier else None
+                    # USAGE-TRUE: once a P leg is known for this rid (before the
+                    # stream or, RESUME-VIA-P, during it) the client's copy of
+                    # every usage event carries the prefill really computed; the
+                    # tail and the usage reader above keep D's raw bytes.
+                    usage_fix: Dict[str, Any] = {"c": None, "p": None, "open": True}
+
+                    async def _emit(chunk: bytes) -> None:
+                        p_now = self._p_leg_computed(rid) if usage_fix["open"] else None
+                        if usage_fix["c"] is None and p_now is None:
+                            await _write_client(chunk)  # no P leg: D's bytes as they are
+                            return
+                        if not usage_fix["open"]:
+                            await _write_client(chunk)  # after D's end (TN): as is
+                            return
+                        if usage_fix["c"] is None:
+                            usage_fix["c"] = _ut.StreamCorrector()
+                        if p_now is not None:
+                            usage_fix["p"] = p_now
+                        chunk = usage_fix["c"].feed(chunk, usage_fix["p"])
+                        if chunk:
+                            await _write_client(chunk)
 
                     async def _write_client(chunk: bytes) -> None:
                         if chunk and r.status == 200:
@@ -11406,7 +11463,7 @@ class Front:
                                     chunk = strip_cached_tier(chunk, request.path, True)
                                     if not chunk:
                                         return
-                            await _write_client(chunk)
+                            await _emit(chunk)
 
                     async def _next_d_chunk() -> bytes:
                         # Same reads as `r.content.iter_any()`; bounded by the
@@ -11440,8 +11497,13 @@ class Front:
                             self._ipc_out_book().token(rid, time.time())  # front.outstanding_stalest
                             await _push(restate_inband_refusal(chunk, request.path))
                     if tier_carry and not client_io["gone"]:
-                        await _write_client(strip_cached_tier(bytes(tier_carry), request.path, True))
+                        await _emit(strip_cached_tier(bytes(tier_carry), request.path, True))
                     tier_carry = None  # D has ended: anything pushed after this (TN) goes out as is
+                    if usage_fix["c"] is not None and not client_io["gone"]:
+                        _uc_rest = usage_fix["c"].flush(usage_fix["p"])
+                        if _uc_rest:
+                            await _write_client(_uc_rest)
+                    usage_fix["open"] = False  # USAGE-TRUE: D has ended, TN goes out as is
                     if client_io["gone"] and not client_io["finished"]:
                         # The client left and D's stream ended without an end
                         # marker: not served, exactly as before H61b.
@@ -11531,6 +11593,8 @@ class Front:
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
                                 dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"],
                                 self._sess_tag(rid))
+                    self._usage_true_done(rid, usage_fix["c"].reading if usage_fix["c"] is not None else None,
+                                          usage_fix["p"])
                     # UNIFY S4 (H85): the streamed leg samples r_D too (it never did).
                     if r.status == 200 and priced and not x_inband:
                         _sample_r_d(pt, ct, verdict, dterms)
@@ -11671,6 +11735,13 @@ class Front:
                                         headers={"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)})
                 if _strip_tier:
                     body = strip_cached_tier(body, request.path, False)
+                if r.status == 200:
+                    # USAGE-TRUE: the client's copy carries the prefill really
+                    # computed (P legs + D); D-only = no P leg = these bytes.
+                    _pc = self._p_leg_computed(rid)
+                    if _pc is not None:
+                        body, _ut_reading = _ut.correct_doc(body, _pc)
+                        self._usage_true_done(rid, _ut_reading, _pc)
                 return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Weg2Stop:
             raise
