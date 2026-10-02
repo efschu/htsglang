@@ -49,3 +49,12 @@ def test_phase_now_flip_running_and_decode():
     segs = SEGS[:4]
     p2 = ipcboot.phase_now(segs, {}, {}, [], True, 199.5)
     assert p2["label"] == "D aktiv: Decode" and p2["since"] == 105.0
+
+
+def test_phase_now_flip_has_a_direction_for_the_active_frame():
+    # Nutzer 02.10.: der Aktivrahmen wandert mit der Phase -- Vorlauf und Nachlauf brauchen die Richtung
+    p = ipcboot.phase_now([{"k": "dec", "s": 0.0, "e": 10.0}], {}, {"state": "flipping", "awake": "D", "ts": 9.0}, [], True, 10.0)
+    assert p["k"] == "flip" and p["dir"] == "D>P"
+    views = [{"dir": "P>D", "kind": "fertig", "begin": 1.0, "done": 3.0}]
+    p2 = ipcboot.phase_now([{"k": "flip_tail", "s": 0.0, "e": 10.0}], {}, {}, views, True, 10.0)
+    assert p2["k"] == "flip" and p2["dir"] == "P>D"

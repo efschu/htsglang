@@ -338,6 +338,8 @@ details.fold[open] { padding-bottom: 12px; }
 .kpi .s { font-size: 11.5px; color: var(--muted); min-height: 1.3em; overflow-wrap: anywhere; }
 .kpi.hl { border-color: color-mix(in srgb, var(--s7) 55%, var(--line)); box-shadow: inset 3px 0 0 var(--s7); }
 .kpi.on .v { color: var(--c, var(--text)); }
+/* Nutzer 02.10.: der Aktivrahmen wandert live mit der Phase (Decode, P-/D-Prefill, Flip P→D / D→P); TTFT behält hl */
+.kpi.act { border-color: var(--c, var(--s7)); box-shadow: inset 0 0 0 1px var(--c, var(--s7)); }
 .kpi.ok .v { color: var(--good); } .kpi.bad .v { color: var(--bad); } .kpi.warn .v { color: var(--warn); }
 .phnow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 15px; margin: -2px 0 10px; }
 .phnow i.sw { width: 22px; height: 14px; border-radius: 3px; display: inline-block; }
@@ -1477,6 +1479,13 @@ function phaseNowHtml(b, now) {
   return `<div class="phnow${p.k === "flip" ? " flip" : ""}" title="Quelle: events.jsonl (Flip) + Rang-Segmente (rankstats), Auflösung ~1 s">`
     + `<i class="sw ${cls}"></i><b>${esc(p.label)}</b>${p.sub ? ` <span class="sub">${esc(p.sub)}</span>` : ""} ${since}${fl}</div>`;
 }
+// Nutzer 02.10.: welche KPI gerade den Aktivrahmen trägt -- aus phase_now (dieselbe Quelle wie die Phasenzeile)
+function actKey(b) {
+  const p = b.live ? b.phase_now : null;
+  if (!p) return "";
+  if (p.k === "flip") return p.dir ? "flip:" + p.dir : "";
+  return {P: "P", single: "P", D: "D", dec: "dec"}[p.k] || "";
+}
 function flipKpi(b, dir, now) {
   const fl = ((b.flip_last || {})[dir]) || {};
   const x = fl.last;
@@ -1486,7 +1495,7 @@ function flipKpi(b, dir, now) {
     x ? `<span class="muted">${ago(now - x.begin)} her &middot; Median ${sec(fl.median)} s &middot; p90 ${sec(fl.p90)} s &middot; n=${fl.n}</span>` : null,
     fl.idle_n ? `<span class="muted">Leerlauf-Flips (ohne wartende Arbeit): ${fl.idle_n}, nicht gezählt</span>` : null,
     fl.front_early_n ? `<span class="muted x">Front-Ereignis vor Flip-Ende: ${fl.front_early_n}× (dort zeigte die Front &lt; 1 s)</span>` : null].filter(Boolean).join("<br>");
-  return kpi(`Flipzeit ${dir.replace(">", "&rarr;")} &middot; letzte`, x ? sec(x.total_ms) : null, "s", sub, "wide", dir === "P>D" ? "var(--s7)" : "var(--s5)",
+  return kpi(`Flipzeit ${dir.replace(">", "&rarr;")} &middot; letzte`, x ? sec(x.total_ms) : null, "s", sub, "wide" + (actKey(b) === "flip:" + dir ? " act" : ""), dir === "P>D" ? "var(--s7)" : "var(--s5)",
     dir === "P>D" ? "P-Ende (letzter P-Chunk) → erstes Decode-Token auf D (Rang-Segmente); flip_first_work der Front kam oft vor flip_done"
       : "Decode-Ende → erster P-Prefill-Start (events flip_user_time mit parts)");
 }
@@ -1530,12 +1539,13 @@ function ovCard(b, d, now) {
   const dKpi = kpi("Decode tok/s", dv != null ? fmt(dv, 1) : (dd ? null : {na: "kein Decode-Rang"}), "",
     [dl, dd && dd.per_stream != null ? `je Stream ${fmt(dd.per_stream, 1)}` : null,
       dd && dd.seats_mean != null ? `Ø ${fmt(dd.seats_mean, 1)} Sitze` : null, bs != null ? `<b>bs ${fmt(bs)}</b>` : null].filter(Boolean).join(" &middot; "),
-    dd && dd.one_s > 0 ? "on" : "", "var(--s3)");
+    (dd && dd.one_s > 0 ? "on" : "") + (actKey(b) === "dec" ? " act" : ""), "var(--s3)");
   // Prefill P und D (bzw. eine Gruppe)
   const pre = b.prefill || {};
   const pk = (g, label, color) => {
     const [v, l] = rateOfPrefill(pre[g], now);
-    return kpi(label + " tok/s", v != null ? fmt(v) : null, "", l, pre[g] && pre[g].one_s > 0 ? "on" : "", color);
+    const ak = actKey(b) === (g === "single" ? "P" : g);
+    return kpi(label + " tok/s", v != null ? fmt(v) : null, "", l, (pre[g] && pre[g].one_s > 0 ? "on" : "") + (ak ? " act" : ""), color);
   };
   const pKpis = pre.single && !pre.P ? pk("single", "Prefill", "var(--s1)") : pk("P", "P-Prefill", "var(--s1)") + pk("D", "D-Prefill", "var(--s2)");
   // Flipzeit in Nutzersicht (Nutzer 01.10. ~08:20Z): letzte je Richtung FETT, Vorlauf/Layer-Tausch/Nachlauf

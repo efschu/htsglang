@@ -590,7 +590,9 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
         return {"k": "flip", "dir": last["dir"], "label": "FLIP " + last["dir"].replace(">", "→"),
                 "sub": "Nachlauf (bis zur ersten Arbeit)", "since": last["done"], "flip_since": last["begin"]}
     if (front or {}).get("state") == "flipping":
-        return {"k": "flip", "dir": None, "label": "FLIP", "sub": "Vorlauf (Drain/Park, vor flip_begin)",
+        # Vorlauf: the still-awake group is the source (Nutzer 02.10.: the active frame follows the phase)
+        aw = (front or {}).get("awake")
+        return {"k": "flip", "dir": {"P": "P>D", "D": "D>P"}.get(aw), "label": "FLIP", "sub": "Vorlauf (Drain/Park, vor flip_begin)",
                 "since": (front or {}).get("ts") or now, "flip_since": None}
     work = [x for x in segs if x["k"] != "unknown"]
     if not work:
@@ -613,7 +615,7 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
         return {"k": "flip", "dir": "P>D" if k == "flip_pd" else "D>P", "label": "FLIP " + ("P→D" if k == "flip_pd" else "D→P"),
                 "sub": "Layer-Tausch", "since": since, "flip_since": since}
     if k == "flip_tail":
-        return {"k": "flip", "dir": None, "label": "FLIP", "sub": "Nachlauf (bis zur ersten Arbeit)", "since": since}
+        return {"k": "flip", "dir": (last or {}).get("dir"), "label": "FLIP", "sub": "Nachlauf (bis zur ersten Arbeit)", "since": since}
     return {"k": k, "label": k, "sub": cur.get("why") or "", "since": since}
 
 
