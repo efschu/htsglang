@@ -7445,6 +7445,33 @@ class SchedulerWeightUpdaterManager:
                         "base(s) after resume", cleared)
         return cleared
 
+    def _l15_release_host_hold_refs(self, sched) -> int:
+        """L15-HOSTLOCK: give the sleep's L2 arena refs back (LCHOST defect 2
+        partner). The sleep hook recorded what it pinned on
+        ``sched._l15_host_hold``; the wake act calls this AFTER its act
+        (hold: once the refill copied; fallback: at the end of the drop).
+        The record is cleared FIRST, so a repeat call is a no-op and the
+        ledger-protected arena never sees a double release from here. A
+        deferred (refused) wake never calls it: the hold stays armed. Only
+        the recorded slots are released; a lost record (crash between sleep
+        and wake) is reclaimed when the next boot recreates the arena --
+        stated in l15_hostlock's docstring."""
+        held = (getattr(sched, "_l15_host_hold", None)
+                if sched is not None else None)
+        if not held:
+            return 0
+        sched._l15_host_hold = None
+        try:
+            from sglang.srt.weg2 import l15_bind, l15_hostlock
+            kv, mamba = l15_bind.live_host_pools(sched.tree_cache)
+            return l15_hostlock.release_wake_refs(kv, mamba, held,
+                                                  lambda m: logger.info(m))
+        except Exception as exc:  # noqa: BLE001 - cleanup never splits group
+            logger.warning("L15-HOSTLOCK wake release failed (%s: %s) -- the "
+                           "refs stay on the arena until the next boot "
+                           "recreates it", type(exc).__name__, exc)
+            return 0
+
     def _l15_fallback_drop(self, sched) -> int:
         """L15-12c-B: the group verdict "fallback" ACTS (plan part 3 sec 3):
         today's empty-tree wake shape WITHOUT the re-reservation --
@@ -7479,9 +7506,16 @@ class SchedulerWeightUpdaterManager:
             logger.warning("L15-RESTORE fallback drop failed (%s: %s)",
                            type(exc).__name__, exc)
         self._l15_wake_manifest = None
+        # L15-HOSTLOCK: the fallback act is done -- the dropped hold needs no
+        # L2 protection anymore, hand the sleep's arena refs back. getattr
+        # style: pre-HOSTLOCK test stubs without the helper keep working.
+        rel = getattr(self, "_l15_release_host_hold_refs", None)
+        if rel is not None:
+            rel(sched)
         return dropped
 
-    def _l15_decide_wake_verdict(self, wake_on: bool, fp, *, epoch: int):
+    def _l15_decide_wake_verdict(self, wake_on: bool, fp, check=None,
+                                 *, epoch: int):
         """L15-12c-E1X (plan sec 9): the ONE decision source for the
         keep-or-fallback-drop verdict at wake.  ``wake_on`` False -> return
         None and touch NO collective (byte-identical master-off wake).
@@ -7489,15 +7523,16 @@ class SchedulerWeightUpdaterManager:
         position (xsn410: no rank may skip a collective); a no-hold rank
         passes fp=None (vote None) but still participates.  The collective
         is l15_wake_check.decide over the tp cpu group the fence uses.
-        L15CheckRefused CANNOT fire yet: bad is always 0 until the sample
-        check lands (next AP).  A failing collective PROPAGATES, like the
-        fence's own gather -- it is never caught per rank."""
+        L15-W2C: ``check`` is this rank's (ok, bad, missing) sample-check
+        result (None -> zeros: a rank without a manifest votes on fp
+        alone).  bad > 0 on ANY rank -> decide() raises L15CheckRefused on
+        EVERY rank; like the fence's own gather, a refusal or a failing
+        collective PROPAGATES -- it is never caught per rank."""
         if not wake_on:
             return None
         from sglang.srt.weg2 import l15_restore, l15_wake_check
-        # missing=0 for now: group_check decides on fp/bad/drop_rids only;
-        # the real count_missing lands with the sample-check AP.
-        vote = (l15_restore.check_vote(fp, 0, 0, 0, ())
+        ok, bad, missing = check if check is not None else (0, 0, 0)
+        vote = (l15_restore.check_vote(fp, ok, bad, missing, ())
                 if fp is not None else None)
         world_group = getattr(self.scheduler, "world_group", None)
         cpu_group = (getattr(world_group, "cpu_group", None)
@@ -7506,6 +7541,102 @@ class SchedulerWeightUpdaterManager:
                  if cpu_group is not None else 1)
         return l15_wake_check.decide(
             vote, group=cpu_group, world=world, epoch=epoch).verdict
+
+    def _l15_optimistic_refill(self) -> bool:
+        """L15-OPT (operator order 01.10 ~20:45Z, L15-WIRE2-NOTES sec 1):
+        the OPTIMISTIC cap-0 refill that runs BEFORE the group decide() so
+        the sample check (next AP) can verify live rows.  Reached only when
+        the wake hold signal set the refill mark -- that mark already
+        encodes SGLANG_WEG2_L15_REFILL=1 and "this rank is the refill rank"
+        -- and a manifest is stashed.  REFILL=0: the mark is never set, the
+        helper returns False and touches nothing (byte-identical boot 1).
+        The mark is consumed here, so the act after decide() KEEPS or DROPS
+        but never refills a second time.  A refill FAILURE must not drop per
+        rank (xsn409: the drop is the group's act): the helper returns True,
+        which flips this rank's decide() vote to None at the fence tail,
+        and the group fallback drop erases every row the failed attempt may
+        have landed.  Returns True only on such a failure."""
+        if not self._l15_wake_refill or self._l15_wake_manifest is None:
+            return False
+        sched = self.scheduler
+        if sched is None:
+            return False
+        self._l15_wake_refill = False
+        try:
+            self._l15_do_refill(sched, optimistic=True)
+        except Exception as exc:  # noqa: BLE001 -- vote None, never drop here
+            logger.info("L15-OPT optimistic refill failed (%s: %s) -> vote None",
+                        type(exc).__name__, exc)
+            return True
+        return False
+
+    def _l15_wake_sample_check(self):
+        """L15-W2C (L15-WIRE2-NOTES sec 1/2/4): sample-verify this rank's
+        rows at wake, between the optimistic refill and decide().  cap>0
+        ranks sample the HELD rows, the cap-0 rank the REFILLED ones --
+        the same owned-with-L2-source set, rid-tagged 4-tuples.  Returns
+        (ok, bad, missing), or None when this rank holds no manifest (it
+        still votes None, xsn410).  Any raise that is not the sampled
+        mismatch itself folds into an all-bad vote (0, k_or_len, missing)
+        -- the gather is never skipped.  One-shot scratch, freed always."""
+        from sglang.srt.weg2 import (l15_bind, l15_check, l15_restore,
+                                     l15_scratch)
+        m = self._l15_wake_manifest
+        if m is None:
+            return None
+        k = 64
+        rank = self._weg2_rank()
+        sched = self.scheduler
+        plan, scratch = [], None
+        try:
+            tp = int(getattr(sched, "tp_size", 0)
+                     or getattr(getattr(sched, "server_args", None),
+                                "tp_size", 1) or 1)
+            from sglang.srt.distributed.utils import get_cp_token_ratios
+            _ratios = get_cp_token_ratios()
+            _vw = ([int(x) for x in _ratios]
+                   if _ratios is not None and len(_ratios) == tp
+                   and all(int(x) > 0 for x in _ratios) else [1] * tp)
+            prefix = [0]
+            for _x in _vw:
+                prefix.append(prefix[-1] + _x)
+            # L15-DEDUPE: shared-prefix rows planned ONCE; the rid tag is
+            # display-only here (l15_sample.sample_plan str()-es it) and a
+            # duplicate would only waste sample slots.
+            plan = [(str(rids[0]), row, slot, gen)
+                    for row, slot, gen, _lane, rids in
+                    l15_restore.owned_l2_rows(m, rank, prefix)]
+            device_pool = getattr(getattr(getattr(sched, "tp_worker", None),
+                                          "model_runner", None),
+                                  "token_to_kv_pool", None)
+            host_pool = l15_bind.live_host_pools(
+                getattr(sched, "tree_cache", None))[0]
+            if device_pool is None or host_pool is None:
+                raise LookupError("sample check needs the device KV pool "
+                                  "and the L2 host pool")
+            page_tokens = max(1, int(getattr(host_pool, "_arena_page_tokens",
+                                             1)))
+            scratch = l15_scratch.make_scratch_pool(device_pool, k)
+            try:
+                ok, bad, missing = l15_check.sample_check(
+                    plan, host_pool, device_pool, scratch, page_tokens, k=k)
+            finally:
+                scratch.free()
+            logger.info(l15_restore.check_line(rank, ok, bad, missing))
+            return (ok, bad, missing)
+        except Exception as exc:  # noqa: BLE001 -- never skip the gather
+            logger.info("L15-CHECK rank=%d failed (%s: %s) -> all-bad vote",
+                        rank, type(exc).__name__, exc)
+            return (0, min(k, len(plan)) if plan else k, 0)
+
+    def _l15_wake_check_and_decide(self, wake_on: bool, fp, *, epoch: int):
+        """L15-W2C fence-tail entry: master off -> None with NO sample
+        call and NO collective; otherwise sample-check first, then the
+        one decide() collective carrying (ok, bad, missing)."""
+        if not wake_on:
+            return None
+        return self._l15_decide_wake_verdict(
+            wake_on, fp, self._l15_wake_sample_check(), epoch=epoch)
 
     def _l15_wake_act(self, sched, verdict: str, *, group_ok: bool,
                       master_on: bool) -> int:
@@ -7524,10 +7655,21 @@ class SchedulerWeightUpdaterManager:
             # L15-12c-E2: the cap-0 rank's refill ACT.  Runs only on the
             # group-uniform "hold" verdict, behind the hold-aware restore
             # that already re-reserved every held destination row.
-            return self._l15_do_refill(sched)
+            n = self._l15_do_refill(sched)
+            # L15-HOSTLOCK: the refill copied (or its failure already ran the
+            # fallback drop, which released) -- hand the sleep's refs back.
+            rel = getattr(self, "_l15_release_host_hold_refs", None)
+            if rel is not None:
+                rel(sched)
+            return n
+        # L15-HOSTLOCK: acted "hold" with cap>0 (the rows never left VRAM) or
+        # "none" -- the decision is behind us, release what the sleep pinned.
+        rel = getattr(self, "_l15_release_host_hold_refs", None)
+        if rel is not None:
+            rel(sched)
         return 0
 
-    def _l15_do_refill(self, sched) -> int:
+    def _l15_do_refill(self, sched, optimistic: bool = False) -> int:
         """L15-12c-E2: refill this cap-0 rank's owned held rows from L2
         (plan L15-12-PART3-PLAN sec 2), ACTED only behind the group verdict
         "hold".  The hold-aware restore ran first: the held slots are
@@ -7571,15 +7713,11 @@ class SchedulerWeightUpdaterManager:
                 raise LookupError("refill needs the device KV pool and the "
                                   "L2 host pool")
             page_tokens = max(1, int(getattr(host_pool, "_arena_page_tokens", 1)))
-            # rid-tagged 4-tuples (rid, compact_row, l2_slot, l2_gen): the
-            # rid is what makes a generation mismatch drop a whole request.
-            plan = []
-            for span, i, slot in l15_restore._owned_tokens(m, rank, prefix):
-                src = l15_restore._l2_source(span, i)
-                if src is not None:
-                    plan.append((str(span.rid),
-                                 l15_restore._compact_row(prefix, rank, slot),
-                                 int(src[0]), int(src[1])))
+            # rid-tagged plan (L15-DEDUPE): one entry per distinct row,
+            # shared-prefix rows ONCE, tagged with the FULL tuple of the
+            # sharing rids so one generation mismatch drops every sharing
+            # request whole (l15_restore.rid_tagged_plan).
+            plan = l15_restore.rid_tagged_plan(m, rank, prefix)
             if not plan:
                 return 0
             ok, bad = l15_refill.gen_check(plan, host_pool)
@@ -7621,7 +7759,14 @@ class SchedulerWeightUpdaterManager:
                         "from L2", rank, n, len(a_slots))
             return n
         except Exception as exc:  # noqa: BLE001 -- all-or-nothing into the fallback
-            logger.info("L15-REFILL rank=%d failed: %s -> fallback", rank, exc)
+            logger.info("L15-REFILL rank=%d failed: %s -> %s", rank, exc,
+                         "vote None (optimistic)" if optimistic else "fallback")
+            if optimistic:
+                # L15-OPT: the pre-decide attempt must never drop per rank
+                # (xsn409: the drop is the group's act).  Reraise so
+                # _l15_optimistic_refill flips this rank's vote to None; the
+                # group fallback drop then erases whatever landed.
+                raise
             self._l15_fallback_drop(sched)
             return 0
 
@@ -11509,9 +11654,25 @@ class SchedulerWeightUpdaterManager:
                 # (bad is always 0 until the sample check lands, next AP).  A
                 # failing collective PROPAGATES like the fence's own gather --
                 # never caught per rank here.
-                _l15_v = self._l15_decide_wake_verdict(
-                    _l15_wake, _l15_fp,
-                    epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
+                # L15-OPT (operator order 01.10 ~20:45Z, L15-WIRE2-NOTES
+                # sec 1): attempt the cap-0 rank's refill BEFORE decide so
+                # the sample check (next AP) sees LIVE rows instead of the
+                # post-drop emptiness that makes the fingerprint reduction
+                # degenerate (min==max==fp -> spurious "hold").  No-op unless
+                # this rank is THE refill rank and SGLANG_WEG2_L15_REFILL=1
+                # (the wake mark already encodes both).  On failure this rank
+                # votes None -> the group falls back to a uniform drop, which
+                # erases the partial refill (xsn409: the drop stays a GROUP act,
+                # never per-rank).  The mark is consumed, so the post-decide act
+                # keeps or drops but never refills a second time.
+                if self._l15_optimistic_refill():
+                    _l15_v = self._l15_wake_check_and_decide(
+                        _l15_wake, None,
+                        epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
+                else:
+                    _l15_v = self._l15_wake_check_and_decide(
+                        _l15_wake, _l15_fp,
+                        epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
                 logger.info("L15-DECIDE epoch=%d verdict=%s fence_verdict=%s",
                             int(_l15_m.epoch) if _l15_m is not None else 0,
                             _l15_v, _l15_fence_v)

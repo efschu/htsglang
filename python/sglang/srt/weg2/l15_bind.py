@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
 )
 from sglang.srt.weg2.l15_compact import owner_of
+from sglang.srt.weg2.l15_hostlock import hold_sleep_refs
 from sglang.srt.weg2.l15_shadow import candidates_from
 
 
@@ -366,6 +367,7 @@ def build_retain_kwargs(
     host_pool=None,
     mamba_host_pool=None,
     tree_cache=None,
+    hold_sink: Optional[Callable[[tuple], None]] = None,
 ) -> Dict:
     """Assemble the whole retain_at_sleep keyword set from live reqs.
 
@@ -478,21 +480,33 @@ def build_retain_kwargs(
     _live_kv, _live_mamba = live_host_pools(getattr(reset_keep, "__self__", None))
     pool = _group_entry(host_pool, "kv") if host_pool is not None else _live_kv
     l2_by_rid: Dict[str, Tuple[Tuple, Tuple]] = {}
+    l2_lanes_by_rid: Dict[str, Tuple[int, ...]] = {}
     if pool is not None and l2_rows:
         _s = int(getattr(pool, "staging_rows", 0))
         _p = max(1, int(getattr(pool, "_arena_page_tokens", 1)))
         _row_slot = getattr(pool, "row_slot", None)
         _slot_of = {}
+        # L15-12c-P1: the lane inside the arena page, lane = (row - S) % P,
+        # recorded next to the slot = (row - S) // P. Staging rows: lane -1.
+        # The row_slot map (draft role) is not page-addressed: lane 0 at
+        # P == 1 (the only lane), unknown (-1) at P > 1.
+        _lane_of = {}
         for rid, rows in l2_rows:
             per = []
+            lanes = []
             for r in rows:
                 if r < _s:
                     per.append(-1)
+                    lanes.append(-1)
                 elif _row_slot is not None:
                     per.append(int(_row_slot.get(r, -1)))
+                    lanes.append(0 if _p == 1 else -1)
                 else:
-                    per.append((r - _s) // _p)
+                    off = r - _s
+                    per.append(off // _p)
+                    lanes.append(off % _p)
             _slot_of[rid] = per
+            _lane_of[rid] = lanes
         uniq = sorted({s for per in _slot_of.values() for s in per if s >= 0})
         gen_of = {}
         if uniq:
@@ -503,6 +517,7 @@ def build_retain_kwargs(
                 tuple(per),
                 tuple(int(gen_of.get(s, -1)) for s in per),
             )
+            l2_lanes_by_rid[rid] = tuple(_lane_of[rid])
 
     # L15-12c-E2a: anchor host row -> (mamba arena slot, generation). One
     # state per slot: slot = row - staging_rows; a row below staging_rows
@@ -549,14 +564,39 @@ def build_retain_kwargs(
         # old empty columns when no host pool could be reached.
         return l2_by_rid.get(rid, ((), ()))
 
+    def l2_lanes_of(rid: str) -> Tuple[int, ...]:
+        # L15-12c-P1: the lane inside each held token's L2 page (parallel to
+        # l2_of's slots; -1 = staging). () when the pool was unreachable or
+        # the rid is unknown -- retain keeps the empty column.
+        return l2_lanes_by_rid.get(rid, ())
+
+    # L15-HOSTLOCK (LCHOST defect 2): pin this rank's held L2 slots in its
+    # OWN host pools' arena before retain's step (5) reset_keep hands the
+    # kept chains' references back; the record of what was pinned goes to
+    # hold_sink (the scheduler) so the wake act can release it. No hold_sink
+    # (master off / hook unwired) -> no callable -> no reference taken.
+    _hold_kv = pool if pool is not None else _live_kv
+    _hold_mamba = mpool
+
+    def _hold_l2_refs(kv_slots, anchor_slots):
+        rec = hold_sleep_refs(_hold_kv, _hold_mamba, kv_slots, anchor_slots,
+                              log)
+        if rec is not None:
+            hold_sink(rec)
+
+    hold_l2_refs = _hold_l2_refs if hold_sink is not None else None
+
     return {
         "candidates": candidates,
         "node_of": node_of,
         "slots_of": slots_of,
         "anchor_slot_of": anchor_slot_of,
         "l2_of": l2_of,
+        "l2_lanes_of": l2_lanes_of,
         # L15-12c-E2a: the anchor's L2 identity, (-1, -1) when absent.
         "anchor_l2_of": lambda rid: anchor_l2_by_rid.get(rid, (-1, -1)),
+        # L15-HOSTLOCK: None unless the hook passed a hold_sink (master on).
+        "hold_l2_refs": hold_l2_refs,
         "caps_rows_by_rank": caps_rows_by_rank,
         "cap_anchor_slots": cap_anchor_slots,
         "prefix": prefix,

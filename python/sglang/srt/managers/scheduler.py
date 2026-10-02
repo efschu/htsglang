@@ -20083,6 +20083,13 @@ class Scheduler(
                             manifest_path=l15_manifest.manifest_path(
                                 "D", _l15_rank, os.environ),
                             log=logger.info,
+                            # L15-HOSTLOCK (LCHOST defect 2): this hook runs
+                            # only behind the L15 master gate, so a present
+                            # sink means "master on": the arena refs the
+                            # sleep pins are recorded here and released by
+                            # the wake act (_l15_wake_act / fallback drop).
+                            hold_sink=lambda _rec: setattr(
+                                self, "_l15_host_hold", _rec),
                         )
                         # L15-12c-C2: alignment probe -- chain host rows vs
                         # the seqlen-1 KV span; the first L15=1 boot confirms

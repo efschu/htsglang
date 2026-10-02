@@ -50,6 +50,17 @@ def verdict(
     return decide(min_fp, max_fp)
 
 
+class L15RefillError(RuntimeError):
+    """Refill could not be performed as one whole operation.
+
+    The caller folds this into the wake's gather as a bad vote; a partial
+    copy is never reported as success. Defined here (not in l15_refill)
+    because the plan builders below raise it for a plan that cannot be
+    built at all; l15_refill re-exports it, so every existing
+    ``l15_refill.L15RefillError`` site keeps working -- no cycle:
+    l15_refill imports this module, never the reverse."""
+
+
 def _owns(prefix: Sequence[int], rank: int, slot: int) -> bool:
     lo = slot % prefix[-1]
     return prefix[rank] <= lo < prefix[rank + 1]
@@ -76,11 +87,75 @@ def _l2_source(span, i: int) -> Optional[Tuple[int, int]]:
     return None
 
 
+def owned_l2_rows(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
+    """Every L2-backed row this rank must refill, ONCE per compact row.
+
+    This is the ONE dedupe all plan builders share (refill_plan,
+    refill_plan_laned, the wake's refill ACT and sample check): held spans
+    that share a radix path share the prefix's device slot (compact_plan
+    F7 planned it once), so the spans x tokens walk visits the same
+    compact row once per sharing span, each time with the IDENTICAL
+    recorded (l2_slot, l2_gen, lane). Returning the row once is what lets
+    the refill load it once -- refusing the second, identical occurrence
+    (the old l15_refill "duplicate page slot") made every multi-rid hold
+    with a shared system prompt vote None and fall back.
+
+    Entries come in first-appearance order as ``(compact_row, l2_slot,
+    l2_gen, lane, rids)``; ``rids`` names EVERY span rid that landed on
+    the row (first-appearance order, the leading tag is the first rid),
+    because a generation mismatch must drop each referencing request
+    WHOLE -- the whole rid set therefore travels with the row into
+    gen_check. A row whose two visits recorded DIFFERENT identities is a
+    real conflict -- the one destination row cannot come from two sources
+    -- and raises L15RefillError naming row and both sources, never a
+    silent first-wins. Tokens whose span carries no L2 source are skipped
+    (count_missing counts them per token still)."""
+    entries: List[List] = []
+    by_row: dict = {}
+    for span, i, slot in _owned_tokens(m, rank, prefix):
+        src = _l2_source(span, i)
+        if src is None:
+            continue
+        lanes = getattr(span, "l2_lanes", ())  # pre-P1 records/records
+        lane = lanes[i] if i < len(lanes) else -1  # without lanes at all
+        row = _compact_row(prefix, rank, slot)
+        ident = (int(src[0]), int(src[1]), int(lane))
+        ent = by_row.get(row)
+        if ent is None:
+            ent = [row, ident[0], ident[1], ident[2], [str(span.rid)]]
+            by_row[row] = ent
+            entries.append(ent)
+        elif tuple(ent[1:4]) != ident:
+            raise L15RefillError(
+                "refill plan: row %d claimed by two L2 sources: "
+                "(slot %d, gen %d, lane %d) via rid %s vs "
+                "(slot %d, gen %d, lane %d) via rid %s"
+                % (row, ent[1], ent[2], ent[3], ",".join(ent[4]),
+                   ident[0], ident[1], ident[2], str(span.rid)))
+        elif str(span.rid) not in ent[4]:
+            ent[4].append(str(span.rid))
+    return [(e[0], e[1], e[2], e[3], tuple(e[4])) for e in entries]
+
+
+def rid_tagged_plan(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[Tuple[str, ...], int, int, int]]:
+    """The refill ACT's plan: owned_l2_rows' rows as
+    ``(rids, compact_row, l2_slot, l2_gen)`` -- the full rid tuple travels
+    with a shared row so gen_check drops EVERY sharing rid on a generation
+    mismatch, never just the first tag."""
+    return [(rids, row, slot, gen)
+            for row, slot, gen, _lane, rids in owned_l2_rows(m, rank, prefix)]
+
+
 def refill_plan(
     m: Manifest, rank: int, prefix: Sequence[int],
     cap_rows_by_rank: Sequence[int],
 ) -> List[Tuple[int, int, int]]:
-    """Rows rank must refill from L2 as (compact_row, l2_slot, l2_gen).
+    """Rows rank must refill from L2 as (compact_row, l2_slot, l2_gen),
+    each row ONCE (shared-prefix rows deduped by owned_l2_rows).
 
     Invariant (cap > 0 = resident): ``cap_rows_by_rank[rank] > 0`` means
     this rank KEPT its rows mapped on the TMS keep spans through the hold,
@@ -95,12 +170,8 @@ def refill_plan(
     count_missing()."""
     if cap_rows_by_rank[rank] > 0:
         return []
-    plan = []
-    for span, i, slot in _owned_tokens(m, rank, prefix):
-        src = _l2_source(span, i)
-        if src is not None:
-            plan.append((_compact_row(prefix, rank, slot), src[0], src[1]))
-    return plan
+    return [(row, slot, gen)
+            for row, slot, gen, _lane, _rids in owned_l2_rows(m, rank, prefix)]
 
 
 def count_missing(m: Manifest, rank: int, prefix: Sequence[int]) -> int:

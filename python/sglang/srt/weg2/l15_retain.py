@@ -209,6 +209,12 @@ def _no_anchor_l2(rid: str) -> Tuple[int, int]:
     return (-1, -1)
 
 
+def _no_l2_lanes(rid: str) -> Tuple[int, ...]:
+    """Default l2_lanes_of: no lanes recorded (()) -- the pre-P1
+    behaviour for callers that do not supply the callable."""
+    return ()
+
+
 def retain_at_sleep(
     *,
     candidates: Iterable,
@@ -217,6 +223,7 @@ def retain_at_sleep(
     anchor_slot_of: Callable[[str], int],
     l2_of: Callable[[str], Tuple[Sequence[int], Sequence[int]]],
     anchor_l2_of: Callable[[str], Tuple[int, int]] = _no_anchor_l2,
+    l2_lanes_of: Callable[[str], Tuple[int, ...]] = _no_l2_lanes,
     rewrite_tree: Callable[
         [object, Dict[int, int], Dict[int, int], set], None
     ],
@@ -230,6 +237,8 @@ def retain_at_sleep(
     mamba_buffers,
     allocator,
     mamba_allocator=None,
+    hold_l2_refs: Optional[
+        Callable[[Sequence[int], Sequence[int]], None]] = None,
     reset_keep: Callable[[list], None],
     set_keep: Callable[[object, Tuple[Tuple[int, int], ...]], None],
     manifest_path: str,
@@ -319,6 +328,24 @@ def retain_at_sleep(
             seen_last.add(id(node))
             rewrite_tree(node, kv_map, hold_anchor_map, visited)
 
+    # L15-HOSTLOCK (LCHOST defect 2): BEFORE reset_keep (whose _reset_full
+    # hands every kept chain's arena references back -- kept chains never
+    # carry host_lock_ref) pin this rank's held L2 slots once, in this
+    # rank's own host pools: a rank's l2_slots are its OWN shard's arena
+    # slots, so cap-0 ranks take refs too -- TP0 is exactly the rank that
+    # refills from L2 at the wake. The wake act gives them back (hold: after
+    # the refill copied; fallback: in the drop). Master off: the scheduler
+    # hook passes no callable, no reference is taken (byte-identical). The
+    # slot list is the bind-time l2_of/anchor_l2_of snapshot -- the same
+    # values step (8) publishes into the manifest.
+    if hold_l2_refs is not None:
+        kv_l2: list = []
+        anchor_l2: list = []
+        for rid in hs.rids:
+            kv_l2.extend(int(x) for x in l2_of(rid)[0])
+            anchor_l2.append(int(anchor_l2_of(rid)[0]))
+        hold_l2_refs(kv_l2, anchor_l2)
+
     # (5) partial tree reset over exactly the kept nodes
     reset_keep(nodes)
 
@@ -366,6 +393,8 @@ def retain_at_sleep(
             # L15-12c-E2a: the anchor's L2 identity for the cap-0 wake
             anchor_l2_slot=int(anchor_l2_of(rid)[0]),
             anchor_l2_gen=int(anchor_l2_of(rid)[1]),
+            # L15-12c-P1: the lane each held token owns in its L2 page
+            l2_lanes=tuple(int(x) for x in l2_lanes_of(rid)),
         )
         for rid in hs.rids
     )
