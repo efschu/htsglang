@@ -172,3 +172,37 @@ class Handover:
         """One log line per state, the WEG2 way: name it, do not hint at it."""
         return "HOT-HANDOVER rid=%s n=%d state=%s reason=%s" % (
             self.plan.rid, self.plan.n_tokens, self.state, self.reason)
+
+
+# -- L15-10 S2: real candidates from the front ------------------------------
+
+def front_candidates(queue, sess_prev, d_live) -> list:
+    """decide()'s input from the front's own state at a D->P flip.
+
+    ``queue``: the waiting follow-ups (objects with ``.rid``), in order;
+    ``sess_prev``: rid -> (previous rid of the same session, common token
+    prefix) -- the SESSION-PREFIX bookkeeping; ``d_live``: rids D still holds
+    (running or parked: their KV is on D). A follow-up is hot when its
+    session's previous rid is live on D; its handable prefix is the common
+    token prefix, and the anchor sits at that depth (D parks/ends a request at
+    its END anchor, the prefix the follow-up shares)."""
+    out = []
+    for q in queue:
+        rid = str(getattr(q, "rid", ""))
+        prev = (sess_prev or {}).get(rid)
+        hot = bool(prev) and str(prev[0]) in d_live
+        n = int(prev[1]) if hot else 0
+        out.append({"rid": rid, "hot_in_d": hot, "prefix_tokens": n,
+                    "anchor_depth": n})
+    return out
+
+
+def plan_line(epoch: int, candidates, p_free_rows: int) -> str:
+    """One HOT-HANDOVER-PLAN line: waiting, hot count, hot tokens, and the
+    handover decide() would choose (none -> the store read of today)."""
+    hot = [c for c in candidates if c.get("hot_in_d")]
+    plan = decide(candidates, p_free_rows)
+    chosen = ("chosen=%s n=%d" % (plan.rid, plan.n_tokens)) if plan else "chosen=none"
+    return ("HOT-HANDOVER-PLAN epoch=%d waiting=%d hot=%d hot_tokens=%d %s"
+            % (int(epoch), len(candidates), len(hot),
+               sum(int(c.get("prefix_tokens", 0)) for c in hot), chosen))

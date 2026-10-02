@@ -10388,6 +10388,20 @@ class Front:
                             for q in itertools.islice(self.queue, 8)
                         ],
                     )
+                    # L15-10 S2: the decision from REAL candidates -- a
+                    # follow-up is hot when its session's previous rid is
+                    # still live on D (running or parked). Measurement only:
+                    # no copy happens yet (S3-S5).
+                    from sglang.srt.weg2 import hot_handover as _hh
+
+                    _d_live = set(S.outstanding) | set(
+                        getattr(self, "_d_parked", None) or {})
+                    logger.info("%s", _hh.plan_line(
+                        self.epoch,
+                        _hh.front_candidates(
+                            list(self.queue),
+                            self.__dict__.get("_sess_prev") or {}, _d_live),
+                        p_free_rows=1 << 30))
             except Exception:  # noqa: BLE001 - shadow must never block a flip
                 pass
         if _fw_none is not None:  # FEHLT 3: the previous flip's woken group never worked
