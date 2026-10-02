@@ -98,3 +98,19 @@ def test_shadow_only_under_the_l15_master(monkeypatch):
     assert park_l3._l15_shadow_on() is True
     monkeypatch.setenv("SGLANG_WEG2_L15_L2_SHADOW", "0")
     assert park_l3._l15_shadow_on() is False
+
+
+def test_a_slot_not_complete_at_the_bind_is_no_l2_source(monkeypatch):
+    """L15-L2-REQUIRE-COMPLETE: a live tail row whose page the census does not
+    see COMPLETE (gen -1, write-through in flight) is unbacked, never sampled
+    or refilled. =0 restores the old pairing (slot kept with gen -1)."""
+    monkeypatch.delenv("SGLANG_WEG2_L15_L2_REQUIRE_COMPLETE", raising=False)
+    pool = _Pool(staging_rows=10, gens={0: 7, 1: 7})          # slot 2 not COMPLETE
+    root = _node(None, 3, host_rows=torch.tensor([10, 11, 12], dtype=torch.int64))
+    logs = []
+    slots, gens = _bind(root, pool, 3, logs)
+    assert slots == (0, 1, -1) and gens == (7, 7, -1)
+    assert any("L15-L2-INCOMPLETE rid=weg2-8-8 rows=1 of 3" in m for m in logs)
+    monkeypatch.setenv("SGLANG_WEG2_L15_L2_REQUIRE_COMPLETE", "0")
+    slots, gens = _bind(root, pool, 3, [])
+    assert slots == (0, 1, 2) and gens == (7, 7, -1)
