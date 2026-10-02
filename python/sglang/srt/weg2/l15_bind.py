@@ -297,6 +297,54 @@ def anchor_host_row(node, anchor_slot: int) -> int:
     return -1
 
 
+def _group_entry(pool, name: str):
+    """L15-FIX-HOSTGROUP: the host pool behind a HostPoolGroup entry.
+
+    On the hybrid 27B the cache controller's ``mem_pool_host`` is a
+    HostPoolGroup (hybrid_pool_assembler), which has no ``slot_gens`` /
+    ``staging_rows`` of its own; the arena pools are its KV / MAMBA entries.
+    A plain pool (no ``entry_map``) is returned unchanged; a group without
+    that entry gives None.
+    """
+    emap = getattr(pool, "entry_map", None)
+    if not isinstance(emap, dict):
+        return pool
+    entry = emap.get(name)
+    return None if entry is None else getattr(entry, "host_pool", None)
+
+
+def live_host_pools(tree_cache):
+    """(kv_host_pool, mamba_host_pool) of the live tree, either may be None.
+
+    ONE resolver for the sleep bind and the wake refill: the controller's
+    ``mem_pool_host`` is unwrapped through its HostPoolGroup entries; the
+    mamba pool falls back to a controller- or tree-level ``mamba_pool_host``
+    (the older hybrid mamba cache sets it on the tree) when there is no
+    group entry.
+    """
+    cc = getattr(tree_cache, "cache_controller", None)
+    raw = getattr(cc, "mem_pool_host", None)
+    kv = _group_entry(raw, "kv")
+    mamba = _group_entry(raw, "mamba")
+    if mamba is None or mamba is raw:
+        mamba = getattr(cc, "mamba_pool_host", None)
+    if mamba is None:
+        mamba = getattr(tree_cache, "mamba_pool_host", None)
+    return kv, mamba
+
+
+def _slot_gens_or_minus_one(pool, slots, log, what: str):
+    """One census call; a pool without ``slot_gens`` (plain MambaPoolHost on
+    a form-A worker) gives -1 per slot -- that span is held but not
+    L2-refillable -- instead of failing the whole retain round."""
+    fn = getattr(pool, "slot_gens", None)
+    if fn is None:
+        log("L15-L2-GENS %s pool %s has no slot_gens: %d slot(s) gen -1 "
+            "(held, not L2-refillable)" % (what, type(pool).__name__, len(slots)))
+        return [-1] * len(slots)
+    return fn(slots)
+
+
 def build_retain_kwargs(
     reqs: Iterable,
     req_to_token,
@@ -427,10 +475,8 @@ def build_retain_kwargs(
     # Host ids: [0, S) staging rows (no L2 copy -> -1), [S, S + A*P) arena
     # token ids, slot = (row - S) // P (P == 1 is the 27B form); the draft
     # role maps rows through row_slot instead. Gens come from ONE census.
-    pool = host_pool
-    if pool is None:
-        _rc = getattr(reset_keep, "__self__", None)
-        pool = getattr(getattr(_rc, "cache_controller", None), "mem_pool_host", None)
+    _live_kv, _live_mamba = live_host_pools(getattr(reset_keep, "__self__", None))
+    pool = _group_entry(host_pool, "kv") if host_pool is not None else _live_kv
     l2_by_rid: Dict[str, Tuple[Tuple, Tuple]] = {}
     if pool is not None and l2_rows:
         _s = int(getattr(pool, "staging_rows", 0))
@@ -450,7 +496,7 @@ def build_retain_kwargs(
         uniq = sorted({s for per in _slot_of.values() for s in per if s >= 0})
         gen_of = {}
         if uniq:
-            for s, g in zip(uniq, pool.slot_gens(uniq)):
+            for s, g in zip(uniq, _slot_gens_or_minus_one(pool, uniq, log, "kv")):
                 gen_of[int(s)] = int(g)
         for rid, per in _slot_of.items():
             l2_by_rid[rid] = (
@@ -465,11 +511,9 @@ def build_retain_kwargs(
     # reset_keep's cache_controller: ``mamba_pool_host``, the controller-
     # side name of the component's _mamba_pool_host
     # (hybrid_pool_assembler._COMPONENT_HOST_ATTR).
-    mpool = mamba_host_pool
-    if mpool is None:
-        _mc = getattr(getattr(reset_keep, "__self__", None),
-                      "cache_controller", None)
-        mpool = getattr(_mc, "mamba_pool_host", None)
+    # the controller holds the HostPoolGroup; its MAMBA entry is the anchor
+    # pool (live_host_pools; L15-FIX-HOSTGROUP)
+    mpool = mamba_host_pool if mamba_host_pool is not None else _live_mamba
     anchor_l2_by_rid: Dict[str, Tuple[int, int]] = {}
     if anchor_rows and mpool is not None:
         _ms = int(getattr(mpool, "staging_rows", 0))
@@ -478,7 +522,7 @@ def build_retain_kwargs(
         _want = sorted({s for s in _slot_row.values() if s >= 0})
         _agen: Dict[int, int] = {}
         if _want:
-            for s, g in zip(_want, mpool.slot_gens(_want)):
+            for s, g in zip(_want, _slot_gens_or_minus_one(mpool, _want, log, "mamba")):
                 _agen[int(s)] = int(g)
         for rid, s in _slot_row.items():
             anchor_l2_by_rid[rid] = (

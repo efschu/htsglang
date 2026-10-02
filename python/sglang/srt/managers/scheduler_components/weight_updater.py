@@ -7550,9 +7550,11 @@ class SchedulerWeightUpdaterManager:
                 prefix.append(prefix[-1] + _x)
             mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
             device_pool = getattr(mr, "token_to_kv_pool", None)
-            host_pool = getattr(
-                getattr(getattr(sched, "tree_cache", None),
-                        "cache_controller", None), "mem_pool_host", None)
+            # L15-FIX-HOSTGROUP: mem_pool_host is the HostPoolGroup on the
+            # hybrid 27B; the arena pools are its KV / MAMBA entries.
+            from sglang.srt.weg2.l15_bind import live_host_pools
+            host_pool, host_mamba = live_host_pools(
+                getattr(sched, "tree_cache", None))
             if device_pool is None or host_pool is None:
                 raise LookupError("refill needs the device KV pool and the "
                                   "L2 host pool")
@@ -7578,8 +7580,6 @@ class SchedulerWeightUpdaterManager:
             # anchor_slot is the span's device anchor row, kept out of the
             # req clear by the restore's keep_mamba_rows; anchor_l2_slot is
             # its L2 page (>= 0 here -- the gate did not open without it).
-            tree = getattr(sched, "tree_cache", None)
-            host_mamba = getattr(tree, "mamba_pool_host", None)
             dev_mamba = getattr(getattr(sched, "req_to_token_pool", None),
                                 "mamba_pool", None)
             if host_mamba is None or dev_mamba is None:
