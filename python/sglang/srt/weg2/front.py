@@ -8406,6 +8406,8 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
+        if self._d_direct_yields(rid):
+            return None  # FLIPCYCLE H5b: the flip comes anyway -- ride P's batch
         if _asr.enabled():
             # ARRIVAL-SEAT (b): no seat free or D's KV short -> wait for the
             # next free seat in arrival order, never the P detour (H91c3-3's
@@ -8425,6 +8427,8 @@ class Front:
             if refused is not None:
                 refused.append("d_budget")
             return None
+        if self._d_direct_yields(rid):
+            return None  # FLIPCYCLE H5b: a P-bound request queued while it waited
         await self._d_seat.acquire()
         if (not (self.awake == "D" and self.admit_d and self.state == "serving")
                 or (not _asr.enabled() and self._d_phase_seats_full(rid, own_seat=True))):
@@ -8719,6 +8723,37 @@ class Front:
                         ("it fits" if not plan else
                          "it goes to D; D's SEAT-AGE decides the displacement on its real KV"))
         return plan
+
+    def _d_direct_yields(self, rid: str) -> bool:
+        """FLIPCYCLE H5b (02.10.): no D-direct prefill when the D->P flip is
+        already foreseeable -- a request that needs P is queued. A D pass with
+        >= 8 new tokens streams the routed experts of all 48 layers (1.2-3.8 s,
+        pool.host_fetch at the link floor) and the park of that flip waits the
+        whole pass behind it (y6z park RPC p90 1872 ms: ep 8 1.87 s, ep 22
+        1.96 s behind a D-direct SHORT). The SHORT rides P's batch instead (its
+        prefix from the shared store); the flip it waited for comes anyway.
+        Unforeseeable (the P-bound arrival lands DURING the pass) stays the
+        pass: a running forward is not cut."""
+        if not envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD.get():
+            return False
+        try:
+            # only a P-bound request that FITS (seat and KV, the ARRIVAL-SEAT step's
+            # own reading) makes the flip foreseeable; a seat- or KV-blocked one
+            # does not flip, and the SHORT waits for its seat on D (rule 29.09.)
+            # read, never create (the ARRIVAL-SEAT-off path keeps no state)
+            fits = (getattr(self, "__dict__", {}).get("_asr_state") or {}).get("fits") or {}
+            cands = [q for q in self._asr_live_p_cands()
+                     if getattr(q, "rid", None) != rid and fits.get(getattr(q, "rid", None)) is True]
+        except Exception:  # noqa: BLE001 - a reading never blocks the route
+            return False
+        if not cands:
+            return False
+        self.counters["d_direct_yield"] += 1
+        logger.info("WEG2-FLIPCYCLE stage=park_wait rid=%s ms=0 floor_ms=0 yield=d_direct "
+                    "p_bound=%s epoch=%d (H5b: a D->P flip is foreseeable, this SHORT joins P's "
+                    "batch instead of a 1.2-3.8 s D pass the park would wait behind)",
+                    rid, getattr(cands[0], "rid", "?"), self.epoch)
+        return True
 
     def _asr_live_p_cands(self) -> List["Pending"]:
         """The queued requests that need P (the step's candidates)."""
