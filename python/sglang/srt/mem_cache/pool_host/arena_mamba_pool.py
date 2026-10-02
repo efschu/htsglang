@@ -52,6 +52,17 @@ def _arena_state_load_block_bytes() -> int:
         return 256 << 20
 
 
+#: DP-NACHLAUF 02.10.: the staging rows' per-layer load with device rows on
+#: the card -- gather, pinned, non-blocking H2D, index_copy_ (no host wait on
+#: the forward-fenced load stream). Unset = on; 0/false/no/off = the base path.
+ENV_MAMBA_REST_DEVICE_ROWS = "SGLANG_WEG2_MAMBA_REST_DEVICE_ROWS"
+
+
+def mamba_rest_device_rows_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_MAMBA_REST_DEVICE_ROWS, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _load_sub(pool) -> dict:
     """H2D phase 1 (a): CPU ms of the mamba state load's sub-stages, summed
     over one start_loading; the hybrid host pool folds them into the
@@ -757,6 +768,33 @@ class ArenaMambaPoolHost(MambaPoolHost):
                         _STATE_LOAD_N, n, n * row_bytes, B, "dma" if dma else "cpu",
                         f"{len(runs)} copies per slot from the arena" if dma else "pinned gather + one H2D per block")
 
+    def _load_rest_rows(self, device_pool, host_rows, dev_rows, layer_id, io_backend) -> str:
+        """The staging (non-arena) rows of one layer. DP-NACHLAUF 02.10.: with
+        the device rows ON THE CARD (P-NOSYNC keeps them there) the base
+        path's ``transfer_kv_direct`` calls ``dst_indices.cpu()`` -- a host
+        wait on the load stream, which is fenced behind the forward in flight
+        (N5d WEG2-START-LOADING mamba=345 ms against 9 ms of timed
+        sub-stages, right before P's first prefill forward). Here the rows go
+        host gather -> pinned -> non-blocking H2D -> ``index_copy_`` with the
+        device rows as they are: no host wait. Host rows on the host, device
+        rows on the host, a page-first layout or the switch off -> the base
+        path. Returns ``"device"`` or ``"base"`` (counted on the line)."""
+        dst_t = device_pool.mamba_cache.temporal[layer_id]
+        if (not mamba_rest_device_rows_on() or not getattr(dev_rows, "is_cuda", False)
+                or getattr(host_rows, "is_cuda", False)
+                or getattr(self, "layout", "layer_first") in ("page_first", "page_first_direct")):
+            MambaPoolHost.load_to_device_per_layer(self, device_pool, host_rows, dev_rows, layer_id, io_backend)
+            return "base"
+        hr = host_rows.to(torch.int64)
+        dev = dst_t.device
+        rows = self.temporal_buffer[layer_id].index_select(0, hr)
+        dst_t.index_copy_(0, dev_rows, rows.pin_memory().to(dev, non_blocking=True))
+        for conv_idx in range(len(self.conv_state_shapes)):
+            dst_c = device_pool.mamba_cache.conv[conv_idx][layer_id]
+            rows_c = self.conv_buffer[conv_idx][layer_id].index_select(0, hr)
+            dst_c.index_copy_(0, dev_rows, rows_c.pin_memory().to(dev, non_blocking=True))
+        return "device"
+
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend="direct"):
         if self.arena is None or host_indices.numel() == 0:
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
@@ -779,12 +817,13 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 rest = (~is_arena).nonzero(as_tuple=True)[0]
                 if rest.numel():
                     _trest = time.perf_counter()
-                    super().load_to_device_per_layer(
+                    _how = self._load_rest_rows(
                         device_pool, host_indices[rest.to(host_indices.device)],
                         device_indices[rest.to(device_indices.device)], layer_id, io_backend)
                     # DP-NACHLAUF: the staging (non-arena) rows' per-layer copies
                     _subp["rest"] = _subp.get("rest", 0.0) + (time.perf_counter() - _trest) * 1000.0
                     _subp["rest_rows"] = float(rest.numel())
+                    _subp["rest_" + _how] = _subp.get("rest_" + _how, 0.0) + 1.0
                 return  # every layer came with the state load at layer 0
             if layer_id == 0:
                 try:
@@ -812,11 +851,12 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     rest = (~is_arena).nonzero(as_tuple=True)[0]
                     if rest.numel():
                         _trest = time.perf_counter()
-                        super().load_to_device_per_layer(
+                        _how = self._load_rest_rows(
                             device_pool, host_indices[rest.to(host_indices.device)],
                             device_indices[rest.to(device_indices.device)], layer_id, io_backend)
                         _subp["rest"] = _subp.get("rest", 0.0) + (time.perf_counter() - _trest) * 1000.0
                         _subp["rest_rows"] = float(rest.numel())
+                        _subp["rest_" + _how] = _subp.get("rest_" + _how, 0.0) + 1.0
                     return
                 except Exception as exc:  # noqa: BLE001 -- one named fallback to the per-layer path
                     logger.warning("WEG2-ARENA-STATE-LOAD failed (%s: %s); per-layer path", type(exc).__name__, exc)
