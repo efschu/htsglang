@@ -77,6 +77,8 @@ def test_flush_branch_wiring():
     i_reset = src.index("self.tree_cache.reset()", i_q)
     i_note = src.index("_weg2_note_reset(self)", i_reset)
     assert i_q < i_reset < i_note
+    # NF has no WEG2-SLEEP-SUB segment clock (_fsub, 27B PDFLIP-L): the skip
+    # branch only has to leave the tree and both pools untouched
     seg = src[i_q:i_reset]
-    for m in ('_fsub.mark("tree_reset")', '_fsub.mark("req_pool_clear")', '_fsub.mark("alloc_clear")'):
-        assert m in seg
+    for m in (".reset()", ".clear()"):
+        assert m not in seg
