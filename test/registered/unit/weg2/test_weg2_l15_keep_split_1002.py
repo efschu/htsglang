@@ -154,3 +154,24 @@ def test_a_hold_covering_the_whole_base_is_still_split_and_kept(tmp_path):
                             b.data_ptr(), r, native=[(0, G), (G, 3 * G)]))
     assert ok is True
     assert sv.pause_kept_bytes() == 4 * G
+
+
+def test_split_early_runs_on_every_plain_d_flush_not_only_with_parked():
+    """L15-SPLIT-EARLY (N5n 14:43:49, dac8b62b8c): the split ran only in the first
+    sleep WITH parked requests (inside the KEEP-CLEAR gate on weg2_d_parked), i.e.
+    inside a user flip. It must sit outside that gate: master on + group D only.
+    RED on a9dcae8df7 (the call sat under the parked gate)."""
+    import inspect
+    import re
+
+    from sglang.srt.managers import scheduler as sch
+
+    src = inspect.getsource(sch)
+    i = src.index("L15-SPLIT-EARLY")
+    block = src[i:i + 1600]
+    assert "ensure_split_for_sched" in block
+    assert 'SGLANG_WEG2_GROUP' in block and "master_on" in block
+    assert "weg2_d_parked" not in block
+    clear = src[src.index('"L15-KEEP-CLEAR at=sleep rank=%d bases=%d"') - 1200:i]
+    assert not re.search(r"ensure_split_for_sched\(", clear), \
+        "the split must not stay inside the parked-only KEEP-CLEAR gate"
