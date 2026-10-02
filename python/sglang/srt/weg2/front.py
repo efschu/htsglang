@@ -2590,6 +2590,17 @@ def _eb_reroute_enabled(env=None) -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def p_phase_arrival(awake: str, state: str, flip_dst: Optional[str]) -> bool:
+    """P-BATCH-ALL: an arrival in a P phase -- P awake (serving or flipping
+    away: the flip to D has not begun when ``flip_dst`` is not D), or D
+    flipping to P. The cut-off is the begin of the P->D flip
+    (``state == "flipping"`` and ``flip_dst == "D"``): from then on the
+    arrival is D's (SHORT-IN-FLIP), no reverse flip."""
+    if state == "flipping":
+        return flip_dst == "P"
+    return awake == "P"
+
+
 def _short_keep_enabled(env=None) -> bool:
     """SK: ``SGLANG_WEG2_SHORT_KEEP_PRESENCE`` (default on; 0 = a SHORT that
     falls through is queued BATCH and prefilled on P, as before)."""
@@ -3264,9 +3275,10 @@ class Pending:
     #: SHORT route's (pending=None -- no leg 1 ever ran for it).
     d_direct: bool = False
     #: SK (#243, NF rc12r weg2-12-39 / weg2-13-44): a SHORT verdict with a
-    #: measured D presence that fell through to the queue (gate timeout, P
-    #: awake): kept for D -- no leg 1 on P -- and re-priced at its D
-    #: admission when a flip lay between the price and the admission.
+    #: measured D presence that fell through to the queue IN A D PHASE (gate
+    #: timeout, seats): kept for D -- no leg 1 -- and re-priced at its D
+    #: admission when a flip lay between. P-BATCH-ALL (02.10.): never while
+    #: P is awake; a P drain gives a kept SHORT its leg 1 back.
     short_kept: bool = False
     #: SK: the front epoch the price was taken in.
     price_epoch: int = -1
@@ -5905,6 +5917,56 @@ class Front:
         self._x_exact_reprice_queue("p_anchor")
         return anchor
 
+    def _to_p_batch(self, p: "Pending", where: str) -> None:
+        """P-BATCH-ALL: ``p`` gets a normal leg 1 on P (no D prefill)."""
+        was = ("short_kept" if getattr(p, "short_kept", False)
+               else "d_direct" if getattr(p, "d_direct", False) else "queued")
+        if getattr(p, "short_kept", False):
+            p.skip_leg1 = False
+        p.short_kept = False
+        p.d_direct = False
+        p.leg1_done = False
+        self.counters["p_batch_from_d"] += 1
+        logger.info("WEG2 P-BATCH-TAKES rid=%s was=%s where=%s est_uncached=%d epoch=%d (P is awake: "
+                    "its whole prefill runs on P, the prefix read from the shared store; D gets it "
+                    "under the E2 contract, d_compute=0)", p.rid, was, where,
+                    int(getattr(p, "est_uncached", 0) or 0), self.epoch)
+
+    def _p_batch_takes_d_prefill(self) -> int:
+        """P-BATCH-ALL (user 02.10.): at the start of a P drain, every request
+        still waiting for a D PREFILL -- a D-phase decision (SK SHORT-KEPT,
+        D-SHORT-DRAIN, ARRIVAL-SEAT QUEUED-SHORT / SHORT-IN-FLIP, X-IDLE-REGRANT:
+        ``d_direct``, no leg 1 ran) that D did not admit before the D->P flip
+        -- leaves ``_ready_for_d`` for P's queue, in arrival order. Queued kept
+        SHORTs get their leg 1 back. A request P already prefilled
+        (``leg1_done``, not ``d_direct``) stays. Returns the number moved."""
+        moved = []
+        ready = getattr(self, "_ready_for_d", None)
+        if ready:
+            keep = []
+            for p in ready:
+                if (getattr(p, "d_direct", False) and not getattr(p, "resume_via_p", False)
+                        and not getattr(p, "p_only", False)
+                        and (getattr(p, "fut", None) is None or not p.fut.done())):
+                    moved.append(p)
+                else:
+                    keep.append(p)
+            if moved:
+                ready.clear()
+                ready.extend(keep)
+                for p in moved:
+                    self._to_p_batch(p, "ready_for_d")
+                merged = sorted(list(self.queue) + moved, key=lambda q: q.t_arrive)
+                self.queue.clear()
+                self.queue.extend(merged)
+                self._sync_batch_gate()
+        n = len(moved)
+        for p in self.queue:
+            if getattr(p, "short_kept", False):
+                self._to_p_batch(p, "queue")
+                n += 1
+        return n
+
     def _d_inflight_presence(self, rid: str, text: str, pending: Any, via: str) -> int:
         """X-CREDIT-INFLIGHT-1002 (switch SGLANG_WEG2_ENABLE_D_INFLIGHT_PRESENCE).
 
@@ -7600,18 +7662,26 @@ class Front:
         # tokens again on P for an uncached remainder of 186). It keeps its
         # queue place, skips leg 1 and waits for D; its D admission re-prices
         # it if a flip lay between (see _sk_admission_reprice).
+        # P-BATCH-ALL (user 02.10. ~07:45Z, strict phase batch): the SHORT
+        # price only decides whether a D phase wakes P. While P is awake or
+        # waking, EVERY prefill joins P's batch -- its prefix comes from the
+        # shared store (L2/L3, written by either group), never "kept for D"
+        # (y6x weg2-15-52: kept, D prefilled 207 tokens after the P->D flip
+        # with three decodes stalled behind it). SK keeps only a D-phase
+        # fall-through.
+        _p_phase = p_phase_arrival(self.awake, self.state, getattr(self, "_flip_dst", None))
         _sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0
-               and not short_refused and presence_src not in ("", "none", None))
-        if self.awake != "D" and short_ok:
+               and not short_refused and presence_src not in ("", "none", None)
+               and not _p_phase)
+        if _p_phase and short_ok:
             # L4/R-10: law 1 read literally means every arrival during a P
             # drain is queued BATCH, SHORT ones included.  Counted here,
             # printed by the drain (n=0 printed too), never discovered.
             self.counters["short_behind_p"] += 1
-            # SK: the per-rid line this fall-through never had (weg2-13-44).
-            logger.info("WEG2 SHORT-BEHIND-P rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
-                        "arrived while %s is awake -- queued%s", rid, remainder, store_span,
-                        presence_src, self.awake,
-                        " and KEPT for D (no leg 1 on P)" if _sk else " BATCH (leg 1 on P)")
+            logger.info("WEG2 SHORT-TO-P rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
+                        "arrived while P is %s -- joins P's batch (leg 1 on P, the prefix read "
+                        "from the shared store)", rid, remainder, store_span, presence_src,
+                        "awake" if self.awake == "P" else "waking")
         elif self.awake == "D" and not short_ok:
             # L5: a BATCH arrival during a D phase -- named and left; it is
             # served by the NEXT P phase, whose epoch this line names.
@@ -12719,6 +12789,8 @@ class Front:
                 # dispatches, the stalled request stays at the head) and the
                 # flip below follows because the queue is not empty.
                 self._p_intake_stalled = False
+                # P-BATCH-ALL: prefill queued for D before this P phase joins it
+                self._p_batch_takes_d_prefill()
                 short_behind_p0 = self.counters.get("short_behind_p", 0)
                 # MF-3: the same delta idiom as `short_behind_p0` -- the
                 # epoch's terms are read off the running counters rather than
@@ -12736,6 +12808,9 @@ class Front:
                     self.p_pool_tokens,
                     min(self.p_concurrency + _ahead, self.p_phase_max_requests or (self.p_concurrency + _ahead)))
                 async def one(p: Pending) -> Pending:
+                    if getattr(p, "short_kept", False):
+                        # P-BATCH-ALL: P is awake -- a kept SHORT is prefilled here
+                        self._to_p_batch(p, "drain")
                     if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
                         p.leg1_done = True
                         return p
@@ -12862,7 +12937,7 @@ class Front:
                     # L4/R-10: the counted consequence of law 1 -- SHORT work
                     # that arrived while P was draining and had to queue
                     # BATCH.  n=0 is printed too, so absence is a reading.
-                    logger.info("WEG2 SHORT-BEHIND-P epoch=%d n=%d oldest_wait_s=%.1f",
+                    logger.info("WEG2 SHORT-TO-P epoch=%d n=%d oldest_wait_s=%.1f",
                                 self.epoch, self.counters.get("short_behind_p", 0) - short_behind_p0,
                                 oldest_short)
                     # MF-3 (L15): what group P's disarmed store read cost THIS
