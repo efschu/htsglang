@@ -22,6 +22,14 @@ l15.
   landed at least one page.
 * ``l15``: the schema and its writer (:func:`note_l15`); the block exists only
   once an L1,5 stage has written it -- no stage, no key (never zeros).
+* ``vision`` (Nutzer 02.10. ~11:00Z: "der visiontower laden rechnen entladen
+  auch mit in die phasenliste ins dashboard"): the transient tower stage on
+  P's PP0 (weg2/vision_rank_runner.py). ``live`` = {run, leg, since, rids}
+  while a stage runs (the leg it is in, wall clock), null between stages;
+  ``runs`` = the stages so far; ``recent`` = the last :data:`RECENT_KEEP`
+  stages as {run, ok, code, t0, t1, rids, tower_mib, place, card,
+  legs{leg: [t0, t1, ms]}} (wall clock per leg: build, reserve, load, encode,
+  attach, teardown). Only on a rank that ran a stage.
 
 RULES (operator 01.10.): host timestamps the paths take anyway, or device
 events that have already landed; no CUDA sync, no lock, no I/O. A note is a
@@ -67,6 +75,9 @@ class _State:
         self.l3_recent: collections.deque = collections.deque(maxlen=RECENT_KEEP)
         self.prefetch: Optional[Dict[str, Any]] = None
         self.l15: Optional[Dict[str, Any]] = None
+        self.vision_live: Optional[Dict[str, Any]] = None
+        self.vision_runs = 0
+        self.vision_recent: collections.deque = collections.deque(maxlen=RECENT_KEEP)
 
 
 _S = _State()
@@ -156,6 +167,42 @@ def note_l15(**fields: Any) -> None:
             a[k] = a[k] + v
 
 
+def note_vision_leg(run: int, leg: str, rids, t: Optional[float] = None) -> None:
+    """The tower stage entered ``leg`` (wall clock ``t``): the live phase."""
+    _S.vision_live = {"run": int(run), "leg": str(leg),
+                      "since": round(time.time() if t is None else float(t), 3),
+                      "rids": [str(r) for r in (rids or ())][:8]}
+
+
+def note_vision_run(run: int, *, ok: bool, code: str, rids, legs_wall: Dict[str, Any],
+                    legs_ms: Dict[str, float], tower_bytes: int = 0, place: str = "",
+                    card: Optional[int] = None, t: Optional[float] = None) -> None:
+    """One finished tower stage. ``legs_wall`` = {leg: (t0, t1)} wall clock; a
+    leg only in ``legs_ms`` (the async form's worker legs) is laid back from
+    the stage end ``t`` in leg order."""
+    t1 = time.time() if t is None else float(t)
+    legs: Dict[str, list] = {}
+    for k, w in (legs_wall or {}).items():
+        a, b = float(w[0]), float(w[1])
+        legs[k] = [round(a, 3), round(b, 3), round((b - a) * 1e3, 1)]
+    end = t1
+    for k in reversed(list(legs_ms or {})):
+        if k in legs:
+            end = min(end, legs[k][0])
+            continue
+        ms = float(legs_ms[k])
+        legs[k] = [round(end - ms / 1e3, 3), round(end, 3), round(ms, 1)]
+        end -= ms / 1e3
+    t0 = min([v[0] for v in legs.values()] or [t1])
+    _S.vision_runs += 1
+    _S.vision_recent.append({"run": int(run), "ok": bool(ok), "code": str(code or ""),
+                             "t0": round(t0, 3), "t1": round(t1, 3),
+                             "rids": [str(r) for r in (rids or ())][:8],
+                             "tower_mib": round(int(tower_bytes or 0) / (1 << 20), 1),
+                             "place": str(place or ""), "card": card, "legs": legs})
+    _S.vision_live = None
+
+
 # ---------------- readers (the rankstats timer) ----------------
 def _agg_out(a: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if a is None:
@@ -208,6 +255,15 @@ def cache_fields() -> Dict[str, Any]:
     if _S.l15 is not None:
         out["l15"] = dict(_S.l15)
     return out
+
+
+def vision_block() -> Optional[Dict[str, Any]]:
+    """rankstats ``vision``; None on a rank that never ran a tower stage."""
+    if not _S.vision_runs and _S.vision_live is None:
+        return None
+    live = _S.vision_live
+    return {"runs": _S.vision_runs, "live": None if live is None else dict(live),
+            "recent": list(_S.vision_recent)}
 
 
 def prefetch_fields() -> Dict[str, Any]:

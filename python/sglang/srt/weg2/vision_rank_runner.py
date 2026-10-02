@@ -63,6 +63,7 @@ from sglang.srt.planner.vision_stage_load import (
     is_vision_weight,
     map_tower_param_name,
 )
+from sglang.srt.weg2 import rank_timing
 from sglang.srt.weg2 import vision_rank_stage as vrs
 from sglang.srt.weg2 import vision_verdict as _vv
 from sglang.srt.weg2.vision_stage_service import (
@@ -518,6 +519,9 @@ class StageOutcome:
     host_current_delta: str = "n/a"
     host_anon_delta: str = "n/a"
     legs_ms: Dict[str, float] = field(default_factory=dict)
+    #: 02.10. (dashboard phase list, rank_timing.note_vision_run): each leg's
+    #: wall-clock (start, end) -- legs_ms keeps the perf_counter durations
+    legs_wall: Dict[str, Tuple[float, float]] = field(default_factory=dict)
     teardown_ms: Dict[str, float] = field(default_factory=dict)
     encode_ms: Dict[str, float] = field(default_factory=dict)
     #: 27B review of H125e: the wait for PP0's last forward before a tower in
@@ -578,7 +582,18 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
     # stream joins below) -- the survivors are judged against these
     blocks0 = live_blocks(device) if on_card else None
     own_streams = [_stream_id(torch.cuda.current_stream(device))] if on_card else []
+    # 02.10.: the live leg and each leg's wall clock for the dashboard (IPC via
+    # rankstats ``vision``); a handful of dict operations, no sync
+    run_no = int(getattr(scheduler, "_weg2_vision_runs", 0) or 0)
+    rids = [str(getattr(r, "rid", "?")) for r in reqs]
+
+    def _enter(name: str) -> float:
+        w = time.time()
+        rank_timing.note_vision_leg(run_no, name, rids, w)
+        return w
+
     leg, t0 = "items", clock()
+    w0 = _enter("build")
     try:
         try:
             non_image = [it for it in items if not it.is_image()]
@@ -602,7 +617,9 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                         raise
                     tail_why = f"no KV tail to place on ({exc})"
             out.legs_ms["build"] = (clock() - t0) * 1e3
+            out.legs_wall["build"] = (w0, time.time())
             leg, t0 = "reserve", clock()
+            w0 = _enter("reserve")
             if on_card:
                 # A freed page may still be read by forward work queued before
                 # it was freed; nothing of the tower lands on it before that
@@ -639,7 +656,9 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                 segments = [slab]
                 logger.info("%s place=free on PP0 (%s)%s", W_STAGE_OK, why,
                             f" -- {tail_why}" if tail_why else "")
+            out.legs_wall["reserve"] = (w0, time.time())
             leg, t0 = "load", clock()
+            w0 = _enter("load")
             views = vrs.place_parameters(module, vrs.SlabAllocator(segments))
             segments = None
             shard = find_tower_shard(model_dir)
@@ -663,7 +682,9 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
                                 direct=src.direct)
             out.read_bytes, out.direct = rep.bytes_read, rep.direct
             out.legs_ms["load"] = (clock() - t0) * 1e3
+            out.legs_wall["load"] = (w0, time.time())
             leg, t0 = "encode", clock()
+            w0 = _enter("encode")
             with torch.inference_mode(), attention_backend_scope(backend):
                 rows = encode(module, items)
             # (d): the encode's first item vs the rest (a cold first kernel
@@ -674,9 +695,12 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             # inference mode.
             rows = [r.clone() if r.is_inference() else r for r in rows]
             out.legs_ms["encode"] = (clock() - t0) * 1e3
+            out.legs_wall["encode"] = (w0, time.time())
             leg, t0 = "attach", clock()
+            w0 = _enter("attach")
             attach_precomputed_embeddings(items, rows, expected_width=int(module.out_hidden_size))
             out.legs_ms["attach"] = (clock() - t0) * 1e3
+            out.legs_wall["attach"] = (w0, time.time())
         except Exception as exc:  # noqa: BLE001 -- every seam is a named verdict
             out.ok = False
             out.code = (W_NO_ROOM if leg == "reserve"
@@ -684,6 +708,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             out.detail = f"{leg}: {type(exc).__name__}: {exc}"
     finally:
         t0 = clock()
+        w0 = _enter("teardown")
         views = plan = rows = segments = slab = None
         if module is not None:
             _strip_module(module)
@@ -707,6 +732,7 @@ def run_rank_stage(scheduler, reqs: Sequence[Any], *, model_dir: str, hf_config:
             torch.cuda.empty_cache()
         _t1 = clock()
         out.legs_ms["teardown"] = (_t1 - t0) * 1e3
+        out.legs_wall["teardown"] = (w0, time.time())
         # (d) Befund 28.09.: where the 370-470 ms teardown goes (strip, gc,
         # stream sync, tail return, empty_cache) -- instrument only.
         out.teardown_ms = {"strip": (_tg - t0) * 1e3, "gc": (_ts - _tg) * 1e3,
@@ -737,6 +763,10 @@ def _strip_module(module: torch.nn.Module) -> None:
 
 
 def log_outcome(out: StageOutcome, rids: Sequence[str], run: int) -> None:
+    # 02.10.: the stage as IPC (rankstats ``vision``) for the dashboard phase list
+    rank_timing.note_vision_run(run, ok=out.ok, code=out.code, rids=rids, legs_wall=out.legs_wall,
+                                legs_ms=out.legs_ms, tower_bytes=out.tower_bytes,
+                                place=out.place, card=out.card)
     legs = ", ".join(f"{k} {v:.0f}" for k, v in out.legs_ms.items())
     residue = "n/a" if out.residue_bytes is None else f"{out.residue_bytes / vrs.MIB:+.1f}"
     torch_res = ("n/a" if out.torch_residue_bytes is None
