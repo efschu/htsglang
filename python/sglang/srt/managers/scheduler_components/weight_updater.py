@@ -204,6 +204,28 @@ from sglang.srt.weg2 import rpc_stall_watchdog as _rpc_stall  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _l15_drop_retained_tree(sched, rank) -> bool:
+    """L15-FIX-NOHOLD-TREE (N4a D TP0 09:22:56Z: free_and_cached=2, "#924
+    MAMBA SLOT ALIASING", the idle leak check killed D): the sleep armed a
+    hold on THIS rank (tree reduced to the held chains, their slots and
+    anchors reserved), but the wake keeps nothing here (manifest consumed:
+    REFILL off, anchors missing, record gone). The plain #1455 restore
+    clears the pools and keeps the tree, so the kept chains would name
+    free slots -- drop them first. Ranks without a hold flushed their tree
+    at the sleep; afterwards every rank's tree is empty (uniform). Only a
+    rank whose sleep RETAINED is touched; the #1455 hold prefetch of every
+    other rank survives as before. Returns True when it dropped."""
+    retained = bool(getattr(sched, "_l15_tree_retained", False))
+    sched._l15_tree_retained = False
+    if not retained:
+        return False
+    sched.tree_cache.reset()
+    logger.info("L15-RESTORE rank=%d no hold kept here: the sleep's held "
+                "chains are dropped with the pools",
+                int(rank) if rank is not None else -1)
+    return True
+
+
 def _l15_refill_on(env) -> bool:
     """L15-12c-SW: the cap-0 refill kill switch, SGLANG_WEG2_L15_REFILL.
 
@@ -7839,6 +7861,7 @@ class SchedulerWeightUpdaterManager:
                 if getattr(sched, "draft_worker", None):
                     sched.draft_worker.clear_cache_pool()
                 self._l15_clear_tms_keep_spans(sched)
+                sched._l15_tree_retained = False
                 logger.info(
                     "WEG2-WAKE-RESTORE L15 hold-aware (rank %d): %d slot(s) "
                     "re-reserved, mamba rows [0,%d) kept, KV scrub bounded "
@@ -7847,6 +7870,8 @@ class SchedulerWeightUpdaterManager:
                 return True
             # No local hold (master off / no manifest / cap 0): today's
             # restore, byte-identical.
+            if _l15_master_on:
+                _l15_drop_retained_tree(sched, _l15_rank)
             sched.req_to_token_pool.clear()
             sched.token_to_kv_pool_allocator.clear()
             try:

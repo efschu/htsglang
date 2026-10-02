@@ -20284,6 +20284,12 @@ class Scheduler(
                     _l15_so.forget(self)
             except Exception:  # noqa: BLE001 -- bookkeeping only
                 pass
+            # L15-FIX-NOHOLD-TREE (N4a TP0 09:22:56Z, #924 aliasing): this
+            # rank's tree still carries the held chains (reset_keep) exactly
+            # when the round armed; the wake must drop them if it does not
+            # keep the hold HERE (the plain restore clears the pools but keeps
+            # the tree -- the held anchors would be free AND cached).
+            self._l15_tree_retained = _l15_res is not None
             if len(_l15_tt) > 1:
                 logger.info(
                     "L15-SLEEP-TIMING rank=%d held=%s reuse=%s total_ms=%.0f "
