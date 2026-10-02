@@ -5634,6 +5634,10 @@ class Front:
                     time.monotonic() - t0)
 
     # -- X-EXACT (user 26.09. ~19:00Z): exact pending tokens ------------------
+    #: BOOT-START HOLD bound: the longest a route decision waits for the front
+    #: tokenizer (y7d: load_s=10.1 after the first group answered).
+    X_EXACT_HOLD_MAX_S = 30.0
+
     def _x_exact_ready_event(self) -> asyncio.Event:
         """BOOT-START HOLD: set once the front tokenizer's load ENDED (ready or
         failed); created lazily in the running loop."""
@@ -5665,7 +5669,20 @@ class Front:
             return
         t0 = time.monotonic()
         self.counters["x_exact_held"] += 1
-        await self._x_exact_ready_event().wait()
+        # HOLD-BOUND (02.10.): never unbounded. The load waits for a group's
+        # /get_server_info with no end of its own (and a front whose startup
+        # hook never ran has no load at all), so the hold ends after
+        # X_EXACT_HOLD_MAX_S whatever the load does: the route decision then
+        # falls back by name (X-EXACT-FALLBACK reason=tokenizer_loading).
+        try:
+            await asyncio.wait_for(self._x_exact_ready_event().wait(), self.X_EXACT_HOLD_MAX_S)
+        except asyncio.TimeoutError:
+            self.counters["x_exact_hold_timeout"] += 1
+            logger.warning("WEG2 X-EXACT-HOLD-TIMEOUT rid=%s waited_ms=%.0f state=%s bound_s=%.0f -- "
+                           "the front tokenizer did not finish loading within the bound; this route "
+                           "decision goes on without it (chars/3, by name), the load continues",
+                           rid, (time.monotonic() - t0) * 1000.0, ft.state, self.X_EXACT_HOLD_MAX_S)
+            return
         logger.info("WEG2 X-EXACT-HOLD rid=%s waited_ms=%.0f state=%s (the route decision waited "
                     "for the front tokenizer; a boot-start arrival is never priced by chars/3 "
                     "because the tokenizer was loading)", rid, (time.monotonic() - t0) * 1000.0,

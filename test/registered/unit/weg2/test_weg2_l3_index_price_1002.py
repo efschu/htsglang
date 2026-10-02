@@ -399,6 +399,37 @@ def test_the_boot_task_releases_the_hold_even_when_the_load_fails():
     assert asyncio.run(go())
 
 
+def test_the_hold_is_bounded_when_the_load_never_ends(store, caplog, monkeypatch):
+    """HOLD-BOUND (02.10.): the load waits for a group's /get_server_info with no
+    end of its own, and a front whose startup hook never ran has no load at all
+    (the h91c harness: test_27b_park2_metal's fairness requests never reached
+    D). A route decision must never wait unbounded: after the bound it goes on
+    by name (chars/3, reason=tokenizer_loading). Red on the parent: the hold
+    waited forever."""
+    caplog.set_level(logging.INFO, logger="weg2.front")
+    monkeypatch.setattr(F.Front, "X_EXACT_HOLD_MAX_S", 0.2, raising=False)
+    f = _boot_front(store.probe(), _ids(30076))
+    payload = {"model": "m", "max_tokens": 10,
+               "messages": [{"role": "user", "content": "a" * 90000}]}
+
+    async def go():
+        # a LONG then waits in P's queue (no controller here): the subject is
+        # the route decision, not the answer
+        t = asyncio.create_task(f.handle_generate(_Req(payload)))
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            if any("ROUTE-VERDICT" in r.getMessage() for r in caplog.records):
+                break
+        t.cancel()
+
+    asyncio.run(go())
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("WEG2 X-EXACT-HOLD-TIMEOUT rid=weg2-0-1 ") for m in msgs)
+    assert f.counters["x_exact_hold_timeout"] == 1
+    assert any("WEG2 ROUTE-VERDICT rid=weg2-0-1" in m for m in msgs)
+    assert f.ftok.states_at_count == [], "never counted while loading"
+
+
 # ---- launcher: no declaration of the deleted CARRIER route --------------------------
 
 def test_the_launcher_no_longer_declares_the_carrier_route():
