@@ -304,6 +304,11 @@ def retain_at_sleep(
     # kv_map/anchor_map carry GLOBAL old->new slots; ``visited`` is shared
     # across the held requests so a shared prefix chain is remapped once.
     kv_map = {int(old): int(new) for old, new in plan.moves}
+    # every HELD anchor old->new, identity for one that did not move: the
+    # rewrite drops any chain mamba value outside this map (only these
+    # slots survive the mamba allocator re-arm in step 6)
+    hold_anchor_map = {int(anchor_slot_of(rid)): int(new_anchors[rid])
+                       for rid in hs.rids}
     visited: set = set()
     seen_last: set = set()
     nodes = []
@@ -312,7 +317,7 @@ def retain_at_sleep(
         nodes.append(node)
         if id(node) not in seen_last:
             seen_last.add(id(node))
-            rewrite_tree(node, kv_map, anchor_map, visited)
+            rewrite_tree(node, kv_map, hold_anchor_map, visited)
 
     # (5) partial tree reset over exactly the kept nodes
     reset_keep(nodes)

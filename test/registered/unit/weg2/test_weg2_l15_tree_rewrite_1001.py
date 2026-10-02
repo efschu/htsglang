@@ -198,9 +198,17 @@ def test_rewrite_tree_chain_remaps_each_node_once_across_chains():
     # The map is NOT idempotent: old_a[0] -> old_a[1] -> 402. A double remap
     # of the shared node would put 402 where old_a[1] belongs.
     kv_map = {old_a[0]: old_a[1], old_a[1]: 402}
+    # both requests' anchors are HELD (identity: they do not move) -- since
+    # L15-FIX-MAMBA-ALIAS the rewrite drops any chain mamba value outside
+    # the held-anchor map, so an empty map would strip the anchors too
+    held = {}
+    for ids in (a_ids, b_ids):
+        mv = _match(fx, ids).last_device_node.component_data[
+            ComponentType.MAMBA].value
+        held.update({int(x): int(x) for x in mv.flatten().tolist()})
     visited = set()
-    rewrite_tree_chain(_match(fx, a_ids).last_device_node, kv_map, {}, visited)
-    rewrite_tree_chain(_match(fx, b_ids).last_device_node, kv_map, {}, visited)
+    rewrite_tree_chain(_match(fx, a_ids).last_device_node, kv_map, held, visited)
+    rewrite_tree_chain(_match(fx, b_ids).last_device_node, kv_map, held, visited)
 
     got_a = _match(fx, a_ids).device_indices.tolist()
     got_b = _match(fx, b_ids).device_indices.tolist()
