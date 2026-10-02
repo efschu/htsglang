@@ -4192,8 +4192,17 @@ def weg2_791c_release_on_idle_vote(self, vote) -> None:
     A MODULE function on purpose: the #1268 lap tests drive
     ``_weg2_vote_attach_own_slot`` on stand-ins that are no Scheduler; every
     read here is a ``getattr`` with a default, so a stand-in returns at once."""
+    # W3-WAITABORT (N3 #2 dkr27browauthoritybar1fs10011814, 18:18:13-18:19:44Z):
+    # the #1180-W holds a follower keeps for a WAITING-queue abort
+    # (``_weg2_pending_waiting_aborts``, weg2-0-3/-4 behind #TW TWIN-DEFER) are
+    # released by the same vote. They were invisible here -- this hook looked
+    # at the chunked abort only -- and a frameless follower skips the plan
+    # (PLAN BYPASS), so ``_weg2_process_waiting_aborts`` never ran once P went
+    # idle: 6643x "WEG2-P-IDLE-VERDICT idle=False blocking_rank=1
+    # blockers=[waiting_queue]", every /flush_cache 400, W3 at the drain.
     req = getattr(self, "_pending_chunked_abort_req", None)
-    if req is None or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
+    waiting = getattr(self, "_weg2_pending_waiting_aborts", None)
+    if (req is None and not waiting) or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
         return
     try:
         from sglang.srt.weg2 import p_row_authority as _prow
@@ -4210,6 +4219,18 @@ def weg2_791c_release_on_idle_vote(self, vote) -> None:
         self.process_pending_chunked_abort()
     finally:
         self._791c_pp0_drained = False
+    # the guard: a waiting hold that survives an idle-PP0 vote on a drained
+    # follower is named (it should have been popped right here), never silent
+    left = getattr(self, "_weg2_pending_waiting_aborts", None)
+    if left:
+        n = getattr(self, "_w3_stale_votes", 0) + 1
+        self._w3_stale_votes = n
+        if n <= 8 or (n & (n - 1)) == 0:
+            logger.warning("WEG2-PP-WAITING-ABORT STALE rids=%s pp_rank=%s votes=%d: an idle-PP0 vote on a "
+                           "drained follower did not release the hold (#1180-W / W3)",
+                           sorted(left)[:4], getattr(self.ps, "pp_rank", "?"), n)
+    else:
+        self._w3_stale_votes = 0
 
 
 _LBV_N = [0]

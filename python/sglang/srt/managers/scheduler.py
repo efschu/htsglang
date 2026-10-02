@@ -801,16 +801,30 @@ def _weg2_fork_anchor_on_consumer() -> bool:
     return (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "P"
 
 
-def _weg2_fork_match_end(req, match_end: int) -> int:
+def _weg2_fork_match_end(req, match_end: int, exact_bigram: bool = False) -> int:
     """FORK ANCHOR: the end of ``req``'s store-read span -- ``match_end``
     unchanged unless the switch is on, this is not group P, and the prompt's
     fork cut lies below it (then the cut: a fork-cut P leg wrote exactly
-    that far). Counted once per power of two."""
+    that far). Counted once per power of two.
+
+    ``exact_bigram`` (the tree keys bigrams AND takes the exact N-1 form,
+    ``UnifiedRadixCache.bigram_anchor_exact``): the span takes ONE MORE token,
+    the held-back fork token itself. A bigram key of n tokens has n-1 units,
+    so a span ending at the fork F asked F-1 units -- but P keyed its leg
+    with the held-back token as the last unit's partner (exact form: F units
+    for F committed tokens, ``HANDOFF page_keys=F``) and its end anchor sits
+    on that last unit. Measured (N3c 10012013): every hand-off read asked one
+    key short of its own end anchor (``FETCH CAP keys=40131``, anchor on key
+    40131 of 40132) and D recomputed from the previous grid anchor (lost
+    2585-4053). ``fork_cut`` guarantees F <= N-2, so F+1 still leaves D the
+    generation prompt to extend."""
     if not _weg2_fork_anchor_on_consumer():
         return match_end
     fork = _weg2_fork.fork_cut_of_req(req)
     if fork is None or fork >= match_end:
         return match_end
+    if exact_bigram:
+        fork = min(int(fork) + 1, int(match_end))
     n = globals().get("_WEG2_FORK_SPAN_N", 0) + 1
     globals()["_WEG2_FORK_SPAN_N"] = n
     if n & (n - 1) == 0:
@@ -832,6 +846,18 @@ def _weg2_store_short_tail_on() -> bool:
     if raw is None or not str(raw).strip():
         return bool(envs.SGLANG_WEG2_STORE_SHORT_TAIL.get())
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _weg2_hb_claim_n_on() -> bool:
+    """RELEASE-HEAD 1002: the 27B HANDBACK N-1 contract applies on this rank
+    (profile switch SGLANG_WEG2_HANDBACK_CLAIM_N: qwen27b on, nextflash off;
+    weg2/handback_claim._claim_n_on). Gates the X-gate's 27B WEG2-HANDBACK line."""
+    try:
+        from sglang.srt.weg2.handback_claim import _claim_n_on
+
+        return bool(_claim_n_on(os.environ))
+    except Exception:  # noqa: BLE001 -- an instrument gate never stops the gate
+        return False
 
 
 def _weg2_store_tail_min_tokens(req) -> Optional[int]:
@@ -7595,7 +7621,11 @@ class Scheduler(
         # leg-2 read then lands complete (no #1324 store-short deferral, no
         # extra pass after the wake). Pure function of the prompt ids and the
         # env: the same span on every rank. Group P keeps its span.
-        _match_end = _weg2_fork_match_end(req, _match_end)
+        _match_end = _weg2_fork_match_end(
+            req, _match_end,
+            exact_bigram=bool(getattr(self.tree_cache, "is_eagle", False))
+            and bool(getattr(self.tree_cache, "bigram_anchor_exact", False)),
+        )
         # PARK-RETAIN READ (weg2/d_park_read.py, SGLANG_WEG2_PARK_READ_CAP,
         # default on): a flip-parked request reads back exactly what its park
         # retained -- the KV above the mamba track point was freed, never
@@ -7776,6 +7806,12 @@ class Scheduler(
         # HANDBACK (NF 12 boots: 33x '#915 PREFETCH REFUSED vote_negative
         # need=64..255 keys=handoff', D prefilled P's pages again): a hand-off
         # read is read whatever its length (weg2/handback_claim.py).
+        # 27B HAND-BACK READ (gmps4 ...10011614, weg2-0-7 N=25): a P hand-back (P's
+        # #1442 chain; in the dual layout every D request), and P published its N-1 anchor
+        # (END-ANCHOR units=24/24) -- the #915 threshold (256) refused the read
+        # ("vote_negative need=24"), D matched 0, uncached 25 -> W31/W50 ->
+        # re-route through P -> the same refusal again. A hand-back is read
+        # whatever its length.
         from sglang.srt.weg2.handback_claim import handback_min_tokens
 
         _hb_min = handback_min_tokens(has_handoff=_weg2_hb_handoff)
@@ -7794,6 +7830,9 @@ class Scheduler(
                 # HP1: the span's absolute start, so a Form A group votes ENDS
                 # (the rest of the tree ignores it off Form A).
                 span_base=int(_matched_len),
+                # #1442: P's handed-over chain is sliced at the span's
+                # absolute start (the fallback key list of the tree)
+                key_base=int(_matched_len),
                 **_tail_kw,
             )
             # H99: on a Form A expert worker the span bookkeeping is the host's
@@ -7806,6 +7845,7 @@ class Scheduler(
                 new_input_tokens,
                 last_hash,
                 prefix_keys,
+                key_base=int(_matched_len),
                 **_tail_kw,
             )
 
@@ -9946,6 +9986,69 @@ class Scheduler(
             n, rid[:16], span, len(getattr(req, "origin_input_ids", ()) or ()),
         )
 
+    def _weg2_defer_waiting_abort(self, recv_req) -> bool:
+        """#1180-W: True = this follower holds the abort of a waiting-queue
+        request until PP0's forwarded schedule decides it. Only a PP follower
+        whose group is not pass-aligned (row authority True / unknown); never
+        for abort_all; never twice for a rid this method itself releases."""
+        ps = getattr(self, "ps", None)
+        if int(getattr(ps, "pp_size", 1) or 1) <= 1 or int(getattr(ps, "pp_rank", 0) or 0) <= 0:
+            return False
+        if getattr(recv_req, "abort_all", False):
+            return False
+        rid = str(getattr(recv_req, "rid", "") or "")
+        force = self.__dict__.setdefault("_weg2_force_waiting_abort", set())
+        if not rid or rid in force:
+            force.discard(rid)
+            return False
+        from sglang.srt.weg2.pp_abort import row_authority_of
+
+        if row_authority_of(self) is False:
+            return False  # pass-aligned request wire: applied at receipt (#791C-NF)
+        held = [r for r in self.waiting_queue if str(r.rid).startswith(rid)]
+        if not held:
+            return False
+        pend = self.__dict__.setdefault("_weg2_pending_waiting_aborts", {})
+        for r in held:
+            pend[str(r.rid)] = [recv_req, 0]
+            logger.info(
+                "WEG2-PP-WAITING-ABORT held rid=%s pp_rank=%s: still in this follower's "
+                "waiting queue -- applied when PP0's forwarded schedule decides it (#1180-W)",
+                r.rid, getattr(ps, "pp_rank", 0))
+        return True
+
+    def _weg2_process_waiting_aborts(self) -> None:
+        """#1180-W: once per scheduling pass, before the plan."""
+        pend = getattr(self, "_weg2_pending_waiting_aborts", None)
+        if not pend:
+            return
+        from sglang.srt.weg2.pp_abort import follower_waiting_abort_verdict
+
+        try:
+            sched = self._pp_scheduled_extents()
+        except Exception:  # noqa: BLE001 -- no frame readable = no frame this pass
+            sched = None
+        drained = bool(getattr(self, "_791c_pp0_drained", False))
+        laps = int(getattr(self.ps, "pp_size", 1) or 1)
+        for rid, ent in list(pend.items()):
+            recv_req, misses = ent
+            ch = self.chunked_req
+            admitted = ch is not None and str(ch.rid) == rid
+            in_wait = any(str(r.rid) == rid for r in self.waiting_queue)
+            verdict, misses = follower_waiting_abort_verdict(
+                rid, sched, misses, laps=laps, pp0_drained=drained,
+                admitted=admitted, in_waiting=in_wait)
+            if verdict == "keep":
+                ent[1] = misses
+                continue
+            del pend[rid]
+            logger.info("WEG2-PP-WAITING-ABORT %s rid=%s pp_rank=%s misses=%d (#1180-W)",
+                        verdict, rid, getattr(self.ps, "pp_rank", 0), misses)
+            if verdict in ("chunked", "pop"):
+                self._weg2_force_waiting_abort.add(rid)
+                self._abort_request_now(AbortReq(rid=rid, finished_reason=getattr(
+                    recv_req, "finished_reason", None)))
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
@@ -9960,6 +10063,9 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        # via the class: the #791c/xsn324 harnesses drive this method on a bare
+        # namespace; the hook itself is a no-op without pending waiting aborts
+        Scheduler._weg2_process_waiting_aborts(self)
         req = self._pending_chunked_abort_req
         if req is None:
             return
@@ -13979,6 +14085,23 @@ class Scheduler(
         )
         if verdict == "admit":
             _weg2_rvp.clear_capacity_park(req)  # #248h: its re-read landed
+        if str(getattr(req, "rid", "")).startswith("weg2-") and _weg2_hb_claim_n_on():
+            # HANDBACK N-1: one line per hand-back (flip and dual) -- P's contract
+            # (N-1 tokens computed, anchor at N-1), what D holds and what D must
+            # still compute. RELEASE-HEAD 1002: the 27B contract only (profile
+            # switch SGLANG_WEG2_HANDBACK_CLAIM_N); NF writes its own
+            # WEG2-HANDBACK line at D's admission (weg2/tail_adopt._handback).
+            _fill = getattr(req, "full_untruncated_fill_ids", None)
+            _n = 0 if _fill is None else len(_fill)
+            _pre = getattr(req, "prefix_indices", None)
+            _anc = getattr(req, "state_anchor_depth", None)
+            logger.info(
+                "WEG2-HANDBACK rid=%s N=%d p_end=%d d_prefix=%d anchor=%s d_uncached=%d "
+                "verdict=%s (contract: p_end = anchor = d_prefix = N-1, d_uncached = 1)",
+                str(getattr(req, "rid", "?"))[:16], _n, max(0, _n - 1),
+                0 if _pre is None else len(_pre), "-" if _anc is None else int(_anc),
+                uncached, verdict,
+            )
         if verdict == "W31":
             # #1471b (z30m 03:19-03:22, weg2-116-141): three W31s priced the
             # WHOLE prompt right after every rank had read 28096/4352/36800 of
@@ -19942,17 +20065,359 @@ class Scheduler(
             # blockers -- x169: hicache_backup(5) on PP1/PP2 in the same
             # second, D's store read short by 11776 tokens.  Join them first.
             self._weg2_join_store_writes_before_reset()
+            # [L1.5 SHADOW] Log-only shadow pricing of a hypothetical L1.5
+            # hold set at this sleep flush (no behaviour change).
+            try:
+                from sglang.srt.weg2 import l15_policy, l15_shadow
+                from sglang.srt.weg2 import l15_bind as l15_bind_e
+
+                if l15_shadow.shadow_on(os.environ):
+                    _tp = int(
+                        getattr(self, "tp_size", 0)
+                        or getattr(getattr(self, "server_args", None), "tp_size", 1)
+                        or 1
+                    )
+                    try:
+                        from sglang.srt.distributed.utils import (
+                            get_cp_token_ratios,
+                        )
+
+                        _ratios = get_cp_token_ratios()
+                    except Exception:  # noqa: BLE001 - even split is the fallback
+                        _ratios = None
+                    _split = "ratios" if _ratios else "even"
+                    _rb = getattr(self, "running_batch", None)
+                    _entries = []
+                    for _req in (getattr(_rb, "reqs", None) or []):
+                        _tok = len(getattr(_req, "origin_input_ids", []) or []) + len(
+                            getattr(_req, "output_ids", []) or []
+                        )
+                        # span = seqlen - 1: the last token has no KV yet
+                        # (l15_bind, schedule_batch.py:2821)
+                        _span = max(_tok - 1, 0)
+                        _entries.append(
+                            {
+                                "rid": getattr(_req, "rid", None),
+                                "kind": "seat",
+                                "last_active": 0.0,
+                                # rows follow the DCP token vector (or even),
+                                # not "whole request on rank 0"
+                                "rows_by_rank": list(
+                                    l15_shadow.rows_split(_span, _tp, _ratios)
+                                ),
+                                "anchor_depth": _span,
+                                "kv_depth": _span,
+                            }
+                        )
+                    for _req in (getattr(self, "weg2_d_parked", None) or []):
+                        _tok = len(getattr(_req, "origin_input_ids", []) or []) + len(
+                            getattr(_req, "output_ids", []) or []
+                        )
+                        # span = seqlen - 1: the last token has no KV yet
+                        # (l15_bind, schedule_batch.py:2821)
+                        _span = max(_tok - 1, 0)
+                        _entries.append(
+                            {
+                                "rid": getattr(_req, "rid", None),
+                                "kind": "parked",
+                                "last_active": 0.0,
+                                "rows_by_rank": list(
+                                    l15_shadow.rows_split(_span, _tp, _ratios)
+                                ),
+                                "anchor_depth": _span,
+                                "kv_depth": _span,
+                            }
+                        )
+                    _mr = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+                    _cell = l15_shadow.cell_bytes_from(getattr(_mr, "token_to_kv_pool", None))
+                    _rgid = getattr(getattr(self, "server_args", None), "rank_gpu_id", None)
+                    _cards = (
+                        list(_rgid)
+                        if isinstance(_rgid, (list, tuple)) and len(_rgid) == _tp
+                        else list(range(_tp))
+                    )
+                    _caps = l15_shadow.caps_from_env(os.environ, _tp, [_cell] * _tp, _cards)
+                    _hs = l15_policy.select_hold(
+                        l15_shadow.candidates_from(_entries), _caps, len(_entries)
+                    )
+                    logger.info(
+                        "%s split=%s card_map=%s",
+                        l15_policy.shadow_line(
+                            l15_bind_e.sleep_epoch(self), _hs, _caps
+                        ),
+                        _split,
+                        _cards,
+                    )
+                    l15_shadow.LEDGER.note_sleep(_hs)
+            except Exception as exc:  # noqa: BLE001 - shadow must never block flush
+                logger.warning("L15-SHADOW select failed (ignored): %s: %s", type(exc).__name__, exc)
+            # [L1.5 RETAIN] L15-11c: hold the priced KV prefix across this
+            # sleep flush at D instead of dropping it. Master switch
+            # SGLANG_WEG2_L15; off means the untouched flush below. Only the
+            # SETUP is wrapped: retain_at_sleep returns None for a benign
+            # skip (run today's flush) but from its step 3 on it re-raises,
+            # and that must propagate -- the buffers are half-moved by then.
+            _l15_kwargs = None
+            _l15_mba = None
+            try:
+                from sglang.srt.weg2 import (
+                    l15_bind,
+                    l15_keep_arm,
+                    l15_manifest,
+                    l15_plan,
+                    l15_retain,
+                    l15_shadow,
+                )
+
+                if l15_plan.master_on(os.environ) and (
+                    getattr(self, "weg2_d_parked", None) is not None
+                ):
+                    _tp = int(
+                        getattr(self, "tp_size", 0)
+                        or getattr(getattr(self, "server_args", None), "tp_size", 1)
+                        or 1
+                    )
+                    try:
+                        from sglang.srt.distributed.utils import get_cp_token_ratios
+
+                        _ratios = get_cp_token_ratios()
+                    except Exception:  # noqa: BLE001 - even split is the fallback
+                        _ratios = None
+                    _v = (
+                        [int(x) for x in _ratios]
+                        if _ratios is not None
+                        and len(_ratios) == _tp
+                        and all(int(x) > 0 for x in _ratios)
+                        else [1] * _tp
+                    )
+                    _prefix = [0]
+                    for _x in _v:
+                        _prefix.append(_prefix[-1] + _x)
+                    _mr = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+                    # N1 (dkr27browauthoritybar1fs10011036): the 27B pool is a
+                    # HybridLinearKVPool whose K/V live on .full_kv_pool -- read
+                    # from the wrapper, _kv was EMPTY and retain would compact
+                    # the node slots while no KV byte moved (silent wrong KV).
+                    _pool = l15_shadow.kv_pool_of(getattr(_mr, "token_to_kv_pool", None))
+                    _kv = [t for t in l15_shadow.kv_buffers_of(_pool) if isinstance(t, torch.Tensor)]
+                    if not _kv:
+                        logger.warning(
+                            "L15-RETAIN skipped reason=no-kv-buffers: the KV pool "
+                            "has no k_buffer/v_buffer (wrapper not unwrapped?), "
+                            "nothing to retain"
+                        )
+                    _l15_mba = getattr(self.req_to_token_pool, "mamba_allocator", None)
+                    # The GDN state lives in the pool's mamba_cache, NOT in
+                    # the allocator: conv (a list of per-layer tensors) and
+                    # temporal, each (num_layers, slots, ...). The per-layer
+                    # VIEW is what moves -- dim 0 = slots (memory_pool.py
+                    # clear_slots indexes t[:, idx]).
+                    _mamba_cache = getattr(
+                        getattr(self.req_to_token_pool, "mamba_pool", None),
+                        "mamba_cache",
+                        None,
+                    )
+                    _conv = getattr(_mamba_cache, "conv", None)
+                    _temp = getattr(_mamba_cache, "temporal", None)
+                    _mb = []
+                    for _c in _conv or []:
+                        _mb.extend(_c[i] for i in range(int(_c.shape[0])))
+                    if _temp is not None:
+                        _mb.extend(_temp[i] for i in range(int(_temp.shape[0])))
+                    if not _mb:
+                        # L15-11c: no mamba bytes to retain (the pool lacks a
+                        # non-empty mamba_cache). Retain would still compact the
+                        # anchor PLAN and rewrite node.anchor_slot while zero
+                        # mamba bytes move -> held anchors point at stale state.
+                        # Treat it exactly like the not-a-base case below: log +
+                        # skip the retain (today's flush), no silent success.
+                        logger.warning(
+                            "L15-RETAIN skipped reason=no-mamba-state: the "
+                            "pool mamba_cache is missing or empty, nothing to "
+                            "retain"
+                        )
+                    _ad = self.memory_saver_adapter
+                    # tms_set_keep_spans honours allocation BASES only (-1 =
+                    # not a base, and retain_at_sleep ignores the code). A
+                    # sub-view buffer would lose the hold SILENTLY while the
+                    # manifest says it was armed -- so check now, pre-move:
+                    # any not-a-base means today's flush, nothing moved.
+                    # tms_set_keep_spans acts on ALLOCATION BASES and the
+                    # per-layer KV/mamba buffers are views of a few big
+                    # buffers -- gate on the distinct bases (dedup by
+                    # data_ptr), not on every view.
+                    _bases = []
+                    _seen_b = set()
+                    for _t in _kv + _mb:
+                        _b = _t._base if _t._base is not None else _t
+                        if _b.data_ptr() not in _seen_b:
+                            _seen_b.add(_b.data_ptr())
+                            _bases.append(_b)
+                    _base_ok = all(_ad.alloc_info_ok(_b) for _b in _bases)
+                    if not _base_ok:
+                        logger.warning(
+                            "L15-RETAIN skipped reason=not-a-base: a "
+                            "KV/mamba buffer data_ptr is not a tracked "
+                            "allocation base (tms_alloc_info)"
+                        )
+                    _reqs = list(
+                        getattr(getattr(self, "running_batch", None), "reqs", None) or []
+                    ) + list(getattr(self, "weg2_d_parked", None) or [])
+                    _rgid = getattr(getattr(self, "server_args", None), "rank_gpu_id", None)
+                    _cards = (
+                        list(_rgid)
+                        if isinstance(_rgid, (list, tuple)) and len(_rgid) == _tp
+                        else list(range(_tp))
+                    )
+                    _caps = l15_shadow.caps_from_env(
+                        os.environ, _tp, [l15_shadow.cell_bytes_from(_pool)] * _tp, _cards
+                    )
+                    if _base_ok and _mb and _kv:
+                        # set_keep here only COLLECTs byte ranges per
+                        # allocation base: tms_set_keep_spans REPLACES the
+                        # base's keep set, so the real calls go out AFTER
+                        # retain returns -- one call per base, all ranges
+                        # (rc != 0 raises: the rows have moved by then).
+                        _keep_by_base = {}
+
+                        def _set_keep_collect(buf, spans):
+                            _b = buf._base if buf._base is not None else buf
+                            _key = _b.data_ptr()
+                            _off = buf.data_ptr() - _b.data_ptr()
+                            _unit = int(buf.stride(0)) * int(buf.element_size())
+                            _keep_by_base.setdefault(_key, (_b, []))
+                            _keep_by_base[_key][1].extend(
+                                (_off + int(lo) * _unit, _off + int(hi) * _unit)
+                                for lo, hi in spans
+                            )
+
+                        _l15_rank = int(
+                            getattr(getattr(self, "ps", None), "tp_rank", 0) or 0
+                        )
+                        _l15_kwargs = l15_bind.build_retain_kwargs(
+                            _reqs,
+                            getattr(self.req_to_token_pool, "req_to_token", None),
+                            caps_rows_by_rank=_caps,
+                            cap_anchor_slots=len(_reqs),
+                            prefix=_prefix,
+                            rank=_l15_rank,
+                            # L15-FIX-EPOCH: the front's flip index, not
+                            # PP0's vote counter (always 0 on D).
+                            epoch=l15_bind.sleep_epoch(self),
+                            pid=os.getpid(),
+                            kv_buffers=_kv,
+                            mamba_buffers=_mb,
+                            allocator=self.token_to_kv_pool_allocator,
+                            # L15-FIX-DUPKW: the builder puts mamba_allocator
+                            # into the returned kwargs dict; passing it here
+                            # AND at retain_at_sleep was the boot killer
+                            # ("multiple values for keyword argument").
+                            mamba_allocator=_l15_mba,
+                            # L15-FIX-PARKED: a parked req (D park retract,
+                            # req_to_token row released) is matched in the
+                            # tree it was inserted into.
+                            tree_cache=self.tree_cache,
+                            reset_keep=self.tree_cache.reset_keep,
+                            set_keep=_set_keep_collect,
+                            # L15-12c-C: per-(group, rank) manifest file -- the
+                            # group is "D" (the wake reads it under the "D"
+                            # gate) and the rank is the same tp_rank the
+                            # rank= kwarg above uses.
+                            manifest_path=l15_manifest.manifest_path(
+                                "D", _l15_rank, os.environ),
+                            log=logger.info,
+                            # L15-HOSTLOCK (LCHOST defect 2): this hook runs
+                            # only behind the L15 master gate, so a present
+                            # sink means "master on": the arena refs the
+                            # sleep pins are recorded here and released by
+                            # the wake act (_l15_wake_act / fallback drop).
+                            hold_sink=lambda _rec: setattr(
+                                self, "_l15_host_hold", _rec),
+                        )
+                        # L15-12c-C2: alignment probe -- chain host rows vs
+                        # the seqlen-1 KV span; the first L15=1 boot confirms
+                        # whether the snapshot ever exceeds the span.
+                        for _r in _reqs:
+                            try:
+                                logger.info(
+                                    "L15-L2-ALIGN rid=%s chain_rows=%d kv_span=%d",
+                                    getattr(_r, "rid", "?"),
+                                    len(l15_bind.chain_host_rows(
+                                        l15_bind.node_of_req(_r)
+                                    )),
+                                    len(l15_bind.slots_of_req(
+                                        _r,
+                                        getattr(
+                                            self.req_to_token_pool,
+                                            "req_to_token",
+                                            None,
+                                        ),
+                                    )),
+                                )
+                            except Exception as _exc:  # noqa: BLE001
+                                logger.info(
+                                    "L15-L2-ALIGN rid=%s probe failed: %s",
+                                    getattr(_r, "rid", "?"),
+                                    _exc,
+                                )
+            except Exception as exc:  # noqa: BLE001 - pre-move setup only
+                logger.warning(
+                    "L15-RETAIN failed before the move (flushing as today): %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                _l15_kwargs = None
+            _l15_res = None
+            if _l15_kwargs is not None:
+                _l15_res = l15_retain.retain_at_sleep(
+                    # L15-FIX-DUPKW: mamba_allocator travels inside
+                    # **_l15_kwargs (build_retain_kwargs always emits it);
+                    # an explicit copy here duplicated the keyword.
+                    # L15-11d: step (4) remaps the REAL tree component
+                    # values (the old fake kv_slots/anchor_slot writes were
+                    # never read); shared visited set is owned by retain.
+                    rewrite_tree=l15_bind.rewrite_tree_chain,
+                    **_l15_kwargs
+                )
+                if _l15_res is not None:
+                    # The keep spans are the one thing retain_at_sleep
+                    # itself could not persist (it collects per view); one
+                    # adapter call per base. L15-12c-F2: a failing arm must
+                    # NOT raise here -- the rows have moved and the
+                    # manifest is written; raising left that manifest
+                    # claiming a hold while the pause discarded the pages
+                    # (garbage KV at the wake). The helper discards this
+                    # rank's manifest, clears the already-armed bases, logs
+                    # once and returns False; dropping _l15_res then makes
+                    # the sleep finish as the plain flush below, so this
+                    # rank votes None at the wake while its peers vote a
+                    # fingerprint -> mixed verdict -> group fallback
+                    # (the existing rule; no wake-side code here).
+                    if not l15_keep_arm.arm_keep_spans(
+                        _ad,
+                        _keep_by_base,
+                        _l15_kwargs["manifest_path"],
+                        rank=_l15_rank,
+                        log=logger.warning,
+                    ):
+                        _l15_res = None
             self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
-            if self._flush_zero_kv_wanted(zero_kv):
-                # Default part of the flush (opt-out env): the post-flush
-                # state must equal a fresh boot, whose pools are torch.zeros.
-                # #1457: the Weg-2 sleep leg opts out (pages are discarded).
-                self._flush_zero_kv_buffers()
+            if _l15_res is not None:
+                # Retain ran reset_keep and re-armed both allocators; only
+                # the req rows go, keeping the compacted mamba anchors. The
+                # zeroing would destroy the held pages, so it is skipped.
+                self.req_to_token_pool.clear(keep_mamba_rows=_l15_res.a_h)
+            else:
+                self.tree_cache.reset()
+                self.req_to_token_pool.clear()
+                self.token_to_kv_pool_allocator.clear()
+                if self._flush_zero_kv_wanted(zero_kv):
+                    # Default part of the flush (opt-out env): the post-flush
+                    # state must equal a fresh boot, whose pools are torch.zeros.
+                    # #1457: the Weg-2 sleep leg opts out (pages are discarded).
+                    self._flush_zero_kv_buffers()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
 
@@ -21590,6 +22055,10 @@ class Scheduler(
                 )
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        # #1180-W: a follower holds a waiting-queue abort until PP0's forwarded
+        # schedule decides it (weg2.pp_abort.follower_waiting_abort_verdict).
+        if Scheduler._weg2_defer_waiting_abort(self, recv_req):  # via the class: bare-namespace harnesses (#791c)
+            return
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):

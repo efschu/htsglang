@@ -140,3 +140,40 @@ def test_nf_l3_identity_unchanged():
         "model_path", "model_config_sha1", "weights_fp", "profile", "form_kv",
         "kv_cache_dtype", "override_p", "override_d", "vision", "generation",
     }
+
+
+# RELEASE-HEAD 1002: the 27B N-claim and NF's upstream claim live in one tree.
+# Both profiles key exact bigrams, so the tree note (BIGRAM_EXACT_TREE) cannot
+# tell them apart; the profile switch SGLANG_WEG2_HANDBACK_CLAIM_N does.
+
+
+def test_profile_rows_split_the_claim():
+    from sglang.srt.weg2.form import PROFILE_SWITCH_DEFAULTS
+
+    assert PROFILE_SWITCH_DEFAULTS["nextflash"]["SGLANG_WEG2_HANDBACK_CLAIM_N"] is False
+    assert PROFILE_SWITCH_DEFAULTS["qwen27b"]["SGLANG_WEG2_HANDBACK_CLAIM_N"] is True
+
+
+@pytest.mark.parametrize("profile,want", [("nextflash", False), ("qwen27b", True)])
+def test_nf_d_on_an_exact_tree_keeps_the_upstream_claim(monkeypatch, profile, want):
+    from sglang.srt.weg2 import form
+
+    monkeypatch.setattr(hc, "BIGRAM_EXACT_TREE", [True])  # the NF tree IS exact
+    monkeypatch.setattr(form, "current_form", lambda environ=None: SimpleNamespace(profile=profile))
+    env = {"SGLANG_WEG2_GROUP": "D"}
+    assert hc.handback_bigram_claim(env=env) is want
+    # an explicit value wins over the row
+    assert hc.handback_bigram_claim(env={**env, "SGLANG_WEG2_HANDBACK_CLAIM_N": "0"}) is False
+    assert hc.handback_bigram_claim(env={**env, "SGLANG_WEG2_HANDBACK_CLAIM_N": "1"}) is True
+
+
+def test_nf_req_claim_on_an_exact_tree(monkeypatch):
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.weg2 import form
+
+    monkeypatch.setattr(hc, "BIGRAM_EXACT_TREE", [True])
+    monkeypatch.setattr(form, "current_form", lambda environ=None: SimpleNamespace(profile="nextflash"))
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", "D")
+    monkeypatch.delenv("SGLANG_WEG2_HANDBACK_CLAIM_N", raising=False)
+    me = SimpleNamespace(return_logprob=False, logprob_start_len=-1)
+    assert Req._compute_max_prefix_len(me, N) == N - 1

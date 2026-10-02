@@ -142,6 +142,9 @@ class TorchMemorySaverAdapter(ABC):
     def tag_bytes(self, tag: str):
         raise NotImplementedError
 
+    def tag_mapped_bytes(self, tag: str):
+        raise NotImplementedError
+
     def backed_up_tag_bytes(self):
         raise NotImplementedError
 
@@ -158,6 +161,15 @@ class TorchMemorySaverAdapter(ABC):
         raise NotImplementedError
 
     def ring_stats(self):
+        raise NotImplementedError
+
+    def set_keep_spans(self, tensor, row_ranges) -> int:
+        raise NotImplementedError
+
+    def alloc_info_ok(self, tensor) -> bool:
+        raise NotImplementedError
+
+    def set_keep_byte_spans(self, base_tensor, byte_ranges) -> int:
         raise NotImplementedError
 
     @property
@@ -303,6 +315,125 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         fn.restype = ctypes.c_uint64
         fn.argtypes = [ctypes.c_char_p]
         return int(fn(tag.encode()))
+
+    def tag_mapped_bytes(self, tag: str):
+        """L15-13b: bytes physically mapped NOW for ``tag`` (C ``tms_tag_mapped_bytes``), or None.
+
+        Unlike :meth:`tag_bytes` (the full plan, incl. spans TMS keeps mapped
+        while paused), this counts only the physical pages present, so a paused
+        tag reports its kept-span resident bytes. The wake fit check subtracts
+        this from the plan so resident bytes are charged against the card's
+        free VRAM once, not twice (see :func:`sglang.srt.weg2.wake_kv.kv_resume_need_bytes`).
+        None means the running hook has no such symbol (older C / stock wheel);
+        the caller then falls back to the full plan.
+        """
+        fn = _weg2_ring_symbol("tms_tag_mapped_bytes")
+        if fn is None:
+            return None
+        import ctypes
+
+        fn.restype = ctypes.c_uint64
+        fn.argtypes = [ctypes.c_char_p]
+        return int(fn(tag.encode()))
+
+    def set_keep_spans(self, tensor, row_ranges) -> int:
+        """L15-11c: tell the saver which byte ranges of ``tensor`` a paused tag
+        must KEEP mapped (C ``tms_set_keep_spans``, entrypoint.cpp:174).
+
+        ``row_ranges`` are ``(lo_row, hi_row)`` pairs in units of the tensor's
+        first dimension; they convert to byte offsets relative to the
+        allocation base via ``stride(0) * element_size()`` -- the C ABI takes
+        byte ranges relative to the base pointer, nothing row-shaped.
+        Returns the C code (0 ok, negative codes: -1 not a base, -2
+        cpu-backed, -3 malformed), or -100 when the running hook carries no
+        such symbol; the caller treats -100 as "this saver cannot keep".
+        """
+        fn = _weg2_ring_symbol("tms_set_keep_spans")
+        if fn is None:
+            return -100
+        import ctypes
+
+        unit = int(tensor.stride(0)) * int(tensor.element_size())
+        rows = sorted((int(lo), int(hi)) for lo, hi in row_ranges)
+        n = len(rows)
+        lo_arr = (ctypes.c_uint64 * n)(*(r[0] * unit for r in rows))
+        hi_arr = (ctypes.c_uint64 * n)(*(r[1] * unit for r in rows))
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        return int(fn(ctypes.c_void_p(tensor.data_ptr()), n, lo_arr, hi_arr))
+
+    def set_keep_byte_spans(self, base_tensor, byte_ranges) -> int:
+        """L15-11c: ``set_keep_spans`` for ABSOLUTE byte ranges of ONE base.
+
+        ``base_tensor`` must be the allocation BASE (checked upstream with
+        :meth:`alloc_info_ok`); ``byte_ranges`` are ``(lo, hi)`` byte offsets
+        relative to ``base_tensor.data_ptr()`` -- already offset-shifted from
+        any view that produced them.  tms_set_keep_spans REPLACES the keep set
+        of the allocation, so callers must aggregate every view of a base
+        into ONE call per base.  Returns the C code, or -100 when the running
+        hook has no such symbol.
+        """
+        fn = _weg2_ring_symbol("tms_set_keep_spans")
+        if fn is None:
+            return -100
+        import ctypes
+
+        ranges = sorted((int(lo), int(hi)) for lo, hi in byte_ranges)
+        n = len(ranges)
+        lo_arr = (ctypes.c_uint64 * n)(*(r[0] for r in ranges))
+        hi_arr = (ctypes.c_uint64 * n)(*(r[1] for r in ranges))
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        return int(fn(ctypes.c_void_p(base_tensor.data_ptr()), n, lo_arr, hi_arr))
+
+    def alloc_info_ok(self, tensor) -> bool:
+        """L15-11c: is ``tensor.data_ptr()`` the BASE of a tracked allocation?
+
+        C ``tms_alloc_info`` (entrypoint.cpp:178) returns 0 when the pointer
+        keys an allocation and -1 ("not a base") otherwise.  This matters
+        because ``tms_set_keep_spans`` honours BASE pointers only: a KV buffer
+        that is a sub-view of the pool allocation would have its keep spans
+        silently refused (-1) while the caller believes the hold was armed.
+        Callers must check every buffer BEFORE moving anything.  False when
+        the running hook has no such symbol.
+        """
+        fn = _weg2_ring_symbol("tms_alloc_info")
+        if fn is None:
+            return False
+        import ctypes
+
+        size = ctypes.c_uint64()
+        mapped = ctypes.c_uint64()
+        planned = ctypes.c_uint64()
+        active = ctypes.c_int()
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        return (
+            fn(
+                ctypes.c_void_p(tensor.data_ptr()),
+                ctypes.byref(size),
+                ctypes.byref(mapped),
+                ctypes.byref(planned),
+                ctypes.byref(active),
+            )
+            == 0
+        )
 
     def backed_up_tag_bytes(self):
         """C16 / A1-2: ``{tag: bytes}`` over EVERY tag with a host backup, or None.
@@ -540,6 +671,21 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     def tag_bytes(self, tag: str):
         return None
+
+    def tag_mapped_bytes(self, tag: str):
+        return None
+
+    def set_keep_spans(self, tensor, row_ranges) -> int:
+        # No saver, nothing can be kept; -100 is the "no symbol" code the
+        # caller already handles.
+        return -100
+
+    def alloc_info_ok(self, tensor) -> bool:
+        # No saver -> no tracked allocations; a keep would not stick.
+        return False
+
+    def set_keep_byte_spans(self, base_tensor, byte_ranges) -> int:
+        return -100
 
     def backed_up_tag_bytes(self):
         return None

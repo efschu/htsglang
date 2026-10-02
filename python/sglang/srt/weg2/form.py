@@ -654,6 +654,12 @@ class ModelProfile:
     #: roles on D, no other --form-kv stated, a flip boot with a host tier).
     #: ``off`` = the code default (qwen27b).
     d_kv_token_cut: str = "off"
+    #: HANDBACK N-1 claim (27B fe5c55041b; RELEASE-HEAD 1002 gate): on a group-D
+    #: rank with an exact bigram tree D claims N raw tokens (N-1 units). The
+    #: 27B contract (qwen27b on); NF keeps the upstream N-1 raw claim (its P
+    #: files the CLAIM ANCHOR at floor_page(N-2), NF 1160d65e1d) -> off.
+    #: SGLANG_WEG2_HANDBACK_CLAIM_N (weg2/handback_claim._claim_n_on).
+    handback_claim_n: bool = False
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -666,6 +672,7 @@ class ModelProfile:
         out["SGLANG_WEG2_X_IDLE_REGRANT"] = bool(self.x_split)
         out["SGLANG_WEG2_STORE_SHORT_TAIL"] = bool(self.store_short_tail)
         out["SGLANG_WEG2_BIGRAM_ANCHOR_EXACT"] = bool(self.bigram_anchor_exact)
+        out["SGLANG_WEG2_HANDBACK_CLAIM_N"] = bool(self.handback_claim_n)
         out["SGLANG_WEG2_ENABLE_WARM_MIN_DWELL"] = bool(self.warm_min_dwell)
         out["SGLANG_WEG2_ENABLE_AGENT_SPAN"] = bool(self.agent_span)
         out["SGLANG_WEG2_STANDARD_FORM"] = bool(self.standard_form)
@@ -863,7 +870,15 @@ PROFILES: Dict[str, ModelProfile] = {
         idle_layout="pp",
         x_split=True,
         store_short_tail=True,
-        bigram_anchor_exact=False,
+        # HANDBACK N-1 (01.10., user: "den anker fix koennen alle brauchen"):
+        # the exact keying for the 27B too -- a node of k units = KV of k
+        # tokens = state after k tokens, so P's N-1 anchor node is claimed
+        # whole and D computes one token after every hand-back (was 2). The
+        # L3 store identity carries it (launcher L3_ANCHOR_KEYING_PROFILES).
+        bigram_anchor_exact=True,
+        # ... and D claims N raw tokens = N-1 units after every hand-back
+        # (fe5c55041b; NF's row keeps the upstream claim, field default off).
+        handback_claim_n=True,
         warm_min_dwell=False,
         agent_span=True,
         standard_form=False,

@@ -2055,6 +2055,14 @@ class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
     #: dropped (device only, no host copy), union over the group's ranks.
     #: The front stops crediting presence at them.  None = nothing lost.
     anchors_lost: Optional[List[int]] = None
+    #: L15-13c part 2: the kv_cache bytes still MAPPED on each card after
+    #: this pause -- the L1.5 keep-spans -- as ``{card uuid: MiB}``, reduced
+    #: over the group's ranks by the group fence's own ``all_gather_object``
+    #: (weight_updater).  The front subtracts it from the dormant-residue
+    #: record so the hold is not charged twice on the next launch.  None on
+    #: every non-Weg-2 path and whenever the L1.5 master switch is off -- a
+    #: stock ``/release_memory_occupation`` answer is unchanged.
+    l15_held_mib: Optional[Dict[str, int]] = None
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):

@@ -111,6 +111,7 @@ from sglang.srt.weg2 import (
     checkpoint_census,
     corridor_budget,
     host_ledger,
+    l15_plan,
     ring_table,
     seam_digest,
     weight_exchange,
@@ -4665,6 +4666,55 @@ CALIBRATION_PREFIX_TOKENS = 4096
 #: is what makes the optimum a FUNCTION of the design prefix rather than a
 #: constant, and it is cited to its record rather than written as a literal.
 ATTN_ANCHOR_MS = 400.0
+#: PP-COST (01.10.): the stage model the 27B INT8 P cut is priced on under
+#: --pp-cut-stage-model auto (rank-line fit of 09290020 cut 43,11,10 and four
+#: 44,10,10 boots of 01.10., weg2/p_stage_model_data/)
+PP_CUT_STAGE_MODEL_27B_INT8 = "27b_int8_rc12z30"
+
+
+def resolve_pp_cut_stage_model(arg: str, profile: Optional[str], model: str):
+    """(LayerCostModel, provenance) for --pp-cut-stage-model, or (None, why)."""
+    from sglang.srt.weg2 import p_stage_model as _psm
+
+    arg = str(arg or "").strip()
+    if arg in ("", "off"):
+        return None, "--pp-cut-stage-model off"
+    if arg == "auto":
+        fmt = weg2_form.format_of(profile, model)
+        if str(profile or "") != PROFILE_QWEN27B or fmt != "int8":
+            return None, ("--pp-cut-stage-model auto: no stage model for profile %r format %r (only "
+                          "qwen27b/int8 is calibrated) -- previous pricing" % (profile, fmt or "?"))
+        arg = PP_CUT_STAGE_MODEL_27B_INT8
+    path = arg if arg.endswith(".json") or os.sep in arg else os.path.join(
+        os.path.dirname(os.path.abspath(_psm.__file__)), "p_stage_model_data", arg + ".json")
+    model_obj = _psm.load_model(path)
+    return model_obj, "%s (%s)" % (os.path.basename(path), model_obj.source[:160])
+
+
+def pp_cut_chunk_mix(log_path: Optional[str], fallback_width: int, fallback_prefix: int,
+                     graph_bucket: int):
+    """(chunk mix, provenance): the predecessor boot's PP0 chunks as
+    (width, prefix bin, mode, count); without a readable log ONE cell, the
+    configured chunk at the design prefix, named as such."""
+    from sglang.srt.weg2 import p_stage_model as _psm
+
+    if log_path:
+        try:
+            with open(log_path, errors="replace") as fh:
+                mix = _psm.chunk_mix_from_samples(_psm.samples_from_rank_lines(fh))
+        except OSError as exc:
+            mix, why = (), "unreadable (%s)" % exc
+        else:
+            why = "no paired PP0 rank line"
+        if mix:
+            return mix, "MEASURED chunk mix of %s (%d PP0 chunks, %d cells)" % (
+                log_path, int(sum(n for *_x, n in mix)), len(mix))
+    else:
+        why = "no predecessor P log"
+    mode = _psm.MODE_GRAPH if (graph_bucket and int(fallback_width) <= int(graph_bucket)) else _psm.MODE_EAGER
+    return ((int(fallback_width), int(fallback_prefix), mode, 1.0),), (
+        "FALLBACK chunk mix: %s -- one cell, the configured chunk %d at the design prefix %d (%s)"
+        % (why, int(fallback_width), int(fallback_prefix), mode))
 ATTN_ANCHOR_PREFIX_TOKENS = 262144
 
 #: DESIGN DEPTH FALLBACK. When no boot log carries a prefill census the design
@@ -6735,6 +6785,13 @@ def l3_persist_enabled(env=None) -> bool:
 #: a new directory instead of a MixedGenerationError on a reused one.
 L3_PERSIST_GENERATION = "706"
 L3_IDENTITY_FILE = "L3_IDENTITY.json"
+#: HANDBACK N-1 (01.10.): profiles whose anchor keying switched to the exact
+#: bigram form. Their L3 identity names it, so a store written under the
+#: upstream keying -- whose persisted Mamba anchors at k units carry the state
+#: after k+1 tokens -- becomes a new directory instead of a silently wrong
+#: anchor (the page KV keys themselves are unchanged). NF ran the exact form
+#: already; its identity and directory stay byte for byte.
+L3_ANCHOR_KEYING_PROFILES = {"qwen27b": "exact-n1"}
 #: YaRN x2: how the runtime applies a rope override (hf_transformers.config.
 #: apply_model_override_args, nested sub-config merge). Bump when that changes.
 L3_ROPE_APPLY = "merge-v1"
@@ -6818,6 +6875,9 @@ def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
         "vision": str(vision or ""),
         "generation": L3_PERSIST_GENERATION,
     }
+    _keying = L3_ANCHOR_KEYING_PROFILES.get(str(profile or ""))
+    if _keying:
+        ident["anchor_keying"] = _keying
     # YaRN x2 (28.09.): the rope the pages were rotated with, by name -- the
     # override's rope/position part (rope_scaling, rope_parameters,
     # max_position_embeddings; top level and text_config), canonical, and the
@@ -13820,6 +13880,13 @@ def resolve_dual_layout(ns) -> None:
                 "DUAL-TP3PP3: --dual-mps on needs --dual-layout (MPS only pays when both groups "
                 "run kernels at the same time)")
         return
+    # L15-01b: L1.5 (and the hot handover) need a SLEEPING P group; the dual
+    # layout keeps both groups awake, so refuse the combination BY NAME before
+    # any launch. refuse_dual names the armed switch; a silent off would let a
+    # boot believe L1.5 holds what it does not.
+    l15_msg = l15_plan.refuse_dual(["--dual-layout"], os.environ)
+    if l15_msg is not None:
+        raise Weg2LaunchRefused(l15_msg)
     if str(getattr(ns, "dual_mps", "off")) == "on" and os.environ.get(DUAL_MPS_OPT_IN_ENV, "").strip() != "1":
         raise Weg2DualLayoutRefused(
             "DUAL-TP3PP3: --dual-mps on is refused -- MEASURED to wedge both groups: repro v2 "
@@ -14098,6 +14165,7 @@ def budgets_from_dc(
     terms_out: Optional[List[Dict[str, object]]] = None,
     booked_rest_mib: Optional[Sequence[Optional[int]]] = None,
     booked_rest_provenance: str = "",
+    l15_mib: Optional[Sequence[int]] = None,
 ) -> List[int]:
     """Per card the budget of group ``label``; ``terms_out`` (a list) receives
     the terms per card in order, for the #145 card ledger (rc12c: the card
@@ -14111,8 +14179,22 @@ def budgets_from_dc(
     builtin awake overshoot, a budget-relative overshoot and the awake rest of
     the form are what it replaces -- no reserve is charged beside it. A
     ``None`` entry is UNMEASURED: that card keeps the terms below, and its
-    line says so by name."""
+    line says so by name.
+
+    ``l15_mib`` (L15-01b, weg2/l15_plan.py): the L1.5 post per card, in the
+    SAME order as ``cards``. Where given, each card's budget subtracts its
+    post BEFORE the ``// 8 * 8`` rounding, the term dict gains an ``l15`` key,
+    and the budget line carries a ``- l15 {mib} (L1.5 post)`` suffix. ``None``
+    (the L1.5 master switch off) leaves the pass byte-identical: no term, no
+    suffix.
+    """
     out = []
+    l15_given = l15_mib is not None
+    l15_vec: List[int] = [None] * len(cards) if not l15_given else [int(v) for v in l15_mib]
+    if l15_given and len(l15_vec) != len(cards):
+        raise Weg2LaunchRefused(
+            f"L15-01b: {len(l15_vec)} L1.5 posts for {len(cards)} cards -- a partial "
+            "vector never prices a card it never saw")
     # #1257c: ONE derivation, per card, for the group this budget is for.
     # ``user_reserve_by_card`` is the operator's external headroom (default 0);
     # it RAISES the floor and therefore lowers the budget by exactly as much,
@@ -14144,12 +14226,15 @@ def budgets_from_dc(
             rest_b = int(booked[i])
             grow = int(dormant_growth_mib[i]) if dormant_growth_mib is not None else 0
             carve = int(getattr(c, "reserved_mib", 0) or 0)
-            b = ((c.total_mib - carve - dc_mib[c.uuid] - grow - rest_b) // 8) * 8
+            l15_i = 0 if not l15_given else int(l15_vec[i])
+            b = ((c.total_mib - carve - dc_mib[c.uuid] - grow - rest_b - l15_i) // 8) * 8
             out.append(b)
             _terms_seen.append(dict(
                 total=int(c.total_mib), carve=carve, floor=0,
                 dormant=int(dc_mib[c.uuid]) + grow, growth=grow, awake=rest_b,
                 awake_source=f"{_budget_rest.SOURCE_RECORD} {booked_rest_provenance}".strip()))
+            if l15_given:
+                _terms_seen[-1]["l15"] = l15_i
             if terms_out is not None:
                 terms_out.append({k: v for k, v in _terms_seen[-1].items() if k != "growth"})
             _res = int((user_reserve_by_card or {}).get(c.uuid, 0))
@@ -14159,6 +14244,7 @@ def budgets_from_dc(
                 f"{b} MiB = total {c.total_mib} - driver_carve {carve} (NVML reserved) "
                 f"- dormant_other {dc_mib[c.uuid]}"
                 + (f" - served_dormant_growth {grow} ({dormant_growth_provenance})" if grow else "")
+                + (f" - l15 {l15_i} (L1.5 post)" if l15_given else "")
                 + f" - awake_rest_booked {rest_b} ({_budget_rest.SOURCE_RECORD} "
                 f"{booked_rest_provenance}; replaces corridor floor transient "
                 f"{int(cf.mib)} (source={cf.source}), user reserve {_res}, awake_overshoot "
@@ -14200,7 +14286,8 @@ def budgets_from_dc(
         carve = (int(getattr(c, "reserved_mib", 0) or 0)
                  if charge_driver_carve and int(c.total_mib) >= int(driver_carve_min_total_mib or 0) else 0)
         awake = int(rest) if rest is not None else 0
-        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake
+        l15_i = 0 if not l15_given else int(l15_vec[i])
+        b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake - l15_i
         b = (b // 8) * 8
         out.append(b)
         _terms_seen.append(dict(
@@ -14212,6 +14299,8 @@ def budgets_from_dc(
                 else f"awake_overshoot {awake_builtin}"
                 + (f" + measured_awake_overshoot {over}" if over else "")),
         ))
+        if l15_given:
+            _terms_seen[-1]["l15"] = l15_i
         if terms_out is not None:
             terms_out.append({k: v for k, v in _terms_seen[-1].items() if k != "growth"})
         log(
@@ -14226,6 +14315,7 @@ def budgets_from_dc(
             + (f" - measured_awake_overshoot {over} ({overshoot_provenance})" if over else "")
             + (f" - awake_rest {awake} (D_AWAKE_REST_MIB, measured against the booked "
                f"form, not the budget; {awake_rest_provenance})" if rest is not None else "")
+            + (f" - l15 {l15_i} (L1.5 post)" if l15_given else "")
             + " MiB"
         )
         log(cf.line)
@@ -20680,7 +20770,31 @@ def solve_p_cut(
     model_pool = p_prefill_graph_vram_gate(
         ns, model_pool, _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else None,
         families, pool_floor, log)
+    # PP-COST (01.10.): the stage model over the predecessor boot's chunk mix.
+    _stage_model, _stage_prov = resolve_pp_cut_stage_model(
+        str(getattr(ns, "pp_cut_stage_model", "off")), getattr(ns, "profile", None), model)
+    _chunk_mix = None
+    if _stage_model is not None:
+        from sglang.srt.weg2 import p_stage_model as _psm
+        from sglang.srt.weg2 import power_limit as _plim
+
+        _current = {}
+        for _c, _w in zip(cards, _power_now):
+            if _w is not None:
+                _current.setdefault(_plim.card_class(_c.name), float(_w))
+        _stage_model, _plines = _psm.check_power(_stage_model, _current)
+        for _ln in _plines:
+            log("PP-CUT STAGE MODEL " + _ln)
+        _chunk_mix, _mix_prov = pp_cut_chunk_mix(
+            design_src, int(chunk_tokens), int(design_prefix), int(p_prefill_graph_bucket()))
+        log("PP-CUT STAGE MODEL (--pp-cut-stage-model): %s; %s -- every candidate's makespan below is the "
+            "mean ms per chunk over that mix (per chunk the bottleneck stage)" % (_stage_prov, _mix_prov))
+    else:
+        log("PP-CUT STAGE MODEL off: %s" % _stage_prov)
     decision = _cut.solve_launch_cut(
+        stage_model=_stage_model,
+        chunk_mix=_chunk_mix,
+        stage_model_provenance=_stage_prov,
         layer_families=families,
         incumbent_layers=incumbent,
         measured_ms_per_layer=ms,
@@ -22693,6 +22807,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only with --pp-cut-stage-fit: price with a fit whose card or "
              "power limit differs from this boot's metal (default: W40).")
     ap.add_argument(
+        "--pp-cut-stage-model", default="auto", metavar="auto|off|NAME|PATH",
+        help="PP-COST (27B line, 01.10.): the TIME axis of the P cut solver is priced by the "
+             "per-layer-type, per-card stage model (weg2/p_stage_model.py, calibrated from the "
+             "'Prefill rank batch' + '#1469 RETAIN' lines) over the CHUNK MIX of the predecessor "
+             "boot (the same P log the design prefix comes from, --pp-cut-design-prefix-from), "
+             "instead of the card-rate/family split at one design prefix. 'auto' (default) = "
+             f"profile qwen27b on its int8 checkpoint -> {PP_CUT_STAGE_MODEL_27B_INT8}; any other "
+             "profile/format -> off. 'off' = the previous pricing, byte-identical. NAME = a file "
+             "under weg2/p_stage_model_data/ (without .json), PATH = a JSON. Why: the old pricing "
+             "ranked 44,10,10 ahead of 43,11,10 while the rank lines measure 43,11,10 +4.5 %% faster "
+             "with +15 %% P pool.")
+    ap.add_argument(
         "--pp-cut-depth-profile", default="", metavar="ladder:N,N,...|fit",
         help="27B line, default off (unset = price every cut at the single "
              "design prefix, as before). 'ladder:2048,8192,32768' = each "
@@ -23923,6 +24049,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     vram_view().note_asleep("D", cards, dc_expect_d,
                             "MODEL(dc_expect_d: D reserve = record or census + margin + slack)")
+    # L15-01b: the L1.5 post, gated on the master switch; off = byte-identical
+    # to today. The post sizes against the PRE-post budget (the pure layer
+    # prices budget minus the measured P awake peak), so the first pass is
+    # today's pass without l15 and the second pass is what ships.
+    l15_posts = None
+    if l15_plan.master_on(os.environ):
+        if ns.profile in (weg2_form.PROFILE_QWEN27B, weg2_form.PROFILE_NEXTFLASH):
+            l15_base = budgets_from_dc(
+                cards, dc_expect_d, log, "P",
+                overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
+                overshoot_provenance=_pconst_boots("P_OVERSHOOT_MIB", ns.profile) or "boot weg2ls2b2",
+                user_reserve_by_card=user_reserve_by_card,
+            )
+            try:
+                l15_peaks = list(_pconst("P_AWAKE_PEAK_MIB", ns.profile))
+            except KeyError:
+                # UNMEASURED: the pure layer prices a missing peak as a 0 post,
+                # never an estimate.
+                l15_peaks = [None] * len(cards)
+            l15_posts = l15_plan.resolve_posts(
+                ns.profile, l15_base, l15_peaks, os.environ)
+            for post in l15_posts:
+                log(l15_plan.post_line(post))
+            # L15-NOCAP (N3f): armed with nothing to hold is a launch error,
+            # not a boot window spent on cap=0 (N3c/N3e).
+            _nocap = l15_plan.refuse_no_caps(l15_posts, os.environ)
+            if _nocap is not None:
+                raise Weg2LaunchRefused(_nocap)
+        else:
+            log(f"L15-POST skipped profile={ns.profile}")
     budgets_p = budgets_from_dc(
         cards, dc_expect_d, log, "P", overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
         # #240: whose measurement the line charges -- the profile's own record
@@ -23930,6 +24086,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # every profile.
         overshoot_provenance=_pconst_boots("P_OVERSHOOT_MIB", ns.profile) or "boot weg2ls2b2",
         user_reserve_by_card=user_reserve_by_card,
+        l15_mib=[p.mib for p in l15_posts] if l15_posts is not None else None,
     )
     state.budgets["P"] = budgets_p
     # Same TRAIN 2 MERGE FIX as at ``form_argv_p`` below: everything past the

@@ -37,6 +37,8 @@
 #define S_COMPLETE 2u
 #define S_EVICTING 3u
 #define S_QUARANTINE 4u
+#define S_REAPING 5u   /* ARENA-COPY-GEN: transient, held by arena_reap_stale_aged only
+                        * (RELEASE-HEAD 1002: 5, the NF line holds 4 = QUARANTINE) */
 #define TOMB (~0ULL)
 #define KV_IVALS 64      /* interval capacity for slots <= 1 MiB */
 #define BLOB_IVALS 8192  /* interval capacity for larger slots (mamba blobs) */
@@ -603,6 +605,10 @@ int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint
         /* unlink from the index (ZR-1: the cell of THIS slot, under the index lock) */
         index_unlink(base, sh->key_lo, s);
         atomic_fetch_sub(&h->n_complete, 1);
+        /* ARENA-COPY-GEN: the EVICTING transition is stamped -- the reaper
+         * judges an EVICTING slot stale only by its age, never while its
+         * evictor may still be copying it to disk. */
+        atomic_store(&sh->touched_ms, mono_ms());
         slots[got] = (int64_t)s;
         klo[got] = sh->key_lo;
         khi[got] = sh->key_hi;
@@ -942,7 +948,7 @@ void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
          * else the next claim of this key finds a stale cell and is handed
          * a slot it does not own. */
         if (prev != S_EVICTING && sh->key_lo != 0) {
-            index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
+            index_unlink(base, sh->key_lo, (uint64_t)slots[i]);   /* ZR-1 */
         }
         sh->key_lo = 0; sh->key_hi = 0;
         sh->generation++;  /* #1427: a late arena_complete on this slot is refused */
@@ -973,7 +979,7 @@ int64_t arena_drop_unreferenced(uint8_t *base, int64_t n, const int64_t *slots, 
         uint32_t expect = S_COMPLETE;
         if (!atomic_compare_exchange_strong(&sh->state, &expect, S_EVICTING)) continue;
         if (atomic_load(&sh->refcount) != 0) { atomic_store(&sh->state, S_COMPLETE); continue; }
-        index_unlink(base, sh->key_lo, (uint64_t)slots[i]);
+        index_unlink(base, sh->key_lo, (uint64_t)slots[i]);   /* ZR-1 */
         atomic_fetch_sub(&h->n_complete, 1);
         arena_free_slots(base, 1, &slots[i]);
         out[i] = 1;
@@ -982,23 +988,110 @@ int64_t arena_drop_unreferenced(uint8_t *base, int64_t n, const int64_t *slots, 
     return dropped;
 }
 
-/* Reap CLAIMED slots older than `max_generation_age` writes of the clock:
- * a rank that died mid-write leaves a CLAIMED slot behind. Cheap form: a
- * CLAIMED slot whose index entry is tombstoned or missing is freed. Returns
- * the number freed. Called by the sweeper. */
-int64_t arena_reap_stale(uint8_t *base) {
+/* Reap EVICTING slots whose evictor died: a rank that died between
+ * arena_evict_candidates and arena_free_slots leaves EVICTING slots behind.
+ * ARENA-COPY-GEN (N2, 01.10.): EVERY process called this after its own
+ * eviction and freed every EVICTING slot with refcount 0 AT ONCE -- including
+ * the candidates another LIVE process was still copying to disk
+ * (arena_secure_to_disk). The next claim took the slot, wrote its page, and
+ * the copy renamed the NEW bytes into the OLD stem's file. Now only a slot
+ * EVICTING for at least `min_age_ms` (stamped at the transition) is stale;
+ * the generation moves on so a late completion on it is refused.
+ * Returns the number freed. */
+int64_t arena_reap_stale_aged(uint8_t *base, int64_t min_age_ms) {
     ArenaHeader *h = hdr(base);
+    uint32_t now = mono_ms();
     int64_t freed = 0;
     for (uint64_t s = 0; s < h->slots; s++) {
         SlotHeader *sh = slot_hdr(base, s);
         if (atomic_load(&sh->state) != S_EVICTING) continue;
         if (atomic_load(&sh->refcount) != 0) continue;
-        /* an EVICTING slot nobody freed: its evictor died */
+        uint32_t t = atomic_load(&sh->touched_ms);
+        if ((uint32_t)(now - t) < (uint32_t)min_age_ms) continue;
+        /* take the slot privately (S_REAPING: no path acts on it) so a live
+         * evictor's own free racing this reap cannot be clobbered */
+        uint32_t expect = S_EVICTING;
+        if (!atomic_compare_exchange_strong(&sh->state, &expect, S_REAPING)) continue;
+        if (atomic_load(&sh->touched_ms) != t || atomic_load(&sh->refcount) != 0) {
+            atomic_store(&sh->state, S_EVICTING);
+            continue;
+        }
         sh->key_lo = 0; sh->key_hi = 0;
+        sh->generation++;
         atomic_store(&sh->state, S_FREE);
         freed++;
     }
     return freed;
+}
+
+/* the historical entry point: the default stale age (ARENA_REAP_STALE_MS) */
+#define ARENA_REAP_STALE_MS 60000
+int64_t arena_reap_stale(uint8_t *base) {
+    return arena_reap_stale_aged(base, ARENA_REAP_STALE_MS);
+}
+
+/* ARENA-COPY-GEN (N2, 01.10.): the write-behind's pin bound to the census
+ * GENERATION, not only the key: a slot freed and re-claimed for the same key
+ * since the census is a different page instance and is not pinned. */
+int64_t arena_pin_complete_gen(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                               const uint64_t *klo, const uint64_t *khi, int8_t *ok) {
+    ArenaHeader *h = hdr(base);
+    int64_t pinned = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ok[i] = 0;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        atomic_fetch_add(&sh->refcount, 1);
+        if (atomic_load(&sh->state) != S_COMPLETE || (int64_t)sh->generation != gens[i]
+            || sh->key_lo != klo[i] || sh->key_hi != khi[i]) {
+            uint32_t r = atomic_load(&sh->refcount);
+            while (r > 0 && !atomic_compare_exchange_weak(&sh->refcount, &r, r - 1u)) { }
+            continue;
+        }
+        ok[i] = 1;
+        pinned++;
+    }
+    return pinned;
+}
+
+/* ARENA-COPY-GEN: give back a pin of arena_pin_complete_gen only while the
+ * slot still carries that generation. After a free + re-claim the claim
+ * reset the count (claim_slot); a raw -1 would take the NEW generation's
+ * reader reference. Returns how many pins were returned. */
+int64_t arena_unpin_gen(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens) {
+    ArenaHeader *h = hdr(base);
+    int64_t done = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) continue;
+        uint32_t r = atomic_load(&sh->refcount);
+        while (r > 0 && !atomic_compare_exchange_weak(&sh->refcount, &r, r - 1u)) { }
+        if (r > 0) done++;
+    }
+    return done;
+}
+
+/* ARENA-COPY-GEN: after a copy, is each slot still the page that was copied?
+ * state must equal `want_state` (S_COMPLETE for the write-behind, S_EVICTING
+ * for the evict path), the key must match, and -- when gens is given and
+ * gens[i] >= 0 -- the generation too. ok[i] = 1 valid, 0 the slot moved. */
+int64_t arena_slots_still(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                          const uint64_t *klo, const uint64_t *khi, int32_t want_state, int8_t *ok) {
+    ArenaHeader *h = hdr(base);
+    int64_t good = 0;
+    atomic_thread_fence(memory_order_acquire);
+    for (int64_t i = 0; i < n; i++) {
+        ok[i] = 0;
+        if (slots[i] < 0 || (uint64_t)slots[i] >= h->slots) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if (atomic_load(&sh->state) != (uint32_t)want_state) continue;
+        if (sh->key_lo != klo[i] || sh->key_hi != khi[i]) continue;
+        if (gens && gens[i] >= 0 && (int64_t)sh->generation != gens[i]) continue;
+        ok[i] = 1;
+        good++;
+    }
+    return good;
 }
 
 /* #231 (rc12m-dpr 09271152, P mamba arena 32 slots): a slot is COMPLETE only
@@ -1047,7 +1140,7 @@ int64_t arena_reap_partial(uint8_t *base, int64_t min_age_ms, int64_t *out, int6
             atomic_store(&sh->state, S_CLAIMED);
             continue;
         }
-        index_unlink(base, sh->key_lo, (uint64_t)s);
+        index_unlink(base, sh->key_lo, (uint64_t)s);   /* ZR-1 */
         sh->key_lo = 0; sh->key_hi = 0;
         sh->n_ivals = 0;
         sh->generation++;

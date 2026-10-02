@@ -148,6 +148,9 @@ def group_p(monkeypatch):
     monkeypatch.setenv(_F.FORM_ENV, _F.Weg2Form(
         arch="dense", experts="none", draft="dflash", p_draft="none", kv="paged_dcp",
         flip="family", vision="off", profile="qwen27b", model="m").env_value())
+    # HANDBACK N-1 (fe5c55041b): the 27B row is exact now; this test pins the
+    # UPSTREAM keying its specimens were measured under, explicitly
+    monkeypatch.setenv("SGLANG_WEG2_BIGRAM_ANCHOR_EXACT", "0")
     monkeypatch.setattr(urc, "_WEG2_END_ANCHOR", True)
     return monkeypatch
 
@@ -339,7 +342,7 @@ def test_the_span_cap_sits_where_the_span_is_cut():
 
     src = inspect.getsource(S.Scheduler._prefetch_kvcache)
     a = src.index("_match_end = req._compute_max_prefix_len(")
-    b = src.index("_match_end = _weg2_fork_match_end(req, _match_end)")
+    b = src.index("_match_end = _weg2_fork_match_end(")
     c = src.index("_new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]")
     assert a < b < c
 

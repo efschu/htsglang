@@ -205,6 +205,24 @@ from sglang.srt.weg2 import rpc_stall_watchdog as _rpc_stall  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _l15_refill_on(env) -> bool:
+    """L15-12c-SW: the cap-0 refill kill switch, SGLANG_WEG2_L15_REFILL.
+
+    Default OFF: the remote head must never carry an open TP0 gate without
+    a switch (operator order 01.10. ~19:10Z). Same parsing as the l15_plan
+    switches ("1"/"true"/"on" = on, case/blanks tolerated; absent or "0" =
+    off); a read failure means OFF -- the safe shape is today's fallback.
+    Boot ladder: boot 1 with L15=1 and REFILL=0 (TP0 falls back), boot 2
+    with REFILL=1 only after a green boot 1; the default flips to 1 after
+    the metal proof."""
+    try:
+        from sglang.srt.weg2 import l15_plan
+
+        return l15_plan._switch(env, "SGLANG_WEG2_L15_REFILL")
+    except Exception:  # noqa: BLE001 -- unreadable switch: off (fallback)
+        return False
+
+
 def _weg2_exc_note(exc: BaseException, *, limit: int = 120) -> str:
     """``Type: message @ file:line`` for a SWALLOWED exception (#1328).
 
@@ -604,6 +622,18 @@ class SchedulerWeightUpdaterManager:
     #: lesson above: y4j-po (30.09. 10:42:44Z) died on AttributeError in the
     #: assignment on all three D ranks at the first sleep with the switch on.
     _weg2_resident_prefetch: Any = None
+    #: L15-12c-A: this rank's just-consumed L1.5 hold manifest, read at the D
+    #: wake by :meth:`_l15_wake_hold_signal` and stashed here for the fence /
+    #: AP-B fallback; None outside an L15 wake with a record (the slots guard
+    #: catches an undeclared write only on the path that writes it).
+    _l15_wake_manifest: Any = None
+    #: L15-12c-E2: True on a cap-0 D rank whose wake record passed the ANCHOR
+    #: GATE (every span names its GDN anchor's L2 identity): this rank holds
+    #: nothing itself but refills its owned rows from L2 when the group
+    #: verdict is "hold".  Set by :meth:`_l15_wake_hold_signal` (reset at its
+    #: head, so it never survives into a wake that did not mark it), acted
+    #: on by :meth:`_l15_wake_act`, folded into the fallback on any failure.
+    _l15_wake_refill: bool = False
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -1557,6 +1587,27 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001
             return 0
         return int(value or 0)
+
+    def _weg2_tag_mapped_bytes(self, tag: str) -> Optional[int]:
+        """L15-13b: bytes physically mapped NOW for one tag, or None.
+
+        Twin of :meth:`_weg2_tag_bytes` (the full plan).  With TMS keep spans
+        (L15-13a, b172a12a6a) a paused kv_cache keeps its held rows mapped, so
+        ``tms_tag_bytes`` counts them into the plan against the card's free
+        budget at wake; this reads the resident subset so the fit check can
+        subtract it.  None means the running hook has no such symbol (older C
+        / stock wheel): the caller then maps the whole plan, the pre-L15-13b
+        behaviour.  A 0 is a real answer: nothing is mapped.
+        """
+        adapter = getattr(self, "memory_saver_adapter", None)
+        getter = getattr(adapter, "tag_mapped_bytes", None)
+        if getter is None:
+            return None
+        try:
+            value = getter(tag)
+        except Exception:  # noqa: BLE001
+            return None
+        return None if value is None else int(value)
 
     def _weg2_tag_resident_bytes(self, tag: str) -> Optional[int]:
         """The saver's OWN byte sum for ``tag`` as a THREE-VALUED reading:
@@ -4235,6 +4286,8 @@ class SchedulerWeightUpdaterManager:
         failure: str = "",
         per_tag: Optional[Dict[str, List[float]]] = None,
         leg_ms: float = 0.0,
+        l15_held: Optional[Dict[str, int]] = None,
+        l15_fp: Optional[int] = None,
     ) -> Dict[str, Any]:
         """:meth:`_weg2_group_fence_impl`, plus the marker that stops re-entry.
 
@@ -4248,7 +4301,8 @@ class SchedulerWeightUpdaterManager:
         self.weg2_fence_raised = False
         try:
             return self._weg2_group_fence_impl(
-                what, ok=ok, failure=failure, per_tag=per_tag, leg_ms=leg_ms
+                what, ok=ok, failure=failure, per_tag=per_tag, leg_ms=leg_ms,
+                l15_held=l15_held, l15_fp=l15_fp,
             )
         except BaseException:
             self.weg2_fence_raised = True
@@ -4262,6 +4316,8 @@ class SchedulerWeightUpdaterManager:
         failure: str = "",
         per_tag: Optional[Dict[str, List[float]]] = None,
         leg_ms: float = 0.0,
+        l15_held: Optional[Dict[str, int]] = None,
+        l15_fp: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Every rank of the group joins here before the owner rank answers.
 
@@ -4393,6 +4449,19 @@ class SchedulerWeightUpdaterManager:
             "waves_published": wx.waves_digest(wx.published_waves() or ()),
             "waves_planned": wx.waves_digest(wx.planned_waves() or ()),
         }
+        # L15-13c part 2: the same gather carries this rank's held kv_cache
+        # bytes (the L1.5 keep-spans, {card uuid: MiB}).  The key is ADDED
+        # ONLY when the caller read one (master on, keep present), so with
+        # the master off the gathered payload is byte-identical to before.
+        if l15_held is not None:
+            mine["l15_held"] = dict(l15_held)
+        # L15-12 part 2: the same gather carries this rank's L1.5 manifest
+        # fingerprint (the wake side reads what the sleep side wrote).  The
+        # key is ADDED ONLY when the caller read one (master on, manifest
+        # present), so with the master off the gathered payload is
+        # byte-identical to before.
+        if l15_fp is not None:
+            mine["l15_fp"] = int(l15_fp)
         gathered: List[Optional[Dict[str, Any]]] = [None] * world
         torch.distributed.all_gather_object(gathered, mine, group=cpu_group)
         votes = [v for v in gathered if isinstance(v, dict)]
@@ -4444,7 +4513,29 @@ class SchedulerWeightUpdaterManager:
             )
         )
         lost = sorted({int(d) for v in votes for d in (v.get("anchors_lost") or ())})
-        return {"per_tag": merged, "critical_path": critical, "anchors_lost": lost}
+        # L15-13c part 2: per-card union of the ranks' held kv_cache bytes;
+        # ranks co-located on one card sum to that card's held total.  No
+        # rank carried one (master off): the key is absent -> None downstream.
+        held: Dict[str, int] = {}
+        for v in votes:
+            for _uuid, _mib in (v.get("l15_held") or {}).items():
+                try:
+                    held[str(_uuid)] = held.get(str(_uuid), 0) + int(_mib)
+                except (TypeError, ValueError):
+                    continue
+        # L15-12 part 2: the group's manifest-fingerprint reduction --
+        # (min, max) over the ranks that read their sleep manifest, plus the
+        # mixed flag ("some ranks held, others did not").  Rides the same
+        # gather: no new collective.  The reduction is the pure helper
+        # l15_restore.l15_fp_reduce, unit-testable without a process group.
+        from sglang.srt.weg2 import l15_restore
+
+        fp_minmax, fp_mixed = l15_restore.l15_fp_reduce(
+            [v.get("l15_fp") for v in votes])
+        return {"per_tag": merged, "critical_path": critical, "anchors_lost": lost,
+                "l15_held_mib": held or None,
+                "l15_fp_minmax": fp_minmax,
+                "l15_fp_mixed": bool(fp_mixed)}
 
     def _weg2_anchors_lost_for(self, what: str) -> List[int]:
         return _weg2_anchors_lost_for_leg(self, what)
@@ -4967,7 +5058,16 @@ class SchedulerWeightUpdaterManager:
         if str(os.environ.get("SGLANG_WEG2_WAKE_KV_FIRST", "1")).strip().lower() in ("0", "false", "no", "off"):
             return False
         try:
-            need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+            from sglang.srt.weg2.wake_kv import kv_resume_need_bytes
+            # L15-13d: need = the bytes the resume will actually map
+            # (plan - mapped_now).  A paused kv_cache keeps its spans mapped,
+            # so sizing by the full plan demanded them twice.  Mapped figure
+            # unreadable (method absent, symbol absent, probe failed) ->
+            # need == plan, byte-identical to the pre-13d decision.
+            _mfn = getattr(self, "_weg2_tag_mapped_bytes", None)
+            _mapped = _mfn(GPU_MEMORY_TYPE_KV_CACHE) if callable(_mfn) else None
+            need = kv_resume_need_bytes(
+                int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0), _mapped)
             free = self._weg2_free_bytes()
             floor = int(self._weg2_corridor_floor_bytes() or 0)
         except Exception as exc:  # noqa: BLE001 -- no probe, old order
@@ -7149,6 +7249,556 @@ class SchedulerWeightUpdaterManager:
             logger.warning("WEG2 CARRIER-HOLD wake release raised %s: %s", type(exc).__name__, exc)
             return 0
 
+    def _l15_wake_hold_signal(self) -> tuple:
+        """L15-12c-A: LOCAL pre-fence hold signal for the D wake ->
+        ``(manifest, rank, keep_rows, master_on)``.  ``manifest`` is this
+        rank's just-consumed L1.5 record (``load_for_wake`` reads and
+        unlinks it: one sleep-wake pair per record); non-None only when the
+        master is on, the group is D, the record exists and this rank's
+        planner cap (caps_from_env, same derivation as the sleep hook /
+        wake fence) is > 0.  ``keep_rows`` = the held compact prefix
+        ``rows_by_rank[rank]``.  Master off -> ``(None, None, 0, False)``
+        (byte-identical restore)."""
+        sched = self.scheduler
+        # L15-12c-E2: a per-wake mark -- reset at the head so it can never
+        # survive into a wake whose signal did not set it.
+        self._l15_wake_refill = False
+        if sched is None:
+            return None, None, 0, False
+        try:
+            from sglang.srt.weg2 import l15_plan
+
+            master = l15_plan.master_on(os.environ)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("L15-WAKE-RESTORE master switch read failed (%s: %s)",
+                        type(exc).__name__, exc)
+            return None, None, 0, False
+        if not master:
+            return None, None, 0, False
+        try:
+            from sglang.srt.weg2 import l15_manifest, l15_restore
+
+            if self._weg2_group_name() != "D":
+                return None, None, 0, True
+            rank = self._weg2_rank()
+            if rank < 0:
+                return None, None, 0, True
+            m = l15_restore.load_for_wake(
+                l15_manifest.manifest_path(self._weg2_group_name(), rank, os.environ)
+            )
+            if m is None:
+                return None, rank, 0, True
+            tp = int(getattr(sched, "tp_size", 0)
+                     or getattr(getattr(sched, "server_args", None), "tp_size", 1)
+                     or 1)
+            mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+            pool = getattr(mr, "token_to_kv_pool", None)
+            if pool is None:
+                return None, rank, 0, True
+            rgid = getattr(getattr(sched, "server_args", None), "rank_gpu_id", None)
+            cards = (list(rgid) if isinstance(rgid, (list, tuple))
+                     and len(rgid) == tp else list(range(tp)))
+            from sglang.srt.weg2 import l15_shadow
+
+            caps = l15_shadow.caps_from_env(
+                os.environ, tp, [l15_shadow.cell_bytes_from(pool)] * tp, cards)
+            cap = int(caps[rank]) if 0 <= rank < len(caps) else 0
+            if cap <= 0:
+                # L15-12c-SW: kill switch BEFORE the anchor gate -- OFF votes
+                # None even when every span carries the anchor L2 identity
+                # (the boot-1 shape: master on, TP0 still falls back).
+                if not _l15_refill_on(os.environ):
+                    logger.info("L15-REFILL rank=%d off "
+                                "(SGLANG_WEG2_L15_REFILL=0): votes no hold",
+                                rank)
+                    return None, rank, 0, True
+                # L15-12c-E2: this rank kept NOTHING mapped through the sleep
+                # (cap 0; TP0 on the big card).  It can still honour a group
+                # "hold" by refilling every held row it owns over H2D from L2
+                # (plan L15-12-PART3-PLAN sec 2).  The ANCHOR GATE (plan sec 8)
+                # runs before anything is even considered: a HoldSpan without
+                # the GDN anchor's L2 identity (anchor_l2_slot absent, None
+                # or -1 -- E2b: -1 is the sleep side's explicit "not
+                # recorded"; every manifest written before C2 records it)
+                # cannot be held here, the anchor state would come back
+                # missing or garbage and a half-held tree is worse than the
+                # fallback shape.  Until then this rank votes None, exactly
+                # the pre-E2 behaviour.
+                def _anchor_named(_sp):
+                    _a = getattr(_sp, "anchor_l2_slot", None)
+                    return _a is not None and int(_a) >= 0
+
+                if not all(_anchor_named(_sp) for _sp in m.spans):
+                    logger.info("L15-REFILL rank=%d anchors-missing: votes no hold",
+                                rank)
+                    return None, rank, 0, True
+                self._l15_wake_refill = True
+                keep_rows = (int(m.rows_by_rank[rank])
+                              if 0 <= rank < len(m.rows_by_rank) else 0)
+                return m, rank, keep_rows, True
+            keep_rows = (int(m.rows_by_rank[rank])
+                          if 0 <= rank < len(m.rows_by_rank) else 0)
+            return m, rank, keep_rows, True
+        except Exception as exc:  # noqa: BLE001 -- no signal: today's restore
+            logger.info("L15-WAKE-RESTORE hold signal unavailable (%s: %s)",
+                        type(exc).__name__, exc)
+            return None, None, 0, True
+
+    @staticmethod
+    def _l15_wake_rpc(tags) -> bool:
+        """L15-FIX-KVRPC-GATE: True only for the resume RPC that carries
+        kv_cache. A D wake is two resume RPCs (weights legs first, then
+        kv_cache + cuda_graph -- N3l D log 02:29:42); the hold-aware
+        restore runs in the kv RPC only, so the L15 fence-tail block
+        (manifest read, decide, act) must run there and nowhere else:
+        in the weights RPC it read-and-unlinked the manifest before the
+        restore could consume it. Tags are identical on every rank of the
+        group for one RPC, so the gate is group-uniform (xsn410)."""
+        return GPU_MEMORY_TYPE_KV_CACHE in set(tags or ())
+
+    def _l15_fence_manifest(self, manifest_path):
+        """L15-12c-B F11: the fence's manifest read.  The wake restore has
+        ALREADY read-and-unlinked this wake's record at
+        :meth:`_l15_wake_hold_signal` (cap>0 ranks stash it on
+        _l15_wake_manifest); a second load_for_wake on the same path always
+        returns None and would pin _l15_fp to None, so the part-2 verdict
+        could never come out "hold".  The stashed record wins; only a rank
+        that did not consume it (cap 0, no pool) asks the file -- and finds
+        it absent, which votes None -> mixed -> fallback (plan sec 6)."""
+        m = self._l15_wake_manifest
+        if m is not None:
+            return m
+        from sglang.srt.weg2 import l15_restore
+
+        return l15_restore.load_for_wake(manifest_path)
+
+    def _l15_flush_zero_kv_bounded(self, sched, keep_rows: int) -> int:
+        """L15-12c-A: the SGLANG_FLUSH_ZERO_KV scrub with the hold prefix
+        kept: zero only rows >= keep_rows.  The held rows are the compact
+        prefix [0, keep_rows) (l15_compact); the gap rows are freshly
+        mapped pages, so the sleep leg already opted out of scrubbing them
+        for the same reason.  Same pool set and backing / safe-zero-row
+        rules as Scheduler._flush_zero_kv_buffers."""
+        from sglang.srt.platforms import current_platform
+
+        zeroed = 0
+        for pool in sched._kv_pools_for_flush():
+            if not getattr(pool, "backing_is_resident", True):
+                continue
+            pools = [pool]
+            for attr in ("full_kv_pool", "swa_kv_pool"):
+                sub = getattr(pool, attr, None)
+                if sub is not None:
+                    pools.append(sub)
+            for p in pools:
+                limit = getattr(p, "safe_zero_rows", None)
+                for name in ("k_buffer", "v_buffer", "kv_buffer"):
+                    bufs = getattr(p, name, None)
+                    if bufs is None:
+                        continue
+                    if isinstance(bufs, torch.Tensor):
+                        bufs = [bufs]
+                    for t in bufs:
+                        rows = int(t.shape[0])
+                        hi = rows if limit is None else min(rows, int(limit))
+                        lo = min(int(keep_rows), hi)
+                        if hi > lo:
+                            t[lo:hi].zero_()
+                        zeroed += 1
+        current_platform.synchronize()
+        return zeroed
+
+    def _l15_clear_tms_keep_spans(self, sched) -> int:
+        """L15-12c-A: after this wake's resume has consumed the sleep-armed
+        TMS keep spans, replace each base's keep set with the empty set
+        (patch-5 sequence) -- one call per allocation base.  The keep set
+        lives on the ALLOCATION (patch 6); pause/resume do not clear it, so
+        a stale set would pin rows a later pause no longer holds.  Bases via
+        the same kv/mamba buffer walk as the scheduler retain hook (dedup
+        by base data_ptr).  Cleanup, not the move: failures are logged.
+        Returns the bases cleared."""
+        ad = getattr(sched, "memory_saver_adapter", None)
+        if ad is None:
+            return 0
+        bufs = []
+        try:
+            for pool in sched._kv_pools_for_flush():
+                # F10: the flush entry can be a HybridLinearKVPool (27B),
+                # whose buffers live on the sub-pools -- same walk as
+                # _l15_flush_zero_kv_bounded.
+                pools = [pool]
+                for attr in ("full_kv_pool", "swa_kv_pool"):
+                    sub = getattr(pool, attr, None)
+                    if sub is not None:
+                        pools.append(sub)
+                for p in pools:
+                    for name in ("k_buffer", "v_buffer", "kv_buffer"):
+                        t = getattr(p, name, None)
+                        if t is None:
+                            continue
+                        if isinstance(t, torch.Tensor):
+                            bufs.append(t)
+                        else:
+                            bufs.extend(t)
+            mc = getattr(
+                getattr(sched.req_to_token_pool, "mamba_pool", None),
+                "mamba_cache", None)
+            for c in getattr(mc, "conv", None) or []:
+                bufs.extend(c[i] for i in range(int(c.shape[0])))
+            temp = getattr(mc, "temporal", None)
+            if temp is not None:
+                bufs.extend(temp[i] for i in range(int(temp.shape[0])))
+        except Exception as exc:  # noqa: BLE001
+            logger.info("L15-WAKE-RESTORE keep-set clear: buffer walk failed "
+                        "(%s: %s)", type(exc).__name__, exc)
+            return 0
+        cleared = 0
+        seen = set()
+        for t in bufs:
+            b = getattr(t, "_base", None)
+            b = b if b is not None else t
+            key = b.data_ptr()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if not ad.alloc_info_ok(b):
+                    continue
+                ad.set_keep_byte_spans(b, ())
+                cleared += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.info("L15-WAKE-RESTORE keep-set clear failed for base "
+                            "%d (%s: %s)", key, type(exc).__name__, exc)
+        if cleared:
+            logger.info("L15-WAKE-RESTORE TMS keep set cleared on %d "
+                        "base(s) after resume", cleared)
+        return cleared
+
+    def _l15_release_host_hold_refs(self, sched) -> int:
+        """L15-HOSTLOCK: give the sleep's L2 arena refs back (LCHOST defect 2
+        partner). The sleep hook recorded what it pinned on
+        ``sched._l15_host_hold``; the wake act calls this AFTER its act
+        (hold: once the refill copied; fallback: at the end of the drop).
+        The record is cleared FIRST, so a repeat call is a no-op and the
+        ledger-protected arena never sees a double release from here. A
+        deferred (refused) wake never calls it: the hold stays armed. Only
+        the recorded slots are released; a lost record (crash between sleep
+        and wake) is reclaimed when the next boot recreates the arena --
+        stated in l15_hostlock's docstring."""
+        held = (getattr(sched, "_l15_host_hold", None)
+                if sched is not None else None)
+        if not held:
+            return 0
+        sched._l15_host_hold = None
+        try:
+            from sglang.srt.weg2 import l15_bind, l15_hostlock
+            kv, mamba = l15_bind.live_host_pools(sched.tree_cache)
+            return l15_hostlock.release_wake_refs(kv, mamba, held,
+                                                  lambda m: logger.info(m))
+        except Exception as exc:  # noqa: BLE001 - cleanup never splits group
+            logger.warning("L15-HOSTLOCK wake release failed (%s: %s) -- the "
+                           "refs stay on the arena until the next boot "
+                           "recreates it", type(exc).__name__, exc)
+            return 0
+
+    def _l15_fallback_drop(self, sched) -> int:
+        """L15-12c-B: the group verdict "fallback" ACTS (plan part 3 sec 3):
+        today's empty-tree wake shape WITHOUT the re-reservation --
+        tree_cache.reset() + req_to_token_pool.clear() (full, no keep; the
+        flush shape has no separate mamba allocator, the mamba rows go with
+        the req clear) + token_to_kv_pool_allocator.clear() + the TMS
+        keep-set clear.  Ranks that kept nothing experience the plain flush;
+        ranks that kept something drop the held bytes -- acceptable because
+        L2 stayed the authority (every row was published before the sleep).
+        Idempotent: the pools converge to the same state under a repeat and
+        the stashed manifest is consumed on the first pass.  NO collective
+        inside -- the uniformity comes from the gather that decided the
+        verdict, and the danger (xsn410) is entering the drop unevenly, so
+        this runs at one list position behind the group flag.  Returns the
+        number of held slots dropped (0 when nothing was held)."""
+        if sched is None:
+            return 0
+        m = self._l15_wake_manifest
+        dropped = 0
+        if m is not None:
+            try:
+                dropped = len({int(s) for sp in m.spans
+                               for s in sp.slots} - {0})
+            except Exception:  # noqa: BLE001 -- the log value must not decide the path
+                dropped = 0
+        try:
+            sched.tree_cache.reset()
+            sched.req_to_token_pool.clear()
+            sched.token_to_kv_pool_allocator.clear()
+            self._l15_clear_tms_keep_spans(sched)
+        except Exception as exc:  # noqa: BLE001 -- never split the group at the tail
+            logger.warning("L15-RESTORE fallback drop failed (%s: %s)",
+                           type(exc).__name__, exc)
+        self._l15_wake_manifest = None
+        # L15-HOSTLOCK: the fallback act is done -- the dropped hold needs no
+        # L2 protection anymore, hand the sleep's arena refs back. getattr
+        # style: pre-HOSTLOCK test stubs without the helper keep working.
+        rel = getattr(self, "_l15_release_host_hold_refs", None)
+        if rel is not None:
+            rel(sched)
+        return dropped
+
+    def _l15_decide_wake_verdict(self, wake_on: bool, fp, check=None,
+                                 *, epoch: int):
+        """L15-12c-E1X (plan sec 9): the ONE decision source for the
+        keep-or-fallback-drop verdict at wake.  ``wake_on`` False -> return
+        None and touch NO collective (byte-identical master-off wake).
+        ``wake_on`` True -> EVERY rank must call this at this one list
+        position (xsn410: no rank may skip a collective); a no-hold rank
+        passes fp=None (vote None) but still participates.  The collective
+        is l15_wake_check.decide over the tp cpu group the fence uses.
+        L15-W2C: ``check`` is this rank's (ok, bad, missing) sample-check
+        result (None -> zeros: a rank without a manifest votes on fp
+        alone).  bad > 0 on ANY rank -> decide() raises L15CheckRefused on
+        EVERY rank; like the fence's own gather, a refusal or a failing
+        collective PROPAGATES -- it is never caught per rank."""
+        if not wake_on:
+            return None
+        from sglang.srt.weg2 import l15_restore, l15_wake_check
+        ok, bad, missing = check if check is not None else (0, 0, 0)
+        vote = (l15_restore.check_vote(fp, ok, bad, missing, ())
+                if fp is not None else None)
+        world_group = getattr(self.scheduler, "world_group", None)
+        cpu_group = (getattr(world_group, "cpu_group", None)
+                     if world_group is not None else None)
+        world = (torch.distributed.get_world_size(group=cpu_group)
+                 if cpu_group is not None else 1)
+        return l15_wake_check.decide(
+            vote, group=cpu_group, world=world, epoch=epoch).verdict
+
+    def _l15_optimistic_refill(self) -> bool:
+        """L15-OPT (operator order 01.10 ~20:45Z, L15-WIRE2-NOTES sec 1):
+        the OPTIMISTIC cap-0 refill that runs BEFORE the group decide() so
+        the sample check (next AP) can verify live rows.  Reached only when
+        the wake hold signal set the refill mark -- that mark already
+        encodes SGLANG_WEG2_L15_REFILL=1 and "this rank is the refill rank"
+        -- and a manifest is stashed.  REFILL=0: the mark is never set, the
+        helper returns False and touches nothing (byte-identical boot 1).
+        The mark is consumed here, so the act after decide() KEEPS or DROPS
+        but never refills a second time.  A refill FAILURE must not drop per
+        rank (xsn409: the drop is the group's act): the helper returns True,
+        which flips this rank's decide() vote to None at the fence tail,
+        and the group fallback drop erases every row the failed attempt may
+        have landed.  Returns True only on such a failure."""
+        if not self._l15_wake_refill or self._l15_wake_manifest is None:
+            return False
+        sched = self.scheduler
+        if sched is None:
+            return False
+        self._l15_wake_refill = False
+        try:
+            self._l15_do_refill(sched, optimistic=True)
+        except Exception as exc:  # noqa: BLE001 -- vote None, never drop here
+            logger.info("L15-OPT optimistic refill failed (%s: %s) -> vote None",
+                        type(exc).__name__, exc)
+            return True
+        return False
+
+    def _l15_wake_sample_check(self):
+        """L15-W2C (L15-WIRE2-NOTES sec 1/2/4): sample-verify this rank's
+        rows at wake, between the optimistic refill and decide().  cap>0
+        ranks sample the HELD rows, the cap-0 rank the REFILLED ones --
+        the same owned-with-L2-source set, rid-tagged 4-tuples.  Returns
+        (ok, bad, missing), or None when this rank holds no manifest (it
+        still votes None, xsn410).  Any raise that is not the sampled
+        mismatch itself folds into an all-bad vote (0, k_or_len, missing)
+        -- the gather is never skipped.  One-shot scratch, freed always."""
+        from sglang.srt.weg2 import (l15_bind, l15_check, l15_restore,
+                                     l15_scratch)
+        m = self._l15_wake_manifest
+        if m is None:
+            return None
+        k = 64
+        rank = self._weg2_rank()
+        sched = self.scheduler
+        plan, scratch = [], None
+        try:
+            tp = int(getattr(sched, "tp_size", 0)
+                     or getattr(getattr(sched, "server_args", None),
+                                "tp_size", 1) or 1)
+            from sglang.srt.distributed.utils import get_cp_token_ratios
+            _ratios = get_cp_token_ratios()
+            _vw = ([int(x) for x in _ratios]
+                   if _ratios is not None and len(_ratios) == tp
+                   and all(int(x) > 0 for x in _ratios) else [1] * tp)
+            prefix = [0]
+            for _x in _vw:
+                prefix.append(prefix[-1] + _x)
+            # L15-DEDUPE: shared-prefix rows planned ONCE; the rid tag is
+            # display-only here (l15_sample.sample_plan str()-es it) and a
+            # duplicate would only waste sample slots.
+            plan = [(str(rids[0]), row, slot, gen)
+                    for row, slot, gen, _lane, rids in
+                    l15_restore.owned_l2_rows(m, rank, prefix)]
+            device_pool = getattr(getattr(getattr(sched, "tp_worker", None),
+                                          "model_runner", None),
+                                  "token_to_kv_pool", None)
+            host_pool = l15_bind.live_host_pools(
+                getattr(sched, "tree_cache", None))[0]
+            if device_pool is None or host_pool is None:
+                raise LookupError("sample check needs the device KV pool "
+                                  "and the L2 host pool")
+            page_tokens = max(1, int(getattr(host_pool, "_arena_page_tokens",
+                                             1)))
+            scratch = l15_scratch.make_scratch_pool(device_pool, k)
+            try:
+                ok, bad, missing = l15_check.sample_check(
+                    plan, host_pool, device_pool, scratch, page_tokens, k=k)
+            finally:
+                scratch.free()
+            logger.info(l15_restore.check_line(rank, ok, bad, missing))
+            return (ok, bad, missing)
+        except Exception as exc:  # noqa: BLE001 -- never skip the gather
+            logger.info("L15-CHECK rank=%d failed (%s: %s) -> all-bad vote",
+                        rank, type(exc).__name__, exc)
+            return (0, min(k, len(plan)) if plan else k, 0)
+
+    def _l15_wake_check_and_decide(self, wake_on: bool, fp, *, epoch: int):
+        """L15-W2C fence-tail entry: master off -> None with NO sample
+        call and NO collective; otherwise sample-check first, then the
+        one decide() collective carrying (ok, bad, missing)."""
+        if not wake_on:
+            return None
+        return self._l15_decide_wake_verdict(
+            wake_on, fp, self._l15_wake_sample_check(), epoch=epoch)
+
+    def _l15_wake_act(self, sched, verdict: str, *, group_ok: bool,
+                      master_on: bool) -> int:
+        """L15-12c-B: the fence tail's single-branch ACT on the group
+        verdict.  Master off -> zero new calls (byte-identical wake).  A
+        refused sibling (W114) defers EVERY rank: nothing is restored,
+        refilled or dropped here and the hold stays armed -- touching the
+        still-paused pool of a refused rank is the xsn408 fault class, never
+        the price of a cleanup.  "hold" and "none" drop nothing (the "hold"
+        refill is AP L15-12c-D's copy); returns slots dropped."""
+        if not master_on or not group_ok:
+            return 0
+        if verdict == "fallback":
+            return self._l15_fallback_drop(sched)
+        if verdict == "hold" and self._l15_wake_refill:
+            # L15-12c-E2: the cap-0 rank's refill ACT.  Runs only on the
+            # group-uniform "hold" verdict, behind the hold-aware restore
+            # that already re-reserved every held destination row.
+            n = self._l15_do_refill(sched)
+            # L15-HOSTLOCK: the refill copied (or its failure already ran the
+            # fallback drop, which released) -- hand the sleep's refs back.
+            rel = getattr(self, "_l15_release_host_hold_refs", None)
+            if rel is not None:
+                rel(sched)
+            return n
+        # L15-HOSTLOCK: acted "hold" with cap>0 (the rows never left VRAM) or
+        # "none" -- the decision is behind us, release what the sleep pinned.
+        rel = getattr(self, "_l15_release_host_hold_refs", None)
+        if rel is not None:
+            rel(sched)
+        return 0
+
+    def _l15_do_refill(self, sched, optimistic: bool = False) -> int:
+        """L15-12c-E2: refill this cap-0 rank's owned held rows from L2
+        (plan L15-12-PART3-PLAN sec 2), ACTED only behind the group verdict
+        "hold".  The hold-aware restore ran first: the held slots are
+        re-reserved (reserve_slots + keep_mamba_rows), so no admission can
+        take a destination row mid-copy.  The plan is rebuilt from the
+        stashed manifest with the same token prefix the fence's plan line
+        used (local read, no collective); rows carry their span's rid so a
+        generation mismatch drops the WHOLE request, never a partial one
+        (l15_refill.gen_check).  ALL-OR-NOTHING: any dropped rid or any
+        refill failure folds the whole attempt into the group fallback drop
+        -- a half-filled hold is never kept.  Returns rows copied (0 when
+        it fell back).  P>1: l15_refill.refill refuses by itself (OPEN C2).
+        """
+        from sglang.srt.weg2 import l15_refill, l15_restore
+
+        m = self._l15_wake_manifest
+        rank = self._weg2_rank()
+        try:
+            if m is None:
+                raise LookupError("refill rank without a stashed manifest")
+            tp = int(getattr(sched, "tp_size", 0)
+                     or getattr(getattr(sched, "server_args", None), "tp_size", 1)
+                     or 1)
+            from sglang.srt.distributed.utils import get_cp_token_ratios
+
+            _ratios = get_cp_token_ratios()
+            _vw = ([int(x) for x in _ratios]
+                   if _ratios is not None and len(_ratios) == tp
+                   and all(int(x) > 0 for x in _ratios) else [1] * tp)
+            prefix = [0]
+            for _x in _vw:
+                prefix.append(prefix[-1] + _x)
+            mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+            device_pool = getattr(mr, "token_to_kv_pool", None)
+            # L15-FIX-HOSTGROUP: mem_pool_host is the HostPoolGroup on the
+            # hybrid 27B; the arena pools are its KV / MAMBA entries.
+            from sglang.srt.weg2.l15_bind import live_host_pools
+            host_pool, host_mamba = live_host_pools(
+                getattr(sched, "tree_cache", None))
+            if device_pool is None or host_pool is None:
+                raise LookupError("refill needs the device KV pool and the "
+                                  "L2 host pool")
+            page_tokens = max(1, int(getattr(host_pool, "_arena_page_tokens", 1)))
+            # rid-tagged plan (L15-DEDUPE): one entry per distinct row,
+            # shared-prefix rows ONCE, tagged with the FULL tuple of the
+            # sharing rids so one generation mismatch drops every sharing
+            # request whole (l15_restore.rid_tagged_plan).
+            plan = l15_restore.rid_tagged_plan(m, rank, prefix)
+            if not plan:
+                return 0
+            ok, bad = l15_refill.gen_check(plan, host_pool)
+            if bad:
+                raise l15_refill.L15RefillError(
+                    "generation mismatch, drop-eligible rids: %s" % (bad[:4],))
+            # L15-12c-E2b: the GDN anchors travel in the same all-or-nothing
+            # unit: EVERY anchor generation is checked before any copy (KV
+            # included), so a mismatching wake copies nothing at all.
+            # anchor_slot is the span's device anchor row, kept out of the
+            # req clear by the restore's keep_mamba_rows; anchor_l2_slot is
+            # its L2 page (>= 0 here -- the gate did not open without it).
+            dev_mamba = getattr(getattr(sched, "req_to_token_pool", None),
+                                "mamba_pool", None)
+            if host_mamba is None or dev_mamba is None:
+                raise LookupError("refill needs the mamba host and device "
+                                  "pools for the anchors")
+            _sg = getattr(host_mamba, "slot_gens", None)
+            if _sg is None:
+                raise LookupError("mamba host pool has no slot_gens yet "
+                                  "(E2a pending) -- cannot verify anchors")
+            a_slots = [int(getattr(_sp, "anchor_l2_slot", -1))
+                       for _sp in m.spans]
+            a_didx = [int(getattr(_sp, "anchor_slot", -1)) for _sp in m.spans]
+            a_gens = [int(getattr(_sp, "anchor_l2_gen", -1)) for _sp in m.spans]
+            if any(s < 0 or d < 0 for s, d in zip(a_slots, a_didx)):
+                raise l15_refill.L15RefillError(
+                    "anchor identity incomplete: l2_slots=%s rows=%s"
+                    % (a_slots, a_didx))
+            if [int(g) for g in _sg(a_slots)] != a_gens:
+                raise l15_refill.L15RefillError(
+                    "anchor generation mismatch, recorded %s" % (a_gens,))
+            n = l15_refill.refill(ok, host_pool, device_pool, page_tokens)
+            host_mamba._load_states_all_layers(
+                dev_mamba,
+                torch.tensor(a_slots, dtype=torch.int64),
+                torch.tensor(a_didx, dtype=torch.int64))
+            logger.info("L15-REFILL rank=%d done: %d KV row(s) + %d anchor(s) "
+                        "from L2", rank, n, len(a_slots))
+            return n
+        except Exception as exc:  # noqa: BLE001 -- all-or-nothing into the fallback
+            logger.info("L15-REFILL rank=%d failed: %s -> %s", rank, exc,
+                         "vote None (optimistic)" if optimistic else "fallback")
+            if optimistic:
+                # L15-OPT: the pre-decide attempt must never drop per rank
+                # (xsn409: the drop is the group's act).  Reraise so
+                # _l15_optimistic_refill flips this rank's vote to None; the
+                # group fallback drop then erases whatever landed.
+                raise
+            self._l15_fallback_drop(sched)
+            return 0
+
     def _weg2_wake_restore_pools(self) -> bool:
         """#1455: Scheduler.flush_cache minus tree_cache.reset(): the pool
         state the remap left undefined is restored, the radix tree with the
@@ -7157,6 +7807,38 @@ class SchedulerWeightUpdaterManager:
         if sched is None:
             return False
         try:
+            _l15_m, _l15_rank, _l15_keep, _l15_master_on = self._l15_wake_hold_signal()
+            if _l15_master_on:
+                self._l15_wake_manifest = _l15_m
+            if _l15_m is not None:
+                # Hold-aware (AP-A): the radix tree was reduced to the held
+                # chains at sleep; keep the KV rows and the mamba anchors
+                # those chains point at out of the reset.  Local signal only
+                # -- the fence verdict is computed later, and the AP-B
+                # fallback reset undoes this idempotently.
+                from sglang.srt.weg2 import l15_retain
+
+                held = sorted({int(s) for _sp in _l15_m.spans for s in _sp.slots} - {0})
+                sched.req_to_token_pool.clear(keep_mamba_rows=int(_l15_m.anchor_slots))
+                sched.token_to_kv_pool_allocator.clear()
+                l15_retain.reserve_slots(sched.token_to_kv_pool_allocator, held)
+                try:
+                    from sglang.srt.environ import envs as _envs  # noqa: PLC0415
+                    if _envs.SGLANG_FLUSH_ZERO_KV.get():
+                        self._l15_flush_zero_kv_bounded(sched, _l15_keep)
+                except Exception:  # noqa: BLE001
+                    pass
+                if getattr(sched, "draft_worker", None):
+                    sched.draft_worker.clear_cache_pool()
+                self._l15_clear_tms_keep_spans(sched)
+                logger.info(
+                    "WEG2-WAKE-RESTORE L15 hold-aware (rank %d): %d slot(s) "
+                    "re-reserved, mamba rows [0,%d) kept, KV scrub bounded "
+                    "to rows>=%d", _l15_rank, len(held),
+                    int(_l15_m.anchor_slots), _l15_keep)
+                return True
+            # No local hold (master off / no manifest / cap 0): today's
+            # restore, byte-identical.
             sched.req_to_token_pool.clear()
             sched.token_to_kv_pool_allocator.clear()
             try:
@@ -7167,6 +7849,10 @@ class SchedulerWeightUpdaterManager:
                 pass
             if getattr(sched, "draft_worker", None):
                 sched.draft_worker.clear_cache_pool()
+            if _l15_master_on:
+                # AP-A: clear the sleep-armed keep set on every L15 wake
+                # (hold and fallback); master off stays byte-identical.
+                self._l15_clear_tms_keep_spans(sched)
             logger.info("WEG2-WAKE-RESTORE pools cleared, radix tree KEPT (#1455: the hold's prefetch survives the wake)")
             return True
         except Exception as exc:  # noqa: BLE001 -- fall back to the full flush, never leave pools undefined
@@ -9170,6 +9856,11 @@ class SchedulerWeightUpdaterManager:
             if _pls is not None:
                 _pls.on_sleep()
                 logger.info("%s", _pls.census_line())
+            # L15-FIX-EPOCH: hand the front's flip index to the L1.5 retain
+            # hook in flush_cache (D has no other group-uniform counter).
+            if self.scheduler is not None:
+                self.scheduler._l15_sleep_flip = _weg2_flip_index_of(
+                    getattr(recv_req, "epoch", None))
             self.flush_cache(zero_kv=False)
             # AH (--p-attn-head-split): the helper mirror lives in this region;
             # reset the split rule and drain the helper before it is unmapped,
@@ -9624,6 +10315,28 @@ class SchedulerWeightUpdaterManager:
         self._weg2_join_store_rescan("release")
         store_failure = self.weg2_store_rescan_failure
         self.weg2_store_rescan_failure = ""
+        # L15-13c part 2: the kv_cache bytes THIS rank still keeps MAPPED
+        # after the pause (the L1.5 keep-spans, L15-13a/b), tagged with this
+        # rank's card uuid, so the fence's own gather carries them and the
+        # front can subtract the hold from the dormant-residue record
+        # instead of the next launch charging it twice (planner l15 post).
+        # Master off: nothing is read, the gather payload grows no key --
+        # the leg stays byte-identical.
+        _l15_held: Optional[Dict[str, int]] = None
+        if weg2_memory_saver_on:
+            from sglang.srt.weg2 import l15_plan
+
+            if l15_plan.master_on(os.environ):
+                try:
+                    _mapped = self._weg2_tag_mapped_bytes(GPU_MEMORY_TYPE_KV_CACHE)
+                    if isinstance(_mapped, int) and _mapped > 0:
+                        _uuid = str(torch.cuda.get_device_properties(
+                            torch.cuda.current_device()).uuid)
+                        _l15_held = {_uuid: _mapped >> 20}
+                except Exception as _exc:  # noqa: BLE001 -- no probe, no harm
+                    logger.info("L15-HELD skipped (%s: %s)",
+                                type(_exc).__name__, _exc)
+                    _l15_held = None
         report: Dict[str, Any] = {}
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(
@@ -9632,6 +10345,7 @@ class SchedulerWeightUpdaterManager:
                 failure=store_failure,
                 per_tag=weg2_per_tag,
                 leg_ms=weg2_leg_ms,
+                l15_held=_l15_held,
             )
         if store_failure and not report:
             raise Weg2WakeRefused(store_failure)
@@ -9659,6 +10373,12 @@ class SchedulerWeightUpdaterManager:
             if weg2_memory_saver_on
             else None,
             anchors_lost=(report.get("anchors_lost") or None)
+            if weg2_memory_saver_on
+            else None,
+            # L15-13c part 2: same fallback rule as per_tag -- the gathered
+            # reduction when there was a group, else this rank's own reading;
+            # None when the master is off or nothing stayed mapped.
+            l15_held_mib=(report.get("l15_held_mib") or _l15_held or None)
             if weg2_memory_saver_on
             else None,
         ))
@@ -9772,7 +10492,10 @@ class SchedulerWeightUpdaterManager:
             from sglang.srt.utils.torch_memory_saver_adapter import (
                 Weg2TmsResumeRefused,
             )
-            from sglang.srt.weg2.wake_kv import kv_resume_fit_refusal
+            from sglang.srt.weg2.wake_kv import (
+                kv_resume_fit_refusal,
+                kv_resume_need_bytes,
+            )
 
             # #1491: the census BEFORE the resume, on every wake. This is the
             # reading that did not exist: `stage=release` runs at the SLEEP,
@@ -9787,13 +10510,27 @@ class SchedulerWeightUpdaterManager:
 
             _kv_need = None
             _kv_free = None
+            _kv_mapped = None
             try:
                 _kv_need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+                _kv_mapped = self._weg2_tag_mapped_bytes(GPU_MEMORY_TYPE_KV_CACHE)
                 _kv_free = self._weg2_free_bytes()
                 _kv_floor = int(self._weg2_corridor_floor_bytes() or 0)
             except Exception as _exc:  # noqa: BLE001 -- no probe, no refusal
                 logger.info("WEG2-WAKE-KV-FIT skipped (%s: %s)", type(_exc).__name__, _exc)
                 _kv_floor = 0
+            # L15-13b: count only the bytes the resume will actually map.  With
+            # TMS keep spans (L15-13a, b172a12a6a) a paused kv_cache keeps its
+            # held rows mapped, so tms_tag_bytes (the plan) demands them twice
+            # against the card's free budget -- a false "cannot fit" at every
+            # wake with a hold.  need = plan - mapped; no keep, or no symbol
+            # (mapped None): need == plan, byte-identical to the old check.
+            _kv_plan = _kv_need
+            _kv_need = kv_resume_need_bytes(_kv_need, _kv_mapped)
+            if isinstance(_kv_mapped, int) and _kv_mapped > 0 and _kv_plan is not None:
+                logger.info(
+                    "L15-WAKE-NEED tag=kv_cache plan=%d mapped=%d need=%d",
+                    _kv_plan, _kv_mapped, int(_kv_need or 0))
             _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
             if _unfit is not None and _kv_free is not None:
                 # z30y7: the sleeper's leg runs concurrently and may still be
@@ -10406,10 +11143,20 @@ class SchedulerWeightUpdaterManager:
                             not in ("0", "false", "no", "off")):
                         try:
                             from sglang.srt.weg2.wake_kv import kv_mid_ok as _kv_mid_ok
+                            from sglang.srt.weg2.wake_kv import kv_resume_need_bytes as _kv_need_fn
                             _ti_mid = list(weights_tags).index(tag)
                             _rest = list(weights_tags)[_ti_mid + 1:]
                             _rest_need = sum(int(tag_bytes.get(t, 0) or 0) for t in _rest)
-                            _kv_need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+                            # L15-13d: size by the bytes the resume will actually
+                            # map (plan - mapped_now); a paused kv_cache keeps its
+                            # spans mapped, so the full plan demanded them twice.
+                            # Mapped figure unreadable (method absent, symbol
+                            # absent, probe failed) -> need == plan, as before.
+                            _mfn = getattr(self, "_weg2_tag_mapped_bytes", None)
+                            _mapped = _mfn(GPU_MEMORY_TYPE_KV_CACHE) if callable(_mfn) else None
+                            _kv_need = _kv_need_fn(
+                                int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0),
+                                _mapped)
                             _free_mid = self._weg2_free_bytes()
                             _floor_mid = int(self._weg2_corridor_floor_bytes() or 0)
                             _mid_ok = _kv_mid_ok(_free_mid, _floor_mid, _kv_need, _rest_need)
@@ -10899,6 +11646,38 @@ class SchedulerWeightUpdaterManager:
         self.weg2_store_rescan_failure = ""
         if _weg2_kv_refusal:
             store_failure = (store_failure + "; " if store_failure else "") + _weg2_kv_refusal
+        # L15-12 part 2: THIS rank's L1.5 manifest fingerprint for the D
+        # wake.  Master off, or a non-D group -> stays None: the fence's
+        # gather carries no l15_fp key and no wake line is printed --
+        # today's byte-identical empty-tree wake.  The path is the one the
+        # sleep side (scheduler.py retain hook) wrote to.
+        _l15_wake = False
+        _l15_fp: Optional[int] = None
+        _l15_m = None
+        if weg2_memory_saver_on and self._weg2_group_name() == "D" and self._l15_wake_rpc(tags):
+            from sglang.srt.weg2 import l15_plan
+
+            if l15_plan.master_on(os.environ):
+                _l15_wake = True
+                try:
+                    from sglang.srt.weg2 import l15_manifest, l15_restore
+
+                    # L15-12c-C: the per-(group, rank) manifest file -- the
+                    # SAME path the sleep side (scheduler.py retain hook)
+                    # wrote, one record per rank of this group. load_for_wake
+                    # reads AND clears it (one sleep-wake pair per record).
+                    # F11: the wake restore already consumed the file for
+                    # cap>0 ranks -- take the stashed record, do NOT
+                    # load_for_wake a second time (it would always be None).
+                    _l15_m = self._l15_fence_manifest(
+                        l15_manifest.manifest_path(
+                            self._weg2_group_name(), self._weg2_rank(),
+                            os.environ))
+                    if _l15_m is not None:
+                        _l15_fp = int(l15_manifest.fingerprint(_l15_m))
+                except Exception as _exc:  # noqa: BLE001 -- no manifest, no hold
+                    logger.info("L15-WAKE manifest read skipped (%s: %s)",
+                                type(_exc).__name__, _exc)
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(
                 "resume tags=%s" % (list(tags),),
@@ -10906,6 +11685,7 @@ class SchedulerWeightUpdaterManager:
                 failure=store_failure,
                 per_tag=weg2_per_tag,
                 leg_ms=weg2_leg_ms,
+                l15_fp=_l15_fp,
             )
             _weg2_ph("fence")
             logger.info("WEG2-WAKE-TAIL ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
@@ -10914,6 +11694,154 @@ class SchedulerWeightUpdaterManager:
                             + " (F22: reload = legs_barrier + reload_weights; dest_hook_compare = static_import"
                             " + dest_leg + shadow_compare + rest; store_rescan = rescan + hold_release + rest;"
                             " WT: kv call cg_resume = wake_seats + seat_vram + kv_plan_vote + cg_remap + rest)")
+            # L15-12 part 2: the GROUP's verdict on the D wake's hold, from
+            # the fingerprints gathered by the fence above (reduced there by
+            # the pure l15_restore.l15_fp_reduce).  Master off -> _l15_wake is
+            # False, none of this runs: today's empty-tree wake, unchanged.
+            #   "none":     nobody held anything -> nothing to restore.
+            #   "fallback":  group mixed or disagreeing -> today's empty-tree
+            #                behaviour (OPEN L15-12 part 3: actually drop the
+            #                hold from the pools).
+            #   "hold":     the group kept one hold -> plan this rank's L2
+            #                refill (OPEN L15-12 part 3: the actual copy).
+            if _l15_wake:
+                from sglang.srt.weg2 import l15_restore
+
+                _mm = report.get("l15_fp_minmax")
+                if report and _mm is not None:
+                    _l15_min, _l15_max = int(_mm[0]), int(_mm[1])
+                elif _l15_fp is not None:
+                    # No group gathered over (world <= 1 / no cpu group): a
+                    # single rank cannot disagree with itself, so the group
+                    # verdict is its own fingerprint twice.
+                    _l15_min = _l15_max = _l15_fp
+                else:
+                    _l15_min = _l15_max = None
+                _l15_fence_v = ("fallback" if report.get("l15_fp_mixed")
+                                else l15_restore.verdict(_l15_fp, _l15_min,
+                                                         _l15_max))
+                # L15-12c-E1X (plan sec 9): the wake verdict is now decided by
+                # the group's decide() collective -- the ONE decision source.
+                # The fence-tail fingerprint reduction above is KEPT for now
+                # (the fence still needs it to build the report) and logged
+                # alongside so the first boot shows the two agree.  EVERY rank
+                # of the group runs this at this one list position (xsn410:
+                # a rank that skips the collective splits the group); a rank
+                # with no hold votes None.  L15CheckRefused cannot fire yet
+                # (bad is always 0 until the sample check lands, next AP).  A
+                # failing collective PROPAGATES like the fence's own gather --
+                # never caught per rank here.
+                # L15-OPT (operator order 01.10 ~20:45Z, L15-WIRE2-NOTES
+                # sec 1): attempt the cap-0 rank's refill BEFORE decide so
+                # the sample check (next AP) sees LIVE rows instead of the
+                # post-drop emptiness that makes the fingerprint reduction
+                # degenerate (min==max==fp -> spurious "hold").  No-op unless
+                # this rank is THE refill rank and SGLANG_WEG2_L15_REFILL=1
+                # (the wake mark already encodes both).  On failure this rank
+                # votes None -> the group falls back to a uniform drop, which
+                # erases the partial refill (xsn409: the drop stays a GROUP act,
+                # never per-rank).  The mark is consumed, so the post-decide act
+                # keeps or drops but never refills a second time.
+                if self._l15_optimistic_refill():
+                    _l15_v = self._l15_wake_check_and_decide(
+                        _l15_wake, None,
+                        epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
+                else:
+                    _l15_v = self._l15_wake_check_and_decide(
+                        _l15_wake, _l15_fp,
+                        epoch=int(_l15_m.epoch) if _l15_m is not None else 0)
+                logger.info("L15-DECIDE epoch=%d verdict=%s fence_verdict=%s",
+                            int(_l15_m.epoch) if _l15_m is not None else 0,
+                            _l15_v, _l15_fence_v)
+                if _weg2_kv_refusal:
+                    # L15-12c-B (W114): a refused kv resume on ANY rank
+                    # defers the whole group's L15 action.  The restore_line
+                    # below names it (verdict=deferred); nothing is dropped
+                    # this wake and the hold stays armed for the next.
+                    _l15_v = "deferred"
+                _l15_refill = 0
+                _l15_missing = 0
+                if _l15_v == "hold" and _l15_m is not None:
+                    try:
+                        _l15_rank = self._weg2_rank()
+                        _l15_sched = self.scheduler
+                        _l15_tp = int(
+                            getattr(_l15_sched, "tp_size", 0)
+                            or getattr(getattr(_l15_sched, "server_args", None),
+                                       "tp_size", 1)
+                            or 1)
+                        from sglang.srt.distributed.utils import (
+                            get_cp_token_ratios as _l15_ratios_fn,
+                        )
+
+                        _l15_ratios = _l15_ratios_fn()
+                        _l15_vw = (
+                            [int(x) for x in _l15_ratios]
+                            if _l15_ratios is not None
+                            and len(_l15_ratios) == _l15_tp
+                            and all(int(x) > 0 for x in _l15_ratios)
+                            else [1] * _l15_tp
+                        )
+                        _l15_prefix = [0]
+                        for _l15_x in _l15_vw:
+                            _l15_prefix.append(_l15_prefix[-1] + _l15_x)
+                        if 0 <= _l15_rank < len(_l15_prefix) - 1:
+                            # THE CAP SIGNAL IS THE PLANNER'S PER-CARD CAP
+                            # (SGLANG_WEG2_L15_MIB, the same caps_from_env
+                            # derivation as the sleep hook): > 0 means this
+                            # rank kept its rows mapped.  The manifest's
+                            # rows_by_rank is the per-rank KEEP CAPACITY
+                            # (blocks * ratio) and is > 0 for TP0 too --
+                            # passing it here would make refill_plan return
+                            # [] for every rank, TP0 included (D3 review).
+                            from sglang.srt.weg2 import l15_shadow
+
+                            _l15_mr = getattr(getattr(_l15_sched, "tp_worker",
+                                                     None), "model_runner", None)
+                            _l15_pool = getattr(_l15_mr, "token_to_kv_pool", None)
+                            if _l15_pool is None:
+                                raise LookupError(
+                                    "no token_to_kv_pool to price the caps")
+                            _l15_cell = l15_shadow.cell_bytes_from(_l15_pool)
+                            _l15_rgid = getattr(
+                                getattr(_l15_sched, "server_args", None),
+                                "rank_gpu_id", None)
+                            _l15_cards = (
+                                list(_l15_rgid)
+                                if isinstance(_l15_rgid, (list, tuple))
+                                and len(_l15_rgid) == _l15_tp
+                                else list(range(_l15_tp))
+                            )
+                            _l15_caps = l15_shadow.caps_from_env(
+                                os.environ, _l15_tp,
+                                [_l15_cell] * _l15_tp, _l15_cards)
+                            _l15_refill = len(l15_restore.refill_plan(
+                                _l15_m, _l15_rank, _l15_prefix, _l15_caps))
+                            _l15_missing = l15_restore.count_missing(
+                                _l15_m, _l15_rank, _l15_prefix)
+                    except Exception as _exc:  # noqa: BLE001 -- plan only
+                        logger.info("L15-WAKE refill plan skipped "
+                                    "(%s: %s)", type(_exc).__name__, _exc)
+                # L15-12c-B: the group-uniform ACT, at ONE list position on
+                # every rank (same branch, no collective inside; the group
+                # flag is the xsn409-uniform kv verdict of this wake).
+                _l15_dropped = self._l15_wake_act(
+                    self.scheduler, _l15_v,
+                    group_ok=not _weg2_kv_refusal, master_on=_l15_wake)
+                if _l15_v == "fallback":
+                    logger.info("L15-RESTORE verdict=fallback dropped=%d "
+                                "slots", _l15_dropped)
+                logger.info("%s", l15_restore.restore_line(
+                    int(_l15_m.epoch) if _l15_m is not None else 0,
+                    _l15_v,
+                    tuple(_l15_m.rows_by_rank) if _l15_m is not None else (),
+                    _l15_refill, _l15_missing))
+                # F11: the fence has consumed the record (fingerprint,
+                # verdict, action -- the file was unlinked at the hold
+                # signal); the stash does not survive into the next wake.
+                self._l15_wake_manifest = None
+                # L15-12c-E2: the refill mark dies with the record too.
+                self._l15_wake_refill = False
         if store_failure and not report:
             # The fence did not gather: no memory saver, no cpu group, or
             # world <= 1. A single-rank engine cannot disagree with itself, so

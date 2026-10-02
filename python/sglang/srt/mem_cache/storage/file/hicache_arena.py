@@ -105,6 +105,16 @@ class RefLedger:
 
 _LEDGERS: dict = {}
 
+#: ARENA-COPY-GEN (N2, 01.10.): an EVICTING slot is stale (its evictor died)
+#: only after this many seconds in that state. Before, every process's reap
+#: freed every EVICTING slot at once -- including a live evictor's candidates
+#: in the middle of their disk copy (arena.c arena_reap_stale_aged).
+REAP_STALE_MIN_AGE_S = 60.0
+
+#: arena.c slot states the copy check names
+STATE_COMPLETE = 2
+STATE_EVICTING = 3
+
 #: Instrument (default 0 = off): every N seconds a daemon thread logs the
 #: arena's reference census (ShmArena.ref_census) -- how many COMPLETE slots a
 #: reader reference pins, over the whole boot. Off the round path: the strided
@@ -424,12 +434,22 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_quarantine_sweep.argtypes = [p_u8, i64]
             lib.arena_free_if_gen.restype = i64
             lib.arena_free_if_gen.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
+            # ARENA-COPY-GEN (N2): copies bound to the slot generation
+            lib.arena_reap_stale_aged.restype = i64
+            lib.arena_reap_stale_aged.argtypes = [p_u8, i64]
+            lib.arena_pin_complete_gen.restype = i64
+            lib.arena_pin_complete_gen.argtypes = [p_u8, i64, p_i64, p_i64, p_u64, p_u64, p_i8]
+            lib.arena_unpin_gen.restype = i64
+            lib.arena_unpin_gen.argtypes = [p_u8, i64, p_i64, p_i64]
+            # ZR-1 (port of NF cfecb699df): index lock + writer census
             lib.arena_set_writer_tag.restype = None
             lib.arena_set_writer_tag.argtypes = [ctypes.c_uint32]
             lib.arena_claim_census.restype = i64
             lib.arena_claim_census.argtypes = [p_u8, i64, p_i64, p_i64]
             lib.arena_index_lock_steals.restype = i64
             lib.arena_index_lock_steals.argtypes = [p_u8]
+            lib.arena_slots_still.restype = i64
+            lib.arena_slots_still.argtypes = [p_u8, i64, p_i64, p_i64, p_u64, p_u64, ctypes.c_int32, p_i8]
             _lib = lib
             return lib
         except Exception as e:  # noqa: BLE001 - the arena is optional
@@ -741,6 +761,7 @@ class ShmArena:
         st = (ctypes.c_int8 * n)()
         # xsn350: keys hashed in C (arena_claim_stems); the Python key128 per
         # stem was ~30 ms per 4096-page node in the scheduler thread.
+        ensure_writer_tag(self._lib)
         rc = self._lib.arena_claim_stems(self._base, n, c_stems, c_tot, slots, gens, st)
         if rc < 0:
             lo, hi = self._keys(stems)
@@ -769,6 +790,7 @@ class ShmArena:
         p_slots = slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
         p_gens = gens.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
         p_st = st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
+        ensure_writer_tag(self._lib)
         rc = self._lib.arena_claim_stems(self._base, n, c_stems, c_tot, p_slots, p_gens, p_st)
         if rc < 0:
             lo, hi = self._keys(stems)
@@ -989,8 +1011,71 @@ class ShmArena:
         out = (ctypes.c_int8 * n)()
         return int(self._lib.arena_drop_unreferenced(self._base, n, c, out))
 
-    def reap_stale(self) -> int:
-        return int(self._lib.arena_reap_stale(self._base))
+    def reap_stale(self, min_age_s: Optional[float] = None) -> int:
+        """Free EVICTING slots whose evictor died: EVICTING for at least
+        ``min_age_s`` (default REAP_STALE_MIN_AGE_S). ARENA-COPY-GEN: a young
+        EVICTING slot is a live evictor's candidate being copied to disk."""
+        age = REAP_STALE_MIN_AGE_S if min_age_s is None else max(0.0, float(min_age_s))
+        return int(self._lib.arena_reap_stale_aged(self._base, int(age * 1e3)))
+
+    def pin_complete_gen(self, slots, gens, klo, khi):
+        """ARENA-COPY-GEN: :meth:`pin_complete` bound to the census generation
+        as well as the key; numpy bool mask of the pinned slots, returned with
+        :meth:`unpin_gen` under the same generations."""
+        import numpy as np
+
+        s = np.ascontiguousarray(slots, dtype=np.int64)
+        g = np.ascontiguousarray(gens, dtype=np.int64)
+        lo = np.ascontiguousarray(klo, dtype=np.uint64)
+        hi = np.ascontiguousarray(khi, dtype=np.uint64)
+        n = int(s.shape[0])
+        ok = np.zeros(max(1, n), dtype=np.int8)
+        if n:
+            P64 = ctypes.POINTER(ctypes.c_int64)
+            PU64 = ctypes.POINTER(ctypes.c_uint64)
+            self._lib.arena_pin_complete_gen(
+                self._base, n, s.ctypes.data_as(P64), g.ctypes.data_as(P64),
+                lo.ctypes.data_as(PU64), hi.ctypes.data_as(PU64),
+                ok.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return ok[:n].astype(bool)
+
+    def unpin_gen(self, slots, gens) -> int:
+        """ARENA-COPY-GEN: return pins of :meth:`pin_complete_gen` only where
+        the slot still carries that generation (a re-claimed slot's count
+        belongs to its new page's readers)."""
+        import numpy as np
+
+        s = np.ascontiguousarray(slots, dtype=np.int64)
+        g = np.ascontiguousarray(gens, dtype=np.int64)
+        n = int(s.shape[0])
+        if not n:
+            return 0
+        P64 = ctypes.POINTER(ctypes.c_int64)
+        return int(self._lib.arena_unpin_gen(self._base, n, s.ctypes.data_as(P64), g.ctypes.data_as(P64)))
+
+    def slots_still(self, slots, klo, khi, state: int, gens=None):
+        """ARENA-COPY-GEN: after a copy, the numpy bool mask of the slots that
+        are still the copied page -- in ``state``, same key, and (when
+        ``gens`` is given, entries >= 0) the same generation."""
+        import numpy as np
+
+        s = np.ascontiguousarray(slots, dtype=np.int64)
+        lo = np.ascontiguousarray(klo, dtype=np.uint64)
+        hi = np.ascontiguousarray(khi, dtype=np.uint64)
+        n = int(s.shape[0])
+        ok = np.zeros(max(1, n), dtype=np.int8)
+        if n:
+            P64 = ctypes.POINTER(ctypes.c_int64)
+            PU64 = ctypes.POINTER(ctypes.c_uint64)
+            g_ptr = None
+            if gens is not None:
+                g = np.ascontiguousarray(gens, dtype=np.int64)
+                g_ptr = g.ctypes.data_as(P64)
+            self._lib.arena_slots_still(
+                self._base, n, s.ctypes.data_as(P64), g_ptr,
+                lo.ctypes.data_as(PU64), hi.ctypes.data_as(PU64), int(state),
+                ok.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return ok[:n].astype(bool)
 
     def reap_partial(self, min_age_s: float, cap: int = 64) -> list[int]:
         """#231: free CLAIMED direct-write slots no writer can still come to

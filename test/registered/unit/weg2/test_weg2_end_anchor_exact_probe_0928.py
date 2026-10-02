@@ -212,8 +212,12 @@ def _page64(n, chunks=(), exact=True, trim=False):
     prompt = array("q", range(1000, 1000 + n))
     ids = prompt[:-1] if trim else prompt
 
+    # HANDBACK N-1 (fe5c55041b): a trimmed request's insert keys its committed
+    # ids PLUS the held-back prompt token (cache_finished_req token_ids_full)
+    key_ids = prompt if trim else ids
+
     def key_units(cache_len):
-        return len(urc.bigram_anchor_key(ids, cache_len, None, is_bigram=True,
+        return len(urc.bigram_anchor_key(key_ids, cache_len, None, is_bigram=True,
                                          exact=exact, page_size=PAGE64))
 
     retain = len(ids) if trim else n - 1
@@ -231,7 +235,9 @@ def _page64(n, chunks=(), exact=True, trim=False):
 
     tree = SimpleNamespace(is_eagle=True, page_size=PAGE64, bigram_anchor_exact=exact,
                            match_prefix=match_prefix, root_node=root)
-    req = SimpleNamespace(rid=f"weg2-b-{n}", extra_key=None)
+    # HANDBACK N-1 (fe5c55041b): the trimmed probe reads the request's own
+    # prompt (origin = the N-1 committed ids) plus the held-back tail
+    req = SimpleNamespace(rid=f"weg2-b-{n}", extra_key=None, origin_input_ids=ids)
     if trim:
         setattr(req, urc._P_TRIM_ATTR, prompt[-1:])
     UnifiedRadixCache._weg2_note_end_anchor(tree, req, ids)
@@ -291,9 +297,12 @@ def test_page64_control_upstream_keying_is_unchanged(caplog):
 
 
 def test_page64_control_p_trim_form_is_unchanged(caplog):
+    # HANDBACK N-1 (fe5c55041b): under the exact keying the trimmed probe and
+    # the insert both take the held-back prompt token: N-1 units (was N-2
+    # page-aligned -- D claimed N-2, uncached=2, X refused, W50 on dual1m).
     with caplog.at_level(logging.WARNING):
         _nodes, _a, probes = _page64(1025, trim=True)
-    assert probes == [960]
+    assert probes == [1024]
     line = _b_line(caplog, 1025)
-    assert "tokens=1025 anchor=960 target=1024 units=960/960 ok=True" in line, line
+    assert "tokens=1025 anchor=1024 target=1024 units=1024/1024 ok=True" in line, line
     assert line.endswith("trim=1")

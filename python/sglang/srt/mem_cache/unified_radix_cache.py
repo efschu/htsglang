@@ -150,6 +150,19 @@ def prefetch_namespace(*, anchor_extra_key, request_extra_key):
     return request_extra_key if request_extra_key is not None else anchor_extra_key
 
 
+def _ids_with_tail(ids, tail):
+    """``ids`` + the P-TRIM held-back ``tail``, same container type (RadixKey
+    asserts array('q') where the tree passes arrays; an array needs its
+    typecode, so ``type(ids)(...)`` would not do)."""
+    from array import array as _array
+
+    if isinstance(ids, _array):
+        out = _array(ids.typecode, ids)
+        out.extend(int(t) for t in tail)
+        return out
+    return list(ids) + [int(t) for t in tail]
+
+
 def bigram_anchor_ids(fill_ids, full_ids):
     """The ids the exact key reads its next token from.
 
@@ -1144,6 +1157,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # evictable checkpoints were sitting in the tree.
         if hasattr(self.req_to_token_pool, "bind_tree_cache"):
             self.req_to_token_pool.bind_tree_cache(self)
+        # HANDBACK N-1 COLD FIRST CLAIM: note the keying NOW, not at the first
+        # cache_*_req / match validator. D's claim (`Req._compute_max_prefix_len`
+        # -> `handback_bigram_claim`) runs BEFORE the request's own match_prefix,
+        # and the launcher boots with --skip-server-warmup, so a lazily noted
+        # flag was still False for the first hand-back on every D rank: N-1 raw
+        # tokens on the exact tree ended inside P's N-1 node and D resumed at 0
+        # (a full D re-prefill). Reading the property here caches it once per
+        # tree (the keying must not change under a live tree) and calls note_tree.
+        _ = self.bigram_anchor_exact
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
         self._log_mamba_floor_posture()
 
@@ -1479,6 +1501,91 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def reset(self) -> None:
         self._reset_full()
+
+    def reset_keep(self, keep_nodes) -> None:
+        """Partial tree reset (AP L15-06, tree half of the L1.5 hold).
+
+        ``keep_nodes`` are tree nodes (typically each request's last node).
+        The new tree contains exactly the union of the chains
+        root -> kept node, re-attached to the fresh root as the SAME node
+        objects; everything else is dropped. With an empty iterable this is
+        ``_reset_full`` verbatim.
+
+        Pure tree bookkeeping: NO KV/Mamba pool memory is freed here, for
+        kept nodes nor for dropped ones. THE CALLER MUST KEEP THE SLOTS OF
+        THE KEPT NODES ALLOCATED IN THE ALLOCATOR (wired in L15-11); the
+        dropped nodes' device indices are handed back by the caller's own
+        release path, exactly as with ``reset()``. Host arena references of
+        the old tree -- including the kept chains' host copies -- are
+        released as in ``_reset_full`` -- but the release SKIPS host-locked
+        or write-pending nodes and does not clear their ``host_value``, so
+        ``reset_keep`` itself nulls ``host_value`` and
+        ``write_through_pending_id`` on every kept node: after the call the
+        kept chains are device-only (``backuped`` False) and no stale ack can
+        land on a dead pending entry. A kept node the release skipped keeps
+        its arena reference unreturned; that is acceptable and is logged by
+        the reset as #1424e. Kept nodes are unlocked (lock_ref 0 for every
+        component) so no request holds them across a sleep.
+        """
+        keep = [n for n in keep_nodes if n is not self.root_node]
+        if not keep:
+            self._reset_full()
+            return
+        # Union of the chains root -> kept node, root excluded. Identity
+        # membership: nodes are unique objects and the walk stops at the
+        # first ancestor already collected (chains share their prefixes).
+        keep_set: set[UnifiedTreeNode] = set()
+        for node in keep:
+            cur = node
+            while (
+                cur is not None
+                and cur is not self.root_node
+                and cur not in keep_set
+            ):
+                keep_set.add(cur)
+                cur = cur.parent
+        # Everything _reset_full does for the tree: prefetch pins, host
+        # arena values, deferred publish/cap state, counters, fresh root
+        # (lock_ref 1), empty LRU lists and leaf sets, zeroed sizes.
+        self._reset_full()
+        root = self.root_node
+        for node in keep_set:
+            for cd in node.component_data:
+                cd.lock_ref = 0
+                cd.host_lock_ref = 0
+                # _release_host_values_before_reset (inside _reset_full above)
+                # gives the arena rows back but never clears host_value, so
+                # without this the kept node would still read backuped=True at
+                # a released/reused row -- a device eviction would keep the
+                # stale pointer and a load-back would read foreign KV.
+                cd.host_value = None
+            # Its ack would land on a dead pending entry.
+            if node.write_through_pending_id is not None:
+                node.write_through_pending_id = None
+            # Drop every child not on a kept chain, then re-file the
+            # top-level nodes under the new root (their old parent -- the
+            # old root -- is gone; deeper parents are kept objects already
+            # wired through the surviving children dicts).
+            node.children = {
+                k: c for k, c in node.children.items() if c in keep_set
+            }
+            if node.parent is None or node.parent not in keep_set:
+                node.parent = root
+                root.children[node.key.child_key(self.page_size)] = node
+        # Sizes from the surviving device values; protected stays 0 (all
+        # kept nodes were unlocked above).
+        for ct in self.tree_components:
+            total = 0
+            for node in keep_set:
+                value = node.component_data[ct].value
+                if value is not None:
+                    total += len(value)
+            self.component_evictable_size_[ct] = total
+        for node in keep_set:
+            self._for_each_component_lru(
+                node, UnifiedLRUList.insert_mru, skip_existing=True
+            )
+            self._update_evictable_leaf_sets(node)
 
     def weg2_node_depth(self, node) -> int:
         """Token depth at the END of ``node`` (its key plus every ancestor's)
@@ -2698,6 +2805,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # fnFL2x76: the retention key may take one token beyond the retained
         # KV (`bigram_anchor_key`); `token_ids` itself is truncated below.
         token_ids_full = token_ids
+        # DUAL ANCHOR N-1 (01.10., metal dual1m ...10011503): a P-TRIM request
+        # committed exactly its N-1 prompt tokens and holds the prompt's last
+        # token back; the exact bigram key's "one more token" must be THAT
+        # token, not the sampled leg-1 output (which follows in output_ids and
+        # is no prompt token). Without it the exact form had no next token and
+        # fell back to N-2 units -- D claimed N-2, uncached=2, X=1 refused (W50).
+        _tail = getattr(req, _P_TRIM_ATTR, None)
+        if _tail is not None and kv_committed_len >= len(req.origin_input_ids):
+            token_ids_full = _ids_with_tail(req.origin_input_ids[:kv_committed_len], _tail)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
@@ -5885,7 +6001,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # forms.
         _trim_tail = getattr(req, _P_TRIM_ATTR, None)
         _trim = len(_trim_tail) if _trim_tail is not None else 0
-        tokens = len(token_ids) + _trim
+        # the caller passes the key ids, which for a trimmed request already
+        # carry the held-back tail (DUAL ANCHOR N-1); the prompt the client
+        # sent is origin + tail either way
+        tokens = (len(req.origin_input_ids) + _trim) if _trim else len(token_ids)
         # CLAIM ANCHOR (dynpf-Praefix 0929): where group P tracks the hand-back
         # anchor at the store reader's claim (80fa726f31), the probe asks for
         # THAT depth -- the deepest a reader of this prompt claims -- and the
@@ -5909,9 +6028,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # RadixKey asserts the array('q') type of `token_ids` (boot weg2zr1:
             # a list raised at the probe); slicing keeps the type.
             if _trim:
-                probe = RadixKey(
-                    token_ids, req.extra_key, is_bigram=self.is_eagle
-                ).page_aligned(self.page_size)
+                # N-1 prompt tokens committed; under the exact keying the key
+                # takes the held-back prompt token as its next token (N-1
+                # units), under the upstream keying this is RadixKey(ids[:N-1])
+                # exactly as before (N-2 units).
+                _full = _ids_with_tail(req.origin_input_ids, _trim_tail)
+                probe = bigram_anchor_key(
+                    _full, tokens - _trim, req.extra_key,
+                    is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
+                    page_size=self.page_size,
+                )
             else:
                 # W123/#241 (rc12z10 weg2-2-12 N=9537, rc12u weg2-6-18 N=23361):
                 # the N-1 node was inserted with the EXACT bigram key
@@ -6964,6 +7090,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         min_tokens: Optional[int] = None,
         span_base: Optional[int] = None,
         extra_key: Optional[str] = None,
+        key_base: Optional[int] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -7449,15 +7576,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     f"local={local_len}): a MIN reduce can never do that, so "
                     "the ranks were not all inside this collective."
                 )
-            # y6l: the group prices the read with the same minimum as the
-            # local gate (`_min_len`: prefetch_threshold, or the caller's
-            # min_tokens). Against the bare threshold every hand-back read
-            # below 256 declined here as vote_negative with every rank
-            # present (D TP=3, 27B need=24/40), so 1160d65e1d's min_tokens=1
-            # never reached the store.
+            # HANDBACK VOTE MIN (gmps7 dkr27bnvfp4dual1mbar1fs10011748, D TP=3,
+            # 17:52:27-17:52:56): the group decides against the SAME smallest
+            # read the local gate uses (`_min_len`: the threshold, or the
+            # caller's `min_tokens` -- a P hand-back, a store-short tail, a
+            # told read). Against the bare threshold every hand-back span below
+            # 256 tokens was `vote_negative` with present=True on all three
+            # ranks (weg2-0-6 need=24, weg2-0-10 need=40) -> W31 -> W50 -> P
+            # ran leg 1 twice -> W53/503. `_min_len` is rank-uniform: it is a
+            # pure function of the request (its told, its store-short tail, its
+            # park) and the group's env, the same on every rank of the group.
             if group_len < _min_len or _end_decline:
                 # #1068 L1: the group declined (0, or a common span below the
-                # read's minimum). Named on every rank, including the one
+                # smallest read worth issuing). Named on every rank, including the one
                 # whose own gate term or anchor exhaustion lowered the vote
                 # (that rank counted its local term above as well; the
                 # attribution order names the local term first).
@@ -7479,8 +7610,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # span is 0 and a span check above the threshold return would fire
             # on the most ordinary condition in the system. Past that return
             # the population is provably clean: `group_len >= _min_len >= 1`
-            # and `local_len` is 0 on any rank that was ineligible or did
-            # not allocate, so a MIN at or above the minimum proves EVERY
+            # (max(1, ...) above) and `local_len` is 0 on any rank that was ineligible or did
+            # not allocate, so a MIN at or above the threshold proves EVERY
             # rank was eligible AND allocated. Only real spans are compared.
             span_lo = int(vote[3].item())
             span_hi = -int(vote[4].item())
@@ -7664,13 +7795,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _keys:
                 _pages = int(prefetch_length) // int(self.page_size)
                 _total = _keys  # chain length in pages == P's inserted page count
-                from sglang.srt.weg2.handoff_keys import fallback_page_offset as _hk_off
 
                 _ids = _ho.read_ids(str(req_id))
                 _ntok = len(_ids) if _ids else None
-                # the span starts at the matched length, not at N - length
-                # (a read trimmed at its end would take later pages' keys)
-                _off = _hk_off(_ntok, prefetch_length, self.page_size, span_base)
+                # HANDOFF-KEY OFFSET (N3c 10012013): from the span's absolute
+                # start, never "ids minus span" (weg2.handoff_keys.span_key_offset)
+                from sglang.srt.weg2.handoff_keys import span_key_offset as _span_key_offset
+                _off = _span_key_offset(key_base, _ntok, int(prefetch_length), int(self.page_size))
                 if _off is not None and 0 <= _off < len(_total):
                     # partial coverage is fine (P's list is one page short of the ids)
                     operation.weg2_page_keys = list(_total[_off:_off + _pages])
@@ -8754,6 +8885,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 (_bytes / (_read_ms / 1000.0) / 1e9) if _read_ms > 0 else -1.0,
                 int(insert_result.prefix_len), int(loaded_from_storage),
             )
+            # L15-02b: if this req was in the last sleep's shadow hold set, price
+            # the load-back it would have saved. Log-only, never raises.
+            try:
+                from sglang.srt.weg2 import l15_shadow
+
+                if l15_shadow.shadow_on(os.environ):
+                    _l15_line = l15_shadow.LEDGER.note_load(req_id, _ms, _read_ms)
+                    if _l15_line is not None:
+                        logger.info("%s", _l15_line)
+            except Exception:  # noqa: BLE001 - shadow must never break a load-back
+                pass
         except Exception as _ie:  # noqa: BLE001 -- an instrument never kills the prefetch
             # xsn289: 27 prefetch successes on D, 0 WEG2-LOAD-DEVICE lines and
             # this branch silent at DEBUG -- an instrument that fails must SAY
@@ -10959,6 +11101,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             v = bool(self.is_eagle and ComponentType.MAMBA in self.components
                      and envs.SGLANG_WEG2_BIGRAM_ANCHOR_EXACT.get())
             self.__dict__["_weg2_bigram_anchor_exact"] = v
+            from sglang.srt.weg2.handback_claim import note_tree as _dac_note
+
+            _dac_note(bool(v))  # HANDBACK N-1: D's claim reads this
         return v
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----

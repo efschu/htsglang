@@ -73,6 +73,7 @@ from aiohttp import (
     web,
 )
 
+from sglang.srt.weg2 import front_metrics as _front_metrics  # TSDB: imported off the loop
 from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xsn272
 from sglang.srt.weg2.intake_stall import STALL_MARK as _INTAKE_STALL_MARK  # H91 part C
 
@@ -100,6 +101,7 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import l15_plan  # L15-13c: D's residue record excludes the hold
 from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock lock
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
@@ -111,7 +113,7 @@ from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST rerou
 from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
 # DASHBOARD-IPC 01.10. (stdlib only, imported HERE: no first import on the loop, weg2rc2)
 from sglang.srt.weg2 import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
-from sglang.srt.weg2 import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
+
 
 logger = logging.getLogger("weg2.front")
 
@@ -132,7 +134,10 @@ FORWARD_PATHS = ("/generate", "/v1/completions", "/v1/chat/completions", "/v1/me
 #: passthroughs beside it -- routing it through ``handle_generate`` would
 #: allocate a seat for a request that never generates.
 PASSTHROUGH_POST = ("/v1/messages/count_tokens",)
-PASSTHROUGH_GET = ("/v1/models", "/get_model_info", "/get_server_info", "/model_info", "/metrics")
+PASSTHROUGH_GET = ("/v1/models", "/get_model_info", "/get_server_info", "/model_info")
+#: TSDB (01.10.): /metrics is the front's own route (front_metrics): its weg2_* families
+#: plus P's and D's /metrics relabelled with weg2_group="P"|"D".
+METRICS_PATH = "/metrics"
 CHARS_PER_TOKEN = 3.0  # conservative: over-estimates tokens, never under-prices
 # #1233 zero-remainder: the CARRIER-EXCEEDS route must not UNDER-estimate --
 # measured boot weg2zr1: 80,000 chars of markdown = 30,100 tokens (2.66
@@ -656,6 +661,30 @@ def anchors_lost(body: str) -> List[int]:
         except (TypeError, ValueError):
             continue
     return sorted(set(out))
+
+
+def l15_held_mib_from_body(body: str) -> Optional[Dict[str, int]]:
+    """L15-13c part 2: the release leg's answer's ``l15_held_mib`` -- the
+    kv_cache bytes still MAPPED per card after the pause (the L1.5 keep-
+    spans), ``{card uuid: MiB}`` (weight_updater / io_struct).  None when
+    the answer carries none or is not this tree's JSON -- the dormant-image
+    record then keeps the residue as measured, exactly as before part 2."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    held = payload.get("l15_held_mib")
+    if not isinstance(held, dict) or not held:
+        return None
+    out: Dict[str, int] = {}
+    for k, v in held.items():
+        try:
+            out[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out or None
 
 
 def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
@@ -5109,6 +5138,7 @@ class Front:
             late[:8], still[:8], time.time() - t_park)
         # D->P flip time (user definition): D's decodes stopped with this park
         self._ipc_dp_clock().note_park(self.epoch, t_park, (time.time() - t_park) * 1000.0)
+        self._metrics().park_rpc_done(time.time() - t_park)  # TSDB
         return "parked"
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
@@ -6219,15 +6249,19 @@ class Front:
         return task
 
     def _first_sleep_reading(self, S: Group, src: str,
-                             shmem_before: Optional[int]) -> Tuple[Dict[str, int], Optional[dict]]:
+                             shmem_before: Optional[int],
+                             l15_held_mib: Optional[Dict[str, int]] = None,
+                             ) -> Tuple[Dict[str, int], Optional[dict]]:
         """The residue reading of ``src``'s FIRST sleep, as the flip took it
         inline: ``ps`` + ``nvidia-smi`` + the dormant-image sample -- minus
         the sidecar append, which the caller hands to the writer (H78).
         Runs in a worker thread; the flip awaits it, so W19 and the sample
-        keep their place in the flip."""
+        keep their place in the flip.  ``l15_held_mib`` (L15-13c part 2) is
+        the D sleep reply's per-card held kv_cache MiB, off the caller's
+        leg body; None keeps the record as measured."""
         pids = _session_pids(S.sid) if S.sid else set()
         dc = _nvml_process_mib(pids) if pids else {}
-        rec = self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc, persist=False)
+        rec = self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc, persist=False, l15_held_mib=l15_held_mib)
         return dc, rec
 
     async def cleanup(self, app):
@@ -6562,6 +6596,94 @@ class Front:
                 on_error=self._ipc_failed)
         w.submit(fn, *args)
 
+    def _ipc_out_book(self):
+        """Every open request's arrival and last token (front_state_ipc.OutstandingBook,
+        NF port): the 27B front reads its arrival for weg2_ttft_seconds."""
+        b = self.__dict__.get("_ipc_out_book_obj")
+        if b is None:
+            from sglang.srt.weg2.front_state_ipc import OutstandingBook
+
+            b = self.__dict__["_ipc_out_book_obj"] = OutstandingBook()
+        return b
+
+    def ipc_out_wrap(self, handler):
+        """The rid-end of the outstanding book (NF port): every return, exception
+        and cancel of the generate handler takes the rid out (the #243 seam's rid)."""
+        import functools
+
+        @functools.wraps(handler)
+        async def _wrapped(request):
+            status: Any = None
+            try:
+                resp = await handler(request)
+                status = getattr(resp, "status", None)
+                return resp
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
+            except BaseException as e:
+                status = f"error:{type(e).__name__}"
+                raise
+            finally:
+                try:
+                    rid = request.get(_hs.RID_KEY)
+                except Exception:  # noqa: BLE001
+                    rid = None
+                if rid:
+                    self._ipc_out_book().end(rid)
+                    try:  # DASHBOARD-IPC: request_done (+ an open park) -- never the answer's fault
+                        Front._rb_done(self, rid, status)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("WEG2 request_done not built rid=%s: %s: %s", rid, type(e).__name__, e)
+                    m = self.__dict__.get("_front_metrics")
+                    if m is not None:
+                        m.forget(rid)
+        return _wrapped
+
+    def _metrics(self):
+        """TSDB (01.10.): the front's weg2_* instruments (front_metrics). Read-only
+        observations; the optional push rides the IPC writer thread."""
+        m = self.__dict__.get("_front_metrics")
+        if m is None:
+            m = self.__dict__["_front_metrics"] = _front_metrics.FrontMetrics(submit=self._ipc_submit)
+        return m
+
+    async def handle_metrics(self, request: web.Request) -> web.Response:
+        """TSDB: the front's own weg2_* families + P's and D's /metrics, each
+        relabelled weg2_group="P"|"D" (2 s per group; a failed group reads
+        weg2_group_scrape_ok 0). Never raises: a failure here is counted."""
+        GROUP_SCRAPE_TIMEOUT_S = _front_metrics.GROUP_SCRAPE_TIMEOUT_S
+        m = self._metrics()
+        try:
+            _live = {r for g in self.groups.values() for r in (getattr(g, "outstanding", None) or {})}
+            _pn = getattr(self, "_d_phase_n", None)
+            m.set_gauges(queue_len=len(getattr(self, "queue", ()) or ()),
+                         outstanding=len(_live),
+                         d_seats=int(_pn) if _pn is not None else int(getattr(self, "d_bs", 0) or 0),
+                         d_parked=len(getattr(self, "_d_parked", None) or {}),
+                         awake=getattr(self, "awake", None), groups=tuple(self.groups))
+        except Exception as e:  # noqa: BLE001
+            m._err("gauges_read", e)
+
+        async def _one(name):
+            g = self.groups.get(name)
+            if g is None:
+                return name, None
+            try:
+                async with self.session.get(
+                        f"{g.url}{METRICS_PATH}",
+                        timeout=ClientTimeout(total=GROUP_SCRAPE_TIMEOUT_S)) as r:
+                    if r.status != 200:
+                        return name, None
+                    return name, (await r.read()).decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001 - a down/asleep group reads scrape_ok 0
+                return name, None
+
+        texts = await asyncio.gather(*[_one(n) for n in self.groups])
+        body = m.aggregate(list(texts))
+        return web.Response(body=body.encode(), status=200,
+                            headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
+
     def _ipc_failed(self, fn: Callable[..., Any], e: Exception) -> None:
         logger.warning("WEG2 IPC WRITE FAILED %s: %s: %s", getattr(fn, "__name__", fn),
                        type(e).__name__, e)
@@ -6570,6 +6692,8 @@ class Front:
         """An event of the front into the boot's events.jsonl; no state dir = no-op."""
         from sglang.srt.weg2 import front_state_ipc
 
+        if typ in ("flip_done", "flip_first_work", "flip_user_time"):
+            self._metrics().on_event(typ, data)  # TSDB: counted, never raised
         d = envs.WEG2_STATE_DIR.get() or None
         if d:
             self._ipc_submit(front_state_ipc.publish_event, d, typ, data)
@@ -6687,14 +6811,9 @@ class Front:
             Front._ipc_submit(self, functools.partial(Front._ipc_req_push, self), rec)
 
     def _ipc_pusher(self):
-        """TSDB-DELTA 1c: the Influx pusher (env set), its writes in the IPC thread."""
-        p = self.__dict__.get("_ipc_pusher_obj")
-        if p is None:
-            url = envs.SGLANG_WEG2_METRICS_PUSH_URL.get()
-            if not url:
-                return None
-            p = self.__dict__["_ipc_pusher_obj"] = _fmet.InfluxPusher(url, submit=functools.partial(Front._ipc_submit, self))
-        return p
+        """TSDB-DELTA 1c: the ONE Influx pusher (env set) -- the TSDB front metrics'
+        (front_metrics.FrontMetrics.pusher, 30c4c22c3f); its writes in the IPC thread."""
+        return Front._metrics(self).pusher
 
     def _ipc_req_push(self, rec: dict) -> None:
         """Runs in the IPC thread: one ``weg2_req`` line, bundled ~2 s."""
@@ -6704,7 +6823,7 @@ class Front:
         tags, fields = _frq.influx_req_fields(rec)
         tags["model"] = envs.SGLANG_WEG2_METRICS_MODEL.get() or None
         ts = rec.get("end_ts")
-        p.add(_fmet.influx_line("weg2_req", tags, fields,
+        p.add(_front_metrics.influx_line("weg2_req", tags, fields,
                           ts_ns=int(float(ts) * 1e9) if ts is not None else None))
         p.maybe_flush()
 
@@ -6722,46 +6841,6 @@ class Front:
         if D is not None and getattr(self, "dormant_admit", False) and D.outstanding:
             return "dormant_held"
         return "p_phase_end" if queue else "idle"
-
-    def _ipc_out_book(self):
-        """Every open request's arrival and last token (front_state_ipc.OutstandingBook)."""
-        b = self.__dict__.get("_ipc_out_book_obj")
-        if b is None:
-            from sglang.srt.weg2.front_state_ipc import OutstandingBook
-
-            b = self.__dict__["_ipc_out_book_obj"] = OutstandingBook()
-        return b
-
-    def ipc_out_wrap(self, handler):
-        """The rid-end of the outstanding book: every return, exception and
-        cancel of the generate handler takes the rid out (the #243 seam's rid)."""
-        import functools
-
-        @functools.wraps(handler)
-        async def _wrapped(request):
-            status: Any = None
-            try:
-                resp = await handler(request)
-                status = getattr(resp, "status", None)
-                return resp
-            except asyncio.CancelledError:
-                status = "cancelled"
-                raise
-            except BaseException as e:
-                status = f"error:{type(e).__name__}"
-                raise
-            finally:
-                try:
-                    rid = request.get(_hs.RID_KEY)
-                except Exception:  # noqa: BLE001
-                    rid = None
-                if rid:
-                    self._ipc_out_book().end(rid)
-                    try:  # DASHBOARD-IPC: request_done (+ an open park) -- never the answer's fault
-                        Front._rb_done(self, rid, status)
-                    except Exception as e:  # noqa: BLE001
-                        logger.debug("WEG2 request_done not built rid=%s: %s: %s", rid, type(e).__name__, e)
-        return _wrapped
 
     def _park_stuck(self):
         """#287 NEED0 (c): the per-rid park streak (weg2/park_stuck.py)."""
@@ -6827,7 +6906,7 @@ class Front:
         out["d_activity"] = _rb.activity_block()
         out["ttft_by_via"] = _rb.ttft_block()
         _fwc = self.__dict__.get("_ipc_fw_clock")
-        _push = self.__dict__.get("_ipc_pusher_obj")
+        _push = Front._ipc_pusher(self)
         out["request_book"] = {
             "open": len(_rb.rows), "dropped": _rb.dropped, "page_size": _rb.page_size,
             "first_work_stale_skipped": _fwc.stale_skipped if _fwc is not None else 0,
@@ -6935,7 +7014,7 @@ class Front:
                 logger.debug("WEG2 IPC front fields not built: %s: %s", type(e).__name__, e)
                 continue
             self._ipc_submit(front_state_ipc.publish_front_fields, d, fields)
-            _p = self.__dict__.get("_ipc_pusher_obj")
+            _p = Front._ipc_pusher(self)
             if _p is not None:  # TSDB 1c: the last points of a quiet minute go out too
                 _p.maybe_flush()
 
@@ -7416,11 +7495,11 @@ class Front:
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
-        self._ipc_out_book().arrive(rid, time.time())  # state.json front.oldest_outstanding_*
         Front._req_book(self).arrive(rid, time.time(), self.epoch)  # DASHBOARD-IPC: request_done / TTFT
         if _asr.enabled():
             self._asr_arrival_note(rid)  # NF-STAU: the TTFT clocks start here
-        self._sess_note(rid, request, payload)  # SESSION-TRACE
+        self._sess_note(rid, request, payload)  # SESSION-TRACE (after the book's row: session/turn)
+        self._ipc_out_book().arrive(rid, time.time())  # state.json front.oldest_outstanding_* + weg2_ttft_seconds
         # UNIFY S7 (27B RC7-X): the arrival time the idle re-grant's quiet
         # window reads ("did anything arrive in the last window").
         self._x_last_arrival = time.time()
@@ -9190,8 +9269,34 @@ class Front:
             _dp = self._ipc_dp_clock().first_prefill(p.rid, t0, time.time(), d_prefill_seconds(js))
             if _dp is not None:
                 self._ipc_publish("flip_user_time", _dp)
+            self._metrics().served_leg("P", p.rid, time.time() - t0, pt, ct, 0)  # TSDB
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
+            # L15-18 (L3-RETURN stage 2): say whether this prompt's prefix
+            # was known BEFORE this boot, so monitor M2's L3-RETURN check
+            # does not count never-seen prompts as MISS. Gated on
+            # SGLANG_WEG2_PREFIX_FP_PATH: unset -> no line, no file, no cost.
+            # No token ids exist at this point of leg1 (the payload carries
+            # the text), so the source here is p.text, named as src=text.
+            _fp_path = os.environ.get("SGLANG_WEG2_PREFIX_FP_PATH")
+            if _fp_path:
+                try:
+                    from sglang.srt.weg2.prefix_fp import PrefixSeen, fingerprint
+                    _ps = getattr(self, "_prefix_seen", None)
+                    if _ps is None:
+                        _ps = self._prefix_seen = PrefixSeen(_fp_path)
+                        self._prefix_fp_adds = 0
+                    _fp = fingerprint(p.text)
+                    logger.info(
+                        "WEG2-PREFIX-FP rid=%s fp=%s n=%d src=text seen_before_boot=%d",
+                        p.rid, _fp, min(len(p.text), 4096 * 4),
+                        1 if _ps.seen_before(_fp) else 0)
+                    _ps.add(_fp)
+                    self._prefix_fp_adds += 1
+                    if self._prefix_fp_adds % 16 == 0:
+                        _ps.save()
+                except Exception:  # never raise from the serving path
+                    pass
         finally:
             g.outstanding.pop(p.rid, None)
 
@@ -9538,6 +9643,9 @@ class Front:
                             else "d_single" if single_prefill else "after_p")
                     logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f ttft_ms=%.0f",
                                 rid, self.epoch, _via, (time.time() - t0) * 1000.0, _ttft)
+                    # TSDB: leg-2 first content and the TTFT from the front's arrival stamp
+                    self._metrics().leg2_first_content(
+                        rid, _via, time.time() - t0, self._ipc_out_book().arrival.get(str(rid)))
                     # DASHBOARD-IPC: the TTFT per via and its parts (front.ttft_by_via)
                     Front._req_book(self).first_token(rid, time.time(), _via)
                     Front._rb_changed(self)
@@ -9803,6 +9911,7 @@ class Front:
                                                      mark=_pfc_mark0)
                     self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_stream_tail(bytes(tail)), rid=rid)
                     Front._req_book(self).d_prefill_s(rid, dterms.get("prefill_s"))
+                    self._metrics().served_leg("D", rid, time.time() - t0, pt, ct, comp)  # TSDB
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
@@ -9838,6 +9947,7 @@ class Front:
                 dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
                                                  mark=_pfc_mark0)
                 Front._req_book(self).d_prefill_s(rid, dterms.get("prefill_s"))
+                self._metrics().served_leg("D", rid, time.time() - t0, pt, ct, comp)  # TSDB
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
@@ -10799,6 +10909,7 @@ class Front:
 
     def sample_dormant_image(self, group: str, shmem_before: Optional[int],
                              vram_residue_mib: Optional[Dict[str, int]] = None,
+                             l15_held_mib: Optional[Dict[str, int]] = None,
                              persist: bool = True) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
 
@@ -10820,6 +10931,27 @@ class Front:
         weight_tags = (
             host_ledger.WEIGHT_TAGS_P_BYTES if group == "P" else host_ledger.WEIGHT_TAGS_D_BYTES
         ) / host_ledger.GIB
+        # L15-13c: the record must not contain the L1.5 hold.  The next
+        # launch prices D's measured residue per card (launcher's
+        # dormant_other) AND subtracts the hold again as the planner's
+        # own l15 post (L15-01b); keeping the hold here would charge it
+        # twice.  l15_held_mib is the per-card kv_cache bytes still
+        # mapped at sleep (tms_tag_mapped_bytes via the adapter's
+        # tag_mapped_bytes, MiB); absent entry / master off = unchanged.
+        if (
+            group == "D"
+            and vram_residue_mib
+            and l15_held_mib is not None
+            and l15_plan.master_on(os.environ)
+        ):
+            vram_residue_mib = dict(vram_residue_mib)
+            for uuid in list(vram_residue_mib):
+                _r = int(vram_residue_mib[uuid])
+                _h = l15_held_mib.get(uuid)
+                _w = l15_plan.residue_without_hold(_r, None if _h is None else int(_h))
+                if _w != _r:
+                    vram_residue_mib[uuid] = _w
+                    logger.info("L15-RESIDUE record=%d held=%d written=%d uuid=%s", _r, _h, _w, uuid)
         rec = host_ledger.dormant_image_sample(
             group=group,
             shmem_before_bytes=shmem_before,
@@ -11069,6 +11201,24 @@ class Front:
         if src == "D" and dst == "P":
             _live = [q.t_arrive for q in self.queue if getattr(q, "fut", None) is None or not q.fut.done()]
             self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
+            # L15-02b: one shadow line at the D->P hot-handover flip begin.
+            try:
+                import itertools
+
+                from sglang.srt.weg2 import l15_shadow
+
+                if l15_shadow.shadow_on(os.environ):
+                    logger.info(
+                        "HOT-HANDOVER-SHADOW epoch=%d waiting=%d rids=%s",
+                        self.epoch, len(self.queue),
+                        # self.queue is a deque: slice it not, islice it
+                        [
+                            getattr(q, "rid", None)
+                            for q in itertools.islice(self.queue, 8)
+                        ],
+                    )
+            except Exception:  # noqa: BLE001 - shadow must never block a flip
+                pass
         if _fw_none is not None:  # FEHLT 3: the previous flip's woken group never worked
             self._ipc_publish("flip_first_work", _fw_none)
         # H91 part C rule 2: the wake message to D carries the hand-off count
@@ -11232,6 +11382,14 @@ class Front:
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
             return
+        # L15-13c part 2: the sleep reply carries the kv_cache MiB the group
+        # still keeps MAPPED per card (the L1.5 keep-spans, weight_updater).
+        # Capture it HERE -- ``body`` is the sleep answer only until the wake
+        # leg reassigns it -- so both dormant-image stamp sites below can
+        # subtract the hold from the residue instead of the next launch
+        # charging it twice.  Only D runs the L1.5 hold; any other source
+        # keeps the record as measured (parser returns None on no field).
+        _l15_held = l15_held_mib_from_body(body) if src == "D" else None
         family = list(self.weights_tags)
         # #1233 fix 4 ON THE RING FORM.  The tight-card-first order survives the
         # move to gathered legs (C9); the serial per-tag RPC loop it used to
@@ -11497,7 +11655,7 @@ class Front:
             # the flip AWAITS it -- the gate keeps its place, the loop is free
             # (x172-x175: 51-63 ms of ps + nvidia-smi + /proc on the loop). The
             # sidecar append (79-94 ms of JSON) goes to the writer, off the flip.
-            dc, _img = await asyncio.to_thread(self._first_sleep_reading, S, src, shmem_before)
+            dc, _img = await asyncio.to_thread(self._first_sleep_reading, S, src, shmem_before, _l15_held)
             if _img is not None and self.measured_record:
                 self._sidecar_submit(self._persist_dormant_image, _img)
         else:
@@ -11506,7 +11664,7 @@ class Front:
             # #1444: the device residue rides in the dormant-image record, so the
             # NEXT boot prices this form's MEASURED residue instead of the xsn14
             # constant (launcher.dc_residue_from_record).
-            self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc)
+            self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc, l15_held_mib=_l15_held)
         if not dc_off_path:
             for uuid, mib in sorted(dc.items()):
                 logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
@@ -13929,6 +14087,7 @@ def main():
     app.router.add_post("/close_session", front.handle_session_refused)
     for path in PASSTHROUGH_GET:
         app.router.add_get(path, front.handle_passthrough_get)
+    app.router.add_get(METRICS_PATH, front.handle_metrics)  # TSDB: P/D-aggregated
     for path in PASSTHROUGH_POST:
         app.router.add_post(path, front.handle_passthrough_post)
     # #243 seam: the wrapper is the one rid-end site that drops the rid's

@@ -29,9 +29,14 @@ def test_small_container_still_binds_below_ct999():
 
 
 def test_predicted_97_is_under_the_105g_hard_bound():
+    """27B port: the margin is the line's own (resolve_margin, 8.60 GiB on 27B
+    vs NF's smaller one), so the NF y6f specimen 97.0 GiB is not the 27B
+    number. The rule is: a run peak just above the old CT999 bound is refused
+    there and funded under the 105g container mark."""
     margin = hl.resolve_margin()
     hard_bound = hl.reap_mark_gib(105 * 1024**3, "cgroup memory.max") - margin.total_gib
     assert abs(hard_bound - (105.0 - margin.total_gib)) < 1e-9
-    assert 97.0 < hard_bound
-    # the same prediction against the old CT999 mark is refused territory
-    assert 97.0 >= CT999 - margin.total_gib
+    old_bound = CT999 - margin.total_gib
+    predicted = old_bound + 1.0          # refused against the old CT999 mark ...
+    assert predicted >= old_bound
+    assert predicted < hard_bound        # ... funded under the 105g container mark

@@ -89,6 +89,33 @@ def kv_mid_ok(free_bytes, floor_bytes: int, kv_bytes: int, remaining_bytes: int,
 # landing check only ever says "this did not happen", never "this is unsafe".
 
 
+def kv_resume_need_bytes(
+    plan_bytes: Optional[int], mapped_now_bytes: Optional[int]
+) -> Optional[int]:
+    """The bytes the resume will actually have to MAP for a tag.
+
+    ``plan_bytes`` is ``tms_tag_bytes`` -- the full plan, i.e. the bytes the
+    next resume covers INCLUDING the spans TMS keeps mapped while paused
+    (L15-13a, b172a12a6a). ``mapped_now_bytes`` is ``tms_tag_mapped_bytes`` --
+    the bytes physically mapped NOW for the tag, which counts the kept spans
+    while paused. The resume only has to map ``plan - mapped_now``; the kept
+    bytes are already resident, so charging them against the card's free budget
+    (the old check) demanded them twice and produced a false "cannot fit" at
+    every wake with a hold.
+
+    A ``None`` plan is passed through as ``None`` -- no plan, no verdict. A
+    ``None`` mapped figure means the probe is absent (stock hook / older C), in
+    which case the whole plan is what must be mapped: byte-identical to the
+    pre-L15-13b behaviour, so the fix is a strict no-op there. A negative result
+    is clamped to 0 -- a resume never unmaps.
+    """
+    if plan_bytes is None:
+        return None
+    if mapped_now_bytes is None:
+        return int(plan_bytes)
+    return max(0, int(plan_bytes) - int(mapped_now_bytes))
+
+
 def kv_resume_fit_refusal(free_bytes, need_bytes, floor_bytes: int = 0) -> Optional[str]:
     """Name the shortfall when the card cannot possibly map ``need_bytes``.
 

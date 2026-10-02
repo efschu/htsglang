@@ -912,6 +912,10 @@ class Envs:
     # flip_first_work median 1757 (y4k) / 1588 ms (y4l) against 2002 (y4i) --
     # on by default since (user law: a proven switch is on); off via env.
     SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(True)
+    # L3-CSUM (N2, 01.10., hicache_storage.l3_csum_on): a blob's (arena slot
+    # >= 1 MiB, the mamba anchor) disk copy carries a CRC32 sidecar, the L3
+    # fill verifies it; a mismatch is a named MISS. False = no sidecar, no check.
+    SGLANG_WEG2_L3_BLOB_CSUM = EnvBool(True)
     # MAMBA-SNAPSHOT-FENCE (N2, 01.10., hybrid_cache_controller.start_writing):
     # a write op carrying a recurrent-state (mamba) transfer makes the compute
     # stream wait for the op's finish event, so no later forward can mutate the
@@ -1726,6 +1730,11 @@ class Envs:
     # nextflash on (its metal), qwen27b off (upstream keying, the 27B metal);
     # on without a form (the NF code default).
     SGLANG_WEG2_BIGRAM_ANCHOR_EXACT = EnvBool(_profile_default("SGLANG_WEG2_BIGRAM_ANCHOR_EXACT", True))
+    # HANDBACK N-1 claim (27B fe5c55041b, gated RELEASE-HEAD 1002): D claims N
+    # raw tokens on an exact bigram tree. Profile row ``handback_claim_n``
+    # (qwen27b on, nextflash off); on without a form (the 27B line's claim --
+    # NF always runs with its form, whose row turns it off).
+    SGLANG_WEG2_HANDBACK_CLAIM_N = EnvBool(_profile_default("SGLANG_WEG2_HANDBACK_CLAIM_N", True))
     # #49 (27B 196f6a8f57, S7c) behind a switch -- NF P49 c1988ff84f: agent
     # turns priced so that a short tail on a prefix D already holds stays on D.
     # On = (A) request_text renders tools FIRST (the Qwen3.8/Flash-Next template

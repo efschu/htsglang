@@ -272,11 +272,29 @@ class FormASleepHook:
             nbytes = self._tag_bytes(tag)
             if tag == GPU_MEMORY_TYPE_KV_CACHE:
                 # HAZARD 2: ask the card BEFORE the void-ABI resume.
-                from sglang.srt.weg2.wake_kv import kv_resume_fit_refusal
+                from sglang.srt.weg2.wake_kv import (
+                    kv_resume_fit_refusal,
+                    kv_resume_need_bytes,
+                )
 
                 free = self._free_bytes()
+                # L15-13b: with TMS keep spans (L15-13a) a paused kv_cache keeps
+                # its held rows mapped, so the plan (nbytes) double-counts them
+                # against free. Only the not-yet-mapped tail must fit the card; the
+                # held bytes are already resident. Hold off / no mapped symbol =>
+                # _mapped None => need == plan (byte-identical to the old check).
+                # The report step below keeps the plan nbytes (not _need).
+                _mapped = self._tag_mapped_bytes(tag)
+                _need = kv_resume_need_bytes(nbytes, _mapped)
+                if _mapped is not None and _mapped > 0 and self.logger is not None:
+                    self.logger.info(
+                        "L15-WAKE-NEED tag=%s plan=%d MiB mapped=%d MiB need=%d MiB "
+                        "(kept spans excluded)",
+                        tag, (nbytes or 0) >> 20, _mapped >> 20,
+                        int(_need or 0) >> 20,
+                    )
                 why = kv_resume_fit_refusal(
-                    free, nbytes, self.corridor_floor_bytes
+                    free, _need, self.corridor_floor_bytes
                 )
                 if why is not None:
                     report.refused = f"kv_fit: {why}"
@@ -307,6 +325,16 @@ class FormASleepHook:
     def _tag_bytes(self, tag: str) -> Optional[int]:
         try:
             value = self.adapter.tag_bytes(tag)
+        except Exception:  # noqa: BLE001 -- an absent probe is not a verdict
+            return None
+        return None if value is None else int(value)
+
+    def _tag_mapped_bytes(self, tag: str) -> Optional[int]:
+        """L15-13b twin of :meth:`_tag_bytes`: bytes physically mapped NOW for
+        the tag (kept spans count while paused). None when the running hook has
+        no ``tms_tag_mapped_bytes`` symbol -- an absent probe is not a verdict."""
+        try:
+            value = self.adapter.tag_mapped_bytes(tag)
         except Exception:  # noqa: BLE001 -- an absent probe is not a verdict
             return None
         return None if value is None else int(value)

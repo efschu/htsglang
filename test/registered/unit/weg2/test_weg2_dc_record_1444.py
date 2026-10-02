@@ -135,7 +135,7 @@ class Wiring(CustomTestCase):
         fsrc = inspect.getsource(front)
         self.assertIn("dc_residue_from_record(\n        _dc_rec_d, cards, ns.weg2_weight_source)", lsrc)
         self.assertIn('"--weight-form", str(ns.weg2_weight_source)', lsrc)
-        self.assertIn("self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc)", fsrc)
+        self.assertIn("self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc,", fsrc)
         self.assertIn("vram_residue_form=self.weight_form", fsrc)
         self.assertIn('ap.add_argument("--weight-form"', fsrc)
 

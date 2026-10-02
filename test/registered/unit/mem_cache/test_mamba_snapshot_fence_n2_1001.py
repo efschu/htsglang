@@ -159,3 +159,116 @@ def test_an_empty_mamba_transfer_needs_no_fence():
         [PoolTransfer(name=PoolName.MAMBA, host_indices=torch.tensor([], dtype=torch.int64),
                       device_indices=torch.tensor([], dtype=torch.int64))])
     assert hcc._mamba_snapshot_fence_needed(_mamba())
+
+
+# --------------------------------------------------------------------------- STAGE
+# MAMBA-SNAPSHOT-STAGE (N2 01.10.): the fence cost P -26 % prefill (N2 boot
+# 10011623 PP0: a 512-token chunk 190 ms instead of 90, bubble up to 190 ms) --
+# the compute stream waited for the whole async D2H of every chunk anchor. Now
+# the state rows are copied D2D into a staging buffer on the compute stream
+# BEFORE start_event (the snapshot point), the D2H reads the staging copy, and
+# the compute stream never waits for the D2H.
+
+
+class _StagingGroup(_HostPool):
+    def __init__(self, log):
+        super().__init__(log)
+        self.released = []
+
+    def snapshot_mamba_transfers(self, pool_transfers):
+        self.log.append(("snapshot", "compute", "d2d"))
+        staged = [PoolTransfer(name=t.name, host_indices=t.host_indices,
+                               device_indices=torch.arange(int(t.device_indices.numel())))
+                  for t in pool_transfers]
+        return staged, [(self, 0)]
+
+    def snapshot_release(self, tok, ev):
+        self.released.append((tok, ev.name))
+
+
+def test_staged_snapshot_precedes_start_and_the_forward_never_waits_for_the_d2h(monkeypatch):
+    """RED on 3db208a976 (and da33b3c551): the compute stream waits for
+    `finish` -- the D2H -- on every MAMBA write op."""
+    log = _Log()
+    monkeypatch.setattr(hcc, "device_module", _Dev(log))
+    monkeypatch.setattr(hcc, "consume_gate", lambda *a, **kw: True)
+    c = _controller(log, _mamba())
+    c.mem_pool_host = _StagingGroup(log)
+    c.start_writing()
+    log.append(("forward", "compute", "next"))
+    i_snap = log.index(("snapshot", "compute", "d2d"))
+    i_start = log.index(("record", "start", "current"))
+    i_copy = log.index(("copy", "write", "all_layer"))
+    assert i_snap < i_start < i_copy                      # the D2H reads the snapshot
+    assert ("wait", "compute", "finish") not in log      # no wait for the D2H
+    assert c.mem_pool_host.released == [(0, "finish")]   # the slot is reusable after the D2H
+
+
+def test_an_unstageable_op_keeps_the_fence(monkeypatch):
+    log = _Log()
+    monkeypatch.setattr(hcc, "device_module", _Dev(log))
+    monkeypatch.setattr(hcc, "consume_gate", lambda *a, **kw: True)
+    c = _controller(log, _mamba())
+    grp = _StagingGroup(log)
+    grp.snapshot_mamba_transfers = lambda pt: None
+    c.mem_pool_host = grp
+    c.start_writing()
+    assert ("wait", "compute", "finish") in log
+
+
+def _arena_mamba_host(pending_rows=(0,), staging_rows=3):
+    from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost
+
+    hp = object.__new__(ArenaMambaPoolHost)
+    hp.arena = object()
+    hp.staging_rows = staging_rows
+    hp.arena_slots = 8
+    hp._pending = {r: (1, True) for r in pending_rows}
+    return hp
+
+
+class _Dev2:
+    def __init__(self, L=4, rows=6):
+        self.mamba_cache = type("MC", (), {})()
+        self.mamba_cache.temporal = torch.arange(L * rows * 2 * 3, dtype=torch.float32).view(L, rows, 2, 3)
+        self.mamba_cache.conv = [torch.arange(L * rows * 5 * 2, dtype=torch.float32).view(L, rows, 5, 2) + 1000]
+
+
+def test_snapshot_rows_copies_the_rows_and_is_immune_to_later_writes():
+    hp = _arena_mamba_host(pending_rows=(0, 1))
+    dev = _Dev2()
+    host = torch.tensor([3, 4])                 # arena rows 0, 1 (staging_rows=3), both pending
+    didx = torch.tensor([5, 2])
+    shim, idx, tok = hp.snapshot_rows(dev, host, didx)
+    want_t = dev.mamba_cache.temporal[:, [5, 2]].clone()
+    want_c = dev.mamba_cache.conv[0][:, [5, 2]].clone()
+    dev.mamba_cache.temporal.add_(1.0)          # a later forward changes the live rows
+    dev.mamba_cache.conv[0].mul_(0.0)
+    assert torch.equal(shim.mamba_cache.temporal, want_t)
+    assert torch.equal(shim.mamba_cache.conv[0], want_c)
+    assert idx.tolist() == [0, 1]
+    # the write path reads the shim like a device pool: row i of the op
+    assert torch.equal(shim.mamba_cache.temporal[2].index_select(0, idx), want_t[2])
+
+
+def test_snapshot_rows_refuses_what_the_fence_must_keep():
+    dev = _Dev2()
+    assert _arena_mamba_host(pending_rows=()).snapshot_rows(dev, torch.tensor([3]), torch.tensor([1])) is None
+    assert _arena_mamba_host().snapshot_rows(dev, torch.tensor([1]), torch.tensor([1])) is None  # staging row
+    hp = _arena_mamba_host()
+    hp.arena = None
+    assert hp.snapshot_rows(dev, torch.tensor([3]), torch.tensor([1])) is None
+
+
+def test_pool_group_stages_only_mamba_transfers():
+    from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+
+    hp = _arena_mamba_host()
+    dev = _Dev2()
+    grp = object.__new__(HostPoolGroup)
+    grp.entry_map = {PoolName.MAMBA: type("E", (), {"host_pool": hp, "device_pool": dev})()}
+    t = PoolTransfer(name=PoolName.MAMBA, host_indices=torch.tensor([3]), device_indices=torch.tensor([4]))
+    out, toks = grp.snapshot_mamba_transfers([t])
+    assert out[0]._snapshot_pool.mamba_cache.temporal.shape[1] == 1
+    assert out[0].device_indices.tolist() == [0] and toks == [(hp, 0)]
+    assert t.device_indices.tolist() == [4]     # the op's own transfer is not mutated
