@@ -50,6 +50,12 @@ def test_compact_reads_the_new_fields_and_falls_back_to_none():
     assert c["dreqs"] == [["r1", 25000, 120], ["r2", 30000, 7]]
     old = ipcboot.compact({"ts": 1.0, "prefill": {"last": {"t": 1.0}}, "decode": {}})
     assert old["plast_ext"] is None and old["dreqs"] is None
+    # port seat c4c196e729: prefill.last_ext (newest chunk, also untimed; last may be None) wins over last.ext;
+    # decode.reqs = null after a read error reads as "no field in this sample"
+    new = ipcboot.compact({"ts": 1.0, "prefill": {"last": None, "last_ext": [["r9", 0, 512]]}, "decode": {"reqs": None}})
+    assert new["plast_ext"] == [["r9", 0, 512]] and new["dreqs"] is None
+    both = ipcboot.compact({"ts": 1.0, "prefill": {"last": {"t": 1.0, "ext": [["a", 1, 2]]}, "last_ext": [["b", 3, 4]]}})
+    assert both["plast_ext"] == [["b", 3, 4]]
 
 
 def test_prefill_depth_falls_back_to_the_prefix_of_the_first_chunk_and_shows_the_slope():

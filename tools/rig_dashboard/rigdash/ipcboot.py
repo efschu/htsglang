@@ -113,7 +113,10 @@ def compact(rec: dict) -> dict:
         "plast_conly": _n((pre.get("last") or {}).get("compute_only_ms")) if isinstance(pre.get("last"), dict) else None,
         # Nutzer 02.10. ~12:04Z ("token x - y, tok new"): the depth of the newest chunk(s) and the running decode
         # requests -- fields the port seat adds (prefill.last.ext, decode.reqs); None on older builds
-        "plast_ext": _ext_rows((pre.get("last") or {}).get("ext")) if isinstance(pre.get("last"), dict) else None,
+        # port seat c4c196e729: prefill.last_ext = the newest chunk, timed or not (an untimed chunk leaves
+        # prefill.last as it was, and a rank without timer has last = None); else prefill.last.ext
+        "plast_ext": _ext_rows(pre.get("last_ext")) or (_ext_rows((pre.get("last") or {}).get("ext"))
+                                                         if isinstance(pre.get("last"), dict) else None),
         "dreqs": _dreq_rows(dec.get("reqs")),
         "last_bs": _n(dec.get("last_bs")),
         "si_del": _n(cache.get("store_incomplete_delivered")), "si_deliv": _n(cache.get("store_incomplete_deliverable")),
