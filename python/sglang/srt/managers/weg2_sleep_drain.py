@@ -131,6 +131,49 @@ def hold_owned_prefetch(
     return frozenset(str(r) for r in list(ongoing_prefetch) if str(r) in held)
 
 
+#: PDFLIP-A (02.10.): switch of :func:`parked_owned_prefetch` (default on; 0 = off)
+PARKED_PREFETCH_ENV = "SGLANG_WEG2_PARKED_PREFETCH_NOT_A_SLEEP_TERM"
+
+
+def parked_prefetch_on(env=None) -> bool:
+    import os as _os
+
+    e = _os.environ if env is None else env
+    raw = (e.get(PARKED_PREFETCH_ENV, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def parked_owned_prefetch(
+    *,
+    parked: Iterable[object],
+    ongoing_prefetch: Collection[object],
+    env=None,
+) -> FrozenSet[str]:
+    """PDFLIP-A: the open store reads of requests in D's PARK LIST -- not a
+    quiesce / sleep term while D goes to sleep.
+
+    N5d 1002_124821 epoch 6: weg2-6-10 (SHORT on D, 171166 tokens, 169224 of
+    them in L3) was admitted at 12:51:48; its store read (READ-STAGES
+    l3fill_pages=104379 total_ms=15886) was still running when the front parked
+    D at 12:51:58 (``park_running ... queued-behind=['weg2-6-10']``). Every
+    /flush_cache quiesce poll then answered 400 ``hicache_prefetch(1:
+    weg2-6-1)`` (547 polls), FLIP STALL stage=quiesce at 9.8 s, the D->P flip
+    took 14.3 s (layer 12.6 s) -- and the request went into the #1443 hold
+    anyway once the read ended, re-read at the wake.
+
+    A request in the park list is held by the sleep: its read is a storage ->
+    HOST operation whose device half is the wake's load; the release flush's
+    reset terminates and joins the open operation (``#1068 RESET JOIN``) and the
+    #248 hold intake defers the read to the wake. So the read does not hold the
+    flip back. The park list is replicated (``park_running`` is a broadcast
+    control request, every rank parks the same list) and prefetch registration
+    is participation-voted -- the exempt set is the same on every rank."""
+    if not parked_prefetch_on(env) or not parked or not ongoing_prefetch:
+        return frozenset()
+    rids = {str(getattr(r, "rid", "")) for r in parked}
+    return frozenset(str(r) for r in list(ongoing_prefetch) if str(r) in rids)
+
+
 def drain_until_group_verdict(
     *,
     idle_blockers: Callable[[], Sequence[str]],
