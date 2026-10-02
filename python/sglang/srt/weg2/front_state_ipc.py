@@ -407,14 +407,22 @@ class DpFlipClock:
         ``{pid: (forward_ct, t_start_ns, t_done_ns)}``; None = no beacon reading."""
         if self._armed is not None and self._armed["done_ts"] is None:
             self._armed["done_ts"] = float(now)
-            self._armed["beacon_snap"] = dict(beacon_snap) if beacon_snap else None
+            # PDFLIP-E3 (N5f first D->P 13:30:08): P had never run a forward since
+            # the boot, so it had NO beacon file at done -- an empty reading is a
+            # baseline of 0 (every file that appears is that rank's first forward),
+            # not "no beacon". None = beacon off / unreadable.
+            self._armed["beacon_snap"] = None if beacon_snap is None else dict(beacon_snap)
             self._armed["beacon_first"] = {}
 
     def waits_for_beacon(self) -> bool:
         """Until every P rank rose (the end is known at the first; the last
         stage's start completes the decomposition)."""
         a = self._armed
-        return bool(a is not None and a.get("beacon_snap") and a.get("pp_last_ts") is None)
+        if a is None or a.get("beacon_snap") is None:
+            return False
+        if not a["beacon_snap"]:                    # empty baseline: the end is all we can know
+            return a.get("pp_first_ts") is None
+        return a.get("pp_last_ts") is None
 
     def first_forward_ts(self) -> Optional[float]:
         """PDFLIP-E2: the D->P end -- the FIRST P rank's first forward after the
@@ -434,23 +442,26 @@ class DpFlipClock:
         (``pp_first_ts``); once every rank rose, the latest = ``pp_last_ts``,
         kept for the decomposition only. Returns ``pp_first_ts`` once known."""
         a = self._armed
-        if a is None or not a.get("beacon_snap"):
+        if a is None or a.get("beacon_snap") is None:
             return None
         if a.get("pp_last_ts") is not None:
             return a.get("pp_first_ts")
         first = a.setdefault("beacon_first", {})
-        for pid, (ct0, _ts0, _td0) in a["beacon_snap"].items():
+        snap = a["beacon_snap"]
+        # PDFLIP-E3: a rank absent from the done reading has forward_ct 0 there
+        for pid in set(snap) | (set(cur) if not snap else set()):
+            ct0 = int(snap.get(pid, (0, 0, 0))[0])
             if pid in first:
                 continue
             row = cur.get(pid)
-            if row is None or int(row[0]) <= int(ct0):
+            if row is None or int(row[0]) <= ct0:
                 continue
-            first[pid] = (float(row[1]) / 1e9, int(row[0]) - int(ct0) > 1)
+            first[pid] = (float(row[1]) / 1e9, int(row[0]) - ct0 > 1)
         if first:
             t0, ap0 = min(first.values(), key=lambda x: x[0])
             if a.get("pp_first_ts") is None or t0 < a["pp_first_ts"]:
                 a["pp_first_ts"], a["pp_first_approx"] = t0, ap0
-        if len(first) == len(a["beacon_snap"]):
+        if snap and len(first) == len(snap):
             a["pp_last_ts"] = max(t for t, _ in first.values())
         return a.get("pp_first_ts")
 
