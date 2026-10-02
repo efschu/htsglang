@@ -40,7 +40,10 @@ from sglang.srt.weg2 import launcher as L
 from sglang.srt.weg2 import xchg_census as XC
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint_base_3fe878018d.json")
+# NF y7 line (desk/nf-y7j-hwgen-1002): the golden is re-derived on THIS line's base
+# e7a70285bd (y7h + H4 fix + big_cards fix), the tree without HW-GENERIC; the
+# 3fe878018d golden stays beside it for the release-tree line.
+GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint_base_e7a70285bd.json")
 MIB = 1 << 20
 
 
@@ -87,7 +90,7 @@ class RegressionGateReferenceRig(unittest.TestCase):
         now = json.loads(json.dumps(FP.fingerprint(), sort_keys=True, default=str))
         self.assertEqual(sorted(now), sorted(golden))
         for key in sorted(golden):
-            self.assertEqual(now[key], golden[key], f"plan fingerprint {key!r} differs from base 3fe878018d")
+            self.assertEqual(now[key], golden[key], f"plan fingerprint {key!r} differs from base e7a70285bd")
 
     def test_order_is_the_old_5090_first_then_3080s_by_nvml_index(self):
         o = L.order_cards(rig())

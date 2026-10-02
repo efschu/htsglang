@@ -53,7 +53,10 @@ def rig_cards(L):
 def fingerprint():
     from sglang.srt.weg2 import form as F
     from sglang.srt.weg2 import launcher as L
-    from sglang.srt.weg2 import l15_plan
+    try:  # the NF y7 line carries no L15 (27B release feature) -- recorded as absent
+        from sglang.srt.weg2 import l15_plan
+    except ImportError:
+        l15_plan = None
     from sglang.srt.weg2 import xchg_census as XC
 
     fp = {}
@@ -105,11 +108,17 @@ def fingerprint():
         rest = L.d_awake_rest(cards, prof)
         pf["d_awake_rest"] = [list(rest[0]) if rest[0] is not None else None, str(rest[1])]
         try:
+            if l15_plan is None:
+                raise ImportError("weg2.l15_plan not in this tree")
             posts = l15_plan.resolve_posts(prof, list(budgets), [None] * len(cards), dict(L15_ENV))
             pf["l15_posts"] = [[p.card, p.mib, p.src, p.experts_rows_traded] for p in posts]
         except Exception as exc:  # noqa: BLE001 - recorded, compared like a value
             pf["l15_posts"] = f"{type(exc).__name__}: {exc}"
         ckpt = F.profile_row("qwen27b").formats["int8"].checkpoint
+        if not hasattr(L, "resolve_pp_cut_stage_model"):
+            # NF y7 line: PP-COST stage model (27B release 01.10.) not in this tree
+            pf["pp_cut_stage_model_auto"] = "absent"
+            continue
         try:
             m, why = L.resolve_pp_cut_stage_model("auto", prof, ckpt,
                                                   inventory=("RTX5090", "RTX3080", "RTX3080"))
