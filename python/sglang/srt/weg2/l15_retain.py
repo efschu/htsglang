@@ -143,6 +143,14 @@ def reserve_mamba_slots(mamba_allocator, slots: Sequence[int]) -> int:
         )
     take = torch.tensor(distinct, dtype=torch.int64, device=free.device)
     mamba_allocator.free_slots = free[~torch.isin(free, take)]
+    # L15-MAMBA-LEDGER: the #924 ownership ledger must see the reserved
+    # slots as USED. Carving them out of free_slots alone left slot_used
+    # False, so the first legitimate release of a held/adopted anchor (node
+    # eviction, request finish) was refused as a double free
+    # (MambaSlotDoubleFree raises -> rank death).
+    used = getattr(mamba_allocator, "slot_used", None)
+    if used is not None:
+        used[take.to(used.device)] = True
     return len(distinct)
 
 
