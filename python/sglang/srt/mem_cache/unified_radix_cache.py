@@ -812,6 +812,67 @@ from sglang.srt.weg2.p_trim_end_anchor import (  # noqa: E402
 )
 
 
+#: CENSUS-DEFER (02.10., N6d ..._ec4d492f58: WEG2-TREE-RESET-SUB census=19-24 ms
+#: of a 34-48 ms tree reset on every P rank, inside the P>D quiesce): the
+#: at=reset ARENA-REF-HOLDERS census -- an instrument, no branch reads it --
+#: runs this many seconds after the reset in a one-shot timer thread, not in the
+#: flush. The flip (~2.5 s) is over by then and the group sleeps; the census
+#: already tolerates a scheduler moving under it (snapshot=torn, the 60 s census
+#: thread runs the same walk). The line names deferred_s. 0 = in the reset, as before.
+WEG2_RESET_CENSUS_DEFER_ENV = "SGLANG_WEG2_RESET_CENSUS_DEFER_S"
+
+
+def _weg2_reset_census_defer_s() -> float:
+    raw = os.environ.get(WEG2_RESET_CENSUS_DEFER_ENV, "")
+    try:
+        return max(0.0, float(raw)) if str(raw).strip() else 5.0
+    except ValueError:
+        return 5.0
+
+
+#: ORPHAN-OWN (02.10., N6d: WEG2-TREE-RESET-SUB orphans=7-9 ms on PP0, 12.2 on
+#: PP1/PP2): the #1424g give-back computed held - named over EVERY slot of the
+#: arena (zeros + clone + subtract + clamp + nonzero over 720896 slots per pool)
+#: although only the slots this process holds a reference on can be orphans. It
+#: now reads those slots once (nonzero of the ledger), counts the holders' names
+#: on them only, and returns at once when this process holds nothing. Same
+#: answer (orphan = max(held - named, 0) is 0 wherever held is 0).
+#: 0 = the dense form, as before.
+WEG2_ORPHAN_OWN_ENV = "SGLANG_WEG2_ORPHAN_OWN_SLOTS"
+
+
+def _weg2_orphan_own_on() -> bool:
+    return str(os.environ.get(WEG2_ORPHAN_OWN_ENV, "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+class _Weg2NamedSlots:
+    """ORPHAN-OWN: stands where the dense ``named`` tensor stands for
+    ``_weg2_name_holders`` -- collects the named slots instead of adding
+    them into a tensor the size of the arena."""
+
+    def __init__(self, n: int):
+        self.n = int(n)
+        self.parts: list = []
+
+    def numel(self) -> int:
+        return self.n
+
+    def index_add_(self, dim, index, source) -> "_Weg2NamedSlots":
+        self.parts.append(index.reshape(-1).to(torch.int64))
+        return self
+
+    def counts_at(self, own: "torch.Tensor") -> "torch.Tensor":
+        """Names per slot of ``own`` (sorted ascending, as nonzero returns it)."""
+        k = int(own.numel())
+        if not self.parts or k == 0:
+            return torch.zeros(k, dtype=torch.int64)
+        cat = torch.cat(self.parts)
+        pos = torch.searchsorted(own, cat).clamp(max=k - 1)
+        hit = own[pos] == cat
+        return torch.bincount(pos[hit], minlength=k).to(torch.int64)
+
+
 def _weg2_carrier_hold_on() -> bool:
     """H81: does the flip's reset hold the phase's END anchors (see
     `UnifiedRadixCache._weg2_carrier_rotate`)? Group P of a weg2 boot, only
@@ -1881,16 +1942,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             led = getattr(arena, "_ledger", None)
             if led is None:
                 continue
-            named = torch.zeros(int(led.held.numel()), dtype=torch.int64)
-            for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
-                tree._weg2_name_holders(arena, named)
-            with led.lock:
-                held = led.held.to(torch.int64).clone()
-            orphan = (held - named).clamp_min(0)
-            slots = torch.nonzero(orphan).reshape(-1)
-            if slots.numel() == 0:
-                continue
-            multi = torch.repeat_interleave(slots, orphan[slots])
+            if _weg2_orphan_own_on():
+                # ORPHAN-OWN: only the slots this process references can be orphans
+                with led.lock:
+                    if not bool(led.held.any()):
+                        continue
+                named_s = _Weg2NamedSlots(int(led.held.numel()))
+                for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
+                    tree._weg2_name_holders(arena, named_s)
+                with led.lock:
+                    own = torch.nonzero(led.held).reshape(-1)
+                    held_own = led.held[own].to(torch.int64)
+                orphan_own = (held_own - named_s.counts_at(own)).clamp_min(0)
+                hit = orphan_own > 0
+                slots = own[hit]
+                if slots.numel() == 0:
+                    continue
+                multi = torch.repeat_interleave(slots, orphan_own[hit])
+            else:
+                named = torch.zeros(int(led.held.numel()), dtype=torch.int64)
+                for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
+                    tree._weg2_name_holders(arena, named)
+                with led.lock:
+                    held = led.held.to(torch.int64).clone()
+                orphan = (held - named).clamp_min(0)
+                slots = torch.nonzero(orphan).reshape(-1)
+                if slots.numel() == 0:
+                    continue
+                multi = torch.repeat_interleave(slots, orphan[slots])
             given = int(arena.ref_slots_np(multi.numpy(), -1))
             done[ct] = int(done.get(ct, 0)) + given
             total += given
@@ -2072,7 +2151,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 + f"{_hp.census(pool, refresh=refresh)}")
         return "; ".join(lines) or None
 
-    def _weg2_log_holder_census(self, where: str) -> None:
+    def _weg2_log_holder_census(self, where: str, deferred_s: float = 0.0) -> None:
+        if where == "reset" and not deferred_s:
+            defer = _weg2_reset_census_defer_s()
+            if defer > 0:
+                # CENSUS-DEFER: the newest reset's census replaces a pending one
+                old = self.__dict__.get("_weg2_census_timer")
+                if old is not None:
+                    old.cancel()
+                t = threading.Timer(defer, self._weg2_log_holder_census, args=(where, defer))
+                t.daemon = True
+                t.name = "weg2-reset-census"
+                self._weg2_census_timer = t
+                t.start()
+                return
+        if deferred_s:
+            try:  # CENSUS-DEFER: an arena unmapped since the reset is never read
+                if any(getattr(getattr(p.arena, "_mm", None), "closed", False)
+                       for p in self._weg2_arena_pools().values()):
+                    return
+            except Exception:  # noqa: BLE001 - an instrument never raises
+                return
         try:
             # PDFLIP-H: the reset's census (inside every sleep flush) never
             # re-hashes the hand-off keep -- handoff_pending.census(refresh=False)
@@ -2080,8 +2179,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception as exc:  # noqa: BLE001 - an instrument never breaks a reset
             line = f"failed={exc!r}"
         if line:
-            logger.info("ARENA-REF-HOLDERS at=%s %s (#1424e: gap = own_held - sum, this "
-                        "process's references no class names)", where, line)
+            logger.info("ARENA-REF-HOLDERS at=%s %s%s (#1424e: gap = own_held - sum, this "
+                        "process's references no class names)", where, line,
+                        " deferred_s=%.1f" % deferred_s if deferred_s else "")
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
