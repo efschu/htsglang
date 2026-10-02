@@ -25740,6 +25740,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
+    # L3-INDEX PRICE (02.10.): the front asks the shared L3 stem index with the
+    # groups' own page-key scheme and arena dir (group_env's values, so the
+    # credit is what P/D read).
+    if ns.hicache_bigram_keys:
+        fenv["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
+    else:
+        fenv.pop("SGLANG_HICACHE_BIGRAM_KEYS", None)
+    fenv.setdefault("SGLANG_HICACHE_ARENA_DIR", f"/dev/shm/weg2-arena-{ns.tag}")
     # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
     # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
     #

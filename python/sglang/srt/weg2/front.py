@@ -3925,6 +3925,10 @@ class Front:
             self.ftok = FrontTokens()
             self.tspans = TokenSpans(agent_span=self.spans.agent_span,
                                      anchor_page=envs.SGLANG_WEG2_FRONT_ANCHOR_PAGE.get())
+        #: L3-INDEX PRICE (02.10.): the page-granular store prefix of an arrival
+        #: (weg2/front_store.py), opened after the tokenizer; None = no credit.
+        self.store_probe = None
+        self._store_probe_why = "not opened"
         # NF (P49): a boot with the switch on says so once. Off prints nothing,
         # so an off boot's front log keeps the pre-P49 lines (the arm's env
         # line is the off witness).
@@ -5608,6 +5612,67 @@ class Front:
             info.get("chat_template_default_kwargs"), info.get("reasoning_parser"),
             info.get("tool_call_parser"), int(is_mm),
             int(bool(envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.get())), ft.why, ft.load_s)
+        self._store_probe_info = info
+        await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)
+
+    #: L3-INDEX PRICE: a probe that could not open is retried at most this often
+    STORE_PROBE_RETRY_S = 30.0
+
+    def _store_probe_open(self) -> None:
+        """L3-INDEX PRICE: join the shared L3 stem index the ranks opened (worker
+        thread). Page size and hybrid-ness from the group's server args; the
+        bigram key scheme and the arena dir from the env the launcher hands the
+        front (the groups' own values)."""
+        from sglang.srt.weg2.front_store import open_store_presence
+
+        info = self.__dict__.get("_store_probe_info") or {}
+        self._store_probe_t = time.monotonic()
+        arena_dir = os.environ.get("SGLANG_HICACHE_ARENA_DIR")
+        if arena_dir is None:
+            arena_dir = f"/dev/shm/weg2-arena-{self.tag}"  # the launcher's group default
+        spec = str(info.get("speculative_algorithm") or "").upper()
+        bigram = (os.environ.get("SGLANG_HICACHE_BIGRAM_KEYS", "") == "1"
+                  or spec in ("EAGLE", "EAGLE3", "NEXTN", "DFLASH", "STANDALONE"))
+        probe, why = open_store_presence(
+            store_dir=self.store_dir, arena_dir=arena_dir.strip(),
+            page_size=int(info.get("page_size") or envs.SGLANG_WEG2_FRONT_ANCHOR_PAGE.get()),
+            bigram=bigram, hybrid=bool(info.get("uses_mamba_radix_cache")))
+        self.store_probe, self._store_probe_why = probe, why
+        if probe is not None:
+            logger.info("WEG2 L3-INDEX-PRICE armed %s -- an arrival's credit is the page-granular "
+                        "store prefix of its exact ids (keys as P/D read them), earlier boots and "
+                        "this one alike (src=l3_index)", why)
+        else:
+            logger.warning("WEG2 L3-INDEX-PRICE n/a: %s -- no store credit at arrival (retried "
+                           "every %.0f s)", why, self.STORE_PROBE_RETRY_S)
+
+    async def _store_probe_depth(self, rid: str, ids: Any, timeout_s: float) -> int:
+        """L3-INDEX PRICE: the store depth of ``ids`` in tokens (0 = none or
+        not askable), asked in the front tokenizer's worker thread."""
+        ft = self.ftok
+        if self.__dict__.get("store_probe") is None:
+            t = self.__dict__.get("_store_probe_t")
+            if t is None or time.monotonic() - t < self.STORE_PROBE_RETRY_S:
+                return 0
+            await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)
+            if self.store_probe is None:
+                return 0
+        try:
+            d = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(ft.executor, self.store_probe.depth, ids),
+                timeout=max(0.05, timeout_s))
+        except Exception as e:  # noqa: BLE001 -- no credit, named; the price stands
+            self.counters["l3_index_price_failed"] += 1
+            logger.info("WEG2 L3-INDEX-PRICE rid=%s FAILED %s: %s (no store credit)",
+                        rid, type(e).__name__, str(e)[:160])
+            return 0
+        self.counters["l3_index_probes"] += 1
+        if d.tokens > 0:
+            logger.info("WEG2 L3-INDEX-PRESENCE rid=%s depth=%d pages=%d kv_pages=%d tokens=%d "
+                        "probe_ms=%.1f (the shared store holds these leading pages with their "
+                        "anchor -- what P/D read for this prompt)", rid, d.tokens, d.pages,
+                        d.kv_pages, int(ids.size), d.ms)
+        return int(d.tokens)
 
     async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
                              est_uncached: int, est_prompt: int, multimodal: bool = False):
@@ -5644,6 +5709,15 @@ class Front:
             return None
         ft.remember(text, c.ids)
         self._sess_prefix(rid, c.ids)  # SESSION-TRACE
+        # L3-INDEX PRICE (y7d weg2-0-2 / 2-19): the page-granular store prefix
+        # of these exact ids, earlier boots and this one -- a store fact like
+        # P's END-ANCHOR, recorded before the measured prefix is read.
+        l3 = await self._store_probe_depth(
+            rid, c.ids, envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
+            - (time.monotonic() - t0))
+        if l3 > 0 and self.tspans.record_store_depth(c.ids, l3, source="l3_index") > 0:
+            self.counters["l3_index_credit"] += 1
+            self.counters["l3_index_credit_tokens"] += int(l3)
         # the epoch is read AFTER the count: a flip during it ends the held credit
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
         pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
@@ -7256,6 +7330,9 @@ class Front:
                 "d_inflight_tokens": int(self.counters["presence_d_inflight_tokens"]),
                 "d_inflight_retracted": int(self.counters["presence_d_inflight_retracted"]),
                 "d_inflight_park_capped": int(self.counters["presence_d_inflight_park_capped"]),
+                # L3-INDEX PRICE (02.10.): arrivals credited by the store's page prefix
+                "l3_index": int(self.counters["l3_index_credit"]),
+                "l3_index_tokens": int(self.counters["l3_index_credit_tokens"]),
             },
             "corridor_min_mib": {k: dict(v) for k, v in self.corridor_min.items()},
             # Same instrument and band as the WEG2-CORRIDOR log line: a reader
