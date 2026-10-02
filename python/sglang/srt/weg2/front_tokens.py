@@ -399,6 +399,9 @@ class TokenSpans:
         #: below its end anchor), recorded with the P-anchor witness; beside the entry like
         #: :attr:`published`. :meth:`pending` credits the deepest one on the new text's shared path.
         self.inner: Dict[str, Tuple[int, ...]] = {}
+        #: STORE-PRESENCE (NF ba76adffe2, ported 02.10.): key -> label of an entry recorded as a
+        #: store anchor (P's END-ANCHOR published by P's sleep flush); a finish reading replaces it.
+        self.store_keys: Dict[str, str] = {}
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -425,6 +428,7 @@ class TokenSpans:
         key = self._key(ids)
         self.entries.pop(key, None)
         self.depth_caps.pop(key, None)
+        self.store_keys.pop(key, None)  # STORE-PRESENCE: D's finish reading replaces the label
         # #49 L2: a NEW D reading of this text supersedes its published depth -- a W31 refusal's small
         # cached_tokens retracts an over-credit here, D itself being the witness
         self.published.pop(key, None)
@@ -460,7 +464,8 @@ class TokenSpans:
         return max(0, int(n)) // self.anchor_page * self.anchor_page
 
     def record_store_anchor(self, ids: Optional[np.ndarray], prompt_tokens: int = 0,
-                            inner: Optional[Sequence[int]] = None, inner_keep: int = 0) -> int:
+                            inner: Optional[Sequence[int]] = None, inner_keep: int = 0,
+                            source: Optional[str] = None) -> int:
         """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE):
         P's END-ANCHOR of ``ids`` is in the store and D resumed from it -- the
         caller calls this only at the first content of an ``after_p`` leg 2,
@@ -480,6 +485,9 @@ class TokenSpans:
             return 0
         key = self._key(ids)
         old = self.entries.pop(key, None)
+        if source:
+            # STORE-PRESENCE: the witness label pending() names (a finish reading replaces it)
+            self.store_keys[key] = str(source)
         if old is None:
             self.entries[key] = (ids, anchor, 0, None)
             self.depth_caps[key] = anchor
@@ -540,6 +548,7 @@ class TokenSpans:
             self.published.pop(old_key, None)
             self.inner.pop(old_key, None)
             self.entry_seq.pop(old_key, None)
+            self.store_keys.pop(old_key, None)
 
     def record_inflight(self, ids: Optional[np.ndarray], held_epoch: Optional[int]) -> None:
         if ids is None or ids.size == 0 or held_epoch is None:
@@ -603,5 +612,6 @@ class TokenSpans:
                     credit = int(on_path[-1])  # #49 L3: the deepest inner anchor on the shared path
             if credit > best:
                 best = credit
-                src = "d_served_epoch" if held and credit > ct else "d_leg2_cached"
+                src = ("d_served_epoch" if held and credit > ct
+                       else self.store_keys.get(key, "d_leg2_cached"))
         return max(0, int(ids.size) - best), best, known, src

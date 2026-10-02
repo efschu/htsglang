@@ -700,6 +700,9 @@ def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
         if (cap is not None and int(cap) in lost) or (cap is None and ct in lost):
             entries.pop(key, None)
             caps.pop(key, None)
+            sk = getattr(spans, "store_keys", None)
+            if sk is not None:
+                sk.pop(key, None)  # STORE-PRESENCE label of a retracted entry
             gone.append(key)
     return gone
 
@@ -3280,6 +3283,10 @@ class Pending:
     #: (Front._x_idle_regrant) serves it on D once D is idle and quiet.
     #: Only set under SGLANG_WEG2_X_IDLE_REGRANT (profile qwen27b).
     x_deferred: bool = False
+    #: STORE-PRESENCE reprice (27B port): this request's OWN route verdict was LONG (uncached > X
+    #: at its price). A re-price to <= X makes it a SHORT (d_eligible); a SHORT that D's #915
+    #: budget refused at arrival is NOT one (RC2 review: it stays out of the D-short drain).
+    route_long: bool = False
     #: set when that drain handed it to D: its leg 2 then runs exactly as the
     #: SHORT route's (pending=None -- no leg 1 ever ran for it).
     d_direct: bool = False
@@ -5772,7 +5779,8 @@ class Front:
         here. Not re-priced: a request whose leg 1 is done or skipped, a
         P-only one, one D refused over X (``x_requeues``: D's own extent
         stands) and one priced by the chars/3 fallback (no ids). Routing
-        eligibility is NOT changed -- only the number. Returns the count."""
+        eligibility changes only for a LONG re-priced to <= X (STORE-PRESENCE
+        02.10.: it becomes d_eligible, a SHORT). Returns the count."""
         if not self.x_exact or self.ftok is None or self.tspans is None:
             return 0
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
@@ -5791,6 +5799,21 @@ class Front:
             p.est_uncached = int(new)
             n += 1
             self.counters["x_exact_repriced"] += 1
+            _short_now = False
+            if (new <= x and new < old and not p.d_eligible
+                    and (old > x or getattr(p, "route_long", False))
+                    and not p.reroutes and not p.x_deferred and not p.intake_stalled
+                    and not p.client_gone and not p.dual_requeued and not p.dual_pause):
+                # STORE-PRESENCE (NF ba76adffe2, ported 02.10.): the new price is <= X on a
+                # realised store prefix -- the request is a SHORT now, so a D phase may serve it
+                # (27B: D-SHORT-DRAIN / X-IDLE-REGRANT read d_eligible) instead of waking P for it.
+                # In a P phase P's batch takes it anyway (law 1). 27B: X moves during a boot, so
+                # a LONG priced over the X of its arrival counts too, not only a crossing of the
+                # X in force (b6a878f145 weg2-28-45: 'X-EXACT-REPRICE ... 4971 -> 209 X=8452
+                # crossed=no', then a D->P flip for 159 real tokens).
+                p.d_eligible = True
+                _short_now = True
+                self.counters["x_exact_reprice_short"] += 1
             logger.info("WEG2 X-EXACT-REPRICE rid=%s why=%s est_uncached %d -> %d X=%d "
                         "crossed=%s src=%s epoch=%s (queued request re-priced against the "
                         "current measured cached-on-D prefix; routing flags unchanged)",
@@ -6185,6 +6208,69 @@ class Front:
         logger.info("WEG2 X-EXACT-BACKFILL rid=%s reason=%s tokens=%d count_ms=%.1f wait_ms=%.1f (priced by "
                     "chars/3 at arrival; its exact ids now feed this request's presence records: P anchor, "
                     "D reading)", rid, reason, c.n, c.ms, (time.monotonic() - t0) * 1000.0)
+
+    def _p_leg1_store_note(self, rid: str, text: str, prompt_tokens: int) -> None:
+        """STORE-PRESENCE (NF ba76adffe2, ported 02.10.): a P leg 1 served in this P phase; its
+        END-ANCHOR is in the shared store once P's sleep flush publishes (see
+        :meth:`_p_flush_store_presence`). Behind the K1 switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE
+        -- the same fact (P's END-ANCHOR is a store presence), witnessed one flush earlier than
+        K1's first content."""
+        if (not getattr(self, "x_exact", False) or getattr(self, "tspans", None) is None
+                or getattr(self, "dual_layout", False)  # no P sleep flush in the dual layout
+                or not envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get()):
+            return
+        served = self.__dict__.setdefault("_p_phase_served", collections.OrderedDict())
+        served[rid] = (text, int(prompt_tokens or 0))
+        while len(served) > 256:  # one P phase's legs (texts are large: bounded)
+            served.popitem(last=False)
+
+    def _p_flush_store_presence(self, lost: Sequence[int] = ()) -> int:
+        """STORE-PRESENCE (user law 02.10.: the credit is the STORE prefix, L2/L3 are shared --
+        no group-local presence). P's sleep leg returned 200: its flush published every
+        un-backed node BEFORE the reset ('#1470 FLUSH-PUBLISH ... unbacked_left=0' on every 27B
+        P flush of b6a878f145), so the END-ANCHOR of every P leg 1 of the phase is readable from
+        L2/L3 by either group. Each is recorded as a store presence (``src=store_anchor``), beyond
+        the epoch, before any D leg 2 of the phase has content. An anchor the flush reports lost
+        ('WEG2-ANCHOR-LOST at=flush depths=[...]') is skipped.
+
+        27B b6a878f145 weg2-28-45 (07:39:11.692, D phase): P served weg2-26-43 (55607) at
+        07:39:06.964, P's sleep flush ran in the flip that was done at 07:39:09.461; 28-45
+        (reused=55607) priced credit 50790 -> LONG 4971 > X=4096; K1's witness (D's first content
+        of 26-43) came only at 07:39:12.105 -- now credit 55552 at the flush, pending 209, SHORT.
+        weg2-12-13 (07:35:16.618): 0-4's END-ANCHOR 45248 (P leg 1 in epoch 1, its leg 2 ended
+        unpriced, K1 never fired) -- now pending 1148 <= X=9132."""
+        served = self.__dict__.get("_p_phase_served")
+        ts = getattr(self, "tspans", None)
+        ft = getattr(self, "ftok", None)
+        if not served or ts is None or ft is None:
+            if served:
+                served.clear()
+            return 0
+        lost_set = {int(d) for d in lost or ()}
+        n, tokens, rids = 0, 0, []
+        for rid, (text, pt) in list(served.items()):
+            ids = ft.ids_for(text)
+            if ids is None:
+                self.counters["store_presence_no_ids"] += 1
+                continue
+            n_eff = min(int(ids.size), int(pt)) if int(pt) > 0 else int(ids.size)
+            if ts.own_anchor(n_eff) in lost_set:
+                self.counters["store_presence_lost"] += 1
+                continue
+            anchor = ts.record_store_anchor(ids, pt, source="store_anchor")
+            if anchor > 0:
+                n += 1
+                tokens += anchor
+                rids.append(f"{rid}:{anchor}")
+        served.clear()
+        self.counters["store_presence"] += n
+        self.counters["store_presence_tokens"] += tokens
+        if n:
+            logger.info("WEG2 STORE-PRESENCE src=p_flush n=%d epoch=%d anchors=%s (P's sleep flush "
+                        "published these END-ANCHORs to L2/L3: a store prefix either group reads -- "
+                        "priced as src=store_anchor)", n, self.epoch, rids[:16])
+            self._x_exact_reprice_queue("store_presence")
+        return n
 
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
                         held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
@@ -7862,7 +7948,8 @@ class Front:
                     # closed batch gate stops every SHORT arrival behind it --
                     # also the ones that fit -- until D's running decodes end,
                     # up to --drain-deadline-s each. Today's path keeps it here.
-                    d_eligible=short_ok and not short_refused)
+                    d_eligible=short_ok and not short_refused,
+                    route_long=route == "long")
         if _sk and self.awake == "D" and self.admit_d and self.state == "serving":
             # SK: D is awake -- the kept SHORT waits in D's own admission line,
             # BEHIND the batch work that held the gate (no overtaking, no flip
@@ -8554,6 +8641,10 @@ class Front:
             self._metrics().served_leg("P", p.rid, time.time() - t0, pt, ct, 0)  # TSDB
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
+            # STORE-PRESENCE (NF ba76adffe2): ids for a fallback-priced rid NOW (before P's sleep
+            # flush, not only at its leg 2), and P's END-ANCHOR noted for the flush
+            await self._x_exact_backfill(p.rid, p.path, p.payload, p.text)
+            self._p_leg1_store_note(p.rid, p.text, pt)
             # L15-18 (L3-RETURN stage 2): say whether this prompt's prefix
             # was known BEFORE this boot, so monitor M2's L3-RETURN check
             # does not count never-seen prompts as MISS. Gated on
@@ -10848,6 +10939,9 @@ class Front:
         w_done, w_per_tag, w_crit = completed_tags(w_body)
         if src == "D":
             self._retract_lost_anchors(anchors_lost(s_body))
+        elif src == "P" and s_code == 200:
+            # STORE-PRESENCE: P's flush published its END-ANCHORs (L2/L3, shared)
+            self._p_flush_store_presence(anchors_lost(s_body))
         sleep_ms += s_ms
         wake_ms += w_ms
         if s_code != 200 or w_code != 200:
