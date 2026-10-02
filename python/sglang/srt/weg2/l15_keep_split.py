@@ -124,7 +124,14 @@ def keep_extents(base_ptr: int, ranges: Sequence[Tuple[int, int]]
                  ) -> Optional[List[Tuple[int, int]]]:
     """The WHOLE hold extents covering ``ranges`` on a split base, or None
     when the base is not split or a range leaves the hold region (the arm
-    must then refuse: a partial extent would be dropped by the pause)."""
+    must then refuse: a partial extent would be dropped by the pause).
+
+    L15-FIX-CAP0-SPLIT (N3y 08:41:17Z): nothing to keep is always keepable --
+    the cap-0 rank arms EMPTY windows (L15-FIX-CAP0-KEEP) on bases it never
+    split; refusing them discarded its manifest, so it voted None and EVERY
+    wake fell back (verdict=fallback on the whole group)."""
+    if not any(int(hi) > int(lo) for lo, hi in ranges):
+        return []
     holds = _HOLD.get(int(base_ptr))
     if not holds:
         return None
