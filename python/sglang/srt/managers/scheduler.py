@@ -1599,6 +1599,22 @@ def _weg2_store_presence(
     return present
 
 
+def _weg2_parked_owned_prefetch_of(sched) -> frozenset:
+    """PDFLIP-A: open prefetch records of requests in D's park list (empty off
+    D's park, without HiCache, or on any error -- the old verdict stands)."""
+    try:
+        from sglang.srt.managers.weg2_sleep_drain import parked_owned_prefetch
+
+        tc = getattr(sched, "tree_cache", None)
+        if not getattr(sched, "enable_hierarchical_cache", False) or tc is None:
+            return frozenset()
+        return parked_owned_prefetch(
+            parked=getattr(sched, "weg2_d_parked", None) or (),
+            ongoing_prefetch=getattr(tc, "ongoing_prefetch", None) or ())
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -19978,6 +19994,10 @@ class Scheduler(
                 "thread, those pages miss in the store)",
                 drained, left, waited_ms)
 
+    def _weg2_parked_owned_prefetch(self) -> frozenset:
+        """PDFLIP-A: open prefetch records of requests in D's park list."""
+        return _weg2_parked_owned_prefetch_of(self)
+
     def group_idle_verdict(self, tp_group_verdict: bool = False) -> Tuple[bool, str]:
         """#1268: is THE GROUP idle -- not "is this rank idle".
 
@@ -20056,8 +20076,18 @@ class Scheduler(
         answer unchanged -- so a single-rank engine and every stock path are
         byte-identical.
         """
-        my_idle = self.is_fully_idle()
-        own = ", ".join(self.idle_blockers()) or "none"
+        # PDFLIP-A: the open store reads of D's park list do not hold the
+        # quiesce (weg2_sleep_drain.parked_owned_prefetch); empty off D's park.
+        _pk = _weg2_parked_owned_prefetch_of(self)
+        my_idle = self.is_fully_idle(exempt_prefetch=_pk) if _pk else self.is_fully_idle()
+        own = ", ".join(self.idle_blockers(exempt_prefetch=_pk) if _pk else self.idle_blockers()) or "none"
+        if _pk:
+            _n = getattr(self, "_weg2_parked_prefetch_n", 0) + 1
+            self._weg2_parked_prefetch_n = _n
+            if _n <= 8 or _n % 64 == 0:
+                logger.info("WEG2-QUIESCE-PARKED-PREFETCH rids=%s n=%d: store reads of D's park list "
+                            "are not a quiesce term (held by the sleep, re-read at the wake; the "
+                            "release reset joins them)", sorted(r[:12] for r in _pk), _n)
 
         pp_size = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1)
         pp_rank = int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0)
