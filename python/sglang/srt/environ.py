@@ -1717,6 +1717,15 @@ class Envs:
     # X-EXACT: longest wait for the count before the request is priced by the
     # chars/3 estimate instead (named: WEG2 X-EXACT-FALLBACK reason=timeout).
     SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS = EnvInt(3000)
+    # PARK-NO-DWELL (user 02.10.: an arriving request is prefilled AT ONCE, no
+    # grace for running decodes; N6d ..._ec4d492f58 epoch 4: 'WEG2
+    # PARK-IMMEDIATE-DWELL awake_ms=310 min_dwell_ms=1974 floor_ms=2000' held the
+    # LONG weg2-4-6 142 ms until D's 2-token SHORT had finished): the immediate
+    # park of D's running decodes for a queued request over X fires at once --
+    # no K7 min-dwell, no park-cycle/decode dwell, no collect window, no fairness
+    # floor -- and the D->P MIN-DWELL after that park does not hold either.
+    # Marker 'WEG2 PARK-NO-DWELL'. 0 = the dwell rules as before.
+    SGLANG_WEG2_PARK_NO_DWELL = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")

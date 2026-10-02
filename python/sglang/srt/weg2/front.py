@@ -4914,6 +4914,18 @@ class Front:
                 self._park_window_send(D, -1)
             return None
         need_ms, prov = self._derived_min_dwell_ms("D", "P")
+        if envs.SGLANG_WEG2_PARK_NO_DWELL.get():
+            # PARK-NO-DWELL (user 02.10.): the arrival is prefilled at once -- no
+            # dwell, no collect window, no floor; the running decodes park now.
+            self.counters["park_no_dwell"] = self.counters.get("park_no_dwell", 0) + 1
+            if self.__dict__.get("_park_no_dwell_epoch") != self.epoch:
+                self._park_no_dwell_epoch = self.epoch
+                logger.info("WEG2 PARK-NO-DWELL epoch=%d rid=%s awake_ms=%d running=%d would_hold_ms=%d "
+                            "(%s) floor_ms=%d -- a request over X arrived: D's decodes park now, no "
+                            "dwell (SGLANG_WEG2_PARK_NO_DWELL)", self.epoch, p.rid,
+                            int((now - self.t_awake) * 1000.0), len(self._flip_ledger(D)),
+                            int(max(need_ms, FAIRNESS_DWELL_FLOOR_MS)), prov, int(FAIRNESS_DWELL_FLOOR_MS))
+            return p
         collect = envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
         # PARK-CYCLE DWELL: a D phase that began by resuming parked requests is
         # priced at the whole park cycle (both flips), not at one flip.
@@ -13617,7 +13629,12 @@ class Front:
         # request P can never hold, the D->P legs ran into W35/W68 and both
         # groups died. A floor under every override: the woken group keeps
         # the cards for at least FAIRNESS_DWELL_FLOOR_MS.
-        ok = awake_ms >= need or overridden == "d_idle" or (
+        if (src == "D" and overridden in ("park", "fairness") and envs.SGLANG_WEG2_PARK_NO_DWELL.get()
+                and getattr(self, "_park_attempt_epoch", None) == self.epoch):
+            # PARK-NO-DWELL: this D phase already parked its decodes for an arrival
+            # over X -- the flip that serves it follows at once, no floor
+            overridden = "park_no_dwell"
+        ok = awake_ms >= need or overridden in ("d_idle", "park_no_dwell") or (
             overridden != "none" and awake_ms >= FAIRNESS_DWELL_FLOOR_MS
         )
         logger.info("WEG2 MIN-DWELL src=%s dst=%s awake_ms=%d derived_from_flip_ms=%d overridden_by=%s "
