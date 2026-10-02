@@ -5916,9 +5916,11 @@ class Front:
         self.counters["l3_index_probes"] += 1
         if d.tokens > 0:
             logger.info("WEG2 L3-INDEX-PRESENCE rid=%s tier=%s depth=%d pages=%d l3_pages=%d "
-                        "kv_pages=%d tokens=%d probe_ms=%.1f (the shared L2/L3 store holds these "
-                        "leading pages with their anchor -- what P/D read for this prompt)",
-                        rid, d.tier, d.tokens, d.pages, d.l3_pages, d.kv_pages, int(ids.size), d.ms)
+                        "kv_pages=%d tokens=%d probe_ms=%.1f probe=%s asked=%d (the shared L2/L3 "
+                        "store holds these leading pages with their anchor -- what P/D read for "
+                        "this prompt)",
+                        rid, d.tier, d.tokens, d.pages, d.l3_pages, d.kv_pages, int(ids.size), d.ms,
+                        getattr(d, "form", "list"), int(getattr(d, "asked", 0)))
         return int(d.tokens), str(d.tier)
 
     async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,

@@ -66,6 +66,9 @@ TRAILING_COMPONENTS = frozenset({"mamba"})
 PRESENCE_ONLY_PREFIX = "draft"
 #: stems asked per index call; the walk stops at the chunk with the first miss
 CHUNK = 512
+#: PROBE-FAST: the forward chunk doubles from CHUNK up to this many stems (a
+#: long hit costs log2 calls, an early miss still at most CHUNK stems asked)
+CHUNK_MAX = 8192
 #: shard directories sampled for the store's component set
 SAMPLE_SHARDS = 8
 SAMPLE_NAMES = 4096
@@ -81,6 +84,12 @@ class Depth(msgspec.Struct, frozen=True):
     tier: str = "none"
     #: the depth L3 alone proves (pages)
     l3_pages: int = 0
+    #: PROBE-FAST (02.10.): "fast" (stems encoded once into one NUL-terminated
+    #: buffer, every tier asked over the same char ** in C, numpy verdicts) or
+    #: "list" (the per-stem form); the answer is the same
+    form: str = "list"
+    #: stem lookups made (per tier ask, not per tier)
+    asked: int = 0
 
 def shared_suffix(store_dir: str) -> Tuple[Optional[str], str]:
     """The suffix every group of the shared-key store scans (the group-wide,
@@ -250,18 +259,202 @@ class StorePresence:
                             default=-1)
         return pages, kv
 
-    def depth(self, ids: Optional[np.ndarray]) -> Depth:
+    # -- PROBE-FAST (02.10.) ----------------------------------------------------
+    # N5q epoch 4 (front log ..._1002_151409, 15:17:13.127-13.540): weg2-3-5
+    # 'L3-INDEX-PRESENCE tier=l2_arena depth=73728 kv_pages=74064 tokens=98798
+    # probe_ms=413.3' -- serial after the 132 ms X-EXACT count, before the
+    # ROUTE-VERDICT. The 27B keys pages of ONE token, so the probe asks ~74k
+    # stems per tier (L3 index + 2 arenas). Desk profile of the same shape
+    # (213-238 ms): the C lookups are a minority; the time is Python per stem --
+    # str.encode x3 tiers, a ctypes c_char_p array built per call and per tier,
+    # int8 -> list -> bool, the memo dict and an any() generator per stem.
+    # The fast form encodes each stem ONCE into a fixed-width NUL-terminated
+    # numpy buffer, hands the SAME char ** to every tier, and reads the
+    # verdicts as numpy arrays. Same stems, same tiers, same leading-run /
+    # cut / deepest-anchor rules, so the same Depth (pinned by the tests
+    # against the list form).
+    class _Asked:
+        """Per-probe verdicts per component: (in L3, COMPLETE in L2, L3 asked,
+        L2 asked). A tier is asked a page only when the answer needs it: the
+        union walk asks the arenas first (``batch_exists_v2``'s order) and the
+        L3 index only where no arena holds the page; the L3-only walk asks the
+        index for the leading pages it has not asked yet."""
+
+        def __init__(self, n: int, hlen: int = 0):
+            self.n = n
+            #: the one width of every page hash, 0 = not uniform
+            self.hlen = hlen
+            self.comps: Dict[Optional[str], Tuple[np.ndarray, ...]] = {}
+            self.lookups = 0
+
+        def arrays(self, comp: Optional[str]):
+            a = self.comps.get(comp)
+            if a is None:
+                a = self.comps[comp] = tuple(np.zeros(self.n, dtype=bool) for _ in range(4))
+            return a
+
+    def _tail(self, comp: Optional[str]) -> str:
+        return self.suffix if comp is None else f".{comp}{self.suffix}"
+
+    def _stems_fast(self, hashes: Sequence[str], comp: Optional[str], todo: np.ndarray, st: "_Asked"):
+        """(stems thunk, char ** over one NUL-terminated buffer, n, keep-alive).
+
+        Uniform hash width (the probe checked it once): the rows are written
+        as bytes -- ''.join + one ASCII encode + two column copies, no per-stem
+        Python. Otherwise via a str list. Non-ASCII raises UnicodeEncodeError
+        (the caller falls back to the list form)."""
+        import ctypes
+
+        tail = self._tail(comp)
+        lo, hi = int(todo[0]), int(todo[-1]) + 1
+        contiguous = hi - lo == todo.size
+        sel = hashes[lo:hi] if contiguous else [hashes[int(i)] for i in todo]
+        n = len(sel)
+        if st.hlen:
+            tb = tail.encode("ascii")
+            w = st.hlen + len(tb) + 1
+            buf = np.zeros((n, w), dtype=np.uint8)
+            buf[:, :st.hlen] = np.frombuffer("".join(sel).encode("ascii"), dtype=np.uint8).reshape(n, st.hlen)
+            buf[:, st.hlen:w - 1] = np.frombuffer(tb, dtype=np.uint8)
+            row = w
+        else:
+            u = np.array([h + tail for h in sel])
+            # +1: every stem NUL-terminated, the longest one too
+            buf = np.zeros(n, dtype="S%d" % (u.dtype.itemsize // 4 + 1))
+            buf[:] = u
+            row = buf.dtype.itemsize
+        addr = np.uint64(buf.ctypes.data) + np.arange(n, dtype=np.uint64) * np.uint64(row)
+
+        def stems():
+            return [h + tail for h in sel]
+
+        return stems, addr.ctypes.data_as(ctypes.POINTER(ctypes.c_char_p)), n, (buf, addr)
+
+    def _ask_l3(self, hashes, comp, todo: np.ndarray, st: "_Asked") -> None:
+        l3, _, a3, _ = st.arrays(comp)
+        if todo.size == 0:
+            return
+        if self.index is not None:
+            stems, ptrs, n, keep = self._stems_fast(hashes, comp, todo, st)
+            st.lookups += n
+            if hasattr(self.index, "has_ptrs"):
+                l3[todo] = self.index.has_ptrs(ptrs, n) != 0
+            else:
+                l3[todo] = np.asarray(self.index.has(stems()), dtype=bool)
+            del keep  # alive through the C call above
+        a3[todo] = True
+
+    def _ask_fast(self, hashes: Sequence[str], comp: Optional[str], lo: int, hi: int,
+                  st: "_Asked", tiers=(0, 1)) -> None:
+        """Ask what ``tiers``' answer over [lo, hi) of ``comp`` still needs."""
+        l3, l2, a3, a2 = st.arrays(comp)
+        if 1 in tiers:
+            todo = lo + np.flatnonzero(~a2[lo:hi])
+            if todo.size:
+                # COMPLETE in ANY arena: each further arena is asked only for the
+                # pages the ones before it did not hold (largest arena first --
+                # the KV pages live there; the order changes no answer)
+                rest = todo
+                for arena in sorted(self.arenas.values(),
+                                    key=lambda a: -int(getattr(a, "slots", 0) or 0)):
+                    if rest.size == 0:
+                        break
+                    stems, ptrs, n, keep = self._stems_fast(hashes, comp, rest, st)
+                    st.lookups += n
+                    if hasattr(arena, "find_states_ptrs"):
+                        got = arena.find_states_ptrs(ptrs, n) == 2
+                    else:
+                        got = np.asarray(arena.find_states(stems()), dtype=np.int8) == 2
+                    del keep  # alive through the C call above
+                    l2[rest[got]] = True
+                    rest = rest[~got]
+                a2[todo] = True
+            # the index only where no arena holds the page (the union needs no more)
+            todo3 = lo + np.flatnonzero(~a3[lo:hi] & ~l2[lo:hi])
+        else:
+            todo3 = lo + np.flatnonzero(~a3[lo:hi])
+        self._ask_l3(hashes, comp, todo3, st)
+
+    @staticmethod
+    def _present(st: "_Asked", comp: Optional[str], lo: int, hi: int, tiers) -> np.ndarray:
+        l3, l2, _, _ = st.arrays(comp)
+        return (l3[lo:hi] | l2[lo:hi]) if 1 in tiers else l3[lo:hi].copy()
+
+    def _leading_fast(self, hashes, comp, upto: int, st, tiers) -> int:
+        off, size = 0, CHUNK
+        while off < upto:
+            hi = min(upto, off + size)
+            self._ask_fast(hashes, comp, off, hi, st, tiers)
+            miss = np.flatnonzero(~self._present(st, comp, off, hi, tiers))
+            if miss.size:
+                return off + int(miss[0])
+            off, size = hi, min(CHUNK_MAX, size * 2)
+        return int(upto)
+
+    def _deepest_fast(self, hashes, pages: int, comp: str, st, tiers) -> int:
+        hi = int(pages)
+        while hi > 0:
+            lo = max(0, hi - CHUNK)
+            self._ask_fast(hashes, comp, lo, hi, st, tiers)
+            hit = np.flatnonzero(self._present(st, comp, lo, hi, tiers))
+            if hit.size:
+                return lo + int(hit[-1])
+            hi = lo
+        return -1
+
+    def _pages_fast(self, hashes, upto: int, st, tiers) -> Tuple[int, int]:
+        """``_pages`` over ``hashes[:upto]`` -- same rules, verdicts from ``st``."""
+        kv = self._leading_fast(hashes, None, upto, st, tiers)
+        pages = kv
+        for comp in self.all_pages:
+            if pages <= 0:
+                break
+            pages = min(pages, self._leading_fast(hashes, comp, pages, st, tiers))
+        for comp in self.trailing:
+            if pages <= 0:
+                break
+            pages = self._deepest_fast(hashes, pages, comp, st, tiers) + 1
+        return pages, kv
+
+    def _depth_fast(self, hashes: Sequence[str], t0: float) -> Depth:
+        widths = set(map(len, hashes))
+        st = StorePresence._Asked(len(hashes), widths.pop() if len(widths) == 1 else 0)
+        pages, kv = self._pages_fast(hashes, len(hashes), st, (0, 1))
+        l3_pages = self._pages_fast(hashes, pages, st, (0,))[0] if pages > 0 else 0
+        tier = "none" if pages <= 0 else ("l3_index" if l3_pages >= pages else "l2_arena")
+        return Depth(tokens=int(pages) * self.page_size, kv_pages=int(kv), pages=int(pages),
+                     ms=(time.perf_counter() - t0) * 1000.0, tier=tier, l3_pages=int(l3_pages),
+                     form="fast", asked=int(st.lookups))
+
+    def depth(self, ids: Optional[np.ndarray], fast: Optional[bool] = None) -> Depth:
+        """``fast``: None = the switch SGLANG_WEG2_FRONT_PROBE_FAST (default on)."""
         t0 = time.perf_counter()
         if ids is None or ids.size == 0:
             return Depth(tokens=0, kv_pages=0, pages=0, ms=0.0)
         self._rejoin()
+        if fast is None:
+            fast = probe_fast_on()
+        if fast:
+            hashes = self.hasher(ids, self.page_size, self.bigram)
+            try:
+                return self._depth_fast(hashes, t0)
+            except UnicodeEncodeError:
+                pass  # a non-ASCII stem: the list form below asks it utf-8 encoded
         hashes = self.hasher(ids, self.page_size, self.bigram)
         memo: Dict[str, Tuple[bool, bool]] = {}
         pages, kv = self._pages(hashes, memo, (0, 1))
         l3_pages = self._pages(hashes[:pages], memo, (0,))[0] if pages > 0 else 0
         tier = "none" if pages <= 0 else ("l3_index" if l3_pages >= pages else "l2_arena")
         return Depth(tokens=int(pages) * self.page_size, kv_pages=int(kv), pages=int(pages),
-                     ms=(time.perf_counter() - t0) * 1000.0, tier=tier, l3_pages=int(l3_pages))
+                     ms=(time.perf_counter() - t0) * 1000.0, tier=tier, l3_pages=int(l3_pages),
+                     form="list", asked=len(memo))
+
+
+def probe_fast_on() -> bool:
+    """PROBE-FAST switch (SGLANG_WEG2_FRONT_PROBE_FAST, default on)."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_FRONT_PROBE_FAST.get())
 
 
 def l3_index_path(arena_dir: str) -> str:
