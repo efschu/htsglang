@@ -73,7 +73,7 @@ import os
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sglang.srt.weg2 import rank_timing
 
@@ -143,7 +143,7 @@ def _prefill_block(mr) -> Optional[Dict[str, Any]]:
     if not isinstance(cum, dict):
         return None
     out = dict(cum)
-    for k in ("gpu_ms", "split_ms", "compute_ms", "wait_ms", "bubble_ms"):
+    for k in ("gpu_ms", "split_ms", "compute_ms", "wait_ms", "bubble_ms", "own_ms", "compute_only_ms"):
         if isinstance(out.get(k), float):
             out[k] = round(out[k], 1)
     return out
@@ -174,6 +174,14 @@ def _decode_block(mr) -> Optional[Dict[str, Any]]:
         "accept_rate_ewma": None if rate is None else round(float(rate), 3),
         "cuda_graph": getattr(mr, "last_cuda_graph", None),
     }
+
+
+def _with_decode_reqs(block: Optional[Dict[str, Any]], rb) -> Optional[Dict[str, Any]]:
+    """DASH-FIELDS: ``decode.reqs`` beside the decode block's sums (additive)."""
+    if block is None:
+        return None
+    block["reqs"] = _decode_reqs(rb)
+    return block
 
 
 def _cache_block(scheduler) -> Dict[str, Any]:
@@ -235,6 +243,27 @@ def _cache_block(scheduler) -> Dict[str, Any]:
     return out
 
 
+#: DASH-FIELDS (02.10.): running decode requests named per rankstats tick
+DECODE_REQS_CAP = 16
+
+
+def _decode_reqs(rb) -> Optional[List[List[Any]]]:
+    """DASH-FIELDS (02.10., rigdash per-rid decode): ``[[rid, prompt, out], ...]`` of the
+    running batch -- prompt = len(origin_input_ids), out = len(output_ids), depth =
+    prompt + out. Read HERE, in the rankstats timer thread, from host lists the round
+    path keeps anyway (no decode-path change, no sync, no D2H); capped; None when a
+    racing batch swap makes it unreadable."""
+    try:
+        out = []
+        for req in list(getattr(rb, "reqs", None) or ())[:DECODE_REQS_CAP]:
+            out.append([str(getattr(req, "rid", "")),
+                        len(getattr(req, "origin_input_ids", None) or ()),
+                        len(getattr(req, "output_ids", None) or ())])
+        return out
+    except Exception:  # noqa: BLE001 -- unknown, never a broken rankstats line
+        return None
+
+
 def scheduler_counters(scheduler) -> Dict[str, Any]:
     """READ ONLY: the counters the scheduler's round path increments anyway."""
     mr = getattr(scheduler, "metrics_reporter", None)
@@ -252,7 +281,7 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
         "progress": {"fwd_ct": fwd, "tokens_done": pre + dec,
                      "prefill_tokens": pre, "decode_tokens": dec},
         "prefill": _prefill_block(mr),
-        "decode": _decode_block(mr),
+        "decode": _with_decode_reqs(_decode_block(mr), rb),
         "cache": _cache_block(scheduler),
         "work": {"forward_ct": fwd},
         "tokens": {"prefill_total": pre, "decode_total": dec},

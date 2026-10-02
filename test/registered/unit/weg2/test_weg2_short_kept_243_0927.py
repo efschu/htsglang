@@ -80,7 +80,9 @@ class Wiring(unittest.TestCase):
     def test_fall_through_keeps_a_measured_d_presence(self):
         i = self.src.index("_sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0")
         blk = self.src[i:i + 6000]
-        self.assertIn("WEG2 SHORT-BEHIND-P rid=%s", blk)
+        # P-BATCH-ALL (02.10.): the per-rid line names P's batch, not a keep
+        self.assertIn("WEG2 SHORT-TO-P rid=%s", blk)
+        self.assertIn("and not _p_phase)", blk)
         self.assertIn("skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch)", blk)
         self.assertIn('if _sk and self.awake == "D" and self.admit_d and self.state == "serving":', blk)
         self.assertIn("self._ready_for_d.append(p)", blk)
@@ -105,8 +107,12 @@ class Wiring(unittest.TestCase):
         self.assertLess(b, blk.index("p = _q"))
         self.assertLess(b, blk.index("await self._d_seat.acquire()"))
 
-    def test_p_drain_skips_leg1_for_a_kept_short(self):
-        self.assertIn("if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once", self.src)
+    def test_p_drain_gives_a_kept_short_its_leg1(self):
+        # P-BATCH-ALL (02.10.): P is awake -- a kept SHORT is prefilled on P;
+        # law 02.10.: CARRIER-EXCEEDS is deleted -- no skip of leg 1 in a P drain at all
+        a = self.src.index('self._to_p_batch(p, "drain")')
+        self.assertNotIn("if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once", self.src)
+        self.assertGreater(a, 0)
 
 
 if __name__ == "__main__":

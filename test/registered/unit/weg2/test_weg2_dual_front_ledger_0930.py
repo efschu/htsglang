@@ -101,12 +101,15 @@ class PersistentOverPromiseIsBooked(CustomTestCase):
         self._run(a, [free, free - 500 * MIB, free, free - 400 * MIB, free])
         self.assertEqual(K.peek(path).budget, 4538 * MIB)
 
-    def test_books_the_smallest_persistent_over(self):
+    def test_books_the_persistent_over_measured_now(self):
+        # gmps7 (D 17:53:15): booking the window MINIMUM (209 MB of 209/477/466)
+        # left the ledger over-promising 466 MB -> PP0 cuMemCreate OOM. Persistence
+        # decides WHETHER to book; the gap measured now is WHAT is booked.
         path, d = self._card()
         free = K.peek(path).free
         a = types.SimpleNamespace(ledger=d)
         self._run(a, [free - 700 * MIB, free - 600 * MIB, free - 650 * MIB])
-        self.assertEqual(K.peek(path).budget, 4538 * MIB - 600 * MIB)
+        self.assertEqual(K.peek(path).budget, 4538 * MIB - 650 * MIB)
 
 
 if __name__ == "__main__":

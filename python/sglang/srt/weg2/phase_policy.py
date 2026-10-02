@@ -207,17 +207,25 @@ def park_body(epoch: int, bound_s: float, reason: Optional[str] = None) -> dict:
 
 def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
             leg1_done: bool = False, p_only: bool = False, x_requeues: int = 0,
-            x_deferred: bool = False) -> bool:
+            x_deferred: bool = False, x_routed: int = 0) -> bool:
     """Does this queued request need P's prefill (the immediate park's
     trigger)? ``est_uncached > X`` (law 4: D never prefills above X), a
     P-only request (an image under transient vision, long by rule), or one D
     already refused as over X (W31, ``x_requeues``). Never a request whose
     leg 1 is done (it waits for D, not for P) or that skips leg 1 (route
-    CARRIER-EXCEEDS: D prefills it once, a flip to P buys nothing)."""
+    CARRIER-EXCEEDS: D prefills it once, a flip to P buys nothing).
+
+    #246b (NF y4c 04:39:57, weg2-22-37): ``x_routed`` > 0 is the X the front
+    ROUTED this request on (the X-SOLO band floor X_busy while D is busy); above
+    it the request was sent to P and needs P, even when it lies below the live
+    X ``x_tokens`` -- otherwise it is neither D's (routed away) nor P's (no
+    trigger) and waits until D runs empty."""
     if skip_leg1 or leg1_done:
         return False
     if p_only or int(x_requeues or 0) > 0 or x_deferred:
         return True  # x_deferred: over X_busy, the X in force while D decodes (PK2)
+    if int(x_routed or 0) > 0 and int(est_uncached) > int(x_routed):
+        return True  # #246b: routed to P on this X
     return int(est_uncached) > int(x_tokens)
 
 
@@ -230,7 +238,8 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
                    leg1_done=bool(getattr(p, "leg1_done", False)),
                    p_only=bool(getattr(p, "p_only", False)),
                    x_requeues=int(getattr(p, "x_requeues", 0) or 0),
-                   x_deferred=bool(getattr(p, "x_deferred", False))):
+                   x_deferred=bool(getattr(p, "x_deferred", False)),
+                   x_routed=int(getattr(p, "x_routed", 0) or 0)):
             return p
     return None
 
@@ -627,6 +636,52 @@ def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: Optional[flo
         return (float("inf") if num > 0.0 else 0.0), (
             f"{side}(d={marg_ms:.3f}ms/tok<=p={p_marg:.3f})")
     return max(0.0, num / denom), "ok"
+
+
+# ---------------------------------------------------------------------------
+# PDFLIP-X (02.10.2026, user: "bei 15 sekunden flipzeit plus rechnung ist die
+# schwelle aber nicht bei 6k sondern eher bei 35k oder sowas???"): the price
+# of a LONG excursion is what the request WAITS, in the user's definition --
+# D->P = arrival (hold, drain) to P's first prefill chunk (R28 DP-WAIT
+# wait_s), P->D = P's prefill end to D's first content (LEG2-FIRST-CONTENT
+# via=after_p) -- not the gather legs plus D's resume (the ski price), and it
+# is NOT divided by k. P's own prefill time stays on P's cost line.
+#
+# WHY NOT /k. k (requests one P phase prefilled) amortises a round trip as
+# shared WORK. The decision X makes is per arrival, and the arrival that
+# triggers the excursion (PARK-IMMEDIATE cause=over-x / PARK-SEAT-FREE FIRE)
+# pays the whole round trip itself -- every request of that P phase waits the
+# full D->P and P->D. The decodes the excursion stops cancel out: a D-direct
+# prefill stops the same decodes for its own a_D + b_D*n (MIXED-CHUNK off).
+# Measured: N4p 1002_095319 price 5.27 s / k 1.33 -> 3.96 s, X 6223; N4q
+# 1002_101341 price 8.14 s / k 3.00 -> 2.71 s, X 2918 -- k counted the
+# acceptance probe's manual flips too (PARK-MANUAL-FLIP 10:17:15/10:17:21),
+# which are no excursions and are excluded here.
+# ---------------------------------------------------------------------------
+
+
+def excursion_price_s(dp: Sequence[Tuple[int, float]], pd: Sequence[Tuple[int, float]],
+                      manual_epochs=(), first_epochs: Optional[dict] = None
+                      ) -> Tuple[Optional[float], str]:
+    """``mean(D->P waits) + mean(P->D first-content times)`` in seconds over
+    the WARM, non-manual samples ``(epoch, seconds)``; ``(None, why)`` while
+    either side has none. Warm = not the boot's first excursion
+    (``first_epochs[side]``, the cold wake); manual = an epoch of a POST
+    /weg2/flip (the acceptance probe), never an excursion."""
+    first = first_epochs or {}
+    man = set(manual_epochs or ())
+
+    def _warm(rows, side):
+        return [float(v) for e, v in rows
+                if e not in man and e != first.get(side) and float(v) >= 0.0]
+
+    w_dp, w_pd = _warm(dp, "dp"), _warm(pd, "pd")
+    if not w_dp or not w_pd:
+        return None, (f"excursion:none(dp n={len(w_dp)} pd n={len(w_pd)}; "
+                      f"raw {len(dp)}/{len(pd)}, manual epochs {len(man)})")
+    m_dp, m_pd = statistics.mean(w_dp), statistics.mean(w_pd)
+    return m_dp + m_pd, (f"excursion:dp={m_dp:.2f}s(n={len(w_dp)})+pd={m_pd:.2f}s(n={len(w_pd)})"
+                         f"(warm, {len(man)} manual epochs excluded)")
 
 
 def x_cost_line_record(*, form_key: str, line: dict, k: float, boot_tag: str,

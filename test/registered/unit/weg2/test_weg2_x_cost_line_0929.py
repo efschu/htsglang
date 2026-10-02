@@ -217,7 +217,11 @@ def test_green_x_moves_from_ds_forwards_under_load(name, caplog):
     F, ns, rows = _front(name)
     _feed(ns, rows)
     assert ns.counters["x_cost_rows"] == len(rows) and ns.counters["x_cost_rows_lost"] == 0
-    with envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), caplog.at_level("INFO"):
+    # the boot-mean amortisation these bands were measured under (X-K-FLIP off) and the ski
+    # price / k form (PDFLIP-X: SGLANG_WEG2_X_EXCURSION_PRICE=0)
+    with envs.SGLANG_WEG2_X_K_FLIP.override(False), \
+            envs.SGLANG_WEG2_X_EXCURSION_PRICE.override(False), \
+            envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), caplog.at_level("INFO"):
         x = F.resolve_x_live(ns)
     assert x is not None and x != 4096
     assert ns.tp_prefill_max_tokens == x and ns.flip_min_work_tokens == x
@@ -241,7 +245,11 @@ def test_front_seeds_from_the_record_and_names_missing_inputs(caplog):
                        "at": "2026-09-29 09:00:00,000"}
     ns._park_rt_seed = {"round_trip_s": 7.87, "boot_tag": "z30w", "at": "2026-09-29 09:01:00,000"}
     caplog.clear()
-    with envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), caplog.at_level("INFO"):
+    # the boot-mean amortisation these bands were measured under (X-K-FLIP off) and the ski
+    # price / k form (PDFLIP-X: SGLANG_WEG2_X_EXCURSION_PRICE=0)
+    with envs.SGLANG_WEG2_X_K_FLIP.override(False), \
+            envs.SGLANG_WEG2_X_EXCURSION_PRICE.override(False), \
+            envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), caplog.at_level("INFO"):
         x = F.resolve_x_live(ns)
     assert x is not None and 64 <= x < 4096
     msg = next(m for m in caplog.messages if "X COST-LINE RE-SOLVE" in m)

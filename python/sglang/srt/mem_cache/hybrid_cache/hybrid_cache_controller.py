@@ -125,6 +125,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
 from sglang.srt.weg2 import p_fork_cut
 from sglang.srt.utils import get_device_module
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -272,6 +273,9 @@ class PrefetchOperation(StorageOperation):
             pool_transfers=pool_transfers,
         )
         self.pool_transfers_done = not bool(pool_transfers)
+        #: SA: pages of a SHORT read up to whose last one the recurrent state
+        #: was read (0 = none could be); None = not a short read of this arm.
+        self._weg2_short_anchor_pages: Optional[int] = None
 
     #: #1157: see `managers.cache_controller.PrefetchOperation.probed_hit_tokens`.
     probed_hit_tokens: Optional[int] = None
@@ -292,6 +296,13 @@ class PrefetchOperation(StorageOperation):
 
 
 class HybridCacheController(BaseHiCacheController):
+    #: SA: True only when the tree this controller serves cuts a short read
+    #: to the anchor the read VOTES (``UnifiedRadixCache._anchor_reach_local``,
+    #: set by ``hybrid_pool_assembler._apply_stack_result``). HiMambaRadixCache
+    #: inserts the whole landed span with the state attached at its end, so a
+    #: state read at an earlier anchor would land at a foreign depth there.
+    short_read_anchor_consumer: bool = False
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -620,7 +631,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def reset(self):
         super().reset()
-        if self.enable_storage:
+        if self.enable_storage and not self.weg2_reset_reaper_alive():
             self.host_mem_release_queue.queue.clear()
             for release_queue in self.extra_host_mem_release_queues.values():
                 release_queue.queue.clear()
@@ -1021,6 +1032,7 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
+        self.weg2_await_reset_reaper("prefetch")  # PARK-READ-DETACH
         operation = PrefetchOperation(
             request_id,
             host_indices,
@@ -1045,6 +1057,7 @@ class HybridCacheController(BaseHiCacheController):
         """``sidecar_only`` (fnFL2x62): the KV pages are already in the store
         (direct-written arena slots); only ``extra_pools`` are persisted and
         the operation acks as complete for every token."""
+        self.weg2_await_reset_reaper("write_storage")  # PARK-READ-DETACH
         operation = StorageOperation(
             host_indices,
             token_ids,
@@ -1201,7 +1214,11 @@ class HybridCacheController(BaseHiCacheController):
         # without a recurrent state; PP0's adder ends a chunk at its depth.
         p_fork_cut.note_store_uncapped(
             getattr(operation, "request_id", None),
-            getattr(hit_result, "kv_uncapped", 0),
+            # QS: the fork stands on what every ALL_PAGES pool holds with KV
+            p_fork_cut.store_fork_pages(
+                getattr(hit_result, "kv_uncapped", 0),
+                getattr(hit_result, "all_pages_uncapped", None),
+            ),
             kv_hit_pages,
         )
 
@@ -1418,7 +1435,115 @@ class HybridCacheController(BaseHiCacheController):
             except Exception:  # noqa: BLE001
                 pass
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+        elif operation.pool_transfers and 0 < kv_completed_pages < len(operation.hash_value):
+            self._short_read_anchor_transfer(operation, kv_completed_pages)
         operation.pool_transfers_done = True
+
+    def _short_read_anchor_armed(self) -> bool:
+        """SA (NF y3v 5327bdfa17, PP0 01:16:06, weg2-46-98): the arm below runs
+        where the rank decides its own cut -- no attention-TP reduce in
+        ``check_prefetch_progress`` (P's carrierless PP stages, tp 1). On a
+        TP group the MIN over the ranks' hit pages would let one rank's
+        state at its own anchor ride with another rank's state at a
+        different depth; there the short read keeps its old answer."""
+        if not envs.SGLANG_WEG2_ENABLE_SHORT_READ_ANCHOR.get():
+            return False
+        if not self.short_read_anchor_consumer:
+            return False
+        group = self.tp_group
+        if group is None:
+            return True
+        try:
+            return int(torch.distributed.get_world_size(group=group)) <= 1
+        except Exception:  # noqa: BLE001 - an unanswerable group is not alone
+            return False
+
+    def _short_read_anchor_transfer(self, operation, kv_completed_pages: int) -> None:
+        """SA: a KV read that ended SHORT still reads the recurrent state at
+        the deepest anchor INSIDE the pages that landed.
+
+        THE BREAK (NF y3v 5327bdfa17, PP0 01:16:04-01:16:11, weg2-46-98,
+        prompt 54226): the probe held 823 pages, the read got 757 (48448
+        tokens; READ-STAGES without an ``extra_ms`` term -- this branch was
+        never entered), #257 (b) cut the claim to the store's deepest mamba
+        anchor inside them (``BELOW-ANCHOR read=48448 of 52672
+        anchored=45824``) and inserted 45824 KV tokens -- with NO state,
+        because the extra pools were skipped for any short read. Five
+        seconds later PP0's own walk refused the node
+        (``#904 ... refusers=MambaComponent:45824 why=MambaComponent:absent``),
+        ``#TF TOLD-FIDELITY ... pp0_admissible=0`` put told=0 on the wire and
+        all three stages re-prefilled 54226 tokens (37.7 s) although PP1 and
+        PP2 had read the same 45824 WITH their state.
+
+        THE RULE: ask the store for the deepest page <= kv_completed_pages at
+        which every own pool is present (the same ``batch_exists_v2`` the
+        registration probe asked, over the landed pages only), move the
+        trailing keys there (mamba: exactly that page), cut the KV-indexed
+        sidecars (QSA index) to the same pages, and read. The anchor that
+        was READ is recorded on the operation
+        (``_weg2_short_anchor_pages``; 0 = no state could be read) and is
+        this rank's #257 anchor vote -- the cut lands on the page whose
+        state is on the host, never on a page whose state was only seen.
+        Host slots: the ones the registration already allocated for this
+        read (one mamba slot, the KV rows' sidecar rows); nothing new."""
+        if not self._short_read_anchor_armed():
+            return
+        own, host_pools = split_host_state_pools(self, operation.pool_transfers)
+        if host_pools or not own:
+            return  # a Form A worker's pools are the host's (tp > 1 anyway)
+        hash_value = list(operation.hash_value)
+        anchor_pages = 0
+        try:
+            from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+
+            res = self.storage_backend.batch_exists_v2(
+                hash_value[:kv_completed_pages], own, HiCacheStorageExtraInfo(prefix_keys=None)
+            )
+            anchor_pages = min(int(res.kv_hit_pages or 0), int(kv_completed_pages))
+        except Exception:  # noqa: BLE001 - an unanswerable probe reads nothing
+            logger.warning("SA short-read anchor probe failed for rid=%s",
+                           getattr(operation, "request_id", "?"), exc_info=True)
+            anchor_pages = 0
+        ok = False
+        results: dict = {}
+        _te = time.perf_counter()
+        if anchor_pages > 0:
+            self._sync_trailing_keys(operation.pool_transfers, hash_value, anchor_pages)
+            self._resolve_sidecar_derived_pool_transfers(operation)
+            for t in operation.pool_transfers:
+                if t.indices_from_pool == PoolName.KV:
+                    t.keys = hash_value[:anchor_pages]
+                    t.host_indices = operation.host_indices[: anchor_pages * self.page_size]
+            try:
+                results = self.storage_backend.batch_get_v2(own) or {}
+                ok = all(
+                    len(results.get(t.name, ())) > 0 and all(results.get(t.name, ()))
+                    for t in own
+                )
+            except Exception:  # noqa: BLE001 - a failed read is an unread state
+                logger.warning("SA short-read anchor read failed for rid=%s",
+                               getattr(operation, "request_id", "?"), exc_info=True)
+                ok = False
+        try:
+            from sglang.srt.managers.cache_controller import _read_stages
+
+            _rs = _read_stages(operation)
+            _rs["extra"] = _rs.get("extra", 0.0) + (time.perf_counter() - _te) * 1000.0
+        except Exception:  # noqa: BLE001
+            pass
+        if ok:
+            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+        operation._weg2_short_anchor_pages = int(anchor_pages) if ok else 0
+        n = getattr(self, "_sa_short_anchor_n", 0) + 1
+        self._sa_short_anchor_n = n
+        if n <= 16 or n % 256 == 0:
+            logger.warning(
+                "SA SHORT-READ ANCHOR rid=%s landed=%d of %d pages anchor=%d read=%s "
+                "(n=%d): the recurrent state at the deepest anchor inside the landed "
+                "pages is read, so the #257 cut resumes there instead of re-prefilling",
+                getattr(operation, "request_id", "?"), int(kv_completed_pages),
+                len(hash_value), int(anchor_pages), "ok" if ok else "none", n,
+            )
 
     def _page_backup(self, operation):
         # Backup extra pools

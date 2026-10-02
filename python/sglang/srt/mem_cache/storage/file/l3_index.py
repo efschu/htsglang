@@ -48,9 +48,12 @@ def _declare(lib: ctypes.CDLL) -> None:
 
 class L3Index:
     """One mapping of the shared table.  ``open`` creates it when absent; a
-    second opener waits for the creator's magic (bounded), then maps it."""
+    second opener waits for the creator's magic (bounded), then maps it.
+    ``create=False`` (L3-INDEX PRICE, the front): join an EXISTING table only
+    -- FileNotFoundError when no rank created it yet (a non-rank creator would
+    leave it unseeded: the creator seeds it from the store's snapshot)."""
 
-    def __init__(self, path: str, cap: int = DEFAULT_CAP):
+    def __init__(self, path: str, cap: int = DEFAULT_CAP, create: bool = True):
         lib = _load_lib()
         if lib is None:
             raise RuntimeError("arena.c did not build; no L3 index")
@@ -61,11 +64,21 @@ class L3Index:
             raise ValueError(f"cap must be a power of two >= 1024: {cap}")
         self._lock = threading.Lock()
         created = False
-        try:
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-            created = True
-        except FileExistsError:
+        wait_s = 30.0
+        if not create:
             fd = os.open(path, os.O_RDWR)
+            try:
+                nbytes, self.cap = self._layout_of(lib, os.fstat(fd).st_size, path)
+            except BaseException:
+                os.close(fd)
+                raise
+            wait_s = 2.0  # a joiner never waits out a creator; it asks again later
+        else:
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
+            except FileExistsError:
+                fd = os.open(path, os.O_RDWR)
         try:
             if created:
                 os.ftruncate(fd, nbytes)
@@ -85,11 +98,22 @@ class L3Index:
         else:
             t0 = time.monotonic()
             while int(lib.l3idx_cap(self._base)) != self.cap:
-                if time.monotonic() - t0 > 30.0:
+                if time.monotonic() - t0 > wait_s:
                     raise RuntimeError(f"L3 index {path}: magic/cap never appeared (cap {lib.l3idx_cap(self._base)})")
                 time.sleep(0.01)
         self.created = created
         self._full_logged = False
+
+    @staticmethod
+    def _layout_of(lib, size: int, path: str):
+        """``(nbytes, cap)`` of an existing table from its file size: the cap
+        is the creator's, whatever it was."""
+        cap = 1024
+        while cap <= (1 << 34):
+            if int(lib.l3idx_layout(cap)) == int(size):
+                return int(size), cap
+            cap <<= 1
+        raise RuntimeError(f"L3 index {path}: {size} bytes is no table layout (still being created?)")
 
     @staticmethod
     def _carr(stems: Sequence[str]):
@@ -123,6 +147,18 @@ class L3Index:
         out = (ctypes.c_int8 * n)()
         self._lib.l3idx_has_stems(self._base, n, arr, out)
         return [bool(v) for v in out]
+
+    def has_ptrs(self, ptrs, n: int):
+        """PROBE-FAST (02.10.): ``has`` over a ready ``char **`` (see
+        ``ArenaView.find_states_ptrs``) -- int8 numpy array, 1 = listed."""
+        import numpy as np
+
+        out = np.zeros((max(0, int(n)),), dtype=np.int8)
+        if n <= 0:
+            return out
+        self._lib.l3idx_has_stems(self._base, int(n), ptrs,
+                                  out.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return out
 
     def clear(self) -> None:
         with self._lock:

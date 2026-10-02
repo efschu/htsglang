@@ -52,6 +52,13 @@ def adopt(tree_cache, allocator, mamba_allocator, *, token_ids: Sequence[int],
             "adopt: %d token(s) vs %d row(s)" % (len(toks), len(rws)))
     if int(anchor_row) < 0:
         raise L15AdoptRefused("adopt: no anchor row (anchor_row=%d)" % anchor_row)
+    # L15-ADOPT-TAIL: insert() page-aligns the key and drops the value's
+    # tail; reserved tail rows would then be owned by nobody (a leak per
+    # adopt) and the anchor would sit deeper than its key -- refuse instead
+    page = int(getattr(tree_cache, "page_size", 1) or 1)
+    if page > 1 and len(toks) % page:
+        raise L15AdoptRefused("adopt: %d token(s) not a multiple of page %d"
+                              % (len(toks), page))
     free_kv = set(int(x) for x in allocator.free_pages.tolist())
     busy = [r for r in rws if r not in free_kv]
     if busy:
@@ -75,5 +82,15 @@ def adopt(tree_cache, allocator, mamba_allocator, *, token_ids: Sequence[int],
         key=RadixKey(token_ids=array("q", toks), extra_key=extra_key,
                      is_bigram=getattr(tree_cache, "is_eagle", False)),
         value=value, mamba_value=mamba_value))
+    # L15-ADOPT-TAIL: a bigram (EAGLE/MTP) tree files n tokens as n-1 keys
+    # and drops the value's last row -- reserved, in no node: give it back
+    kept = len(toks) - 1 if getattr(tree_cache, "is_eagle", False) else len(toks)
+    if kept < len(rws):
+        allocator.free(value[kept:])
+    if getattr(res, "mamba_exist", False):
+        # L15-ADOPT-TAIL: the tree kept another state at this node (or refused
+        # the anchor off-grid) -- the reserved anchor row is nobody's, give
+        # it back (the tree freed its own duplicate KV rows itself)
+        mamba_allocator.free(mamba_value)
     return AdoptResult(adopted=len(toks),
                        last_node=getattr(res, "last_device_node", None))

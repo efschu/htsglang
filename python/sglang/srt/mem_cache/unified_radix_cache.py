@@ -36,7 +36,9 @@ from sglang.srt.distributed.utils import uneven_dcp_active
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import prefix_trace as _prefix_trace
 from sglang.srt.weg2 import tail_adopt, tail_handoff
+from sglang.srt.weg2 import short_read as _weg2_short_read
 from sglang.srt.weg2 import d_park_read as _weg2_park_read
+from sglang.srt.weg2 import park_retract_laps as _prl  # FLIP-EDGE 2: park retract sub-laps
 from sglang.srt.weg2 import rank_timing as _rank_timing  # RANK-TIMING: L2 load-back ms
 from sglang.srt.managers.weg2_min_hit import note_min_hit_tokens  # PARK-RETAIN READ
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -105,6 +107,9 @@ from sglang.srt.mem_cache.producer_phase_census import (
 )
 from sglang.srt.mem_cache.mamba_ckpt_utils import weg2_max_states_per_path
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.weg2.turn_anchor import PENDING_ATTR as _TURN_PENDING_ATTR
+from sglang.srt.weg2.turn_anchor import TWIN_PENDING_ATTR as _TWIN_PENDING_ATTR
+from sglang.srt.weg2.turn_anchor import FORK_PENDING_ATTR as _FORK_PENDING_ATTR
 
 
 def bigram_anchor_key(token_ids, cache_len: int, extra_key, *, is_bigram: bool,
@@ -486,6 +491,13 @@ class UnifiedTreeNode:
         # anchor of that request because the arena refused this node.
         self.weg2_anchor_rid: Optional[str] = None
         self.weg2_arena_displaced: bool = False
+        # ANCHOR-ONLY BACKUP, KV only in the store (y5d 19:52:54Z): the anchor was
+        # written into the mamba arena (keyed by the node's last page hash) and
+        # completed, but NOT committed as the tree's Mamba host value -- the
+        # tree law "aux host requires Full host" forbids it. The arena slot is
+        # what survives the flush; this flag keeps the sweep from rewriting it
+        # and ANCHOR-LOST from counting it.
+        self.weg2_anchor_secured: bool = False
         # #1481: the END-ANCHOR witness marks the N-1 node (set in
         # UnifiedRadixCache._weg2_note_end_anchor).
         self._weg2_end_anchor: bool = False
@@ -800,6 +812,67 @@ from sglang.srt.weg2.p_trim_end_anchor import (  # noqa: E402
 )
 
 
+#: CENSUS-DEFER (02.10., N6d ..._ec4d492f58: WEG2-TREE-RESET-SUB census=19-24 ms
+#: of a 34-48 ms tree reset on every P rank, inside the P>D quiesce): the
+#: at=reset ARENA-REF-HOLDERS census -- an instrument, no branch reads it --
+#: runs this many seconds after the reset in a one-shot timer thread, not in the
+#: flush. The flip (~2.5 s) is over by then and the group sleeps; the census
+#: already tolerates a scheduler moving under it (snapshot=torn, the 60 s census
+#: thread runs the same walk). The line names deferred_s. 0 = in the reset, as before.
+WEG2_RESET_CENSUS_DEFER_ENV = "SGLANG_WEG2_RESET_CENSUS_DEFER_S"
+
+
+def _weg2_reset_census_defer_s() -> float:
+    raw = os.environ.get(WEG2_RESET_CENSUS_DEFER_ENV, "")
+    try:
+        return max(0.0, float(raw)) if str(raw).strip() else 5.0
+    except ValueError:
+        return 5.0
+
+
+#: ORPHAN-OWN (02.10., N6d: WEG2-TREE-RESET-SUB orphans=7-9 ms on PP0, 12.2 on
+#: PP1/PP2): the #1424g give-back computed held - named over EVERY slot of the
+#: arena (zeros + clone + subtract + clamp + nonzero over 720896 slots per pool)
+#: although only the slots this process holds a reference on can be orphans. It
+#: now reads those slots once (nonzero of the ledger), counts the holders' names
+#: on them only, and returns at once when this process holds nothing. Same
+#: answer (orphan = max(held - named, 0) is 0 wherever held is 0).
+#: 0 = the dense form, as before.
+WEG2_ORPHAN_OWN_ENV = "SGLANG_WEG2_ORPHAN_OWN_SLOTS"
+
+
+def _weg2_orphan_own_on() -> bool:
+    return str(os.environ.get(WEG2_ORPHAN_OWN_ENV, "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+class _Weg2NamedSlots:
+    """ORPHAN-OWN: stands where the dense ``named`` tensor stands for
+    ``_weg2_name_holders`` -- collects the named slots instead of adding
+    them into a tensor the size of the arena."""
+
+    def __init__(self, n: int):
+        self.n = int(n)
+        self.parts: list = []
+
+    def numel(self) -> int:
+        return self.n
+
+    def index_add_(self, dim, index, source) -> "_Weg2NamedSlots":
+        self.parts.append(index.reshape(-1).to(torch.int64))
+        return self
+
+    def counts_at(self, own: "torch.Tensor") -> "torch.Tensor":
+        """Names per slot of ``own`` (sorted ascending, as nonzero returns it)."""
+        k = int(own.numel())
+        if not self.parts or k == 0:
+            return torch.zeros(k, dtype=torch.int64)
+        cat = torch.cat(self.parts)
+        pos = torch.searchsorted(own, cat).clamp(max=k - 1)
+        hit = own[pos] == cat
+        return torch.bincount(pos[hit], minlength=k).to(torch.int64)
+
+
 def _weg2_carrier_hold_on() -> bool:
     """H81: does the flip's reset hold the phase's END anchors (see
     `UnifiedRadixCache._weg2_carrier_rotate`)? Group P of a weg2 boot, only
@@ -973,6 +1046,11 @@ def _form_a_note_loaded(tree, rows: int) -> None:
 
 
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
+    #: HY (weg2/park_hold_yield.py): the retained nodes whose backup the arena
+    #: refused (#1421 arena_claim) during a D park's retraction; None = no
+    #: park is recording.
+    _weg2_park_track: Optional[dict] = None
+
     #: The scheduler, once the phase flip has claimed ownership of the request
     #: pool (`bind_req_pool_owner`). None on every boot that never flips, which
     #: is why the property below falls back to the constructor's pool.
@@ -1095,6 +1173,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # fnFL2 H19: per-request mamba arena anchors (weg2/mamba_arena_displace.py)
         self._weg2_anchor_ledger = _mad.RidAnchorLedger()
         self._weg2_direct_mamba_rows: dict = {}   # #1427: node id -> mamba arena rows in flight
+        self._weg2_anchor_only_ids: set = set()   # ANCHOR-ONLY BACKUP: in-flight anchor-only writes
+        self._weg2_anchor_only_detached: set = set()   # ... of those: KV only in the store (no tree host value)
         self._weg2_rid_anchor_cfg = envs.SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS.get()
 
         self.tp_group = params.tp_cache_group
@@ -1513,6 +1593,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not keep:
             self._reset_full()
             return
+        # L15-FLIPCOST-3: the reset step of the D sleep on its own clocks
+        _t0 = time.perf_counter()
         # Union of the chains root -> kept node, root excluded. Identity
         # membership: nodes are unique objects and the walk stops at the
         # first ancestor already collected (chains share their prefixes).
@@ -1529,7 +1611,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Everything _reset_full does for the tree: prefetch pins, host
         # arena values, deferred publish/cap state, counters, fresh root
         # (lock_ref 1), empty LRU lists and leaf sets, zeroed sizes.
+        _t1 = time.perf_counter()
         self._reset_full()
+        _t2 = time.perf_counter()
         root = self.root_node
         for node in keep_set:
             for cd in node.component_data:
@@ -1563,11 +1647,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if value is not None:
                     total += len(value)
             self.component_evictable_size_[ct] = total
+        _t3 = time.perf_counter()
         for node in keep_set:
             self._for_each_component_lru(
                 node, UnifiedLRUList.insert_mru, skip_existing=True
             )
             self._update_evictable_leaf_sets(node)
+        _t4 = time.perf_counter()
+        logger.info(
+            "L15-RESET-KEEP kept_nodes=%d walk_ms=%.0f reset_full_ms=%.0f "
+            "reattach_ms=%.0f lru_ms=%.0f total_ms=%.0f", len(keep_set),
+            (_t1 - _t0) * 1e3, (_t2 - _t1) * 1e3, (_t3 - _t2) * 1e3,
+            (_t4 - _t3) * 1e3, (_t4 - _t0) * 1e3)
 
     def weg2_node_depth(self, node) -> int:
         """Token depth at the END of ``node`` (its key plus every ancestor's)
@@ -1594,6 +1685,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba = getattr(ComponentType, "MAMBA", None)
         if mamba is None:
             return out
+        _det = self.__dict__.get("_weg2_anchor_only_detached") or ()
         stack = [self.root_node]
         while stack:
             node = stack.pop()
@@ -1606,6 +1698,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             if cd is None or cd.value is None or cd.host_value is not None:
                 continue
+            if (_det and getattr(node, "id", None) in _det) or self._weg2_anchor_secured_holds(node):
+                continue    # ANCHOR-ONLY (KV in the store): its arena slot carries it (or its write is in flight)
             out.append((self.weg2_node_depth(node), getattr(node, "weg2_anchor_rid", None)))
         out.sort()
         return out
@@ -1848,16 +1942,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             led = getattr(arena, "_ledger", None)
             if led is None:
                 continue
-            named = torch.zeros(int(led.held.numel()), dtype=torch.int64)
-            for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
-                tree._weg2_name_holders(arena, named)
-            with led.lock:
-                held = led.held.to(torch.int64).clone()
-            orphan = (held - named).clamp_min(0)
-            slots = torch.nonzero(orphan).reshape(-1)
-            if slots.numel() == 0:
-                continue
-            multi = torch.repeat_interleave(slots, orphan[slots])
+            if _weg2_orphan_own_on():
+                # ORPHAN-OWN: only the slots this process references can be orphans
+                with led.lock:
+                    if not bool(led.held.any()):
+                        continue
+                named_s = _Weg2NamedSlots(int(led.held.numel()))
+                for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
+                    tree._weg2_name_holders(arena, named_s)
+                with led.lock:
+                    own = torch.nonzero(led.held).reshape(-1)
+                    held_own = led.held[own].to(torch.int64)
+                orphan_own = (held_own - named_s.counts_at(own)).clamp_min(0)
+                hit = orphan_own > 0
+                slots = own[hit]
+                if slots.numel() == 0:
+                    continue
+                multi = torch.repeat_interleave(slots, orphan_own[hit])
+            else:
+                named = torch.zeros(int(led.held.numel()), dtype=torch.int64)
+                for tree in {id(t): t for t in list(_WEG2_ARMED_TREES) + [self]}.values():
+                    tree._weg2_name_holders(arena, named)
+                with led.lock:
+                    held = led.held.to(torch.int64).clone()
+                orphan = (held - named).clamp_min(0)
+                slots = torch.nonzero(orphan).reshape(-1)
+                if slots.numel() == 0:
+                    continue
+                multi = torch.repeat_interleave(slots, orphan[slots])
             given = int(arena.ref_slots_np(multi.numpy(), -1))
             done[ct] = int(done.get(ct, 0)) + given
             total += given
@@ -2039,7 +2151,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 + f"{_hp.census(pool, refresh=refresh)}")
         return "; ".join(lines) or None
 
-    def _weg2_log_holder_census(self, where: str) -> None:
+    def _weg2_log_holder_census(self, where: str, deferred_s: float = 0.0) -> None:
+        if where == "reset" and not deferred_s:
+            defer = _weg2_reset_census_defer_s()
+            if defer > 0:
+                # CENSUS-DEFER: the newest reset's census replaces a pending one
+                old = self.__dict__.get("_weg2_census_timer")
+                if old is not None:
+                    old.cancel()
+                t = threading.Timer(defer, self._weg2_log_holder_census, args=(where, defer))
+                t.daemon = True
+                t.name = "weg2-reset-census"
+                self._weg2_census_timer = t
+                t.start()
+                return
+        if deferred_s:
+            try:  # CENSUS-DEFER: an arena unmapped since the reset is never read
+                if any(getattr(getattr(p.arena, "_mm", None), "closed", False)
+                       for p in self._weg2_arena_pools().values()):
+                    return
+            except Exception:  # noqa: BLE001 - an instrument never raises
+                return
         try:
             # PDFLIP-H: the reset's census (inside every sleep flush) never
             # re-hashes the hand-off keep -- handoff_pending.census(refresh=False)
@@ -2047,11 +2179,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception as exc:  # noqa: BLE001 - an instrument never breaks a reset
             line = f"failed={exc!r}"
         if line:
-            logger.info("ARENA-REF-HOLDERS at=%s %s (#1424e: gap = own_held - sum, this "
-                        "process's references no class names)", where, line)
+            logger.info("ARENA-REF-HOLDERS at=%s %s%s (#1424e: gap = own_held - sum, this "
+                        "process's references no class names)", where, line,
+                        " deferred_s=%.1f" % deferred_s if deferred_s else "")
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # TREE-RESET-SUB (02.10., N6a ..._4dd76c122a_1002_164400: WEG2-SLEEP-SUB
+        # rpc_flush tree_reset=31-47 ms on P's PP ranks, the block of the P>D
+        # quiesce): where this reset spends it, one line per reset with a host
+        # pool behind it. Instrument only -- no branch reads it.
+        _ts = [("t0", time.perf_counter())]
+
+        def _mk(name: str) -> None:
+            _ts.append((name, time.perf_counter()))
+
         # rc12 (D, all ranks, 23:12:47Z: "H-leaf extra: [62, 64, 60, 63]" +
         # "4 stale nodes in host_leaves"): the #1417 prefetch pins name nodes
         # of the tree being destroyed. Kept across the sleep flush, the held
@@ -2061,9 +2203,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # -- and before the arena release below, which skips host-locked nodes.
         for _rid in list(getattr(self, "_prefetch_span_pins", None) or ()):
             self._unpin_prefetched_span(_rid)
+        _mk("unpin")
         # H81: the old tree's arena references go back FIRST -- see
         # `_release_host_values_before_reset` (fnNV4f2 mamba_full).
         self._release_host_values_before_reset()
+        _mk("release_host")
         # P-HOST-OVERLAP: a deferred chunk publish names nodes of the tree being
         # destroyed; it must not outlive it (empty unless the mode is on).
         self._weg2_deferred_chunk_publish = []
@@ -2151,6 +2295,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # `--hicache-host-role retention`, which is the default (G2).
         self._drop_staging_write_ring()
         self._init_pin_trace()
+        _mk("tree_rebuild")
 
         # the HOLDERS census thread names a snapshot a reset moved under (torn)
         self._weg2_reset_epoch = int(getattr(self, "_weg2_reset_epoch", 0)) + 1
@@ -2159,12 +2304,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # row queued there still holds the reader reference its resolve
             # took -- given back here, before it has no holder at all.
             self._weg2_release_queued_refs_before_reset()
+            _mk("queued_refs")
             self.cache_controller.reset()
+            _mk("controller_reset")
             self.cache_controller.mem_pool_host.clear()
+            _mk("host_clear")
             self.enable_storage = self.cache_controller.enable_storage
             if getattr(self.cache_controller.mem_pool_host, "arena_read", False):
                 self._weg2_release_orphan_refs("reset")
+                _mk("orphans")
                 self._weg2_log_holder_census("reset")
+                _mk("census")
 
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
@@ -2177,6 +2327,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node=self.root_node,
         )
         self._record_all_cleared_event()
+        _mk("tail")
+        if self.cache_controller is not None:
+            try:
+                segs = " ".join("%s=%.1f" % (n, (t - _ts[i][1]) * 1000.0)
+                                for i, (n, t) in enumerate(_ts[1:]))
+                start_ms = getattr(self.cache_controller, "_weg2_last_start_ms", None)
+                logger.info("WEG2-TREE-RESET-SUB total=%.1f %s threads_start=%s (ms per step of "
+                            "UnifiedRadixCache._reset_full, in order; threads_start = the storage "
+                            "threads' restart inside controller_reset)",
+                            (_ts[-1][1] - _ts[0][1]) * 1000.0, segs,
+                            "-" if start_ms is None else "%.1f" % start_ms)
+            except Exception:  # noqa: BLE001 -- an instrument never breaks a reset
+                pass
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -2705,8 +2868,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
         # #243: the rid ended on D -- its hand-off is no longer waited for
         _weg2_handoff_consumed(getattr(req, "rid", None), "end")
+        # L15-14d: the deposit's last tokens + END anchor, BEFORE the finish
+        # path can free or dedupe the request's rows (no-op without a session;
+        # an aborted request deposits nothing more -- its record says why)
+        from sglang.srt.weg2 import l15_deposit_hook as _l15_dep
+        if _l15_dep.active():
+            if type(getattr(req, "finished_reason", None)).__name__ == "FINISH_ABORT":
+                _l15_dep.abort(getattr(req, "rid", ""), "aborted")
+            else:
+                _l15_dep.on_chunk(req, final=True)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
+        _prl.mark("head")
         # P-HOST-OVERLAP: a chunk publish still deferred goes out before the
         # finish path publishes its own node, so the chain keeps parents first.
         # Nothing is deferred unless SGLANG_WEG2_P_HOST_OVERLAP=1 (the only
@@ -2729,8 +2902,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # without waiting: only copies whose events are complete are
             # retired (writing_check's non-blocking branch, Event.query()).
             self.writing_check()
+        # TURN ANCHOR (weg2/turn_anchor.py): the step's second track goes in
+        # first, as its own node below the finish insert. Asked only when a
+        # plan is pending: unarmed, the finish path is the stock one byte for
+        # byte (the h63c/h63d harnesses bind this method alone).
+        # TWIN ANCHOR (weg2/twin_anchor.py): the step's twin-boundary tracks
+        # ride the same insert, in position order.
+        if (getattr(req, _TURN_PENDING_ATTR, None) is not None
+                or getattr(req, _TWIN_PENDING_ATTR, None)
+                or getattr(req, _FORK_PENDING_ATTR, None) is not None):
+            self._weg2_turn_insert(req, is_insert=is_insert)
 
         kv_committed_len = req.pop_committed_kv_cache()
+        _prl.mark("turn")
         # #969L: THE VALUE AT THE PARK INSERT. §S proved this insert IS reached
         # for a retracted request (is_insert=True, skip=False) and that nothing
         # declines it (#991=0, #969H EMPTY=0), which leaves only a ZERO-LENGTH
@@ -2772,6 +2956,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
+        _prl.mark("commit")
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         # fnFL2x76: the retention key may take one token beyond the retained
         # KV (`bigram_anchor_key`); `token_ids` itself is truncated below.
@@ -2791,6 +2976,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = None
         insert_params = None
+        _prl.mark("ids")
 
         if is_insert:
             insert_params = InsertParams(
@@ -2822,12 +3008,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # None and never truncated), and the publish behind the free read
             # 97792 rows for a cut of 97840 (x169: "WEG2-TAIL-PUBLISH refused",
             # D no_parts).  No capture armed = a no-op (tail_handoff).
+            _prl.mark("prepare")
             tail_handoff.publish_rows(
                 req, kv_indices, self.token_to_kv_pool_allocator, f"pp{self.pp_rank}-{os.getpid()}",
                 req_to_token_pool=self.req_to_token_pool, n_parts=self.pp_size,
             )
 
             # Truncate if needed
+            _prl.mark("rows")
             if effective_cache_len < len(token_ids):
                 free_start = max(effective_cache_len, req.cache_protected_len)
                 # #935: THE FINISHED PATH TRUSTS cache_protected_len AND NEVER
@@ -2861,6 +3049,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
+            _prl.mark("trim")
             radix_key = bigram_anchor_key(
                 token_ids_full, len(token_ids), req.extra_key,
                 is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
@@ -2877,10 +3066,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # KV tail above the component cap that was just freed.
             setattr(req, _weg2_park_read.RETAINED_ATTR, _weg2_park_read.retained_raw_tokens(radix_key))
             self._weg2_cap_tail = None
+            _prl.mark("key")
             result = self.insert(insert_params)
+            _prl.mark("insert")
 
             # Free unaligned tail (the tail hand-off above has its rows)
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            _prl.mark("free")
             if _WEG2_END_ANCHOR:
                 # fnFL2 H63d: the probe asks for the anchor at or below N-1 of
                 # the PROMPT, not of the retained key -- on the truncated ids
@@ -2890,12 +3082,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # 27B line (24.09.): the per-path cap runs AFTER the #1481 mark, so
             # the hand-back anchor N-1 is already exempt when the final node's
             # insert pushes the path over the bound.
+            _prl.mark("anchor")
             self._weg2_cap_after_insert()
+            _prl.mark("cap")
             self._weg2_handoff_write(req, radix_key)
+            _prl.mark("handoff")
             self._weg2_publish_at_retain(req, radix_key)
+            _prl.mark("publish")
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
+        _prl.mark("release_free")
         finish_dec_params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
         # #811: an anchor pin already released at the write-through ack must
         # not be decremented a second time here. Covers retraction too --
@@ -2907,15 +3104,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
+        _prl.mark("dec")
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+        _prl.mark("cleanup")
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
+        # TURN ANCHOR (weg2/turn_anchor.py): the step's second track goes in
+        # first, as its own node below this chunk's insert (only with a plan
+        # pending; unarmed nothing is asked) -- with the twin-boundary tracks
+        if (getattr(req, _TURN_PENDING_ATTR, None) is not None
+                or getattr(req, _TWIN_PENDING_ATTR, None)
+                or getattr(req, _FORK_PENDING_ATTR, None) is not None):
+            self._weg2_turn_insert(req)
 
         token_ids = req.get_fill_ids()
 
@@ -3095,6 +3301,121 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._weg2_defer_chunk_publish(req, radix_key)
         else:
             self._weg2_publish_at_chunk(req, radix_key)   # xsn346: the chunk's node goes out now
+        # L15-14d: a P request with a deposit session writes the tokens
+        # computed so far into D's held deposit rows (no-op without a session)
+        from sglang.srt.weg2 import l15_deposit_hook as _l15_dep
+        if _l15_dep.active():
+            _l15_dep.on_chunk(req, final=False, filled=len(req.fill_ids))
+
+    def _weg2_turn_insert(self, req: Req, is_insert: bool = True) -> None:
+        """TURN ANCHOR (weg2/turn_anchor.py): insert the state the step's
+        second track wrote at ``t`` (the start of the prompt's last message) as
+        the request's anchor node ``key[:t]``, before the step's own insert.
+
+        The same sequence as ``cache_unfinished_req`` for a chunk ending at t,
+        with the tracked slot as the mamba value: insert, re-match, rewrite the
+        request's rows to the tree's, move the lock, settle the #811 pin (the
+        step's own insert right after publishes the chain). A plan the forward did not fully write (a missing
+        GDN/PLE mark), a skipped insert, or a protected prefix already at t
+        frees the slot and inserts nothing. Unarmed: no pending plan, a no-op.
+        """
+        from sglang.srt.weg2 import turn_anchor as _ta
+
+        # TWIN ANCHOR / FORK TRACK: the turn plan, the step's twin-boundary
+        # plans and its told-fork plan, lowest position first -- each is its
+        # own node on the request's path.
+        for kind, pend in _ta.pop_all_pending(req):
+            self._weg2_turn_insert_one(req, pend, kind=kind, is_insert=is_insert)
+
+    def _weg2_turn_insert_one(self, req: Req, pend, *, kind: str, is_insert: bool) -> None:
+        """One second-track plan ``pend`` (turn or twin boundary) into the tree
+        (see ``_weg2_turn_insert``)."""
+        from sglang.srt.weg2 import turn_anchor as _ta
+
+        t, slot, _desc, step_start, step_end = pend
+        ok, why = _ta.insert_verdict(pend)
+        if ok and (not is_insert or self.disable):
+            ok, why = False, "no_insert"
+        if ok and int(req.cache_protected_len or 0) >= t:
+            ok, why = False, "protected"
+        radix_key = None
+        if ok:
+            radix_key = bigram_anchor_key(
+                bigram_anchor_ids(req.origin_input_ids[:t], req.full_untruncated_fill_ids),
+                t, req.extra_key,
+                is_bigram=self.is_eagle, exact=self.bigram_anchor_exact,
+                page_size=self.page_size,
+            )
+            if len(radix_key) != t:
+                ok, why = False, "key_len"
+        if not ok:
+            self._weg2_turn_free(slot)
+            _ta.note_skip(req, why, t, kind=kind)
+            return
+        # #811: the old anchor's pin may already be gone (released at its ack);
+        # its MAMBA half is then not decremented again below.
+        mamba_anchor_released = bool(
+            self._anchor_ack_release_armed and req.mamba_anchor_pin_released
+        )
+        kv_step = self.req_to_token_pool.req_to_token[req.req_pool_idx, :step_end]
+        insert_params = InsertParams(
+            prev_prefix_len=req.cache_protected_len,
+            chunked=True,
+            priority=req.priority or 0,
+        )
+        insert_params.key = radix_key
+        insert_params.value = kv_step[:t].to(dtype=torch.int64, copy=True)
+        insert_params.mamba_value = slot
+        self._weg2_cap_tail = None
+        result = self.insert(insert_params)
+
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        new_indices = match_result.device_indices
+        new_last_node = match_result.last_device_node
+        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"TURN ANCHOR: {req.cache_protected_len=}, {len(new_indices)=}, {t=}"
+        )
+        self.req_to_token_pool.write(
+            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+            new_indices[req.cache_protected_len :],
+        )
+        dec_params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        if mamba_anchor_released:
+            dec_params.skip_lock_node_ids.setdefault(ComponentType.MAMBA, set()).add(
+                req.last_node.id
+            )
+        self.dec_lock_ref(req.last_node, dec_params)
+        lock_result = self.inc_lock_ref(new_last_node)
+        if len(new_indices) < len(kv_step):
+            req.prefix_indices = torch.cat([new_indices, kv_step[len(new_indices) :]])
+        else:
+            req.prefix_indices = new_indices
+        req.cache_protected_len = len(new_indices)
+        req.last_node = new_last_node
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        self.note_anchor_pin(req, lock_result, settle=True)
+
+        taken = result is not None and not result.mamba_exist
+        if not taken:
+            self._weg2_turn_free(slot)
+        self._weg2_cap_after_insert()
+        # No publish of its own: the step's insert follows in this same call
+        # and publishes the request's chain parents-first (chunk publish /
+        # retain), this node included -- one sweep, not two (~20 ms each of
+        # scheduler-thread wall between forwards, WEG2-PUBLISH-REQ).
+        _ta.note_insert(
+            req, t=t, prefix_len=len(new_indices), taken=taken,
+            prompt=len(req.origin_input_ids), step=(step_start, step_end), kind=kind,
+        )
+
+    def _weg2_turn_free(self, slot) -> None:
+        """Give an unused turn slot back (through the component's free, so
+        the #1469 provenance sees it)."""
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is not None:
+            comp._free_mamba_value(slot)
+        else:
+            self.req_to_token_pool.mamba_allocator.free(slot)
 
     def _weg2_defer_chunk_publish(self, req, radix_key) -> None:
         pend = getattr(self, "_weg2_deferred_chunk_publish", None)
@@ -4343,6 +4664,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _r12.worker_short(self, why, node)
         except Exception as _e:  # noqa: BLE001 - an instrument never refuses harder
             logger.warning("R12 refusal note raised: %s: %s", type(_e).__name__, _e)
+        # HY: a park backup the arena refused (getattr: hermetic ranks borrow
+        # this method onto bare namespaces, test_form_a_host_shadow_r12)
+        _track = getattr(self, "_weg2_park_track", None)
+        if why == "arena_claim" and _track is not None:
+            _track[node.id] = node
         n = getattr(UnifiedRadixCache, "_1421_n", 0) + 1
         UnifiedRadixCache._1421_n = n
         # #1426: sampled PER REASON. xsn186 sampled 1/256 over the whole
@@ -4523,6 +4849,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if _pre is False:
             return 0
+        if _pre is None and kv_only_if_mamba_refused:
+            self._weg2_byteless_worker_kv_only(node, comp_xfers)
         if ComponentType.MAMBA not in comp_xfers and sidecar_xfers:
             # P-FUND: the claim dropped the anchor; a sidecar indexed by it
             # has no source rows either.
@@ -4674,6 +5002,138 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         adopted = int(getattr(insert_result, "anchor_adopted_tokens", 0) or 0)
         return max(0, int(insert_result.prefix_len) - adopted)
 
+    def _weg2_anchor_only_candidate(self, node: UnifiedTreeNode) -> bool:
+        """ANCHOR-ONLY BACKUP: a node whose KV is backed (host copy or store)
+        and whose Mamba anchor is on the device only, with nothing in flight."""
+        if not envs.SGLANG_WEG2_ANCHOR_ONLY_BACKUP.get():
+            return False
+        if node is self.root_node or node.evicted:
+            return False
+        if not (node.backuped or node.l3_present):
+            return False
+        if node.write_through_pending_id is not None:
+            return False
+        if self._weg2_anchor_secured_holds(node):
+            return False    # KV-in-store anchor already in the arena (not in the tree)
+        if ComponentType.MAMBA not in self.tree_components:
+            return False
+        if len(node.component_data) <= int(ComponentType.MAMBA):
+            return False
+        cd = node.component_data[ComponentType.MAMBA]
+        return cd.value is not None and cd.host_value is None and bool(node.hash_value)
+
+    def _weg2_anchor_secured_holds(self, node: UnifiedTreeNode) -> bool:
+        """y6b (review a54a22e54d F1): ``weg2_anchor_secured`` was set once at
+        the ack and never cleared. The ack hands the write's reference back
+        (the tree holds none), so the slot is a clock candidate; the clock
+        writes it to L3 before it frees it (#257 (d)), but a copy that write
+        could not make (``dropped_without_l3``) left the mark standing -- the
+        sweep never rewrote the anchor and ANCHOR-LOST never counted it, while
+        the device anchor it could have been rewritten from was still there.
+
+        The mark now holds only while the bytes do: a COMPLETE arena slot or an
+        L3 copy (``ArenaMambaPoolHost.anchor_held``). Gone -> the mark is
+        cleared and named (ANCHOR-SECURED-LOST); the next sweep writes the
+        anchor again. A pool that cannot tell keeps the mark (as before)."""
+        if not getattr(node, "weg2_anchor_secured", False):
+            return False
+        mp = self._weg2_mamba_pool()
+        probe = getattr(mp, "anchor_held", None)
+        if not callable(probe) or not node.hash_value:
+            return True
+        try:
+            held = probe(node.hash_value[-1])
+        except Exception as exc:  # noqa: BLE001 - loud; an unreadable answer keeps the mark
+            logger.warning("WEG2 ANCHOR-SECURED probe raised: %r", exc)
+            return True
+        if held is None or held:
+            return True
+        node.weg2_anchor_secured = False
+        n = getattr(UnifiedRadixCache, "_weg2_anchor_secured_lost_n", 0) + 1
+        UnifiedRadixCache._weg2_anchor_secured_lost_n = n
+        if n <= 16 or n % 64 == 0:
+            logger.warning(
+                "WEG2 ANCHOR-SECURED-LOST n=%d node=%s depth=%d (anchor-only slot gone with no L3 copy; "
+                "the mark is cleared -- the sweep writes the device anchor again, ANCHOR-LOST counts it)",
+                n, node.id, self.weg2_node_depth(node),
+            )
+        return False
+
+    def write_backup_anchor_only(self, node: UnifiedTreeNode) -> int:
+        """ANCHOR-ONLY BACKUP (NF y5a 30.09.): copy ONLY the node's Mamba anchor
+        D->H into the Mamba arena -- the KV is already backed (``backuped`` or
+        ``l3_present``), so no KV row is claimed or copied.
+
+        The KV-less write goes through the same controller write as every
+        backup (empty KV indices, the anchor as its one extra pool), is pinned
+        and tracked like a write-through (``ongoing_write_through``), and its
+        ack completes the anchor's arena slot only
+        (``_weg2_direct_complete``); the arena later writes it to L3 before its
+        slot is freed (#257). Returns 1 when issued, 0 when not (named)."""
+        if self.cache_controller is None or not self._weg2_anchor_only_candidate(node):
+            return 0
+        mp = self._weg2_mamba_pool()
+        if mp is None:
+            self._1421_refused("anchor_only_no_arena", node)
+            return 0
+        if not self._mamba_write_through_pin_admissible(node):
+            self._note_mamba_pin_skipped()
+            self._1421_refused("anchor_only_pin", node)
+            return 0
+        comp = self.components[ComponentType.MAMBA]
+        xfers = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+        if not xfers:
+            return 0
+        mrows = self._weg2_mamba_claim(node, mp, node.hash_value[-1])
+        if mrows is None:
+            self._weg2_sweep_last_refusal = "mamba_claim"   # xsn342: a full arena ends the sweep
+            self._1421_refused("anchor_only_claim", node)
+            return 0
+        xfers[0].host_indices = mrows
+        kv_dv = node.component_data[BASE_COMPONENT_TYPE].value
+        empty_dev = kv_dv[:0]
+        empty_host = torch.empty((0,), dtype=torch.int64)
+        try:
+            got = self.cache_controller.write(
+                empty_dev, node_id=node.id, extra_pools=xfers, host_indices=empty_host,
+            )
+        except BaseException:
+            mp.abort_write(mrows)
+            raise
+        if got is None:
+            mp.abort_write(mrows)
+            self._1421_refused(
+                "anchor_only_write_none:%s" % getattr(self.cache_controller, "_weg2_last_write_refusal", "?"),
+                node,
+            )
+            return 0
+        self._weg2_direct_mamba_rows[node.id] = mrows   # in flight: no displacement takes it
+        self._weg2_anchor_only_ids.add(node.id)
+        # y5d (D TP0 19:52:54Z, sanity_check "node 147 mamba host present but
+        # Full.host_value=None"): the tree law is "aux host requires Full host"
+        # (evict_host, host leaves, the host LRUs, write_backup and load-back all
+        # key on Full.host_value). With the KV only in the store (l3_present, no
+        # host copy) the anchor goes into the arena slot of its page hash and
+        # is released there at the ack -- the slot, not the tree, carries it
+        # over the flush. Only a node whose KV has a host copy commits it.
+        if node.backuped:
+            comp.commit_hicache_transfer(node, CacheTransferPhase.BACKUP_HOST, transfers=xfers)
+        else:
+            self.__dict__.setdefault("_weg2_anchor_only_detached", set()).add(node.id)
+        lock_params = self.inc_lock_ref(node).to_dec_params()
+        self._track_write_through_node(node, lock_params)
+        n = getattr(UnifiedRadixCache, "_weg2_anchor_only_n", 0) + 1
+        UnifiedRadixCache._weg2_anchor_only_n = n
+        if n <= 16 or n % 64 == 0:
+            logger.info(
+                "WEG2 ANCHOR-ONLY-BACKUP n=%d node=%s depth=%d kv=%s (the KV is backed; only the "
+                "device Mamba anchor is copied into the arena -- no flush drops it; %s)",
+                n, node.id, self.weg2_node_depth(node),
+                "host" if node.backuped else "store",
+                "tree host value" if node.backuped else "arena slot only, not in the tree: Full has no host copy",
+            )
+        return 1
+
     def _track_write_through_node(
         self,
         node: UnifiedTreeNode,
@@ -4766,6 +5226,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         pool = self.cache_controller.mem_pool_host.get_pool(PoolName.MAMBA)
         return int(pool.available_size()) >= len(mxfer.device_indices)
 
+    def _weg2_byteless_worker_kv_only(self, node, comp_xfers) -> None:
+        """y6h-kvh (01.10. 15:27:56Z, token vector 64,0,0 = Form A dcp 1): a
+        Form A worker that owns NO KV rows has no KV arena either (store
+        FormAWorkerNullStorage), so its backups take the staging path, where
+        the anchor needs a row of the byteless R12 shadow mamba pool. With
+        that pool full and its host eviction refused by R12 the controller
+        returned None ('#1421 BACKUP-REFUSED why=write_none:?'), every device
+        leaf refused, 'MAMBA-EVICT NO-PROGRESS', and TP1/TP2 died in
+        alloc_req_slots at mamba_available=2/38 while TP0 (P-FUND KV-only on
+        its arena) still had room. The direct path's M1s rule, applied here:
+        under eviction a full shadow pool goes KV-only; R12 reconciles the
+        anchor ('short')."""
+        if _r12.role() != "worker":
+            return
+        group = getattr(self.cache_controller, "mem_pool_host", None)
+        names = getattr(group, "entry_map", None) or {}
+        if PoolName.MAMBA not in names:
+            return
+        pool = group.get_pool(PoolName.MAMBA)
+        if pool is None or hasattr(pool, "arena_resolve_reads"):
+            return
+        for ct, xfers in list(comp_xfers.items()):
+            for x in xfers:
+                if x.name == PoolName.MAMBA and x.host_indices is None and x.device_indices is not None:
+                    if int(pool.available_size()) < len(x.device_indices):
+                        comp_xfers.pop(ct, None)
+                        self._pfund_note_kv_only(node)
+                    return
+
     def _weg2_mamba_pool(self):
         cc = self.cache_controller
         group = getattr(cc, "mem_pool_host", None)
@@ -4794,7 +5283,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rid = node.weg2_anchor_rid
         cap = _mad.rid_anchor_cap(configured=self._weg2_rid_anchor_cfg, arena_slots=mp.arena_slots)
         if rid is None or cap == 0:
-            return mp.alloc_write([last_hash])
+            mrows = mp.alloc_write([last_hash])
+            if (mrows is None and getattr(self, "_weg2_flush_spill", False)
+                    and not getattr(node, "_weg2_flush_spilled", False)):
+                # once per node and rank (the H19 FULL rule): a slot frees only
+                # after the LAST rank released it -- later rounds re-claim only
+                node._weg2_flush_spilled = True
+                if self._weg2_flush_spill_room(node, mp):
+                    mrows = mp.alloc_write([last_hash])
+            return mrows
         st = self._weg2_anchor_ledger.of(rid)
         path, depth = _mad.ancestor_path(target=node, root=self.root_node)
         owned = _mad.owned_anchors(path=path, rid=rid, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
@@ -4813,6 +5310,61 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mrows = mp.alloc_write([last_hash])
         self._weg2_note_anchor_claim(node, rid, st, ok=mrows is not None, held=len(owned), depth=depth, cap=cap, mp=mp)
         return mrows
+
+    #: FLUSH-SPILL: anchors spilled to L3 and freed at sleep flushes (per process)
+    _weg2_flush_spill_n = 0
+
+    def _weg2_flush_spill_room(self, node, mp) -> bool:
+        """D-NORECOMPUTE (a), y6z 08:24:41: the sleep flush could not back up
+        the retained span of a parked request -- '#1421 BACKUP-REFUSED
+        why=mamba_claim node=205 depth=45888 rid=None', '#1427 ARENA-CLAIM
+        REFUSED (4 = no free slot)', '#1470 FLUSH-PUBLISH ... unbacked_left=1',
+        'WEG2-ANCHOR-LOST at=flush n=13 depths=[45888..51520]'; the wake read
+        stopped at 45568 and D recomputed 5952 tokens. A rid-less node has no
+        own anchor to give (the H19 FULL path needs a rid), and the arena was
+        full of other requests' settled anchors the tree still referenced.
+
+        At the flush (``_weg2_flush_spill`` set by the #1470 loop; the reset
+        follows): another request's shallowest INTERMEDIATE anchor
+        (``pick_foreign_victim``: never an end anchor, never a request's
+        deepest) is SPILLED to L3 (``arena_secure_to_disk``: an anchor already
+        on disk is not written again), then released and its slot freed -- the
+        read after the wake takes it from disk. A victim whose copy could not
+        be secured is NOT released (no anchor is traded for another). Returns
+        True when a slot was freed."""
+        backend = getattr(mp, "_backend", None)
+        arena = getattr(mp, "arena", None)
+        secure = getattr(backend, "arena_secure_to_disk", None)
+        if arena is None or not callable(secure):
+            return False
+        tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
+        tree = [a for a in tree if a.node is not node]
+        victim = _mad.pick_foreign_victim(tree, rid="")
+        if victim is None or not victim.slots:
+            logger.warning("WEG2 MAMBA-ARENA FLUSH-SPILL node=%s depth=%s victim=none (no releasable "
+                           "intermediate anchor in the tree -- the node stays un-backed, named)",
+                           getattr(node, "id", "?"), _mad.ancestor_path(target=node, root=self.root_node)[1])
+            return False
+        slot_bytes = int(getattr(arena, "slot_bytes", 0) or 0)
+        try:
+            sec = secure(arena, [(int(s), 0, 0, slot_bytes) for s in victim.slots])  # 27B: no writer label
+        except Exception as exc:  # noqa: BLE001 -- not secured = not released
+            logger.warning("WEG2 MAMBA-ARENA FLUSH-SPILL secure raised %s: %s", type(exc).__name__, exc)
+            return False
+        if int(sec.get("lost", 0) or 0) > 0:
+            logger.warning("WEG2 MAMBA-ARENA FLUSH-SPILL victim=%s depth=%d NOT released: its L3 copy "
+                           "could not be secured (%s)", victim.node.id, victim.depth, sec)
+            return False
+        st = self._weg2_anchor_ledger.of(victim.rid)
+        self._weg2_release_anchor(victim, mp, st, why="flush_spill", for_rid="flush")
+        UnifiedRadixCache._weg2_flush_spill_n += 1
+        logger.info("WEG2 MAMBA-ARENA FLUSH-SPILL n=%d node=%s victim_rid=%s victim_node=%s depth=%d "
+                    "on_disk=%d written=%d (sleep flush: the victim's anchor is on L3, its slot freed "
+                    "for the un-backed node -- no anchor lost, no D recompute after the wake)",
+                    UnifiedRadixCache._weg2_flush_spill_n, getattr(node, "id", "?"), str(victim.rid)[:16],
+                    victim.node.id, victim.depth, int(sec.get("on_disk", 0) or 0),
+                    int(sec.get("written", 0) or 0))
+        return True
 
     def _weg2_anchor_of(self, n, mp):
         """(held, slots): an arena anchor sits on `n`; its slots when this rank
@@ -5148,6 +5700,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         reference, and mark the node store-present -- the sweep has nothing
         left to publish for it."""
         cc = self.cache_controller
+        _ao = getattr(self, "_weg2_anchor_only_ids", None)
+        if _ao and node.id in _ao:
+            # ANCHOR-ONLY BACKUP: this write carried no KV -- complete the
+            # anchor's arena slot only (the KV was complete before).
+            _ao.discard(node.id)
+            mrows = (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
+            mp = self._weg2_mamba_pool()
+            _det = getattr(self, "_weg2_anchor_only_detached", None)
+            if _det is not None and node.id in _det:
+                # KV only in the store: complete the slot, give this write's
+                # reader reference back (the tree holds none), mark it secured
+                _det.discard(node.id)
+                if mp is not None and mrows is not None and mrows.numel() and mp.is_arena_id(int(mrows.min())):
+                    try:
+                        mp.complete_write(mrows)
+                        mp.free(mrows)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("ANCHOR-ONLY (store) complete raised: %r", exc)
+                    else:
+                        node.weg2_anchor_secured = True
+                return True
+            mhv = node.component_data[ComponentType.MAMBA].host_value
+            if mp is not None and mhv is not None and mhv.numel() and mp.is_arena_id(int(mhv.min())):
+                try:
+                    mp.complete_write(mhv)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("ANCHOR-ONLY complete raised: %r", exc)
+                else:
+                    self._weg2_release_inner_anchor(node, mp)
+            return True
         pool = getattr(cc, "mem_pool_host", None)
         if getattr(pool, "arena", None) is None:
             return False
@@ -5976,6 +6558,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 or node.backuped
                 or node.l3_present
             ):
+                # ANCHOR-ONLY BACKUP (y5a: 16x WEG2-ANCHOR-LOST at=flush): the
+                # KV of this node is on the host / in the store, its Mamba
+                # anchor on the device only -- the reset would drop it.
+                if node is not self.root_node and self._weg2_anchor_only_candidate(node):
+                    stats["unbacked"] += 1
+                    stats["anchor_only"] = stats.get("anchor_only", 0) + 1
+                    if stats["issued"] < max_issue:
+                        if self.write_backup_anchor_only(node) > 0:
+                            stats["issued"] += 1
+                        else:
+                            stats["refused"] += 1
                 continue
             if node.component_data[BASE_COMPONENT_TYPE].value is None:
                 continue
@@ -6519,7 +7112,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 or node.hit_count >= self.write_through_threshold
             )
         ):
-            self.write_backup(node)
+            if _prl.armed():  # FLIP-EDGE 2: the write-through issue, nested in "insert"
+                _t0 = time.perf_counter()
+                self.write_backup(node)
+                _prl.acc("wb", time.perf_counter() - _t0)
+            else:
+                self.write_backup(node)
 
     @staticmethod
     def _plain_sidecar_transfers(transfers, registered_pools) -> list:
@@ -7444,6 +8042,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _keys:
                 _pages = int(prefetch_length) // int(self.page_size)
                 _total = _keys  # chain length in pages == P's inserted page count
+
                 _ids = _ho.read_ids(str(req_id))
                 _ntok = len(_ids) if _ids else None
                 # HANDOFF-KEY OFFSET (N3c 10012013): from the span's absolute
@@ -7584,6 +8183,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rate, and the acceptance expects 0 of them on a sized boot.
         """
         t = self._prefetch_line_terms(need)
+        # #287 NEED0: the settle reads a refusal's own terms (need/available)
+        # to tell "no room" from "nothing to read" (weg2/settle_writer.py).
+        _terms = self.__dict__.get("_weg2_refusal_terms")
+        if _terms is None:
+            import collections as _collections
+
+            _terms = self.__dict__["_weg2_refusal_terms"] = _collections.OrderedDict()
+        _terms.pop(str(req_id), None)
+        # the ROOM is the smaller of the host pool's free rows and the
+        # prefetch budget left (limit - occupied): y3u refused need=77824 with
+        # available=415040 but occupied=392320 > limit=373536
+        _room = int(t["available"])
+        if int(t["limit"]) >= 0 and int(t["occupied"]) >= 0:
+            _budget = int(t["limit"]) - int(t["occupied"])
+            _room = _budget if _room < 0 else min(_room, _budget)
+        _terms[str(req_id)] = (str(reason), int(t["need"]), int(_room))
+        while len(_terms) > 1024:
+            _terms.popitem(last=False)
         # H108: the key source of this rank's #950 presence probe (handoff /
         # own), "-" when the rank was eligible without asking.
         _keys = (getattr(self, PRESENCE_SRC_ATTR, None) or {}).get(str(req_id), "-")
@@ -7839,15 +8456,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         return done
 
-    def _anchor_reach_local(self, completed_tokens: int, hash_value) -> int:
+    def _anchor_reach_local(self, completed_tokens: int, hash_value, operation=None) -> int:
         """#257 (b): this rank's deepest reachable recurrent anchor of a SHORT
         read, in tokens -- the trailing mamba boundary the store reports over
         the pages that did land (the same question ``_storage_hit_query``
         asked before the read, ``_presence_pool_transfers``). A full read, a
-        model without a mamba component, or a rank without a store abstains."""
+        model without a mamba component, or a rank without a store abstains.
+
+        SA (NF y3v, weg2-46-98): when the controller READ the state of a short
+        read (``_weg2_short_anchor_pages`` on the operation, 0 = none could be
+        read), that page is the anchor -- the store's presence answer named
+        45824 while nothing had loaded the state there, and the cut inserted
+        a stateless prefix PP0's own walk then refused."""
         full = len(hash_value) * self.page_size
         if int(completed_tokens) >= full:
             return _ANCHOR_ABSTAIN
+        _sa_pages = None if operation is None else getattr(operation, "_weg2_short_anchor_pages", None)
+        if _sa_pages is not None:
+            return int(_sa_pages) * self.page_size
         cc = self.cache_controller
         backend = getattr(cc, "storage_backend", None)
         transfers_fn = getattr(cc, "_presence_pool_transfers", None)
@@ -7922,7 +8548,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _eb,
             completed_tokens,
             _hit_tokens_local,
-            self._anchor_reach_local(completed_tokens, hash_value),
+            self._anchor_reach_local(completed_tokens, hash_value, operation),
         )
         _synced_end = int(_c_vote)
         packed_list = [_c_vote] + [0] * _POOL_SLOT_COUNT
@@ -7998,6 +8624,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # is collective-free. On a rank whose scheduler thread is blocked in
         # something else, neither runs and this diagnostic is structurally
         # silent -- by construction, not by chance.
+        # held short wake read (weg2/short_read.py): the group's probe held
+        # every page, the read ended short -- the settle re-reads at once
+        _weg2_short_read.note_reap(
+            req_id,
+            requested_pages=len(getattr(operation, "token_ids", None) or ())
+            // max(1, int(self.page_size)),
+            hit_pages=_hit_tokens // max(1, int(self.page_size)),
+            completed_tokens=int(min_completed_tokens),
+            page_size=int(self.page_size),
+        )
         _hit_pages_kv = len(hash_value)
         _completed_local = (
             _hit_pages_kv > 0 and completed_tokens == _hit_pages_kv * self.page_size
@@ -8159,6 +8795,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         // self.page_size
                     ]
                 )
+
+        # SA: a state is committed only at the cut it belongs to. On a rank
+        # that decides its own cut (no attention-TP reduce) this is local and
+        # final; on a TP group the MIN-reduced hit pages already decide for
+        # every rank alike and a rank-local refusal would split them.
+        if self.tp_world_size <= 1:
+            from sglang.srt.mem_cache.short_read_anchor import refuse_foreign_depth_states
+
+            refuse_foreign_depth_states(
+                rid=req_id,
+                transfers=[x for xfers in comp_xfers.values() for x in xfers],
+                hash_value=hash_value,
+                cut_pages=int(min_completed_tokens) // self.page_size,
+                hit_pages=operation.pool_storage_result.extra_pool_hit_pages,
+            )
 
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
@@ -8998,6 +9649,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rest stays queued (see hicache_drain_budget). None = drain the agreed
         counts whole, the unchanged path."""
         cc = self.cache_controller
+        if getattr(cc, "weg2_reset_reaper_alive", lambda: False)() is True:
+            # PARK-READ-DETACH: a detached reset's old pipeline is still ending;
+            # its control queues name slots of the cleared pool and are discarded
+            # with it at the restart -- never drained into a reallocated slot.
+            return
         # SGLANG_HICACHE_ROUND_TIMING: part times of this round (None = off).
         _parts = getattr(self, "_hc_parts", None)
 

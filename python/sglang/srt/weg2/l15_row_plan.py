@@ -249,8 +249,15 @@ def plan_p_to_d(
     row_bytes_per_layer: int,
     slot_bytes: int,
     tp0_skip: bool = True,
+    skip_ranks=None,
 ) -> List[RowPiece]:
     """Phase-2 deposit rows (plan 2.5): P chunk -> D owner rows.
+
+    ``skip_ranks`` (L15 hardware-generic, user order 02.10. 07:05Z): the D
+    ranks whose rows come from L2 at the wake instead of a deposit -- the
+    ranks with cap 0, whichever card they sit on. When given it REPLACES the
+    legacy ``tp0_skip`` (rank 0 by position), which stays only for callers
+    and tests written before.
 
     Chunk tokens ``[a, b)`` of P stage ``stage``; token ``i`` lands at D
     global slot ``e0 + i``, so its owner is the rank the owner rule names
@@ -272,7 +279,9 @@ def plan_p_to_d(
         idx, compact = owned_rows(global_slots, prefix, rank)
         if not idx:
             continue
-        if rank == 0 and tp0_skip:
+        skip = (rank in set(skip_ranks)) if skip_ranks is not None else (
+            rank == 0 and tp0_skip)
+        if skip:
             route = ROUTE_SKIP
         elif rank_card[rank] == stage_card[stage]:
             route = ROUTE_LOCAL

@@ -25,8 +25,11 @@ from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
-FLUSH_ORDER = ["sweep", "verdict", "store_join", "l15", "anchors", "l15_tail", "tree_reset",
-               "req_pool_clear", "alloc_clear", "zero_kv", "grammar_metrics", "draft",
+# RELEASE-INTEG 1002: the tree_reset / req_pool_clear marks sat inside the l15-lead's
+# L15-PLAIN-RESET timing block (reset + pool clears); his block wins, so those two marks are
+# dropped and alloc_clear covers the reset and both clears (the instrument tolerates gaps)
+FLUSH_ORDER = ["sweep", "verdict", "store_join", "l15", "anchors", "l15_tail",
+               "alloc_clear", "zero_kv", "grammar_metrics", "draft",
                "empty_cache", "scrub"]
 
 

@@ -46,9 +46,37 @@ def build_descriptor(*, epoch: int, rank: int, prefix: Sequence[int],
         "bases": [dict(b) for b in bases],
         "spans": [{"rid": str(s.rid), "depth": int(s.depth),
                    "slots": [int(x) for x in s.slots],
-                   "anchor_slot": int(s.anchor_slot)} for s in spans],
+                   "anchor_slot": int(s.anchor_slot),
+                   # L15-10c: the END anchor's canonical L2 slot -- P loads the
+                   # anchor from there (all heads of its layers, a few MiB)
+                   "anchor_l2_slot": int(getattr(s, "anchor_l2_slot", -1)),
+                   "anchor_l2_gen": int(getattr(s, "anchor_l2_gen", -1)),
+                   # L15-10c: every token's canonical L2 page (slot, gen) --
+                   # P loads the cap-0 ranks' tokens from there (base64 int64)
+                   "l2_slots_b64": _b64(getattr(s, "l2_slots", ())),
+                   "l2_gens_b64": _b64(getattr(s, "l2_gens", ()))}
+                  for s in spans],
         "n_fds": int(n_fds),
     }
+
+
+def _b64(values) -> str:
+    import base64
+
+    import numpy as np
+
+    return base64.b64encode(np.asarray(list(values), dtype="<i8").tobytes()).decode()
+
+
+def unb64(text) -> list:
+    """Inverse of the descriptor's ``*_b64`` int lists."""
+    import base64
+
+    import numpy as np
+
+    if not text:
+        return []
+    return np.frombuffer(base64.b64decode(text), dtype="<i8").tolist()
 
 
 class SharePublisher:
@@ -84,6 +112,17 @@ class SharePublisher:
         self._thr = threading.Thread(target=self._serve, daemon=True,
                                      name="l15-share-D%d" % self.rank)
         self._thr.start()
+
+    def update(self, **fields) -> None:
+        """L15-16c: add fields (the parked rows after the release's park) to
+        the served descriptor and its JSON; later connections see them."""
+        d = dict(self.descriptor)
+        d.update(fields)
+        self.descriptor = d
+        tmp = self.json_path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(d, fh, sort_keys=True)
+        os.replace(tmp, self.json_path)
 
     def _serve(self) -> None:
         from sglang.srt.weg2.l15_hold_share import send_hold
@@ -159,6 +198,26 @@ def publish_for_sched(sched, manifest, env, log) -> Optional["SharePublisher"]:
     mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
     wrapper = getattr(mr, "token_to_kv_pool", None)
     pool = l15_shadow.kv_pool_of(wrapper)
+    # L15-10c: a cap-0 rank keeps nothing on its card -- nothing to share
+    # (P loads that rank's tokens from L2); the capped ranks name it "cap0"
+    try:
+        from sglang.srt.distributed.utils import get_cp_token_ratios as _gr
+
+        _tp = len(_gr() or [1])
+        _rk = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0)
+        _rg = getattr(getattr(sched, "server_args", None), "rank_gpu_id", None)
+        _cards = (list(_rg) if isinstance(_rg, (list, tuple)) and len(_rg) == _tp
+                  else list(range(_tp)))
+        _caps = l15_shadow.caps_from_env(
+            env, _tp, [l15_shadow.cell_bytes_from(pool)] * _tp, _cards)
+        cap0 = [r for r in range(_tp) if int(_caps[r]) <= 0]
+        if _rk in cap0:
+            log("L15-SHARE rank=%d cap 0: nothing on this card to share (P "
+                "loads its tokens from L2)" % _rk)
+            return None
+    except Exception as exc:  # noqa: BLE001 -- no cap view, publish as before
+        cap0 = []
+        log("L15-SHARE cap view unavailable (%s: %s)" % (type(exc).__name__, exc))
     # layers are published as GLOBAL model layer ids (P stages hold subsets):
     # the hybrid wrapper's dense index -> global id, identity without one
     amap = getattr(wrapper, "full_attention_layer_id_mapping", None) or {}
@@ -222,6 +281,25 @@ def publish_for_sched(sched, manifest, env, log) -> Optional["SharePublisher"]:
         prefix.append(prefix[-1] + int(x))
     desc = build_descriptor(epoch=int(manifest.epoch), rank=rank, prefix=prefix,
                             bases=bases, spans=manifest.spans)
+    desc["cap0"] = [int(r) for r in cap0]
+    # L15-14b: the deposit region a running P prefill may write into
+    try:
+        from sglang.srt.weg2 import l15_deposit
+
+        tp = len(prefix) - 1
+        rgid = getattr(getattr(sched, "server_args", None), "rank_gpu_id", None)
+        cards = (list(rgid) if isinstance(rgid, (list, tuple)) and len(rgid) == tp
+                 else list(range(tp)))
+        caps = l15_shadow.caps_from_env(
+            env, tp, [l15_shadow.cell_bytes_from(pool)] * tp, cards)
+        reg = l15_deposit.deposit_region(
+            list(manifest.rows_by_rank), prefix, caps,
+            int(manifest.anchor_slots), l15_keep_split.anchor_cap(env))
+        if reg is not None:
+            desc["deposit"] = {"e0": reg.e0, "e1": reg.e1, "a0": reg.a0,
+                               "a1": reg.a1, "skip_ranks": list(reg.skip_ranks)}
+    except Exception as exc:  # noqa: BLE001 -- no deposit, the share stays
+        log("L15-DEPOSIT region refused (%s: %s)" % (type(exc).__name__, exc))
     pub = SharePublisher(share_dir(env), rank, desc, fds)
     pub.start()
     log("L15-SHARE published rank=%d bases=%d fds=%d spans=%d"

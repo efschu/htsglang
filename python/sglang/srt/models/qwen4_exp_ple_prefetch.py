@@ -57,6 +57,7 @@ from typing import Callable, List, NamedTuple, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.weg2 import rank_timing as _rank_timing  # RANK-TIMING: rankstats ple.prefill
 
 logger = logging.getLogger(__name__)
 
@@ -564,6 +565,9 @@ class _Pending(NamedTuple):
     slot: int
     ids: torch.Tensor
     vocab: tuple
+    #: H43 re-key (1001): the prediction's rows begin at this row of the slot
+    #: (an admission whose read window started before the chunk does)
+    off: int = 0
 
 
 def ple_row_keys(
@@ -726,12 +730,14 @@ class PlePrefetchGather:
         hit = 0
         ready = "none"
         pend, self._pending = self._pending, None
+        off = 0
         if pend is not None:
             was_ready = w.ready(pend.seq)
             tj = time.monotonic()
             gather_s += w.join(pend.seq)
             wait_s += time.monotonic() - tj
             k = pend.slot
+            off = max(0, int(pend.off))
             if pend.vocab == vocab:
                 m = min(n, int(pend.ids.numel()))
                 eq = ids[:m] == pend.ids[:m]
@@ -746,15 +752,15 @@ class PlePrefetchGather:
         else:
             k = 0
             miss = torch.arange(n)
-        slot = self._ensure_rows(k, n)
+        slot = self._ensure_rows(k, off + n)
         if miss.numel():
             keys = ple_row_keys(ids[miss], in_range[miss], self._table, self._file_index)
             tr = time.monotonic()
-            seq = w.submit(k, miss, keys)
+            seq = w.submit(k, miss + off, keys)
             gather_s += w.join(seq)
             wait_s += time.monotonic() - tr
         flat_out = out.reshape(n, dim)
-        flat_out.copy_(self._rows_view(slot, n), non_blocking=out.is_cuda and slot.pinned)
+        flat_out.copy_(self._rows_view(slot, off + n)[off:], non_blocking=out.is_cuda and slot.pinned)
         if flat_out.data_ptr() != out.data_ptr():
             out.copy_(flat_out.reshape(out.shape))
         if out.is_cuda:
@@ -787,6 +793,10 @@ class PlePrefetchGather:
         self.stats["hit_rows"] += hit
         self.stats["read_rows"] += int(miss.numel())
         self.stats["wait_s"] += wait_s
+        # RANK-TIMING: the chunk's PLE (host wall; hit = rows the prefetch had ready)
+        _rank_timing.note_ple("prefill", wall * 1000.0, hit=hit, miss=int(miss.numel()),
+                              wait_ms=wait_s * 1000.0,
+                              nbytes=int(miss.numel()) * int(self._table.row_bytes))
         logger.info(
             "PLE-PREFETCH chunk=%d rows=%d ready=%s wait_ms=%.1f gather_ms=%.1f "
             "hit_rows=%d read_rows=%d host_ms=%.1f next=%s procs=%d",

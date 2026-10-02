@@ -112,3 +112,66 @@ def test_layer_major_views_get_one_hold_extent_per_layer():
     assert holds == [(0, G), (8 * G, 9 * G), (16 * G, 17 * G)]
     plan = ks.split_plan(holds, 24 * G, G)
     assert plan[0] == (0, G) and plan[1] == (G, 8 * G) and plan[-1] == (17 * G, 24 * G)
+
+
+def test_cap0_rank_arms_empty_windows_on_unsplit_bases_and_keeps_its_manifest(tmp_path):
+    """L15-FIX-CAP0-SPLIT (N3y 08:41:17Z): the cap-0 rank never splits
+    (hold rows 0) and arms EMPTY keep windows (L15-FIX-CAP0-KEEP); the arm
+    must succeed so its manifest stays -- a refusal made it vote None and
+    every wake fell back group-wide."""
+    sv = FakeSaver(64 * G)
+    base = Base(0x4000)
+    m = tmp_path / "m.json"
+    m.write_text("{}")
+    logs = []
+    ok = arm_keep_spans(sv, {1: (base, [])}, str(m), rank=0, log=logs.append,
+                        granule=G,
+                        split_lookup=lambda b, r: ks.keep_extents(b.data_ptr(), r))
+    assert ok is True and m.exists(), logs
+    assert sv.keep == [] and sv.pause_kept_bytes() == 0
+    assert ks.keep_extents(0x4000, [(5, 5)]) == []
+
+
+def test_a_hold_covering_the_whole_base_is_still_split_and_kept(tmp_path):
+    """L15-FIX-WHOLE-HOLD (N4f 11:09:36): the merged hold regions cover the
+    whole allocation (conv base); a one-range plan would be the stock
+    mapping -- no extents, unmapped whole by the pause. The split cuts it
+    into two span extents inside the hold region, both kept."""
+    sv = FakeSaver(4 * G)
+    base = Base(0x5000)
+    # 4 layer views of G each, 1 row of G/2 held per view -> each region is
+    # widened to the granule and they merge into [0, 4G): the whole base
+    views = [(i * G, G // 2) for i in range(4)]
+    n = ks.ensure_split({0x5000: (base, views)}, lambda p: 1, lambda b: G, sv,
+                        lambda t: None, lambda m: None)
+    assert n == 1, "the whole-base hold must still be split"
+    assert sv.extents == [(0, G), (G, 4 * G)]
+    m = tmp_path / "m.json"
+    m.write_text("{}")
+    ok = arm_keep_spans(sv, {1: (base, [(0, G // 2), (2 * G, 2 * G + G // 2)])},
+                        str(m), rank=1, log=lambda s: None, granule=G,
+                        split_lookup=lambda b, r: ks.keep_extents(
+                            b.data_ptr(), r, native=[(0, G), (G, 3 * G)]))
+    assert ok is True
+    assert sv.pause_kept_bytes() == 4 * G
+
+
+def test_split_early_runs_on_every_plain_d_flush_not_only_with_parked():
+    """L15-SPLIT-EARLY (N5n 14:43:49, dac8b62b8c): the split ran only in the first
+    sleep WITH parked requests (inside the KEEP-CLEAR gate on weg2_d_parked), i.e.
+    inside a user flip. It must sit outside that gate: master on + group D only.
+    RED on a9dcae8df7 (the call sat under the parked gate)."""
+    import inspect
+    import re
+
+    from sglang.srt.managers import scheduler as sch
+
+    src = inspect.getsource(sch)
+    i = src.index("L15-SPLIT-EARLY")
+    block = src[i:i + 1600]
+    assert "ensure_split_for_sched" in block
+    assert 'SGLANG_WEG2_GROUP' in block and "master_on" in block
+    assert "weg2_d_parked" not in block
+    clear = src[src.index('"L15-KEEP-CLEAR at=sleep rank=%d bases=%d"') - 1200:i]
+    assert not re.search(r"ensure_split_for_sched\(", clear), \
+        "the split must not stay inside the parked-only KEEP-CLEAR gate"

@@ -23,6 +23,7 @@ Two independent defects on that one path, both from the known
    reject that, it wedges.
 """
 
+import os
 import threading
 import types
 import unittest
@@ -201,7 +202,9 @@ class TestRankUniformCollectiveShape(unittest.TestCase):
         self.assertEqual(rank0["numel"], rank1["numel"])
 
     def test_drain_vector_keeps_head_triple_and_local_pool_values(self):
-        got = self._drain_vector({PoolName.MAMBA: _FakeQueue(4)})
+        # the unbudgeted drain ("0": SGLANG_HICACHE_DRAIN_BUDGET is on by default since 29.09.)
+        with mock.patch.dict(os.environ, {"SGLANG_HICACHE_DRAIN_BUDGET": "0"}):
+            got = self._drain_vector({PoolName.MAMBA: _FakeQueue(4)})
         self.assertEqual(got["values"][:3], [1, 2, 3])
         self.assertEqual(got["impl"]["n_revoke"], 1)
         # fnFL2 H74 (x172): the backup acks drain rank-locally (None = every

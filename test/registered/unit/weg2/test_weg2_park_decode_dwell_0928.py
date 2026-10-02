@@ -27,6 +27,8 @@ from sglang.srt.weg2 import phase_policy as pp  # noqa: E402
 def _env(monkeypatch):
     monkeypatch.delenv(pp.PARK_CYCLE_DWELL_ENV, raising=False)
     monkeypatch.delenv(pp.PARK_DECODE_DWELL_ENV, raising=False)
+    # PARK-NO-DWELL (02.10.) removes the dwell this file pins: the old rule, explicitly
+    monkeypatch.setenv("SGLANG_WEG2_PARK_NO_DWELL", "0")
 
 
 def test_policy_counts_decode_not_wake():

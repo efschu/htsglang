@@ -124,6 +124,11 @@ public:
     //: CUresult of cuMemExportToShareableHandle (the extent was not created
     //: exportable: SGLANG_WEG2_VMM_EXPORTABLE unset).
     int export_extent(void* ptr, uint64_t offset, int* fd, uint64_t* size);
+    //: L15-EXTENTS: the span extents of allocation base ``ptr`` as
+    //: (offset, size) pairs, sorted by offset, at most ``cap`` written; returns
+    //: the extent count (0 = stock mapping or paused with nothing kept), -1
+    //: not a base.  Read-only: the hold share exports exactly what exists.
+    int list_extents(void* ptr, size_t cap, uint64_t* offs, uint64_t* sizes);
 
     //: C7: the planner's sizing input.  Sum of ``metadata.size`` over the
     //: allocations carrying ``tag`` -- H95c: the PHYSICAL bytes, i.e. per

@@ -164,6 +164,7 @@ def plan_anchor(
     rank_card: Sequence[int],
     direction: str,
     tp0_skip: bool = True,
+    skip_ranks=None,
 ) -> List[AnchorPiece]:
     """Byte pieces of ONE END anchor between the D ranks and the P stages.
 
@@ -197,7 +198,11 @@ def plan_anchor(
             if not rrs:
                 continue
             same_card = stage_card[s] == rank_card[r]
-            if direction == "p_to_d" and tp0_skip and r == 0:
+            # L15 hardware-generic: ``skip_ranks`` (the cap-0 ranks, any
+            # card) replaces the positional tp0_skip when given
+            _skip = (r in set(skip_ranks)) if skip_ranks is not None else (
+                tp0_skip and r == 0)
+            if direction == "p_to_d" and _skip:
                 route = "skip"
             else:
                 route = "local" if same_card else "lane"

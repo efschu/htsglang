@@ -540,6 +540,89 @@ def test_red_pdflip_f22_default_on_reads_beside_the_legs(env):
     assert s.weg2_post_wake_settle == []
 
 
+def test_red_pdflip_early_read_is_off_under_l15(env):
+    """N4f 1002_110321 (L15 on): the early read completed during the legs, the kv
+    wake's L15 path then RESET the tree (#1427 RESET-RELEASE released=203827)
+    and weg2-10-16 met X-GATE uncached=206952 W31 -> reroute to P -> ping-pong.
+    Under the L15 master switch the read stays at the release (after that
+    reset), on every rank alike. RED on e34d3eea16."""
+    env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    env.mp.setenv("SGLANG_WEG2_L15", "1")
+    reads = []
+    tree = _Tree()
+    s = _wake_sched(tree, reads)
+    s._l15_tree_retained = True  # L15-ON-READ-EARLY: the group retained a hold
+    a = _req(PARKED)
+    park_l3.defer_hold_read(s, a)
+    s.weg2_dormant_hold = [a]
+    assert park_l3.early_enabled() is False
+    assert park_l3.early_enabled(s) is False
+    assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == []
+    Scheduler._weg2_release_dormant_hold(s)
+    assert reads == [PARKED]
+    env.mp.setenv("SGLANG_WEG2_L15", "0")
+    assert park_l3.early_enabled() is True
+
+
+def test_l15_on_read_early_after_a_plain_sleep(env):
+    """L15-ON-READ-EARLY: since L15-SLEEP-AGREE (17e65cff75) the hold is decided
+    by the whole D group -- every rank retained or none. After a plain sleep
+    (``_l15_tree_retained`` False everywhere) the wake has no tree to drop, so
+    the early read survives it and runs again under L1.5. SLEEP-AGREE off, or
+    no scheduler to ask, keeps the read at the release. RED on a9dcae8df7."""
+    env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    env.mp.setenv("SGLANG_WEG2_L15", "1")
+    env.mp.delenv("SGLANG_WEG2_L15_SLEEP_AGREE", raising=False)
+    reads = []
+    tree = _Tree()
+    s = _wake_sched(tree, reads)
+    s._l15_tree_retained = False
+    a = _req(PARKED)
+    park_l3.defer_hold_read(s, a)
+    s.weg2_dormant_hold = [a]
+    assert park_l3.early_enabled() is False, "no scheduler -> the old shape"
+    assert park_l3.early_enabled(s) is True
+    assert park_l3.issue_reads_at_wake_begin(s) == [a] and reads == [PARKED]
+    env.mp.setenv("SGLANG_WEG2_L15_SLEEP_AGREE", "0")
+    assert park_l3.early_enabled(s) is False
+
+
+def test_red_pdflip_spread_issues_one_read_per_tag_in_hold_order(env):
+    """PDFLIP-S: WEG2-WAKE-TAIL read_early p50 89 / max 319 ms (N4p), p50 301 /
+    max 789 ms (N4f) -- all registrations before the first resume while P's
+    depositors waited. Now one per weight tag after its collect went to the
+    worker, the rest after the last tag; the same hold order on every rank.
+    RED on a065d6957b (no max_n, no spread switch)."""
+    env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    env.mp.delenv("SGLANG_WEG2_WAKE_READ_EARLY_SPREAD", raising=False)
+    assert ho.write(HELD, list(range(12)), ["hA", "hB", "hC"])
+    reads = []
+    tree = _Tree()
+    s = _wake_sched(tree, reads)
+    a, b = _req(PARKED), _req(HELD)
+    for r in (a, b):
+        park_l3.defer_hold_read(s, r)
+    s.weg2_dormant_hold = [a, b]
+    assert park_l3.spread_enabled() is True
+    assert park_l3.issue_reads_at_wake_begin(s, max_n=1) == [a] and reads == [PARKED]
+    assert park_l3.issue_reads_at_wake_begin(s, max_n=1) == [b] and reads == [PARKED, HELD]
+    assert park_l3.issue_reads_at_wake_begin(s, max_n=1) == []
+    tree.ongoing_prefetch.clear()
+    assert Scheduler._weg2_release_dormant_hold(s) == 2 and reads == [PARKED, HELD]
+
+
+def test_the_wake_loop_spreads_the_early_reads():
+    import inspect
+
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    src = inspect.getsource(wu)
+    assert "_pl3_early.issue_reads_at_wake_begin(self.scheduler, max_n=1)" in src
+    assert "WEG2-WAKE-READ-EARLY-SPREAD" not in src or "#248 WAKE-READ-EARLY-SPREAD issued=" in src
+    assert src.index("_pl3_early.issue_reads_at_wake_begin(self.scheduler, max_n=1)") < src.index(
+        'WEG2-WAKE-OVERLAP collects=%d joined_ms')
+
+
 def test_f22_switch_off_reads_at_the_release_as_before(env):
     """Off (=0, the pre-default form): the legs' start issues nothing, the
     release reads as on 895559fed2."""

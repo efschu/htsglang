@@ -88,7 +88,7 @@ def test_pp0_grant_sizes_the_level_for_all_held_requests(monkeypatch):
     monkeypatch.setattr(S, "_actor", lambda sched: actor)
     asked = []
 
-    def _grant(stages_, tokens, open_ledger, covered=None):
+    def _grant(stages_, tokens, open_ledger, covered=None, taken_out=None):
         asked.append(tokens)
         return S.round_up(tokens, 4096)
 

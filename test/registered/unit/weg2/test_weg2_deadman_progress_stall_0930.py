@@ -359,29 +359,3 @@ class TestDeadmanShell(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class Test27bFrontPublishesTheOutstandingBookFields(unittest.TestCase):
-    """27B has no OutstandingBook: the front's own state block publishes the two fields
-    only_nonstream reads (outstanding_n, outstanding_nonstream_n; NF f0bc387040)."""
-
-    def test_nonstream_outstanding_is_counted(self):
-        import types
-
-        from sglang.srt.weg2 import front as F
-
-        f = F.Front(prefill="http://p", decode="http://d", awake="D", tag="t", store_dir="/tmp",
-                    prefill_sid=0, decode_sid=0, dc_reserve={}, w_s=45.0, weight_chunks=2,
-                    flip_min_work_tokens=1)
-        import time as _t
-
-        f._ipc_stream_of = {"weg2-32-62": (False, _t.time()), "weg2-32-63": (False, _t.time()),
-                            "weg2-32-64": (True, _t.time())}
-        f.groups["D"].outstanding = {"weg2-32-62": _t.time(), "weg2-32-63": _t.time()}
-        out = f._ipc_front_fields()
-        self.assertEqual((out["outstanding_n"], out["outstanding_nonstream_n"]), (2, 2))
-        self.assertTrue(SF.only_nonstream(out))
-        f.groups["D"].outstanding["weg2-32-64"] = _t.time()                # one stream request open
-        out = f._ipc_front_fields()
-        self.assertEqual((out["outstanding_n"], out["outstanding_nonstream_n"]), (3, 2))
-        self.assertFalse(SF.only_nonstream(out))

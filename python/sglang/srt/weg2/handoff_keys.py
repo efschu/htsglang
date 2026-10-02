@@ -27,6 +27,25 @@ def keys_for_span(page_keys: Optional[Sequence[str]], matched_len: int, n_tokens
     return [str(k) for k in page_keys[p0:p0 + n_pages]]
 
 
+def fallback_page_offset(n_ids: Optional[int], prefetch_length: int, page_size: int,
+                         span_base: Optional[int] = None) -> Optional[int]:
+    """First page of the tree's fallback slice (operation.weg2_page_keys).
+    With ``span_base`` (the caller's matched length) the span starts there.
+    Without it, ``n_ids - prefetch_length`` -- only right for an untrimmed
+    tail read: a read trimmed or truncated at its END (fork/told trim, host
+    pool truncation) shifts that start by the trimmed length and hands the
+    store the keys of later pages (27B 01.10.: KV and Mamba shifted)."""
+    page = int(page_size)
+    if page <= 0:
+        return None
+    if span_base is not None:
+        base = int(span_base)
+        if base < 0 or base % page:
+            return None
+        return base // page
+    if n_ids is None:
+        return None
+    return (int(n_ids) - int(prefetch_length)) // page
 def span_key_offset(key_base: Optional[int], n_ids: Optional[int], span_len: int,
                     page_size: int = 1) -> Optional[int]:
     """Index of the first handed-over key of a store-read span (pages).

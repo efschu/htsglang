@@ -21,6 +21,24 @@ from sglang.srt.managers.scheduler_components.ipc_channels import (
 ENV_DORMANT_REFUSE = "SGLANG_WEG2_FLUSH_DORMANT_REFUSE"
 
 
+#: QUIESCE-PENDING (02.10., N5t epoch 11): the immediate /flush_cache answered a
+#: refusal with an empty message, so the front could not tell "the #1268 idle
+#: vote is on the ring" (its landing answers the NEXT poll) from "the group is
+#: busy" and slept its full poll interval after both. A refusal whose verdict is
+#: PENDING now says so in the HTTP body (400 as before; only the text). The
+#: words are ``Scheduler.group_idle_verdict``'s own -- the front matches them
+#: (weg2/front.py QUIESCE_PENDING_MARK). ``0`` = the empty message, as before.
+ENV_PENDING_MESSAGE = "SGLANG_WEG2_FLUSH_PENDING_MESSAGE"
+PENDING_MARK = "GROUP VERDICT PENDING"
+PENDING_MESSAGE = "W-FLUSH GROUP VERDICT PENDING: the #1268 idle vote is on the ring (undecided, not idle)\n"
+
+
+def pending_message_enabled(env=None) -> bool:
+    e = os.environ if env is None else env
+    raw = (e.get(ENV_PENDING_MESSAGE, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def dormant_refuse_enabled(env=None) -> bool:
     e = os.environ if env is None else env
     raw = (e.get(ENV_DORMANT_REFUSE, "") or "").strip().lower()
@@ -37,6 +55,7 @@ class SchedulerFlushWrapper:
         is_dormant: Optional[Callable[[], bool]] = None,
         park_forwarded: Optional[Callable[[FlushCacheReqInput], bool]] = None,
         on_decided: Optional[Callable[[FlushCacheReqInput, bool, str], None]] = None,
+        refusal_detail: Optional[Callable[[], str]] = None,
     ) -> None:
         self._flush_cache = flush_cache
         self._is_fully_idle = is_fully_idle
@@ -46,6 +65,8 @@ class SchedulerFlushWrapper:
         # instead of deciding it; PP0 reports every terminal outcome.
         self._park_forwarded = park_forwarded
         self._on_decided = on_decided
+        # QUIESCE-PENDING: the last refused flush's #1268 verdict text
+        self._refusal_detail = refusal_detail
         self._pending: Optional[Tuple[FlushCacheReqInput, float]] = None
         self._dormant_refusals = 0
 
@@ -72,6 +93,17 @@ class SchedulerFlushWrapper:
             success=False,
             message="W25 Weg2DormantRefused: flush_cache on a released (dormant) group",
         )
+
+    def _refusal_message(self) -> str:
+        """QUIESCE-PENDING: PENDING_MESSAGE when the refused verdict was the
+        idle vote on the ring, else "" (the body stays 'Flush cache failed.')."""
+        if self._refusal_detail is None or not pending_message_enabled():
+            return ""
+        try:
+            detail = str(self._refusal_detail() or "")
+        except Exception:  # noqa: BLE001 -- a text never breaks the flush answer
+            return ""
+        return PENDING_MESSAGE if PENDING_MARK in detail else ""
 
     def _decided(self, recv_req: FlushCacheReqInput, out: FlushCacheReqOutput) -> FlushCacheReqOutput:
         if self._on_decided is not None:
@@ -100,8 +132,10 @@ class SchedulerFlushWrapper:
             # pass, so its idle verdict may be (and is) a TP-group reduction.
             # The deferred path below flushes on a rank-local idle test and
             # must stay rank-local.
+            success = self._flush_cache(tp_group_verdict=True)
             return FlushCacheReqOutput(
-                success=self._flush_cache(tp_group_verdict=True)
+                success=success,
+                message="" if success else self._refusal_message(),
             )
 
         if self._is_fully_idle():

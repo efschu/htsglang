@@ -462,6 +462,28 @@ int TorchMemorySaver::export_extent(void* ptr, uint64_t offset, int* fd, uint64_
 #endif
 }
 
+int TorchMemorySaver::list_extents(void* ptr, size_t cap, uint64_t* offs, uint64_t* sizes) {
+#if defined(USE_ROCM)
+    return -5;
+#elif defined(USE_CUDA)
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    auto it = allocation_metadata_.find(ptr);
+    if (it == allocation_metadata_.end()) {
+        return -1;
+    }
+    std::vector<Weg2SpanExtent> ex = it->second.weg2_extents;
+    std::sort(ex.begin(), ex.end(),
+              [](const Weg2SpanExtent& a, const Weg2SpanExtent& b) { return a.offset < b.offset; });
+    for (size_t i = 0; i < ex.size() && i < cap; ++i) {
+        if (offs != nullptr) offs[i] = (uint64_t) ex[i].offset;
+        if (sizes != nullptr) sizes[i] = (uint64_t) ex[i].size;
+    }
+    return (int) ex.size();
+#else
+    #error "USE_PLATFORM is not set"
+#endif
+}
+
 int TorchMemorySaver::set_keep_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi) {
 #if defined(USE_ROCM)
     return -5;

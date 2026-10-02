@@ -237,6 +237,145 @@ def take_requests(directory: str) -> List[dict]:
     return out
 
 
+#: #248h: first capacity park of this rid (monotonic, rank-local; the group
+#: verdict is MIN-reduced) and the last one (the re-read cadence).
+CAPPARK_SINCE_ATTR = "_weg2_rvp_cappark_since"
+CAPPARK_AT_ATTR = "_weg2_rvp_cappark_at"
+CAPPARK_MARK = "#248h RESUME-VIA-P CAPACITY-PARK"
+#: the shortest interval between two capacity re-reads of one rid (the #1456
+#: re-read timer's value): a read that ends short again is not re-issued in a
+#: loop of passes.
+CAPPARK_REREAD_S = 2.0
+
+
+def capacity_park_bound_s() -> float:
+    try:
+        from sglang.srt.environ import envs
+
+        return float(envs.SGLANG_WEG2_RVP_CAPACITY_PARK_S.get() or 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def capacity_park_on() -> bool:
+    return capacity_park_bound_s() > 0 and enabled()
+
+
+def capacity_park_precondition(req) -> bool:
+    """#248h: the REPLICATED half of the candidate test (switch, group D, a
+    stream without an image, released by the W88 store-short bound) -- it
+    decides whether the group takes the MIN vote at all, so it may read no
+    rank-local term. Never raises."""
+    try:
+        if not capacity_park_on():
+            return False
+        if (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "D":
+            return False
+        if not bool(getattr(req, "stream", False)):
+            return False
+        if getattr(req, "multimodal_inputs", None) is not None:
+            return False
+        return bool(getattr(req, "_weg2_store_short_fallback", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def capacity_park_candidate(req, x: int, sched=None, now: Optional[float] = None) -> bool:
+    """#248h (30.09., NF y4b D 03:58:57, weg2-32-72): this rank's vote that
+    the X refusal of ``req`` is a CAPACITY short read, not a missing context.
+
+    True when: the RESUME-VIA-P preconditions hold (switch, group D, a stream,
+    no image); its last store read was released by the store-short bound
+    (``_weg2_store_short_fallback``, the W88 over-X re-route); it delivered
+    less than the store holds (``delivered < deliverable``: pages lost to a
+    full arena / host budget, not unwritten); what the store holds covers the
+    context up to X (a whole read would be admitted -- P already wrote it,
+    another P leg cannot add anything); and the park bound has not lapsed.
+    y4b: delivered 39168, deliverable 95104, total 95137, X 12288 -> True
+    three times; the base spent two P legs (7.7 s / 7.5 s, flips included)
+    and ended the client's stream with W50 at the third refusal. Never raises
+    (a vote of the group MIN)."""
+    try:
+        if not capacity_park_precondition(req):
+            return False
+        delivered = getattr(req, "_weg2_store_delivered", None)
+        deliverable = getattr(req, "_weg2_store_deliverable", None)
+        if delivered is None or deliverable is None or int(delivered) >= int(deliverable):
+            return False
+        ids = getattr(req, "full_untruncated_fill_ids", None)
+        total = len(ids) if ids is not None else len(context_ids(req))
+        if x <= 0 or total - int(deliverable) > int(x):
+            return False
+        since = getattr(req, CAPPARK_SINCE_ATTR, None)
+        now = time.monotonic() if now is None else float(now)
+        return since is None or (now - float(since)) < capacity_park_bound_s()
+    except Exception:  # noqa: BLE001 -- a vote never breaks the MIN
+        return False
+
+
+def park_for_capacity(sched, req, d_extent: int, x: int) -> None:
+    """#248h: D keeps ``req`` parked (flip park, every rank the same mutation)
+    for a re-read of its whole context -- no needs-p file, no attempt spent,
+    nothing to the client. The park re-queues it when the arena has room
+    (``d_park_runtime.park_tick`` -> :func:`capacity_requeue_due`) or at the
+    next wake's hold read (#248f: oldest first)."""
+    from sglang.srt.weg2 import d_park_read, d_park_runtime, d_seats
+
+    now = time.monotonic()
+    if getattr(req, CAPPARK_SINCE_ATTR, None) is None:
+        setattr(req, CAPPARK_SINCE_ATTR, now)
+    setattr(req, CAPPARK_AT_ATTR, now)
+    delivered = getattr(req, "_weg2_store_delivered", None)
+    deliverable = getattr(req, "_weg2_store_deliverable", None)
+    setattr(req, d_park_read.CAP_ATTR, None)
+    d_park_read.clear_read_cycle(req)
+    d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=None, now=now)
+    parked = d_park_runtime.parked_list(sched)
+    if not any(p is req for p in parked):
+        parked.append(req)
+    logger.warning(
+        "%s rid=%s d_extent=%d X=%d delivered=%s deliverable=%s held_s=%.1f bound_s=%.0f "
+        "attempts=%d -- the store holds the context and D's read of it ended short on its own "
+        "capacity: D keeps the stream parked and re-reads it when the arena has room (no P leg, "
+        "no attempt, no W50 to the client)",
+        CAPPARK_MARK, str(req.rid)[:24], int(d_extent), int(x), delivered, deliverable,
+        now - float(getattr(req, CAPPARK_SINCE_ATTR)), capacity_park_bound_s(),
+        int(getattr(req, ATTEMPTS_ATTR, 0) or 0))
+
+
+def clear_capacity_park(req) -> None:
+    """#248h: the X gate admitted ``req`` -- its capacity park is over (a later
+    one starts a fresh bound)."""
+    if getattr(req, CAPPARK_SINCE_ATTR, None) is not None or getattr(req, CAPPARK_AT_ATTR, None) is not None:
+        setattr(req, CAPPARK_SINCE_ATTR, None)
+        setattr(req, CAPPARK_AT_ATTR, None)
+
+
+def capacity_requeue_due(sched, parked, now: Optional[float] = None) -> list:
+    """#248h: the capacity-parked requests of ``parked`` whose re-read may run
+    now -- in park order, as far as the KV arena holds them beside this wake's
+    reads still holding it (#248f accounting), at most one re-read per
+    :data:`CAPPARK_REREAD_S`. Rank-local clock: the caller MIN-reduces."""
+    from sglang.srt.weg2 import park_l3
+
+    now = time.monotonic() if now is None else float(now)
+    cands = [r for r in parked or () if getattr(r, CAPPARK_AT_ATTR, None) is not None]
+    if not cands:
+        return []
+    cap = park_l3.arena_capacity(sched) if park_l3.arena_gate_on() else None
+    in_flight = park_l3._in_flight_pages(sched, getattr(sched, "weg2_post_wake_settle", None) or ())
+    out = []
+    for r in cands:
+        if now - float(getattr(r, CAPPARK_AT_ATTR)) < CAPPARK_REREAD_S:
+            break
+        need = park_l3.read_pages(sched, r)
+        if cap is not None and in_flight > 0 and in_flight + need > cap:
+            break
+        in_flight += need
+        out.append(r)
+    return out
+
+
 def keep_on_d(sched, req, d_extent: int, x: int, reason: str = "x_refusal_midstream") -> bool:
     """D, inside the W31 answer: keep ``req`` parked for P instead of the abort.
     Every rank runs it (the same queue mutation); only TP rank 0 writes the

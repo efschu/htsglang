@@ -25,6 +25,14 @@ from sglang.srt.managers import weg2_store_told as m
 from sglang.srt.managers.scheduler import Scheduler
 
 
+@pytest.fixture(autouse=True)
+def _told_first_order(monkeypatch):
+    # these cases pin the told-first order; the follower early read (default on
+    # since 02.10.) is covered by test_weg2_follower_early_read_1002
+    monkeypatch.setenv("SGLANG_WEG2_FOLLOWER_EARLY_READ", "0")
+
+
+
 class _Rec(int):
     """PrefetchOutcome-like: int = loaded, .materialized = matched + loaded."""
 

@@ -656,6 +656,158 @@ def _complete_count(pool, arena, rec) -> int:
     return int((find(hit[1]) == 2).sum())
 
 
+# -- #248e: the kept pages go in hold order, the chain's head last ------------
+#: the rids the current wake reads, in hold order (``note_read_order``); the
+#: head of the list is read first and is the last whose pages go
+_READ_ORDER: list = []
+#: arena -> the host pool whose keep list governs it (``bind_arena``)
+_ARENA_POOLS: dict = {}
+#: at most this many clock rounds per ordered eviction (each one a full lap)
+ORDERED_ROUNDS = 8
+
+
+def note_read_order(rids) -> None:
+    """#248e: the wake reads ``rids`` in this order (the dormant hold's). The
+    kept pages of a rid later in the list go before those of an earlier one;
+    a kept rid the wake does not read at all goes before every one it reads."""
+    global _READ_ORDER
+    _READ_ORDER = [str(r) for r in (rids or ()) if r]
+
+
+def bind_arena(pool, arena) -> None:
+    """#248e: ``pool``'s keep list governs ``arena`` -- the backend's clock
+    evict (``HiCacheFile._arena_evict_to_disk``, the L3 fill's room) finds
+    the order through it. Weak on the pool; idempotent."""
+    import weakref
+
+    try:
+        _ARENA_POOLS[id(arena)] = (weakref.ref(arena), weakref.ref(pool))
+    except TypeError:  # an arena or pool without weak references keeps no order
+        pass
+
+
+def pool_for_arena(arena):
+    """The host pool whose keep list governs ``arena`` (``bind_arena``, else a
+    ``register_pool`` pool bound to it), None when there is none."""
+    rec = _ARENA_POOLS.get(id(arena))
+    if rec is not None and rec[0]() is arena and rec[1]() is not None:
+        return rec[1]()
+    for r in list(_POOLS):
+        p = r()
+        if p is not None and getattr(p, "arena", None) is arena:
+            return p
+    return None
+
+
+def _rid_ranks(keep: Keep):
+    """Rank per rid of ``keep`` (lower = read earlier = kept longer): the
+    position in the wake's read order; a rid it does not read ranks after
+    all of them, the later in the keep order the higher."""
+    import numpy as np
+
+    pos = {rid: i for i, rid in enumerate(_READ_ORDER)}
+    base = len(pos)
+    return np.array([pos[rid] if rid in pos else base + i for i, rid in enumerate(keep.rids)],
+                    dtype=np.int64)
+
+
+def victim_order(keep: Keep):
+    """#248e: positions into ``keep.keys`` (one per distinct key) in the order
+    the kept pages may leave the arena: the rid ranked last first, and inside
+    a rid its chain from the TAIL -- never the head of the next read first. A
+    key two rids share (a common prefix) ranks with the earlier of them."""
+    import numpy as np
+
+    n = len(keep)
+    if not n:
+        return np.zeros(0, dtype=np.int64)
+    rank = _rid_ranks(keep)[keep.rid_ix]
+    by_key = np.lexsort((rank, keep.keys))  # each key's best (lowest) rank first
+    ks = keep.keys[by_key]
+    first = np.ones(n, dtype=bool)
+    first[1:] = ks[1:] != ks[:-1]
+    sel = by_key[first]
+    return sel[np.lexsort((-keep.page[sel], -rank[sel]))]
+
+
+def _present(arena, keep: Keep, idx):
+    """The victims of ``idx`` that are COMPLETE and unreferenced in the arena
+    now -- the clock can take only those, so a window never goes to pages the
+    L3 already holds alone (the tail a fill is reading back)."""
+    import numpy as np
+
+    if not idx.shape[0]:
+        return idx
+    try:
+        stems = keep.sorted_stems()
+        slots, states = arena.find_slots_np([stems[int(i)] for i in idx])
+        ok = (np.asarray(slots) >= 0) & (np.asarray(states) == 2)
+        refs = np.asarray(arena.slot_refs(np.asarray(slots)[ok].tolist()), dtype=np.int64)
+        free = np.zeros(ok.shape[0], dtype=bool)
+        free[np.flatnonzero(ok)] = refs == 0
+        return idx[free]
+    except Exception:  # noqa: BLE001 - no presence answer: the clock decides alone
+        return idx
+
+
+def evict_ordered(arena, keep: Keep, n: int, *, eligible=None, protect_lo=None, site: str = "-"):
+    """#248e: take up to ``n`` KEPT slots from ``arena`` in :func:`victim_order`
+    (``eligible``: a bool mask over ``keep.keys``, e.g. the L3-copied ones of
+    a claim's stage ii). The arena's own clock does the taking -- EVICTING,
+    unlinked, returned as ``(slot, key_lo, key_hi, total)`` -- with every
+    kept key except the next ``n`` victims (and ``protect_lo``, the pins) on
+    its keep list, so it cannot reach past them. Returns the candidates."""
+    import numpy as np
+
+    n = int(n)
+    if n <= 0 or not len(keep):
+        return []
+    idx = victim_order(keep)
+    if eligible is not None:
+        idx = idx[np.asarray(eligible, dtype=bool)[idx]]
+    idx = _present(arena, keep, idx)
+    guard = keep.keys if protect_lo is None or not len(protect_lo) else np.union1d(
+        keep.keys, np.asarray(protect_lo, dtype=np.uint64))
+    out, at = [], 0
+    for _ in range(ORDERED_ROUNDS):
+        short = n - len(out)
+        if short <= 0 or at >= idx.shape[0]:
+            break
+        take = keep.keys[idx[at:at + short]]
+        at += short
+        guard_now = np.ascontiguousarray(np.setdiff1d(guard, take, assume_unique=False), dtype=np.uint64)
+        out += list(arena.evict_candidates(short, keep_lo=guard_now))
+    if out:
+        _note_ordered(keep, out, n, site)
+    return out
+
+
+def _note_ordered(keep: Keep, cands, n: int, site: str) -> None:
+    """``#248e ORDERED-EVICT``: which kept rids gave how many pages, and the
+    LOWEST page each gave (the head is page 0 -- a healthy order shows the
+    tail going, lowest_page far from 0 for the rid read first)."""
+    import numpy as np
+
+    k = globals().get("_ordered_n", 0) + 1
+    globals()["_ordered_n"] = k
+    if not (k <= 16 or k % 64 == 0):
+        return
+    lo = np.fromiter((int(c[1]) & 0xFFFFFFFFFFFFFFFF for c in cands), dtype=np.uint64)
+    pos = np.minimum(np.searchsorted(keep.keys, lo), keep.keys.shape[0] - 1)
+    hit = keep.keys[pos] == lo
+    per: dict = {}
+    for p in pos[hit].tolist():
+        r = int(keep.rid_ix[p])
+        per.setdefault(r, []).append(int(keep.page[p]))
+    ranks = _rid_ranks(keep)
+    parts = [f"{keep.rids[r][:14]}:rank={int(ranks[r])},pages={len(v)},lowest_page={min(v)}"
+             for r, v in sorted(per.items(), key=lambda kv: -int(ranks[kv[0]]))]
+    logger.info("#248e ORDERED-EVICT n=%d site=%s need=%d took=%d read_order=%s victims=[%s] (kept pages leave "
+                "in hold order, the last-read rid first and every chain from its tail -- the head of the next "
+                "read stays in L2)", k, site, int(n), len(cands), [r[:14] for r in _READ_ORDER[:8]],
+                "; ".join(parts))
+
+
 def census(pool, refresh: bool = True) -> str:
     """HOLDERS-line fields for ``pool``: this pool's kept keys still COMPLETE
     in the arena, and every process's reference-pinned complete slots.

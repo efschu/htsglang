@@ -1309,6 +1309,9 @@ class OpenAIServingChat(OpenAIServingBase):
             sglext_resumable = weg2_resumable_depth.from_meta_infos(
                 list(resumable_depths.values())
             )
+            # SEQ-HASH: the finishing output's sequence mark (first choice that has one)
+            sglext_seq = next((mi.get("weg2_seq_hash") for mi in resumable_depths.values()
+                               if isinstance(mi, dict) and mi.get("weg2_seq_hash")), None)
 
             if (
                 sglext_routed is not None
@@ -1324,6 +1327,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
                         weg2_resumable_depth=sglext_resumable,
+                        weg2_seq_hash=sglext_seq,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1418,6 +1422,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # #49 L3: a Weg-2 P prefill's inner anchor depths (first choice: per request).
         anchor_depths = first_ret["meta_info"].get("weg2_anchor_depths") or None
         response_sglext = None
+        seq_hash = first_ret["meta_info"].get("weg2_seq_hash")  # SEQ-HASH
         if (
             routed_experts
             or cached_tokens_details
@@ -1431,6 +1436,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 weg2_prefill_s=weg2_prefill_s,
                 weg2_resumable_depth=resumable_depth,
                 weg2_anchor_depths=anchor_depths,
+                weg2_seq_hash=seq_hash,
             )
 
         for idx, ret_item in enumerate(ret):

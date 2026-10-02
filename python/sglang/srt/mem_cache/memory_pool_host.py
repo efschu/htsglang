@@ -2535,13 +2535,15 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
-        # 1. Anchor (KV) backup
-        self.anchor_entry.host_pool.backup_from_device_all_layer(
-            self.anchor_entry.device_pool,
-            host_indices,
-            device_indices,
-            io_backend,
-        )
+        # 1. Anchor (KV) backup -- none for an ANCHOR-ONLY write (the KV is
+        # already backed; only the Mamba anchor travels as an extra pool)
+        if host_indices is None or host_indices.numel() > 0:
+            self.anchor_entry.host_pool.backup_from_device_all_layer(
+                self.anchor_entry.device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+            )
         # 2. Extra pool backup
         for transfer in pool_transfers or []:
             entry = self._entry_for_transfer(transfer, "backup")
@@ -2586,9 +2588,10 @@ class HostPoolGroup:
         """H2: :meth:`backup_from_device_all_layer` for an op every pool of
         which accepted its device indices on the card -- same order (anchor
         first, then the extra pools), same pools, no index normalisation."""
-        self.anchor_entry.host_pool.backup_from_device_indices(
-            self.anchor_entry.device_pool, host_indices, device_indices
-        )
+        if host_indices is None or host_indices.numel() > 0:  # ANCHOR-ONLY: no KV rows
+            self.anchor_entry.host_pool.backup_from_device_indices(
+                self.anchor_entry.device_pool, host_indices, device_indices
+            )
         for transfer in pool_transfers or []:
             entry = self._entry_for_transfer(transfer, "backup")
             entry.host_pool.backup_from_device_indices(

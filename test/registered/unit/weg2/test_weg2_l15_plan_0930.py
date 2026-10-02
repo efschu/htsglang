@@ -5,9 +5,8 @@ The post ``l15`` carves the P layout's awake headroom out of the P budget so
 D's sleep residue can hold it there (L1.5 = the brach VRAM of the 3080s).
 This is the pure half of L15-01: the master/handover switch parsing, the
 ``SGLANG_WEG2_L15_MIB`` override grammar, the post derivation from the
-``P_AWAKE_PEAK_MIB`` record, the NF expert trade (the NF law says free VRAM
-belongs to the experts, so an NF hold is PAID with resident expert rows:
-rows = floor(l15 / row_mib)), and the dual-layout refusal -- the dual layout
+``P_AWAKE_PEAK_MIB`` record, the 27B-only refusal (user correction
+2026-10-02: no L1.5 on NF, not even as an option), and the dual-layout refusal -- the dual layout
 never sleeps P, so L1.5 there is refused by name (W-L15-DUAL), never silently
 off.  The wiring into ``budgets_from_dc`` / ``vram_plan_view`` is the separate
 L15-01b; nothing here imports the launcher.
@@ -55,7 +54,6 @@ class MasterOffIsZeroOff(CustomTestCase):
         self.assertEqual([p.card for p in posts], [0, 1, 2])
         self.assertEqual([p.mib for p in posts], [0, 0, 0])
         self.assertEqual([p.src for p in posts], ["OFF", "OFF", "OFF"])
-        self.assertEqual([p.experts_rows_traded for p in posts], [0, 0, 0])
 
     def test_master_off_beats_an_override(self):
         env = {"SGLANG_WEG2_L15": "0", "SGLANG_WEG2_L15_MIB": "c0=4096"}
@@ -103,53 +101,44 @@ class OverrideIsThePost(CustomTestCase):
         self.assertEqual([(p.mib, p.src) for p in posts],
                          [(4096, "OVERRIDE"), (0, "OVERRIDE-UNNAMED"), (1024, "OVERRIDE")])
 
-    def test_override_beats_the_record_even_on_nf(self):
-        env = dict(MASTER, SGLANG_WEG2_L15_MIB="c0=10000")
-        posts = LP.resolve_posts("nextflash", [15896], [11666], env)
-        self.assertEqual([(p.mib, p.src) for p in posts], [(10000, "OVERRIDE")])
 
-
-class NfDefaultsToZero(CustomTestCase):
-    #: (e) the NF law: free VRAM is the experts', so without an override nothing
-    #: is held no matter what the record would say
-    def test_nf_default_zero(self):
-        posts = LP.resolve_posts("nextflash", BUDGETS, PEAKS, MASTER)
-        self.assertEqual([p.mib for p in posts], [0, 0, 0])
-        self.assertEqual([p.src for p in posts], ["NF-DEFAULT-0"] * 3)
-        self.assertEqual([p.experts_rows_traded for p in posts], [0, 0, 0])
-
+class L15Is27BOnly(CustomTestCase):
+    #: user correction 2026-10-02: L1.5 is a 27B-only feature; NF has no variant
     def test_27b_auto_falls_through_to_the_record(self):
         posts = LP.resolve_posts("qwen27b", BUDGETS, PEAKS, MASTER)
         self.assertEqual([p.src for p in posts], ["RECORD(P_AWAKE_PEAK_MIB)"] * 3)
         self.assertEqual([p.mib for p in posts], [4230, 2384, 1660])
 
-
-class NfTradePaysWithExperts(CustomTestCase):
-    #: (f) the user addendum: an NF hold is shown with the expert rows it costs
-    def test_nf_override_trades_rows(self):
-        env = dict(MASTER, SGLANG_WEG2_L15_MIB="c0=10000")
-        posts = LP.resolve_posts("nextflash", [15896], [11666], env, row_mib=[1200.0])
-        self.assertEqual(posts[0].mib, 10000)
-        self.assertEqual(posts[0].src, "OVERRIDE")
-        self.assertEqual(posts[0].experts_rows_traded, 8)  # floor(10000 / 1200)
-
-    def test_no_row_size_no_rows(self):
-        env = dict(MASTER, SGLANG_WEG2_L15_MIB="c0=10000")
-        posts = LP.resolve_posts("nextflash", [15896], [11666], env)
-        self.assertEqual(posts[0].experts_rows_traded, 0)
-
-    def test_rows_only_on_nf(self):
-        env = dict(MASTER, SGLANG_WEG2_L15_MIB="c0=10000")
-        posts = LP.resolve_posts("qwen27b", [15896], [11666], env, row_mib=[1200.0])
-        self.assertEqual(posts[0].experts_rows_traded, 0)
-
-    def test_trade_floor_and_guard(self):
-        self.assertEqual(LP.nf_expert_trade(10000, 1200.0), 8)
-        self.assertEqual(LP.nf_expert_trade(0, 1200.0), 0)
-        self.assertEqual(LP.nf_expert_trade(1199, 1200.0), 0)
-        for bad in (0.0, -1.0):
+    def test_no_posts_for_another_line(self):
+        for line in ("nextflash", "gemma"):
             with self.assertRaises(ValueError):
-                LP.nf_expert_trade(10000, bad)
+                LP.resolve_posts(line, BUDGETS, PEAKS, MASTER)
+        self.assertFalse(hasattr(LP, "nf_expert_trade"))
+        self.assertFalse(hasattr(LP, "LINE_NEXTFLASH"))
+
+    def test_nf_with_master_or_handover_is_refused_by_name(self):
+        for env, name in ((MASTER, "SGLANG_WEG2_L15"),
+                          ({"SGLANG_WEG2_HOT_HANDOVER": "1"}, "SGLANG_WEG2_HOT_HANDOVER")):
+            msg = LP.refuse_not_27b("nextflash", env)
+            self.assertIsNotNone(msg)
+            self.assertTrue(msg.startswith(LP.NOT27B_REFUSAL_CODE), msg)
+            self.assertIn(name, msg)
+
+    def test_27b_or_switches_off_pass(self):
+        self.assertIsNone(LP.refuse_not_27b("qwen27b", MASTER))
+        self.assertIsNone(LP.refuse_not_27b("nextflash", {}))
+        self.assertIsNone(LP.refuse_not_27b("nextflash", {"SGLANG_WEG2_L15": "0"}))
+
+    def test_launcher_refuses_before_any_post(self):
+        import inspect
+
+        from sglang.srt.weg2 import launcher
+
+        src = inspect.getsource(launcher)
+        i = src.index("l15_plan.refuse_not_27b(ns.profile, os.environ)")
+        self.assertLess(i, src.index("l15_posts = l15_plan.resolve_posts("))
+        self.assertIn("raise Weg2LaunchRefused(_not27b)", src[i:i + 200])
+        self.assertNotIn("PROFILE_NEXTFLASH):", src[i:i + 600])
 
 
 class DualLayoutIsRefused(CustomTestCase):
@@ -179,12 +168,11 @@ class DualLayoutIsRefused(CustomTestCase):
 class BootLine(CustomTestCase):
     def test_post_line_format(self):
         self.assertEqual(
-            LP.post_line(LP.L15Post(card=1, mib=2384, src="RECORD(P_AWAKE_PEAK_MIB)",
-                                    experts_rows_traded=0)),
-            "L15-POST card=1 mib=2384 src=RECORD(P_AWAKE_PEAK_MIB) experts_rows_traded=0")
+            LP.post_line(LP.L15Post(card=1, mib=2384, src="RECORD(P_AWAKE_PEAK_MIB)")),
+            "L15-POST card=1 mib=2384 src=RECORD(P_AWAKE_PEAK_MIB)")
         self.assertEqual(
-            LP.post_line(LP.L15Post(card=0, mib=10000, src="OVERRIDE", experts_rows_traded=8)),
-            "L15-POST card=0 mib=10000 src=OVERRIDE experts_rows_traded=8")
+            LP.post_line(LP.L15Post(card=0, mib=10000, src="OVERRIDE")),
+            "L15-POST card=0 mib=10000 src=OVERRIDE")
 
 
 if __name__ == "__main__":

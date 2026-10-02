@@ -72,9 +72,11 @@ ENV_SMALL_BAR_GROUPS = "SGLANG_WEG2_BAR1_SMALL_BAR_GROUPS"
 ENV_CYCLE_GRACE_S = "SGLANG_WEG2_BAR1_CYCLE_GRACE_S"
 SLOW_WAIT_S = 0.5     # a credit wait longer than this posts a `blocked` flag
 #: W109b (rc12z4 flip 22): how often a blocked depositor asks whether its wait
-#: closes a credit cycle, and the edge age it acts at -- a third of the
-#: waker's W109 grace, so the sleeper spills before the waker would refuse.
-SPILL_TICK_S = 0.5
+#: closes a credit cycle. The edge age it acts at is ``spill_grace_s()``.
+#: 0.5 -> 0.1 s on 02.10. (NF y6u, see SGLANG_WEG2_BAR1_SPILL_GRACE_S): the
+#: question is two directory reads of the flag tree, the wait it rides on
+#: already polls every 20 us.
+SPILL_TICK_S = 0.1
 BIG_BAR_MIN = 4 << 30      # a BAR1 at least this large holds the big slot ring
 MODE_BAR1 = "bar1"
 MODE_HOST = "host"
@@ -372,18 +374,27 @@ class SocketCredits:
 
     def _read(self, n: int, timeout_s: float) -> Optional[bytes]:
         buf = b""
-        deadline = time.monotonic() + float(timeout_s)
-        k = 0
+        t_wait0 = time.monotonic()
+        deadline = t_wait0 + float(timeout_s)
+        slow_sent = False
+        # W109b (02.10., NF y6u): a depositor's wait asks its cycle question
+        # every SPILL_TICK_S -- with the old 0.5-s socket slice the metal path
+        # (credits=sock) asked only every 0.5 s whatever SPILL_TICK_S said.
+        # Waits without a tick question keep the 0.5-s slice.
+        slice_s = SPILL_TICK_S if self.on_tick is not None else 0.5
         while len(buf) < n:
             left = deadline - time.monotonic()
             if left <= 0:
                 return None
-            self.sock.settimeout(min(left, 0.5))
+            self.sock.settimeout(min(left, slice_s))
             try:
                 chunk = self.sock.recv(n - len(buf))
             except socket.timeout:
-                k += 1
-                if k == 1 and self.on_slow is not None:
+                # the `blocked` flag still goes up after SLOW_WAIT_S (0.5 s,
+                # the first 0.5-s slice before), not after the shorter slice
+                if (not slow_sent and self.on_slow is not None
+                        and time.monotonic() - t_wait0 >= SLOW_WAIT_S - 1e-3):
+                    slow_sent = True
                     self.on_slow()
                 # W109b: only between frames -- a half-read frame is never dropped
                 if not buf and self.on_tick is not None and self.on_tick():
@@ -597,6 +608,20 @@ def cycle_grace_s(env: Optional[_Map[str, str]] = None) -> float:
         return max(0.5, float(env.get(ENV_CYCLE_GRACE_S, "3")))
     except ValueError:
         return 3.0
+
+
+def spill_grace_s() -> float:
+    """W109b: the edge age at which a blocked depositor spills (its half of
+    the cycle). Its own knob since 02.10. (NF y6u): until then a third of the
+    waker's W109 grace (1.0 s at the default 3 s), which put 1.6-1.9 s of
+    deposit stall on every cycled D->P wake. Never above the old value, never
+    below 0.05 s (flag-read skew between the two groups' processes)."""
+    from sglang.srt.environ import envs
+    try:
+        g = float(envs.SGLANG_WEG2_BAR1_SPILL_GRACE_S.get())
+    except (TypeError, ValueError):
+        g = 0.1
+    return min(max(0.5, cycle_grace_s() / 3.0), max(0.05, g))
 
 
 def credit_cycle(me: int, waits: dict, blocked: dict, grace_s: float, now: float):
@@ -840,9 +865,10 @@ class Bar1Lanes:
         """The waker credit cycle one of whose edges is THIS rank's blocked
         deposit, or None. Read from the depositor's side: the wakers are the
         other group, the blocked flags are the ones this group posted into
-        it. ``grace_s`` defaults to a third of the waker's W109 grace -- the
-        sleeper has to act (``_spill_rest``) before the waker refuses."""
-        g = (max(0.5, cycle_grace_s() / 3.0) if grace_s is None else float(grace_s))
+        it. ``grace_s`` defaults to :func:`spill_grace_s` -- the sleeper has
+        to act (``_spill_rest``) long before the waker refuses, and the chain
+        cannot dissolve on its own, so it acts as soon as the flags agree."""
+        g = spill_grace_s() if grace_s is None else float(grace_s)
         other = other_group(self.group)
         waits = self.read_credit_waits(other)
         blocked = self.read_blocked(other)

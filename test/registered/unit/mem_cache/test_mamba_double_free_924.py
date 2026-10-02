@@ -248,13 +248,18 @@ class TestTheMambaLedgerNamesTheDuplicate(unittest.TestCase):
         )
         return checker, ps
 
+    # CONTRACT, 30.09. (the five tests below were red since 29.08.): #969 CUT C
+    # (77b42d6d0a + 7f88b49a08) deleted the subtracted ``double_owned`` term of
+    # the ledger equation -- and with it the ``double_owned=N`` the equation's
+    # message printed. The diagnosis stays (``double_owned_src`` + the live
+    # detail); the number is no posten any more, so it is not asserted.
     def test_a_healthy_pool_is_unchanged_and_says_census(self):
         checker, ps = self._checker(
             list(range(1, SPECIMEN_TOTAL + 1)), tree=_Tree(full_rows=range(1, 11))
         )
         leak, msg = checker._check_mamba_pool(ps)
         self.assertFalse(leak, msg)
-        self.assertIn("double_owned=0", msg)
+        self.assertNotIn("double_owned=", msg)
         self.assertIn("double_owned_src=census", msg)
 
     def test_the_specimen_is_named_as_a_double_free_and_stays_fatal(self):
@@ -264,7 +269,6 @@ class TestTheMambaLedgerNamesTheDuplicate(unittest.TestCase):
         self.assertEqual(len(free_list), SPECIMEN_AVAILABLE)
         leak, msg = checker._check_mamba_pool(ps)
         self.assertTrue(leak, msg)
-        self.assertIn("double_owned=3", msg)
         self.assertIn("double_owned_src=live", msg)
         self.assertIn("free_list_duplicates=3", msg)
         self.assertIn("duplicate_slot_ids=[4, 9, 17]", msg)
@@ -278,9 +282,15 @@ class TestTheMambaLedgerNamesTheDuplicate(unittest.TestCase):
         self.assertIn("leaked_mamba_pages=None", msg)
         self.assertIn("duplicate_slot_ids=", msg)
 
-    def test_a_free_and_cached_slot_is_the_912_population_and_only_balances(self):
-        # A slot the tree also holds is NOT a double free: nothing will be
-        # handed out twice. It is subtracted, named, and NOT made fatal.
+    def test_a_free_and_cached_slot_is_aliasing_and_fatal(self):
+        # CONTRACT, 30.09.: this was "the #912 population, only balances, NOT
+        # fatal". 4bb978726d (#924, 04.09.) measured the opposite on metal:
+        # boot 10 died on exactly this line (free_and_cached=4,
+        # free_list_duplicates=0) -- a slot on the free list that the tree
+        # still names is handed by alloc() to the next request while the tree
+        # offers it as a resume anchor: one GDN state read by two requests.
+        # Nothing is freed twice, so the allocator's own guard is silent; the
+        # negative occupancy (#924 NAMED STOP) is what makes it fatal.
         free_list = list(range(1, SPECIMEN_TOTAL + 1))
         checker, ps = self._checker(
             free_list,
@@ -288,8 +298,9 @@ class TestTheMambaLedgerNamesTheDuplicate(unittest.TestCase):
             evictable=1,
         )
         leak, msg = checker._check_mamba_pool(ps)
-        self.assertFalse(leak, msg)
-        self.assertIn("double_owned=1", msg)
+        self.assertTrue(leak, msg)
+        self.assertIn("#924 MAMBA SLOT ALIASING", msg)
+        self.assertIn("free_and_cached=1", msg)
         self.assertIn("free_list_duplicates=0", msg)
         self.assertIn("double_owned_src=live", msg)
 
@@ -299,8 +310,8 @@ class TestTheMambaLedgerNamesTheDuplicate(unittest.TestCase):
             free_list, tree=_Tree(full_rows=range(1, 11)), published=2
         )
         leak, msg = checker._check_mamba_pool(ps)
-        self.assertIn("double_owned=2", msg)
         self.assertIn("double_owned_src=census", msg)
+        self.assertNotIn("free_list_duplicates=", msg)   # the census suppresses the live reading
 
     def test_mutant_a_genuine_deficit_stays_fatal(self):
         # Slots owned by nobody: the opposite sign, and the new term is 0.
@@ -308,7 +319,7 @@ class TestTheMambaLedgerNamesTheDuplicate(unittest.TestCase):
         checker, ps = self._checker(free_list, tree=_Tree(full_rows=range(1, 11)))
         leak, msg = checker._check_mamba_pool(ps)
         self.assertTrue(leak, msg)
-        self.assertIn("double_owned=0", msg)
+        self.assertIn("leaked_mamba_pages=", msg)
 
     def test_mutant_the_term_must_not_absolve_a_wider_surplus(self):
         # One duplicate, but four slots too many: subtracting the duplicate

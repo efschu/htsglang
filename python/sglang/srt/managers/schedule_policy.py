@@ -1371,6 +1371,27 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _weg2_tail_fit_tokens(self, req: Req, input_tokens: int) -> int:
+        """cold-round1: the tokens the whole-fit test and the chunk charge
+        take -- what the forward computes. With an agreed tail the admission
+        writes the rows up to c from the staged payload (and, under the E2
+        skip, runs no target forward at all), so a corridor-narrowed chunk
+        (y3p: '#794 GROUP-NARROWED ... from 4096 to 64' right after every
+        wake) must not route a parked resume with 112-211 uncached tokens
+        into the chunked branch, which never takes a tail (1.9-2.4 s expert
+        pass per 64-token piece instead of none). Rank-uniform: the agreed
+        vote, the matched prefix, the batch's skip state."""
+        if not envs.SGLANG_WEG2_TAIL_FIT_ON_COMPUTE.get():
+            return input_tokens
+        computed = tail_adopt.peek_compute_tokens(
+            req,
+            len(req.prefix_indices),
+            batch_empty=not self.can_run_list or self.weg2_skip_extend_taken,
+        )
+        if computed is None:
+            return input_tokens
+        return min(input_tokens, self.ceil_paged_tokens(computed))
+
     def budget_state(self):
         # PS2 batch separation: once a born-spilled-deep prompt is in the list
         # the extend batch is CLOSED -- its out_cache_loc is a row of host
@@ -1501,7 +1522,11 @@ class PrefillAdder:
         mamba_gap_reserve: int = 0,
         mamba_slot_charge: int = 0,
         computed_input_len: Optional[int] = None,
+        chunk_charge: Optional[int] = None,
     ):
+        # cold-round1: ``chunk_charge`` (page-ceiled) is what an adopted tail's
+        # forward computes; the chunk budget pays that, the KV budgets below
+        # still pay the whole extend_input_len the commit allocates.
         # H24: the LOG counters (#new-token of the prefill lines, input
         # throughput) count the tokens the forward computes; only the BUDGET
         # is page-ceiled. fnFL2x137 D printed '#new-token: 64' for a 1-token
@@ -1539,7 +1564,7 @@ class PrefillAdder:
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
         elif self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= extend_input_len
+            self.rem_chunk_tokens -= extend_input_len if chunk_charge is None else int(chunk_charge)
 
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
@@ -1676,7 +1701,16 @@ class PrefillAdder:
         # which is floor_page(end - 1) unless end is a page multiple (then the
         # cut below stays) -- and D takes the END state P publishes at the
         # finish (weg2/tail_handoff.arm_fold); no state at c is ever needed.
-        if tail_handoff.fold_applies(end, _page):
+        # P-MINIFWD (SGLANG_WEG2_TAIL_FOLD_PAGE_END): at end % page == 0 the
+        # fold holds too where the CLAIM ANCHOR track lands the anchor on the
+        # reader's claim end - page inside this chunk (one predicate with the
+        # track, tail_handoff.page_end_fold_applies).
+        _claim = (
+            tail_handoff.claim_anchor_end(req, getattr(self, "tree_cache", None))
+            if end % max(1, _page) == 0
+            else None
+        )
+        if tail_handoff.fold_applies(end, _page, start=start, claim=_claim):
             n = getattr(PrefillAdder, "_weg2_end_anchor_folds", 0) + 1
             PrefillAdder._weg2_end_anchor_folds = n
             if n <= 8 or n % 64 == 0:
@@ -2904,6 +2938,10 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
+            # cold-round1: what the forward COMPUTES (the agreed tail makes it
+            # 0 or N - c); the chunk fit and the chunk charge take this, the
+            # KV charge keeps input_tokens.
+            fit_tokens = self._weg2_tail_fit_tokens(req, input_tokens)
             if _fa_host_first:
                 # H105b: the host's load-back is through (or there was none):
                 # ADMIT goes out now, one broadcast per gate call as before.
@@ -2925,12 +2963,31 @@ class PrefillAdder:
 
             if self.weg2_skip_extend_taken and (
                 self.dllm_config is not None
-                or (self.rem_chunk_tokens is not None and input_tokens > self.rem_chunk_tokens)
+                or (self.rem_chunk_tokens is not None and fit_tokens > self.rem_chunk_tokens)
                 or not tail_adopt.skip_joinable(req, len(req.prefix_indices))
             ):
                 # H24c: behind a skip only a request that takes the END state
                 # at THIS prefix (the matched page anchor) -- anything else
                 # would run its extend in a batch whose forward is skipped
+                return AddReqResult.OTHER
+            if tail_adopt.skip_waits(
+                req, len(req.prefix_indices),
+                skip_taken=self.weg2_skip_extend_taken,
+                batch_nonempty=bool(self.can_run_list),
+            ):
+                # ZR-3, the mirror of H24c: an END-state request in front of a
+                # batch that already runs a forward waits one pass instead of
+                # dropping its END state; the next pass leads with it
+                # (weg2/skip_first.py). Rank-uniform inputs.
+                return AddReqResult.OTHER
+            from sglang.srt.weg2 import d_twin_pass
+
+            if not tail_adopt.skip_joinable(
+                req, len(req.prefix_indices)
+            ) and d_twin_pass.waits(req, len(req.prefix_indices), self.can_run_list):
+                # ZR-4: a twin in this pass computes these tokens already; this
+                # one waits a pass and matches them from the tree (D only; an
+                # END-state adoption computes nothing and never waits here)
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
@@ -2943,7 +3000,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif self.rem_chunk_tokens is None or fit_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 # #1233 END-OF-PREFILL ANCHOR: a whole-fit prompt still holds
                 # its last token back so the N-1 anchor is published; the
@@ -2963,6 +3020,15 @@ class PrefillAdder:
                     req, _ea_start,
                     batch_empty=not self.can_run_list or self.weg2_skip_extend_taken,
                 )
+                if (
+                    _tail is None
+                    and self.rem_chunk_tokens is not None
+                    and input_tokens > self.rem_chunk_tokens
+                ):
+                    # cold-round1 belt: the whole fit was granted on the tail
+                    # (peek) and the plan refused it -- the full extend does
+                    # not fit this chunk; the chunked path takes it next pass
+                    return AddReqResult.OTHER
                 # W123 belt (D vision guard): the guard admitted an image on
                 # the tail it READ; the target's first computed position is
                 # fixed here. An image reaching it would be prefilled by a
@@ -3034,6 +3100,7 @@ class PrefillAdder:
                     mamba_gap_reserve=mamba_gap_reserve,
                     mamba_slot_charge=mamba_slot_charge,
                     computed_input_len=_ea_len if _ea_forced else len(req.full_untruncated_fill_ids) - _ea_start,
+                    chunk_charge=None if (_ea_forced or _tail is None) else fit_tokens,
                 )
             else:
                 # W123 belt, chunked form: no tail is taken on this path, the

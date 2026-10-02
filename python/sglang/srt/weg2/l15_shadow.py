@@ -230,3 +230,17 @@ class ShadowLedger:
 # Process-wide singleton: the scheduler sleep hook writes, the
 # unified_radix_cache load hook reads; both in the same worker process.
 LEDGER = ShadowLedger()
+
+
+def own_cap_rows(sched, env) -> int:
+    """This D rank's L1.5 hold cap in rows (0 = not held here), the same
+    caps_from_env derivation as the sleep hook."""
+    mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    pool = getattr(mr, "token_to_kv_pool", None)
+    tp = int(getattr(sched, "tp_size", 0) or getattr(
+        getattr(sched, "server_args", None), "tp_size", 1) or 1)
+    rg = getattr(getattr(sched, "server_args", None), "rank_gpu_id", None)
+    cards = list(rg) if isinstance(rg, (list, tuple)) and len(rg) == tp else list(range(tp))
+    caps = caps_from_env(env, tp, [cell_bytes_from(pool)] * tp, cards)
+    rank = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0)
+    return int(caps[rank]) if 0 <= rank < len(caps) else 0

@@ -214,3 +214,37 @@ def test_source_both_sites_use_manifest_path() -> None:
         assert '"/tmp/weg2_l115_manifest.json"' not in text, (
             f"{name} still carries the misspelled default")
 
+
+
+def test_binary_record_roundtrips_and_json_records_still_read(tmp_path) -> None:
+    """L15-FLIPCOST-3: write() lands the binary record; read() takes it and
+    the old JSON form (tombstones, earlier writers) alike."""
+    import os
+
+    from sglang.srt.weg2 import l15_manifest as M
+    from sglang.srt.weg2.l15_manifest import HoldSpan, Manifest
+
+    m = Manifest(epoch=3, pid=os.getpid(), spans=(
+        HoldSpan(rid="b", depth=3, slots=(5, 6, 7), anchor_slot=2, l2_slots=(1, -1, 3),
+                 l2_gens=(4, -1, 4), anchor_l2_slot=9, anchor_l2_gen=1, l2_lanes=(0, -1, 0)),
+        HoldSpan(rid="a", depth=1, slots=(1,), anchor_slot=1, l2_slots=(), l2_gens=())),
+        rows_by_rank=(4, 2), anchor_slots=3)
+    p = str(tmp_path / "m.json")
+    M.write(p, m)
+    assert open(p, "rb").read().startswith(b"L15MB1")
+    back = M.read(p)
+    assert M.fingerprint(back) == M.fingerprint(m)
+    assert sorted(s.rid for s in back.spans) == ["a", "b"]
+    b = [s for s in back.spans if s.rid == "b"][0]
+    assert b.l2_slots == (1, -1, 3) and b.l2_lanes == (0, -1, 0) and b.anchor_l2_slot == 9
+    with open(p, "w") as fh:
+        fh.write(M.to_json(m))
+    assert M.fingerprint(M.read(p)) == M.fingerprint(m)
+    with open(p, "wb") as fh:
+        fh.write(M.to_bytes(m)[:-3])
+    try:
+        M.read(p)
+    except ValueError as exc:
+        assert "binary" in str(exc)
+    else:
+        raise AssertionError("a truncated binary record must raise")

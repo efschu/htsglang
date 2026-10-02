@@ -150,41 +150,52 @@ def compact_plan(
     rule ``anchor_plan`` enforces for anchors). The default ``()``
     reproduces the pre-L15-11b behaviour exactly.
     """
+    # L15-FLIPCOST: vectorised (numpy). The per-slot Python loop cost ~0.85 s
+    # per sleep at the metal's ~250k held tokens, inside the D->P flip.
+    # Same plan, same errors (the rare error paths fall back to the scalar
+    # loop so the messages name the same slot).
+    import numpy as np
+
     s = _check_prefix(prefix)
     n_ranks = len(prefix) - 1
     reserved_set = {int(x) for x in reserved}
+    pre = np.asarray([int(x) for x in prefix], dtype=np.int64)
 
-    need = [0] * n_ranks
-    held_all: set = set()
+    def _owner(a):
+        r = np.searchsorted(pre, a % s, side="right") - 1
+        if a.size and (int(r.min()) < 0 or int(r.max()) >= n_ranks):
+            bad = int(a[(r < 0) | (r >= n_ranks)][0])
+            owner_of(bad, prefix)          # raises the named ValueError
+        return r
+
+    arrs = {}
     for rid, slots in held.items():
-        rid_seen: set = set()
-        for slot in slots:
-            slot = int(slot)
-            if slot in rid_seen:
-                raise ValueError(
-                    f"slot {slot} appears twice inside the held list of "
-                    f"request {rid!r}; one request holding a slot twice is "
-                    "corruption, not a shared prefix"
-                )
-            rid_seen.add(slot)
-            if slot in held_all:
-                # F7: shared with another request -- planned and counted
-                # once; every holder maps through the same moves entry.
-                continue
-            held_all.add(slot)
-            need[owner_of(slot, prefix)] += 1
-    hit = sorted(reserved_set & held_all)
-    if hit:
-        # Symmetry with anchor_plan: a held anchor on a reserved slot is a
-        # ValueError; a held KV slot must fail the same way, not silently
-        # double-count its owner's need in the loop below.
+        a = np.asarray(slots, dtype=np.int64).reshape(-1)
+        if a.size and np.unique(a).size != a.size:
+            seen: set = set()
+            for slot in a.tolist():
+                if slot in seen:
+                    raise ValueError(
+                        f"slot {slot} appears twice inside the held list of "
+                        f"request {rid!r}; one request holding a slot twice is "
+                        "corruption, not a shared prefix"
+                    )
+                seen.add(slot)
+        arrs[rid] = a
+    held_all = (np.unique(np.concatenate(list(arrs.values())))
+                if arrs else np.zeros(0, dtype=np.int64))
+    res = np.asarray(sorted(reserved_set), dtype=np.int64)
+    hit = np.intersect1d(res, held_all)
+    if hit.size:
         raise ValueError(
-            f"held slot(s) {hit} sit on a reserved slot (padding slot 0 is "
+            f"held slot(s) {hit.tolist()} sit on a reserved slot (padding slot 0 is "
             "the dummy write target for padded tokens); a held slot must "
             "never land there"
         )
-    for slot in reserved_set:
-        need[owner_of(slot, prefix)] += 1
+    need = np.bincount(_owner(held_all), minlength=n_ranks)[:n_ranks]
+    if res.size:
+        need = need + np.bincount(_owner(res), minlength=n_ranks)[:n_ranks]
+    need = [int(x) for x in need]
 
     l_h = hold_prefix(need, prefix)
     blocks = l_h // s
@@ -192,38 +203,39 @@ def compact_plan(
         blocks * (int(prefix[r + 1]) - int(prefix[r])) for r in range(n_ranks)
     )
 
-    # Free slots of each class inside [0, l_h), ascending (scanning ascending).
-    free_by_rank: list = [[] for _ in range(n_ranks)]
-    for slot in range(l_h):
-        if slot not in held_all and slot not in reserved_set:
-            free_by_rank[owner_of(slot, prefix)].append(slot)
-
-    # Sources at or above l_h, per class; paired ascending with the targets.
-    src_by_rank: list = [[] for _ in range(n_ranks)]
-    for slot in held_all:
-        if slot >= l_h:
-            src_by_rank[owner_of(slot, prefix)].append(slot)
-
-    mapping: Dict[int, int] = {}
+    # free slots of each class inside [0, l_h), ascending; sources at or
+    # above l_h per class, ascending; paired in order
+    below = np.arange(l_h, dtype=np.int64)
+    taken = np.union1d(held_all, res)
+    free = below[~np.isin(below, taken)]
+    free_owner = _owner(free)
+    src = held_all[held_all >= l_h]
+    src_owner = _owner(src)
+    m_src, m_tgt = [], []
     for r in range(n_ranks):
-        srcs = sorted(src_by_rank[r])
-        targets = free_by_rank[r]
-        if len(srcs) > len(targets):
+        srcs = src[src_owner == r]            # held_all is sorted -> ascending
+        targets = free[free_owner == r]
+        if srcs.size > targets.size:
             # Unreachable when hold_prefix is the sole sizer; defensive.
             raise ValueError(
-                f"rank {r}: {len(srcs)} slots to move but only {len(targets)} "
+                f"rank {r}: {srcs.size} slots to move but only {targets.size} "
                 f"free class-{r} slots inside [0, {l_h})"
             )
-        for src, tgt in zip(srcs, targets):
-            mapping[src] = tgt
+        m_src.append(srcs)
+        m_tgt.append(targets[: srcs.size])
+    m_src_a = np.concatenate(m_src) if m_src else np.zeros(0, dtype=np.int64)
+    m_tgt_a = np.concatenate(m_tgt) if m_tgt else np.zeros(0, dtype=np.int64)
+    order = np.argsort(m_src_a, kind="stable")
+    m_src_a, m_tgt_a = m_src_a[order], m_tgt_a[order]
+    moves = tuple(zip(m_src_a.tolist(), m_tgt_a.tolist()))
 
-    moves = tuple(sorted((src, tgt) for src, tgt in mapping.items()))
-    new_slots = {
-        rid: tuple(
-            (int(t) if int(t) < l_h else mapping[int(t)]) for t in slots
-        )
-        for rid, slots in held.items()
-    }
+    new_slots = {}
+    for rid, a in arrs.items():
+        out = a.copy()
+        hi = a >= l_h
+        if hi.any():
+            out[hi] = m_tgt_a[np.searchsorted(m_src_a, a[hi])]
+        new_slots[rid] = tuple(out.tolist())
     return CompactPlan(
         l_h=l_h, moves=moves, new_slots=new_slots, rows_by_rank=rows_by_rank
     )

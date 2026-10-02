@@ -115,6 +115,8 @@ def format_freed(freed: Dict[str, int]) -> str:
     return f"{total / _MIB:.1f} MiB ({parts or 'nothing held'})"
 
 
+#: offsets inside the pinned stash are aligned so every dtype view is legal
+_STASH_ALIGN = 256
 #: FLIP-LEGS 02.10.: the stash copies each device buffer into PINNED host
 #: memory with non_blocking=True and synchronizes ONCE per device, instead of
 #: one pageable, synchronizing ``.to("cpu")`` per buffer. Same values, same
@@ -153,40 +155,62 @@ def export_static_state_host(model: Any) -> dict:
     ``_import_static_state``'s in-place copy) on the HOST while asleep --
     64 MiB on NF PP0 no pause covered. The import copies host -> device.
 
+    WT (30.09., NF y4f): ONE pinned host block, each buffer a view into it.
+    The pageable per-buffer stash cost the P->D wake ``static_import`` 111 ms
+    median on D TP0 (rc12g before 7002b171d5: 11 ms) -- a synchronous pageable
+    H2D per buffer on the wake's critical path. From pinned memory the import
+    is an asynchronous copy on the current stream (``pinned=True``), ordered
+    before the next forward. Without CUDA (a CPU double) the block is plain.
+
     FLIP-LEGS 02.10.: this export stands between the gathered sleep RPC and
     the sleeper's first deposit (WEG2-SLEEP-PRELOOP census_credit 41-54 ms p50
-    on every sleeping rank of N4p/N4q, export + TP barrier + census), and the
-    import stands in the waker's tail (static_import 16-79 ms). Pinned +
-    non_blocking + one sync per device (:data:`ENV_STASH_PINNED`)."""
+    on every sleeping rank of N4p/N4q). The copies into the block are queued
+    non_blocking and synchronized ONCE per device (:func:`stage_buffers`);
+    :data:`ENV_STASH_PINNED` off = the per-buffer pageable form. Numbers in
+    :data:`LAST_EXPORT` for the WEG2-STATIC-EXPORT line.
+    RELEASE-INTEG 1002: both sides kept -- the single pinned block (and its
+    ``pinned``/``block`` keys the importer reads) from the release head, the
+    async queue + one sync per device + switch + numbers from FLIP-LEGS."""
     import time as _time
+
+    import torch
 
     t0 = _time.perf_counter()
     named = [(name, buffer.detach()) for name, buffer in model.named_buffers()]
     nbytes = sum(int(b.numel()) * int(b.element_size()) for _, b in named)
     if not stash_pinned_on():
         bufs = [(name, b.to("cpu", copy=True)) for name, b in named]
-        mode = "pageable"
-    else:
-        import torch
+        LAST_EXPORT.clear()
+        LAST_EXPORT.update(n=len(bufs), bytes=nbytes, ms=(_time.perf_counter() - t0) * 1000.0,
+                           mode="pageable")
+        return dict(buffers=bufs, pinned=False)
+    spans, total = [], 0
+    for _name, buf in named:
+        spans.append(total)
+        total += -(-_nbytes(buf) // _STASH_ALIGN) * _STASH_ALIGN
+    pinned = bool(total) and torch.cuda.is_available()
+    block = torch.empty(max(total, 1), dtype=torch.uint8, pin_memory=pinned)
+    views = {name: block[off:off + _nbytes(buf)].view(buf.dtype).view(buf.shape)
+             for (name, buf), off in zip(named, spans)}
 
-        def to_host(b):
-            if not b.is_cuda:
-                return b.to("cpu", copy=True), None
-            try:
-                h = torch.empty_like(b, device="cpu", pin_memory=True)
-            except RuntimeError:          # no pinned memory: the old copy, still correct
-                return b.to("cpu", copy=True), None
-            h.copy_(b, non_blocking=True)
-            return h, b.device
+    def to_host(item):
+        name, buf = item
+        view = views[name]
+        if pinned and buf.is_cuda:
+            view.copy_(buf, non_blocking=True)
+            return view, buf.device
+        view.copy_(buf)
+        return view, None
 
-        def sync_device(dev):
-            torch.cuda.current_stream(dev).synchronize()
+    def sync_device(dev):
+        torch.cuda.current_stream(dev).synchronize()
 
-        bufs = stage_buffers(named, to_host=to_host, sync_device=sync_device)
-        mode = "pinned-async"
+    bufs = stage_buffers([(name, (name, buf)) for name, buf in named], to_host=to_host,
+                         sync_device=sync_device)
     LAST_EXPORT.clear()
-    LAST_EXPORT.update(n=len(bufs), bytes=nbytes, ms=(_time.perf_counter() - t0) * 1000.0, mode=mode)
-    return dict(buffers=bufs)
+    LAST_EXPORT.update(n=len(bufs), bytes=nbytes, ms=(_time.perf_counter() - t0) * 1000.0,
+                       mode="pinned-async")
+    return dict(buffers=bufs, pinned=pinned, block=block)
 
 
 # -- (c) the holder report -------------------------------------------------------------

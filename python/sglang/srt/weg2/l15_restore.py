@@ -87,7 +87,55 @@ def _l2_source(span, i: int) -> Optional[Tuple[int, int]]:
     return None
 
 
+#: L15-PLAN-CACHE (N6k: the wake's refill plan + sample rebuilt owned_l2_rows
+#: from the manifest on the resume RPC -- ~80 ms per 47k / ~230 ms per 133k
+#: held tokens per call, on TP0's path that every peer's fence waits for).
+#: One entry: (fingerprint, rank, prefix) -> rows; warmed at the sleep.
+_PLAN_CACHE: dict = {}
+
+
+def _plan_key(m: Manifest, rank: int, prefix: Sequence[int]):
+    from sglang.srt.weg2.l15_manifest import fingerprint
+
+    return (int(fingerprint(m)), int(rank), tuple(int(x) for x in prefix))
+
+
 def owned_l2_rows(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
+    """Cached :func:`owned_l2_rows_uncached` (same manifest content, rank and
+    prefix -> the same rows; the rows are immutable tuples)."""
+    try:
+        key = _plan_key(m, rank, prefix)
+    except Exception:  # noqa: BLE001 -- an odd manifest: compute directly
+        return owned_l2_rows_uncached(m, rank, prefix)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        return list(hit)
+    rows = owned_l2_rows_uncached(m, rank, prefix)
+    _PLAN_CACHE.clear()
+    _PLAN_CACHE[key] = tuple(rows)
+    return rows
+
+
+def warm_plan_async(m: Manifest, rank: int, prefix: Sequence[int]) -> None:
+    """Build the wake's plan in a daemon thread after the sleep (P's phase
+    lasts seconds; the wake then finds it cached). Never raises."""
+    import threading
+
+    def _run():
+        try:
+            owned_l2_rows(m, rank, prefix)
+        except Exception:  # noqa: BLE001 -- the wake computes it then
+            pass
+
+    try:
+        threading.Thread(target=_run, name="l15-plan-warm", daemon=True).start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def owned_l2_rows_uncached(
     m: Manifest, rank: int, prefix: Sequence[int],
 ) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
     """Every L2-backed row this rank must refill, ONCE per compact row.
@@ -315,3 +363,42 @@ def refusal_message(gc: GroupCheck, epoch: int) -> str:
     return "L15-CHECK REFUSED epoch=%d bad_ranks=%s" % (
         epoch, ",".join(str(i) for i in gc.bad_ranks),
     )
+
+
+def owned_held_rows(m: Manifest, rank: int, prefix: Sequence[int]) -> int:
+    """Distinct held slots of ``m`` this rank owns (shared prefixes once)."""
+    s = int(prefix[-1])
+    lo, hi = int(prefix[rank]), int(prefix[rank + 1])
+    seen = set()
+    for sp in m.spans:
+        for slot in sp.slots:
+            if lo <= int(slot) % s < hi:
+                seen.add(int(slot))
+    return len(seen)
+
+
+def hostbytes_line(m: Optional[Manifest], rank: int, prefix: Sequence[int],
+                   cap_rows: int, cell_bytes: int, anchor_bytes: int,
+                   verdict: str, epoch: int, parked: bool = False) -> str:
+    """L15-HOSTBYTES (user law 02.10.: with L15 the flip must move FEWER host
+    bytes): per rank and wake, the bytes that did NOT cross the host because
+    they stayed on the card (h2d_saved: KV rows + anchor shares of a capped
+    rank on verdict hold), the bytes still loaded from L2 (h2d_refill: the
+    cap-0 rank's owned held rows), and d2h_saved (the sleep's write-through
+    of held rows -- still issued today, so 0)."""
+    rows = owned_held_rows(m, rank, prefix) if m is not None else 0
+    anchors = len({int(sp.anchor_slot) for sp in m.spans}) if m is not None else 0
+    kv = rows * int(cell_bytes)
+    an = anchors * int(anchor_bytes)
+    keep = verdict == "hold"
+    if int(cap_rows) > 0:
+        saved, refill = (kv + an if keep else 0), 0
+    elif parked:
+        # L15-16: the cap-0 rank's KV came back card to card, anchors from L2
+        saved, refill = (kv if keep else 0), (an if keep else 0)
+    else:
+        saved, refill = 0, (kv + an if keep else 0)
+    return ("L15-HOSTBYTES flip=%d rank=%d verdict=%s rows=%d anchors=%d "
+            "h2d_saved=%d h2d_refill=%d d2h_saved=0 parked=%d"
+            % (int(epoch), int(rank), verdict, rows, anchors, saved, refill,
+               int(bool(parked))))

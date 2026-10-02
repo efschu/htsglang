@@ -831,7 +831,11 @@ class TheDetectorStaysADetectorTest(CustomTestCase):
 
         from sglang.srt.layers.dcp import prefix_lens_check
 
-        src = inspect.getsource(prefix_lens_check.assert_prefix_lens_rank_uniform)
+        # nf-pd-post 01.10.: the verdict lives in ``_decide`` (shared by the
+        # immediate check and a skip batch's deferred one)
+        src = inspect.getsource(prefix_lens_check.assert_prefix_lens_rank_uniform) + inspect.getsource(
+            prefix_lens_check._decide
+        )
         self.assertIn("raise PrefixLensRankDivergence", src)
         # No write-back of a reduced vector: the ballot is read, never applied.
         self.assertNotIn("prefix_lens[:]", src)
@@ -843,8 +847,8 @@ class TheDetectorStaysADetectorTest(CustomTestCase):
         from sglang.srt.managers.schedule_batch import ScheduleBatch
 
         src = inspect.getsource(ScheduleBatch.prepare_for_extend)
-        head = src[: src.index("assert_prefix_lens_rank_uniform(prefix_lens)")]
-        tail = src[src.index("assert_prefix_lens_rank_uniform(prefix_lens)") :]
+        head = src[: src.index("assert_prefix_lens_rank_uniform(prefix_lens")]
+        tail = src[src.index("assert_prefix_lens_rank_uniform(prefix_lens") :]
         # The vector handed to the detector is the one built from the radix
         # match, and it is not rewritten after the detector returns.
         self.assertIn("prefix_lens = [len(r.prefix_indices) for r in reqs]", head)

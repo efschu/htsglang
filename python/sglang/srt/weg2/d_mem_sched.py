@@ -97,7 +97,7 @@ class MemSched:
         return j is not None and j < self.stage
 
     def step(self, used_tokens: int, incoming_tokens: int = 0, *, ended: bool = False,
-             unbacked_tokens: int = 0, floor_tokens: int = 0) -> StageStep:
+             unbacked_tokens: int = 0, floor_tokens=0) -> StageStep:
         """One scheduler iteration (between rounds / at the admission point).
 
         ``used_tokens``: the global KV tokens the group holds now;
@@ -109,7 +109,11 @@ class MemSched:
         stage never ends below a page a request or an unbacked tree node
         holds. A shrink it blocks stays PENDING (``pending``): the caller
         caps new pages below the wanted stage, and the next iteration takes
-        it as soon as the floor has drained (no second hysteresis)."""
+        it as soon as the floor has drained (no second hysteresis).
+        ``floor_tokens`` may be a zero-argument callable: it is called only
+        on the paths that shrink (replicated), so an iteration that cannot
+        shrink asks the group for no floor (NF y6k 01.10.: the floor read
+        was 32 % of the D-TP0 scheduler, a device sync each round)."""
         self._round += 1
         top = len(self.stage_tokens) - 1
         need = int(used_tokens) + int(incoming_tokens) + int(self.air_tokens)
@@ -162,10 +166,12 @@ class MemSched:
         return self._shrink_to(gap, floor_tokens, end=False,
                                why="below for %d rounds" % self.hysteresis_rounds)
 
-    def _shrink_to(self, want: int, floor_tokens: int, *, end: bool, why: str) -> StageStep:
+    def _shrink_to(self, want: int, floor_tokens, *, end: bool, why: str) -> StageStep:
         """Shrink toward ``want``, never below the live floor; the blocked
         rest stays pending (``stage_down_waited_backup`` once per decision)."""
         want, before = int(want), self.stage
+        if callable(floor_tokens):
+            floor_tokens = floor_tokens()
         f = self._smallest_holding(int(floor_tokens))
         j = before if f is None else min(before, max(want, f))
         blocked = j > want

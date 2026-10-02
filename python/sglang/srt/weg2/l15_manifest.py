@@ -207,17 +207,82 @@ def from_json(s: str) -> Manifest:
     )
 
 
+#: L15-FLIPCOST-3: binary record = magic + 8-byte head length + small JSON
+#: head (scalars and per-span scalars/lengths) + every span's int lists as
+#: little-endian int64, spans in rid order. JSON records (tombstones, older
+#: writers) are still read.
+_BIN_MAGIC = b"L15MB1\n"
+_LISTS = ("slots", "l2_slots", "l2_gens", "l2_lanes")
+
+
+def to_bytes(m: Manifest) -> bytes:
+    import numpy as np
+
+    spans = sorted(m.spans, key=lambda s: s.rid)
+    head = {"epoch": int(m.epoch), "pid": int(m.pid),
+            "rows_by_rank": [int(x) for x in m.rows_by_rank],
+            "anchor_slots": int(m.anchor_slots),
+            "spans": [{"rid": s.rid, "depth": int(s.depth),
+                       "anchor_slot": int(s.anchor_slot),
+                       "anchor_l2_slot": int(s.anchor_l2_slot),
+                       "anchor_l2_gen": int(s.anchor_l2_gen),
+                       "lens": [len(getattr(s, f)) for f in _LISTS]} for s in spans]}
+    hb = json.dumps(head, sort_keys=True).encode()
+    parts = [_BIN_MAGIC, len(hb).to_bytes(8, "little"), hb]
+    for s in spans:
+        for f in _LISTS:
+            parts.append(np.asarray(getattr(s, f), dtype="<i8").tobytes())
+    return b"".join(parts)
+
+
+def from_bytes(raw: bytes) -> Manifest:
+    """Inverse of :func:`to_bytes`; a JSON record goes through from_json."""
+    import numpy as np
+
+    if not raw.startswith(_BIN_MAGIC):
+        return from_json(raw.decode())
+    off = len(_BIN_MAGIC)
+    try:
+        n = int.from_bytes(raw[off:off + 8], "little")
+        head = json.loads(raw[off + 8:off + 8 + n].decode())
+        pos = off + 8 + n
+        spans = []
+        for sp in head["spans"]:
+            vals = []
+            for k in sp["lens"]:
+                k = int(k)
+                vals.append(tuple(np.frombuffer(raw, dtype="<i8", count=k,
+                                                offset=pos).tolist()))
+                pos += 8 * k
+            spans.append(HoldSpan(rid=str(sp["rid"]), depth=int(sp["depth"]),
+                                  slots=vals[0], anchor_slot=int(sp["anchor_slot"]),
+                                  l2_slots=vals[1], l2_gens=vals[2],
+                                  anchor_l2_slot=int(sp["anchor_l2_slot"]),
+                                  anchor_l2_gen=int(sp["anchor_l2_gen"]),
+                                  l2_lanes=vals[3]))
+        if pos != len(raw):
+            raise ValueError("%d trailing bytes" % (len(raw) - pos))
+        return Manifest(epoch=int(head["epoch"]), pid=int(head["pid"]),
+                        spans=tuple(spans),
+                        rows_by_rank=tuple(int(x) for x in head["rows_by_rank"]),
+                        anchor_slots=int(head["anchor_slots"]))
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError(f"malformed L1.5 manifest (binary): {exc}") from None
+
+
 def write(path: str, m: Manifest) -> None:
     """Publish under ``flock`` on ``<path>.lock``; land atomically with a
-    tmp file + ``os.replace`` so a reader never sees a half record."""
+    tmp file + ``os.replace`` so a reader never sees a half record.
+
+    L15-FLIPCOST-3: the binary record (no JSON over ~1M ints) and no fsync --
+    the record lives for one sleep-wake pair of THIS process (a dead pid's
+    record is reaped on read), so surviving a host crash buys nothing."""
     with open(path + ".lock", "w") as lock_fh:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
         try:
             tmp = path + ".tmp"
-            with open(tmp, "w") as fh:
-                fh.write(to_json(m))
-                fh.flush()
-                os.fsync(fh.fileno())
+            with open(tmp, "wb") as fh:
+                fh.write(to_bytes(m))
             os.replace(tmp, path)
         finally:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -228,11 +293,11 @@ def read(path: str, pid_alive=_pid_alive) -> Optional[Manifest]:
     is dead is reaped here (removed and reported absent): the driver freed
     that process's memory, so its hold description is stale by definition."""
     try:
-        with open(path, "r") as fh:
+        with open(path, "rb") as fh:
             raw = fh.read()
     except FileNotFoundError:
         return None
-    m = from_json(raw)
+    m = from_bytes(raw)
     if not pid_alive(m.pid):
         try:
             os.remove(path)
@@ -267,10 +332,28 @@ def fingerprint(m: Manifest) -> int:
     """Signed int64 over the canonical serialization WITHOUT ``pid`` (the
     same content from two processes must agree). Stable under span order;
     changes when any slot, generation, depth or rows_by_rank changes."""
-    obj = json.loads(to_json(m))
-    obj.pop("pid", None)
-    payload = json.dumps(obj, sort_keys=True).encode()
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=True)
+    # L15-FLIPCOST (N4a: retain step "manifest" 170-182 ms, most of it this
+    # JSON round trip over ~1M ints): the same content, hashed as a small
+    # canonical JSON head plus every span's int lists as little-endian int64
+    # bytes, spans in rid order. Every rank runs this same code, so ranks
+    # still agree exactly when their records agree.
+    import numpy as np
+
+    h = hashlib.sha256()
+    head = {"epoch": int(m.epoch), "rows_by_rank": [int(x) for x in m.rows_by_rank],
+            "anchor_slots": int(m.anchor_slots), "n_spans": len(m.spans)}
+    h.update(json.dumps(head, sort_keys=True).encode())
+    for sp in sorted(m.spans, key=lambda x: x.rid):
+        h.update(json.dumps({"rid": sp.rid, "depth": int(sp.depth),
+                             "anchor_slot": int(sp.anchor_slot),
+                             "anchor_l2_slot": int(sp.anchor_l2_slot),
+                             "anchor_l2_gen": int(sp.anchor_l2_gen),
+                             "lens": [len(sp.slots), len(sp.l2_slots),
+                                      len(sp.l2_gens), len(sp.l2_lanes)]},
+                            sort_keys=True).encode())
+        for arr in (sp.slots, sp.l2_slots, sp.l2_gens, sp.l2_lanes):
+            h.update(np.asarray(arr, dtype="<i8").tobytes())
+    return int.from_bytes(h.digest()[:8], "big", signed=True)
 
 
 def agree(min_fp: int, max_fp: int) -> bool:

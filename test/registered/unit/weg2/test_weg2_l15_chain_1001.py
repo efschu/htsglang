@@ -152,8 +152,8 @@ def test_sleep_writes_per_rank_manifests_f7_shape(tmp_path):
     res2, _pool2, _a2, nodes2 = _retain_rank(tmp_path, 2,
                                              manifest_name="m_rank2.json")
     assert res1 is not None and res2 is not None, "F7 shape must retain"
-    m1 = l15_manifest.from_json((tmp_path / "m_rank1.json").read_text())
-    m2 = l15_manifest.from_json((tmp_path / "m_rank2.json").read_text())
+    m1 = l15_manifest.from_bytes((tmp_path / "m_rank1.json").read_bytes())
+    m2 = l15_manifest.from_bytes((tmp_path / "m_rank2.json").read_bytes())
     # The fingerprint covers the hold, not the rank: equal inputs -> equal fp.
     assert l15_manifest.fingerprint(m1) == l15_manifest.fingerprint(m2)
     assert m1.epoch == EPOCH and m2.epoch == EPOCH
@@ -689,10 +689,13 @@ def test_refill1_chain_holds_and_the_act_never_refills_again(
         assert WU._l15_wake_check_and_decide(fss[r], True, fps[r],
                                              epoch=EPOCH) == "hold"
     # Real sample plans: distinct owned-with-L2 rows per rank (slot%3
-    # classes), shared prefix rows sampled ONCE (L15-DEDUPE): rank 0 row
-    # 12 (both spans), rank 1 rows 10,13, rank 2 rows 11,14.
-    assert seen == [1, 2, 2]
-    assert [o for _g, o in calls] == [v, v, v]   # the REAL votes agree
+    # classes), shared prefix rows sampled ONCE (L15-DEDUPE): rank 1 rows
+    # 10,13, rank 2 rows 11,14. L15-FIX-CAP0-CHECK: rank 0's rows were just
+    # copied from L2 under the generation check -- no sample re-read; it
+    # votes the same fingerprint with a clean (0, 0, 0) check.
+    assert seen == [2, 2]
+    v0 = l15_restore.check_vote(fps[0], 0, 0, 0, ())
+    assert [o for _g, o in calls] == [v0, v, v]   # same fp, nobody bad
     for r in range(3):
         assert WU._l15_wake_act(fss[r], scheds[r], "hold",
                                 group_ok=True, master_on=True) == 0

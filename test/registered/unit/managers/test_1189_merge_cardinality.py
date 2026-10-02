@@ -190,6 +190,7 @@ def _batch(
     b.mamba_track_indices = None
     b.mamba_track_mask = None
     b.mamba_track_seqlens = None
+    b.weg2_turn_tracks = None
     b.return_logprob = return_logprob
     b.top_logprobs_nums = [f"{tag}top{i}" for i in range(n)]
     b.token_ids_logprobs = [f"{tag}tid{i}" for i in range(n)]

@@ -211,6 +211,11 @@ def _unsupported_components(node) -> list:
 
 
 def chain_host_rows(node) -> Tuple[int, ...]:
+    """The host rows of the chain (see :func:`chain_host_rows_ex`)."""
+    return chain_host_rows_ex(node)[0]
+
+
+def chain_host_rows_ex(node) -> Tuple[Tuple[int, ...], Tuple[Optional[int], ...]]:
     """L15-12c-C2: the host rows of the radix chain root -> node, in token
     order. The walk goes last_node -> root; each node contributes its
     component_data[ComponentType.FULL].host_value (the host row ids of its
@@ -229,6 +234,7 @@ def chain_host_rows(node) -> Tuple[int, ...]:
     count.
     """
     chunks = []
+    recs = []
     cur = node
     while cur is not None:
         try:
@@ -236,9 +242,18 @@ def chain_host_rows(node) -> Tuple[int, ...]:
         except (AttributeError, KeyError, IndexError, TypeError):
             cd = None  # duck-typed: a fake/odd node contributes no rows
         hv = getattr(cd, "host_value", None) if cd is not None else None
+        sh = getattr(cur, "_weg2_l2_shadow", None)
         if hv is not None and len(hv):
             vals = hv.tolist() if hasattr(hv, "tolist") else hv
             chunks.append([int(x) for x in vals])
+            recs.append([None] * len(vals))
+        elif (sh is not None and len(sh) == 2 and len(sh[0]) == len(sh[1])
+              and len(sh[0]) == _node_tokens(cd, cur)):
+            # L15-L2-SHADOW: the #248 release dropped this node's KV host rows
+            # but recorded them with their arena generation -- adopted here,
+            # the caller keeps a row only where the slot still has that gen
+            chunks.append([int(x) for x in sh[0]])
+            recs.append([int(g) for g in sh[1]])
         else:
             n_tok = None
             val = getattr(cd, "value", None) if cd is not None else None
@@ -254,12 +269,28 @@ def chain_host_rows(node) -> Tuple[int, ...]:
                     n_tok = None
             if n_tok:
                 chunks.append([-1] * n_tok)
+                recs.append([None] * n_tok)
             # else: no host rows, no token count -> old positional skip
         cur = getattr(cur, "parent", None)
     rows: list = []
-    for chunk in reversed(chunks):
+    rec: list = []
+    for chunk, rc in zip(reversed(chunks), reversed(recs)):
         rows.extend(chunk)
-    return tuple(rows)
+        rec.extend(rc)
+    return tuple(rows), tuple(rec)
+
+
+def _node_tokens(cd, node) -> int:
+    """The node's own token count: its device value, else its radix key."""
+    for v in (getattr(cd, "value", None) if cd is not None else None,
+              getattr(node, "key", None)):
+        if v is None:
+            continue
+        try:
+            return len(v)
+        except TypeError:
+            continue
+    return -1
 
 
 def anchor_host_row(node, anchor_slot: int) -> int:
@@ -346,6 +377,25 @@ def _slot_gens_or_minus_one(pool, slots, log, what: str):
     return fn(slots)
 
 
+def _owner_counts(slots, prefix) -> Tuple[int, ...]:
+    """Per-rank count of ``slots`` under the owner rule (rank r owns slot L
+    iff prefix[r] <= L % S < prefix[r+1]); a slot with no owner raises like
+    l15_compact.owner_of."""
+    import numpy as np
+
+    pre = np.asarray([int(x) for x in prefix], dtype=np.int64)
+    n = len(pre) - 1
+    a = np.asarray(slots, dtype=np.int64).reshape(-1)
+    if a.size == 0:
+        return tuple([0] * n)
+    S = int(pre[-1])
+    r = np.searchsorted(pre, a % S, side="right") - 1
+    if int(r.min()) < 0 or int(r.max()) >= n:
+        bad = int(a[(r < 0) | (r >= n)][0])
+        owner_of(bad, prefix)        # raises the named ValueError
+    return tuple(int(x) for x in np.bincount(r, minlength=n)[:n])
+
+
 def build_retain_kwargs(
     reqs: Iterable,
     req_to_token,
@@ -379,6 +429,7 @@ def build_retain_kwargs(
     by_rid = {}
     entries = []
     l2_rows = []  # (rid, chain host rows truncated to the KV span)
+    shadow_gens: Dict[str, Tuple] = {}  # L15-L2-SHADOW: rid -> recorded gen per token
     # L15-12c-E2a: (rid, mamba anchor host row, -1 when absent) -- the
     # anchor state's L2 identity, snapshot at bind like the KV rows.
     anchor_rows = []
@@ -432,11 +483,14 @@ def build_retain_kwargs(
                     "FULL+MAMBA trees only (27B/NF); SWA or other "
                     "components -> no retain"
                 )
-            _rows = chain_host_rows(_node)[: len(_slots)]
+            _rows, _rec = chain_host_rows_ex(_node)
+            _rows, _rec = _rows[: len(_slots)], _rec[: len(_slots)]
         except ValueError:
-            _rows = ()
+            _rows, _rec = (), ()
         if _rows:
             l2_rows.append((rid, _rows))
+            if any(g is not None for g in _rec):
+                shadow_gens[rid] = _rec
         # L15-12c-E2a: the anchor's host row from the chain node that
         # carries the req's anchor device slot; best-effort (-1 on any
         # missing piece -- the anchor columns then read (-1, -1)).
@@ -448,8 +502,11 @@ def build_retain_kwargs(
             )
         except ValueError:
             anchor_rows.append((rid, -1))
-        _owned = tuple(owner_of(s, prefix) for s in _slots)
+        # L15-FLIPCOST-4 (N4f bind 538-945 ms with nothing held): owner_of
+        # per slot re-validated the prefix every call (~250k calls per
+        # sleep); one vectorised owner count, same rule
         _n = len(prefix) - 1
+        _owned_counts = _owner_counts(_slots, prefix)
         entries.append(
             {
                 "rid": rid,
@@ -457,9 +514,7 @@ def build_retain_kwargs(
                 "last_active": float(
                     getattr(req, "l15_last_active", 0.0) or 0.0
                 ),
-                "rows_by_rank": tuple(
-                    sum(1 for o in _owned if o == r) for r in range(_n)
-                ),
+                "rows_by_rank": _owned_counts,
                 "anchor_depth": span,
                 "kv_depth": span,
             }
@@ -491,32 +546,79 @@ def build_retain_kwargs(
         # The row_slot map (draft role) is not page-addressed: lane 0 at
         # P == 1 (the only lane), unknown (-1) at P > 1.
         _lane_of = {}
+        import numpy as _np
+
         for rid, rows in l2_rows:
+            if _row_slot is None:
+                # L15-FLIPCOST (N4a bind 330-370 ms): vectorised, same rule
+                _r = _np.asarray(rows, dtype=_np.int64)
+                _off = _r - _s
+                _stg = _r < _s
+                _per = _np.where(_stg, -1, _off // _p)
+                _ln = _np.where(_stg, -1, _off % _p)
+                _slot_of[rid] = _per.tolist()
+                _lane_of[rid] = _ln.tolist()
+                continue
             per = []
             lanes = []
             for r in rows:
                 if r < _s:
                     per.append(-1)
                     lanes.append(-1)
-                elif _row_slot is not None:
+                else:
                     per.append(int(_row_slot.get(r, -1)))
                     lanes.append(0 if _p == 1 else -1)
-                else:
-                    off = r - _s
-                    per.append(off // _p)
-                    lanes.append(off % _p)
             _slot_of[rid] = per
             _lane_of[rid] = lanes
-        uniq = sorted({s for per in _slot_of.values() for s in per if s >= 0})
+        _all = (_np.concatenate([_np.asarray(v, dtype=_np.int64) for v in _slot_of.values()])
+                if _slot_of else _np.zeros(0, dtype=_np.int64))
+        uniq = _np.unique(_all[_all >= 0]).tolist()
         gen_of = {}
         if uniq:
             for s, g in zip(uniq, _slot_gens_or_minus_one(pool, uniq, log, "kv")):
                 gen_of[int(s)] = int(g)
+        import os as _os
+
+        _require_complete = str(_os.environ.get(
+            "SGLANG_WEG2_L15_L2_REQUIRE_COMPLETE", "1")).strip() != "0"
         for rid, per in _slot_of.items():
-            l2_by_rid[rid] = (
-                tuple(per),
-                tuple(int(gen_of.get(s, -1)) for s in per),
-            )
+            _g = gen_of.get
+            gens = [_g(s, -1) for s in per]
+            rec = shadow_gens.get(rid)
+            if rec is not None:
+                # L15-L2-SHADOW: a shadow row counts only while its slot still
+                # carries the generation recorded at the #248 release (the
+                # page P wrote and D loaded); a re-claimed slot is unbacked
+                per = list(per)
+                live = shadow = valid = 0
+                for i, r in enumerate(rec):
+                    if r is None:
+                        live += 1
+                        continue
+                    shadow += 1
+                    if per[i] >= 0 and int(gens[i]) >= 0 and int(gens[i]) == int(r):
+                        valid += 1
+                    else:
+                        per[i], gens[i] = -1, -1
+                log("L15-L2-SHADOW-ADOPT rid=%s tokens=%d live=%d shadow=%d valid=%d stale=%d"
+                    % (rid, len(per), live, shadow, valid, shadow - valid))
+            if _require_complete:
+                # L15-L2-REQUIRE-COMPLETE: a slot the bind's census does not
+                # see COMPLETE (gen -1: the write-through of a just decoded
+                # tail page still in flight, or a partial page) is no L2
+                # source -- the wake would load an unfinished page into the
+                # sample / the refill. Unbacked instead (the cap-0 rank's POST
+                # vote then refuses a hold it could not refill).
+                per = list(per)
+                _inc = 0
+                for i, (sl, g) in enumerate(zip(per, gens)):
+                    if int(sl) >= 0 and int(g) < 0:
+                        per[i], gens[i] = -1, -1
+                        _inc += 1
+                if _inc:
+                    log("L15-L2-INCOMPLETE rid=%s rows=%d of %d (slot not COMPLETE at the bind: "
+                        "no L2 source)" % (rid, _inc, len(per)))
+            l2_by_rid[rid] = (tuple(per), tuple(gens))
             l2_lanes_by_rid[rid] = tuple(_lane_of[rid])
 
     # L15-12c-E2a: anchor host row -> (mamba arena slot, generation). One
@@ -625,12 +727,16 @@ def _remap_slots(value, slot_map: Dict[int, int]):
     """
     if value is None or not torch.is_tensor(value) or value.numel() == 0:
         return value
-    out = torch.empty_like(value.flatten())
-    flat = value.flatten()
-    for i in range(flat.numel()):
-        old = int(flat[i])
-        out[i] = slot_map.get(old, old)
-    return out.reshape(value.shape)
+    # L15-FLIPCOST (N3y: D->P flip 7-12 s instead of 2.4 s): the old loop
+    # read and wrote ONE element per step -- on a CUDA value that is a
+    # device sync plus a kernel per token (~250k tokens per sleep, ~4 s on
+    # TP1 between L15-L2-ALIGN and L15-HOSTLOCK). One D2H, the dict map on
+    # host, one H2D.
+    vals = value.flatten().tolist()
+    get = slot_map.get
+    mapped = [get(v, v) for v in vals]
+    return torch.tensor(mapped, dtype=value.dtype,
+                        device=value.device).reshape(value.shape)
 
 
 def rewrite_tree_chain(

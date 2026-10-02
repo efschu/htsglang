@@ -186,6 +186,18 @@ def _start_ref_census(arena: "ShmArena") -> None:
                     )
                 except Exception as exc:  # noqa: BLE001 - an instrument never raises
                     logger.info("ARENA-REF-CENSUS n=%d failed: %r", n, exc)
+                try:
+                    oc = arena.oldest_claim()
+                    logger.info(
+                        "ARENA-REF-CENSUS-CLAIM n=%d path=%s claimed=%d other_state=%d oldest=%s "
+                        "(L3FILL-JOINED 30.09.: the oldest open claim -- slot/age since its "
+                        "last claim or merge/pid/role/generation/open writers; a claim no "
+                        "writer finishes blocks every L3 fill of its stem)",
+                        n, arena.path, oc["claimed"], oc["other_state"],
+                        claim_owner_text((oc["slot"], oc["gen"], oc["age_ms"], oc["pid"],
+                                          oc["role"], oc["open"], 1)) if oc["slot"] >= 0 else "-")
+                except Exception as exc:  # noqa: BLE001 - an instrument never raises
+                    logger.info("ARENA-REF-CENSUS-CLAIM n=%d failed: %r", n, exc)
                 for line in _holder_lines(arena):
                     logger.info("ARENA-REF-HOLDERS n=%d path=%s %s", n, arena.path, line)
 
@@ -219,14 +231,25 @@ def _note_free(reason: str, slots) -> None:
                     reason, n, (list(slots)[:4] if n else []), k, cnt[1], caller)
 
 
-#: ZR-1 (port of NF cfecb699df): the writer tag of this process in the slot
-#: census (arena.c arena_set_writer_tag): P rank r -> r, D rank r -> 8 + r,
-#: any other -> 16 + r, 31 = not known yet (stamped until the rank is)
+#: L3FILL-JOINED (30.09.): who claims -- stamped on every fresh claim (arena.c
+#: owner_role) so a JOIN can name the writer it waits on
+CLAIM_ROLES = {0: "other", 1: "l3fill", 2: "host-write"}
+ROLE_L3FILL = 1
+ROLE_HOST_WRITE = 2
+
+
+def claim_owner_text(info) -> str:
+    """``slot/age_ms/pid/role/gen/open`` of one ``claim_info`` row."""
+    slot, gen, age, pid, role, opened, _state = info
+    return "%d/%dms/pid%d/%s/g%d/open%d" % (int(slot), int(age), int(pid),
+                                            CLAIM_ROLES.get(int(role), str(role)), int(gen), int(opened))
+
+
+#: ZR-1: the writer tag of this process in the slot census (arena.c
+#: arena_set_writer_tag): P rank r -> r, D rank r -> 8 + r, any other -> 16 + r,
+#: 31 = not known yet (stamped until the rank is)
 WRITER_TAG_UNKNOWN = 31
 _writer_tag: Optional[int] = None
-#: this line keeps no claim roles (NF's L3FILL-JOINED series does); the census
-#: answers role 0
-CLAIM_ROLES = {0: "other"}
 
 
 def _rank_writer_tag() -> Optional[int]:
@@ -261,6 +284,15 @@ def ensure_writer_tag(lib, tag: Optional[int] = None) -> None:
     lib.arena_set_writer_tag(t)
 
 
+def writer_tags_text(mask: int) -> str:
+    """``P0+D1+D2`` for a census bit mask (tag per bit), ``-`` for none."""
+    names = []
+    for t in range(32):
+        if mask & (1 << t):
+            names.append(writer_tag_text(t))
+    return "+".join(names) if names else "-"
+
+
 def writer_tag_text(tag: int) -> str:
     tag = int(tag)
     if tag == WRITER_TAG_UNKNOWN:
@@ -270,12 +302,6 @@ def writer_tag_text(tag: int) -> str:
     if tag < 16:
         return "D%d" % (tag - 8)
     return "R%d" % (tag - 16)
-
-
-def writer_tags_text(mask: int) -> str:
-    """``P0+D1+D2`` for a census bit mask (tag per bit), ``-`` for none."""
-    names = [writer_tag_text(t) for t in range(32) if mask & (1 << t)]
-    return "+".join(names) if names else "-"
 
 
 def claim_open_text(stem: str, row: dict) -> str:
@@ -396,6 +422,18 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_pin_complete.argtypes = [p_u8, i64, p_i64, p_u64, p_u64, p_i8]
             lib.arena_ref_slots_mask.restype = i64
             lib.arena_ref_slots_mask.argtypes = [p_u8, i64, p_i64, p_i8]
+            lib.arena_set_claim_role.restype = None
+            lib.arena_set_claim_role.argtypes = [ctypes.c_uint32]
+            lib.arena_claim_info.restype = i64
+            lib.arena_claim_info.argtypes = [p_u8, i64, p_i64, p_i64, p_i64, p_i64, p_i64, p_i64, p_i8]
+            lib.arena_oldest_claim.restype = i64
+            lib.arena_oldest_claim.argtypes = [p_u8, p_i64]
+            lib.arena_quarantine_stale.restype = i64
+            lib.arena_quarantine_stale.argtypes = [p_u8, i64, p_i64, p_i64, i64, p_i8]
+            lib.arena_quarantine_sweep.restype = i64
+            lib.arena_quarantine_sweep.argtypes = [p_u8, i64]
+            lib.arena_free_if_gen.restype = i64
+            lib.arena_free_if_gen.argtypes = [p_u8, i64, p_i64, p_i64, p_i8]
             # ARENA-COPY-GEN (N2): copies bound to the slot generation
             lib.arena_reap_stale_aged.restype = i64
             lib.arena_reap_stale_aged.argtypes = [p_u8, i64]
@@ -721,13 +759,23 @@ class ShmArena:
         self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
         return list(st)
 
-    def claim_slots(self, stems: Sequence[str], totals: Sequence[int]) -> list[tuple[int, int, int]]:
+    def claim_slots(self, stems: Sequence[str], totals: Sequence[int],
+                    role: int = 0) -> list[tuple[int, int, int]]:
         """#1427 direct writes: (slot, status, generation) per stem. status
         0 = fresh claim, 1 = join an earlier writer's claim, 2 = already
-        COMPLETE, 3 = too large, 4 = no free slot (slot -1)."""
+        COMPLETE, 3 = too large, 4 = no free slot (slot -1). ``role`` is
+        stamped on the fresh claims (L3FILL-JOINED, ``CLAIM_ROLES``)."""
         n = len(stems)
         if n == 0:
             return []
+        ensure_writer_tag(self._lib)
+        self._lib.arena_set_claim_role(int(role))
+        try:
+            return self._claim_slots_impl(stems, totals, n)
+        finally:
+            self._lib.arena_set_claim_role(0)
+
+    def _claim_slots_impl(self, stems, totals, n):
         c_tot = (ctypes.c_int64 * n)(*[int(t) for t in totals])
         c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
         slots = (ctypes.c_int64 * n)()
@@ -742,13 +790,22 @@ class ShmArena:
             self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, slots, gens, st)
         return [(int(slots[i]), int(st[i]), int(gens[i])) for i in range(n)]
 
-    def claim_slots_np(self, stems: Sequence[str], totals: Sequence[int]):
+    def claim_slots_np(self, stems: Sequence[str], totals: Sequence[int], role: int = 0):
         """xsn359: claim_slots as numpy arrays (slots int64, status int8,
         generation int64) -- no 3 x n ctypes reads into Python tuples."""
         import numpy as np
         n = len(stems)
         if n == 0:
             return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int8), np.zeros(0, dtype=np.int64))
+        ensure_writer_tag(self._lib)
+        self._lib.arena_set_claim_role(int(role))
+        try:
+            return self._claim_slots_np_impl(stems, totals, n)
+        finally:
+            self._lib.arena_set_claim_role(0)
+
+    def _claim_slots_np_impl(self, stems, totals, n):
+        import numpy as np
         c_tot = (ctypes.c_int64 * n)(*[int(t) for t in totals])
         c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
         slots = np.zeros(n, dtype=np.int64); gens = np.zeros(n, dtype=np.int64); st = np.zeros(n, dtype=np.int8)
@@ -761,6 +818,85 @@ class ShmArena:
             lo, hi = self._keys(stems)
             self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, p_slots, p_gens, p_st)
         return slots, st, gens
+
+    def claim_info(self, slots: Sequence[int]) -> list:
+        """L3FILL-JOINED: per slot (slot, generation, age_ms since the last
+        claim / merge, pid and role of the fresh claimant, open writers, state)."""
+        n = len(slots)
+        if n == 0:
+            return []
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        gen = (ctypes.c_int64 * n)(); age = (ctypes.c_int64 * n)(); pid = (ctypes.c_int64 * n)()
+        role = (ctypes.c_int64 * n)(); opn = (ctypes.c_int64 * n)(); st = (ctypes.c_int8 * n)()
+        self._lib.arena_claim_info(self._base, n, c_sl, gen, age, pid, role, opn, st)
+        return [(int(slots[i]), int(gen[i]), int(age[i]), int(pid[i]), int(role[i]), int(opn[i]),
+                 int(st[i])) for i in range(n)]
+
+    def quarantine_stale(self, slots: Sequence[int], gens: Sequence[int], min_age_ms: int) -> list[int]:
+        """L3FILL-JOINED (3): take stale live claims away from their keys
+        (generation-checked). Per slot 1 quarantined, 0 young, 2 generation
+        moved / not claimed, 3 referenced."""
+        n = len(slots)
+        if n == 0:
+            return []
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_quarantine_stale(self._base, n, c_sl, c_g, int(min_age_ms), st)
+        return list(st)
+
+    def quarantine_sweep(self, backstop_ms: int) -> int:
+        """L3FILL-JOINED (3): free quarantined slots nobody holds (or held
+        past the backstop). Returns the number freed."""
+        return int(self._lib.arena_quarantine_sweep(self._base, int(backstop_ms)))
+
+    def free_if_gen(self, slots: Sequence[int], gens: Sequence[int], reason: str = "unnamed") -> list[int]:
+        """Free this writer's own claims only while they still carry its
+        generation (a late free never hits the slot's next owner)."""
+        n = len(slots)
+        if n == 0:
+            return []
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_g = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_free_if_gen(self._base, n, c_sl, c_g, st)
+        freed = [int(slots[i]) for i in range(n) if st[i] == 1]
+        if freed:
+            _note_free(reason, freed)
+        return list(st)
+
+    #: ZR-1: values per slot of arena_claim_census (arena.c CENSUS_W)
+    _CENSUS_KEYS = ("gen", "state", "pid", "role", "owner_tag", "joined", "merged", "open",
+                    "claims", "ivals", "covered", "total", "same_key_slots", "age_ms")
+
+    def claim_census(self, slots: Sequence[int]) -> list:
+        """ZR-1: the writer census of each slot as a dict (``_CENSUS_KEYS`` +
+        ``slot``); a slot out of range answers gen -1."""
+        n = len(slots)
+        if n == 0:
+            return []
+        w = len(self._CENSUS_KEYS)
+        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        out = (ctypes.c_int64 * (n * w))()
+        self._lib.arena_claim_census(self._base, n, c_sl, out)
+        rows = []
+        for i in range(n):
+            row = {k: int(out[i * w + c]) for c, k in enumerate(self._CENSUS_KEYS)}
+            row["slot"] = int(slots[i])
+            rows.append(row)
+        return rows
+
+    def index_lock_steals(self) -> int:
+        """ZR-1: how often the index lock was taken over from a dead holder."""
+        return int(self._lib.arena_index_lock_steals(self._base))
+
+    def oldest_claim(self) -> dict:
+        """L3FILL-JOINED: the oldest open CLAIMED slot and the claimed count."""
+        out = (ctypes.c_int64 * 8)()
+        self._lib.arena_oldest_claim(self._base, out)
+        return {"slot": int(out[0]), "age_ms": int(out[1]), "pid": int(out[2]), "role": int(out[3]),
+                "gen": int(out[4]), "open": int(out[5]), "claimed": int(out[6]),
+                "other_state": int(out[7])}
 
     def complete_slots_np(self, slots, gens, extents):
         """xsn359: complete_slots on numpy int64 arrays; returns status int8."""
@@ -1001,31 +1137,6 @@ class ShmArena:
             _note_free(reason, freed)
         return out
 
-    #: ZR-1: values per slot of arena_claim_census (arena.c CENSUS_W)
-    _CENSUS_KEYS = ("gen", "state", "pid", "role", "owner_tag", "joined", "merged", "open",
-                    "claims", "ivals", "covered", "total", "same_key_slots", "age_ms")
-
-    def claim_census(self, slots: Sequence[int]) -> list:
-        """ZR-1: the writer census of each slot as a dict (``_CENSUS_KEYS`` +
-        ``slot``); a slot out of range answers gen -1."""
-        n = len(slots)
-        if n == 0:
-            return []
-        w = len(self._CENSUS_KEYS)
-        c_sl = (ctypes.c_int64 * n)(*[int(s) for s in slots])
-        out = (ctypes.c_int64 * (n * w))()
-        self._lib.arena_claim_census(self._base, n, c_sl, out)
-        rows = []
-        for i in range(n):
-            row = {k: int(out[i * w + c]) for c, k in enumerate(self._CENSUS_KEYS)}
-            row["slot"] = int(slots[i])
-            rows.append(row)
-        return rows
-
-    def index_lock_steals(self) -> int:
-        """ZR-1: how often the index lock was taken over from a dead holder."""
-        return int(self._lib.arena_index_lock_steals(self._base))
-
     def stats(self) -> dict:
         out = (ctypes.c_int64 * 4)()
         self._lib.arena_stats(self._base, out)
@@ -1037,3 +1148,71 @@ class ShmArena:
             self._mm.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+#: arena.c A_MAGIC ("ARNA2692"): the header word of an initialised arena
+ARENA_MAGIC = 0x41524E4132363932
+
+
+class ArenaView:
+    """L2-ARENA PRICE (02.10.): a LOOKUP-ONLY join of an EXISTING arena file
+    (the front's presence probe). Never creates, sizes or initialises the
+    file, never takes a reference, starts no census: the geometry is read from
+    the creator's header, and an arena whose magic is not set yet is refused
+    (the caller asks again later). Only ``find_states`` -- arena.c's
+    ``arena_find_stems``, the same C lookup ``batch_exists_v2`` asks."""
+
+    def __init__(self, path: str):
+        import struct
+
+        lib = _load_lib()
+        if lib is None:
+            raise RuntimeError("arena helper unavailable")
+        self._lib = lib
+        self.path = path
+        fd = os.open(path, os.O_RDWR)
+        try:
+            size = os.fstat(fd).st_size
+            head = os.pread(fd, 24, 0)
+            if len(head) < 24:
+                raise RuntimeError(f"{path}: no arena header yet")
+            magic, slots, slot_bytes = struct.unpack("<QQQ", head)
+            if magic != ARENA_MAGIC:
+                raise RuntimeError(f"{path}: arena not initialised yet")
+            out = (ctypes.c_int64 * 6)()
+            total = int(lib.arena_layout(int(slots), int(slot_bytes), out))
+            if total <= 0 or total > size:
+                raise RuntimeError(f"{path}: header geometry {slots} x {slot_bytes} "
+                                   f"does not fit the file ({size} bytes)")
+            self.slots, self.slot_bytes, self.file_bytes = int(slots), int(slot_bytes), total
+            self._mm = mmap.mmap(fd, total, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        finally:
+            os.close(fd)
+        self._base = ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(self._mm)))
+
+    def find_states(self, stems: Sequence[str]) -> list[int]:
+        """0 absent/free, 1 claimed, 2 COMPLETE -- per stem, hashed in C."""
+        n = len(stems)
+        if n == 0:
+            return []
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = (ctypes.c_int64 * n)()
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
+        return list(st)
+
+    def find_states_ptrs(self, ptrs, n: int):
+        """PROBE-FAST (02.10.): ``find_states`` over a ready ``char **`` (a
+        ``ctypes.POINTER(c_char_p)`` into NUL-terminated stems the caller keeps
+        alive) -- the same C lookup, an int8 numpy array back; no per-stem
+        encode, no ctypes array built per call, no list."""
+        import numpy as np
+
+        st = np.zeros((max(0, int(n)),), dtype=np.int8)
+        if n <= 0:
+            return st
+        slots = np.empty((int(n),), dtype=np.int64)
+        self._lib.arena_find_stems(self._base, int(n), ptrs,
+                                   slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                   st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return st

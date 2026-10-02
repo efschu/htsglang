@@ -519,6 +519,39 @@ def _is_on_with_default(value: Optional[str], default: bool = True) -> bool:
     return value not in _OFF
 
 
+_MPS_NO_GRID = 1 << 62
+_MPS_GRID_REPORTED = [False]
+
+
+def grid_threshold_default(env=None) -> int:
+    """Payload bytes from which a spin collective uses the cooperative grid.
+
+    Default 4 MiB (MESSUNG_ALLES_IM_SELBEN_LAUF.md: 'grid' wins from 4 MiB up).
+    An explicit ``SGLANG_BARLINK_BAR1_GRID_THRESHOLD`` always wins.
+
+    **MPS client (``CUDA_MPS_PIPE_DIRECTORY`` set): no cooperative grid.** The
+    grid is sized perSM x all SMs, so it can only start when every block fits
+    at once. Under MPS two groups share one server context without
+    time-slice preemption; a resident spin block of the other group (waiting
+    for its partner on another card) keeps the grid from starting, and the
+    two groups' spins form a wait cycle across the cards that only the
+    capCycles deadline breaks. Measured: repro scjhru S1 (D 8 MiB all-reduce
+    under MPS: rounds 20.6/61.7/62.0 s = multiples of the 60e9-cycle cap, P
+    wedged) and metal ndktv4 05:09:24 (D extend >= 4 MiB while P prefilled:
+    both groups froze in the same second). One-block spin kernels make no
+    co-residency demand, so the cycle cannot form.
+    """
+    import os as _os
+
+    env = _os.environ if env is None else env
+    raw = env.get("SGLANG_BARLINK_BAR1_GRID_THRESHOLD")
+    if raw is not None and str(raw).strip() != "":
+        return int(raw)
+    if str(env.get("CUDA_MPS_PIPE_DIRECTORY", "") or "").strip():
+        return _MPS_NO_GRID
+    return 4 << 20
+
+
 def graph_grid_default(env=None) -> bool:
     """May the cooperative launch fire WHILE a graph is being captured?
 
@@ -2186,9 +2219,19 @@ class BarlinkBar1Transport:
         # Payload size from which the cooperative multi-block launch kicks
         # in. 4 MiB, because in MESSUNG_ALLES_IM_SELBEN_LAUF.md the 'grid'
         # variant wins from 4 MiB up and '1blk' wins below it.
-        self.grid_from = int(
-            os.environ.get("SGLANG_BARLINK_BAR1_GRID_THRESHOLD", str(4 << 20))
-        )
+        # Under MPS (CUDA_MPS_PIPE_DIRECTORY set) the cooperative variant is
+        # off unless the threshold is set explicitly -- see
+        # grid_threshold_default (repro scjhru S1, metal ndktv4).
+        self.grid_from = grid_threshold_default()
+        if self.grid_from >= _MPS_NO_GRID and not _MPS_GRID_REPORTED[0]:
+            _MPS_GRID_REPORTED[0] = True
+            logger.info(
+                "barlink-BAR1: MPS client (CUDA_MPS_PIPE_DIRECTORY set) -- the "
+                "cooperative full-card grid variant is OFF, every spin kernel is "
+                "one block (a cooperative grid cannot start while another MPS "
+                "client's spin block is resident: cross-card wait cycle, repro "
+                "scjhru S1). SGLANG_BARLINK_BAR1_GRID_THRESHOLD overrides."
+            )
         # May the cooperative variant be launched WHILE a CUDA graph is being
         # captured? The default comes from SGLANG_BARLINK_GRAPH_ENABLE -- the
         # same release, the same gate (`bar1_graph_check.py`, case `grid`).

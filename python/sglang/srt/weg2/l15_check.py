@@ -67,6 +67,18 @@ def sample_check(
             logger.warning("%s", check_diag(device, source, sampled))
         except Exception as exc:  # noqa: BLE001 -- diagnostics only
             logger.warning("L15-CHECK-DIAG failed: %r", exc)
+        # L15-CHECK-WHO (N6e): per bad row token/slot/layers and what moved
+        # since the sleep's snapshot; the wake caller set the context
+        # (manifest/rank/prefix) -- none set (tests, other callers) = no line
+        try:
+            from sglang.srt.weg2 import l15_check_snap as _cs
+
+            bad_rows = [(int(t[1]), d, s_) for t, d, s_ in zip(sampled, device, source)
+                        if not torch.equal(d, s_)]
+            for line in _cs.explain_current(bad_rows):
+                logger.warning("%s", line)
+        except Exception as exc:  # noqa: BLE001 -- diagnostics only
+            logger.warning("L15-CHECK-WHO failed: %r", exc)
     return (ok, bad, missing)
 
 

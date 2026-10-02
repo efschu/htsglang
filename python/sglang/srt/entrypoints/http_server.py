@@ -1438,6 +1438,9 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
     resumable = getattr(ret, "weg2_resumable_depth", None)
     if resumable:
         body["weg2_resumable_depth"] = dict(resumable)
+    seq_marks = getattr(ret, "weg2_seq_hash", None)  # SEQ-HASH (02.10.)
+    if seq_marks:
+        body["weg2_seq_hash"] = dict(seq_marks)
     return ORJSONResponse(
         body,
         status_code=200 if ret.success else HTTPStatus.CONFLICT,
