@@ -4671,14 +4671,17 @@ class SchedulerWeightUpdaterManager:
         sch = self.scheduler
         if sch is None:
             return frozenset()
-        return hold_owned_prefetch(
+        _op = getattr(getattr(sch, "tree_cache", None), "ongoing_prefetch", None) or ()
+        owned = hold_owned_prefetch(
             dormant=bool(getattr(sch, "weg2_dormant", False)),
             hold=getattr(sch, "weg2_dormant_hold", None) or (),
-            ongoing_prefetch=getattr(
-                getattr(sch, "tree_cache", None), "ongoing_prefetch", None
-            )
-            or (),
+            ongoing_prefetch=_op,
         )
+        # PDFLIP-A: the reads of D's park list are not a sleep term either
+        from sglang.srt.managers.weg2_sleep_drain import parked_owned_prefetch
+
+        return owned | parked_owned_prefetch(
+            parked=getattr(sch, "weg2_d_parked", None) or (), ongoing_prefetch=_op)
 
     def _weg2_sleep_idle(self) -> bool:
         """The release leg's idle assert. H91e: with the dormant hold's own
