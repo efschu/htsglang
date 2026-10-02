@@ -474,7 +474,15 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
     tmo = verdict_timeout_s(env)
 
     def verdict(ok: bool) -> str:
-        return stage_verdict(directory, rid, stage, n_stages, ok, tmo)
+        import time as _t
+
+        t0 = _t.perf_counter()
+        v = stage_verdict(directory, rid, stage, n_stages, ok, tmo)
+        # the wait blocks this stage's admission: measured per hot request
+        log("HOT-HANDOVER-VERDICT rid=%s stage=%d/%d mine=%s verdict=%s wait_ms=%.0f"
+            % (rid, stage, n_stages, "ok" if ok else "fail", v,
+               (_t.perf_counter() - t0) * 1000.0))
+        return v
 
     try:
         d0 = _first_share(directory, l15_share_publish.fetch_share)
