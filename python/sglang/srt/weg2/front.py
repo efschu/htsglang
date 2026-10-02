@@ -3194,7 +3194,7 @@ class Group:
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
-                        extra=None, poll_s: float = 0.0) -> int:
+                        extra=None, poll_s: float = 0.0, cap_exempt=None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -3220,6 +3220,14 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     ``stats`` (optional) is filled with ``dispatched``, ``peak_n``,
     ``peak_tokens`` and ``pool_holds`` for the drain's P-PHASE line.
 
+    FLIPCYCLE H5 (02.10., ``cap_exempt``): once the phase cap is reached, a
+    queued item for which ``cap_exempt(item)`` is True (a SHORT, est_uncached
+    <= X) is still dispatched -- taken out of the queue wherever it stands, in
+    queue order, under the same overlap plan. Without it the cap stranded the
+    SHORT in the queue and D prefilled it after the P->D flip with every seat
+    stalled (y6z ep 2, weg2-1-7: 25 tokens, 2.03 s D pass). ``stats`` then also
+    counts ``short_rides``. The LONG items keep waiting for the next P phase.
+
     RO (weg2.p_read_overlap): ``extra(items)`` gets the in-flight items and
     returns how many dispatches may go beyond ``limit`` (one per leg P only
     holds for its store read); with it the pool also wakes every ``poll_s``
@@ -3238,8 +3246,20 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     items: Dict[Any, Any] = {}
     rounds = 0
     if stats is not None:
-        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched"):
+        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched",
+                  "short_rides"):
             stats.setdefault(k, 0)
+
+    def _exempt_index() -> Optional[int]:
+        if cap_exempt is None:
+            return None
+        for i, q in enumerate(queue):
+            try:
+                if cap_exempt(q):
+                    return i
+            except Exception:  # noqa: BLE001 - a predicate error never stops the drain
+                return None
+        return None
 
     def _cap() -> int:
         if extra is None or len(inflight) < limit:
@@ -3252,15 +3272,26 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     while True:
         dispatched = False
         while queue and len(inflight) < _cap() and may_dispatch():
+            idx = 0
+            ride = False
             if phase_policy.phase_cap_reached(dispatched_total, max_dispatch):
-                break
-            c = int(cost(queue[0])) if (cost is not None and budget > 0) else 0
+                idx = _exempt_index()
+                if idx is None:
+                    break
+                ride = True
+            c = int(cost(queue[idx])) if (cost is not None and budget > 0) else 0
             if not phase_policy.p_overlap_admits(inflight_tokens, len(inflight), c, budget):
                 if stats is not None:
                     stats["pool_holds"] += 1
                 break
             _beyond = len(inflight) >= limit
-            item = queue.popleft()
+            if idx == 0:
+                item = queue.popleft()
+            else:
+                item = queue[idx]
+                del queue[idx]
+            if ride and stats is not None:
+                stats["short_rides"] += 1
             t = asyncio.ensure_future(one(item))
             inflight[t] = c
             items[t] = item
@@ -8943,6 +8974,24 @@ class Front:
                            sum(1 for r in running if r in resumed), self.epoch)
         return True
 
+    def _p_phase_short_rides(self, p: "Pending") -> bool:
+        """FLIPCYCLE H5 (02.10.): a queued request the P phase takes past its
+        cap -- the same SHORT a D phase would prefill itself (QUEUED-SHORT's
+        filter: route verdict SHORT, uncached <= X, no vision stage, never
+        re-queued, not P-only). Its prefill is P's while P is awake (E2: no D
+        prefill after the flip); it still needs a D seat for its decode, as the
+        QUEUED-SHORT would have."""
+        def _g(k, d=None):
+            return getattr(p, k, d)
+        if not _g("d_eligible", False) or _g("intake_stalled", False) or _g("leg1_done", False):
+            return False
+        if _g("reroutes", 0) or _g("x_requeues", 0) or _g("p_only", False) or _g("x_deferred", False):
+            return False
+        if _g("client_gone", False):
+            return False
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        return 0 <= int(_g("est_uncached", 0) or 0) <= x
+
     def _asr_queued_short_to_d(self, live_q: List["Pending"], now: float) -> List["Pending"]:
         """ARRIVAL-SEAT: every queued SHORT whose own route verdict was SHORT
         (``d_eligible``: uncached <= X, no vision stage, never re-queued) goes
@@ -13469,7 +13518,19 @@ class Front:
                     budget=self.p_pool_tokens, stats=_phase_stats,
                     extra=(None if _ro_state is None else
                            (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
-                    poll_s=_ro.POLL_S)
+                    poll_s=_ro.POLL_S,
+                    # FLIPCYCLE H5: the phase cap never strands a SHORT
+                    cap_exempt=(self._p_phase_short_rides
+                                if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() else None))
+                if _phase_stats.get("short_rides"):
+                    self.counters["p_phase_short_rides"] += _phase_stats["short_rides"]
+                    logger.info(
+                        "WEG2-FLIPCYCLE stage=d_prefill_after_flip epoch=%d ms=0 floor_ms=0 "
+                        "avoided=%d dispatched=%d cap=%d (H5: SHORTs past the P phase cap rode "
+                        "P's batch instead of a D prefill after the P->D flip -- each such D "
+                        "pass cost 1.2-2.2 s with every seat stalled, y6z d_extend)",
+                        self.epoch, _phase_stats["short_rides"], _phase_stats["dispatched"],
+                        self.p_phase_max_requests)
                 if _phase_stats.get("overlap_dispatched"):
                     self.counters["p_read_overlap"] += _phase_stats["overlap_dispatched"]
                     logger.info("WEG2 P-READ-OVERLAP epoch=%d overlap_dispatched=%d dispatched=%d "
