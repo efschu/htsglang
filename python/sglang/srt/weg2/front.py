@@ -9951,16 +9951,17 @@ class Front:
                 self._ipc_publish("flip_user_time", _dp)
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
+            # STORE-PRESENCE: ids for a fallback-priced rid, and P's END-ANCHOR for the flush
+            await self._x_exact_backfill(p.rid, p.path, p.payload, p.text)
+            self._p_leg1_store_note(p.rid, p.text, pt)
             # USAGE-TRUE: every P leg of the rid (re-route, X-REQUEUE, park
             # hand-back, RESUME-VIA-P alike) adds what P really computed; leg 2
-            # corrects the client's cached count with it.
+            # corrects the client's cached count with it. (Leg 2 starts only
+            # after leg 1 returned, so noting it last changes nothing.)
             self._p_leg_note(p.rid, pt, ct, _ut.tier_split_of(js))
             # USAGE-DETAILS: a rid that went through P is served LONG (a
             # re-route of a SHORT verdict included), from this epoch on
             self._usage_route_note(p.rid, "long", self.epoch, keep_same=True)
-            # STORE-PRESENCE: ids for a fallback-priced rid, and P's END-ANCHOR for the flush
-            await self._x_exact_backfill(p.rid, p.path, p.payload, p.text)
-            self._p_leg1_store_note(p.rid, p.text, pt)
         finally:
             g.outstanding.pop(p.rid, None)
 
