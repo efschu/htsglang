@@ -925,6 +925,9 @@ class Envs:
     # time-multiplexed down to 4.3 GB/s (y6z P-PP0 p0 lane_ms 1198 for 5.22 GB).
     # Off = the engine's own time-multiplexing.
     SGLANG_WEG2_ENABLE_LANE_FAST_FIRST = EnvBool(True)
+    # FLIPCYCLE H1 (02.10., weg2/front.drain): a flip whose ledger is already
+    # empty (D->P after the park) skips the drain's blocking progress read.
+    SGLANG_WEG2_ENABLE_DRAIN_EMPTY_SKIP = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.

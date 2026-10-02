@@ -11420,15 +11420,25 @@ class Front:
         """
         t0 = time.time()
         self._drain_progress = None
+        # H91 part C: requests D PARKED on the wait bound are not waited for
+        # (they continue in D's next phase); `_flip_ledger` is the ledger
+        # itself whenever nothing is parked.
+        _ledger = getattr(self, "_flip_ledger", None)
+        if (envs.SGLANG_WEG2_ENABLE_DRAIN_EMPTY_SKIP.get()
+                and not (_ledger(g) if _ledger is not None else g.outstanding)):
+            # FLIPCYCLE H1 (02.10.): nothing to wait for -> no window -> the
+            # progress witness (#1317c) is never read. Its blocking
+            # /get_server_info cost D->P p50 81 / p90 400 ms on y6z right after
+            # the park, while D's scheduler ran the post-park publish.
+            self.counters["drain_empty_skip"] += 1
+            logger.info("WEG2-FLIPCYCLE stage=drain group=%s epoch=%d ms=0 floor_ms=0 "
+                        "skipped=ledger-empty (H1: no progress read)", g.name, getattr(self, "epoch", -1))
+            return True
         try:
             before = await self._weg2_decode_progress(g)
         except Weg2ProgressUnreachable as e:
             self._stop_progress_unreachable(e)
             return False
-        # H91 part C: requests D PARKED on the wait bound are not waited for
-        # (they continue in D's next phase); `_flip_ledger` is the ledger
-        # itself whenever nothing is parked.
-        _ledger = getattr(self, "_flip_ledger", None)
         while (_ledger(g) if _ledger is not None else g.outstanding):
             if time.time() - t0 > self.drain_deadline_s:
                 try:
