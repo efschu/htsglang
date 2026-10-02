@@ -107,7 +107,8 @@ logger = logging.getLogger(__name__)
 
 
 def _dcp_uneven_merge(
-    o, lse, group, head_counts, return_lse: bool = False, block_tokens: int = 0
+    o, lse, group, head_counts, return_lse: bool = False, block_tokens: int = 0,
+    force_fused: bool = False,
 ):
     """The uneven-DCP LSE merge of the paged-prefix / decode partials.
 
@@ -144,6 +145,9 @@ def _dcp_uneven_merge(
             merge, o, lse, group, head_counts,
             return_lse=return_lse, block_tokens=block_tokens,
         )
+    if force_fused and merge is cp_lse_ag_out_a2a_mha_uneven:
+        # DP-NACHLAUF small-q rule: the LSE all-gather rides in the a2a
+        return merge(o, lse, group, head_counts, return_lse=return_lse, force_fused=True)
     return merge(o, lse, group, head_counts, return_lse=return_lse)
 
 
@@ -3225,7 +3229,7 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         return kv_full[:n], kv_full[n:]
 
-    def _dcp_kvq_fusable(self, layer, k, v, q_local) -> bool:
+    def _dcp_kvq_fusable(self, layer, k, v, q_local, force: bool = False) -> bool:
         """May the KV write gather (A) and the q-head gather (B) of this layer
         run as ONE all-gather (SGLANG_DCP_FUSE_KVQ_GATHER, default off)?
 
@@ -3234,7 +3238,7 @@ class FlashInferAttnBackend(AttentionBackend):
         Off for replicated-KV (no A to fuse), for the weightless-KV head (its
         workers mirror the unfused A,B sequence 1:1) and whenever the three
         tensors cannot share one buffer."""
-        if not dcp_fuse_kvq_gather():
+        if not (dcp_fuse_kvq_gather() or force):
             return False
         if not self.uneven_dcp or self.dcp_kv_replicated_heads or self.weightless_kv:
             return False
@@ -6727,6 +6731,11 @@ class FlashInferAttnBackend(AttentionBackend):
         has_prefix = weightless_has_prefix(
             force_prefix, forward_batch.extend_prefix_lens_cpu
         )
+        # DP-NACHLAUF small-q rule (layers/dcp/comm.py SMALL_Q_FUSE_ENV)
+        from sglang.srt.layers.dcp import comm as _dcp_comm
+
+        _sq = bool(has_prefix) and not self.weightless_kv and _dcp_comm.small_q_fuse_applies(
+            int(q_local.shape[0]), bool(force_prefix), bool(torch.cuda.is_current_stream_capturing()))
 
         comm_stream = self.dcp_comm_stream
         if comm_stream is None:
@@ -6739,7 +6748,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if do_write:
                 if _scatter_late:
                     k_full_seq, v_full_seq = self._dcp_write_gather(layer, k, v)
-                elif has_prefix and self._dcp_kvq_fusable(layer, k, v, q_local):
+                elif has_prefix and self._dcp_kvq_fusable(layer, k, v, q_local, force=_sq):
                     # SGLANG_DCP_FUSE_KVQ_GATHER: B (the q gather of step 3)
                     # moves up into A -- it depends only on q_local, and the
                     # ragged current-chunk attention in between is local.
@@ -6809,6 +6818,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.dcp_q_head_counts,
                 return_lse=True,
                 block_tokens=self._dcp_merge_block_tokens,
+                force_fused=_sq,
             )
             if do_write and _scatter_late:
                 if os.environ.get("SGLANG_DCP_DEBUG") == "1" and layer.layer_id < 8:
@@ -6818,6 +6828,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 self._dcp_write_scatter(
                     layer, forward_batch, cache_loc, k_full_seq, v_full_seq
                 )
+            if _sq:
+                _dcp_comm.note_small_q_fuse(int(q_local.shape[0]), q_full_fused is not None, True)
             _o_fin = self._dcp_extend_final_merge(
                 q, layer, o_cur, lse_cur, o_pre, lse_pre
             )
@@ -6929,6 +6941,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.dcp_q_head_counts,
                 return_lse=True,
                 block_tokens=self._dcp_merge_block_tokens,
+                force_fused=_sq,
             )
         # main lane: the masked scatter-write targets the current chunk's
         # out_cache_loc slots, disjoint from the paged prefix read above and

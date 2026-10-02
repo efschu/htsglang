@@ -466,12 +466,65 @@ def _cp_lse_a2a_fused_body(cp_attn_out, cp_attn_lse, cp_group, counts, return_ls
     return merged
 
 
+#: DP-NACHLAUF 02.10. (N6d ec4d492f58, D's first P>D extend: 5 new tokens on
+#: ~98k cached): the 15 full-attention layers carried ~80-140 ms extra; the GPU
+#: check showed flashinfer's prefix kernel at ~0.1 ms per layer (stock already
+#: splits), so the cost is the DCP chain around it -- per layer A/B gathers,
+#: the LSE all-gather, the a2a merge, scatter, final merge, launched eagerly.
+#: For a SMALL-q extend (rows <= SGLANG_DCP_SMALL_Q_FUSE_ROWS, default 16; not
+#: verify, not inside a graph capture) the two existing bit-identical fusions
+#: are used whatever their global switches say: A+B as one all-gather
+#: (SGLANG_DCP_FUSE_KVQ_GATHER's path) and the LSE all-gather inside the a2a
+#: (SGLANG_DCP_LSE_MERGE_FUSED's path). Rank-uniform: rows, the verify flag and
+#: the capture state are equal on every DCP rank. Unset = on; 0/false/no/off =
+#: the global switches alone decide, as before.
+SMALL_Q_FUSE_ENV = "SGLANG_DCP_SMALL_Q_FUSE"
+SMALL_Q_FUSE_ROWS_ENV = "SGLANG_DCP_SMALL_Q_FUSE_ROWS"
+_SMALL_Q = {"on": None, "rows": None, "n": 0}
+
+
+def small_q_fuse_on() -> bool:
+    if _SMALL_Q["on"] is None:
+        import os
+
+        v = str(os.environ.get(SMALL_Q_FUSE_ENV, "1") or "1").strip().lower()
+        _SMALL_Q["on"] = v not in ("0", "false", "no", "off")
+    return bool(_SMALL_Q["on"])
+
+
+def small_q_fuse_rows() -> int:
+    if _SMALL_Q["rows"] is None:
+        import os
+
+        try:
+            _SMALL_Q["rows"] = max(0, int(os.environ.get(SMALL_Q_FUSE_ROWS_ENV, "16") or 16))
+        except ValueError:
+            _SMALL_Q["rows"] = 16
+    return int(_SMALL_Q["rows"])
+
+
+def small_q_fuse_applies(rows: int, force_prefix: bool, capturing: bool) -> bool:
+    """The rank-uniform small-q rule (see SMALL_Q_FUSE_ENV)."""
+    return bool(small_q_fuse_on() and not force_prefix and not capturing
+                and 0 < int(rows) <= small_q_fuse_rows())
+
+
+def note_small_q_fuse(rows: int, kvq: bool, lse: bool) -> None:
+    _SMALL_Q["n"] += 1
+    n = _SMALL_Q["n"]
+    if n <= 8 or n % 1024 == 0:
+        logger.info("DCP-SMALL-Q-FUSE n=%d rows=%d kvq_gather=%s lse_in_a2a=%s (a small-q extend over a "
+                    "prefix: fewer rendezvous per full-attention layer; %s=0 restores the global switches)",
+                    n, int(rows), kvq, lse, SMALL_Q_FUSE_ENV)
+
+
 def cp_lse_ag_out_a2a_mha_uneven(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     head_counts: list,
     return_lse: bool = False,
+    force_fused: bool = False,
 ):
     """Uneven-DCP MHA combine as a REDUCE-SCATTER: the same LSE math as
     ``cp_lse_ag_out_ar_mha_uneven``, but instead of all-reducing the whole
@@ -496,7 +549,7 @@ def cp_lse_ag_out_a2a_mha_uneven(
     _ng("merge.local_out", cp_attn_out, cp_group)
     _ng("merge.local_lse", cp_attn_lse, cp_group, allow_neg_inf=True)
     if (
-        lse_merge_fused()
+        (lse_merge_fused() or force_fused)
         and lse_merge_reduce_dtype() == "fp32"
         and cp_attn_out.shape[0] <= dcp_fuse_max_rows()
     ):

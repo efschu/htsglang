@@ -355,7 +355,8 @@ class TestBackendGate(CustomTestCase):
         ext = inspect.getsource(fb.FlashInferAttnBackend._forward_extend_dcp)
         seq, overlapped = ext.split("OVERLAPPED SCHEDULING", 1)
         # fused only in the sequential (mode 0) schedule, and only with a prefix
-        self.assertIn("elif has_prefix and self._dcp_kvq_fusable(layer, k, v, q_local):", seq)
+        # DP-NACHLAUF (test_dcp_small_q_fuse_1002): the small-q rule may force it
+        self.assertIn("elif has_prefix and self._dcp_kvq_fusable(layer, k, v, q_local, force=_sq):", seq)
         self.assertNotIn("_dcp_write_gather_with_q", overlapped)
         # the weightless workers keep the unfused A,B sequence
         for name in ("forward_decode_weightless_worker", "forward_extend_weightless_worker"):
