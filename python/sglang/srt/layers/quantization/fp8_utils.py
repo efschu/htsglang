@@ -68,6 +68,7 @@ from sglang.srt.utils import (
     resolve_capability_device_id,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.wheel_sass import wheel_carries_sass
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +237,14 @@ def cutlass_fp8_supported(device_id: int) -> bool:
     if major >= 9:
         return cuda_version >= (12, 0)
     elif major == 8 and minor == 9:
-        return cuda_version >= (12, 4)
+        # SM89-DURCHSPIEL-1002: CUDA 12.4+ only means the CUTLASS Sm89 path
+        # is BUILT; the installed wheel must also CARRY sm_89 SASS. In the
+        # release wheel (86;120a) the Sm89 template compiled for sm_86 is
+        # CUTLASS_NOT_IMPLEMENTED (printf + brkpt) -- a device trap, not an
+        # error. Unknown detection counts as not-carried: the conservative
+        # route is the FP8-Marlin fallback (can_auto_enable_marlin_fp8),
+        # never the trap.
+        return cuda_version >= (12, 4) and wheel_carries_sass((8, 9)) is True
     return False
 
 
@@ -2417,9 +2425,48 @@ def can_auto_enable_marlin_fp8(device_id: int) -> bool:
     Marlin has no ROCm kernel, while the raw capability reader answers in the
     caller's vendor namespace -- gfx803 reports (8, 0), landing inside the
     range on a card Marlin was never built for.
+
+    SM89-DURCHSPIEL-1002 adds the sm_89 WHEEL FALLBACK: an sm_89 card whose
+    installed sgl_kernel carries no sm_89 SASS (the release wheel is
+    86;120a; the CUTLASS Sm89 branch would brkpt) is routed through the
+    NAMED FP8-Marlin fallback instead of the trap. The decision reads the
+    wheel's cubin notes (utils/wheel_sass.py), never a card name; unknown
+    detection counts as not-carried. The fallback is announced once per
+    process by name, with what to rebuild for the native path.
     """
     sm = get_cuda_sm(device_id)
-    return sm is not None and 80 <= sm < 89
+    if sm is None:
+        return False
+    if 80 <= sm < 89:
+        return True
+    if sm == 89 and wheel_carries_sass((8, 9)) is not True:
+        _warn_sm89_marlin_fallback_once()
+        return True
+    return False
+
+
+#: The sm_89 fallback is a per-device gate (cached, cheap), but the log line
+#: must not repeat per card in a mixed group.
+_sm89_marlin_fallback_logged = False
+
+
+def _warn_sm89_marlin_fallback_once() -> None:
+    global _sm89_marlin_fallback_logged
+    if _sm89_marlin_fallback_logged:
+        return
+    _sm89_marlin_fallback_logged = True
+    from sglang.srt.utils.wheel_sass import sgl_kernel_sass_archs
+
+    found = sgl_kernel_sass_archs((8, 9))
+    found_txt = ", ".join(f"sm_{a}" for a in sorted(found)) if found else "none detected"
+    logger.warning(
+        "FP8-SM89-FALLBACK: the installed sgl_kernel wheel carries no sm_89 SASS for this "
+        "sm_89 rank (wheel SASS: %s). The CUTLASS Sm89 fp8 kernel in the sm_86 pass is a "
+        "not-implemented stub (brkpt), so fp8 GEMMs here run through the FP8-Marlin (W8A16) "
+        "fallback -- correct, no native fp8 throughput. For the native path rebuild the wheel "
+        "with SGL_KERNEL_LIMIT_CUDA_ARCHS=86;89;120a.",
+        found_txt,
+    )
 
 
 def apply_fp8_ptpc_linear(
