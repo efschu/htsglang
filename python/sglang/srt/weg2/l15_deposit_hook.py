@@ -230,6 +230,16 @@ def on_chunk(req, *, final: bool, filled: Optional[int] = None) -> None:
         if slot is None:
             _close(sess, failed="request has no mamba slot")
             return
+        if int(g.stage_linear[0]) == 0:
+            # L15-14e: the stage owning linear layer 0 leaves the prompt's
+            # token ids for D's adopt (BEFORE its record: D trusts records)
+            from sglang.srt.weg2.l15_deposit_adopt import write_tokens
+
+            ids = list(getattr(req, "origin_input_ids", ()) or ())[: sess.n]
+            if len(ids) != sess.n:
+                _close(sess, failed="prompt has %d ids < n %d" % (len(ids), sess.n))
+                return
+            write_tokens(sess.directory, sess.rid, ids)
         ratios = _ratios(sess.shares)
         nbytes = put_anchor(
             sess.shares, spec=g.spec, ratios=ratios, stage=g.stage_linear,

@@ -114,7 +114,8 @@ def _open(w, *, rid="r1", n=10, hint=None, prompt_len=None, d0=None, mapper=None
 
 
 def _req(rid="r1"):
-    return SimpleNamespace(rid=rid, req_pool_idx=2, mamba_pool_idx=1)
+    return SimpleNamespace(rid=rid, req_pool_idx=2, mamba_pool_idx=1,
+                           origin_input_ids=list(range(500, 510)))
 
 
 def _rank1_row(w, layer, role, slot):
@@ -228,3 +229,13 @@ def test_wiring_sits_where_the_rows_are_valid():
     assert 'SGLANG_WEG2_L15_DEPOSIT", "0") == "1"' in src[:k]
     rel = inspect.getsource(weight_updater)
     assert '_l15_dh.close_all("P sleep")' in rel
+
+
+def test_stage_zero_leaves_the_token_ids_before_its_record(tmp_path):
+    from sglang.srt.weg2.l15_deposit_adopt import read_tokens
+
+    w = _world(tmp_path)
+    _open(w)
+    H.on_chunk(_req(), final=True)
+    assert read_tokens(w.dir, "r1") == list(range(500, 510))
+    assert json.load(open(H.record_path(w.dir, "r1", "L0-2")))["failed"] is None
