@@ -7309,6 +7309,18 @@ class SchedulerWeightUpdaterManager:
                         type(exc).__name__, exc)
             return None, None, 0, True
 
+    @staticmethod
+    def _l15_wake_rpc(tags) -> bool:
+        """L15-FIX-KVRPC-GATE: True only for the resume RPC that carries
+        kv_cache. A D wake is two resume RPCs (weights legs first, then
+        kv_cache + cuda_graph -- N3l D log 02:29:42); the hold-aware
+        restore runs in the kv RPC only, so the L15 fence-tail block
+        (manifest read, decide, act) must run there and nowhere else:
+        in the weights RPC it read-and-unlinked the manifest before the
+        restore could consume it. Tags are identical on every rank of the
+        group for one RPC, so the gate is group-uniform (xsn410)."""
+        return GPU_MEMORY_TYPE_KV_CACHE in set(tags or ())
+
     def _l15_fence_manifest(self, manifest_path):
         """L15-12c-B F11: the fence's manifest read.  The wake restore has
         ALREADY read-and-unlinked this wake's record at
@@ -11560,7 +11572,7 @@ class SchedulerWeightUpdaterManager:
         _l15_wake = False
         _l15_fp: Optional[int] = None
         _l15_m = None
-        if weg2_memory_saver_on and self._weg2_group_name() == "D":
+        if weg2_memory_saver_on and self._weg2_group_name() == "D" and self._l15_wake_rpc(tags):
             from sglang.srt.weg2 import l15_plan
 
             if l15_plan.master_on(os.environ):
