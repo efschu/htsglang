@@ -7961,6 +7961,11 @@ class SchedulerWeightUpdaterManager:
                     sched.draft_worker.clear_cache_pool()
                 self._l15_clear_tms_keep_spans(sched)
                 sched._l15_tree_retained = False
+                try:  # L15-FWD-INST: the next first forward is a held wake's
+                    from sglang.srt.weg2 import first_fwd_timing as _fft_h
+                    _fft_h.mark_held()
+                except Exception:  # noqa: BLE001 -- an instrument only
+                    pass
                 logger.info(
                     "WEG2-WAKE-RESTORE L15 hold-aware (rank %d): %d slot(s) "
                     "re-reserved, mamba rows [0,%d) kept, KV scrub bounded "
