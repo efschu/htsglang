@@ -244,6 +244,7 @@ from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision ver
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
 from sglang.srt.weg2 import dual_d_priority as _weg2_dual_d_priority  # D HOLD FOR GROW (dual D)
+from sglang.srt.weg2 import dual_handback_defer as _weg2_hbd  # D-HANDBACK-DEFER (dual D)
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -13364,6 +13365,18 @@ class Scheduler(
             return False
         if getattr(req, "prefetch_deferred", None) is not None:
             return True
+        # D-HANDBACK-DEFER (dual D): a hand-back whose tail P has not made
+        # readable yet votes pending until its read is issued, inside the
+        # length-priced bound (weg2/dual_handback_defer.py).
+        if getattr(req, _weg2_hbd.MARK_ATTR, None) is not None:
+            try:
+                _hb_bound = float(self._deferred_prefetch_bound_s(len(
+                    getattr(req, "full_untruncated_fill_ids", None)
+                    or getattr(req, "origin_input_ids", None) or ())))
+            except Exception:  # noqa: BLE001 - an unpriceable bound is not a wait
+                _hb_bound = 0.0
+            if _weg2_hbd.pending(req, _hb_bound):
+                return True
         ongoing = getattr(getattr(self, "tree_cache", None), "ongoing_prefetch", None)
         try:
             return bool(ongoing) and rid in ongoing
@@ -15386,6 +15399,9 @@ class Scheduler(
         # beyond what the intake path already carries.
         if self.enable_hicache_storage:
             self._retry_deferred_prefetches()
+            # D-HANDBACK-DEFER (dual D): re-issue the store read of the deferred
+            # hand-backs (pass-counted back-off, rank-identical set and order)
+            _weg2_hbd.retry(self)
         prefetch_verdicts = self.__dict__.pop("_pass_prefetch_verdicts", None)
         if prefetch_verdicts is None:
             prefetch_verdicts = self._drain_prefetch_progress()
@@ -16725,9 +16741,19 @@ class Scheduler(
                 _note_skip("weg2_x_defer", req.rid)
                 continue
             if self._weg2_x_refuses(req, _head_inputs):
+                # D-HANDBACK-DEFER (dual D): the first W31 of a hand-back is a
+                # defer -- P's tail may simply not be readable yet; the refusal
+                # would make P prefill it a second time. The W31 is the group's
+                # verdict, so the mark lands on every rank in the same pass.
+                if _weg2_hbd.armed() and _weg2_hbd.begin(
+                    req, int(self.weg2_uncached_extent(req, _head_inputs))
+                ):
+                    _note_skip("weg2_handback_defer", req.rid)
+                    continue
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
                 continue
+            _weg2_hbd.note_admit(req)
             # PARK-WINDOW-GATE (29.09.): while the front's collect window is
             # open, no extend whose forward ends after its deadline -- the park
             # must not wait for it. Inert without a window (every term replicated).
