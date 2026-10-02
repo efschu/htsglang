@@ -3053,6 +3053,9 @@ def release_req(
     #
     # `retain` is threaded from the cutover only; every other caller keeps
     # upstream's discard semantics unchanged.
+    from sglang.srt.weg2 import park_retract_laps as _prl  # FLIP-EDGE 2: no-op unless a park retracts
+
+    _prl.mark("pre")
     release_kv_cache(req, tree_cache, is_insert=bool(retain))
 
     if not retain:
@@ -3063,7 +3066,9 @@ def release_req(
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(tree_cache, num_tokens)
 
+    _prl.mark("release_tail")
     req.reset_for_retract()
+    _prl.mark("reset")
 
 
 #: #998 reader-side invariant probe: rid -> (start, end, len_prefix,

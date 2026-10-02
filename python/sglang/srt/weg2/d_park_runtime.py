@@ -32,7 +32,7 @@ import time
 from typing import Optional
 
 from sglang.srt.managers import weg2_resumable_depth
-from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield
+from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_laps
 from sglang.srt.weg2 import handback_claim as _hb
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,8 @@ def _host_bytes_per_slot(sched) -> int:
 
 
 def _log_park_timing(sched, epoch: int, laps: dict, *, total_s: float, coll_s: float,
-                     running, retracted, resumable, host_before, host_after) -> None:
+                     running, retracted, resumable, host_before, host_after,
+                     retract_sub=None) -> None:
     """PARK-TIMING (01.10., z30y11-13: the park RPC 0.57-1.84 s ahead of every
     D->P flip, equal on all ranks): ONE line per park per rank, the same
     fields on every rank. ``coll_ms`` is the #59b tp-min reduce -- on a rank
@@ -153,6 +154,14 @@ def _log_park_timing(sched, epoch: int, laps: dict, *, total_s: float, coll_s: f
         probe_ms, coll_s * 1e3, rest_ms, len(running), len(retracted),
         seq, res_tokens, res_tokens // max(1, page), page, wt_host, wt_bytes,
     )
+    # FLIP-EDGE 2: the retract lap split into its steps (contiguous, sum_ms ==
+    # the retract lap minus the host-pool reads around it), one line per park
+    # per rank, beside the TIMING line.
+    if retract_sub and retract_sub[0]:
+        logger.info(
+            "WEG2-D-PARK RETRACT-SUB epoch=%d rank=%d seq_tokens=%d %s",
+            epoch, rank, seq, park_retract_laps.describe(*retract_sub),
+        )
 
 
 def park_running(sched, recv_req, *, late_hold_armed: bool = False):
@@ -241,10 +250,15 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _lap("draft")
     host_before = _host_free_slots(sched)
     park_hold_yield.begin(getattr(sched, "tree_cache", None))
-    retracted = (
-        sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
-        if running else []
-    )
+    # FLIP-EDGE 2: the retract lap's own contiguous sub-laps (park_retract_laps)
+    park_retract_laps.arm()
+    try:
+        retracted = (
+            sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
+            if running else []
+        )
+    finally:
+        retract_sub = park_retract_laps.disarm()
     host_after = _host_free_slots(sched)
     _lap("retract")
     sched.running_batch.batch_is_full = False
@@ -365,6 +379,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _log_park_timing(
         sched, epoch, laps, total_s=t_lap - t_start, coll_s=coll_s[0], running=running,
         retracted=retracted, resumable=resumable, host_before=host_before, host_after=host_after,
+        retract_sub=retract_sub,
     )
     return Weg2ParkRunningReqOutput(
         success=True, parked=rids, held=held, epoch=epoch, late_hold=late_hold,
