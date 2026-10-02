@@ -120,7 +120,8 @@ def ensure_split(bases: Dict[int, Tuple[object, List[Tuple[int, int]]]],
     return n
 
 
-def keep_extents(base_ptr: int, ranges: Sequence[Tuple[int, int]]
+def keep_extents(base_ptr: int, ranges: Sequence[Tuple[int, int]],
+                 native: Optional[Sequence[Tuple[int, int]]] = None
                  ) -> Optional[List[Tuple[int, int]]]:
     """The WHOLE hold extents covering ``ranges`` on a split base, or None
     when the base is not split or a range leaves the hold region (the arm
@@ -144,6 +145,19 @@ def keep_extents(base_ptr: int, ranges: Sequence[Tuple[int, int]]
             return None
         if hit not in out:
             out.append(hit)
+    # L15-EXTENTS (N3y share rc=-2): trust the saver, not this module's
+    # memory -- a hold region the saver no longer covers with span extents
+    # (re-planned / re-allocated base) would be unmapped whole by the pause
+    # while the manifest claims a hold. Refuse (clean fallback) instead.
+    if native is None:
+        from sglang.srt.weg2.l15_hold_share import list_extents
+
+        native = list_extents(int(base_ptr))
+    if native is not None:
+        from sglang.srt.weg2.l15_hold_share import native_cover
+
+        if native_cover(native, out) is None:
+            return None
     return sorted(out)
 
 

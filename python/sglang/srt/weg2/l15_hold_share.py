@@ -60,14 +60,75 @@ def _export_symbol():
     return fn
 
 
+def _list_symbol():
+    from sglang.srt.utils.torch_memory_saver_adapter import _weg2_ring_symbol
+
+    fn = _weg2_ring_symbol("tms_list_extents")
+    if fn is None:
+        return None
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                   ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+    return fn
+
+
+def list_extents(base_ptr: int, lister=None) -> Optional[List[Tuple[int, int]]]:
+    """L15-EXTENTS: the saver's span extents of one base as sorted
+    ``[(offset, size)]`` ([] = stock mapping), or None when the build has no
+    tms_list_extents or ``base_ptr`` is not a base."""
+    fn = lister if lister is not None else _list_symbol()
+    if fn is None:
+        return None
+    cap = 4096
+    offs = (ctypes.c_uint64 * cap)()
+    sizes = (ctypes.c_uint64 * cap)()
+    n = int(fn(ctypes.c_void_p(int(base_ptr)), ctypes.c_size_t(cap), offs, sizes))
+    if n < 0:
+        return None
+    return [(int(offs[i]), int(sizes[i])) for i in range(min(n, cap))]
+
+
+def native_cover(extents: Sequence[Tuple[int, int]],
+                 holds: Sequence[Tuple[int, int]]) -> Optional[List[Tuple[int, int]]]:
+    """The native extents lying wholly inside the hold regions, if together
+    they cover every hold region exactly; else None (the split is not what
+    Python believes -- nothing of it may be exported or kept)."""
+    out: List[Tuple[int, int]] = []
+    for a, b in holds:
+        inside = sorted((o, z) for o, z in extents if a <= o and o + z <= b)
+        cur = a
+        for o, z in inside:
+            if o != cur:
+                return None
+            cur = o + z
+        if cur != b:
+            return None
+        out.extend(inside)
+    return out
+
+
 def export_hold_extents(base_ptr: int, extents: Sequence[Tuple[int, int]],
-                        export=None) -> List[Tuple[int, int, int]]:
+                        export=None, lister=None) -> List[Tuple[int, int, int]]:
     """``[(offset, size, fd), ...]`` for the hold extents of one base. The
     caller owns the fds. ``export`` is the tms_export_extent callable (tests
-    pass a fake)."""
+    pass a fake).
+
+    L15-EXTENTS (N3y: rc=-2 "no extent at offset 0"): with a saver that can
+    list its extents, the NATIVE extents inside the hold regions are exported
+    (several per region are fine); a hold region the saver does not cover is
+    refused naming what the saver has."""
     fn = export if export is not None else _export_symbol()
     if fn is None:
         raise L15ShareError("tms_export_extent missing (old saver build)")
+    native = list_extents(base_ptr, lister)
+    if native is not None:
+        cover = native_cover(native, [(int(a), int(b)) for a, b in extents])
+        if cover is None:
+            raise L15ShareError(
+                "base %#x: the saver's extents %s do not cover the hold regions "
+                "%s (split lost or never applied)"
+                % (base_ptr, native[:6], list(extents)[:4]))
+        extents = [(o, o + z) for o, z in cover]
     out: List[Tuple[int, int, int]] = []
     try:
         for off, _hi in extents:
