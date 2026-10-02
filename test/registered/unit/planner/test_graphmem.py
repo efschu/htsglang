@@ -139,6 +139,8 @@ class TestAnchorStore(CustomTestCase):
         store = self._store()
         n = graphmem.scan_boot_logs([log], store=store)
         self.assertEqual(n, 1)
+        # K8: the scan stamps the machine's card classes; a lookup asks for
+        # the cards it means (same machine here -> same classes).
         hit = store.lookup(
             {
                 "model_path": "/models/Qwen3.6-27B-FP8",
@@ -149,6 +151,7 @@ class TestAnchorStore(CustomTestCase):
                 "speculative_num_draft_tokens": 6,
                 "speculative_adaptive": True,
                 "decode_bs": list(_SNIPPET_DECODE_BS),
+                "card_classes": graphmem.live_card_classes(),
             }
         )
         self.assertIsNotNone(hit)
@@ -177,10 +180,11 @@ class TestAnchorStore(CustomTestCase):
             "speculative_num_draft_tokens": 6,
             "speculative_adaptive": True,
         }
+        cards = graphmem.live_card_classes()  # K8: same machine (see above)
         self.assertIsNotNone(
-            store.lookup({**meta, "decode_bs": list(_SNIPPET_DECODE_BS)})
+            store.lookup({**meta, "decode_bs": list(_SNIPPET_DECODE_BS), "card_classes": cards})
         )
-        self.assertIsNone(store.lookup({**meta, "decode_bs": list(range(12))}))
+        self.assertIsNone(store.lookup({**meta, "decode_bs": list(range(12)), "card_classes": cards}))
 
     def test_the_attention_backend_separates_two_anchors(self):
         """#513: BASE_MIB is documented as the flashinfer workspace, so the
