@@ -654,6 +654,9 @@ def test_t10b_min_dwell_is_derived_from_the_last_flip_and_names_its_overrides():
     f.flip_log.append({"sleep": "D", "wake": "P", "flip_ms": 14000})
     assert f._derived_min_dwell_ms("D", "P")[0] == 14000.0
     f.t_awake = time.time()  # just woke: dwell not served
+    # K7-DWELL idle skip (02.10.): an idle D never holds -- this C8/K7 check is about
+    # a D with work, so D runs a decode
+    f.groups["D"].outstanding["running"] = object()
     assert f._dwell_ok("D", "P", fairness_fired=False, work_exhausted=False,
                        oldest_wait_s=0.0) is False
     # xsn291: an override does not flip a group that woke 200 ms ago -- the
