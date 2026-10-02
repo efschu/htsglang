@@ -3981,6 +3981,14 @@ def _env_switch_on_or_profile(name: str, env=None) -> bool:
     return bool(profile_switch_default(name, False, src))
 
 
+
+def _decode_collect_window_s() -> float:
+    """DECODE-COLLECT window (user 02.10.); 0 = the old path, byte for byte."""
+    try:
+        return max(0.0, float(envs.SGLANG_WEG2_DECODE_COLLECT_WINDOW_S.get() or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
@@ -4943,6 +4951,14 @@ class Front:
         decodes the parked requests for at least the price of its flip."""
         if self._park_attempt_epoch == self.epoch or not self._flip_ledger(D):
             return None
+        if _decode_collect_window_s() > 0.0:
+            # DECODE-COLLECT (user 02.10.): the window wins over every park rule
+            dc = self._decode_collect(now)
+            if dc == "hold":
+                return None
+            if dc == "P":
+                live = [q for q in self.queue if not q.fut.done()]
+                return min(live, key=lambda q: float(q.t_arrive)) if live else None
         p = phase_policy.immediate_park_trigger(self.queue, int(self.tp_prefill_max_tokens))
         if p is None:
             if envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():  # off: nothing touched
@@ -9673,6 +9689,13 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
+        if _decode_collect_window_s() > 0.0:
+            # DECODE-COLLECT: D decodes -> this SHORT waits for the window; the
+            # set's route decides (P: route BATCH, the flip takes it)
+            if await self._decode_collect_short(rid, uncached if uncached is not None else est_tokens) == "P":
+                return None
+            if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                return None
         if self._d_direct_yields(rid):
             return None  # FLIPCYCLE H5b: the flip comes anyway -- ride P's batch
         if _asr.enabled():
@@ -9710,6 +9733,113 @@ class Front:
     # the immediate flip); no seat -> no flip, the arrival waits for the next seat
     # in arrival order; the wait bound parks the youngest running decode. Off:
     # none of the methods below is called.
+
+    # ------------------------------------------------------------------ DECODE-COLLECT
+    # User rule 02.10. ~19:07Z (both models): while D decodes, arriving prefills
+    # are collected for SGLANG_WEG2_DECODE_COLLECT_WINDOW_S; then the set goes
+    # to D (summed uncached <= X, nothing P-only) or, by one flip, to P.
+
+    def _dc_window_s(self) -> float:
+        return _decode_collect_window_s()
+
+    def _dc_decoding(self) -> bool:
+        """D is awake, serving and runs decodes (parked ones excluded)."""
+        if not (self.awake == "D" and self.state == "serving"):
+            return False
+        D = self.groups.get("D") if isinstance(self.groups, dict) else None
+        return bool(D is not None and self._flip_ledger(D))
+
+    def _dc_st(self) -> dict:
+        st = self.__dict__.setdefault("_dc_state", {"epoch": None})
+        if st.get("epoch") != self.epoch:
+            st.clear()
+            st.update(epoch=self.epoch, t_open=None, t_rel=float(getattr(self, "t_awake", 0.0) or 0.0),
+                      shorts={}, route=None, wid=0)
+        return st
+
+    def _decode_collect(self, now: float, live_q: Optional[List["Pending"]] = None) -> Optional[str]:
+        """DECODE-COLLECT, the one decision site: ``"hold"`` while the window
+        is open, ``"D"``/``"P"`` once it released (``"P"`` stays for the rest
+        of this D phase -- the flip takes everything queued), ``None`` when the
+        window is off or D was not decoding when the prefill arrived."""
+        win = self._dc_window_s()
+        if win <= 0.0:
+            return None
+        st = self._dc_st()
+        if st["route"] == "P":
+            return "P"
+        if live_q is None:
+            live_q = [p for p in self.queue if not p.fut.done()]
+        fresh = [p for p in live_q if float(getattr(p, "t_arrive", now) or now) > st["t_rel"]]
+        if st["t_open"] is None:
+            if not (fresh or st["shorts"]) or not self._dc_decoding():
+                return None
+            ts = [float(getattr(p, "t_arrive", now) or now) for p in fresh] + [t for t, _ in st["shorts"].values()]
+            st["t_open"] = min(ts) if ts else now
+        x_tok = int(self.tp_prefill_max_tokens)
+        unc = [int(getattr(p, "est_uncached", 0) or 0) for p in fresh] + [u for _, u in st["shorts"].values()]
+        n, tokens = len(unc), sum(unc)
+        waited = max(0.0, now - st["t_open"])
+        decoding = self._dc_decoding()
+        p_bound = any(phase_policy.immediate_park_trigger([p], x_tok) is not None
+                      or bool(getattr(p, "p_only", False)) for p in fresh)
+        try:
+            dcheck = max(0.0, float(envs.SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S.get() or 0.0))
+        except (TypeError, ValueError):
+            dcheck = 0.0
+        stage = "window" if decoding else "d-idle"
+        if waited < win and decoding:
+            if 0.0 < dcheck < win and waited >= dcheck and not p_bound and tokens <= x_tok:
+                stage = "dcheck"  # a small set: D prefills it now
+            else:
+                if 0.0 < dcheck < win and waited >= dcheck and st.get("dcheck_wid") != st["wid"]:
+                    st["dcheck_wid"] = st["wid"]
+                    self.counters["decode_collect_dcheck_hold"] += 1
+                    logger.info("WEG2 DECODE-COLLECT dcheck n=%d tokens=%d X=%d waited_s=%.1f p_bound=%s -- "
+                                "over X: collects on to %.1f s", n, tokens, x_tok, waited, p_bound, win)
+                if st.get("hold_wid") != st["wid"]:
+                    st["hold_wid"] = st["wid"]
+                    self.counters["decode_collect_hold"] += 1
+                    logger.info("WEG2 DECODE-COLLECT hold n=%d tokens=%d X=%d waited_s=%.1f window_s=%.1f "
+                                "d_check_s=%.1f epoch=%d -- D decodes on, the arriving prefills collect",
+                                n, tokens, x_tok, waited, win, dcheck, self.epoch)
+                return "hold"
+        if stage == "window" and 0.0 < dcheck < win:
+            route = "P"  # user ~19:13Z: "ansonsten wartet er auf die 15er grenze und flippt"
+        else:
+            route = "P" if (p_bound or tokens > x_tok) else "D"
+        st.update(route=route, t_rel=now, t_open=None, shorts={}, wid=st["wid"] + 1)
+        self.counters["decode_collect_release_" + route] += 1
+        logger.info("WEG2 DECODE-COLLECT release n=%d tokens=%d X=%d waited_s=%.1f route=%s stage=%s p_bound=%s "
+                    "epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, self.epoch)
+        return route
+
+    async def _decode_collect_short(self, rid: str, uncached: int) -> Optional[str]:
+        """DECODE-COLLECT for a SHORT arrival on the D seat path: ``None`` = no
+        window (as before), else the released route ("P": fall through to
+        route BATCH, the flip takes it)."""
+        win = self._dc_window_s()
+        if win <= 0.0:
+            return None
+        st = self._dc_st()
+        if st["route"] == "P":
+            return "P"
+        if st["t_open"] is None and not self._dc_decoding():
+            return None
+        now = time.time()
+        st["shorts"][rid] = (now, int(uncached or 0))
+        wid, epoch = st["wid"], self.epoch
+        deadline = now + win + float(getattr(self, "drain_deadline_s", 30.0) or 30.0)
+        while time.time() < deadline:
+            route = self._decode_collect(time.time())
+            if self.epoch != epoch or not (self.awake == "D" and self.state == "serving"):
+                return "P"
+            if route in ("D", "P") and self._dc_st()["wid"] != wid:
+                return self._dc_st()["route"] if self._dc_st()["route"] == "P" else route
+            if route is None:
+                return None
+            await asyncio.sleep(0.05)
+        return "D"
 
     def _asr_st(self) -> dict:
         return self.__dict__.setdefault("_asr_state", {
@@ -10212,6 +10342,20 @@ class Front:
             logger.info("%s PARKED-CLEAR n=%d why=lapsed rids=%s", _asr.MARKER, len(lapsed), lapsed[:4])
         bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
         live_q = [p for p in self.queue if not p.fut.done()]
+        dc = self._decode_collect(now, live_q) if _decode_collect_window_s() > 0.0 else None
+        if dc == "hold":
+            return False, not self.admit_d, None  # DECODE-COLLECT: no flip, no D seat yet
+        if dc == "P":
+            if not live_q:
+                return False, not self.admit_d, None  # the released SHORTs are on their way to the queue
+            head = min(live_q, key=lambda q: float(getattr(q, "t_arrive", now) or now))
+            if st["flip_rid"] != head.rid:
+                st["flip_rid"] = head.rid
+                self.counters["arrival_seat_flip_now"] += 1
+                logger.warning("%s rid=%s verdict=%s DECODE-COLLECT route=P queued=%d -- the collected set "
+                               "goes to P: D pauses its decodes and flips now", _asr.MARKER, head.rid,
+                               _asr.FLIP_NOW, len(live_q))
+            return True, True, head
         # y4y: a queued SHORT has an owner -- D, as a d_prefill verdict (the
         # candidates below are only the entries that need P)
         handed = self._asr_queued_short_to_d(live_q, now) if live_q else []

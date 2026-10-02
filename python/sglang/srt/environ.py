@@ -1776,6 +1776,29 @@ class Envs:
     # request is admitted to D past it. Marker 'PBOUND-FLIP-NOW' /
     # 'PBOUND-STALL'. 0 = the seat/KV verdict as before.
     SGLANG_WEG2_PBOUND_FLIP_NOW = EnvBool(True)
+    # DECODE-COLLECT (user rule 02.10. ~19:07Z, both models: "wenn prefill
+    # requests reinkommen und noch decoded wird, dann wird erstmal noch 15
+    # sekunden weiterdecoded und prefill requests gesammelt, erst dann ...
+    # je nach anzahl in P oder D"; ~19:09Z: "auf den alten weg ... indem man
+    # die zeit auf 0 stellt"): while D decodes, every arriving prefill (SHORT
+    # and P-bound alike) is held for this many seconds from the first one; D
+    # decodes on. At the end the collected set goes as a whole: summed
+    # uncached <= X and nothing P-only -> D, else the D->P flip and P takes
+    # all of it. D not decoding (or it stops decoding inside the window) ->
+    # at once, as before. While a window holds it wins over PARK-NO-DWELL,
+    # PBOUND-FLIP-NOW, the ARRIVAL-SEAT flip_now and the SHORT seat on D.
+    # Marker 'WEG2 DECODE-COLLECT hold|dcheck|release'. 0 = the old path, byte
+    # for byte (whatever D_CHECK_S says).
+    SGLANG_WEG2_DECODE_COLLECT_WINDOW_S = EnvFloat(15.0)
+    # DECODE-COLLECT D-CHECK (user ~19:12Z: "es wird 7,5 gesammelt, wenn dann
+    # gesammelt nicht mehr token anstehen, als X in D prefillen wuerde, dann
+    # prefillt er in D die kleine menge ... auch diese zeit muss einstellbar
+    # sein"): at this many seconds into the window a set whose summed uncached
+    # is <= X (and nothing P-only) goes to D at once; else it collects on to
+    # WINDOW_S and then flips (user: "ansonsten wartet er auf die 15er grenze
+    # und flippt"), P takes all of it. 0 or >= WINDOW_S = no intermediate
+    # check (the window routes the set by its amount).
+    SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S = EnvFloat(7.5)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")

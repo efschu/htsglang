@@ -144,3 +144,13 @@ def _weg2_published_form():
             os.environ[_FORM_ENV] = backup
         launcher._SPEC_FORM.clear()
         launcher._SPEC_FORM.update(spec)
+
+
+@pytest.fixture(autouse=True)
+def _weg2_decode_collect_old_path(monkeypatch):
+    """DECODE-COLLECT (02.10.) ships ON (15 s window). The suite's arrival /
+    park / flip tests pin the immediate paths they were written for, so the
+    window is 0 (the old path, byte for byte) unless a test sets it."""
+    if "SGLANG_WEG2_DECODE_COLLECT_WINDOW_S" not in os.environ:
+        monkeypatch.setenv("SGLANG_WEG2_DECODE_COLLECT_WINDOW_S", "0")
+    yield
