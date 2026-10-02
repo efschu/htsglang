@@ -8353,6 +8353,22 @@ class Front:
     async def handle_health(self, request: web.Request) -> web.Response:
         from sglang.srt.weg2 import front_health as _fh
 
+        # FRONT-PREWARM truthful readiness (y8f): while /weg2/state says
+        # ``warming`` -- the boot's tokenizer load still holds the first route
+        # decision -- /health must not announce serving. The launcher's
+        # ``wait_ready`` calls READY on the first 200 (weg2/launcher.py), and
+        # boot y8c announced serving 11.8 s before the load ended: the first
+        # arrival stalled 12818 ms behind the BOOT-START HOLD. The gate rides
+        # ``_reported_state()``: the switch off or the load ended -> 200 at
+        # once; a flip reads ``flipping``, STOP reads 503 as before; and the
+        # X_EXACT_HOLD_MAX_S bound inside ``_reported_state()`` bounds this
+        # gate, so a load that never ends cannot suppress READY forever.
+        reported = self._reported_state()
+        if reported == "warming":
+            return web.json_response(
+                {"state": reported, "awake": self.awake, "epoch": self.epoch,
+                 "prewarm": "front tokenizer load running; same state /weg2/state calls warming"},
+                status=503)
         if _fh.enabled():
             return await self._handle_health_facts()
         return await self._handle_health_old()
