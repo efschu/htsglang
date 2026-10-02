@@ -461,6 +461,11 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        #: FLIP-LEGS 02.10. (N5d: WEG2-LOAD-DEVICE queue_ms=1333 for a 206-ms
+        #: read on the first P prefill after a D->P flip): where the queue goes
+        #: -- monotonic stamps the prefetch thread sets, printed by
+        #: :func:`prefetch_queue_parts` on the LOAD-DEVICE line.
+        self.stage_times: dict = {}
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -791,6 +796,30 @@ STORAGE_THREAD_JOIN_BOUND_S = 10.0
 #: reads it shares nothing with. ``1`` = the single aux thread as before.
 PREFETCH_IO_WORKERS_ENV = "SGLANG_HICACHE_PREFETCH_IO_WORKERS"
 PREFETCH_IO_WORKERS_DEFAULT = 4
+
+
+def prefetch_queue_parts(operation) -> str:
+    """FLIP-LEGS: ``pick=..,hash=..,exists=..,vote=..,pin=..,buf=..`` ms of an
+    operation's queue (registration -> aux-thread read start): pick = waiting
+    for the prefetch thread, hash = page keys, exists = the store probe, vote =
+    probe hold + the group MIN, pin = host slot release up to the aux buffer,
+    buf = waiting in the aux buffer for a free reader. ``-`` = not stamped."""
+    st = getattr(operation, "stage_times", None) or {}
+    t0 = float(getattr(operation, "start_time", 0.0) or 0.0)
+    rs = float(getattr(operation, "read_start_time", 0.0) or 0.0)
+    order = (("pick", "picked"), ("hash", "hashed"), ("exists", "probed"),
+             ("vote", "voted"), ("pin", "buffered"))
+    out, prev = [], (t0 or None)
+    for name, key in order:
+        t = st.get(key)
+        if t is None or prev is None:
+            out.append(f"{name}=-")
+            prev = None if t is None else float(t)
+            continue
+        out.append(f"{name}={(float(t) - prev) * 1000.0:.0f}")
+        prev = float(t)
+    out.append(f"buf={(rs - prev) * 1000.0:.0f}" if (prev is not None and rs) else "buf=-")
+    return ",".join(out)
 
 
 def prefetch_io_workers() -> int:
@@ -4407,6 +4436,9 @@ class HiCacheController:
         page_hashes = self.get_hash_str(
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
+        _st = getattr(operation, "stage_times", None)
+        if _st is not None:
+            _st["hashed"] = time.monotonic()
         # xsn328/329: a held request reads with P's handed-over page keys
         # (weg2.handoff_keys); its own hashes agreed with P's for the first
         # 64 tokens only. The first mismatch is named once.
@@ -4532,11 +4564,16 @@ class HiCacheController:
             # `_storage_hit_query` asks the store nothing and the drain is
             # one collective per operation, not one storage walk.
             self._prefetch_current = operation
+            _st = getattr(operation, "stage_times", None)
+            if _st is not None:
+                _st["picked"] = time.monotonic()
             try:
                 if self.storage_stop_event.is_set():
                     operation.mark_terminate()
                     self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+                if _st is not None:
+                    _st["probed"] = time.monotonic()
                 # #257 (a): hold what the probe reports until the read
                 probe_hold_pin(self, operation, hash_value, storage_hit_count)
                 # fnFL2x22: the FORM is agreed over the group first (one
@@ -4588,6 +4625,8 @@ class HiCacheController:
                 # transfer both carry it; a reap that finds None was ahead of
                 # the probe.
                 operation.probed_hit_tokens = int(storage_hit_count)
+                if _st is not None:
+                    _st["voted"] = time.monotonic()
 
                 if storage_hit_count < revoke_threshold(self, operation):
                     # not to prefetch if not enough benefits
@@ -4653,6 +4692,8 @@ class HiCacheController:
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
+                    if _st is not None:
+                        _st["buffered"] = time.monotonic()
                     self.prefetch_buffer.put(operation)
             except (Weg2DraftDisagree, HiCacheCollectiveTimeoutError) as e:
                 # S5: group STOP, never a dead thread under a live server.

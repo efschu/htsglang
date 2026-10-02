@@ -8442,6 +8442,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         try:
             _t0 = float(getattr(operation, "start_time", 0.0) or 0.0)
             _ms = (time.monotonic() - _t0) * 1000.0 if _t0 else -1.0
+            from sglang.srt.managers.cache_controller import (
+                prefetch_queue_parts as _prefetch_queue_parts,
+            )
             # xsn291: the arena host pool answers get_ksize_per_token, not
             # get_size_per_token (its __getattr__ raised on every D rank).
             _hp = self.cache_controller.mem_pool_host
@@ -8471,11 +8474,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "WEG2-LOAD-DEVICE req=%s tokens=%d bytes_per_token=%d bytes=%d ms=%.0f "
                 "queue_ms=%.0f read_ms=%.0f harvest_ms=%.0f GB/s=%.2f (the read's own "
                 "clock: aux-thread transfer start to end; ms = queue + read + wait for "
-                "the scheduler pass that reaps it; matched=%d loaded=%d)",
+                "the scheduler pass that reaps it; matched=%d loaded=%d) queue_parts=%s",
                 req_id, int(completed_tokens), _bpt, _bytes, _ms,
                 _queue_ms, _read_ms, _harvest_ms,
                 (_bytes / (_read_ms / 1000.0) / 1e9) if _read_ms > 0 else -1.0,
                 int(insert_result.prefix_len), int(loaded_from_storage),
+                _prefetch_queue_parts(operation),
             )
             # L15-02b: if this req was in the last sleep's shadow hold set, price
             # the load-back it would have saved. Log-only, never raises.
