@@ -533,3 +533,26 @@ def test_b3_the_room_ignored_mutant_turns_the_room_test_red(monkeypatch):
     monkeypatch.setattr(DK, "decide", ns["decide"])
     with pytest.raises(AssertionError):
         test_b3_a_shrink_keeps_the_look_ahead_room()
+
+
+# -- (C) --dual-p-sleep defaults to on under --dual-share --------------------------------
+
+from sglang.srt.weg2 import launcher as L  # noqa: E402
+
+
+def test_c_dual_share_arms_stage_2_by_default_without_the_probe():
+    base = ["--tree", "/t", "--tag", "t", "--dual-layout", "--dual-unified-kv", "on"]
+    share = L.build_parser().parse_args(base + ["--dual-share"])
+    assert L.dual_p_sleep_armed(share), "stage 2 is part of the dual-share default"
+    env = L.dual_p_sleep_front_env(share, L.dual_d_air_tokens(6))
+    assert env.get(DP.P_SLEEP_ENV) == "1" and FR.Front.DUAL_P_SLEEP_PROBE_ENV not in env
+    assert "--enable-weights-cpu-backup" in L.dual_p_sleep_argv(share, [])
+    assert not L.dual_p_sleep_armed(L.build_parser().parse_args(base)), "without --dual-share: off"
+    off = L.build_parser().parse_args(base + ["--dual-share", "--dual-p-sleep", "off"])
+    assert not L.dual_p_sleep_armed(off), "an explicit off still wins"
+
+
+def test_c_the_old_default_mutant_turns_the_default_test_red(monkeypatch):
+    monkeypatch.setattr(L, "dual_p_sleep_choice", lambda ns: str(getattr(ns, "dual_p_sleep", None) or "off"))
+    with pytest.raises(AssertionError):
+        test_c_dual_share_arms_stage_2_by_default_without_the_probe()

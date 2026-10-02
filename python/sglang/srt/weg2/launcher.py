@@ -13790,13 +13790,30 @@ DUAL_P_SLEEP_GROUP_ENV = {
 }
 
 
+def dual_p_sleep_choice(ns) -> str:
+    """'on' / 'off': --dual-p-sleep as given, or its DEFAULT -- on when
+    --dual-share is set (the dual-share sleep is metal-proven: gmps12, SLEEP-LEND
+    7958691840 / 3219128320 / 3508535296 B and WAKE-RECLAIM on all three P
+    stages), off otherwise. The metal probe (SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S) is
+    never part of the default."""
+    v = getattr(ns, "dual_p_sleep", None)
+    if v is None:
+        return "on" if bool(getattr(ns, "dual_share", False)) else "off"
+    return str(v)
+
+
 def dual_p_sleep_armed(ns) -> bool:
-    """D PRIORITY stage 2 is armed: dual layout + unified KV + --dual-p-sleep on.
-    Under --dual-share it is REFUSED by name (:class:`Weg2DualPSleepShareRefused`)."""
+    """D PRIORITY stage 2 is armed: dual layout + unified KV + --dual-p-sleep on
+    (explicit, or the default under --dual-share: :func:`dual_p_sleep_choice`).
+    An explicit 'on' under --dual-share in a tree without the transient load is
+    REFUSED by name (:class:`Weg2DualPSleepShareRefused`); the DEFAULT there
+    stays off instead."""
     on = (bool(getattr(ns, "dual_layout", False))
           and str(getattr(ns, "dual_unified_kv", "off")) == "on"
-          and str(getattr(ns, "dual_p_sleep", "off")) == "on")
+          and dual_p_sleep_choice(ns) == "on")
     if on and bool(getattr(ns, "dual_share", False)) and not dual_p_sleep_share_supported():
+        if getattr(ns, "dual_p_sleep", None) is None:
+            return False
         raise Weg2DualPSleepShareRefused(
             "W-DUAL-P-SLEEP-SHARE: --dual-p-sleep on with --dual-share -- P's weights would load inside the "
             "memory-saver's private MemPool and the union bind's freed copies would stay reserved there "
@@ -21136,8 +21153,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "(risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs "
                          "~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. "
                          "100 = no limit.")
-    ap.add_argument("--dual-p-sleep", choices=("off", "on"), default="off",
-                    help="DEFAULT OFF since gmps9 (dkr27bnvfp4dual1mbar1fs10012051, P-PP0 init_memory_pool: 'per-rank "
+    ap.add_argument("--dual-p-sleep", choices=("off", "on"), default=None,
+                    help="DEFAULT: ON with --dual-share, OFF otherwise (since gmps12, "
+                         "dkr27bnvfp4dual1mpsleepbar1fs10020008: P slept and woke under --dual-share on all three "
+                         "stages, SLEEP-LEND/WAKE-RECLAIM; the metal probe SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S stays "
+                         "off by default). History: "
+                         "default off since gmps9 (dkr27bnvfp4dual1mbar1fs10012051, P-PP0 init_memory_pool: 'per-rank "
                          "budget leaves no GPU memory for the KV cache'): 'on' loads P's weights inside the "
                          "memory-saver's private MemPool (not resident), and the --dual-share union bind frees P's "
                          "own copies into that pool, which empty_cache never returns ('WEG2-UNION PEER ... card free "

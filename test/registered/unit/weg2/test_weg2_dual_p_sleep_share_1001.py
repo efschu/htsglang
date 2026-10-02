@@ -313,8 +313,11 @@ def test_without_the_tree_support_dual_share_sleep_is_still_refused(monkeypatch)
     monkeypatch.setattr(L, "dual_p_sleep_share_supported", lambda: False)
     with pytest.raises(L.Weg2DualPSleepShareRefused):
         L.dual_p_sleep_armed(SHARE_SLEEP)
-    assert L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]).dual_p_sleep == "off", \
-        "default off until the metal proof"
+    # gmps12 is the metal proof: the flag's default is unset, which means ON under --dual-share
+    assert L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]).dual_p_sleep is None
+    default = types.SimpleNamespace(**{**vars(SHARE_SLEEP), "dual_p_sleep": None})
+    assert L.dual_p_sleep_choice(default) == "on"
+    assert not L.dual_p_sleep_armed(default), "an implicit default never refuses: off in such a tree"
 
 
 # -- step 3: the front sleeps P only after the group-idle witness ---------------------------

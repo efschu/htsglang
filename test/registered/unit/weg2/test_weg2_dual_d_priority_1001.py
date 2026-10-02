@@ -327,14 +327,20 @@ def test_p_sleep_and_wake_use_their_own_epochs_and_leave_the_flip_alone():
 def test_the_launcher_arms_stage_2_only_in_the_dual_unified_form(monkeypatch):
     from sglang.srt.weg2 import launcher as L
 
-    # gmps9: default OFF, and 'on' under --dual-share is a named refusal (P's weights in the private
-    # memory-saver pool keep the union bind's freed copies reserved -> P-PP0 KV budget refused)
-    assert L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]).dual_p_sleep == "off"
+    # since gmps12 (02.10.): the DEFAULT is on under --dual-share (no flag given), off without it; an
+    # explicit 'on' under --dual-share in a tree without steps 1-3 is still the named refusal (gmps9),
+    # the implicit default there stays off
+    assert L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]).dual_p_sleep is None
     share_on = types.SimpleNamespace(dual_layout=True, dual_share=True, dual_unified_kv="on", dual_p_sleep="on",
                                      tag="t")
+    share_default = types.SimpleNamespace(**{**vars(share_on), "dual_p_sleep": None})
+    assert L.dual_p_sleep_choice(share_default) == "on" and L.dual_p_sleep_armed(share_default)
+    no_share_default = types.SimpleNamespace(**{**vars(share_default), "dual_share": False})
+    assert L.dual_p_sleep_choice(no_share_default) == "off" and not L.dual_p_sleep_armed(no_share_default)
     monkeypatch.setattr(L, "dual_p_sleep_share_supported", lambda: False)   # a tree without steps 1-3
     with pytest.raises(L.Weg2DualPSleepShareRefused, match="W-DUAL-P-SLEEP-SHARE"):
         L.dual_p_sleep_armed(share_on)
+    assert not L.dual_p_sleep_armed(share_default)
     monkeypatch.undo()
     share_off = types.SimpleNamespace(**{**vars(share_on), "dual_p_sleep": "off"})
     assert not L.dual_p_sleep_armed(share_off) and L.dual_p_sleep_argv(share_off, ["--x"]) == ["--x"]
