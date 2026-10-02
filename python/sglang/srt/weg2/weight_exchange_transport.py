@@ -662,6 +662,26 @@ class DeviceOps:
     def memset_async(self, dst: int, value: int, nbytes: int, stream: int) -> None:
         raise NotImplementedError
 
+    #: FLIP-LEGS 02.10.: True when :meth:`memcpy_async_held` really keeps the
+    #: GIL across the call (the cudart adapter); False = it is memcpy_async.
+    held_gil = False
+
+    def memcpy_async_held(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        """A device-to-device ``memcpy_async`` issued WITHOUT releasing the
+        GIL (FLIP-LEGS 02.10.). Only for copies whose two ends are device
+        memory -- the call then only queues work and returns in microseconds.
+        A ctypes ``CDLL`` call drops the GIL and must win it back afterwards;
+        with another Python thread running that costs ~0.9 ms per call (one
+        busy thread) to ~4 ms (three), measured on this rig's Python 3.12 --
+        the BAR1 collector's issue_ms (240-490 ms per lane per flip on the
+        5090 rank, N4p/N4q) is that, call after call. Default: the plain call."""
+        self.memcpy_async(dst, src, nbytes, stream)
+
+    def memcpy2d_async_held(self, dst: int, dpitch: int, src: int, spitch: int,
+                            width: int, height: int, stream: int) -> None:
+        """The strided form of :meth:`memcpy_async_held`."""
+        self.memcpy2d_async(dst, dpitch, src, spitch, width, height, stream)
+
     # -- host pinning -----------------------------------------------------
     def host_register(self, ptr: int, nbytes: int, flags: int) -> None:
         raise NotImplementedError
@@ -820,6 +840,13 @@ class CudartDeviceOps(DeviceOps):
                                              _IpcHandle, ctypes.c_uint]
         lib.cudaIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
         self.lib = lib
+        # FLIP-LEGS 02.10.: the same library through PyDLL -- calls that keep
+        # the GIL. Bound ONLY for the two async copy entry points, used ONLY
+        # for device-to-device copies (DeviceOps.memcpy_async_held).
+        held = ctypes.PyDLL(self.path)
+        held.cudaMemcpyAsync.argtypes = list(lib.cudaMemcpyAsync.argtypes)
+        held.cudaMemcpy2DAsync.argtypes = list(lib.cudaMemcpy2DAsync.argtypes)
+        self.lib_held = held
 
     def _check(self, rc: int, what: str) -> None:
         if int(rc) != 0:
@@ -892,6 +919,26 @@ class CudartDeviceOps(DeviceOps):
                                      nbytes, CUDA_MEMCPY_DEFAULT,
                                      ctypes.c_void_p(stream)),
             "cudaMemcpyAsync",
+        )
+
+    held_gil = True
+
+    def memcpy_async_held(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        self._check(
+            self.lib_held.cudaMemcpyAsync(ctypes.c_void_p(dst), ctypes.c_void_p(src),
+                                          nbytes, CUDA_MEMCPY_DEFAULT,
+                                          ctypes.c_void_p(stream)),
+            "cudaMemcpyAsync",
+        )
+
+    def memcpy2d_async_held(self, dst: int, dpitch: int, src: int, spitch: int,
+                            width: int, height: int, stream: int) -> None:
+        self._check(
+            self.lib_held.cudaMemcpy2DAsync(ctypes.c_void_p(dst), dpitch,
+                                            ctypes.c_void_p(src), spitch,
+                                            width, height, CUDA_MEMCPY_DEFAULT,
+                                            ctypes.c_void_p(stream)),
+            "cudaMemcpy2DAsync",
         )
 
     def memcpy2d_async(self, dst: int, dpitch: int, src: int, spitch: int,

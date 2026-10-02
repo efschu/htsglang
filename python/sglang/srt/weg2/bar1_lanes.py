@@ -427,6 +427,10 @@ COPY_SM = "sm"
 #: and pointer probes are built for the whole tag before the first credit.
 ENV_COLLECT_LAG = "SGLANG_WEG2_BAR1_COLLECT_LAG"
 ENV_COLLECT_PREPLAN = "SGLANG_WEG2_BAR1_COLLECT_PREPLAN"
+#: FLIP-LEGS 02.10.: the collector's copy-out (own window -> own tensors, both
+#: device memory) is issued through the GIL-holding entry points
+#: (DeviceOps.memcpy_async_held). Unset = on; 0/false/no/off = CDLL as before.
+ENV_COLLECT_HOLD_GIL = "SGLANG_WEG2_BAR1_COLLECT_HOLD_GIL"
 _SEQ_MARK = "\x00seq\x00"
 
 
@@ -441,6 +445,28 @@ def collect_lag_on(env: Optional[_Map[str, str]] = None) -> bool:
 
 def collect_preplan_on(env: Optional[_Map[str, str]] = None) -> bool:
     return _env_on(ENV_COLLECT_PREPLAN, env)
+
+
+def collect_hold_gil_on(env: Optional[_Map[str, str]] = None) -> bool:
+    return _env_on(ENV_COLLECT_HOLD_GIL, env)
+
+
+def collect_copiers(ops, env: Optional[_Map[str, str]] = None):
+    """FLIP-LEGS 02.10.: (memcpy, memcpy2d, mode) for the collector's copy-out.
+
+    The copy-out reads the collector's OWN BAR1 window and writes its OWN
+    tensors -- device to device on one card, a queue-and-return call. Issued
+    through ``CDLL`` every call drops the GIL and waits to win it back behind
+    the rank's other Python threads (the lanes, the scheduler loop): measured
+    ~0.9 ms per call with one busy thread and ~4 ms with three, against
+    ~1 us held. N4p/N4q collect issue_ms 240-490 ms per lane per flip on the
+    5090 rank, 350-490 ms on every rank in the slow P->D flip (N4q epoch 8),
+    while the depositors sat 1.1-1.8 s in credit_ms. ``mode`` names the path
+    on the lane-time line (``issue_gil=held|released``)."""
+    held = bool(getattr(ops, "held_gil", False)) and collect_hold_gil_on(env)
+    if held:
+        return ops.memcpy_async_held, ops.memcpy2d_async_held, "held"
+    return ops.memcpy_async, ops.memcpy2d_async, "released"
 
 
 def parallel_copy_on() -> bool:
@@ -1425,8 +1451,10 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     # window (local D2D) and stays on memcpy.
     if role == "src":
         cmode, copier, cwhy = deposit_copy_mode(ops, device)
+        out_cp, out_cp2d, gil_mode = ops.memcpy_async, ops.memcpy2d_async, ""
     else:
         cmode, copier, cwhy = COPY_SERIAL, None, ""
+        out_cp, out_cp2d, gil_mode = collect_copiers(ops)
     cblocks = sm_blocks() if copier is not None else 0
     slow = 0          # this tag's bytes that could not take the 16-B SM path
     t0 = time.perf_counter()
@@ -1638,9 +1666,9 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
             if pre is not None:
                 for kind, dst, soff, a, b, c in pre[g]:
                     if kind == tp.FLAT:
-                        ops.memcpy_async(dst, sbase + soff, a, stream)
+                        out_cp(dst, sbase + soff, a, stream)
                     else:
-                        ops.memcpy2d_async(dst, a, sbase + soff, b, b, c, stream)
+                        out_cp2d(dst, a, sbase + soff, b, b, c, stream)
                 clk.issue += time.perf_counter() - ti
                 if pre_why and g == len(pre) - 1:
                     # the refused piece's batch: everything before it is out,
@@ -1669,10 +1697,10 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 if _why:
                     return f"bar1 seq={seq} batch {g}: {_why}"
                 if piece.kind == tp.FLAT:
-                    ops.memcpy_async(dst, src, int(piece.nbytes), stream)
+                    out_cp(dst, src, int(piece.nbytes), stream)
                 else:
-                    ops.memcpy2d_async(dst, int(piece.dpitch), src, int(piece.run_bytes),
-                                       int(piece.run_bytes), int(piece.rows), stream)
+                    out_cp2d(dst, int(piece.dpitch), src, int(piece.run_bytes),
+                             int(piece.run_bytes), int(piece.rows), stream)
             clk.issue += time.perf_counter() - ti
             if g >= lag:
                 _finish(g - lag)
@@ -1728,7 +1756,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"wait_ms={clk.credit * 1000:.0f} copy_sync_ms={clk.sync * 1000:.0f} "
         f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
         f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
-        f"lag={lag} prep_ms={prep_s * 1000:.0f}")
+        f"lag={lag} prep_ms={prep_s * 1000:.0f}"
+        + (f" issue_gil={gil_mode}" if gil_mode else ""))
     return ""
 
 
