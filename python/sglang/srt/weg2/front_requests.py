@@ -432,6 +432,9 @@ class RequestBook:
             "rid": row["rid"], "session_id": row.get("sess"), "turn": row.get("turn"), "via": via,
             "stream": row.get("stream"), "status": status,
             "arrival_ts": _r3(row["arrival_ts"]), "first_token_ts": _r3(ft), "end_ts": _r3(end),
+            # DASH-FIELDS (02.10.): P's leg 1 on its own clock (dispatch and answer), so a
+            # reader attributes the P prefill of this rid to its P phase exactly
+            "p_leg1_dispatch_ts": _r3(row.get("leg1_dispatch_ts")), "p_leg1_end_ts": _r3(row.get("leg1_end_ts")),
             "ttft_ms": t.get("ttft_ms"), "queue_ms": t.get("queue_ms") if t else _ms(row["arrival_ts"], row.get("first_dispatch_ts")),
             "p_prefill_ms": t.get("p_prefill_ms"), "flip_wait_ms": t.get("flip_wait_ms"),
             "d_first_token_ms": t.get("d_first_token_ms"), "other_ms": t.get("other_ms"),

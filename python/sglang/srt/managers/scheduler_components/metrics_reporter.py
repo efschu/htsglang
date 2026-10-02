@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
+    Optional,
 )
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -340,6 +341,31 @@ class PrefillStats:
         )
 
 
+#: DASH-FIELDS (02.10.): requests named per flushed prefill chunk (rankstats prefill.last.ext)
+PREFILL_EXT_CAP = 8
+
+
+def prefill_ext(batch) -> Optional[list]:
+    """DASH-FIELDS (02.10., rigdash depth view): ``[[rid, start, end], ...]`` of the
+    requests in this prefill batch -- start = the prefix depth before the chunk
+    (``req.extend_range.start``, the #969 EXTENT start; else ``len(req.prefix_indices)``),
+    end = start + the tokens computed (``req.extend_input_len``). Host values only
+    (a tensor's ``len`` is its shape: no sync, no D2H); capped; None when unreadable."""
+    try:
+        out = []
+        for req in list(getattr(batch, "reqs", None) or ())[:PREFILL_EXT_CAP]:
+            er = getattr(req, "extend_range", None)
+            start = getattr(er, "start", None) if er is not None else None
+            if start is None:
+                pi = getattr(req, "prefix_indices", None)
+                start = len(pi) if pi is not None else 0
+            n = int(getattr(req, "extend_input_len", 0) or 0)
+            out.append([str(getattr(req, "rid", "")), int(start), int(start) + n])
+        return out
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the stats line
+        return None
+
+
 class RankPrefillLog:
     """Per-rank prefill visibility.
 
@@ -463,13 +489,18 @@ class RankPrefillLog:
             # whose own span was readable (the first one of a rank is not)
             "own_ms": 0.0, "compute_only_ms": 0.0, "own_n": 0,
             "last": None,
+            # DASH-FIELDS: [[rid, start, end], ...] of the NEWEST prefill chunk (timed or not);
+            # the timed flush also writes it into last["ext"] (its folded chunks, cap 8)
+            "last_ext": None,
         }
 
-    def _cum_untimed(self, new_tokens: int, cached_tokens: int) -> None:
+    def _cum_untimed(self, new_tokens: int, cached_tokens: int, ext=None) -> None:
         c = self.cum
         c["chunks"] += 1
         c["new_tokens"] += int(new_tokens or 0)
         c["cached_tokens"] += int(cached_tokens or 0)
+        if ext is not None:
+            c["last_ext"] = list(ext)[:PREFILL_EXT_CAP]
 
     @property
     def has_pending(self) -> bool:
@@ -499,10 +530,11 @@ class RankPrefillLog:
         cached_tokens: int,
         timed: bool,
         graphed: bool = False,
+        ext: Optional[list] = None,
     ) -> None:
         if timed and self.timer is not None and not self.pairing_refused:
             self._pending.append(
-                (new_tokens, cached_tokens, graphed, self.bubble.take_pending())
+                (new_tokens, cached_tokens, graphed, self.bubble.take_pending(), ext)
             )
         else:
             logger.info(
@@ -510,7 +542,7 @@ class RankPrefillLog:
                 new_tokens,
                 cached_tokens,
             )
-            self._cum_untimed(new_tokens, cached_tokens)
+            self._cum_untimed(new_tokens, cached_tokens, ext)
 
     def _drain_untimed(self) -> None:
         """Emit the queued records without a duration, and drop the durations.
@@ -521,13 +553,13 @@ class RankPrefillLog:
         """
         self._durations.clear()
         while self._pending:
-            new_tokens, cached_tokens, _graphed, _bubble = self._pending.popleft()
+            new_tokens, cached_tokens, _graphed, _bubble, *_ext = self._pending.popleft()
             logger.info(
                 "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
                 new_tokens,
                 cached_tokens,
             )
-            self._cum_untimed(new_tokens, cached_tokens)
+            self._cum_untimed(new_tokens, cached_tokens, _ext[0] if _ext else None)
 
     def _refuse_pairing(self, skew: int) -> None:
         """Announce once, then stop attaching durations on this rank.
@@ -590,8 +622,14 @@ class RankPrefillLog:
         # FEHLT 7: the folded chunks' own spans (None once one is unreadable)
         own_s = 0.0
         own_wait_s = 0.0
+        ext_all: Optional[list] = []  # DASH-FIELDS: the folded chunks' [[rid, start, end]]
         for _ in range(k):
-            n, c, graphed, bub = self._pending.popleft()
+            n, c, graphed, bub, *_ext = self._pending.popleft()
+            if ext_all is not None:
+                if _ext and _ext[0] is not None:
+                    ext_all.extend(_ext[0])
+                else:
+                    ext_all = None
             if bub is not None:
                 bubble_ms += bub[0]
                 bubble_mb = bub[1]
@@ -706,7 +744,10 @@ class RankPrefillLog:
                      "compute_ms": None if compute_ms is None else round(compute_ms, 1),
                      "own_ms": None if own_ms is None else round(own_ms, 1),
                      "behind_prev_ms": None if own_ms is None else round(max(gpu_s * 1000.0 - own_ms, 0.0), 1),
-                     "compute_only_ms": None if compute_only_ms is None else round(compute_only_ms, 1)}
+                     "compute_only_ms": None if compute_only_ms is None else round(compute_only_ms, 1),
+                     "ext": None if ext_all is None else ext_all[:PREFILL_EXT_CAP]}
+        if ext_all is not None:
+            c["last_ext"] = ext_all[:PREFILL_EXT_CAP]
         if split_known:
             # Advanced only for a reading a consumer may legitimately count.
             # A graph-covered flush leaves the sequence where it was, so the
@@ -1296,6 +1337,7 @@ class SchedulerMetricsReporter:
                 and batch.forward_mode.is_plain_prefill()
             ),
             graphed=can_run_cuda_graph,
+            ext=prefill_ext(batch),  # DASH-FIELDS: host values of batch.reqs, after the forward
         )
         self.rank_prefill_log.flush()
         # #1241: the decode half is drained at the same three sites the
