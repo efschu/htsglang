@@ -515,10 +515,35 @@ def test_f22_early_read_keeps_the_keys_while_the_read_is_still_short(env):
     assert os.path.exists(ho.path(HELD)) and _cc.WEG2_HANDOFF_PAGE_KEYS.get(HELD) == ["hA"]
 
 
-def test_f22_switch_off_reads_at_the_release_as_before(env):
-    """Off (the default until the first series), and the 27B's D the same:
-    the legs' start issues nothing, the release reads as on 895559fed2."""
+def test_red_pdflip_f22_default_on_reads_beside_the_legs(env):
+    """27B P->D nachlauf (N3u 1002_072908, desk/27b-l15-10s4-1002 @ 6dd8d7e68c):
+    the switch unset, the 27B's D issued every hold read only at the release
+    AFTER the legs and the kv resume (WEG2-WAKE-TAIL read_early=0 on 19/19
+    wakes; HOLD-RELEASE after-reply ms p50 330, then the reads queued 0.6-2.1 s;
+    #1471 SETTLE held_after_wake_s p50 1.4 s; WEG2-WAKE-COHORT
+    wake_to_last_decode_ms p50 2.49 s). NF reads beside its legs since 09300726
+    (60+ boots, nf-int4.env:340; wake_to_last_decode_ms 476-579 ms). The
+    switch's own comment says "model-neutral, then default on": the default
+    is on. RED on 6dd8d7e68c (EnvBool(False))."""
     env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    reads = []
+    tree = _Tree()
+    s = _wake_sched(tree, reads)
+    a = _req(PARKED)
+    park_l3.defer_hold_read(s, a)
+    s.weg2_dormant_hold = [a]
+    assert park_l3.early_enabled() is True
+    assert park_l3.issue_reads_at_wake_begin(s) == [a] and reads == [PARKED]
+    tree.ongoing_prefetch.clear()
+    assert Scheduler._weg2_release_dormant_hold(s) == 1
+    assert reads == [PARKED], "the release issues no second read"
+    assert s.weg2_post_wake_settle == []
+
+
+def test_f22_switch_off_reads_at_the_release_as_before(env):
+    """Off (=0, the pre-default form): the legs' start issues nothing, the
+    release reads as on 895559fed2."""
+    env.mp.setenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", "0")
     reads = []
     tree = _Tree()
     s = _wake_sched(tree, reads)
