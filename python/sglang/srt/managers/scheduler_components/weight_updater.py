@@ -633,6 +633,9 @@ class SchedulerWeightUpdaterManager:
     #: head, so it never survives into a wake that did not mark it), acted
     #: on by :meth:`_l15_wake_act`, folded into the fallback on any failure.
     _l15_wake_refill: bool = False
+    # L15-FIX-CHECK-FALLBACK: refused wake sample checks turned into a
+    # group-uniform fallback (never a raise that kills D).
+    _l15_check_refusals: int = 0
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -7635,8 +7638,24 @@ class SchedulerWeightUpdaterManager:
         one decide() collective carrying (ok, bad, missing)."""
         if not wake_on:
             return None
-        return self._l15_decide_wake_verdict(
-            wake_on, fp, self._l15_wake_sample_check(), epoch=epoch)
+        # L15-FIX-CHECK-FALLBACK (N3r 06:31:42Z): decide() raises
+        # L15CheckRefused from the SAME gathered vote list on EVERY rank, so
+        # catching it HERE is group-uniform. A refused check must never kill
+        # D (it did: W29 -> W17); the hold is simply not trusted -> verdict
+        # "fallback", the act drops it and the plain restore runs. Only the
+        # refusal is caught -- a failing collective still propagates.
+        from sglang.srt.weg2.l15_wake_check import L15CheckRefused
+
+        try:
+            return self._l15_decide_wake_verdict(
+                wake_on, fp, self._l15_wake_sample_check(), epoch=epoch)
+        except L15CheckRefused as exc:
+            self._l15_check_refusals = int(
+                getattr(self, "_l15_check_refusals", 0) or 0) + 1
+            logger.warning("L15-CHECK FALLBACK n=%d (%s) -- the hold is "
+                           "dropped, plain restore", self._l15_check_refusals,
+                           exc)
+            return "fallback"
 
     def _l15_wake_act(self, sched, verdict: str, *, group_ok: bool,
                       master_on: bool) -> int:

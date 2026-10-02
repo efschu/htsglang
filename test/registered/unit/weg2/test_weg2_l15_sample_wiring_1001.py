@@ -173,8 +173,9 @@ def test_sample_check_raise_votes_all_bad_gather_still_runs(monkeypatch):
     ok, bad, missing = fs._l15_wake_sample_check()
     assert ok == 0 and bad > 0
     assert scratch.freed == 1, "scratch freed even on the failing path"
-    with pytest.raises(l15_wake_check.L15CheckRefused):
-        fs._l15_wake_check_and_decide(True, 7, epoch=9)
+    # L15-FIX-CHECK-FALLBACK (N3r): the refusal no longer escapes -- every
+    # rank gets the same "fallback" verdict instead of an exception.
+    assert fs._l15_wake_check_and_decide(True, 7, epoch=9) == "fallback"
     assert len(calls) == 1, "one collective per rank, even after the raise"
 
 
