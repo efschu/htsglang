@@ -107,10 +107,12 @@ def _pconst(name: str, profile: Optional[str] = None):
 # Task #58: the arming variable's name comes from the module that READS it, so
 # the publisher and the reader cannot drift into two spellings of one key.
 from sglang.srt.weg2.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
+from sglang.srt.weg2 import topology as _topo
 from sglang.srt.weg2 import (
     checkpoint_census,
     corridor_budget,
     host_ledger,
+    card_identity,
     ring_table,
     seam_digest,
     weight_exchange,
@@ -266,6 +268,16 @@ CORRIDOR_MIB = 1024 + D_AWAKE_OVERSHOOT_MIB
 #: first sleep by the front.  Plus D's open BAR1 windows (deviation above).
 DC_EXPECT_5090_MIB = 1848
 DC_EXPECT_3080_MIB = 1442
+#: HW-GENERIC 1002: the two expectations above BY CALIBRATION CLASS
+#: (weg2/card_identity.py) -- the selector, so no reader picks one by a name
+#: substring. A class absent here has no expectation: printed UNCALIBRATED.
+DC_EXPECT_MIB_BY_CLASS = {"RTX5090": DC_EXPECT_5090_MIB, "RTX3080": DC_EXPECT_3080_MIB}
+
+
+def dc_expect_mib(card) -> Optional[int]:
+    """The spec-1.6 dormant-residue EXPECTATION of ``card``'s calibration
+    class, or None (uncalibrated class: no expectation, never the 3080's)."""
+    return DC_EXPECT_MIB_BY_CLASS.get(card_identity.calibration_class(card) or "")
 #: MEASURED on boot weg2ls1b2 (2026-09-07 07:11:55-58Z, NVML per-process at
 #: group D's first sleep, tags kv_cache+weights, NEXTN draft + TP decode
 #: graphs resident): D_c(D) = 2228 MiB on the 5090, 1922 MiB on each 3080 --
@@ -679,19 +691,32 @@ def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     """
     name = str(getattr(card, "name", ""))
     xchg = str(weight_source) == WEIGHT_SOURCE_EXCHANGE
-    # UNIFY S3: the published profile's row (weg2/form.py), not the 27B alias.
-    xchg_triple = _pconst("DC_MEASURED_D_XCHG_MIB")
-    if "5090" in name:
-        return xchg_triple[1] if xchg else _pconst("DC_MEASURED_D_5090_MIB")
-    if "3080" in name:
-        return xchg_triple[0] if xchg else _pconst("DC_MEASURED_D_3080_MIB")
+    # HW-GENERIC 1002: selected by CALIBRATION CLASS (model + arch + VRAM
+    # tier, weg2/card_identity.py), never by a name substring -- a 10 GB RTX
+    # 3080 used to borrow the 20 GB card's residue here.
+    cls = card_identity.calibration_class(card)
+    sel = DC_MEASURED_D_BY_CLASS.get(cls or "")
+    if sel is not None:
+        # UNIFY S3: the published profile's row (weg2/form.py), not the 27B alias.
+        const_name, xchg_index = sel
+        return _pconst("DC_MEASURED_D_XCHG_MIB")[xchg_index] if xchg else _pconst(const_name)
     raise Weg2LaunchRefused(
-        f"W19 dormant-residue reserve: board {name!r} (nvml"
-        f"{getattr(card, 'nvml_index', '?')}) is named by neither DC_MEASURED_D_* "
-        "nor DC_MEASURED_D_XCHG_* -- both triples are measurements of this rig's "
-        "1x5090 + 2x3080 inventory, and a third model's dormant residue is not a "
-        "property either of them has.  Measure it, do not borrow it."
+        f"W19 dormant-residue reserve ({card_identity.CODE_UNCALIBRATED}): board {name!r} (nvml"
+        f"{getattr(card, 'nvml_index', '?')}, {card_identity.card_key(card)}) belongs to no "
+        "calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: "
+        + ", ".join(sorted(DC_MEASURED_D_BY_CLASS)) + ") -- a third card's dormant residue "
+        "is not a property either of them has.  Measure it, do not borrow it."
     )
+
+
+#: HW-GENERIC 1002: calibration class -> (the record constant of the serving
+#: form, the index into DC_MEASURED_D_XCHG_MIB of the exchange form). The
+#: xchg triple is in NVML order of the reference rig (nvml0 3080, nvml1 5090,
+#: nvml2 3080): the 5090 reads index 1, both 3080s read index 0 -- as before.
+DC_MEASURED_D_BY_CLASS = {
+    "RTX5090": ("DC_MEASURED_D_5090_MIB", 1),
+    "RTX3080": ("DC_MEASURED_D_3080_MIB", 0),
+}
 #: Flags that only make sense while barlink owns the group's collectives.
 #: Each takes a value except the bare --barlink itself.
 BARLINK_FLAGS_WITH_VALUE = (
@@ -1573,9 +1598,34 @@ _P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None, "
 #: model is used as calibrated (spec byte-identical); only warning lines added.
 P_POWER_SCALE_DEFAULT = "off"
 P_POWER_SCALE_LAWS = ("off", "linear", "power")
-#: The card class of each P stage: PP0 on the 5090, PP1/PP2 on the 3080s
-#: (order_cards; the builtin/fit models name no cards).
-P_STAGE_CARD_CLASSES = ("RTX5090", "RTX3080", "RTX3080")
+#: The card class of each P stage OF THE CALIBRATION RIG the builtin chunk
+#: model was fitted on (PP0 on the 5090, PP1/PP2 on the 3080s) -- a property
+#: of that RECORD, not of the live rig. HW-GENERIC 1002: the live stages'
+#: classes come from :func:`p_stage_live_classes` (order_cards + card
+#: identity); a stage whose live class differs from its calibration class is
+#: named by :func:`p_stage_class_mismatch_lines`.
+P_STAGE_CARD_CLASSES = card_identity.REFERENCE_INVENTORY
+
+
+def p_stage_live_classes(stages: int) -> List[Optional[str]]:
+    """The live calibration-class label of each P stage (``order_cards``
+    order); ``None`` per stage when NVML cannot answer (never refuses)."""
+    try:
+        cards = order_cards(resolve_cards())
+    except Exception:  # noqa: BLE001 - a label, never a boot blocker
+        return [None] * stages
+    return [card_identity.class_label(cards[r]) if r < len(cards) else None for r in range(stages)]
+
+
+def p_stage_class_mismatch_lines(stages: int, live: Optional[Sequence[Optional[str]]] = None) -> List[str]:
+    """One line per P stage whose live card class is not the class the
+    builtin/fitted chunk model was calibrated on (the power comparison of
+    row 27 is then between different cards: UNCALIBRATED, named)."""
+    live = list(p_stage_live_classes(stages) if live is None else live)
+    cal = list(P_STAGE_CARD_CLASSES[:stages]) + [P_STAGE_CARD_CLASSES[-1]] * max(0, stages - 3)
+    return [f"P-STAGE-CLASS PP{r}: live {lv} vs calibration {cv} -- the chunk model's timings and "
+            f"power limit are a measurement of {cv}, not of this card ({card_identity.CODE_UNCALIBRATED})"
+            for r, (lv, cv) in enumerate(zip(live, cal)) if lv is not None and lv != cv]
 
 
 def p_chunk_model_power_limits(src: str, stages: int) -> Tuple[Optional[List[Optional[float]]], str]:
@@ -1635,7 +1685,7 @@ def p_stage_power_current(stages: int) -> Tuple[List[Optional[float]], List[str]
         c = cards[r] if r < len(cards) else None
         w = cur.get(c.uuid, (None, ""))[0] if c is not None else None
         vals.append(None if w is None else float(w))
-        labels.append(f"PP{r}" + (f"(nvml{c.nvml_index} {_pl.card_class(c.name)})" if c is not None else ""))
+        labels.append(f"PP{r}" + (f"(nvml{c.nvml_index} {card_identity.class_label(c)})" if c is not None else ""))
     return vals, labels
 
 
@@ -1655,6 +1705,10 @@ def apply_p_power_check(ns, models, source: str, src: str):
     cur, labels = p_stage_power_current(n)
     verdicts = _pl.check(labels, cal or [None] * n, cur, law, alpha)
     lines = _pl.verdict_lines("p-chunk-model", verdicts, law, alpha, cal_src)
+    # HW-GENERIC 1002: a stage on another card class than the model's
+    # calibration stage is named beside the power verdicts (empty on the
+    # reference rig).
+    lines = list(lines) + p_stage_class_mismatch_lines(n)
     _P_CHUNK["power_lines"] = tuple(lines)
     if not any(v.factor != 1.0 for v in verdicts):
         return models, source
@@ -4599,6 +4653,25 @@ CALIBRATION_PREFIX_TOKENS = 4096
 #: is what makes the optimum a FUNCTION of the design prefix rather than a
 #: constant, and it is cited to its record rather than written as a literal.
 ATTN_ANCHOR_MS = 400.0
+#: HW-GENERIC 1002: the calibration class ATTN_ANCHOR_MS was measured on.
+ATTN_ANCHOR_CARD_CLASS = "RTX3080"
+
+
+def attn_anchor_stage(cards: Sequence["Card"]) -> int:
+    """The first P stage whose card is of :data:`ATTN_ANCHOR_CARD_CLASS`.
+    No such card: refused BY NAME (HW-UNCALIBRATED) -- the anchor is a
+    measurement of that class, and pricing another card's attention layer
+    with it would be a borrow."""
+    for i, c in enumerate(cards):
+        if card_identity.calibration_class(c) == ATTN_ANCHOR_CARD_CLASS:
+            return i
+    raise Weg2LaunchRefused(
+        f"{card_identity.CODE_UNCALIBRATED}: the P-cut deep attention anchor (--pp-cut-attn-anchor-ms, "
+        f"{ATTN_ANCHOR_MS:g} ms/layer) was measured on class {ATTN_ANCHOR_CARD_CLASS}; no P stage "
+        "carries that class (" + ", ".join(card_identity.class_label(c) for c in cards)
+        + "). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed.")
+
+
 ATTN_ANCHOR_PREFIX_TOKENS = 262144
 
 #: DESIGN DEPTH FALLBACK. When no boot log carries a prefill census the design
@@ -5423,6 +5496,15 @@ class Card:
     #: it -- that the awake budget omits this term is a SEPARATE open finding
     #: (weg2/refute/lens2.md sec 3), deliberately not changed here.
     reserved_mib: int = 0
+    #: HW-GENERIC 1002: the NVML properties identity and order are decided on
+    #: (weg2/card_identity.py). ``None`` = NVML did not report it; a card
+    #: without ``cc`` never passes ``resolve_cards`` (arch gate, HW-ARCH).
+    cc: Optional[Tuple[int, int]] = None
+    bar1_total_mib: Optional[int] = None
+    pcie_max_gen: Optional[int] = None
+    pcie_max_width: Optional[int] = None
+    mem_bus_width_bits: Optional[int] = None
+    mem_clock_max_mhz: Optional[int] = None
 
 
 @dataclass
@@ -5538,10 +5620,25 @@ def resolve_cards() -> List[Card]:
     carve-out term, which this launcher now needs, so the copy is gone rather
     than grown.
     """
-    return [
-        Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib)
+    cards = [
+        Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib,
+             cc=getattr(d, "compute_capability", None),
+             bar1_total_mib=(None if getattr(d, "bar1_total_bytes", None) is None
+                             else int(d.bar1_total_bytes) // (1 << 20)),
+             pcie_max_gen=getattr(d, "pcie_max_gen", None),
+             pcie_max_width=getattr(d, "pcie_max_width", None),
+             mem_bus_width_bits=getattr(d, "mem_bus_width_bits", None),
+             mem_clock_max_mhz=getattr(d, "mem_clock_max_mhz", None))
         for d in nvml_registry.list_devices()
     ]
+    # HW-GENERIC 1002: THE arch gate, once, at the one card-list producer --
+    # every boot path (main, p_stage_power_current, xchg_census) reads its
+    # cards here. sm_86 / sm_120 only; anything else refused BY NAME.
+    try:
+        card_identity.arch_gate(cards)
+    except card_identity.CardInventoryRefused as exc:
+        raise Weg2LaunchRefused(str(exc)) from exc
+    return cards
 
 
 def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
@@ -5567,16 +5664,122 @@ def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
         log(_pl.boot_line({"launcher_card": i}, p, why or "card not in the NVML power snapshot"))
 
 
-def order_cards(cards: List[Card]) -> List[Card]:
-    """CUDA ordinal order: the 5090 first (rank 0 / PP0 / TP0), then the 3080s
-    by NVML index.  Never a fixed index: resolved by name per launch."""
-    big = [c for c in cards if "5090" in c.name]
-    small = sorted([c for c in cards if "3080" in c.name], key=lambda c: c.nvml_index)
-    if len(big) != 1 or len(small) != 2:
-        raise Weg2LaunchRefused(
-            f"NVML inventory is not 1x5090 + 2x3080: {[(c.nvml_index, c.name) for c in cards]}"
-        )
-    return [big[0], small[0], small[1]]
+#: HW-GENERIC 1002: the launcher flags (dest names) and the --extra-p/-d,
+#: --env-p/-d tokens that carry a POSITIONAL per-card vector (ordinal i =
+#: the i-th card of order_cards). Each is a measurement or a pin of the
+#: inventory the profile was written for (HW-KOPPLUNG-AUDIT-1002.md 2).
+POSITIONAL_VECTOR_FLAGS = (
+    "d_foreign_context_mib", "d_nontorch_mib", "pp_stage_ratio", "pp_attn_stage_ratio",
+    "pp_cut_expert_device_fraction", "pp_cut_expert_lru_rows", "user_reserve_mib",
+    "d_reserve_mib", "pp_cut_reserve_mib", "d_reshard_presets", "p_barlink_bar1_window_mib",
+)
+POSITIONAL_VECTOR_TOKENS = (
+    "--rank-role", "--rank-tp-ratio", "--rank-moe-ratio", "--rank-moe-resident-fraction",
+    "--rank-user-reserve-mib", "--rank-gpu-memory-mib", "--pp-stage-ratio",
+    "--pp-attn-stage-ratio", "SGLANG_MOE_SCRATCH_SLOTS=", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION=",
+    "SGLANG_WEG2_L15_MIB=", "SGLANG_WEG2_EXTEND_TRIM_MIB=",
+)
+
+
+def positional_inputs_present(ns) -> List[str]:
+    """The positional per-card inputs this launch carries (flag dests set to
+    something other than their parser default + vector tokens found in
+    --extra-p/-d and --env-p/-d)."""
+    out: List[str] = []
+    defaults = build_parser().parse_args(["--tree", "/", "--tag", "x"])
+    for dest in POSITIONAL_VECTOR_FLAGS:
+        v = getattr(ns, dest, None)
+        if v not in (None, "", [], ()) and v != getattr(defaults, dest, None):
+            out.append("--" + dest.replace("_", "-"))
+    blob = " ".join(str(getattr(ns, k, "") or "") for k in ("extra_p", "extra_d", "env_p", "env_d"))
+    for tok in POSITIONAL_VECTOR_TOKENS:
+        if tok in blob and tok.rstrip("=") not in out:
+            out.append(tok.rstrip("="))
+    env_l15 = os.environ.get("SGLANG_WEG2_L15_MIB", "")
+    if env_l15 and env_l15.strip().lower() != "auto" and "SGLANG_WEG2_L15_MIB" not in out:
+        out.append("SGLANG_WEG2_L15_MIB")
+    return out
+
+
+def records_inventory(profile: str) -> Tuple[Tuple[str, ...], str]:
+    """(the inventory the profile's MEASURED records were taken on, its source)."""
+    from sglang.srt.weg2 import profile_records as _pr
+
+    inv = _pr.inventory_of(str(profile))
+    if inv is not None:
+        return inv, f"profile_records_data/{profile}.json inventory"
+    return card_identity.REFERENCE_INVENTORY, (
+        f"profile {profile!r} records declare no inventory: every record of this tree "
+        "was measured on the reference rig")
+
+
+def calibrated_inventory(ns) -> Tuple[Tuple[str, ...], str]:
+    """(the inventory the profile's positional VECTORS (argv/env) were
+    measured on, its source): ``--profile-inventory``, else the records'."""
+    explicit = card_identity.parse_inventory(getattr(ns, "profile_inventory", ""))
+    if explicit is not None:
+        return explicit, "--profile-inventory"
+    prof = getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE
+    return records_inventory(str(prof))
+
+
+def inventory_check_line(ns, cards: Sequence["Card"]) -> str:
+    """The HW-INVENTORY line; raises Weg2LaunchRefused (HW-UNCALIBRATED) when
+    the live ordered inventory is not the one the profile's positional
+    measured RECORDS were taken on, or not the one its positional VECTORS
+    (argv/env, ``--profile-inventory``) were written for. Two checks: a
+    profile that names a foreign inventory does not make the reference
+    rig's records hold there."""
+    from sglang.srt.weg2 import profile_records as _pr
+
+    prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
+    rec_inv, rec_src = records_inventory(prof)
+    vec_inv, vec_src = calibrated_inventory(ns)
+    rec_what = sorted({r.name for r in _pr.records(prof) if _pr.is_positional(r.value, len(rec_inv))})
+    vec_what = positional_inputs_present(ns)
+    msgs = []
+    if vec_src == "--profile-inventory":
+        m = card_identity.uncalibrated_message(cards, vec_inv, vec_what,
+                                               f"profile {prof!r} vectors ({vec_src})")
+        if m is not None:
+            msgs.append(m)
+        m = card_identity.uncalibrated_message(cards, rec_inv, rec_what,
+                                               f"profile {prof!r} measured records ({rec_src})")
+        if m is not None:
+            msgs.append(m)
+    else:
+        m = card_identity.uncalibrated_message(cards, rec_inv, rec_what + vec_what,
+                                               f"profile {prof!r} ({rec_src})")
+        if m is not None:
+            msgs.append(m)
+    if msgs:
+        raise Weg2LaunchRefused(" || ".join(msgs))
+    return ("HW-INVENTORY " + "; ".join(f"ordinal {i}: {card_identity.describe(c)}"
+                                        for i, c in enumerate(cards))
+            + f" -- calibrated inventory [{','.join(rec_inv)}] ({rec_src}"
+            + (f"; vectors: {vec_src}" if vec_src == "--profile-inventory" else "") + ") MATCH")
+
+
+#: HW-GENERIC 1002 Stage 1: the release topology is P = PP3 / D = TP3 (argv
+#: below, Form A from the profile), so a launch needs exactly this many cards.
+#: Stage 2 derives it from the inventory (HW-GENERISCH-SM86-SM120-1002.md).
+WEG2_CARD_COUNT = 3
+
+
+def order_cards(cards: List[Card], expect_count: Optional[int] = WEG2_CARD_COUNT) -> List[Card]:
+    """CUDA ordinal order (rank 0 / PP0 / TP0 first), from NVML PROPERTIES
+    (weg2/card_identity.py): biggest NVML total first, then nameplate DRAM
+    bandwidth, then NVML index. On the reference rig that is the 5090 first,
+    then the 3080s by NVML index -- the order the name-based predecessor
+    produced, byte for byte. Never a fixed index, never a name substring.
+
+    Refuses BY NAME (HW-COUNT) an inventory of another size than
+    ``expect_count`` (the topology is fixed at PP3/TP3 in Stage 1). The arch
+    gate (HW-ARCH) runs once in :func:`resolve_cards`."""
+    try:
+        return card_identity.order_cards(cards, expect_count, gate=False)
+    except card_identity.CardInventoryRefused as exc:
+        raise Weg2LaunchRefused(str(exc)) from exc
 
 
 def log_power_limits(state: BootState, cards: List[Card], log, *,
@@ -7743,7 +7946,9 @@ def common_flags(
         # from the model path by default and overridable by flag; never a
         # constant, because a constant here is a silent identity swap.
         "--served-model-name", served_model_name(model),
-        "--rank-gpu-id", "0,1,2",
+        # HW-GENERIC 1002 S2 (enabling): one rank per card in order_cards
+        # order -- the topology's rank map, "0,1,2" on the N=3 release.
+        "--rank-gpu-id", _topo.rank_gpu_id_csv(WEG2_CARD_COUNT),
         "--skip-server-warmup",
         "--kv-cache-dtype", KV_CACHE_DTYPE,
         "--context-length", str(CONTEXT_LENGTH_TOKENS),
@@ -7955,7 +8160,9 @@ def argv_p(
         # the size of P's req_to_token_pool (R-13), which is why it is
         # resolved before the budget solve and printed with it.
         "--max-running-requests", str(p_bs),
-        "--tp-size", "1", "--pp-size", "3",
+        # HW-GENERIC 1002 S2 (enabling): P = PP<N> over every card (TP1);
+        # from the topology, "--pp-size 3" on the N=3 release.
+        "--tp-size", "1", "--pp-size", str(_topo.release_topology(WEG2_CARD_COUNT).p_pp),
         # #692 MICROBATCH DEPTH, group P only -- group D runs pp_size=1 and a
         # pipeline depth is meaningless there. STATED even at 0 so the argv is
         # an honest statement of what the boot runs, and published ONCE as a
@@ -8416,7 +8623,9 @@ def argv_d(
         # residency without the number appearing. The value follows the
         # overlap choice exactly -- it is not a second knob.
         "--mamba-radix-cache-strategy", "no_buffer" if disable_overlap else "extra_buffer",
-        "--tp-size", "3", "--pp-size", "1",
+        # HW-GENERIC 1002 S2 (enabling): D = TP<N> (PP1) over every card;
+        # from the topology, "--tp-size 3" on the N=3 release.
+        "--tp-size", str(_topo.release_topology(WEG2_CARD_COUNT).d_tp), "--pp-size", "1",
         # OVERLAP SCHEDULE ON for D -- by ABSENCE of the disable flag, which
         # is the only way to have it: there is no --enable-overlap-schedule.
         # Every gate that forces it off was checked against THIS argv and
@@ -13793,6 +14002,21 @@ def budget_charges_driver_carve(profile: Optional[str] = None) -> bool:
     return bool(getattr(row, "budget_charges_driver_carve", False))
 
 
+def driver_carve_charged(card, min_total_mib: int) -> bool:
+    """Is the driver carve booked on ``card`` (with the profile's carve switch on)?
+
+    The ``min_total_mib`` scope (27B b1 death) is a MEASURED decision about
+    the reference rig's classes: the 27B corridor pass was SATISFIED on the
+    20 GB RTX 3080s with their carve already in predicted_free, and bound on
+    the 5090. HW-GENERIC 1002: it therefore holds for those calibration
+    classes only; a card of any other class books its NVML-reported carve
+    (a measured, unallocatable term -- not a margin), because no measurement
+    says its corridor already absorbs it."""
+    if card_identity.calibration_class(card) is None:
+        return True
+    return int(card.total_mib) >= int(min_total_mib or 0)
+
+
 def driver_carve_min_total_mib(profile: Optional[str] = None) -> int:
     """The profile row's ``driver_carve_min_total_mib`` (27B b1 death): the
     carve is charged only on cards with at least this NVML total; 0 (and an
@@ -14006,7 +14230,7 @@ def budgets_from_dc(
         # 27B b1 death: a profile may scope the carve to its big cards
         # (driver_carve_min_total_mib; 0 = every card, the NF row).
         carve = (int(getattr(c, "reserved_mib", 0) or 0)
-                 if charge_driver_carve and int(c.total_mib) >= int(driver_carve_min_total_mib or 0) else 0)
+                 if charge_driver_carve and driver_carve_charged(c, driver_carve_min_total_mib) else 0)
         awake = int(rest) if rest is not None else 0
         b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake
         b = (b // 8) * 8
@@ -20243,9 +20467,11 @@ def solve_p_cut(
         )
 
     measured_attn = _pp_cut.attention_counts(families, incumbent)
-    anchor_stage = next(
-        (i for i, c in enumerate(cards) if "5090" not in c.name), len(cards) - 1
-    )
+    # HW-GENERIC 1002: the stage whose card is of the class the deep
+    # attention anchor (ATTN_ANCHOR_MS, "a 3080 ... 0.4 s per chunk") was
+    # measured on -- by calibration class, not "the first card that is not a
+    # 5090". On the reference rig that is stage 1, as before.
+    anchor_stage = attn_anchor_stage(cards)
     family_cost, family_prov = _pp_cut.family_costs_from_measurement(
         measured_ms_per_layer=ms,
         measured_counts=incumbent,
@@ -20828,6 +21054,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "WEG2-HOST-LEDGER ARM line's xchg_bounce= field). "
                          "Required with --prior-cushion-min-gib.")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--profile-inventory", default="",
+        help="HW-GENERIC 1002: the card inventory (calibration-class labels in card order, "
+             "weg2/card_identity.py, e.g. 'RTX5090,RTX3080,RTX3080') the profile's positional "
+             "vectors were measured on. Default: the inventory the profile's measured records "
+             "declare (profile_records_data/<profile>.json 'inventory'). A live inventory that "
+             "differs is refused BY NAME (HW-UNCALIBRATED) -- positional measurements of other "
+             "cards are never borrowed.")
     ap.add_argument("--debug-hold", choices=["none", "P", "D", "both"], default="none")
     # #1236: --store-min-gib IS DELETED. It was a FLOOR on how much of the host
     # RAM leftover the store tmpfs had to get, and there is no RAM leftover to
@@ -23237,6 +23471,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     refuse_if_front_unbindable(log, ns.front_host, PORT_FRONT, dry)
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
+    # HW-GENERIC 1002: the profile's positional records and vectors hold only
+    # for the inventory they were measured on -- checked once, here, before
+    # any of them is read. The reference rig passes silently-identically.
+    log(inventory_check_line(ns, cards))
     state.cards = [c.__dict__ for c in cards]
     record_card_power(state.cards, cards, log)
     if not dry:
@@ -25415,13 +25653,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dc_p.setdefault(c.uuid, 0)
     mem = nvml_memory(cards)
     for c in cards:
-        exp = DC_EXPECT_5090_MIB if "5090" in c.name else DC_EXPECT_3080_MIB
+        exp = dc_expect_mib(c)
+        _exp_txt = (f"expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
+                    f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; "
+                    if exp is not None else
+                    f"expectation UNCALIBRATED ({card_identity.card_key(c)}: no spec-1.6 class; ")
         log(
             f"WEG2-DC group=P nvml{c.nvml_index} {c.name}: measured {dc_p[c.uuid]} MiB per-process "
             f"(pids {sorted(pids_p)}) card used {mem[c.uuid].tenant_used_mib} MiB by processes "
             f"(instrument {mem[c.uuid].tenant_used_instrument}; card free {mem[c.uuid].free_mib} MiB allocatable, "
-            f"{mem[c.uuid].reserved_mib} MiB driver-reserved); expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
-            f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; the launcher derives D from the MEASUREMENT, record 1f B6)"
+            f"{mem[c.uuid].reserved_mib} MiB driver-reserved); " + _exp_txt
+            + "the launcher derives D from the MEASUREMENT, record 1f B6)"
         )
     state.dc_measured_p = dc_p
     # BOOTZEIT 3: the free-read journal's cut (P's first sleep is over here) and,

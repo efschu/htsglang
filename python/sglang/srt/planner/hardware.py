@@ -78,6 +78,13 @@ class GpuDescriptor:
     #: CUDA-order index of this card (the --rank-gpu-id/--base-gpu-id space);
     #: None when unbridged. Resolved through registry.nvml.IdentityMap.
     cuda_index: Optional[int] = None
+    #: Compute capability ``(major, minor)`` (HW-GENERIC 1002): for live specs
+    #: what NVML answered (``nvmlDeviceGetCudaComputeCapability`` via
+    #: ``registry.nvml.DeviceInfo``, matched by UUID); for manual/json specs
+    #: what the user declared. None when nothing answered -- never derived
+    #: from the name here (``planner.flags.gpu_cc`` owns the exact-name
+    #: catalogue fallback and names an unknown arch).
+    cc: Optional[Tuple[int, int]] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -248,6 +255,7 @@ def hardware_from_nvml() -> HardwareSpec:
                 uuid=c.get("uuid"),
                 pcie_gen=c.get("pcie_gen"),
                 pcie_width=c.get("pcie_width"),
+                cc=_cc_of(c),
             )
         )
     if not gpus:
@@ -255,6 +263,7 @@ def hardware_from_nvml() -> HardwareSpec:
             "The NVML/nvidia-smi inventory returned zero GPUs. Declare the "
             "hardware manually (--gpu 'NAME:TOTAL_MIB' per card)."
         )
+    gpus = _annotate_compute_capability(gpus)
     gpus, cuda_src = _annotate_cuda_indices(gpus)
     return HardwareSpec(
         gpus=tuple(gpus),
@@ -262,6 +271,71 @@ def hardware_from_nvml() -> HardwareSpec:
         host_ram_mib=_host_ram_mib(),
         cuda_index_source=cuda_src,
     )
+
+
+def _cc_of(rec) -> Optional[Tuple[int, int]]:
+    """A declared compute capability from a sampler/json record: ``cc`` as
+    ``[8, 6]`` / ``"8.6"`` / ``"sm86"``, or ``cc_major`` + ``cc_minor``; None
+    when the record carries none (or an unreadable one)."""
+    get = rec.get if isinstance(rec, dict) else (lambda k: getattr(rec, k, None))
+    major, minor = get("cc_major"), get("cc_minor")
+    if major is not None and minor is not None:
+        try:
+            return (int(major), int(minor))
+        except (TypeError, ValueError):
+            return None
+    for key in ("cc", "compute_capability", "compute_cap"):
+        cc = _parse_cc_text(get(key))
+        if cc is not None:
+            return cc
+    return None
+
+
+def _parse_cc_text(value) -> Optional[Tuple[int, int]]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (tuple, list)):
+        try:
+            return (int(value[0]), int(value[1])) if len(value) == 2 else None
+        except (TypeError, ValueError):
+            return None
+    text = str(value).strip().lower()
+    if "." in text:
+        major, _, minor = text.partition(".")
+        if major.isdigit() and minor.isdigit() and len(minor) == 1:
+            return (int(major), int(minor))
+        return None
+    text = text[2:].lstrip("_") if text.startswith("sm") else text
+    text = text.rstrip("af")
+    if text.isdigit() and len(text) >= 2:
+        major, minor = divmod(int(text), 10)
+        return (major, minor)
+    return None
+
+
+def _annotate_compute_capability(gpus):
+    """Attach the NVML compute capability to every live card that does not
+    carry one yet, matched by UUID against ``registry.nvml.list_devices()``
+    (``nvmlDeviceGetCudaComputeCapability``). Never by NVML index or name: a
+    card that cannot be matched keeps ``cc=None``. Any NVML failure leaves the
+    descriptors as they are."""
+    if all(g.cc is not None for g in gpus):
+        return gpus
+    try:
+        from sglang.srt.registry import nvml as _nvml
+
+        by_uuid = {
+            str(d.uuid): d.compute_capability for d in _nvml.list_devices()
+        }
+    except Exception:  # noqa: BLE001 - unanswered = None, never a guess
+        return gpus
+    out = []
+    for g in gpus:
+        cc = g.cc
+        if cc is None and g.uuid:
+            cc = by_uuid.get(str(g.uuid))
+        out.append(g if cc == g.cc else dataclasses.replace(g, cc=tuple(cc)))
+    return out
 
 
 def _annotate_cuda_indices(gpus):
@@ -293,9 +367,24 @@ def _annotate_cuda_indices(gpus):
 
 
 def parse_manual_gpu(text: str, index: int) -> GpuDescriptor:
-    """Parse one ``--gpu`` CLI item: ``NAME:TOTAL_MIB`` (e.g.
-    ``"RTX 5090:32607"``). A ``g``/``G`` suffix reads as GiB
-    (``"RTX 3080:20g"`` -> 20480 MiB)."""
+    """Parse one ``--gpu`` CLI item: ``NAME:TOTAL_MIB[:CC]`` (e.g.
+    ``"RTX 5090:32607"``, ``"RTX 3090:24576:sm86"``, ``"RTX A6000:48g:8.6"``).
+    A ``g``/``G`` suffix reads as GiB (``"RTX 3080:20g"`` -> 20480 MiB). The
+    optional third field declares the compute capability (HW-GENERIC 1002)."""
+    cc = None
+    head, sep3, last = text.rpartition(":")
+    # Only a third field SHAPED like a cc ('sm..', 'X.Y') is one; anything
+    # else keeps the old reading (the name may itself contain ':').
+    if sep3 and ":" in head and (
+        last.strip().lower().startswith("sm") or "." in last
+    ):
+        cc = _parse_cc_text(last)
+        if cc is None:
+            raise ValueError(
+                f"--gpu {text!r}: cannot parse the compute capability "
+                f"{last!r} (e.g. 'sm86', 'sm120', '8.6')."
+            )
+        text = head
     name, sep, mem = text.rpartition(":")
     if not sep or not name.strip():
         raise ValueError(
@@ -315,7 +404,7 @@ def parse_manual_gpu(text: str, index: int) -> GpuDescriptor:
         ) from e
     if total_mib <= 0:
         raise ValueError(f"--gpu {text!r}: VRAM must be positive.")
-    return GpuDescriptor(index=index, name=name.strip(), total_mib=total_mib)
+    return GpuDescriptor(index=index, name=name.strip(), total_mib=total_mib, cc=cc)
 
 
 def hardware_from_manual(items: Sequence[str]) -> HardwareSpec:
@@ -347,6 +436,7 @@ def hardware_from_json(path: str) -> HardwareSpec:
                     if g.get("cuda_index") is not None
                     else None
                 ),
+                cc=_cc_of(g),
             )
         )
     return HardwareSpec(
