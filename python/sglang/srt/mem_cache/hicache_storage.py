@@ -1071,6 +1071,25 @@ def audit_layout(root_dir: str, *, limit: int = 8) -> list:
 
 
 
+#: DP-NACHLAUF: the trace cap, read once (the env read moved off the hot path).
+_969G_CAP: Optional[int] = None
+
+#: DP-NACHLAUF 02.10. (N5m 5576ce0f16, D->P, weg2-8-9 72786 tokens: PP0's
+#: store probe queued 1270 ms before a 92-ms read; #969G counted 100k -> 200k
+#: key derivations inside it): the per-pool L3 presence and readability of the
+#: probe are answered per CHUNK of pages on first ask instead of for every
+#: KV page up front -- the trailing-pages rule (mamba: one anchor per ~2k
+#: tokens) asks a few dozen pages but paid ~61k key derivations per pool.
+#: Same answers per page. Unset = on; 0/false/no/off = the whole-span bulk.
+PROBE_CHUNKED_ENV = "SGLANG_HICACHE_PROBE_CHUNKED"
+PROBE_CHUNK_PAGES = 512
+
+
+def probe_chunked_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(PROBE_CHUNKED_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _969g_trace(direction: str, tag: str, stem: str) -> None:
     """#1065: one key-trace for BOTH funnels, so the sets are comparable.
 
@@ -1086,8 +1105,25 @@ def _969g_trace(direction: str, tag: str, stem: str) -> None:
     rather than going silent.
     """
     try:
+        # DP-NACHLAUF 02.10.: past the cap the probe only counts -- one int
+        # compare, no env read, no frame (N5m: 100k-200k derivations within the
+        # first P store probe after a D->P flip, each paying the env read).
+        global _969G_CAP
         _n = getattr(HiCacheFile, "_969g_n", 0) + 1
         HiCacheFile._969g_n = _n
+        if _969G_CAP is not None and _n > _969G_CAP:
+            _s = getattr(HiCacheFile, "_969g_suppressed", 0) + 1
+            HiCacheFile._969g_suppressed = _s
+            if _s == 1 or _s % 100000 == 0:
+                logger.warning(
+                    "#969G KEY TRACE CAPPED at %d lines; %d further key "
+                    "derivations SUPPRESSED so far. A set difference read off "
+                    "the printed lines is bounded by this number, not by the "
+                    "population.",
+                    _969G_CAP,
+                    _s,
+                )
+            return
         # Order point 2 (xsn123): 20000 lines per rank per boot landed in the
         # FIRST requests' seconds (PP1: 8151 lines in the second its second
         # chunk ran 3x slow, 1278 ms for 3616 tokens against 479 ms for
@@ -1095,6 +1131,7 @@ def _969g_trace(direction: str, tag: str, stem: str) -> None:
         # launches kernels. 64 lines keep the writer/lookup stem comparison
         # readable; SGLANG_HICACHE_KEY_TRACE_CAP raises it for a key hunt.
         _cap = int(envs.SGLANG_HICACHE_KEY_TRACE_CAP.get() or 0) or 64
+        _969G_CAP = _cap
         if _n <= _cap:
             import sys as _sys
 
@@ -4431,10 +4468,67 @@ class HiCacheFile(HiCacheStorage):
                     present = None
                 _rbulk[name] = present
                 return present
+            _chunked = probe_chunked_on()
+            _l3c: dict = {}
+            _rbc: dict = {}
+
+            def _l3_chunk(name: str, c: int):
+                """DP-NACHLAUF: the L3 presence of the pages of chunk ``c``."""
+                key = (name, c)
+                if key in _l3c:
+                    return _l3c[key]
+                present = None
+                try:
+                    _idx = self._l3_index()
+                    lo, hi = c * PROBE_CHUNK_PAGES, min(kv_pages, (c + 1) * PROBE_CHUNK_PAGES)
+                    if _idx is not None and hi > lo:
+                        present = _idx.has([self._get_component_key(k, name) for k in keys[lo:hi]])
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    present = None
+                _l3c[key] = present
+                return present
+
+            def _readable_chunk(name: str, c: int, states):
+                """DP-NACHLAUF: ``_bulk_readable`` for the pages of chunk ``c``."""
+                key = (name, c)
+                if key in _rbc:
+                    return _rbc[key]
+                try:
+                    lo, hi = c * PROBE_CHUNK_PAGES, min(kv_pages, (c + 1) * PROBE_CHUNK_PAGES)
+                    # the bulk form consults L3 only where the arena answered
+                    l3 = _l3_chunk(name, c) if states is not None else None
+                    idx = [i for i in range(lo, hi)
+                           if not (states is not None and i < len(states) and states[i] == 2)
+                           and not (l3 is not None and (i - lo) < len(l3) and not l3[i - lo])]
+                    stems = [self._get_component_key(keys[i], name) for i in idx]
+                    present = set(self._readable_stems(stems)) if stems else set()
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    present = None
+                _rbc[key] = present
+                return present
+
             def has_component(page_idx: int, name: str) -> bool:
                 states = _bulk_states(name)
                 if states is not None and page_idx < len(states) and states[page_idx] == 2:
                     return True
+                if _chunked:
+                    if page_idx >= kv_pages:
+                        # the bulk form's readable set spans [0, kv_pages):
+                        # a page past it answered False after a derivation
+                        return False
+                    c = page_idx // PROBE_CHUNK_PAGES
+                    if states is not None and page_idx < len(states):
+                        l3c = _l3_chunk(name, c)
+                        j = page_idx - c * PROBE_CHUNK_PAGES
+                        if l3c is not None and j < len(l3c) and not l3c[j]:
+                            return False   # neither COMPLETE in the arena nor on any disk
+                    k = self._get_component_key(keys[page_idx], name)
+                    v = _memo.get(k)
+                    if v is None:
+                        rb = _readable_chunk(name, c, states)
+                        v = (k in rb) if rb is not None else bool(self._readable_stems([k]))
+                        _memo[k] = v
+                    return v
                 l3 = None
                 if states is not None and page_idx < len(states):
                     l3 = _bulk_l3(name)
@@ -4575,7 +4669,15 @@ class HiCacheFile(HiCacheStorage):
                 # DEEPEST index carrying one (-1 = none at all). Computed only
                 # on the rate-limited logging path.
                 _anchor_probe = {}
-                for _t in pool_transfers or []:
+                # DP-NACHLAUF 02.10.: the discriminator answers `claimed=0`
+                # only. N5m (5576ce0f16) printed n=3 with claimed=61343
+                # lost=27 and paid has_component over all 72779 keys per pool
+                # in PP0's prefetch thread -- the 100k->200k #969G derivations
+                # inside the 1270-ms queue of the first P read after D->P.
+                # With a non-zero claim the probe is skipped and says so.
+                if final_pages and probe_chunked_on():
+                    _anchor_probe = "skipped(claimed>0)"
+                for _t in (pool_transfers or []) if isinstance(_anchor_probe, dict) else []:
                     if _t.name == PoolName.KV:
                         continue
                     _present = [
