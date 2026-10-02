@@ -3547,6 +3547,27 @@ def _mmap_addr(mm: "_mmap.mmap") -> int:
     return addr
 
 
+#: FLIP-LEGS 02.10.: an on-card SEQ lane staged by IPC (deposit: own tensor ->
+#: the on-card staging buffer; collect: the opened staging buffer -> own
+#: tensor) copies device to device -- issued through the GIL-holding entry
+#: points (DeviceOps.memcpy_async_held). A host-staged lane (D2H/H2D) keeps
+#: CDLL. Unset = on; 0/false/no/off = CDLL everywhere.
+ENV_SEQ_IPC_HOLD_GIL = "SGLANG_WEG2_SEQ_IPC_HOLD_GIL"
+
+
+def seq_ipc_hold_gil_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_SEQ_IPC_HOLD_GIL, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _seq_copiers(ops, device_to_device: bool):
+    """(memcpy, memcpy2d) for one SEQ copy: held only for a device-to-device
+    (IPC-staged) copy on an adapter that has the held entry points."""
+    if device_to_device and getattr(ops, "held_gil", False) and seq_ipc_hold_gil_on():
+        return ops.memcpy_async_held, ops.memcpy2d_async_held
+    return ops.memcpy_async, ops.memcpy2d_async
+
+
 def run_sequential_units(descs, ops, boot_nonce: str, *,
                          slot_bytes: int,
                          shm_root: str = xr.SHM_ROOT,
@@ -3985,12 +4006,13 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     # the D2H (or D2D staging) copy into this piece's window,
                     # the SAME pitch arithmetic the lane form runs
                     _buf_addr = (_ipc_base + window_off) if _ipc_base else (base_addr + window_off)
+                    _cp, _cp2d = _seq_copiers(ops, bool(_ipc_base))
                     if piece.kind == tp.FLAT:
-                        ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
+                        _cp(_buf_addr, src_ptr, nbytes, stream)
                     else:
-                        ops.memcpy2d_async(_buf_addr, int(piece.run_bytes), src_ptr,
-                                           int(piece.spitch), int(piece.run_bytes),
-                                           int(piece.rows), stream)
+                        _cp2d(_buf_addr, int(piece.run_bytes), src_ptr,
+                              int(piece.spitch), int(piece.run_bytes),
+                              int(piece.rows), stream)
                     _issued.append((i, window_off, name, tag, nbytes))
                 ops.synchronize(stream)
                 _n_sync += 1
@@ -4173,13 +4195,14 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 if _why:
                     return _why
                 _tc0 = time.perf_counter()
+                _cp, _cp2d = _seq_copiers(ops, bool(_ipc_base))
                 if piece.kind == tp.FLAT:
-                    ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
+                    _cp(int(dst_ptr), _buf_addr, nbytes, stream)
                 else:
                     # on the way OUT a STRIDED2D piece scatters (spitch = run)
-                    ops.memcpy2d_async(int(dst_ptr), int(piece.dpitch), _buf_addr,
-                                       int(piece.run_bytes), int(piece.run_bytes),
-                                       int(piece.rows), stream)
+                    _cp2d(int(dst_ptr), int(piece.dpitch), _buf_addr,
+                          int(piece.run_bytes), int(piece.run_bytes),
+                          int(piece.rows), stream)
                 _t_copy += time.perf_counter() - _tc0
                 _issued.append((i, name, int(dst_ptr), nbytes, dep_digest, my_digest, label))
             if _issued:
@@ -4211,6 +4234,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             f"bytes={total_bytes} total_ms={(time.perf_counter() - _t_lane0) * 1000:.0f} "
             f"wait_ms={_t_wait * 1000:.0f} copy_sync_ms={_t_copy * 1000:.0f} "
             f"record_ms={_t_rec * 1000:.0f} ipc={'yes' if _ipc_base else 'no'} "
+            f"issue_gil={'held' if (_ipc_base and getattr(ops, 'held_gil', False) and seq_ipc_hold_gil_on()) else 'released'} "
             f"syncs={_n_sync} batch={_bat_units}u/{_bat_bytes >> 20}MiB "
             f"t={_time.time():.3f} t0={_time.time() - (time.perf_counter() - _t_lane0):.3f}"
             + (f" host={_host_mode or 'none'}" if _lazy else ""))

@@ -117,6 +117,37 @@ def format_freed(freed: Dict[str, int]) -> str:
 
 #: offsets inside the pinned stash are aligned so every dtype view is legal
 _STASH_ALIGN = 256
+#: FLIP-LEGS 02.10.: the stash copies each device buffer into PINNED host
+#: memory with non_blocking=True and synchronizes ONCE per device, instead of
+#: one pageable, synchronizing ``.to("cpu")`` per buffer. Same values, same
+#: names, same order; the pinned stash also lets the wake's import copy by
+#: direct DMA. Unset = on; 0/false/no/off = the per-buffer pageable form.
+ENV_STASH_PINNED = "SGLANG_WEG2_STATIC_STASH_PINNED"
+#: the last export's numbers, for the WEG2-STATIC-EXPORT line
+LAST_EXPORT: Dict[str, Any] = {}
+
+
+def stash_pinned_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    return str(e.get(ENV_STASH_PINNED, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def stage_buffers(named, *, to_host, sync_device) -> List[Tuple[str, Any]]:
+    """The pinned/async stash, torch-free so the desk proves its shape:
+    ``to_host(tensor)`` queues one copy (returns the host tensor, or None for
+    a buffer it does not stage -- copied the old way by the caller's
+    fallback), ``sync_device(device)`` is called ONCE per device that had a
+    queued copy, after the last one and before this returns."""
+    out: List[Tuple[str, Any]] = []
+    devices: List[Any] = []
+    for name, buf in named:
+        host, dev = to_host(buf)
+        out.append((name, host))
+        if dev is not None and dev not in devices:
+            devices.append(dev)
+    for dev in devices:
+        sync_device(dev)
+    return out
 
 
 def export_static_state_host(model: Any) -> dict:
@@ -129,22 +160,57 @@ def export_static_state_host(model: Any) -> dict:
     median on D TP0 (rc12g before 7002b171d5: 11 ms) -- a synchronous pageable
     H2D per buffer on the wake's critical path. From pinned memory the import
     is an asynchronous copy on the current stream (``pinned=True``), ordered
-    before the next forward. Without CUDA (a CPU double) the block is plain."""
+    before the next forward. Without CUDA (a CPU double) the block is plain.
+
+    FLIP-LEGS 02.10.: this export stands between the gathered sleep RPC and
+    the sleeper's first deposit (WEG2-SLEEP-PRELOOP census_credit 41-54 ms p50
+    on every sleeping rank of N4p/N4q). The copies into the block are queued
+    non_blocking and synchronized ONCE per device (:func:`stage_buffers`);
+    :data:`ENV_STASH_PINNED` off = the per-buffer pageable form. Numbers in
+    :data:`LAST_EXPORT` for the WEG2-STATIC-EXPORT line.
+    RELEASE-INTEG 1002: both sides kept -- the single pinned block (and its
+    ``pinned``/``block`` keys the importer reads) from the release head, the
+    async queue + one sync per device + switch + numbers from FLIP-LEGS."""
+    import time as _time
+
     import torch
 
+    t0 = _time.perf_counter()
     named = [(name, buffer.detach()) for name, buffer in model.named_buffers()]
+    nbytes = sum(int(b.numel()) * int(b.element_size()) for _, b in named)
+    if not stash_pinned_on():
+        bufs = [(name, b.to("cpu", copy=True)) for name, b in named]
+        LAST_EXPORT.clear()
+        LAST_EXPORT.update(n=len(bufs), bytes=nbytes, ms=(_time.perf_counter() - t0) * 1000.0,
+                           mode="pageable")
+        return dict(buffers=bufs, pinned=False)
     spans, total = [], 0
     for _name, buf in named:
         spans.append(total)
         total += -(-_nbytes(buf) // _STASH_ALIGN) * _STASH_ALIGN
     pinned = bool(total) and torch.cuda.is_available()
     block = torch.empty(max(total, 1), dtype=torch.uint8, pin_memory=pinned)
-    buffers = []
-    for (name, buf), off in zip(named, spans):
-        view = block[off:off + _nbytes(buf)].view(buf.dtype).view(buf.shape)
+    views = {name: block[off:off + _nbytes(buf)].view(buf.dtype).view(buf.shape)
+             for (name, buf), off in zip(named, spans)}
+
+    def to_host(item):
+        name, buf = item
+        view = views[name]
+        if pinned and buf.is_cuda:
+            view.copy_(buf, non_blocking=True)
+            return view, buf.device
         view.copy_(buf)
-        buffers.append((name, view))
-    return dict(buffers=buffers, pinned=pinned, block=block)
+        return view, None
+
+    def sync_device(dev):
+        torch.cuda.current_stream(dev).synchronize()
+
+    bufs = stage_buffers([(name, (name, buf)) for name, buf in named], to_host=to_host,
+                         sync_device=sync_device)
+    LAST_EXPORT.clear()
+    LAST_EXPORT.update(n=len(bufs), bytes=nbytes, ms=(_time.perf_counter() - t0) * 1000.0,
+                       mode="pinned-async")
+    return dict(buffers=bufs, pinned=pinned, block=block)
 
 
 # -- (c) the holder report -------------------------------------------------------------
