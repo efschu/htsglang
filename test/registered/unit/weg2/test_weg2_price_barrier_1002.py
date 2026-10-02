@@ -133,6 +133,13 @@ def _lines(caplog, mark="WEG2 PRICE-BARRIER"):
     return [r.getMessage() for r in caplog.records if r.getMessage().startswith(mark)]
 
 
+
+@pytest.fixture(autouse=True)
+def _no_early_flip(monkeypatch):
+    # EARLY-FLIP (02.10.) would begin a D->P flip for these big arrivals on an
+    # idle D; this file tests the barrier in isolation, on the path without it
+    monkeypatch.setenv("SGLANG_WEG2_EARLY_FLIP", "0")
+
 def test_red_n5x_boot_start_pair_goes_to_p_as_a_group_and_d_does_no_extend(caplog):
     # the SHORT's count is the slower one but runs first (it waited longer in the
     # hold); the LONG's count queues behind it -- N5x: 127 ms, then 81 ms

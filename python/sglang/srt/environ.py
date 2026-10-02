@@ -1753,6 +1753,29 @@ class Envs:
     # and their cache_controller.write -- wall clock only, no device sync, the
     # wrappers live for the retract alone. 0 = the park as before.
     SGLANG_WEG2_PARK_RETRACT_SPLIT = EnvBool(True)
+    # PARK-NO-DWELL (user 02.10.: an arriving request is prefilled AT ONCE, no
+    # grace for running decodes; N6d ..._ec4d492f58 epoch 4: 'WEG2
+    # PARK-IMMEDIATE-DWELL awake_ms=310 min_dwell_ms=1974 floor_ms=2000' held the
+    # LONG weg2-4-6 142 ms until D's 2-token SHORT had finished): the immediate
+    # park of D's running decodes for a queued request over X fires at once --
+    # no K7 min-dwell, no park-cycle/decode dwell, no collect window, no fairness
+    # floor -- and the D->P MIN-DWELL after that park does not hold either.
+    # Marker 'WEG2 PARK-NO-DWELL'. 0 = the dwell rules as before.
+    SGLANG_WEG2_PARK_NO_DWELL = EnvBool(True)
+    # EARLY-FLIP (02.10., binding flip time = last D token -> first P chunk; N6d:
+    # arrival -> verdict 194-224 ms = X-EXACT count 100-130 + PROBE-FAST ~100, all
+    # of it before the flip could begin): with D IDLE (nothing running, no
+    # hand-off, nothing prefilled waiting, empty queue) an arrival whose chars/3
+    # uncached price is >= SGLANG_WEG2_EARLY_FLIP_X_FACTOR x X begins the D->P flip
+    # at once -- drain and D quiesce run beside the count and the store probe --
+    # and the flip awaits the verdict before its first sleep RPC (sleep-kv): LONG
+    # (and economics + MIN-DWELL say flip) -> it goes on; anything else -> ABORT,
+    # D stays awake and serves (its quiesce flushed the radix; the prefix comes
+    # back from L2). Measured 01./02.10.: 2x catches 597 of 1063 LONGs, 7 of 604
+    # early begins end SHORT (1.2 %). Markers 'WEG2-EARLY-FLIP begin|go|abort'.
+    # 0 = the flip waits for the verdict, as before.
+    SGLANG_WEG2_EARLY_FLIP = EnvBool(True)
+    SGLANG_WEG2_EARLY_FLIP_X_FACTOR = EnvFloat(2.0)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
