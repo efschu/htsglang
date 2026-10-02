@@ -5761,23 +5761,25 @@ class Front:
         self.store_probe, self._store_probe_why = probe, why
         if probe is not None:
             logger.info("WEG2 L3-INDEX-PRICE armed %s -- an arrival's credit is the page-granular "
-                        "store prefix of its exact ids (keys as P/D read them), earlier boots and "
-                        "this one alike (src=l3_index)", why)
+                        "L2/L3 store prefix of its exact ids (keys as P/D read them), earlier boots "
+                        "and this one alike (src=l3_index, or src=l2_arena when only L2 proves it)",
+                        why)
         else:
             logger.warning("WEG2 L3-INDEX-PRICE n/a: %s -- no store credit at arrival (retried "
                            "every %.0f s)", why, self.STORE_PROBE_RETRY_S)
 
-    async def _store_probe_depth(self, rid: str, ids: Any, timeout_s: float) -> int:
-        """L3-INDEX PRICE: the store depth of ``ids`` in tokens (0 = none or
-        not askable), asked in the front tokenizer's worker thread."""
+    async def _store_probe_depth(self, rid: str, ids: Any, timeout_s: float) -> Tuple[int, str]:
+        """L3-INDEX / L2-ARENA PRICE: (the store depth of ``ids`` in tokens,
+        the tier it needs -- ``l3_index`` or ``l2_arena``); (0, "none") = none
+        or not askable. Asked in the front tokenizer's worker thread."""
         ft = self.ftok
         if self.__dict__.get("store_probe") is None:
             t = self.__dict__.get("_store_probe_t")
             if t is None or time.monotonic() - t < self.STORE_PROBE_RETRY_S:
-                return 0
+                return 0, "none"
             await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)
             if self.store_probe is None:
-                return 0
+                return 0, "none"
         try:
             d = await asyncio.wait_for(
                 asyncio.get_running_loop().run_in_executor(ft.executor, self.store_probe.depth, ids),
@@ -5786,14 +5788,14 @@ class Front:
             self.counters["l3_index_price_failed"] += 1
             logger.info("WEG2 L3-INDEX-PRICE rid=%s FAILED %s: %s (no store credit)",
                         rid, type(e).__name__, str(e)[:160])
-            return 0
+            return 0, "none"
         self.counters["l3_index_probes"] += 1
         if d.tokens > 0:
-            logger.info("WEG2 L3-INDEX-PRESENCE rid=%s depth=%d pages=%d kv_pages=%d tokens=%d "
-                        "probe_ms=%.1f (the shared store holds these leading pages with their "
-                        "anchor -- what P/D read for this prompt)", rid, d.tokens, d.pages,
-                        d.kv_pages, int(ids.size), d.ms)
-        return int(d.tokens)
+            logger.info("WEG2 L3-INDEX-PRESENCE rid=%s tier=%s depth=%d pages=%d l3_pages=%d "
+                        "kv_pages=%d tokens=%d probe_ms=%.1f (the shared L2/L3 store holds these "
+                        "leading pages with their anchor -- what P/D read for this prompt)",
+                        rid, d.tier, d.tokens, d.pages, d.l3_pages, d.kv_pages, int(ids.size), d.ms)
+        return int(d.tokens), str(d.tier)
 
     async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
                              est_uncached: int, est_prompt: int, multimodal: bool = False):
@@ -5834,12 +5836,14 @@ class Front:
         # L3-INDEX PRICE (y7d weg2-0-2 / 2-19): the page-granular store prefix
         # of these exact ids, earlier boots and this one -- a store fact like
         # P's END-ANCHOR, recorded before the measured prefix is read.
-        l3 = await self._store_probe_depth(
+        l3, tier = await self._store_probe_depth(
             rid, c.ids, envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
             - (time.monotonic() - t0))
-        if l3 > 0 and self.tspans.record_store_depth(c.ids, l3, source="l3_index") > 0:
+        if l3 > 0 and self.tspans.record_store_depth(c.ids, l3, source=tier) > 0:
             self.counters["l3_index_credit"] += 1
             self.counters["l3_index_credit_tokens"] += int(l3)
+            if tier == "l2_arena":
+                self.counters["l2_arena_credit"] += 1
         # the epoch is read AFTER the count: a flip during it ends the held credit
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
         pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
@@ -7489,6 +7493,7 @@ class Front:
                 # L3-INDEX PRICE (02.10.): arrivals credited by the store's page prefix
                 "l3_index": int(self.counters["l3_index_credit"]),
                 "l3_index_tokens": int(self.counters["l3_index_credit_tokens"]),
+                "l2_arena": int(self.counters["l2_arena_credit"]),  # of them: L2-only depth
             },
             "corridor_min_mib": {k: dict(v) for k, v in self.corridor_min.items()},
             # Same instrument and band as the WEG2-CORRIDOR log line: a reader
