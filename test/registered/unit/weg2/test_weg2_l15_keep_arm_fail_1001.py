@@ -79,7 +79,7 @@ def test_failed_arm_rc_discards_manifest_and_clears_earlier_bases(tmp_path):
     assert (2, ()) not in ad.calls
     assert len(logs) == 1
     assert "L15-RETAIN keep-arm FAILED rank=3 rc=1" in logs[0]
-    assert "manifest discarded, this rank holds nothing" in logs[0]
+    assert "manifest discarded, clears_failed=0, this rank holds nothing" in logs[0]
 
 
 def test_failed_arm_exception_degrades_the_same_way(tmp_path):
