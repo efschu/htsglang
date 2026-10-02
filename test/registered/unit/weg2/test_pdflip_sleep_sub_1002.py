@@ -221,19 +221,20 @@ def test_red_census_encodes_each_kept_record_once_and_counts_the_same(tmp_path, 
     keep = types.SimpleNamespace(rids=["r0", "r1", "r2"], roles=[hp.ROLE_HANDOFF, hp.ROLE_HANDOFF, hp.ROLE_PARK])
     pool.__dict__["_weg2_hp_keep"] = (None, keep)
     pool.__dict__["_weg2_hp_rid_keys"] = recs
+    monkeypatch.setattr(hp, "_live_marks", lambda: set(recs))   # PDFLIP-H: the marks exist on disk
     encodes, finds = [], []
     real_enc = ha.ShmArena.encode_stems
     monkeypatch.setattr(ha.ShmArena, "encode_stems", staticmethod(lambda st: encodes.append(len(st)) or real_enc(st)))
     monkeypatch.setattr(ha.ShmArena, "find_slots", lambda self, st: finds.append(len(st)) or [])
-    first = hp.census(pool)
-    second = hp.census(pool)
+    first = hp.census(pool, refresh=False)
+    second = hp.census(pool, refresh=False)
     assert first == second
     assert "handoff_kept=250/300 handoff_rids=2 park_kept=10/10 park_rids=1" in first
     assert sorted(encodes) == [10, 100, 200], "one encode per record, not per census"
     assert finds == [], "no per-stem tuple list on the reset path"
     # a replaced record (renewed mark) is encoded again; the old one leaves the cache
     recs[(hp.PENDING, "r0")] = (2, (None, None, stems[:50], stems[:50]))
-    assert "handoff_kept=200/250" in hp.census(pool)
+    assert "handoff_kept=200/250" in hp.census(pool, refresh=False)
     assert sorted(encodes) == [10, 50, 100, 200]
     assert len(pool.__dict__["_weg2_hp_census_enc"]) == 3
 
@@ -249,4 +250,5 @@ def test_census_falls_back_on_an_arena_without_the_encoded_lookup(monkeypatch):
     keep = types.SimpleNamespace(rids=["r0"], roles=[hp.ROLE_HANDOFF])
     pool.__dict__["_weg2_hp_keep"] = (None, keep)
     pool.__dict__["_weg2_hp_rid_keys"] = {(hp.PENDING, "r0"): (1, (None, None, ["a", "b", "c"], None))}
-    assert "handoff_kept=2/3" in hp.census(pool)
+    monkeypatch.setattr(hp, "_live_marks", lambda: {(hp.PENDING, "r0")})
+    assert "handoff_kept=2/3" in hp.census(pool, refresh=False)
