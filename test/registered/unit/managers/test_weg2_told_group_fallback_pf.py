@@ -266,6 +266,9 @@ def test_frist_values(monkeypatch):
 
 
 def test_switch_off_is_byte_identical_to_the_pre_pf_head(monkeypatch):
+    # the golden digest is the told-first order; the follower early read
+    # (default on since 02.10.) is covered by test_weg2_follower_early_read_1002
+    monkeypatch.setenv("SGLANG_WEG2_FOLLOWER_EARLY_READ", "0")
     assert R.run_digest(m, monkeypatch, {}) == GOLDEN_OFF
     assert R.run_digest(m, monkeypatch, {fb.ENV_FALLBACK: "0"}) == GOLDEN_OFF
 

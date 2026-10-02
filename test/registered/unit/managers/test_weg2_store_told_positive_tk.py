@@ -29,6 +29,14 @@ import pytest
 from sglang.srt.managers import weg2_store_told as m
 
 
+@pytest.fixture(autouse=True)
+def _told_first_order(monkeypatch):
+    # these cases pin the told-first order; the follower early read (default on
+    # since 02.10.) is covered by test_weg2_follower_early_read_1002
+    monkeypatch.setenv("SGLANG_WEG2_FOLLOWER_EARLY_READ", "0")
+
+
+
 class _SpanTree:
     """Tree double: registration from `head` up to `limit` (raw tokens), a
     completed read records the SPAN it retained (span-relative, #1176)."""

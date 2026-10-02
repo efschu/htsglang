@@ -1137,14 +1137,15 @@ def front_span_inflight_line() -> str:
 #: leg 2 takes on every P->D flip): tokenised ids and the store prefetch run on
 #: P's prefetch threads while the weight legs run; the wake releases the held
 #: request and only the device load is left. The P drain awaits the leg it
-#: finds in flight instead of posting it again. Default OFF (the P-side hold
-#: has not run on the NF metal yet); SGLANG_WEG2_LEG1_EARLY=1 arms it.
+#: finds in flight instead of posting it again. Default ON since 02.10. (metal
+#: 27B N5q..N6e: LEG1-EARLY + #1443 DORMANT-HOLD every D>P; NF y8b d019aa8e1e /
+#: y8c 71da6e387c: LEG1-EARLY 10x, 0 deaths); SGLANG_WEG2_LEG1_EARLY=0 disarms it.
 LEG1_EARLY_ENV = "SGLANG_WEG2_LEG1_EARLY"
 
 
 def leg1_early_on(env: Optional[dict] = None) -> bool:
     env = os.environ if env is None else env
-    return str(env.get(LEG1_EARLY_ENV, "") or "").strip().lower() in ("1", "true", "yes", "on")
+    return str(env.get(LEG1_EARLY_ENV, "1") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def leg1_early_candidates(queue, limit: int) -> list:
