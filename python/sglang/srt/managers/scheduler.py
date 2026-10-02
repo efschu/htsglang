@@ -19932,6 +19932,9 @@ class Scheduler(
             # and that must propagate -- the buffers are half-moved by then.
             _l15_kwargs = None
             _l15_mba = None
+            # L15-FLIPCOST: wall clock of every L15 step of this flush, one
+            # L15-SLEEP-TIMING line at the end (N3y: D->P flip 7-12 s)
+            _l15_tt = {"t0": time.perf_counter()}
             try:
                 from sglang.srt.weg2 import (
                     l15_bind,
@@ -20095,6 +20098,7 @@ class Scheduler(
                         _l15_rank = int(
                             getattr(getattr(self, "ps", None), "tp_rank", 0) or 0
                         )
+                        _l15_tt["bind0"] = time.perf_counter()
                         _l15_kwargs = l15_bind.build_retain_kwargs(
                             _reqs,
                             getattr(self.req_to_token_pool, "req_to_token", None),
@@ -20144,10 +20148,12 @@ class Scheduler(
                                     self.tree_cache),
                                 log=logger.info),
                         )
+                        _l15_tt["bind"] = time.perf_counter() - _l15_tt["bind0"]
                         # L15-12c-C2: alignment probe -- chain host rows vs
-                        # the seqlen-1 KV span; the first L15=1 boot confirms
-                        # whether the snapshot ever exceeds the span.
-                        for _r in _reqs:
+                        # the seqlen-1 KV span. L15-FLIPCOST: a diagnostic
+                        # walk inside the flip -- only on request now.
+                        for _r in (_reqs if os.environ.get(
+                                "SGLANG_WEG2_L15_ALIGN_PROBE", "0") == "1" else ()):
                             try:
                                 logger.info(
                                     "L15-L2-ALIGN rid=%s chain_rows=%d kv_span=%d",
@@ -20185,6 +20191,7 @@ class Scheduler(
             if _l15_reuse is not None:
                 _l15_res = _l15_reuse
             elif _l15_kwargs is not None:
+                _l15_tt["retain0"] = time.perf_counter()
                 _l15_res = l15_retain.retain_at_sleep(
                     # L15-FIX-DUPKW: mamba_allocator travels inside
                     # **_l15_kwargs (build_retain_kwargs always emits it);
@@ -20209,6 +20216,8 @@ class Scheduler(
                     # rank votes None at the wake while its peers vote a
                     # fingerprint -> mixed verdict -> group fallback
                     # (the existing rule; no wake-side code here).
+                    _l15_tt["retain"] = time.perf_counter() - _l15_tt["retain0"]
+                    _l15_tt["arm0"] = time.perf_counter()
                     from sglang.srt.weg2 import l15_keep_split as _l15_ks
                     if not l15_keep_arm.arm_keep_spans(
                         _ad,
@@ -20222,6 +20231,7 @@ class Scheduler(
                             int(_b.data_ptr()), _r),
                     ):
                         _l15_res = None
+                    _l15_tt["arm"] = time.perf_counter() - _l15_tt["arm0"]
             self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None
@@ -20240,8 +20250,10 @@ class Scheduler(
                     if _old is not None and _old is not _l15_reuse:
                         _old.close()
                     if _l15_reuse is None or getattr(self, "_l15_share_pub", None) is None:
+                        _l15_tt["share0"] = time.perf_counter()
                         self._l15_share_pub = _l15_sp.publish_for_sched(
                             self, _l15_res.manifest, os.environ, logger.info)
+                        _l15_tt["share"] = time.perf_counter() - _l15_tt["share0"]
                 except Exception as exc:  # noqa: BLE001 -- share is optional
                     logger.warning("L15-SHARE publish failed (%s: %s)",
                                    type(exc).__name__, exc)
@@ -20257,6 +20269,17 @@ class Scheduler(
                     _l15_so.forget(self)
             except Exception:  # noqa: BLE001 -- bookkeeping only
                 pass
+            if len(_l15_tt) > 1:
+                logger.info(
+                    "L15-SLEEP-TIMING rank=%d held=%s reuse=%s total_ms=%.0f "
+                    "bind_ms=%.0f retain_ms=%.0f arm_ms=%.0f share_ms=%.0f",
+                    int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
+                    _l15_res is not None, _l15_reuse is not None,
+                    (time.perf_counter() - _l15_tt["t0"]) * 1000.0,
+                    _l15_tt.get("bind", 0.0) * 1000.0,
+                    _l15_tt.get("retain", 0.0) * 1000.0,
+                    _l15_tt.get("arm", 0.0) * 1000.0,
+                    _l15_tt.get("share", 0.0) * 1000.0)
             if _l15_res is not None:
                 pass
             else:

@@ -625,12 +625,16 @@ def _remap_slots(value, slot_map: Dict[int, int]):
     """
     if value is None or not torch.is_tensor(value) or value.numel() == 0:
         return value
-    out = torch.empty_like(value.flatten())
-    flat = value.flatten()
-    for i in range(flat.numel()):
-        old = int(flat[i])
-        out[i] = slot_map.get(old, old)
-    return out.reshape(value.shape)
+    # L15-FLIPCOST (N3y: D->P flip 7-12 s instead of 2.4 s): the old loop
+    # read and wrote ONE element per step -- on a CUDA value that is a
+    # device sync plus a kernel per token (~250k tokens per sleep, ~4 s on
+    # TP1 between L15-L2-ALIGN and L15-HOSTLOCK). One D2H, the dict map on
+    # host, one H2D.
+    vals = value.flatten().tolist()
+    get = slot_map.get
+    mapped = [get(v, v) for v in vals]
+    return torch.tensor(mapped, dtype=value.dtype,
+                        device=value.device).reshape(value.shape)
 
 
 def rewrite_tree_chain(
