@@ -49,7 +49,7 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 TEXT = "a flipped agent turn"
 RID = "weg2-2-1"
 PROMPT, D_CACHED, P_CACHED, OUT = 20000, 19990, 4000, 7
-P_TIERS = {"device": 4000, "host": 0, "storage": 0}
+P_TIERS = {"device": 1000, "host": 2000, "storage": 1000}  # sums to P_CACHED
 _ORIG_SR = web.StreamResponse
 
 
@@ -366,7 +366,7 @@ def test_openai_body_flipped_carries_the_details(caplog):
     assert d["queue_s"] > 0
     # the tier split P reported for the prefill it computed (where its hits came from)
     ptd = u["prompt_tokens_details"]
-    assert (ptd["cached_device"], ptd["cached_l2"], ptd["cached_l3"]) == (4000, 0, 0)
+    assert (ptd["cached_device"], ptd["cached_l2"], ptd["cached_l3"]) == (1000, 2000, 990)
     assert ptd["cached_tokens"] == 3990  # the USAGE-TRUE fix still holds
     m = _lines(caplog, "WEG2-USAGE-DETAILS")
     assert len(m) == 1 and "flips=1" in m[0] and "p_computed=16000" in m[0]
@@ -381,7 +381,7 @@ def test_openai_stream_flipped_final_usage_chunk_carries_the_details():
     assert d["flips"] == 1 and d["p_computed"] == PROMPT - P_CACHED
     assert d["sleep"] == 0 and d["sleep_causes"] == ZERO_CAUSES
     assert d["ttft_s"] >= 0 and d["decode_s"] >= 0
-    assert final["usage"]["prompt_tokens_details"]["cached_device"] == 4000
+    assert final["usage"]["prompt_tokens_details"]["cached_l3"] == 990
 
 
 def test_anthropic_body_flipped_carries_the_details():
@@ -390,7 +390,7 @@ def test_anthropic_body_flipped_carries_the_details():
     d = u["total_tokens_details"]
     assert d["flips"] == 1 and d["p_computed"] == PROMPT - P_CACHED
     # no standard object on this wire: the split rides in the detail object
-    assert (d["cached_device"], d["cached_l2"], d["cached_l3"]) == (4000, 0, 0)
+    assert (d["cached_device"], d["cached_l2"], d["cached_l3"]) == (1000, 2000, 990)
     assert "prompt_tokens_details" not in u
     assert u["cache_read_input_tokens"] == 3990
 
@@ -508,3 +508,46 @@ def test_reasoning_tokens_counted_by_the_front_tokenizer_when_d_did_not():
     _f, got = asyncio.run(_run("/v1/chat/completions", json.dumps(body).encode(), False, p_legs=(),
                                before_leg2=give_tok))
     assert json.loads(got)["usage"]["completion_tokens_details"] == {"reasoning_tokens": 3}
+
+
+# ---------------------------------------------------- tier split (02.10.) --
+
+
+def test_trim_tiers_removes_the_excess_deepest_first_never_negative():
+    t = {"cached_device": 1000, "cached_l2": 2000, "cached_l3": 1000}
+    assert UT.trim_tiers(t, 3990) == {"cached_device": 1000, "cached_l2": 2000, "cached_l3": 990}
+    assert UT.trim_tiers(t, 1500) == {"cached_device": 1000, "cached_l2": 500, "cached_l3": 0}
+    assert UT.trim_tiers(t, 200) == {"cached_device": 200, "cached_l2": 0, "cached_l3": 0}
+    assert UT.trim_tiers(t, 0) == {"cached_device": 0, "cached_l2": 0, "cached_l3": 0}
+    # a tier the rank did not report is not invented; a split below the target is never raised
+    assert UT.trim_tiers({"cached_device": 50, "cached_l2": 70}, 100) == {"cached_device": 50, "cached_l2": 50}
+    assert UT.trim_tiers({"cached_device": 50}, 100) == {"cached_device": 50}
+
+
+def test_flipped_split_sums_to_the_corrected_cached_tokens():
+    _f, got = asyncio.run(_run("/v1/chat/completions", _oa_body(), False))
+    ptd = json.loads(got)["usage"]["prompt_tokens_details"]
+    assert ptd["cached_device"] + ptd["cached_l2"] + ptd["cached_l3"] == ptd["cached_tokens"] == 3990
+    _f, got = asyncio.run(_run("/v1/messages", _anth_body(), False))
+    u = json.loads(got)["usage"]
+    d = u["total_tokens_details"]
+    assert d["cached_device"] + d["cached_l2"] + d["cached_l3"] == u["cache_read_input_tokens"] == 3990
+
+
+def test_d_only_follow_up_shows_only_ds_split_never_an_earlier_p_leg():
+    """An earlier rid (an earlier turn of the same conversation) ran a P leg and
+    sits in the ledger; this rid is served on D alone: its split is D's own,
+    summing to D's cached count -- nothing from any P leg."""
+    d_tiers = {"device": 19000, "host": 990, "storage": 0}
+
+    def earlier_turn(front):
+        front._p_leg_note("weg2-2-0", PROMPT, P_CACHED,
+                          {"cached_device": 1000, "cached_l2": 2000, "cached_l3": 1000})
+
+    _f, got = asyncio.run(_run("/v1/chat/completions", _oa_body(tiers=d_tiers), False, p_legs=(),
+                               before_leg2=earlier_turn))
+    u = json.loads(got)["usage"]
+    ptd = u["prompt_tokens_details"]
+    assert (ptd["cached_device"], ptd["cached_l2"], ptd["cached_l3"]) == (19000, 990, 0)
+    assert ptd["cached_device"] + ptd["cached_l2"] + ptd["cached_l3"] == ptd["cached_tokens"] == D_CACHED
+    assert u["total_tokens_details"]["p_computed"] == 0

@@ -9645,6 +9645,11 @@ class Front:
             det["route"], det["route_epoch"] = route[0], route[1]
         adds: Dict[str, Dict[str, Any]] = {"total_tokens_details": det}
         anth = _ut.wire_of(obj) == "anthropic"
+        if tiers and p_computed is not None and reading:
+            # a flipped request: P's split, trimmed (l3 -> l2 -> device) to sum
+            # to the corrected cached count the client sees. A D-only rid never
+            # gets here -- its split is D's own (the ledger is per rid).
+            tiers = _ut.trim_tiers(tiers, _ut.true_cached(reading[0], reading[1], p_computed)[0])
         if tiers:
             if anth:
                 det.update(tiers)  # no standard object on the Anthropic wire
