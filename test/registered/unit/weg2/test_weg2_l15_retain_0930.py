@@ -270,7 +270,9 @@ def test_rows_land_at_new_slots_reserved_leave_free_pages_manifest_roundtrips(
     line = sc["log_lines"][-1]
     m = re.fullmatch(
         r"L15-RETAIN epoch=77 n=2 keep_rows_by_rank=(?P<rows>[\d,]+) "
-        r"l_h=(?P<lh>\d+) anchors=3 fp=(?P<fp>-?\d+)", line)
+        r"l_h=(?P<lh>\d+) anchors=3 fp=(?P<fp>-?\d+)"
+        r" ms=\d+ steps=plan:\d+,moves:\d+,rewrite:\d+,hostlock:\d+,reset:\d+,"
+        r"alloc:\d+,keep:\d+,manifest:\d+", line)
     assert m is not None, line
     assert m.group("rows") == ",".join(str(x) for x in res.plan.rows_by_rank)
     assert m.group("lh") == str(res.plan.l_h)
@@ -344,3 +346,26 @@ def test_retain_accepts_generator_candidates(tmp_path):
     assert res is not None
     assert {s.rid for s in res.manifest.spans} == {"r_seat", "r_parked"}
     assert os.path.exists(sc["manifest_path"])
+
+
+def test_keep_over_cap_trims_the_set_before_anything_moves(tmp_path):
+    """L15-FIX-KEEP-OVER-CAP (N3y TP2 08:41:52Z): the compacted keep is a
+    whole number of blocks on EVERY rank -- rank 0's larger need drives L_H,
+    so rank 1 would keep 4 rows against a cap of 3 although the candidate's
+    summed rows (3) fit. The set is trimmed before the moves: here to
+    nothing, so retain returns None and touches nothing."""
+    events = []
+    sc = make_scenario(tmp_path, events,
+                       slots_of=lambda rid: {"r_x": (2, 4, 6, 8, 1, 3, 5)}[rid])
+    kw = sc["kwargs"]
+    kw["candidates"] = [Candidate(rid="r_x", kind="seat", last_active=2.0,
+                                  rows_by_rank=(4, 3), anchor_depth=7, kv_depth=7)]
+    kw["caps_rows_by_rank"] = (5, 3)
+    kw["anchor_slot_of"] = lambda rid: 4
+    before = sc["kv_buf"].clone()
+    res = l15_retain.retain_at_sleep(**kw)
+    assert res is None
+    assert any("L15-RETAIN trimmed n=1" in x for x in sc["log_lines"])
+    assert "reset_keep" not in events and "set_keep" not in events
+    assert torch.equal(before, sc["kv_buf"])
+    assert not os.path.exists(sc["manifest_path"])
