@@ -129,7 +129,7 @@ def test_the_backward_anchor_scan_equals_the_forward_answer(store):
     assert pr._deepest(h, 100, "mamba", memo, (0, 1)) == -1
 
 
-# ---- BOOT-START HOLD (NF a105d38905) with the 27B bound ------------------------------------
+# ---- BOOT-START HOLD (NF a105d38905) bounded (NF HOLD-BOUND 2202214f9d, 30 s) ------------------------------------
 
 def test_the_boot_start_hold_is_bounded(caplog):
     import asyncio
@@ -149,7 +149,8 @@ def test_the_boot_start_hold_is_bounded(caplog):
 
     asyncio.run(asyncio.wait_for(go(), 5))
     assert f.counters["x_exact_hold_timeout"] == 1
-    assert any("WEG2 X-EXACT-HOLD rid=weg2-0-1 TIMEOUT" in m for m in caplog.messages)
+    assert any("WEG2 X-EXACT-HOLD-TIMEOUT rid=weg2-0-1" in m for m in caplog.messages)
+    assert F.Front.X_EXACT_HOLD_MAX_S == 30.0, "NF's HOLD-BOUND value on 27B too"
 
 
 # ---- L2-ARENA PRICE (NF 0d65279f70) on the 27B arenas ---------------------------------------

@@ -158,6 +158,13 @@ class Harness:
         kw.update(self.front_kwargs)
         self.front = Front(self.p.url, self.d.url, **kw)
         self.front.session = ClientSession(timeout=ClientTimeout(total=60))
+        # BOOT-START HOLD (a105d38905): the served front ends the hold when its
+        # tokenizer load (scheduled from on_startup, which this harness does not
+        # run) ends. No load runs here, so it has ended: release it, or every
+        # arrival of an x_exact profile (qwen27b form) waits for the hold bound.
+        _ready = getattr(self.front, "_x_exact_ready_event", None)
+        if _ready is not None:
+            _ready().set()
         app = web.Application(client_max_size=1024 ** 3)
         app.router.add_post("/generate", self.front.handle_generate)
         self.server = TestServer(app)
