@@ -29,7 +29,7 @@ contract; per-page subsets are refused named, not guessed).
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -110,11 +110,28 @@ def gen_check(
     return ok, sorted(bad)
 
 
+MODE_ENV = "SGLANG_WEG2_L15_REFILL_MODE"
+
+
+def refill_mode(env=None) -> Optional[str]:
+    """L15-REFILL-DMA: the page-load mode of the cap-0 refill -- "dma" (one
+    H2D copy per run of consecutive arena slots straight out of the
+    cudaHostRegistered arena: no CPU gather, no JIT, no stage), "kernel"
+    (the GPU gathers whole pages through the mapped arena), "cpu" (pinned
+    stage); unset = the pool's own choice (27B's 32-KiB page: "kernel")."""
+    import os as _os
+
+    env = _os.environ if env is None else env
+    m = str(env.get(MODE_ENV, "") or "").strip().lower()
+    return m if m in ("dma", "kernel", "cpu") else None
+
+
 def refill(
     plan_ok: Sequence[Tuple[str, int, int, int, ...]],
     host_pool,
     device_pool,
     page_tokens: int,
+    mode: Optional[str] = None,
 ) -> int:
     """Bulk H2D of the checked plan: ONE _load_pages_all_layers call,
     return the number of rows copied.
@@ -129,7 +146,7 @@ def refill(
     before any copy; any failure of the load itself likewise raises, never
     with a partial count reported as success."""
     if page_tokens != 1:
-        return _refill_pgt(plan_ok, host_pool, device_pool)
+        return _refill_pgt(plan_ok, host_pool, device_pool, mode=mode)
     rows_by_slot: Dict[int, int] = {}
     for rid, row, slot, _gen in plan_ok:
         if slot < 0:
@@ -148,7 +165,7 @@ def refill(
     didx_t = torch.tensor(didx, dtype=torch.int64)
     try:
         host_pool._load_pages_all_layers(
-            device_pool, slots_t, didx_t, lanes=None, mode=None
+            device_pool, slots_t, didx_t, lanes=None, mode=mode
         )
     except Exception as exc:  # noqa: BLE001 -- all-or-nothing: fold into a bad vote
         raise L15RefillError("refill: page load failed: %r" % (exc,)) from exc
@@ -159,6 +176,7 @@ def _refill_pgt(
     plan_ok: Sequence[Tuple[str, int, int, int, int]],
     host_pool,
     device_pool,
+    mode: Optional[str] = None,
 ) -> int:
     """P>1 (the NF form) refill: rows grouped by page, ONE loader call.
 
@@ -227,7 +245,7 @@ def _refill_pgt(
             torch.tensor(slots_list, dtype=torch.int64),
             torch.tensor(didx, dtype=torch.int64),
             lanes=torch.tensor(lane_list, dtype=torch.int64),
-            mode=None,
+            mode=mode,
         )
     except Exception as exc:  # noqa: BLE001 -- all-or-nothing: fold into a bad vote
         raise L15RefillError("refill(P>1): page load failed: %r" % (exc,)) from exc

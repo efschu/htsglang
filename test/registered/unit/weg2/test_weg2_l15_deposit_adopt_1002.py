@@ -66,3 +66,47 @@ def test_rows_free_and_agree():
     assert "not free" in A.rows_free(A.Deposit("b", 4, 8, 2, 2, ()), kv, mb)
     assert "anchor row 3" in A.rows_free(A.Deposit("c", 4, 5, 1, 3, ()), kv, mb)
     assert A.agree(["a", "b"], lambda v: [v, ["b", "c"], ["b"]]) == ["b"]
+
+
+def test_adopt_deposits_on_the_real_tree_agreed_only(tmp_path):
+    """Two complete deposits; this rank can take both, a peer only 'a'
+    -> exactly 'a' becomes device nodes (slots + anchor reserved)."""
+    import importlib.util
+    import os
+
+    spec = importlib.util.spec_from_file_location(
+        "test_weg2_l15_tree_rewrite_1001",
+        os.path.join(os.path.dirname(__file__), "test_weg2_l15_tree_rewrite_1001.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    fx = m._fixture()
+    for rid, e0, a in (("a", 40, 3), ("b", 50, 4)):
+        _rec(tmp_path, rid, "L0-2", att_layers=[3], linear=[0, 2], e_start=e0, n=6,
+             upto=6, anchor_row=a, skip_ranks=[])
+        A.write_tokens(str(tmp_path), rid, list(range(800 + e0, 806 + e0)))
+
+    class _Sp:
+        pass
+
+    def fake_span(dep, tokens, match, hp, hm, log):
+        sp = _Sp()
+        sp.rid = dep.rid
+        return sp
+
+    import pytest
+    mp = pytest.MonkeyPatch()
+    mp.setattr(A, "span_for", fake_span)
+    try:
+        logs = []
+        got = A.adopt_deposits(
+            directory=str(tmp_path), epoch=4, rank=1, prefix=[0, 1, 2],
+            att_layers=[3], n_linear=2, match=None, tree_cache=fx.cache,
+            kv_alloc=fx.allocator, mamba_alloc=fx.pool.mamba_allocator,
+            host_pool=None, device_pool=None, host_mamba=None, dev_mamba=None,
+            gather=lambda v: [v, ["a"]], log=logs.append)
+    finally:
+        mp.undo()
+    assert got == ["a"]
+    hit = m._match(fx, list(range(840, 846)))
+    assert len(hit.device_indices) >= 5
+    assert any("adopted=1" in x for x in logs)

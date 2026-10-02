@@ -102,8 +102,26 @@ def _rows2d(buf):
     return t.view(-1).view(torch.uint8).view(int(buf.shape[0]), -1)
 
 
+CHUNK_ENV = "SGLANG_WEG2_L15_PARK_CHUNK_MIB"
+
+
+def chunk_rows(row_bytes: int, env=None) -> int:
+    """Rows per collective: the barlink a2a takes its BAR1 path only for
+    blocks its slot ring carries -- a larger block falls back to the pinned
+    host + gloo layer, i.e. exactly the host bounce the park exists to avoid.
+    Default 16 MiB per block (the same figure on every rank: env + geometry)."""
+    import os as _os
+
+    env = _os.environ if env is None else env
+    try:
+        mib = max(1, int(env.get(CHUNK_ENV, "16")))
+    except (TypeError, ValueError):
+        mib = 16
+    return max(1, (mib << 20) // max(1, int(row_bytes)))
+
+
 def run_park(direction: str, pieces: Sequence[ParkPiece], rank: int,
-             world: int, buffers: Sequence, a2a) -> int:
+             world: int, buffers: Sequence, a2a, env=None) -> int:
     """Move every piece's rows of every buffer: ``direction`` "out" (sleep:
     src -> dst) or "back" (wake: dst -> src). EVERY rank of the group calls
     this with the same pieces and buffers in the same order (one collective
@@ -116,18 +134,21 @@ def run_park(direction: str, pieces: Sequence[ParkPiece], rank: int,
         to_row = p.dst_row if direction == "out" else p.src_row
         for buf in buffers:
             b = _rows2d(buf)
-            in_splits = [0] * world
-            out_splits = [0] * world
-            inp = b[0:0]
-            out = b[0:0]
-            if rank == frm:
-                inp = b[frm_row:frm_row + p.rows]
-                in_splits[to] = p.rows
-                sent += int(inp.numel())
-            if rank == to:
-                out = b[to_row:to_row + p.rows]
-                out_splits[frm] = p.rows
-            a2a(out, inp, out_splits, in_splits)
+            step = chunk_rows(int(b.shape[1]), env)
+            for c0 in range(0, p.rows, step):
+                n = min(step, p.rows - c0)
+                in_splits = [0] * world
+                out_splits = [0] * world
+                inp = b[0:0]
+                out = b[0:0]
+                if rank == frm:
+                    inp = b[frm_row + c0:frm_row + c0 + n]
+                    in_splits[to] = n
+                    sent += int(inp.numel())
+                if rank == to:
+                    out = b[to_row + c0:to_row + c0 + n]
+                    out_splits[frm] = n
+                a2a(out, inp, out_splits, in_splits)
     return sent
 
 
@@ -277,7 +298,7 @@ def park_at_release(sched, env, log) -> Optional[int]:
     err = None
     sent = 0
     try:
-        sent = run_park("out", pieces, rank, world, bufs, a2a)
+        sent = run_park("out", pieces, rank, world, bufs, a2a, env)
         torch.cuda.current_stream().synchronize()
     except Exception as exc:  # noqa: BLE001 -- the wake refills from L2
         err = "%s: %s" % (type(exc).__name__, exc)
@@ -324,7 +345,7 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool) -> bool:
     sent = 0
     try:
         bufs, _pool = _kv_buffers(sched)
-        sent = run_park("back", rec[1], rank, world, bufs, a2a)
+        sent = run_park("back", rec[1], rank, world, bufs, a2a, env)
         torch.cuda.current_stream().synchronize()
     except Exception as exc:  # noqa: BLE001
         err = "%s: %s" % (type(exc).__name__, exc)

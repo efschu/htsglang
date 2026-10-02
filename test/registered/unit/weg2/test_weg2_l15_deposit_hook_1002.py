@@ -239,3 +239,18 @@ def test_stage_zero_leaves_the_token_ids_before_its_record(tmp_path):
     H.on_chunk(_req(), final=True)
     assert read_tokens(w.dir, "r1") == list(range(500, 510))
     assert json.load(open(H.record_path(w.dir, "r1", "L0-2")))["failed"] is None
+
+
+def test_no_share_is_fetched_from_a_cap0_rank(tmp_path):
+    w = _world(tmp_path)
+    fetched = []
+    d0 = dict(w.shares[1][0])
+    d0["cap0"] = [0]
+    logs = []
+    mapper = _Mapper(w.reg)
+    why = H.open_session(rid="r1", prompt_len=10,
+                         hint={"epoch": 4, "e_start": 30, "n": 10, "anchor_row": 3},
+                         d0=d0, geom=w.geom,
+                         fetch=lambda r: fetched.append(r) or w.shares[r],
+                         n_d_ranks=2, mapper=mapper, directory=w.dir, log=logs.append)
+    assert why is None and fetched == [1]

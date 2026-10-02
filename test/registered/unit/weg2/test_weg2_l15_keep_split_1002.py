@@ -130,3 +130,27 @@ def test_cap0_rank_arms_empty_windows_on_unsplit_bases_and_keeps_its_manifest(tm
     assert ok is True and m.exists(), logs
     assert sv.keep == [] and sv.pause_kept_bytes() == 0
     assert ks.keep_extents(0x4000, [(5, 5)]) == []
+
+
+def test_a_hold_covering_the_whole_base_is_still_split_and_kept(tmp_path):
+    """L15-FIX-WHOLE-HOLD (N4f 11:09:36): the merged hold regions cover the
+    whole allocation (conv base); a one-range plan would be the stock
+    mapping -- no extents, unmapped whole by the pause. The split cuts it
+    into two span extents inside the hold region, both kept."""
+    sv = FakeSaver(4 * G)
+    base = Base(0x5000)
+    # 4 layer views of G each, 1 row of G/2 held per view -> each region is
+    # widened to the granule and they merge into [0, 4G): the whole base
+    views = [(i * G, G // 2) for i in range(4)]
+    n = ks.ensure_split({0x5000: (base, views)}, lambda p: 1, lambda b: G, sv,
+                        lambda t: None, lambda m: None)
+    assert n == 1, "the whole-base hold must still be split"
+    assert sv.extents == [(0, G), (G, 4 * G)]
+    m = tmp_path / "m.json"
+    m.write_text("{}")
+    ok = arm_keep_spans(sv, {1: (base, [(0, G // 2), (2 * G, 2 * G + G // 2)])},
+                        str(m), rank=1, log=lambda s: None, granule=G,
+                        split_lookup=lambda b, r: ks.keep_extents(
+                            b.data_ptr(), r, native=[(0, G), (G, 3 * G)]))
+    assert ok is True
+    assert sv.pause_kept_bytes() == 4 * G

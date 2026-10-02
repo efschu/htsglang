@@ -101,6 +101,18 @@ def ensure_split(bases: Dict[int, Tuple[object, List[Tuple[int, int]]]],
         if not holds:
             continue
         plan = split_plan(holds, info.size, g)
+        if len(plan) == 1 and int(plan[0][1]) - int(plan[0][0]) >= 2 * g:
+            # L15-FIX-WHOLE-HOLD (N4f 11:09:36 TP1/TP2 keep-arm FAILED, N3y
+            # 'export of extent @0 refused rc=-2'): when the hold regions
+            # merge to the WHOLE allocation (e.g. the mamba conv base: every
+            # layer's anchor rows widened to the granule), the one-range plan
+            # IS the saver's stock mapping -- no span extent exists, the
+            # pause unmaps the base whole whatever the keep set says, and
+            # L15-EXTENTS (rightly) refuses the arm. Cut the region into two
+            # span extents at a granule: both lie inside the hold region and
+            # are kept.
+            a0, b0 = int(plan[0][0]), int(plan[0][1])
+            plan = [(a0, a0 + g), (a0 + g, b0)]
         if len(plan) <= 1:
             _PLANS[ptr] = tuple(plan)
             _HOLD[ptr] = tuple(holds)

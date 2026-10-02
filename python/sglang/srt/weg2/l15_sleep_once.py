@@ -74,8 +74,8 @@ def restamp(manifest_path: str, epoch: int):
     the new Manifest. Uses l15_manifest's atomic write."""
     from sglang.srt.weg2 import l15_manifest
 
-    with open(manifest_path) as fh:
-        m = l15_manifest.from_json(fh.read())
+    with open(manifest_path, "rb") as fh:
+        m = l15_manifest.from_bytes(fh.read())
     m2 = dataclasses.replace(m, epoch=int(epoch))
     l15_manifest.write(manifest_path, m2)
     return m2

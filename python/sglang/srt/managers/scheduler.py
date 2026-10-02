@@ -20387,6 +20387,34 @@ class Scheduler(
                     and getattr(self, "weg2_d_parked", None) is not None
                     else None
                 )
+                # L15-SLEEP-AGREE PRE (N4f: ranks diverged across the sleep ->
+                # W50; bind+retain paid for discarded holds): one host gather,
+                # every D rank, BEFORE any bind/retain cost -- any rank that
+                # cannot hold this sleep turns the round off everywhere.
+                _l15_pre_why = None
+                _l15_agree_on = False
+                try:
+                    from sglang.srt.weg2 import l15_sleep_agree as _l15_sa2
+                    _l15_agree_on = (_l15_sa2.env_on() and l15_plan.master_on(os.environ)
+                                     and getattr(self, "weg2_d_parked", None) is not None)
+                    if _l15_agree_on:
+                        _l15_gather = _l15_sa2.gather_for(self)
+                        if _l15_reuse is not None:
+                            _l15_mine = None
+                        else:
+                            _l15_mine = _l15_sa2.can_hold(
+                                l15_shadow.own_cap_rows(self, os.environ),
+                                os.environ, _l15_sa2.split_ready_native)
+                        _l15_pre_why = _l15_sa2.agree(_l15_mine, _l15_gather)
+                        if _l15_pre_why is not None:
+                            logger.info("L15-SLEEP-AGREE pre=off reason=%s "
+                                        "(no rank binds or retains this sleep)",
+                                        _l15_pre_why)
+                            _l15_reuse = None
+                except Exception as _exc:  # noqa: BLE001 -- vote "no" path
+                    _l15_pre_why = "agree failed: %s" % (_exc,)
+                    _l15_reuse = None
+                    logger.warning("L15-SLEEP-AGREE pre failed (%s)", _exc)
                 if _l15_reuse is not None:
                     _l15_flip = getattr(self, "_l15_sleep_flip", None)
                     _l15_mp = l15_manifest.manifest_path(
@@ -20403,7 +20431,7 @@ class Scheduler(
                         _l15_flip, len(_l15_reuse.hold.rids))
                 elif l15_plan.master_on(os.environ) and (
                     getattr(self, "weg2_d_parked", None) is not None
-                ):
+                ) and _l15_pre_why is None:
                     _tp = int(
                         getattr(self, "tp_size", 0)
                         or getattr(getattr(self, "server_args", None), "tp_size", 1)
@@ -20660,6 +20688,29 @@ class Scheduler(
                     ):
                         _l15_res = None
                     _l15_tt["arm"] = time.perf_counter() - _l15_tt["arm0"]
+            # L15-SLEEP-AGREE POST: the hold stands only if EVERY rank armed;
+            # otherwise the armed ranks give it back and flush plain too.
+            try:
+                if _l15_agree_on and _l15_pre_why is None:
+                    _l15_post = _l15_sa2.agree(
+                        _l15_sa2.post_vote(_l15_res, l15_shadow.own_cap_rows(
+                            self, os.environ)),
+                        _l15_gather)
+                    if _l15_post is not None:
+                        if _l15_res is not None:
+                            _l15_sa2.undo_armed(self, l15_manifest.manifest_path(
+                                "D", int(getattr(getattr(self, "ps", None),
+                                                 "tp_rank", 0) or 0),
+                                os.environ), logger.info)
+                        logger.info("L15-SLEEP-AGREE post=off reason=%s (the "
+                                    "armed ranks undo, every rank flushes plain)",
+                                    _l15_post)
+                        _l15_res = None
+                        _l15_reuse = None
+            except NameError:
+                pass
+            except Exception as _exc:  # noqa: BLE001 -- uniform: the vote ran
+                logger.warning("L15-SLEEP-AGREE post failed (%s)", _exc)
             _fsub.mark("l15")
             self._weg2_note_lost_anchors()
             _fsub.mark("anchors")

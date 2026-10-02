@@ -227,6 +227,10 @@ def _l15_drop_retained_tree(sched, rank) -> bool:
     return True
 
 
+#: L15-10d: the tag whose resume closes P's wake (hot take at wake)
+KV_CACHE_TAG_FOR_L15 = "kv_cache"
+
+
 def _l15_refill_on(env) -> bool:
     """L15-12c-SW: the cap-0 refill kill switch, SGLANG_WEG2_L15_REFILL.
 
@@ -662,6 +666,9 @@ class SchedulerWeightUpdaterManager:
     # L15-16 PARK: the parked rows came back at this wake (the cap-0 rank
     # then refills only its anchors from L2)
     _l15_park_back_ok: bool = False
+    # L15-FIX-CAP0-CHECK: this wake's cap-0 refill landed (gen-checked); the
+    # sample check of this rank then votes clean without re-reading L2
+    _l15_refill_done: bool = False
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -7291,6 +7298,7 @@ class SchedulerWeightUpdaterManager:
         # L15-12c-E2: a per-wake mark -- reset at the head so it can never
         # survive into a wake whose signal did not set it.
         self._l15_wake_refill = False
+        self._l15_refill_done = False
         if sched is None:
             return None, None, 0, False
         try:
@@ -7653,6 +7661,15 @@ class SchedulerWeightUpdaterManager:
             return None
         k = 64
         rank = self._weg2_rank()
+        if getattr(self, "_l15_refill_done", False) and os.environ.get(
+                "SGLANG_WEG2_L15_CAP0_SAMPLE", "0") != "1":
+            # L15-FIX-CAP0-CHECK: this rank's rows were just copied from L2
+            # under a generation check (refill raised otherwise); re-reading
+            # 64 of them from L2 compares L2 with itself. Vote clean.
+            self._l15_refill_done = False
+            logger.info("L15-CHECK rank=%d cap-0: refilled rows are gen-checked, "
+                        "sample skipped", rank)
+            return (0, 0, 0)
         sched = self.scheduler
         plan, scratch = [], None
         try:
@@ -7673,9 +7690,12 @@ class SchedulerWeightUpdaterManager:
             plan = [(str(rids[0]), row, slot, gen)
                     for row, slot, gen, _lane, rids in
                     l15_restore.owned_l2_rows(m, rank, prefix)]
-            device_pool = getattr(getattr(getattr(sched, "tp_worker", None),
-                                          "model_runner", None),
-                                  "token_to_kv_pool", None)
+            # L15-FIX-REFILL-POOL: the same full-attention pool the refill
+            # writes (the hybrid wrapper has no k_buffer)
+            from sglang.srt.weg2.l15_shadow import kv_pool_of as _l15_kvp
+            device_pool = _l15_kvp(getattr(getattr(getattr(sched, "tp_worker", None),
+                                                   "model_runner", None),
+                                           "token_to_kv_pool", None))
             host_pool = l15_bind.live_host_pools(
                 getattr(sched, "tree_cache", None))[0]
             if device_pool is None or host_pool is None:
@@ -7711,8 +7731,11 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weg2.l15_wake_check import L15CheckRefused
 
         try:
-            return self._l15_decide_wake_verdict(
-                wake_on, fp, self._l15_wake_sample_check(), epoch=epoch)
+            # L15-FIX-CHECK-NOVOTE (N4f TP0: a failed refill voted None and
+            # STILL paid the 64-row sample, 156-962 ms): a rank that votes no
+            # hold has nothing to check
+            _chk = self._l15_wake_sample_check() if fp is not None else None
+            return self._l15_decide_wake_verdict(wake_on, fp, _chk, epoch=epoch)
         except L15CheckRefused as exc:
             self._l15_check_refusals = int(
                 getattr(self, "_l15_check_refusals", 0) or 0) + 1
@@ -7786,7 +7809,12 @@ class SchedulerWeightUpdaterManager:
             for _x in _vw:
                 prefix.append(prefix[-1] + _x)
             mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
-            device_pool = getattr(mr, "token_to_kv_pool", None)
+            # L15-FIX-REFILL-POOL (N4f TP0 every wake: 'HybridLinearKVPool'
+            # object has no attribute 'k_buffer' -> refill failed, the sample
+            # read zeros, bad=64): the arena loader writes per-layer K/V rows,
+            # which the hybrid wrapper keeps on its full-attention pool
+            from sglang.srt.weg2.l15_shadow import kv_pool_of as _l15_kvp
+            device_pool = _l15_kvp(getattr(mr, "token_to_kv_pool", None))
             # L15-FIX-HOSTGROUP: mem_pool_host is the HostPoolGroup on the
             # hybrid 27B; the arena pools are its KV / MAMBA entries.
             from sglang.srt.weg2.l15_bind import live_host_pools
@@ -7838,13 +7866,30 @@ class SchedulerWeightUpdaterManager:
             if [int(g) for g in _sg(a_slots)] != a_gens:
                 raise l15_refill.L15RefillError(
                     "anchor generation mismatch, recorded %s" % (a_gens,))
-            n = l15_refill.refill(ok, host_pool, device_pool, page_tokens) if ok else 0
+            _rf_mode = l15_refill.refill_mode()
+            _rf_t0 = time.perf_counter()
+            n = (l15_refill.refill(ok, host_pool, device_pool, page_tokens,
+                                   mode=_rf_mode) if ok else 0)
             host_mamba._load_states_all_layers(
                 dev_mamba,
                 torch.tensor(a_slots, dtype=torch.int64),
                 torch.tensor(a_didx, dtype=torch.int64))
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
+            _rf_s = max(1e-9, time.perf_counter() - _rf_t0)
+            try:
+                from sglang.srt.weg2 import l15_shadow as _l15_shr
+                _rf_bytes = int(n) * int(_l15_shr.cell_bytes_from(device_pool))
+            except Exception:  # noqa: BLE001 -- instrument only
+                _rf_bytes = 0
+            # L15-FIX-CAP0-CHECK: rows copied from L2 under a generation check
+            # need no sample re-read against L2 -- the wake check of THIS
+            # rank votes from the gen check (a refill failure raised above)
+            self._l15_refill_done = True
             logger.info("L15-REFILL rank=%d done: %d KV row(s) + %d anchor(s) "
-                        "from L2", rank, n, len(a_slots))
+                        "from L2 mode=%s refill_ms=%.0f refill_GBps=%.2f bytes=%d",
+                        rank, n, len(a_slots), _rf_mode or "pool-default",
+                        _rf_s * 1000.0, _rf_bytes / _rf_s / 1e9, _rf_bytes)
             return n
         except Exception as exc:  # noqa: BLE001 -- all-or-nothing into the fallback
             logger.info("L15-REFILL rank=%d failed: %s -> %s", rank, exc,
@@ -12011,6 +12056,35 @@ class SchedulerWeightUpdaterManager:
                 _l15_dropped = self._l15_wake_act(
                     self.scheduler, _l15_v,
                     group_ok=not _weg2_kv_refusal, master_on=_l15_wake)
+                # L15-14e: the complete phase-2 deposits become device nodes
+                # (opt-in SGLANG_WEG2_L15_DEPOSIT=1), behind the uniform hold
+                # verdict, on every D rank at this one position (one gather)
+                if (_l15_v == "hold" and not _weg2_kv_refusal
+                        and os.environ.get("SGLANG_WEG2_L15_DEPOSIT", "0") == "1"):
+                    try:
+                        from sglang.srt.weg2 import l15_deposit_adopt as _l15_da
+                        _l15_wg = getattr(self.scheduler, "world_group", None)
+                        _l15_cg = (getattr(_l15_wg, "cpu_group", None)
+                                   if _l15_wg is not None else None)
+                        _l15_ww = (torch.distributed.get_world_size(group=_l15_cg)
+                                   if _l15_cg is not None else 1)
+
+                        def _l15_gather(_v):
+                            if _l15_cg is None or _l15_ww <= 1:
+                                return [_v]
+                            _o = [None] * _l15_ww
+                            torch.distributed.all_gather_object(_o, _v, group=_l15_cg)
+                            return _o
+
+                        _l15_da.adopt_for_sched(
+                            self.scheduler, os.environ, logger.info,
+                            epoch=int(_l15_m.epoch) if _l15_m is not None else -1,
+                            gather=_l15_gather)
+                    except RuntimeError:
+                        raise   # an agreed rid refused on one rank: ranks diverged
+                    except Exception as exc:  # noqa: BLE001 -- deposits are optional
+                        logger.warning("L15-DEPOSIT-ADOPT failed (%s: %s)",
+                                       type(exc).__name__, exc)
                 if _l15_v == "fallback":
                     logger.info("L15-RESTORE verdict=fallback dropped=%d "
                                 "slots", _l15_dropped)
@@ -12084,6 +12158,24 @@ class SchedulerWeightUpdaterManager:
         # #284b: the last statement before the answer -- behind the fence and
         # every host wait of this wake (a no-op while the group is dormant).
         self._weg2_defer_host_fill_start()
+
+        # L15-10d: the hot follow-ups' prefixes are taken from D's hold HERE,
+        # in P's kv_cache resume, on every P stage inside this one fenced RPC
+        # (default SGLANG_WEG2_L15_HOT_AT_WAKE=1): no stage's admission ever
+        # waits for a verdict behind a busy pipeline.
+        if (weg2_memory_saver_on and KV_CACHE_TAG_FOR_L15 in (tags or ())
+                and self._weg2_group_name() == "P"
+                and os.environ.get("SGLANG_WEG2_L15_HOT_SHARE", "0") == "1"):
+            try:
+                from sglang.srt.weg2 import l15_share_admit as _l15_sa
+                if _l15_sa.at_wake(os.environ):
+                    _l15_n = _l15_sa.take_all_at_wake(self.scheduler, os.environ,
+                                                      logger.info)
+                    if _l15_n:
+                        logger.info("HOT-HANDOVER at=wake adopted=%d", _l15_n)
+            except Exception as exc:  # noqa: BLE001 -- the store read serves
+                logger.warning("HOT-HANDOVER at=wake failed (%s: %s)",
+                               type(exc).__name__, exc)
 
         return self._weg2_leg_commit("resume", recv_req, ResumeMemoryOccupationReqOutput(
             per_tag=(report.get("per_tag") or weg2_per_tag or None)
