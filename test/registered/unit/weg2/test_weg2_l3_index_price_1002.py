@@ -394,3 +394,21 @@ def test_the_boot_task_releases_the_hold_even_when_the_load_fails():
         return f._x_exact_ready_event().is_set()
 
     assert asyncio.run(go())
+
+
+# ---- launcher: no declaration of the deleted CARRIER route --------------------------
+
+def test_the_launcher_no_longer_declares_the_carrier_route():
+    """y7d boot log: 'WEG2-LAUNCH DEVIATION (declared): zero-remainder: a BATCH
+    prompt longer than group D's host staging pool ... is served by ONE prefill
+    on D (front route CARRIER-EXCEEDS, no leg 1)' -- a route 9bdfe50185 deleted.
+    The declaration names what the boot does: every BATCH prompt on P's leg 1."""
+    import importlib.util
+
+    with open(importlib.util.find_spec("sglang.srt.weg2.launcher").origin) as f:
+        src = f.read()
+    i = src.index("state.deviations = [")
+    block = src[i:src.index("]\n", i)]
+    assert "CARRIER-EXCEEDS, no leg 1" not in block
+    assert "is served by ONE prefill on D" not in block
+    assert "every BATCH prompt takes P's leg 1" in block

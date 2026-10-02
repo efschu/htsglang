@@ -25072,8 +25072,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "zero-remainder: group P holds the last token of every prefill back into its own chunk (SGLANG_WEG2_END_ANCHOR=1) so the GDN anchor D resumes from sits at N-1; "
         "costs P one 1-token pass per request and serialises whole-fit prompts behind the one chunked request per pass",
         "zero-remainder: /flush_cache publishes un-backed nodes before the idle witness on both groups (SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1); the quiesce then waits for those backups",
-        "zero-remainder: a BATCH prompt longer than group D's host staging pool can carry (launcher-measured from D's log, x0.9 prefetch bound) is served by ONE prefill on D "
-        "(front route CARRIER-EXCEEDS, no leg 1) -- served and single-prefill, but NOT a zero-remainder leg 2; the windowed prefetch that would lift it is the next round",
+        # y7d (9bdfe50185) still declared the deleted CARRIER-EXCEEDS route here
+        # ("served by ONE prefill on D, no leg 1"); 9bdfe50185 removed it.
+        "zero-remainder: no D single-prefill route -- every BATCH prompt takes P's leg 1 (CARRIER-EXCEEDS deleted, P-COVERS-D-SESSION law 02.10.); "
+        "a boot whose P prefill stages do not cover D's session is refused by name above, never served by a D prefill",
         "zero-remainder: BATCH streams are priced post hoc via stream_options.include_usage (one standard trailing usage chunk reaches the client)",
     ]
     log(early_read_provenance())
