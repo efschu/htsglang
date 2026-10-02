@@ -565,6 +565,16 @@ def spill_grace_s() -> float:
     return min(max(0.5, cycle_grace_s() / 3.0), max(0.05, g))
 
 
+def own_edge_on() -> bool:
+    """y7z: a blocked depositor counts its OWN live wait as a cycle edge from
+    the wait's start (SGLANG_WEG2_BAR1_SPILL_OWN_EDGE)."""
+    from sglang.srt.environ import envs
+    try:
+        return bool(envs.SGLANG_WEG2_BAR1_SPILL_OWN_EDGE.get())
+    except Exception:  # noqa: BLE001 -- the desk may lack the knob
+        return False
+
+
 def credit_cycle(me: int, waits: dict, blocked: dict, grace_s: float, now: float):
     """The chain of blocked edges that closes at waker ``me``, or None.
 
@@ -849,18 +859,36 @@ class Bar1Lanes:
         return credit_cycle(self.rank, self.read_credit_waits(), self.read_blocked(), g, time.time())
 
     # -- W109b: the depositor's half of the cycle ------------------------
-    def deposit_cycle(self, grace_s: Optional[float] = None):
+    def deposit_cycle(self, grace_s: Optional[float] = None, own=None):
         """The waker credit cycle one of whose edges is THIS rank's blocked
         deposit, or None. Read from the depositor's side: the wakers are the
         other group, the blocked flags are the ones this group posted into
         it. ``grace_s`` defaults to :func:`spill_grace_s` -- the sleeper has
         to act (``_spill_rest``) long before the waker refuses, and the chain
-        cannot dissolve on its own, so it acts as soon as the flags agree."""
+        cannot dissolve on its own, so it acts as soon as the flags agree.
+
+        ``own`` = ``(dst, seq, since)``: THIS rank's live credit wait, aged
+        from its START (see :func:`own_edge_on`) instead of from its
+        ``blocked`` flag, which goes up only after SLOW_WAIT_S."""
         g = spill_grace_s() if grace_s is None else float(grace_s)
         other = other_group(self.group)
         waits = self.read_credit_waits(other)
         blocked = self.read_blocked(other)
         now = time.time()
+        if own is not None:
+            # y7z (02.10., A/B 7cwk87): the depositor's own edge is a fact in
+            # this process, not a flag to read back. The flag's 0.5-s delay put
+            # 0.6 s of deposit stall on every cycled D->P wake (sleeper blocked
+            # depositing to a waker that sits in its own credit wait for the
+            # first claim); the draft-park skip (D sleeps ~120 ms earlier) made
+            # that the common case -- P first claims 787-1788 ms, D>P layer
+            # 3.5-3.8 s. A posted flag older than the wait start wins.
+            dst, seq, since = own
+            key = (int(self.rank), int(dst))
+            prev = blocked.get(key)
+            if prev is None or float(prev.get("since", now)) > float(since):
+                blocked = dict(blocked)
+                blocked[key] = {"seq": str(seq), "since": float(since), "own": True}
         for w in sorted(waits):
             chain = credit_cycle(w, waits, blocked, g, now)
             if chain and any(int(s) == self.rank for s, _d, _t in chain):
@@ -1398,12 +1426,15 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
 
 
 def _recv_marked(cred, kind: str, g: int, budget_s: float, d: str, seq, lane_key: str,
-                 rank: int, wait: str, on_tick=None):
+                 rank: int, wait: str, on_tick=None, own_state=None):
     """The depositor's credit wait; longer than SLOW_WAIT_S it posts a
     `blocked` flag (#22) the wakers' cycle reader sees, removed on return.
     ``on_tick`` (W109b): asked while the wait lasts; truthy raises
-    _CycleSpill (the flag is removed on that exit too)."""
+    _CycleSpill (the flag is removed on that exit too). ``own_state`` (y7z):
+    a dict the tick reads; carries this wait's start while it lasts."""
     posted = []
+    if own_state is not None:
+        own_state["since"] = time.time()
 
     def slow():
         if not posted:
@@ -1421,6 +1452,8 @@ def _recv_marked(cred, kind: str, g: int, budget_s: float, d: str, seq, lane_key
     finally:
         cred.on_slow = None
         cred.on_tick = None
+        if own_state is not None:
+            own_state.pop("since", None)
         if posted:
             try:
                 os.unlink(_flag_path(d, "blocked", seq, g))
@@ -1553,10 +1586,20 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
     # the cycle is gone. The collector's protocol is unchanged.
     tick_state: dict = {}
     tick = None
+    _own_dst = None
+    if role == "src" and own_edge_on():
+        try:
+            _own_dst = int(lanes.cross_pairs[int(str(lane_key)[1:])][1])
+        except (AttributeError, ValueError, IndexError, TypeError):
+            _own_dst = None
     if role == "src" and hasattr(lanes, "deposit_cycle") and hasattr(lanes, "backlog_push"):
         def tick():
             try:
-                chain = lanes.deposit_cycle()
+                _since = tick_state.get("since")
+                if _own_dst is not None and _since is not None:
+                    chain = lanes.deposit_cycle(own=(_own_dst, seq, _since))
+                else:
+                    chain = lanes.deposit_cycle()
             except Exception:  # noqa: BLE001 -- a probe may not raise
                 chain = None
             if chain:
@@ -1679,7 +1722,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                     tw = time.perf_counter()
                     try:
                         got_free = _recv_marked(cred, "free", g - ring, budget_s, d, seq, lane_key,
-                                                lanes.rank, "free", on_tick=tick)
+                                                lanes.rank, "free", on_tick=tick, own_state=tick_state)
                     except _CycleSpill:
                         clk.credit += time.perf_counter() - tw
                         return _spill_rest(g, g - ring, plan_sent=True,
@@ -1788,7 +1831,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                 for g in range(max(0, nb - ring), nb):
                     try:
                         got_free = _recv_marked(cred, "free", g, budget_s, d, seq, lane_key,
-                                                lanes.rank, "trailing-free", on_tick=tick)
+                                                lanes.rank, "trailing-free", on_tick=tick, own_state=tick_state)
                     except _CycleSpill:
                         # every byte is in the ring already: the backlog only waits
                         return _spill_rest(nb, g, plan_sent=True)
@@ -1797,7 +1840,7 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                                 f"batch {g} within {budget_s:.0f} s")
             try:
                 got_done = _recv_marked(cred, "done", 0, budget_s, d, seq, lane_key,
-                                        lanes.rank, "done", on_tick=tick)
+                                        lanes.rank, "done", on_tick=tick, own_state=tick_state)
             except _CycleSpill:
                 return _spill_rest(nb, nb, plan_sent=True)
             if got_done is None:
