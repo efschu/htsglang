@@ -285,11 +285,6 @@ class DecodeRoundLog:
         #: DASHBOARD-AUS-IPC (30.09., Inventar FEHLT 6): the batch size of the
         #: last emitted round (None before the first) -- the decode tile's bs
         self.last_bs = None
-        #: FLIPZEIT (02.10., user definition D>P = end of the last D decode round
-        #: -> first P prefill chunk): the wall-clock END of the last round, the
-        #: same base as rankstats prefill.last.t (time.time()) -- round open
-        #: (``acc.wall``, the 't:' of the Decode rank batch line) + its gpu-ms.
-        self.last_end_t = None
         #: fnFL2 H23: DECODE-ROUND-COST for the first rounds after a Weg-2
         #: wake. Inert until ``arm_wake_census``.
         self.wake_census = WakeRoundCensus(rank=self.rank)
@@ -567,7 +562,6 @@ class DecodeRoundLog:
         if split_known:
             self.last_seq += 1
 
-        self.last_end_t = float(acc.wall) + round_ms / 1000.0
         self._overhead_rounds += 1
         self._overhead_gpu_ms += round_ms
         self.cum_rounds += 1
