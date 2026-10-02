@@ -1679,6 +1679,69 @@ def cached_tier_of(body: Any) -> Optional[Dict[str, int]]:
 #: ``meta_info.cached_tokens_details`` unasked and is left alone.
 CACHED_TIER_ASK_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages")
 
+#: DP-NACHLAUF 02.10. (N5d 0c996cf05c 1002_124821, D->P epoch 25): leg 1 of a
+#: 132809-token chat prompt reached PP0's scheduler ~0.8 s after the front
+#: dispatched it at the flip's done -- P's HTTP server rendered the template
+#: and tokenized the whole prompt again, although the front had counted it
+#: EXACTLY (X-EXACT-PRICE, the same tokenizer + template; X-EXACT-TOKENS
+#: tokens_front=132814 tokens_group=132814 match=1). Leg 1 now goes to P's
+#: /generate with those input_ids. Unset = on; 0/false/no/off = the client's
+#: path and text as before.
+LEG1_INPUT_IDS_ENV = "SGLANG_WEG2_LEG1_INPUT_IDS"
+_LEG1_IDS_FROM = ("/v1/chat/completions", "/v1/messages", "/generate")
+
+
+def leg1_input_ids_on(env: Optional[Mapping[str, str]] = None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(LEG1_INPUT_IDS_ENV, "") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+_MEDIA_PART_TYPES = frozenset({"image_url", "image", "input_image", "video_url", "video",
+                               "input_audio", "audio", "file", "document"})
+
+
+def _leg1_payload_has_media(payload: dict) -> bool:
+    """Any image/video/audio/file part (OpenAI or Anthropic shape, nested in
+    tool results too) or a /generate media field: such a prompt is never sent
+    as text ids -- the front's ids are the TEXT's (P's media processor
+    expands the parts)."""
+    if any(payload.get(k) for k in ("image_data", "video_data", "audio_data", "input_embeds")):
+        return True
+
+    def walk(x, depth=0) -> bool:
+        if depth > 6:
+            return False
+        if isinstance(x, dict):
+            if str(x.get("type") or "") in _MEDIA_PART_TYPES:
+                return True
+            return any(walk(v, depth + 1) for k, v in x.items() if k in ("content", "source", "messages"))
+        if isinstance(x, list):
+            return any(walk(v, depth + 1) for v in x)
+        return False
+
+    return walk(payload.get("messages")) or walk(payload.get("system"))
+
+
+def leg1_input_ids_payload(path: str, payload: Any, ids: Any) -> Optional[dict]:
+    """The leg-1 body for P's ``/generate`` carrying the front's exact token
+    ids (one token out, no stream), or None (keep the client's path): no ids,
+    a path the front does not count, or a payload with media in it."""
+    if ids is None or path not in _LEG1_IDS_FROM or not isinstance(payload, dict):
+        return None
+    try:
+        toks = [int(t) for t in (ids.tolist() if hasattr(ids, "tolist") else ids)]
+    except (TypeError, ValueError):
+        return None
+    if not toks:
+        return None
+    if _leg1_payload_has_media(payload):
+        return None
+    out: dict = {"input_ids": toks, "stream": False,
+                 "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
+    if payload.get("rid") is not None:
+        out["rid"] = payload["rid"]
+    return out
+
 
 def cached_tier_asked(payload: Any) -> bool:
     """Did this request body (the CLIENT's) ask for the tier split itself?"""
@@ -10256,9 +10319,26 @@ class Front:
             except Exception:  # noqa: BLE001 -- a hint, never the route
                 pass
 
+        # DP-NACHLAUF: the front's exact ids instead of the text P would
+        # tokenize again (LEG1-INPUT-IDS); the client's path when it has none
+        _post_path, _post_body = p.path, with_cached_tier_ask(payload, p.path)
+        if leg1_input_ids_on():
+            _ft = getattr(self, "ftok", None)
+            _ids = _ft.ids_for(p.text) if (_ft is not None and p.text) else None
+            _gb = leg1_input_ids_payload(p.path, payload, _ids)
+            if _gb is not None:
+                _post_path, _post_body = "/generate", _gb
+                self.counters["leg1_input_ids"] += 1
+                logger.info("WEG2 LEG1-INPUT-IDS rid=%s tokens=%d from=%s (the front's exact ids; "
+                            "P tokenizes nothing)", p.rid, len(_gb["input_ids"]), p.path)
+            else:
+                self.counters["leg1_input_ids_none"] += 1
+                logger.info("WEG2 LEG1-INPUT-IDS rid=%s none path=%s why=%s", p.rid, p.path,
+                            "no-ids" if _ids is None else "payload")
+
         async def _post() -> Tuple[int, bytes]:
             try:
-                async with self.session.post(f"{g.url}{p.path}", json=with_cached_tier_ask(payload, p.path)) as resp:
+                async with self.session.post(f"{g.url}{_post_path}", json=_post_body) as resp:
                     return resp.status, await resp.read()
             finally:
                 if _hot_dir is not None:  # every stage admitted it by now
