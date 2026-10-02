@@ -77,6 +77,7 @@ def test_flag_on_keeps_the_hold_for_a_genuinely_fresh_group():
         f = _front()
         f.flip_log.append(dict(REC_DRAINED))
         f.t_awake = time.time() - 0.2
+        f.groups["D"].outstanding["running"] = object()   # K7-DWELL idle skip: a D with work holds
         assert f._dwell_ok("D", "P", fairness_fired=False, work_exhausted=False, oldest_wait_s=0.0) is False
 
 

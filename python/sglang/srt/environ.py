@@ -3604,6 +3604,13 @@ class Envs:
     # a park-closed admission is labelled "park", not "fairness", in MIN-DWELL.
     # 0 = the band floor and the threshold as before.
     SGLANG_WEG2_X_BAND_FOLLOWS_PRICE = EnvBool(True)
+    # K7-DWELL idle skip (02.10., N5j 13:50:12-15: D just woke, nothing to decode,
+    # a LONG waiting; MIN-DWELL held the idle D 2.2 s until awake >= the derived
+    # 2586 ms). The D->P min-dwell only holds while D has work (running decodes,
+    # a hand-off in flight or ready_for_d); an idle D flips at once (NF cd12370e30
+    # names: "WEG2 ARRIVAL-SEAT K7-DWELL skip ... d_running=0",
+    # arrival_seat_k7_dwell_skip_idle). 0 = the dwell holds an idle D as before.
+    SGLANG_WEG2_K7_DWELL_IDLE_SKIP = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at

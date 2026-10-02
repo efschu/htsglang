@@ -11274,6 +11274,37 @@ class Front:
                 return ms, prov
         return 0.0, "none-first-flip"
 
+    def _k7_dwell_idle_skip(self, awake_ms: float, need_ms: float) -> bool:
+        """K7-DWELL skip (N5j 13:50:12-15; NF cd12370e30 form and names): IDLE D
+        NEVER HOLDS. The D->P min-dwell exists only so D's running decodes
+        progress; with none running (the flip ledger of D -- the parked ones
+        dropped, as in NF), no hand-off in flight and nothing prefilled in
+        ``_ready_for_d`` a hold is pure Vorlauf, so the flip goes at once. Switch
+        SGLANG_WEG2_K7_DWELL_IDLE_SKIP (default on)."""
+        if not envs.SGLANG_WEG2_K7_DWELL_IDLE_SKIP.get():
+            return False
+        D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
+        if D is None:
+            return False
+        _fl = getattr(self, "_flip_ledger", None)
+        d_running = len(_fl(D)) if callable(_fl) else len(getattr(D, "outstanding", None) or ())
+        _hof = getattr(self, "_handoff_in_flight", None)
+        handoff = max(0, int(_hof())) if callable(_hof) else 0
+        ready = len(getattr(self, "_ready_for_d", None) or ())
+        if d_running or handoff or ready:
+            return False
+        _c = getattr(self, "counters", None)
+        if isinstance(_c, dict):
+            _c["arrival_seat_k7_dwell_skip_idle"] = _c.get("arrival_seat_k7_dwell_skip_idle", 0) + 1
+        if getattr(self, "_k7_skip_told", None) != getattr(self, "epoch", -1):
+            self._k7_skip_told = getattr(self, "epoch", -1)
+            q = getattr(self, "queue", None) or ()
+            logger.info("WEG2 ARRIVAL-SEAT K7-DWELL skip rid=%s d_running=0 awake_ms=%d min_dwell_ms=%d "
+                        "epoch=%d handoff=0 ready_for_d=0 (idle D: the dwell would be pure Vorlauf)",
+                        getattr(q[0], "rid", "-") if q else "-", int(awake_ms), int(need_ms),
+                        int(getattr(self, "epoch", -1)))
+        return True
+
     def _dwell_ok(self, src: str, dst: str, fairness_fired: bool,
                   work_exhausted: bool, oldest_wait_s: float) -> bool:
         """C8, with its two NAMED overrides.
@@ -11286,7 +11317,11 @@ class Front:
         need, prov = self._derived_min_dwell_ms(src, dst)
         awake_ms = (time.time() - self.t_awake) * 1000.0
         overridden = "none"
-        if fairness_fired and getattr(self, "_park_attempt_epoch", None) == self.epoch \
+        if src == "D" and awake_ms < need and Front._k7_dwell_idle_skip(self, awake_ms, need):
+            # K7-DWELL skip (N5j): the dwell amortises a flip over D's decodes --
+            # an idle D has none, so holding it only delays the waiting P work
+            overridden = "d_idle"
+        elif fairness_fired and getattr(self, "_park_attempt_epoch", None) == self.epoch \
                 and Front._x_excursion_band_off(self):
             # PDFLIP-B: admission was closed by this phase's own park, whose trigger
             # already passed the derived min-dwell (_immediate_park_due) -- not a
@@ -11301,7 +11336,7 @@ class Front:
         # request P can never hold, the D->P legs ran into W35/W68 and both
         # groups died. A floor under every override: the woken group keeps
         # the cards for at least FAIRNESS_DWELL_FLOOR_MS.
-        ok = awake_ms >= need or (
+        ok = awake_ms >= need or overridden == "d_idle" or (
             overridden != "none" and awake_ms >= FAIRNESS_DWELL_FLOOR_MS
         )
         logger.info("WEG2 MIN-DWELL src=%s dst=%s awake_ms=%d derived_from_flip_ms=%d overridden_by=%s "
