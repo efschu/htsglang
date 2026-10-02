@@ -116,6 +116,11 @@ def chunks(ring, keys, g: str) -> List[dict]:
         if n > 1:
             # several chunks between two samples: they ran back to back for their summed compute time
             s = min(s, e0 - (_d(b, a, "pcomp") or 0.0) / 1000.0)
+            if k0 == kl:
+                # one stage (D): no pipeline queue in front of a chunk, its wait is expert streaming and
+                # collectives -- the chunks ran for their summed gpu_ms (02.10.: 2944+475 tokens took
+                # 4766+1961 ms, compute alone 1323 ms drew a 5-s hole before the prefill)
+                s = min(s, e0 - (_d(b, a, "pgpu") or 0.0) / 1000.0)
         cnt = b.get("pchunks")
         el = next((t for c, t in last_recs if cnt is not None and c >= cnt), None) if kl != k0 else e0
         out.append({"s": s, "e0": e0, "e": max(e0, el if el is not None else e0), "tok": tok,

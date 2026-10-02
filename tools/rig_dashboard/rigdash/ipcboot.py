@@ -69,6 +69,9 @@ def compact(rec: dict) -> dict:
         "pcached": _n(pre.get("cached_tokens")),
         "pchunks": _n(pre.get("chunks")),
         "pcomp": first(_n(pre.get("compute_ms")), _n(pre.get("gpu_ms"))),
+        # Nutzer 02.10. (D 07:16:32-37Z "steht 5 s still"): the whole forward incl. its wait -- on D the
+        # wait is expert H2D streaming and DCP collectives, work, not queueing behind another chunk
+        "pgpu": _n(pre.get("gpu_ms")),
         "plast_t": _n((pre.get("last") or {}).get("t")) if isinstance(pre.get("last"), dict) else None,
         "plast_gpu": _n((pre.get("last") or {}).get("gpu_ms")) if isinstance(pre.get("last"), dict) else None,
         # FEHLT 7 (d086ac9a71, ab Build y5a): the chunk's own time and pure compute, without the wait
