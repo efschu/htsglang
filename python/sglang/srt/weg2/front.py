@@ -7594,6 +7594,10 @@ class Front:
                 "attached on P's PP0 and do not exist on D",
                 rid, route)
             route = "long"
+        if _verdict == VERDICT_STAGE:
+            # PDFLIP-X: a vision excursion (bound to P by W102) is no text
+            # excursion -- its waits never price X.
+            Front._x_note_vision(self, rid)
         # H84: THE BAND ABOVE THE START X GOES TO D ONLY AS A SINGLETON. A
         # live X above the start X would send a burst of 4-8k prompts to D one
         # after another -- NF's D is bs1, so x177's 8x4.2k burst (22.8 s
@@ -8855,7 +8859,7 @@ class Front:
                             else "d_single" if single_prefill else "after_p")
                     logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f",
                                 rid, self.epoch, _via, (time.time() - t0) * 1000.0)
-                    if _via == "after_p":  # PDFLIP-X: the excursion's P->D wait
+                    if _via == "after_p" and not Front._x_is_vision(self, rid):  # PDFLIP-X: P->D wait
                         Front._note_x_excursion(self, "pd", time.time() - t0)
                     # TSDB: leg-2 first content and the TTFT from the front's arrival stamp
                     self._metrics().leg2_first_content(
@@ -11097,7 +11101,7 @@ class Front:
                 for lim in (10, 30, 60):
                     if dec["wait_s"] >= lim:
                         self.counters[f"dp_wait_ge{lim}s"] += 1
-                if a.origin == "long":  # PDFLIP-X: the excursion's D->P wait
+                if a.origin == "long" and not Front._x_is_vision(self, p.rid):  # PDFLIP-X: D->P wait
                     try:
                         Front._note_x_excursion(self, "dp", float(dec["wait_s"]))
                     except Exception:  # noqa: BLE001 -- an instrument never breaks a flip
@@ -11403,6 +11407,22 @@ class Front:
             k_src = f"not-divided(measured k={k:.2f} [{k_src}]: the trigger waits the whole round trip)"
             k = 1.0
         return line, line_src, price, price_src, k, k_src
+
+    #: PDFLIP-X: vision rids remembered (newest), bounded
+    X_VISION_RIDS_MAX = 1024
+
+    def _x_note_vision(self, rid) -> None:
+        """PDFLIP-X: ``rid`` carries an image (W102 STAGE, bound to P)."""
+        try:
+            d = self.__dict__.setdefault("_x_vision_rids", collections.OrderedDict())
+            d[str(rid)] = True
+            while len(d) > self.X_VISION_RIDS_MAX:
+                d.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks routing
+            pass
+
+    def _x_is_vision(self, rid) -> bool:
+        return str(rid) in (getattr(self, "_x_vision_rids", None) or ())
 
     def _note_x_excursion(self, side: str, seconds: float) -> None:
         """PDFLIP-X: one wait of a LONG excursion (``dp`` | ``pd``) at this epoch."""

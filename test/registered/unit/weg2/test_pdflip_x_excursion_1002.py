@@ -161,3 +161,37 @@ def test_red_the_front_records_samples_and_the_manual_flip_marks_its_epochs():
     asyncio.run(F.Front.handle_manual_flip(ns, None))
     assert flips == [("D", "P"), ("P", "D")]
     assert ns._x_manual_epochs == {21, 22}            # the probe's P phase and the D phase after it
+
+
+def test_red_vision_excursions_never_price_x():
+    """weg2-14-69 / weg2-16-73 (N4p) carry an image: W102 binds them to P,
+    whose tower runs before the prefill -- a vision excursion is no text
+    excursion. Their DP-WAIT / LEG2 waits are not sampled."""
+    import inspect
+
+    from sglang.srt.weg2 import front as F
+
+    ns = types.SimpleNamespace(X_VISION_RIDS_MAX=2)
+    F.Front._x_note_vision(ns, "weg2-14-69")
+    assert F.Front._x_is_vision(ns, "weg2-14-69") and not F.Front._x_is_vision(ns, "weg2-14-70")
+    F.Front._x_note_vision(ns, "a")
+    F.Front._x_note_vision(ns, "b")
+    assert not F.Front._x_is_vision(ns, "weg2-14-69")        # bounded, oldest first
+    src = inspect.getsource(F.Front)
+    assert 'a.origin == "long" and not Front._x_is_vision(self, p.rid)' in src
+    assert '_via == "after_p" and not Front._x_is_vision(self, rid)' in src
+    assert "Front._x_note_vision(self, rid)" in src
+
+
+def test_n4p_text_only_samples_still_make_7691_short():
+    """N4p's two warm D->P samples (epochs 15, 17) are weg2-14-69 and weg2-16-73 --
+    both vision. Text only, the D->P side has no warm sample yet, the price falls
+    back to the ski price -- undivided: 5.27 s -> X* ~8.3k > 7691, still SHORT.
+    With the P->D text samples (3.089 3.099 3.169 3.004 4.307 s) and a first
+    text D->P wait the excursion price takes over."""
+    text_dp = [(1, 4.0), (1, 3.2)]
+    text_pd = [(2, 6.723), (8, 3.089), (10, 3.099), (12, 3.169), (14, 3.004), (20, 4.307)]
+    price, src = pp.excursion_price_s(text_dp, text_pd, (), FIRST)
+    assert price is None and "dp n=0" in src
+    x_star = _x(5.27, 1.0)
+    assert 8200 < x_star < 8450 and x_star > UNCACHED_14_69
