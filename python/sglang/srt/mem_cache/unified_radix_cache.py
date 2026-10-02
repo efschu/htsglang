@@ -2085,6 +2085,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # TREE-RESET-SUB (02.10., N6a ..._4dd76c122a_1002_164400: WEG2-SLEEP-SUB
+        # rpc_flush tree_reset=31-47 ms on P's PP ranks, the block of the P>D
+        # quiesce): where this reset spends it, one line per reset with a host
+        # pool behind it. Instrument only -- no branch reads it.
+        _ts = [("t0", time.perf_counter())]
+
+        def _mk(name: str) -> None:
+            _ts.append((name, time.perf_counter()))
+
         # rc12 (D, all ranks, 23:12:47Z: "H-leaf extra: [62, 64, 60, 63]" +
         # "4 stale nodes in host_leaves"): the #1417 prefetch pins name nodes
         # of the tree being destroyed. Kept across the sleep flush, the held
@@ -2094,9 +2103,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # -- and before the arena release below, which skips host-locked nodes.
         for _rid in list(getattr(self, "_prefetch_span_pins", None) or ()):
             self._unpin_prefetched_span(_rid)
+        _mk("unpin")
         # H81: the old tree's arena references go back FIRST -- see
         # `_release_host_values_before_reset` (fnNV4f2 mamba_full).
         self._release_host_values_before_reset()
+        _mk("release_host")
         # P-HOST-OVERLAP: a deferred chunk publish names nodes of the tree being
         # destroyed; it must not outlive it (empty unless the mode is on).
         self._weg2_deferred_chunk_publish = []
@@ -2184,6 +2195,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # `--hicache-host-role retention`, which is the default (G2).
         self._drop_staging_write_ring()
         self._init_pin_trace()
+        _mk("tree_rebuild")
 
         # the HOLDERS census thread names a snapshot a reset moved under (torn)
         self._weg2_reset_epoch = int(getattr(self, "_weg2_reset_epoch", 0)) + 1
@@ -2192,12 +2204,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # row queued there still holds the reader reference its resolve
             # took -- given back here, before it has no holder at all.
             self._weg2_release_queued_refs_before_reset()
+            _mk("queued_refs")
             self.cache_controller.reset()
+            _mk("controller_reset")
             self.cache_controller.mem_pool_host.clear()
+            _mk("host_clear")
             self.enable_storage = self.cache_controller.enable_storage
             if getattr(self.cache_controller.mem_pool_host, "arena_read", False):
                 self._weg2_release_orphan_refs("reset")
+                _mk("orphans")
                 self._weg2_log_holder_census("reset")
+                _mk("census")
 
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
@@ -2210,6 +2227,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node=self.root_node,
         )
         self._record_all_cleared_event()
+        _mk("tail")
+        if self.cache_controller is not None:
+            try:
+                segs = " ".join("%s=%.1f" % (n, (t - _ts[i][1]) * 1000.0)
+                                for i, (n, t) in enumerate(_ts[1:]))
+                start_ms = getattr(self.cache_controller, "_weg2_last_start_ms", None)
+                logger.info("WEG2-TREE-RESET-SUB total=%.1f %s threads_start=%s (ms per step of "
+                            "UnifiedRadixCache._reset_full, in order; threads_start = the storage "
+                            "threads' restart inside controller_reset)",
+                            (_ts[-1][1] - _ts[0][1]) * 1000.0, segs,
+                            "-" if start_ms is None else "%.1f" % start_ms)
+            except Exception:  # noqa: BLE001 -- an instrument never breaks a reset
+                pass
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
