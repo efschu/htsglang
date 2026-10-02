@@ -6,8 +6,7 @@ carves a post ``l15`` out of every P budget, sized from the MEASURED P awake
 peak (record ``P_AWAKE_PEAK_MIB``), never from a reserve -- keep spans are
 fixed per sleep, so the planner sizes them against what P actually needed
 (L15-PLAN-0930 2.4, "Elastic").  This module answers, from numbers handed in,
-how much each card holds, under which provenance, and what an NF hold costs in
-resident expert rows.  It decides; it never launches: no launcher import, no
+how much each card holds and under which provenance.  It decides; it never launches: no launcher import, no
 torch, no record I/O.  The wiring into ``launcher.budgets_from_dc`` and
 ``vram_plan_view._p_group`` is the separate L15-01b.
 
@@ -17,16 +16,16 @@ Switches (code default off; off means the launch stays byte for byte today's):
   SGLANG_WEG2_L15_MIB      ``auto`` | ``c<card>=<mib>,...`` operator override,
                            shown as OVERRIDE in the vram_plan
 
-NF law (free VRAM = experts): on the ``nextflash`` line the post defaults to
-0 no matter what the record would say.  An override > 0 is the user addendum:
-an L1.5 hold PAID with resident MoE experts -- rows = floor(l15 / row_mib),
-the row size from the P card fit, shown next to the post (boot line
-``L15-POST card= mib= src= experts_rows_traded=``).
+L1.5 is a 27B-ONLY feature (user correction 2026-10-02): the 27B fits the
+VRAM whole, so its free VRAM is context/cache; on NF free VRAM belongs to the
+MoE experts and there is NO L1.5 variant, not even as an option. A launch on
+any other line with the master (or the hot handover) on is refused by name
+(``W-L15-27B-ONLY``, :func:`refuse_not_27b`), never silently off -- the ranks
+read the switch from the environment and would arm the hold.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -37,11 +36,12 @@ HOT_HANDOVER_ENV = "SGLANG_WEG2_HOT_HANDOVER"
 _ON_VALUES = ("1", "true", "on")
 
 LINE_QWEN27B = "qwen27b"
-LINE_NEXTFLASH = "nextflash"
 
 #: refusal code: L1.5 and the hot handover are refused on --dual-layout in V1
 DUAL_REFUSAL_CODE = "W-L15-DUAL"
 NOCAP_REFUSAL_CODE = "W-L15-NOCAP"
+#: refusal code: L1.5 / the hot handover on any line but the 27B
+NOT27B_REFUSAL_CODE = "W-L15-27B-ONLY"
 
 
 def _switch(env: Mapping[str, str], key: str) -> bool:
@@ -54,7 +54,7 @@ def master_on(env: Mapping[str, str]) -> bool:
 
 
 def handover_on(env: Mapping[str, str]) -> bool:
-    """The hot-handover switch (2.0, both lines); same parsing, default off."""
+    """The hot-handover switch (2.0, 27B only); same parsing, default off."""
     return _switch(env, HOT_HANDOVER_ENV)
 
 
@@ -92,51 +92,37 @@ def l15_post_mib(p_budget_mib: int, p_awake_peak_mib: Optional[int]) -> Tuple[in
     return (max(0, int(p_budget_mib) - int(p_awake_peak_mib)), "RECORD(P_AWAKE_PEAK_MIB)")
 
 
-def nf_expert_trade(l15_mib: int, row_mib: float) -> int:
-    """Expert rows an NF hold of ``l15_mib`` costs at ``row_mib`` per row."""
-    if row_mib <= 0:
-        raise ValueError(f"nf_expert_trade: row_mib must be > 0, got {row_mib!r} "
-                         "-- an expert row of 0 or less MiB prices nothing")
-    return int(math.floor(int(l15_mib) / float(row_mib)))
-
-
 @dataclass(frozen=True)
 class L15Post:
-    """One card's L1.5 hold: the bytes, where they come from, their expert cost."""
+    """One card's L1.5 hold: the bytes and where they come from."""
 
     card: int
     mib: int
     src: str
-    experts_rows_traded: int
 
 
 def resolve_posts(line: str, p_budget_mib: Sequence[int],
                   p_awake_peak_mib: Sequence[Optional[int]],
-                  env: Mapping[str, str],
-                  row_mib: Optional[Sequence[float]] = None) -> List[L15Post]:
+                  env: Mapping[str, str]) -> List[L15Post]:
     """Per card what L1.5 holds on the given launch line, in order.
 
     Precedence (fail-fast, no hidden mode mixing): master off -> every card 0
     under OFF; else an override decides the cards it names (OVERRIDE) and
-    holds 0 on the rest (OVERRIDE-UNNAMED); else the NF line defaults to 0
-    (NF-DEFAULT-0, the free-VRAM-is-the-experts' law); else the post comes
-    from the records.  ``experts_rows_traded`` is priced only where the hold
-    is actually paid with experts: the NF line with a row size handed in.
+    holds 0 on the rest (OVERRIDE-UNNAMED); else the post comes from the
+    records.  Only the 27B line exists (any other line raises: L1.5 is
+    27B-only, see the module docstring).
     """
     n = len(p_budget_mib)
     if len(p_awake_peak_mib) != n:
         raise ValueError(f"resolve_posts: {len(p_awake_peak_mib)} awake peaks for "
                          f"{n} budgets -- a partial vector never prices a card")
-    if row_mib is not None and len(row_mib) != n:
-        raise ValueError(f"resolve_posts: {len(row_mib)} row sizes for {n} cards")
     norm = str(line).strip().lower()
-    if norm not in (LINE_QWEN27B, LINE_NEXTFLASH):
-        raise ValueError(f"resolve_posts: unknown launch line {line!r} "
-                         f"(known: {LINE_QWEN27B!r}, {LINE_NEXTFLASH!r})")
+    if norm != LINE_QWEN27B:
+        raise ValueError(f"resolve_posts: launch line {line!r} has no L1.5 "
+                         f"(27B-only: {LINE_QWEN27B!r})")
     if not master_on(env):
-        return [L15Post(card=i, mib=0, src="OFF", experts_rows_traded=0) for i in range(n)]
+        return [L15Post(card=i, mib=0, src="OFF") for i in range(n)]
     mode, override = parse_l15_mib(env.get(L15_MIB_ENV))
-    nf = norm == LINE_NEXTFLASH
     posts: List[L15Post] = []
     for i in range(n):
         if mode == "override":
@@ -144,13 +130,9 @@ def resolve_posts(line: str, p_budget_mib: Sequence[int],
                 mib, src = override[i], "OVERRIDE"
             else:
                 mib, src = 0, "OVERRIDE-UNNAMED"
-        elif nf:
-            mib, src = 0, "NF-DEFAULT-0"
         else:
             mib, src = l15_post_mib(int(p_budget_mib[i]), p_awake_peak_mib[i])
-        rows = (nf_expert_trade(mib, row_mib[i])
-                if nf and mib > 0 and row_mib is not None else 0)
-        posts.append(L15Post(card=i, mib=mib, src=src, experts_rows_traded=rows))
+        posts.append(L15Post(card=i, mib=mib, src=src))
     return posts
 
 
@@ -174,6 +156,23 @@ def refuse_dual(argv: Sequence[str], env: Mapping[str, str]) -> Optional[str]:
             "boot a launch whose L1.5 would silently do nothing.")
 
 
+def refuse_not_27b(profile: str, env: Mapping[str, str]) -> Optional[str]:
+    """L1.5 is 27B-only (user correction 2026-10-02): on any other launch
+    line (NF: free VRAM = experts) the master or the hot handover switch is a
+    launch error, refused BY NAME -- a silent off would still let every rank
+    read SGLANG_WEG2_L15=1 from its environment and arm the hold."""
+    if str(profile).strip().lower() == LINE_QWEN27B:
+        return None
+    armed = [name for name, on in ((L15_MASTER_ENV, master_on(env)),
+                                   (HOT_HANDOVER_ENV, handover_on(env))) if on]
+    if not armed:
+        return None
+    return (f"{NOT27B_REFUSAL_CODE}: {', '.join(armed)} on profile {profile!r} is refused: "
+            "L1.5 is a 27B-only feature (the 27B fits the VRAM whole, its free VRAM is "
+            "context/cache; on NF free VRAM belongs to the MoE experts, there is no L1.5 "
+            "variant). Turn the switch off for this profile.")
+
+
 def refuse_no_caps(posts: Sequence[L15Post], env: Mapping[str, str]) -> Optional[str]:
     """The no-cap refusal (N3f): with the master on, a launch whose every card
     holds 0 MiB can never retain a single row -- N3c (10012013) and N3e
@@ -193,9 +192,8 @@ def refuse_no_caps(posts: Sequence[L15Post], env: Mapping[str, str]) -> Optional
 
 
 def post_line(p: L15Post) -> str:
-    """The boot line, one per card: what is held there and what it cost."""
-    return (f"L15-POST card={p.card} mib={p.mib} src={p.src} "
-            f"experts_rows_traded={p.experts_rows_traded}")
+    """The boot line, one per card: what is held there."""
+    return f"L15-POST card={p.card} mib={p.mib} src={p.src}"
 
 
 def residue_without_hold(residue_mib: int, held_mib: Optional[int]) -> int:
