@@ -7661,9 +7661,12 @@ class SchedulerWeightUpdaterManager:
             plan = [(str(rids[0]), row, slot, gen)
                     for row, slot, gen, _lane, rids in
                     l15_restore.owned_l2_rows(m, rank, prefix)]
-            device_pool = getattr(getattr(getattr(sched, "tp_worker", None),
-                                          "model_runner", None),
-                                  "token_to_kv_pool", None)
+            # L15-FIX-REFILL-POOL: the same full-attention pool the refill
+            # writes (the hybrid wrapper has no k_buffer)
+            from sglang.srt.weg2.l15_shadow import kv_pool_of as _l15_kvp
+            device_pool = _l15_kvp(getattr(getattr(getattr(sched, "tp_worker", None),
+                                                   "model_runner", None),
+                                           "token_to_kv_pool", None))
             host_pool = l15_bind.live_host_pools(
                 getattr(sched, "tree_cache", None))[0]
             if device_pool is None or host_pool is None:
@@ -7699,8 +7702,11 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weg2.l15_wake_check import L15CheckRefused
 
         try:
-            return self._l15_decide_wake_verdict(
-                wake_on, fp, self._l15_wake_sample_check(), epoch=epoch)
+            # L15-FIX-CHECK-NOVOTE (N4f TP0: a failed refill voted None and
+            # STILL paid the 64-row sample, 156-962 ms): a rank that votes no
+            # hold has nothing to check
+            _chk = self._l15_wake_sample_check() if fp is not None else None
+            return self._l15_decide_wake_verdict(wake_on, fp, _chk, epoch=epoch)
         except L15CheckRefused as exc:
             self._l15_check_refusals = int(
                 getattr(self, "_l15_check_refusals", 0) or 0) + 1
@@ -7774,7 +7780,12 @@ class SchedulerWeightUpdaterManager:
             for _x in _vw:
                 prefix.append(prefix[-1] + _x)
             mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
-            device_pool = getattr(mr, "token_to_kv_pool", None)
+            # L15-FIX-REFILL-POOL (N4f TP0 every wake: 'HybridLinearKVPool'
+            # object has no attribute 'k_buffer' -> refill failed, the sample
+            # read zeros, bad=64): the arena loader writes per-layer K/V rows,
+            # which the hybrid wrapper keeps on its full-attention pool
+            from sglang.srt.weg2.l15_shadow import kv_pool_of as _l15_kvp
+            device_pool = _l15_kvp(getattr(mr, "token_to_kv_pool", None))
             # L15-FIX-HOSTGROUP: mem_pool_host is the HostPoolGroup on the
             # hybrid 27B; the arena pools are its KV / MAMBA entries.
             from sglang.srt.weg2.l15_bind import live_host_pools

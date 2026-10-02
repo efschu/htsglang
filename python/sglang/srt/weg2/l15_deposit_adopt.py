@@ -31,6 +31,8 @@ gate is open (verdict "hold", group ok, switch on), even with no deposits.
 
 from __future__ import annotations
 
+from sglang.srt.weg2.l15_shadow import kv_pool_of as _kvp  # L15-FIX-REFILL-POOL
+
 import json
 import os
 from array import array
@@ -434,7 +436,7 @@ def adopt_for_sched(sched, env, log, *, epoch: int, gather) -> List[str]:
             match=match, tree_cache=tree,
             kv_alloc=getattr(sched, "token_to_kv_pool_allocator", None),
             mamba_alloc=getattr(rtp, "mamba_allocator", None),
-            host_pool=host_pool, device_pool=wrapper, host_mamba=host_mamba,
+            host_pool=host_pool, device_pool=_kvp(wrapper), host_mamba=host_mamba,
             dev_mamba=getattr(rtp, "mamba_pool", None), gather=gather, log=log)
     finally:
         clear_epoch_files(directory)

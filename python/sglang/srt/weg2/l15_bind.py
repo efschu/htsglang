@@ -346,6 +346,25 @@ def _slot_gens_or_minus_one(pool, slots, log, what: str):
     return fn(slots)
 
 
+def _owner_counts(slots, prefix) -> Tuple[int, ...]:
+    """Per-rank count of ``slots`` under the owner rule (rank r owns slot L
+    iff prefix[r] <= L % S < prefix[r+1]); a slot with no owner raises like
+    l15_compact.owner_of."""
+    import numpy as np
+
+    pre = np.asarray([int(x) for x in prefix], dtype=np.int64)
+    n = len(pre) - 1
+    a = np.asarray(slots, dtype=np.int64).reshape(-1)
+    if a.size == 0:
+        return tuple([0] * n)
+    S = int(pre[-1])
+    r = np.searchsorted(pre, a % S, side="right") - 1
+    if int(r.min()) < 0 or int(r.max()) >= n:
+        bad = int(a[(r < 0) | (r >= n)][0])
+        owner_of(bad, prefix)        # raises the named ValueError
+    return tuple(int(x) for x in np.bincount(r, minlength=n)[:n])
+
+
 def build_retain_kwargs(
     reqs: Iterable,
     req_to_token,
@@ -448,8 +467,11 @@ def build_retain_kwargs(
             )
         except ValueError:
             anchor_rows.append((rid, -1))
-        _owned = tuple(owner_of(s, prefix) for s in _slots)
+        # L15-FLIPCOST-4 (N4f bind 538-945 ms with nothing held): owner_of
+        # per slot re-validated the prefix every call (~250k calls per
+        # sleep); one vectorised owner count, same rule
         _n = len(prefix) - 1
+        _owned_counts = _owner_counts(_slots, prefix)
         entries.append(
             {
                 "rid": rid,
@@ -457,9 +479,7 @@ def build_retain_kwargs(
                 "last_active": float(
                     getattr(req, "l15_last_active", 0.0) or 0.0
                 ),
-                "rows_by_rank": tuple(
-                    sum(1 for o in _owned if o == r) for r in range(_n)
-                ),
+                "rows_by_rank": _owned_counts,
                 "anchor_depth": span,
                 "kv_depth": span,
             }

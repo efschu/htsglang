@@ -81,3 +81,25 @@ def test_all_ranks_retained_cap0_without_refill_falls_back_uniformly(monkeypatch
     for r in range(3):
         free = {int(x) for x in scheds[r].token_to_kv_pool_allocator.free_pages.tolist()}
         assert free == set(range(1, c.ALLOC_SIZE + 1))
+
+
+def test_agreed_no_hold_wake_keeps_every_tree_for_the_parked_reads(monkeypatch, tmp_path):
+    """N4f W50 class: the sleep agreement turned the round off on EVERY rank
+    (nobody retained); the wake with verdict none must not reset any tree --
+    the #248 hold reads of the parked requests (head + store credit) live
+    there (#1455)."""
+    c = _chain()
+    c._env(monkeypatch, tmp_path, mib="c1=64,c2=64")
+    scheds = {r: c._sched() for r in range(3)}
+    for r in range(3):
+        scheds[r]._l15_tree_retained = False        # agreement: nobody holds
+    fss = {r: c._fake_self(scheds[r], r) for r in range(3)}
+    for r in range(3):
+        assert c.WU._weg2_wake_restore_pools(fss[r]) is True
+    votes = [c._hold_votes(fss[r]) for r in range(3)]
+    gc = l15_restore.group_check(votes)
+    assert gc.verdict == "none"
+    for r in range(3):
+        c.WU._l15_wake_act(fss[r], scheds[r], gc.verdict, group_ok=True,
+                           master_on=True)
+    assert [scheds[r].tree_cache.resets for r in range(3)] == [0, 0, 0]

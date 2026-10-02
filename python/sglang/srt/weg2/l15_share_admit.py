@@ -20,6 +20,8 @@ SGLANG_WEG2_L15_HOT_SHARE=1.
 
 from __future__ import annotations
 
+from sglang.srt.weg2.l15_shadow import kv_pool_of as _kvp  # L15-FIX-REFILL-POOL
+
 import json
 import os
 from dataclasses import dataclass
@@ -549,7 +551,7 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
     dev = g.dev
     host_pool, host_mamba = l15_bind.live_host_pools(g.tree_cache)
     mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
-    l2 = L2Loader(host_pool, getattr(mr, "token_to_kv_pool", None), host_mamba,
+    l2 = L2Loader(host_pool, _kvp(getattr(mr, "token_to_kv_pool", None)), host_mamba,
                   getattr(g.req_to_token_pool, "mamba_pool", None))
     # L15-HOLDMAP: every fd received and every extent mapped by this take is
     # released once the copies are done -- a lingering import pins D's hold
@@ -618,7 +620,7 @@ def take_all_at_wake(sched, env, log) -> int:
         return 0
     host_pool, host_mamba = l15_bind.live_host_pools(g.tree_cache)
     mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
-    l2 = L2Loader(host_pool, getattr(mr, "token_to_kv_pool", None), host_mamba,
+    l2 = L2Loader(host_pool, _kvp(getattr(mr, "token_to_kv_pool", None)), host_mamba,
                   getattr(g.req_to_token_pool, "mamba_pool", None))
     adopted = 0
     for rid in rids:

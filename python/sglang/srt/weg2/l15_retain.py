@@ -314,6 +314,7 @@ def retain_at_sleep(
         # overrun a capped rank's hold region. Drop the lowest-priority held
         # request until every capped rank's keep fits its cap.
         trimmed = []
+        _rows0 = tuple(int(x) for x in plan.rows_by_rank)
         while hs.rids and any(
                 int(caps_rows_by_rank[r]) > 0
                 and int(plan.rows_by_rank[r]) > int(caps_rows_by_rank[r])
@@ -333,6 +334,8 @@ def retain_at_sleep(
                                 prefix, reserved=PAD_SLOTS)
         if trimmed:
             log(f"L15-RETAIN trimmed n={len(trimmed)} rids={trimmed} "
+                f"keep_rows={_rows0} caps={tuple(int(c) for c in caps_rows_by_rank)} "
+                f"l_h={plan.l_h} "
                 f"(compacted keep rows over a capped rank's hold region)")
         if not hs.rids:
             log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold (all trimmed)")
