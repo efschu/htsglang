@@ -4082,6 +4082,31 @@ class Envs:
     # a queued request that needs P); P stays awake ("WEG2 MANUAL-FLIP RETURN-SKIP
     # reason=..."). 0 = the round trip always returns to D, as before.
     SGLANG_WEG2_MANUAL_FLIP_RETURN_SKIP = EnvBool(True)
+    # GC-GUARD (02.10., N5q epoch 4: 'WEG2-FRONT GC-PAUSE generation=2 ms=92
+    # collected=0' between the P>D done and the D>P begin): the front never lets
+    # CPython start a generation-2 pass on its own; the due pass runs when no flip
+    # is open and no verdict waits (weg2/front_gc_guard.py), the warm-up end
+    # freezes the heap again, a slow pass refreezes its survivors. Markers
+    # 'WEG2-FRONT GC-GUARD armed=|full reason=|warm-freeze|refreeze'.
+    # 0 = CPython's own schedule, as before.
+    SGLANG_WEG2_FRONT_GC_GUARD = EnvBool(True)
+    # GC-GUARD: a due full pass waits at most this long for a moment without
+    # queued work; then it runs at the next moment no flip is open.
+    SGLANG_WEG2_FRONT_GC_MAX_DEFER_S = EnvFloat(30.0)
+    # DONE-KICK (02.10., N5q epoch 4: the LONG weg2-3-5 queued at 13.541 during a
+    # P>D flip; done 13.854, the controller's next 0.2 s tick decided at 14.038):
+    # a P>D flip that closes with P-bound work queued wakes the controller at
+    # once -- the same D-branch decision (economics, MIN-DWELL, fairness), only
+    # not one tick later. Marker 'WEG2-FLIP DONE-KICK'. 0 = the tick, as before.
+    SGLANG_WEG2_CTL_KICK_DONE_QUEUED = EnvBool(True)
+    # PARK-READ-DETACH (02.10., L15 boot dac8b62b8c D 14:43:49: '#1068 RESET JOIN
+    # terminated_ops=1 joined_s=1.29', 'WEG2-SLEEP-SUB alloc_clear=1414'): the sleep
+    # flush's reset terminates the open store reads of D's park list and joins their
+    # thread in a background reaper (which restarts the pipeline) instead of
+    # synchronously -- only while no store->host page transfer is in flight. Marker
+    # '#1068 RESET JOIN ... detached=prefetch' / '#1068 PARK-READ-DETACH reaped'.
+    # 0 = the reset joins as before.
+    SGLANG_WEG2_PARK_READ_DETACH = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
