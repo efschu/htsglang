@@ -4052,6 +4052,11 @@ class Envs:
     # "park", not "fairness", in MIN-DWELL (NF: the ARRIVAL-SEAT trigger passes
     # K7's min-dwell first). 0 = the band floor and the threshold as before.
     SGLANG_WEG2_X_BAND_FOLLOWS_PRICE = EnvBool(True)
+    # MANUAL-FLIP RETURN-SKIP (02.10., L15 boot dac8b62b8c 14:43:03): POST /weg2/flip
+    # from D skips its return half P->D while P-bound work waits (P outstanding or
+    # a queued request that needs P); P stays awake ("WEG2 MANUAL-FLIP RETURN-SKIP
+    # reason=..."). 0 = the round trip always returns to D, as before.
+    SGLANG_WEG2_MANUAL_FLIP_RETURN_SKIP = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
