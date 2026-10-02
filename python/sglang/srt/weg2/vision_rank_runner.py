@@ -249,7 +249,9 @@ def stage_skip_verdict(scheduler, req) -> Tuple[str, int, str]:
     end = image_end(req)
     if not end:
         return STAGE, 0, "none"
-    local = (len(getattr(req, "prefix_indices", None) or ())
+    # prefix_indices is a tensor on the cached path: `tensor or ()` raises on an empty one (y7m 13:17Z P death)
+    _pi = getattr(req, "prefix_indices", None)
+    local = ((0 if _pi is None else len(_pi))
              + int(getattr(req, "host_hit_length", 0) or 0))
     if getattr(scheduler, "_weg2_store_told_armed", False):
         told = (getattr(scheduler, "_weg2_store_told", None) or {}).get(req.rid)
@@ -290,7 +292,8 @@ def skip_still_covered(scheduler, req) -> bool:
     from sglang.srt.weg2.vision_d_guard import image_end
 
     end = image_end(req)
-    covered = (len(getattr(req, "prefix_indices", None) or ())
+    _pi = getattr(req, "prefix_indices", None)
+    covered = ((0 if _pi is None else len(_pi))
                + int(getattr(req, "host_hit_length", 0) or 0))
     if covered >= end:
         return True
