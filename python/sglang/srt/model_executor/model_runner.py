@@ -5156,12 +5156,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
+            from sglang.srt.managers.weg2_p_overlap import span as _weg2_pov_span
+
+            with _weg2_pov_span("fwd_raw"):  # PDFLIP-G: a part of #PGAP launch (no-op unless armed)
+                output = self._forward_raw(
+                    forward_batch,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,

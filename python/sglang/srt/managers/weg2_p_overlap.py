@@ -372,6 +372,8 @@ class GapMeter:
         self._pending: Deque[Tuple] = deque()
         self._cap = int(cap)
         self.n = 0
+        #: PDFLIP-G: (gap_ms, launch_ms) of the forwards since the last #PGAP-SUM
+        self._win: list = []
 
     def _event(self):
         if self._event_factory is not None:
@@ -403,6 +405,10 @@ class GapMeter:
             fwd = float(start.elapsed_time(end))
             self.n += 1
             lines.append(format_line(self.rank, fwd_ct, tokens, gap, fwd, host))
+            self._win.append((gap, float(host.get("launch", 0.0)), fwd))
+            if len(self._win) >= SUMMARY_EVERY:
+                lines.append(summary_line(self.rank, self._win))
+                self._win = []
         return lines
 
 
@@ -414,6 +420,30 @@ _PLAN_PARTS = ("anchor", "publish", "rowcheck", "evict_drain")
 #: ``launch - fi_plan`` is the launch's own host work.
 _ORDER = ("plan", "proxy_recv", "launch", "fi_plan", "deferred_publish",
           "output_commit", "d2h_wait", "process")
+#: PDFLIP-G (N5a 1002_114540: launch 426-640 ms ~ gpu_fwd 475-540 ms, card
+#: idle 78-180 ms on every chunk): the parts of ``launch`` -- ForwardBatch.init_new
+#: and the model's _forward_raw; ``rest`` = launch minus both (run_batch's own).
+_LAUNCH_PARTS = ("fb_init", "fwd_raw")
+#: a #PGAP-SUM line every this many forwards
+SUMMARY_EVERY = 16
+
+
+def _q(vals, p):
+    v = sorted(vals)
+    return v[min(len(v) - 1, int(round(p * (len(v) - 1))))] if v else None
+
+
+def summary_line(rank, win) -> str:
+    """PDFLIP-G: gpu_gap / launch / gpu_fwd p50 p90 over the last forwards."""
+    gaps = [g for g, _, _ in win if g is not None]
+    launch = [lw for _, lw, _ in win]
+    fwd = [f for _, _, f in win]
+    fmt = lambda x: "-" if x is None else "%.1f" % x  # noqa: E731
+    return ("#PGAP-SUM pp_rank=%s n=%d gpu_gap_ms p50=%s p90=%s max=%s launch_ms p50=%s p90=%s "
+            "gpu_fwd_ms p50=%s (card idle per forward against the host's launch; a launch near "
+            "gpu_fwd starves the card whatever runs after it)" % (
+                rank, len(win), fmt(_q(gaps, 0.5)), fmt(_q(gaps, 0.9)), fmt(max(gaps) if gaps else None),
+                fmt(_q(launch, 0.5)), fmt(_q(launch, 0.9)), fmt(_q(fwd, 0.5))))
 
 
 def format_line(rank, fwd_ct, tokens, gap_ms, fwd_ms, host: Dict[str, float]) -> str:
@@ -421,9 +451,14 @@ def format_line(rank, fwd_ct, tokens, gap_ms, fwd_ms, host: Dict[str, float]) ->
     term is wall time on the scheduler thread since the previous launch."""
     parts = " ".join("%s=%.0f" % (k, host.get(k, 0.0)) for k in _ORDER)
     inner = " ".join("%s=%.0f" % (k, host.get(k, 0.0)) for k in _PLAN_PARTS)
+    lp = ""
+    if any(k in host for k in _LAUNCH_PARTS):
+        rest = host.get("launch", 0.0) - sum(host.get(k, 0.0) for k in _LAUNCH_PARTS)
+        lp = " launch_parts[%s rest=%.0f]" % (
+            " ".join("%s=%.0f" % (k, host.get(k, 0.0)) for k in _LAUNCH_PARTS), max(0.0, rest))
     return (
-        "#PGAP pp_rank=%s fwd=%s tokens=%s gpu_gap_ms=%s gpu_fwd_ms=%.1f host[%s] "
-        "plan_parts[%s] overlap=%d"
+        ("#PGAP pp_rank=%s fwd=%s tokens=%s gpu_gap_ms=%s gpu_fwd_ms=%.1f host[%s]"
+         + lp.replace("%", "%%") + " plan_parts[%s] overlap=%d")
         % (
             rank,
             fwd_ct,

@@ -568,7 +568,10 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
+            from sglang.srt.managers.weg2_p_overlap import span as _weg2_pov_span
+
+            with _weg2_pov_span("fb_init"):  # PDFLIP-G: a part of #PGAP launch (no-op unless armed)
+                forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
