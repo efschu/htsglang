@@ -338,11 +338,18 @@ def retain_at_sleep(
             mamba_allocator, sorted({int(a) for a in new_anchors.values()})
         )
 
-    # (7) keep windows: kv rows [0, rows_by_rank[rank]), mamba rows [0, A_H)
-    kv_range = ((0, int(plan.rows_by_rank[rank])),)
+    # (7) keep windows: kv rows [0, rows_by_rank[rank]), mamba rows [0, A_H).
+    # L15-FIX-CAP0-KEEP (N3l 02:29:56Z: TP0 kept 555 MB with cap 0): a rank
+    # whose cap is 0 (the 5090 / TP0) is "not held here" -- select_hold does
+    # not charge it, its rows come back from L2 at the wake (refill), so it
+    # must NOT pin VRAM through the P phase, which never budgeted it. Its
+    # keep windows are EMPTY; the rows are still compacted and the manifest
+    # still published (the wake refill and the group vote need both).
+    cap0 = int(caps_rows_by_rank[rank]) == 0
+    kv_range = () if cap0 else ((0, int(plan.rows_by_rank[rank])),)
     for buf in kv_buffers:
         set_keep(buf, kv_range)
-    mamba_range = ((0, int(a_h)),)
+    mamba_range = () if cap0 else ((0, int(a_h)),)
     for buf in mamba_buffers:
         set_keep(buf, mamba_range)
 
