@@ -7232,6 +7232,11 @@ class DeferredRowsFill:
         self.by_tick = 0
         self.by_eager = 0
         self.ticks = 0
+        # 02.10. (y7l NF D->P): layers whose rows were NOT yet on the card when
+        # the forward stream needed them (event open, or loaded by land() on the
+        # forward stream itself). 0 = no forward ever waited for the fill.
+        self.waited = 0
+        self.t_first_tick = None
         # xid13 kvh: layers whose full layout landed after a live seat-row change
         self.seat_moved = 0
         self.seat_moved_on = None
@@ -7302,9 +7307,14 @@ class DeferredRowsFill:
                 load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
                 self.events[id(cache)] = ops.record(self.stream) if ops is not None else None
 
-    def _promote(self, cache, how: str) -> None:
+    def _promote(self, cache, how: str, *, waited: Optional[bool] = None) -> None:
         ops = self._ops()
         ev = self.events.pop(id(cache), None)
+        if waited is None:
+            # an event still open here makes the forward stream wait for it
+            waited = ev is not None and not bool(ev.query())
+        if waited:
+            self.waited += 1
         if ev is not None and ops is not None:
             ops.current_waits(ev)
         rows = int(cache._deferred_rows.rows)
@@ -7320,13 +7330,24 @@ class DeferredRowsFill:
             self.by_eager += 1
         if not self.pending:
             now = self._clock()
+            # fill_ms is fill-start -> THIS promotion (it happens at a forward of
+            # this rank), NOT the copy time: y7l (02.10.) read PP2's fill_ms=6630
+            # as 6.6 s of copies gating P's first chunk, while every layer had
+            # landed before PP2's first forward (forward_waited_layers=0) and
+            # PP2's first forward simply came when PP0+PP1 had computed chunk 1.
+            first = self.t_first_tick
             logger.info(
                 "%s landed layers=%d rows=%d by_tick=%d by_eager=%d ticks=%d "
-                "fill_ms=%s since_rearm_ms=%.0f (every pool layer is on its full layout "
-                "again)", self.LINE, self.by_tick + self.by_eager, self.rows_landed,
-                self.by_tick, self.by_eager, self.ticks,
+                "fill_ms=%s since_rearm_ms=%.0f forward_waited_layers=%d first_forward_ms=%s "
+                "(every pool layer is on its full layout again; fill_ms = fill-start -> this "
+                "promotion at a forward of this rank, not the copy time; "
+                "forward_waited_layers=0: the rows had landed before any forward needed them, "
+                "the fill gated nothing)", self.LINE, self.by_tick + self.by_eager,
+                self.rows_landed, self.by_tick, self.by_eager, self.ticks,
                 "n/a" if self.t_start is None else "%.0f" % ((now - self.t_start) * 1000),
-                (now - (self.t_rearm or now)) * 1000)
+                (now - (self.t_rearm or now)) * 1000, self.waited,
+                "n/a" if first is None or self.t_start is None
+                else "%.0f" % ((first - self.t_start) * 1000))
             if self.seat_moved:
                 logger.info(
                     "%s SEAT-RESTAMP layers=%d rows_on %d->%d (the full layouts were built "
@@ -7344,6 +7365,8 @@ class DeferredRowsFill:
             d = cache._deferred_rows
             # noch nicht auf dem Seitenstrom: dieser Layer allein, hier
             load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
+            self._promote(cache, "eager", waited=True)  # the forward stream copies
+            return
         self._promote(cache, "eager")
 
     def tick(self, is_decode: bool) -> None:
@@ -7351,6 +7374,8 @@ class DeferredRowsFill:
         if not self.pending:
             return
         self.ticks += 1
+        if self.t_first_tick is None:
+            self.t_first_tick = self._clock()
         early = [c for c in self.pending
                  if c._deferred_rows is not None and c._deferred_rows.early]
         if early:

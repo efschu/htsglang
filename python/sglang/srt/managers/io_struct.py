@@ -1689,6 +1689,9 @@ class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     PLE read of its first chunk now (no reply, a pure prefetch)."""
 
     input_ids: List[int] = []
+    #: 02.10.: the front's store span of this request (where P's first chunk
+    #: will start, before P's page floor); -1 = unknown (tail window)
+    start_hint: int = -1
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):

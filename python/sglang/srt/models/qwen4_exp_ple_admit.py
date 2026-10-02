@@ -177,21 +177,39 @@ def admit_ple_request(
     return verdict
 
 
-def admit_ple_hint(rid: str, input_ids, chunk_size: Optional[int], *, dormant: bool = False) -> Optional[str]:
+def admit_ple_hint(rid: str, input_ids, chunk_size: Optional[int], *, dormant: bool = False,
+                   start_hint: Optional[int] = None, page_size: int = 1) -> Optional[str]:
     """The front's hint (``PlePrefetchHintReqInput``): the same as an intake,
-    for a request that has not reached this scheduler yet -- but reading the
-    prompt's TAIL window (:func:`ple_hint_start`), not its first chunk."""
+    for a request that has not reached this scheduler yet -- reading the window
+    :func:`ple_hint_start` names (the front's store span when it sent one, else
+    the prompt's TAIL), not necessarily its first chunk."""
     if not _SINKS or not input_ids:
         return None
-    start = ple_hint_start(len(input_ids), chunk_size)
+    start = ple_hint_start(len(input_ids), chunk_size, start_hint=start_hint, page_size=page_size)
     verdict = None
     for sink in list(_SINKS):
         verdict = sink.admit(str(rid), input_ids, chunk_size, dormant=dormant, source="hint", start=start)
     return verdict
 
 
-def ple_hint_start(n: int, chunk_size: Optional[int]) -> int:
-    """Where the hint's read window starts: the last ``chunk_size`` tokens.
+def ple_hint_start(n: int, chunk_size: Optional[int], *, start_hint: Optional[int] = None,
+                   page_size: int = 1) -> int:
+    """Where the hint's read window starts.
+
+    02.10. (NF y7l, boot ...dauer10021206_99d1977a63): the first P chunk of
+    every D->P wake (weg2-2-7 / -4-18 / -6-19 / -8-20) started at PP0's told
+    6208 / 6400 / 78208 / 78336, the tail window at 63100 / 61965 / 147906 /
+    ... -- 4 of 4 hints dropped ``start_moved``, the told's own read started
+    53-147 ms before the forward, and P's first forward after the wake waited
+    ``PLE-PREFETCH chunk=0 ready=no wait_ms=541 / 406 / 241`` on PP0. The front
+    KNEW the start: its store span of the same request (``WEG2 DP-WAIT ...
+    presence_span=6208 / 6400 / 78208 / 78348``) is the told, floored to P's
+    page (78348 -> 78336). So ``start_hint`` (the front's store span,
+    ``Pending.store_span_est`` when ``span_known``) floored to ``page_size``
+    names the window when it lies inside the prompt; otherwise (no span sent,
+    or a span covering the whole prompt) the tail window below.
+
+    Without ``start_hint``: the last ``chunk_size`` tokens.
 
     1001 (NF bfpgwv ...dauer10011823 and three later boots): 0 of 69 hinted
     requests ever used their hint. Every one was read from token 0, and P's first
@@ -206,6 +224,11 @@ def ple_hint_start(n: int, chunk_size: Optional[int]) -> int:
     (:meth:`PleAdmitPrefetchGather._rekey`). A prompt of at most one chunk
     reads it whole, exactly as before."""
     n = int(n)
+    if start_hint is not None and int(start_hint) >= 0:
+        page = max(1, int(page_size or 1))
+        s = (int(start_hint) // page) * page
+        if s < n:
+            return s
     size = int(chunk_size) if chunk_size and int(chunk_size) > 0 else n
     return max(0, n - size)
 
