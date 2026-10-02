@@ -211,7 +211,7 @@ def admit(*, rid: str, token_ids: Sequence[int], hint: dict,
           kv_alloc, mamba_alloc, tree_cache, stage_att_layers: Sequence[int],
           p_buffers: Dict[int, tuple], spec, stage_linear: Tuple[int, int],
           p_temporal, p_conv, map_extent, log, cap0: Sequence[int] = (),
-          l2=None, verdict=None) -> Optional[str]:
+          l2=None, verdict=None, stats: Optional[dict] = None) -> Optional[str]:
     """Adopt the hint's prefix; None on success, else the named reason
     (everything allocated is freed again).
 
@@ -304,6 +304,24 @@ def admit(*, rid: str, token_ids: Sequence[int], hint: dict,
         log("HOT-HANDOVER rid=%s adopt REFUSED after the adopt verdict: %s"
             % (rid, exc))
         return "adopt: %s" % exc
+    if stats is not None:
+        # L15-10d: what crossed card-to-card vs from L2 (per layer row = one
+        # K row + one V row of this stage)
+        try:
+            k0 = next(iter(p_buffers.values()))[0]
+            row = int(k0[0].numel() * k0.element_size())
+        except Exception:  # noqa: BLE001 -- instrument only
+            row = 0
+        nl = len(stage_att_layers)
+        a_l2 = 0
+        if abytes == -1 and spec is not None:
+            try:
+                a_l2 = int(spec.for_layers(*stage_linear).total_bytes)
+            except Exception:  # noqa: BLE001
+                a_l2 = 0
+        stats.update(card_bytes=int(cells) * 2 * row,
+                     l2_bytes=int(l2_tokens) * nl * 2 * row + a_l2,
+                     anchor_card_bytes=0 if abytes == -1 else int(abytes))
     log("HOT-HANDOVER rid=%s from=%s n=%d cells=%d l2_tokens=%d anchor=%s adopted"
         % (rid, prev, n, cells, l2_tokens, "l2" if abytes == -1 else abytes))
     return None
@@ -611,9 +629,13 @@ def take_all_at_wake(sched, env, log) -> int:
             log("HOT-HANDOVER rid=%s at=wake fallback=hint without token ids" % rid)
             continue
         mapper = HoldMapper(g.dev)
+        import time as _t
+
+        st: dict = {}
+        t0 = _t.perf_counter()
         try:
             why = admit(
-                rid=rid, token_ids=ids, hint=hint,
+                rid=rid, token_ids=ids, hint=hint, stats=st,
                 fetch=lambda r: mapper.fetch(
                     lambda q: l15_share_publish.fetch_share(directory, q), r),
                 n_d_ranks=g.n_d, kv_alloc=g.kv_alloc, mamba_alloc=g.mamba_alloc,
@@ -627,8 +649,14 @@ def take_all_at_wake(sched, env, log) -> int:
             verdict_for(rid)(False)   # no-op when this stage already voted
         finally:
             mapper.close()
+        take_ms = (_t.perf_counter() - t0) * 1000.0
         if why is None:
             adopted += 1
+            log("HOT-HANDOVER rid=%s at=wake result=adopted n=%d take_ms=%.0f "
+                "card_bytes=%d l2_bytes=%d anchor_card_bytes=%d"
+                % (rid, int(hint.get("n", 0)), take_ms, st.get("card_bytes", 0),
+                   st.get("l2_bytes", 0), st.get("anchor_card_bytes", 0)))
         else:
-            log("HOT-HANDOVER rid=%s at=wake fallback=%s" % (rid, why))
+            log("HOT-HANDOVER rid=%s at=wake result=fallback take_ms=%.0f fallback=%s"
+                % (rid, take_ms, why))
     return adopted

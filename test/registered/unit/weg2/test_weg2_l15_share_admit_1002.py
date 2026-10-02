@@ -276,6 +276,7 @@ def test_take_all_at_wake_adopts_every_hint_in_rid_order(monkeypatch, tmp_path):
     def fake_admit(**kw):
         seen.append((kw["rid"], kw["token_ids"], kw["cap0"]))
         kw["verdict"](True)
+        kw["stats"].update(card_bytes=100, l2_bytes=50, anchor_card_bytes=0)
         return None
 
     monkeypatch.setattr(sa, "admit", fake_admit)
@@ -286,6 +287,7 @@ def test_take_all_at_wake_adopts_every_hint_in_rid_order(monkeypatch, tmp_path):
     assert [s[0] for s in seen] == ["rA", "rB"] and seen[0][1] == [7, 8]
     assert seen[0][2] == [0]
     assert any("rC at=wake fallback=hint without token ids" in x for x in logs)
+    assert sum("result=adopted" in x and "take_ms=" in x and "card_bytes=" in x for x in logs) == 2
     assert any("verdict=adopt" in x and "at=wake" in x for x in logs)
 
 
@@ -304,3 +306,33 @@ def test_wiring_front_and_resume():
     j = w.index("_l15_sa.take_all_at_wake(self.scheduler, os.environ,")
     assert 'self._weg2_group_name() == "P"' in w[j - 600:j]
     assert j < w.index('return self._weg2_leg_commit("resume", recv_req, ResumeMemoryOccupationReqOutput(')
+
+
+def test_admit_stats_split_card_and_l2_bytes(monkeypatch):
+    import torch
+
+    m, fx = _fx()
+    l2 = _L2()
+    st = {}
+
+    def fake_kv(shares, *, rid, n, stage_layers, p_buffers, p_rows, map_extent,
+                skip_ranks=()):
+        return 12                       # cells: token rows x layers, K+V each
+
+    monkeypatch.setattr(l15_share_take, "take_kv", fake_kv)
+    slots = list(range(100, 106))
+    span = {"rid": "r1", "slots": slots, "anchor_l2_slot": 41, "anchor_l2_gen": 6,
+            "l2_slots_b64": _b64(list(range(6))), "l2_gens_b64": _b64([9] * 6)}
+    k = torch.zeros(10, 4, dtype=torch.uint8)    # 4 bytes per row
+    why = sa.admit(rid="r2", token_ids=list(range(700, 706)),
+                   hint={"prev_rid": "r1", "n": 6},
+                   fetch=lambda r: ({"prefix": PREFIX, "spans": [span]}, []),
+                   n_d_ranks=2, kv_alloc=fx.allocator,
+                   mamba_alloc=fx.pool.mamba_allocator, tree_cache=fx.cache,
+                   stage_att_layers=[1, 3], p_buffers={1: (k, k), 3: (k, k)},
+                   spec=None, stage_linear=(0, 2), p_temporal=None, p_conv=None,
+                   map_extent=None, log=lambda s: None, cap0=[0], l2=l2, stats=st)
+    assert why is None
+    owned0 = sum(1 for s_ in slots if s_ % 3 in (0, 1))
+    assert st["card_bytes"] == 12 * 2 * 4
+    assert st["l2_bytes"] == owned0 * 2 * 2 * 4
