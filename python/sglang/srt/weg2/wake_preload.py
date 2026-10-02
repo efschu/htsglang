@@ -20,8 +20,11 @@ that batch loads nothing itself, so its forward waits per layer exactly as
 for its own load (a newer producer on the same load stream covers it).
 
 Off: the PP/told form (group P -- followers settle PP0's told before any
-load), an L15 hold-aware wake (its fence may reset the pools afterwards), no
-hierarchical cache, or ``SGLANG_WEG2_WAKE_PRELOAD`` = 0/false/no/off.
+load), no hierarchical cache, or ``SGLANG_WEG2_WAKE_PRELOAD`` = 0/false/no/off.
+On an L15 D kv wake (master on) the preload is not run at the kv resume but
+AFTER the L15 act (site=after_l15_act: hold rows reserved / fallback drop
+done, no L15 path touches the pools after it); both decisions are taken from
+group-uniform terms, never from a rank's own manifest.
 Unset = on. Marker: ``WEG2-WAKE-PRELOAD``.
 """
 
@@ -98,7 +101,7 @@ def _probe_extents(sched, hold) -> List[int]:
     return exts
 
 
-def run(updater, l15_hold_aware: bool = False) -> int:
+def run(updater, l15_hold_aware: bool = False, site: str = "kv_resume") -> int:
     """At the kv resume RPC, after the restore: issue and START the held
     requests' loads. Returns the number of requests issued (group-uniform)."""
     sched = getattr(updater, "scheduler", None)
@@ -109,7 +112,7 @@ def run(updater, l15_hold_aware: bool = False) -> int:
         return 0
     why = ineligible(sched, l15_hold_aware)
     if why:
-        logger.info("WEG2-WAKE-PRELOAD off reason=%s held=%d", why, len(hold))
+        logger.info("WEG2-WAKE-PRELOAD off reason=%s held=%d site=%s", why, len(hold), site)
         return 0
     t0 = time.perf_counter()
     exts = _probe_extents(sched, hold)
@@ -137,9 +140,9 @@ def run(updater, l15_hold_aware: bool = False) -> int:
             setattr(tree, ATTR, producer)
         except Exception:  # noqa: BLE001 - a tree without attributes cannot hand it over
             producer = -1
-    logger.info("WEG2-WAKE-PRELOAD held=%d issued=%d extents=%s producer=%d ms=%.1f (the H2D runs from "
-                "here; the first batch waits on it per layer)", len(hold), n, lo, producer,
-                (time.perf_counter() - t0) * 1000.0)
+    logger.info("WEG2-WAKE-PRELOAD held=%d issued=%d extents=%s producer=%d ms=%.1f site=%s (the H2D runs "
+                "from here; the first batch waits on it per layer)", len(hold), n, lo, producer,
+                (time.perf_counter() - t0) * 1000.0, site)
     return n
 
 
