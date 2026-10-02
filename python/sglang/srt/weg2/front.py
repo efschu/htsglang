@@ -8916,7 +8916,9 @@ class Front:
         elif _verdict == VERDICT_STAGE and _xx is not None and getattr(_xx, "mm", False):
             # IMAGE-CACHED-1002: the uncached verdict names its why before the rule
             self._w102_image_uncached(rid, _xx)
+        _route_vision_p_only = False
         if _verdict == VERDICT_STAGE and not _mm_cached and route != "none" and route != "long":
+            _route_vision_p_only = True
             logger.info(
                 "W102 Weg2VisionStage rid=%s -- route %s -> long (P): an image "
                 "request is prefilled on P by rule; its embeddings are "
@@ -9076,12 +9078,22 @@ class Front:
         self.counters["route_batch"] += 1
         if route == "long":
             self.counters["route_long"] += 1
-            logger.info(
-                "WEG2-ROUTE rid=%s LONG -> P leg 1 (uncached=%d > X=%d, so D "
-                "cannot prefill it; carrier_est=%d <= carrier_max=%d, so P's "
-                "KV can come back to D) est_prompt=%d queue=%d",
-                rid, remainder, x_route, carrier_est,
-                self.carrier_max_tokens, est_prompt, len(self.queue))
+            if _route_vision_p_only:
+                # the vision rule, not the X comparison, sent it to P (y8a
+                # weg2-10-22 printed 'uncached=724 > X=6074')
+                logger.info(
+                    "WEG2-ROUTE rid=%s LONG -> P leg 1 reason=vision_p_only (an image is "
+                    "prefilled on P by rule; uncached=%d X=%d not compared) carrier_est=%d "
+                    "<= carrier_max=%d est_prompt=%d queue=%d",
+                    rid, remainder, x_route, carrier_est,
+                    self.carrier_max_tokens, est_prompt, len(self.queue))
+            else:
+                logger.info(
+                    "WEG2-ROUTE rid=%s LONG -> P leg 1 (uncached=%d > X=%d, so D "
+                    "cannot prefill it; carrier_est=%d <= carrier_max=%d, so P's "
+                    "KV can come back to D) est_prompt=%d queue=%d",
+                    rid, remainder, x_route, carrier_est,
+                    self.carrier_max_tokens, est_prompt, len(self.queue))
         # SK (#243): a SHORT verdict whose price rests on a MEASURED D presence
         # is not re-prefilled on P when it falls through (weg2-12-39: 76602
         # tokens again on P for an uncached remainder of 186). It keeps its
@@ -9997,8 +10009,12 @@ class Front:
             # does not flip, and the SHORT waits for its seat on D (rule 29.09.)
             # read, never create (the ARRIVAL-SEAT-off path keeps no state)
             fits = (getattr(self, "__dict__", {}).get("_asr_state") or {}).get("fits") or {}
+            # PBOUND-FLIP-NOW: every queued request that needs P flips now -- the
+            # flip is foreseeable for each of them, fitting a D seat or not
+            pbound = bool(envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get())
             cands = [q for q in self._asr_live_p_cands()
-                     if getattr(q, "rid", None) != rid and fits.get(getattr(q, "rid", None)) is True]
+                     if getattr(q, "rid", None) != rid
+                     and (pbound or fits.get(getattr(q, "rid", None)) is True)]
         except Exception:  # noqa: BLE001 - a reading never blocks the route
             return False
         if not cands:
@@ -10033,6 +10049,8 @@ class Front:
             t = float(getattr(q, "t_arrive", 0.0) or 0.0)
             if t >= t_mine:
                 continue
+            if envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get():
+                return False    # PBOUND-FLIP-NOW: an older request that needs P is never "blocked"
             f2, _why, d2 = await self._arrival_seat_kv(
                 int(getattr(q, "est_prompt", 0) or 0), _asr.max_tokens_of(getattr(q, "payload", None)),
                 q.rid, int(getattr(q, "est_uncached", 0) or 0))
@@ -10228,6 +10246,8 @@ class Front:
                                    bool(getattr(head, "d_eligible", False)))
                 return True, True, None
             return False, not self.admit_d, None
+        if envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get():
+            return self._asr_pbound_flip_now(cands, x_tok, now)
         if age_plan:
             return await self._arrival_seat_step_age(cands, x_tok, now)
         p = cands[0]
@@ -10295,6 +10315,36 @@ class Front:
                         "the next free seat in arrival order", _asr.MARKER, p.rid, v, why_wait,
                         int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
         return False, not self.admit_d, None
+
+    def _asr_pbound_flip_now(self, cands: List["Pending"], x_tok: int,
+                             now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+        """PBOUND-FLIP-NOW (user law 02.10. "Request kommt = sofort Prefill"):
+        the OLDEST queued request that needs P (LONG over X, P-only/vision,
+        requeued, carrier) flips D->P now. It never needed a D seat or D KV
+        before P prefills it -- the P->D re-admission seats it -- so neither
+        the seat/KV verdict nor the K7/MIN-DWELL hold applies (y8a weg2-10-22:
+        229 s on 'wait_seat why=kv', 17 younger requests admitted past it)."""
+        st = self._asr_st()
+        p = min(cands, key=lambda c: float(getattr(c, "t_arrive", now) or now))
+        waited = now - max(float(getattr(p, "t_arrive", now) or now), float(self.t_awake))
+        if waited > 2.0 and st.get("pbound_stall_rid") != p.rid:
+            st["pbound_stall_rid"] = p.rid
+            self.counters["arrival_seat_pbound_stall"] += 1
+            logger.warning("%s PBOUND-STALL rid=%s waited=%.1f s uncached=%d p_only=%s -- a request that "
+                           "needs P waits on an awake D: it flips now", _asr.MARKER, p.rid, waited,
+                           int(getattr(p, "est_uncached", 0) or 0), bool(getattr(p, "p_only", False)))
+        if st["flip_rid"] != p.rid:
+            st["flip_rid"] = p.rid
+            self.counters["arrival_seat_flip_now"] += 1
+            self.counters["arrival_seat_pbound_flip_now"] += 1
+            taken, n = self._arrival_seat_taken()
+            ms = self._asr_verdict_ms(p.rid, getattr(p, "t_arrive", None), now)
+            logger.warning("%s rid=%s verdict=%s PBOUND-FLIP-NOW uncached=%d X=%d p_only=%s taken=%d n=%d "
+                           "arrival_to_verdict_ms=%.0f -- D pauses its decodes at the round boundary and "
+                           "flips to P now (no seat/KV test, no dwell)", _asr.MARKER, p.rid, _asr.FLIP_NOW,
+                           int(getattr(p, "est_uncached", 0) or 0), x_tok,
+                           bool(getattr(p, "p_only", False)), taken, n, ms)
+        return True, True, p
 
     def _asr_k7_dwell_held(self, p: "Pending", now: float) -> bool:
         """PDFLIP-B on NF: the ARRIVAL-SEAT flip_now passes K7's derived

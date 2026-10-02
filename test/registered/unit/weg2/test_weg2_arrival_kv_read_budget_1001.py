@@ -34,6 +34,16 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from test_weg2_arrival_seat_rule_0929 import _front, _on, _pending  # noqa: E402
 
 from sglang.srt.weg2 import arrival_seat_rule as asr  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _pbound_flip_now_off(monkeypatch):
+    """These tests pin the seat/KV verdict and the dwell holds for requests that
+    need P -- the rule PBOUND-FLIP-NOW (default on, 02.10.) replaces; they keep
+    covering it as the switch-off path."""
+    monkeypatch.setenv("SGLANG_WEG2_PBOUND_FLIP_NOW", "0")
+
 
 FITS = {"available": 400000, "evictable": 0}       # weg2-14-90's ladder: free 436000
 SHORT = {"available": 1000, "evictable": 0}

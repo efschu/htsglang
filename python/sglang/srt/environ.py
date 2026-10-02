@@ -1753,15 +1753,6 @@ class Envs:
     # and their cache_controller.write -- wall clock only, no device sync, the
     # wrappers live for the retract alone. 0 = the park as before.
     SGLANG_WEG2_PARK_RETRACT_SPLIT = EnvBool(True)
-    # PARK-NO-DWELL (user 02.10.: an arriving request is prefilled AT ONCE, no
-    # grace for running decodes; N6d ..._ec4d492f58 epoch 4: 'WEG2
-    # PARK-IMMEDIATE-DWELL awake_ms=310 min_dwell_ms=1974 floor_ms=2000' held the
-    # LONG weg2-4-6 142 ms until D's 2-token SHORT had finished): the immediate
-    # park of D's running decodes for a queued request over X fires at once --
-    # no K7 min-dwell, no park-cycle/decode dwell, no collect window, no fairness
-    # floor -- and the D->P MIN-DWELL after that park does not hold either.
-    # Marker 'WEG2 PARK-NO-DWELL'. 0 = the dwell rules as before.
-    SGLANG_WEG2_PARK_NO_DWELL = EnvBool(True)
     # EARLY-FLIP (02.10., binding flip time = last D token -> first P chunk; N6d:
     # arrival -> verdict 194-224 ms = X-EXACT count 100-130 + PROBE-FAST ~100, all
     # of it before the flip could begin): with D IDLE (nothing running, no
@@ -1776,6 +1767,15 @@ class Envs:
     # 0 = the flip waits for the verdict, as before.
     SGLANG_WEG2_EARLY_FLIP = EnvBool(True)
     SGLANG_WEG2_EARLY_FLIP_X_FACTOR = EnvFloat(2.0)
+    # PBOUND-FLIP-NOW (user law 02.10. "Request kommt = sofort Prefill"; y8a
+    # weg2-10-22: an image request, P-only by the vision rule, waited 229 s on
+    # 'ARRIVAL-SEAT verdict=wait_seat why=kv' while 17 younger requests were
+    # admitted to D): under ARRIVAL-SEAT the oldest queued request that needs P
+    # flips D->P at once -- no D seat/KV test (P prefills it; D's seat is the
+    # P->D re-admission's business), no K7/MIN-DWELL hold -- and no younger
+    # request is admitted to D past it. Marker 'PBOUND-FLIP-NOW' /
+    # 'PBOUND-STALL'. 0 = the seat/KV verdict as before.
+    SGLANG_WEG2_PBOUND_FLIP_NOW = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
