@@ -587,7 +587,9 @@ def test_off_never_reprices_and_the_hooks_sit_behind_the_switch():
     # 5th/6th: _d_inflight_presence / _d_inflight_park (X-CREDIT-INFLIGHT-1002):
     # the first returns before it when x_exact is off, the second needs a
     # tspans entry (None when x_exact is off)
-    assert src.count("self._x_exact_reprice_queue(") == 6
+    # 7th: _p_flush_store_presence (STORE-PRESENCE 1002), returns before it
+    # without tspans (None when x_exact is off)
+    assert src.count("self._x_exact_reprice_queue(") == 7
 
 
 def test_the_w31_requeue_counts_the_whole_prompt_exactly():

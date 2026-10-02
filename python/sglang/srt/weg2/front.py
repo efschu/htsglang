@@ -5595,6 +5595,7 @@ class Front:
         wait_ms = (time.monotonic() - t0) * 1000.0
         if c is None:
             self.counters["x_exact_fallback"] += 1
+            self._x_exact_note_fallback(rid, reason)
             logger.info("WEG2 X-EXACT-FALLBACK rid=%s reason=%s est_uncached=%d est_prompt=%d "
                         "(chars/3 estimate stands for this request) wait_ms=%.1f",
                         rid, reason, est_uncached, est_prompt, wait_ms)
@@ -5629,7 +5630,8 @@ class Front:
         here. Not re-priced: a request whose leg 1 is done or skipped, a
         P-only one, one D refused over X (``x_requeues``: D's own extent
         stands) and one priced by the chars/3 fallback (no ids). Routing
-        eligibility is NOT changed -- only the number. Returns the count."""
+        eligibility changes only on a crossing DOWN to <= X (STORE-PRESENCE
+        02.10.: it becomes d_eligible, a SHORT). Returns the count."""
         if not self.x_exact or self.ftok is None or self.tspans is None:
             return 0
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
@@ -5648,6 +5650,18 @@ class Front:
             p.est_uncached = int(new)
             n += 1
             self.counters["x_exact_repriced"] += 1
+            if (old > x >= new and not p.d_eligible and not p.reroutes
+                    and not getattr(p, "x_deferred", False) and not getattr(p, "intake_stalled", False)):
+                # STORE-PRESENCE (02.10.): the new price crosses X downwards on a
+                # realised store prefix -- the request is a SHORT now, so a D
+                # phase may admit it (QUEUED-SHORT) instead of waking P for it
+                # (y6y weg2-1-7: priced 105048 in a P phase, left by the P-phase
+                # cap, flip_now at the P->D flip for 24 real tokens). In a P
+                # phase P's batch still takes it (P-BATCH-ALL).
+                p.d_eligible = True
+                if getattr(p, "x_routed", 0):
+                    p.x_routed = 0
+                self.counters["x_exact_reprice_short"] += 1
             logger.info("WEG2 X-EXACT-REPRICE rid=%s why=%s est_uncached %d -> %d X=%d "
                         "crossed=%s src=%s epoch=%s (queued request re-priced against the "
                         "current measured cached-on-D prefix; routing flags unchanged)",
@@ -6044,6 +6058,105 @@ class Front:
                         "depth=%d: the parked leg resumes from there)", rid, got[0], got[1], depth)
         if changed:
             self._x_exact_reprice_queue("d_inflight_park")
+
+    #: X-EXACT-BACKFILL (27B 74e51fb2c4, ported to NF 02.10.): the fallback reasons whose count
+    #: gives the RIGHT ids once the tokenizer is ready (multimodal / path / a payload the count
+    #: raised on would not)
+    X_EXACT_BACKFILL_REASONS = ("tokenizer_loading", "timeout")
+
+    def _x_exact_note_fallback(self, rid: str, reason: Optional[str]) -> None:
+        """Remember why ``rid`` was priced by chars/3 (X-EXACT-BACKFILL)."""
+        fb = self.__dict__.get("_x_exact_fallback_rid")
+        if fb is None:
+            fb = self.__dict__["_x_exact_fallback_rid"] = collections.OrderedDict()
+        fb[rid] = str(reason)
+        while len(fb) > 4096:
+            fb.popitem(last=False)
+
+    async def _x_exact_backfill(self, rid: str, path: str, payload: Any, text: str) -> None:
+        """X-EXACT-BACKFILL: a request priced by the chars/3 fallback because the front
+        tokenizer was still LOADING (or the count timed out) never got its token ids, so every
+        presence record of its own legs (P's store anchor, D's in-flight anchor, D's finish
+        reading) wrote nothing and its follow-ups priced credit=0. NF y6y (0e1967fd36): the six
+        requests before 'X-EXACT READY' (weg2-0-1..0-5, 1-6) were every session's base prefix;
+        weg2-4-10 / 5-11 / 5-12 / 10-17 priced src=none and went LONG for 257 / 135 / 220 / 12
+        real tokens. Counts it once (at its P leg 1, else at leg 2) with the same
+        ``ftok.count(path, payload)``; the routing of this request is unchanged."""
+        fb = self.__dict__.get("_x_exact_fallback_rid")
+        reason = fb.pop(rid, None) if fb else None
+        if reason not in self.X_EXACT_BACKFILL_REASONS:
+            return
+        ft = getattr(self, "ftok", None)
+        if (ft is None or getattr(ft, "state", None) != "ready" or not isinstance(payload, dict)
+                or ft.ids_for(text) is not None):
+            return
+        t0 = time.monotonic()
+        try:
+            c = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(ft.executor, ft.count, path, payload),
+                timeout=envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0)
+        except Exception as e:  # noqa: BLE001 -- the leg runs as before, named
+            self.counters["x_exact_backfill_failed"] += 1
+            logger.info("WEG2 X-EXACT-BACKFILL rid=%s reason=%s FAILED %s: %s (no presence records "
+                        "for this request's legs)", rid, reason, type(e).__name__, str(e)[:160])
+            return
+        ft.remember(text, c.ids)
+        self.counters["x_exact_backfilled"] += 1
+        logger.info("WEG2 X-EXACT-BACKFILL rid=%s reason=%s tokens=%d count_ms=%.1f wait_ms=%.1f (priced by "
+                    "chars/3 at arrival; its exact ids now feed this request's presence records)",
+                    rid, reason, c.n, c.ms, (time.monotonic() - t0) * 1000.0)
+
+    def _p_leg1_store_note(self, rid: str, text: str, prompt_tokens: int) -> None:
+        """STORE-PRESENCE: a P leg 1 served in this P phase; its END-ANCHOR is in the shared
+        store once P's sleep flush publishes (see :meth:`_p_flush_store_presence`)."""
+        if not getattr(self, "x_exact", False) or getattr(self, "tspans", None) is None:
+            return
+        served = self.__dict__.setdefault("_p_phase_served", collections.OrderedDict())
+        served[rid] = (text, int(prompt_tokens or 0))
+        while len(served) > 1024:
+            served.popitem(last=False)
+
+    def _p_flush_store_presence(self, lost: Sequence[int] = ()) -> int:
+        """STORE-PRESENCE (user law 02.10.: the credit is the STORE prefix, L2/L3 are shared --
+        no group-local presence). P's sleep leg returned 200: its flush published every
+        un-backed node BEFORE the reset ('#1470 FLUSH-PUBLISH ... unbacked_left=0', 26 of 26 on
+        y6y P), so the END-ANCHOR of every P leg 1 of the phase is readable from L2/L3 by either
+        group. Each is recorded as a store presence (``src=store_anchor``), beyond the epoch, before
+        any D leg 2 of the phase has content. y6y weg2-8-13: P wrote weg2-5-11's END-ANCHOR
+        105344 at 07:51:02 ('WEG2 END-ANCHOR ... anchor=105344'), the P flush ran 07:51:04, D's
+        first content came only at 07:51:07.15 -- 8-13 was priced at 07:51:06.956 with credit 0
+        (LONG, P prefilled 162 on a 105344 hit). An anchor the flush reports lost is skipped."""
+        served = self.__dict__.get("_p_phase_served")
+        ts = getattr(self, "tspans", None)
+        ft = getattr(self, "ftok", None)
+        if not served or ts is None or ft is None:
+            if served:
+                served.clear()
+            return 0
+        lost_set = {int(d) for d in lost or ()}
+        n, tokens, rids = 0, 0, []
+        for rid, (text, pt) in list(served.items()):
+            ids = ft.ids_for(text)
+            if ids is None:
+                self.counters["store_presence_no_ids"] += 1
+                continue
+            n_eff = min(int(ids.size), int(pt)) if int(pt) > 0 else int(ids.size)
+            if ts.own_anchor(n_eff) in lost_set:
+                continue
+            anchor = ts.record_store_anchor(ids, pt, source="store_anchor")
+            if anchor > 0:
+                n += 1
+                tokens += anchor
+                rids.append(f"{rid}:{anchor}")
+        served.clear()
+        self.counters["store_presence"] += n
+        self.counters["store_presence_tokens"] += tokens
+        if n:
+            logger.info("WEG2 STORE-PRESENCE src=p_flush n=%d epoch=%d anchors=%s (P's sleep flush "
+                        "published these END-ANCHORs to L2/L3: a store prefix either group reads -- "
+                        "priced as src=store_anchor)", n, self.epoch, rids[:16])
+            self._x_exact_reprice_queue("store_presence")
+        return n
 
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
                         held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
@@ -9169,6 +9282,9 @@ class Front:
                 self._ipc_publish("flip_user_time", _dp)
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
+            # STORE-PRESENCE: ids for a fallback-priced rid, and P's END-ANCHOR for the flush
+            await self._x_exact_backfill(p.rid, p.path, p.payload, p.text)
+            self._p_leg1_store_note(p.rid, p.text, pt)
         finally:
             g.outstanding.pop(p.rid, None)
 
@@ -9358,6 +9474,8 @@ class Front:
                 logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
                                rid, type(e).__name__, e)
 
+        # X-EXACT-BACKFILL: a request priced by chars/3 while the tokenizer loaded gets its ids now
+        await self._x_exact_backfill(rid, request.path, payload, text)
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
@@ -11389,6 +11507,9 @@ class Front:
         w_done, w_per_tag, w_crit = completed_tags(w_body)
         if src == "D":
             self._retract_lost_anchors(anchors_lost(s_body))
+        elif src == "P" and s_code == 200:
+            # STORE-PRESENCE: P's flush published its END-ANCHORs (L2/L3, shared)
+            self._p_flush_store_presence(anchors_lost(s_body))
         sleep_ms += s_ms
         wake_ms += w_ms
         if s_code != 200 or w_code != 200:

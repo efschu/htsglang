@@ -397,6 +397,9 @@ class TokenSpans:
         #: Only these entries price as ``d_inflight``.
         self.inflight_keys: Dict[str, str] = {}
         self.inflight_rid: Dict[str, str] = {}
+        #: STORE-PRESENCE (02.10.): key -> label of an entry recorded as a store anchor
+        #: (P's END-ANCHOR published by P's sleep flush); a finish reading replaces it.
+        self.store_keys: Dict[str, str] = {}
         #: X-CREDIT-FINISHED-1002: key -> the depth D REPORTED before the own-text
         #: clamp lowered the cap (K2). ANCHOR-LOST names D's real anchor depths,
         #: so a clamped entry is retracted by its unclamped depth too.
@@ -462,7 +465,8 @@ class TokenSpans:
         """The end anchor a served ``n``-token prompt leaves: its page floor."""
         return max(0, int(n)) // self.anchor_page * self.anchor_page
 
-    def record_store_anchor(self, ids: Optional[np.ndarray], prompt_tokens: int = 0) -> int:
+    def record_store_anchor(self, ids: Optional[np.ndarray], prompt_tokens: int = 0,
+                            source: Optional[str] = None) -> int:
         """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE):
         P's END-ANCHOR of ``ids`` is in the store and D resumed from it -- the
         caller calls this only at the first content of an ``after_p`` leg 2,
@@ -482,6 +486,9 @@ class TokenSpans:
             return 0
         key = self._key(ids)
         old = self.entries.pop(key, None)
+        if source:
+            # STORE-PRESENCE: the witness label pending() names (a finish reading replaces it)
+            self.store_keys[key] = str(source)
         if old is None:
             self.entries[key] = (ids, anchor, 0, None)
             self.depth_caps[key] = anchor
@@ -509,6 +516,7 @@ class TokenSpans:
 
     # -- D-INFLIGHT (X-CREDIT-INFLIGHT-1002) ----------------------------------
     def _unflag_inflight(self, key: str) -> None:
+        self.store_keys.pop(key, None)
         rid = self.inflight_keys.pop(key, None)
         if rid is not None and self.inflight_rid.get(rid) == key:
             self.inflight_rid.pop(rid, None)
@@ -665,5 +673,6 @@ class TokenSpans:
                 best = credit
                 src = ("d_served_epoch" if held and credit > ct
                        else "d_served_anchor" if served and credit > ct
-                       else "d_inflight" if key in self.inflight_keys else "d_leg2_cached")
+                       else "d_inflight" if key in self.inflight_keys
+                       else self.store_keys.get(key, "d_leg2_cached"))
         return max(0, int(ids.size) - best), best, known, src
