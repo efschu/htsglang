@@ -112,3 +112,21 @@ def test_layer_major_views_get_one_hold_extent_per_layer():
     assert holds == [(0, G), (8 * G, 9 * G), (16 * G, 17 * G)]
     plan = ks.split_plan(holds, 24 * G, G)
     assert plan[0] == (0, G) and plan[1] == (G, 8 * G) and plan[-1] == (17 * G, 24 * G)
+
+
+def test_cap0_rank_arms_empty_windows_on_unsplit_bases_and_keeps_its_manifest(tmp_path):
+    """L15-FIX-CAP0-SPLIT (N3y 08:41:17Z): the cap-0 rank never splits
+    (hold rows 0) and arms EMPTY keep windows (L15-FIX-CAP0-KEEP); the arm
+    must succeed so its manifest stays -- a refusal made it vote None and
+    every wake fell back group-wide."""
+    sv = FakeSaver(64 * G)
+    base = Base(0x4000)
+    m = tmp_path / "m.json"
+    m.write_text("{}")
+    logs = []
+    ok = arm_keep_spans(sv, {1: (base, [])}, str(m), rank=0, log=logs.append,
+                        granule=G,
+                        split_lookup=lambda b, r: ks.keep_extents(b.data_ptr(), r))
+    assert ok is True and m.exists(), logs
+    assert sv.keep == [] and sv.pause_kept_bytes() == 0
+    assert ks.keep_extents(0x4000, [(5, 5)]) == []
