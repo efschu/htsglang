@@ -27,7 +27,7 @@ def test_owned_rows_count_shared_prefix_once():
 def test_capped_rank_saves_cap0_rank_refills_fallback_neither():
     line = R.hostbytes_line(_m(), 1, PREFIX, cap_rows=10, cell_bytes=100,
                             anchor_bytes=7, verdict="hold", epoch=7)
-    assert "h2d_saved=314 h2d_refill=0 d2h_saved=0" in line and "flip=7 rank=1" in line
+    assert "h2d_saved=314 h2d_refill=0 d2h_saved=0 parked=0" in line and "flip=7 rank=1" in line
     line0 = R.hostbytes_line(_m(), 0, PREFIX, cap_rows=0, cell_bytes=100,
                              anchor_bytes=7, verdict="hold", epoch=7)
     assert "h2d_saved=0 h2d_refill=414" in line0
@@ -44,3 +44,9 @@ def test_wake_logs_timing_and_hostbytes_after_the_restore_line():
     tail = src[i:i + 4000]
     assert "L15-WAKE-TIMING rank=%d verdict=%s refill_ms" in tail
     assert "l15_restore.hostbytes_line(" in tail
+
+
+def test_parked_cap0_rank_saves_its_kv_and_refills_only_anchors():
+    line0 = R.hostbytes_line(_m(), 0, PREFIX, cap_rows=0, cell_bytes=100,
+                             anchor_bytes=7, verdict="hold", epoch=7, parked=True)
+    assert "h2d_saved=400 h2d_refill=14 d2h_saved=0 parked=1" in line0

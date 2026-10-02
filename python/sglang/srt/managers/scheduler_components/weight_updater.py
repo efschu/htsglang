@@ -636,6 +636,9 @@ class SchedulerWeightUpdaterManager:
     # L15-FIX-CHECK-FALLBACK: refused wake sample checks turned into a
     # group-uniform fallback (never a raise that kills D).
     _l15_check_refusals: int = 0
+    # L15-16 PARK: the parked rows came back at this wake (the cap-0 rank
+    # then refills only its anchors from L2)
+    _l15_park_back_ok: bool = False
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -7747,9 +7750,14 @@ class SchedulerWeightUpdaterManager:
             # sharing rids so one generation mismatch drops every sharing
             # request whole (l15_restore.rid_tagged_plan).
             plan = l15_restore.rid_tagged_plan(m, rank, prefix)
-            if not plan:
+            # L15-16 PARK: the KV rows came back card to card -- only the
+            # anchors are loaded from L2 below
+            parked = bool(getattr(self, "_l15_park_back_ok", False))
+            if parked:
+                plan = []
+            if not plan and not parked:
                 return 0
-            ok, bad = l15_refill.gen_check(plan, host_pool)
+            ok, bad = (l15_refill.gen_check(plan, host_pool) if plan else ([], []))
             if bad:
                 raise l15_refill.L15RefillError(
                     "generation mismatch, drop-eligible rids: %s" % (bad[:4],))
@@ -7779,7 +7787,7 @@ class SchedulerWeightUpdaterManager:
             if [int(g) for g in _sg(a_slots)] != a_gens:
                 raise l15_refill.L15RefillError(
                     "anchor generation mismatch, recorded %s" % (a_gens,))
-            n = l15_refill.refill(ok, host_pool, device_pool, page_tokens)
+            n = l15_refill.refill(ok, host_pool, device_pool, page_tokens) if ok else 0
             host_mamba._load_states_all_layers(
                 dev_mamba,
                 torch.tensor(a_slots, dtype=torch.int64),
@@ -9773,6 +9781,20 @@ class SchedulerWeightUpdaterManager:
         # ordered first on the sleep and last on the wake, which is exactly
         # upstream's pause/resume order for cuda_graph.
         tags = self._weg2_with_graph_tag(tags, weg2_memory_saver_on)
+        # L15-16 PARK (opt-in SGLANG_WEG2_L15_PARK=1): the cap-0 ranks' held
+        # rows go card to card onto the capped ranks' free hold rows BEFORE
+        # the kv pause unmaps them -- on EVERY D rank at this one position
+        # (the kv_cache RPC), one host agreement, then the collectives.
+        if ("kv_cache" in tags and weg2_memory_saver_on
+                and self._weg2_group_name() == "D"):
+            try:
+                from sglang.srt.weg2 import l15_park as _l15_pk
+                from sglang.srt.weg2 import l15_plan as _l15_pl2
+                if _l15_pl2.master_on(os.environ) and _l15_pk.park_on(os.environ):
+                    _l15_pk.park_at_release(self.scheduler, os.environ, logger.info)
+            except Exception as exc:  # noqa: BLE001 -- the wake refills from L2
+                logger.warning("L15-PARK at=sleep failed (%s: %s)",
+                               type(exc).__name__, exc)
         # Task #47 Scheibe 6a: under --flip-weights resident the weights family
         # is never paused. A release naming one is a wrong front, not a sleep --
         # refused by name before any tag is touched.
@@ -11706,6 +11728,21 @@ class SchedulerWeightUpdaterManager:
                 # keeps or drops but never refills a second time.
                 # L15-FLIPCOST: the wake's L15 steps on their own clocks
                 _l15_wt0 = time.perf_counter()
+                # L15-16 PARK: the parked rows come back first (every D rank,
+                # this one position); the cap-0 rank's refill then loads only
+                # its anchors from L2
+                self._l15_park_back_ok = False
+                try:
+                    from sglang.srt.weg2 import l15_park as _l15_pk
+                    if _l15_pk.park_on(os.environ):
+                        self._l15_park_back_ok = _l15_pk.park_back_at_wake(
+                            self.scheduler, os.environ, logger.info,
+                            epoch=int(_l15_m.epoch) if _l15_m is not None else -1,
+                            group_ok=not _weg2_kv_refusal)
+                except Exception as exc:  # noqa: BLE001 -- L2 refill serves
+                    logger.warning("L15-PARK at=wake failed (%s: %s)",
+                                   type(exc).__name__, exc)
+                    self._l15_park_back_ok = False
                 _l15_opt_failed = self._l15_optimistic_refill()
                 _l15_wt1 = time.perf_counter()
                 if _l15_opt_failed:
@@ -11849,7 +11886,8 @@ class SchedulerWeightUpdaterManager:
                         _l15_m, _l15_hrk, _l15_hpre,
                         _l15_hcaps[_l15_hrk] if _l15_hrk < len(_l15_hcaps) else 0,
                         _l15_hcell, _l15_hab, str(_l15_v),
-                        int(_l15_m.epoch) if _l15_m is not None else 0))
+                        int(_l15_m.epoch) if _l15_m is not None else 0,
+                        parked=bool(getattr(self, "_l15_park_back_ok", False))))
                 except Exception as _exc:  # noqa: BLE001 -- instrument only
                     logger.info("L15-HOSTBYTES skipped (%s: %s)",
                                 type(_exc).__name__, _exc)
