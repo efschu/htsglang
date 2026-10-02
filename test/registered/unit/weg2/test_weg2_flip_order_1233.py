@@ -386,6 +386,16 @@ class TestFlipUsesTheOrder(CustomTestCase):
     """C: the front actually pauses in that order and resumes in the natural
     one -- the wiring, not just the helper."""
 
+    def setUp(self):
+        # FLIPCYCLE H6 (02.10.): this class pins the SEPARATE kv resume RPC
+        # after the family leg; the fused form (kv_cache on the waker's weights
+        # leg) is pinned in test_weg2_flipcycle_wake_kv_fused_1002.
+        from sglang.srt.environ import envs
+
+        cm = envs.SGLANG_WEG2_ENABLE_WAKE_KV_FUSED.override(False)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
     def _front(self, src_chunk_cards):
         f = Front("http://p", "http://d", "P", "t", "", 0, 0, {}, 45.0,
                   weight_chunks=CHUNK_COUNT, src_chunk_cards=src_chunk_cards)

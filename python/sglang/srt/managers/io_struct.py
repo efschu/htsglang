@@ -2094,6 +2094,11 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # D treats them as ordinary waiting work (weg2/d_park_runtime). Same object
     # on every rank. None on every other resume.
     park_defer_rids: Optional[List[str]] = None
+    # FLIPCYCLE H6 (02.10.): the front sends kv_cache WITH the weights family on
+    # the waker's leg and asks for the LATE site (after the legs) -- never the
+    # early resume before them (xsn315/317/318: barlink lost its peer mapping
+    # under a kv region remapped before the legs). None on every other resume.
+    kv_late: Optional[bool] = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):

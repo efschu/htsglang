@@ -32,9 +32,10 @@ _spec.loader.exec_module(rt)
 def test_the_front_sends_the_seat_counts_on_the_weights_leg():
     """RED on 351aa9c20f: the weights leg's body was {"tags", "epoch"} only."""
     src = open(fr.__file__).read()
-    i = src.index('self.timed_rpc(D, "/resume_memory_occupation",\n'
-                  '                               dict({"tags": pause_order, "epoch": flip_epoch}')
+    # FLIPCYCLE H6: the weights leg's body is built once as _w_payload
+    i = src.index('_w_payload = dict({"tags": list(pause_order)')
     assert "**_wake_extra" in src[i:i + 200]
+    assert 'self.timed_rpc(D, "/resume_memory_occupation", _w_payload, RPC_TIMEOUT_S)' in src
 
 
 def test_n_on_the_weights_leg_leaves_the_kv_leg_no_live_bank_move():

@@ -27,6 +27,7 @@ import tempfile
 import time
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.srt.managers import weg2_memory_saver as ms
 from sglang.srt.weg2 import front as front_mod
 
@@ -51,6 +52,14 @@ class GatheredLegsTest(unittest.TestCase):
     """T3: one gathered pair per family, kv strictly outside, W4 names the tags."""
 
     FAMILY_MS = 0.05
+
+    def setUp(self):
+        # FLIPCYCLE H6 (02.10.): this class pins the SEPARATE kv resume RPC; the
+        # fused form (kv_cache on the waker's weights leg, kv_late) is pinned in
+        # test_weg2_flipcycle_wake_kv_fused_1002.
+        cm = envs.SGLANG_WEG2_ENABLE_WAKE_KV_FUSED.override(False)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
 
     def _front(self):
         f = front_mod.Front(

@@ -12089,6 +12089,7 @@ class Front:
         flip_epoch = credit_epoch(self.boot_epoch, self.epoch)
         t_gather0 = time.perf_counter()
         _kv_task = None   # fnFL2x83: the kv wake chained on the waker's leg (gathered form only)
+        _kv_fused = False  # FLIPCYCLE H6: set by the gathered form only
         if self.weights_resident:
             # Scheibe 6a: no weights family to move -- both layouts stay mapped.
             s_code = w_code = 200
@@ -12125,6 +12126,12 @@ class Front:
             # call after the legs -- either way the held requests' loads overlap
             # the legs. The post-legs kv call below stays (idempotent per epoch).
             from sglang.srt.weg2.wake_kv import early_send_on as _kv_early_on
+            # FLIPCYCLE H6: kv_cache rides the waker's weights leg (late site)
+            _kv_fused = bool(envs.SGLANG_WEG2_ENABLE_WAKE_KV_FUSED.get()) and not bool(_kv_early_on())
+            _w_payload = dict({"tags": list(pause_order) + ([KV_TAG] if _kv_fused else []),
+                               "epoch": flip_epoch}, **_wake_extra)
+            if _kv_fused:
+                _w_payload["kv_late"] = True
             _legs = [
                 self.timed_rpc(S, "/release_memory_occupation",
                                {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
@@ -12151,9 +12158,7 @@ class Front:
                 # the first request the bank is planned while paused and
                 # mapped once by its tag; the kv leg changes nothing
                 # (d_seat_vram.on_wake: has_n). {} for P and for qwen27b.
-                self.timed_rpc(D, "/resume_memory_occupation",
-                               dict({"tags": pause_order, "epoch": flip_epoch}, **_wake_extra),
-                               RPC_TIMEOUT_S),
+                self.timed_rpc(D, "/resume_memory_occupation", _w_payload, RPC_TIMEOUT_S),
             ]
             _kv_early = bool(_kv_early_on())
             if _kv_early:
@@ -12175,7 +12180,7 @@ class Front:
             _w_task = _leg_tasks[-1]
             (w_code, w_body, w_ms) = await _w_task
             _kv_task = None
-            if w_code == 200:
+            if w_code == 200 and not _kv_fused:
                 self._flip_marks["wake-kv-issued"] = time.time()
                 _kv_task = asyncio.ensure_future(self.leg_rpc(
                     D, "/resume_memory_occupation",
@@ -12249,7 +12254,14 @@ class Front:
         t0 = time.time()
         self._flip_stage = "wake-kv"
         self._flip_marks["wake-kv"] = time.time()
-        if _kv_task is not None:
+        if _kv_fused:
+            # FLIPCYCLE H6: the weights leg resumed kv_cache at its late site; a
+            # refused resume made that leg non-200 (z30y7) and stopped above
+            code, body = w_code, w_body
+            logger.info("WEG2-FLIPCYCLE stage=wake-kv dir=%s>%s epoch=%d ms=0 floor_ms=0 fused=1 "
+                        "(H6: kv_cache resumed inside the waker's weights leg, no second RPC)",
+                        src, dst, self.epoch)
+        elif _kv_task is not None:
             # fnFL2x83: issued the moment the waker's weights leg returned
             code, body = await _kv_task
         else:
