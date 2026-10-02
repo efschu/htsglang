@@ -336,10 +336,10 @@ details.fold[open] { padding-bottom: 12px; }
 .kpi .v small { font-size: 13px; font-weight: 400; color: var(--text-2); margin-left: 3px; }
 .kpi .v.na { font-size: 14px; font-weight: 500; color: var(--muted); white-space: normal; line-height: 1.3; padding: 6px 0 3px; }
 .kpi .s { font-size: 11.5px; color: var(--muted); min-height: 1.3em; overflow-wrap: anywhere; }
-.kpi.hl { border-color: color-mix(in srgb, var(--s7) 55%, var(--line)); box-shadow: inset 3px 0 0 var(--s7); }
+/* Aktivrahmen (Nutzer 02.10.): dünner Rand rundum in der Kachelfarbe, linker Rand breit -- TTFT (hl) immer,
+   die Phasen-KPI (act) live; eine Regel für beide, die Farbe kommt aus --c der Kachel */
+.kpi.hl, .kpi.act { border-color: color-mix(in srgb, var(--c, var(--s7)) 55%, var(--line)); box-shadow: inset 3px 0 0 var(--c, var(--s7)); }
 .kpi.on .v { color: var(--c, var(--text)); }
-/* Nutzer 02.10.: der Aktivrahmen wandert live mit der Phase (Decode, P-/D-Prefill, Flip P→D / D→P); TTFT behält hl */
-.kpi.act { border-color: var(--c, var(--s7)); box-shadow: inset 0 0 0 1px var(--c, var(--s7)); }
 .kpi.ok .v { color: var(--good); } .kpi.bad .v { color: var(--bad); } .kpi.warn .v { color: var(--warn); }
 .phnow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 15px; margin: -2px 0 10px; }
 .phnow i.sw { width: 22px; height: 14px; border-radius: 3px; display: inline-block; }
