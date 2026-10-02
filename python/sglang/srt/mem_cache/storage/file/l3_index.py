@@ -148,6 +148,18 @@ class L3Index:
         self._lib.l3idx_has_stems(self._base, n, arr, out)
         return [bool(v) for v in out]
 
+    def has_ptrs(self, ptrs, n: int):
+        """PROBE-FAST (02.10.): ``has`` over a ready ``char **`` (see
+        ``ArenaView.find_states_ptrs``) -- int8 numpy array, 1 = listed."""
+        import numpy as np
+
+        out = np.zeros((max(0, int(n)),), dtype=np.int8)
+        if n <= 0:
+            return out
+        self._lib.l3idx_has_stems(self._base, int(n), ptrs,
+                                  out.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return out
+
     def clear(self) -> None:
         with self._lock:
             self._lib.l3idx_clear(self._base)

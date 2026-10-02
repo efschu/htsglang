@@ -1200,3 +1200,19 @@ class ArenaView:
         st = (ctypes.c_int8 * n)()
         self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
         return list(st)
+
+    def find_states_ptrs(self, ptrs, n: int):
+        """PROBE-FAST (02.10.): ``find_states`` over a ready ``char **`` (a
+        ``ctypes.POINTER(c_char_p)`` into NUL-terminated stems the caller keeps
+        alive) -- the same C lookup, an int8 numpy array back; no per-stem
+        encode, no ctypes array built per call, no list."""
+        import numpy as np
+
+        st = np.zeros((max(0, int(n)),), dtype=np.int8)
+        if n <= 0:
+            return st
+        slots = np.empty((int(n),), dtype=np.int64)
+        self._lib.arena_find_stems(self._base, int(n), ptrs,
+                                   slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                   st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return st

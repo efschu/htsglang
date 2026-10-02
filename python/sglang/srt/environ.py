@@ -4112,6 +4112,12 @@ class Envs:
     # once -- the same D-branch decision (economics, MIN-DWELL, fairness), only
     # not one tick later. Marker 'WEG2-FLIP DONE-KICK'. 0 = the tick, as before.
     SGLANG_WEG2_CTL_KICK_DONE_QUEUED = EnvBool(True)
+    # PROBE-FAST (02.10., N5q epoch 4: 'L3-INDEX-PRESENCE ... kv_pages=74064
+    # probe_ms=413.3' before the ROUTE-VERDICT): the front's store presence
+    # probe encodes each page stem once and asks the L3 index and every arena
+    # over the same char ** in C (weg2/front_store.py) -- the same Depth.
+    # Marker: 'probe=fast' on the L3-INDEX-PRESENCE line. 0 = the per-stem form.
+    SGLANG_WEG2_FRONT_PROBE_FAST = EnvBool(True)
     # PARK-READ-DETACH (02.10., L15 boot dac8b62b8c D 14:43:49: '#1068 RESET JOIN
     # terminated_ops=1 joined_s=1.29', 'WEG2-SLEEP-SUB alloc_clear=1414'): the sleep
     # flush's reset terminates the open store reads of D's park list and joins their
