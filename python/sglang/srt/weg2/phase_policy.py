@@ -629,6 +629,52 @@ def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: Optional[flo
     return max(0.0, num / denom), "ok"
 
 
+# ---------------------------------------------------------------------------
+# PDFLIP-X (02.10.2026, user: "bei 15 sekunden flipzeit plus rechnung ist die
+# schwelle aber nicht bei 6k sondern eher bei 35k oder sowas???"): the price
+# of a LONG excursion is what the request WAITS, in the user's definition --
+# D->P = arrival (hold, drain) to P's first prefill chunk (R28 DP-WAIT
+# wait_s), P->D = P's prefill end to D's first content (LEG2-FIRST-CONTENT
+# via=after_p) -- not the gather legs plus D's resume (the ski price), and it
+# is NOT divided by k. P's own prefill time stays on P's cost line.
+#
+# WHY NOT /k. k (requests one P phase prefilled) amortises a round trip as
+# shared WORK. The decision X makes is per arrival, and the arrival that
+# triggers the excursion (PARK-IMMEDIATE cause=over-x / PARK-SEAT-FREE FIRE)
+# pays the whole round trip itself -- every request of that P phase waits the
+# full D->P and P->D. The decodes the excursion stops cancel out: a D-direct
+# prefill stops the same decodes for its own a_D + b_D*n (MIXED-CHUNK off).
+# Measured: N4p 1002_095319 price 5.27 s / k 1.33 -> 3.96 s, X 6223; N4q
+# 1002_101341 price 8.14 s / k 3.00 -> 2.71 s, X 2918 -- k counted the
+# acceptance probe's manual flips too (PARK-MANUAL-FLIP 10:17:15/10:17:21),
+# which are no excursions and are excluded here.
+# ---------------------------------------------------------------------------
+
+
+def excursion_price_s(dp: Sequence[Tuple[int, float]], pd: Sequence[Tuple[int, float]],
+                      manual_epochs=(), first_epochs: Optional[dict] = None
+                      ) -> Tuple[Optional[float], str]:
+    """``mean(D->P waits) + mean(P->D first-content times)`` in seconds over
+    the WARM, non-manual samples ``(epoch, seconds)``; ``(None, why)`` while
+    either side has none. Warm = not the boot's first excursion
+    (``first_epochs[side]``, the cold wake); manual = an epoch of a POST
+    /weg2/flip (the acceptance probe), never an excursion."""
+    first = first_epochs or {}
+    man = set(manual_epochs or ())
+
+    def _warm(rows, side):
+        return [float(v) for e, v in rows
+                if e not in man and e != first.get(side) and float(v) >= 0.0]
+
+    w_dp, w_pd = _warm(dp, "dp"), _warm(pd, "pd")
+    if not w_dp or not w_pd:
+        return None, (f"excursion:none(dp n={len(w_dp)} pd n={len(w_pd)}; "
+                      f"raw {len(dp)}/{len(pd)}, manual epochs {len(man)})")
+    m_dp, m_pd = statistics.mean(w_dp), statistics.mean(w_pd)
+    return m_dp + m_pd, (f"excursion:dp={m_dp:.2f}s(n={len(w_dp)})+pd={m_pd:.2f}s(n={len(w_pd)})"
+                         f"(warm, {len(man)} manual epochs excluded)")
+
+
 def x_cost_line_record(*, form_key: str, line: dict, k: float, boot_tag: str,
                        commit: Optional[str], at: str, side: str = "D") -> dict:
     """The sidecar entry of one fitted cost line of group ``side`` (D, or P's

@@ -3585,6 +3585,12 @@ class Envs:
     SGLANG_WEG2_X_COST_FIT_MIN_SPREAD = EnvFloat(4.0)
     SGLANG_WEG2_X_COST_FIT_MIN_BIG = EnvInt(8)
     SGLANG_WEG2_X_COST_MAX_STEP = EnvFloat(0.25)
+    # PDFLIP-X (02.10.): X-COST-LINE's price = the measured LONG excursion the
+    # request waits (R28 DP-WAIT wait_s of LONG arrivals + LEG2-FIRST-CONTENT
+    # via=after_p, warm, the acceptance probe's manual flips excluded), NOT
+    # divided by k; k samples skip manual-flip phases. Model-neutral (NF shares
+    # the solver). 0 = the ski price (warm legs + resume) / k, byte for byte.
+    SGLANG_WEG2_X_EXCURSION_PRICE = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
