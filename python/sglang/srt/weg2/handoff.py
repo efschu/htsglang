@@ -31,6 +31,29 @@ def _dir() -> str:
     return os.path.join(base, "handoff") if base else ""
 
 
+#: DP-NACHLAUF 02.10. (N5t epoch 11, P>D quiesce 443 ms): every P stage wrote
+#: the SAME hand-off file at its request finish (json.dump of 98880 ids +
+#: 98875 hex keys, 7.5 MB, ~42 ms streamed through the pure-Python encoder),
+#: PP2's being the last work before P reports idle. Only PP0 writes it now
+#: (its finish lies before PP1/PP2's drain of the last chunk), in one shot
+#: (C encoder, ~18 ms, byte-identical file). Unset = on; 0/false/no/off =
+#: every stage writes, streamed, as before.
+ONE_WRITER_ENV = "SGLANG_WEG2_HANDOFF_ONE_WRITER"
+
+
+def one_writer_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ONE_WRITER_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def writes_on_stage(pp_rank) -> bool:
+    """Whether a stage writes the hand-off file (all stages with the switch off)."""
+    try:
+        return (not one_writer_on()) or int(pp_rank or 0) == 0
+    except (TypeError, ValueError):
+        return True
+
+
 def path(rid: str) -> str:
     d = _dir()
     return os.path.join(d, f"{rid}.json") if d and rid else ""
@@ -43,8 +66,12 @@ def write(rid: str, input_ids: Sequence[int], page_keys: Sequence[str]) -> bool:
     try:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         tmp = f"{p}.{os.getpid()}.tmp"
+        obj = {"input_ids": list(int(t) for t in input_ids), "page_keys": list(page_keys)}
         with open(tmp, "w") as f:
-            json.dump({"input_ids": list(int(t) for t in input_ids), "page_keys": list(page_keys)}, f)
+            if one_writer_on():
+                f.write(json.dumps(obj))   # one shot: the C encoder, same bytes
+            else:
+                json.dump(obj, f)
         os.replace(tmp, p)
         return True
     except Exception:  # noqa: BLE001 - a hand-off that fails is the old path
