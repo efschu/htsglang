@@ -4828,6 +4828,10 @@ class Front:
                             "phase", self.epoch, p.rid, int(awake_s * 1000.0), int(need_ms), prov,
                             int(FAIRNESS_DWELL_FLOOR_MS))
             return None
+        if collect and envs.SGLANG_WEG2_ENABLE_PARK_SEAT_FREE.get():
+            seat = Front._park_seat_free_due(self, D, p, now)
+            if seat is not None:
+                return p if seat else None
         if collect:
             # PARK-COLLECT-WINDOW (NF z30w-park 08:31-08:46, user 29.09.): D keeps
             # decoding while the pending P work collects for the window; the park
@@ -4866,6 +4870,58 @@ class Front:
                         "uncached=%d collected_s=%.1f", self.epoch, p.rid, why, n_running, len(items),
                         sum(u for _, u in items), (now - t_start) if t_start is not None else 0.0)
         return p
+
+    def _park_seat_free_due(self, D: Group, p: "Pending", now: float) -> Optional[bool]:
+        """PARK-SEAT-FREE (NF ARRIVAL-SEAT case (a), user 29.09. ~19:40Z, minimal
+        port for the 27B flip layout; switch SGLANG_WEG2_ENABLE_PARK_SEAT_FREE).
+
+        N3o ...10020544 05:51:35-06:01:17: every PARK-COLLECT-WINDOW HOLD came
+        with running=1..4 of d_bs=6 -- the P-bound arrival waited 20-46 s (rent
+        or the fairness bound) beside free D seats. The user's rule: a free seat
+        -> D pauses its decodes and the arrival is prefilled now (over X: with
+        the flip to P), no collect window.
+
+        Returns ``None`` when no seat is free (the collect window decides, as
+        before), ``True`` = park now, ``False`` = MIN-DWELL hold (NF y5c: a
+        decode D resumed in this phase first decodes one measured round trip;
+        unmeasured = no hold, never a constant). The immediate park's own dwell
+        (K7 + the fairness floor) has already passed when this is asked.
+        Taken seats count D's running ledger (parked ones excepted), the
+        hand-offs in flight and the prefilled requests waiting in
+        ``_ready_for_d`` -- each of them takes a seat in this phase."""
+        seats = int(getattr(self, "d_bs", 0) or 0)
+        running = list(self._flip_ledger(D))
+        _hof = getattr(self, "_handoff_in_flight", None)
+        handoff = max(0, int(_hof())) if callable(_hof) else 0
+        ready = [q for q in (getattr(self, "_ready_for_d", None) or ())
+                 if getattr(q, "fut", None) is None or not q.fut.done()]
+        taken = len(running) + handoff + len(ready)
+        if not phase_policy.seat_free(taken, seats):
+            return None
+        need_s, src = self._park_collect_window_s()
+        epochs = getattr(self, "_seat_resumed_epoch", None) or {}
+        resumed = {r: float(self.t_awake) for r, e in epochs.items() if e == self.epoch}
+        hold = phase_policy.resumed_min_dwell_hold(resumed, running, now, need_s)
+        if hold is not None:
+            # DP-WAIT (#1416i): the requests whose wait spans it name min-dwell
+            self._park_dwell_held_t = time.time()
+            if getattr(self, "_park_seat_free_held", None) != (p.rid, self.epoch):
+                self._park_seat_free_held = (p.rid, self.epoch)
+                self.counters["park_seat_free_min_dwell_hold"] += 1
+                logger.info("WEG2 PARK-SEAT-FREE MIN-DWELL hold epoch=%d rid=%s dwell_s=%.2f "
+                            "need_s=%.2f (%s) resumed_rid=%s taken=%d n=%d -- the park waits until "
+                            "the decodes D resumed this phase decoded one round trip",
+                            self.epoch, p.rid, hold[1], need_s, src, hold[0], taken, seats)
+            return False
+        self.counters["park_seat_free_fired"] += 1
+        logger.info("WEG2 PARK-SEAT-FREE FIRE epoch=%d rid=%s uncached=%d taken=%d n=%d "
+                    "(running=%d handoff=%d ready_for_d=%d) waited_s=%.1f -- a D seat is free: "
+                    "D's decodes park and the flip to P comes now, no collect window "
+                    "(ARRIVAL-SEAT (a), NF; KV ladder not ported)",
+                    self.epoch, p.rid, int(getattr(p, "est_uncached", 0) or 0), taken, seats,
+                    len(running), handoff, len(ready),
+                    max(0.0, now - float(getattr(p, "t_arrive", now))))
+        return True
 
     def _park_window_send(self, D: Group, left_ms: int) -> None:
         """PARK-WINDOW-GATE (27B decision 29.09. ~13:55Z): the open collect
@@ -4998,6 +5054,17 @@ class Front:
                 len(running), len(self._ready_for_d), len(self.queue),
                 "parking the running decodes, then the flip to P" if running
                 else "nothing running: the flip to P follows without a park")
+        elif cause == phase_policy.PARK_REASON_MANUAL:
+            # FLIPWAIT (N3o ...10020544 05:49:00): POST /weg2/flip under the
+            # immediate park -- PK2's rule holds for this caller too.
+            self.counters["park_manual_flip"] += 1
+            logger.warning(
+                "WEG2 PARK-MANUAL-FLIP FIRED epoch=%d running=%d ready_for_d=%d queue=%d awake_s=%.1f "
+                "-- POST /weg2/flip under the immediate park: admission to D closed, %s",
+                self.epoch, len(running), len(self._ready_for_d), len(self.queue),
+                max(0.0, now - float(self.t_awake)),
+                "parking the running decodes (a D->P flip never drains them, PK2); they resume "
+                "first after the flip back" if running else "nothing running: no park")
         else:
             self.counters["wait_bound_fired"] += 1
             # ROS-1P: a served / finished request (future done) is not waiting.
@@ -5023,7 +5090,9 @@ class Front:
             return "unsupported"
         body = phase_policy.park_body(
             self.epoch, self.d_wait_bound_s,
-            reason=phase_policy.PARK_REASON_IMMEDIATE if immediate is not None else None)
+            reason=(phase_policy.PARK_REASON_IMMEDIATE if immediate is not None
+                    else phase_policy.PARK_REASON_MANUAL if cause == phase_policy.PARK_REASON_MANUAL
+                    else None))
         # H91c3-1: the park's stamp is taken BEFORE the RPC. D stamps its park
         # while serving the RPC and re-queues it after PARK_REQUEUE_S on its
         # own clock; a front stamp taken after the answer ran that clock late
@@ -12736,6 +12805,15 @@ class Front:
                                       "code": "W115"}, status=409)
         src, dst = self.awake, ("P" if self.awake == "D" else "D")
         self.admit_d = False
+        if (src == "D" and getattr(self, "d_park_immediate", False)
+                and self._flip_ledger(self.groups["D"])):
+            # FLIPWAIT (N3o ...10020544, the acceptance flip probe at 05:49:00):
+            # this handler called flip(D, P) past PK2, so the drain waited 106.7 s
+            # for five agent decodes (WEG2-FLIP-TIMELINE epoch=5 quiesce@106697)
+            # and every arrival meanwhile sat in DP-WAIT drain_s 58-105 s. Under
+            # the immediate park a D->P flip never drains running decodes --
+            # whatever decided it; the flip back below resumes them first.
+            await self._wait_bound_park(None, cause=phase_policy.PARK_REASON_MANUAL)
         await self.flip(src, dst)
         if self.awake == "P" and self.state == "serving":
             await self.flip("P", "D")
