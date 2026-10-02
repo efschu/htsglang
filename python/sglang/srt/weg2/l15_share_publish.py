@@ -157,20 +157,29 @@ def publish_for_sched(sched, manifest, env, log) -> Optional["SharePublisher"]:
     from sglang.srt.weg2.l15_hold_share import L15ShareError, export_hold_extents
 
     mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
-    pool = l15_shadow.kv_pool_of(getattr(mr, "token_to_kv_pool", None))
-    views = []  # (role, layer, tensor)
+    wrapper = getattr(mr, "token_to_kv_pool", None)
+    pool = l15_shadow.kv_pool_of(wrapper)
+    # layers are published as GLOBAL model layer ids (P stages hold subsets):
+    # the hybrid wrapper's dense index -> global id, identity without one
+    amap = getattr(wrapper, "full_attention_layer_id_mapping", None) or {}
+    att_gid = {int(i): int(g) for g, i in amap.items()}
+    rtp = getattr(sched, "req_to_token_pool", None)
+    mmap = getattr(rtp, "mamba_map", None) or {}
+    mam_gid = {int(i): int(g) for g, i in mmap.items()}
+    views = []  # (role, global layer id, tensor)
     for role, lst in (("k", getattr(pool, "k_buffer", None)),
                       ("v", getattr(pool, "v_buffer", None))):
         for i, t in enumerate(lst or ()):
             if isinstance(t, torch.Tensor):
-                views.append((role, i, t))
-    mc = getattr(getattr(getattr(sched, "req_to_token_pool", None),
-                         "mamba_pool", None), "mamba_cache", None)
+                views.append((role, att_gid.get(i, i), t))
+    mc = getattr(getattr(rtp, "mamba_pool", None), "mamba_cache", None)
     temp = getattr(mc, "temporal", None)
     if temp is not None:
-        views += [("mamba_temporal", i, temp[i]) for i in range(int(temp.shape[0]))]
+        views += [("mamba_temporal", mam_gid.get(i, i), temp[i])
+                  for i in range(int(temp.shape[0]))]
     for c, ct in enumerate(getattr(mc, "conv", None) or []):
-        views += [("mamba_conv%d" % c, i, ct[i]) for i in range(int(ct.shape[0]))]
+        views += [("mamba_conv%d" % c, mam_gid.get(i, i), ct[i])
+                  for i in range(int(ct.shape[0]))]
     bases, fds = [], []
     exported = {}  # base ptr -> [(off, size, fd_index)] -- one export per base
     try:

@@ -187,11 +187,14 @@ def take_anchor(shares: Mapping[int, Tuple[dict, Sequence[int]]], *, rid: str,
                                    "is supported" % (r, role))
             idx += len(b["extents"])
         L = spec.num_layers
-        if sorted(temporal) != list(range(L)) or sorted(conv) != list(range(L)):
+        # published layer labels are GLOBAL ids: their sorted order is the
+        # linear-layer ordinal the canonical blob uses
+        if len(temporal) != L or sorted(temporal) != sorted(conv):
             raise L15TakeError("D rank %d publishes %d/%d temporal and %d/%d conv "
                                "layers" % (r, len(temporal), L, len(conv), L))
-        blob = torch.cat([temporal[l].reshape(-1) for l in range(L)]
-                         + [conv[l].reshape(-1) for l in range(L)])
+        order = sorted(temporal)
+        blob = torch.cat([temporal[g].reshape(-1) for g in order]
+                         + [conv[g].reshape(-1) for g in order])
         rs = spec.shard_for_rank(list(ratios), r)
         if blob.numel() != rs.total_bytes:
             raise L15TakeError("D rank %d anchor blob %d bytes != spec %d"

@@ -7862,6 +7862,22 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        # L15-10 S4n-e: a hot follow-up's prefix comes from D's published
+        # hold (opt-in), adopted as device nodes BEFORE the prefix match;
+        # any refusal is named and the request proceeds as today.
+        if (not is_retracted
+                and os.environ.get("SGLANG_WEG2_L15_HOT_SHARE", "0") == "1"
+                and __import__("sglang.srt.managers.weg2_memory_saver",
+                               fromlist=["weg2_group_name"]
+                               ).weg2_group_name() == "P"):
+            try:
+                from sglang.srt.weg2 import l15_share_admit as _l15_sa
+                _why = _l15_sa.admit_for_sched(self, req, os.environ, logger.info)
+                if _why is not None:
+                    logger.info("HOT-HANDOVER rid=%s fallback=%s", req.rid, _why)
+            except Exception as exc:  # noqa: BLE001 -- the store read serves
+                logger.warning("HOT-HANDOVER rid=%s failed (%s: %s) -- store read",
+                               req.rid, type(exc).__name__, exc)
         # kv-session-offload: FCFS arrival order. Assigned once (a retracted
         # re-queue keeps its original arrival position). The admission order
         # is identical on every TP rank, so the counter is rank-uniform.

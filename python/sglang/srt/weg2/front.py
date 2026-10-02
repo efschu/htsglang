@@ -8387,10 +8387,35 @@ class Front:
         g.outstanding[p.rid] = time.time()
         t0 = time.time()
         Front._req_book(self).leg1_dispatch(p.rid, t0)  # DASHBOARD-IPC: queue_ms ends, p_prefill starts
+        # L15-10 S4n-e: a hot follow-up (its session's previous rid is held by
+        # D) gets a rid-keyed hint P's stages read at admission; opt-in.
+        _hot_dir = None
+        if os.environ.get("SGLANG_WEG2_L15_HOT_SHARE", "0") == "1":
+            try:
+                from sglang.srt.weg2 import l15_share_admit as _l15_sa
+                from sglang.srt.weg2 import l15_share_publish as _l15_sp
+
+                _prev = (self.__dict__.get("_sess_prev") or {}).get(p.rid)
+                _d = self.groups.get("D")
+                _live = (set(_d.outstanding) if _d is not None else set()) | set(
+                    getattr(self, "_d_parked", None) or {})
+                if _prev and str(_prev[0]) in _live and int(_prev[1]) > 0:
+                    _hot_dir = _l15_sp.share_dir(os.environ)
+                    _l15_sa.write_hot_hint(_hot_dir, p.rid, str(_prev[0]),
+                                           int(_prev[1]))
+                    logger.info("HOT-HANDOVER-HINT rid=%s from=%s n=%d",
+                                p.rid, _prev[0], int(_prev[1]))
+            except Exception:  # noqa: BLE001 -- a hint, never the route
+                _hot_dir = None
 
         async def _post() -> Tuple[int, bytes]:
-            async with self.session.post(f"{g.url}{p.path}", json=with_cached_tier_ask(payload, p.path)) as resp:
-                return resp.status, await resp.read()
+            try:
+                async with self.session.post(f"{g.url}{p.path}", json=with_cached_tier_ask(payload, p.path)) as resp:
+                    return resp.status, await resp.read()
+            finally:
+                if _hot_dir is not None:  # every stage admitted it by now
+                    from sglang.srt.weg2 import l15_share_admit as _l15_sa
+                    _l15_sa.reap_hot_hint(_hot_dir, p.rid)
 
         try:
             # H91 part C: under part A an admissible request WAITS in P's
