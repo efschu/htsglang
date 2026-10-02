@@ -506,6 +506,10 @@ class RecentPrompts:
         # rid -> (ids, time noted)
         self.items: "collections.OrderedDict[str, Tuple[np.ndarray, float]]" = \
             collections.OrderedDict()
+        #: PREFIX-DIVERGE-TEXT: rid -> the request's message digest
+        #: (front_diverge_text.payload_digest); written and read only in the
+        #: front tokenizer's worker, so it may lag ``items`` by one job
+        self.meta: Dict[str, Any] = {}
 
     def note(self, rid: str, ids: Optional[np.ndarray], now: Optional[float] = None) -> None:
         if ids is None or int(ids.size) == 0:
@@ -514,6 +518,16 @@ class RecentPrompts:
         self.items[str(rid)] = (ids, time.time() if now is None else float(now))
         while len(self.items) > self.cap:
             self.items.popitem(last=False)
+
+    def note_meta(self, rid: str, meta: Any) -> None:
+        """PREFIX-DIVERGE-TEXT: keep ``meta`` beside the ids of ``rid``
+        (worker thread only; bounded like ``items``)."""
+        if meta is None:
+            return
+        self.meta.pop(str(rid), None)
+        self.meta[str(rid)] = meta
+        while len(self.meta) > self.cap:
+            self.meta.pop(next(iter(self.meta)))
 
     def best(self, ids: np.ndarray, exclude_rid: Optional[str] = None
              ) -> Tuple[int, Optional[str], int, Optional[float]]:
