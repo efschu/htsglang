@@ -48,7 +48,8 @@ def test_pd_early_front_event_is_never_a_small_flipzeit():
 
 
 def test_dp_ends_at_the_last_stage_forward_and_idle_pd_flip():
-    v = ipcboot.flip_views(SEGS, _ipc(102.5), 450.0, _ring(p_rise_ts=204.0))
+    # D's last TP0 round of the D phase ends at 199,6 (open 199,55 + 50 gpu-ms)
+    v = ipcboot.flip_views(SEGS, _ipc(102.5), 450.0, _ring(p_rise_ts=204.0), d_rounds=[(150.0, 150.05), (199.55, 199.6)])
     dp = v[1]
     assert dp["dir"] == "D>P" and dp["kind"] == "ok"
     assert round(dp["total_ms"]) == 4400              # 199,6 -> 204,0 (first forward on PP0), not the front's 2300
@@ -117,8 +118,11 @@ def test_pd_first_decode_comes_from_the_front_event_not_the_rank_raster():
            "flip_first_work": [{"dir": "P>D", "flip_begin_ts": 100.0, "first_work_ts": 103.11, "what": "decode_token",
                                 "flip_time_ms": 3110, "p_end_ts": 99.95, "p_end_source": "p_leg1_end"}]}
     pd = ipcboot.flip_views(segs, ipc, 140.0)[0]
-    assert pd["end_src"].startswith("front flip_first_work") and pd["start_src"].startswith("front flip_first_work.p_end_ts")
-    assert round(pd["nachlauf_ms"]) == 450 and round(pd["total_ms"]) == 3160
+    # Nutzer 02.10. ~17:50Z: the flip starts at P's last chunk end (99,9; no ring here: the P segment), the
+    # front's leg-1 end (99,95) is only named -- the 50 ms between are flip time
+    assert pd["end_src"].startswith("front flip_first_work") and pd["start_src"].startswith("P-Segment-Ende")
+    assert pd["p_end_front"] == 99.95
+    assert round(pd["nachlauf_ms"]) == 450 and round(pd["total_ms"]) == 3210
     assert round(pd["nachlauf_d_extend_ms"]) == 450                 # only the extend before the real first token
     # without the front event and without D's rank counters: missing (Nutzer 02.10.), not the segment raster
     pd2 = ipcboot.flip_views(segs, {"ipc_events": ev}, 140.0)[0]

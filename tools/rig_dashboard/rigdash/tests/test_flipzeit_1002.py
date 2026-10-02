@@ -51,6 +51,8 @@ def _ipc_dp(prefill_source="leg1_dispatch", prefill_ts=46.608):
 
 
 SEGS = [{"s": T + 0.0, "e": T + 60.0, "k": "unknown"}]
+#: D's TP0 rounds (open, open + gpu-ms): the last one before the D>P flip ends at 44,096
+D_ROUNDS = [(T + 43.9, T + 43.93), (T + 44.07, T + 44.096)]
 
 
 def _sum(x):
@@ -62,7 +64,7 @@ class FlipzeitDP(unittest.TestCase):
         """Nutzer 02.10. ~13:05Z ("... prefill batch beginn"): D>P ends at the first forward on P's FIRST stage.
         y7l 12:10:44: PP0 forward_ct 6 -> 7 first seen 47,74 (ADMIT PP0 12:10:47); PP2 only at 53,91 -- the
         ~6 s between are PP0 + PP1 computing chunk 1 (pipeline fill = prefill, not flip)."""
-        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, _ring())[0]
+        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, _ring(), d_rounds=D_ROUNDS)[0]
         self.assertEqual(x["kind"], "ok")
         self.assertAlmostEqual(x["end"], T + 47.74, places=3)            # PP0 forward_ct 6 -> 7 first seen
         self.assertAlmostEqual(x["total_ms"], (47.74 - 44.096) * 1000, delta=1)
@@ -78,13 +80,13 @@ class FlipzeitDP(unittest.TestCase):
     def test_dp_front_pp_first_forward_is_exact_and_preferred(self):
         ipc = _ipc_dp("pp_first_forward", 47.21)
         ipc["flip_user_time"][0]["pp_last_start_ts"] = T + 53.23
-        x = ipcboot.flip_views(SEGS, ipc, T + 60.0, _ring())[0]
+        x = ipcboot.flip_views(SEGS, ipc, T + 60.0, _ring(), d_rounds=D_ROUNDS)[0]
         self.assertAlmostEqual(x["end"], T + 47.21, places=3)
         self.assertEqual(x["rest_ms"], 0.0)
         self.assertAlmostEqual(x["pp_last_start"], T + 53.23, places=3)   # named, not part of the flip
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)
         # a stamp at the leg-1 dispatch is not the end
-        y = ipcboot.flip_views(SEGS, _ipc_dp("leg1_dispatch", 46.608), T + 60.0, _ring())[0]
+        y = ipcboot.flip_views(SEGS, _ipc_dp("leg1_dispatch", 46.608), T + 60.0, _ring(), d_rounds=D_ROUNDS)[0]
         self.assertAlmostEqual(y["end"], T + 47.74, places=3)
 
     def test_phase_bar_draws_pipeline_fill_as_prefill(self):
@@ -99,7 +101,7 @@ class FlipzeitDP(unittest.TestCase):
     def test_dp_without_pp0_counter_is_missing_not_small(self):
         ring = [{"t": s["t"], "r": {k: v for k, v in s["r"].items() if k.startswith("D")}} for s in _ring()]
         # (no P rank in the ring: P's first stage cannot be read)
-        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, ring)[0]
+        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, ring, d_rounds=D_ROUNDS)[0]
         self.assertEqual(x["kind"], "fehlt")
         self.assertIsNone(x["total_ms"])
         self.assertIn("forward_ct", x["missing"])
@@ -118,6 +120,9 @@ def _ipc_pd(first_work=11.063, what="decode_token"):
     return {"ipc_events": ev, "flip_first_work": fw, "flip_user_time": []}
 
 
+SEGS_PD = [{"s": T + 0.0, "e": T + 8.46, "k": "P"}, {"s": T + 8.46, "e": T + 60.0, "k": "unknown"}]
+
+
 def _ring_pd():
     out = []
     for i in range(10):
@@ -130,7 +135,7 @@ def _ring_pd():
 
 class FlipzeitPD(unittest.TestCase):
     def test_pd_first_token_during_wake_kv_dc_counts(self):
-        x = ipcboot.flip_views(SEGS, _ipc_pd(), T + 60.0, _ring_pd())[0]
+        x = ipcboot.flip_views(SEGS_PD, _ipc_pd(), T + 60.0, _ring_pd(), d_rounds=None)[0]
         self.assertEqual(x["kind"], "ok")
         self.assertAlmostEqual(x["total_ms"], 2603, delta=1)              # not 4496 (to flip_done)
         self.assertAlmostEqual(x["layer_ms"], 2427, delta=1)
@@ -141,7 +146,7 @@ class FlipzeitPD(unittest.TestCase):
     def test_pd_non_streaming_d_first_forward_is_the_exact_end(self):
         # 27B PDFLIP-E3 a0d03e9321: a non-streaming request stamps D's first forward from its beacon
         for what in ("d_first_forward_done", "d_first_forward_done_approx"):
-            x = ipcboot.flip_views(SEGS, _ipc_pd(what=what), T + 60.0, _ring_pd())[0]
+            x = ipcboot.flip_views(SEGS_PD, _ipc_pd(what=what), T + 60.0, _ring_pd(), d_rounds=None)[0]
             self.assertEqual(x["kind"], "ok")
             self.assertIn(what, x["end_src"])
             self.assertAlmostEqual(x["total_ms"], 2603, delta=1)
@@ -149,7 +154,7 @@ class FlipzeitPD(unittest.TestCase):
 
     def test_pd_early_fire_before_layers_falls_back_to_d_rank_counters(self):
         # the NF y6d class: a "decode_token" 0,1 s after flip_begin -- D's layers are not back yet
-        x = ipcboot.flip_views(SEGS, _ipc_pd(first_work=8.56), T + 60.0, _ring_pd())[0]
+        x = ipcboot.flip_views(SEGS_PD, _ipc_pd(first_work=8.56), T + 60.0, _ring_pd(), d_rounds=None)[0]
         self.assertIn("rankstats D.tp0pp0", x["end_src"])
         self.assertAlmostEqual(x["end"], T + 11.893, places=3)            # rounds/pnew 1 -> 2/5 first seen
         self.assertGreater(x["rest_ms"], 0)
@@ -158,7 +163,7 @@ class FlipzeitPD(unittest.TestCase):
 
 class FlipzeitPush(unittest.TestCase):
     def test_vm_gets_only_the_total_and_its_parts(self):
-        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, _ring())[0]
+        x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, _ring(), d_rounds=D_ROUNDS)[0]
         lines = vmpush.flip_view_points([x], "NF", "068d", set())
         parts = sorted(l.split('part="')[1].split('"')[0] for l in lines)
         self.assertEqual(parts, ["layer", "nachlauf", "rest", "total", "vorlauf", "wake_kv_dc"])

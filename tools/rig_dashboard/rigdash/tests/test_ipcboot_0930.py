@@ -87,9 +87,10 @@ class TestBuildView(unittest.TestCase):
         c = self.v["cache"]["D"]["boot"]
         self.assertEqual((c["cached"], c["new"]), (20000, 10))
         ft = self.v["flip_times"]
-        # Nutzer 02.10.: the Flipzeit is P-Ende -> erstes Decode-Token (2,2 s), never the layer-only 1,8 s
+        # Nutzer 02.10.: the Flipzeit is P-Ende -> erstes Decode-Token, never the layer-only 1,8 s; 17:50Z: P-Ende
+        # is P's own last chunk stamp (prefill.last.t 1020,0 on the last stage), not the front's leg-1 end 1020,4
         self.assertEqual(ft["P>D"]["n"], 1)
-        self.assertAlmostEqual(ft["P>D"]["last"], 2200.0, delta=0.5)
+        self.assertAlmostEqual(ft["P>D"]["last"], 2600.0, delta=0.5)
         self.assertNotIn("layer_newest", ft["P>D"])
         self.assertEqual(self.v["flip_count"], 1)
         self.assertTrue(any(x["k"] == "flip_pd" for x in self.v["timeline"]["segs"]))
@@ -164,6 +165,10 @@ class TestStaticScan(unittest.TestCase):
                     v = node.value
                     if name == "stops.py" and v in ("abnahme_cu130.log",):
                         continue     # HarnessLogs (not started by the server); constant kept for its tests
+                    if name == "grouplog.py" and v in (".D.log", "boot_weg2_%s_*.D.log"):
+                        continue     # Nutzer 02.10. ~17:50Z: Flipzeit-Endpunkte = D's eigene Decode-Runden (TP0
+                                     # 'Decode rank batch' t:); rankstats hat keine Rundenzeit -- IPC-Nachfolger
+                                     # decode.last_t beim Rang-Schreiber, dann faellt dieser eine Leser
                     self.assertFalse(v.endswith(".log") or "*.log" in v or "boot_*.log" in v,
                                      "%s: %r" % (name, v))
                 if isinstance(node, ast.Attribute) and node.attr in ("LiveLogs", "HarnessLogs") and name != "stops.py":
