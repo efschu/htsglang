@@ -38,8 +38,9 @@ def test_the_kv_wake_chains_on_the_wakers_leg_before_the_sleepers_leg_is_awaited
 def test_step_five_takes_the_chained_answer_and_the_resident_form_still_issues_its_own():
     src = _src()
     j = src.index('self._flip_stage = "wake-kv"')
-    blk = src[j:j + 700]
-    assert "if _kv_task is not None:" in blk and "code, body = await _kv_task" in blk
+    blk = src[j:j + 1400]
+    # FLIPCYCLE H6: the fused form comes first, the chained answer is its elif
+    assert "elif _kv_task is not None:" in blk and "code, body = await _kv_task" in blk
     assert 'await self.leg_rpc(D, "/resume_memory_occupation"' in blk
     # `_kv_task` exists on the resident branch too (no NameError at step 5)
     k = src.index("_kv_task = None   # fnFL2x83")

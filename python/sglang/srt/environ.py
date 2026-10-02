@@ -947,6 +947,12 @@ class Envs:
     SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE = EnvBool(True)
     # the sleeping group(s) that take it (comma list; default the D->P leg).
     SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
+    # FLIPCYCLE H6 (02.10., weg2/front.flip): the waker's kv_cache resume rides
+    # its weights leg (late site, after the legs, with the z30y7 bounded fit wait)
+    # instead of a second RPC the waker's scheduler picks up only after its
+    # post-wake pass (y6z P->D wake-kv p50 158 ms on the front against 41 ms of
+    # D-side work). Off = the separate kv RPC issued when the weights leg returns.
+    SGLANG_WEG2_ENABLE_WAKE_KV_FUSED = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.
