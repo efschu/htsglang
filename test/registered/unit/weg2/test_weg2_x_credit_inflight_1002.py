@@ -109,14 +109,18 @@ def test_x_exact_err_names_the_d_inflight_witness(caplog):
             "tokens_front=31723 tokens_d=31723 match=1 src=d_inflight") in caplog.text
 
 
-def test_d_direct_in_flight_anchor_is_the_page_floor_of_the_prompt():
-    # D's own prefill: '#1469 RETAIN is_finished=False token_ids_len=19580
-    # cache_len=19520 value=True' (weg2-8-12, d_direct)
+def test_a_prompt_d_prefilled_itself_is_not_credited_in_flight():
+    # D's own prefill anchors on its TRACK, not the page floor, in 8 of 54
+    # in-flight RETAIN lines of the boot: 'weg2-4-7 ... token_ids_len=19509
+    # cache_len=17728 value=True' (floor would be 19456). Not a realised
+    # in-flight reading -- the finish reading covers it.
     f = _front()
-    f.ftok.m["weg2-8-12"] = _base(19580)
-    assert f._d_inflight_presence("weg2-8-12", "weg2-8-12", None, "d_direct") == 19520
-    pending, credit, _k, src = f.tspans.pending(_base(19900))
-    assert (credit, pending, src) == (19520, 380, "d_inflight")
+    f.ftok.m["weg2-4-7"] = _base(19509)
+    assert f._d_inflight_presence("weg2-4-7", "weg2-4-7", None, "d_direct") == 0
+    assert f._d_inflight_presence("weg2-4-7", "weg2-4-7",
+                                  types.SimpleNamespace(leg1_prompt_tokens=0), "after_p") == 0
+    assert f.tspans.pending(_base(19900))[1] == 0
+    assert f.counters["presence_d_inflight_no_p_anchor"] == 2
 
 
 def test_never_credits_past_a_divergence_before_the_anchor():
@@ -177,7 +181,7 @@ def test_park_depth_caps_and_a_zero_retracts(caplog):
     assert "WEG2 PRESENCE-INFLIGHT-PARK rid=a credit 31552 -> 30976" in caplog.text
     # a park depth past the prompt (decoded tokens retained) never raises it
     f.ftok.m["c"] = _base(1000) + 5 * 10 ** 6
-    f._d_inflight_presence("c", "c", None, "d_direct")
+    f._d_inflight_presence("c", "c", types.SimpleNamespace(leg1_prompt_tokens=1000), "after_p")
     f._d_inflight_park({"c": 1300})
     assert f.tspans.pending(np.concatenate([_base(1000) + 5 * 10 ** 6, _base(50)]))[1] == 960
 
@@ -267,10 +271,15 @@ async def _mid_stream_price(finish: bool = True):
     front.ftok = _Tok()
     front.ftok.m[FIRST] = FIRST_IDS
     front.tspans = TokenSpans(agent_span=False)
+    # an after_p leg 2: P served leg 1 with PT prompt tokens
+    pending = F.Pending("r1", "/v1/messages", {}, FIRST, 0.0,
+                        asyncio.get_running_loop().create_future(), est_prompt=PT,
+                        est_uncached=PT)
+    pending.leg1_prompt_tokens = PT
 
     async def handler(request):
         payload = await request.json()
-        return await front.leg2(request, "r1", payload, FIRST, True, None)
+        return await front.leg2(request, "r1", payload, FIRST, True, pending)
 
     app = web.Application()
     app.router.add_post("/v1/messages", handler)
@@ -303,7 +312,7 @@ def test_leg2_credits_the_in_flight_prompt_mid_stream(caplog):
         front, mid, end = asyncio.run(_mid_stream_price(finish=True))
     # mid-stream: the twin is priced on the in-flight anchor (1300 -> 1280)
     assert mid == (PT + 195 - 1280, 1280, True, "d_inflight"), mid
-    assert any("WEG2 PRESENCE-INFLIGHT rid=r1 via=d_direct anchor=1280" in r.getMessage()
+    assert any("WEG2 PRESENCE-INFLIGHT rid=r1 via=after_p anchor=1280" in r.getMessage()
                for r in caplog.records)
     # the finish's reading replaced it (no #59 depth on this wire: ct stands)
     assert end == (PT + 195 - CT, CT, True, "d_leg2_cached"), end

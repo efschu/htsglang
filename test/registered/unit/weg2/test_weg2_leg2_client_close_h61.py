@@ -23,6 +23,18 @@ from aiohttp.test_utils import TestServer
 from sglang.srt.weg2.front import Front, stream_finish_seen
 
 PROMPT_TEXT = "the prompt text of a 12.7k code probe"
+
+
+def _booked(front):
+    """The presence the leg booked for PROMPT_TEXT: the entry's MEASURED
+    cached_tokens. Read from the entry, not ``SpanLRU.span_tokens`` (a reader
+    whose #49 arm caps by the chars/3 estimate of this short text -- 9, not
+    12668 -- so the pin held only with the agent span off; nextflash runs it
+    since X-CREDIT-1002)."""
+    import hashlib
+
+    e = front.spans.entries.get(hashlib.sha1(PROMPT_TEXT.encode()).hexdigest())
+    return (int(e[1]), True) if e is not None else (0, False)
 PT, CT = 12672, 12668
 
 
@@ -126,7 +138,7 @@ def test_hang_up_after_the_finish_chunk_is_served_and_books_presence():
     assert front.groups["D"].served == 1
     # The presence witness is D's own cached share, read from the usage chunk
     # the client never saw.
-    assert front.spans.span_tokens(PROMPT_TEXT) == (CT, True)
+    assert _booked(front) == (CT, True)
     assert seen.get("d_completed") is True
 
 
@@ -137,7 +149,7 @@ def test_hang_up_mid_answer_still_aborts_and_books_nothing():
     assert front.counters["leg2_failures"] == 1
     assert front.counters["leg2_client_closed_after_finish"] == 0
     assert front.groups["D"].served == 0
-    assert front.spans.span_tokens(PROMPT_TEXT) == (0, False)
+    assert _booked(front) == (0, False)
     # Closing D's connection is what aborts decoding for a client that left.
     assert seen.get("d_completed") is not True
 
@@ -148,7 +160,7 @@ def test_a_client_that_reads_to_the_end_is_unchanged():
     assert front.counters["leg2_failures"] == 0
     assert front.counters["leg2_client_closed_after_finish"] == 0
     assert front.groups["D"].served == 1
-    assert front.spans.span_tokens(PROMPT_TEXT) == (CT, True)
+    assert _booked(front) == (CT, True)
 
 
 def test_finish_marker_on_both_wires():

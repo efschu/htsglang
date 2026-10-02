@@ -372,8 +372,8 @@ class ModelProfile:
     #: 27B #49 agent span on the front (SGLANG_WEG2_ENABLE_AGENT_SPAN, NF P49
     #: c1988ff84f): tools priced first, a D serve holds its prompt_tokens for
     #: its epoch, prefix priced in measured tokens. Operator 26.09.: the 27B
-    #: line ran it unswitched since RC9 (S7c); NF off until the NF seat
-    #: releases it with a boot tag.
+    #: line ran it unswitched since RC9 (S7c); NF released 02.10. by the NF
+    #: seat (X-CREDIT-1002, see the nextflash row).
     agent_span: bool
     #: NF H91 STANDARD FORM (user design 25.09.; NF H91b/c/c2/d, H95 B/c):
     #: the front's phase policy (P phase cap 6 + overlap plan against P's pool,
@@ -875,8 +875,17 @@ PROFILES: Dict[str, ModelProfile] = {
         store_short_tail=False,
         bigram_anchor_exact=True,
         warm_min_dwell=True,
-        # NF P49: off until the NF seat releases #49 with a boot tag
-        agent_span=False,
+        # NF P49: released by X-CREDIT-1002 (NF seat, 02.10.). Boot
+        # dkrnfint4bar1dauer10020634 (5b46b8842e, #49 off): a FINISHED D leg 2
+        # credited only its admission hit, so every agent follow-up kept the
+        # predecessor's delta as uncached -- weg2-26-45 credit 50688 (26-44's
+        # cached_tokens) pending 4582 > X=3647 -> LONG, P prefilled 1510 of a
+        # 53760 hit; 24-40 45824 / 4339 > 3602 -> LONG, P prefilled 2291. The
+        # premises hold on NF: the Flash-Next template renders <tools> first
+        # (chat_template.jinja:57-67), D sends weg2_resumable_depth on every
+        # finish (#59 RESUMABLE mode=form-a-dcp-min). Metal tag: the next NF
+        # boot on desk/nf-x-credit-inflight-1002.
+        agent_span=True,
         standard_form=True,
         # NF-MZ (29.09., y3m boot ...dauer09292136, 375f44975e): released.
         # Claude Code 2.1.280 sends role:"system" (api_system) messages

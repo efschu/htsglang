@@ -397,6 +397,10 @@ class TokenSpans:
         #: Only these entries price as ``d_inflight``.
         self.inflight_keys: Dict[str, str] = {}
         self.inflight_rid: Dict[str, str] = {}
+        #: X-CREDIT-FINISHED-1002: key -> the depth D REPORTED before the own-text
+        #: clamp lowered the cap (K2). ANCHOR-LOST names D's real anchor depths,
+        #: so a clamped entry is retracted by its unclamped depth too.
+        self.raw_depths: Dict[str, int] = {}
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -423,7 +427,9 @@ class TokenSpans:
         key = self._key(ids)
         self.entries.pop(key, None)
         self.depth_caps.pop(key, None)
+        self.raw_depths.pop(key, None)
         self._unflag_inflight(key)  # D-INFLIGHT: the finish reading replaces it
+        reported_depth = resumable_depth
         if not self.agent_span:
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
@@ -448,6 +454,8 @@ class TokenSpans:
         self.entries[key] = (ids, ct, pt, held)
         if resumable_depth is not None:
             self.depth_caps[key] = int(resumable_depth)
+            if int(reported_depth) != int(resumable_depth):
+                self.raw_depths[key] = int(reported_depth)
         self._stamp(key)
 
     def own_anchor(self, n: int) -> int:
@@ -496,6 +504,7 @@ class TokenSpans:
             old_key, _ = self.entries.popitem(last=False)
             self.depth_caps.pop(old_key, None)
             self.entry_seq.pop(old_key, None)
+            self.raw_depths.pop(old_key, None)
             self._unflag_inflight(old_key)
 
     # -- D-INFLIGHT (X-CREDIT-INFLIGHT-1002) ----------------------------------
@@ -566,6 +575,7 @@ class TokenSpans:
         old = self.entries.pop(key, None)
         self.depth_caps.pop(key, None)
         self.entry_seq.pop(key, None)
+        self.raw_depths.pop(key, None)
         return int(old[1]) if old is not None else 0
 
     def park_cap(self, rid: str, depth: int) -> Optional[Tuple[int, int]]:
@@ -636,6 +646,17 @@ class TokenSpans:
             cap = self.depth_caps.get(key)
             if cap is not None:
                 raw = min(raw, cap)  # #59: never past D's deepest anchor
+            # X-CREDIT-FINISHED-1002 (cross epoch): a leg D SERVED (held_epoch
+            # set) whose resumable depth D named keeps its end anchor after
+            # the epoch -- min(prompt, D's depth, page floor of the text). The
+            # #49 epoch guard protects the radix-only tokens past the anchor
+            # (D flushes them on sleep); the anchor itself comes back from
+            # the store as a load (NF 10020634: 14 of 14 follow-ups after a
+            # D sleep read >= it, e.g. weg2-26-45 P hit 53760 >= 53696), and
+            # ANCHOR-LOST retracts it when the flush drops it.
+            served = (not held and held_epoch is not None and pt > 0 and cap is not None)
+            if served:
+                raw = max(raw, min(int(pt), int(cap), self.own_anchor(int(eids.size))))
             if raw <= 0:
                 continue
             known = True
@@ -643,5 +664,6 @@ class TokenSpans:
             if credit > best:
                 best = credit
                 src = ("d_served_epoch" if held and credit > ct
+                       else "d_served_anchor" if served and credit > ct
                        else "d_inflight" if key in self.inflight_keys else "d_leg2_cached")
         return max(0, int(ids.size) - best), best, known, src

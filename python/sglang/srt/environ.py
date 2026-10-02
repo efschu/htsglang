@@ -1686,8 +1686,8 @@ class Envs:
     # unchanged: an uncached rest above X still routes LONG. Off = the pre-#49
     # pricing (NF rc2.1l + H100). Default per profile (weg2/form.py
     # ModelProfile.agent_span, operator 26.09.): qwen27b on (its line ran #49
-    # unswitched since RC9), nextflash off until the NF seat releases it with a
-    # boot tag; off without a form (the NF code default).
+    # unswitched since RC9), nextflash on since X-CREDIT-1002 (02.10., NF seat:
+    # a finished D leg 2 credits its own end anchor); off without a form.
     SGLANG_WEG2_ENABLE_AGENT_SPAN = EnvBool(_profile_default("SGLANG_WEG2_ENABLE_AGENT_SPAN", False))
     # PREFILL-EINBRUCH-0929 K1 (Weg-2 front, X-EXACT): at the first content of
     # an after_p leg 2 -- P's publish is complete, D resumed from it -- the

@@ -673,10 +673,14 @@ def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
     if entries is None or caps is None:
         return []
     gone = []
+    raw = getattr(spans, "raw_depths", None) or {}
     for key, entry in list(entries.items()):
         cap = caps.get(key)
         ct = int(entry[1]) if len(entry) > 1 else 0
-        if (cap is not None and int(cap) in lost) or (cap is None and ct in lost):
+        # X-CREDIT-FINISHED-1002: a K2-clamped entry by D's unclamped depth too
+        if ((cap is not None and int(cap) in lost) or (cap is None and ct in lost)
+                or (raw.get(key) is not None and int(raw[key]) in lost)):
+            raw.pop(key, None)
             entries.pop(key, None)
             caps.pop(key, None)
             unflag = getattr(spans, "_unflag_inflight", None)  # D-INFLIGHT
@@ -5924,6 +5928,15 @@ class Front:
             self.counters["presence_d_inflight_no_ids"] += 1
             return 0
         p_pt = int(getattr(pending, "leg1_prompt_tokens", 0) or 0) if pending is not None else 0
+        if p_pt <= 0:
+            # Only a leg D resumed from P's END-ANCHOR: that anchor is a store
+            # fact D just read. A prompt D prefilled itself anchors on its
+            # prefill TRACK, which the front cannot see in flight (NF 10020634:
+            # 8 of 54 in-flight '#1469 RETAIN ... value=True' below the page
+            # floor, up to 1.9k -- weg2-4-7 19509 -> 17728); its finish
+            # reading (#59 depth, d_served_epoch / d_served_anchor) covers it.
+            self.counters["presence_d_inflight_no_p_anchor"] += 1
+            return 0
         anchor = self.tspans.record_d_inflight(rid, ids, p_pt)
         if anchor <= 0:
             return 0
@@ -7458,6 +7471,9 @@ class Front:
             # X-CREDIT-INFLIGHT-1002: named only on a d_inflight verdict
             + ("; d_inflight = the end anchor of a prompt a still-decoding D leg 2 "
                "holds (realised at its first content)" if presence_src == "d_inflight" else "")
+            + ("; d_served_anchor = the end anchor of a text D served in an earlier "
+               "epoch, capped by D's resumable depth (a store load, not a prefill)"
+               if presence_src == "d_served_anchor" else "")
             + (X_EXACT_VERDICT_NOTE if _xx is not None else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
