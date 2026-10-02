@@ -342,7 +342,8 @@ def lean_boot(b: dict) -> dict:
     out = {k: b.get(k) for k in LEAN_KEEP if k in b}
     out["prefill"] = {g: {"last_burst": {"tps": ((v or {}).get("last_burst") or {}).get("tps")}}
                       for g, v in (b.get("prefill") or {}).items()}
-    out["decode"] = {g: {"gen_tps_last": (v or {}).get("gen_tps_last")} for g, v in (b.get("decode") or {}).items()}
+    out["decode"] = {g: {k: (v or {}).get(k) for k in ("gen_tps_last", "gen_tps_boot", "seats_boot", "boot_decode_s")}
+                     for g, v in (b.get("decode") or {}).items()}
     ipc = b.get("ipc") or {}
     out["ipc"] = {k: ipc.get(k) for k in ("lifecycle", "terminal", "model", "tag", "boot_id", "cause") if k in ipc}
     out["lean"] = True

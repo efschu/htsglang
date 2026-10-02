@@ -132,6 +132,10 @@ class TestInstrument(unittest.TestCase):
         self.assertAlmostEqual(dec["gen_tps"], 200.0, delta=2)
         self.assertAlmostEqual(dec["per_stream"], 100.0, delta=1)
         self.assertLess(abs((dec["gen_tps_last"] or 0) - 200.0), 5)
+        # Nutzer 02.10.: "Letzte Boots" reads the whole boot's decode, not the last stretch
+        self.assertAlmostEqual(dec["gen_tps_boot"], 200.0, delta=2)
+        self.assertAlmostEqual(dec["seats_boot"], 2.0, delta=0.1)
+        self.assertGreater(dec["boot_decode_s"], 2.0)
 
     def test_timeline_flip_tail(self):
         segs = self.m.segments()

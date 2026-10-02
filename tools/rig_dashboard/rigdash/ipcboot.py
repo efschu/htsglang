@@ -283,6 +283,13 @@ def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict
             r = acc_t / acc_d
             best = r if best is None or r > best else best
             acc_t = acc_d = 0.0
+    # Nutzer 02.10.: "Letzte Boots" compared two boots of one image by their LAST stretch (146,5 vs 114 --
+    # bs 5 vs bs 2 at the end).  The boot figure is the whole boot's decode: tokens / decode seconds over
+    # every steady interval, with the seats over the same time.
+    allst = [x for x in iv if x["steady"]] or iv
+    b_tok, b_dur = sum(x["tok"] for x in allst), sum(x["dur"] for x in allst)
+    b_seat = sum(x["seat_s"] for x in allst if x.get("seat_s"))
+    b_busy = sum(x["busy"] for x in allst if x.get("seat_s"))
     gms = sum((x.get("gpu_ms") or 0.0) for x in sw)
     by_bs = {str(bs): {"median_ms": round(v[1] / v[0], 1), "n": int(v[0]), "stat": "Mittel"}
              for bs, v in sorted((last.get("by_bs") or {}).items(), key=lambda x: int(x[0]))
@@ -292,6 +299,8 @@ def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict
         seats = {"n": front.get("d_phase_n"), "parked_n": front.get("d_parked_n"), "cap": last.get("cap_seats")}
     return {"window_s": WINDOW_S, "gen_tps": (tok / dur) if dur >= 2.0 else None,
             "gen_tps_last": lastst["rate"] if lastst else None, "rows": len(win),
+            "gen_tps_boot": (b_tok / b_dur) if b_dur >= 2.0 else None, "boot_decode_s": b_dur,
+            "seats_boot": (b_seat / b_busy) if b_busy > 0 else None,
             "last_t": lastst["e"] if lastst else None,
             "one_s": (cur["tok"] / cur["busy"]) if cur else 0.0, "max3s_120": best,
             "per_stream": (tok_s / seat_s) if seat_s > 0 else ((sum(streams) / len(streams)) if streams else None),
