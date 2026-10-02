@@ -83,6 +83,30 @@ class DeviceInfo:
     #: allocation. NVML reports it only through the v2 memory struct; ``0``
     #: means the driver did not report it (see :func:`_memory_info`).
     reserved_bytes: int = 0
+    #: HW-GENERIC 1002 (user 02.10.: "die software soll fuer jede hardware
+    #: laufen"): the card's PROPERTIES, so identity and ordering never read a
+    #: name substring (weg2/card_identity.py). Every field is what NVML
+    #: answered; ``None`` = NVML did not answer (old binding, old recording) --
+    #: never a guess. ``cc_major``/``cc_minor``: nvmlDeviceGetCudaComputeCapability.
+    cc_major: Optional[int] = None
+    cc_minor: Optional[int] = None
+    #: nvmlDeviceGetBAR1MemoryInfo().bar1Total
+    bar1_total_bytes: Optional[int] = None
+    #: nvmlDeviceGetMaxPcieLinkGeneration / nvmlDeviceGetMaxPcieLinkWidth
+    #: (the link the slot+card can train to, not the momentary one).
+    pcie_max_gen: Optional[int] = None
+    pcie_max_width: Optional[int] = None
+    #: nvmlDeviceGetMemoryBusWidth (bits) and nvmlDeviceGetMaxClockInfo(MEM)
+    #: (MHz): the nameplate DRAM bandwidth is bus/8 * clock * 2 (DDR).
+    mem_bus_width_bits: Optional[int] = None
+    mem_clock_max_mhz: Optional[int] = None
+
+    @property
+    def compute_capability(self) -> Optional[tuple]:
+        """``(major, minor)`` or None when NVML did not report it."""
+        if self.cc_major is None or self.cc_minor is None:
+            return None
+        return (int(self.cc_major), int(self.cc_minor))
 
     @property
     def total_mib(self) -> int:
@@ -345,9 +369,49 @@ def _replay_devices() -> "list[DeviceInfo] | None":
             total_bytes=int(r["total_bytes"]),
             reserved_bytes=int(r.get("reserved_bytes", 0)),
             pci_bus_id=str(r.get("pci_bus_id", "")),
+            # HW-GENERIC 1002: a recording without a property replays it as
+            # None (unknown), exactly like an NVML that did not answer.
+            **{k: (None if r.get(k) is None else int(r[k])) for k in IDENTITY_FIELDS},
         )
         for r in rows
     ]
+
+
+#: HW-GENERIC 1002: the optional property fields of :class:`DeviceInfo`, in
+#: the order a recording may carry them.
+IDENTITY_FIELDS = ("cc_major", "cc_minor", "bar1_total_bytes", "pcie_max_gen",
+                   "pcie_max_width", "mem_bus_width_bits", "mem_clock_max_mhz")
+
+
+def _identity_fields(pynvml, handle) -> dict:
+    """The card's property fields (:data:`IDENTITY_FIELDS`). Each query is
+    answered or ``None`` -- one unanswered query (an old binding, a driver
+    that does not implement it) never costs the others and never becomes a
+    guessed value."""
+    out: dict = {k: None for k in IDENTITY_FIELDS}
+
+    def _try(fn):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001 - unanswered = None, by design
+            return None
+
+    cc = _try(lambda: pynvml.nvmlDeviceGetCudaComputeCapability(handle))
+    if cc is not None:
+        out["cc_major"], out["cc_minor"] = int(cc[0]), int(cc[1])
+    bar1 = _try(lambda: pynvml.nvmlDeviceGetBAR1MemoryInfo(handle))
+    if bar1 is not None and getattr(bar1, "bar1Total", None) is not None:
+        out["bar1_total_bytes"] = int(bar1.bar1Total)
+    for key, fn in (
+        ("pcie_max_gen", lambda: pynvml.nvmlDeviceGetMaxPcieLinkGeneration(handle)),
+        ("pcie_max_width", lambda: pynvml.nvmlDeviceGetMaxPcieLinkWidth(handle)),
+        ("mem_bus_width_bits", lambda: pynvml.nvmlDeviceGetMemoryBusWidth(handle)),
+        ("mem_clock_max_mhz", lambda: pynvml.nvmlDeviceGetMaxClockInfo(
+            handle, pynvml.NVML_CLOCK_MEM)),
+    ):
+        v = _try(fn)
+        out[key] = None if v is None else int(v)
+    return out
 
 
 def list_devices() -> list[DeviceInfo]:
@@ -377,6 +441,7 @@ def list_devices() -> list[DeviceInfo]:
                     total_bytes=total_bytes,
                     reserved_bytes=reserved_bytes,
                     pci_bus_id=_decode(pynvml.nvmlDeviceGetPciInfo(handle).busId),
+                    **_identity_fields(pynvml, handle),
                 )
             )
         return devices
