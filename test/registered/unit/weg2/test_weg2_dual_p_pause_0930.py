@@ -144,6 +144,10 @@ class DualPPause(CustomTestCase):
             await asyncio.sleep(0.02)
             before = list(started)
             self.p.release(800 * MIB)                  # P freed its context: pressure answered
+            # D's next tick takes the 300 MiB it was short of (ledger demand[D] -> 0). Since the
+            # dual pressure fix (02.10.) the stages read D's shortfall too: P does not resume
+            # into rows D still waits for
+            self.assertEqual(self.d.request(300 * MIB), (300 * MIB, 0))
             f._dual_pump(pass_fn)
             await asyncio.sleep(0.02)
             return before, started

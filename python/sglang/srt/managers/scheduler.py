@@ -243,6 +243,7 @@ from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progre
 from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
 from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
+from sglang.srt.weg2 import dual_d_priority as _weg2_dual_d_priority  # D HOLD FOR GROW (dual D)
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -12522,6 +12523,8 @@ class Scheduler(
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
+                if _weg2_dual_d_priority.take_hold_for_grow(running_batch):
+                    ret = None  # D HOLD FOR GROW: no decode this iteration
             else:
                 ret = None
             # maybe_take_tick keeps its cadence gate, now read as PCIe
@@ -12578,6 +12581,8 @@ class Scheduler(
                 else:
                     running_batch = self.update_running_batch(running_batch)
                     ret = running_batch if not running_batch.is_empty() else None
+                    if _weg2_dual_d_priority.take_hold_for_grow(running_batch):
+                        ret = None  # D HOLD FOR GROW: no decode this iteration
             else:
                 ret = None
 
@@ -18202,6 +18207,21 @@ class Scheduler(
             num_tokens_next = batch.new_tokens_required_next_decode()
             evict_from_tree_cache(self.tree_cache, num_tokens_next)
             kv_full_retract_flag = self.uniform_min_avail() < num_tokens_next
+        # D HOLD FOR GROW (dual layout, group D; user rule: D never retracts a running
+        # decode). The flag above is group-uniform; instead of the retract D grows
+        # on the spot, or -- when the card ledger is short (its request pressed P,
+        # stage 1 then stage 2) -- holds the batch for THIS iteration and asks again
+        # in the next one. Only a hold past SGLANG_WEG2_DUAL_D_HOLD_MAX_S falls
+        # through to the retract's named stop (W-DUAL-D-RETRACT). Off the dual D
+        # this is one env read on an already-full round, nothing else.
+        if kv_full_retract_flag and _weg2_dual_d_priority.d_retract_forbidden():
+            _hold = _weg2_dual_d_priority.grow_or_hold(self, batch, num_tokens_next)
+            if _hold == "go":
+                kv_full_retract_flag = False
+            elif _hold == "hold":
+                return batch  # marked: the callers skip the decode, the batch stays
+        elif getattr(self, "_weg2_d_hold", None) is not None:
+            _weg2_dual_d_priority.end_hold(self, "fits")
         # #797, EXAMINED AND DELIBERATELY NOT CHANGED. This decision and the
         # loop bound below are RANK-LOCAL on a TP=1/PP=3 boot -- not by
         # oversight, but because `_update_uniform_pool_budget` reduces on

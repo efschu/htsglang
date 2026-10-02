@@ -245,17 +245,79 @@ def want_local_tokens(demand: int, locked: int, air: int, step: int) -> int:
 
 
 def decide(mapped: int, want: int, p_waiting: bool, below_rounds: int, step: int,
-           hold: int = SHRINK_HOLD_ROUNDS) -> Tuple[str, int]:
+           hold: int = SHRINK_HOLD_ROUNDS, *, avail_min: Optional[int] = None, air: int = 0,
+           holds: bool = False) -> Tuple[str, int]:
     """REPLICATED, pure: ('grow', want) / ('shrink', target) / ('hold', mapped),
     plus the new below-counter via the caller. Grow at once; shrink when a P
     prompt waits (D's cache must not starve it) or after ``hold`` rounds with
-    at least two lattice steps of slack."""
+    at least two lattice steps of slack.
+
+    D PRIORITY (gmps12, D 00:16:45/00:16:50: SHRINK 167936 -> 69632 twice for a
+    waiting P prompt, then a 35736-token hand-back and kv_full): ``avail_min`` --
+    the group's free rows (MIN over the ranks) -- must keep ``air`` + two lattice
+    steps AFTER the shrink: the shrink goes only as low as that allows (and not
+    at all below one step); and while a hold exists (``holds``: a parked /
+    W50-midstream request, a D-HOLD-FOR-GROW episode) a waiting P prompt shrinks
+    nothing -- the held context comes back to these rows. ``avail_min=None`` (no
+    reading, or nothing running, queued or held): the old rule."""
     if want > mapped:
         return "grow", want
     slack = mapped - want
-    if slack >= int(step) and (p_waiting or (slack >= 2 * int(step) and below_rounds >= int(hold))):
+    if avail_min is not None:
+        room = int(avail_min) - int(air) - 2 * int(step)       # rows a shrink may still take
+        slack = min(slack, (room // int(step)) * int(step)) if room > 0 else 0
+        want = mapped - slack
+    p_shrink = bool(p_waiting) and not bool(holds)
+    if slack >= int(step) and (p_shrink or (slack >= 2 * int(step) and below_rounds >= int(hold))):
         return "shrink", want
     return "hold", mapped
+
+
+#: the group-free reading's "no reading" value (a MIN collective ignores it)
+NO_AVAIL = 1 << 62
+
+
+def d_avail_rows(sched, actor) -> int:
+    """This rank's rows a decode round can get WITHOUT the card ledger:
+    allocator.available_size() -- the reading ``uniform_min_avail`` /
+    ``uniform_avail_floor`` reduce for the retract check -- plus the tree's
+    evictable cache, which ``update_running_batch`` evicts before it allocates.
+    The evictable term on purpose: D's cached prefix is not demand (the
+    cache_yield rule); counting only available_size would grow D -- and press P
+    -- for cache. The retract path re-reads available_size after the eviction
+    (dual_d_priority.grow_or_hold), so both read the same rows. NO_AVAIL when
+    there is no reading."""
+    try:
+        free = int(actor.allocator.available_size())
+    except Exception:  # noqa: BLE001 -- no reading: the MIN takes the other ranks', or the old rule
+        return NO_AVAIL
+    tree = getattr(sched, "tree_cache", None)
+    try:
+        ev = int(tree.evictable_size() or 0) if tree is not None else 0
+    except Exception:  # noqa: BLE001 -- a tree without the counter: available alone (the stricter reading)
+        ev = 0
+    return free + max(0, ev)
+
+
+def d_holds(sched) -> int:
+    """1 while D holds rows the bookkeeping does not schedule: a parked request
+    (``weg2_d_parked`` -- the D-PARK and the W50 midstream hold of
+    resume_via_p.keep_on_d both land there) or a D-HOLD-FOR-GROW episode."""
+    return 1 if (getattr(sched, "weg2_d_parked", None) or getattr(sched, "_weg2_d_hold", None)) else 0
+
+
+def floor_want(want: int, mapped: int, avail_min: int, air: int, step: int, demand: int) -> int:
+    """D PRIORITY: the level the TIGHTEST rank needs. The token sums (``want``)
+    do not see the binding rank; the retract check does (MIN over the ranks).
+    When the group has demand and its free rows fall under ``air`` + two lattice
+    steps, D asks for the gap (at least one step) -- before the decode round
+    finds the pool full."""
+    if int(demand) <= 0 or int(avail_min) >= NO_AVAIL:
+        return int(want)
+    gap = int(air) + 2 * int(step) - int(avail_min)
+    if gap <= 0:
+        return int(want)
+    return max(int(want), int(mapped) + max(int(step), _pk.round_up(gap, int(step))))
 
 
 # -- wiring (D process, dual only) -------------------------------------------
@@ -350,7 +412,8 @@ def tick(sched) -> Optional[str]:
 
     actor.gmin = getattr(sched, "_weg2_group_min_ints", None) or actor.gmin
     demand_local = d_demand(sched)
-    want_local = want_local_tokens(demand_local, d_locked_rows(sched, actor), _sv._air(sched), actor.step)
+    air = int(_sv._air(sched))
+    want_local = want_local_tokens(demand_local, d_locked_rows(sched, actor), air, actor.step)
     st = peek(actor.ledger.path)
     p_wait_local = 1 if (st is not None and int(st.demand.get("P", 0)) > 0) else 0
     live_local = int(_pk.max_live_id(actor.allocator, actor.page)) * int(actor.page)
@@ -358,10 +421,15 @@ def tick(sched) -> Optional[str]:
     # P counted those bytes as free -> the budget held them twice. D keeps its
     # boot pool until P has JOINED every D card (group decision).
     p_missing_local = 1 if (st is None or not int(st.pid.get("P", 0) or 0)) else 0
+    # D PRIORITY: the tightest rank's free rows (MIN) and the holds (MAX) ride the
+    # SAME collective -- every rank decides on the same numbers
     g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local), -int(demand_local),
-                    -int(p_missing_local)])
+                    -int(p_missing_local), int(d_avail_rows(sched, actor)), -int(d_holds(sched))])
     want, p_waiting, floor = -int(g[0]), -int(g[1]) > 0, -int(g[2])
     p_missing = len(g) > 4 and -int(g[4]) > 0
+    avail_min = int(g[5]) if len(g) > 5 else NO_AVAIL
+    holds = len(g) > 6 and -int(g[6]) > 0
+    want = floor_want(want, actor.mapped_tokens, avail_min, air, actor.step, -int(g[3]))
     if p_waiting and -int(g[3]) == 0:
         # the GROUP has no running or waiting request and P waits: D's cached
         # prefix is not demand (user rule) -- every rank gives it up alike, the
@@ -369,7 +437,11 @@ def tick(sched) -> Optional[str]:
         cache_yield(sched, actor)
     want = max(want, _pk.round_up(floor, actor.step))       # never below a live row of any rank
     below = actor._below + 1 if want < actor.mapped_tokens else 0
-    verdict, level = decide(actor.mapped_tokens, want, p_waiting, below, actor.step)
+    # the room rule of decide() guards running, queued or held work; an idle D's
+    # level is its look-ahead already (the cache_yield path shrinks it to that)
+    guarded = (-int(g[3]) > 0 or holds) and avail_min < NO_AVAIL
+    verdict, level = decide(actor.mapped_tokens, want, p_waiting, below, actor.step,
+                            avail_min=avail_min if guarded else None, air=air, holds=holds)
     if verdict == "shrink" and p_missing:
         verdict, level = "hold", actor.mapped_tokens
     if verdict != "grow" and st is not None and (int(st.pressure.get("P", 0) or 0) > 0

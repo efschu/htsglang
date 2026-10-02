@@ -11240,13 +11240,15 @@ class Front:
         from sglang.srt.weg2 import dual_p_kv_stage as _pk
         from sglang.srt.weg2.card_kv_ledger import peek
 
-        committed, free = 0, None
+        committed, free, d_short = 0, None, 0
         for pth in self.dual_kv_ledgers:
             st = peek(pth)
             if st is None:
                 continue
             committed += int(st.committed["P"])
             free = int(st.free) if free is None else min(free, int(st.free))
+            # D's unmet request on this card (card_kv_ledger.request: need - grant)
+            d_short = max(d_short, int(st.demand.get("D", 0) or 0))
         tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
         grant, per_tok, weights, step_tok = 0, 0.0, 0, 0
         stages = []
@@ -11284,7 +11286,7 @@ class Front:
             card_room.append((int(st.free), int(t.get("lent") or 0) + step_b + int(air_tok * tok_b)))
         return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
                 "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights,
-                "card_room": card_room if stages else None}
+                "card_room": card_room if stages else None, "d_short": d_short}
 
     #: env: the metal probe of stage 2 (one sleep + wake of P in the first idle
     #: stretch, no pressure needed) -- seconds P stays asleep; unset/0 = off
@@ -11342,6 +11344,15 @@ class Front:
         except Exception as exc:  # noqa: BLE001 -- a failed reading keeps the stage, never acts on a guess
             logger.warning("WEG2 DUAL-KV-PRESSURE reading failed: %r", exc)
             return
+        # D PRIORITY: the stages read D's SHORTFALL, not only the ledger's pressure on
+        # P. card_kv_ledger.arbitrate caps that pressure at what P still commits, so
+        # it reads 0 the moment stage 1 is complete (P released everything) although
+        # D is still short -- stage 2 ("P released everything AND the pressure held")
+        # could never fire, and P would never sleep under real pressure (gmps12 only
+        # proved the sleep through the probe). D's unmet request (ledger demand[D],
+        # set by every short request, cleared once D fits) keeps the ladder going.
+        d_short = int(rd.pop("d_short", 0) or 0)
+        pressure = max(int(pressure), d_short)
         host_ok = True
         if stages.p_state == "stopped" and stages.sleep_capable and pressure > 0:
             host_ok = _ddp.host_allows_sleep(_mem_available_bytes(), rd["weights_bytes"])

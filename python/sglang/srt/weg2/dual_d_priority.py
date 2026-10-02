@@ -17,8 +17,12 @@ This module holds the D-side tripwire (no retract in the dual layout).
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from typing import Optional, Sequence, Tuple
+
+logger = logging.getLogger(__name__)
 
 MARK = "W-DUAL-D-RETRACT"
 
@@ -49,6 +53,137 @@ def refuse_d_retract(batch, *, kv_full: bool, reason, env=None) -> None:
         "%s: group D of the dual layout was about to retract %s (kv_full=%s, reason=%s) -- decode is "
         "never interrupted here; P must have stopped, freed its KV or slept before D's pool ran full"
         % (MARK, rids, bool(kv_full), reason or "-"))
+
+
+# -- D HOLD FOR GROW: emergency growth instead of the retract (D side) -----------
+#
+# gmps12 (boot ...dual1mpsleepbar1fs10020008, D 00:16:45-53): D's stage shrank to
+# 69632 for a waiting P prompt, a 35736-token hand-back came in, the decode round
+# found the pool full (uniform_min_avail < num_tokens_next) and W-DUAL-D-RETRACT
+# stopped the layout -- while the card ledger had 2.4 GB free. The decode is never
+# interrupted (user rule); instead D grows on the spot (group-uniform), and when
+# the card is really short it HOLDS the batch for this iteration: the short request
+# left pressure on P in the ledger (stage 1, then stage 2), the next iteration asks
+# again. Only a hold that outlasts HOLD_MAX_S ends in the named stop.
+
+HOLD_MARK = "D-HOLD-FOR-GROW"
+HOLD_MAX_ENV = "SGLANG_WEG2_DUAL_D_HOLD_MAX_S"
+#: 120 s. What the hold waits for, measured on gmps12: the sleep leg 2.2 s
+#: (front 00:11:52.153 -> 00:11:54.368), stage 1 one P chunk boundary, the stages'
+#: SLEEP_AFTER_TICKS x the front's 0.2 s tick -- the whole ladder in ~10 s. 120 s is
+#: >10x that and stays under the 300 s a client waits for its first byte (H102), so
+#: the named stop comes only when the ladder cannot free the pool at all (stage 2
+#: refused by the host floor, D at its top, a hung P), not for a slow sleep.
+HOLD_MAX_S_DEFAULT = 120.0
+#: grow target in the hold path: the deficit at this factor plus two lattice steps.
+#: The deficit is read on the tightest rank; the factor covers an uneven owner
+#: share (one rank's rows vs the group's tokens) so ONE grow suffices -- the
+#: re-read after the grow is the truth either way.
+HOLD_DEFICIT_FACTOR = 4
+_BATCH_ATTR = "_weg2_hold_for_grow"
+_SCHED_ATTR = "_weg2_d_hold"
+
+
+def hold_max_s(env=None) -> float:
+    e = os.environ if env is None else env
+    try:
+        v = float(e.get(HOLD_MAX_ENV, "") or HOLD_MAX_S_DEFAULT)
+    except ValueError:
+        return HOLD_MAX_S_DEFAULT
+    return v if v > 0 else HOLD_MAX_S_DEFAULT
+
+
+def _group_avail(actor, gmin) -> int:
+    """The pool's free rows, MIN over the D ranks -- the same reading
+    ``uniform_min_avail`` reduces (allocator.available_size), taken AFTER the
+    eviction ``update_running_batch`` already ran."""
+    return int(gmin([int(actor.allocator.available_size())])[0])
+
+
+def end_hold(sched, why: str, now=time.monotonic) -> None:
+    """The hold episode is over: one line with its count and wall time."""
+    ep = getattr(sched, _SCHED_ATTR, None)
+    if ep is None:
+        return
+    setattr(sched, _SCHED_ATTR, None)
+    logger.warning("%s n=%d ms=%d released=%s -- the decode runs again, nothing retracted", HOLD_MARK,
+                   int(ep["n"]), int((float(now()) - ep["t0"]) * 1000), why)
+
+
+def take_hold_for_grow(batch) -> bool:
+    """The caller's half: True when update_running_batch held ``batch`` this
+    iteration (the decode does not run; the batch stays the running batch).
+    Consumes the mark."""
+    if batch is None or not getattr(batch, _BATCH_ATTR, False):
+        return False
+    setattr(batch, _BATCH_ATTR, False)
+    return True
+
+
+def grow_or_hold(sched, batch, num_tokens_next: int, *, now=time.monotonic, env=None) -> str:
+    """Dual D only, called where the decode round found the pool full (the flag
+    is group-uniform, #603). Returns
+
+    * ``"go"``: the pool has the rows (after the eviction, or after an emergency
+      group grow to the deficit x HOLD_DEFICIT_FACTOR + 2 lattice steps) -- run
+      the decode, no retract;
+    * ``"hold"``: the card ledger is short -- the request left pressure/demand on
+      P (the front's stages 1 and 2), this iteration skips the decode, the batch
+      is marked (``take_hold_for_grow``) and stays; ``D-HOLD-FOR-GROW n= ms=``;
+    * ``"retract"``: not dual D, no D actor, or the hold outlasted
+      ``SGLANG_WEG2_DUAL_D_HOLD_MAX_S`` -- the caller's retract runs and
+      ``refuse_d_retract`` stops by name (W-DUAL-D-RETRACT).
+
+    Group-uniform: every branch is taken on a MIN-reduced value (the avail
+    re-reads, group_grow's verdict, the expiry vote), so every D rank enters the
+    same collectives and returns the same verdict."""
+    if not d_retract_forbidden(env):
+        return "retract"
+    from sglang.srt.weg2 import dual_d_kv_stage as _ddk
+    from sglang.srt.weg2 import dual_p_kv_stage as _pk
+
+    runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    actor = getattr(runner, _ddk.ACTOR_ATTR, None)
+    if actor is None:
+        return "retract"
+    gmin = getattr(sched, "_weg2_group_min_ints", None) or actor.gmin
+    actor.gmin = gmin
+    need = int(num_tokens_next)
+    avail = _group_avail(actor, gmin)
+    if avail >= need:
+        end_hold(sched, "evicted", now)
+        return "go"
+    target = int(actor.mapped_tokens) + _pk.round_up(
+        2 * int(actor.step) + HOLD_DEFICIT_FACTOR * (need - avail), int(actor.step))
+    if actor.group_grow(target):
+        avail = _group_avail(actor, gmin)
+        if avail >= need:
+            end_hold(sched, "grown", now)
+            return "go"
+    t = float(now())
+    ep = getattr(sched, _SCHED_ATTR, None)
+    if ep is None:
+        ep = {"t0": t, "n": 0, "next": 0.0, "iv": 0.5}
+        setattr(sched, _SCHED_ATTR, ep)
+    ep["n"] += 1
+    ms = int((t - ep["t0"]) * 1000)
+    expired = -int(gmin([-(1 if ms >= hold_max_s(env) * 1000 else 0)])[0]) > 0
+    rids = [str(getattr(r, "rid", "?"))[:16] for r in (getattr(batch, "reqs", None) or ())]
+    if expired:
+        setattr(sched, _SCHED_ATTR, None)
+        logger.error("%s n=%d ms=%d EXPIRED after %s=%.0f s (need=%d avail=%d mapped=%d top=%d) -- the "
+                     "ladder did not free the pool; the retract's named stop follows", HOLD_MARK, ep["n"], ms,
+                     HOLD_MAX_ENV, hold_max_s(env), need, avail, actor.mapped_tokens, actor.top)
+        return "retract"
+    if t >= ep["next"]:
+        ep["iv"] = min(10.0, 2.0 * float(ep["iv"]))
+        ep["next"] = t + ep["iv"]
+        logger.warning("%s n=%d ms=%d need=%d avail=%d mapped=%d want=%d top=%d reqs=%s -- the card is "
+                       "short: the decode waits this iteration (nothing retracted), D's request pressed P "
+                       "(stage 1, then stage 2)", HOLD_MARK, ep["n"], ms, need, avail, actor.mapped_tokens,
+                       min(int(actor.top), target), actor.top, rids)
+    setattr(batch, _BATCH_ATTR, True)
+    return "hold"
 
 
 # -- the P stages (front, dual only) -------------------------------------------
