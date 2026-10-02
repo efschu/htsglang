@@ -2304,6 +2304,16 @@ def bdf_of_card(device) -> str:
         fn.restype = ctypes.c_int
         if fn(buffer, ctypes.c_int(32), ctypes.c_int(int(ordinal))) == 0:
             return _norm_bdf(buffer.value.decode())
+        # y7h: a failed query leaves its error as the thread's LAST error, and
+        # the next checked launch on this thread raises it far from here
+        # ("invalid device ordinal" in D's resume). Read it away now.
+        try:
+            clear = (lib.hipGetLastError if torch.version.hip is not None
+                     else lib.cudaGetLastError)
+            clear.restype = ctypes.c_int
+            clear()
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as e:                      # pragma: no cover
         logger.warning("barlink-Matrix: could not determine PCI address (%s).", e)
     return f"unknown-{ordinal}"
