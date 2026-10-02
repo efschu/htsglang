@@ -214,7 +214,8 @@ def unstaged_items(req) -> List[Any]:
     if getattr(req, "_weg2_vision_skip", False):
         return []  # W102 SKIP: every image position is inside the admitted prefix
     mm = getattr(req, "multimodal_inputs", None)
-    items = getattr(mm, "mm_items", None) or []
+    items = getattr(mm, "mm_items", None)
+    items = [] if items is None else items  # never truth-tested (tensor class, y7m)
     return [it for it in items
             if getattr(it, "precomputed_embeddings", None) is None
             and getattr(it, "feature", None) is not None]

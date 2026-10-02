@@ -58,8 +58,10 @@ def image_spans(req: Any) -> List[Tuple[int, int]]:
     """Every multimodal placeholder span of the request, (start, end) inclusive."""
     mm = getattr(req, "multimodal_inputs", None)
     spans: List[Tuple[int, int]] = []
-    for it in getattr(mm, "mm_items", None) or []:
-        for off in getattr(it, "offsets", None) or []:
+    items = getattr(mm, "mm_items", None)
+    for it in (() if items is None else items):
+        offs = getattr(it, "offsets", None)  # a list today; never truth-tested
+        for off in (() if offs is None else offs):
             spans.append((int(off[0]), int(off[1])))
     return spans
 
