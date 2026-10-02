@@ -84,32 +84,31 @@ def reserve_slots(allocator, slots: Sequence[int]) -> int:
     free (busy, or the padded slot 0, or requested twice) is a ValueError --
     reserving around it would double-book memory against the hold.
     """
-    wanted = [int(s) for s in slots]
-    if not wanted:
+    # L15-FLIPCOST (N4a: retain step "alloc" 284-319 ms): vectorised -- the
+    # old form built a Python set over every free page (~1M) per sleep.
+    free = allocator.free_pages
+    want = (slots if torch.is_tensor(slots)
+            else torch.as_tensor(list(slots), dtype=torch.int64)).to(free.dtype).reshape(-1)
+    if want.numel() == 0:
         return 0
-    # Counter keeps the dupe scan linear: a real hold is tens of thousands of
-    # slots and this runs inside D's sleep, where wanted.count(s) per distinct
-    # slot would be O(n^2) (~4e9 ops for a single 64k-token request).
-    counts = Counter(wanted)
-    dupes = sorted(s for s, c in counts.items() if c > 1)
-    if dupes:
+    uniq, counts = torch.unique(want, return_counts=True)
+    if bool((counts > 1).any()):
+        dupes = sorted(int(x) for x in uniq[counts > 1].tolist())
         raise ValueError(
             f"reserve_slots: slot(s) {dupes} requested twice; a slot can be "
             "reserved once"
         )
-    distinct = sorted(counts)
-    free = allocator.free_pages
-    free_set = set(int(x) for x in free.tolist())
-    missing = [s for s in distinct if s not in free_set]
-    if missing:
+    uniq_d = uniq.to(free.device)
+    present = torch.isin(uniq_d, free)
+    if not bool(present.all()):
+        missing = sorted(int(x) for x in uniq_d[~present].tolist())
         raise ValueError(
             f"reserve_slots: slot(s) {missing} are not free "
-            f"(free_pages holds {len(free_set)} entries, {len(distinct)} "
+            f"(free_pages holds {int(free.numel())} entries, {int(uniq.numel())} "
             "requested)"
         )
-    take = torch.tensor(distinct, dtype=free.dtype, device=free.device)
-    allocator.free_pages = free[~torch.isin(free, take)]
-    return len(distinct)
+    allocator.free_pages = free[~torch.isin(free, uniq_d)]
+    return int(uniq.numel())
 
 
 def reserve_mamba_slots(mamba_allocator, slots: Sequence[int]) -> int:
@@ -411,10 +410,12 @@ def retain_at_sleep(
     # never goes to reserve_slots. A given mamba_allocator is re-armed the
     # same way for the held anchors' compacted slots.
     allocator.clear()
-    new_all = sorted(
-        {int(s) for rid in hs.rids for s in plan.new_slots[rid]}
-        - set(PAD_SLOTS)
-    )
+    import numpy as _np
+
+    _cat = _np.concatenate([_np.asarray(plan.new_slots[rid], dtype=_np.int64)
+                            for rid in hs.rids]) if hs.rids else _np.zeros(0, _np.int64)
+    _u = _np.unique(_cat)
+    new_all = _u[~_np.isin(_u, _np.asarray(sorted(PAD_SLOTS), dtype=_np.int64))].tolist()
     reserve_slots(allocator, new_all)
     if mamba_allocator is not None:
         mamba_allocator.clear()
