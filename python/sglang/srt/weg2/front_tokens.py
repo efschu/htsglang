@@ -55,7 +55,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -202,14 +202,114 @@ def _server_args_namespace(server_args: Dict[str, Any]) -> SimpleNamespace:
 
 def _hf_config_stub(path: str) -> SimpleNamespace:
     """``model_type`` / ``architectures`` from the checkpoint's config.json --
-    the two fields the chat serving and the template detection read."""
+    the two fields the chat serving and the template detection read -- and
+    ``image_token_id`` (MM-XPRICE: the placeholder the processor expands)."""
     try:
         with open(os.path.join(path, "config.json")) as f:
             cfg = json.load(f)
     except Exception:  # noqa: BLE001
         cfg = {}
+    tc = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
     return SimpleNamespace(model_type=cfg.get("model_type"),
-                           architectures=cfg.get("architectures") or [])
+                           architectures=cfg.get("architectures") or [],
+                           image_token_id=cfg.get("image_token_id"),
+                           max_position_embeddings=(tc.get("max_position_embeddings")
+                                                    or cfg.get("max_position_embeddings")))
+
+
+# ---------------------------------------------------------------------------
+# MM-XPRICE (02.10.): an image request priced exactly, the same as text
+# ---------------------------------------------------------------------------
+# y7h-noH4 (23c8fb584e), front log ..._1002_105106.front.log: weg2-1-5 (a repeat
+# of the image needle weg2-0-1) and weg2-4-18 (a follow-up turn whose image sat
+# in the conversation) fell back to chars/3 with ``X-EXACT-FALLBACK
+# reason=multimodal`` and were forced LONG by W102 / VISION_FLIP_URGENT: a
+# flip pair each, for 24 resp. 1478 new tokens on P (cached 73088).
+#
+# The front has no processor and no tower, so it cannot know the pad ids D/P
+# derive from the pixel hash. It does not need them: the front's ids are FRONT
+# keys (TokenSpans LCP, presence records), never sent anywhere. The compact
+# render (``_process_messages``: the placeholder once per image) is expanded
+# with K copies of a surrogate per image, K = the image's token count as a
+# group REALISED it (learned from the first served leg of a request carrying
+# it), so every position after the image is the real position. An image the
+# front has never seen served has no K: that request keeps the chars/3
+# fallback and its leg on P, as before -- the tower must run for it anyway.
+
+#: surrogate ids live above every vocabulary and stay int32
+MM_SURROGATE_BASE = 1 << 30
+
+
+def mm_image_key(item: Any) -> str:
+    """Identity of one image item as the processor sees it: its source and
+    the request-level knobs that change its token count."""
+    if isinstance(item, (str, bytes)):
+        src = item if isinstance(item, str) else hashlib.sha1(item).hexdigest()
+        fields = {"url": src}
+    elif isinstance(item, dict):
+        fields = {k: item.get(k) for k in ("url", "detail", "max_dynamic_patch")}
+    else:
+        fields = {k: getattr(item, k, None) for k in ("url", "detail", "max_dynamic_patch")}
+    return _sha(json.dumps(fields, sort_keys=True, default=str))
+
+
+def mm_surrogate_value(key: str) -> int:
+    return MM_SURROGATE_BASE + (int(key[:7], 16) & ((1 << 28) - 1))
+
+
+@dataclasses.dataclass
+class MMExpansion:
+    ids: np.ndarray
+    #: one past the last image position -- what a covered prefix must reach
+    image_end: int
+    #: the real-token prefix before the first image (the L3 page keys hold there)
+    first_image: int
+    n_images: int
+    #: one past each image's positions, in prompt order
+    ends: List[int] = dataclasses.field(default_factory=list)
+
+
+def mm_expand(compact: np.ndarray, image_token_id: Optional[int], keys: Sequence[str],
+              ktok: Dict[str, int]) -> Optional[MMExpansion]:
+    """``compact`` with each image placeholder replaced by K surrogate ids;
+    None when an image's K is unknown or the placeholders do not match."""
+    if image_token_id is None or not keys:
+        return None
+    compact = np.asarray(compact, dtype=np.int32)
+    pos = np.flatnonzero(compact == int(image_token_id))
+    if pos.size != len(keys) or any(k not in ktok for k in keys):
+        return None
+    parts: List[np.ndarray] = []
+    ends: List[int] = []
+    last = width_sum = 0
+    for p, k in zip(pos.tolist(), keys):
+        parts.append(compact[last:p])
+        width_sum += p - last
+        width = int(ktok[k])
+        parts.append(np.full(width, mm_surrogate_value(k), dtype=np.int32))
+        width_sum += width
+        ends.append(width_sum)
+        last = p + 1
+    parts.append(compact[last:])
+    ids = np.concatenate(parts).astype(np.int32, copy=False)
+    return MMExpansion(ids=ids, image_end=int(ends[-1]), first_image=int(pos[0]),
+                       n_images=len(keys), ends=ends)
+
+
+def mm_learn(n_compact: int, keys: Sequence[str], ktok: Dict[str, int],
+             realised: int) -> Optional[Tuple[str, int]]:
+    """K of the ONE image of ``keys`` the front does not know yet, from the
+    prompt length a group realised; None when that is not determined."""
+    unknown = {k for k in keys if k not in ktok}
+    if len(unknown) != 1 or int(realised) <= 0:
+        return None
+    key = unknown.pop()
+    reps = sum(1 for k in keys if k == key)
+    rest = (int(realised) - (int(n_compact) - len(keys))
+            - sum(int(ktok[k]) for k in keys if k != key))
+    if rest <= 0 or rest % reps:
+        return None
+    return key, rest // reps
 
 
 class FrontTokens:
@@ -226,6 +326,10 @@ class FrontTokens:
         self._tok = None
         self._seg: Optional[SegmentEncoder] = None
         self.is_multimodal = False
+        #: MM-XPRICE: the placeholder the processor expands (config.json)
+        self.image_token_id: Optional[int] = None
+        #: CONTEXT-GATE: the group's --context-length, else the checkpoint's
+        self.context_len: Optional[int] = None
         self.load_s = 0.0
 
     # -- loading -------------------------------------------------------------
@@ -252,8 +356,9 @@ class FrontTokens:
                                 tokenizer_backend=getattr(ns, "tokenizer_backend", "huggingface"))
             seg = SegmentEncoder(tok)
             wrapped = _TokWrapper(tok, seg)
+            hf = _hf_config_stub(ns.model_path or path)
             mc = SimpleNamespace(
-                hf_config=_hf_config_stub(ns.model_path or path),
+                hf_config=hf,
                 is_multimodal=bool(is_multimodal),
                 get_default_sampling_params=lambda: {},
             )
@@ -270,6 +375,10 @@ class FrontTokens:
             self._anth = AnthropicServing(chat)
             self._chat, self._tok, self._seg = chat, wrapped, seg
             self.is_multimodal = bool(is_multimodal)
+            itid = getattr(hf, "image_token_id", None)
+            self.image_token_id = int(itid) if itid is not None else None
+            cl = getattr(ns, "context_length", None) or getattr(hf, "max_position_embeddings", None)
+            self.context_len = int(cl) if cl else None
             self.tokenizer_path = path
             self.load_s = time.time() - t0
             self.state = "ready"
@@ -283,21 +392,37 @@ class FrontTokens:
     def count(self, path: str, payload: Dict[str, Any]) -> Count:
         """Exact prompt tokens of ``payload`` as D tokenizes it. Raises on a
         payload D would refuse (the caller falls back and says so)."""
+        return self._count(path, payload)[0]
+
+    def count_mm(self, path: str, payload: Dict[str, Any]) -> Tuple[Count, List[str]]:
+        """MM-XPRICE: the COMPACT render of an image request (each image's
+        placeholder once, as the chat template writes it) and the key of
+        every image in prompt order. Raises where :meth:`count` would, and on
+        a path that carries no message images (the native ``/generate``)."""
+        if path not in ("/v1/messages", "/v1/chat/completions"):
+            raise ValueError(f"path {path} carries no message images")
+        c, image_data = self._count(path, payload)
+        return c, [mm_image_key(it) for it in (image_data or [])]
+
+    def _count(self, path: str, payload: Dict[str, Any]) -> Tuple[Count, Optional[List[Any]]]:
         if self.state != "ready":
             raise RuntimeError(f"front tokenizer not ready ({self.state}: {self.why})")
         t0 = time.perf_counter()
         seg = self._seg
+        image_data = None
         if path == "/v1/messages":
             from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
 
             req = self._anth._convert_to_chat_completion_request(
                 AnthropicMessagesRequest(**payload))
-            ids = self._chat._process_messages(req, self.is_multimodal).prompt_ids
+            r = self._chat._process_messages(req, self.is_multimodal)
+            ids, image_data = r.prompt_ids, r.image_data
         elif path == "/v1/chat/completions":
             from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-            ids = self._chat._process_messages(
-                ChatCompletionRequest(**payload), self.is_multimodal).prompt_ids
+            r = self._chat._process_messages(
+                ChatCompletionRequest(**payload), self.is_multimodal)
+            ids, image_data = r.prompt_ids, r.image_data
         elif path == "/generate":
             if payload.get("input_ids") is not None:
                 ids = list(payload["input_ids"])
@@ -313,7 +438,7 @@ class FrontTokens:
             ids = self._tok.encode(ids)
         arr = np.asarray(ids, dtype=np.int32)
         return Count(n=int(arr.size), ids=arr, ms=(time.perf_counter() - t0) * 1000.0,
-                     reused=seg.last_reused, encoded=seg.last_encoded)
+                     reused=seg.last_reused, encoded=seg.last_encoded), image_data
 
     def remember(self, text: str, ids: np.ndarray) -> None:
         key = _sha(text)
