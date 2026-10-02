@@ -10871,17 +10871,18 @@ class Front:
             self._metrics().served_leg("P", p.rid, time.time() - t0, pt, ct, 0)  # TSDB
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
-            # USAGE-TRUE: every P leg of the rid (re-route, X-REQUEUE, park
-            # hand-back, RESUME-VIA-P alike) adds what P really computed; leg 2
-            # corrects the client's cached count with it.
-            self._p_leg_note(p.rid, pt, ct, _ut.tier_split_of(js))
-            # USAGE-DETAILS: a rid that went through P is served LONG (a
-            # re-route of a SHORT verdict included), from this epoch on
-            self._usage_route_note(p.rid, "long", self.epoch, keep_same=True)
             # STORE-PRESENCE (NF ba76adffe2): ids for a fallback-priced rid NOW (before P's sleep
             # flush, not only at its leg 2), and P's END-ANCHOR noted for the flush
             await self._x_exact_backfill(p.rid, p.path, p.payload, p.text)
             self._p_leg1_store_note(p.rid, p.text, pt)
+            # USAGE-TRUE: every P leg of the rid (re-route, X-REQUEUE, park
+            # hand-back, RESUME-VIA-P alike) adds what P really computed; leg 2
+            # corrects the client's cached count with it. (Leg 2 starts only
+            # after leg 1 returned, so noting it last changes nothing.)
+            self._p_leg_note(p.rid, pt, ct, _ut.tier_split_of(js))
+            # USAGE-DETAILS: a rid that went through P is served LONG (a
+            # re-route of a SHORT verdict included), from this epoch on
+            self._usage_route_note(p.rid, "long", self.epoch, keep_same=True)
             # L15-18 (L3-RETURN stage 2): say whether this prompt's prefix
             # was known BEFORE this boot, so monitor M2's L3-RETURN check
             # does not count never-seen prompts as MISS. Gated on
