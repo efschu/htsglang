@@ -652,7 +652,23 @@ def rewrite_tree_chain(
             cur.component_data[ComponentType.FULL].value, kv_map
         )
         if len(cur.component_data) > int(ComponentType.MAMBA):
-            cur.component_data[ComponentType.MAMBA].value = _remap_slots(
-                cur.component_data[ComponentType.MAMBA].value, anchor_map
-            )
+            # L15-FIX-MAMBA-ALIAS (N3l 02.10. 02:29:57Z): only the HELD
+            # anchors survive the sleep -- the mamba allocator is re-armed
+            # with exactly their compacted slots (retain step 6), every
+            # other slot goes back to the free list. A chain node whose
+            # mamba value is not a held anchor (an intermediate checkpoint
+            # of the same prefix) must therefore LOSE its mamba value, or
+            # the tree names a free slot (#924 MAMBA SLOT ALIASING,
+            # free_and_cached > 0 -> the idle leak check kills D).
+            # ``anchor_map`` carries every held anchor old->new (identity
+            # for an anchor that did not move).
+            mv = cur.component_data[ComponentType.MAMBA].value
+            if (mv is not None and torch.is_tensor(mv) and mv.numel() > 0
+                    and not all(int(x) in anchor_map
+                                for x in mv.flatten().tolist())):
+                cur.component_data[ComponentType.MAMBA].value = None
+            else:
+                cur.component_data[ComponentType.MAMBA].value = _remap_slots(
+                    mv, anchor_map
+                )
         cur = getattr(cur, "parent", None)
