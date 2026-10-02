@@ -3560,6 +3560,46 @@ def seq_ipc_hold_gil_on(env=None) -> bool:
     return str(env.get(ENV_SEQ_IPC_HOLD_GIL, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
+#: FLIP-LEGS 02.10.: a SEQ deposit writes ONE record file per sync group
+#: (``<dpath>.g<first unit>``, every unit of the group in it) instead of one
+#: per unit; the one-``full``-per-unit handshake is unchanged. The collector
+#: reads the group file once and falls back to the per-unit file when it is
+#: absent (a depositor with the switch off). Unset = on; 0/false/no/off = one
+#: file per unit as before.
+ENV_SEQ_GROUP_RECORD = "SGLANG_WEG2_SEQ_GROUP_RECORD"
+
+
+def seq_group_record_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_SEQ_GROUP_RECORD, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def seq_group_record_path(dpath: str, first_unit: int) -> str:
+    return f"{dpath}.g{int(first_unit)}"
+
+
+def write_seq_group_record(dpath: str, first_unit: int, recs: dict) -> None:
+    """Atomic tmp+rename of one sync group's unit records ``{str(i): rec}``."""
+    import json as _json
+
+    path = seq_group_record_path(dpath, first_unit)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        _json.dump({"units": recs}, fh)
+    os.replace(tmp, path)
+
+
+def read_seq_group_record(dpath: str, first_unit: int) -> dict:
+    """``{str(i): rec}`` of the group file, or ``{}`` when it is absent/unreadable."""
+    import json as _json
+
+    try:
+        with open(seq_group_record_path(dpath, first_unit)) as fh:
+            return dict((_json.load(fh) or {}).get("units") or {})
+    except (OSError, ValueError):
+        return {}
+
+
 def _seq_copiers(ops, device_to_device: bool):
     """(memcpy, memcpy2d) for one SEQ copy: held only for a device-to-device
     (IPC-staged) copy on an adapter that has the held entry points."""
@@ -3985,6 +4025,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         # witness per unit (it reads the destination, so only after the sync).
         _bat_bytes, _bat_units = seq_sync_batch()
         _groups = _sync_groups(_batch.pieces, _bat_bytes, _bat_units)
+        # FLIP-LEGS: unit -> first unit of its sync group (the group record's
+        # name); the collector's cache of records read from group files
+        _grp_first = {i: g[0] for g in _groups for i in g}
+        _col_recs: dict = {}
+        _n_grp_reads = 0
         _n_sync = 0
         _first_done = False
         for _grp in _groups:
@@ -4017,23 +4062,42 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 ops.synchronize(stream)
                 _n_sync += 1
                 _t_copy += time.perf_counter() - _tc0
+                _grp_rec = seq_group_record_on()
+                if _grp_rec:
+                    # FLIP-LEGS: the group's records, ONE file, before any of
+                    # its units' `full` is posted (the collector reads it after
+                    # the first of them)
+                    _tr0 = time.perf_counter()
+                    _grecs = {}
+                    for (i, window_off, name, tag, nbytes) in _issued:
+                        digest = (hashlib.sha256(
+                            bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
+                            if (_digest_on and not _ipc_base) else "")
+                        _dep_recs[str(i)] = _grecs[str(i)] = {
+                            "name": name, "tag": tag, "digest": digest, "ipc": _ipc_hex,
+                            "nbytes": nbytes}
+                    if _issued:
+                        write_seq_group_record(dpath, _issued[0][0], _grecs)
+                    _t_rec += time.perf_counter() - _tr0
                 for (i, window_off, name, tag, nbytes) in _issued:
                     t0 = _time.perf_counter()
-                    digest = (hashlib.sha256(
-                        bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
+                    digest = str(_dep_recs.get(str(i), {}).get("digest", "")) if _grp_rec else (
+                        hashlib.sha256(
+                            bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
                         if (_digest_on and not _ipc_base) else "")
-                    recs = _dep_recs
-                    recs[str(i)] = {"name": name, "tag": tag, "digest": digest, "ipc": _ipc_hex,
-                                    "nbytes": nbytes}
-                    # weg2xsn90/xsn111: ONE SMALL FILE PER UNIT, atomic
-                    # tmp+rename -- the collector reads it after the `full`.
-                    _tr0 = time.perf_counter()
-                    _upath = f"{dpath}.u{i}"
-                    _tmp = _upath + ".tmp"
-                    with open(_tmp, "w") as fh:
-                        _json.dump(recs[str(i)], fh)
-                    os.replace(_tmp, _upath)
-                    _t_rec += time.perf_counter() - _tr0
+                    if not _grp_rec:
+                        recs = _dep_recs
+                        recs[str(i)] = {"name": name, "tag": tag, "digest": digest, "ipc": _ipc_hex,
+                                        "nbytes": nbytes}
+                        # weg2xsn90/xsn111: ONE SMALL FILE PER UNIT, atomic
+                        # tmp+rename -- the collector reads it after the `full`.
+                        _tr0 = time.perf_counter()
+                        _upath = f"{dpath}.u{i}"
+                        _tmp = _upath + ".tmp"
+                        with open(_tmp, "w") as fh:
+                            _json.dump(recs[str(i)], fh)
+                        os.replace(_tmp, _upath)
+                        _t_rec += time.perf_counter() - _tr0
                     # #1378 xsn53: THE LANE'S OWN TOKEN, one full per unit on
                     # the lane's resolved handshake -- after the sync above.
                     if _is_diagonal:
@@ -4091,7 +4155,23 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 # written (atomically) -- wait for it, never proceed on `{}`.
                 dep = {}
                 _t_rec0 = time.perf_counter()
-                while True:
+                # FLIP-LEGS: the group file first (one read per sync group)
+                if str(i) not in _col_recs and i in _grp_first:
+                    _col_recs.update(read_seq_group_record(dpath, _grp_first[i]))
+                if str(i) in _col_recs:
+                    dep = dict(_col_recs.pop(str(i)))
+                    if (str(dep.get("name", "") or "") != str(name)
+                            and os.path.exists(f"{dpath}.u{i}")):
+                        # a group file left by an EARLIER tag while this
+                        # depositor writes unit files (switch off there): the
+                        # unit file is this unit's record. Without a unit file
+                        # the group record stands and the identity check
+                        # below refuses a real mismatch by name.
+                        dep = {}
+                        _col_recs.clear()
+                    else:
+                        _n_grp_reads += 1
+                while not dep:
                     dep = {}
                     _upath = f"{dpath}.u{i}"
                     if os.path.exists(_upath):
@@ -4235,6 +4315,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             f"wait_ms={_t_wait * 1000:.0f} copy_sync_ms={_t_copy * 1000:.0f} "
             f"record_ms={_t_rec * 1000:.0f} ipc={'yes' if _ipc_base else 'no'} "
             f"issue_gil={'held' if (_ipc_base and getattr(ops, 'held_gil', False) and seq_ipc_hold_gil_on()) else 'released'} "
+            f"records={('group' if seq_group_record_on() else 'unit') if phase == PHASE_DEPOSIT else ('group:%d' % _n_grp_reads)} "
             f"syncs={_n_sync} batch={_bat_units}u/{_bat_bytes >> 20}MiB "
             f"t={_time.time():.3f} t0={_time.time() - (time.perf_counter() - _t_lane0):.3f}"
             + (f" host={_host_mode or 'none'}" if _lazy else ""))
