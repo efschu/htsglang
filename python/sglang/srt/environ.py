@@ -4045,8 +4045,10 @@ class Envs:
     # use (live warm legs > record of this checkpoint x form; unmeasured =
     # no hold, named). The arrival waits in arrival order meanwhile (its seat
     # stays its own under the AGE PLAN), is never rerouted. Name ordered by
-    # the operator (no ENABLE verb); default on: a stability fix.
-    SGLANG_WEG2_ARRIVAL_MIN_DWELL = EnvBool(True)
+    # the operator (no ENABLE verb). DEFAULT OFF since 02.10. (user rule: an
+    # arriving request is prefilled at once, no grace for running decodes; NF:
+    # DP-WAIT hold_s=1.6-1.9 hold_by=d-work+min-dwell). 1 = the hold again.
+    SGLANG_WEG2_ARRIVAL_MIN_DWELL = EnvBool(False)
     # ARRIVAL-SEAT KV reading budget (NF D->P flip, 01.10. bfpgwv): how long
     # the controller tick waits for a FRESH /server_info from D before it
     # decides on the last reading it has. D answers /server_info only at its
