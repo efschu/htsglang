@@ -7708,8 +7708,13 @@ class SchedulerWeightUpdaterManager:
                                              1)))
             scratch = l15_scratch.make_scratch_pool(device_pool, k)
             try:
-                ok, bad, missing = l15_check.sample_check(
-                    plan, host_pool, device_pool, scratch, page_tokens, k=k)
+                from sglang.srt.weg2 import l15_check_snap as _l15_cs
+                _l15_cs.set_wake_context(rank, m, prefix, device_pool)
+                try:
+                    ok, bad, missing = l15_check.sample_check(
+                        plan, host_pool, device_pool, scratch, page_tokens, k=k)
+                finally:
+                    _l15_cs.set_wake_context(None, None, None, None)
             finally:
                 scratch.free()
             logger.info(l15_restore.check_line(rank, ok, bad, missing))
