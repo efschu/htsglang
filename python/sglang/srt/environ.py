@@ -1488,6 +1488,16 @@ class Envs:
     # flag-read skew. The waker's W109 refusal keeps its own grace
     # (SGLANG_WEG2_BAR1_CYCLE_GRACE_S, 3 s).
     SGLANG_WEG2_BAR1_SPILL_GRACE_S = EnvFloat(0.1)
+    # y7z (02.10., A/B 7cwk87): the blocked depositor counts its OWN live
+    # credit wait as a cycle edge from the wait's START, not from its
+    # `blocked` flag (posted only after SLOW_WAIT_S = 0.5 s). The chain is the
+    # same deadlock (D's serial tag deposit waits on a P collector that sits in
+    # its own VRAM credit wait for its first claim, funded only by the pause
+    # behind that deposit); the spill now comes ~0.1 s after the block, not
+    # ~0.6 s. Needed before SGLANG_OPT_WEG2_DRAFT_PARK_SKIP_UNCHANGED goes back
+    # on (with the skip that cycle was the common case: D>P layer 3.5-3.8 s).
+    # Default off until metal A/B: it also moves the spill on the skip-off path.
+    SGLANG_WEG2_BAR1_SPILL_OWN_EDGE = EnvBool(False)
     # Weg-2 load (H39, fnFL2x141-x145): the dense Marlin linears
     # (compressed_tensors_wNa16: GDN/attention/shared-expert 6->8 bit, HC
     # mixer, PLE, lm_head) keep their checkpoint-format tensors and the whole
