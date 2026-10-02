@@ -28,7 +28,9 @@ RankState reader and the W7/W10 gate never see it):
             wait_ms, bubble_ms, last{t, new, gpu_ms, compute_ms}
             (RankPrefillLog.cum -- the ``Prefill rank batch`` numbers, summed)
   decode    §3: rounds, gpu_ms, gpu_ms_by_bs{bs: [rounds, gpu_ms]}, tokens,
-            running, accept_len_ewma, accept_rate_ewma, cuda_graph
+            running, last_bs, last_t (END of the last round, time.time() base
+            like prefill.last.t = round open + gpu-ms), accept_len_ewma,
+            accept_rate_ewma, cuda_graph
             (DecodeRoundLog.cum_* + the logged Decode batch values)
   cache     §3: loadback_n, loadback_tok, mamba_resume_n, mamba_tok,
             store_incomplete_n, prefetch{landed, deferred, refused, expired,
@@ -169,6 +171,9 @@ def _decode_block(mr) -> Optional[Dict[str, Any]]:
         # FEHLT 6 (30.09.): the batch size of the last round (running counts
         # the batch AFTER the round's admissions, not the round's bs)
         "last_bs": (None if getattr(drl, "last_bs", None) is None else int(drl.last_bs)),
+        # FLIPZEIT (02.10.): the end of the last decode round (time.time() base,
+        # like prefill.last.t) -- rigdash's D>P start, no log line needed
+        "last_t": (None if getattr(drl, "last_end_t", None) is None else round(float(drl.last_end_t), 3)),
         "accept_len_ewma": None if ewma is None else round(float(ewma), 3),
         "accept_rate_ewma": None if rate is None else round(float(rate), 3),
         "cuda_graph": getattr(mr, "last_cuda_graph", None),
