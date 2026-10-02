@@ -5626,11 +5626,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ids = _p_trim_full_prompt_ids(req)
             if not keys or not ids:
                 return
-            if _ho.write(rid, ids, keys):
+            # DP-NACHLAUF: one writer (PP0) -- a later stage keeps only the mark
+            _writer = _ho.writes_on_stage(getattr(self, "pp_rank", 0))
+            _t_ho = time.perf_counter()
+            if (not _writer) or _ho.write(rid, ids, keys):
                 n = getattr(self, "_1442_n", 0) + 1
                 self._1442_n = n
                 if n <= 8 or n % 256 == 0:
-                    logger.info("#1442 HANDOFF rid=%s ids=%d page_keys=%d (n=%d)", rid[:12], len(ids), len(keys), n)
+                    logger.info("#1442 HANDOFF rid=%s ids=%d page_keys=%d (n=%d) writer=%s ms=%.1f", rid[:12],
+                                len(ids), len(keys), n, "self" if _writer else "pp0", (time.perf_counter() - _t_ho) * 1000.0)
                 # #243: the hand-off is kept (evicted last) until D takes the
                 # rid -- not only until P's reset / next wake (group P only)
                 from sglang.srt.weg2 import handoff_pending as _hp
