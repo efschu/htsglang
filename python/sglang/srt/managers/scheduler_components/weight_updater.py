@@ -9929,7 +9929,16 @@ class SchedulerWeightUpdaterManager:
                     if _ss.enabled() and os.environ.get("SGLANG_WEG2_GROUP")
                     else _export_static_state(self.tp_worker.model_runner.model)
                 )
+                if _ss.LAST_EXPORT:
+                    # FLIP-LEGS: one line per sleep -- what the stash cost
+                    logger.info("WEG2-STATIC-EXPORT n=%d bytes=%d ms=%.1f mode=%s",
+                                _ss.LAST_EXPORT.get("n", 0), _ss.LAST_EXPORT.get("bytes", 0),
+                                _ss.LAST_EXPORT.get("ms", 0.0), _ss.LAST_EXPORT.get("mode", "?"))
+                    _ss.LAST_EXPORT.clear()
+            # FLIP-LEGS: census_credit split -- the stash, then the TP barrier
+            _weg2_ph("static_export")
             torch.distributed.barrier(self.tp_cpu_group)
+            _weg2_ph("tp_barrier")
             # The PCIe serialisation lock is taken AFTER the barrier and around
             # the D2H leg only: with --enable-weights-cpu-backup this pause
             # copies the whole shard to host (~2.1 s / 27 GiB measured), and a

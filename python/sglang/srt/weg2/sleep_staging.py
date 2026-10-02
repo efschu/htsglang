@@ -115,13 +115,78 @@ def format_freed(freed: Dict[str, int]) -> str:
     return f"{total / _MIB:.1f} MiB ({parts or 'nothing held'})"
 
 
+#: FLIP-LEGS 02.10.: the stash copies each device buffer into PINNED host
+#: memory with non_blocking=True and synchronizes ONCE per device, instead of
+#: one pageable, synchronizing ``.to("cpu")`` per buffer. Same values, same
+#: names, same order; the pinned stash also lets the wake's import copy by
+#: direct DMA. Unset = on; 0/false/no/off = the per-buffer pageable form.
+ENV_STASH_PINNED = "SGLANG_WEG2_STATIC_STASH_PINNED"
+#: the last export's numbers, for the WEG2-STATIC-EXPORT line
+LAST_EXPORT: Dict[str, Any] = {}
+
+
+def stash_pinned_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    return str(e.get(ENV_STASH_PINNED, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def stage_buffers(named, *, to_host, sync_device) -> List[Tuple[str, Any]]:
+    """The pinned/async stash, torch-free so the desk proves its shape:
+    ``to_host(tensor)`` queues one copy (returns the host tensor, or None for
+    a buffer it does not stage -- copied the old way by the caller's
+    fallback), ``sync_device(device)`` is called ONCE per device that had a
+    queued copy, after the last one and before this returns."""
+    out: List[Tuple[str, Any]] = []
+    devices: List[Any] = []
+    for name, buf in named:
+        host, dev = to_host(buf)
+        out.append((name, host))
+        if dev is not None and dev not in devices:
+            devices.append(dev)
+    for dev in devices:
+        sync_device(dev)
+    return out
+
+
 def export_static_state_host(model: Any) -> dict:
     """(b) The static-state stash (model buffers, restored at the wake by
     ``_import_static_state``'s in-place copy) on the HOST while asleep --
-    64 MiB on NF PP0 no pause covered. The import copies host -> device."""
-    return dict(
-        buffers=[(name, buffer.detach().to("cpu", copy=True)) for name, buffer in model.named_buffers()]
-    )
+    64 MiB on NF PP0 no pause covered. The import copies host -> device.
+
+    FLIP-LEGS 02.10.: this export stands between the gathered sleep RPC and
+    the sleeper's first deposit (WEG2-SLEEP-PRELOOP census_credit 41-54 ms p50
+    on every sleeping rank of N4p/N4q, export + TP barrier + census), and the
+    import stands in the waker's tail (static_import 16-79 ms). Pinned +
+    non_blocking + one sync per device (:data:`ENV_STASH_PINNED`)."""
+    import time as _time
+
+    t0 = _time.perf_counter()
+    named = [(name, buffer.detach()) for name, buffer in model.named_buffers()]
+    nbytes = sum(int(b.numel()) * int(b.element_size()) for _, b in named)
+    if not stash_pinned_on():
+        bufs = [(name, b.to("cpu", copy=True)) for name, b in named]
+        mode = "pageable"
+    else:
+        import torch
+
+        def to_host(b):
+            if not b.is_cuda:
+                return b.to("cpu", copy=True), None
+            try:
+                h = torch.empty_like(b, device="cpu", pin_memory=True)
+            except RuntimeError:          # no pinned memory: the old copy, still correct
+                return b.to("cpu", copy=True), None
+            h.copy_(b, non_blocking=True)
+            return h, b.device
+
+        def sync_device(dev):
+            torch.cuda.current_stream(dev).synchronize()
+
+        bufs = stage_buffers(named, to_host=to_host, sync_device=sync_device)
+        mode = "pinned-async"
+    LAST_EXPORT.clear()
+    LAST_EXPORT.update(n=len(bufs), bytes=nbytes, ms=(_time.perf_counter() - t0) * 1000.0, mode=mode)
+    return dict(buffers=bufs)
 
 
 # -- (c) the holder report -------------------------------------------------------------
