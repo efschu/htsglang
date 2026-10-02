@@ -195,3 +195,27 @@ def test_n4p_text_only_samples_still_make_7691_short():
     assert price is None and "dp n=0" in src
     x_star = _x(5.27, 1.0)
     assert 8200 < x_star < 8450 and x_star > UNCACHED_14_69
+
+
+def test_red_the_cost_line_resolve_never_waits_for_the_launcher_import(monkeypatch):
+    """N4p first D->P (09:57:42): kv wake answered 09:57:44.787, FLIP-TIMELINE done 46.310,
+    yet `X COST-LINE RE-SOLVE` / `WEG2-FLIP done` only at 46.986 -- `resolve_x_live`
+    imported sglang.srt.weg2.launcher first and sat on the import lock until the H75
+    prewarm thread finished ("launcher prewarmed off the event loop in 5.8 s", 46.989):
+    677 ms between the flip's end and P's first chunk (VM D>P nachlauf=677). The
+    cost-line solve (default) needs nothing from the launcher."""
+    import builtins
+
+    from sglang.srt.weg2 import front as F
+
+    real_import = builtins.__import__
+
+    def guard(name, *a, **k):
+        if name == "sglang.srt.weg2.launcher":
+            raise AssertionError("the cost-line resolve imported the launcher")
+        return real_import(name, *a, **k)
+
+    ns = types.SimpleNamespace(_resolve_x_cost_line=lambda: 4242)
+    monkeypatch.setattr(builtins, "__import__", guard)
+    with envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True):
+        assert F.Front.resolve_x_live(ns) == 4242
