@@ -63,6 +63,8 @@ class AnthropicSglExt(BaseModel):
 
     weg2_resumable_depth: Optional[NonNegativeInt] = None
     cached_tokens_details: Optional[dict[str, Any]] = None
+    #: SEQ-HASH (02.10.): the sequence mark beside the resumable depth.
+    weg2_seq_hash: Optional[str] = None
 
 
 # ---------- Content blocks (discriminated by ``type``) ----------

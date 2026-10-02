@@ -589,7 +589,8 @@ def test_off_never_reprices_and_the_hooks_sit_behind_the_switch():
     # tspans entry (None when x_exact is off)
     # 7th: _p_flush_store_presence (STORE-PRESENCE 1002), returns before it
     # without tspans (None when x_exact is off)
-    assert src.count("self._x_exact_reprice_queue(") == 7
+    # 8th: _seq_park (SEQ-HASH 1002), returns before it when x_exact is off
+    assert src.count("self._x_exact_reprice_queue(") == 8
 
 
 def test_the_w31_requeue_counts_the_whole_prompt_exactly():

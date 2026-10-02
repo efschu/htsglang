@@ -1663,6 +1663,10 @@ class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
     #: (weg2_resumable_depth.park_depths); empty = nothing named, and the
     #: front keeps its old price.
     weg2_resumable_depth: Dict[str, int] = {}
+    #: SEQ-HASH (02.10.): {rid: "<depth>:<hash>"} of each parked request's whole
+    #: sequence up to its #59b depth -- filled by the tokenizer manager (it holds
+    #: prompt + output ids; the scheduler computes nothing for it).
+    weg2_seq_hash: Dict[str, str] = {}
 
 
 class Weg2ParkWindowReqInput(BaseReq, kw_only=True):

@@ -6474,7 +6474,8 @@ class Scheduler(
         if 0 < _tail <= self.WEG2_TAIL_RECOMPUTE_TOKENS and int(getattr(req, "_1456_n", 0) or 0) >= 1:
             req._1471_short = False
             logger.info("#x38 SETTLE-TAIL rid=%s tail=%d tokens <= %d after %d re-read(s) (%s): "
-                        "released -- the extend computes the tail",
+                        "released -- D-NORECOMPUTE sends it through RESUME-VIA-P (no D compute "
+                        "after a flip)",
                         str(req.rid)[:12], _tail, self.WEG2_TAIL_RECOMPUTE_TOKENS,
                         int(getattr(req, "_1456_n", 0) or 0), reason)
             return "complete"
@@ -6826,6 +6827,21 @@ class Scheduler(
                 release.append((req, state, lapsed))
             else:
                 keep.append(req)
+        # D-NORECOMPUTE (user law 02.10.): a released SHORT read whose tail no
+        # agreed F4/E2 window adopts goes through RESUME-VIA-P, never to D's extend
+        try:
+            from sglang.srt.weg2 import d_norecompute as _dnr
+
+            if _dnr.enabled() and release:
+                _rel2 = []
+                for _r, _s, _l in release:
+                    _rem = _dnr.d_would_compute(_r)
+                    if _rem > 0 and _dnr.divert(self, _r, _rem):
+                        continue
+                    _rel2.append((_r, _s, _l))
+                release = _rel2
+        except Exception as exc:  # noqa: BLE001 -- the release stands, named
+            logger.warning("WEG2 D-NORECOMPUTE n/a (%s: %s) -- released as before", type(exc).__name__, exc)
         self.weg2_post_wake_settle = keep + _cap_wait
         if release:
             try:  # #1461: back under the strict claim law
@@ -19826,31 +19842,42 @@ class Scheduler(
                     self, {}, tp_group_verdict)
                 # kvs2 W3 (boot ...kvdemandbar1dauer09291534): the poll's own
                 # publish work is not the idle lap's age (weg2_idle_vote.own_work).
-                with _weg2_own_work():
-                    for _round in range(64):
-                        _stats = _sweep(max_issue=256) or {}
-                        _issued += int(_stats.get("issued", 0) or 0)
-                        if int(_stats.get("unbacked", 0) or 0) == 0:
-                            break
-                        if _b1_nowait:
-                            if not _weg2_flush_nonblock.quiesce_sweep_blocking(
-                                    self, _stats, tp_group_verdict):
+                # D-NORECOMPUTE (a): a full mamba arena at the flush spills a
+                # foreign intermediate anchor to L3 instead of losing this one
+                _spill_tc = self.tree_cache
+                _spill_prev = getattr(_spill_tc, "_weg2_flush_spill", False)
+                try:
+                    _spill_tc._weg2_flush_spill = True
+                    with _weg2_own_work():
+                        for _round in range(64):
+                            _stats = _sweep(max_issue=256) or {}
+                            _issued += int(_stats.get("issued", 0) or 0)
+                            if int(_stats.get("unbacked", 0) or 0) == 0:
                                 break
-                            _b1_nowait = False  # a node left un-issued: the #1470 loop
-                        # kvs2 W3: a round that issued nothing with nothing in
-                        # flight cannot be followed by one that does -- no pin
-                        # frees, no write lands. Measured: 4 such rounds of
-                        # 1.2 s per poll (issued=0 unbacked_left=37, arena
-                        # full), 4.6-5.0 s ahead of the idle read on every poll.
-                        if (int(_stats.get("issued", 0) or 0) == 0
-                                and int(_stats.get("pending", 0) or 0) == 0):
-                            break
-                        if _wc is not None:
-                            _wc(write_back=True)  # free the pins, then sweep again
-                        if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
-                            break
-                    if _wc is not None and not _b1_nowait:
-                        _wc(write_back=True)
+                            if _b1_nowait:
+                                if not _weg2_flush_nonblock.quiesce_sweep_blocking(
+                                        self, _stats, tp_group_verdict):
+                                    break
+                                _b1_nowait = False  # a node left un-issued: the #1470 loop
+                            # kvs2 W3: a round that issued nothing with nothing in
+                            # flight cannot be followed by one that does -- no pin
+                            # frees, no write lands. Measured: 4 such rounds of
+                            # 1.2 s per poll (issued=0 unbacked_left=37, arena
+                            # full), 4.6-5.0 s ahead of the idle read on every poll.
+                            if (int(_stats.get("issued", 0) or 0) == 0
+                                    and int(_stats.get("pending", 0) or 0) == 0):
+                                break
+                            if _wc is not None:
+                                _wc(write_back=True)  # free the pins, then sweep again
+                            if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
+                                break
+                        if _wc is not None and not _b1_nowait:
+                            _wc(write_back=True)
+                finally:
+                    try:
+                        _spill_tc._weg2_flush_spill = _spill_prev
+                    except Exception:  # noqa: BLE001 -- a stand-in tree
+                        pass
                 logger.info(
                     "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
                     "(un-backed nodes published and their write-throughs joined BEFORE the reset)%s",

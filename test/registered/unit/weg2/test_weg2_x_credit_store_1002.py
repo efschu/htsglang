@@ -166,7 +166,7 @@ def test_wiring():
     assert "self._p_leg1_store_note(p.rid, p.text, pt)" in blk
     assert ('elif src == "P" and s_code == 200:\n'
             '            # STORE-PRESENCE: P\'s flush published its END-ANCHORs (L2/L3, shared)\n'
-            '            self._p_flush_store_presence(anchors_lost(s_body))') in src
+            '            self._p_flush_store_presence(_lost_all)') in src
     j = src.index("await self._x_exact_backfill(rid, request.path, payload, text)")
     assert j < src.index("if pending is not None and pending.skip_leg1:\n            single_prefill = True")
     k = src.index("if c is None:\n            self.counters[\"x_exact_fallback\"] += 1")

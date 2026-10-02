@@ -397,6 +397,11 @@ class TokenSpans:
         #: Only these entries price as ``d_inflight``.
         self.inflight_keys: Dict[str, str] = {}
         self.inflight_rid: Dict[str, str] = {}
+        #: SEQ-HASH (02.10.): prompt key -> (prompt ids, [(depth, hash)]) -- D's
+        #: resumable anchors on the request's WHOLE sequence (prompt + output),
+        #: each with the hash of that sequence up to the depth (finish / park).
+        self.seq_marks: "collections.OrderedDict[str, Tuple[np.ndarray, List[Tuple[int, str]]]]" = \
+            collections.OrderedDict()
         #: STORE-PRESENCE (02.10.): key -> label of an entry recorded as a store anchor
         #: (P's END-ANCHOR published by P's sleep flush); a finish reading replaces it.
         self.store_keys: Dict[str, str] = {}
@@ -513,6 +518,55 @@ class TokenSpans:
             self.entry_seq.pop(old_key, None)
             self.raw_depths.pop(old_key, None)
             self._unflag_inflight(old_key)
+
+    # -- SEQ-HASH (02.10.) ------------------------------------------------------
+    def record_seq(self, ids: Optional[np.ndarray], depth: int, digest: str) -> bool:
+        """D named an anchor at ``depth`` on the sequence that starts with the
+        prompt ``ids`` and continues with D's own output, plus the hash of that
+        sequence up to ``depth`` (managers/weg2_seq_hash.py). Only a depth PAST
+        the prompt adds anything (inside the prompt the token LCP prices it)."""
+        if ids is None or ids.size == 0 or int(depth) <= int(ids.size) or not digest:
+            return False
+        key = self._key(ids)
+        _ids, marks = self.seq_marks.pop(key, (ids, []))
+        marks = [m for m in marks if m[0] != int(depth)] + [(int(depth), str(digest))]
+        marks.sort(key=lambda m: -m[0])
+        self.seq_marks[key] = (ids, marks[:8])
+        while len(self.seq_marks) > self.cap:
+            self.seq_marks.popitem(last=False)
+        return True
+
+    def seq_credit(self, ids: np.ndarray) -> Tuple[int, Optional[int]]:
+        """(credit, prompt length of the matched sequence): the deepest seq mark
+        whose prompt ``ids`` extends and whose hash equals ``ids`` hashed to
+        that depth. (0, None) = none."""
+        from sglang.srt.managers import weg2_seq_hash as _sh
+
+        best, plen = 0, None
+        for pids, marks in self.seq_marks.values():
+            n = int(pids.size)
+            if ids.size <= n or token_lcp(pids, ids) < n:
+                continue  # it does not extend that prompt
+            for depth, digest in marks:
+                if depth <= best or depth > ids.size:
+                    continue
+                if _sh.digest(ids, depth) == digest:
+                    best, plen = depth, n
+                    break
+        return best, plen
+
+    def drop_seq_depths(self, lost) -> int:
+        """ANCHOR-LOST: forget the seq marks at depths a flush dropped."""
+        lost = {int(d) for d in lost or ()}
+        n = 0
+        for key, (pids, marks) in list(self.seq_marks.items()):
+            keep = [m for m in marks if m[0] not in lost]
+            n += len(marks) - len(keep)
+            if keep:
+                self.seq_marks[key] = (pids, keep)
+            else:
+                self.seq_marks.pop(key, None)
+        return n
 
     # -- D-INFLIGHT (X-CREDIT-INFLIGHT-1002) ----------------------------------
     def _unflag_inflight(self, key: str) -> None:
@@ -675,4 +729,9 @@ class TokenSpans:
                        else "d_served_anchor" if served and credit > ct
                        else "d_inflight" if key in self.inflight_keys
                        else self.store_keys.get(key, "d_leg2_cached"))
+        if self.seq_marks:
+            # SEQ-HASH: a prompt that extends a previous turn's GENERATED tokens
+            seq, _plen = self.seq_credit(ids)
+            if seq > best:
+                best, src, known = seq, "d_seq_anchor", True
         return max(0, int(ids.size) - best), best, known, src

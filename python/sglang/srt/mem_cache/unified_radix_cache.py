@@ -4963,7 +4963,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         rid = node.weg2_anchor_rid
         cap = _mad.rid_anchor_cap(configured=self._weg2_rid_anchor_cfg, arena_slots=mp.arena_slots)
         if rid is None or cap == 0:
-            return mp.alloc_write([last_hash])
+            mrows = mp.alloc_write([last_hash])
+            if (mrows is None and getattr(self, "_weg2_flush_spill", False)
+                    and not getattr(node, "_weg2_flush_spilled", False)):
+                # once per node and rank (the H19 FULL rule): a slot frees only
+                # after the LAST rank released it -- later rounds re-claim only
+                node._weg2_flush_spilled = True
+                if self._weg2_flush_spill_room(node, mp):
+                    mrows = mp.alloc_write([last_hash])
+            return mrows
         st = self._weg2_anchor_ledger.of(rid)
         path, depth = _mad.ancestor_path(target=node, root=self.root_node)
         owned = _mad.owned_anchors(path=path, rid=rid, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
@@ -4982,6 +4990,61 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mrows = mp.alloc_write([last_hash])
         self._weg2_note_anchor_claim(node, rid, st, ok=mrows is not None, held=len(owned), depth=depth, cap=cap, mp=mp)
         return mrows
+
+    #: FLUSH-SPILL: anchors spilled to L3 and freed at sleep flushes (per process)
+    _weg2_flush_spill_n = 0
+
+    def _weg2_flush_spill_room(self, node, mp) -> bool:
+        """D-NORECOMPUTE (a), y6z 08:24:41: the sleep flush could not back up
+        the retained span of a parked request -- '#1421 BACKUP-REFUSED
+        why=mamba_claim node=205 depth=45888 rid=None', '#1427 ARENA-CLAIM
+        REFUSED (4 = no free slot)', '#1470 FLUSH-PUBLISH ... unbacked_left=1',
+        'WEG2-ANCHOR-LOST at=flush n=13 depths=[45888..51520]'; the wake read
+        stopped at 45568 and D recomputed 5952 tokens. A rid-less node has no
+        own anchor to give (the H19 FULL path needs a rid), and the arena was
+        full of other requests' settled anchors the tree still referenced.
+
+        At the flush (``_weg2_flush_spill`` set by the #1470 loop; the reset
+        follows): another request's shallowest INTERMEDIATE anchor
+        (``pick_foreign_victim``: never an end anchor, never a request's
+        deepest) is SPILLED to L3 (``arena_secure_to_disk``: an anchor already
+        on disk is not written again), then released and its slot freed -- the
+        read after the wake takes it from disk. A victim whose copy could not
+        be secured is NOT released (no anchor is traded for another). Returns
+        True when a slot was freed."""
+        backend = getattr(mp, "_backend", None)
+        arena = getattr(mp, "arena", None)
+        secure = getattr(backend, "arena_secure_to_disk", None)
+        if arena is None or not callable(secure):
+            return False
+        tree = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
+        tree = [a for a in tree if a.node is not node]
+        victim = _mad.pick_foreign_victim(tree, rid="")
+        if victim is None or not victim.slots:
+            logger.warning("WEG2 MAMBA-ARENA FLUSH-SPILL node=%s depth=%s victim=none (no releasable "
+                           "intermediate anchor in the tree -- the node stays un-backed, named)",
+                           getattr(node, "id", "?"), _mad.ancestor_path(target=node, root=self.root_node)[1])
+            return False
+        slot_bytes = int(getattr(arena, "slot_bytes", 0) or 0)
+        try:
+            sec = secure(arena, [(int(s), 0, 0, slot_bytes) for s in victim.slots], writer="flush_spill")
+        except Exception as exc:  # noqa: BLE001 -- not secured = not released
+            logger.warning("WEG2 MAMBA-ARENA FLUSH-SPILL secure raised %s: %s", type(exc).__name__, exc)
+            return False
+        if int(sec.get("lost", 0) or 0) > 0:
+            logger.warning("WEG2 MAMBA-ARENA FLUSH-SPILL victim=%s depth=%d NOT released: its L3 copy "
+                           "could not be secured (%s)", victim.node.id, victim.depth, sec)
+            return False
+        st = self._weg2_anchor_ledger.of(victim.rid)
+        self._weg2_release_anchor(victim, mp, st, why="flush_spill", for_rid="flush")
+        UnifiedRadixCache._weg2_flush_spill_n += 1
+        logger.info("WEG2 MAMBA-ARENA FLUSH-SPILL n=%d node=%s victim_rid=%s victim_node=%s depth=%d "
+                    "on_disk=%d written=%d (sleep flush: the victim's anchor is on L3, its slot freed "
+                    "for the un-backed node -- no anchor lost, no D recompute after the wake)",
+                    UnifiedRadixCache._weg2_flush_spill_n, getattr(node, "id", "?"), str(victim.rid)[:16],
+                    victim.node.id, victim.depth, int(sec.get("on_disk", 0) or 0),
+                    int(sec.get("written", 0) or 0))
+        return True
 
     def _weg2_anchor_of(self, n, mp):
         """(held, slots): an arena anchor sits on `n`; its slots when this rank
