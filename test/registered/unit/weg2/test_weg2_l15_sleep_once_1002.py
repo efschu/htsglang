@@ -24,7 +24,8 @@ from sglang.srt.weg2 import l15_manifest, l15_sleep_once
 
 def _m(epoch=0):
     span = l15_manifest.HoldSpan(rid="r1", depth=3, slots=(1, 2, 3),
-                                 anchor_slot=4)
+                                 anchor_slot=4, l2_slots=(7, 8, 9),
+                                 l2_gens=(1, 1, 1))
     return l15_manifest.Manifest(epoch=epoch, pid=os.getpid(), spans=(span,),
                                  rows_by_rank=(3,), anchor_slots=1)
 
@@ -86,4 +87,4 @@ def test_scheduler_hook_consults_reuse_before_building_kwargs():
     i_build = src.find("l15_bind.build_retain_kwargs(")
     assert i_reuse != -1, "flush_cache must ask l15_sleep_once.reusable"
     assert i_reuse < i_build, "reuse must be decided before the kwargs build"
-    assert "l15_sleep_once.remember(self, _l15_res)" in src
+    assert "_l15_so.remember(self, _l15_res)" in src

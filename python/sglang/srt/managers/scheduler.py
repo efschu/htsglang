@@ -19925,9 +19925,36 @@ class Scheduler(
                     l15_plan,
                     l15_retain,
                     l15_shadow,
+                    l15_sleep_once,
                 )
 
-                if l15_plan.master_on(os.environ) and (
+                # L15-SLEEP1X: a D sleep is two flushes (the front's
+                # /flush_cache RPC, then the release RPC's flush). If the
+                # first one already retained and armed, and nothing touched
+                # the pools since, REUSE that round: no second bind, move,
+                # reset_keep, allocator re-arm or keep arm -- only stamp the
+                # release's flip epoch into the published manifest.
+                _l15_reuse = (
+                    l15_sleep_once.reusable(self)
+                    if l15_plan.master_on(os.environ)
+                    and getattr(self, "weg2_d_parked", None) is not None
+                    else None
+                )
+                if _l15_reuse is not None:
+                    _l15_flip = getattr(self, "_l15_sleep_flip", None)
+                    _l15_mp = l15_manifest.manifest_path(
+                        "D", int(getattr(getattr(self, "ps", None),
+                                         "tp_rank", 0) or 0), os.environ)
+                    if _l15_flip is not None and int(_l15_flip) >= 0:
+                        try:
+                            l15_sleep_once.restamp(_l15_mp, int(_l15_flip))
+                        except FileNotFoundError:
+                            pass
+                    logger.info(
+                        "L15-RETAIN reuse epoch=%s n=%d (second flush of this "
+                        "sleep, pools untouched since the first round)",
+                        _l15_flip, len(_l15_reuse.hold.rids))
+                elif l15_plan.master_on(os.environ) and (
                     getattr(self, "weg2_d_parked", None) is not None
                 ):
                     _tp = int(
@@ -20131,7 +20158,13 @@ class Scheduler(
                 )
                 _l15_kwargs = None
             _l15_res = None
-            if _l15_kwargs is not None:
+            try:
+                _l15_reuse  # noqa: B018 -- bound when the block above ran
+            except NameError:
+                _l15_reuse = None
+            if _l15_reuse is not None:
+                _l15_res = _l15_reuse
+            elif _l15_kwargs is not None:
                 _l15_res = l15_retain.retain_at_sleep(
                     # L15-FIX-DUPKW: mamba_allocator travels inside
                     # **_l15_kwargs (build_retain_kwargs always emits it);
@@ -20172,6 +20205,20 @@ class Scheduler(
                 # the req rows go, keeping the compacted mamba anchors. The
                 # zeroing would destroy the held pages, so it is skipped.
                 self.req_to_token_pool.clear(keep_mamba_rows=_l15_res.a_h)
+            # L15-SLEEP1X: remember an ARMED round -- with the token of the
+            # pools AFTER the req-row clear, i.e. exactly the state the next
+            # flush of this sleep will see -- so that flush reuses it; any
+            # other outcome must not be reused.
+            try:
+                from sglang.srt.weg2 import l15_sleep_once as _l15_so
+                if _l15_res is not None:
+                    _l15_so.remember(self, _l15_res)
+                else:
+                    _l15_so.forget(self)
+            except Exception:  # noqa: BLE001 -- bookkeeping only
+                pass
+            if _l15_res is not None:
+                pass
             else:
                 self.tree_cache.reset()
                 self.req_to_token_pool.clear()
