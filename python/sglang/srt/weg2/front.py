@@ -8756,6 +8756,10 @@ class Front:
         # ever saw a prefill.
         presence_src = ((getattr(self.spans, "last_src", None) or "d_leg2_cached")
                         if known else "none")
+        # PRICE-BARRIER: an arrival whose chars/3 price is a LONG candidate is
+        # announced to the SHORTs priced beside it -- from HERE, before the
+        # BOOT-START HOLD, so arrivals one hold releases are priced as a group.
+        _pb_fut = Front._pb_register(self, rid, remainder) if self.x_exact else None
         # X-EXACT: the count replaces the chars/3 figures (off: never entered).
         _xx = None
         if self.x_exact:
@@ -8769,6 +8773,7 @@ class Front:
         # is answered 400 HERE -- before any verdict, seat, flip or park.
         _ctx_refusal = self._context_gate(rid, text, _xx, est_prompt)
         if _ctx_refusal is not None:
+            Front._pb_resolve(self, rid, _pb_fut, "none", 0)
             return _ctx_refusal
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
@@ -8895,6 +8900,7 @@ class Front:
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text),
         )
+        Front._pb_resolve(self, rid, _pb_fut, route, remainder)  # PRICE-BARRIER: the verdict, for the SHORTs waiting on it
         if route == "none":
             # TERMINAL AT ADMISSION, and 4xx only when the request provably
             # does not fit this server (`refusal_status`: an EXACT count over
@@ -8939,7 +8945,15 @@ class Front:
         # RC2 review (idle policy b): why a SHORT falls through to BATCH. Only
         # D's own #915 refusal is recorded -- see `d_eligible` below.
         short_refused: List[str] = []
-        if self.awake == "D" and self.admit_d and self.state == "serving" and short_ok:
+        # PRICE-BARRIER: a SHORT D would admit NOW waits for the LONG candidates
+        # being priced beside it; one went LONG -> it rides that LONG's P phase.
+        _pb_to_p = None
+        if (short_ok and self.__dict__.get("_pb_inflight") and self.awake == "D"
+                and self.admit_d and self.state == "serving"
+                and envs.SGLANG_WEG2_PRICE_BARRIER.get() and Front._pb_seat_free(self)):
+            _pb_to_p = await Front._price_barrier(self, rid)
+        if (_pb_to_p is None and self.awake == "D" and self.admit_d and self.state == "serving"
+                and short_ok):
             # UNIFY S7 (27B Review V (3)): D's load at the grant, read BEFORE
             # the seat is taken (the seat itself is not work).
             _x_busy_at_grant = self._d_holds_work()
@@ -8997,8 +9011,17 @@ class Front:
                     and p_phase_arrival(self.awake, self.state, getattr(self, "_flip_dst", None)))
         _sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0
                and not short_refused and presence_src not in ("", "none", None)
-               and not _p_phase)
-        if _p_phase and short_ok:
+               and not _p_phase and _pb_to_p is None)
+        if _pb_to_p is not None:
+            # PRICE-BARRIER: priced beside a LONG that flips D to P -- the SHORT
+            # joins that P phase's batch (leg 1 on P, prefix from the shared
+            # store) instead of a D extend the flip would park at once.
+            self.counters["price_barrier_to_p"] += 1
+            logger.info("WEG2 PRICE-BARRIER rid=%s outcome=to_p sibling=%s sibling_uncached=%d "
+                        "uncached=%d -- a LONG over X was priced beside this SHORT: it joins "
+                        "P's batch with it (no D extend, no park; SGLANG_WEG2_PRICE_BARRIER)",
+                        rid, _pb_to_p[0], int(_pb_to_p[1]), remainder)
+        elif _p_phase and short_ok:
             # L4/R-10: law 1 read literally means every arrival during a P
             # drain is queued BATCH, SHORT ones included.  Counted here,
             # printed by the drain (n=0 printed too), never discovered.
@@ -9038,6 +9061,8 @@ class Front:
                     # up to --drain-deadline-s each. Today's path keeps it here.
                     d_eligible=short_ok and not short_refused,
                     route_long=route == "long")
+        if _pb_to_p is not None:
+            p.d_eligible = False  # PRICE-BARRIER: it rides the LONG's P phase, never handed back to D
         if _sk and self.awake == "D" and self.admit_d and self.state == "serving":
             # SK: D is awake -- the kept SHORT waits in D's own admission line,
             # BEHIND the batch work that held the gate (no overtaking, no flip
@@ -9320,6 +9345,77 @@ class Front:
                     len(moved), total, x_idle, self._x_band_floor(),
                     [p.rid for p in moved][:8], max(0.0, now - min(p.t_arrive for p in moved)))
         return "moved"
+
+    # -- PRICE-BARRIER (02.10., N5x 16:23:41) ---------------------------------------
+    #: an arrival whose chars/3 uncached price is above this share of X is a LONG
+    #: candidate (chars/3 undercounts by up to ~1/3: N5x weg2-0-2 50929 est, 74148 exact)
+    PRICE_BARRIER_CANDIDATE_FRACTION = 0.5
+
+    def _pb_register(self, rid: str, est_uncached: int) -> Optional["asyncio.Future"]:
+        """PRICE-BARRIER: announce a LONG-candidate arrival; resolved at its verdict."""
+        if not envs.SGLANG_WEG2_PRICE_BARRIER.get():
+            return None
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        if x <= 0 or int(est_uncached or 0) <= self.PRICE_BARRIER_CANDIDATE_FRACTION * x:
+            return None
+        fut = asyncio.get_running_loop().create_future()
+        fut._pb_t0 = time.monotonic()  # a pricing that never reached its verdict ages out
+        self.__dict__.setdefault("_pb_inflight", {})[rid] = fut
+        task = asyncio.current_task()
+        if task is not None:
+            # a handler that ends before its verdict (client gone, refusal, error)
+            # resolves "none" -- no SHORT waits for a pricing that will not come
+            task.add_done_callback(lambda _t, r=rid, f=fut: Front._pb_resolve(self, r, f, "none", 0))
+        return fut
+
+    def _pb_seat_free(self) -> bool:
+        """The SHORT would be admitted to D now (a seat is free); unreadable -> no barrier."""
+        try:
+            return self.seats_free() > 0
+        except Exception:  # noqa: BLE001 -- a partial front: the old path
+            return False
+
+    def _pb_resolve(self, rid: str, fut: Optional["asyncio.Future"], route: str, uncached: int) -> None:
+        if fut is None:
+            return
+        self.__dict__.get("_pb_inflight", {}).pop(rid, None)
+        if not fut.done():
+            fut.set_result((str(route), int(uncached or 0)))
+
+    async def _price_barrier(self, rid: str) -> Optional[Tuple[str, int]]:
+        """PRICE-BARRIER: wait for the LONG candidates still being priced (a
+        snapshot, this rid excluded); return ``(sibling rid, uncached)`` of the
+        first that went LONG, or None -- none in flight costs nothing, else at
+        most their pricing time (bounded by the X-EXACT timeout)."""
+        t0 = time.monotonic()
+        bound = envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0 + 0.25
+        reg = self.__dict__.get("_pb_inflight") or {}
+        for r in [r for r, f in reg.items() if t0 - getattr(f, "_pb_t0", t0) > bound]:
+            reg.pop(r, None)  # cancelled or refused before its verdict: never waited for again
+        inflight = {r: f for r, f in reg.items() if r != rid and not f.done()}
+        if not inflight:
+            return None
+        self.counters["price_barrier_waits"] += 1
+        by_fut = {f: r for r, f in inflight.items()}
+        pending = set(by_fut)
+        hit = None
+        while pending and hit is None:
+            left = bound - (time.monotonic() - t0)
+            if left <= 0:
+                break
+            done, pending = await asyncio.wait(pending, timeout=left,
+                                               return_when=asyncio.FIRST_COMPLETED)
+            for f in done:
+                route, unc = f.result()
+                if route == "long" and hit is None:
+                    hit = (by_fut[f], unc)
+        ms = (time.monotonic() - t0) * 1000.0
+        outcome = "to_p" if hit else ("timeout" if pending else "to_d")
+        self.counters[f"price_barrier_{outcome if outcome != 'to_p' else 'long_seen'}"] += 1
+        logger.info("WEG2 PRICE-BARRIER rid=%s waited_ms=%.0f siblings=%d outcome=%s sibling=%s "
+                    "(the SHORT's D admission waited for the LONG candidates priced beside it)",
+                    rid, ms, len(inflight), outcome, hit[0] if hit else "-")
+        return hit
 
     async def _acquire_short_seat(self, rid: str, est_tokens: int = 0,
                                   refused: Optional[List[str]] = None,

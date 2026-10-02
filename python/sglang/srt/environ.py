@@ -1707,6 +1707,17 @@ class Envs:
     # X-EXACT: longest wait for the count before the request is priced by the
     # chars/3 estimate instead (named: WEG2 X-EXACT-FALLBACK reason=timeout).
     SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS = EnvInt(3000)
+    # PRICE-BARRIER (02.10., N5x ..._5ddc067a81_1002_162100 16:23:41: the SHORT
+    # weg2-0-1 was admitted to D 12 ms before its LONG sibling weg2-0-2's verdict --
+    # both released by the same BOOT-START HOLD -- and was parked after its first
+    # extend for the whole P phase, wall 19.1 s; agent load 01./02.10.: ~1 per 1000
+    # arrivals). A SHORT that D would admit now waits for the verdicts of the
+    # arrivals still being priced beside it whose chars/3 estimate is a LONG
+    # candidate (> X/2); one goes LONG -> the SHORT joins P's batch with it (no D
+    # extend, no park); none does -> D as before, having lost at most their count
+    # time (bounded by SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS). Marker 'WEG2
+    # PRICE-BARRIER'. 0 = the SHORT takes its D seat at once, as before.
+    SGLANG_WEG2_PRICE_BARRIER = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
