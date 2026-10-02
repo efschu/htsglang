@@ -4962,7 +4962,9 @@ class Front:
                 return None
             if dc == "P":
                 live = [q for q in self.queue if not q.fut.done()]
-                return min(live, key=lambda q: float(q.t_arrive)) if live else None
+                if not live or not self._dc_p_seat_gate(now):
+                    return None  # SEAT GATE: no free seat on D -> no prefill on P
+                return min(live, key=lambda q: float(q.t_arrive))
         p = phase_policy.immediate_park_trigger(self.queue, int(self.tp_prefill_max_tokens))
         if p is None:
             if envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():  # off: nothing touched
@@ -9819,6 +9821,54 @@ class Front:
                     "epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, self.epoch)
         return route
 
+    def _dc_p_seat_gate(self, now: float) -> bool:
+        """DECODE-COLLECT SEAT GATE (user 02.10. ~20:25Z): may the collected set
+        flip to P now? Only while D has a free seat after the flip back
+        (ARRIVAL-SEAT's own count: running minus parked, hand-offs, ready,
+        grants); the P phase then dispatches at most that many (``_dc_p_cap``,
+        oldest first). False: no seat -- the set keeps waiting."""
+        if not envs.SGLANG_WEG2_DECODE_COLLECT_SEAT_GATE.get():
+            return True
+        taken, n = self._arrival_seat_taken()
+        free = max(0, int(n) - int(taken))
+        st = self._dc_st()
+        if free <= 0:
+            if st.get("seat_hold_wid") != st["wid"]:
+                st["seat_hold_wid"] = st["wid"]
+                self.counters["decode_collect_seat_hold"] += 1
+                logger.info("WEG2 DECODE-COLLECT seat-gate hold taken=%d n=%d epoch=%d -- route P, but D has no "
+                            "free seat: no prefill on P; the set waits for a seat or the wait bound",
+                            taken, n, self.epoch)
+            return False
+        self._dc_p_cap = free
+        if st.get("seat_flip_wid") != st["wid"]:
+            st["seat_flip_wid"] = st["wid"]
+            self.counters["decode_collect_seat_flip"] += 1
+            logger.info("WEG2 DECODE-COLLECT seat-gate flip free=%d taken=%d n=%d epoch=%d -- P prefills at most "
+                        "%d (the free seats), oldest first", free, taken, n, self.epoch, free)
+        return True
+
+    async def _dc_no_seat_step(self, D: "Group", live_q: List["Pending"], bound: float,
+                               now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+        """SEAT GATE, route P without a free D seat: no flip of its own. The
+        ARRIVAL-SEAT room rules decide -- AGE PLAN: the oldest one's
+        displacement plan (the fewest youngest decodes park, then it flips with
+        P capped at one); else (c): past the wait bound the youngest running
+        decode parks and frees a seat for the next tick."""
+        if _asr.age_plan_enabled():
+            x_tok = int(self.tp_prefill_max_tokens)
+            cands = [q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None] or live_q
+            res = await self._arrival_seat_step_age(cands, x_tok, now)
+            if res[0] and res[2] is not None:
+                self._dc_p_cap = 1  # the displacement made room for one
+            return res
+        st = self._asr_st()
+        wait_s = _asr.oldest_wait_s([p.t_arrive for p in live_q] + list(st["waiters"].values()),
+                                    self.t_awake, now)
+        if _asr.bound_fired(wait_s, bound):
+            await self._arrival_seat_park_youngest(D, wait_s, bound, now)
+        return False, not self.admit_d, None
+
     async def _decode_collect_short(self, rid: str, uncached: int) -> Optional[str]:
         """DECODE-COLLECT for a SHORT arrival on the D seat path: ``None`` = no
         window (as before), else the released route ("P": fall through to
@@ -10399,6 +10449,8 @@ class Front:
         if dc == "P":
             if not live_q:
                 return False, not self.admit_d, None  # the released SHORTs are on their way to the queue
+            if not self._dc_p_seat_gate(now):
+                return await self._dc_no_seat_step(D, live_q, bound, now)
             head = min(live_q, key=lambda q: float(getattr(q, "t_arrive", now) or now))
             if st["flip_rid"] != head.rid:
                 st["flip_rid"] = head.rid
@@ -15356,13 +15408,21 @@ class Front:
                 # 29.5 s again -- the 3 s store probe was back on every
                 # second request).  The pool refills the moment ONE leg
                 # finishes, so P always has the next request queued.
+                # DECODE-COLLECT SEAT GATE: the flip that brought P here was armed
+                # for the free D seats -- P prefills at most that many this phase
+                _dc_cap = int(self.__dict__.pop("_dc_p_cap", 0) or 0)
+                _max_dispatch = self.p_phase_max_requests
+                if _dc_cap > 0:
+                    _max_dispatch = min(_max_dispatch, _dc_cap) if _max_dispatch else _dc_cap
+                    logger.info("WEG2 DECODE-COLLECT seat-gate p-cap=%d epoch=%d queued=%d -- this P phase "
+                                "prefills at most the free D seats", _max_dispatch, self.epoch, len(self.queue))
                 passes = await _p_drain_pool(
                     self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
                     lambda: self.state == "serving" and not self._p_intake_stalled,
                     # H91 part C rule 1: at most p_phase_max_requests leave the
                     # queue in this P phase, overlapping only as far as their
                     # est_prompt fits P's unified pool (0 = off, law 1 as before).
-                    max_dispatch=self.p_phase_max_requests,
+                    max_dispatch=_max_dispatch,
                     cost=lambda p: phase_policy.p_request_cost(
                         p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1),
                     budget=self.p_pool_tokens, stats=_phase_stats,
@@ -15370,8 +15430,10 @@ class Front:
                            (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
                     poll_s=_ro.POLL_S,
                     # FLIPCYCLE H5: the phase cap never strands a SHORT
+                    # (the seat gate's cap is hard: a SHORT needs a D seat too)
                     cap_exempt=(self._p_phase_short_rides
-                                if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() else None))
+                                if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0
+                                else None))
                 if _phase_stats.get("short_rides"):
                     self.counters["p_phase_short_rides"] += _phase_stats["short_rides"]
                     logger.info(

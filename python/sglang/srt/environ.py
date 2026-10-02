@@ -1799,6 +1799,14 @@ class Envs:
     # und flippt"), P takes all of it. 0 or >= WINDOW_S = no intermediate
     # check (the window routes the set by its amount).
     SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S = EnvFloat(7.5)
+    # DECODE-COLLECT SEAT GATE (user 02.10. ~20:25Z: no prefill on P while D has
+    # no room for it; filling prefills for free seats stay allowed): the
+    # collect window's route P flips only while D has a free seat after the
+    # flip back, and the P phase then dispatches at most that many requests
+    # (oldest first). No free seat: the set keeps waiting; the ARRIVAL-SEAT
+    # wait bound parks the youngest running decode, which frees one. Marker
+    # 'WEG2 DECODE-COLLECT seat-gate'. 0 = route P flips at once, as before.
+    SGLANG_WEG2_DECODE_COLLECT_SEAT_GATE = EnvBool(True)
     # X-EXACT: tokenizer path override (tests, or a front without a group
     # reachable); empty = the group's own server_args.tokenizer_path.
     SGLANG_WEG2_FRONT_TOKENIZER_PATH = EnvStr("")
