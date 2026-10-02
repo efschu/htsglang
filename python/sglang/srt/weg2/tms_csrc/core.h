@@ -117,6 +117,13 @@ public:
     //: bytes mapped NOW (0 while paused), the bytes the next resume maps, and
     //: ``active`` (1 ACTIVE, 0 PAUSED); -1 otherwise.  Any pointer may be null.
     int alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, uint64_t* planned, int* active);
+    //: L15-10 S3b: export the span extent of allocation base ``ptr`` that
+    //: starts at byte ``offset`` as a POSIX fd (the caller owns and closes
+    //: it); ``size`` gets the extent's bytes.  0 on success; -1 not a base,
+    //: -2 no extent at that offset (stock allocation or unaligned), else the
+    //: CUresult of cuMemExportToShareableHandle (the extent was not created
+    //: exportable: SGLANG_WEG2_VMM_EXPORTABLE unset).
+    int export_extent(void* ptr, uint64_t offset, int* fd, uint64_t* size);
 
     //: C7: the planner's sizing input.  Sum of ``metadata.size`` over the
     //: allocations carrying ``tag`` -- H95c: the PHYSICAL bytes, i.e. per

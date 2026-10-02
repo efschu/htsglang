@@ -644,6 +644,8 @@ CUresult cuMemGetAllocationGranularity(size_t* g, const CUmemAllocationProp*, CU
 CUresult cuDeviceGetAttribute(int* v, CUdevice_attribute, CUdevice) { *v = 0; return CUDA_SUCCESS; }
 CUresult cuGetErrorString(CUresult, const char** s) { *s = "mock"; return CUDA_SUCCESS; }
 CUresult cuGetErrorName(CUresult, const char** s) { *s = "mock"; return CUDA_SUCCESS; }
+// L15-10 S3b: tms_export_extent links this (never called by these tests).
+CUresult cuMemExportToShareableHandle(void*, CUmemGenericAllocationHandle, CUmemAllocationHandleType, unsigned long long) { return CUDA_ERROR_NOT_SUPPORTED; }
 CUresult cuCtxGetDevice(CUdevice* d) { *d = 0; return CUDA_SUCCESS; }
 CUresult cuDeviceGet(CUdevice* d, int) { *d = 0; return CUDA_SUCCESS; }
 CUresult cuDeviceGetUuid(CUuuid* u, CUdevice) { memset(u, 0, sizeof(*u)); return CUDA_SUCCESS; }

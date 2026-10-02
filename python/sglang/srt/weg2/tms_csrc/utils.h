@@ -258,6 +258,19 @@ namespace CUDAUtils {
         if (rc == CUDA_SUCCESS && flag) {
             prop.allocFlags.gpuDirectRDMACapable = 1;
         }
+        // L15-10 S3b: the span extents (resume / set_spans) are what the hot
+        // handover exports to the waking P process, so they honour the same
+        // opt-in as cu_mem_create (#113): SGLANG_WEG2_VMM_EXPORTABLE=1 asks
+        // for the POSIX-fd handle type, with the same no-crash fallback.
+        const char *_exportable = std::getenv("SGLANG_WEG2_VMM_EXPORTABLE");
+        if (_exportable != nullptr && _exportable[0] == '1') {
+            CUmemAllocationProp prop_exp = prop;
+            prop_exp.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+            rc = cuMemCreate(alloc_handle, size, &prop_exp, 0);
+            if (rc == CUDA_SUCCESS) {
+                return rc;
+            }
+        }
         rc = cuMemCreate(alloc_handle, size, &prop, 0);
         if (rc != CUDA_SUCCESS) {
             const char* err_str = nullptr;

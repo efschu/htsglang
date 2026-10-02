@@ -431,6 +431,37 @@ int TorchMemorySaver::set_spans(void* ptr, size_t n, const uint64_t* lo, const u
 // ranges are validated exactly like a set_spans plan (aligned, sorted,
 // disjoint, inside the allocation); n == 0 CLEARS the keep set (= patch-5
 // pause/resume).  No implicit extra retention beyond what the user set.
+int TorchMemorySaver::export_extent(void* ptr, uint64_t offset, int* fd, uint64_t* size) {
+#if defined(USE_ROCM)
+    return -5;
+#elif defined(USE_CUDA)
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    auto it = allocation_metadata_.find(ptr);
+    if (it == allocation_metadata_.end()) {
+        return -1;
+    }
+    AllocationMetadata& md = it->second;
+    for (size_t i = 0; i < md.weg2_extents.size(); ++i) {
+        const Weg2SpanExtent& e = md.weg2_extents[i];
+        if ((uint64_t) e.offset != offset) {
+            continue;
+        }
+        int out = -1;
+        CUresult rc = cuMemExportToShareableHandle(
+            (void*) &out, e.handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
+        if (rc != CUDA_SUCCESS) {
+            return (int) rc;
+        }
+        if (fd != nullptr) *fd = out;
+        if (size != nullptr) *size = (uint64_t) e.size;
+        return 0;
+    }
+    return -2;
+#else
+    #error "USE_PLATFORM is not set"
+#endif
+}
+
 int TorchMemorySaver::set_keep_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* hi) {
 #if defined(USE_ROCM)
     return -5;

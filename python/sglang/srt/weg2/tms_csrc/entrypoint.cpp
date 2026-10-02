@@ -175,6 +175,12 @@ int tms_set_keep_spans(void* ptr, size_t n, const uint64_t* lo, const uint64_t* 
     return TorchMemorySaver::instance().set_keep_spans(ptr, n, lo, hi);
 }
 
+// L15-10 S3b: one span extent of an allocation base as a POSIX fd, for the
+// hot D->P handover (P maps D's held KV pages).  Codes: core.h export_extent.
+int tms_export_extent(void* ptr, uint64_t offset, int* fd, uint64_t* size) {
+    return TorchMemorySaver::instance().export_extent(ptr, offset, fd, size);
+}
+
 int tms_alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, uint64_t* planned, int* active) {
     return TorchMemorySaver::instance().alloc_info(ptr, size, mapped, planned, active);
 }
