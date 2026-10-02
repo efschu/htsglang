@@ -47,6 +47,10 @@ RankState reader and the W7/W10 gate never see it):
   ple       RANK-TIMING: prefill / decode {n, ms_sum, ms_max, last_ms, last_t,
             hit_n, miss_n, wait_ms_sum, bytes}, recent[[t, ms, hit, miss,
             phase]]; absent on a rank that gathered no PLE row
+  vision    RANK-TIMING (02.10.): the transient tower stage -- runs, live
+            {run, leg, since, rids} | null, recent[{run, ok, code, t0, t1,
+            rids, tower_mib, place, card, legs{leg: [t0, t1, ms]}}]; absent
+            on a rank that ran no stage
   errors    n, last[8]{t, logger, level, exc, text}  (ERROR/CRITICAL records)
   last_post_wake  the latest WEG2-POST-WAKE-PASS census as a dict, or null
   stops     n, last[8]{t, reason, code, exc, ticket, text}: the scheduler's
@@ -266,6 +270,7 @@ def scheduler_counters(scheduler) -> Dict[str, Any]:
         "cap": {"kv_tokens": getattr(scheduler, "max_total_num_tokens", None),
                 "seats": getattr(scheduler, "max_running_requests", None)},
         **_ple_entry(),
+        **_vision_entry(),
     }
 
 
@@ -273,6 +278,13 @@ def _ple_entry() -> Dict[str, Any]:
     """RANK-TIMING: ``ple`` only on a rank that gathered PLE rows."""
     b = rank_timing.ple_block()
     return {} if b is None else {"ple": b}
+
+
+def _vision_entry() -> Dict[str, Any]:
+    """RANK-TIMING: ``vision`` (tower stage laden/rechnen/entladen) only on a
+    rank that ran a transient vision stage (P's PP0)."""
+    b = rank_timing.vision_block()
+    return {} if b is None else {"vision": b}
 
 
 def _park_window_left_ms(scheduler, now: Optional[float] = None):
