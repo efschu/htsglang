@@ -1432,9 +1432,15 @@ def lane_streams(ops, device: int, ring: int):
 def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
                   budget_s, device, log, base, slot_bytes, ring, batches, tp) -> str:
     with lane_streams(ops, device, ring) as streams:
-        return _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase,
-                                      no_write, liveness, budget_s, device, log, base,
-                                      slot_bytes, ring, batches, tp, streams)
+        try:
+            return _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase,
+                                          no_write, liveness, budget_s, device, log, base,
+                                          slot_bytes, ring, batches, tp, streams)
+        finally:
+            # FLIPCYCLE H4: the top lane's streams go now -- no peer may sync them
+            _g = getattr(lanes, "_engine_gate", None)
+            if _g is not None and role == "src":
+                _g.retire(lane_key)
 
 
 def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_write,
@@ -1455,6 +1461,16 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         cmode, copier, cwhy = COPY_SERIAL, None, ""
     cblocks = sm_blocks() if copier is not None else 0
     slow = 0          # this tag's bytes that could not take the 16-B SM path
+    # FLIPCYCLE H4: fast-receiver-first on this card's one D2H engine
+    _gate = None
+    _gate_ms = 0.0
+    if role == "src":
+        try:
+            from sglang.srt.weg2 import lane_priority as _lp
+
+            _gate = _lp.gate_for(lanes)
+        except Exception:  # noqa: BLE001 - the gate never fails a transfer
+            _gate = None
     t0 = time.perf_counter()
     span = span_open(lane_key, t0)
     clk = LaneClock()
@@ -1625,6 +1641,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
                                 f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
                     clk.credit += time.perf_counter() - tw
+                if _gate is not None:
+                    _gate_ms += _gate.before_issue(lane_key, ops)
                 ti = time.perf_counter()
                 for piece in batch.pieces:
                     desc = descs[piece.desc_index]
@@ -1650,6 +1668,8 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
                         ops.memcpy2d_async(dst, int(piece.run_bytes), src, int(piece.spitch),
                                            int(piece.run_bytes), int(piece.rows), stream)
                 clk.issue += time.perf_counter() - ti
+                if _gate is not None:
+                    _gate.issued(lane_key, stream)
                 if g >= lag:
                     _finish(g - lag)
                 continue
@@ -1755,6 +1775,10 @@ def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_wri
         f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via} "
         f"{clk.fields()} {mode_f} overlap_ms={overlap_s * 1000:.0f} "
         f"lag={lag} prep_ms={prep_s * 1000:.0f}")
+    if _gate is not None and _gate_ms > 0:
+        log(f"WEG2-FLIPCYCLE stage=legs_engine lane={lane_key} seq={seq} top={_gate.top} "
+            f"ms={_gate_ms:.0f} floor_ms=0 (H4: this slower-receiver lane yielded the D2H "
+            f"engine to the lane into the widest receiver)")
     return ""
 
 

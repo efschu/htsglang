@@ -918,6 +918,13 @@ class Envs:
     # (land_deferred_rows before that layer's MoE), not for all of them before
     # the forward starts. Off = the whole forward waits (y6z: 0.3-1.0 s on PP0).
     SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER = EnvBool(True)
+    # FLIPCYCLE H4 (02.10., weg2/lane_priority.py): on a depositor with two or
+    # more cross lanes into receivers of different PCIe bandwidth, the lane into
+    # the widest receiver goes first on the card's one D2H engine, so the lane
+    # into the narrow (x4) receiver -- the leg's critical path -- is not
+    # time-multiplexed down to 4.3 GB/s (y6z P-PP0 p0 lane_ms 1198 for 5.22 GB).
+    # Off = the engine's own time-multiplexing.
+    SGLANG_WEG2_ENABLE_LANE_FAST_FIRST = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.
