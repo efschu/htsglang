@@ -78,3 +78,22 @@ def test_vorlauf_never_reaches_past_the_previous_flip_probe_artifact():
     assert probe_back["dir"] == "P>D" and probe_back["vorlauf_ms"] is None
     assert probe_back["total_ms"] is not None and round(probe_back["total_ms"]) == 2997   # flip_begin -> first decode
     assert probe_back["start_src"].startswith("flip_begin")
+
+
+def test_pd_first_decode_comes_from_the_front_event_not_the_rank_raster():
+    """N4p 10:00:28: front first decode 0,45 s after flip_done; the 2-s rank raster put "dec" 1,88 s
+    after it, behind a D-direct extend of a new arrival (1,43 s "d_extend")."""
+    ev = [{"type": "flip_begin", "ts": 100.0, "data": {"flip_begin_ts": 100.0, "sleep": "P", "wake": "D"}},
+          {"type": "flip_done", "ts": 102.66, "data": {"flip_begin_ts": 100.0, "t": 102.66, "flip_ms": 2660, "epoch": 10, "sleep": "P", "wake": "D"}}]
+    segs = [{"s": 90.0, "e": 99.9, "k": "P"}, {"s": 100.0, "e": 102.66, "k": "flip_pd"},
+            {"s": 102.66, "e": 104.1, "k": "D"}, {"s": 104.54, "e": 130.0, "k": "dec"}]
+    ipc = {"ipc_events": ev,
+           "flip_first_work": [{"dir": "P>D", "flip_begin_ts": 100.0, "first_work_ts": 103.11, "what": "decode_token",
+                                "flip_time_ms": 3110, "p_end_ts": 99.95, "p_end_source": "p_leg1_end"}]}
+    pd = ipcboot.flip_views(segs, ipc, 140.0)[0]
+    assert pd["first_src"] == "front flip_first_work" and pd["p_end_src"] == "front p_leg1_end"
+    assert round(pd["nachlauf_ms"]) == 450 and round(pd["total_ms"]) == 3160
+    assert round(pd["nachlauf_d_extend_ms"]) == 450                 # only the extend before the real first token
+    # without the front event the segments stay the fallback
+    pd2 = ipcboot.flip_views(segs, {"ipc_events": ev}, 140.0)[0]
+    assert "first_src" not in pd2 and round(pd2["nachlauf_ms"]) == 1880

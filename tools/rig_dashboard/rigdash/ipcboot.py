@@ -583,6 +583,25 @@ def flip_views(segs: List[dict], ipc: dict, now: float) -> List[dict]:
             p_lo = b - FLIP_IDLE_S if prev_done is None else max(b - FLIP_IDLE_S, float(prev_done))
             p_end = _seg_last_end(segs, ("P", "single"), b + 0.3, p_lo)
             first = _seg_first(segs, ("dec",), t_done - 0.3, horizon)
+            # P>D first decode token from the FRONT's flip_first_work (decode_token, its own clock, ms)
+            # instead of the rank segments (decode.tokens deltas, ~2 s raster: a D-direct extend of a
+            # new arrival at the start of the interval pushed "dec" out -- N4p 10:00:28 front 0,45 s vs
+            # segments 1,88 s nachlauf with 1,43 s "d_extend"). Checked on 27B 1002 (N4f 0837/1103,
+            # N4p, N4q; 36 P>D flips): never before flip_done, never earlier than the real first token
+            # (the early-fire class of NF y6d is closed by the front's leg-2 rule); two misses (first
+            # P>D of N4p/N4q, content before done of a leg 2 dispatched before begin) -- then the
+            # segments stay the fallback. P's end likewise from the front (p_end_ts = P's last leg 1).
+            fwd = f if (f.get("what") == "decode_token" and f.get("first_work_ts") is not None) else {}
+            # a front event well before flip_done (D not awake yet: the NF y6d early-fire class) is not
+            # trusted -- same 0,3 s tolerance as the segment search
+            if fwd and t_done - 0.3 <= float(fwd["first_work_ts"]) <= horizon + 0.5:
+                first = float(fwd["first_work_ts"])
+                row["first_src"] = "front flip_first_work"
+                fpe = fwd.get("p_end_ts")
+                if fwd.get("p_end_source") == "p_leg1_end" and fpe is not None and (
+                        prev_done is None or float(fpe) >= float(prev_done)):
+                    p_end = float(fpe)
+                    row["p_end_src"] = "front p_leg1_end"
             if p_end is not None:
                 row["vorlauf_ms"] = max(0.0, (b - p_end) * 1000.0)
             if first is not None:
