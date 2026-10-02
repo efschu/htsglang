@@ -144,7 +144,7 @@ def _granule_of(base):
 
 
 def arm_keep_spans(adapter, keep_by_base, manifest_path, *, rank, log=print,
-                   granule=None):
+                   granule=None, split_lookup=None):
     """Arm one adapter call per allocation base; degrade on failure.
 
     keep_by_base: the hook's {base_key: (base_buffer, [(lo, hi), ...])}
@@ -161,6 +161,15 @@ def arm_keep_spans(adapter, keep_by_base, manifest_path, *, rank, log=print,
         try:
             _g = int(granule) if granule is not None else _granule_of(_base)
             _aligned = align_keep_ranges(_ranges, _g, _base_limit(_base, _g))
+            if split_lookup is not None:
+                # L15-FIX-KEEP-SPLIT: the pause keeps only WHOLE extents of a
+                # span-mapped allocation; a stock base or a range outside the
+                # split hold region cannot be kept -> refuse (clean fallback)
+                _whole = split_lookup(_base, _aligned)
+                if _whole is None:
+                    rc_repr = "not-split-or-outside-hold"
+                    break
+                _aligned = _whole
             raw_b += sum(max(0, int(h) - int(l)) for l, h in _ranges)
             kept_b += sum(h - l for l, h in _aligned)
             n_rng += len(_aligned)

@@ -20083,7 +20083,11 @@ class Scheduler(
                             _reqs,
                             getattr(self.req_to_token_pool, "req_to_token", None),
                             caps_rows_by_rank=_caps,
-                            cap_anchor_slots=len(_reqs),
+                            cap_anchor_slots=min(
+                                len(_reqs),
+                                __import__("sglang.srt.weg2.l15_keep_split",
+                                           fromlist=["anchor_cap"]
+                                           ).anchor_cap(os.environ)),
                             prefix=_prefix,
                             rank=_l15_rank,
                             # L15-FIX-EPOCH: the front's flip index, not
@@ -20189,12 +20193,17 @@ class Scheduler(
                     # rank votes None at the wake while its peers vote a
                     # fingerprint -> mixed verdict -> group fallback
                     # (the existing rule; no wake-side code here).
+                    from sglang.srt.weg2 import l15_keep_split as _l15_ks
                     if not l15_keep_arm.arm_keep_spans(
                         _ad,
                         _keep_by_base,
                         _l15_kwargs["manifest_path"],
                         rank=_l15_rank,
                         log=logger.warning,
+                        # L15-FIX-KEEP-SPLIT: keep only WHOLE hold extents of
+                        # a split base; a stock base refuses (clean fallback)
+                        split_lookup=lambda _b, _r: _l15_ks.keep_extents(
+                            int(_b.data_ptr()), _r),
                     ):
                         _l15_res = None
             self._weg2_note_lost_anchors()
@@ -20237,6 +20246,12 @@ class Scheduler(
                         logger.info("L15-KEEP-CLEAR at=sleep rank=%d bases=%d",
                                     int(getattr(getattr(self, "ps", None),
                                                 "tp_rank", 0) or 0), int(_n))
+                        # L15-FIX-KEEP-SPLIT (N3t): the pause keeps only span
+                        # extents; split the hold bases NOW, while the pools
+                        # are reset and their content does not matter.
+                        from sglang.srt.weg2 import l15_keep_split as _l15_ks
+                        _l15_ks.ensure_split_for_sched(self, os.environ,
+                                                       logger.info)
                 except Exception as exc:  # noqa: BLE001 -- cleanup only
                     logger.warning("L15-KEEP-CLEAR at=sleep failed (%s: %s)",
                                    type(exc).__name__, exc)
