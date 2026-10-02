@@ -111,6 +111,7 @@ from sglang.srt.weg2 import (
     checkpoint_census,
     corridor_budget,
     host_ledger,
+    card_identity,
     ring_table,
     seam_digest,
     weight_exchange,
@@ -5423,6 +5424,15 @@ class Card:
     #: it -- that the awake budget omits this term is a SEPARATE open finding
     #: (weg2/refute/lens2.md sec 3), deliberately not changed here.
     reserved_mib: int = 0
+    #: HW-GENERIC 1002: the NVML properties identity and order are decided on
+    #: (weg2/card_identity.py). ``None`` = NVML did not report it; a card
+    #: without ``cc`` never passes ``resolve_cards`` (arch gate, HW-ARCH).
+    cc: Optional[Tuple[int, int]] = None
+    bar1_total_mib: Optional[int] = None
+    pcie_max_gen: Optional[int] = None
+    pcie_max_width: Optional[int] = None
+    mem_bus_width_bits: Optional[int] = None
+    mem_clock_max_mhz: Optional[int] = None
 
 
 @dataclass
@@ -5538,10 +5548,25 @@ def resolve_cards() -> List[Card]:
     carve-out term, which this launcher now needs, so the copy is gone rather
     than grown.
     """
-    return [
-        Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib)
+    cards = [
+        Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib,
+             cc=getattr(d, "compute_capability", None),
+             bar1_total_mib=(None if getattr(d, "bar1_total_bytes", None) is None
+                             else int(d.bar1_total_bytes) // (1 << 20)),
+             pcie_max_gen=getattr(d, "pcie_max_gen", None),
+             pcie_max_width=getattr(d, "pcie_max_width", None),
+             mem_bus_width_bits=getattr(d, "mem_bus_width_bits", None),
+             mem_clock_max_mhz=getattr(d, "mem_clock_max_mhz", None))
         for d in nvml_registry.list_devices()
     ]
+    # HW-GENERIC 1002: THE arch gate, once, at the one card-list producer --
+    # every boot path (main, p_stage_power_current, xchg_census) reads its
+    # cards here. sm_86 / sm_120 only; anything else refused BY NAME.
+    try:
+        card_identity.arch_gate(cards)
+    except card_identity.CardInventoryRefused as exc:
+        raise Weg2LaunchRefused(str(exc)) from exc
+    return cards
 
 
 def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
@@ -5567,16 +5592,26 @@ def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
         log(_pl.boot_line({"launcher_card": i}, p, why or "card not in the NVML power snapshot"))
 
 
-def order_cards(cards: List[Card]) -> List[Card]:
-    """CUDA ordinal order: the 5090 first (rank 0 / PP0 / TP0), then the 3080s
-    by NVML index.  Never a fixed index: resolved by name per launch."""
-    big = [c for c in cards if "5090" in c.name]
-    small = sorted([c for c in cards if "3080" in c.name], key=lambda c: c.nvml_index)
-    if len(big) != 1 or len(small) != 2:
-        raise Weg2LaunchRefused(
-            f"NVML inventory is not 1x5090 + 2x3080: {[(c.nvml_index, c.name) for c in cards]}"
-        )
-    return [big[0], small[0], small[1]]
+#: HW-GENERIC 1002 Stage 1: the release topology is P = PP3 / D = TP3 (argv
+#: below, Form A from the profile), so a launch needs exactly this many cards.
+#: Stage 2 derives it from the inventory (HW-GENERISCH-SM86-SM120-1002.md).
+WEG2_CARD_COUNT = 3
+
+
+def order_cards(cards: List[Card], expect_count: Optional[int] = WEG2_CARD_COUNT) -> List[Card]:
+    """CUDA ordinal order (rank 0 / PP0 / TP0 first), from NVML PROPERTIES
+    (weg2/card_identity.py): biggest NVML total first, then nameplate DRAM
+    bandwidth, then NVML index. On the reference rig that is the 5090 first,
+    then the 3080s by NVML index -- the order the name-based predecessor
+    produced, byte for byte. Never a fixed index, never a name substring.
+
+    Refuses BY NAME (HW-COUNT) an inventory of another size than
+    ``expect_count`` (the topology is fixed at PP3/TP3 in Stage 1). The arch
+    gate (HW-ARCH) runs once in :func:`resolve_cards`."""
+    try:
+        return card_identity.order_cards(cards, expect_count, gate=False)
+    except card_identity.CardInventoryRefused as exc:
+        raise Weg2LaunchRefused(str(exc)) from exc
 
 
 def log_power_limits(state: BootState, cards: List[Card], log, *,
