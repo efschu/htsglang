@@ -9601,22 +9601,40 @@ class Front:
         awake time and the override let the flip through after the 2 s fairness
         floor (27B N5d: overridden_by=fairness after 6.6 s awake, need 12.6 s).
         True = hold: D keeps decoding, the arrival keeps its place. Off with
-        SGLANG_WEG2_X_BAND_FOLLOWS_PRICE=0 (or no flip log: a test double)."""
+        SGLANG_WEG2_X_BAND_FOLLOWS_PRICE=0 (or no flip log: a test double).
+
+        IDLE D NEVER HOLDS (user law 02.10.: Flipzeit = last token of the
+        outgoing phase -> first token of the incoming one; 27B D>P Vorlauf
+        1.6-2.2 s = min-dwell holding an idle D): the dwell exists only so D's
+        running decodes progress. With no decode running on D (the front's own
+        flip ledger of D minus the requests this step parked) a hold is pure
+        Vorlauf -- the flip goes at once (``K7-DWELL skip ... d_running=0``)."""
         if not hasattr(self, "flip_log") or not Front._x_excursion_band_off(self):
             return False
         need, prov = Front._derived_min_dwell_ms(self, "D", "P")
         awake_ms = (float(now) - float(self.t_awake)) * 1000.0
         if awake_ms >= need:
             return False
-        self._park_dwell_held_t = time.time()  # DP-WAIT (#1416i): hold_by=min-dwell
         st = self._asr_st()
+        D = (getattr(self, "groups", None) or {}).get("D")
+        d_running = 0 if D is None else sum(
+            1 for r in self._flip_ledger(D) if r not in st.get("parked", ()))
+        if d_running == 0:
+            if st.get("k7_dwell_skip_told") != (p.rid, self.epoch):
+                st["k7_dwell_skip_told"] = (p.rid, self.epoch)
+                self.counters["arrival_seat_k7_dwell_skip_idle"] += 1
+                logger.info("%s K7-DWELL skip rid=%s d_running=0 awake_ms=%d min_dwell_ms=%d epoch=%d "
+                            "(idle D: the dwell would be pure Vorlauf)", _asr.MARKER, p.rid,
+                            int(awake_ms), int(need), self.epoch)
+            return False
+        self._park_dwell_held_t = time.time()  # DP-WAIT (#1416i): hold_by=min-dwell
         if st.get("k7_dwell_told") != (p.rid, self.epoch):
             st["k7_dwell_told"] = (p.rid, self.epoch)
             self.counters["arrival_seat_k7_dwell_hold"] += 1
-            logger.info("%s K7-DWELL hold rid=%s awake_ms=%d min_dwell_ms=%d provenance=%s epoch=%d -- "
-                        "PDFLIP-B: the flip to P waits for the derived min-dwell before the park; D keeps "
-                        "decoding, the arrival keeps its place and seat", _asr.MARKER, p.rid,
-                        int(awake_ms), int(need), prov, self.epoch)
+            logger.info("%s K7-DWELL hold rid=%s d_running=%d awake_ms=%d min_dwell_ms=%d provenance=%s "
+                        "epoch=%d -- PDFLIP-B: the flip to P waits for the derived min-dwell before the "
+                        "park; D keeps decoding, the arrival keeps its place and seat", _asr.MARKER, p.rid,
+                        d_running, int(awake_ms), int(need), prov, self.epoch)
         return True
 
     def _asr_min_dwell_held(self, p: "Pending", D: "Group", now: float) -> bool:
