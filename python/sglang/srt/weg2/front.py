@@ -7331,6 +7331,11 @@ class Front:
             # H91c: D holds the parked request while P runs; it is released
             # on D the same way (D's /abort_request, TP broadcast).
             getattr(self, "_d_parked", {}).pop(rid, None)
+            # N3t 07:02:47Z W3: leave the D ledger too -- else the flip
+            # ledger (outstanding minus parked) counts it as RUNNING on an
+            # idle D and the drain witness stops the boot (handle_abort pops
+            # both as well).
+            self.groups["D"].outstanding.pop(rid, None)
             try:
                 code, _b = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
                 action = f"abort-d-park status={code}"
