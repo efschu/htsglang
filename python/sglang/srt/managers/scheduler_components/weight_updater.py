@@ -11000,11 +11000,17 @@ class SchedulerWeightUpdaterManager:
             _weg2_ph("pre_leg")
             # F22 WAKE-READ-EARLY: the #248 hold reads start beside the legs
             # (host-only aux-thread reads); off = issued at DORMANT-RELEASE.
+            _pl3_spread = False
+            _pl3_async_ms = 0.0
+            _pl3_async_n = 0
             if self.scheduler is not None:
                 try:
                     from sglang.srt.weg2 import park_l3 as _pl3_early
 
-                    _pl3_early.issue_reads_at_wake_begin(self.scheduler)
+                    # PDFLIP-S: spread over the tag loop below (beside the collects)
+                    _pl3_spread = _pl3_early.early_enabled() and _pl3_early.spread_enabled()
+                    if not _pl3_spread:
+                        _pl3_early.issue_reads_at_wake_begin(self.scheduler)
                 except Exception as _early_exc:  # noqa: BLE001 -- the release issues what is left
                     logger.warning("#248 WAKE-READ-EARLY n/a (%s: %s) -- the release issues it",
                                    type(_early_exc).__name__, _early_exc)
@@ -11415,6 +11421,31 @@ class SchedulerWeightUpdaterManager:
                     # returns None -- never a fabricated 0 -- when the running
                     # hook has no such symbol or the record names another tag.
                     weg2_map_stats[tag] = self.memory_saver_adapter.resume_stats(tag)
+                    if _pl3_spread:
+                        # PDFLIP-S: ONE deferred hold read per tag, after this tag's collect
+                        # went to the worker -- same hold order on every rank, the only
+                        # collective (the read's vote) on this thread inside the loop.
+                        _t_rd = time.perf_counter()
+                        try:
+                            _pl3_async_n += len(_pl3_early.issue_reads_at_wake_begin(self.scheduler, max_n=1))
+                        except Exception as _sp_exc:  # noqa: BLE001 -- the release issues what is left
+                            logger.warning("#248 WAKE-READ-EARLY-SPREAD n/a (%s: %s) -- the release issues it",
+                                           type(_sp_exc).__name__, _sp_exc)
+                            _pl3_spread = False
+                        _pl3_async_ms += (time.perf_counter() - _t_rd) * 1000.0
+            if _pl3_spread:
+                _t_rd = time.perf_counter()
+                try:
+                    _pl3_async_n += len(_pl3_early.issue_reads_at_wake_begin(self.scheduler))
+                except Exception as _sp_exc:  # noqa: BLE001
+                    logger.warning("#248 WAKE-READ-EARLY-SPREAD tail n/a (%s: %s) -- the release issues it",
+                                   type(_sp_exc).__name__, _sp_exc)
+                _pl3_async_ms += (time.perf_counter() - _t_rd) * 1000.0
+                if _pl3_async_n:
+                    logger.info("#248 WAKE-READ-EARLY-SPREAD issued=%d tags=%d read_early_async_ms=%.0f "
+                                "(one hold read per weight tag after its collect went to the worker, the "
+                                "rest after the last tag -- beside the collects; read_early at the legs' "
+                                "start is ~0 now)", _pl3_async_n, len(weights_tags), _pl3_async_ms)
             if _wake_worker is not None:
                 _t_join = time.perf_counter()
                 _errs = []

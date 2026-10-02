@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +230,7 @@ def _in_flight_pages(sched, reqs) -> int:
     return total
 
 
-def issue_deferred_reads(sched, hold) -> list:
+def issue_deferred_reads(sched, hold, max_n: Optional[int] = None) -> list:
     """``#1443 DORMANT-RELEASE``: issue the store read of every held request
     whose intake only looked it up, in hold order. Every rank runs this at
     the same point of the resume with the same hold (the intake order is
@@ -252,6 +253,10 @@ def issue_deferred_reads(sched, hold) -> list:
     input is replicated (request lengths, hold order, the shared arena's
     geometry), so every rank decides alike."""
     reqs = [r for r in list(hold or ()) if deferred(r)]
+    if max_n is not None:
+        # PDFLIP-S: at most max_n (hold order) per call -- one per weight tag beside the collects;
+        # the rest stay deferred for the next call (RELEASE-INTEG: on the #248f arena gate's list)
+        reqs = reqs[:max(0, int(max_n))]
     if not reqs:
         return []
     cap = arena_capacity(sched) if arena_gate_on() else None
@@ -369,10 +374,28 @@ def note_hold_order(hold) -> None:
 
 
 def early_enabled() -> bool:
+    """F22 WAKE-READ-EARLY -- never under L1.5 (PDFLIP-P, 02.10.).
+
+    N4f 1002_110321 (L15 on, early read on by default since d1e5da09dc):
+    11:11:19 ``#248 WAKE-READ-EARLY issued=3`` for D's parked rids, 11:11:21
+    ``HiCache prefetch success req=weg2-10-16 loaded=203826`` -- then the kv
+    wake's L15 path (``L15-REFILL anchors-missing: votes no hold``, ``L15-RESTORE
+    no hold kept``) RESET the tree (``#1427 ARENA-REF RESET-RELEASE
+    released=203827``, ``HOST-POOL CLEAR``) and the read was gone: ``X-GATE
+    rid=weg2-10-16 uncached=206952 verdict=W31``, W50-REROUTE of 2 parked rids
+    to P, a D->P flip 4 s after the P->D -- the ping-pong. The release-time
+    read (issued after that reset) survives it. Until the L15 wake keeps a
+    completed hold read (or skips the L15-held rids rank-uniformly, l15-lead),
+    the master switch turns the early read off on every rank alike (the env
+    is the group's). Reads only L15's switch, no L15 code changes."""
     try:
         from sglang.srt.environ import envs
 
-        return bool(envs.SGLANG_WEG2_ENABLE_WAKE_READ_EARLY.get())
+        if not bool(envs.SGLANG_WEG2_ENABLE_WAKE_READ_EARLY.get()):
+            return False
+        from sglang.srt.weg2 import l15_plan
+
+        return not l15_plan.master_on(os.environ)
     except Exception:  # noqa: BLE001
         return False
 
@@ -381,7 +404,17 @@ def issued(req) -> bool:
     return bool(getattr(req, ISSUED_ATTR, False))
 
 
-def issue_reads_at_wake_begin(sched) -> list:
+def spread_enabled() -> bool:
+    """PDFLIP-S: the early reads one per weight tag, beside the collects."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_WAKE_READ_EARLY_SPREAD.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def issue_reads_at_wake_begin(sched, max_n: Optional[int] = None) -> list:
     """F22 (29.09.): the deferred hold reads at the START of the weight legs.
 
     MEASURED (marker audit x178 / z30w-park / z30x2-kvdemand): the #248 read
@@ -400,8 +433,8 @@ def issue_reads_at_wake_begin(sched) -> list:
     if not hold:
         return []
     note_hold_order(hold)
-    out = issue_deferred_reads(sched, hold)
-    if out:
+    out = issue_deferred_reads(sched, hold, max_n=max_n)
+    if out and max_n is None and not spread_enabled():
         logger.info("#248 WAKE-READ-EARLY issued=%d at the weight legs' start (F22: the read runs "
                     "beside the legs, the settle finds it complete)", len(out))
     return out
