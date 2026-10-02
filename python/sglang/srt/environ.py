@@ -947,6 +947,9 @@ class Envs:
     SGLANG_WEG2_MAMBA_SNAPSHOT_FENCE = EnvBool(True)
     # the sleeping group(s) that take it (comma list; default the D->P leg).
     SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS = EnvStr("D")
+    # FLIPCYCLE H1 (02.10., weg2/front.drain): a flip whose ledger is already
+    # empty (D->P after the park) skips the drain's blocking progress read.
+    SGLANG_WEG2_ENABLE_DRAIN_EMPTY_SKIP = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.
