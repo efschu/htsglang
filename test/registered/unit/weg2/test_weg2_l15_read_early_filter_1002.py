@@ -78,7 +78,7 @@ def test_wake_begin_skips_the_agreed_rids(monkeypatch):
     reqs = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b"), SimpleNamespace(rid="c")]
     sched = SimpleNamespace(weg2_dormant_hold=reqs)
     seen = []
-    monkeypatch.setattr(park_l3, "early_enabled", lambda: True)
+    monkeypatch.setattr(park_l3, "early_enabled", lambda *a: True)
     monkeypatch.setattr(park_l3, "enabled", lambda: True)
     monkeypatch.setattr(park_l3, "_group_d", lambda: True)
     monkeypatch.setattr(park_l3, "l15_agreed_held_rids", lambda s: {"a", "c"})
@@ -94,7 +94,7 @@ def test_wake_begin_asks_the_group_once_per_wake_under_the_spread(monkeypatch):
     reqs = [SimpleNamespace(rid="a"), SimpleNamespace(rid="b"), SimpleNamespace(rid="c")]
     sched = SimpleNamespace(weg2_dormant_hold=reqs, _weg2_wake_seq=4, weg2_dormant=True)
     asks = []
-    monkeypatch.setattr(park_l3, "early_enabled", lambda: True)
+    monkeypatch.setattr(park_l3, "early_enabled", lambda *a: True)
     monkeypatch.setattr(park_l3, "enabled", lambda: True)
     monkeypatch.setattr(park_l3, "_group_d", lambda: True)
     monkeypatch.setattr(park_l3, "note_hold_order", lambda hold: None)

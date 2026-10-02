@@ -11056,7 +11056,8 @@ class SchedulerWeightUpdaterManager:
                     from sglang.srt.weg2 import park_l3 as _pl3_early
 
                     # PDFLIP-S: spread over the tag loop below (beside the collects)
-                    _pl3_spread = _pl3_early.early_enabled() and _pl3_early.spread_enabled()
+                    _pl3_spread = (_pl3_early.early_enabled(self.scheduler)
+                                   and _pl3_early.spread_enabled())
                     if not _pl3_spread:
                         _pl3_early.issue_reads_at_wake_begin(self.scheduler)
                 except Exception as _early_exc:  # noqa: BLE001 -- the release issues what is left

@@ -373,8 +373,8 @@ def note_hold_order(hold) -> None:
         logger.warning("#248e hold order not noted", exc_info=True)
 
 
-def early_enabled() -> bool:
-    """F22 WAKE-READ-EARLY -- never under L1.5 (PDFLIP-P, 02.10.).
+def early_enabled(sched=None) -> bool:
+    """F22 WAKE-READ-EARLY -- under L1.5 only when no D rank retained a hold.
 
     N4f 1002_110321 (L15 on, early read on by default since d1e5da09dc):
     11:11:19 ``#248 WAKE-READ-EARLY issued=3`` for D's parked rids, 11:11:21
@@ -386,8 +386,19 @@ def early_enabled() -> bool:
     to P, a D->P flip 4 s after the P->D -- the ping-pong. The release-time
     read (issued after that reset) survives it. Until the L15 wake keeps a
     completed hold read (or skips the L15-held rids rank-uniformly, l15-lead),
-    the master switch turns the early read off on every rank alike (the env
-    is the group's). Reads only L15's switch, no L15 code changes."""
+    the master switch turned the early read off on every rank alike.
+
+    L15-ON-READ-EARLY (02.10.): the N4f loss came from a DIVERGED sleep (the
+    cap-0 rank kept chains its peers flushed) and from a retained hold the
+    wake then dropped. Since L15-SLEEP-AGREE (17e65cff75) the hold is decided
+    by the whole D group at the sleep: either every rank retained or none did
+    (``_l15_tree_retained`` is rank-uniform). A wake after a plain sleep has
+    no tree to drop (L15-FIX-NOHOLD-TREE touches only a retaining rank), so
+    the early read survives it -- the read runs again under L1.5 exactly then.
+    A retained hold (the wake may still keep nothing and reset) keeps the old
+    shape: no early read, the release-time read takes over. Without a
+    scheduler, or with SLEEP-AGREE off (``SGLANG_WEG2_L15_SLEEP_AGREE=0``),
+    L1.5 keeps the read off as before."""
     try:
         from sglang.srt.environ import envs
 
@@ -395,7 +406,13 @@ def early_enabled() -> bool:
             return False
         from sglang.srt.weg2 import l15_plan
 
-        return not l15_plan.master_on(os.environ)
+        if not l15_plan.master_on(os.environ):
+            return True
+        from sglang.srt.weg2 import l15_sleep_agree
+
+        if sched is None or not l15_sleep_agree.env_on(os.environ):
+            return False
+        return not bool(getattr(sched, "_l15_tree_retained", False))
     except Exception:  # noqa: BLE001
         return False
 
@@ -485,7 +502,7 @@ def issue_reads_at_wake_begin(sched, max_n: Optional[int] = None) -> list:
     hold order, at the same point of the same RPC on every rank); the release
     then finds nothing deferred and its settle verdict sees complete reads.
     Off (:func:`early_enabled`) = nothing here, the release issues as before."""
-    if not early_enabled() or not enabled() or not _group_d():
+    if not early_enabled(sched) or not enabled() or not _group_d():
         return []
     hold = getattr(sched, "weg2_dormant_hold", None) or []
     if not hold:

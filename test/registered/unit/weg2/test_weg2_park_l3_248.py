@@ -551,15 +551,40 @@ def test_red_pdflip_early_read_is_off_under_l15(env):
     reads = []
     tree = _Tree()
     s = _wake_sched(tree, reads)
+    s._l15_tree_retained = True  # L15-ON-READ-EARLY: the group retained a hold
     a = _req(PARKED)
     park_l3.defer_hold_read(s, a)
     s.weg2_dormant_hold = [a]
     assert park_l3.early_enabled() is False
+    assert park_l3.early_enabled(s) is False
     assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == []
     Scheduler._weg2_release_dormant_hold(s)
     assert reads == [PARKED]
     env.mp.setenv("SGLANG_WEG2_L15", "0")
     assert park_l3.early_enabled() is True
+
+
+def test_l15_on_read_early_after_a_plain_sleep(env):
+    """L15-ON-READ-EARLY: since L15-SLEEP-AGREE (17e65cff75) the hold is decided
+    by the whole D group -- every rank retained or none. After a plain sleep
+    (``_l15_tree_retained`` False everywhere) the wake has no tree to drop, so
+    the early read survives it and runs again under L1.5. SLEEP-AGREE off, or
+    no scheduler to ask, keeps the read at the release. RED on a9dcae8df7."""
+    env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    env.mp.setenv("SGLANG_WEG2_L15", "1")
+    env.mp.delenv("SGLANG_WEG2_L15_SLEEP_AGREE", raising=False)
+    reads = []
+    tree = _Tree()
+    s = _wake_sched(tree, reads)
+    s._l15_tree_retained = False
+    a = _req(PARKED)
+    park_l3.defer_hold_read(s, a)
+    s.weg2_dormant_hold = [a]
+    assert park_l3.early_enabled() is False, "no scheduler -> the old shape"
+    assert park_l3.early_enabled(s) is True
+    assert park_l3.issue_reads_at_wake_begin(s) == [a] and reads == [PARKED]
+    env.mp.setenv("SGLANG_WEG2_L15_SLEEP_AGREE", "0")
+    assert park_l3.early_enabled(s) is False
 
 
 def test_red_pdflip_spread_issues_one_read_per_tag_in_hold_order(env):
