@@ -9648,6 +9648,16 @@ class SchedulerWeightUpdaterManager:
         
         if replay is not None:
             return replay
+        # L15-14d: a sleeping P releases every open deposit session first (its
+        # imports of D's hold pin D's VRAM otherwise); a no-op without one
+        try:
+            from sglang.srt.weg2 import l15_deposit_hook as _l15_dh
+            if _l15_dh.active():
+                logger.info("L15-DEPOSIT-CLOSE-ALL at=sleep n=%d",
+                            _l15_dh.close_all("P sleep"))
+        except Exception as exc:  # noqa: BLE001 -- the sleep proceeds
+            logger.warning("L15-DEPOSIT-CLOSE-ALL failed (%s: %s)",
+                           type(exc).__name__, exc)
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}

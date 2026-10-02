@@ -2703,6 +2703,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
         # #243: the rid ended on D -- its hand-off is no longer waited for
         _weg2_handoff_consumed(getattr(req, "rid", None), "end")
+        # L15-14d: the deposit's last tokens + END anchor, BEFORE the finish
+        # path can free or dedupe the request's rows (no-op without a session;
+        # an aborted request deposits nothing more -- its record says why)
+        from sglang.srt.weg2 import l15_deposit_hook as _l15_dep
+        if _l15_dep.active():
+            if type(getattr(req, "finished_reason", None)).__name__ == "FINISH_ABORT":
+                _l15_dep.abort(getattr(req, "rid", ""), "aborted")
+            else:
+                _l15_dep.on_chunk(req, final=True)
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
         # P-HOST-OVERLAP: a chunk publish still deferred goes out before the
@@ -3093,6 +3102,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._weg2_defer_chunk_publish(req, radix_key)
         else:
             self._weg2_publish_at_chunk(req, radix_key)   # xsn346: the chunk's node goes out now
+        # L15-14d: a P request with a deposit session writes the tokens
+        # computed so far into D's held deposit rows (no-op without a session)
+        from sglang.srt.weg2 import l15_deposit_hook as _l15_dep
+        if _l15_dep.active():
+            _l15_dep.on_chunk(req, final=False, filled=len(req.fill_ids))
 
     def _weg2_defer_chunk_publish(self, req, radix_key) -> None:
         pend = getattr(self, "_weg2_deferred_chunk_publish", None)

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 
@@ -111,18 +112,27 @@ def _ratios(shares) -> list:
     return [prefix[i + 1] - prefix[i] for i in range(len(prefix) - 1)]
 
 
-def admit_for_sched(sched, req, env, log) -> Optional[str]:
-    """P-stage entry at admission: the geometry from the live stage, then
-    :func:`admit`. Returns None when nothing was to do or the prefix was
-    adopted, else the named reason (logged by the caller)."""
-    from sglang.srt.weg2 import l15_share_publish
-    from sglang.srt.weg2.l15_hold_share import HoldMapper, L15ShareError
+@dataclass
+class StageGeom:
+    """The live P stage as the hold-share copies need it (D's published
+    layer set decides the stage's linear range)."""
 
-    directory = l15_share_publish.share_dir(env)
-    rid = str(getattr(req, "rid", ""))
-    hint = hot_hint(directory, rid)
-    if hint is None:
-        return None
+    p_buffers: Dict[int, tuple]
+    p_temporal: object
+    p_conv: object
+    spec: object
+    stage_linear: Tuple[int, int]
+    n_d: int
+    dev: int
+    kv_alloc: object
+    mamba_alloc: object
+    req_to_token_pool: object
+    tree_cache: object
+
+
+def stage_geometry(sched, d0: dict):
+    """StageGeom of this P stage against D rank 0's descriptor ``d0``, or the
+    named reason (str) when the stage cannot take/deposit."""
     mr = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
     wrapper = getattr(mr, "token_to_kv_pool", None)
     amap = getattr(wrapper, "full_attention_layer_id_mapping", None)
@@ -138,19 +148,9 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
         return "stage has no single-conv mamba cache"
     stage_gids = sorted(int(g) for g in mmap)
     order = [int(mmap[g]) for g in stage_gids]
-    p_temporal = mc.temporal[order] if order != sorted(order) else mc.temporal
-    p_conv = mc.conv[0][order] if order != sorted(order) else mc.conv[0]
-    if order != sorted(order):
-        return "stage mamba layers are not stored in layer order"
-    try:
-        d0, f0 = l15_share_publish.fetch_share(directory, 0)
-    except L15ShareError as exc:
-        return "share: %s" % exc
-    for f in f0:
-        try:
-            os.close(f)
-        except OSError:
-            pass
+    if order != list(range(len(order))):
+        # put/take index the cache by stage-local layer 0..n-1
+        return "stage mamba layers are not stored as 0..n-1 in layer order"
     n_d = len(d0["prefix"]) - 1
     all_gids = sorted({int(b["layer"]) for b in d0["bases"]
                        if b.get("role") == "mamba_temporal"})
@@ -169,6 +169,40 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
     except Exception as exc:  # noqa: BLE001 -- named refusal
         return "spec: %s" % exc
     dev = int(getattr(full.k_buffer[0], "device", None).index or 0)
+    return StageGeom(p_buffers=p_buffers, p_temporal=mc.temporal,
+                     p_conv=mc.conv[0], spec=spec,
+                     stage_linear=(pos[0], pos[0] + len(pos)), n_d=n_d, dev=dev,
+                     kv_alloc=getattr(sched, "token_to_kv_pool_allocator", None),
+                     mamba_alloc=getattr(rtp, "mamba_allocator", None),
+                     req_to_token_pool=rtp,
+                     tree_cache=getattr(sched, "tree_cache", None))
+
+
+def admit_for_sched(sched, req, env, log) -> Optional[str]:
+    """P-stage entry at admission: the geometry from the live stage, then
+    :func:`admit`. Returns None when nothing was to do or the prefix was
+    adopted, else the named reason (logged by the caller)."""
+    from sglang.srt.weg2 import l15_share_publish
+    from sglang.srt.weg2.l15_hold_share import HoldMapper, L15ShareError
+
+    directory = l15_share_publish.share_dir(env)
+    rid = str(getattr(req, "rid", ""))
+    hint = hot_hint(directory, rid)
+    if hint is None:
+        return None
+    try:
+        d0, f0 = l15_share_publish.fetch_share(directory, 0)
+    except L15ShareError as exc:
+        return "share: %s" % exc
+    for f in f0:
+        try:
+            os.close(f)
+        except OSError:
+            pass
+    g = stage_geometry(sched, d0)
+    if isinstance(g, str):
+        return g
+    dev = g.dev
     # L15-HOLDMAP: every fd received and every extent mapped by this take is
     # released once the copies are done -- a lingering import pins D's hold
     # VRAM after D frees it (one hold-extent set per hot admission)
@@ -179,12 +213,9 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
             hint=hint,
             fetch=lambda r: mapper.fetch(
                 lambda q: l15_share_publish.fetch_share(directory, q), r),
-            n_d_ranks=n_d,
-            kv_alloc=getattr(sched, "token_to_kv_pool_allocator", None),
-            mamba_alloc=getattr(rtp, "mamba_allocator", None),
-            tree_cache=getattr(sched, "tree_cache", None),
-            stage_att_layers=sorted(p_buffers), p_buffers=p_buffers, spec=spec,
-            stage_linear=(pos[0], pos[0] + len(pos)), p_temporal=p_temporal,
-            p_conv=p_conv, map_extent=mapper, log=log)
+            n_d_ranks=g.n_d, kv_alloc=g.kv_alloc, mamba_alloc=g.mamba_alloc,
+            tree_cache=g.tree_cache, stage_att_layers=sorted(g.p_buffers),
+            p_buffers=g.p_buffers, spec=g.spec, stage_linear=g.stage_linear,
+            p_temporal=g.p_temporal, p_conv=g.p_conv, map_extent=mapper, log=log)
     finally:
         mapper.close()

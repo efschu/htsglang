@@ -7878,6 +7878,21 @@ class Scheduler(
             except Exception as exc:  # noqa: BLE001 -- the store read serves
                 logger.warning("HOT-HANDOVER rid=%s failed (%s: %s) -- store read",
                                req.rid, type(exc).__name__, exc)
+        # L15-14d: a P request the front gave a deposit slot range opens its
+        # deposit session (opt-in; any refusal named, today's path serves)
+        if (not is_retracted
+                and os.environ.get("SGLANG_WEG2_L15_DEPOSIT", "0") == "1"
+                and __import__("sglang.srt.managers.weg2_memory_saver",
+                               fromlist=["weg2_group_name"]
+                               ).weg2_group_name() == "P"):
+            try:
+                from sglang.srt.weg2 import l15_deposit_hook as _l15_dh
+                _why = _l15_dh.open_for_sched(self, req, os.environ, logger.info)
+                if _why is not None:
+                    logger.info("L15-DEPOSIT-OFF rid=%s reason=%s", req.rid, _why)
+            except Exception as exc:  # noqa: BLE001 -- today's path serves
+                logger.warning("L15-DEPOSIT-OFF rid=%s failed (%s: %s)",
+                               req.rid, type(exc).__name__, exc)
         # kv-session-offload: FCFS arrival order. Assigned once (a retracted
         # re-queue keeps its original arrival position). The admission order
         # is identical on every TP rank, so the counter is rank-uniform.
