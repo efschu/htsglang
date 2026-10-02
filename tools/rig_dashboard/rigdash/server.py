@@ -364,6 +364,10 @@ def lean_boot(b: dict) -> dict:
                      for g, v in (b.get("decode") or {}).items()}
     ipc = b.get("ipc") or {}
     out["ipc"] = {k: ipc.get(k) for k in ("lifecycle", "terminal", "model", "tag", "boot_id", "cause") if k in ipc}
+    # Nutzer 02.10.: "Letzte Boots" shows the Flipzeit p50/p90/max per direction (and "fehlt (Feld X)")
+    out["flip_last"] = {d: {k: (x or {}).get(k) for k in ("n", "median", "p90", "max")}
+                        | {"newest": {k: ((x or {}).get("newest") or {}).get(k) for k in ("kind", "missing")}}
+                        for d, x in (b.get("flip_last") or {}).items()}
     out["lean"] = True
     return out
 

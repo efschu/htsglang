@@ -283,8 +283,8 @@
       "uid": "vm"
      },
      "refId": "A",
-     "expr": "max by (model, dir) (weg2_flip_user_view_ms{part=\"total\",model=~\"$model\"}) / 1000",
-     "legendFormat": "{{dir}} {{model}}"
+     "expr": "max by (model, dir) (weg2_flip_user_view_ms{def=\"t2t\",part=\"total\",model=~\"$model\"}) / 1000",
+     "legendFormat": "Flipzeit {{dir}} {{model}}"
     },
     {
      "datasource": {
@@ -292,8 +292,8 @@
       "uid": "vm"
      },
      "refId": "B",
-     "expr": "max by (model, dir) (weg2_flip_user_view_ms{part=\"layer\",model=~\"$model\"}) / 1000",
-     "legendFormat": "Layer-Tausch {{dir}} {{model}}"
+     "expr": "max by (model, dir) (weg2_flip_user_view_ms{def=\"t2t\",part=\"layer\",model=~\"$model\"}) / 1000",
+     "legendFormat": "Teil Layer-Tausch (in Flipzeit enthalten) {{dir}} {{model}}"
     }
    ]
   },

@@ -100,14 +100,18 @@
       ? `Device ${fmtN(t.tiers.device)} · L2 ${fmtN(t.tiers.host)} · L3 ${fmtN(t.tiers.storage)} · ohne Stufe ${fmtN(t.tiers.unassigned)}`
       : "Stufen Device/L2/L3: –";
     const hitPct = t.cache_hit == null ? null : 100 * t.cache_hit;
-    const flipAge = t.flip_last_t ? Math.max(0, d.now - t.flip_last_t) : null;
     $("vl-tiles").innerHTML = [
       tile("Decode je Stream p50", big(fmtN(t.out_p50), "tok/s"), `Median ${over} (${d.step}-s-Eimer) · ${seatTxt}`, s.decode),
       tile("Decode je Stream p90", big(fmtN(t.out_p90), "tok/s"), `90. Perzentil ${over} · Sitze = Batchgröße der Decode-Runden, nur über die Decode-Zeit gemittelt`, s.seats || s.decode),
       tile("Prefix-Cache-Treffer", gauge(hitPct == null ? null : hitPct / 100, hitPct == null ? "–" : fmtN(hitPct, 1) + " %", C.s1),
         `aus Cache / (Cache + neu gerechnet); Übergabe P→D nie Cache (${t.handoff_share == null ? "–" : fmtN(100 * t.handoff_share, 1) + " %"} der Input-Tokens) · ${tierTxt}`, s.cache),
-      tile("Flipzeit P→D", big(t.flip_last_ms == null ? "–" : fmtN(t.flip_last_ms / 1000, 2), "s"),
-        `zuletzt${flipAge != null ? " vor " + fmtN(flipAge / 60, 0) + " min" : ""} · Median ${t.flip_median_ms == null ? "–" : fmtN(t.flip_median_ms / 1000, 2) + " s"} (n=${t.flip_n || 0}) · P-Ende → erstes Decode-Token`, s.flip),
+      ...["P>D", "D>P"].map((dir) => {
+        const f = (t.flip || {})[dir] || {}, sx = (v) => v == null ? "–" : fmtN(v / 1000, 2);
+        const age = f.last_t ? Math.max(0, d.now - f.last_t) : null;
+        return tile("Flipzeit " + dir.replace(">", "→"), big(sx(f.last_ms), "s"),
+          `zuletzt${age != null ? " vor " + fmtN(age / 60, 0) + " min" : ""} · p50 ${sx(f.p50_ms)} · p90 ${sx(f.p90_ms)} · max ${sx(f.max_ms)} s (n=${f.n || 0}) · `
+          + (dir === "P>D" ? "P-Chunk-Ende → erstes Decode-Token" : "Decode-Ende → erster Forward der letzten P-Stufe"), s.flip);
+      }),
     ].join("");
     $("hw-tiles").innerHTML = [
       tile("Leistungsaufnahme", big(t.power_sum_w == null ? "–" : fmtN(t.power_sum_w, 0), "W"),
@@ -355,7 +359,7 @@
       scales: { y: { range: zeroUp(1000) } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s")],
       series: [{}, line("P→D", C.s1, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s1 }, noDot: true }),
-        line("D→P (Decode-Ende → P-Prefill, flip_user_time)", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
+        line("D→P (Decode-Ende → erster Forward der letzten P-Stufe)", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
     }, rowsFlips(d));
     // Karten: Leistungsaufnahme als Summe (kräftig, Fläche), die Einzelkarten dünn darunter
     charts.power = mk("hw-c-power", {
@@ -427,15 +431,13 @@
     }
     return [d.t, c1, c2, c3, h.map((v) => (v == null ? null : v))];
   }
-  // Flipzeit nach Nutzerdefinition, nie flip_total: P→D = flip_first_work (P-Ende → erstes Decode-Token),
-  // D→P = flip_user_time (Decode-Ende → P-Prefill-Start, ab Build y4z); ohne flip_user_time keine D→P-Punkte
+  // Flipzeit (Nutzer 02.10.) = letztes Token der abgebenden Phase -> erstes Token der annehmenden, beide
+  // Richtungen aus den Marken flip_t2t (ipcboot.flip_views); ältere Marken (flip_user, flip_pd_user, Front-Werte)
+  // waren andere Definitionen und werden nicht gezeichnet
   function rowsFlips(d) {
-    // P→D in Nutzersicht (flip_pd_user, Rang-Segmente) wo vorhanden; ältere Flips aus flip_first_work
-    const hasUser = (d.marks || []).some((m) => m.kind === "flip_pd_user" && m.v != null);
-    const isPd = (m) => hasUser ? m.kind === "flip_pd_user" : (m.kind === "flip" && m.label === "P>D");
-    const fl = (d.marks || []).filter((m) => m.v != null && (isPd(m) || m.kind === "flip_user"))
-      .sort((a, b) => a.t - b.t);
-    return [fl.map((m) => m.t), fl.map((m) => (isPd(m) ? m.v : null)), fl.map((m) => (m.kind === "flip_user" ? m.v : null))];
+    const fl = (d.marks || []).filter((m) => m.kind === "flip_t2t" && m.v != null).sort((a, b) => a.t - b.t);
+    const isPd = (m) => (m.label || "").startsWith("P>D");
+    return [fl.map((m) => m.t), fl.map((m) => (isPd(m) ? m.v : null)), fl.map((m) => (isPd(m) ? null : m.v))];
   }
   const sigOf = (d) => [d.model, d.range, d.zoom ? "z" : "", (d.cards || []).map((c) => cardLabel(c)).join("|")].join("/");
 

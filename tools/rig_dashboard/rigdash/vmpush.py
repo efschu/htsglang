@@ -7,7 +7,7 @@ Bis die Front und die Ränge ihre Marker selbst nach VictoriaMetrics schreiben (
 
   state.json front       weg2_front_*  (served, served_tokens, arrival_seat.ttft_* , Warteschlange ...)
   rankstate/*.rankstats  weg2_rank_*   (kumulative Zähler und Pegel je Rang)
-  events.jsonl           weg2_flip_time_ms / weg2_flip_user_ms als Punkte mit dem Zeitstempel des Flips
+  events.jsonl + Ring    weg2_flip_user_view_ms{def="t2t",dir,part} je Flip zum flip_begin (ipcboot.flip_views)
 
 Kein Log wird geöffnet.  Labels: ``model`` (27B|NF), ``boot`` (Kurzform der Boot-ID, ein Wert je Boot),
 ``group``/``rank``/``dir``/``kind`` -- nie eine rid (Nutzer: keine Labels mit hoher Kardinalität).
@@ -117,26 +117,16 @@ def lines_for_boot(ipc: dict, rankstats: Dict[str, dict], model: str, now_ms: in
 
 
 def flip_points(ipc: dict, model: str, since_ts: float) -> Tuple[List[str], float]:
-    """One point per flip newer than ``since_ts`` at the flip's own time (events.jsonl, front clock):
-    weg2_flip_time_ms{dir} = flip_first_work.flip_time_ms (P>D Flipzeit, what="none" gives none),
-    weg2_flip_user_ms{dir="D>P"} = flip_user_time.flip_user_ms (D>P Flipzeit nach Nutzerdefinition)."""
-    base = {"model": model, "boot": short_boot(ipc.get("boot_id") or ipc.get("dir"))}
-    out, newest = [], since_ts
-    for d in ipc.get("flip_first_work") or []:
-        t = d.get("flip_begin_ts") or d.get("t")
-        v = d.get("flip_time_ms")
-        if t is None or t <= since_ts or d.get("dir") not in ("P>D", "D>P"):
-            continue
-        newest = max(newest, float(t))
-        if v is not None and d.get("what") != "none":
-            out.append("weg2_flip_time_ms%s %s %d" % (_lbl(dict(base, dir=d["dir"])), repr(float(v)), int(float(t) * 1000)))
-    for u in ipc.get("flip_user_time") or []:
-        t, v = u.get("start_ts"), u.get("flip_user_ms")
-        if t is None or v is None or t <= since_ts:
-            continue
-        newest = max(newest, float(t))
-        out.append("weg2_flip_user_ms%s %s %d" % (_lbl(dict(base, dir="D>P")), repr(float(v)), int(float(t) * 1000)))
-    return out, newest
+    """Nutzer 02.10.: the front's own small numbers (flip_first_work.flip_time_ms, flip_user_time.flip_user_ms =
+    up to the leg-1 DISPATCH) are no Flipzeit and are no longer pushed -- weg2_flip_time_ms / weg2_flip_user_ms
+    stay empty from this build on.  The Flipzeit is weg2_flip_user_view_ms{def="t2t"} (flip_view_points).
+    Returns no lines; ``newest`` still advances so the caller's bookkeeping stays as it was."""
+    newest = since_ts
+    for d in list(ipc.get("flip_first_work") or []) + list(ipc.get("flip_user_time") or []):
+        t = d.get("flip_begin_ts") or d.get("start_ts") or d.get("t")
+        if t is not None and t > since_ts:
+            newest = max(newest, float(t))
+    return [], newest
 
 
 def push(lines: Iterable[str], url: str = DEFAULT_URL, timeout: float = 4.0) -> int:
@@ -184,7 +174,7 @@ class Bridge:
                 if m is not None and m.ring:
                     segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc),
                                                   detail=False)["segs"]
-                    lines += flip_view_points(ipcboot.flip_views(segs, ipc, now), model, short_boot(key), self.view_done)
+                    lines += flip_view_points(ipcboot.flip_views(segs, ipc, now, m.ring), model, short_boot(key), self.view_done)
                 if m is not None and m.dec:
                     lines += self._decode_sum_lines(key, m.dec, model, now - 3 * ipcboot.SAMPLE_S, now)
             except Exception as e:  # noqa: BLE001 -- one boot's view never stops the push
@@ -351,9 +341,17 @@ def ttft_series(client: VmClient, model: str, ts: List[int], step: int) -> dict:
             "src": "VictoriaMetrics weg2_front_ttft_* (state.json front.arrival_seat, LEG2-FIRST-CONTENT)"}
 
 
+#: VM parts of one flip: total and its complete partition (Summe = total), d_extend only as "davon" of nachlauf
+VIEW_PARTS = (("total", "total_ms"), ("vorlauf", "vorlauf_ms"), ("layer", "layer_ms"), ("wake_kv_dc", "wake_kv_dc_ms"),
+              ("nachlauf", "nachlauf_ms"), ("rest", "rest_ms"), ("d_extend", "nachlauf_d_extend_ms"))
+
+
 def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -> List[str]:
-    """Flipzeit in Nutzersicht (ipcboot.flip_views) als Punkte zum flip_begin: weg2_flip_user_view_ms{dir,part}
-    mit part = total|vorlauf|layer|nachlauf|d_extend; nur gemessene Flips (kind ok), jeder einmal."""
+    """Flipzeit (ipcboot.flip_views, Nutzer 02.10.: letztes Token -> erstes Token, beide Richtungen) als Punkte
+    zum flip_begin: weg2_flip_user_view_ms{def="t2t",dir,part}, part = total | vorlauf | layer | wake_kv_dc |
+    nachlauf | rest (die Teile summieren zu total) | d_extend (davon im Nachlauf).  Das Label def trennt die
+    Reihen von den alten (bis 02.10. endete D>P am Leg-1-Dispatch).  Nur gemessene Flips (kind ok), jeder
+    einmal."""
     out = []
     for x in views:
         if x.get("kind") != "ok" or x.get("total_ms") is None or x.get("begin") is None:
@@ -363,12 +361,11 @@ def flip_view_points(views: List[dict], model: str, boot: str, done_keys: set) -
             continue
         done_keys.add(key)
         ts = int(float(x["begin"]) * 1000)
-        for part, k in (("total", "total_ms"), ("vorlauf", "vorlauf_ms"), ("layer", "layer_ms"),
-                        ("nachlauf", "nachlauf_ms"), ("d_extend", "nachlauf_d_extend_ms")):
+        for part, k in VIEW_PARTS:
             v = x.get(k)
             if v is not None:
-                out.append("weg2_flip_user_view_ms%s %s %d" % (_lbl({"model": model, "boot": boot, "dir": x["dir"], "part": part}),
-                                                              repr(float(v)), ts))
+                out.append("weg2_flip_user_view_ms%s %s %d" % (
+                    _lbl({"model": model, "boot": boot, "dir": x["dir"], "part": part, "def": "t2t"}), repr(float(v)), ts))
     return out
 
 
@@ -452,15 +449,34 @@ def boot_rates_from(series: Dict[Tuple[str, str, str], List[Tuple[float, float]]
                    "Decode weg2_boot_decode_* (1-s-Ring des Samplers, stetige Intervalle, ganzer Boot)"}
 
 
+def flip_stats_from(points: Dict[str, List[Tuple[float, float]]]) -> Dict[str, dict]:
+    """{dir: [(t, total_ms)]} -> {dir: {n, median, p90, max}} -- one point per flip (the push writes each once at
+    its flip_begin).  Pure, unit-tested."""
+    import math as _m
+    out = {}
+    for d, pts in points.items():
+        vals = sorted(v for _, v in pts if v is not None)
+        q = (lambda p: vals[max(0, _m.ceil(p * len(vals)) - 1)] if vals else None)  # noqa: E731
+        out[d] = {"n": len(vals), "median": q(0.5), "p90": q(0.9), "max": vals[-1] if vals else None,
+                  "src": "VictoriaMetrics weg2_flip_user_view_ms{def=t2t,part=total}"}
+    return out
+
+
 def boot_rates(client: "VmClient", boot_id: str, span_s: int = 12 * 3600) -> dict:
-    """boot_rates_from over what VictoriaMetrics holds for one boot (label boot = short_boot)."""
+    """boot_rates_from over what VictoriaMetrics holds for one boot (label boot = short_boot), plus the
+    Flipzeit per direction (Nutzer 02.10.: letztes Token -> erstes Token, def="t2t")."""
     sel = 'boot="%s"' % short_boot(boot_id)
     series: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
     names = ["weg2_rank_prefill_new_tokens_total", "weg2_rank_prefill_compute_ms_total"] + [n for _, n in BOOT_DECODE_FIELDS]
     for m in names:
         for met, pts in client.raw("%s{%s}" % (m, sel), span_s):
             series[(m, met.get("group", ""), met.get("rank", ""))] = pts
-    return boot_rates_from(series)
+    out = boot_rates_from(series)
+    fl: Dict[str, List[Tuple[float, float]]] = {}
+    for met, pts in client.raw('weg2_flip_user_view_ms{%s,def="t2t",part="total"}' % sel, span_s):
+        fl.setdefault(met.get("dir", "?"), []).extend(pts)
+    out["flips"] = flip_stats_from(fl)
+    return out
 
 
 def ttft_last(client: "VmClient", now: Optional[float] = None, span_s: int = 900) -> Dict[str, dict]:

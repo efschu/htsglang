@@ -263,16 +263,14 @@ class TestWhatNone(unittest.TestCase):
                             "flip_total_ms": 9000, "reason": "next_flip_before_work"},
                            {"dir": "D>P", "flip_begin_ts": 55.0, "what": "none", "flip_time_ms": None,
                             "flip_total_ms": 1200, "reason": "front_stop"}]
-        ft = ipcboot.flip_times_view(fw, FLIP_DONE, False)
-        self.assertEqual((ft["P>D"]["n"], ft["P>D"]["median"], ft["P>D"]["no_work"]), (1, 2500.0, 1))
-        self.assertEqual(ft["D>P"]["n"], 0)
-        self.assertIn("flip_user_time", ft["D>P"]["missing"])      # no fallback on flip_first_work D>P
-        ut = [{"dir": "D>P", "start_ts": 49.0, "prefill_start_ts": 51.3, "flip_user_ms": 2300,
-               "prefill_start_source": "leg1_dispatch"}]
-        ft2 = ipcboot.flip_times_view(fw, FLIP_DONE, False, ut)
-        self.assertEqual((ft2["D>P"]["n"], ft2["D>P"]["last"], ft2["D>P"]["missing"]), (1, 2300.0, None))
-        self.assertIn("Dispatch", ft2["D>P"]["src"])
-        self.assertEqual([r["ms"] for r in ft["recent"]], [2500])
+        # Nutzer 02.10.: the Flipzeit comes from flip_views only; a what="none" flip is a Leerlauf-Flip there
+        ipc = {"ipc_events": [{"type": "flip_begin", "ts": 50.0, "data": {"flip_begin_ts": 50.0, "sleep": "P", "wake": "D"}},
+                              {"type": "flip_done", "ts": 51.0, "data": {"flip_begin_ts": 50.0, "t": 51.0, "flip_ms": 900}}],
+               "flip_first_work": fw}
+        v = ipcboot.flip_views([{"s": 0.0, "e": 60.0, "k": "unknown"}], ipc, 300.0)
+        self.assertEqual([x["kind"] for x in v], ["leerlauf"])
+        ft = ipcboot.flip_times_of(v)
+        self.assertEqual((ft["P>D"]["n"], ft["P>D"]["no_work"], ft["recent"]), (0, 1, []))
         m = activity.Model(ring_until(60.0), FLIP_DONE + [{"sleep": "D", "wake": "P", "flip_begin_ts": 50.0, "t": 51.0}], fw)
         self.assertEqual(len(m.tails()), 1)
         ev = [{"type": "flip_first_work", "data": x} for x in fw]

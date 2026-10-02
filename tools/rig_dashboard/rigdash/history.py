@@ -631,37 +631,28 @@ class Recorder:
                 self.db.set("roles." + model, roles)
 
     def _mark_flips(self, key: str, model: str, ipc: dict) -> None:
-        """One mark per flip (events.jsonl, the front's one clock), new ones only.  Value = Flipzeit
-        after the user's definition, never flip_total: P>D = flip_first_work.flip_time_ms (what="none"
-        gives no value); D>P = flip_user_time.flip_user_ms (build y4z on) -- a D>P flip_first_work
-        only draws the flip line, without a value (no fallback)."""
+        """One flip LINE per flip (events.jsonl, the front's one clock), new ones only, without a value: Nutzer
+        02.10. -- the front's own numbers (flip_first_work.flip_time_ms, flip_user_time.flip_user_ms up to the
+        leg-1 dispatch) are no Flipzeit.  The value marks come from _mark_flip_views (kind flip_t2t)."""
         rows = (ipc or {}).get("flip_first_work") or []
         done = self._flips_done.get(key, 0)
         for dd in rows[done:] if done <= len(rows) else rows:
             t0 = dd.get("flip_begin_ts") or dd.get("t")
             if t0 is not None and dd.get("dir") in ("P>D", "D>P"):
-                v = dd.get("flip_time_ms") if dd.get("dir") == "P>D" and dd.get("what") != "none" else None
-                self.db.mark(t0, model, "flip", dd["dir"] + " ipc", v)
+                self.db.mark(t0, model, "flip", dd["dir"] + " ipc", None)
         self._flips_done[key] = len(rows)
-        ut = (ipc or {}).get("flip_user_time") or []
-        done_u = self._flips_done.get(key + "#ut", 0)
-        for u in ut[done_u:] if done_u <= len(ut) else ut:
-            if u.get("flip_user_ms") is not None and u.get("start_ts") is not None:
-                self.db.mark(u["start_ts"], model, "flip_user", "D>P ipc", u["flip_user_ms"])
-        self._flips_done[key + "#ut"] = len(ut)
 
     def _mark_flip_views(self, key: str, model: str, ipc: dict, m, now: float) -> None:
-        """Nutzer 01.10. ~08:20Z: P->D-Flipzeit in Nutzersicht (P-Ende -> erstes Decode auf D, aus den Rang-
-        Segmenten), nicht das Front-Ereignis flip_first_work, das in 3-12 Flips je Boot vor flip_done kam.
-        Eine Marke je gemessenem Flip (kind flip_pd_user), Wert = Gesamtzeit; Teile im Label."""
+        """Nutzer 02.10.: the Flipzeit of every measured flip, both directions (ipcboot.flip_views: letztes Token
+        -> erstes Token), one mark each (kind flip_t2t, value = total); the partition in the label."""
         from . import ipcboot
         segs = ipcboot.timeline_view(m, not ipc.get("terminal"), None, now, ipcboot.boot_start(ipc),
                                      detail=False)["segs"]
-        for x in ipcboot.flip_views(segs, ipc, now):
-            if x["dir"] != "P>D" or x.get("kind") != "ok" or x.get("total_ms") is None:
+        for x in ipcboot.flip_views(segs, ipc, now, m.ring):
+            if x.get("kind") != "ok" or x.get("total_ms") is None:
                 continue
-            parts = "v=%d l=%d n=%d" % tuple(int(round(x.get(k) or 0)) for k in ("vorlauf_ms", "layer_ms", "nachlauf_ms"))
-            self.db.mark(x["begin"], model, "flip_pd_user", "P>D %s ipc" % parts, x["total_ms"])
+            parts = "v=%d l=%d w=%d n=%d r=%d" % tuple(int(round(x.get(k) or 0)) for k in ipcboot.PARTS)
+            self.db.mark(x["begin"], model, "flip_t2t", "%s %s ipc" % (x["dir"], parts), x["total_ms"])
 
     # --- loop ----------------------------------------------------------------
     def publish(self, now: Optional[float] = None) -> None:
@@ -883,11 +874,15 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             continue
         m["label"] = lab[:-4]
         marks.append(m)
-    user_pd = [m for m in marks if m["kind"] == "flip_pd_user" and m["v"] is not None]
-    old_pd = [m for m in marks if m["kind"] == "flip" and m["label"] == "P>D" and m["v"] is not None]
-    pd_src = user_pd if user_pd else old_pd
-    flips_pd = [m["v"] for m in pd_src]
-    last_pd = pd_src[-1] if pd_src else None
+    # Nutzer 02.10.: Flipzeit = letztes Token -> erstes Token (marks flip_t2t, both directions); the older marks
+    # (flip with the front's P>D value, flip_user = D>P up to the leg-1 dispatch, flip_pd_user) were other
+    # definitions and are neither a tile value nor a point any more
+    def _flip_tile(d):
+        ms = [m for m in marks if m["kind"] == "flip_t2t" and m["v"] is not None and (m["label"] or "").startswith(d)]
+        vals = [m["v"] for m in ms]
+        return {"last_ms": ms[-1]["v"] if ms else None, "last_t": ms[-1]["t"] if ms else None,
+                "p50_ms": _pct(vals, 0.5), "p90_ms": _pct(vals, 0.9), "max_ms": max(vals) if vals else None, "n": len(vals)}
+    flip_pd, flip_dp = _flip_tile("P>D"), _flip_tile("D>P")
     roles = {m: (db.get("roles." + m) or {}) for m in MODELS}
     card_info = [dict(c, roles={m: roles[m].get(c["uuid"], []) for m in MODELS}) for c in cards]
     tiles = {
@@ -903,13 +898,14 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
         "power_sum_w": sum(p for p in powers if p is not None) if any(p is not None for p in powers) else None,
         "cpu_pct": latest("host.cpu"),
         "live": latest("m.ipc") is not None,
-        "flip_last_ms": last_pd["v"] if last_pd else None, "flip_last_t": last_pd["t"] if last_pd else None,
-        "flip_median_ms": _pct(flips_pd, 0.5), "flip_n": len(flips_pd),
+        "flip_last_ms": flip_pd["last_ms"], "flip_last_t": flip_pd["last_t"],
+        "flip_median_ms": flip_pd["p50_ms"], "flip_n": flip_pd["n"],
+        "flip": {"P>D": flip_pd, "D>P": flip_dp},
     }
     tiles.update(seat_tiles(series))
-    thin = [m for m in marks if m["kind"] not in ("flip", "flip_user", "flip_pd_user")] + \
-        [m for m in marks if m["kind"] in ("flip_user", "flip_pd_user")]
-    fl = [m for m in marks if m["kind"] == "flip"]
+    thin = [m for m in marks if m["kind"] not in ("flip", "flip_user", "flip_pd_user", "flip_t2t")] + \
+        [m for m in marks if m["kind"] == "flip_t2t"]
+    fl = [dict(m, v=None) for m in marks if m["kind"] == "flip"]
     if len(fl) > 800:
         k = len(fl) / 800.0
         fl = [fl[int(i * k)] for i in range(800)]
@@ -930,7 +926,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             "power": "NVML, Summe aller Karten",
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
                             else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
-            "flip": "P→D: Rang-Segmente (P-Ende → erstes Decode auf D, flip_pd_user; ältere Flips flip_first_work) · D→P: flip_user_time",
+            "flip": "Flipzeit = letztes Token → erstes Token (ipcboot.flip_views, flip_t2t, ab 02.10.): P→D P-Chunk-Ende → erstes Decode-Token, D→P Decode-Ende → erster Forward der letzten P-Stufe",
             "marks": "state.json (Boot-ID, lifecycle) + events.jsonl flip_first_work",
         },
         "errors": dict(rec.errors) if rec else dict((db.get("rec.state") or {}).get("errors") or {}),

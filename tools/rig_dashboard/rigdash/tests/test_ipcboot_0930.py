@@ -54,9 +54,11 @@ class TestBuildView(unittest.TestCase):
         self.now = self.ring[-1]["t"]
         self.ipc = {"boot_id": "nfx-boot-x", "dir": "/x/nf/state/nfx-boot", "tag": "nfx",
                     "model": "NF", "terminal": False, "lifecycle": "serving", "front": {"awake": "D"},
-                    "ipc_events": [{"type": "flip_done", "ts": 1021.0,
+                    "ipc_events": [{"type": "flip_begin", "ts": 1020.5, "data": {"flip_begin_ts": 1020.5, "sleep": "P", "wake": "D"}},
+                                   {"type": "flip_done", "ts": 1021.0,
                                     "data": {"sleep": "P", "wake": "D", "flip_ms": 1800, "flip_begin_ts": 1020.5, "t": 1021.0}}],
-                    "flip_first_work": [{"dir": "P>D", "flip_begin_ts": 1020.5, "flip_time_ms": 2100, "what": "decode_token"}]}
+                    "flip_first_work": [{"dir": "P>D", "flip_begin_ts": 1020.5, "flip_time_ms": 2100, "what": "decode_token",
+                                         "first_work_ts": 1022.6, "p_end_ts": 1020.4, "p_end_source": "p_leg1_end"}]}
         self.v = ipcboot.build_view(self.ipc, self.ring, {"rankstats": {}, "rankstate": {}}, {}, self.now)
 
     def test_rates_from_deltas(self):
@@ -85,7 +87,10 @@ class TestBuildView(unittest.TestCase):
         c = self.v["cache"]["D"]["boot"]
         self.assertEqual((c["cached"], c["new"]), (20000, 10))
         ft = self.v["flip_times"]
-        self.assertEqual((ft["P>D"]["n"], ft["P>D"]["last"], ft["P>D"]["layer_newest"]), (1, 2100.0, 1800.0))
+        # Nutzer 02.10.: the Flipzeit is P-Ende -> erstes Decode-Token (2,2 s), never the layer-only 1,8 s
+        self.assertEqual(ft["P>D"]["n"], 1)
+        self.assertAlmostEqual(ft["P>D"]["last"], 2200.0, delta=0.5)
+        self.assertNotIn("layer_newest", ft["P>D"])
         self.assertEqual(self.v["flip_count"], 1)
         self.assertTrue(any(x["k"] == "flip_pd" for x in self.v["timeline"]["segs"]))
 

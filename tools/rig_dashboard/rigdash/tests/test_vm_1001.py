@@ -34,9 +34,7 @@ def test_lines_carry_ttft_counters_and_no_rid():
 
 def test_flip_points_at_flip_time_without_what_none_and_only_new():
     pts, newest = vmpush.flip_points(_ipc(), "NF", 0.0)
-    assert len(pts) == 3                       # 2 flip_first_work with value + 1 flip_user_time
-    assert any(p.endswith(" 2100.0 100000") for p in pts)
-    assert not any(" 900.0 " in p for p in pts)
+    assert pts == []                           # Nutzer 02.10.: the front's own numbers are no Flipzeit, not pushed
     assert newest == 301.0
     pts2, _ = vmpush.flip_points(_ipc(), "NF", newest)
     assert pts2 == []

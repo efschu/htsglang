@@ -571,7 +571,7 @@ def _cur_flip(lb, fb, gpus):
         return None
     return ("P→D Median %s, p90 %s (n=%s); D→P Median %s (n=%s); Flips %s" % (
         _fmt_s(pd.get("median")), _fmt_s(pd.get("p90")), pd.get("n"), _fmt_s(dp.get("median")), dp.get("n"),
-        lb.get("flip_count")), "events.jsonl flip_first_work (Front-Uhr) + flip_done (IPC)")
+        lb.get("flip_count")), "flip_views: letztes Token -> erstes Token (events.jsonl + rankstats, IPC)")
 
 
 def _cur_decode(lb, fb, gpus):

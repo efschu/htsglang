@@ -106,9 +106,11 @@ class TestRecorderIpc(unittest.TestCase):
                                                                          or one["mi.NF.d_tps"].get(t, 0) > 0)]
             self.assertEqual(both1, [])                                         # 1-s rows: never both
             flips = [m for m in db.marks("NF", T0, T0 + 100) if m["kind"] == "flip"]
-            self.assertEqual([(m["label"], m["v"]) for m in flips], [("P>D ipc", 2500), ("D>P ipc", None)])
+            # Nutzer 02.10.: the flip lines carry no value (the front's numbers are no Flipzeit); values only flip_t2t
+            self.assertEqual([(m["label"], m["v"]) for m in flips], [("P>D ipc", None), ("D>P ipc", None)])
+            t2t = [m for m in db.marks("NF", T0, T0 + 100) if m["kind"] == "flip_t2t" and m["label"].startswith("P>D")]
             v = history.view(db, None, "NF", "15m", now=T0 + 100)
-            self.assertEqual(v["tiles"]["flip_n"], 1)                            # what=none is no Flipzeit
+            self.assertEqual(v["tiles"]["flip_n"], len(t2t))                     # what=none is no Flipzeit
 
 
 class TestNoLogInHistory(unittest.TestCase):

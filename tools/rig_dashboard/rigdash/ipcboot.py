@@ -35,8 +35,6 @@ STALE_S = 20.0          # a rank file older than this: the rank gives no sign of
 BURST_GAP_S = 5.0       # idle stretches up to this long do not end a burst
 MAX3_S = 3.0
 MAX3_WIN_S = 120.0
-FIRST_TOKEN_HEADLINE_FOR_27B = False     # same rule as the log reader had (README: Flipzeit)
-INSTRUMENTS = {"first_token": "P-Ende→erstes Token (flip_first_work)", "flip_total": "flip_ms (flip_done)"}
 
 
 def _n(x) -> Optional[float]:
@@ -543,65 +541,13 @@ def _q(xs, p):
     return xs[max(0, math.ceil(p * len(xs)) - 1)] if xs else None
 
 
-def flip_times_view(first_work: List[dict], flip_done: List[dict], is_27b: bool,
-                    user_time: Optional[List[dict]] = None) -> dict:
-    """Flipzeit per direction, never flip_total (NF-Operator 30.09.):
-    P>D = flip_first_work.flip_time_ms (P-Ende -> erstes Decode-Token), what="none" never counted;
-    D>P = flip_user_time.flip_user_ms (Decode-Ende -> P-Prefill-Start, ab Build y4z 53977b2b67) --
-    no fallback on flip_first_work: without the event the D>P value is "fehlt in IPC"."""
-    out = {"instruments": INSTRUMENTS,
-           "headline": "flip_total" if is_27b and not FIRST_TOKEN_HEADLINE_FOR_27B else "first_token"}
-    ut = sorted((x for x in (user_time or []) if x.get("flip_user_ms") is not None),
-                key=lambda x: x.get("start_ts") or 0)
-    for d in ("P>D", "D>P"):
-        mine = [x for x in first_work if x.get("dir") == d]
-        no_work = sum(1 for x in mine if x.get("what") == "none")
-        if d == "P>D":
-            fw = sorted((x for x in mine if x.get("what") != "none" and x.get("flip_time_ms") is not None),
-                        key=lambda x: x.get("flip_begin_ts") or 0)
-            vals = [float(x["flip_time_ms"]) for x in fw]
-            last_t = fw[-1].get("flip_begin_ts") if fw else None
-            src = "IPC flip_first_work (%s)" % (fw[-1].get("what") or "?") if fw else None
-            missing = None
-        else:
-            vals = [float(x["flip_user_ms"]) for x in ut]
-            last_t = ut[-1].get("start_ts") if ut else None
-            src = ("IPC flip_user_time%s" % (" (Ende = nur Leg-1-Dispatch)"
-                                             if ut[-1].get("prefill_start_source") == "leg1_dispatch" else "")) if ut else None
-            missing = None if ut else "flip_user_time (ab Build y4z)"
-        sl, wk = d.split(">")
-        fd = [x for x in flip_done if x.get("sleep") == sl and x.get("wake") == wk and x.get("flip_ms") is not None]
-        lay = [float(x["flip_ms"]) for x in fd]
-        out[d] = {"n": len(vals), "last": vals[-1] if vals else None, "last_t": last_t,
-                  "median": _q(vals, 0.5), "p90": _q(vals, 0.9), "resolution_s": 0.001, "open": False,
-                  "src": src, "missing": missing, "no_work": no_work, "layer_n": len(lay),
-                  "layer_newest": lay[-1] if lay else None, "layer_median": _q(lay, 0.5), "layer_p90": _q(lay, 0.9)}
-    done_by_begin = {round(x.get("flip_begin_ts") or 0, 1): x for x in flip_done}
-    recent = []
-    for x in sorted((x for x in first_work if x.get("what") != "none"), key=lambda x: x.get("flip_begin_ts") or 0)[-24:]:
-        fd = done_by_begin.get(round(x.get("flip_begin_ts") or 0, 1)) or {}
-        if x.get("dir") == "D>P":
-            u = next((y for y in ut if y.get("parts") is not None and abs((y.get("start_ts") or 0) - (x.get("flip_begin_ts") or 0)) < 15
-                      and (y.get("prefill_start_ts") or 0) >= (x.get("flip_begin_ts") or 0)), None)
-            ms = u.get("flip_user_ms") if u else None
-        else:
-            ms = x.get("flip_time_ms")
-        recent.append({"t": x.get("flip_begin_ts"), "dir": x.get("dir"), "ms": ms,
-                       "layer_ms": fd.get("flip_ms"), "state": "ok", "src": "ipc"})
-    out["recent"] = recent
-    return out
-
-
 # ----------------------------------------------------------------------------- Flipzeit in Nutzersicht
-# Nutzer 01.10. ~08:20Z (Definition 29.09.): Flipzeit = volle Nutzersicht, nie flip_total.
-#   P->D: P-Ende (letzter Prefill-Chunk) -> erstes Decode-Token auf D
-#   D->P: Decode-Ende -> erster P-Prefill-Start
-# zerlegt in Vorlauf (Arbeitsende -> flip_begin), Layer-Tausch (flip_begin -> flip_done), Nachlauf (flip_done ->
-# erste Arbeit).  Gemessen am 01.10. (NF y6d): das Front-Ereignis flip_first_work (decode_token) kam bei P->D in
-# 3-12 Flips je Boot VOR flip_done (+0,02..+0,99 s nach flip_begin), waehrend die Rang-Zaehler das erste Decode
-# erst nach flip_done zeigen -- daher die Werte "unter 1 s".  P->D misst rigdash deshalb aus den Rang-Segmenten
-# (activity.Model: P-Chunk-Ende aus prefill.last, Decode-Beginn aus decode.tokens/gpu_ms) und nennt das
-# Front-Ereignis nur zum Vergleich.  D->P kommt aus flip_user_time (Front, mit parts).
+# Nutzer 02.10. (ersetzt 29.09./01.10.): FLIPZEIT = vom LETZTEN Token der abgebenden Phase bis zum ERSTEN Token
+# der annehmenden, fuer beide Richtungen und beide Modelle, die eine und einzige Flipzeit:
+#   P->D: Ende des letzten P-Prefill-Chunks -> erstes Decode-Token auf D
+#   D->P: letztes Decode-Token auf D -> Beginn des ersten Prefill-Forwards, der ALLE P-Stufen passiert hat
+# Die kleine Zahl (flip_ms, done-begin, Leg-1-Dispatch) ist nirgends mehr eine Flipzeit, nur ein Teil der
+# Zerlegung (flip_partition: Vorlauf + Layer + Wake-KV/DC + Nachlauf + Rest = total).
 FLIP_IDLE_S = 120.0          # no work this long after flip_done (or before the next flip): Leerlauf-Flip
 
 
@@ -620,10 +566,94 @@ def _seg_last_end(segs, kinds, t_to, t_from):
     return best
 
 
-def flip_views(segs: List[dict], ipc: dict, now: float) -> List[dict]:
-    """One row per flip of the ring window, newest last: dir, begin, total_ms (Nutzersicht), parts, kind
-    (ok | leerlauf | offen | ohne_daten), front_ms (the front's own number) and front_early (front event before
-    flip_done).  Pure over its inputs (unit-tested)."""
+def _ring_keys(ring) -> set:
+    keys = set()
+    for s in ring or []:
+        keys.update((s.get("r") or {}).keys())
+    return keys
+
+
+def _rank_first_rise(ring, key: Optional[str], fields, t_from: float, t_to: float):
+    """The first rise of any of ``fields`` on rank ``key`` whose rank clock lies after ``t_from``:
+    (seen_ts, lo) -- the work began in (lo, seen_ts], lo = max(previous rank clock, t_from).  The rank file
+    is written every SGLANG_WEG2_RANKSTATS_PERIOD_S (1 s), so seen_ts - lo is the instrument's resolution.
+    None when the ring holds no such rise up to ``t_to``."""
+    if not ring or key is None:
+        return None
+    for a, b in activity.rank_pairs(ring, key):
+        if b["ts"] <= t_from:
+            continue
+        if a["ts"] > t_to:
+            break
+        if any((b.get(f) is not None and a.get(f) is not None and b[f] > a[f]) for f in fields):
+            return b["ts"], max(a["ts"], t_from)
+    return None
+
+
+#: the partition of a flip, in time order (Summe = total_ms)
+PARTS = ("vorlauf_ms", "layer_ms", "wake_kv_dc_ms", "nachlauf_ms", "rest_ms")
+
+
+def flip_partition(start: float, end: float, begin: float, flip_ms, done, lo: Optional[float] = None) -> dict:
+    """Nutzer 02.10. (Flipzeit-Gesetz): total = letztes Token der abgebenden Phase -> erstes Token der
+    annehmenden, VOLLSTAENDIG zerlegt auf der Zeitachse -- jeder Teil ist ein Stueck von [start, end]:
+
+      vorlauf      start -> flip_begin
+      layer        flip_begin -> flip_begin + flip_ms           (Layer-Tausch, flip_done.flip_ms)
+      wake_kv_dc   flip_begin + flip_ms -> flip_done            (FLIP-TIMELINE wake-kv@..dc@..done)
+      nachlauf     flip_done -> lo                               (bis zur ersten Arbeit, sicher gemessen)
+      rest         total - Summe der Teile: lo -> end, wo das Ende nur in einem Rang-Takt (lo, end] liegt
+                   (Aufloesung), sonst 0 -- und jede Spanne, deren Grenze fehlt
+
+    Grenzen ausserhalb [start, lo] werden geklemmt (ein erstes Token waehrend wake-kv/dc beendet den Flip
+    dort; der Rest des Flips ist fuer den Nutzer keine Wartezeit)."""
+    total = (end - start) * 1000.0
+    lo = end if lo is None else min(max(lo, start), end)
+
+    def clip(x):
+        return min(max(float(x), start), lo)
+
+    b = clip(begin)
+    p = {"vorlauf_ms": (b - start) * 1000.0, "layer_ms": None, "wake_kv_dc_ms": None, "nachlauf_ms": None}
+    # the marks run in time order (an event out of order never gives a negative part: running max)
+    l_end = max(b, clip(begin + float(flip_ms) / 1000.0)) if flip_ms is not None else None
+    if l_end is not None:
+        p["layer_ms"] = (l_end - b) * 1000.0
+    if done is not None:
+        dn = max(clip(done), l_end if l_end is not None else b)
+        if l_end is not None:
+            p["wake_kv_dc_ms"] = (dn - l_end) * 1000.0
+        p["nachlauf_ms"] = (lo - dn) * 1000.0
+    p["rest_ms"] = total - sum(v for v in p.values() if v is not None)
+    p["total_ms"] = total
+    return p
+
+
+#: the endpoint fields, named where the page says "fehlt (Feld X)"
+F_PD_START = "flip_first_work.p_end_ts (P>D, Front) / P-Rang-Segment"
+F_PD_END = "flip_first_work.first_work_ts what=decode_token / rankstats D decode.tokens im Ring"
+F_DP_START = "flip_user_time.start_ts (D>P, Front)"
+F_DP_END = "rankstats P.tp0pp<letzte>.work.forward_ct im Ring / flip_user_time.prefill_start_ts (pp_last_forward)"
+
+
+def flip_views(segs: List[dict], ipc: dict, now: float, ring=None) -> List[dict]:
+    """One row per flip of the ring window, newest last (Nutzer 02.10., FLIPZEIT fuer beide Richtungen und
+    beide Modelle): total_ms = vom LETZTEN Token der abgebenden Phase bis zum ERSTEN Token der annehmenden,
+    das ist DIE Flipzeit und die einzige.
+
+      P>D  start = Ende des letzten P-Prefill-Chunks (front flip_first_work.p_end_ts = Ende von P-Leg 1;
+           sonst P-Rang-Segment), end = erstes Decode-Token auf D (front flip_first_work.first_work_ts
+           what=decode_token, wenn >= flip_begin + flip_ms - 0,3 s; sonst erster Anstieg der D-Rang-Zaehler).
+           Gemessen NF y7l Flip 2: D dekodierte 1,9 s VOR flip_done (waehrend wake-kv/dc) -- ein Riegel
+           "nach flip_done" machte 4,5 s aus 2,6 s.
+      D>P  start = Decode-Ende (flip_user_time.start_ts), end = Beginn des ersten Forwards auf der LETZTEN
+           P-PP-Stufe (der Chunk hat alle Stufen passiert): flip_user_time.prefill_start_ts, wenn die Front
+           ihn als pp_last_forward liefert, sonst der erste Anstieg von rankstats work.forward_ct der letzten
+           P-Stufe (Rang-Takt 1 s, die Aufloesung steht als Rest).  NIE der Leg-1-Dispatch.
+
+    Teile: flip_partition (Summe = total, Rest explizit).  Fehlt ein Endpunkt, ist kind "fehlt" und
+    ``missing`` nennt das Feld -- nie ein Ersatzwert.  ``ring`` = the boot's rank sample ring (the
+    endpoints from rank counters).  Pure over its inputs (unit-tested)."""
     evs = ipc.get("ipc_events") or []
     begins = sorted(((e.get("data") or {}).get("flip_begin_ts") or e.get("ts"), e.get("data") or {})
                     for e in evs if e.get("type") == "flip_begin")
@@ -631,6 +661,10 @@ def flip_views(segs: List[dict], ipc: dict, now: float) -> List[dict]:
             for e in evs if e.get("type") == "flip_done"}
     fw = {round(float(x.get("flip_begin_ts") or 0), 2): x for x in ipc.get("flip_first_work") or []}
     ut = list(ipc.get("flip_user_time") or [])
+    keys = _ring_keys(ring)
+    p_last = activity.stage_keys(keys, "P")[1] if keys else None
+    d_first = activity.stage_keys(keys, "D")[0] if keys else None
+    ring_lo = min((s["t"] for s in ring), default=None) if ring else None
     lo = segs[0]["s"] if segs else now
     out = []
     prev_done = None   # the previous flip's done: P cannot have ended a chunk before it was woken
@@ -647,99 +681,147 @@ def flip_views(segs: List[dict], ipc: dict, now: float) -> List[dict]:
         sl, wk = bd.get("sleep"), bd.get("wake")
         d = "%s>%s" % (sl, wk)
         t_done = fd.get("t")
-        row = {"dir": d, "begin": b, "done": t_done, "layer_ms": fd.get("flip_ms"),
-               "vorlauf_ms": None, "nachlauf_ms": None, "total_ms": None, "kind": "offen", "nachlauf_d_extend_ms": None}
+        flip_ms = fd.get("flip_ms")
+        row = {"dir": d, "begin": b, "done": t_done, "kind": "offen", "total_ms": None, "start": None, "end": None,
+               "vorlauf_ms": None, "layer_ms": None, "wake_kv_dc_ms": None, "nachlauf_ms": None, "rest_ms": None,
+               "nachlauf_d_extend_ms": None, "end_res_ms": None, "missing": None}
         f = fw.get(key) or {}
-        if f.get("flip_time_ms") is not None and f.get("what") != "none":
-            row["front_ms"] = f.get("flip_time_ms")
-            row["front_what"] = f.get("what")
-            row["front_early"] = bool(t_done and f.get("first_work_ts") and f["first_work_ts"] < t_done)
         if t_done is None:
             row["kind"] = "offen" if nxt is None else "ohne_daten"
             out.append(row)
             continue
         horizon = min(nxt if nxt is not None else now, t_done + FLIP_IDLE_S)
+        still_open = nxt is None and horizon >= now - 0.5
+        start = end = e_lo = None
         if d == "P>D":
-            # Vorlauf-Artefakt (N3u 07:33:29/:39 11,3/21,0 s, N4p 09:58:14 17,2 s): after the acceptance
-            # probe's manual D->P (POST /weg2/flip) P did no work and flipped back -- the search reached
-            # back past that D->P to the P chunk of the phase BEFORE it. Bounded by the previous flip's done.
+            # Vorlauf-Artefakt (N3u 07:33:29/:39, N4p 09:58:14): after the acceptance probe's manual D->P P did
+            # no work and flipped back -- the search is bounded by the previous flip's done.
             p_lo = b - FLIP_IDLE_S if prev_done is None else max(b - FLIP_IDLE_S, float(prev_done))
-            p_end = _seg_last_end(segs, ("P", "single"), b + 0.3, p_lo)
-            first = _seg_first(segs, ("dec",), t_done - 0.3, horizon)
-            # P>D first decode token from the FRONT's flip_first_work (decode_token, its own clock, ms)
-            # instead of the rank segments (decode.tokens deltas, ~2 s raster: a D-direct extend of a
-            # new arrival at the start of the interval pushed "dec" out -- N4p 10:00:28 front 0,45 s vs
-            # segments 1,88 s nachlauf with 1,43 s "d_extend"). Checked on 27B 1002 (N4f 0837/1103,
-            # N4p, N4q; 36 P>D flips): never before flip_done, never earlier than the real first token
-            # (the early-fire class of NF y6d is closed by the front's leg-2 rule); two misses (first
-            # P>D of N4p/N4q, content before done of a leg 2 dispatched before begin) -- then the
-            # segments stay the fallback. P's end likewise from the front (p_end_ts = P's last leg 1).
-            fwd = f if (f.get("what") == "decode_token" and f.get("first_work_ts") is not None) else {}
-            # a front event well before flip_done (D not awake yet: the NF y6d early-fire class) is not
-            # trusted -- same 0,3 s tolerance as the segment search
-            if fwd and t_done - 0.3 <= float(fwd["first_work_ts"]) <= horizon + 0.5:
-                first = float(fwd["first_work_ts"])
-                row["first_src"] = "front flip_first_work"
-                fpe = fwd.get("p_end_ts")
-                if fwd.get("p_end_source") == "p_leg1_end" and fpe is not None and (
-                        prev_done is None or float(fpe) >= float(prev_done)):
-                    p_end = float(fpe)
-                    row["p_end_src"] = "front p_leg1_end"
-            if p_end is not None:
-                row["vorlauf_ms"] = max(0.0, (b - p_end) * 1000.0)
-                # Nutzer 02.10.: which prefill the flip followed -- Token x-y (n neu) of the P segment that ended last
+            fpe = f.get("p_end_ts")
+            if fpe is not None and (prev_done is None or float(fpe) >= float(prev_done)):
+                start = float(fpe)
+                row["start_src"] = "front flip_first_work.p_end_ts (%s)" % (f.get("p_end_source") or "?")
+            else:
+                start = _seg_last_end(segs, ("P", "single"), b + 0.3, p_lo)
+                if start is not None:
+                    row["start_src"] = "P-Chunk-Ende (rankstats prefill.last, letzte Stufe)"
+            if start is not None:
                 pseg = max((x for x in segs if x["k"] in ("P", "single") and x.get("depth") and x["s"] < b + 0.3
                             and x["e"] > p_lo), key=lambda x: x["e"], default=None)
                 if pseg is not None:
                     row["p_depth"] = {k: pseg["depth"].get(k) for k in ("x", "y", "n", "exact", "src", "tps_start", "tps_end")}
-            if first is not None:
-                row["nachlauf_ms"] = max(0.0, (first - t_done) * 1000.0)
-                ext = sum(max(0.0, min(x["e"], first) - max(x["s"], t_done)) for x in segs
-                          if x["k"] == "D" and x["e"] > t_done and x["s"] < first)
-                row["nachlauf_d_extend_ms"] = ext * 1000.0 if ext > 0 else None
-            if p_end is None and first is None:
-                row["kind"] = "leerlauf"           # no P work before, no decode after: nothing waited
-            elif first is None:
-                row["kind"] = "offen" if horizon >= now - 0.5 and nxt is None else "leerlauf"
-            elif p_end is None:
-                row["kind"] = "ok"                 # the flip was not ended by a prefill (D's queue woke D)
-                row["total_ms"] = (first - b) * 1000.0
-                row["start_src"] = "flip_begin (kein P-Chunk davor im Ring)"
+            # D cannot emit before its layers are back: the floor is flip_begin + flip_ms (0,3 s tolerance); it
+            # rejects the NF y6d early-fire class (+0,02..0,99 s after begin), not D's real tokens during wake-kv/dc
+            floor = (b + float(flip_ms) / 1000.0 if flip_ms is not None else t_done) - 0.3
+            fwt = f.get("first_work_ts") if f.get("what") == "decode_token" else None
+            if fwt is not None and floor <= float(fwt) <= horizon + 0.5:
+                end = float(fwt)
+                row["end_src"] = "front flip_first_work.first_work_ts (decode_token)"
+            else:
+                r = _rank_first_rise(ring, d_first, ("dtok", "rounds", "pnew"), floor, horizon)
+                if r is not None:
+                    end, e_lo = r
+                    row["end_src"] = "rankstats %s decode.tokens/rounds (erster Anstieg, Rang-Takt)" % d_first
+            if f.get("what") == "none" and end is None:
+                row["kind"] = "leerlauf"
+            elif end is None:
+                if d_first is None or ring_lo is None or ring_lo > floor:
+                    row["kind"], row["missing"] = "fehlt", F_PD_END
+                else:
+                    row["kind"] = "offen" if still_open else "leerlauf"
+            elif start is None:
+                if ring_lo is not None and ring_lo <= p_lo and p_last is not None \
+                        and _rank_first_rise(ring, p_last, ("fwd",), p_lo, b + 0.3) is None:
+                    # P computed no forward in its whole phase (27B N4: the acceptance probe's manual flips):
+                    # the outgoing phase has no last token, nothing to measure from
+                    row["kind"] = "leerlauf"
+                else:
+                    row["kind"], row["missing"] = "fehlt", F_PD_START
             else:
                 row["kind"] = "ok"
-                row["total_ms"] = (first - p_end) * 1000.0
-                row["start_src"] = "P-Chunk-Ende (rankstats prefill.last)"
-            row["src"] = "Rang-Segmente (rankstats) + events flip_begin/flip_done"
         else:
             u = next((x for x in ut if fd.get("epoch") is not None and x.get("epoch") == fd.get("epoch")), None) or \
                 next((x for x in ut if (x.get("prefill_start_ts") or 0) >= b and (nxt is None or (x.get("prefill_start_ts") or 0) < nxt)), None)
-            if u is not None and u.get("flip_user_ms") is not None:
-                p = u.get("parts") or {}
-                row.update(total_ms=float(u["flip_user_ms"]), vorlauf_ms=p.get("pre_begin_ms"),
-                           nachlauf_ms=p.get("first_chunk_ms"), legs_ms=p.get("legs_ms"), park_rpc_ms=p.get("park_rpc_ms"),
-                           kind="leerlauf" if u.get("idle_flip") else "ok",
-                           src="events flip_user_time (%s -> %s)" % (u.get("start_source") or "?", u.get("prefill_start_source") or "?"))
+            if u is not None and u.get("start_ts") is not None:
+                start = float(u["start_ts"])
+                row["start_src"] = "front flip_user_time.start_ts (%s)" % (u.get("start_source") or "?")
+            p = (u or {}).get("parts") or {}
+            if p.get("park_rpc_ms") is not None:
+                row["park_rpc_ms"] = p.get("park_rpc_ms")
+            if u is not None and u.get("prefill_start_source") == "pp_last_forward" and u.get("prefill_start_ts") is not None:
+                end = float(u["prefill_start_ts"])
+                row["end_src"] = "front flip_user_time.prefill_start_ts (pp_last_forward)"
             else:
-                first = _seg_first(segs, ("P", "single"), t_done - 0.3, horizon)
-                row["kind"] = "leerlauf" if first is None and (nxt is not None or horizon < now - 0.5) else ("offen" if first is None else "ohne_daten")
-                row["src"] = "kein flip_user_time zu diesem Flip"
+                # the forward on the last stage starts after flip_begin and after P's leg-1 dispatch
+                t_from = max(float(b), start if start is not None else float(b),
+                             float((u or {}).get("prefill_start_ts") or 0.0))
+                r = _rank_first_rise(ring, p_last, ("fwd",), t_from, horizon)
+                if r is not None:
+                    end, e_lo = r
+                    row["end_src"] = "rankstats %s work.forward_ct (erster Forward der letzten PP-Stufe, Rang-Takt)" % p_last
+            if u is not None and u.get("idle_flip"):
+                row["kind"] = "leerlauf"
+            elif end is None:
+                if p_last is None or ring_lo is None or ring_lo > b:
+                    row["kind"], row["missing"] = "fehlt", F_DP_END
+                else:
+                    row["kind"] = "offen" if still_open else "leerlauf"
+            elif start is None:
+                row["kind"] = "offen" if still_open else "fehlt"
+                row["missing"] = F_DP_START
+            else:
+                row["kind"] = "ok"
+        if start is not None and end is not None:
+            row.update(flip_partition(start, end, b, flip_ms, t_done, e_lo))
+            row["start"], row["end"] = start, end
+            row["end_res_ms"] = (end - e_lo) * 1000.0 if e_lo is not None else 0.0
+            if d == "P>D":
+                ext = sum(max(0.0, min(x["e"], end) - max(x["s"], t_done)) for x in segs
+                          if x["k"] == "D" and x["e"] > t_done and x["s"] < end)
+                row["nachlauf_d_extend_ms"] = ext * 1000.0 if ext > 0 else None
+        row["src"] = "%s -> %s" % (row.get("start_src") or "Start fehlt", row.get("end_src") or "Ende fehlt")
         out.append(row)
     return out
 
 
+def _stats(vals: List[float]) -> dict:
+    return {"n": len(vals), "median": _q(vals, 0.5), "p90": _q(vals, 0.9), "max": max(vals) if vals else None}
+
+
 def flip_last(views: List[dict]) -> dict:
-    """Per direction: the newest measured flip (bold on the page), the newest idle flip, median/p90 of the
-    measured ones in the ring, and how many front events came before flip_done."""
+    """Per direction: the newest measured flip (bold on the page), p50/p90/max of the measured totals in the
+    ring, the newest flip whose endpoint is missing (the page says "fehlt (Feld X)"), idle and open flips."""
     out = {}
     for d in ("P>D", "D>P"):
         mine = [x for x in views if x["dir"] == d]
         ok = [x for x in mine if x["kind"] == "ok" and x.get("total_ms") is not None]
         idle = [x for x in mine if x["kind"] == "leerlauf"]
-        vals = [x["total_ms"] for x in ok]
-        out[d] = {"last": ok[-1] if ok else None, "n": len(ok), "median": _q(vals, 0.5), "p90": _q(vals, 0.9),
-                  "idle_n": len(idle), "idle_last": idle[-1] if idle else None,
-                  "open": next((x for x in reversed(mine) if x["kind"] == "offen"), None),
-                  "front_early_n": sum(1 for x in mine if x.get("front_early"))}
+        miss = [x for x in mine if x["kind"] == "fehlt"]
+        newest = next((x for x in reversed(mine) if x["kind"] in ("ok", "fehlt")), None)
+        out[d] = dict(_stats([x["total_ms"] for x in ok]), last=ok[-1] if ok else None,
+                      newest=newest, missing_n=len(miss), missing_last=miss[-1] if miss else None,
+                      idle_n=len(idle), idle_last=idle[-1] if idle else None,
+                      open=next((x for x in reversed(mine) if x["kind"] == "offen"), None))
+    return out
+
+
+def flip_times_of(views: List[dict]) -> dict:
+    """flip_times for the card, from flip_views only (Nutzer 02.10.: the layer-only number disappears as a
+    Flipzeit everywhere): per direction n/last/p50/p90/max of total_ms, ``recent`` = total per flip."""
+    fl = flip_last(views)
+    out = {"instruments": {"total": "Flipzeit = letztes Token -> erstes Token (flip_views)"}, "headline": "total"}
+    for d in ("P>D", "D>P"):
+        x = fl[d]
+        last = x["last"]
+        nw = x["newest"] or {}
+        out[d] = {"n": x["n"], "last": last["total_ms"] if last else None, "last_t": last["begin"] if last else None,
+                  "median": x["median"], "p90": x["p90"], "max": x["max"], "open": x["open"] is not None,
+                  "src": last.get("src") if last else None,
+                  "missing": nw.get("missing") if nw.get("kind") == "fehlt" else None,
+                  "missing_n": x["missing_n"], "no_work": x["idle_n"]}
+    out["recent"] = [{"t": x["begin"], "dir": x["dir"], "ms": x["total_ms"], "kind": x["kind"], "missing": x.get("missing"),
+                      "parts": {k: x.get(k) for k in PARTS}, "state": x["kind"], "src": "ipc"}
+                     for x in views if x["kind"] in ("ok", "fehlt")][-24:]
     return out
 
 
@@ -1011,7 +1093,6 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
     fw = list(ipc.get("flip_first_work") or [])
     model = ipc.get("model") or ""
     tag = ipc.get("tag") or ""
-    is27 = "27b" in (model + " " + tag + " " + (ipc.get("dir") or "")).lower()
     fields = ipcfields.resolve(ipc, rank, {}, rates or ring_rates(ring))
     m = model_of(ipc, ring)
     if not any(e.get("type") in ("flip_begin", "flip_done", "flip_first_work") for e in (ipc.get("ipc_events") or [])) \
@@ -1051,7 +1132,7 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
         "flip_open": bool(b6.get("open")),
         "flips": flip_done[-12:],
         "flip_count": len(flip_done),
-        "flip_times": flip_times_view(fw, flip_done, is27, ipc.get("flip_user_time")),
+        "flip_times": None,             # below, from flip_views (the one Flipzeit)
         "health": health,
         "errors": [{"t": x.get("t"), "group": x.get("group"), "text": x.get("text") or x.get("exc") or ""}
                    for x in (a13.get("last") or [])],
@@ -1080,9 +1161,10 @@ def build_view(ipc: dict, ring, rank: dict, rates: dict, now: float,
     # Nutzer 01.10.: Dauer und Bootzeit je Boot in "Letzte Boots"
     v.update(life_view(ipc, t0, sig))
     # Nutzer 01.10. ~08:20Z: Flipzeit in Nutzersicht mit Vorlauf/Layer-Tausch/Nachlauf, und die Phase jetzt
-    fv = flip_views(v["timeline"]["segs"], ipc, now)
+    fv = flip_views(v["timeline"]["segs"], ipc, now, ring)
     v["flip_views"] = fv[-24:]
     v["flip_last"] = flip_last(fv)
+    v["flip_times"] = flip_times_of(fv)
     v["phase_now"] = phase_now(v["timeline"]["segs"], ipc, front, fv, live, now)
     view_ipc = {k: x for k, x in ipc.items() if k not in ("ipc_events", "flip_first_work", "flip_user_time", "request_done")}
     v["ipc"] = view_ipc

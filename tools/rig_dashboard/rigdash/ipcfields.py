@@ -75,6 +75,9 @@ MISSING_WRITER = {
     "F3": "wie B1", "F4": "wie A4", "F6": "wie C1-C6",
 }
 MISSING_LABEL = "fehlt in IPC"
+#: Nutzer 02.10.: the front's own flip numbers (B1/B2) are raw instruments, never the Flipzeit -- that is
+#: ipcboot.flip_views (letztes Token -> erstes Token), shown as flip_last / flip_times
+NOT_FLIPZEIT = "Front-Rohwert, keine Flipzeit (Flipzeit: flip_last, letztes -> erstes Token)"
 
 
 def field(key: str, ipc_value, ipc_src: Optional[str], log_value=None, from_log: Optional[List[str]] = None) -> dict:
@@ -247,7 +250,7 @@ def _flip_first_work(ipc, direction: str):
     ms_sorted = sorted(ms)
     return {"n": len(ms), "last_ms": ms[-1] if ms else None,
             "median_ms": ms_sorted[len(ms_sorted) // 2] if ms_sorted else None,
-            "rows": rows[-24:]}
+            "rows": rows[-24:], "instrument": NOT_FLIPZEIT}
 
 
 def _flip_user_time(ipc):
@@ -257,7 +260,8 @@ def _flip_user_time(ipc):
     ms = [float(r["flip_user_ms"]) for r in rows]
     ss = sorted(ms)
     return {"n": len(ms), "last_ms": ms[-1], "median_ms": ss[len(ss) // 2], "rows": rows[-24:],
-            "end_is_dispatch": rows[-1].get("prefill_start_source") == "leg1_dispatch"}
+            "end_is_dispatch": rows[-1].get("prefill_start_source") == "leg1_dispatch",
+            "instrument": NOT_FLIPZEIT}
 
 
 def _flip_done(ipc):
