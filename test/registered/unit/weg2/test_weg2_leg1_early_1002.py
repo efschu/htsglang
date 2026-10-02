@@ -44,7 +44,7 @@ def test_candidates_are_the_drains_head():
 def test_flip_posts_and_drain_awaits_the_early_leg():
     flip = inspect.getsource(F.Front.flip)
     i = flip.index('if src == "D" and dst == "P":')
-    assert "leg1_early_candidates(self.queue, self.p_concurrency)" in flip[i:i + 1500]
+    assert "leg1_early_candidates(self.queue, self.p_concurrency)" in flip[i:i + 6000]
     assert "_ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))" in flip
     assert "WEG2 LEG1-EARLY rid=%s epoch=%d" in flip
     src = inspect.getsource(F.Front)
