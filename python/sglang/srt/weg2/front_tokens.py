@@ -506,6 +506,45 @@ class TokenSpans:
         self._stamp(key)
         return anchor
 
+    def record_store_depth(self, ids: Optional[np.ndarray], depth: int,
+                           source: str = "l3_index") -> int:
+        """L3-INDEX PRICE (02.10.): the shared store holds ``ids``' leading
+        pages with an anchor at ``depth`` (``front_store.StorePresence``:
+        page keys as P/D read them, KV + every all-pages component, the
+        trailing mamba blob at the last page). Credited like a store anchor
+        -- beyond the epoch, a store fact -- but at the PAGE depth the store
+        proves, not at the prompt's page floor: a page prefix of an earlier,
+        longer prompt is a credit too (y7d weg2-2-19: P hit 30016 of 30076).
+        An entry that already credits at least ``depth`` stands untouched;
+        otherwise its credit and #59 cap are raised to it. A finish reading
+        replaces it (:meth:`record_presence`). Returns the depth recorded
+        (0 = none)."""
+        if ids is None or ids.size == 0:
+            return 0
+        depth = min(int(depth), int(ids.size))
+        if depth <= 0:
+            return 0
+        key = self._key(ids)
+        old = self.entries.get(key)
+        if old is not None:
+            cap = self.depth_caps.get(key)
+            have = int(old[1]) if cap is None else min(int(old[1]), int(cap))
+            if have >= depth:
+                return 0
+        self.entries.pop(key, None)
+        self.store_keys[key] = str(source)
+        if old is None:
+            self.entries[key] = (ids, depth, 0, None)
+            self.depth_caps[key] = depth
+        else:
+            oids, ct, pt, held = old
+            self.entries[key] = (oids, max(int(ct), depth), pt, held)
+            cap = self.depth_caps.get(key)
+            if cap is not None and int(cap) < depth:
+                self.depth_caps[key] = depth
+        self._stamp(key)
+        return depth
+
     def _stamp(self, key: str) -> None:
         self.seq += 1
         self.entry_seq[key] = self.seq
