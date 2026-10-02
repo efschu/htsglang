@@ -182,7 +182,11 @@ class TestFrontWrites(CustomTestCase):
         self.assertEqual((w["dir"], w["what"], w["rid"], w["flip_begin_ts"]),
                          ("D>P", "p_leg1_dispatch", "weg2-1-1", ts))
         self.assertEqual(w["epoch"], done[0]["data"]["epoch"])
-        self.assertGreaterEqual(w["flip_time_ms"], 0)
+        # 02.10.: the D->P end is the PP-last stage's first forward (progress
+        # beacon); this test front's group P has none -> missing, no flip time,
+        # and the dispatch only as leg1_dispatch_ts (never the end)
+        self.assertEqual((w["prefill_start_source"], w["flip_time_ms"], w["first_work_ts"]), ("missing", None, None))
+        self.assertGreaterEqual(w["leg1_dispatch_ts"], ts)
         self.assertNotIn("chunks", done[0]["data"])
 
     def test_front_writer_publishes_own_keys_only(self):
