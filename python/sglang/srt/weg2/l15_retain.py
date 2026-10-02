@@ -369,6 +369,11 @@ def retain_at_sleep(
     # kv_map/anchor_map carry GLOBAL old->new slots; ``visited`` is shared
     # across the held requests so a shared prefix chain is remapped once.
     kv_map = {int(old): int(new) for old, new in plan.moves}
+    try:  # L15-CHECK-SNAP: the wake diag names a bad row's pre-move slot
+        from sglang.srt.weg2 import l15_check_snap as _l15_cs
+        _l15_cs.note_moves(plan.moves)
+    except Exception:  # noqa: BLE001 -- diagnostics only
+        pass
     # every HELD anchor old->new, identity for one that did not move: the
     # rewrite drops any chain mamba value outside this map (only these
     # slots survive the mamba allocator re-arm in step 6)

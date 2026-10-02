@@ -20674,6 +20674,23 @@ class Scheduler(
                     rewrite_tree=l15_bind.rewrite_tree_chain,
                     **_l15_kwargs
                 )
+                # L15-CHECK-SNAP (N6e bad=1 foreign at gen=1): a capped rank
+                # copies the wake check's sample (device + L2) at the sleep,
+                # so the wake can tell who changed a bad row. Diagnostics only.
+                if _l15_res is not None:
+                    try:
+                        from sglang.srt.weg2 import l15_check_snap as _l15_cs
+                        if _l15_cs.enabled() and l15_shadow.own_cap_rows(self, os.environ) > 0:
+                            from sglang.srt.weg2 import l15_sleep_agree as _l15_sa3
+                            from sglang.srt.weg2.l15_shadow import kv_pool_of as _l15_kvp3
+                            _l15_rk3, _l15_pf3 = _l15_sa3.rank_prefix(self)
+                            _l15_cs.snap_at_sleep(
+                                getattr(_l15_res, "manifest", None), _l15_rk3, _l15_pf3,
+                                _l15_kvp3(getattr(getattr(self, "tp_worker", None) and
+                                                  self.tp_worker.model_runner, "token_to_kv_pool", None)),
+                                l15_bind.live_host_pools(self.tree_cache)[0])
+                    except Exception as exc:  # noqa: BLE001 -- diagnostics only
+                        logger.info("L15-CHECK-SNAP skipped (%s: %s)", type(exc).__name__, exc)
                 if _l15_res is not None:
                     # The keep spans are the one thing retain_at_sleep
                     # itself could not persist (it collects per view); one
