@@ -18,7 +18,8 @@ a few ms at 13.7 GB/s for a 32 MiB slot). The fast lane's whole tag is small
 narrow lane then has the engine to itself, at its receiver's link rate. No new
 wait on a credit path: the gate waits only for this process's OWN issued copies.
 The bandwidth is read from sysfs (current link width x max link speed of the
-receiver's PCI function) -- hardware-generic, no card names, no ordinals.
+receiver's PCI function, whose address the lane's own BAR1 handshake carries)
+-- hardware-generic, no card names, no ordinals, and NO CUDA call (y7h).
 
 Switch ``SGLANG_WEG2_ENABLE_LANE_FAST_FIRST`` (default on); off = the engine's
 own time-multiplexing, byte for byte.
@@ -127,13 +128,25 @@ def gate_for(lanes) -> Optional[EngineGate]:
         return g if g.armed else None
     rates: Dict[str, float] = {}
     try:
-        from sglang.srt.distributed.device_communicators.barlink_matrix import bdf_of_card
-
-        for k, pair in enumerate(lanes.cross_pairs):
+        # y7h (23c8fb584e, 10:42:56Z) DIED HERE: the receiver's card was named by
+        # its launcher ORDINAL through bdf_of_card() -> cudaDeviceGetPCIBusId on a
+        # rank that sees ONE device (CUDA_VISIBLE_DEVICES; `big_cards: card 1
+        # unreadable ... unknown-1` on TP1/TP2/PP1/PP2). The call failed, the
+        # except below swallowed it, but the CUDA runtime kept
+        # cudaErrorInvalidDevice as the thread's last error; the next checked
+        # launch on that thread -- D's resume at the P->D wake -- raised it:
+        # "AcceleratorError: CUDA error: invalid device ordinal" on TP1/TP2.
+        # The receiver's PCI address comes from the lane's own handshake
+        # (PeerWindow.peer_bdf, the BAR1 window it maps) -- no CUDA call at all.
+        peers = getattr(lanes, "peers", None) or {}
+        for k, _pair in enumerate(lanes.cross_pairs):
             lk = f"p{k}"
             if lanes.role(lk) != "src":
                 continue
-            r = link_gbytes_per_s(str(bdf_of_card(int(pair[1]))))
+            bdf = getattr(peers.get(lk), "peer_bdf", None)
+            if not bdf:
+                continue
+            r = link_gbytes_per_s(str(bdf))
             if r is not None:
                 rates[lk] = r
     except Exception as exc:  # noqa: BLE001
