@@ -411,22 +411,33 @@ class DpFlipClock:
             self._armed["beacon_first"] = {}
 
     def waits_for_beacon(self) -> bool:
+        """Until every P rank rose (the end is known at the first; the last
+        stage's start completes the decomposition)."""
         a = self._armed
         return bool(a is not None and a.get("beacon_snap") and a.get("pp_last_ts") is None)
 
+    def first_forward_ts(self) -> Optional[float]:
+        """PDFLIP-E2: the D->P end -- the FIRST P rank's first forward after the
+        flip (PP0 starts the prefill batch; the followers' starts are pipeline
+        fill, i.e. prefill compute). None until one rank rose."""
+        a = self._armed
+        return None if a is None else a.get("pp_first_ts")
+
     def note_beacon(self, cur: Dict[int, Tuple[int, int, int]]) -> Optional[float]:
-        """PDFLIP-E (user order 02.10.: D->P ends when ALL PP stages began P's
-        first forward, never at the leg-1 dispatch): fold one beacon reading in.
-        A rank whose forward_ct rose past its done snapshot began its first
-        forward after the flip at ``t_start`` (exact while the rise is 1; a
-        wider rise between two readings is marked approximate). Once every rank
-        of the snapshot rose: the LAST of those starts = the last PP stage's
-        first forward = the D->P end. Returns it (s) once known."""
+        """PDFLIP-E2 (user: D->P ends at the "PREFILL BATCH BEGINN"; NF y7l: the
+        span to the LAST stage's first forward is pipeline fill = prefill
+        compute, PP0 chunk 1 3.0-3.5 s, then PP1, then PP2): fold one beacon
+        reading in. A rank whose forward_ct rose past its done snapshot began
+        its first forward after the flip at ``t_start`` (exact while the rise is
+        1; a wider rise between two readings is marked approximate). The
+        EARLIEST such start = PP0's first forward = the D->P end
+        (``pp_first_ts``); once every rank rose, the latest = ``pp_last_ts``,
+        kept for the decomposition only. Returns ``pp_first_ts`` once known."""
         a = self._armed
         if a is None or not a.get("beacon_snap"):
             return None
         if a.get("pp_last_ts") is not None:
-            return a["pp_last_ts"]
+            return a.get("pp_first_ts")
         first = a.setdefault("beacon_first", {})
         for pid, (ct0, _ts0, _td0) in a["beacon_snap"].items():
             if pid in first:
@@ -435,17 +446,22 @@ class DpFlipClock:
             if row is None or int(row[0]) <= int(ct0):
                 continue
             first[pid] = (float(row[1]) / 1e9, int(row[0]) - int(ct0) > 1)
+        if first:
+            t0, ap0 = min(first.values(), key=lambda x: x[0])
+            if a.get("pp_first_ts") is None or t0 < a["pp_first_ts"]:
+                a["pp_first_ts"], a["pp_first_approx"] = t0, ap0
         if len(first) == len(a["beacon_snap"]):
             a["pp_last_ts"] = max(t for t, _ in first.values())
-            a["pp_last_approx"] = any(ap for _, ap in first.values())
-        return a.get("pp_last_ts")
+        return a.get("pp_first_ts")
 
     def first_prefill(self, rid: Optional[str], t_dispatch: float, t_end: float,
                       p_prefill_s: Optional[float]) -> Optional[dict]:
         """The first leg 1 after the flip finished: the event, or None.
 
-        PDFLIP-E: P's prefill start is the last PP stage's first forward
-        (``note_beacon``) -- ``prefill_start_source="pp_last_forward"``. Without
+        PDFLIP-E2: P's prefill start is the FIRST P rank's (PP0's) first forward
+        (``note_beacon``) -- ``prefill_start_source="pp_first_forward"``; the
+        last stage's start rides as ``pp_last_start_ts`` (pipeline fill counts
+        as prefill, not as flip). Without
         that reading the end is MISSING (``prefill_start_ts`` None, no
         ``flip_user_ms``): never the leg-1 dispatch (user: "DIE FALSCHE, ZU
         KLEINE ZAHL MUSS UEBERALL WEG")."""
@@ -453,11 +469,12 @@ class DpFlipClock:
         if a is None:
             return None
         self._armed = None
-        if a.get("pp_last_ts") is not None:
-            start = max(float(a["pp_last_ts"]), float(a["done_ts"] or a["pp_last_ts"]))
-            src = "pp_last_forward" + ("_approx" if a.get("pp_last_approx") else "")
+        if a.get("pp_first_ts") is not None:
+            start = max(float(a["pp_first_ts"]), float(a["done_ts"] or a["pp_first_ts"]))
+            src = "pp_first_forward" + ("_approx" if a.get("pp_first_approx") else "")
         else:
             start, src = None, "missing"
+        pp_last = a.get("pp_last_ts")
         done = a["done_ts"] if a["done_ts"] is not None else start
         idle = bool(a.get("idle_flip"))
         pre_begin_start = a["start_ts"]
@@ -472,6 +489,7 @@ class DpFlipClock:
                 "prefill_start_ts": None if start is None else round(start, 3),
                 "prefill_start_source": src,
                 "leg1_dispatch_ts": round(float(t_dispatch), 3),
+                "pp_last_start_ts": None if pp_last is None else round(float(pp_last), 3),
                 "flip_user_ms": ms(a["start_ts"], start),
                 "parts": {"park_rpc_ms": (None if a["park_rpc_ms"] is None else round(float(a["park_rpc_ms"]))),
                           "pre_begin_ms": ms(pre_begin_start, a["flip_begin_ts"]),

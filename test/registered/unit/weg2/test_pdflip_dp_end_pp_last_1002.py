@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""PDFLIP-E (user order 02.10.2026, both lines): FLIPZEIT D->P ends at the
-first forward of the LAST P stage (all PP stages have begun), never at the
-leg-1 dispatch. "NUR DIESE ZAHL ZAEHLT. DIE FALSCHE, ZU KLEINE ZAHL MUSS
+"""PDFLIP-E / E2 (user order 02.10.2026, both lines): FLIPZEIT D->P ends at the
+"PREFILL BATCH BEGINN" -- the first forward on PP0 after flip_done (E2, NF y7l:
+the span to the LAST stage's first forward is pipeline fill = prefill compute),
+never at the leg-1 dispatch. "NUR DIESE ZAHL ZAEHLT. DIE FALSCHE, ZU KLEINE ZAHL MUSS
 UEBERALL WEG."
 
 N5a 1002_114540 ep9: D->P done 11:49:06.227, the front dispatched leg 1 at once
@@ -42,25 +43,28 @@ def _clock(snap):
 SNAP = {11: (40, 90 * NS, 91 * NS), 12: (40, 90 * NS, 91 * NS), 13: (39, 90 * NS, 91 * NS)}
 
 
-def test_red_dp_ends_at_the_last_stage_first_forward_not_at_the_dispatch():
+def test_red_dp_ends_at_pp0_first_forward_not_at_the_dispatch():
     c = _clock(SNAP)
     assert c.waits_for_beacon()
-    # PP0 starts at 102.8 (store read), PP1 103.6, PP2 104.0
-    assert c.note_beacon({11: (41, int(102.8 * NS), 0), 12: (40, 90 * NS, 91 * NS), 13: (39, 90 * NS, 0)}) is None
-    assert c.note_beacon({11: (42, int(103.3 * NS), 0), 12: (41, int(103.6 * NS), 0), 13: (39, 90 * NS, 0)}) is None
+    # PP0 starts at 102.8 (after the store read), PP1 103.6, PP2 104.0 (pipeline fill)
+    assert c.note_beacon({11: (41, int(102.8 * NS), 0), 12: (40, 90 * NS, 91 * NS), 13: (39, 90 * NS, 0)}) == 102.8
+    assert c.waits_for_beacon()                            # still collecting the last stage
+    assert c.note_beacon({11: (42, int(103.3 * NS), 0), 12: (41, int(103.6 * NS), 0), 13: (39, 90 * NS, 0)}) == 102.8
     assert c.note_beacon({11: (43, int(103.9 * NS), 0), 12: (42, int(104.2 * NS), 0),
-                          13: (40, int(104.0 * NS), 0)}) == 104.0
+                          13: (40, int(104.0 * NS), 0)}) == 102.8
+    assert not c.waits_for_beacon()
     ev = c.first_prefill("weg2-7-9", 101.91, 106.0, 2.0)
-    assert ev["prefill_start_source"] == "pp_last_forward"
-    assert ev["prefill_start_ts"] == 104.0 and ev["leg1_dispatch_ts"] == 101.91
-    assert ev["flip_user_ms"] == 4000                      # flip begin 100.0 -> 104.0, not 1910 (dispatch)
-    assert ev["parts"]["first_chunk_ms"] == 2100           # done -> last stage's first forward
+    assert ev["prefill_start_source"] == "pp_first_forward"
+    assert ev["prefill_start_ts"] == 102.8 and ev["leg1_dispatch_ts"] == 101.91
+    assert ev["pp_last_start_ts"] == 104.0                 # decomposition: the fill is prefill
+    assert ev["flip_user_ms"] == 2800                      # flip begin 100.0 -> 102.8, not 1910 (dispatch)
+    assert ev["parts"]["first_chunk_ms"] == 900            # done -> PP0's first forward
 
 
 def test_red_a_wider_rise_between_readings_is_named_approximate():
     c = _clock({11: (40, 0, 0)})
     assert c.note_beacon({11: (43, int(103.0 * NS), 0)}) == 103.0
-    assert c.first_prefill("r", 102.0, 105.0, None)["prefill_start_source"] == "pp_last_forward_approx"
+    assert c.first_prefill("r", 102.0, 105.0, None)["prefill_start_source"] == "pp_first_forward_approx"
 
 
 def test_red_no_beacon_is_missing_never_the_dispatch():
@@ -71,11 +75,15 @@ def test_red_no_beacon_is_missing_never_the_dispatch():
     assert ev["flip_user_ms"] is None and ev["parts"]["first_chunk_ms"] is None
 
 
-def test_red_a_rank_that_never_rose_leaves_the_end_missing():
+def test_red_no_rank_rose_leaves_the_end_missing_and_a_partial_rise_has_no_pp_last():
+    c = _clock(SNAP)
+    c.note_beacon({11: (40, 90 * NS, 0), 12: (40, 90 * NS, 0), 13: (39, 90 * NS, 0)})
+    ev = c.first_prefill("r", 101.95, 105.0, 2.5)
+    assert ev["prefill_start_source"] == "missing" and ev["flip_user_ms"] is None
     c = _clock(SNAP)
     c.note_beacon({11: (41, int(102.8 * NS), 0), 12: (41, int(103.0 * NS), 0), 13: (39, 90 * NS, 0)})
     ev = c.first_prefill("r", 101.95, 105.0, 2.5)
-    assert ev["prefill_start_source"] == "missing" and ev["flip_user_ms"] is None
+    assert ev["prefill_start_source"] == "pp_first_forward" and ev["pp_last_start_ts"] is None
 
 
 def test_red_the_front_watches_the_beacon_and_fires_no_dispatch_first_work():
@@ -83,7 +91,7 @@ def test_red_the_front_watches_the_beacon_and_fires_no_dispatch_first_work():
 
     src = inspect.getsource(F.Front)
     assert '_ipc_first_work_seen("P", "p_leg1_dispatch"' not in src
-    assert 'Front._ipc_first_work_at(self, "P", "p_last_stage_forward"' in src
+    assert 'Front._ipc_first_work_at(self, "P", "p_first_stage_forward"' in src
     assert "beacon_snap=_bsnap" in src and "Front._watch_pp_last_forward(self)" in src
 
 
