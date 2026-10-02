@@ -139,14 +139,20 @@
   }
   // Phasen-Band unter jedem Modell-Diagramm: je Bucket der Zustand mit dem größten Anteil (history ph_*),
   // dieselben Farben/Muster wie die Phasenleiste der Boot-Karte (Nutzer 30.09.: idle ≠ flip ≠ Nachlauf)
-  const PH = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown"];
+  const PH = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "vis_load", "vis_enc", "vis_unload", "idle", "off", "unknown"];
   function phFill(ctx, k) {
-    const c = { P: C.s1, D: C.s2, dec: C.s3, flip_pd: C.s7, flip_dp: C.s5 }[k];
+    const c = { P: C.s1, D: C.s2, dec: C.s3, flip_pd: C.s7, flip_dp: C.s5, vis_enc: C.s4 }[k];
     if (c) return c;
     const t = document.createElement("canvas"), dpr = devicePixelRatio, n = Math.round(6 * dpr);
     t.width = n; t.height = n;
     const x = t.getContext("2d");
     x.fillStyle = k === "off" ? C.text2 : C.surface; x.fillRect(0, 0, n, n);
+    if (k === "vis_load" || k === "vis_unload") {
+      // Vision-Tower: laden = Streifen, entladen = blass (wie die Phasenleiste der Boot-Karte)
+      x.fillStyle = C.s4; x.globalAlpha = k === "vis_load" ? 1 : 0.4;
+      if (k === "vis_load") x.fillRect(0, 0, Math.round(n * 0.6), n); else x.fillRect(0, 0, n, n);
+      x.globalAlpha = 1;
+    }
     if (k === "flip_tail" || k === "unknown") {
       x.strokeStyle = k === "flip_tail" ? C.s7 : C.muted; x.lineWidth = 1.6 * dpr;
       x.beginPath(); x.moveTo(0, n); x.lineTo(n, 0); x.moveTo(-n / 2, n / 2); x.lineTo(n / 2, -n / 2); x.moveTo(n / 2, n * 1.5); x.lineTo(n * 1.5, n / 2); x.stroke();
@@ -492,7 +498,8 @@
   try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", rebuild); } catch (e) { /* old browser */ }
   // Legende der Phasen-Bänder: dieselben Klassen wie die Phasenleiste der Boot-Karte
   const PH_NAME = { P: "P-Prefill", D: "D-Prefill/Extend", dec: "D-Decode", flip_pd: "Flip P→D", flip_dp: "Flip D→P",
-    flip_tail: "Flip-Nachlauf", idle: "Leerlauf", off: "aus/lädt/tot", unknown: "unbekannt" };
+    flip_tail: "Flip-Nachlauf", vis_load: "Vision laden", vis_enc: "Vision rechnen", vis_unload: "Vision entladen",
+    idle: "Leerlauf", off: "aus/lädt/tot", unknown: "unbekannt" };
   const lgEl = $("vl-legend");
   if (lgEl) lgEl.innerHTML = "<b style=\"color:var(--text)\">Band unter den Diagrammen = Phase:</b>" + PH.map((k) =>
     `<span class="lg" style="display:inline-flex;align-items:center;gap:4px"><i class="ph-k-${k}" style="display:inline-block;width:18px;height:11px;border-radius:2px${k === "idle" ? ";--ic:var(--muted)" : ""}"></i>${PH_NAME[k]}</span>`).join("");

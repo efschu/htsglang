@@ -217,7 +217,8 @@ class TestPhaseStates(unittest.TestCase):
         for page in (html, rel):
             for k in activity.STATES:
                 self.assertIn(".ph-k-%s {" % k, page)
-            self.assertIn('const PHASE_ORDER = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown"]', page)
+            # the legend order IS the model's state list (02.10.: + vis_load/vis_enc/vis_unload)
+            self.assertIn("const PHASE_ORDER = [%s]" % ", ".join('"%s"' % k for k in activity.STATES), page)
 
 
 class TestIdenticalBurst(unittest.TestCase):

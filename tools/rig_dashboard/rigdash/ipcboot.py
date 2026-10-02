@@ -99,7 +99,33 @@ def compact(rec: dict) -> dict:
         "mamba_n": _n(cache.get("mamba_resume_n")), "l3inc_n": _n(cache.get("store_incomplete_n")),
         "pf_refused": _n(pf.get("refused")), "pf_timeout": _n(pf.get("timeout")),
         "cap_kv": _n(cap.get("kv_tokens")), "cap_seats": _n(cap.get("seats")),
+        "vis": vision_compact(rec.get("vision")),
     }
+
+
+#: runs of the vision block kept per sample (the rank keeps 32; a ring sample needs the newest few)
+VIS_KEEP = 6
+
+
+def vision_compact(v) -> Optional[dict]:
+    """rankstats ``vision`` (Nutzer 02.10.: Vision-Tower laden/rechnen/entladen in die Phasenliste;
+    writer weg2/rank_timing.note_vision_*): {runs, live{run, leg, since, rids}, recent[{run, ok, t0, t1,
+    rids, mib, legs{leg: [t0, t1]}}]}; None on a rank that never ran a tower stage."""
+    if not isinstance(v, dict):
+        return None
+    live = v.get("live") if isinstance(v.get("live"), dict) else None
+    rec = []
+    for r in (v.get("recent") or [])[-VIS_KEEP:]:
+        if not isinstance(r, dict) or not isinstance(r.get("legs"), dict):
+            continue
+        legs = {k: [float(x[0]), float(x[1])] for k, x in r["legs"].items()
+                if isinstance(x, (list, tuple)) and len(x) >= 2 and x[0] is not None and x[1] is not None}
+        rec.append({"run": r.get("run"), "ok": r.get("ok"), "t0": _n(r.get("t0")), "t1": _n(r.get("t1")),
+                    "rids": list(r.get("rids") or [])[:8], "mib": _n(r.get("tower_mib")), "legs": legs})
+    return {"runs": _n(v.get("runs")),
+            "live": None if live is None else {"run": live.get("run"), "leg": live.get("leg"),
+                                               "since": _n(live.get("since")), "rids": list(live.get("rids") or [])[:8]},
+            "recent": rec}
 
 
 def _front_small(front: dict) -> dict:
@@ -366,6 +392,33 @@ def series_view(m: "activity.Model", now: float, zoom: Optional[Tuple[float, flo
     return out
 
 
+def fmt_mib(v) -> str:
+    return ("%.0f" % float(v)) if v is not None else "?"
+
+
+#: the tower-stage phases (activity.VIS_LEGS): label for the phase list and the active frame
+VIS_NAME = {"vis_load": "Vision laden", "vis_enc": "Vision rechnen", "vis_unload": "Vision entladen"}
+
+
+def vis_annotate(x: dict, spans) -> None:
+    """A vis_* segment carries its stage: run, rids, tower MiB, the legs it covers (ms each) and
+    whether the stage is still running (IPC ``live``)."""
+    hit = [(s, e, k, r) for s, e, k, r in spans if k == x["k"] and s < x["e"] and e > x["s"]]
+    if not hit:
+        return
+    r = hit[-1][3]
+    x["run"] = r.get("run")
+    x["rids"] = list(r.get("rids") or [])
+    if r.get("mib") is not None:
+        x["mib"] = r["mib"]
+    legs = {leg: round((se[1] - se[0]) * 1e3) for leg, se in (r.get("legs") or {}).items()
+            if activity.VIS_LEGS.get(leg) == x["k"]}
+    if legs:
+        x["legs_ms"] = legs
+    if r.get("live"):
+        x["vis_live"] = r.get("leg")
+
+
 def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t0: Optional[float] = None) -> dict:
     """Phase bar = the data-backed segments of activity.Model (Nutzer 30.09.: idle, flip and tail must
     be told apart).  Time inside the window that no sample covers is "unknown" (rigdash did not watch),
@@ -386,11 +439,13 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
             x["n"] = 1
         if x["k"] == "idle":
             x["awake"] = m.awake_at(x["s"], awake_now)
+        if x["k"] in VIS_NAME:
+            vis_annotate(x, m.vision_spans(end))
         out.append(x)
         prev = max(prev, x["e"])
     if end > prev + 0.05:
         out.append({"s": prev, "e": end, "k": "unknown", "why": "noch keine zweite IPC-Probe"})
-    if live and out and out[-1]["k"] in ("P", "D", "dec"):
+    if live and out and (out[-1]["k"] in ("P", "D", "dec") or out[-1].get("vis_live")):
         out[-1]["running"] = True
     if live:
         for x in out[-2:]:
@@ -608,6 +663,11 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
         since = x["s"]
     if k in PHASE_LABEL:
         return {"k": k, "label": PHASE_LABEL[k], "sub": "", "since": since}
+    if k in VIS_NAME:
+        # the tower stage on P's PP0 (rankstats vision): live while ``live`` names a leg, else just done
+        rid = ", ".join(cur.get("rids") or [])
+        sub = "Tower %s MiB" % fmt_mib(cur.get("mib")) if cur.get("mib") is not None else "Tower-Stufe auf P/PP0"
+        return {"k": k, "label": VIS_NAME[k], "sub": sub + (" · " + rid if rid else ""), "since": since}
     if k == "idle":
         aw = cur.get("awake") or (front or {}).get("awake")
         return {"k": "idle", "label": "%s inaktiv" % (aw or "?"), "sub": "wach, keine Arbeit", "since": since, "awake": aw}

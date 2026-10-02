@@ -158,6 +158,10 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
 .ph-k-flip_pd { background: var(--s7); }
 .ph-k-flip_dp { background: var(--s5); }
 .ph-k-flip_tail { background: repeating-linear-gradient(135deg, var(--s7) 0 3px, color-mix(in srgb, var(--s7) 22%, var(--surface)) 3px 7px); }
+/* Vision-Tower (P/PP0, rankstats vision): laden = gestreift, rechnen = voll, entladen = blass -- eine Farbe (s4) */
+.ph-k-vis_load { background: repeating-linear-gradient(90deg, var(--s4) 0 4px, color-mix(in srgb, var(--s4) 40%, var(--surface)) 4px 7px); }
+.ph-k-vis_enc { background: var(--s4); }
+.ph-k-vis_unload { background: color-mix(in srgb, var(--s4) 40%, var(--surface)); box-shadow: inset 0 0 0 1px var(--s4); }
 .ph-k-idle { background: var(--surface); box-shadow: inset 0 0 0 1px var(--line), inset 0 -3px 0 var(--ic, transparent); }
 .ph-k-off { background: color-mix(in srgb, var(--text-2) 80%, var(--surface)); }
 .ph-k-unknown { background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--muted) 70%, var(--surface)) 0 2px, var(--surface-2) 2px 6px); }
@@ -686,8 +690,11 @@ function bsBadge(d, on) {
 
 // ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
 const PHASE = {P: ["P-Prefill"], D: ["D-Prefill/Extend"], dec: ["D-Decode"], flip_pd: ["Flip P→D"], flip_dp: ["Flip D→P"],
-  flip_tail: ["Flip-Nachlauf"], idle: ["Leerlauf"], off: ["aus/lädt/tot"], unknown: ["unbekannt"]};
-const PHASE_ORDER = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown"];
+  flip_tail: ["Flip-Nachlauf"], vis_load: ["Vision laden"], vis_enc: ["Vision rechnen"], vis_unload: ["Vision entladen"],
+  idle: ["Leerlauf"], off: ["aus/lädt/tot"], unknown: ["unbekannt"]};
+const PHASE_ORDER = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "vis_load", "vis_enc", "vis_unload", "idle", "off", "unknown"];
+const VIS_TIP = {vis_load: "Tower bauen + KV-Tail reservieren + Gewichte laden", vis_enc: "Bild-Encoder + Embeddings anh&auml;ngen",
+  vis_unload: "Tower abbauen, KV-Tail zur&uuml;ckgeben"};
 const phaseData = {};
 let phaseSpan = 0;
 try { phaseSpan = +localStorage.getItem("rigdash.phaseSpan") || 0; } catch (e) { phaseSpan = 0; }
@@ -703,6 +710,13 @@ function phaseTip(x, single) {
   const when = `${hhmm(x.s)}&ndash;${x.running ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
   if (x.k === "flip_pd" || x.k === "flip_dp") return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}<br>${when} <span class="muted">flip_begin bis flip_done (events.jsonl, Front-Uhr)</span>`;
   if (x.k === "flip_tail") return `<b>Flip-Nachlauf</b> &middot; ${dur(x.e - x.s)} &middot; flip_done bis zur ersten Arbeit (P&rarr;D: erstes Decode-Token, flip_first_work; D&rarr;P: P-Prefill-Start, flip_user_time)<br>${when}`;
+  if (VIS_TIP[x.k]) {
+    const legs = x.legs_ms ? Object.entries(x.legs_ms).map(([k, v]) => `${esc(k)} ${fmt(v)} ms`).join(", ") : "";
+    return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}${x.vis_live ? " &middot; l&auml;uft (" + esc(x.vis_live) + ")" : ""}<br>${when}`
+      + `<br>${VIS_TIP[x.k]}${legs ? " &middot; " + legs : ""}${x.mib != null ? " &middot; Tower " + fmt(x.mib) + " MiB" : ""}`
+      + `${(x.rids || []).length ? "<br>" + esc(x.rids.join(", ")) : ""}${x.run != null ? " &middot; Lauf " + esc(String(x.run)) : ""}`
+      + ` <span class="muted">(rankstats vision, P/PP0)</span>`;
+  }
   if (x.k === "idle") return `<b>Leerlauf</b>${x.awake ? " &middot; " + esc(x.awake) + " wach" : ""} &middot; keine Arbeit<br>${when} <span class="muted">belegt: queue 0, outstanding 0 (state.json front), kein Rang-Z&auml;hler bewegt sich</span>`;
   if (x.k === "off") return `<b>aus/l&auml;dt/tot</b> &middot; ${esc(x.why || "")}<br>${when} <span class="muted">state.json lifecycle</span>`;
   if (x.k === "unknown") return `<b>unbekannt</b> &middot; ${esc(x.why || "keinem Zustand zuordenbar")}<br>${when}`;
@@ -1478,7 +1492,8 @@ function rateOfPrefill(p, now) {
 }
 // Phase jetzt (Nutzer 01.10. ~08:20Z: "gerade beim Flippen sieht der Server aus, als würde nichts passieren"):
 // ipcboot.phase_now; der Sekundenzähler läuft im Browser je Sekunde weiter (tickSince), ohne Neuzeichnen
-const PH_CLS = {P: "ph-k-P", single: "ph-k-P", D: "ph-k-D", dec: "ph-k-dec", idle: "ph-k-idle", unknown: "ph-k-unknown"};
+const PH_CLS = {P: "ph-k-P", single: "ph-k-P", D: "ph-k-D", dec: "ph-k-dec", idle: "ph-k-idle", unknown: "ph-k-unknown",
+  vis_load: "ph-k-vis_load", vis_enc: "ph-k-vis_enc", vis_unload: "ph-k-vis_unload"};
 function phaseNowHtml(b, now) {
   const p = b.phase_now;
   if (!p) return "";

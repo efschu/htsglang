@@ -315,9 +315,40 @@ def spread(items, lo: float, n: int, step: float, key: str = "tok", excl=None) -
 
 #: the states of the phase bar (Nutzer 30.09. ~18Z: "idle sieht aus wie flip ... das muss eindeutig
 #: unterscheidbar sein").  Each comes from data; what no data explains is "unknown", never idle or flip.
-STATES = ("P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "idle", "off", "unknown")
+STATES = ("P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "vis_load", "vis_enc", "vis_unload",
+          "idle", "off", "unknown")
+#: Nutzer 02.10. ~11:00Z: "der visiontower laden rechnen entladen auch mit in die phasenliste" -- the
+#: transient tower stage on P's PP0 (rankstats ``vision``, legs with wall clock): laden = build + reserve
+#: + load, rechnen = encode + attach, entladen = teardown.  It runs in P's admission after the wake, so it
+#: sits inside the flip tail and before the P prefill: it wins over both.
+VIS_LEGS = {"build": "vis_load", "reserve": "vis_load", "load": "vis_load",
+            "encode": "vis_enc", "attach": "vis_enc", "teardown": "vis_unload"}
+VIS_PRIO = 0.5
 SAMPLE_GAP_S = 3.0      # two dashboard samples further apart: the time between is unobserved (unknown)
 RANK_GAP_S = 30.0       # two records of one rank further apart: the rank stalled or was gone -- not observed
+
+
+def vision_runs(ring) -> Tuple[List[dict], Optional[dict]]:
+    """Tower stages from the ranks' rankstats ``vision`` (compacted by ipcboot.vision_compact): every
+    finished run once (a rank keeps the newest runs, so one run sits in many samples), oldest first;
+    and the leg a stage is in right now (the newest sample's ``live``), else None."""
+    seen: Dict[Tuple, dict] = {}
+    live = None
+    for s in ring:
+        for k, r in (s.get("r") or {}).items():
+            v = r.get("vis") if isinstance(r, dict) else None
+            if not isinstance(v, dict):
+                continue
+            for run in v.get("recent") or []:
+                if run.get("t0") is None or not run.get("legs"):
+                    continue
+                seen[(_grp(k), run.get("run"), round(float(run["t0"]), 2))] = dict(run, group=_grp(k))
+    if ring:
+        for k, r in (ring[-1].get("r") or {}).items():
+            v = r.get("vis") if isinstance(r, dict) else None
+            if isinstance(v, dict) and isinstance(v.get("live"), dict):
+                live = dict(v["live"], group=_grp(k))
+    return sorted(seen.values(), key=lambda x: x["t0"]), live
 
 
 def _outstanding(front: dict) -> Optional[float]:
@@ -359,8 +390,26 @@ class Model:
         excl = list(self.flips) + [(s, e) for s, e, _ in self.tails()] + \
             [(c["s"], c["e"]) for c in self.pchunks.get("D", [])]
         self.dec = decode_intervals(self.ring, self.keys, dg, sorted(excl)) if dg else []
+        self.vis_runs, self.vis_live = vision_runs(self.ring)
 
     # --- phases -----------------------------------------------------------
+    def vision_spans(self, now: Optional[float] = None) -> List[Tuple[float, float, str, dict]]:
+        """(s, e, vis_*, run) per tower-stage leg; the running stage (``live``) up to ``now``."""
+        out = []
+        for r in self.vis_runs:
+            for leg, (s, e) in sorted(r["legs"].items(), key=lambda kv: kv[1][0]):
+                k = VIS_LEGS.get(leg)
+                if k is not None and e >= s:
+                    out.append((s, max(e, s + 1e-3), k, r))
+        lv = self.vis_live
+        end = now if now is not None else (self.ring[-1]["t"] if self.ring else None)
+        if lv and lv.get("since") is not None and end is not None and end > lv["since"] \
+                and not any(r.get("run") == lv.get("run") for r in self.vis_runs):
+            k = VIS_LEGS.get(lv.get("leg") or "")
+            if k is not None:
+                out.append((lv["since"], end, k, dict(lv, live=True)))
+        return out
+
     def tails(self) -> List[Tuple[float, float, str]]:
         """Flip tail = flip_done -> first work after it: P>D the first decode token (flip_first_work),
         D>P the P prefill start (flip_user_time, else flip_first_work's first work); what="none" has none."""
@@ -413,6 +462,8 @@ class Model:
                 raw.append((x["flip_begin_ts"], end_all, self._flip_kind(x.get("sleep"), x.get("wake")), 0))
         for s, e, _ in self.tails():
             raw.append((s, e, "flip_tail", 1))
+        for s, e, k, _ in self.vision_spans(now):
+            raw.append((s, e, k, VIS_PRIO))
         for g, cs in self.pchunks.items():
             k = "D" if g == "D" else "P"
             # a burst is one prefill phase: between two chunks of it the pipeline's other stages work
