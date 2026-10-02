@@ -475,7 +475,12 @@ class DcOffPath(CustomTestCase):
         fk = self._install({CARD: 1700})
 
         async def body():
-            f = _front(prefill_sid=11, decode_sid=22, dc_reserve={CARD: 2000}, **{ENV_DC: "1"})
+            # FLIP-LEGS 02.10.: the H78 form of the first-sleep reading (image
+            # awaited); the off-flip image has its own suite
+            # (test_weg2_flip_legs_first_sleep_image_1002.py) -- with it a flip
+            # right behind a first sleep settles that sample before its legs.
+            f = _front(prefill_sid=11, decode_sid=22, dc_reserve={CARD: 2000},
+                       **{ENV_DC: "1", "SGLANG_WEG2_DC_IMAGE_OFF_FLIP": "0"})
             loop_tid = threading.get_ident()
             with self.assertLogs(front_mod.logger, level=logging.INFO) as cm:
                 walls = await self._four_flips(f)

@@ -302,8 +302,11 @@ class TheFirstSleepLeavesTheLoop(_NoNvml):
         with open(self.path) as fh:
             return [e.get("group") for e in json.load(fh)["samples"]]
 
+    @mock.patch.dict(os.environ, {"SGLANG_WEG2_DC_IMAGE_OFF_FLIP": "0"})
     def test_switch_on_the_loop_stays_free_and_the_flip_skips_the_appends(self):
-        """RED before H78: 0.6 s of reading + 0.6 s per append on the loop and on the flip."""
+        """RED before H78: 0.6 s of reading + 0.6 s per append on the loop and on the flip.
+        FLIP-LEGS 02.10.: pinned to H78's awaited image (the off-flip image
+        has its own suite, test_weg2_flip_legs_first_sleep_image_1002.py)."""
         s = self._install({CARD: 1700})
         post_threads = []
         real_post = hl.read_flip_currency_gib

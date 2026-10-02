@@ -61,7 +61,7 @@ import subprocess
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from aiohttp import (
     ClientConnectionError,
@@ -3855,6 +3855,33 @@ CTL_KICK_AFTER_FLIP_ENV = "SGLANG_WEG2_CTL_KICK_AFTER_FLIP"
 #: and the sidecar appends (dormant image, flip ratchet) go to the FIFO writer
 #: (Front._sidecar_submit). Off = both exactly as before.
 DC_OFF_PATH_ENV = "SGLANG_WEG2_DC_OFF_PATH"
+#: FLIP-LEGS 02.10. (user: "die zeit verringern, die zwischen den wach phasen
+#: liegt"; N4p/N4q: total - (vorlauf + layer + nachlauf) = 1.49/1.52 s on the
+#: first D->P and 1.03/1.06 s on the first P->D of each boot, between the kv
+#: wake's answer and ``done`` -- FLIP-TIMELINE wake-kv@2992 dc@4511 against
+#: 23-45 ms on every later D->P): the dormant-image sample of a group's FIRST
+#: sleep walks /proc/<pid>/smaps of every process of the group (Pss of the
+#: anonymous shared mappings, host_ledger.image_shmem_bytes) and the flip
+#: awaited it. It gates nothing in this front -- it is the NEXT boot's ledger
+#: record -- so it now runs in a worker thread after the flip closed. W19's
+#: input (ps + nvidia-smi) stays on the flip. The sample must still see the
+#: group asleep: a flip that WAKES that group awaits the pending sample before
+#: its legs (Front._dormant_image_settled, named on the log). Unset = on;
+#: 0/false/no/off = the awaited form of H78, byte for byte.
+DC_IMAGE_OFF_FLIP_ENV = "SGLANG_WEG2_DC_IMAGE_OFF_FLIP"
+#: Upper bound of the settle wait before a waking leg (a smaps walk of ~60
+#: processes measured 1.0-1.5 s; past this the legs go on and the line says
+#: the sample may read a waking group).
+DORMANT_IMAGE_SETTLE_S = 30.0
+
+
+def dc_image_off_flip_on(env: Optional[Mapping[str, str]] = None) -> bool:
+    """FLIP-LEGS: the first-sleep dormant image off the flip (default on)."""
+    env = os.environ if env is None else env
+    raw = str(env.get(DC_IMAGE_OFF_FLIP_ENV, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 #: The controller's tick. Unchanged; with a kick switch on it is the UPPER
 #: bound of a wait, not its length.
 CTL_TICK_S = 0.2
@@ -4304,6 +4331,10 @@ class Front:
         # F1: the off-path readings in flight; held so the loop cannot drop a
         # task it only references weakly.
         self._dc_tasks: Set[asyncio.Task] = set()
+        # FLIP-LEGS: the first-sleep dormant image off the flip, and the sample
+        # still running per group (a flip that wakes that group settles it first).
+        self._dc_image_off_flip = dc_image_off_flip_on()
+        self._dormant_image_pending: Dict[str, asyncio.Task] = {}
         # FIX 4a (round 1), boot weg2sc1 LINK 1 -- D's CONCURRENCY IS A
         # TOKEN BUDGET, NOT ONLY A COUNT.
         #
@@ -6844,6 +6875,93 @@ class Front:
         rec = self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc, persist=False, l15_held_mib=l15_held_mib)
         return dc, rec
 
+    @staticmethod
+    def _first_sleep_residue(S: Group) -> Dict[str, int]:
+        """FLIP-LEGS: W19's input alone (``ps`` + ``nvidia-smi``), without
+        the dormant-image sample -- runs in a worker thread the flip awaits."""
+        pids = _session_pids(S.sid) if S.sid else set()
+        return _nvml_process_mib(pids) if pids else {}
+
+    def _dormant_image_off_flip_due(self, src: str) -> bool:
+        """FLIP-LEGS: does ``src``'s first-sleep image leave the flip?  Only
+        under H78 (``_dc_off_path``) with the switch on, and only while that
+        group has neither a sample nor one in flight."""
+        return (bool(getattr(self, "_dc_off_path", False))
+                and bool(getattr(self, "_dc_image_off_flip", False))
+                and src not in self.dormant_image
+                and src not in getattr(self, "_dormant_image_pending", {}))
+
+    def _start_dormant_image_off_flip(self, src: str, shmem_before: Optional[int],
+                                      dc: Dict[str, int],
+                                      l15_held_mib: Optional[Dict[str, int]]) -> "asyncio.Task":
+        """FLIP-LEGS: sample ``src``'s first-sleep image in a worker thread
+        after the flip; the record is the one the awaited form wrote (same
+        epoch stamp, same load witness -- both taken HERE, on the loop, at the
+        moment the awaited form took them), appended through the sidecar."""
+        epoch = int(self.epoch)
+        witness = {
+            "queued": len(self.queue),
+            "outstanding": sum(len(getattr(gr, "outstanding", ()) or ())
+                               for gr in self.groups.values()),
+        }
+        pending = self.__dict__.setdefault("_dormant_image_pending", {})
+        t0 = time.time()
+
+        async def _run() -> None:
+            rec = None
+            try:
+                rec = await asyncio.to_thread(
+                    self.sample_dormant_image, src, shmem_before, vram_residue_mib=dc,
+                    l15_held_mib=l15_held_mib, persist=False,
+                    sampled_at_flip_epoch=epoch, load_witness=witness)
+            except Exception as e:  # noqa: BLE001 -- an instrument never breaks serving
+                counters = getattr(self, "counters", None)
+                if counters is not None:
+                    counters["dormant_image_off_flip_failed"] += 1
+                logger.warning("WEG2-DORMANT-IMAGE-OFFFLIP epoch=%d group=%s sample FAILED: %s: %s "
+                               "-- no record for the next boot's ledger from this boot's first "
+                               "%s sleep", epoch, src, type(e).__name__, e, src)
+                return
+            finally:
+                pending.pop(src, None)
+            logger.info("WEG2-DORMANT-IMAGE-OFFFLIP epoch=%d group=%s sampled ms=%.0f record=%s "
+                        "(the first-sleep image, read in a worker thread after the flip closed; "
+                        "the flip awaited only W19's residue reading -- %s)",
+                        epoch, src, (time.time() - t0) * 1000.0,
+                        "none (already sampled)" if rec is None else "yes", DC_IMAGE_OFF_FLIP_ENV)
+            if rec is not None and self.measured_record:
+                self._sidecar_submit(self._persist_dormant_image, rec)
+
+        task = asyncio.ensure_future(_run())
+        pending[src] = task
+        logger.info("WEG2-DORMANT-IMAGE-OFFFLIP epoch=%d group=%s armed (the smaps walk of the "
+                    "group's processes leaves the flip; a flip that wakes %s settles it before "
+                    "its legs)", epoch, src, src)
+        return task
+
+    async def _dormant_image_settled(self, group: str) -> float:
+        """FLIP-LEGS: before ``group`` is woken, its first-sleep sample (if
+        still running) completes -- the image is read from a sleeping group or
+        not at all.  Returns the ms waited (0 when nothing was pending)."""
+        task = getattr(self, "_dormant_image_pending", {}).get(group)
+        if task is None or task.done():
+            return 0.0
+        t0 = time.time()
+        timed_out = False
+        try:
+            await asyncio.wait_for(asyncio.shield(task), DORMANT_IMAGE_SETTLE_S)
+        except asyncio.TimeoutError:
+            timed_out = True
+        except Exception:  # noqa: BLE001 -- the sample logs its own failure
+            pass
+        ms = (time.time() - t0) * 1000.0
+        logger.info("WEG2-DORMANT-IMAGE-OFFFLIP settle epoch=%d group=%s waited_ms=%.0f%s "
+                    "(the group wakes in this flip; its first-sleep sample was still reading)",
+                    self.epoch, group, ms,
+                    (" TIMED OUT after %.0f s -- the sample may read a waking group"
+                     % DORMANT_IMAGE_SETTLE_S) if timed_out else "")
+        return ms
+
     async def cleanup(self, app):
         for k in ("controller", "admitter", "health", "corridor", "flip_stall"):
             t = app.get(k)
@@ -6851,6 +6969,14 @@ class Front:
                 t.cancel()
         for t in list(getattr(self, "_dc_tasks", ())):  # 27B flipfast F1: readings still in flight
             t.cancel()
+        # FLIP-LEGS: a first-sleep image still reading lands (its record is the
+        # next boot's ledger input) before the sidecar writes are settled.
+        _img_pending = [t for t in getattr(self, "_dormant_image_pending", {}).values() if not t.done()]
+        if _img_pending:
+            try:
+                await asyncio.wait(_img_pending, timeout=DORMANT_IMAGE_SETTLE_S)
+            except Exception as e:  # noqa: BLE001 -- shutdown goes on
+                logger.error("WEG2-DORMANT-IMAGE-OFFFLIP not settled at cleanup: %r", e)
         # H78: sidecar appends still in the writer land before the front goes.
         try:
             await asyncio.wait_for(self._sidecar_writes_settled(), 30.0)
@@ -11556,7 +11682,9 @@ class Front:
     def sample_dormant_image(self, group: str, shmem_before: Optional[int],
                              vram_residue_mib: Optional[Dict[str, int]] = None,
                              l15_held_mib: Optional[Dict[str, int]] = None,
-                             persist: bool = True) -> Optional[dict]:
+                             persist: bool = True,
+                             sampled_at_flip_epoch: Optional[int] = None,
+                             load_witness: Optional[dict] = None) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
 
         The term boot weg2dk7 refuted: the ledger charged the weight-tag byte
@@ -11568,6 +11696,9 @@ class Front:
 
         ``persist=False`` (H78): the caller appends the record itself, through
         the sidecar writer (:meth:`_persist_dormant_image`), off the flip.
+        ``sampled_at_flip_epoch`` / ``load_witness`` (FLIP-LEGS): taken by a
+        caller that runs this in a worker thread AFTER the flip, at the moment
+        the awaited form read them; None = read here, as before.
         """
         if group in self.dormant_image:
             return None
@@ -11625,7 +11756,8 @@ class Front:
             # the epoch is what lets `run_origin_gib` mark the floor and
             # `predicted_run_peak_gib` refuse (W95) rather than add the same
             # bytes to the origin and to the charges.
-            sampled_at_flip_epoch=self.epoch,
+            sampled_at_flip_epoch=(self.epoch if sampled_at_flip_epoch is None
+                                   else int(sampled_at_flip_epoch)),
             vram_residue_mib=vram_residue_mib,
             vram_residue_form=self.weight_form,
             # RC1: D's residue belongs to its capture set (--max-running-requests
@@ -11633,7 +11765,7 @@ class Front:
             vram_residue_capture_bs=(getattr(self, "d_bs", None) if group == "D" else None),
             # YaRN x2 27B: D's residue names its context when it is not the rig's 262144 (launcher-given)
             vram_residue_context_tokens=(getattr(self, "d_residue_context_tokens", 0) or None) if group == "D" else None,
-            load_witness={
+            load_witness=load_witness if load_witness is not None else {
                 "queued": len(self.queue),
                 "outstanding": sum(
                     len(getattr(gr, "outstanding", ()) or ())
@@ -12132,6 +12264,10 @@ class Front:
         # the FLIP-ORDER line, for the next boot's P->D credit plan -- in the
         # H78 writer thread, never on the flip.
         self._note_pd_free0(src, dst, free_mib)
+        # FLIP-LEGS: the waking group's first-sleep image is read from a
+        # sleeping group -- a sample still in flight completes before its legs
+        # (0 ms unless this flip follows the first sleep within ~1.5 s).
+        await self._dormant_image_settled(dst)
         # FIX 2 round 2: the token names the BOOT and the flip, not the flip
         # alone -- see weg2_memory_saver.credit_epoch for the leftover counters
         # a bare flip index made this boot inherit.
@@ -12325,9 +12461,20 @@ class Front:
             # the flip AWAITS it -- the gate keeps its place, the loop is free
             # (x172-x175: 51-63 ms of ps + nvidia-smi + /proc on the loop). The
             # sidecar append (79-94 ms of JSON) goes to the writer, off the flip.
-            dc, _img = await asyncio.to_thread(self._first_sleep_reading, S, src, shmem_before, _l15_held)
-            if _img is not None and self.measured_record:
-                self._sidecar_submit(self._persist_dormant_image, _img)
+            if self._dormant_image_off_flip_due(src):
+                # FLIP-LEGS: the flip awaits W19's residue reading only; the
+                # smaps walk of the image (1.0-1.5 s, N4p/N4q first flips)
+                # runs after the flip, settled before this group's next wake.
+                _t_res = time.time()
+                dc = await asyncio.to_thread(self._first_sleep_residue, S)
+                logger.info("WEG2-DORMANT-IMAGE-OFFFLIP epoch=%d group=%s residue_ms=%.0f cards=%d "
+                            "(W19's reading, on the flip)", self.epoch, src,
+                            (time.time() - _t_res) * 1000.0, len(dc))
+                self._start_dormant_image_off_flip(src, shmem_before, dc, _l15_held)
+            else:
+                dc, _img = await asyncio.to_thread(self._first_sleep_reading, S, src, shmem_before, _l15_held)
+                if _img is not None and self.measured_record:
+                    self._sidecar_submit(self._persist_dormant_image, _img)
         else:
             pids = _session_pids(S.sid) if S.sid else set()
             dc = _nvml_process_mib(pids) if pids else {}
@@ -13767,7 +13914,13 @@ class Front:
         Every later reading is instrumentation (the WEG2-DC lines and the flip
         record's ``dc_mib``), and it still lands, from a worker thread.
         """
-        if not getattr(self, "_dc_off_path", False) or src not in self.dormant_image:
+        # FLIP-LEGS: a first-sleep image still reading off the flip counts as
+        # taken (it lands before the group's next wake).
+        if not getattr(self, "_dc_off_path", False):
+            return False
+        sampled = (src in getattr(self, "dormant_image", {})
+                   or src in getattr(self, "_dormant_image_pending", {}))
+        if not sampled:
             return False
         return src != "D" or bool(self.dc_measured_d)
 
