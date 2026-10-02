@@ -32,6 +32,7 @@ PREFILL_KEYS = {"chunks", "new_tokens", "cached_tokens", "gpu_ms", "split_ms",
 DECODE_KEYS = {"rounds", "gpu_ms", "gpu_ms_by_bs", "tokens", "running",
                "accept_len_ewma", "accept_rate_ewma", "cuda_graph",
                "last_bs"}  # 30.09. FEHLT 6
+DECODE_KEYS = DECODE_KEYS | {"last_t"}  # 02.10. FLIPZEIT decode.last_t
 CACHE_KEYS = {"loadback_n", "loadback_tok", "mamba_resume_n", "mamba_tok",
               "store_incomplete_n", "prefetch",
               "store_incomplete_delivered", "store_incomplete_deliverable"}  # 30.09. FEHLT 5
