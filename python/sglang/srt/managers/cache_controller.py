@@ -4333,9 +4333,20 @@ class HiCacheController:
             pool_transfers = self._presence_pool_transfers()
             if pool_transfers:
                 try:
+                    # THE WHOLE CHAIN, never the first STORAGE_BATCH_SIZE keys
+                    # (gmps13/gmps14, dual D: `#1028B FETCH CAP kv=1024
+                    # claimed=0 keys=1024 anchors_in_range mamba (0, -1)`). The
+                    # v2 answer is capped to the last page that carries a mamba
+                    # anchor, and a P hand-back tail carries ONE -- its end
+                    # anchor at N-1. With the chain cut to the batch, every tail
+                    # longer than the batch had its anchor outside the question:
+                    # the KV pages were all there and the probe said 0, for ever
+                    # (16 hand-backs deferred 21 s each and then re-prefilled on
+                    # P). `_storage_hit_query` -- the fetch this probe stands in
+                    # for -- asks the whole span in one call; so does this.
                     return int(
                         self.storage_backend.batch_exists_v2(
-                            batch, pool_transfers, extra_info
+                            page_hashes, pool_transfers, extra_info
                         ).kv_hit_pages
                         or 0
                     )
