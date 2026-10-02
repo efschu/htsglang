@@ -141,8 +141,11 @@ def open_session(*, rid: str, prompt_len: int, hint: dict, d0: dict, geom,
     if not int(dep["a0"]) <= a < int(dep["a1"]):
         mapper.close()
         return "anchor row %d outside [%s,%s)" % (a, dep["a0"], dep["a1"])
+    skip = sorted({int(x) for x in dep.get("skip_ranks", ())}
+                  | {int(x) for x in d0.get("cap0", ())})
     try:
-        shares = {r: fetch(r) for r in range(int(n_d_ranks))}
+        # the cap-0 ranks publish no share: nothing is deposited there
+        shares = {r: fetch(r) for r in range(int(n_d_ranks)) if r not in skip}
     except L15ShareError as exc:
         mapper.close()
         return "share: %s" % exc
@@ -155,7 +158,7 @@ def open_session(*, rid: str, prompt_len: int, hint: dict, d0: dict, geom,
         _close(old, failed="re-admitted")
     _SESSIONS[rid] = DepositSession(
         rid=rid, epoch=int(d0["epoch"]), e_start=e_start, n=n, anchor_row=a,
-        skip_ranks=tuple(int(x) for x in dep.get("skip_ranks", ())),
+        skip_ranks=tuple(skip),
         geom=geom, shares=shares, mapper=mapper, directory=directory,
         stage_key=stage_key, log=log)
     log("L15-DEPOSIT-OPEN rid=%s stage=%s e_start=%d n=%d anchor_row=%d skip=%s"
@@ -175,15 +178,12 @@ def open_for_sched(sched, req, env, log) -> Optional[str]:
     hint = l15_deposit.read_deposit_hint(directory, rid)
     if hint is None:
         return None
+    from sglang.srt.weg2.l15_share_admit import _first_share
+
     try:
-        d0, f0 = l15_share_publish.fetch_share(directory, 0)
+        d0 = _first_share(directory, l15_share_publish.fetch_share)
     except L15ShareError as exc:
         return "share: %s" % exc
-    for f in f0:
-        try:
-            os.close(f)
-        except OSError:
-            pass
     geom = stage_geometry(sched, d0)
     if isinstance(geom, str):
         return geom
