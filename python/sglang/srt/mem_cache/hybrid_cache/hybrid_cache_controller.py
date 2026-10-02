@@ -111,6 +111,7 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.managers.cache_controller import split_host_state_pools
 from sglang.srt.mem_cache import hicache_write_path
+from sglang.srt.mem_cache.hybrid_cache import mamba_load_dedup as _mld
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -911,6 +912,9 @@ class HybridCacheController(BaseHiCacheController):
         # and the draft half is skipped by name when the window pool cannot
         # hold this load (an over-threshold context DFLASH will not serve).
         draft_rows, draft_host_rows, draft_rows_skipped = None, None, False
+        # DP-NACHLAUF: one host mamba state loaded once (mamba_load_dedup)
+        load_transfers, _dups = _mld.split_for(self.mem_pool_host, resolved_pool_transfers)
+        _dup_layers = 0
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             # upstream #36738 (see HiCacheController.start_loading): the H2D
@@ -927,9 +931,10 @@ class HybridCacheController(BaseHiCacheController):
                     kv_device_indices,
                     i,
                     self.io_backend,
-                    pool_transfers=resolved_pool_transfers,
+                    pool_transfers=load_transfers,
                 )
                 _sl_kv_ms += (time.perf_counter() - _sl_a) * 1000.0
+                _dup_layers += _mld.copy_dups(self.mem_pool_host, _dups, i)
                 if (
                     self.draft_tier_armed("load")
                     and host_indices.numel() > 0
@@ -959,6 +964,8 @@ class HybridCacheController(BaseHiCacheController):
             self._record_transfer_indices_on_stream(
                 self.load_stream, kv_host_indices, kv_device_indices
             )
+        if _dups:
+            _mld.note(_dups, _dup_layers)
         self.ack_load_queue.append(
             HiCacheAck(
                 producer_event.start_event,
