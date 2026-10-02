@@ -391,6 +391,12 @@ class TokenSpans:
         # until D confirms it afresh. Beside ``entries``, its tuple unchanged.
         self.seq = 0
         self.entry_seq: Dict[str, int] = {}
+        #: D-INFLIGHT (X-CREDIT-INFLIGHT-1002): key -> rid of the D leg 2 whose
+        #: FIRST CONTENT recorded the entry (:meth:`record_d_inflight`) and
+        #: whose finish reading has not replaced it yet; rid -> key beside it.
+        #: Only these entries price as ``d_inflight``.
+        self.inflight_keys: Dict[str, str] = {}
+        self.inflight_rid: Dict[str, str] = {}
 
     @staticmethod
     def _key(ids: np.ndarray) -> str:
@@ -417,6 +423,7 @@ class TokenSpans:
         key = self._key(ids)
         self.entries.pop(key, None)
         self.depth_caps.pop(key, None)
+        self._unflag_inflight(key)  # D-INFLIGHT: the finish reading replaces it
         if not self.agent_span:
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
@@ -489,6 +496,97 @@ class TokenSpans:
             old_key, _ = self.entries.popitem(last=False)
             self.depth_caps.pop(old_key, None)
             self.entry_seq.pop(old_key, None)
+            self._unflag_inflight(old_key)
+
+    # -- D-INFLIGHT (X-CREDIT-INFLIGHT-1002) ----------------------------------
+    def _unflag_inflight(self, key: str) -> None:
+        rid = self.inflight_keys.pop(key, None)
+        if rid is not None and self.inflight_rid.get(rid) == key:
+            self.inflight_rid.pop(rid, None)
+
+    def record_d_inflight(self, rid: str, ids: Optional[np.ndarray],
+                          prompt_tokens: int = 0) -> int:
+        """D-INFLIGHT: D produced the FIRST CONTENT of ``rid``'s leg 2, so the
+        prompt is realised on D while that leg still decodes -- a D reading,
+        not a text guess. NF boot ...10020634 (5b46b8842e): weg2-12-20 (31566
+        tokens) was handed to D at 06:39:51 ('#988 LOADBACK ... anchor_depth=
+        31552', '#59b PARK-RESUMABLE weg2-12-20=31552') and decoded until
+        06:40:44; weg2-14-23 (31723 tokens, same 31566 prefix) was priced at
+        06:39:53 against the only FINISHED reading, 19968 -> pending 11755,
+        LONG, flip pair, P prefilled 171. The in-flight anchor is the page
+        floor of the prompt (``own_anchor``): P's END-ANCHOR an after_p leg
+        resumed from (``prompt_tokens`` = P's leg-1 prompt), D's own #1469
+        RETAIN of a prompt it prefilled ('RETAIN is_finished=False
+        token_ids_len=19580 cache_len=19520 value=True'). It is the entry's
+        credit AND its #59 cap, so ANCHOR-LOST retracts it like any reading.
+
+        An existing entry of this text that already credits at least the
+        anchor stands untouched (0 returned). The finish's
+        :meth:`record_presence` replaces the entry with D's measurement;
+        :meth:`end_d_inflight` retracts it when the leg ends without one;
+        :meth:`park_cap` lowers it to D's #59b park depth. Returns the anchor
+        recorded (0 = none)."""
+        if ids is None or ids.size == 0:
+            return 0
+        n = int(ids.size)
+        if int(prompt_tokens or 0) > 0:
+            n = min(n, int(prompt_tokens))
+        anchor = self.own_anchor(n)
+        if anchor <= 0:
+            return 0
+        key = self._key(ids)
+        old = self.entries.get(key)
+        if old is not None:
+            cap = self.depth_caps.get(key)
+            have = int(old[1]) if cap is None else min(int(old[1]), int(cap))
+            if have >= anchor:
+                return 0
+        self.entries.pop(key, None)
+        pt, held = (int(old[2]), old[3]) if old is not None else (0, None)
+        self.entries[key] = (ids, anchor, pt, held)
+        self.depth_caps[key] = anchor
+        self._unflag_inflight(key)
+        old_key = self.inflight_rid.pop(str(rid), None)
+        if old_key is not None and old_key != key and self.inflight_keys.get(old_key) == str(rid):
+            self.inflight_keys.pop(old_key, None)
+        self.inflight_keys[key] = str(rid)
+        self.inflight_rid[str(rid)] = key
+        self._stamp(key)
+        return anchor
+
+    def end_d_inflight(self, rid: str) -> int:
+        """D-INFLIGHT: ``rid``'s leg 2 ended. If its in-flight entry was not
+        replaced by a finish reading (no usage: an abort, a failed stream),
+        the entry is retracted -- only realised D readings credit. Returns
+        the anchor retracted (0 = nothing)."""
+        key = self.inflight_rid.pop(str(rid), None)
+        if key is None or self.inflight_keys.get(key) != str(rid):
+            return 0
+        self.inflight_keys.pop(key, None)
+        old = self.entries.pop(key, None)
+        self.depth_caps.pop(key, None)
+        self.entry_seq.pop(key, None)
+        return int(old[1]) if old is not None else 0
+
+    def park_cap(self, rid: str, depth: int) -> Optional[Tuple[int, int]]:
+        """D-INFLIGHT x #59b: D parked ``rid`` and named the depth it resumes
+        from (``weg2_resumable_depth`` of the park answer). An in-flight entry
+        is capped there (never raised past its own anchor); 0 retracts it.
+        Returns (old credit, new credit), or None when ``rid`` has no
+        in-flight entry."""
+        key = self.inflight_rid.get(str(rid))
+        if key is None or self.inflight_keys.get(key) != str(rid) or key not in self.entries:
+            return None
+        ids, ct, pt, held = self.entries[key]
+        old = int(self.depth_caps.get(key, ct))
+        new = max(0, min(old, int(depth)))
+        if new <= 0:
+            self.end_d_inflight(rid)
+            return old, 0
+        if new < old:
+            self.entries[key] = (ids, min(int(ct), new), pt, held)
+            self.depth_caps[key] = new
+        return old, new
 
     def record_inflight(self, ids: Optional[np.ndarray], held_epoch: Optional[int]) -> None:
         if ids is None or ids.size == 0 or held_epoch is None:
@@ -544,5 +642,6 @@ class TokenSpans:
             credit = divergence_credit(raw, ct, cap, lcp)
             if credit > best:
                 best = credit
-                src = "d_served_epoch" if held and credit > ct else "d_leg2_cached"
+                src = ("d_served_epoch" if held and credit > ct
+                       else "d_inflight" if key in self.inflight_keys else "d_leg2_cached")
         return max(0, int(ids.size) - best), best, known, src

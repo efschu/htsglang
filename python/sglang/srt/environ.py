@@ -1696,6 +1696,15 @@ class Envs:
     # and stays on D. Line 'WEG2 P-ANCHOR-PRESENCE'. Off = no record (#1324:
     # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
     SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(False)
+    # X-CREDIT-INFLIGHT-1002 (Weg-2 front, X-EXACT): at the first content of
+    # ANY D leg 2 (after_p, d_direct, d_single, a drained SHORT) the prompt's
+    # page-floor anchor is recorded as a D presence of that in-flight leg
+    # (presence_src=d_inflight), so a follow-up turn priced while its
+    # predecessor still decodes on D is credited with it. Replaced by the
+    # finish reading, capped by the #59b park depth, retracted when the leg
+    # ends without one and by ANCHOR-LOST. Line 'WEG2 PRESENCE-INFLIGHT'.
+    # Off = no record (the 5b46b8842e price).
+    SGLANG_WEG2_ENABLE_D_INFLIGHT_PRESENCE = EnvBool(True)
     # The page grain of that end anchor (the store page, ArenaMHAHostPool #107).
     SGLANG_WEG2_FRONT_ANCHOR_PAGE = EnvInt(64)
     # H102 (Weg-2 front): a per-request watcher sees the client's connection

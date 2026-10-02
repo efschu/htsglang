@@ -679,8 +679,30 @@ def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
         if (cap is not None and int(cap) in lost) or (cap is None and ct in lost):
             entries.pop(key, None)
             caps.pop(key, None)
+            unflag = getattr(spans, "_unflag_inflight", None)  # D-INFLIGHT
+            if unflag is not None:
+                unflag(key)
             gone.append(key)
     return gone
+
+
+def park_resumable_depths(body: str) -> Dict[str, int]:
+    """#59b: ``{rid: depth}`` of D's park answer (``weg2_resumable_depth``,
+    http_server ``/weg2/park_running``); {} when absent or unreadable."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return {}
+    got = payload.get("weg2_resumable_depth") if isinstance(payload, dict) else None
+    if not isinstance(got, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for rid, d in got.items():
+        try:
+            out[str(rid)] = max(0, int(d))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
@@ -4959,6 +4981,8 @@ class Front:
             return "failed"
         known = [r for r in rids if r in D.outstanding]
         unknown = [r for r in rids if r not in D.outstanding]
+        # X-CREDIT-INFLIGHT-1002: the park's #59b depths cap in-flight presence.
+        self._d_inflight_park(park_resumable_depths(text))
         # H91c3-2: a hand-off already in ``D.outstanding`` whose leg 2 had not
         # reached D's scheduler when the park came (tokenizer / HTTP pipe) is
         # in neither of D's lists. A D that answers ``late_hold`` holds every
@@ -5876,6 +5900,75 @@ class Front:
                     rid, anchor, p_pt, int(ids.size), self.epoch)
         self._x_exact_reprice_queue("p_anchor")
         return anchor
+
+    def _d_inflight_presence(self, rid: str, text: str, pending: Any, via: str) -> int:
+        """X-CREDIT-INFLIGHT-1002 (switch SGLANG_WEG2_ENABLE_D_INFLIGHT_PRESENCE).
+
+        NF boot ...10020634 (5b46b8842e): 16 of 30 P leg-1s prefilled 150-2700
+        tokens (< X) but were priced over X, because the credit (#1324) took
+        only FINISHED D readings while the prefix sat on D under a leg 2 still
+        decoding. weg2-14-23: 'X-EXACT-PRICE pending=11755 tokens=31723
+        credit=19968 src=d_leg2_cached ... reused=31566' -> LONG, flip pair,
+        P prefilled 171, TTFT 8.7 s; weg2-12-20 (31566) had produced its
+        first content on D at 06:39:51.9 and finished only at 06:40:44.
+
+        Called at the first content of a D leg 2: D holds the prompt now (it
+        read P's END-ANCHOR or prefilled it itself). Records the page-floor
+        anchor (P's leg-1 prompt for an after_p leg) as ``d_inflight``
+        presence and re-prices the queue. Returns the anchor (0 = none)."""
+        if (not getattr(self, "x_exact", False) or getattr(self, "tspans", None) is None
+                or getattr(self, "ftok", None) is None):
+            return 0
+        ids = self.ftok.ids_for(text)
+        if ids is None:
+            self.counters["presence_d_inflight_no_ids"] += 1
+            return 0
+        p_pt = int(getattr(pending, "leg1_prompt_tokens", 0) or 0) if pending is not None else 0
+        anchor = self.tspans.record_d_inflight(rid, ids, p_pt)
+        if anchor <= 0:
+            return 0
+        self.counters["presence_d_inflight"] += 1
+        self.counters["presence_d_inflight_tokens"] += anchor
+        logger.info("WEG2 PRESENCE-INFLIGHT rid=%s via=%s anchor=%d tokens_front=%d p_prompt=%d "
+                    "epoch=%d presence_src=d_inflight (D produced this leg 2's first content: "
+                    "the prompt's end anchor is realised on D while it decodes; replaced by "
+                    "the finish reading, capped by a #59b park depth, retracted when the "
+                    "leg ends without one or by ANCHOR-LOST)",
+                    rid, via, anchor, int(ids.size), p_pt, self.epoch)
+        self._x_exact_reprice_queue("d_inflight")
+        return anchor
+
+    def _d_inflight_end(self, rid: str) -> None:
+        """D-INFLIGHT: the leg 2 of ``rid`` ended; an in-flight entry no
+        finish reading replaced is retracted (only realised readings credit)."""
+        ts = getattr(self, "tspans", None)
+        if ts is None or not hasattr(ts, "end_d_inflight"):
+            return
+        gone = ts.end_d_inflight(rid)
+        if gone > 0:
+            self.counters["presence_d_inflight_retracted"] += 1
+            logger.info("WEG2 PRESENCE-INFLIGHT-END rid=%s retracted anchor=%d (the leg 2 ended "
+                        "without D's finish reading -- no realised presence stands for it)",
+                        rid, gone)
+
+    def _d_inflight_park(self, depths: Dict[str, int]) -> None:
+        """D-INFLIGHT x #59b: D's park answer names the depth each parked
+        request resumes from -- a realised in-flight D reading. An in-flight
+        entry is capped there; 0 retracts it."""
+        ts = getattr(self, "tspans", None)
+        if not depths or ts is None or not hasattr(ts, "park_cap"):
+            return
+        changed = 0
+        for rid, depth in depths.items():
+            got = ts.park_cap(rid, depth)
+            if got is None or got[0] == got[1]:
+                continue
+            changed += 1
+            self.counters["presence_d_inflight_park_capped"] += 1
+            logger.info("WEG2 PRESENCE-INFLIGHT-PARK rid=%s credit %d -> %d (D's #59b park "
+                        "depth=%d: the parked leg resumes from there)", rid, got[0], got[1], depth)
+        if changed:
+            self._x_exact_reprice_queue("d_inflight_park")
 
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
                         held_epoch: Optional[int], resumable_depth: Optional[int] = None) -> None:
@@ -6846,6 +6939,10 @@ class Front:
                 "own_text_clamped_tokens": int(self.counters["presence_own_text_clamped_tokens"]),
                 "p_anchor_presence": int(self.counters["p_anchor_presence"]),
                 "p_anchor_presence_tokens": int(self.counters["p_anchor_presence_tokens"]),
+                "d_inflight": int(self.counters["presence_d_inflight"]),
+                "d_inflight_tokens": int(self.counters["presence_d_inflight_tokens"]),
+                "d_inflight_retracted": int(self.counters["presence_d_inflight_retracted"]),
+                "d_inflight_park_capped": int(self.counters["presence_d_inflight_park_capped"]),
             },
             "corridor_min_mib": {k: dict(v) for k, v in self.corridor_min.items()},
             # Same instrument and band as the WEG2-CORRIDOR log line: a reader
@@ -7358,6 +7455,9 @@ class Front:
             # so the line stays rc2.1l's byte for byte when it is off.
             ("; #49 d_served_epoch = prompt_tokens of a text D served in this epoch"
              if getattr(self.spans, "agent_span", False) else "")
+            # X-CREDIT-INFLIGHT-1002: named only on a d_inflight verdict
+            + ("; d_inflight = the end anchor of a prompt a still-decoding D leg 2 "
+               "holds (realised at its first content)" if presence_src == "d_inflight" else "")
             + (X_EXACT_VERDICT_NOTE if _xx is not None else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
@@ -9332,6 +9432,11 @@ class Front:
                     Front._rb_changed(self)
                     # DASHBOARD-AUS-IPC (a): D's first content after a P->D flip = first decode token.
                     self._ipc_first_work_seen("D", "decode_token", rid)
+                    # X-CREDIT-INFLIGHT-1002: the prompt is realised on D now;
+                    # before the #49 record below, which keeps this anchor.
+                    if (getattr(self, "x_exact", False)
+                            and envs.SGLANG_WEG2_ENABLE_D_INFLIGHT_PRESENCE.get()):
+                        self._d_inflight_presence(rid, text, pending, _via)
                 if _has_content and front_span_inflight() and self.spans.agent_span:
                     # #49 rest: D has produced this leg's first content, so it
                     # has PREFILLED the whole prompt into its radix, where a
@@ -9744,6 +9849,7 @@ class Front:
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         finally:
             g.outstanding.pop(rid, None)
+            self._d_inflight_end(rid)  # X-CREDIT-INFLIGHT-1002
             Front._req_book(self).leg2_end(rid, time.time())  # DASHBOARD-IPC: front.d_activity
             Front._rb_changed(self)
             # H91 part C: a parked request that ends (served, aborted, failed)
