@@ -81,7 +81,8 @@ def test_switch_default_on():
 
 def test_switch_off_keeps_the_mean(caplog):
     ns = _front()
-    with envs.SGLANG_WEG2_X_K_FLIP.override(False), \
+    # RELEASE-INTEG: the boot-mean form is PDFLIP-X's excursion price off as well (pd-flip: on)
+    with envs.SGLANG_WEG2_X_K_FLIP.override(False), envs.SGLANG_WEG2_X_EXCURSION_PRICE.override(False), \
             envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), envs.SGLANG_WEG2_X_COST_MAX_STEP.override(10.0), \
             caplog.at_level(logging.INFO):
         x = F.Front._resolve_x_cost_line(ns)
@@ -92,7 +93,10 @@ def test_switch_off_keeps_the_mean(caplog):
 
 def test_a_lone_2_9k_request_goes_to_d(caplog):
     ns = _front()
-    with envs.SGLANG_WEG2_X_K_FLIP.override(True), envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), \
+    # RELEASE-INTEG: the X-K-FLIP k_src line is pinned with PDFLIP-X's excursion price off (on, the
+    # same lone X is named 'not-divided(...)' -- test_pdflip_x_excursion_1002)
+    with envs.SGLANG_WEG2_X_K_FLIP.override(True), envs.SGLANG_WEG2_X_EXCURSION_PRICE.override(False), \
+            envs.SGLANG_WEG2_ENABLE_X_COST_LINE.override(True), \
             envs.SGLANG_WEG2_X_COST_MAX_STEP.override(10.0), caplog.at_level(logging.INFO):
         x = F.Front._resolve_x_cost_line(ns)
         route, x_route = _route(ns, 2900)

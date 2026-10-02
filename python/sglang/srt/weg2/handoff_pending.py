@@ -89,6 +89,13 @@ PENDING = "pending"
 LOST = "lost"
 #: #248: the marks of D's parked / held rids (the chain inside the mark)
 PARK = "park"
+#: PDFLIP-H (02.10.): tombstones of rids the front ENDED (its rid-end drop); a
+#: mark written after its rid's end is refused by name
+ENDED = "ended"
+#: drop reasons that are NOT a rid end (the rid lives on and P may mark it again)
+NON_TERMINAL_DROPS = ("reroute",)
+#: tombstones older than the expire bound are pruned every this many drops
+ENDED_PRUNE_EVERY = 64
 #: keep roles: a P hand-off waiting for its seat, a D request that does not run
 ROLE_HANDOFF = "handoff"
 ROLE_PARK = "park"
@@ -168,8 +175,9 @@ def mark(rid: str, pages: int, page_size: int = 0) -> bool:
     if not d:
         return False
     _unlink(os.path.join(_sub(LOST), f"{rid}.json"))
-    return _write_atomic(os.path.join(d, rid), {
+    ok = _write_atomic(os.path.join(d, rid), {
         "t": time.time(), "pages": int(pages), "page_size": int(page_size), "pid": os.getpid()})
+    return ok and not _refuse_if_ended(rid, PENDING)
 
 
 def mark_park(rid: str, page_keys, page_size: int = 0, page_range=None) -> bool:
@@ -197,7 +205,8 @@ def mark_park(rid: str, page_keys, page_size: int = 0, page_range=None) -> bool:
            "pid": os.getpid(), "role": ROLE_PARK}
     if rng is not None:
         rec["range"] = [int(rng[0]), int(rng[1])]
-    return _write_atomic(os.path.join(d, rid), rec)
+    ok = _write_atomic(os.path.join(d, rid), rec)
+    return ok and not _refuse_if_ended(rid, PARK)
 
 
 def _norm_range(page_range, n: int):
@@ -260,11 +269,67 @@ def consume(rid: str, where: str, **kv) -> bool:
         return False
 
 
+def _ended_path(rid: str) -> str:
+    d = _sub(ENDED)
+    return os.path.join(d, str(rid)) if d and rid else ""
+
+
+def _refuse_if_ended(rid: str, where: str) -> bool:
+    """PDFLIP-H: the mark just written belongs to a rid the front already
+    ended -> remove it again (True). Write-then-check against the drop's
+    tombstone-then-unlink: whichever of the two runs second removes the mark,
+    so no interleaving -- and no PP/TP rank order, the state is the one shared
+    file -- leaves an orphan."""
+    p = _ended_path(rid)
+    if not p or not os.path.exists(p):
+        return False
+    if _unlink(os.path.join(_sub(where), str(rid))):
+        logger.warning("#243 HANDOFF-PENDING REFUSED-ENDED rid=%s role=%s (the front ended this rid before "
+                       "the mark was written -- e.g. client gone during P's leg 1, P published after the "
+                       "rid-end drop; without this the mark would keep its pages for the whole expire "
+                       "bound)", rid, ROLE_PARK if where == PARK else ROLE_HANDOFF)
+    return True
+
+
+_DROPS = [0]
+
+
+def _tombstone(rid: str) -> None:
+    p = _ended_path(rid)
+    if not p:
+        return
+    _write_atomic(p, {"t": time.time(), "pid": os.getpid()})
+    _DROPS[0] += 1
+    if _DROPS[0] % ENDED_PRUNE_EVERY:
+        return
+    ttl, now = _expire_s(), time.time()
+    try:
+        for e in os.scandir(os.path.dirname(p)):
+            try:
+                if now - e.stat().st_mtime > ttl:
+                    os.remove(e.path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def drop(rid: str, reason: str = "front") -> bool:
     """FRONT SEAM: rid ended where D never took it (served via P, aborted,
-    disconnected, re-routed fresh). Never raises."""
+    disconnected, re-routed fresh). Never raises.
+
+    PDFLIP-H (N3u 1002_072908, weg2-0-2): the client went away during P's
+    leg 1 (07:32:46 WEG2-CLIENT-GONE abort-p), the rid-end drop found no mark,
+    P finished and marked the hand-off 1.3 s later -- an orphan D kept for the
+    900 s bound (117304 kept keys in every D reset census, a 1.1 GB L3 copy
+    by PARK-DEMOTE). A terminal drop now leaves a tombstone first; a later
+    mark of the rid is refused (:func:`_refuse_if_ended`). A re-route
+    (``reroute*``) is not a rid end: no tombstone, P may mark again."""
     try:
-        return _end(str(rid), str(reason), "DROPPED")
+        rid, reason = str(rid), str(reason)
+        if not reason.startswith(NON_TERMINAL_DROPS):
+            _tombstone(rid)
+        return _end(rid, reason, "DROPPED")
     except Exception:  # noqa: BLE001
         return False
 
@@ -552,6 +617,19 @@ def note_evicted(pool, cands: Iterable, keep: Keep, need: int = 0) -> int:
     return len(per)
 
 
+def _live_marks() -> set:
+    """{(where, rid)} of the marks on disk now (two directory listings)."""
+    out = set()
+    for where in (PENDING, PARK):
+        d = _sub(where)
+        try:
+            names = os.listdir(d) if d else []
+        except OSError:
+            names = []
+        out.update((where, n) for n in names if not n.endswith(".tmp"))
+    return out
+
+
 def _complete_count(pool, arena, rec) -> int:
     """PDFLIP-L (02.10.2026): how many of ``rec``'s kept stems are COMPLETE
     in ``arena``. This runs on the scheduler thread inside every tree reset
@@ -730,21 +808,38 @@ def _note_ordered(keep: Keep, cands, n: int, site: str) -> None:
                 "; ".join(parts))
 
 
-def census(pool) -> str:
+def census(pool, refresh: bool = True) -> str:
     """HOLDERS-line fields for ``pool``: this pool's kept keys still COMPLETE
-    in the arena, and every process's reference-pinned complete slots."""
+    in the arena, and every process's reference-pinned complete slots.
+
+    PDFLIP-H (N3u 1002_072908 / N4p 1002_095319): the census read the pool's
+    CACHED keep and never re-read it, so P's FULL pool printed the keep of its
+    first reset for the whole boot (90691 = weg2-0-1 + weg2-0-4 + weg2-1-5,
+    all CONSUMED on D 07:33:21-22; N4p 95986 likewise) -- and looked all of
+    them up at every reset. Now ``refresh`` (the 60 s census thread) re-reads
+    a changed mark directory (:func:`keep_for`); the reset census passes
+    ``refresh=False``: it never hashes a chain on the flush path (a new 45k
+    hand-off costs ~76 ms in keep_for), counts only the cached rids whose mark
+    still exists, and names the marks it has not read as ``unread_marks``."""
     try:
         cache = pool.__dict__.get("_weg2_hp_keep")
-        keep = cache[1] if cache is not None else keep_for(pool)
+        if refresh:
+            keep = keep_for(pool) if cache is None or cache[0] != _stamp() else cache[1]
+        else:
+            keep = cache[1] if cache is not None else _empty_keep()
         arena = getattr(pool, "arena", None)
         # #248: per role -- handoff_kept (P hand-offs) and park_kept (D
         # requests that do not run), each "complete in the arena / kept"
         counts = {ROLE_HANDOFF: [0, 0, 0], ROLE_PARK: [0, 0, 0]}
         per = pool.__dict__.get("_weg2_hp_rid_keys") or {}
+        live = _live_marks()
+        seen = set()
         for rid, role in zip(keep.rids, keep.roles):
-            rec = per.get((PARK if role == ROLE_PARK else PENDING, rid), (0, None))[1]
-            if rec is None:
+            where = PARK if role == ROLE_PARK else PENDING
+            rec = per.get((where, rid), (0, None))[1]
+            if rec is None or (where, rid) not in live:
                 continue
+            seen.add((where, rid))
             c = counts[role]
             c[1] += len(rec[2])
             c[2] += 1
@@ -755,7 +850,7 @@ def census(pool) -> str:
             pinned, _refs, complete = arena.ref_census()
         h, k = counts[ROLE_HANDOFF], counts[ROLE_PARK]
         return (f"handoff_kept={h[0]}/{h[1]} handoff_rids={h[2]} park_kept={k[0]}/{k[1]} park_rids={k[2]} "
-                f"arena_pinned={pinned} arena_complete={complete}")
+                f"arena_pinned={pinned} arena_complete={complete} unread_marks={len(live - seen)}")
     except Exception as exc:  # noqa: BLE001 - an instrument never breaks a census
         return f"handoff_kept=failed:{type(exc).__name__}"
 

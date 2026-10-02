@@ -1953,7 +1953,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 out[comp.component_type] = pool
         return out
 
-    def weg2_arena_holder_census(self, arena=None) -> Optional[str]:
+    def weg2_arena_holder_census(self, arena=None, refresh: bool = True) -> Optional[str]:
         """#1424e: the reader references THIS process's holders name on one
         arena, per class (pages, the release's rule), against the process's
         own reference ledger:
@@ -2057,12 +2057,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 f"gap={own - total if own is not None and not torn else '-'} reset_orphans={orphans} "
                 + (f"snapshot=torn own_before={own0} " if torn else "")
                 + (f"own_drift={drift} " if drift and not torn else "")
-                + f"{_hp.census(pool)}")
+                + f"{_hp.census(pool, refresh=refresh)}")
         return "; ".join(lines) or None
 
     def _weg2_log_holder_census(self, where: str) -> None:
         try:
-            line = self.weg2_arena_holder_census()
+            # PDFLIP-H: the reset's census (inside every sleep flush) never
+            # re-hashes the hand-off keep -- handoff_pending.census(refresh=False)
+            line = self.weg2_arena_holder_census(refresh=where != "reset")
         except Exception as exc:  # noqa: BLE001 - an instrument never breaks a reset
             line = f"failed={exc!r}"
         if line:

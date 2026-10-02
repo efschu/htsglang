@@ -173,8 +173,8 @@ def test_the_park_hands_back_held_and_late_rids():
     src = inspect.getsource(F.Front)
     i = src.index("verdict, rids, why = phase_policy.park_verdict(code, text)")
     blk = src[i:i + 6000]
-    assert ("_handed = set(self._park_handback(\n"
-            "            park_held_rids(text) + [r for r in self._flip_ledger(D) if r not in rids]))") in blk
+    assert ("_handed = set(Front._park_handback(\n"
+            "            self, park_held_rids(text) + [r for r in self._flip_ledger(D) if r not in rids]))") in blk
     # 27B port: a handed-back rid is not also parked (no stale _d_parked hiding its NEW leg 2)
     assert "known = [r for r in known if r not in _handed]" in blk
     assert "late = [r for r in self._flip_ledger(D) if r not in rids and r not in _handed]" in blk

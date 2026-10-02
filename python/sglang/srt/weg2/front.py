@@ -4418,6 +4418,14 @@ class Front:
         self._d_cost_all: Deque[Tuple[int, int, float]] = collections.deque(maxlen=4096)
         #: X-COST-LINE: requests each P phase prefilled (the amortisation k).
         self._p_phase_k: Deque[int] = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
+        #: PDFLIP-X: the LONG excursion's two waits ``(epoch, s)`` -- D->P (R28
+        #: DP-WAIT wait_s of LONG arrivals) and P->D (LEG2-FIRST-CONTENT
+        #: via=after_p); the epochs of manual flips (acceptance probe) and the
+        #: epoch of each side's first sample (the cold wake) are excluded.
+        self._x_exc_dp: Deque[Tuple[int, float]] = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
+        self._x_exc_pd: Deque[Tuple[int, float]] = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
+        self._x_exc_first: Dict[str, Optional[int]] = {"dp": None, "pd": None}
+        self._x_manual_epochs: set = set()
         #: X-COST-LINE: the newest fitted line of this checkpoint x form, the
         #: seed until this boot fitted its own; None = none recorded.
         self._x_cost_seed: Optional[dict] = (
@@ -5268,12 +5276,12 @@ class Front:
         known = [r for r in rids if r in D.outstanding]
         unknown = [r for r in rids if r not in D.outstanding]
         # SEQ-HASH (NF 02ddfc4906): the parked legs' sequence marks at their #59b depths
-        self._seq_park(park_seq_marks(text))
+        Front._seq_park(self, park_seq_marks(text))
         # PARK-HANDBACK (NF 9bdfe50185): prefill D holds unstarted goes to P's batch. 27B port: a
         # handed-back rid is NOT also counted parked (its leg closes, P's batch takes it) -- no
         # double effect with the park ledger / PARK-RESUME below.
-        _handed = set(self._park_handback(
-            park_held_rids(text) + [r for r in self._flip_ledger(D) if r not in rids]))
+        _handed = set(Front._park_handback(
+            self, park_held_rids(text) + [r for r in self._flip_ledger(D) if r not in rids]))
         if _handed:
             known = [r for r in known if r not in _handed]
         # H91c3-2: a hand-off already in ``D.outstanding`` whose leg 2 had not
@@ -10266,6 +10274,8 @@ class Front:
                             else "d_single" if single_prefill else "after_p")
                     logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f ttft_ms=%.0f",
                                 rid, self.epoch, _via, (time.time() - t0) * 1000.0, _ttft)
+                    if _via == "after_p":  # PDFLIP-X: the excursion's P->D wait
+                        Front._note_x_excursion(self, "pd", time.time() - t0)
                     # TSDB: leg-2 first content and the TTFT from the front's arrival stamp
                     self._metrics().leg2_first_content(
                         rid, _via, time.time() - t0, self._ipc_out_book().arrival.get(str(rid)))
@@ -12539,6 +12549,11 @@ class Front:
                 for lim in (10, 30, 60):
                     if dec["wait_s"] >= lim:
                         self.counters[f"dp_wait_ge{lim}s"] += 1
+                if a.origin == "long":  # PDFLIP-X: the excursion's D->P wait
+                    try:
+                        Front._note_x_excursion(self, "dp", float(dec["wait_s"]))
+                    except Exception:  # noqa: BLE001 -- an instrument never breaks a flip
+                        pass
             except Exception as e:  # noqa: BLE001 -- an instrument never breaks a flip
                 logger.debug("DP-WAIT rid=%s not reported: %s: %s", p.rid, type(e).__name__, e)
 
@@ -12836,12 +12851,43 @@ class Front:
         else:
             k, k_src = 1.0, "none(1=no-amortisation)"
         self._x_k_hist = (k, k_src)
+        if envs.SGLANG_WEG2_X_EXCURSION_PRICE.get():
+            # PDFLIP-X: the excursion the request waits, undivided (phase_policy).
+            exc, exc_src = phase_policy.excursion_price_s(
+                getattr(self, "_x_exc_dp", ()), getattr(self, "_x_exc_pd", ()),
+                getattr(self, "_x_manual_epochs", ()), getattr(self, "_x_exc_first", None))
+            if exc is not None:
+                price, price_src = exc, exc_src
+            else:
+                price_src = f"{exc_src}->fallback {price_src}"
+            k_src = f"not-divided(measured k={k:.2f} [{k_src}]: the trigger waits the whole round trip)"
+            k = 1.0
+            # RELEASE-INTEG: PDFLIP-X already prices the lone request undivided (k=1, the same
+            # X in force as X-K-FLIP); its k_src names it. X-K-FLIP's riders (_x_for_flip)
+            # read _x_k_hist above, unchanged.
+            return line, line_src, price, price_src, k, k_src
         if x_k_flip_enabled():
             # X-K-FLIP: the X in force is the LONE request's (k_flip=1); the
             # riders of a flip are priced per decision (_x_for_flip). The
-            # boot's mean P phase is shown, never amortised over.
-            return line, line_src, price, price_src, 1.0, f"flip:1(lone) hist={k:.2f}[{k_src}] display-only"
+            # boot's mean P phase is shown, never amortised over. RELEASE-INTEG:
+            # with PDFLIP-X on, the price above is the undivided excursion.
+            hk, hsrc = self._x_k_hist
+            return line, line_src, price, price_src, 1.0, f"flip:1(lone) hist={hk:.2f}[{hsrc}] display-only"
         return line, line_src, price, price_src, k, k_src
+
+    def _note_x_excursion(self, side: str, seconds: float) -> None:
+        """PDFLIP-X: one wait of a LONG excursion (``dp`` | ``pd``) at this epoch."""
+        try:
+            if not hasattr(self, "_x_exc_dp"):
+                self._x_exc_dp = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
+                self._x_exc_pd = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
+                self._x_exc_first = {"dp": None, "pd": None}
+            rows = self._x_exc_dp if side == "dp" else self._x_exc_pd
+            if self._x_exc_first.get(side) is None:
+                self._x_exc_first[side] = int(self.epoch)
+            rows.append((int(self.epoch), float(seconds)))
+        except Exception:  # noqa: BLE001 -- an instrument never breaks routing
+            pass
 
     def _resolve_x_cost_line(self) -> Optional[int]:
         """X-COST-LINE's re-solve (see phase_policy): X* from D's cost line at
@@ -14019,8 +14065,10 @@ class Front:
                 _drain_s = time.time() - t_drain0
                 if _drain_s > 0 and _drain_uncached > 0:
                     self.note_x_sample("r_p", _drain_uncached / _drain_s)
-                if prefilled > 0:
-                    # X-COST-LINE: the requests this P phase carried (k).
+                if prefilled > 0 and not (envs.SGLANG_WEG2_X_EXCURSION_PRICE.get()
+                                          and int(self.epoch) in getattr(self, "_x_manual_epochs", ())):
+                    # X-COST-LINE: the requests this P phase carried (k);
+                    # PDFLIP-X: never a manual (probe) flip's phase.
                     self._p_phase_k.append(int(prefilled))
                 if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
                     # X-COST-LINE: P's forwards of this drain, as a task.
@@ -14586,6 +14634,12 @@ class Front:
                                       "code": "W115"}, status=409)
         src, dst = self.awake, ("P" if self.awake == "D" else "D")
         self.admit_d = False
+        # PDFLIP-X: the probe's round trip is no LONG excursion -- its P phase
+        # and the D phase after it give no k and no price sample.
+        if not hasattr(self, "_x_manual_epochs"):
+            self._x_manual_epochs = set()
+        _ep = int(getattr(self, "epoch", 0) or 0)  # a test namespace may carry no epoch
+        self._x_manual_epochs.update((_ep + 1, _ep + 2))
         if src == "D":
             # the drain waits only for what the park leaves running (#1011:
             # a decode is never cut, so an unparked one held the flip).
