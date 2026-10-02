@@ -495,3 +495,281 @@ def test_unanimous_fingerprints_every_rank_holds(monkeypatch, tmp_path):
         assert WU._l15_decide_wake_verdict(fss[r], True, fp, epoch=EPOCH) \
             == "hold"
     assert [g for g, _o in calls] == [grp, grp, grp]
+
+
+# ---------------------------------------------------------------------------
+# PART 4 (L15-INT4): the chain through the REAL optimistic refill with
+# SGLANG_WEG2_L15_REFILL=1. Same boot env and caps as PART 3, but now ALL
+# THREE ranks sleep, and the manifests carry the E2a/E2b record: full l2
+# columns per token and the anchor's L2 identity (anchor_l2_slot 31, gen 3).
+# Rank 0 (cap 0) therefore opens the refill gate at its hold signal; wake
+# runs the production order: hold-aware restore -> optimistic refill ->
+# sample check (stubbed clean) -> decide -> act. The fake host pools record
+# every load, so "the act does not refill a second time" is a load census.
+# ---------------------------------------------------------------------------
+
+import logging  # noqa: E402
+
+from sglang.srt.weg2 import l15_check as l15_check_mod  # noqa: E402
+
+# Distinct l2 slots per rid: two rids claiming ONE L2 page row would trip
+# l15_refill.refill's duplicate-slot guard (the shared KV slot 3 keeps the
+# same destination compact row; only its L2 source rows differ per rid).
+REFILL_L2 = {
+    "sa": ((201, 202, 203, 204), (5, 6, 7, 8)),
+    "sb": ((205, 206, 207, 208), (5, 6, 7, 8)),
+}
+REFILL_ANCHOR_L2 = (31, 3)
+REFILL_KV_GENS = {201: 5, 202: 6, 203: 7, 204: 8,
+                  205: 5, 206: 6, 207: 7, 208: 8}
+# rank 0 owns slot 3 (index 2 of both spans) -> the KV load is exactly:
+REFILL_KV_CALL = ([203, 207], [1, 1])
+REFILL_ANCHOR_CALL = ([31, 31], [1, 1])   # both spans share anchor 31 -> row 1
+
+
+class _HostKV:
+    """Fake L2 KV host pool: generation census + recording page loader."""
+
+    _arena_page_tokens = 1
+
+    def __init__(self, gens):
+        self.gens = dict(gens)
+        self.load_calls = []
+
+    def slot_gens(self, slots):
+        return [self.gens.get(int(s), -1) for s in slots]
+
+    def _load_pages_all_layers(self, device_pool, slots, didx,
+                               lanes=None, mode=None):
+        self.load_calls.append(([int(x) for x in slots],
+                                [int(x) for x in didx]))
+
+
+class _HostMamba:
+    """Fake L2 mamba host pool: anchor census + recording state loader."""
+
+    def __init__(self, gens):
+        self.gens = dict(gens)
+        self.load_calls = []
+
+    def slot_gens(self, slots):
+        return [self.gens.get(int(s), -1) for s in slots]
+
+    def _load_states_all_layers(self, dev_mamba, slots, didx):
+        self.load_calls.append(([int(x) for x in slots],
+                                [int(x) for x in didx]))
+
+
+class _PoolM(_Pool):
+    """req_to_token_pool stand-in with the mamba device pool attached."""
+
+    def __init__(self):
+        super().__init__()
+        self.mamba_pool = object()
+
+
+class _Tree2:
+    """tree_cache whose cache_controller exposes the fake host pools
+    exactly like the hybrid 27B (L15-FIX-HOSTGROUP resolver path)."""
+
+    def __init__(self, kv_host, mamba_host):
+        self.cache_controller = SimpleNamespace(
+            mem_pool_host=kv_host, mamba_pool_host=mamba_host)
+        self.resets = 0
+
+    def reset(self):
+        self.resets += 1
+
+
+def _sleep_all_e2(tmp_path):
+    """Sleep on all three ranks with the REAL caps and the E2a/E2b record
+    (l2 columns per token, anchor_l2_slot 31 gen 3): every rank writes its
+    manifest; the contents are rank-independent -> equal fingerprints."""
+    for r in range(3):
+        path = l15_manifest.manifest_path("D", r, os.environ)
+        res = l15_retain.retain_at_sleep(
+            candidates=list(CANDIDATES),
+            node_of=lambda rid: FakeNode(),
+            slots_of=lambda rid: SLOTS_OF[rid],
+            anchor_slot_of=lambda rid: ANCHOR_SLOT_OF[rid],
+            l2_of=lambda rid: REFILL_L2[rid],
+            anchor_l2_of=lambda rid: REFILL_ANCHOR_L2,
+            rewrite_tree=_recorder,
+            caps_rows_by_rank=CAPS_27B,
+            cap_anchor_slots=4,
+            prefix=PREFIX, rank=r, epoch=EPOCH, pid=os.getpid(),
+            kv_buffers=[torch.zeros(8, 3), torch.zeros(8, 3)],
+            mamba_buffers=_mamba_views(_build_pool()),
+            allocator=_fresh_alloc(),
+            mamba_allocator=_build_pool().mamba_allocator,
+            reset_keep=lambda ns: None, set_keep=lambda buf, spans: None,
+            manifest_path=path, log=lambda line: None,
+        )
+        assert res is not None, f"sleep skipped on rank {r}"
+
+
+def _fresh_alloc():
+    alloc = FakeAllocator()
+    alloc.clear()
+    return alloc
+
+
+def _wake4(anchor_gen=3):
+    """Three fake D ranks on one cpu group: real 27B cell, host pools with
+    the given anchor generation, production wake order (the hold-aware
+    restore runs first on EVERY rank, refill mark included)."""
+    grp = object()
+    kv_host = _HostKV(REFILL_KV_GENS)
+    mb_host = _HostMamba({31: anchor_gen})
+    fss, scheds = [], []
+    for r in range(3):
+        sched = _sched()
+        t = torch.zeros(1, 8, 1024, dtype=torch.bfloat16)  # the 27B cell
+        sched.tp_worker.model_runner.token_to_kv_pool = SimpleNamespace(
+            k_buffer=[t], v_buffer=[t])
+        sched.req_to_token_pool = _PoolM()
+        sched.tree_cache = _Tree2(kv_host, mb_host)
+        sched.world_group = SimpleNamespace(cpu_group=grp)
+        fs = _fake_self(sched, r)
+        # fs bound per iteration via default args: a plain closure would
+        # re-read the loop variable and every fake would act as the LAST
+        # rank.
+        fs._l15_wake_sample_check = lambda fs=fs: WU._l15_wake_sample_check(fs)
+        fs._l15_optimistic_refill = lambda fs=fs: WU._l15_optimistic_refill(fs)
+        fs._l15_do_refill = (
+            lambda s, optimistic=False, fs=fs:
+            WU._l15_do_refill(fs, s, optimistic=optimistic))
+        fs._l15_decide_wake_verdict = (
+            lambda w, fp, check=None, *, epoch, fs=fs:
+            WU._l15_decide_wake_verdict(fs, w, fp, check, epoch=epoch))
+        assert WU._weg2_wake_restore_pools(fs) is True
+        fss.append(fs)
+        scheds.append(sched)
+    return grp, fss, scheds, kv_host, mb_host
+
+
+def _stub_clean_check(monkeypatch):
+    """l15_check.sample_check -> (k, 0, 0); records one entry per call."""
+    seen = []
+
+    def _clean(plan, host_pool, device_pool, scratch, page_tokens, k=64):
+        seen.append(len(plan))
+        return (k, 0, 0)
+
+    monkeypatch.setattr(l15_check_mod, "sample_check", _clean)
+    return seen
+
+
+def test_refill1_chain_holds_and_the_act_never_refills_again(
+        monkeypatch, tmp_path):
+    # AP L15-INT4 case 1: rank 0's hold signal opens the gate, the REAL
+    # optimistic refill lands the KV + anchor loads ONCE before decide(),
+    # all three ranks vote the same fingerprint -> "hold", and the act
+    # after decide() does NOT refill a second time.
+    _env_real(monkeypatch, tmp_path)
+    monkeypatch.setenv("SGLANG_WEG2_L15_REFILL", "1")
+    _sleep_all_e2(tmp_path)
+    grp, fss, scheds, kv_host, mb_host = _wake4()
+    # The gate opened exactly on the cap-0 rank and nowhere else.
+    assert [fs._l15_wake_refill for fs in fss] == [True, False, False]
+    fps = [l15_manifest.fingerprint(fs._l15_wake_manifest) for fs in fss]
+    assert fps[0] == fps[1] == fps[2] is not None
+    seen = _stub_clean_check(monkeypatch)
+    # Optimistic refill BEFORE decide: one KV page load, one anchor load.
+    assert [WU._l15_optimistic_refill(fs) for fs in fss] == [False] * 3
+    assert kv_host.load_calls == [REFILL_KV_CALL]
+    assert mb_host.load_calls == [REFILL_ANCHOR_CALL]
+    v = l15_restore.check_vote(fps[0], 64, 0, 0, ())
+    calls = []
+    _fake_gather(monkeypatch, [v, v, v], calls)
+    for r in range(3):
+        assert WU._l15_wake_check_and_decide(fss[r], True, fps[r],
+                                             epoch=EPOCH) == "hold"
+    # Real sample plans: owned-with-L2 tokens per rank (slot%3 classes).
+    assert seen == [2, 3, 3]
+    assert [o for _g, o in calls] == [v, v, v]   # the REAL votes agree
+    for r in range(3):
+        assert WU._l15_wake_act(fss[r], scheds[r], "hold",
+                                group_ok=True, master_on=True) == 0
+    # No second refill (the load census is still one call each) and the
+    # hold keeps every held row reserved on every rank.
+    assert kv_host.load_calls == [REFILL_KV_CALL]
+    assert mb_host.load_calls == [REFILL_ANCHOR_CALL]
+    for sched in scheds:
+        free = {int(x) for x in
+                sched.token_to_kv_pool_allocator.free_pages.tolist()}
+        assert free == set(range(6, ALLOC_SIZE + 1))  # HELD_SLOTS stay out
+        assert sched.tree_cache.resets == 0
+
+
+def _census(scheds):
+    """Pool state census per rank: free KV rows, tree resets, req clears."""
+    return [({int(x) for x in
+              s.token_to_kv_pool_allocator.free_pages.tolist()},
+             s.tree_cache.resets, len(s.req_to_token_pool.clear_calls))
+            for s in scheds]
+
+
+def test_refill1_anchor_gen_mismatch_falls_back_like_refill0(
+        monkeypatch, tmp_path):
+    # AP L15-INT4 case 2: ONE anchor generation mismatch (arena slot 31
+    # moved to gen 4, manifest recorded 3) -> rank 0's optimistic refill
+    # copies NOTHING and votes None -> every rank "fallback" -> the act
+    # frees every pool; the census equals the REFILL=0 scenario.
+    _env_real(monkeypatch, tmp_path)
+    monkeypatch.setenv("SGLANG_WEG2_L15_REFILL", "1")
+    _sleep_all_e2(tmp_path)
+    grp, fss, scheds, kv_host, mb_host = _wake4(anchor_gen=4)
+    assert fss[0]._l15_wake_refill is True
+    _stub_clean_check(monkeypatch)
+    assert WU._l15_optimistic_refill(fss[0]) is True    # -> vote None
+    assert [WU._l15_optimistic_refill(fs) for fs in fss[1:]] == [False, False]
+    assert kv_host.load_calls == []           # all-or-nothing: nothing moved
+    assert mb_host.load_calls == []
+    fps = [l15_manifest.fingerprint(fs._l15_wake_manifest) for fs in fss]
+    v = l15_restore.check_vote(fps[1], 64, 0, 0, ())
+    calls = []
+    _fake_gather(monkeypatch, [None, v, v], calls)
+    verdicts = [WU._l15_wake_check_and_decide(
+        fss[r], True, None if r == 0 else fps[r], epoch=EPOCH)
+        for r in range(3)]
+    assert verdicts == ["fallback"] * 3
+    assert [o for _g, o in calls] == [None, v, v]
+    dropped = [WU._l15_wake_act(fss[r], scheds[r], "fallback",
+                                group_ok=True, master_on=True)
+               for r in range(3)]
+    assert dropped == [len(HELD_SLOTS)] * 3
+    census_refill = _census(scheds)
+    full = set(range(1, ALLOC_SIZE + 1))
+    assert census_refill == [(full, 1, 2)] * 3   # every pool freed, once
+
+    # REFILL=0 on the same sleep: rank 0 never had the gate, votes None
+    # from the off line; the group still falls back -> SAME census.
+    monkeypatch.delenv("SGLANG_WEG2_L15_REFILL")
+    _sleep_all_e2(tmp_path)                        # manifests were consumed
+    grp, fss0, scheds0, kv0, mb0 = _wake4(anchor_gen=4)
+    assert fss0[0]._l15_wake_refill is False
+    _stub_clean_check(monkeypatch)
+    assert [WU._l15_optimistic_refill(fs) for fs in fss0] == [False] * 3
+    assert kv0.load_calls == [] and mb0.load_calls == []
+    verdicts0 = [WU._l15_wake_check_and_decide(
+        fss0[r], True, None if r == 0 else fps[r], epoch=EPOCH)
+        for r in range(3)]
+    assert verdicts0 == ["fallback"] * 3
+    for r in range(3):
+        WU._l15_wake_act(fss0[r], scheds0[r], "fallback",
+                         group_ok=True, master_on=True)
+    assert _census(scheds0) == census_refill       # operator condition
+
+
+def test_refill0_chain_cap0_rank_never_loads(monkeypatch, tmp_path, caplog):
+    # AP L15-INT4 case 3: with REFILL unset the cap-0 rank votes None from
+    # the OFF line, the gate never opens, and rank 0 loads nothing at all.
+    _env_real(monkeypatch, tmp_path)
+    _sleep_all_e2(tmp_path)
+    with caplog.at_level(logging.INFO):
+        grp, fss, scheds, kv_host, mb_host = _wake4()
+        assert [fs._l15_wake_refill for fs in fss] == [False, False, False]
+        assert [WU._l15_optimistic_refill(fs) for fs in fss] == [False] * 3
+    assert kv_host.load_calls == [] and mb_host.load_calls == []
+    assert "L15-REFILL rank=0 off" in caplog.text
