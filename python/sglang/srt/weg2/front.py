@@ -2960,7 +2960,10 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
     tag table (``--wake-credit-plan``), this free sample and the waker's
     corridor floors. A cycle-free order comes back UNCHANGED; a cycling one
     is replaced by ``wake_credit.credit_order``'s funded order, or kept with
-    a W126 note when no order is funded (the planner refused such a form).
+    a W126 note when no order is funded (the planner refused such a form) --
+    since 02.10. (SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT, NF y6u) replaced by
+    the order funded at the smallest free uplift when that is not the given
+    one, still with the W126 note.
 
     No table for this direction, the lever off, or an unreadable floor: the
     order as given, and ``why`` says so."""
@@ -2992,7 +2995,8 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
                   or (plan or {}).get(_wc.SEARCH_KEY))
     new, note = _wc.front_order(
         order, table, free_mib=free, floor_mib=floors,
-        double_staging=not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get(), search=search)
+        double_staging=not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get(), search=search,
+        least_deficit=envs.SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT.get())
     return new, why + ", " + note
 
 

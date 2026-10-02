@@ -1276,6 +1276,17 @@ class Envs:
     # search, so the front runs the same search. A cycle-free order stays
     # unchanged either way. Off by default: never run on metal.
     SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH = EnvBool(False)
+    # FLIP_ORDER_LEAST_DEFICIT (02.10., NF y6u D->P 2->3 / 4->5): when no order
+    # is funded at the measured free (greedy and, if on, H54 found none), the
+    # front no longer keeps the given order -- at y6u's driver_free {0: 1281,
+    # 1: 2212, 2: 1269} that order ran into its credit cycle (sleeper1
+    # weights_15 -> waker2, sleeper2 weights_11 -> waker1) and stalled 1.6-1.9 s
+    # until the W109b spill. It takes the order the model funds at the smallest
+    # uniform free uplift per card (weg2/wake_credit.least_deficit_order; the
+    # given order needs +2048..3072 MiB, the reorder +512), the given one when
+    # it is funded at the same step. Only the order changes: no reservation,
+    # the planner's W126 riegel asks without it. 0 = the given order is kept.
+    SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT = EnvBool(True)
     # PD_TIMED_ORDER (H34, fnFL2x141): the planner times the P->D wake per card
     # in ms (weg2/wake_credit_pd.py) and recommends a rearrangement of the
     # tightest card's own P bands when the credit wait there lengthens the leg
