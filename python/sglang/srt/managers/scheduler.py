@@ -1599,6 +1599,54 @@ def _weg2_store_presence(
     return present
 
 
+#: QUIESCE-EMPTY-CACHE (02.10., N6d ..._ec4d492f58: WEG2-SLEEP-SUB rpc_flush
+#: empty_cache=21 ms per P flush beside tree_reset): the /flush_cache RPC (the
+#: front's quiesce, ``zero_kv`` None) of a Weg-2 group empties the torch caching
+#: allocator. It is the ONLY empty_cache before the flip legs on PP0 -- PP0's
+#: release flush is refused by the PENDING idle lap and skips its own, and the
+#: sleep's sleep_complete empty_cache runs after the legs (it released 0 MiB on
+#: every N6d sleep). Kept by default; every Weg-2 flush now prints what it gave
+#: back and what it cost ('WEG2-FLUSH-EMPTY-CACHE site= ms= released_mib='), so
+#: the next boot says whether the quiesce's call buys VRAM for the waking group.
+#: SGLANG_WEG2_QUIESCE_EMPTY_CACHE=0 skips it on the quiesce RPC (the release's
+#: flush and sleep_complete keep theirs).
+_WEG2_QUIESCE_EMPTY_CACHE_ENV = "SGLANG_WEG2_QUIESCE_EMPTY_CACHE"
+
+
+def _weg2_flush_empty_cache(zero_kv, tp_group_verdict) -> None:
+    """flush_cache's empty_cache, instrumented on Weg-2 groups (see above)."""
+    if not (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip():
+        current_platform.empty_cache()
+        return
+    site = "release" if zero_kv is False else "rpc"
+    if site == "rpc" and str(os.environ.get(_WEG2_QUIESCE_EMPTY_CACHE_ENV, "1") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        logger.info("WEG2-FLUSH-EMPTY-CACHE site=rpc skipped (%s=0: the quiesce leaves the "
+                    "allocator cache to the release's flush and sleep_complete)",
+                    _WEG2_QUIESCE_EMPTY_CACHE_ENV)
+        return
+    try:
+        dev = torch.get_device_module()
+        r0, a0 = int(dev.memory_reserved()), int(dev.memory_allocated())
+    except Exception:  # noqa: BLE001 -- no reading: the call still runs
+        r0 = a0 = None
+    t0 = time.perf_counter()
+    current_platform.empty_cache()
+    ms = (time.perf_counter() - t0) * 1000.0
+    try:
+        r1 = int(torch.get_device_module().memory_reserved()) if r0 is not None else None
+    except Exception:  # noqa: BLE001
+        r1 = None
+    if r0 is None or r1 is None:
+        logger.info("WEG2-FLUSH-EMPTY-CACHE site=%s ms=%.1f released_mib=n/a", site, ms)
+        return
+    mib = 1024.0 * 1024.0
+    logger.info("WEG2-FLUSH-EMPTY-CACHE site=%s ms=%.1f released_mib=%.1f reserved_mib=%.0f->%.0f "
+                "allocated_mib=%.0f tp_group_verdict=%d (torch caching allocator of this rank; "
+                "the untagged reserve handed back to the driver before the flip legs)",
+                site, ms, (r0 - r1) / mib, r0 / mib, r1 / mib, a0 / mib, int(bool(tp_group_verdict)))
+
+
 def _weg2_parked_owned_prefetch_of(sched) -> frozenset:
     """PDFLIP-A: open prefetch records of requests in D's park list (empty off
     D's park, without HiCache, or on any error -- the old verdict stands)."""
@@ -20019,7 +20067,7 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                current_platform.empty_cache()
+                _weg2_flush_empty_cache(zero_kv, tp_group_verdict)
             if envs.SGLANG_FLUSH_SCRUB_FREE_MEMORY.get():
                 self._flush_scrub_free_memory()
             # Per-DP-group leader logs once: ranks within a DP group are
