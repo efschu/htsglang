@@ -43,7 +43,57 @@ def discard_manifest(path: str) -> bool:
         return False
 
 
-def arm_keep_spans(adapter, keep_by_base, manifest_path, *, rank, log=print):
+def align_keep_ranges(ranges, granule, limit=None):
+    """L15-FIX-KEEPALIGN (N3k 02.10. 01:07Z): byte ranges the native
+    tms_set_keep_spans accepts.
+
+    core.cpp set_keep_spans returns -3 unless every range is granule-aligned
+    (lo % g == 0, hi % g == 0), non-empty, inside the allocation and the list
+    is sorted and disjoint. The hook collects ROW-exact ranges
+    (row * stride * elsize), so each range is widened OUTWARD to the granule
+    (lo floored, hi ceiled -- keeping a little more is safe, keeping less
+    would drop held rows), capped at ``limit`` (the allocation size rounded
+    up to the granule) and overlapping/adjacent ranges are merged.
+    """
+    g = int(granule)
+    if g <= 0:
+        raise ValueError("granule must be > 0, got %r" % (granule,))
+    out = []
+    for lo, hi in sorted((int(a), int(b)) for a, b in ranges):
+        if hi <= lo:
+            continue
+        a = (lo // g) * g
+        b = -(-hi // g) * g
+        if limit is not None:
+            b = min(b, int(limit))
+        if b <= a:
+            continue
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _base_limit(base, granule):
+    """The base allocation's byte size rounded up to the granule, or None
+    when the object does not tell (desk fakes)."""
+    try:
+        n = int(base.untyped_storage().nbytes())
+    except Exception:  # noqa: BLE001
+        return None
+    g = int(granule)
+    return -(-n // g) * g
+
+
+def _granule_of(base):
+    from sglang.srt.weg2.d_seat_vram import granule_for
+
+    return int(granule_for(getattr(base, "device", "cuda")))
+
+
+def arm_keep_spans(adapter, keep_by_base, manifest_path, *, rank, log=print,
+                   granule=None):
     """Arm one adapter call per allocation base; degrade on failure.
 
     keep_by_base: the hook's {base_key: (base_buffer, [(lo, hi), ...])}
@@ -53,9 +103,17 @@ def arm_keep_spans(adapter, keep_by_base, manifest_path, *, rank, log=print):
     """
     armed = []
     rc_repr = None
+    raw_b = 0
+    kept_b = 0
+    n_rng = 0
     for _key, (_base, _ranges) in keep_by_base.items():
         try:
-            rc = adapter.set_keep_byte_spans(_base, _ranges)
+            _g = int(granule) if granule is not None else _granule_of(_base)
+            _aligned = align_keep_ranges(_ranges, _g, _base_limit(_base, _g))
+            raw_b += sum(max(0, int(h) - int(l)) for l, h in _ranges)
+            kept_b += sum(h - l for l, h in _aligned)
+            n_rng += len(_aligned)
+            rc = adapter.set_keep_byte_spans(_base, _aligned)
         except Exception as exc:  # noqa: BLE001 - any arm error = no hold
             rc_repr = f"raise:{type(exc).__name__}"
             break
@@ -64,6 +122,9 @@ def arm_keep_spans(adapter, keep_by_base, manifest_path, *, rank, log=print):
             break
         armed.append(_base)
     else:
+        log(f"L15-KEEP-ALIGN rank={rank} bases={len(armed)} ranges={n_rng} "
+            f"row_bytes={raw_b} kept_bytes={kept_b} "
+            f"extra_mib={(kept_b - raw_b) / 1048576:.1f}")
         return True
 
     # Failure path: this rank holds nothing (docstring contract a/b/c).

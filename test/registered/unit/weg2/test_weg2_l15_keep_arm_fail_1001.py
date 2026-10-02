@@ -68,7 +68,7 @@ def test_failed_arm_rc_discards_manifest_and_clears_earlier_bases(tmp_path):
     mpath = _manifest(tmp_path)
     ad = _Ad(fail_on=2)
     logs = []
-    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=3, log=logs.append)
+    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=3, log=logs.append, granule=1)
     assert ok is False
     assert not os.path.exists(mpath)
     assert (1, ((4, 8),)) in ad.calls  # armed before the failure
@@ -85,7 +85,7 @@ def test_failed_arm_exception_degrades_the_same_way(tmp_path):
     mpath = _manifest(tmp_path)
     ad = _Ad(fail_on=2, fail_kind="raise")
     logs = []
-    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=0, log=logs.append)
+    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=0, log=logs.append, granule=1)
     assert ok is False
     assert not os.path.exists(mpath)
     assert (1, ()) in ad.calls
@@ -99,7 +99,7 @@ def test_failing_clear_is_best_effort(tmp_path):
     mpath = _manifest(tmp_path)
     ad = _Ad(fail_on=2, clear_raises=True)
     logs = []
-    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=1, log=logs.append)
+    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=1, log=logs.append, granule=1)
     assert ok is False
     assert not os.path.exists(mpath)
     assert (1, ()) in ad.calls
@@ -111,10 +111,13 @@ def test_arm_success_keeps_manifest_and_logs_nothing(tmp_path):
     mpath = _manifest(tmp_path)
     ad = _Ad()
     logs = []
-    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=2, log=logs.append)
+    ok = arm_keep_spans(ad, _two_bases(), mpath, rank=2, log=logs.append, granule=1)
     assert ok is True
     assert os.path.exists(mpath)
-    assert logs == []
+    # success logs exactly the L15-KEEP-ALIGN accounting line (granule 1:
+    # nothing widened, extra 0)
+    assert len(logs) == 1 and logs[0].startswith("L15-KEEP-ALIGN rank=2 ")
+    assert "extra_mib=0.0" in logs[0]
     assert (1, ((4, 8),)) in ad.calls
     assert (2, ((16, 20),)) in ad.calls
     assert (1, ()) not in ad.calls
