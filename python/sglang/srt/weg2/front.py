@@ -12726,14 +12726,17 @@ class Front:
         """
         import statistics as _st
 
+        if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
+            # PDFLIP-R (N4p 09:57:46): the cost-line solve needs nothing from the
+            # launcher -- importing it first sat 677 ms on the import lock of the
+            # H75 prewarm thread, between the first flip's end and P's first chunk.
+            return self._resolve_x_cost_line()
         from sglang.srt.weg2.launcher import (
             RATE_UNIT_GROUP_THROUGHPUT,
             MixedRateUnits,
             derive_x_star,
         )
 
-        if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
-            return self._resolve_x_cost_line()
         s = self._x_samples
         if not (s["r_d"] and s["r_p"] and s["flip_s"]):
             missing = [k for k in ("r_d", "r_p", "flip_s") if not s[k]]
