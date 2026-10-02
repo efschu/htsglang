@@ -107,6 +107,7 @@ def _pconst(name: str, profile: Optional[str] = None):
 # Task #58: the arming variable's name comes from the module that READS it, so
 # the publisher and the reader cannot drift into two spellings of one key.
 from sglang.srt.weg2.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
+from sglang.srt.weg2 import topology as _topo
 from sglang.srt.weg2 import (
     checkpoint_census,
     corridor_budget,
@@ -5700,38 +5701,63 @@ def positional_inputs_present(ns) -> List[str]:
     return out
 
 
-def calibrated_inventory(ns) -> Tuple[Tuple[str, ...], str]:
-    """(the inventory the profile's positional inputs were measured on, its source)."""
+def records_inventory(profile: str) -> Tuple[Tuple[str, ...], str]:
+    """(the inventory the profile's MEASURED records were taken on, its source)."""
     from sglang.srt.weg2 import profile_records as _pr
 
+    inv = _pr.inventory_of(str(profile))
+    if inv is not None:
+        return inv, f"profile_records_data/{profile}.json inventory"
+    return card_identity.REFERENCE_INVENTORY, (
+        f"profile {profile!r} records declare no inventory: every record of this tree "
+        "was measured on the reference rig")
+
+
+def calibrated_inventory(ns) -> Tuple[Tuple[str, ...], str]:
+    """(the inventory the profile's positional VECTORS (argv/env) were
+    measured on, its source): ``--profile-inventory``, else the records'."""
     explicit = card_identity.parse_inventory(getattr(ns, "profile_inventory", ""))
     if explicit is not None:
         return explicit, "--profile-inventory"
     prof = getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE
-    inv = _pr.inventory_of(str(prof))
-    if inv is not None:
-        return inv, f"profile_records_data/{prof}.json inventory"
-    return card_identity.REFERENCE_INVENTORY, (
-        f"profile {prof!r} records declare no inventory: every record of this tree "
-        "was measured on the reference rig")
+    return records_inventory(str(prof))
 
 
 def inventory_check_line(ns, cards: Sequence["Card"]) -> str:
     """The HW-INVENTORY line; raises Weg2LaunchRefused (HW-UNCALIBRATED) when
     the live ordered inventory is not the one the profile's positional
-    records/vectors were measured on."""
+    measured RECORDS were taken on, or not the one its positional VECTORS
+    (argv/env, ``--profile-inventory``) were written for. Two checks: a
+    profile that names a foreign inventory does not make the reference
+    rig's records hold there."""
     from sglang.srt.weg2 import profile_records as _pr
 
-    want, src = calibrated_inventory(ns)
     prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
-    what = [r.name for r in _pr.records(prof) if _pr.is_positional(r.value, len(want))]
-    what = sorted(set(what)) + positional_inputs_present(ns)
-    msg = card_identity.uncalibrated_message(cards, want, what, f"profile {prof!r} ({src})")
-    if msg is not None:
-        raise Weg2LaunchRefused(msg)
+    rec_inv, rec_src = records_inventory(prof)
+    vec_inv, vec_src = calibrated_inventory(ns)
+    rec_what = sorted({r.name for r in _pr.records(prof) if _pr.is_positional(r.value, len(rec_inv))})
+    vec_what = positional_inputs_present(ns)
+    msgs = []
+    if vec_src == "--profile-inventory":
+        m = card_identity.uncalibrated_message(cards, vec_inv, vec_what,
+                                               f"profile {prof!r} vectors ({vec_src})")
+        if m is not None:
+            msgs.append(m)
+        m = card_identity.uncalibrated_message(cards, rec_inv, rec_what,
+                                               f"profile {prof!r} measured records ({rec_src})")
+        if m is not None:
+            msgs.append(m)
+    else:
+        m = card_identity.uncalibrated_message(cards, rec_inv, rec_what + vec_what,
+                                               f"profile {prof!r} ({rec_src})")
+        if m is not None:
+            msgs.append(m)
+    if msgs:
+        raise Weg2LaunchRefused(" || ".join(msgs))
     return ("HW-INVENTORY " + "; ".join(f"ordinal {i}: {card_identity.describe(c)}"
                                         for i, c in enumerate(cards))
-            + f" -- calibrated inventory [{','.join(want)}] ({src}) MATCH")
+            + f" -- calibrated inventory [{','.join(rec_inv)}] ({rec_src}"
+            + (f"; vectors: {vec_src}" if vec_src == "--profile-inventory" else "") + ") MATCH")
 
 
 #: HW-GENERIC 1002 Stage 1: the release topology is P = PP3 / D = TP3 (argv
@@ -7920,7 +7946,9 @@ def common_flags(
         # from the model path by default and overridable by flag; never a
         # constant, because a constant here is a silent identity swap.
         "--served-model-name", served_model_name(model),
-        "--rank-gpu-id", "0,1,2",
+        # HW-GENERIC 1002 S2 (enabling): one rank per card in order_cards
+        # order -- the topology's rank map, "0,1,2" on the N=3 release.
+        "--rank-gpu-id", _topo.rank_gpu_id_csv(WEG2_CARD_COUNT),
         "--skip-server-warmup",
         "--kv-cache-dtype", KV_CACHE_DTYPE,
         "--context-length", str(CONTEXT_LENGTH_TOKENS),
@@ -8132,7 +8160,9 @@ def argv_p(
         # the size of P's req_to_token_pool (R-13), which is why it is
         # resolved before the budget solve and printed with it.
         "--max-running-requests", str(p_bs),
-        "--tp-size", "1", "--pp-size", "3",
+        # HW-GENERIC 1002 S2 (enabling): P = PP<N> over every card (TP1);
+        # from the topology, "--pp-size 3" on the N=3 release.
+        "--tp-size", "1", "--pp-size", str(_topo.release_topology(WEG2_CARD_COUNT).p_pp),
         # #692 MICROBATCH DEPTH, group P only -- group D runs pp_size=1 and a
         # pipeline depth is meaningless there. STATED even at 0 so the argv is
         # an honest statement of what the boot runs, and published ONCE as a
@@ -8593,7 +8623,9 @@ def argv_d(
         # residency without the number appearing. The value follows the
         # overlap choice exactly -- it is not a second knob.
         "--mamba-radix-cache-strategy", "no_buffer" if disable_overlap else "extra_buffer",
-        "--tp-size", "3", "--pp-size", "1",
+        # HW-GENERIC 1002 S2 (enabling): D = TP<N> (PP1) over every card;
+        # from the topology, "--tp-size 3" on the N=3 release.
+        "--tp-size", str(_topo.release_topology(WEG2_CARD_COUNT).d_tp), "--pp-size", "1",
         # OVERLAP SCHEDULE ON for D -- by ABSENCE of the disable flag, which
         # is the only way to have it: there is no --enable-overlap-schedule.
         # Every gate that forces it off was checked against THIS argv and
