@@ -190,6 +190,17 @@ def settle(sched, *, retracted: Sequence, parked: Sequence) -> Optional[str]:
         return None
     gone = {str(r.rid) for r in retracted}
     cands = [str(r.rid) for r in parked if str(r.rid) not in gone]
+    # FLIP-EDGE (02.10., N5d epoch 8 12:52:29): the held facts stat every L3 page of every held
+    # request's span (held_facts: 169224 slot stems -> _stat_stems), which cost the park
+    # rest_ms=1099 on every rank (WEG2-D-PARK TIMING) -- and the vote said "clean": nothing had
+    # been refused. Stage 1 now votes the refusal alone (one MIN, same vector form, no stat);
+    # only when a rank refused (group-uniform after the MIN) are the facts taken and voted.
+    t1 = torch.tensor(pack_vote(refused=bool(refused), need=need_pages(tree, refused),
+                                on_disk=[], whole=[]), dtype=torch.int64)
+    tree._all_reduce_attn_groups(t1, torch.distributed.ReduceOp.MIN, label="park_hold_yield")
+    any_refused, need, _od, _wh = unpack_vote(t1.tolist())
+    if not any_refused:
+        return "clean"
     facts = [held_facts(tree, rid) for rid in cands]
     vec = pack_vote(refused=bool(refused), need=need_pages(tree, refused),
                     on_disk=[d for _h, d in facts], whole=[h > 0 and d == h for h, d in facts])
