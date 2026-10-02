@@ -22,12 +22,13 @@ SEGS = [{"s": 90.0, "e": 99.5, "k": "P"}, {"s": 100.0, "e": 102.0, "k": "flip_pd
 
 
 def _ring(p_rise_ts=None, keys=("P.tp0pp0", "P.tp0pp1", "D.tp0pp0"), t0=95.0, t1=420.0):
-    """1-s rank samples; P.tp0pp1 (the last P stage) forward_ct rises at ``p_rise_ts``."""
+    """1-s rank samples; P.tp0pp0 (first P stage) forward_ct rises at ``p_rise_ts``, P.tp0pp1 (last) 3 s later."""
     out, t = [], t0
     while t <= t1:
         r = {}
         for k in keys:
-            r[k] = {"ts": t, "fwd": 5.0 + (k == "P.tp0pp1" and p_rise_ts is not None and t >= p_rise_ts), "dtok": 1.0}
+            rise = None if p_rise_ts is None else {"P.tp0pp0": p_rise_ts, "P.tp0pp1": p_rise_ts + 3.0}.get(k)
+            r[k] = {"ts": t, "fwd": 5.0 + (rise is not None and t >= rise), "dtok": 1.0}
         out.append({"t": t + 0.5, "r": r})
         t += 1.0
     return out
@@ -50,7 +51,7 @@ def test_dp_ends_at_the_last_stage_forward_and_idle_pd_flip():
     v = ipcboot.flip_views(SEGS, _ipc(102.5), 450.0, _ring(p_rise_ts=204.0))
     dp = v[1]
     assert dp["dir"] == "D>P" and dp["kind"] == "ok"
-    assert round(dp["total_ms"]) == 4400                                     # 199,6 -> 204,0, not the 2300 of the front
+    assert round(dp["total_ms"]) == 4400              # 199,6 -> 204,0 (first forward on PP0), not the front's 2300
     assert (round(dp["vorlauf_ms"]), round(dp["layer_ms"]), round(dp["wake_kv_dc_ms"]), round(dp["nachlauf_ms"]),
             round(dp["rest_ms"])) == (400, 1500, 0, 1500, 1000)
     idle = v[2]

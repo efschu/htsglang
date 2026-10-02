@@ -32,8 +32,9 @@ RUN1 = run(1, T1, {"build": 69, "load": 488, "encode": 838, "attach": 0, "teardo
 RUN2 = run(2, T2, {"build": 55, "load": 478, "encode": 20, "attach": 0, "teardown": 413}, "weg2-1-5")
 
 
-def pp0(ts, runs, live=None):
-    return ipcboot.compact({"ts": ts, "vision": {"runs": len(runs), "live": live, "recent": runs}})
+def pp0(ts, runs, live=None, fwd=0):
+    return ipcboot.compact({"ts": ts, "vision": {"runs": len(runs), "live": live, "recent": runs},
+                            "work": {"forward_ct": fwd}})
 
 
 def ring_of(*samples):
@@ -76,7 +77,8 @@ class VisionPhases(unittest.TestCase):
         # D>P flip done 2 s before the stage; first P chunk after it: the tail is cut by the stage
         fd = [{"flip_begin_ts": T1 - 5.0, "t": T1 - 2.5, "sleep": "D", "wake": "P"}]
         fw = [{"flip_begin_ts": T1 - 5.0, "dir": "D>P", "first_work_ts": T1 + 0.4, "what": "prefill"}]
-        ring = ring_of((T1 - 6.0, pp0(T1 - 6.0, [])), (T1 - 3.0, pp0(T1 - 3.0, [])), (T1 + 0.5, pp0(T1 + 0.5, [RUN1])))
+        # Nutzer 02.10. ~13:05Z: the D>P tail ends at P's first prefill forward (PP0 forward_ct), after the stage
+        ring = ring_of((T1 - 6.0, pp0(T1 - 6.0, [])), (T1 - 3.0, pp0(T1 - 3.0, [])), (T1 + 0.5, pp0(T1 + 0.5, [RUN1], fwd=1)))
         m = activity.Model(ring, fd, fw)
         ks = [x["k"] for x in m.segments(T1 + 0.5) if x["e"] > T1 - 2.5]
         self.assertIn("vis_load", ks)

@@ -573,21 +573,7 @@ def _ring_keys(ring) -> set:
     return keys
 
 
-def _rank_first_rise(ring, key: Optional[str], fields, t_from: float, t_to: float):
-    """The first rise of any of ``fields`` on rank ``key`` whose rank clock lies after ``t_from``:
-    (seen_ts, lo) -- the work began in (lo, seen_ts], lo = max(previous rank clock, t_from).  The rank file
-    is written every SGLANG_WEG2_RANKSTATS_PERIOD_S (1 s), so seen_ts - lo is the instrument's resolution.
-    None when the ring holds no such rise up to ``t_to``."""
-    if not ring or key is None:
-        return None
-    for a, b in activity.rank_pairs(ring, key):
-        if b["ts"] <= t_from:
-            continue
-        if a["ts"] > t_to:
-            break
-        if any((b.get(f) is not None and a.get(f) is not None and b[f] > a[f]) for f in fields):
-            return b["ts"], max(a["ts"], t_from)
-    return None
+_rank_first_rise = activity.first_rise
 
 
 #: the partition of a flip, in time order (Summe = total_ms)
@@ -633,7 +619,7 @@ def flip_partition(start: float, end: float, begin: float, flip_ms, done, lo: Op
 F_PD_START = "flip_first_work.p_end_ts (P>D, Front) / P-Rang-Segment"
 F_PD_END = "flip_first_work.first_work_ts what=decode_token / rankstats D decode.tokens im Ring"
 F_DP_START = "flip_user_time.start_ts (D>P, Front)"
-F_DP_END = "rankstats P.tp0pp<letzte>.work.forward_ct im Ring / flip_user_time.prefill_start_ts (pp_last_forward)"
+F_DP_END = "rankstats P.tp0pp0.work.forward_ct im Ring / flip_user_time.prefill_start_ts (pp_first_forward)"
 
 
 def flip_views(segs: List[dict], ipc: dict, now: float, ring=None) -> List[dict]:
@@ -646,10 +632,12 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None) -> List[dict]
            what=decode_token, wenn >= flip_begin + flip_ms - 0,3 s; sonst erster Anstieg der D-Rang-Zaehler).
            Gemessen NF y7l Flip 2: D dekodierte 1,9 s VOR flip_done (waehrend wake-kv/dc) -- ein Riegel
            "nach flip_done" machte 4,5 s aus 2,6 s.
-      D>P  start = Decode-Ende (flip_user_time.start_ts), end = Beginn des ersten Forwards auf der LETZTEN
-           P-PP-Stufe (der Chunk hat alle Stufen passiert): flip_user_time.prefill_start_ts, wenn die Front
-           ihn als pp_last_forward liefert, sonst der erste Anstieg von rankstats work.forward_ct der letzten
-           P-Stufe (Rang-Takt 1 s, die Aufloesung steht als Rest).  NIE der Leg-1-Dispatch.
+      D>P  start = Decode-Ende (flip_user_time.start_ts), end = Beginn des ersten Prefill-Batches auf P
+           (Nutzer: "... prefill batch beginn") = erster Forward auf der ERSTEN P-Stufe nach dem Wake
+           (activity.dp_prefill_start: flip_user_time.prefill_start_ts pp_first_forward, sonst erster Anstieg
+           von rankstats P.tp0pp0 work.forward_ct, Rang-Takt 1 s als Rest).  NIE der Leg-1-Dispatch.  Die
+           Pipeline-Fuellung PP0 -> PP-letzte (y7l: ~6 s, PP0 3,0-3,5 s + PP1 2,5 s Rechnen) ist Prefill,
+           keine Flipzeit (pp_last_start_ts wird nur genannt).
 
     Teile: flip_partition (Summe = total, Rest explizit).  Fehlt ein Endpunkt, ist kind "fehlt" und
     ``missing`` nennt das Feld -- nie ein Ersatzwert.  ``ring`` = the boot's rank sample ring (the
@@ -662,7 +650,7 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None) -> List[dict]
     fw = {round(float(x.get("flip_begin_ts") or 0), 2): x for x in ipc.get("flip_first_work") or []}
     ut = list(ipc.get("flip_user_time") or [])
     keys = _ring_keys(ring)
-    p_last = activity.stage_keys(keys, "P")[1] if keys else None
+    p_first, p_last = activity.stage_keys(keys, "P") if keys else (None, None)
     d_first = activity.stage_keys(keys, "D")[0] if keys else None
     ring_lo = min((s["t"] for s in ring), default=None) if ring else None
     lo = segs[0]["s"] if segs else now
@@ -748,21 +736,20 @@ def flip_views(segs: List[dict], ipc: dict, now: float, ring=None) -> List[dict]
             p = (u or {}).get("parts") or {}
             if p.get("park_rpc_ms") is not None:
                 row["park_rpc_ms"] = p.get("park_rpc_ms")
-            if u is not None and u.get("prefill_start_source") == "pp_last_forward" and u.get("prefill_start_ts") is not None:
-                end = float(u["prefill_start_ts"])
-                row["end_src"] = "front flip_user_time.prefill_start_ts (pp_last_forward)"
-            else:
-                # the forward on the last stage starts after flip_begin and after P's leg-1 dispatch
-                t_from = max(float(b), start if start is not None else float(b),
-                             float((u or {}).get("prefill_start_ts") or 0.0))
-                r = _rank_first_rise(ring, p_last, ("fwd",), t_from, horizon)
-                if r is not None:
-                    end, e_lo = r
-                    row["end_src"] = "rankstats %s work.forward_ct (erster Forward der letzten PP-Stufe, Rang-Takt)" % p_last
+            if (u or {}).get("pp_last_start_ts") is not None:
+                row["pp_last_start"] = float(u["pp_last_start_ts"])
+            # the first forward starts after flip_begin and after P's leg-1 dispatch
+            t_from = float(b) if (u or {}).get("prefill_start_source") == activity.DP_END_SOURCE else max(
+                float(b), start if start is not None else float(b), float((u or {}).get("prefill_start_ts") or 0.0))
+            r = activity.dp_prefill_start(ring, keys, u, t_from, horizon)
+            if r is not None:
+                end, e_lo, row["end_src"] = r
+                if e_lo == end:
+                    e_lo = None
             if u is not None and u.get("idle_flip"):
                 row["kind"] = "leerlauf"
             elif end is None:
-                if p_last is None or ring_lo is None or ring_lo > b:
+                if p_first is None or ring_lo is None or ring_lo > b:
                     row["kind"], row["missing"] = "fehlt", F_DP_END
                 else:
                     row["kind"] = "offen" if still_open else "leerlauf"

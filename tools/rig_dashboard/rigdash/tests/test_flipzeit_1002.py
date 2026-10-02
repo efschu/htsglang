@@ -3,8 +3,9 @@ Richtungen, beide Modelle -- die eine Zahl; die Teile (Vorlauf, Layer, Wake-KV/D
 ihr.  Zahlen aus NF y7l (boot ...120607Z-068d, Flip 2 P>D 12:10:08 und Flip 3 D>P 12:10:44, events.jsonl und
 der rigdash-Ring als Vorlage):
 
-* D>P endete bisher am Leg-1-Dispatch (2513 ms); der erste Forward auf PP2 kam erst 12:10:53 (PP2-forward_ct
-  6 -> 7 zwischen den Rang-Takten 052,850 und 053,910) -- Flipzeit 9,8 s, Nachlauf 6,2 s + Rest (Takt) 1,06 s.
+* D>P endete bisher am Leg-1-Dispatch (2513 ms).  Ende = erster Prefill-Forward auf P (PP0, Nutzer 13:05Z
+  "... prefill batch beginn"); der erste Forward auf PP2 (12:10:53) liegt ~6 s spaeter -- Pipeline-Fuellung,
+  Prefill, keine Flipzeit.
 * P>D: D gab sein erstes Token 1,9 s VOR flip_done (waehrend wake-kv/dc) -- 2603 ms, nicht 4496 ms.
 """
 
@@ -57,29 +58,47 @@ def _sum(x):
 
 
 class FlipzeitDP(unittest.TestCase):
-    def test_dp_ends_at_first_forward_of_last_pp_stage_not_leg1_dispatch(self):
+    def test_dp_ends_at_first_prefill_forward_on_pp0_not_dispatch_not_pp_last(self):
+        """Nutzer 02.10. ~13:05Z ("... prefill batch beginn"): D>P ends at the first forward on P's FIRST stage.
+        y7l 12:10:44: PP0 forward_ct 6 -> 7 first seen 47,74 (ADMIT PP0 12:10:47); PP2 only at 53,91 -- the
+        ~6 s between are PP0 + PP1 computing chunk 1 (pipeline fill = prefill, not flip)."""
         x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, _ring())[0]
         self.assertEqual(x["kind"], "ok")
-        self.assertAlmostEqual(x["end"], T + 53.910, places=3)          # PP2 forward_ct 6 -> 7 first seen
-        self.assertAlmostEqual(x["total_ms"], (53.910 - 44.096) * 1000, delta=1)
-        self.assertGreater(x["total_ms"], 9000)                           # never the 2513 of the leg-1 dispatch
-        self.assertIn("P.tp0pp2", x["end_src"])
-        # the partition: vorlauf 221 + layer 2288 + wake-kv/dc ~0 + nachlauf to the previous rank clock + rest (clock)
+        self.assertAlmostEqual(x["end"], T + 47.74, places=3)            # PP0 forward_ct 6 -> 7 first seen
+        self.assertAlmostEqual(x["total_ms"], (47.74 - 44.096) * 1000, delta=1)
+        self.assertIn("P.tp0pp0", x["end_src"])
+        self.assertNotAlmostEqual(x["total_ms"], 2513, delta=50)          # never the leg-1 dispatch
         self.assertAlmostEqual(x["vorlauf_ms"], 221, delta=1)
         self.assertAlmostEqual(x["layer_ms"], 2288, delta=1)
-        self.assertAlmostEqual(x["nachlauf_ms"], (52.845 - 46.605589) * 1000, delta=2)
-        self.assertAlmostEqual(x["rest_ms"], (53.910 - 52.845) * 1000, delta=2)      # the rank clock, as in y7l
+        self.assertAlmostEqual(x["nachlauf_ms"], (46.74 - 46.605589) * 1000, delta=2)
+        self.assertAlmostEqual(x["rest_ms"], 1000.0, delta=2)             # the rank clock (lo 46,74 -> seen 47,74)
         self.assertAlmostEqual(x["end_res_ms"], x["rest_ms"], delta=0.01)
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)
 
-    def test_dp_front_pp_last_forward_is_exact_and_preferred(self):
-        x = ipcboot.flip_views(SEGS, _ipc_dp("pp_last_forward", 53.23), T + 60.0, _ring())[0]
-        self.assertAlmostEqual(x["end"], T + 53.23, places=3)
+    def test_dp_front_pp_first_forward_is_exact_and_preferred(self):
+        ipc = _ipc_dp("pp_first_forward", 47.21)
+        ipc["flip_user_time"][0]["pp_last_start_ts"] = T + 53.23
+        x = ipcboot.flip_views(SEGS, ipc, T + 60.0, _ring())[0]
+        self.assertAlmostEqual(x["end"], T + 47.21, places=3)
         self.assertEqual(x["rest_ms"], 0.0)
+        self.assertAlmostEqual(x["pp_last_start"], T + 53.23, places=3)   # named, not part of the flip
         self.assertAlmostEqual(_sum(x), x["total_ms"], delta=1e-6)
+        # a stamp at the leg-1 dispatch is not the end
+        y = ipcboot.flip_views(SEGS, _ipc_dp("leg1_dispatch", 46.608), T + 60.0, _ring())[0]
+        self.assertAlmostEqual(y["end"], T + 47.74, places=3)
 
-    def test_dp_without_last_stage_counter_is_missing_not_small(self):
+    def test_phase_bar_draws_pipeline_fill_as_prefill(self):
+        from rigdash import activity
+        ipc = _ipc_dp()
+        fd = [dict(e["data"]) for e in ipc["ipc_events"] if e["type"] == "flip_done"]
+        m = activity.Model(_ring(), fd, ipc["flip_first_work"], None, ipc["flip_user_time"])
+        tail = [t for t in m.tails() if t[2] == "D>P"]
+        self.assertEqual(len(tail), 1)
+        self.assertAlmostEqual(tail[0][1], T + 47.74, places=3)           # Nachlauf ends at PP0's first forward
+
+    def test_dp_without_pp0_counter_is_missing_not_small(self):
         ring = [{"t": s["t"], "r": {k: v for k, v in s["r"].items() if k.startswith("D")}} for s in _ring()]
+        # (no P rank in the ring: P's first stage cannot be read)
         x = ipcboot.flip_views(SEGS, _ipc_dp(), T + 60.0, ring)[0]
         self.assertEqual(x["kind"], "fehlt")
         self.assertIsNone(x["total_ms"])

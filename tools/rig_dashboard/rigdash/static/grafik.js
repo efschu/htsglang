@@ -110,7 +110,7 @@
         const age = f.last_t ? Math.max(0, d.now - f.last_t) : null;
         return tile("Flipzeit " + dir.replace(">", "→"), big(sx(f.last_ms), "s"),
           `zuletzt${age != null ? " vor " + fmtN(age / 60, 0) + " min" : ""} · p50 ${sx(f.p50_ms)} · p90 ${sx(f.p90_ms)} · max ${sx(f.max_ms)} s (n=${f.n || 0}) · `
-          + (dir === "P>D" ? "P-Chunk-Ende → erstes Decode-Token" : "Decode-Ende → erster Forward der letzten P-Stufe"), s.flip);
+          + (dir === "P>D" ? "P-Chunk-Ende → erstes Decode-Token" : "Decode-Ende → erster Prefill-Forward auf P (PP0)"), s.flip);
       }),
     ].join("");
     $("hw-tiles").innerHTML = [
@@ -359,7 +359,7 @@
       scales: { y: { range: zeroUp(1000) } },
       axes: [axisX(), axisY((v) => v == null ? "–" : fmtN(v / 1000, 1) + " s")],
       series: [{}, line("P→D", C.s1, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s1 }, noDot: true }),
-        line("D→P (Decode-Ende → erster Forward der letzten P-Stufe)", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
+        line("D→P (Decode-Ende → erster Prefill-Forward auf P (PP0))", C.s2, "s", { value: valFmt("s", 2, null, 0.001), width: 0, fill: undefined, points: { show: true, size: 7, fill: C.s2 }, noDot: true })],
     }, rowsFlips(d));
     // Karten: Leistungsaufnahme als Summe (kräftig, Fläche), die Einzelkarten dünn darunter
     charts.power = mk("hw-c-power", {

@@ -428,7 +428,7 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
       <div class="vp"><h3><span>Decode-Durchsatz <span class="muted">tok/s &middot; alle Streams und je Stream</span></span><span id="vl-s-dec"></span></h3><div class="u" id="vl-c-dec"></div></div>
       <div class="vp"><h3><span>Input-Tokens: aus Cache / neu gerechnet <span class="muted">tok/s, gestapelt &middot; Übergabe P&rarr;D gestrichelt, nie Cache</span></span><span id="vl-s-cache"></span></h3><div class="u" id="vl-c-cache"></div></div>
       <div class="vp"><h3><span>KV-Cache-Belegung <span class="muted">% der KV-Token je Gruppe</span></span><span id="vl-s-kv"></span></h3><div class="u" id="vl-c-kv"></div></div>
-      <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; letztes Token &rarr; erstes Token &middot; P&rarr;D: P-Chunk-Ende &rarr; erstes Decode-Token &middot; D&rarr;P: Decode-Ende &rarr; erster Forward der letzten P-Stufe (ab 02.10.)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
+      <div class="vp w2"><h3><span>Flipzeit je Flip <span class="muted">s &middot; letztes Token &rarr; erstes Token &middot; P&rarr;D: P-Chunk-Ende &rarr; erstes Decode-Token &middot; D&rarr;P: Decode-Ende &rarr; erster Prefill-Forward auf P (PP0) (ab 02.10.)</span></span><span id="vl-s-flip"></span></h3><div class="u" id="vl-c-flip"></div></div>
     </div>
     <div class="vl-grafana" id="vl-grafana"></div>
   </section>
@@ -765,7 +765,7 @@ function decodeDetailTip(x) {
 function phaseTip(x, single) {
   const when = `${hhmm(x.s)}&ndash;${x.running ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
   if (x.k === "flip_pd" || x.k === "flip_dp") return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}<br>${when} <span class="muted">flip_begin bis flip_done (events.jsonl, Front-Uhr)</span>`;
-  if (x.k === "flip_tail") return `<b>Flip-Nachlauf</b> &middot; ${dur(x.e - x.s)} &middot; flip_done bis zur ersten Arbeit (P&rarr;D: erstes Decode-Token; D&rarr;P: erster Forward der letzten P-Stufe)<br>${when}`;
+  if (x.k === "flip_tail") return `<b>Flip-Nachlauf</b> &middot; ${dur(x.e - x.s)} &middot; flip_done bis zur ersten Arbeit (P&rarr;D: erstes Decode-Token; D&rarr;P: erster Prefill-Forward auf P (PP0))<br>${when}`;
   if (VIS_TIP[x.k]) {
     const legs = x.legs_ms ? Object.entries(x.legs_ms).map(([k, v]) => `${esc(k)} ${fmt(v)} ms`).join(", ") : "";
     return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}${x.vis_live ? " &middot; l&auml;uft (" + esc(x.vis_live) + ")" : ""}<br>${when}`
@@ -1483,7 +1483,7 @@ function historyHtml(boots, now) {
     const p = (b.prefill || {})[g];
     return p && p.last_burst && p.last_burst.tps != null ? fmt(p.last_burst.tps) : "—";
   };
-  return `<table><tr><th>Modell</th><th>Tag</th><th class="num" title="Boot-Start (boot_id) bis Ende bzw. letztes IPC-Lebenszeichen">Dauer</th><th class="num" title="Boot-Start (boot_id) bis serving (state.json serving_since_ts)">Bootzeit</th><th class="num">letzte IPC-Probe</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Flipzeit = letztes Token → erstes Token, p50 / p90 / max je Richtung (laufender Boot: flip_views; beendeter: VictoriaMetrics weg2_flip_user_view_ms def=t2t)">Flipzeit P&rarr;D<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="wie links, D→P bis zum ersten Forward auf der letzten P-Stufe">Flipzeit D&rarr;P<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
+  return `<table><tr><th>Modell</th><th>Tag</th><th class="num" title="Boot-Start (boot_id) bis Ende bzw. letztes IPC-Lebenszeichen">Dauer</th><th class="num" title="Boot-Start (boot_id) bis serving (state.json serving_since_ts)">Bootzeit</th><th class="num">letzte IPC-Probe</th><th class="num">P-Prefill</th><th class="num">D-Prefill</th><th class="num">Decode</th><th class="num">Flips</th><th class="num" title="Flipzeit = letztes Token → erstes Token, p50 / p90 / max je Richtung (laufender Boot: flip_views; beendeter: VictoriaMetrics weg2_flip_user_view_ms def=t2t)">Flipzeit P&rarr;D<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="wie links, D→P bis zum ersten Prefill-Forward auf P (PP0)">Flipzeit D&rarr;P<br><span class="muted">p50 / p90 / max s</span></th><th class="num" title="Summe #new-token, Prefill batch, nur PP0">P neu &Sigma;<br><span class="muted">#new-token PP0</span></th><th class="num" title="Summe #new-token, Prefill batch, nur TP0">D neu &Sigma;<br><span class="muted">#new-token TP0</span></th><th class="num" title="Summe completion_tokens der Front-Zeilen WEG2-SERVED">dekodiert &Sigma;<br><span class="muted">WEG2-SERVED</span></th><th>Ende</th></tr>` +
     rows.map((b) => `<tr><td>${esc((b.meta || {}).model || "")}</td><td class="mono">${esc((b.meta || {}).tag || b.stem)}</td><td class="num">${ago(b.dur_s)}</td><td class="num">${b.boot_s == null ? "—" : fmt(b.boot_s, 0) + " s"}</td><td class="num">vor ${ago(b.age_s)}</td><td class="num">${r(b, "P")}</td><td class="num">${r(b, "D")}</td><td class="num">${decCell(b)}</td><td class="num">${fmt(b.flip_count)}</td><td class="num">${flipCell(b, "P>D")}</td><td class="num">${flipCell(b, "D>P")}</td><td class="num">${fmt((b.totals || {}).p_new)}</td><td class="num">${fmt((b.totals || {}).d_new)}</td><td class="num">${fmt((b.totals || {}).decoded)}${(b.totals || {}).read_progress < 1 ? "*" : ""}</td>${endCell(b)}</tr>`).join("") +
     `</table><div class="muted" style="font-size:12px;margin-top:4px">Prefill-Spalten: Rechenrate (gpu-ms) des letzten Schubs, langsamster Rang; Decode: Mittel über die ganze Dekodierzeit des Boots (Token / Decode-Sekunden, nur stetige Intervalle), darunter Ø Sitze; der letzte Wert steht im Tooltip.</div>`;
 }
@@ -1497,7 +1497,7 @@ const sec = (ms) => ms == null || !isFinite(ms) ? "—" : fmt(ms / 1000, ms < 10
 // Nutzer 02.10.: FLIPZEIT = letztes Token der abgebenden Phase -> erstes Token der annehmenden (beide Richtungen,
 // beide Modelle), die eine Zahl.  Layer/Vorlauf/Nachlauf nur als Teile, die zusammen die Flipzeit ergeben (+ Rest).
 const FLIP_DEF = {"P>D": "Ende des letzten P-Prefill-Chunks → erstes Decode-Token auf D",
-  "D>P": "letztes Decode-Token auf D → Beginn des ersten Prefill-Forwards auf der letzten P-Stufe (alle PP-Stufen passiert)"};
+  "D>P": "letztes Decode-Token auf D → Beginn des ersten Prefill-Batches auf P (erster Forward auf PP0; die Pipeline-Füllung PP0 → letzte Stufe ist Prefill)"};
 function flipParts(x) {
   if (!x || x.total_ms == null) return "";
   const p = (k, v) => `${k} ${sec(v)}`;

@@ -184,14 +184,16 @@ class TestPhaseStates(unittest.TestCase):
         unk = [x for x in m.segments(40.0) if x["k"] == "unknown"]
         self.assertTrue(unk and unk[-1]["s"] <= 30.0 and unk[-1]["e"] >= 38.0)
 
-    def test_dp_tail_runs_to_the_first_p_chunk(self):
-        # D>P: the first-work stamp is only the leg-1 dispatch; the tail ends where P's first chunk starts
+    def test_dp_tail_runs_to_the_first_prefill_forward(self):
+        # D>P: the first-work stamp is only the leg-1 dispatch; the tail ends at P's first prefill forward
+        # (PP0 work.forward_ct, Nutzer 02.10. ~13:05Z) -- here the first chunk's start
         ring = []
         for i in range(21):
             t = float(i)
             done = 1 if t >= 12.0 else 0
             ring.append({"t": t, "front": {"queue": 0, "outstanding": 0},
-                         "r": {"P.tp0pp0": ipcboot.compact({"ts": t, "prefill": {"chunks": done, "new_tokens": 16384 * done,
+                         "r": {"P.tp0pp0": ipcboot.compact({"ts": t, "work": {"forward_ct": 1 if t >= 10.0 else 0},
+                                                            "prefill": {"chunks": done, "new_tokens": 16384 * done,
                                                                                   "compute_ms": 2000.0 * done,
                                                                                   "last": {"t": 12.0, "gpu_ms": 2000.0, "new": 16384} if done else None}})}})
         fd = [{"sleep": "D", "wake": "P", "flip_begin_ts": 4.0, "t": 6.0}]

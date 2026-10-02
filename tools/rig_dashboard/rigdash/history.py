@@ -926,7 +926,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
             "power": "NVML, Summe aller Karten",
             "cache_tiers": ("state.json front.served_tokens.*.cached_tier" if src_tiers == "ipc"
                             else "– (Feld served_tokens.*.cached_tier ab Image z30y2, 9266bdfb8d)"),
-            "flip": "Flipzeit = letztes Token → erstes Token (ipcboot.flip_views, flip_t2t, ab 02.10.): P→D P-Chunk-Ende → erstes Decode-Token, D→P Decode-Ende → erster Forward der letzten P-Stufe",
+            "flip": "Flipzeit = letztes Token → erstes Token (ipcboot.flip_views, flip_t2t, ab 02.10.): P→D P-Chunk-Ende → erstes Decode-Token, D→P Decode-Ende → erster Prefill-Forward auf P (PP0)",
             "marks": "state.json (Boot-ID, lifecycle) + events.jsonl flip_first_work",
         },
         "errors": dict(rec.errors) if rec else dict((db.get("rec.state") or {}).get("errors") or {}),

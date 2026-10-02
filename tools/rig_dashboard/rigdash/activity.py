@@ -80,6 +80,43 @@ def rank_pairs(ring, key: str):
     return out
 
 
+def first_rise(ring, key: Optional[str], fields, t_from: float, t_to: float):
+    """The first rise of any of ``fields`` on rank ``key`` whose rank clock lies after ``t_from``:
+    (seen_ts, lo) -- the work began in (lo, seen_ts], lo = max(previous rank clock, t_from).  The rank file
+    is written every SGLANG_WEG2_RANKSTATS_PERIOD_S (1 s), so seen_ts - lo is the instrument's resolution.
+    None when the ring holds no such rise up to ``t_to``."""
+    if not ring or key is None:
+        return None
+    for a, b in rank_pairs(ring, key):
+        if b["ts"] <= t_from:
+            continue
+        if a["ts"] > t_to:
+            break
+        if any((b.get(f) is not None and a.get(f) is not None and b[f] > a[f]) for f in fields):
+            return b["ts"], max(a["ts"], t_from)
+    return None
+
+
+#: the front's stamp of the D>P end (Nutzer 02.10. ~13:05Z: "... prefill batch beginn"): the first forward on
+#: P's FIRST stage after the wake; pp_last_start_ts rides along (the pipeline fill PP0 -> PP-last is prefill)
+DP_END_SOURCE = "pp_first_forward"
+
+
+def dp_prefill_start(ring, keys, u: Optional[dict], t_from: float, t_to: float):
+    """D>P end = Beginn des ersten Prefill-Forwards auf P (erste PP-Stufe) nach dem Wake -- (end, lo, src):
+    the front's flip_user_time.prefill_start_ts when it is a ``pp_first_forward`` stamp (exact, lo = end),
+    else the first rise of rankstats work.forward_ct of P's first stage (TP0/PP0) after ``t_from``, bounded by
+    the rank clock (lo = previous rank clock).  Never the leg-1 DISPATCH.  None when neither is there."""
+    if u is not None and u.get("prefill_start_source") == DP_END_SOURCE and u.get("prefill_start_ts") is not None:
+        t = float(u["prefill_start_ts"])
+        return t, t, "front flip_user_time.prefill_start_ts (%s)" % DP_END_SOURCE
+    k0 = stage_keys(keys, "P")[0] if keys else None
+    r = first_rise(ring, k0, ("fwd",), t_from, t_to)
+    if r is None:
+        return None
+    return r[0], r[1], "rankstats %s work.forward_ct (erster Prefill-Forward auf P, Rang-Takt)" % k0
+
+
 def chunks(ring, keys, g: str) -> List[dict]:
     """Prefill chunks of group g with the time they really ran.
 
@@ -596,38 +633,60 @@ class Model:
                 out.append((lv["since"], end, k, dict(lv, live=True)))
         return out
 
-    def tails(self) -> List[Tuple[float, float, str]]:
-        """Flip tail = flip_done -> first work after it: P>D the first decode token (flip_first_work),
-        D>P the P prefill start (flip_user_time, else flip_first_work's first work); what="none" has none."""
+    def _dp_user_time(self, b: float, done: float) -> Optional[dict]:
+        return next((u for u in self.user_time if done - 30 <= u["prefill_start_ts"] and u["prefill_start_ts"] >= b
+                     and abs((u.get("start_ts") or b) - b) < 30), None)
+
+    def _dp_ends(self) -> List[Tuple[float, float, Optional[float]]]:
+        """(done, end, first chunk start) per D>P flip: end = dp_prefill_start (first forward on P's first
+        stage, Nutzer 02.10.), the first chunk start of the burst after it (the rank prefill.last record),
+        which lies later on PP > 1 -- the stretch between is P's pipeline fill, prefill, not flip."""
         out = []
+        pcs = self.pchunks.get("P", []) + self.pchunks.get("single", [])
         for x in self.first_work:
-            if x.get("what") == "none":
+            if x.get("what") == "none" or x.get("dir") != "D>P":
                 continue
             b = x["flip_begin_ts"]
             done = next((e for s, e in self.flips if abs(s - b) < 1.0), None)
             if done is None:
                 continue
-            end = None
-            if x.get("dir") == "D>P":
-                u = next((u for u in self.user_time if done - 30 <= u["prefill_start_ts"] and u["prefill_start_ts"] >= b
-                          and abs((u.get("start_ts") or b) - b) < 30), None)
-                if u is not None:
-                    end = u["prefill_start_ts"]
-            if end is None and x.get("first_work_ts") is not None:
-                end = float(x["first_work_ts"])
-            if end is None and x.get("flip_time_ms") is not None:
-                end = b + float(x["flip_time_ms"]) / 1000.0
-            if x.get("dir") == "D>P" and end is not None:
-                # the front's first-work stamp for D>P is the leg-1 DISPATCH (flip_user_time
-                # prefill_start_source "leg1_dispatch" on y4z too); P's prefill really starts with its
-                # first chunk (rank prefill.last) -- measured NF y4z 30.09.: up to 5 s later
-                pcs = self.pchunks.get("P", []) + self.pchunks.get("single", [])
-                first = min((c["s"] for c in pcs if done - 0.5 <= c["s"] <= done + 20.0), default=None)
-                if first is not None and first > end:
-                    end = first
+            u = self._dp_user_time(b, done)
+            # the first forward starts after flip_begin and after P's leg-1 dispatch
+            t_from = float(b)
+            if u is not None and u.get("prefill_start_source") != DP_END_SOURCE:
+                t_from = max(t_from, float(u.get("prefill_start_ts") or 0.0))
+            r = dp_prefill_start(self.ring, self.keys, u, t_from, done + 120.0)
+            if r is None:
+                continue
+            first = min((c["s"] for c in pcs if done - 0.5 <= c["s"] <= r[0] + 30.0), default=None)
+            out.append((done, r[0], first))
+        return out
+
+    def tails(self) -> List[Tuple[float, float, str]]:
+        """Flip tail = flip_done -> first work after it: P>D the first decode token (flip_first_work), D>P the
+        first prefill forward on P's first stage (dp_prefill_start -- never the leg-1 dispatch); what="none"
+        has none."""
+        out = []
+        for x in self.first_work:
+            if x.get("what") == "none" or x.get("dir") == "D>P":
+                continue
+            b = x["flip_begin_ts"]
+            done = next((e for s, e in self.flips if abs(s - b) < 1.0), None)
+            if done is None:
+                continue
+            end = float(x["first_work_ts"]) if x.get("first_work_ts") is not None else (
+                b + float(x["flip_time_ms"]) / 1000.0 if x.get("flip_time_ms") is not None else None)
             if end is not None and end > done:
                 out.append((done, end, x.get("dir") or ""))
+        for done, end, _ in self._dp_ends():
+            if end > done:
+                out.append((done, end, "D>P"))
         return out
+
+    def pipeline_fills(self) -> List[Tuple[float, float]]:
+        """P's pipeline fill after a D>P flip: first forward on PP0 -> start of the first chunk record (on PP > 1
+        the chunk passes PP0, PP1, ... before the last stage starts) -- prefill, drawn as P."""
+        return [(end, first) for _, end, first in self._dp_ends() if first is not None and first > end]
 
     def _flip_kind(self, sleep, wake) -> str:
         return "flip_dp" if (sleep, wake) == ("D", "P") else "flip_pd"
@@ -648,6 +707,8 @@ class Model:
                 raw.append((x["flip_begin_ts"], end_all, self._flip_kind(x.get("sleep"), x.get("wake")), 0))
         for s, e, _ in self.tails():
             raw.append((s, e, "flip_tail", 1))
+        for s, e in self.pipeline_fills():
+            raw.append((s, e, "P", 2))
         for s, e, k, _ in self.vision_spans(now):
             raw.append((s, e, k, VIS_PRIO))
         for g, cs in self.pchunks.items():
