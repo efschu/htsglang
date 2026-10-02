@@ -1,7 +1,9 @@
 """HW-GENERIC 1002: the ``card_identity`` CLI is the release entrypoint's GPU gate.
 
 User order 02.10.: the release runs on any sm_86/sm_120 NVIDIA card set, not
-only 1x RTX 5090 + 2x RTX 3080 (sm_89 out of scope). The entrypoint's
+only 1x RTX 5090 + 2x RTX 3080. SM89-DURCHSPIEL-1002: sm_89 passes the arch
+gate too -- it has no calibration class, so it lands on HW-UNCALIBRATED
+(rc 4) rather than HW-ARCH. The entrypoint's
 ``preflight_gpus`` (staged: /spinning/gpu-arb/docker/entrypoint.sh.hwgeneric-staged)
 runs ``python -m sglang.srt.weg2.card_identity --expect-count N [--inventory L]``
 and acts on its exit code and on the FIRST line carrying one of these prefixes:
@@ -68,6 +70,7 @@ INVENTORIES = {
     ],
     "rig_plus_4090": [_r3080(0), _r5090(1), _r3080(2),
                       _card(3, "NVIDIA GeForce RTX 4090", 24564, (8, 9), 384, 10501)],
+    "3x4090": [_card(i, "NVIDIA GeForce RTX 4090", 24564, (8, 9), 384, 10501) for i in range(3)],
     "4x_sm86": [_r3080(i) for i in range(4)],
     # a stock 10 GB RTX 3080 is NOT the 20 GB calibration class
     "rig_10g_3080": [_r3080(0, mib=10240), _r5090(1), _r3080(2)],
@@ -156,14 +159,25 @@ def test_pro6000_two_a6000_uncalibrated_biggest_first(run_cli):
     assert "RTXA6000/49140MiB/sm86 vs calibrated RTX3080" in msg
 
 
-def test_sm89_card_refused_by_arch_before_count(run_cli):
-    # 4 cards with --expect-count 3: the arch gate speaks first
+def test_sm89_card_passes_the_gate_and_the_count_speaks(run_cli):
+    # SM89-DURCHSPIEL-1002: 4 cards with --expect-count 3 -- the arch gate no
+    # longer speaks for 8.9, the COUNT refusal does (and names all four cards).
     rc, out = run_cli("rig_plus_4090", "--expect-count", "3", "--inventory", REF_INV)
     assert rc == 3, out
-    msg = _named(out, "refuse HW-ARCH:")
-    assert "nvml3 'NVIDIA GeForce RTX 4090': compute capability 8.9 (sm89)" in msg
-    assert "nvml0" not in msg and "nvml1" not in msg
-    assert "HW-COUNT" not in out and not _ordinal_rows(out)
+    msg = _named(out, "refuse HW-COUNT:")
+    assert "4 card(s) visible, this launch needs exactly 3" in msg
+    assert "HW-ARCH" not in out
+
+
+def test_pure_sm89_inventory_is_uncalibrated_not_refused(run_cli):
+    # 8.9 is arch-accepted; with no calibration class it names the
+    # HW-UNCALIBRATED path and the calibration procedure.
+    rc, out = run_cli("3x4090", "--expect-count", "3", "--inventory", REF_INV)
+    assert rc == 4, out
+    msg = _named(out, "HW-UNCALIBRATED:")
+    assert "RTX4090/24564MiB/sm89" in msg
+    assert "card_rate_pass --run" in msg
+    assert "HW-ARCH" not in out
 
 
 def test_four_sm86_cards_refused_by_count(run_cli):

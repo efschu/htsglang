@@ -306,8 +306,13 @@ def summarize_captures(entries: Sequence[dict]) -> dict:
 #: anchor was written under a different key recipe" from "this rig never
 #: booted that shape". v2 (#513) added the attention backend, the page size
 #: and the capture-bs LIST; v1 anchors no longer match and are rebuilt by
-#: re-running ``scan_boot_logs`` over the boot logs they came from.
-ANCHOR_KEY_VERSION = "v2"
+#: re-running ``scan_boot_logs`` over the boot logs they came from. v3
+#: (K8, SM89-DURCHSPIEL-1002 / HW-GENERISCH-1002 6) adds the CARD CLASS:
+#: graph memory belongs to the cards as much as to the config, and a key
+#: without cards handed a rig of different cards the measurement labelled
+#: "measured". v2 anchors no longer match and are rebuilt by a scan (the
+#: boot logs are local, and their cards are this machine's cards).
+ANCHOR_KEY_VERSION = "v3"
 
 
 def anchor_key(meta: dict) -> str:
@@ -327,10 +332,21 @@ def anchor_key(meta: dict) -> str:
     attention backend was absent although ``BASE_MIB`` below is documented as
     the "flashinfer workspace", i.e. the module's own account of the quantity
     is backend-dependent. ``page_size`` joins them for the same reason.
+
+    K8 (SM89-DURCHSPIEL-1002 / HW-GENERISCH-1002 6): so does the CARD
+    CLASS. A key without cards handed a foreign rig -- e.g. an sm_89 Ada
+    box running the mirrored config -- the reference rig's measurement with
+    provenance "measured". The segment is the sorted ``weg2.card_identity``
+    class labels (calibration class, else the card key
+    ``<model>/<MiB>/sm<cc>``); ``?`` when NVML cannot answer -- and ``?``
+    matches only ``?``, so an unknown card set never claims a known rig's
+    anchor either. The store is machine-local, so live NVML at scan/lookup
+    time is the honest attribution of a locally parsed local boot.
     """
     model = os.path.basename(str(meta.get("model_path") or "").rstrip("/"))
     algo = meta.get("speculative_algorithm") or "off"
     bs = meta.get("decode_bs") or []
+    cards = meta.get("card_classes")
     return "|".join(
         [
             ANCHOR_KEY_VERSION,
@@ -344,8 +360,25 @@ def anchor_key(meta: dict) -> str:
             f"attn:{meta.get('attention_backend') or 'auto'}",
             f"page:{meta.get('page_size') or 1}",
             "bs:" + ",".join(str(int(x)) for x in bs),
+            "cards:" + ("+".join(str(c) for c in sorted(cards)) if cards else "?"),
         ]
     )
+
+
+def live_card_classes() -> Optional[tuple]:
+    """The class labels (:func:`sglang.srt.weg2.card_identity.class_label`)
+    of the cards on THIS machine, sorted -- the K8 anchor-key card segment.
+    None when NVML cannot be asked (no pynvml/no replay file): the key then
+    says ``?``, which matches only ``?``."""
+    try:
+        from sglang.srt.registry import nvml as _nvml
+        from sglang.srt.weg2 import card_identity as _ci
+    except Exception:  # noqa: BLE001 -- desk tooling must not break on a missing optional dep
+        return None
+    try:
+        return tuple(sorted(_ci.class_label(d) for d in _nvml.list_devices()))
+    except Exception:  # noqa: BLE001 -- "cannot ask NVML" is an answer, not a crash
+        return None
 
 
 class AnchorStore:
@@ -431,6 +464,12 @@ def scan_boot_logs(
         meta = parse_boot_meta(text)
         if not meta:
             continue
+        # K8: the cards of a locally parsed LOCAL boot are this machine's
+        # cards -- attribute them (``?`` when NVML cannot be asked).
+        if "card_classes" not in meta:
+            cards = live_card_classes()
+            if cards is not None:
+                meta["card_classes"] = cards
         entries = parse_capture_lines(text)
         if not entries:
             continue
@@ -592,6 +631,8 @@ def estimate(
             ),
             "speculative_adaptive": spec.get("speculative_adaptive"),
             "decode_bs": geom.get("decode_bs"),
+            # K8: ask for the anchor of THIS machine's cards only.
+            "card_classes": live_card_classes(),
         }
         hit = store.lookup(meta)
         if hit:
