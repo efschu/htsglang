@@ -390,6 +390,25 @@ def flip_windows(flip_done: List[dict]) -> List[Tuple[float, float]]:
                   if x.get("flip_begin_ts") is not None and x.get("t") is not None and x["t"] >= x["flip_begin_ts"])
 
 
+def open_flips(begins: Optional[List[dict]], flips: List[Tuple[float, float]]) -> List[dict]:
+    """flip_begin events without a flip_done.  Only the newest begin can still be in flight: one front runs
+    one flip at a time, so a begin that a later begin follows was abandoned (NF y8c 0cf3 19:33:06, the boot's
+    first D>P begun, then begun anew at 19:33:20 with the same epoch_before -- drawn as open to "now" it
+    painted every later P phase as FLIP D->P).  Such a begin ends at the next begin (``open_end``); the newest
+    one has ``open_end`` None = still open."""
+    done_b = [s for s, _ in flips]
+    starts = sorted({float(x["flip_begin_ts"]) for x in begins or () if x.get("flip_begin_ts") is not None}
+                    | set(done_b))
+    out = []
+    for x in begins or ():
+        b = x.get("flip_begin_ts")
+        if b is None or any(abs(b - d) < 1.0 for d in done_b):
+            continue
+        nxt = next((t for t in starts if t > b + 1.0), None)
+        out.append(dict(x, open_end=nxt))
+    return out
+
+
 def _minus(s: float, e: float, wins) -> List[Tuple[float, float]]:
     """[s, e] without the windows."""
     parts = [(s, e)]
@@ -604,9 +623,7 @@ class Model:
         self.first_work = [x for x in first_work or () if x.get("flip_begin_ts") is not None]
         self.user_time = [x for x in user_time or () if x.get("prefill_start_ts") is not None]
         self.life = life or {}
-        done_b = [s for s, _ in self.flips]
-        self.open_flips = [x for x in begins or () if x.get("flip_begin_ts") is not None
-                           and not any(abs(x["flip_begin_ts"] - b) < 1.0 for b in done_b)]
+        self.open_flips = open_flips(begins, self.flips)
         self.pchunks = {g: chunks(self.ring, self.keys, g) for g in self.groups if g in ("P", "D", "single")}
         dg = "D" if "D" in self.groups else ("single" if "single" in self.groups else None)
         self.dec_group = dg
@@ -703,8 +720,9 @@ class Model:
             raw.append((x["flip_begin_ts"], x["t"], self._flip_kind(x.get("sleep"), x.get("wake")), 0))
         end_all = now if now is not None else (self.ring[-1]["t"] if self.ring else None)
         for x in self.open_flips:
-            if end_all is not None and end_all > x["flip_begin_ts"]:
-                raw.append((x["flip_begin_ts"], end_all, self._flip_kind(x.get("sleep"), x.get("wake")), 0))
+            end = x["open_end"] if x["open_end"] is not None else end_all
+            if end is not None and end > x["flip_begin_ts"]:
+                raw.append((x["flip_begin_ts"], end, self._flip_kind(x.get("sleep"), x.get("wake")), 0))
         for s, e, _ in self.tails():
             raw.append((s, e, "flip_tail", 1))
         for s, e in self.pipeline_fills():
