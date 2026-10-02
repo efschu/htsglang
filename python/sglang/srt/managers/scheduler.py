@@ -20220,6 +20220,26 @@ class Scheduler(
             if _l15_res is not None:
                 pass
             else:
+                # L15-D2FIX (LCWAKE D2): a sleep that arms no hold must not
+                # leave a previous sleep's keep set on the allocations -- a
+                # refused (W29) wake bails before the restore that clears it,
+                # and only a retaining sleep REPLACES keep sets. Master on and
+                # D parked only (the retain hook's own gate); master off is
+                # byte-identical. Same base walk as the wake's clear.
+                try:
+                    from sglang.srt.weg2 import l15_plan as _l15_pl
+                    if _l15_pl.master_on(os.environ) and (
+                        getattr(self, "weg2_d_parked", None) is not None
+                    ):
+                        _wu = getattr(self, "weight_updater", None)
+                        _n = (_wu._l15_clear_tms_keep_spans(self)
+                              if _wu is not None else 0)
+                        logger.info("L15-KEEP-CLEAR at=sleep rank=%d bases=%d",
+                                    int(getattr(getattr(self, "ps", None),
+                                                "tp_rank", 0) or 0), int(_n))
+                except Exception as exc:  # noqa: BLE001 -- cleanup only
+                    logger.warning("L15-KEEP-CLEAR at=sleep failed (%s: %s)",
+                                   type(exc).__name__, exc)
                 self.tree_cache.reset()
                 self.req_to_token_pool.clear()
                 self.token_to_kv_pool_allocator.clear()
