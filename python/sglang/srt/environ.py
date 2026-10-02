@@ -908,6 +908,11 @@ class Envs:
     # the cap strands it and D prefills it after the P->D flip (y6z ep 2,
     # weg2-1-7: 2.03 s with every seat stalled). Design law E2: on.
     SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES = EnvBool(True)
+    # FLIPCYCLE H5b (02.10., weg2/front._d_direct_yields): a SHORT arrival does
+    # not start a D-direct prefill while a P-bound request is queued (the D->P
+    # flip is foreseeable; its park would wait the whole 1.2-3.8 s D pass). It
+    # rides P's batch. Off = the D pass runs and the park waits behind it.
+    SGLANG_WEG2_ENABLE_D_DIRECT_YIELD = EnvBool(True)
     # PAUSE-MAPS (30.09., tms_csrc patch 5, weg2/pause_overlap.arm_pause_maps):
     # the saver's pause releases a span-mapped (H95c) allocation with ONE
     # cuMemUnmap per contiguous run of extents instead of one per extent.
