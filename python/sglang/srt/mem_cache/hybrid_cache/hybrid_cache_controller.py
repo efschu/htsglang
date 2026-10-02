@@ -1176,6 +1176,14 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        # DP-NACHLAUF: PP0's told clamp reuses this anchor-clamped answer when
+        # the read completes exactly this span (weg2_store_told._anchor_clamp)
+        try:
+            from sglang.srt.managers import weg2_store_told as _wst
+
+            _wst.note_probe_hit(self, getattr(operation, "request_id", None), kv_hit_pages)
+        except Exception:  # noqa: BLE001 -- an accelerator, never a wall
+            pass
         # P-FORK-CUT: KV the store holds past the anchor claim is a shared prefix
         # without a recurrent state; PP0's adder ends a chunk at its depth.
         p_fork_cut.note_store_uncapped(

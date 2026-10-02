@@ -599,6 +599,35 @@ def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None):
         return None
 
 
+#: DP-NACHLAUF 02.10. (N5x 5ddc067a81, warm D->P, 73k store hit): every
+#: store read (PP0 + the followers' early reads) finished DURING the flip, yet
+#: PF TOLD-ACKED came 0.19-0.23 s after the wake -- the followers sat 214 ms
+#: in '#1460 CHAIN-RECV blocked' for PP0's first pass, whose told clamp
+#: (#1416d TOLD-PROBE) re-hashed all 73728 pages and ran a full
+#: batch_exists_v2 on the scheduler thread: the same anchor-clamped question
+#: the prefetch thread had answered a second earlier (queue_parts exists
+#: 207-232 ms). When the read completed EXACTLY that answer's span, the clamp
+#: is the identity (an anchor sits at told, the read pinned it) and the probe
+#: is skipped; a short or truncated read, or no recorded answer, probes as
+#: before. Unset = on; 0/false/no/off = always probe.
+ENV_CLAMP_REUSE = "SGLANG_WEG2_TOLD_CLAMP_REUSE"
+
+
+def told_clamp_reuse_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_CLAMP_REUSE, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def note_probe_hit(cc, rid, pages) -> None:
+    """The prefetch probe's anchor-clamped hit (pages) for ``rid``."""
+    if rid is None:
+        return
+    d = cc.__dict__.setdefault("_weg2_probe_hit_pages", {})
+    d[str(rid)] = int(pages or 0)
+    while len(d) > 512:
+        d.pop(next(iter(d)))
+
+
 def _anchor_clamp(scheduler, req, told: int) -> int:
     """#1416 (boots xsn159/162/167): the completed prefix counts KV pages; the
     admission match accepts a prefix only up to the deepest page that also
@@ -620,6 +649,20 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
         if cc is None or not callable(getattr(cc, "get_hash_str", None)) or not ids:
             return int(told)
         page_size = int(getattr(cc, "page_size", 1) or 1)
+        _hits = getattr(cc, "_weg2_probe_hit_pages", None)
+        _hit = _hits.pop(str(_rid(req)), None) if isinstance(_hits, dict) else None
+        if told_clamp_reuse_on() and _hit is not None and int(told) == int(_hit) * page_size:
+            n = getattr(scheduler, "_1416d_reuse_n", 0) + 1
+            try:
+                scheduler._1416d_reuse_n = n
+            except Exception:  # noqa: BLE001
+                pass
+            if _log_due(n):
+                logger.info("#1416d TOLD-PROBE rid=%s told=%d reused=prefetch_hit pages=%d (n=%d): the read "
+                            "completed the prefetch probe's anchored span -- no second probe (DP-NACHLAUF)",
+                            rid8(req), int(told), int(_hit), n)
+            return int(told)
+        _t_probe = time.perf_counter()
         if _tree_key_probe_armed():
             key, bigram = _probe_key(scheduler, req, ids, told)
             pages = _anchored_pages_full_span(
@@ -633,8 +676,9 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
             if _log_due(n):
                 logger.info(
                     "#1416d TOLD-PROBE rid=%s told=%d keys=%d bigram=%s pages=%s "
-                    "(n=%d): the clamp asks the store with the fetch's key form",
+                    "(n=%d): the clamp asks the store with the fetch's key form ms=%.1f prefetch_hit=%s",
                     rid8(req), int(told), len(key), bigram, pages, n,
+                    (time.perf_counter() - _t_probe) * 1000.0, _hit,
                 )
         else:
             pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size)
