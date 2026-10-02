@@ -116,7 +116,7 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
     :func:`admit`. Returns None when nothing was to do or the prefix was
     adopted, else the named reason (logged by the caller)."""
     from sglang.srt.weg2 import l15_share_publish
-    from sglang.srt.weg2.l15_hold_share import L15ShareError, map_hold_extent
+    from sglang.srt.weg2.l15_hold_share import HoldMapper, L15ShareError
 
     directory = l15_share_publish.share_dir(env)
     rid = str(getattr(req, "rid", ""))
@@ -169,15 +169,22 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
     except Exception as exc:  # noqa: BLE001 -- named refusal
         return "spec: %s" % exc
     dev = int(getattr(full.k_buffer[0], "device", None).index or 0)
-    return admit(
-        rid=rid, token_ids=list(getattr(req, "origin_input_ids", ()) or ()),
-        hint=hint, fetch=lambda r: l15_share_publish.fetch_share(directory, r),
-        n_d_ranks=n_d,
-        kv_alloc=getattr(sched, "token_to_kv_pool_allocator", None),
-        mamba_alloc=getattr(rtp, "mamba_allocator", None),
-        tree_cache=getattr(sched, "tree_cache", None),
-        stage_att_layers=sorted(p_buffers), p_buffers=p_buffers, spec=spec,
-        stage_linear=(pos[0], pos[0] + len(pos)), p_temporal=p_temporal,
-        p_conv=p_conv,
-        map_extent=lambda fd, size: map_hold_extent(fd, size, dev, 0),
-        log=log)
+    # L15-HOLDMAP: every fd received and every extent mapped by this take is
+    # released once the copies are done -- a lingering import pins D's hold
+    # VRAM after D frees it (one hold-extent set per hot admission)
+    mapper = HoldMapper(dev)
+    try:
+        return admit(
+            rid=rid, token_ids=list(getattr(req, "origin_input_ids", ()) or ()),
+            hint=hint,
+            fetch=lambda r: mapper.fetch(
+                lambda q: l15_share_publish.fetch_share(directory, q), r),
+            n_d_ranks=n_d,
+            kv_alloc=getattr(sched, "token_to_kv_pool_allocator", None),
+            mamba_alloc=getattr(rtp, "mamba_allocator", None),
+            tree_cache=getattr(sched, "tree_cache", None),
+            stage_att_layers=sorted(p_buffers), p_buffers=p_buffers, spec=spec,
+            stage_linear=(pos[0], pos[0] + len(pos)), p_temporal=p_temporal,
+            p_conv=p_conv, map_extent=mapper, log=log)
+    finally:
+        mapper.close()

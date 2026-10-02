@@ -161,3 +161,89 @@ def map_hold_extent(fd: int, size: int, device_id: int, peer_rank: int):
         raise L15ShareError("hold share: import/map of %d bytes failed: %r"
                             % (size, exc)) from exc
     return torch.as_tensor(_CAI(va, size), device="cuda:%d" % int(device_id))
+
+
+class HoldMapper:
+    """P side: every import of one take/deposit, released together.
+
+    An imported extent stays PHYSICALLY alive while P maps it (the import
+    handle is released right after cuMemMap, the mapping is the reference) and
+    while P holds the received fd. D releases its kept extents at a later
+    sleep; a mapping P never undoes pins that VRAM on the shared card for the
+    rest of the process -- one whole hold-extent set per hot admission. So a
+    take maps through this object (one mapping per fd, reused across the KV
+    and the anchor pieces) and :meth:`close` -- after the stream has finished
+    the copies -- unmaps every VA and closes every fd it was handed.
+    """
+
+    def __init__(self, device_id: int, map_fn=None, unmap_fn=None,
+                 sync_fn=None):
+        self.device_id = int(device_id)
+        self._map_fn = map_fn or (lambda fd, size: map_hold_extent(
+            fd, size, self.device_id, 0))
+        self._unmap_fn = unmap_fn or _unmap_va
+        self._sync_fn = sync_fn or self._sync
+        self._maps = {}      # fd -> (tensor, size)
+        self._fds: List[int] = []
+
+    def own_fds(self, fds: Sequence[int]) -> Sequence[int]:
+        self._fds.extend(int(f) for f in fds)
+        return fds
+
+    def fetch(self, fetch_fn, rank: int):
+        d, fds = fetch_fn(rank)
+        self.own_fds(fds)
+        return d, fds
+
+    def __call__(self, fd: int, size: int):
+        got = self._maps.get(int(fd))
+        if got is not None:
+            if got[1] != int(size):
+                raise L15ShareError("fd %d mapped as %d bytes, asked %d"
+                                    % (fd, got[1], size))
+            return got[0]
+        t = self._map_fn(int(fd), int(size))
+        self._maps[int(fd)] = (t, int(size))
+        return t
+
+    @property
+    def mapped(self) -> int:
+        return len(self._maps)
+
+    def _sync(self) -> None:
+        import torch
+
+        torch.cuda.current_stream(self.device_id).synchronize()
+
+    def close(self) -> Tuple[int, int]:
+        """(unmapped, fds_closed); never raises (a failed unmap is counted
+        out, the rest is still released)."""
+        unmapped = 0
+        if self._maps:
+            try:
+                self._sync_fn()
+            except Exception:  # noqa: BLE001 -- release what we can
+                pass
+        while self._maps:
+            _fd, (t, size) = self._maps.popitem()
+            try:
+                self._unmap_fn(int(t.data_ptr()), size)
+                unmapped += 1
+            except Exception:  # noqa: BLE001
+                pass
+        closed = 0
+        while self._fds:
+            try:
+                os.close(self._fds.pop())
+                closed += 1
+            except OSError:
+                pass
+        return unmapped, closed
+
+
+def _unmap_va(va: int, size: int) -> None:
+    from sglang.srt.distributed.device_communicators.vmm_utils import (
+        release_mappings,
+    )
+
+    release_mappings([(int(va), int(size), [(0, int(size))])])
