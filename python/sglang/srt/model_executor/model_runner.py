@@ -2926,6 +2926,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         detach_from_model(self.model)
         release_load_transient_pool(reason="after-load")
+        # DUAL P SLEEP under --dual-share (weights not resident): the hard
+        # riegel -- no live device memory the saver does not track (it would
+        # survive the sleep). A no-op on every other rank.
+        from sglang.srt.model_executor.dual_stage_hull import assert_dual_p_sleep_tracked
+
+        assert_dual_p_sleep_tracked(self)
         # #1273 S2 (spec section 6/S2): arm the exchange for this rank at the
         # END OF WEIGHT LOADING -- every weight page this runner will ever hold
         # exists now and nothing has been paused yet.  A no-op under the
@@ -5794,7 +5800,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             pp_proxy_tensors=pp_proxy_tensors,
                         )
                     return ModelRunnerOutput(logits_output=None, can_run_graph=True)
-                with self._decode_round_segment("decode", graphed=False):
+                # WI (NF y3u-y3z: "Prefill rank timing DISABLED ... drifted -9"
+                # on TP1/TP2 of every boot): the worker's eager prefill is
+                # bracketed by the per-rank prefill timer like the host's
+                # (the eager runner / PCG sites), so its line pairs 1:1.
+                rank_ctx = (
+                    self.prefill_rank_timer.wrap(metadata={"category": "extend"})
+                    if self.prefill_rank_timer
+                    and forward_batch.forward_mode.is_plain_prefill()
+                    else contextlib.nullcontext()
+                )
+                with self._decode_round_segment("decode", graphed=False), rank_ctx:
                     return self._forward_form_a_worker(forward_batch)
 
             mode_check = (

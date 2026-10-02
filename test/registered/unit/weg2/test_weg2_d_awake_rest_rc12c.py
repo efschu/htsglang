@@ -97,10 +97,21 @@ class TheRestIsMeasuredAgainstTheBookedForm(CustomTestCase):
         self.assertLess(max(rests) - min(rests), 200, rests)       # 3039..3186
         self.assertGreater(max(overs) - min(overs), 1000, overs)   # 353..1798: the ratchet
 
-    def test_the_shipped_record_is_the_logs_maximum(self):
+    def test_the_shipped_record_is_the_edge_minus_y5as_unheld_rest(self):
+        """y5a (30.09., same checkpoint, NF-Operator decision): the rc12c edge
+        maximum (3186, the logs below) was booked on TP0, and the rank's
+        tightest moment of the whole y5a boot left 1281 MiB free on the card
+        (WEG2-VRAM-PEAK round 17:45:00Z: min(card_free_start 3011, end 1989)
+        - transient 708) -- 514 MiB above the corridor floor 767 that the
+        booked rest never held. The shipped record gives exactly those 514
+        MiB to the experts; the floor stays. The 3080s keep no record."""
         fixed, rest, _ = AR.records([(t, _log(o)) for t, _b, o in BOOTS], n_ranks=3,
                                     n_layers=48, layer_row_mib=LAYER_ROW)
-        self.assertEqual(list(L._pconst("D_AWAKE_REST_MIB", "nextflash")), rest)
+        self.assertEqual(rest, [3186, None, None])                 # the edge history stays
+        tightest_free = min(3011, 1989) - 708
+        unheld = tightest_free - 767
+        self.assertEqual(unheld, 514)
+        self.assertEqual(list(L._pconst("D_AWAKE_REST_MIB", "nextflash")), [rest[0] - unheld, None, None])
         self.assertEqual(list(L._pconst("D_FIXED_MIB", "nextflash"))[0], fixed[0])
 
     def test_no_edge_no_record(self):
@@ -178,11 +189,11 @@ class TheDBudgetBooksTheRestNotTheRatchet(CustomTestCase):
         lines = []
         _cards_, b = _d_pass("nextflash", lines)
         b0 = [l for l in lines if "ordinal=0 " in l][0]
-        self.assertIn("awake_rest 3186 (D_AWAKE_REST_MIB", b0)
+        self.assertIn("awake_rest 2672 (D_AWAKE_REST_MIB", b0)
         self.assertNotIn("awake_overshoot 404", b0)
         self.assertNotIn("measured_awake_overshoot", b0)
-        # 32607 - 767 - 1320 - 482 - 518 - 3186 = 26334 -> 26328
-        self.assertEqual(b[0], 26328)
+        # y5a record: 32607 - 767 - 1320 - 482 - 518 - 2672 = 26848 (rc12c edge 3186: 26328)
+        self.assertEqual(b[0], 26848)
         for i in (1, 2):  # no rest measured on the 3080s: the builtin 404 stays
             bi = [l for l in lines if f"ordinal={i} " in l][0]
             self.assertIn("+ awake_overshoot 404)", bi)
@@ -242,8 +253,9 @@ class TheScratchFollowsTheBookedBudget(CustomTestCase):
         fits = _fits(budgets, (100, 48, 48))
         self.assertEqual(fits[0].verdict, "262K VERFEHLT")
         capped, lines = L.d_scratch_cap(fits, [100, 48, 48])
-        self.assertEqual(capped, [91, 48, 48], lines)
-        self.assertIn("SCRATCH-DECKEL rang0: SGLANG_MOE_SCRATCH_SLOTS 100 -> 91", lines[0])
+        # y5a record 2672 (rc12c edge 3186 capped to 91): 514 MiB more budget -> 5 rows
+        self.assertEqual(capped, [96, 48, 48], lines)
+        self.assertIn("SCRATCH-DECKEL rang0: SGLANG_MOE_SCRATCH_SLOTS 100 -> 96", lines[0])
         again = _fits(budgets, capped)
         self.assertTrue(all(f.verdict == "PASST" for f in again))
 
@@ -251,12 +263,12 @@ class TheScratchFollowsTheBookedBudget(CustomTestCase):
         """TP0 after the cap: posts (KV 262144 fixed) + measured rest, against
         the torch-visible 5090 minus P asleep (1320 + 482) -> >= floor 767."""
         _c, budgets = _d_pass("nextflash", [])
-        f = _fits(budgets, (91, 48, 48))[0]
+        f = _fits(budgets, (96, 48, 48))[0]
         posts = f.budget_mib - f.kv_rest_mib
-        peak = posts + 3186
+        peak = posts + L._pconst("D_AWAKE_REST_MIB", "nextflash")[0]   # the shipped rest (y5a: 2672)
         free = (32607 - 518) - P_ASLEEP_5090 - peak
         self.assertGreaterEqual(free, 767, (posts, peak, free))
-        self.assertEqual(f.buffer_rows, 103)
+        self.assertEqual(f.buffer_rows, 108)  # 96 + 12 staging (rc12c edge: 91 -> 103)
 
     def test_the_cap_never_raises(self):
         _c, budgets = _d_pass("nextflash", [])

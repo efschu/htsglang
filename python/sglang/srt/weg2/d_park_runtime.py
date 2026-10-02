@@ -32,7 +32,8 @@ import time
 from typing import Optional
 
 from sglang.srt.managers import weg2_resumable_depth
-from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats
+from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield
+from sglang.srt.weg2 import handback_claim as _hb
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,8 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
 
     epoch = int(getattr(recv_req, "epoch", 0) or 0)
     reason = str(getattr(recv_req, "reason", "") or "")
+    if str(getattr(recv_req, "youngest", "") or ""):
+        return park_youngest(sched, recv_req)
     if not d_seats.d_flip_park_active():
         return Weg2ParkRunningReqOutput(
             success=False, parked=[], epoch=epoch,
@@ -237,6 +240,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _park_end(sched, running)
     _lap("draft")
     host_before = _host_free_slots(sched)
+    park_hold_yield.begin(getattr(sched, "tree_cache", None))
     retracted = (
         sched.running_batch.retract_all(sched.server_args, offload_kv=False, retain=True)
         if running else []
@@ -249,6 +253,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     for req in retracted:
         d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=epoch, now=now)
         sched._969ad_note_retract(req, "weg2_park_running")
+        _hb.note_origin(req.rid, _hb.ORIGIN_PARK)  # ZR: the resume computes 0 tokens again
         # STALE-DELIVERED (b23 10:23:15, weg2-24-100): a flip park opens a NEW
         # read cycle. The #1324 stamp of the previous cycle's read (79103) made
         # the #1471 wake settle release a request whose THIS-cycle read had
@@ -285,6 +290,10 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         for req in settle:
             setattr(req, FROM_SETTLE_ATTR, True)
     sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + settle + queued)
+    # HY: a retained span whose backup the full arena refused takes the
+    # L3-copied pages of a held (not running) request -- one group vote, then
+    # the give-back and the backup again on every rank, or nothing moves
+    park_hold_yield.settle(sched, retracted=retracted, parked=sched.weg2_d_parked)
     # #248: every parked request is kept by ORDER over the flip -- the
     # sleep's reset gives its references back, the hold reads it at the wake
     _lap("order")
@@ -385,7 +394,7 @@ def hold_late_arrival(sched, req) -> bool:
     return True
 
 
-def _park_end(sched, running) -> int:
+def _park_end(sched, running, *, reduce_min=None) -> int:
     """F4 (#259 4c, SGLANG_WEG2_ENABLE_D_PARK_END): every rank writes its
     part of each running request's END state (weg2/tail_handoff
     ``publish_park_end``) -- the resume adopts it as E2's skip instead of
@@ -411,20 +420,98 @@ def _park_end(sched, running) -> int:
     # depth), at most one track interval below the end: two cover the lag of
     # a spec-decode track
     interval = int(getattr(sched.server_args, "mamba_track_interval", 0) or 0) or int(sched.page_size)
+    # PARK-ANCHOR (0929): a D-direct prefill's track point sits at its
+    # extend's START, a whole extend below the end -- the window reaches down
+    # to the anchor the retraction below leaves (group-uniform), capped at X
+    t_anchor = time.perf_counter()
+    anchors, mode = _park_anchors(sched, running, reduce_min=reduce_min)
+    anchor_ms = (time.perf_counter() - t_anchor) * 1000.0
+    max_rows = int(getattr(sched.server_args, "tp_prefill_max_tokens", 0) or 0)
     events, why = [], {}
-    for req in running:
+    for req, anchor in zip(running, anchors):
         refusal, ev = th.publish_park_end(
             req, sched.req_to_token_pool, sched.token_to_kv_pool_allocator, sched.page_size,
-            part, tp_size, 2 * interval,
+            part, tp_size, 2 * interval, anchor=anchor, max_rows=max_rows,
         )
         if refusal:
             why[str(req.rid)[:12]] = refusal
         else:
             events.append(ev)
     sync_ms = th.park_end_barrier(events) if events else 0.0
-    logger.info("F4 PARK-END park: parts=%d of %d running sync_ms=%.1f refused=%s part=%s",
-                len(events), len(running), sync_ms, why or "-", part)
+    logger.info("F4 PARK-END park: parts=%d of %d running sync_ms=%.1f refused=%s part=%s "
+                "anchor_mode=%s anchor_ms=%.1f",
+                len(events), len(running), sync_ms, why or "-", part, mode, anchor_ms)
     return len(events)
+
+
+#: PARK-ANCHOR: a rank that names no anchor (a Form A worker, a request
+#: without a tracked position or prefix) votes this -- the MIN takes the
+#: deciding rank's value, and a reduce that stays here means "no anchor".
+_NO_ANCHOR = 1 << 62
+
+
+def _local_anchor(req, tree_cache=None) -> int:
+    """This rank's view of the depth ``req``'s retaining retraction leaves
+    as its resume anchor: the tracked position the mamba retention inserts
+    at (``mamba_last_track_seqlen``, the #1469 RETAIN ``cache_len`` -- y3p
+    weg2-4-8 2368, weg2-8-12 16704).
+
+    H' (30.09.): without a pending track point the anchor is the one the TREE
+    already holds on the request's path -- the depth #59b names a few lines
+    later and the wake resumes from (``weg2_resumable_depth.local_depth``, the
+    side-effect-free admission probe). NOT ``len(prefix_indices)``: after the
+    D-direct extend's own retain (``cache_unfinished_req``) the track is
+    cleared and ``prefix_indices`` covers the whole extended KV, tombstoned
+    above the anchor. y3y weg2-14-34: RETAIN cache_len=2368, F4 anchor=4446
+    (window=default [3904, 4444)), #59b 2368, 'adopt=skipped:prefix:2368' and
+    D computed 2078 tokens again behind the wake; y3w weg2-2-7 (4448 vs
+    2368) and weg2-6-11 (18782 vs 16704) the same. Only without a tree (desk
+    stubs) the matched prefix stays the fallback."""
+    t = req.mamba_last_track_seqlen
+    if t is not None and int(t) >= 0:
+        return int(t)
+    if tree_cache is not None:
+        # an unpriceable probe votes 0: no anchor, today's window
+        depth = int(weg2_resumable_depth.local_depth(tree_cache, req))
+        return depth if depth > 0 else _NO_ANCHOR
+    if req.prefix_indices is not None:
+        return len(req.prefix_indices)
+    return _NO_ANCHOR
+
+
+def _park_anchors(sched, running, *, reduce_min=None):
+    """PARK-ANCHOR (0929): per running request the resume anchor the F4
+    window must reach, the SAME list on every rank (the park parts of one rid
+    are OR-ed together and must name one geometry, ``end_differs``).
+
+    Only the rank that decides the recurrent anchor knows it: a Form A expert
+    worker tracks no mamba state (y3p TP1/TP2 ``#1469 RETAIN cache_len=4416``
+    where the host retained 2368) and votes ``_NO_ANCHOR``; the group takes
+    the MIN over the TP cpu group -- the collective #59b runs a few lines
+    later in the same park, entered by every rank with the same list (the
+    running batch is replicated). A group that cannot make a depth uniform
+    (``weg2_resumable_depth.MODE_NONE``: PP, DP attention) names none and
+    keeps today's window. Returns (anchors, mode)."""
+    if not running:
+        return [], "-"
+    mode = weg2_resumable_depth.group_mode(getattr(sched, "ps", None))
+    if mode == weg2_resumable_depth.MODE_NONE:
+        return [None] * len(running), mode
+    reduce = mode != weg2_resumable_depth.MODE_SOLO
+    if reduce and reduce_min is None:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            # process-global, so group-uniform: no group to agree with
+            return [None] * len(running), "no_dist"
+    from sglang.srt.managers import tp_match_floor
+
+    follows = tp_match_floor.this_rank_follows()
+    tree = getattr(sched, "tree_cache", None)
+    local = [_NO_ANCHOR if follows else _local_anchor(r, tree) for r in running]
+    if reduce:
+        local = (reduce_min or weg2_resumable_depth._tp_min)(local)
+    return [None if int(v) >= _NO_ANCHOR else int(v) for v in local], mode
 
 
 def _live_rids(sched, running) -> set:
@@ -510,7 +597,7 @@ def park_tick(sched) -> int:
         )
         due = bool(sched._weg2_group_min_flags([local])[0])
     if not due:
-        return 0
+        return _capacity_requeue(sched, parked)
     moved = list(parked)
     sched.weg2_d_parked = []
     sched._weg2_d_park_slept = False
@@ -536,6 +623,31 @@ def park_tick(sched) -> int:
                 (", %d back to the #1471 settle %s" % (len(back), [str(r.rid)[:12] for r in back]))
                 if back else "")
     return len(mine) + len(back)
+
+
+def _capacity_requeue(sched, parked) -> int:
+    """#248h: the capacity-parked requests (``resume_via_p.park_for_capacity``)
+    re-join the queue head as soon as the arena holds their re-read -- the
+    other parked requests keep waiting for their P leg / the awake bound.
+    One group verdict per parked request (MIN, rank-local clock)."""
+    from sglang.srt.weg2 import resume_via_p as _rvp
+
+    if not any(getattr(r, _rvp.CAPPARK_AT_ATTR, None) is not None for r in parked):
+        return 0
+    due_ids = {id(r) for r in _rvp.capacity_requeue_due(sched, parked)}
+    flags = sched._weg2_group_min_flags([id(r) in due_ids for r in parked])
+    moved = [r for r, f in zip(list(parked), flags) if f]
+    if not moved:
+        return 0
+    ids = {id(r) for r in moved}
+    sched.weg2_d_parked = [r for r in parked if id(r) not in ids]
+    for req in moved:
+        setattr(req, _rvp.CAPPARK_AT_ATTR, None)  # a re-park stamps it again
+        sched._add_request_to_queue(req, is_retracted=True)
+    mine = _to_queue_head(sched, moved)
+    logger.info("#248h WEG2-D-PARK requeue (capacity): %d parked request(s) at the queue head %s -- "
+                "the arena holds their re-read now", len(mine), [str(r.rid)[:12] for r in mine])
+    return len(mine)
 
 
 def note_retracted(sched, retracted_reqs) -> int:
@@ -679,16 +791,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                         "decoding only the back of the batch may leave; the youngest is not the back",
                         older[:16], victim_rid[:16], n)
         return None
-    snap = sched._weg2_d_park_draft_snapshot(running_batch) if hasattr(
-        sched, "_weg2_d_park_draft_snapshot") else None
-    victim = reqs[idx]
-    running_batch.release_req(idx, len(reqs) - 1, sched.server_args, retain=True)
-    running_batch.filter_batch(keep_indices=[i for i in range(len(reqs)) if i != idx])
-    if snap is not None and hasattr(sched, "_weg2_d_park_draft_save"):
-        sched._weg2_d_park_draft_save([victim], snap)
-    sched._add_request_to_queue(victim, is_retracted=True)
-    d_seats.mark_parked(victim, d_seats.SITE_PRESSURE, now=time.monotonic())
-    sched.waiting_queue = [q for q in sched.waiting_queue if q is not victim] + [victim]
+    victim = _displace_at(sched, running_batch, reqs, idx)
     sched._weg2_sa_displaced = getattr(sched, "_weg2_sa_displaced", 0) + 1
     # H106b (rc12z22-dwell30 D 15:51:41, weg2-6-33): this runs AFTER the pass's
     # #580 prefetch drain, so the victim joins a queue the drain never saw.
@@ -702,6 +805,79 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                    "the device only as far as the older one needs it -- LRU eviction, tail last)",
                    victim_rid[:16], older[:16], trigger, len(reqs), cap, pages_out)
     return victim_rid
+
+
+
+def _displace_at(sched, running_batch, reqs, idx):
+    """Park ``reqs[idx]`` WHOLE at this round boundary: retract it retaining its
+    span (KV, the node's GDN anchor, the draft rows), re-queue it as a pressure
+    park at the back (it resumes when it is the oldest live request and a seat
+    is free). The one retraction shape of SA (3) and ARRIVAL-SEAT (c)."""
+    snap = sched._weg2_d_park_draft_snapshot(running_batch) if hasattr(
+        sched, "_weg2_d_park_draft_snapshot") else None
+    victim = reqs[idx]
+    running_batch.release_req(idx, len(reqs) - 1, sched.server_args, retain=True)
+    running_batch.filter_batch(keep_indices=[i for i in range(len(reqs)) if i != idx])
+    if snap is not None and hasattr(sched, "_weg2_d_park_draft_save"):
+        sched._weg2_d_park_draft_save([victim], snap)
+    sched._add_request_to_queue(victim, is_retracted=True)
+    d_seats.mark_parked(victim, d_seats.SITE_PRESSURE, now=time.monotonic())
+    sched.waiting_queue = [q for q in sched.waiting_queue if q is not victim] + [victim]
+    return victim
+
+
+def park_youngest(sched, recv_req):
+    """ARRIVAL-SEAT (c) (weg2/arrival_seat_rule.py; user rule #246 "Ältester rückt
+    nach und verdrängt Jüngere"): the front's oldest waiter passed the wait bound,
+    so ONE running request -- the front's youngest, named in ``youngest`` -- is
+    parked at this round boundary in SA (3)'s pressure shape; the seat it frees
+    is the arrival rule's to fill (D prefill or the flip). Replicated inputs
+    (the running set, the named rid), so every rank parks alike. Under
+    speculative decoding only the back of the batch may leave: otherwise it is
+    refused by name and the front asks again on its next tick. Nothing else is
+    touched -- no sleep follows, the batch keeps decoding."""
+    from sglang.srt.managers.io_struct import Weg2ParkRunningReqOutput
+
+    epoch = int(getattr(recv_req, "epoch", 0) or 0)
+    rid = str(getattr(recv_req, "youngest", "") or "")
+
+    def _out(ok, parked, msg):
+        return Weg2ParkRunningReqOutput(success=ok, parked=list(parked), epoch=epoch, message=msg)
+
+    if not d_seats.d_flip_park_active():
+        return _out(False, [], "W-PARK refused: not group D -- nothing parked")
+    if getattr(sched, "weg2_dormant", False):
+        return _out(False, [], "group D is dormant: nothing runs, nothing parked")
+    # the in-flight result lands first (park_running's shape)
+    if sched.enable_overlap and sched.last_batch and sched.result_queue:
+        tmp_batch, tmp_result = sched.result_queue.popleft()
+        sched.process_batch_result(tmp_batch, tmp_result)
+    last = sched.last_batch
+    if last and last.forward_mode.is_extend():
+        last.filter_batch(chunked_req_to_exclude=[])
+        if not last.is_empty():
+            if sched.running_batch.is_empty():
+                sched.running_batch = last
+            else:
+                sched.running_batch.merge_batch(last)
+    sched.last_batch = None
+    running_batch = sched.running_batch
+    reqs = list(getattr(running_batch, "reqs", None) or [])
+    idx = next((i for i, r in enumerate(reqs) if str(r.rid) == rid), None)
+    if idx is None:
+        return _out(True, [], f"{rid} is not running here (finished or not admitted): nothing parked")
+    spec = not (getattr(running_batch, "spec_algorithm", None) is None
+                or running_batch.spec_algorithm.is_none())
+    if spec and idx != len(reqs) - 1:
+        return _out(False, [], f"{rid} is not the back of the batch under speculative decoding: "
+                               "refused, the front asks again")
+    _displace_at(sched, running_batch, reqs, idx)
+    n = getattr(sched, "_weg2_asr_parked", 0) + 1
+    sched._weg2_asr_parked = n
+    logger.warning("WEG2 ARRIVAL-SEAT YOUNGEST-PARK rid=%s running_before=%d n=%d: the youngest running "
+                   "decode pauses at this round boundary (span retained, pressure park); its seat goes "
+                   "to the oldest waiter (user rule #246)", rid[:16], len(reqs), n)
+    return _out(True, [rid], "parked (arrival-seat youngest)")
 
 
 def exclude_displaced(sched, prefetch_verdicts) -> Optional[str]:
@@ -930,6 +1106,34 @@ def resume_tail(req) -> int:
     return int(ntok) if cap is None else max(0, int(ntok) - int(cap))
 
 
+def realised_resume_tail(sched, req, head_inputs) -> int:
+    """F3b (01.10., y6h 10011531): the tail the resume will REALLY extend.
+
+    The park's read cap is a promise, not a measurement. At the wake the read
+    can come back short and the prefix demoted (``#1036 PREFIX DEMOTED``,
+    ``#1028B FETCH CAP lost``): weg2-26-124 had a park tail of 1 token
+    (``SETTLE-TAIL tail=1``) and extended 4138 (``X-GATE uncached=4138``,
+    5.5 s eager pass); F3 kept it in the first pass and the hand-off
+    weg2-28-127 (7 tokens) got its first token 11.9 s after P's end.
+
+    So the tail is the larger of the promise and the GROUP's priced extent --
+    the same ``weg2_uncached_extent`` term X-GATE prices on this pass, from
+    #823's MIN-reduced match (replicated). Without a group match on a
+    multi-rank group the extent is rank-local, so the promise alone decides
+    (the verdict stays group-uniform)."""
+    tail = resume_tail(req)
+    extent = getattr(sched, "weg2_uncached_extent", None)
+    if extent is None:
+        return tail
+    tp_size = int(getattr(getattr(sched, "ps", None), "tp_size", 1) or 1)
+    if tp_size > 1:
+        from sglang.srt.managers import tp_head_congruence
+
+        if tp_head_congruence.group_match_for(head_inputs, str(req.rid)) is None:
+            return tail
+    return max(tail, int(extent(req, head_inputs)))
+
+
 def decode_first_facts(sched, running_batch) -> Optional["d_seats.DecodeFirst"]:
     """F3's replicated inputs for this pass, or None (switch off, no wake yet)."""
     if not d_seats.decode_first_enabled():
@@ -940,8 +1144,9 @@ def decode_first_facts(sched, running_batch) -> Optional["d_seats.DecodeFirst"]:
     from sglang.srt.environ import envs
 
     settle = list(getattr(sched, "weg2_post_wake_settle", None) or [])
+    head_inputs = getattr(sched, "_pp_head_inputs_this_pass", None)
     tails = {
-        str(r.rid): resume_tail(r)
+        str(r.rid): realised_resume_tail(sched, r, head_inputs)
         for r in sched.waiting_queue if d_seats.park_site(r) == d_seats.SITE_FLIP
     }
     return d_seats.DecodeFirst(

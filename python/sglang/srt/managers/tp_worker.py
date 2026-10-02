@@ -351,6 +351,15 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.max_token_pool_size - 1,
         )
         assert max_req_len > 0, "Memory pool size is too small"
+        # TAIL-STAGE-WORKER: pin the rank's staging arena once, from the form,
+        # now that the KV and GDN pools exist (y5a: at the spec worker's init
+        # they did not -- AttributeError token_to_kv_pool, the first staging
+        # pinned 1386 MiB inside the first flip, 757 ms on TP0). No-op unless
+        # SGLANG_WEG2_TAIL_STAGE_WORKER on an adopting (group D) target rank.
+        if not self.is_draft_worker:
+            from sglang.srt.weg2 import tail_adopt as _tail_adopt
+
+            _tail_adopt.prepare_arena(self.model_runner, self.server_args)
 
     def init_attention_backends(self):
         """Initialize attention backends for all model runners."""

@@ -230,8 +230,11 @@ def test_red_a_manual_flip_under_the_immediate_park_parks_instead_of_draining(q2
     asyncio.run(body())
 
 
-def test_manual_flip_without_the_immediate_park_drains_as_before(q27):
-    """Switch off (NF x177 / any non-park form): the handler is unchanged."""
+def test_manual_flip_without_the_immediate_park_parks_once_nf_1011(q27):
+    """RELEASE-HEAD 1002: the NF base already parks a manual flip from D
+    whatever the park switch (#1011, MANUAL_FLIP_PARK_CAUSE: a decode is never
+    cut, so an unparked one held the flip). The 27B FLIPWAIT case maps onto
+    that one park: exactly one park body, reason manual-flip, no drain."""
     H = _h91c()
 
     async def body():
@@ -240,10 +243,11 @@ def test_manual_flip_without_the_immediate_park_drains_as_before(q27):
             t0 = h.post("r0")
             assert await H._until(lambda: h.d.running and h.front.awake == "D", 20)
             flip = asyncio.create_task(h.front.handle_manual_flip(None))
-            await asyncio.sleep(2.0)
-            assert not flip.done() and h.d.park_bodies == []
+            done, _ = await asyncio.wait({flip}, timeout=15)
+            assert flip in done, h.d.timeline
+            assert [b["reason"] for b in h.d.park_bodies] == [pp.PARK_REASON_MANUAL]
+            assert h.front.counters["park_manual_flip"] == 1
             h.d.release_all()
-            await asyncio.wait_for(flip, 20)
             s0, _ = await asyncio.wait_for(t0, 20)
             assert s0 == 200
 

@@ -616,6 +616,22 @@ class Envs:
     # p0 waited 115/139 ms). 0 = the pool of the 2026-09-18 form. Resumes and
     # VRAM are unchanged by it.
     SGLANG_WEG2_WAKE_COLLECT_SPARE = EnvInt(1)
+    # ARENA_OWNER_LANE_DMA (01.10., NF y6o P->D): a Form-A worker's owner
+    # loadback after the wake ("dma" mode, registered arena) copies only the
+    # lanes the rank owns -- one cudaMemcpy2DAsync per run of consecutive
+    # slots (src pitch = owner split x cell, width = owned run x cell) into a
+    # compact device stage -- instead of whole pages (y6o: 3601 pages = 2.83
+    # GB per worker, TP1 owns 40/64 lanes, TP2 24/64). Same stage bytes, same
+    # loaded KV bytes; =0 restores the whole-page load for an A/B.
+    SGLANG_WEG2_ARENA_OWNER_LANE_DMA = EnvBool(True)
+    # WAKE_RUNAHEAD_ANY (30.09., NF y4k/y4l P->D, weg2/wake_runahead.py): the
+    # run-ahead bound waits for ANY collect in flight to finish instead of the
+    # OLDEST (a slow 3080 source's band held D TP1/TP2's resume of PP0's next
+    # band -- the flip's critical chain -- while newer collects were done;
+    # main-loop gaps 654/659 ms per flip, PP0 p0/p1 credit waits 313/138 ms).
+    # Same collects in flight, same resumes and credit waits, no VRAM. Per
+    # group (the waking group reads it); off until metal.
+    SGLANG_WEG2_WAKE_RUNAHEAD_ANY = EnvBool(False)
     # CREDIT_LIVE_STAGING: the waker's credit check subtracts only the peer's
     # stagings that are booked but not yet allocated; an allocated staging is
     # already missing from the free reading (x105 TP2: 943 MiB counted twice,
@@ -638,6 +654,23 @@ class Envs:
     # device load -- at the wake. False = the pre-#248 hold read (reference
     # and pin during the sleep), byte for byte.
     SGLANG_WEG2_ENABLE_PARK_L3 = EnvBool(True)
+    # ENABLE_PARK_HOLD_YIELD (HY, NF y3w 01:39:13 / y3u 00:36:46): a D park
+    # whose forced host write-through the full arena refuses takes the pages
+    # of a HELD (not running) request whose whole span has an L3 copy -- one
+    # MIN vote over the TP group, the same give-back on every rank, the
+    # refused backups again; the wake reads the held request from L3. Before:
+    # the park's KV died with the sleep and P recomputed ~125k tokens (30 s).
+    # False = the refusal stands (the marker line still counts need/held).
+    SGLANG_WEG2_ENABLE_PARK_HOLD_YIELD = EnvBool(True)
+    # ENABLE_SHORT_READ_ANCHOR (SA, NF y3v 5327bdfa17, weg2-46-98): a store
+    # read whose KV ended short still reads the recurrent state (and the QSA
+    # index pages) at the deepest anchor inside the landed pages; that anchor
+    # is the rank's #257 cut. Before: the extra pools were skipped for every
+    # short read, the #257 cut inserted 45824 KV tokens without a state, PP0's
+    # walk refused them (#TF told=0) and P re-prefilled 54226 tokens. Only
+    # where the rank decides its own cut (no attention-TP reduce). False = the
+    # pre-SA skip, byte for byte.
+    SGLANG_WEG2_ENABLE_SHORT_READ_ANCHOR = EnvBool(True)
     # ENABLE_WAKE_READ_EARLY (F22, 29.09.): the #248 hold read is issued at the
     # START of D's weight legs instead of after the kv resume, so the store
     # reads (aux threads, host only) run beside the ~1.5 s of legs. Measured
@@ -655,6 +688,61 @@ class Envs:
     # p50 2.49 s = the bulk of the 2.8 s P->D nachlauf. =0 restores the
     # release-time read byte for byte.
     SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(True)
+    # TAIL-STAGE-EARLY (30.09., NF y4k/y4l P->D, weg2/tail_adopt.stage_early):
+    # the E2 tail staging of the dormant hold starts at the START of D's weight
+    # legs (beside them, host-only) instead of at the first prefetch check
+    # after the wake. Measured: WEG2-TAIL-READY waited_ms (the H45 hold on a
+    # finished store read) median 291 ms (y4l, n=12) / 286 (y4k, n=14), up to
+    # 757 at a wake cohort of 6 -- inside flip_first_work. Off until metal.
+    SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY = EnvBool(False)
+    # TAIL-STAGE-AFTER-LEGS (30.09., NF y4s/y4s-tse P->D): with TAIL-STAGE-EARLY
+    # on, start that staging after the LAST weight collect (legs end, before
+    # the expert rearm) instead of at the legs' start. Measured y4s-tse vs y4l
+    # at 5-6 seats: the staging threads (part read, digest, pin_memory per
+    # layer) ran beside the collectors -- D collector issue_ms 202-286 ->
+    # 359-1127 ms on TP0, P deposit credit waits 451-584 -> 951-2094 ms, legs
+    # 1522 -> ~2030 ms median; the post-wake gain (TAIL-READY 291 -> 0 ms) is
+    # kept in part, since the staging still starts before the first pass.
+    # Off = the leg-start site of TAIL-STAGE-EARLY, unchanged.
+    SGLANG_WEG2_TAIL_STAGE_AFTER_LEGS = EnvBool(False)
+    # TAIL-STAGE-WORKER (30.09., NF y4x/y4w P->D, weg2/tail_adopt): the E2 tail
+    # staging runs on ONE long-lived worker thread per rank (a queue, not a
+    # thread per rid) and copies into ONE host arena pinned once (sized from
+    # the form: D's seat cap x the held tail of one rid), never pin_memory()
+    # per tensor. Measured: staged at the legs' start (y4w, 6 seats) the
+    # per-rid threads slowed the D collectors (TP0 issue_ms 452 vs 247 in y4l,
+    # P credit waits 1069 vs 457); staged behind the legs (y4x, TSAL) they
+    # slowed the expert rearm (TP0 375 vs 90 ms) and TAIL-READY came back
+    # (338 ms). Off = one thread and pin_memory() per rid, unchanged.
+    SGLANG_WEG2_TAIL_STAGE_WORKER = EnvBool(False)
+    # WAKE_READ_ARENA_GATE (#248f, 30.09., NF y4b ep18): the #248 hold reads of
+    # a wake are issued in hold (arrival) order only while their pages fit in
+    # the KV arena together (its slot count -- no reserve); a younger read
+    # whose pages would overrun it waits parked in the #1471 settle, by name,
+    # and is issued as soon as the older reads leave the settle. y4b: three
+    # hold reads of 1412 + 1728 + 3841 = 6981 pages against 6485 slots, and
+    # weg2-16-29's L3 fills evicted 449 of its OWN kept pages (#248e
+    # ORDERED-EVICT) -- 4 re-reads, 4.5 s held after the wake.
+    SGLANG_WEG2_ENABLE_WAKE_READ_ARENA_GATE = EnvBool(True)
+    # X_FLOOR_CREDIT (H98x, 30.09., NF y4b D 03:50:21 weg2-14-27): on a Form A
+    # group the X gate credits the group's USABLE floor -- the depth every
+    # rank admits (host: its admission match, workers: their KV reach) --
+    # when it lies above the head/store terms. A Form A expert worker's head
+    # walk is refused by its own absent mamba bytes (#904 MambaComponent:
+    # absent) and votes 0, so the head MIN was 0 and W31 priced the whole
+    # prompt (110438) of a request whose 109440-token prefix sat on TP0's
+    # device: W50, P re-prefilled it. Off = the pre-H98x pricing.
+    SGLANG_WEG2_ENABLE_X_FLOOR_CREDIT = EnvBool(True)
+    # RVP_CAPACITY_PARK (#248h, 30.09., NF y4b D 03:58:57-03:59:24 weg2-32-72):
+    # a streamed request the X gate refuses right after a store read that ended
+    # short although the store holds its context (P wrote it: delivered 39168
+    # of deliverable 95104, total 95137) is kept parked on D and re-read when
+    # the arena has room -- no P leg (P already has it), no attempt spent, no
+    # W50 to the client. Bounded by this many seconds from its first capacity
+    # park; past it the RESUME-VIA-P legs / the named end apply as before.
+    # 0 = off. y4b: two needless P legs (p_ms 7712 / 7460, flips included),
+    # then the third refusal ended the client's stream with W50.
+    SGLANG_WEG2_RVP_CAPACITY_PARK_S = EnvFloat(120.0)
     # PARK_DEMOTE_S (#248): the tick of the background thread (D, attention
     # rank 0, never the scheduler thread) that copies the kept pages of
     # parked and waiting rids from the arena to HiCacheFile without freeing
@@ -682,22 +770,45 @@ class Envs:
     # L3_WRITE_BEHIND_MIB: bytes copied per arena and pass (KV 786 KiB pages:
     # 325 per pass; mamba blobs 56 MiB: 4 per pass).
     SGLANG_WEG2_L3_WRITE_BEHIND_MIB = EnvInt(256)
-    # L3WB-SLICE (z30y10, dcdb9ab8f9, D TP0 20:03:52-20:04:10): ONE pass after
-    # the P->D gate opened ran 17.6 s (cpu_ms=17574.6) over new=4092 stems for
-    # 8 pages written, and TP0 answered nothing in that window (front W3).
-    # SLICE_MS bounds one uninterrupted burst of the pass (census, stat, write):
-    # when it is used up the pass stops at a slice edge, remembers where
-    # (per-arena cursor) and the thread continues after YIELD_MS instead of
-    # the full tick -- the work is stretched, never dropped. 0 = the pre-slice
-    # form (one pass does everything it finds).
+    # L3WB-SLICE (27B z30y10, dcdb9ab8f9, D TP0 20:03:52-20:04:10): ONE pass
+    # after the P->D gate opened ran 17.6 s (cpu_ms=17574.6) over new=4092
+    # stems for 8 pages written, and TP0 answered nothing in that window
+    # (front W3). SLICE_MS bounds one uninterrupted burst of the pass (census,
+    # stem read, stat, pair gate, write): when it is used up the pass stops at
+    # a slice edge, remembers where (per-arena cursor) and the thread
+    # continues after YIELD_MS instead of the full tick -- the work is
+    # stretched, never dropped. 0 = the pre-slice form (one pass does
+    # everything it finds).
     SGLANG_WEG2_L3_WRITE_BEHIND_SLICE_MS = EnvFloat(25.0)
     SGLANG_WEG2_L3_WRITE_BEHIND_YIELD_MS = EnvFloat(25.0)
+    # L3FILL_JOIN_WAIT_MS (L3FILL-JOINED 30.09., NF y4a ep36 weg2-36-74): how
+    # long an L3 -> L2 fill waits for a stem another writer has CLAIMED to
+    # become COMPLETE before it counts as a miss. A prefix read ends at its
+    # first miss, so one JOINED page cut a 1070-page prefix at 146 (the rest
+    # re-prefilled). Only on the prefetch io threads (hicache-prefetch-io-<k>);
+    # the scheduler, flip and decode threads never wait. 0 = the pre-0930 form.
+    SGLANG_WEG2_L3FILL_JOIN_WAIT_MS = EnvInt(300)
+    # L3FILL_STALE_CLAIM_S (L3FILL-JOINED (3), 30.09.): a claim whose writer is
+    # alive but delivered no byte for this long is taken from its key
+    # (arena_quarantine_stale, generation-safe: a late completion of the old
+    # writer is refused by name, status 6) and the fill claims the stem fresh.
+    # y4a: 29 stems JOINED for >= 6 s blocked D and P. 0 = never.
+    SGLANG_WEG2_L3FILL_STALE_CLAIM_S = EnvFloat(5.0)
     # STORE_REFUSE_FS (W57, user 28.09.: "L3 gehoert auf XFS, nie ZFS"): a
     # real boot whose store directory lives on one of these filesystems
     # (/proc/mounts) is refused by name -- the container layer (overlay) or
     # the ZFS pool instead of the told store disk. A dry run only warns.
     # Empty = no filesystem is refused.
     SGLANG_WEG2_STORE_REFUSE_FS = EnvTuple(("overlay", "zfs"))
+    # STORE_MLOCK (30.09., NF y3z/y4a D load 99 s: 6-8 store files per rank
+    # whose registration stalled 4-17 s behind the host's direct compaction,
+    # which isolates the pinned 4K shmem store pages and fails to migrate
+    # them): mlock every expert-store mapping (layers/moe/shared_pinned.py)
+    # BEFORE its cudaHostRegister, so the pages sit on the unevictable LRU.
+    # Only effective together with the HOST sysctl
+    # vm.compact_unevictable_allowed=0; OFF until that is set and the metal
+    # shows it. A failed mlock is refused by name (Weg2StoreMlockRefused).
+    SGLANG_WEG2_STORE_MLOCK = EnvBool(False)
     # RANK_STATE_DIR (IPC Phase 1, user 28.09. "über logfiles?"): the
     # directory each rank writes its versioned RankState record into
     # (weg2/rank_state.py). Set by the weg2 launcher per group, next to the
@@ -785,6 +896,15 @@ class Envs:
     # floor. False = the lockstep, byte for byte.
     SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD = EnvBool(False)
     SGLANG_WEG2_DEPOSIT_LANE_AHEAD = EnvInt(1)
+    # TAG-STALL-SENTINEL (30.09., NF y3z ep52: PP0 still 5.4 s process-wide at
+    # the first tag of P's sleep): per sleep tag, faulthandler's C watchdog
+    # dumps every thread's stack into <evidence>/weg2_tagstall_*.txt when the
+    # tag outlives this many seconds (weg2/tag_stall_sentinel.py). 0 = off.
+    SGLANG_WEG2_TAG_STALL_SENTINEL_S = EnvFloat(1.5)
+    # WEG2-GC warn (30.09.): > 0 arms the gen-2 GC warning in the scheduler
+    # (weg2/gc_instrument.arm_after_boot) when --gc-warning-threshold-secs is
+    # 0; the launcher sets 0.5 for group P by default (--env-p states another).
+    SGLANG_WEG2_GC_WARN_SECS = EnvFloat(0.0)
     # the sleeping group(s) that take the lookahead (comma list, default the
     # P->D direction only: P sleeps, PP0's chain is the Flipzeit's legs).
     SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD_GROUPS = EnvStr("P")
@@ -794,7 +914,10 @@ class Envs:
     # at the leg end. Measured: D's leg binds the D->P flip (TP1 37/39, TP2
     # 23/31) and pause_ms is 26-28 ms per tag on the 3080 D ranks (5090: 6)
     # with sync_ms=0 -- 465-517 ms per leg. Inert while H111b runs the leg.
-    # False = the per-tag chain, byte for byte. Off until the first series.
+    # False = the per-tag chain, byte for byte. METAL (y4k 09301110, y4l
+    # rc12z30y4l 11e5db4370, profile -clk-po-pm-b1): 0 deaths, D->P
+    # flip_first_work median 1757 (y4k) / 1588 ms (y4l) against 2002 (y4i) --
+    # on by default since (user law: a proven switch is on); off via env.
     SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP = EnvBool(True)
     # L3-CSUM (N2, 01.10., hicache_storage.l3_csum_on): a blob's (arena slot
     # >= 1 MiB, the mamba anchor) disk copy carries a CRC32 sidecar, the L3
@@ -814,8 +937,10 @@ class Envs:
     # Measured y4i (WEG2-PAUSE-SUB): 3080 D tag = 10 allocations, 31-64
     # cuMemUnmap calls, 21-25 ms; the same tag before the first D phase (no
     # extents, 10 calls) 10.6 ms. False = the per-extent walk, call for call.
-    # Off until metal (the driver may refuse a multi-mapping range: that run
-    # then falls back to the per-extent walk and the line counts it).
+    # The driver may refuse a multi-mapping range: that run then falls back to
+    # the per-extent walk and the line counts it. METAL (y4l): unmaps = allocs
+    # 8172/8172, fallbacks 0, unmap time per tag line 14.9 ms against 17.9 in
+    # y4k, calls per line 44.9 -> 13.4 -- on by default; off via env.
     SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP = EnvBool(True)
     # B1 (30.09., NF y4i, managers/weg2_flush_nonblock.py): the HiCache
     # publish leaves the D->P flip's quiesce. Measured: the first quiesce
@@ -823,6 +948,9 @@ class Envs:
     # waited 32-166 ms, begin -> quiesce done median 98 ms; D was idle
     # 137-333 ms before each flip. (1) D-IDLE-PUBLISH: the bubble publisher's
     # sweep from Scheduler.on_idle (nothing running/waiting, not dormant).
+    # METAL (y4l): WEG2-D-IDLE-PUBLISH 117x, D quiesce median 10 ms (max 23)
+    # against 98 ms; no "Cache not flushed", no STORE READ INCOMPLETE, no
+    # W120 -- on by default; off via env.
     SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH = EnvBool(True)
     # nodes per idle pass (the sweep's max_issue). 1: a request that lands
     # during a pass waits at most one node's issue (y4i: ~23-48 ms per node
@@ -832,16 +960,63 @@ class Envs:
     # (2) FLUSH-QUIESCE-NONBLOCK: the quiesce answers "quiesced" when the only
     # blockers on every rank are the group's own write-throughs / store
     # writes; the sleep leg's group drain + #1470 flush reset before the pause.
+    # On by default with (1) (y4l: never needed to act, the idle publish left
+    # nothing in flight at the quiesce); off via env.
     SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(True)
     # the groups both parts apply to (comma list; default the D->P sleeper)
     SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
+    # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
+    # front.d_park_stuck lists the rids parked in at least this many
+    # consecutive D phases with no output in between (weg2/park_stuck.py).
+    SGLANG_WEG2_PARK_STUCK_PHASES = EnvInt(3)
     # TSDB (user 01.10. ~07:40Z, docs/TSDB-DELTA-27B-1001.md 1c): the front's
-    # optional Influx-line push to VictoriaMetrics (e.g.
-    # http://192.168.0.88:8428/write), bundled ~2 s in the front's IPC writer
-    # thread. Unset = no push (default). The model tag of every point (e.g. NF /
-    # 27B). Read by weg2/front_metrics.py (registered here, one switch).
+    # optional Influx-line push of one `weg2_req` point per finished request
+    # to VictoriaMetrics (e.g. http://192.168.0.88:8428/write), bundled ~2 s in
+    # the front's IPC writer thread. Unset = no push (default). The model tag
+    # of every point (e.g. NF / 27B).
     SGLANG_WEG2_METRICS_PUSH_URL = EnvStr(None)
     SGLANG_WEG2_METRICS_MODEL = EnvStr(None)
+    # RW-FINISH (#287, 30.09., NF y4k): the resume warm runs to the end instead
+    # of being cancelled at the first decode (14/14 wakes: warm_layers=8
+    # skipped_cancel=40; window-1 decode wall 38.4 ms vs 27-28.5 steady). The
+    # rest goes on a side stream in layer order, each layer committed before a
+    # forward once its event completed -- no host wait in the decode path.
+    # Off until its own metal proof (layers/moe/expert_offload.ResumeWarm).
+    SGLANG_WEG2_RESUME_WARM_FINISH = EnvBool(False)
+    # RW-AT-ARM (30.09., NF y4k/y4l P->D): the resume warm is planned,
+    # reserved and copied on the side stream AT THE ARM (the weight legs are
+    # over) instead of 8 layers per idle settle pass -- the settle ends first
+    # (y4l 12/12 wakes: warm_layers=8, skipped_cancel=40). The copies land
+    # during the kv leg and the first pass; deferred_rows_tick commits each
+    # layer before a forward once its event completed (no host wait). Measured
+    # target: the first decode round after every P->D wake, pool.fetch 104 ms
+    # (y4l median, n=12; y4k 108, n=14) against the steady round. Rows per
+    # layer: _ROWS (no new VRAM: free LRU rows only, below the seat block).
+    # Off until metal.
+    SGLANG_WEG2_RESUME_WARM_AT_ARM = EnvBool(False)
+    SGLANG_WEG2_RESUME_WARM_AT_ARM_ROWS = EnvInt(16)
+    # PFO (#287 Hebel A, 30.09., layers/moe/expert_offload.PrefillFetchOverlap):
+    # the expert-major multi-wave prefill copies wave k+1 on the rank's
+    # prefetch stream while wave k computes; the scratch is split in two
+    # halves (wave count ~doubles), events only, no host sync, no new VRAM.
+    # Measured today: PP0 16k fetch 1.13-1.48 s fully serial (moe_fetch
+    # segment == copy events). Byte-identical under the table partials; the
+    # single-wave (decode) path is untouched. Off until metal.
+    SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP = EnvBool(False)
+    # P-PREWARM (30.09., NF y4k/y4l first P forward vs warm median): at boot,
+    # beside H101/H103/P-COLD, (a) the PLE admission armed -- vocab range,
+    # hash constants on the host, pread workers up (models/qwen4_exp_ple_admit
+    # run_boot_prewarm; ple 334 vs 39 ms, 'admit ... skipped: no prefill
+    # gather in this process yet') -- and (c) the MoE router's first call
+    # (layers/moe/router_prewarm; gate +80-105 ms per stage). No forward, no
+    # new RAM or VRAM. Off until metal.
+    SGLANG_WEG2_ENABLE_TARGETED_PREWARM = EnvBool(False)
+    # P-HC-DYNROWS (30.09., NF y4k/y4l PP2 other_ms 1266 first / 329 second
+    # forward): the GatedResidual torch.compile fallbacks (layers/
+    # hyperconnection.py) mark the row count dynamic, so the first call
+    # compiles once and a new prefill length never recompiles. Bytes equal to
+    # the static compile. Off until metal.
+    SGLANG_ENABLE_HC_COMPILE_DYNAMIC_ROWS = EnvBool(False)
     # REARM_PREFETCH (H31, fnFL2x141): the Platztausch rows the exchange does
     # not carry (pad + D-extra rows, loaded from the host store) are issued on
     # a side stream right behind the resume of their layer's chunk tag, i.e.
@@ -955,6 +1130,22 @@ class Envs:
     # TAIL_ADOPT; any refusal falls back to E1 (extend [c, N)), then to the
     # page resume. 0 = the H21 form.
     SGLANG_WEG2_TAIL_SKIP_EXTEND = EnvBool(_profile_default("SGLANG_WEG2_TAIL_SKIP_EXTEND", True))
+    # SKIP_RESULT_NOW (nf-pd-post 01.10., y6o): the overlap loop processes a
+    # skip-extend batch's result (P's token) in the iteration that launched
+    # it, instead of after the NEXT batch's launch. The skip runs no target
+    # forward, so there is nothing to overlap; deferred, the first token
+    # waited for the next pass's TP recv broadcast (~175 ms behind the slowest
+    # worker's load-back issue) and that pass's launch (531 ms on a boot's
+    # first wake). Rank-uniform: the skip verdict is the group's vote. 0 =
+    # the deferred order.
+    SGLANG_WEG2_ENABLE_SKIP_RESULT_NOW = EnvBool(True)
+    # DCP_PREFIX_LENS_DEFER_SKIP (nf-pd-post 01.10., y6o): the #639 prefix-lens
+    # ballot of a skip-extend batch (no target forward) is issued in
+    # prepare_for_extend as before but DECIDED after the batch's result, at the
+    # latest before the next forward (layers/dcp/prefix_lens_check.py). TP0
+    # waited there for TP1's load-back issue (prepare_ms 240-295) before it could
+    # stream P's token. Read once at import. 0 = decide in prepare.
+    SGLANG_DCP_PREFIX_LENS_DEFER_SKIP = EnvBool(True)
     # TAIL_WAIT_MS (H45, metal fnFL2x150/x151): P's PP ranks write their tail
     # parts from background threads; D's vote used to read the part list ONCE
     # at the first prefetch check and fell on a partial manifest (parts=1-2 of
@@ -966,6 +1157,44 @@ class Envs:
     # slot of the existing MAX, never a new collective. 0 = no hold (vote at
     # the termination on whatever is staged then).
     SGLANG_WEG2_TAIL_WAIT_MS = EnvInt(1500)
+    # TAIL_FIT_ON_COMPUTE (cold-round1, metal y3p ...dauer09292250, D TP0): right
+    # after a wake the corridor narrows the prefill chunk to 64 tokens ('#794
+    # GROUP-NARROWED ... from 4096 to 64'); a parked resume with an agreed END
+    # tail but 112-211 uncached tokens then took the CHUNKED branch, where no
+    # tail is taken -- a real extend of 64 + the rest, each an expert-major pass
+    # of 1.9-2.4 s (ep44 5.97 s, ep54 5.16 s, 23:11:55 5.77 s, 23:13:24 5.66 s,
+    # 23:15:34 5.97 s from wake to the cohort's first decode). The whole-fit test
+    # and the chunk charge now take what the forward COMPUTES with the tail (0
+    # under the E2 skip, N - c under E1) instead of N - prefix; the KV charge is
+    # unchanged. 0 = the old test on N - prefix.
+    SGLANG_WEG2_TAIL_FIT_ON_COMPUTE = EnvBool(True)
+    # TAIL_FOLD_SHORT (metal y3r ...dauer09292330, P/D): under the H63 fold P
+    # published NO part when c = floor_grain(N-1) sat on a page boundary
+    # (N % page in 1..grain; 23 of 53 prompts, all N % 64 in {1, 2, 4}) and D
+    # re-ran 1-65 tokens as a real extend (2 tokens 0.6-0.7 s, 65 tokens
+    # 1.5-2.4 s, cold expert pass). On: the END-only part is published anyway
+    # (tail_handoff.fold_spec, page_prefix = the reader's claim, E1 rows may be
+    # 0) and D takes it as the E2 skip. 0 = spec_for (no part, D extends).
+    SGLANG_WEG2_TAIL_FOLD_SHORT = EnvBool(True)
+    # TAIL_FOLD_PAGE_END (P-MINIFWD 0930, metal y3r ...dauer09292330 / y3t,
+    # group P under the H63 fold): a page-multiple prompt (N % 64 == 0) still
+    # took the END-ANCHOR split -- the last 4 tokens a PP0 forward of their
+    # own (1.37-1.57 s), the body [.., N-4) truncated, so no waiting request
+    # joined it and its 60/124-token remainder ran alone as well (weg2-74:
+    # 6 x 124 tokens at 1.1 s each). On: the fold applies wherever the CLAIM
+    # ANCHOR track puts the anchor on the reader's claim N - page inside the
+    # last chunk (tail_handoff.page_end_fold_applies); END-only part as for
+    # every other fold. False = the split at N % page == 0, byte for byte.
+    SGLANG_WEG2_TAIL_FOLD_PAGE_END = EnvBool(True)
+    # P_MINIFWD_TOLD_WAIT (P-MINIFWD 0930, group P PP0 under the #1400 told):
+    # a carried request's final rest below 1000 tokens waits at the top of its
+    # pass for the store read of a request already queued (held, read open),
+    # so the told goes on this pass's wire and the rest runs in that request's
+    # chunk 0 instead of alone (y3r weg2-62-92: 66 tokens 1144.7 gpu-ms alone,
+    # 93's told one pass later). Bound = the measured price of a lone rest on
+    # this rank (weg2/p_minifwd_hold.py), no waiter / a control request / a
+    # co-admissible request / unmeasured -> no wait. False = no wait, ever.
+    SGLANG_WEG2_P_MINIFWD_TOLD_WAIT = EnvBool(True)
     # TAIL FOLD (fnFL2 H63, group P, only with TAIL_HANDOFF + TAIL_ADOPT +
     # TAIL_SKIP_EXTEND): the END-ANCHOR no longer splits the last chunk at
     # c = floor_r(N-1) when N is not a page multiple -- the tail [c, N) runs
@@ -979,6 +1208,8 @@ class Envs:
     # or 0 for them, a refused skip is the page resume. N % page == 0 keeps
     # the cut (the fold would track the anchor at N, one token too deep).
     # False = the H24 form, byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_ENABLE_P_TAIL_FOLD = EnvBool(False)
     # TAIL KEEP (fnFL2 H63b, set on BOTH groups): the tail-part store
     # (<arena dir>/handoff, tmpfs = host RAM) as a bounded buffer between P
@@ -994,6 +1225,8 @@ class Envs:
     # Bound: max(KEEP_MIB, capture_keep() x one rid's parts) plus the parts
     # being written; one 97k rid (PP0+PP1+PP2) is 56.9 MiB folded (H63),
     # 113.8 MiB not (x166).
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_TAIL_KEEP_MIB = EnvInt(0)
     # TAIL READ MMAP (Kriech-Sitz 29.09., z30w-park): a D rank reads a tail
     # part with torch.load(mmap=True) -- the tensors are views of the part
@@ -1018,6 +1251,8 @@ class Envs:
     # n-gram hash and short conv at the resume point). Rows are only written
     # and installed on the rank that runs the PLE layer. False = the H24/H63b
     # form, byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_PLE_STATE_HANDOFF = EnvBool(False)
     # DECODE WARM FROM P (fnFL2 H29). P publishes what it saw at the END of
     # the prompt into the hand-off dir (<SGLANG_HICACHE_ARENA_DIR>/handoff):
@@ -1101,6 +1336,17 @@ class Envs:
     # search, so the front runs the same search. A cycle-free order stays
     # unchanged either way. Off by default: never run on metal.
     SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH = EnvBool(False)
+    # FLIP_ORDER_LEAST_DEFICIT (02.10., NF y6u D->P 2->3 / 4->5): when no order
+    # is funded at the measured free (greedy and, if on, H54 found none), the
+    # front no longer keeps the given order -- at y6u's driver_free {0: 1281,
+    # 1: 2212, 2: 1269} that order ran into its credit cycle (sleeper1
+    # weights_15 -> waker2, sleeper2 weights_11 -> waker1) and stalled 1.6-1.9 s
+    # until the W109b spill. It takes the order the model funds at the smallest
+    # uniform free uplift per card (weg2/wake_credit.least_deficit_order; the
+    # given order needs +2048..3072 MiB, the reorder +512), the given one when
+    # it is funded at the same step. Only the order changes: no reservation,
+    # the planner's W126 riegel asks without it. 0 = the given order is kept.
+    SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT = EnvBool(True)
     # PD_TIMED_ORDER (H34, fnFL2x141): the planner times the P->D wake per card
     # in ms (weg2/wake_credit_pd.py) and recommends a rearrangement of the
     # tightest card's own P bands when the credit wait there lengthens the leg
@@ -1205,6 +1451,19 @@ class Envs:
     # one lane takes of the card's SMs; the metal probe
     # (probe_lanes_parallel.py) sweeps it.
     SGLANG_WEG2_LANE_SM_COPY_BLOCKS = EnvInt(64)
+    # BAR1_SPILL_GRACE_S (W109b, NF y6u 01.10. epochs 2->3 and 4->5): the age
+    # a blocked BAR1 depositor demands of every edge of a waker credit cycle
+    # through its own deposit before it spills the rest of the tag to host
+    # memory. Until 02.10. it was a third of the waker's W109 grace (1.0 s)
+    # plus a 0.5 s poll on top of the 0.5 s `blocked` flag delay: y6u's two
+    # cycled D->P wakes (sleeper1 weights_15 -> waker2, sleeper2 weights_11 ->
+    # waker1) sat 1.6-1.9 s in deposit before the spill, 3.40/3.46 s gathered
+    # legs against 1.31-1.45 s in the four uncycled ones. The chain is a
+    # deadlock by construction (each waker's credit can only come from the
+    # sleeper that is blocked on the other waker), so the grace only covers
+    # flag-read skew. The waker's W109 refusal keeps its own grace
+    # (SGLANG_WEG2_BAR1_CYCLE_GRACE_S, 3 s).
+    SGLANG_WEG2_BAR1_SPILL_GRACE_S = EnvFloat(0.1)
     # Weg-2 load (H39, fnFL2x141-x145): the dense Marlin linears
     # (compressed_tensors_wNa16: GDN/attention/shared-expert 6->8 bit, HC
     # mixer, PLE, lm_head) keep their checkpoint-format tensors and the whole
@@ -1306,6 +1565,8 @@ class Envs:
     # stay on the HMM path. LOG_EVERY rounds per PLE-DECODE-PREAD line. Off =
     # the captured kernel reads every row through HMM (the pre-H40 graph).
     SGLANG_QWEN4_PLE_DECODE_PREAD = EnvBool(True)
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_QWEN4_PLE_DECODE_PREAD_PROCS = EnvInt(4)
     SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS = EnvInt(4)
     SGLANG_QWEN4_PLE_DECODE_PREAD_BUDGET_MS = EnvFloat(8.0)
@@ -1319,6 +1580,8 @@ class Envs:
     # the host's event wait + hash + pread (x168: gpu_gap_ple 1.7 ms per
     # round, all three cards idle) off the device's critical path. Off = the
     # H40 order and the H40 kernel, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY = EnvBool(False)
     # fnFL2 H73 (D, verify rounds): the pread WORKERS stage the round on their
     # own. The verify's windows are posted by the device into a mailbox of the
@@ -1331,12 +1594,16 @@ class Envs:
     # start at the draft's end instead of after the verify replay returned.
     # Implies the gated kernel; supersedes BEHIND_REPLAY (no hook). Off = the
     # H40/H69 paths, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_PLE_STAGE_AUTONOMOUS = EnvBool(False)
     # fnFL2 H73 (with AUTONOMOUS): the NEXT round's first verify token is this
     # round's bonus -- after the accept its window [committed history | bonus]
     # is posted as well, and the workers read those rows (16 per request)
     # while the draft extend and the next draft run; the verify round then
     # keeps every row whose id is already staged. Off = only the verify post.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_PLE_STAGE_BONUS_EARLY = EnvBool(False)
     # fnFL2 H69b (Form A only, D's host): build the PLE n-gram table with the
     # full vocabulary (enable_tp=False), as F13 does for embed_tokens. Without
@@ -1346,6 +1613,8 @@ class Envs:
     # (x168: kernel_rows/rows 33.4 %). A correctness fix: it changes D's
     # numerics back to P's model and triples D's staged PLE rows per round
     # (21 -> 64 at bs 1). Off = the pre-H69b layout, byte-identical.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB = EnvBool(False)
     # H68d (models/qwen4_exp_ple_fp8.py): how the PLE gathers read an fp8
     # (float8_e4m3fn) table -- the nvidia NVFP4 export's PLE is fp8, and Triton
@@ -1376,6 +1645,15 @@ class Envs:
     # is in flight; otherwise it is routed with the start X (to P). NF D is
     # bs1, so a burst served serially on D would be slower than P's batch.
     SGLANG_WEG2_X_SOLO_WINDOW_MS = EnvInt(250)
+    # X_ROUTED_NEEDS_P (#246b, 30.09., NF y4c ...dauer09300427 front 04:39:57):
+    # a queued request needs P above the X it was ROUTED on, not only above the
+    # live X. weg2-22-37 / 22-38 (4447 / 4191 tokens) were routed LONG on the
+    # X-SOLO band floor X_busy=4096 (D busy), but the ARRIVAL-SEAT step, the
+    # park collect window and the immediate park asked needs_p() against the
+    # live X 4964 -> no candidate, no verdict, no flip: D decoded one stream
+    # with 5 free seats for 128 s (DP-WAIT hold_by=d-work) until it ended.
+    # Off = needs_p() against the live X only, as before.
+    SGLANG_WEG2_ENABLE_X_ROUTED_NEEDS_P = EnvBool(True)
     # #49 rest (FS 26.09., desk/27b-frontspan2-0926 a561991382, inflight half
     # only: #49 itself runs unswitched in the unified tree since S7c): a D leg
     # 2 whose stream has delivered its first content event has PREFILLED its
@@ -1459,6 +1737,11 @@ class Envs:
     # nextflash on (its metal), qwen27b off (upstream keying, the 27B metal);
     # on without a form (the NF code default).
     SGLANG_WEG2_BIGRAM_ANCHOR_EXACT = EnvBool(_profile_default("SGLANG_WEG2_BIGRAM_ANCHOR_EXACT", True))
+    # HANDBACK N-1 claim (27B fe5c55041b, gated RELEASE-HEAD 1002): D claims N
+    # raw tokens on an exact bigram tree. Profile row ``handback_claim_n``
+    # (qwen27b on, nextflash off); on without a form (the 27B line's claim --
+    # NF always runs with its form, whose row turns it off).
+    SGLANG_WEG2_HANDBACK_CLAIM_N = EnvBool(_profile_default("SGLANG_WEG2_HANDBACK_CLAIM_N", True))
     # #49 (27B 196f6a8f57, S7c) behind a switch -- NF P49 c1988ff84f: agent
     # turns priced so that a short tail on a prefix D already holds stays on D.
     # On = (A) request_text renders tools FIRST (the Qwen3.8/Flash-Next template
@@ -1560,7 +1843,9 @@ class Envs:
     # 3320/6096, TP2 3120/7632; repack ~30 s per D rank. On: repack only the
     # rows that were read (+ the pad row). Same bytes for every row anyone
     # reads; the vetoed rows stay what they were -- unread garbage.
-    SGLANG_MOE_REPACK_SKIP_VETOED = EnvBool(False)
+    # Default on (30.09.): every NF metal boot since z30r3 ran it, but only via
+    # the instrument profile -- a release with HTSGLANG_INSTRUMENTS=0 lost it.
+    SGLANG_MOE_REPACK_SKIP_VETOED = EnvBool(True)
     # BOOTZEIT 4 (29.09., z30w-park): the per-layer host reclaim at the end of
     # the presplit (PresplitGcMode). FULL: gc.collect() + malloc_trim(0) --
     # the collect was 7.8-9.6 % of the D loader thread, under the GIL, 48x
@@ -1816,6 +2101,12 @@ class Envs:
     # the read's end when that node carries no state -- instead of releasing it
     # (the node then matched KV to 43200 with no state: "#928 REFUSING").
     SGLANG_WEG2_PREFETCH_ANCHOR_ATTACH = EnvBool(True)
+    # ANCHOR-ONLY BACKUP (NF y5a 30.09., 16x WEG2-ANCHOR-LOST at=flush): a node
+    # whose KV is already backed (backuped / l3_present) but whose Mamba anchor
+    # lives on the device only gets the anchor alone copied D->H into the Mamba
+    # arena (no KV copy); the publish sweep skipped such nodes and the flush
+    # reset dropped the anchor.
+    SGLANG_WEG2_ANCHOR_ONLY_BACKUP = EnvBool(True)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be
@@ -2105,6 +2396,8 @@ class Envs:
     SGLANG_UNEVEN_MOE_VECTOR = EnvStr(None)
     # WP3a: shard MoE experts by INDEX (whole experts per rank, pad expert at
     # local 0) under an uneven plan for non-GGUF quant paths too.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_UNEVEN_MOE_EXPERT_SHARD = EnvBool(False)
     # WP8 expert lookahead (slotstream +11 % decode): a MoE block runs the
     # router of the block N steps AHEAD on its own stream and that block's
@@ -2476,6 +2769,12 @@ class Envs:
     # runs ~1 s each off the reset-joined threads, 23 flips interleave max 2.34 s, needle MATCH; user order: a
     # proven performance switch is default on). Off: byte-identical old path, the whole run stays in reserve().
     SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH = EnvBool(True)
+    # 30.09. (NF y3u 5bedac26f1, weg2-0-5): the L3 LRU evicted the QSA index page of a KV page alone -- D's owner
+    # unlinked 8 `{h}.qsa_indexer` files at 00:35:43 whose KV pages stayed on disk (index order: QSA 21:41:25, KV
+    # 00:10:24), so D's resume and P's reroute both capped at 47 of 1996 pages and P re-prefilled 127813 tokens.
+    # On: the QSA index page of a KV page that is on disk is never the victim; it leaves together with its KV page.
+    # Off: byte-identical old path (every file its own LRU entry).
+    SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT = EnvBool(True)
     SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE = EnvStr("0")
     # Enable client-side metadata caching to optimize filesystem checks (e.g. for Lustre/NFS/FUSE)
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
@@ -2888,6 +3187,42 @@ class Envs:
     # the decode LRU. False: the plan before H107. Rank-uniform: every rank
     # reads the same launcher env; the waves are rank-local (no collective).
     SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS = EnvBool(True)
+    # D-Mini-Extend (30.09., y3u): an eager forward under the pool whose routed
+    # ids fit the widest CAPTURED decode step (graph form: max graph bs x MTP
+    # verify rows x top-k, and the step's wave bound min(ids, E - R) <=
+    # waves x (LRU + staging) with waves <= SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES)
+    # runs the decode graph's device-planned step instead of the host plan:
+    # prepare_pool / run_pool_waves, eager. No per-layer D2H of the routing,
+    # no host plan, no sync_pool_from_host (its 4-5 device reads per layer);
+    # the misses are those of the decode step, promoted into the LRU by its
+    # own rule. y3u D TP0: extends of 2-6 new tokens cost 403-739 gpu-ms,
+    # every MoE layer serialized CPU launch and H2D behind its syncs. Single
+    # wave: bit-identical to the host plan (one apply over the same lanes on
+    # rows holding the same bytes). False: every eager forward plans on the
+    # host as before. Rank-local choice, no collective inside the MoE.
+    SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP = EnvBool(True)
+    # y6o (01.10.): the host-planned eager forward (D's extend of more ids
+    # than the device step takes) republishes each layer's pool tables
+    # (check_pool_error + sync_tables, device reads) right after that layer's
+    # waves -- a drain of the stream at EVERY MoE layer, so the next layer's
+    # attention is launched only after this layer's experts finished
+    # (y6m slot 2 py-spy: check_pool_error 18.8 % of D TP0). True: inside a
+    # model forward the per-layer republish is queued and run once at the end
+    # of the layer loop (eager_pool_sync_scope), in layer order, before the
+    # forward returns -- a sticky pool error still stops the forward by layer
+    # name before its output is used. Outside such a scope (any other caller)
+    # the republish runs at once as before. False: per layer as before.
+    # Rank-local, no collective.
+    SGLANG_OPT_MOE_POOL_DEFER_EAGER_SYNC = EnvBool(True)
+    # Metal instrument for SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP: the first N
+    # device-planned eager forwards PER LAYER also run the plain host plan
+    # (history-free, H107 off: every spill expert fetched fresh from the host
+    # store) as the reference and compare the MoE outputs. One line
+    # 'EAGER-DEVICE-STEP CHECK ... verdict=MATCH' per check; a deviation
+    # beyond fp rounding stops the rank by name ('EAGER-DEVICE-STEP
+    # MISMATCH'). 1 (default) = the first mini extend of the process proves
+    # all 48 layers once (one extra MoE pass); 0 = off.
+    SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK = EnvInt(1)
     # H95: the captured decode step of the device-planned pool
     # (SGLANG_MOE_OFFLOAD_GRAPH_MODE=pool) in up to N OVERFLOW WAVES. 0 or 1
     # (default) = off, the Task #40 worst case: a captured batch needs
@@ -2917,13 +3252,29 @@ class Envs:
     SGLANG_DEBUG_MOE_HEAT = EnvStr(None)
     # #239 S3f miss record (layers/moe/pool_miss_cost.py): the records root
     # of the line (``.../records/<line>``, IPC plan section 2.2 req. 7 / VRAM
-    # contract M3) turns it on. Each D rank sums the pool.fetch device ms of
-    # its split decode rounds and the rows every pool layer missed, and writes
-    # one JSON record per rank at its sleep into ``<root>/<model_id>/owned_miss/``
-    # (next to the #276 heat record). The launcher's owned solve reads the same
-    # directory and prices a missed row with it instead of the seed. Unset
-    # (default) = off: one cached bool test per round and per pool sync.
+    # contract M3) turns it on. PR2 (30.09.): each D rank pairs, per timed
+    # prefill forward, the device ms of its host-plan expert fetches
+    # (``pool.host_fetch`` spans) with the rows THE SAME fetches loaded (a
+    # window at the prefill timer's bracket; only a #691-paired, split-known
+    # duration whose span count equals its fetch count counts), and writes
+    # one JSON record per rank at its
+    # sleep into ``<root>/<model_id>/owned_miss/`` (next to the #276 heat
+    # record). The launcher sets it for group D by default (evidence
+    # ``records/weg2``; --env-d names another root, empty = off); its owned
+    # solve reads RECORD from K paired forwards per rank, else the seed.
+    # Unset = off: one None test per fetch.
     SGLANG_WEG2_OWNED_MISS_RECORD = EnvStr(None)
+    # Owned cut from the profiles (user 01.10. ~19:05Z: the expert split on D
+    # comes from the planner, not from a hand vector in the profile). The
+    # owned solve weights its round over the decode batch-size mix the line
+    # runs, "<bs>:<weight>,..." (unset = the measured default bs1 0.107 / bs2
+    # 0.446 / bs3 0.447 of y6k -dres 01.10.; "bs1" = the old bs1-only solve).
+    SGLANG_WEG2_OWNED_BS_WEIGHTS = EnvStr(None)
+    # Form-A base of the owned solve: "derive" (default) = the planner derives
+    # the ownership that minimises the weighted round, the profile's
+    # --rank-moe-ratio only seeds the search; "stated" = the stated vector is
+    # the base (the old hand base, explicit override).
+    SGLANG_WEG2_OWNED_BASE = EnvStr("derive")
     # H95c (Nutzer 26.09.: "1,6gb experten cache kostet es nur bei tatsaechlich
     # 6 sitzen"): D's per-seat posts are PHYSICALLY backed only for the seats
     # the phase occupies (n = d_seats.phase_seats of the wake's handoff_n); the
@@ -2937,6 +3288,17 @@ class Envs:
     # the Next-Flash launcher profile writes it True into --env-d.
     # Rank-uniform: every rank of D reads the same launcher env.
     SGLANG_OPT_WEG2_D_SEAT_VRAM = EnvBool(False)
+    # D-SEAT-REWAKE (Nutzer 30.09.: "D sleeped (ohne wirklich runterzufahren)
+    # und waket sofort wieder mit mehr sitzen ... selbe funktion nur auch
+    # wieder in die andere richtung"): D's phase seat count n moves LIVE at a
+    # round boundary, rank-uniform, no weight legs, no P -- grow n -> n+k when
+    # waiting requests find every seat taken (the expert rows the new seats'
+    # GDN pages need go off, coldest first); shrink n -> n-k when seats stand
+    # free and nobody waits, once the free time exceeds the MEASURED price of a
+    # re-plan round trip (ski rental, the flip policy's shape) -- the freed
+    # pages go back to expert rows. Needs SGLANG_OPT_WEG2_D_SEAT_VRAM; read by
+    # D's ranks AND by the front (which then counts D's seats at --d-bs).
+    SGLANG_WEG2_D_SEAT_REWAKE = EnvBool(False)
     # H95c: the extra expert rows' VIRTUAL reservation per MoE TP rank
     # ("16,0,0"), written by the launcher from the seat table (rows at n=1
     # minus rows at the --d-bs cap, GERECHNET). Only the rows the runtime's
@@ -2981,6 +3343,43 @@ class Envs:
     #   coldest kept rows first (weg2/d_mem_sched.py). ON by default; this is
     #   the diagnosis-only emergency stop, not a feature switch.
     SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS = EnvBool(False)
+    # D-MEM-SCHED floor/room re-check (01.10., NF y6k: 32 % of the D-TP0
+    #   scheduler in max_live_page, a device sync + a group collective every
+    #   decode round under a pending shrink; host gap 9 ms/round vs 2.9 in
+    #   x176). While a shrink stays pending and nothing replicated changed,
+    #   the floor and the room below the cap are re-read after 1, 2, 4, ...
+    #   up to this many rounds (an end event, a lift or a demand change
+    #   re-reads at once; the room re-reads before decode can use up its
+    #   slack). 1 = every round (the old behaviour).
+    SGLANG_WEG2_D_MEM_RECHECK_ROUNDS = EnvInt(64)
+    # KV-STAGE warm refill (01.10., y6h: 179 shrinks, 178 on an end event, 72
+    #   of 109 grows within 5 s after one): a seat-row shrink remembers the
+    #   experts it sent to the store, hottest first; the next grow refills its
+    #   freed rows with them at once (the miss path's copy, no new VRAM)
+    #   instead of letting each one miss cold. False = byte-identical lazy fill.
+    SGLANG_WEG2_D_SEAT_WARM_REFILL = EnvBool(True)
+    # D-TRANSIENT-LEND (01.10., user law "free VRAM is always experts"): between
+    #   two extends D's statically booked transient (corridor floor above the
+    #   near-OOM edge, awake overshoot, extend activation, the KV share the
+    #   stage does not map) sits free on the card -- fqnsdm 01.10.: 1.7-2.0 GiB
+    #   NVML-free per rank for ~95 % of D's time. It is lent as extra LRU
+    #   expert rows after SETTLE decode rounds and returned (rows OFF coldest
+    #   first, sync, unmap) before the next extend / stage move / wake
+    #   (weg2/d_transient_lend.py). ON by default; off = byte-identical.
+    SGLANG_WEG2_D_TRANSIENT_LEND = EnvBool(True)
+    #   The near-OOM edge per D rank (MiB, "767,700,701"): the launcher writes
+    #   the card ledger's floor beside SGLANG_WEG2_EXTEND_TRIM_MIB. Unset = no
+    #   lend (nothing is guessed).
+    SGLANG_WEG2_D_LEND_FLOOR_MIB = EnvStr(None)
+    #   Virtual seat rows a lend may take above the rank's own seat rows (VA
+    #   only: unmapped rows cost no byte), per rank or one value; only ranks
+    #   that already have seat rows get them.
+    SGLANG_WEG2_D_LEND_HEAD_ROWS = EnvStr("16")
+    #   The lend lattice: the bank's plans are cut every STEP rows so a lend
+    #   and its return release whole cells only (S1-Wisch).
+    SGLANG_WEG2_D_LEND_STEP_ROWS = EnvInt(4)
+    #   Decode rounds in a row before a lend (a burst of extends lends nothing).
+    SGLANG_WEG2_D_LEND_SETTLE_ROUNDS = EnvInt(8)
     # 29.09. (Nutzer 12:35Z, Grundgesetz): KV stages BELOW the booked S0 at this
     #   granularity (floor, 2 x floor, ... < S0, e.g. 32768). The plan still
     #   books S0; the KV between the floor and S0 is born unmapped and funds
@@ -3070,6 +3469,19 @@ class Envs:
     # its own (`Scheduler.anchor_tails`); the tails [N-1', N) are re-added
     # together in the next pass. Inert without the END-ANCHOR (group D).
     SGLANG_WEG2_ENABLE_P_MULTI_ANCHOR_TAILS = EnvBool(False)
+    # TURN ANCHOR (weg2/turn_anchor.py, 29.09.): the chat template's turn-start
+    # token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Set on group P,
+    # a prefill step whose extend holds the start of the prompt's LAST message
+    # snapshots the recurrent state there too (a second extend track in the
+    # same forward) and inserts it as its own anchor -- where the next turn
+    # and a client's side request fork. Unset/None = every path byte-identical.
+    SGLANG_WEG2_TURN_ANCHOR_TOKEN = EnvInt(None)
+    # TWIN ANCHOR (weg2/twin_anchor.py, 30.09., NF y4a weg2-16-28): where the
+    # turn anchor and the twin deferral are armed, a prefill step also tracks
+    # the state at floor_page(shared - 1) of every fork twin still queued
+    # behind the request (one more gather row, one mamba slot), and a twin
+    # waits only for a source that promised an anchor <= shared. 0 = off.
+    SGLANG_WEG2_TWIN_ANCHOR = EnvBool(True)
     # fnFL2 H42b: burst assembly on the DECIDING P rank (PP0), only while
     # multi anchor tails are armed. A pass that would carry nothing but new
     # bodies is held back up to this many ms while more of a burst is still
@@ -3278,6 +3690,8 @@ class Envs:
     # 256 codes. Grammar [smXX:]MODE[;...] (MODE exp2|bits|ptx), an arch group
     # wins over a generic one, e.g. "sm86:ptx" moves only the 3080 stages.
     # Empty = exp2 (default; the kernel compiles to the same SASS as before).
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_QSA_FP8_DECODE = EnvStr("")
     # QSA prefix-free prefill launch (fnFL2 H65, F2 of H58, same file): the
     # first chunk of a prompt and every short prefill run _sparse_gqa_prefill
@@ -3292,6 +3706,8 @@ class Envs:
     # instead of the torch chain, whose int64 top-k copy, gather, full_like and
     # where hold ~0.57 GB per full-attention layer of a 16k chunk above the
     # 134-MB rows. Same rows, bit-identical attention. False = torch chain.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_QSA_ROWS_FUSED_EAGER = EnvBool(False)
 
     # Torch Compile
@@ -3515,6 +3931,8 @@ class Envs:
     # publish_park_end); the resume is then E2's skip (no tail extend, ~2 s
     # expert pass on NF-D). Needs SGLANG_WEG2_TAIL_SKIP_EXTEND; refused by
     # name under uneven DCP / the token cut. Off = the park byte for byte.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_ENABLE_D_PARK_END = EnvBool(False)
     # PARK-COLLECT-WINDOW (29.09., NF z30w-park 08:31-08:46: 21 immediate parks
     # in 15 min, 37 parked streams, park->resume median 8.4 s / p90 17.8 s --
@@ -3551,6 +3969,48 @@ class Envs:
     # one decision site. Front-side switch, model-neutral; off = nothing sent,
     # D's admission byte for byte. Off until the first boot series, then on.
     SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE = EnvBool(False)
+    # ARRIVAL-SEAT (user 29.09. ~19:40Z, weg2/arrival_seat_rule.py): while D
+    # decodes, an arrival that finds a free D seat and fits D's free KV is
+    # prefilled at once -- on D (uncached <= X) or by an immediate flip to P
+    # (no collect window); without a seat nothing flips and it waits for the
+    # next seat in arrival order; the wait bound parks the youngest decode.
+    # With it on, PARK-COLLECT-WINDOW and PARK-WINDOW-GATE are inert. Front-
+    # side, model-neutral. Off until the first series, then on.
+    SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE = EnvBool(False)
+    # ARRIVAL-SEAT: the decode part of an arrival's KV need when the client
+    # set no max_tokens (prompt + this = the need checked against D's free KV).
+    SGLANG_WEG2_ARRIVAL_DECODE_RESERVE_TOKENS = EnvInt(2048)
+    # ARRIVAL-SEAT AGE PLAN (Nutzer 30.09. ~14:40Z/14:45Z, the seat policy):
+    # age has the right of way; a younger request that fits beside older
+    # running ones is backfilled (no time limit); the oldest waiter displaces
+    # younger running decodes ONLY when it does not fit otherwise -- the
+    # fewest youngest that make it fit (seat and KV), and only when they do.
+    # ONE displacement logic, on D (d_park_runtime.displace_for_age, SEAT-AGE
+    # seat/KV trigger + victims_needed on D's real KV); the front only orders
+    # by age across the P and D waiters, admits a head D can make fit, and
+    # backfills past heads their elders block -- no front park, no wait-bound
+    # blanket park, no clock on the backfill. Needs
+    # SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE; 0 = the ARRIVAL-SEAT/#246 front.
+    SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN = EnvBool(True)
+    # ARRIVAL-SEAT MIN-DWELL (NF-Operator 30.09., y5c: weg2-0-2 parked 6x by
+    # flip_now, park 4 came 1.1 s after its resume): a flip_now to P waits
+    # until the decodes this D phase RESUMED have decoded since their resume
+    # at least one measured flip round trip -- the price X-COST-LINE / K_FLIP
+    # use (live warm legs > record of this checkpoint x form; unmeasured =
+    # no hold, named). The arrival waits in arrival order meanwhile (its seat
+    # stays its own under the AGE PLAN), is never rerouted. Name ordered by
+    # the operator (no ENABLE verb); default on: a stability fix.
+    SGLANG_WEG2_ARRIVAL_MIN_DWELL = EnvBool(True)
+    # ARRIVAL-SEAT KV reading budget (NF D->P flip, 01.10. bfpgwv): how long
+    # the controller tick waits for a FRESH /server_info from D before it
+    # decides on the last reading it has. D answers /server_info only at its
+    # scheduler pass boundary, and so does the park RPC that follows a
+    # flip_now -- a blocking read put the park one whole D pass later (6 of
+    # the 6 bfpgwv D->P flips over 4 s: `kv=unread` after the 2.0 s timeout,
+    # park RPC 1.0-5.1 s). The refresh keeps running in the background and
+    # lands for the next tick; no reading at all (boot, after a KV park)
+    # still waits for D as before. Seconds; 0 = never wait for a refresh.
+    SGLANG_WEG2_ARRIVAL_KV_READ_BUDGET_S = EnvFloat(0.05)
     # X-COST-LINE (29.09., third part of the ski-rental decision; NF z30w
     # 09290827 and 27B 09290020 both ran with `X NO-SOLVE: no r_d` because the
     # solo r_D probe never fired under load). X is re-solved from D's measured
@@ -3585,11 +4045,22 @@ class Envs:
     SGLANG_WEG2_X_COST_FIT_MIN_SPREAD = EnvFloat(4.0)
     SGLANG_WEG2_X_COST_FIT_MIN_BIG = EnvInt(8)
     SGLANG_WEG2_X_COST_MAX_STEP = EnvFloat(0.25)
+    # X-K-FLIP (30.09., NF y5a front): the X COST-LINE re-solve amortised the
+    # flip's round trip over k = the MEAN requests per P phase of the boot
+    # (mean-of-19 = 2.4-2.6, inflated by the dmatrix 6-request bursts), so the
+    # live X fell 4096 -> 1440-1900 and 8 flips were fired by ONE agent request
+    # of 2087-2940 new tokens (k real 1-2). On: X in force = the lone request's
+    # (k=1, ~4200 on y5a's lines); an arrival is routed on the X of the flip it
+    # would take (1 + requests queued for P now). The mean stays display-only.
+    # Default on for the NF freeze (y5c): the routing rule itself, not a tuning.
+    SGLANG_WEG2_X_K_FLIP = EnvBool(True)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at
     # their compact slots and the QSA pending ring -- instead of refusing it,
     # so the group votes 2 and the extend is skipped again. Off = the refusal.
+    # LEISTUNGSSCHALTER: --profile nextflash defaults it ON per group (registry
+    # group_switch_defaults, weg2/form.py); this global default stays (27B).
     SGLANG_WEG2_ENABLE_CUT_WORKER_END = EnvBool(False)
     # Fix B (weg2/p_row_authority.py): the #631 row form on group P
     # (ModelProfile.p_row_authority: qwen27b on since the agent-load proof

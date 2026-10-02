@@ -55,7 +55,10 @@ THE RULE (PP0 decides the fork at its told; every stage cuts at that number):
     C)``, C the configured chunk). A cut that would cost a forward (the ~1.7 s
     expert-stream floor per forward, H118) is not taken and counted as
     ``paid``. Nothing else moves: the end-anchor split, the fold and the
-    chunk budget stay as they were.
+    chunk budget stay as they were. A paid fork is not lost: the step that
+    runs through it draws one more extend track there (FORK TRACK,
+    weg2/turn_anchor.py ``_note_fork_step``, NF y5k weg2-0-4) -- the anchor
+    without the forward.
   * under ``SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL`` the cut is taken only where
     that rule donates an anchor anyway (``fork - p >= interval``); an
     anchorless boundary would buy nothing.
@@ -100,6 +103,21 @@ def armed() -> bool:
     return int(getattr(sa, "pp_size", 1) or 1) > 1 and int(
         getattr(sa, "tp_size", 1) or 1
     ) == 1
+
+
+def store_fork_pages(kv_uncapped: int, all_pages_uncapped: Optional[int]) -> int:
+    """QS (NF y4b 04:05:26, weg2-52-142): the store pages a fork may stand on
+    -- the KV prefix every claim-capping ALL_PAGES pool (the QSA index) holds
+    too, the same MIN the fetch takes (``batch_exists_v2``). The fork used
+    the raw KV prefix: ``P-FORK-CUT TOLD fork=96000 src=store`` while the
+    fetch capped the claim at the QSA index's 359 pages (``#1028B FETCH CAP
+    kv=1500 ... caps={qsa_indexer: 359}``) -- told and fetch disagreed about
+    what the store holds. None (a probe without the per-pool walk): the KV
+    prefix, unchanged."""
+    kv = max(0, int(kv_uncapped or 0))
+    if all_pages_uncapped is None:
+        return kv
+    return min(kv, max(0, int(all_pages_uncapped)))
 
 
 def note_store_uncapped(rid, kv_uncapped_pages: int, claimed_pages: int) -> None:

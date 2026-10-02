@@ -141,7 +141,7 @@ def _prefill_block(mr) -> Optional[Dict[str, Any]]:
     if not isinstance(cum, dict):
         return None
     out = dict(cum)
-    for k in ("gpu_ms", "split_ms", "compute_ms", "wait_ms", "bubble_ms"):
+    for k in ("gpu_ms", "split_ms", "compute_ms", "wait_ms", "bubble_ms", "own_ms", "compute_only_ms"):
         if isinstance(out.get(k), float):
             out[k] = round(out[k], 1)
     return out

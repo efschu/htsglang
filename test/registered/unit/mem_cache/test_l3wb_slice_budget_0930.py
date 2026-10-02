@@ -1,5 +1,12 @@
 """L3WB-SLICE (30.09.): one L3 write-behind pass never blocks a rank for more than its slice budget.
 
+NF port of 27B 82871045cd (the L3WB part only). The NF pass differs from the 27B one: the QSA
+index arena goes first and every KV page passes the QS pair gate (``_l3_pair_gate``) before it is
+written. The 27B tests below run unchanged against the NF pass (no QSA window -> the pair gate
+allows every stem); the last test pins the NF-only shape: QSA arena first, sliced, and the KV
+arena of the SECOND cycle still written (a new cycle resets every arena, not only those its first
+pass reached).
+
 Metal z30y10 (dcdb9ab8f9, D TP0): the P->D flip's wake was clean at 20:03:51; at 20:03:52 the
 write-behind gate opened (``gate=open (was leg)``) and the next pass logged at 20:04:10
 
@@ -39,8 +46,11 @@ import torch  # noqa: E402
 
 from sglang.srt.mem_cache import hicache_storage as HS  # noqa: E402
 from sglang.srt.mem_cache.canonical_page_store import CanonicalExtentWindow  # noqa: E402
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile  # noqa: E402
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile, PoolName  # noqa: E402
 from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena  # noqa: E402
+from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
+
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
 pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="needs gcc")
 
@@ -53,6 +63,15 @@ STEM_S = 1 / 1024        # the per-stem verification cost (virtual): the metal's
 
 class _KVPage:
     pass
+
+
+@pytest.fixture(autouse=True)
+def _awake_gate():
+    from sglang.srt.mem_cache import l3_write_behind as gate
+
+    gate._reset_for_tests()
+    yield
+    gate._reset_for_tests()
 
 
 class _Clock:
@@ -298,7 +317,7 @@ def test_the_default_budget_is_25_ms():
     assert abs(HiCacheFile._l3wb_slice_s() - 0.025) < 1e-12
 
 
-T2 = 128
+Q_TOTAL = 32
 
 
 def _put(arena, stem, total, fill=0):
@@ -306,25 +325,28 @@ def _put(arena, stem, total, fill=0):
     assert arena.write([stem], [total], [((0, total),)], [pay.data_ptr()]) == [1]
 
 
-def test_a_new_cycle_resets_every_arena_not_only_those_its_first_pass_reaches(tmp_path, monkeypatch):
-    """NF 03ef1f6699 (port of its NF-only test to the 27B pass): a new cycle resets the cycle
-    state of EVERY arena before the first one is visited. Two arenas; cycle 1 writes n pages
-    in each. Cycle 2 brings m new pages in each and its FIRST pass is cut inside arena 1, so
-    arena 2 is not reached by it. Arena 2 must still be visited later in cycle 2 -- in the
-    82871045cd form an arena was reset only when the cycle's first pass reached it, arena 2
-    kept cycle 1's ``done`` and its m new pages waited a whole cycle."""
+def test_nf_qsa_first_and_the_kv_arena_of_the_next_cycle_is_not_skipped(tmp_path, monkeypatch):
+    """NF: the QSA index arena goes first and every KV page passes the QS pair gate. Cycle 1
+    writes n pairs (sliced). Cycle 2 brings m new pairs: its FIRST pass is cut inside the QSA
+    arena, so the KV arena is not reached by it. The KV arena must still be visited later in
+    cycle 2 -- a new cycle resets EVERY arena, not only those its first pass reached (the 27B
+    form reset an arena only when it was reached, so the KV arena kept cycle 1's ``done`` and
+    its m new pages waited a whole cycle). No KV page ever lands without its index."""
     n, m = 200, 200
-    be, _a0, _ = _backend(tmp_path, monkeypatch, 0)
-    a1 = ShmArena(str(tmp_path / "shm" / f"arena-a1-{TOTAL}.bin"), TOTAL, n + m + 16)
-    a2 = ShmArena(str(tmp_path / "shm" / f"arena-a2-{T2}.bin"), T2, n + m + 16)
-    be._arenas = {TOTAL: a1, T2: a2}
-    s1 = [be._get_suffixed_key(f"{i:05d}" + "a1" * 30) for i in range(n + m)]
-    s2 = [be._get_suffixed_key(f"{i:05d}" + "b2" * 30) for i in range(n + m)]
+    be, kv_arena, _ = _backend(tmp_path, monkeypatch, 0)
+    be.canonical_qsa_page = CanonicalExtentWindow(Q_TOTAL, ((0, Q_TOTAL),), label="qsa")
+    be._canonical_probe_mismatch = lambda: None
+    kv_arena = ShmArena(str(tmp_path / "shm" / f"arena-kv-{TOTAL}.bin"), TOTAL, n + m + 16)
+    q_arena = ShmArena(str(tmp_path / "shm" / f"arena-q-{Q_TOTAL}.bin"), Q_TOTAL, n + m + 16)
+    be._arenas = {TOTAL: kv_arena, Q_TOTAL: q_arena}
+    hs = [f"{i:05d}" + "ef" * 30 for i in range(n + m)]
+    kv_st = [be._get_suffixed_key(h) for h in hs]
+    q_st = [be._get_suffixed_key(f"{h}.{PoolName.QSA_INDEXER}") for h in hs]
 
     def fill(lo, hi):
         for i in range(lo, hi):
-            _put(a1, s1[i], TOTAL, i)
-            _put(a2, s2[i], T2, i)
+            _put(q_arena, q_st[i], Q_TOTAL, i)
+            _put(kv_arena, kv_st[i], TOTAL, i)
 
     clock = _Clock()
     monkeypatch.setattr(HS, "time", clock)
@@ -332,11 +354,12 @@ def test_a_new_cycle_resets_every_arena_not_only_those_its_first_pass_reaches(tm
     fill(0, n)
     p1 = _drive(be)
     _assert_bounded(p1)
-    assert all(be._stem_exists(s) for s in s1[:n] + s2[:n])
+    assert all(be._stem_exists(s) for s in kv_st[:n] + q_st[:n])
     fill(n, n + m)
     p2 = _drive(be)
-    assert p2[0]["sliced"] and p2[0]["arenas"] == 1          # the first pass ends in arena 1
+    assert p2[0]["sliced"] and p2[0]["arenas"] == 1          # the first pass ends in the QSA arena
     _assert_bounded(p2)
-    assert all(be._stem_exists(s) for s in s1[n:])
-    assert all(be._stem_exists(s) for s in s2[n:])           # RED in the 82871045cd form
     assert sum(p["written"] for p in p2) == 2 * m
+    assert all(be._stem_exists(s) for s in q_st[n:])
+    assert all(be._stem_exists(s) for s in kv_st[n:])       # RED in the 27B form: cycle 2 skips KV
+    assert sum(p.get("unpaired", 0) for p in p1 + p2) == 0

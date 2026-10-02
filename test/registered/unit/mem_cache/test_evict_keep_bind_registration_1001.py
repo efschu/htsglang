@@ -1,11 +1,17 @@
 """EVICT-KEEP bind seam (review gap of 3f7378473f, 01.10.): both host pools
-register themselves with the storage backend when they bind an arena, so the
-clock evict (``HiCacheFile._arena_evict_to_disk``) can find their #243/#248
-keep. Without the registration ``_arena_evict_keep_lo`` answers None and the
-small MAMBA arena collapses again (z30y12 epoch 50).
+make their #243/#248 keep findable by the clock evict
+(``HiCacheFile._arena_evict_to_disk``) when they bind an arena. Without it
+the clock evict keeps only the pins and the small MAMBA arena collapses again
+(z30y12 epoch 50).
 
-The registration is duck-typed (``getattr(..., "register_keep_pool")``): a
-backend without it still binds.
+Unified tree (desk/nf-release-unified-1002, 02.10.): the clock evict reads the
+NF #248e seam -- ``handoff_pending.bind_arena`` in ``ArenaMHAHostPool.bind``
+(role kv) and ``ArenaMambaPoolHost.bind``, read back through
+``handoff_pending.pool_for_arena`` in ``HiCacheFile._arena_evict_candidates``
+(stage (i) passes the pool's ``keep_for`` keys as ``keep_lo``). The 27B
+backend registry (``register_keep_pool`` / ``_arena_evict_keep_lo``) is not in
+the tree; the pools' duck-typed ``register_keep_pool`` call in
+``ensure_bound`` stays harmless for a backend without the hook (pinned below).
 """
 from __future__ import annotations
 
@@ -74,15 +80,72 @@ def test_a_backend_without_the_hook_still_binds():
         assert pool.arena is be.arena
 
 
-def test_the_registered_pool_is_what_the_clock_evict_reads(monkeypatch):
+class _Arena:
+    """Weak-referenceable stand-in recording what the clock asks for."""
+
+    def __init__(self):
+        self.asked = []
+
+    def evict_candidates(self, want, keep_stems=(), keep_lo=None):
+        self.asked.append((want, list(keep_stems), None if keep_lo is None else list(keep_lo)))
+        return []
+
+
+class _Pool:
+    pass
+
+
+def test_the_bound_pool_is_what_the_clock_evict_reads(monkeypatch):
+    """bind_arena(pool, arena) -> the clock evict's stage (i) passes that
+    pool's keep as keep_lo; an arena no pool is bound to keeps only the pins."""
     from sglang.srt.weg2 import handoff_pending as hp
 
-    store = HiCacheFile.__new__(HiCacheFile)
-    arena, other, pool = object(), object(), object()
-    store.register_keep_pool(arena, pool)
-    keep = type("K", (), {"keys": [7, 9], "__len__": lambda self: 2})()
-    seen = []
-    monkeypatch.setattr(hp, "keep_for", lambda p: (seen.append(p), keep)[1])
-    assert store._arena_evict_keep_lo(arena) == [7, 9]
-    assert seen == [pool]
-    assert store._arena_evict_keep_lo(other) is None   # an unregistered arena keeps nothing
+    arena, other, pool = _Arena(), _Arena(), _Pool()
+    hp.bind_arena(pool, arena)
+    try:
+        assert hp.pool_for_arena(arena) is pool
+        assert hp.pool_for_arena(other) is None          # an unbound arena keeps nothing
+        keep = type("K", (), {"keys": [7, 9], "__len__": lambda self: 2})()
+        seen = []
+        monkeypatch.setattr(hp, "keep_for", lambda p: (seen.append(p), keep)[1])
+        HiCacheFile._arena_evict_candidates(arena, 4, 0, ["pin.sfx"])
+        assert seen == [pool]
+        assert arena.asked == [(4, ["pin.sfx"], [7, 9])]
+        HiCacheFile._arena_evict_candidates(other, 4, 0, ["pin.sfx"])
+        assert seen == [pool]                            # keep_for never asked for the unbound arena
+        assert other.asked == [(4, ["pin.sfx"], None)]   # the pins-only clock
+    finally:
+        hp._ARENA_POOLS.pop(id(arena), None)
+
+
+def test_the_real_kv_bind_makes_its_arena_findable(tmp_path):
+    """The real ``ArenaMHAHostPool.bind`` (role kv, as ``ensure_bound`` calls
+    it) leaves the pool findable for its arena -- the registration the 27B
+    seam did in ensure_bound happens in bind on the NF form."""
+    import shutil
+
+    import pytest
+    import torch
+
+    from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+    from sglang.srt.weg2 import handoff_pending as hp
+
+    if shutil.which("gcc") is None:
+        pytest.skip("needs gcc (arena.c)")
+    L, H, D, S, PAGE = 2, 2, 4, 5, 64
+    win = types.SimpleNamespace(total_bytes=PAGE, extents=((8, L * 8), (PAGE // 2 + 8, L * 8)))
+    p = object.__new__(ArenaMHAHostPool)
+    p.layout = "layer_first"; p.page_size = 1; p.layer_num = L; p.head_num = H; p.head_dim = D  # noqa: E702
+    p.dtype = torch.uint8; p.device = "cpu"; p.pin_memory = False; p.size = S  # noqa: E702
+    p.element_dim = H * D; p.can_use_jit = True  # noqa: E702
+    p.free_slots = torch.arange(S, dtype=torch.int64); p.slot_used = torch.zeros(S, dtype=torch.bool)  # noqa: E702
+    p.kv_buffer = torch.zeros(2, L, S, H, D, dtype=torch.uint8)
+    p._arena_init_fields()
+    arena = ShmArena(str(tmp_path / "kv.bin"), PAGE, 8)
+    try:
+        assert hp.pool_for_arena(arena) is None
+        p.bind(arena, win, role="kv", pin=False)
+        assert hp.pool_for_arena(arena) is p
+    finally:
+        hp._ARENA_POOLS.pop(id(arena), None)
+        arena.close()

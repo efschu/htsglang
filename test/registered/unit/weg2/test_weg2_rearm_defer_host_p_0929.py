@@ -235,14 +235,16 @@ def test_27b_model_without_offload_layers_is_neutral(ops):
 
 
 def test_the_wake_starts_the_fill_behind_the_late_rearm():
+    """#284b: behind the rearm AND behind the wake's host waits -- the start is
+    the resume RPC's last statement (test_weg2_rearm_defer_host_after_kv_0929)."""
     from sglang.srt.managers.scheduler_components import weight_updater as wu
 
     res = inspect.getsource(wu.SchedulerWeightUpdaterManager.resume_memory_occupation)
     marks = [
         "_m, prefetch=_rearm_pf, defer=_defer, sync=False)",
-        "if _defer == DEFER_HOST:",
-        "deferred_rows_fill().start(",
         "deferred=%d",
+        "_import_static_state(",
+        "self._weg2_defer_host_fill_start()",
     ]
     pos = [res.find(m) for m in marks]
     assert all(p >= 0 for p in pos), dict(zip(marks, pos))

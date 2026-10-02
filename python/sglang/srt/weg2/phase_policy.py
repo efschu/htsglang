@@ -207,17 +207,25 @@ def park_body(epoch: int, bound_s: float, reason: Optional[str] = None) -> dict:
 
 def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
             leg1_done: bool = False, p_only: bool = False, x_requeues: int = 0,
-            x_deferred: bool = False) -> bool:
+            x_deferred: bool = False, x_routed: int = 0) -> bool:
     """Does this queued request need P's prefill (the immediate park's
     trigger)? ``est_uncached > X`` (law 4: D never prefills above X), a
     P-only request (an image under transient vision, long by rule), or one D
     already refused as over X (W31, ``x_requeues``). Never a request whose
     leg 1 is done (it waits for D, not for P) or that skips leg 1 (route
-    CARRIER-EXCEEDS: D prefills it once, a flip to P buys nothing)."""
+    CARRIER-EXCEEDS: D prefills it once, a flip to P buys nothing).
+
+    #246b (NF y4c 04:39:57, weg2-22-37): ``x_routed`` > 0 is the X the front
+    ROUTED this request on (the X-SOLO band floor X_busy while D is busy); above
+    it the request was sent to P and needs P, even when it lies below the live
+    X ``x_tokens`` -- otherwise it is neither D's (routed away) nor P's (no
+    trigger) and waits until D runs empty."""
     if skip_leg1 or leg1_done:
         return False
     if p_only or int(x_requeues or 0) > 0 or x_deferred:
         return True  # x_deferred: over X_busy, the X in force while D decodes (PK2)
+    if int(x_routed or 0) > 0 and int(est_uncached) > int(x_routed):
+        return True  # #246b: routed to P on this X
     return int(est_uncached) > int(x_tokens)
 
 
@@ -230,7 +238,8 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
                    leg1_done=bool(getattr(p, "leg1_done", False)),
                    p_only=bool(getattr(p, "p_only", False)),
                    x_requeues=int(getattr(p, "x_requeues", 0) or 0),
-                   x_deferred=bool(getattr(p, "x_deferred", False))):
+                   x_deferred=bool(getattr(p, "x_deferred", False)),
+                   x_routed=int(getattr(p, "x_routed", 0) or 0)):
             return p
     return None
 

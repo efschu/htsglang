@@ -193,8 +193,14 @@ def test_the_front_runs_the_search_the_riegel_promised():
         assert new != order and sorted(new) == sorted(order) and new[-1] == "weights", why
         assert "full-simulation search (H54)" in why
         unmarked = {k: v for k, v in plan.items() if k != wc.SEARCH_KEY}
-        kept, why = front.credit_pause_order(order, "rr", unmarked, "D", "P", free_now,
-                                             floor_of=floors.get)
+        # 02.10.: with the LEAST-DEFICIT fallback on (default) the unmarked
+        # front no longer keeps the order either -- but it never claims H54
+        _ld, why = front.credit_pause_order(order, "rr", unmarked, "D", "P", free_now,
+                                            floor_of=floors.get)
+        assert "full-simulation search (H54)" not in why and wc.REFUSAL_CODE in why
+        with envs.SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT.override(False):
+            kept, why = front.credit_pause_order(order, "rr", unmarked, "D", "P", free_now,
+                                                 floor_of=floors.get)
         assert kept == order and wc.REFUSAL_CODE in why
     with envs.SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH.override(True):
         new2, _why = front.credit_pause_order(order, "rr", unmarked, "D", "P", free_now,

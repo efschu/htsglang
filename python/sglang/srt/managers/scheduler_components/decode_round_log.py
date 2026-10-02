@@ -181,7 +181,6 @@ from sglang.srt.managers.scheduler_components.decode_host_split import (
 from sglang.srt.managers.scheduler_components.host_round_cost import (
     DecodeHostCost,
 )
-from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
 from sglang.srt.weg2 import rank_metrics as _rank_metrics  # TSDB 01.10.
 from sglang.srt.managers.scheduler_components.wake_round_census import (
     WakeRoundCensus,
@@ -580,9 +579,10 @@ class DecodeRoundLog:
             # fnFL2 H28: BARLINK-ROUND-CENSUS every N rounds; no-op unless
             # SGLANG_WEG2_AR_ROUND_CENSUS.
             _ar_round_census(self.rank, family_acc)
-            # #239 S3f: the round's pool.fetch ms into the rank's miss record
-            # (no-op unless SGLANG_WEG2_OWNED_MISS_RECORD)
-            _miss_cost.note_round(family_acc)
+            # #239 S3f PR (30.09.): a decode round no longer feeds the miss
+            # record -- its sync-window misses cannot be told from graphed
+            # rounds'; the record pairs timed prefill forwards
+            # (layers.moe.pool_miss_cost.note_paired).
         if self.wake_census.armed:
             self.wake_census.on_round(
                 round_id=acc.round_id,

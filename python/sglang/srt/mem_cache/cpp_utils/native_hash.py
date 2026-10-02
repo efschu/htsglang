@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from array import array
 from typing import Any, Optional
 
@@ -85,6 +86,48 @@ def _reload_from_copy(module: Any) -> Any:
     return fresh
 
 
+def _stage_sources(*, sources: list, build_dir: str) -> tuple[list, list]:
+    """Copy each source INTO the build directory, writing only on a content change.
+
+    ``load()`` hands ninja the tree's own path, and ninja decides "dirty" by
+    mtime alone. A delta image replaces the whole tree from a tar whose mtimes
+    are the context's creation time, while the build directory lives on a
+    cache volume that outlives the image (keyed by source CONTENT). So every
+    new image looked newer than the object built by the previous one, and the
+    first process to hash a page rebuilt the extension -- 4-7 s, on every image
+    switch of 2026-10-01 (y6h 15:20, y6m 19:52, y6o 21:36: the first request
+    after boot y6o sat in queue_ms=6338). The same image booted a second time
+    was warm, which is why it looked random.
+
+    A copy that is rewritten only when its BYTES change keeps its mtime across
+    images with an identical source, so ninja finds nothing to do; a real
+    change rewrites it and ninja rebuilds as before. ``load_inline`` (barlink)
+    has had this property all along through torch's write-if-changed.
+    Returns ``(staged_paths, written_paths)``.
+    """
+    staged: list = []
+    written: list = []
+    for src in sources:
+        dst = os.path.join(build_dir, os.path.basename(src))
+        with open(src, "rb") as fh:
+            data = fh.read()
+        try:
+            with open(dst, "rb") as fh:
+                same = fh.read() == data
+        except OSError:
+            same = False
+        if not same:
+            # write-then-rename: ranks sharing the volume stage concurrently,
+            # and the compiler must never read a half-written file
+            tmp = f"{dst}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, dst)
+            written.append(dst)
+        staged.append(dst)
+    return staged, written
+
+
 def _load_via_torch() -> Any:
     if sys.byteorder != "little" or not sys.platform.startswith("linux"):
         raise RuntimeError(
@@ -94,10 +137,13 @@ def _load_via_torch() -> Any:
     try:
         from torch.utils.cpp_extension import load
 
-        from sglang.jit_kernel.baton_health import jit_build_guard
+        from sglang.jit_kernel.baton_health import (
+            jit_build_guard,
+            torch_build_directory,
+        )
 
         abs_path = os.path.dirname(os.path.abspath(__file__))
-        sources = [f"{abs_path}/hash_binding.cpp"]
+        tree_sources = [f"{abs_path}/hash_binding.cpp"]
         extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
         if _cpu_supports_avx2():
             extra_cflags.append("-mavx2")
@@ -111,20 +157,40 @@ def _load_via_torch() -> Any:
         # a silent slowdown -- the same class as the arch tag missing from the
         # JIT kernel cache key in jit_kernel/utils.py.
         libname = f"hicache_hash_cpp_{isa}"
+        build_dir = str(torch_build_directory(libname))
+        try:
+            sources, written = _stage_sources(
+                sources=tree_sources, build_dir=build_dir
+            )
+            staged = "written" if written else "unchanged"
+        except OSError as exc:
+            # never fail the load on staging: the tree path is the old
+            # behaviour and costs at most the mtime rebuild
+            sources, staged = tree_sources, f"off ({exc!r})"
+        t0 = time.monotonic()
         # This callsite is where an abandoned torch build lock was first seen
         # stalling a run for 18 minutes with the .so already built. The guard
         # tells baton_health which sources the artifact must be newer than, so
         # such a lock is recognised as orphaned on the first poll instead of
         # waited on forever.
         with jit_build_guard(libname, sources=sources):
-            return load(
+            module = load(
                 name=libname,
                 sources=sources,
                 extra_cflags=extra_cflags,
                 extra_ldflags=["-lcrypto"],
+                build_directory=build_dir,
                 with_cuda=False,
                 verbose=False,
             )
+        logger.info(
+            "HICACHE-HASH-JIT %s ready in %.2f s (source staged=%s in %s)",
+            libname,
+            time.monotonic() - t0,
+            staged,
+            build_dir,
+        )
+        return module
     except Exception as exc:
         raise RuntimeError("Failed to load HiCache native hash extension") from exc
 

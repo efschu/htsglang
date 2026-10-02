@@ -542,6 +542,63 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            # getattr: forward-batch doubles predating the field carry no plan
+            if getattr(forward_batch, "weg2_turn_tracks", None) is not None:
+                self._weg2_turn_rows(forward_batch)
+
+    def _weg2_turn_rows(self, forward_batch: ForwardBatch) -> None:
+        """TURN ANCHOR (weg2/turn_anchor.py): append the batch's second tracks
+        to this forward's track gathers -- one more ``h`` row and one more conv
+        window per turn row, into the turn slot -- and mark them written. The
+        default rows stay first and unchanged; a batch whose geometry is not
+        the planned one gets no rows (and no mark: the tree frees the slot)."""
+        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.weg2 import turn_anchor as _ta
+
+        tt = _ta.forward_rows(forward_batch)
+        if tt is None:
+            return
+        md = self.forward_metadata
+        ext = forward_batch.extend_seq_lens_cpu
+        conv_len = self.conv_states_shape[-1]
+        h_src = _ta.h_rows(
+            ext, tt.rows, tt.targets, tt.prefixes,
+            get_server_args().mamba_cache_chunk_size,
+        )
+        starts = _ta.conv_starts(ext, tt.rows, tt.targets, tt.prefixes, conv_len)
+        conv_idx = (
+            torch.tensor(starts, dtype=torch.int64).unsqueeze(-1)
+            + torch.arange(conv_len, dtype=torch.int64)
+        ).clamp(0, max(0, int(sum(ext)) - 1))
+        dst = self._translate_mamba_indices(
+            torch.cat([s.view(-1) for s in tt.slots]).to(
+                device=self.device, dtype=torch.int64
+            )
+        )
+        md.track_ssm_h_src = torch.cat([
+            md.track_ssm_h_src,
+            torch.tensor(h_src, dtype=md.track_ssm_h_src.dtype).to(
+                self.device, non_blocking=True
+            ),
+        ])
+        md.track_ssm_h_dst = torch.cat(
+            [md.track_ssm_h_dst, dst.to(md.track_ssm_h_dst.dtype)]
+        )
+        md.track_conv_indices = torch.cat([
+            md.track_conv_indices,
+            conv_idx.to(self.device, md.track_conv_indices.dtype, non_blocking=True),
+        ])
+        md.conv_states_mask_indices = torch.cat(
+            [md.conv_states_mask_indices, dst.to(md.conv_states_mask_indices.dtype)]
+        )
+        tt.dst_phys = dst
+        tt.rows_dev = torch.tensor(tt.rows, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        tt.offsets_dev = torch.tensor(
+            [t - p for t, p in zip(tt.targets, tt.prefixes)], dtype=torch.int64
+        ).to(self.device, non_blocking=True)
+        tt.done.add("gdn")
 
     def forward_decode(
         self,

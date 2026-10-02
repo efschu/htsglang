@@ -28,7 +28,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 PREFILL_KEYS = {"chunks", "new_tokens", "cached_tokens", "gpu_ms", "split_ms",
-                "compute_ms", "wait_ms", "bubble_ms", "last"}
+                "compute_ms", "wait_ms", "bubble_ms", "last",
+                "own_ms", "compute_only_ms", "own_n"}  # 30.09. FEHLT 7
 DECODE_KEYS = {"rounds", "gpu_ms", "gpu_ms_by_bs", "tokens", "running",
                "accept_len_ewma", "accept_rate_ewma", "cuda_graph",
                "last_bs"}  # 30.09. FEHLT 6
