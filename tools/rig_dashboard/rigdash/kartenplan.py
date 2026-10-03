@@ -232,7 +232,7 @@ class Kartenplaner:
         ordinal_of = {o["nvml_index"]: i for i, o in enumerate(order)}
         by_ord = {ordinal_of[c["index"]]: c for c in cards}
         plan_cards = _plan_cards(rec)
-        phases = {g: _phase_breakdown(rec, g, plan_cards) for g in ("P", "D")}
+        phases = {g: _phase_breakdown(rec, g, plan_cards, prof["id"].endswith("-dual")) for g in ("P", "D")}
         peak = _flip_peak(plan_cards, phases)
         flags = _flags(rec)
         ctx = _context(rec)
@@ -334,7 +334,61 @@ def _seg(key, label, mib, src, kind="post"):
     return {"key": key, "label": label, "mib": int(round(mib)), "src": src, "kind": kind}
 
 
-def _phase_breakdown(rec: dict, group: str, plan_cards: List[dict]) -> List[dict]:
+#: Ein-Satz-Erklärung je Posten-Schlüssel (Tooltip des VRAM-Balkens)
+SEG_WHAT = {
+    "weights": "Dichte Modellgewichte dieser Gruppe auf dieser Karte (Attention, Normen, Embeddings, dichte MLP).",
+    "runtime": "Laufzeit-Zustand neben den geladenen Gewichten (Puffer, Skalen, Metadaten).",
+    "experts": "MoE-Experten, die dauerhaft auf der Karte liegen.",
+    "experts_lru": "Experten-Cache (LRU), der den sonst freien VRAM füllt (Grundgesetz: freier VRAM gehört den Experten).",
+    "kv": "KV-Cache-Pool: Schlüssel und Werte der laufenden und der gecachten Requests.",
+    "state": "Mamba/GDN-State-Pools: Rekurrenzzustand je Sitz (kein KV).",
+    "draft": "Draft-/MTP-Modell für spekulatives Decoding.",
+    "graphs": "CUDA-Graphen (aufgezeichnete Decode-/Prefill-Läufe) samt ihrem privaten Speicherpool.",
+    "transient": "Aktivierungen und Zwischenpuffer während Prefill/Decode (Spitzenwert).",
+    "act": "Aktivierungsreserve, die der Rang-Planer für den Prefill einplant.",
+    "free_in_budget": "Teil des Rang-Budgets, der nicht einzeln verbucht ist (Allokator-Cache, Workspaces, ungenutzter Pool).",
+    "carve": "Vom Treiber reservierter Teil der Karte (CUDA-Kontext), für nichts nutzbar.",
+    "asleep": "VRAM, den die schlafende andere Gruppe auf dieser Karte behält (Schlafrest).",
+    "corridor": "Korridor: gemessener Aktivierungs-Peak, den der Planer freihält, damit Spitzen keinen OOM auslösen.",
+    "overshoot": "Gemessener Wach-Überschuss über dem Plan, den der Planer zusätzlich abzieht.",
+    "awake_rest": "Wach-Rest: VRAM, den die wache Gruppe über ihre gebuchten Posten hinaus belegt (Record).",
+    "l15": "L1.5-Cache auf der Karte (Post, Trade gegen Experten/KV).",
+}
+#: Reihenfolge der Posten INNERHALB eines Phasenblocks (stabil: gleicher Schlüssel behält die Planer-Reihenfolge)
+SEG_ORDER = ["weights", "runtime", "experts", "experts_lru", "state", "draft", "kv", "graphs", "transient", "act",
+             "corridor", "overshoot", "awake_rest", "l15", "free_in_budget"]
+#: Blöcke von links nach rechts: gemeinsam (Treiber), P, D -- in der P-Zeile und der D-Zeile an derselben Stelle
+PHASE_BLOCKS = ("gemeinsam", "P", "D")
+
+
+def _seg_phase(key: str, group: str, other: str) -> str:
+    if key == "carve":
+        return "gemeinsam"
+    return other if key == "asleep" else group
+
+
+def _annotate_segments(segs: List[dict], group: str, dual: bool) -> List[dict]:
+    """Posten mit Phase (P/D/gemeinsam), Herkunft und Erklärung versehen und je Phase zusammenhängend ordnen.
+
+    Ein Balken ist die Karte in dem Zustand, in dem ``group`` wach ist: Block ``gemeinsam`` (Treiber), Block P, Block D.
+    Der Block der wachen Gruppe trägt ihre Posten, der Block der anderen Gruppe ihren Schlafrest (im Dual-Profil sind
+    beide wach).  Innerhalb eines Blocks nach SEG_ORDER, sonst in Planer-Reihenfolge."""
+    other = "D" if group == "P" else "P"
+    for s in segs:
+        s["phase"] = _seg_phase(s["key"], group, other)
+        measured = str(s["src"]).startswith("Rang-Log") or s["key"] == "carve"
+        s["origin"] = "gemessen" if measured else "Planerwert"
+        s["origin_note"] = ("NVML-Reservierung der Karte" if s["key"] == "carve" else ("Rang-Log des Referenz-Boots" if measured
+                            else "vram_plan bzw. Budgetzeile des Launchers"))
+        s["what"] = SEG_WHAT.get(s["key"], s["label"])
+        if dual and s["key"] == "asleep":
+            s["what"] += " Im Dual-Profil ist diese Gruppe gleichzeitig wach."
+    order = {k: i for i, k in enumerate(SEG_ORDER)}
+    idx = {id(s): i for i, s in enumerate(segs)}
+    return sorted(segs, key=lambda s: (PHASE_BLOCKS.index(s["phase"]), order.get(s["key"], len(order)), idx[id(s)]))
+
+
+def _phase_breakdown(rec: dict, group: str, plan_cards: List[dict], dual: bool = False) -> List[dict]:
     """Je Karte die Posten der Phase ``group`` (P = Prefill-Layout wach, D = Decode-Layout wach)."""
     other = "D" if group == "P" else "P"
     out = []
@@ -413,8 +467,16 @@ def _phase_breakdown(rec: dict, group: str, plan_cards: List[dict]) -> List[dict
                                 "Budget minus Summe der gemessenen Posten (Allokator-Cache, Workspaces, ungenutzter Pool)", kind="rest")]
             if extras.get("ctx_mib"):
                 notes.append("CUDA-Kontext/NCCL-Init %d MiB (Rang-Log 'Init torch distributed') liegen vor dem Rang-Budget." % extras["ctx_mib"])
-        out.append({"ordinal": pc["ordinal"], "segments": segs + around, "total_mib": total, "budget": bound,
-                    "rest_mib": rest, "notes": notes, "group": group})
+        allsegs = _annotate_segments(segs + around, group, dual)
+        # Summe der gezeichneten Posten gegen die Karte.  Ein negativer Rest im Rang-Budget (Posten > Budget, weil sie
+        # überlappen bzw. in der anderen Phase gemessen wurden) ist keine Überfüllung: der Planer schließt die Karte
+        # trotzdem (rest_mib ~ 0).  Der Überstand zeigt sich im Balken, wird aber getrennt als ``overlap_mib`` benannt.
+        sum_mib = sum(max(0, x["mib"]) for x in allsegs)
+        over = max(0, sum_mib - total)
+        overlap = min(over, max(0, -(free_in_budget or 0)))
+        out.append({"ordinal": pc["ordinal"], "segments": allsegs, "total_mib": total, "budget": bound,
+                    "rest_mib": rest, "notes": notes, "group": group,
+                    "sum_mib": sum_mib, "over_mib": over, "overlap_mib": overlap, "hard_over_mib": over - overlap})
     return out
 
 

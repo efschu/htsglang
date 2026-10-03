@@ -111,7 +111,26 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .kp-ctx { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 13px; } .kp-ctx i { font-style: normal; color: var(--muted); font-size: 11px; }
 .kp-vram { margin: 8px 0 12px; } .kp-vh { margin-bottom: 3px; }
 .kp-row { display: flex; align-items: center; gap: 8px; margin: 2px 0; } .kp-g { width: 1.2em; font-weight: 650; color: var(--text-2); }
-.kp-bar { flex: 1 1 auto; display: flex; height: 18px; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; background: var(--bar-bg); }
+.kp-barw { flex: 1 1 auto; position: relative; min-width: 0; }
+.kp-bar { display: flex; height: 18px; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; background: var(--bar-bg); }
+.kp-bar > i[data-s]:hover, .kp-bar > i[data-s]:focus { outline: 2px solid var(--text); outline-offset: -2px; position: relative; z-index: 1; }
+.kp-bar > i { flex: 0 0 auto; }
+/* Überlauf (Summe > Karte): Kante markiert, der Überstand rot schraffiert */
+.kp-barw { --ov: var(--bad); } .kp-soft { --ov: var(--warn); }
+.kp-ov .kp-bar { border-color: var(--ov); }
+.kp-bar .kp-beyond { background-image: repeating-linear-gradient(135deg, color-mix(in srgb, var(--ov) 75%, transparent) 0 3px, transparent 3px 6px); box-shadow: inset 0 0 0 1px var(--ov); }
+.kp-edge { position: absolute; top: -3px; height: 24px; border-left: 2px solid var(--ov); pointer-events: none; z-index: 2; }
+.kp-edge span { position: absolute; top: -13px; left: -2px; font-size: 10px; color: var(--ov); white-space: nowrap; }
+.kp-ov { margin-top: 12px; }
+/* Phasenblöcke: zusammenhängende Klammer je Phase unter dem Balken */
+.kp-strip { display: flex; height: 11px; margin-top: 1px; }
+.kp-ph { flex: 0 0 auto; box-sizing: border-box; border-top: 3px solid var(--muted); overflow: hidden; font-size: 9.5px; line-height: 9px; color: var(--text-2); }
+.kp-ph em { font-style: normal; padding-left: 2px; }
+.kp-ph-P { border-top-color: var(--s1); } .kp-ph-D { border-top-color: var(--s2); }
+.kp-over { border: 1px solid var(--line); border-left-width: 5px; border-radius: 6px; padding: 5px 10px; margin: 3px 0 6px 1.8em; font-size: 12.5px; background: var(--surface); }
+.kp-over.bad { border-left-color: var(--bad); } .kp-over.warn { border-left-color: var(--warn); color: var(--text-2); }
+.kp-tip { position: fixed; z-index: 50; display: none; max-width: min(380px, calc(100vw - 16px)); padding: 7px 10px; font-size: 12.5px; line-height: 1.45; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); box-shadow: 0 4px 16px rgba(0,0,0,.25); pointer-events: none; }
+.kp-t-bad { color: var(--bad); }
 .kp-bud { font-size: 11.5px; min-width: 9.5em; text-align: right; }
 .kp-s { display: inline-block; height: 100%; min-width: 1px; }
 .ks-w { background: var(--s1); } .ks-x { background: var(--s3); } .ks-k { background: var(--s2); } .ks-s { background: var(--s4); } .ks-d { background: var(--s5); }
@@ -857,7 +876,8 @@ function phaseTip(x, single) {
       + (dec ? decodeDetailTip({by_bs: x.co_by_bs}) + coRoundTip(x) : "") + depthTip(x.depth);
   }
   if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; l&auml;uft" : ""}${decodeDetailTip(x)}`;
-  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok${x.running ? " &middot; l&auml;uft" : ""}${depthTip(x.depth)}`;
+  const adm = x.k === "D" && x.admit_n ? `<br>D-Admit/Extend (Tokens je Request): <b>${fmt(x.admit_n)}</b> Extends &middot; ${fmt(x.admit_tok)} Tok &middot; &Oslash; ${fmt(x.admit_tok / x.admit_n, 1)} Tok je Request <span class="muted">(keine Prefill-Rate)</span>` : "";
+  return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit${x.k === "D" ? ", nur Chunks &ge; 64 Tok" : ""})</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok${x.running ? " &middot; l&auml;uft" : ""}${adm}${depthTip(x.depth)}`;
 }
 function phaseHtml(b, pre) {
   const tl = b.timeline;
@@ -1017,7 +1037,9 @@ function prefillTile(b, g, color, label, binders, now) {
   const ranks = src ? Object.entries(src.ranks || {}).map(([r, a]) => `${r} ${fmt(a.tps)}`).join(" &middot; ") : "—";
   const small = src && src.tokens != null && src.tokens < 512;
   const state = active ? `Chunks der letzten ${Math.round(p.window_s)} s`
-    : (p.last_t ? `ruht &middot; letzter Chunk fertig vor ${ago(now - p.last_t)}, Zahlen = letzter Schub` : "noch kein Chunk");
+    : (p.last_t ? `ruht &middot; letzter Chunk fertig vor ${ago(now - p.last_t)}, Zahlen = letzter Schub` : (p.min_chunk_tok ? `noch kein Prefill mit mindestens ${p.min_chunk_tok} neuen Tokens` : "noch kein Chunk"));
+  const ad = p.admit, adRow = !ad ? null : ["<span title=\"Auf D beginnt jeder &uuml;bernommene Request mit einem Extend von meist 1 neuen Token (nach der P&rarr;D-&Uuml;bergabe, Rest kommt aus dem Cache). Das ist Aufnahme, keine Prefill-Geschwindigkeit: der Stock-Logwert &bdquo;input throughput&ldquo; dieser Zeilen (1 Token / Wanduhr seit der letzten Zeile) liegt bei ~6 tok/s und wird hier nicht als Rate gezeigt.\">D-Admit/Extend (Tokens je Request) &#9432;</span>",
+    `${fmt(ad.now.n)} Extends &middot; ${fmt(ad.now.tokens)} Tok${ad.now.tok_per_req != null ? ` &middot; &Oslash; ${fmt(ad.now.tok_per_req, 1)} Tok je Request` : ""} <span class="muted">(${Math.round(ad.window_s)} s; Ring ${fmt(ad.ring.n)} Extends${ad.ring.tok_per_req != null ? `, &Oslash; ${fmt(ad.ring.tok_per_req, 1)}` : ""})</span>`];
   const charts = rateCharts(b, g + "_prefill_tps", color, 0, now, binders);
   const one = p.one_s || 0;
   return `<div class="tile${one > 0 ? " active" : ""}" style="--c:${color}"><div class="label"><i style="background:${color}"></i>${label}${srcOf(b, "C1", "C2", "C7")}</div>
@@ -1032,6 +1054,7 @@ function prefillTile(b, g, color, label, binders, now) {
       ["Rechenrate je Rang (compute-ms)", ranks || "—"],
       [active ? "Tokens / Chunks, 60 s" : "Tokens / Chunks im letzten Schub", src ? `${fmt(src.tokens)} / ${fmt(src.chunks)}` : "—"],
       ["mittl. Chunk &middot; aus Cache", src ? `${fmt(src.mean_chunk)} &middot; ${fmt(src.cached)}` : "—"],
+      adRow,
       lb && lb.depth && lb.depth.x != null ? [`letzter Schub: Tiefe`, `${tokRange(lb.depth.x, lb.depth.y, lb.depth.n)}${lb.depth.tps_start != null ? ` &middot; ${fmt(lb.depth.tps_start)} &rarr; ${fmt(lb.depth.tps_end)} tok/s` : ""}`] : null,
       active ? ["Durchsatz Wandzeit (Tokens / " + Math.round(p.window_s) + " s, mit Pausen)", fmt(n.tokens / p.window_s)] : null,
       ["Warteschlange &middot; ausstehende Tokens", `${fmt(p.queue)} &middot; ${fmt(p.pending_tok)}`],
@@ -1092,14 +1115,27 @@ function alarmHtml(b, now) {
 }
 
 const pct = (x) => x == null ? "\u2014" : fmt(100 * x, x >= 0.995 || x < 0.1 ? 1 : 0) + " %";
-function bootTile(label, tok, src, rGpu, rGpuNote, rWall, e) {
+// D (Auftrag 880): the since-boot sum mixes 1-token admit extends with real prefill; the rates are over the ring and
+// real chunks only, the admit extends are named (Tokens je Request)
+function dTileOpt(t) {
+  const sp = t.d_split;
+  if (!sp) return {};
+  const w = sp.wide, a = sp.admit, ring = Math.round((sp.span_s || 0) / 60);
+  return {gpuLabel: `Prefill-Rate &middot; GPU-Rechenzeit, nur Chunks &ge; ${sp.min_chunk_tok} Tok (letzte ${ring} min)`,
+    wallLabel: `Prefill-Rate &middot; Wandzeit, nur Chunks &ge; ${sp.min_chunk_tok} Tok (letzte ${ring} min)`,
+    row: ["D-Admit/Extend (Tokens je Request), letzte " + ring + " min",
+      `${fmt(a.chunks)} Extends &middot; ${fmt(a.tokens)} Tok${a.tok_per_req != null ? ` &middot; &Oslash; ${fmt(a.tok_per_req, 1)} Tok je Request` : ""} <span class="muted">(Prefill: ${fmt(w.chunks)} Chunks, ${fmt(w.tokens)} Tok)</span>`]};
+}
+function bootTile(label, tok, src, rGpu, rGpuNote, rWall, e, opt) {
   e = e || {};
+  opt = opt || {};
   const wall = rWall == null ? "\u2014" : fmt(rWall, rWall < 100 ? 1 : 0);
   return `<div class="tile"><div class="label">${label}</div>
     <div class="big num" style="font-size:24px">${fmt(tok)}<small>Tok (Summe)</small></div><div class="state">${src}</div>
     ${kv([
-      ["&Oslash; tok/s seit Boot &middot; GPU-Rechenzeit", rGpu == null ? "\u2014" : fmt(rGpu, rGpu < 100 ? 1 : 0), "kvb"],
-      ["&Oslash; tok/s seit Boot &middot; Wandzeit (inkl. Leerlauf und andere Phase)", wall],
+      [opt.gpuLabel || "&Oslash; tok/s seit Boot &middot; GPU-Rechenzeit", rGpu == null ? "\u2014" : fmt(rGpu, rGpu < 100 ? 1 : 0), "kvb"],
+      [opt.wallLabel || "&Oslash; tok/s seit Boot &middot; Wandzeit (inkl. Leerlauf und andere Phase)", wall],
+      opt.row || null,
       ["Energie je Token", e.j_per_tok == null ? "\u2014" : `${fmt(e.j_per_tok, e.j_per_tok < 1 ? 3 : 2)} J &middot; ${fmt(e.wh_per_1k, 3)} Wh/1k`],
       ["&Oslash; tok/s/W seit Boot (Token / Energie)", e.tok_per_j == null ? "\u2014" : fmt(e.tok_per_j, 2)],
     ])}
@@ -1149,7 +1185,7 @@ function cacheHtml(b, now, awake) {
   return `<div class="cachebox">
     <div class="tiles" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:10px">
       ${bootTile("P-Prefill seit Boot", t.p_new, `rankstats prefill.new_tokens, erster Rang (${fmt(t.p_chunks)} Chunks), ohne Cache-Treffer`, t.p_rate_gpu, "GPU-Rechenzeit: prefill.new_tokens / prefill.compute_ms je Rang, langsamster Rang", t.p_rate_wall, E.P)}
-      ${bootTile("D-Prefill seit Boot", t.d_new, `rankstats prefill.new_tokens, TP0 (${fmt(t.d_chunks)} Chunks), ohne &Uuml;bernahme/Cache`, t.d_rate_gpu, "GPU-Rechenzeit: prefill.new_tokens / prefill.compute_ms je Rang, langsamster Rang", t.d_rate_wall, E.D)}
+      ${bootTile(t.d_split ? "D-Prefill + Admit seit Boot" : "D-Prefill seit Boot", t.d_new, `rankstats prefill.new_tokens, TP0 (${fmt(t.d_chunks)} Chunks${t.d_mean_chunk != null ? `, &Oslash; ${fmt(t.d_mean_chunk, 1)} Tok je Chunk` : ""}), ohne &Uuml;bernahme/Cache`, t.d_rate_gpu, "GPU-Rechenzeit: prefill.new_tokens / prefill.compute_ms je Rang, langsamster Rang", t.d_rate_wall, E.D, dTileOpt(t))}
       ${bootTile("Decode seit Boot", t.decoded, `rankstats decode.tokens, TP0 (${fmt(t.served_requests)} D-Beine bedient laut front.served)`, t.dec_rate_gpu, "GPU-Rechenzeit: decode.tokens / decode.gpu_ms (TP0)", t.dec_rate_wall, E.dec)}
     </div>
     <div class="muted" style="font-size:11px;margin:-4px 0 10px">Energie je Token: jedes abgeschlossene 5-s-Intervall kostet
@@ -1232,7 +1268,7 @@ function bootCard(b, now, binders) {
     ${phaseHtml(b)}
     <div class="tiles">
       ${prefillTile(b, "P", "var(--s1)", "P-Prefill", binders, now)}
-      ${prefillTile(b, "D", "var(--s2)", "D-Prefill", binders, now)}
+      ${prefillTile(b, "D", "var(--s2)", "D-Prefill <small class=\"muted\" title=\"Rate nur aus Chunks mit mindestens 64 neuen Tokens; die 1-Token-Admit-Extends nach der Übergabe stehen getrennt als D-Admit/Extend\">(Chunks &ge; 64 Tok)</small>", binders, now)}
       ${decodeTile(b, "D", "var(--s3)", binders, now)}
       <div class="tile"><div class="label">Flips &middot; Warteschlange${srcOf(b, "B1", "B2", "B3", "B4", "B5", "B6")}</div>
         <div class="big num">${fmt(fieldIpc(b, "B4") ? fieldIpc(b, "B4").value.n : b.flip_count)}<small>Flips</small></div>

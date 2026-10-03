@@ -62,13 +62,91 @@
   // ------------------------------------------------------------------ Ergebnis
   const SEGCLS = { weights: "w", runtime: "w", experts: "x", experts_lru: "x", kv: "k", state: "s", draft: "d", graphs: "g", act: "g", transient: "g",
     asleep: "z", carve: "c", corridor: "c", overshoot: "c", awake_rest: "c", l15: "l", free_in_budget: "f" };
-  function bar(ph, total, withLabels) {
-    const segs = ph.segments.filter((s) => s.mib > 0);
-    const sum = segs.reduce((a, s) => a + s.mib, 0);
-    const rest = Math.max(0, total - sum);
-    const html = segs.map((s) => `<i class="kp-s ks-${SEGCLS[s.key] || "o"}" style="width:${(100 * s.mib / total).toFixed(2)}%" title="${esc(s.label)}: ${fmt(s.mib)} MiB (${esc(s.src)})"></i>`).join("") +
-      (rest > total * 0.002 ? `<i class="kp-s ks-f" style="width:${(100 * rest / total).toFixed(2)}%" title="Rest: ${fmt(rest)} MiB"></i>` : "");
-    return `<div class="kp-bar">${html}</div>`;
+  // ---- VRAM-Balken (Auftrag 880): Phasen als zusammenhängende Blöcke, Tooltip je Posten, Überlauf über die Kartenkante
+  // Reihenfolge (Server, stabil): Block "gemeinsam" (Treiber), Block P, Block D; innerhalb eines Blocks nach Postenart.
+  const PHN = { P: "P-Phase", D: "D-Phase", gemeinsam: "gemeinsam (Treiber)" };
+  const OVER_TOL = 8;      // MiB: Rundung der Planer-Posten
+  const pct = (a, t) => (t ? (100 * a / t).toLocaleString("de-DE", { maximumFractionDigits: 1 }) : "–") + " %";
+  // Modell eines Balkens: Segmente mit Start/Ende in MiB, Skala = max(Karte, Summe) -- wächst die Summe über die Karte,
+  // wächst der Balken mit (Kante bleibt markiert)
+  function barModel(ph, total) {
+    const segs = (ph.segments || []).filter((x) => x.mib > 0);
+    let at = 0;
+    const rows = segs.map((x, i) => { const r = { i, x, a: at, b: at + x.mib }; at += x.mib; return r; });
+    const sum = at;
+    const scale = Math.max(total, sum);
+    const over = Math.max(0, sum - total);
+    const overlap = Math.min(over, ph.overlap_mib != null ? ph.overlap_mib : 0);
+    return { rows, sum, scale, total, over, overlap, hard: over - overlap, free: Math.max(0, total - sum) };
+  }
+  function segTip(ph, total, m, r) {
+    const x = r.x;
+    const crosses = r.b > total ? Math.min(x.mib, r.b - total) : 0;
+    return `<b>${esc(x.label)}</b> <span class="muted">· ${esc(PHN[x.phase] || x.phase || "")}</span><br>` +
+      `${fmt(x.mib)} MiB (${gib(x.mib)} GiB) · ${pct(x.mib, total)} der Karte<br>` +
+      `Herkunft: <b>${esc(x.origin || "Planerwert")}</b> <span class="muted">(${esc(x.origin_note || x.src || "")})</span><br>` +
+      `<span class="muted">${esc(x.what || x.label)}</span>` +
+      (crosses > 0 ? `<br><span class="kp-t-bad">${fmt(crosses)} MiB davon liegen hinter dem Kartenende (${fmt(total)} MiB)</span>` : "");
+  }
+  function bar(ph, total, ctx) {
+    const m = barModel(ph, total), sc = m.scale;
+    const w = (a) => (100 * a / sc).toFixed(3) + "%";
+    let html = "";
+    m.rows.forEach((r) => {
+      const cls = SEGCLS[r.x.key] || "o";
+      // a segment that crosses the card edge is cut in two: the part inside, the part beyond (hatched red)
+      const inside = Math.min(r.b, total) - Math.min(r.a, total), beyond = r.b - Math.max(r.a, total);
+      if (inside > 0) html += `<i class="kp-s ks-${cls}" data-s="${r.i}" style="width:${w(inside)}"></i>`;
+      if (beyond > 0 && m.over > 0) html += `<i class="kp-s ks-${cls} kp-beyond" data-s="${r.i}" style="width:${w(beyond)}"></i>`;
+    });
+    if (m.free > m.total * 0.002) html += `<i class="kp-s ks-f" data-s="free" style="width:${w(m.free)}" title="Rest: ${fmt(m.free)} MiB"></i>`;
+    // phase blocks: the contiguous stretch of one phase, drawn as a bracket strip below the bar
+    const blocks = [];
+    m.rows.forEach((r) => {
+      const k = r.x.phase || "";
+      const last = blocks[blocks.length - 1];
+      if (last && last.k === k) { last.mib += r.x.mib; last.n++; } else blocks.push({ k, mib: r.x.mib, n: 1 });
+    });
+    const strip = blocks.map((b) => `<span class="kp-ph kp-ph-${esc(b.k)}" style="width:${w(b.mib)}" title="${esc(PHN[b.k] || b.k)}: ${fmt(b.mib)} MiB, ${b.n} Posten"><em>${b.mib / sc >= 0.04 ? esc(b.k === "gemeinsam" ? "gem." : b.k) : ""}</em></span>`).join("");
+    const edge = m.over > 0 ? `<div class="kp-edge" style="left:${w(total)}" title="Kartenende ${fmt(total)} MiB"><span>Kartenende ${gib(total)} GiB</span></div>` : "";
+    return `<div class="kp-barw${m.over > 0 ? " kp-ov" : ""}${m.over > 0 && m.hard <= OVER_TOL ? " kp-soft" : ""}" data-b="${ctx}"><div class="kp-bar">${html}</div>${edge}<div class="kp-strip">${strip}</div></div>`;
+  }
+  // Hinweis unter dem Balken: harter Überlauf (Profil passt nicht) bzw. benannte Überlappung des Planers
+  function overNote(b, g) {
+    const ph = b[g], m = barModel(ph, b.total_mib);
+    const name = `Karte ${b.ordinal + 1} (${esc(b.card_label)}), ${g}-Phase`;
+    let h = "";
+    if (m.hard > OVER_TOL) {
+      const top = m.rows.slice().sort((p, q) => q.x.mib - p.x.mib).slice(0, 3).map((r) => `${esc(r.x.label)} ${fmt(r.x.mib)} MiB`).join(", ");
+      h += `<div class="kp-over bad" role="alert"><b>${name}: ${fmt(m.hard)} MiB über dem VRAM – Profil passt nicht.</b> Größte Posten: ${top}.</div>`;
+    }
+    if (m.overlap > OVER_TOL) {
+      h += `<div class="kp-over warn">${name}: Rang-Budget um ${fmt(m.overlap)} MiB überbucht – die Posten überlappen oder wurden in der anderen Phase gemessen; der Planer schließt diese Karte trotzdem (Rest ${fmt(ph.rest_mib)} MiB).</div>`;
+    }
+    return h;
+  }
+  function overSummary(bars) {
+    const hard = [];
+    bars.forEach((b) => ["P", "D"].forEach((g) => { const m = barModel(b[g], b.total_mib); if (m.hard > OVER_TOL) hard.push(`Karte ${b.ordinal + 1} ${g}-Phase: ${fmt(m.hard)} MiB über dem VRAM`); }));
+    return hard.length ? `<div class="kp-over bad" role="alert"><b>Profil passt nicht auf die Karten:</b> ${hard.join(" · ")}.</div>` : "";
+  }
+  // Tooltip: one floating box for all bars (hover, focus and tap)
+  let tipEl = null;
+  function tipShow(html, x, y) {
+    if (!tipEl) { tipEl = document.createElement("div"); tipEl.className = "kp-tip"; tipEl.setAttribute("role", "tooltip"); document.body.appendChild(tipEl); }
+    tipEl.innerHTML = html;
+    tipEl.style.display = "block";
+    const r = tipEl.getBoundingClientRect();
+    tipEl.style.left = Math.max(8, Math.min(x + 12, window.innerWidth - r.width - 8)) + "px";
+    tipEl.style.top = (y - r.height - 12 < 8 ? y + 18 : y - r.height - 12) + "px";
+  }
+  function tipHide() { if (tipEl) tipEl.style.display = "none"; }
+  function segAt(ev) {
+    const el = ev.target.closest && ev.target.closest(".kp-bar > i[data-s]");
+    if (!el || el.dataset.s === "free" || !state.res || !state.res.plan) return null;
+    const wrap = el.closest(".kp-barw"), [oi, g] = wrap.dataset.b.split(":");
+    const b = state.res.plan.einfach.bars[+oi], ph = b[g], m = barModel(ph, b.total_mib);
+    return segTip(ph, b.total_mib, m, m.rows[+el.dataset.s]);
   }
   const LEG = [["w", "Gewichte"], ["x", "Experten"], ["k", "KV"], ["s", "Mamba/State"], ["d", "Draft"], ["g", "Aktivierung/Graphen"], ["l", "L1.5-Cache"], ["z", "Schlafrest andere Gruppe"], ["c", "Carve/Korridor/Wach-Rest"], ["f", "Rest"]];
   const legend = () => `<div class="kp-leg">${LEG.map(([c, t]) => `<span><i class="kp-s ks-${c}"></i>${t}</span>`).join("")}</div>`;
@@ -94,9 +172,9 @@
       const c = e.context;
       h += `<h3>Kontext und Sitze</h3><div class="kp-ctx"><span><b>${fmt(c.context_tokens)}</b> Token Kontext</span><span><b>${fmt(c.kv_pool_tokens)}</b> Token KV-Pool D <i>${esc(c.kv_pool_src || "nicht im Record")}</i></span>
         <span><b>${c.seats_d || "–"}</b> Sitze D</span><span><b>${c.seats_p || "–"}</b> Sitze P</span></div>`;
-      h += `<h3>VRAM je Karte <span class="muted">P = Prefill-Layout wach, D = Decode-Layout wach (Flip wechselt)</span></h3>${legend()}`;
-      h += e.bars.map((b) => `<div class="kp-vram"><div class="kp-vh"><b>${esc(b.card_label)}</b> <span class="muted">Ordinal ${b.ordinal} · ${fmt(b.total_mib)} MiB</span></div>
-        ${["P", "D"].map((g) => `<div class="kp-row"><span class="kp-g">${g}</span>${bar(b[g], b.total_mib)}<span class="muted kp-bud">Budget ${fmt((b[g].budget || {}).budget_mib)} MiB</span></div>`).join("")}</div>`).join("");
+      h += `<h3>VRAM je Karte <span class="muted">P = Prefill-Layout wach, D = Decode-Layout wach (Flip wechselt) · Mauszeiger auf einen Posten: Details</span></h3>${overSummary(e.bars)}${legend()}`;
+      h += e.bars.map((b, bi) => `<div class="kp-vram"><div class="kp-vh"><b>${esc(b.card_label)}</b> <span class="muted">Ordinal ${b.ordinal} · ${fmt(b.total_mib)} MiB</span></div>
+        ${["P", "D"].map((g) => `<div class="kp-row"><span class="kp-g">${g}</span>${bar(b[g], b.total_mib, bi + ":" + g)}<span class="muted kp-bud">Budget ${fmt((b[g].budget || {}).budget_mib)} MiB</span></div>${overNote(b, g)}`).join("")}</div>`).join("");
       h += `<div class="muted kp-note">Quelle: ${esc(p.source.note)}</div>`;
     } else if (res.naeherung) {
       h += naeherung(res.naeherung);
@@ -219,6 +297,9 @@
       draw(); schedule();
     }
   });
+  root.addEventListener("mousemove", (ev) => { const t = segAt(ev); if (t) tipShow(t, ev.clientX, ev.clientY); else tipHide(); });
+  root.addEventListener("mouseleave", tipHide);
+  root.addEventListener("click", (ev) => { const t = segAt(ev); if (t) tipShow(t, ev.clientX, ev.clientY); else if (!(ev.target.closest && ev.target.closest(".kp-barw"))) tipHide(); });
   root.addEventListener("input", (ev) => { if (ev.target.id === "kp-envf") { state.envFilter = ev.target.value; draw(); } });
   root.addEventListener("click", (ev) => {
     const t = ev.target;

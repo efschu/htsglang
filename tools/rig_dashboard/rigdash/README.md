@@ -80,6 +80,23 @@ nur mit Decode davor und danach. Verlauf: 1-s-Modellzeilen unter dem Präfix `mi
 werden nicht mehr gezeigt. Flipzeit: P→D `flip_first_work` (ohne `what="none"`), D→P nur `flip_user_time` (ab Build y4z).
 Audit aller Werte: `/spinning/gpu-arb/docs/DASHBOARD-PLAUSI-AUDIT-0930.md`; Tests `tests/test_activity_0930.py`.
 
+### D-Prefill: Admit-Extends sind keine Prefill-Rate (Auftrag 880, Nutzer 03.10. „6 token/s prefill in D???“)
+
+Auf D beginnt jeder von P übernommene Request mit einem Extend von meist **1 neuem Token** (Rest aus dem Cache). y8vb `D.log`:
+3029 von 3051 `Prefill batch`-Zeilen haben `#new-token: 1`; der Stock-Wert `input throughput (token/s)` einer solchen Zeile ist
+1 Token / Wanduhr seit der letzten Zeile = 5,8 tok/s. Im Dashboard stand die Zahl nicht als Stock-Wert, aber derselbe Fehler steckte in den
+D-Kennzahlen: die 1-Token-Chunks hängen (Abstand < 1,5 s) zu einem „Schub“ über Minuten zusammen (Tokens / Wanduhr = wenige tok/s) und
+die Tile „D-Prefill seit Boot“ teilte alle D-Tokens durch Boot-Wanduhr bzw. alle Rechenzeit. Jetzt (`activity.WIDE_MIN_TOK = 64`):
+
+* `activity.chunks(..., kind="wide"|"admit")` trennt VOR der Schub-Bildung; `Model.dwide` / `Model.dadmit`. Die Phasenleiste behält alle Chunks.
+* D-Rate (Kachel „D-Prefill“, KPI, Kurve `D_prefill_rate`, Phasen-Segment) nur aus Chunks mit mindestens 64 neuen Tokens; ohne solchen Chunk „–“.
+* Getrennt benannt: „D-Admit/Extend (Tokens je Request)“ = Anzahl Extends, Tokens, Ø Tokens je Request (`prefill.D.admit`, Segment `admit_n/admit_tok`).
+* „D-Prefill + Admit seit Boot“: Summe aller D-Tokens bleibt, die Raten (GPU-Zeit und Wandzeit) gelten für die Chunks ≥ 64 Tokens im 16-min-Ring
+  (`totals.d_split`), weil die kumulativen Zähler keine Chunk-Breite vor dem Ring tragen.
+* Log-Pfad (`live.py`): `wall_confounded_tps` und die D-Raten nehmen Zeilen mit < 64 Tokens nicht mehr auf, `prefill.D.now.admit` zählt sie.
+* Grenze: Die Trennung geschieht je 1-s-Probenschritt (Ø neue Tokens je Chunk im Schritt); ein Admit im selben Schritt wie ein breiter Chunk zählt mit dem breiten (±1 Token).
+* P ist nicht betroffen (Chunks von 1–16k Tokens, jede Zeile zählt).
+
 ## Glatt und ehrlich, Sitze, Zoom (Nutzer 30.09. ~21:05Z / ~21:10Z)
 
 „der decode durchsatz … nicht durchgehend sondern extrem sprunghaft“. Gemessen am Dienst (NF y5i): zwei Ursachen.
@@ -326,5 +343,13 @@ auf 1..6 gewählten Karten (Katalog `kartenplan_catalog.py`, PCIe je Karte: Gen,
 * Andere Karten/Zahlen: der Planer verweigert (HW-COUNT/HW-ARCH/HW-UNCALIBRATED/HW-TOPOLOGY); es gibt dann nur eine gekennzeichnete NÄHERUNG.
 * Records erneuern (Schreibtisch; liest Logs, darum außerhalb dieses Pakets): `cd tools/rig_dashboard; python3 -m kartenplan_build.records;
   python3 -m kartenplan_build.bridge --trees-root <Ordner mit <rev>/python/sglang>`.
+* VRAM-Balken je Karte und Phase (Auftrag 880): ein Balken = die Karte in dem Zustand, in dem die Zeilengruppe (P bzw. D) wach ist. Die Posten liegen als
+  zusammenhängende Blöcke in fester Reihenfolge **gemeinsam (Treiber) → P → D** (Server: `kartenplan._annotate_segments`, stabil nach `SEG_ORDER`;
+  die Klammer unter dem Balken zeigt die Blöcke). Mauszeiger/Tipp auf einen Posten: Name, MiB/GiB, Anteil an der Karte, Phase, Herkunft
+  (**gemessen** = Rang-Log/NVML, **Planerwert** = vram_plan bzw. Budgetzeile) und eine Ein-Satz-Erklärung (`SEG_WHAT`).
+  Überlauf: ist die Summe größer als die Karte, wächst der Balken (Skala = Summe), die Kartenkante bleibt markiert, der Überstand ist schraffiert und ein
+  Hinweis „Karte N: X MiB über dem VRAM – Profil passt nicht“ nennt die größten Posten. Ein negativer Rest im Rang-Budget (Dual-Record: Posten
+  überlappen, der Planer schließt die Karte trotzdem) ist **kein** Misfit: gelb schraffiert, Hinweis „Rang-Budget um X MiB überbucht“
+  (`overlap_mib` / `hard_over_mib`). Live-NVML-Balken können nicht überlaufen und bleiben unverändert.
 * Ansehen ohne den Dienst: `python3 -m rigdash.kartenplan_preview --port 18890 --tree <baum>/python`, dann `http://127.0.0.1:18890/#t=kartenplan`.
 * Deploy-Vorschlag: `deploy/install_510.sh --check` / `deploy/install_510.sh` (Lead).

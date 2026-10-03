@@ -33,6 +33,19 @@ from typing import Dict, List, Optional, Tuple
 CHUNK_GAP_S = 1.5      # chunks closer than this belong to one burst
 MIN_RATE_TOK = 512     # a burst smaller than this has no meaningful rate (a 1-token re-extend)
 DEC_MERGE_S = 1.5      # decode intervals closer than this form one decode stretch
+#: a prefill chunk needs this many new tokens on average to count as a real prefill.  On D every request
+#: admits with a 1-token extend after the P->D hand-off (y8vb D.log: 3029 of 3051 prefill batches had
+#: #new-token 1; the stock "input throughput" of such a line is 1 token / wall seconds since the previous line,
+#: 5,8 tok/s).  They are admits, not prefill: counted apart, never rated (Auftrag 880, Nutzer 03.10. "6 token/s
+#: prefill in D???").
+WIDE_MIN_TOK = 64
+
+
+def is_wide(tok, n) -> bool:
+    """True when a chunk record (``n`` chunks, ``tok`` new tokens) has real prefill width (mean >= WIDE_MIN_TOK)."""
+    tok = tok or 0
+    n = n or 0
+    return tok >= WIDE_MIN_TOK * n if n > 0 else tok >= WIDE_MIN_TOK
 
 
 def _grp(key: str) -> str:
@@ -117,7 +130,7 @@ def dp_prefill_start(ring, keys, u: Optional[dict], t_from: float, t_to: float):
     return r[0], r[1], "rankstats %s work.forward_ct (erster Prefill-Forward auf P, Rang-Takt)" % k0
 
 
-def chunks(ring, keys, g: str) -> List[dict]:
+def chunks(ring, keys, g: str, kind: Optional[str] = None) -> List[dict]:
     """Prefill chunks of group g with the time they really ran.
 
     Measured at NF y4x (30.09. ~17:00Z, raw rankstats every 0.5 s): the first stage's chunk ends
@@ -130,6 +143,10 @@ def chunks(ring, keys, g: str) -> List[dict]:
       last-stage record whose counter reached that chunk) -- the P-Ende wall clock;
     * the curve spreads a burst's tokens evenly over the burst: never more than the burst rate, every
       token once (per chunk gave 10k spikes with 27B's 1k-token chunks, several per sample).
+
+    ``kind``: None = every chunk; "wide" = only chunks with a mean width >= WIDE_MIN_TOK new tokens (real
+    prefill); "admit" = only the narrower ones (1-token admit extends).  The filter runs BEFORE the bursts
+    are formed, so a chain of admits never stretches the wall time of a real prefill burst.
     """
     k0, kl = stage_keys(keys, g)
     if k0 is None:
@@ -144,6 +161,8 @@ def chunks(ring, keys, g: str) -> List[dict]:
         n = _d(b, a, "pchunks") or 0
         tok = _d(b, a, "pnew") or 0
         if n <= 0 and tok <= 0:
+            continue
+        if kind is not None and is_wide(tok, n) != (kind == "wide"):
             continue
         e0 = b.get("plast_t") if b.get("plast_t") is not None else b["ts"]
         # FEHLT 7 (build y5a): own_ms = the chunk's own time after the previous one left -- the
@@ -375,6 +394,12 @@ def decode_rounds(iv: List[dict], s: float, e: float, solo: Optional[List[dict]]
 RESUME_NEW_TOK = 64
 #: round-time reference per bs needs this many rounds without P (else no reference is shown)
 SOLO_MIN_ROUNDS = 20
+
+
+def admit_in(chunks: List[dict], s: float, e: float) -> dict:
+    """The 1-token admit extends (chunks(kind="admit")) that ended inside [s, e]: {n, tok}."""
+    hit = [c for c in chunks if s - 0.05 <= c["e0"] <= e + 0.05]
+    return {"n": int(sum(c.get("n") or 1 for c in hit)), "tok": int(sum(c["tok"] for c in hit))}
 
 
 def co_extends(chunks: List[dict], s: float, e: float) -> dict:
@@ -715,6 +740,9 @@ class Model:
         self.life = life or {}
         self.open_flips = open_flips(begins, self.flips)
         self.pchunks = {g: chunks(self.ring, self.keys, g) for g in self.groups if g in ("P", "D", "single")}
+        # D: real prefill (wide) and the 1-token admit extends apart (WIDE_MIN_TOK); the phase bar keeps pchunks
+        self.dwide = chunks(self.ring, self.keys, "D", "wide") if "D" in self.pchunks else []
+        self.dadmit = chunks(self.ring, self.keys, "D", "admit") if "D" in self.pchunks else []
         dg = "D" if "D" in self.groups else ("single" if "single" in self.groups else None)
         self.dec_group = dg
         excl = list(self.flips) + [(s, e) for s, e, _ in self.tails()] + \
@@ -988,6 +1016,8 @@ class Model:
         cache_d = spread(pc.get("D", []), lo, n, step, key="cached")
         p_busy = spread(_busy_spans(pcs), lo, n, step, key="w")
         d_busy = spread(_busy_spans(pc.get("D", [])), lo, n, step, key="w")
+        dw_tok = spread(self.dwide, lo, n, step)
+        dw_busy = spread(_busy_spans(self.dwide), lo, n, step, key="w")
         dec_busy = spread(self.dec, lo, n, step, key="busy")
         dec_seat = spread(self.dec, lo, n, step, key="seat_s")
         bmin: List[Optional[float]] = [None] * n
@@ -1011,7 +1041,7 @@ class Model:
         # rates while working (None = the phase did not work in this bucket: a real gap)
         rate = lambda tok, busy: [(t / b) if have[i] and b > 1e-6 else None  # noqa: E731
                                   for i, (t, b) in enumerate(zip(tok, busy))]
-        out["dec_rate"], out["p_rate"], out["d_rate"] = rate(dec, dec_busy), rate(p_tok, p_busy), rate(d_tok, d_busy)
+        out["dec_rate"], out["p_rate"], out["d_rate"] = rate(dec, dec_busy), rate(p_tok, p_busy), rate(dw_tok, dw_busy)
         out["seats"] = rate(dec_seat, dec_busy)
         out["stream_tps"] = rate(dec, dec_seat)
         # levels: the mean of the samples in the bucket; a watched bucket without its own sample

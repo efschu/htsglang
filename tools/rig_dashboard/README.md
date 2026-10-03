@@ -61,7 +61,11 @@ Everything is optional and degrades gracefully:
   KV pool (with a live-filled overlay from `kv_used_tokens`), mamba pool, and
   free/unaccounted. A red line marks current NVML `used`. Co-located ranks
   (duplicate `--rank-gpu-id`) are summed onto their shared card. Tooltips give
-  GB and %.
+  GB and %, the origin (measured in the boot log) and a one-line explanation.
+  If the posts add up to more than the card, the bar grows past the card edge
+  (edge marked, excess hatched red) and a notice "Karte N: X MiB über dem VRAM –
+  Profil passt nicht" names the largest posts. The live service's Kartenplaner tab
+  (`rigdash/`) has the per-phase variant, see `rigdash/README.md`.
 * **Head / unit distribution** — Q heads as boxes colored by owning rank.
   Under replicated KV (TP > kv-heads) the split is taken **materialized** from
   the boot log's `REPLICATED-KV geometry active ... q heads split [8, 4, 4]`

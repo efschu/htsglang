@@ -39,6 +39,7 @@ WINDOW_S = 60.0        # headline window for the rates
 BUCKET_S = 5.0
 HISTORY_S = 15 * 60.0
 PHASE_GAP_S = 5.0      # no line of a class for longer than this -> that phase paused
+WIDE_MIN_TOK = 64         # D: a prefill line with fewer new tokens is an admit extend, not a prefill speed (activity.WIDE_MIN_TOK)
 ANON_EXTEND_MIN_MS = 50.0     # HOST-ANON-PASS phase=EXTEND below this is the empty follow-up pass
 ANON_EXTEND_WINDOW_S = 8.0    # the D rank line trails its extend by about one pass
 FLIP_TAIL_MAX_S = 60.0        # a 'first decode' later than this after FLIP done is not the flip's
@@ -1009,8 +1010,12 @@ class Boot:
         return {"P>D": stats("P>D"), "D>P": stats("D>P"), "recent": rows[-24:]}
 
     @staticmethod
-    def _prefill_window(ranks, batches, t0):
+    def _prefill_window(ranks, batches, t0, wide_only=False):
         """Compute-honest prefill rate over rank lines with t >= t0.
+
+        ``wide_only`` (group D, Auftrag 880): only rank lines / batches of at least WIDE_MIN_TOK new tokens are
+        rated; the 1-token admit extends after the P->D hand-off (y8vb D.log: 3029 of 3051 batches had #new-token 1,
+        stock "input throughput" 5,8 tok/s = 1 token / wall seconds since the previous line) go to ``admit``.
 
         Per rank: sum(#new-token) / sum(compute_ms).  The group's rate is the
         SLOWEST rank's (a PP stage or a TP peer bounds the chunk), which is
@@ -1019,6 +1024,8 @@ class Boot:
         """
         per = {}
         unrated = 0
+        if wide_only:
+            ranks = [e for e in ranks if (e.get("new_tok") or 0) >= WIDE_MIN_TOK]
         for e in ranks:
             if e["t"] < t0:
                 continue
@@ -1037,6 +1044,9 @@ class Boot:
             a["tps"] = _rate(a["tok"], a["ms"])
             a["mean_chunk"] = a["tok"] / a["chunks"] if a["chunks"] else None
         rated = [a["tps"] for a in per.values() if a["tps"]]
+        admit = [b for b in batches if b["t"] >= t0 and (b.get("new_tok") or 0) < WIDE_MIN_TOK and b.get("rank") in (None, 0)] if wide_only else []
+        if wide_only:
+            batches = [b for b in batches if (b.get("new_tok") or 0) >= WIDE_MIN_TOK]
         wall = [b["wall_tps"] for b in batches if b["t"] >= t0 and b.get("wall_tps") is not None]
         rank0 = per.get("PP0") or per.get("TP0") or (next(iter(per.values())) if per else None)
         wall_tps, wall_s, _ = _prefill_wall([e for e in ranks if e["t"] >= t0])
@@ -1053,15 +1063,19 @@ class Boot:
             "mean_chunk": rank0["mean_chunk"] if rank0 else None,
             "cached": rank0["cached"] if rank0 else 0,
             "wall_confounded_tps": (sum(wall) / len(wall)) if wall else None,
+            "admit": ({"n": len(admit), "tokens": sum(b.get("new_tok") or 0 for b in admit),
+                       "tok_per_req": (sum(b.get("new_tok") or 0 for b in admit) / len(admit)) if admit else None}
+                      if wide_only else None),
         }
 
     def _prefill_view(self, g: str, now: float) -> dict:
         ranks = self.ev["%s_prefill_rank" % g]
         batches = self.ev["%s_prefill_batch" % g]
-        win = self._prefill_window(ranks, batches, now - WINDOW_S)
+        wide = g == "D"
+        win = self._prefill_window(ranks, batches, now - WINDOW_S, wide)
         # last burst: the rows of the newest 20 s of activity, however old
         last_t = ranks[-1]["t"] if ranks else None
-        burst = self._prefill_window(ranks, batches, last_t - 20.0) if last_t else None
+        burst = self._prefill_window(ranks, batches, last_t - 20.0, wide) if last_t else None
         lb = self.last.get("%s_prefill_batch" % g)
         return {
             "window_s": WINDOW_S,
@@ -1244,6 +1258,8 @@ class Boot:
                 i = idx(e["t"])
                 if i is None or e.get("compute_ms") is None:
                     continue
+                if g == "D" and (e.get("new_tok") or 0) < WIDE_MIN_TOK:
+                    continue            # 1-token admit extends are no prefill rate (Auftrag 880)
                 key = "%s%s" % (e.get("rk", ""), e.get("rank", 0))
                 a = per_rank[i].setdefault(key, [0, 0.0])
                 a[0] += e.get("new_tok") or 0
@@ -1419,6 +1435,7 @@ class Boot:
             "dec_rate_wall": (dec / wall) if wall else None,
             "p_new": p_new, "d_new": d.get("new", 0),
             "p_chunks": p.get("chunks", 0), "d_chunks": d.get("chunks", 0),
+            "d_mean_chunk": (d.get("new", 0) / d["chunks"]) if d.get("chunks") else None,
             "decoded": dec, "served_requests": self.tot.get("served_D", {}).get("n", 0),
             "read_progress": round(self.read_progress(), 4),
         }

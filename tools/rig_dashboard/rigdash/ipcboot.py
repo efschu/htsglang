@@ -246,7 +246,7 @@ def one_s(ps, f: str, now: float) -> float:
 LIVE_BURST_S = 6.0      # a prefill burst whose last chunk ended this recently is "running"
 
 
-def _rank_gpu_rates(ring, keys, g, t0, t1) -> Dict[str, dict]:
+def _rank_gpu_rates(ring, keys, g, t0, t1, wide_only: bool = False) -> Dict[str, dict]:
     """Rate per rank over the chunks that ended in [t0, t1].  With FEHLT 7 (build y5a):
     Σ last.new / Σ last.compute_only_ms of the chunks read one by one -- the rank's pure compute
     rate.  Without it: Δnew / Δcompute_ms, which on PP0 includes the wait behind the previous
@@ -258,6 +258,8 @@ def _rank_gpu_rates(ring, keys, g, t0, t1) -> Dict[str, dict]:
             e = b.get("plast_t") or b["ts"]
             if not (t0 - 0.5 <= e <= t1 + 0.5):
                 continue
+            if wide_only and not activity.is_wide(_d(b, a, "pnew"), _d(b, a, "pchunks")):
+                continue                    # a 1-token admit extend is no prefill speed (WIDE_MIN_TOK)
             n += _d(b, a, "pnew") or 0.0
             ms += _d(b, a, "pcomp") or 0.0
             if (_d(b, a, "pchunks") or 0) == 1 and b.get("plast_conly") and b.get("plast_new"):
@@ -271,7 +273,7 @@ def _rank_gpu_rates(ring, keys, g, t0, t1) -> Dict[str, dict]:
 
 
 def _burst_dict(ring, keys, g, b) -> dict:
-    ranks = _rank_gpu_rates(ring, keys, g, b["s"], b["e"])
+    ranks = _rank_gpu_rates(ring, keys, g, b["s"], b["e"], g == "D")
     gpu = min((r["tps"] for r in ranks.values()), default=None) if b["tok"] >= activity.MIN_RATE_TOK else None
     exact = bool(ranks) and all(r.get("exact") for r in ranks.values())
     return {"tokens": b["tok"], "chunks": b["n"], "cached": b["cached"], "mean_chunk": (b["tok"] / b["n"]) if b["n"] else None,
@@ -283,10 +285,16 @@ def _burst_dict(ring, keys, g, b) -> dict:
 def prefill_view(m: "activity.Model", g: str, now: float, done: Optional[List[dict]] = None) -> Optional[dict]:
     """Prefill tile.  Rates only over the time the chunks ran (activity.py): the running or last burst
     (P-Ende wall clock: first chunk's start on the first stage -> last chunk's end on the last stage),
-    the best burst of the ring, and the chunks that ended in the last 60 s."""
+    the best burst of the ring, and the chunks that ended in the last 60 s.
+
+    D (Auftrag 880): only chunks of real width (>= WIDE_MIN_TOK new tokens) are rated; the 1-token admit extends
+    after the P->D hand-off are counted apart (``admit``: n / tokens / tokens per extend) and never rated."""
     cs = m.pchunks.get(g)
     if cs is None:
         return None
+    dwide = g == "D"
+    if dwide:
+        cs = m.dwide
     bs = activity.bursts(cs)
     last = bs[-1] if bs else None
     running = last is not None and now - last["e"] <= LIVE_BURST_S
@@ -303,14 +311,32 @@ def prefill_view(m: "activity.Model", g: str, now: float, done: Optional[List[di
             "now": ({"tokens": wtok, "chunks": sum(b["n"] for b in wb), "cached": sum(b["cached"] for b in wb),
                      "mean_chunk": wtok / max(1, sum(b["n"] for b in wb)), "wall_s": wwall,
                      "wall_tps": (wtok / wwall) if wwall > 0 and wtok >= activity.MIN_RATE_TOK else None,
-                     "ranks": _rank_gpu_rates(m.ring, m.keys, g, now - WINDOW_S, now),
-                     "tps_gpu": min((r["tps"] for r in _rank_gpu_rates(m.ring, m.keys, g, now - WINDOW_S, now).values()),
+                     "ranks": _rank_gpu_rates(m.ring, m.keys, g, now - WINDOW_S, now, dwide),
+                     "tps_gpu": min((r["tps"] for r in _rank_gpu_rates(m.ring, m.keys, g, now - WINDOW_S, now, dwide).values()),
                                     default=None) if wtok >= activity.MIN_RATE_TOK else None}
                     if wb else None),
             "last_burst": dict(_burst_dict(m.ring, m.keys, g, last), depth=_depth_round(activity.prefill_depth(last, done, g)))
                           if last else None,
             "last_t": last["e"] if last else None, "queue": lastrec.get("queue"), "pending_tok": lastrec.get("pending"),
-            "instrument": "Chunks zur Rechenzeit (prefill.last t/gpu_ms), Schub = erster Chunk-Start PP0 bis letztes Chunk-Ende letzte Stufe"}
+            "instrument": "Chunks zur Rechenzeit (prefill.last t/gpu_ms), Schub = erster Chunk-Start PP0 bis letztes Chunk-Ende letzte Stufe"
+                          + (f"; nur Chunks mit mindestens {activity.WIDE_MIN_TOK} neuen Tokens (kürzere sind Admit/Extend, getrennt gezählt)" if dwide else ""),
+            "min_chunk_tok": activity.WIDE_MIN_TOK if dwide else None,
+            "admit": admit_view(m, now) if dwide else None}
+
+
+def admit_view(m: "activity.Model", now: float) -> dict:
+    """D-Admit/Extend: the 1-token (< WIDE_MIN_TOK) prefill extends of D after the P->D hand-off, apart from the
+    prefill rate.  ``n`` = extends (one per admitted request), ``tokens`` = their new tokens, ``tok_per_req`` = mean
+    new tokens per extend; for the last WINDOW_S and for the whole ring."""
+    def agg(lo):
+        cs = [c for c in m.dadmit if c["e0"] >= lo]
+        n = int(sum(c.get("n") or 1 for c in cs))
+        tok = sum(c["tok"] for c in cs)
+        return {"n": n, "tokens": int(tok), "tok_per_req": (tok / n) if n else None, "cached": int(sum(c["cached"] for c in cs))}
+    return {"window_s": WINDOW_S, "now": agg(now - WINDOW_S), "ring": agg(float("-inf")),
+            "ring_s": (m.ring[-1]["t"] - m.ring[0]["t"]) if len(m.ring) > 1 else None,
+            "max_tok": activity.WIDE_MIN_TOK - 1,
+            "src": "rankstats prefill.new_tokens / prefill.chunks je Probenschritt; Schritte mit Ø < %d neuen Tokens je Chunk" % activity.WIDE_MIN_TOK}
 
 
 def decode_view(m: "activity.Model", g: str, front, now: float) -> Optional[dict]:
@@ -520,6 +546,13 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
             x["tok"] = tok
             x["tps"] = tok / max(1e-3, x["e"] - x["s"])
             x["n"] = 1
+            if x["k"] == "D":
+                # Auftrag 880: only chunks of real width are a prefill speed; the 1-token admit extends are named
+                # (n, tokens) and the rate is "-" when the segment holds nothing wide
+                wtok = activity.spread(m.dwide, x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
+                ad = activity.admit_in(m.dadmit, x["s"], x["e"])
+                x["tok"], x["tps"] = wtok, (wtok / max(1e-3, x["e"] - x["s"]) if wtok > 0 else None)
+                x["admit_n"], x["admit_tok"] = ad["n"], ad["tok"]
         if x.get("co") in src:
             # dual: D's work in the same stretch, by the same token model as its own segments
             ctok = activity.spread(src[x["co"]], x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
@@ -1034,6 +1067,39 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
     return {"k": k, "label": k, "sub": cur.get("why") or "", "since": since}
 
 
+def d_split(ring, keys) -> Optional[dict]:
+    """D's prefill chunks of the ring in two classes (activity.is_wide): real prefill (>= WIDE_MIN_TOK new tokens
+    per chunk) with its compute-honest rate (slowest rank, tokens / compute_ms) and its rate per ring second, and
+    the 1-token admit extends (n, tokens, tokens per extend).  None without D rankstats."""
+    dks = sorted(k for k in keys if _grp(k) == "D")
+    if not dks or len(ring) < 2:
+        return None
+    k0 = first_key(keys, "D")
+    span = ring[-1]["t"] - ring[0]["t"]
+    acc = {"wide": {"tok": 0.0, "chunks": 0}, "admit": {"tok": 0.0, "chunks": 0}}
+    per = {}
+    for k in dks:
+        for a, b in activity.rank_pairs(ring, k):
+            dn, dc, dm = _d(b, a, "pnew") or 0.0, _d(b, a, "pchunks") or 0.0, _d(b, a, "pcomp") or 0.0
+            if dn <= 0 and dc <= 0:
+                continue
+            cls = "wide" if activity.is_wide(dn, dc) else "admit"
+            if k == k0:
+                acc[cls]["tok"] += dn
+                acc[cls]["chunks"] += int(dc)
+            if cls == "wide":
+                t = per.setdefault(k, [0.0, 0.0])
+                t[0] += dn
+                t[1] += dm
+    rated = [t / (ms / 1000.0) for t, ms in per.values() if t > 0 and ms > 0]
+    w, ad = acc["wide"], acc["admit"]
+    return {"min_chunk_tok": activity.WIDE_MIN_TOK, "span_s": span,
+            "wide": {"tokens": int(w["tok"]), "chunks": w["chunks"], "rate_gpu": min(rated) if rated else None,
+                     "rate_wall": (w["tok"] / span) if w["tok"] > 0 and span > 0 else None},
+            "admit": {"tokens": int(ad["tok"]), "chunks": ad["chunks"],
+                      "tok_per_req": (ad["tok"] / ad["chunks"]) if ad["chunks"] else None}}
+
+
 def totals_view(ring, keys, front, boot_t0, now) -> dict:
     last = ring[-1]["r"] if ring else {}
     wall = max(1.0, now - boot_t0) if boot_t0 else None
@@ -1056,8 +1122,14 @@ def totals_view(ring, keys, front, boot_t0, now) -> dict:
     dg = "D" if first_key(last.keys(), "D") else "single"
     dec, _, dec_gpu, dec_wall = grp(dg, "dtok", "dgpu")
     served = (front or {}).get("served") or {}
+    dsplit = d_split(ring, keys)
+    if dsplit is not None:
+        # D: the since-boot rates would be dragged down by the 1-token admit extends (Auftrag 880) -- rate the
+        # real prefill chunks only, over the ring (the counters carry no per-chunk history before it)
+        d_gpu, d_wall = dsplit["wide"]["rate_gpu"], dsplit["wide"]["rate_wall"]
     return {"p_new": p_new, "p_chunks": p_chunks, "p_rate_gpu": p_gpu, "p_rate_wall": p_wall,
-            "d_new": d_new, "d_chunks": d_chunks, "d_rate_gpu": d_gpu, "d_rate_wall": d_wall,
+            "d_new": d_new, "d_chunks": d_chunks, "d_rate_gpu": d_gpu, "d_rate_wall": d_wall, "d_split": dsplit,
+            "d_mean_chunk": (d_new / d_chunks) if d_new is not None and d_chunks else None,
             "decoded": dec, "dec_rate_gpu": dec_gpu, "dec_rate_wall": dec_wall,
             "served_requests": served.get("D") if isinstance(served, dict) else None,
             "boot_wall_s": wall, "read_progress": 1.0}
