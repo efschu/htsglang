@@ -268,6 +268,12 @@ class WeightFormat:
     args: Tuple[str, ...] = ()
     p_cut_pin: Tuple[Tuple[int, ...], ...] = ()
     profile_format: str = ""
+    #: HW-P1c 1003: checkpoint NAMES (model_key) of derivatives that are THIS
+    #: format: same config and tensor headers, only weight VALUES differ (the
+    #: abliterated release checkpoint, ``...-abl-wxp``; footprint_key below).
+    #: ``format_of`` returned '' for the NF release checkpoint because only
+    #: ``checkpoint`` was listed.
+    derivatives: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1020,7 +1026,8 @@ PROFILES: Dict[str, ModelProfile] = {
         formats={
             "int4-mixed": WeightFormat("int4-mixed", note="compressed-tensors AutoRound (Minachist)",
                                        checkpoint=_MC + "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
-                                       p_cut_pin=((29, 11, 8), (7, 3, 2))),
+                                       p_cut_pin=((29, 11, 8), (7, 3, 2)),
+                                       derivatives=("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp",)),
             "nvfp4": WeightFormat("nvfp4", sm8x="w4a8", sm12x="native",
                                   note="ModelOpt; 3080 W4A8 planned (user 25.09.)",
                                   checkpoint=_MC + "Qwen3.8-Flash-Next-NVFP4-nvidia",
@@ -1457,6 +1464,8 @@ def format_of(profile: Optional[str], model: str) -> str:
     for name, wf in row.formats.items():
         if wf.checkpoint and model_key(wf.checkpoint) == key:
             return name
+        if key in wf.derivatives:
+            return name
     return ""
 
 
@@ -1479,7 +1488,13 @@ def profile_constant(
     row = profile_row(profile)
     if row is None:
         raise KeyError(f"unknown model profile {profile!r}; known: {sorted(PROFILES)}")
-    return row.constant(name)
+    # HW-P1c 1003: a launch on a SUBSET of the inventory the positional records
+    # were measured on reads them derived for its cards (weg2/inventory_view.py,
+    # installed by the launcher); no view installed / the calibrated inventory =
+    # the record unchanged.
+    from sglang.srt.weg2 import inventory_view as _iv
+
+    return _iv.apply_active(name, profile, row.constant(name))
 
 
 # --------------------------------------------------------------------------
