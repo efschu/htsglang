@@ -49,6 +49,8 @@ _FAKE_KW = {
     "hold_sink": lambda _rec: None,
     # L15-FIX-PARKED: the hook passes the radix tree for parked reqs
     "tree_cache": None,
+    # L15-TREE-CAND: cap on the finished-request tips
+    "tree_cand_max": 8,
 }
 
 

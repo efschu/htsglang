@@ -20559,6 +20559,41 @@ class Scheduler(
                 elif l15_plan.master_on(os.environ) and (
                     getattr(self, "weg2_d_parked", None) is not None
                 ) and _l15_pre_why is None:
+                    # L15-TREE-CAND: finished requests stay hold candidates.
+                    # The DECODE-COLLECT window lets the decodes finish before
+                    # the sleep (27B 195124: held=0, SHADOW n=0 at every
+                    # sleep); their spans sit in the radix tree with their END
+                    # anchor. ONE gather over D's group (taken by every rank
+                    # right here, before any rank-local step can raise) agrees
+                    # on the most recently used tips; they join the live reqs
+                    # as pseudo reqs the bind resolves through the tree match.
+                    # Needs the SLEEP-AGREE gather (no collective without it).
+                    _l15_tree_reqs = []
+                    if _l15_agree_on:
+                        try:
+                            from sglang.srt.weg2 import l15_tree_cand
+
+                            if l15_tree_cand.env_on(os.environ):
+                                try:
+                                    _l15_tree_l2 = (l15_shadow.own_cap_rows(
+                                        self, os.environ) <= 0)
+                                except Exception:  # noqa: BLE001 -- stricter filter
+                                    _l15_tree_l2 = True
+                                _l15_tree_reqs = l15_tree_cand.build(
+                                    self.tree_cache,
+                                    _l15_gather,
+                                    len(getattr(getattr(self, "running_batch", None), "reqs", None) or [])
+                                    + len(getattr(self, "weg2_d_parked", None) or []),
+                                    os.environ,
+                                    logger.info,
+                                    # a cap-0 rank refills from L2: it offers
+                                    # only tips whose chain is L2-backed
+                                    require_l2=_l15_tree_l2,
+                                )
+                        except Exception as _exc:  # noqa: BLE001 -- no tree candidates
+                            _l15_tree_reqs = []
+                            logger.warning("L15-TREE-CAND failed (ignored): %s: %s",
+                                           type(_exc).__name__, _exc)
                     _tp = int(
                         getattr(self, "tp_size", 0)
                         or getattr(getattr(self, "server_args", None), "tp_size", 1)
@@ -20649,7 +20684,7 @@ class Scheduler(
                         )
                     _reqs = list(
                         getattr(getattr(self, "running_batch", None), "reqs", None) or []
-                    ) + list(getattr(self, "weg2_d_parked", None) or [])
+                    ) + list(getattr(self, "weg2_d_parked", None) or []) + _l15_tree_reqs
                     _rgid = getattr(getattr(self, "server_args", None), "rank_gpu_id", None)
                     _cards = (
                         list(_rgid)
@@ -20709,6 +20744,9 @@ class Scheduler(
                             # req_to_token row released) is matched in the
                             # tree it was inserted into.
                             tree_cache=self.tree_cache,
+                            tree_cand_max=__import__(
+                                "sglang.srt.weg2.l15_tree_cand",
+                                fromlist=["max_n"]).max_n(os.environ),
                             reset_keep=self.tree_cache.reset_keep,
                             set_keep=_set_keep_collect,
                             # L15-12c-C: per-(group, rank) manifest file -- the

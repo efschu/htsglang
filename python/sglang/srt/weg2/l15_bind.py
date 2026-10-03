@@ -86,10 +86,18 @@ def match_parked(req, tree_cache):
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
     rid = getattr(req, "rid", "?")
-    toks = list(getattr(req, "origin_input_ids", None) or ()) + list(
-        getattr(req, "output_ids", None) or ()
-    )
-    span = max(len(toks) - 1, 0)
+    _tree_toks = getattr(req, "l15_tree_tokens", None)
+    if _tree_toks is not None:
+        # L15-TREE-CAND: a finished request's tree tip. Its chain is complete
+        # (every token has KV), so the WHOLE chain is matched -- no "last
+        # token has no KV yet" minus one.
+        toks = list(_tree_toks)
+        span = len(toks)
+    else:
+        toks = list(getattr(req, "origin_input_ids", None) or ()) + list(
+            getattr(req, "output_ids", None) or ()
+        )
+        span = max(len(toks) - 1, 0)
     if span == 0:
         raise ValueError(f"parked req {rid!r} has no token span")
     res = tree_cache.match_prefix(
@@ -418,8 +426,15 @@ def build_retain_kwargs(
     mamba_host_pool=None,
     tree_cache=None,
     hold_sink: Optional[Callable[[tuple], None]] = None,
+    tree_cand_max: Optional[int] = None,
 ) -> Dict:
     """Assemble the whole retain_at_sleep keyword set from live reqs.
+
+    L15-TREE-CAND: a req carrying ``l15_tree_tokens`` is a finished request's
+    radix-tree tip (l15_tree_cand.pseudo_req). It is resolved through the
+    parked match; one whose node already sits on the chain of a real req
+    earlier in ``reqs`` is covered by it and dropped, at most
+    ``tree_cand_max`` (None = no cap) are kept.
 
     Geometry: rows_by_rank = the EXACT per-rank owned count of the real
     slots (l15_compact.owner_of over slots_of_req); anchor_depth = kv_depth
@@ -435,8 +450,13 @@ def build_retain_kwargs(
     anchor_rows = []
     skipped = []  # L15-FIX-NOIDX: (rid, reason) of reqs that cannot be held
     parked_by_rid = {}  # L15-FIX-PARKED: rid -> (slots, node, anchor)
+    covered_nodes: set = set()  # L15-TREE-CAND: id() of nodes on real reqs' chains
+    tree_used, tree_covered, tree_unholdable = [], [], []
     for req in reqs:
         rid = str(req.rid)
+        _is_tree = getattr(req, "l15_tree_tokens", None) is not None
+        if _is_tree and tree_cand_max is not None and len(tree_used) >= tree_cand_max:
+            continue
         # L15-FIX-NOIDX: a req without a holdable token span (no
         # req_to_token row, or the padding slot inside its span) is skipped
         # per rid -- before this fix its error escaped and the whole round
@@ -450,8 +470,22 @@ def build_retain_kwargs(
             else:
                 _slots = slots_of_req(req, req_to_token)
         except ValueError as exc:
-            skipped.append((rid, str(exc)))
+            if _is_tree:
+                tree_unholdable.append(rid)
+            else:
+                skipped.append((rid, str(exc)))
             continue
+        _cnode = _pk[1] if _pk is not None else getattr(req, "last_node", None)
+        if _is_tree and id(_cnode) in covered_nodes:
+            tree_covered.append(rid)
+            continue
+        if _is_tree:
+            tree_used.append(rid)
+        else:
+            _cur = _cnode
+            while _cur is not None and id(_cur) not in covered_nodes:
+                covered_nodes.add(id(_cur))
+                _cur = getattr(_cur, "parent", None)
         by_rid[rid] = req
         if _pk is not None:
             parked_by_rid[rid] = _pk
@@ -524,6 +558,10 @@ def build_retain_kwargs(
             "L15-RETAIN skipped %d req(s) without a holdable span: %s"
             % (len(skipped), "; ".join("%s (%s)" % (r, why) for r, why in skipped[:4]))
         )
+    if tree_used or tree_covered or tree_unholdable:
+        log("L15-TREE-CAND bind used=%d covered=%d unholdable=%d rids=%s"
+            % (len(tree_used), len(tree_covered), len(tree_unholdable),
+               ",".join(tree_used[:6])))
     candidates = candidates_from(entries)
 
     # L15-12c-C2: host row -> (arena page slot, generation). The pool is the
