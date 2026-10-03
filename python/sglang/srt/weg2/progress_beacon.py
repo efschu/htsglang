@@ -299,8 +299,39 @@ class PpForwardProbe:
                 self.baseline[s] = {pid: cur[pid][0] for pid in stages[s]}
                 for pid in stages[s]:
                     self.paths[pid] = os.path.join(directory, f"{group}-pid{pid}.bin")
+            #: the baseline reading itself (ct, t_start_ns, t_done_ns) per pid, kept for
+            #: :meth:`resolve_started_after` (Y8P-PPFWD-ARM-RACE)
+            self.base_reading = dict(cur)
         except Exception as e:  # noqa: BLE001 -- an instrument never breaks a flip
             self._set_all({"missing": f"probe_error {type(e).__name__}"})
+
+    def resolve_started_after(self, floor_ns: int) -> None:
+        """Y8P-PPFWD-ARM-RACE (NF y8p 03.10. 08:52:05 / 08:53:41 / 08:57:00): the probe is armed
+        at ``flip_done``, but P's first forward can start BEFORE the front logs ``done`` (the wake
+        RPC returns, P admits at once; 0-70 ms ahead of the front). That forward is then already
+        inside the baseline (``forward_ct`` rose before the arm), the probe waited for the NEXT rise
+        and reported the SECOND chunk's start -- a false Nachlauf of one whole chunk (2.5-2.9 s) in
+        3 of 7 flips, i.e. D>P total 5.2 s where the flip was 2.2 s. P sleeps for the whole D phase,
+        so a forward whose ``t_start_ns`` lies at or after ``floor_ns`` (the flip's begin) is the
+        woken group's first forward. Read from the baseline reading, per stage; never raises."""
+        try:
+            base = getattr(self, "base_reading", None) or {}
+            for s in STAGES:
+                if self.results[s] is not None:
+                    continue
+                best = None
+                for pid in self.stages[s]:
+                    r = base.get(pid)
+                    if r is None:
+                        continue
+                    ct, ts, _td = r
+                    if ct > 0 and ts >= int(floor_ns) and (best is None or ts < best[0]):
+                        best = (int(ts), int(pid), int(ct))
+                if best is not None:
+                    self._set(s, {"ts": best[0] / 1e9, "pid": best[1], "ct": best[2],
+                                 "armed_in_forward": True})
+        except Exception:  # noqa: BLE001 -- an instrument never breaks a flip
+            pass
 
     @property
     def result(self) -> Optional[dict]:

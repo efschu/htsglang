@@ -7913,6 +7913,9 @@ class Front:
             return
         probe.epoch = int(getattr(self, "epoch", 0) or 0)
         probe.t_done = time.time()
+        _t0 = getattr(self, "_flip_t0", None)
+        if _t0:   # Y8P-PPFWD-ARM-RACE: a P forward that began after flip_begin but before this arm
+            probe.resolve_started_after(int(float(_t0) * 1e9))
         self.__dict__["_dp_ppfwd"] = probe
         if probe.result is None:
             logger.info("WEG2-FLIP-PPFWD armed epoch=%d group=%s pp_first=%s pp_last=%s baseline_forward_ct=%s",

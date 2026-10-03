@@ -385,3 +385,46 @@ def test_the_front_without_a_beacon_reports_missing_not_the_dispatch():
     assert (fw[0]["prefill_start_source"], fw[0]["first_work_ts"], fw[0]["flip_time_ms"]) == ("missing", None, None)
     last = front_mod.Front._flip_phase(f).snap["last"]
     assert last["first_work_ts"] is None and last["nachlauf_ms"] is None
+
+
+def test_y8p_arm_race_a_forward_begun_before_the_arm_is_the_first_forward_not_the_next_one():
+    """NF y8p 08:52:05: P's first chunk began ~70 ms BEFORE the front logged ``done``, so the
+    baseline already held it and the probe reported the SECOND chunk's start (+2.9 s). The
+    baseline forward whose start lies at/after the flip's begin IS the end."""
+    d = tempfile.mkdtemp(prefix="ppfwd-race-")
+    stages = {101: 0, 102: 1, 103: 2}
+    begin_ns = 100_000_000_000
+    # P slept through the D phase: forward 7 ended long before the flip began ...
+    for pid in stages:
+        _beat(d, "P", pid, 7, begin_ns - 50_000_000_000, begin_ns - 49_000_000_000)
+    # ... and forward 8 on PP0 began 2.4 s after the begin, 70 ms before the arm (still running)
+    _beat(d, "P", 101, 8, begin_ns + 2_400_000_000, 0)
+    got = []
+    probe = fp.PpForwardProbe(d, "P", 77, session_of=lambda pid: 77, pp_of=stages.get, poll_s=0.001)
+    assert probe.baseline == {"first": {101: 8}, "last": {103: 7}}
+    probe.resolve_started_after(begin_ns)
+    assert probe.results["first"] == {"ts": 102.4, "pid": 101, "ct": 8, "armed_in_forward": True,
+                                      "pp_rank": 0}
+    assert probe.results["last"] is None                      # PP2 has not begun: still to come
+    probe.start(lambda stage, res: got.append((stage, res)))
+    assert [g[0] for g in got] == ["first"]                   # reported at once, in order
+    _beat(d, "P", 103, 8, begin_ns + 5_300_000_000)
+    deadline = time.time() + 2.0
+    while time.time() < deadline and len(got) < 2:
+        time.sleep(0.005)
+    assert got[1][0] == "last" and got[1][1]["ts"] == 105.3
+    probe.stop("x")
+
+
+def test_y8p_arm_race_a_forward_of_the_previous_phase_is_not_taken_for_the_first():
+    d = tempfile.mkdtemp(prefix="ppfwd-race-old-")
+    stages = {101: 0, 102: 1, 103: 2}
+    begin_ns = 100_000_000_000
+    for pid in stages:                                        # last P forward: before the begin
+        _beat(d, "P", pid, 7, begin_ns - 30_000_000_000, begin_ns - 29_000_000_000)
+    probe = fp.PpForwardProbe(d, "P", 77, session_of=lambda pid: 77, pp_of=stages.get, poll_s=0.001)
+    probe.resolve_started_after(begin_ns)
+    assert probe.results == {"first": None, "last": None}     # unchanged: wait for the next rise
+    _beat(d, "P", 101, 8, begin_ns + 300_000_000)
+    r = fp.first_rise(probe.baseline["first"], fp.read_group(d, "P", 77, lambda pid: 77))
+    assert r["ts"] == 100.3 and r["ct"] == 8
