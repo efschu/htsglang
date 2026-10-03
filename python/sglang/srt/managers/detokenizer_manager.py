@@ -160,6 +160,28 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             self.degen.on_dump = TailDumper.from_env(getattr(self, "tokenizer", None))
         except Exception as e:  # noqa: BLE001 -- an instrument never kills the detokenizer
             logger.warning("DEGEN-DUMP off: %s: %s", type(e).__name__, e)
+        # DEGEN-STOP (stage 2, SGLANG_WEG2_DEGEN_STOP): a looping request is
+        # ended through the tokenizer manager (single-tokenizer mode only: the
+        # one socket this process owns towards it).
+        self._degen_stopped = set()
+        if self.degen.stop and hasattr(self, "send_to_tokenizer"):
+            self.degen.on_stop = self._degen_stop
+
+    def _degen_stop(self, rid: str, part: str, period: int, reps: int) -> None:
+        from sglang.srt.managers.degen_stop import degen_stop_abort_req
+
+        if rid in self._degen_stopped:
+            return
+        if len(self._degen_stopped) >= 4096:
+            self._degen_stopped.clear()
+        self._degen_stopped.add(rid)
+        out_len = self.degen.out_len(rid)
+        logger.warning(
+            "DEGEN-STOP rid=%s part=%s period=%d reps=%d out_len=%d -- the decode "
+            "tail loops; the request is ended with finish_reason=length (abort to "
+            "the scheduler via the tokenizer manager)", rid, part, period, reps, out_len,
+        )
+        sock_send(self.send_to_tokenizer, degen_stop_abort_req(rid, part, period, reps, out_len))
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(

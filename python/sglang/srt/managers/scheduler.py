@@ -121,6 +121,7 @@ from sglang.srt.managers.weg2_idle_vote import (
     tally,
 )
 from sglang.srt.managers.wedge_recovery import drain_recovery_request
+from sglang.srt.managers.degen_stop import running_abort_finish
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -21845,7 +21846,8 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                # DEGEN-STOP: a looping request ends with length, not abort
+                req.to_finish = running_abort_finish(recv_req)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
