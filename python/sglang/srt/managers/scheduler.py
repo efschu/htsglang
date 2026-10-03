@@ -839,6 +839,33 @@ def _weg2_fork_match_end(req, match_end: int, exact_bigram: bool = False) -> int
     return fork
 
 
+def _weg2_fork_handback_tail(req) -> int:
+    """FORK ANCHOR, the X gate's half (Q-360, 27B dual y8p 10030828): the
+    generation-prompt tail ``N - F`` a fork-cut P leg leaves to group D, or 0.
+
+    A fork-cut P leg computes the prompt up to the fork F (the last
+    ``<|im_start|>`` among the final ``max_tail`` ids, P-TRIM-END-ANCHOR
+    ``tokens=N->F``) and NEVER the generation prompt after it: that tail is
+    D's own extend by construction (the leg-2 extend D runs anyway; without
+    the switch it is the single token N-1). The X gate priced it against X,
+    and with the dual layout's X=1 every fork-cut hand-back was refused --
+    metal ``W50 ... extent after prefix matching is 7`` after a FULL P prefill,
+    the front's re-leg wrote the same F again, D refused again, ``W35
+    Weg2XReQueueLoop`` (weg2-0-1 25->18, weg2-0-6 4061->4054).
+
+    Same predicate as the store-read cap (``_weg2_fork_match_end``): group D
+    only, the switch on, a front request P's intake cuts. Derived from the
+    prompt ids and the env alone -- identical on every rank. The allowance is
+    the tail and nothing else: ``N - F <= max_tail`` (16) by ``fork_cut``."""
+    if not _weg2_fork_anchor_on_consumer():
+        return 0
+    fork = _weg2_fork.fork_cut_of_req(req)
+    if fork is None:
+        return 0
+    n = len(getattr(req, "origin_input_ids", None) or ())
+    return max(0, n - int(fork))
+
+
 def _weg2_store_short_tail_on() -> bool:
     """UNIFY S7: set = that value (``0/false/no/off`` = off); unset = the
     default of the published form's MODEL PROFILE (weg2/form.py
@@ -14282,6 +14309,20 @@ class Scheduler(
         # D's own #915 line, and it is the term the acceptance checks against
         # cap x share.
         verdict = "W31" if uncached > x else "admit"
+        # FORK ANCHOR (Q-360): the generation-prompt tail a fork-cut P leg
+        # leaves to D is D's own extend, not a prefill over X -- admitted when
+        # the GROUP match reaches the fork (uncached <= N - F). Both terms are
+        # replicated (group-priced extent; ids + env), so the verdict stays the
+        # group's. Not X raised: a match short of the fork prices as before.
+        if verdict == "W31":
+            _fork_tail = _weg2_fork_handback_tail(req)
+            if 0 < uncached <= _fork_tail:
+                verdict = "admit"
+                logger.info(
+                    "WEG2 X-GATE FORK-TAIL rid=%s uncached=%d tail=%d X=%d verdict=admit "
+                    "(the generation prompt after P's fork cut is D's own extend)",
+                    str(getattr(req, "rid", "?"))[:16], uncached, _fork_tail, x,
+                )
         logger.info(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
             str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
