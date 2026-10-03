@@ -8,7 +8,9 @@ import os
 from unittest import mock
 
 from sglang.srt.environ import envs
+from sglang.srt.managers import weg2_store_told as told
 from sglang.srt.weg2 import arrival_seat_rule as asr
+from sglang.srt.weg2 import front as front_mod
 
 ASR = "SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE"
 
@@ -33,3 +35,16 @@ def test_arrival_seat_rule_explicit_off_still_disables():
         assert asr.enabled({ASR: off}) is False
     assert asr.age_plan_enabled({ASR: "0"}) is False
     assert asr.enabled({ASR: "1"}) is True
+
+
+def test_follower_early_read_empty_value_is_the_default_on():
+    assert told.follower_early_read_on({}) is True
+    assert told.follower_early_read_on({told.ENV_FOLLOWER_EARLY_READ: ""}) is True
+    assert told.follower_early_read_on({told.ENV_FOLLOWER_EARLY_READ: "0"}) is False
+    assert told.follower_early_read_on({told.ENV_FOLLOWER_EARLY_READ: "off"}) is False
+
+
+def test_leg1_early_empty_value_is_the_default_on():
+    assert front_mod.leg1_early_on({}) is True
+    assert front_mod.leg1_early_on({front_mod.LEG1_EARLY_ENV: ""}) is True
+    assert front_mod.leg1_early_on({front_mod.LEG1_EARLY_ENV: "0"}) is False
