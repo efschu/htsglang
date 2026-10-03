@@ -693,7 +693,9 @@ def pp0_grant(sched, req) -> Optional[int]:
     rid = str(getattr(req, "rid", "?"))[:16]
     # Q-670 GRANT-BYPASS: an older request waiting for its card grant does not
     # hold this one back while it is young; past the age the head is the head.
-    older = _older_waits(sched, rid)
+    # pp0_grant runs only where _actor is armed (a dual-layout P rank); the gate is
+    # restated here so the bypass can never reach a flip-form PP0.
+    older = _older_waits(sched, rid) if _dual_layout_env() else []
     if older and not _dpar.grant_may_bypass([t for _r, t in older], now=_now(), age_s=_dpar.head_age_s()):
         _log_wait(rid, tokens)
         return 0
@@ -778,6 +780,11 @@ def _log_wait(rid: str, tokens: int) -> None:
         _CENSUS["waits"] = 0
         _CENSUS["next"] = t + _CENSUS["iv"]
         _CENSUS["iv"] *= 2.0
+
+
+def _dual_layout_env() -> bool:
+    """Q-670: GRANT-BYPASS exists only in the dual layout (SGLANG_WEG2_DUAL_LAYOUT=1)."""
+    return str(os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() == "1"
 
 
 def _older_waits(sched, rid: str) -> list:

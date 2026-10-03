@@ -3393,7 +3393,7 @@ class Group:
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
-                        extra=None, poll_s: float = 0.0) -> int:
+                        extra=None, poll_s: float = 0.0, dual_wake: bool = False) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -3477,14 +3477,18 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
             rounds += 1
         if not inflight:
             return rounds
-        # Q-670: wake every ``poll_s`` while legs run, not only when the queue was
-        # non-empty at this moment. Dual y8w (fs10031623, 16:37:20): weg2-0-144 went
-        # out alone, the queue was empty for 20 ms, the pool slept on its leg (P's
-        # card grant WAIT) for 143 s -- 8 arrivals behind it, a free slot, nothing
-        # dispatched; the OpenWebUI request weg2-0-151 timed out (503).
+        # Q-670 (``dual_wake``, DUAL LAYOUT ONLY): wake every ``poll_s`` while legs
+        # run, not only when the queue was non-empty at this moment. Dual y8w
+        # (fs10031623, 16:37:20): weg2-0-144 went out alone, the queue was empty for
+        # 20 ms, the pool slept on its leg (P's card grant WAIT) for 143 s -- 8
+        # arrivals behind it, a free slot, nothing dispatched; the OpenWebUI request
+        # weg2-0-151 timed out (503). The flip form keeps the old wake byte for byte.
+        if dual_wake:
+            _timeout = poll_s if poll_s > 0 else None
+        else:
+            _timeout = poll_s if (extra is not None and poll_s > 0 and queue) else None
         done, _pending = await asyncio.wait(
-            set(inflight), return_when=asyncio.FIRST_COMPLETED,
-            timeout=(poll_s if poll_s > 0 else None))
+            set(inflight), return_when=asyncio.FIRST_COMPLETED, timeout=_timeout)
         for t in sorted(done, key=seq.__getitem__):
             inflight_tokens -= inflight.pop(t, 0)
             seq.pop(t, None)
@@ -16094,7 +16098,7 @@ class Front:
                 budget=self.p_pool_tokens, stats=_phase_stats,
                 extra=(None if _ro_state is None else
                        (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
-                poll_s=_ro.POLL_S)
+                poll_s=_ro.POLL_S, dual_wake=bool(self.dual_layout))
             if _phase_stats.get("overlap_dispatched"):
                 self.counters["p_read_overlap"] += _phase_stats["overlap_dispatched"]
                 logger.info("WEG2 P-READ-OVERLAP epoch=%d overlap_dispatched=%d dispatched=%d "

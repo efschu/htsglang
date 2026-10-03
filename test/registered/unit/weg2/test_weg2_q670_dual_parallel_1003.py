@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import json
+import logging
 import os
 import tempfile
 import time
@@ -87,7 +88,8 @@ class PoolWakesForArrivals(CustomTestCase):
                 q.append("short")                       # 20 ms after the long one went out
 
             asyncio.ensure_future(arrive())
-            await F._p_drain_pool(q, 2, one, lambda p: None, lambda: True, poll_s=0.05)
+            await F._p_drain_pool(q, 2, one, lambda p: None, lambda: True, poll_s=0.05,
+                                  dual_wake=True)
             return started
 
         started = _run(run())
@@ -162,10 +164,17 @@ class FrontShortBypass(CustomTestCase):
         self.assertEqual(order, ["a", "b"])
 
 
-class Pp0GrantBypass(CustomTestCase):
-    """(1) P, PP0: a grant that fits now is taken past a waiting head; past the age the head is the head."""
+class _Pp0Fixture(CustomTestCase):
+    """Temp card ledgers: D holds all but 96 MiB per card; P PP0 decides the group grant."""
+
+    DUAL_ENV = "1"
 
     def setUp(self):
+        self._env = os.environ.get("SGLANG_WEG2_DUAL_LAYOUT")
+        if self.DUAL_ENV is None:
+            os.environ.pop("SGLANG_WEG2_DUAL_LAYOUT", None)
+        else:
+            os.environ["SGLANG_WEG2_DUAL_LAYOUT"] = self.DUAL_ENV
         S._reset_wait_log()
         self.root = tempfile.mkdtemp(prefix="wkv670p")
         self.paths = []
@@ -190,6 +199,10 @@ class Pp0GrantBypass(CustomTestCase):
     def tearDown(self):
         S.stage_file, S._actor, S._now = self._orig
         S._reset_wait_log()
+        if self._env is None:
+            os.environ.pop("SGLANG_WEG2_DUAL_LAYOUT", None)
+        else:
+            os.environ["SGLANG_WEG2_DUAL_LAYOUT"] = self._env
 
     def _sched(self):
         return types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=0, pp_size=3), waiting_queue=[],
@@ -197,6 +210,10 @@ class Pp0GrantBypass(CustomTestCase):
 
     def _req(self, rid, tokens):
         return types.SimpleNamespace(rid=rid, origin_input_ids=list(range(tokens)), _dual_grant_untold=None)
+
+
+class Pp0GrantBypass(_Pp0Fixture):
+    """(1) P, PP0: a grant that fits now is taken past a waiting head; past the age the head is the head."""
 
     def test_a_small_grant_passes_the_waiting_head_and_is_named(self):
         sched = self._sched()
@@ -236,3 +253,80 @@ class Pp0GrantBypass(CustomTestCase):
         self.t[0] += 61.0                                   # both waited past the age now
         older = S._older_waits(sched, "weg2-0-144")
         self.assertEqual(older, [], "the younger waiter counted against the head: two aged waiters deadlock")
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+class FlipLayoutUnchanged(CustomTestCase):
+    """User order 03.10.: loops happened ONLY on dual NVFP4 -- the flip form (27B INT8
+    row authority, NF) must work byte for byte as on 006cd2955e. Green on base AND fix."""
+
+    def test_flip_drain_pool_does_not_poll_without_a_ro_slot(self):
+        async def run():
+            q = collections.deque(["long"])
+            started = {}
+            t0 = time.monotonic()
+
+            async def one(item):
+                started[item] = time.monotonic() - t0
+                await asyncio.sleep(0.6 if item == "long" else 0.0)
+                return item
+
+            async def arrive():
+                await asyncio.sleep(0.05)
+                q.append("short")
+
+            asyncio.ensure_future(arrive())
+            await F._p_drain_pool(q, 2, one, lambda p: None, lambda: True, poll_s=0.05)
+            return started
+
+        started = _run(run())
+        self.assertIn("short", started)
+        self.assertGreaterEqual(started["short"], 0.5,
+                                "flip form: the pool woke for an arrival (base sleeps on the leg)")
+
+    def test_flip_front_queue_order_is_untouched(self):
+        async def run():
+            f = F.Front(prefill="http://p", decode="http://d", awake="P", tag="flip", store_dir="/tmp",
+                        prefill_sid=0, decode_sid=0, dc_reserve={}, w_s=45.0, weight_chunks=2,
+                        flip_min_work_tokens=1, dual_layout=False)
+            f.queue = collections.deque([_pending("a", 91477), _pending("b", 25, paused=1)])
+            reorder = getattr(f, "_dual_short_reorder", None)
+            moved = [reorder(head_blocked=hb) for hb in (True, False)] if reorder else []
+            return moved, [p.rid for p in f.queue]
+
+        moved, order = _run(run())
+        self.assertFalse(any(moved))
+        self.assertEqual(order, ["a", "b"])
+
+
+class FlipPp0GrantUnchanged(_Pp0Fixture):
+    """pp0_grant without SGLANG_WEG2_DUAL_LAYOUT=1: no older-wait refusal, no GRANT-BYPASS line."""
+
+    DUAL_ENV = None
+
+    def test_newcomer_is_tried_as_on_base_and_nothing_is_named(self):
+        sched = self._sched()
+        head = self._req("weg2-0-144", 91477)
+        self.assertEqual(S.pp0_grant(sched, head), 0)
+        head._dual_kv_wait = True
+        sched._weg2_store_held[head.rid] = head
+        self.t[0] += 61.0                                   # past the dual age bound
+        h = _ListHandler()
+        S.logger.addHandler(h)
+        old = S.logger.level
+        S.logger.setLevel(logging.DEBUG)
+        try:
+            lvl = S.pp0_grant(sched, self._req("weg2-0-160", 25))
+        finally:
+            S.logger.removeHandler(h)
+            S.logger.setLevel(old)
+        self.assertGreater(lvl, 0, "flip form: a newcomer was held behind an aged head (base grants it)")
+        self.assertFalse(any("GRANT-BYPASS" in m for m in h.lines), h.lines)
