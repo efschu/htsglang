@@ -50,6 +50,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
+import dataclasses
 import json
 import os
 import sys
@@ -120,6 +122,9 @@ class SimModel:
     argv: Tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
     source: str = ""
+    #: KV heads of the model (0 = not a KV-head-limited layout); TP beyond it
+    #: replicates KV (a table fact of the model, not a profile name)
+    kv_heads: int = 0
 
 
 #: 27B attention geometry (plan 3.1): 24 Q heads, 4 KV heads.
@@ -139,17 +144,17 @@ MODELS: Dict[str, SimModel] = {m.key: m for m in (
              _27B_BASE + ("--env-d", "SGLANG_WEG2_EXTEND_TRIM_MIB=1200,0,0"),
              {"SGLANG_WEG2_L15": "1", "SGLANG_WEG2_L15_MIB": "c1=7616,c2=1792"},
              "27b.env (27b-base.env, :50 extend trim, :117/:133 L15 c1=7616,c2=1792); ckpt 27 G (plan 3.1, S)"),
-    SimModel("27B-FP8", "qwen27b", "fp8", 25422, _27B_BASE, {}, "27b-fp8.env; du 25422 MiB"),
-    SimModel("27B-NVFP4", "qwen27b", "nvfp4", 18753,
+    SimModel("27B-FP8", "qwen27b", "fp8", 29437, _27B_BASE, {}, "27b-fp8.env; safetensors 29437 MiB (du 25422 is the ZFS-compressed size)"),
+    SimModel("27B-NVFP4", "qwen27b", "nvfp4", 20906,
              _27B_BASE + ("--pp-stage-ratio", "49,8,7", "--pp-attn-stage-ratio", "12,2,2"), {},
-             "27b-nvfp4.env:79; du 18753 MiB"),
+             "27b-nvfp4.env:79; safetensors 20906 MiB (du 18753 is the ZFS-compressed size)"),
     SimModel("27B-GGUF", "qwen27b", "gguf", 13593,
              _27B_BASE + ("--pp-stage-ratio", "42,11,11", "--pp-attn-stage-ratio", "10,3,3"), {},
              "27b-gguf.env:49 (IQ4_XS); du 13593 MiB"),
-    SimModel("27B-NVFP4-DUAL", "qwen27b", "nvfp4", 18753,
+    SimModel("27B-NVFP4-DUAL", "qwen27b", "nvfp4", 20906,
              _27B_BASE + ("--dual-share", "--pp-stage-ratio", "45,10,9", "--pp-attn-stage-ratio", "11,2,3",
                           "--extra-p=--max-running-requests=1 --rank-gpu-memory-mib 8740,3000,3500"),
-             {}, "27b-nvfp4-dual.env:81/90; du 18753 MiB"),
+             {}, "27b-nvfp4-dual.env:81/90; safetensors 20906 MiB"),
     SimModel("NF", "nextflash", "int4-mixed", None,
              ("--weg2-weight-source", "exchange",
               "--pp-stage-ratio", "29,11,8", "--pp-attn-stage-ratio", "7,3,2",
@@ -163,6 +168,10 @@ MODELS: Dict[str, SimModel] = {m.key: m for m in (
               f"--rank-moe-resident-fraction {_NF_FR_D} --rank-user-reserve-mib 0,0,0"),
              {}, "nf.env:90-92,105-107,128-139 (Form A); experts in the host store, no VRAM bound"),
 )}
+
+# the 27B models are KV-head limited (24 Q / 4 KV heads): TP beyond 4 replicates KV
+MODELS = {k: (dataclasses.replace(m, kv_heads=QWEN27B_KV_HEADS) if m.key.startswith("27B") else m)
+          for k, m in MODELS.items()}
 
 #: The release profile file of each model (docker/profiles_release).
 PROFILE_FILES: Dict[str, str] = {
@@ -196,7 +205,7 @@ def models_from_profiles(profiles_dir: str) -> Dict[str, SimModel]:
         m = MODELS[key]
         out[key] = SimModel(m.key, m.profile, m.weight_format, m.ckpt_mib,
                             tuple(profile_args(path)), m.env,
-                            f"{path} (PROFILE_ARGS)")
+                            f"{path} (PROFILE_ARGS)", m.kv_heads)
     return out
 
 
@@ -294,14 +303,17 @@ class CellResult:
                 "details": list(self.details)}
 
 
-_ARGV_CACHE: Dict[int, str] = {}
+_ARGV_CACHE: Dict[Tuple[int, str, str], str] = {}
 
 
-def argv_shape(n: int) -> str:
-    """``--pp-size``/``--tp-size``/``--rank-gpu-id`` of the launcher's real
-    argv builders for ``n`` cards (one sentinel budget per card)."""
-    if n in _ARGV_CACHE:
-        return _ARGV_CACHE[n]
+def argv_shape(n: int, p_window: str = "", d_window: str = "") -> str:
+    """``--pp-size``/``--tp-size``/``--rank-gpu-id`` (and the BAR1 windows) of
+    the launcher's real argv builders for ``n`` cards (one sentinel budget per
+    card). ``p_window`` / ``d_window``: the windows the launch derived (HW-P1c);
+    empty = the builders' shipped defaults."""
+    key = (n, p_window, d_window)
+    if key in _ARGV_CACHE:
+        return _ARGV_CACHE[key]
     from sglang.srt.weg2 import launcher as L
     from sglang.srt.weg2 import topology as T
 
@@ -309,16 +321,19 @@ def argv_shape(n: int) -> str:
         shape = "-"
     else:
         try:
-            p = L.argv_p("py", L.MODEL_DEFAULT, [1] * n, 1, 1, L.RING_FORM_SENTINEL_STORE_CFG, [], p_bs=1)
-            d = L.argv_d("py", L.MODEL_DEFAULT, [1] * n, 1, 1, L.RING_FORM_SENTINEL_STORE_CFG, [], d_bs=1)
+            pk = {"window_mib": p_window} if p_window else {}
+            dk = {"window_mib": d_window} if d_window else {}
+            p = L.argv_p("py", L.MODEL_DEFAULT, [1] * n, 1, 1, L.RING_FORM_SENTINEL_STORE_CFG, [], p_bs=1, **pk)
+            d = L.argv_d("py", L.MODEL_DEFAULT, [1] * n, 1, 1, L.RING_FORM_SENTINEL_STORE_CFG, [], d_bs=1, **dk)
 
             def val(a, flag):
                 return a[a.index(flag) + 1] if flag in a else "?"
             shape = (f"P tp{val(p, '--tp-size')}/pp{val(p, '--pp-size')} "
-                     f"D tp{val(d, '--tp-size')}/pp{val(d, '--pp-size')} ranks {val(d, '--rank-gpu-id')}")
+                     f"D tp{val(d, '--tp-size')}/pp{val(d, '--pp-size')} ranks {val(d, '--rank-gpu-id')} "
+                     f"bar1 P '{val(p, '--barlink-bar1-window-mib')}' D '{val(d, '--barlink-bar1-window-mib')}'")
         except Exception as exc:  # noqa: BLE001 - named in the table, never a crash of the harness
             shape = f"ARGV-ERROR {type(exc).__name__}: {exc}"
-    _ARGV_CACHE[n] = shape
+    _ARGV_CACHE[key] = shape
     return shape
 
 
@@ -340,8 +355,8 @@ def _kernel_notes(model: SimModel, cards: Sequence) -> List[str]:
         elif path not in ("default", "native"):
             notes.append(f"sm{cc[0]}{cc[1]}: {model.weight_format} kernel path '{path}'")
     n = len(cards)
-    if model.profile == "qwen27b" and n > QWEN27B_KV_HEADS:
-        notes.append(f"D = TP{n} > {QWEN27B_KV_HEADS} KV heads: replicated KV / uneven DCP "
+    if model.kv_heads and n > model.kv_heads:
+        notes.append(f"D = TP{n} > {model.kv_heads} KV heads: replicated KV / uneven DCP "
                      "(KV capacity cost, plan 3.1, S)")
     return notes
 
@@ -389,12 +404,59 @@ def simulate(inventory: str, keys: Sequence[str], model: SimModel,
         code = str(exc).split(":", 1)[0]
         cell.refuse(code, str(exc).split(" || ")[0])
         cell.blockers.extend(b.code for b in getattr(cause, "blockers", ()))
-    # 5. calibration inventory
+    # 5. calibration inventory (a live SUBSET of the calibrated cards is DERIVED, HW-P1c)
+    uncalibrated = False
     try:
-        L.inventory_check_line(ns, order)
+        line = L.inventory_check_line(ns, order, env)
+        if line.endswith(" DERIVED"):
+            cell.notes.append("inventory: positional values DERIVED by card class (weg2/inventory_view.py), "
+                              "not measured -- the first boot on these cards is the measurement")
     except L.Weg2LaunchRefused as exc:
         cell.refuse(CI.CODE_UNCALIBRATED, str(exc)[:400])
         cell.blockers.append("UNCALIBRATED")
+        uncalibrated = True
+    # 5b. what main does right after the two checks, on COPIES: install the
+    # derived vectors / cut-pin drop / L15 posts, derive the BAR1 windows; then
+    # the post-condition -- no positional vector of the launch is left at
+    # another card count
+    p_win = d_win = ""
+    ns2, env2 = copy.deepcopy(ns), dict(env)
+    try:
+        if not uncalibrated:
+            for ln in L.apply_inventory_derivation(ns2, order, None, env2):
+                cell.notes.append(ln[:300])
+        try:
+            L.apply_bar1_windows(ns2, order, None)
+        except L.Weg2LaunchRefused as exc:
+            cell.refuse("BAR1-WINDOW", str(exc))
+            cell.blockers.append("BAR1-WINDOW")
+        p_win = str(getattr(ns2, "p_barlink_bar1_window_mib", ""))
+        d_win = str(getattr(ns2, "d_barlink_bar1_window_mib", ""))
+        if not uncalibrated and len(order) >= 2:
+            resid = {k: c for k, c in L.positional_vector_lengths(ns2).items() if c != len(order)}
+            if resid:
+                cell.refuse("PROFILE-VECTORS", "after derivation: " + ", ".join(
+                    f"{k} ({c} entries)" for k, c in sorted(resid.items())))
+                cell.blockers.append("PROFILE-VECTORS")
+        # 5c. the P-chunk stage table and the prefill-graph pool vector are
+        # reference-rig (three-stage) tables: for the live stage count they are
+        # mapped by card class or the launch is refused BY NAME (they sit in
+        # main's early path, before the cards are read, so they read NVML again)
+        if not uncalibrated and len(order) >= 2:
+            with replayed(keys, selection):
+                try:
+                    models_, _src = L.p_chunk_stage_model(
+                        str(getattr(ns2, "p_chunk_model", L.P_CHUNK_MODEL_DEFAULT) or L.P_CHUNK_MODEL_DEFAULT),
+                        str(getattr(ns2, "p_chunk_mscale", L.P_CHUNK_MSCALE_DEFAULT) or L.P_CHUNK_MSCALE_DEFAULT),
+                        L.p_group_stages(), profile=model.profile)
+                    if len(models_) != len(order):
+                        cell.refuse("P-CHUNK-MODEL", f"{len(models_)} stage models for {len(order)} stages")
+                        cell.blockers.append("P-CHUNK-MODEL")
+                except SystemExit as exc:
+                    cell.refuse("P-CHUNK-MODEL", str(exc))
+                    cell.blockers.append("P-CHUNK-MODEL")
+    finally:
+        L.inventory_view_mod.clear_active()
     # 6. weight fit bound (necessary condition)
     if model.ckpt_mib is not None and order:
         room = order[0].total_mib if len(order) == 1 else sum(c.total_mib for c in order)
@@ -418,7 +480,7 @@ def simulate(inventory: str, keys: Sequence[str], model: SimModel,
     except Exception as exc:  # noqa: BLE001 - a planner error is a named note, never a crash
         cell.notes.append(f"planner preset: ERROR {type(exc).__name__}: {exc}")
     # 8. argv shape
-    cell.argv = argv_shape(len(order))
+    cell.argv = argv_shape(len(order), p_win, d_win)
     # de-dup blockers, keep order
     seen: List[str] = []
     for b in cell.blockers:

@@ -15394,7 +15394,10 @@ class Front:
         tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
         grant, per_tok, weights, step_tok = 0, 0.0, 0, 0
         stages = []
-        for r in range(3):
+        # HW-P1c 1003 (DUAL-FRONT-STAGES): one stage file per P stage = per card;
+        # at most 3 on the reference rig (range(3) as before), more cards read
+        # theirs too. A missing file is skipped below, so N < 3 needs no change.
+        for r in range(max(3, len(self.dual_kv_ledgers or ()))):
             try:
                 with open(_pk.stage_file(tag, r)) as f:
                     t = json.load(f)
