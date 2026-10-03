@@ -20589,6 +20589,11 @@ class Scheduler(
                                     # a cap-0 rank refills from L2: it offers
                                     # only tips whose chain is L2-backed
                                     require_l2=_l15_tree_l2,
+                                    # L15-UNHOLDABLE: every rank tests the
+                                    # agreed tips against its tree, a second
+                                    # gather keeps those ALL ranks can hold
+                                    probe=lambda _r: l15_bind.tree_probe(
+                                        _r, self.tree_cache),
                                 )
                         except Exception as _exc:  # noqa: BLE001 -- no tree candidates
                             _l15_tree_reqs = []
