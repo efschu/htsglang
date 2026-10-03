@@ -28,7 +28,6 @@ THE RULES (all pure here; the callers act):
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional, Sequence
 
 #: a request counts as short at or below this many UNCACHED tokens
@@ -41,24 +40,58 @@ HEAD_AGE_DEFAULT = 60.0
 BYPASS_MARK = "DUAL SHORT-BYPASS"
 FIRST_MARK = "DUAL SHORT-FIRST"
 GRANT_MARK = "P-KV GRANT-BYPASS"
+STALE_MARK = "DUAL RESUME-STALE-LEDGER"
 
 
 def short_tokens(env=None) -> int:
-    e = os.environ if env is None else env
+    """``env``: a plain mapping (tests); None reads ``envs`` (environ.py)."""
+    if env is None:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_DUAL_SHORT_BYPASS_TOKENS.get()))
     try:
-        v = int(e.get(SHORT_ENV, "") or SHORT_DEFAULT)
+        v = int(env.get(SHORT_ENV, "") or SHORT_DEFAULT)
     except ValueError:
         return SHORT_DEFAULT
     return max(0, v)
 
 
 def head_age_s(env=None) -> float:
-    e = os.environ if env is None else env
+    if env is None:
+        from sglang.srt.environ import envs
+
+        return max(0.0, float(envs.SGLANG_WEG2_DUAL_BYPASS_HEAD_AGE_S.get()))
     try:
-        v = float(e.get(HEAD_AGE_ENV, "") or HEAD_AGE_DEFAULT)
+        v = float(env.get(HEAD_AGE_ENV, "") or HEAD_AGE_DEFAULT)
     except ValueError:
         return HEAD_AGE_DEFAULT
     return max(0.0, v)
+
+
+def resume_stale_s() -> float:
+    """Q-680: how long a paused head may wait on nothing but "P committed"
+    while P is idle before the front reads the ledger as stale."""
+    from sglang.srt.environ import envs
+
+    return max(0.0, float(envs.SGLANG_WEG2_DUAL_RESUME_STALE_S.get()))
+
+
+def resume_stale(per, *, p_idle: bool) -> bool:
+    """Q-680: the card rows (pressure, P committed, D demand) hold a paused head
+    ONLY by "P committed" -- no pressure, no D demand, at least one P byte --
+    while P has no leg in flight. That P byte belongs to no request: a stale
+    ledger (dual y8w 16:45:42, follower load-back lock), not a reason to wait."""
+    if not p_idle or not per:
+        return False
+    held = False
+    for row in per:
+        if row is None:
+            return False
+        pressure, p_committed, d_demand = row
+        if int(pressure) or int(d_demand):
+            return False
+        held = held or int(p_committed) > 0
+    return held
 
 
 def _paused(p: Any) -> bool:

@@ -15554,6 +15554,7 @@ class Front:
         head = self.queue[0] if self.queue else None
         if head is None or int(getattr(head, "dual_paused_n", 0) or 0) <= 0:
             return False
+        from sglang.srt.weg2 import dual_parallel as _dpar
         from sglang.srt.weg2.card_kv_ledger import p_resume_ready
 
         try:
@@ -15572,6 +15573,24 @@ class Front:
         if getattr(self, "_dual_resume_wait_since", None) is None:
             self._dual_resume_wait_since = now
             self._dual_resume_log_next = 0.0
+        # Q-680: never unbounded on a stale ledger. Dual y8w fs10031623 16:45:42:
+        # PP1/PP2 kept 201/302 MB committed for no request (an undrained load-back
+        # lock held their release), P idle -- RESUME-WAIT 905 s, 0 requests served.
+        if _dpar.resume_stale(per, p_idle=not self._dual_inflight):
+            if getattr(self, "_dual_resume_stale_since", None) is None:
+                self._dual_resume_stale_since = now
+            stale_s = now - self._dual_resume_stale_since
+            if stale_s >= _dpar.resume_stale_s():
+                self.counters["dual_resume_stale"] += 1
+                logger.warning("WEG2 %s rid=%s after %.1f s (waited %.1f s): P idle, no leg in flight, "
+                               "only 'P committed' holds -- per card (pressure, P committed, D demand) = %s "
+                               "-- resuming (Q-680)", _dpar.STALE_MARK, head.rid, stale_s,
+                               now - self._dual_resume_wait_since, per)
+                self._dual_resume_wait_since = None
+                self._dual_resume_stale_since = None
+                return False
+        else:
+            self._dual_resume_stale_since = None
         if now >= getattr(self, "_dual_resume_log_next", 0.0):
             self._dual_resume_log_next = now + self.DUAL_PRESSURE_LOG_S
             logger.info("WEG2 DUAL RESUME-WAIT rid=%s waited %.1f s: per card (pressure, P committed, "

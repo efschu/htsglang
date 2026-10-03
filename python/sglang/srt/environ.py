@@ -654,6 +654,19 @@ class Envs:
     # The pages stay COMPLETE in the arena until a claim needs their slot.
     # Inert outside SGLANG_WEG2_DUAL_LAYOUT=1 + SGLANG_WEG2_GROUP=P.
     SGLANG_WEG2_ENABLE_DUAL_ANCHOR_RELEASE = EnvBool(True)
+    # Q-670 DUAL-PARALLEL (weg2.dual_parallel; dual layout only): a request
+    # counts as short at or below DUAL_SHORT_BYPASS_TOKENS uncached tokens and
+    # may pass a paused or long head; a head is overtaken for at most
+    # DUAL_BYPASS_HEAD_AGE_S seconds (front SHORT-FIRST and PP0 GRANT-BYPASS),
+    # then newcomers wait behind it again.
+    SGLANG_WEG2_DUAL_SHORT_BYPASS_TOKENS = EnvInt(8192)
+    SGLANG_WEG2_DUAL_BYPASS_HEAD_AGE_S = EnvFloat(60.0)
+    # Q-680 DUAL RESUME-STALE-LEDGER (dual y8w fs10031623 16:45:42: two P
+    # followers kept 201/302 MB committed for 905 s, the front's RESUME-WAIT
+    # held the whole queue): when P is idle (no leg in flight) and the only
+    # thing a paused head waits for is "P committed" -- no pressure, no D
+    # demand -- for this many seconds, the front resumes it.
+    SGLANG_WEG2_DUAL_RESUME_STALE_S = EnvFloat(10.0)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,

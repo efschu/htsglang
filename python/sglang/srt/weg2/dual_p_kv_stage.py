@@ -1026,8 +1026,35 @@ def flush_acks_when_idle(sched) -> bool:
         return False
     if not getattr(sched, "enable_hierarchical_cache", False):
         return False
-    sched.tree_cache.flush_write_through_acks()
+    tree = sched.tree_cache
+    tree.flush_write_through_acks()
+    drain_idle_load_acks(sched, tree)
     return True
+
+
+def drain_idle_load_acks(sched, tree) -> int:
+    """Q-680 IDLE-LOAD-ACK (dual P): an idle P stage drains its load-back acks
+    too. The load-back lock (``ongoing_load_back``) is released only by
+    ``loading_check``, which the batch path polls per microbatch; a follower
+    whose request finished in the very pass that loaded its prefix goes idle and
+    never polls again. Dual y8w fs10031623 16:45:43: PP1/PP2 loaded weg2-0-220's
+    39099-row prefix, the request finished, and the lock stayed (lock census
+    ongoing_lb=1 tracked_protected=39168 until 17:02) -- on_idle never released
+    (protected > 0), PP1/PP2 kept 201/302 MB committed for 905 s, the front's
+    RESUME-WAIT held every request (900-s timeouts). Rank-local (#737)."""
+    ongoing = getattr(tree, "ongoing_load_back", None)
+    check = getattr(tree, "loading_check", None)
+    if not ongoing or check is None:
+        return 0
+    n0 = len(ongoing)
+    check()
+    done = n0 - len(getattr(tree, "ongoing_load_back", None) or ())
+    if done > 0:
+        logger.info("%s P-KV IDLE-LOAD-ACK pp_rank=%s drained=%d left=%d: an idle P stage released the "
+                    "load-back lock(s) the batch path no longer polls (Q-680)", MARK,
+                    getattr(getattr(sched, "ps", None), "pp_rank", "?"), done,
+                    len(getattr(tree, "ongoing_load_back", None) or ()))
+    return done
 
 
 def _idle_marker(tag: str, root: str = "/dev/shm") -> str:
@@ -1129,6 +1156,32 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
     return True
 
 
+IDLE_HELD_LOG_S = 30.0
+
+
+def _note_idle_held(sched, actor, tree) -> None:
+    """Q-680: an idle P rank whose release is held names why, every 30 s -- a
+    held mapping keeps 'P committed' on the card and the front's RESUME-WAIT
+    reads it (dual y8w: 905 s without one line saying so)."""
+    import time as _t
+
+    now = _t.time()
+    if now - float(getattr(sched, "_dual_idle_held_log_t", 0.0) or 0.0) < IDLE_HELD_LOG_S:
+        return
+    sched._dual_idle_held_log_t = now
+    try:
+        prot = int(getattr(tree, "protected_size", lambda: 0)() or 0)
+        evict = int(tree.evictable_size() or 0)
+    except Exception:  # noqa: BLE001 -- an instrument never raises
+        prot = evict = -1
+    logger.warning("%s P-KV IDLE-HELD pp_rank=%s mapped=%d committed=%d B protected=%d evictable=%d "
+                   "ongoing_load_back=%d ongoing_write_through=%d: the idle release waits for these",
+                   MARK, getattr(getattr(sched, "ps", None), "pp_rank", "?"), int(actor.mapped_tokens),
+                   int(getattr(actor, "_committed", 0) or 0), prot, evict,
+                   len(getattr(tree, "ongoing_load_back", None) or ()),
+                   len(getattr(tree, "ongoing_write_through", None) or ()))
+
+
 def on_idle(sched) -> int:
     """A fully idle P rank gives its whole context back: device tree evicted
     (write-back keeps the pages in L2), then unmapped and released."""
@@ -1148,6 +1201,7 @@ def on_idle(sched) -> int:
             if ev > 0:
                 tree.evict(EvictParams(num_tokens=ev))
             if int(tree.evictable_size() or 0) > 0 or int(getattr(tree, "protected_size", lambda: 0)() or 0) > 0:
+                _note_idle_held(sched, actor, tree)
                 return 0  # still held (write-back in flight / locked): next idle pass
         except Exception as exc:  # noqa: BLE001 -- a failed flush keeps the pages, never frees under them
             logger.warning("%s idle flush skipped: %r", MARK, exc)
