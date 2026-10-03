@@ -879,7 +879,9 @@ def return_untold_grant(sched, req, why: str) -> int:
     147456) tokens x 4096 / 6144 B -- the front's RESUME-WAIT never saw all
     zeros (210.8 s, up to 1441 s), long requests ran into the client timeout.
     Returns the bytes given back."""
-    untold = req._dual_grant_untold
+    # getattr: the flip form reaches this through the Q-580 / publish-loop drops with
+    # any Req-like; a request that never took a dual grant carries none
+    untold = getattr(req, "_dual_grant_untold", None)
     if not untold:
         return 0
     req._dual_grant_untold = None

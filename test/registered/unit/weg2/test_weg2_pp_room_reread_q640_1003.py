@@ -65,7 +65,8 @@ class _Tree:
 
 
 def _on():
-    return mock.patch.dict(os.environ, {SF.ENV: "1"})
+    # Q-640b: the re-read rounds are the dual layout's (flip form / NF keep one round)
+    return mock.patch.dict(os.environ, {SF.ENV: "1", "SGLANG_WEG2_DUAL_LAYOUT": "1"})
 
 
 class TheRoomVerdictRereadsTheEvictableSet(CustomTestCase):
