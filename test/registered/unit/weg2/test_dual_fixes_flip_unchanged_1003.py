@@ -23,11 +23,14 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-695  #791T probe old-instance chunk / old chunk abort store release / #791C new-instance named
   Q-696  D live cache yield + regrow hold (D tick without the dual actor) / front INTAKE-STALL
          card WAIT (drain ends as before) and STALL-BYPASS / wedge class P-KV-WAIT (no post skip)
+  Q-800  DUAL-SHARE: PP0 chunk cap, share duty, D capture priority, MPS client priority,
+         front controller/admin route/leg hooks (weg2/dual_share.py)
 """
 from __future__ import annotations
 
 import asyncio
 import collections
+import inspect
 import os
 import tempfile
 import time
@@ -725,3 +728,97 @@ class TestQ696FlipUnchanged:
                 continue
             with mock.patch.object(PK, "stage_file", boom):
                 assert DCS.p_kv_wait_class(sched, env) is None, env
+
+
+# ---------------------------------------------------------------------------------- Q-800
+
+def _q800_wrong_gates():
+    """Every wrong gate, also WITH the share knobs that only the dual launcher sets
+    on the wrong group: none of them arms a DUAL-SHARE hook."""
+    from sglang.srt.weg2 import dual_share as DS
+
+    out = []
+    for env in _wrong_gates():
+        out.append(dict(env))
+        out.append(dict(env, **{DS.ACT_ENV: "chunk,duty", DS.BUCKETS_ENV: "512"}))
+        if (env.get("SGLANG_WEG2_GROUP") or "").upper() != "D":
+            out.append(dict(env, **{DS.D_CAPTURE_PRIO_ENV: "1"}))
+    return out
+
+
+class TestQ800FlipUnchanged:
+    """DUAL-SHARE (item 800): P/D precedence. Flip/NF/27B-INT8 never pass the
+    launcher's --dual-layout + --dual-priority / --dual-d-capture-prio /
+    --dual-p-mps-low-prio, so no rank gets SGLANG_WEG2_DUAL_SHARE_CTL /
+    _DUTY / _D_CAPTURE_PRIO and the front builds no controller."""
+
+    def test_no_chunk_cap_and_identity_width(self):
+        from sglang.srt.weg2 import dual_share as DS
+
+        for env in _q800_wrong_gates():
+            for first in (True, False):
+                assert DS.maybe_chunk_cap(env, first_pp_rank=first, chunked_prefill_size=1024, page=64,
+                                          planner_buckets=(512,)) is None, env
+        sched = SimpleNamespace()
+        for w in (None, 0, 128, 1024, 16384):
+            assert DS.apply_chunk_cap(sched, w) == w
+        assert vars(sched) == {}
+
+    def test_no_duty_actuator_and_the_pp_site_stays_on_the_old_env(self):
+        from sglang.srt.managers import scheduler_pp_mixin as PPM
+        from sglang.srt.weg2 import dual_share as DS
+
+        for env in _q800_wrong_gates():
+            assert DS.ShareDuty.from_env(env) is None, env
+        src = inspect.getsource(PPM)
+        assert ('if (os.environ.get("SGLANG_WEG2_DUAL_P_DUTY")\n'
+                '                     or os.environ.get("SGLANG_WEG2_DUAL_SHARE_DUTY")) else None)') in src
+
+    def test_no_d_capture_stream(self):
+        from sglang.srt.distributed import parallel_state as PS
+        from sglang.srt.weg2 import dual_share as DS
+
+        for env in _q800_wrong_gates():
+            with mock.patch.dict(os.environ, env, clear=False):
+                assert DS.d_capture_armed() is False, env
+                assert DS.d_capture_stream() is None, env  # torch untouched: the stock Stream() is taken
+        src = inspect.getsource(PS.graph_capture)
+        assert "if stream is None:" in src and "_dsh.d_capture_stream()" in src
+
+    def test_launcher_flip_form_is_byte_identical(self):
+        from sglang.srt.weg2 import launcher as L
+
+        for extra in ((), ("--idle-layout", "pp"), ("--flip-weights", "resident")):
+            ns = L.build_parser().parse_args(["--tree", "/x", "--tag", "t", *extra])
+            L.resolve_dual_layout(ns)
+            assert L.dual_priority_env(ns, "P") == {} and L.dual_priority_env(ns, "D") == {}
+            assert L.dual_priority_front_argv(ns) == []
+            argv = L.front_argv_for("py", "/s", 1, 2, {}, [], ns, 0, 0, 8, 8, 4096, 4096, "D")
+            assert not any(a.startswith("--dual-") for a in argv), argv
+
+    def test_flip_front_builds_no_controller(self):
+        f = _front(dual=False)
+        assert getattr(f, "_dual_share", None) is None
+        src = inspect.getsource(F.main)
+        assert "front._dual_share = (_dual_share_mod.FrontShare.from_args(" in src
+        assert "if front.dual_layout else None)" in src
+        assert 'if getattr(front, "_dual_share", None) is not None:  # DUAL-SHARE admin switch' in src
+        # every serving hook is behind the same None test
+        fsrc = inspect.getsource(F.Front)
+        n_hooks = fsrc.count("self._dual_share.note_")
+        assert n_hooks == 5 and fsrc.count('if getattr(self, "_dual_share", None) is not None:') >= n_hooks
+
+    def test_flip_leg_hooks_write_nothing(self):
+        from sglang.srt.weg2 import dual_share as DS
+
+        f = _front(dual=False)
+        assert DS.FrontShare.from_args(ctl="", mode="", actuators="chunk", d_min_rate_tps=0.0,
+                                       p_min_share=0.25) is None
+        assert not hasattr(f, "_dual_share") or f._dual_share is None
+
+    def test_scheduler_cap_is_behind_the_init_none(self):
+        from sglang.srt.managers import scheduler as SC
+
+        src = inspect.getsource(SC.Scheduler)
+        assert ('if getattr(self, "_dual_share_chunk", None) is not None:\n'
+                '            chunked_prefill_size = _weg2_dual_share.apply_chunk_cap(') in src

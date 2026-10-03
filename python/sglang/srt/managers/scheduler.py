@@ -255,6 +255,7 @@ from sglang.srt.weg2 import tail_adopt as _weg2_tail_adopt
 from sglang.srt.weg2 import dual_d_priority as _weg2_dual_d_priority  # D HOLD FOR GROW (dual D)
 from sglang.srt.weg2 import dual_handback_defer as _weg2_hbd  # D-HANDBACK-DEFER (dual D)
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
+from sglang.srt.weg2 import dual_share as _weg2_dual_share  # DUAL-SHARE chunk cap (None = off)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
 from sglang.srt.managers.pp_admission_congruence import (
@@ -3465,6 +3466,28 @@ class Scheduler(
 
         self._p_chunk_stream = self._p_chunk_planner is not None and _pcnf.budget_is_stream(
             os.environ
+        )
+        # DUAL-SHARE stage 1c/2 (weg2/dual_share.py, item 800): PP0's chunk cap
+        # from the front's share rung. None unless the launcher handed this
+        # rank SGLANG_WEG2_DUAL_SHARE_CTL (dual layout, --dual-priority) -- the
+        # flip/NF/27B-INT8 forms never set it, so they stay byte-identical.
+        from sglang.srt.weg2 import dual_share as _dsh
+
+        self._dual_share_chunk = (
+            _dsh.maybe_chunk_cap(
+                os.environ,
+                first_pp_rank=self.ps.pp_rank == 0,
+                chunked_prefill_size=self.chunked_prefill_size,
+                page=self.page_size,
+                planner_buckets=(
+                    self._p_chunk_planner.spec.limits.graph_buckets
+                    if self._p_chunk_planner is not None
+                    else ()
+                ),
+                log=logger.info,
+            )
+            if os.environ.get(_dsh.CTL_ENV)
+            else None
         )
 
         # Init the dynamic chunking predictor for PP
@@ -16151,6 +16174,12 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.dynamic_chunked_prefill_size()
+        # DUAL-SHARE (weg2/dual_share.py): PP0 caps the width by the share
+        # rung; identity unless the cap was armed at init (dual layout only).
+        if getattr(self, "_dual_share_chunk", None) is not None:
+            chunked_prefill_size = _weg2_dual_share.apply_chunk_cap(
+                self, chunked_prefill_size
+            )
 
         # #656 item 15a, AT THE PREFILL ALLOCATION SITE (register C17).
         #

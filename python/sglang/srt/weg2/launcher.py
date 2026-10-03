@@ -14196,6 +14196,7 @@ def resolve_dual_layout(ns) -> None:
         print("WEG2-DUAL --dual-share implies --dual-layout", flush=True)
         ns.dual_layout = True
     dual = bool(getattr(ns, "dual_layout", False))
+    refuse_dual_priority(ns)  # DUAL-SHARE: no-op unless one of its switches is set
     if not dual:
         if str(getattr(ns, "dual_mps", "off")) == "on":
             raise Weg2DualLayoutRefused(
@@ -14500,6 +14501,96 @@ def dual_p_sm_env(ns) -> Dict[str, str]:
     if pct >= 100 or not getattr(ns, "dual_layout", False) or str(getattr(ns, "dual_mps", "off")) != "on":
         return {}
     return {"CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(pct)}
+
+
+#: DUAL-SHARE --dual-priority modes (weg2/dual_share.MODES).
+DUAL_PRIORITY_MODES = ("p", "balanced", "d", "dynamic")
+
+
+def dual_priority_armed(ns) -> bool:
+    """Any DUAL-SHARE switch set (each default off)."""
+    return (getattr(ns, "dual_priority", None) is not None
+            or str(getattr(ns, "dual_d_capture_prio", "off")) == "on"
+            or str(getattr(ns, "dual_p_mps_low_prio", "off")) == "on")
+
+
+def _read_driver_text() -> Optional[str]:
+    try:
+        with open("/proc/driver/nvidia/version") as f:
+            return f.read(4096)
+    except OSError:
+        return None
+
+
+def dual_priority_env(ns, group: str, log=None) -> Dict[str, str]:
+    """DUAL-SHARE (item 800): one group's env of the P/D share switches. {} for
+    every switch left off, and {} outside --dual-layout (resolve_dual_layout
+    refuses the switches there by name)."""
+    if not getattr(ns, "dual_layout", False):
+        return {}
+    from sglang.srt.weg2 import dual_share as _dsh
+
+    env: Dict[str, str] = {}
+    if group == "D":
+        if str(getattr(ns, "dual_d_capture_prio", "off")) == "on":
+            env[_dsh.D_CAPTURE_PRIO_ENV] = "1"
+        return env
+    mode = getattr(ns, "dual_priority", None)
+    if mode is not None:
+        acts = _dsh.parse_actuators(str(getattr(ns, "dual_share_actuators", "chunk") or "chunk"))
+        env[_dsh.CTL_ENV] = _dsh.ctl_path(ns.tag)
+        env[_dsh.ACT_ENV] = ",".join(acts)
+        if p_prefill_graph_buckets():
+            env[_dsh.BUCKETS_ENV] = ",".join(str(b) for b in p_prefill_graph_buckets())
+        if "duty" in acts:
+            env[_dsh.DUTY_ENV] = "1"
+    if str(getattr(ns, "dual_p_mps_low_prio", "off")) == "on":
+        penv, line = _dsh.mps_client_priority_env(
+            mps_on=str(getattr(ns, "dual_mps", "off")) == "on", driver_text=_read_driver_text())
+        env.update(penv)
+        if log is not None:
+            log(line)
+    return env
+
+
+def dual_priority_front_argv(ns) -> List[str]:
+    """DUAL-SHARE: the front's controller terms ([] unless --dual-priority)."""
+    mode = getattr(ns, "dual_priority", None)
+    if mode is None or not getattr(ns, "dual_layout", False):
+        return []
+    from sglang.srt.weg2 import dual_share as _dsh
+
+    return ["--dual-priority", str(mode), "--dual-share-ctl", _dsh.ctl_path(ns.tag),
+            "--dual-d-min-rate-tps", f"{float(getattr(ns, 'dual_d_min_rate_tps', 0.0)):g}",
+            "--dual-p-min-share", f"{float(getattr(ns, 'dual_p_min_share', 0.25)):g}",
+            "--dual-share-actuators",
+            ",".join(_dsh.parse_actuators(str(getattr(ns, "dual_share_actuators", "chunk") or "chunk")))]
+
+
+def refuse_dual_priority(ns) -> None:
+    """DUAL-SHARE: named refusals before any launch."""
+    if not dual_priority_armed(ns):
+        return
+    if not getattr(ns, "dual_layout", False):
+        raise Weg2DualLayoutRefused(
+            "DUAL-SHARE: --dual-priority / --dual-d-capture-prio / --dual-p-mps-low-prio need --dual-layout "
+            "(the P/D share exists only while both groups run at once; the flip form stays untouched)")
+    from sglang.srt.weg2 import dual_share as _dsh
+
+    try:
+        acts = _dsh.parse_actuators(str(getattr(ns, "dual_share_actuators", "chunk") or "chunk"))
+    except ValueError as e:
+        raise Weg2DualLayoutRefused(str(e))
+    share = float(getattr(ns, "dual_p_min_share", 0.25))
+    if not (0.0 < share <= 1.0):
+        raise Weg2DualLayoutRefused(f"DUAL-SHARE: --dual-p-min-share {share} outside (0, 1]")
+    if float(getattr(ns, "dual_d_min_rate_tps", 0.0)) < 0.0:
+        raise Weg2DualLayoutRefused("DUAL-SHARE: --dual-d-min-rate-tps must be >= 0")
+    if (getattr(ns, "dual_priority", None) is not None and "duty" in acts
+            and float(getattr(ns, "dual_p_duty", 1.0)) < 1.0):
+        raise Weg2DualLayoutRefused(
+            "DUAL-SHARE: --dual-share-actuators duty with --dual-p-duty below 1 -- two duty throttles on "
+            "PP0; take one (the share duty follows the rung, --dual-p-duty is constant)")
 
 
 def start_dual_mps(ns, log, dry: bool) -> Dict[str, str]:
@@ -21849,6 +21940,29 @@ def build_parser() -> argparse.ArgumentParser:
                          "(risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs "
                          "~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. "
                          "100 = no limit.")
+    # DUAL-SHARE (weg2/dual_share.py, item 800, user order 03.10. ~18:55-19:15Z):
+    # P vs D precedence selectable and dynamic. Every switch alone, default off =
+    # launcher argv/env byte-identical; refused by name outside --dual-layout.
+    ap.add_argument("--dual-priority", choices=DUAL_PRIORITY_MODES, default=None,
+                    help="DUAL-SHARE stage 2: the front's P/D share controller writes a rung (P's share "
+                         "1.0/0.75/0.5/0.25, profile env SGLANG_WEG2_DUAL_SHARE_RUNGS) to <busy>.ctl; P acts "
+                         "through --dual-share-actuators. p = P full (today), balanced/d = a static rung while "
+                         "D decodes, dynamic = matrix of tau (queued prefill tokens / P full rate) x D bs. "
+                         "Switchable at runtime: POST /weg2/dual-priority on the front. Unset = off.")
+    ap.add_argument("--dual-d-min-rate-tps", type=float, default=0.0,
+                    help="DUAL-SHARE: D's minimum decode rate per request (tok/s, measured from the leg-2 "
+                         "token stream); below it the rung steps toward D. 0 = off.")
+    ap.add_argument("--dual-p-min-share", type=float, default=0.25,
+                    help="DUAL-SHARE: floor of P's share (rungs below it are never used).")
+    ap.add_argument("--dual-share-actuators", default="chunk",
+                    help="DUAL-SHARE: comma list of P actuators: chunk (PP0's chunk cap), duty (P duty throttle "
+                         "at the rung's fraction), green (stage 3, NOT built: named fallback to chunk).")
+    ap.add_argument("--dual-d-capture-prio", choices=("off", "on"), default="off",
+                    help="DUAL-SHARE stage 1a: D captures its CUDA graphs on the device's highest-priority "
+                         "stream (graph nodes keep the capture stream's priority). Group D of the dual layout only.")
+    ap.add_argument("--dual-p-mps-low-prio", choices=("off", "on"), default="off",
+                    help="DUAL-SHARE stage 1b: P starts with CUDA_MPS_CLIENT_PRIORITY=1 (below normal; read at "
+                         "connect, boot only). Needs --dual-mps on, else a named W-DUAL-SHARE-FALLBACK line.")
     ap.add_argument("--dual-p-sleep", choices=("off", "on"), default=None,
                     help="DEFAULT: ON with --dual-share, OFF otherwise (since gmps12, "
                          "dkr27bnvfp4dual1mpsleepbar1fs10020008: P slept and woke under --dual-share on all three "
@@ -26290,6 +26404,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     spec_p.env.update(dual_p_sm_env(ns))
     spec_p.env.update(dual_duty_env(ns))
     spec_p.env.update(dual_share_env(ns, "P"))
+    spec_p.env.update(dual_priority_env(ns, "P", log))  # DUAL-SHARE: {} unless a switch is on
     launch_group(spec_p, tree, log, dry)
     ns._dual_spec_d = None
     if getattr(ns, "dual_share", False):
@@ -26308,6 +26423,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"WEG2-DUAL-SHARE P cut for D's image filter: {_pcut or '(none -> whole image)'}")
         _sd, _ = _d_spec_from(_dual_dc, "D(dual-share, P-Plan)", _denv)
         _sd.env.update(ns._dual_mps_env)
+        _sd.env.update(dual_priority_env(ns, "D", log))  # DUAL-SHARE: {} unless a switch is on
         state.argv["D"] = " ".join(shlex.quote(a) for a in _sd.argv)
         launch_group(_sd, tree, log, dry)
         ns._dual_spec_d = _sd
@@ -26583,6 +26699,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         spec_d, _ = _d_spec_from(dc_p, "D")
         state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
         spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})
+        spec_d.env.update(dual_priority_env(ns, "D", log))  # DUAL-SHARE: {} unless a switch is on
         launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
     _write_state(state)
@@ -27160,7 +27277,7 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + (
         ["--dual-layout"] if getattr(ns, "dual_layout", False) else []) + (
         ["--dual-dbusy-file", dual_duty_env(ns)["SGLANG_WEG2_DUAL_DBUSY_FILE"]]
-        if dual_duty_env(ns) else []) + (
+        if dual_duty_env(ns) else []) + dual_priority_front_argv(ns) + (
         ["--dual-kv-ledgers", ",".join(dual_kv_ledger_paths(ns, cards))]
         if dual_kv_ledger_paths(ns, cards) else []) + [
         "--carrier-max-tokens", str(carrier_max_tokens),
