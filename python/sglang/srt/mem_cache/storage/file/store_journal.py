@@ -116,8 +116,14 @@ def parse_lines(data: bytes) -> Tuple[List[Record], Optional[str]]:
         parts = s.split(" ", 3)
         if len(parts) != 4 or parts[0] not in ("R", "C", "A", "E"):
             continue
+        stem = parts[3]
+        # A torn tail (rank killed mid-append, the filesystem zero-fills the block)
+        # leaves NUL bytes in the last line; such a stem names no page and would
+        # make every later os.* call on it raise ValueError -- drop the record.
+        if not stem or "\x00" in stem or "/" in stem:
+            continue
         try:
-            out.append((float(parts[1]), parts[0], int(parts[2]), parts[3]))
+            out.append((float(parts[1]), parts[0], int(parts[2]), stem))
         except ValueError:
             continue
     return out, boot

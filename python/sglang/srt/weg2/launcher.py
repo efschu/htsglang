@@ -7344,7 +7344,7 @@ def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
     def _stat(stem):
         try:
             st = os.lstat(_sj.page_path(directory, stem))
-        except OSError:
+        except (OSError, ValueError):  # ValueError: a stem os.* cannot name (NUL byte)
             return None
         return (st.st_mtime, st.st_blocks * 512)
 
