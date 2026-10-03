@@ -191,6 +191,11 @@ h2 .muted, .muted { color: var(--muted); font-weight: 400; }
    Arbeit = volle Farbe; Flip = eigene Hues (violett P→D, magenta D→P); Nachlauf = violette Schraffur;
    Leerlauf = hell mit Umriss; aus/lädt/tot = dunkles Neutral; unbekannt = graue Streifen. */
 .ph-k-P { background: var(--s1); } .ph-k-D { background: var(--s2); } .ph-k-dec { background: var(--s3); }
+/* Dual (27B NVFP4 Dual, Nutzer 03.10. ~17:50Z): P prefillt und D arbeitet GLEICHZEITIG -- beide Farben
+   übereinander, diagonal schraffiert (P-Blau über D-Decode bzw. D-Prefill); nur ein Dual-Boot trägt solche
+   Segmente (activity.Model co), die Flip-Linien bleiben einfarbig */
+.ph-k-P.co-dec, .ph-k-Pdec { background: repeating-linear-gradient(135deg, var(--s1) 0 5px, var(--s3) 5px 10px); }
+.ph-k-P.co-D, .ph-k-PD { background: repeating-linear-gradient(135deg, var(--s1) 0 5px, var(--s2) 5px 10px); }
 .ph-k-flip_pd { background: var(--s7); }
 .ph-k-flip_dp { background: var(--s5); }
 .ph-k-flip_tail { background: repeating-linear-gradient(135deg, var(--s7) 0 3px, color-mix(in srgb, var(--s7) 22%, var(--surface)) 3px 7px); }
@@ -739,7 +744,9 @@ function bsBadge(d, on) {
 // ---- phase bar: P-Prefill / D-Prefill / Decode runs and the flips between them
 const PHASE = {P: ["P-Prefill"], D: ["D-Prefill/Extend"], dec: ["D-Decode"], flip_pd: ["Flip P→D"], flip_dp: ["Flip D→P"],
   flip_tail: ["Flip-Nachlauf"], vis_load: ["Vision laden"], vis_enc: ["Vision rechnen"], vis_unload: ["Vision entladen"],
-  idle: ["Leerlauf"], off: ["aus/lädt/tot"], unknown: ["unbekannt"]};
+  idle: ["Leerlauf"], off: ["aus/lädt/tot"], unknown: ["unbekannt"],
+  Pdec: ["P-Prefill + D-Decode gleichzeitig"], PD: ["P-Prefill + D-Prefill gleichzeitig"]};
+const CO_KEY = {dec: "Pdec", D: "PD"};      // dual: P segment with D's simultaneous work (seg.co)
 const PHASE_ORDER = ["P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "vis_load", "vis_enc", "vis_unload", "idle", "off", "unknown"];
 const VIS_TIP = {vis_load: "Tower bauen + KV-Tail reservieren + Gewichte laden", vis_enc: "Bild-Encoder + Embeddings anh&auml;ngen",
   vis_unload: "Tower abbauen, KV-Tail zur&uuml;ckgeben"};
@@ -825,6 +832,14 @@ function phaseTip(x, single) {
   if (x.k === "off") return `<b>aus/l&auml;dt/tot</b> &middot; ${esc(x.why || "")}<br>${when} <span class="muted">state.json lifecycle</span>`;
   if (x.k === "unknown") return `<b>unbekannt</b> &middot; ${esc(x.why || "keinem Zustand zuordenbar")}<br>${when}`;
   const nm = phaseName(x.k, single);
+  if (x.k === "P" && CO_KEY[x.co]) {
+    // dual: both phases of the stretch, each with its own rate (the same instruments as their own segments)
+    const dec = x.co === "dec", sw = (k) => `<i class="ph-k-${k}" style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px"></i>`;
+    return `<b>${PHASE[CO_KEY[x.co]][0]}</b> <span class="muted">(Dual: P und D laufen parallel, kein Flip)</span><br>${when}${x.running ? " &middot; l&auml;uft" : ""}`
+      + `<br>${sw("P")} <b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"} &middot; ${fmt(x.tok)} Tok`
+      + `<br>${sw(dec ? "dec" : "D")} <b>${PHASE[dec ? "dec" : "D"][0]}</b> &middot; ${x.co_tps != null ? `<b>${fmt(x.co_tps, dec ? 1 : 0)}</b> tok/s <span class="muted">(${dec ? "&Delta;decode.tokens / Dauer" : "Chunks zur Rechenzeit"})</span>` : "&mdash;"} &middot; ${fmt(x.co_tok)} Tok`
+      + (dec ? decodeDetailTip({by_bs: x.co_by_bs}) : "") + depthTip(x.depth);
+  }
   if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; l&auml;uft" : ""}${decodeDetailTip(x)}`;
   return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok${x.running ? " &middot; l&auml;uft" : ""}${depthTip(x.depth)}`;
 }
@@ -841,9 +856,10 @@ function phaseHtml(b, pre) {
   const bars = segs.map((x, i) => {
     let full = "", short = "";
     if (x.k === "flip_pd" || x.k === "flip_dp") { full = short = fmt(x.e - x.s, 1) + " s"; }
+    else if (x.k === "P" && CO_KEY[x.co] && x.tps != null) { const d = x.co === "dec" ? 1 : 0; short = fmt(x.tps) + " / " + fmt(x.co_tps, d); full = "P " + fmt(x.tps) + " · D " + fmt(x.co_tps, d) + " tok/s"; }
     else if ((x.k === "P" || x.k === "D" || x.k === "dec") && x.tps != null) { const d = x.k === "dec" ? 1 : 0; short = fmt(x.tps, d); full = short + " tok/s"; }
     const ic = x.k === "idle" && x.awake ? `--ic:${x.awake === "P" ? "var(--s1)" : "var(--s2)"};` : "";
-    return `<div class="seg ph-k-${x.k}${x.running ? " run" : ""}" data-i="${i}" style="${ic}left:${pos(x.s)}%;width:${(100 * (x.e - x.s) / span).toFixed(3)}%"><span data-full="${esc(full)}" data-short="${esc(short)}"></span></div>`;
+    return `<div class="seg ph-k-${x.k}${x.k === "P" && CO_KEY[x.co] ? " co-" + x.co : ""}${x.running ? " run" : ""}" data-i="${i}" style="${ic}left:${pos(x.s)}%;width:${(100 * (x.e - x.s) / span).toFixed(3)}%"><span data-full="${esc(full)}" data-short="${esc(short)}"></span></div>`;
   }).join("");
   const cut = tl.cut_at && tl.cut_at > t0 ? `<div class="cut${tl.cut_kind === "planned" ? " planned" : ""}" style="left:${pos(tl.cut_at)}%" title="${esc(tl.cut_reason || "")}"></div>` : "";
   let end = b.live ? "jetzt" : "letzte IPC-Probe " + hhmm(t1);
@@ -851,9 +867,10 @@ function phaseHtml(b, pre) {
     : `<span style="color:var(--bad)">✕ ${esc(tl.cut_reason)} ${hhmm(tl.cut_at)}</span> &middot; ${end}`;
   const ticks = z ? [hhmm(t0), hhmm(t0 + span / 2), hhmm(t1)]
     : span >= 900 ? ["&minus;15 min", "&minus;10", "&minus;5", end] : ["&minus;5 min", "&minus;2:30", end];
+  const coKeys = ["dec", "D"].filter((c) => tl.segs.some((x) => x.k === "P" && x.co === c)).map((c) => CO_KEY[c]);
   const lg = (k) => `<span class="lg"><i class="sw ph-k-${k}"${k === "idle" ? ' style="--ic:var(--muted)"' : ""}></i>${phaseName(k, single)}</span>`;
   return `<div class="phasewrap">
-    <div class="ph-head"><b style="color:var(--text)">Phasen</b>${srcOf(b, "D1", "D2", "D3", "D4")} ${PHASE_ORDER.map(lg).join("")}
+    <div class="ph-head"><b style="color:var(--text)">Phasen</b>${srcOf(b, "D1", "D2", "D3", "D4")} ${PHASE_ORDER.concat(coKeys).map(lg).join("")}
       <span class="span">${[300, 900].map((v) => `<button type="button" class="${span === v ? "sel" : ""}" onclick="setPhaseSpan(${v})">${v / 60} min</button>`).join("")}</span></div>
     <div class="phasebar" id="${esc(id)}" role="img" tabindex="0" data-zoom-t0="${t0}" data-zoom-t1="${t1}" aria-label="Phasenverlauf ${z ? "Zoom " + hhmm(t0) + " bis " + hhmm(t1) : "der letzten " + span / 60 + " Minuten"}; ziehen zoomt, Doppelklick oder Esc zurück">${bars}${cut}</div>
     <div class="xaxis">${ticks.map((t) => `<span>${t}</span>`).join("")}</div>
@@ -1597,7 +1614,7 @@ const PH_CLS = {P: "ph-k-P", single: "ph-k-P", D: "ph-k-D", dec: "ph-k-dec", idl
 function phaseNowHtml(b, now) {
   const p = b.phase_now;
   if (!p) return "";
-  const cls = p.k === "flip" ? (p.dir === "D>P" ? "ph-k-flip_dp" : "ph-k-flip_pd") : (PH_CLS[p.k] || "ph-k-unknown");
+  const cls = p.k === "flip" ? (p.dir === "D>P" ? "ph-k-flip_dp" : "ph-k-flip_pd") : (PH_CLS[p.k] || "ph-k-unknown") + (p.k === "P" && CO_KEY[p.co] ? " co-" + p.co : "");
   const since = p.since != null ? `<span class="since num" data-since="${p.since}" data-now="${now}">${dur(Math.max(0, now - p.since))}</span>` : "";
   const fl = p.k === "flip" && p.flip_since != null && p.flip_since !== p.since
     ? ` <span class="muted">&middot; Flip seit <span class="since num" data-since="${p.flip_since}" data-now="${now}">${dur(Math.max(0, now - p.flip_since))}</span></span>` : "";

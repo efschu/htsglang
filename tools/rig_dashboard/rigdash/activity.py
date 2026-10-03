@@ -566,7 +566,14 @@ STATES = ("P", "D", "dec", "flip_pd", "flip_dp", "flip_tail", "vis_load", "vis_e
 VIS_LEGS = {"build": "vis_load", "reserve": "vis_load", "load": "vis_load",
             "encode": "vis_enc", "attach": "vis_enc", "teardown": "vis_unload"}
 VIS_PRIO = 0.5
-SAMPLE_GAP_S = 3.0      # two dashboard samples further apart: the time between is unobserved (unknown)
+#: Nutzer 03.10. ~17:50Z: "beim 27b dual nvfp4 die prefill/decode schraffiert übereinanderliegen und auch im
+#: tooltip beim hovern beides angezeigt werden in solch einer phase".  In the dual layout P (PP) and D (TP) run
+#: AT THE SAME TIME on their own cards (no flip): a P prefill segment in which D placed work too (its decode
+#: rounds or its prefill/extend chunks, the same token model) carries ``co`` = "dec" / "D".  Kept as the P
+#: segment (the phase states, the Flipzeit and every flip line stay as they are); the bar draws it hatched in
+#: both colours and the hover names both.  Bucket shares of it: ph_<CO_STATES> (only for a dual boot).
+CO_STATES = {"Pdec": "dec", "PD": "D"}
+SAMPLE_GAP_S = 3.0     # two dashboard samples further apart: the time between is unobserved (unknown)
 RANK_GAP_S = 30.0       # two records of one rank further apart: the rank stalled or was gone -- not observed
 
 
@@ -606,10 +613,12 @@ class Model:
 
     ``begins`` = flip_begin event data (an open flip has no flip_done yet), ``user_time`` =
     flip_user_time data (D>P: end of the flip tail = P prefill start), ``life`` = {serving_since,
-    terminal_since, terminal_state} from state.json."""
+    terminal_since, terminal_state} from state.json, ``dual`` = the boot runs the dual layout (P and D
+    at the same time, ipcboot.is_dual): only then a P segment names D's simultaneous work (``co``)."""
 
     def __init__(self, ring, flip_done: List[dict], first_work: List[dict], begins: Optional[List[dict]] = None,
-                 user_time: Optional[List[dict]] = None, life: Optional[dict] = None):
+                 user_time: Optional[List[dict]] = None, life: Optional[dict] = None, dual: bool = False):
+        self.dual = bool(dual)
         self.ring = list(ring or ())
         self.keys = set()
         for s in self.ring:
@@ -773,11 +782,20 @@ class Model:
             live = [r for r in raw if r[0] <= a and r[1] >= b]
             if not live:
                 continue
-            k = min(live, key=lambda r: r[3])[2]
-            if segs and segs[-1]["k"] == k and abs(segs[-1]["e"] - a) < 1e-6:
+            top = min(live, key=lambda r: r[3])
+            k, co = top[2], None
+            if self.dual and k == "P" and top[3] == 2:
+                # dual layout: P's placed prefill and D's placed work (its own token model: decode rounds
+                # prio 4, prefill/extend chunks prio 3 -- never a sample fill-in) in the same stretch
+                dw = [r for r in live if r[2] in ("D", "dec") and r[3] in (3, 4)]
+                if dw:
+                    co = min(dw, key=lambda r: r[3])[2]
+            if segs and segs[-1]["k"] == k and segs[-1].get("co") == co and abs(segs[-1]["e"] - a) < 1e-6:
                 segs[-1]["e"] = b
             else:
                 segs.append({"s": a, "e": b, "k": k})
+                if co:
+                    segs[-1]["co"] = co
         for x in segs:
             if x["k"] == "unknown":
                 x["why"] = self._why_unknown(x)
@@ -931,15 +949,23 @@ class Model:
         # a watched bucket without its own sample: its levels (KV) were held, not read (the "held" count)
         out["held"] = [1.0 if h and not sm else None for h, sm in zip(have, sampled)]
         # phase share per bucket (0..1 per state): averages stay right at every history tier
-        frac = {k: [0.0] * n for k in STATES}
+        frac = {k: [0.0] * n for k in STATES + tuple(CO_STATES)}
+        co_of = {v: c for c, v in CO_STATES.items()}
         for x in self.segments():
             a, b = max(x["s"], lo), min(x["e"], lo + n * step)
+            cok = co_of.get(x.get("co"))
             while a < b:
                 i = int((a - lo) // step)
                 z = min(b, lo + (i + 1) * step)
                 if 0 <= i < n:
                     frac[x["k"]][i] += (z - a) / step
+                    if cok:
+                        frac[cok][i] += (z - a) / step
                 a = z
         for k in STATES:
             out["ph_" + k] = [(min(1.0, frac[k][i]) if have[i] else None) for i in range(n)]
+        if self.dual:
+            # the part of ph_P in which D worked at the same time (dual layout only; a flip boot writes none)
+            for k in CO_STATES:
+                out["ph_" + k] = [(min(1.0, frac[k][i]) if have[i] else None) for i in range(n)]
         return out

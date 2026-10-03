@@ -150,6 +150,13 @@
     const t = document.createElement("canvas"), dpr = devicePixelRatio, n = Math.round(6 * dpr);
     t.width = n; t.height = n;
     const x = t.getContext("2d");
+    if (k === "Pdec" || k === "PD") {
+      // Dual (Nutzer 03.10.): P und D gleichzeitig -- diagonale Streifen in beiden Farben (wie die Phasenleiste)
+      x.fillStyle = k === "Pdec" ? C.s3 : C.s2; x.fillRect(0, 0, n, n);
+      x.strokeStyle = C.s1; x.lineWidth = n / 2.8;
+      x.beginPath(); x.moveTo(0, n); x.lineTo(n, 0); x.moveTo(-n / 2, n / 2); x.lineTo(n / 2, -n / 2); x.moveTo(n / 2, n * 1.5); x.lineTo(n * 1.5, n / 2); x.stroke();
+      return ctx.createPattern(t, "repeat");
+    }
     x.fillStyle = k === "off" ? C.text2 : C.surface; x.fillRect(0, 0, n, n);
     if (k === "vis_load" || k === "vis_unload") {
       // Vision-Tower: laden = Streifen, entladen = blass (wie die Phasenleiste der Boot-Karte)
@@ -173,7 +180,14 @@
     ctx.save();
     for (let i = 0; i < xs.length; i++) {
       let best = null, bv = 0;
-      for (const k of PH) { const v = (data.series["m.ph_" + k] || [])[i]; if (v != null && v > bv) { bv = v; best = k; } }
+      // Dual: ph_Pdec / ph_PD = the part of ph_P in which D worked at the same time (only a dual boot writes them)
+      const co = { Pdec: (data.series["m.ph_Pdec"] || [])[i] || 0, PD: (data.series["m.ph_PD"] || [])[i] || 0 };
+      for (const k of PH) {
+        let v = (data.series["m.ph_" + k] || [])[i];
+        if (k === "P" && v != null) v -= co.Pdec + co.PD;
+        if (v != null && v > bv) { bv = v; best = k; }
+      }
+      for (const k of ["Pdec", "PD"]) if (co[k] > bv) { bv = co[k]; best = k; }
       if (!best) continue;
       const a = u.valToPos(xs[i], "x", true), b = u.valToPos(xs[i] + step, "x", true);
       if (b < left || a > left + width) continue;
@@ -501,9 +515,9 @@
   // Legende der Phasen-Bänder: dieselben Klassen wie die Phasenleiste der Boot-Karte
   const PH_NAME = { P: "P-Prefill", D: "D-Prefill/Extend", dec: "D-Decode", flip_pd: "Flip P→D", flip_dp: "Flip D→P",
     flip_tail: "Flip-Nachlauf", vis_load: "Vision laden", vis_enc: "Vision rechnen", vis_unload: "Vision entladen",
-    idle: "Leerlauf", off: "aus/lädt/tot", unknown: "unbekannt" };
+    idle: "Leerlauf", off: "aus/lädt/tot", unknown: "unbekannt", Pdec: "P-Prefill + D-Decode (Dual)", PD: "P-Prefill + D-Prefill (Dual)" };
   const lgEl = $("vl-legend");
-  if (lgEl) lgEl.innerHTML = "<b style=\"color:var(--text)\">Band unter den Diagrammen = Phase:</b>" + PH.map((k) =>
+  if (lgEl) lgEl.innerHTML = "<b style=\"color:var(--text)\">Band unter den Diagrammen = Phase:</b>" + PH.concat(["Pdec", "PD"]).map((k) =>
     `<span class="lg" style="display:inline-flex;align-items:center;gap:4px"><i class="ph-k-${k}" style="display:inline-block;width:18px;height:11px;border-radius:2px${k === "idle" ? ";--ic:var(--muted)" : ""}"></i>${PH_NAME[k]}</span>`).join("");
   bar();
   // Tabs (Nutzer 01.10.): Verlauf und Karten liegen in eigenen Tabs; versteckt wird nicht geladen, beim Zeigen

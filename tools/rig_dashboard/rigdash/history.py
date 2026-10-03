@@ -583,6 +583,8 @@ class Recorder:
                             "dec_seat": b["dec_seat"][i], "dec_bs_min": b["dec_bs_min"][i],
                             "dec_bs_max": b["dec_bs_max"][i]}
                     vals.update({"ph_" + k: b["ph_" + k][i] for k in activity.STATES})
+                    # dual boots only (activity.CO_STATES): the part of ph_P with D working at the same time
+                    vals.update({"ph_" + k: b["ph_" + k][i] for k in activity.CO_STATES if "ph_" + k in b})
                     rows += [(pre + k, ts, v) for k, v in vals.items() if v is not None]
                 self.db.put(rows)
                 c1 = self.db.get("cursor.p1")
@@ -815,7 +817,7 @@ def view(db: HistoryDB, rec: Optional[Recorder], model: str, range_key: str, now
     names += ["host.cpu", "host.mem_pct", "host.bootmem_pct", "host.bootmem_gib"]
     mp = SERIES % model
     msr = ["p_tps", "d_tps", "dec_tps", "stream_tps", "kv_pct", "kv_p_pct", "ipc"] + ["tok_" + k for k in cacheacct.CLASSES] \
-        + ["ph_" + k for k in activity.STATES] + list(BUSY_SERIES)
+        + ["ph_" + k for k in activity.STATES] + ["ph_" + k for k in activity.CO_STATES] + list(BUSY_SERIES)
     names += [mp + k for k in msr] + [mp + "tier_" + k for k in cacheacct.TIERS]
     data = db.query(names, lo, hi, step, now)
     t0 = int(lo // step) * step

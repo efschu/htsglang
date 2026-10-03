@@ -475,6 +475,9 @@ def _attach_detail(m: "activity.Model", segs: List[dict], done: Optional[List[di
     cache: Dict[Tuple[str, int], dict] = {}
     dk, _ = activity.stage_keys(m.keys, m.dec_group) if m.dec_group else (None, None)
     for x in segs:
+        if x.get("co") == "dec":
+            x["co_by_bs"] = [{k: (round(v, 1) if isinstance(v, float) else v) for k, v in r.items()}
+                             for r in activity.decode_by_bs(m.dec, x["s"], x["e"])]
         if x["k"] in ("P", "D"):
             best, ov = None, 0.0
             for i, b in enumerate(bursts[x["k"]]):
@@ -516,6 +519,11 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
             x["tok"] = tok
             x["tps"] = tok / max(1e-3, x["e"] - x["s"])
             x["n"] = 1
+        if x.get("co") in src:
+            # dual: D's work in the same stretch, by the same token model as its own segments
+            ctok = activity.spread(src[x["co"]], x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
+            x["co_tok"] = ctok
+            x["co_tps"] = ctok / max(1e-3, x["e"] - x["s"])
         if x["k"] == "idle":
             x["awake"] = m.awake_at(x["s"], awake_now)
         if x["k"] in VIS_NAME:
@@ -949,6 +957,7 @@ def flip_times_of(views: List[dict]) -> dict:
 
 
 PHASE_LABEL = {"P": "P aktiv (Prefill)", "single": "Prefill", "D": "D aktiv: Prefill", "dec": "D aktiv: Decode"}
+CO_LABEL = {"dec": "P Prefill + D Decode", "D": "P Prefill + D Prefill"}
 
 
 def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live: bool, now: float) -> Optional[dict]:
@@ -982,6 +991,9 @@ def phase_now(segs: List[dict], ipc: dict, front: dict, views: List[dict], live:
         if x["k"] != k or since - x["e"] > 1.5:
             break
         since = x["s"]
+    if k == "P" and cur.get("co") in CO_LABEL:
+        # dual (Nutzer 03.10.): P prefills and D works at the same time -- both named
+        return {"k": k, "co": cur["co"], "label": CO_LABEL[cur["co"]], "sub": "gleichzeitig (Dual, kein Flip)", "since": since}
     if k in PHASE_LABEL:
         return {"k": k, "label": PHASE_LABEL[k], "sub": "", "since": since}
     if k in VIS_NAME:
@@ -1168,6 +1180,23 @@ def _awake(m: "activity.Model", front: dict):
     return (front or {}).get("awake")
 
 
+DUAL_COUNTERS = ("flip_refused_dual", "dual_passes", "dual_short_first", "dual_kv_pressure_probe")
+
+
+def is_dual(ipc: dict) -> bool:
+    """The boot runs the dual layout (27B NVFP4 Dual, Nutzer 03.10.: P and D at the same time, no flip): the
+    launcher's profile or tag names it (state.json ``profile`` 27b-nvfp4-dual*, tag dkr27bnvfp4dual*) or the
+    front counts dual passes / refused flips (front.counters), AND the boot has no flip -- a boot that flipped
+    is a flip layout, its phase bar stays one phase at a time."""
+    ipc = ipc or {}
+    if any(e.get("type") in ("flip_begin", "flip_done") for e in ipc.get("ipc_events") or ()) \
+            or ipc.get("flip_first_work"):
+        return False
+    names = " ".join(str(ipc.get(k) or "") for k in ("profile", "tag")).lower()
+    cnt = ((ipc.get("front") or {}).get("counters")) or {}
+    return "dual" in names or any(cnt.get(k) for k in DUAL_COUNTERS)
+
+
 def model_of(ipc: dict, ring) -> "activity.Model":
     """activity.Model with everything the phase states need from the boot's IPC."""
     evs = ipc.get("ipc_events") or []
@@ -1177,7 +1206,7 @@ def model_of(ipc: dict, ring) -> "activity.Model":
             "terminal_since": ipc.get("lifecycle_since") if ipc.get("terminal") else None,
             "terminal_state": ipc.get("lifecycle") if ipc.get("terminal") else None}
     return activity.Model(ring, flip_done_of(ipc), list(ipc.get("flip_first_work") or []), begins,
-                          list(ipc.get("flip_user_time") or []), life)
+                          list(ipc.get("flip_user_time") or []), life, dual=is_dual(ipc))
 
 
 def life_view(ipc: dict, t0: Optional[float], sig: Optional[float]) -> dict:
