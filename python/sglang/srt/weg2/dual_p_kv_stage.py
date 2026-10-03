@@ -886,13 +886,20 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
     if int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0) == 0:
         return False
     req = getattr(sched, "_pending_chunked_abort_req", None)
-    if req is None:
+    # metal dual1m-psleep (boot ...10020527, 05:36:22Z, weg2-0-73): the front's pause aborted a
+    # request that PP1/PP2 still held in their WAITING queue; the #1180-W hold
+    # (``_weg2_pending_waiting_aborts``) waits for PP0's forwarded schedule to decide it, PP0 sent
+    # no further frame, and this release looked at the chunked abort only: 352321536 B / 528482304 B
+    # stayed committed on two cards for 271 s, the front's RESUME-WAIT never saw all zeros, six
+    # requests sat until the operator tore the boot down. A waiting hold is a held abort too.
+    held = tuple(sorted(str(r) for r in (getattr(sched, "_weg2_pending_waiting_aborts", None) or ())))
+    if req is None and not held:
         sched._dual_abort_seen = None
         return False
     t = _t.time() if now is None else float(now)
     seen = getattr(sched, "_dual_abort_seen", None)
-    if seen is None or seen[0] is not req:
-        sched._dual_abort_seen = (req, t)
+    if seen is None or seen[0] is not req or not set(held) <= set(seen[2]):
+        sched._dual_abort_seen = (req, t, held)
         return False
     try:
         with open(_idle_marker(_dual_tag())) as f:
@@ -918,7 +925,8 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
     logger.info("%s FOLLOWER-ABORT-APPLIED rid=%s pp_rank=%s: PP0 idle since %.1f s after this rank "
                 "saw the abort, every pass it launched ran here (fwd %d >= %d; the #791C liveness "
                 "release the dual layout has no lap for)", MARK,
-                str(getattr(req, "rid", "?"))[:16], getattr(sched.ps, "pp_rank", "?"), idle_t - seen[1],
+                str(getattr(req, "rid", None) or ",".join(held) or "?")[:48], getattr(sched.ps, "pp_rank", "?"),
+                idle_t - seen[1],
                 int(getattr(sched, "forward_ct", 0) or 0), pp0_fwd)
     return True
 
