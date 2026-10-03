@@ -5,7 +5,7 @@ The dual layout runs the 5090 (nvml1) at ~57 MiB physical free. Boot
 dkr27bnvfp4dual1mpsleepbar1fs10020527 (D.log): LEDGER-PHYS OVER-PROMISE up to 343 MiB
 (:18702), CORRIDOR LAW BREACHED min 56 MiB (:32484), one cuMemCreate OOM rolled back by
 GROW-SHORT (:32516) -- while D's own torch allocator cache swung 270 MiB in the same window
-(:32505 '#1028c BOUND alloc_cache ... delta=269.7'). The cache starts at the same sample in
+(:32482 '#1028c BOUND alloc_cache ... bound=1378.4 instant=1648.1 delta=269.7'; highwater 1665.6 at :42878). The cache starts at the same sample in
 every dual boot (TP0 348.4 MiB, the cache when the pools were sized) and grows with traffic;
 the ledger budget (the sum of the groups' boot KV) knows nothing of it and books it after the
 fact, 3 OVER-PROMISE checks (30 s) at a time.
