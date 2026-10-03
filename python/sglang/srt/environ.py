@@ -4108,8 +4108,10 @@ class Envs:
     # (no collect window); without a seat nothing flips and it waits for the
     # next seat in arrival order; the wait bound parks the youngest decode.
     # With it on, PARK-COLLECT-WINDOW and PARK-WINDOW-GATE are inert. Front-
-    # side, model-neutral. Off until the first series, then on.
-    SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE = EnvBool(False)
+    # side, model-neutral. DEFAULT ON on this (NF) line since 03.10. (110: NF
+    # metal since 29.09. ~19:40Z, DP-WAIT p90 3-6.5 s against 27B 16-60 s); the
+    # 27B line never ran it and keeps it off. =0 is the pre-rule front.
+    SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE = EnvBool(True)
     # ARRIVAL-SEAT: the decode part of an arrival's KV need when the client
     # set no max_tokens (prompt + this = the need checked against D's free KV).
     SGLANG_WEG2_ARRIVAL_DECODE_RESERVE_TOKENS = EnvInt(2048)

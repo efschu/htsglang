@@ -48,11 +48,11 @@ def test_it_does_not_fit_the_older_goes_first_as_before():
 
 
 def test_rule_off_is_todays_path_and_an_explicit_margin_wins():
-    assert ds.ResumeBook.from_env({}).margin_tokens == -1
-    assert ds.ResumeBook.from_env({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "0"}).margin_tokens == -1
+    OFF = {"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "0"}
+    assert ds.ResumeBook.from_env(OFF).margin_tokens == -1
     b = ds.ResumeBook.from_env({**ON, ds.RESUME_MARGIN_ENV: "500"})
     assert b.margin_tokens == 500 and b.source == "env"
-    off = ds.ResumeBook.from_env({})
+    off = ds.ResumeBook.from_env(OFF)
     old, young = _req("a", 1), _req("b", 2, site=ds.SITE_PRESSURE, n_in=1000)
     assert set(_passes(off, young, old, avail=10**9, n=20)) == {"weg2_d_park_older_live"}
 

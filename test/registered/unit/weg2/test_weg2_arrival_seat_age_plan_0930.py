@@ -75,7 +75,8 @@ def test_the_plan_is_the_fewest_youngest_younger_decodes():
 
 
 def test_the_switch_needs_the_rule():
-    assert asr.age_plan_enabled({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "1"}) is False
+    assert asr.age_plan_enabled({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "1",
+                                 "SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "0"}) is False
     assert asr.age_plan_enabled({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_AGE_PLAN": "1",
                                  "SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "1"}) is True
     assert asr.age_plan_enabled({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "1"}) is True   # default on
