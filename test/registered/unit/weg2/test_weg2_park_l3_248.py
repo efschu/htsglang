@@ -516,9 +516,9 @@ def test_f22_early_read_keeps_the_keys_while_the_read_is_still_short(env):
 
 
 def test_f22_switch_off_reads_at_the_release_as_before(env):
-    """Off (the default until the first series), and the 27B's D the same:
-    the legs' start issues nothing, the release reads as on 895559fed2."""
-    env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    """Off (=0, the pre-default form): the legs' start issues nothing, the
+    release reads as on 895559fed2."""
+    env.mp.setenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", "0")
     reads = []
     tree = _Tree()
     s = _wake_sched(tree, reads)
@@ -539,3 +539,16 @@ def test_f22_early_read_is_group_d_only(env):
     r._weg2_248_read_at_wake = True
     s.weg2_dormant_hold = [r]
     assert park_l3.issue_reads_at_wake_begin(s) == [] and reads == []
+
+
+def test_f22_wake_read_early_is_default_on(env):
+    """110: proven on the NF metal (60 boots), so the code default is ON with
+    the variable unset -- no profile line needed."""
+    env.mp.delenv("SGLANG_WEG2_ENABLE_WAKE_READ_EARLY", raising=False)
+    assert park_l3.early_enabled() is True
+    reads = []
+    s = _wake_sched(_Tree(), reads)
+    a = _req(PARKED)
+    park_l3.defer_hold_read(s, a)
+    s.weg2_dormant_hold = [a]
+    assert park_l3.issue_reads_at_wake_begin(s) == [a] and reads == [PARKED]
