@@ -1373,7 +1373,8 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     Admits whose window has passed. Never waits."""
     held: Dict[str, Any] = scheduler._weg2_store_held
     pacing = _pacing(scheduler)
-    if not held and not pacing:
+    fb_watch = bool(getattr(scheduler, "_weg2_told_fallback_on", False)) and _fb.pp0_watching(scheduler)
+    if not held and not pacing and not fb_watch:
         return recv_reqs
     told_map: Dict[str, int] = scheduler._weg2_store_told
     tree = scheduler.tree_cache
@@ -1384,16 +1385,26 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     scheduler._weg2_told_pass_n = pass_n
     fb_on = bool(getattr(scheduler, "_weg2_told_fallback_on", False))
     fb_parked = set()
-    if fb_on and pacing:
+    if fb_on and (pacing or fb_watch):
         # PF: the followers' read acks that have landed (no wait), BEFORE
         # the verdicts below read them.
         _fb.pp0_harvest(scheduler)
         fb_parked = _parked(scheduler)
+    out: List[Any] = []
+    if fb_on and fb_watch:
+        # item 220: a follower found its tree short of an ADMITTED told; PP0
+        # (alone) retracts it to told=0 for every rank while it has not
+        # seated the rid itself.
+        for r_rid, r_told, r_own in _fb.pp0_retract_due(scheduler, queued, _parked(scheduler)):
+            _fb.pp0_retract_applied(scheduler, r_rid, r_told, r_own)
+            retract = Weg2StoreAdmit(rid=r_rid, told=0)
+            setattr(retract, _fb.WIRE_FALLBACK, 1)
+            told_map[r_rid] = 0
+            out.append(retract)
     # TW: held fork twins whose sibling finished (or whose Frist ran out)
     # register their store read now (the paced read clock starts here).
     for _treq, _is_twin in _twin.release_due(scheduler, queued | _parked(scheduler)):  # TW-WAKE
         _twin_register(scheduler, _treq, _is_twin)
-    out: List[Any] = []
     # (a) Admits first: an entry created in THIS pass is never admitted in it,
     # so the read-ahead always precedes its Admit by at least one pass.
     for rid in list(pacing):

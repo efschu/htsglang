@@ -150,6 +150,9 @@ class Ring:
         self.pass_n = 0
         self.sleeps = {0: 0.0, 1: 0.0, 2: 0.0}
         self._in = None
+        #: optional ``hold(rank, rid, planned_pp0_pass) -> bool``: True = the
+        #: adder skips the rid on that rank this pass (item 220 tests)
+        self.hold = None
 
         def _sleep(sec):
             self.sleeps[self._in] += sec
@@ -176,6 +179,8 @@ class Ring:
         for s in self.stages:
             self._in = s.ps.pp_rank
             for r in list(s.waiting_queue):
+                if self.hold is not None and self.hold(s.ps.pp_rank, r.rid, k - s.ps.pp_rank):
+                    continue
                 credit = m.admission(s, r, lambda kind, rid: None)
                 if credit is None:
                     continue

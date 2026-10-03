@@ -332,6 +332,101 @@ def pp0_forget(scheduler, rid: str) -> None:
     _pp0_open_map(scheduler).pop(str(rid), None)
 
 
+#: item 220: ``rid -> told`` PP0 admitted (told > 0) and has not seated yet
+RETRACT_ADMITTED_MAX = 1024
+
+
+def _admitted_map(scheduler) -> Dict[str, int]:
+    d = getattr(scheduler, "_weg2_fb_admitted", None)
+    if d is None:
+        d = scheduler._weg2_fb_admitted = {}
+    return d
+
+
+def _late_map(scheduler) -> Dict[str, int]:
+    d = getattr(scheduler, "_weg2_fb_late", None)
+    if d is None:
+        d = scheduler._weg2_fb_late = {}
+    return d
+
+
+def pp0_watching(scheduler) -> bool:
+    """True while PP0 holds an admitted-at-told rid a late ack could still
+    retract: the publish pass keeps harvesting the ack stream for it."""
+    return bool(getattr(scheduler, "_weg2_fb_admitted", None))
+
+
+def pp0_retract_due(scheduler, queued, parked) -> List[Tuple[str, int, int]]:
+    """W27-UNIFORM (item 220, residual of item 180): the answer path for a
+    short reach a follower finds AFTER the Admit. Returns ``(rid, told, own)``
+    for every rid PP0 retracts to told=0 in THIS pass (the caller puts one
+    ``Admit(0, fallback)`` on the wire and applies it to PP0 itself, exactly
+    like a Frist fallback).
+
+    Rank-uniform by construction: only PP0 decides, and only from PP0-local
+    facts -- a follower's late ack differing from the told PP0 admitted, and
+    the rid still in PP0's own waiting queue (PP0 has not seated it, so no
+    rank has: every rank seats at PP0's pass plus its plan lag, and the wire
+    keeps its order). A rid PP0 seated already is TOO LATE: nothing is put on
+    the wire (a retract after PP0's seat would be the rank-local split), the
+    follower's hold stays and the #1233 W27 guard names it. No reserve, and
+    PP0 never waits for a follower, so the follower's hold cannot deadlock
+    against it. Admitted rids that left the queue are forgotten here."""
+    admitted = _admitted_map(scheduler)
+    late = _late_map(scheduler)
+    out: List[Tuple[str, int, int]] = []
+    for rid in list(late):
+        own = late[rid]
+        told = admitted.get(rid)
+        if told is None:
+            late.pop(rid, None)
+            continue
+        if rid in queued:
+            late.pop(rid, None)
+            admitted.pop(rid, None)
+            out.append((rid, int(told), int(own)))
+        elif rid not in parked:
+            late.pop(rid, None)
+            admitted.pop(rid, None)
+            n = _bump(scheduler, "_pf_retract_late_n")
+            if _say(n):
+                logger.error(
+                    "PF TOLD-RETRACT TOO LATE rid=%s told=%d follower_reach=%d (n=%d): PP0 "
+                    "seated this rid already -- no rank-uniform answer is possible any more, "
+                    "nothing is put on the wire; the follower's hold stays and the #1233 W27 "
+                    "guard names the split", rid[:8], told, own, n,
+                )
+    for rid in list(admitted):
+        if rid not in queued and rid not in parked:
+            admitted.pop(rid, None)  # seated or gone: nothing left to retract
+    while len(admitted) > RETRACT_ADMITTED_MAX:
+        admitted.pop(next(iter(admitted)), None)
+    return out
+
+
+def pp0_retract_applied(scheduler, rid: str, told: int, own: int) -> None:
+    """PP0 applies its own retract (same as the Frist fallback: its read is
+    released, its admission compares 0 with 0) and names it."""
+    rid = str(rid)
+    release_own_read(scheduler, rid)
+    try:
+        from sglang.srt.managers import weg2_store_told as _st
+
+        _st.forget_unreached(scheduler, rid)
+    except Exception:  # noqa: BLE001 - bookkeeping
+        pass
+    (getattr(scheduler, "_weg2_told_kept", None) or {}).pop(rid, None)
+    (getattr(scheduler, "_weg2_store_told_satisfied", None) or {}).pop(rid, None)
+    n = _bump(scheduler, "_pf_retract_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-RETRACT rid=%s told=%d -> 0 follower_reach=%d (n=%d): a follower's tree "
+            "stayed short of the admitted told after the Admit and PP0 had not seated the "
+            "rid yet -- PP0 switches it to told=0 for EVERY rank on the Admit channel "
+            "(fallback marker); P recomputes the prefix", rid[:8], told, own, n,
+        )
+
+
 def pp0_harvest(scheduler) -> int:
     """Take every ack that has landed off the standing receives (no wait)."""
     open_map = _pp0_open_map(scheduler)
@@ -343,6 +438,14 @@ def pp0_harvest(scheduler) -> int:
         for rid, own in ack.reads:
             o = open_map.get(str(rid))
             if o is None:
+                # item 220: a follower's re-ask (item 180) of a rid PP0
+                # admitted at told that has NOT been seated yet is a retract
+                # candidate; PP0 decides it at its next publish
+                # (pp0_retract_due), never here
+                adm = _admitted_map(scheduler).get(str(rid))
+                if adm is not None and int(own) != int(adm):
+                    _late_map(scheduler)[str(rid)] = int(own)
+                    continue
                 # decided (or dropped) already: late ack (item 180: also a
                 # follower's re-ask of an already admitted rid -- named)
                 k = _bump(scheduler, "_pf_ack_late_n")
@@ -379,6 +482,10 @@ def pp0_decide(scheduler, rid: str, now: float) -> Optional[Tuple[int, str]]:
 def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float) -> None:
     o = _pp0_open_map(scheduler).pop(str(rid), None)
     acks = dict(o.acks) if o is not None else {}
+    if int(told_final) > 0:
+        # item 220: PP0 admitted at told; until it seats the rid, a follower's
+        # late re-ask can still switch it to told=0 (pp0_retract_due)
+        _admitted_map(scheduler)[str(rid)] = int(told_final)
     if reason == REASON_ACKS:
         n = _bump(scheduler, "_pf_admit_acks_n")
         if _say(n):
