@@ -492,3 +492,13 @@ def _tokenizer_meta_info(x_tokens: int) -> dict:
 def test_red_first_meta_info_carries_weg2_prefill_s_on_a_weg2_d_only():
     assert _tokenizer_meta_info(START_X)["weg2_prefill_s"] == pytest.approx(3.17)
     assert "weg2_prefill_s" not in _tokenizer_meta_info(0)
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")

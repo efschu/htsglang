@@ -100,7 +100,9 @@ def test_a_parked_request_still_settling_outside_the_queue_holds_the_barrier():
 def test_stage2_early_resume_is_off_by_default_and_hysteretic_when_armed():
     old = _req("old", 1)
     young = _req("young", 2, site=ds.SITE_PRESSURE, n_in=1000, n_out=0)
-    off = ds.ResumeBook.from_env({})
+    # 110: the early resume follows ARRIVAL_SEAT_RULE (default ON on the NF line);
+    # the pre-rule form is the rule's explicit off.
+    off = ds.ResumeBook.from_env({"SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE": "0"})
     assert off.margin_tokens == -1
     assert ds.admission_gate([young], running=[old], avail_tokens=10**9, resume_book=off).skip(young)
     book = ds.ResumeBook.from_env({ds.RESUME_MARGIN_ENV: "100", ds.RESUME_STEPS_ENV: "2"})
@@ -135,3 +137,13 @@ def test_graph_list_coverage():
     assert ds.graph_bs_covers([1, 2], 2)
     assert not ds.graph_bs_covers([1], 2)
     assert ds.graph_bs_covers(None, 6)
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")
