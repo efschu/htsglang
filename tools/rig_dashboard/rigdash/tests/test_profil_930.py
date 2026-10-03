@@ -200,6 +200,40 @@ class Editor(unittest.TestCase):
             self.ed.dry_run(self.ed.load("release", "demo")["doc"], [{"card": "no-such-card"}])
 
 
+class Models(unittest.TestCase):
+    """S3 (Auftrag 960) in the Profil tab: the models of the release profiles, and the ones this container cannot read stay in the list, named."""
+
+    def test_unmounted_models_are_listed_and_named_not_dropped(self):
+        tmp = tempfile.mkdtemp(prefix="pf930m_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        good, empty, missing = (os.path.join(tmp, n) for n in ("Modell-lesbar", "Modell-leer", "Modell-fehlt"))
+        os.makedirs(good)
+        open(os.path.join(good, "config.json"), "w").write("{}")
+        os.makedirs(empty)
+        rel = os.path.join(tmp, "rel")
+        os.makedirs(rel)
+        for n, model, draft in (("a", good, empty), ("b", empty, ""), ("c", missing, good)):
+            with open(os.path.join(rel, n + ".env"), "w") as fh:
+                fh.write("PROFILE_NAME=%s\nPROFILE_MODEL=%s\nPROFILE_DRAFT=%s\nPROFILE_ARGS=(--model /m)\n" % (n, model, draft))
+        ed = P.ProfilEditor(kartenplaner=K.Kartenplaner(tree=FIXTURE_TREE), release_dir=rel, user_dir=os.path.join(tmp, "u"),
+                            tree=FIXTURE_TREE, catalog_file=REPO_CATALOG)
+        by = {m["name"]: m for m in ed.known_models()["models"]}
+        self.assertEqual(set(by), {"Modell-lesbar", "Modell-leer", "Modell-fehlt"})            # nothing silently left out
+        self.assertEqual((by["Modell-lesbar"]["state"], by["Modell-lesbar"]["readable"]), ("lesbar", True))
+        self.assertEqual(by["Modell-leer"]["state"], "nicht_gemountet")
+        self.assertIn("Modell im Container nicht gemountet", by["Modell-leer"]["why"])
+        self.assertIn("Verzeichnis leer", by["Modell-leer"]["why"])
+        self.assertIn("Pfad fehlt", by["Modell-fehlt"]["why"])
+        self.assertEqual(sorted(by["Modell-leer"]["roles"]), ["Draft", "Modell"])
+        self.assertEqual(sorted(by["Modell-leer"]["used_by"]), ["a", "b"])
+
+    def test_the_ui_says_it_and_offers_no_estimate_for_them(self):
+        js = open(os.path.join(os.path.dirname(HERE), "static", "profil.js"), encoding="utf-8").read()
+        self.assertIn("Modell im Container nicht gemountet", js)
+        self.assertIn("nicht schätzbar: nichts zu lesen", js)
+        self.assertIn("window.ModellProfil.schaetzen", js)
+
+
 class Routes(unittest.TestCase):
     def serve(self, edition):
         tmp = tempfile.mkdtemp(prefix="pf930r_")
@@ -255,6 +289,8 @@ class Routes(unittest.TestCase):
         self.assertEqual(self.call(port, "POST", "/api/profil/save", {"doc": {}, "name": "x"}, headers=px)[0], 403)
         rel = self.serve("release")
         self.assertEqual(self.call(rel, "GET", "/api/profil/list")[0], 404)
+        self.assertEqual(self.call(rel, "GET", "/api/profil/modelle")[0], 404)
+        self.assertEqual(self.call(port, "GET", "/api/profil/modelle", headers=px)[0], 403)
         self.assertEqual(self.call(rel, "POST", "/api/profil/load", {})[0], 404)
         self.assertEqual(self.call(rel, "GET", "/profil.js")[0], 404)
 

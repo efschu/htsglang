@@ -35,6 +35,9 @@ git -C "$repo" cat-file -e "$PROFIL_REV^{commit}" || { echo "REFUSED: Revision $
 for f in profile_json.py refusals.py profile_catalog.py; do
   git -C "$repo" cat-file -e "$PROFIL_REV:python/sglang/srt/weg2/$f" || { echo "REFUSED: $f fehlt in $PROFIL_REV" >&2; exit 3; }
 done
+# Auftrag 960 (S3): model_profile.py (Schaetzer, stdlib) liegt auf dem Zweig desk/profil-s3-modell-1003; MODELLPROFIL_REV nennt die Revision.
+MODELLPROFIL_REV=${KARTENPLAN_MODELLPROFIL_REV:-3d729b672c}
+git -C "$repo" cat-file -e "$MODELLPROFIL_REV:python/sglang/srt/weg2/model_profile.py" || { echo "REFUSED: model_profile.py fehlt in $MODELLPROFIL_REV" >&2; exit 3; }
 dst=/opt/rigdash/kartenplan/releases/$GATE_REV
 echo "Planer-Stufe: $dst  (card_identity.py, topology.py aus $GATE_REV)"
 if [ "$check_only" = 1 ]; then
@@ -53,5 +56,7 @@ for f in profile_json.py refusals.py profile_catalog.py; do
   git -C "$repo" show "$PROFIL_REV:python/sglang/srt/weg2/$f" > "$dst/python/sglang/srt/weg2/$f"
 done
 echo "Profil-Editor-Module (profile_json.py refusals.py profile_catalog.py) aus $PROFIL_REV"
+git -C "$repo" show "$MODELLPROFIL_REV:python/sglang/srt/weg2/model_profile.py" > "$dst/python/sglang/srt/weg2/model_profile.py"
+echo "Modellprofil-Schaetzer (model_profile.py) aus $MODELLPROFIL_REV"
 ln -sfn "releases/$GATE_REV" /opt/rigdash/kartenplan/current.new && mv -T /opt/rigdash/kartenplan/current.new /opt/rigdash/kartenplan/current
 exec "$here/install.sh" "$sha"

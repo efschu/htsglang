@@ -161,6 +161,50 @@ class ProfilEditor:
                 "register": self.register(), "coverage": cat.get("stats"), "tree_rev": cat.get("tree_rev"),
                 "planner_tree": self.tree}
 
+    def known_models(self) -> dict:
+        """Every model / draft path the release profiles name, with what THIS container can read of it.  A path that is not readable here
+        stays in the list, named ("Modell im Container nicht gemountet"): the estimator reads only config.json and shard headers, so an empty mount
+        point cannot be estimated, but it is still the profile's model (Koordinator 03.10.: die Zeile nicht einfach weglassen)."""
+        seen: Dict[str, dict] = {}
+        try:
+            names = sorted(n[:-4] for n in os.listdir(self.release_dir) if n.endswith(".env") and NAME_RE.match(n[:-4]))
+        except OSError:
+            names = []
+        for n in names:
+            try:
+                doc = self._import_release(n)
+            except Exception:       # noqa: BLE001 -- one broken profile must not hide the others
+                continue
+            vars_ = {v["name"]: v for v in doc.get("vars") or []}
+            for var, role in (("PROFILE_MODEL", "Modell"), ("PROFILE_DRAFT", "Draft")):
+                path = str((vars_.get(var) or {}).get("value") or "")
+                if not path:
+                    continue
+                e = seen.setdefault(path, {"path": path, "name": os.path.basename(path.rstrip("/")) or path, "roles": [], "used_by": []})
+                if role not in e["roles"]:
+                    e["roles"].append(role)
+                e["used_by"].append(n)
+        out = []
+        for e in sorted(seen.values(), key=lambda x: x["name"]):
+            e["state"], e["why"] = self._mount_state(e["path"])
+            e["readable"] = e["state"] == "lesbar"
+            out.append(e)
+        return {"ok": True, "models": out}
+
+    @staticmethod
+    def _mount_state(path: str):
+        if os.path.isfile(path):
+            return "lesbar", "Datei lesbar (%s Bytes)" % os.path.getsize(path)
+        if not os.path.isdir(path):
+            return "nicht_gemountet", "Modell im Container nicht gemountet (Pfad fehlt)"
+        try:
+            entries = os.listdir(path)
+        except OSError as exc:
+            return "nicht_gemountet", "Modell im Container nicht gemountet (Verzeichnis nicht lesbar: %s)" % exc
+        if not entries:
+            return "nicht_gemountet", "Modell im Container nicht gemountet (Verzeichnis leer: Mountpunkt)"
+        return "lesbar", "%d Einträge" % len(entries)
+
     def register(self) -> List[dict]:
         _pj, ref = self.mods()
         return ref.public_register(self.catalog().get("register_wired") or [])

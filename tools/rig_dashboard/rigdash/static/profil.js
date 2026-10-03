@@ -8,7 +8,7 @@
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const st = { list: null, doc: null, view: null, loaded: "", mode: "einfach", search: "", filt: "alle", cards: [], dry: null, exp: null,
-               busy: false, err: null, msg: null, open: {}, fold: {}, dirty: false, started: false };
+               busy: false, err: null, msg: null, open: {}, fold: {}, dirty: false, started: false, models: null, mprof: null, mpath: "" };
   const isOpen = (id, dflt) => (id in st.fold ? st.fold[id] : dflt);
   try { const v = localStorage.getItem("rigdash.pf.view"); if (v === "einfach" || v === "experte") st.mode = v; } catch (e) { /* private window */ }
   const REL = { tauscht: "tauscht mit", braucht: "braucht", schliesst_aus: "schließt aus", abgeleitet_von: "abgeleitet von", skaliert_mit: "skaliert mit" };
@@ -49,6 +49,13 @@
   const doDelete = (name) => run(async () => {
     await api("delete", { name }); st.msg = "Profil " + name + " gelöscht."; st.list = await api("list");
     if (st.loaded === "user:" + name) { st.doc = null; st.view = null; st.loaded = ""; }
+  });
+  const doModels = () => run(async () => { st.models = await api("modelle"); });
+  const doEstimate = (path) => run(async () => {
+    if (!window.ModellProfil) throw new Error("modellprofil.js fehlt (Release-Ausgabe?)");
+    st.mpath = path;
+    const j = await window.ModellProfil.schaetzen(path);
+    st.mprof = { path, profile: j.profile, elapsed: j.elapsed_s, cached: j.cached };
   });
   const doExport = () => run(async () => { st.exp = await api("export", { doc: st.doc }); });
   const doDry = () => run(async () => { st.dry = await api("dry", { doc: st.doc, cards: st.cards.map((c) => ({ card: c.card, pcie: c.pcie })) }); });
@@ -152,6 +159,29 @@
     return `<details class="pf-fold" data-fold="rm" ${isOpen("rm", false) ? "open" : ""}><summary>Aus dem Profil entfernt (${rm.length})</summary>
       <table class="pf-t">${rm.map((p) => `<tr><td class="mono">${esc(p.key)}</td><td class="mono pf-val">${esc(p.value)}</td><td><button type="button" data-reset="${esc(p.key)}" data-to="profil">↺ Profil</button></td></tr>`).join("")}</table></details>`;
   }
+  function drawModels() {
+    const m = st.models;
+    let body;
+    if (!m) body = `<div class="muted pf-note">Zeigt die Modelle und Drafts der Release-Profile und schätzt am Schreibtisch Gewichte, KV-Zelle, Zustand und Extend-Rate aus config.json und den Kopfzeilen der Dateien (kein Gewicht wird gelesen, keine Karte berührt).</div>
+      <div class="pf-row-actions"><button type="button" data-act="models">Modelle laden</button></div>`;
+    else {
+      const rows = m.models.map((e) => `<tr><td><b>${esc(e.name)}</b><div class="muted mono pf-val">${esc(e.path)}</div></td>
+        <td>${esc(e.roles.join(" + "))}<div class="muted">${esc(e.used_by.join(", "))}</div></td>
+        <td><span class="pf-mstate pf-mstate-${esc(e.state)}">${e.readable ? "lesbar" : "Modell im Container nicht gemountet"}</span><div class="muted">${esc(e.why)}</div></td>
+        <td>${e.readable ? `<button type="button" data-est="${esc(e.path)}">Schätzen</button>` : '<span class="muted">nicht schätzbar: nichts zu lesen</span>'}</td></tr>`).join("");
+      body = `<table class="pf-models"><tr><th>Modell</th><th>Rolle · benutzt von</th><th>Zustand in diesem Container</th><th></th></tr>${rows}</table>
+        <div class="pf-row-actions"><label>Anderer Pfad <input type="text" id="pf-mpath" value="${esc(st.mpath)}" size="48" spellcheck="false" placeholder="/spinning/llm_stuff/club-3090/models-cache/&lt;Modell&gt;"></label>
+        <button type="button" data-act="estpath">Schätzen</button></div>`;
+    }
+    let res = "";
+    if (st.mprof) {
+      const p = st.mprof;
+      res = `<h3 class="pf-h3">Modellprofil <span class="muted mono">${esc(p.path)}</span> <span class="muted">${p.cached ? "aus dem Merker" : p.elapsed + " s"}</span></h3>
+        ${window.ModellProfil ? window.ModellProfil.tabelle(p.profile) : ""}
+        <div class="muted pf-note">Jeder Wert nennt seine Quelle (config / Index = exakte Tensorgrößen aus den Kopfzeilen / geschätzt / stat). Laufzeitpuffer sind nicht enthalten: der Planer bucht sie aus den Records.</div>`;
+    }
+    return `<details class="pf-fold" data-fold="models" ${isOpen("models", false) ? "open" : ""}><summary><b>Modell</b> · was steckt im Checkpoint? (Modellprofil am Schreibtisch schätzen)</summary>${body}${res}</details>`;
+  }
   function drawExport() {
     const x = st.exp;
     if (!x) return "";
@@ -191,6 +221,7 @@
     root.innerHTML = `${top}${tip}${st.err ? `<div class="kp-verdict bad">${esc(st.err)}</div>` : ""}${st.msg ? `<div class="muted pf-note">${esc(st.msg)}</div>` : ""}
       ${body}
       <details class="pf-fold" data-fold="dry" ${isOpen("dry", false) ? "open" : ""}><summary><b>Trockenlauf</b> · welche Ablehnungen hätte der Planer?</summary>${drawCards()}${drawDry()}</details>
+      ${drawModels()}
       ${drawExport()}`;
     if (keep) { const el = root.querySelector(`[data-k="${CSS.escape(keep)}"]`); if (el) el.focus(); }
   }
@@ -210,6 +241,7 @@
   root.addEventListener("click", (e) => {
     const t = e.target.closest("button, [data-open], [data-goto]");
     if (!t) return;
+    if (t.dataset.est) return doEstimate(t.dataset.est);
     if (t.dataset.open) { st.open[t.dataset.open] = !st.open[t.dataset.open]; return draw(); }
     if (t.dataset.goto) {
       const row = st.view.rows.find((r) => r.name === t.dataset.goto);
@@ -228,6 +260,8 @@
     if (a === "save") { const n = (document.getElementById("pf-name").value || "").trim(); if (n) doSave(n); else { st.err = "Einen Namen eingeben (a-z, 0-9, . _ -)."; draw(); } return; }
     if (a === "del") { if (st.loaded.startsWith("user:") && confirm("Profil " + st.loaded.slice(5) + " löschen?")) doDelete(st.loaded.slice(5)); return; }
     if (a === "export") return doExport();
+    if (a === "models") return doModels();
+    if (a === "estpath") { const v = (document.getElementById("pf-mpath") || {}).value || ""; if (v.trim()) doEstimate(v.trim()); return; }
     if (a === "dry") return doDry();
     if (a === "cadd") { st.cards.push({ card: st.list.cards[0].id, pcie: { gen: 4, lanes: 8 } }); st.dry = null; return draw(); }
     if (a === "cdel") { st.cards.splice(+t.closest(".pf-card").dataset.i, 1); st.dry = null; return draw(); }

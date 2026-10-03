@@ -557,6 +557,8 @@ def make_handler(app: App):
             try:
                 if path == "/api/profil/list":
                     return self._json(dict(app.profil.list(), ok=True))
+                if path == "/api/profil/modelle":
+                    return self._json(app.profil.known_models())
             except profil.ProfilError as e:
                 return self._json({"ok": False, "error": str(e)}, 400)
             return self._send(404, "not found", "text/plain")

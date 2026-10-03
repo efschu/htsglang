@@ -90,6 +90,12 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 /* <!--DEV:BEGIN--> */
 /* Profil-Editor (Auftrag 930, S1) */
 #pf-root { max-width: 1280px; }
+.pf-h3 { font-size: 13.5px; margin: 10px 0 2px; }
+.pf-models { width: 100%; border-collapse: collapse; } .pf-models td, .pf-models th { padding: 4px 6px; border-top: 1px solid var(--line); font-size: 12.5px; vertical-align: top; text-align: left; }
+.pf-mstate { font-size: 11px; padding: 0 7px; border-radius: 8px; border: 1px solid var(--line); white-space: nowrap; }
+.pf-mstate-lesbar { border-color: var(--good); color: var(--good); } .pf-mstate-nicht_gemountet { border-color: var(--warn); color: var(--warn); }
+.mp-tab { width: 100%; border-collapse: collapse; margin: 6px 0; } .mp-tab th, .mp-tab td { text-align: left; padding: 3px 8px; font-size: 12.5px; border-top: 1px solid var(--line); }
+.mp-tab .mp-grp th { background: var(--surface-2); font-size: 12px; color: var(--text-2); }
 .pf-top { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin: 4px 0 8px; }
 .pf-top select, .pf-top input, .pf-card select, #pf-search, .pf-t input[type=text], .pf-t select { font: inherit; font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); max-width: 100%; }
 #pf-root button { font: inherit; font-size: 12px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--text); cursor: pointer; }
@@ -641,6 +647,7 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
 <script src="zoom.js"></script>
 <!--DEV:BEGIN-->
 <script src="kartenplan.js"></script>
+<script src="modellprofil.js"></script>
 <script src="profil.js"></script>
 <!--DEV:END-->
 <script>
