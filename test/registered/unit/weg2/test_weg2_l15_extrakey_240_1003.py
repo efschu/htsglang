@@ -63,7 +63,7 @@ def _published(c, depth=None):
 
 def test_salted_tip_matches_the_prompt_that_extends_it():
     span = _published(_cand(TIP, EK))
-    got, tips = tc.match_tip([span], TIP + [9, 9])
+    got, tips = tc.match_tip([span], TIP + [9, 9], extra_key=EK)    # 280: pinned, never "any"
     assert got is not None and got[1] == 4 and got[2] == 4 and len(tips) == 1
 
 
@@ -71,8 +71,8 @@ def test_salted_tip_matches_through_the_p_stage_resolution():
     span = _published(_cand(TIP, EK))
     d0 = {"spans": [span]}
     logs = []
-    out = sa.resolve_tree_hint({"tree": True, "prev_rid": "tree:", "n": 6}, d0,
-                               TIP + [9, 9], "q1", logs.append)
+    out = sa.resolve_tree_hint({"tree": True, "prev_rid": "tree:", "n": 6, "extra_key": EK}, d0,
+                               TIP + [9, 9], "q1", logs.append)    # 280: the hint carries the key
     assert out is not None and out["prev_rid"] == span["rid"] and out["n"] == 4
     assert any("tree-match" in x for x in logs)
 
@@ -203,7 +203,7 @@ def test_real_bigram_tree_salted_tip_is_matched():
     slots, _node, _anchor = l15_bind.match_parked(pr, fx.cache)   # the bind still resolves it
     span = sp.build_descriptor(epoch=1, rank=0, prefix=[0, 1], bases=[],
                                spans=[_hold_span(pr.rid, len(slots))])["spans"][0]
-    got, _ = tc.match_tip([span], ids + [7, 8, 9])
+    got, _ = tc.match_tip([span], ids + [7, 8, 9], extra_key=EK)
     assert got == (pr.rid, len(ids) - 1, len(ids))
     assert tc.match_tip([span], ids + [7], extra_key=EK)[0] is not None
     assert tc.match_tip([span], ids + [7], extra_key=None)[0] is None

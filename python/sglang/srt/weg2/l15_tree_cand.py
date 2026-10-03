@@ -439,8 +439,10 @@ def tip_spans(spans: Sequence[Mapping]) -> List[Tuple[str, int]]:
 
 
 class _AnyKey:
-    """Sentinel: ``match_tip`` ignores the extra_key (the wake-mode hint
-    carries the prompt's token ids only)."""
+    """Sentinel: ``match_tip`` ignores the extra_key. L15-WAKE-SALT (280):
+    DIAGNOSTICS / TESTS ONLY -- no serving path passes it any more (the wake
+    hint carries the request's extra_key, an old hint without the field means
+    "unsalted only")."""
 
     def __repr__(self) -> str:
         return "ANY_EXTRA_KEY"
@@ -450,7 +452,7 @@ ANY_EXTRA_KEY = _AnyKey()
 
 
 def match_tip(spans: Sequence[Mapping], token_ids: Sequence[int],
-              extra_key=ANY_EXTRA_KEY
+              extra_key=None
               ) -> Tuple[Optional[Tuple[str, int, int]], List[Tuple[str, int]]]:
     """L15-TREE-FRONT: the held tree tip a prompt extends.
 
@@ -464,10 +466,13 @@ def match_tip(spans: Sequence[Mapping], token_ids: Sequence[int],
     digest mixes the tip's extra_key in, so a salted / multimodal tip could
     never match a bare prefix by it (240).
 
-    ``extra_key``: the default ``ANY_EXTRA_KEY`` matches by tokens alone (the
-    wake-mode hint has no extra_key); a value (incl. ``None``) also demands
-    that ``digest_of(prefix, extra_key)`` is the tip's own digest, i.e. the
-    prompt's extra_key is the tip's (admission mode, the live request).
+    ``extra_key``: the REQUEST's namespace (cache_salt / lora / extra_key);
+    ``digest_of(prefix, extra_key)`` must be the tip's own digest, i.e. the
+    prompt's extra_key is the tip's -- ``None`` (the default) matches UNSALTED
+    tips only, never "any" (L15-WAKE-SALT 280: a tip held under cache_salt A
+    must not serve a request with salt B / no salt). Admission mode passes
+    the live request's, wake mode the extra_key its hint carries.
+    ``ANY_EXTRA_KEY`` (tokens alone) stays for diagnostics and tests.
 
     The span's ``depth`` counts KV slots: ``raw`` == ``depth`` on a plain tree,
     ``depth + 1`` on a bigram tree (units + 1 raw tokens); both are tried and

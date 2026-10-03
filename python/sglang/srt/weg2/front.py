@@ -6366,6 +6366,7 @@ class Front:
                         if reason == "multimodal-unseen-image" else "")
             return None
         ft.remember(text, c.ids)
+        self._l15_ek_note(rid, payload)  # L15-WAKE-SALT: before the hint can be written
         self._sess_prefix(rid, c.ids)  # SESSION-TRACE
         # L3-INDEX PRICE (y7d weg2-0-2 / 2-19): the page-granular store prefix
         # of these exact ids, earlier boots and this one -- a store fact like
@@ -6750,6 +6751,35 @@ class Front:
             logger.info("WEG2 SESSION rid=%s sess=%s src=%s", rid, sess or "-", src)
         except Exception:  # noqa: BLE001 -- an instrument, never the route
             pass
+
+    def _l15_ek_note(self, rid: str, payload) -> None:
+        """L15-WAKE-SALT (280): the request's extra_key (cache_salt +
+        extra_key), kept per rid (bounded) so that the hot hints carry it. A
+        key the front cannot know (LoRA) is kept as unknown: no hint."""
+        try:
+            from sglang.srt.weg2 import l15_share_admit as _l15_sa
+
+            m = self.__dict__.setdefault("_l15_ek", collections.OrderedDict())
+            m[str(rid)] = _l15_sa.payload_extra_key(payload)
+            while len(m) > 4096:
+                m.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- no note = no hint (fail closed)
+            pass
+
+    def _l15_hint_ek(self, rid: str, prev_rid=None):
+        """``(ok, extra_key)`` for a hot hint of ``rid``: ok only when the
+        key is known; with ``prev_rid`` (a hint that names the previous
+        request's own hold) also when the previous request's key is the same,
+        so a hold never crosses a cache_salt."""
+        m = self.__dict__.get("_l15_ek") or {}
+        mine = m.get(str(rid))
+        if mine is None or not mine[0]:
+            return False, None
+        if prev_rid is not None:
+            theirs = m.get(str(prev_rid))
+            if theirs is None or not theirs[0] or theirs[1] != mine[1]:
+                return False, None
+        return True, mine[1]
 
     def _sess_tag(self, rid: str) -> str:
         """`` sess=<hash>`` for a SERVED line (empty without one)."""
@@ -10977,10 +11007,14 @@ class Front:
                 _d = self.groups.get("D")
                 _live = (set(_d.outstanding) if _d is not None else set()) | set(
                     getattr(self, "_d_parked", None) or {})
+                _ek_ok, _ek = Front._l15_hint_ek(
+                    self, p.rid, str(_prev[0]) if _prev and str(_prev[0]) in _live else None)
+                if not _ek_ok:
+                    _prev = None     # L15-WAKE-SALT: key unknown / differs from the held one
                 if _prev and str(_prev[0]) in _live and int(_prev[1]) > 0:
                     _hot_dir = _l15_sp.share_dir(os.environ)
                     _l15_sa.write_hot_hint(_hot_dir, p.rid, str(_prev[0]),
-                                           int(_prev[1]))
+                                           int(_prev[1]), extra_key=_ek)
                     logger.info("HOT-HANDOVER-HINT rid=%s from=%s n=%d",
                                 p.rid, _prev[0], int(_prev[1]))
                 elif _prev:
@@ -10992,7 +11026,7 @@ class Front:
                     if _l15_tc.env_on(os.environ) and _full is not None and len(_full) > 0:
                         _hot_dir = _l15_sp.share_dir(os.environ)
                         _l15_sa.write_hot_hint(_hot_dir, p.rid, _l15_sa.TREE_PREV,
-                                               len(_full), tree=True)
+                                               len(_full), tree=True, extra_key=_ek)
                         logger.info("HOT-HANDOVER-HINT rid=%s tree n=%d (previous turn %s "
                                     "finished: P picks the held tree tip by prefix)",
                                     p.rid, len(_full), _prev[0])
@@ -13374,10 +13408,13 @@ class Front:
                             _r = str(getattr(_q, "rid", ""))
                             _pv = _sprev.get(_r)
                             _ids = _sids.get(_r)
-                            if (_pv and str(_pv[0]) in _dl and int(_pv[1]) > 0
+                            _ek_ok, _ek = Front._l15_hint_ek(
+                                self, _r, str(_pv[0]) if _pv and str(_pv[0]) in _dl else None)
+                            if (_ek_ok and _pv and str(_pv[0]) in _dl and int(_pv[1]) > 0
                                     and _ids is not None and len(_ids) >= int(_pv[1])):
                                 _l15_sa.write_hot_hint(_hdir, _r, str(_pv[0]), int(_pv[1]),
-                                                       ids=list(_ids)[: int(_pv[1])])
+                                                       ids=list(_ids)[: int(_pv[1])],
+                                                       extra_key=_ek)
                                 self._l15_wake_hints.append(_r)
                         if self._l15_wake_hints:
                             logger.info("HOT-HANDOVER-HINT at=wake n=%d rids=%s",
@@ -13397,11 +13434,14 @@ class Front:
                                 _r = str(getattr(_q, "rid", ""))
                                 _pv = _sprev.get(_r)
                                 _full = _tids.get(_r)
+                                _ek_ok, _ek = Front._l15_hint_ek(self, _r)
                                 if (_r in self._l15_wake_hints or not _pv or _full is None
-                                        or str(_pv[0]) in _dl or len(_full) == 0):
+                                        or str(_pv[0]) in _dl or len(_full) == 0
+                                        or not _ek_ok):
                                     continue
                                 _l15_sa.write_hot_hint(_hdir, _r, _l15_sa.TREE_PREV,
-                                                       len(_full), ids=_full, tree=True)
+                                                       len(_full), ids=_full, tree=True,
+                                                       extra_key=_ek)
                                 self._l15_wake_hints.append(_r)
                                 _tree_hinted.append(_r)
                             if _tree_hinted:

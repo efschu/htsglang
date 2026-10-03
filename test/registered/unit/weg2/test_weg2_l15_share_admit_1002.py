@@ -299,7 +299,7 @@ def test_wiring_front_and_resume():
 
     src = inspect.getsource(front)
     i = src.index("_l15_sa.write_hot_hint(_hdir, _r, str(_pv[0]), int(_pv[1]),")
-    assert "if _l15_sa.at_wake(os.environ):" in src[i - 900:i]
+    assert "if _l15_sa.at_wake(os.environ):" in src[i - 1500:i]
     assert "_l15_sa.reap_hot_hint(_l15_sp.share_dir(os.environ), _r)" in src
     assert "_prev = None     # wake mode: the hint went out at the flip" in src
     w = inspect.getsource(wu)
