@@ -412,7 +412,8 @@ def pp0_decide(scheduler, rid: str, now: float, req=None, absolute: bool = True)
     return None
 
 
-def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float) -> None:
+def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float,
+                     pp0_res: Optional[int] = None) -> None:
     o = _pp0_open_map(scheduler).pop(str(rid), None)
     acks = dict(o.acks) if o is not None else {}
     if reason == REASON_ADOPT:
@@ -441,9 +442,9 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
             "PF TOLD-FALLBACK rid=%s told=%d -> 0 reason=%s after=%.2fs acks=%s "
             "followers=%d (n=%d): PP0 switches the request to told=0 for EVERY "
             "rank; P recomputes the prefix instead of the group dying in "
-            "STORE-TOLD WAIT EXCEEDED / MISMATCH",
+            "STORE-TOLD WAIT EXCEEDED / MISMATCH%s",
             rid[:8], told, reason, now - published_at, acks,
-            int(scheduler.ps.pp_size) - 1, n,
+            int(scheduler.ps.pp_size) - 1, n, _fidelity_detail(rid, reason, pp0_res),
         )
 
 
@@ -462,6 +463,18 @@ def adopt_own_read(scheduler, rid: str, told: int) -> None:
     if satisfied is None:
         satisfied = scheduler._weg2_store_told_satisfied = {}
     satisfied[str(rid)] = int(told)
+
+
+def _fidelity_detail(rid: str, reason: str, pp0_res: Optional[int]) -> str:
+    """Q-920 C (measurement only, dual P only): what ``weg2_told_fidelity.pp0_admissible`` answered for
+    this verdict -- the depth PP0's own tree resumes at (reason=told_fidelity: the probe that zeroed
+    the Admit; every other reason: not probed). The y8x/y8z told_fidelity cases (7) could not be sized
+    from the line (analysis 860 section 3 C). The flip form's line is unchanged."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return ""
+    return " | Q-920 C full_rid=%s pp0_admissible=%s" % (str(rid), "not_probed" if pp0_res is None else int(pp0_res))
 
 
 def release_own_read(scheduler, rid: str) -> None:

@@ -1657,14 +1657,16 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             if verdict is None:
                 continue
             told_final, reason = verdict
+            _tf_own = None
             if told_final > 0:
                 # TF: the Admit is PP0's own admission -- told=0 for every rank
                 # when PP0's tree cannot resume at it (weg2_told_fidelity).
-                _tf_told, _ = _tf.pp0_verdict(scheduler, p.req, told_final, p.absolute)
+                _tf_told, _tf_own = _tf.pp0_verdict(scheduler, p.req, told_final, p.absolute)
                 if _tf_told != told_final:
                     told_final, reason = _tf_told, "told_fidelity"
             pacing.pop(rid, None)
-            _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
+            _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at,
+                                 pp0_res=_tf_own if reason == "told_fidelity" else None)
             admit = Weg2StoreAdmit(rid=rid, told=told_final)
             if reason == _fb.REASON_ADOPT:
                 # Q-920 B (dual P only): the followers' common resumable depth -- PP0's read is

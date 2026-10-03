@@ -321,3 +321,40 @@ class TestQ920AdoptFlipUnchanged:
                 assert getattr(wire[-1], FB.WIRE_FALLBACK, None) == 1, env
                 assert getattr(wire[-1], FB.WIRE_ADOPT, None) is None, env
                 assert not any(getattr(s, "_weg2_store_told_satisfied", None) for s in ring.stages), env
+
+
+# --- 3. C told_fidelity: the pp0_admissible value in the fallback line ----------------------------
+
+
+def _fallback_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("PF TOLD-FALLBACK rid=")]
+
+
+def test_c_the_told_fidelity_fallback_line_names_pp0_admissible(dual_p, monkeypatch, caplog):
+    """y8x weg2-0-213 / y8z weg2-0-177: PP0's tree cannot resume at told, the line did not say where it could."""
+    ring = _b_ring(monkeypatch, res_follower=BTOLD, res_pp0=30000)
+    with caplog.at_level(logging.WARNING):
+        plans, wire = _drive(ring)
+    assert plans[0] == plans[1] == plans[2] and plans[0][0][2] == 0       # behaviour unchanged: told=0
+    (line,) = _fallback_lines(caplog)
+    assert "reason=told_fidelity" in line and "pp0_admissible=30000" in line and "full_rid=%s" % BIG in line, line
+
+
+def test_c_other_reasons_say_not_probed(dual_p, monkeypatch, caplog):
+    ring = _b_ring(monkeypatch, acks={2: 0})
+    with caplog.at_level(logging.WARNING):
+        _drive(ring)
+    (line,) = _fallback_lines(caplog)
+    assert "reason=mismatch" in line and "pp0_admissible=not_probed" in line and "full_rid=%s" % BIG in line, line
+
+
+class TestQ920FidelityFlipUnchanged:
+    def test_the_fallback_line_is_the_base_text_on_every_wrong_gate(self, monkeypatch, caplog):
+        for env in OFF_ENVS:
+            caplog.clear()
+            with mock.patch.dict(os.environ, env), caplog.at_level(logging.WARNING):
+                ring = _b_ring(monkeypatch, res_follower=BTOLD, res_pp0=30000)
+                plans, _wire = _drive(ring)
+            assert plans[0][0][2] == 0, env
+            (line,) = _fallback_lines(caplog)
+            assert "reason=told_fidelity" in line and line.endswith("STORE-TOLD WAIT EXCEEDED / MISMATCH"), (env, line)
