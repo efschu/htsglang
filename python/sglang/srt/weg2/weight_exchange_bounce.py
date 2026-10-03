@@ -2358,8 +2358,8 @@ def seq_oncard_ipc() -> bool:
 #: ONCE, and only then digested/recorded/posted (deposit) or placement-checked
 #: (collect). The handshake stays one token per unit; the collect still waits
 #: per unit before it issues that unit's copy. Env: the batch closes at
-#: SGLANG_WEG2_SEQ_SYNC_BATCH_MIB (default 64) or at
-#: SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS (default 32) units, whichever first;
+#: SGLANG_WEG2_SEQ_SYNC_BATCH_MIB (default 256, 27B xsn123; was 64) or at
+#: SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS (default 128, was 32) units, whichever first;
 #: UNITS=1 restores the per-unit form.
 SEQ_SYNC_BATCH_MIB_ENV = "SGLANG_WEG2_SEQ_SYNC_BATCH_MIB"
 SEQ_SYNC_BATCH_UNITS_ENV = "SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS"
@@ -2368,13 +2368,13 @@ SEQ_SYNC_BATCH_UNITS_ENV = "SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS"
 def seq_sync_batch() -> tuple:
     """``(max_bytes, max_units)`` of one sync batch; clamped to sane values."""
     try:
-        mib = float(os.environ.get(SEQ_SYNC_BATCH_MIB_ENV, "64"))
+        mib = float(os.environ.get(SEQ_SYNC_BATCH_MIB_ENV, "256"))
     except ValueError:
-        mib = 64.0
+        mib = 256.0
     try:
-        units = int(os.environ.get(SEQ_SYNC_BATCH_UNITS_ENV, "32"))
+        units = int(os.environ.get(SEQ_SYNC_BATCH_UNITS_ENV, "128"))
     except ValueError:
-        units = 32
+        units = 128
     return int(max(1.0, mib) * (1 << 20)), max(1, min(units, 4096))
 
 
