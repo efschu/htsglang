@@ -120,6 +120,17 @@ class SimModel:
     argv: Tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
     source: str = ""
+    #: NF port 1003: boot the release checkpoint (the format's named
+    #: ``WeightFormat.derivatives[0]``, the abliterated ``...-abl-wxp``) instead
+    #: of the registry's base checkpoint -- what nf.env's PROFILE_MODEL names
+    derivative: bool = False
+    #: experts live in the host store (system RAM): the harness has no host-RAM
+    #: input, so a cell says so instead of passing it silently
+    host_store: bool = False
+    #: a launcher flag the model's argv needs; a line whose launcher does not
+    #: know it (NF: no ``--dual-share``, dual fixes never go to NF) does not
+    #: carry the model (:func:`available_models`)
+    needs_flag: str = ""
 
 
 #: 27B attention geometry (plan 3.1): 24 Q heads, 4 KV heads.
@@ -149,7 +160,7 @@ MODELS: Dict[str, SimModel] = {m.key: m for m in (
     SimModel("27B-NVFP4-DUAL", "qwen27b", "nvfp4", 18753,
              _27B_BASE + ("--dual-share", "--pp-stage-ratio", "45,10,9", "--pp-attn-stage-ratio", "11,2,3",
                           "--extra-p=--max-running-requests=1 --rank-gpu-memory-mib 8740,3000,3500"),
-             {}, "27b-nvfp4-dual.env:81/90; du 18753 MiB"),
+             {}, "27b-nvfp4-dual.env:81/90; du 18753 MiB", needs_flag="--dual-share"),
     SimModel("NF", "nextflash", "int4-mixed", None,
              ("--weg2-weight-source", "exchange",
               "--pp-stage-ratio", "29,11,8", "--pp-attn-stage-ratio", "7,3,2",
@@ -161,7 +172,8 @@ MODELS: Dict[str, SimModel] = {m.key: m for m in (
               f"--extra-p=--rank-moe-resident-fraction {_NF_FR_P} --rank-user-reserve-mib 0,0,0",
               "--extra-d=--rank-role host,worker,worker --rank-tp-ratio 1,0,0 --rank-moe-ratio 183,137,168 "
               f"--rank-moe-resident-fraction {_NF_FR_D} --rank-user-reserve-mib 0,0,0"),
-             {}, "nf.env:90-92,105-107,128-139 (Form A); experts in the host store, no VRAM bound"),
+             {}, "nf.env:90-92,105-107,128-139 (Form A); experts in the host store, no VRAM bound",
+             derivative=True, host_store=True),
 )}
 
 #: The release profile file of each model (docker/profiles_release).
@@ -198,6 +210,17 @@ def models_from_profiles(profiles_dir: str) -> Dict[str, SimModel]:
                             tuple(profile_args(path)), m.env,
                             f"{path} (PROFILE_ARGS)")
     return out
+
+
+def available_models(table: Optional[Mapping[str, SimModel]] = None) -> List[str]:
+    """The model keys THIS tree's launcher can run the hardware path for: a
+    model whose ``needs_flag`` the launcher parser does not know is left out
+    (the NF line has no dual layout). On the 27B line this is every model."""
+    from sglang.srt.weg2 import launcher as L
+
+    known = set(L.build_parser()._option_string_actions)
+    tab = MODELS if table is None else table
+    return [k for k, m in tab.items() if not m.needs_flag or m.needs_flag in known]
 
 
 def _round_robin(keys: Sequence[str], n: int) -> List[str]:
@@ -358,9 +381,10 @@ def simulate(inventory: str, keys: Sequence[str], model: SimModel,
 
     n_sel = len(selection) if selection is not None else len(keys)
     cell = CellResult(inventory=inventory, model=model.key, n_cards=n_sel)
+    _wf = F.profile_row(model.profile).formats[model.weight_format]
     ns = L.build_parser().parse_args(
         ["--tree", "/sim", "--tag", "sim", "--profile", model.profile,
-         "--model", F.profile_row(model.profile).formats[model.weight_format].checkpoint,
+         "--model", (_wf.derivatives[0] if model.derivative and _wf.derivatives else _wf.checkpoint),
          *model.argv])
     env = dict(model.env)
     with replayed(keys, selection):
@@ -407,6 +431,10 @@ def simulate(inventory: str, keys: Sequence[str], model: SimModel,
     if fmt != model.weight_format:
         cell.notes.append(f"PROFILE: format_of -> {fmt!r}, expected {model.weight_format!r}")
     cell.notes.extend(_kernel_notes(model, order))
+    if model.host_store:
+        cell.notes.append("host store: the experts live in system RAM; this harness takes no host-RAM "
+                          "input, so the NF cell proves the card path only (the host-store sizing is "
+                          "measured on the rig, N = 3)")
     gpus = [{"name": c.name, "total_mib": c.total_mib, "memory_mib": c.total_mib,
              "cc_major": c.cc[0] if c.cc else None, "cc_minor": c.cc[1] if c.cc else None}
             for c in order]
@@ -434,7 +462,7 @@ def grid(ns_cards: Sequence[int] = (1, 2, 3, 4, 5, 6), models: Optional[Sequence
     """The standard grid: :func:`scenarios` per N x every model, plus the
     reference rig's ``--cards`` subsets."""
     table = dict(model_table or MODELS)
-    mkeys = list(models or table)
+    mkeys = list(models or available_models(table))
     out: List[CellResult] = []
     for n in ns_cards:
         for label, keys in scenarios(int(n)):
@@ -498,7 +526,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "default: the standard grid")
     ap.add_argument("--cards", default="", help="--cards selection (NVML indices) on --inventory")
     ap.add_argument("--n", default="1,2,3,4,5,6", help="card counts of the standard grid")
-    ap.add_argument("--models", default=",".join(MODELS), help="models: " + ", ".join(MODELS))
+    ap.add_argument("--models", default=",".join(available_models()),
+                    help="models: " + ", ".join(available_models()))
     ap.add_argument("--no-subsets", action="store_true", help="skip the reference rig --cards subsets")
     ap.add_argument("--wide", action="store_true", help="add the argv shape and the notes columns")
     ap.add_argument("--details", action="store_true", help="print every refusal text under the table")
@@ -518,9 +547,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     table = models_from_profiles(ns.profiles_dir) if ns.profiles_dir else dict(MODELS)
     models = [m.strip() for m in ns.models.split(",") if m.strip()]
-    unknown = [m for m in models if m not in MODELS]
+    unknown = [m for m in models if m not in available_models()]
     if unknown:
-        raise SystemExit(f"hw_sim: unknown model(s) {unknown}; models: {', '.join(MODELS)}")
+        raise SystemExit(f"hw_sim: unknown model(s) {unknown}; models: {', '.join(available_models())}")
     if ns.inventory:
         keys = _parse_inventory(ns.inventory)
         sel = None

@@ -47,19 +47,6 @@
    "UNCALIBRATED"
   ]
  ],
- "1x ref 5090+3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-TOPOLOGY",
-  [
-   "SINGLE-MODE",
-   "BARLINK-R1",
-   "DUAL-1",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
  "1x ref 5090+3080 | NF": [
   "verweigert",
   "HW-TOPOLOGY",
@@ -115,19 +102,6 @@
   [
    "SINGLE-MODE",
    "BARLINK-R1",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "1x sm120 5090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-TOPOLOGY",
-  [
-   "SINGLE-MODE",
-   "BARLINK-R1",
-   "DUAL-1",
    "PROFILE-VECTORS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
@@ -197,19 +171,6 @@
    "UNCALIBRATED"
   ]
  ],
- "1x sm86 3080-20G | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-TOPOLOGY",
-  [
-   "SINGLE-MODE",
-   "BARLINK-R1",
-   "DUAL-1",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
  "1x sm86 3080-20G | NF": [
   "verweigert",
   "HW-TOPOLOGY",
@@ -273,19 +234,6 @@
    "UNCALIBRATED"
   ]
  ],
- "1x sm86 3090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-TOPOLOGY",
-  [
-   "SINGLE-MODE",
-   "BARLINK-R1",
-   "DUAL-1",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
  "1x sm86 3090 | NF": [
   "verweigert",
   "HW-TOPOLOGY",
@@ -301,9 +249,8 @@
  ],
  "1x sm89 4090 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-TOPOLOGY",
   [
-   "ARCH-sm89",
    "SINGLE-MODE",
    "BARLINK-R1",
    "PROFILE-VECTORS",
@@ -315,9 +262,8 @@
  ],
  "1x sm89 4090 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-TOPOLOGY",
   [
-   "ARCH-sm89",
    "SINGLE-MODE",
    "BARLINK-R1",
    "PROFILE-VECTORS",
@@ -328,9 +274,8 @@
  ],
  "1x sm89 4090 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-TOPOLOGY",
   [
-   "ARCH-sm89",
    "SINGLE-MODE",
    "BARLINK-R1",
    "PROFILE-VECTORS",
@@ -342,25 +287,10 @@
  ],
  "1x sm89 4090 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-TOPOLOGY",
   [
-   "ARCH-sm89",
    "SINGLE-MODE",
    "BARLINK-R1",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "1x sm89 4090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "SINGLE-MODE",
-   "BARLINK-R1",
-   "DUAL-1",
    "PROFILE-VECTORS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
@@ -369,9 +299,8 @@
  ],
  "1x sm89 4090 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-TOPOLOGY",
   [
-   "ARCH-sm89",
    "SINGLE-MODE",
    "BARLINK-R1",
    "FORM-A-1",
@@ -383,9 +312,8 @@
  ],
  "2x mix 5090/4090/3080 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -397,9 +325,8 @@
  ],
  "2x mix 5090/4090/3080 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -412,14 +339,12 @@
  ],
  "2x mix 5090/4090/3080 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -427,27 +352,10 @@
  ],
  "2x mix 5090/4090/3080 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "2x mix 5090/4090/3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -458,9 +366,8 @@
  ],
  "2x mix 5090/4090/3080 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -505,7 +412,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -517,21 +423,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "2x ref 5090+3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -588,7 +479,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -600,21 +490,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "2x sm120 5090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -671,7 +546,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -683,21 +557,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "2x sm86 3080-20G | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -754,7 +613,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -766,21 +624,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "2x sm86 3090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -804,9 +647,8 @@
  ],
  "2x sm89 4090 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -818,9 +660,8 @@
  ],
  "2x sm89 4090 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -833,14 +674,12 @@
  ],
  "2x sm89 4090 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -848,27 +687,10 @@
  ],
  "2x sm89 4090 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "2x sm89 4090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -879,9 +701,8 @@
  ],
  "2x sm89 4090 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -893,49 +714,36 @@
  ],
  "3x mix 5090/4090/3080 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "3x mix 5090/4090/3080 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "3x mix 5090/4090/3080 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "3x mix 5090/4090/3080 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
-   "UNCALIBRATED"
-  ]
- ],
- "3x mix 5090/4090/3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "3x mix 5090/4090/3080 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
@@ -955,11 +763,6 @@
   []
  ],
  "3x ref 5090+3080 | 27B-NVFP4": [
-  "läuft",
-  "",
-  []
- ],
- "3x ref 5090+3080 | 27B-NVFP4-DUAL": [
   "läuft",
   "",
   []
@@ -991,13 +794,6 @@
   ]
  ],
  "3x sm120 5090 | 27B-NVFP4": [
-  "verweigert",
-  "HW-UNCALIBRATED",
-  [
-   "UNCALIBRATED"
-  ]
- ],
- "3x sm120 5090 | 27B-NVFP4-DUAL": [
   "verweigert",
   "HW-UNCALIBRATED",
   [
@@ -1039,13 +835,6 @@
    "UNCALIBRATED"
   ]
  ],
- "3x sm86 3080-20G | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-UNCALIBRATED",
-  [
-   "UNCALIBRATED"
-  ]
- ],
  "3x sm86 3080-20G | NF": [
   "verweigert",
   "HW-UNCALIBRATED",
@@ -1081,13 +870,6 @@
    "UNCALIBRATED"
   ]
  ],
- "3x sm86 3090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-UNCALIBRATED",
-  [
-   "UNCALIBRATED"
-  ]
- ],
  "3x sm86 3090 | NF": [
   "verweigert",
   "HW-UNCALIBRATED",
@@ -1097,57 +879,43 @@
  ],
  "3x sm89 4090 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "3x sm89 4090 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "3x sm89 4090 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "3x sm89 4090 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
-   "UNCALIBRATED"
-  ]
- ],
- "3x sm89 4090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "3x sm89 4090 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-UNCALIBRATED",
   [
-   "ARCH-sm89",
    "UNCALIBRATED"
   ]
  ],
  "4x mix 5090/4090/3080 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -1159,9 +927,8 @@
  ],
  "4x mix 5090/4090/3080 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -1174,14 +941,12 @@
  ],
  "4x mix 5090/4090/3080 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1189,27 +954,10 @@
  ],
  "4x mix 5090/4090/3080 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "4x mix 5090/4090/3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1220,9 +968,8 @@
  ],
  "4x mix 5090/4090/3080 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -1267,7 +1014,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1279,21 +1025,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "4x ref 5090+3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1350,7 +1081,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1362,21 +1092,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "4x sm120 5090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1433,7 +1148,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1445,21 +1159,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "4x sm86 3080-20G | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1516,7 +1215,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1528,21 +1226,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "4x sm86 3090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1566,9 +1249,8 @@
  ],
  "4x sm89 4090 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -1580,9 +1262,8 @@
  ],
  "4x sm89 4090 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -1595,14 +1276,12 @@
  ],
  "4x sm89 4090 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1610,27 +1289,10 @@
  ],
  "4x sm89 4090 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "4x sm89 4090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1641,9 +1303,8 @@
  ],
  "4x sm89 4090 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -1655,9 +1316,8 @@
  ],
  "5x mix 5090/4090/3080 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -1669,9 +1329,8 @@
  ],
  "5x mix 5090/4090/3080 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -1684,14 +1343,12 @@
  ],
  "5x mix 5090/4090/3080 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1699,27 +1356,10 @@
  ],
  "5x mix 5090/4090/3080 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "5x mix 5090/4090/3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1730,9 +1370,8 @@
  ],
  "5x mix 5090/4090/3080 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -1777,7 +1416,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1789,21 +1427,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "5x ref 5090+3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1860,7 +1483,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1872,21 +1494,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "5x sm120 5090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -1943,7 +1550,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -1955,21 +1561,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "5x sm86 3080-20G | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2026,7 +1617,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2038,21 +1628,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "5x sm86 3090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2076,9 +1651,8 @@
  ],
  "5x sm89 4090 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -2090,9 +1664,8 @@
  ],
  "5x sm89 4090 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -2105,14 +1678,12 @@
  ],
  "5x sm89 4090 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2120,27 +1691,10 @@
  ],
  "5x sm89 4090 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "5x sm89 4090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2151,9 +1705,8 @@
  ],
  "5x sm89 4090 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -2165,9 +1718,8 @@
  ],
  "6x mix 5090/4090/3080 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -2179,9 +1731,8 @@
  ],
  "6x mix 5090/4090/3080 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -2194,14 +1745,12 @@
  ],
  "6x mix 5090/4090/3080 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2209,27 +1758,10 @@
  ],
  "6x mix 5090/4090/3080 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "6x mix 5090/4090/3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2240,9 +1772,8 @@
  ],
  "6x mix 5090/4090/3080 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -2287,7 +1818,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2299,21 +1829,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "6x ref 5090+3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2370,7 +1885,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2382,21 +1896,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "6x sm120 5090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2453,7 +1952,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2465,21 +1963,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "6x sm86 3080-20G | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2536,7 +2019,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2548,21 +2030,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "6x sm86 3090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2586,9 +2053,8 @@
  ],
  "6x sm89 4090 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -2600,9 +2066,8 @@
  ],
  "6x sm89 4090 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -2615,14 +2080,12 @@
  ],
  "6x sm89 4090 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2630,27 +2093,10 @@
  ],
  "6x sm89 4090 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "6x sm89 4090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2661,9 +2107,8 @@
  ],
  "6x sm89 4090 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -2675,9 +2120,8 @@
  ],
  "7x mix 5090/4090/3080 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -2689,9 +2133,8 @@
  ],
  "7x mix 5090/4090/3080 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -2704,14 +2147,12 @@
  ],
  "7x mix 5090/4090/3080 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2719,27 +2160,10 @@
  ],
  "7x mix 5090/4090/3080 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "7x mix 5090/4090/3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2750,9 +2174,8 @@
  ],
  "7x mix 5090/4090/3080 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -2797,7 +2220,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2809,21 +2231,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "7x ref 5090+3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2880,7 +2287,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2892,21 +2298,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "7x sm120 5090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -2963,7 +2354,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -2975,21 +2365,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "7x sm86 3080-20G | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3046,7 +2421,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3058,21 +2432,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "7x sm86 3090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3096,9 +2455,8 @@
  ],
  "7x sm89 4090 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -3110,9 +2468,8 @@
  ],
  "7x sm89 4090 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -3125,14 +2482,12 @@
  ],
  "7x sm89 4090 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3140,27 +2495,10 @@
  ],
  "7x sm89 4090 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "7x sm89 4090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3171,9 +2509,8 @@
  ],
  "7x sm89 4090 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -3185,9 +2522,8 @@
  ],
  "8x mix 5090/4090/3080 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -3199,9 +2535,8 @@
  ],
  "8x mix 5090/4090/3080 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -3214,14 +2549,12 @@
  ],
  "8x mix 5090/4090/3080 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3229,27 +2562,10 @@
  ],
  "8x mix 5090/4090/3080 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "8x mix 5090/4090/3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3260,9 +2576,8 @@
  ],
  "8x mix 5090/4090/3080 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -3307,7 +2622,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3319,21 +2633,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "8x ref 5090+3080 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3390,7 +2689,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3402,21 +2700,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "8x sm120 5090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3473,7 +2756,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3485,21 +2767,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "8x sm86 3080-20G | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3556,7 +2823,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3568,21 +2834,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "8x sm86 3090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3606,9 +2857,8 @@
  ],
  "8x sm89 4090 | 27B-FP8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -3620,9 +2870,8 @@
  ],
  "8x sm89 4090 | 27B-GGUF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
@@ -3635,14 +2884,12 @@
  ],
  "8x sm89 4090 | 27B-INT8": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3650,27 +2897,10 @@
  ],
  "8x sm89 4090 | 27B-NVFP4": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "8x sm89 4090 | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-ARCH",
-  [
-   "ARCH-sm89",
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3681,9 +2911,8 @@
  ],
  "8x sm89 4090 | NF": [
   "verweigert",
-  "HW-ARCH",
+  "HW-COUNT",
   [
-   "ARCH-sm89",
    "XCHG-REGION",
    "BAR1-WINDOW",
    "PP-CUT-PIN",
@@ -3728,7 +2957,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3740,21 +2968,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "rig --cards 0,2 (3080+3080) | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",
@@ -3824,19 +3037,6 @@
    "UNCALIBRATED"
   ]
  ],
- "rig --cards 1 (5090) | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-TOPOLOGY",
-  [
-   "SINGLE-MODE",
-   "BARLINK-R1",
-   "DUAL-1",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
  "rig --cards 1 (5090) | NF": [
   "verweigert",
   "HW-TOPOLOGY",
@@ -3885,7 +3085,6 @@
    "BAR1-WINDOW",
    "PP-CUT-FLOOR",
    "PROFILE-VECTORS",
-   "L15-POSTS",
    "RECORDS-NVEC",
    "METAL-UNPROVEN",
    "UNCALIBRATED"
@@ -3897,21 +3096,6 @@
   [
    "XCHG-REGION",
    "BAR1-WINDOW",
-   "PP-CUT-FLOOR",
-   "PP-CUT-PIN",
-   "PROFILE-VECTORS",
-   "RECORDS-NVEC",
-   "METAL-UNPROVEN",
-   "UNCALIBRATED"
-  ]
- ],
- "rig --cards 1,0 (5090+3080) | 27B-NVFP4-DUAL": [
-  "verweigert",
-  "HW-COUNT",
-  [
-   "XCHG-REGION",
-   "BAR1-WINDOW",
-   "DUAL-FRONT-STAGES",
    "PP-CUT-FLOOR",
    "PP-CUT-PIN",
    "PROFILE-VECTORS",

@@ -30,6 +30,7 @@ puts sm89 into SUPPORTED_ARCHS, P1c makes the exchange region N-capable)::
 GPU-free, NVML-free (replay seam / hand-built cards).
 """
 
+import importlib.util
 import json
 import os
 import unittest
@@ -41,6 +42,10 @@ from sglang.srt.weg2 import card_identity as CI
 from sglang.srt.weg2 import hw_sim as HS
 from sglang.srt.weg2 import launcher as L
 from sglang.srt.weg2 import topology as T
+
+# NF line (order 980): no L1.5 module and no dual flags -- those assertions apply only where the tree carries them
+HAS_L15 = importlib.util.find_spec("sglang.srt.weg2.l15_plan") is not None
+HAS_DUAL = "--dual-share" in L.build_parser()._option_string_actions
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GOLDEN = os.path.join(HERE, "fixtures", "hw_sim_1003", "grid_golden_1to8.json")
@@ -107,9 +112,10 @@ class P1aTopologyFromInventory(unittest.TestCase):
         msg, codes = refused_blockers(ns, L.order_cards(rig()[:2]),
                                       {"SGLANG_WEG2_L15": "1", "SGLANG_WEG2_L15_MIB": "c1=7616,c2=1792"})
         self.assertTrue(msg.startswith("HW-COUNT: 2 cards would be P = TP1 x PP2, D = TP2 x PP1"), msg)
-        self.assertEqual(codes, ["XCHG-REGION", "BAR1-WINDOW", "PP-CUT-FLOOR", "PROFILE-VECTORS",
-                                 "L15-POSTS", "RECORDS-NVEC", "METAL-UNPROVEN"])
-        self.assertIn("c2 names no card of 2", msg)
+        self.assertEqual(codes, ["XCHG-REGION", "BAR1-WINDOW", "PP-CUT-FLOOR", "PROFILE-VECTORS"]
+                         + (["L15-POSTS"] if HAS_L15 else []) + ["RECORDS-NVEC", "METAL-UNPROVEN"])
+        if HAS_L15:
+            self.assertIn("c2 names no card of 2", msg)
         self.assertIn("--user-reserve-mib (3 entries)", msg)
         self.assertIn("weight_exchange_region.py N_CARDS=3", msg)
         self.assertIn("visible: nvml1 NVIDIA GeForce RTX 5090", msg)
@@ -121,11 +127,18 @@ class P1aTopologyFromInventory(unittest.TestCase):
         _, codes = refused_blockers(ns_for("--profile", "nextflash", "--weg2-weight-source", "ring"), rig2)
         self.assertNotIn("XCHG-REGION", codes)
         self.assertNotIn("PP-CUT-FLOOR", codes)  # the 27B pool floor only
-        # dual: the front's stage loop
-        _, codes = refused_blockers(ns_for("--profile", "qwen27b", "--dual-share"), rig2)
-        self.assertIn("DUAL-FRONT-STAGES", codes)
-        msg, _ = refused_blockers(ns_for("--profile", "qwen27b", "--dual-layout"), rig2)
-        self.assertIn("DUAL_P_BARLINK_BAR1_WINDOW_MIB '16,PP_0=64'", msg)
+        # dual: the front's stage loop (the probe itself; the flag exists only on the 27B line)
+        self.assertIn("DUAL-FRONT-STAGES", [b.code for b in T.blockers(2, T.TopologyContext(
+            profile="qwen27b", dual=True))])
+        self.assertIn("DUAL_P_BARLINK_BAR1_WINDOW_MIB '16,PP_0=64'", " ".join(
+            b.where for b in T.blockers(2, T.TopologyContext(profile="qwen27b", dual=True))))
+        self.assertNotIn("DUAL-FRONT-STAGES", [b.code for b in T.blockers(2, T.TopologyContext(
+            profile="nextflash", dual=False))])
+        if HAS_DUAL:
+            _, codes = refused_blockers(ns_for("--profile", "qwen27b", "--dual-share"), rig2)
+            self.assertIn("DUAL-FRONT-STAGES", codes)
+            msg, _ = refused_blockers(ns_for("--profile", "qwen27b", "--dual-layout"), rig2)
+            self.assertIn("DUAL_P_BARLINK_BAR1_WINDOW_MIB '16,PP_0=64'", msg)
         # the format's cut pin (27B NVFP4 49,8,7 / 12,2,2)
         from sglang.srt.weg2 import form as F
 
@@ -260,7 +273,7 @@ class P1bSimulationHarness(unittest.TestCase):
 
     def test_only_the_reference_rig_runs_and_it_runs_every_model(self):
         runs = sorted(k for k, c in self.by_id.items() if c.result == HS.RUNS)
-        self.assertEqual(runs, sorted(f"3x ref 5090+3080 | {m}" for m in HS.MODELS))
+        self.assertEqual(runs, sorted(f"3x ref 5090+3080 | {m}" for m in HS.available_models()))
         for c in self.cells:
             if c.n_cards != 3:
                 self.assertNotEqual(c.result, HS.RUNS, c.row())
@@ -312,7 +325,7 @@ class P1bEmbeddedModelsMatchTheReleaseProfiles(unittest.TestCase):
     def test_embedded_equals_real_for_the_topology_context(self):
         real = HS.models_from_profiles(DOCKER_PROFILES)
         for key, fname in HS.PROFILE_FILES.items():
-            if not os.path.isfile(os.path.join(DOCKER_PROFILES, fname)):
+            if key not in HS.available_models() or not os.path.isfile(os.path.join(DOCKER_PROFILES, fname)):
                 continue
             head = ["--tree", "/t", "--tag", "t", "--profile", HS.MODELS[key].profile]
             want = L.topology_context(L.build_parser().parse_args([*head, *real[key].argv]), {})

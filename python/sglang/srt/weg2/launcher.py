@@ -5924,13 +5924,17 @@ def topology_context(ns, environ: Optional[Mapping[str, str]] = None) -> "_topo.
         fmt = weg2_form.format_of(prof, str(getattr(ns, "model", "") or ""))
     except Exception:  # noqa: BLE001 - an unknown format only drops the cut-pin probe
         fmt = ""
+    try:
+        from sglang.srt.weg2 import l15_plan
+    except ImportError:  # NF line (order 980): no L1.5 module -> L15-POSTS cannot apply
+        l15_plan = None
     return _topo.TopologyContext(
         profile=prof,
         weight_format=str(fmt or ""),
         dual=bool(getattr(ns, "dual_layout", False) or getattr(ns, "dual_share", False)),
         weight_source=str(getattr(ns, "weg2_weight_source", "") or ""),
-        l15=l15_plan.master_on(env),
-        l15_mib=str(env.get(l15_plan.L15_MIB_ENV, "") or ""),
+        l15=bool(l15_plan is not None and l15_plan.master_on(env)),
+        l15_mib=("" if l15_plan is None else str(env.get(l15_plan.L15_MIB_ENV, "") or "")),
         vectors=positional_vector_lengths(ns),
     )
 
