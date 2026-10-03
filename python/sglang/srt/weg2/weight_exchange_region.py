@@ -106,6 +106,7 @@ import struct
 import time
 import zlib
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from sglang.srt.weg2 import shm_namespace as shm_ns
 
 KIB = 1024
 MIB = 1024 * 1024
@@ -572,7 +573,8 @@ def pair_id(src_card: int, dst_card: int) -> int:
 
 
 def region_dir(boot_nonce: str, shm_root: str = SHM_ROOT) -> str:
-    return os.path.join(shm_root, f"{REGION_PREFIX}{boot_nonce}")
+    return os.path.join(
+        shm_root, shm_ns.shm_name_for_root(f"{REGION_PREFIX}{boot_nonce}", shm_root))
 
 
 def region_path(boot_nonce: str, shm_root: str = SHM_ROOT) -> str:
@@ -1816,7 +1818,8 @@ def sem_name(boot_nonce: str, pair: int, slot: int, kind: str) -> str:
             f"does not have"
         )
     src, dst = CROSS_PAIRS[int(pair)]
-    return f"/{REGION_PREFIX}{boot_nonce}-{src}-{dst}-{int(slot)}-{kind}"
+    return shm_ns.posix_sem_name(
+        f"/{REGION_PREFIX}{boot_nonce}-{src}-{dst}-{int(slot)}-{kind}")
 
 
 def cross_sem_name(boot_nonce: str, src_card: int, dst_card: int, slot: int,
@@ -1887,7 +1890,8 @@ def diagonal_sem_name(boot_nonce: str, card: int, slot: int, kind: str) -> str:
             f"slot={slot!r} exceeds SLOTS_PER_PAIR={SLOTS_PER_PAIR}; the "
             f"diagonal carrier is sized for exactly that many slots and a "
             f"third would be a slot nothing charged for")
-    return (f"/{REGION_PREFIX}{boot_nonce}-card{int(card)}-{int(slot)}-{kind}")
+    return shm_ns.posix_sem_name(
+        f"/{REGION_PREFIX}{boot_nonce}-card{int(card)}-{int(slot)}-{kind}")
 
 
 def all_diagonal_sem_names(boot_nonce: str) -> List[str]:
@@ -2023,7 +2027,7 @@ def lane_permit_sem_name(boot_nonce: str) -> str:
     {empty,full}``): it is the only member of this namespace with no digit
     where the cross/diagonal forms have one.
     """
-    return f"/{REGION_PREFIX}{boot_nonce}-lanes-permit"
+    return shm_ns.posix_sem_name(f"/{REGION_PREFIX}{boot_nonce}-lanes-permit")
 
 
 def create_lane_permit_semaphore(boot_nonce: str, permits: int) -> str:

@@ -87,6 +87,7 @@ from sglang.srt.weg2 import (
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import budget_rest as _budget_rest
 from sglang.srt.weg2 import rank_state as rank_state_mod
+from sglang.srt.weg2 import shm_namespace
 from sglang.srt.weg2 import shared_cache_release as shared_cache_release_mod
 from sglang.srt.weg2 import state_file as state_file_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
@@ -6475,8 +6476,17 @@ def shm_residue_sweep(
     except OSError:
         log(f"#1217/#1233 shm residue: {shm_dir} unreadable -- NOT swept, and not read as empty")
         return {"swept": [], "bytes_freed": 0, "refused": {}, "archive": ""}
-    own = [n for n in names if any(n.startswith(p) for p in SHM_OWN_PREFIXES)]
+    # Auftrag 1000: a name under the TEST NAMESPACE (weg2/shm_namespace.py) is a pytest
+    # process's object, not a boot's -- never ours, never a holder, never swept.  The
+    # prefix already puts it outside SHM_OWN_PREFIXES; the explicit filter keeps that true
+    # if a family prefix is ever shortened to something a "test-" name could match.
+    test_ns = [n for n in names if shm_namespace.is_test_shm_name(n)]
+    own = [n for n in names
+           if any(n.startswith(p) for p in SHM_OWN_PREFIXES) and not shm_namespace.is_test_shm_name(n)]
     foreign = len(names) - len(own)
+    if test_ns:
+        log(f"#1217 shm residue (Auftrag 1000): {len(test_ns)} test-namespace entr(ies) "
+            f"({test_ns[:6]}{'...' if len(test_ns) > 6 else ''}) are a pytest run's, not counted as holders, not swept")
     if not own:
         log(f"#1217/#1233 shm residue: none of ours in {shm_dir} ({foreign} foreign entries untouched)")
         return {"swept": [], "bytes_freed": 0, "refused": {}, "archive": ""}
@@ -9374,7 +9384,9 @@ def sweep_xchg_semaphores(
         return []
     prefix = f"sem.{weight_exchange_region.REGION_PREFIX}"
     # rename transition (compat_shims): a dead boot under the other name left its handshake too
-    stale = [n for n in names if n.startswith((prefix,) + _name_counterparts((prefix,)))]
+    stale = [n for n in names
+             if n.startswith((prefix,) + _name_counterparts((prefix,)))
+             and not shm_namespace.is_test_shm_name(n)]
     if not stale:
         log("WEG2-XCHG-SEM residue: none")
         return []
