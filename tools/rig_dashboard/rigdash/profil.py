@@ -416,7 +416,10 @@ class ProfilEditor:
             try:
                 tp.plan_topology(len(cards))
             except tp.TopologyRefused as exc:
-                found.append({"code": "HW-TOPOLOGY", "text": str(exc), "source": "weg2/topology.plan_topology"})
+                # N inside the range that is only not proven ("N cards would be P = ..., proven on metal only for N in [3]") is the value
+                # refusal HW-COUNT (the 27B line names it so); N with no topology at all is HW-TOPOLOGY (not forceable)
+                code = "HW-COUNT" if (str(exc).startswith("HW-COUNT") or " would be " in str(exc)) else "HW-TOPOLOGY"
+                found.append({"code": code, "text": str(exc), "source": "weg2/topology.plan_topology"})
         st = var("PROFILE_STATUS") or ("platzhalter" if var("PROFILE_PLACEHOLDER") == "1" else "abgenommen")
         if st != "abgenommen":
             found.append({"code": "PROFIL-STATUS", "text": "Profil %r hat den Stand %s (%s)" % (doc.get("name"), st.upper(), var("PROFILE_OWNER") or "Eigentümer offen"),

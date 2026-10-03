@@ -133,21 +133,27 @@ class Editor(unittest.TestCase):
     def test_dry_run_names_codes_classes_and_what_force_does(self):
         r = self.ed.load("release", "demo")
         two = self.ed.dry_run(r["doc"], RIG[:2])
-        by = {q["code"]: q for q in two["rejections"]}
+        by = {}
+        for q in two["rejections"]:
+            by.setdefault(q["code"], []).append(q)
         self.assertTrue({"HW-COUNT", "HW-UNCALIBRATED"} <= set(by))
         for c in ("HW-COUNT", "HW-UNCALIBRATED"):
-            self.assertEqual(by[c]["klass"], "wert")
-            self.assertEqual(by[c]["force_state"], "force")
-            self.assertIn("Force übergeht", by[c]["force"])
-            self.assertTrue(by[c]["why_class"])
-        self.assertTrue(by["HW-COUNT"]["text"].startswith("HW-COUNT:"))                       # the planner's own text
-        self.assertEqual(by["HW-TOPOLOGY"]["force_state"], "ungeprueft")
+            for q in by[c]:
+                self.assertEqual(q["klass"], "wert")
+                self.assertEqual(q["force_state"], "force")
+                self.assertIn("Force übergeht", q["force"])
+                self.assertTrue(q["why_class"])
+        self.assertTrue(any(q["text"].startswith("HW-COUNT:") for q in by["HW-COUNT"]))      # the planner's own text
+        self.assertNotIn("HW-TOPOLOGY", by)                         # an unproven N inside the range is HW-COUNT, not "no topology"
         four = self.ed.dry_run(r["doc"], [{"card": "rtx4090-24", "pcie": {"gen": 4, "lanes": 16}}] + RIG)
         arch = {q["code"]: q for q in four["rejections"]}["HW-ARCH"]
         self.assertFalse(arch["forcebar"])
         self.assertEqual(arch["klass"], "nicht_forcebar")
         self.assertIn("nein", arch["force"])
         self.assertIn("bleiben auch mit Force bestehen", four["verdict"])
+        one = self.ed.dry_run(r["doc"], RIG[:1])
+        topo = {q["code"]: q for q in one["rejections"]}["HW-TOPOLOGY"]                      # no flip topology for one card
+        self.assertEqual((topo["klass"], topo["forcebar"], topo["force_state"]), ("nicht_forcebar", False, "blockiert"))
 
     def test_no_force_switch_and_no_start_route_in_the_dashboard(self):
         src = open(S.__file__, encoding="utf-8").read()

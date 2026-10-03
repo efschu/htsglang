@@ -26,6 +26,15 @@ git -C "$repo" cat-file -e "$GATE_REV^{commit}" || { echo "REFUSED: Gate-Revisio
 for f in card_identity.py topology.py; do
   git -C "$repo" cat-file -e "$GATE_REV:python/sglang/srt/weg2/$f" || { echo "REFUSED: $f fehlt in $GATE_REV" >&2; exit 3; }
 done
+# Auftrag 930 (Profil-Editor S1): profile_json.py + refusals.py + profile_catalog.py (stdlib-rein) in dieselbe Stufe. Sie liegen auf dem Planer-Zweig
+# desk/profil-editor-s1-py-1003 (nicht auf der Dashboard-Linie); PROFIL_REV nennt die Revision, aus der sie kommen (Env KARTENPLAN_PROFIL_REV).
+# Das Dashboard laedt sie per Dateipfad (profil.py); der Katalog liegt im rigdash-Release (rigdash/profil_data/catalog.json), die Nutzerprofile
+# in $FLLIPER_PROFILES_DIR (Standard /var/lib/flliper/profiles, derselbe Ort wie im Entrypoint).
+PROFIL_REV=${KARTENPLAN_PROFIL_REV:-136a929fa5}
+git -C "$repo" cat-file -e "$PROFIL_REV^{commit}" || { echo "REFUSED: Revision $PROFIL_REV (Planer-Zweig des Profil-Editors) nicht im Repo" >&2; exit 3; }
+for f in profile_json.py refusals.py profile_catalog.py; do
+  git -C "$repo" cat-file -e "$PROFIL_REV:python/sglang/srt/weg2/$f" || { echo "REFUSED: $f fehlt in $PROFIL_REV" >&2; exit 3; }
+done
 dst=/opt/rigdash/kartenplan/releases/$GATE_REV
 echo "Planer-Stufe: $dst  (card_identity.py, topology.py aus $GATE_REV)"
 if [ "$check_only" = 1 ]; then
@@ -39,15 +48,10 @@ if [ ! -d "$dst/python" ]; then
   done
   echo "$GATE_REV" > "$dst/GATE_REV"
 fi
-# Auftrag 930 (Profil-Editor S1): profile_json.py + refusals.py (stdlib-rein) aus der ZU DEPLOYENDEN Revision in dieselbe Stufe.
-# Sie existieren in GATE_REV noch nicht; das Dashboard laedt sie per Dateipfad (profil.py). Der Katalog liegt im rigdash-Release
-# (rigdash/profil_data/catalog.json), die Nutzerprofile im State-Volume (--profile-dir / <state-dir>/profiles).
+mkdir -p "$dst/python/sglang/srt/weg2"
 for f in profile_json.py refusals.py profile_catalog.py; do
-  if git -C "$repo" cat-file -e "$sha:python/sglang/srt/weg2/$f" 2>/dev/null; then
-    git -C "$repo" show "$sha:python/sglang/srt/weg2/$f" > "$dst/python/sglang/srt/weg2/$f"
-  else
-    echo "WARN: $f fehlt in $sha -- der Profil-Reiter bleibt ohne Planer-Baum (Fehlermeldung im Reiter)" >&2
-  fi
+  git -C "$repo" show "$PROFIL_REV:python/sglang/srt/weg2/$f" > "$dst/python/sglang/srt/weg2/$f"
 done
+echo "Profil-Editor-Module (profile_json.py refusals.py profile_catalog.py) aus $PROFIL_REV"
 ln -sfn "releases/$GATE_REV" /opt/rigdash/kartenplan/current.new && mv -T /opt/rigdash/kartenplan/current.new /opt/rigdash/kartenplan/current
 exec "$here/install.sh" "$sha"

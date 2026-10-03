@@ -38,6 +38,7 @@ SCHEMA = "flliper.server/1"
 _DUMP = r'''
 set +e +u
 export HTSGLANG_INSTRUMENTS="$2"
+export HTSGLANG_TAG='@@HTSGLANG_TAG@@' SGLANG_WEG2_EVIDENCE_DIR='@@SGLANG_WEG2_EVIDENCE_DIR@@' SGLANG_WEG2_GPU_ARB='@@SGLANG_WEG2_GPU_ARB@@'
 declare -A _B
 while IFS= read -r -d '' _kv; do _B["${_kv%%=*}"]="${_kv#*=}"; done < <(env -0)
 cd "$(dirname "$1")" || exit 2
@@ -55,7 +56,7 @@ for _v in $(compgen -v | grep '^PROFILE_' | sort); do
 done
 while IFS= read -r -d '' _kv; do
   _k="${_kv%%=*}"; _x="${_kv#*=}"
-  case "$_k" in _*|OLDPWD|PWD|SHLVL|BASH_FUNC_*|HTSGLANG_INSTRUMENTS) continue ;; esac
+  case "$_k" in _*|OLDPWD|PWD|SHLVL|BASH_FUNC_*|HTSGLANG_INSTRUMENTS|HTSGLANG_TAG|SGLANG_WEG2_EVIDENCE_DIR|SGLANG_WEG2_GPU_ARB) continue ;; esac
   if [ "${_B[$_k]+x}" != x ] || [ "${_B[$_k]}" != "$_x" ]; then printf 'EXP\0%s\0%s\0' "$_k" "$_x"; fi
 done < <(env -0)
 _FK=FORM
@@ -77,6 +78,82 @@ def _canonical(obj) -> str:
 def doc_id(doc: Mapping) -> str:
     """sha256 of the canonical document without its ``id`` (a saved profile names the exact content)."""
     return "sha256:" + hashlib.sha256(_canonical({k: v for k, v in doc.items() if k != "id"}).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# runtime placeholders
+#
+# A profile may use values the ENTRYPOINT sets before it sources the profile (the boot tag, the evidence and arb directories):
+# ``_form SGLANG_MOE_COLD_TIER_INSTANCE "${HTSGLANG_TAG}"``.  Evaluated at import time they would be frozen to nothing.  The dump therefore
+# runs with a sentinel for each of them; a value that carries a sentinel is stored with the placeholder ``${NAME}`` and written back as an
+# expansion the entrypoint resolves at its own run time.  (Caller SWITCHES with a default -- ``${HTSGLANG_DRAFT:-x}`` -- cannot be told from
+# a constant by evaluation; they are listed in ``meta.caller_switches`` and are baked with their default.)
+
+PLACEHOLDERS = ("HTSGLANG_TAG", "SGLANG_WEG2_EVIDENCE_DIR", "SGLANG_WEG2_GPU_ARB")
+_SENTINEL = {n: "@@%s@@" % n for n in PLACEHOLDERS}
+
+
+def _to_placeholders(v: str) -> str:
+    for n, sv in _SENTINEL.items():
+        if sv in v:
+            v = v.replace(sv, "${%s}" % n)
+    return v
+
+
+def _from_placeholders(v: str) -> str:
+    for n, sv in _SENTINEL.items():
+        if "${%s}" % n in v:
+            v = v.replace("${%s}" % n, sv)
+    return v
+
+
+def _walk_strings(obj, fn):
+    if isinstance(obj, str):
+        return fn(obj)
+    if isinstance(obj, list):
+        return [_walk_strings(x, fn) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _walk_strings(v, fn) for k, v in obj.items()}
+    return obj
+
+
+def caller_switches(path: str, _depth: int = 0, _seen=None) -> List[str]:
+    """Names of ``HTSGLANG_*`` / ``FLLIPER_*`` variables the profile (and the profiles it sources, within its directory) READS and that the
+    entrypoint does not set for it: the profile's caller switches, baked with their default by an import."""
+    seen = _seen if _seen is not None else set()
+    out: set = set()
+    if path in seen or _depth > 3:
+        return []
+    seen.add(path)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    for ln in text.splitlines():
+        if ln.lstrip().startswith("#"):
+            continue
+        i = 0
+        while True:
+            i = ln.find("$", i)
+            if i < 0:
+                break
+            j = i + 1
+            if j < len(ln) and ln[j] == "{":
+                j += 1
+            k = j
+            while k < len(ln) and (ln[k].isalnum() or ln[k] == "_"):
+                k += 1
+            name = ln[j:k]
+            if name.startswith(("HTSGLANG_", "FLLIPER_")) and name not in ("HTSGLANG_TAG", "HTSGLANG_INSTRUMENTS"):
+                out.add(name)
+            i = k
+        if "source " in ln and ".env" in ln:
+            base = ln.split("source ", 1)[1].strip().strip('"').strip("'")
+            tail = base.rsplit("/", 1)[-1].strip('"').strip("'")
+            if tail.endswith(".env"):
+                out |= set(caller_switches(os.path.join(os.path.dirname(path), tail), _depth + 1, seen))
+    return sorted(out)
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +289,7 @@ def import_env(path: str, specs: Optional[Mapping[str, Mapping]] = None, runner=
     ``HTSGLANG_INSTRUMENTS=1`` (the three nf*.env put instrument env into ``--env-p/-d``)."""
     r0 = dump_env(path, "0", runner)
     r1 = dump_env(path, "1", runner)
-    f0, f1 = _facts(r0, specs), _facts(r1, specs)
+    f0, f1 = _walk_strings(_facts(r0, specs), _to_placeholders), _walk_strings(_facts(r1, specs), _to_placeholders)
     var0 = {v["name"]: v for v in f0["vars"]}
     doc: Dict[str, object] = {
         "schema": SCHEMA,
@@ -221,7 +298,7 @@ def import_env(path: str, specs: Optional[Mapping[str, Mapping]] = None, runner=
         "source": {"kind": "env", "file": os.path.basename(path), "sha256": _file_sha(path),
                    "rc": r0["rc"]},
         "vars": f0["vars"], "exports": f0["exports"], "args": f0["args"], "form": f0["form"], "instr": f0["instr"],
-        "meta": {"origins": {}, "planner": {}, "notes": []},
+        "meta": {"origins": {}, "planner": {}, "notes": [], "caller_switches": caller_switches(os.path.abspath(path))},
     }
     delta = {k: f1[k] for k in _VARIANT_KEYS if f1[k] != f0[k]}
     if delta:
@@ -244,7 +321,22 @@ def _file_sha(path: str) -> str:
 # rendering
 
 def _q(v: str) -> str:
-    return shlex.quote(v)
+    """Shell-quote ``v``; a ``${PLACEHOLDER}`` stays an expansion (double quotes), everything else is literal."""
+    if "${" not in v:
+        return shlex.quote(v)
+    parts: List[str] = []
+    rest = v
+    while rest:
+        hit = [(rest.find("${%s}" % n), n) for n in PLACEHOLDERS if rest.find("${%s}" % n) >= 0]
+        if not hit:
+            parts.append(shlex.quote(rest))
+            break
+        i, n = min(hit)
+        if i:
+            parts.append(shlex.quote(rest[:i]))
+        parts.append('"${%s}"' % n)
+        rest = rest[i + len(n) + 3:]
+    return "".join(parts)
 
 
 def _assign_block(f: Mapping[str, object], indent: str) -> List[str]:
@@ -333,6 +425,7 @@ def expected_effective(doc: Mapping) -> Dict[str, object]:
         out[ins] = {"vars": vars_, "arrays": arrays, "exports": [[e["name"], str(e["value"])] for e in src["exports"]],
                     "form": [[r["name"], str(r["value"])] for r in src["form"]],
                     "instr": [[r["name"], str(r["value"])] for r in (doc.get("instr") or [])]}
+        out[ins] = _walk_strings(out[ins], _from_placeholders)
     return out
 
 
