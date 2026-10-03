@@ -5953,8 +5953,15 @@ def topology_check_line(ns, cards: Sequence["Card"],
     try:
         t = _topo.plan_topology(len(cards), topology_context(ns, environ))
     except _topo.TopologyRefused as exc:
-        raise Weg2LaunchRefused(
-            f"{exc} || visible: " + "; ".join(card_identity.describe(c) for c in cards)) from exc
+        msg = f"{exc} || visible: " + "; ".join(card_identity.describe(c) for c in cards)
+        # PROFIL-EDITOR S1 on the NF line (order 980 item 4): a value refusal -- --force lifts it and
+        # lists it as FORCED-PAST; without --force this is exactly the raise it was (same text, same cause)
+        if str(exc).startswith("HW-TOPOLOGY"):
+            refusals.refuse_value("HW-TOPOLOGY", msg, Weg2LaunchRefused, cause=exc)
+        else:
+            refusals.refuse_value("HW-COUNT", msg, Weg2LaunchRefused, cause=exc)
+        return (f"HW-TOPOLOGY N={len(cards)}: FORCED past {len(exc.blockers)} blocker(s) "
+                f"({', '.join(b.code for b in exc.blockers) or 'N outside 2..8'}) -- --force")
     return _topo.topology_line(t)
 
 
