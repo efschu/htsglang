@@ -846,6 +846,12 @@ class AnthropicServing:
             request_data["rid"] = anthropic_request.rid
         if anthropic_request.return_cached_tokens_details:
             request_data["return_cached_tokens_details"] = True
+        # Q-460 SALT-ISOLATION: the namespace reaches the chat layer, which
+        # folds it into ``extra_key`` (serving_base._compute_extra_key)
+        for _ns_field in ("cache_salt", "extra_key"):
+            _ns_val = getattr(anthropic_request, _ns_field, None)
+            if _ns_val:
+                request_data[_ns_field] = _ns_val
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:

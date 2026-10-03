@@ -4490,7 +4490,7 @@ class HiCacheController:
 
     @_pass_timed("_1474_probe_ms")  # #1474
     def store_presence_pages(
-        self, token_ids, last_hash, prefix_keys=None, page_keys=None
+        self, token_ids, last_hash, prefix_keys=None, page_keys=None, extra_key=None
     ) -> int:
         """#950: how many pages the STORE holds for this span, by CONTENT KEY.
 
@@ -4555,6 +4555,17 @@ class HiCacheController:
         if not token_ids:
             return 0
         try:
+            # Q-460 SALT-ISOLATION: the request's namespace seeds a chain
+            # from the root -- the key the fetch (a RadixKey carrying
+            # extra_key) and P's write-through (the node's key) use. A
+            # plain id list lost it: the probe answered for the unsalted
+            # chain, i.e. for another tenant's pages.
+            if extra_key is None:
+                extra_key = getattr(token_ids, "extra_key", None)
+            if not last_hash and extra_key is not None:
+                from sglang.srt.mem_cache.utils import namespace_root_hash
+
+                last_hash = namespace_root_hash(extra_key)
             page_hashes = self.get_hash_str(
                 list(token_ids), last_hash, page_size=self.page_size
             )
