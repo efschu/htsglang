@@ -1145,7 +1145,7 @@ LEG1_EARLY_ENV = "SGLANG_WEG2_LEG1_EARLY"
 
 def leg1_early_on(env: Optional[dict] = None) -> bool:
     env = os.environ if env is None else env
-    return str(env.get(LEG1_EARLY_ENV, "1") or "").strip().lower() in ("1", "true", "yes", "on")
+    return str(env.get(LEG1_EARLY_ENV, "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def leg1_early_candidates(queue, limit: int) -> list:
