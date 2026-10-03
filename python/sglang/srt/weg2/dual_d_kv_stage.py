@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import List, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import dual_p_kv_stage as _pk
@@ -397,6 +398,47 @@ def cache_yield(sched, actor) -> int:
     return ev
 
 
+def _arena_census() -> Tuple[int, int]:
+    """(COMPLETE slots, slots) of the shared Mamba-anchor arena this process
+    reads through its registered host pools (the anchor pool; else the first
+    arena); (0, 0) without one."""
+    from sglang.srt.weg2 import handoff_pending as _hp
+
+    pools = [p for p in (r() for r in list(_hp._POOLS)) if p is not None and getattr(p, "arena", None) is not None]
+    pools.sort(key=lambda p: getattr(p, _hp.ROLE_ATTR, "kv") != "anchor")
+    for pool in pools:
+        arena = pool.arena
+        if hasattr(arena, "ref_census"):
+            _pinned, _refs, complete = arena.ref_census()
+            return int(complete), int(arena.slots)
+    return 0, 0
+
+
+def publish_d_signal(sched, actor) -> None:
+    """Q-660: D's shortage beyond the ledger bytes -- its id space and the Mamba
+    arena -- for the front's stages (dual_d_priority.d_signal_short). TP0 only,
+    at most every D_SIGNAL_EVERY_S; an instrument, never raises."""
+    from sglang.srt.weg2 import dual_d_priority as _ddp
+
+    if int(getattr(sched, "tp_rank", 0) or 0) != 0:
+        return
+    t = _pk._now()
+    if t < float(getattr(actor, "_dsig_next", 0.0) or 0.0):
+        return
+    actor._dsig_next = t + _ddp.D_SIGNAL_EVERY_S
+    try:
+        size = int(actor.allocator.size)
+        tree = getattr(sched, "tree_cache", None)
+        evictable = int(tree.evictable_size() or 0) if tree is not None else 0
+        used = size - (int(actor.allocator.available_size()) + evictable)
+        complete, slots = _arena_census()
+        tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
+        _ddp.publish_d_signal(_ddp.d_signal_file(tag), id_frac=used / max(1, size), arena_complete=complete,
+                              arena_slots=slots, now=time.time())
+    except Exception as exc:  # noqa: BLE001 -- the front then sees no D signal: the ledger demand still counts
+        logger.info("%s D-SIGNAL not published: %r", MARK, exc)
+
+
 def tick(sched) -> Optional[str]:
     """Once per scheduler iteration on every D rank. ONE collective per tick
     (MAX of want, P-waiting and the highest live row), so every rank decides on
@@ -450,6 +492,7 @@ def tick(sched) -> Optional[str]:
         # on P goes with it (metal dual20: it stood 4 min after the L seats were gone)
         actor.ledger.clear_pressure()
     _pk.phys_check(actor, "D")
+    publish_d_signal(sched, actor)                          # Q-660: id space + arena for the front
     actor._below = below
     if verdict == "grow":
         actor.group_grow(level)

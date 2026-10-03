@@ -81,14 +81,24 @@ def _p_leg1(rid, intake=None):
     return N - int(told or 0)
 
 
-def _return(sleep: bool, intake=None) -> int:
-    st = DP.PressureStages(sleep_capable=True, sleep_after=1)
+def _return(sleep, intake=None) -> int:
+    st = DP.PressureStages(sleep_capable=True, sleep_after=1, reclaim_after=1)
     base = dict(p_grant_bytes=64, d_air_bytes=32, weights_bytes=1000, host_ok=True)
     act, _ = st.tick(pressure=9, p_committed=500, free_min=0, seats_done=0, **base)
     assert act == "stop"
     f, p = _front_requeue("weg2-0-1")
     assert f.queue[0] is p and p.dual_paused_n == 1 and not p.leg1_done
-    if sleep:
+    if sleep == "lend":
+        # Q-660: stage 1 complete -> P lends awake; calm -> the loan back -> resume
+        act, _ = st.tick(pressure=9, p_committed=0, free_min=0, seats_done=0, **base)
+        assert act == "lend"
+        act, _ = st.tick(pressure=0, p_committed=0, free_min=2000, seats_done=0, p_lent=500, **base)
+        assert act == "reclaim"
+        act, _ = st.tick(pressure=0, p_committed=0, free_min=2000, seats_done=0, p_lent=0, **base)
+        assert act == "resume"
+    elif sleep:
+        act, _ = st.tick(pressure=9, p_committed=0, free_min=0, seats_done=0, **base)
+        assert act == "lend"
         act, _ = st.tick(pressure=9, p_committed=0, free_min=0, seats_done=0, **base)
         assert act == "sleep"
         act, _ = st.tick(pressure=0, p_committed=0, free_min=2000, seats_done=1, **base)
@@ -101,7 +111,7 @@ def _return(sleep: bool, intake=None) -> int:
     return _p_leg1(head.rid, intake=intake)
 
 
-@pytest.mark.parametrize("sleep", [False, True], ids=["stop", "sleep"])
+@pytest.mark.parametrize("sleep", [False, "lend", True], ids=["stop", "lend", "sleep"])
 def test_p_returns_and_computes_only_n_minus_the_store(sleep):
     computed = _return(sleep)
     assert computed == N - STORE, "P prefills what the store does not hold, not the whole prompt"
@@ -117,7 +127,7 @@ def _intake_without_store_read():
     return ns["intake"]
 
 
-@pytest.mark.parametrize("sleep", [False, True], ids=["stop", "sleep"])
+@pytest.mark.parametrize("sleep", [False, "lend", True], ids=["stop", "lend", "sleep"])
 def test_the_requeue_without_store_intake_mutant_is_red(sleep):
     with pytest.raises(AssertionError):
         computed = _return(sleep, intake=_intake_without_store_read())

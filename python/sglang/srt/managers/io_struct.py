@@ -1683,6 +1683,17 @@ class Weg2ParkWindowReqInput(BaseReq, kw_only=True):
     c_ms: float = 0.0
 
 
+class Weg2DualPLendReqInput(BaseReq, kw_only=True):
+    """Q-660 DUAL-AWAKE-LEND: the front's stage-1 order to group P of the dual
+    layout, ``POST /weg2/dual_p_lend`` -- ``action`` "lend" (P, awake and with its
+    KV released, lends its freed device bytes to the card pool) or "reclaim" (the
+    loan back). No reply; every P rank acts on its own card and republishes its
+    stage file (weg2/dual_p_kv_stage.awake_lend / awake_reclaim)."""
+
+    action: str = "lend"
+    why: str = ""
+
+
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     """fnFL2 H43: the front's hint that request ``rid`` (its prompt tokenized
     here, ``input_ids``) will come to this group; the PP0 scheduler starts the

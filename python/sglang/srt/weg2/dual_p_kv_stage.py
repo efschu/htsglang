@@ -563,9 +563,10 @@ def publish_stage(actor: "PKvStage", tag: str, pp_rank: int) -> str:
                    "bytes": actor.table(),
                    # D PRIORITY stage 2: this rank's weights image (the host peak of a sleep)
                    "weights_bytes": int(getattr(actor, "weights_bytes", 0) or 0),
-                   # D PRIORITY stage 2: what this rank lent its card pool while asleep (0
-                   # awake) -- the front's wake check is per card: free >= lent + grant + air
-                   "lent": int(getattr(actor, "_sleep_lent", 0) or 0)}, f)
+                   # D PRIORITY: what this rank lent its card pool -- asleep (stage 2) plus
+                   # awake (Q-660, stage 1) -- the front's return check is per card:
+                   # free >= lent + grant + air
+                   "lent": lent_bytes(actor)}, f)
     os.replace(tmp, path)
     return path
 
@@ -781,12 +782,22 @@ class Weg2DualPWakeShort(RuntimeError):
     case it cannot see."""
 
 
-def _sleep_armed(sched):
+def _lend_armed(sched):
+    """This rank's stage when it is a P rank of the dual layout (the only rank
+    that lends its card pool -- awake at stage 1, asleep at stage 2), else None."""
     if str(os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() != "1":
         return None
     if str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip().upper() != "P":
         return None
     return _actor(sched)
+
+
+_sleep_armed = _lend_armed
+
+
+def lent_bytes(actor) -> int:
+    """What this rank lent its card pool now: the sleep loan plus the awake loan."""
+    return int(getattr(actor, "_sleep_lent", 0) or 0) + int(getattr(actor, "_awake_lent", 0) or 0)
 
 
 def sleep_phys_before(sched) -> Optional[int]:
@@ -826,9 +837,10 @@ def _republish_stage(sched, actor) -> None:
 
 
 def wake_reclaim(sched) -> int:
-    """Before P's wake maps its weights: take the loan back, or stop named."""
+    """Before P's wake maps its weights: take the loan back -- the sleep loan and
+    an awake loan of stage 1 (Q-660) still standing -- or stop named."""
     actor = _sleep_armed(sched)
-    lent = int(getattr(actor, "_sleep_lent", 0) or 0) if actor is not None else 0
+    lent = lent_bytes(actor) if actor is not None else 0
     if lent <= 0:
         return 0
     if not actor.ledger.reclaim(lent):
@@ -836,8 +848,77 @@ def wake_reclaim(sched) -> int:
             "W-DUAL-P-WAKE-SHORT: P's wake needs back the %d B it lent the card pool at its sleep, the pool "
             "has %d B free -- D committed into the loan" % (lent, int(actor.ledger.state().free)))
     actor._sleep_lent = 0
+    actor._awake_lent = 0
     _republish_stage(sched, actor)
     logger.warning("%s WAKE-RECLAIM %d B back from the card pool before P maps its weights", MARK, lent)
+    return lent
+
+
+# -- Q-660 DUAL-AWAKE-LEND: stage 1 lends what an awake P does not need ----------
+#
+# User rule 03.10. (~15:35Z, verbatim): "wenn auf D kv knapp wird, gibt P seinen kv
+# auf". Dual y8v (fs10031504, 15:20:53): D ran its pool to 0.96 and stalled while P
+# kept its share -- the old ladder lent P's bytes only at stage 2 (the sleep). Stage
+# 1 now: P stopped at its chunk boundary and released its KV (release_all, finished
+# chunks in L2); then it returns its device allocator cache and LENDS the freed bytes
+# to the card pool, awake -- D grows into them. The loan comes back (awake_reclaim)
+# only once D's pressure is gone; the sleep (stage 2) stays the next step if not.
+
+LEND_MARK = "Q-660 DUAL-P-LEND"
+RECLAIM_MARK = "Q-660 DUAL-P-RECLAIM"
+
+
+def _empty_device_cache() -> None:
+    import torch
+
+    torch.cuda.empty_cache()
+
+
+def awake_lend(sched, why: str = "", *, phys=None, empty_cache=None) -> int:
+    """Stage 1, awake: P has released its KV (no live page); give the device
+    allocator's cached free blocks back and lend the freed bytes to the card
+    pool. Returns the bytes lent (0 off a dual P rank, with a live page, or when
+    nothing was freed). ``phys``/``empty_cache``: injectable for tests."""
+    actor = _lend_armed(sched)
+    if actor is None:
+        return 0
+    phys = phys or phys_free_bytes
+    if int(getattr(actor, "mapped_tokens", 0) or 0) > 0:
+        logger.warning("%s refused why=%s: P still maps %d KV tokens -- stage 1 lends only after P released "
+                       "its KV", LEND_MARK, why or "-", int(actor.mapped_tokens))
+        return 0
+    before = phys()
+    if before is None:
+        return 0
+    (empty_cache or _empty_device_cache)()
+    after = phys()
+    freed = max(0, int(after or 0) - int(before))
+    if freed:
+        actor.ledger.lend(freed)
+        actor._awake_lent = int(getattr(actor, "_awake_lent", 0) or 0) + freed
+        _republish_stage(sched, actor)
+    logger.warning("%s bytes=%d lent_total=%d why=%s -- P awake (stage 1, KV released) lends its freed "
+                   "device bytes to the card pool; D may grow into them until P reclaims them",
+                   LEND_MARK, freed, int(getattr(actor, "_awake_lent", 0) or 0), why or "-")
+    return freed
+
+
+def awake_reclaim(sched, why: str = "") -> int:
+    """P returns from stage 1: take the awake loan back. Only when the card pool
+    has it free (D did not commit into it) -- else nothing changes and P stays
+    stopped (the front asks again). Returns the bytes reclaimed."""
+    actor = _lend_armed(sched)
+    lent = int(getattr(actor, "_awake_lent", 0) or 0) if actor is not None else 0
+    if lent <= 0:
+        return 0
+    if not actor.ledger.reclaim(lent):
+        logger.warning("%s refused bytes=%d free=%d why=%s -- D still holds part of the awake loan; P stays "
+                       "stopped", RECLAIM_MARK, lent, int(actor.ledger.state().free), why or "-")
+        return 0
+    actor._awake_lent = 0
+    _republish_stage(sched, actor)
+    logger.warning("%s bytes=%d why=%s -- the awake loan is back; P may prefill again", RECLAIM_MARK, lent,
+                   why or "-")
     return lent
 
 
