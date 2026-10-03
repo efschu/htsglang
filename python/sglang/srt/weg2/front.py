@@ -3477,9 +3477,14 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
             rounds += 1
         if not inflight:
             return rounds
+        # Q-670: wake every ``poll_s`` while legs run, not only when the queue was
+        # non-empty at this moment. Dual y8w (fs10031623, 16:37:20): weg2-0-144 went
+        # out alone, the queue was empty for 20 ms, the pool slept on its leg (P's
+        # card grant WAIT) for 143 s -- 8 arrivals behind it, a free slot, nothing
+        # dispatched; the OpenWebUI request weg2-0-151 timed out (503).
         done, _pending = await asyncio.wait(
             set(inflight), return_when=asyncio.FIRST_COMPLETED,
-            timeout=(poll_s if (extra is not None and poll_s > 0 and queue) else None))
+            timeout=(poll_s if poll_s > 0 else None))
         for t in sorted(done, key=seq.__getitem__):
             inflight_tokens -= inflight.pop(t, 0)
             seq.pop(t, None)
@@ -15214,7 +15219,8 @@ class Front:
             return  # no new P pass while D is short
         if not self.queue or time.time() < self._dual_backoff_until:
             return
-        if self.dual_kv_ledgers and self._dual_resume_held():
+        if (self.dual_kv_ledgers and self._dual_resume_held()
+                and not self._dual_short_reorder(head_blocked=True)):
             return  # a paused request waits until every P stage released and D stopped growing
         if self.dual_kv_ledgers and self._dual_p_held_by_stage():
             return  # D PRIORITY: P stopped or asleep until the hysteresis lets it back
@@ -15505,7 +15511,35 @@ class Front:
             return True
         if self._dual_p_held_by_stage():
             return True  # D PRIORITY: P stopped or asleep until the hysteresis lets it back
-        return self._dual_resume_held()
+        if self._dual_resume_held():
+            # Q-670 SHORT-BYPASS: the paused head blocks only itself
+            return not self._dual_short_reorder(head_blocked=True)
+        self._dual_short_reorder(head_blocked=False)  # Q-670 SHORT-FIRST
+        return False
+
+    def _dual_short_reorder(self, *, head_blocked: bool) -> bool:
+        """Q-670 (weg2.dual_parallel): move a short request to the queue head --
+        past a paused head in RESUME-WAIT (``head_blocked``) or past a young long
+        head. True when one was moved."""
+        from sglang.srt.weg2 import dual_parallel as _dpar
+
+        if not self.dual_layout:
+            return False
+        q = self.queue
+        i = _dpar.short_pick(q, head_blocked=head_blocked, limit=_dpar.short_tokens(),
+                             age_s=_dpar.head_age_s(), now=time.time())
+        if i is None:
+            return False
+        head = q[0]
+        p = q[i]
+        del q[i]
+        q.appendleft(p)
+        self.counters["dual_short_bypass" if head_blocked else "dual_short_first"] += 1
+        logger.info("WEG2 %s rid=%s uncached=%d past=%s head_uncached=%d head_wait_s=%.1f%s",
+                    _dpar.BYPASS_MARK if head_blocked else _dpar.FIRST_MARK, p.rid, int(p.est_uncached),
+                    head.rid, int(head.est_uncached), time.time() - float(head.t_arrive),
+                    " (head paused, RESUME-WAIT)" if head_blocked else "")
+        return True
 
     def _dual_resume_held(self) -> bool:
         """A requeued PAUSED request at the head goes back to P only when every

@@ -31,6 +31,8 @@ import logging
 import os
 from typing import List, Optional, Sequence, Tuple
 
+from sglang.srt.weg2 import dual_parallel as _dpar
+
 logger = logging.getLogger(__name__)
 
 MARK = "DUAL-TP3PP3 P-KV"
@@ -688,10 +690,21 @@ def pp0_grant(sched, req) -> Optional[int]:
     # only and found avail=1717 (SF LOADBACK-ROOM PP-RESIDUAL) -> #968. The
     # level now covers this prompt PLUS every other request holding a grant.
     tokens += live_grant_tokens(sched, req, int(actor.page))
+    rid = str(getattr(req, "rid", "?"))[:16]
+    # Q-670 GRANT-BYPASS: an older request waiting for its card grant does not
+    # hold this one back while it is young; past the age the head is the head.
+    older = _older_waits(sched, rid)
+    if older and not _dpar.grant_may_bypass([t for _r, t in older], now=_now(), age_s=_dpar.head_age_s()):
+        _log_wait(rid, tokens)
+        return 0
     own = int(getattr(actor, "_committed", 0) or 0)    # PP0's card: the ledger covers its mapping exactly
     taken: list = []
     lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own}, taken_out=taken)
-    rid = str(getattr(req, "rid", "?"))[:16]
+    if lvl and older:
+        head, since = min(older, key=lambda x: x[1])
+        logger.info("%s %s rid=%s tokens=%d past=%s head_wait_s=%.1f: the head waits for a card, this grant "
+                    "fits now (Q-670, PP0 decides, the told carries it)", MARK, _dpar.GRANT_MARK, rid,
+                    int(tokens), head, _now() - since)
     if lvl:
         k = lvl // int(stages[0]["step"])
         try:
@@ -765,6 +778,25 @@ def _log_wait(rid: str, tokens: int) -> None:
         _CENSUS["waits"] = 0
         _CENSUS["next"] = t + _CENSUS["iv"]
         _CENSUS["iv"] *= 2.0
+
+
+def _older_waits(sched, rid: str) -> list:
+    """(rid, wait start) of every request PP0 still holds for its card grant
+    that started waiting BEFORE ``rid`` did -- only the held ones: a rid that
+    left (abort, finish) keeps no say, and a younger waiter never blocks an
+    older one (two aged waiters would otherwise hold each other for ever)."""
+    held = getattr(sched, "_weg2_store_held", None) or {}
+    own = _WAITS.get(rid)
+    own_t = own[0] if own is not None else _now()
+    out = []
+    for r in held.values():
+        if not getattr(r, "_dual_kv_wait", False):
+            continue
+        k = str(getattr(r, "rid", "?"))[:16]
+        e = _WAITS.get(k)
+        if k != rid and e is not None and e[0] < own_t:
+            out.append((k, e[0]))
+    return out
 
 
 def _wait_granted(rid: str):
