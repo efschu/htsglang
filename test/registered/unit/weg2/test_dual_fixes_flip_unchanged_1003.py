@@ -21,6 +21,7 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-692  dual_handback_defer.* / d_seats.admission_gate exemption / front pause requeue
   Q-693  follower untold waiting abort / PF ACK-ROOM HOLD / PP0 intake stamp / RESUME-OWN-HELD
   Q-695  #791T probe old-instance chunk / old chunk abort store release / #791C new-instance named
+  Q-920  PF NO-ROOM line / told adopt / fallback fidelity suffix / just-finished hold tracker
 """
 from __future__ import annotations
 
@@ -668,3 +669,62 @@ class TestQ695FlipUnchanged:
             s, kept, released = self._abort(monkeypatch, env, [{"weg2-0-235": (0, 1024)}], told=0)
             assert kept == [True], env
             assert not hasattr(s, "_q695_new_named_n"), env
+
+
+# ---------------------------------------------------------------------------------- Q-920
+
+class TestQ920FlipUnchanged:
+    """Q-920 A observability / B told adopt / C fidelity measurement / A1 just-finished hold: on every
+    wrong gate (P KV size set) the follower and PP0 answer exactly as on 5342040a72. (The ring and
+    pump scenarios are test_weg2_q920_dual_told_fallback_1003.TestQ920*FlipUnchanged.)"""
+
+    def test_no_room_line_and_ack_are_the_base_ones(self, caplog):
+        import logging
+
+        from sglang.srt.managers import weg2_told_fallback as FB
+
+        pred = SimpleNamespace(rid="weg2-0-182", fill_ids=[0] * 86561, origin_input_ids=[0] * 86561)
+        req = SimpleNamespace(rid="weg2-0-183")
+        for env in _q693_wrong_gates():
+            caplog.clear()
+            with mock.patch.dict(os.environ, env), mock.patch.object(FB, "_loadback_rows", lambda s, r, t: int(t)), \
+                    caplog.at_level(logging.WARNING, logger=FB.logger.name):
+                tree = SimpleNamespace(token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 3735),
+                                       evictable_size=lambda: 0)
+                s = SimpleNamespace(tree_cache=tree, ps=SimpleNamespace(pp_rank=1), waiting_queue=[req],
+                                    mbs=[SimpleNamespace(reqs=[pred])], max_running_requests=1)
+                assert FB._room_own(s, req, "weg2-0-183", 68096) == 0, env
+            lines = [r.getMessage() for r in caplog.records]
+            assert len(lines) == 1 and lines[0].startswith("PF TOLD-ACK NO-ROOM"), (env, lines)
+            assert "Q-920" not in lines[0] and not hasattr(s, "_q920_nohold_n"), env
+
+    def test_equal_follower_acks_below_told_still_mean_told_zero(self):
+        from sglang.srt.managers import weg2_told_fallback as FB
+        from sglang.srt.managers import weg2_told_fidelity as TF
+
+        for env in _q693_wrong_gates():
+            with mock.patch.dict(os.environ, dict(env, SGLANG_WEG2_TOLD_ABSOLUTE="1")), \
+                    mock.patch.object(TF, "pp0_admissible", lambda s, r, t: min(int(t), 34588)):
+                sch = SimpleNamespace(ps=SimpleNamespace(pp_size=3))
+                FB._pp0_open_map(sch)["r"] = FB._Open(told=40960, deadline=10.0, acks={1: 34588, 2: 34588})
+                assert FB.pp0_decide(sch, "r", 1.0, SimpleNamespace(rid="r"), True) == (0, FB.REASON_MISMATCH), env
+
+    def test_fallback_line_has_no_fidelity_suffix(self):
+        from sglang.srt.managers import weg2_told_fallback as FB
+
+        for env in _q693_wrong_gates():
+            with mock.patch.dict(os.environ, env):
+                assert FB._fidelity_detail("weg2-0-213", "told_fidelity", 30000) == "", env
+
+    def test_nothing_is_tracked_for_a_just_finished_hold(self):
+        from sglang.srt.managers import weg2_told_fallback as FB
+
+        pred = SimpleNamespace(rid="weg2-0-200", fill_ids=[0] * 21766, origin_input_ids=[0] * 21766)
+        for env in _q693_wrong_gates():
+            with mock.patch.dict(os.environ, env):
+                s = SimpleNamespace(ps=SimpleNamespace(pp_rank=1), mbs=[SimpleNamespace(reqs=[pred])],
+                                    max_running_requests=1)
+                FB.jf_note_pass(s)
+                s.mbs = [None]
+                FB.jf_note_pass(s)
+                assert not hasattr(s, FB._JF_ATTR), env
