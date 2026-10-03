@@ -107,7 +107,10 @@ BAR1_NOT_MEASURED = (
     "path and is labelled as such."
 )
 
-BAR1_SHORT = "BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)"
+#: The compute formats the card probe itself measures (the others come from the stage-0 profile only).
+PROBE_FORMATS = ("bf16", "fp8_native", "int8", "nvfp4_w4a8", "nvfp4_marlin")
+
+BAR1_SHORT ="BAR1-Strecke nicht gemessen: kein Einzelprozess-Pfad ohne Server (Begründung: bar1.note)"
 
 #: The compute formats of the view, in display order: key, unit, label.  A format
 #: a card cannot run keeps its row, as "nicht gemessen" with the reason.
@@ -600,7 +603,10 @@ def build(
         if latest_state and driver and latest_state[3].get("driver") not in (None, driver):
             entry["driver_mismatch"] = {"probe": latest_state[3].get("driver"), "live": driver}
         cards_out.append(entry)
-        gaps = [k for k, n in compute.items() if n["v"] is None]
+        # An open gap is a measurement that has not run.  A format the card itself cannot run (fp8 on sm_86,
+        # W4A8 on sm_12x: its reason is stored) is final, and the stage-0-only lanes (fp8 Marlin / W8A16) are
+        # not the probe's to measure -- neither keeps "Hardwareprofil messen" lit forever.
+        gaps = [k for k in PROBE_FORMATS if compute[k]["v"] is None and k not in notes]
         gaps += [k for k in ("sm_count", "l2_mib", "d2d_intra_gbs") if entry[k]["v"] is None]
         gaps += [f"h2d.{k}" for k, n in entry["h2d"].items() if n["v"] is None]
         gaps += [f"d2h.{k}" for k, n in entry["d2h"].items() if n["v"] is None]

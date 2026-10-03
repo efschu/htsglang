@@ -134,6 +134,23 @@ class TestProfileView(CustomTestCase):
         self.assertEqual(c1["compute"]["bf16"]["src"], hp.SRC_NONE)
         self.assertTrue(doc["measure_needed"])
 
+    def test_a_fully_probed_rig_needs_no_measurement_formats_a_card_cannot_run_do_not_count(self):
+        w4a8_gone = {"nvfp4_w4a8": "compute capability 12.0: the W4A8 kernel is the sm_8x one"}
+        _write_probe(self.d.name, "card_probe-all.json", NOW - 60, [
+            _probe_card(U0, "RTX 3080"), _probe_card(U2, "RTX 3080"),
+            _probe_card(U1, "RTX 5090", gemm_fp8_tflops=500.0, fp8_note="", gemm_w4a8_int8_tflops=None,
+                        lane_notes=w4a8_gone, compute_capability="12.0")])
+        doc = self._build()
+        self.assertFalse(doc["measure_needed"], doc["unmeasured"])
+        self.assertEqual(doc["unmeasured"], {"0": [], "1": [], "2": []})
+        # ... but BAR1 stays explicitly not measured, and so does fp8 on the 3080s
+        self.assertFalse(doc["bar1"]["measured"])
+        c0 = next(c for c in doc["cards"] if c["uuid"] == U0)
+        self.assertIsNone(c0["compute"]["fp8_native"]["v"])
+        c1 = next(c for c in doc["cards"] if c["uuid"] == U1)
+        self.assertIn("sm_8x", c1["compute"]["nvfp4_w4a8"]["note"])
+        self.assertEqual(hp.validate(doc), [])
+
     def test_no_fp8_on_sm86_is_the_cards_own_reason_not_a_number(self):
         _write_probe(self.d.name, "card_probe-aaa.json", NOW - 10, [_probe_card(U0, "RTX 3080")])
         n = next(c for c in self._build()["cards"] if c["uuid"] == U0)["compute"]["fp8_native"]
