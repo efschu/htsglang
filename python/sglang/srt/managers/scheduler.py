@@ -10246,6 +10246,12 @@ class Scheduler(
         held = [r for r in self.waiting_queue if str(r.rid).startswith(rid)]
         if not held:
             return False
+        # Q-693 (dual P only): no told of it ever reached this follower, so PP0
+        # had not admitted it -- applied at receipt like PP0 does (y8y PP1 zombie)
+        from sglang.srt.weg2 import dual_untold_abort as _q693
+
+        if _q693.applies_at_receipt(self, held):
+            return False
         pend = self.__dict__.setdefault("_weg2_pending_waiting_aborts", {})
         for r in held:
             pend[str(r.rid)] = [recv_req, 0]

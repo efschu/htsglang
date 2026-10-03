@@ -34,6 +34,9 @@ THE RULES (all pure here; the callers act):
      it -- P was never idle, so 'P committed' never reached 0 and the Q-680
      stale bound (P idle) never applied. 'P committed' is then P's own room
      for other legs; P's admission decides whether the request fits.
+     Q-693: only while ANOTHER leg 1 is in flight on P -- with none, "P
+     committed" is the head's own previous instance on a P stage (dual y8y
+     fs10031814 18:25:43.89, wait_s=0.0 -> PP1 #791T, W17).
 """
 
 from __future__ import annotations
@@ -52,6 +55,8 @@ FIRST_MARK = "DUAL SHORT-FIRST"
 GRANT_MARK = "P-KV GRANT-BYPASS"
 STALE_MARK = "DUAL RESUME-STALE-LEDGER"
 UNSTARVE_MARK = "DUAL RESUME-UNSTARVE"
+#: Q-693: an unstarve verdict withheld because no other leg 1 is in flight on P
+OWN_HELD_MARK = "DUAL RESUME-OWN-HELD"
 #: Q-691 resume reasons
 UNSTARVE_SHORT = "short"
 UNSTARVE_BYPASSED = "bypassed"
@@ -147,10 +152,11 @@ def grant_may_bypass(waiting_since: Sequence[float], *, now: float, age_s: float
 
 
 def resume_unstarve(per, *, head_uncached: int, short_limit: int, wait_s: float,
-                    stale_s: float, bypassed: int) -> Optional[str]:
+                    stale_s: float, bypassed: int, p_busy: bool = True) -> Optional[str]:
     """Q-691 (front, dual only): may a paused head in RESUME-WAIT go back to P
     although some card still shows "P committed"? Only when NO card shows
-    pressure or D demand (a missing row is never clear), and then
+    pressure or D demand (a missing row is never clear), ANOTHER leg 1 is in
+    flight on P (``p_busy``, Q-693), and then
 
       * ``short``    -- its uncached rest is itself a SHORT-BYPASS candidate
         (``head_uncached <= short_limit``), or
@@ -158,8 +164,17 @@ def resume_unstarve(per, *, head_uncached: int, short_limit: int, wait_s: float,
         least one SHORT-BYPASS went past it (P kept busy: "P committed" never
         drops to 0, the Q-680 idle bound cannot apply).
 
+    Q-693 (dual y8y fs10031814 18:25:43.89): with NO other leg in flight "P
+    committed" is not P's room for its other legs -- it is the paused head's
+    OWN previous instance, still held by a P stage (PP1/PP2 apply the pause
+    abort only once PP0 is idle). Resuming then (wait_s=0.0, reason=short)
+    sent the same rid back to P twice in 0.4 s; PP1 kept the aborted instance
+    queued under that rid and died in #791T STORE-TOLD HOP OVERDUE (the metal
+    dual22 class the all-zeros rule closed). That head waits for all zeros,
+    or for Q-680 on a stale ledger.
+
     None = keep waiting (resume at all zeros, or Q-680 on a stale ledger)."""
-    if not per:
+    if not per or not p_busy:
         return None
     for row in per:
         if row is None:

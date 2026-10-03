@@ -15580,6 +15580,7 @@ class Front:
                             "growing (per card (pressure, P committed, D demand) = %s)", head.rid,
                             now - self._dual_resume_wait_since, per)
             self._dual_resume_wait_since = None
+            self._q693_own_held_rid = None
             self._dual_unstarve_reset(head)
             return False
         if getattr(self, "_dual_resume_wait_since", None) is None:
@@ -15592,10 +15593,22 @@ class Front:
         # 12 bypasses on [(0,1107296256,0),(0,201326592,0),(0,301989888,0)].
         if self.dual_layout:
             wait_s = now - self._dual_resume_wait_since
+            # Q-693: 'P committed' is P's room for OTHER legs only while one is in
+            # flight; with none it is this head's own previous instance on a P stage
+            p_busy = any(rid != head.rid for rid in self._dual_inflight)
             why = _dpar.resume_unstarve(
                 per, head_uncached=int(getattr(head, "est_uncached", 0) or 0),
                 short_limit=_dpar.short_tokens(), wait_s=wait_s, stale_s=_dpar.resume_stale_s(),
                 bypassed=int(getattr(head, "dual_bypassed_n", 0) or 0))
+            if why is not None and not p_busy:
+                if getattr(self, "_q693_own_held_rid", None) != head.rid:
+                    self._q693_own_held_rid = head.rid
+                    self.counters["dual_resume_own_held"] += 1
+                    logger.warning("WEG2 %s rid=%s would-be=%s waited %.1f s: no other leg 1 in flight, so "
+                                   "'P committed' %s is this head's own previous instance on a P stage -- no "
+                                   "RESUME-UNSTARVE, it resumes at all zeros or Q-680 (Q-693)",
+                                   _dpar.OWN_HELD_MARK, head.rid, why, wait_s, per)
+                why = None
             if why is not None:
                 self.counters["dual_resume_unstarve"] += 1
                 logger.warning("WEG2 %s rid=%s reason=%s wait_s=%.1f bypassed=%d head_uncached=%d per=%s "
@@ -15623,6 +15636,7 @@ class Front:
                                now - self._dual_resume_wait_since, per)
                 self._dual_resume_wait_since = None
                 self._dual_resume_stale_since = None
+                self._q693_own_held_rid = None
                 self._dual_unstarve_reset(head)
                 return False
         else:

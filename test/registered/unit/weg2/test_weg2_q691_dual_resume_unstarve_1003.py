@@ -99,6 +99,9 @@ class ShortHeadResumes(_Base):
     def test_metal_short_paused_head_resumes_on_p_committed(self):
         async def run():
             f = self._setup(173)
+            # metal: P was never idle -- a SHORT-BYPASS leg is in flight (Q-693:
+            # without one, 'P committed' is the head's own previous instance)
+            f._dual_inflight["weg2-0-320"] = _pending("weg2-0-320", 600)
             with self.assertLogs(F.logger.name, level="WARNING") as cm:
                 held = self._held(f)
             return f, held, cm.output
@@ -120,7 +123,8 @@ class BypassedHeadResumes(_Base):
             r = [self._held(f)]
             moved = f._dual_short_reorder(head_blocked=True)       # the pump's SHORT-BYPASS
             head = f.queue[1]
-            f.queue.popleft()                                       # the short one went to P
+            short = f.queue.popleft()                               # the short one went to P
+            f._dual_inflight[short.rid] = short                     # ... and is in flight there
             r.append(self._held(f))                                 # young wait: still held
             f._dual_resume_wait_since = time.time() - 11.0          # >= RESUME_STALE_S (10)
             with self.assertLogs(F.logger.name, level="WARNING") as cm:
