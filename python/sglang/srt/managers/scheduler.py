@@ -1569,10 +1569,14 @@ def _weg2_store_presence(
     cached = getattr(req, "_pp_store_presence_cache", None)
     if cached is not None and cached[0] == key:
         return cached[1]
+    # Q-460 SALT-ISOLATION: asked in the request's namespace (cache_salt /
+    # extra_key) -- the unsalted chain is another tenant's pages.
+    _ek = getattr(req, "extra_key", None)
+    _ns = {"extra_key": _ek} if _ek is not None else {}
     if keys:
-        pages = probe(tokens, last_hash, prefix_keys, page_keys=keys)
+        pages = probe(tokens, last_hash, prefix_keys, page_keys=keys, **_ns)
     else:
-        pages = probe(tokens, last_hash, prefix_keys)
+        pages = probe(tokens, last_hash, prefix_keys, **_ns)
     present = bool(pages)
     req._pp_store_presence_cache = (key, present)
     tree = getattr(sched, "tree_cache", None)
@@ -13670,7 +13674,10 @@ class Scheduler(
                 if cached is not None and cached[0] == key:
                     pages = int(cached[1])
                 else:
-                    pages = int(probe(span, last_hash, prefix_keys) or 0)
+                    # Q-460 SALT-ISOLATION: the request's namespace
+                    _ek = getattr(req, "extra_key", None)
+                    _ns = {"extra_key": _ek} if _ek is not None else {}
+                    pages = int(probe(span, last_hash, prefix_keys, **_ns) or 0)
                     req._weg2_store_match_cache = (key, pages)
                 # The probe counts PAGES; the arm votes TOKENS, because the
                 # extent it prices is a token count. Clamped to the span so a

@@ -687,7 +687,7 @@ def _adopt_keys(scheduler, req) -> None:
                         rid8(req), digest, verdict, n)
 
 
-def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None):
+def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None, extra_key=None):
     """#1416c (boot xsn174): ``store_presence_pages`` asks the store about
     the FIRST ``STORAGE_BATCH_SIZE`` (128) pages only -- a 98,550-token span
     whose anchor sits on its last page answered 0, so told was clamped to 0
@@ -696,12 +696,19 @@ def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None):
     ``batch_exists_v2`` over every page key with the tree's component
     transfers (the mamba anchor is the trailing-pages pool). None = the
     question could not be asked.
+
+    Q-460 SALT-ISOLATION: ``extra_key`` (the request's namespace) seeds a
+    plain id list's chain; a RadixKey carries its own.
     """
     try:
-        # a RadixKey (#1416d) goes in as is -- the hash reads its bigram flag;
-        # a plain id list keeps the pre-#1416d call.
+        # a RadixKey (#1416d) goes in as is -- the hash reads its bigram flag
+        # and its namespace; a plain id list keeps the pre-#1416d call.
+        from sglang.srt.mem_cache.utils import namespace_root_hash
+
+        _ek = extra_key if extra_key is not None else getattr(ids, "extra_key", None)
         hashes = cc.get_hash_str(
-            ids if not isinstance(ids, list) else list(ids), None, page_size=page_size
+            ids if not isinstance(ids, list) else list(ids),
+            namespace_root_hash(_ek), page_size=page_size
         )
         if not hashes:
             return 0
@@ -802,7 +809,8 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
                     (time.perf_counter() - _t_probe) * 1000.0, _hit,
                 )
         else:
-            pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size)
+            pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size,
+                                              extra_key=getattr(req, "extra_key", None))
         if pages is None:
             # the full-span question could not be asked: no clamp (the
             # pre-#1416 number; #1419 caps every rank's match to told, so a

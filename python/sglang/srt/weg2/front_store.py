@@ -139,8 +139,12 @@ def store_components(store_dir: str, suffix: str) -> FrozenSet[str]:
     return frozenset(out)
 
 
-def bigram_page_hasher(ids: np.ndarray, page_size: int, bigram: bool) -> List[str]:
-    """The page keys of ``ids`` as the tree keys them (complete pages only)."""
+def bigram_page_hasher(ids: np.ndarray, page_size: int, bigram: bool,
+                       extra_key: Optional[str] = None) -> List[str]:
+    """The page keys of ``ids`` as the tree keys them (complete pages only).
+
+    Q-460 SALT-ISOLATION: ``extra_key`` is the request's namespace (cache_salt
+    + extra_key); the store keys a namespaced chain from its own root seed."""
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.utils import get_hash_str
 
@@ -150,7 +154,7 @@ def bigram_page_hasher(ids: np.ndarray, page_size: int, bigram: bool) -> List[st
         return []
     raw = array("q")
     raw.frombytes(np.ascontiguousarray(ids, dtype=np.int64).tobytes())
-    hashes = get_hash_str(RadixKey(raw, None, is_bigram=bool(bigram)), None, page_size=int(page_size))
+    hashes = get_hash_str(RadixKey(raw, extra_key, is_bigram=bool(bigram)), None, page_size=int(page_size))
     return list(hashes[:pages])
 
 
@@ -426,8 +430,17 @@ class StorePresence:
                      ms=(time.perf_counter() - t0) * 1000.0, tier=tier, l3_pages=int(l3_pages),
                      form="fast", asked=int(st.lookups))
 
-    def depth(self, ids: Optional[np.ndarray], fast: Optional[bool] = None) -> Depth:
-        """``fast``: None = the switch SGLANG_WEG2_FRONT_PROBE_FAST (default on)."""
+    def _hash(self, ids: np.ndarray, extra_key: Optional[str]) -> List[str]:
+        # the default namespace keeps the 3-argument hasher call (test doubles)
+        if extra_key is None:
+            return self.hasher(ids, self.page_size, self.bigram)
+        return self.hasher(ids, self.page_size, self.bigram, extra_key)
+
+    def depth(self, ids: Optional[np.ndarray], fast: Optional[bool] = None,
+              extra_key: Optional[str] = None) -> Depth:
+        """``fast``: None = the switch SGLANG_WEG2_FRONT_PROBE_FAST (default on).
+        ``extra_key``: the request's namespace (Q-460) -- the store depth OF
+        THAT NAMESPACE; another tenant's pages are not this request's credit."""
         t0 = time.perf_counter()
         if ids is None or ids.size == 0:
             return Depth(tokens=0, kv_pages=0, pages=0, ms=0.0)
@@ -435,12 +448,12 @@ class StorePresence:
         if fast is None:
             fast = probe_fast_on()
         if fast:
-            hashes = self.hasher(ids, self.page_size, self.bigram)
+            hashes = self._hash(ids, extra_key)
             try:
                 return self._depth_fast(hashes, t0)
             except UnicodeEncodeError:
                 pass  # a non-ASCII stem: the list form below asks it utf-8 encoded
-        hashes = self.hasher(ids, self.page_size, self.bigram)
+        hashes = self._hash(ids, extra_key)
         memo: Dict[str, Tuple[bool, bool]] = {}
         pages, kv = self._pages(hashes, memo, (0, 1))
         l3_pages = self._pages(hashes[:pages], memo, (0,))[0] if pages > 0 else 0
