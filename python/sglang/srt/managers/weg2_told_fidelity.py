@@ -74,6 +74,25 @@ def _node_has_state(node) -> bool:
 def pp0_admissible(scheduler, req, told: int) -> Optional[int]:
     """The prefix PP0's own tree can resume ``req`` from, capped at ``told``
     keys; None = the probe could not be asked (no verdict)."""
+    return _admissible(scheduler, req, told, aligned=False)
+
+
+def rank_resumable(scheduler, req, told: int) -> Optional[int]:
+    """W27-UNIFORM (NF e124d8f431, P 02.10. 22:37:12Z weg2-58-576 and
+    23:05:11Z weg2-6-77): the prefix THIS rank's admission -- the capped match
+    plus the #988 load-back -- reaches for ``req``, capped at ``told`` keys;
+    None = no verdict.
+
+    :func:`pp0_admissible` plus the load-back's own clamp: a host hit loads
+    back only up to the state anchor (``state_aligned_extent``, the
+    expression ``stamp_state_aligned_extent`` applies), so a host KV run whose
+    end carries no recurrent state stops the admission at the anchor below
+    it -- exactly where PP1/PP2 stopped (13184, the twin anchor of the
+    sibling) while PP0 loaded back to its told (16640 / 16896)."""
+    return _admissible(scheduler, req, told, aligned=True)
+
+
+def _admissible(scheduler, req, told: int, aligned: bool) -> Optional[int]:
     try:
         tree = getattr(scheduler, "tree_cache", None)
         match = getattr(tree, "match_prefix", None)
@@ -98,6 +117,16 @@ def pp0_admissible(scheduler, req, told: int) -> Optional[int]:
         depth = dev + host
         if depth <= 0:
             return 0
+        anchor = getattr(mr, "state_anchor_depth", None) if aligned else None
+        if aligned and host > 0 and isinstance(anchor, int):
+            # the load-back's own extent (#1040): KV beyond the deepest state
+            # anchor is not loaded back, the admission resumes at the anchor
+            from sglang.srt.managers.pp_admission_congruence import state_aligned_extent
+
+            extent, _raised = state_aligned_extent(
+                host, anchor, dev, getattr(mr, "key_match_depth", None)
+            )
+            return min(dev + int(extent), int(told))
         node = getattr(mr, "last_host_node", None) if host > 0 else getattr(mr, "last_device_node", None)
         if node is not None and not _node_has_state(node):
             return 0  # the #928 (a) refusal zeroes the whole match

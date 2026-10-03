@@ -1606,6 +1606,99 @@ def _pop_credit_keep_pin(tree, rid: str) -> int:
     return int(tree.prefetch_loaded_tokens_by_reqid.pop(rid, 0) or 0)
 
 
+#: W27-UNIFORM switch (default ON): a follower's admission at an absolute told
+#: checks its LIVE tree, not only its read's completion record; 0 = the record
+#: alone (pre-fix, byte for byte).
+ENV_REACH_TOLD = "SGLANG_WEG2_FOLLOWER_REACH_TOLD"
+
+
+def follower_reach_told_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_REACH_TOLD, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admission") -> int:
+    """W27-UNIFORM (NF e124d8f431, P 02.10. 22:37:12Z weg2-58-576 and
+    23:05:11Z weg2-6-77 -- the two deaths of that image): a FOLLOWER admits
+    an absolute told only when its OWN TREE reaches it; when it does not, the
+    follower re-reads the missing span from the store (PP0 read the same keys
+    a pass ago) and waits for it here -- PP0 stays the authority, the
+    follower follows, no rank refuses.
+
+    THE BREAK. The follower's early read (DP-NACHLAUF, default ON since
+    20cd343551) ran at intake, BEFORE PP0 released the twin (``#TW
+    TWIN-DEFER``): it read the whole span into this rank's host tier (576:
+    matched=0 loaded=16640; 77: on top of its sibling 76's host read,
+    matched=13184 loaded=3712). By the time PP0's twin told came (10-17 s
+    later) the sibling had been released (``PF TOLD-FALLBACK ABSORBED`` --
+    the abort path unpins its host span) and prefilled from 0, and the
+    early read's span no longer resumed past the sibling's twin anchor. The
+    settle compared PP0's told with the read's COMPLETION RECORD
+    (``FOLLOWER-EARLY-SETTLE told=16896 own=16896 -> equal``), the admission
+    match then reached only the device head 13184, no ``#988 LOADBACK`` on
+    PP1/PP2 -- PP0 loaded back to 16640 / 16896 and sent 194 / 174 rows for
+    the followers' 3650 / 3886: ``PPWidthDivergenceRefused`` (START-SPLIT),
+    group dead. PP0 asks its own tree before the Admit (TF); the followers
+    never asked theirs.
+
+    Returns the own prefix the caller compares with told: ``told`` when the
+    tree reaches it (now or after the re-read), else ``own`` unchanged (the
+    record; the old behaviour -- the W27 guard names a remaining split, no new
+    refusal here)."""
+    rid = _rid(req)
+    try:
+        if is_pp0(scheduler) or int(told) <= 0 or not follower_reach_told_on():
+            return own
+    except Exception:  # noqa: BLE001 - a stand-in without ps
+        return own
+    live = _tf.rank_resumable(scheduler, req, int(told))
+    if live is None or int(live) >= int(told):
+        return own
+    tree = scheduler.tree_cache
+    n = getattr(scheduler, "_w27u_short_n", 0) + 1
+    scheduler._w27u_short_n = n
+    logger.warning(
+        "W27-UNIFORM FOLLOWER TREE SHORT rank pp=%s rid=%s told=%d own_record=%d live=%d "
+        "site=%s (n=%d): this rank's tree no longer reaches PP0's told (the read's record "
+        "does); re-reading [%d, %d) from the store before admitting -- PP0's prefix stands",
+        scheduler.ps.pp_rank, _rt(rid), int(told), int(own), int(live), site, n,
+        int(live), int(told),
+    )
+    try:
+        _pop_credit_keep_pin(tree, rid)
+    except Exception:  # noqa: BLE001
+        pass
+    satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
+    if satisfied:
+        satisfied.pop(rid, None)
+    verdict = _follower_register(scheduler, req, int(told), early=False)
+    if str(verdict).startswith("issued"):
+        deadline = time.monotonic() + WAIT_CAP_S
+        while not tree.check_prefetch_progress(rid):
+            if time.monotonic() > deadline:
+                break  # named below: the tree is still short
+            time.sleep(0.002)
+    if satisfied:
+        satisfied.pop(rid, None)
+    after = _tf.rank_resumable(scheduler, req, int(told))
+    if after is not None and int(after) < int(told):
+        logger.error(
+            "W27-UNIFORM FOLLOWER STILL SHORT rank pp=%s rid=%s told=%d live=%d verdict=%s "
+            "(n=%d): the re-read did not bring this rank's tree to PP0's told -- the "
+            "#1233 W27 guard will name the split at the forward",
+            scheduler.ps.pp_rank, _rt(rid), int(told), int(after), verdict, n,
+        )
+        return own
+    n2 = getattr(scheduler, "_w27u_reread_n", 0) + 1
+    scheduler._w27u_reread_n = n2
+    logger.warning(
+        "W27-UNIFORM FOLLOWER RE-READ rank pp=%s rid=%s told=%d live=%s verdict=%s (n=%d): "
+        "this rank's tree reaches PP0's told again -- admitted at told like PP0",
+        scheduler.ps.pp_rank, _rt(rid), int(told), after, verdict, n2,
+    )
+    return int(told)
+
+
 def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional[int]:
     """The admission gate on every rank. ``None`` = skip this pass (verdict
     outstanding). Otherwise this rank's loaded credit, after its completed
@@ -1653,7 +1746,10 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         # _follower_register): admit at told, no read to wait for.
         satisfied.pop(rid, None)
         told_map.pop(rid, None)
-        _twin.take_follower_twin(scheduler, rid)
+        if _twin.take_follower_twin(scheduler, rid):
+            # W27-UNIFORM: "holds the span" was the read's record -- the
+            # tree must still reach told when this rank admits.
+            follower_reach_told(scheduler, req, told, int(told), site="satisfied")
         return 0
     # The single-phase form waits here for a read registered THIS pass (the
     # stage stops for it); the paced form (#1416e) registered it a window
@@ -1675,6 +1771,9 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         # TW: an absolute twin told -- this rank's own prefix is the head its
         # registration matched plus the span its read completed.
         own = _twin.registered_head(req) + int(own)
+        if int(own) == int(told):
+            # W27-UNIFORM: the record says told; the tree must say it too.
+            own = follower_reach_told(scheduler, req, told, int(own), site="admission")
     credit = _pop_credit_keep_pin(tree, rid)
     told_map.pop(rid, None)
     if own != told:
