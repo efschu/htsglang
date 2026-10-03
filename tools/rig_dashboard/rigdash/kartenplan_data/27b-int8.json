@@ -1,0 +1,2177 @@
+{
+ "argv_from_log": {
+  "D": [
+   "/opt/venv/bin/python",
+   "-m",
+   "sglang.launch_server",
+   "--model-path",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "--trust-remote-code",
+   "--json-model-override-args",
+   "{\"language_model_only\": true}",
+   "--served-model-name",
+   "Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "--rank-gpu-id",
+   "0,1,2",
+   "--skip-server-warmup",
+   "--kv-cache-dtype",
+   "fp8_e4m3",
+   "--context-length",
+   "262144",
+   "--max-kv-per-request",
+   "262144",
+   "--reasoning-parser",
+   "qwen3",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--chat-template-default-kwargs",
+   "{\"preserve_thinking\": true}",
+   "--enable-cache-report",
+   "--enable-metrics",
+   "--enable-hierarchical-cache",
+   "--hicache-host-role",
+   "staging",
+   "--hicache-size",
+   "4",
+   "--hicache-mamba-host-mib",
+   "100",
+   "--hicache-write-policy",
+   "write_back",
+   "--hicache-storage-backend",
+   "file",
+   "--hicache-mem-layout",
+   "layer_first",
+   "--hicache-io-backend",
+   "direct",
+   "--hicache-storage-backend-extra-config",
+   "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+   "--hicache-canonical-kv-page",
+   "--host",
+   "127.0.0.1",
+   "--chunked-prefill-size",
+   "4096",
+   "--scheduler-distributed-teardown",
+   "--page-size",
+   "1",
+   "--random-seed",
+   "785500001",
+   "--mamba-slot-reorder",
+   "--kv-backing-relief",
+   "--barlink",
+   "--barlink-transport",
+   "bar1",
+   "--barlink-bar1-cap-cycles",
+   "300000000000",
+   "--collective-census-interval",
+   "50",
+   "--uneven-dcp",
+   "--uneven-dcp-weighted",
+   "--mamba-ssm-dtype",
+   "bfloat16",
+   "--enable-memory-saver",
+   "--max-running-requests",
+   "6",
+   "--tp-prefill-max-tokens",
+   "12288",
+   "--mamba-radix-cache-strategy",
+   "extra_buffer",
+   "--tp-size",
+   "3",
+   "--pp-size",
+   "1",
+   "--num-continuous-decode-steps",
+   "2",
+   "--rank-gpu-memory-mib",
+   "27792,17384,17168",
+   "--rank-tp-ratio",
+   "58,25,25",
+   "--speculative-algorithm",
+   "DFLASH",
+   "--speculative-draft-model-path",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "--speculative-num-draft-tokens",
+   "8",
+   "--speculative-draft-window-size",
+   "2048",
+   "--enable-linear-replayssm-spec",
+   "--linear-replayssm-cache-len",
+   "16",
+   "--barlink-bar1-window-mib",
+   "16,TP_0=32,DCP_0=40",
+   "--barlink-uncovered-class",
+   "refuse",
+   "--port",
+   "30032",
+   "--rank-mlp-ratio",
+   "652,218,218"
+  ],
+  "P": [
+   "/opt/venv/bin/python",
+   "-m",
+   "sglang.launch_server",
+   "--model-path",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "--trust-remote-code",
+   "--json-model-override-args",
+   "{\"language_model_only\": true}",
+   "--served-model-name",
+   "Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "--rank-gpu-id",
+   "0,1,2",
+   "--skip-server-warmup",
+   "--kv-cache-dtype",
+   "fp8_e4m3",
+   "--context-length",
+   "262144",
+   "--max-kv-per-request",
+   "262144",
+   "--reasoning-parser",
+   "qwen3",
+   "--tool-call-parser",
+   "qwen3_coder",
+   "--chat-template-default-kwargs",
+   "{\"preserve_thinking\": true}",
+   "--enable-cache-report",
+   "--enable-metrics",
+   "--enable-hierarchical-cache",
+   "--hicache-host-role",
+   "staging",
+   "--hicache-size",
+   "1",
+   "--hicache-mamba-host-mib",
+   "100",
+   "--hicache-write-policy",
+   "write_back",
+   "--hicache-storage-backend",
+   "file",
+   "--hicache-mem-layout",
+   "layer_first",
+   "--hicache-io-backend",
+   "direct",
+   "--hicache-storage-backend-extra-config",
+   "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+   "--hicache-canonical-kv-page",
+   "--host",
+   "127.0.0.1",
+   "--chunked-prefill-size",
+   "2048",
+   "--scheduler-distributed-teardown",
+   "--page-size",
+   "1",
+   "--random-seed",
+   "785500001",
+   "--mamba-slot-reorder",
+   "--kv-backing-relief",
+   "--barlink",
+   "--barlink-transport",
+   "bar1",
+   "--barlink-bar1-cap-cycles",
+   "300000000000",
+   "--collective-census-interval",
+   "50",
+   "--mamba-ssm-dtype",
+   "bfloat16",
+   "--enable-memory-saver",
+   "--max-running-requests",
+   "1",
+   "--tp-size",
+   "1",
+   "--pp-size",
+   "3",
+   "--pp-async-batch-depth",
+   "0",
+   "--disable-overlap-schedule",
+   "--pp-stage-ratio",
+   "43,11,10",
+   "--pp-attn-stage-ratio",
+   "10,3,3",
+   "--rank-gpu-memory-mib",
+   "26344,8312,13864",
+   "--barlink-bar1-window-mib",
+   "24,PP_0=96",
+   "--speculative-algorithm",
+   "DFLASH",
+   "--speculative-draft-model-path",
+   "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "--speculative-num-draft-tokens",
+   "8",
+   "--speculative-draft-kv-only",
+   "--max-total-tokens",
+   "310242",
+   "--port",
+   "30031",
+   "--max-mamba-cache-size",
+   "24",
+   "--cuda-graph-config",
+   "{\"prefill\":{\"backend\":\"full\",\"bs\":[512],\"full_prefill_max_req\":1}}",
+   "--max-running-requests=2"
+  ]
+ },
+ "boot": {
+  "boot_id": "27bbf-boot-20261003T090641Z-30ca",
+  "boot_profile": "27b-row-authority-cut43",
+  "form": {
+   "D": {
+    "arch": "dense",
+    "describe": "arch=dense experts=none draft=dflash p_draft=cold kv=paged_dcp flip=family vision=transient",
+    "draft": "dflash",
+    "experts": "none",
+    "flip": "family",
+    "kv": "paged_dcp",
+    "model": "Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "p_draft": "cold",
+    "profile": "qwen27b",
+    "vision": "transient"
+   },
+   "P": {
+    "arch": "dense",
+    "describe": "arch=dense experts=none draft=dflash p_draft=cold kv=paged_dcp flip=family vision=transient",
+    "draft": "dflash",
+    "experts": "none",
+    "flip": "family",
+    "kv": "paged_dcp",
+    "model": "Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "p_draft": "cold",
+    "profile": "qwen27b",
+    "vision": "transient"
+   }
+  },
+  "image": "htsglang:cu130-weg2-rc12z30y8r-27b-nf",
+  "ipc_era": true,
+  "lifecycle": "stopped_clean",
+  "rev": "55c95a89c7",
+  "state_dir": "/spinning/docker-acceptance/27b/state/27bbf-boot-20261003T090641Z-30ca",
+  "tag": "dkr27browauthoritycut43bar1fs10030906"
+ },
+ "boot_json": {
+  "budgets": {
+   "D": [
+    27792,
+    17384,
+    17168
+   ],
+   "P": [
+    26344,
+    8312,
+    13864
+   ]
+  },
+  "cards": [
+   {
+    "name": "NVIDIA GeForce RTX 5090",
+    "nvml_index": 1,
+    "reserved_mib": 518,
+    "total_mib": 32607,
+    "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
+   },
+   {
+    "name": "NVIDIA GeForce RTX 3080",
+    "nvml_index": 0,
+    "reserved_mib": 425,
+    "total_mib": 20480,
+    "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7"
+   },
+   {
+    "name": "NVIDIA GeForce RTX 3080",
+    "nvml_index": 2,
+    "reserved_mib": 425,
+    "total_mib": 20480,
+    "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
+   }
+  ],
+  "dc_expect_d": {
+   "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 2082,
+   "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 1650,
+   "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 1650
+  },
+  "dc_measured_p": {
+   "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 1104,
+   "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 588,
+   "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 814
+  },
+  "stamp": "1003_090656",
+  "tag": "dkr27browauthoritycut43bar1fs10030906",
+  "tip": "55c95a89c7"
+ },
+ "budget_lines": [
+  {
+   "budget_mib": 26344,
+   "group": "P",
+   "label": "P",
+   "log_line": 36,
+   "name": "NVIDIA GeForce RTX 5090",
+   "nvml": 1,
+   "ordinal": 0,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 3259,
+    "dormant": 2082,
+    "floor": 2855,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": null,
+    "over": 920,
+    "over_prov": "boot weg2ls2b2",
+    "reserve": 1800
+   },
+   "seq": 0,
+   "terms": "total 32607 - corridor 3259 (floor 2855 source=MEASURED-P reserve=1800 + awake_overshoot 404) - dormant_other 2082 - measured_awake_overshoot 920 (boot weg2ls2b2) MiB"
+  },
+  {
+   "budget_mib": 15928,
+   "group": "P",
+   "label": "P",
+   "log_line": 38,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 0,
+   "ordinal": 1,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2899,
+    "dormant": 1650,
+    "floor": 2495,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": null,
+    "over": null,
+    "over_prov": null,
+    "reserve": 1400
+   },
+   "seq": 1,
+   "terms": "total 20480 - corridor 2899 (floor 2495 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1650 MiB"
+  },
+  {
+   "budget_mib": 15656,
+   "group": "P",
+   "label": "P",
+   "log_line": 40,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 2,
+   "ordinal": 2,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2662,
+    "dormant": 1650,
+    "floor": 2258,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": null,
+    "over": 512,
+    "over_prov": "boot weg2ls2b2",
+    "reserve": 1400
+   },
+   "seq": 2,
+   "terms": "total 20480 - corridor 2662 (floor 2258 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1650 - measured_awake_overshoot 512 (boot weg2ls2b2) MiB"
+  },
+  {
+   "budget_mib": 26344,
+   "group": "P",
+   "label": "P",
+   "log_line": 45,
+   "name": "NVIDIA GeForce RTX 5090",
+   "nvml": 1,
+   "ordinal": 0,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 3259,
+    "dormant": 2082,
+    "floor": 2855,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": 0,
+    "over": 920,
+    "over_prov": "boot weg2ls2b2",
+    "reserve": 1800
+   },
+   "seq": 3,
+   "terms": "total 32607 - corridor 3259 (floor 2855 source=MEASURED-P reserve=1800 + awake_overshoot 404) - dormant_other 2082 - measured_awake_overshoot 920 (boot weg2ls2b2) - l15 0 (L1.5 post) MiB"
+  },
+  {
+   "budget_mib": 8312,
+   "group": "P",
+   "label": "P",
+   "log_line": 47,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 0,
+   "ordinal": 1,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2899,
+    "dormant": 1650,
+    "floor": 2495,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": 7616,
+    "over": null,
+    "over_prov": null,
+    "reserve": 1400
+   },
+   "seq": 4,
+   "terms": "total 20480 - corridor 2899 (floor 2495 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1650 - l15 7616 (L1.5 post) MiB"
+  },
+  {
+   "budget_mib": 13864,
+   "group": "P",
+   "label": "P",
+   "log_line": 49,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 2,
+   "ordinal": 2,
+   "parsed": {
+    "awake_rest": null,
+    "booked": null,
+    "booked_prov": null,
+    "carve": null,
+    "corridor": 2662,
+    "dormant": 1650,
+    "floor": 2258,
+    "floor_source": "MEASURED-P",
+    "growth": null,
+    "l15": 1792,
+    "over": 512,
+    "over_prov": "boot weg2ls2b2",
+    "reserve": 1400
+   },
+   "seq": 5,
+   "terms": "total 20480 - corridor 2662 (floor 2258 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1650 - measured_awake_overshoot 512 (boot weg2ls2b2) - l15 1792 (L1.5 post) MiB"
+  },
+  {
+   "budget_mib": 27792,
+   "group": "D",
+   "label": "D",
+   "log_line": 221,
+   "name": "NVIDIA GeForce RTX 5090",
+   "nvml": 1,
+   "ordinal": 0,
+   "parsed": {
+    "awake_rest": null,
+    "booked": 3191,
+    "booked_prov": "D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300",
+    "carve": 518,
+    "corridor": null,
+    "dormant": 1104,
+    "floor": null,
+    "floor_source": null,
+    "growth": null,
+    "l15": null,
+    "over": 489,
+    "over_prov": null,
+    "reserve": null
+   },
+   "seq": 6,
+   "terms": "total 32607 - driver_carve 518 (NVML reserved) - dormant_other 1104 - awake_rest_booked 3191 (RECORD D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300; replaces corridor floor transient 767 (source=MEASURED-D), user reserve 1800, awake_overshoot 404, measured_awake_overshoot 489) MiB"
+  },
+  {
+   "budget_mib": 17384,
+   "group": "D",
+   "label": "D",
+   "log_line": 223,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 0,
+   "ordinal": 1,
+   "parsed": {
+    "awake_rest": null,
+    "booked": 2079,
+    "booked_prov": "D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300",
+    "carve": 425,
+    "corridor": null,
+    "dormant": 588,
+    "floor": null,
+    "floor_source": null,
+    "growth": null,
+    "l15": null,
+    "over": null,
+    "over_prov": null,
+    "reserve": null
+   },
+   "seq": 7,
+   "terms": "total 20480 - driver_carve 425 (NVML reserved) - dormant_other 588 - awake_rest_booked 2079 (RECORD D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300; replaces corridor floor transient 700 (source=MEASURED-D), user reserve 1400, awake_overshoot 404) MiB"
+  },
+  {
+   "budget_mib": 17168,
+   "group": "D",
+   "label": "D",
+   "log_line": 225,
+   "name": "NVIDIA GeForce RTX 3080",
+   "nvml": 2,
+   "ordinal": 2,
+   "parsed": {
+    "awake_rest": null,
+    "booked": 2067,
+    "booked_prov": "D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300",
+    "carve": 425,
+    "corridor": null,
+    "dormant": 814,
+    "floor": null,
+    "floor_source": null,
+    "growth": null,
+    "l15": null,
+    "over": null,
+    "over_prov": null,
+    "reserve": null
+   },
+   "seq": 8,
+   "terms": "total 20480 - driver_carve 425 (NVML reserved) - dormant_other 814 - awake_rest_booked 2067 (RECORD D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300; replaces corridor floor transient 701 (source=MEASURED-D), user reserve 1400, awake_overshoot 404) MiB"
+  }
+ ],
+ "budgets_final": {
+  "D": [
+   27792,
+   17384,
+   17168
+  ],
+  "P": [
+   26344,
+   8312,
+   13864
+  ]
+ },
+ "built_from": {
+  "boot_json": "/spinning/docker-acceptance/27b/evidence/docker_dkr27browauthoritycut43bar1fs10030906/boot_dkr27browauthoritycut43bar1fs10030906.json",
+  "evidence": {
+   "D": [
+    "/spinning/docker-acceptance/27b/evidence/boot_weg2_dkr27browauthoritycut43bar1fs10030906_55c95a89c7_1003_090656.D.log"
+   ],
+   "P": [
+    "/spinning/docker-acceptance/27b/evidence/boot_weg2_dkr27browauthoritycut43bar1fs10030906_55c95a89c7_1003_090656.P.log"
+   ],
+   "front": [
+    "/spinning/docker-acceptance/27b/evidence/boot_weg2_dkr27browauthoritycut43bar1fs10030906_55c95a89c7_1003_090656.front.log"
+   ]
+  }
+ },
+ "flag_docs": {
+  "--anon-preboot-bytes": {
+   "code_help": "#1269 fix 3: cgroup memory.stat `anon` measured by the launcher preflight BEFORE this boot existed. The only valid foreign baseline for the W22 split -- `cgroup anon - sum(RssAnon)` is not subtractable and printed foreign=-30.91 GiB on weg2sb5b. 0 = unset, and then no split is printed rather than an invented one."
+  },
+  "--awake": {},
+  "--barlink": {
+   "code_help": "Enable barlink. Promoted from SGLANG_BARLINK (#781)."
+  },
+  "--barlink-bar1-cap-cycles": {
+   "code_help": "Ceiling on barlink's build-time cycle budget, both groups. Default {...} is large BY CONSTRUCTION: it is a ceiling, not a target, and the gate that actually binds on this rig is the BAR1 aperture priced at --barlink-bar1-window-mib (#1234 C1), not this number."
+  },
+  "--barlink-bar1-window-mib": {
+   "code_help": "BAR1 aperture window in MiB. Either a bare integer (applies to every group) or a comma-separated list mixing a bare default with GROUP=VALUE overrides, e.g. '24,PP_0=96,FLIP_TP_0=48,FLIP_DCP_0=32'. Promoted from SGLANG_BARLINK_BAR1_WINDOW_MIB and its per-group suffixed variants (#781). These are TIGHT: the two 3080s expose only 256 MiB of BAR1 each, so a departing tenant holding ~211 MiB of that aperture is the difference between a boot and a refusal."
+  },
+  "--barlink-transport": {
+   "code_help": "Barlink transport ('device', 'bar1', ...). Promoted from SGLANG_BARLINK_TRANSPORT (#781). NOTE: the consumer at device_communicators/barlink.py caches this at MODULE IMPORT, so the value must be settled before that import -- which a flag guarantees and a mid-process env write does not."
+  },
+  "--barlink-uncovered-class": {
+   "code_help": "What happens when the configured barlink transport does not cover a message class at its size. 'warn' (the default, and today's behaviour) logs once per operation and size class and answers on the inline host-staged gloo plane -- correct, but measured 4.7x slower per byte than bar1 on a 96-MiB all_reduce. 'refuse' stops the group instead. Note there is no NCCL rung underneath: a barlink-owned group never constructs a PyNccl communicator (parallel_state.should_build_pynccl), so a declined size has exactly one destination. Use 'refuse' where a silent 4.7x on a hot-path class is worse than a failed boot -- #1234, group D of the Weg-2 launcher."
+  },
+  "--carrier-max-tokens": {
+   "code_help": "#1246: ship a LOWER carrier bound than the one the census reads from group D's own '#915 PREFETCH LIMIT' line. IT CAN ONLY LOWER IT: N is accepted exactly on floor < N <= measured, where 'measured' is the budget group D's KV carrier reports it will enforce and 'floor' is the route floor derived from the front's own two bypass branches. N ABOVE measured is a W45 Weg2CarrierCensusRefused (operator_above_measured): a higher number does not enlarge the carrier, it only stops the front bypassing prompts the carrier cannot read back, so everything priced between measured and N takes leg 1 on P and a leg-2 store read the store must refuse -- the '#915 PREFETCH REFUSED' / W16 shape of boot weg2ls4b2"
+  },
+  "--chat-template-default-kwargs": {
+   "code_help": "JSON object of default chat_template_kwargs applied to every chat completion before rendering, e.g. '{\"preserve_thinking\": true}'. Per-request chat_template_kwargs override these key by key. Use this to make a template flag that only exists per request into a serving default; 'preserve_thinking' in particular keeps prior-turn think blocks in the rendered prompt so multi-turn prompts stay a byte-exact prefix of what was generated, which is what lets the KV prefix cache hit instead of re-prefilling the conversation on every turn. --default-chat-template-kwargs (upstream #29579 spelling) is an alias of this flag."
+  },
+  "--chunked-prefill-size": {},
+  "--collective-census-interval": {
+   "code_help": "How often the collective census prints, both groups. Default {...} is a STRIDE and not a measurement: larger is quieter, smaller costs log volume, and nothing about the boot depends on it except how much of it a reader sees."
+  },
+  "--commit": {
+   "code_help": "#1233 fix 8: the tip this boot runs, stamped into every measurement"
+  },
+  "--context-length": {
+   "code_help": "The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). {...}"
+  },
+  "--cuda-graph-config": {
+   "code_help": "Per-phase CUDA graph settings as JSON, e.g. '{\"decode\":{\"backend\":\"full\",\"max_bs\":256},\"prefill\":{\"backend\":\"tc_piecewise\",\"tc_compiler\":\"eager\"}}'. Allowed backends per phase: full, breakable, tc_piecewise, disabled (full is decode-only). JSON wins over the per-phase --cuda-graph-* convenience flags and over legacy flags."
+  },
+  "--d-bs": {
+   "code_help": "K2: group D's --max-running-requests AND the number of front seats, so the front never hands D more concurrent requests than D can run. Default {...} by the user order of 2026-09-09 ('der decode bs6 soll mit bs6 (nicht mehr bs4) der standard werden'), which superseded that same day's 'bs4 fuer decode' before it reached metal. Equally provisional and equally re-measurable."
+  },
+  "--d-hold-s": {
+   "code_help": "27B idle policy (c), passed to the front: D stays awake this many seconds after its own work ended before it flips -- at rest under --idle-layout pp, and in front of a small backlog FLIP-ECONOMICS holds -- so a SHORT arrival inside the hold is served without a flip. Unset (default) or 0 = off = today: the idle flip waits for --min-dwell-ms only, a held backlog for --fairness-w-s only.",
+   "profile_comment": {
+    "source": "27b.env:126",
+    "text": "(c) D bleibt 10 s nach eigener Arbeit wach, bevor der Idle-Flip kommt"
+   }
+  },
+  "--d-short-drain-tokens": {
+   "code_help": "27B idle policy (b), passed to the front: while D is awake, a queued backlog made ONLY of SHORT requests (each <= X, law 4 -- D never prefills above X) whose uncached tokens sum to at most N is served on D instead of waiting for a flip. N > X is refused (W153: law 4 holds for the sum of a drain too), and the front caps every drain at min(N, the X in force). 0 (default) = off = today: such a backlog waits for FLIP-ECONOMICS (--flip-min-work-tokens) or the fairness bound.",
+   "profile_comment": {
+    "source": "27b.env:127",
+    "text": "(b) Rueckstau nur aus SHORT-Requests (je <= X=4096) bis 4096 Tokens bedient D ohne Flip"
+   }
+  },
+  "--dc-reserve": {
+   "code_help": "uuid=mib,uuid=mib"
+  },
+  "--decode": {},
+  "--decode-sid": {},
+  "--disable-overlap-schedule": {
+   "code_help": "Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker."
+  },
+  "--drain-deadline-s": {
+   "code_help": "K10: seconds before a flip is refused by name (W1 -> W2). Shipped value."
+  },
+  "--enable-cache-report": {},
+  "--enable-hierarchical-cache": {},
+  "--enable-linear-replayssm-spec": {},
+  "--enable-memory-saver": {},
+  "--enable-metrics": {},
+  "--fairness-w-s": {
+   "code_help": "A1-1: the only sanctioned pre-emption; 0 disables it. Passed to the front."
+  },
+  "--flip-min-work-tokens": {
+   "code_help": "K6: queued tokens that make a D->P round trip worth its cost. Unset = X."
+  },
+  "--hicache-canonical-kv-page": {
+   "code_help": "#706: persist HiCache KV pages in the GEOMETRY-NEUTRAL whole-page format, so tokens produced by the same model do not miss between a prefill group and a decode group, or across a reboot. A stored page carries EVERY attention layer of one token (page_size 1, layer-major, global layer order); each PP stage deposits only its own slots at their global offset into one shared page and a completeness marker keeps the page invisible until the last slot arrives. Because the bytes then stop depending on the cut, the KV key drops BOTH geometry suffixes (_{tp_rank}_{tp_size} and _{pp_size}_{pp_rank}) and carries content alone -- the same argument weighted uneven-DCP already used on the token axis, and t"
+  },
+  "--hicache-host-role": {
+   "code_help": "#810: what the PINNED host tier is FOR. 'retention' (the default, today's behaviour) sizes it as an L2 cache from --hicache-ratio, so its pinned footprint scales with the device pool. 'staging' declares it a small write-through staging area in front of the storage tier, per DESIGN_706_BOOT ('the host tier is staging; the disk tier is retention'): retention then belongs to --hicache-storage-backend, and the pinned host budget stops scaling with the device pool. 'staging' REFUSES --hicache-ratio and requires an explicit --hicache-size, because a staging area is sized from write-through bandwidth x latency, which a ratio of the device pool does not express. It also requires a storage backend: s"
+  },
+  "--hicache-io-backend": {
+   "code_help": "The IO backend for KV cache transfer between CPU and GPU"
+  },
+  "--hicache-mamba-host-mib": {},
+  "--hicache-mem-layout": {
+   "code_help": "The layout of host memory pool for hierarchical cache."
+  },
+  "--hicache-size": {},
+  "--hicache-storage-backend": {
+   "code_help": "The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix, eic, simm, mori. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name)."
+  },
+  "--hicache-storage-backend-extra-config": {},
+  "--hicache-write-policy": {
+   "code_help": "The write policy of hierarchical cache."
+  },
+  "--host": {},
+  "--host-census-arena-widths": {},
+  "--host-census-key": {},
+  "--host-census-record": {
+   "code_help": "29.09.: the host census record (host_census.py) this front keeps current -- every 60 s one sample_live, max-merged under --host-census-key. Empty = off."
+  },
+  "--idle-layout": {
+   "code_help": "K8: which layout is awake at rest -- tp = group D (today's shape), pp = group P. The front's idle guard always counts the requests P has just prefilled, so resting on P loses no request.",
+   "profile_comment": {
+    "source": "27b.env:125",
+    "text": "(a) in Ruhe wacht Gruppe P (Launcher-Default tp = D)"
+   }
+  },
+  "--json-model-override-args": {},
+  "--kv-backing-relief": {
+   "code_help": "Enable KV backing relief. Promoted from SGLANG_KV_BACKING_RELIEF (#781). Default is ON."
+  },
+  "--kv-cache-dtype": {
+   "code_help": "Data type for kv cache storage. \"auto\" will use model data type. \"bf16\" or \"bfloat16\" for BF16 KV cache. \"fp8_e5m2\" and \"fp8_e4m3\" are supported for CUDA 11.8+. \"fp4_e2m1\" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+"
+  },
+  "--ledger-arm": {
+   "code_help": "#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to derive the RUN-MOMENT residual from the front's own cgroup reading"
+  },
+  "--linear-replayssm-cache-len": {},
+  "--mamba-radix-cache-strategy": {
+   "code_help": "The strategy to use for mamba radix cache."
+  },
+  "--mamba-slot-reorder": {
+   "code_help": "Reorder mamba pool slots. Promoted from SGLANG_MAMBA_SLOT_REORDER (#781)."
+  },
+  "--mamba-ssm-dtype": {
+   "code_help": "The data type of the SSM states in mamba cache. If not set, will be read from model config (mamba_ssm_dtype)."
+  },
+  "--max-kv-per-request": {
+   "code_help": "K9: per-request KV ceiling for BOTH groups. Unset = the model context ({...}), i.e. the as-built cap."
+  },
+  "--max-mamba-cache-size": {},
+  "--max-running-requests": {},
+  "--max-total-tokens": {
+   "code_help": "The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. This option is typically used for development and debugging purposes. {...}"
+  },
+  "--measured-record": {
+   "code_help": "#1233 fix 8: the JSON sidecar this line writes its DORMANT-IMAGE measurements into (empty = measure and log, do not persist)"
+  },
+  "--model-path": {
+   "code_help": "The path of the model weights. This can be a local folder or a Hugging Face repo ID."
+  },
+  "--num-continuous-decode-steps": {
+   "code_help": "Group D only. Decode steps run per scheduler visit (server_args.py:1424). Default {...}: Pass 1 to restore the shipped value."
+  },
+  "--p-concurrency": {
+   "code_help": "law 1 (K3): how many leg-1 POSTs group P runs at once. CONCURRENCY ONLY -- the P phase ends when the backlog is empty, never on this number. Written by the launcher from --p-bs; the front never derives it over HTTP. This default ({...}) therefore binds ONLY when the front is run by hand, and it is the same provisional number the launcher ships (user order 2026-09-09), read from one place so the two cannot disagree."
+  },
+  "--page-size": {
+   "code_help": "The number of tokens in a page."
+  },
+  "--port": {},
+  "--pp-async-batch-depth": {},
+  "--pp-attn-stage-ratio": {
+   "code_help": "OVERRIDE the solved full-attention split for group P (e.g. '8,4,4'). Same PINNED provenance. Unset = the attention axis is resolved for the chosen layer cut by pp_cut.best_attention_split."
+  },
+  "--pp-size": {
+   "code_help": "The pipeline parallelism size."
+  },
+  "--pp-stage-ratio": {
+   "code_help": "OVERRIDE the solved layer cut for group P (e.g. '32,18,14'). Passing it is announced as 'PINNED (user override)' in the PP-CUT provenance line and priced on the same two axes as the solved cut. Unset = the solver decides. Next-Flash arm: this is the ONE cut variable, PP_RATIO in arm_fnFL2_long.sh (default 29,11,8), with PP_ATTN_RATIO = the attention count that cut lands on (fnFL2 H57). The 'PP-CUT RATEN-SCHNITT' line prints the cut the measured stage rates recommend for the CURRENT power limit (or 'keine Raten fuer <Limit>, Schnitt bleibt gepinnt'); it is never applied."
+  },
+  "--prefill": {},
+  "--prefill-sid": {},
+  "--random-seed": {
+   "code_help": "Sampling seed for BOTH groups. Default {...} is ARBITRARY AND FIXED, and that is the whole provenance -- it is not measured and not solved, and it is a flag so that no reader has to wonder which it was. What it buys is that two boots of one tip sample identically, so a decode difference between them is a difference in the code."
+  },
+  "--rank-gpu-id": {
+   "code_help": "Comma-separated GPU device indices, one per tensor-parallel rank (CUDA device order as seen by torch.cuda, which is not necessarily the nvidia-smi/NVML order). Duplicates co-locate several ranks on one physical GPU. Length must equal --tp-size. Replaces the --base-gpu-id/--gpu-id-step formula; requires --rank-gpu-memory-mib (or --rank-tp-ratio auto). Only pure single-node tensor parallelism is supported. Example: --rank-gpu-id 0,0,1,2 (TP=4, two ranks share GPU 0)."
+  },
+  "--rank-gpu-memory-mib": {
+   "code_help": "Absolute memory budget in MiB per rank when --rank-gpu-id is set. A single scalar applies uniformly to every rank (even TP: all shards are structurally equal). With --rank-tp-ratio a comma-separated per-rank list may be given instead (e.g. 26000,17000,17000), since shards then differ in size. The value is each rank's ENTIRE budget \u2014 no additional utilization ceiling or safety margin is applied on top; leaving headroom for the CUDA context is the user's responsibility. Required when --rank-gpu-id is set, except with --rank-tp-ratio auto (budgets are then derived from the NVML totals). Each budget is checked against, and converted to a fraction of, the NVML total of the card its rank's CUDA or"
+  },
+  "--rank-mlp-ratio": {
+   "code_help": "Uneven TP self-calibration: comma-separated positive integer weights, one per rank (length must equal --tp-size), for the dense-MLP weight family ONLY. Attention/KV splits keep following --rank-tp-ratio; shifting MLP units between ranks re-balances the per-rank weight bytes so the MIN-synced KV token pool grows. The server logs a suggested vector ('restart with SGLANG_UNEVEN_MLP_VECTOR=...') when its profiling detects a rebalancing gain > 10%%. The environment variable SGLANG_UNEVEN_MLP_VECTOR takes precedence over this flag. Requires an active --rank-tp-ratio plan."
+  },
+  "--rank-tp-ratio": {
+   "code_help": "UNEVEN tensor parallelism: comma-separated positive integer weights, one per rank (length must equal --tp-size), 'auto', or 'auto-performance'. Example: 2,1,1 gives rank 0 half of every sharded dimension and ranks 1/2 a quarter each \u2014 one large GPU plus two smaller ones. sum(weights) must divide every sharded dimension. 'auto' derives the weights from the --rank-gpu-memory-mib list, or, when that is omitted, from the NVML totals of the GPUs named in --rank-gpu-id (minus --rank-auto-reserve-mib). 'auto' is the CAPACITY-FIRST default and does NOT optimize for speed: it maximizes the KV pool and ignores how fast the cards are. It is not the per-task optimum, and it does not probe. 'auto-perform"
+  },
+  "--reasoning-parser": {
+   "code_help": "Specify the parser for reasoning models. Use 'auto' to detect from chat template. Options include: {...}."
+  },
+  "--record-line": {
+   "code_help": "UNIFY S7 (27B line 76e87ac3b2): the calibration identity the launcher resolved, as model=..|repo=..|head=..|evidence=..; the sleep-leg gate's record reader takes only its samples. Empty = every sample."
+  },
+  "--scheduler-distributed-teardown": {
+   "code_help": "#673: destroy this scheduler's process groups on the graceful shutdown path, instead of leaving them to the interpreter. torch already reports the omission on every boot (\"destroy_process_group() was not called before program exit\"), and the cost is the #673 abort: ProcessGroupNCCL's watchdog and heartbeat are C++ threads joined by the group's destructor, so with the group never destroyed they are still joinable when the process tears down -- and destroying a joinable std::thread calls std::terminate, which is the observed \"terminate called without an active exception\" after a CLEAN drain. Default off because the destroy path also closes barlink (a POSIX shm segment and the device-mapped abo"
+  },
+  "--served-model-name": {},
+  "--skip-server-warmup": {},
+  "--speculative-algorithm": {},
+  "--speculative-draft-kv-only": {
+   "code_help": "#1233 (Weg 2 draft KV across the flip): run the drafter as a draft-KV PRODUCER only (no proposal, no verify): every prefill chunk on the LAST pipeline stage writes the draft layer's KV rows so HiCache can persist them in the canonical draft page that the decode group reads. Requires the full speculative flag set (--speculative-algorithm/--speculative-num-steps/--speculative-eagle-topk/--speculative-num-draft-tokens, carried byte-for-byte from the decode group so both compute the same drafter identity); valid only under pp_size>1, tp_size==1, page_size==1, --hicache-canonical-kv-page, and no dp/ep. Deliberately NOT part of the drafter identity hash: it decides whether the drafter PROPOSES, no"
+  },
+  "--speculative-draft-model-path": {
+   "code_help": "The path of the draft model weights. This can be a local folder or a Hugging Face repo ID. CANONICAL SPELLING (#382): --speculative-draft-model-path. The bare --speculative-draft-model is accepted as a DEPRECATED alias and resolves to the same field; every error and log message names the canonical form, because two names for one flag cost a sweep-2 arm the time it took to notice the message and the parser disagreed."
+  },
+  "--speculative-draft-window-size": {},
+  "--speculative-num-draft-tokens": {},
+  "--src-chunk-cards": {
+   "code_help": "#1233 weg2dk4: JSON {group: {weights_k: [nvml_index, ...]}} -- which cards hold each chunk tag's bytes, per group, derived by the launcher from that group's parallelism. A group that is absent (or an empty map) pauses in the natural tag order, exactly as before."
+  },
+  "--store-dir": {},
+  "--tag": {},
+  "--tool-call-parser": {
+   "code_help": "Specify the parser for handling tool-call interactions. Use 'auto' to detect from chat template. Options include: {...}."
+  },
+  "--tp-prefill-max-tokens": {
+   "code_help": "K5 (X): uncached tokens D may prefill itself. Default 4096 since 2026-09-15: the derivation below priced r_P from a single in-flip leg's front wall (1346 tok/s) and routed every request SHORT->D (xsn124-126); pass 0 to derive. Derived = 2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip lines, else the recorded PRE-BARLINK pair; floor = --chunked-prefill-size. The derivation and its three inputs are printed at launch.",
+   "profile_comment": {
+    "source": "27b.env:101",
+    "text": "RC7-X (X-Review V, Operator 25.09.): Start-X ausdruecklich 4096 -- ohne das Flag koennte ein spaeterer Default oder \"0 = ableiten\" das Start-X aus der Evidenz ziehen (Wand-r_D: 26503 aus xsn123 bzw. 22556 aus dem Record-Paar), und mit dem X-Fix waeren Split, Fenster und Re-Grant ab einem Start-X > 4096 aktiv. Decke 12288 wie arm_rc7/rc7b X_ARGS (D's W50-Riegel = 12288, Front klemmt das Live-X darauf). --x-busy-tokens bewusst NICHT gesetzt (Front-Default 4096)."
+   }
+  },
+  "--tp-size": {
+   "code_help": "The tensor parallelism size."
+  },
+  "--trust-remote-code": {},
+  "--uneven-dcp": {
+   "code_help": "Enable uneven DCP. Promoted from SGLANG_UNEVEN_DCP (#781). Superseded in most cases by --rank-kv-ratio."
+  },
+  "--uneven-dcp-weighted": {
+   "code_help": "Enable weighted uneven DCP. Promoted from SGLANG_UNEVEN_DCP_WEIGHTED (#781)."
+  },
+  "--vision": {
+   "code_help": "#58: `off` (default) refuses image requests by name (W101); `resident` routes them to groups that carry the tower; `transient` loads the tower for the request and takes it down again. Videos refuse (W103) in every mode -- unpriced."
+  },
+  "--weight-chunks": {
+   "code_help": "#1233: number of weights_<k> layer-chunk tags per group (0 = the round-1 single tag / two-backup shape)"
+  },
+  "--weight-form": {
+   "code_help": "#1444: weight source form stamped into the dormant record"
+  },
+  "--x-ceiling-tokens": {
+   "code_help": "H84: group D's --tp-prefill-max-tokens (its W50 riegel) and the ceiling of the front's live X re-solve. 0 (default) = off: D and the front both keep the start X, argv unchanged. >0: D starts with this riegel, the front keeps its start X and gets --x-ceiling-tokens, so the live X may rise up to it; a request between the start X and the live X goes to D only when nothing else is in flight (WEG2 X-SOLO). Lifted to the start X when below it. Group P is not affected."
+  },
+  "NCCL_BUFFSIZE": {
+   "profile_comment": {
+    "source": "27b.env:193",
+    "text": "NCCL-Puffer je Communicator (xsn300 A/B, Task #16): gilt unter BEIDEN Transporten -- auch unter bar1 entstehen NCCL-Communicatoren (Residuum ausserhalb torch D 1,5-1,8 GB)."
+   }
+  },
+  "SGLANG_BARLINK_BAR1_ABORT_MAX_LAG": {
+   "profile_comment": {
+    "source": "27b.env:175",
+    "text": "SGLANG_HICACHE_DRAIN_AGREE_EVERY=8 entfernt (Profil-Bereinigung v3 30.09.): Code-Default AN seit LS12-Rest (Registry qwen27b, Metall hauenh dkr27browauthorityls12bar1fs09301342); explizit schaltet weiter ab SGLANG_HICACHE_LOAD_ASYNC_INDEX=1 entfernt (Profil-Bereinigung v3 30.09.): Code-Default AN seit LS12-Rest (Registry qwen27b, Metall hauenh dkr27browauthorityls12bar1fs09301342); explizit schaltet weiter ab SGLANG_DFLASH_WINDOW_POOL_SYNC_FREE=1 entfernt (Profil-Bereinigung 30.09.): Code-Default AN seit b4fbe0412b (Registry qwen27b d_hostgap_base); explizit =0 schaltet weiter ab"
+   }
+  },
+  "SGLANG_HICACHE_ARENA_LOAD_BLOCK_QUOTA": {
+   "profile_comment": {
+    "source": "27b.env:190",
+    "text": "SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS=2 entfernt (Profil-Bereinigung v3 30.09.): Code-Default AN seit LS12-Rest (Registry qwen27b, Metall hauenh dkr27browauthorityls12bar1fs09301342); explizit schaltet weiter ab"
+   }
+  },
+  "SGLANG_HICACHE_ARENA_QUEUE_REFS": {
+   "profile_comment": {
+    "source": "27b.env:186",
+    "text": "SGLANG_WEG2_D_DEFER_REBUILD=1 entfernt (Profil-Bereinigung 30.09.): Code-Default AN seit b4fbe0412b (Registry qwen27b d_hostgap_base); explizit =0 schaltet weiter ab SGLANG_DFLASH_VERIFY_VOCAB_ARGMAX=1 entfernt (Profil-Bereinigung v3 30.09.): Code-Default AN seit LS12-Rest (Registry qwen27b, Metall hauenh dkr27browauthorityls12bar1fs09301342); explizit schaltet weiter ab SGLANG_DCP_LSE_MERGE=a2a entfernt (Profil-Bereinigung LS6 30.09.): Code-Default a2a (Registry qwen27b d_dcp_lse_merge); explizit =ar schaltet weiter ab"
+   }
+  },
+  "SGLANG_HICACHE_DRAIN_BUDGET": {
+   "profile_comment": {
+    "source": "27b.env:182",
+    "text": "SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU=1 entfernt (Profil-Bereinigung 30.09.): Code-Default AN seit b4fbe0412b (Registry qwen27b d_hostgap_base); explizit =0 schaltet weiter ab"
+   }
+  },
+  "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": {
+   "profile_comment": {
+    "source": "27b.env:180",
+    "text": "SGLANG_DFLASH_PLAN_SYNC_FREE=1 entfernt (Profil-Bereinigung 30.09.): Code-Default AN seit b4fbe0412b (Registry qwen27b d_hostgap_base); explizit =0 schaltet weiter ab SGLANG_VRAM_PEAK_FAST_READ=1 entfernt (Profil-Bereinigung v3 30.09.): Code-Default AN seit LS12-Rest (Registry qwen27b, Metall hauenh dkr27browauthorityls12bar1fs09301342); explizit schaltet weiter ab"
+   }
+  },
+  "SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH": {
+   "profile_comment": {
+    "source": "27b.env:98",
+    "text": "B1 Teil 1 (ea00e4acbc+11e5db4370)"
+   }
+  },
+  "SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK": {
+   "profile_comment": {
+    "source": "27b.env:99",
+    "text": "B1 Teil 2"
+   }
+  },
+  "SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP": {
+   "profile_comment": {
+    "source": "27b.env:97",
+    "text": "PAUSE-MAPS (835ab6be92): auf 27B-D ein No-op (keine H95c-Extents)"
+   }
+  },
+  "SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE": {
+   "profile_comment": {
+    "source": "27b.env:102",
+    "text": "49 L1: P-Anker-Praesenz (a59c95ae36; Replay w109290020 59 -> 38 LONG). Metall-Urteil: der naechste 27B-Flip-Boot (W50-REROUTE)."
+   }
+  },
+  "SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP": {
+   "profile_comment": {
+    "source": "27b.env:95",
+    "text": "SGLANG_WEG2_P_ROW_AUTHORITY=1 entfernt (Profil-Bereinigung Release 30.09.): Code-Default AN seit 85d426c6ce (Registry qwen27b p_row_authority); explizit =0 schaltet weiter ab FLIP-HEBEL (NF-Port 30.09., desk/27b-integ-dual-merge-0930 >= b43c19ef1a; Metall hauenh dkr27browauthorityls12bar1fs09301342: D->P stationaer max 1,94 s gegen 8,00 s) -- Code-Default AUS, hier AN wie im Live-Profil 27b-row-authority.env (flip-levers-0930). | PAUSE-OVERLAP (0a78051a4d+dff1a7fed4)"
+   }
+  },
+  "SGLANG_WEG2_EXTEND_TRIM_MIB": {
+   "profile_comment": {
+    "source": "27b.env:50",
+    "text": "waehrend 1,46-1,6 GiB freier Cache fuer den Treiber unerreichbar waren (#1028c alloc_cache). WEG2-EXTEND-CACHE-TRIM (rc12e, weg2/extend_trim.py) gibt vor dem Target-Extend die ganz freien Segmente zurueck, wenn card_free < Schwelle. Schwelle TP0 1200 = max. Extend-Zuwachs 646 + ~512 Treiber-Reserve; TP1/TP2 (3080) 0 = nie (dort min. frei 394/532, kein Tod). NUR fuer D (--env-d): auf P stuende sonst sync+empty_cache vor jedem P-Chunk. Der 27B-Launcher setzt die Variable nicht selbst (nur der NF-D-Rang- Solve-Pfad, launcher.py d_extend_trim_env). Beleg im Lauf: D 'WEG2-EXTEND-CACHE-TRIM rank=0 ... released= card_free_after='. Ein zweites --env-d (Arm/Profil darueber) ERSETZT diesen String (arg"
+   }
+  },
+  "SGLANG_WEG2_L15_MIB": {
+   "profile_comment": {
+    "source": "27b.env:133",
+    "text": "c1 = 7616 MiB (3080, NVML 0), c2 = 1792 MiB (3080, NVML 2). Gleiche Werte wie EXTRA_CENV der Watcher. RIG-GEBUNDEN: gilt nur fuer das Referenz-Rig 5090 + 2x3080 in Budget-Reihenfolge. Auf anderer Bestueckung entweder Zeile ueberschreiben (docker run -e SGLANG_WEG2_L15_MIB=..., _form meldet FORM-OVERRIDE) oder nach 260 HW-GENERIC (de0130eb2f) mit Karten-Identitaet schluesseln (GPU-<uuid>=/pci:<bus>=/nvml<i>=). Dort verweigert der Launcher fremde Bestueckung ohnehin (HW-UNCALIBRATED), die Ordinalform bleibt byte-gleich. SGLANG_WEG2_L15_SHADOW ist bewusst NICHT hier: reines Log-Instrument (l15_shadow.py \"log lines only\"), kein Verhalten."
+   }
+  },
+  "SGLANG_WEG2_STORE_SHORT_TAIL": {
+   "profile_comment": {
+    "source": "27b.env:205",
+    "text": "Gruppen P/D (scheduler.py:670-690, 3453cc7766, Default AN -> hier nur ausdruecklich): ein kurzer Store-Read liest seinen Rest unter der Schwelle nach; ein Stillstand innerhalb X rechnet neu statt W88-503."
+   }
+  },
+  "SGLANG_WEG2_VISION_FLIP_URGENT": {
+   "profile_comment": {
+    "source": "27b.env:202",
+    "text": "Front (front.py:1905-1945, flipfast 502e97ef3c, alle Default aus): SGLANG_WEG2_CTL_KICK_ARRIVAL=1 entfernt (Profil-Bereinigung v3 30.09.): Code-Default AN seit LS12-Rest (Registry qwen27b, Metall hauenh dkr27browauthorityls12bar1fs09301342); explizit schaltet weiter ab SGLANG_WEG2_CTL_KICK_AFTER_FLIP=1 entfernt (Profil-Bereinigung v3 30.09.): Code-Default AN seit LS12-Rest (Registry qwen27b, Metall hauenh dkr27browauthorityls12bar1fs09301342); explizit schaltet weiter ab SGLANG_WEG2_DC_OFF_PATH=1 entfernt (Profil-Bereinigung LS6 30.09.): Code-Default AN (Registry qwen27b front_dc_off_path); explizit =0 schaltet weiter ab Front (front.py:495-505, ed6630d6c2, Default aus): ein Bild-Request, de"
+   }
+  }
+ },
+ "flag_docs_sources": {
+  "code": "argparse help am Boot-Rev 55c95a89c7",
+  "profile_files": [
+   "27b-row-authority-cut43.env",
+   "27b.env",
+   "27b.env"
+  ]
+ },
+ "id": "27b-int8",
+ "launch": {
+  "argv": {
+   "D": [
+    "/opt/venv/bin/python",
+    "-m",
+    "sglang.launch_server",
+    "--model-path",
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "--trust-remote-code",
+    "--json-model-override-args",
+    "{\"language_model_only\": true}",
+    "--served-model-name",
+    "Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "--rank-gpu-id",
+    "0,1,2",
+    "--skip-server-warmup",
+    "--kv-cache-dtype",
+    "fp8_e4m3",
+    "--context-length",
+    "262144",
+    "--max-kv-per-request",
+    "262144",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
+    "--chat-template-default-kwargs",
+    "{\"preserve_thinking\": true}",
+    "--enable-cache-report",
+    "--enable-metrics",
+    "--enable-hierarchical-cache",
+    "--hicache-host-role",
+    "staging",
+    "--hicache-size",
+    "4",
+    "--hicache-mamba-host-mib",
+    "100",
+    "--hicache-write-policy",
+    "write_back",
+    "--hicache-storage-backend",
+    "file",
+    "--hicache-mem-layout",
+    "layer_first",
+    "--hicache-io-backend",
+    "direct",
+    "--hicache-storage-backend-extra-config",
+    "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+    "--hicache-canonical-kv-page",
+    "--host",
+    "127.0.0.1",
+    "--chunked-prefill-size",
+    "4096",
+    "--scheduler-distributed-teardown",
+    "--page-size",
+    "1",
+    "--random-seed",
+    "785500001",
+    "--mamba-slot-reorder",
+    "--kv-backing-relief",
+    "--barlink",
+    "--barlink-transport",
+    "bar1",
+    "--barlink-bar1-cap-cycles",
+    "300000000000",
+    "--collective-census-interval",
+    "50",
+    "--uneven-dcp",
+    "--uneven-dcp-weighted",
+    "--mamba-ssm-dtype",
+    "bfloat16",
+    "--enable-memory-saver",
+    "--max-running-requests",
+    "6",
+    "--tp-prefill-max-tokens",
+    "12288",
+    "--mamba-radix-cache-strategy",
+    "extra_buffer",
+    "--tp-size",
+    "3",
+    "--pp-size",
+    "1",
+    "--num-continuous-decode-steps",
+    "2",
+    "--rank-gpu-memory-mib",
+    "27792,17384,17168",
+    "--rank-tp-ratio",
+    "58,25,25",
+    "--speculative-algorithm",
+    "DFLASH",
+    "--speculative-draft-model-path",
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+    "--speculative-num-draft-tokens",
+    "8",
+    "--speculative-draft-window-size",
+    "2048",
+    "--enable-linear-replayssm-spec",
+    "--linear-replayssm-cache-len",
+    "16",
+    "--barlink-bar1-window-mib",
+    "16,TP_0=32,DCP_0=40",
+    "--barlink-uncovered-class",
+    "refuse",
+    "--port",
+    "30032",
+    "--rank-mlp-ratio",
+    "652,218,218"
+   ],
+   "P": [
+    "/opt/venv/bin/python",
+    "-m",
+    "sglang.launch_server",
+    "--model-path",
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "--trust-remote-code",
+    "--json-model-override-args",
+    "{\"language_model_only\": true}",
+    "--served-model-name",
+    "Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "--rank-gpu-id",
+    "0,1,2",
+    "--skip-server-warmup",
+    "--kv-cache-dtype",
+    "fp8_e4m3",
+    "--context-length",
+    "262144",
+    "--max-kv-per-request",
+    "262144",
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
+    "--chat-template-default-kwargs",
+    "{\"preserve_thinking\": true}",
+    "--enable-cache-report",
+    "--enable-metrics",
+    "--enable-hierarchical-cache",
+    "--hicache-host-role",
+    "staging",
+    "--hicache-size",
+    "1",
+    "--hicache-mamba-host-mib",
+    "100",
+    "--hicache-write-policy",
+    "write_back",
+    "--hicache-storage-backend",
+    "file",
+    "--hicache-mem-layout",
+    "layer_first",
+    "--hicache-io-backend",
+    "direct",
+    "--hicache-storage-backend-extra-config",
+    "{\"max_size\":\"150000000000\",\"min_free_space\":\"34359738368\",\"max_size_scope\":\"shared\"}",
+    "--hicache-canonical-kv-page",
+    "--host",
+    "127.0.0.1",
+    "--chunked-prefill-size",
+    "2048",
+    "--scheduler-distributed-teardown",
+    "--page-size",
+    "1",
+    "--random-seed",
+    "785500001",
+    "--mamba-slot-reorder",
+    "--kv-backing-relief",
+    "--barlink",
+    "--barlink-transport",
+    "bar1",
+    "--barlink-bar1-cap-cycles",
+    "300000000000",
+    "--collective-census-interval",
+    "50",
+    "--mamba-ssm-dtype",
+    "bfloat16",
+    "--enable-memory-saver",
+    "--max-running-requests",
+    "1",
+    "--tp-size",
+    "1",
+    "--pp-size",
+    "3",
+    "--pp-async-batch-depth",
+    "0",
+    "--disable-overlap-schedule",
+    "--pp-stage-ratio",
+    "43,11,10",
+    "--pp-attn-stage-ratio",
+    "10,3,3",
+    "--rank-gpu-memory-mib",
+    "26344,8312,13864",
+    "--barlink-bar1-window-mib",
+    "24,PP_0=96",
+    "--speculative-algorithm",
+    "DFLASH",
+    "--speculative-draft-model-path",
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+    "--speculative-num-draft-tokens",
+    "8",
+    "--speculative-draft-kv-only",
+    "--max-total-tokens",
+    "310242",
+    "--port",
+    "30031",
+    "--max-mamba-cache-size",
+    "24",
+    "--cuda-graph-config",
+    "{\"prefill\":{\"backend\":\"full\",\"bs\":[512],\"full_prefill_max_req\":1}}",
+    "--max-running-requests=2"
+   ]
+  },
+  "env": {
+   "D": {
+    "CUDA_HOME": "/usr/local/cuda",
+    "CUDA_VERSION": "13.0.2",
+    "CUDA_VISIBLE_DEVICES": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d,GPU-5c648f96-be1d-42d5-0221-34d11ab137f7,GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+    "HTSGLANG_ALLOW_EXPERIMENTAL": "1",
+    "HTSGLANG_DELTA_FROM": "rc12g",
+    "HTSGLANG_INSTRUMENTS": "1",
+    "HTSGLANG_LINE": "27b",
+    "HTSGLANG_LINES": "27b nf",
+    "HTSGLANG_MEMAVAIL_MIN_GIB": "80",
+    "HTSGLANG_PROFILE": "27b-row-authority-cut43",
+    "HTSGLANG_REVISION_27B": "55c95a89c70399747058434a17d3a6865c1cd61e",
+    "HTSGLANG_REVISION_NF": "b2ec1a6d0f51595f899b64d1085776b38a118740",
+    "HTSGLANG_TAG": "dkr27browauthoritycut43bar1fs10030906",
+    "HTSGLANG_TRANSPORT": "bar1",
+    "HTSGLANG_TREE": "/opt/htsglang/src-27b",
+    "NCCL_BUFFSIZE": "1048576",
+    "NCCL_MAX_NCHANNELS": "8",
+    "NCCL_VERSION": "2.28.3-1",
+    "SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE": "1",
+    "SGLANG_ARMING_FLOOR_SOLVED": "1",
+    "SGLANG_BARLINK_BAR1_ABORT_MAX_LAG": "64",
+    "SGLANG_BARLINK_BAR1_NV_SOURCE": "/opt/nvidia-open-595",
+    "SGLANG_BARLINK_BUILD_WINDOW_CAP_S": "300",
+    "SGLANG_BARLINK_CAPTURE_CENSUS_DIR": "/var/lib/htsglang/evidence/capture_census",
+    "SGLANG_BARLINK_LAUNCH_DUMP": "0",
+    "SGLANG_DEBUG_DFLASH_SYNC_TRACE": "20",
+    "SGLANG_DEBUG_HOLD": "1",
+    "SGLANG_DEBUG_HOLD_DIR": "/var/lib/htsglang/evidence/debug_hold",
+    "SGLANG_DEBUG_HOLD_S": "900",
+    "SGLANG_DEBUG_HOLD_TAG": "rc12gbf10030904",
+    "SGLANG_DFLASH_PHASE_TIMING": "/var/lib/htsglang/evidence/dflash_phase_dkr27browauthoritycut43bar1fs10030906",
+    "SGLANG_DFLASH_WINDOW_POOL": "1",
+    "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
+    "SGLANG_FLA_L2NORM_RUNTIME_T": "1",
+    "SGLANG_GIL_SWITCH_INTERVAL_MS": "0.2",
+    "SGLANG_HICACHE_ARENA_DIR": "/dev/shm/weg2-arena-dkr27browauthoritycut43bar1fs10030906",
+    "SGLANG_HICACHE_ARENA_GIB": "22",
+    "SGLANG_HICACHE_ARENA_HOST": "1",
+    "SGLANG_HICACHE_ARENA_LOAD_BLOCK_QUOTA": "16",
+    "SGLANG_HICACHE_ARENA_MAMBA_SLOTS": "112",
+    "SGLANG_HICACHE_ARENA_PREPIN": "1",
+    "SGLANG_HICACHE_ARENA_QUEUE_REFS": "1",
+    "SGLANG_HICACHE_ARENA_REF_CENSUS_S": "10",
+    "SGLANG_HICACHE_ARENA_STAGING_GB": "0.05",
+    "SGLANG_HICACHE_DRAIN_BUDGET": "16384",
+    "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/var/lib/htsglang/hicache-weg2/l3-qwen27b-Qwen3.8-27B-INT8-gdncov-vocabembed-b8da3c4e59",
+    "SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP": "1",
+    "SGLANG_HICACHE_READ_BUFFERS": "256",
+    "SGLANG_HICACHE_ROUND_TIMING": "512",
+    "SGLANG_HICACHE_STORAGE_BATCH": "1024",
+    "SGLANG_IDLE_BLOCKING_POLL": "1",
+    "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
+    "SGLANG_MATCH_REFUSAL_CENSUS_EVERY": "64",
+    "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "1",
+    "SGLANG_PINNED_HOST_RESERVE_LEDGER_GIB": "1.4708",
+    "SGLANG_PINNED_HOST_RESERVE_LEDGER_SOURCE": "ledger margin 1.47 GiB (measured)",
+    "SGLANG_PLANNER_GRAPH_ANCHORS": "/root/.cache/sglang/graph_mem_anchors.json",
+    "SGLANG_PLANNER_PROFILES": "/root/.cache/sglang/planner_profiles.json",
+    "SGLANG_PP_CHAIN_RECV_STALL_S": "60",
+    "SGLANG_PP_OCCUPANT_HORIZON_S": "90",
+    "SGLANG_UNEVEN_DCP": "1",
+    "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+    "SGLANG_WEG2_BAR1_CONNECT_S": "480",
+    "SGLANG_WEG2_BUBBLE_PUBLISH": "1",
+    "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": "1",
+    "SGLANG_WEG2_DEVTOOLS_DIR": "/opt/htsglang/devtools",
+    "SGLANG_WEG2_DRAFT_ON_P": "True",
+    "SGLANG_WEG2_DRESHARD_OBJECTIVE": "segment",
+    "SGLANG_WEG2_D_ADOPT": "off",
+    "SGLANG_WEG2_D_HOSTGAP": "512",
+    "SGLANG_WEG2_D_RESHARD": "wake",
+    "SGLANG_WEG2_D_RESHARD_SPEC": "{\"base\":[58,25,25],\"boot\":\"drq\",\"fmt\":\"int8\",\"min_gain\":0.02,\"objective\":\"segment\",\"policy\":\"wake\",\"presets\":[{\"mlp\":[652,218,218],\"name\":\"drq\"}]}",
+    "SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH": "1",
+    "SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK": "1",
+    "SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW": "1",
+    "SGLANG_WEG2_ENABLE_PARK_SEAT_FREE": "1",
+    "SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP": "1",
+    "SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE": "1",
+    "SGLANG_WEG2_ENABLE_RANKSTATS": "1",
+    "SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP": "1",
+    "SGLANG_WEG2_ENABLE_WAKE_READ_EARLY": "1",
+    "SGLANG_WEG2_ENABLE_X_COST_LINE": "1",
+    "SGLANG_WEG2_EVIDENCE_DIR": "/var/lib/htsglang/evidence",
+    "SGLANG_WEG2_EXTEND_TRIM_MIB": "1200,0,0",
+    "SGLANG_WEG2_FIRST_FWD_TIMING_N": "6",
+    "SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS": "D",
+    "SGLANG_WEG2_FOLLOWER_EARLY_READ": "1",
+    "SGLANG_WEG2_FORM": "arch=dense,experts=none,draft=dflash,p_draft=cold,kv=paged_dcp,flip=family,vision=transient,profile=qwen27b,model=Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "SGLANG_WEG2_FRONT_SPAN_INFLIGHT": "1",
+    "SGLANG_WEG2_GPU_ARB": "/var/lib/htsglang/arb",
+    "SGLANG_WEG2_GRAPH_UPLOAD_AT_CAPTURE": "1",
+    "SGLANG_WEG2_GROUP": "D",
+    "SGLANG_WEG2_HICACHE_DRAFT_TIER": "off",
+    "SGLANG_WEG2_IDLE_CLOCK": "1",
+    "SGLANG_WEG2_IDLE_CLOCK_ADDR": "tcp:172.17.0.1:8779",
+    "SGLANG_WEG2_L15": "1",
+    "SGLANG_WEG2_L15_HOT_SHARE": "1",
+    "SGLANG_WEG2_L15_MIB": "c1=7616,c2=1792",
+    "SGLANG_WEG2_L15_REFILL": "1",
+    "SGLANG_WEG2_L15_SHADOW": "1",
+    "SGLANG_WEG2_L3_EPOCH": "1791018426.630661",
+    "SGLANG_WEG2_L3_INHERITED_SUFFIXES": "[\"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_0_1_3_0\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_0_1_3_1\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_0_1_3_2\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_0_3\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_1_3\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_2_3\"]",
+    "SGLANG_WEG2_L3_WRITE_BEHIND_YIELD_MS": "2000",
+    "SGLANG_WEG2_LEG1_EARLY": "1",
+    "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": "4096",
+    "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": "1",
+    "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": "4",
+    "SGLANG_WEG2_METRICS_MODEL": "27B",
+    "SGLANG_WEG2_METRICS_PUSH_URL": "http://192.168.0.88:8428/write",
+    "SGLANG_WEG2_OWNED_MISS_RECORD": "/var/lib/htsglang/evidence/records/weg2",
+    "SGLANG_WEG2_PYSPY_DIR": "/var/lib/htsglang/evidence",
+    "SGLANG_WEG2_P_TWIN_DEFER": "1",
+    "SGLANG_WEG2_RANKDUMP_DIR": "/var/lib/htsglang/evidence",
+    "SGLANG_WEG2_RANK_STATE_DIR": "/var/lib/htsglang/state/rankstate/D",
+    "SGLANG_WEG2_SEQ_SYNC_BATCH_MIB": "256",
+    "SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS": "128",
+    "SGLANG_WEG2_SHADOW_HOP_BOUND_MS": "60.0",
+    "SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS": "D",
+    "SGLANG_WEG2_STORE_ROOT": "/var/lib/htsglang/hicache-weg2",
+    "SGLANG_WEG2_STORE_SHORT_TAIL": "1",
+    "SGLANG_WEG2_STORE_SHORT_TAIL_X": "4096",
+    "SGLANG_WEG2_TMS_OUT_DIR": "/opt/htsglang/tms-27b",
+    "SGLANG_WEG2_TMS_PRELOAD_SO": "/opt/htsglang/tms-27b/torch_memory_saver_hook_mode_preload_cu13_ring_3863d0403e3a.so",
+    "SGLANG_WEG2_TOLD_GROUP_FALLBACK": "1",
+    "SGLANG_WEG2_TOLD_PACED": "1",
+    "SGLANG_WEG2_VENV": "/opt/venv",
+    "SGLANG_WEG2_VISION_FLIP_URGENT": "1",
+    "SGLANG_WEG2_VMM_EXPORTABLE": "1",
+    "SGLANG_WEG2_WEIGHTS_CPU_BACKUP": "off",
+    "SGLANG_WEG2_WEIGHT_CHUNKS": "8",
+    "SGLANG_WEG2_WEIGHT_CHUNK_LAYERS": "8",
+    "SGLANG_WEG2_WEIGHT_SOURCE": "exchange",
+    "SGLANG_WEG2_XCHG_BOOT": "1791018417",
+    "SGLANG_WEG2_XCHG_BOUNCE_TERMS": "bytes_per_direction=24387228672,n_layers=64,widest_layer_bytes=383939008,pairs=3,depth=1,slot_bytes=134217728,n_lanes=9,max_tag_bytes=3048403584,lanes_concurrent=0,band_credit=0,n_cross_lanes=0,price_lane_cap=0",
+    "SGLANG_WEG2_XCHG_INJECT": "authoritative",
+    "SGLANG_WEG2_XCHG_LEGS": "both",
+    "SGLANG_WEG2_XCHG_MANIFEST_DIR": "/var/lib/htsglang/evidence",
+    "SGLANG_WEG2_XCHG_ONCARD": "host",
+    "SGLANG_WEG2_XCHG_ONCARD_SLOT_MIB": "128",
+    "SGLANG_WEG2_XCHG_REGION": "/dev/shm/weg2-xchg-1791018417/xchg.bin",
+    "SGLANG_WEG2_XCHG_WAVES": "weights_0,weights_5,weights_6|weights_1,weights_7,weights_draft|weights_2,weights_3,weights_4,weights",
+    "SGLANG_WEIGHT_LOADER_SHARED_CACHE_MANIFEST": "/var/lib/htsglang/evidence/boot_weg2_dkr27browauthoritycut43bar1fs10030906_55c95a89c7_1003_090656.shared_cache",
+    "WEG2_CONTAINER": "htsglang-acc-27b-rowauthoritycut43bar1fs",
+    "WEG2_HOSTSAMPLE_CSV": "/var/lib/htsglang/evidence/dkr27browauthoritycut43bar1fs10030906_1003/hostsample_dkr27browauthoritycut43bar1fs10030906.csv",
+    "WEG2_STATE_DIR": "/var/lib/htsglang/state"
+   },
+   "P": {
+    "CUDA_HOME": "/usr/local/cuda",
+    "CUDA_VERSION": "13.0.2",
+    "CUDA_VISIBLE_DEVICES": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d,GPU-5c648f96-be1d-42d5-0221-34d11ab137f7,GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+    "HTSGLANG_ALLOW_EXPERIMENTAL": "1",
+    "HTSGLANG_DELTA_FROM": "rc12g",
+    "HTSGLANG_INSTRUMENTS": "1",
+    "HTSGLANG_LINE": "27b",
+    "HTSGLANG_LINES": "27b nf",
+    "HTSGLANG_MEMAVAIL_MIN_GIB": "80",
+    "HTSGLANG_PROFILE": "27b-row-authority-cut43",
+    "HTSGLANG_REVISION_27B": "55c95a89c70399747058434a17d3a6865c1cd61e",
+    "HTSGLANG_REVISION_NF": "b2ec1a6d0f51595f899b64d1085776b38a118740",
+    "HTSGLANG_TAG": "dkr27browauthoritycut43bar1fs10030906",
+    "HTSGLANG_TRANSPORT": "bar1",
+    "HTSGLANG_TREE": "/opt/htsglang/src-27b",
+    "NCCL_BUFFSIZE": "1048576",
+    "NCCL_MAX_NCHANNELS": "8",
+    "NCCL_VERSION": "2.28.3-1",
+    "SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE": "1",
+    "SGLANG_ARMING_FLOOR_SOLVED": "1",
+    "SGLANG_BARLINK_BAR1_ABORT_MAX_LAG": "64",
+    "SGLANG_BARLINK_BAR1_NV_SOURCE": "/opt/nvidia-open-595",
+    "SGLANG_BARLINK_BUILD_WINDOW_CAP_S": "300",
+    "SGLANG_BARLINK_CAPTURE_CENSUS_DIR": "/var/lib/htsglang/evidence/capture_census",
+    "SGLANG_BARLINK_LAUNCH_DUMP": "0",
+    "SGLANG_DEBUG_DFLASH_SYNC_TRACE": "20",
+    "SGLANG_DEBUG_HOLD": "1",
+    "SGLANG_DEBUG_HOLD_DIR": "/var/lib/htsglang/evidence/debug_hold",
+    "SGLANG_DEBUG_HOLD_S": "900",
+    "SGLANG_DEBUG_HOLD_TAG": "rc12gbf10030904",
+    "SGLANG_DFLASH_PHASE_TIMING": "/var/lib/htsglang/evidence/dflash_phase_dkr27browauthoritycut43bar1fs10030906",
+    "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
+    "SGLANG_FI_PREFILL_GRAPH_SPLIT": "7",
+    "SGLANG_FLA_L2NORM_RUNTIME_T": "1",
+    "SGLANG_FULL_CG_PREFILL_SHARED_WORKSPACE": "1",
+    "SGLANG_GIL_SWITCH_INTERVAL_MS": "0.2",
+    "SGLANG_HICACHE_ARENA_DIR": "/dev/shm/weg2-arena-dkr27browauthoritycut43bar1fs10030906",
+    "SGLANG_HICACHE_ARENA_GIB": "22",
+    "SGLANG_HICACHE_ARENA_HOST": "1",
+    "SGLANG_HICACHE_ARENA_LOAD_BLOCK_QUOTA": "16",
+    "SGLANG_HICACHE_ARENA_MAMBA_SLOTS": "112",
+    "SGLANG_HICACHE_ARENA_PREPIN": "1",
+    "SGLANG_HICACHE_ARENA_QUEUE_REFS": "1",
+    "SGLANG_HICACHE_ARENA_REF_CENSUS_S": "10",
+    "SGLANG_HICACHE_ARENA_STAGING_GB": "0.05",
+    "SGLANG_HICACHE_DRAIN_BUDGET": "16384",
+    "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/var/lib/htsglang/hicache-weg2/l3-qwen27b-Qwen3.8-27B-INT8-gdncov-vocabembed-b8da3c4e59",
+    "SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP": "1",
+    "SGLANG_HICACHE_READ_BUFFERS": "256",
+    "SGLANG_HICACHE_ROUND_TIMING": "512",
+    "SGLANG_HICACHE_STORAGE_BATCH": "1024",
+    "SGLANG_HICACHE_WRITE_STREAM_PRIORITY": "-1",
+    "SGLANG_IDLE_BLOCKING_POLL": "1",
+    "SGLANG_KV_BUDGET_PREFILL_GRAPH_MIB": "160.0,160.0,160.0",
+    "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
+    "SGLANG_MATCH_REFUSAL_CENSUS_EVERY": "64",
+    "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "1",
+    "SGLANG_PINNED_HOST_RESERVE_LEDGER_GIB": "1.4708",
+    "SGLANG_PINNED_HOST_RESERVE_LEDGER_SOURCE": "ledger margin 1.47 GiB (measured)",
+    "SGLANG_PLANNER_GRAPH_ANCHORS": "/root/.cache/sglang/graph_mem_anchors.json",
+    "SGLANG_PLANNER_PROFILES": "/root/.cache/sglang/planner_profiles.json",
+    "SGLANG_PP_CHAIN_RECV_STALL_S": "60",
+    "SGLANG_PP_OCCUPANT_HORIZON_S": "90",
+    "SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM": "1",
+    "SGLANG_P_CHUNK_POLICY": "dynamic",
+    "SGLANG_P_CHUNK_SPEC": "{\"limits\":{\"dynamic_min_tokens\":8192,\"eager\":true,\"fixed_tokens\":512,\"graph_buckets\":[512],\"grid\":0,\"max_inflight\":0,\"max_tokens\":2048,\"min_gain\":0.01,\"min_tokens\":512,\"page\":1,\"ramps\":true},\"source\":\"builtin-int8 (weg2rc7c fit [0,32k), mscale=int8)\",\"stages\":[{\"attn_ms_per_tok_1k\":0.00199609375,\"eager_floor_ms\":63.0,\"name\":\"PP0\",\"points\":[[256,29.845499999999998],[512,47.67],[1024,86.59031999999999],[2048,161.57904],[4096,305.34936]]},{\"attn_ms_per_tok_1k\":0.00180078125,\"eager_floor_ms\":42.0,\"name\":\"PP1\",\"points\":[[256,21.1785],[512,36.87],[1024,71.74],[2048,141.48],[4096,280.96]]},{\"attn_ms_per_tok_1k\":0.001943359375,\"eager_floor_ms\":74.0,\"name\":\"PP2\",\"points\":[[256,23.1255],[512,40.41],[1024,78.82],[2048,155.64],[4096,309.28]]}]}",
+    "SGLANG_UNEVEN_DCP": "1",
+    "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+    "SGLANG_WEG2_BAR1_CONNECT_S": "480",
+    "SGLANG_WEG2_BUBBLE_PUBLISH": "1",
+    "SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL": "1",
+    "SGLANG_WEG2_DEVTOOLS_DIR": "/opt/htsglang/devtools",
+    "SGLANG_WEG2_DFLASH_PRODUCE": "0",
+    "SGLANG_WEG2_DRAFT_ON_P": "True",
+    "SGLANG_WEG2_D_ADOPT": "off",
+    "SGLANG_WEG2_D_HOSTGAP": "512",
+    "SGLANG_WEG2_ENABLE_D_IDLE_PUBLISH": "1",
+    "SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK": "1",
+    "SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW": "1",
+    "SGLANG_WEG2_ENABLE_PARK_SEAT_FREE": "1",
+    "SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP": "1",
+    "SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE": "1",
+    "SGLANG_WEG2_ENABLE_RANKSTATS": "1",
+    "SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP": "1",
+    "SGLANG_WEG2_ENABLE_WAKE_READ_EARLY": "1",
+    "SGLANG_WEG2_ENABLE_X_COST_LINE": "1",
+    "SGLANG_WEG2_END_ANCHOR": "1",
+    "SGLANG_WEG2_EVIDENCE_DIR": "/var/lib/htsglang/evidence",
+    "SGLANG_WEG2_FIRST_FWD_TIMING_N": "6",
+    "SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS": "D",
+    "SGLANG_WEG2_FOLLOWER_EARLY_READ": "1",
+    "SGLANG_WEG2_FORM": "arch=dense,experts=none,draft=dflash,p_draft=cold,kv=paged_dcp,flip=family,vision=transient,profile=qwen27b,model=Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "SGLANG_WEG2_FRONT_SPAN_INFLIGHT": "1",
+    "SGLANG_WEG2_GC_WARN_SECS": "0.5",
+    "SGLANG_WEG2_GPU_ARB": "/var/lib/htsglang/arb",
+    "SGLANG_WEG2_GROUP": "P",
+    "SGLANG_WEG2_HICACHE_DRAFT_TIER": "off",
+    "SGLANG_WEG2_IDLE_CLOCK": "1",
+    "SGLANG_WEG2_IDLE_CLOCK_ADDR": "tcp:172.17.0.1:8779",
+    "SGLANG_WEG2_L15": "1",
+    "SGLANG_WEG2_L15_HOT_SHARE": "1",
+    "SGLANG_WEG2_L15_MIB": "c1=7616,c2=1792",
+    "SGLANG_WEG2_L15_REFILL": "1",
+    "SGLANG_WEG2_L15_SHADOW": "1",
+    "SGLANG_WEG2_L3_EPOCH": "1791018426.630661",
+    "SGLANG_WEG2_L3_INHERITED_SUFFIXES": "[\"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_0_1_3_0\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_0_1_3_1\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_0_1_3_2\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_0_3\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_1_3\", \"_Qwen3.8-27B-INT8-gdncov-vocabembed_520526c68d6530e9_2_3\"]",
+    "SGLANG_WEG2_L3_WRITE_BEHIND_YIELD_MS": "2000",
+    "SGLANG_WEG2_LEG1_EARLY": "1",
+    "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": "4096",
+    "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": "1",
+    "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": "4",
+    "SGLANG_WEG2_METRICS_MODEL": "27B",
+    "SGLANG_WEG2_METRICS_PUSH_URL": "http://192.168.0.88:8428/write",
+    "SGLANG_WEG2_PYSPY_DIR": "/var/lib/htsglang/evidence",
+    "SGLANG_WEG2_P_HOSTGAP": "1",
+    "SGLANG_WEG2_P_HOST_OVERLAP": "1",
+    "SGLANG_WEG2_P_NOSYNC": "1",
+    "SGLANG_WEG2_P_TRIM_END_ANCHOR": "1",
+    "SGLANG_WEG2_P_TWIN_DEFER": "1",
+    "SGLANG_WEG2_RANKDUMP_DIR": "/var/lib/htsglang/evidence",
+    "SGLANG_WEG2_RANK_STATE_DIR": "/var/lib/htsglang/state/rankstate/P",
+    "SGLANG_WEG2_SEQ_SYNC_BATCH_MIB": "256",
+    "SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS": "128",
+    "SGLANG_WEG2_SHADOW_HOP_BOUND_MS": "60.0",
+    "SGLANG_WEG2_SLEEP_PAUSE_OVERLAP_GROUPS": "D",
+    "SGLANG_WEG2_STORE_ROOT": "/var/lib/htsglang/hicache-weg2",
+    "SGLANG_WEG2_STORE_SHORT_TAIL": "1",
+    "SGLANG_WEG2_TMS_OUT_DIR": "/opt/htsglang/tms-27b",
+    "SGLANG_WEG2_TMS_PRELOAD_SO": "/opt/htsglang/tms-27b/torch_memory_saver_hook_mode_preload_cu13_ring_3863d0403e3a.so",
+    "SGLANG_WEG2_TOLD_GROUP_FALLBACK": "1",
+    "SGLANG_WEG2_TOLD_PACED": "1",
+    "SGLANG_WEG2_VENV": "/opt/venv",
+    "SGLANG_WEG2_VISION": "transient",
+    "SGLANG_WEG2_VISION_FLIP_URGENT": "1",
+    "SGLANG_WEG2_VMM_EXPORTABLE": "1",
+    "SGLANG_WEG2_WEIGHTS_CPU_BACKUP": "off",
+    "SGLANG_WEG2_WEIGHT_CHUNKS": "8",
+    "SGLANG_WEG2_WEIGHT_CHUNK_LAYERS": "8",
+    "SGLANG_WEG2_WEIGHT_SOURCE": "exchange",
+    "SGLANG_WEG2_XCHG_BOOT": "1791018417",
+    "SGLANG_WEG2_XCHG_BOUNCE_TERMS": "bytes_per_direction=24387228672,n_layers=64,widest_layer_bytes=383939008,pairs=3,depth=1,slot_bytes=134217728,n_lanes=9,max_tag_bytes=3048403584,lanes_concurrent=0,band_credit=0,n_cross_lanes=0,price_lane_cap=0",
+    "SGLANG_WEG2_XCHG_INJECT": "authoritative",
+    "SGLANG_WEG2_XCHG_LEGS": "both",
+    "SGLANG_WEG2_XCHG_MANIFEST_DIR": "/var/lib/htsglang/evidence",
+    "SGLANG_WEG2_XCHG_ONCARD": "host",
+    "SGLANG_WEG2_XCHG_ONCARD_SLOT_MIB": "128",
+    "SGLANG_WEG2_XCHG_REGION": "/dev/shm/weg2-xchg-1791018417/xchg.bin",
+    "SGLANG_WEG2_XCHG_WAVES": "weights_0,weights_5,weights_6|weights_1,weights_7,weights_draft|weights_2,weights_3,weights_4,weights",
+    "SGLANG_WEIGHT_LOADER_SHARED_CACHE_MANIFEST": "/var/lib/htsglang/evidence/boot_weg2_dkr27browauthoritycut43bar1fs10030906_55c95a89c7_1003_090656.shared_cache",
+    "WEG2_CONTAINER": "htsglang-acc-27b-rowauthoritycut43bar1fs",
+    "WEG2_HOSTSAMPLE_CSV": "/var/lib/htsglang/evidence/dkr27browauthoritycut43bar1fs10030906_1003/hostsample_dkr27browauthoritycut43bar1fs10030906.csv",
+    "WEG2_STATE_DIR": "/var/lib/htsglang/state"
+   }
+  },
+  "front_argv": [
+   "/opt/venv/bin/python",
+   "-m",
+   "sglang.srt.weg2.front",
+   "--prefill",
+   "http://127.0.0.1:30031",
+   "--decode",
+   "http://127.0.0.1:30032",
+   "--port",
+   "30030",
+   "--host",
+   "0.0.0.0",
+   "--awake",
+   "D",
+   "--tag",
+   "dkr27browauthoritycut43bar1fs10030906",
+   "--store-dir",
+   "/var/lib/htsglang/hicache-weg2/l3-qwen27b-Qwen3.8-27B-INT8-gdncov-vocabembed-b8da3c4e59",
+   "--prefill-sid",
+   "492",
+   "--decode-sid",
+   "6117",
+   "--vision",
+   "transient",
+   "--dc-reserve",
+   "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d=2082,GPU-5c648f96-be1d-42d5-0221-34d11ab137f7=1650,GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4=1650",
+   "--weight-form",
+   "exchange",
+   "--fairness-w-s",
+   "45.0",
+   "--weight-chunks",
+   "8",
+   "--carrier-max-tokens",
+   "648806",
+   "--p-concurrency",
+   "1",
+   "--d-bs",
+   "6",
+   "--tp-prefill-max-tokens",
+   "4096",
+   "--flip-min-work-tokens",
+   "4096",
+   "--idle-layout",
+   "P",
+   "--drain-deadline-s",
+   "120.0",
+   "--record-line",
+   "model=/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed|repo=/opt/htsglang/src-27b|head=HEAD|evidence=/var/lib/htsglang/evidence",
+   "--x-ceiling-tokens",
+   "12288",
+   "--anon-preboot-bytes",
+   "834162688",
+   "--host-census-record",
+   "/var/lib/htsglang/evidence/host_census_record.json",
+   "--host-census-key",
+   "5a324e4044bf915181537d1481662a3050e984acd2eb3977174a54aba0ab3143|arch=dense,experts=none,draft=dflash,p_draft=cold,kv=paged_dcp,flip=family,vision=transient,profile=qwen27b,model=Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "--host-census-arena-widths",
+   "32768,78446592",
+   "--d-short-drain-tokens",
+   "4096",
+   "--d-hold-s",
+   "10.0",
+   "--src-chunk-cards",
+   "{\"P\": {\"weights_0\": [1], \"weights_1\": [1], \"weights_2\": [1], \"weights_3\": [1], \"weights_4\": [1], \"weights_5\": [0, 1], \"weights_6\": [0, 2], \"weights_7\": [2], \"weights_draft\": [2]}}",
+   "--measured-record",
+   "/var/lib/htsglang/evidence/weg2_measured_record.json",
+   "--commit",
+   "55c95a89c7",
+   "--ledger-arm",
+   "{\"m_mib\": 600, \"s_gb\": 1, \"s_gb_d\": 4, \"xchg_bounce_gib\": 0.0009765625}"
+  ],
+  "redacted": "Admin-Schl\u00fcssel und -Schl\u00fcsseldatei (--admin-api-key, --admin-key-file) werden vom Launcher je Boot erzeugt und nie gezeigt."
+ },
+ "line": "27b",
+ "planer_nachrechnung": {
+  "all_match": true,
+  "checked_utc": "2026-10-03T10:08:56Z",
+  "ok": true,
+  "rev": "55c95a89c7",
+  "rows": [
+   {
+    "error": null,
+    "expected_mib": [
+     27792,
+     17384,
+     17168
+    ],
+    "got_mib": [
+     27792,
+     17384,
+     17168
+    ],
+    "id": "27b-int8:D",
+    "label": "D",
+    "lines": [
+     "budget D group=D ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 27792 MiB = total 32607 - driver_carve 518 (NVML reserved) - dormant_other 1104 - awake_rest_booked 3191 (RECORD boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300; replaces corridor floor transient 767 (source=MEASURED-D), user reserve 1800, awake_overshoot 404) MiB",
+     "budget D group=D ordinal=1 nvml_idx=0 NVIDIA GeForce RTX 3080: 17384 MiB = total 20480 - driver_carve 425 (NVML reserved) - dormant_other 588 - awake_rest_booked 2079 (RECORD boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300; replaces corridor floor transient 700 (source=MEASURED-D), user reserve 1400, awake_overshoot 404) MiB",
+     "budget D group=D ordinal=2 nvml_idx=2 NVIDIA GeForce RTX 3080: 17168 MiB = total 20480 - driver_carve 425 (NVML reserved) - dormant_other 814 - awake_rest_booked 2067 (RECORD boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300; replaces corridor floor transient 701 (source=MEASURED-D), user reserve 1400, awake_overshoot 404) MiB"
+    ],
+    "match": true
+   },
+   {
+    "error": null,
+    "expected_mib": [
+     26344,
+     8312,
+     13864
+    ],
+    "got_mib": [
+     26344,
+     8312,
+     13864
+    ],
+    "id": "27b-int8:P",
+    "label": "P",
+    "lines": [
+     "budget P group=P ordinal=0 nvml_idx=1 NVIDIA GeForce RTX 5090: 26344 MiB = total 32607 - corridor 3259 (floor 2855 source=MEASURED-P reserve=1800 + awake_overshoot 404) - dormant_other 2082 - measured_awake_overshoot 920 (boot weg2ls2b2) - l15 0 (L1.5 post) MiB",
+     "budget P group=P ordinal=1 nvml_idx=0 NVIDIA GeForce RTX 3080: 8312 MiB = total 20480 - corridor 2899 (floor 2495 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1650 - l15 7616 (L1.5 post) MiB",
+     "budget P group=P ordinal=2 nvml_idx=2 NVIDIA GeForce RTX 3080: 13864 MiB = total 20480 - corridor 2662 (floor 2258 source=MEASURED-P reserve=1400 + awake_overshoot 404) - dormant_other 1650 - measured_awake_overshoot 512 (boot weg2ls2b2) - l15 1792 (L1.5 post) MiB"
+    ],
+    "match": true
+   }
+  ]
+ },
+ "profile": "27b-int8",
+ "rank_posts": {
+  "D": {
+   "tp0": {
+    "avail_after_pool_mib": 3666,
+    "graphs": [
+     {
+      "mib": 379,
+      "what": "target verify"
+     },
+     {
+      "mib": 287,
+      "what": "draft verify"
+     }
+    ],
+    "init_dist_mib": 276,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 4311,
+      "tokens": 276115,
+      "v_mib": 4311
+     },
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 61,
+      "tokens": 24673,
+      "v_mib": 61
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 13913,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool": 1421,
+      "prefill activation reserve": 1024,
+      "speculative intermediate state": 100,
+      "weights + runtime state": 16202
+     },
+     "rest_mib": 9044
+    },
+    "mamba": {
+     "conv_mib": 51,
+     "intermediate_mib": 31,
+     "mib": 1485,
+     "slots": 38,
+     "ssm_mib": 1403
+    },
+    "weights": [
+     {
+      "mib": 14725,
+      "type": "Qwen3_5ForConditionalGeneration"
+     },
+     {
+      "mib": 1280,
+      "type": "DFlash2DraftModel"
+     }
+    ]
+   },
+   "tp1": {
+    "avail_after_pool_mib": 2785,
+    "graphs": [
+     {
+      "mib": 440,
+      "what": "target verify"
+     },
+     {
+      "mib": 287,
+      "what": "draft verify"
+     }
+    ],
+    "init_dist_mib": 154,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 3942,
+      "tokens": 252105,
+      "v_mib": 3942
+     },
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 31,
+      "tokens": 24673,
+      "v_mib": 31
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 11539,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool": 711,
+      "prefill activation reserve": 1024,
+      "speculative intermediate state": 50,
+      "weights + runtime state": 7480
+     },
+     "rest_mib": 8119
+    },
+    "mamba": {
+     "conv_mib": 31,
+     "intermediate_mib": 20,
+     "mib": 758,
+     "slots": 38,
+     "ssm_mib": 707
+    },
+    "weights": [
+     {
+      "mib": 6676,
+      "type": "Qwen3_5ForConditionalGeneration"
+     },
+     {
+      "mib": 604,
+      "type": "DFlash2DraftModel"
+     }
+    ]
+   },
+   "tp2": {
+    "avail_after_pool_mib": 2939,
+    "graphs": [
+     {
+      "mib": 440,
+      "what": "target verify"
+     },
+     {
+      "mib": 287,
+      "what": "draft verify"
+     }
+    ],
+    "init_dist_mib": 154,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 3748,
+      "tokens": 240100,
+      "v_mib": 3748
+     },
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 31,
+      "tokens": 24673,
+      "v_mib": 31
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 11314,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool": 711,
+      "prefill activation reserve": 1024,
+      "speculative intermediate state": 50,
+      "weights + runtime state": 7480
+     },
+     "rest_mib": 7903
+    },
+    "mamba": {
+     "conv_mib": 31,
+     "intermediate_mib": 20,
+     "mib": 758,
+     "slots": 38,
+     "ssm_mib": 707
+    },
+    "weights": [
+     {
+      "mib": 6676,
+      "type": "Qwen3_5ForConditionalGeneration"
+     },
+     {
+      "mib": 604,
+      "type": "DFlash2DraftModel"
+     }
+    ]
+   }
+  },
+  "P": {
+   "pp0": {
+    "avail_after_pool_mib": 6810,
+    "graphs": [
+     {
+      "mib": 205,
+      "what": "target prefill"
+     }
+    ],
+    "init_dist_mib": 307,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 3031,
+      "tokens": 310242,
+      "v_mib": 3031
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 14214,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool + speculative intermediate state + prefill activation reserve": 1234,
+      "prefill graph pool": 160,
+      "weights + runtime state": 17044
+     },
+     "rest_mib": 7905
+    },
+    "mamba": {
+     "conv_mib": 51,
+     "intermediate_mib": 0,
+     "mib": 1290,
+     "slots": 24,
+     "ssm_mib": 1239
+    },
+    "prefill_graph_mib": 206,
+    "weights": [
+     {
+      "mib": 16978,
+      "type": "Qwen3_5ForConditionalGeneration"
+     }
+    ]
+   },
+   "pp1": {
+    "avail_after_pool_mib": 13332,
+    "graphs": [
+     {
+      "mib": 184,
+      "what": "target prefill"
+     }
+    ],
+    "init_dist_mib": 184,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 911,
+      "tokens": 310242,
+      "v_mib": 911
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 15501,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool + speculative intermediate state + prefill activation reserve": 299,
+      "prefill graph pool": 160,
+      "weights + runtime state": 4146
+     },
+     "rest_mib": 3707
+    },
+    "mamba": {
+     "conv_mib": 10,
+     "intermediate_mib": 0,
+     "mib": 307,
+     "slots": 24,
+     "ssm_mib": 297
+    },
+    "prefill_graph_mib": 186,
+    "weights": [
+     {
+      "mib": 4076,
+      "type": "Qwen3_5ForConditionalGeneration"
+     }
+    ]
+   },
+   "pp2": {
+    "avail_after_pool_mib": 8929,
+    "graphs": [
+     {
+      "mib": 225,
+      "what": "target prefill"
+     }
+    ],
+    "init_dist_mib": 184,
+    "kv_pools": [
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 911,
+      "tokens": 310242,
+      "v_mib": 911
+     },
+     {
+      "dtype": "torch.float8_e4m3fn",
+      "k_mib": 82,
+      "tokens": 16384,
+      "v_mib": 82
+     }
+    ],
+    "kv_posts": {
+     "measured_free_mib": 11055,
+     "posts_mib": {
+      "GGUF dequant scratch": 0,
+      "mamba state pool + speculative intermediate state + prefill activation reserve": 262,
+      "prefill graph pool": 160,
+      "weights + runtime state": 8592
+     },
+     "rest_mib": 4850
+    },
+    "mamba": {
+     "conv_mib": 10,
+     "intermediate_mib": 0,
+     "mib": 276,
+     "slots": 24,
+     "ssm_mib": 266
+    },
+    "prefill_graph_mib": 222,
+    "weights": [
+     {
+      "mib": 6205,
+      "type": "Qwen3_5ForConditionalGeneration"
+     },
+     {
+      "mib": 2191,
+      "type": "DFlash2DraftModel"
+     }
+    ]
+   }
+  }
+ },
+ "rank_state": {
+  "D.tp0pp0": {
+   "kv": {
+    "holds_kv": true,
+    "kv_tokens": 768256,
+    "share": 1.0
+   },
+   "page_size": 1,
+   "pp_size": 1,
+   "role": "attn_host",
+   "seats": 6,
+   "tp_size": 3
+  },
+  "D.tp1pp0": {
+   "kv": {
+    "holds_kv": true,
+    "kv_tokens": 768256,
+    "share": 1.0
+   },
+   "page_size": 1,
+   "pp_size": 1,
+   "role": "attn_host",
+   "seats": 6,
+   "tp_size": 3
+  },
+  "D.tp2pp0": {
+   "kv": {
+    "holds_kv": true,
+    "kv_tokens": 768256,
+    "share": 1.0
+   },
+   "page_size": 1,
+   "pp_size": 1,
+   "role": "attn_host",
+   "seats": 6,
+   "tp_size": 3
+  },
+  "P.tp0pp0": {
+   "kv": {
+    "holds_kv": true,
+    "kv_tokens": 310242,
+    "share": 1.0
+   },
+   "page_size": 1,
+   "pp_size": 3,
+   "role": "stage",
+   "seats": 2,
+   "tp_size": 1
+  },
+  "P.tp0pp1": {
+   "kv": {
+    "holds_kv": true,
+    "kv_tokens": 310242,
+    "share": 1.0
+   },
+   "page_size": 1,
+   "pp_size": 3,
+   "role": "stage",
+   "seats": 2,
+   "tp_size": 1
+  },
+  "P.tp0pp2": {
+   "kv": {
+    "holds_kv": true,
+    "kv_tokens": 310242,
+    "share": 1.0
+   },
+   "page_size": 1,
+   "pp_size": 3,
+   "role": "stage",
+   "seats": 2,
+   "tp_size": 1
+  }
+ },
+ "schema": "kartenplan.record/1",
+ "vram_plan": {
+  "asleep": {
+   "D": {
+    "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 2082,
+    "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 1650,
+    "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 1650
+   },
+   "P": {
+    "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 1104,
+    "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 588,
+    "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 814
+   }
+  },
+  "boot_id": "dkr27browauthoritycut43bar1fs10030906",
+  "budget_terms": {
+   "D": {
+    "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": {
+     "awake": 3191,
+     "awake_source": "RECORD D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300",
+     "budget": 27792,
+     "budget_prelim": 27792,
+     "carve": 518,
+     "corridor_lowering": 0,
+     "dormant": 1104,
+     "floor": 0,
+     "growth": 0,
+     "total": 32607
+    },
+    "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": {
+     "awake": 2079,
+     "awake_source": "RECORD D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300",
+     "budget": 17384,
+     "budget_prelim": 17384,
+     "carve": 425,
+     "corridor_lowering": 0,
+     "dormant": 588,
+     "floor": 0,
+     "growth": 0,
+     "total": 20480
+    },
+    "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": {
+     "awake": 2067,
+     "awake_source": "RECORD D_AWAKE_REST_BOOKED_MIB boot dkr27browauthoritybar1fs09291152,dkr27browauthoritybar1fs09290956,dkr27browauthoritybar1w109290020,dkr27browauthoritybar1w109290002,dkr27browauthoritybar1w109281851,dkr27browauthoritybar1w109281715,dkr27browauthoritybar1w109281556,dkr27browauthoritybar1w109281300",
+     "budget": 17168,
+     "budget_prelim": 17168,
+     "carve": 425,
+     "corridor_lowering": 0,
+     "dormant": 814,
+     "floor": 0,
+     "growth": 0,
+     "total": 20480
+    }
+   },
+   "P": {
+    "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": {
+     "awake": 1324,
+     "awake_source": "awake_overshoot 404 + measured_awake_overshoot 920",
+     "budget": 26344,
+     "budget_prelim": 26344,
+     "carve": 0,
+     "corridor_lowering": 0,
+     "dormant": 2082,
+     "floor": 2855,
+     "growth": 0,
+     "total": 32607
+    },
+    "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": {
+     "awake": 404,
+     "awake_source": "awake_overshoot 404",
+     "budget": 8312,
+     "budget_prelim": 8312,
+     "carve": 0,
+     "corridor_lowering": 0,
+     "dormant": 1650,
+     "floor": 2495,
+     "growth": 0,
+     "total": 20480
+    },
+    "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": {
+     "awake": 916,
+     "awake_source": "awake_overshoot 404 + measured_awake_overshoot 512",
+     "budget": 13864,
+     "budget_prelim": 13864,
+     "carve": 0,
+     "corridor_lowering": 0,
+     "dormant": 1650,
+     "floor": 2258,
+     "growth": 0,
+     "total": 20480
+    }
+   }
+  },
+  "cards": [
+   {
+    "class": "NVIDIA GeForce RTX 5090",
+    "driver_reserved_mib": 518,
+    "nvml": 1,
+    "total_mib": 32607,
+    "user_reserve_mib": 0,
+    "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
+   },
+   {
+    "class": "NVIDIA GeForce RTX 3080",
+    "driver_reserved_mib": 425,
+    "nvml": 0,
+    "total_mib": 20480,
+    "user_reserve_mib": 0,
+    "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7"
+   },
+   {
+    "class": "NVIDIA GeForce RTX 3080",
+    "driver_reserved_mib": 425,
+    "nvml": 2,
+    "total_mib": 20480,
+    "user_reserve_mib": 0,
+    "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
+   }
+  ],
+  "closure": [],
+  "flip_legs": {},
+  "groups": {
+   "D": {
+    "ranks": {
+     "tp0": {
+      "budget_mib": 27792,
+      "card": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+      "cells": {},
+      "elastic": {},
+      "fixed": {},
+      "provenance": {
+       "budget_mib": "MODEL(budgets_from_dc)",
+       "posts": "UNMEASURED(kein D-FRACTION-SOLVE)"
+      },
+      "torch_cache_cap_mib": 0,
+      "transient_by_state": {}
+     },
+     "tp1": {
+      "budget_mib": 17384,
+      "card": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+      "cells": {},
+      "elastic": {},
+      "fixed": {},
+      "provenance": {
+       "budget_mib": "MODEL(budgets_from_dc)",
+       "posts": "UNMEASURED(kein D-FRACTION-SOLVE)"
+      },
+      "torch_cache_cap_mib": 0,
+      "transient_by_state": {}
+     },
+     "tp2": {
+      "budget_mib": 17168,
+      "card": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+      "cells": {},
+      "elastic": {},
+      "fixed": {},
+      "provenance": {
+       "budget_mib": "MODEL(budgets_from_dc)",
+       "posts": "UNMEASURED(kein D-FRACTION-SOLVE)"
+      },
+      "torch_cache_cap_mib": 0,
+      "transient_by_state": {}
+     }
+    }
+   },
+   "P": {
+    "ranks": {
+     "pp0": {
+      "budget_mib": 26344,
+      "card": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+      "cells": {},
+      "elastic": {},
+      "fixed": {},
+      "provenance": {
+       "budget_mib": "MODEL(budgets_from_dc)",
+       "posts": "UNMEASURED(PP-CUT P-KARTE entfiel)"
+      },
+      "torch_cache_cap_mib": 0,
+      "transient_by_state": {}
+     },
+     "pp1": {
+      "budget_mib": 8312,
+      "card": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+      "cells": {},
+      "elastic": {},
+      "fixed": {},
+      "provenance": {
+       "budget_mib": "MODEL(budgets_from_dc)",
+       "posts": "UNMEASURED(PP-CUT P-KARTE entfiel)"
+      },
+      "torch_cache_cap_mib": 0,
+      "transient_by_state": {}
+     },
+     "pp2": {
+      "budget_mib": 13864,
+      "card": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+      "cells": {},
+      "elastic": {},
+      "fixed": {},
+      "provenance": {
+       "budget_mib": "MODEL(budgets_from_dc)",
+       "posts": "UNMEASURED(PP-CUT P-KARTE entfiel)"
+      },
+      "torch_cache_cap_mib": 0,
+      "transient_by_state": {}
+     }
+    }
+   }
+  },
+  "identity": {
+   "model": "Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "profile": "qwen27b",
+   "tag": "dkr27browauthoritycut43bar1fs10030906"
+  },
+  "open": [
+   "D.closure UNMEASURED (kein D-FRACTION-SOLVE in D)",
+   "P.closure UNMEASURED (PP-CUT P-KARTE entfiel in diesem Pass)"
+  ],
+  "overrides": [
+   {
+    "group": "P",
+    "key": "--max-running-requests",
+    "source": "--extra-p",
+    "value": "2"
+   },
+   {
+    "group": "launcher",
+    "key": "--pp-stage-ratio",
+    "source": "argv",
+    "value": "43,11,10"
+   },
+   {
+    "group": "launcher",
+    "key": "--user-reserve-mib",
+    "source": "argv",
+    "value": "1800,1400,1400"
+   }
+  ],
+  "pass": "d",
+  "plan_id": "sha256:4746db1aa7b7414b62dc4b058b76d334ff69ae540321853554bd98fb569a28e5",
+  "rev": "",
+  "schema": "weg2.vram_plan/1"
+ },
+ "vram_plan_ok": true,
+ "weights": [
+  {
+   "bytes": null,
+   "flag": "--model-path",
+   "path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+   "src": "Pfad nicht lesbar"
+  },
+  {
+   "bytes": null,
+   "flag": "--speculative-draft-model-path",
+   "path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued",
+   "src": "Pfad nicht lesbar"
+  }
+ ]
+}

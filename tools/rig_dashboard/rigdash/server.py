@@ -25,7 +25,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, history, imagechanges, ipcboot, launchview, live, redact, sampler, sources, vmpush, weg2line
+from . import energy, features, health, history, imagechanges, ipcboot, kartenplan, launchview, live, redact, sampler, sources, vmpush, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -37,6 +37,10 @@ STATIC_FILES = {
     "/uplot.LICENSE": ("uplot.LICENSE", "text/plain; charset=utf-8"),
     "/grafik.js": ("grafik.js", "application/javascript; charset=utf-8"),
     "/zoom.js": ("zoom.js", "application/javascript; charset=utf-8"),
+}
+#: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
+DEV_STATIC_FILES = {
+    "/kartenplan.js": ("kartenplan.js", "application/javascript; charset=utf-8"),
 }
 
 
@@ -222,6 +226,7 @@ class App:
         # this process reads what it published and measures nothing
         self.src = sources.SourcesReader(self.ring_store) if self.sup is not None else sources.Sources(cfg)
         self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
+        self.kartenplaner = kartenplan.Kartenplaner()
         self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
                        else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
@@ -559,6 +564,26 @@ def make_handler(app: App):
                     if q.get("from") and q.get("to"):
                         lo_hi = (float(q["from"]), float(q["to"]))     # a zoomed stretch (Klicken und Ziehen)
                     return self._json(app.history_view(model, q.get("range", "1h"), lo_hi=lo_hi))
+                if path.startswith("/api/kartenplan/"):
+                    # Kartenplaner: reine Rechnung auf Planer-Funktionen und Aufzeichnungen, keine GPU, kein Launcher
+                    if app.edition == "release":
+                        return self._send(404, "not found", "text/plain")
+                    if path == "/api/kartenplan/catalog":
+                        return self._json(dict(app.kartenplaner.catalog(), ok=True))
+                    if path == "/api/kartenplan/plan":
+                        from urllib.parse import parse_qs, urlsplit
+
+                        raw = (parse_qs(urlsplit(self.path).query).get("q") or [""])[0]
+                        try:
+                            req = json.loads(raw)
+                        except ValueError:
+                            raise ValueError("q= muss JSON sein: {profile, cards:[{card, pcie:{gen,lanes,rebar,chipset}}], host_patched}")
+                        return self._json(app.kartenplaner.plan(req))
+                    return self._send(404, "not found", "text/plain")
+                if path in DEV_STATIC_FILES and app.edition != "release":
+                    name, ctype = DEV_STATIC_FILES[path]
+                    with open(os.path.join(STATIC, name), "rb") as fh:
+                        return self._send(200, fh.read(), ctype)
                 if path in STATIC_FILES:
                     name, ctype = STATIC_FILES[path]
                     with open(os.path.join(STATIC, name), "rb") as fh:

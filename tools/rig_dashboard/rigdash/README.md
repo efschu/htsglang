@@ -312,3 +312,19 @@ geben 404. Neue Entwicklungsteile gehören in einen DEV-Block (`tests/test_editi
 - Neue Reihen: in `history.view` den Namen aufnehmen. Den Schreiber in `Recorder` setzen, nie aus
   einem neuen Log-Regex (`tests/test_no_new_log_parsers.py`).
 - Diagramme: `static/grafik.js` mit uPlot 1.6.32, lokal eingebettet (`static/uplot.*`, MIT). Es gibt kein CDN.
+
+
+## Kartenplaner (Item 510, Reiter "Kartenplaner", nur Rig-Ausgabe)
+
+Optimale Startkonfiguration für ein gewähltes Modell/Profil (27B INT8, NF INT4 abl, 27B NVFP4 Dual, 27B FP8, 27B GGUF UD-IQ4_XS)
+auf 1..6 gewählten Karten (Katalog `kartenplan_catalog.py`, PCIe je Karte: Gen, Lanes, Resizable BAR, über Chipsatz).
+
+* Urteil "geht / geht nicht": die Original-Planerfunktionen `card_identity.arch_gate/order_cards/uncalibrated_message` und
+  `topology.plan_topology` (`kartenplan_gate.py`, per Dateipfad geladen, synthetische Karten, keine GPU, kein Launcher).
+* Plan: Aufzeichnung des Planers beim echten Boot (`kartenplan_data/*.json`: vram_plan.json, Budgetzeilen, argv/env, Rang-Log-Posten,
+  Flag-Erklärungen, `planer_nachrechnung` = `launcher.budgets_from_dc` im Kindprozess gegen die Boot-Zahlen).
+* Andere Karten/Zahlen: der Planer verweigert (HW-COUNT/HW-ARCH/HW-UNCALIBRATED/HW-TOPOLOGY); es gibt dann nur eine gekennzeichnete NÄHERUNG.
+* Records erneuern (Schreibtisch; liest Logs, darum außerhalb dieses Pakets): `cd tools/rig_dashboard; python3 -m kartenplan_build.records;
+  python3 -m kartenplan_build.bridge --trees-root <Ordner mit <rev>/python/sglang>`.
+* Ansehen ohne den Dienst: `python3 -m rigdash.kartenplan_preview --port 18890 --tree <baum>/python`, dann `http://127.0.0.1:18890/#t=kartenplan`.
+* Deploy-Vorschlag: `deploy/install_510.sh --check` / `deploy/install_510.sh` (Lead).

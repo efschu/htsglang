@@ -87,6 +87,42 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
   background: var(--surface-2); color: var(--text); cursor: pointer; }
 .lf .miss { color: var(--warn); font-size: 12px; }
 /* <!--DEV:END--> */
+/* <!--DEV:BEGIN--> */
+/* Kartenplaner (Item 510): Auswahl, Einfach- und Expertenseite; Farben aus den Seitenvariablen (hell/dunkel) */
+#kp-root { max-width: 1200px; }
+.kp-top { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 4px 0 10px; }
+.kp-top select, .kp-card select { font: inherit; font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); max-width: 100%; }
+.kp-top button, #kp-root button { font: inherit; font-size: 12px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+.kp-top button:disabled { opacity: .5; cursor: default; }
+.kp-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.kp-card { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--surface); }
+.kp-card-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.kp-card-head select { flex: 1 1 200px; }
+.kp-pcie { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12.5px; margin: 6px 0 2px; align-items: center; }
+.kp-meta { font-size: 11.5px; } .kp-meta i { font-style: normal; color: var(--muted); }
+.kp-x { padding: 0 8px !important; font-size: 16px !important; line-height: 1.3; }
+.kp-verdict { border: 1px solid var(--line); border-left-width: 5px; border-radius: 8px; padding: 8px 12px; margin: 10px 0 6px; background: var(--surface); }
+.kp-verdict.ok { border-left-color: var(--good); } .kp-verdict.bad { border-left-color: var(--bad); }
+.kp-cs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0; }
+.kp-reasons { margin: 6px 0 10px 18px; padding: 0; font-size: 13px; } .kp-reasons li { margin: 4px 0; overflow-wrap: anywhere; }
+.kp-notes { margin: 4px 0 8px 18px; padding: 0; font-size: 12.5px; color: var(--text-2); } .kp-notes.kp-warn { color: var(--warn); }
+.kp-pre { margin: 6px 0; padding: 8px 10px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; overflow-x: auto; font-size: 12px; white-space: pre; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.kp-note { font-size: 12px; margin: 4px 0 8px; } .kp-src { font-size: 12.5px; color: var(--text-2); overflow-wrap: anywhere; }
+.kp-ctx { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 13px; } .kp-ctx i { font-style: normal; color: var(--muted); font-size: 11px; }
+.kp-vram { margin: 8px 0 12px; } .kp-vh { margin-bottom: 3px; }
+.kp-row { display: flex; align-items: center; gap: 8px; margin: 2px 0; } .kp-g { width: 1.2em; font-weight: 650; color: var(--text-2); }
+.kp-bar { flex: 1 1 auto; display: flex; height: 18px; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; background: var(--bar-bg); }
+.kp-bud { font-size: 11.5px; min-width: 9.5em; text-align: right; }
+.kp-s { display: inline-block; height: 100%; min-width: 1px; }
+.ks-w { background: var(--s1); } .ks-x { background: var(--s3); } .ks-k { background: var(--s2); } .ks-s { background: var(--s4); } .ks-d { background: var(--s5); }
+.ks-g { background: var(--s7); } .ks-l { background: repeating-linear-gradient(45deg, var(--s1) 0 4px, var(--surface) 4px 8px); } .ks-z { background: var(--flip); }
+.ks-c { background: color-mix(in srgb, var(--muted) 55%, transparent); } .ks-f { background: transparent; } .ks-o { background: var(--muted); }
+.kp-leg { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11.5px; color: var(--text-2); margin: 4px 0 6px; } .kp-leg .kp-s { width: 12px; height: 12px; margin-right: 4px; vertical-align: -2px; border: 1px solid var(--line); }
+.kp-ft td { font-size: 12px; } .kp-ft td:first-child { min-width: 15em; overflow-wrap: anywhere; } .kp-ft td:nth-child(2) { min-width: 8em; } .kp-val { overflow-wrap: anywhere; max-width: 28em; }
+.kp-fold { border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; margin: 6px 0; background: var(--surface); } .kp-fold > summary { cursor: pointer; font-size: 13px; }
+.kp-nae { border: 1px dashed var(--warn); border-radius: 8px; padding: 6px 12px; margin: 6px 0; }
+#kp-envf { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; width: min(420px, 100%); margin-bottom: 6px; }
+/* <!--DEV:END--> */
 .cardstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 6px; margin: -4px 0 12px; }
 .cardstrip > div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; }
 .cardstrip b { font-size: 13px; }
@@ -402,6 +438,7 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
   <button type="button" role="tab" data-tab="sitzungen">Sitzungen</button>
   <button type="button" role="tab" data-tab="karten">Karten</button>
   <!--DEV:BEGIN-->
+  <button type="button" role="tab" data-tab="kartenplan">Kartenplaner</button>
   <button type="button" role="tab" data-tab="entwicklung">Entwicklung <span class="cnt" id="tab-dev-cnt"></span></button>
   <!--DEV:END-->
 </nav>
@@ -454,6 +491,14 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
     </div>
   </section>
   </div>
+  <!--DEV:BEGIN-->
+  <div class="tab" id="tab-kartenplan" role="tabpanel" hidden>
+    <section class="card" id="kp-card" aria-label="Kartenplaner">
+      <h2>Kartenplaner <span class="muted">optimale Startkonfiguration für ein Modell auf bis zu 6 Karten &middot; Zahlen aus unserem Planer und seinen Aufzeichnungen, nichts wird gestartet</span></h2>
+      <div id="kp-root"><div class="muted">lädt &hellip;</div></div>
+    </section>
+  </div>
+  <!--DEV:END-->
   <!--DEV:BEGIN-->
   <div class="tab" id="tab-entwicklung" role="tabpanel" hidden>
   <div class="devhead" id="dev-head"><h2>Entwicklungsstand</h2><span class="muted">nur im Rig-Dashboard; die veröffentlichte fLLiper-Ausgabe (<span class="mono">--edition release</span>) liefert diesen Teil nicht aus &middot; Bereiche auf-/zuklappen, der Zustand bleibt gemerkt</span></div>
@@ -520,6 +565,9 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
 </main>
 <div class="tip" id="tip"></div>
 <script src="zoom.js"></script>
+<!--DEV:BEGIN-->
+<script src="kartenplan.js"></script>
+<!--DEV:END-->
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
