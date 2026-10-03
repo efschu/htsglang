@@ -396,6 +396,11 @@ class Envs:
     # publishes the resolved value to the front and both groups' ranks.
     SGLANG_WEG2_DRAFT_ON_P = EnvBool(False)
 
+    # Auftrag 1000: test namespace of the weg2 /dev/shm name families. Unset =
+    # release names (under pytest: "test-<pid>", see weg2/shm_namespace.py);
+    # "" = explicitly no namespace; any other value = "test-<value>" prefix.
+    SGLANG_WEG2_SHM_NAMESPACE = EnvStr(None)
+
     # #695: allocate the permanent phase-flip host weight images at their exact
     # size (MAP_ANONYMOUS + cudaHostRegister) instead of through torch's pinned
     # caching allocator, which rounds every request up to a power of two and

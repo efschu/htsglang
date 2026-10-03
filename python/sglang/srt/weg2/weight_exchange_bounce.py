@@ -124,6 +124,7 @@ from sglang.srt.mem_cache.pinned_host_budget import (
     revert_pinned_posts_on_failure,
     unregister_pinned_post,
 )
+from sglang.srt.weg2 import shm_namespace as shm_ns
 from sglang.srt.weg2 import weight_exchange as wx
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2 import weight_exchange_transport as tp
@@ -2178,7 +2179,8 @@ _SLOT_REC = struct.Struct("<qq")
 
 
 def bounce_slots_path(boot_nonce: str, shm_root: str = "/dev/shm") -> str:
-    return os.path.join(shm_root, f"{BOUNCE_SLOT_PREFIX}{boot_nonce}")
+    return os.path.join(
+        shm_root, shm_ns.shm_name_for_root(f"{BOUNCE_SLOT_PREFIX}{boot_nonce}", shm_root))
 
 
 class BounceSlots:
@@ -2678,13 +2680,13 @@ def sequential_buffer_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
     # #1378 xsn53: PER LANE.  Three cards run their co-located pairs at the
     # same time; a boot-wide file would put all three pairs' bytes on the
     # same windows.  The lane key is the handshake's own (p<pair> / c<card>).
-    return (f"{shm_root}/weg2-seq-{boot_nonce}/"
+    return (f"{shm_root}/" + shm_ns.shm_name_for_root(f"weg2-seq-{boot_nonce}", shm_root) + "/"
             + (f"{lane}_" if lane else "") + "unit_buffer.bin")
 
 
 def sequential_digest_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
                            lane: str = "") -> str:
-    return (f"{shm_root}/weg2-seq-{boot_nonce}/"
+    return (f"{shm_root}/" + shm_ns.shm_name_for_root(f"weg2-seq-{boot_nonce}", shm_root) + "/"
             + (f"{lane}_" if lane else "") + "unit_digests.json")
 
 
@@ -2768,7 +2770,7 @@ def seq_ring_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
                   lane: str = "") -> str:
     """Die Ringdatei eines Lane-Pufferslots, NEBEN dem Ganz-Tag-Puffer: ein
     Tag im Ganz-Modus darf die Ringdatei nicht auf Taggroesse wachsen lassen."""
-    return (f"{shm_root}/weg2-seq-{boot_nonce}/"
+    return (f"{shm_root}/" + shm_ns.shm_name_for_root(f"weg2-seq-{boot_nonce}", shm_root) + "/"
             + (f"{lane}_" if lane else "") + "ring.bin")
 
 

@@ -24,6 +24,7 @@ import shutil
 
 import pytest
 
+from sglang.srt.weg2 import shm_namespace as shm_ns
 from sglang.srt.weg2 import weight_exchange_region as xr
 
 
@@ -35,7 +36,8 @@ def _own_residue():
     this must not then sweep the real root under a stale assumption.
     """
     root = getattr(xr, "SHM_ROOT", "/dev/shm")
-    mine = f"{xr.REGION_PREFIX}s4b{os.getpid()}x"
+    # Auftrag 1000: under pytest the product's names carry the test-namespace prefix.
+    mine = f"{shm_ns.shm_prefix()}{xr.REGION_PREFIX}s4b{os.getpid()}x"
     try:
         names = os.listdir(root)
     except OSError:
@@ -73,6 +75,33 @@ def _weg2_shm_residue_guard():
                 pass
 
 
+def _sweep_test_namespace():
+    """Auftrag 1000: at session end remove EVERYTHING this process created under its
+    own test namespace (``test-<pid>-*``, semaphore files ``sem.test-<pid>-*``).
+
+    The namespace prefix is the proof of ownership (it carries this pid), so no
+    holder check is needed -- and the launcher's #1217 sweep never counted these
+    names in the first place (``launcher.is_test_shm_name``)."""
+    prefix = shm_ns.shm_prefix()
+    if not prefix:
+        return
+    root = shm_ns.REAL_SHM_ROOT
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for n in names:
+        if n.startswith(prefix) or n.startswith(f"sem.{prefix}"):
+            p = os.path.join(root, n)
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+            except OSError:
+                pass
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _weg2_shm_ratchet():
     """THE RATCHET: zero own-pid weg2 residue when the session ends.
@@ -83,6 +112,9 @@ def _weg2_shm_ratchet():
     """
     yield
     left = _own_residue()
+    # the ratchet above still sees a leaked region; everything else under the test
+    # namespace (bounce slots, seq buffers, semaphores) is removed at session end
+    _sweep_test_namespace()
     assert not left, (
         "#1344 RATCHET: the weg2 suite left its own /dev/shm residue behind: "
         + ", ".join(os.path.basename(p) for p in left)

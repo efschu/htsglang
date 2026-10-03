@@ -1050,7 +1050,10 @@ def test_the_boot_nonce_is_in_the_semaphore_name(tmp_path):
     format string, so nothing else in this file would notice.
     """
     name = xr.sem_name(BOOT, 0, 0, "empty")
-    assert name == f"/{xr.REGION_PREFIX}{BOOT}-0-1-0-empty", name
+    # Auftrag 1000: under pytest the name carries the test-namespace prefix (release: none).
+    from sglang.srt.weg2 import shm_namespace as _shm_ns
+
+    assert name == f"/{_shm_ns.shm_prefix()}{xr.REGION_PREFIX}{BOOT}-0-1-0-empty", name
     assert BOOT in name
     mine, theirs = set(xr.all_sem_names(BOOT)), set(xr.all_sem_names(OTHER_BOOT))
     assert len(mine) == len(theirs) == 24

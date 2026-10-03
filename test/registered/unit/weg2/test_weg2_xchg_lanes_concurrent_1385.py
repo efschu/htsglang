@@ -768,7 +768,10 @@ class TheLauncherPricesTheOnlyPermitCount(CustomTestCase):
         from sglang.srt.weg2 import weight_exchange_region as xr
 
         name = xr.lane_permit_sem_name("abc123")
-        self.assertTrue(name.startswith(f"/{xr.REGION_PREFIX}"))
+        # Auftrag 1000: under pytest the name carries the test-namespace prefix (release: none).
+        from sglang.srt.weg2 import shm_namespace as _shm_ns
+
+        self.assertTrue(name.startswith(f"/{_shm_ns.shm_prefix()}{xr.REGION_PREFIX}"))
         # And it must never collide with a cross (`-<digit>-<digit>-<digit>-
         # {kind}`) or diagonal (`-card<n>-<digit>-{kind}`) name.
         self.assertNotIn("-card", name)

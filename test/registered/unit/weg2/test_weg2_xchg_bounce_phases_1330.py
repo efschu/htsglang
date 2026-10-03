@@ -67,11 +67,15 @@ def _sweep_own_shm():
     # sweep still named only the region prefix, so nine files accumulated
     # across runs. A cleanup that knows one of its own two artefacts is the
     # same half-measure as a check written against the last incident.
-    for name in os.listdir("/dev/shm"):
+    from sglang.srt.weg2 import shm_namespace as _shm_ns
+
+    for entry in os.listdir("/dev/shm"):
+        # Auftrag 1000: under pytest the product's names carry the test-namespace prefix.
+        name = entry.removeprefix(_shm_ns.shm_prefix())
         if (name == f"weg2-xchg-{NONCE}"
                 or name.startswith(f"weg2-xchg-{NONCE}-")
                 or name == f"{wb.BOUNCE_SLOT_PREFIX}{NONCE}"):
-            target = os.path.join("/dev/shm", name)
+            target = os.path.join("/dev/shm", entry)
             if os.path.isdir(target):
                 shutil.rmtree(target, ignore_errors=True)
             else:
