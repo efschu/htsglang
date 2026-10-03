@@ -136,6 +136,26 @@
    "power_limit_source": "not recorded per record; the eight boots ran 5090 400 W / 3080 230 W (boot json power_limit_w)"
   },
   {
+   "name": "D_DUAL_ALLOC_CACHE_BOOK_MIB",
+   "value": [
+    1318,
+    0,
+    0
+   ],
+   "provenance": "item 170 (desk/27b-q-170-nvml1-alloccache-1003, weg2/budget_rest.py --dual-d-log): D's torch allocator cache GROWTH after the pools were sized, per card ordinal (5090 nvml1, nvml0, nvml2), that the card ledger books when P joins the pool (CardKvLedger.book_unpriced). Source series: '#1028c BOUND alloc_cache' instant of the D log, first sample = the cache at the sizing (TP0 348.4 / TP1 266.5 / TP2 258.7 MiB, identical in every boot), highwater over the four newest serving boots of 27B NVFP4 dual 27b-nvfp4-dual1m-psleep (10020008 / 10020145 / 10020256 / 10020527): TP0 998.6 / 1002.7 / 990.5 / 1665.6 (growth 650.2 / 654.3 / 642.1 / 1317.2), TP1 1530.1 / 1399.8 / 969.2 / 1757.9, TP2 1466.2 / 1342.1 / 967.2 / 1766.2. BOOKED where the ledger had to book unbooked card use ('LEDGER-PHYS BOOKED') in a strict majority of the boots: nvml1 4/4 (445.3 / 533.3 / 583.3 / 490.0 MiB; its budget fell 535 / 583 / 1223 MiB from its post-join maximum in the three boots with a stable ledger, ratio 0.82-0.93 of the growth) -> max growth 1317.2 rounded up = 1318. 0 on the two 3080s: 2/4 (24.5, 162.5 MiB) and 1/4 (120.5 MiB) -- the free memory beside the ledger absorbs the growth there, booking it would be a reserve. Same checkpoint and form only (fmt nvfp4, dual layout): the INT8 flip layout and the older dual builds never read it.",
+   "boots": [
+    "dkr27bnvfp4dual1mpsleepbar1fs10020527",
+    "dkr27bnvfp4dual1mpsleepbar1fs10020256",
+    "dkr27bnvfp4dual1mpsleepbar1fs10020145",
+    "dkr27bnvfp4dual1mpsleepbar1fs10020008"
+   ],
+   "kind": "memory",
+   "power_limit_w": null,
+   "power_limit_source": "not recorded per record; the boots ran 5090 400 W / 3080 230 W (boot json power_limit_w)",
+   "fmt": "nvfp4",
+   "n": 4
+  },
+  {
    "name": "D_EXTEND_CAP_PER_ROW_MIB",
    "value": [
     0.3091,

@@ -368,6 +368,138 @@ def torch_caps(budgets: Sequence[int], rests: Sequence[Optional[int]],
     return [int(b) + int(r) - int(o) for b, r, o in zip(budgets, rests, others)]
 
 
+# --------------------------------------------------------------------------
+# WEG2-ALLOC-CACHE-BOOK (desk/27b-q-170-nvml1-alloccache-1003, item 170): D's
+# torch allocator cache growth in the DUAL layout, booked into the card ledger
+# of the card where it measurably binds.
+#
+# THE GAP (boot dkr27bnvfp4dual1mpsleepbar1fs10020527, D.log): the card ledger
+# promised bytes the 5090 did not have -- LEDGER-PHYS OVER-PROMISE up to 343 MiB,
+# CORRIDOR LAW BREACHED min 56 MiB, one cuMemCreate OOM rolled back by
+# GROW-SHORT -- while D's own torch allocator cache swung 270 MiB in the same
+# window (``#1028c BOUND alloc_cache ... instant=1648.1 delta=269.7``).
+#
+# WHAT THE SERIES SAYS (``#1028c BOUND alloc_cache``, ``_allocator_cache_bytes``
+# = reserved - allocated, one line per second per D rank): every dual boot
+# starts at the same sample (TP0 348.4 / TP1 266.5 / TP2 258.7 MiB, the cache
+# when the pools were sized) and GROWS under traffic -- TP0 to 999 / 1003 / 991
+# / 1666 MiB in the four newest serving boots of ``27b-nvfp4-dual1m-psleep``.
+# The ledger budget (the SUM of the two groups' boot KV, sized when the cache
+# was that first sample) knows nothing of the growth. On the 5090 the growth
+# ends up in the ledger anyway, one OVER-PROMISE check at a time (3 checks =
+# 30 s before ``LEDGER-PHYS BOOKED``): the budget of the three newest boots
+# fell 535 / 583 / 1223 MiB from its post-join maximum for a cache growth of
+# 654 / 642 / 1317 MiB (ratio 0.82 / 0.91 / 0.93). On the 3080s the same growth
+# (1100-1500 MiB) is absorbed by the free memory beside the ledger (budget fell
+# 0-162 MiB): booking it there would be a reserve, so those cards are not priced.
+#
+# THE BOOKING (accounting, not a reserve): per card ordinal::
+#
+#     book = HW - FIRST    if the card booked unbooked card use (LEDGER-PHYS
+#                          BOOKED) in a strict majority of the boots given,
+#            0             otherwise (absorbed -- measured, named)
+#     HW    max ``instant`` of the series over the boots given
+#     FIRST the series' first sample (the cache at the sizing)
+#
+# the boots being the newest serving boots of ONE checkpoint and form (27B
+# NVFP4, dual layout). RECORD > BUILTIN > UNMEASURED (H94): a profile without
+# the record books nothing and the launcher line says UNMEASURED. The ledger
+# lowers its budget by ``book`` when P joins the card pool
+# (``CardKvLedger.book_unpriced``), i.e. what the reconcile would have booked
+# after the fact is priced at the join. No constant.
+# --------------------------------------------------------------------------
+
+ALLOC_CACHE_RECORD_FMT = "{group}_DUAL_ALLOC_CACHE_BOOK_MIB"
+ALLOC_CACHE_MARKER = "WEG2-ALLOC-CACHE-BOOK"
+
+_BOUND_CACHE = re.compile(
+    r"TP(?P<rank>\d+)\] #1028c BOUND alloc_cache: .*?instant=(?P<inst>[0-9.]+) MiB "
+    r"delta=(?P<delta>[0-9.]+) MiB")
+_PHYS_BOOKED = re.compile(r"TP(?P<rank>\d+)\] \S+ P-KV LEDGER-PHYS BOOKED (?P<n>\d+) B")
+
+
+def alloc_cache_record_name(group: str) -> str:
+    return ALLOC_CACHE_RECORD_FMT.format(group=str(group).upper())
+
+
+@dataclass(frozen=True)
+class CacheSeries:
+    """One D rank of one boot."""
+
+    first: float      # first '#1028c BOUND alloc_cache' instant (MiB): the cache at the sizing
+    highwater: float  # max instant (MiB)
+    delta_max: float  # max window delta (MiB)
+    n: int
+    booked_b: int     # sum of 'LEDGER-PHYS BOOKED' bytes of this rank
+
+    @property
+    def growth(self) -> float:
+        return self.highwater - self.first
+
+
+def cache_series(group_text: str) -> Dict[int, CacheSeries]:
+    """rank -> :class:`CacheSeries` from one D log (only the ``#1028c BOUND
+    alloc_cache`` and ``LEDGER-PHYS BOOKED`` lines are read)."""
+    first: Dict[int, float] = {}
+    high: Dict[int, float] = {}
+    dmax: Dict[int, float] = {}
+    cnt: Dict[int, int] = {}
+    booked: Dict[int, int] = {}
+    for line in group_text.splitlines():
+        m = _BOUND_CACHE.search(line)
+        if m:
+            r, inst, delta = int(m.group("rank")), float(m.group("inst")), float(m.group("delta"))
+            first.setdefault(r, inst)
+            high[r] = max(high.get(r, inst), inst)
+            dmax[r] = max(dmax.get(r, delta), delta)
+            cnt[r] = cnt.get(r, 0) + 1
+            continue
+        m = _PHYS_BOOKED.search(line)
+        if m:
+            r = int(m.group("rank"))
+            booked[r] = booked.get(r, 0) + int(m.group("n"))
+    return {r: CacheSeries(first[r], high[r], dmax[r], cnt[r], booked.get(r, 0)) for r in first}
+
+
+def alloc_cache_book_from_boots(
+    boots: Sequence[Tuple[str, str]], n_cards: int,
+) -> Tuple[List[Optional[int]], List[str]]:
+    """``boots`` = (tag, D-log text) of the SAME checkpoint and form, newest
+    first. Per card ordinal ``max over boots (highwater - first)``, rounded UP
+    to the MiB, where the card booked unbooked card use in a strict majority of
+    the boots; 0 where it did not (absorbed -- a measured statement, named);
+    ``None`` where no boot sampled the rank (UNMEASURED, never zero)."""
+    import math
+
+    per_card: List[List[Tuple[str, CacheSeries]]] = [[] for _ in range(int(n_cards))]
+    lines: List[str] = []
+    for tag, txt in boots:
+        for r, cs in sorted(cache_series(txt).items()):
+            if r < n_cards:
+                per_card[r].append((tag, cs))
+                lines.append(
+                    f"{ALLOC_CACHE_MARKER} {tag} rank={r}: alloc_cache first {cs.first:.1f} -> "
+                    f"highwater {cs.highwater:.1f} MiB (growth {cs.growth:.1f}, window delta max "
+                    f"{cs.delta_max:.1f}, n={cs.n}); ledger booked {cs.booked_b / (1 << 20):.1f} MiB")
+    out: List[Optional[int]] = []
+    for o, rows in enumerate(per_card):
+        if not rows:
+            out.append(None)
+            lines.append(f"{ALLOC_CACHE_MARKER} group=D ordinal={o}: no boot sampled it: UNMEASURED")
+            continue
+        binding = sum(1 for _, cs in rows if cs.booked_b > 0)
+        if binding * 2 > len(rows):
+            out.append(int(math.ceil(max(cs.growth for _, cs in rows))))
+            lines.append(f"{ALLOC_CACHE_MARKER} group=D ordinal={o}: BOOK {out[-1]} MiB = max growth over "
+                         f"{len(rows)} boots; the ledger had to book card use in {binding}/{len(rows)}")
+        else:
+            out.append(0)
+            lines.append(f"{ALLOC_CACHE_MARKER} group=D ordinal={o}: 0 MiB -- the ledger booked card use in "
+                         f"only {binding}/{len(rows)} boots, the card's free memory absorbs the growth "
+                         f"(booking it would be a reserve)")
+    return out, lines
+
+
 def _boot_tag(path: str) -> str:
     m = re.search(r"boot_weg2_([A-Za-z0-9]+?)_[0-9a-f]{10}_", os.path.basename(path))
     return m.group(1) if m else os.path.basename(path)
@@ -382,6 +514,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--capped", action="store_true",
                     help="also print the torch-cache-cap records (<G>_TORCH_CAP_OTHER_MIB, "
                          "<G>_AWAKE_REST_CAPPED_MIB)")
+    ap.add_argument("--dual-d-log", action="append", default=[], metavar="D_LOG",
+                    help="WEG2-ALLOC-CACHE-BOOK: a D log of the dual form (newest first, repeat); prints "
+                         "<G>_DUAL_ALLOC_CACHE_BOOK_MIB (see WEG2-ALLOC-CACHE-BOOK)")
     ap.add_argument("front_logs", nargs="+", help="front logs, newest first; the group log "
                     "is the same path with .front.log -> .<group>.log")
     a = ap.parse_args(argv)
@@ -409,6 +544,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         (capped_record_name(a.group), capped)):
             print(json.dumps({"name": name, "value": v, "boots": [b[0] for b in boots],
                               "kind": "memory"}))
+    if a.dual_d_log:
+        dual = []
+        for p in a.dual_d_log:
+            with open(p, errors="replace") as fh:
+                dual.append((_boot_tag(p), "".join(
+                    ln for ln in fh if "#1028c BOUND alloc_cache" in ln or "LEDGER-PHYS BOOKED" in ln)))
+        book, blines = alloc_cache_book_from_boots(dual, int(a.cards))
+        for ln in blines:
+            print(ln)
+        print(json.dumps({"name": alloc_cache_record_name(a.group), "value": book,
+                          "boots": [d[0] for d in dual], "kind": "memory", "fmt": "nvfp4"}))
     return 0
 
 

@@ -14063,6 +14063,38 @@ def dual_share_env(ns, group: str) -> Dict[str, str]:
     return env
 
 
+def dual_alloc_cache_book_env(ns, cards: List[Card], log: Log) -> Dict[str, str]:
+    """WEG2-ALLOC-CACHE-BOOK (item 170): P's env carrying the MiB per card
+    ordinal that the card ledger books at P's join for D's allocator-cache
+    growth (weg2/budget_rest.py, record ``D_DUAL_ALLOC_CACHE_BOOK_MIB`` of the
+    profile, fmt = the checkpoint's format). RECORD > BUILTIN > UNMEASURED:
+    a profile / format without the record books nothing and the line says
+    UNMEASURED; so does any non-dual-share boot ({} and no line)."""
+    if not getattr(ns, "dual_share", False) or str(getattr(ns, "dual_unified_kv", "off")) != "on":
+        return {}
+    from sglang.srt.weg2 import dual_p_kv_stage as _dual_p_kv
+
+    name = _budget_rest.alloc_cache_record_name("D")
+    fmt = d_reshard_format(str(getattr(ns, "model", "") or ""))
+    sel = weg2_form.profile_record(name, getattr(ns, "profile", None), fmt=fmt)
+    if sel is None:
+        log(f"{_budget_rest.ALLOC_CACHE_MARKER} {_budget_rest.SOURCE_UNMEASURED} profile="
+            f"{getattr(ns, 'profile', None)} fmt={fmt or '-'}: no record {name} of this checkpoint and "
+            f"form -- the card ledger books no allocator-cache growth at P's join (named, not measured); "
+            f"measure with python -m sglang.srt.weg2.budget_rest --dual-d-log")
+        return {}
+    vals = list(sel.record.value)
+    if len(vals) != len(cards):
+        raise Weg2LaunchRefused(
+            f"{_budget_rest.ALLOC_CACHE_MARKER}: {name} has {len(vals)} entries for {len(cards)} cards; "
+            f"re-measure with python -m sglang.srt.weg2.budget_rest --dual-d-log")
+    log(f"{_budget_rest.ALLOC_CACHE_MARKER} {_budget_rest.SOURCE_RECORD} {name} fmt={fmt} "
+        f"boot {','.join(sel.record.boots)}: " + ", ".join(
+            f"ordinal {i} nvml{c.nvml_index} " + ("UNMEASURED" if v is None else f"{int(v)} MiB")
+            for i, (c, v) in enumerate(zip(cards, vals))) + " -- booked into the card ledger at P's join")
+    return {_dual_p_kv.ALLOC_CACHE_BOOK_ENV: ",".join("" if v is None else str(int(v)) for v in vals)}
+
+
 class Weg2DualPSleepShareRefused(SystemExit):
     """W-DUAL-P-SLEEP-SHARE: --dual-p-sleep on with --dual-share. Not resident, P's
     weights load inside the memory-saver's private MemPool; the union bind frees
@@ -25937,6 +25969,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
         log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
     apply_dual_p_sleep(ns, spec_p, log)  # D PRIORITY stage 2 (dual unified KV only)
+    spec_p.env.update(dual_alloc_cache_book_env(ns, cards, log))  # item 170: D's cache growth, booked at P's join
     ns._dual_mps_env = start_dual_mps(ns, log, dry)
     spec_p.env.update(ns._dual_mps_env)
     spec_p.env.update(dual_p_sm_env(ns))

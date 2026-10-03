@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 MARK = "DUAL-TP3PP3 P-KV"
 MAX_TOKENS_ENV = "SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS"
+#: WEG2-ALLOC-CACHE-BOOK (item 170): MiB per card ordinal (P stage s on card s) of D's allocator
+#: cache growth the card ledger books at P's join (launcher: record D_DUAL_ALLOC_CACHE_BOOK_MIB)
+ALLOC_CACHE_BOOK_ENV = "SGLANG_WEG2_DUAL_ALLOC_CACHE_BOOK_MIB"
 #: the token lattice every P KV span plan is cut at (a live move keeps whole
 #: cells) and the unit ``ensure`` rounds up to
 STEP_TOKENS_ENV = "SGLANG_WEG2_DUAL_P_KV_STEP_TOKENS"
@@ -487,6 +490,7 @@ def attach(runner) -> Optional["PKvStage"]:
     boot = int(getattr(runner, "_dual_p_boot_tokens", 0) or 0)
     boot_bytes = actor.bytes_for(boot) - actor.bytes_for(0)
     ledger.contribute(boot_bytes, committed=0)
+    book_alloc_cache(ledger, int(getattr(runner, "pp_rank", 0) or 0), card)
     actor._engage_cap(actor.allocator, 0, actor.page)
     setattr(runner, ACTOR_ATTR, actor)
     publish_stage(actor, tag, int(getattr(runner, "pp_rank", 0) or 0))
@@ -494,6 +498,42 @@ def attach(runner) -> Optional["PKvStage"]:
                 "mapped; its KV is the card pool's", MARK, card[-12:], boot, boot_bytes, actor.top,
                 actor.step)
     return actor
+
+
+def alloc_cache_book_mib(pp_rank: int, env=None) -> Optional[int]:
+    """The MiB the launcher's record books on this stage's card (``None``: no
+    record / this card unpriced -- nothing is booked, by name)."""
+    env = os.environ if env is None else env
+    raw = str(env.get(ALLOC_CACHE_BOOK_ENV, "") or "").strip()
+    if not raw:
+        return None
+    parts = [x.strip() for x in raw.split(",")]
+    if not (0 <= int(pp_rank) < len(parts)) or not parts[int(pp_rank)]:
+        return None
+    try:
+        return max(0, int(parts[int(pp_rank)]))
+    except ValueError:
+        return None
+
+
+def book_alloc_cache(ledger, pp_rank: int, card: str, env=None) -> int:
+    """WEG2-ALLOC-CACHE-BOOK: after P's boot KV joined the card pool, book D's
+    allocator cache growth (a measured record, same checkpoint and form) into
+    the ledger -- priced at the join, not after three OVER-PROMISE checks and a
+    rolled-back grow (dual mpsleep 10020527: 343 MiB over-promise, CORRIDOR LAW
+    BREACHED min 56 MiB on the 5090). Returns the bytes booked."""
+    mib = alloc_cache_book_mib(pp_rank, env)
+    if mib is None:
+        logger.info("%s ALLOC-CACHE-BOOK card=%s pp_rank=%d: UNMEASURED (no record prices this card), "
+                    "nothing booked", MARK, str(card)[-12:], int(pp_rank))
+        return 0
+    want = mib << 20
+    got = ledger.book_unpriced(want) if want > 0 else 0
+    logger.info("%s ALLOC-CACHE-BOOK card=%s pp_rank=%d: booked %d of %d B (D's allocator-cache growth, "
+                "record D_DUAL_ALLOC_CACHE_BOOK_MIB) into the card budget%s", MARK, str(card)[-12:],
+                int(pp_rank), got, want, "" if got == want else " -- the rest does not fit under what is "
+                "committed (I1) and stays unbooked")
+    return got
 
 
 def _actor(sched) -> Optional["PKvStage"]:

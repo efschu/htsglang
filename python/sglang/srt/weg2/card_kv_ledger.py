@@ -311,6 +311,27 @@ class CardKvLedger:
             st.contrib[other] = max(0, st.contrib[other] - (over - mine))
             return over
 
+    def book_unpriced(self, nbytes: int) -> int:
+        """WEG2-ALLOC-CACHE-BOOK (item 170): lower the budget by ``nbytes`` of
+        card use that grows AFTER the pools were sized and is not KV (D's torch
+        allocator cache, measured as a record of the same checkpoint and form).
+        The same books as :meth:`reconcile` -- from this group's contribution
+        first, the rest from the other's -- but priced at the join instead of
+        after three OVER-PROMISE checks and a rolled-back grow. Never below
+        what is committed (I1): the part that does not fit stays unbooked and
+        is returned as the difference. Returns the bytes booked."""
+        n = max(0, int(nbytes))
+        with self._locked() as st:
+            n = min(n, max(0, int(st.free)))
+            if n <= 0:
+                return 0
+            st.budget -= n
+            mine = min(n, st.contrib[self.group])
+            st.contrib[self.group] -= mine
+            other = GROUPS[1 - self._gi]
+            st.contrib[other] = max(0, st.contrib[other] - (n - mine))
+            return n
+
     def clear_pressure(self) -> None:
         """This group no longer needs what it asked the other one for (its demand
         fits what it maps): the pressure it put on the other group goes."""
