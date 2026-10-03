@@ -359,6 +359,55 @@ class PpCut(unittest.TestCase):
                                   families, 4096)
 
 
+class TwoStageSolver(unittest.TestCase):
+    """The planner's cut solver on P = PP2 with the DERIVED inputs (cost model
+    from the reference basis by class, N-stage incumbent, no pool floor): it
+    prices and ships a cut -- the solver is not three-stage."""
+
+    def solve(self, objective, cards=(1, 0)):
+        from sglang.srt.planner import pp_cut as PC
+        from sglang.srt.planner.pp_cut_launch import solve_launch_cut
+
+        fams = tuple(PC.LAYER_FAMILY_ATTENTION if (i % 4) == 3 else PC.LAYER_FAMILY_LINEAR for i in range(64))
+        ns = ns_for("--profile", "qwen27b")
+        with HS.replayed(HS.REFERENCE_RIG, cards):
+            order = L.order_cards(L.resolve_cards())
+            cost, _ = L.derived_family_cost(ns, order, fams, 4096)
+        ms = (8.10, 35.16) if cards == (1, 0) else (35.16, 35.16)
+        pool = PC.PhasePoolModel(
+            free_mib=(27960.0, 17064.0) if cards == (1, 0) else (17064.0, 17064.0),
+            weight_mib_per_layer=363.4 if cards == (1, 0) else 252.0,   # INT8 / NVFP4 mean layer
+            kv_mib_per_token_per_attn_layer=2048.0 / (1024.0 * 1024.0),
+            arming_floor_mib=(1229.0, 1229.0), mamba_mib_per_linear_layer_per_slot=1.5588, mamba_slots=20,
+            stage_fixed_mib=(1418.4, 4960.6) if cards == (1, 0) else (2425.0, 606.0),
+            activation_reserve_mib=1024.0, corridor_holdback_mib=1024.0,
+            zero_posts_acknowledged=("mamba pre-capture reserve", "speculative intermediate state",
+                                     "GGUF dequant scratch"), page_size=1)
+        floor, floor_cut, rule = L.resolve_pool_floor(None, 2)
+        self.assertEqual((floor, floor_cut), (None, None))
+        return solve_launch_cut(
+            layer_families=fams, incumbent_layers=L.n_stage_incumbent(2, 64, ms), measured_ms_per_layer=ms,
+            measured_provenance="derived", card_names=("HERMETIC-A", "HERMETIC-B"), pool_model=pool,
+            cap_tokens=262144, family_cost=cost, design_prefix_tokens=4096,
+            per_pair_crossing_ms={(0, 1): 0.0}, enumerate_gapped=False, objective=objective,
+            pool_floor=floor, pool_floor_from_cut=floor_cut)
+
+    def test_the_solver_ships_a_two_stage_cut(self):
+        for objective in ("makespan", "maxkv"):
+            d = self.solve(objective)
+            self.assertEqual(len(d.chosen.layers), 2, objective)
+            self.assertEqual(sum(d.chosen.layers), 64)
+            self.assertEqual(sum(d.chosen.attn), 16)
+            self.assertGreater(d.chosen.pool_tokens, 0)
+        fast = self.solve("makespan")
+        self.assertGreater(fast.chosen.layers[0], fast.chosen.layers[1])   # the 5090 stage takes more
+
+    def test_two_equal_cards_split_the_layers_evenly(self):
+        d = self.solve("makespan", (0, 2))
+        self.assertLessEqual(abs(d.chosen.layers[0] - d.chosen.layers[1]), 4)
+        self.assertGreaterEqual(d.chosen.pool_tokens, 262144)   # the full context fits on P (fixture: NVFP4 weights, 17064 MiB free)
+
+
 class PChunkStages(unittest.TestCase):
     """The P-chunk stage table and the prefill-graph pool vector are
     three-stage tables of the reference rig; main reads them BEFORE the cards,
