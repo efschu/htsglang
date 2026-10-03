@@ -1724,6 +1724,29 @@ def cached_tier_of(body: Any) -> Optional[Dict[str, int]]:
 CACHED_TIER_ASK_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages")
 
 
+def payload_namespace(payload: Any) -> Tuple[bool, Optional[str]]:
+    """Q-530 SALT-ISOLATION (port of 27B Q-460): ``(known, extra_key)`` of a client
+    payload -- the KV namespace the groups run it under (serving_base.
+    _compute_extra_key: cache_salt + extra_key concatenated). ``known`` is False
+    for a key only the group can form (a LoRA adapter folds its id into the
+    key at the tokenizer manager): such a request is isolated (fail closed)."""
+    if not isinstance(payload, dict):
+        return True, None
+    if payload.get("lora_path"):
+        return False, None
+    model = payload.get("model")
+    if isinstance(model, str) and ":" in model:
+        return False, None            # model "base:adapter" selects a LoRA
+    parts = []
+    for k in ("cache_salt", "extra_key"):
+        v = payload.get(k)
+        if v:
+            if not isinstance(v, str):
+                return False, None
+            parts.append(v)
+    return True, ("".join(parts) if parts else None)
+
+
 def cached_tier_asked(payload: Any) -> bool:
     """Did this request body (the CLIENT's) ask for the tier split itself?"""
     return isinstance(payload, dict) and bool(payload.get("return_cached_tokens_details"))
@@ -4795,6 +4818,17 @@ class Front:
             else:
                 payload = {"rid": rid, "input_ids": ids,
                            "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
+                # Q-530 SALT-ISOLATION: P prefills D's context in the rid's own
+                # namespace -- D reads it back under that key (D's needs-P record,
+                # else the arrival's note). Without it P's pages land under None.
+                _ek = r.get("extra_key")
+                if _ek is None:
+                    _note = (self.__dict__.get("_ns_ek") or {}).get(rid)
+                    _ek = _note[1] if _note is not None and _note[0] else None
+                if _ek is not None:
+                    payload["extra_key"] = str(_ek)
+                    logger.info("WEG2 NS-ISOLATED rvp rid=%s ns=salted (Q-530: the needs-P leg runs "
+                                "in the request's namespace)", rid)
                 p = Pending(rid=rid, path="/generate", payload=payload, text=f"\x00rvp:{rid}",
                             t_arrive=now, fut=asyncio.get_event_loop().create_future(),
                             est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
@@ -6005,10 +6039,13 @@ class Front:
             logger.warning("WEG2 L3-INDEX-PRICE n/a: %s -- no store credit at arrival (retried "
                            "every %.0f s)", why, self.STORE_PROBE_RETRY_S)
 
-    async def _store_probe_depth(self, rid: str, ids: Any, timeout_s: float) -> Tuple[int, str]:
+    async def _store_probe_depth(self, rid: str, ids: Any, timeout_s: float,
+                                 extra_key: Optional[str] = None) -> Tuple[int, str]:
         """L3-INDEX / L2-ARENA PRICE: (the store depth of ``ids`` in tokens,
         the tier it needs -- ``l3_index`` or ``l2_arena``); (0, "none") = none
-        or not askable. Asked in the front tokenizer's worker thread."""
+        or not askable. Asked in the front tokenizer's worker thread.
+        ``extra_key`` (Q-530): the request's namespace -- the depth of THAT
+        namespace's chain, never another tenant's pages."""
         ft = self.ftok
         if self.__dict__.get("store_probe") is None:
             t = self.__dict__.get("_store_probe_t")
@@ -6019,7 +6056,10 @@ class Front:
                 return 0, "none"
         try:
             d = await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(ft.executor, self.store_probe.depth, ids),
+                asyncio.get_running_loop().run_in_executor(
+                    ft.executor,
+                    (self.store_probe.depth if extra_key is None else
+                     functools.partial(self.store_probe.depth, extra_key=extra_key)), ids),
                 timeout=max(0.05, timeout_s))
         except Exception as e:  # noqa: BLE001 -- no credit, named; the price stands
             self.counters["l3_index_price_failed"] += 1
@@ -6117,22 +6157,41 @@ class Front:
         # P's END-ANCHOR, recorded before the measured prefix is read.
         # MM-XPRICE: the store's page keys hold the REAL ids -- an image
         # request is probed only up to its first image (surrogates beyond)
-        l3, tier = await self._store_probe_depth(
-            rid, c.ids if mm is None else c.ids[: mm.first_image],
-            envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
-            - (time.monotonic() - t0))
-        if l3 > 0 and self.tspans.record_store_depth(c.ids, l3, source=tier) > 0:
+        # Q-530 SALT-ISOLATION: a namespaced request (cache_salt / extra_key) is
+        # priced from ITS namespace's store chain alone. The token spans (D
+        # readings, END-ANCHORs, seq marks) are keyed by ids only, so such a
+        # request neither takes nor gives span credit. A key only the group can
+        # form (LoRA): no credit at all.
+        ns_known, ns = payload_namespace(payload)
+        isolated = (not ns_known) or ns is not None
+        l3, tier = 0, "none"
+        if ns_known:
+            l3, tier = await self._store_probe_depth(
+                rid, c.ids if mm is None else c.ids[: mm.first_image],
+                envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
+                - (time.monotonic() - t0), extra_key=ns)
+        if l3 > 0 and (isolated or self.tspans.record_store_depth(c.ids, l3, source=tier) > 0):
             self.counters["l3_index_credit"] += 1
             self.counters["l3_index_credit_tokens"] += int(l3)
             if tier == "l2_arena":
                 self.counters["l2_arena_credit"] += 1
-        if mm is not None:
+        if mm is not None and not isolated:
             # MM-PERSIST-1002: the image pages are keyed by the group's pad
             # value, which the probe above cannot ask -- a restored anchor can
+            # (Q-530: not for a namespaced request -- the anchors are unsalted)
             self._mm_persist_credit(rid, c.ids, mm_keys, mm, l3)
         # the epoch is read AFTER the count: a flip during it ends the held credit
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
-        pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
+        if isolated:
+            self.counters["ns_isolated_priced"] += 1
+            logger.info("WEG2 NS-ISOLATED rid=%s ns=%s store_depth=%d tier=%s (Q-530: priced from its "
+                        "own namespace's store chain; no token-span credit taken or given)",
+                        rid, "salted" if ns_known else "unknown", int(l3), tier)
+            credit = max(0, min(int(l3), int(c.ids.size)))
+            pending, known, src = max(0, int(c.ids.size) - credit), credit > 0, \
+                (tier if credit > 0 else "none")
+        else:
+            pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
         self._x_exact_rid[rid] = (pending, c.n, src)
         while len(self._x_exact_rid) > 4096:
             self._x_exact_rid.popitem(last=False)
@@ -6429,6 +6488,8 @@ class Front:
             mm_rid = p.p_only and p.rid in (self.__dict__.get("_mm_rid_info") or {})
             if (p.leg1_done or p.skip_leg1 or (p.p_only and not mm_rid) or p.x_requeues):
                 continue
+            if Front._ns_isolated(self, p.rid):
+                continue  # Q-530: a namespaced request keeps its own store price
             ids = self.ftok.ids_for(p.text)
             if ids is None and mm_rid:
                 exp = self._mm_ids(p.rid)
@@ -6499,7 +6560,11 @@ class Front:
         # expired with that refusal. Only D evidence recorded AFTER it counts
         # (``since_seq``); without a fresh confirmation the P reroute stands.
         void = getattr(p, "sk_void_seq", None)
-        if void is None:
+        if Front._ns_isolated(self, p.rid):
+            # Q-530: no span credit for a namespaced request -- its store price
+            # stands; after a D refusal nothing confirms it (the whole prompt)
+            new, src = (int(ids.size), "none") if void is not None else (int(p.est_uncached), "ns_store")
+        elif void is None:
             new, _credit, _known, src = self.tspans.pending(ids, epoch=self.epoch)
         else:
             new, _credit, _known, src = self.tspans.pending(ids, epoch=self.epoch, since_seq=void)
@@ -6834,6 +6899,27 @@ class Front:
                     "held Mamba anchor, #59)", rid, old, int(depth), int(depth), int(ct), int(pt),
                     int(held))
 
+    def _ns_note(self, rid: str, payload) -> None:
+        """Q-530 SALT-ISOLATION: the request's namespace ``(known, extra_key)``
+        (payload_namespace), kept per rid (bounded) so that every recording site
+        and the resume-via-P leg know it, even when the exact count falls back."""
+        try:
+            m = self.__dict__.setdefault("_ns_ek", collections.OrderedDict())
+            m[str(rid)] = payload_namespace(payload)
+            while len(m) > 4096:
+                m.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- no note = the default namespace
+            pass
+
+    def _ns_isolated(self, rid: Any) -> bool:
+        """Q-530 SALT-ISOLATION: ``rid`` runs in a namespace of its own
+        (cache_salt / extra_key) or in one the front cannot know (LoRA): its
+        D readings and P anchors are never recorded into the token spans
+        (keyed by ids alone), and it is never re-priced from them. A rid the
+        front holds no note for is the default namespace."""
+        got = (self.__dict__.get("_ns_ek") or {}).get(str(rid))
+        return got is not None and ((not got[0]) or got[1] is not None)
+
     def _p_anchor_presence(self, rid: str, text: str, pending: Any) -> int:
         """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE).
 
@@ -6850,6 +6936,8 @@ class Front:
         in-flight write-through #1324 refused to credit. Returns the anchor."""
         if not self.x_exact or self.tspans is None:
             return 0
+        if Front._ns_isolated(self, rid):
+            return 0  # Q-530: a namespaced anchor credits no other tenant
         ids = self.ftok.ids_for(text)
         p_pt = int(getattr(pending, "leg1_prompt_tokens", 0) or 0)
         anchor = self.tspans.record_store_anchor(ids, p_pt)
@@ -6872,6 +6960,8 @@ class Front:
         got = _sh.parse(mark)
         if ts is None or ids is None or got is None:
             return False
+        if Front._ns_isolated(self, rid):
+            return False  # Q-530: a namespaced sequence credits no other tenant
         depth, digest = got
         if not ts.record_seq(ids, depth, digest):
             return False
@@ -7042,6 +7132,8 @@ class Front:
         if (not getattr(self, "x_exact", False) or getattr(self, "tspans", None) is None
                 or getattr(self, "ftok", None) is None):
             return 0
+        if Front._ns_isolated(self, rid):
+            return 0  # Q-530: a namespaced in-flight anchor credits no other tenant
         ids = self.ftok.ids_for(text)
         if ids is None:
             self.counters["presence_d_inflight_no_ids"] += 1
@@ -7181,6 +7273,9 @@ class Front:
         lost_set = {int(d) for d in lost or ()}
         n, tokens, rids = 0, 0, []
         for rid, (text, pt) in list(served.items()):
+            if Front._ns_isolated(self, rid):
+                self.counters["store_presence_ns_isolated"] += 1
+                continue  # Q-530: its END-ANCHOR lies in its own namespace's chain
             ids = ft.ids_for(text)
             if ids is None:
                 self.counters["store_presence_no_ids"] += 1
@@ -7266,8 +7361,9 @@ class Front:
         ids = self.ftok.ids_for(text)
         clamps = self.tspans.own_text_clamps
         clamped_tokens = self.tspans.own_text_clamped_tokens
-        self.tspans.record_presence(ids, ct, prompt_tokens=pt,
-                                    held_epoch=held_epoch, resumable_depth=resumable_depth)
+        if not Front._ns_isolated(self, rid):  # Q-530: a namespaced reading credits no other tenant
+            self.tspans.record_presence(ids, ct, prompt_tokens=pt,
+                                        held_epoch=held_epoch, resumable_depth=resumable_depth)
         self._seq_record(rid, ids, seq_mark, "finish")  # SEQ-HASH (02.10.)
         if self.tspans.own_text_clamps != clamps:
             # PREFILL-EINBRUCH-0929 K2: a parked + resumed leg 2 counts its
@@ -8895,6 +8991,9 @@ class Front:
         # PRICE-BARRIER: an arrival whose chars/3 price is a LONG candidate is
         # announced to the SHORTs priced beside it -- from HERE, before the
         # BOOT-START HOLD, so arrivals one hold releases are priced as a group.
+        # Q-530 SALT-ISOLATION: the namespace is noted at the arrival, so every
+        # recording site knows it even when the exact count falls back
+        Front._ns_note(self, rid, payload)
         _pb_fut = Front._pb_register(self, rid, remainder) if self.x_exact else None
         # EARLY-FLIP: D idle and a chars/3 price far over X -> the D->P flip begins
         # NOW, beside the count and the probe below; it awaits this verdict
@@ -11813,7 +11912,8 @@ class Front:
                     if (getattr(self, "x_exact", False)
                             and envs.SGLANG_WEG2_ENABLE_D_INFLIGHT_PRESENCE.get()):
                         self._d_inflight_presence(rid, text, pending, _via)
-                if _has_content and front_span_inflight() and self.spans.agent_span:
+                if (_has_content and front_span_inflight() and self.spans.agent_span
+                        and not Front._ns_isolated(self, rid)):  # Q-530: no cross-tenant credit
                     # #49 rest: D has produced this leg's first content, so it
                     # has PREFILLED the whole prompt into its radix, where a
                     # concurrent request with this prefix matches it (boot
@@ -12106,9 +12206,10 @@ class Front:
                         _held = r.status == 200 and priced and not x_inband
                         _depth = d_resumable_depth_stream_tail(bytes(tail))
                         self._note_resumable_depth(rid, pt, ct, _held, _depth)
-                        self.spans.record_presence(text, ct, prompt_tokens=pt,
-                                                   held_epoch=(self.epoch if _held else None),
-                                                   resumable_depth=_depth)
+                        if not Front._ns_isolated(self, rid):  # Q-530: no cross-tenant credit
+                            self.spans.record_presence(text, ct, prompt_tokens=pt,
+                                                       held_epoch=(self.epoch if _held else None),
+                                                       resumable_depth=_depth)
                         self._note_exact(text, pt)
                         if self.x_exact:
                             self._x_exact_record(rid, text, pt, ct, pending,
@@ -12220,9 +12321,10 @@ class Front:
                     _held = r.status == 200 and priced and verdict != "reroute"
                     _depth = d_resumable_depth(js)
                     self._note_resumable_depth(rid, pt, ct, _held, _depth)
-                    self.spans.record_presence(text, ct, prompt_tokens=pt,
-                                               held_epoch=(self.epoch if _held else None),
-                                               resumable_depth=_depth)
+                    if not Front._ns_isolated(self, rid):  # Q-530: no cross-tenant credit
+                        self.spans.record_presence(text, ct, prompt_tokens=pt,
+                                                   held_epoch=(self.epoch if _held else None),
+                                                   resumable_depth=_depth)
                     self._note_exact(text, pt)
                     if self.x_exact:
                         self._x_exact_record(rid, text, pt, ct, pending,

@@ -157,8 +157,11 @@ def chunk_page_hashes(req, prefix_len: int, extend_len: int, *,
         return []
     cached_pos = getattr(req, _HASH_POS_ATTR, None)
     cached_last = getattr(req, _HASH_LAST_ATTR, None)
+    # Q-460 SALT-ISOLATION: a chain from position 0 starts in the request's
+    # namespace (cache_salt / extra_key), as the tree's own keys do.
+    _ns = getattr(req, "extra_key", None)
     if prefix_len == 0:
-        hashes = get_hash_str(_key_units(tokens[:raw_end], bigram), None, page_size=1)
+        hashes = get_hash_str(_key_units(tokens[:raw_end], bigram), None, page_size=1, extra_key=_ns)
     elif cached_pos == prefix_len and cached_last:
         hashes = get_hash_str(
             _key_units(tokens[prefix_len:raw_end], bigram), cached_last, page_size=1
@@ -166,7 +169,7 @@ def chunk_page_hashes(req, prefix_len: int, extend_len: int, *,
     else:
         # A prefix hit or a chunk boundary we did not see: rebuild the chain
         # from position 0 (same function, same result, only slower).
-        hashes = get_hash_str(_key_units(tokens[:raw_end], bigram), None, page_size=1)[prefix_len:]
+        hashes = get_hash_str(_key_units(tokens[:raw_end], bigram), None, page_size=1, extra_key=_ns)[prefix_len:]
     if not isinstance(hashes, list) or len(hashes) != want:
         raise DFlashDraftKvProduceError(
             f"rid={getattr(req, 'rid', '?')}: expected {want} page hash(es) "

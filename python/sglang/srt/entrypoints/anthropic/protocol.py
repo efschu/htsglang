@@ -497,6 +497,14 @@ class AnthropicMessagesRequest(BaseModel):
     #: ``sglext.cached_tokens_details``). Declared for the reason ``rid`` is:
     #: undeclared, ``extra="ignore"`` would drop it silently.
     return_cached_tokens_details: Optional[bool] = None
+    #: Q-460 SALT-ISOLATION: the KV-cache namespace, as on
+    #: ``/v1/chat/completions`` (``cache_salt`` + ``extra_key`` ->
+    #: ``extra_key``). Undeclared, ``extra="ignore"`` dropped it: a salted
+    #: Messages request shared the prefix cache with every other tenant, and
+    #: the Weg 2 front (which keys P's leg by the payload's salt) and this
+    #: group disagreed about the namespace.
+    cache_salt: Optional[str] = None
+    extra_key: Optional[str] = None
 
     @field_validator("model")
     @classmethod

@@ -192,8 +192,11 @@ def context_ids(req) -> List[int]:
 
 
 def write_request(rid: str, ids: Iterable[int], d_extent: int, x: int, reason: str,
-                  directory: Optional[str] = None, attempt: int = 1) -> str:
-    """Atomically publish one needs-P request; returns the path ('' = not written)."""
+                  directory: Optional[str] = None, attempt: int = 1,
+                  extra_key: Optional[str] = None) -> str:
+    """Atomically publish one needs-P request; returns the path ('' = not written).
+    ``extra_key`` (Q-460): the request's KV namespace, so P prefills the
+    context under the key D reads it back with."""
     d = directory if directory is not None else needs_p_dir()
     if not d or not rid:
         return ""
@@ -202,8 +205,11 @@ def write_request(rid: str, ids: Iterable[int], d_extent: int, x: int, reason: s
         p = os.path.join(d, f"{rid}.json")
         tmp = f"{p}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            json.dump({"rid": rid, "input_ids": list(ids), "d_extent": int(d_extent), "x": int(x),
-                       "reason": reason, "attempt": int(attempt), "t": time.time()}, f)
+            rec = {"rid": rid, "input_ids": list(ids), "d_extent": int(d_extent), "x": int(x),
+                   "reason": reason, "attempt": int(attempt), "t": time.time()}
+            if extra_key is not None:
+                rec["extra_key"] = str(extra_key)
+            json.dump(rec, f)
         os.replace(tmp, p)
         return p
     except Exception:  # noqa: BLE001 - an unwritten request falls back to the abort
@@ -400,7 +406,7 @@ def keep_on_d(sched, req, d_extent: int, x: int, reason: str = "x_refusal_midstr
     # there -- scheduler.py's own notes at the #10516/#18042 sites)
     rank0 = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0) == 0
     ok = bool(write_request(str(req.rid), context_ids(req), d_extent, x, reason,
-                            attempt=n)) if rank0 else True
+                            attempt=n, extra_key=getattr(req, "extra_key", None))) if rank0 else True
     d_seats.mark_parked(req, d_seats.SITE_FLIP, epoch=None, now=time.monotonic())
     parked = d_park_runtime.parked_list(sched)
     if not any(p is req for p in parked):
