@@ -358,3 +358,163 @@ class TestQ920FidelityFlipUnchanged:
             assert plans[0][0][2] == 0, env
             (line,) = _fallback_lines(caplog)
             assert "reason=told_fidelity" in line and line.endswith("STORE-TOLD WAIT EXCEEDED / MISMATCH"), (env, line)
+
+
+# --- 4. A1 NO-ROOM: the predecessor finished a moment ago, its rows are still pinned ---------------
+
+PRED_FILL = 21766
+
+
+class _PumpTree(_Tree):
+    """The tree stub of the pump: the read terminates when ``ready`` is set."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.ready = False
+
+    def check_prefetch_progress(self, rid):
+        return self.ready
+
+    def completed_prefetch_tokens(self, rid):
+        return TOLD
+
+
+class _Chan:
+    def __init__(self):
+        self.sent = []
+
+    def pump(self):
+        return True
+
+    def send_nowait(self, ack):
+        self.sent.append(list(ack.reads))
+        return True
+
+
+def _jf_setup(monkeypatch, *, avail=2697, publish=1, pred=True):
+    s, req = _sched(_pred(fill=PRED_FILL, origin=PRED_FILL) if pred else None, avail=avail, publish=publish)
+    s.tree_cache = _PumpTree(avail, 0, 0, publish)
+    ch = _Chan()
+    monkeypatch.setattr(FB, "_channel", lambda sched: ch)
+    st = FB._fstate(s, create=True)
+    st.expect[RID] = TOLD
+    st.registered[RID] = req
+    return s, req, ch, st
+
+
+def _finish_pred(s):
+    s.mbs = [None, None, None]
+
+
+def test_a1_predecessor_finished_before_the_ack_with_pinned_rows_holds_the_ack(dual_p, rows, monkeypatch, caplog):
+    """y8z 19:22:56 PP1: weg2-0-200 finished (PASS-TAIL finished=1), publish pin in flight, room=2697 ->
+    RED on 5342040a72: ack 0 and a 21766-token re-prefill; now: ROOM-HOLD reason=just-finished."""
+    s, req, ch, st = _jf_setup(monkeypatch)
+    FB.follower_pump(s)                              # pass 1: the predecessor is in flight, the read not done
+    assert ch.sent == []
+    _finish_pred(s)
+    s.tree_cache.ready = True
+    with caplog.at_level(logging.WARNING, logger=FB.logger.name):
+        FB.follower_pump(s)                          # pass 2: finished, rows pinned by the publish node
+    assert ch.sent == [] and RID in st.registered
+    hold = next(m for m in _msgs(caplog) if FB.ROOM_HOLD_MARK in m and "reason=just-finished" in m)
+    assert "rid=%s " % RID in hold and "finished_rows=%d" % PRED_FILL in hold and "pending_publish=1" in hold, hold
+    s.tree_cache.token_to_kv_pool_allocator.avail = 2697 + PRED_FILL     # the pins released
+    s.tree_cache.ongoing_write_through.clear()
+    with caplog.at_level(logging.WARNING, logger=FB.logger.name):
+        FB.follower_pump(s)
+    assert ch.sent == [[(RID, TOLD)]] and RID not in st.registered
+    assert any("END" in m and "how=room" in m for m in _msgs(caplog))
+    assert not getattr(s, FB._JF_HOLD_ATTR)
+
+
+def test_a1_without_pins_the_shortage_is_stable_and_the_ack_is_zero(dual_p, rows, monkeypatch, caplog):
+    s, req, ch, st = _jf_setup(monkeypatch, publish=0)
+    FB.follower_pump(s)
+    _finish_pred(s)
+    s.tree_cache.ready = True
+    with caplog.at_level(logging.WARNING, logger=FB.logger.name):
+        FB.follower_pump(s)
+    assert ch.sent == [[(RID, 0)]]
+    assert any(FB.NOHOLD_MARK in m and "why=just-finished_unpinned" in m for m in _msgs(caplog))
+
+
+def test_a1_the_hold_ends_stable_when_the_pins_leave_and_the_room_does_not_rise(dual_p, rows, monkeypatch, caplog):
+    s, req, ch, st = _jf_setup(monkeypatch)
+    FB.follower_pump(s)
+    _finish_pred(s)
+    s.tree_cache.ready = True
+    FB.follower_pump(s)
+    assert ch.sent == []
+    s.tree_cache.ongoing_write_through.clear()       # pins gone, room still 2697
+    with caplog.at_level(logging.WARNING, logger=FB.logger.name):
+        FB.follower_pump(s)
+    assert ch.sent == [[(RID, 0)]]
+    assert any("END" in m and "how=stable" in m for m in _msgs(caplog))
+
+
+def test_a1_a_predecessor_that_finished_long_ago_is_not_held_for(dual_p, rows, monkeypatch):
+    s, req, ch, st = _jf_setup(monkeypatch)
+    FB.follower_pump(s)
+    _finish_pred(s)
+    for _ in range(FB.jf_passes() + 2):
+        FB.follower_pump(s)                          # the read is still running: no ack, the record ages
+    s.tree_cache.ready = True
+    FB.follower_pump(s)
+    assert ch.sent == [[(RID, 0)]]
+    # the window is a runtime value (SGLANG_WEG2_DUAL_ROOM_JF_PASSES), not a constant
+    s2, req2, ch2, st2 = _jf_setup(monkeypatch)
+    with mock.patch.dict(os.environ, {FB.ENV_JF_PASSES: "10"}):
+        FB.follower_pump(s2)
+        _finish_pred(s2)
+        for _ in range(5):
+            FB.follower_pump(s2)
+        s2.tree_cache.ready = True
+        FB.follower_pump(s2)
+    assert ch2.sent == []
+
+
+def test_a1_a_finished_request_too_small_to_cover_the_shortfall_is_not_held_for(dual_p, rows, monkeypatch):
+    s, req, ch, st = _jf_setup(monkeypatch)
+    s.mbs[0].reqs[0].fill_ids = list(range(500))
+    FB.follower_pump(s)
+    _finish_pred(s)
+    s.tree_cache.ready = True
+    FB.follower_pump(s)
+    assert ch.sent == [[(RID, 0)]]
+
+
+def test_a1_a_request_never_seen_in_flight_is_no_predecessor(dual_p, rows, monkeypatch):
+    s, req, ch, st = _jf_setup(monkeypatch, pred=False)
+    s.tree_cache.ready = True
+    FB.follower_pump(s)
+    assert ch.sent == [[(RID, 0)]]
+
+
+def test_a1_pp0_verdict_ends_the_just_finished_hold(dual_p, rows, monkeypatch):
+    s, req, ch, st = _jf_setup(monkeypatch)
+    FB.follower_pump(s)
+    _finish_pred(s)
+    s.tree_cache.ready = True
+    FB.follower_pump(s)
+    assert getattr(s, FB._JF_HOLD_ATTR) == {RID: PRED_FILL}
+    FB.follower_forget(s, RID)                       # PP0's Frist / Admit arrived first
+    assert not getattr(s, FB._JF_HOLD_ATTR) and not getattr(s, FB._ROOM_HOLD_ATTR)
+    FB.follower_pump(s)
+    assert ch.sent == []
+
+
+class TestQ920JustFinishedFlipUnchanged:
+    """Every wrong gate: the ack is 0 at once and the follower tracks nothing."""
+
+    def test_the_ack_is_zero_at_once_and_nothing_is_tracked(self, rows, monkeypatch, caplog):
+        for env in OFF_ENVS:
+            with mock.patch.dict(os.environ, env):
+                s, req, ch, st = _jf_setup(monkeypatch)
+                FB.follower_pump(s)
+                _finish_pred(s)
+                s.tree_cache.ready = True
+                FB.follower_pump(s)
+                assert ch.sent == [[(RID, 0)]], env
+                assert not hasattr(s, FB._JF_ATTR) and not hasattr(s, FB._JF_HOLD_ATTR), env
+                assert not hasattr(s, FB._ROOM_HOLD_ATTR), env
