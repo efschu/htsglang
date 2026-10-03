@@ -2795,7 +2795,14 @@ def _match_calibration(gpus: Sequence, quant: Optional[str]) -> Optional[dict]:
 
     classes: Dict[str, int] = {}
     for g in gpus or ():
-        label = calibration_class(_calibration_props(g))
+        props = _calibration_props(g)
+        if not props.total_mib:
+            # No NVML total (manual / offline spec): ``calibration_class``
+            # matches a hand-built stand-in on what it states, but this gate
+            # hands out a measured BUDGET and cannot check a budget against a
+            # total it does not have -- refuse rather than assume (#434).
+            return None
+        label = calibration_class(props)
         if label is None:
             return None
         classes[label] = classes.get(label, 0) + 1
