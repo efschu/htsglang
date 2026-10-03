@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 import types
 import unittest.mock as mock
@@ -27,6 +28,11 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import pytest  # noqa: E402
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "managers"))
+
+import _told_ring_pf as R  # noqa: E402
+
+from sglang.srt.managers import weg2_store_told as ST  # noqa: E402
 from sglang.srt.managers import weg2_told_fallback as FB  # noqa: E402
 from sglang.srt.managers import weg2_told_fidelity as TF  # noqa: E402
 from sglang.srt.weg2 import dual_p_kv_stage as DPK  # noqa: E402
@@ -177,3 +183,141 @@ class TestQ920ObservabilityFlipUnchanged:
             assert len(ms) == 1 and ms[0].startswith("PF TOLD-ACK NO-ROOM"), (env, ms)
             assert "Q-920" not in ms[0] and "NOHOLD" not in ms[0], env
             assert not hasattr(s, "_q920_nohold_n") and not hasattr(s, "_q920_stable_nohold_n"), env
+
+
+# --- 2. B UNRESUMABLE: told=a instead of told=0 ------------------------------------------------
+
+BIG = "big-prompt-1"
+BTOLD = 40960      # y8x weg2-0-45: told 40960, both followers acked 34588
+BRES = 34588
+
+
+def _resumable_at(depth):
+    """pp0_admissible stand-in: the tree resumes up to ``depth`` keys, never beyond."""
+    return lambda s, r, told: min(int(told), int(depth))
+
+
+def _b_ring(monkeypatch, *, res_follower=BRES, res_pp0=None, adopt_env=None, acks=None):
+    for k in list(os.environ):
+        if k.startswith("SGLANG_WEG2_TOLD") or k == "SGLANG_WEG2_DUAL_TOLD_ADOPT":
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv(FB.ENV_FALLBACK, "1")
+    monkeypatch.setenv("SGLANG_WEG2_TOLD_ABSOLUTE", "1")
+    if adopt_env is not None:
+        monkeypatch.setenv(FB.ENV_ADOPT, adopt_env)
+    depth = {1: res_follower, 2: res_follower}
+    if acks:
+        depth.update(acks)
+    pp0_depth = BTOLD if res_pp0 is None else res_pp0
+    calls = {"rank": None}
+
+    def fake(sched, req, told):
+        rank = int(sched.ps.pp_rank)
+        return min(int(told), int(pp0_depth if rank == 0 else depth[rank]))
+
+    monkeypatch.setattr(TF, "pp0_admissible", fake)
+    read = {r: {BIG: 0.1} for r in range(3)}
+    return R.Ring(ST, monkeypatch, {BIG: BTOLD}, read)
+
+
+def _drive(ring):
+    ring.arrive(BIG)
+    ring.run(80)
+    return ring.plans(BIG), ring.wire_objs()
+
+
+def test_b_all_followers_ack_the_same_resumable_depth_pp0_admits_at_it(dual_p, monkeypatch, caplog):
+    """RED on 5342040a72: PF TOLD-FALLBACK told=40960 -> 0 reason=mismatch (y8x 292 k, y8z 224 k tokens)."""
+    ring = _b_ring(monkeypatch)
+    with caplog.at_level(logging.WARNING):
+        plans, wire = _drive(ring)
+    assert all(len(p) == 1 for p in plans) and plans[0] == plans[1] == plans[2], plans
+    assert plans[0][0][2] == BRES                     # the prefix cap: a on EVERY rank, PP0 included
+    admit = [o for o in wire if type(o).__name__ == "Weg2StoreAdmit"]
+    assert len(admit) == 1 and admit[0].told == BRES
+    assert getattr(admit[0], FB.WIRE_ADOPT, None) == 1 and getattr(admit[0], FB.WIRE_FALLBACK, None) is None
+    assert all(not s.tree_cache.released for s in ring.stages)       # no read was cut
+    assert all(s.tree_cache.op_refs == 0 for s in ring.stages)
+    assert [a[3] for s in ring.stages for a in s.admitted] == [0, 0, 0]  # credit popped on every rank
+    assert not getattr(ring.stages[0], "_pf_fallback_n", 0)
+    ms = [r.getMessage() for r in caplog.records]
+    assert any("PF TOLD-ADOPT rid=%s told=%d -> %d" % (BIG, BTOLD, BRES) in m for m in ms)
+    assert sum("PF TOLD-ADOPT ABSORBED" in m for m in ms) == 2
+
+
+def test_b_followers_that_disagree_still_get_told_zero(dual_p, monkeypatch):
+    ring = _b_ring(monkeypatch, acks={2: 30000})
+    plans, wire = _drive(ring)
+    assert plans[0] == plans[1] == plans[2] and plans[0][0][2] == 0
+    assert getattr(wire[-1], FB.WIRE_FALLBACK, None) == 1 and getattr(wire[-1], FB.WIRE_ADOPT, None) is None
+
+
+def test_b_a_follower_with_no_room_acks_zero_and_the_group_gets_told_zero(dual_p, monkeypatch):
+    ring = _b_ring(monkeypatch, acks={2: 0})
+    plans, wire = _drive(ring)
+    assert plans[0] == plans[1] == plans[2] and plans[0][0][2] == 0
+
+
+def test_b_pp0_that_cannot_resume_at_a_falls_back_to_zero(dual_p, monkeypatch):
+    ring = _b_ring(monkeypatch, res_pp0=BRES - 4096)
+    plans, wire = _drive(ring)
+    assert plans[0] == plans[1] == plans[2] and plans[0][0][2] == 0
+    assert getattr(wire[-1], FB.WIRE_ADOPT, None) is None
+
+
+def test_b_switch_off_keeps_told_zero(dual_p, monkeypatch):
+    ring = _b_ring(monkeypatch, adopt_env="0")
+    plans, wire = _drive(ring)
+    assert plans[0] == plans[1] == plans[2] and plans[0][0][2] == 0
+
+
+def test_b_waits_for_the_second_ack_inside_the_frist_only(dual_p, monkeypatch):
+    class Sch:
+        ps = types.SimpleNamespace(pp_size=3)
+
+    sch = Sch()
+    monkeypatch.setattr(TF, "pp0_admissible", _resumable_at(BRES))
+    o = FB._Open(told=BTOLD, deadline=10.0, acks={1: BRES})
+    FB._pp0_open_map(sch)[BIG] = o
+    req = types.SimpleNamespace(rid=BIG)
+    monkeypatch.setenv("SGLANG_WEG2_TOLD_ABSOLUTE", "1")
+    assert FB.pp0_decide(sch, BIG, 5.0, req, True) is None
+    o.acks[2] = BRES
+    assert FB.pp0_decide(sch, BIG, 5.0, req, True) == (BRES, FB.REASON_ADOPT)
+    o.acks.pop(2)
+    assert FB.pp0_decide(sch, BIG, 10.5, req, True) == (0, FB.REASON_MISMATCH)    # the Frist decides: today's 0
+
+
+def test_b_span_relative_told_is_never_adopted(dual_p, monkeypatch):
+    class Sch:
+        ps = types.SimpleNamespace(pp_size=3)
+
+    sch = Sch()
+    monkeypatch.setattr(TF, "pp0_admissible", _resumable_at(BRES))
+    FB._pp0_open_map(sch)[BIG] = FB._Open(told=BTOLD, deadline=10.0, acks={1: BRES, 2: BRES})
+    assert FB.pp0_decide(sch, BIG, 1.0, types.SimpleNamespace(rid=BIG), False) == (0, FB.REASON_MISMATCH)
+
+
+class TestQ920AdoptFlipUnchanged:
+    """Every wrong gate: equal follower acks below told still mean told=0 (reason=mismatch), no
+    marker on the wire, nothing satisfied."""
+
+    def test_pp0_decide_answers_zero_on_every_wrong_gate(self, monkeypatch):
+        monkeypatch.setattr(TF, "pp0_admissible", _resumable_at(BRES))
+        monkeypatch.setenv("SGLANG_WEG2_TOLD_ABSOLUTE", "1")
+        for env in OFF_ENVS:
+            with mock.patch.dict(os.environ, env):
+                sch = types.SimpleNamespace(ps=types.SimpleNamespace(pp_size=3))
+                FB._pp0_open_map(sch)[BIG] = FB._Open(told=BTOLD, deadline=10.0, acks={1: BRES, 2: BRES})
+                assert FB.pp0_decide(sch, BIG, 1.0, types.SimpleNamespace(rid=BIG), True) == \
+                    (0, FB.REASON_MISMATCH), env
+
+    def test_the_ring_answers_told_zero_with_the_fallback_marker(self, monkeypatch):
+        for env in OFF_ENVS:
+            with mock.patch.dict(os.environ, env):
+                ring = _b_ring(monkeypatch)
+                plans, wire = _drive(ring)
+                assert plans[0] == plans[1] == plans[2] and plans[0][0][2] == 0, env
+                assert getattr(wire[-1], FB.WIRE_FALLBACK, None) == 1, env
+                assert getattr(wire[-1], FB.WIRE_ADOPT, None) is None, env
+                assert not any(getattr(s, "_weg2_store_told_satisfied", None) for s in ring.stages), env

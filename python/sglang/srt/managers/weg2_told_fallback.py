@@ -108,6 +108,11 @@ HARVEST_MAX_PER_SRC = 8
 REASON_ACKS = "acks"
 REASON_MISMATCH = "mismatch"
 REASON_FRIST = "frist"
+#: Q-920 B (dual P only): every follower acked the SAME resumable a, 0 < a < told, and PP0's own
+#: tree resumes at a -- the Admit names a (marker ``adopt``) instead of told=0.
+REASON_ADOPT = "adopt"
+WIRE_ADOPT = "adopt"
+ENV_ADOPT = "SGLANG_WEG2_DUAL_TOLD_ADOPT"
 
 _LOG_FIRST = 8
 _LOG_EVERY = 256
@@ -351,13 +356,54 @@ def pp0_harvest(scheduler) -> int:
     return n
 
 
-def pp0_decide(scheduler, rid: str, now: float) -> Optional[Tuple[int, str]]:
-    """``None`` = keep waiting; else ``(told to admit, reason)``."""
+def adopt_armed() -> bool:
+    """Q-920 B: dual P only (``dual_p_kv_stage.armed``), ``SGLANG_WEG2_DUAL_TOLD_ADOPT=0`` switches it off."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return False
+    return os.environ.get(ENV_ADOPT, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _adopt_depth(scheduler, o: "_Open", req, absolute: bool) -> Tuple[Optional[int], bool]:
+    """(a, wait): ``a`` = the depth every follower acked and PP0's own tree resumes at, when the
+    mismatch is the UNRESUMABLE shape (all acks equal, 0 < a < told); ``wait`` = the acks so far
+    are all that same ``a`` but a follower's is still out -- the verdict waits for it (PP0's
+    Frist bounds the wait, as for any missing ack)."""
+    if req is None or not absolute or not adopt_armed():
+        return None, False
+    vals = set(int(v) for v in o.acks.values())
+    if len(vals) != 1:
+        return None, False
+    a = next(iter(vals))
+    if not (0 < a < int(o.told)):
+        return None, False
+    try:
+        from sglang.srt.managers import weg2_told_fidelity as _tf
+
+        res = _tf.pp0_admissible(scheduler, req, a)
+    except Exception:  # noqa: BLE001 - a probe never breaks the verdict
+        res = None
+    if res is None or int(res) < a:
+        return None, False  # PP0's own tree cannot resume at a: told=0 as before
+    followers = range(1, int(scheduler.ps.pp_size))
+    return a, not all(r in o.acks for r in followers)
+
+
+def pp0_decide(scheduler, rid: str, now: float, req=None, absolute: bool = True) -> Optional[Tuple[int, str]]:
+    """``None`` = keep waiting; else ``(told to admit, reason)``. ``req`` / ``absolute`` (the
+    pacing record's) let the dual form adopt a follower-agreed resumable depth (Q-920 B)."""
     o = _pp0_open_map(scheduler).get(str(rid))
     if o is None:
         return 0, REASON_FRIST  # untracked paced rid: the always-uniform answer
     followers = range(1, int(scheduler.ps.pp_size))
     if any(own != o.told for own in o.acks.values()):
+        a, wait = _adopt_depth(scheduler, o, req, absolute)
+        if a is not None:
+            if not wait:
+                return a, REASON_ADOPT
+            if now < o.deadline:
+                return None  # the other follower's ack is one pass away; the Frist bounds this
         return 0, REASON_MISMATCH
     if all(r in o.acks for r in followers):
         return o.told, REASON_ACKS
@@ -369,6 +415,17 @@ def pp0_decide(scheduler, rid: str, now: float) -> Optional[Tuple[int, str]]:
 def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float) -> None:
     o = _pp0_open_map(scheduler).pop(str(rid), None)
     acks = dict(o.acks) if o is not None else {}
+    if reason == REASON_ADOPT:
+        n = _bump(scheduler, "_q920_adopt_n")
+        if n <= 32 or n % _LOG_EVERY == 0:
+            logger.warning(
+                "PF TOLD-ADOPT rid=%s told=%d -> %d reason=%s after=%.2fs acks=%s followers=%d avoided_tokens=%d "
+                "(n=%d): every follower acked the same resumable depth and PP0's own tree resumes there -- "
+                "PP0 admits at it for EVERY rank (Q-920 B) instead of told=0",
+                str(rid), told, told_final, reason, now - published_at, acks,
+                int(scheduler.ps.pp_size) - 1, int(told_final), n,
+            )
+        return
     if reason == REASON_ACKS:
         n = _bump(scheduler, "_pf_admit_acks_n")
         if _say(n):
@@ -388,6 +445,23 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
             rid[:8], told, reason, now - published_at, acks,
             int(scheduler.ps.pp_size) - 1, n,
         )
+
+
+def adopt_own_read(scheduler, rid: str, told: int) -> None:
+    """Q-920 B, PP0 and followers alike: this rank's read completed MORE than the adopted told (the
+    span up to the dropped told); it is SATISFIED at told -- its credit is popped, the admission
+    caps the radix match at told (``_weg2_prefix_cap``) and does not compare the read's count with
+    it (the follower_early_settle 'over' form). The read and its rows stay with the tree."""
+    from sglang.srt.managers import weg2_store_told as _st
+
+    try:
+        _st._pop_credit_keep_pin(scheduler.tree_cache, str(rid))
+    except Exception as exc:  # noqa: BLE001 - the satisfied mark below is what admission reads
+        logger.warning("Q-920 TOLD-ADOPT pop credit(%s) raised: %r", str(rid), exc)
+    satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
+    if satisfied is None:
+        satisfied = scheduler._weg2_store_told_satisfied = {}
+    satisfied[str(rid)] = int(told)
 
 
 def release_own_read(scheduler, rid: str) -> None:
@@ -457,6 +531,20 @@ def follower_forget(scheduler, rid: str) -> None:
     _room_hold_end(scheduler, rid, "verdict")  # Q-693: PP0 decided before the held ack
     if st.outbox:
         st.outbox = [e for e in st.outbox if e[0] != rid]
+
+
+def follower_adopt(scheduler, rid: str, told: int) -> None:
+    """``Admit(a, adopt)`` absorbed (Q-920 B): the ack bookkeeping goes as for any Admit, the read
+    is kept and satisfied at ``a``."""
+    follower_forget(scheduler, rid)
+    adopt_own_read(scheduler, rid, told)
+    n = _bump(scheduler, "_q920_follower_adopt_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-ADOPT ABSORBED rank pp=%s rid=%s told=%d (n=%d): PP0 admitted at the depth this "
+            "rank acked; the read is kept and satisfied there (Q-920 B)",
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid), int(told), n,
+        )
 
 
 def follower_release(scheduler, rid: str) -> None:

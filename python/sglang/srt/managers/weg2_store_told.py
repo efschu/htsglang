@@ -1653,7 +1653,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             # PF: PP0 alone decides -- told once every follower's read
             # reproduced it, told=0 for every rank on a short read or at the
             # Frist. Never the window's guess.
-            verdict = _fb.pp0_decide(scheduler, rid, now)
+            verdict = _fb.pp0_decide(scheduler, rid, now, p.req, p.absolute)
             if verdict is None:
                 continue
             told_final, reason = verdict
@@ -1666,7 +1666,12 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             pacing.pop(rid, None)
             _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
             admit = Weg2StoreAdmit(rid=rid, told=told_final)
-            if told_final != p.told:
+            if reason == _fb.REASON_ADOPT:
+                # Q-920 B (dual P only): the followers' common resumable depth -- PP0's read is
+                # satisfied there like theirs; no read is released.
+                _fb.adopt_own_read(scheduler, rid, told_final)
+                setattr(admit, _fb.WIRE_ADOPT, 1)
+            elif told_final != p.told:
                 # PP0's own read is released like a follower's: its record
                 # said told, its admission now compares 0 with 0.
                 _fb.release_own_read(scheduler, rid)
@@ -1796,10 +1801,15 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
     rid = str(item.rid)
     told = int(item.told)
     fallback = bool(getattr(item, _fb.WIRE_FALLBACK, 0))
+    adopt = bool(getattr(item, _fb.WIRE_ADOPT, 0))
     if fallback:
         # PF: PP0 switched this rid to told=0 for every rank -- cut this
         # rank's read (abort path: rows, lock, reader references) first.
         _fb.follower_release(scheduler, rid)
+    elif adopt:
+        # Q-920 B (the wire marker is set by PP0 on the dual P layout only): the read is kept and
+        # satisfied at the adopted told.
+        _fb.follower_adopt(scheduler, rid, told)
     elif getattr(scheduler, "_weg2_fb_follower", None) is not None:
         _fb.follower_forget(scheduler, rid)
     early = _early(scheduler)
@@ -1811,7 +1821,7 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
         # no read-ahead reached this request (it was not queued yet): register
         # now; admission then waits for it as the single-phase form does.
         _follower_register(scheduler, req, told)
-    if ahead is not None and int(ahead) != told and not fallback:
+    if ahead is not None and int(ahead) != told and not fallback and not adopt:
         logger.warning(
             "#1416e PACED-ADMIT rid=%s told=%d differs from the read-ahead %d; admission "
             "compares against the admitted value", _rt(rid), told, int(ahead),
