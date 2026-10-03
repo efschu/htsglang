@@ -1126,6 +1126,19 @@ class Envs:
     # the model geometry). Written by the weg2 launcher on the flip line's D
     # group; off = the rate above alone, byte-identical.
     SGLANG_WEG2_EXTEND_RATE_MEASURE = EnvBool(False)
+    # Q-710 EXTEND-CAP-FLOOR (INT8 y8vb 03.10. 19:34-19:51Z, 3905 one-token D
+    # extends, ~150 ms each, 11x 'GROUP-NARROWED 4096 to 1'): the rc12g vote
+    # floor((card_free_post - 300) / rate) is page-clamped to ONE row once a
+    # card (the 3080, 72-290 MiB free in the D phase) sits under the 300 MiB
+    # line, and an eager extend costs the same ~150 ms at 1 row as at 100. With
+    # this on the vote never drops below a floor chunk (1/16 of the configured
+    # width, bounded by what the free card physically funds at the priced
+    # rate), and a fresh D-direct request longer than the group's width while
+    # that width is under the floor is refused at the X gate so the front
+    # routes it through P. Written by the weg2 launcher only where it wrote
+    # the flip arm's rate (Q-694); off = byte-identical, P0 arm and dual never
+    # set it.
+    SGLANG_WEG2_EXTEND_CAP_FLOOR = EnvBool(False)
     # CORRIDOR BOUND WAKE RESET (y3r Klasse E/A2, D TP1 3080, 23:45:29-34): the
     # '#794 GROUP-NARROWED ... from 4096 to 64' right after every wake is the
     # #1028c bounded-min window (5 s) of the #656 gate still holding the

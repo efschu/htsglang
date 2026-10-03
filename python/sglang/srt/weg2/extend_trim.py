@@ -47,7 +47,9 @@ _UNSET = object()
 _CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": None, "cap_trimmed": False,
           # Q-694b EXTEND-RATE: measurement switch, this rank's measured rate
           # (MiB/row, ratchet up), the open extend's start reading
-          "measure": _UNSET, "measured": None, "pending": None}
+          "measure": _UNSET, "measured": None, "pending": None,
+          # Q-710 EXTEND-CAP-FLOOR: the arming switch, the last logged floor line
+          "cap_floor": _UNSET, "logged_floor": None}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -96,6 +98,8 @@ def reset_for_tests() -> None:
     _CACHE["measure"] = _UNSET
     _CACHE["measured"] = None
     _CACHE["pending"] = None
+    _CACHE["cap_floor"] = _UNSET
+    _CACHE["logged_floor"] = None
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -323,6 +327,7 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         cap = rows_cap(post_mib, rate, page_size)
         if cap >= int(configured):
             _CACHE["logged_cap"] = None
+            _CACHE["logged_floor"] = None
             return None
         if cap != _CACHE["logged_cap"]:
             _CACHE["logged_cap"] = cap
@@ -333,10 +338,122 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                 + ("" if not measure_armed() else
                    f" rate_src={'measured' if rate > start_rate else 'start'} start_rate={start_rate:.4f}")
             )
+        if cap_floor_armed():
+            return _apply_cap_floor(rank, cap, post_mib, rate, int(configured), page_size)
         return cap
     except Exception as exc:  # noqa: BLE001 -- a vote that cannot price abstains
         logger.debug("%s skipped: %s", STUECKELUNG_MARKER, exc)
         return None
+
+
+# --------------------------------------------------------------------------
+# Q-710 EXTEND-CAP-FLOOR: the vote never crawls.
+#
+# INT8 y8vb (03.10. 19:34-19:51Z, D group on the flip line): 3905 target
+# extends of ONE token per rank in 17 minutes of serving (76 requests; six
+# of them 190-1006 forwards each), ~152 ms of group wall each, against a
+# 45-58 ms decode round. Root: the rc12g vote above is
+# ``floor((card_free_post - 300) / rate)`` and :func:`rows_cap` never goes
+# below one page. The D-TP1 3080 held 72-290 MiB free in the D phase (CORRIDOR
+# verdict BELOW all boot long), so its vote was 1 row, the MIN reduce cut the
+# whole group to 1 (``#794 GROUP-NARROWED ... from 4096 to 1`` x11), and a
+# 5-token hand-off tail took five forwards, a 1546-token SHORT 860. An extend
+# is eager (``cuda graph: False``): 129 tp.all_reduce + 16 dcp.all_gather per
+# forward make it latency-bound, the same ~150 ms at one row as at a hundred.
+# While it crawled, prefill ran before decode (mixed chunk off): five running
+# streams got no token for 133 s and 147 s.
+#
+# The 300 MiB line is the operator's HALT line for the chunk's growth; it is
+# not an allocation limit. Under the flag the vote therefore has a floor
+# chunk, derived from the run-time configuration and the card, never a
+# constant of one rig:
+#
+#     floor_rows = chunked_prefill_size / CAP_FLOOR_DIV   (page aligned)
+#     width      = max(cap, min(floor_rows, floor(card_free_post / rate)))
+#
+# ``card_free_post / rate`` is what the whole free card funds at the priced
+# rate (measured maximum x 1.15, or the start): the floor chunk is only ever
+# raised to what physically fits, so the raise cannot turn into the OOM of
+# y8va. A card that cannot fund even that keeps the narrow vote -- and the
+# X gate (:func:`refuses_over_width`) then refuses a fresh D-direct request
+# longer than the group width, so the front routes it through P instead of
+# crawling. Hand-off tails (a few rows) always fit one chunk.
+#
+# One line per new width:
+#
+#     EXTEND-CAP-FLOOR rank=1 cap=1 width=256 floor=256 post=108 rate=0.3091 configured=4096
+#
+# Off (no ``SGLANG_WEG2_EXTEND_CAP_FLOOR``): nothing here runs, byte-identical.
+# --------------------------------------------------------------------------
+
+CAP_FLOOR_MARKER = "EXTEND-CAP-FLOOR"
+#: the floor chunk is this fraction of the configured width: the width below
+#: which an eager extend forward is dominated by its fixed per-forward latency
+CAP_FLOOR_DIV = 16
+
+
+def cap_floor_armed() -> bool:
+    """``SGLANG_WEG2_EXTEND_CAP_FLOOR``, read once per process."""
+    if _CACHE["cap_floor"] is _UNSET:
+        try:
+            from sglang.srt.environ import envs
+
+            _CACHE["cap_floor"] = bool(envs.SGLANG_WEG2_EXTEND_CAP_FLOOR.get())
+        except Exception:  # noqa: BLE001 -- a guard never kills a pass
+            _CACHE["cap_floor"] = False
+    return bool(_CACHE["cap_floor"])
+
+
+def floor_rows(configured: int, page_size: int) -> int:
+    """The floor chunk: ``configured / CAP_FLOOR_DIV`` rows, page aligned, at least one page."""
+    page = max(1, int(page_size or 1))
+    return max(page, (int(configured) // CAP_FLOOR_DIV // page) * page)
+
+
+def floored_width(cap: int, post_mib: float, rate: float, configured: int, page_size: int) -> int:
+    """``max(cap, min(floor_rows, floor(post / rate)))``, page aligned: the vote
+    with its floor. A pure function of the card reading, the priced rate and
+    the configured width."""
+    page = max(1, int(page_size or 1))
+    fl = floor_rows(configured, page)
+    if int(cap) >= fl or rate <= 0:
+        return int(cap)
+    phys = (int(math.floor(max(0.0, float(post_mib)) / float(rate))) // page) * page
+    return max(int(cap), min(fl, phys))
+
+
+def _apply_cap_floor(rank: int, cap: int, post_mib: float, rate: float, configured: int,
+                     page_size: int) -> int:
+    width = floored_width(cap, post_mib, rate, configured, page_size)
+    if width != cap and width != _CACHE["logged_floor"]:
+        _CACHE["logged_floor"] = width
+        logger.info(
+            f"{CAP_FLOOR_MARKER} rank={rank} cap={cap} width={width} "
+            f"floor={floor_rows(configured, page_size)} post={post_mib:.0f} rate={rate:.4f} "
+            f"configured={configured} (the line-respecting cap is under the floor chunk; "
+            f"the vote is raised to what the free card funds at the priced rate)"
+        )
+    return width
+
+
+def refuses_over_width(group_width: Optional[int], uncached: int, configured: int,
+                       page_size: int, already_admitted: bool) -> bool:
+    """The X gate's EXTEND-CAP-FLOOR verdict for one request: refuse (the front
+    routes it through P) a FRESH D-direct request longer than the group's chunk
+    width while that width is under the floor chunk -- the card cannot fund even
+    a floor chunk, so the request would crawl. Every term is the group's (the
+    MIN-reduced width, the group-priced extent, a per-rid admit mark set on the
+    same pass on every rank). Never for a request this gate already admitted
+    (a chunk continuation), and never for a tail that fits one chunk.
+    ``False`` when armed off, without a group width, or without a configured width."""
+    if not cap_floor_armed() or already_admitted:
+        return False
+    if group_width is None or int(configured) <= 0:
+        return False
+    w = int(group_width)
+    if w <= 0 or w >= floor_rows(configured, page_size):
+        return False
+    return int(uncached) > w
 
 
 def _torch_cap_mib(rank: int) -> Optional[float]:

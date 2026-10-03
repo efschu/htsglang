@@ -19157,7 +19157,37 @@ def _d_extend_flip_rate_env(ns, log, label: str) -> Optional[str]:
     only the start value of the per-rank run-time measurement."""
     if getattr(ns, "dual_layout", False) is True or getattr(ns, "dual_share", False) is True:
         return None
-    return _d_extend_cap_rate_env(ns, log, label, capped=False)
+    _rtext = _d_extend_cap_rate_env(ns, log, label, capped=False)
+    if _rtext:
+        _d_extend_cap_floor_env(ns, log, label)
+    return _rtext
+
+
+#: Q-710: the arming variable of the chunk-cap floor (the vote never crawls)
+EXTEND_CAP_FLOOR_ENV = "SGLANG_WEG2_EXTEND_CAP_FLOOR"
+EXTEND_CAP_FLOOR_MARKER = "EXTEND-CAP-FLOOR"
+
+
+def _d_extend_cap_floor_env(ns, log, label: str) -> None:
+    """Q-710 (INT8 y8vb 03.10. 19:34-19:51Z): arm the vote floor wherever the flip arm armed
+    the Q-694 chunk cap -- and only there. On a card with < 300 MiB free in the D phase the
+    rc12g vote was ONE row, the group cut to 1 token per forward (3905 extends of ~152 ms in 17
+    min, 133 s without a decode step). With the flag the vote keeps a floor chunk derived from
+    the configured chunk width and what the free card funds at the priced rate, and a fresh
+    D-direct request longer than a starved group width is refused at the X gate so the front
+    routes it through P (``EXTEND-CAP-FLOOR route=P``). A value named in --env-d wins. The P0
+    arm, Next Flash (ledger rate) and the dual layout never reach this."""
+    _env_d = getattr(ns, "env_d", "") or ""
+    _given = EXTEND_CAP_FLOOR_ENV in parse_group_env(_env_d) and \
+        str(parse_group_env(_env_d).get(EXTEND_CAP_FLOOR_ENV, "1")).strip() != "1"
+    if not _given:
+        ns.env_d = set_group_env(_env_d, EXTEND_CAP_FLOOR_ENV, "1")
+    _on = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_CAP_FLOOR_ENV, "")
+              ).strip().lower() in ("1", "true", "yes", "on")
+    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_CAP_FLOOR_MARKER} floor={'on' if _on else 'off'}"
+        f"{' (aus --env-d, Vorrang)' if _given else ''}: der Chunk-Deckel faellt nie unter "
+        f"chunked_prefill_size/16 (begrenzt auf floor(card_free_post / Rate)); ein frischer "
+        f"D-Direktprefill laenger als eine Gruppenbreite unter dem Boden geht ueber P")
 
 
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
