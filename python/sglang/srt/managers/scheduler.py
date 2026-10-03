@@ -20752,6 +20752,11 @@ class Scheduler(
                             tree_cand_max=__import__(
                                 "sglang.srt.weg2.l15_tree_cand",
                                 fromlist=["max_n"]).max_n(os.environ),
+                            # L15-TREE-DISAGREE: the tips were agreed AND probed
+                            # holdable by every rank (l15_tree_cand.build), so a
+                            # bind-time failure is no rank-local skip: it raises,
+                            # this rank does not arm, the POST vote refuses all.
+                            tree_agreed=True,
                             reset_keep=self.tree_cache.reset_keep,
                             set_keep=_set_keep_collect,
                             # L15-12c-C: per-(group, rank) manifest file -- the

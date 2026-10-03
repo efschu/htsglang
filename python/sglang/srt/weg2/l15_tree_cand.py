@@ -69,6 +69,9 @@ class TreeCand:
     last_access: float
     tokens: Tuple[int, ...] = field(default=(), compare=False, repr=False)
     extra_key: Optional[str] = field(default=None, compare=False, repr=False)
+    # L15-TREE-DISAGREE: the tip node of a LAZY candidate (tokens not built
+    # yet); :func:`with_tokens` fills ``tokens`` for the agreed ones only.
+    node: object = field(default=None, compare=False, repr=False)
 
 
 def _mamba_type():
@@ -204,28 +207,109 @@ def l2_backed(node, root) -> bool:
     return True
 
 
-def local_candidates(tree_cache, limit: int,
-                     require_l2: bool = False) -> List[TreeCand]:
-    """This rank's tips, most recently used first, at most ``limit``.
-    ``require_l2`` (the cap-0 rank): only tips whose chain is L2-backed."""
-    if limit <= 0:
+class _Chain:
+    """Streaming blake2b of a root -> node chain (see :func:`digest_of`)."""
+
+    __slots__ = ("h", "last", "n")
+
+    def __init__(self, h, last, n):
+        self.h, self.last, self.n = h, last, n
+
+
+def _chain_digests(tips: Sequence[object], root) -> Dict[int, Optional[Tuple[str, int]]]:
+    """``id(tip) -> (digest, n_tokens)`` (None when the chain does not
+    compose), every node's key hashed ONCE however many tips share it.
+
+    Byte-identical to ``digest_of(chain_tokens(tip, root), extra_key)``: the
+    digest is blake2b over the concatenated raw token ids (the bigram boundary
+    token kept once, :func:`chain_tokens`), streamed node by node, the extra
+    key appended last. This is what lets the walk digest EVERY tip instead of
+    the first ``limit`` ones (L15-TREE-DISAGREE)."""
+    memo: Dict[int, Optional[_Chain]] = {id(root): _Chain(
+        hashlib.blake2b(digest_size=8), None, 0)}
+
+    def state(node) -> Optional[_Chain]:
+        path = []
+        cur = node
+        while id(cur) not in memo:
+            path.append(cur)
+            cur = getattr(cur, "parent", None)
+            if cur is None:  # not below the root: no chain
+                for n in path:
+                    memo[id(n)] = None
+                return None
+        base = memo[id(cur)]
+        for n in reversed(path):
+            if base is None:
+                memo[id(n)] = None
+                continue
+            toks, bigram = _key_tokens(n)
+            if bigram and base.n and toks:
+                if toks[0] != base.last:
+                    base = None
+                    memo[id(n)] = None
+                    continue
+                toks = toks[1:]
+            h = base.h.copy()
+            if toks:
+                h.update(array("q", toks).tobytes())
+            base = _Chain(h, toks[-1] if toks else base.last, base.n + len(toks))
+            memo[id(n)] = base
+        return memo[id(node)]
+
+    out: Dict[int, Optional[Tuple[str, int]]] = {}
+    for t in tips:
+        st = state(t)
+        if st is None or st.n == 0:
+            out[id(t)] = None
+            continue
+        h = st.h.copy()
+        ek = getattr(getattr(t, "key", None), "extra_key", None)
+        if ek is not None:
+            h.update(b"\x00" + str(ek).encode("utf-8", "replace"))
+        out[id(t)] = (h.hexdigest(), st.n)
+    return out
+
+
+def local_candidates(tree_cache, limit: Optional[int],
+                     require_l2: bool = False,
+                     lazy_tokens: bool = False) -> List[TreeCand]:
+    """This rank's tips, most recently used first.
+
+    ``limit`` None = EVERY tip (L15-TREE-DISAGREE: the walk that feeds the
+    agreement must not truncate, see :func:`build`); an int keeps at most that
+    many. ``require_l2`` (the cap-0 rank): only tips whose chain is L2-backed.
+    ``lazy_tokens``: digest every tip by streaming, build the token chain
+    (``tokens``) later for the agreed ones only (:func:`with_tokens`)."""
+    if limit is not None and limit <= 0:
         return []
     root = getattr(tree_cache, "root_node", None)
     tips = tips_of(tree_cache)
     tips.sort(key=lambda n: -float(getattr(n, "last_access_time", 0) or 0))
     if require_l2:
         tips = [n for n in tips if l2_backed(n, root)]
+    if lazy_tokens:
+        dig = _chain_digests(tips, root)
     out: List[TreeCand] = []
     for n in tips:
-        if len(out) >= limit:
+        if limit is not None and len(out) >= limit:
             break
+        ek = getattr(getattr(n, "key", None), "extra_key", None)
+        if lazy_tokens:
+            got = dig.get(id(n))
+            if got is None:
+                continue  # this tip cannot be matched; the next one may
+            out.append(TreeCand(
+                digest=got[0], n_tokens=got[1],
+                last_access=float(getattr(n, "last_access_time", 0) or 0),
+                extra_key=ek, node=n))
+            continue
         try:
             toks = chain_tokens(n, root)
         except ChainError:
             continue  # this tip cannot be matched; the next one may
         if not toks:
             continue
-        ek = getattr(getattr(n, "key", None), "extra_key", None)
         out.append(TreeCand(
             digest=digest_of(toks, ek),
             n_tokens=len(toks),
@@ -234,6 +318,16 @@ def local_candidates(tree_cache, limit: int,
             extra_key=ek,
         ))
     return out
+
+
+def with_tokens(c: TreeCand, tree_cache) -> TreeCand:
+    """``c`` with its token chain built (a lazy candidate's agreed tip)."""
+    if c.tokens or c.node is None:
+        return c
+    toks = chain_tokens(c.node, getattr(tree_cache, "root_node", None))
+    return TreeCand(digest=c.digest, n_tokens=c.n_tokens,
+                    last_access=c.last_access, tokens=tuple(toks),
+                    extra_key=c.extra_key, node=c.node)
 
 
 def agree(local: Sequence[TreeCand], gather: Callable[[object], List[object]],
@@ -254,7 +348,11 @@ def agree(local: Sequence[TreeCand], gather: Callable[[object], List[object]],
     pos: Dict[str, List[int]] = {}
     sizes: Dict[str, set] = {}
     for vec in votes:
+        seen = set()
         for i, (d, n) in enumerate(vec or ()):
+            if d in seen:  # one vote per rank per digest
+                continue
+            seen.add(d)
             pos.setdefault(d, []).append(i)
             sizes.setdefault(d, set()).add(int(n))
     everywhere = [
@@ -403,18 +501,23 @@ def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
     by every rank too (an empty vote when the first agreement failed).
     """
     lim = max_n(env)
+    cap = lim + max(0, int(n_live))
     local: List[TreeCand] = []
     err = None
     try:
-        # live reqs may cover some tips (dropped at the bind), so look
-        # n_live deeper than the cap
-        local = local_candidates(tree_cache, lim + max(0, int(n_live)),
-                                 require_l2=require_l2)
+        # L15-TREE-DISAGREE (b): the walk offers EVERY tip. The cap (live reqs
+        # may cover some tips, dropped at the bind, hence lim + n_live) is
+        # applied by ``agree`` AFTER the agreement, on the gathered votes. A
+        # per-rank truncation before the gather picks by the rank-local
+        # recency clock and, with the cap-0 rank's L2 filter, can leave the
+        # ranks' windows disjoint: agreed=0 although every tip is common.
+        local = local_candidates(tree_cache, None, require_l2=require_l2,
+                                 lazy_tokens=True)
     except Exception as exc:  # noqa: BLE001 -- vote empty, stay in the collective
         err = exc
         local = []
     try:
-        agreed = agree(local, gather, lim + max(0, int(n_live)))
+        agreed = [with_tokens(c, tree_cache) for c in agree(local, gather, cap)]
     except Exception as exc:  # noqa: BLE001 -- no agreed list, no tree candidates
         agreed = []
         err = err or exc

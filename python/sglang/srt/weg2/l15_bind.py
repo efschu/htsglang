@@ -71,6 +71,16 @@ class L15Unholdable(ValueError):
         self.why = why
 
 
+class L15TreeDisagree(RuntimeError):
+    """L15-TREE-DISAGREE: an AGREED tree tip (every rank's probe said it can
+    be held) is not holdable HERE at the bind. The hook catches it pre-move
+    (a RuntimeError, so the per-rid ValueError skip cannot swallow it) and
+    this rank's round does not arm; its POST vote then refuses the hold on
+    every rank (l15_sleep_agree.post_vote: "round did not arm"). The skip it
+    replaces was a rank-local decision after the gather: one rank dropping a
+    tip its peers hold arms DIFFERENT hold sets."""
+
+
 def unholdable_why(exc: BaseException) -> str:
     """The reason code of a skip: L15Unholdable.why, else a generic one."""
     return str(getattr(exc, "why", None) or "error:%s" % type(exc).__name__)
@@ -480,6 +490,7 @@ def build_retain_kwargs(
     tree_cache=None,
     hold_sink: Optional[Callable[[tuple], None]] = None,
     tree_cand_max: Optional[int] = None,
+    tree_agreed: bool = False,
 ) -> Dict:
     """Assemble the whole retain_at_sleep keyword set from live reqs.
 
@@ -487,7 +498,10 @@ def build_retain_kwargs(
     radix-tree tip (l15_tree_cand.pseudo_req). It is resolved through the
     parked match; one whose node already sits on the chain of a real req
     earlier in ``reqs`` is covered by it and dropped, at most
-    ``tree_cand_max`` (None = no cap) are kept.
+    ``tree_cand_max`` (None = no cap) are kept. ``tree_agreed`` (the hook,
+    after the probe gather): every tree req was agreed holdable by ALL ranks,
+    so one that fails here raises :class:`L15TreeDisagree` instead of being
+    skipped rank-locally.
 
     Geometry: rows_by_rank = the EXACT per-rank owned count of the real
     slots (l15_compact.owner_of over slots_of_req); anchor_depth = kv_depth
@@ -524,6 +538,11 @@ def build_retain_kwargs(
             else:
                 _slots = slots_of_req(req, req_to_token)
         except ValueError as exc:
+            if _is_tree and tree_agreed:
+                raise L15TreeDisagree(
+                    "agreed tree tip %r is not holdable on this rank at the "
+                    "bind (%s): no rank-local skip after the gather"
+                    % (rid, unholdable_why(exc))) from exc
             if _is_tree:
                 tree_unholdable.append(rid)
                 tree_why[rid] = unholdable_why(exc)
