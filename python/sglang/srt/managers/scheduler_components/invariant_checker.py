@@ -1203,14 +1203,36 @@ def check_admission_wedge_once(
         if stamp is None:
             stamp = (now, fwd_now)
             scheduler._wedge_class_sample = stamp
-        detail = f"{detail} | {_wedge_class_for(scheduler, stamp, fwd_now, now)}"
+        # Q-696 (dual layout, group P only): a P that waits for a CARD grant is
+        # its own class -- named, and the recovery driver posts no corridor relief
+        pkv = _dual_p_kv_wait_class(scheduler)
+        if pkv is not None or getattr(scheduler, "_wedge_p_kv_wait", None) is not None:
+            scheduler._wedge_p_kv_wait = pkv
+        cls = pkv if pkv is not None else _wedge_class_for(scheduler, stamp, fwd_now, now)
+        detail = f"{detail} | {cls}"
     else:
         # Cleared: the next wedge is a new window, never this one's tail.
         if getattr(scheduler, "_wedge_class_sample", None) is not None:
             scheduler._wedge_class_sample = None
+        if getattr(scheduler, "_wedge_p_kv_wait", None) is not None:
+            scheduler._wedge_p_kv_wait = None
     if alarm and log_on_alarm:
         logger.error(detail)
     return alarm, detail
+
+
+def _dual_p_kv_wait_class(scheduler) -> Optional[str]:
+    """Q-696: ``CLASS=P-KV-WAIT (...)`` on a dual group-P rank whose card
+    ledgers show P waiting for a grant, else None (every other form: None
+    before anything is read). Dual y8z fs10031909 19:25:42: the alarm said
+    CLASS=UNCLEAR, the corridor relief came back NOT APPLICABLE after 10 s
+    ('phase-flip-off'); D's cache held the card. Never raises."""
+    try:
+        from sglang.srt.weg2.dual_card_stall import p_kv_wait_class
+
+        return p_kv_wait_class(scheduler)
+    except Exception:  # noqa: BLE001 - an instrument never kills what it measures
+        return None
 
 
 def _wedge_class_for(scheduler, stamp, fwd_now: int, now: float) -> str:
@@ -1342,6 +1364,19 @@ class AdmissionWedgeRecovery:
             channel = getattr(self._scheduler, RECOVERY_CHANNEL_ATTR, None)
             if channel is not None:
                 channel.reset_episode()
+            if getattr(self, "_p_kv_wait_said", False):
+                self._p_kv_wait_said = False
+            return None
+        pkv = getattr(self._scheduler, "_wedge_p_kv_wait", None)
+        if pkv:
+            # Q-696: a dual P waiting for a card grant -- the corridor relief is
+            # NOT APPLICABLE by construction (dual y8z: answered after 10 s of
+            # scheduler time, exit 'phase-flip-off'); D's cache yield frees the card
+            if not getattr(self, "_p_kv_wait_said", False):
+                self._p_kv_wait_said = True
+                logger.warning(
+                    "%s RECOVERY: %s -- no corridor-relief request posted in the "
+                    "dual layout (Q-696)", ADMISSION_WEDGE, pkv)
             return None
         threshold = _admission_wedge_recovery_threshold()
         age = time.perf_counter() - self._scheduler.last_first_token_progress_time

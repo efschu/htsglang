@@ -39,6 +39,49 @@ MARK = "DUAL-TP3PP3 D-KV"
 MAX_TOKENS_ENV = "SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS"
 #: rounds a shrink condition must hold before D gives memory back (no flap)
 SHRINK_HOLD_ROUNDS = 64
+#: Q-696: a RUNNING D gave its unlocked cache to a P that waited for a card
+LIVE_YIELD_MARK = "DUAL D-CACHE-YIELD-LIVE"
+#: Q-696: P waits for a card, D maps more than it needs, and the shrink cannot go
+SHRINK_BLOCKED_MARK = "SHRINK-BLOCKED"
+
+
+def live_yield_wait_s() -> float:
+    """Q-696: P's card wait (seconds, group MAX) before a running D yields its
+    cache; <= 0 = off (only an idle D yields, the pre-Q-696 rule)."""
+    from sglang.srt.environ import envs
+
+    return float(envs.SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S.get())
+
+
+def regrow_hold_s() -> float:
+    """Q-696: no shrink this many seconds after a grow (no grow/shrink/grow flap)."""
+    from sglang.srt.environ import envs
+
+    return max(0.0, float(envs.SGLANG_WEG2_DUAL_D_REGROW_HOLD_S.get()))
+
+
+def live_yield_due(p_wait_s: float, wait_s: float) -> bool:
+    """Q-696 (pure): has P waited long enough for a running D to yield its cache?"""
+    return float(wait_s) > 0 and float(p_wait_s) >= float(wait_s)
+
+
+def shrink_blocked_reason(*, mapped: int, need: int, floor: int, step: int, holds: bool,
+                          p_missing: bool, regrow_hold: bool) -> Optional[str]:
+    """Q-696 (pure): why a P-waiting tick did not shrink although D maps more
+    than its work needs (``need``: the level demand + air ask, before the live
+    floor). None when D maps nothing beyond ``need``."""
+    if int(mapped) - int(need) < int(step):
+        return None
+    if holds:
+        return "holds"
+    if p_missing:
+        return "p_missing"
+    if regrow_hold:
+        return "regrow_hold"
+    if _pk.round_up(int(floor), int(step)) >= int(mapped):
+        return "live_floor"
+    return "d_air"      # decide()'s D-PRIORITY room: air + two lattice steps stay free (gmps12)
+
 
 _D_BORN: List[Tuple[int, object]] = []
 #: D's boot level (GLOBAL tokens), set at _config_from_budget before the pool
@@ -178,6 +221,7 @@ class DKvStage(_pk.PKvStage):
                            self.mapped_tokens, over, phys, pressure)
             return False
         self._committed = int(getattr(self, "_committed", 0) or 0) + need
+        self._grow_t = _pk._now()                           # Q-696: the regrow hold starts here
         logger.info("%s GROW %d -> %d tokens (+%d B)", MARK, self.mapped_tokens, want, need)
         self.mapped_tokens = want
         _pk.check_cover(self, "grow")
@@ -372,11 +416,16 @@ def d_demand(sched) -> int:
     return sum(_sv._req_tokens(r) for r in running) + sum(_sv._req_tokens(r) for r in queue)
 
 
-def cache_yield(sched, actor) -> int:
+def cache_yield(sched, actor, live: Optional[Tuple[int, float]] = None) -> int:
     """Evict D's whole EVICTABLE device cache (unlocked nodes only -- a live
     seat's rows are locked and stay). Backed prefixes keep their L2 copy.
     Metal dual13 (3q33cu): D held 65536 mapped rows of cache with 0 running and
-    0 queued while P's grant starved on the 5090. Returns the evicted tokens."""
+    0 queued while P's grant starved on the 5090. Returns the evicted tokens.
+
+    ``live`` (Q-696): ``(group floor, P's card wait s)`` -- the yield of a D
+    that still runs work, named LIVE_YIELD_MARK. Dual y8z fs10031909: D held
+    225280 rows (163929 evictable) for ONE running request while P's grant
+    waited 73.9 s; the idle-only rule gave them back only when D ran empty."""
     tree = getattr(sched, "tree_cache", None)
     if tree is None:
         return 0
@@ -390,6 +439,15 @@ def cache_yield(sched, actor) -> int:
 
     tree.evict(EvictParams(num_tokens=ev))
     t = _pk._now()
+    if live is not None:
+        if t >= getattr(actor, "_live_yield_log_next", 0.0):
+            actor._live_yield_log_iv = min(60.0, 2.0 * float(getattr(actor, "_live_yield_log_iv", 0.5)))
+            actor._live_yield_log_next = t + actor._live_yield_log_iv
+            logger.info("%s %s freed=%d floor=%d p_wait_s=%.1f mapped=%d: P waits for a card and D's cache "
+                        "is not demand -- unlocked nodes evicted under running work (backed prefixes stay in "
+                        "L2), the next tick shrinks to the live floor (Q-696)", MARK, LIVE_YIELD_MARK, ev,
+                        int(live[0]), float(live[1]), actor.mapped_tokens)
+        return ev
     if t >= getattr(actor, "_yield_log_next", 0.0):
         actor._yield_log_iv = min(300.0, 2.0 * float(getattr(actor, "_yield_log_iv", 0.5)))
         actor._yield_log_next = t + actor._yield_log_iv
@@ -439,6 +497,22 @@ def publish_d_signal(sched, actor) -> None:
         logger.info("%s D-SIGNAL not published: %r", MARK, exc)
 
 
+def _note_shrink_blocked(actor, reason: Optional[str], need: int, floor: int, p_wait_s: float) -> None:
+    """Q-696: name why D keeps rows it does not need while P waits for a card
+    (rate-limited, the gap doubling to 60 s; reset once nothing is blocked)."""
+    if reason is None:
+        actor._blocked_log_iv = 0.5
+        return
+    t = _pk._now()
+    if t < float(getattr(actor, "_blocked_log_next", 0.0) or 0.0):
+        return
+    actor._blocked_log_iv = min(60.0, 2.0 * float(getattr(actor, "_blocked_log_iv", 0.5) or 0.5))
+    actor._blocked_log_next = t + actor._blocked_log_iv
+    logger.info("%s %s reason=%s mapped=%d need=%d live_floor=%d p_wait_s=%.1f: P waits for a card and D "
+                "maps more than its work needs, the shrink cannot go now (Q-696)", MARK, SHRINK_BLOCKED_MARK,
+                reason, actor.mapped_tokens, int(need), int(floor), float(p_wait_s))
+
+
 def tick(sched) -> Optional[str]:
     """Once per scheduler iteration on every D rank. ONE collective per tick
     (MAX of want, P-waiting and the highest live row), so every rank decides on
@@ -463,20 +537,42 @@ def tick(sched) -> Optional[str]:
     # P counted those bytes as free -> the budget held them twice. D keeps its
     # boot pool until P has JOINED every D card (group decision).
     p_missing_local = 1 if (st is None or not int(st.pid.get("P", 0) or 0)) else 0
+    # Q-696: how long THIS rank's card has shown P waiting, and whether this rank
+    # grew within the regrow hold -- both as group MAX on the same collective, so
+    # the live yield and the hold are decided on the same numbers on every rank
+    t_now = _pk._now()
+    if p_wait_local:
+        if getattr(actor, "_p_wait_since", None) is None:
+            actor._p_wait_since = t_now
+        p_wait_ms_local = int(1000.0 * (t_now - actor._p_wait_since))
+    else:
+        actor._p_wait_since, p_wait_ms_local = None, 0
+    grow_t = getattr(actor, "_grow_t", None)
+    recent_grow_local = 1 if (grow_t is not None and t_now - float(grow_t) < regrow_hold_s()) else 0
     # D PRIORITY: the tightest rank's free rows (MIN) and the holds (MAX) ride the
     # SAME collective -- every rank decides on the same numbers
     g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local), -int(demand_local),
-                    -int(p_missing_local), int(d_avail_rows(sched, actor)), -int(d_holds(sched))])
+                    -int(p_missing_local), int(d_avail_rows(sched, actor)), -int(d_holds(sched)),
+                    -int(p_wait_ms_local), -int(recent_grow_local)])
     want, p_waiting, floor = -int(g[0]), -int(g[1]) > 0, -int(g[2])
     p_missing = len(g) > 4 and -int(g[4]) > 0
     avail_min = int(g[5]) if len(g) > 5 else NO_AVAIL
     holds = len(g) > 6 and -int(g[6]) > 0
+    p_wait_s = max(0, -int(g[7])) / 1000.0 if (len(g) > 7 and p_waiting) else 0.0
+    recent_grow = len(g) > 8 and -int(g[8]) > 0
     want = floor_want(want, actor.mapped_tokens, avail_min, air, actor.step, -int(g[3]))
+    need, freed = want, 0
+    live_due = p_waiting and live_yield_due(p_wait_s, live_yield_wait_s())
     if p_waiting and -int(g[3]) == 0:
         # the GROUP has no running or waiting request and P waits: D's cached
         # prefix is not demand (user rule) -- every rank gives it up alike, the
         # next tick's live floor lets the shrink through
         cache_yield(sched, actor)
+    elif live_due and not holds:
+        # Q-696: D runs work, P has waited for a card past the bound -- the cache
+        # is still not demand. Unlocked nodes only (a running seat's rows are
+        # locked); a held context (D-PARK, W50, D-HOLD-FOR-GROW) keeps its rows.
+        freed = cache_yield(sched, actor, live=(floor, p_wait_s))
     want = max(want, _pk.round_up(floor, actor.step))       # never below a live row of any rank
     below = actor._below + 1 if want < actor.mapped_tokens else 0
     # the room rule of decide() guards running, queued or held work; an idle D's
@@ -486,6 +582,15 @@ def tick(sched) -> Optional[str]:
                             avail_min=avail_min if guarded else None, air=air, holds=holds)
     if verdict == "shrink" and p_missing:
         verdict, level = "hold", actor.mapped_tokens
+    if verdict == "shrink" and recent_grow:
+        # Q-696 REGROW HOLD: a shrink right after a grow is the flap (dual y8z
+        # 19:26:04 GROW 110592->196608, SHRINK back, GROUP-WAIT for 196608 again
+        # in the same second -> pressure on P -> a second P pause)
+        verdict, level = "hold", actor.mapped_tokens
+    if live_due and verdict != "shrink" and not freed:     # a yield tick's floor predates its eviction
+        _note_shrink_blocked(actor, shrink_blocked_reason(
+            mapped=actor.mapped_tokens, need=need, floor=floor, step=actor.step, holds=holds,
+            p_missing=p_missing, regrow_hold=recent_grow), need, floor, p_wait_s)
     if verdict != "grow" and st is not None and (int(st.pressure.get("P", 0) or 0) > 0
                                                  or int(st.demand.get("D", 0) or 0) > 0):
         # D's demand fits what it maps (seats ended, aborted or shrunk): the pressure

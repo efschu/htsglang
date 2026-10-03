@@ -8665,13 +8665,18 @@ class Front:
         p.intake_stalled = True
         p.leg1_done = False
         p.x_requeues += 1
-        self._p_intake_stalled = True
+        card = Front._q696_card_stall(self, p)   # by class: stand-ins of the flip form carry no Q-696 method
+        if card is None:
+            self._p_intake_stalled = True
         self.counters["p_intake_stalls"] += 1
         self.queue.appendleft(p)
         logger.warning(
             "WEG2 P-INTAKE-STALL rid=%s est_prompt=%d requeued at the head "
-            "(requeues=%d, queue=%d) -- drain ends, flip to D follows: %s",
+            "(requeues=%d, queue=%d) -- %s: %s",
             p.rid, int(p.est_prompt), p.x_requeues, len(self.queue),
+            "drain ends, flip to D follows" if card is None else
+            "DUAL card WAIT on %s: no flip, the drain goes on -- short legs pass, the head goes "
+            "again once no long leg 1 is in flight (Q-696)" % card,
             str(err)[:300],
         )
         try:
@@ -8681,6 +8686,48 @@ class Front:
         except Exception as exc:  # noqa: BLE001 -- P's own rank already dropped it
             logger.warning("WEG2 P-INTAKE-STALL rid=%s /abort_request on P raised: %s",
                            p.rid, exc)
+
+    def _q696_card_stall(self, p: "Pending") -> Optional[str]:
+        """Q-696 (dual layout only): P's intake stall of a head that waits for a
+        card grant is not a drain end -- there is no flip. Returns the card the
+        ledgers show P waiting on (the head is marked), else None (the stall
+        ends the drain as before)."""
+        if not (getattr(self, "dual_layout", False) and getattr(self, "dual_kv_ledgers", None)):
+            return None
+        from sglang.srt.weg2 import dual_card_stall as _dcs
+
+        card = _dcs.card_wait(self.dual_kv_ledgers)
+        p.q696_card_stall = card is not None
+        if card is not None:
+            self.counters["dual_card_stalls"] += 1
+        return card
+
+    def _q696_stall_held(self) -> bool:
+        """Q-696 (dual layout only): a card-stalled head waits while another
+        long leg 1 is in flight on P; a short request behind it goes first. True
+        = nothing may go now."""
+        if not getattr(self, "dual_layout", False) or not self.queue:
+            return False
+        from sglang.srt.weg2 import dual_card_stall as _dcs
+        from sglang.srt.weg2 import dual_parallel as _dpar
+
+        head = self.queue[0]
+        short = _dpar.short_tokens()
+        behind = _dcs.stall_held(head, getattr(self, "_dual_inflight", None) or {}, short_limit=short)
+        if behind is None:
+            return False
+        i = _dpar.short_pick(self.queue, head_blocked=True, limit=short, age_s=0.0, now=time.time())
+        if i is None:
+            return True
+        p = self.queue[i]
+        del self.queue[i]
+        self.queue.appendleft(p)
+        self.counters["dual_stall_bypass"] += 1
+        logger.info("WEG2 %s rid=%s uncached=%d past=%s head_uncached=%d behind=%s -- the head was "
+                    "intake-stalled in P's card WAIT, %s is still in flight there (Q-696)",
+                    _dcs.STALL_BYPASS_MARK, p.rid, int(p.est_uncached), head.rid,
+                    int(head.est_uncached), behind, behind)
+        return False
 
     # ---------------- H102: the client hung up before its answer ----------------
     def _arm_client_watch(self, request: web.Request, rid: str,
@@ -15517,6 +15564,8 @@ class Front:
             return True
         if self._dual_p_held_by_stage():
             return True  # D PRIORITY: P stopped or asleep until the hysteresis lets it back
+        if Front._q696_stall_held(self):
+            return True  # Q-696: a card-stalled head behind a long leg in flight, no short one behind it
         if self._dual_resume_held():
             # Q-670 SHORT-BYPASS: the paused head blocks only itself
             return not self._dual_short_reorder(head_blocked=True)

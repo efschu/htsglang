@@ -667,6 +667,17 @@ class Envs:
     # thing a paused head waits for is "P committed" -- no pressure, no D
     # demand -- for this many seconds, the front resumes it.
     SGLANG_WEG2_DUAL_RESUME_STALE_S = EnvFloat(10.0)
+    # Q-696 DUAL D-CACHE-HOLDS-CARD (dual y8z fs10031909 19:24:40-19:25:54: P's
+    # 94720-token grant waited 73.9 s on PP0's card while D held 225280 mapped
+    # rows for ONE running request, 163929 of them evictable cache): once P has
+    # waited for a card this many seconds (group MAX), a RUNNING D yields its
+    # unlocked cache too and shrinks to its live floor; <= 0 = only an idle D
+    # yields (the pre-Q-696 rule). DUAL_D_REGROW_HOLD_S: no D shrink this many
+    # seconds after a D grow (19:26:04 GROW 110592->196608, SHRINK back and a
+    # GROUP-WAIT for the same level within one second -> a second P pause).
+    # Inert outside SGLANG_WEG2_DUAL_LAYOUT=1 + SGLANG_WEG2_GROUP=D.
+    SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S = EnvFloat(4.0)
+    SGLANG_WEG2_DUAL_D_REGROW_HOLD_S = EnvFloat(5.0)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,

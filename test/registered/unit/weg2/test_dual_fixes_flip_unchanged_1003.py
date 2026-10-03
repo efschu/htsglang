@@ -21,6 +21,8 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-692  dual_handback_defer.* / d_seats.admission_gate exemption / front pause requeue
   Q-693  follower untold waiting abort / PF ACK-ROOM HOLD / PP0 intake stamp / RESUME-OWN-HELD
   Q-695  #791T probe old-instance chunk / old chunk abort store release / #791C new-instance named
+  Q-696  D live cache yield + regrow hold (D tick without the dual actor) / front INTAKE-STALL
+         card WAIT (drain ends as before) and STALL-BYPASS / wedge class P-KV-WAIT (no post skip)
 """
 from __future__ import annotations
 
@@ -668,3 +670,58 @@ class TestQ695FlipUnchanged:
             s, kept, released = self._abort(monkeypatch, env, [{"weg2-0-235": (0, 1024)}], told=0)
             assert kept == [True], env
             assert not hasattr(s, "_q695_new_named_n"), env
+
+
+# ---------------------------------------------------------------------------------- Q-696
+
+class TestQ696FlipUnchanged:
+    def test_d_tick_without_the_dual_actor_reads_no_clock_and_no_collective(self):
+        sched = SimpleNamespace(tp_worker=SimpleNamespace(model_runner=SimpleNamespace()),
+                                _weg2_group_min_ints=mock.Mock(side_effect=AssertionError("collective")))
+        with mock.patch.object(PK, "_now", side_effect=AssertionError("clock")), \
+                mock.patch.object(DK, "cache_yield", side_effect=AssertionError("yield")):
+            assert DK.tick(sched) is None
+
+    def test_d_actor_is_never_armed_outside_dual_group_d(self):
+        for env in [{}, {"SGLANG_WEG2_GROUP": "D"}, {"SGLANG_WEG2_DUAL_LAYOUT": "1"},
+                    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"}]:
+            env = dict(env, SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS="196608")
+            assert DK.armed(env) is False, env
+
+    def test_intake_stall_ends_the_drain_and_names_the_flip(self, caplog):
+        async def run():
+            f = _front(dual=False)
+            f.dual_kv_ledgers = _metal_ledgers()               # even with ledgers that show P waiting
+            for pth in f.dual_kv_ledgers:
+                K.CardKvLedger(pth, "P").request(8000 * MIB)
+
+            async def rpc(g, path, body, timeout):
+                return 200, {}
+
+            f.rpc = rpc
+            f._p_intake_stalled = False
+            f.queue = collections.deque([_pending("weg2-0-234", 24)])
+            p = _pending("weg2-0-218", 94564)
+            f._dual_inflight["weg2-0-222"] = _pending("weg2-0-222", 94720)
+            with caplog.at_level("WARNING", logger="weg2.front"):
+                await f._requeue_intake_stalled(p, "WEG2-INTAKE-STALL rid=weg2-0-218")
+            return f, f._dual_dispatch_held()
+
+        f, held = _run(run())
+        assert f._p_intake_stalled is True
+        assert [p.rid for p in f.queue] == ["weg2-0-218", "weg2-0-234"]     # no STALL-BYPASS reorder
+        assert held is False
+        assert f.counters.get("dual_card_stalls", 0) == 0 and f.counters.get("dual_stall_bypass", 0) == 0
+        assert not hasattr(f.queue[0], "q696_card_stall")
+        assert any("drain ends, flip to D follows: WEG2-INTAKE-STALL" in r.getMessage() for r in caplog.records)
+
+    def test_wedge_class_is_never_p_kv_wait_outside_dual_group_p(self):
+        from sglang.srt.weg2 import dual_card_stall as DCS
+
+        boom = mock.Mock(side_effect=AssertionError("read a stage file"))
+        sched = SimpleNamespace(ps=SimpleNamespace(pp_size=3))
+        for env in _wrong_gates():
+            if env.get("SGLANG_WEG2_DUAL_LAYOUT") == "1" and env.get("SGLANG_WEG2_GROUP") == "P":
+                continue
+            with mock.patch.object(PK, "stage_file", boom):
+                assert DCS.p_kv_wait_class(sched, env) is None, env
