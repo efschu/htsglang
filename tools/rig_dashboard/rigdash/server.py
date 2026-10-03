@@ -25,7 +25,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, history, imagechanges, ipcboot, kartenplan, launchview, live, redact, sampler, sources, vmpush, weg2line
+from . import (energy, features, health, history, imagechanges, ipcboot, kartenplan, launchview, live, modellprofil, redact, sampler,
+               sources, vmpush, weg2line)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -41,7 +42,13 @@ STATIC_FILES = {
 #: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
 DEV_STATIC_FILES = {
     "/kartenplan.js": ("kartenplan.js", "application/javascript; charset=utf-8"),
+    # PROFIL-EDITOR S3 (Auftrag 960): das kleine Modul hinter "Modellprofil erstellen" (die Oberfläche baut Auftrag 930)
+    "/modellprofil.js": ("modellprofil.js", "application/javascript; charset=utf-8"),
 }
+#: Körper einer POST-Anfrage: Pfad und ein paar Optionen, nie mehr
+MAX_POST_BODY = 64 * 1024
+#: so viel eines zu großen Körpers wird noch gelesen und verworfen, damit die 400-Antwort beim Client ankommt
+MAX_POST_DRAIN = 1 << 20
 
 
 def _version():
@@ -227,6 +234,8 @@ class App:
         self.src = sources.SourcesReader(self.ring_store) if self.sup is not None else sources.Sources(cfg)
         self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
         self.kartenplaner = kartenplan.Kartenplaner()
+        # Modellprofil schätzen (S3): liest nur config.json und Kopfzeilen unter den Modellwurzeln
+        self.modellprofil = modellprofil.ModelEstimator(roots=getattr(args, "model_root", None) or None)
         self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
                        else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
@@ -580,6 +589,13 @@ def make_handler(app: App):
                             raise ValueError("q= muss JSON sein: {profile, cards:[{card, pcie:{gen,lanes,rebar,chipset}}], host_patched}")
                         return self._json(app.kartenplaner.plan(req))
                     return self._send(404, "not found", "text/plain")
+                if path == "/api/modellprofil/modelle":
+                    # welche Modellverzeichnisse unter den Wurzeln liegen (nur stat); wie das Schätzen nur im LAN und nicht im Release
+                    if app.edition == "release":
+                        return self._send(404, "not found", "text/plain")
+                    if self._via_proxy():
+                        return self._json({"ok": False, "error": "Modellprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
+                    return self._json(app.modellprofil.models())
                 if path in DEV_STATIC_FILES and app.edition != "release":
                     name, ctype = DEV_STATIC_FILES[path]
                     with open(os.path.join(STATIC, name), "rb") as fh:
@@ -625,6 +641,35 @@ def make_handler(app: App):
             except Exception as e:
                 return self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
 
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            try:
+                # den Körper zuerst lesen (nie ungelesen schließen: das Ende mit ungelesenen Bytes wird ein TCP-RST, der die Antwort verschluckt)
+                n = max(0, int(self.headers.get("Content-Length") or 0))
+                raw = self.rfile.read(min(n, MAX_POST_DRAIN)) if n > 0 else b""
+                if path == "/api/modellprofil/schaetzen":
+                    # PROFIL-EDITOR S3: Modellpfad -> flliper.model/1.  Liest Dateien des Hosts: nur im LAN, nicht im Release.
+                    if app.edition == "release":
+                        return self._send(404, "not found", "text/plain")
+                    if self._via_proxy():
+                        return self._json({"ok": False, "error": "Modellprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
+                    if n > MAX_POST_BODY:
+                        raise ValueError("Anfrage zu groß (%d Byte, höchstens %d)" % (n, MAX_POST_BODY))
+                    try:
+                        req = json.loads(raw.decode("utf-8") or "null")
+                    except (ValueError, UnicodeDecodeError):
+                        raise ValueError("Körper muss JSON sein: {path, draft_path?, kv_dtype?, mamba_ssm_dtype?, gguf_file?, registry?}")
+                    return self._json(app.modellprofil.estimate(req))
+                return self._send(404, "not found", "text/plain")
+            except BrokenPipeError:
+                return None
+            except ValueError as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
+            except modellprofil.ModellprofilUnavailable as e:
+                return self._json({"ok": False, "error": str(e)}, 503)
+            except Exception as e:
+                return self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+
     return H
 
 
@@ -651,6 +696,9 @@ def main(argv=None):
                     help="the feature list (built / in image / active / gain; im Image and aktiv are computed here)")
     ap.add_argument("--features-repo", default=features.DEFAULT_REPO,
                     help="git repo holding the image revs and feature commits")
+    ap.add_argument("--model-root", action="append", default=[],
+                    help="Verzeichnis, unter dem Modelle liegen dürfen (Modellprofil schätzen; wiederholbar; env RIGDASH_MODEL_ROOTS; "
+                         "Standard: der Modell-Cache des Rigs)")
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     ap.add_argument("--edition", choices=EDITIONS, default=os.environ.get("RIGDASH_EDITION", "rig"),
