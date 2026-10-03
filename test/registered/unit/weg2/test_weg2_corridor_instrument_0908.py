@@ -120,6 +120,11 @@ class FakeNvml:
     def nvmlDeviceGetPciInfo(self, h):
         return _Pci(h)
 
+    def nvmlDeviceGetCudaComputeCapability(self, h):
+        # HW-GENERIC 1002: the driver reports the arch; the launcher's arch
+        # gate refuses a card whose cc it cannot read. This rig's boards.
+        return (12, 0) if "5090" in CARD_NAME[h] else (8, 6)
+
     def nvmlDeviceGetMemoryInfo(self, h, version=None):
         self.calls += 1
         total, free, reserved = self.cards[h]

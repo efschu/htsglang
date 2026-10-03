@@ -225,13 +225,20 @@ def test_auto_resolves_only_for_the_27b_int8_checkpoint():
     from sglang.srt.weg2 import form as F
     from sglang.srt.weg2 import launcher as L
 
+    from sglang.srt.weg2 import card_identity as CI
+
+    ref = CI.REFERENCE_INVENTORY  # HW-GENERIC 1002: the cards are part of the key
     ckpt = F.profile_row("qwen27b").formats["int8"].checkpoint
-    model, prov = L.resolve_pp_cut_stage_model("auto", "qwen27b", ckpt)
+    model, prov = L.resolve_pp_cut_stage_model("auto", "qwen27b", ckpt, inventory=ref)
     assert model is not None and "27b_int8_rc12z30" in prov
-    assert L.resolve_pp_cut_stage_model("off", "qwen27b", ckpt)[0] is None
+    assert L.resolve_pp_cut_stage_model("off", "qwen27b", ckpt, inventory=ref)[0] is None
     nvfp4 = F.profile_row("qwen27b").formats["nvfp4"].checkpoint
-    assert L.resolve_pp_cut_stage_model("auto", "qwen27b", nvfp4)[0] is None
-    assert L.resolve_pp_cut_stage_model("auto", "nextflash", ckpt)[0] is None
+    assert L.resolve_pp_cut_stage_model("auto", "qwen27b", nvfp4, inventory=ref)[0] is None
+    assert L.resolve_pp_cut_stage_model("auto", "nextflash", ckpt, inventory=ref)[0] is None
+    # a foreign inventory gets no model measured on the reference cards: named
+    foreign = ("RTX3090/24576MiB/sm86",) * 3
+    model, prov = L.resolve_pp_cut_stage_model("auto", "qwen27b", ckpt, inventory=foreign)
+    assert model is None and "RTX3090/24576MiB/sm86" in prov and "previous pricing" in prov
     assert L.build_parser().parse_args(["--tree", "/t", "--tag", "t"]).pp_cut_stage_model == "auto"
 
 

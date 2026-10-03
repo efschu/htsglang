@@ -393,8 +393,8 @@ def retain_at_sleep(
     # hands every kept chain's arena references back -- kept chains never
     # carry host_lock_ref) pin this rank's held L2 slots once, in this
     # rank's own host pools: a rank's l2_slots are its OWN shard's arena
-    # slots, so cap-0 ranks take refs too -- TP0 is exactly the rank that
-    # refills from L2 at the wake. The wake act gives them back (hold: after
+    # slots, so cap-0 ranks take refs too -- the rank(s) whose cap is 0 are
+    # exactly the ones that refill from L2 at the wake. The wake act gives them back (hold: after
     # the refill copied; fallback: in the drop). Master off: the scheduler
     # hook passes no callable, no reference is taken (byte-identical). The
     # slot list is the bind-time l2_of/anchor_l2_of snapshot -- the same
@@ -441,8 +441,8 @@ def retain_at_sleep(
 
     _lap("alloc")
     # (7) keep windows: kv rows [0, rows_by_rank[rank]), mamba rows [0, A_H).
-    # L15-FIX-CAP0-KEEP (N3l 02:29:56Z: TP0 kept 555 MB with cap 0): a rank
-    # whose cap is 0 (the 5090 / TP0) is "not held here" -- select_hold does
+    # L15-FIX-CAP0-KEEP (N3l 02:29:56Z: the cap-0 rank kept 555 MB): a rank
+    # whose cap is 0 (any of them, if several) is "not held here" -- select_hold does
     # not charge it, its rows come back from L2 at the wake (refill), so it
     # must NOT pin VRAM through the P phase, which never budgeted it. Its
     # keep windows are EMPTY; the rows are still compacted and the manifest
