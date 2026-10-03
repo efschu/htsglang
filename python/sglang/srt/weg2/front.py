@@ -3537,6 +3537,8 @@ class Pending:
     leg1_aborted: bool = False  # DUAL-TP3PP3: P ended the leg by an abort (200, prompt_tokens=0)
     dual_paused_n: int = 0
     dual_requeued: bool = False  # DUAL-TP3PP3: requeued by a pause, not ready for D
+    #: Q-691: SHORT-BYPASS requests that went past this paused head in its RESUME-WAIT
+    dual_bypassed_n: int = 0
     #: H102: the client closed its connection before its answer; nothing is
     #: dispatched for it any more (no leg 1, no hand-off to D).
     client_gone: bool = False
@@ -15538,12 +15540,21 @@ class Front:
         p = q[i]
         del q[i]
         q.appendleft(p)
+        if head_blocked:
+            # Q-691: the paused head counts who went past it (RESUME-UNSTARVE b)
+            head.dual_bypassed_n = int(getattr(head, "dual_bypassed_n", 0) or 0) + 1
         self.counters["dual_short_bypass" if head_blocked else "dual_short_first"] += 1
         logger.info("WEG2 %s rid=%s uncached=%d past=%s head_uncached=%d head_wait_s=%.1f%s",
                     _dpar.BYPASS_MARK if head_blocked else _dpar.FIRST_MARK, p.rid, int(p.est_uncached),
                     head.rid, int(head.est_uncached), time.time() - float(head.t_arrive),
                     " (head paused, RESUME-WAIT)" if head_blocked else "")
         return True
+
+    @staticmethod
+    def _dual_unstarve_reset(head) -> None:
+        """Q-691: a resumed head starts its next RESUME-WAIT with no bypasses."""
+        if int(getattr(head, "dual_bypassed_n", 0) or 0):
+            head.dual_bypassed_n = 0
 
     def _dual_resume_held(self) -> bool:
         """A requeued PAUSED request at the head goes back to P only when every
@@ -15569,10 +15580,33 @@ class Front:
                             "growing (per card (pressure, P committed, D demand) = %s)", head.rid,
                             now - self._dual_resume_wait_since, per)
             self._dual_resume_wait_since = None
+            self._dual_unstarve_reset(head)
             return False
         if getattr(self, "_dual_resume_wait_since", None) is None:
             self._dual_resume_wait_since = now
             self._dual_resume_log_next = 0.0
+        # Q-691 RESUME-UNSTARVE (dual only): no pressure, no D demand, and the
+        # head is short itself or has waited the stale bound while SHORT-BYPASS
+        # requests kept P busy ('P committed' then never drops to 0). Dual y8x
+        # fs10031727 17:52:30: weg2-0-309, 173 tokens left, waited > 90 s past
+        # 12 bypasses on [(0,1107296256,0),(0,201326592,0),(0,301989888,0)].
+        if self.dual_layout:
+            wait_s = now - self._dual_resume_wait_since
+            why = _dpar.resume_unstarve(
+                per, head_uncached=int(getattr(head, "est_uncached", 0) or 0),
+                short_limit=_dpar.short_tokens(), wait_s=wait_s, stale_s=_dpar.resume_stale_s(),
+                bypassed=int(getattr(head, "dual_bypassed_n", 0) or 0))
+            if why is not None:
+                self.counters["dual_resume_unstarve"] += 1
+                logger.warning("WEG2 %s rid=%s reason=%s wait_s=%.1f bypassed=%d head_uncached=%d per=%s "
+                               "-- no pressure, no D demand: 'P committed' is P's room for its other legs, "
+                               "P's admission decides (Q-691)", _dpar.UNSTARVE_MARK, head.rid, why, wait_s,
+                               int(getattr(head, "dual_bypassed_n", 0) or 0),
+                               int(getattr(head, "est_uncached", 0) or 0), per)
+                self._dual_resume_wait_since = None
+                self._dual_resume_stale_since = None
+                self._dual_unstarve_reset(head)
+                return False
         # Q-680: never unbounded on a stale ledger. Dual y8w fs10031623 16:45:42:
         # PP1/PP2 kept 201/302 MB committed for no request (an undrained load-back
         # lock held their release), P idle -- RESUME-WAIT 905 s, 0 requests served.
@@ -15588,6 +15622,7 @@ class Front:
                                now - self._dual_resume_wait_since, per)
                 self._dual_resume_wait_since = None
                 self._dual_resume_stale_since = None
+                self._dual_unstarve_reset(head)
                 return False
         else:
             self._dual_resume_stale_since = None

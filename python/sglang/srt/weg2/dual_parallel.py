@@ -24,6 +24,16 @@ THE RULES (all pure here; the callers act):
   3. SHORT-FIRST (front): a short request overtakes a long head that has waited
      less than ``HEAD_AGE_ENV`` -- short requests never starve behind long ones,
      long ones never starve behind a stream of short ones.
+  4. RESUME-UNSTARVE (Q-691, front): a paused head in RESUME-WAIT is resumed
+     although "P committed" > 0 when no card shows pressure or D demand AND
+     (a) its uncached rest is itself short (<= ``SHORT_ENV``), or (b) it has
+     waited ``SGLANG_WEG2_DUAL_RESUME_STALE_S`` while at least one SHORT-BYPASS
+     went past it. Dual y8x fs10031727 17:52:30-17:54:10: weg2-0-309 (paused,
+     173 tokens left) waited > 90 s on per card [(0,1107296256,0),
+     (0,201326592,0),(0,301989888,0)] while 12 SHORT-BYPASS requests went past
+     it -- P was never idle, so 'P committed' never reached 0 and the Q-680
+     stale bound (P idle) never applied. 'P committed' is then P's own room
+     for other legs; P's admission decides whether the request fits.
 """
 
 from __future__ import annotations
@@ -41,6 +51,10 @@ BYPASS_MARK = "DUAL SHORT-BYPASS"
 FIRST_MARK = "DUAL SHORT-FIRST"
 GRANT_MARK = "P-KV GRANT-BYPASS"
 STALE_MARK = "DUAL RESUME-STALE-LEDGER"
+UNSTARVE_MARK = "DUAL RESUME-UNSTARVE"
+#: Q-691 resume reasons
+UNSTARVE_SHORT = "short"
+UNSTARVE_BYPASSED = "bypassed"
 
 
 def short_tokens(env=None) -> int:
@@ -130,3 +144,31 @@ def grant_may_bypass(waiting_since: Sequence[float], *, now: float, age_s: float
     if not waiting_since:
         return True
     return float(now) - min(float(t) for t in waiting_since) < float(age_s)
+
+
+def resume_unstarve(per, *, head_uncached: int, short_limit: int, wait_s: float,
+                    stale_s: float, bypassed: int) -> Optional[str]:
+    """Q-691 (front, dual only): may a paused head in RESUME-WAIT go back to P
+    although some card still shows "P committed"? Only when NO card shows
+    pressure or D demand (a missing row is never clear), and then
+
+      * ``short``    -- its uncached rest is itself a SHORT-BYPASS candidate
+        (``head_uncached <= short_limit``), or
+      * ``bypassed`` -- it has waited ``stale_s`` (Q-680's bound) while at
+        least one SHORT-BYPASS went past it (P kept busy: "P committed" never
+        drops to 0, the Q-680 idle bound cannot apply).
+
+    None = keep waiting (resume at all zeros, or Q-680 on a stale ledger)."""
+    if not per:
+        return None
+    for row in per:
+        if row is None:
+            return None
+        pressure, _p_committed, d_demand = row
+        if int(pressure) or int(d_demand):
+            return None
+    if int(short_limit) > 0 and 0 <= int(head_uncached) <= int(short_limit):
+        return UNSTARVE_SHORT
+    if int(bypassed) > 0 and float(wait_s) >= float(stale_s):
+        return UNSTARVE_BYPASSED
+    return None
