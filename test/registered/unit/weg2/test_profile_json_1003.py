@@ -110,7 +110,7 @@ class SyntheticRoundTrip(unittest.TestCase):
         entrypoint equality test on nf-int4's SGLANG_MOE_COLD_TIER_INSTANCE). It stays an expansion, resolved at run time."""
         d = PJ.import_env(self.path("base"))
         text = PJ.render_env(d)
-        self.assertIn("_form SGLANG_TAGGED 'pre-'\"${HTSGLANG_TAG}\"'-post'", text)
+        self.assertIn('_form SGLANG_TAGGED pre-"${HTSGLANG_TAG}"-post', text)       # an expansion the entrypoint resolves, not a frozen value
         out = os.path.join(self.dir, "ph.env")
         with open(out, "w") as fh:
             fh.write(text)
