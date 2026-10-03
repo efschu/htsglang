@@ -51,6 +51,8 @@ _FAKE_KW = {
     "tree_cache": None,
     # L15-TREE-CAND: cap on the finished-request tips
     "tree_cand_max": 8,
+    # L15-TREE-DISAGREE: the tips are agreed + probed before the bind
+    "tree_agreed": True,
 }
 
 
