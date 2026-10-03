@@ -315,7 +315,7 @@ ENV_FOLLOWER_EARLY_READ = "SGLANG_WEG2_FOLLOWER_EARLY_READ"
 
 def follower_early_read_on(env=None) -> bool:
     env = os.environ if env is None else env
-    return str(env.get(ENV_FOLLOWER_EARLY_READ, "1") or "").strip().lower() in ("1", "true", "yes", "on")
+    return str(env.get(ENV_FOLLOWER_EARLY_READ, "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _early_reads(scheduler) -> Dict[str, float]:
