@@ -151,8 +151,9 @@ class _RingBase(unittest.TestCase):
         xr.unlink_semaphores(self.nonce)
         xr.create_semaphores(self.nonce)
         self._env_before = {k: os.environ.get(k) for k in (
-            bx.SEQ_SYNC_BATCH_MIB_ENV, bx.SEQ_UNIT_DIGEST_ENV)}
+            bx.SEQ_SYNC_BATCH_MIB_ENV, bx.SEQ_SYNC_BATCH_UNITS_ENV, bx.SEQ_UNIT_DIGEST_ENV)}
         os.environ[bx.SEQ_SYNC_BATCH_MIB_ENV] = "1"
+        os.environ[bx.SEQ_SYNC_BATCH_UNITS_ENV] = "32"   # 110: the code default is 128 now; this file pins 32
         os.environ[bx.SEQ_UNIT_DIGEST_ENV] = "1"
         self._ov = [envs.SGLANG_WEG2_SEQ_LANE_RING_SLOTS.override(self.SLOTS),
                     envs.SGLANG_WEG2_SEQ_LANE_RING_READY_MS.override(3000)]
