@@ -94,12 +94,33 @@ class TestDeterministicFp8Gate(unittest.TestCase):
         #190 measured 0/2000 at the same shape on sm120, so there is nothing to
         fix there and disabling fp8 would be a pure regression.
         """
+        # HW-P0 1003: sm89 is untouched only where it keeps CUTLASS, i.e. the
+        # wheel carries sm_89 SASS (the probe is stubbed: never the real wheel).
         for sm in [(8, 9), (9, 0), (10, 0), (12, 0)]:
-            with _Env(True, sm=sm):
+            with _Env(True, sm=sm), mock.patch.object(U, "wheel_carries_sass", lambda cc: True):
                 self.assertFalse(
                     U.deterministic_fp8_marlin_disabled(),
                     f"flag wrongly fired at sm{sm}",
                 )
+
+    def test_sm89_on_the_marlin_fallback_is_switched_off_too(self):
+        """HW-P0 1003: an sm89 rank whose wheel has no sm_89 SASS runs fp8
+        through gptq_marlin_gemm (FP8-SM89-FALLBACK) -- the #190 kernel -- so
+        the flag must switch it off there as on sm80..88; an unknown probe
+        counts as the fallback, like in can_auto_enable_marlin_fp8."""
+        for carries in (False, None):
+            with _Env(True, sm=(8, 9)), mock.patch.object(U, "wheel_carries_sass", lambda cc: carries):
+                self.assertTrue(U.deterministic_fp8_marlin_disabled(), f"carries={carries}")
+        with _Env(False, sm=(8, 9)), mock.patch.object(U, "wheel_carries_sass", lambda cc: False):
+            self.assertFalse(U.deterministic_fp8_marlin_disabled())
+
+    def test_sm86_and_sm120_never_consult_the_wheel_probe(self):
+        def _boom(cc):
+            raise AssertionError("the wheel probe must not gate this sm")
+
+        for sm, want in (((8, 6), True), ((12, 0), False)):
+            with _Env(True, sm=sm), mock.patch.object(U, "wheel_carries_sass", _boom):
+                self.assertIs(want, U.deterministic_fp8_marlin_disabled(), f"sm{sm}")
 
     def test_below_sm80_untouched(self):
         """sm75 has no Marlin fp8 to begin with; it is already on the fallback."""
