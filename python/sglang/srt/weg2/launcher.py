@@ -19024,11 +19024,17 @@ def _d_extend_cap_rate_env(ns, log, label: str, *, capped: bool = True) -> Optio
     from ``min(card_free, cap - reserved)``); a value named in --env-d wins. A profile without
     the record: nothing written, no vote. ``capped=False`` is the Q-694 flip arm
     (:func:`_d_extend_flip_rate_env`): same record, the vote funds the chunk from
-    ``card_free`` alone (no torch cap), and the line says so."""
+    ``card_free`` alone (no torch cap), and the line says so.
+
+    Q-694b (hardware-generic): the record is a START value measured on one rig. The flip arm
+    also arms the per-rank run-time measurement (``SGLANG_WEG2_EXTEND_RATE_MEASURE=1``, line
+    ``EXTEND-RATE source=record``); a profile WITHOUT the record no longer leaves the vote unarmed
+    -- :func:`_d_extend_derived_rate_env` writes a start rate derived from the model geometry
+    (``EXTEND-RATE source=derived``). The P0 arm with its record is byte-identical."""
     try:
         _rate = [None if v is None else float(v) for v in _pconst(D_EXTEND_CAP_RATE_RECORD, ns.profile)]
     except KeyError:
-        return None
+        return _d_extend_derived_rate_env(ns, log, label, capped=capped)
     _rate_src = _pconst_boots(D_EXTEND_CAP_RATE_RECORD, ns.profile)
     from sglang.srt.weg2 import extend_trim as _et
 
@@ -19047,6 +19053,78 @@ def _d_extend_cap_rate_env(ns, log, label: str, *, capped: bool = True) -> Optio
         f"SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB={_rtext}{' (aus --env-d, Vorrang)' if _given else ''} "
         f"(Rate aus {D_EXTEND_CAP_RATE_RECORD} {_rate}, boots {_rate_src}; D kappt den Extend-Chunk "
         f"auf floor((post - 300) / Rate), MIN ueber TP)")
+    if not capped:
+        _d_extend_rate_measure_env(ns, log, label, "record", _rtext,
+                                   f"{D_EXTEND_CAP_RATE_RECORD} {_rate}, boots {_rate_src}")
+    return _rtext
+
+
+#: Q-694b: the arming variable of the per-rank run-time measurement of the extend rate
+EXTEND_RATE_MEASURE_ENV = "SGLANG_WEG2_EXTEND_RATE_MEASURE"
+#: Q-694b: the launcher's line naming where the start rate of the chunk cap came from
+EXTEND_RATE_MARKER = "EXTEND-RATE"
+
+
+def _d_extend_rate_measure_env(ns, log, label: str, source: str, rtext: str, why: str) -> None:
+    """Q-694b: arm the per-rank run-time measurement in the D group env (a value named in
+    --env-d wins) and name the start rate's source: ``EXTEND-RATE source=record|derived``."""
+    from sglang.srt.weg2 import extend_trim as _et
+
+    _env_d = getattr(ns, "env_d", "") or ""
+    # a value other than our own came from the user (a second solve pass sees its own write)
+    _given = str(parse_group_env(_env_d).get(EXTEND_RATE_MEASURE_ENV, "1")).strip() != "1"
+    if not _given:
+        ns.env_d = set_group_env(_env_d, EXTEND_RATE_MEASURE_ENV, "1")
+    _on = str(parse_group_env(getattr(ns, "env_d", "") or "").get(EXTEND_RATE_MEASURE_ENV, "")
+              ).strip().lower() in ("1", "true", "yes", "on")
+    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source={source} start={rtext} "
+        f"measure={'on' if _on else 'off'}{' (aus --env-d, Vorrang)' if _given else ''} "
+        f"safety={_et.RATE_SAFETY} ({why}; je Rang gilt max(start, gemessen x {_et.RATE_SAFETY}), "
+        f"gemessen = max(Allokator-Spitze, reserved-Zuwachs) / Zeilen ueber jeden Ziel-Extend "
+        f">= {_et.GROWTH_PER_ROW_MIN_ROWS} Zeilen, Ratsche nur nach oben)")
+
+
+def _d_extend_derived_rate_env(ns, log, label: str, *, capped: bool) -> Optional[str]:
+    """Q-694b: the chunk-cap start rate of a profile WITHOUT ``D_EXTEND_CAP_PER_ROW_MIB``
+    (another model, another card mix): derived from the checkpoint's geometry
+    (:func:`extend_trim.derived_rate_mib`, no rig number), the run-time measurement armed.
+
+    Next Flash UNCHANGED: a profile carrying ``D_EXTEND_GROWTH_PER_ROW_MIB`` gets its rate from
+    the #145 ledger's EXTEND-STUECKELUNG write -- nothing is written here, byte for byte as
+    before. An unreadable geometry writes nothing and says the cap is NOT armed."""
+    if d_extend_growth_per_row_record(getattr(ns, "profile", None))[0] is not None:
+        return None
+    from sglang.srt.weg2 import extend_trim as _et
+
+    try:
+        _rate = _et.derived_rate_mib(_model_config(str(getattr(ns, "model", "") or "")))
+        _geo_err = "" if _rate is not None else "keine hidden_size"
+    except Exception as exc:  # noqa: BLE001 -- an unreadable geometry is NAMED below, never fatal
+        _rate, _geo_err = None, f"{type(exc).__name__}: {exc}"
+    if _rate is None:
+        log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source=none: kein "
+            f"{D_EXTEND_CAP_RATE_RECORD} im Profil {getattr(ns, 'profile', None)} und keine "
+            f"Modellgeometrie ({_geo_err}) -- der Extend-Chunk-Deckel ist NICHT scharf")
+        return None
+    _rtext = _et.launcher_rates([_rate])
+    _env_d = getattr(ns, "env_d", "") or ""
+    _given = any(x.split("=", 1)[0].strip() == "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB"
+                 and x.split("=", 1)[1].strip() != _rtext
+                 for x in _env_d.split(";") if "=" in x)
+    if not _given:
+        ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB", _rtext)
+    _what = ("EXTEND-CAP rows_cap aus min(card_free, torch_cap - reserved)" if capped else
+             f"{EXTEND_CAP_FLIP_MARKER} rows_cap aus card_free_post (ohne torch cache cap, Flip-Linie)")
+    log(f"{D_RANK_SOLVE_MARKER} {label} {_what}: "
+        f"SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB={_rtext}{' (aus --env-d, Vorrang)' if _given else ''} "
+        f"(Startrate aus der Modellgeometrie, kein {D_EXTEND_CAP_RATE_RECORD} im Profil "
+        f"{getattr(ns, 'profile', None)}; D kappt den Extend-Chunk auf floor((post - 300) / Rate), "
+        f"MIN ueber TP)")
+    _d_extend_rate_measure_env(
+        ns, log, label, "derived", _rtext,
+        f"Geometrie {getattr(ns, 'model', '')}: ({_et.DERIVED_HIDDEN_COPIES} x hidden + "
+        f"{_et.DERIVED_MLP_COPIES} x intermediate + {_et.DERIVED_MIXER_COPIES} x mixer [+ MoE top-k]) "
+        f"x max({_et.DERIVED_MIN_ELEM_BYTES}, dtype) Bytes je Zeile, ohne TP-Teilung")
     return _rtext
 
 
@@ -19073,8 +19151,10 @@ def _d_extend_flip_rate_env(ns, log, label: str) -> Optional[str]:
     the ALLOCATED transient per row; 40 boots up to 03.10. measured <= 0.2690 on every extend of
     >= 2048 rows), so ``rows_cap = floor((card_free_post - 300) / 0.3091)``: 740 rows at the
     death's 529 MiB. DUAL UNCHANGED: the dual layout (``--dual-layout`` / ``--dual-share``)
-    writes nothing here, byte for byte as before. A profile without the record (Next Flash):
-    nothing written."""
+    writes nothing here, byte for byte as before. Next Flash (its own record
+    ``D_EXTEND_GROWTH_PER_ROW_MIB`` through the #145 ledger): nothing written. Q-694b: any other
+    profile without the record gets a geometry-derived start rate; the record, where present, is
+    only the start value of the per-rank run-time measurement."""
     if getattr(ns, "dual_layout", False) is True or getattr(ns, "dual_share", False) is True:
         return None
     return _d_extend_cap_rate_env(ns, log, label, capped=False)

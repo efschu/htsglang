@@ -44,7 +44,10 @@ MARKER = "WEG2-EXTEND-CACHE-TRIM"
 MIB = float(1 << 20)
 
 _UNSET = object()
-_CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": None, "cap_trimmed": False}
+_CACHE = {"thresholds": _UNSET, "rates": _UNSET, "armed": False, "logged_cap": None, "cap_trimmed": False,
+          # Q-694b EXTEND-RATE: measurement switch, this rank's measured rate
+          # (MiB/row, ratchet up), the open extend's start reading
+          "measure": _UNSET, "measured": None, "pending": None}
 
 
 def parse_thresholds(text: Optional[str]) -> Optional[List[float]]:
@@ -90,6 +93,9 @@ def reset_for_tests() -> None:
     _CACHE["armed"] = False
     _CACHE["logged_cap"] = None
     _CACHE["cap_trimmed"] = False
+    _CACHE["measure"] = _UNSET
+    _CACHE["measured"] = None
+    _CACHE["pending"] = None
 
 
 def threshold_for(rank: int, values: Optional[Sequence[float]]) -> Optional[float]:
@@ -143,7 +149,16 @@ def maybe_trim(cuda, rank: int, threshold_mib: Optional[float],
 def before_extend(worker, batch) -> Optional[str]:
     """Hook for ``TpModelWorker.forward_batch_generation``: the target
     worker's extend batches only (the draft extend that follows shares the
-    allocator and profits from the same trim)."""
+    allocator and profits from the same trim). Q-694b: after the trim, the
+    rate measurement opens its reading (only with
+    ``SGLANG_WEG2_EXTEND_RATE_MEASURE``; off = byte-identical)."""
+    line = _before_extend_trim(worker, batch)
+    if batch is not None and measure_armed():
+        measure_open(worker, batch)
+    return line
+
+
+def _before_extend_trim(worker, batch) -> Optional[str]:
     values = thresholds()
     if batch is None or (values is None and not _CACHE["cap_trimmed"]):
         return None
@@ -276,6 +291,10 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
         rate = threshold_for(rank, vals)
         if rate is None or rate <= 0 or not pending or int(configured) <= 0:
             return None
+        # Q-694b: the start rate (record / derived) or this rank's measured
+        # rate x RATE_SAFETY, whichever is larger; off: the start rate itself
+        start_rate = rate
+        rate = effective_rate(rate)
         if bool(cuda.is_current_stream_capturing()):
             return None
         if not _CACHE["armed"]:
@@ -311,6 +330,8 @@ def width_vote(cuda, rank: int, configured: int, page_size: int, pending: bool,
                 f"{STUECKELUNG_MARKER} rank={rank} geplant={int(configured)} cap={cap} "
                 f"post={post_mib:.0f} rate={rate:.4f} floor={STUECKELUNG_FLOOR_MIB:.0f}"
                 + ("" if cap_post is None else f" torch_cap={torch_cap:.0f} cap_post={cap_post:.0f}")
+                + ("" if not measure_armed() else
+                   f" rate_src={'measured' if rate > start_rate else 'start'} start_rate={start_rate:.4f}")
             )
         return cap
     except Exception as exc:  # noqa: BLE001 -- a vote that cannot price abstains
@@ -334,3 +355,223 @@ def launcher_rates(rate_mib: Sequence[Optional[float]]) -> str:
     if not rate_mib or all(r is None for r in rate_mib):
         return ""
     return ",".join("0" if r is None else f"{float(r):.4f}" for r in rate_mib)
+
+
+# --------------------------------------------------------------------------
+# Q-694b EXTEND-RATE: the chunk-cap rate is MEASURED per rank at run time.
+#
+# Q-694 armed the rc12g vote on the 27B flip line from the profile record
+# ``D_EXTEND_CAP_PER_ROW_MIB`` -- a number measured on ONE rig for ONE
+# checkpoint. Another card mix, another model or a deeper prefix than the
+# record's boots saw is then either uncapped (no record: no vote, the y8va OOM
+# class) or capped by a number that describes other hardware. So the rate the
+# vote uses is now
+#
+#     effective = max(start, measured x RATE_SAFETY)
+#
+# ``start`` is the env rate the launcher wrote (the record where the profile
+# has one, else :func:`derived_rate_mib` from the model geometry); ``measured``
+# is this rank's own maximum, over its target extends of at least
+# ``GROWTH_PER_ROW_MIN_ROWS`` rows, of
+#
+#     max(peak_allocated - allocated_at_start, reserved_after - reserved_at_start) / rows
+#
+# read around the extend forward (``before_extend`` .. the forward-end hook
+# ``vram_family_census.maybe_log_vram_peak``) without resetting the
+# allocator's peak counter (WEG2-VRAM-PEAK owns those re-bases): the peak term
+# counts only when the extend RAISED the counter, else only the reserved
+# growth does. Process-local, so every rank keeps its own (a 3080 and a 5090
+# differ). Ratchet up only. Rows under the minimum are not priced: a fixed part
+# of the transient would inflate their per-row rate, narrow the next chunk,
+# inflate again -- the cut must not feed its own measurement. One line per new
+# maximum:
+#
+#     EXTEND-RATE source=measured rank=0 rows=4096 transient_mib=.. reserved_growth_mib=..
+#       rate=.. prev=.. effective=.. start=.. safety=1.15
+# --------------------------------------------------------------------------
+
+RATE_MARKER = "EXTEND-RATE"
+#: the vote's margin over the measured maximum: the record carries the same
+#: ratio over the maximum of its own measurement (0.3091 / 0.2690 = 1.149) --
+#: a deeper prefix than any seen so far draws more attention workspace
+RATE_SAFETY = 1.15
+
+
+def _ceil4(x: float) -> float:
+    return math.ceil(float(x) * 10000.0 - 1e-9) / 10000.0
+
+
+def measure_armed() -> bool:
+    """``SGLANG_WEG2_EXTEND_RATE_MEASURE``, read once per process."""
+    if _CACHE["measure"] is _UNSET:
+        try:
+            from sglang.srt.environ import envs
+
+            _CACHE["measure"] = bool(envs.SGLANG_WEG2_EXTEND_RATE_MEASURE.get())
+        except Exception:  # noqa: BLE001 -- an instrument never kills a forward
+            _CACHE["measure"] = False
+    return bool(_CACHE["measure"])
+
+
+def measured_rate() -> Optional[float]:
+    """This rank's measured extend rate (MiB/row), ``None`` before the first."""
+    return _CACHE["measured"]  # type: ignore[return-value]
+
+
+def effective_rate(start: float) -> float:
+    """The rate the vote uses: ``max(start, measured x RATE_SAFETY)`` while the
+    measurement is armed and holds a value, else ``start``."""
+    m = _CACHE["measured"] if measure_armed() else None
+    if m is None:
+        return float(start)
+    return max(float(start), _ceil4(float(m) * RATE_SAFETY))
+
+
+def _alloc_stats(cuda):
+    """(peak_allocated, allocated, reserved) in bytes, ONE ``memory_stats()``."""
+    st = cuda.memory_stats()
+    return (int(st.get("allocated_bytes.all.peak", 0)),
+            int(st.get("allocated_bytes.all.current", 0)),
+            int(st.get("reserved_bytes.all.current", 0)))
+
+
+def measure_open(worker, batch, cuda=None) -> None:
+    """Start reading of a target extend (after the trim). Never raises."""
+    try:
+        _CACHE["pending"] = None
+        if getattr(worker, "is_draft_worker", False):
+            return
+        mode = getattr(batch, "forward_mode", None)
+        if mode is None or not mode.is_extend() or mode.is_target_verify():
+            return
+        if cuda is None:
+            import torch
+
+            cuda = torch.cuda
+        if bool(cuda.is_current_stream_capturing()):
+            return
+        pa, a, r = _alloc_stats(cuda)
+        runner = getattr(worker, "model_runner", None)
+        _CACHE["pending"] = (None if runner is None else id(runner), pa, a, r)
+    except Exception as exc:  # noqa: BLE001
+        _CACHE["pending"] = None
+        logger.debug("%s open skipped: %s", RATE_MARKER, exc)
+
+
+def measure_close(runner, forward_batch, cuda, rank: Optional[int] = None) -> Optional[str]:
+    """Forward-end reading of the extend :func:`measure_open` opened; raises
+    this rank's measured rate when the extend's per-row cost is a new maximum.
+    Returns the line it logged. Never raises."""
+    pending = _CACHE["pending"]
+    if pending is None:
+        return None
+    try:
+        if getattr(runner, "is_draft_worker", False) or getattr(runner, "is_draft_model_runner", False):
+            return None
+        owner, pa0, a0, r0 = pending
+        if owner is not None and owner != id(runner):
+            return None
+        _CACHE["pending"] = None
+        mode = getattr(forward_batch, "forward_mode", None)
+        if mode is None or not mode.is_extend() or mode.is_target_verify():
+            return None
+        ids = getattr(forward_batch, "input_ids", None)
+        rows = (int(ids.shape[0]) if ids is not None
+                else int(getattr(forward_batch, "extend_num_tokens", 0) or 0))
+        if rows < GROWTH_PER_ROW_MIN_ROWS:
+            return None
+        pa1, _a1, r1 = _alloc_stats(cuda)
+        # the peak counter is this extend's only if the extend raised it
+        transient = (pa1 - a0) if pa1 > pa0 else 0
+        growth = max(0, r1 - r0)
+        cost = max(transient, growth)
+        if cost <= 0:
+            return None
+        rate = _ceil4(cost / MIB / rows)
+        prev = _CACHE["measured"]
+        if prev is not None and rate <= float(prev):
+            return None
+        _CACHE["measured"] = rate
+        start = threshold_for(int(rank) if rank is not None else 0, rates())
+        eff = None if start is None else effective_rate(start)
+        line = (
+            f"{RATE_MARKER} source=measured rank={'?' if rank is None else int(rank)} rows={rows} "
+            f"transient_mib={transient / MIB:.0f} reserved_growth_mib={growth / MIB:.0f} "
+            f"rate={rate:.4f} prev={'none' if prev is None else f'{float(prev):.4f}'} "
+            f"effective={'none' if eff is None else f'{eff:.4f}'} "
+            f"start={'none' if start is None else f'{float(start):.4f}'} safety={RATE_SAFETY}"
+        )
+        logger.info(line)
+        return line
+    except Exception as exc:  # noqa: BLE001
+        _CACHE["pending"] = None
+        logger.debug("%s close skipped: %s", RATE_MARKER, exc)
+        return None
+
+
+# Q-694b: the start rate where the profile has no record -- the per-row element
+# count of ONE layer's live activations (layers run one after another), with
+# no TP division: the start cannot see the rank's share, the measurement
+# narrows it per rank later.
+#: residual, layer input, normed copy, mixer/MLP output, all-reduce in + out
+DERIVED_HIDDEN_COPIES = 6
+#: gate_up (2 x intermediate) + activation (1 x intermediate)
+DERIVED_MLP_COPIES = 3
+#: mixer projection output + mixer output before o_proj
+DERIVED_MIXER_COPIES = 2
+#: routed MoE: the top-k permuted hidden copies per row (dispatch in, expert out)
+DERIVED_MOE_HIDDEN_COPIES = 2
+#: every element priced at least at fp32: bf16/fp16 kernels upcast norms, GDN
+#: chunk states, softmax and quant scales to fp32
+DERIVED_MIN_ELEM_BYTES = 4
+
+_DTYPE_BYTES = {"float64": 8, "double": 8, "float32": 4, "float": 4,
+                "bfloat16": 2, "float16": 2, "half": 2}
+
+
+def derived_rate_mib(cfg: dict) -> Optional[float]:
+    """Q-694b: a conservative start rate (MiB per extend row) from the model
+    geometry alone -- no card, no rig measurement::
+
+        elems/row = 6 x hidden + 3 x intermediate + 2 x mixer_width
+                    [+ 2 x top_k x hidden + num_experts   for a routed MoE]
+        bytes/row = elems/row x max(4, dtype bytes)
+
+    ``intermediate`` is the widest MLP a row passes (dense
+    ``intermediate_size``, or ``moe_intermediate_size x num_experts_per_tok``
+    plus a shared expert; 4 x hidden when the config names neither);
+    ``mixer_width`` the widest of full attention (q, its output gate under
+    ``attn_output_gate``, k, v), linear attention (q, k, v, z, the per-head
+    a/b) and hidden. ``None`` without ``hidden_size``: nothing derived, and the
+    launcher names that the cap is not armed."""
+    try:
+        t = cfg.get("text_config") or cfg
+        hidden = int(t.get("hidden_size") or 0)
+        if hidden <= 0:
+            return None
+        dense_i = int(t.get("intermediate_size") or 0)
+        moe_i = int(t.get("moe_intermediate_size") or 0) * int(t.get("num_experts_per_tok") or 0)
+        moe_i += int(t.get("shared_expert_intermediate_size") or 0) if moe_i else 0
+        inter = max(dense_i, moe_i) or 4 * hidden
+        heads = int(t.get("num_attention_heads") or 0)
+        kv_heads = int(t.get("num_key_value_heads") or heads)
+        head_dim = int(t.get("head_dim") or (hidden // heads if heads else 0))
+        full = heads * head_dim * (2 if t.get("attn_output_gate") else 1) + 2 * kv_heads * head_dim
+        lk = int(t.get("linear_num_key_heads") or 0) * int(t.get("linear_key_head_dim") or 0)
+        lv_heads = int(t.get("linear_num_value_heads") or 0)
+        lv = lv_heads * int(t.get("linear_value_head_dim") or 0)
+        linear = 2 * lk + 2 * lv + 2 * lv_heads
+        mixer = max(full, linear, hidden)
+        # a routed MoE layer also holds the row's top-k permuted copies of
+        # hidden (dispatch in, expert out) and the router logits
+        top_k = int(t.get("num_experts_per_tok") or 0) if moe_i else 0
+        moe_extra = (DERIVED_MOE_HIDDEN_COPIES * top_k * hidden + int(t.get("num_experts") or 0)
+                     if top_k else 0)
+        dtype = str(t.get("torch_dtype") or t.get("dtype") or cfg.get("torch_dtype")
+                    or cfg.get("dtype") or "bfloat16").replace("torch.", "")
+        elem = max(DERIVED_MIN_ELEM_BYTES, _DTYPE_BYTES.get(dtype, 2))
+        elems = (DERIVED_HIDDEN_COPIES * hidden + DERIVED_MLP_COPIES * inter
+                 + DERIVED_MIXER_COPIES * mixer + moe_extra)
+        return _ceil4(elems * elem / MIB)
+    except Exception:  # noqa: BLE001 -- an unreadable geometry derives nothing
+        return None

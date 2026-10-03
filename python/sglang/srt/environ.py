@@ -1119,6 +1119,13 @@ class Envs:
     # CSV, "0" = no rate). Set by the weg2 launcher from D_EXTEND_GROWTH_PER_ROW_MIB;
     # the scheduler caps the extend chunk to floor((card_free_post - 300) / rate).
     SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB = EnvStr(None)
+    # Q-694b EXTEND-RATE: the rank MEASURES its own extend transient per row
+    # (allocator peak / reserved growth of every target extend of >= 2048 rows)
+    # and votes with max(start rate, measured x 1.15), a per-rank ratchet up
+    # only; the rate above is then only the start value (record or derived from
+    # the model geometry). Written by the weg2 launcher on the flip line's D
+    # group; off = the rate above alone, byte-identical.
+    SGLANG_WEG2_EXTEND_RATE_MEASURE = EnvBool(False)
     # CORRIDOR BOUND WAKE RESET (y3r Klasse E/A2, D TP1 3080, 23:45:29-34): the
     # '#794 GROUP-NARROWED ... from 4096 to 64' right after every wake is the
     # #1028c bounded-min window (5 s) of the #656 gate still holding the
