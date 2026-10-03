@@ -212,10 +212,15 @@ class DegenDetector:
             self._dump(rid, "suspect", st, {"out_len": st.out_len, "period": period,
                                              "reps": reps, "span": span})
         if self.stop and self.on_stop is not None:
-            # Stage 2 (prepared, OFF by default): the caller decides how to
-            # end the request; the detector only names it.
+            # Stage 2 (SGLANG_WEG2_DEGEN_STOP, OFF by default): the caller
+            # ends the request (detokenizer -> managers/degen_stop.py); the
+            # detector only names it.
             self.on_stop(rid, st.part, period, reps)
         return period, reps
+
+    def out_len(self, rid: str) -> int:
+        st = self.states.get(rid)
+        return st.out_len if st is not None else 0
 
 
 class TailDumper:

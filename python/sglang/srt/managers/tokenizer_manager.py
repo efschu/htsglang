@@ -3052,6 +3052,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
+        if getattr(recv_obj, "degen_stop", False):
+            # DEGEN-STOP (degen_detect stage 2): the detokenizer named a
+            # looping request. It is not an echo -- forward it to the
+            # scheduler (every rank), whose finish output (length) ends the
+            # stream; this side keeps the request until then.
+            if recv_obj.rid in self.rid_to_state:
+                self._dispatch_to_scheduler(recv_obj)
+            return
         # Two scheduler messages can race in handle_loop for the same rid: a
         # batch output that finishes it normally (deletes rid_to_state[rid])
         # and this abort echo. If the finish wins, the rid is already gone and

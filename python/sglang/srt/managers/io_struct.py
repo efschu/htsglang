@@ -2164,6 +2164,10 @@ class AbortReq(BaseReq, kw_only=True):
     # The finished reason data (from BaseFinishReason.to_json())
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
+    # DEGEN-STOP (managers/degen_detect.py): set by the detokenizer when a
+    # decode tail loops; the tokenizer manager forwards it to the scheduler,
+    # which finishes the running request with ``finished_reason`` (length).
+    degen_stop: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

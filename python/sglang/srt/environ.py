@@ -1136,8 +1136,10 @@ class Envs:
     # for an exact repetition (smallest period <= 256 tokens covering >= 8
     # repetitions and >= MIN_SPAN tokens of the last 2048) and logs it once per
     # rid and period (managers/degen_detect.py). Off the scheduler's decode
-    # round by construction (separate process). STOP is the prepared stage 2
-    # (abort the request): OFF -- stage 1 only logs.
+    # round by construction (separate process). STOP is stage 2: the request
+    # is ended with finish_reason=length ('DEGEN-STOP rid=...'; detokenizer ->
+    # tokenizer manager -> scheduler abort). Default OFF -- stage 1 only logs;
+    # turning it on is the user's call (03.10.).
     SGLANG_WEG2_DEGEN_DETECT = EnvBool(True)
     SGLANG_WEG2_DEGEN_STOP = EnvBool(False)
     SGLANG_WEG2_DEGEN_MIN_SPAN = EnvInt(512)
