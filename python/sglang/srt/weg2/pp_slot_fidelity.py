@@ -80,6 +80,11 @@ PLAN_ATTR = "_weg2_sf_budget_plan"
 ADDER_INITIAL_ATTR = "sf_rem_chunk_initial"
 
 _LOG_FIRST = 8
+#: Q-640: eviction rounds the room verdict may run before it decides. A round
+#: can free more than it was asked for (an evict drains the in-flight write-
+#: backs, #1465, which makes their nodes evictable), so the set is re-read and
+#: evicted again -- bounded, never a spin.
+_ROOM_MAX_ROUNDS = 4
 
 
 def enabled(env=None) -> bool:
@@ -130,7 +135,15 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
              its path unchanged.
     True  -- room is there now (after evicting the shortfall): load in THIS pass.
     False -- the residual: even every evictable row does not make room; the
-             caller refuses as before."""
+             caller refuses as before.
+
+    Q-640 (27B dual y8u 10031206 12:33:47, rid weg2-0-51): PP2 read evictable=2081
+    while an in-flight write-back held node 79; the eviction of node 80 drained it
+    (#1465 WRITE-BACK DRAIN), node 79 became evictable (82788) -- and the verdict,
+    taken from the ONE read before the eviction, was PP-RESIDUAL while PP0/PP1
+    (evictable=84869) admitted: #968 PREFIX MATERIALISATION SHORTFALL on PP2. The
+    evictable set is re-read after every round and evicted again until the room is
+    there or a round frees nothing (at most ``_ROOM_MAX_ROUNDS``)."""
     if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
         return None
     alloc = getattr(tree, "token_to_kv_pool_allocator", None)
@@ -138,38 +151,48 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
         return None
     kv_tokens = int(kv_tokens)
     avail0 = int(alloc.available_size())
-    evictable = int(tree.evictable_size())
+    evictable0 = evictable = int(tree.evictable_size())
     evicted = 0
-    short = kv_tokens - avail0
-    if short > 0 and evictable > 0:
+    rounds = 0
+    avail1 = avail0
+    while avail1 < kv_tokens and evictable > 0 and rounds < _ROOM_MAX_ROUNDS:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        res = tree.evict(EvictParams(num_tokens=min(short, evictable)))
-        evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
-    avail1 = int(alloc.available_size())
+        res = tree.evict(EvictParams(num_tokens=min(kv_tokens - avail1, evictable)))
+        got = int(getattr(res, "num_tokens_evicted", 0) or 0)
+        rounds += 1
+        evicted += got
+        avail_prev, avail1 = avail1, int(alloc.available_size())
+        evictable = int(tree.evictable_size())
+        if got <= 0 and avail1 <= avail_prev:
+            break
     ok = avail1 >= kv_tokens
     if ok:
         n = _sampled(tree, "_weg2_sf_room_same_pass")
         if n is not None:
             logger.info(
                 "SF LOADBACK-ROOM SAME-PASS rid=%s kv_tokens=%d floor=%d avail=%d "
-                "evictable=%d evicted=%d avail_after=%d (n=%d): the floor is this "
+                "evictable=%d evicted=%d avail_after=%d evictable_after=%d rounds=%d (n=%d): "
+                "the floor is this "
                 "rank's own value (tp group of one, pp>1), so the shortfall is "
                 "evicted and the host hit loads in THIS pass -- a next-pass retry "
                 "would only skew this stage one pass behind its peers (#1004, b23)",
-                rid, kv_tokens, int(floor), avail0, evictable, evicted, avail1, n,
+                rid, kv_tokens, int(floor), avail0, evictable0, evicted, avail1, evictable,
+                rounds, n,
             )
     else:
         n = _sampled(tree, "_weg2_sf_room_residual")
         if n is not None:
             logger.warning(
                 "SF LOADBACK-ROOM PP-RESIDUAL rid=%s kv_tokens=%d floor=%d avail=%d "
-                "evictable=%d evicted=%d avail_after=%d (n=%d): this rank cannot hold "
+                "evictable=%d evicted=%d avail_after=%d evictable_after=%d rounds=%d (n=%d): "
+                "this rank cannot hold "
                 "the load-back even with every evictable row freed and refuses this "
                 "pass. The verdict is RANK-LOCAL on a carrierless PP form: a peer "
                 "with room admits in this pass, and if one does the #1004 SLOT "
                 "DISAGREEMENT that follows has THIS line as its cause",
-                rid, kv_tokens, int(floor), avail0, evictable, evicted, avail1, n,
+                rid, kv_tokens, int(floor), avail0, evictable0, evicted, avail1, evictable,
+                rounds, n,
             )
     return ok
 
