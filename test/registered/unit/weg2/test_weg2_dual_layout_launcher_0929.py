@@ -90,8 +90,12 @@ class DualLayoutLauncher(CustomTestCase):
         # MPS env reaches BOTH groups, before each launch.
         self.assertIn("spec_p.env.update(ns._dual_mps_env)\n    spec_p.env.update(dual_p_sm_env(ns))\n"
                       "    spec_p.env.update(dual_duty_env(ns))\n"
-                      "    spec_p.env.update(dual_share_env(ns, \"P\"))\n    launch_group(spec_p", src)
-        self.assertIn('spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})\n        launch_group(spec_d',
+                      "    spec_p.env.update(dual_share_env(ns, \"P\"))\n"
+                      "    spec_p.env.update(dual_priority_env(ns, \"P\", log))  # DUAL-SHARE: {} unless a switch "
+                      "is on\n    launch_group(spec_p", src)
+        self.assertIn('spec_d.env.update(getattr(ns, "_dual_mps_env", None) or {})\n'
+                      '        spec_d.env.update(dual_priority_env(ns, "D", log))'
+                      '  # DUAL-SHARE: {} unless a switch is on\n        launch_group(spec_d',
                       src)
 
     def test_dual_share_implies_dual_and_splits_the_union_roles(self):

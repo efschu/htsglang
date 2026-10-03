@@ -119,6 +119,7 @@ from sglang.srt.managers.weg2_memory_saver import (
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
+from sglang.srt.weg2 import dual_share as _dual_share_mod  # DUAL-SHARE (dual layout only)
 from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import l15_plan  # L15-13c: D's residue record excludes the hold
 from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock lock
@@ -6000,6 +6001,8 @@ class Front:
         app["admitter"] = asyncio.create_task(self.d_admitter())
         if getattr(self, "dual_layout", False) and getattr(self, "dual_dbusy_file", ""):
             app["dual_dbusy"] = asyncio.create_task(self.dual_dbusy_writer())
+        if getattr(self, "dual_layout", False) and getattr(self, "_dual_share", None) is not None:
+            app["dual_share"] = asyncio.create_task(self.dual_share_writer())
         app["health"] = asyncio.create_task(self.health_poller())
         app["corridor"] = asyncio.create_task(self.corridor_sampler())
         # #1262 tier 3 -- the deadman's third signal, see flip_stall_check.
@@ -11142,6 +11145,8 @@ class Front:
             payload["max_tokens"] = 1
             payload.pop("max_completion_tokens", None)
         g.outstanding[p.rid] = time.time()
+        if getattr(self, "_dual_share", None) is not None:  # DUAL-SHARE: P's in-flight rest for tau
+            self._dual_share.note_leg1_start(p.rid, p.est_uncached)
         t0 = time.time()
         Front._req_book(self).leg1_dispatch(p.rid, t0)  # DASHBOARD-IPC: queue_ms ends, p_prefill starts
         # L15-10 S4n-e: a hot follow-up (its session's previous rid is held by
@@ -11297,6 +11302,9 @@ class Front:
             if _dp is not None:
                 self._ipc_publish("flip_user_time", _dp)
             self._metrics().served_leg("P", p.rid, time.time() - t0, pt, ct, 0)  # TSDB
+            if getattr(self, "_dual_share", None) is not None:  # DUAL-SHARE: P's rate for tau
+                self._dual_share.note_leg1_done(p.rid, max(0, pt - ct), d_prefill_seconds(js) or (_t1 - t0),
+                                                not self.groups["D"].outstanding)
             logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
                         p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
             # STORE-PRESENCE (NF ba76adffe2): ids for a fallback-priced rid NOW (before P's sleep
@@ -12086,6 +12094,8 @@ class Front:
                                 self._rvp_resumed(rid)
                             self._park_stuck().note_output(rid)  # #287 NEED0 (c): progress
                             self._ipc_out_book().token(rid, time.time())  # front.outstanding_stalest
+                            if getattr(self, "_dual_share", None) is not None:  # DUAL-SHARE: D rate
+                                self._dual_share.note_d_chunk(rid, chunk)
                             await _push(restate_inband_refusal(chunk, request.path))
                     if tier_carry and not client_io["gone"]:
                         await _emit(strip_cached_tier(bytes(tier_carry), request.path, True))
@@ -12181,6 +12191,8 @@ class Front:
                     self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_stream_tail(bytes(tail)), rid=rid)
                     Front._req_book(self).d_prefill_s(rid, dterms.get("prefill_s"))
                     self._metrics().served_leg("D", rid, time.time() - t0, pt, ct, comp)  # TSDB
+                    if getattr(self, "_dual_share", None) is not None:  # DUAL-SHARE: D rate calibration
+                        self._dual_share.note_d_done(rid, comp, time.time() - t0)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                                 "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
@@ -12227,6 +12239,8 @@ class Front:
                                                  mark=_pfc_mark0)
                 Front._req_book(self).d_prefill_s(rid, dterms.get("prefill_s"))
                 self._metrics().served_leg("D", rid, time.time() - t0, pt, ct, comp)  # TSDB
+                if getattr(self, "_dual_share", None) is not None:  # DUAL-SHARE: D rate (non-stream)
+                    self._dual_share.note_d_done(rid, comp, time.time() - t0)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
@@ -15189,6 +15203,45 @@ class Front:
                 logger.warning("WEG2 DUAL-DBUSY write failed: %s", e)
             await asyncio.sleep(period_s)
 
+    async def dual_share_writer(self) -> None:
+        """DUAL-SHARE (weg2/dual_share.py): one controller decision per tick,
+        written to the ctl file P reads; only with --dual-layout --dual-priority."""
+        fs = self._dual_share
+        while True:
+            try:
+                fs.tick(queue=list(self.queue), p_outstanding=dict(self.groups["P"].outstanding),
+                        d_outstanding=dict(self.groups["D"].outstanding), seats=int(self.d_bs),
+                        d_handoff=self._handoff_in_flight())
+            except Exception as e:  # noqa: BLE001 -- P falls back to rung 0 on a stale ctl (named there)
+                logger.warning("DUAL-SHARE tick failed: %s: %s", type(e).__name__, e)
+            await asyncio.sleep(fs.ctrl.cfg.tick_s)
+
+    async def handle_dual_priority(self, request: web.Request) -> web.Response:
+        """DUAL-SHARE admin switch: GET = state, POST {"mode": p|balanced|d|dynamic,
+        "d_min_rate_tps"?, "p_min_share"?}. With an admin key the bearer must
+        match; without one only loopback callers are served."""
+        fs = getattr(self, "_dual_share", None)
+        if fs is None:
+            return web.json_response({"error": "dual-share-off"}, status=404)
+        if self.admin_key:
+            import hmac
+
+            got = request.headers.get("Authorization", "")
+            if not hmac.compare_digest(got.encode(), f"Bearer {self.admin_key}".encode()):
+                return web.json_response({"error": "unauthorized"}, status=401)
+        elif (request.remote or "") not in ("127.0.0.1", "::1", "localhost"):
+            return web.json_response({"error": "loopback-only (no admin key on this boot)"}, status=403)
+        if request.method == "GET":
+            return web.json_response(fs.snapshot())
+        try:
+            body = await request.json()
+            mode = str(body.get("mode", fs.ctrl.mode))
+            snap = fs.set_mode(mode, d_min_rate_tps=body.get("d_min_rate_tps"),
+                               p_min_share=body.get("p_min_share"), who=f"POST from {request.remote}")
+        except (ValueError, TypeError, AttributeError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response(snap)
+
     def _dual_pump(self, pass_fn) -> None:
         """DUAL-TP3PP3: keep ONE P drain pass running while the queue holds
         work. A pass ends when the queue is empty (law 1), at the H91 cap or on
@@ -16978,6 +17031,18 @@ def main():
     ap.add_argument("--dual-dbusy-file", default="",
                     help="DUAL-TP3PP3 --dual-p-duty: the file the front rewrites with '1'/'0' when D's "
                          "outstanding set turns non-empty/empty; P's first stage throttles on it.")
+    ap.add_argument("--dual-priority", default="", choices=("", "p", "balanced", "d", "dynamic"),
+                    help="DUAL-SHARE (weg2/dual_share.py): arm the P/D share controller in this mode; it "
+                         "writes its rung to --dual-share-ctl. Empty = off (the launcher sets it with "
+                         "--dual-priority). Runtime switch: POST /weg2/dual-priority with a JSON mode.")
+    ap.add_argument("--dual-share-ctl", default="",
+                    help="DUAL-SHARE: the control file P reads (<busy>.ctl).")
+    ap.add_argument("--dual-d-min-rate-tps", type=float, default=0.0,
+                    help="DUAL-SHARE: D's minimum per-request decode rate (tok/s), 0 = off.")
+    ap.add_argument("--dual-p-min-share", type=float, default=0.25,
+                    help="DUAL-SHARE: floor of P's share.")
+    ap.add_argument("--dual-share-actuators", default="chunk",
+                    help="DUAL-SHARE: P's actuators (for the decision line; P reads its own env).")
     ap.add_argument("--dual-layout", action="store_true", default=False,
                     help="DUAL-TP3PP3 (F26): both groups stay awake, the front never flips; leg 1 "
                          "goes to P at once, leg 2 to D right after leg 1 (prefix from the store). "
@@ -17164,6 +17229,15 @@ def main():
     # the one pinned by test_27b_park_immediate (the class default is off).
     front.dual_layout = bool(getattr(args, "dual_layout", False))
     front.dual_dbusy_file = str(getattr(args, "dual_dbusy_file", "") or "")
+    # DUAL-SHARE (weg2/dual_share.py, item 800): None unless --dual-layout AND
+    # --dual-priority -- the flip front never builds it, every hook below is a
+    # getattr(..., None) is not None and its routes are not registered.
+    front._dual_share = (_dual_share_mod.FrontShare.from_args(
+        ctl=str(getattr(args, "dual_share_ctl", "") or ""), mode=str(getattr(args, "dual_priority", "") or ""),
+        actuators=str(getattr(args, "dual_share_actuators", "chunk") or "chunk"),
+        d_min_rate_tps=float(getattr(args, "dual_d_min_rate_tps", 0.0) or 0.0),
+        p_min_share=float(getattr(args, "dual_p_min_share", 0.25) or 0.25), log=logger.info)
+        if front.dual_layout else None)
     front.dual_kv_ledgers = [x for x in str(getattr(args, "dual_kv_ledgers", "") or "").split(",") if x]
     if front.dual_layout:
         logger.info("WEG2 DUAL-LAYOUT on: both groups stay awake, the front never flips; "
@@ -17196,6 +17270,9 @@ def main():
     app.router.add_get("/weg2/state", front.handle_state)
     app.router.add_get("/metrics_summary", front.handle_state)
     app.router.add_post("/weg2/flip", front.handle_manual_flip)
+    if getattr(front, "_dual_share", None) is not None:  # DUAL-SHARE admin switch (dual only)
+        app.router.add_get("/weg2/dual-priority", front.handle_dual_priority)
+        app.router.add_post("/weg2/dual-priority", front.handle_dual_priority)
     app.router.add_post("/abort_request", front.handle_abort)
     app.router.add_post("/open_session", front.handle_session_refused)
     app.router.add_post("/close_session", front.handle_session_refused)

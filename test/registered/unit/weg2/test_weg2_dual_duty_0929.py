@@ -74,7 +74,9 @@ class DualDuty(CustomTestCase):
         self.assertIn("_duty = (_dual_duty_throttle(self)", src)
         self.assertIn("_duty.before_forward()", src)
         self.assertIn("self.pp_group.is_first_rank".replace("self", "sched"), inspect.getsource(M._dual_duty_throttle))
-        self.assertIn("if os.environ.get(\"SGLANG_WEG2_DUAL_P_DUTY\") else None", src)
+        # item 800: the same site also arms the DUAL-SHARE duty actuator (its own env, dual only)
+        self.assertIn("if (os.environ.get(\"SGLANG_WEG2_DUAL_P_DUTY\")\n"
+                      "                     or os.environ.get(\"SGLANG_WEG2_DUAL_SHARE_DUTY\")) else None", src)
         ns = L.build_parser().parse_args(["--tree", "/x", "--tag", "t", "--dual-layout", "--dual-p-duty", "0.3"])
         L.resolve_dual_layout(ns)
         env = L.dual_duty_env(ns)

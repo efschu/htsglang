@@ -11666,8 +11666,12 @@ class SchedulerPPMixin:
         # DUAL-TP3PP3 (weg2/dual_duty.py): while D decodes, the first P stage
         # idles after each forward so P computes at most --dual-p-duty of the
         # wall time. None unless SGLANG_WEG2_DUAL_P_DUTY + _DBUSY_FILE are set.
+        # DUAL-SHARE (weg2/dual_share.py ShareDuty): the same site with the
+        # front's share rung as the duty -- None unless the launcher armed
+        # SGLANG_WEG2_DUAL_SHARE_DUTY (dual layout, --dual-priority, actuator duty).
         _duty = (_dual_duty_throttle(self)
-                 if os.environ.get("SGLANG_WEG2_DUAL_P_DUTY") else None)
+                 if (os.environ.get("SGLANG_WEG2_DUAL_P_DUTY")
+                     or os.environ.get("SGLANG_WEG2_DUAL_SHARE_DUTY")) else None)
         _duty_ev0 = None
         if _duty is not None:
             _duty.before_forward()
@@ -12118,7 +12122,13 @@ def _dual_duty_throttle(sched):
 
         gang = _dd.gang_chunks_from_env()
         if sched.pp_group.is_first_rank:
-            if gang:
+            from sglang.srt.weg2 import dual_share as _dsh
+
+            t = _dsh.ShareDuty.from_env()
+            if t is not None:
+                logger.info("DUAL-SHARE P duty actuator armed: duty = the front's rung fraction, "
+                            "signal=%s (PP0 only)", t.reader.path)
+            elif gang:
                 t = _dd.GangGate.from_env()
                 if t is not None:
                     logger.info("DUAL-TP3PP3 P gang window armed: duty=%.2f chunks=%d signal=%s done=%s",

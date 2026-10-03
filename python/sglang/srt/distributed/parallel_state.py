@@ -3428,6 +3428,15 @@ def graph_capture(stream=None):
     # CALLING thread's stream, and the watchdog is a different thread.)
     from sglang.srt.distributed.device_communicators import barlink_abort_gate
 
+    if stream is None:
+        # DUAL-SHARE stage 1a (weg2/dual_share.py, item 800): on group D of the
+        # dual layout with --dual-d-capture-prio on, capture on a HIGH-priority
+        # stream (a graph node keeps its capture stream's priority). None on
+        # every other rank/form -> the stock Stream() below, byte-identical.
+        from sglang.srt.weg2 import dual_share as _dsh
+
+        stream = _dsh.d_capture_stream()
+
     with (
         barlink_abort_gate.pause_polling(),
         get_tp_group().graph_capture(stream=stream) as context,
