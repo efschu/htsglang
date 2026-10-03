@@ -119,3 +119,19 @@ GGUF pinned-partial, and an early minimal boot) including the subtle case where
 the DCP log line contains both a restart *recommendation*
 (`SGLANG_UNEVEN_TOKEN_VECTOR=…`) and the *active* materialized vector — the
 parser must take the active one.
+
+## Profil-Editor (Auftrag 930, S1)
+
+Reiter **Profil** (nur Edition `rig`, nur im LAN, über den öffentlichen Proxy 403): ein Serverprofil laden (Release-`.env` aus `--profiles-release-dir`
+oder ein eigenes JSON aus `--profile-dir`, Standard `<state-dir>/profiles`), jeden Wert mit Erklärung, Herkunft (Profil / Nutzer / Planer / Default),
+Rücksetzknopf und Abhängigkeits-Chips bearbeiten, den Trockenlauf gegen gewählte Karten sehen (Ablehnungen mit Code, Klasse und der Aussage, was
+**Force am Serverstart** damit tut), speichern und als geprüftes `.env` exportieren.
+
+* Das Dashboard **erstellt** nur ein Profil und startet nichts; es hat keinen Force-Schalter. Am Server: `FLLIPER_PROFILE=<name>` und bei Bedarf
+  `FLLIPER_FORCE=1` (Launcher `--force`). Entrypoint-Patch gestaged: `/spinning/gpu-arb/docker/entrypoint.sh.profil-force-staged` (+ `.diff`).
+* Die Rechnung liegt im Planer-Baum (stdlib, per Dateipfad geladen): `weg2/profile_json.py`, `weg2/refusals.py`; Erklärungen aus
+  `rigdash/profil_data/catalog.json` (neu erzeugen: `python -m sglang.srt.weg2.profile_catalog --rev <sha> -o rigdash/profil_data/catalog.json`).
+* Ansicht Einfach (die wichtigsten Werte) / Experte (alle, Suche, Filter geändert / mit Planer-Wert / unerklärt).
+* `.env` bleibt die maßgebliche Quelle, bis der Round-Trip-Golden über alle Release-Profile dauerhaft grün ist
+  (`python -m sglang.srt.weg2.profile_json check /spinning/gpu-arb/docker/profiles_release`).
+* Deploy (Lead): `deploy/install_510.sh --check <sha>`, dann `deploy/install_510.sh <sha>` (stagt auch die Planer-Module des Editors).

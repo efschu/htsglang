@@ -88,6 +88,47 @@ details.lf details > summary { cursor: pointer; font-size: 13px; color: var(--te
 .lf .miss { color: var(--warn); font-size: 12px; }
 /* <!--DEV:END--> */
 /* <!--DEV:BEGIN--> */
+/* Profil-Editor (Auftrag 930, S1) */
+#pf-root { max-width: 1280px; }
+.pf-top { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin: 4px 0 8px; }
+.pf-top select, .pf-top input, .pf-card select, #pf-search, .pf-t input[type=text], .pf-t select { font: inherit; font-size: 13px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); max-width: 100%; }
+#pf-root button { font: inherit; font-size: 12px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--text); cursor: pointer; }
+#pf-root button:disabled { opacity: .5; cursor: default; }
+#pf-root button.pf-main { border-color: var(--bar); font-weight: 600; }
+#pf-root button.sel { background: var(--bar); color: var(--surface); }
+.pf-seg { display: inline-flex; gap: 0; margin-left: auto; } .pf-seg button { border-radius: 0; } .pf-seg button:first-child { border-radius: 6px 0 0 6px; } .pf-seg button:last-child { border-radius: 0 6px 6px 0; }
+.pf-note { font-size: 12px; margin: 4px 0 8px; } .pf-stat { margin: 8px 0; font-size: 13px; } .pf-warn { color: var(--warn); }
+.pf-filter { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; } #pf-search { width: min(360px, 100%); }
+.pf-grp { border: 1px solid var(--line); border-radius: 8px; margin: 8px 0; background: var(--surface); padding: 2px 8px; } .pf-grp > summary { cursor: pointer; padding: 4px 0; }
+.pf-t { width: 100%; border-collapse: collapse; } .pf-t th { text-align: left; font-size: 11.5px; color: var(--text-2); font-weight: 600; padding: 2px 6px; }
+.pf-t td { vertical-align: top; padding: 5px 6px; border-top: 1px solid var(--line); font-size: 12.5px; }
+.pf-n { min-width: 15em; overflow-wrap: anywhere; } .pf-v { min-width: 13em; } .pf-v input[type=text] { width: 100%; min-width: 10em; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; box-sizing: border-box; }
+.pf-o { min-width: 9em; white-space: normal; } .pf-e { min-width: 20em; }
+.pf-chip { font-size: 10.5px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text-2); white-space: nowrap; }
+.pf-org { font-size: 11px; padding: 0 7px; border-radius: 8px; border: 1px solid var(--line); }
+.pf-org-nutzer { border-color: var(--warn); color: var(--warn); } .pf-org-planer { border-color: var(--good); color: var(--good); } .pf-org-profil { color: var(--text-2); }
+.pf-ch td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+.pf-diff { display: block; font-size: 11px; color: var(--good); margin-top: 2px; overflow-wrap: anywhere; }
+.pf-short { cursor: pointer; } .pf-unex-s, .pf-unex { color: var(--warn); font-size: 12px; }
+.pf-part { margin: 3px 0; } .pf-gc { margin: 4px 0; font-size: 12px; }
+.pf-deps { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.pf-dep { font-size: 11px; padding: 0 7px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); cursor: pointer; }
+.pf-dep-off { opacity: .55; border-style: dashed; }
+.pf-flash { animation: pfflash 1.6s; } @keyframes pfflash { 0% { background: color-mix(in srgb, var(--warn) 35%, transparent); } 100% { background: transparent; } }
+.pf-fold { border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; margin: 8px 0; background: var(--surface); } .pf-fold > summary { cursor: pointer; font-size: 13px; }
+.pf-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 6px; margin: 6px 0; }
+.pf-card { display: flex; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; } .pf-card select { flex: 1 1 auto; }
+.pf-row-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.pf-verdict { border: 1px solid var(--line); border-left-width: 5px; border-radius: 8px; padding: 8px 12px; margin: 8px 0; background: var(--surface); }
+.pf-verdict.ok { border-left-color: var(--good); } .pf-verdict.bad { border-left-color: var(--bad); }
+.pf-rejs { list-style: none; padding: 0; margin: 6px 0; } .pf-rej { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 6px 0; background: var(--surface); font-size: 12.5px; overflow-wrap: anywhere; }
+.pf-rej.pf-force { border-left: 4px solid var(--good); } .pf-rej.pf-blockiert { border-left: 4px solid var(--bad); } .pf-rej.pf-ungeprueft { border-left: 4px solid var(--warn); }
+.pf-force { margin-top: 3px; font-weight: 600; } .pf-notes { margin: 4px 0 4px 18px; padding: 0; font-size: 12px; color: var(--text-2); }
+.pf-export { border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; margin: 10px 0; background: var(--surface); } .pf-export h3 { margin: 4px 0; font-size: 14px; }
+.pf-ok { border-color: var(--good); color: var(--good); } .pf-bad { border-color: var(--bad); color: var(--bad); }
+.pf-env { max-height: 420px; overflow: auto; } .pf-use { font-size: 12.5px; margin: 6px 0; } .pf-val { overflow-wrap: anywhere; max-width: 30em; }
+/* <!--DEV:END--> */
+/* <!--DEV:BEGIN--> */
 /* Kartenplaner (Item 510): Auswahl, Einfach- und Expertenseite; Farben aus den Seitenvariablen (hell/dunkel) */
 #kp-root { max-width: 1200px; }
 .kp-top { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin: 4px 0 10px; }
@@ -463,6 +504,7 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
   <button type="button" role="tab" data-tab="karten">Karten</button>
   <!--DEV:BEGIN-->
   <button type="button" role="tab" data-tab="kartenplan">Kartenplaner</button>
+  <button type="button" role="tab" data-tab="profil">Profil</button>
   <button type="button" role="tab" data-tab="entwicklung">Entwicklung <span class="cnt" id="tab-dev-cnt"></span></button>
   <!--DEV:END-->
 </nav>
@@ -520,6 +562,14 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
     <section class="card" id="kp-card" aria-label="Kartenplaner">
       <h2>Kartenplaner <span class="muted">optimale Startkonfiguration für ein Modell auf bis zu 6 Karten &middot; Zahlen aus unserem Planer und seinen Aufzeichnungen, nichts wird gestartet</span></h2>
       <div id="kp-root"><div class="muted">lädt &hellip;</div></div>
+    </section>
+  </div>
+  <!--DEV:END-->
+  <!--DEV:BEGIN-->
+  <div class="tab" id="tab-profil" role="tabpanel" hidden>
+    <section class="card" id="pf-card" aria-label="Profil-Editor">
+      <h2>Profil <span class="muted">ein Serverprofil laden, jeden Wert erklärt bearbeiten, prüfen, speichern &middot; erstellt nur, startet nichts &middot; nur im LAN</span></h2>
+      <div id="pf-root"><div class="muted">lädt &hellip;</div></div>
     </section>
   </div>
   <!--DEV:END-->
@@ -591,6 +641,7 @@ section.card .ipcsrc, section.card .logsrc { white-space: normal; overflow-wrap:
 <script src="zoom.js"></script>
 <!--DEV:BEGIN-->
 <script src="kartenplan.js"></script>
+<script src="profil.js"></script>
 <!--DEV:END-->
 <script>
 "use strict";
@@ -1961,6 +2012,7 @@ function setTab(t, fromHash) {
   try { localStorage.setItem("rigdash.tab", t); } catch (e) { /* private window */ }
   if (!fromHash) history.replaceState(null, "", "#t=" + t);
   if ((t === "verlauf" || t === "karten") && window.RigGrafik) window.RigGrafik.show();
+  if (t === "profil" && window.RigProfil) window.RigProfil.show();
   refresh(true);
 }
 document.querySelectorAll("#tabbar button[data-tab]").forEach((b) => { b.onclick = () => setTab(b.dataset.tab); });

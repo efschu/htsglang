@@ -39,5 +39,15 @@ if [ ! -d "$dst/python" ]; then
   done
   echo "$GATE_REV" > "$dst/GATE_REV"
 fi
+# Auftrag 930 (Profil-Editor S1): profile_json.py + refusals.py (stdlib-rein) aus der ZU DEPLOYENDEN Revision in dieselbe Stufe.
+# Sie existieren in GATE_REV noch nicht; das Dashboard laedt sie per Dateipfad (profil.py). Der Katalog liegt im rigdash-Release
+# (rigdash/profil_data/catalog.json), die Nutzerprofile im State-Volume (--profile-dir / <state-dir>/profiles).
+for f in profile_json.py refusals.py profile_catalog.py; do
+  if git -C "$repo" cat-file -e "$sha:python/sglang/srt/weg2/$f" 2>/dev/null; then
+    git -C "$repo" show "$sha:python/sglang/srt/weg2/$f" > "$dst/python/sglang/srt/weg2/$f"
+  else
+    echo "WARN: $f fehlt in $sha -- der Profil-Reiter bleibt ohne Planer-Baum (Fehlermeldung im Reiter)" >&2
+  fi
+done
 ln -sfn "releases/$GATE_REV" /opt/rigdash/kartenplan/current.new && mv -T /opt/rigdash/kartenplan/current.new /opt/rigdash/kartenplan/current
 exec "$here/install.sh" "$sha"
