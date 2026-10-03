@@ -576,16 +576,24 @@ def derived_rate_mib(cfg: dict) -> Optional[float]:
 # (Bericht 780 section A.4: a gap). The two 3080 ranks then never cap the
 # extend chunk although they have LESS room than the 5090 (z30x2: card_free
 # 16 / 78 MiB under the floors with the old trim threshold). A start rate for a
-# null rank is DERIVED, never copied from another rank's rig number:
+# null rank is DERIVED, never a rig number written into the code:
 #
 #   ratio    = rate[anchor] x growth[r] / growth[anchor]
 #              the anchor is the first ranked with a recorded rate; growth is
 #              the profile's per-rank ``D_EXTEND_GROWTH_MIB`` (what one D extend
 #              added to torch reserved on each rank, the same extends)
 #   geometry = derived_rate_mib(config.json): the model's own per-row activation
-#              bound, no card, no rig
+#              bound, no card, no rig. It is the Q-694b formula and it is NOT
+#              a bound on the reserved growth NF measures: 0.4622 on the NF
+#              geometry against the measured 0.5871 (report 960, -21 %; on the
+#              27B geometry it is conservative, 0.4422 against 0.3091)
+#   floor    = the recorded rank's own measured rate: no rank of the profile
+#              starts under the highest MEASURED value of its record until
+#              the formula knows the NF terms (coordinator, report 960) or the
+#              3080 ranks are measured (the run-time measurement below only
+#              ratchets UP, so the floor is also the 3080 ranks' resting value)
 #
-# and the start is the LARGER of the candidates that exist (the conservative
+# and the start is the LARGEST of the candidates that exist (the conservative
 # direction); the run-time measurement above then raises it per rank
 # (``SGLANG_WEG2_EXTEND_RATE_MEASURE_RANKS`` names exactly these ranks, so a
 # recorded rank keeps its recorded rate byte for byte).
@@ -594,14 +602,17 @@ def derived_rate_mib(cfg: dict) -> Optional[float]:
 
 def fill_null_rates(rate_mib: Sequence[Optional[float]],
                     growth_mib: Optional[Sequence[Optional[float]]] = None,
-                    geometry_mib: Optional[float] = None) -> "tuple[List[Optional[float]], List[str]]":
+                    geometry_mib: Optional[float] = None,
+                    floor_to_record: bool = True) -> "tuple[List[Optional[float]], List[str]]":
     """``(rates, sources)``: ``rate_mib`` with every ``None`` rank replaced by
-    the larger of its derivable candidates (``ratio``, ``geometry``), or left
+    the largest of its derivable candidates (``ratio``, ``geometry``, and with
+    ``floor_to_record`` the highest recorded rate ``record-floor``), or left
     ``None`` when it has none. ``sources[r]`` is ``record`` for a recorded
-    rank, else the winning candidate (``ratio`` / ``geometry``) or ``none``."""
+    rank, else the winning candidate or ``none``."""
     rates = [None if r is None or float(r) <= 0 else float(r) for r in rate_mib]
     anchor = next((i for i, r in enumerate(rates) if r is not None), None)
     growth = list(growth_mib) if growth_mib is not None and len(growth_mib) == len(rates) else None
+    top = max((r for r in rates if r is not None), default=None)
     out: List[Optional[float]] = []
     src: List[str] = []
     for i, r in enumerate(rates):
@@ -610,6 +621,8 @@ def fill_null_rates(rate_mib: Sequence[Optional[float]],
             src.append("record")
             continue
         cands = []
+        if floor_to_record and top is not None:
+            cands.append(("record-floor", top))
         if (anchor is not None and growth is not None
                 and growth[i] is not None and growth[anchor] is not None
                 and float(growth[i]) > 0 and float(growth[anchor]) > 0):

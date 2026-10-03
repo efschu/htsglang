@@ -8,10 +8,11 @@ free 16 / 78 MiB). Q-694b (27B line, 1de15e82ca) measured the rate per rank at
 run time; here the same measurement is ported and armed ONLY on the null ranks,
 with a start rate DERIVED (never copied from another rank, no rig constant):
 
-* ``ratio``    = recorded rank's rate x D_EXTEND_GROWTH_MIB[r] / D_EXTEND_GROWTH_MIB[recorded rank]
-* ``geometry`` = ``extend_trim.derived_rate_mib(config.json)``
-* start        = the larger of the two that exist; the rank then votes with
-                 ``max(start, measured x 1.15)``.
+* ``ratio``        = recorded rank's rate x D_EXTEND_GROWTH_MIB[r] / D_EXTEND_GROWTH_MIB[recorded rank]
+* ``geometry``     = ``extend_trim.derived_rate_mib(config.json)`` (0.4622 on NF: UNDER the measured 0.5871)
+* ``record-floor`` = the profile's highest recorded (measured) rate: no rank starts under it
+                     (coordinator, report 960)
+* start            = the largest of the three; the rank then votes with ``max(start, measured x 1.15)``.
 
 The recorded rank keeps its recorded rate byte for byte (TP0: 0.5871, no
 measurement). With the record complete, or without a null rank, nothing changes.
@@ -52,44 +53,96 @@ def _model_dir(cfg):
     return d
 
 
-class FillNullRates(unittest.TestCase):
+FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "nf_ports_1003",
+                       "nextflash_int4mixed_config.json")
 
-    def test_ratio_of_the_recorded_rank(self):
-        rates, src = ET.fill_null_rates(RECORD, GROWTH, None)
-        # 0.5871 x 2176 / 2434 = 0.52489 -> 0.5249 ; 0.5871 x 1728 / 2434 = 0.41679 -> 0.4168
-        self.assertEqual(rates, [0.5871, 0.5249, 0.4168])
-        self.assertEqual(src, ["record", "ratio", "ratio"])
 
-    def test_the_larger_candidate_wins(self):
-        rates, src = ET.fill_null_rates(RECORD, GROWTH, 0.46)
-        self.assertEqual(rates, [0.5871, 0.5249, 0.46])
-        self.assertEqual(src, ["record", "ratio", "geometry"])
+def _real_nf_model_dir():
+    """A model dir carrying the REAL NF INT4-mixed config.json (fixture of the profile S3 report 960)."""
+    d = tempfile.mkdtemp(prefix="nf_ports_real_")
+    with open(FIXTURE) as src, open(os.path.join(d, "config.json"), "w") as dst:
+        dst.write(src.read())
+    return d
+
+
+class TheStartRateNeverFallsBelowTheMeasuredNfValue(unittest.TestCase):
+    """Coordinator, report 960 (extend rate): ``derived_rate_mib`` on the NF geometry is 0.4622 MiB/row,
+    21 % UNDER the measured NF record 0.5871 (reserved growth); on 27B it is conservative (0.4422 vs 0.3091).
+    So no NF rank may start under the measured value: the start of a null rank is
+    max(ratio, geometry, the recorded rank's own rate)."""
+
+    MEASURED = 0.5871
+
+    def test_the_formula_alone_is_below_the_measured_value_on_the_nf_geometry(self):
+        with open(FIXTURE) as fh:
+            geo = ET.derived_rate_mib(json.load(fh))
+        self.assertEqual(geo, 0.4622)
+        self.assertLess(geo, self.MEASURED)  # why the floor exists; the formula itself is not changed
+
+    def test_every_nf_rank_starts_at_or_above_the_measured_record(self):
+        ns = SimpleNamespace(profile="nextflash", model=_real_nf_model_dir(), env_d="")
+        rates, fill = L.d_extend_rate_fill_null(ns, list(RECORD))
+        self.assertEqual(fill["geometry"], 0.4622)
+        for r, v in enumerate(rates):
+            self.assertGreaterEqual(v, self.MEASURED, f"rank {r}")
+
+    def test_the_emitted_env_text_never_carries_a_rate_under_it(self):
+        ns = SimpleNamespace(profile="nextflash", model=_real_nf_model_dir(), env_d="")
+        rates, _ = L.d_extend_rate_fill_null(ns, list(RECORD))
+        for v in ET.launcher_rates(rates).split(","):
+            self.assertGreaterEqual(float(v), self.MEASURED)
+
+    def test_an_unreadable_geometry_does_not_lower_it_either(self):
+        ns = SimpleNamespace(profile="nextflash", model="/nonexistent/model", env_d="")
+        rates, _ = L.d_extend_rate_fill_null(ns, list(RECORD))
+        for v in rates:
+            self.assertGreaterEqual(v, self.MEASURED)
+
+    def test_a_higher_derived_candidate_still_wins(self):
         rates, src = ET.fill_null_rates(RECORD, GROWTH, 0.9)
         self.assertEqual(rates[1:], [0.9, 0.9])
         self.assertEqual(src[1:], ["geometry", "geometry"])
 
-    def test_geometry_alone_without_a_growth_record(self):
-        rates, src = ET.fill_null_rates(RECORD, None, 0.4422)
-        self.assertEqual(rates, [0.5871, 0.4422, 0.4422])
-        self.assertEqual(src, ["record", "geometry", "geometry"])
+
+class FillNullRates(unittest.TestCase):
+
+    def test_ratio_of_the_recorded_rank_without_the_floor(self):
+        rates, src = ET.fill_null_rates(RECORD, GROWTH, None, floor_to_record=False)
+        # 0.5871 x 2176 / 2434 = 0.5249 ; 0.5871 x 1728 / 2434 = 0.4169 (the ratio alone, for the record)
+        self.assertEqual(rates, [0.5871, 0.5249, 0.4169])
+        self.assertEqual(src, ["record", "ratio", "ratio"])
+
+    def test_the_record_floor_lifts_every_null_rank(self):
+        rates, src = ET.fill_null_rates(RECORD, GROWTH, 0.4622)
+        self.assertEqual(rates, [0.5871, 0.5871, 0.5871])
+        self.assertEqual(src, ["record", "record-floor", "record-floor"])
+
+    def test_the_larger_candidate_wins(self):
+        rates, src = ET.fill_null_rates(RECORD, GROWTH, 0.9)
+        self.assertEqual(rates[1:], [0.9, 0.9])
+        self.assertEqual(src[1:], ["geometry", "geometry"])
+        # a rank that grows MORE than the recorded one wins by its ratio
+        rates, src = ET.fill_null_rates(RECORD, [2000.0, 2500.0, 1000.0], None)
+        self.assertEqual(rates, [0.5871, 0.7339, 0.5871])
+        self.assertEqual(src, ["record", "ratio", "record-floor"])
+
+    def test_geometry_alone_without_a_record_floor(self):
+        rates, src = ET.fill_null_rates([None, None, None], None, 0.4422)
+        self.assertEqual(rates, [0.4422] * 3)
+        self.assertEqual(src, ["geometry"] * 3)
 
     def test_nothing_derivable_stays_unarmed_and_named(self):
-        rates, src = ET.fill_null_rates(RECORD, None, None)
-        self.assertEqual(rates, [0.5871, None, None])
-        self.assertEqual(src, ["record", "none", "none"])
-        self.assertEqual(ET.launcher_rates(rates), "0.5871,0,0")  # the old env text
+        rates, src = ET.fill_null_rates([None, None, None], GROWTH, None)
+        self.assertEqual(rates, [None, None, None])
+        self.assertEqual(src, ["none"] * 3)
+        self.assertEqual(ET.launcher_rates(rates), "")
 
     def test_a_complete_record_is_untouched(self):
         rates, src = ET.fill_null_rates([0.5, 0.6, 0.7], GROWTH, 9.0)
         self.assertEqual(rates, [0.5, 0.6, 0.7])
         self.assertEqual(src, ["record"] * 3)
 
-    def test_a_missing_growth_rank_falls_back_to_the_geometry(self):
-        rates, src = ET.fill_null_rates(RECORD, [2434.0, None, 1728.0], 0.46)
-        self.assertEqual(src, ["record", "geometry", "geometry"])
-        self.assertEqual(rates[1], 0.46)
-
-    def test_no_recorded_rank_means_no_anchor(self):
+    def test_no_recorded_rank_means_no_anchor_and_no_floor(self):
         rates, src = ET.fill_null_rates([None, None, None], GROWTH, None)
         self.assertEqual(src, ["none"] * 3)
 
@@ -110,15 +163,15 @@ class LauncherFillAndArm(unittest.TestCase):
         rates, fill = L.d_extend_rate_fill_null(self._ns(d), list(RECORD))
         geo = ET.derived_rate_mib(_nf_config())
         self.assertIsNotNone(geo)
-        self.assertEqual(rates[0], 0.5871)
-        self.assertEqual(rates[1], max(0.5249, geo))
-        self.assertEqual(rates[2], max(0.4168, geo))
+        self.assertEqual(rates, [0.5871, 0.5871, 0.5871])  # the synthetic geometry is under the record too
+        self.assertLess(geo, 0.5871)
         self.assertEqual(fill["ranks"], [1, 2])
         self.assertEqual(fill["geometry"], geo)
+        self.assertEqual(fill["sources"], ["record", "record-floor", "record-floor"])
 
     def test_an_unreadable_model_is_named_not_fatal(self):
         rates, fill = L.d_extend_rate_fill_null(self._ns("/nonexistent/model"), list(RECORD))
-        self.assertEqual(rates, [0.5871, 0.5249, 0.4168])  # the ratio candidate alone
+        self.assertEqual(rates, [0.5871, 0.5871, 0.5871])  # the record floor alone
         self.assertIn("FileNotFoundError", fill["geo_err"])
         self.assertEqual(fill["ranks"], [1, 2])
 
@@ -135,9 +188,10 @@ class LauncherFillAndArm(unittest.TestCase):
         self.assertEqual(env["SGLANG_WEG2_EXTEND_RATE_MEASURE"], "1")
         self.assertEqual(env["SGLANG_WEG2_EXTEND_RATE_MEASURE_RANKS"], "1,2")
         (line,) = lines
-        self.assertIn("EXTEND-RATE source=record+derived start=0.5871,0.5249,0.4168 measure=on ranks=1,2", line)
+        self.assertIn("EXTEND-RATE source=record+derived start=0.5871,0.5871,0.5871 measure=on ranks=1,2", line)
         self.assertIn("rank0=record", line)
-        self.assertIn("rank1=ratio", line)
+        self.assertIn("rank1=record-floor", line)
+        self.assertIn("kein Rang startet unter dem gemessenen Wert", line)
 
     def test_a_second_solve_pass_sees_its_own_write_not_a_user_value(self):
         ns, lines = self._ns("/nonexistent/model"), []
@@ -160,14 +214,14 @@ class LauncherFillAndArm(unittest.TestCase):
         self.assertIn("Vorrang", lines[0])
 
     def test_an_unarmed_rank_is_named(self):
+        # nothing derivable: no recorded rank (no floor, no ratio) and no readable geometry
         ns, lines = self._ns("/nonexistent/model"), []
-        with mock.patch.object(L, "d_extend_growth_record", return_value=(None, "")):
-            rates, fill = L.d_extend_rate_fill_null(ns, list(RECORD))
-        self.assertEqual(rates, [0.5871, None, None])
+        rates, fill = L.d_extend_rate_fill_null(ns, [None, None, None])
+        self.assertEqual(rates, [None, None, None])
         self.assertEqual(fill["ranks"], [])
         L.d_extend_rate_measure_ranks_env(ns, lines.append, "D(test)", fill, ET.launcher_rates(rates))
         self.assertIn("measure=off ranks=-", lines[0])
-        self.assertIn("Rang 1,2: weder Wachstums-Record noch Geometrie", lines[0])
+        self.assertIn("Rang 0,1,2: weder Wachstums-Record noch Geometrie", lines[0])
         self.assertNotIn("SGLANG_WEG2_EXTEND_RATE_MEASURE", ns.env_d)
 
     def test_the_d_rank_solve_calls_the_fill_inside_the_rate_block(self):
@@ -272,9 +326,10 @@ class NfVoteWouldBindFarAboveTheCardFloor(unittest.TestCase):
     even with TP1/TP2 voting the cap stays in the thousands."""
 
     def test_cap_at_the_lowest_post_of_the_real_boots(self):
-        # lowest card_free_after in the 13:52 abl boot: TP0 1915, TP1 1876, TP2 1738
-        for post, rate, lo in ((1915, 0.5871, 2700), (1876, 0.5249, 2900), (1738, 0.4168, 3100)):
-            self.assertGreaterEqual(ET.rows_cap(post, rate, 64), lo)
+        # lowest card_free_after in the 13:52 abl boot: TP0 1915, TP1 1876, TP2 1738; every rank now
+        # starts at 0.5871 (the record floor)
+        for post, lo in ((1915, 2600), (1876, 2600), (1738, 2400)):
+            self.assertGreaterEqual(ET.rows_cap(post, 0.5871, 64), lo)
 
     def test_the_page_is_the_floor_not_one_row(self):
         self.assertEqual(ET.rows_cap(100.0, 0.5871, 64), 64)  # starved card: one NF page, never 1 row
