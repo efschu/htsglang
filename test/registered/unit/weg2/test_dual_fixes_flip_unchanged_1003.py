@@ -19,6 +19,7 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-690  p_twin_defer rule 6 (gate and release_due)
   Q-691  _dual_resume_held unstarve / bypass count
   Q-692  dual_handback_defer.* / d_seats.admission_gate exemption / front pause requeue
+  Q-693  follower untold waiting abort / PF ACK-ROOM HOLD / PP0 intake stamp / RESUME-OWN-HELD
 """
 from __future__ import annotations
 
@@ -522,3 +523,66 @@ class TestQ692FlipUnchanged:
 
         p = _run(run())
         assert p.intake_stalled is True
+
+
+# ---------------------------------------------------------------------------------- Q-693
+
+_Q693_KV = {"SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS": "196608"}
+
+
+def _q693_wrong_gates():
+    """Every wrong gate WITH the P KV size set: the size alone arms nothing."""
+    return [dict(env, **_Q693_KV) for env in _wrong_gates()]
+
+
+class TestQ693FlipUnchanged:
+    def test_untold_waiting_abort_is_held_as_before(self):
+        from sglang.srt.managers import scheduler as SC
+        from sglang.srt.weg2 import p_row_authority
+
+        for env in _q693_wrong_gates():
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(p_row_authority, "applies", lambda s: True):
+                f = SimpleNamespace(ps=SimpleNamespace(pp_rank=1, pp_size=3), chunked_req=None,
+                                    _weg2_store_told_armed=True, _weg2_store_told={},
+                                    waiting_queue=[SimpleNamespace(rid="weg2-0-152", req_pool_idx=None,
+                                                                   is_retracted=False)])
+                assert SC.Scheduler._weg2_defer_waiting_abort(f, SC.AbortReq(rid="weg2-0-152")) is True, env
+                assert sorted(f._weg2_pending_waiting_aborts) == ["weg2-0-152"], env
+
+    def test_no_room_ack_is_zero_at_once(self):
+        from sglang.srt.managers import weg2_told_fallback as FB
+
+        pred = SimpleNamespace(rid="weg2-0-182", fill_ids=[0] * 86561, origin_input_ids=[0] * 86561)
+        req = SimpleNamespace(rid="weg2-0-183")
+        for env in _q693_wrong_gates():
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(FB, "_loadback_rows", lambda s, r, t: int(t)):
+                tree = SimpleNamespace(token_to_kv_pool_allocator=SimpleNamespace(available_size=lambda: 3735),
+                                       evictable_size=lambda: 0)
+                s = SimpleNamespace(tree_cache=tree, ps=SimpleNamespace(pp_rank=1), waiting_queue=[req],
+                                    mbs=[SimpleNamespace(reqs=[pred])], max_running_requests=1)
+                assert FB._room_own(s, req, "weg2-0-183", 68096) == 0, env
+                assert not hasattr(s, FB._ROOM_HOLD_ATTR), env
+
+    def test_intake_stamp_survives_forget_left_queue(self):
+        for env in _q693_wrong_gates():
+            with mock.patch.dict(os.environ, env):
+                req = SimpleNamespace(rid="weg2-0-152", _dual_grant_untold=None)
+                s = SimpleNamespace(ps=SimpleNamespace(pp_rank=0), _weg2_store_told_armed=True,
+                                    _weg2_store_told={}, _weg2_store_held={"weg2-0-152": req},
+                                    _weg2_told_intake_t={"weg2-0-152": 1.0}, waiting_queue=[])
+                assert "intake_t" not in ST.forget_left_queue(s, req, "abort"), env
+                assert s._weg2_told_intake_t == {"weg2-0-152": 1.0}, env
+
+    def test_flip_front_names_no_own_held_head(self):
+        async def run():
+            f = _front(dual=False)
+            f.dual_kv_ledgers = _metal_ledgers()
+            f.queue = collections.deque([_pending("weg2-0-152", 169, paused=1)])
+            return f, f._dual_resume_held()
+
+        f, held = _run(run())
+        assert held is True
+        assert f.counters.get("dual_resume_own_held", 0) == 0
+        assert getattr(f, "_q693_own_held_rid", None) is None
