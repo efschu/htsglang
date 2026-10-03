@@ -145,7 +145,8 @@ class Wiring(CustomTestCase):
         is unmapped right after); flush_cache(zero_kv=None) keeps the env law."""
         import inspect as _i
         from sglang.srt.managers.scheduler_components import weight_updater as wu
-        self.assertIn("self.flush_cache(zero_kv=False)", _i.getsource(wu))
+        # Q-590: the release flush runs through _weg2_sleep_flush (group verdict)
+        self.assertIn("self.flush_cache(zero_kv=False, sleep_group_verdict=True)", _i.getsource(wu))
         sig = _i.signature(Scheduler.flush_cache)
         self.assertIn("zero_kv", sig.parameters)
         self.assertIsNone(sig.parameters["zero_kv"].default)

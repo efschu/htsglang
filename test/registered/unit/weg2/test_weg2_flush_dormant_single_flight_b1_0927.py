@@ -106,7 +106,8 @@ class TheFlushOnAReleasedGroupIsRefused(unittest.TestCase):
         # the release's flush runs BEFORE the pause and before weg2_dormant is set; the wake's
         # restore flush runs after the resume, before it is cleared -- both call flush_cache directly
         src = inspect.getsource(_wu)
-        i = src.index("self.flush_cache(zero_kv=False)")
+        # Q-590: the release flush runs through _weg2_sleep_flush (group verdict)
+        i = src.index("self.flush_cache(zero_kv=False, sleep_group_verdict=True)")
         self.assertLess(i, src.index("scheduler.weg2_dormant = True", i))
         self.assertLess(i, src.index("self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)", i))
 

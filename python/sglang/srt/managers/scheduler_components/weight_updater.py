@@ -67,9 +67,13 @@ from sglang.srt.managers.weg2_memory_saver import (
 from sglang.srt.managers.weg2_sleep_drain import (
     WEG2_SLEEP_DRAIN_BOUND_S,
     Weg2SleepDrainRefused,
+    Weg2WakeTreeHeld,
     drain_until_group_verdict,
     hold_owned_prefetch,
+    l15_retained_books,
     refusal_message,
+    sleep_flush_until_reset,
+    tree_device_held,
 )
 from sglang.srt.mem_cache.hicache_collective import collective_rank_desc
 from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
@@ -4799,6 +4803,33 @@ class SchedulerWeightUpdaterManager:
                 )
             )
 
+    def _weg2_sleep_flush(self) -> int:
+        """Q-570/Q-590: the release leg's ``flush_cache(zero_kv=False)``, run
+        until no rank's radix tree holds a device value the wake will not keep
+        (``weg2_sleep_drain.sleep_flush_until_reset``). B1 (``WEG2-FLUSH-NONBLOCK
+        quiesced``) hands the tree reset to this flush; NF y8s D TP1 refused it
+        rank-locally (``hicache_backup(2)``, the flush's own #1470 publish) while
+        TP0/TP2 reset -- the refusal was dropped, the pause followed, and the
+        wake's #1455 restore cleared the pools under the kept tree (#924 MAMBA
+        SLOT ALIASING). 27B: the idle verdict is group-reduced
+        (``sleep_group_verdict``: the idle branch posts the L15 SLEEP-AGREE
+        gathers, all ranks or none) and the L15 hold's chains are not counted
+        (``l15_retained_books``). Called on EVERY rank of the group (the held
+        bit, the drain and the verdict are collectives). Returns the retries
+        used; raises W120b before any pause otherwise."""
+        sch = self.scheduler
+        tc = getattr(sch, "tree_cache", None) if sch is not None else None
+        if tc is None:
+            self.flush_cache(zero_kv=False, sleep_group_verdict=True)
+            return 0
+        return sleep_flush_until_reset(
+            flush=lambda: self.flush_cache(zero_kv=False, sleep_group_verdict=True),
+            tree=tc,
+            drain=self._weg2_drain_hicache_before_sleep,
+            retained=lambda: l15_retained_books(sch),
+            log=logger,
+        )
+
     def _weg2_hold_owned_prefetch(self) -> frozenset:
         """H91e: the open prefetch records of the #1443 dormant hold (empty
         while the group is awake) -- see ``weg2_sleep_drain.hold_owned_prefetch``."""
@@ -7990,6 +8021,24 @@ class SchedulerWeightUpdaterManager:
             # restore, byte-identical.
             if _l15_master_on:
                 _l15_drop_retained_tree(sched, _l15_rank)
+            # Q-570/Q-590 tripwire (no-hold branch only; the hold-aware branch
+            # above keeps the held chains by design): clearing the pools under
+            # a tree that still references device slots puts every one of them
+            # on BOTH credit sides (NF y8s TP1: free_and_cached=22, #924 MAMBA
+            # SLOT ALIASING at the first idle pass). A retained L15 tree was
+            # dropped just above; the sleep leg guarantees the rest
+            # (_weg2_sleep_flush) -- a tree that still holds one here is
+            # refused by name, before any clear.
+            _held_full, _held_mamba = tree_device_held(getattr(sched, "tree_cache", None))
+            if _held_full or _held_mamba:
+                raise Weg2WakeTreeHeld(
+                    f"W26b Weg2WakeTreeHeld: the radix tree kept across the sleep still "
+                    f"holds device values (full={_held_full} mamba={_held_mamba}) and no "
+                    f"L15 hold keeps them on this rank; the #1455 restore would clear "
+                    f"req_to_token/mamba/allocator under them (#924 MAMBA SLOT ALIASING). "
+                    f"The sleep flush of this rank did not reset its tree -- nothing was "
+                    f"cleared."
+                )
             sched.req_to_token_pool.clear()
             sched.token_to_kv_pool_allocator.clear()
             try:
@@ -8006,6 +8055,8 @@ class SchedulerWeightUpdaterManager:
                 self._l15_clear_tms_keep_spans(sched)
             logger.info("WEG2-WAKE-RESTORE pools cleared, radix tree KEPT (#1455: the hold's prefetch survives the wake)")
             return True
+        except Weg2WakeTreeHeld:
+            raise  # W26b by name: nothing was cleared, no fallback hides it
         except Exception as exc:  # noqa: BLE001 -- fall back to the full flush, never leave pools undefined
             logger.warning("WEG2-WAKE-RESTORE failed (%s: %s) -> full flush_cache", type(exc).__name__, exc)
             return bool(self.flush_cache())
@@ -10073,7 +10124,11 @@ class SchedulerWeightUpdaterManager:
                 self.scheduler._l15_sleep_flip = _weg2_flip_index_of(
                     getattr(recv_req, "epoch", None))
             _kvsub.mark("pre")
-            self.flush_cache(zero_kv=False)
+            # Q-570/Q-590 (NF y8s TP1 09:53:43): the flush's verdict was
+            # rank-local and its refusal was dropped here -- TP1 paused with
+            # device values in its tree while TP0/TP2 had reset. No rank pauses
+            # with one beyond its L15 hold (group-reduced, every rank retries).
+            self._weg2_sleep_flush()
             _kvsub.mark("flush")
             # AH (--p-attn-head-split): the helper mirror lives in this region;
             # reset the split rule and drain the helper before it is unmapped,

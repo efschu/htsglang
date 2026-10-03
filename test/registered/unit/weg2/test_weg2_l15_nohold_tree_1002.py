@@ -60,11 +60,19 @@ def test_a_rank_that_retained_but_keeps_nothing_drops_its_chains(monkeypatch):
 
 def test_without_the_flag_the_tree_survives_the_restore_as_before(monkeypatch):
     """The #1455 restore keeps the tree on every rank that did not retain --
-    and on this fixture that is exactly the aliasing the flag prevents."""
+    and on this fixture that WAS exactly the aliasing the flag prevents
+    (free_and_cached: the N4a death condition). Q-590: a no-hold restore under
+    a tree that still holds device values now refuses by name (W26b) before
+    any clear, so the anchor is never free AND cached."""
+    import pytest
+
+    from sglang.srt.managers.weg2_sleep_drain import Weg2WakeTreeHeld
+
     _m, fx = _fx()
-    _wake(fx, False, monkeypatch)
+    with pytest.raises(Weg2WakeTreeHeld, match="W26b"):
+        _wake(fx, False, monkeypatch)
     _dup, _ids, shared = IC._mamba_double_claimed(fx.pool.mamba_allocator, fx.cache)
-    assert shared > 0      # free_and_cached: the N4a death condition
+    assert shared == 0     # nothing was cleared under the kept tree
 
 
 def test_the_sleep_sets_the_flag_exactly_when_the_round_armed():

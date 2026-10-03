@@ -20313,8 +20313,17 @@ class Scheduler(
         empty_cache: bool = True,
         zero_kv: Optional[bool] = None,
         tp_group_verdict: bool = False,
+        sleep_group_verdict: bool = False,
     ):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache.
+        ``sleep_group_verdict``: Q-590 -- the Weg-2 release leg's flush (every
+        rank of the group runs it in the same pass, behind the group drain)
+        reduces its idle verdict over the HiCache group exactly as
+        ``tp_group_verdict`` does, but WITHOUT B1's quiesce answer or its
+        non-blocking sweep: the sleep flush resets or refuses on all ranks
+        alike. NF y8s TP1 refused rank-locally while its peers reset; on 27B D
+        the peers' idle branch posts the L15 SLEEP-AGREE gathers, which a
+        refusing rank never joins.
         ``tp_group_verdict``: fnFL2x105 -- the caller guarantees every TP rank
         runs this flush in the same pass (the immediate /flush_cache RPC), so
         the idle verdict is reduced over the HiCache group instead of read
@@ -20419,7 +20428,7 @@ class Scheduler(
                     "before its reset" if _b1_nowait else "")
         _fsub.mark("sweep")
         group_idle, verdict_detail = self.group_idle_verdict(
-            tp_group_verdict=tp_group_verdict
+            tp_group_verdict=tp_group_verdict or sleep_group_verdict
         )
         _fsub.mark("verdict")
         # B1 (weg2_flush_nonblock part 2): a quiesce whose only blockers are
@@ -21021,6 +21030,17 @@ class Scheduler(
             # keep the hold HERE (the plain restore clears the pools but keeps
             # the tree -- the held anchors would be free AND cached).
             self._l15_tree_retained = _l15_res is not None
+            # Q-590: the hold's books in this tree, recorded right here where
+            # the tree is EXACTLY the held chains (reset_keep, or the reused
+            # round whose state token is unchanged) -- the sleep guard counts
+            # only what the tree holds beyond them (weg2_sleep_drain).
+            from sglang.srt.managers.weg2_sleep_drain import (
+                tree_device_held as _q590_held,
+            )
+
+            self._l15_tree_retained_books = (
+                _q590_held(self.tree_cache) if _l15_res is not None else (0, 0)
+            )
             if len(_l15_tt) > 1:
                 logger.info(
                     "L15-SLEEP-TIMING rank=%d held=%s reuse=%s total_ms=%.0f "
