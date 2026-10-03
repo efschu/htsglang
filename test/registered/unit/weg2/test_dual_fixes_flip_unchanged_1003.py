@@ -18,6 +18,7 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-680  flush_acks_when_idle / front RESUME-STALE (the audit made the front gate explicit)
   Q-690  p_twin_defer rule 6 (gate and release_due)
   Q-691  _dual_resume_held unstarve / bypass count
+  Q-692  dual_handback_defer.* / d_seats.admission_gate exemption / front pause requeue
 """
 from __future__ import annotations
 
@@ -480,3 +481,44 @@ class TestQ690FlipUnchanged:
         out, st = self._release(dual=True)
         assert [r.rid for r, twin in out] == ["weg2-0-45"] and out[0][1] is False
         assert st.n_source_gone == 1
+
+
+# ---------------------------------------------------------------------------------- Q-692
+
+class TestQ692FlipUnchanged:
+    def test_handback_defer_helpers_are_inert_outside_dual_d(self):
+        from sglang.srt.weg2 import dual_handback_defer as HBD
+
+        req = SimpleNamespace(rid="weg2-0-373", output_ids=[1] * 25, _weg2_x_deferring=False)
+        for env in [{}, {"SGLANG_WEG2_GROUP": "D"}, {"SGLANG_WEG2_DUAL_LAYOUT": "1"},
+                    {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"}]:
+            assert HBD.armed(env) is False, env
+            assert HBD.d_own_tail(req, env) == 0
+            assert HBD.d_owned(req, env) is False
+            assert HBD.defer_exempt(req, env) is False
+            assert HBD.begin(req, 26, env=env) is False
+            HBD.note_x_defer(req, True, env)
+        assert req._weg2_x_deferring is False, "the flip form recorded an X-DEFER verdict"
+        assert not hasattr(req, "_weg2_hb_d_own_said")
+        denv = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D"}
+        assert HBD.d_own_tail(req, denv) == 26 and HBD.d_owned(req, denv) is True   # control
+
+    def test_admission_gate_exempts_nobody_in_the_flip_form(self):
+        from sglang.srt.weg2 import d_seats
+
+        parked = [SimpleNamespace(rid="p1", _weg2_x_deferring=True)]
+        assert d_seats._dual_defer_exempt(parked) == frozenset()
+        gate = d_seats.AdmissionGate()
+        assert gate.defer_exempt == frozenset() and gate.newcomers_free is False
+
+    def test_pause_requeue_keeps_intake_stalled_in_the_flip_form(self):
+        async def run():
+            f = _front(dual=False)
+            p = _pending("weg2-0-321", 1000)
+            p.intake_stalled = True
+            p.dual_pause = True
+            f._dual_requeue_paused(p)
+            return p
+
+        p = _run(run())
+        assert p.intake_stalled is True
