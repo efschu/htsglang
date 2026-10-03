@@ -136,12 +136,19 @@ class LauncherWiring(Base):
 
     def test_hw_count_refused_without_force_passes_with_force(self):
         two = rig()[:2]
+        # since HW-P1a the count is judged by topology_check_line (order_cards only refuses an explicit expect_count)
         with self.assertRaises(L.Weg2LaunchRefused) as cm:
-            L.order_cards(two)
+            L.order_cards(two, expect_count=3)
+        self.assertIn("HW-COUNT", str(cm.exception))
+        with self.assertRaises(L.Weg2LaunchRefused) as cm:
+            L.topology_check_line(ns_for(), L.order_cards(two), {})
         self.assertIn("HW-COUNT", str(cm.exception))
         R.arm(True)
-        ordered = L.order_cards(two)
+        ordered = L.order_cards(two, expect_count=3)
         self.assertEqual(len(ordered), 2)
+        self.assertEqual(R.forced_list()[0]["code"], "HW-COUNT")
+        R.arm(True)                                   # a fresh list for the topology line
+        L.topology_check_line(ns_for(), L.order_cards(two), {})
         self.assertEqual(CI.class_label(ordered[0]), "RTX5090")
         self.assertEqual([x["code"] for x in R.forced_list()], ["HW-COUNT"])
 
@@ -166,7 +173,7 @@ class LauncherWiring(Base):
     def test_arch_gate_is_not_lifted_by_force(self):
         R.arm(True)
         with self.assertRaises(CI.CardInventoryRefused):
-            CI.arch_gate([card(0, "NVIDIA GeForce RTX 4090", 24564, (8, 9))])
+            CI.arch_gate([card(0, "NVIDIA H100 80GB HBM3", 81559, (9, 0))])   # sm89 is supported since HW-P0
 
 
 class NoRecords(Base):

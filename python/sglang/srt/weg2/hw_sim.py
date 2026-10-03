@@ -131,6 +131,9 @@ class SimModel:
     #: know it (NF: no ``--dual-share``, dual fixes never go to NF) does not
     #: carry the model (:func:`available_models`)
     needs_flag: str = ""
+    #: KV heads of the model's full-attention layers where D = TP{N} replicates
+    #: the KV beyond them (27B: 4, plan 3.1); 0 = not modelled
+    kv_heads: int = 0
 
 
 #: 27B attention geometry (plan 3.1): 24 Q heads, 4 KV heads.
@@ -149,18 +152,21 @@ MODELS: Dict[str, SimModel] = {m.key: m for m in (
     SimModel("27B-INT8", "qwen27b", "int8", 27648,
              _27B_BASE + ("--env-d", "SGLANG_WEG2_EXTEND_TRIM_MIB=1200,0,0"),
              {"SGLANG_WEG2_L15": "1", "SGLANG_WEG2_L15_MIB": "c1=7616,c2=1792"},
-             "27b.env (27b-base.env, :50 extend trim, :117/:133 L15 c1=7616,c2=1792); ckpt 27 G (plan 3.1, S)"),
-    SimModel("27B-FP8", "qwen27b", "fp8", 25422, _27B_BASE, {}, "27b-fp8.env; du 25422 MiB"),
+             "27b.env (27b-base.env, :50 extend trim, :117/:133 L15 c1=7616,c2=1792); ckpt 27 G (plan 3.1, S)",
+             kv_heads=QWEN27B_KV_HEADS),
+    SimModel("27B-FP8", "qwen27b", "fp8", 25422, _27B_BASE, {}, "27b-fp8.env; du 25422 MiB",
+             kv_heads=QWEN27B_KV_HEADS),
     SimModel("27B-NVFP4", "qwen27b", "nvfp4", 18753,
              _27B_BASE + ("--pp-stage-ratio", "49,8,7", "--pp-attn-stage-ratio", "12,2,2"), {},
-             "27b-nvfp4.env:79; du 18753 MiB"),
+             "27b-nvfp4.env:79; du 18753 MiB", kv_heads=QWEN27B_KV_HEADS),
     SimModel("27B-GGUF", "qwen27b", "gguf", 13593,
              _27B_BASE + ("--pp-stage-ratio", "42,11,11", "--pp-attn-stage-ratio", "10,3,3"), {},
-             "27b-gguf.env:49 (IQ4_XS); du 13593 MiB"),
+             "27b-gguf.env:49 (IQ4_XS); du 13593 MiB", kv_heads=QWEN27B_KV_HEADS),
     SimModel("27B-NVFP4-DUAL", "qwen27b", "nvfp4", 18753,
              _27B_BASE + ("--dual-share", "--pp-stage-ratio", "45,10,9", "--pp-attn-stage-ratio", "11,2,3",
                           "--extra-p=--max-running-requests=1 --rank-gpu-memory-mib 8740,3000,3500"),
-             {}, "27b-nvfp4-dual.env:81/90; du 18753 MiB", needs_flag="--dual-share"),
+             {}, "27b-nvfp4-dual.env:81/90; du 18753 MiB", needs_flag="--dual-share",
+             kv_heads=QWEN27B_KV_HEADS),
     SimModel("NF", "nextflash", "int4-mixed", None,
              ("--weg2-weight-source", "exchange",
               "--pp-stage-ratio", "29,11,8", "--pp-attn-stage-ratio", "7,3,2",
@@ -363,8 +369,8 @@ def _kernel_notes(model: SimModel, cards: Sequence) -> List[str]:
         elif path not in ("default", "native"):
             notes.append(f"sm{cc[0]}{cc[1]}: {model.weight_format} kernel path '{path}'")
     n = len(cards)
-    if model.profile == "qwen27b" and n > QWEN27B_KV_HEADS:
-        notes.append(f"D = TP{n} > {QWEN27B_KV_HEADS} KV heads: replicated KV / uneven DCP "
+    if model.kv_heads and n > model.kv_heads:
+        notes.append(f"D = TP{n} > {model.kv_heads} KV heads: replicated KV / uneven DCP "
                      "(KV capacity cost, plan 3.1, S)")
     return notes
 

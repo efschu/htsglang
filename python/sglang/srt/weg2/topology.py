@@ -131,7 +131,10 @@ def _b_single(n: int, ctx: TopologyContext) -> List[Blocker]:
         out.append(Blocker("DUAL-1", "launcher resolve_dual_layout",
                            "dual on one card = two engines with the same weights under MPS, i.e. "
                            "chunked prefill in one engine with two contexts; not a mode"))
-    if str(ctx.profile) == "nextflash":
+    from sglang.srt.weg2 import form as _form
+
+    _row = _form.profile_row(ctx.profile)
+    if _row is not None and _row.experts.store == "offload":   # the host-store (Form A) rows: NF
         out.append(Blocker("FORM-A-1", "managers/rank_role.py Form A >= 2 ranks",
                            "NF Form A needs a host and at least one worker; a one-card NF needs "
                            "expert offload from the host store (plan P4)"))
@@ -189,7 +192,10 @@ def _b_dual_front(n: int, ctx: TopologyContext) -> List[Blocker]:
 def _b_pp_cut_floor(n: int, ctx: TopologyContext) -> List[Blocker]:
     if n < MIN_CARDS:
         return []   # no flip groups on one card (SINGLE-MODE names it)
-    if str(ctx.profile) != "qwen27b":
+    from sglang.srt.weg2 import form as _form
+
+    _row = _form.profile_row(ctx.profile)
+    if _row is None or _row.arch != "dense":   # the dense row's pool floor only (27B); a registry fact, not a name
         return []
     from sglang.srt.weg2 import DEFAULT_PP_ORDERED_CUT
 
