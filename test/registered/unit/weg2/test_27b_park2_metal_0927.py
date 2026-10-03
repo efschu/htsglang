@@ -223,3 +223,13 @@ def test_without_the_immediate_park_a_zero_answer_waits_as_before_pk2(clean, pro
     sched = types.SimpleNamespace(server_args=types.SimpleNamespace(tp_prefill_max_tokens=12288))
     assert S._weg2_store_tail_settles(sched, _tail_req(418, True, None)) is False
     assert S._weg2_store_tail_settles(sched, _tail_req(4316, True, 4095)) is True
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")

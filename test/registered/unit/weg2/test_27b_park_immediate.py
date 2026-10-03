@@ -695,3 +695,13 @@ def test_the_launcher_main_runs_the_refusal_before_anything_spawns():
     i_ref = src.index("_park_split = d_park_split_refusal(ns)")
     i_sf = src.index("_sf_on, _sf_src = standard_form_resolved(ns)")
     assert i_ref < i_sf
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")

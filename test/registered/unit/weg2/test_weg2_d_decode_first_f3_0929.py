@@ -185,3 +185,13 @@ def test_switch_off_is_the_park_first_gate(monkeypatch):
     assert gate.skip(p, admitted=[]) is None
     assert gate.skip(h1, admitted=[]) == "weg2_d_park_first"
     assert not getattr(gate, "deferred", frozenset())
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")
