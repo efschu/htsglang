@@ -17,8 +17,10 @@ Two halves:
    L1.5 posts, the PP-COST stage-model choice and the planner presets.
 
 2. SYNTHETIC INVENTORIES. 3x RTX 3090, 3x RTX 5090, 2x RTX 5090 + RTX 3080,
-   RTX PRO 6000 Blackwell + 2x RTX A6000, a stock 10 GB RTX 3080, and a mix
-   with an sm_89 card: each reaches a coherent order and then either the
+   RTX PRO 6000 Blackwell + 2x RTX A6000, a stock 10 GB RTX 3080, and sm_89
+   sets (pure RTX 4090, and a 5090/3080/4090 mix -- SM89-DURCHSPIEL-1002:
+   8.9 passes the arch gate and lands on the named HW-UNCALIBRATED path,
+   not on HW-ARCH): each reaches a coherent order and then either the
    named HW-UNCALIBRATED path (positional measurements of the reference rig
    are never borrowed) or the named HW-ARCH / HW-COUNT refusal -- never a
    KeyError, never a silent 3080/5090 number.
@@ -66,6 +68,11 @@ SYNTHETIC = {
     "5090+2x3080-10GB": [card(0, "NVIDIA GeForce RTX 3080", 10240, (8, 6)),
                          card(1, "NVIDIA GeForce RTX 5090", 32607, (12, 0)),
                          card(2, "NVIDIA GeForce RTX 3080", 10240, (8, 6))],
+    # SM89-DURCHSPIEL-1002: Ada is arch-accepted and uncalibrated, pure and mixed.
+    "3x4090": [card(i, "NVIDIA GeForce RTX 4090", 24564, (8, 9)) for i in range(3)],
+    "5090+3080+4090": [card(0, "NVIDIA GeForce RTX 3080", 20480, (8, 6)),
+                       card(1, "NVIDIA GeForce RTX 5090", 32607, (12, 0)),
+                       card(2, "NVIDIA GeForce RTX 4090", 24564, (8, 9))],
 }
 
 
@@ -119,6 +126,8 @@ class SyntheticInventories(unittest.TestCase):
             "2x5090+3080": [1, 2, 0],
             "pro6000+2xa6000": [1, 0, 2],
             "5090+2x3080-10GB": [1, 0, 2],
+            "3x4090": [0, 1, 2],
+            "5090+3080+4090": [1, 2, 0],
         }
         for name, cards in SYNTHETIC.items():
             self.assertEqual([c.nvml_index for c in L.order_cards(list(cards))], want[name], name)
@@ -163,7 +172,7 @@ class SyntheticInventories(unittest.TestCase):
         self.assertIn("vectors: --profile-inventory", line)
 
     def test_w19_residue_is_never_borrowed(self):
-        for name in ("3x3090", "3x5090", "pro6000+2xa6000", "5090+2x3080-10GB"):
+        for name in ("3x3090", "3x5090", "pro6000+2xa6000", "5090+2x3080-10GB", "3x4090"):
             o = L.order_cards(list(SYNTHETIC[name]))
             for c in o:
                 cls = CI.calibration_class(c)
@@ -249,16 +258,37 @@ class ArchAndCountGates(unittest.TestCase):
         self.assertEqual([c.nvml_index for c in o], [1, 0, 2])
         self.assertEqual([c.cc for c in o], [(12, 0), (8, 6), (8, 6)])
 
-    def test_an_sm89_card_in_the_mix_is_refused_by_name(self):
+    def test_an_sm89_card_in_the_mix_passes_the_gate_and_names_uncalibrated(self):
+        """SM89-DURCHSPIEL-1002: 8.9 passes the arch gate (the wheel's sm_86
+        cubins run on sm_89 by binary compatibility; the CUTLASS-Sm89 FP8
+        stub is avoided by the FP8-Marlin fallback at the dispatch, not by
+        a refusal here) and the plan stops at the NAMED HW-UNCALIBRATED path
+        with the calibration route -- never HW-ARCH, never a KeyError."""
         self._replay([self._row(0, "NVIDIA GeForce RTX 3080", 20480, (8, 6)),
                       self._row(1, "NVIDIA GeForce RTX 5090", 32607, (12, 0)),
                       self._row(2, "NVIDIA GeForce RTX 4090", 24564, (8, 9))])
+        o = L.order_cards(L.resolve_cards())
+        self.assertEqual([c.nvml_index for c in o], [1, 2, 0])
         with self.assertRaises(L.Weg2LaunchRefused) as cm:
-            L.resolve_cards()
+            L.inventory_check_line(ns_for("qwen27b", "--pp-stage-ratio", "43,11,10"), o)
         msg = str(cm.exception)
-        self.assertTrue(msg.startswith("HW-ARCH"), msg)
-        self.assertIn("nvml2 'NVIDIA GeForce RTX 4090': compute capability 8.9 (sm89)", msg)
-        self.assertNotIn("nvml0", msg)
+        self.assertTrue(msg.startswith(CI.CODE_UNCALIBRATED), msg)
+        self.assertIn("RTX4090/24564MiB/sm89", msg)
+        self.assertIn("card_rate_pass --run", msg)
+        self.assertIn("--pp-stage-ratio", msg)
+        self.assertNotIn("HW-ARCH", msg)
+
+    def test_a_pure_sm89_inventory_reaches_uncalibrated(self):
+        self._replay([self._row(i, "NVIDIA GeForce RTX 4090", 24564, (8, 9))
+                      for i in range(3)])
+        o = L.order_cards(L.resolve_cards())
+        self.assertEqual([c.nvml_index for c in o], [0, 1, 2])
+        with self.assertRaises(L.Weg2LaunchRefused) as cm:
+            L.inventory_check_line(ns_for("nextflash", "--d-nontorch-mib", "1981,528,524"), o)
+        msg = str(cm.exception)
+        self.assertTrue(msg.startswith(CI.CODE_UNCALIBRATED), msg)
+        self.assertIn("RTX4090/24564MiB/sm89 vs calibrated RTX5090", msg)
+        self.assertNotIn("HW-ARCH", msg)
 
     def test_an_unreported_cc_is_refused_not_guessed(self):
         self._replay([self._row(0, "NVIDIA GeForce RTX 3080", 20480, None),
