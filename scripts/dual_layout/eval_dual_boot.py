@@ -64,10 +64,44 @@ def _grep(path, pats, limit=6):
 # 1.4 s / p99 19 s), which made the old 1-s buckets report "5 s with BOTH" for
 # ~55 s of real overlap. P activity: per rank, the chunk window
 # [WEG2-VRAM-PEAK t_unix_ms - 'Prefill rank batch' gpu-ms, t_unix_ms] (paired by
-# order); without those lines, the old PP0 'Prefill batch' log seconds.
+# TIME, see pair_peaks_with_batches: a peak without a batch line is dropped and
+# counted, never shifts the later pairs as zip() did); without those lines, the old PP0 'Prefill batch' log seconds.
 _VP = re.compile(r"PP(\d)\] WEG2-VRAM-PEAK rank=\d+ phase=chunk rows=(\d+) .*?t_unix_ms=(\d+)")
 _RB = re.compile(r"PP(\d)\] Prefill rank batch, #new-token: (\d+), .*gpu-ms: ([\d.]+)")
 _DR = re.compile(r"TP0\] Decode rank batch, rank: 0, #round: \d+, t: ([\d.]+), .*gpu-ms: ([\d.]+)")
+
+
+#: A 'Prefill rank batch' line is stamped to the whole second and follows its
+#: chunk's WEG2-VRAM-PEAK line by milliseconds; further back than this it is a
+#: different chunk's line (ITEM 200, 03.10.).
+MAX_PAIR_GAP_S = 10.0
+
+
+def pair_peaks_with_batches(peaks, batches, max_gap=MAX_PAIR_GAP_S):
+    """Pair VRAM-PEAK chunk ends with 'Prefill rank batch' lines BY TIME.
+
+    ``peaks``: chunk end times (epoch s). ``batches``: (log stamp epoch s,
+    gpu-ms). For each peak, in time order, take the LAST not-yet-used batch whose
+    stamp is <= the peak end and at most ``max_gap`` s before it. A peak with no
+    such batch is dropped (the old zip() paired the n-th peak with the n-th
+    batch, so ONE missing line shifted every later pair by a whole chunk).
+    Returns (list of (end, gpu_ms), n_dropped_peaks)."""
+    import bisect
+
+    bs = sorted(range(len(batches)), key=lambda i: (batches[i][0], i))
+    stamps = [batches[i][0] for i in bs]
+    used = [False] * len(bs)
+    out, dropped = [], 0
+    for end in sorted(peaks):
+        k = bisect.bisect_right(stamps, end) - 1
+        while k >= 0 and used[k]:
+            k -= 1
+        if k < 0 or end - stamps[k] > max_gap:
+            dropped += 1
+            continue
+        used[k] = True
+        out.append((end, batches[bs[k]][1]))
+    return out, dropped
 
 
 def _union(iv):
@@ -102,7 +136,9 @@ def overlap(p_path, d_path):
                     continue
                 m = _RB.search(line)
                 if m:
-                    rb[int(m.group(1))].append((int(m.group(2)), float(m.group(3))))
+                    st = _sec(line)
+                    if st is not None:
+                        rb[int(m.group(1))].append((float(st), float(m.group(3))))
                     continue
                 if "PP0] Prefill batch" in line:
                     s = _sec(line)
@@ -110,9 +146,12 @@ def overlap(p_path, d_path):
                     if s is not None and t:
                         batch_sec.add(s)
                         tokens += int(t.group(1))
-    p_iv = []
+    p_iv, dropped_peaks, paired_peaks = [], 0, 0
     for r in vp:
-        for (end, (_, g)) in zip(vp[r], rb.get(r, [])):
+        pairs, dr = pair_peaks_with_batches(vp[r], rb.get(r, []))
+        dropped_peaks += dr
+        paired_peaks += len(pairs)
+        for end, g in pairs:
             p_iv.append((end - g / 1000.0, end))
     if p_iv:
         p_source = "chunk-windows"
@@ -139,7 +178,8 @@ def overlap(p_path, d_path):
             idle.append(g)
     return {"p_source": p_source, "d_source": "t-field", "p_tokens": tokens,
             "p_s": sum(b - a for a, b in merged), "d_s": sum(b - a for a, b in d_merged),
-            "both_s": both, "during": during, "idle": idle}
+            "both_s": both, "during": during, "idle": idle,
+            "peaks_paired": paired_peaks, "peaks_dropped": dropped_peaks}
 
 
 def main():
@@ -182,6 +222,9 @@ def main():
     o = overlap(fs["P"], fs["D"])
     print(f"\n== overlap (P: {o['p_source']}, D: {o['d_source']}): {o['p_s']:.0f} s with P prefill "
           f"({o['p_tokens']} tokens), {o['d_s']:.0f} s with D decode, {o['both_s']:.0f} s with BOTH")
+    if o["p_source"] == "chunk-windows":
+        print(f"   chunk windows: {o['peaks_paired']} VRAM-PEAK ends paired with a 'Prefill rank batch' line by time, "
+              f"{o['peaks_dropped']} unmatched peaks dropped")
     for name, vals in (("D round gpu-ms while P prefills", o["during"]), ("D round gpu-ms, P idle (+-1 s)", o["idle"])):
         if vals:
             vals = sorted(vals)

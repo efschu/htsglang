@@ -17,9 +17,12 @@ variables are set.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 DUTY_ENV = "SGLANG_WEG2_DUAL_P_DUTY"
 DBUSY_FILE_ENV = "SGLANG_WEG2_DUAL_DBUSY_FILE"
@@ -124,6 +127,13 @@ GANG_ENV = "SGLANG_WEG2_DUAL_P_GANG_CHUNKS"
 GANG_POLL_S = 0.002
 GANG_MAX_DRAIN_S = 2.0
 GANG_MAX_HOLD_S = 2.5
+# ITEM 200 (03.10.): the cap above bounds how long D is alone, so a burst whose
+# hold burst*(1-duty)/duty exceeds it gave D LESS exclusive time than the duty
+# promises (duty 0.25, burst 2.0 s: hold 6.0 -> 2.5 s, D alone 2.5/4.5 = 55.6 %
+# instead of 75 %). The cap is NOT raised and nothing is reserved: the NEXT
+# burst is bounded to k_eff chunks so burst_wall*(1-duty)/duty <= the cap
+# (GangGate._bound_next_burst).
+GANG_LOG_EVERY = 50
 
 
 def gang_done_path(busy_path: str) -> str:
@@ -205,6 +215,37 @@ class GangGate(DutyThrottle):
         self.rebased = 0
         self.blind = False
         self._last_timeout_done: Optional[int] = -1
+        self.k_eff = self.chunks  # chunks the NEXT burst may launch (<= chunks)
+        self.capped_bursts = 0  # bursts whose uncapped hold exceeded GANG_MAX_HOLD_S
+        self.bounded_bursts = 0  # bursts that ran with k_eff < chunks
+        self.burst_wall_s = 0.0  # sum of burst walls (chunk 1 launched .. pipeline drained)
+        self.last_burst_wall = 0.0
+        self.last_hold = 0.0
+
+    def burst_wall_budget_s(self) -> float:
+        """Longest burst whose full hold fits under the (unchanged) hold cap."""
+        return GANG_MAX_HOLD_S * self.duty / (1.0 - self.duty)
+
+    def _bound_next_burst(self, burst_wall: float, n: int, drain_timed_out: bool,
+                          drain_waited: bool) -> None:
+        """Size the next burst from this one's per-chunk wall so that its hold
+        needs no capping. Shrinks always; GROWS back toward ``chunks`` only on
+        a burst whose drain really waited for the pipeline: a drain that was
+        satisfied at once (stale count after a re-base) or that timed out
+        (a tail longer than GANG_MAX_DRAIN_S -- exactly the starving case --
+        only measured a LOWER bound) says nothing about how fast chunks are."""
+        if n < 1:
+            return
+        per = burst_wall / n
+        fit = self.chunks if per <= 0.0 else int(self.burst_wall_budget_s() / per)
+        new = max(1, min(self.chunks, fit))
+        if drain_timed_out or not drain_waited:
+            new = min(new, self.k_eff)
+        if new != self.k_eff:
+            logger.info("DUAL-TP3PP3 P gang bound: k_eff %d -> %d (chunks=%d burst_wall=%.3fs n=%d "
+                        "per_chunk=%.3fs budget=%.3fs duty=%.2f)", self.k_eff, new, self.chunks,
+                        burst_wall, n, per, self.burst_wall_budget_s(), self.duty)
+        self.k_eff = new
 
     @classmethod
     def from_env(cls, env=None) -> Optional["GangGate"]:
@@ -237,10 +278,11 @@ class GangGate(DutyThrottle):
             self._burst_n = 0
             self._launch()
             return 0.0
-        if self._burst_n < self.chunks:
+        if self._burst_n < self.k_eff:
             self._launch()
             return 0.0
         t0 = self._clock()
+        rebased0 = self.rebased
         while not self.blind and not self._drained():
             if self._clock() - t0 >= GANG_MAX_DRAIN_S:
                 d = self.read_done()
@@ -256,8 +298,15 @@ class GangGate(DutyThrottle):
             self._sleep(GANG_POLL_S)
         t1 = self._clock()
         self.drain_s += t1 - t0
+        drain_waited = t1 - t0 > 0.0
         burst_wall = max(0.0, t1 - self._burst_t0)
-        hold = min(GANG_MAX_HOLD_S, burst_wall * (1.0 - self.duty) / self.duty)
+        want = burst_wall * (1.0 - self.duty) / self.duty
+        hold = min(GANG_MAX_HOLD_S, want)
+        n_burst = self._burst_n
+        if want > GANG_MAX_HOLD_S:
+            self.capped_bursts += 1
+        if self.k_eff < self.chunks:
+            self.bounded_bursts += 1
         while self.d_busy():
             left = hold - (self._clock() - t1)
             if left <= 1e-4:
@@ -266,6 +315,15 @@ class GangGate(DutyThrottle):
         t2 = self._clock()
         self.held_s += t2 - t1
         self.bursts += 1
+        self.burst_wall_s += burst_wall
+        self.last_burst_wall, self.last_hold = burst_wall, t2 - t1
+        self._bound_next_burst(burst_wall, n_burst, self.rebased != rebased0, drain_waited)
+        if self.bursts <= 5 or self.bursts % GANG_LOG_EVERY == 0:
+            logger.info("DUAL-TP3PP3 P gang burst #%d: n=%d k_eff=%d burst_wall=%.3fs hold=%.3fs "
+                        "(wanted %.3fs, cap %.1fs) d_alone_share=%.3f duty_target=%.3f capped=%d bounded=%d",
+                        self.bursts, n_burst, self.k_eff, burst_wall, t2 - t1, want, GANG_MAX_HOLD_S,
+                        (t2 - t1) / max(1e-9, burst_wall + (t2 - t1)), 1.0 - self.duty,
+                        self.capped_bursts, self.bounded_bursts)
         self.throttled += 1
         self.slept_s += t2 - t0
         self._burst_n = 0
