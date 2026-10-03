@@ -937,10 +937,16 @@ class MambaComponent(TreeComponent):
                 host_lru.remove_node(node)
 
         # After device tombstone: if only host_value remains, insert into host LRU
+        # Y8P-HOSTLOCK-LRU (NF y8p D TP1/TP2 03.10. 08:57:45, node 266: "mamba host-locked node(s)
+        # on the host LRU" killed both ranks at the idle sanity walk right after a D park): a
+        # host-locked node (#1417 prefetch pin) is OFF the host LRU by design -- the last host
+        # unlock (`release_component_lock(lock_host=True)`) files it. Device eviction of such a
+        # node must not file it here.
         if (
             target is EvictLayer.DEVICE
             and cd.value is None
             and cd.host_value is not None
+            and cd.host_lock_ref == 0
         ):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)

@@ -11693,7 +11693,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if (
             host_lru is not None
             and cd.host_value is not None
-            and not host_lru.in_list(node)
+            and cd.host_lock_ref == 0   # Y8P-HOSTLOCK-LRU: a host-locked node stays OFF the host LRU;
+            and not host_lru.in_list(node)   # the last host unlock files it (release_component_lock)
         ):
             host_lru.insert_mru(node)
 
