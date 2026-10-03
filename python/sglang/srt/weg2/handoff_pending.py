@@ -314,6 +314,17 @@ def _tombstone(rid: str) -> None:
         pass
 
 
+def ended(rid: str) -> bool:
+    """Q-610: the front ENDED rid (its terminal rid-end drop left the
+    tombstone) -- the rid will not be read by D any more. Never raises; in
+    doubt False (pruned after the expire bound, like the tombstone itself)."""
+    try:
+        p = _ended_path(str(rid))
+        return bool(p) and os.path.exists(p)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def drop(rid: str, reason: str = "front") -> bool:
     """FRONT SEAM: rid ended where D never took it (served via P, aborted,
     disconnected, re-routed fresh). Never raises.

@@ -208,6 +208,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.weg2 import mamba_arena_displace as _mad
+from sglang.srt.weg2 import dual_anchor_release as _dar  # Q-610
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -5291,6 +5292,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node._weg2_flush_spilled = True
                 if self._weg2_flush_spill_room(node, mp):
                     mrows = mp.alloc_write([last_hash])
+            if mrows is None:
+                mrows = self._weg2_dual_claim_retry(node, mp, last_hash)   # Q-610
             return mrows
         st = self._weg2_anchor_ledger.of(rid)
         path, depth = _mad.ancestor_path(target=node, root=self.root_node)
@@ -5308,7 +5311,131 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._weg2_release_anchor(victim, mp, st, why="full", for_rid=rid)
                 owned = [a for a in owned if a is not victim]
                 mrows = mp.alloc_write([last_hash])
+        if mrows is None:
+            mrows = self._weg2_dual_claim_retry(node, mp, last_hash)   # Q-610
         self._weg2_note_anchor_claim(node, rid, st, ok=mrows is not None, held=len(owned), depth=depth, cap=cap, mp=mp)
+        return mrows
+
+    # -- Q-610: group P of the dual layout gives its anchor references back ---
+    # (weg2/dual_anchor_release.py: the dual layout never resets P, the only
+    # point that released them; y8t 11:24:25 P held 92 of the 112 slots)
+
+    def _weg2_dual_note_end_anchor(self, rid: str, node) -> None:
+        """Q-610: register `node` (the #1481 END anchor of `rid`) for its
+        consumption-bound release (weg2_dual_release_ended)."""
+        if not rid or node is None or not _dar.armed():
+            return
+        reg = getattr(self, "_weg2_dual_end_reg", None)
+        if reg is None:
+            reg = self._weg2_dual_end_reg = _dar.Registry()
+        reg.note(rid, node)
+
+    def _weg2_dual_releasable(self, n, mp, claimer=None) -> bool:
+        """A SETTLED arena anchor on `n` this rank may give back now: acked
+        (no pending claim), no write in flight, no host lock, not a direct
+        write's rows, and no running request on the node (device lock 0)."""
+        if n is None or n is self.root_node or n is claimer:
+            return False
+        cd = n.component_data[ComponentType.MAMBA]
+        hv = cd.host_value
+        if hv is None or hv.numel() == 0 or not mp.is_arena_id(int(hv.min())):
+            return False
+        if cd.host_lock_ref > 0 or getattr(n, "write_through_pending_id", None) is not None:
+            return False
+        if n.id in (getattr(self, "_weg2_direct_mamba_rows", None) or {}):
+            return False
+        if any(int(getattr(c, "lock_ref", 0) or 0) > 0 for c in n.component_data):
+            return False
+        return mp.settled_anchor_slots(hv) is not None
+
+    def _weg2_dual_release_ref(self, n) -> None:
+        """Tombstone `n`'s mamba host value and give its arena reference back
+        (the mamba HOST eviction funnel, as `_weg2_release_anchor` -- but no
+        slot is dropped here: the page stays COMPLETE until a claim needs it)."""
+        comp = self.components[ComponentType.MAMBA]
+        self._evict_component_and_detach_lru(n, comp, target=EvictLayer.HOST, tracker=None)
+        self._update_evictable_leaf_sets(n)
+        if _r12.role() == "host":
+            _r12.record_state(self, n, why="q610_dual")
+
+    def weg2_dual_release_ended(self, mp=None, at: str = "retain", claimer=None) -> int:
+        """Q-610 retain: the registered END anchors whose rid is done (the
+        front ended it, or neither pending nor ended past the expire bound)
+        give their tree reference back. Group P of the dual layout only.
+        Returns the references given back."""
+        if not _dar.armed():
+            return 0
+        self._weg2_dual_gen = getattr(self, "_weg2_dual_gen", 0) + (1 if at == "retain" else 0)
+        reg = getattr(self, "_weg2_dual_end_reg", None)
+        if reg is None or not reg.entries:
+            return 0
+        mp = mp if mp is not None else self._weg2_mamba_pool()
+        if mp is None:
+            return 0
+        released = 0
+        for _rid, n in reg.done():
+            # a done rid leaves the registry either way; an anchor still in
+            # flight or under a running request is the claim walk's (by tag)
+            if self._weg2_dual_releasable(n, mp, claimer):
+                self._weg2_dual_release_ref(n)
+                released += 1
+        if at == "retain":
+            _dar.log_batch(at=at, released=released, ended=released, prefix=0, kept_pending=len(reg.entries))
+        return released
+
+    def _weg2_dual_retain_release(self) -> None:
+        """Q-610: dual P gives the END-anchor references of ended rids back
+        at every retain, before its claims; never raises into the retain."""
+        try:
+            self.weg2_dual_release_ended(at="retain")
+        except Exception as exc:  # noqa: BLE001 -- a release never takes the retain down
+            logger.warning("Q-610 DUAL-ANCHOR-RELEASE at=retain raised %s: %s", type(exc).__name__, exc)
+
+    def _weg2_dual_claim_room(self, node, mp) -> tuple:
+        """Q-610 claim: the arena refused `node`'s anchor. Give back every
+        settled anchor P's tree holds that D will not read any more -- END
+        anchors of done rids (registered or by tag) and every other anchor
+        no running request holds (forks, grid anchors: P's prefix cache).
+        One pass; the trees of the PP ranks are replicas, so every rank gives
+        back the same set. Returns (released, ended, prefix, kept_pending)."""
+        ended = self.weg2_dual_release_ended(mp, at="claim", claimer=node)
+        prefix = kept = 0
+        stack = list(self.root_node.children.values())
+        while stack:
+            n = stack.pop()
+            stack.extend(n.children.values())
+            if not self._weg2_dual_releasable(n, mp, node):
+                continue
+            if getattr(n, "_weg2_end_anchor", False):
+                if not _dar.rid_done(getattr(n, "weg2_anchor_rid", None)):
+                    kept += 1
+                    continue
+                ended += 1
+            else:
+                prefix += 1
+            self._weg2_dual_release_ref(n)
+        return ended + prefix, ended, prefix, kept
+
+    def _weg2_dual_claim_retry(self, node, mp, last_hash):
+        """Q-610: a refused mamba claim on dual P makes room from P's own tree
+        references and claims once more. A walk that gave nothing back is not
+        repeated before the next retain (a full arena of live hand-offs would
+        otherwise walk the tree at every refused claim). None = still refused."""
+        if not _dar.armed():
+            return None
+        gen = getattr(self, "_weg2_dual_gen", 0)
+        if getattr(self, "_weg2_dual_empty_gen", None) == gen:
+            return None
+        released, ended, prefix, kept = self._weg2_dual_claim_room(node, mp)
+        mrows = mp.alloc_write([last_hash]) if released else None
+        if not released:
+            self._weg2_dual_empty_gen = gen
+        try:
+            depth = _mad.ancestor_path(target=node, root=self.root_node)[1]
+        except Exception:  # noqa: BLE001 -- an instrument
+            depth = None
+        _dar.log_batch(at="claim", released=released, ended=ended, prefix=prefix,
+                       kept_pending=kept, claim_ok=mrows is not None, depth=depth)
         return mrows
 
     #: FLUSH-SPILL: anchors spilled to L3 and freed at sleep flushes (per process)
@@ -6055,6 +6182,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         node NOW -- parents first, bounded, the sweep's own pin budget -- instead
         of waiting for a PP bubble or the sleep flush (weg2.retain_publish)."""
         _h49_retain_ms = None
+        self._weg2_dual_retain_release()   # Q-610: before this retain's claims
         try:
             try:
                 from sglang.srt.weg2 import retain_publish as _rp
@@ -6319,6 +6447,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _n = getattr(mr, "last_device_node", None)
             if ok and _n is not None and _n is not self.root_node:
                 _n._weg2_end_anchor = True
+                self._weg2_dual_note_end_anchor(str(getattr(req, "rid", "") or ""), _n)   # Q-610
         except Exception:  # noqa: BLE001 -- an instrument never kills a rank
             pass
         if not ok:

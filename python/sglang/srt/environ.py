@@ -645,6 +645,15 @@ class Envs:
     # (the front's drop missing). A garbage bound, not a capacity: the order
     # itself never holds a slot. Seat waits up to 658 s were measured (rc12r).
     SGLANG_WEG2_HANDOFF_PENDING_EXPIRE_S = EnvFloat(900.0)
+    # ENABLE_DUAL_ANCHOR_RELEASE (Q-610, dual y8t 11:24:25: P's tree held a
+    # reader reference on every mamba anchor it ever wrote -- 92 of the 112
+    # arena slots on each PP rank -- because the dual layout never resets P,
+    # the only point that gave them back): on a group-P rank of the dual
+    # layout an END anchor's tree reference goes once the front ended its rid,
+    # and a refused mamba claim gives back the settled prefix-cache anchors.
+    # The pages stay COMPLETE in the arena until a claim needs their slot.
+    # Inert outside SGLANG_WEG2_DUAL_LAYOUT=1 + SGLANG_WEG2_GROUP=P.
+    SGLANG_WEG2_ENABLE_DUAL_ANCHOR_RELEASE = EnvBool(True)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,
