@@ -225,3 +225,118 @@ def refusal_message(
         f"[{', '.join(own_blockers) or 'none'}]. Every rank of the group raises "
         f"this in the same pass -- nothing was paused."
     )
+
+
+# ---- Q-570: the sleep leg's flush must leave no device value in the tree ---------------
+#
+# NF y8s 03.10. 09:53:43 (D TP1): the front's quiesce answered "WEG2-FLUSH-NONBLOCK
+# quiesced" (B1), which hands the tree reset to the sleep leg. TP0/TP2 reset there; on TP1
+# the same flush_cache(zero_kv=False) ran its #1470 sweep (issued=1 in_flight_after=2),
+# read its RANK-LOCAL idle verdict and refused ("not-idle because: hicache_backup(2)").
+# The release leg dropped the return value and paused kv_cache -- TP1 slept with a tree
+# whose nodes still referenced device KV indices and 22 device mamba slots. The wake's
+# #1455 restore ("pools cleared, radix tree KEPT") then put every one of them into the
+# free lists as well: "[mamba] available=38 evictable=22 free_and_cached=22, #924 MAMBA
+# SLOT ALIASING" at the first idle pass, RANK-DEATH 15 s after the sleep.
+#
+# THE LAW. Nothing that pauses kv_cache may leave a device value in the radix tree. The
+# question "does any rank still hold one" is a GROUP question (the drain that frees the
+# blocker is a collective), so it is reduced over the group check_hicache_events posts on;
+# every rank then drains, retries or refuses in the same pass.
+
+#: drain + flush rounds a rank whose sleep flush left device values gets before the group
+#: refuses by name. Measured need: one (TP1's backups were acked within the next drain).
+WEG2_SLEEP_FLUSH_ATTEMPTS = 3
+
+
+class Weg2SleepFlushRefused(Weg2SleepDrainRefused):
+    """W120b: a rank's radix tree still holds device values after the sleep flush.
+
+    A subclass of W120: raised on EVERY rank in the same pass (the verdict is a
+    group reduction) BEFORE the kv_cache pause -- nothing was paused.
+    """
+
+
+def tree_device_held(tree) -> Tuple[int, int]:
+    """``(full, mamba)``: the device KV tokens and device mamba slots ``tree``
+    still references (evictable + protected). ``(0, 0)`` for a tree without
+    those books -- a reset tree, or a cache that holds no device values."""
+
+    def _n(name: str) -> int:
+        f = getattr(tree, name, None)
+        if not callable(f):
+            return 0
+        try:
+            v = f()
+        except Exception:  # noqa: BLE001 -- a stand-in without the books counts nothing
+            return 0
+        if isinstance(v, tuple):
+            v = v[0]
+        try:
+            return max(0, int(v or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    if tree is None:
+        return 0, 0
+    full = max(_n("full_evictable_size"), _n("evictable_size")) + max(
+        _n("full_protected_size"), _n("protected_size")
+    )
+    mamba = _n("mamba_evictable_size") + _n("mamba_protected_size")
+    return full, mamba
+
+
+def sleep_flush_until_reset(
+    *,
+    flush: Callable[[], object],
+    tree,
+    drain: Callable[[], object],
+    attempts: int = WEG2_SLEEP_FLUSH_ATTEMPTS,
+    log=None,
+) -> int:
+    """The sleep leg's flush, run until no rank's tree holds a device value.
+
+    ``flush`` is this rank's ``flush_cache(zero_kv=False)`` (rank-local, it
+    posts no collective); ``drain`` is the group HiCache drain
+    (``_weg2_drain_hicache_before_sleep``, a collective every rank posts);
+    the held bit is reduced with ``tree.hicache_group_max`` (the rank's own
+    value on a cache without HiCache collectives). Returns the retries used;
+    raises :class:`Weg2SleepFlushRefused` on every rank when ``attempts``
+    drains left a device value anywhere in the group.
+    """
+    if log is None:
+        import logging
+
+        log = logging.getLogger(__name__)
+    ok = bool(flush())
+    group_max = getattr(tree, "hicache_group_max", None)
+    for n in range(int(attempts) + 1):
+        full, mamba = tree_device_held(tree)
+        mine = int(full + mamba > 0)
+        if callable(group_max):
+            (any_held,) = group_max([mine], label="weg2_sleep_flush/held")
+        else:
+            any_held = mine
+        if not int(any_held):
+            if n:
+                log.warning(
+                    "WEG2-SLEEP-FLUSH-HELD resolved after %d drain(s): no rank's tree "
+                    "holds a device value before the kv_cache pause", n)
+            return n
+        if n == int(attempts):
+            raise Weg2SleepFlushRefused(
+                f"W120b Weg2SleepFlushRefused: after {n} group drain(s) a rank's radix tree "
+                f"still holds device values before the kv_cache pause (this rank full={full} "
+                f"mamba={mamba}, last flush ok={ok}). Pausing would hand them to the wake's "
+                f"#1455 restore, which clears the pools under the kept tree (#924 MAMBA SLOT "
+                f"ALIASING, NF y8s TP1). Every rank raises this in the same pass -- nothing "
+                f"was paused.")
+        log.warning(
+            "WEG2-SLEEP-FLUSH-HELD attempt=%d: the sleep flush left device values in a "
+            "rank's tree (this rank full=%d mamba=%d flush_ok=%s) -- the group drains and "
+            "the holding rank flushes again BEFORE the kv_cache pause (Q-570)",
+            n + 1, full, mamba, ok)
+        drain()
+        if mine:
+            ok = bool(flush())
+    raise AssertionError("unreachable")  # pragma: no cover
