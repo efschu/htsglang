@@ -7163,6 +7163,60 @@ class Front:
                     "under the E2 contract, d_compute=0)", p.rid, was, where,
                     int(getattr(p, "est_uncached", 0) or 0), self.epoch)
 
+    def _short_kept_bound(self, now: float) -> int:
+        """Q-711 SHORT-KEPT-BOUND (INT8 y8vb 03.10.: SHORT-KEPT p90 137 s, max 152 s; y8va p90
+        4 s): a SHORT kept for D waits in ``_ready_for_d``, and no flip trigger of the D phase
+        reads that deque -- DECODE-COLLECT release, ``_immediate_park_due``, the fairness bound
+        and the wait bound all read only ``self.queue``. The kept SHORT therefore had no upper
+        bound: it left only when a D seat freed or an unrelated LONG flipped D to P and
+        P-BATCH-ALL took it along (y8vb: six seats held by five decodes and the crawling D
+        prefill of the kept SHORT itself, nothing ever finished).
+
+        With ``SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S`` (profile row ``short_kept_max_wait_s``;
+        0 = off, byte-identical) a D-direct entry that has waited that long in D's admission
+        line, with NO free D seat, moves to P's queue (``_to_p_batch``, arrival order merged
+        like P-BATCH-ALL). The existing triggers then see a queue entry with its old
+        ``t_arrive`` and flip D to P (its leg 1 on P is ~4 s: y8vb 14-79, cached 32014).
+        The age runs from the first controller tick that saw the entry in the line. Not in
+        the dual layout (no flip there). Returns the number moved."""
+        bound = float(envs.SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S.get() or 0.0)
+        ready = getattr(self, "_ready_for_d", None)
+        if bound <= 0.0 or not ready or getattr(self, "dual_layout", False):
+            return 0
+        if self.seats_free() > 0:
+            return 0
+        moved = []
+        for p in ready:
+            if not (getattr(p, "d_direct", False) and not getattr(p, "leg1_done", False)
+                    and not getattr(p, "resume_via_p", False) and not getattr(p, "p_only", False)
+                    and (getattr(p, "fut", None) is None or not p.fut.done())):
+                continue
+            t0 = getattr(p, "t_ready_seen", None)
+            if t0 is None:
+                p.t_ready_seen = now
+                continue
+            if now - t0 >= bound:
+                moved.append((p, now - t0))
+        if not moved:
+            return 0
+        ids = {id(p) for p, _w in moved}
+        keep = [p for p in ready if id(p) not in ids]
+        ready.clear()
+        ready.extend(keep)
+        for p, waited in moved:
+            self.counters["short_kept_bound"] += 1
+            logger.info("WEG2 SHORT-KEPT-BOUND rid=%s waited_s=%.1f bound_s=%.1f seats_free=%d "
+                        "ready_for_d=%d epoch=%d: a kept SHORT without a D seat moves to P's queue "
+                        "(the flip triggers read only that queue)", p.rid, waited, bound,
+                        self.seats_free(), len(keep), self.epoch)
+            self._to_p_batch(p, "kept_bound")
+        merged = sorted(list(self.queue) + [p for p, _w in moved], key=lambda q: q.t_arrive)
+        self.queue.clear()
+        self.queue.extend(merged)
+        self._sync_batch_gate()
+        self._kick_controller("arrival")
+        return len(moved)
+
     def _p_batch_takes_d_prefill(self) -> int:
         """P-BATCH-ALL (user 02.10.): at the start of a P drain, every request
         still waiting for a D PREFILL -- a D-phase decision (SK SHORT-KEPT,
@@ -16093,6 +16147,7 @@ class Front:
                     if _x_rg == "moved":
                         continue
                     self._drop_lapsed_parks()
+                    self._short_kept_bound(_now)  # Q-711: a kept SHORT without a seat is bounded
                     oldest = self.queue[0].t_arrive if self.queue else None
                     # H91 part C rule 3: with the wait bound armed it is the
                     # D phase's pre-emption and REPLACES the fairness switch

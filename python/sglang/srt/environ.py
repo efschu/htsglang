@@ -1923,6 +1923,15 @@ class Envs:
     # and stays on D. Line 'WEG2 P-ANCHOR-PRESENCE'. Off = no record (#1324:
     # P's leg 1 feeds no presence); A/B against the W50-REROUTE count.
     SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE = EnvBool(True)
+    # Q-711 SHORT-KEPT-BOUND (INT8 y8vb 03.10.): a SHORT kept for D waits in the
+    # front's _ready_for_d, which no flip trigger reads (they read only the batch
+    # queue) -- it had no upper bound (137 s and 152 s, p90 137 s against 1 s on
+    # y8va). Past this many seconds in D's admission line WITHOUT a free seat it
+    # moves to P's queue (_to_p_batch, arrival order) and the existing flip path
+    # takes it. Profile row ``short_kept_max_wait_s`` (qwen27b 30 s, nextflash
+    # 0); 0 = off, byte-identical (also the value without a form). Not read in
+    # the dual layout.
+    SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S = EnvFloat(_profile_default("SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S", 0.0))
     # RPC-STALL-WATCHDOG (30.09., hauenh P->D epoch 6: D TP0 silent 6 s inside the wake RPC):
     # faulthandler's C watchdog writes every thread's stack into its own file per rank when a sleep
     # (release) or wake (resume) RPC outlives this many seconds (weg2/rpc_stall_watchdog.py). A normal
