@@ -36,7 +36,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "profil_data")
 CATALOG_FILE = os.path.join(DATA_DIR, "catalog.json")
 DEFAULT_RELEASE_DIR = "/spinning/gpu-arb/docker/profiles_release"
-DEFAULT_USER_DIR = "/var/lib/flliper/profiles"
+#: ein gemeinsamer Ort fuer Dashboard und Entrypoint (Koordinator 03.10.): Env FLLIPER_PROFILES_DIR, Standard /var/lib/flliper/profiles
+DEFAULT_USER_DIR = os.environ.get("FLLIPER_PROFILES_DIR") or "/var/lib/flliper/profiles"
 
 
 class _NameCheck:

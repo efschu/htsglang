@@ -58,7 +58,7 @@ def editor(tmp):
     with open(os.path.join(rel, "demo.env"), "w") as fh:
         fh.write(ENV)
     kp = K.Kartenplaner(tree=FIXTURE_TREE)
-    return P.ProfilEditor(kartenplaner=kp, release_dir=rel, user_dir=usr, tree=REPO_PY, catalog_file=REPO_CATALOG), rel, usr
+    return P.ProfilEditor(kartenplaner=kp, release_dir=rel, user_dir=usr, tree=FIXTURE_TREE, catalog_file=REPO_CATALOG), rel, usr
 
 
 RIG = [{"card": "rtx3080-20", "pcie": {"gen": 4, "lanes": 4}}, {"card": "rtx5090-32", "pcie": {"gen": 5, "lanes": 8}},

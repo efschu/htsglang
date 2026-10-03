@@ -232,7 +232,7 @@ class App:
         self.profil = profil.ProfilEditor(
             kartenplaner=self.kartenplaner,
             release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
-            user_dir=getattr(args, "profile_dir", None) or (os.path.join(args.state_dir, "profiles") if args.state_dir else profil.DEFAULT_USER_DIR))
+            user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR)
         self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
                        else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
@@ -719,8 +719,9 @@ def main(argv=None):
                     help="git repo holding the image revs and feature commits")
     ap.add_argument("--profiles-release-dir", default=os.environ.get("RIGDASH_PROFILES_RELEASE_DIR", profil.DEFAULT_RELEASE_DIR),
                     help="the release profiles (<name>.env) the Profil editor can load")
-    ap.add_argument("--profile-dir", default=os.environ.get("RIGDASH_PROFILE_DIR", ""),
-                    help="where the Profil editor keeps user profiles (JSON); default <state-dir>/profiles, else /var/lib/flliper/profiles")
+    ap.add_argument("--profile-dir", default=profil.DEFAULT_USER_DIR,
+                    help="where the Profil editor keeps user profiles (JSON): ONE place for the dashboard and the container entrypoint, "
+                         "env FLLIPER_PROFILES_DIR, default /var/lib/flliper/profiles")
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     ap.add_argument("--edition", choices=EDITIONS, default=os.environ.get("RIGDASH_EDITION", "rig"),
