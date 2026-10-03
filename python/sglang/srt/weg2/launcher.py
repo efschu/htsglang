@@ -14091,6 +14091,68 @@ def d_extend_growth_per_row_record(profile: Optional[str] = None) -> Tuple[Optio
     return [None if v is None else float(v) for v in vals], _pconst_boots("D_EXTEND_GROWTH_PER_ROW_MIB", profile)
 
 
+#: NF port 1003: the arming variables of the per-rank run-time measurement of the extend rate
+EXTEND_RATE_MEASURE_ENV = "SGLANG_WEG2_EXTEND_RATE_MEASURE"
+EXTEND_RATE_MEASURE_RANKS_ENV = "SGLANG_WEG2_EXTEND_RATE_MEASURE_RANKS"
+EXTEND_RATE_MARKER = "EXTEND-RATE"
+
+
+def d_extend_rate_fill_null(ns, rate: Sequence[Optional[float]]):
+    """NF port 1003 (order 980 item 2): ``(rates, fill)`` -- ``rate`` (the profile's
+    ``D_EXTEND_GROWTH_PER_ROW_MIB``) with every NULL rank given a start rate DERIVED from the
+    profile's own per-rank extend growth (``D_EXTEND_GROWTH_MIB``, ratio to the recorded rank) and
+    from the checkpoint's geometry (``extend_trim.derived_rate_mib``), the larger of the two --
+    no rig constant is copied. ``fill`` is ``None`` when the record has no null rank (the
+    unchanged path, byte for byte), else a dict ``{"sources", "ranks", "geometry", "geo_err",
+    "record"}`` (``ranks`` = the ranks the run-time measurement is armed on)."""
+    from sglang.srt.weg2 import extend_trim as _et
+
+    rate = list(rate)
+    if not any(r is None for r in rate):
+        return rate, None
+    growth, _ = d_extend_growth_record(getattr(ns, "profile", None))
+    geo_err = ""
+    try:
+        geo = _et.derived_rate_mib(_model_config(str(getattr(ns, "model", "") or "")))
+        if geo is None:
+            geo_err = "keine hidden_size"
+    except Exception as exc:  # noqa: BLE001 -- an unreadable geometry is NAMED, never fatal
+        geo, geo_err = None, f"{type(exc).__name__}: {exc}"
+    filled, sources = _et.fill_null_rates(rate, growth, geo)
+    ranks = [i for i, r in enumerate(rate) if r is None and filled[i] is not None]
+    return filled, {"sources": sources, "ranks": ranks, "geometry": geo, "geo_err": geo_err,
+                    "record": rate}
+
+
+def d_extend_rate_measure_ranks_env(ns, log, label: str, fill: dict, rtext: str) -> None:
+    """NF port 1003: arm the run-time measurement on the filled ranks ONLY (a recorded rank keeps
+    its recorded rate) and name every rank's start source: ``EXTEND-RATE source=record+derived``.
+    A value named in --env-d wins; a rank that stays without any rate is named as NOT armed."""
+    from sglang.srt.weg2 import extend_trim as _et
+
+    _env_d = getattr(ns, "env_d", "") or ""
+    _have = parse_group_env(_env_d)
+    _ranks = ",".join(str(r) for r in fill["ranks"])
+    _given = (str(_have.get(EXTEND_RATE_MEASURE_ENV, "1")).strip() != "1"
+              or str(_have.get(EXTEND_RATE_MEASURE_RANKS_ENV, _ranks)).strip() != _ranks)
+    if _ranks and not _given:
+        _env_d = set_group_env(_env_d, EXTEND_RATE_MEASURE_ENV, "1")
+        ns.env_d = set_group_env(_env_d, EXTEND_RATE_MEASURE_RANKS_ENV, _ranks)
+    _vals = [x.strip() for x in str(rtext).split(",")]
+    _per_rank = "; ".join(f"rank{i}={src} {_vals[i] if i < len(_vals) else '-'}"
+                          for i, src in enumerate(fill["sources"]))
+    _unarmed = [i for i, src in enumerate(fill["sources"]) if src == "none"]
+    log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source=record+derived start={rtext} "
+        f"measure={'on' if _ranks and not _given else 'off'} ranks={_ranks or '-'}"
+        f"{' (aus --env-d, Vorrang)' if _given else ''} safety={_et.RATE_SAFETY} ({_per_rank}; "
+        f"ratio = Rate des erfassten Rangs x D_EXTEND_GROWTH_MIB[Rang] / D_EXTEND_GROWTH_MIB[erfasster Rang], "
+        f"geometry = {fill['geometry']} aus config.json"
+        f"{'' if not fill['geo_err'] else ' (' + fill['geo_err'] + ')'}; je Startrang gilt "
+        f"max(Start, gemessen x {_et.RATE_SAFETY}), Ratsche nur nach oben)"
+        + (f" -- Rang {','.join(str(i) for i in _unarmed)}: weder Wachstums-Record noch Geometrie, "
+           f"der Extend-Chunk-Deckel ist dort NICHT scharf" if _unarmed else ""))
+
+
 def d_extend_trim_env(ledger, fits, growth_mib: Optional[Sequence[Optional[float]]] = None) -> str:
     """rc12e: ``SGLANG_WEG2_EXTEND_TRIM_MIB`` from the card ledger's floor and
     the solved form's booked activation, per rank; '' when a rank is missing.
@@ -19055,6 +19117,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         if _rate is not None and len(_rate) == len(_ledger.floor_mib):
             from sglang.srt.weg2 import extend_trim as _et
 
+            # NF port 1003 (order 980 item 2): a rank the record leaves null gets a
+            # DERIVED start rate (and the run-time measurement) instead of no vote
+            _rate_rec = list(_rate)
+            _rate, _fill = d_extend_rate_fill_null(ns, _rate)
             _rtext = _et.launcher_rates(_rate)
             _env_d = getattr(ns, "env_d", "") or ""
             # a value that differs from the record's came from the user (a second
@@ -19068,8 +19134,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                 log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-STUECKELUNG rows_cap aus card_free_post: "
                     f"SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB={_rtext}"
                     f"{' (aus --env-d, Vorrang)' if _given else ''} "
-                    f"(Rate aus D_EXTEND_GROWTH_PER_ROW_MIB {_rate}, boots {_rate_src}; D kappt den "
+                    f"(Rate aus D_EXTEND_GROWTH_PER_ROW_MIB {_rate_rec}, boots {_rate_src}; D kappt den "
                     f"Extend-Chunk auf floor((card_free_post - 300) / Rate), MIN ueber TP)")
+            if _fill is not None and _rtext and not _given:
+                d_extend_rate_measure_ranks_env(ns, log, label, _fill, _rtext)
     _w = getattr(ns, "_d_kv_stage_written", None) or {}
     _stage_rows = dict((_w.get("worker_rows") or {}))
     if _w:
