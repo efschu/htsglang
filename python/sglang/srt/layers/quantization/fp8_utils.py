@@ -395,7 +395,15 @@ def deterministic_fp8_marlin_disabled(device_id: int) -> bool:
     except Exception:  # noqa: BLE001 - unknown device means "leave it alone"
         return False
     sm = major * 10 + minor
-    if not (80 <= sm < 89):
+    # HW-P0 1003: the range follows the MARLIN ROUTE, not a fixed number.
+    # SM89-DURCHSPIEL-1002 routes an sm_89 rank whose wheel carries no sm_89
+    # SASS through the same gptq_marlin_gemm (FP8-SM89-FALLBACK in
+    # can_auto_enable_marlin_fp8); there the #190 nondeterminism is the same
+    # kernel's, so the flag must switch it off too. An sm_89 rank with sm_89
+    # SASS keeps CUTLASS and is untouched, as are sm_86 (already in range) and
+    # sm_90+/sm_120.
+    marlin_route = 80 <= sm < 89 or (sm == 89 and wheel_carries_sass((8, 9)) is not True)
+    if not marlin_route:
         return False
     logger.warning(
         "SGLANG_DETERMINISTIC_FP8_GEMM is set and this rank is sm%d: the fp8 "
