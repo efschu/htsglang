@@ -19,7 +19,21 @@ that differ (all = a foreign token, some = a partial write), and
   at_sleep   = device(sleep) != L2(sleep)      -> they already disagreed at the sleep
 
 Process-local (sleep and wake run in the same scheduler process); one snapshot,
-replaced at every held sleep. SGLANG_WEG2_L15_CHECK_SNAP=0 turns it off.
+replaced at every held sleep.
+
+540 (27B y8r 55c95a89c7, D>P /flush_cache 2.9 s): OFF BY DEFAULT now,
+SGLANG_WEG2_L15_CHECK_SNAP=1 turns it on. The snapshot draws the wake's sample
+from ``l15_restore.owned_l2_rows`` -- the WHOLE refill plan over every held
+token -- synchronously inside the sleep flush, on exactly the capped ranks
+(TP1/TP2) that are the flush's critical path; TP0 (cap 0, no snapshot) waits
+for them at the SLEEP-AGREE POST gather. Measured as the capped ranks'
+``retain_ms`` minus their ``L15-RETAIN ms``: 96-128 ms at 70-100k held rows,
+755-770 ms at 151k rows (09:14:02), 356 ms at 147k (09:17:34); 615 ms on the
+02.10. 18:54 boot already. The plan cache warm thread (``warm_plan_async``)
+builds the same plan after the sleep for free. Since the snapshot exists
+(02.10. 18:49) every one of its 30 copies read ``equal_at_sleep=rows`` and
+all 26 capped wake checks ``bad=0``: the N6e question it was built for has
+not come back. The wake's own sample check (``L15-CHECK``) is unchanged.
 """
 
 from __future__ import annotations
@@ -47,8 +61,10 @@ def set_wake_context(rank, m, prefix, device_pool) -> None:
 
 
 def explain_current(bad_rows) -> List[str]:
-    """:func:`explain` under the context the wake set; none set -> no lines."""
-    if _WAKE is None or not enabled():
+    """:func:`explain` under the context the wake set; none set -> no lines.
+    540: independent of the snapshot switch -- without a snapshot the
+    CHECK-WHO line still names the row, token and slot (``snap=none``)."""
+    if _WAKE is None:
         return []
     rank, m, prefix, pool = _WAKE
     return explain(rank, m, prefix, pool, bad_rows)
@@ -56,7 +72,7 @@ def explain_current(bad_rows) -> List[str]:
 
 def enabled(env=None) -> bool:
     env = os.environ if env is None else env
-    return str(env.get("SGLANG_WEG2_L15_CHECK_SNAP", "1")).strip() != "0"
+    return str(env.get("SGLANG_WEG2_L15_CHECK_SNAP", "0")).strip() not in ("", "0")
 
 
 def note_moves(moves) -> None:
