@@ -57,6 +57,91 @@ def _grep(path, pats, limit=6):
     return out
 
 
+# D rounds are placed by their own ``t:`` field (epoch seconds, taken as the
+# round's END; the round spans gpu-ms before it), never by the log line's stamp:
+# the D log flushes 'Decode rank batch' lines in bursts (boot dual1i
+# ...10010932: 6453 rounds over 457 s of t landed in 109 log seconds, lag p50
+# 1.4 s / p99 19 s), which made the old 1-s buckets report "5 s with BOTH" for
+# ~55 s of real overlap. P activity: per rank, the chunk window
+# [WEG2-VRAM-PEAK t_unix_ms - 'Prefill rank batch' gpu-ms, t_unix_ms] (paired by
+# order); without those lines, the old PP0 'Prefill batch' log seconds.
+_VP = re.compile(r"PP(\d)\] WEG2-VRAM-PEAK rank=\d+ phase=chunk rows=(\d+) .*?t_unix_ms=(\d+)")
+_RB = re.compile(r"PP(\d)\] Prefill rank batch, #new-token: (\d+), .*gpu-ms: ([\d.]+)")
+_DR = re.compile(r"TP0\] Decode rank batch, rank: 0, #round: \d+, t: ([\d.]+), .*gpu-ms: ([\d.]+)")
+
+
+def _union(iv):
+    out = []
+    for a, b in sorted(iv):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def _cover(a, b, merged, starts):
+    import bisect
+
+    k = max(0, bisect.bisect_right(starts, b) - 1)
+    s = 0.0
+    while k >= 0 and k < len(merged) and merged[k][1] >= a:
+        s += max(0.0, min(b, merged[k][1]) - max(a, merged[k][0]))
+        k -= 1
+    return s
+
+
+def overlap(p_path, d_path):
+    vp, rb, batch_sec, tokens = collections.defaultdict(list), collections.defaultdict(list), set(), 0
+    if os.path.exists(p_path):
+        with open(p_path, errors="replace") as f:
+            for line in f:
+                m = _VP.search(line)
+                if m:
+                    vp[int(m.group(1))].append(int(m.group(3)) / 1000.0)
+                    continue
+                m = _RB.search(line)
+                if m:
+                    rb[int(m.group(1))].append((int(m.group(2)), float(m.group(3))))
+                    continue
+                if "PP0] Prefill batch" in line:
+                    s = _sec(line)
+                    t = re.search(r"#new-token: (\d+)", line)
+                    if s is not None and t:
+                        batch_sec.add(s)
+                        tokens += int(t.group(1))
+    p_iv = []
+    for r in vp:
+        for (end, (_, g)) in zip(vp[r], rb.get(r, [])):
+            p_iv.append((end - g / 1000.0, end))
+    if p_iv:
+        p_source = "chunk-windows"
+    else:
+        p_source = "batch-line-seconds"
+        p_iv = [(float(s), float(s) + 1.0) for s in batch_sec]
+    merged = _union(p_iv)
+    starts = [a for a, _ in merged]
+    rounds = []
+    if os.path.exists(d_path):
+        with open(d_path, errors="replace") as f:
+            for line in f:
+                m = _DR.search(line)
+                if m:
+                    t, g = float(m.group(1)), float(m.group(2))
+                    rounds.append((t - g / 1000.0, t, g))
+    d_merged = _union([(a, b) for a, b, _ in rounds])
+    both = sum(_cover(a, b, merged, starts) for a, b in d_merged)
+    during, idle = [], []
+    for a, b, g in rounds:
+        if _cover(a, b, merged, starts) > 0:
+            during.append(g)
+        elif _cover(a - 1.0, b + 1.0, merged, starts) == 0:
+            idle.append(g)
+    return {"p_source": p_source, "d_source": "t-field", "p_tokens": tokens,
+            "p_s": sum(b - a for a, b in merged), "d_s": sum(b - a for a, b in d_merged),
+            "both_s": both, "during": during, "idle": idle}
+
+
 def main():
     fs = _files(sys.argv[1])
     print("files:", fs)
@@ -94,33 +179,12 @@ def main():
                   "d_kv_grow", "d_kv_shrink", "d_kv_wait", "p_pause", "p_paused", "terminate"):
             for line in g.get(n, [])[:3]:
                 print(f"   {n}: {line}")
-    # overlap: PP0 prefill seconds vs TP0 decode seconds
-    pre = collections.Counter()
-    if os.path.exists(fs["P"]):
-        with open(fs["P"], errors="replace") as f:
-            for line in f:
-                if "PP0] Prefill batch" in line:
-                    s = _sec(line)
-                    m = re.search(r"#new-token: (\d+)", line)
-                    if s is not None and m:
-                        pre[s] += int(m.group(1))
-    dec = collections.defaultdict(list)
-    if os.path.exists(fs["D"]):
-        with open(fs["D"], errors="replace") as f:
-            for line in f:
-                if "TP0] Decode rank batch" in line:
-                    s = _sec(line)
-                    m = re.search(r"gpu-ms: ([\d.]+)", line)
-                    if s is not None and m:
-                        dec[s].append(float(m.group(1)))
-    both = [s for s in dec if s in pre]
-    alone = [s for s in dec if s not in pre and (s - 1) not in pre and (s + 1) not in pre]
-    print(f"\n== overlap: {len(pre)} s with P prefill ({sum(pre.values())} tokens), {len(dec)} s with D decode, "
-          f"{len(both)} s with BOTH")
-    for name, secs in (("D round gpu-ms while P prefills", both), ("D round gpu-ms, P idle (+-1 s)", alone)):
-        vals = [v for s in secs for v in dec[s]]
+    o = overlap(fs["P"], fs["D"])
+    print(f"\n== overlap (P: {o['p_source']}, D: {o['d_source']}): {o['p_s']:.0f} s with P prefill "
+          f"({o['p_tokens']} tokens), {o['d_s']:.0f} s with D decode, {o['both_s']:.0f} s with BOTH")
+    for name, vals in (("D round gpu-ms while P prefills", o["during"]), ("D round gpu-ms, P idle (+-1 s)", o["idle"])):
         if vals:
-            vals.sort()
+            vals = sorted(vals)
             print(f"   {name}: n={len(vals)} p50={statistics.median(vals):.1f} "
                   f"p90={vals[int(0.9 * (len(vals) - 1))]:.1f}")
         else:
