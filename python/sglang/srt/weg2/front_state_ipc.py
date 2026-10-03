@@ -413,6 +413,24 @@ class DpFlipClock:
             # not "no beacon". None = beacon off / unreadable.
             self._armed["beacon_snap"] = None if beacon_snap is None else dict(beacon_snap)
             self._armed["beacon_first"] = {}
+            # Y8P-PPFWD-ARM-RACE (NF y8p 03.10. 08:52:05 / 08:53:41 / 08:57:00; port 490): P's
+            # first forward can start BEFORE the front logs ``done`` (the wake RPC returns, P
+            # admits at once; 0-70 ms ahead). It is then already inside the done snapshot, the
+            # rise this clock waits for is the SECOND chunk's start -- a false Nachlauf of one
+            # whole chunk (2.5-2.9 s on NF). P sleeps for the whole D phase, so a rank whose
+            # ``t_start`` lies at or after the flip's begin ran its first forward of the woken
+            # group: count it from the snapshot itself. Never raises.
+            try:
+                fb = float(self._armed.get("flip_begin_ts") or 0.0)
+                snap = self._armed["beacon_snap"]
+                if fb > 0.0 and snap:
+                    for pid, row in snap.items():
+                        if int(row[0]) > 0 and float(row[1]) / 1e9 >= fb:
+                            self._armed["beacon_first"][pid] = (float(row[1]) / 1e9, False)
+                    if self._armed["beacon_first"]:
+                        self.note_beacon(snap)       # derives pp_first_ts / pp_last_ts from them
+            except Exception:  # noqa: BLE001 -- an instrument never breaks a flip
+                pass
 
     def waits_for_beacon(self) -> bool:
         """Until every P rank rose (the end is known at the first; the last

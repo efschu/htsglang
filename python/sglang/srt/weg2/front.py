@@ -8025,6 +8025,13 @@ class Front:
         clk = self._ipc_dp_clock()
         t_end = time.time() + bound_s
         fired = False
+        _ts0 = clk.first_forward_ts()
+        if _ts0 is not None:
+            # Y8P-PPFWD-ARM-RACE (port 490): PP0's first forward began before ``done`` and was
+            # read from the done snapshot -- the end is known, fire it now (the loop below may
+            # have nothing left to wait for).
+            Front._ipc_first_work_at(self, "P", "p_first_stage_forward", None, float(_ts0))
+            fired = True
         while clk.waits_for_beacon() and time.time() < t_end:
             cur = await asyncio.to_thread(Front._p_beacons, self)
             if cur:
