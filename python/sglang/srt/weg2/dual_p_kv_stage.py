@@ -584,8 +584,9 @@ def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optio
     idle-release between this grant and its adoption, so a follower card is
     charged the full unit and returns the excess on adoption.
 
-    ``taken_out``: on a grant, receives the (ledger, bytes) charges taken, so
-    PP0 can return them when its own card is physically short (MAP-SHORT WAIT)."""
+    ``taken_out``: on a grant, receives the (stage index, ledger, bytes) charges
+    taken, so PP0 can return them when its own card is physically short
+    (MAP-SHORT WAIT) or when the told that carries them never leaves (Q-630)."""
     covered = covered or {}
     if not stages:
         return 0
@@ -605,9 +606,9 @@ def group_grant(stages: Sequence[dict], tokens: int, open_ledger, covered: Optio
         need = max(0, int(stages[i]["bytes"][k]) - int(covered.get(i, 0)))
         led = open_ledger(stages[i]["ledger"])
         got, _ = led.request(need)
-        taken.append((led, got))
+        taken.append((i, led, got))
         if got < need:
-            for l2, g2 in taken:
+            for _i2, l2, g2 in taken:
                 if g2:
                     l2.release(g2)
             return 0
@@ -673,6 +674,10 @@ def pp0_grant(sched, req) -> Optional[int]:
         except OSError:
             logger.warning("%s PP0 GRANT waits: stage %d has not published its table yet", MARK, r)
             return 0
+    # Q-630: a re-intake of a request whose earlier grant never reached the
+    # followers (intake_stall/abort before the told) -- that grant is returned
+    # before a new one is taken, never charged twice on a follower card.
+    return_untold_grant(sched, req, "regrant")
     _ids = getattr(req, "origin_input_ids", None)
     tokens = (0 if _ids is None else len(_ids)) + int(actor.page)   # never `x or ()` on a tensor
     # GRANT-SUM (dual1k 09:55:20Z, weg2-0-10): the mapping is ONE high-water
@@ -695,7 +700,7 @@ def pp0_grant(sched, req) -> Optional[int]:
             # have. Every card's charge goes back, PP0's ledger is reconciled
             # against cuMemGetInfo (the next grant is priced on what is really
             # there) and the request is HELD -- a wait, never a rank death.
-            for led, got in taken:
+            for _i, led, got in taken:
                 if got:
                     led.release(got)
             phys = phys_free_bytes()
@@ -706,6 +711,10 @@ def pp0_grant(sched, req) -> Optional[int]:
             _log_wait(rid, tokens)
             return 0
         req._dual_kv_tokens = lvl
+        # Q-630: the followers' charges stand on their cards until a follower
+        # adopts them from the told (map_granted) -- held on the request until
+        # the told is on the wire (with_dual_kv), returned if it never leaves.
+        req._dual_grant_untold = [(i, led, got) for i, led, got in taken if i != 0 and got] or None
         waited = _wait_granted(rid)
         logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards%s", MARK, rid, lvl, pp,
                     (" after %d waits over %.1f s" % waited) if waited else "")
@@ -852,7 +861,36 @@ def with_dual_kv(told, req):
     lvl = int(getattr(req, "_dual_kv_tokens", 0) or 0)
     if lvl > 0:
         setattr(told, WIRE_DUAL_KV, lvl)
+        # Q-630: the grant is on the wire -- from here every follower adopts its
+        # charge (on_told -> map_granted), nobody may return it a second time.
+        req._dual_grant_untold = None
     return told
+
+
+def return_untold_grant(sched, req, why: str) -> int:
+    """Q-630 DUAL-GRANT-RETURN (PP0): give back the follower cards' share of
+    ``req``'s group grant whose told never went on the wire. ``pp0_grant``
+    charged every follower card at the intake; a follower takes the charge over
+    only when the told reaches it (``on_told``). A request that leaves the
+    queue before (abort, intake stall) left that charge on the follower cards
+    with no owner: dual y8u 12:09:23 (boot ...fs10031206), weg2-0-1 + weg2-0-10
+    aborted by the front's P-PAUSE before their told, Q-580 dropped the held
+    told, PP1 stayed at 973078528 B / PP2 at 1459617792 B committed = (90112 +
+    147456) tokens x 4096 / 6144 B -- the front's RESUME-WAIT never saw all
+    zeros (210.8 s, up to 1441 s), long requests ran into the client timeout.
+    Returns the bytes given back."""
+    untold = req._dual_grant_untold
+    if not untold:
+        return 0
+    req._dual_grant_untold = None
+    n = 0
+    for pp, led, got in untold:
+        led.release(got)
+        n += int(got)
+        logger.warning("%s P-KV GRANT-RETURN rid=%s pp=%d bytes=%d why=%s: the told carrying PP0's group "
+                       "grant never left -- this follower card's charge goes back to the card pool",
+                       MARK, str(getattr(req, "rid", "?"))[:16], int(pp), int(got), why)
+    return n
 
 
 def flush_acks_when_idle(sched) -> bool:

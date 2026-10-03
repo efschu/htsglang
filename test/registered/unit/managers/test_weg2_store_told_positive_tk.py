@@ -102,7 +102,7 @@ class _Sched:
 
 
 def _req(rid, n_ids):
-    return SimpleNamespace(rid=rid, prefetch_deferred=None, origin_input_ids=list(range(n_ids)),
+    return SimpleNamespace(_dual_grant_untold=None, rid=rid, prefetch_deferred=None, origin_input_ids=list(range(n_ids)),
                            extra_key=None)
 
 

@@ -108,7 +108,7 @@ def _pp0(monkeypatch, tmpdir, cap_tokens, pp0_grant=None):
     sf = S.publish_stage(st, tag, 0)
     sched = types.SimpleNamespace(tp_worker=types.SimpleNamespace(model_runner=types.SimpleNamespace(
         **{S.ACTOR_ATTR: st})), ps=types.SimpleNamespace(pp_rank=0, pp_size=1))
-    req = types.SimpleNamespace(rid="weg2-0-2", origin_input_ids=list(range(10000)))
+    req = types.SimpleNamespace(_dual_grant_untold=None, rid="weg2-0-2", origin_input_ids=list(range(10000)))
     try:
         lvl = (pp0_grant or S.pp0_grant)(sched, req)
     finally:
@@ -190,7 +190,7 @@ def test_a_follower_that_cannot_map_pp0s_grant_stops_named_and_rolled_back():
     spans.cap = _plan_bytes(st, 8192)
     sched = types.SimpleNamespace(tp_worker=types.SimpleNamespace(model_runner=types.SimpleNamespace(
         **{S.ACTOR_ATTR: st})))
-    item = types.SimpleNamespace(rid="weg2-0-2", **{S.WIRE_DUAL_KV: 12288})
+    item = types.SimpleNamespace(_dual_grant_untold=None, rid="weg2-0-2", **{S.WIRE_DUAL_KV: 12288})
     with pytest.raises(S.Weg2DualKvFollowerMapShort, match="DUAL-FOLLOWER-MAP-SHORT"):
         S.on_told(sched, item)
     assert st.mapped_tokens == 0

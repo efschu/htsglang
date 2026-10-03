@@ -55,7 +55,7 @@ TOLD = h1157.REAP_TOKENS
 
 
 def _req(rid, n, granted=0):
-    r = SimpleNamespace(rid=rid, origin_input_ids=list(range(n)))
+    r = SimpleNamespace(_dual_grant_untold=None, rid=rid, origin_input_ids=list(range(n)))
     if granted:
         r._dual_kv_tokens = granted
     return r
@@ -131,7 +131,7 @@ def _follower(cache):
 
 
 def _ack_req():
-    return SimpleNamespace(rid=REQ, origin_input_ids=list(range(1, TOLD + 1)), extra_key=None,
+    return SimpleNamespace(_dual_grant_untold=None, rid=REQ, origin_input_ids=list(range(1, TOLD + 1)), extra_key=None,
                            full_untruncated_fill_ids=None)
 
 

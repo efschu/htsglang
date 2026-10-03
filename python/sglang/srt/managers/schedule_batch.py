@@ -1787,6 +1787,10 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # Q-630 (dual P, PP0 only): the follower cards' share of this request's
+        # group grant while its told is not on the wire yet -- [(pp, ledger,
+        # bytes)]; None once the told carried it (dual_p_kv_stage).
+        self._dual_grant_untold: Optional[list] = None
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.

@@ -57,7 +57,7 @@ def _stage(led):
 
 
 def _req(rid, n):
-    return types.SimpleNamespace(rid=rid, origin_input_ids=list(range(n)), output_ids=[])
+    return types.SimpleNamespace(_dual_grant_untold=None, rid=rid, origin_input_ids=list(range(n)), output_ids=[])
 
 
 class GrantDelta(CustomTestCase):

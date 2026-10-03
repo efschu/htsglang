@@ -67,7 +67,7 @@ class _Sched:
 
 
 def _req(rid):
-    return SimpleNamespace(rid=rid, prefetch_deferred=None)
+    return SimpleNamespace(_dual_grant_untold=None, rid=rid, prefetch_deferred=None)
 
 
 def _skips():
@@ -296,7 +296,7 @@ def test_follower_that_already_holds_the_told_span_is_satisfied_without_a_read()
     s = _Sched(1)
     m.armed(s)
     s._prefetch_kvcache = lambda req, rematch=True, limit_tokens=None: "declined:too_short"
-    r = SimpleNamespace(rid="eeee0001", prefetch_deferred=None,
+    r = SimpleNamespace(_dual_grant_untold=None, rid="eeee0001", prefetch_deferred=None,
                         prefix_indices=list(range(3000)), host_hit_length=700)
     s.waiting_queue.append(r)
     gates = []
@@ -307,14 +307,14 @@ def test_follower_that_already_holds_the_told_span_is_satisfied_without_a_read()
     assert skips == []
     # xsn155: the same with 'declined:store_absent' (probe started past told)
     s._prefetch_kvcache = lambda req, rematch=True, limit_tokens=None: "declined:store_absent"
-    r3 = SimpleNamespace(rid="eeee0003", prefetch_deferred=None,
+    r3 = SimpleNamespace(_dual_grant_untold=None, rid="eeee0003", prefetch_deferred=None,
                          prefix_indices=list(range(94206)), host_hit_length=0)
     s.waiting_queue.append(r3)
     m.intake(s, r3, gates.append)
     m.follower_absorb(s, [m.Weg2StoreTold("eeee0003", 53246)])
     assert m.admission(s, r3, note) == 0
     # a follower that holds LESS than told still refuses by name
-    r2 = SimpleNamespace(rid="eeee0002", prefetch_deferred=None,
+    r2 = SimpleNamespace(_dual_grant_untold=None, rid="eeee0002", prefetch_deferred=None,
                          prefix_indices=list(range(100)), host_hit_length=0)
     s.waiting_queue.append(r2)
     m.intake(s, r2, gates.append)
@@ -416,7 +416,7 @@ def test_1419_told_caps_the_radix_match_on_every_rank():
         def pop_prefetch_loaded_tokens(self, rid):
             return 0
 
-    req = types.SimpleNamespace(rid="r9")
+    req = types.SimpleNamespace(_dual_grant_untold=None, rid="r9")
     sched = types.SimpleNamespace(
         tree_cache=_Tree(), _weg2_store_told={"r9": 4095},
         _weg2_store_told_satisfied={}, ps=types.SimpleNamespace(pp_rank=1),

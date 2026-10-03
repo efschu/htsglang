@@ -358,6 +358,7 @@ def forget_left_queue(scheduler, req, why: str) -> List[str]:
     if isinstance(held, dict) and held.get(rid) is req:
         held.pop(rid, None)
         dropped.append("held")
+        _return_untold_dual_grant(scheduler, req, why)
     if dropped:
         n = getattr(scheduler, "_q580_forget_n", 0) + 1
         scheduler._q580_forget_n = n
@@ -370,6 +371,16 @@ def forget_left_queue(scheduler, req, why: str) -> List[str]:
                 ",".join(dropped), n,
             )
     return dropped
+
+
+def _return_untold_dual_grant(scheduler, req, why: str) -> None:
+    """Q-630: PP0 drops a held request whose told never went out -- the group
+    grant it charged on the follower cards goes back (dual_p_kv_stage)."""
+    if int(getattr(getattr(scheduler, "ps", None), "pp_rank", 0) or 0) != 0:
+        return
+    from sglang.srt.weg2.dual_p_kv_stage import return_untold_grant
+
+    return_untold_grant(scheduler, req, why)
 
 
 def _queued_obj(scheduler, obj) -> bool:
@@ -1181,6 +1192,7 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             # Left the queue without an admission (abort, deferral elsewhere);
             # a re-queue holds it again through intake.
             held.pop(rid, None)
+            _return_untold_dual_grant(scheduler, req, "left_queue")
             _twin.take_pp0_twin(scheduler, rid)
             continue
         if getattr(req, "_dual_kv_wait", False):
@@ -1684,6 +1696,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             if rid in parked:
                 continue  # TK path 4: back through the hold release
             held.pop(rid, None)
+            _return_untold_dual_grant(scheduler, req, "left_queue")
             intake_t.pop(rid, None)
             _twin.take_pp0_twin(scheduler, rid)
             continue

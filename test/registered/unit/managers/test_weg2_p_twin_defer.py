@@ -87,6 +87,7 @@ class _Req:
         self.origin_input_ids = list(ids)
         self.extra_key = extra_key
         self.prefetch_deferred = None
+        self._dual_grant_untold = None  # Q-630: every Req carries it
         self.done = False
 
     def finished(self):
