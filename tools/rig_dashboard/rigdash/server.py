@@ -25,7 +25,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, history, imagechanges, ipcboot, kartenplan, launchview, live, redact, sampler, sources, vmpush, weg2line
+from . import energy, features, health, history, imagechanges, ipcboot, kartenplan, launchview, live, profil, redact, sampler, sources, vmpush, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -41,6 +41,7 @@ STATIC_FILES = {
 #: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
 DEV_STATIC_FILES = {
     "/kartenplan.js": ("kartenplan.js", "application/javascript; charset=utf-8"),
+    "/profil.js": ("profil.js", "application/javascript; charset=utf-8"),
 }
 
 
@@ -227,6 +228,11 @@ class App:
         self.src = sources.SourcesReader(self.ring_store) if self.sup is not None else sources.Sources(cfg)
         self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
         self.kartenplaner = kartenplan.Kartenplaner()
+        # Profil-Editor (Auftrag 930, S1): erstellt Profile, startet nichts
+        self.profil = profil.ProfilEditor(
+            kartenplaner=self.kartenplaner,
+            release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
+            user_dir=getattr(args, "profile_dir", None) or (os.path.join(args.state_dir, "profiles") if args.state_dir else profil.DEFAULT_USER_DIR))
         self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
                        else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
@@ -526,6 +532,64 @@ def make_handler(app: App):
                 return self._json(dict(app.weg2.dry_run(built), ok=True, line=built))
             return self._send(404, "not found", "text/plain")
 
+        def _profil_guard(self):
+            """None if allowed; else the (code, message) of the refusal.  The editor shows host paths and tunables of the
+            profiles and writes to the state volume: LAN only, never through the public proxy, never in the release edition."""
+            if app.edition == "release":
+                return 404, "not found"
+            if self._via_proxy():
+                return 403, "Der Profil-Editor ist nur im LAN erreichbar (http://192.168.0.88:8890/#t=profil)"
+            return None
+
+        def _profil_get(self, path):
+            bad = self._profil_guard()
+            if bad:
+                return self._json({"ok": False, "error": bad[1]}, bad[0]) if bad[0] != 404 else self._send(404, "not found", "text/plain")
+            try:
+                if path == "/api/profil/list":
+                    return self._json(dict(app.profil.list(), ok=True))
+            except profil.ProfilError as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
+            return self._send(404, "not found", "text/plain")
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            try:
+                if not path.startswith("/api/profil/"):
+                    return self._send(404, "not found", "text/plain")
+                bad = self._profil_guard()
+                if bad:
+                    return self._json({"ok": False, "error": bad[1]}, bad[0]) if bad[0] != 404 else self._send(404, "not found", "text/plain")
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > profil.MAX_BODY:
+                    return self._json({"ok": False, "error": "Anfrage zu groß"}, 413)
+                try:
+                    body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                except ValueError:
+                    return self._json({"ok": False, "error": "Körper ist kein JSON"}, 400)
+                if not isinstance(body, dict):
+                    return self._json({"ok": False, "error": "Körper muss ein JSON-Objekt sein"}, 400)
+                ed = app.profil
+                if path == "/api/profil/load":
+                    return self._json(ed.load(str(body.get("kind", "")), str(body.get("name", ""))))
+                if path == "/api/profil/edit":
+                    return self._json(ed.edit(body.get("doc"), body.get("edits") or []))
+                if path == "/api/profil/save":
+                    return self._json(ed.save(body.get("doc"), str(body.get("name", ""))))
+                if path == "/api/profil/delete":
+                    return self._json(ed.delete(str(body.get("name", ""))))
+                if path == "/api/profil/export":
+                    return self._json(ed.export_env(body.get("doc")))
+                if path == "/api/profil/dry":
+                    return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
+                return self._send(404, "not found", "text/plain")
+            except BrokenPipeError:
+                return None
+            except (profil.ProfilError, ValueError) as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
+            except Exception as e:
+                return self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             try:
@@ -564,6 +628,8 @@ def make_handler(app: App):
                     if q.get("from") and q.get("to"):
                         lo_hi = (float(q["from"]), float(q["to"]))     # a zoomed stretch (Klicken und Ziehen)
                     return self._json(app.history_view(model, q.get("range", "1h"), lo_hi=lo_hi))
+                if path.startswith("/api/profil/"):
+                    return self._profil_get(path)
                 if path.startswith("/api/kartenplan/"):
                     # Kartenplaner: reine Rechnung auf Planer-Funktionen und Aufzeichnungen, keine GPU, kein Launcher
                     if app.edition == "release":
@@ -651,6 +717,10 @@ def main(argv=None):
                     help="the feature list (built / in image / active / gain; im Image and aktiv are computed here)")
     ap.add_argument("--features-repo", default=features.DEFAULT_REPO,
                     help="git repo holding the image revs and feature commits")
+    ap.add_argument("--profiles-release-dir", default=os.environ.get("RIGDASH_PROFILES_RELEASE_DIR", profil.DEFAULT_RELEASE_DIR),
+                    help="the release profiles (<name>.env) the Profil editor can load")
+    ap.add_argument("--profile-dir", default=os.environ.get("RIGDASH_PROFILE_DIR", ""),
+                    help="where the Profil editor keeps user profiles (JSON); default <state-dir>/profiles, else /var/lib/flliper/profiles")
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     ap.add_argument("--edition", choices=EDITIONS, default=os.environ.get("RIGDASH_EDITION", "rig"),
