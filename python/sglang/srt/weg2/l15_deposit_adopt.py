@@ -48,6 +48,15 @@ class Deposit:
     n: int
     anchor_row: int
     skip_ranks: Tuple[int, ...]
+    # L15-DEPOSIT-SALT (300): the P request's extra_key (cache_salt / mm /
+    # lora namespace) from the depdone records; None = the field is absent =
+    # UNSALTED only, never "any"
+    extra_key: Optional[str] = None
+
+
+def record_extra_key(rec: dict) -> Optional[str]:
+    ek = rec.get("extra_key")
+    return None if ek is None else str(ek)
 
 
 # -- token ids (written by the P stage owning linear layer 0) --------------
@@ -105,7 +114,8 @@ def load_deposits(directory: str, epoch: int, att_layers: Sequence[int],
         r0 = by_rid[rid][0]
         ok.append(Deposit(rid, int(r0["epoch"]), int(r0["e_start"]), int(r0["n"]),
                           int(r0["anchor_row"]),
-                          tuple(int(x) for x in r0.get("skip_ranks", ()))))
+                          tuple(int(x) for x in r0.get("skip_ranks", ())),
+                          record_extra_key(r0)))
     return ok, bad
 
 
@@ -120,6 +130,8 @@ def _incomplete(recs: List[dict], epoch: int, want_att: List[int],
              tuple(r.get("skip_ranks", ()))) for r in recs}
     if len(keys) != 1:
         return "stages disagree on the slot range/anchor row"
+    if len({record_extra_key(r) for r in recs}) != 1:
+        return "stages disagree on the extra_key"
     n = int(recs[0]["n"])
     short = [r.get("linear") for r in recs if int(r.get("upto", -1)) != n]
     if short:
@@ -204,7 +216,13 @@ def span_for(dep: Deposit, token_ids: Sequence[int], match, kv_pool,
 
     if len(token_ids) != dep.n:
         return "token ids %d != n %d" % (len(token_ids), dep.n)
-    node, got = match(list(token_ids))
+    # L15-DEPOSIT-SALT (300): the chain is looked up under the request's own
+    # namespace (a one-argument match = unsalted only; a salted deposit then
+    # fails closed through the TypeError -> named refusal in the caller)
+    if dep.extra_key is None:
+        node, got = match(list(token_ids))
+    else:
+        node, got = match(list(token_ids), dep.extra_key)
     if node is None or int(got) != dep.n:
         return "D's tree covers %d of %d tokens" % (int(got or 0), dep.n)
     rows = chain_host_rows(node)
@@ -357,7 +375,8 @@ def adopt_deposits(*, directory: str, epoch: int, rank: int,
             l15_p_adopt.adopt(tree_cache, kv_alloc, mamba_alloc,
                               token_ids=toks[rid],
                               rows=list(range(d.e_start, d.e_start + d.n)),
-                              anchor_row=d.anchor_row)
+                              anchor_row=d.anchor_row,
+                              extra_key=d.extra_key)   # L15-DEPOSIT-SALT (300)
         except l15_p_adopt.L15AdoptRefused as exc:
             # checked free before the vote on every rank: a refusal here
             # means ranks diverged -- loud, never silent
@@ -414,9 +433,9 @@ def adopt_for_sched(sched, env, log, *, epoch: int, gather) -> List[str]:
         rank = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0)
         host_pool, host_mamba = l15_bind.live_host_pools(tree)
 
-        def match(ids):
+        def match(ids, extra_key=None):
             res = tree.match_prefix(MatchPrefixParams(key=RadixKey(
-                token_ids=list(ids), extra_key=None,
+                token_ids=list(ids), extra_key=extra_key,
                 is_bigram=getattr(tree, "is_eagle", False))))
             got = len(res.device_indices) + int(res.host_hit_length or 0)
             return res.best_match_node, got

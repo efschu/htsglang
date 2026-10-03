@@ -59,6 +59,9 @@ class DepositSession:
     cells: int = 0
     log: object = None
     chunks: int = 0
+    # L15-DEPOSIT-SALT (300): the P request's own extra_key (cache_salt / mm /
+    # lora namespace) -- the record carries it to D's adopt; None = unsalted
+    extra_key: Optional[str] = None
 
 
 _SESSIONS: Dict[str, DepositSession] = {}
@@ -86,6 +89,9 @@ def write_record(sess: DepositSession, *, anchor_bytes: int = 0,
         "skip_ranks": list(sess.skip_ranks),
         "failed": failed,
     }
+    if sess.extra_key is not None:
+        # absent = unsalted ONLY (an old record), never "any"
+        rec["extra_key"] = str(sess.extra_key)
     path = record_path(sess.directory, sess.rid, sess.stage_key)
     tmp = path + ".tmp"
     try:
@@ -116,7 +122,7 @@ def _close(sess: DepositSession, *, anchor_bytes: int = 0,
 
 def open_session(*, rid: str, prompt_len: int, hint: dict, d0: dict, geom,
                  fetch, n_d_ranks: int, mapper, directory: str,
-                 log) -> Optional[str]:
+                 log, extra_key: Optional[str] = None) -> Optional[str]:
     """Register the session; None on success, else the named reason (the
     mapper is closed again on a refusal)."""
     from sglang.srt.weg2.l15_hold_share import L15ShareError
@@ -160,7 +166,7 @@ def open_session(*, rid: str, prompt_len: int, hint: dict, d0: dict, geom,
         rid=rid, epoch=int(d0["epoch"]), e_start=e_start, n=n, anchor_row=a,
         skip_ranks=tuple(skip),
         geom=geom, shares=shares, mapper=mapper, directory=directory,
-        stage_key=stage_key, log=log)
+        stage_key=stage_key, log=log, extra_key=extra_key)
     log("L15-DEPOSIT-OPEN rid=%s stage=%s e_start=%d n=%d anchor_row=%d skip=%s"
         % (rid, stage_key, e_start, n, a, list(dep.get("skip_ranks", ()))))
     return None
@@ -193,7 +199,9 @@ def open_for_sched(sched, req, env, log) -> Optional[str]:
         hint=hint, d0=d0, geom=geom,
         fetch=lambda r: mapper.fetch(
             lambda q: l15_share_publish.fetch_share(directory, q), r),
-        n_d_ranks=geom.n_d, mapper=mapper, directory=directory, log=log)
+        n_d_ranks=geom.n_d, mapper=mapper, directory=directory, log=log,
+        # L15-DEPOSIT-SALT (300): the request's namespace, as its own tree uses it
+        extra_key=getattr(req, "extra_key", None))
 
 
 def _p_rows(sess: DepositSession, req, a: int, b: int) -> List[int]:
