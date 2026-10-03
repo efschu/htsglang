@@ -108,6 +108,11 @@ HARVEST_MAX_PER_SRC = 8
 REASON_ACKS = "acks"
 REASON_MISMATCH = "mismatch"
 REASON_FRIST = "frist"
+#: Q-920 B (dual P only): every follower acked the SAME resumable a, 0 < a < told, and PP0's own
+#: tree resumes at a -- the Admit names a (marker ``adopt``) instead of told=0.
+REASON_ADOPT = "adopt"
+WIRE_ADOPT = "adopt"
+ENV_ADOPT = "SGLANG_WEG2_DUAL_TOLD_ADOPT"
 
 _LOG_FIRST = 8
 _LOG_EVERY = 256
@@ -351,13 +356,54 @@ def pp0_harvest(scheduler) -> int:
     return n
 
 
-def pp0_decide(scheduler, rid: str, now: float) -> Optional[Tuple[int, str]]:
-    """``None`` = keep waiting; else ``(told to admit, reason)``."""
+def adopt_armed() -> bool:
+    """Q-920 B: dual P only (``dual_p_kv_stage.armed``), ``SGLANG_WEG2_DUAL_TOLD_ADOPT=0`` switches it off."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return False
+    return os.environ.get(ENV_ADOPT, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _adopt_depth(scheduler, o: "_Open", req, absolute: bool) -> Tuple[Optional[int], bool]:
+    """(a, wait): ``a`` = the depth every follower acked and PP0's own tree resumes at, when the
+    mismatch is the UNRESUMABLE shape (all acks equal, 0 < a < told); ``wait`` = the acks so far
+    are all that same ``a`` but a follower's is still out -- the verdict waits for it (PP0's
+    Frist bounds the wait, as for any missing ack)."""
+    if req is None or not absolute or not adopt_armed():
+        return None, False
+    vals = set(int(v) for v in o.acks.values())
+    if len(vals) != 1:
+        return None, False
+    a = next(iter(vals))
+    if not (0 < a < int(o.told)):
+        return None, False
+    try:
+        from sglang.srt.managers import weg2_told_fidelity as _tf
+
+        res = _tf.pp0_admissible(scheduler, req, a)
+    except Exception:  # noqa: BLE001 - a probe never breaks the verdict
+        res = None
+    if res is None or int(res) < a:
+        return None, False  # PP0's own tree cannot resume at a: told=0 as before
+    followers = range(1, int(scheduler.ps.pp_size))
+    return a, not all(r in o.acks for r in followers)
+
+
+def pp0_decide(scheduler, rid: str, now: float, req=None, absolute: bool = True) -> Optional[Tuple[int, str]]:
+    """``None`` = keep waiting; else ``(told to admit, reason)``. ``req`` / ``absolute`` (the
+    pacing record's) let the dual form adopt a follower-agreed resumable depth (Q-920 B)."""
     o = _pp0_open_map(scheduler).get(str(rid))
     if o is None:
         return 0, REASON_FRIST  # untracked paced rid: the always-uniform answer
     followers = range(1, int(scheduler.ps.pp_size))
     if any(own != o.told for own in o.acks.values()):
+        a, wait = _adopt_depth(scheduler, o, req, absolute)
+        if a is not None:
+            if not wait:
+                return a, REASON_ADOPT
+            if now < o.deadline:
+                return None  # the other follower's ack is one pass away; the Frist bounds this
         return 0, REASON_MISMATCH
     if all(r in o.acks for r in followers):
         return o.told, REASON_ACKS
@@ -366,9 +412,21 @@ def pp0_decide(scheduler, rid: str, now: float) -> Optional[Tuple[int, str]]:
     return None
 
 
-def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float) -> None:
+def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float,
+                     pp0_res: Optional[int] = None) -> None:
     o = _pp0_open_map(scheduler).pop(str(rid), None)
     acks = dict(o.acks) if o is not None else {}
+    if reason == REASON_ADOPT:
+        n = _bump(scheduler, "_q920_adopt_n")
+        if n <= 32 or n % _LOG_EVERY == 0:
+            logger.warning(
+                "PF TOLD-ADOPT rid=%s told=%d -> %d reason=%s after=%.2fs acks=%s followers=%d avoided_tokens=%d "
+                "(n=%d): every follower acked the same resumable depth and PP0's own tree resumes there -- "
+                "PP0 admits at it for EVERY rank (Q-920 B) instead of told=0",
+                str(rid), told, told_final, reason, now - published_at, acks,
+                int(scheduler.ps.pp_size) - 1, int(told_final), n,
+            )
+        return
     if reason == REASON_ACKS:
         n = _bump(scheduler, "_pf_admit_acks_n")
         if _say(n):
@@ -384,10 +442,39 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
             "PF TOLD-FALLBACK rid=%s told=%d -> 0 reason=%s after=%.2fs acks=%s "
             "followers=%d (n=%d): PP0 switches the request to told=0 for EVERY "
             "rank; P recomputes the prefix instead of the group dying in "
-            "STORE-TOLD WAIT EXCEEDED / MISMATCH",
+            "STORE-TOLD WAIT EXCEEDED / MISMATCH%s",
             rid[:8], told, reason, now - published_at, acks,
-            int(scheduler.ps.pp_size) - 1, n,
+            int(scheduler.ps.pp_size) - 1, n, _fidelity_detail(rid, reason, pp0_res),
         )
+
+
+def adopt_own_read(scheduler, rid: str, told: int) -> None:
+    """Q-920 B, PP0 and followers alike: this rank's read completed MORE than the adopted told (the
+    span up to the dropped told); it is SATISFIED at told -- its credit is popped, the admission
+    caps the radix match at told (``_weg2_prefix_cap``) and does not compare the read's count with
+    it (the follower_early_settle 'over' form). The read and its rows stay with the tree."""
+    from sglang.srt.managers import weg2_store_told as _st
+
+    try:
+        _st._pop_credit_keep_pin(scheduler.tree_cache, str(rid))
+    except Exception as exc:  # noqa: BLE001 - the satisfied mark below is what admission reads
+        logger.warning("Q-920 TOLD-ADOPT pop credit(%s) raised: %r", str(rid), exc)
+    satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
+    if satisfied is None:
+        satisfied = scheduler._weg2_store_told_satisfied = {}
+    satisfied[str(rid)] = int(told)
+
+
+def _fidelity_detail(rid: str, reason: str, pp0_res: Optional[int]) -> str:
+    """Q-920 C (measurement only, dual P only): what ``weg2_told_fidelity.pp0_admissible`` answered for
+    this verdict -- the depth PP0's own tree resumes at (reason=told_fidelity: the probe that zeroed
+    the Admit; every other reason: not probed). The y8x/y8z told_fidelity cases (7) could not be sized
+    from the line (analysis 860 section 3 C). The flip form's line is unchanged."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return ""
+    return " | Q-920 C full_rid=%s pp0_admissible=%s" % (str(rid), "not_probed" if pp0_res is None else int(pp0_res))
 
 
 def release_own_read(scheduler, rid: str) -> None:
@@ -457,6 +544,20 @@ def follower_forget(scheduler, rid: str) -> None:
     _room_hold_end(scheduler, rid, "verdict")  # Q-693: PP0 decided before the held ack
     if st.outbox:
         st.outbox = [e for e in st.outbox if e[0] != rid]
+
+
+def follower_adopt(scheduler, rid: str, told: int) -> None:
+    """``Admit(a, adopt)`` absorbed (Q-920 B): the ack bookkeeping goes as for any Admit, the read
+    is kept and satisfied at ``a``."""
+    follower_forget(scheduler, rid)
+    adopt_own_read(scheduler, rid, told)
+    n = _bump(scheduler, "_q920_follower_adopt_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-ADOPT ABSORBED rank pp=%s rid=%s told=%d (n=%d): PP0 admitted at the depth this "
+            "rank acked; the read is kept and satisfied there (Q-920 B)",
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid), int(told), n,
+        )
 
 
 def follower_release(scheduler, rid: str) -> None:
@@ -591,8 +692,9 @@ def _room_own(scheduler, req, rid: str, own: int) -> Optional[int]:
             "PF TOLD-ACK NO-ROOM rank pp=%s rid=%s told=%d loadback_rows=%d room=%d (n=%d): "
             "this rank holds the told span on its HOST only and cannot load it back even "
             "with every evictable row freed -- the ack says 0 and PP0 answers told=0 for "
-            "every rank instead of an SF LOADBACK-ROOM residual and #968 after PP0 admitted",
+            "every rank instead of an SF LOADBACK-ROOM residual and #968 after PP0 admitted%s",
             getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(rows), room, n,
+            _noroom_detail(scheduler, rid),
         )
     return 0
 
@@ -663,47 +765,237 @@ def inflight_release_rows(scheduler, req) -> int:
     return rows
 
 
+def _int_or_none(fn) -> Optional[int]:
+    try:
+        v = fn()
+        if isinstance(v, (tuple, list)):
+            v = v[0]
+        return None if v is None else int(v)
+    except Exception:  # noqa: BLE001 - an observation never breaks the ack
+        return None
+
+
+def pool_snapshot(scheduler) -> Dict[str, Any]:
+    """Q-920 (observability, dual P only): what this rank's pool holds right now.
+    ``available`` (allocator free list), ``evictable``, ``protected`` (rows locked
+    by requests and publish pins), ``publish`` (write-through / backup nodes in
+    flight), ``usage`` = 1 - (available + evictable) / total, and the last
+    ``MAPPED-BY-GRANT``: tokens it added and its age. None = not readable."""
+    tree = getattr(scheduler, "tree_cache", None)
+    alloc = getattr(tree, "token_to_kv_pool_allocator", None)
+    avail = _int_or_none(getattr(alloc, "available_size", lambda: None))
+    evictable = _int_or_none(getattr(tree, "evictable_size", lambda: None))
+    protected = _int_or_none(getattr(tree, "protected_size", lambda: None))
+    publish = None
+    try:
+        publish = len(getattr(tree, "ongoing_write_through", None) or ()) + len(
+            getattr(tree, "ongoing_backup", None) or ())
+    except Exception:  # noqa: BLE001
+        publish = None
+    total = getattr(scheduler, "max_total_num_tokens", None)
+    if total is None:
+        total = getattr(alloc, "size", None)
+    usage = None
+    try:
+        if avail is not None and evictable is not None and total:
+            usage = round(1.0 - (avail + evictable) / float(total), 3)
+    except Exception:  # noqa: BLE001
+        usage = None
+    grant_new, grant_age = None, None
+    try:
+        from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+        lg = getattr(_dpk._actor(scheduler), "last_grant", None)
+        if lg:
+            grant_age, grant_new = round(time.monotonic() - float(lg[0]), 2), int(lg[1])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"available": avail, "evictable": evictable, "protected": protected, "publish": publish,
+            "usage": usage, "grant_new": grant_new, "grant_age": grant_age}
+
+
+def _noroom_detail(scheduler, rid: str) -> str:
+    """Q-920: the dual NO-ROOM line's extra terms; "" in the flip form (its line is unchanged)."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return ""
+    p = pool_snapshot(scheduler)
+    return (" | Q-920 full_rid=%s available=%s evictable=%s protected=%s pending_publish=%s usage=%s "
+            "grant_new=%s grant_age_s=%s" % (str(rid), p["available"], p["evictable"], p["protected"],
+                                              p["publish"], p["usage"], p["grant_new"], p["grant_age"]))
+
+
+NOHOLD_MARK = "PF TOLD-ACK ROOM-NOHOLD"
+
+
+def _room_nohold(scheduler, why: str, rid: str, rows: int, room: int, pending: int) -> None:
+    """Q-920 (dual P only): WHY a NO-ROOM shortfall was not held -- one capped line per refusal
+    (y8z had 0 ROOM-HOLD lines and no way to tell whether the check ran)."""
+    n = _bump(scheduler, "_q920_nohold_n")
+    if not (n <= 32 or n % _LOG_EVERY == 0):
+        return
+    p = pool_snapshot(scheduler)
+    logger.warning(
+        "%s why=%s rid=%s room=%d rows=%d pending=%d usage=%s protected=%s available=%s evictable=%s "
+        "pending_publish=%s rank pp=%s (n=%d)",
+        NOHOLD_MARK, why, str(rid), int(room), int(rows), int(pending), p["usage"], p["protected"],
+        p["available"], p["evictable"], p["publish"], getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), n,
+    )
+
+
+# Q-920 A1 JUST-FINISHED (analysis 860, y8z P.log:58743-58777, 19:22:56 PP1 weg2-0-201 told=20224
+# room=2697): the predecessor weg2-0-200 had driven its last chunk and was ``finished`` BEFORE the ack
+# (PASS-TAIL finished=1), but its rows were still pinned by the publish sweep (in_flight_after=1,
+# pins=1/5; usage 0.99 -> 0.53 one second later). Q-693 counts only requests still in a ring slot, so
+# pending was 0, the verdict 'stable', the ack 0 and 21766 tokens were re-prefilled. A request that left
+# this rank's in-flight set within the last JF_PASSES follower passes (tracked per pump) is a
+# 'just-finished' predecessor: while publish nodes are still in flight and its rows cover the
+# shortfall the ack is held exactly like Q-693's (PP0's Frist bounds it; the next pump re-reads).
+ROOM_HOLD_JF = "just-finished"
+ENV_JF_PASSES = "SGLANG_WEG2_DUAL_ROOM_JF_PASSES"
+JF_PASSES_DEFAULT = 2
+_JF_ATTR = "_q920_jf_track"
+_JF_HOLD_ATTR = "_q920_jf_hold"
+
+
+def jf_passes() -> int:
+    try:
+        return max(0, int(os.environ.get(ENV_JF_PASSES, "") or JF_PASSES_DEFAULT))
+    except ValueError:
+        return JF_PASSES_DEFAULT
+
+
+def jf_note_pass(scheduler) -> None:
+    """Every follower pump (dual P only): remember which in-flight requests this rank held at the
+    previous pump and note those that are gone now as finished at this pass."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return
+    st = getattr(scheduler, _JF_ATTR, None)
+    if st is None:
+        st = {"pass": 0, "live": {}, "done": {}}
+        setattr(scheduler, _JF_ATTR, st)
+    st["pass"] += 1
+    cur: Dict[int, Tuple[str, int]] = {}
+    for r in _inflight_reqs(scheduler, None):
+        fill = len(getattr(r, "fill_ids", None) or ())
+        if fill > 0:
+            cur[id(r)] = (str(getattr(r, "rid", "")), fill)
+    for k, (rid, fill) in st["live"].items():
+        if k not in cur:
+            st["done"][rid] = (st["pass"], fill)
+    st["live"] = cur
+    horizon = jf_passes()
+    held = getattr(scheduler, _JF_HOLD_ATTR, None) or {}
+    for rid in [r for r, (p, _f) in st["done"].items() if st["pass"] - p > horizon and r not in held]:
+        st["done"].pop(rid, None)
+    while len(st["done"]) > 256:
+        st["done"].pop(next(iter(st["done"])), None)
+
+
+def _jf_rows(scheduler, rid: str) -> Tuple[int, int]:
+    """(rows, passes_ago) of the requests that finished on this rank within the last JF_PASSES
+    pump passes; a hold already taken keeps the rows it was taken for."""
+    kept = (getattr(scheduler, _JF_HOLD_ATTR, None) or {}).get(rid)
+    if kept is not None:
+        return int(kept), -1
+    st = getattr(scheduler, _JF_ATTR, None)
+    if not st:
+        return 0, 0
+    horizon, rows, ago = jf_passes(), 0, 0
+    for r, (p, fill) in st["done"].items():
+        if r != rid and st["pass"] - p <= horizon:
+            rows += fill
+            ago = max(ago, st["pass"] - p)
+    return rows, ago
+
+
+def _publish_pending(scheduler) -> int:
+    tree = getattr(scheduler, "tree_cache", None)
+    try:
+        return len(getattr(tree, "ongoing_write_through", None) or ()) + len(getattr(tree, "ongoing_backup", None) or ())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _room_hold(scheduler, req, rid: str, own: int, rows: int, room: int) -> bool:
     """Q-693 (dual P only): True = hold this ack, the shortfall is a predecessor
-    in flight that releases it."""
+    in flight that releases it (Q-920 A1: or one that finished a moment ago and
+    whose rows the publish pins still hold)."""
     from sglang.srt.weg2 import dual_p_kv_stage as _dpk
 
     if not _dpk.armed():
         return False
     if not any(r is req for r in (getattr(scheduler, "waiting_queue", None) or ())):
+        _room_nohold(scheduler, "left_queue", rid, rows, room, 0)
         _room_hold_end(scheduler, rid, "left_queue")
         return False  # aborted / gone here: nothing to hold for
     pending = inflight_release_rows(scheduler, req)
-    if pending <= 0 or room + pending < rows:
+    reason, covered, ago = None, 0, 0
+    if pending > 0 and room + pending >= rows:
+        reason, covered = "inflight", pending
+    else:
+        fin, ago = _jf_rows(scheduler, rid)
+        if fin > 0 and room + max(pending, 0) + fin >= rows and _publish_pending(scheduler) > 0:
+            reason, covered = ROOM_HOLD_JF, fin
+        elif fin > 0:
+            why = "just-finished_unpinned" if _publish_pending(scheduler) <= 0 else "just-finished_too_small"
+            _room_nohold(scheduler, why, rid, rows, room, pending)
+            _room_hold_end(scheduler, rid, "stable")
+            return False
+    if reason is None:
+        _room_nohold(scheduler, "no_predecessor" if pending <= 0 else "predecessor_too_small",
+                     rid, rows, room, pending)
         _room_hold_end(scheduler, rid, "stable")
         return False
     holds = getattr(scheduler, _ROOM_HOLD_ATTR, None)
     if holds is None:
         holds = {}
         setattr(scheduler, _ROOM_HOLD_ATTR, holds)
+    if reason == ROOM_HOLD_JF:
+        jf_hold = getattr(scheduler, _JF_HOLD_ATTR, None)
+        if jf_hold is None:
+            jf_hold = {}
+            setattr(scheduler, _JF_HOLD_ATTR, jf_hold)
+        jf_hold.setdefault(rid, covered)
     if rid not in holds:
         holds[rid] = time.monotonic()
         n = _bump(scheduler, "_q693_room_hold_n")
         if n <= 32 or n % _LOG_EVERY == 0:
             logger.warning(
-                "%s rank pp=%s rid=%s told=%d loadback_rows=%d room=%d predecessor_rows=%d (n=%d): "
-                "the pool is short only by a predecessor still in flight on this rank -- the ack "
-                "is held and re-read every pass instead of 0 (Q-693; PP0's Frist bounds it)",
-                ROOM_HOLD_MARK, getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, rows,
-                room, pending, n,
+                "%s reason=%s rank pp=%s rid=%s told=%d loadback_rows=%d room=%d %s=%d pending_publish=%d "
+                "passes_ago=%s (n=%d): the pool is short only by a predecessor that %s on this rank -- the "
+                "ack is held and re-read every pass instead of 0 (Q-693/Q-920; PP0's Frist bounds it)",
+                ROOM_HOLD_MARK, reason, getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, rows, room,
+                "predecessor_rows" if reason == "inflight" else "finished_rows", covered,
+                _publish_pending(scheduler), ago, n,
+                "is still in flight" if reason == "inflight" else "finished a moment ago and whose rows the "
+                "publish pins still hold",
             )
     return True
 
 
 def _room_hold_end(scheduler, rid: str, how: str) -> None:
+    (getattr(scheduler, _JF_HOLD_ATTR, None) or {}).pop(rid, None)
     holds = getattr(scheduler, _ROOM_HOLD_ATTR, None)
     if not holds or rid not in holds:
+        if how == "stable":
+            # Q-920: a 'stable' verdict without a hold used to be silent (y8z: 0 ROOM-HOLD lines)
+            n = _bump(scheduler, "_q920_stable_nohold_n")
+            if n <= 32 or n % _LOG_EVERY == 0:
+                logger.warning(
+                    "%s END rank pp=%s rid=%s how=stable held_s=none (no hold was taken: the shortage "
+                    "was stable at the first look, ack 0) (n=%d)",
+                    ROOM_HOLD_MARK, getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), str(rid), n,
+                )
         return
     t0 = holds.pop(rid)
     logger.warning(
         "%s END rank pp=%s rid=%s how=%s held_s=%.2f (room = the predecessor released; stable = "
         "the shortage outlived it, ack 0; verdict = PP0 decided first, its Frist)",
-        ROOM_HOLD_MARK, getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), str(rid)[:12], how,
+        ROOM_HOLD_MARK, getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), str(rid), how,
         time.monotonic() - t0,
     )
 
@@ -724,6 +1016,7 @@ def follower_pump(scheduler) -> None:
     st = _fstate(scheduler)
     if st is None:
         return
+    jf_note_pass(scheduler)  # Q-920 A1 (dual P only): which predecessors just finished
     tree = scheduler.tree_cache
     free = None
     for rid in list(st.registered):
