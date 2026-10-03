@@ -8,7 +8,7 @@ verdict=hold`` and held a queued batch for 39.2 s, until FAIRNESS fired and a
 short admitted during the hold had to be drained too (11.3 s).
 
 Hermetic: no GPU, no model, no server. The flag SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN
-defaults to off (behaviour byte-identical to before); on, the price is the flip
+defaults to ON since 03.10. (110; =0 is the old price); on, the price is the flip
 without its drain.
 """
 
@@ -42,11 +42,22 @@ def _qwen27b_form(monkeypatch):
         flip="family", vision="off", profile="qwen27b", model="m").env_value())
 
 
-def test_flag_default_off_keeps_the_old_price_and_provenance():
-    assert front_mod.envs.SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN.get() is False
-    f = _front()
-    f.flip_log.append(dict(REC_DRAINED))
-    assert f._derived_min_dwell_ms("D", "P") == (31115.0, "last-flip-D->P")
+def test_flag_off_keeps_the_old_price_and_provenance():
+    with mock.patch.dict(os.environ, {"SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN": "0"}):
+        assert front_mod.envs.SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN.get() is False
+        f = _front()
+        f.flip_log.append(dict(REC_DRAINED))
+        assert f._derived_min_dwell_ms("D", "P") == (31115.0, "last-flip-D->P")
+
+
+def test_flag_default_is_on_without_any_profile_line():
+    """110: proven on the 27B metal (w109290020, 129x drain-excluded) and on NF."""
+    env = {k: v for k, v in os.environ.items() if k != "SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN"}
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert front_mod.envs.SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN.get() is True
+        f = _front()
+        f.flip_log.append(dict(REC_DRAINED))
+        assert f._derived_min_dwell_ms("D", "P") == (1445.0, "last-flip-D->P:drain-29670ms-excluded")
 
 
 def test_flag_on_prices_the_flip_without_its_drain():
