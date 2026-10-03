@@ -104,7 +104,7 @@ def pp0_admissible(scheduler, req, told: int) -> Optional[int]:
         return min(int(depth), int(told))
     except Exception as exc:  # noqa: BLE001 - a probe never breaks publication
         logger.warning("#TF told-fidelity probe skipped for rid=%s: %r",
-                       str(getattr(req, "rid", "?"))[:12], exc)
+                       str(getattr(req, "rid", "?")), exc)
         return None
 
 
@@ -137,6 +137,6 @@ def pp0_verdict(scheduler, req, told: int, absolute: bool = True) -> tuple:
         "the Admit carries told=0 for EVERY rank (PF fallback: every read released, "
         "every stage prefills from 0) instead of PP0 admitting a different prefix than "
         "the followers adopt (rc12k27 b1: W27 start split 512 vs 16895)",
-        str(getattr(req, "rid", "?"))[:16], int(told), int(depth), int(own), n,
+        str(getattr(req, "rid", "?")), int(told), int(depth), int(own), n,
     )
     return 0, own

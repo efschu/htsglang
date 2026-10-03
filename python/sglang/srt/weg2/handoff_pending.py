@@ -811,11 +811,11 @@ def _note_ordered(keep: Keep, cands, n: int, site: str) -> None:
         r = int(keep.rid_ix[p])
         per.setdefault(r, []).append(int(keep.page[p]))
     ranks = _rid_ranks(keep)
-    parts = [f"{keep.rids[r][:14]}:rank={int(ranks[r])},pages={len(v)},lowest_page={min(v)}"
+    parts = [f"{keep.rids[r]}:rank={int(ranks[r])},pages={len(v)},lowest_page={min(v)}"
              for r, v in sorted(per.items(), key=lambda kv: -int(ranks[kv[0]]))]
     logger.info("#248e ORDERED-EVICT n=%d site=%s need=%d took=%d read_order=%s victims=[%s] (kept pages leave "
                 "in hold order, the last-read rid first and every chain from its tail -- the head of the next "
-                "read stays in L2)", k, site, int(n), len(cands), [r[:14] for r in _READ_ORDER[:8]],
+                "read stays in L2)", k, site, int(n), len(cands), _READ_ORDER[:8],
                 "; ".join(parts))
 
 

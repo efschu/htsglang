@@ -377,7 +377,7 @@ def _note_form_a_dcp_worker_floor(
                 "than the host admits (token cut, #239), so the group takes the "
                 "worker's reach; the realize round decides whether the host can "
                 "resume there or the group re-prefills (H97).",
-                str(rid)[:16],
+                str(rid),
                 int(group_max.get(rid, g)),
                 int(g),
                 n,
@@ -470,7 +470,7 @@ def apply_realize_verdict(
                     "cannot admit the group depth (no usable anchor there), so the "
                     "group re-prefills this rid from 0 on every rank (H97, rc9m "
                     "weg2-18-15 died on H96 CAP-MISS instead).",
-                    str(rid)[:16],
+                    str(rid),
                     int(skewed[rid]),
                     n,
                 )
@@ -531,7 +531,7 @@ def group_floor_zeroes(tree_cache: Any, req: Any, result: Any) -> bool:
         local = _local_match_len(result)
     except Exception as exc:  # noqa: BLE001 - re-raised by name
         raise RankFloorUndecidable(
-            f"RU FLOOR UNDECIDABLE rid={rid[:16]}: this rank could not measure "
+            f"RU FLOOR UNDECIDABLE rid={rid}: this rank could not measure "
             f"its own match ({type(exc).__name__}: {exc}); its peers act on the "
             "group verdict, so guessing here would split the extend."
         ) from exc
@@ -546,7 +546,7 @@ def group_floor_zeroes(tree_cache: Any, req: Any, result: Any) -> bool:
                 "store/host walk refused it), so every rank re-prefills from 0 "
                 "instead of this one alone resuming -- the #928 shape, taken "
                 "group-uniformly (raenge-nie-uneins).",
-                rid[:16],
+                rid,
                 local,
                 n,
             )
@@ -622,7 +622,7 @@ def group_floor_cap(tree_cache: Any, req: Any, result: Any) -> Optional[int]:
         local = _admission_len(result)
     except Exception as exc:  # noqa: BLE001 - re-raised by name (H99 audit)
         raise RankFloorUndecidable(
-            f"RU FLOOR UNDECIDABLE rid={rid[:16]}: this rank could not measure "
+            f"RU FLOOR UNDECIDABLE rid={rid}: this rank could not measure "
             f"its own match ({type(exc).__name__}: {exc}) for the H96 cap."
         ) from exc
     if floor_verdict(local, group.get(rid)) != "above_group":
@@ -649,7 +649,7 @@ def rematch_at_group_depth(tree_cache: Any, params: Any, cap: int, local: int) -
     n = _STATS["above_group"]
     if got != int(cap):
         raise RankFloorCapMiss(
-            f"H96 RU FLOOR CAP-MISS rid={rid[:16]} local_match={local} "
+            f"H96 RU FLOOR CAP-MISS rid={rid} local_match={local} "
             f"group_usable={cap} capped_match={got}: this rank has no usable "
             "recurrent anchor at the group depth, so it cannot admit what the "
             "other TP ranks admit -- stopping instead of resuming alone "
@@ -661,7 +661,7 @@ def rematch_at_group_depth(tree_cache: Any, params: Any, cap: int, local: int) -
             "(n=%d): this rank matched deeper than the group can use; it "
             "admits the group depth so every TP rank runs the same extend "
             "(H96, rc9l weg2-21-21 hung on the uncapped split).",
-            rid[:16],
+            rid,
             local,
             cap,
             got,
@@ -964,7 +964,7 @@ def form_a_follow_admission(tree_cache: Any, req: Any, result: Any) -> Optional[
     local = host_admission_len(result)  # H105b: what the host ADMITS
     if g > 0 and local < g:
         raise FormAHostBelowGroup(
-            f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid[:16]} local_match={local} "
+            f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid} local_match={local} "
             f"group={g}: the attention host admits less than the depth the group "
             "planted from its own admission probe; the workers adopt the group "
             "depth, so admitting the smaller one would split the extend -- "
@@ -987,7 +987,7 @@ def form_a_host_zero_guard(tree_cache: Any, req: Any, why: str) -> None:
     g = group.get(rid)
     if g is not None and int(g) > 0:
         raise FormAHostBelowGroup(
-            f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid[:16]} group={int(g)} "
+            f"H98 RU FORM-A HOST-BELOW-GROUP rid={rid} group={int(g)} "
             f"local=0 ({why}): the attention host refuses a depth its own "
             "admission probe voted; the workers adopt it -- stopping by name "
             "instead of splitting the extend (raenge-nie-uneins)."
@@ -1009,7 +1009,7 @@ def follow_rematch(tree_cache: Any, params: Any, depth: int, local: int) -> Any:
     rid = str(getattr(getattr(params, "req", None), "rid", "") or "")
     if got != int(depth):
         raise FormAFollowMiss(
-            f"H98 RU FORM-A FOLLOW-MISS rid={rid[:16]} tp0_depth={int(depth)} "
+            f"H98 RU FORM-A FOLLOW-MISS rid={rid} tp0_depth={int(depth)} "
             f"worker_local={int(local)} followed={got}: this expert worker cannot "
             "present the host's depth on its KV path although its reach vote "
             "covered it -- stopping instead of extending a different shape."
@@ -1025,7 +1025,7 @@ def follow_rematch(tree_cache: Any, params: Any, depth: int, local: int) -> Any:
             "(n=%d): this expert worker holds no KV/mamba bytes, so its own "
             "anchor verdict is bookkeeping; it admits the attention host's depth "
             "(H98, rc9l/rc9m).",
-            rid[:16],
+            rid,
             int(depth),
             int(local),
             got,
@@ -1108,7 +1108,7 @@ class FormAAdmissionWedgeWatch:
         if waited < self.limit_s:
             return ""
         return (
-            f"H106 FORM-A ADMISSION DEADLOCK rid={str(rid)[:16]} host={code} "
+            f"H106 FORM-A ADMISSION DEADLOCK rid={str(rid)} host={code} "
             f"price={price} budget={budget} refusals={self._refusals} "
             f"stuck_s={waited:.1f} running=0: the attention host's gate refused "
             "the queue head with nothing running and neither its price nor the "
@@ -1146,7 +1146,7 @@ def _note_admission_wait(rid: str, host_code: str, host_price, host_budget,
                 "host_budget=%s local=%s local_price=%s local_budget=%s "
                 "refusals=%d waited_s=%.1f (n=%d): the attention host's gate "
                 "refuses; the request stays queued on every rank.",
-                rid[:16], host_code, host_price, host_budget, local, price,
+                rid, host_code, host_price, host_budget, local, price,
                 budget, ent[1], time.monotonic() - ent[0], n,
             )
         return
@@ -1155,7 +1155,7 @@ def _note_admission_wait(rid: str, host_code: str, host_price, host_budget,
         logger.info(
             "H105 RU FORM-A ADMISSION AFTER-WAIT rid=%s refusals=%d waited_s=%.1f "
             "host_price=%s host_budget=%s",
-            rid[:16], ent[1], time.monotonic() - ent[0], host_price, host_budget,
+            rid, ent[1], time.monotonic() - ent[0], host_price, host_budget,
         )
 
 
@@ -1210,7 +1210,7 @@ def form_a_admission_verdict(
     )
     if not isinstance(got, tuple) or len(got) not in (4, 6):
         raise FormAAdmissionSplit(
-            f"H105 RU FORM-A ADMISSION MALFORMED rid={rid[:16]} got={str(got)[:120]}: "
+            f"H105 RU FORM-A ADMISSION MALFORMED rid={rid} got={str(got)[:120]}: "
             "this rank is at the admission gate but the host sent no verdict -- "
             "the ranks' admission loops made different numbers of gate calls; "
             "stopping instead of admitting on a guess (raenge-nie-uneins)."
@@ -1218,8 +1218,8 @@ def form_a_admission_verdict(
     host_rid, host_code = str(got[0]), str(got[1])
     if host_rid != rid:
         raise FormAAdmissionSplit(
-            f"H105 RU FORM-A ADMISSION SPLIT host_rid={host_rid[:16]} "
-            f"local_rid={rid[:16]} host={host_code}: this rank reached the "
+            f"H105 RU FORM-A ADMISSION SPLIT host_rid={host_rid} "
+            f"local_rid={rid} host={host_code}: this rank reached the "
             "admission gate for a different request than the attention host -- "
             "the queues or the loop's skips diverged; stopping by name instead "
             "of building a different extend (raenge-nie-uneins)."
@@ -1232,7 +1232,7 @@ def form_a_admission_verdict(
                 "H105 RU FORM-A ADMISSION FOLLOW rid=%s host=%s worker_local=%s "
                 "(n=%d): the attention host holds the KV and arena bytes, so its "
                 "gate is the group's; this worker takes it.",
-                rid[:16],
+                rid,
                 host_code,
                 local,
                 n,
@@ -1258,7 +1258,7 @@ def _form_a_dcp_admission_verdict(
         or any(not isinstance(v, tuple) or len(v) != 4 for v in got)
     ):
         raise FormAAdmissionSplit(
-            f"H105 RU FORM-A ADMISSION MALFORMED rid={rid[:16]} got={str(got)[:120]}: "
+            f"H105 RU FORM-A ADMISSION MALFORMED rid={rid} got={str(got)[:120]}: "
             "this rank is at the admission gate but the group's gather carries no "
             "verdict from every rank -- the ranks' admission loops made different "
             "numbers of gate calls; stopping instead of admitting on a guess "
@@ -1267,8 +1267,8 @@ def _form_a_dcp_admission_verdict(
     rids = [str(v[0]) for v in got]
     if any(r != rid for r in rids):
         raise FormAAdmissionSplit(
-            f"H105 RU FORM-A ADMISSION SPLIT rids={[r[:16] for r in rids]} "
-            f"local_rid={rid[:16]}: the ranks reached the admission gate for "
+            f"H105 RU FORM-A ADMISSION SPLIT rids={list(rids)} "
+            f"local_rid={rid}: the ranks reached the admission gate for "
             "different requests -- the queues or the loop's skips diverged; "
             "stopping by name instead of building a different extend "
             "(raenge-nie-uneins)."
@@ -1287,7 +1287,7 @@ def _form_a_dcp_admission_verdict(
                         "expert worker owns full-attention rows, so its pool gate is "
                         "the group's too (#239 S3d); the request stays queued on "
                         "every rank.",
-                        rid[:16], r, code, v[2], v[3], n,
+                        rid, r, code, v[2], v[3], n,
                     )
                 break
     if not is_host:
@@ -1497,7 +1497,7 @@ def adopt_host_prefetch_span(tree_cache: Any, req: Any, match_end: int) -> Optio
             "byteless shadow anchors; its prefetch span abstained in the #580 "
             "vote and its request bookkeeping takes the attention host's (H99, "
             "rc9o weg2-33-33 W65 min=320 max=6720).",
-            rid[:16],
+            rid,
             m0,
             local,
             int(span),

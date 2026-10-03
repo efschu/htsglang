@@ -4765,7 +4765,7 @@ class SchedulerWeightUpdaterManager:
                 "H91e SLEEP-DRAIN HOLD-OWNED prefetch=%d rids=%s: store->host "
                 "reads of the #1443 dormant hold (KV pool paused; the device "
                 "load is the wake's) -- not a sleep term, they keep running",
-                len(owned), sorted(r[:12] for r in owned),
+                len(owned), sorted(owned),
             )
         first = list(blockers())
         # H136: the decode-round cadence of the storage-queue agreement
@@ -6200,7 +6200,7 @@ class SchedulerWeightUpdaterManager:
                 ext = sp._pp_load_back_extent(req)
                 if not ext:
                     logger.info("WEG2-PRELOAD rid=%s no host extent (device hit %d)",
-                                str(getattr(req, "rid", "?"))[:12],
+                                str(getattr(req, "rid", "?")),
                                 0 if getattr(req, "prefix_indices", None) is None
                                 else len(req.prefix_indices))  # SL: no bool() of a tensor
                     continue
@@ -6217,9 +6217,9 @@ class SchedulerWeightUpdaterManager:
                         tree.dec_lock_ref(old_last, dec)
                 n += 1
                 logger.info("WEG2-PRELOAD rid=%s extent=%d issued=%d tokens",
-                            str(getattr(req, "rid", "?"))[:12], int(ext), int(new_indices.numel()))
+                            str(getattr(req, "rid", "?")), int(ext), int(new_indices.numel()))
             except Exception as exc:  # noqa: BLE001 -- init_new loads it later as before
-                logger.info("WEG2-PRELOAD rid=%s skipped: %r", str(getattr(req, "rid", "?"))[:12], exc)
+                logger.info("WEG2-PRELOAD rid=%s skipped: %r", str(getattr(req, "rid", "?")), exc)
         logger.info("WEG2-PRELOAD held=%d issued=%d ms=%.0f", len(hold), n, (time.perf_counter() - t0) * 1000)
         return n
 

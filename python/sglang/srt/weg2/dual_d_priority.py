@@ -48,7 +48,7 @@ def refuse_d_retract(batch, *, kv_full: bool, reason, env=None) -> None:
     if not d_retract_forbidden(env):
         return
     reqs = list(getattr(batch, "reqs", None) or ())
-    rids = [str(getattr(r, "rid", "?"))[:16] for r in reqs]
+    rids = [str(getattr(r, "rid", "?")) for r in reqs]
     raise Weg2DualDRetract(
         "%s: group D of the dual layout was about to retract %s (kv_full=%s, reason=%s) -- decode is "
         "never interrupted here; P must have stopped, freed its KV or slept before D's pool ran full"
@@ -168,7 +168,7 @@ def grow_or_hold(sched, batch, num_tokens_next: int, *, now=time.monotonic, env=
     ep["n"] += 1
     ms = int((t - ep["t0"]) * 1000)
     expired = -int(gmin([-(1 if ms >= hold_max_s(env) * 1000 else 0)])[0]) > 0
-    rids = [str(getattr(r, "rid", "?"))[:16] for r in (getattr(batch, "reqs", None) or ())]
+    rids = [str(getattr(r, "rid", "?")) for r in (getattr(batch, "reqs", None) or ())]
     if expired:
         setattr(sched, _SCHED_ATTR, None)
         logger.error("%s n=%d ms=%d EXPIRED after %s=%.0f s (need=%d avail=%d mapped=%d top=%d) -- the "

@@ -417,7 +417,7 @@ def _weg2_cap_deliverable(req_id, deliverable: int, no_writer: bool, hit_tokens:
                 "-> deliverable=%d (n=%d): no writer can deliver pages past what the store "
                 "holds for these keys (no hand-off chain, no hand-off record, no tail part), "
                 "so the read is complete as it stands",
-                str(req_id)[:16], int(deliverable), known, int(hit_tokens), int(synced), capped, n)
+                str(req_id), int(deliverable), known, int(hit_tokens), int(synced), capped, n)
     return capped
 
 
@@ -2936,7 +2936,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         "#969L COMMIT-AT-INSERT n=%d rid=%s committed=%s src=%s "
                         "is_insert=%s origin=%d out=%d readmit=%s",
                         _n,
-                        str(getattr(req, "rid", "?"))[:8],
+                        str(getattr(req, "rid", "?")),
                         kv_committed_len,
                         getattr(req, "_kvc_src", "UNSTAMPED"),
                         is_insert,
@@ -5537,7 +5537,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         logger.info("WEG2 MAMBA-ARENA FLUSH-SPILL n=%d node=%s victim_rid=%s victim_node=%s depth=%d "
                     "on_disk=%d written=%d (sleep flush: the victim's anchor is on L3, its slot freed "
                     "for the un-backed node -- no anchor lost, no D recompute after the wake)",
-                    UnifiedRadixCache._weg2_flush_spill_n, getattr(node, "id", "?"), str(victim.rid)[:16],
+                    UnifiedRadixCache._weg2_flush_spill_n, getattr(node, "id", "?"), str(victim.rid),
                     victim.node.id, victim.depth, int(sec.get("on_disk", 0) or 0),
                     int(sec.get("written", 0) or 0))
         return True
@@ -5583,7 +5583,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         UnifiedRadixCache._weg2_displace_n = n
         if n <= 16 or n % 64 == 0 or victim.rid != for_rid:
             logger.info("WEG2 MAMBA-ARENA DISPLACE n=%d why=%s for_rid=%s victim_rid=%s node=%s depth=%d dropped=%d",
-                        n, why, for_rid[:12], victim.rid[:12], victim.node.id, victim.depth, dropped)
+                        n, why, for_rid, victim.rid, victim.node.id, victim.depth, dropped)
 
     def _weg2_note_anchor_claim(self, node, rid, st, ok: bool, held: int, depth: int, cap: int, mp) -> None:
         if ok:
@@ -6251,7 +6251,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._weg2_retain_publish_n = n
                 _h49_retain_ms = (time.perf_counter() - _t0) * 1000.0
                 if n <= 16 or n % 64 == 0:
-                    logger.info("WEG2 RETAIN-PUBLISH rid=%s %s ms=%.0f (n=%d)", str(getattr(req, "rid", "?"))[:12],
+                    logger.info("WEG2 RETAIN-PUBLISH rid=%s %s ms=%.0f (n=%d)", str(getattr(req, "rid", "?")),
                                 stats, (time.perf_counter() - _t0) * 1000.0, n)
                 self._weg2_log_rid_anchors(str(req.rid), first)
             except Exception as exc:  # noqa: BLE001 -- a publisher never takes the retain down
@@ -6348,7 +6348,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._weg2_chunk_publish_n = n
             h2_line = h2.finish(n)
             if n <= 16 or n % 256 == 0:
-                logger.info("WEG2 CHUNK-PUBLISH rid=%s chain=%d %s (n=%d)", str(getattr(req, "rid", "?"))[:12],
+                logger.info("WEG2 CHUNK-PUBLISH rid=%s chain=%d %s (n=%d)", str(getattr(req, "rid", "?")),
                             len(first), stats, n)
                 logger.info("%s", h2_line)
             # fnFL2 H49: every chunk, with its budget and its request's sum.
@@ -6392,7 +6392,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 n = getattr(self, "_1442_n", 0) + 1
                 self._1442_n = n
                 if n <= 8 or n % 256 == 0:
-                    logger.info("#1442 HANDOFF rid=%s ids=%d page_keys=%d (n=%d) writer=%s ms=%.1f", rid[:12],
+                    logger.info("#1442 HANDOFF rid=%s ids=%d page_keys=%d (n=%d) writer=%s ms=%.1f", rid,
                                 len(ids), len(keys), n, "self" if _writer else "pp0", (time.perf_counter() - _t_ho) * 1000.0)
                 # #243: the hand-off is kept (evicted last) until D takes the
                 # rid -- not only until P's reset / next wake (group P only)
@@ -6475,7 +6475,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             usable_units = len(mr.device_indices)
         except Exception as e:  # noqa: BLE001 -- an instrument never kills a rank
             logger.warning("WEG2 END-ANCHOR n=%d rid=%s tokens=%d PROBE RAISED %s: %s",
-                           n, str(getattr(req, "rid", "?"))[:12], tokens, type(e).__name__, e)
+                           n, str(getattr(req, "rid", "?")), tokens, type(e).__name__, e)
             return
         # raw-token position of a key-unit depth: bigram units span one more
         # token than their count (`MambaComponent._raw_token_pos`) -- unless
@@ -6508,7 +6508,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             + (" claim=%d" % _claim if _claim is not None else ""),
             # FORK ANCHOR (weg2/fork_anchor.py): a fork cut's target is the
             # fork (N - trim), not N-1; trim=1 prints N-1 exactly as before.
-            n, str(getattr(req, "rid", "?"))[:12], tokens, anchor,
+            n, str(getattr(req, "rid", "?")), tokens, anchor,
             (tokens - _trim) if _trim else _probe_len,
             usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
         )
@@ -8069,7 +8069,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 raise HiCacheCollectiveDesyncError(
                     "W65 Weg2PrefetchSpanSplit: the ranks entered "
                     "prefetch_participation_vote with DIFFERENT pre-vote spans "
-                    f"(min={span_lo} max={span_hi}) for rid={str(req_id)[:8]} "
+                    f"(min={span_lo} max={span_hi}) for rid={str(req_id)} "
                     f"while agreeing a group length of {group_len}. Every rank "
                     "is past the eligibility threshold here, so these are real "
                     "spans, and they differ only if the ranks disagree about "
@@ -8250,7 +8250,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self._1442_use_n = n
                     if n <= 8 or n % 256 == 0:
                         logger.info("#1442 HANDOFF-KEYS rid=%s pages=%d offset=%d (n=%d)",
-                                    str(req_id)[:12], _pages, _off, n)
+                                    str(req_id), _pages, _off, n)
         except Exception:  # noqa: BLE001
             logger.warning("#1442 hand-off keys raised", exc_info=True)
         # DIAGNOSTIC ONLY (#905 window): stamp the host pool identity and its
@@ -8447,7 +8447,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             "#915 PREFETCH TRUNCATED rid=%s need=%d got=%d lost=%d chunk=%d "
             "over_bound=%s available=%d pool_id=%d epoch=%d phase=%s generation=%d "
             "cut_rank=%s local=%s",
-            str(req_id)[:8],
+            str(req_id),
             int(need),
             int(got),
             lost,
@@ -8480,7 +8480,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "HP1 FORM-A END-VOTE rid=%s host_base=%d my_base=%d group_end=%d "
                 "host_len=%d my_len=%d (n=%d): the #580 vote compared span "
                 "ENDS, not lengths from different starts",
-                str(req_id)[:16], int(host_base), int(my_base), int(group_end),
+                str(req_id), int(host_base), int(my_base), int(group_end),
                 int(group_len), int(my_len), n,
             )
 
@@ -8954,7 +8954,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         "#1423 INSERT-PLACED req=%s reg_node=%s reg_depth=%d reg_keylen=%d "
                         "reg_children_after=%s matched=%d inserted=%d head_unit=%s "
                         "deepest=%s unclaimed=%s",
-                        str(req_id)[:8], getattr(last_host_node, "id", "?"), _d,
+                        str(req_id), getattr(last_host_node, "id", "?"), _d,
                         len(last_host_node.key), [str(k)[:30] for k in list(last_host_node.children.keys())[:4]],
                         _pl, int(min_completed_tokens) - _pl, _head,
                         getattr(insert_result.inserted_host_node, "id", None),

@@ -168,7 +168,7 @@ def _weg2_fork_track(req, prefix_len: int, end: int, chunk: int,
             logger.info(
                 "WEG2 FORK-ANCHOR TRACK n=%d rid=%s step=[%d,%d) anchor %d -> %d "
                 "(at or below the generation prompt; chunk grid %d)",
-                n, str(getattr(req, "rid", "?"))[:16], prefix_len, end,
+                n, str(getattr(req, "rid", "?")), prefix_len, end,
                 default_aligned, t, chunk,
             )
     return t
@@ -200,7 +200,7 @@ def _weg2_claim_track(req, tree_cache, prefix_len: int, end: int, chunk: int,
             logger.info(
                 "WEG2 CLAIM-ANCHOR TRACK n=%d rid=%s step=[%d,%d) anchor %d -> %d "
                 "(the deepest page a bigram reader of N=%d claims; chunk grid %d)",
-                n, str(getattr(req, "rid", "?"))[:16], prefix_len, end,
+                n, str(getattr(req, "rid", "?")), prefix_len, end,
                 default_aligned, t, len(req.origin_input_ids), chunk,
             )
     return t
@@ -272,7 +272,7 @@ def _note_1037_instance(rid: str) -> None:
                 "running instance %d, the two ranks hold different objects "
                 "under one identity -- the prefix-0-versus-8192 split the "
                 "extent census names.",
-                str(rid)[:8],
+                str(rid),
                 n,
                 n,
                 n - 1,
@@ -319,7 +319,7 @@ def _note_968_readmit_cached(req, pre_len: int, new_cached: int) -> None:
                 "non-zero cached prefix; before FIX-8 the retraction stain "
                 "held this at 0 for the whole re-admitted population. "
                 "occurrence=%d",
-                str(getattr(req, "rid", None))[:8],
+                str(getattr(req, "rid", None)),
                 int(new_cached),
                 int(pre_len),
                 int(getattr(req, "readmit_cached_tokens", 0)),
@@ -706,7 +706,7 @@ def _note_1036_prefix_demotion(req, start: int, hwm: int) -> None:
                 "admitted_start=%d lost=%d prefix_indices=%d "
                 "host_hit=%s mamba_host_hit=%s seam_readmit=%s "
                 "site_occurrence=%d census=%s",
-                str(getattr(req, "rid", "?"))[:8],
+                str(getattr(req, "rid", "?")),
                 site,
                 hwm,
                 live,
@@ -2169,7 +2169,7 @@ class Req(ReqDllmMixin):
                         "#969AC lap=%s last_queued_as=%s from_fwd=%s "
                         "stamped_rank=%s",
                         _n,
-                        _rid[:8],
+                        _rid,
                         0 if self.prefix_indices is None else len(self.prefix_indices),
                         getattr(self, "host_hit_length", None),
                         getattr(self, "mamba_host_hit_length", None),
@@ -2440,7 +2440,7 @@ class Req(ReqDllmMixin):
             _fr = self.finished_reason
             logger.info(
                 "FINISH-TRACE rid=%s reason=%s matched=%r acc_len=%d out_len=%d tail=%s",
-                self.rid[:16] if isinstance(self.rid, str) else self.rid,
+                self.rid,
                 type(_fr).__name__ if _fr is not None else None,
                 getattr(_fr, "matched", None),
                 new_accepted_len,
@@ -3675,7 +3675,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     getattr(self, "forward_mode", "?"),
                     [
                         (
-                            str(getattr(r, "rid", "?"))[:8],
+                            str(getattr(r, "rid", "?")),
                             None if r.extend_range is None else int(r.extend_range.start),
                             None if r.extend_range is None else int(r.extend_range.end),
                             0 if r.prefix_indices is None else len(r.prefix_indices),
@@ -4652,7 +4652,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     logger.info(
                         "WEG2-RETRACT-RETAIN n=%d rid=%s span=%d (origin=%d out=%d): "
                         "kept in the tree, evictable; the re-admission loads it back",
-                        _n, str(req.rid)[:16],
+                        _n, str(req.rid),
                         len(req.origin_input_ids or ()) + len(req.output_ids or ()),
                         len(req.origin_input_ids or ()), len(req.output_ids or ()),
                     )
@@ -4752,7 +4752,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             logger.warning(
                 "WEG2-D-PARK retraction: the back of this spec batch (rid=%s) is not its "
                 "youngest request -- the stock back-only order stands",
-                str(getattr(reqs[-1], "rid", "?"))[:12],
+                str(getattr(reqs[-1], "rid", "?")),
             )
 
         # TODO(lsyin): improve retraction policy for radix cache

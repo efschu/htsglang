@@ -552,7 +552,7 @@ def _dual_defer_exempt(parked_waiting: Sequence) -> FrozenSet[str]:
                 pass
             logger.info("WEG2-D-PARK DEFER-EXEMPT rid=%s site=%s -- parked, but waiting for a store "
                         "read (D-HANDBACK-DEFER / X-DEFER): it holds no younger newcomer back",
-                        str(r.rid)[:16], park_site(r))
+                        str(r.rid), park_site(r))
     return out
 
 

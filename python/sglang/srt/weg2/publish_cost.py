@@ -77,7 +77,7 @@ class PublishCostLedger:
             "WEG2-PUBLISH-CHUNK rid=%s chunk=%d ms=%.1f budget_ms=%.0f over=%s "
             "stopped=%s issued=%d sum_ms=%.1f parts=%s"
             % (
-                rid[:12],
+                rid,
                 acc.chunks,
                 ms,
                 budget_ms,
@@ -103,7 +103,7 @@ class PublishCostLedger:
             "(scheduler-thread wall of this request's publishes on this rank, "
             "between forwards)"
             % (
-                rid[:12],
+                rid,
                 acc.chunks,
                 acc.sum_ms,
                 acc.max_ms,

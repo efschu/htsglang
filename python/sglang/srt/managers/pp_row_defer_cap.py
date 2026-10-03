@@ -246,7 +246,7 @@ class RowDeferCap:
         occurrence: int,
         bound: int,
     ) -> str:
-        named = ",".join(sorted(r[:8] for r in missing)[:4])
+        named = ",".join(sorted(missing)[:4])
         return (
             f"#1180 PP ROW DEFER PAST ITS LAP CAP: slot {slot} has held the "
             f"SAME proxy frame in the inbox for {occurrence} consecutive "

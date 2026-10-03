@@ -96,9 +96,11 @@ def sampled(n: int, first: int, every: int) -> bool:
 
 
 def rid_text(rid, width: int = 8) -> str:
-    """The rid as a log field: full when traced, the legacy prefix otherwise."""
-    s = str(rid)
-    return s if on() else s[:width]
+    """The rid as a log field: ALWAYS the full rid. RID-FULL-LOG (y8y 18:25:45Z):
+    the legacy 8-character prefix printed 'weg2-0-152' as 'weg2-0-1' and the
+    diagnosis followed the wrong request. ``width`` is kept for callers and
+    ignored."""
+    return str(rid)
 
 
 def walk_due(rid, depth: int, remaining: int) -> bool:

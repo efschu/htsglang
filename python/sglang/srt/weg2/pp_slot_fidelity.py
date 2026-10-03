@@ -408,7 +408,7 @@ def replan_after_move(scheduler, adder, req, new_pos: int, box) -> Optional[int]
                     "rem_chunk=%s initial=%s can_run=%d (n=%d): the pass budget was "
                     "already spent on another request; the next pass replans at the "
                     "executed position",
-                    rid[:16], plan.pos, new_pos, rem, initial,
+                    rid, plan.pos, new_pos, rem, initial,
                     len(getattr(adder, "can_run_list", None) or ()), n,
                 )
             return None
@@ -431,7 +431,7 @@ def replan_after_move(scheduler, adder, req, new_pos: int, box) -> Optional[int]
                 "width %d -> %d (plan %d, never widened) (n=%d): the pass budget was "
                 "planned for another start; #988 moved the prefix, so the plan is "
                 "redone at the moved prefix on every rank alike",
-                rid[:16], plan.pos, plan.src, new_pos, int(initial), new_budget, width, n,
+                rid, plan.pos, plan.src, new_pos, int(initial), new_budget, width, n,
             )
         return new_budget
     except Exception as exc:  # noqa: BLE001 -- a plan must never stop a pass

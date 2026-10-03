@@ -91,7 +91,7 @@ def note_924d(station: str, *, rid=None, slot=None, node_id=None, extra: str = "
     if not _SLOT_TRAIL:
         return  # #1467: opt-in -- `.tolist()` on a CUDA slot is a device sync
     try:
-        subject = str(rid)[:12] if rid is not None else f"node{node_id}"
+        subject = str(rid) if rid is not None else f"node{node_id}"
         # #Q0-trail: LIFECYCLE STATIONS MUST NOT DEDUP. The (subject, station)
         # key prints ONE line per pair, which is right for a census and WRONG
         # for a trail: a request that allocates a ping-pong buffer TWICE shows

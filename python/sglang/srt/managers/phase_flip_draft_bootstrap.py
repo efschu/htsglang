@@ -392,7 +392,7 @@ def bootstrap_clock_report(batch) -> str:
         parts.append(
             "%s: seq_lens=%s seqlen=%s out[-2:]=%s input_id=%s"
             % (
-                getattr(req, "rid", "?")[:8],
+                getattr(req, "rid", "?"),
                 lens[i] if i < len(lens) else "?",
                 len(getattr(req, "origin_input_ids", None) or []) + len(out_ids),
                 list(out_ids[-2:]),

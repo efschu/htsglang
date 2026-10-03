@@ -116,7 +116,7 @@ def snapshot_rows(reqs) -> List[Row]:
         out = getattr(req, "output_ids", None) or []
         rows.append(
             (
-                str(getattr(req, "rid", "?"))[:8],
+                str(getattr(req, "rid", "?")),
                 len(out),
                 int(getattr(req, "send_token_offset", -1) or 0),
                 _tail(out),
@@ -352,7 +352,7 @@ def trace_cutover(scheduler, direction: str) -> None:
         " | ".join(
             "%s seen=%d kv=%s tail=%s"
             % (
-                str(getattr(r, "rid", "?"))[:8],
+                str(getattr(r, "rid", "?")),
                 len(getattr(r, "origin_input_ids", None) or [])
                 + len(getattr(r, "output_ids", None) or []),
                 getattr(r, "kv_committed_len", "?"),
@@ -401,7 +401,7 @@ def trace_round(kind: str, reqs, next_token_ids, result=None) -> None:
         parts.append(
             "%s have=%d kv=%s seen=%d +%s"
             % (
-                str(getattr(req, "rid", "?"))[:8],
+                str(getattr(req, "rid", "?")),
                 len(out_ids),
                 getattr(req, "kv_committed_len", "?"),
                 len(origin) + len(out_ids),
@@ -450,7 +450,7 @@ def trace_emit(rid: str, offset_before: int, sent: int, total: int) -> None:
     trace = _ACTIVE_TRACE
     if trace is None or not trace.armed_after:
         return
-    short = str(rid)[:8]
+    short = str(rid)
     logger.info(
         "%s emit rid=%s off=%d->%d sent=%d of n=%d",
         LOG_PREFIX,

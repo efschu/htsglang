@@ -110,7 +110,7 @@ def told_admission(
                     "verdict of an earlier visit that did not admit stands "
                     "(it used to be consumed there and the rid skipped as "
                     "weg2_store_told_pending for ever: cu130 53572be2)",
-                    rid[:8], entry.told, entry.credit, n,
+                    rid, entry.told, entry.credit, n,
                 )
             return entry.credit
         # another request object under this rid, or a fresh told arrived for
@@ -239,7 +239,7 @@ def intake_phase_verdict(scheduler, rid: str, need_tokens: int,
                 "free=%d evictable=%d inflight=%d pool_tokens=%d %s decline=%s -- "
                 "not an intake stall: the request stays queued and is admitted "
                 "in order (no 503, no flip)",
-                str(rid)[:16], verdict, int(need_tokens), free, evictable,
+                str(rid), verdict, int(need_tokens), free, evictable,
                 int(inflight), int(pool_tokens), gate,
                 getattr(scheduler, "_admission_decline_note", None),
             )

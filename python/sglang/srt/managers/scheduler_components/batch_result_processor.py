@@ -282,7 +282,7 @@ class SchedulerBatchResultProcessor:
                 "ordinary path. A non-zero count here is a void whose "
                 "consumers were not all told.",
                 len(getattr(batch, "reqs", None) or []),
-                ",".join(str(getattr(r, "rid", "?"))[:8] for r in (getattr(batch, "reqs", None) or [])[:4]) or "-",
+                ",".join(str(getattr(r, "rid", "?")) for r in (getattr(batch, "reqs", None) or [])[:4]) or "-",
             )
             return
 

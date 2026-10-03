@@ -1800,7 +1800,7 @@ class HiCacheController:
                 self.prefetch_tokens_occupied = 0
                 self._start_storage_threads()
             logger.info("#1068 PARK-READ-DETACH reaped rids=%s joined_bg_s=%.2f (the detached store probe "
-                        "ended; pipeline restarted off the flush)", sorted(r[:12] for r in rids),
+                        "ended; pipeline restarted off the flush)", sorted(rids),
                         time.monotonic() - t_detach)
 
         self._weg2_reset_reaper = threading.Thread(target=_reap, daemon=True, name="hicache-reset-reaper")
@@ -2750,7 +2750,7 @@ class HiCacheController:
                 "joined_s=%.2f detached=prefetch rids=%s -- PARK-READ-DETACH: the parked read is "
                 "terminated, its thread joined in the background",
                 int(STORAGE_THREAD_JOIN_BOUND_S), stop.threads, stop.terminated_ops,
-                stop.drained_ops, stop.joined_s, sorted(r[:12] for r in _rids))
+                stop.drained_ops, stop.joined_s, sorted(_rids))
             self.write_queue.clear()
             self.load_queue.clear()
             self.ack_write_queue.clear()

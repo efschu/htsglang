@@ -70,7 +70,7 @@ def forget_presence(req) -> None:
 def _line(st: dict, req, state: str, now, extra: str = "") -> None:
     logger.warning("%s n=%d passes=%d ms=%d tail=%d rid=%s state=%s%s", LINE, int(st["n"]), int(st["passes"]),
                    int((float(now()) - float(st["t0"])) * 1000), int(st["tail"]),
-                   str(getattr(req, "rid", "?"))[:16], state, extra)
+                   str(getattr(req, "rid", "?")), state, extra)
 
 
 def _park_site(req):
@@ -160,7 +160,7 @@ def begin(req, tail: int, *, now=time.monotonic, env=None) -> bool:
                 pass
             logger.warning("%s tail=%d rid=%s state=d_own out=%d site=%s -- D's own end (decoded "
                            "before a park), not a P hand-back: no defer", LINE, int(tail),
-                           str(getattr(req, "rid", "?"))[:16],
+                           str(getattr(req, "rid", "?")),
                            len(getattr(req, "output_ids", None) or ()), _park_site(req))
         return False
     st = getattr(req, MARK_ATTR, None)

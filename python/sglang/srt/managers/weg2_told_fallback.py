@@ -375,7 +375,7 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
             logger.info(
                 "PF TOLD-ACKED rid=%s told=%d after=%.2fs acks=%s (n=%d): every "
                 "follower's read reproduced told -- admitted without the window",
-                rid[:8], told, now - published_at, acks, n,
+                rid, told, now - published_at, acks, n,
             )
         return
     n = _bump(scheduler, "_pf_fallback_n")
@@ -385,7 +385,7 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
             "followers=%d (n=%d): PP0 switches the request to told=0 for EVERY "
             "rank; P recomputes the prefix instead of the group dying in "
             "STORE-TOLD WAIT EXCEEDED / MISMATCH",
-            rid[:8], told, reason, now - published_at, acks,
+            rid, told, reason, now - published_at, acks,
             int(scheduler.ps.pp_size) - 1, n,
         )
 
@@ -399,7 +399,7 @@ def release_own_read(scheduler, rid: str) -> None:
         try:
             rel(str(rid))
         except Exception as exc:  # noqa: BLE001 - never leave the verdict unapplied
-            logger.warning("PF TOLD-FALLBACK release_aborted_request(%s) raised: %r", str(rid)[:8], exc)
+            logger.warning("PF TOLD-FALLBACK release_aborted_request(%s) raised: %r", str(rid), exc)
     else:
         # a tree without the abort path: at least drop the records admission reads
         for attr in ("_prefetch_completed_tokens", "prefetch_loaded_tokens_by_reqid"):
@@ -478,7 +478,7 @@ def follower_release(scheduler, rid: str) -> None:
         logger.warning(
             "PF TOLD-FALLBACK ABSORBED rank pp=%s rid=%s (n=%d): PP0 admitted at "
             "told=0; this rank's store read was released (abort path) and it "
-            "admits at 0 like every rank", getattr(scheduler.ps, "pp_rank", "?"), rid[:8], n,
+            "admits at 0 like every rank", getattr(scheduler.ps, "pp_rank", "?"), rid, n,
         )
 
 
@@ -532,7 +532,7 @@ def _resumable_own(scheduler, req, rid: str, own: int) -> Optional[int]:
             "rank's read completed the KV span but its tree cannot resume there (no "
             "recurrent state at the end) -- the ack says so and PP0 answers told=0 for "
             "every rank instead of admitting a prefix this rank cannot materialise",
-            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(res), n,
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, int(res), n,
         )
     return int(res)
 
@@ -592,7 +592,7 @@ def _room_own(scheduler, req, rid: str, own: int) -> Optional[int]:
             "this rank holds the told span on its HOST only and cannot load it back even "
             "with every evictable row freed -- the ack says 0 and PP0 answers told=0 for "
             "every rank instead of an SF LOADBACK-ROOM residual and #968 after PP0 admitted",
-            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(rows), room, n,
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, int(rows), room, n,
         )
     return 0
 
@@ -689,7 +689,7 @@ def _room_hold(scheduler, req, rid: str, own: int, rows: int, room: int) -> bool
                 "%s rank pp=%s rid=%s told=%d loadback_rows=%d room=%d predecessor_rows=%d (n=%d): "
                 "the pool is short only by a predecessor still in flight on this rank -- the ack "
                 "is held and re-read every pass instead of 0 (Q-693; PP0's Frist bounds it)",
-                ROOM_HOLD_MARK, getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, rows,
+                ROOM_HOLD_MARK, getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, rows,
                 room, pending, n,
             )
     return True
@@ -703,7 +703,7 @@ def _room_hold_end(scheduler, rid: str, how: str) -> None:
     logger.warning(
         "%s END rank pp=%s rid=%s how=%s held_s=%.2f (room = the predecessor released; stable = "
         "the shortage outlived it, ack 0; verdict = PP0 decided first, its Frist)",
-        ROOM_HOLD_MARK, getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), str(rid)[:12], how,
+        ROOM_HOLD_MARK, getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), str(rid), how,
         time.monotonic() - t0,
     )
 
@@ -761,5 +761,5 @@ def follower_pump(scheduler) -> None:
         if _say(n):
             logger.info(
                 "PF TOLD-ACK SENT rank pp=%s seq=%d reads=%s (n=%d)",
-                scheduler.ps.pp_rank, ack.seq, [(r[:8], o) for r, o in ack.reads], n,
+                scheduler.ps.pp_rank, ack.seq, list(ack.reads), n,
             )

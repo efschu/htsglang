@@ -690,7 +690,7 @@ def pp0_grant(sched, req) -> Optional[int]:
     # only and found avail=1717 (SF LOADBACK-ROOM PP-RESIDUAL) -> #968. The
     # level now covers this prompt PLUS every other request holding a grant.
     tokens += live_grant_tokens(sched, req, int(actor.page))
-    rid = str(getattr(req, "rid", "?"))[:16]
+    rid = str(getattr(req, "rid", "?"))
     # Q-670 GRANT-BYPASS: an older request waiting for its card grant does not
     # hold this one back while it is young; past the age the head is the head.
     # pp0_grant runs only where _actor is armed (a dual-layout P rank); the gate is
@@ -799,7 +799,7 @@ def _older_waits(sched, rid: str) -> list:
     for r in held.values():
         if not getattr(r, "_dual_kv_wait", False):
             continue
-        k = str(getattr(r, "rid", "?"))[:16]
+        k = str(getattr(r, "rid", "?"))
         e = _WAITS.get(k)
         if k != rid and e is not None and e[0] < own_t:
             out.append((k, e[0]))
@@ -974,7 +974,7 @@ def on_told(sched, item) -> None:
             raise Weg2DualKvFollowerMapShort(
                 "DUAL-FOLLOWER-MAP-SHORT rid=%s level=%d mapped=%d: %s -- PP0's committed group grant "
                 "cannot be mapped on this follower's card (rolled back to the standing mapping)"
-                % (str(getattr(item, "rid", "?"))[:16], lvl, actor.mapped_tokens, exc)) from exc
+                % (str(getattr(item, "rid", "?")), lvl, actor.mapped_tokens, exc)) from exc
 
 
 def with_dual_kv(told, req):
@@ -1011,7 +1011,7 @@ def return_untold_grant(sched, req, why: str) -> int:
         n += int(got)
         logger.warning("%s P-KV GRANT-RETURN rid=%s pp=%d bytes=%d why=%s: the told carrying PP0's group "
                        "grant never left -- this follower card's charge goes back to the card pool",
-                       MARK, str(getattr(req, "rid", "?"))[:16], int(pp), int(got), why)
+                       MARK, str(getattr(req, "rid", "?")), int(pp), int(got), why)
     return n
 
 
@@ -1152,7 +1152,7 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
     logger.info("%s FOLLOWER-ABORT-APPLIED rid=%s pp_rank=%s: PP0 idle since %.1f s after this rank "
                 "saw the abort, every pass it launched ran here (fwd %d >= %d; the #791C liveness "
                 "release the dual layout has no lap for)", MARK,
-                str(getattr(req, "rid", None) or ",".join(held) or "?")[:48], getattr(sched.ps, "pp_rank", "?"),
+                str(getattr(req, "rid", None) or ",".join(held) or "?"), getattr(sched.ps, "pp_rank", "?"),
                 idle_t - seen[1],
                 int(getattr(sched, "forward_ct", 0) or 0), pp0_fwd)
     return True

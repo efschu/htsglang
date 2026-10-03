@@ -705,8 +705,8 @@ def _follower_register(scheduler, req, told: int, early: bool = True) -> str:
 
 
 def rid8(req) -> str:
-    """The rid as a log field: 8 characters, the FULL rid under the prefix
-    trace (SGLANG_WEG2_PREFIX_TRACE, IN 26.09.)."""
+    """The rid as a log field: the FULL rid (RID-FULL-LOG; it was 8 characters
+    unless the prefix trace SGLANG_WEG2_PREFIX_TRACE was on)."""
     return _pt.rid_text(_rid(req))
 
 
@@ -1054,7 +1054,7 @@ def _twin_register(scheduler, req, twin: bool) -> str:
     try:
         verdict = scheduler._prefetch_kvcache(req)
     except Exception as exc:  # noqa: BLE001 - never leave it unregistered AND held
-        logger.warning("#TW twin registration raised for rid=%s: %r", rid[:12], exc)
+        logger.warning("#TW twin registration raised for rid=%s: %r", rid, exc)
         _twin.take_pp0_twin(scheduler, rid)
         return "declined:twin_register_raised"
     try:
@@ -1069,7 +1069,7 @@ def _twin_register(scheduler, req, twin: bool) -> str:
         _pace_intake_t(scheduler)[rid] = _clock()
     logger.info(
         "#TW TWIN-REGISTER rid=%s twin=%s verdict=%s head=%d span=%s",
-        rid[:12], twin, verdict, _twin.registered_head(req),
+        rid, twin, verdict, _twin.registered_head(req),
         getattr(req, "_prefetch_span_tokens", None),
     )
     return verdict
@@ -1093,7 +1093,7 @@ def _twin_pp0_told(scheduler, tree, req, rid: str, label: str = "TW TWIN-TOLD") 
         logger.info(
             "#TW TWIN-TOLD rid=%s head=%d span=%d told=%d clamped=%d: the twin's told "
             "is absolute (the followers compare head + span)",
-            rid[:12], head, span, told, clamped,
+            rid, head, span, told, clamped,
         )
     else:
         n = getattr(scheduler, "_tk_abs_told_n", 0) + 1
@@ -1774,7 +1774,7 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
                 logger.info(
                     "PF TOLD-OPEN rid=%s told=%d window=%.2fs frist=%.2fs (n=%d): "
                     "admission follows the followers' read acks, told=0 at the Frist",
-                    rid[:8], told, window, _frist, n_fb,
+                    rid, told, window, _frist, n_fb,
                 )
         out.append(ahead)
         n = getattr(scheduler, "_1416e_ahead_n", 0) + 1
