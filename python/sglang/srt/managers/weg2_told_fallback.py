@@ -638,11 +638,47 @@ def own_prefix(scheduler, req, rid: str, told: int) -> int:
 
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None) or {}
     if rid in satisfied:
-        return int(told)
+        return _satisfied_resumable(scheduler, req, rid, int(told))
     own = int(_st._completed_prefix(scheduler.tree_cache, rid))
     if _is_follower_twin(scheduler, rid):
         own += _twin.registered_head(req)
     return _resumable_own(scheduler, req, rid, own)
+
+
+def _satisfied_resumable(scheduler, req, rid: str, told: int) -> int:
+    """OVER-UNRESUMABLE (#968, 27B 673cc89f6a PP1 17:23:06Z; NF port): a SATISFIED
+    rid (early read past told, or a local prefix covering it) used to ack told
+    unprobed -- "holds the span" is not "can resume at told" on the hybrid tree
+    (one node 0..N, recurrent state at N only: ``#904 refused ... Mamba:absent``,
+    then ``#968 SHORTFALL`` after 45 s). The settle already refuses to mark an
+    unresumable over-read satisfied (``weg2_store_told.follower_early_settle``);
+    this is the guard on the ack for every other way into ``satisfied``: the
+    rank's own admission reach AT told (``rank_resumable``) below told acks that
+    reach, so PP0 answers told=0 for every rank. No probe / dual layout /
+    fidelity off = told, as before."""
+    if told <= 0 or (os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip() == "1":
+        return told
+    if not env_on():   # the ack only exists on the PF ring; kept for callers
+        return told
+    try:
+        from sglang.srt.managers import weg2_told_fidelity as _tf
+
+        if not _tf.enabled():
+            return told
+        res = _tf.rank_resumable(scheduler, req, told)
+    except Exception:  # noqa: BLE001 - a probe never breaks the ack
+        return told
+    if res is None or int(res) >= told:
+        return told
+    n = _bump(scheduler, "_pf_ack_satisfied_unresumable_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-ACK SATISFIED-UNRESUMABLE rank pp=%s rid=%s told=%d resumable=%d (n=%d): "
+            "this rank counts the told span as held but its tree cannot resume there -- the "
+            "ack says so and PP0 answers told=0 for every rank",
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], told, int(res), n,
+        )
+    return int(res)
 
 
 def _resumable_own(scheduler, req, rid: str, own: int) -> int:

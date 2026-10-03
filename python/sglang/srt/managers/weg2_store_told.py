@@ -320,19 +320,81 @@ def follower_early_settle_now(scheduler, req, rid: str, told: int) -> bool:
     return how != "short"
 
 
+#: OVER-UNRESUMABLE (#968; 27B 673cc89f6a boot 1003_170754, PP1 17:22:21 ->
+#: 17:23:06Z, rid weg2-24-204; ported to NF 03.10.): the follower's early read
+#: reached 59392 tokens (PP0/PP2: 57041 -- D's sleep flush was still landing
+#: weg2-22-172's decoded tail in the shared store while the three ranks read it
+#: at different instants), the settle said "over" and marked the rid SATISFIED
+#: at told=57041; ``weg2_told_fallback.own_prefix`` then acked told for a
+#: satisfied rid WITHOUT the ACK-RESUMABLE probe, PP0 admitted at 57041 on every
+#: rank -- and PP1's read had put ONE node 0..59392 into its tree with the
+#: recurrent state at 59392 only (``#904 match-census refused=57041
+#: MambaComponent:absent``, ``#631 UNDER-COVERAGE told=57041 local=0``, 45 s,
+#: ``#968 PREFIX MATERIALISATION SHORTFALL ... holds 0`` -> W17 group stop).
+#: "Holds more KV than told" is not "can resume at told" on a hybrid tree.
+#: The over-settle now asks this rank's own admission reach (``rank_resumable``,
+#: the probe ACK-RESUMABLE uses for the ack) AT told: only a rank that can
+#: resume there is satisfied; else NOT satisfied, the ack names the own read
+#: (!= told) and PP0's PF answers told=0 for every rank -- a rank-agreed
+#: re-prefill instead of a group stop. No probe = no verdict (the old "over").
+#: Only with the PF ack stream armed (SGLANG_WEG2_TOLD_GROUP_FALLBACK: the ack
+#: is the only carrier of the verdict); never on the dual layout (both
+#: byte-identical to before).
+OVER_UNRESUMABLE = "over_unresumable"
+
+
+def _over_resumable_at_told(scheduler, req, told: int, own: int) -> bool:
+    """True = this rank can resume ``req`` at ``told`` (or no probe/verdict):
+    the "over" settle stands. False = KV past told but no recurrent state
+    reachable at told on this rank (device or host): not satisfied."""
+    if (os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip() == "1":
+        return True
+    if not _tf.enabled():
+        return True
+    if not _fb.env_on():
+        # no PF ack stream: nothing carries "I cannot resume" to PP0, and the
+        # admission would meet own > told as a MISMATCH raise -- the old
+        # "over" (satisfied + W27-UNIFORM reach/re-read for twins) stands
+        return True
+    try:
+        res = _tf.rank_resumable(scheduler, req, int(told))
+    except Exception:  # noqa: BLE001 - a probe never breaks the settle
+        return True
+    if res is None or int(res) >= int(told):
+        return True
+    n = getattr(scheduler, "_weg2_over_unresumable_n", 0) + 1
+    scheduler._weg2_over_unresumable_n = n
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "#1400 OVER-UNRESUMABLE rid=%s pp=%s told=%d own=%d resumable_at_told=%d (n=%d): "
+            "this rank's early read reached past told but its tree cannot resume AT told "
+            "(no recurrent state there) -- not satisfied; the ack names the own read and "
+            "PP0 answers told=0 for every rank instead of a #968 SHORTFALL group stop",
+            _rt(_rid(req)), getattr(scheduler.ps, "pp_rank", "?"), int(told), int(own),
+            int(res), n,
+        )
+    return False
+
+
 def follower_early_settle(scheduler, req, told: int, own: int, absolute: bool = False) -> str:
     """The told against a follower's EARLY read (own completed prefix):
     ``"equal"`` (admit as #1400 does), ``"over"`` (absolute told only: this
-    rank holds more than told -- SATISFIED at told, its credit popped),
-    ``"refuse"`` (a span-relative told the read overshot: #1400's MISMATCH
-    refusal follows in the admission), ``"short"`` (register the #1400
-    told-limited read now; the admission then waits for it)."""
+    rank holds more than told AND can resume at told -- SATISFIED at told, its
+    credit popped), ``"over_unresumable"`` (absolute told, own > told, but this
+    rank's tree cannot RESUME at told: not satisfied -- the ack names the own
+    read and PP0 answers told=0 for every rank, see
+    :func:`_over_resumable_at_told`), ``"refuse"`` (a span-relative told the
+    read overshot: #1400's MISMATCH refusal follows in the admission),
+    ``"short"`` (register the #1400 told-limited read now; the admission then
+    waits for it)."""
     rid = _rid(req)
     tree = scheduler.tree_cache
     if int(own) == int(told):
         return "equal"
     if int(own) > int(told) and not absolute:
         return "refuse"
+    if int(own) > int(told) and not _over_resumable_at_told(scheduler, req, told, own):
+        return OVER_UNRESUMABLE
     if int(own) > int(told):
         try:
             _pop_credit_keep_pin(tree, rid)
