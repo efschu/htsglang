@@ -61,6 +61,9 @@ def _scheduler_method(name):
                         g["_p_intake"] = p_intake
                     except ImportError:  # the base has no such module
                         pass
+                    # Q-580: the stall exit hands the told records back too
+                    from sglang.srt.managers import weg2_store_told
+                    g["weg2_store_told"] = weg2_store_told
                     exec(compile(ast.Module(body=[fn], type_ignores=[]), _SCHED_PY, "exec"), g)
                     return g[name]
     raise AssertionError(f"Scheduler.{name} not found")

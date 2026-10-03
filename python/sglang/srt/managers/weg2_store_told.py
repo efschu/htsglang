@@ -287,6 +287,126 @@ def forget_rid_leftovers(tree, rid: str) -> bool:
     return bool(dropped)
 
 
+# Q-580 (27B dual y8r, boot dkr27bnvfp4dual1mpsleepbar1fs10030958, P PP1
+# 10:04:22 '#791T STORE-TOLD HOP OVERDUE ... weg2-0-6' -> #1223 DEBUG-HOLD ->
+# W17): THE TOLD OUTLIVED ITS REQUEST. The told records are keyed by rid and
+# die only at an admission (``admission`` pops them). weg2-0-6 came through P
+# three times (leg 1, the front's spec-3.6 re-route, the DUAL P-PAUSE requeue):
+#   10:04:20.98 PP0 publishes instance 2's told (P-FORK-CUT TOLD fork=16) --
+#               told_map[rid] set on PP0, absorbed on the followers;
+#   10:04:21.06 the front's P-PAUSE aborts instance 2 while it is still QUEUED
+#               on every rank. PP0's adder never visited it (weg2-0-9's chunk
+#               held the pass), the followers did (H91 KEPT: their visit
+#               consumes told_map[rid]); the abort dropped the request and
+#               nothing else -- PP0 kept a told for a request that no longer
+#               existed, the followers kept none;
+#   10:04:22    instance 3 arrives. PP0 admits it IN ITS INTAKE PASS on the
+#               stale told (no told of its own was ever put on the wire: the
+#               publish runs at the top of the next pass and drops the rid as
+#               no longer queued); PP1 queues it, has no told, defers PP0's
+#               frame (#791T) and stops at the lap cap.
+# The fix keeps the told's lifetime equal to its request's on every rank:
+#   1. :func:`forget_left_queue` -- a request that leaves the waiting queue
+#      WITHOUT an admission (abort, intake-stall refusal) takes every told
+#      record of its rid with it, on every rank alike (each rank applies the
+#      abort to its own queue; a follower's #1180-W hold applies it later
+#      through the same path);
+#   2. :func:`_drop_stale_pp0_told` -- PP0's intake: PP0 writes a told only
+#      when it publishes, and it publishes only for a request its intake has
+#      HELD, so a told present at PP0's intake belongs to an earlier instance
+#      by construction. Dropped by name (defence in depth for any exit path
+#      that does not reach 1.).
+_TOLD_RECORDS = (
+    "_weg2_store_told",            # the verdict (PP0: published, follower: absorbed)
+    "_weg2_store_fork",            # P-FORK-CUT: the told's fork depth
+    "_weg2_told_early",            # #1416e: a follower's paced read-ahead
+    "_weg2_store_told_satisfied",  # xsn141: a follower that held the told span
+    "_weg2_told_pacing",           # #1416e: PP0's open pacing window
+)
+
+
+def forget_left_queue(scheduler, req, why: str) -> List[str]:
+    """Q-580: ``req`` left this rank's waiting queue without an admission --
+    drop every told record of its rid. Returns the dropped record names.
+
+    Only on a scheduler whose told form is ARMED (the cached flag; nothing is
+    resolved here, so no other form and no desk stand-in changes). A held
+    entry and a pacing window are dropped only when they belong to THIS
+    request object (an older entry is dropped too: nothing else can own it)."""
+    if getattr(scheduler, "_weg2_store_told_armed", None) is not True:
+        return []
+    rid = _rid(req)
+    if not rid:
+        return []
+    dropped: List[str] = []
+    for attr in _TOLD_RECORDS:
+        d = getattr(scheduler, attr, None)
+        if not isinstance(d, dict) or rid not in d:
+            continue
+        if attr == "_weg2_told_pacing":
+            p = d.get(rid)
+            if getattr(p, "req", req) is not req and _queued_obj(scheduler, getattr(p, "req", None)):
+                continue  # a live window of another queued object (never on the ring's order)
+            d.pop(rid, None)
+            if getattr(scheduler, "_weg2_told_fallback_on", False):
+                _fb.pp0_forget(scheduler, rid)
+            dropped.append("pacing")
+            continue
+        val = d.pop(rid)
+        dropped.append("%s=%s" % (attr.replace("_weg2_", "").replace("store_", ""), val))
+    held = getattr(scheduler, "_weg2_store_held", None)
+    if isinstance(held, dict) and held.get(rid) is req:
+        held.pop(rid, None)
+        dropped.append("held")
+    if dropped:
+        n = getattr(scheduler, "_q580_forget_n", 0) + 1
+        scheduler._q580_forget_n = n
+        if _log_due(n):
+            logger.info(
+                "Q-580 TOLD-FORGET rid=%s pp=%s why=%s dropped=%s (n=%d): the request left the "
+                "waiting queue unadmitted, its told goes with it (a later request under this "
+                "rid waits for its OWN told on every rank)",
+                _rt(rid), getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), why,
+                ",".join(dropped), n,
+            )
+    return dropped
+
+
+def _queued_obj(scheduler, obj) -> bool:
+    if obj is None:
+        return False
+    return any(r is obj for r in (getattr(scheduler, "waiting_queue", None) or ()))
+
+
+def _drop_stale_pp0_told(scheduler, req, rid: str) -> List[str]:
+    """Q-580 (2): PP0's intake of ``req`` -- a told PP0 holds for this rid now
+    was published for an earlier instance (PP0 writes a told only at the
+    publish of a request its intake HELD). Dropped by name; PP0 then holds
+    ``req`` and publishes its own told, which every follower waits for."""
+    stale: List[str] = []
+    tm = getattr(scheduler, "_weg2_store_told", None)
+    if isinstance(tm, dict) and rid in tm:
+        stale.append("told=%s" % tm.pop(rid))
+    forks = getattr(scheduler, "_weg2_store_fork", None)
+    if isinstance(forks, dict) and rid in forks:
+        stale.append("fork=%s" % forks.pop(rid))
+    pacing = getattr(scheduler, "_weg2_told_pacing", None)
+    p = pacing.get(rid) if isinstance(pacing, dict) else None
+    if p is not None and getattr(p, "req", None) is not req:
+        pacing.pop(rid, None)
+        if getattr(scheduler, "_weg2_told_fallback_on", False):
+            _fb.pp0_forget(scheduler, rid)
+        stale.append("pacing")
+    if stale:
+        logger.warning(
+            "Q-580 STALE-TOLD rid=%s at PP0 intake dropped=%s: a told of an earlier instance of "
+            "this rid was still standing (PP0 would admit the new request on it before its own "
+            "told is on the wire, the followers wait for that told: #791T STORE-TOLD HOP OVERDUE)",
+            _rt(rid), ",".join(stale),
+        )
+    return stale
+
+
 #: DP-NACHLAUF 02.10. (N5d D->P epoch 25, weg2-24-93): a follower registered
 #: its store read only after PP0's terminated read was published as the told --
 #: PP0 queue 1333 ms + read 206 ms, THEN PP1/PP2 queue ~495 ms + read ~176 ms,
@@ -393,6 +513,8 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     rid = _rid(req)
     forget_rid_leftovers(scheduler.tree_cache, rid)
     if int(scheduler.ps.pp_rank) == 0:
+        # Q-580: a told standing at PP0's intake is an earlier instance's.
+        _drop_stale_pp0_told(scheduler, req, rid)
         # DUAL-TP3PP3 unified KV: PP0 takes the grant on ALL cards atomically
         # before the store read registers; a short card holds the request
         # (retried at the top of every PP0 pass, ``pp0_publish``).

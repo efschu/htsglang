@@ -9130,6 +9130,7 @@ class Scheduler(
         )
         refused_id = id(req)
         self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
+        weg2_store_told.forget_left_queue(self, req, "store_load_failed")  # Q-580
         # fnFL2x36 (23.09.): THE ANSWER IS THE END OF THE REQUEST EVERYWHERE.
         # weg2-0-1 was answered 503 here at 08:27:37 (site=drain) while it
         # sat in the post-wake settle list; the list kept it, the 20-s bound
@@ -22689,6 +22690,7 @@ class Scheduler(
             logger.warning("WEG2-INTAKE-STALL-CENSUS raised", exc_info=True)
         refused_id = id(req)
         self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
+        weg2_store_told.forget_left_queue(self, req, "intake_stall")  # Q-580
         try:
             if self.enable_hicache_storage:
                 self.tree_cache.release_aborted_request(req.rid)
@@ -22773,6 +22775,9 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            # Q-580: the told of a request that leaves the queue unadmitted
+            # goes with it, on every rank (weg2_store_told.forget_left_queue).
+            weg2_store_told.forget_left_queue(self, req, "abort")
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
