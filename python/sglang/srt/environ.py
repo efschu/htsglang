@@ -4020,7 +4020,9 @@ class Envs:
     # 09252328: a D->P flip that drained 29.7 s recorded flip_ms=31115, and the next
     # D->P was held 39.2 s by min-dwell (need 31115 ms, awake 8758 ms) while a batch
     # waiter queued. On: the price is flip_ms - drain_quiesce_ms (the flip itself).
-    SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN = EnvBool(False)
+    # DEFAULT ON since 03.10. (110: NF in 197 boots, 27B w109290020 129x
+    # ':drain-<n>ms-excluded'); =0 restores the flip_ms-with-drain price.
+    SGLANG_WEG2_MIN_DWELL_EXCLUDE_DRAIN = EnvBool(True)
     # H91d D-PARK DRAFT KV (user decision 2026-09-25: "Ausnahme nur fuers
     # Parken"): the one exception to the tier being off. A PARKED group-D
     # request (flip park before D's sleep, pressure park of the youngest)
