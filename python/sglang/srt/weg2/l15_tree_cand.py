@@ -41,6 +41,13 @@ TREE_CAND_ENV = "SGLANG_WEG2_L15_TREE_CAND"
 TREE_CAND_N_ENV = "SGLANG_WEG2_L15_TREE_CAND_N"
 DEFAULT_MAX_N = 8
 RID_PREFIX = "tree:"
+# L15-EXTRAKEY (240): a tip whose key carries an extra_key (cache salt,
+# multimodal hash) is published as ``tree:<digest>@<match_key>``: ``digest``
+# (extra_key mixed in) is the tip's identity for the rank agreement,
+# ``match_key`` (the digest of the SAME raw tokens WITHOUT the extra_key) is
+# what the front compares the prompt's prefix against. Without an extra_key
+# the two are equal and the rid stays ``tree:<digest>``.
+MATCH_SEP = "@"
 
 
 def env_on(env: Optional[Mapping[str, str]] = None) -> bool:
@@ -72,6 +79,8 @@ class TreeCand:
     # L15-TREE-DISAGREE: the tip node of a LAZY candidate (tokens not built
     # yet); :func:`with_tokens` fills ``tokens`` for the agreed ones only.
     node: object = field(default=None, compare=False, repr=False)
+    # L15-EXTRAKEY: digest_of(tokens, None); "" = same as ``digest``
+    match_key: str = field(default="", compare=False, repr=False)
 
 
 def _mamba_type():
@@ -216,9 +225,11 @@ class _Chain:
         self.h, self.last, self.n = h, last, n
 
 
-def _chain_digests(tips: Sequence[object], root) -> Dict[int, Optional[Tuple[str, int]]]:
-    """``id(tip) -> (digest, n_tokens)`` (None when the chain does not
-    compose), every node's key hashed ONCE however many tips share it.
+def _chain_digests(tips: Sequence[object], root
+                   ) -> Dict[int, Optional[Tuple[str, int, str]]]:
+    """``id(tip) -> (digest, n_tokens, match_key)`` (None when the chain does
+    not compose; ``match_key`` = the digest without the extra_key), every
+    node's key hashed ONCE however many tips share it.
 
     Byte-identical to ``digest_of(chain_tokens(tip, root), extra_key)``: the
     digest is blake2b over the concatenated raw token ids (the bigram boundary
@@ -257,17 +268,18 @@ def _chain_digests(tips: Sequence[object], root) -> Dict[int, Optional[Tuple[str
             memo[id(n)] = base
         return memo[id(node)]
 
-    out: Dict[int, Optional[Tuple[str, int]]] = {}
+    out: Dict[int, Optional[Tuple[str, int, str]]] = {}
     for t in tips:
         st = state(t)
         if st is None or st.n == 0:
             out[id(t)] = None
             continue
         h = st.h.copy()
+        pk = h.hexdigest()
         ek = getattr(getattr(t, "key", None), "extra_key", None)
         if ek is not None:
             h.update(b"\x00" + str(ek).encode("utf-8", "replace"))
-        out[id(t)] = (h.hexdigest(), st.n)
+        out[id(t)] = (h.hexdigest(), st.n, pk)
     return out
 
 
@@ -302,7 +314,7 @@ def local_candidates(tree_cache, limit: Optional[int],
             out.append(TreeCand(
                 digest=got[0], n_tokens=got[1],
                 last_access=float(getattr(n, "last_access_time", 0) or 0),
-                extra_key=ek, node=n))
+                extra_key=ek, node=n, match_key=got[2]))
             continue
         try:
             toks = chain_tokens(n, root)
@@ -316,6 +328,7 @@ def local_candidates(tree_cache, limit: Optional[int],
             last_access=float(getattr(n, "last_access_time", 0) or 0),
             tokens=tuple(toks),
             extra_key=ek,
+            match_key=digest_of(toks, None),
         ))
     return out
 
@@ -327,7 +340,8 @@ def with_tokens(c: TreeCand, tree_cache) -> TreeCand:
     toks = chain_tokens(c.node, getattr(tree_cache, "root_node", None))
     return TreeCand(digest=c.digest, n_tokens=c.n_tokens,
                     last_access=c.last_access, tokens=tuple(toks),
-                    extra_key=c.extra_key, node=c.node)
+                    extra_key=c.extra_key, node=c.node,
+                    match_key=c.match_key)
 
 
 def agree(local: Sequence[TreeCand], gather: Callable[[object], List[object]],
@@ -368,6 +382,29 @@ def agree(local: Sequence[TreeCand], gather: Callable[[object], List[object]],
     return out
 
 
+def rid_of(c: TreeCand) -> str:
+    """``tree:<digest>`` (no extra_key), ``tree:<digest>@<match_key>`` else."""
+    if c.match_key and c.match_key != c.digest:
+        return RID_PREFIX + c.digest + MATCH_SEP + c.match_key
+    return RID_PREFIX + c.digest
+
+
+def split_rid(rid: str) -> Tuple[str, str]:
+    """``(digest, match_key)`` of a tree rid; ``match_key`` == ``digest`` for
+    a rid without the ``@`` part (no extra_key, or a pre-240 descriptor)."""
+    rest = str(rid)[len(RID_PREFIX):]
+    digest, _sep, pk = rest.partition(MATCH_SEP)
+    return digest, (pk or digest)
+
+
+def match_key_of_rid(rid: str) -> str:
+    """The extra_key-free match key a span publishes ("" for a non-tree rid)."""
+    rid = str(rid)
+    if not rid.startswith(RID_PREFIX):
+        return ""
+    return split_rid(rid)[1]
+
+
 def pseudo_req(c: TreeCand, rank_in_order: int, total: int):
     """A Req-shaped stand-in l15_bind resolves through the tree match.
 
@@ -377,7 +414,7 @@ def pseudo_req(c: TreeCand, rank_in_order: int, total: int):
     agreed position), larger = younger.
     """
     return SimpleNamespace(
-        rid=RID_PREFIX + c.digest,
+        rid=rid_of(c),
         req_pool_idx=None,
         origin_input_ids=c.tokens,
         output_ids=[],
@@ -401,6 +438,19 @@ def tip_spans(spans: Sequence[Mapping]) -> List[Tuple[str, int]]:
     return out
 
 
+class _AnyKey:
+    """Sentinel: ``match_tip`` ignores the extra_key. L15-WAKE-SALT (280):
+    DIAGNOSTICS / TESTS ONLY -- no serving path passes it any more (the wake
+    hint carries the request's extra_key, an old hint without the field means
+    "unsalted only")."""
+
+    def __repr__(self) -> str:
+        return "ANY_EXTRA_KEY"
+
+
+ANY_EXTRA_KEY = _AnyKey()
+
+
 def match_tip(spans: Sequence[Mapping], token_ids: Sequence[int],
               extra_key=None
               ) -> Tuple[Optional[Tuple[str, int, int]], List[Tuple[str, int]]]:
@@ -408,26 +458,53 @@ def match_tip(spans: Sequence[Mapping], token_ids: Sequence[int],
 
     ``spans``: the published hold descriptor's spans (every rank publishes the
     same agreed list). A tip is hot for ``token_ids`` when the prompt's first
-    ``raw`` tokens hash to the tip's digest (the rid is ``tree:<digest>``,
-    digest = :func:`digest_of` of the tip's whole RAW token chain, which is the
-    request's own token sequence -- :func:`chain_tokens` keeps a bigram
-    boundary token once). The span's ``depth`` counts KV slots: ``raw`` ==
-    ``depth`` on a plain tree, ``depth + 1`` on a bigram tree (units + 1 raw
-    tokens); both are tried. Pure function of data every rank sees -- the
-    answer is the same on every P stage. The LONGEST matching tip wins.
+    ``raw`` tokens hash to the tip's MATCH KEY: the span's ``match_key`` (L15-
+    EXTRAKEY: ``digest_of`` of the tip's whole RAW token chain WITHOUT its
+    extra_key -- :func:`build_descriptor` publishes it; the request's own token
+    sequence, :func:`chain_tokens` keeps a bigram boundary token once), else
+    the digest part of the rid (a descriptor without the field). The rid
+    digest mixes the tip's extra_key in, so a salted / multimodal tip could
+    never match a bare prefix by it (240).
 
-    Returns ``((rid, depth, raw) or None, tips)``; ``tips`` is every
+    ``extra_key``: the REQUEST's namespace (cache_salt / lora / extra_key);
+    ``digest_of(prefix, extra_key)`` must be the tip's own digest, i.e. the
+    prompt's extra_key is the tip's -- ``None`` (the default) matches UNSALTED
+    tips only, never "any" (L15-WAKE-SALT 280: a tip held under cache_salt A
+    must not serve a request with salt B / no salt). Admission mode passes
+    the live request's, wake mode the extra_key its hint carries.
+    ``ANY_EXTRA_KEY`` (tokens alone) stays for diagnostics and tests.
+
+    The span's ``depth`` counts KV slots: ``raw`` == ``depth`` on a plain tree,
+    ``depth + 1`` on a bigram tree (units + 1 raw tokens); both are tried and
+    no other raw length exists: every insert and match aligns the key to the
+    page in KEY UNITS (unified_radix_cache.insert/match_prefix ->
+    RadixKey.page_aligned), an off-grid mamba anchor only drops the node's
+    mamba VALUE (a tombstone, not a shorter key). Pure function of data every
+    rank sees -- the answer is the same on every P stage. The LONGEST matching
+    tip wins.
+
+    Returns ``((rid, depth, raw) or None, tip_spans)``; ``tip_spans`` is every
     ``(rid, depth)`` for the miss marker."""
     tips = tip_spans(spans)
     if not tips:
         return None, tips
+    keys: Dict[str, str] = {}
+    for s in spans or ():
+        rid = str(s.get("rid", ""))
+        if rid.startswith(RID_PREFIX):
+            keys[rid] = str(s.get("match_key") or "") or match_key_of_rid(rid)
     arr = array("q", [int(t) for t in token_ids])
     for rid, depth in sorted(tips, key=lambda t: (-t[1], t[0])):
+        want = keys.get(rid) or match_key_of_rid(rid)
         for raw in (depth, depth + 1):
             if raw > len(arr):
                 continue
-            if digest_of(arr[:raw], extra_key) == rid[len(RID_PREFIX):]:
-                return (rid, depth, raw), tips
+            if digest_of(arr[:raw], None) != want:
+                continue
+            if (extra_key is not ANY_EXTRA_KEY
+                    and digest_of(arr[:raw], extra_key) != split_rid(rid)[0]):
+                continue
+            return (rid, depth, raw), tips
     return None, tips
 
 
@@ -525,7 +602,7 @@ def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
         log("L15-TREE-CAND local=%d agreed=%d%s rids=%s"
             % (len(local), len(agreed),
                "" if err is None else " walk_failed=%s: %s" % (type(err).__name__, err),
-               ",".join("%s(%d)" % (RID_PREFIX + c.digest, c.n_tokens)
+               ",".join("%s(%d)" % (rid_of(c), c.n_tokens)
                         for c in agreed[:6])))
     reqs = [pseudo_req(c, i, len(agreed)) for i, c in enumerate(agreed)]
     if probe is None:

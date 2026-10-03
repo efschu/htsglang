@@ -36,6 +36,8 @@ def build_descriptor(*, epoch: int, rank: int, prefix: Sequence[int],
                      bases: Sequence[dict], spans) -> dict:
     """``bases``: [{role, layer, view_off, unit, extents: [[off, size]...]}]
     in the order their fds are sent; ``spans``: manifest HoldSpans."""
+    from sglang.srt.weg2.l15_tree_cand import match_key_of_rid
+
     n_fds = (1 + max((int(e[2]) for b in bases for e in b["extents"]
                       if len(e) > 2), default=-1)) if any(
         len(e) > 2 for b in bases for e in b["extents"]) else sum(
@@ -45,6 +47,10 @@ def build_descriptor(*, epoch: int, rank: int, prefix: Sequence[int],
         "prefix": [int(x) for x in prefix],
         "bases": [dict(b) for b in bases],
         "spans": [{"rid": str(s.rid), "depth": int(s.depth),
+                   # L15-EXTRAKEY (240): the tree tip's token digest WITHOUT its
+                   # extra_key -- what P's front match compares the prompt to
+                   # (pure function of the tokens: identical on every rank)
+                   "match_key": match_key_of_rid(s.rid),
                    "slots": [int(x) for x in s.slots],
                    "anchor_slot": int(s.anchor_slot),
                    # L15-10c: the END anchor's canonical L2 slot -- P loads the

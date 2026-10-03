@@ -6366,6 +6366,7 @@ class Front:
                         if reason == "multimodal-unseen-image" else "")
             return None
         ft.remember(text, c.ids)
+        self._l15_ek_note(rid, payload)  # L15-WAKE-SALT: before the hint can be written
         self._sess_prefix(rid, c.ids)  # SESSION-TRACE
         # L3-INDEX PRICE (y7d weg2-0-2 / 2-19): the page-granular store prefix
         # of these exact ids, earlier boots and this one -- a store fact like
@@ -6750,6 +6751,35 @@ class Front:
             logger.info("WEG2 SESSION rid=%s sess=%s src=%s", rid, sess or "-", src)
         except Exception:  # noqa: BLE001 -- an instrument, never the route
             pass
+
+    def _l15_ek_note(self, rid: str, payload) -> None:
+        """L15-WAKE-SALT (280): the request's extra_key (cache_salt +
+        extra_key), kept per rid (bounded) so that the hot hints carry it. A
+        key the front cannot know (LoRA) is kept as unknown: no hint."""
+        try:
+            from sglang.srt.weg2 import l15_share_admit as _l15_sa
+
+            m = self.__dict__.setdefault("_l15_ek", collections.OrderedDict())
+            m[str(rid)] = _l15_sa.payload_extra_key(payload)
+            while len(m) > 4096:
+                m.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- no note = no hint (fail closed)
+            pass
+
+    def _l15_hint_ek(self, rid: str, prev_rid=None):
+        """``(ok, extra_key)`` for a hot hint of ``rid``: ok only when the
+        key is known; with ``prev_rid`` (a hint that names the previous
+        request's own hold) also when the previous request's key is the same,
+        so a hold never crosses a cache_salt."""
+        m = self.__dict__.get("_l15_ek") or {}
+        mine = m.get(str(rid))
+        if mine is None or not mine[0]:
+            return False, None
+        if prev_rid is not None:
+            theirs = m.get(str(prev_rid))
+            if theirs is None or not theirs[0] or theirs[1] != mine[1]:
+                return False, None
+        return True, mine[1]
 
     def _sess_tag(self, rid: str) -> str:
         """`` sess=<hash>`` for a SERVED line (empty without one)."""
@@ -9803,6 +9833,55 @@ class Front:
                     "epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, self.epoch)
         return route
 
+    def _dc_p_seat_gate(self, now: float) -> bool:
+        """DECODE-COLLECT SEAT GATE (user 02.10. ~20:25Z; NF e124d8f431): may the
+        collected set flip to P now? Only while D has a free seat after the flip
+        back (ARRIVAL-SEAT's own count: running minus parked, hand-offs, ready,
+        grants); the P phase then dispatches at most that many (``_dc_p_cap``,
+        oldest first). False: no seat -- the set keeps waiting. Front-side only:
+        no collective, no reserve."""
+        if not envs.SGLANG_WEG2_DECODE_COLLECT_SEAT_GATE.get():
+            return True
+        taken, n = self._arrival_seat_taken()
+        free = max(0, int(n) - int(taken))
+        st = self._dc_st()
+        if free <= 0:
+            if st.get("seat_hold_wid") != st["wid"]:
+                st["seat_hold_wid"] = st["wid"]
+                self.counters["decode_collect_seat_hold"] += 1
+                logger.info("WEG2 DECODE-COLLECT seat-gate hold taken=%d n=%d epoch=%d -- route P, but D has no "
+                            "free seat: no prefill on P; the set waits for a seat or the wait bound",
+                            taken, n, self.epoch)
+            return False
+        self._dc_p_cap = free
+        if st.get("seat_flip_wid") != st["wid"]:
+            st["seat_flip_wid"] = st["wid"]
+            self.counters["decode_collect_seat_flip"] += 1
+            logger.info("WEG2 DECODE-COLLECT seat-gate flip free=%d taken=%d n=%d epoch=%d -- P prefills at most "
+                        "%d (the free seats), oldest first", free, taken, n, self.epoch, free)
+        return True
+
+    async def _dc_no_seat_step(self, D: "Group", live_q: List["Pending"], bound: float,
+                               now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+        """SEAT GATE, route P without a free D seat: no flip of its own. The
+        ARRIVAL-SEAT room rules decide -- AGE PLAN: the oldest one's
+        displacement plan (the fewest youngest decodes park, then it flips with
+        P capped at one); else (c): past the wait bound the youngest running
+        decode parks and frees a seat for the next tick."""
+        if _asr.age_plan_enabled():
+            x_tok = int(self.tp_prefill_max_tokens)
+            cands = [q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None] or live_q
+            res = await self._arrival_seat_step_age(cands, x_tok, now)
+            if res[0] and res[2] is not None:
+                self._dc_p_cap = 1  # the displacement made room for one
+            return res
+        st = self._asr_st()
+        wait_s = _asr.oldest_wait_s([p.t_arrive for p in live_q] + list(st["waiters"].values()),
+                                    self.t_awake, now)
+        if _asr.bound_fired(wait_s, bound):
+            await self._arrival_seat_park_youngest(D, wait_s, bound, now)
+        return False, not self.admit_d, None
+
     async def _decode_collect_short(self, rid: str, uncached: int) -> Optional[str]:
         """DECODE-COLLECT for a SHORT arrival on the D seat path: ``None`` = no
         window (as before), else the released route ("P": fall through to
@@ -10346,6 +10425,8 @@ class Front:
         if dc == "P":
             if not live_q:
                 return False, not self.admit_d, None  # the released SHORTs are on their way to the queue
+            if not self._dc_p_seat_gate(now):
+                return await self._dc_no_seat_step(D, live_q, bound, now)
             head = min(live_q, key=lambda q: float(getattr(q, "t_arrive", now) or now))
             if st["flip_rid"] != head.rid:
                 st["flip_rid"] = head.rid
@@ -10977,10 +11058,14 @@ class Front:
                 _d = self.groups.get("D")
                 _live = (set(_d.outstanding) if _d is not None else set()) | set(
                     getattr(self, "_d_parked", None) or {})
+                _ek_ok, _ek = Front._l15_hint_ek(
+                    self, p.rid, str(_prev[0]) if _prev and str(_prev[0]) in _live else None)
+                if not _ek_ok:
+                    _prev = None     # L15-WAKE-SALT: key unknown / differs from the held one
                 if _prev and str(_prev[0]) in _live and int(_prev[1]) > 0:
                     _hot_dir = _l15_sp.share_dir(os.environ)
                     _l15_sa.write_hot_hint(_hot_dir, p.rid, str(_prev[0]),
-                                           int(_prev[1]))
+                                           int(_prev[1]), extra_key=_ek)
                     logger.info("HOT-HANDOVER-HINT rid=%s from=%s n=%d",
                                 p.rid, _prev[0], int(_prev[1]))
                 elif _prev:
@@ -10992,7 +11077,7 @@ class Front:
                     if _l15_tc.env_on(os.environ) and _full is not None and len(_full) > 0:
                         _hot_dir = _l15_sp.share_dir(os.environ)
                         _l15_sa.write_hot_hint(_hot_dir, p.rid, _l15_sa.TREE_PREV,
-                                               len(_full), tree=True)
+                                               len(_full), tree=True, extra_key=_ek)
                         logger.info("HOT-HANDOVER-HINT rid=%s tree n=%d (previous turn %s "
                                     "finished: P picks the held tree tip by prefix)",
                                     p.rid, len(_full), _prev[0])
@@ -13374,10 +13459,13 @@ class Front:
                             _r = str(getattr(_q, "rid", ""))
                             _pv = _sprev.get(_r)
                             _ids = _sids.get(_r)
-                            if (_pv and str(_pv[0]) in _dl and int(_pv[1]) > 0
+                            _ek_ok, _ek = Front._l15_hint_ek(
+                                self, _r, str(_pv[0]) if _pv and str(_pv[0]) in _dl else None)
+                            if (_ek_ok and _pv and str(_pv[0]) in _dl and int(_pv[1]) > 0
                                     and _ids is not None and len(_ids) >= int(_pv[1])):
                                 _l15_sa.write_hot_hint(_hdir, _r, str(_pv[0]), int(_pv[1]),
-                                                       ids=list(_ids)[: int(_pv[1])])
+                                                       ids=list(_ids)[: int(_pv[1])],
+                                                       extra_key=_ek)
                                 self._l15_wake_hints.append(_r)
                         if self._l15_wake_hints:
                             logger.info("HOT-HANDOVER-HINT at=wake n=%d rids=%s",
@@ -13397,11 +13485,14 @@ class Front:
                                 _r = str(getattr(_q, "rid", ""))
                                 _pv = _sprev.get(_r)
                                 _full = _tids.get(_r)
+                                _ek_ok, _ek = Front._l15_hint_ek(self, _r)
                                 if (_r in self._l15_wake_hints or not _pv or _full is None
-                                        or str(_pv[0]) in _dl or len(_full) == 0):
+                                        or str(_pv[0]) in _dl or len(_full) == 0
+                                        or not _ek_ok):
                                     continue
                                 _l15_sa.write_hot_hint(_hdir, _r, _l15_sa.TREE_PREV,
-                                                       len(_full), ids=_full, tree=True)
+                                                       len(_full), ids=_full, tree=True,
+                                                       extra_key=_ek)
                                 self._l15_wake_hints.append(_r)
                                 _tree_hinted.append(_r)
                             if _tree_hinted:
@@ -15794,6 +15885,14 @@ class Front:
             # 29.5 s again -- the 3 s store probe was back on every
             # second request).  The pool refills the moment ONE leg
             # finishes, so P always has the next request queued.
+            # DECODE-COLLECT SEAT GATE: the flip that brought P here was armed
+            # for the free D seats -- P prefills at most that many this phase
+            _dc_cap = int(self.__dict__.pop("_dc_p_cap", 0) or 0)
+            _max_dispatch = self.p_phase_max_requests
+            if _dc_cap > 0:
+                _max_dispatch = min(_max_dispatch, _dc_cap) if _max_dispatch else _dc_cap
+                logger.info("WEG2 DECODE-COLLECT seat-gate p-cap=%d epoch=%d queued=%d -- this P phase "
+                            "prefills at most the free D seats", _max_dispatch, self.epoch, len(self.queue))
             passes = await _p_drain_pool(
                 self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
                 lambda: (self.state == "serving" and not self._p_intake_stalled
@@ -15802,7 +15901,7 @@ class Front:
                 # H91 part C rule 1: at most p_phase_max_requests leave the
                 # queue in this P phase, overlapping only as far as their
                 # est_prompt fits P's unified pool (0 = off, law 1 as before).
-                max_dispatch=self.p_phase_max_requests,
+                max_dispatch=_max_dispatch,
                 cost=lambda p: phase_policy.p_request_cost(
                     p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1),
                 budget=self.p_pool_tokens, stats=_phase_stats,
@@ -15927,8 +16026,11 @@ class Front:
                     immediate: Optional[Pending] = None
                     if _asr.enabled():
                         # ARRIVAL-SEAT: the one decision site while D is awake.
-                        # The collect window and the window gate are never
-                        # consulted (inert); X-COST-LINE only supplies X.
+                        # The collect window is read inside it
+                        # (``_arrival_seat_step``: hold / route D / route P, the
+                        # latter behind the DECODE-COLLECT SEAT GATE); the
+                        # window gate is never consulted (inert); X-COST-LINE
+                        # only supplies X.
                         wait_fired, fairness_fired, immediate = await self._arrival_seat_step(D, _now)
                     elif self.d_park_immediate and not wait_fired and self.queue:
                         immediate = self._immediate_park_due(D, _now)

@@ -21,7 +21,6 @@ SGLANG_WEG2_L15_HOT_SHARE=1.
 from __future__ import annotations
 
 from sglang.srt.weg2.l15_shadow import kv_pool_of as _kvp  # L15-FIX-REFILL-POOL
-
 import json
 import os
 from dataclasses import dataclass
@@ -45,7 +44,7 @@ TREE_PREV = "tree:"      # L15-TREE-FRONT: prev_rid of a by-prefix hint
 
 def write_hot_hint(directory: str, rid: str, prev_rid: str, n: int,
                    ids: Optional[Sequence[int]] = None,
-                   tree: bool = False) -> None:
+                   tree: bool = False, extra_key: Optional[str] = None) -> None:
     """Front side: before leg 1 of a hot follow-up (admission mode), or at
     the D->P flip's begin with the prefix's token ``ids`` (wake mode: P
     adopts the prefix in its resume RPC, before the request exists there).
@@ -53,7 +52,11 @@ def write_hot_hint(directory: str, rid: str, prev_rid: str, n: int,
     L15-TREE-FRONT ``tree=True``: the follow-up's previous request FINISHED,
     so no rid names its hold; the hint carries the whole prompt (``n`` =
     its length) and every P stage picks the held tree tip the prompt extends
-    from the published descriptor (:func:`resolve_tree_hint`)."""
+    from the published descriptor (:func:`resolve_tree_hint`).
+
+    L15-WAKE-SALT (280): ``extra_key`` is the REQUEST's namespace (cache_salt /
+    extra_key); the P stages match the tip under it and adopt under it. A hint
+    without the field means "unsalted" (never "any")."""
     os.makedirs(directory, exist_ok=True)
     sweep_stale(directory)
     path = os.path.join(directory, "hot.%s.json" % rid)
@@ -61,6 +64,8 @@ def write_hot_hint(directory: str, rid: str, prev_rid: str, n: int,
     body = {"prev_rid": str(prev_rid), "n": int(n)}
     if tree:
         body["tree"] = True
+    if extra_key is not None:
+        body["extra_key"] = str(extra_key)
     if ids is not None:
         import base64
         from array import array
@@ -70,6 +75,47 @@ def write_hot_hint(directory: str, rid: str, prev_rid: str, n: int,
     with open(tmp, "w") as fh:
         json.dump(body, fh)
     os.replace(tmp, path)
+
+
+def hint_extra_key(hint: Optional[dict]) -> Optional[str]:
+    """The extra_key a hint carries; None = the field is absent = UNSALTED
+    (an old hint, or a request without cache_salt) -- never "any"."""
+    ek = (hint or {}).get("extra_key")
+    return None if ek is None else str(ek)
+
+
+def pin_hint_extra_key(hint: dict, extra_key) -> dict:
+    """A copy of ``hint`` whose extra_key is ``extra_key`` (the live
+    request's, admission mode: the request is authoritative over the file)."""
+    out = dict(hint)
+    if extra_key is None:
+        out.pop("extra_key", None)
+    else:
+        out["extra_key"] = str(extra_key)
+    return out
+
+
+def payload_extra_key(payload) -> Tuple[bool, Optional[str]]:
+    """Front side: ``(known, extra_key)`` of a request payload, as the
+    serving layer builds it (serving_base._compute_extra_key: cache_salt +
+    extra_key concatenated). ``known`` is False when the key cannot be known
+    here (a LoRA adapter folds its id into the key at the tokenizer manager):
+    such a request gets NO hot hint (fail closed)."""
+    if not isinstance(payload, dict):
+        return True, None
+    if payload.get("lora_path"):
+        return False, None
+    model = payload.get("model")
+    if isinstance(model, str) and ":" in model:
+        return False, None            # model "base:adapter" selects a LoRA
+    parts = []
+    for k in ("cache_salt", "extra_key"):
+        v = payload.get(k)
+        if v:
+            if not isinstance(v, str):
+                return False, None
+            parts.append(v)
+    return True, ("".join(parts) if parts else None)
 
 
 def hint_ids(hint: dict) -> Optional[list]:
@@ -85,20 +131,30 @@ def hint_ids(hint: dict) -> Optional[list]:
     return list(a)
 
 
+_FROM_HINT = object()     # resolve_tree_hint: take the extra_key from the hint
+
+
 def resolve_tree_hint(hint: dict, d0: Optional[dict], token_ids: Sequence[int],
-                      rid: str, log) -> Optional[dict]:
+                      rid: str, log, extra_key=_FROM_HINT) -> Optional[dict]:
     """L15-TREE-FRONT, P stage: a ``tree`` hint becomes the ordinary
     ``{prev_rid, n}`` of the held tip the prompt extends, or None (named).
 
     The decision uses data every stage sees (the published descriptor's agreed
     tip spans and the prompt's own ids), so all stages resolve the same tip
-    (or all miss). A hint without the ``tree`` flag passes through unchanged."""
+    (or all miss). A hint without the ``tree`` flag passes through unchanged.
+
+    L15-EXTRAKEY (240): the tip is matched by its extra_key-free match key.
+    L15-WAKE-SALT (280): the tip's own extra_key is ALWAYS pinned -- to
+    ``extra_key`` (admission mode: the live request's) or, by default, to the
+    one the hint carries (wake mode; an old hint without the field = unsalted
+    only). The resolved hint carries that extra_key on to the adopt."""
+    ek = hint_extra_key(hint) if extra_key is _FROM_HINT else extra_key
     if not hint.get("tree"):
-        return hint
+        return hint if extra_key is _FROM_HINT else pin_hint_extra_key(hint, ek)
     from sglang.srt.weg2 import l15_tree_cand
 
     spans = (d0 or {}).get("spans", ())
-    got, tips = l15_tree_cand.match_tip(spans, token_ids)
+    got, tips = l15_tree_cand.match_tip(spans, token_ids, ek)
     if got is None:
         log("HOT-HANDOVER rid=%s tree-miss tips=%d depths=%s prompt=%d (no held tree tip "
             "is a prefix of the prompt: the store read serves)"
@@ -107,7 +163,7 @@ def resolve_tree_hint(hint: dict, d0: Optional[dict], token_ids: Sequence[int],
         return None
     log("HOT-HANDOVER rid=%s tree-match tip=%s depth=%d raw=%d prompt=%d tips=%d"
         % (rid, got[0], got[1], got[2], len(token_ids), len(tips)))
-    out = dict(hint)
+    out = pin_hint_extra_key(hint, ek)
     out["prev_rid"], out["n"] = got[0], int(got[1])
     # bigram tree: units + 1 raw tokens; the adopt files them as `depth` keys
     # and gives the extra row back (l15_p_adopt, L15-ADOPT-TAIL)
@@ -344,7 +400,8 @@ def admit(*, rid: str, token_ids: Sequence[int], hint: dict,
     try:
         l15_p_adopt.adopt(tree_cache, kv_alloc, mamba_alloc,
                           token_ids=list(token_ids[:n + extra]), rows=all_rows,
-                          anchor_row=slot)
+                          anchor_row=slot,
+                          extra_key=hint_extra_key(hint))   # L15-WAKE-SALT
     except l15_p_adopt.L15AdoptRefused as exc:
         # every stage checked the same free rows before the verdict; a
         # refusal here means the stages' allocators diverged -- named loudly
@@ -590,7 +647,8 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
         verdict(False)
         return "share: %s" % exc
     _ids = list(getattr(req, "origin_input_ids", ()) or ())
-    hint = resolve_tree_hint(hint, d0, _ids, rid, log)
+    hint = resolve_tree_hint(hint, d0, _ids, rid, log,
+                             extra_key=getattr(req, "extra_key", None))
     if hint is None:
         verdict(False)
         return "tree: no held tip is a prefix of the prompt"
