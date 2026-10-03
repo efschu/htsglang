@@ -95,9 +95,26 @@ _PLAN_CACHE: dict = {}
 
 
 def _plan_key(m: Manifest, rank: int, prefix: Sequence[int]):
+    """Cache key of the plan: the manifest CONTENT, not its epoch stamp.
+
+    L15-PLAN-KEY-NO-EPOCH (item 470, 27B y8r 09:14:13 / 09:17:44): the plan
+    (row, l2_slot, l2_gen, lane, rids) is a function of the spans only, but
+    ``fingerprint`` (the group agreement) also hashes ``m.epoch``. A D sleep
+    is two flushes; the second REUSES the first round and ``restamp`` writes
+    the release's flip epoch into the published manifest (L15-SLEEP1X). The
+    plan warmed at the first flush was keyed with the old epoch, the wake
+    read the restamped manifest, missed, and rebuilt the plan on the resume
+    RPC: ``L15-REFILL ... steps=plan:972`` / ``plan:844`` (54k rows, 198k
+    held tokens of 7 TREE-CAND tips) against ``plan:21..58`` on the unstamped
+    holds -- every peer's fence waited for it (P>D layer +1 s, once even a
+    fallback after the wait). The epoch is therefore zeroed in the key."""
     from sglang.srt.weg2.l15_manifest import fingerprint
 
-    return (int(fingerprint(m)), int(rank), tuple(int(x) for x in prefix))
+    return (
+        int(fingerprint(dataclasses.replace(m, epoch=0))),
+        int(rank),
+        tuple(int(x) for x in prefix),
+    )
 
 
 def owned_l2_rows(
@@ -135,7 +152,7 @@ def warm_plan_async(m: Manifest, rank: int, prefix: Sequence[int]) -> None:
         pass
 
 
-def owned_l2_rows_uncached(
+def owned_l2_rows_reference(
     m: Manifest, rank: int, prefix: Sequence[int],
 ) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
     """Every L2-backed row this rank must refill, ONCE per compact row.
@@ -185,6 +202,108 @@ def owned_l2_rows_uncached(
         elif str(span.rid) not in ent[4]:
             ent[4].append(str(span.rid))
     return [(e[0], e[1], e[2], e[3], tuple(e[4])) for e in entries]
+
+
+def _owned_l2_rows_np(
+    m: Manifest, rank: int, prefix: Sequence[int],
+):
+    """L15-PLAN-NP (item 470): :func:`owned_l2_rows_reference` as numpy.
+
+    27B y8r 09:14:13: ``plan:972`` ms for 198k held tokens (7 TREE-CAND tips
+    sharing their prefix) -- a per-token Python walk with a generator, two
+    helper calls and a dict probe each, ~5 us/token, slower still beside the
+    scheduler threads. The same answer as arrays: owned mask, compact row,
+    first-appearance order (``np.unique`` first index), identity check against
+    the first occurrence, and the rid tuple from a per-row span bitmask.
+    Returns None when a case needs the reference (a conflicting identity -- it
+    raises there with the exact message -- more than 62 spans, or odd data)."""
+    import numpy as np
+
+    spans = m.spans
+    if not spans or len(spans) > 62:
+        return None
+    s_tot = int(prefix[-1])
+    lo = int(prefix[rank])
+    width = int(prefix[rank + 1]) - lo
+    rows_p, l2s_p, l2g_p, lane_p, spi_p = [], [], [], [], []
+    for k, span in enumerate(spans):
+        slots = np.asarray(span.slots, dtype=np.int64)
+        n = int(slots.shape[0])
+        if n == 0:
+            continue
+        m_src = min(len(span.l2_slots), len(span.l2_gens), n)
+        if m_src == 0:
+            continue
+        l2s = np.asarray(span.l2_slots[:m_src], dtype=np.int64)
+        l2g = np.asarray(span.l2_gens[:m_src], dtype=np.int64)
+        lanes = np.full(m_src, -1, dtype=np.int64)
+        lv = getattr(span, "l2_lanes", ())
+        if len(lv):
+            lk = min(len(lv), m_src)
+            lanes[:lk] = np.asarray(lv[:lk], dtype=np.int64)
+        sl = slots[:m_src]
+        lo_s = sl % s_tot
+        sel = (lo_s >= lo) & (lo_s < lo + width) & (l2s >= 0)
+        if not bool(sel.any()):
+            continue
+        sl, lo_s = sl[sel], lo_s[sel]
+        rows_p.append((sl // s_tot) * width + (lo_s - lo))
+        l2s_p.append(l2s[sel])
+        l2g_p.append(l2g[sel])
+        lane_p.append(lanes[sel])
+        spi_p.append(np.full(sl.shape[0], k, dtype=np.int64))
+    if not rows_p:
+        return []
+    rows = np.concatenate(rows_p)
+    l2s = np.concatenate(l2s_p)
+    l2g = np.concatenate(l2g_p)
+    lane = np.concatenate(lane_p)
+    spi = np.concatenate(spi_p)
+    uniq, first, inv = np.unique(rows, return_index=True, return_inverse=True)
+    # a row visited again with ANOTHER identity is a real conflict: the
+    # reference raises it with row, both sources and rids
+    if (np.any(l2s != l2s[first][inv]) or np.any(l2g != l2g[first][inv])
+            or np.any(lane != lane[first][inv])):
+        return None
+    mask = np.zeros(uniq.shape[0], dtype=np.int64)
+    np.bitwise_or.at(mask, inv, np.left_shift(np.int64(1), spi))
+    order = np.argsort(first, kind="stable")  # first-appearance order
+    rids_of: dict = {}
+
+    def _rids(mk: int) -> Tuple[str, ...]:
+        hit = rids_of.get(mk)
+        if hit is None:
+            out: List[str] = []
+            for k in range(len(spans)):
+                if (mk >> k) & 1:
+                    r = str(spans[k].rid)
+                    if r not in out:
+                        out.append(r)
+            hit = tuple(out)
+            rids_of[mk] = hit
+        return hit
+
+    f_idx = first[order]
+    return [
+        (int(r), int(a), int(b), int(c), _rids(int(mk)))
+        for r, a, b, c, mk in zip(
+            uniq[order].tolist(), l2s[f_idx].tolist(), l2g[f_idx].tolist(),
+            lane[f_idx].tolist(), mask[order].tolist())
+    ]
+
+
+def owned_l2_rows_uncached(
+    m: Manifest, rank: int, prefix: Sequence[int],
+) -> List[Tuple[int, int, int, int, Tuple[str, ...]]]:
+    """:func:`owned_l2_rows_reference` through the numpy plan; any case the
+    arrays do not cover (conflict, odd data) runs the reference."""
+    try:
+        got = _owned_l2_rows_np(m, rank, prefix)
+    except Exception:  # noqa: BLE001 -- odd manifest: the reference decides
+        got = None
+    if got is not None:
+        return got
+    return owned_l2_rows_reference(m, rank, prefix)
 
 
 def rid_tagged_plan(
