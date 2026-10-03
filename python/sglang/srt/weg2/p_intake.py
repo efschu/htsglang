@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 
 #: scheduler attribute holding the kept verdicts ({rid: _Kept})
 KEPT_ATTR = "_weg2_told_kept"
+SKIP_TOLD_PENDING = "weg2_store_told_pending"  # = weg2_store_told.SKIP_TOLD_PENDING
 _LOG_FIRST = 8
 _LOG_EVERY = 256
 
@@ -105,8 +106,11 @@ def told_admission(
                 )
             except Exception:  # noqa: BLE001 - a double without the field
                 pass
-            if entry.reach:
-                _reach_kept(scheduler, req, entry)
+            if entry.reach and _reach_kept(scheduler, req, entry):
+                # item 180: the tree is still short of told -- not seated on
+                # this rank's own say; PP0 is re-asked, the request is held
+                note_skip(SKIP_TOLD_PENDING, rid)
+                return None
             n = getattr(scheduler, "_h91_told_kept_n", 0) + 1
             scheduler._h91_told_kept_n = n
             if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
@@ -119,7 +123,10 @@ def told_admission(
                 )
             return entry.credit
         # another request object under this rid, or a fresh told arrived for
-        # it (re-intake): the old verdict is not this visit's
+        # it (re-intake): the old verdict is not this visit's. The wait budget
+        # and the held mark of that verdict go with it (item 180): settle_told
+        # never sees the rid again when no fresh told follows.
+        _drop_reach_state(scheduler, rid)
         kept.pop(rid, None)
     told = told_map.get(rid)
     # W27-UNIFORM: admission consumes the twin-follower mark; ask before it
@@ -143,14 +150,29 @@ def _is_follower_twin(scheduler, rid: str) -> bool:
         return False
 
 
-def _reach_kept(scheduler, req, entry: "_Kept") -> None:
+def _drop_reach_state(scheduler, rid: str) -> None:
+    """The follower's per-rid W27 state (re-read wait budget, held mark)."""
+    for attr in ("_w27u_wait_spent_s", "_w27u_unreached"):
+        m = getattr(scheduler, attr, None)
+        if m:
+            m.pop(rid, None)
+    named = getattr(scheduler, "_w27u_spent_named", None)
+    if named:
+        named.discard(rid)
+
+
+def _reach_kept(scheduler, req, entry: "_Kept") -> bool:
     """W27-UNIFORM (open point (a) of item 025): the verdict kept across visits
     was checked against the follower's live tree when it was made; between that
     visit and the one that finally seats the request the tree can move (the
     sibling's read released, eviction), and only the TOLD-PIN held the anchor.
     The same ``follower_reach_told`` check runs at the later admission: a tree
     that fell short is re-read to told (wait bounded per rid, WAIT_CAP_S), PP0's
-    prefix stands, nothing is refused here."""
+    prefix stands, nothing is refused here.
+
+    Returns True when the tree is STILL short after the bounded re-read
+    (item 180): the caller holds the request instead of returning the kept
+    credit (PP0 re-asked through ``weg2_store_told.follower_hold_unreached``)."""
     try:
         from sglang.srt.managers import weg2_store_told as _st
 
@@ -162,9 +184,11 @@ def _reach_kept(scheduler, req, entry: "_Kept") -> None:
             fresh = int(_st._pop_credit_keep_pin(tree, str(getattr(req, "rid", ""))) or 0)
             if fresh > 0:
                 entry.credit = fresh
+        return bool(_st.follower_hold_unreached(scheduler, req, "kept"))
     except Exception:  # noqa: BLE001 - a probe never breaks the admission
         logger.warning("W27-UNIFORM kept-verdict reach check skipped for rid=%s",
                        str(getattr(req, "rid", ""))[:8], exc_info=True)
+        return False
 
 
 def told_pending(scheduler, req) -> bool:
@@ -208,11 +232,9 @@ def settle_told(scheduler, waiting_queue: Iterable[Any]) -> int:
     gone = [rid for rid, e in kept.items() if id(e.req) not in queued]
     tree = getattr(scheduler, "tree_cache", None)
     unpin = getattr(tree, "_unpin_prefetched_span", None)
-    spent = getattr(scheduler, "_w27u_wait_spent_s", None)
     for rid in gone:
         kept.pop(rid, None)
-        if spent:
-            spent.pop(rid, None)
+        _drop_reach_state(scheduler, rid)
         if callable(unpin):
             # TOLD-PIN: the admission kept the #1417 pin (anchor included)
             # while the verdict stood; the request left the queue, the pin goes

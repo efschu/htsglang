@@ -107,6 +107,9 @@ HARVEST_MAX_PER_SRC = 8
 REASON_ACKS = "acks"
 REASON_MISMATCH = "mismatch"
 REASON_FRIST = "frist"
+#: item 180: where a follower's re-ask of PP0 went (follower_reask)
+ROUTE_PF = "pf-ack"
+ROUTE_NONE = "none"
 
 _LOG_FIRST = 8
 _LOG_EVERY = 256
@@ -340,7 +343,15 @@ def pp0_harvest(scheduler) -> int:
         for rid, own in ack.reads:
             o = open_map.get(str(rid))
             if o is None:
-                continue  # decided (or dropped) already: late ack
+                # decided (or dropped) already: late ack (item 180: also a
+                # follower's re-ask of an already admitted rid -- named)
+                k = _bump(scheduler, "_pf_ack_late_n")
+                if _say(k):
+                    logger.warning(
+                        "PF TOLD-ACK LATE rank=%s rid=%s own=%s (n=%d): PP0 decided this "
+                        "rid already -- the ack changes nothing", ack.rank, str(rid)[:8], own, k,
+                    )
+                continue
             o.acks[int(ack.rank)] = int(own)
             n += 1
     if n:
@@ -446,6 +457,23 @@ def follower_note_registered(scheduler, req) -> None:
         st.registered[rid] = req
 
 
+def follower_reask(scheduler, rid: str, told: int, live: int) -> str:
+    """W27-UNIFORM (item 180): a follower whose LIVE tree stays short of
+    PP0's told (``weg2_store_told.follower_hold_unreached``) re-asks PP0
+    instead of seating on its own tree: its reach (``live``) goes out on the
+    PF ack stream like any terminated read's, and PP0's rule stands -- an ack
+    that differs from told means told=0 for EVERY rank (``pp0_decide``). The
+    follower decides nothing; it holds until PP0 answers
+    (``follower_release``) or its tree reaches told. ``ROUTE_NONE`` = the
+    boot has no ack stream (PF off: no follower state), nothing is sent."""
+    st = _fstate(scheduler)
+    if st is None:
+        return ROUTE_NONE
+    st.outbox = [e for e in st.outbox if e[0] != str(rid)]
+    st.outbox.append((str(rid), int(live)))
+    return ROUTE_PF
+
+
 def follower_forget(scheduler, rid: str) -> None:
     st = _fstate(scheduler)
     if st is None:
@@ -464,6 +492,14 @@ def follower_release(scheduler, rid: str) -> None:
     rid = str(rid)
     follower_forget(scheduler, rid)
     release_own_read(scheduler, rid)
+    # item 180: the rank-uniform answer ends a hold for a tree short of told
+    try:
+        from sglang.srt.managers import weg2_store_told as _st
+
+        _st.forget_unreached(scheduler, rid)
+    except Exception:  # noqa: BLE001 - bookkeeping
+        pass
+    (getattr(scheduler, "_weg2_told_kept", None) or {}).pop(rid, None)
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
     if satisfied:
         satisfied.pop(rid, None)

@@ -1617,6 +1617,122 @@ def follower_reach_told_on(env=None) -> bool:
     return str(env.get(ENV_REACH_TOLD, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _unreached(scheduler, create: bool = False):
+    m = getattr(scheduler, "_w27u_unreached", None)
+    if m is None and create:
+        m = scheduler._w27u_unreached = {}
+    return m
+
+
+def reach_unresolved(scheduler, rid) -> Optional[tuple]:
+    """(told, live[, route]) when the last :func:`follower_reach_told` of
+    ``rid`` ended with this rank's live tree still short of PP0's told
+    (re-read budget spent or the re-read did not bring it), else None."""
+    m = _unreached(scheduler)
+    return m.get(str(rid)) if m else None
+
+
+def _mark_unreached(scheduler, rid, told, live, prior) -> None:
+    """Record the unresolved shortness; a rid already re-asked keeps its route."""
+    _unreached(scheduler, create=True)[str(rid)] = (int(told), int(live)) + tuple(
+        prior[2:] if prior else ()
+    )
+
+
+def forget_unreached(scheduler, rid) -> None:
+    """The rid left this rank's admission (aborted / admitted / PP0 answered
+    told=0): its unresolved mark and its re-read budget go with it."""
+    for attr in ("_w27u_unreached", "_w27u_wait_spent_s"):
+        m = getattr(scheduler, attr, None)
+        if m:
+            m.pop(str(rid), None)
+    named = getattr(scheduler, "_w27u_spent_named", None)
+    if named:
+        named.discard(str(rid))
+
+
+def follower_hold_unreached(scheduler, req, site: str) -> bool:
+    """W27-UNIFORM (item 180): True = this follower's tree is STILL short of
+    PP0's told after the bounded re-read, and it must not seat the request
+    on its own tree: the caller holds the request this pass (skipped like a
+    told that has not arrived yet) and the rank re-asks PP0 (the PF ack
+    stream, rank-uniform: PP0 alone answers told=0 for every rank). Admitting
+    at told over a shorter tree is the PP0-vs-follower width split W27 exists
+    to prevent; refusing here would be a new rank-local verdict. The hold ends
+    when the live tree reaches told (checked every visit, no further wait), PP0
+    answers told=0 (``follower_release``) or the request leaves the queue.
+    One log line names the outcome (first hold of a rid, then every 256th)."""
+    rid = _rid(req)
+    un = reach_unresolved(scheduler, rid)
+    if un is None:
+        return False
+    t, live = int(un[0]), int(un[1])
+    first = len(un) < 3
+    if first:
+        route = _fb.follower_reask(scheduler, rid, t, live)
+        _unreached(scheduler, create=True)[rid] = (t, live, route)
+    else:
+        route = un[2]
+    n = getattr(scheduler, "_w27u_hold_n", 0) + 1
+    scheduler._w27u_hold_n = n
+    if first or n % 256 == 0:
+        logger.error(
+            "W27-UNIFORM FOLLOWER HELD rank pp=%s rid=%s told=%d live=%d site=%s route=%s "
+            "(n=%d): this rank's tree stays short of PP0's told after the bounded re-read -- "
+            "NOT seated on its own tree (that is the PP0-vs-follower width split); the "
+            "request is held this pass and PP0 is re-asked (%s); the hold ends when the "
+            "tree reaches told, PP0 answers told=0 for every rank, or the request leaves",
+            scheduler.ps.pp_rank, _rt(rid), t, live, site, route, n,
+            "PF ack queued: PP0 answers told=0 for all ranks"
+            if route == _fb.ROUTE_PF
+            else "no PF ack channel on this boot: no uniform answer can arrive, the #1233 W27 guard stays the stop",
+        )
+    return True
+
+
+def hold_revisit(scheduler, req, rid: str, told: int, note_skip):
+    """A held request visits :func:`admission` again: (True, value) = the
+    visit is settled here (``value`` None = still held, else the credit of an
+    admission whose tree now reaches told), (False, None) = not a held rid,
+    continue with the normal path."""
+    un = reach_unresolved(scheduler, rid)
+    if un is None:
+        return False, None
+    if int(told) <= 0:
+        # PP0 answered told=0 (fallback Admit): nothing to reach, normal path
+        forget_unreached(scheduler, rid)
+        return False, None
+    live = _tf.rank_resumable(scheduler, req, int(told))
+    if live is not None and int(live) < int(told):
+        _unreached(scheduler)[rid] = (int(un[0]), int(live)) + tuple(un[2:])
+        follower_hold_unreached(scheduler, req, "revisit")
+        note_skip(SKIP_TOLD_PENDING, rid)
+        return True, None
+    # the live tree reaches told (or cannot be asked): admit at told like PP0
+    forget_unreached(scheduler, rid)
+    scheduler._weg2_store_told.pop(rid, None)
+    (getattr(scheduler, "_weg2_store_told_satisfied", None) or {}).pop(rid, None)
+    _twin.take_follower_twin(scheduler, rid)
+    credit = _pop_credit_keep_pin(scheduler.tree_cache, rid)
+    logger.warning(
+        "W27-UNIFORM FOLLOWER HOLD RELEASED rank pp=%s rid=%s told=%d live=%s: this rank's "
+        "tree reaches PP0's told again -- admitted at told like PP0",
+        scheduler.ps.pp_rank, _rt(rid), int(told), live,
+    )
+    return True, credit
+
+
+def _hold_restore(scheduler, rid: str, told: int, satisfied: bool) -> None:
+    """The visit that ends in a hold consumed the marks the next visit needs."""
+    scheduler._weg2_store_told[rid] = int(told)
+    _twin.note_follower_twin(scheduler, rid)
+    if satisfied:
+        sat = getattr(scheduler, "_weg2_store_told_satisfied", None)
+        if sat is None:
+            sat = scheduler._weg2_store_told_satisfied = {}
+        sat[rid] = int(told)
+
+
 def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admission") -> int:
     """W27-UNIFORM (NF e124d8f431, P 02.10. 22:37:12Z weg2-58-576 and
     23:05:11Z weg2-6-77 -- the two deaths of that image): a FOLLOWER admits
@@ -1653,11 +1769,14 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
         return own
     live = _tf.rank_resumable(scheduler, req, int(told))
     if live is None or int(live) >= int(told):
+        forget_unreached(scheduler, rid)
         return own
     tree = scheduler.tree_cache
+    prior = reach_unresolved(scheduler, rid)
     n = getattr(scheduler, "_w27u_short_n", 0) + 1
     scheduler._w27u_short_n = n
-    logger.warning(
+    # a rid already held (item 180) asks again every pass: name it once
+    (logger.debug if prior is not None else logger.warning)(
         "W27-UNIFORM FOLLOWER TREE SHORT rank pp=%s rid=%s told=%d own_record=%d live=%d "
         "site=%s (n=%d): this rank's tree no longer reaches PP0's told (the read's record "
         "does); re-reading [%d, %d) from the store before admitting -- PP0's prefix stands",
@@ -1680,7 +1799,14 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
         spent_map = scheduler._w27u_wait_spent_s = {}
     budget = WAIT_CAP_S - float(spent_map.get(rid, 0.0))
     if budget <= 0:
-        logger.error(
+        _mark_unreached(scheduler, rid, told, live, prior)
+        # named once per rid (a held rid asks again every pass)
+        named = getattr(scheduler, "_w27u_spent_named", None)
+        if named is None:
+            named = scheduler._w27u_spent_named = set()
+        first_spent = rid not in named
+        named.add(rid)
+        (logger.error if first_spent else logger.debug)(
             "W27-UNIFORM FOLLOWER RE-READ BUDGET SPENT rank pp=%s rid=%s told=%d live=%d "
             "site=%s (n=%d): %.0f ms already waited for this rid (cap %.0f ms) -- no further "
             "wait, the #1233 W27 guard will name the split at the forward",
@@ -1704,6 +1830,7 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
         satisfied.pop(rid, None)
     after = _tf.rank_resumable(scheduler, req, int(told))
     if after is not None and int(after) < int(told):
+        _mark_unreached(scheduler, rid, told, after, prior)
         logger.error(
             "W27-UNIFORM FOLLOWER STILL SHORT rank pp=%s rid=%s told=%d live=%d verdict=%s "
             "wait=%.0f ms%s (n=%d): the re-read did not bring this rank's tree to PP0's told "
@@ -1713,6 +1840,7 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
         )
         return own
     spent_map.pop(rid, None)
+    forget_unreached(scheduler, rid)
     n2 = getattr(scheduler, "_w27u_reread_n", 0) + 1
     scheduler._w27u_reread_n = n2
     logger.warning(
@@ -1734,6 +1862,10 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     if told is None:
         note_skip(SKIP_TOLD_PENDING, rid)
         return None
+    # item 180: a request held for a tree short of told is re-checked, not re-run
+    _settled, _value = hold_revisit(scheduler, req, rid, told, note_skip)
+    if _settled:
+        return _value
     # P-FORK-CUT: the told's fork rides onto the request on every rank alike
     # (PP0 published it, the followers absorbed it); the adder cuts only there.
     forks = getattr(scheduler, "_weg2_store_fork", None) or {}
@@ -1775,6 +1907,10 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
             # W27-UNIFORM: "holds the span" was the read's record -- the
             # tree must still reach told when this rank admits.
             follower_reach_told(scheduler, req, told, int(told), site="satisfied")
+            if follower_hold_unreached(scheduler, req, "satisfied"):
+                _hold_restore(scheduler, rid, told, satisfied=True)
+                note_skip(SKIP_TOLD_PENDING, rid)
+                return None
         return 0
     # The single-phase form waits here for a read registered THIS pass (the
     # stage stops for it); the paced form (#1416e) registered it a window
@@ -1799,6 +1935,10 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         if int(own) == int(told):
             # W27-UNIFORM: the record says told; the tree must say it too.
             own = follower_reach_told(scheduler, req, told, int(own), site="admission")
+            if follower_hold_unreached(scheduler, req, "admission"):
+                _hold_restore(scheduler, rid, told, satisfied=False)
+                note_skip(SKIP_TOLD_PENDING, rid)
+                return None
     credit = _pop_credit_keep_pin(tree, rid)
     told_map.pop(rid, None)
     if own != told:
