@@ -648,6 +648,85 @@ def _apply_park_defer(sched) -> int:
     return len(moved)
 
 
+#: Q-698: at most this many SEAT-AGE displacements for ONE older waiting
+#: request. A request needs at most one victim per younger seat (--d-bs 6 on
+#: NF); the bound only ends a rotation the hold below cannot see (the
+#: verdict's KV fit is not the adder's NO_TOKEN budget: decode reservations,
+#: the group floor, the commitment ledger, mamba slots).
+DISPLACE_MAX_PER_OLDER = 8
+
+
+def _displace_counts(sched) -> dict:
+    counts = getattr(sched, "_weg2_sa_displace_counts", None)
+    if counts is None:
+        counts = sched._weg2_sa_displace_counts = {}
+    return counts
+
+
+def _waiting_rids(sched) -> set:
+    return {str(getattr(q, "rid", "")) for q in list(getattr(sched, "waiting_queue", None) or [])
+            + list(getattr(sched, "weg2_post_wake_settle", None) or [])
+            + list(getattr(sched, "weg2_dormant_hold", None) or [])}
+
+
+def _prune_displace_counts(sched) -> None:
+    """An older request that is admitted or gone starts a new count when it
+    waits again (replicated: the queue is)."""
+    counts = getattr(sched, "_weg2_sa_displace_counts", None)
+    if not counts:
+        return
+    live = _waiting_rids(sched)
+    for rid in [r for r in counts if r not in live]:
+        del counts[rid]
+    told = getattr(sched, "_weg2_sa_exhausted_told", None)
+    if told:
+        sched._weg2_sa_exhausted_told = {r for r in told if r in live}
+
+
+def _release_holds(sched, older: Optional[str] = None) -> list:
+    """Q-698: end the hold of every victim parked for ``older`` (None = for
+    any older request). Returns the released victims' rids."""
+    out = []
+    for q in list(getattr(sched, "waiting_queue", None) or []):
+        held_for = getattr(q, d_seats.DISPLACED_FOR_ATTR, None)
+        if held_for is not None and (older is None or str(held_for) == str(older)):
+            setattr(q, d_seats.DISPLACED_FOR_ATTR, None)
+            out.append(str(q.rid))
+    return out
+
+
+def _lift_holds_when_idle(sched) -> None:
+    """Q-698: nothing runs on D, victims are held for an older request, and
+    that older one was refused NO_TOKEN in the last pass -- on every rank
+    (group MIN; the precondition is replicated, so every rank enters it). No
+    running request will release KV for it, so holding its victims would only
+    idle D: the holds end, named. The older one keeps waiting as any request
+    does (the victims' own end releases their KV)."""
+    held = {str(getattr(q, d_seats.DISPLACED_FOR_ATTR, None))
+            for q in list(getattr(sched, "waiting_queue", None) or [])
+            if getattr(q, d_seats.DISPLACED_FOR_ATTR, None) is not None}
+    if not held:
+        return
+    no_token_rid = getattr(sched, "_weg2_sa_no_token", None)
+    sched._weg2_sa_no_token = None
+    if not getattr(sched, "_weg2_sa_idle_armed", False):
+        # the refusal read here may stem from a pass in which something still
+        # ran: only a refusal from an idle pass counts (replicated: the
+        # running set is)
+        sched._weg2_sa_idle_armed = True
+        return
+    local = no_token_rid is not None and str(no_token_rid) in held
+    gm = getattr(sched, "_weg2_group_min_flags", None)
+    agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
+    if not agreed:
+        return
+    released = _release_holds(sched)
+    logger.warning("Q-698 SEAT-AGE HOLD-LIFT older=%s released=%s: refused NO_TOKEN with nothing "
+                   "running on D -- no running request releases KV for it; its victims resume, "
+                   "it waits for their KV", sorted(r[:16] for r in held),
+                   [r[:16] for r in released])
+
+
 def displace_for_age(sched, running_batch) -> Optional[str]:
     """SA (3) (#244, the user's design): an older request waits on D while
     every seat is held and a YOUNGER one runs -> the youngest running one is
@@ -662,8 +741,11 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     if not _sa.enabled() or not d_seats.d_flip_park_active():
         return None
     reqs = list(getattr(running_batch, "reqs", None) or [])
+    _prune_displace_counts(sched)
     if not reqs:
+        _lift_holds_when_idle(sched)
         return None
+    sched._weg2_sa_idle_armed = False
     cap = seat_cap(sched)
     if cap is None:
         cap = int(getattr(getattr(sched, "server_args", None), "max_running_requests", 0) or 0)
@@ -714,6 +796,22 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     if pair is None:
         return None
     older, victim_rid = pair
+    counts = _displace_counts(sched)
+    if counts.get(older, 0) >= DISPLACE_MAX_PER_OLDER:
+        # Q-698 end state: the displacements did not get the older one in (the
+        # adder's NO_TOKEN budget is not the verdict's fit) -- no further victim
+        # for it, the held ones resume; it waits for the KV the running
+        # requests release, as any request does. Named once per older rid.
+        released = _release_holds(sched, older)
+        if older not in getattr(sched, "_weg2_sa_exhausted_told", set()):
+            sched._weg2_sa_exhausted_told = getattr(sched, "_weg2_sa_exhausted_told", set()) | {older}
+            logger.warning("Q-698 SEAT-AGE DISPLACE-EXHAUSTED older=%s displaced=%d max=%d "
+                           "released=%s: displacing younger seats did not get the older request "
+                           "admitted -- no further victim for it; the held victims resume and it "
+                           "waits for the KV the running requests release",
+                           older[:16], counts.get(older, 0), DISPLACE_MAX_PER_OLDER,
+                           [str(r)[:16] for r in released])
+        return None
     idx = next(i for i, r in enumerate(reqs) if str(r.rid) == victim_rid)
     spec = not (getattr(running_batch, "spec_algorithm", None) is None
                 or running_batch.spec_algorithm.is_none())
@@ -726,6 +824,10 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                         older[:16], victim_rid[:16], n)
         return None
     victim = _displace_at(sched, running_batch, reqs, idx)
+    # Q-698: the victim waits for the older one it was parked for
+    # (d_seats.admission_gate holds it while that one waits and anything runs).
+    setattr(victim, d_seats.DISPLACED_FOR_ATTR, older)
+    counts[older] = counts.get(older, 0) + 1
     sched._weg2_sa_displaced = getattr(sched, "_weg2_sa_displaced", 0) + 1
     # H106b (rc12z22-dwell30 D 15:51:41, weg2-6-33): this runs AFTER the pass's
     # #580 prefetch drain, so the victim joins a queue the drain never saw.
