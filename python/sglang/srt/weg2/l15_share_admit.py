@@ -40,16 +40,27 @@ def hot_hint(directory: str, rid: str) -> Optional[dict]:
     return h
 
 
+TREE_PREV = "tree:"      # L15-TREE-FRONT: prev_rid of a by-prefix hint
+
+
 def write_hot_hint(directory: str, rid: str, prev_rid: str, n: int,
-                   ids: Optional[Sequence[int]] = None) -> None:
+                   ids: Optional[Sequence[int]] = None,
+                   tree: bool = False) -> None:
     """Front side: before leg 1 of a hot follow-up (admission mode), or at
     the D->P flip's begin with the prefix's token ``ids`` (wake mode: P
-    adopts the prefix in its resume RPC, before the request exists there)."""
+    adopts the prefix in its resume RPC, before the request exists there).
+
+    L15-TREE-FRONT ``tree=True``: the follow-up's previous request FINISHED,
+    so no rid names its hold; the hint carries the whole prompt (``n`` =
+    its length) and every P stage picks the held tree tip the prompt extends
+    from the published descriptor (:func:`resolve_tree_hint`)."""
     os.makedirs(directory, exist_ok=True)
     sweep_stale(directory)
     path = os.path.join(directory, "hot.%s.json" % rid)
     tmp = path + ".tmp"
     body = {"prev_rid": str(prev_rid), "n": int(n)}
+    if tree:
+        body["tree"] = True
     if ids is not None:
         import base64
         from array import array
@@ -72,6 +83,36 @@ def hint_ids(hint: dict) -> Optional[list]:
     a = array("q")
     a.frombytes(base64.b64decode(text))
     return list(a)
+
+
+def resolve_tree_hint(hint: dict, d0: Optional[dict], token_ids: Sequence[int],
+                      rid: str, log) -> Optional[dict]:
+    """L15-TREE-FRONT, P stage: a ``tree`` hint becomes the ordinary
+    ``{prev_rid, n}`` of the held tip the prompt extends, or None (named).
+
+    The decision uses data every stage sees (the published descriptor's agreed
+    tip spans and the prompt's own ids), so all stages resolve the same tip
+    (or all miss). A hint without the ``tree`` flag passes through unchanged."""
+    if not hint.get("tree"):
+        return hint
+    from sglang.srt.weg2 import l15_tree_cand
+
+    spans = (d0 or {}).get("spans", ())
+    got, tips = l15_tree_cand.match_tip(spans, token_ids)
+    if got is None:
+        log("HOT-HANDOVER rid=%s tree-miss tips=%d depths=%s prompt=%d (no held tree tip "
+            "is a prefix of the prompt: the store read serves)"
+            % (rid, len(tips), [d for _r, d in sorted(tips, key=lambda t: -t[1])[:6]],
+               len(token_ids)))
+        return None
+    log("HOT-HANDOVER rid=%s tree-match tip=%s depth=%d raw=%d prompt=%d tips=%d"
+        % (rid, got[0], got[1], got[2], len(token_ids), len(tips)))
+    out = dict(hint)
+    out["prev_rid"], out["n"] = got[0], int(got[1])
+    # bigram tree: units + 1 raw tokens; the adopt files them as `depth` keys
+    # and gives the extra row back (l15_p_adopt, L15-ADOPT-TAIL)
+    out["raw_extra"] = int(got[2]) - int(got[1])
+    return out
 
 
 WAKE_ENV = "SGLANG_WEG2_L15_HOT_AT_WAKE"
@@ -236,10 +277,13 @@ def admit(*, rid: str, token_ids: Sequence[int], hint: dict,
         return why
 
     n = int(hint["n"])
+    extra = int(hint.get("raw_extra", 0) or 0)     # L15-TREE-FRONT: bigram tip
     prev = str(hint["prev_rid"])
     skip = sorted({int(r) for r in cap0})
-    if len(token_ids) < n:
-        return _vote(False, "prompt %d tokens < hot prefix %d" % (len(token_ids), n))
+    if extra and not getattr(tree_cache, "is_eagle", False):
+        return _vote(False, "bigram tip (raw_extra=%d) on a non-bigram tree" % extra)
+    if len(token_ids) < n + extra:
+        return _vote(False, "prompt %d tokens < hot prefix %d" % (len(token_ids), n + extra))
     try:
         shares = {r: fetch(r) for r in range(int(n_d_ranks)) if r not in skip}
     except L15ShareError as exc:
@@ -249,11 +293,12 @@ def admit(*, rid: str, token_ids: Sequence[int], hint: dict,
     # if any is not free) -- one owner of the reservation, nothing to undo
     free_kv = [int(x) for x in kv_alloc.free_pages.tolist()]
     free_mb = [int(x) for x in mamba_alloc.free_slots.tolist()]
-    if len(free_kv) < n:
-        return _vote(False, "no %d free P rows (%d free)" % (n, len(free_kv)))
+    if len(free_kv) < n + extra:
+        return _vote(False, "no %d free P rows (%d free)" % (n + extra, len(free_kv)))
     if not free_mb:
         return _vote(False, "no free P mamba slot")
-    rows = free_kv[:n]
+    all_rows = free_kv[:n + extra]       # the extra (bigram) row carries no KV
+    rows = all_rows[:n]
     slot = free_mb[0]
     span = _span_of(shares, prev)
     try:
@@ -298,7 +343,7 @@ def admit(*, rid: str, token_ids: Sequence[int], hint: dict,
         return why
     try:
         l15_p_adopt.adopt(tree_cache, kv_alloc, mamba_alloc,
-                          token_ids=list(token_ids[:n]), rows=rows,
+                          token_ids=list(token_ids[:n + extra]), rows=all_rows,
                           anchor_row=slot)
     except l15_p_adopt.L15AdoptRefused as exc:
         # every stage checked the same free rows before the verdict; a
@@ -544,6 +589,11 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
     except L15ShareError as exc:
         verdict(False)
         return "share: %s" % exc
+    _ids = list(getattr(req, "origin_input_ids", ()) or ())
+    hint = resolve_tree_hint(hint, d0, _ids, rid, log)
+    if hint is None:
+        verdict(False)
+        return "tree: no held tip is a prefix of the prompt"
     g = stage_geometry(sched, d0)
     if isinstance(g, str):
         verdict(False)
@@ -629,6 +679,12 @@ def take_all_at_wake(sched, env, log) -> int:
         if hint is None or ids is None:
             verdict_for(rid)(False)
             log("HOT-HANDOVER rid=%s at=wake fallback=hint without token ids" % rid)
+            continue
+        hint = resolve_tree_hint(hint, d0, ids, rid, log)
+        if hint is None:
+            verdict_for(rid)(False)
+            log("HOT-HANDOVER rid=%s at=wake result=fallback take_ms=0 "
+                "fallback=tree: no held tip is a prefix of the prompt" % rid)
             continue
         mapper = HoldMapper(g.dev)
         import time as _t
