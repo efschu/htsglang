@@ -652,9 +652,10 @@ class Envs:
     # 0.60 s, z30x2-kvdemand 0.35 s; x178 (read during the flip) 0. The
     # reference exists from the wake's first RPC on -- P has drained by then
     # (the front drains before the sleep/wake pair), so #248's measured fault
-    # (a reference over P's whole phase) stays closed. Model-neutral; off
-    # until the first boot series, then default on.
-    SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(False)
+    # (a reference over P's whole phase) stays closed. Model-neutral; default ON
+    # since 03.10. (60 NF boots since 30.09., 99x '#248 WAKE-READ-EARLY issued='
+    # on D; the 27B tree ships it ON). =0 restores the release-time read.
+    SGLANG_WEG2_ENABLE_WAKE_READ_EARLY = EnvBool(True)
     # TAIL-STAGE-EARLY (30.09., NF y4k/y4l P->D, weg2/tail_adopt.stage_early):
     # the E2 tail staging of the dormant hold starts at the START of D's weight
     # legs (beside them, host-only) instead of at the first prefetch check
