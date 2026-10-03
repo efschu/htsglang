@@ -333,6 +333,65 @@ def decode_by_bs(iv: List[dict], s: float, e: float) -> List[dict]:
     return out
 
 
+def decode_rounds(iv: List[dict], s: float, e: float, solo: Optional[List[dict]] = None) -> dict:
+    """Round time of D's decode inside [s, e] (dual: while P prefills): {"ms", "n", "by_bs": [{bs, ms, n, solo_ms}],
+    "solo_ms"} from the delta of ``decode.gpu_ms_by_bs`` {bs: [rounds, ms]} of the sample intervals, each counted with
+    its share inside [s, e].  ``solo`` = intervals in which P did not work: their mean round ms per bs is the
+    reference (solo_ms per bs, and "solo_ms" = the same bs mix weighted by the rounds of [s, e])."""
+    acc: Dict[str, List[float]] = {}
+    for x in iv:
+        ov = sum(max(0.0, min(y, e) - max(a, s)) for a, y in x.get("parts") or [(x["s"], x["e"])])
+        if ov <= 0 or x["dur"] <= 0:
+            continue
+        f = min(1.0, ov / x["dur"])
+        for bs, (dn, dms) in (x.get("rnd") or {}).items():
+            a = acc.setdefault(bs, [0.0, 0.0])
+            a[0] += dn * f
+            a[1] += dms * f
+    ref: Dict[str, List[float]] = {}
+    for x in solo or ():
+        for bs, (dn, dms) in (x.get("rnd") or {}).items():
+            a = ref.setdefault(bs, [0.0, 0.0])
+            a[0] += dn
+            a[1] += dms
+    rows, tn, tms, wn, wms = [], 0.0, 0.0, 0.0, 0.0
+    for bs, (dn, dms) in sorted(acc.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+        if dn <= 0:
+            continue
+        r = ref.get(bs)
+        sm = (r[1] / r[0]) if r and r[0] >= SOLO_MIN_ROUNDS else None
+        rows.append({"bs": int(bs) if bs.isdigit() else bs, "ms": dms / dn, "n": dn, "solo_ms": sm})
+        tn += dn
+        tms += dms
+        if sm is not None:
+            wn += dn
+            wms += dn * sm
+    return {"ms": (tms / tn) if tn > 0 else None, "n": tn, "by_bs": rows,
+            "solo_ms": (wms / wn) if wn > 0 and wn >= 0.5 * tn else None}
+
+
+#: a dual D prefill chunk with at most this many NEW tokens (on average per chunk) and a cached prefix is a
+#: resume extend (#988 LOADBACK + 1-token extend: P's finished request taken over by D), not prefill work
+RESUME_NEW_TOK = 64
+#: round-time reference per bs needs this many rounds without P (else no reference is shown)
+SOLO_MIN_ROUNDS = 20
+
+
+def co_extends(chunks: List[dict], s: float, e: float) -> dict:
+    """What D's prefill chunks inside [s, e] are in a dual boot (Nutzer 03.10.: "D 1-30 tok/s ... falsch"): the
+    chunks (``n``), their cached prefix tokens (``cached``, spread over the burst like the new tokens) and new
+    tokens (``new``).  ``resume`` = every chunk carries a cached prefix and at most RESUME_NEW_TOK new tokens:
+    that is a hand-over from P (loadback + 1-token extend), whose tok/s say nothing about prefill speed."""
+    hit = [c for c in chunks if min(c["e"], e) - max(c["s"], s) > -0.05]
+    if not hit:     # a slice of the burst between two chunk windows: the burst's chunks (they spread over it)
+        hit = [c for c in chunks if any(min(y, e) > max(x, s) for x, y in c.get("parts") or ())]
+    n = int(sum(c.get("n") or 1 for c in hit))
+    resume = bool(hit) and all((c.get("cached") or 0) > 0 and (c.get("tok") or 0) <= RESUME_NEW_TOK * max(1, c.get("n") or 1)
+                               for c in hit)
+    return {"n": n, "cached": spread(chunks, s, 1, max(1e-3, e - s), "cached")[0],
+            "new": spread(chunks, s, 1, max(1e-3, e - s), "tok")[0], "resume": resume}
+
+
 def decode_reqs(ring, key: Optional[str], s: float, e: float, done: Optional[List[dict]] = None) -> Tuple[List[dict], Optional[str]]:
     """Per request in the decode stretch [s, e]: Token x-y (n neu) and its tok/s.  (rows, src).
     1. rankstats decode.reqs [[rid, prompt, out]] of the samples around [s, e] (exact; port seat 02.10.):
@@ -455,6 +514,28 @@ def _bs_of(a: dict, b: dict) -> Tuple[Optional[float], Optional[float], Optional
     return num / den, min(seen), max(seen)
 
 
+def _rounds_of(a: dict, b: dict) -> Dict[str, Tuple[float, float]]:
+    """{bs: (rounds, ms)} of the decode rounds between two records of one rank (Δ of ``decode.gpu_ms_by_bs``,
+    the counter's restart handled as in _bs_of).  {} without the counter."""
+    x, y = b.get("by_bs"), a.get("by_bs") or {}
+    out: Dict[str, Tuple[float, float]] = {}
+    if not isinstance(x, dict):
+        return out
+    for k, v in x.items():
+        try:
+            n1, ms1 = float(v[0]), float(v[1])
+            p = y.get(k) or (0, 0.0)
+            n0, ms0 = float(p[0]), float(p[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        dn, dms = n1 - n0, ms1 - ms0
+        if dn < 0 or dms < 0:
+            dn, dms = n1, ms1
+        if dn > 0 and dms > 0:
+            out[str(k)] = (dn, dms)
+    return out
+
+
 def decode_intervals(ring, keys, g: str, excl) -> List[dict]:
     """Decode work between two samples of the group's first rank, flip windows cut out.  ``steady``
     = decode also in the sample before and after (a full-speed interval, the per-stream instrument).
@@ -491,7 +572,7 @@ def decode_intervals(ring, keys, g: str, excl) -> List[dict]:
             bs = bmin = bmax = float(run)
             bsrc = "running"
         out.append({"s": parts[0][0], "e": parts[-1][1], "parts": parts, "dur": dur, "tok": dk,
-                    "gpu_ms": _d(b, a, "dgpu"),
+                    "gpu_ms": _d(b, a, "dgpu"), "rnd": _rounds_of(a, b),
                     "run": run, "bs": b.get("last_bs"), "steady": steady,
                     "bs_mean": bs, "bs_min": bmin, "bs_max": bmax, "bs_src": bsrc,
                     "stream": (dk / dur / run) if steady and run else None})

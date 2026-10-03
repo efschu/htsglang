@@ -817,6 +817,22 @@ function decodeDetailTip(x) {
   return h;
 }
 /* DEPTH-END */
+// dual, D beside P's prefill (Nutzer 03.10.: "D 1-30 tok/s ist falsch"): a D prefill chunk with a cached prefix and a
+// handful of new tokens is a RESUME EXTEND (P's request taken over from the cache, loadback + 1-token extend): say what it
+// took over, never a tok/s.  D's decode keeps its tok/s (real, the rounds are slower under P) plus the round time.
+function coDetail(x, dec) {
+  if (dec) return `${x.co_tps != null ? `<b>${fmt(x.co_tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"} &middot; ${fmt(x.co_tok)} Tok`;
+  const nq = x.co_n != null ? Math.max(1, x.co_n) : null, cached = x.co_cached != null ? fmt(Math.round(x.co_cached)) : null;
+  if (x.co_resume) return `<b>&uuml;bernimmt ${nq != null ? nq : ""} Anfrage${nq === 1 ? "" : "n"} aus dem Cache</b> <span class="muted">(${cached != null ? cached + " Tok gecacht, " : ""}${fmt(Math.round(x.co_new != null ? x.co_new : x.co_tok))} neu &middot; kein Prefill, keine tok/s)</span>`;
+  return `${x.co_tps != null ? `<b>${fmt(x.co_tps, 0)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"} &middot; ${fmt(x.co_tok)} Tok`
+    + (nq != null && cached != null ? ` <span class="muted">(${nq} Anfrage${nq === 1 ? "" : "n"}, ${cached} Tok gecacht)</span>` : "");
+}
+function coRoundTip(x) {
+  if (x.co_round_ms == null) return "";
+  const slow = x.co_solo_ms ? ` <span class="muted">(ohne P &Oslash; ${fmt(x.co_solo_ms, 0)} ms, &times;${fmt(x.co_round_ms / x.co_solo_ms, 1)})</span>` : "";
+  const rows = (x.co_round || []).filter((r) => r.n >= 1).map((r) => `bs ${esc(String(r.bs))}: ${fmt(r.ms, 0)} ms${r.solo_ms ? " (ohne P " + fmt(r.solo_ms, 0) + ")" : ""}`).join(" &middot; ");
+  return `<br>D-Runde &Oslash; <b>${fmt(x.co_round_ms, 0)}</b> ms${slow} &middot; P rechnet gleichzeitig` + (rows ? `<br><span class="muted">${rows} &middot; rankstats decode.gpu_ms_by_bs</span>` : "");
+}
 function phaseTip(x, single) {
   const when = `${hhmm(x.s)}&ndash;${x.running ? "jetzt" : hhmm(x.e)} &middot; ${dur(x.e - x.s)}`;
   if (x.k === "flip_pd" || x.k === "flip_dp") return `<b>${PHASE[x.k][0]}</b> &middot; ${dur(x.e - x.s)}<br>${when} <span class="muted">flip_begin bis flip_done (events.jsonl, Front-Uhr)</span>`;
@@ -837,8 +853,8 @@ function phaseTip(x, single) {
     const dec = x.co === "dec", sw = (k) => `<i class="ph-k-${k}" style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px"></i>`;
     return `<b>${PHASE[CO_KEY[x.co]][0]}</b> <span class="muted">(Dual: P und D laufen parallel, kein Flip)</span><br>${when}${x.running ? " &middot; l&auml;uft" : ""}`
       + `<br>${sw("P")} <b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"} &middot; ${fmt(x.tok)} Tok`
-      + `<br>${sw(dec ? "dec" : "D")} <b>${PHASE[dec ? "dec" : "D"][0]}</b> &middot; ${x.co_tps != null ? `<b>${fmt(x.co_tps, dec ? 1 : 0)}</b> tok/s <span class="muted">(${dec ? "&Delta;decode.tokens / Dauer" : "Chunks zur Rechenzeit"})</span>` : "&mdash;"} &middot; ${fmt(x.co_tok)} Tok`
-      + (dec ? decodeDetailTip({by_bs: x.co_by_bs}) : "") + depthTip(x.depth);
+      + `<br>${sw(dec ? "dec" : "D")} <b>${PHASE[dec ? "dec" : "D"][0]}</b> &middot; ${coDetail(x, dec)}`
+      + (dec ? decodeDetailTip({by_bs: x.co_by_bs}) + coRoundTip(x) : "") + depthTip(x.depth);
   }
   if (x.k === "dec") return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps, 1)}</b> tok/s <span class="muted">(&Delta;decode.tokens / Dauer)</span>` : "&mdash;"}<br>${when}${x.running ? " &middot; l&auml;uft" : ""}${decodeDetailTip(x)}`;
   return `<b>${nm}</b> &middot; ${x.tps != null ? `<b>${fmt(x.tps)}</b> tok/s <span class="muted">(Chunks zur Rechenzeit)</span>` : "&mdash;"}<br>${when} &middot; ${fmt(x.tok)} Tok${x.running ? " &middot; l&auml;uft" : ""}${depthTip(x.depth)}`;
@@ -856,7 +872,10 @@ function phaseHtml(b, pre) {
   const bars = segs.map((x, i) => {
     let full = "", short = "";
     if (x.k === "flip_pd" || x.k === "flip_dp") { full = short = fmt(x.e - x.s, 1) + " s"; }
-    else if (x.k === "P" && CO_KEY[x.co] && x.tps != null) { const d = x.co === "dec" ? 1 : 0; short = fmt(x.tps) + " / " + fmt(x.co_tps, d); full = "P " + fmt(x.tps) + " · D " + fmt(x.co_tps, d) + " tok/s"; }
+    else if (x.k === "P" && CO_KEY[x.co] && x.tps != null) {
+      if (x.co_resume) { short = fmt(x.tps) + " / Üb. " + (x.co_n != null ? Math.max(1, x.co_n) : ""); full = "P " + fmt(x.tps) + " tok/s · D übernimmt " + (x.co_n != null ? Math.max(1, x.co_n) : "") + " aus dem Cache"; }
+      else { const d = x.co === "dec" ? 1 : 0; short = fmt(x.tps) + " / " + fmt(x.co_tps, d); full = "P " + fmt(x.tps) + " · D " + fmt(x.co_tps, d) + " tok/s"; }
+    }
     else if ((x.k === "P" || x.k === "D" || x.k === "dec") && x.tps != null) { const d = x.k === "dec" ? 1 : 0; short = fmt(x.tps, d); full = short + " tok/s"; }
     const ic = x.k === "idle" && x.awake ? `--ic:${x.awake === "P" ? "var(--s1)" : "var(--s2)"};` : "";
     return `<div class="seg ph-k-${x.k}${x.k === "P" && CO_KEY[x.co] ? " co-" + x.co : ""}${x.running ? " run" : ""}" data-i="${i}" style="${ic}left:${pos(x.s)}%;width:${(100 * (x.e - x.s) / span).toFixed(3)}%"><span data-full="${esc(full)}" data-short="${esc(short)}"></span></div>`;

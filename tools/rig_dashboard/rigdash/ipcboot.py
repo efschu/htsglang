@@ -507,7 +507,8 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
     never idle and never flip; before the boot's start nothing is drawn."""
     end = now if live else (m.ring[-1]["t"] if m.ring else now)
     lo = max(now - SPAN_S, boot_t0 or (now - SPAN_S))
-    segs = [dict(x) for x in m.segments(end) if x["e"] > lo]
+    allsegs = m.segments(end)
+    segs = [dict(x) for x in allsegs if x["e"] > lo]
     src = {"P": m.pchunks.get("P", []) + m.pchunks.get("single", []), "D": m.pchunks.get("D", []), "dec": m.dec}
     out, prev = [], lo
     for x in segs:
@@ -524,6 +525,15 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
             ctok = activity.spread(src[x["co"]], x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
             x["co_tok"] = ctok
             x["co_tps"] = ctok / max(1e-3, x["e"] - x["s"])
+            if x["co"] == "D":
+                # Nutzer 03.10. ("D 1-30 tok/s ist falsch"): D's chunks beside P's prefill are mostly resume extends
+                # (loadback + 1-token extend = P's request taken over from the cache); their tok/s is no prefill
+                # speed.  Say what they are: requests, cached prefix, new tokens -- and no rate for a hand-over.
+                ext = activity.co_extends(src["D"], x["s"], x["e"])
+                x["co_n"], x["co_cached"], x["co_new"] = ext["n"], ext["cached"], ext["new"]
+                if ext["resume"]:
+                    x["co_resume"] = True
+                    x["co_tps"] = None
         if x["k"] == "idle":
             x["awake"] = m.awake_at(x["s"], awake_now)
         if x["k"] in VIS_NAME:
@@ -536,6 +546,18 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
         out[-1]["running"] = True
     if detail:
         _attach_detail(m, out, done)
+    if any(x.get("co") == "dec" for x in out):
+        # dual only: the D round time while P prefills vs. the rounds in the stretches in which P did not work
+        # (Nutzer 03.10.: D's 13-60 tok/s under P are real -- the round is 3-4x slower; show the round time)
+        pw = [(a["s"], a["e"]) for a in allsegs if a["k"] == "P"]
+        solo = [d for d in m.dec if not any(min(d["e"], pe) - max(d["s"], ps) > 1e-3 for ps, pe in pw)]
+        for x in out:
+            if x.get("co") == "dec":
+                rd = activity.decode_rounds(m.dec, x["s"], x["e"], solo)
+                if rd["ms"] is not None:
+                    x["co_round_ms"], x["co_solo_ms"] = round(rd["ms"], 1), (None if rd["solo_ms"] is None else round(rd["solo_ms"], 1))
+                    x["co_round"] = [{k: (round(v, 1) if isinstance(v, float) else v) for k, v in r.items()}
+                                     for r in rd["by_bs"]]
     if live:
         for x in out[-2:]:
             if x["k"] == "unknown" and x["e"] >= end - 1.5 and (x.get("why") or "").startswith("Rang-Zähler"):
