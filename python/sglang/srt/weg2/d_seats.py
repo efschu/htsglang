@@ -267,6 +267,12 @@ class AdmissionGate:
     #: F3: the wake whose members pass the barrier while ``deferred`` holds
     #: (their seats are the wake's ``handoff_n``, counted at the wake)
     cohort_wake: Optional[int] = None
+    #: Q-692 (dual D): parked rids that wait in D-HANDBACK-DEFER / WEG2
+    #: X-DEFER -- for a store read, not for a seat; they hold no newcomer back
+    defer_exempt: FrozenSet[str] = frozenset()
+    #: Q-692: every parked request still waiting is ``defer_exempt`` (and none
+    #: waits outside the queue) -- the barrier stands for nobody
+    newcomers_free: bool = False
 
     def skip(self, req, admitted=None, skip_extend: bool = False) -> Optional[str]:
         """Census key when ``req`` is skipped this pass, else None.
@@ -280,7 +286,7 @@ class AdmissionGate:
             if str(req.rid) in self.blocked:
                 return "weg2_d_park_older_live"
             return "weg2_d_park_decode_first" if str(req.rid) in self.deferred else None
-        if not self.barrier or skip_extend:
+        if not self.barrier or skip_extend or self.newcomers_free:
             return None
         if self.deferred and self.cohort_wake is not None and in_wake_cohort(req, self.cohort_wake):
             # F3: a member of THIS wake goes ahead of the deferred resume; the
@@ -481,6 +487,7 @@ def admission_gate(
         if resume_book is not None:
             resume_book.forget(())
         return AdmissionGate()
+    exempt = _dual_defer_exempt(parked_waiting)
     live = list(running) + parked_waiting + parked_outside
     blocked = set()
     for r in parked_waiting:
@@ -508,14 +515,45 @@ def admission_gate(
         f"parked_outside={len(parked_outside)} blocked={len(blocked)}"
         + (f" decode_first={len(deferred)}" if deferred else "") + ")"
     )
-    _waiting_parked = [r for r in parked_waiting if str(r.rid) not in blocked] or parked_waiting
+    # Q-692: a parked request waiting for a store read (exempt) holds no seat
+    # against newcomers -- neither the barrier nor the SA age nor AP count it
+    holders = [r for r in parked_waiting if str(r.rid) not in exempt]
+    if exempt:
+        note = note[:-1] + f" defer_exempt={len(exempt)})"
+    _waiting_parked = [r for r in holders if str(r.rid) not in blocked] or holders
     oldest = min((_arrival(r) for r in _waiting_parked + parked_outside), default=None)
     return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
                          oldest_parked_age=oldest,
-                         parked_in_queue=frozenset(str(r.rid) for r in parked_waiting),
+                         parked_in_queue=frozenset(str(r.rid) for r in holders),
                          parked_outside=len(parked_outside),
                          deferred=deferred,
-                         cohort_wake=decode_first.wake_seq if deferred else None)
+                         cohort_wake=decode_first.wake_seq if deferred else None,
+                         defer_exempt=exempt,
+                         newcomers_free=bool(exempt) and not holders and not parked_outside)
+
+
+def _dual_defer_exempt(parked_waiting: Sequence) -> FrozenSet[str]:
+    """Q-692 (27B NVFP4 dual fs10031727 17:59:40-18:01:06): weg2-0-373, pressure
+    parked by SEAT-AGE DISPLACE, sat 94 s in D-HANDBACK-DEFER / X-DEFER, and
+    every younger arrival got ``weg2_d_park_first`` behind it -- ADMISSION-WEDGE
+    4-6 queued, 0 running. A parked request waiting for a STORE READ is not
+    coming back to a seat this pass. Dual D only (``dual_handback_defer.armed``);
+    the terms are group verdicts (W31 mark, MIN-reduced X-defer arm)."""
+    from sglang.srt.weg2 import dual_handback_defer as _hbd
+
+    if not parked_waiting or not _hbd.armed():
+        return frozenset()
+    out = frozenset(str(r.rid) for r in parked_waiting if _hbd.defer_exempt(r))
+    for r in parked_waiting:
+        if str(r.rid) in out and not getattr(r, "_weg2_q692_exempt_said", False):
+            try:
+                r._weg2_q692_exempt_said = True
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info("WEG2-D-PARK DEFER-EXEMPT rid=%s site=%s -- parked, but waiting for a store "
+                        "read (D-HANDBACK-DEFER / X-DEFER): it holds no younger newcomer back",
+                        str(r.rid)[:16], park_site(r))
+    return out
 
 
 AP_ENV = "SGLANG_WEG2_D_PARK_BARRIER_ADMITTED"

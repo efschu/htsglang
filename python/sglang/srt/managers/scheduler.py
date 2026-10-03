@@ -14201,6 +14201,10 @@ class Scheduler(
         an absence of defers reads as an absence of pending reads rather than
         as a silenced emitter.
         """
+        # Q-692: the defer verdict of the LAST pass is what the next pass's
+        # D-park barrier reads (a deferred park holds no newcomer back); dual
+        # D only, the verdict is the group's.
+        _weg2_hbd.note_x_defer(req, False)
         pending_ms = tp_head_congruence.group_store_read_pending_ms(
             head_inputs, str(getattr(req, "rid", "") or "")
         )
@@ -14255,6 +14259,7 @@ class Scheduler(
                     str(getattr(req, "rid", "?"))[:16], _defer_reason,
                     pending_ms / 1000.0, bound_s, n,
                 )
+            _weg2_hbd.note_x_defer(req, True)
             return True
         logger.info(
             "WEG2 X-DEFER rid=%s reason=%s age_s=%.2f bound_s=%.2f "
@@ -14358,6 +14363,23 @@ class Scheduler(
                     "WEG2 X-GATE FORK-TAIL rid=%s uncached=%d tail=%d X=%d verdict=admit "
                     "(the generation prompt after P's fork cut is D's own extend)",
                     str(getattr(req, "rid", "?"))[:16], uncached, _fork_tail, x,
+                )
+        # Q-692 D-OWN-TAIL (27B NVFP4 dual fs10031727 17:59:29-18:01:06,
+        # weg2-0-373): a request D decoded itself and then parked (SEAT-AGE
+        # DISPLACE -> pressure park) resumes from P's GDN anchor, so its tail
+        # -- the tokens D generated plus the decode input -- is D's OWN extend.
+        # P never writes it; pricing it against X=1 deferred it (D-HANDBACK-
+        # DEFER, 94.7 s) and then RESUME-VIA-P'd it for ever. Dual D only;
+        # both terms replicated (group-priced extent; output_ids are the same
+        # tokens on every rank), so the verdict stays the group's.
+        if verdict == "W31":
+            _own_tail = _weg2_hbd.d_own_tail(req)
+            if 0 < uncached <= _own_tail:
+                verdict = "admit"
+                logger.info(
+                    "WEG2 X-GATE D-OWN-TAIL rid=%s uncached=%d out=%d X=%d verdict=admit "
+                    "(D decoded this tail itself before its park; P never writes it)",
+                    str(getattr(req, "rid", "?"))[:16], uncached, _own_tail - 1, x,
                 )
         logger.info(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",

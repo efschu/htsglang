@@ -15664,6 +15664,15 @@ class Front:
         p.dual_pause = False
         p.leg1_done = False
         p.dual_requeued = True  # _on_leg1_done must not hand it to D (dual23)
+        if getattr(self, "dual_layout", False) and getattr(p, "intake_stalled", False):
+            # Q-692 (27B NVFP4 dual fs10031727, weg2-0-321): an earlier
+            # P-INTAKE-STALL left intake_stalled set; this pause's _on_leg1_done
+            # then returned on it BEFORE consuming dual_requeued, and the NEXT
+            # successful leg 1 consumed the flag instead -> never handed to D.
+            # The pause's requeue is the request's state now.
+            p.intake_stalled = False
+            logger.info("WEG2 DUAL P-PAUSED rid=%s clears an earlier INTAKE-STALL (Q-692): the "
+                        "next successful leg 1 goes to D", p.rid)
         p.dual_paused_n = int(getattr(p, "dual_paused_n", 0) or 0) + 1
         self.queue.appendleft(p)
         self.counters["dual_p_paused_requeued"] += 1

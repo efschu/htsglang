@@ -73,11 +73,95 @@ def _line(st: dict, req, state: str, now, extra: str = "") -> None:
                    str(getattr(req, "rid", "?"))[:16], state, extra)
 
 
+def _park_site(req):
+    from sglang.srt.weg2 import d_seats  # lazy: d_seats reads this module back
+
+    return d_seats.park_site(req)
+
+
+def d_own_tail(req, env=None) -> int:
+    """Q-692 D-OWN-TAIL: the extent at the end of ``req`` that D owns, or 0.
+
+    Metal 27B NVFP4 dual fs10031727 (bc2bd121c0), weg2-0-373: D decoded 25
+    tokens, SEAT-AGE DISPLACE parked it (pressure park, span retained), and
+    the retain kept the KV of the decoded tokens but no GDN/Mamba state at the
+    span's end -- the resume depth is P's anchor 94918, ``uncached=26`` against
+    the dual layout's X=1. That tail is the ``output_ids`` D generated plus the
+    decode input: D's own extend. P never writes it (P's leg 1 ends at the
+    prompt), so neither the X gate's W31 nor a hand-back defer can ever be
+    answered by P.
+
+    ``len(output_ids) + 1`` when ``req`` carries output D decoded (dual D
+    only), else 0. Replicated: every rank decoded the same tokens."""
+    if not armed(env):
+        return 0
+    out = len(getattr(req, "output_ids", None) or ())
+    return out + 1 if out > 0 else 0
+
+
+def d_owned(req, env=None) -> bool:
+    """Q-692: ``req`` carries output D decoded or a PRESSURE park site (D
+    retracted/displaced it while it ran) -- its end is D's, not a P hand-back
+    (dual D only). A FLIP site without output is #248h's capacity park of a
+    fresh hand-back, whose tail IS P's: that one keeps the defer. Replicated
+    terms (the tokens; the park is a group verdict)."""
+    if not armed(env):
+        return False
+    if len(getattr(req, "output_ids", None) or ()) > 0:
+        return True
+    from sglang.srt.weg2 import d_seats
+
+    return _park_site(req) == d_seats.SITE_PRESSURE
+
+
+X_DEFER_ATTR = "_weg2_x_deferring"
+
+
+def note_x_defer(req, deferring: bool, env=None) -> None:
+    """Q-692: the X-completion arm's group verdict for ``req`` on this pass
+    (True = WEG2 X-DEFER), read by the NEXT pass's D-park barrier. Dual D only."""
+    if not armed(env):
+        return
+    try:
+        setattr(req, X_DEFER_ATTR, bool(deferring))
+    except Exception:  # noqa: BLE001 -- a request without the slot has no barrier vote
+        pass
+
+
+def defer_exempt(req, env=None) -> bool:
+    """Q-692 PARK BARRIER: a parked request that is held in D-HANDBACK-DEFER
+    (an open mark) or in WEG2 X-DEFER waits for a store read, not for a seat --
+    it must hold no younger newcomer back (metal: ADMISSION-WEDGE 4-6 queued,
+    0 running, 83 s behind weg2-0-373). Both terms are group verdicts (W31 /
+    the MIN-reduced pending arm), so the barrier stays the group's."""
+    if not armed(env):
+        return False
+    st = getattr(req, MARK_ATTR, None)
+    if st is not None and not st.get("spent") and not st.get("done"):
+        return True
+    return bool(getattr(req, X_DEFER_ATTR, False))
+
+
 def begin(req, tail: int, *, now=time.monotonic, env=None) -> bool:
     """The X gate priced ``req`` W31. True = defer it this pass (first time: the
     mark is set); False = refuse as before (not dual D, or the mark is spent --
-    the bound expired or the group priced it short after the read)."""
+    the bound expired or the group priced it short after the read).
+
+    Q-692: never for a request whose end is D's own (``d_owned``: output D
+    decoded, or a D park site) -- P never writes that tail, so the defer
+    could only run into its bound (94.7 s for weg2-0-373)."""
     if not armed(env):
+        return False
+    if d_owned(req, env):
+        if not getattr(req, "_weg2_hb_d_own_said", False):
+            try:
+                req._weg2_hb_d_own_said = True
+            except Exception:  # noqa: BLE001
+                pass
+            logger.warning("%s tail=%d rid=%s state=d_own out=%d site=%s -- D's own end (decoded "
+                           "before a park), not a P hand-back: no defer", LINE, int(tail),
+                           str(getattr(req, "rid", "?"))[:16],
+                           len(getattr(req, "output_ids", None) or ()), _park_site(req))
         return False
     st = getattr(req, MARK_ATTR, None)
     if st is not None:
@@ -100,7 +184,9 @@ def pending(req, bound_s: float, *, now=time.monotonic) -> bool:
     """This rank's vote: the mark stands, no read has been issued for it yet, and
     this rank's own wait is inside the length-priced bound."""
     st = getattr(req, MARK_ATTR, None)
-    if st is None or st.get("spent") or st.get("issued"):
+    if st is None or st.get("spent") or st.get("issued") or st.get("done"):
+        # Q-692: an admitted mark's episode is over -- a later park of the
+        # same request (D decoded, displaced) is no hand-back wait
         return False
     if bound_s <= 0 or float(now()) - float(st["t0"]) > float(bound_s):
         return False
@@ -122,7 +208,8 @@ def retry(sched, *, now=time.monotonic) -> int:
     if not armed():
         return 0
     marked = [r for r in (getattr(sched, "waiting_queue", None) or ())
-              if (lambda st: st is not None and not st.get("spent") and not st.get("issued"))(
+              if (lambda st: st is not None and not st.get("spent") and not st.get("issued")
+                  and not st.get("done"))(
                   getattr(r, MARK_ATTR, None))]
     if not marked:
         return 0
