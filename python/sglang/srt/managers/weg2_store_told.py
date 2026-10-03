@@ -1671,30 +1671,55 @@ def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admiss
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
     if satisfied:
         satisfied.pop(rid, None)
+    # (c) the wait is bounded PER RID across visits: a verdict kept over many
+    # passes (H91) re-asks this gate every pass, and a read that never comes
+    # must not stall the scheduler WAIT_CAP_S per pass -- WAIT_CAP_S is the
+    # whole stall budget this rid may cost, spent across all its re-reads.
+    spent_map = getattr(scheduler, "_w27u_wait_spent_s", None)
+    if spent_map is None:
+        spent_map = scheduler._w27u_wait_spent_s = {}
+    budget = WAIT_CAP_S - float(spent_map.get(rid, 0.0))
+    if budget <= 0:
+        logger.error(
+            "W27-UNIFORM FOLLOWER RE-READ BUDGET SPENT rank pp=%s rid=%s told=%d live=%d "
+            "site=%s (n=%d): %.0f ms already waited for this rid (cap %.0f ms) -- no further "
+            "wait, the #1233 W27 guard will name the split at the forward",
+            scheduler.ps.pp_rank, _rt(rid), int(told), int(live), site, n,
+            float(spent_map.get(rid, 0.0)) * 1e3, WAIT_CAP_S * 1e3,
+        )
+        return own
+    t0 = time.monotonic()
+    capped = False
     verdict = _follower_register(scheduler, req, int(told), early=False)
     if str(verdict).startswith("issued"):
-        deadline = time.monotonic() + WAIT_CAP_S
+        deadline = t0 + budget
         while not tree.check_prefetch_progress(rid):
             if time.monotonic() > deadline:
+                capped = True
                 break  # named below: the tree is still short
             time.sleep(0.002)
+    wait_s = time.monotonic() - t0
+    spent_map[rid] = float(spent_map.get(rid, 0.0)) + wait_s
     if satisfied:
         satisfied.pop(rid, None)
     after = _tf.rank_resumable(scheduler, req, int(told))
     if after is not None and int(after) < int(told):
         logger.error(
             "W27-UNIFORM FOLLOWER STILL SHORT rank pp=%s rid=%s told=%d live=%d verdict=%s "
-            "(n=%d): the re-read did not bring this rank's tree to PP0's told -- the "
-            "#1233 W27 guard will name the split at the forward",
-            scheduler.ps.pp_rank, _rt(rid), int(told), int(after), verdict, n,
+            "wait=%.0f ms%s (n=%d): the re-read did not bring this rank's tree to PP0's told "
+            "-- the #1233 W27 guard will name the split at the forward",
+            scheduler.ps.pp_rank, _rt(rid), int(told), int(after), verdict, wait_s * 1e3,
+            " CAPPED(%.0f ms)" % (WAIT_CAP_S * 1e3) if capped else "", n,
         )
         return own
+    spent_map.pop(rid, None)
     n2 = getattr(scheduler, "_w27u_reread_n", 0) + 1
     scheduler._w27u_reread_n = n2
     logger.warning(
-        "W27-UNIFORM FOLLOWER RE-READ rank pp=%s rid=%s told=%d live=%s verdict=%s (n=%d): "
-        "this rank's tree reaches PP0's told again -- admitted at told like PP0",
-        scheduler.ps.pp_rank, _rt(rid), int(told), after, verdict, n2,
+        "W27-UNIFORM FOLLOWER RE-READ rank pp=%s rid=%s told=%d live=%s verdict=%s "
+        "wait=%.0f ms site=%s (n=%d): this rank's tree reaches PP0's told again -- admitted "
+        "at told like PP0",
+        scheduler.ps.pp_rank, _rt(rid), int(told), after, verdict, wait_s * 1e3, site, n2,
     )
     return int(told)
 

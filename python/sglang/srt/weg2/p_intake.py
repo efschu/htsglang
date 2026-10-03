@@ -66,6 +66,9 @@ class _Kept:
     req: Any
     told: int
     credit: int
+    #: W27-UNIFORM: the told was an ABSOLUTE twin told on this follower, whose
+    #: live tree must reach it at the later admission as well
+    reach: bool = False
 
 
 def _kept(scheduler) -> Dict[str, _Kept]:
@@ -102,6 +105,8 @@ def told_admission(
                 )
             except Exception:  # noqa: BLE001 - a double without the field
                 pass
+            if entry.reach:
+                _reach_kept(scheduler, req, entry)
             n = getattr(scheduler, "_h91_told_kept_n", 0) + 1
             scheduler._h91_told_kept_n = n
             if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
@@ -117,10 +122,49 @@ def told_admission(
         # it (re-intake): the old verdict is not this visit's
         kept.pop(rid, None)
     told = told_map.get(rid)
+    # W27-UNIFORM: admission consumes the twin-follower mark; ask before it
+    reach = _is_follower_twin(scheduler, rid)
     credit = admission(scheduler, req, note_skip)
     if credit is not None and told is not None:
-        kept[rid] = _Kept(req=req, told=int(told), credit=int(credit))
+        kept[rid] = _Kept(req=req, told=int(told), credit=int(credit), reach=reach)
     return credit
+
+
+def _is_follower_twin(scheduler, rid: str) -> bool:
+    try:
+        from sglang.srt.managers import weg2_store_told as _st
+        from sglang.srt.weg2 import p_twin_defer as _twin
+
+        if _st.is_pp0(scheduler):
+            return False
+        st = getattr(scheduler, _twin._ATTR, None)
+        return bool(st) and str(rid) in (getattr(st, "twin_follower", None) or {})
+    except Exception:  # noqa: BLE001 - a double without the form: no check
+        return False
+
+
+def _reach_kept(scheduler, req, entry: "_Kept") -> None:
+    """W27-UNIFORM (open point (a) of item 025): the verdict kept across visits
+    was checked against the follower's live tree when it was made; between that
+    visit and the one that finally seats the request the tree can move (the
+    sibling's read released, eviction), and only the TOLD-PIN held the anchor.
+    The same ``follower_reach_told`` check runs at the later admission: a tree
+    that fell short is re-read to told (wait bounded per rid, WAIT_CAP_S), PP0's
+    prefix stands, nothing is refused here."""
+    try:
+        from sglang.srt.managers import weg2_store_told as _st
+
+        before = getattr(scheduler, "_w27u_reread_n", 0)
+        _st.follower_reach_told(scheduler, req, int(entry.told), int(entry.told), site="kept")
+        if getattr(scheduler, "_w27u_reread_n", 0) != before:
+            # the re-read registered a fresh credit (and kept pin) of its own
+            tree = getattr(scheduler, "tree_cache", None)
+            fresh = int(_st._pop_credit_keep_pin(tree, str(getattr(req, "rid", ""))) or 0)
+            if fresh > 0:
+                entry.credit = fresh
+    except Exception:  # noqa: BLE001 - a probe never breaks the admission
+        logger.warning("W27-UNIFORM kept-verdict reach check skipped for rid=%s",
+                       str(getattr(req, "rid", ""))[:8], exc_info=True)
 
 
 def told_pending(scheduler, req) -> bool:
@@ -164,8 +208,11 @@ def settle_told(scheduler, waiting_queue: Iterable[Any]) -> int:
     gone = [rid for rid, e in kept.items() if id(e.req) not in queued]
     tree = getattr(scheduler, "tree_cache", None)
     unpin = getattr(tree, "_unpin_prefetched_span", None)
+    spent = getattr(scheduler, "_w27u_wait_spent_s", None)
     for rid in gone:
         kept.pop(rid, None)
+        if spent:
+            spent.pop(rid, None)
         if callable(unpin):
             # TOLD-PIN: the admission kept the #1417 pin (anchor included)
             # while the verdict stood; the request left the queue, the pin goes

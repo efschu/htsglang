@@ -518,7 +518,13 @@ def _resumable_own(scheduler, req, rid: str, own: int) -> int:
     try:
         from sglang.srt.managers import weg2_told_fidelity as _tf
 
-        res = _tf.pp0_admissible(scheduler, req, int(own))
+        # W27-UNIFORM (open point (b) of item 025): the rank's OWN admission
+        # reach -- capped match plus the #988 load-back's state-aligned extent
+        # -- not PP0's plain TF probe: host KV whose end carries no recurrent
+        # state loads back only to the anchor below it, and the ack must say so
+        # (PP0 then answers told=0 for every rank) instead of acking a depth
+        # this rank's admission stops short of (START-SPLIT, PPWidthDivergence).
+        res = _tf.rank_resumable(scheduler, req, int(own))
     except Exception:  # noqa: BLE001 - a probe never breaks the ack
         return own
     if res is None or int(res) >= own:
