@@ -20,6 +20,7 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-691  _dual_resume_held unstarve / bypass count
   Q-692  dual_handback_defer.* / d_seats.admission_gate exemption / front pause requeue
   Q-693  follower untold waiting abort / PF ACK-ROOM HOLD / PP0 intake stamp / RESUME-OWN-HELD
+  Q-695  #791T probe old-instance chunk / old chunk abort store release / #791C new-instance named
 """
 from __future__ import annotations
 
@@ -586,3 +587,84 @@ class TestQ693FlipUnchanged:
         assert held is True
         assert f.counters.get("dual_resume_own_held", 0) == 0
         assert getattr(f, "_q693_own_held_rid", None) is None
+
+
+# ---------------------------------------------------------------------------------- Q-695
+
+def _q695_pp1(told=None, old_end=5120):
+    """y8z PP1 at 19:26:05.98: instance 2 chunked at old_end, abort recorded; instance 3 queued."""
+    rid = "weg2-0-235"
+    old = SimpleNamespace(rid=rid, req_pool_idx=None, is_retracted=False,
+                          extend_range=SimpleNamespace(start=old_end - 1024, end=old_end))
+    new = SimpleNamespace(rid=rid, req_pool_idx=None, is_retracted=False)
+    s = SimpleNamespace(pp_group=object(), ps=SimpleNamespace(pp_rank=1, pp_size=3, tp_size=1),
+                        waiting_queue=[new], chunked_req=old, _pending_chunked_abort_req=old,
+                        running_batch=None, _pp_row_chain_owed=False, _pp_flip_epoch=lambda: -1,
+                        _weg2_store_told_armed=True,
+                        _weg2_store_told={} if told is None else {rid: told})
+    return s, old, new
+
+
+class TestQ695FlipUnchanged:
+    """Q-695 OLD-INSTANCE CHUNK / ABORT KEEPS THE NEW READ / NEW-INSTANCE NAMED: on every wrong
+    gate (P KV size set) the #791T probe, the old chunk's store release and the #791C keep
+    answer exactly as on ceff4aae7b."""
+
+    def test_791t_probe_defers_and_stops_as_before(self, monkeypatch, caplog):
+        from sglang.srt.managers import scheduler_pp_mixin as ppm
+        from sglang.srt.managers.pp_row_defer_cap import ROW_DEFER_LAP_CAP, PpRowDeferCapExceeded
+
+        row = ("weg2-0-235", 5120, 1024, True, False, None, None, False, 13449, (), None)
+        frame = {"__stamp__": (1, 1560, 1024, -1, 1560, ("weg2-0-235", 5120, 6144)),
+                 ppm._ADMISSION_DECISION_PAYLOAD_KEY: (0, (row,))}
+        for env in _q693_wrong_gates():
+            q = [frame]
+            monkeypatch.setattr(ppm, "resolve_src", lambda group, x: 0)
+            monkeypatch.setattr(ppm, "typed_inbox", lambda group, q=q: {(0, "proxy"): q})
+            with mock.patch.dict(os.environ, env):
+                s, old, new = _q695_pp1()
+                with pytest.raises(PpRowDeferCapExceeded, match="#791T STORE-TOLD HOP OVERDUE"):
+                    for _ in range(ROW_DEFER_LAP_CAP + 2):
+                        assert ppm.SchedulerPPMixin._pp_proxy_frame_pending(s, 1) is False
+                assert not hasattr(s, "_q695_continued_n"), env
+                assert len(q) == 1, env
+        assert "Q-695" not in caplog.text
+
+    def _abort(self, monkeypatch, env, schedules, told=None):
+        from sglang.srt.managers import scheduler as SC
+        from sglang.srt.weg2 import p_row_authority
+
+        monkeypatch.setattr(SC, "prepare_abort", lambda req, why: setattr(req, "aborted_why", why))
+        monkeypatch.setattr(SC, "release_kv_cache", lambda *a, **k: None)
+        monkeypatch.setattr(p_row_authority, "applies", lambda s: True)
+        s, old, new = _q695_pp1(told=told, old_end=6144)
+        old.kv_committed_freed, old.to_finish, old.finished = True, None, (lambda: False)
+        old.time_stats = SimpleNamespace(trace_ctx=SimpleNamespace(abort=lambda **k: None))
+        released, cur, kept = [], {"s": None}, []
+        s._pending_chunked_abort_delay = 0
+        s._pp_scheduled_extents = lambda: cur["s"]
+        s.disaggregation_mode = None
+        s.enable_hicache_storage = True
+        s.tree_cache = SimpleNamespace(supports_mamba=lambda: False,
+                                       release_aborted_request=released.append)
+        s.ipc_channels = SimpleNamespace(send_to_tokenizer=SimpleNamespace(send_output=lambda o, r: None))
+        with mock.patch.dict(os.environ, env):
+            for sch in schedules:
+                cur["s"] = sch
+                SC.Scheduler.process_pending_chunked_abort(s)
+                kept.append(s.chunked_req is old)
+        return s, kept, released
+
+    def test_old_chunk_abort_releases_the_rid_as_before(self, monkeypatch):
+        for env in _q693_wrong_gates():
+            s, kept, released = self._abort(monkeypatch, env,
+                                            [{"weg2-0-235": (5120, 1024)}, {"weg2-0-236": (0, 512)}])
+            assert kept == [True, False], env
+            assert released == ["weg2-0-235"], env
+            assert not hasattr(s, "_q695_keep_read_n"), env
+
+    def test_a_schedule_naming_the_rid_keeps_the_old_chunk_as_before(self, monkeypatch):
+        for env in _q693_wrong_gates():
+            s, kept, released = self._abort(monkeypatch, env, [{"weg2-0-235": (0, 1024)}], told=0)
+            assert kept == [True], env
+            assert not hasattr(s, "_q695_new_named_n"), env

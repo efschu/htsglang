@@ -10336,6 +10336,14 @@ class Scheduler(
             )
         except Exception:  # noqa: BLE001 - the verdict never blocks the old rule
             _row_791c = None
+        from sglang.srt.weg2 import dual_old_instance as _q695
+
+        if _row_791c is False:
+            # Q-695 (dual P only): the schedule names the rid, but at a start the
+            # old chunk does not continue while its newer instance (told here)
+            # waits -- PP0 admits the NEW instance; release the old chunk now.
+            if _q695.schedule_names_new_instance(self, req, self._pp_scheduled_extents()):
+                _row_791c = True
         if _row_791c is False:
             return  # #791C: PP0's schedule still names this chunk (or no frame yet)
         if _row_791c is None:
@@ -10361,7 +10369,9 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage and not _q695.newer_instance_queued(self, req):
+            # Q-695: a newer instance of the rid waiting here owns every
+            # rid-keyed store record (dual P followers only skip it).
             self.tree_cache.release_aborted_request(req.rid)
         if (
             req.req_pool_idx is not None or self.tree_cache.supports_mamba()

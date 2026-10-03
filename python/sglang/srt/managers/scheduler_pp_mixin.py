@@ -9675,6 +9675,8 @@ class SchedulerPPMixin:
                         _queued = {
                             getattr(r, "rid", None): r for r in self.waiting_queue
                         }
+                        from sglang.srt.weg2 import dual_old_instance as _q695
+
                         _told_missing = [
                             e.rid
                             for e in _peek.entries
@@ -9683,6 +9685,17 @@ class SchedulerPPMixin:
                             and e.rid not in _missing
                             and e.rid in _queued
                             and _p_intake_791t.told_pending(self, _queued[e.rid])
+                            # Q-695 (dual P only): the entry continues this
+                            # rank's own chunked OLDER instance of the rid
+                            # (abort recorded, #791C keeps it while PP0 names
+                            # it) -- the queued newer instance's told is not
+                            # what this frame waits for.
+                            and not _q695.old_chunk_continued(
+                                self,
+                                e.rid,
+                                e.prefix_len,
+                                pp_chunked_req_for_slot(self, mb_id),
+                            )
                         ]
                     except Exception:  # noqa: BLE001 - peek is advisory only
                         _told_missing = []
@@ -9726,6 +9739,10 @@ class SchedulerPPMixin:
                     _verdict = _cap.observe(mb_id, _missing, token=stamp)
                     if not _verdict.defer and _told_missing:
                         _trace("defer_told_cap")
+                        # Q-695 (dual P only): name the full rids and every
+                        # instance this rank holds under them before the stop
+                        # (the text below cuts rids to 8 characters).
+                        _q695.log_told_overdue(self, _told_missing, _peek, mb_id)
                         raise PpRowDeferCapExceeded(
                             "#791T STORE-TOLD HOP OVERDUE: the frame's row admits "
                             f"rid(s) {','.join(str(r)[:8] for r in _told_missing[:4])} "
