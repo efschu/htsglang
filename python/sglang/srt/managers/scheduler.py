@@ -20763,6 +20763,8 @@ class Scheduler(
                             getattr(getattr(self, "ps", None), "tp_rank", 0) or 0
                         )
                         _l15_tt["bind0"] = time.perf_counter()
+                        # 540: agree PRE + TREE-CAND (gathers, probe) before the bind
+                        _l15_tt["pre"] = _l15_tt["bind0"] - _l15_tt["t0"]
                         _l15_kwargs = l15_bind.build_retain_kwargs(
                             _reqs,
                             getattr(self.req_to_token_pool, "req_to_token", None),
@@ -20877,7 +20879,10 @@ class Scheduler(
                 # L15-CHECK-SNAP (N6e bad=1 foreign at gen=1): a capped rank
                 # copies the wake check's sample (device + L2) at the sleep,
                 # so the wake can tell who changed a bad row. Diagnostics only.
+                # 540: off by default (it built the whole wake plan here, in
+                # the flip, on the capped critical ranks: 96-770 ms in y8r).
                 if _l15_res is not None:
+                    _l15_tt["snap0"] = time.perf_counter()
                     try:
                         from sglang.srt.weg2 import l15_check_snap as _l15_cs
                         if _l15_cs.enabled() and l15_shadow.own_cap_rows(self, os.environ) > 0:
@@ -20891,14 +20896,19 @@ class Scheduler(
                                 l15_bind.live_host_pools(self.tree_cache)[0])
                     except Exception as exc:  # noqa: BLE001 -- diagnostics only
                         logger.info("L15-CHECK-SNAP skipped (%s: %s)", type(exc).__name__, exc)
+                    _l15_tt["snap"] = time.perf_counter() - _l15_tt["snap0"]
                     # L15-PLAN-CACHE: the wake's refill/sample plan, built
-                    # during P's phase instead of on the resume RPC
+                    # during P's phase instead of on the resume RPC.
+                    # 540 PLAN-WARM-DEFER: the thread waits until this D is
+                    # dormant, so its Python walk never takes the GIL from
+                    # the rest of the sleep leg (the flip's critical path).
                     try:
                         from sglang.srt.weg2 import l15_restore as _l15_rs4
                         from sglang.srt.weg2 import l15_sleep_agree as _l15_sa4
                         _l15_rk4, _l15_pf4 = _l15_sa4.rank_prefix(self)
                         _l15_rs4.warm_plan_async(getattr(_l15_res, "manifest", None),
-                                                 _l15_rk4, _l15_pf4)
+                                                 _l15_rk4, _l15_pf4,
+                                                 ready=lambda: bool(getattr(self, "weg2_dormant", False)))
                     except Exception:  # noqa: BLE001 -- the wake builds it then
                         pass
                 if _l15_res is not None:
@@ -20935,11 +20945,14 @@ class Scheduler(
             # otherwise the armed ranks give it back and flush plain too.
             try:
                 if _l15_agree_on and _l15_pre_why is None:
+                    _l15_tt["post0"] = time.perf_counter()
                     _l15_rk, _l15_pfx = _l15_sa2.rank_prefix(self)
                     _l15_post = _l15_sa2.agree(
                         _l15_sa2.post_vote(_l15_res, l15_shadow.own_cap_rows(
                             self, os.environ), prefix=_l15_pfx, rank=_l15_rk),
                         _l15_gather)
+                    # 540: incl. the wait for the slowest rank of the group
+                    _l15_tt["post"] = time.perf_counter() - _l15_tt["post0"]
                     if _l15_post is not None:
                         if _l15_res is not None:
                             _l15_sa2.undo_armed(self, l15_manifest.manifest_path(
@@ -21003,14 +21016,20 @@ class Scheduler(
             if len(_l15_tt) > 1:
                 logger.info(
                     "L15-SLEEP-TIMING rank=%d held=%s reuse=%s total_ms=%.0f "
-                    "bind_ms=%.0f retain_ms=%.0f arm_ms=%.0f share_ms=%.0f",
+                    "bind_ms=%.0f retain_ms=%.0f arm_ms=%.0f share_ms=%.0f "
+                    "pre_ms=%.0f snap_ms=%.0f post_ms=%.0f",
                     int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
                     _l15_res is not None, _l15_reuse is not None,
                     (time.perf_counter() - _l15_tt["t0"]) * 1000.0,
                     _l15_tt.get("bind", 0.0) * 1000.0,
                     _l15_tt.get("retain", 0.0) * 1000.0,
                     _l15_tt.get("arm", 0.0) * 1000.0,
-                    _l15_tt.get("share", 0.0) * 1000.0)
+                    _l15_tt.get("share", 0.0) * 1000.0,
+                    # 540: pre = agree PRE + TREE-CAND, snap = CHECK-SNAP
+                    # (inside retain_ms), post = the POST gather incl. wait
+                    _l15_tt.get("pre", 0.0) * 1000.0,
+                    _l15_tt.get("snap", 0.0) * 1000.0,
+                    _l15_tt.get("post", 0.0) * 1000.0)
             if _l15_res is not None:
                 pass
             else:

@@ -47,6 +47,7 @@ def test_snapshot_then_who_names_the_row_and_what_moved(monkeypatch):
         return list(range(len(sampled)))
 
     monkeypatch.setattr(l15_sample, "load_into_scratch", fake_load)
+    monkeypatch.setenv("SGLANG_WEG2_L15_CHECK_SNAP", "1")   # 540: opt-in
     monkeypatch.setattr(CS, "LAST", None)
     CS.note_moves([(7, 3)])                     # token at slot 3 came from slot 7
     m = _manifest()

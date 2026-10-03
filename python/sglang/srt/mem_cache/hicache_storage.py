@@ -3319,6 +3319,15 @@ class HiCacheFile(HiCacheStorage):
         return False, max(y, float(every) - max(0.0, now - cycle_t0))
 
     @staticmethod
+    def _l3wb_anchor_min_bytes() -> int:
+        """540 L3WB-ANCHOR-FIRST: slot size from which an arena is an anchor
+        arena (visited every pass); 0 = off (the open order)."""
+        try:
+            return max(0, int(envs.SGLANG_WEG2_L3_WRITE_BEHIND_ANCHOR_MIN_MIB.get())) << 20
+        except Exception:  # noqa: BLE001
+            return 1 << 20
+
+    @staticmethod
     def _l3_write_behind_budget() -> int:
         try:
             return max(1, int(envs.SGLANG_WEG2_L3_WRITE_BEHIND_MIB.get())) << 20
@@ -3416,11 +3425,32 @@ class HiCacheFile(HiCacheStorage):
         _qsa = getattr(self, "canonical_qsa_page", None)
         _q_bytes = int(_qsa.total_bytes) if _qsa is not None else None
         _arenas = [a for a in list((getattr(self, "_arenas", None) or {}).values()) if a is not None]
-        _arenas.sort(key=lambda a: 0 if int(getattr(a, "slot_bytes", -1)) == _q_bytes else 1)
+        # 540 L3WB-ANCHOR-FIRST: the anchor arenas, then QSA, then the rest.
+        # Anchors first, even before QSA: the pair rule orders QSA before KV
+        # only, and on NF the QSA arena's backlog follows the KV one 1:1 (it
+        # would starve the anchors exactly like KV did on the 27B).
+        _anchor_min = self._l3wb_anchor_min_bytes()
+
+        def _is_anchor(a) -> bool:
+            sb = int(getattr(a, "slot_bytes", -1))
+            return _anchor_min > 0 and sb >= _anchor_min and sb != _q_bytes
+
+        _arenas.sort(key=lambda a: 0 if _is_anchor(a)
+                     else (1 if int(getattr(a, "slot_bytes", -1)) == _q_bytes else 2))
         tot["unpaired"] = 0
+        tot["anchor_written"] = 0
         if not cont:
             # a new cycle: every arena from its first slot, its byte budget full
             for arena in _arenas:
+                arena._l3wb_cycle_pages = 0
+                arena._l3wb_cursor = 0
+                arena._l3wb_done = False
+        for arena in _arenas:
+            if _is_anchor(arena):
+                # 540: an anchor arena does not wait for the KV arena's cycle
+                # to end (it never did under load): every pass, from slot 0,
+                # with its own fresh budget. Its census is ~100 slots and the
+                # (slot, gen, key) baseline keeps a secured page off it.
                 arena._l3wb_cycle_pages = 0
                 arena._l3wb_cursor = 0
                 arena._l3wb_done = False
@@ -3430,6 +3460,7 @@ class HiCacheFile(HiCacheStorage):
                 break
             if getattr(arena, "_l3wb_done", False):
                 continue                    # this cycle has visited all of it already
+            _anchor_arena = _is_anchor(arena)
             tot["arenas"] += 1
             nslots = int(arena.slots)
             sec = getattr(arena, "_l3wb_sec", None)
@@ -3578,6 +3609,8 @@ class HiCacheFile(HiCacheStorage):
                                     sec_lo[slots[i]] = klo[i]
                                     tot["written"] += 1
                                     tot["bytes"] += total
+                                    if _anchor_arena:
+                                        tot["anchor_written"] += 1
                                     arena._l3wb_cycle_pages = int(getattr(arena, "_l3wb_cycle_pages", 0)) + 1
                                 else:
                                     self._evictor.abort(stem)
@@ -3624,13 +3657,17 @@ class HiCacheFile(HiCacheStorage):
         if tot["written"] or tot["refused"] or tot["sliced"] or over or tot["torn"]:
             k = getattr(self, "_l3wb_logged", 0) + 1
             self._l3wb_logged = k
-            if k <= 32 or k % 64 == 0 or tot["refused"] or over:
+            if tot["anchor_written"]:
+                self._l3wb_anchor_written = (getattr(self, "_l3wb_anchor_written", 0)
+                                             + tot["anchor_written"])
+            if k <= 32 or k % 64 == 0 or tot["refused"] or over or tot["anchor_written"]:
                 logger.info(
                     "L3-REUSE WRITE-BEHIND pass=%d pages=%d bytes=%d ms=%.1f cpu_ms=%.1f "
                     "arenas=%d complete=%d new=%d on_disk=%d pending=%d refused=%d "
                     "unpaired=%d paused=%s written_total=%d budget=%s slice_ms=%.0f slices=%d "
                     "slice_max_ms=%.1f slice_max_stems=%d stat_ms=%.1f stat_cpu_ms=%.1f "
-                    "pair_ms=%.1f deferred=%d cont=%d sliced_total=%d torn=%d torn_total=%d (L2 pages "
+                    "pair_ms=%.1f deferred=%d cont=%d sliced_total=%d torn=%d torn_total=%d "
+                    "anchor_pages=%d anchor_total=%d (L2 pages "
                     "copied to the persistent L3 without a free; budget=hit: the pass stopped at a slice "
                     "edge and continues after the yield, deferred stems are NOT dropped)",
                     n, tot["written"], tot["bytes"], tot["ms"], tot["cpu_ms"],
@@ -3642,6 +3679,7 @@ class HiCacheFile(HiCacheStorage):
                     tot["stat_ms"], tot["stat_cpu_ms"], tot["pair_ms"], tot["deferred"],
                     int(bool(cont)), getattr(self, "_l3wb_sliced_n", 0),
                     tot["torn"], getattr(self, "_l3wb_torn", 0),
+                    tot["anchor_written"], getattr(self, "_l3wb_anchor_written", 0),
                 )
         return tot
 

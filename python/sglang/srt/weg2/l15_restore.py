@@ -118,12 +118,50 @@ def owned_l2_rows(
     return rows
 
 
-def warm_plan_async(m: Manifest, rank: int, prefix: Sequence[int]) -> None:
+#: 540 PLAN-WARM-DEFER: poll step of the deferred warm thread (s)
+_WARM_POLL_S = 0.02
+
+
+def warm_defer_s() -> float:
+    """540: how long the warm thread waits for ``ready`` at most (s); 0 = start
+    at once (the pre-540 form)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0.0, float(envs.SGLANG_WEG2_L15_PLAN_WARM_DEFER_S.get()))
+    except Exception:  # noqa: BLE001
+        return 5.0
+
+
+def warm_plan_async(m: Manifest, rank: int, prefix: Sequence[int],
+                    ready: Optional[Callable[[], bool]] = None,
+                    defer_s: Optional[float] = None) -> None:
     """Build the wake's plan in a daemon thread after the sleep (P's phase
-    lasts seconds; the wake then finds it cached). Never raises."""
+    lasts seconds; the wake then finds it cached). Never raises.
+
+    540 PLAN-WARM-DEFER (27B y8r 55c95a89c7): the plan is a pure-Python walk
+    over every held token (~0.6-0.9 s at 150k held rows). Started inside the
+    sleep flush it competes for the GIL with the rest of the D>P sleep leg
+    on the same process (release flush, kv pause) -- the flip's critical
+    path. With ``ready`` (the scheduler passes "D is dormant") the thread
+    first waits until it holds, at most ``defer_s`` (``warm_defer_s``), and
+    only then builds: the work lands in P's phase, where D's scheduler
+    thread is idle."""
     import threading
+    import time as _time
+
+    wait_s = warm_defer_s() if defer_s is None else max(0.0, float(defer_s))
 
     def _run():
+        if ready is not None and wait_s > 0:
+            t_end = _time.monotonic() + wait_s
+            while _time.monotonic() < t_end:
+                try:
+                    if ready():
+                        break
+                except Exception:  # noqa: BLE001 -- an unreadable flag: build now
+                    break
+                _time.sleep(_WARM_POLL_S)
         try:
             owned_l2_rows(m, rank, prefix)
         except Exception:  # noqa: BLE001 -- the wake computes it then

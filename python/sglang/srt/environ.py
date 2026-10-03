@@ -789,6 +789,25 @@ class Envs:
     # everything it finds).
     SGLANG_WEG2_L3_WRITE_BEHIND_SLICE_MS = EnvFloat(25.0)
     SGLANG_WEG2_L3_WRITE_BEHIND_YIELD_MS = EnvFloat(25.0)
+    # 540 L3WB-ANCHOR-FIRST (27B y8r 55c95a89c7, D>P flush 2.9 s): the write-
+    # behind visited the arenas in open order and the KV arena (720896 slots,
+    # 50-150k new stems) never ended its cycle (cont=1 for minutes), so the
+    # mamba anchor arena behind it (112 x 78 MiB) was NEVER reached. Every
+    # anchor claim of the flip's FLUSH-PUBLISH then evicted a slot without an
+    # L3 copy and wrote it synchronously (#257 d, CRC + fsync of 78 MiB,
+    # ~140-400 ms each; y8r 09:14:00 TP1: 5 such writes, sweep 1039 ms; the
+    # same passes with only on_disk drops: 89 ms). Arenas whose slot is at
+    # least this many MiB (the anchor arenas; KV/QSA/draft pages are KiB) go
+    # first (before QSA) and are revisited from slot 0 with a fresh byte
+    # budget on EVERY pass, continuation or not. 0 = the open order.
+    SGLANG_WEG2_L3_WRITE_BEHIND_ANCHOR_MIN_MIB = EnvInt(1)
+    # 540 PLAN-WARM-DEFER (weg2/l15_restore.warm_plan_async): the L1.5 wake
+    # plan's warm thread is started in D's sleep flush; it now waits until D
+    # is dormant (kv paused) before its pure-Python walk over every held token
+    # (~0.6-0.9 s at 150k rows), at most this many seconds, so it never
+    # competes for the GIL with the rest of the D>P sleep leg. 0 = build at
+    # once (the pre-540 form).
+    SGLANG_WEG2_L15_PLAN_WARM_DEFER_S = EnvFloat(5.0)
     # L3FILL_JOIN_WAIT_MS (L3FILL-JOINED 30.09., NF y4a ep36 weg2-36-74): how
     # long an L3 -> L2 fill waits for a stem another writer has CLAIMED to
     # become COMPLETE before it counts as a miss. A prefix read ends at its
