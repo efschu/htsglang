@@ -639,7 +639,7 @@ def explain_row(r: Mapping, catalog: Optional[Mapping], comments: Optional[Mappi
     ent = (catalog or {}).get(name)
     parts: List[Dict[str, str]] = []
     out: Dict[str, object] = {"status": "unerklaert", "parts": parts, "depends": [], "gain": "", "cost": "", "group": "", "level": "experte",
-                              "planner_derived": False, "source": None, "default": None, "choices": None}
+                              "planner_derived": False, "source": None, "default": None, "choices": None, "note": ""}
     if ent:
         if ent.get("text"):
             parts.append({"kind": "kuratiert", "text": str(ent["text"]), "source": "profile_catalog_curated.py"})
@@ -650,7 +650,9 @@ def explain_row(r: Mapping, catalog: Optional[Mapping], comments: Optional[Mappi
         out.update({"gain": ent.get("gain", ""), "cost": ent.get("cost", ""), "group": ent.get("group", ""),
                     "level": ent.get("level", "experte"), "planner_derived": bool(ent.get("planner_derived")),
                     "source": ent.get("source"), "default": ent.get("default"), "choices": ent.get("choices"),
-                    "depends": [dict(d) for d in ent.get("depends", [])]})
+                    "depends": [dict(d) for d in ent.get("depends", [])],
+                    # catalog entries read by code but declared nowhere ("nur-leser") carry "ohne Doku" instead of an explanation
+                    "note": ent.get("doc_note", "")})
     c = (comments or {}).get(name)
     if c:
         parts.append({"kind": "profil", "text": str(c["text"]), "source": str(c.get("source", ""))})

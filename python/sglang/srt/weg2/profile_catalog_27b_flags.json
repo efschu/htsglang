@@ -1,0 +1,210 @@
+{
+ "flags": {
+  "--dual-d-capture-prio": {
+   "action": null,
+   "bare": false,
+   "choices": [
+    "off",
+    "on"
+   ],
+   "default": "off",
+   "help": "DUAL-SHARE stage 1a: D captures its CUDA graphs on the device's highest-priority stream (graph nodes keep the capture stream's priority). Group D of the dual layout only.",
+   "line": 21960,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  },
+  "--dual-d-kv-max-tokens": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": 1048576,
+   "help": "DUAL-TP3PP3 --dual-unified-kv: D's KV pool in GLOBAL tokens (virtual; D keeps its boot level mapped and grows from the card pool). Must exceed D's boot context; each buffer is born at its owner share of this and trimmed at once.",
+   "line": 21992,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": "int"
+  },
+  "--dual-d-min-rate-tps": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": 0.0,
+   "help": "DUAL-SHARE: D's minimum decode rate per request (tok/s, measured from the leg-2 token stream); below it the rung steps toward D. 0 = off.",
+   "line": 21952,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": "float"
+  },
+  "--dual-d-prefill-tokens": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": 0,
+   "help": "DUAL-TP3PP3 D PREFILL ALLOWANCE, DEFAULT 0 (user decision 01.10.: in the dual layout EVERY prefill runs on P, D only decodes). D's X (its W31 riegel and the front's route bound) becomes 1 + this value: the 1 is the N-1 anchor convention (P holds the last prompt token back, D's first step computes it), anything larger goes to P and a larger remainder at D is refused by name (W31 -> P), never silently recomputed. Ignored outside --dual-layout; replaces --tp-prefill-max-tokens / --x-ceiling-tokens / --d-short-drain-tokens there.",
+   "line": 21922,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": "int"
+  },
+  "--dual-layout": {
+   "action": "store_true",
+   "bare": true,
+   "choices": null,
+   "default": false,
+   "help": "DUAL-TP3PP3 (F26, user 29.09.): BOTH groups stay awake for the whole boot and the front never flips. Implies --flip-weights resident; P is NOT put to sleep after READY, its AWAKE footprint is measured in its place and D is sized from that measurement (the same per-PID reading the dormant residue uses). P's own budget is lowered with --extra-p '--rank-gpu-memory-mib ...' (W100 allows lowering). Refuses --weg2-d-adopt on and --idle-layout pp. Default off: the launcher is byte-identical.",
+   "line": 21904,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  },
+  "--dual-mps": {
+   "action": null,
+   "bare": false,
+   "choices": [
+    "off",
+    "on"
+   ],
+   "default": "off",
+   "help": "DUAL-TP3PP3: start a private MPS control daemon before the groups (pipe dir under the boot's run dir) so P and D kernels run concurrently on a card instead of time-slicing. Only with --dual-layout. REFUSED unless SGLANG_WEG2_DUAL_MPS_OPT_IN=1: measured to wedge both groups under extend-sized collectives (repro v2 scjhru S1, boots kw6pft/ndktv4); the dual layout runs without MPS, latency guard --dual-p-duty.",
+   "line": 21996,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  },
+  "--dual-p-duty": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": 1.0,
+   "help": "DUAL-TP3PP3 PAUSE ALLOWANCE (Pausenzulassung), DEFAULT 0 = 1.0 = no pause: P and D run at once and share every card, only physics limits them (user decision 01.10.). Below 1.0 P MAY pause while D holds decodes: the share of wall time P's first stage may compute (weg2/dual_duty.py). Plain form: PP0 idles t_fwd*(1-duty)/duty after each forward. With env SGLANG_WEG2_DUAL_P_GANG_CHUNKS=K (gang window): PP0 runs K chunks, waits for the pipeline to drain, then holds so D is alone on all cards.",
+   "line": 21930,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": "float"
+  },
+  "--dual-p-kv-max-tokens": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": 196608,
+   "help": "DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows (virtual; pages from the card pool). Each K/V buffer is born at this size and trimmed at once, so the boot transient is one buffer (tokens x bytes per token per layer).",
+   "line": 21988,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": "int"
+  },
+  "--dual-p-min-share": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": 0.25,
+   "help": "DUAL-SHARE: floor of P's share (rungs below it are never used).",
+   "line": 21955,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": "float"
+  },
+  "--dual-p-mps-low-prio": {
+   "action": null,
+   "bare": false,
+   "choices": [
+    "off",
+    "on"
+   ],
+   "default": "off",
+   "help": "DUAL-SHARE stage 1b: P starts with CUDA_MPS_CLIENT_PRIORITY=1 (below normal; read at connect, boot only). Needs --dual-mps on, else a named W-DUAL-SHARE-FALLBACK line.",
+   "line": 21963,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  },
+  "--dual-p-overhead-mib": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": 1500,
+   "help": "DUAL-TP3PP3 --dual-share: what P holds on a card outside its --rank-gpu-memory-mib budget (CUDA context, graphs, activations), charged when D is sized from P's plan instead of P's measurement.",
+   "line": 21918,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": "int"
+  },
+  "--dual-p-sleep": {
+   "action": null,
+   "bare": false,
+   "choices": [
+    "off",
+    "on"
+   ],
+   "default": null,
+   "help": "DEFAULT: ON with --dual-share, OFF otherwise (since gmps12, dkr27bnvfp4dual1mpsleepbar1fs10020008: P slept and woke under --dual-share on all three stages, SLEEP-LEND/WAKE-RECLAIM; the metal probe SGLANG_WEG2_DUAL_P_SLEEP_PROBE_S stays off by default). History: default off since gmps9 (dkr27bnvfp4dual1mbar1fs10012051, P-PP0 init_memory_pool: 'per-rank budget leaves no GPU memory for the KV cache'): 'on' loads P's weights inside the memory-saver's private MemPool (not resident), and the --dual-share union bind frees P's own copies into that pool, which empty_cache never returns ('WEG2-UNION PEER ... card free 3.35 -> 3.35 GiB', resident gmps7: 3.31 -> 11.74 GiB). 'on' together with --dual-share is therefore REFUSED at launch (W-DUAL-P-SLEEP-SHARE) until P's union-bound part loads outside the pool. DUAL-TP3PP3 with --dual-unified-kv on: D PRIORITY stage 2 (user decision 01.10.) -- when D is still short after P stopped and released its KV, P sleeps and parks its weights in host RAM (P boots with --enable-weights-cpu-backup and NOT resident; the vendored torch_memory_saver allocates the host image at the pause and frees it after the restore, tms_csrc/core.cpp -- no resting image, KEIN-DAUER-HOSTRAM). off = stage 1 only, the front prints 'stage=2 unavailable (weights resident)'.",
+   "line": 21966,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  },
+  "--dual-p-sm-pct": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": 100,
+   "help": "DUAL-TP3PP3 with --dual-mps on: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for group P, i.e. the share of SMs P's kernels may occupy while D decodes. MEASURED 29.09. (risk-1 bench, 5090): unlimited P takes ~90%% of the card and D's step runs ~7x slower; 50 splits ~50/50; the sum of both shares stays ~1.0 either way. 100 = no limit.",
+   "line": 21937,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": "int"
+  },
+  "--dual-priority": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": null,
+   "help": "DUAL-SHARE stage 2: the front's P/D share controller writes a rung (P's share 1.0/0.75/0.5/0.25, profile env SGLANG_WEG2_DUAL_SHARE_RUNGS) to <busy>.ctl; P acts through --dual-share-actuators. p = P full (today), balanced/d = a static rung while D decodes, dynamic = matrix of tau (queued prefill tokens / P full rate) x D bs. Switchable at runtime: POST /weg2/dual-priority on the front. Unset = off.",
+   "line": 21946,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  },
+  "--dual-share": {
+   "action": "store_true",
+   "bare": true,
+   "choices": null,
+   "default": false,
+   "help": "DUAL-TP3PP3 stage 1b (implies --dual-layout): P's stage computes on D's TP shards (shells over D's three shards of its layers) and binds the shard of the D rank on its card to D's bytes via the union image. D boots right after P as the union OWNER, sized from P's PLANNED budget (+ --dual-p-overhead-mib); P waits for D's image before it loads anything.",
+   "line": 21912,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  },
+  "--dual-share-actuators": {
+   "action": null,
+   "bare": false,
+   "choices": null,
+   "default": "chunk",
+   "help": "DUAL-SHARE: comma list of P actuators: chunk (PP0's chunk cap), duty (P duty throttle at the rung's fraction), green (stage 3, NOT built: named fallback to chunk).",
+   "line": 21957,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  },
+  "--dual-unified-kv": {
+   "action": null,
+   "bare": false,
+   "choices": [
+    "off",
+    "on"
+   ],
+   "default": "off",
+   "help": "DUAL-TP3PP3: one KV pool per card shared by P and D at runtime (user orders 30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P maps KV only while it prefills and pauses when D is short. Needs --dual-share.",
+   "line": 21984,
+   "nargs": null,
+   "rev": "54a30199b1",
+   "type": null
+  }
+ },
+ "prefix": "--dual-",
+ "rev": "54a30199b1",
+ "schema": "flliper.catalog.extra/1",
+ "source": "weg2/launcher.py @ 54a30199b1"
+}
