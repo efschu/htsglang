@@ -268,6 +268,14 @@ class WeightFormat:
     args: Tuple[str, ...] = ()
     p_cut_pin: Tuple[Tuple[int, ...], ...] = ()
     profile_format: str = ""
+    #: HW-P1 NF port 1003 (hw-p1ab finding 2): checkpoints that ARE this format
+    #: by name and by footprint -- an abliterated derivative (``...-abl-wxp``:
+    #: config.json and every safetensors header byte-identical to ``checkpoint``,
+    #: only the weight VALUES differ, see H87 :func:`footprint_key`). Named one
+    #: by one and never matched by a suffix, so a new export stays "unknown"
+    #: (:func:`format_of` returns ``""`` and the caller keeps its code default).
+    #: ``checkpoint`` stays the docker-profile source (profile_docker).
+    derivatives: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -927,6 +935,7 @@ PROFILES: Dict[str, ModelProfile] = {
         formats={
             "int4-mixed": WeightFormat("int4-mixed", note="compressed-tensors AutoRound (Minachist)",
                                        checkpoint=_MC + "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",
+                                       derivatives=(_MC + "Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist-abl-wxp",),
                                        p_cut_pin=((29, 11, 8), (7, 3, 2))),
             "nvfp4": WeightFormat("nvfp4", sm8x="w4a8", sm12x="native",
                                   note="ModelOpt; 3080 W4A8 planned (user 25.09.)",
@@ -1408,6 +1417,8 @@ def format_of(profile: Optional[str], model: str) -> str:
         return ""
     for name, wf in row.formats.items():
         if wf.checkpoint and model_key(wf.checkpoint) == key:
+            return name
+        if any(model_key(d) == key for d in wf.derivatives):
             return name
     return ""
 
