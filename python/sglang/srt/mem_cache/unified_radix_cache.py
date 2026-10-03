@@ -6919,7 +6919,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             key = node.key
             try:
                 raw = key.raw_token_ids() if hasattr(key, "raw_token_ids") else key
-                out.append(get_hash_str([int(t) for t in raw[i * P:(i + 1) * P]], prior, page_size=P)[0])
+                # Q-460: the plain ids carry no namespace -- the node's does
+                out.append(get_hash_str([int(t) for t in raw[i * P:(i + 1) * P]], prior, page_size=P,
+                                        extra_key=getattr(key, "extra_key", None))[0])
             except Exception:  # noqa: BLE001 -- a convention that cannot hash proves nothing
                 pass
             try:
