@@ -107,6 +107,21 @@ CALIBRATED_CLASSES: Tuple[CalibratedClass, ...] = (
 #: vectors are measured in this order).
 REFERENCE_INVENTORY: Tuple[str, ...] = ("RTX5090", "RTX3080", "RTX3080")
 
+#: HW-P0 1003: the archs the gate ADMITS although no calibration class of
+#: that arch exists in this release (today: sm_89). A card of such an arch
+#: is never refused HW-ARCH; it takes the NAMED calibration fallback
+#: :data:`CALIBRATION_FALLBACK` -- its record-lookup label is its card key
+#: (``<model>/<MiB>/sm<cc>``), which matches no calibrated record, so every
+#: positional value the plan needs reaches HW-UNCALIBRATED by name until a
+#: calibration boot has written records for it. Derived, never listed by
+#: hand: adding a calibrated class of an arch removes it from here.
+UNCALIBRATED_ARCHS: Tuple[Tuple[int, int], ...] = tuple(
+    a for a in SUPPORTED_ARCHS if a not in {c.cc for c in CALIBRATED_CLASSES})
+
+#: The name of that fallback (printed in the HW-UNCALIBRATED message of an
+#: inventory holding an uncalibrated-arch card).
+CALIBRATION_FALLBACK = "card-key (uncalibrated arch: no class, no borrowed record)"
+
 
 @dataclass(frozen=True)
 class CardProps:
@@ -225,6 +240,15 @@ def class_label(card) -> str:
     return calibration_class(card) or card_key(card)
 
 
+def arch_uncalibrated(card) -> bool:
+    """True when the card's arch passes the gate but has NO calibration class
+    in this release (:data:`UNCALIBRATED_ARCHS`, today sm_89): the card takes
+    :data:`CALIBRATION_FALLBACK`. An unreported cc is not this case (the gate
+    refuses it)."""
+    p = props_of(card)
+    return p.cc is not None and tuple(p.cc) in UNCALIBRATED_ARCHS
+
+
 def describe(card) -> str:
     p = props_of(card)
     bw = p.peak_membw_gbps
@@ -256,10 +280,10 @@ def arch_gate(cards: Iterable) -> None:
             f"{CODE_ARCH}: this release carries kernels for "
             + ", ".join(f"sm_{a}{b}" for a, b in SUPPORTED_ARCHS[:-1])
             + f" and sm_{SUPPORTED_ARCHS[-1][0]}{SUPPORTED_ARCHS[-1][1]}"
-            + " (sgl-kernel wheel 86;120a: sm_86 and sm_120 have SASS, sm_89"
-            " runs on the sm_86 cubins plus JIT at first boot; an sm_89 card"
-            " passes this gate but is UNCALIBRATED -- measure it with"
-            " card_rate_pass --run and one calibration boot,"
+            + " (sgl-kernel wheel 86;120a or 86;89;120a: sm_86 and sm_120 have"
+            " SASS, sm_89 runs on its own cubins or the sm_86 ones plus JIT at"
+            " first boot; an sm_89 card passes this gate but is UNCALIBRATED --"
+            " measure it with card_rate_pass --run and one calibration boot,"
             " see HW-GENERISCH-SM86-SM120-1002.md 5); refused: "
             + "; ".join(bad))
 
@@ -318,9 +342,13 @@ def uncalibrated_message(ordered_cards: Sequence, calibrated: Sequence[str],
         b = want[i] if i < len(want) else "-"
         if a != b:
             diff.append(f"ordinal {i}: live {a} vs calibrated {b}")
+    archs = sorted({tuple(props_of(c).cc) for c in ordered_cards if arch_uncalibrated(c)})
+    arch_note = ("" if not archs else
+                 " " + ", ".join(_sm(a) for a in archs)
+                 + f" has no calibration class in this release: {CALIBRATION_FALLBACK}.")
     return (f"{CODE_UNCALIBRATED}: {source} was measured on the inventory "
             f"[{', '.join(want)}] (card order), this rig is [{', '.join(live)}] ("
-            + "; ".join(diff) + "). Positional measurements of the other inventory are NOT "
+            + "; ".join(diff) + ")." + arch_note + " Positional measurements of the other inventory are NOT "
             "borrowed: " + (", ".join(what) if what else "(none named)")
             + ". Measure them on this rig: card_rate_pass --run (GEMM/membw/link rates), then "
             "one calibration boot per profile that writes the per-rank records "
