@@ -7889,10 +7889,11 @@ class Front:
     # forward rides along as flip_user_time.pp_last_start_ts (the pipeline fill
     # is prefill). Unavailable -> "missing" and no value; NEVER the leg-1
     # dispatch. Log marker: WEG2-FLIP-PPFWD.
-    def _dp_ppfwd_arm(self) -> None:
+    def _dp_ppfwd_arm(self, t_flip0: Optional[float] = None) -> None:
         """At a D->P ``flip_done``: read the woken group P's first/last-stage
-        baseline and start the probe thread. Never raises (an instrument never
-        breaks a flip)."""
+        baseline and start the probe thread. ``t_flip0``: the flip's begin (the
+        caller's own stamp; ``self._flip_t0`` is already cleared by then --
+        Y8P-PPFWD-ARM-RACE-2). Never raises (an instrument never breaks a flip)."""
         from sglang.srt.weg2 import progress_beacon as _fp
 
         _old = self.__dict__.pop("_dp_ppfwd", None)  # a pending first work is THIS flip's: kept
@@ -7913,7 +7914,11 @@ class Front:
             return
         probe.epoch = int(getattr(self, "epoch", 0) or 0)
         probe.t_done = time.time()
-        _t0 = getattr(self, "_flip_t0", None)
+        # Y8P-PPFWD-ARM-RACE-2 (NF y8s 03.10. 09:32:06, epoch 5: armed with baseline ct 18, first
+        # stage reported the SECOND chunk, +3.19 s): `flip()` clears `self._flip_t0` at its end,
+        # BEFORE this arm (front.py "the flip is closed"), so the attribute read gave None and
+        # resolve_started_after never ran. The begin stamp comes in as an argument.
+        _t0 = t_flip0 if t_flip0 else getattr(self, "_flip_t0", None)
         if _t0:   # Y8P-PPFWD-ARM-RACE: a P forward that began after flip_begin but before this arm
             probe.resolve_started_after(int(float(_t0) * 1e9))
         self.__dict__["_dp_ppfwd"] = probe
@@ -14080,7 +14085,7 @@ class Front:
                 _dt.add_done_callback(self._dc_tasks.discard)
         Front._flip_phase(self).done(time.time())  # DASHBOARD-IPC: Layer -> Nachlauf
         if src == "D" and dst == "P":
-            Front._dp_ppfwd_arm(self)  # FLIPZEIT D>P: P's first stage's first forward from here
+            Front._dp_ppfwd_arm(self, t_flip0)  # FLIPZEIT D>P: P's first stage's first forward from here
         Front._ipc_live_kick(self)
         if dc_off_path:
             _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))

@@ -428,3 +428,38 @@ def test_y8p_arm_race_a_forward_of_the_previous_phase_is_not_taken_for_the_first
     _beat(d, "P", 101, 8, begin_ns + 300_000_000)
     r = fp.first_rise(probe.baseline["first"], fp.read_group(d, "P", 77, lambda pid: 77))
     assert r["ts"] == 100.3 and r["ct"] == 8
+
+
+def test_y8s_arm_race_2_the_front_hands_the_flip_begin_to_the_arm_not_the_cleared_attribute():
+    """NF y8s 03.10. 09:32:06 (epoch 5, D>P 6.98 s): `flip()` sets `self._flip_t0 = None` before
+    it arms the probe, so `resolve_started_after` (044316dd1a) never saw a floor -- the fix was
+    dead in the real flip path (its unit tests set the attribute by hand). End to end through
+    `flip()`: PP0's first forward began after the flip's begin and is already in the baseline at
+    the arm; the second chunk of PP0 follows. The end is the FIRST forward."""
+    arena = tempfile.mkdtemp(prefix="ppfwd-arm2-arena-")
+    bd = os.path.join(arena, "progress")
+    os.makedirs(bd)
+    procs = _ranks(["sglang::scheduler_PP0", "sglang::scheduler_PP1", "sglang::scheduler_PP2"])
+    pids = [p.pid for p in procs]
+    for pid in pids:
+        _beat(bd, "P", pid, 30, 1, 2)                             # forwards of the previous P phase
+    t_first_ns = time.time_ns() + 30_000_000_000                  # after any flip begin, already running
+    _beat(bd, "P", pids[0], 31, t_first_ns, 0)                    # in the baseline at the arm
+    seen = {}
+
+    def on_post():
+        seen["second_ns"] = t_first_ns + 3_000_000_000
+        _beat(bd, "P", pids[0], 32, seen["second_ns"])             # the SECOND chunk (the bug reported it)
+        _beat(bd, "P", pids[1], 31, t_first_ns + 15_000_000)
+        _beat(bd, "P", pids[2], 31, t_first_ns + 30_000_000)
+
+    try:
+        f, sd = _run_dp_flip(arena, on_post)
+    finally:
+        _kill(procs)
+    ut = [e["data"] for e in _d._of(sd, "flip_user_time")]
+    assert len(ut) == 1
+    assert (ut[0]["prefill_start_source"], ut[0]["prefill_start_ts"]) == \
+        ("pp_first_forward", round(t_first_ns / 1e9, 3))
+    assert ut[0]["prefill_start_ts"] != round(seen["second_ns"] / 1e9, 3)
+    assert ut[0]["pp_last_start_ts"] == round((t_first_ns + 30_000_000) / 1e9, 3)
