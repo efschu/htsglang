@@ -6789,6 +6789,20 @@ class Front:
                 sids[str(rid)] = _arr("q", [int(t) for t in list(ids)[: int(common)]])
                 while len(sids) > 64:
                     sids.popitem(last=False)
+            # L15-TREE-FRONT: a follow-up of a session's earlier turn keeps its WHOLE
+            # prompt's ids (bounded) so that, when that turn has finished by the
+            # flip, the hint can name the held tree tip by prefix (the P stages
+            # compare the tip digests with these ids)
+            if os.environ.get("SGLANG_WEG2_L15_HOT_SHARE", "0") == "1":
+                from array import array as _arr2
+
+                from sglang.srt.weg2 import l15_tree_cand as _l15_tc
+
+                if _l15_tc.env_on(os.environ):
+                    tids = self.__dict__.setdefault("_tree_ids", collections.OrderedDict())
+                    tids[str(rid)] = _arr2("q", [int(t) for t in ids])
+                    while len(tids) > 16:
+                        tids.popitem(last=False)
             logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=%s common=%d prompt=%d "
                         "prev_prompt=%d (front token ids: where this prompt leaves the session's "
                         "previous one)", rid, sess, prev_rid, common, len(ids), prev_len)
@@ -10969,6 +10983,19 @@ class Front:
                                            int(_prev[1]))
                     logger.info("HOT-HANDOVER-HINT rid=%s from=%s n=%d",
                                 p.rid, _prev[0], int(_prev[1]))
+                elif _prev:
+                    # L15-TREE-FRONT: previous turn finished -- the P stage picks the
+                    # held tree tip by prefix (its own prompt ids; n = prompt length)
+                    from sglang.srt.weg2 import l15_tree_cand as _l15_tc
+
+                    _full = (self.__dict__.get("_tree_ids") or {}).get(p.rid)
+                    if _l15_tc.env_on(os.environ) and _full is not None and len(_full) > 0:
+                        _hot_dir = _l15_sp.share_dir(os.environ)
+                        _l15_sa.write_hot_hint(_hot_dir, p.rid, _l15_sa.TREE_PREV,
+                                               len(_full), tree=True)
+                        logger.info("HOT-HANDOVER-HINT rid=%s tree n=%d (previous turn %s "
+                                    "finished: P picks the held tree tip by prefix)",
+                                    p.rid, len(_full), _prev[0])
             except Exception:  # noqa: BLE001 -- a hint, never the route
                 _hot_dir = None
         # L15-14b: the phase-2 deposit -- every P request gets a slot range in
@@ -13355,6 +13382,33 @@ class Front:
                         if self._l15_wake_hints:
                             logger.info("HOT-HANDOVER-HINT at=wake n=%d rids=%s",
                                         len(self._l15_wake_hints), self._l15_wake_hints[:8])
+                        # L15-TREE-FRONT: a queued follow-up whose session's previous
+                        # request is NOT live on D (it finished: the 15-s collect window
+                        # lets the decodes end before the sleep) may extend a held tree tip
+                        # -- the hint carries the whole prompt, the P stages pick the tip
+                        # by prefix from D's published descriptor (rank-uniform: same
+                        # descriptor, same ids, no reserve)
+                        from sglang.srt.weg2 import l15_tree_cand as _l15_tc
+
+                        if _l15_tc.env_on(os.environ):
+                            _tids = self.__dict__.get("_tree_ids") or {}
+                            _tree_hinted = []
+                            for _q in list(self.queue):
+                                _r = str(getattr(_q, "rid", ""))
+                                _pv = _sprev.get(_r)
+                                _full = _tids.get(_r)
+                                if (_r in self._l15_wake_hints or not _pv or _full is None
+                                        or str(_pv[0]) in _dl or len(_full) == 0):
+                                    continue
+                                _l15_sa.write_hot_hint(_hdir, _r, _l15_sa.TREE_PREV,
+                                                       len(_full), ids=_full, tree=True)
+                                self._l15_wake_hints.append(_r)
+                                _tree_hinted.append(_r)
+                            if _tree_hinted:
+                                logger.info("HOT-HANDOVER-HINT at=wake tree n=%d rids=%s "
+                                            "(session's previous turn finished: P picks the "
+                                            "held tree tip by prefix)",
+                                            len(_tree_hinted), _tree_hinted[:8])
                 except Exception:  # noqa: BLE001 -- a hint, never the route
                     pass
             # DP-NACHLAUF: leg 1 of the queue head goes to the dormant P now

@@ -292,6 +292,47 @@ def pseudo_req(c: TreeCand, rank_in_order: int, total: int):
     )
 
 
+def tip_spans(spans: Sequence[Mapping]) -> List[Tuple[str, int]]:
+    """``(rid, depth)`` of the published hold spans that are tree tips."""
+    out: List[Tuple[str, int]] = []
+    for s in spans or ():
+        rid = str(s.get("rid", ""))
+        depth = int(s.get("depth", 0) or 0)
+        if rid.startswith(RID_PREFIX) and depth > 0:
+            out.append((rid, depth))
+    return out
+
+
+def match_tip(spans: Sequence[Mapping], token_ids: Sequence[int],
+              extra_key=None
+              ) -> Tuple[Optional[Tuple[str, int, int]], List[Tuple[str, int]]]:
+    """L15-TREE-FRONT: the held tree tip a prompt extends.
+
+    ``spans``: the published hold descriptor's spans (every rank publishes the
+    same agreed list). A tip is hot for ``token_ids`` when the prompt's first
+    ``raw`` tokens hash to the tip's digest (the rid is ``tree:<digest>``,
+    digest = :func:`digest_of` of the tip's whole RAW token chain, which is the
+    request's own token sequence -- :func:`chain_tokens` keeps a bigram
+    boundary token once). The span's ``depth`` counts KV slots: ``raw`` ==
+    ``depth`` on a plain tree, ``depth + 1`` on a bigram tree (units + 1 raw
+    tokens); both are tried. Pure function of data every rank sees -- the
+    answer is the same on every P stage. The LONGEST matching tip wins.
+
+    Returns ``((rid, depth, raw) or None, tips)``; ``tips`` is every
+    ``(rid, depth)`` for the miss marker."""
+    tips = tip_spans(spans)
+    if not tips:
+        return None, tips
+    arr = array("q", [int(t) for t in token_ids])
+    for rid, depth in sorted(tips, key=lambda t: (-t[1], t[0])):
+        for raw in (depth, depth + 1):
+            if raw > len(arr):
+                continue
+            if digest_of(arr[:raw], extra_key) == rid[len(RID_PREFIX):]:
+                return (rid, depth, raw), tips
+    return None, tips
+
+
 def is_tree_req(req) -> bool:
     return getattr(req, "l15_tree_tokens", None) is not None
 
