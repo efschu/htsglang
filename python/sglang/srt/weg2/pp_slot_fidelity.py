@@ -83,8 +83,19 @@ _LOG_FIRST = 8
 #: Q-640: eviction rounds the room verdict may run before it decides. A round
 #: can free more than it was asked for (an evict drains the in-flight write-
 #: backs, #1465, which makes their nodes evictable), so the set is re-read and
-#: evicted again -- bounded, never a spin.
+#: evicted again -- bounded, never a spin. DUAL LAYOUT ONLY (Q-640b, user order
+#: 03.10.): outside SGLANG_WEG2_DUAL_LAYOUT=1 -- the flip form, NF (TP=1/PP>1 as
+#: well) -- the verdict keeps its single eviction round, as before Q-640.
 _ROOM_MAX_ROUNDS = 4
+
+
+def _room_max_rounds(env=None) -> int:
+    """Q-640b: the re-read rounds exist only in the dual layout; one round
+    (the pre-Q-640 behaviour, byte for byte) everywhere else."""
+    e = os.environ if env is None else env
+    if (e.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip() == "1":
+        return _ROOM_MAX_ROUNDS
+    return 1
 
 
 def enabled(env=None) -> bool:
@@ -155,7 +166,8 @@ def local_pp_room(tree, kv_tokens: int, floor: int, rid=None) -> Optional[bool]:
     evicted = 0
     rounds = 0
     avail1 = avail0
-    while avail1 < kv_tokens and evictable > 0 and rounds < _ROOM_MAX_ROUNDS:
+    max_rounds = _room_max_rounds()
+    while avail1 < kv_tokens and evictable > 0 and rounds < max_rounds:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         res = tree.evict(EvictParams(num_tokens=min(kv_tokens - avail1, evictable)))

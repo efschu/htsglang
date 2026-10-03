@@ -15610,7 +15610,8 @@ class Front:
         # Q-680: never unbounded on a stale ledger. Dual y8w fs10031623 16:45:42:
         # PP1/PP2 kept 201/302 MB committed for no request (an undrained load-back
         # lock held their release), P idle -- RESUME-WAIT 905 s, 0 requests served.
-        if _dpar.resume_stale(per, p_idle=not self._dual_inflight):
+        # Q-680b: dual layout only, stated here (a paused head exists only there already)
+        if self.dual_layout and _dpar.resume_stale(per, p_idle=not self._dual_inflight):
             if getattr(self, "_dual_resume_stale_since", None) is None:
                 self._dual_resume_stale_since = now
             stale_s = now - self._dual_resume_stale_since
