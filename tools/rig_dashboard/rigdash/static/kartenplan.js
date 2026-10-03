@@ -12,8 +12,13 @@
   try { const v = localStorage.getItem("rigdash.kp.view"); if (v === "einfach" || v === "experte") state.view = v; } catch (e) { /* private window */ }
 
   async function getJson(url) {
+    // relative URL: the page is also served under a path prefix (nginx /rigdash/)
     const r = await fetch(url, { cache: "no-store" });
-    const j = await r.json();
+    const text = await r.text();
+    let j;
+    try { j = JSON.parse(text); } catch (e) {
+      throw new Error("HTTP " + r.status + ", keine JSON-Antwort von " + url + ": " + text.slice(0, 80));
+    }
     if (!r.ok || j.ok === false) throw new Error(j.error || ("HTTP " + r.status));
     return j;
   }
@@ -194,7 +199,7 @@
     state.busy = true;
     try {
       const q = { profile: state.profile, host_patched: state.hostPatched, cards: state.cards.map((k) => ({ card: k.card, pcie: k.pcie })) };
-      state.res = await getJson("/api/kartenplan/plan?q=" + encodeURIComponent(JSON.stringify(q)));
+      state.res = await getJson("api/kartenplan/plan?q=" + encodeURIComponent(JSON.stringify(q)));
       state.err = null;
     } catch (e) { state.err = String(e.message || e); state.res = null; }
     state.busy = false;
@@ -229,7 +234,7 @@
 
   async function init() {
     try {
-      state.cat = await getJson("/api/kartenplan/catalog");
+      state.cat = await getJson("api/kartenplan/catalog");
     } catch (e) { root.innerHTML = `<div class="kp-verdict bad">Katalog nicht erreichbar: ${esc(e.message)}</div>`; return; }
     state.profile = (state.cat.profiles.find((p) => p.has_record) || {}).id;
     state.cards = state.cat.rig_preset.cards.map((c) => ({ card: c.card, pcie: Object.assign({}, c.pcie) }));
