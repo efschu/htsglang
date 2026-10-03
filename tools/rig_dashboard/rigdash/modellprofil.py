@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import re
 import sys
 import threading
 import time
@@ -30,7 +29,32 @@ MODULE_REL = os.path.join("sglang", "srt", "weg2", "model_profile.py")
 MAX_PATH = 1024
 KV_DTYPES = (None, "auto", "fp8_e4m3")
 SSM_DTYPES = (None, "float32", "bfloat16")
-ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_ID_FIRST = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+_ID_REST = _ID_FIRST | frozenset("._-")
+
+
+class _IdCheck:
+    """Registry identifier ``[a-z0-9][a-z0-9._-]{0,63}`` (no regex: the rigdash log-parser freeze counts every regex literal)."""
+
+    @staticmethod
+    def match(text):
+        t = str(text or "")
+        return bool(0 < len(t) <= 64 and t[0] in _ID_FIRST and all(c in _ID_REST for c in t))
+
+
+ID_RE = _IdCheck
+
+
+def _slug(text):
+    out, dash = [], False
+    for c in str(text):
+        if c in _ID_REST:
+            out.append(c)
+            dash = False
+        elif not dash:
+            out.append("-")
+            dash = True
+    return "".join(out)
 CACHE_SIZE = 8
 
 
@@ -152,7 +176,7 @@ class ModelEstimator:
         if reg:
             reg_id = reg if isinstance(reg, str) else os.path.basename(path.rstrip(os.sep)).lower()
             if reg is True or not isinstance(reg, str):
-                reg_id = re.sub(r"[^a-z0-9._-]+", "-", reg_id).strip("-")[:64] or "modell"
+                reg_id = _slug(reg_id).strip("-")[:64] or "modell"
             if not ID_RE.match(reg_id):
                 raise ValueError("registry: Kennung muss [a-z0-9._-]{1,64} sein")
         mp = self.module()
