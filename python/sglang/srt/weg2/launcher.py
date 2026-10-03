@@ -5612,14 +5612,63 @@ class Log:
 # --------------------------------------------------------------------------
 
 
-def resolve_cards() -> List[Card]:
-    """The rig's cards, from the registry's ONE NVML reader.
+#: HW-P1a 1003: the ``--cards`` selection of the running launch (NVML
+#: indices), set ONCE at the top of :func:`main` and read by every
+#: :func:`resolve_cards` call of that launch (the boot path and the helpers
+#: that re-read the card list: p_stage_live_classes, p_stage_power_current,
+#: _live_inventory_or_none). None = every NVML device (today's behaviour).
+_CARD_SELECTION: Optional[Tuple[int, ...]] = None
+#: refusal code of a --cards value that names no card / a card twice
+CODE_CARDS = "HW-CARDS"
 
-    Was a second pynvml transcript here (init / getCount / getHandle / decode /
-    shutdown).  ``registry.nvml.list_devices`` is that transcript plus the v2
-    carve-out term, which this launcher now needs, so the copy is gone rather
-    than grown.
-    """
+
+def parse_card_selection(text: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """``"1,0"`` -> ``(1, 0)``; empty/None -> None (every card). Refuses BY
+    NAME (HW-CARDS) a malformed entry or a duplicate index."""
+    t = str(text or "").strip()
+    if not t:
+        return None
+    out: List[int] = []
+    for part in t.split(","):
+        p = part.strip()
+        if not p.isdigit():
+            raise Weg2LaunchRefused(
+                f"{CODE_CARDS}: --cards {t!r}: {p!r} is not an NVML index (expected e.g. '1,0')")
+        if int(p) in out:
+            raise Weg2LaunchRefused(f"{CODE_CARDS}: --cards {t!r} names NVML index {p} twice")
+        out.append(int(p))
+    return tuple(out)
+
+
+def set_card_selection(text: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """Install the launch's ``--cards`` selection (None clears it)."""
+    global _CARD_SELECTION
+    _CARD_SELECTION = parse_card_selection(text)
+    return _CARD_SELECTION
+
+
+def select_cards(cards: Sequence["Card"], selection: Optional[Sequence[int]]) -> List["Card"]:
+    """The cards whose NVML index is in ``selection`` (all when None), in
+    NVML order; an index NVML did not report is refused BY NAME."""
+    cards = list(cards)
+    if selection is None:
+        return cards
+    have = {int(c.nvml_index) for c in cards}
+    missing = [i for i in selection if int(i) not in have]
+    if missing:
+        raise Weg2LaunchRefused(
+            f"{CODE_CARDS}: --cards {','.join(str(i) for i in selection)}: NVML index "
+            f"{','.join(str(i) for i in missing)} not reported (NVML sees "
+            f"{','.join(str(i) for i in sorted(have)) or 'no card'})")
+    want = {int(i) for i in selection}
+    return [c for c in cards if int(c.nvml_index) in want]
+
+
+def selected_nvml_cards() -> List[Card]:
+    """The launch's cards from the registry's ONE NVML reader, restricted to
+    the ``--cards`` selection (:data:`_CARD_SELECTION`) -- WITHOUT the arch
+    gate (:func:`resolve_cards` adds it; the simulation harness reads the
+    ungated list to name every blocker of a refused inventory)."""
     cards = [
         Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib,
              cc=getattr(d, "compute_capability", None),
@@ -5631,6 +5680,22 @@ def resolve_cards() -> List[Card]:
              mem_clock_max_mhz=getattr(d, "mem_clock_max_mhz", None))
         for d in nvml_registry.list_devices()
     ]
+    return select_cards(cards, _CARD_SELECTION)
+
+
+def resolve_cards() -> List[Card]:
+    """The rig's cards, from the registry's ONE NVML reader.
+
+    Was a second pynvml transcript here (init / getCount / getHandle / decode /
+    shutdown).  ``registry.nvml.list_devices`` is that transcript plus the v2
+    carve-out term, which this launcher now needs, so the copy is gone rather
+    than grown.
+
+    HW-P1a 1003: restricted to the launch's ``--cards`` selection
+    (:data:`_CARD_SELECTION`), BEFORE the arch gate -- a card outside the
+    selection is not this launch's card and is not judged.
+    """
+    cards = selected_nvml_cards()
     # HW-GENERIC 1002: THE arch gate, once, at the one card-list producer --
     # every boot path (main, p_stage_power_current, xchg_census) reads its
     # cards here. sm_86 / sm_89 / sm_120 pass (sm_89 UNCALIBRATED: it reaches
@@ -5762,26 +5827,126 @@ def inventory_check_line(ns, cards: Sequence["Card"]) -> str:
             + (f"; vectors: {vec_src}" if vec_src == "--profile-inventory" else "") + ") MATCH")
 
 
-#: HW-GENERIC 1002 Stage 1: the release topology is P = PP3 / D = TP3 (argv
-#: below, Form A from the profile), so a launch needs exactly this many cards.
-#: Stage 2 derives it from the inventory (HW-GENERISCH-SM86-SM120-1002.md).
-WEG2_CARD_COUNT = 3
+#: HW-P1a 1003: the card count of the REFERENCE rig (the proven release
+#: topology P = PP3 / D = TP3). NO LONGER A GATE: the launch's count is
+#: ``len(order_cards(resolve_cards()))`` and :func:`topology_check_line`
+#: decides it (``topology.plan_topology``, named blockers). Kept as the
+#: default of the helpers that have no card list (``common_flags`` outside
+#: argv_p/argv_d, desk tests).
+WEG2_CARD_COUNT = _topo.PROVEN_CARD_COUNTS[0]
 
 
-def order_cards(cards: List[Card], expect_count: Optional[int] = WEG2_CARD_COUNT) -> List[Card]:
+def order_cards(cards: List[Card], expect_count: Optional[int] = None) -> List[Card]:
     """CUDA ordinal order (rank 0 / PP0 / TP0 first), from NVML PROPERTIES
     (weg2/card_identity.py): biggest NVML total first, then nameplate DRAM
     bandwidth, then NVML index. On the reference rig that is the 5090 first,
     then the 3080s by NVML index -- the order the name-based predecessor
     produced, byte for byte. Never a fixed index, never a name substring.
 
-    Refuses BY NAME (HW-COUNT) an inventory of another size than
-    ``expect_count`` (the topology is fixed at PP3/TP3 in Stage 1). The arch
-    gate (HW-ARCH) runs once in :func:`resolve_cards`."""
+    HW-P1a 1003: no count gate by default -- the count is the inventory's and
+    :func:`topology_check_line` refuses an unrunnable one BY NAME with its
+    blockers. ``expect_count`` (a caller that needs exactly N) still refuses
+    HW-COUNT. The arch gate (HW-ARCH) runs once in :func:`resolve_cards`."""
     try:
         return card_identity.order_cards(cards, expect_count, gate=False)
     except card_identity.CardInventoryRefused as exc:
         raise Weg2LaunchRefused(str(exc)) from exc
+
+
+#: HW-P1a: launcher flag dests whose value is a per-card vector the topology
+#: probe counts (POSITIONAL_VECTOR_FLAGS minus the BAR1 window, which is a
+#: window spec "24,PP_0=96" -- BAR1-WINDOW names it -- and the d_reshard
+#: presets, which are not per card).
+_TOPOLOGY_VECTOR_FLAGS = tuple(f for f in POSITIONAL_VECTOR_FLAGS
+                               if f not in ("p_barlink_bar1_window_mib", "d_reshard_presets"))
+#: the --extra-*/--env-* tokens of POSITIONAL_VECTOR_TOKENS the probe counts
+#: (L1.5 has its own probe; --rank-role/-ratio are vectors like the rest)
+_TOPOLOGY_VECTOR_TOKENS = tuple(t for t in POSITIONAL_VECTOR_TOKENS if t != "SGLANG_WEG2_L15_MIB=")
+
+
+def _vector_len(value: str) -> Optional[int]:
+    """Entry count of a per-card vector value; None for a scalar (no comma:
+    one value for every card, e.g. ``SGLANG_MOE_SCRATCH_SLOTS=32``) or an
+    unexpanded shell variable."""
+    v = str(value or "").strip().strip("'\"")
+    if not v or v.startswith("$") or "," not in v:
+        return None
+    return len(v.split(","))
+
+
+def positional_vector_lengths(ns) -> Dict[str, int]:
+    """HW-P1a: every positional per-card vector this launch carries -> its
+    entry count (launcher flags set off their default, and the vector tokens
+    inside --extra-p/-d, --env-p/-d). Only a COUNT -- the values are judged
+    by the inventory check."""
+    out: Dict[str, int] = {}
+    defaults = build_parser().parse_args(["--tree", "/", "--tag", "x"])
+    for dest in _TOPOLOGY_VECTOR_FLAGS:
+        v = getattr(ns, dest, None)
+        if v in (None, "", [], ()) or v == getattr(defaults, dest, None):
+            continue
+        n = _vector_len(v if isinstance(v, str) else ",".join(str(x) for x in v))
+        if n is not None:
+            out["--" + dest.replace("_", "-")] = n
+    for key in ("extra_p", "extra_d", "env_p", "env_d"):
+        blob = str(getattr(ns, key, "") or "")
+        if not blob:
+            continue
+        try:
+            words = shlex.split(blob)
+        except ValueError:
+            words = blob.split()
+        # --env-p/-d carry 'K=V;K=V' -- one assignment per word
+        words = [x for w in words for x in w.split(";") if x]
+        for i, w in enumerate(words):
+            for tok in _TOPOLOGY_VECTOR_TOKENS:
+                if tok.endswith("="):
+                    if not w.startswith(tok):
+                        continue
+                    val = w[len(tok):]
+                elif w == tok:
+                    val = words[i + 1] if i + 1 < len(words) else ""
+                elif w.startswith(tok + "="):
+                    val = w[len(tok) + 1:]
+                else:
+                    continue
+                n = _vector_len(val)
+                if n is not None:
+                    out.setdefault(tok.rstrip("="), n)
+    return out
+
+
+def topology_context(ns, environ: Optional[Mapping[str, str]] = None) -> "_topo.TopologyContext":
+    """HW-P1a: what of THIS launch the topology blockers depend on."""
+    env = os.environ if environ is None else environ
+    prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
+    try:
+        fmt = weg2_form.format_of(prof, str(getattr(ns, "model", "") or ""))
+    except Exception:  # noqa: BLE001 - an unknown format only drops the cut-pin probe
+        fmt = ""
+    return _topo.TopologyContext(
+        profile=prof,
+        weight_format=str(fmt or ""),
+        dual=bool(getattr(ns, "dual_layout", False) or getattr(ns, "dual_share", False)),
+        weight_source=str(getattr(ns, "weg2_weight_source", "") or ""),
+        l15=l15_plan.master_on(env),
+        l15_mib=str(env.get(l15_plan.L15_MIB_ENV, "") or ""),
+        vectors=positional_vector_lengths(ns),
+    )
+
+
+def topology_check_line(ns, cards: Sequence["Card"],
+                        environ: Optional[Mapping[str, str]] = None) -> str:
+    """HW-P1a 1003: the HW-TOPOLOGY line of the launch's card count (from the
+    inventory, not a constant); raises Weg2LaunchRefused BY NAME --
+    HW-TOPOLOGY (N outside 2..8) or HW-COUNT with the CONCRETE blockers of
+    this launch -- when the count is not runnable. N = 3 passes as before."""
+    try:
+        t = _topo.plan_topology(len(cards), topology_context(ns, environ))
+    except _topo.TopologyRefused as exc:
+        raise Weg2LaunchRefused(
+            f"{exc} || visible: " + "; ".join(card_identity.describe(c) for c in cards)) from exc
+    return _topo.topology_line(t)
 
 
 def log_power_limits(state: BootState, cards: List[Card], log, *,
@@ -7900,6 +8065,9 @@ def common_flags(
     # same predicate is the #1358 defect class ("2.16 GiB" had three causes)
     # one flag over.
     weights_cpu_backup: bool = True,
+    # HW-P1a 1003: the launch's card count (argv_p/argv_d pass len(budgets),
+    # one budget per card); the default is the reference rig's 3.
+    n_cards: int = WEG2_CARD_COUNT,
 ) -> List[str]:
     """Flags BOTH groups share.
 
@@ -7950,7 +8118,7 @@ def common_flags(
         "--served-model-name", served_model_name(model),
         # HW-GENERIC 1002 S2 (enabling): one rank per card in order_cards
         # order -- the topology's rank map, "0,1,2" on the N=3 release.
-        "--rank-gpu-id", _topo.rank_gpu_id_csv(WEG2_CARD_COUNT),
+        "--rank-gpu-id", _topo.rank_gpu_id_csv(n_cards),
         "--skip-server-warmup",
         "--kv-cache-dtype", KV_CACHE_DTYPE,
         "--context-length", str(CONTEXT_LENGTH_TOKENS),
@@ -8157,6 +8325,7 @@ def argv_p(
         vision=vision,
         profile=profile,
         weights_cpu_backup=weights_cpu_backup,
+        n_cards=len(budgets),
     ) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
         # the size of P's req_to_token_pool (R-13), which is why it is
@@ -8164,7 +8333,7 @@ def argv_p(
         "--max-running-requests", str(p_bs),
         # HW-GENERIC 1002 S2 (enabling): P = PP<N> over every card (TP1);
         # from the topology, "--pp-size 3" on the N=3 release.
-        "--tp-size", "1", "--pp-size", str(_topo.release_topology(WEG2_CARD_COUNT).p_pp),
+        "--tp-size", "1", "--pp-size", str(_topo.release_topology(len(budgets)).p_pp),
         # #692 MICROBATCH DEPTH, group P only -- group D runs pp_size=1 and a
         # pipeline depth is meaningless there. STATED even at 0 so the argv is
         # an honest statement of what the boot runs, and published ONCE as a
@@ -8585,6 +8754,7 @@ def argv_d(
         weights_cpu_backup=weights_cpu_backup,
         profile=profile,
         vision=vision,
+        n_cards=len(budgets),
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + (
@@ -8627,7 +8797,7 @@ def argv_d(
         "--mamba-radix-cache-strategy", "no_buffer" if disable_overlap else "extra_buffer",
         # HW-GENERIC 1002 S2 (enabling): D = TP<N> (PP1) over every card;
         # from the topology, "--tp-size 3" on the N=3 release.
-        "--tp-size", str(_topo.release_topology(WEG2_CARD_COUNT).d_tp), "--pp-size", "1",
+        "--tp-size", str(_topo.release_topology(len(budgets)).d_tp), "--pp-size", "1",
         # OVERLAP SCHEDULE ON for D -- by ABSENCE of the disable flag, which
         # is the only way to have it: there is no --enable-overlap-schedule.
         # Every gate that forces it off was checked against THIS argv and
@@ -21064,6 +21234,14 @@ def build_parser() -> argparse.ArgumentParser:
              "declare (profile_records_data/<profile>.json 'inventory'). A live inventory that "
              "differs is refused BY NAME (HW-UNCALIBRATED) -- positional measurements of other "
              "cards are never borrowed.")
+    ap.add_argument(
+        "--cards", default="",
+        help="HW-P1a 1003: the NVML indices this launch may use, e.g. '1,0' (the 5090 and one "
+             "3080 of the reference rig). Default: every NVML device. The launcher reads NVML "
+             "directly and ignores CUDA_VISIBLE_DEVICES (it sets that itself per group, by UUID), "
+             "so a bare-metal subset is chosen here; the card ORDER still comes from the card "
+             "properties (order_cards), never from this list. An index NVML does not report, or "
+             "a duplicate, is refused by name (HW-CARDS).")
     ap.add_argument("--debug-hold", choices=["none", "P", "D", "both"], default="none")
     # #1236: --store-min-gib IS DELETED. It was a FLOOR on how much of the host
     # RAM leftover the store tmpfs had to get, and there is no RAM leftover to
@@ -23144,6 +23322,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _ACTIVE_BOOT_STATE = None
     # rename transition (compat_shims): old and new flip-flag spellings both reach the parser
     ns = build_parser().parse_args(_canonical_flags(sys.argv[1:] if argv is None else list(argv)))
+    # HW-P1a 1003: the launch's --cards selection, installed before ANY card
+    # read of this launch (and cleared when absent -- one process, one launch).
+    set_card_selection(getattr(ns, "cards", ""))
     if not ns.teardown:   # rename transition: rig-state dir (compat_shims); a teardown boots nothing
         from sglang._compat_boot import link_state_dir
 
@@ -23473,6 +23654,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     refuse_if_front_unbindable(log, ns.front_host, PORT_FRONT, dry)
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
+    # HW-P1a 1003: the card count is the inventory's; an unrunnable one is
+    # refused here BY NAME with its concrete blockers (N = 3: one line, as before).
+    log(topology_check_line(ns, cards))
     # HW-GENERIC 1002: the profile's positional records and vectors hold only
     # for the inventory they were measured on -- checked once, here, before
     # any of them is read. The reference rig passes silently-identically.
