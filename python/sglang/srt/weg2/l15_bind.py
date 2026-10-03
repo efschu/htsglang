@@ -10,7 +10,7 @@ on kept nodes), mapped to arena page slots, with the generation read once
 from the arena census (ArenaMHAHostPool.slot_gens).
 """
 
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 
@@ -61,6 +61,32 @@ def slots_of_req(req, req_to_token) -> Tuple[int, ...]:
     return slots
 
 
+class L15Unholdable(ValueError):
+    """L15-UNHOLDABLE: a ValueError (the per-rid skip path) carrying a short
+    reason code, so the bind and the tree-candidate probe can NAME why a
+    candidate is not held (27B y8j: "unholdable=4" said nothing)."""
+
+    def __init__(self, why: str, msg: str):
+        super().__init__(msg)
+        self.why = why
+
+
+def unholdable_why(exc: BaseException) -> str:
+    """The reason code of a skip: L15Unholdable.why, else a generic one."""
+    return str(getattr(exc, "why", None) or "error:%s" % type(exc).__name__)
+
+
+def _expected_units(tree_cache, n_raw: int) -> int:
+    """Units a whole-chain match of ``n_raw`` raw tokens returns: one fewer
+    under bigram keys (is_eagle), page-aligned like match_prefix aligns."""
+    units = n_raw - 1 if getattr(tree_cache, "is_eagle", False) else n_raw
+    try:
+        ps = max(1, int(getattr(tree_cache, "page_size", 1) or 1))
+    except (TypeError, ValueError):
+        ps = 1
+    return max(0, units) // ps * ps
+
+
 def match_parked(req, tree_cache):
     """L15-FIX-PARKED: the held span of a PARKED req, from the radix tree.
 
@@ -99,7 +125,7 @@ def match_parked(req, tree_cache):
         )
         span = max(len(toks) - 1, 0)
     if span == 0:
-        raise ValueError(f"parked req {rid!r} has no token span")
+        raise L15Unholdable("no_span", f"parked req {rid!r} has no token span")
     res = tree_cache.match_prefix(
         MatchPrefixParams(
             # array('q'): the tree's stored keys are array('q') and
@@ -113,19 +139,46 @@ def match_parked(req, tree_cache):
     slots = tuple(int(x) for x in (di.tolist() if hasattr(di, "tolist") else (di or ())))
     node = getattr(res, "last_device_node", None)
     if not slots or node is None:
-        raise ValueError(f"parked req {rid!r}: no device span in the tree")
+        raise L15Unholdable("no_device_span",
+                            f"parked req {rid!r}: no device span in the tree")
     if 0 in slots:
-        raise ValueError(f"parked req {rid!r}: padding slot 0 inside the matched span")
+        raise L15Unholdable("pad_slot",
+                            f"parked req {rid!r}: padding slot 0 inside the matched span")
+    if _tree_toks is not None:
+        # L15-UNHOLDABLE: a tip is a WHOLE device chain by construction
+        # (l15_tree_cand.tips_of); a shorter match means the chain the
+        # candidate was built from is not the tree's (27B y8j: bigram
+        # boundary token doubled) -- name it instead of holding something
+        # else or failing on the node's missing anchor.
+        _want = _expected_units(tree_cache, span)
+        if len(slots) < _want:
+            raise L15Unholdable(
+                "partial_match",
+                f"tree tip {rid!r}: matched {len(slots)} of {_want} units")
     try:
         mv = node.component_data[ComponentType.MAMBA].value
     except (AttributeError, KeyError, IndexError, TypeError):
         mv = None
     if mv is None or len(mv) == 0:
-        raise ValueError(f"parked req {rid!r}: matched node has no mamba checkpoint")
+        raise L15Unholdable("no_mamba",
+                            f"parked req {rid!r}: matched node has no mamba checkpoint")
     anchor = int(mv.tolist()[0] if hasattr(mv, "tolist") else mv[0])
     if anchor == 0:
-        raise ValueError(f"parked req {rid!r}: matched anchor is padding slot 0")
+        raise L15Unholdable("anchor_pad",
+                            f"parked req {rid!r}: matched anchor is padding slot 0")
     return slots, node, anchor
+
+
+def tree_probe(req, tree_cache) -> Optional[str]:
+    """L15-UNHOLDABLE: the hold test of one tree candidate, BEFORE the bind:
+    None when ``match_parked`` resolves it, else the reason code. The probe
+    result is what the candidate probe gather (l15_tree_cand.build) agrees
+    on, so every rank drops the same candidates."""
+    try:
+        match_parked(req, tree_cache)
+    except ValueError as exc:
+        return unholdable_why(exc)
+    return None
 
 
 def sleep_epoch(sched) -> int:
@@ -452,6 +505,7 @@ def build_retain_kwargs(
     parked_by_rid = {}  # L15-FIX-PARKED: rid -> (slots, node, anchor)
     covered_nodes: set = set()  # L15-TREE-CAND: id() of nodes on real reqs' chains
     tree_used, tree_covered, tree_unholdable = [], [], []
+    tree_why: Dict[str, str] = {}  # L15-UNHOLDABLE: rid -> reason code
     for req in reqs:
         rid = str(req.rid)
         _is_tree = getattr(req, "l15_tree_tokens", None) is not None
@@ -472,6 +526,7 @@ def build_retain_kwargs(
         except ValueError as exc:
             if _is_tree:
                 tree_unholdable.append(rid)
+                tree_why[rid] = unholdable_why(exc)
             else:
                 skipped.append((rid, str(exc)))
             continue
@@ -562,6 +617,10 @@ def build_retain_kwargs(
         log("L15-TREE-CAND bind used=%d covered=%d unholdable=%d rids=%s"
             % (len(tree_used), len(tree_covered), len(tree_unholdable),
                ",".join(tree_used[:6])))
+    if tree_unholdable:
+        from sglang.srt.weg2.l15_tree_cand import unholdable_line
+
+        log(unholdable_line("bind", tree_unholdable, tree_why))
     candidates = candidates_from(entries)
 
     # L15-12c-C2: host row -> (arena page slot, generation). The pool is the

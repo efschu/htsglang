@@ -92,24 +92,52 @@ def _has_value(node, ctype) -> bool:
         return True
 
 
-def _key_tokens(node) -> List[int]:
+def _key_tokens(node) -> Tuple[List[int], bool]:
+    """(raw token ids of the node's key, is_bigram). A bigram key holds
+    ``units + 1`` raw tokens (RadixKey: "slices share one boundary token");
+    ``limit`` is honoured through ``raw_token_ids`` where the key has it."""
     key = getattr(node, "key", None)
-    ids = getattr(key, "token_ids", None)
+    raw = getattr(key, "raw_token_ids", None)
+    ids = raw() if callable(raw) else getattr(key, "token_ids", None)
     if ids is None:
-        return []
-    return [int(x) for x in (ids.tolist() if hasattr(ids, "tolist") else ids)]
+        return [], False
+    toks = [int(x) for x in (ids.tolist() if hasattr(ids, "tolist") else ids)]
+    return toks, bool(getattr(key, "is_bigram", False))
+
+
+class ChainError(ValueError):
+    """The node keys do not compose to one token chain (bigram boundary
+    token of a child differs from its parent's last token)."""
 
 
 def chain_tokens(node, root) -> List[int]:
-    """Token ids of the chain root -> node (the root excluded)."""
-    parts: List[List[int]] = []
+    """Token ids of the chain root -> node (the root excluded), exactly the
+    raw ids the tree was inserted with.
+
+    L15-UNHOLDABLE (27B y8j 06:31:38, BIGRAM_KEYS=1 / DFLASH): under bigram
+    keys every node's key carries ``units + 1`` raw tokens and a child's FIRST
+    raw token IS its parent's LAST one (RadixKey.__getitem__ slices bigrams
+    ``[start, stop)`` as raw ``[start, stop + 1)``). Concatenating the keys
+    as-is doubled that boundary token at every node edge: the match walked
+    the first node, asked for the child keyed ``(t, t)``, found none and
+    stopped on a node without a mamba value -- "match-census ...
+    MambaComponent:absent", all 4 agreed tips "unholdable" at the bind. The
+    boundary token is kept once."""
+    parts: List[Tuple[List[int], bool]] = []
     cur = node
     while cur is not None and cur is not root:
         parts.append(_key_tokens(cur))
         cur = getattr(cur, "parent", None)
     out: List[int] = []
-    for p in reversed(parts):
-        out.extend(p)
+    for toks, bigram in reversed(parts):
+        if bigram and out and toks:
+            if toks[0] != out[-1]:
+                raise ChainError(
+                    "bigram boundary token %d != parent's last token %d"
+                    % (toks[0], out[-1]))
+            out.extend(toks[1:])
+        else:
+            out.extend(toks)
     return out
 
 
@@ -188,8 +216,13 @@ def local_candidates(tree_cache, limit: int,
     if require_l2:
         tips = [n for n in tips if l2_backed(n, root)]
     out: List[TreeCand] = []
-    for n in tips[:limit]:
-        toks = chain_tokens(n, root)
+    for n in tips:
+        if len(out) >= limit:
+            break
+        try:
+            toks = chain_tokens(n, root)
+        except ChainError:
+            continue  # this tip cannot be matched; the next one may
         if not toks:
             continue
         ek = getattr(getattr(n, "key", None), "extra_key", None)
@@ -263,14 +296,70 @@ def is_tree_req(req) -> bool:
     return getattr(req, "l15_tree_tokens", None) is not None
 
 
+def unholdable_line(at: str, rids: Sequence[str], why: Mapping[str, str]) -> str:
+    """L15-UNHOLDABLE counter line: a count per reason and the reason per
+    candidate (first 8), e.g. ``L15-TREE-CAND unholdable at=bind n=4
+    why=partial_match:4 rids=tree:ab..(partial_match),...``."""
+    counts: Dict[str, int] = {}
+    for r in rids:
+        k = why.get(r, "?")
+        counts[k] = counts.get(k, 0) + 1
+    return ("L15-TREE-CAND unholdable at=%s n=%d why=%s rids=%s"
+            % (at, len(rids),
+               ",".join("%s:%d" % kv for kv in sorted(counts.items())),
+               ",".join("%s(%s)" % (r, why.get(r, "?")) for r in list(rids)[:8])))
+
+
+def agree_holdable(reqs: Sequence[object], probe: Callable[[object], Optional[str]],
+                   gather: Callable[[object], List[object]]
+                   ) -> Tuple[List[object], Dict[str, str]]:
+    """L15-UNHOLDABLE: ONE more gather over D's group -- each rank's hold
+    test of every agreed candidate. Kept: the candidates EVERY rank can hold
+    (a rank-uniform answer: the agreed list is identical everywhere, the
+    votes are the same gathered vectors). Returns (kept reqs, rid -> reason
+    of each dropped one, ``<code>@r<rank>`` of the first refusing rank)."""
+    mine = []
+    for r in reqs:
+        try:
+            why = probe(r)
+        except Exception as exc:  # noqa: BLE001 -- a refusal, not an escape
+            why = "probe_error:%s" % type(exc).__name__
+        mine.append((str(r.rid), why))
+    votes = gather(mine) or []
+    maps = [dict(v or ()) for v in votes]
+    kept, dropped = [], {}
+    for r in reqs:
+        rid = str(r.rid)
+        reason = None
+        for rk, m in enumerate(maps):
+            if rid not in m:
+                reason = "peer_missing@r%d" % rk
+                break
+            if m[rid] is not None:
+                reason = "%s@r%d" % (m[rid], rk)
+                break
+        if reason is None and maps:
+            kept.append(r)
+        else:
+            dropped[rid] = reason or "no_votes"
+    return kept, dropped
+
+
 def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
           env: Optional[Mapping[str, str]] = None, log=None,
-          require_l2: bool = False) -> List[object]:
+          require_l2: bool = False,
+          probe: Optional[Callable[[object], Optional[str]]] = None) -> List[object]:
     """Local walk + the single collective + pseudo reqs; never raises.
 
     The gather is entered by every rank no matter what its local walk did
     (a failed walk votes the empty list), so one rank's exception cannot
     leave the others blocked in the collective.
+
+    ``probe`` (L15-UNHOLDABLE): when given, every rank tests every agreed
+    candidate (``l15_bind.tree_probe``) and a SECOND gather keeps only the
+    ones every rank can hold; the dropped ones are named per candidate in an
+    ``L15-TREE-CAND unholdable at=probe`` line. The second gather is entered
+    by every rank too (an empty vote when the first agreement failed).
     """
     lim = max_n(env)
     local: List[TreeCand] = []
@@ -294,4 +383,18 @@ def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
                "" if err is None else " walk_failed=%s: %s" % (type(err).__name__, err),
                ",".join("%s(%d)" % (RID_PREFIX + c.digest, c.n_tokens)
                         for c in agreed[:6])))
-    return [pseudo_req(c, i, len(agreed)) for i, c in enumerate(agreed)]
+    reqs = [pseudo_req(c, i, len(agreed)) for i, c in enumerate(agreed)]
+    if probe is None:
+        return reqs
+    try:
+        kept, dropped = agree_holdable(reqs, probe, gather)
+    except Exception as exc:  # noqa: BLE001 -- no candidates, never an escape
+        if log is not None:
+            log("L15-TREE-CAND probe failed: %s: %s" % (type(exc).__name__, exc))
+        return []
+    if log is not None:
+        log("L15-TREE-CAND probe agreed=%d holdable=%d unholdable=%d"
+            % (len(reqs), len(kept), len(dropped)))
+        if dropped:
+            log(unholdable_line("probe", list(dropped), dropped))
+    return kept
