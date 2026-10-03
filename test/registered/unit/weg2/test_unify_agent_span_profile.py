@@ -47,12 +47,13 @@ def clean(monkeypatch):
 
 def test_the_registry_rows():
     assert FM.PROFILES["qwen27b"].agent_span is True
-    assert FM.PROFILES["nextflash"].agent_span is False
+    # X-CREDIT-1002 (02.10.): the NF seat released #49 on nextflash
+    assert FM.PROFILES["nextflash"].agent_span is True
     assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][SWITCH] is True
-    assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][SWITCH] is False
+    assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][SWITCH] is True
 
 
-@pytest.mark.parametrize("profile,want", [("qwen27b", True), ("nextflash", False), (None, False)])
+@pytest.mark.parametrize("profile,want", [("qwen27b", True), ("nextflash", True), (None, False)])
 def test_the_default_is_per_profile(clean, profile, want):
     if profile is not None:
         clean.setenv(FM.FORM_ENV, _form_env(profile))
@@ -82,8 +83,10 @@ def test_environ_holds_exactly_one_entry():
     assert src.count(f"    {SWITCH} = ") == 1
 
 
-def test_nextflash_drops_the_held_epoch_and_prices_pre_49(clean):
+def test_span_off_drops_the_held_epoch_and_prices_pre_49(clean):
+    # nextflash runs #49 since X-CREDIT-1002; the off path is the explicit 0
     clean.setenv(FM.FORM_ENV, _form_env("nextflash"))
+    clean.setenv(SWITCH, "0")
     spans = F.SpanLRU()
     text = "x" * 3000
     spans.record_presence(text, 10, prompt_tokens=1000, held_epoch=4)
@@ -93,10 +96,11 @@ def test_nextflash_drops_the_held_epoch_and_prices_pre_49(clean):
 
 
 def test_inflight_credits_only_under_the_span(clean, caplog):
-    """FS on, profile nextflash (span off): the first-content instrument line
+    """FS on, profile nextflash with the span set off: the first-content instrument line
     stays, the in-flight credit does not happen (it would bring #49's held
     price back through record_inflight)."""
     clean.setenv(FM.FORM_ENV, _form_env("nextflash"))
+    clean.setenv(SWITCH, "0")  # X-CREDIT-1002: nextflash's default is on now
     clean.setenv("SGLANG_WEG2_FRONT_SPAN_INFLIGHT", "1")
     with caplog.at_level(logging.INFO):
         front, mid, _end = asyncio.run(_mid_stream_price())
@@ -112,4 +116,6 @@ def test_inflight_credits_under_the_27b_profile(clean):
     front, mid, _end = asyncio.run(_mid_stream_price())
     assert front.spans.agent_span is True
     assert front.counters["span_inflight_credited"] == 1
-    assert mid[2] is True
+    # #59 A (operator 28.09.): the in-flight text is credited only up to a depth known for its
+    # prefix before the leg -- none here -> 0 until the finish; FS acted (the counter above).
+    assert mid[2] is False

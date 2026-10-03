@@ -350,14 +350,14 @@ def test_dry_run_off_is_unchanged_on_moves_the_edge(launcher_env, tmp_path):
     launcher = launcher_env
     _, off = _dry(launcher, tmp_path, "off", 121, ring=False)
     head = [ln for ln in off if "KARTE D(dry, expectation) (H33" in ln]
-    assert head and "Zeilen [133, 137, 134] = SCRATCH <= [121, 63, 49]" in head[0], off
+    assert head and "Zeilen [133, 138, 136] = SCRATCH <= [121, 64, 51]" in head[0], off
     assert not any("REPLAYSSM-SPEC" in ln for ln in off)
     r0 = [ln for ln in off if "FRACTION-SOLVE D(dry, expectation) rang0" in ln][0]
     assert "spec 224 +" in r0
 
     _, on = _dry(launcher, tmp_path, "on", 121, ring=True)
     head = [ln for ln in on if "KARTE D(dry, expectation) (H33" in ln]
-    assert head and "Zeilen [136, 137, 134] = SCRATCH <= [124, 63, 49]" in head[0], on
+    assert head and "Zeilen [136, 138, 136] = SCRATCH <= [124, 64, 51]" in head[0], on
     rebook = [ln for ln in on if "FRACTION-SOLVE D(dry, expectation) REPLAYSSM-SPEC (H64)" in ln]
     assert rebook and "224.3 -> 22.3, 0.0 -> 0.0, 0.0 -> 0.0" in rebook[0], on
     assert "431.7 -> 36.2" in rebook[0] and "GERECHNET" in rebook[0]

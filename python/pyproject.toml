@@ -197,8 +197,8 @@ st-attn = ["setuptools", "torch"]
 vsa = ["setuptools", "torch"]
 
 [project.urls]
-"Homepage" = "https://github.com/sgl-project/sglang"
-"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+"Homepage" = "https://github.com/efschu/fLLiper"
+"Bug Tracker" = "https://github.com/efschu/fLLiper/issues"
 
 [project.scripts]
 sglang = "sglang.cli.main:main"
@@ -238,7 +238,7 @@ root = ".."
 version_file = "sglang/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
-fallback_version = "0.0.0.dev0"
+fallback_version = "0.1.0.dev0"
 
 [[tool.setuptools-rust.ext-modules]]
 target = "sglang.srt.grpc._core"

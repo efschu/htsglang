@@ -3172,6 +3172,15 @@ class PhasePoolModel:
     #: 1.000 GiB on every rank of both boots. Zero = UNFUNDED.
     activation_reserve_mib: float = 0.0
 
+    #: #242: the same post PER STAGE, where the profile measured it per stage
+    #: (``P_ACTIVATION_MIB``). The runtime books the prefill transient per rank
+    #: (``SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB``), so ONE scalar for every
+    #: stage -- the maximum -- over-charged the cheap stages and, once a
+    #: measured stage outgrew the reference, under-charged the dear one (NF
+    #: 28.09.: PP0 4594 MiB with two to four sequences in one chunk, PP1/PP2
+    #: 2945/2941, against a scalar 3697). Empty = the scalar on every stage.
+    activation_reserve_mib_by_stage: Tuple[float, ...] = ()
+
     #: The boot's `gapped corridor holdback` post, MiB per rank. ``None`` falls
     #: back to :attr:`arming_floor_mib`, which is what this model charged
     #: before #1286 -- and the two are NOT the same term: the runtime's post
@@ -3302,7 +3311,9 @@ class PhasePoolModel:
         missing: List[str] = []
         if not self.stage_fixed_mib:
             missing.append("stage_fixed_mib")
-        if float(self.activation_reserve_mib) <= 0.0:
+        if float(self.activation_reserve_mib) <= 0.0 and not any(
+            float(v) > 0.0 for v in self.activation_reserve_mib_by_stage
+        ):
             missing.append("activation_reserve_mib")
         if self.corridor_holdback_mib is None:
             missing.append("corridor_holdback_mib")
@@ -4081,6 +4092,16 @@ def _stage_free_after_residency(
             f"{len(list(counts))} stages; it is a PER-STAGE post (the mirror "
             "sits on the helper stage only) and cannot be broadcast."
         )
+    act_by_stage = tuple(
+        float(x) for x in getattr(model, "activation_reserve_mib_by_stage", ()) or ()
+    )
+    if act_by_stage and len(act_by_stage) != len(list(counts)):
+        raise ValueError(
+            f"activation_reserve_mib_by_stage has {len(act_by_stage)} entries "
+            f"for {len(list(counts))} stages; it is a PER-STAGE post (#242: "
+            "each stage's own measured prefill transient) and cannot be "
+            "broadcast."
+        )
     for r, (n, a) in enumerate(zip(counts, attn_counts)):
         if swing:
             # the swing slab: its layers cost weights and mamba like owned ones
@@ -4101,7 +4122,7 @@ def _stage_free_after_residency(
             * linear
             * int(model.mamba_slots)
             - float(model.speculative_intermediate_mib)
-            - float(model.activation_reserve_mib)
+            - (act_by_stage[r] if act_by_stage else float(model.activation_reserve_mib))
             - (graph_pool[r] if graph_pool else 0.0)
             - (ah_split[r] if ah_split else 0.0)
             - float(model.mamba_precapture_reserve_mib)

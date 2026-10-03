@@ -7,7 +7,8 @@ PROFILE_SWITCH_DEFAULTS), one environ.py entry each.
   test_weg2_dense_repack_outside_pool_27b.py).
 * SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD (H81): the 27B line held the END anchors
   only with SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE=1 (default off, its arms set
-  1), the NF line holds by default. The 27B switch is read as an alias.
+  1), the NF line holds by default. The 27B switch is read as an alias. Since
+  29.09. the qwen27b row holds too (the form every 27B boot ran).
 
 Explicit value > 27B alias > profile default > the NF default (no form).
 """
@@ -38,7 +39,9 @@ def clean(monkeypatch):
     return monkeypatch
 
 
-@pytest.mark.parametrize("profile,want", [("qwen27b", False), ("nextflash", True), (None, True)])
+# 29.09. (registry = the metal form): qwen27b True -- every 27B profile armed
+# the hold through the alias (27b.env INNER_ANCHOR_RELEASE 1).
+@pytest.mark.parametrize("profile,want", [("qwen27b", True), ("nextflash", True), (None, True)])
 def test_carrier_hold_default_per_profile(clean, profile, want):
     if profile is not None:
         clean.setenv("SGLANG_WEG2_FORM", _form_env(profile))
@@ -74,9 +77,14 @@ def test_the_rank_gate_reads_the_resolved_switch(clean):
 def test_every_profile_names_every_switch_and_each_has_one_environ_entry():
     from sglang.srt import environ as env_mod
 
+    from sglang.srt.weg2.form import STATED_SWITCHES
+
     names = {n for d in PROFILE_SWITCH_DEFAULTS.values() for n in d}
+    # SCHALTER-HALBPORT 1002: a STATED switch is carried only by the rows that
+    # state it (unstated = the code default; the qwen27b row stays byte-identical)
+    stated = {e for _, envs_ in STATED_SWITCHES for e in envs_}
     for prof, d in PROFILE_SWITCH_DEFAULTS.items():
-        assert set(d) == names, prof
+        assert set(d) - stated == names - stated, prof
     tree = ast.parse(inspect.getsource(env_mod))
     for name in names:
         hits = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Assign)

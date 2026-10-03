@@ -329,20 +329,28 @@ def test_a_store_short_standstill_within_x_is_recomputed_not_503(metal, caplog):
     assert "W88 Weg2StoreLoadNotProgressing" not in caplog.text, "genuine marker (#995: the recompute line names W88 in prose)"
 
 
-def test_over_x_the_standstill_stays_the_named_w88(caplog):
+def test_over_x_the_standstill_is_the_named_reroute(caplog):
+    # W88 CYCLE (29.09.): over X the store-short standstill falls back BY NAME
+    # to the delivered depth -- the X gate (no exemption) refuses the rest and
+    # re-routes it through P; the veto "never a prefill over X on D" is the
+    # gate's, and no request dies of a read that is short.
     n, delivered, deliverable = SN6S
     s, r = _sched(PrefetchOutcome(delivered, matched=0, deliverable=deliverable, synced=delivered),
                   n, SN6S_X)
     with caplog.at_level(logging.WARNING, logger=sched_mod.logger.name):
         verdict = _stand_still(s, r)
-    assert verdict == "failed" and "W88 Weg2StoreLoadNotProgressing" in caplog.text
-    assert r not in s.waiting_queue, "the user's veto: never a prefill over X"
+    assert verdict == "expired" and "W88-REROUTE" in caplog.text
+    assert "W88 Weg2StoreLoadNotProgressing" not in caplog.text
+    assert r in s.waiting_queue and r.prefetch_deferred is None
 
 
-def test_the_switch_off_restores_the_w88(monkeypatch, caplog):
+def test_the_switch_off_restores_the_reroute(monkeypatch, caplog):
     monkeypatch.setenv("SGLANG_WEG2_STORE_SHORT_TAIL", "0")
     n, delivered, deliverable = METAL_A
     s, r = _sched(PrefetchOutcome(delivered, matched=0, deliverable=deliverable, synced=delivered), n, X)
     with caplog.at_level(logging.WARNING, logger=sched_mod.logger.name):
         verdict = _stand_still(s, r)
-    assert verdict == "failed" and "W88" in caplog.text
+    # W88 CYCLE (29.09.): with the tail off the standstill is no longer a 503
+    # but the named re-route through P (the X gate refuses the remainder)
+    assert verdict == "expired" and "W88-REROUTE" in caplog.text
+    assert "STORE-SHORT TAIL RECOMPUTE" not in caplog.text

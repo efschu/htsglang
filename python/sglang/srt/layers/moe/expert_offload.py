@@ -110,9 +110,11 @@ Design notes
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -127,6 +129,7 @@ logger = logging.getLogger(__name__)
 
 from sglang.srt.debug_utils import host_anon_probe as _hap
 from sglang.srt.layers.moe import pinned_host_ledger
+from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
 from sglang.srt.layers.fwd_timeline import fwd_mark
 from sglang.srt.layers.prefill_timing import StageHead, flush_wait
 from sglang.srt.managers.scheduler_components.decode_host_split import (
@@ -145,6 +148,12 @@ _TRACE_LOCK = threading.Lock()
 # The one layer whose per-chunk H2D volume is logged at INFO (see
 # MoEExpertOffloadCache._log_wave_h2d). Latched to the first layer that reports.
 _H2D_LOG_LAYER = None
+# H107: the one layer whose eager LRU plan is logged at INFO, one line per
+# extend (same latch rule as _H2D_LOG_LAYER).
+_H107_LOG_LAYER = None
+# D-Mini-Extend: the one layer whose device-planned eager step is logged at
+# INFO, one line per forward (same latch rule).
+_EDS_LOG_LAYER = None
 
 
 def write_routing_trace(
@@ -230,6 +239,70 @@ def record_expert_offload_release(
     _RELEASE_TALLY.tensors += max(0, int(tensors))
     if count_layer:
         _RELEASE_TALLY.layers += 1
+
+
+# BOOTZEIT 3 (29.09.): the host-store half of the per-layer presplit, split
+# out of the `[ct-stream-presplit]` seconds (instrument only). open_s is
+# `open_store` -- a fresh store file is ftruncated, first-touched and
+# cudaHostRegister'ed there (shared_pinned_empty, 8-14 % of the loader
+# thread in rc12z30o3); write_s is the D2H of the cold rows into it.
+_STORE_CLOCK = {"open_s": 0.0, "write_s": 0.0, "opens": 0,
+                # BOOTZEIT 3 (29.09.): the repack itself, split (instrument
+                # only): marlin_s = gptq_marlin_moe_repack of w13+w2 (one JIT
+                # launch per expert row), scales_s = marlin_moe_permute_scales,
+                # presplit_s = presplit_expert_offload_after_repack (store
+                # open/write included, see open_s/write_s), rows = expert rows
+                # repacked / rows in the [E] windows.
+                "marlin_s": 0.0, "scales_s": 0.0, "presplit_s": 0.0,
+                "rows_repacked": 0, "rows_total": 0,
+                # BOOTZEIT 4 (29.09.): the per-layer host reclaim at the end
+                # of the presplit, split out of presplit_s: gc_s = gc.collect,
+                # gc_found = the unreachable objects it found (0 = it freed
+                # nothing), trim_s = malloc_trim(0).
+                "gc_s": 0.0, "gc_found": 0, "trim_s": 0.0,
+                # BOOTZEIT 5: how many reclaims ran (the load-end line divides
+                # gc_s by it: seconds per layer is the metal criterion)
+                "reclaims": 0}
+
+
+def presplit_host_reclaim() -> None:
+    """Hand the host memory a presplit layer freed back to the OS (clocked).
+
+    z30w-park (LOAD-PROFILE, 29.09.): the gc.collect here was 7.8-9.6 % of
+    the D loader thread (TP0 48.6 s, TP2 39.1 s) and malloc_trim 1.3-4.0 %,
+    both under the GIL, 48 times per D rank. The loaded [E] stack dies by
+    refcount at ``del``; the collect only helps if it sits in a reference
+    cycle -- gc_found says per boot whether it ever did.
+
+    BOOTZEIT 5: the 7.8-9.6 % undercounted it -- a GIL-holding call gets
+    about one sampler hit per call (41 hits for 48 calls on TP0). Its real
+    price is the fixed per-layer residual (0.43 s PP0, 0.49 s D TP0), a walk
+    over the whole process heap; under ``load_gc_frozen`` (model_loader/
+    load_gc.py) it walks only what the load created. gc_s says which."""
+    import time
+
+    from sglang.srt.environ import PresplitGcMode, envs
+
+    if envs.SGLANG_OPT_LOAD_PRESPLIT_GC.get() == PresplitGcMode.FULL:
+        import gc as _gc
+
+        _t = time.perf_counter()
+        _STORE_CLOCK["gc_found"] += int(_gc.collect())
+        _STORE_CLOCK["gc_s"] += time.perf_counter() - _t
+    _STORE_CLOCK["reclaims"] += 1
+    _t = time.perf_counter()
+    try:
+        import ctypes as _ct
+
+        _ct.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    _STORE_CLOCK["trim_s"] += time.perf_counter() - _t
+
+
+def expert_store_clock() -> dict:
+    """Snapshot of the store clocks (a copy)."""
+    return dict(_STORE_CLOCK)
 
 
 def expert_offload_release_totals() -> ExpertOffloadRelease:
@@ -428,6 +501,79 @@ def plan_expert_waves_np(
         spill_sorted[i : i + scratch] for i in range(0, len(spill_sorted), scratch)
     ]
     return used[res_of_used].tolist(), spill_waves
+
+
+def pool_lru_rows(hot_phys, lru_start: int, row_limit: int) -> Dict[int, int]:
+    """H107: expert -> the LRU row it OWNS, read off a host copy of the pool's
+    ``hot_phys`` map. The pool keeps ``row_key[r] == e`` iff ``hot_phys[e] ==
+    r`` over the LRU rows (#104), and a staged expert never enters ``hot_phys``
+    (``step_reference``: staging lives in the step map only), so a row in
+    ``[lru_start, row_limit)`` carries exactly that expert's bytes. Residents
+    (rows below ``lru_start``) and experts without a row (-1) are not listed."""
+    out: Dict[int, int] = {}
+    for e, r in enumerate(hot_phys):
+        r = int(r)
+        if lru_start <= r < row_limit:
+            out[e] = r
+    return out
+
+
+def eager_lru_static_residency(planner, resident_count: int) -> bool:
+    """H107b: does the planner hold the static identity residency -- expert
+    ``e`` resident at slot ``e`` for ``e`` in ``[0, R)`` -- the layout
+    ``_run_eager_lru`` computes wave 0 in (``slot0 = {e: e}``)? True for no
+    map at all and for the store layout's spelled-out identity maps (Task #47,
+    ``resident_ids == range(R)``, ``resident_slot == {e: e}``); False for a hot
+    set or a load-time layout that moved a resident off its own slot."""
+    ids = getattr(planner, "resident_ids", None)
+    if ids is None:
+        return True
+    R = int(resident_count)
+    if frozenset(int(e) for e in ids) != frozenset(range(R)):
+        return False
+    slot = getattr(planner, "resident_slot", None)
+    return slot is None or all(slot.get(e) == e for e in range(R))
+
+
+def plan_eager_lru_waves(
+    spill_sorted: Sequence[int],
+    lru_row_of: Dict[int, int],
+    scratch_rows: Sequence[int],
+) -> Optional[Tuple[Dict[int, int], List[List[Tuple[int, int]]]]]:
+    """H107 (D extend, 28.09.): the expert-major eager plan that KNOWS the
+    pool's warm LRU rows.
+
+    Before H107 an eager forward under the pool mode fetched every routed
+    spill expert into the scratch rows ``[R, R + scratch)`` -- also the ones
+    that already sat in an LRU row from the decode rounds before (D TP0
+    rc12z26: 12 residents + 98 LRU rows = 110 of 193 experts on the card, a
+    61-token extend still moved 0.20 GiB per layer in 3 waves, ~1.6 s gpu-ms),
+    and it overwrote the decode working set on the way (H23: cold round 1
+    after every extend).
+
+    Returns ``(hits, miss_waves)``: ``hits`` = spill expert -> the LRU row it
+    is read from (no fetch, computed in the fetch-free wave 0 with the
+    residents); ``miss_waves`` = the remaining spill experts, sorted, chunked
+    over the scratch rows that hold NO hit, as ``(expert, row)`` fetch pairs.
+    A hit row is never written during the forward, so no wave can swap an
+    expert out from under a later wave that reads it. None when misses remain
+    but every scratch row holds a hit (the caller keeps the plain plan).
+
+    Which row holds an expert never changes WHAT the forward computes (the
+    apply reads the expert's bytes wherever they are; expert-major lands every
+    pair in its own k-slot and reduces once at the end), so the output is the
+    plain plan's, bit for bit."""
+    hits = {int(e): int(lru_row_of[e]) for e in spill_sorted if e in lru_row_of}
+    held = set(hits.values())
+    writable = [int(r) for r in scratch_rows if int(r) not in held]
+    misses = [int(e) for e in spill_sorted if e not in hits]
+    if misses and not writable:
+        return None
+    width = max(1, len(writable))
+    miss_waves = [
+        list(zip(misses[i : i + width], writable)) for i in range(0, len(misses), width)
+    ]
+    return hits, miss_waves
 
 
 # fnFL2 H20b: below this many routed (token, k) pairs the list path stays --
@@ -3001,6 +3147,118 @@ _WAVE_SLICE = {"pairs": None}
 _PARTIALS_MODE = {"mode": None}
 
 
+class PrefillFetchOverlap:
+    """PFO (#287 Hebel A, 30.09., NF y4k/y4l): the expert-major multi-wave
+    prefill fetches wave k+1 on the rank's prefetch stream while wave k's
+    grouped GEMM runs on the forward's stream.
+
+    MEASURED (FWD-TIMING-PREFILL vs MOE-OFFLOAD-TIMING-PREFILL, PP0 16k): the
+    compute stream's ``moe_fetch`` segment EQUALS the copies' own event sum
+    (y4k forward 1: 1453.5 = 1453.5 ms) -- today nothing overlaps: every wave is
+    fetch-join-apply on one stream (P-MINIFWD-THROTTLE put the joined copies on
+    the forward stream). PP0 16k chunk: 279 waves, 5859-7592 spill experts,
+    1.13-1.48 s of copies (~13 GB/s, the link) against ~1.4 s of other compute.
+
+    THE FORM. The scratch region [R, R+S) is split into two halves of
+    H = S // 2 slots; the spill waves are re-chunked to <= H experts (sorted
+    order kept, so the wave count about doubles); spill wave j uses half
+    (j - 1) % 2 (slot R + half * H + i). Wave w's copy is issued before wave
+    w - 1's apply is enqueued; it waits (``after``) for the apply event of wave
+    w - 2, the last reader of its half, or -- the first use of a half in this
+    forward -- for everything the forward's stream holds at issue time. The
+    forward's stream waits on the copy's event before the wave's apply. Events
+    only: no host sync, no join, no new VRAM (the scratch is SHARED, not grown).
+
+    Byte-identical to the serial form under the default partials table: every
+    (token, k) pair is computed once into its own row whatever the split
+    (see ``_run_waves_expert_major``), and the combine runs once at the end.
+    Not taken: the switch off, stream partials (fp32 sum order would follow
+    the split), H107 slot plans, graph capture, scratch < 2 or one spill wave.
+    The resident wave (w = 0) needs no copy -- spill wave 1 is issued before
+    it, so the first copy of every layer overlaps the resident GEMM."""
+
+    def __init__(self, stream, half: int):
+        self.stream = stream
+        self.half = int(half)
+        self.plans = {}
+        self.fetch_ev = {}
+        self.apply_ev = {}
+        self._cache = None
+        self._waves = None
+
+    def split(self, spill_waves):
+        h = self.half
+        return [g[i:i + h] for g in spill_waves for i in range(0, len(g), h)]
+
+    def begin(self, cache, all_waves) -> None:
+        self._cache = cache
+        self._waves = all_waves
+
+    def _plan(self, w):
+        slot_of_needed, fetch_plan = self._cache.planner.resolve(self._waves[w])
+        if w >= 1:
+            off = ((w - 1) % 2) * self.half
+            if off:
+                R = self._cache.planner.resident_count
+                moved = {e: s + off for e, s in slot_of_needed.items() if s >= R}
+                slot_of_needed = {**slot_of_needed, **moved}
+                fetch_plan = [(e, s + off) for e, s in fetch_plan]
+        return slot_of_needed, fetch_plan
+
+    def ensure(self, w):
+        """Plan wave ``w`` and issue its copy once; returns its slot map (None
+        past the last wave)."""
+        if w >= len(self._waves):
+            return None
+        if w not in self.plans:
+            self.plans[w] = self._plan(w)
+            after = self.apply_ev.get(w - 2) if w >= 3 else None
+            self.fetch_ev[w] = self._cache._fetch(self.plans[w][1], join=False,
+                                                  stream=self.stream, after=after)
+        return self.plans[w][0]
+
+    def wait(self, w) -> None:
+        ev = self.fetch_ev.get(w)
+        if ev is not None:
+            import torch
+
+            torch.cuda.current_stream().wait_event(ev)
+
+    def applied(self, w) -> None:
+        if self.stream is None:
+            return
+        import torch
+
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream())
+        self.apply_ev[w] = ev
+
+
+def prefill_fetch_overlap_on() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP.get())
+
+
+def prefill_fetch_overlap_form(cache, slot_plans, n_spill_waves: int):
+    """The PFO form for one expert-major forward, or None (the serial loop)."""
+    if not prefill_fetch_overlap_on():
+        return None
+    if slot_plans is not None or partials_mode() != "table":
+        return None
+    half = int(getattr(cache, "scratch", 0) or 0) // 2
+    if half < 1 or n_spill_waves < 1:
+        return None
+    stream = None
+    if getattr(cache, "_stream", None) is not None:
+        import torch
+
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        stream = pool_prefetch_stream()
+    return PrefillFetchOverlap(stream, half)
+
+
 def partials_mode() -> str:
     """SGLANG_MOE_OFFLOAD_PARTIALS: 'table' (default) keeps the [T*K, H]
     partials table and combines once at the end (byte-identical to the
@@ -3090,6 +3348,26 @@ def fetch_sync_on() -> bool:
 
         _FETCH_SYNC["on"] = str(os.environ.get("SGLANG_MOE_OFFLOAD_FETCH_SYNC", "0")).strip().lower() in ("1", "true", "on")
     return _FETCH_SYNC["on"]
+
+
+_FORWARD_STREAM_FETCH = {"n": 0}
+
+
+def _note_forward_stream_fetch(layer) -> None:
+    """P-MINIFWD-THROTTLE metal marker: once per process, the first joined
+    fetch that ran on the forward's own stream (count kept for tests)."""
+    n = _FORWARD_STREAM_FETCH["n"] + 1
+    _FORWARD_STREAM_FETCH["n"] = n
+    if n == 1:
+        import logging
+
+        logging.getLogger(__name__).info(
+            "MOE-FETCH-STREAM forward layer=%s: joined expert fetches run on the "
+            "forward's stream, never on the layer's side stream -- a PP send "
+            "parked on a shared hardware queue can no longer stall them "
+            "(P-MINIFWD-THROTTLE 0930)",
+            getattr(layer, "layer_id", "?"),
+        )
 
 
 def _fetch_mode() -> str:
@@ -3283,6 +3561,28 @@ def prepare_capturable_remap(
     return remapped, src_row, num_spill
 
 
+def compare_moe_outputs(got, want) -> Tuple[str, float, float]:
+    """D-Mini-Extend metal check: ``(verdict, max_abs, scale)`` of two MoE
+    outputs. MATCH = bit-identical; MATCH~fp = the same non-finite pattern
+    and every finite difference within 2^-5 of the reference's largest
+    magnitude (fp rounding of another summation order); else MISMATCH."""
+    import torch
+
+    if tuple(got.shape) != tuple(want.shape):
+        return "MISMATCH", float("inf"), 0.0
+    w = want.float()
+    fin = torch.isfinite(w)
+    scale = float(w[fin].abs().max()) if bool(fin.any()) else 0.0
+    if torch.equal(got, want):
+        return "MATCH", 0.0, scale
+    g = got.float()
+    if not torch.equal(torch.isfinite(g), fin):
+        return "MISMATCH", float("inf"), scale
+    max_abs = float((g - w)[fin].abs().max()) if bool(fin.any()) else 0.0
+    tol = max(scale * 2.0**-5, 1e-6)
+    return ("MATCH~fp" if max_abs <= tol else "MISMATCH"), max_abs, scale
+
+
 class MoEExpertOffloadCache:
     """Tensor-level wrapper around ExpertResidencyPlanner for a FusedMoE layer.
 
@@ -3299,6 +3599,13 @@ class MoEExpertOffloadCache:
     _route_note = False
     #: H31b: the Pad+Extra rows this pool layer has NOT loaded yet (DeferredRows)
     _deferred_rows = None
+    #: H107: armed by run_eager_pool for one eager forward (set per instance)
+    _eager_lru_armed = False
+    #: D-Mini-Extend: device-planned eager step on/off, metal checks left, and
+    #: the graph form's id limit (None = not derived yet; set per instance)
+    _pool_eager_device_step = False
+    _pool_eager_device_checks = 0
+    _pool_eager_device_limit = None
 
     #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
     EXPERT_TENSOR_ATTRS = (
@@ -3386,6 +3693,9 @@ class MoEExpertOffloadCache:
         self._pinned: Dict[str, "object"] = {}  # attr -> pinned spill [E-R,...]
         self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
         self._stream = None
+        # P-MINIFWD-THROTTLE: copies a WP8 lookahead left on ``_stream``
+        # (join=False) that the next joined fetch still has to make visible.
+        self._side_copies_in_flight = False
         self._installed = False
         # WP8 lookahead: what each scratch slot currently holds (slot -> expert),
         # written by every fetch on every route so a sticky resolve can trust
@@ -3409,6 +3719,10 @@ class MoEExpertOffloadCache:
         self._pool_srcs = None
         self._pool_dsts = None
         self._pool_view_holders = []
+        # KV-STAGE warm refill: experts the last seat-row shrink sent to the
+        # store (hottest first) and the rows the grows refilled with them.
+        self._weg2_seat_recall = []
+        self._weg2_seat_warmed = 0
         # Speculative expert prefetch (SGLANG_MOE_POOL_PREFETCH=1, default off):
         # own step buffers, because the gather list the side stream copies from
         # must survive while the real step writes the layer's normal buffers.
@@ -3416,6 +3730,11 @@ class MoEExpertOffloadCache:
         self._pool_pf_begin = None  # main -> side: x_L is ready
         self._pool_pf_done = None  # side -> main: the predicted rows are in
         self._pool_pf_armed = False
+        # #276 heat record (SGLANG_DEBUG_MOE_HEAT, default off): the device
+        # histogram of the captured step's routed ids (layers/moe/pool_heat).
+        # None = off: prepare_pool then adds no op to the captured step.
+        self._pool_heat = None
+        self._pool_heat_ones = None
         # H95: (n_ids -> waves) the captured steps of this layer were built
         # with, for the capture log line and the demand probe.
         self._pool_waves_seen: Dict[int, int] = {}
@@ -3423,6 +3742,12 @@ class MoEExpertOffloadCache:
         # phase seat count (weg2/d_seat_vram.py); 0 = the bank of H95 B. Set
         # by the presplit that allocated the [R+C+X] buffer.
         self.seat_rows = int(getattr(layer, "_weg2_seat_rows", 0) or 0)
+        # D-TRANSIENT-LEND: of the seat rows, the virtual head only a lend
+        # turns ON (never a capture floor, never a stage cell)
+        self.seat_lend_head = int(getattr(layer, "_weg2_seat_lend_head", 0) or 0)
+        # #251c: the seat rows the step being CAPTURED may count as ON (set by
+        # pool_waves per captured forward; 0 = the live count)
+        self._pool_capture_on = 0
         from sglang.srt.environ import envs as _envs
 
         self.lookahead_sticky = int(_envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get()) > 0
@@ -3545,6 +3870,19 @@ class MoEExpertOffloadCache:
             if envs.SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR.get()
             else self._wave_order
         )
+        # H107: the expert-major eager forward reads warm LRU rows instead of
+        # fetching them again (SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS).
+        self._pool_eager_lru_hits = bool(envs.SGLANG_OPT_MOE_POOL_EAGER_LRU_HITS.get())
+        # D-Mini-Extend: small eager forwards take the decode's device step
+        # (SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP) + its metal check budget
+        self._pool_eager_device_step = bool(envs.SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP.get())
+        self._pool_eager_device_checks = max(
+            0, int(envs.SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK.get() or 0)
+        )
+        # per eager forward: armed by run_eager_pool, the hit rows the sync
+        # stamps as used (row -> expert)
+        self._eager_lru_armed = False
+        self._eager_lru_used: Dict[int, int] = {}
 
         # --- Stage-3 CUDA-graph-capturable path ----------------------------
         # Built by install_capturable_buffers() (after install(), and after any
@@ -3799,7 +4137,8 @@ class MoEExpertOffloadCache:
             if not nan_guard_on():
                 return
             import os
-            if os.environ.get("SGLANG_NAN_GUARD_WAVE", "1").strip() in ("0", "off"):
+            # LEISTUNGSSCHALTER class (d) (01.10.): a diagnostic, default OFF -- =1 arms it
+            if os.environ.get("SGLANG_NAN_GUARD_WAVE", "0").strip() in ("", "0", "off"):
                 return  # the per-slice .item() completes each GEMM before the next fetch -- hides a race
             import torch
             hs = getattr(combine_out, "hidden_states", combine_out)
@@ -3829,7 +4168,8 @@ class MoEExpertOffloadCache:
             if not nan_guard_on():
                 return
             import os
-            if os.environ.get("SGLANG_NAN_GUARD_FETCH", "1").strip() in ("0", "off"):
+            # LEISTUNGSSCHALTER class (d) (01.10.): a diagnostic, default OFF -- =1 arms it
+            if os.environ.get("SGLANG_NAN_GUARD_FETCH", "0").strip() in ("", "0", "off"):
                 return  # the per-fetch check joins copy and compute -- a race hides behind it
             import torch
             slots = [int(sl) for _e, sl in fetch_plan]
@@ -3852,7 +4192,7 @@ class MoEExpertOffloadCache:
             import logging
             logging.getLogger(__name__).debug("[nan-guard] fetched check skipped: %s", exc)
 
-    def _fetch(self, fetch_plan, join: bool = True):
+    def _fetch(self, fetch_plan, join: bool = True, stream=None, after=None):
         """Async H2D-copy each wave's SPILL experts into their scratch slots,
         then join the copy stream before compute reads them. ``fetch_plan`` is
         (spill_expert_id, scratch_slot); the spill pool is indexed by
@@ -3864,11 +4204,19 @@ class MoEExpertOffloadCache:
         pool at all -- its row is a zero-copy view of a PEER's shared segment,
         resolved through ``self._cold_tier``. The copy itself is the same
         ``copy_`` over the same link; only the source address differs, which is
-        the whole design (the storage moved, the transport did not)."""
+        the whole design (the storage moved, the transport did not).
+
+        PFO (#287 Hebel A, 30.09.): ``stream`` given = the copies run on THAT
+        stream (the rank's one prefetch stream), ordered behind ``after`` (the
+        event of the apply that last read these slots) or, without one, behind
+        everything the forward's stream holds now; an event recorded behind the
+        copies is RETURNED and the caller's compute stream waits on it before
+        it reads the slots. No join here, no host sync. Without ``stream``
+        nothing below changes."""
         import torch
 
         if not fetch_plan:
-            return
+            return None
         for expert_id, slot in fetch_plan:
             self._scratch_holds[slot] = expert_id
         R = self.resident_count
@@ -3913,8 +4261,11 @@ class MoEExpertOffloadCache:
                 if capturing:
                     dst.index_copy_(0, slots_t, torch.index_select(pool_dev, 0, rows_t))
                 else:
+                    # the stream these copies run on: the side stream inside
+                    # its context, the forward's own on the joined path
                     gather_rows_into(dst, slots_t, pool_dev, rows_t,
-                                     ring_rows=GATHER_RING_ROWS, stream=self._stream)
+                                     ring_rows=GATHER_RING_ROWS,
+                                     stream=torch.cuda.current_stream())
                 moved += dst[0].numel() * dst.element_size() * len(rows)
 
         def _copies():
@@ -3952,15 +4303,54 @@ class MoEExpertOffloadCache:
                     dst[slot].copy_(spill[row], non_blocking=True)
                     moved += per_expert
 
+        # #239 S3f PR2: inside a timed prefill forward's miss window (D, record
+        # on) these rows and one clock span over the copies + join pair up as
+        # the miss record's numerator and denominator (a no-op context
+        # outside). Device events only -- no host read. join=False (lookahead)
+        # is a prefetch, not this forward's miss. Entered/exited around the
+        # unchanged copy block rather than re-indenting it.
+        miss_span = (_miss_cost.host_fetch_span(len(fetch_plan))
+                     if join and _miss_cost.window_open() else nullcontext())
+        miss_span.__enter__()
+        pfo_event = None
         if self._stream is None:
             # No CUDA context (desk test): same copies, same order, no streams.
             _copies()
-        else:
-            self._stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._stream):
+        elif stream is not None:
+            # PFO: the copies on the given stream, WAR-ordered by event
+            if after is not None:
+                stream.wait_event(after)
+            else:
+                stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
                 _copies()
-            if join:
-                torch.cuda.current_stream().wait_stream(self._stream)
+            pfo_event = torch.cuda.Event()
+            pfo_event.record(stream)
+        else:
+            if join and not self._side_copies_in_flight:
+                # P-MINIFWD-THROTTLE (30.09.): a JOINED fetch runs on the
+                # forward's own stream. The side-stream round trip bought no
+                # overlap (the side stream waited for the forward, the forward
+                # for the side stream) but put every wave on one of this
+                # rank's ~30 per-layer streams, which share the device's 8
+                # hardware queues (CUDA_DEVICE_MAX_CONNECTIONS, engine.py) with
+                # the PP send stream. An isend the next stage has not received
+                # yet parks on its queue, and every command queued behind it
+                # waits: y3v/y3w/y3u PP0 16k chunks right behind a lone rest
+                # forward stalled until PP1 took the rest's hidden states
+                # (fetch 312-359 us per expert instead of 193, +0.9-1.26 s,
+                # 11 of 11; stall = PP1's wait - a fixed forward offset).
+                _note_forward_stream_fetch(self.layer)
+                _copies()
+            else:
+                self._stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._stream):
+                    _copies()
+                if join:
+                    torch.cuda.current_stream().wait_stream(self._stream)
+                # WP8 lookahead copies stay in flight until a joined fetch
+                # of this cache waits for them (the branch above never does)
+                self._side_copies_in_flight = not join
             if fetch_sync_on():
                 # Task #49 probe (fn8ah 20.09.): a device-side wait is the
                 # design; a host-side synchronize here is the DISCRIMINATOR --
@@ -3972,6 +4362,8 @@ class MoEExpertOffloadCache:
             _g(fetch_plan)
         self.planner.stats.h2d_bytes += moved
         self.planner.stats.remote_h2d_bytes += remote_moved
+        miss_span.__exit__(None, None, None)
+        return pfo_event
 
     def _build_lut(self, slot_of_needed, dtype, device):
         """Global expert id -> slot LUT for one wave; -1 for every id the wave
@@ -4285,6 +4677,9 @@ class MoEExpertOffloadCache:
                 device, E, rows, R, staging, hot_slot_of, host_row, demand=demand
             )
         self._pool_buffers = allocate_step_buffers(device, E, width)
+        from sglang.srt.layers.moe import pool_heat
+
+        self._pool_heat, self._pool_heat_ones = pool_heat.allocate(device, E, width)
         self._pool_srcs = [device_view_of_pinned(self._pinned[a]) for a in attrs]
         self._pool_dsts = [self._resident[a] for a in attrs]
         self._pool_view_holders = [self._pinned[a] for a in attrs]
@@ -4344,6 +4739,10 @@ class MoEExpertOffloadCache:
             step_row_demand,
         )
 
+        # #251c: a D KV stage form moves stage rows from the scratch into the
+        # seat rows (OFF at boot); the captured step counts the fewest rows ON
+        # of any phase this batch can replay in (d_seat_vram.capture_floor_rows)
+        self._pool_capture_on = self._stage_capture_rows(int(n_ids))
         cap = int(envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.get() or 0)
         if cap < 2:
             return 1
@@ -4352,9 +4751,24 @@ class MoEExpertOffloadCache:
         t = self._pool_tables
         # H95c: C of the phase with EVERY seat occupied (seat rows OFF) --
         # the capture happens in that form, a phase with rows ON needs fewer
-        C = pool_row_capacity(t)
+        C = pool_row_capacity(t, getattr(self, "_pool_capture_on", 0))
         need = pool_waves_for(int(n_ids), t.num_experts, resident_count(t), C)
         waves = min(need, cap)
+        if need > cap and int(getattr(self, "seat_rows", 0) or 0) > 0:
+            # y6n (01.10. 21:07:02, TP2): the step refuses this capture right
+            # after ('Step ids exceed the LRU rows plus the staging rows') --
+            # name the rank's own numbers once, the ones the launcher's
+            # WELLENBODEN (#239 S3g) had to price: C = LRU + staging + the
+            # capture floor of the seat rows (#251 CAPTURE-FLOOR, the top stage)
+            logging.getLogger(__name__).error(
+                "MoE expert pool layer %s (H95/#251c) CAPTURE-SHORT: demand min(ids, E-R)=%d "
+                "> %d wave(s) x C=%d (C counts %d capture-floor row(s) ON of %d seat rows, "
+                "lend head %d) for a captured step of %d ids -- the launcher's wave floor "
+                "priced more rows ON at the top KV stage than this rank's cells fund",
+                getattr(self.layer, "layer_id", None),
+                step_row_demand(int(n_ids), t.num_experts, resident_count(t)), cap, C,
+                int(getattr(self, "_pool_capture_on", 0) or 0), int(self.seat_rows),
+                int(getattr(self, "seat_lend_head", 0) or 0), int(n_ids))
         if self._pool_waves_seen.get(int(n_ids)) != waves:
             self._pool_waves_seen[int(n_ids)] = waves
             lid = getattr(self.layer, "layer_id", None)
@@ -4362,11 +4776,38 @@ class MoEExpertOffloadCache:
                 logging.getLogger(__name__).info(
                     "MoE expert pool layer %s (H95): captured step of %d ids -> %d "
                     "wave(s); demand bound min(ids, E-R)=%d, C=LRU+staging=%d, "
-                    "SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=%d",
+                    "SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=%d%s",
                     lid, int(n_ids), waves,
                     step_row_demand(int(n_ids), t.num_experts, resident_count(t)), C, cap,
+                    (" (#251 capture floor: %d stage/seat rows ON)" % self._pool_capture_on)
+                    if self._pool_capture_on else "",
                 )
         return waves
+
+    def _stage_capture_rows(self, n_ids: int) -> int:
+        """#251c: the seat rows ON that the captured step of ``n_ids`` routed
+        ids may count on (``d_seat_vram.capture_floor_rows``); 0 on a layer
+        without seat rows or without a KV stage form."""
+        seat_rows = int(getattr(self, "seat_rows", 0) or 0)
+        # D-TRANSIENT-LEND: the lend head is never ON at the wake -- the
+        # captured waves may not count it
+        seat_rows -= int(getattr(self, "seat_lend_head", 0) or 0)
+        if seat_rows <= 0:
+            return 0
+        from sglang.srt.weg2 import d_seat_vram as _dsv
+
+        per_seat = None
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            sa = get_server_args()
+            spec = getattr(sa, "speculative_algorithm", None)
+            verify = getattr(sa, "speculative_num_draft_tokens", None) if spec else None
+            k = int(getattr(self.layer, "top_k", 0) or 0)
+            per_seat = max(1, int(verify or 1)) * k if k > 0 else None
+        except Exception:  # noqa: BLE001 -- no runtime context: no floor
+            per_seat = None
+        return min(seat_rows, _dsv.capture_floor_rows(int(n_ids), per_seat))
 
     def set_seat_rows_on(self, k: int, *, device_write: bool) -> int:
         """H95c: this phase's k of the layer's X seat rows are ON
@@ -4376,9 +4817,67 @@ class MoEExpertOffloadCache:
             if int(k) != 0:
                 raise ValueError("H95c: seat rows on a layer without seat rows / pool")
             return 0
+        from sglang.srt.environ import envs
         from sglang.srt.layers.moe.expert_pool_device import set_seat_rows_on
 
-        return set_seat_rows_on(self._pool_tables, int(k), device_write=device_write)
+        # D-MEM-SCHED (29.09.): a shrink moves the dropped rows' experts into
+        # the coldest kept rows first (Not-Aus: SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS)
+        mover = None
+        if (device_write and getattr(self, "_resident", None)
+                and not envs.SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS.get()):
+            mover = functools.partial(MoEExpertOffloadCache._move_bank_rows, self)
+        # KV-STAGE warm refill (01.10.): a shrink remembers the experts it sent
+        # to the store (hottest first); the grow that follows hands them their
+        # rows back at once instead of one cold miss each. This method is bound
+        # onto test doubles too (types.MethodType); only a real cache warms.
+        warm = (device_write and isinstance(self, MoEExpertOffloadCache)
+                and envs.SGLANG_WEG2_D_SEAT_WARM_REFILL.get())
+        departed = [] if warm else None
+        old = set_seat_rows_on(self._pool_tables, int(k), device_write=device_write,
+                               move_rows=mover, departed_out=departed)
+        if warm:
+            self._seat_warm_step(int(k), old, departed)
+        return old
+
+    def _seat_warm_step(self, k: int, old: int, departed: List[int]) -> None:
+        """KV-STAGE warm refill: remember on a shrink, refill on a grow. The
+        refill is the miss path's own copy (``warm_lru_local``: free rows,
+        pinned store rows, current stream, between rounds) -- no new VRAM."""
+        recall = self._weg2_seat_recall
+        if k < old:
+            seen = set(departed)
+            self._weg2_seat_recall = (departed + [e for e in recall if e not in seen])[
+                : max(1, int(self.seat_rows)) * 2]
+            return
+        if k > old and recall:
+            warmed_rows = self.warm_lru_local(recall, limit=k - old)
+            self._weg2_seat_warmed += warmed_rows
+            self._weg2_seat_recall = []
+
+    def _move_bank_rows(self, moves) -> None:
+        """Copy bank rows ``src -> dst`` in every row buffer the fetch writes
+        (``self._resident``: w13/w2 and their scales, [R+C+X, ...]),
+        stream-ordered like the fetch; the pairs' rows are disjoint (dropped
+        vs kept), so one index_copy each. A buffer too short for a row is a
+        stop, never a skip -- the tables would point at stale bytes."""
+        import torch
+
+        if not moves:
+            return
+        top = max(max(s, d) for s, d in moves)
+        src = dst = None
+        copied = 0
+        for attr, buf in self._resident.items():
+            if int(buf.shape[0]) <= top:
+                raise RuntimeError(
+                    "D-MEM-SCHED: bank buffer %s has %d rows, a coldest-first move needs row %d"
+                    % (attr, int(buf.shape[0]), top))
+            if src is None:
+                src = torch.tensor([s for s, _ in moves], dtype=torch.long, device=buf.device)
+                dst = torch.tensor([d for _, d in moves], dtype=torch.long, device=buf.device)
+            buf.index_copy_(0, dst, buf.index_select(0, src))
+            copied += len(moves) * (buf.numel() // int(buf.shape[0])) * buf.element_size()
+        self._weg2_bank_bytes_copied = int(getattr(self, "_weg2_bank_bytes_copied", 0)) + copied
 
     def _pool_zero_row(self):
         """H95: a [1] device view of the row that masked wave lanes point at.
@@ -4471,7 +4970,7 @@ class MoEExpertOffloadCache:
         armed = clock.armed
         with clock.span("pool.step") if armed else nullcontext():
             step(self._pool_tables, ids, self._pool_buffers, spill=spill, wave=True,
-                 waves=waves)
+                 waves=waves, capture_rows_on=getattr(self, "_pool_capture_on", 0))
         with clock.span("pool.fetch") if armed else nullcontext():
             copy_rows(
                 self._pool_srcs,
@@ -4504,6 +5003,12 @@ class MoEExpertOffloadCache:
             # the graph, and the real plan below sees them as ordinary hits.
             self._pool_pf_armed = False
             torch.cuda.current_stream().wait_event(self._pool_pf_done)
+        heat = getattr(self, "_pool_heat", None)
+        if heat is not None:
+            # #276: wave 1 sees every lane of the step; on the device, no host read
+            from sglang.srt.layers.moe import pool_heat
+
+            pool_heat.count(heat, self._pool_heat_ones, flat, self.num_local_experts)
         # 20.09. (fn8u, Task #52): the pool step and the row fetch are timed
         # as their own clock families, so a decode round's split names the
         # host->device expert traffic apart from compute and collectives.
@@ -4516,9 +5021,11 @@ class MoEExpertOffloadCache:
         armed = clock.armed
         with clock.span("pool.step") if armed else nullcontext():
             if spill or waves != 1:
-                step(self._pool_tables, flat, self._pool_buffers, spill=spill, waves=waves)
+                step(self._pool_tables, flat, self._pool_buffers, spill=spill, waves=waves,
+                     capture_rows_on=getattr(self, "_pool_capture_on", 0))
             else:
-                step(self._pool_tables, flat, self._pool_buffers)
+                step(self._pool_tables, flat, self._pool_buffers,
+                     capture_rows_on=getattr(self, "_pool_capture_on", 0))
         with clock.span("pool.fetch") if armed else nullcontext():
             copy_rows(
                 self._pool_srcs,
@@ -4588,15 +5095,185 @@ class MoEExpertOffloadCache:
 
     def run_eager_pool(self, dispatch_output, apply_fn):
         """An eager forward (extend, uncaptured shape) under the pool mode, the
-        FusedMoE branch in one place: record the rows run_waves writes, split
-        in the pool's eager order (SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR,
+        FusedMoE branch in one place.
+
+        D-Mini-Extend (SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP): a forward whose
+        routed ids fit the widest captured decode step runs that step's
+        device plan (``_run_eager_device_step``) -- the misses are the same,
+        the host plan and the per-layer syncs are gone. Everything else, and
+        every forward with a host-side routing instrument, plans on the host
+        (``_run_eager_host_plan``)."""
+        n_ids = int(dispatch_output.topk_output.topk_ids.numel())
+        waves, _reason = self.eager_device_waves(n_ids)
+        if waves:
+            return self._run_eager_device_step(dispatch_output, apply_fn, waves)
+        return self._run_eager_host_plan(dispatch_output, apply_fn)
+
+    def eager_device_limit(self) -> int:
+        """D-Mini-Extend: the most routed ids an eager forward may hand the
+        device step -- the widest CAPTURED decode step of this boot (graph
+        form: max graph bs x MTP verify rows x top-k), never above the step
+        buffers' width. No new width, no new kernel, no VRAM."""
+        if self._pool_eager_device_limit is None:
+            width = int(self._pool_buffers.gather_src.shape[0])
+            graph = self._pool_max_step_ids()
+            self._pool_eager_device_limit = width if graph is None else min(width, int(graph))
+        return int(self._pool_eager_device_limit)
+
+    def eager_device_waves(self, n_ids: int) -> Tuple[int, str]:
+        """D-Mini-Extend: ``(waves, reason)`` -- the device step's wave count
+        for an eager forward of ``n_ids`` routed ids, or 0 and why the host
+        plans it. The bound is the captured step's own: ``min(ids, E - R) <=
+        waves x (LRU + staging)`` over the rows ON now, with ``waves`` <=
+        SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES (1 when off). Host ints only."""
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_pool_device import (
+            pool_row_capacity,
+            pool_waves_for,
+            resident_count,
+        )
+
+        if not self._pool_eager_device_step:
+            return 0, "switch_off"
+        if not self._pool_ready:
+            return 0, "pool_not_ready"
+        if n_ids <= 0:
+            return 0, "empty"
+        if (
+            self._route_note
+            or getattr(self, "_router_stats", None) is not None
+            or getattr(self, "_heat", None) is not None
+            or (getattr(self, "_hot_enabled", False) and not getattr(self, "_hot_frozen", True))
+        ):
+            return 0, "host_instrument"  # they read the routing on the host
+        if n_ids > self.eager_device_limit():
+            return 0, "over_graph_form"
+        t = self._pool_tables
+        need = pool_waves_for(n_ids, t.num_experts, resident_count(t), pool_row_capacity(t, 0))
+        cap = max(1, int(envs.SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES.get() or 0))
+        if need > cap:
+            return 0, "waves_cap"
+        return need, "device"
+
+    def _run_eager_device_step(self, dispatch_output, apply_fn, waves: int):
+        """D-Mini-Extend: the eager forward on the decode graph's device plan
+        (``prepare_pool`` / ``run_pool_waves``), run eagerly -- plan and row
+        copies on the device, the LRU updated by the step's own rule, nothing
+        republished from the host. Deferred rows land first and the resume
+        warm drops this layer, exactly as on the host plan."""
+        self.land_deferred_rows()  # H31b: the layout is the full one before the step
+        resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
+        check = self._pool_eager_device_checks > 0
+        saved = None
+        if check:
+            # the reference must see the MoE input this forward saw
+            scale_in = dispatch_output.hidden_states_scale
+            saved = dispatch_output._replace(
+                hidden_states=dispatch_output.hidden_states.clone(),
+                hidden_states_scale=(
+                    scale_in.clone() if hasattr(scale_in, "clone") else scale_in
+                ),
+            )
+        prev_on = getattr(self, "_pool_capture_on", 0)
+        self._pool_capture_on = 0  # not a capture: the rows ON now
+        try:
+            if waves > 1:
+                out = self.run_pool_waves(dispatch_output, apply_fn, waves)
+            else:
+                topk_output = dispatch_output.topk_output
+                remapped = self.prepare_pool(topk_output.topk_ids)
+                out = apply_fn(
+                    dispatch_output._replace(
+                        topk_output=topk_output._replace(topk_ids=remapped)
+                    )
+                )
+        finally:
+            self._pool_capture_on = prev_on
+        topk_ids = dispatch_output.topk_output.topk_ids
+        self._note_eager_device_step(int(topk_ids.shape[0]), int(topk_ids.numel()), waves)
+        if check:
+            self._pool_eager_device_checks -= 1
+            out = self._check_eager_device_step(saved, apply_fn, out, waves)
+        return out
+
+    def _note_eager_device_step(self, tokens: int, n_ids: int, waves: int) -> None:
+        """Metal marker, one line per forward on one representative layer."""
+        import logging
+
+        global _EDS_LOG_LAYER
+
+        self._eager_device_steps = int(getattr(self, "_eager_device_steps", 0)) + 1
+        layer_id = getattr(self.layer, "layer_id", "?")
+        if _EDS_LOG_LAYER is None:
+            _EDS_LOG_LAYER = layer_id
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == _EDS_LOG_LAYER else logging.DEBUG,
+            "EAGER-DEVICE-STEP layer %s: T=%d ids=%d waves=%d limit=%d n=%d (the decode's "
+            "device-planned pool step on an eager forward: no host plan, no per-layer "
+            "sync; SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP)",
+            layer_id, tokens, n_ids, waves, self.eager_device_limit(),
+            self._eager_device_steps,
+        )
+
+    def _check_eager_device_step(self, saved, apply_fn, out, waves: int):
+        """SGLANG_DEBUG_MOE_POOL_EAGER_DEVICE_CHECK: the same forward on the
+        plain host plan (H107 off -- every spill expert fetched fresh from
+        the host store, no device table trusted) is the reference. MATCH
+        (bit-identical) or MATCH~fp (fp rounding, e.g. a multi-wave
+        reference) logs; anything else stops the rank by name. Returns the
+        device result (a copy: the reference's apply may reuse buffers)."""
+        import logging
+
+        got = out.hidden_states.clone()
+        lru = self._pool_eager_lru_hits
+        self._pool_eager_lru_hits = False
+        try:
+            ref = self._run_eager_host_plan(saved, apply_fn)
+        finally:
+            self._pool_eager_lru_hits = lru
+        verdict, max_abs, scale = compare_moe_outputs(got, ref.hidden_states)
+        layer_id = getattr(self.layer, "layer_id", "?")
+        tokens = int(saved.topk_output.topk_ids.shape[0])
+        if verdict == "MISMATCH":
+            raise RuntimeError(
+                f"EAGER-DEVICE-STEP MISMATCH layer {layer_id}: T={tokens} waves={waves} "
+                f"max_abs={max_abs:.6g} scale={scale:.6g} -- the device-planned eager "
+                f"step's MoE output differs from the host plan's beyond fp rounding; "
+                f"SGLANG_OPT_MOE_POOL_EAGER_DEVICE_STEP=0 restores the host plan"
+            )
+        logging.getLogger(__name__).info(
+            "EAGER-DEVICE-STEP CHECK layer %s: T=%d waves=%d verdict=%s max_abs=%.3g "
+            "scale=%.3g (reference: plain host plan, fresh fetch)",
+            layer_id, tokens, waves, verdict, max_abs, scale,
+        )
+        return out._replace(hidden_states=got)
+
+    def _run_eager_host_plan(self, dispatch_output, apply_fn):
+        """The host-planned eager forward: record the rows run_waves writes,
+        split in the pool's eager order (SGLANG_OPT_MOE_POOL_EAGER_EXPERT_MAJOR,
         H12: expert-major -- each spill expert fetched once and held by one
         row), then republish those rows to the device tables."""
         self.land_deferred_rows()  # H31b: run_waves plans with every resident row
+        resume_warm().eager_reached(self)  # RW: an eager layer never waits for the warm
         self.begin_eager_pool()
-        out = self.run_waves(
-            dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
+        # H107: static residency and expert-major only (a hot resident set or a
+        # token-major split keep the plain plan). H107b: "static" is the
+        # identity [0,R) at slot == id, not "no map" -- the store layout
+        # (Task #47) spells that identity out as maps, and the NF D pool runs
+        # on the store, so `resident_ids is None` kept H107 off on the metal
+        # (bridge 28.09. 19:38-19:58: 0x 'H107 EAGER-LRU').
+        self._eager_lru_armed = (
+            self._pool_eager_lru_hits
+            and self._pool_ready
+            and self._pool_eager_wave_order == "expert"
+            and eager_lru_static_residency(self.planner, self.resident_count)
         )
+        try:
+            out = self.run_waves(
+                dispatch_output, apply_fn, lookahead=None, order=self._pool_eager_wave_order
+            )
+        finally:
+            self._eager_lru_armed = False
         self.sync_pool_from_host()
         return out
 
@@ -4604,12 +5281,28 @@ class MoEExpertOffloadCache:
         """Before an eager (prefill / uncaptured) forward under the pool mode:
         run_waves will rewrite scratch rows; record exactly those."""
         self._scratch_holds.clear()
+        self._eager_lru_used.clear()
 
     def sync_pool_from_host(self):
         """After that eager forward: the device tables take the host's truth
-        for the LRU rows run_waves wrote; the rest of the LRU region is free."""
+        for the LRU rows run_waves wrote; the rest of the LRU region is free.
+        Inside an ``eager_pool_sync_scope`` (y6o) the republish is queued and
+        runs at the end of the model's layer loop instead of draining the
+        stream here."""
         if not self._pool_ready:
             return
+        # H107: a row the pass READ an expert from keeps it and is stamped as
+        # used, exactly like a row it wrote (one owner per expert holds: a hit
+        # row is never written in the same pass)
+        holds = dict(self._eager_lru_used)
+        holds.update(self._scratch_holds)
+        if _EAGER_SYNC.defer(self, holds, len(self._scratch_holds)):
+            return
+        self._finish_pool_sync(holds, len(self._scratch_holds))
+
+    def _finish_pool_sync(self, holds, n_scratch: int):
+        """The republish itself (device reads): the sticky error, the reports,
+        and ``sync_tables`` over ``holds`` (row -> expert of the eager pass)."""
         import logging
 
         from sglang.srt.layers.moe.expert_pool_device import (
@@ -4635,9 +5328,8 @@ class MoEExpertOffloadCache:
         from sglang.srt.environ import envs
 
         keep = envs.SGLANG_OPT_MOE_POOL_KEEP_LRU.get()
-        report = sync_tables(
-            self._pool_tables, dict(self._scratch_holds), keep_unwritten=keep
-        )
+        resume_warm().note_eager_sync(lid, n_scratch)  # RW instrument
+        report = sync_tables(self._pool_tables, holds, keep_unwritten=keep)
         if lid in (0, 23, 47):
             # Beweiszeile #104 + SGLANG_OPT_MOE_POOL_KEEP_LRU: wie viel Decode-
             # Arbeitsmenge ein eager Forward uebrig laesst, und wie viele
@@ -4649,7 +5341,7 @@ class MoEExpertOffloadCache:
                 "MoE expert pool layer %s sync: eager pass wrote %d rows, LRU owns "
                 "%d of %d rows after the sync, %d twin rows freed (keep_lru=%s, "
                 "one owner per expert, #104)",
-                lid, len(self._scratch_holds), report.owned,
+                lid, n_scratch, report.owned,
                 t.pool_rows - t.lru_start, report.twins_freed, keep,
             )
 
@@ -4725,6 +5417,95 @@ class MoEExpertOffloadCache:
         copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
         return len(pairs)
 
+    def lru_snapshot(self, limit: int = 0) -> List[int]:
+        """RW: the LOCAL expert ids this layer's LRU rows own right now, most
+        recently used first (``row_use`` desc), at most ``limit`` (0 = all).
+        Two small host reads of the pool tables; call it outside any capture."""
+        if not self._pool_ready:
+            return []
+        t = self._pool_tables
+        lo, hi = int(t.lru_start), int(t.pool_rows)
+        key = t.row_key[lo:hi].cpu().tolist()
+        use = t.row_use[lo:hi].cpu().tolist()
+        owned = sorted(((int(u), int(k)) for k, u in zip(key, use) if int(k) >= 0), reverse=True)
+        ids = [k for _u, k in owned]
+        return ids[:limit] if limit > 0 else ids
+
+    def pool_row_bytes(self) -> int:
+        """RW / K10: bytes ONE pool row moves (every resident buffer's row);
+        0 when the pool is not installed."""
+        dsts = getattr(self, "_pool_dsts", None) or ()
+        try:
+            return int(sum(int(t[0].numel()) * int(t.element_size()) for t in dsts))
+        except Exception:  # noqa: BLE001 -- an instrument
+            return 0
+
+    def warm_lru_local(self, ids, limit: int = 0) -> int:
+        """RW: hand free LRU rows to the LOCAL expert ids ``ids`` and copy their
+        bytes from the pinned store rows, on the CURRENT stream -- the same rows,
+        the same copies a miss makes (``seed_lru_rows`` + ``copy_rows``); no new
+        VRAM, no transient. Returns the rows filled."""
+        if not self._pool_ready or not ids:
+            return 0
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows, seed_lru_rows
+
+        pairs = seed_lru_rows(self._pool_tables, [int(e) for e in ids], limit=int(limit))
+        if not pairs:
+            return 0
+        dev = self._pool_dsts[0].device
+        src = torch.tensor([p[0] for p in pairs], dtype=torch.int32, device=dev)
+        dst = torch.tensor([p[1] for p in pairs], dtype=torch.int32, device=dev)
+        count = torch.tensor([len(pairs)], dtype=torch.int32, device=dev)
+        copy_rows(self._pool_srcs, self._pool_dsts, src, dst, count)
+        return len(pairs)
+
+    # -- RW-FINISH (#287, 30.09.): the warm in four device-side steps ---------
+    def warm_plan(self, ids, limit: int = 0):
+        """RW-FINISH: choose free LRU rows for ``ids`` (host reads; the caller
+        is the RW tick, device idle) and RESERVE them on the current stream.
+        Returns the plan (device tensors) or None."""
+        if not self._pool_ready or not ids:
+            return None
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import plan_warm_rows, reserve_warm_rows
+
+        triples = plan_warm_rows(self._pool_tables, [int(e) for e in ids], limit=int(limit))
+        if not triples:
+            return None
+        dev = self._pool_dsts[0].device
+        plan = WarmPlan(
+            src=torch.tensor([t[0] for t in triples], dtype=torch.int32, device=dev),
+            dst=torch.tensor([t[1] for t in triples], dtype=torch.int32, device=dev),
+            exp=torch.tensor([t[2] for t in triples], dtype=torch.int64, device=dev),
+            count=torch.tensor([len(triples)], dtype=torch.int32, device=dev),
+            rows=len(triples))
+        reserve_warm_rows(self._pool_tables, plan.dst.long())
+        return plan
+
+    def warm_copy(self, plan) -> None:
+        """RW-FINISH: the reserved rows' bytes from the pinned store rows, on
+        the CURRENT stream (the RW tick's, or the finish side stream)."""
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows
+
+        copy_rows(self._pool_srcs, self._pool_dsts, plan.src, plan.dst, plan.count)
+
+    def warm_commit(self, plan) -> None:
+        """RW-FINISH: the landed rows into the tables (device-side, current
+        stream -- behind the copy's event)."""
+        from sglang.srt.layers.moe.expert_pool_device import commit_warm_rows
+
+        commit_warm_rows(self._pool_tables, plan.exp, plan.dst.long())
+
+    def warm_release(self, plan) -> None:
+        """RW-FINISH: reserved rows back to free (an eager pass reached the
+        layer before its copy was issued)."""
+        from sglang.srt.layers.moe.expert_pool_device import release_warm_rows
+
+        release_warm_rows(self._pool_tables, plan.dst.long())
+
     def rearm_after_wake(self, rows_loaded: bool = False, defer: bool = False) -> int:
         """Nach dem Wake, bevor irgendein Forward laeuft (Platztausch).
 
@@ -4745,6 +5526,9 @@ class MoEExpertOffloadCache:
         holt sie wie jeden anderen kalten Experten), der Pad wird sofort
         genullt, und :class:`DeferredRowsFill` laedt die Zeilen nach dem ersten
         Decode-Forward und befoerdert den Layer dann auf das volle Layout.
+        ``defer=DEFER_HOST`` (P, Host-Planung): dieselben Zeilen, aber ohne
+        Pool-Tabellen und ``early`` -- der Nachlader startet schon hinter dem
+        Rearm, der naechste Forward des Rangs (jeder Modus) wartet ihre Events.
 
         Gibt die Zahl der HIER nachgeladenen Experten-Zeilen zurueck.
         """
@@ -4757,15 +5541,26 @@ class MoEExpertOffloadCache:
                    for attr, buf in self._resident.items()]
         lid = getattr(self.layer, "layer_id", "?")
         extra = tuple(r for r in runs if r[1] >= 0)
+        early = defer == DEFER_HOST
         plan = None
         if defer and not rows_loaded and self._pool_ready and extra:
             plan = self._deferred_layout(extra, entries)
+        # DEFER_HOST on a layer without the pool (P: run_waves plans on the
+        # host): no cold layout to write, the rows only need to be on the
+        # card before this rank's next forward
+        host_rows = (early and plan is None and not rows_loaded and not self._pool_ready
+                     and bool(extra) and all(spill is not None for _a, _b, spill in entries))
         zeilen = 0
-        if plan is not None:
+        if plan is not None or host_rows:
             load_refill_rows(entries, tuple(r for r in runs if r[1] < 0), layer_id=lid)
         elif not rows_loaded:
             zeilen = load_refill_rows(entries, runs, layer_id=lid)
         self._scratch_holds.clear()
+        if host_rows:
+            self._deferred_rows = DeferredRows(
+                entries=entries, runs=extra, full=None,
+                rows=sum(n for _z, _p, n in extra) * len(entries), layer_id=lid, early=True)
+            deferred_rows_fill().add(self)
         if self._pool_ready:
             from sglang.srt.layers.moe.expert_pool_device import (
                 apply_pool_layout,
@@ -4783,7 +5578,8 @@ class MoEExpertOffloadCache:
                                   pool_layout_tensors(self._pool_tables, hot_cold, host_cold))
                 self._deferred_rows = DeferredRows(
                     entries=entries, runs=extra, full=full,
-                    rows=sum(n for _z, _p, n in extra) * len(entries), layer_id=lid)
+                    rows=sum(n for _z, _p, n in extra) * len(entries), layer_id=lid,
+                    early=early)
                 deferred_rows_fill().add(self)
             if self._pool_pf_buffers is not None:
                 self._pool_pf_armed = False
@@ -4819,18 +5615,29 @@ class MoEExpertOffloadCache:
         deferred_rows_fill().land(self)
         return True
 
-    def _promote_deferred(self) -> None:
-        """Das volle Layout in die Tabellen (laufender Strom, geraeteintern)."""
+    def _promote_deferred(self):
+        """Das volle Layout in die Tabellen (laufender Strom, geraeteintern).
+        Gibt ``(built_on, now_on)`` zurueck, wenn eine Live-Aenderung der
+        Sitzzeilen zwischen Rearm und Landung lag (xid13 kvh 01.10.: das
+        Layout traegt den Sitzblock seines Rearms, ``apply_pool_layout``
+        schreibt ihn aus dem lebenden Stand), sonst None."""
         from sglang.srt.layers.moe.expert_pool_device import apply_pool_layout
 
         d = self._deferred_rows
         if d is None:
-            return
-        apply_pool_layout(self._pool_tables, d.full)
+            return None
+        moved = None
+        if d.full is not None:
+            built_on = getattr(d.full, "seat_on", None)
+            now_on = int(self._pool_tables.seat_on)
+            if built_on is not None and int(built_on) != now_on:
+                moved = (int(built_on), now_on)
+            apply_pool_layout(self._pool_tables, d.full)
         self._scratch_holds.clear()
         if self._pool_pf_buffers is not None:
             self._pool_pf_armed = False
         self._deferred_rows = None
+        return moved
 
     def prepare_breakable(self, topk_ids, bridge, stage=None):
         """#462 breakable route: the EAGER pre-replay phase, in one call.
@@ -5004,7 +5811,14 @@ class MoEExpertOffloadCache:
 
         topk_ids = dispatch_output.topk_output.topk_ids
         n_own = int(topk_ids.numel())
-        if lookahead is None:
+        pool_hot = None
+        if lookahead is None and self._eager_lru_armed:
+            # H107: the pool map rides the ids' D2H (see run_waves)
+            both_np = torch.cat(
+                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
+            ).cpu().numpy()
+            pool_hot = both_np[n_own:].tolist()
+        elif lookahead is None:
             both_np = topk_ids.reshape(-1).cpu().numpy()
         else:
             _next_cache, pred = lookahead
@@ -5027,6 +5841,17 @@ class MoEExpertOffloadCache:
             self.planner.resident_ids,
             num_experts=self.num_local_experts,
         )
+        if pool_hot is not None:
+            out = self._run_eager_lru(
+                dispatch_output,
+                apply_fn,
+                flat_np=flat_np,
+                resident_used=resident_used,
+                spill_waves=spill_waves,
+                pool_hot=pool_hot,
+            )
+            if out is not None:
+                return out
         if len(spill_waves) <= 1:
             own = flat_np.tolist()
             ids_list = [own[i : i + k] for i in range(0, n_own, k)]
@@ -5092,7 +5917,18 @@ class MoEExpertOffloadCache:
             return self._run_waves_vector(dispatch_output, apply_fn, lookahead)
 
         prefetch = None
-        if lookahead is None:
+        pool_hot = None
+        if lookahead is None and self._eager_lru_armed:
+            # H107: this layer's pool map crosses in the SAME rendezvous as the
+            # routing -- one D2H per layer, as before
+            n_own = topk_ids.numel()
+            k = topk_ids.shape[-1]
+            both = torch.cat(
+                [topk_ids.reshape(-1), self._pool_tables.hot_phys.reshape(-1).to(topk_ids.dtype)]
+            ).tolist()
+            ids_list = [both[i : i + k] for i in range(0, n_own, k)]
+            pool_hot = both[n_own:]
+        elif lookahead is None:
             ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
         else:
             # One rendezvous for both: this forward's routing and the later
@@ -5138,6 +5974,17 @@ class MoEExpertOffloadCache:
             resident_used, spill_waves = plan_expert_waves(
                 ids_list, self.resident_count, self.scratch, self.planner.resident_ids
             )
+            if pool_hot is not None:
+                out = self._run_eager_lru(
+                    dispatch_output,
+                    apply_fn,
+                    flat_np=np.asarray(ids_list, dtype=np.int64).reshape(-1),
+                    resident_used=resident_used,
+                    spill_waves=spill_waves,
+                    pool_hot=pool_hot,
+                )
+                if out is not None:
+                    return out
             if len(spill_waves) > 1:
                 self.planner.stats.overflow_forwards += 1
                 if prefetch is not None:
@@ -5222,6 +6069,88 @@ class MoEExpertOffloadCache:
         self._log_wave_h2d("token", len(waves), h2d_before)
         return combine_out._replace(hidden_states=out_full)
 
+    def _run_eager_lru(
+        self, dispatch_output, apply_fn, *, flat_np, resident_used, spill_waves, pool_hot
+    ):
+        """H107: run this eager pool forward on the plan that reads warm LRU
+        rows (``plan_eager_lru_waves``). ``pool_hot`` is the host copy of the
+        pool's ``hot_phys`` that crossed with the routing. Returns None when the
+        plan does not apply (every scratch row holds a hit); the caller then
+        runs the plain plan. One fetch-free wave for residents + hits; one
+        apply when the misses fit the rows left, expert-major waves otherwise."""
+        t = self._pool_tables
+        bank_rows = int(next(iter(self._resident.values())).shape[0])
+        lru = pool_lru_rows(pool_hot, t.lru_start, min(int(t.pool_rows), bank_rows))
+        spill = [e for wave in spill_waves for e in wave]
+        R = self.resident_count
+        plan = plan_eager_lru_waves(spill, lru, range(R, R + self.scratch))
+        if plan is None:
+            return None
+        hits, miss_waves = plan
+        self._eager_lru_used.update({row: e for e, row in hits.items()})
+        slot0 = {int(e): int(e) for e in resident_used}
+        slot0.update(hits)
+        n_miss = sum(len(w) for w in miss_waves)
+        stats = self.planner.stats
+        stats.forwards += 1 + len(miss_waves)
+        stats.waves += 1 + len(miss_waves)
+        stats.hits += len(slot0)
+        stats.misses += n_miss
+        stats.fetches += n_miss
+        h2d_before = stats.h2d_bytes
+        if len(miss_waves) <= 1:
+            fetch = list(miss_waves[0]) if miss_waves else []
+            slot = dict(slot0)
+            slot.update(fetch)
+            out = self._run_single_wave(
+                dispatch_output, apply_fn, None, slot_plan=(slot, fetch)
+            )
+        else:
+            self.planner.stats.overflow_forwards += 1
+            out = self._run_waves_expert_major(
+                dispatch_output,
+                apply_fn,
+                flat_np,
+                sorted(slot0),
+                [[e for e, _row in w] for w in miss_waves],
+                slot_plans=[(slot0, [])] + [(dict(w), list(w)) for w in miss_waves],
+            )
+        self._note_eager_lru(
+            tokens=int(dispatch_output.topk_output.topk_ids.shape[0]),
+            spill=len(spill),
+            hits=len(hits),
+            misses=n_miss,
+            waves_before=len(spill_waves),
+            waves_after=len(miss_waves),
+            h2d_bytes=stats.h2d_bytes - h2d_before,
+        )
+        return out
+
+    def _note_eager_lru(self, *, tokens, spill, hits, misses, waves_before, waves_after, h2d_bytes):
+        """H107 metal marker, one line per eager forward (INFO for one
+        representative layer, DEBUG for the rest -- the _log_wave_h2d rule).
+        waves_before = the scratch waves the plain plan would have run."""
+        import logging
+
+        global _H107_LOG_LAYER
+
+        layer_id = getattr(self.layer, "layer_id", "?")
+        if _H107_LOG_LAYER is None:
+            _H107_LOG_LAYER = layer_id
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == _H107_LOG_LAYER else logging.DEBUG,
+            "H107 EAGER-LRU layer %s: T=%d spill %d = lru_hits %d + misses %d, "
+            "waves %d -> %d, %.3f GiB H2D",
+            layer_id,
+            tokens,
+            spill,
+            hits,
+            misses,
+            waves_before,
+            waves_after,
+            h2d_bytes / float(1 << 30),
+        )
+
     def _issue_lookahead(self, lookahead, pred_list):
         """Build the prefetch thunk for ``lookahead`` (see run_waves). With
         ``pred_list`` None the prediction was not carried across the
@@ -5295,7 +6224,7 @@ class MoEExpertOffloadCache:
         self.planner.stats.lookahead_prefetched += len(plan)
         return len(plan)
 
-    def _run_single_wave(self, dispatch_output, apply_fn, ids_list, prefetch=None):
+    def _run_single_wave(self, dispatch_output, apply_fn, ids_list, prefetch=None, slot_plan=None):
         """One apply over the full batch: every routed expert fits the buffer at
         once (typical decode, and any prefill whose spill set fits the scratch).
         Shared by both wave orders -- with a single wave they are the same path.
@@ -5316,13 +6245,18 @@ class MoEExpertOffloadCache:
             int(topk_ids.shape[0]),
             int(topk_ids.shape[1]),
         )
-        needed = sorted({e for row in ids_list for e in row if e >= 0})
-        if self.lookahead_sticky:
-            slot_of_needed, fetch_plan, _ = self.planner.resolve_sticky(
-                needed, self._scratch_holds
-            )
+        if slot_plan is not None:
+            # H107: the caller planned the rows (LRU hits + misses)
+            slot_of_needed, fetch_plan = slot_plan
+            needed = sorted(slot_of_needed)
         else:
-            slot_of_needed, fetch_plan = self.planner.resolve(needed)
+            needed = sorted({e for row in ids_list for e in row if e >= 0})
+            if self.lookahead_sticky:
+                slot_of_needed, fetch_plan, _ = self.planner.resolve_sticky(
+                    needed, self._scratch_holds
+                )
+            else:
+                slot_of_needed, fetch_plan = self.planner.resolve(needed)
         _tm = _wave_timing_on() and topk_ids.is_cuda
         fwd_mark("moe_plan")
         if _tm:
@@ -5351,7 +6285,7 @@ class MoEExpertOffloadCache:
         return out
 
     def _run_waves_expert_major(
-        self, dispatch_output, apply_fn, flat_np, resident_used, spill_waves
+        self, dispatch_output, apply_fn, flat_np, resident_used, spill_waves, slot_plans=None
     ):  # pragma: no cover - requires CUDA
         """#254 expert-major prefill: waves are disjoint SPILL-EXPERT groups, so
         every spill expert crosses PCIe exactly ONCE per forward instead of once
@@ -5394,6 +6328,11 @@ class MoEExpertOffloadCache:
         device = topk_ids.device
         T, K = int(topk_ids.shape[0]), int(topk_ids.shape[1])
 
+        # PFO (#287 Hebel A): the double-buffered form, or the serial one
+        pfo = prefill_fetch_overlap_form(self, slot_plans, len(spill_waves))
+        if pfo is not None:
+            spill_waves = pfo.split(spill_waves)
+
         # pair index (t*K + k) -> wave: 0 = the fetch-free resident wave,
         # 1..n = spill groups, -1 = padded slot (contributes an exact zero).
         # flat_np: the [T*K] routed ids as int64 (list path: np.asarray of
@@ -5423,15 +6362,35 @@ class MoEExpertOffloadCache:
         out_acc = None  # [T, H] fp32 when streaming
         try:
             cfg.routed_scaling_factor = 1.0
-            for w, needed in enumerate([resident_used] + spill_waves):
+            all_waves = [resident_used] + spill_waves
+            if pfo is not None:
+                pfo.begin(self, all_waves)
+            for w, needed in enumerate(all_waves):
                 idx_np = np.flatnonzero(wave_of_pair == w)
-                if idx_np.size == 0:
+                if pfo is not None:
+                    # PFO: this wave's copy was issued a wave earlier; the
+                    # NEXT spill wave's copy is issued now, before this apply
+                    slot_of_needed = pfo.ensure(w)
+                    pfo.ensure(w + 1)
+                    if idx_np.size == 0:
+                        pfo.applied(w)
+                        continue
+                    fwd_mark("moe_plan")
+                    if _tm:
+                        _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
+                    pfo.wait(w)
+                    fetch_plan = pfo.plans[w][1]
+                elif idx_np.size == 0:
                     continue
-                slot_of_needed, fetch_plan = self.planner.resolve(needed)
-                fwd_mark("moe_plan")
-                if _tm:
-                    _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
-                self._fetch(fetch_plan)
+                elif slot_plans is None:
+                    slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                else:
+                    slot_of_needed, fetch_plan = slot_plans[w]  # H107
+                if pfo is None:
+                    fwd_mark("moe_plan")
+                    if _tm:
+                        _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
+                    self._fetch(fetch_plan)
                 _hap.checkpoint("moe.fetch", layer=getattr(self.layer, "layer_id", None),
                                 wave=f"{w}/{len(spill_waves) + 1}", fetched=len(fetch_plan))
                 self._nan_trace_wave(w, needed, slot_of_needed)
@@ -5494,6 +6453,8 @@ class MoEExpertOffloadCache:
                     partials.index_copy_(0, idx, part.to(partials.dtype))
                 _hap.checkpoint("moe.apply", layer=getattr(self.layer, "layer_id", None),
                                 wave=f"{w}/{len(spill_waves) + 1}", pairs=int(idx_np.size))
+                if pfo is not None:
+                    pfo.applied(w)
                 fwd_mark("moe_apply")
                 if _tm:
                     _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
@@ -6193,15 +7154,38 @@ def rearm_expert_offload_after_wake(model, prefetch=None, defer=False, sync=True
     return layers, zeilen
 
 
+#: ``defer`` mode of :func:`rearm_expert_offload_after_wake` for a group whose
+#: MoE layers plan on the HOST with full residency (P's prefill): the extra
+#: rows are not loaded before the rearm returns, but they load at once on a
+#: side stream and land before that rank's FIRST forward (any mode) -- a
+#: host-planned layer can never compute on cold rows.
+DEFER_HOST = "host"
+
+
+@dataclass
+class WarmPlan:
+    """RW-FINISH: one layer's warm -- store rows, reserved bank rows, experts
+    (device tensors, built once while the device was idle)."""
+
+    src: object
+    dst: object
+    exp: object
+    count: object
+    rows: int
+
+
 @dataclass
 class DeferredRows:
     """H31b: what one pool layer still owes after a deferred rearm."""
 
     entries: list  # (attr, buf, spill)
     runs: tuple  # the extra runs (zeile0, platz0, n), platz0 >= 0
-    full: object  # expert_pool_device.PoolLayout of the full residency
+    full: object  # expert_pool_device.PoolLayout of the full residency (None: no pool)
     rows: int  # rows over all attrs, the unit of rows_from_store
     layer_id: object = "?"
+    # DEFER_HOST: lands before the next forward of any mode, not after the
+    # first decode forward
+    early: bool = False
 
 
 class DeferredRowsFill:
@@ -6248,6 +7232,15 @@ class DeferredRowsFill:
         self.by_tick = 0
         self.by_eager = 0
         self.ticks = 0
+        # 02.10. (y7l NF D->P): layers whose rows were NOT yet on the card when
+        # the forward stream needed them (event open, or loaded by land() on the
+        # forward stream itself). 0 = no forward ever waited for the fill.
+        self.waited = 0
+        self.t_first_tick = None
+        # xid13 kvh: layers whose full layout landed after a live seat-row change
+        self.seat_moved = 0
+        self.seat_moved_on = None
+        self.per_layer_told = False
 
     def _ops(self):
         if self._ops_arg == "cuda":
@@ -6271,7 +7264,7 @@ class DeferredRowsFill:
                    if c._deferred_rows is not None)
 
     # -- forward side -------------------------------------------------------
-    def start(self) -> None:
+    def start(self, why: str = "behind the first forward") -> None:
         """Alle offenen Layer auf den Seitenstrom, ein Event je Layer."""
         if self.started or not self.pending:
             return
@@ -6282,9 +7275,20 @@ class DeferredRowsFill:
             self.stream = ops.new_stream()
         self._issue(list(self.pending))
         logger.info("%s fill-start layers=%d rows=%d since_rearm_ms=%.0f (the extra rows "
-                    "load now, behind the first forward, on a side stream)", self.LINE,
+                    "load now, %s, on a side stream)", self.LINE,
                     len(self.pending), self.rows_pending(),
-                    (self.t_start - (self.t_rearm or self.t_start)) * 1000)
+                    (self.t_start - (self.t_rearm or self.t_start)) * 1000, why)
+
+    def start_host_planned(self, why: str) -> bool:
+        """#284b: ``start`` for DEFER_HOST (early) layers only -- H31b's decode
+        layers keep their start at the first decode tick (x147: D's link is
+        busy until then). True when rows were issued."""
+        if self.started or not any(
+            c._deferred_rows is not None and c._deferred_rows.early for c in self.pending
+        ):
+            return False
+        self.start(why=why)
+        return True
 
     def _issue(self, caches) -> None:
         """Die Zeilen dieser Layer auf den Seitenstrom, ein Event je Layer
@@ -6303,13 +7307,21 @@ class DeferredRowsFill:
                 load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
                 self.events[id(cache)] = ops.record(self.stream) if ops is not None else None
 
-    def _promote(self, cache, how: str) -> None:
+    def _promote(self, cache, how: str, *, waited: Optional[bool] = None) -> None:
         ops = self._ops()
         ev = self.events.pop(id(cache), None)
+        if waited is None:
+            # an event still open here makes the forward stream wait for it
+            waited = ev is not None and not bool(ev.query())
+        if waited:
+            self.waited += 1
         if ev is not None and ops is not None:
             ops.current_waits(ev)
         rows = int(cache._deferred_rows.rows)
-        cache._promote_deferred()
+        moved = cache._promote_deferred()
+        if moved is not None:
+            self.seat_moved += 1
+            self.seat_moved_on = moved
         self.pending.remove(cache)
         self.rows_landed += rows
         if how == "tick":
@@ -6318,13 +7330,30 @@ class DeferredRowsFill:
             self.by_eager += 1
         if not self.pending:
             now = self._clock()
+            # fill_ms is fill-start -> THIS promotion (it happens at a forward of
+            # this rank), NOT the copy time: y7l (02.10.) read PP2's fill_ms=6630
+            # as 6.6 s of copies gating P's first chunk, while every layer had
+            # landed before PP2's first forward (forward_waited_layers=0) and
+            # PP2's first forward simply came when PP0+PP1 had computed chunk 1.
+            first = self.t_first_tick
             logger.info(
                 "%s landed layers=%d rows=%d by_tick=%d by_eager=%d ticks=%d "
-                "fill_ms=%s since_rearm_ms=%.0f (every pool layer is on its full layout "
-                "again)", self.LINE, self.by_tick + self.by_eager, self.rows_landed,
-                self.by_tick, self.by_eager, self.ticks,
+                "fill_ms=%s since_rearm_ms=%.0f forward_waited_layers=%d first_forward_ms=%s "
+                "(every pool layer is on its full layout again; fill_ms = fill-start -> this "
+                "promotion at a forward of this rank, not the copy time; "
+                "forward_waited_layers=0: the rows had landed before any forward needed them, "
+                "the fill gated nothing)", self.LINE, self.by_tick + self.by_eager,
+                self.rows_landed, self.by_tick, self.by_eager, self.ticks,
                 "n/a" if self.t_start is None else "%.0f" % ((now - self.t_start) * 1000),
-                (now - (self.t_rearm or now)) * 1000)
+                (now - (self.t_rearm or now)) * 1000, self.waited,
+                "n/a" if first is None or self.t_start is None
+                else "%.0f" % ((first - self.t_start) * 1000))
+            if self.seat_moved:
+                logger.info(
+                    "%s SEAT-RESTAMP layers=%d rows_on %d->%d (the full layouts were built "
+                    "at the rearm, a live seat-row change came before they landed; the seat "
+                    "block follows the live count, OFF rows stay OFF)", self.LINE,
+                    self.seat_moved, self.seat_moved_on[0], self.seat_moved_on[1])
             self.reset()
 
     def land(self, cache) -> None:
@@ -6336,6 +7365,8 @@ class DeferredRowsFill:
             d = cache._deferred_rows
             # noch nicht auf dem Seitenstrom: dieser Layer allein, hier
             load_refill_rows(d.entries, d.runs, layer_id=d.layer_id)
+            self._promote(cache, "eager", waited=True)  # the forward stream copies
+            return
         self._promote(cache, "eager")
 
     def tick(self, is_decode: bool) -> None:
@@ -6343,6 +7374,46 @@ class DeferredRowsFill:
         if not self.pending:
             return
         self.ticks += 1
+        if self.t_first_tick is None:
+            self.t_first_tick = self._clock()
+        early = [c for c in self.pending
+                 if c._deferred_rows is not None and c._deferred_rows.early]
+        if early:
+            # DEFER_HOST: this forward's stream waits every early layer's
+            # event (no host wait); the rows were issued at the rearm
+            if not self.started:
+                self.start()
+            late = [c for c in early if id(c) not in self.events]
+            if late:
+                self._issue(late)
+            if is_decode or not per_layer_landing():
+                for cache in early:
+                    self._promote(cache, "tick")
+            else:
+                # FLIPCYCLE H2 (02.10.): an EXTEND forward lands each early layer
+                # right before its own MoE (run_waves / run_eager_pool call
+                # land_deferred_rows -> land -> the forward stream waits THAT
+                # layer's event only). Layer 0 computes while the rows of the
+                # later layers still stream; the old form made the whole forward
+                # wait for every layer (y6z P-PP0 0.3-1.0 s, PP1 ~0.36 s, PLE
+                # gather 743 ms behind it). The layers whose rows already landed
+                # are promoted here; a decode (graph replay, no land) keeps the
+                # full wait above.
+                ready = [c for c in early
+                         if self.events.get(id(c)) is None or bool(self.events[id(c)].query())]
+                for cache in ready:
+                    self._promote(cache, "tick")
+                if self.pending and not self.per_layer_told:
+                    self.per_layer_told = True
+                    logger.info("WEG2-FLIPCYCLE stage=rearm_wait ms=0 floor_ms=0 mode=per_layer "
+                                "layers_open=%d rows_open=%d since_start_ms=%.0f (H2: the first "
+                                "extend after the wake no longer waits for every layer's extra "
+                                "rows; each layer waits for its own)", len(self.pending),
+                                self.rows_pending(),
+                                (self._clock() - (self.t_start or self._clock())) * 1000)
+                return
+            if not self.pending:
+                return
         if not self.started:
             if is_decode:
                 self.start()
@@ -6375,6 +7446,425 @@ class DeferredRowsFill:
 _DEFERRED_ROWS_FILL: Optional[DeferredRowsFill] = None
 
 
+def per_layer_landing() -> bool:
+    """FLIPCYCLE H2 switch (SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER)."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_ENABLE_REARM_DEFER_PER_LAYER.get())
+
+
+# ---------------------------------------------------------------------------
+# RW RESUME WARM (28.09., NF rc12z22 D): the first eager extend after a wake
+# re-fetched its experts one wave at a time -- "MoE expert pool layer N sync:
+# eager pass wrote 23..58 rows", 1.6-2.0 s of compute for 8..229 tokens, while
+# an extend with its experts resident took 12-16 ms. The wake's rearm drops the
+# LRU (the other group overwrote it) and prefetches nothing (rows_from_store=0
+# prefetched=0 overlap=off). The resumes are the requests D decoded before it
+# slept, so the experts its LRU owned then are the ones their tail extend
+# routes to.
+#
+#   * SNAPSHOT at the sleep, before the pauses: per pool layer the LRU's local
+#     expert ids, most recent first (two small host reads per layer, no copy).
+#   * WARM after the legs (never in a leg -- the x147 lesson): the rearm arms
+#     the queue; the scheduler warms up to LAYERS_PER_TICK layers per pass,
+#     only while the device is idle (nothing running, nothing in flight) and a
+#     wake read is still settling. Rows: only those the rearm left free, from
+#     the same pinned store rows a miss copies from -- no VRAM, no transient.
+#   * NEVER WAITS: an eager forward that reaches a layer still queued removes
+#     it (the eager sync fetches as today); a pass that admits work stops the
+#     warm (``cancel``). The copies are on the scheduler's stream, ordered
+#     before the next forward like the rearm's own.
+#   * UNIFORM: the snapshot comes from each rank's own LRU, which the
+#     replicated routing wrote; the ticks run in the group-agreed settle passes
+#     on every rank; no collective.
+# Switch SGLANG_WEG2_RESUME_WARM (default on), SGLANG_WEG2_RESUME_WARM_ROWS
+# (rows per layer, 0 = every snapshot row), SGLANG_WEG2_RESUME_WARM_LAYERS
+# (layers per pass).
+# ---------------------------------------------------------------------------
+
+RESUME_WARM_ENV = "SGLANG_WEG2_RESUME_WARM"
+RESUME_WARM_ROWS_ENV = "SGLANG_WEG2_RESUME_WARM_ROWS"
+RESUME_WARM_LAYERS_ENV = "SGLANG_WEG2_RESUME_WARM_LAYERS"
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def resume_warm_enabled() -> bool:
+    import os
+
+    return (os.environ.get(RESUME_WARM_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def resume_warm_finish_enabled() -> bool:
+    """RW-FINISH (#287, 30.09.): the warm runs to the end instead of being
+    cancelled at the first decode (``SGLANG_WEG2_RESUME_WARM_FINISH``)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_RESUME_WARM_FINISH.get())
+    except Exception:  # noqa: BLE001 -- no environ: the old cancel
+        return False
+
+
+def resume_warm_at_arm_enabled() -> bool:
+    """RW-AT-ARM (30.09., NF y4k/y4l P->D): the whole warm is issued on the
+    side stream at the arm -- the weight legs are over -- instead of in the
+    idle settle passes (``SGLANG_WEG2_RESUME_WARM_AT_ARM``)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_RESUME_WARM_AT_ARM.get())
+    except Exception:  # noqa: BLE001 -- no environ: the settle-pass warm
+        return False
+
+
+def resume_warm_at_arm_rows() -> int:
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_RESUME_WARM_AT_ARM_ROWS.get()))
+    except Exception:  # noqa: BLE001
+        return 16
+
+
+def _pool_caches(model):
+    for module in model.modules():
+        cache = getattr(module, "_expert_offload", None)
+        if isinstance(cache, MoEExpertOffloadCache) and cache._pool_ready:
+            yield cache
+
+
+class ResumeWarm:
+    """RW, and RW-FINISH (#287, 30.09., NF y4k): every wake cancelled the warm
+    at the first decode (``RW WAKE-FIRST-TOKEN ... warm_layers=8 ...
+    skipped_cancel=40 cancel=first_decode``, 14/14 wakes); the first 64 decode
+    rounds then ran cold -- ``MOE-POOL-DEMAND max_nonres_per_step=57
+    median_layer_max=29`` against 22/17 steady, ``DECODE-HOST-SPLIT`` window-1
+    wall 38.4 ms (gpu_verify 35.1, max 186) against 27.0-28.5 steady.
+
+    Under ``SGLANG_WEG2_RESUME_WARM_FINISH`` the first idle tick PLANS every
+    queued layer (host reads, device idle -- the tick's own gate) and RESERVES
+    its rows (OFF rows: never free, never a victim, never routed); the ticks
+    copy and commit layers on the current stream as before; at the cancel
+    point the rest goes on a side stream, in layer order, one event per layer
+    (``_finish``), and :func:`deferred_rows_tick` -- the scheduler's hook before
+    every forward -- commits each layer whose event has COMPLETED
+    (``query``; the forward stream's ``wait_event`` on a finished event does
+    not stall; the commit is a device-side table write). No host read, no
+    synchronize, no wait in the decode path; a layer whose copy is still in
+    flight is simply not committed yet (its experts miss as before)."""
+
+    def __init__(self) -> None:
+        self._queue: List = []
+        self._inflight: List = []
+        self._stream = None
+        self._ops = None
+        self._planned = False
+        self.reset_stats()
+
+    def reset_stats(self) -> None:
+        self.snap_layers = self.snap_rows = 0
+        self.snap_ms = 0.0
+        self.warm_layers = self.warm_rows = 0
+        self.warm_ms = 0.0
+        self.warm_bytes = 0
+        self.row_bytes = 0
+        self.skipped_eager = self.skipped_cancel = 0
+        self.cancel_reason = ""
+        self.finish_layers = self.finish_rows = self.finish_landed = 0
+        self.finish_reason = ""
+        self.at_arm = False
+        self.arm_ms = 0.0
+        self._first_extend_layers: Dict = {}
+        self._first_extend_closed = False
+
+    # -- the sleep --------------------------------------------------------
+    def snapshot(self, models) -> int:
+        """Record every pool layer's LRU owners (before the pauses)."""
+        import time
+
+        if not resume_warm_enabled():
+            return 0
+        t0 = time.perf_counter()
+        rows = _env_int(RESUME_WARM_ROWS_ENV, 32)
+        layers = n = 0
+        for model in models:
+            for cache in _pool_caches(model):
+                ids = cache.lru_snapshot(rows)
+                cache._rw_snap = ids
+                layers += 1
+                n += len(ids)
+        self.snap_layers, self.snap_rows = layers, n
+        self.snap_ms = (time.perf_counter() - t0) * 1000.0
+        return n
+
+    # -- the wake, after the rearm (the legs are over) --------------------
+    def arm(self, models) -> int:
+        if self._inflight:
+            self.settle()  # RW-FINISH: a sleep that skipped the settle hook
+        stats = (self.snap_layers, self.snap_rows, self.snap_ms)
+        self.reset_stats()
+        self.snap_layers, self.snap_rows, self.snap_ms = stats
+        self._queue = []
+        # The settle of THIS wake is not open yet: the arm runs in the weights
+        # leg, the dormant hold is released (and the #1471 settle built) by a
+        # later resume RPC -- the scheduler passes in between must not read
+        # "no settle" as "settle over" (NF rc12z26: 8/8 wakes cancel=settle_done
+        # with warm_layers=0).
+        self._settle_open = False
+        self._planned = False
+        if not resume_warm_enabled():
+            return 0
+        for model in models:
+            for cache in _pool_caches(model):
+                if getattr(cache, "_rw_snap", None):
+                    self._queue.append(cache)
+        n = len(self._queue)
+        if n and resume_warm_at_arm_enabled():
+            # RW-AT-ARM: plan + reserve every layer now (host reads: the rearm
+            # just synchronized, nothing runs) and put every copy on the side
+            # stream behind the rearm -- they land while the kv leg and the
+            # first pass run on the host; deferred_rows_tick commits each
+            # layer before a forward once its event completed.
+            import time
+
+            t0 = time.perf_counter()
+            self._plan_all(rows=resume_warm_at_arm_rows())
+            self._finish("arm")
+            self.at_arm = True
+            self.arm_ms = (time.perf_counter() - t0) * 1000.0
+        return n
+
+    def open_settle(self) -> None:
+        """The wake's dormant hold was released: from now on an empty settle
+        means the settle is over."""
+        self._settle_open = True
+
+    @property
+    def settle_open(self) -> bool:
+        return bool(getattr(self, "_settle_open", False))
+
+    def pending(self) -> int:
+        return len(self._queue)
+
+    def tick(self, layers: Optional[int] = None) -> int:
+        """Warm up to ``layers`` queued layers now (the caller checked that the
+        device is idle). Returns the layers warmed."""
+        import time
+
+        if not self._queue:
+            return 0
+        n = _env_int(RESUME_WARM_LAYERS_ENV, 8) if layers is None else int(layers)
+        t0 = time.perf_counter()
+        done = 0
+        if resume_warm_finish_enabled():
+            if not self._planned:
+                self._plan_all()
+            while self._queue and done < max(1, n):
+                cache = self._queue.pop(0)
+                plan = getattr(cache, "_rw_plan", None)
+                cache._rw_plan = None
+                if plan is not None:
+                    cache.warm_copy(plan)
+                    cache.warm_commit(plan)
+                    self._count(cache, plan.rows)
+                done += 1
+            self.warm_ms += (time.perf_counter() - t0) * 1000.0
+            return done
+        while self._queue and done < max(1, n):
+            cache = self._queue.pop(0)
+            ids = getattr(cache, "_rw_snap", None) or []
+            cache._rw_snap = None
+            rows = cache.warm_lru_local(ids)
+            rb = cache.pool_row_bytes() if hasattr(cache, "pool_row_bytes") else 0
+            self.row_bytes = max(self.row_bytes, rb)
+            self.warm_bytes += rows * rb
+            self.warm_rows += rows
+            self.warm_layers += 1
+            done += 1
+        self.warm_ms += (time.perf_counter() - t0) * 1000.0
+        return done
+
+    def _count(self, cache, rows: int) -> None:
+        rb = cache.pool_row_bytes() if hasattr(cache, "pool_row_bytes") else 0
+        self.row_bytes = max(self.row_bytes, rb)
+        self.warm_bytes += int(rows) * rb
+        self.warm_rows += int(rows)
+        self.warm_layers += 1
+
+    def _plan_all(self, rows: Optional[int] = None) -> None:
+        """RW-FINISH: plan + reserve every queued layer (the first idle tick;
+        RW-AT-ARM: the arm, with its own row cap)."""
+        rows = _env_int(RESUME_WARM_ROWS_ENV, 32) if rows is None else int(rows)
+        for cache in list(self._queue):
+            ids = getattr(cache, "_rw_snap", None) or []
+            cache._rw_snap = None
+            plan = cache.warm_plan(ids, limit=rows) if hasattr(cache, "warm_plan") else None
+            cache._rw_plan = plan
+        self._planned = True
+
+    def eager_reached(self, cache) -> None:
+        """An eager forward reached ``cache``: never wait on the host -- drop it
+        (a planned layer gives its reserved rows back).
+
+        A layer whose copy is IN FLIGHT lands now, ordered on the device: the
+        current stream waits for its event (no host wait) and the rows are
+        committed to their experts before the eager pass plans. Before (y4u
+        f50f51020f, D TP1 15:18:30Z, 40 layers in flight after the wake's
+        first decode, ``finish_landed=0``): the rows stayed reserved
+        (``row_key`` = SEAT_OFF_KEY) while the host eager plan wrote its
+        scratch rows over them -- two writers on one bank row, and
+        ``sync_tables`` read the reserved key as an expert id: IndexError
+        ``index 2147483647 ... size 128``, the group died."""
+        for i, (c, ev) in enumerate(list(self._inflight)):
+            if c is not cache:
+                continue
+            ops = self._ops
+            if ev is not None and ops is not None:
+                ops.current_waits(ev)  # device order: the commit and the eager pass follow the copy
+            plan = getattr(c, "_rw_plan", None)
+            c._rw_plan = None
+            if plan is not None:
+                c.warm_commit(plan)
+                self._count(c, plan.rows)
+            self._inflight.pop(i)
+            self.finish_landed += 1
+            self.eager_landed = int(getattr(self, "eager_landed", 0)) + 1
+            break
+        if cache in self._queue:
+            self._queue.remove(cache)
+            plan = getattr(cache, "_rw_plan", None)
+            if plan is not None:
+                cache.warm_release(plan)
+                cache._rw_plan = None
+            cache._rw_snap = None
+            self.skipped_eager += 1
+
+    def _finish(self, reason: str) -> int:
+        """RW-FINISH: the planned rest on the side stream, layer order, one
+        event per layer. Nothing is skipped; returns 0."""
+        caches = [c for c in self._queue if getattr(c, "_rw_plan", None) is not None]
+        self._queue = []
+        if not caches:
+            return 0
+        if self._ops is None:
+            self._ops = _default_stream_ops()
+        ops = self._ops
+        if ops is not None and self._stream is None:
+            self._stream = ops.new_stream()
+        import contextlib
+
+        ctx = ops.stream_ctx(self._stream) if ops is not None else contextlib.nullcontext()
+        with ctx:
+            if ops is not None:
+                ops.after_current(self._stream)  # behind the reservations and the forward
+            for cache in caches:
+                cache.warm_copy(cache._rw_plan)
+                ev = ops.record(self._stream) if ops is not None else None
+                self._inflight.append((cache, ev))
+                self.finish_rows += int(cache._rw_plan.rows)
+        self.finish_layers += len(caches)
+        self.finish_reason = reason
+        return 0
+
+    def promote_ready(self) -> int:
+        """RW-FINISH, before a forward on its stream: commit every in-flight
+        layer whose event has COMPLETED, in issue order (one stream: behind an
+        unfinished one nothing is done either). Never waits on the host."""
+        n = 0
+        ops = self._ops
+        while self._inflight:
+            cache, ev = self._inflight[0]
+            if ev is not None and not bool(ev.query()):
+                break
+            if ev is not None and ops is not None:
+                ops.current_waits(ev)  # completed: a no-op on the device, orders the commit
+            plan = cache._rw_plan
+            cache._rw_plan = None
+            if plan is not None:
+                cache.warm_commit(plan)
+                self._count(cache, plan.rows)
+            self._inflight.pop(0)
+            self.finish_landed += 1
+            n += 1
+        if n and not self._inflight:
+            logger.info("RW FINISH-LANDED layers=%d rows=%d reason=%s (RW-FINISH: the warm's "
+                        "rest ran on a side stream behind the first decode; committed before "
+                        "the forwards as each layer's event completed, no host wait)",
+                        self.finish_landed, self.finish_rows, self.finish_reason or "-")
+        return n
+
+    def settle(self) -> None:
+        """RW-FINISH, before the first pause of a sleep: the pool buffers are
+        paused next -- wait for copies still in flight, forget the rest (the
+        next wake rewrites the tables)."""
+        for cache, ev in self._inflight:
+            if ev is not None:
+                ev.synchronize()
+            cache._rw_plan = None
+        self._inflight = []
+        for cache in self._queue:
+            cache._rw_plan = None
+            cache._rw_snap = None
+        self._queue = []
+
+    def cancel(self, reason: str) -> int:
+        if (resume_warm_finish_enabled() or getattr(self, "at_arm", False)) and self._planned:
+            return self._finish(reason)
+        n = len(self._queue)
+        for cache in self._queue:
+            cache._rw_snap = None
+        self._queue = []
+        if n:
+            self.skipped_cancel += n
+            self.cancel_reason = reason
+        return n
+
+    # -- instrument -------------------------------------------------------
+    def note_eager_sync(self, layer_id, rows: int) -> None:
+        """The first eager forward after the wake: rows its sync wrote per
+        layer; it ends when a layer syncs a second time."""
+        if self._first_extend_closed:
+            return
+        if layer_id in self._first_extend_layers:
+            self._first_extend_closed = True
+            return
+        self._first_extend_layers[layer_id] = int(rows)
+
+    def fields(self) -> str:
+        fe = self._first_extend_layers
+        return (
+            f"first_extend_eager_syncs={sum(1 for r in fe.values() if r > 0)} "
+            f"first_extend_rows={sum(fe.values())} snap_layers={self.snap_layers} "
+            f"snap_rows={self.snap_rows} snap_ms={self.snap_ms:.1f} "
+            f"warm_layers={self.warm_layers} warm_rows={self.warm_rows} warm_ms={self.warm_ms:.1f} "
+            f"row_bytes={self.row_bytes} warm_mib={self.warm_bytes / 2**20:.1f} "
+            f"skipped_eager={self.skipped_eager} skipped_cancel={self.skipped_cancel}"
+            + (f" cancel={self.cancel_reason}" if self.cancel_reason else "")
+            + (f" finish_layers={self.finish_layers} finish_rows={self.finish_rows} "
+               f"finish_landed={self.finish_landed} finish={self.finish_reason}"
+               if self.finish_layers else "")
+            + (f" at_arm=1 arm_issue_ms={self.arm_ms:.1f}" if getattr(self, "at_arm", False) else "")
+        )
+
+
+_RESUME_WARM: Optional[ResumeWarm] = None
+
+
+def resume_warm() -> ResumeWarm:
+    global _RESUME_WARM
+    if _RESUME_WARM is None:
+        _RESUME_WARM = ResumeWarm()
+    return _RESUME_WARM
+
+
 def deferred_rows_fill() -> DeferredRowsFill:
     global _DEFERRED_ROWS_FILL
     if _DEFERRED_ROWS_FILL is None:
@@ -6382,9 +7872,90 @@ def deferred_rows_fill() -> DeferredRowsFill:
     return _DEFERRED_ROWS_FILL
 
 
+class EagerPoolSyncQueue(threading.local):
+    """y6o: the per-layer republish of the host-planned eager forward
+    (``sync_pool_from_host``: sticky pool error, reports, ``sync_tables`` --
+    device reads, i.e. a drain of the stream) queued for the end of the model
+    forward instead of after every MoE layer, so layer L+1's launches overlap
+    layer L's experts. ``scope()`` opens the window (the model's layer loop);
+    leaving it runs the queue in layer order -- also on an exception, so the
+    tables are never left unpublished. Outside a scope, or with
+    SGLANG_OPT_MOE_POOL_DEFER_EAGER_SYNC=0, ``defer`` declines and the caller
+    republishes at once. Per thread: only the forward's own thread defers."""
+
+    def __init__(self):
+        self.depth = 0
+        self.pending: List[tuple] = []
+
+    def defer(self, cache, holds, n_scratch: int) -> bool:
+        if self.depth <= 0:
+            return False
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_OPT_MOE_POOL_DEFER_EAGER_SYNC.get():
+            return False
+        if any(c is cache for c, _, _ in self.pending):
+            # the same layer twice in one scope: its first pass must be
+            # published before its tables are planned on again
+            self.flush()
+        self.pending.append((cache, holds, n_scratch))
+        return True
+
+    def flush(self):
+        """Run the queued republishes in layer order; the first sticky pool
+        error raises (its layer is in the text) and the rest are dropped."""
+        pending, self.pending = self.pending, []
+        for cache, holds, n_scratch in pending:
+            cache._finish_pool_sync(holds, n_scratch)
+
+    def scope(self):
+        return _EagerPoolSyncScope(self)
+
+
+class _EagerPoolSyncScope:
+    def __init__(self, queue: EagerPoolSyncQueue):
+        self.queue = queue
+
+    def __enter__(self):
+        self.queue.depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.queue.depth -= 1
+        if self.queue.depth == 0:
+            if exc_type is None:
+                self.queue.flush()
+            else:
+                # the forward already failed: still publish, but never let a
+                # second error replace the first
+                try:
+                    self.queue.flush()
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "eager pool sync after a failed forward"
+                    )
+        return False
+
+
+_EAGER_SYNC = EagerPoolSyncQueue()
+
+
+def eager_pool_sync_scope():
+    """Context manager for a model's layer loop: the eager pool republish of
+    every MoE layer inside it runs once, in layer order, when it closes."""
+    return _EAGER_SYNC.scope()
+
+
 def deferred_rows_tick(batch) -> None:
     """Der Scheduler-Haken vor jedem Forward (H31b); ohne offene Zeilen ein
-    Attributzugriff."""
+    Attributzugriff. RW-FINISH: die fertig gelandeten Warm-Layer werden hier
+    eingetragen (Event-Abfrage, keine Host-Wartestelle)."""
+    rw = _RESUME_WARM
+    if rw is not None and rw._inflight:
+        try:
+            rw.promote_ready()
+        except Exception as exc:  # noqa: BLE001 -- a warm never breaks a forward
+            logger.warning("RW FINISH promote skipped: %s", exc)
     fill = _DEFERRED_ROWS_FILL
     if fill is None or not fill.pending:
         return
@@ -7246,6 +8817,35 @@ def publish_expert_bands(layer, attr: str, buf, resident_ids) -> int:
     return n
 
 
+class H2dCutBroken(RuntimeError):
+    """BOOTZEIT 5d: a row the presplit takes from the card's [E] copy was not
+    in the h2d cut -- it would carry the cut's zeros into the resident buffer
+    (forward, flip exchange) or into the shared store (every reader)."""
+
+
+def assert_h2d_cut_covers(layer, rows, *, what: str) -> None:
+    """Every local row in ``rows`` must be one the presplit's h2d copied.
+
+    ``layer._h2d_cut_rows`` is the cut ``_ct_stream_presplit_now`` handed to
+    ``device_loading_context`` (None = the full copy, nothing to check). The
+    cut is ``store_adopt.repack_rows`` = all rows but the H2-vetoed; a vetoed
+    row is never a resident (``filter_store_rows`` raises) and never written
+    (it is skipped there) -- this guard is the same promise stated against the
+    cut itself, so a later change on either side fails loudly instead of
+    loading zeros."""
+    cut = getattr(layer, "_h2d_cut_rows", None)
+    if cut is None:
+        return
+    have = set(int(r) for r in cut)
+    missing = sorted(int(r) for r in rows if int(r) not in have)
+    if missing:
+        raise H2dCutBroken(
+            f"BOOTZEIT5d NULL-ROW: layer {getattr(layer, 'layer_id', '?')} {what}: "
+            f"{len(missing)} rows were not copied to the card (first local "
+            f"{missing[:4]}) -- the cut zeroed them; set "
+            f"SGLANG_OPT_LOAD_H2D_READ_ROWS=0 and report the layer")
+
+
 def presplit_expert_offload_after_repack(
     layer, cold_shard: Optional[ColdShardContext] = None
 ) -> None:  # pragma: no cover - CUDA
@@ -7389,9 +8989,18 @@ def presplit_expert_offload_after_repack(
     if store_rows is not None:
         layer._moe_offload_store_index = dict(store_rows[4])
 
+    # BOOTZEIT 5d: the residents (buffer rows the forward and the flip
+    # exchange read) must all have crossed to the card
+    assert_h2d_cut_covers(
+        layer,
+        range(int(R)) if static else plan.resident_ids,
+        what="resident rows",
+    )
     presplit = {}
     freed_device = 0
     freed_host = 0
+    _store_geom = []  # BOOTZEIT 5c: (attr, row shape, dtype) of each store opened
+    _store_dev = None
     for attr in MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS:
         p = getattr(layer, attr, None)
         if p is None:
@@ -7447,10 +9056,18 @@ def presplit_expert_offload_after_repack(
             # darauf loszulassen -- die Datei waere doppelt verkleinert und
             # der letzte Rang schriebe hinter ihr Ende. Explizit als
             # `num_slots` durchreichen, damit genau eine Stelle rechnet.
+            import time
+
+            _t_open = time.perf_counter()
             spill, _created = _es.open_store(
                 s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype,
                 num_slots=s_num,
             )
+            _STORE_CLOCK["open_s"] += time.perf_counter() - _t_open
+            _STORE_CLOCK["opens"] += 1
+            _store_geom.append((attr, tuple(t.shape[1:]), t.dtype))
+            if t.is_cuda:
+                _store_dev = t.device.index
             # Only the COLD rows go to the host (flip design 20.09.: a row a
             # card holds in some layout is taken from that card over BAR1, the
             # host store keeps what no card holds). fn8m measured the store
@@ -7486,12 +9103,32 @@ def presplit_expert_offload_after_repack(
                     )
             except ImportError:
                 pass
-            written = _es.write_rows(
-                spill, t, list(plan.spill_ids), s_lo, s_pad, rows=s_index
+            # NF-Bootzeit H2: the rows this D rank vetoed at load were never
+            # read -- the store holds P's bytes for them (sentinel). Leave
+            # them out of the write; the reader index stays complete.
+            from sglang.srt.layers.moe import store_adopt as _sa
+
+            _rows_w, _n_adopt = _sa.filter_store_rows(
+                layer, attr, dict(s_index), plan.resident_ids, s_lo, s_pad
             )
+            if _n_adopt:
+                logger.info(
+                    "%s layer=%s attr=%s: %d store rows taken from P (not read, "
+                    "not rewritten), %d written",
+                    _sa.MARKER, s_key, attr, _n_adopt, len(_rows_w),
+                )
+            assert_h2d_cut_covers(layer, _rows_w.keys(), what=f"store rows {attr}")
+            _t_write = time.perf_counter()
+            written = _es.write_rows(
+                spill, t, list(plan.spill_ids), s_lo, s_pad, rows=_rows_w
+            )
+            _STORE_CLOCK["write_s"] += time.perf_counter() - _t_write
+            # H2: the adopted rows are valid store rows too (P's bytes); the
+            # sentinel keeps meaning "these rows hold real weights".
+            _adopted = [int(v) for k, v in s_index.items() if k not in _rows_w]
             _es.mark_rows_written(
                 s_dir, s_key, attr, int(getattr(layer, "moe_tp_rank", 0) or 0),
-                written.values(),
+                list(written.values()) + _adopted,
             )
         else:
             spill = pinned_exact_empty((len(plan.spill_ids),) + tuple(t.shape[1:]), t.dtype)
@@ -7580,6 +9217,14 @@ def presplit_expert_offload_after_repack(
         else:
             setattr(layer, attr, empty)
 
+    if store_rows is not None and _store_geom:
+        # BOOTZEIT 5c: the next layer's store has this geometry; the caller
+        # (_ct_stream_presplit_now) starts its open once this layer's host
+        # stack is gone (layers/moe/store_prefetch.py).
+        layer._store_prefetch_next = dict(
+            directory=store_rows[0], slots=int(store_rows[3]),
+            geometry=list(_store_geom), device_index=_store_dev,
+        )
     if presplit:
         layer._moe_offload_presplit = presplit
         if _seat_x > 0:
@@ -7607,15 +9252,7 @@ def presplit_expert_offload_after_repack(
         # gc + malloc_trim returns them so the host peak stays ~= spill, not the
         # full loaded set. Cheap (runs once per MoE layer at load).
         del t, buf, spill
-        import gc as _gc
-
-        _gc.collect()
-        try:
-            import ctypes as _ct
-
-            _ct.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
+        presplit_host_reclaim()
 
 
 # --- Task #49 (2026-09-20, after fn8c8b): the router-level probe ------------

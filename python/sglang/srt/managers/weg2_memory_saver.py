@@ -1567,6 +1567,14 @@ class VramCredit:
         # first pass that finds it.
         _stage_wait_t0 = None
         _next_abort_check = time.monotonic()
+        # W109b: when the cycle was first seen, and how long it may stand
+        _cycle_seen = None
+        try:
+            from sglang.srt.weg2.bar1_lanes import cycle_grace_s as _cg
+
+            _cycle_hold_s = float(_cg())
+        except Exception:  # noqa: BLE001 -- the desk may lack the lanes module
+            _cycle_hold_s = 3.0
         while True:
             if abort_reader is not None and time.monotonic() >= _next_abort_check:
                 _next_abort_check = time.monotonic() + 0.5
@@ -1587,6 +1595,23 @@ class VramCredit:
                 try:
                     _chain = cycle_reader()
                 except Exception:  # noqa: BLE001 -- a probe may not raise
+                    _chain = None
+                # W109b: the depositor in the chain spills its tag remainder to
+                # host memory and pauses (bar1_lanes._spill_rest, at a third of
+                # the grace); the waker refuses only a cycle that outlives
+                # that answer by one more grace.
+                if not _chain:
+                    _cycle_seen = None
+                elif _cycle_seen is None:
+                    _cycle_seen = time.monotonic()
+                    logger.info(
+                        "WEG2-CREDIT-WAIT tag=%s W109b cycle seen %.1fs into the wait: %s -- "
+                        "waiting for the blocked depositor to spill to host and pause",
+                        tag, time.perf_counter() - t0,
+                        " -> ".join(f"sleeper{s} blocked depositing {t} to waker{d}"
+                                    for s, d, t in _chain))
+                    _chain = None
+                elif time.monotonic() - _cycle_seen < _cycle_hold_s:
                     _chain = None
                 if _chain:
                     raise Weg2XchgCreditCycleRefused(

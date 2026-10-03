@@ -924,12 +924,15 @@ class HiRadixCache(RadixCache):
             return {"host_pools": self.cache_controller.mem_pool_host.entries}
         return {}
 
-    def clear_storage_backend(self) -> bool:
+    def clear_storage_backend(self, force: bool = False) -> bool:
         if self.enable_storage:
             try:
                 # Check if the storage backend has a clear method (for nixl backends)
                 if hasattr(self.cache_controller.storage_backend, "clear"):
-                    self.cache_controller.storage_backend.clear()
+                    from sglang.srt.mem_cache.hicache_storage import clear_storage
+
+                    if not clear_storage(self.cache_controller.storage_backend, force=force):
+                        return False
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )

@@ -56,7 +56,9 @@ def test_111_kein_zwischenpuffer_und_kein_lookup_je_experte():
     code = "\n".join(z for z in src.split("\n") if not z.lstrip().startswith("#"))
     # Das Modul wird EINMAL geholt, vor der Schleife.
     i_mod = code.index("_jit_gptq_marlin_repack_module()")
-    i_loop = code.index("for e in range(num_experts)")
+    # BOOTZEIT 3 (29.09.): die Schleife laeuft ueber `rows` oder alle
+    # Experten (SGLANG_MOE_REPACK_SKIP_VETOED) -- dieselbe Schleife.
+    i_loop = code.index("for e in (range(num_experts) if rows is None else rows)")
     assert i_mod < i_loop, "der Modul-Lookup steht noch in der Schleife"
     assert code.count("_jit_gptq_marlin_repack_module()") == 1
     # Der Kernel schreibt DIREKT in output[e] -- keine Zuweisung aus einem

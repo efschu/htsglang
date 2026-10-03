@@ -118,6 +118,29 @@ from sglang.srt.weg2.front import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+
+# X-COST-LINE is the default since 29.09. (27B z30y metal proof); this module
+# pins the solo-r_D re-solve it was written for -- the =0 path, still valid.
+_XCL_KEY = "SGLANG_WEG2_ENABLE_X_COST_LINE"
+_XCL_SAVED = None
+
+
+def setup_module(module=None):
+    global _XCL_SAVED
+    import os as _os
+
+    _XCL_SAVED = _os.environ.get(_XCL_KEY)
+    _os.environ[_XCL_KEY] = "0"
+
+
+def teardown_module(module=None):
+    import os as _os
+
+    if _XCL_SAVED is None:
+        _os.environ.pop(_XCL_KEY, None)
+    else:
+        _os.environ[_XCL_KEY] = _XCL_SAVED
+
 # --- sb5g, measured -------------------------------------------------------
 SB5G_X = 8742                 # after the #1290 base change, source=boot
 SB5G_D_UNCACHED = 24657       # what D priced the LONG request at
@@ -185,7 +208,9 @@ class ACompletedLegOneMakesTheRefusalTerminal(CustomTestCase):
                            "the re-offer never asks whether the P prefill it "
                            "is about to repeat has already run once")
         self.assertIn("leg1_done", src)
-        self.assertIn("status=413", src[i:i + 3000])
+        # rc12z30d 21:11:35: the status is refusal_status(measured,
+        # carrier_max) -- 503 on a state fault, 413 only over the form.
+        self.assertIn("refusal_status(measured_whole", src[i:i + 3000])
 
     def test_the_terminal_check_follows_the_one_re_offer(self):
         """CORRECTED BY #1296 ROUND 2 -- this assertion pinned the defect.
@@ -214,7 +239,8 @@ class ACompletedLegOneMakesTheRefusalTerminal(CustomTestCase):
         # find() answers -1 for "absent", and -1 satisfies every assertGreater
         # below -- so each anchor is proved PRESENT before it is ordered.
         # (Assert-on-a-literal, the trap this class has now hit five times.)
-        requeue_log = src.find('"WEG2 X-REQUEUE rid=%s n=%d verdict=%s"')
+        # SK-X: the line carries one more %s (the "P never ran" note)
+        requeue_log = src.find('"WEG2 X-REQUEUE rid=%s n=%d verdict=%s%s"')
         w35 = src.find('self.counters["W35_Weg2XReQueueLoop"] += 1')
         for name, off in (("W53 increment", i), ("X-REQUEUE line", requeue_log),
                           ("W35 increment", w35)):

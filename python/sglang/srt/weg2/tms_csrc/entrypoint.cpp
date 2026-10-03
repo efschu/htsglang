@@ -190,6 +190,31 @@ uint64_t tms_resume_stats(char* tag, size_t tag_len,
     return TorchMemorySaver::instance().resume_stats(tag, tag_len, allocations, map_ms, copy_ms);
 }
 
+// PAUSE-SUB (30.09.): the last ``pause`` call's pass-3 split -- allocations,
+// cuMemUnmap calls, the unmap and release clocks, the whole call. Same
+// contract as ``tms_resume_stats``: ``tag`` written back, 0 = none recorded.
+uint64_t tms_pause_stats(char* tag, size_t tag_len, uint64_t* allocations, uint64_t* unmaps,
+                         double* unmap_ms, double* release_ms, double* total_ms) {
+    return TorchMemorySaver::instance().pause_stats(tag, tag_len, allocations, unmaps,
+                                                    unmap_ms, release_ms, total_ms);
+}
+
+// PAUSE-MAPS (30.09., patch 5): ``on`` != 0 = every later ``pause`` releases a
+// span-mapped allocation with ONE cuMemUnmap per contiguous run of extents
+// (0 = the patch-4 walk, one call per extent).  Returns the state now set.
+int tms_set_pause_coalesce(int on) {
+    return TorchMemorySaver::instance().set_pause_coalesce(on != 0) ? 1 : 0;
+}
+
+// PAUSE-MAPS: the last ``pause``'s extent census (extents released, coalesced
+// runs, runs refused as one range, the switch it saw).  Contract of
+// ``tms_pause_stats``: ``tag`` written back, the same sequence, 0 = none.
+uint64_t tms_pause_maps_stats(char* tag, size_t tag_len, uint64_t* extents, uint64_t* runs,
+                              uint64_t* fallbacks, int* coalesce) {
+    return TorchMemorySaver::instance().pause_maps_stats(tag, tag_len, extents, runs,
+                                                         fallbacks, coalesce);
+}
+
 //: Returns 0 when this boot published no ring (stock cudaMallocHost path), 1
 //: otherwise.  Every out-pointer may be null.  ``card_uuid`` is written NUL
 //: terminated and truncated to ``card_uuid_len``.

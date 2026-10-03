@@ -641,6 +641,7 @@ class UnifiedDrainPhaseTest(CustomTestCase):
 
         fixture.cache_controller.write_storage = _write_storage
         fixture.cache_controller._dcp_owner_ctx = lambda: None
+        fixture.cache_controller.page_owner_mask_ctx = lambda: None  # #239 S4b
         fixture._record_store_event = lambda node, medium=None: None
         fixture.dec_lock_ref = lambda node, params: None
 

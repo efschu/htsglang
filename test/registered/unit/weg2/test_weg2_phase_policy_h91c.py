@@ -158,6 +158,13 @@ class Harness:
         kw.update(self.front_kwargs)
         self.front = Front(self.p.url, self.d.url, **kw)
         self.front.session = ClientSession(timeout=ClientTimeout(total=60))
+        # BOOT-START HOLD (a105d38905): the served front ends the hold when its
+        # tokenizer load (scheduled from on_startup, which this harness does not
+        # run) ends. No load runs here, so it has ended: release it, or every
+        # arrival of an x_exact profile (qwen27b form) waits for the hold bound.
+        _ready = getattr(self.front, "_x_exact_ready_event", None)
+        if _ready is not None:
+            _ready().set()
         app = web.Application(client_max_size=1024 ** 3)
         app.router.add_post("/generate", self.front.handle_generate)
         self.server = TestServer(app)
@@ -502,3 +509,13 @@ def test_leg1_that_never_starts_is_requeued_as_an_intake_stall_and_the_flip_foll
             assert h.p.gen_marks.count("st") >= 2                 # prefilled in a later P phase
 
     asyncio.run(body())
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")

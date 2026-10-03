@@ -312,13 +312,15 @@ def test_a_card_that_cannot_hold_the_d_tags_is_refused():
     assert any("STEHT bei" in ln for ln in _card2(plan))
 
 
-def test_a_foreign_geometry_is_named_not_graded():
+def test_a_foreign_cut_without_geometry_is_refused_by_name():
+    """#242r: ein anderer Schnitt ohne die Geometrie des PP-Cut-Solves ist nicht
+    umrechenbar -> W167 mit Namen, nie mehr ein stilles ENTFAELLT."""
     plan = pd.plan_wake_credit_pd(
         model=MODEL, p_split=(24, 12, 12), chunk_layers=CHUNK, n_layers=N_LAYERS, p_card=P_CARD,
         d_ratio="183,137,168", draft_on_p=True, p_rows=P_ROWS["x141"], d_rows=_d_rows(BASE),
         slot_mib=SLOT_MIB, label="D", apply=False)
-    assert plan.refusal is None and plan.front_plan is None
-    assert "ENTFAELLT" in plan.lines[0] and "p_split" in plan.lines[0]
+    assert plan.refusal is not None and plan.refusal.startswith("W167 Weg2PCutRecutRefused")
+    assert "ENTFAELLT" not in plan.lines[0] and "24,12,12" in plan.lines[0]
 
 
 # --------------------------------------------------------------------------- Front

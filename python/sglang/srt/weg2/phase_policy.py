@@ -41,6 +41,8 @@ waiting.
 from __future__ import annotations
 
 import json
+import os
+import statistics
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 # H91c3-3: imported with this module (the front imports it before its loop),
@@ -192,22 +194,38 @@ def park_body(epoch: int, bound_s: float, reason: Optional[str] = None) -> dict:
 # decodes parks D's running decodes at once and the front flips to P -- no
 # 60 s bound, no waiting for D's decodes to end. Only a request that NEEDS P
 # fires it: one D could serve itself once idle (a SHORT behind D's budget, a
-# band request the RC7-X busy/idle split deferred, a SHORT-only backlog the
-# 27B idle policy (b) drains) never does -- for those no flip is due at all.
+# SHORT-only backlog the 27B idle policy (b) drains) never does -- for those no
+# flip is due at all.
+#
+# PK2 (metal dkr27bparkdraftbar1w209270712, 27.09.): a BAND request the RC7-X
+# busy/idle split deferred (Pending.x_deferred: X_busy < uncached <= live X,
+# routed LONG because D was decoding) DOES fire. While D decodes, the X in force
+# is X_busy (the router's own verdict); the idle re-grant only serves it once D
+# is idle, i.e. after D's decodes end -- weg2-28-62 (4172 > X_busy 4096 <= live X
+# 7290) waited 45 s for the fairness bound and 65 s more for the drain (flip 67 s).
 # ---------------------------------------------------------------------------
 
 def needs_p(est_uncached: int, x_tokens: int, *, skip_leg1: bool = False,
-            leg1_done: bool = False, p_only: bool = False, x_requeues: int = 0) -> bool:
+            leg1_done: bool = False, p_only: bool = False, x_requeues: int = 0,
+            x_deferred: bool = False, x_routed: int = 0) -> bool:
     """Does this queued request need P's prefill (the immediate park's
     trigger)? ``est_uncached > X`` (law 4: D never prefills above X), a
     P-only request (an image under transient vision, long by rule), or one D
     already refused as over X (W31, ``x_requeues``). Never a request whose
     leg 1 is done (it waits for D, not for P) or that skips leg 1 (route
-    CARRIER-EXCEEDS: D prefills it once, a flip to P buys nothing)."""
+    CARRIER-EXCEEDS: D prefills it once, a flip to P buys nothing).
+
+    #246b (NF y4c 04:39:57, weg2-22-37): ``x_routed`` > 0 is the X the front
+    ROUTED this request on (the X-SOLO band floor X_busy while D is busy); above
+    it the request was sent to P and needs P, even when it lies below the live
+    X ``x_tokens`` -- otherwise it is neither D's (routed away) nor P's (no
+    trigger) and waits until D runs empty."""
     if skip_leg1 or leg1_done:
         return False
-    if p_only or int(x_requeues or 0) > 0:
-        return True
+    if p_only or int(x_requeues or 0) > 0 or x_deferred:
+        return True  # x_deferred: over X_busy, the X in force while D decodes (PK2)
+    if int(x_routed or 0) > 0 and int(est_uncached) > int(x_routed):
+        return True  # #246b: routed to P on this X
     return int(est_uncached) > int(x_tokens)
 
 
@@ -219,7 +237,9 @@ def immediate_park_trigger(queue: Iterable, x_tokens: int):
                    skip_leg1=bool(getattr(p, "skip_leg1", False)),
                    leg1_done=bool(getattr(p, "leg1_done", False)),
                    p_only=bool(getattr(p, "p_only", False)),
-                   x_requeues=int(getattr(p, "x_requeues", 0) or 0)):
+                   x_requeues=int(getattr(p, "x_requeues", 0) or 0),
+                   x_deferred=bool(getattr(p, "x_deferred", False)),
+                   x_routed=int(getattr(p, "x_routed", 0) or 0)):
             return p
     return None
 
@@ -232,6 +252,398 @@ def immediate_park_dwell_ok(awake_s: float, min_dwell_ms: float, floor_ms: float
     much decode per D phase, so a stream of long arrivals cannot starve them
     to zero progress. Both are inputs: the front owns the clock and K7."""
     return float(awake_s) * 1000.0 >= max(float(min_dwell_ms), float(floor_ms))
+
+
+#: PARK-CYCLE DWELL (27B rc12k27 b23, 27.09.): switch, default on; 0 = K7's
+#: one-flip dwell for every D phase, byte for byte.
+PARK_CYCLE_DWELL_ENV = "SGLANG_WEG2_PARK_CYCLE_DWELL"
+
+
+def park_cycle_dwell_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    raw = (e.get(PARK_CYCLE_DWELL_ENV, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def park_cycle_dwell_ms(d_to_p_ms: float, p_to_d_ms: float, resumed_phase: bool,
+                        on: bool = True) -> float:
+    """The dwell an immediate park waits for in a D phase.
+
+    K7 prices a D phase at ONE flip (the D->P flip the park starts). A D phase
+    that began by RESUMING parked requests paid the whole park cycle for them
+    already -- the D->P flip, P's work, the P->D flip back -- and re-parking
+    them after one flip's worth of decode is the measured thrash (b23 10:02:38-
+    10:04:24: 6 parks, D awake 3.0/3.2/10.2/2.6/18.7/20.5 s, the same six rids
+    parked up to 5 times in 80 s, D decoding 55 % of the wall). Such a phase is
+    priced at the cycle's two flips (D->P + P->D, both measured, K7's own
+    source), so every park round trip buys at least as much decode as it costs
+    in flips; an over-X arrival inside that window rides on the one park that
+    follows it (the queue drains on P as a batch). Every other D phase -- a
+    fresh wake, a phase that parked nothing -- keeps K7 unchanged, and so does
+    the switch off. Pure: the front owns the clock and the flip log."""
+    d_to_p = max(0.0, float(d_to_p_ms))
+    if not on or not resumed_phase:
+        return d_to_p
+    return d_to_p + max(0.0, float(p_to_d_ms))
+
+
+PARK_DECODE_DWELL_ENV = "SGLANG_WEG2_PARK_DECODE_DWELL"
+
+
+def park_decode_dwell_on(env=None) -> bool:
+    """NF rc12z22 (boot ...dauer09281447, 14:52-14:58): 22 flips in 374 s, D
+    decoding 1-3 s per 7-16 s D phase -- the resumed requests' store->device
+    reload took 4-8 s after every wake, and the dwell (priced in FLIP time
+    from the wake) fired the next park just as decode began: 335 completion
+    tokens/min for every agent together. Default ON; "0" = the wake clock."""
+    e = os.environ if env is None else env
+    raw = (e.get(PARK_DECODE_DWELL_ENV, "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+PARK_DECODE_DUTY_ENV = "SGLANG_WEG2_PARK_DECODE_DUTY"
+
+
+def park_decode_duty(env=None) -> float:
+    """Target decode share of a park cycle (default 0.5: D decodes at least
+    as long as the cycle costs); clamped to [0.1, 0.9]."""
+    e = os.environ if env is None else env
+    try:
+        v = float((e.get(PARK_DECODE_DUTY_ENV, "") or "0.5").strip())
+    except ValueError:
+        v = 0.5
+    return min(0.9, max(0.1, v))
+
+
+def park_decode_dwell_ok(awake_s: float, decode_s: Optional[float], cycle_ms: float,
+                         floor_ms: float, duty: float = 0.5) -> bool:
+    """The immediate park waits until D has DECODED at least the cycle it
+    costs: ``cycle_ms`` = the D->P + P->D flips (K7, both measured) plus this
+    phase's own resume (wake -> first decoded chunk), so every park round trip
+    buys at least as much decode as it costs -- decode duty >= 50 %.
+    ``decode_s`` is the time since this phase's first decoded chunk (None:
+    none seen yet). Without a decoded chunk the phase has not decoded at all:
+    it holds for twice the cycle on the wake clock, then fires (a phase that
+    streams nothing -- non-stream legs only -- must not hold to the fairness
+    bound). Pure: the front owns the clocks."""
+    d = min(0.9, max(0.1, float(duty)))
+    need = max(float(cycle_ms) * d / (1.0 - d), float(floor_ms)) / 1000.0
+    if decode_s is None:
+        return float(awake_s) >= 2.0 * need
+    return float(decode_s) >= need
+
+
+def park_collect_window(items: Sequence[Tuple[float, int]], now: float, t_awake: float,
+                        n_running: int, price_s: float, threshold_tokens: int, *,
+                        timer: bool = False, max_requests: int = 0, pool_tokens: int = 0,
+                        wait_bound_s: float = 0.0) -> Tuple[bool, str, Optional[float], float]:
+    """PARK-COLLECT-WINDOW: may the immediate park stop D's running decodes now?
+
+    NF z30w-park 08:31-08:46: 21 immediate parks in 15 min, all fired by ONE
+    over-X arrival (7 of them 4224-4761 uncached against X=4096), 37 parked
+    streams, park -> resume 8.4 s median / 17.8 s p90. The user's model: D
+    keeps decoding; once the pending P work passes the bound, it collects
+    while D decodes on, and the flip comes when collecting has cost as much as
+    the flip would -- or earlier when D's decodes end.
+
+    SKI RENTAL (user decision 29.09.), both sides in request-seconds: the
+    RENT is what the queued requests have waited since the window opened
+    (their sum), the PRICE of the flip is ``price_s`` -- the caller passes one
+    measured round trip per running stream, which is what a park stalls. One
+    stream and one waiting request = "wait one round trip". ``timer`` (the
+    fixed-x override) instead closes the window ``price_s`` after it opened.
+
+    ``items`` are the queued requests that need P as ``(t_arrive, uncached)``.
+    The window opens when their uncached sum first passes
+    ``threshold_tokens`` (head first by arrival), never before this D phase
+    woke. Fires on: nothing running (the park stops nobody), a hard cap --
+    ``max_requests`` queued (P's phase cap), ``pool_tokens`` queued (P's
+    pool), the oldest waited ``wait_bound_s`` -- or the rent reaching the
+    price. Returns ``(fire, why, t_start, left_s)`` (``left_s`` at the current
+    queue); pure -- the front owns the clocks."""
+    rows = sorted((float(t), int(u)) for t, u in items)
+    if not rows:
+        return False, "empty", None, 0.0
+    total, t_cross = 0, None
+    for t, u in rows:
+        total += u
+        if total > int(threshold_tokens):
+            t_cross = t
+            break
+    if t_cross is None:
+        return False, "below-threshold", None, 0.0
+    t_start = max(t_cross, float(t_awake))
+    if timer:
+        left = max(0.0, float(price_s) - (float(now) - t_start))
+    else:
+        rent = sum(max(0.0, float(now) - max(t, t_start)) for t, _ in rows)
+        left = max(0.0, (float(price_s) - rent) / len(rows))
+    if int(n_running) <= 0:
+        return True, "d-idle", t_start, left
+    if int(max_requests) > 0 and len(rows) >= int(max_requests):
+        return True, "cap-requests", t_start, left
+    if int(pool_tokens) > 0 and sum(u for _, u in rows) >= int(pool_tokens):
+        return True, "cap-pool", t_start, left
+    if float(wait_bound_s) > 0.0 and float(now) - rows[0][0] >= float(wait_bound_s):
+        return True, "wait-bound", t_start, left
+    if left <= 0.0:
+        return True, "timer" if timer else "rent", t_start, 0.0
+    return False, "collect", t_start, left
+
+
+#: PARK-COLLECT-WINDOW: the measured-record sidecar entry of one flip round
+#: trip. The sidecar's other readers filter on their own fields
+#: (``rss_shmem_gib``/``flip_ratchet_gib``, ``kind == "pd_free0"``) and do
+#: not see it.
+PARK_ROUND_TRIP_KIND = "park_round_trip"
+PARK_ROUND_TRIP_GROUP = "PARK_RT"
+#: The first round trips of a boot that are appended (the sidecar is
+#: append-only across every boot of the rig; the newest one seeds the next).
+PARK_ROUND_TRIP_RECORDS = 3
+
+
+def warm_resume_ms(resume_log: Sequence[float], window: int = 5) -> Optional[float]:
+    """The median wake -> first decoded chunk of the last ``window`` WARM D
+    phases, or ``None`` before there is one. The boot's first resume is never
+    warm (first park, JIT, pinning -- the same exclusion as H34b's first
+    flip), and one slow resume must not move the price: the caller charges it
+    once per running stream, so a single cold 10 s resume at bs6 would hold D
+    for 60 s (27B review 29.09.)."""
+    warm = [float(ms) for ms in list(resume_log)[1:]][-max(1, int(window)):]
+    return statistics.median(warm) if warm else None
+
+
+def park_round_trip_s(dp_ms: float, pd_ms: float, resume_ms: Optional[float]) -> Optional[float]:
+    """The ski-rental price of one flip round trip in seconds: K7's D->P and
+    P->D prices plus D's wake -> first decoded chunk; ``None`` while any of
+    the three is unmeasured (K7 prices 0 before its first flip)."""
+    if resume_ms is None or float(dp_ms) <= 0.0 or float(pd_ms) <= 0.0:
+        return None
+    return (float(dp_ms) + float(pd_ms) + float(resume_ms)) / 1000.0
+
+
+def park_round_trip_record(*, form_key: str, dp_ms: float, pd_ms: float, resume_ms: float,
+                           boot_tag: str, commit: Optional[str], at: str) -> dict:
+    """The sidecar entry of one measured round trip, keyed by ``form_key``
+    (checkpoint x form, see the front's ``_park_form_key``) so a qwen27b
+    boot never reads a nextflash round trip and vice versa."""
+    return {
+        "kind": PARK_ROUND_TRIP_KIND, "group": PARK_ROUND_TRIP_GROUP, "form_key": str(form_key),
+        "round_trip_s": park_round_trip_s(dp_ms, pd_ms, resume_ms),
+        "dp_ms": float(dp_ms), "pd_ms": float(pd_ms), "resume_ms": float(resume_ms),
+        "boot_tag": str(boot_tag), "commit": commit, "at": str(at),
+    }
+
+
+def newest_park_round_trip(samples: Iterable[dict], form_key: str) -> Optional[dict]:
+    """The newest round-trip entry of ``form_key`` among ``samples``, or ``None``."""
+    rows = [e for e in samples
+            if isinstance(e, dict) and e.get("kind") == PARK_ROUND_TRIP_KIND
+            and e.get("form_key") == form_key and isinstance(e.get("round_trip_s"), (int, float))
+            and float(e["round_trip_s"]) > 0.0]
+    return max(rows, key=lambda e: str(e.get("at", "")), default=None)
+
+
+def read_park_round_trip(path: str, form_key: str) -> Optional[dict]:
+    """:func:`newest_park_round_trip` of the sidecar at ``path``; a missing or
+    malformed sidecar is an ABSENCE (``None``), never a zero."""
+    if not path or not form_key:
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    samples = data.get("samples") if isinstance(data, dict) else None
+    return newest_park_round_trip(samples if isinstance(samples, list) else [], form_key)
+
+
+# ---------------------------------------------------------------------------
+# X-COST-LINE (29.09., third part of the ski-rental decision): X from D's
+# measured cost line, priced by the measured round trip, amortised over the
+# requests one P phase carries.
+#
+# THE MODEL. D prefilling ``n`` uncached tokens behind a cached prefix of
+# ``p`` tokens costs ``a + b*n + c*n*p`` ms (one forward's fixed cost -- NF's
+# expert stream, H118 -- plus a per-token cost that grows with the prefix the
+# attention reads). Routing it through P costs its share of one round trip
+# plus ``n / r_P``. Break-even:
+#
+#     a + (b + c*p) * n = price / k + 1000 * n / r_P
+#     X* = (1000 * price / k - a) / (b + c*p - 1000 / r_P)
+#
+# ``price`` is the ski instrument's warm round trip (D->P + P->D + wake ->
+# first decoded chunk), the one price source of the collect window; ``k`` the
+# mean number of requests a P phase prefills (FLIP-ECONOMICS "amortising
+# once over the backlog", 27B review 29.09.). Measured inputs (D logs
+# 09290827 NF / 09290020 27B, TP0 lines with n >= 64): NF a=1900 ms,
+# b=1.352, c=0.00088 ms/tok per k prefix; 27B a=227, b=0.611, c=0.00093.
+# ---------------------------------------------------------------------------
+
+#: The measured-record sidecar entry of one fitted D cost line (plus the
+#: amortisation k and the prefix depth it was solved at).
+X_COST_LINE_KIND = "x_cost_line"
+X_COST_LINE_GROUP = "X_COST"
+#: The first fitted lines of a boot that are appended (the newest seeds the next).
+X_COST_LINE_RECORDS = 3
+
+
+def _det3(m: Sequence[Sequence[float]]) -> float:
+    return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+
+
+#: A fit needs this many forwards of at least FIT_BIG_TOKENS (27B review of
+#: 800bb82ac6): the break-even sits at thousands of tokens, and a window of
+#: small extends alone moved P's slope 0.039 <-> 0.247 ms/tok on 27B 09290020,
+#: X between 8.6k and 11.6k.
+FIT_BIG_TOKENS = 1024
+
+
+def x_step_limited(x_new: float, x_prev: int, max_step: float) -> Tuple[int, bool]:
+    """Hysteresis of the live X (27B review of 800bb82ac6): one re-solve moves
+    X by at most ``max_step`` of the previous value, so a noisy fit cannot
+    flip the D/P route back and forth. Returns ``(x, limited)``."""
+    if max_step <= 0.0 or x_prev <= 0:
+        return int(x_new), False
+    lo, hi = x_prev * (1.0 - max_step), x_prev * (1.0 + max_step)
+    x = min(max(float(x_new), lo), hi)
+    return int(x), x != float(x_new)
+
+
+def fit_cost_line(rows: Iterable[Tuple[int, int, float]], *, min_tokens: int,
+                  min_samples: int, min_spread: float = 4.0,
+                  min_big: int = 8) -> Tuple[Optional[dict], str]:
+    """Least squares of ``ms = a + b*n + c*n*p_k`` over D's prefill forwards
+    ``(n, prefix_tokens, ms)`` with ``n >= min_tokens`` (``p_k`` = prefix in
+    thousands). Returns ``(line, why)``; ``line`` is ``None`` with a named
+    ``why`` when the rows cannot carry a line: too few, no spread in ``n``
+    (``n_hi / n_lo`` below ``min_spread`` or fewer than ``min_big`` forwards
+    of at least :data:`FIT_BIG_TOKENS` -- the slope would be the small
+    extends' noise), or a non-positive slope.
+
+    The depth term falls back to 0 (``why`` says so) when the prefixes do not
+    span enough to separate it from ``b`` or it comes out negative -- a
+    per-token cost that FALLS with the prefix read is not a measurement of
+    attention, it is the fit using ``c`` to absorb noise."""
+    pts = [(float(n), float(p) / 1000.0, float(ms)) for n, p, ms in rows
+           if int(n) >= int(min_tokens) and float(ms) > 0.0]
+    if len(pts) < max(3, int(min_samples)):
+        return None, f"samples={len(pts)}<{max(3, int(min_samples))}"
+    n_lo = min(x[0] for x in pts)
+    n_hi = max(x[0] for x in pts)
+    n_big = sum(1 for x in pts if x[0] >= FIT_BIG_TOKENS)
+    if n_hi < float(min_spread) * n_lo or n_big < int(min_big):
+        return None, f"no-spread(n {int(n_lo)}..{int(n_hi)}, {n_big} >= {FIT_BIG_TOKENS})"
+    why = "3p"
+    a = b = c = None
+    xs = [(1.0, n, n * pk) for n, pk, _ in pts]
+    ys = [ms for _, _, ms in pts]
+    A = [[sum(x[i] * x[j] for x in xs) for j in range(3)] for i in range(3)]
+    B = [sum(x[i] * y for x, y in zip(xs, ys)) for i in range(3)]
+    d = _det3(A)
+    scale = abs(A[0][0] * A[1][1] * A[2][2]) or 1.0
+    if abs(d) > 1e-9 * scale:
+        sol = []
+        for col in range(3):
+            m = [row[:] for row in A]
+            for i in range(3):
+                m[i][col] = B[i]
+            sol.append(_det3(m) / d)
+        a, b, c = sol
+        if c < 0.0:
+            a = None
+            why = "2p(depth-term<0)"
+    else:
+        why = "2p(no-depth-spread)"
+    if a is None:
+        mn = statistics.mean(x[0] for x in pts)
+        my = statistics.mean(ys)
+        sxx = sum((x[0] - mn) ** 2 for x in pts)
+        b = sum((x[0] - mn) * (y - my) for x, y in zip(pts, ys)) / sxx
+        a, c = my - b * mn, 0.0
+    if not b > 0.0:
+        return None, f"slope<=0(b={b:.4f})"
+    return {"a_ms": max(0.0, a), "b_ms": b, "c_ms": c, "n": len(pts),
+            "n_lo": int(n_lo), "n_hi": int(n_hi),
+            "prefix_med": int(statistics.median(x[1] for x in pts) * 1000.0)}, why
+
+
+def solve_x_cost_line(*, price_s: float, k: float, line: dict, r_p: Optional[float],
+                      prefix_tokens: float,
+                      line_p: Optional[dict] = None) -> Tuple[Optional[float], str]:
+    """``X*`` of the model above, in tokens (the caller clamps it to its
+    measured floor and the ceiling), or ``(None, why)`` without a price or an
+    r_P. When D's marginal token at this depth is not dearer than P's there
+    is no crossing: the round trip never pays back per token, so D is the
+    cheaper route for EVERY size while its fixed cost stays under the price
+    share (``inf``, the ceiling decides) and P for every size otherwise
+    (0, the floor decides). A price share below D's fixed cost gives 0 too.
+
+    ``line_p`` (P's own cost line on its bottleneck stage PP0, same
+    instrument) replaces the drain rate ``r_p`` when given: P's side is then
+    ``a_P + (b_P + c_P*p) * n`` -- compute-honest, where the drain rate also
+    counts P's waits (27B 09290020: drain 1437 tok/s, PP0 9180)."""
+    if not price_s > 0.0:
+        return None, "no-price"
+    pk = float(prefix_tokens) / 1000.0
+    per_req_ms = 1000.0 * float(price_s) / max(1.0, float(k))
+    if line_p is not None:
+        p_fixed = float(line_p["a_ms"])
+        p_marg = float(line_p["b_ms"]) + float(line_p["c_ms"]) * pk
+    elif r_p is not None and r_p > 0.0:
+        p_fixed, p_marg = 0.0, 1000.0 / float(r_p)
+    else:
+        return None, "no-r_p"
+    marg_ms = float(line["b_ms"]) + float(line["c_ms"]) * pk
+    denom = marg_ms - p_marg
+    num = per_req_ms + p_fixed - float(line["a_ms"])
+    if denom <= 0.0:
+        side = "d-never-dearer" if num > 0.0 else "p-always-cheaper"
+        return (float("inf") if num > 0.0 else 0.0), (
+            f"{side}(d={marg_ms:.3f}ms/tok<=p={p_marg:.3f})")
+    return max(0.0, num / denom), "ok"
+
+
+def x_cost_line_record(*, form_key: str, line: dict, k: float, boot_tag: str,
+                       commit: Optional[str], at: str, side: str = "D") -> dict:
+    """The sidecar entry of one fitted cost line of group ``side`` (D, or P's
+    PP0), keyed by ``form_key`` (checkpoint x form) -- a qwen27b boot never
+    reads a nextflash line, and a P line never seeds D's."""
+    return {
+        "kind": X_COST_LINE_KIND, "group": X_COST_LINE_GROUP, "form_key": str(form_key),
+        "side": str(side),
+        "a_ms": float(line["a_ms"]), "b_ms": float(line["b_ms"]), "c_ms": float(line["c_ms"]),
+        "n": int(line["n"]), "n_lo": int(line["n_lo"]), "n_hi": int(line["n_hi"]),
+        "prefix_med": int(line.get("prefix_med", 0)), "k": float(k),
+        "boot_tag": str(boot_tag), "commit": commit, "at": str(at),
+    }
+
+
+def newest_x_cost_line(samples: Iterable[dict], form_key: str,
+                       side: str = "D") -> Optional[dict]:
+    """The newest cost-line entry of ``form_key`` and group ``side`` among
+    ``samples``, or ``None`` (an entry without ``side`` is D's)."""
+    rows = [e for e in samples
+            if isinstance(e, dict) and e.get("kind") == X_COST_LINE_KIND
+            and e.get("form_key") == form_key and e.get("side", "D") == side
+            and isinstance(e.get("b_ms"), (int, float)) and float(e["b_ms"]) > 0.0]
+    return max(rows, key=lambda e: str(e.get("at", "")), default=None)
+
+
+def read_x_cost_line(path: str, form_key: str, side: str = "D") -> Optional[dict]:
+    """:func:`newest_x_cost_line` of the sidecar at ``path``; a missing or
+    malformed sidecar is an ABSENCE (``None``), never a zero."""
+    if not path or not form_key:
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    samples = data.get("samples") if isinstance(data, dict) else None
+    return newest_x_cost_line(samples if isinstance(samples, list) else [], form_key, side)
 
 
 def park_verdict(status: int, text: str) -> Tuple[str, List[str], str]:

@@ -581,6 +581,33 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
             track_indices,
             context.gather(1, track_offsets.unsqueeze(1) + context_cols.unsqueeze(0)),
         )
+    # TURN ANCHOR: the same boundary gather at the second track's offset
+    # (registered as required whether or not the default track ran)
+    turn = _ple_turn_rows(forward_batch, "ple_ngram")
+    if turn is not None:
+        pool.set_ngram_context(
+            turn.dst_phys,
+            context.index_select(0, turn.rows_dev).gather(
+                1, turn.offsets_dev.unsqueeze(1) + context_cols.unsqueeze(0)
+            ),
+        )
+        turn.done.add("ple_ngram")
+
+
+def _ple_turn_rows(forward_batch: ForwardBatch, kind: str):
+    """TURN ANCHOR (weg2/turn_anchor.py): the batch's second tracks when the
+    GDN backend added them (translated slots, rows, offsets on the device),
+    with ``kind`` registered as required -- a turn anchor whose PLE side
+    state was not written is never inserted. None = nothing to write."""
+    # getattr: forward-batch doubles predating the field carry no plan (the
+    # #624 stub-drift class, as for the replay metadata in gdn_backend)
+    turn = getattr(forward_batch, "weg2_turn_tracks", None)
+    if turn is None or not len(turn):
+        return None
+    turn.need.add(kind)
+    if "gdn" not in turn.done or turn.dst_phys is None:
+        return None
+    return turn
 
 
 def _ple_track_targets(
@@ -1580,6 +1607,21 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state[track_indices] = _gather_at(track_offsets).to(
                     dtype=conv_state.dtype
                 )
+            # TURN ANCHOR: the second track's window, same gather (registered
+            # as required whether or not the default track ran)
+            turn = _ple_turn_rows(forward_batch, "ple_conv")
+            if turn is not None:
+                conv_state[turn.dst_phys] = (
+                    conv_input.index_select(0, turn.rows_dev)
+                    .gather(
+                        2,
+                        (turn.offsets_dev.unsqueeze(1) + state_cols.unsqueeze(0))
+                        .unsqueeze(1)
+                        .expand(-1, self.conv_channels, -1),
+                    )
+                    .to(dtype=conv_state.dtype)
+                )
+                turn.done.add("ple_conv")
 
         return F.silu(conv_output[batch.req_indices, batch.token_offsets])
 
@@ -2333,28 +2375,35 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
             int(hidden_states.shape[0]),
         )
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            _hap.checkpoint("layer", layer=i)
-            if i + 1 < self.end_layer:
-                next_ple = getattr(self.layers[i + 1], "ple", None)
-                if next_ple is not None:
-                    next_ple.start_prefetch(ple_batch, forward_batch)
-                    # the pread gather blocks the host here (PLE-GATHER-PREFILL)
-                    fwd_mark("ple")
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                    ple_batch=ple_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
-                )
+        # y6o: the host-planned eager MoE layers republish their pool tables
+        # (device reads) once at the end of this loop, not after each layer --
+        # a sticky pool error still raises here, naming its layer, before the
+        # hidden states leave the forward.
+        from sglang.srt.layers.moe.expert_offload import eager_pool_sync_scope
+
+        with eager_pool_sync_scope():
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                _hap.checkpoint("layer", layer=i)
+                if i + 1 < self.end_layer:
+                    next_ple = getattr(self.layers[i + 1], "ple", None)
+                    if next_ple is not None:
+                        next_ple.start_prefetch(ple_batch, forward_batch)
+                        # the pread gather blocks the host here (PLE-GATHER-PREFILL)
+                        fwd_mark("ple")
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                        ple_batch=ple_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
 
         if ple_batch is not None:
             _commit_ple_batch(ple_batch, forward_batch)
@@ -2460,6 +2509,28 @@ def weight_layer_is_owned(name: str, start_layer: int, end_layer: int) -> bool:
         return True
     layer_id = int(m.group(1))
     return start_layer <= layer_id < end_layer
+
+
+def store_adopt_moe_layer(model, local_name: str):
+    """NF-Bootzeit H2: the FusedMoE module of the decoder layer ``local_name``
+    belongs to, or None (no layer index, foreign layer, no routed experts).
+    Module level on purpose: the veto tests drive ``weight_name_needed`` on a
+    bare stub that carries only the veto methods."""
+    m = _LAYER_ID_RE.search(local_name)
+    if m is None:
+        return None
+    lid = int(m.group(1))
+    lm = getattr(model, "model", None)
+    start = int(getattr(lm, "start_layer", 0))
+    layers = getattr(lm, "layers", None)
+    try:
+        layer = layers[lid - start] if layers is not None else None
+    except (IndexError, TypeError):
+        return None
+    experts = getattr(getattr(layer, "mlp", None), "experts", None)
+    if experts is None or int(getattr(experts, "layer_id", lid) or lid) != lid:
+        return None
+    return experts
 
 
 def mixer_is_foreign(model, name: str) -> bool:
@@ -2630,6 +2701,22 @@ def _expert_layer_for_name(name: str, model):
         except AttributeError:
             continue
     return None
+
+
+def _expert_mapping_index(mapping):
+    """BOOTZEIT 5: the index over the non-fused expert mapping, or None.
+
+    The index (``SGLANG_OPT_LOAD_EXPERT_MAPPING_INDEX``, default on) returns
+    for a tensor name exactly the entries the linear scan would stop at, in
+    list order; None (switch off) keeps the scan over the whole list (A/B).
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_LOAD_EXPERT_MAPPING_INDEX.get():
+        return None
+    from sglang.srt.model_loader.expert_mapping_index import ExpertMappingIndex
+
+    return ExpertMappingIndex(mapping)
 
 
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
@@ -2892,10 +2979,20 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return True
         m = self._EXPERT_ID_RE.search(local)
         if m is not None:
+            gid = int(m.group(1))
             rng = self._owned_expert_range()
             if rng is not None:
                 lo, hi = rng
-                return lo <= int(m.group(1)) < hi
+                if not lo <= gid < hi:
+                    return False
+            # NF-Bootzeit H2: group D does not read the rows P already put
+            # into the shared store (store_adopt; inert everywhere else).
+            moe = store_adopt_moe_layer(self, local)
+            if moe is not None:
+                from sglang.srt.layers.moe import store_adopt as _sa
+
+                if _sa.veto_expert(moe, gid):
+                    return False
         return True
 
     def _num_routed_experts_for_form_a(self):
@@ -3007,20 +3104,32 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         expert_pool = ExpertLoadPool(
             consumer_threads(), device_index=current_device_index()
         )
-        with expert_pool:
-            loaded_params = self._load_weights_with_pool(
-                weights,
-                stacked_params_mapping=stacked_params_mapping,
-                expert_params_mapping=expert_params_mapping,
-                fused_expert_params_mapping=fused_expert_params_mapping,
-                num_experts=num_experts,
-                expert_pool=expert_pool,
-            )
+        from sglang.srt.layers.moe import store_prefetch
+
+        try:
+            with expert_pool:
+                loaded_params = self._load_weights_with_pool(
+                    weights,
+                    stacked_params_mapping=stacked_params_mapping,
+                    expert_params_mapping=expert_params_mapping,
+                    fused_expert_params_mapping=fused_expert_params_mapping,
+                    num_experts=num_experts,
+                    expert_pool=expert_pool,
+                )
+        finally:
+            # BOOTZEIT 5c: every presplit of this load has run; what the
+            # store prefetch opened and nobody took is dropped, census logged.
+            store_prefetch.drain(what=type(self).__name__)
         logger.info(
-            "Ladezeit-2 EXPERT-CONSUMER threads=%d submitted=%d completed=%d",
+            "Ladezeit-2 EXPERT-CONSUMER threads=%d submitted=%d completed=%d "
+            "wait_slots_s=%.2f deferred_s=%.2f deferred_run=%d drain_wait_s=%.2f",
             expert_pool.threads,
             expert_pool.submitted,
             expert_pool.completed,
+            expert_pool.wait_slots_s,
+            expert_pool.deferred_s,
+            expert_pool.deferred_run,
+            expert_pool.drain_wait_s,
         )
         return loaded_params
 
@@ -3201,6 +3310,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             getattr(self.model, "end_layer", getattr(self.config, "num_hidden_layers", 1 << 30))
         )
         skipped_foreign_layer_count = 0
+        # BOOTZEIT 5: the non-fused expert mapping (3 x num_experts entries)
+        # is looked up, not scanned -- same entries, same order, the loop
+        # body below is unchanged (model_loader/expert_mapping_index.py).
+        expert_mapping_index = _expert_mapping_index(expert_params_mapping)
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -3280,11 +3393,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 break
             else:
                 is_expert_weight = False
-                current_expert_params_mapping = (
-                    fused_expert_params_mapping
-                    if is_fused_expert
-                    else expert_params_mapping
-                )
+                if is_fused_expert:
+                    current_expert_params_mapping = fused_expert_params_mapping
+                elif expert_mapping_index is not None:
+                    current_expert_params_mapping = expert_mapping_index.candidates(
+                        name
+                    )
+                else:
+                    current_expert_params_mapping = expert_params_mapping
                 for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -3420,6 +3536,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             _gedreht,
             _angeboten,
             "an" if _transpose_in_worker() else "aus",
+        )
+        # BOOTZEIT 5: says whether the index took the lookups (a switch that
+        # never engaged and one that did not help must read differently).
+        logger.info(
+            "BOOTZEIT5 EXPERT-MAPPING index=%s entries=%d unindexed=%s lookups=%s",
+            "on" if expert_mapping_index is not None else "off",
+            len(expert_params_mapping),
+            expert_mapping_index.unindexed if expert_mapping_index is not None else "-",
+            expert_mapping_index.lookups if expert_mapping_index is not None else "-",
         )
 
         return loaded_params

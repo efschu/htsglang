@@ -103,6 +103,7 @@ class QsaIndexSidecar(unittest.TestCase):
         draft = SimpleNamespace(total_bytes=2048, extents=((0, 2048),))
         backend.canonical_kv_page = kv
         backend._canonical_kv_extents = "kv-extents"
+        backend._kv_owner_rows = None  # #239 S4b: no paged owner form
         backend.canonical_mamba_blob = None
         backend.canonical_draft_page = None
         backend.canonical_qsa_page = qsa

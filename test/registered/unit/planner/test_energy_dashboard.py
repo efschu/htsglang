@@ -414,7 +414,9 @@ class TestCacheFlushWarning(unittest.TestCase):
         self.assertTrue(w["mandatory"])
         self.assertIn("lost", w["message"].lower())
         self.assertIn("/flush_cache", w["endpoints"])
-        self.assertIn("/clear_hicache_storage_backend", w["endpoints"])
+        # L3P (28.09.): the storage clear wiped the persistent L3 store of the
+        # model identity; a cold prefill flushes the tree only
+        self.assertNotIn("/clear_hicache_storage_backend", w["endpoints"])
 
     def test_informative_for_fresh_server(self):
         w = cache_flush_warning(will_flush=True, target_running_server=False)

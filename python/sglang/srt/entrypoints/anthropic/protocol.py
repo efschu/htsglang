@@ -49,6 +49,24 @@ class AnthropicUsage(BaseModel):
     cache_read_input_tokens: Optional[NonNegativeInt] = None
 
 
+class AnthropicSglExt(BaseModel):
+    """SGLang extension beside an Anthropic message (the ``sglext`` of the
+    OpenAI wire): only set fields are serialized (exclude_none).
+
+    #59: ``weg2_resumable_depth`` -- the depth a Weg-2 D group can resume this
+    sequence from; the Weg-2 front caps its presence credit there.
+
+    ``cached_tokens_details`` -- the OpenAI wire's CachedTokensDetails
+    ({device, host[, storage, storage_backend]}), only when the request asked
+    for it (``return_cached_tokens_details``); the Weg-2 front counts the tier
+    of a served answer from it (RANKSTATS-S3 DASHBOARD-GRAFIKEN Feld 2)."""
+
+    weg2_resumable_depth: Optional[NonNegativeInt] = None
+    cached_tokens_details: Optional[dict[str, Any]] = None
+    #: SEQ-HASH (02.10.): the sequence mark beside the resumable depth.
+    weg2_seq_hash: Optional[str] = None
+
+
 # ---------- Content blocks (discriminated by ``type``) ----------
 
 
@@ -474,6 +492,19 @@ class AnthropicMessagesRequest(BaseModel):
     #: under a fresh uuid, the abort matched nothing, and PP1/PP2 kept it in
     #: their waiting queues -> W3 at the next flip.
     rid: Optional[str] = None
+    #: RANKSTATS-S3 DASHBOARD-GRAFIKEN Feld 2: as on ``/v1/chat/completions``,
+    #: the caller asks for the cached-token tier split (answered in
+    #: ``sglext.cached_tokens_details``). Declared for the reason ``rid`` is:
+    #: undeclared, ``extra="ignore"`` would drop it silently.
+    return_cached_tokens_details: Optional[bool] = None
+    #: Q-460 SALT-ISOLATION: the KV-cache namespace, as on
+    #: ``/v1/chat/completions`` (``cache_salt`` + ``extra_key`` ->
+    #: ``extra_key``). Undeclared, ``extra="ignore"`` dropped it: a salted
+    #: Messages request shared the prefix cache with every other tenant, and
+    #: the Weg 2 front (which keys P's leg by the payload's salt) and this
+    #: group disagreed about the namespace.
+    cache_salt: Optional[str] = None
+    extra_key: Optional[str] = None
 
     @field_validator("model")
     @classmethod
@@ -547,6 +578,7 @@ class MessageDeltaEvent(BaseModel):
     type: Literal["message_delta"] = "message_delta"
     delta: AnthropicMessageEndDelta
     usage: AnthropicUsage
+    sglext: Optional[AnthropicSglExt] = None
 
 
 class MessageStopEvent(BaseModel):
@@ -607,6 +639,7 @@ class AnthropicMessagesResponse(BaseModel):
     ] = None
     stop_sequence: Optional[str] = None
     usage: Optional[AnthropicUsage] = None
+    sglext: Optional[AnthropicSglExt] = None
 
 
 # Resolve forward references for nested types.

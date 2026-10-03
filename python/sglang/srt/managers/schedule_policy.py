@@ -17,7 +17,7 @@ from sglang.srt.managers.pp_admission_congruence import (
 )
 
 WEG2_ADMIT_T = {"lb_ms": 0.0, "lb_n": 0}  # xsn325: init_load_back wall per pass, read+reset by the POST-WAKE-PASS line
-_988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0}
+_988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0, "tok": 0}  # tok: RANKSTATS §3 cache.loadback_tok
 #: #1048: this rank's own stamp went stale between the match and the apply.
 _1048_STALE = {"n": 0}
 
@@ -32,6 +32,7 @@ def _note_988_loadback(req, new_prefix_len: int) -> None:
     ('already_in_batch'), so this line carries the geometry facts only.
     """
     _988_LOADBACK_SEEN["n"] += 1
+    _988_LOADBACK_SEEN["tok"] += int(new_prefix_len or 0)
     n = _988_LOADBACK_SEEN["n"]
     # #1040 KV/MAMBA SPLIT, COUNTED APART. A load-back that moved the KV prefix
     # while the recurrent restore refused is a HALF SUCCESS with a named link --
@@ -137,7 +138,8 @@ def note_second_continuation_refused(req, site: str) -> int:
     if n <= 3 or n % 1000 == 0:
         logger.info(
             "[#967] SECOND CONTINUATION REFUSED rid=%s site=%s: a resident "
-            "chunked request is still outstanding, so this FRESH request is "
+            "chunked request is still outstanding (or one was minted earlier "
+            "in this pass, #996), so this FRESH request is "
             "left for a later pass rather than minted as a second "
             "continuation (#959). Nothing of it has run, so no progress is "
             "lost and no double prefill is incurred; it is admitted as soon "
@@ -183,6 +185,7 @@ _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
 # P-TRIM-END-ANCHOR (weg2/p_trim_end_anchor.py): a request P's intake cut to
 # N-1 carries its held-back token under this attribute; the split leaves it be.
 from sglang.srt.weg2.p_trim_end_anchor import TRIM_ATTR as _P_TRIM_ATTR
+from sglang.srt.weg2 import p_fork_cut as _weg2_p_fork_cut
 
 
 def _weg2_end_anchor_grain(allocator, page_size) -> int:
@@ -845,6 +848,75 @@ def _weg2_park_on() -> bool:
     return _WEG2_PARK_ON
 
 
+from sglang.srt.mem_cache.common import deliverable_evictable_or  # ED
+
+
+def _h105c_follow(adder, req, lb_extent, follow, new_indices) -> torch.Tensor:
+    """H105c (rc12z30g D 23:23:28, weg2-180-304): a load-back that served 0
+    rows under an adopted anchor, on a rank that already TOOK the group's
+    ADMIT (a follower reads the verdict before its load-back), must not WAIT
+    alone -- that ended the workers' loop one gate call short of the host's.
+    It follows (:func:`_h105c_follow_load_back`); anything else passes
+    ``new_indices`` through untouched."""
+    if (
+        int(new_indices.numel()) == 0
+        and lb_extent
+        and int(lb_extent) > 0
+        and getattr(req, "mamba_loadback_anchor_adopted", False)
+        and follow is not None
+        and not getattr(follow, "host_decides_load_back", False)
+    ):
+        return _h105c_follow_load_back(adder, req, int(lb_extent))
+    return new_indices
+
+
+def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
+    """H105c: the load-back of a rank that follows the group's ADMIT.
+
+    The first attempt yielded 0 rows under the published floor and adopted
+    the anchor (the WAIT shape). The anchor is given back, the load-back runs
+    once more with ``_h105c_follow_room`` set -- the rank evicts its own
+    shortfall and decides from its live pool
+    (``unified_radix_cache._form_a_load_back_floor``). Still nothing: a named
+    stop HERE, never a rank-local NO_TOKEN the host did not send."""
+    from sglang.srt.managers.tp_match_floor import FormAAdmissionSplit
+    from sglang.srt.mem_cache.common import release_admission_acquired_mamba_slot
+
+    tc = adder.tree_cache
+    release_admission_acquired_mamba_slot(req, tc, site="h105c_follow_retry")
+    req.mamba_loadback_anchor_adopted = False
+    tc._h105c_follow_room = True
+    try:
+        new_indices, req.last_node = tc.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=lb_extent,
+                req=req,
+            )
+        )
+    finally:
+        tc._h105c_follow_room = False
+    applied = int(new_indices.numel())
+    logger.info(
+        "H105c FORM-A FOLLOW LOAD-BACK rid=%s extent=%d applied=%d "
+        "rem_total_tokens=%s: the group's ADMIT was taken before this rank's "
+        "load-back; it made its own room instead of waiting alone",
+        getattr(req, "rid", "?"), int(lb_extent), applied,
+        getattr(adder, "rem_total_tokens", "?"),
+    )
+    if applied == 0:
+        if getattr(req, "mamba_loadback_anchor_adopted", False):
+            release_admission_acquired_mamba_slot(req, tc, site="h105c_follow_unservable")
+            req.mamba_loadback_anchor_adopted = False
+        raise FormAAdmissionSplit(
+            f"H105c FORM-A FOLLOW LOAD-BACK UNSERVABLE rid={getattr(req, 'rid', '?')} "
+            f"extent={int(lb_extent)}: the group admitted this rid, and this rank "
+            "cannot load its host hit back even after evicting its own leaves; "
+            "stopping by name instead of waiting alone (raenge-nie-uneins)."
+        )
+    return new_indices
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -926,8 +998,10 @@ class PrefillAdder:
         self.prefill_spill_region_tokens = int(prefill_spill_region_tokens)
         self.prefill_spill_deep_taken = False
         # H24 (E2): a request admitted with P's END state runs NO forward --
-        # its batch is closed behind it, like the born-spilled-deep one (a
+        # its batch is closed behind it to every request that needs one (a
         # neighbour needing a real extend would share the skipped forward).
+        # H24c: another END-state request still joins (add_one_req asks
+        # tail_adopt.skip_joinable), so a wake's skips share one pass.
         self.weg2_skip_extend_taken = False
         # RANK-UNIFORM admission under uneven DCP (kv-session-offload): a
         # non-negative correction (local_avail - min_reduce(local_avail))
@@ -1002,6 +1076,10 @@ class PrefillAdder:
         #: "nothing resident", which is precisely the pass that then mints a
         #: second one.
         self.chunked_req_outstanding = False
+        #: H105: on a Form A group the scheduler installs the host-verdict
+        #: exchange here (`Scheduler._form_a_admission_follow_fn`); None keeps
+        #: every gate in `add_one_req` rank-local exactly as before.
+        self.form_a_admission_follow = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -1158,9 +1236,11 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:
+            # ED (rc12o b1): the peel's deliverable count, not the reported one
+            # (mamba-locked nodes and their ancestors are counted but unpeelable).
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)
             )
         else:
             available_and_evictable = (
@@ -1218,9 +1298,11 @@ class PrefillAdder:
                 + self.tree_cache.full_evictable_size()
             )
         elif self.is_hybrid_ssm_cache:
+            # ED (rc12o b1): the peel's deliverable count, not the reported one
+            # (mamba-locked nodes and their ancestors are counted but unpeelable).
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
+                + deliverable_evictable_or(self.tree_cache, self.tree_cache.full_evictable_size)
             )
         else:
             available_and_evictable = (
@@ -1289,11 +1371,34 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _weg2_tail_fit_tokens(self, req: Req, input_tokens: int) -> int:
+        """cold-round1: the tokens the whole-fit test and the chunk charge
+        take -- what the forward computes. With an agreed tail the admission
+        writes the rows up to c from the staged payload (and, under the E2
+        skip, runs no target forward at all), so a corridor-narrowed chunk
+        (y3p: '#794 GROUP-NARROWED ... from 4096 to 64' right after every
+        wake) must not route a parked resume with 112-211 uncached tokens
+        into the chunked branch, which never takes a tail (1.9-2.4 s expert
+        pass per 64-token piece instead of none). Rank-uniform: the agreed
+        vote, the matched prefix, the batch's skip state."""
+        if not envs.SGLANG_WEG2_TAIL_FIT_ON_COMPUTE.get():
+            return input_tokens
+        computed = tail_adopt.peek_compute_tokens(
+            req,
+            len(req.prefix_indices),
+            batch_empty=not self.can_run_list or self.weg2_skip_extend_taken,
+        )
+        if computed is None:
+            return input_tokens
+        return min(input_tokens, self.ceil_paged_tokens(computed))
+
     def budget_state(self):
         # PS2 batch separation: once a born-spilled-deep prompt is in the list
         # the extend batch is CLOSED -- its out_cache_loc is a row of host
         # sentinels and must not be concatenated with real device slots.
-        if self.prefill_spill_deep_taken or self.weg2_skip_extend_taken:
+        # H24c: an H24 skip batch stays open to further skips; add_one_req
+        # refuses everything else behind it (the pass visits the next request).
+        if self.prefill_spill_deep_taken:
             return AddReqResult.OTHER
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
@@ -1417,7 +1522,11 @@ class PrefillAdder:
         mamba_gap_reserve: int = 0,
         mamba_slot_charge: int = 0,
         computed_input_len: Optional[int] = None,
+        chunk_charge: Optional[int] = None,
     ):
+        # cold-round1: ``chunk_charge`` (page-ceiled) is what an adopted tail's
+        # forward computes; the chunk budget pays that, the KV budgets below
+        # still pay the whole extend_input_len the commit allocates.
         # H24: the LOG counters (#new-token of the prefill lines, input
         # throughput) count the tokens the forward computes; only the BUDGET
         # is page-ceiled. fnFL2x137 D printed '#new-token: 64' for a 1-token
@@ -1455,7 +1564,7 @@ class PrefillAdder:
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
         elif self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= extend_input_len
+            self.rem_chunk_tokens -= extend_input_len if chunk_charge is None else int(chunk_charge)
 
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
@@ -1592,7 +1701,16 @@ class PrefillAdder:
         # which is floor_page(end - 1) unless end is a page multiple (then the
         # cut below stays) -- and D takes the END state P publishes at the
         # finish (weg2/tail_handoff.arm_fold); no state at c is ever needed.
-        if tail_handoff.fold_applies(end, _page):
+        # P-MINIFWD (SGLANG_WEG2_TAIL_FOLD_PAGE_END): at end % page == 0 the
+        # fold holds too where the CLAIM ANCHOR track lands the anchor on the
+        # reader's claim end - page inside this chunk (one predicate with the
+        # track, tail_handoff.page_end_fold_applies).
+        _claim = (
+            tail_handoff.claim_anchor_end(req, getattr(self, "tree_cache", None))
+            if end % max(1, _page) == 0
+            else None
+        )
+        if tail_handoff.fold_applies(end, _page, start=start, claim=_claim):
             n = getattr(PrefillAdder, "_weg2_end_anchor_folds", 0) + 1
             PrefillAdder._weg2_end_anchor_folds = n
             if n <= 8 or n % 64 == 0:
@@ -2087,6 +2205,11 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated:
+            # P-FORK-CUT: end this chunk at the shared-prefix fork when that is free.
+            new_len = _weg2_p_fork_cut.apply(
+                self, req, len(req.prefix_indices), new_len, "add_chunked_req"
+            )
         # #1233 END-OF-PREFILL ANCHOR: hold the last token back (see helper).
         new_len, _forced = self._weg2_end_anchor_split(
             req, len(req.prefix_indices), new_len
@@ -2264,7 +2387,10 @@ class PrefillAdder:
             # The precedent is `_add_scheduled_req`'s `carried_chunk` flag,
             # which already refuses to announce a NEW chunked req for exactly
             # this reason and names this assert while doing it.
-            if self.chunked_req_outstanding:
+            # #996: a mint earlier in this pass occupies the single field as
+            # much as the resident continuation does (a P-FORK-CUT chunk
+            # leaves `rem_chunk_tokens` behind, see add_one_req).
+            if self.chunked_req_outstanding or self.new_chunked_req is not None:
                 # #967: count and name it -- see note_second_continuation_refused.
                 note_second_continuation_refused(req, "add_one_req_ignore_eos")
                 return AddReqResult.OTHER
@@ -2293,8 +2419,13 @@ class PrefillAdder:
         self, req: Req, truncation_align_size: Optional[int]
     ):
         # PS2 batch separation (see budget_state): a born-spilled-deep prompt
-        # owns its extend batch exclusively; so does an H24 skip-extend one.
-        if self.prefill_spill_deep_taken or self.weg2_skip_extend_taken:
+        # owns its extend batch exclusively; an H24 skip-extend batch admits
+        # only further skips (H24c, rank-uniform: the group's agreed vote and
+        # the request's own parameters), refused here before any match or
+        # load-back side effect -- the exact prefix check follows at the commit.
+        if self.prefill_spill_deep_taken:
+            return AddReqResult.OTHER
+        if self.weg2_skip_extend_taken and not tail_adopt.skip_joinable(req):
             return AddReqResult.OTHER
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -2316,6 +2447,8 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            if self.weg2_skip_extend_taken:
+                return AddReqResult.OTHER  # H24c: that path never takes the END state
             return self.add_one_req_ignore_eos(req)
 
         # #791 CORE: EXECUTE, DO NOT DERIVE.
@@ -2396,6 +2529,13 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        # H105: the budget gates below are RANK-LOCAL (this rank's pool, this
+        # rank's `prefix_indices`). On a Form A group they are collected into
+        # one verdict and the attention host's verdict is taken at the single
+        # point inside the lock (`form_a_admission_follow`); everywhere else
+        # the first failing gate returns exactly as before.
+        _fa_follow = self.form_a_admission_follow
+        _gate = None
         if total_tokens >= self.rem_total_tokens:
             # Lifetime doesn't fit VRAM: wedge -- UNLESS Prefill-Spill can admit
             # it born-spilled (input transiently fits, a host region is free),
@@ -2404,28 +2544,32 @@ class PrefillAdder:
             if not self._admit_born_spilled(
                 req, born_input_tokens
             ) and not self._admit_born_spilled_deep(req, born_input_tokens):
-                return AddReqResult.NO_TOKEN
+                _gate = AddReqResult.NO_TOKEN
 
-        if self.is_hybrid_swa:
+        if _gate is None and self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
                 cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
             )
             if swa_needed >= self.rem_swa_tokens:
-                return AddReqResult.NO_TOKEN
+                _gate = AddReqResult.NO_TOKEN
 
         if (
-            self.rem_chunk_tokens is None
+            _gate is None
+            and self.rem_chunk_tokens is None
             and len(self.can_run_list) != 0
             and real_input_tokens >= self.rem_input_tokens
         ):
             # If without chunked prefill:
             # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
             # - if the can_run_list is empty, always accept the first prefill request
-            return AddReqResult.OTHER
+            _gate = AddReqResult.OTHER
+
+        if _gate is not None and _fa_follow is None:
+            return _gate
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            if _gate is None and total_tokens >= self.rem_total_tokens:
                 # Prefill-Spill: a prompt already admitted born-spilled at the
                 # pre-lock gate stays admitted as long as its input still fits
                 # the (possibly shrunk) device budget; otherwise wedge as usual.
@@ -2436,14 +2580,40 @@ class PrefillAdder:
                 if not req.born_spilled_deep and not (
                     req.born_spilled and born_input_tokens < self.rem_total_tokens
                 ):
-                    return AddReqResult.NO_TOKEN
+                    _gate = AddReqResult.NO_TOKEN
 
-            if self.is_hybrid_swa:
+            if _gate is None and self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
                     cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
                 )
                 if swa_needed >= self.rem_swa_tokens:
-                    return AddReqResult.NO_TOKEN
+                    _gate = AddReqResult.NO_TOKEN
+
+            # H105b (rc12z20 D 12:55:34, weg2-36-145, FormAAdmissionSplit): the
+            # H105 verdict below was sent BEFORE the load-back, and the load-back
+            # has an exit of its own -- the no-room WAIT (applied 0, no device
+            # room, the adopted anchor given back, NO_TOKEN). TP0 took it; the
+            # expert workers hold no recurrent state, never adopt an anchor,
+            # took the #1048 "served 0" arm instead and admitted the rid at
+            # their device prefix (3712) -- two extend sets, a named stop. So
+            # on the host the load-back runs FIRST and its outcome is the
+            # verdict it sends (same broadcast, no new collective); a worker
+            # still reads the verdict first and loads back only on ADMIT.
+            _fa_host_first = _fa_follow is not None and bool(
+                getattr(_fa_follow, "host_decides_load_back", False)
+            )
+            if _fa_follow is not None and (_gate is not None or not _fa_host_first):
+                # H105: after every rank-local gate and BEFORE the load-back
+                # (and the tail-adopt vote behind it) -- the one point every
+                # rank of the group reaches for this rid. The host's verdict
+                # is returned on every rank; a host refusal leaves the request
+                # in the waiting queue, as any NO_TOKEN does.
+                _gate = _fa_follow(
+                    req, _gate, int(total_tokens), int(self.rem_total_tokens)
+                )
+                _fa_host_first = False
+            if _gate is not None:
+                return _gate
 
             # #968/#1035: the load-back runs only where its result can be
             # rank-uniform -- and since this slice, uniformity is CONSTRUCTED
@@ -2488,6 +2658,11 @@ class PrefillAdder:
                 # the only lifecycle shape this fact is safe under.
                 req.mamba_loadback_anchor_adopted = False
                 _lb_t0 = time.perf_counter()
+                # H106: what THIS host-first load-back drained (xsn285) rides
+                # the host's verdict below; the workers drain alike.
+                _h106_d0 = int(
+                    getattr(self.tree_cache, "_weg2_loadback_drained_total", 0) or 0
+                )
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
@@ -2501,6 +2676,12 @@ class PrefillAdder:
                     )
                 )
                 WEG2_ADMIT_T["lb_ms"] += (time.perf_counter() - _lb_t0) * 1000.0
+                if _fa_host_first:
+                    req._h106_host_drained = max(
+                        0,
+                        int(getattr(self.tree_cache, "_weg2_loadback_drained_total", 0) or 0)
+                        - _h106_d0,
+                    )
                 WEG2_ADMIT_T["lb_n"] += 1
                 # #968 S1: THE TOLD EXTENT DECIDES *HOW MUCH*, NOT MERELY
                 # *WHETHER* -- enforced HERE because the callee cannot.
@@ -2537,6 +2718,7 @@ class PrefillAdder:
                 # came from. Only its precondition changes: it now runs whenever
                 # an extent was chosen at all.
                 if _lb_extent is not None:
+                    new_indices = _h105c_follow(self, req, _lb_extent, _fa_follow, new_indices)  # H105c
                     _applied = int(new_indices.numel())
                     if _applied == 0 and _lb_extent > 0 and getattr(
                         req, "mamba_loadback_anchor_adopted", False
@@ -2575,6 +2757,9 @@ class PrefillAdder:
                                 getattr(req, "rid", "?"), int(_lb_extent),
                                 getattr(self, "rem_total_tokens", "?"), _n,
                             )
+                        if _fa_host_first:  # H105b: the group's verdict
+                            return _fa_follow(req, AddReqResult.NO_TOKEN,
+                                              int(total_tokens), int(self.rem_total_tokens))
                         return AddReqResult.NO_TOKEN
                     if _applied != _lb_extent and getattr(
                         req, "mamba_loadback_anchor_adopted", False
@@ -2741,12 +2926,30 @@ class PrefillAdder:
                 # Per-branch bail patches are how #965 was paid for twice.
                 req.set_extend_range(prefix_len, prefix_len)
                 _note_988_loadback(req, prefix_len)
+                # SF (b23 #1004): the prefix moved -- a pass budget planned for
+                # another start is replanned here, on every rank alike
+                # (weg2/pp_slot_fidelity.py; not installed = switch off).
+                _sf_hook = getattr(self, "sf_replan_after_move", None)
+                if _sf_hook is not None:
+                    _sf_hook(req, prefix_len)
                 # H18's probe stood here; H21 decides the tail at the commit
                 # below (tail_adopt.plan_adopt), on the group's vote.
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
+            # cold-round1: what the forward COMPUTES (the agreed tail makes it
+            # 0 or N - c); the chunk fit and the chunk charge take this, the
+            # KV charge keeps input_tokens.
+            fit_tokens = self._weg2_tail_fit_tokens(req, input_tokens)
+            if _fa_host_first:
+                # H105b: the host's load-back is through (or there was none):
+                # ADMIT goes out now, one broadcast per gate call as before.
+                _gate = _fa_follow(
+                    req, None, int(total_tokens), int(self.rem_total_tokens)
+                )
+                if _gate is not None:
+                    return _gate
 
             if (
                 self.rem_chunk_tokens is None
@@ -2756,6 +2959,35 @@ class PrefillAdder:
                 # If without chunked prefill:
                 # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
                 # - if the can_run_list is empty, always accept the first prefill request
+                return AddReqResult.OTHER
+
+            if self.weg2_skip_extend_taken and (
+                self.dllm_config is not None
+                or (self.rem_chunk_tokens is not None and fit_tokens > self.rem_chunk_tokens)
+                or not tail_adopt.skip_joinable(req, len(req.prefix_indices))
+            ):
+                # H24c: behind a skip only a request that takes the END state
+                # at THIS prefix (the matched page anchor) -- anything else
+                # would run its extend in a batch whose forward is skipped
+                return AddReqResult.OTHER
+            if tail_adopt.skip_waits(
+                req, len(req.prefix_indices),
+                skip_taken=self.weg2_skip_extend_taken,
+                batch_nonempty=bool(self.can_run_list),
+            ):
+                # ZR-3, the mirror of H24c: an END-state request in front of a
+                # batch that already runs a forward waits one pass instead of
+                # dropping its END state; the next pass leads with it
+                # (weg2/skip_first.py). Rank-uniform inputs.
+                return AddReqResult.OTHER
+            from sglang.srt.weg2 import d_twin_pass
+
+            if not tail_adopt.skip_joinable(
+                req, len(req.prefix_indices)
+            ) and d_twin_pass.waits(req, len(req.prefix_indices), self.can_run_list):
+                # ZR-4: a twin in this pass computes these tokens already; this
+                # one waits a pass and matches them from the tree (D only; an
+                # END-state adoption computes nothing and never waits here)
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
@@ -2768,7 +3000,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif self.rem_chunk_tokens is None or fit_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 # #1233 END-OF-PREFILL ANCHOR: a whole-fit prompt still holds
                 # its last token back so the N-1 anchor is published; the
@@ -2782,12 +3014,46 @@ class PrefillAdder:
                 # N - floor_page(c)). None = today's extend.
                 # H24 (E2): with the group's level-2 vote and an EMPTY batch
                 # the extend is [N-1, N) as a shape only -- no forward runs
-                # (EAGLEWorkerV2 -> tail_adopt.run_skip).
-                _tail = tail_adopt.plan_adopt(req, _ea_start, batch_empty=not self.can_run_list)
+                # (EAGLEWorkerV2 -> tail_adopt.run_skip). H24c: a batch holding
+                # only skips counts as empty for the next skip.
+                _tail = tail_adopt.plan_adopt(
+                    req, _ea_start,
+                    batch_empty=not self.can_run_list or self.weg2_skip_extend_taken,
+                )
+                if (
+                    _tail is None
+                    and self.rem_chunk_tokens is not None
+                    and input_tokens > self.rem_chunk_tokens
+                ):
+                    # cold-round1 belt: the whole fit was granted on the tail
+                    # (peek) and the plan refused it -- the full extend does
+                    # not fit this chunk; the chunked path takes it next pass
+                    return AddReqResult.OTHER
+                # W123 belt (D vision guard): the guard admitted an image on
+                # the tail it READ; the target's first computed position is
+                # fixed here. An image reaching it would be prefilled by a
+                # group without a tower -- leave the request queued, the
+                # guard refuses it by name next pass. Rank-uniform inputs.
+                _vneed = int(getattr(req, "_weg2_vision_need", 0) or 0)
+                if _vneed:
+                    _tstart = _ea_start if _tail is None else (
+                        len(req.full_untruncated_fill_ids) if _tail.skip else _tail.resume_at
+                    )
+                    if _vneed > _tstart:
+                        req._weg2_vision_tail_lost = True
+                        logger.error(
+                            "W123 VISION TAIL-LOST rid=%s image_end=%d target_start=%d tail=%s "
+                            "(the adopted tail no longer covers the image; refused by name next pass)",
+                            req.rid, _vneed, _tstart,
+                            "none" if _tail is None else ("skip" if _tail.skip else "e1"),
+                        )
+                        return AddReqResult.OTHER
+                _ea_fill = len(req.full_untruncated_fill_ids)
                 if _tail is not None:
                     _ea_start = _tail.resume_at
+                    _ea_fill -= _tail.fill_drop  # F4: the commit pops the parked token
                 _ea_len, _ea_forced = self._weg2_end_anchor_split(
-                    req, _ea_start, len(req.full_untruncated_fill_ids) - _ea_start
+                    req, _ea_start, _ea_fill - _ea_start
                 )
                 # ONE chunked request per pass: the resident continuation
                 # (`chunked_req_outstanding`) AND a mint earlier in this pass
@@ -2834,8 +3100,19 @@ class PrefillAdder:
                     mamba_gap_reserve=mamba_gap_reserve,
                     mamba_slot_charge=mamba_slot_charge,
                     computed_input_len=_ea_len if _ea_forced else len(req.full_untruncated_fill_ids) - _ea_start,
+                    chunk_charge=None if (_ea_forced or _tail is None) else fit_tokens,
                 )
             else:
+                # W123 belt, chunked form: no tail is taken on this path, the
+                # target computes from the prefix.
+                _vneed = int(getattr(req, "_weg2_vision_need", 0) or 0)
+                if _vneed > len(req.prefix_indices):
+                    req._weg2_vision_tail_lost = True
+                    logger.error(
+                        "W123 VISION TAIL-LOST rid=%s image_end=%d target_start=%d tail=chunked "
+                        "(refused by name next pass)", req.rid, _vneed, len(req.prefix_indices),
+                    )
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
@@ -2860,6 +3137,12 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
+                # P-FORK-CUT: end this chunk at the shared-prefix fork when that is
+                # free, so its anchor lands where the next session reads.
+                trunc_len = _weg2_p_fork_cut.apply(
+                    self, req, len(req.prefix_indices), trunc_len, "add_one_req"
+                )
+
                 # #959 ONE CONTINUATION AT A TIME -- the sibling of the guard
                 # in the no-prefix branch above, which carries the reasoning.
                 # Both fresh-request mint sites need it; the forwarded-schedule
@@ -2874,7 +3157,19 @@ class PrefillAdder:
                     len(req.prefix_indices),
                     len(req.prefix_indices) + trunc_len,
                 )
-                if self.chunked_req_outstanding and not _trunc_tail:
+                # #996 (NF y6s 50fa5c42d1, 01.10. 22:27:29, all three P
+                # ranks): the resident continuation is not the only occupant
+                # of the single field -- a mint EARLIER IN THIS PASS is the
+                # other, and only the end-anchor branch above asked for it. A
+                # truncation that stops short of `rem_chunk_tokens` leaves
+                # chunk budget behind and the loop goes on: P-FORK-CUT cut
+                # weg2-0-1 at its told fork ([8704, 16640) of a 16384 chunk,
+                # 8448 left), weg2-0-3 then truncated to those 8448 and hit
+                # `_mint_chunked`. Same refusal as the resident case: the
+                # second request is fresh and waits one pass.
+                if (
+                    self.chunked_req_outstanding or self.new_chunked_req is not None
+                ) and not _trunc_tail:
                     # #967: same guard, second mint site, same instrument.
                     note_second_continuation_refused(req, "add_one_req")
                     return AddReqResult.OTHER

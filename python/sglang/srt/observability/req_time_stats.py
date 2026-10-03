@@ -628,6 +628,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # decode. Stamped once, on the finishing output, by the output streamer of
     # a Weg-2 D group (tp_prefill_max_tokens > 0); 0.0 everywhere else.
     weg2_prefill_s: float = 0.0
+    # #59 (Weg-2 D): the group-uniform depth the next turn can resume this
+    # request's sequence from, stamped with weg2_prefill_s on the finishing
+    # output (managers/weg2_resumable_depth.py). -1 = absent; 0 is measured.
+    weg2_resumable_depth: int = -1
 
     def stamp_weg2_prefill_s(self) -> None:
         if self.forward_entry_time > 0.0 and self.prefill_finished_time > 0.0:
@@ -639,9 +643,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             # H84: a duration, not a timestamp (no cross-process conversion),
             # and present only once stamped -- so it rides WITHOUT
             # --enable-metrics and costs nothing where it is never stamped.
+            state = {}
             if self.weg2_prefill_s > 0.0:
-                return {"weg2_prefill_s": self.weg2_prefill_s}
-            return {}
+                state["weg2_prefill_s"] = self.weg2_prefill_s
+            if self.weg2_resumable_depth >= 0:
+                state["weg2_resumable_depth"] = self.weg2_resumable_depth
+            return state
 
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
@@ -651,6 +658,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         }
         if self.weg2_prefill_s > 0.0:
             state["weg2_prefill_s"] = self.weg2_prefill_s
+        if self.weg2_resumable_depth >= 0:
+            state["weg2_resumable_depth"] = self.weg2_resumable_depth
         return state
 
     def set_scheduler_recv_time(self, ts=None):

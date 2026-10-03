@@ -8734,6 +8734,32 @@ class ServerArgs:
             and self.uneven_weighted_dcp_enabled()
             and int(getattr(self, "tp_size", 1) or 1) > 1
         ):
+            # #239 S4b (F14, rc12z29 -st-cut, 28.09.): under the Form A token
+            # cut a page DOES span owners -- global slot L belongs to the rank
+            # with L % S in [lo, hi) -- but the page is no longer one owner's:
+            # every owner writes its own token rows of each page
+            # (canonical_page_store.owner_token_runs / kv_extents_for, lifted
+            # at runtime by HiCacheController when canonical_kv_owner_rows is
+            # set). The rows are the same in every page only when S divides
+            # the page; that is what stays refused here. Any other weighted
+            # uneven DCP keeps the page-1 limit.
+            cut = self.form_a_dcp_vector()
+            split = int(sum(cut)) if cut else 0
+            if split > 0 and self.page_size % split == 0:
+                logger.info(
+                    "#239 F14 CANONICAL-PAGE UNDER TOKEN CUT: page %d spans owners "
+                    "%s (S=%d); each owner writes its own token rows of every page.",
+                    self.page_size, list(cut), split,
+                )
+                return
+            if split > 0:
+                raise ValueError(
+                    "--hicache-canonical-kv-page under the #239 token cut "
+                    f"{list(cut)} needs a page size divisible by S={split}, got "
+                    f"{self.page_size}: the owned token rows would differ from "
+                    "page to page and one key would name different bytes on "
+                    "every rank."
+                )
             raise ValueError(
                 "--hicache-canonical-kv-page requires --page-size 1 under "
                 f"weighted uneven DCP, got {self.page_size}. A multi-token "
@@ -10843,10 +10869,12 @@ class ServerArgs:
 
     def uneven_weighted_dcp_enabled(self) -> bool:
         """True when the weighted-DCP token vector should be installed:
-        the classic env pair, or any non-'coupled' --rank-kv-ratio."""
+        the classic env pair, or any non-'coupled' --rank-kv-ratio -- or the
+        #239 Form A token cut, which IS a weighted vector."""
         return (
             os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
             or self.uneven_kv_flag_active()
+            or bool(self.form_a_dcp_vector())
         )
 
     def world_rank(self, pp_rank: int, tp_rank: int) -> int:
@@ -11106,6 +11134,57 @@ class ServerArgs:
                 "the host rank and broadcasts the chain token ids once per "
                 "round."
             )
+
+    def _resolve_form_a_dcp(self) -> None:
+        """#239 S3a: Form A x DCP, answered by ``rank_role.resolve_dcp_under_host_kv``.
+
+        The token cut arrives as ``--uneven-token-vector`` (the launcher ships
+        the planner's shares under ``kv=qsa_forma_dcp``), else the inherited
+        ``SGLANG_UNEVEN_TOKEN_VECTOR`` -- the same flag-over-env order the
+        publisher applies later. A cut that gives a worker tokens makes DCP
+        span the group; no cut, or one that leaves every worker at 0, keeps
+        dcp 1 and the host holds the whole KV, as before.
+        """
+        from sglang.srt.rank_role import (
+            RankRoleError,
+            RankRolePlan,
+            resolve_dcp_under_host_kv,
+        )
+
+        raw = self.uneven_token_vector
+        if raw is None:
+            raw = os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR") or None
+        vector = None
+        if raw is not None and str(raw).strip():
+            try:
+                vector = [int(x) for x in str(raw).split(",") if x.strip()]
+            except ValueError as e:
+                raise ValueError(
+                    f"--uneven-token-vector {raw!r} is not a comma-separated "
+                    "integer vector."
+                ) from e
+        forced = self.dcp_size > 1 or os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
+        try:
+            res = resolve_dcp_under_host_kv(
+                RankRolePlan(tuple(self.rank_role)),
+                self.dcp_size,
+                None,
+                forced=forced,
+                token_vector=vector,
+            )
+        except RankRoleError as e:
+            raise ValueError(f"--rank-role (Form A) x DCP: {e}") from e
+        self.dcp_size = res.dcp_size
+        # Underscore attribute: derived, pickled to the scheduler children.
+        self._form_a_dcp_vector = (
+            list(res.token_vector) if res.token_vector else None
+        )
+        if res.token_vector:
+            logger.info("#239 S3a FORM-A DCP: dcp_size=%d -- %s", res.dcp_size, res.reason)
+
+    def form_a_dcp_vector(self) -> Optional[List[int]]:
+        """#239 S3a: the Form A token cut this boot runs, or None."""
+        return getattr(self, "_form_a_dcp_vector", None)
 
     def _validate_pp_stage_gpu_groups(self) -> List[List[int]]:
         """--rank-gpu-id under a pipeline: one disjoint GPU group per stage.
@@ -12277,6 +12356,13 @@ class ServerArgs:
                 "Drop --rank-kv-ratio to keep the coupled layout."
             )
 
+        # #239 S3a: Form A decides its DCP here, once, and before placement
+        # -- from the planner's token cut, never from the uneven-TP auto-engage
+        # below, which would turn an inherited SGLANG_UNEVEN_DCP=1 into a
+        # token-sharded pool nobody planned.
+        if self.rank_role:
+            self._resolve_form_a_dcp()
+
         if self.rank_gpu_id is None:
             self._handle_uneven_mlp_ratio()
             return
@@ -12480,6 +12566,7 @@ class ServerArgs:
         if (
             uneven_plan
             and self.dcp_size == 1
+            and not self.rank_role  # #239 S3a: Form A resolved it above
             and (
                 os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
                 or self.uneven_kv_flag_active()

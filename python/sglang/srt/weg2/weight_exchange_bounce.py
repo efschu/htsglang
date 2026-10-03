@@ -618,26 +618,49 @@ class LayerBounce:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         flags = os.O_RDWR | (os.O_CREAT if create else 0)
         self._fd = os.open(self.path, flags, 0o600)
-        if create:
-            os.ftruncate(self._fd, self.nbytes)
-        self._mm = _mmap.mmap(self._fd, self.nbytes, _mmap.MAP_SHARED,
-                              _mmap.PROT_READ | _mmap.PROT_WRITE)
-        holder = ctypes.c_char.from_buffer(self._mm)
-        self.ptr = ctypes.addressof(holder)
-        del holder
+        self._mm = None
         self._registered = False
+        # 27.09. (lifecycle review): a raise after os.open (ftruncate ENOSPC,
+        # mmap, the ledger event) left the half-built object unreachable -- its
+        # fd open, its pin in the driver. Undo in reverse and re-raise; the
+        # ledger post is reverted by @revert_pinned_posts_on_failure.
         try:
-            ops.host_register(self.ptr, self.nbytes,
-                              tp.CUDA_HOST_REGISTER_PORTABLE)
-            self._registered = True
-        except Exception:  # noqa: BLE001 -- a 7.5 % regression, not a refusal
-            self._registered = False
-        # #1358: the slot is now held. `region` names WHERE the bytes are:
-        # shm always, and `pinned` in addition once cudaHostRegister took.
-        _host_slot_event("alloc", self.path, self.nbytes,
-                         group=self._slot_group, rank=self._slot_rank,
-                         leg=self._slot_leg, slot=self._slot_index,
-                         region=("shm,pinned" if self._registered else "shm"))
+            if create:
+                os.ftruncate(self._fd, self.nbytes)
+            self._mm = _mmap.mmap(self._fd, self.nbytes, _mmap.MAP_SHARED,
+                                  _mmap.PROT_READ | _mmap.PROT_WRITE)
+            holder = ctypes.c_char.from_buffer(self._mm)
+            self.ptr = ctypes.addressof(holder)
+            del holder
+            try:
+                ops.host_register(self.ptr, self.nbytes,
+                                  tp.CUDA_HOST_REGISTER_PORTABLE)
+                self._registered = True
+            except Exception:  # noqa: BLE001 -- a 7.5 % regression, not a refusal
+                self._registered = False
+            # #1358: the slot is now held. `region` names WHERE the bytes are:
+            # shm always, and `pinned` in addition once cudaHostRegister took.
+            _host_slot_event("alloc", self.path, self.nbytes,
+                             group=self._slot_group, rank=self._slot_rank,
+                             leg=self._slot_leg, slot=self._slot_index,
+                             region=("shm,pinned" if self._registered else "shm"))
+        except BaseException:
+            if self._registered:
+                try:
+                    ops.host_unregister(self.ptr)
+                except Exception:  # noqa: BLE001 -- never mask the real error
+                    pass
+                self._registered = False
+            if self._mm is not None:
+                try:
+                    self._mm.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            raise
 
     def slot_address(self, slot: int) -> int:
         return self.ptr + (int(slot) % self.depth) * self.slot_bytes
@@ -655,8 +678,13 @@ class LayerBounce:
                     self.ops.host_unregister(self.ptr)
                 finally:
                     self._registered = False
-            self._mm.close()
-            os.close(self._fd)
+            # 27.09. (lifecycle review): mm.close() and os.close() shared one
+            # try -- a munmap that raised (BufferError: exported pointers)
+            # skipped the fd. The fd now closes on every exit.
+            try:
+                self._mm.close()
+            finally:
+                os.close(self._fd)
         finally:
             unregister_pinned_post(self._post)
             _host_slot_event("free", self.path, self.nbytes,
@@ -1340,8 +1368,24 @@ def run_bounce_leg(
                          create=True, shm_root=shm_root, lane=lane,
                          group=str(leg_group), rank=int(leg_rank),
                          leg=str(leg_name or lane), slot_index=0)
-    d_stream = ops.create_stream(device)
-    c_stream = ops.create_stream(device)
+    # 27.09. (lifecycle review): the streams and the drain prime used to sit
+    # BEFORE the try whose finally releases them -- a second create_stream or a
+    # prime_band_drain that raised leaked the first stream AND this buffer
+    # (fd, mmap, pin, ledger post). Anything that raises here now releases what
+    # was already taken and re-raises.
+    d_stream = c_stream = None
+    try:
+        d_stream = ops.create_stream(device)
+        c_stream = ops.create_stream(device)
+    except BaseException:
+        for _s in (d_stream, c_stream):
+            if _s is not None:
+                try:
+                    ops.destroy_stream(_s)
+                except Exception:  # noqa: BLE001 -- never mask the real error
+                    pass
+        bounce.close()
+        raise
     #: What each slot is still draining, so a slot is never re-deposited under
     #: a collect that has not landed.  This list IS the pipeline's state.
     # #1374: THE FILE'S SLOT COUNT, not `depth`. `slots` is what was
@@ -1359,7 +1403,16 @@ def run_bounce_leg(
         # #1397: discard a PRIOR tag's uncollected tail before this tag's own
         # first band -- see `CrossSlotRendezvous.prime_band_drain`'s own
         # docstring for why this is the only safe instant.
-        rendezvous.prime_band_drain()
+        try:
+            rendezvous.prime_band_drain()
+        except BaseException:
+            for _s in (d_stream, c_stream):
+                try:
+                    ops.destroy_stream(_s)
+                except Exception:  # noqa: BLE001 -- never mask the real error
+                    pass
+            bounce.close()
+            raise
     deposited = collected = 0
     bands = 0
     deposit_ms = collect_ms = 0.0
@@ -3808,6 +3861,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
     # ONE card; D TP0's post-KV headroom at wake fell 1101 -> 201 MiB over 39
     # wakes and the HiCache page loadback died there (torch OOM, 6.81 MiB free).
     stream = 0
+    sems = None
     try:
         sems = tp.SemSet(boot_nonce)
         # The lane the lane-form ran its copies on, or the default stream when the
@@ -4186,6 +4240,16 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     _destroy(stream)
                 except Exception as _ds_exc:  # noqa: BLE001
                     log(f"WEG2-SEQ stream lane={lane_key} destroy failed: {_ds_exc}")
+        # 27.09. (lifecycle review): this call's SemSet was never closed --
+        # SemSet has no __del__, so every call's sem_open handles stayed open.
+        # (glibc shares one mapping per name and counts the opens, so it held
+        # a reference per call rather than growing memory; closing is the
+        # contract either way.) After the stream: no queued copy posts here.
+        if sems is not None:
+            try:
+                sems.close()
+            except Exception as _sc_exc:  # noqa: BLE001
+                log(f"WEG2-SEQ sems lane={lane_key} close failed: {_sc_exc}")
         if _lazy and phase == PHASE_COLLECT:
             # H44: the ready file lives exactly as long as this collect; the
             # caller posts `drained` only after this returns, so a depositor

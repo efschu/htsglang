@@ -506,7 +506,7 @@ def test_openai_wire_still_uses_the_one_chunk_test():
 
     src = inspect.getsource(F.Front.leg2)
     assert 'if request.path == "/v1/messages":' in src
-    assert "_anthropic_refusal_lookahead(r)" in src
+    assert "_anthropic_refusal_lookahead(r" in src  # ROS 0927: second arg = the hold probe
     assert "_first_stream_chunk(r)" in src  # the OpenAI branch survives
 
 

@@ -268,6 +268,28 @@ _QUANT_CFG_IGNORE_KEYS = (
 )
 
 
+def _draft_attention_window(text_config) -> Optional[int]:
+    """YaRN x2 27B (29.09.): the draft's attention horizon when EVERY layer is
+    window-bounded, else None. Window = ``sliding_window`` (> 0, not disabled
+    by ``use_sliding_window: false``); every ``layer_types`` entry must be
+    ``sliding_attention`` (the DFlash2 draft: 5 of 5, window 2048). Without
+    ``layer_types`` the per-layer shape is unknown -> None (the refusal
+    stays): a full-attention layer would see the whole prefix."""
+    window = getattr(text_config, "sliding_window", None)
+    if getattr(text_config, "use_sliding_window", None) is False:
+        return None
+    try:
+        window = int(window) if window is not None else 0
+    except (TypeError, ValueError):
+        return None
+    if window <= 0:
+        return None
+    layer_types = getattr(text_config, "layer_types", None)
+    if not layer_types or any(t != "sliding_attention" for t in layer_types):
+        return None
+    return window
+
+
 def _draft_checkpoint_is_dense(draft_path: str) -> bool:
     """Whether the draft's OWN tensors are stored unquantized (task #318).
 
@@ -989,7 +1011,31 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
 
         if context_length is not None:
-            if context_length > derived_context_len:
+            _window = (
+                _draft_attention_window(self.hf_text_config)
+                if is_draft_model and context_length > derived_context_len
+                else None
+            )
+            if _window is not None:
+                # YaRN x2 27B (29.09.): a draft whose EVERY attention layer is
+                # window-bounded takes the target's longer context without the
+                # global SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN (which would
+                # also silence the TARGET's guard). RoPE scores depend on m - n
+                # only and the window caps that at `sliding_window`, so no
+                # position past the checkpoint's max_position_embeddings puts
+                # an unseen distance into any attention -- the same horizon
+                # cross_algo_utils.derive_ctx_gate_threshold reads off this
+                # drafter. The rope cache must still cover every position: the
+                # override below is upstream's own (the env branch).
+                logger.warning(
+                    f"Draft model context_length {derived_context_len} -> target's "
+                    f"{context_length}: every draft attention layer is window-bounded "
+                    f"(sliding_window {_window}), so RoPE distances stay <= {_window}; "
+                    f"overriding the draft model's max_position_embeddings to {context_length}."
+                )
+                self.context_len = context_length
+                self.hf_text_config.max_position_embeddings = context_length
+            elif context_length > derived_context_len:
                 reason = "Target model's" if is_draft_model else "User-specified"
                 msg = (
                     f"Warning: {reason} context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "

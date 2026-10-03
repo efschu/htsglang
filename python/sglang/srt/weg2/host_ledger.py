@@ -131,7 +131,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.compat_shims import operator_dir as _operator_dir  # host dir kept through the rename
 
@@ -480,6 +480,24 @@ RUN_PEAK_RESIDUAL_GIB = {"weg2sb4": 5.16, "weg2rg6": -0.11, "weg2sb5c": 1.54}
 RUN_PEAK_RESIDUAL_RATCHET_GIB = {
     "weg2xsn20": -1.513, "weg2xsn21b": -0.170, "weg2xsn22": 0.375,
     "weg2xsn23": 0.908, "weg2xsn24": 0.046,
+}
+#: 29.09. NF1c (W87 16:55:33Z, CUSHION FLOOR 81.36 + 1.50 = 82.86 > 82.53): H87
+#: FOR THE MARGIN'S RESIDUAL. The five rows above are Qwen3.8-27B-INT8 boots
+#: (REFERENCE_MODEL; H87 names the xsn series as 27B), yet the margin charged
+#: their +0.908 to the NF checkpoint silently -- the one 27B reference H87 never
+#: reached (run origin and ratchet say FOREIGN-MODEL, the margin did not).
+#: Keyed by memory FOOTPRINT (form.REFERENCE_FOOTPRINTS), the same identity H87
+#: decides by: ``measured peak - predicted ratchet-charged run peak`` of THIS
+#: model's own boots.
+#:   Qwen3.8-Flash-Next-INT4 (NF), boot ...z30y2bar1dauer09291559 @ 9fb98fd279:
+#:     measured = cg_peak_b 86,244,577,280 B = 80.32 GiB (memts csv, 16:18:46Z,
+#:     RAW memory.current incl. page cache and the teardown step +0.56 -- an
+#:     UPPER bound on the non-reclaimable peak, whose flip-window max was 78.53),
+#:     predicted = 81.36 (cf6f2108fb replay = NF1c's own ARM S=1 M=600 line),
+#:     residual <= -1.04 GiB: OVER-prediction. Clamped at >= 0 like every row.
+NF_FOOTPRINT = "5d82a6f6b1f14bfccf79fe321eb448d40751fd9bdc9b50b504f66b2acfddcb7b"
+RUN_PEAK_RESIDUAL_RATCHET_OWN_MODEL_GIB: Dict[str, Dict[str, float]] = {
+    NF_FOOTPRINT: {"dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2bar1dauer09291559": -1.04},
 }
 #: Measured STEADY-STATE drift (#1276), MiB/min, MAX of the recorded 0.01..0.07
 #: band. Two orders below IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT because that one
@@ -902,8 +920,17 @@ def resolve_margin(
     foreign_headroom_gib: float = 0.0,
     foreign_source: str = "",
     flip_ratchet_charged_gib: Optional[float] = None,
+    reference_model_ok: Optional[bool] = None,
+    model_footprint: str = "",
 ) -> Margin:
     """Build the margin from measurements, naming every source.
+
+    ``reference_model_ok`` / ``model_footprint`` (29.09. NF1c, H87): on a
+    ratchet-priced arm of a checkpoint that is NOT the reference, the 27B
+    replay rows are FOREIGN; this model's own rows
+    (:data:`RUN_PEAK_RESIDUAL_RATCHET_OWN_MODEL_GIB`) bind instead. With no
+    own row the 27B rows stay (the refusing direction), tagged FALLBACK.
+    ``None`` / True: byte-identical.
 
     The transient is read from the RING-ERA records of this form (max over the
     recorded flips); the pre-ring :data:`FLIP_HOST_TRANSIENT_GIB` is used only
@@ -1024,6 +1051,29 @@ def resolve_margin(
                 "xsn21b -0.170, xsn22 +0.375, xsn23 +0.908, xsn24 +0.046 -- none "
                 "binds"
             )
+            # 29.09. NF1c (H87): the rows above are 27B boots. On another
+            # checkpoint they are FOREIGN -- its own replay rows bind, one term
+            # (measured - predicted, max, clamped >= 0), the same rule.
+            if reference_model_ok is False:
+                _own = RUN_PEAK_RESIDUAL_RATCHET_OWN_MODEL_GIB.get(str(model_footprint or ""))
+                if _own:
+                    residual = max(0.0, max(_own.values())) + _drift_gib
+                    r_src = (
+                        f"OWN-MODEL (H87, footprint {str(model_footprint)[:12]}...): "
+                        f"max over this checkpoint's ratchet-priced replays "
+                        f"{ {k[-12:]: round(v, 3) for k, v in sorted(_own.items())} } "
+                        f"= {max(_own.values()):+.3f} GiB, clamped at >= 0, plus "
+                        f"steady-state drift {_drift_gib:.3f} GiB; the 27B rows "
+                        f"{sorted(RUN_PEAK_RESIDUAL_RATCHET_GIB)} "
+                        f"(+{max(RUN_PEAK_RESIDUAL_RATCHET_GIB.values()):.3f}) are "
+                        f"{FOREIGN_REFERENCE_TAG} FOREIGN-MODEL here and NOT charged"
+                    )
+                else:
+                    r_src = (
+                        f"{FOREIGN_REFERENCE_TAG} FALLBACK (no own-model replay row "
+                        f"for footprint {str(model_footprint or '?')[:12]}...): the "
+                        f"27B rows are charged in the refusing direction -- " + r_src
+                    )
 
     if drift_mib_per_min is None:
         drift_rate, d_src = IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT, "sb4 default, no WEG2-IDLE-CENSUS yet"
@@ -1063,11 +1113,14 @@ def watermark_provenance(margin: Optional[Margin] = None,
     unreadable.
     """
     m = margin if margin is not None else resolve_margin()
-    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    live = read_cgroup_pressure()
+    # 29.09.: no mark handed in (the front's periodic line) -> the same
+    # reap_mark_gib the ledger grades against: a finite memory.max bounds it.
+    w = watermark_gib if watermark_gib is not None else reap_mark_gib(
+        None if live.get("max_gib") is None else int(float(live["max_gib"]) * GIB))
     events = ", ".join(f"{k} {v:.2f}" for k, v in sorted(REAP_SAMPLES_GIB.items()))
     excl = ", ".join(f"{k} {v:.2f} EXCLUDED ({why})"
                      for k, (v, why) in sorted(REAP_SAMPLE_EXCLUDED.items()))
-    live = read_cgroup_pressure()
     if live.get("current_gib") is None:
         if refuse_unreadable:
             raise Weg2HostLedgerRefused(
@@ -1202,6 +1255,171 @@ RATE_LATCH_CUSHION_RELEVANCE_GIB = 32.0
 RATE_LATCH_FREE_POOL_GIB = 3.0
 
 
+def latch_free_pool(
+    pr: Dict[str, Optional[float]],
+) -> Tuple[Optional[float], str, Optional[float]]:
+    """W98 z30w (29.09.): WHICH free pool absorbs the next write, and the ceiling.
+
+    Returns ``(free_gib, source, ceiling_gib)`` for :meth:`RateLatch.observe`.
+
+    CT999 (LXC, ``memory.max`` reads ``max``): ``/proc/meminfo`` is lxcfs, i.e.
+    the container's own view, and ``MemFree`` is the pool fnFL2 v14 was
+    calibrated on -- unchanged, and there is no cgroup ceiling to price.
+
+    DOCKER (``--memory 84g``: a finite ``memory.max``): ``/proc/meminfo`` is the
+    HOST's, and its ``MemFree`` counts neither the room left under this
+    cgroup's own ceiling nor the page cache of FOREIGN cgroups the kernel
+    reclaims globally before any OOM. Boot z30w-park 1 (08:22:13Z) was torn
+    down on exactly that reading: host MemFree < 3 GiB (34 at launch against 58
+    on z30u, the difference foreign page cache while MemAvailable stayed above
+    100), nonreclaim 64.28 under an 84 GiB ceiling -- ~19.7 GiB of real room.
+    Here the pool is the SMALLER of the cgroup's room (``memory.max -
+    memory.current``, what a charge can take before cgroup reclaim starts) and
+    the host's ``MemAvailable`` (what global reclaim can still hand out), and
+    the ceiling is ``memory.max``: a cgroup OOM fires there, whatever the host
+    mark says.
+    """
+    ceiling = pr.get("max_gib")
+    if ceiling is None:
+        return pr.get("memfree_gib"), "MemFree", None
+    cur = pr.get("current_gib")
+    pools = []
+    if cur is not None:
+        pools.append(float(ceiling) - float(cur))
+    avail = pr.get("memavail_gib")
+    if avail is not None:
+        pools.append(float(avail))
+    if not pools:
+        return pr.get("memfree_gib"), "MemFree", float(ceiling)
+    return (
+        min(pools),
+        "min(cgroup room memory.max-memory.current, host MemAvailable)",
+        float(ceiling),
+    )
+
+
+def reap_mark_gib(ceiling_bytes: Optional[int] = None, ceiling_source: str = "") -> float:
+    """The non-reclaimable level at which this boot is reaped, GiB.
+
+    The recorded mark (:data:`OBSERVED_REAP_NONRECLAIM_BYTES`, 95.90) is the
+    CT999 HOST reap point: global OOM, ``memory.max`` reads ``max``. Inside a
+    finite cgroup the kernel reclaims and then OOM-kills at ``memory.max``
+    first, so inside a finite cgroup the mark IS ``memory.max`` -- 84.00 in
+    the Docker form (``--memory 84g``), 105.00 under the user's 2026-10-01
+    order (``--memory 105g``). The 95.90 constant is the fallback for a run
+    without a finite cgroup ceiling only.
+
+    ``ceiling_source`` is :func:`resolve_cg_ceiling`'s own label: its lxcfs
+    ``MemTotal`` FALLBACK is not a ceiling (CT999, 118 GiB) and keeps the
+    recorded mark, byte for byte. An empty label means the caller read a finite
+    ``memory.max`` directly (:func:`read_cgroup_pressure` ``max_gib``).
+    """
+    const = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    if ceiling_bytes is None:
+        return const
+    if ceiling_source and not ceiling_source.startswith("cgroup memory.max"):
+        return const
+    # 2026-10-01 ~10:20Z user order ("trage 105gb ein", Docker containers
+    # get 105 GB): a finite cgroup memory.max IS the operator's chosen bound,
+    # so the mark follows it. The CT999 constant (95.90) only applies when no
+    # finite cgroup ceiling exists; min(const, ceiling) let the old host mark
+    # bind below a raised container cap (y6f W21 x3: predicted 97.0, measured
+    # peaks that day 87-90 GiB).
+    return float(ceiling_bytes) / GIB
+
+
+#: 29.09.: the line that names a derived runtime latch.
+RIEGEL_MARKER = "WEG2-HOST-LEDGER RIEGEL"
+
+
+def effective_riegel_gib(riegel_gib: Optional[float], hard_bound_gib: float
+                         ) -> Tuple[Optional[float], str]:
+    """``(latch, line)``: the runtime latch a boot runs with.
+
+    29.09. (27B z30y W97 13:02Z): since the mark follows ``memory.max``
+    (:func:`reap_mark_gib`), the latch is DERIVED from it -- the hard bound,
+    mark minus the measured margin. A profile's fixed ``--host-riegel-gib``
+    may only TIGHTEN it: 93.0 written for the 95.90 CT999 mark is above the
+    74.53 GiB bound of a 76 GiB container, so the derivation wins and the line
+    says so, instead of refusing the boot over a number the ceiling outdated.
+    ``None`` stays ``None`` (no latch was asked for)."""
+    if riegel_gib is None:
+        return None, ""
+    flag = float(riegel_gib)
+    if flag <= hard_bound_gib:
+        return flag, ""
+    return float(hard_bound_gib), (
+        f"{RIEGEL_MARKER} --host-riegel-gib {flag:.2f} is above the hard bound "
+        f"{hard_bound_gib:.2f} GiB (mark minus the measured margin) -- the latch is "
+        f"derived: {hard_bound_gib:.2f} GiB; a fixed flag may only tighten it")
+
+
+def pinned_reserve_for_ranks(
+    margin_gib: float,
+    ceiling_bytes: Optional[int],
+    ceiling_source: str = "",
+) -> Tuple[Optional[float], str]:
+    """``(GiB, source)``: the OS reserve the ranks' pinned-host check
+    (``pinned_host_budget.check_and_register_pinned_post``) will keep free,
+    decided HERE so the ledger and the pools use one number.
+
+    29.09. (z30x2-yarn2, 27B conditions): an explicit
+    ``SGLANG_PINNED_HOST_RESERVE_GIB`` always wins. Otherwise, under a finite
+    cgroup ``memory.max``, it is this ledger's own measured margin -- the
+    flip transient, run-moment residual and idle drift the records measured
+    (:func:`resolve_margin`), the non-pool growth the box still spends after a
+    pool is admitted -- not a flat constant. The launcher exports it as
+    ``SGLANG_PINNED_HOST_RESERVE_LEDGER_GIB``; the ranks read it through
+    ``pinned_host_reserve()``. ``(None, why)`` without a finite cgroup: the
+    native 10 GiB stays, byte-identical."""
+    from sglang.srt.mem_cache import pinned_host_budget as _phb
+
+    raw = os.environ.get(_phb.PINNED_HOST_RESERVE_ENV)
+    if raw is not None and raw.strip():
+        b, src = _phb.pinned_host_reserve()
+        return b / GIB, src
+    if ceiling_bytes is None or (
+        ceiling_source and not ceiling_source.startswith("cgroup memory.max")
+    ):
+        return None, "no finite memory.max -- the ranks keep the native reserve"
+    return float(margin_gib), f"ledger margin {float(margin_gib):.2f} GiB (measured)"
+
+
+def pinned_wall(
+    ceiling_bytes: Optional[int],
+    ceiling_source: str,
+    reserve_gib: Optional[float],
+    reserve_source: str = "",
+) -> Tuple[Optional[float], str]:
+    """``(GiB, why)``: the non-reclaimable level above which the ranks'
+    pinned-host check refuses a pool -- ``memory.max`` minus the SAME reserve
+    :func:`pinned_reserve_for_ranks` hands them. The check reads ``available
+    = memory.max - non-reclaimable`` and demands ``available - reserve >=
+    requested``; a run peak (which includes every pool) at or under this wall
+    therefore admits every pool at every earlier moment. z30x2-yarn2 died at
+    73.6 GiB non-reclaimable under a 10 GiB reserve its ledger never saw."""
+    if reserve_gib is None or ceiling_bytes is None or (
+        ceiling_source and not ceiling_source.startswith("cgroup memory.max")
+    ):
+        return None, "no finite memory.max -- the pinned check reads MemAvailable"
+    cap = float(ceiling_bytes) / GIB
+    return cap - float(reserve_gib), (
+        f"memory.max {cap:.2f} - pinned reserve {float(reserve_gib):.2f} ({reserve_source})")
+
+
+def pinned_wall_binding(
+    predicted_gib: Optional[float], wall_gib: Optional[float], why: str,
+) -> Optional[str]:
+    """The arm's PINNED WALL binding, or None when the run peak fits under it
+    (or either side is unknown)."""
+    if predicted_gib is None or wall_gib is None or predicted_gib <= wall_gib:
+        return None
+    return (f"PINNED WALL ({predicted_gib:.2f} > {wall_gib:.2f} GiB = {why} -- the "
+            f"ranks' check_and_register_pinned_post refuses the HiCache host pools "
+            f"above it; z30x2-yarn2 D died there at 73.6 GiB non-reclaimable under "
+            f"a 10 GiB reserve)")
+
+
 def launch_moment_peak_gib(
     anon_load_peak_gib: float,
     ring_fill_gib: float,
@@ -1306,6 +1524,39 @@ def reap_model_line(
     )
 
 
+def arena_fill_gib(tag: Optional[str], root: str = "/dev/shm") -> Optional[Tuple[float, float]]:
+    """W98 dmatrix (09291358): ``(touched_gib, size_gib)`` of this boot's arena
+    files (``<root>/weg2-arena-<tag>/*``), or None when there is none.
+
+    A tmpfs file materialises its pages on first write, so its shmem charge
+    grows with the KV the arena has taken and STOPS at its size: ``st_blocks``
+    is what is charged now, ``st_size`` the bound. MEASURED: shmem rose
+    49.72 -> 53.95 GiB over the serving of boot ...z30x2bar1dauer09291358
+    (arena 5461 x 768 KiB + 32 x 56 MiB = 5.75 GiB) with anon flat at
+    24.5 GiB, and W98 fired on that rise at cg_room 2.73 GiB. Two ``stat``
+    calls per file; never raises."""
+    if not tag:
+        return None
+    d = os.path.join(root, f"weg2-arena-{tag}")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None
+    touched = size = 0
+    for n in names:
+        try:
+            st = os.stat(os.path.join(d, n))
+        except OSError:
+            continue
+        if not (st.st_mode & 0o170000) == 0o100000:
+            continue
+        size += int(st.st_size)
+        touched += min(int(st.st_size), int(getattr(st, "st_blocks", 0)) * 512)
+    if size <= 0:
+        return None
+    return touched / GIB, size / GIB
+
+
 class RateLatch:
     """#1361 (1): the sampler-independent projection latch.  PURE but for its clock.
 
@@ -1335,6 +1586,10 @@ class RateLatch:
         #: #1378: the far-from-the-mark cushion reading is said ONCE per latch.
         self._cushion_far_noted = False
         self._free_pool_noted = False
+        #: W98 dmatrix: shmem net of the arena's touched bytes, for the
+        #: "rising" gate of the writers the latch cannot bound.
+        self._last_unbounded_shmem: Optional[float] = None
+        self._bounded_fill_noted = False
 
     def rate_gib_per_s(self) -> Optional[float]:
         """The WORST consecutive slope inside the trailing window, or ``None``.
@@ -1382,12 +1637,20 @@ class RateLatch:
         cushion_gib: Optional[float] = None,
         shmem_gib: Optional[float] = None,
         free_gib: Optional[float] = None,
+        ceiling_gib: Optional[float] = None,
+        free_source: str = "MemFree",
+        bounded_shm: Optional[Tuple[float, float]] = None,
     ) -> Optional[str]:
         """#1361b: the CUSHION test replaces the remaining-bytes one, measured.
 
         ``free_gib`` (MemFree): free pages absorb a write before the page
         cache does; at or above RATE_LATCH_FREE_POOL_GIB the cushion reading
         is noted once and never latched (fnFL2 v14).
+
+        ``ceiling_gib`` / ``free_source`` (W98 z30w): a finite cgroup
+        ``memory.max`` caps the mark the headroom is taken against, and the pool
+        is the one :func:`latch_free_pool` names -- ``None`` keeps the CT999 form
+        (the recorded host mark, lxcfs MemFree) byte for byte.
 
         ``remaining_leg_gib`` IS DELETED, not left beside this -- a parameter
         that no longer decides anything is the present-but-unwired state this
@@ -1445,7 +1708,35 @@ class RateLatch:
             )
             if shmem_gib is not None:
                 self._last_shmem = float(shmem_gib)
-            headroom = self.reap_mark_gib - float(nonreclaim_gib)
+            # W98 dmatrix (09291358, 14:07:48): ``bounded_shm`` = (touched,
+            # size) GiB of a writer whose END is known -- the arena files, a
+            # tmpfs file materialises its pages on first write, so its growth
+            # stops at ``size``. A rise of that writer alone is priced against
+            # what can absorb it: remaining + floor <= cushion + free pool, and
+            # the rest of shmem (the writers without a bound) keeps the old
+            # rising gate.
+            bounded_absorbed = False
+            if bounded_shm is not None and shmem_gib is not None:
+                _touched, _size = float(bounded_shm[0]), float(bounded_shm[1])
+                _own = float(shmem_gib) - _touched
+                _own_rising = (
+                    self._last_unbounded_shmem is not None
+                    and _own - self._last_unbounded_shmem > RATE_LATCH_FILL_RISING_GIB
+                )
+                self._last_unbounded_shmem = _own
+                _remaining = max(0.0, _size - _touched)
+                _absorb = float(cushion_gib) + (float(free_gib) if free_gib is not None else 0.0)
+                if rising and not _own_rising and (
+                        _remaining + RATE_LATCH_CUSHION_FLOOR_GIB <= _absorb):
+                    bounded_absorbed = True
+            # W98 z30w: inside a finite cgroup the cgroup OOM fires at
+            # memory.max, below the recorded host mark (84 vs 95.90 in the
+            # Docker form); pricing headroom against the host mark over-states
+            # it by the difference.
+            mark = self.reap_mark_gib
+            if ceiling_gib is not None and float(ceiling_gib) < mark:
+                mark = float(ceiling_gib)
+            headroom = mark - float(nonreclaim_gib)
             if rising and float(cushion_gib) < RATE_LATCH_CUSHION_FLOOR_GIB:
                 if free_gib is not None and float(free_gib) >= RATE_LATCH_FREE_POOL_GIB:
                     if not self._free_pool_noted:
@@ -1454,9 +1745,9 @@ class RateLatch:
                             f"WEG2-HOST CUSHION-BELOW-FLOOR FREE-POOL-ABSORBS: cushion="
                             f"{float(cushion_gib):.2f} GiB < floor "
                             f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem rises "
-                            f"(shmem={float(shmem_gib):.2f}) but MemFree={float(free_gib):.2f} "
+                            f"(shmem={float(shmem_gib):.2f}) but {free_source}={float(free_gib):.2f} "
                             f"GiB >= {RATE_LATCH_FREE_POOL_GIB:.2f} (now={nonreclaim_gib:.2f}, "
-                            f"mark={self.reap_mark_gib:.2f}, headroom={headroom:.2f}) -- the "
+                            f"mark={mark:.2f}, headroom={headroom:.2f}) -- the "
                             f"next write lands in free pages, not in a page cache the shared "
                             f"expert store (tmpfs) has already displaced (fnFL2 v14 was torn "
                             f"down on this reading); printed once"
@@ -1474,12 +1765,28 @@ class RateLatch:
                         f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem rises "
                         f"(shmem={float(shmem_gib):.2f}) but headroom="
                         f"{headroom:.2f} GiB (now={nonreclaim_gib:.2f}, mark="
-                        f"{self.reap_mark_gib:.2f}) is ABOVE the relevance bound "
+                        f"{mark:.2f}) is ABOVE the relevance bound "
                         f"{RATE_LATCH_CUSHION_RELEVANCE_GIB:.2f} -- the free pool, "
                         f"not the page cache, absorbs the next write here "
                         f"(weg2xsn65 was torn down on exactly this reading, "
                         f"cushion 0.43 at 9.89 of 95.90, after a cold-cache "
                             f"launch); printed once"
+                        )
+                elif bounded_absorbed:
+                    if not self._bounded_fill_noted:
+                        self._bounded_fill_noted = True
+                        return (
+                            f"WEG2-HOST CUSHION-BELOW-FLOOR BOUNDED-FILL: cushion="
+                            f"{float(cushion_gib):.2f} GiB < floor "
+                            f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} and shmem rises "
+                            f"(shmem={float(shmem_gib):.2f}), but only the arena "
+                            f"grows: touched={float(bounded_shm[0]):.2f} of "
+                            f"{float(bounded_shm[1]):.2f} GiB, remaining "
+                            f"{max(0.0, float(bounded_shm[1]) - float(bounded_shm[0])):.2f} "
+                            f"+ floor fits the absorb {float(cushion_gib) + (float(free_gib) if free_gib is not None else 0.0):.2f} "
+                            f"GiB (cushion + {free_source}; now={nonreclaim_gib:.2f}, "
+                            f"mark={mark:.2f}) -- a tmpfs file stops at its size; "
+                            f"printed once, the unbounded writers keep the latch"
                         )
                 else:
                     self.latched = True
@@ -1559,7 +1866,7 @@ def watermark_breach_verdict(
     but ``own_pids`` no longer participates in the arithmetic.
     """
     m = margin if margin is not None else resolve_margin()
-    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    w = watermark_gib if watermark_gib is not None else reap_mark_gib()
     # #1269 FIX 4: the RUNTIME bound, which carries no model-error term. This
     # call grades a MEASUREMENT; the residual reserves for how wrong a
     # PREDICTION can be, and the measurement has already realised that error.
@@ -2584,6 +2891,16 @@ def _arm_s_d(arm) -> str:
 # ---------------------------------------------------------------------------
 
 
+def xchg_carrier_gib(priced_bytes: int, census: Optional[Dict[str, object]]) -> float:
+    """The exchange carrier's host post: the census MEASUREMENT when a record
+    of this model|form carries one, else the priced bounce region."""
+    priced = max(0, int(priced_bytes)) / GIB
+    measured = (census or {}).get("xchg_measured_gib")
+    if measured is None or priced <= 0.0:
+        return priced
+    return max(0.0, float(measured))
+
+
 def charge_terms(
     s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms,
     s_gb_d: Optional[int] = None,
@@ -2620,6 +2937,15 @@ def charge_terms(
     # rc12d: the torch allocation history (weg2/memhist.py), booked. The
     # lean form arms after the first sleep: RUN moment only.
     memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
+    # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
+    # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
+    cold_tier_shm_gib: float = 0.0,
+    # 29.09. (host census, z30w): measured posts per model|form from
+    # host_census.ledger_terms -- non-rank anon, lane ring, arena sidecar,
+    # hand-off (charged) and the shmem no class names (printed, ungebucht).
+    census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
 ) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
@@ -2645,6 +2971,119 @@ def charge_terms(
     :func:`price`'s own fix-8 note records what a shadowed name costs.
     """
     _m_real = m_mib if anchor_mib is None else int(anchor_mib)
+    _terms = _charge_terms_priced(
+        s_gb, m_mib, ranks_per_group, images, s_gb_d, xchg_bounce_host_bytes,
+        flip_ratchet_gib, arena_gib, staging_gb, _m_real, hicache_disabled,
+        d_draft_host_gib, d_only, memhist_gib, l3_index_gib, cold_tier_shm_gib,
+        census, memhist_run_only)
+    _terms.update(census_shm_posts(_terms, census))
+    return _terms
+
+
+def census_shm_posts(terms: Mapping[str, object], census: Optional[Mapping[str, object]]) -> Dict[str, float]:
+    """29.09.: the two shmem posts a census record MEASURES and no price carries.
+
+    Two-sided replay of 27B z30y 09291331 (peak 62.29 GiB in the level currency
+    memory.current - inactive_file - active_file, 13:36:49Z: anon 24.40 + shmem
+    36.90 + kernel 0.99): the priced arm left shmem 2.2 GiB short --
+      * arena: priced 30.18, the file measured 31.41 (arena_booked) -> the
+        excess is charged, never a deficit (a smaller measured file is a
+        different arm, not a refund);
+      * other_tmpfs 0.89 + unattributed 1.49 (anon_shared: TMS images, parked
+        drafts, memfd) hold the small priced host posts (anchors, rings,
+        overhead, parked drafts, 0.82) and 1.56 GiB more that no post books.
+    Each byte once: the priced small posts are netted out of the measured
+    remainder, and the excess over the arena price is only the excess.
+    Without a record both posts are 0 (UNMEASURED, as every census post).
+    """
+    c = census or {}
+    measured_arena = c.get("arena_measured_gib")
+    arena_excess = (0.0 if measured_arena is None
+                    else max(0.0, float(measured_arena) - float(terms.get("arena_gib", 0.0) or 0.0)))
+    priced_small = sum(float(terms.get(k, 0.0) or 0.0) for k in (
+        "anchors_gib", "rings_gib", "overhead_gib", "draft_host_p_gib",
+        "draft_host_d_gib", "d_draft_host_gib"))
+    measured_rest = (float(c.get("other_tmpfs_gib", 0.0) or 0.0)
+                     + float(c.get("unbooked_shm_gib", 0.0) or 0.0))
+    unposted = max(0.0, measured_rest - priced_small) if measured_arena is not None else 0.0
+    trim = _shm_total_trim_gib(terms, c, arena_excess, min(priced_small, measured_rest), unposted)
+    out = {"arena_census_excess_gib": arena_excess, "unposted_shm_gib": unposted - trim}
+    if trim:  # printed on the ARM line; absent = byte-identical to every pre-NF1d record
+        out["unposted_shm_trim_gib"] = trim
+    return out
+
+
+def _shm_total_trim_gib(terms: Mapping[str, object], c: Mapping[str, object],
+                        arena_excess: float, small_in_rest: float, unposted: float) -> float:
+    """29.09. NF1d (W21 84.16 vs 83.44): how much of ``unposted`` the ledger's
+    shmem claim holds ABOVE what one measured instant held, GiB (>= 0).
+
+    The census record max-merges every class and ``unattributed`` on its own,
+    so their sum is a sum of maxima from different samples: store 41.69
+    (09291559, written map 368 slots) + ungebucht 6.26 (z30w 09:12Z, store
+    39.20). The two trade -- 22 slots more in the store is less elsewhere:
+    z30w cg shmem 53.36, 09291559 host Shmem max 54.11 (+0.75 for +2.49 store).
+    The ledger claimed 56.80 GiB of shmem for 09291559's own arm. The record's
+    ``shm_total_max_gib`` is the peak of the SUM at one instant; the claim is
+    capped there, plus whatever THIS arm's store/arena price exceeds that
+    instant's. Only ``unposted`` (the pathless remainder) is trimmed -- every
+    named post keeps its price. No field (every pre-NF1d record, 27B): 0.
+    """
+    tot = c.get("shm_total_max_gib")
+    if tot is None or c.get("arena_measured_gib") is None:
+        return 0.0
+
+    def _t(k: str) -> float:
+        return float(terms.get(k, 0.0) or 0.0)
+
+    claimed = (_t("cold_tier_shm_gib") + _t("arena_gib") + arena_excess + _t("l3_index_gib")
+               + _t("seq_ring_gib") + _t("arena_sidecar_gib") + _t("arena_handoff_gib")
+               + small_in_rest + unposted)
+    cap = _shm_claim_cap_gib(terms, c, arena_excess)
+    return min(unposted, max(0.0, claimed - cap))
+
+
+def shm_rest_gib(c: Mapping[str, object]) -> Optional[float]:
+    """30.09. LEDGER-FIXPOINT: the measured shmem OUTSIDE the store and the
+    arena at one instant, GiB -- ``shm_rest_max_gib`` of the record (the max
+    of that difference over the samples), else the difference at the record's
+    peak-of-the-SUM instant (``shm_total_max - store@ - arena@``, the same
+    sample). None without a total."""
+    rest = c.get("shm_rest_max_gib")
+    if rest is not None:
+        return max(0.0, float(rest))
+    tot = c.get("shm_total_max_gib")
+    if tot is None:
+        return None
+    return max(0.0, float(tot) - float(c.get("shm_total_store_gib") or 0.0)
+               - float(c.get("shm_total_arena_gib") or 0.0))
+
+
+def _shm_claim_cap_gib(terms: Mapping[str, object], c: Mapping[str, object],
+                       arena_excess: float) -> float:
+    """30.09. LEDGER-FIXPOINT (y4m W87, 12:29Z/12:32Z): the shmem ceiling of
+    this arm's claim = what ONE measured instant held OUTSIDE the store and the
+    arena, plus THIS arm's own store and arena (price, plus the measured arena
+    excess). Before: the instant's whole total, plus the arm's store/arena only
+    where they EXCEEDED the instant's -- a smaller store was never credited, so
+    the record's all-time total (60.14 GiB at 08:34:06Z with a 43.96 GiB store)
+    was charged to y4m's 38.97 GiB store as 4.99 GiB of phantom ``unposted``
+    shmem (run peak 90.03 -> the cushion floor refused against a 90.44 bound).
+    Signed, the same checkpoint and form give the same charge whatever the
+    arm's store is: a fixpoint, not a ratchet."""
+    def _t(k: str) -> float:
+        return float(terms.get(k, 0.0) or 0.0)
+
+    rest = shm_rest_gib(c) or 0.0
+    return rest + _t("cold_tier_shm_gib") + _t("arena_gib") + float(arena_excess)
+
+
+def _charge_terms_priced(
+    s_gb, m_mib, ranks_per_group, images, s_gb_d, xchg_bounce_host_bytes,
+    flip_ratchet_gib, arena_gib, staging_gb, _m_real, hicache_disabled,
+    d_draft_host_gib, d_only, memhist_gib, l3_index_gib, cold_tier_shm_gib,
+    census, memhist_run_only,
+) -> Dict[str, object]:
     anchors_gib = 0.0 if hicache_disabled else (
         (ANCHORS_AT_2400_BYTES * (_m_real / ANCHORS_REFERENCE_M_MIB)) / GIB
     )
@@ -2686,6 +3125,15 @@ def charge_terms(
         "d_draft_host_gib": max(0.0, float(d_draft_host_gib)),
         # rc12d: the ledger post 'memhist'; key always present (0.0 = off)
         "memhist_gib": max(0.0, float(memhist_gib)),
+        "l3_index_gib": max(0.0, float(l3_index_gib)),
+        "cold_tier_shm_gib": max(0.0, float(cold_tier_shm_gib)),
+        "nonrank_anon_gib": max(0.0, float((census or {}).get("nonrank_anon_gib", 0.0) or 0.0)),
+        "seq_ring_gib": max(0.0, float((census or {}).get("seq_ring_gib", 0.0) or 0.0)),
+        "arena_sidecar_gib": max(0.0, float((census or {}).get("arena_sidecar_gib", 0.0) or 0.0)),
+        "arena_handoff_gib": max(0.0, float((census or {}).get("arena_handoff_gib", 0.0) or 0.0)),
+        "unbooked_shm_gib": max(0.0, float((census or {}).get("unbooked_shm_gib", 0.0) or 0.0)),
+        "census_source": str((census or {}).get("census_source", "") or ""),
+        "census_roles": dict((census or {}).get("census_roles") or {}),
         "memhist_run_only": bool(memhist_run_only),
         "image_p_gib": images.p_gib,
         "image_d_gib": images.d_gib,
@@ -2693,7 +3141,16 @@ def charge_terms(
         "weight_tags_d_gib": WEIGHT_TAGS_D_BYTES / GIB,
         "image_extra_p_gib": images.extra_p_gib,
         "image_extra_d_gib": images.extra_d_gib,
-        "xchg_bounce_gib": max(0, int(xchg_bounce_host_bytes)) / GIB,
+        # 29.09. (27B d2 W97; z30y 09291331 predicted 65.53 without the census,
+        # 75.8 with it, measured peak 62.29): EACH POST ONCE. The priced bounce
+        # region (#1464b: the incumbent's 5-lane price, kept as a coverage
+        # constant for "an unattributed ~10 GiB since xsn31") and the census
+        # posts that now attribute those bytes (non-rank anon 7.20 + lane ring
+        # 3.00) are the same bytes. With a census record the carrier is charged
+        # as MEASURED (weg2-xchg-* shmem, 0.0006 GiB on that boot); without one
+        # the price stands.
+        "xchg_bounce_gib": xchg_carrier_gib(xchg_bounce_host_bytes, census),
+        "xchg_bounce_priced_gib": max(0, int(xchg_bounce_host_bytes)) / GIB,
         # #1350: what the first waking of EACH GROUP adds to the cgroup and
         # NEVER gives back.  A MEASUREMENT (`resolve_flip_ratchet_gib`, read
         # from the sidecar the front writes at `WEG2-FLIP done epoch=2`), never
@@ -2736,6 +3193,14 @@ def _boot_charges_gib(terms: Dict[str, object]) -> float:
         + float(terms.get("d_draft_host_gib", 0.0) or 0.0)  # H25: parked D draft
         # rc12d: the history armed from rank start is there at both moments
         + (0.0 if terms.get("memhist_run_only") else float(terms.get("memhist_gib", 0.0) or 0.0))
+        + float(terms.get("l3_index_gib", 0.0) or 0.0)  # 28.09.: the L3 index, every owner
+        + float(terms.get("cold_tier_shm_gib", 0.0) or 0.0)  # 29.09.: tmpfs expert store
+        + float(terms.get("nonrank_anon_gib", 0.0) or 0.0)
+        + float(terms.get("seq_ring_gib", 0.0) or 0.0)
+        + float(terms.get("arena_sidecar_gib", 0.0) or 0.0)
+        + float(terms.get("arena_handoff_gib", 0.0) or 0.0)  # 29.09.: host census posts
+        + float(terms.get("arena_census_excess_gib", 0.0) or 0.0)
+        + float(terms.get("unposted_shm_gib", 0.0) or 0.0)  # 29.09.: measured shmem, once
     )
 
 
@@ -2918,11 +3383,56 @@ def record_run_residual_gib(
     return float(stored) - correction, correction
 
 
+#: 29.09. (27B d2 13:52Z W97, run peak 86.19 vs 60.85 measured): the host
+#: census posts (host_census.ledger_terms) this module charges as their own
+#: terms. A run-moment residual is ``nonreclaim - charges - image`` of the
+#: boot that sampled it; whatever of these posts that boot did NOT charge is
+#: inside its residual, so charging them again on top of it counts the same
+#: bytes twice.
+CENSUS_POST_KEYS = ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib",
+                    "arena_census_excess_gib", "unposted_shm_gib")
+
+
+def census_posts_gib(charges: Optional[Mapping[str, object]]) -> float:
+    """The census posts of one charge dict, summed (0.0 when absent)."""
+    return sum(max(0.0, float((charges or {}).get(k, 0.0) or 0.0)) for k in CENSUS_POST_KEYS)
+
+
+#: 29.09. NF 09291634 (W21: run peak 101.02 vs 82.53, origin 25.35 from the
+#: z30y2 09291559 D record, stored 39.65): the NAMED tmpfs files this module
+#: charges as their own posts -- the tmpfs expert store (cold_tier_shm 38.97),
+#: the L2 arena file (5.75) and the persistent L3 index. eb73b011d1 changed the
+#: sampler's image instrument from RssShmem (which counted every mapped shmem
+#: page, store and arena included, in every process: NF image 140 GiB,
+#: residual -99) to ``pss_anon_shared`` (anonymous shared mappings only, "named
+#: tmpfs files have their own posts"). From then on these files sit INSIDE the
+#: residual the sampler writes -- and the sampler never subtracts them (its
+#: charge_terms call carries neither store nor arena nor index), so a reader
+#: that charges them as terms counts them twice: 39.65 - 14.30 census = 25.35,
+#: of which 38.97 + 5.75 are the store and the arena the same arm charges again.
+NAMED_SHM_POST_KEYS = ("cold_tier_shm_gib", "arena_gib", "l3_index_gib")
+#: the image instrument whose residual holds the named tmpfs files (above)
+IMAGE_INSTRUMENT_PSS_ANON_SHARED = "pss_anon_shared"
+
+
+def named_shm_posts_gib(charges: Optional[Mapping[str, object]]) -> float:
+    """The named tmpfs posts of one charge dict, summed (0.0 when absent)."""
+    return sum(max(0.0, float((charges or {}).get(k, 0.0) or 0.0)) for k in NAMED_SHM_POST_KEYS)
+
+
 def run_origin_gib(
     cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None,
     reference_model_ok: Optional[bool] = None, reference_model_why: str = "",
+    census_now_gib: float = 0.0,
+    named_shm_now_gib: float = 0.0,
 ) -> Tuple[Optional[float], str]:
     """The origin the RUN PEAK is predicted from, and where it came from.
+
+    ``named_shm_now_gib`` (29.09., :data:`NAMED_SHM_POST_KEYS`): the store,
+    arena and L3-index posts this arm charges. A record sampled with the
+    ``pss_anon_shared`` image instrument holds them inside its residual, so
+    they leave the floor exactly like the census posts; a RssShmem-era record
+    (no ``image_instrument``) subtracted them with its image and is untouched.
 
     THE FIX-8 CORRECTION: the launch-moment reading is a FLOOR, not the origin.
     Measured on two boots one night apart -- weg2dk6 launched into 46.80 GiB and
@@ -3052,8 +3562,26 @@ def run_origin_gib(
             _any_death = True
             continue
         _repriced.append((record_run_residual_gib(e), g, e))
+    # 29.09.: EACH CENSUS POST COUNTS ONCE -- as its own term or inside the
+    # measured residual, never both. The residual holds every census post its
+    # sampler did not subtract (`residual_census_gib`, absent = 0 on records
+    # written before the census existed); what this boot charges above that is
+    # taken out of the floor here, so the run peak adds it exactly once.
+    _census_out: Dict[int, float] = {}
+    _named_out: Dict[int, float] = {}
+    for (_v, _c), _g, _e in _repriced:
+        if _v is not None:
+            _census_out[id(_e)] = max(
+                0.0, float(census_now_gib or 0.0) - float(_e.get("residual_census_gib") or 0.0))
+            # 29.09. NF 09291634: the named tmpfs posts, once (see
+            # NAMED_SHM_POST_KEYS). Only the instrument that left them in.
+            if _e.get("image_instrument") == IMAGE_INSTRUMENT_PSS_ANON_SHARED:
+                _named_out[id(_e)] = max(0.0, float(named_shm_now_gib or 0.0))
+    for _k, _n in _named_out.items():
+        _census_out[_k] = _census_out.get(_k, 0.0) + _n
     residuals = [
-        (v, g, e, corr) for (v, corr), g, e in _repriced if v is not None
+        (v - _census_out.get(id(e), 0.0), g, e, corr)
+        for (v, corr), g, e in _repriced if v is not None
     ]
     if residuals:
         floor, group, entry, _corr = max(residuals, key=lambda r: r[0])
@@ -3072,6 +3600,13 @@ def run_origin_gib(
             f"{float(entry['run_residual_gib']):.2f}"
             + (
                 f", RE-PRICED -{_corr:.2f} for S_D (#1325)" if _corr else ""
+            )
+            + (
+                f", -{_census_out[id(entry)]:.2f} census posts charged as their own terms"
+                + (f" (of which {_named_out[id(entry)]:.2f} store+arena+L3-index, "
+                   f"image_instrument={IMAGE_INSTRUMENT_PSS_ANON_SHARED})"
+                   if _named_out.get(id(entry)) else "")
+                if _census_out.get(id(entry)) else ""
             )
             + ")"
         )
@@ -3892,6 +4427,8 @@ class Arm:
     terms: Dict[str, float] = field(default_factory=dict)
     launch_leftover_gib: float = 0.0
     run_leftover_gib: float = 0.0
+    # 29.09.: (GiB|None, source) of the ranks' pinned-host reserve, set by choose()
+    pinned_reserve: Tuple[Optional[float], str] = (None, "")
 
     @property
     def launch_worst_case_gib(self) -> float:
@@ -4237,6 +4774,15 @@ def price(
     anchor_mib: Optional[int] = None,
     d_draft_host_gib: float = 0.0,
     memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
+    # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
+    # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
+    cold_tier_shm_gib: float = 0.0,
+    # 29.09. (host census, z30w): measured posts per model|form from
+    # host_census.ledger_terms -- non-rank anon, lane ring, arena sidecar,
+    # hand-off (charged) and the shmem no class names (printed, ungebucht).
+    census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
     # H87: see `charge_terms` (d_only) and `run_origin_gib`/`resolve_image_terms`
     # (reference_model_ok). Defaults are byte-identical to every caller before.
@@ -4404,7 +4950,10 @@ def price(
                            hicache_disabled=hicache_disabled,
                            arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
                            d_draft_host_gib=d_draft_host_gib, d_only=d_only,
-                           memhist_gib=memhist_gib, memhist_run_only=memhist_run_only)
+                           memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+                           l3_index_gib=l3_index_gib,
+                           cold_tier_shm_gib=cold_tier_shm_gib,
+                           census=census)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -4423,7 +4972,16 @@ def price(
     # numbers (measured image and weight-tag census) to print.
     image_p_gib = images.p_gib
     image_d_gib = images.d_gib
-    common = base_gib - FLOOR_GIB - _boot_charges_gib(charges)
+    # 29.09. (z30y W87/W20 13:01Z): the tmpfs expert store counts ONCE -- in the
+    # run peak against memory.max, where its pages land (z30x2 memts: shmem
+    # 53.3 GiB of 79.54 non-reclaimable). The two moments here are the #721 /
+    # #1236 leftovers above FLOOR and the CLI reserve, and #1236 took the store
+    # out of them ("store=NOT CHARGED HERE"); charging it here as well made the
+    # same 38.97 GiB bind twice -- once in the run peak (77.98 vs 82.53, funded)
+    # and once against the 26 GiB FLOOR + CLI the moments keep -- and refused a
+    # form that ran at 79.54 of 84. The ARM line still prints the post.
+    cold_tier_gib = float(charges.get("cold_tier_shm_gib", 0.0) or 0.0)
+    common = base_gib - FLOOR_GIB - (_boot_charges_gib(charges) - cold_tier_gib)
     # R7: at the launch moment only span 1 is registered (P's first pause is the
     # launcher's sleep(P)); span 2 lands at D's first pause, when D's load
     # transient is gone.  Charging Sigma H at launch is what turns the M=1200
@@ -4453,6 +5011,8 @@ def price(
         measured_record,
         reference_model_ok=reference_model_ok,
         reference_model_why=reference_model_why,
+        census_now_gib=census_posts_gib(charges),
+        named_shm_now_gib=named_shm_posts_gib(charges),
     )
     arm = Arm(
         s_gb=s_gb,
@@ -4533,6 +5093,22 @@ def price(
         "arena_gib": float(charges.get("arena_gib", 0.0) or 0.0),  # #1432: in the Arm's own terms, so the run peak carries it
         "d_draft_host_gib": float(charges.get("d_draft_host_gib", 0.0) or 0.0),  # H25
         "memhist_gib": float(charges.get("memhist_gib", 0.0) or 0.0),  # rc12d
+        "l3_index_gib": float(charges.get("l3_index_gib", 0.0) or 0.0),  # 28.09.
+        "cold_tier_shm_gib": float(charges.get("cold_tier_shm_gib", 0.0) or 0.0),  # 29.09.
+        "nonrank_anon_gib": float(charges.get("nonrank_anon_gib", 0.0) or 0.0),
+        "seq_ring_gib": float(charges.get("seq_ring_gib", 0.0) or 0.0),
+        "arena_sidecar_gib": float(charges.get("arena_sidecar_gib", 0.0) or 0.0),
+        "arena_handoff_gib": float(charges.get("arena_handoff_gib", 0.0) or 0.0),
+        "unbooked_shm_gib": float(charges.get("unbooked_shm_gib", 0.0) or 0.0),
+        # 29.09. NF 09291634 (W21 101.02): 66c46ba763's two measured shmem
+        # posts reached `charges` (and so both moments) but not this fresh
+        # literal -- the run peak never carried them (NF 4.90, 27B 2.79 GiB)
+        # while `census_now_gib` netted them out of the residual floor.
+        "arena_census_excess_gib": float(charges.get("arena_census_excess_gib", 0.0) or 0.0),
+        "unposted_shm_gib": float(charges.get("unposted_shm_gib", 0.0) or 0.0),
+        # 29.09. NF1d: printed, never charged (see _shm_total_trim_gib)
+        "unposted_shm_trim_gib": float(charges.get("unposted_shm_trim_gib", 0.0) or 0.0),
+        "census_source": str(charges.get("census_source", "") or ""),
         "memhist_run_only": bool(charges.get("memhist_run_only", False)),
         "overhead_gib": overhead_gib,
         # #1386: SAME LABEL DEFECT the #1317n comment above names for
@@ -4626,7 +5202,9 @@ def read_flip_currency_gib(root: str = "/sys/fs/cgroup") -> Optional[float]:
     return total / GIB
 
 
-def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[float]]:
+def read_cgroup_pressure(
+    root: str = "/sys/fs/cgroup", meminfo_path: str = "/proc/meminfo",
+) -> Dict[str, Optional[float]]:
     """NON-RECLAIMABLE PRESSURE in GiB, with the raw reading beside it.
 
     #1269 fix 3 -- the defect that refused boot weg2sb5b 28 GiB below danger.
@@ -4669,16 +5247,30 @@ def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[flo
         "anon_gib": None,
         "shmem_gib": None,
         "memfree_gib": None,
+        # W98 z30w: MemAvailable and a finite memory.max feed latch_free_pool;
+        # memory.max 'max' (CT999) stays None, so that form is unchanged.
+        "memavail_gib": None,
+        "max_gib": None,
         "source": None,
     }
     st: Dict[str, int] = {}
     try:
-        with open("/proc/meminfo") as f:
+        with open(meminfo_path) as f:
             for line in f:
                 if line.startswith("MemFree:"):
                     out["memfree_gib"] = int(line.split()[1]) * 1024 / GIB
+                elif line.startswith("MemAvailable:"):
+                    out["memavail_gib"] = int(line.split()[1]) * 1024 / GIB
+                if out["memfree_gib"] is not None and out["memavail_gib"] is not None:
                     break
     except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(f"{root}/memory.max") as f:
+            raw = f.read().strip()
+        if raw.isdigit():
+            out["max_gib"] = int(raw) / GIB
+    except OSError:
         pass
     try:
         with open(f"{root}/memory.stat") as f:
@@ -4897,6 +5489,36 @@ def rss_shmem_bytes(pids: Iterable[int]) -> Tuple[int, List[int]]:
     return total, seen
 
 
+def image_shmem_bytes(pids: Iterable[int], reader=None) -> Tuple[int, List[int]]:
+    """A group's dormant IMAGE: the Pss of its ANONYMOUS shared mappings;
+    return (bytes, the pids that answered).
+
+    29.09. (z30w: stored run residual -98.95 GiB): :func:`rss_shmem_bytes` sums
+    ``RssShmem``, which counts every shared page IN FULL in EVERY process that
+    maps it. Under the tmpfs expert store each of D's three ranks maps the
+    same 39 GiB (RssShmem 52/46/46 GiB, Pss_Shmem 15.9/11.5/11.5), so the
+    'image' came out at ~144 GiB and the residual went negative by the store
+    counted three times. Named tmpfs files -- the store, the arena, the lane
+    ring -- are priced by their own ledger terms; the image is what has no
+    file (the TMS CPU backup, a parked draft: anonymous MAP_SHARED, see
+    :func:`rss_shmem_bytes`), and Pss splits a page shared between processes
+    instead of counting it once per mapper."""
+    from sglang.srt.weg2 import host_census as _hc
+
+    rd = reader or _hc._read
+    total = 0
+    seen: List[int] = []
+    for pid in pids:
+        try:
+            text = rd(f"/proc/{int(pid)}/smaps")
+        except OSError:
+            continue
+        total += sum(b for path, b in _hc.smaps_shm_pss(text).items()
+                     if _hc.shm_class(path.replace(" (deleted)", "")) == "anon_shared")
+        seen.append(int(pid))
+    return total, seen
+
+
 def _cg_oom_kill_now() -> Optional[int]:
     """``memory.events oom_kill`` for this cgroup, or ``None`` if unreadable.
 
@@ -4949,6 +5571,7 @@ def dormant_image_sample(
     vram_residue_mib: Optional[Dict[str, int]] = None,
     vram_residue_form: str = "",
     vram_residue_capture_bs: Optional[int] = None,
+    vram_residue_context_tokens: Optional[int] = None,
 ) -> Dict[str, object]:
     """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
 
@@ -4985,13 +5608,16 @@ def dormant_image_sample(
         if shmem_before_bytes is None or shmem_after_bytes is None
         else (int(shmem_after_bytes) - int(shmem_before_bytes)) / GIB
     )
-    rss, seen = rss_shmem_bytes(pids)
+    # 29.09.: the image in Pss of anonymous shared memory, not RssShmem
+    # (which counted the shared tmpfs store once per mapping rank, z30w)
+    rss, seen = image_shmem_bytes(pids)
     rss_gib = rss / GIB
     residual: Optional[float] = None
     # Initialised here and not only in the branch below: the record's
     # `residual_charges_gib` reads it, and a name that exists on exactly one
     # path is a NameError waiting for the next editor (#1326).
     _charges_gib: Optional[float] = None
+    _census_gib: Optional[float] = None
     residual_note = ""
     if cg_current_bytes is None or arm is None:
         residual_note = (
@@ -5071,6 +5697,7 @@ def dormant_image_sample(
         # needs no version inference at all: correction = stored_charges -
         # correct_charges, and it is 0 for a record already in its own currency.
         _charges_gib = _boot_charges_gib(charges)
+        _census_gib = census_posts_gib(charges)
         residual = nonreclaim_gib - _charges_gib - rss_gib
         residual_note = (
             f"nonreclaimable {nonreclaim_gib:.2f} minus this boot's own charges "
@@ -5091,6 +5718,7 @@ def dormant_image_sample(
         "shmem_after_bytes": shmem_after_bytes,
         "shmem_delta_gib": delta,
         "rss_shmem_gib": rss_gib,
+        "image_instrument": "pss_anon_shared",  # 29.09.: not RssShmem (z30w -98.95)
         # #1350: WHEN, relative to the flips, this sample was taken. The
         # run-moment residual of a sample taken during or after the first flip
         # pair ALREADY CONTAINS the ratchet (measured: `stored=` walks
@@ -5125,6 +5753,9 @@ def dormant_image_sample(
         # record without inferring which version of this function wrote it.
         # None when no run moment was available (the residual is None too).
         "residual_charges_gib": _charges_gib,
+        # 29.09.: the census posts inside that subtraction, so a later boot
+        # takes out of this residual only what it charges beyond them.
+        "residual_census_gib": _census_gib,
         # #1325: WHAT THE BOX WAS DOING WHEN THIS WAS SAMPLED, and WHICH
         # SERVING FORM it speaks for. Both RECORDED, neither yet a selector of
         # a different number -- and that ordering is deliberate. The reading
@@ -5174,6 +5805,11 @@ def dormant_image_sample(
         # (launcher.d_residue_record_accept). Absent when not given.
         **({"vram_residue_capture_bs": int(vram_residue_capture_bs)}
            if vram_residue_capture_bs is not None else {}),
+        # YaRN x2 27B (29.09.): the residue holds the RoPE caches of the group's CONTEXT; a sample of a longer
+        # context names it (absent = the rig's 262144), so the launcher prices only the difference to its own
+        # (launcher.d_rope_context_delta_mib / dc_residue_context).
+        **({"vram_residue_context_tokens": int(vram_residue_context_tokens)}
+           if vram_residue_context_tokens else {}),
     }
 
 
@@ -5242,15 +5878,44 @@ def read_measured_record(
     Qwen3.8-27B boot the Next-Flash boot fnFL2x142's D residue and run sample
     (xsn417). ``None`` (every caller before the form) keeps today's answer.
     """
+    out: Dict[str, dict] = {}
+    for g, e in _measured_entries(path, boot_tag, accept):
+        if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
+            out[g] = e
+    return out
+
+
+def read_measured_records(
+    path: str,
+    group: str,
+    accept: Optional[Callable[[dict], bool]] = None,
+) -> List[dict]:
+    """EVERY entry of one group from the sidecar, oldest first, through the
+    same filter as :func:`read_measured_record` (entry shape, calibration
+    identity ``accept``). A malformed or missing file is an ABSENCE: ``[]``.
+
+    D-EXPECT (29.09.): the D expectation budget prices group P's dormant VRAM
+    residue as the MAXIMUM over the newest boots, not the newest one -- a
+    lucky low sample must not size the D form too large (27B review)."""
+    rows = [e for g, e in _measured_entries(path, None, accept) if g == str(group)]
+    rows.sort(key=lambda e: str(e.get("at", "")))
+    return rows
+
+
+def _measured_entries(
+    path: str,
+    boot_tag: Optional[str],
+    accept: Optional[Callable[[dict], bool]],
+):
+    """The one filter loop of the sidecar readers: ``(group, entry)`` pairs."""
     try:
         with open(path) as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return {}
+        return
     entries = data.get("samples") if isinstance(data, dict) else None
     if not isinstance(entries, list):
-        return {}
-    out: Dict[str, dict] = {}
+        return
     for e in entries:
         # #1350: TWO ENTRY SHAPES, ONE READER. An image entry carries
         # `rss_shmem_gib`; the flip-ratchet entry (group "FLIP", written by the
@@ -5278,9 +5943,7 @@ def read_measured_record(
             continue
         if accept is not None and not accept(e):
             continue
-        if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
-            out[g] = e
-    return out
+        yield g, e
 
 
 #: #1377 W11: where the v3 sampler's CSV is, published by whoever ARMS the
@@ -5528,7 +6191,7 @@ def _gib_or_none(value: Optional[float]) -> str:
     return "unreadable" if value is None else f"{value:.2f} GiB"
 
 
-def _advisory_line(arm: Arm, chosen: bool) -> str:
+def _advisory_line(arm: Arm, chosen: bool, watermark_gib: Optional[float] = None) -> str:
     """The RUN-PEAK line, printed for the CHOSEN arm or -- on a total refusal --
     for the most frugal arm on the ladder.
 
@@ -5538,7 +6201,10 @@ def _advisory_line(arm: Arm, chosen: bool) -> str:
     needs, and a refusal is the outcome on this box today.  Emitting it only on
     success would delete the explanation at the moment it is wanted.
     """
-    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    # 29.09.: the mark `choose` graded against (reap_mark_gib), not the CT999
+    # constant -- the advisory must say ABOVE where the refusal does.
+    if watermark_gib is None:
+        watermark_gib = reap_mark_gib()
     predicted = arm.predicted_run_peak_gib()
     subject = "this arm" if chosen else f"the most frugal arm (S={arm.s_gb} M={arm.m_mib})"
     if predicted is None:
@@ -5601,6 +6267,12 @@ def arm_terms_line(arm) -> str:
         f"d_draft_host={_g('d_draft_host_gib')} "
         + (f"memhist={_g('memhist_gib')}{'(run)' if t.get('memhist_run_only') else ''} "
            if float(t.get('memhist_gib') or 0.0) else "")
+        + (f"l3_index={_g('l3_index_gib')} " if float(t.get('l3_index_gib') or 0.0) else "")
+        + (f"cold_tier_shm={_g('cold_tier_shm_gib')} " if float(t.get('cold_tier_shm_gib') or 0.0) else "")
+        + "".join(f"{_k[:-4]}={_g(_k)} " for _k in ("nonrank_anon_gib", "seq_ring_gib", "arena_sidecar_gib", "arena_handoff_gib",
+                                                     "arena_census_excess_gib", "unposted_shm_gib") if float(t.get(_k) or 0.0))
+        + (f"unposted_shm_trim=-{_g('unposted_shm_trim_gib')}[cap: census shm_total, one instant] "
+           if float(t.get('unposted_shm_trim_gib') or 0.0) else "")
         + f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
         f"host_weights={_g('host_ring_gib')} "
         f"ratchet_charged={_g('flip_ratchet_charged_gib')} "
@@ -5689,7 +6361,19 @@ def choose(
     d_only: bool = False,
     reference_model_ok: Optional[bool] = None,
     reference_model_why: str = "",
+    # 29.09. NF1c (H87): this checkpoint's memory footprint, keys the margin's
+    # own-model residual rows (resolve_margin). "" = unknown.
+    model_footprint: str = "",
     memhist_gib: float = 0.0,
+    # 28.09.: the L3 store's RAM index (store_journal.py), per owner, both moments
+    l3_index_gib: float = 0.0,
+    # 29.09. (Planer post COLD_TIER_SHM): the expert store when it lives on a
+    # tmpfs -- shmem, unevictable without swap, resident in BOTH phases.
+    cold_tier_shm_gib: float = 0.0,
+    # 29.09. (host census, z30w): measured posts per model|form from
+    # host_census.ledger_terms -- non-rank anon, lane ring, arena sidecar,
+    # hand-off (charged) and the shmem no class names (printed, ungebucht).
+    census: Optional[Dict[str, object]] = None,
     memhist_run_only: bool = False,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
@@ -5754,6 +6438,9 @@ def choose(
             reference_model_ok=reference_model_ok,
             reference_model_why=reference_model_why,
             memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+            l3_index_gib=l3_index_gib,
+            cold_tier_shm_gib=cold_tier_shm_gib,
+            census=census,
         )
         for s, m in arms
     ]
@@ -5926,7 +6613,12 @@ def choose(
         )
     )
     # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
-    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    # 29.09. (W98 z30w follow-up): the recorded mark is the CT999 HOST reap
+    # point (global OOM, memory.max 'max'). Inside a finite cgroup the kernel
+    # reaps at memory.max first -- 84 GiB in the Docker form, 11.90 GiB below
+    # 95.90 -- so the mark is the smaller of the two. `reap_mark_gib` is the
+    # one place both the ladder and the launch/front latches read it from.
+    watermark_gib = reap_mark_gib(cg_ceiling_bytes, cg_ceiling_source)
     # #1269 / standing order 2026-09-08: the watermark alone is not the bound.
     # The bound is the watermark MINUS a named margin -- the flip transient the
     # box will actually spend and the idle anon drift it will actually
@@ -5935,9 +6627,21 @@ def choose(
     margin = margin if margin is not None else resolve_margin(
         flip_ratchet_charged_gib=(
             None if flip_ratchet is None else flip_ratchet.charged_gib
-        )
+        ),
+        # 29.09. NF1c (H87): the residual of THIS checkpoint, not the 27B one.
+        reference_model_ok=reference_model_ok,
+        model_footprint=model_footprint,
     )
     hard_bound_gib = watermark_gib - margin.total_gib
+    # 29.09. (27B z30y W97, 13:02Z): the latch is derived from the mark; a
+    # profile's fixed --host-riegel-gib may only tighten it.
+    riegel_gib, _riegel_line = effective_riegel_gib(riegel_gib, hard_bound_gib)
+    if _riegel_line:
+        lines.append(_riegel_line)
+    pinned_reserve_gib, pinned_reserve_src = pinned_reserve_for_ranks(
+        margin.total_gib, cg_ceiling_bytes, cg_ceiling_source)
+    pinned_wall_gib, _pinned_wall_why = pinned_wall(
+        cg_ceiling_bytes, cg_ceiling_source, pinned_reserve_gib, pinned_reserve_src)
     # #1360: BOTH OR NEITHER, checked before a single arm is priced, so a
     # half-armed deviation can never reach a verdict it would then convert.
     _deviation_armed = bool(deviation_reason) and riegel_gib is not None
@@ -5963,7 +6667,15 @@ def choose(
             f"if it were measured (got prior_cushion_min_gib={prior_cushion_min_gib!r} "
             f"prior_bounce_gib={prior_bounce_gib!r})."
         )
-    lines.append(watermark_provenance(margin, watermark_gib, refuse_unreadable=True))
+    _wm_line = watermark_provenance(margin, watermark_gib, refuse_unreadable=True)
+    # 29.09.: shmem the host census could not name is not charged -- but it is
+    # never silent either: it rides the WATERMARK line as `ungebucht`.
+    if census is not None:
+        _wm_line += (f" | ungebucht={float(census.get('unbooked_shm_gib') or 0.0):.2f} GiB "
+                     f"shmem without a post [{census.get('census_source', '')}]")
+    if pinned_wall_gib is not None:
+        _wm_line += f" | pinned_wall={pinned_wall_gib:.2f} GiB ({_pinned_wall_why})"
+    lines.append(_wm_line)
     chosen: Optional[Arm] = None
     peak_bound_any = False
     # #1236: the STORE TERM IS GONE FROM THIS LOOP.  Train fix 3 sized it here
@@ -6073,7 +6785,13 @@ def choose(
                 f"condition, not a sufficient one -- it may refuse; it never "
                 f"funds by itself)"
             )
-        ok = moments_ok and peak_ok and cushion_ok and headroom_ok
+        # 29.09. (z30x2-yarn2): the run peak includes every pinned pool, so it
+        # must sit under the wall the ranks' own pinned check enforces too.
+        _pinned_binding = pinned_wall_binding(predicted, pinned_wall_gib, _pinned_wall_why)
+        pinned_ok = _pinned_binding is None
+        if not pinned_ok:
+            binding.append(_pinned_binding)
+        ok = moments_ok and peak_ok and cushion_ok and headroom_ok and pinned_ok
         # #1360: the deviation converts THIS verdict, after it has been computed
         # in full. `binding` is left exactly as it was so the DEVIATION line and
         # the refusal it replaces name the same terms.
@@ -6097,10 +6815,10 @@ def choose(
                     f"fields, from the one producer, so the refusal and the arm "
                     f"it refused can be compared field by field."
                 )
-            if float(riegel_gib) >= hard_bound_gib:
+            if float(riegel_gib) > hard_bound_gib:
                 raise Weg2HostDeviationRefused(
                     f"W97 Weg2HostDeviationRefused: --host-riegel-gib "
-                    f"{float(riegel_gib):.2f} is AT OR ABOVE the hard bound "
+                    f"{float(riegel_gib):.2f} is ABOVE the hard bound "
                     f"{hard_bound_gib:.2f} GiB it is supposed to latch beneath. A "
                     f"latch above the bound cannot fire before the bound is already "
                     f"crossed; it is decoration, and the rule asks for a runtime "
@@ -6275,7 +6993,7 @@ def choose(
         # The advisory's explanatory half belongs in the refusal too -- see
         # :func:`_advisory_line`.  The most frugal arm is the ladder's last.
         frugal = priced[-1]
-        lines.append(_advisory_line(frugal, chosen=False))
+        lines.append(_advisory_line(frugal, chosen=False, watermark_gib=watermark_gib))
         table = "\n".join(lines)
         # THE HONEST OUTCOME (fix 8): on today's box every arm may refuse, and
         # that IS the answer for this tree.  No term is shrunk to get an arm
@@ -6336,6 +7054,9 @@ def choose(
                         reference_model_ok=reference_model_ok,
                         reference_model_why=reference_model_why,
                         memhist_gib=memhist_gib, memhist_run_only=memhist_run_only,
+                        l3_index_gib=l3_index_gib,
+                        cold_tier_shm_gib=cold_tier_shm_gib,
+                        census=census,
                     )
                 except Exception:  # noqa: BLE001 - advice may never mask the refusal
                     return False
@@ -6398,7 +7119,11 @@ def choose(
         "the launcher prints the delta against THIS boot's own store budget on the "
         "WEG2-STORE line rather than repeating a recalled number here."
     )
-    lines.append(_advisory_line(chosen, chosen=True))
+    lines.append(_advisory_line(chosen, chosen=True, watermark_gib=watermark_gib))
+    # the ONE reserve number: the launcher exports it to the ranks. Kept OFF
+    # arm.terms, which stay byte-identical with price()'s (#1360 guard).
+    chosen.pinned_reserve = (pinned_reserve_gib, pinned_reserve_src)
+    chosen.riegel_effective = riegel_gib
     return chosen, headroom, lines
 
 

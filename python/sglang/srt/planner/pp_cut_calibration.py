@@ -102,6 +102,11 @@ class CensusCalibration:
     #: gate REFUSES on empty rather than charging zero, because a transient
     #: priced at zero reads to the solver as free memory. See law 31.
     transient_by_load_state: Tuple[Dict[str, float], ...] = ()
+    #: 27B review 29.09.: per rank, where the residual's "used" came from --
+    #: "per-process (card used X - foreign Y)" when the census carried the
+    #: NVML per-process split, else "card-wide" (a census written before it,
+    #: which may hold another group's contexts). Empty on old callers.
+    residual_source: Tuple[str, ...] = ()
 
     @property
     def worst_transient_mib(self) -> Tuple[float, ...]:
@@ -117,6 +122,7 @@ class CensusCalibration:
             f"MiB, replicated {self.replicated_mib:.0f} MiB, recurrent state "
             f"{self.state_per_linear_mib:.1f} MiB/linear layer, per-rank "
             f"residual {[round(r) for r in self.residual_mib]} MiB"
+            + (f" ({'; '.join(self.residual_source)})" if self.residual_source else "")
         )
 
 
@@ -172,6 +178,7 @@ def load_census_calibration(census_dir: str) -> CensusCalibration:
 
     counts: List[int] = []
     residual: List[float] = []
+    sources: List[str] = []
     totals: List[float] = []
     names: List[Optional[str]] = []
     attn_per: List[float] = []
@@ -199,7 +206,21 @@ def load_census_calibration(census_dir: str) -> CensusCalibration:
         vis = float(params.get("visual", 0.0))
         replicated = vis if replicated is None else max(replicated, vis)
 
-        used = float(_require(blob.get("nvml_used_mib"), "nvml_used_mib", census_dir))
+        card_used = float(_require(blob.get("nvml_used_mib"), "nvml_used_mib", census_dir))
+        # 27B review 29.09.: `nvml_used_mib` is CARD-wide (mem_get_info). A
+        # census taken while another process held the card (group D's
+        # contexts under an early D start, a probe, a co-tenant) prices that
+        # process as this rank's residual and the cut gate books P too full.
+        # The census now records NVML's per-process split; the FOREIGN part
+        # is subtracted here. The driver carve stays in: it is not foreign,
+        # the card loses it whoever runs.
+        foreign = blob.get("nvml_foreign_mib")
+        if isinstance(foreign, (int, float)) and not isinstance(foreign, bool) and foreign >= 0:
+            used = card_used - float(foreign)
+            sources.append(f"per-process (card used {card_used:.0f} - foreign {float(foreign):.0f})")
+        else:
+            used = card_used
+            sources.append("card-wide (census without the NVML per-process split)")
         pools = float(_require(blob.get("pools_mib"), "pools_mib", census_dir))
         params_total = sum(float(v) for v in params.values())
         # #1009(a): NVML RECONCILIATION, ENFORCED WHERE THE BYTES ARE PRICED.
@@ -285,6 +306,7 @@ def load_census_calibration(census_dir: str) -> CensusCalibration:
         calibrated_on_counts=tuple(counts),
         gpu_names=tuple(names),
         transient_by_load_state=_load_transients(census_dir, expected),
+        residual_source=tuple(sources),
     )
 
 

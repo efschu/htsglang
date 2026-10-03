@@ -103,11 +103,42 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
+#: Q-460 SALT-ISOLATION (27B y8r 55c95a89c7, boot 1003_090656): the store page
+#: key was a function of the TOKENS alone, so a page written under cache_salt A
+#: was read by cache_salt B and by an unsalted request (probe 280/300: B1
+#: cached=8187/8963, N1 cached=8192/8964 from the L2 arena, ``HiCache prefetch
+#: ... loaded=8153``). The namespace (``RadixKey.extra_key``: cache_salt +
+#: extra_key, LoRA id) now seeds the ROOT of every chain: the first page of a
+#: namespaced key hashes over this seed instead of no prior, so every page of
+#: the chain differs per namespace. ``None`` keeps the old key exactly -- the
+#: unsalted store of earlier boots stays readable.
+_NAMESPACE_SEED_TAG = b"sglang-kv-namespace-v1\0"
+
+
+def namespace_root_hash(extra_key: Optional[str]) -> Optional[str]:
+    """The prior hash a chain of namespace ``extra_key`` starts from (hex),
+    None for the default namespace (the unchanged unsalted chain)."""
+    if extra_key is None:
+        return None
+    import hashlib
+
+    return hashlib.sha256(_NAMESPACE_SEED_TAG + str(extra_key).encode()).hexdigest()
+
+
 def get_hash_str(
     token_ids: List[int],
     prior_hash: Optional[str] = None,
     page_size: Optional[int] = None,
+    extra_key: Optional[str] = None,
 ) -> str | List[str]:
+    """Page hash chain of ``token_ids`` after ``prior_hash``.
+
+    Q-460: a chain from the ROOT (no prior) is seeded by its namespace --
+    ``extra_key`` when given, else the ``extra_key`` a ``RadixKey`` carries.
+    A plain id list without ``extra_key`` is the default namespace."""
+    if not prior_hash:
+        ns = extra_key if extra_key is not None else getattr(token_ids, "extra_key", None)
+        prior_hash = namespace_root_hash(ns)
     prior_digest = bytes.fromhex(prior_hash) if prior_hash else None
     return get_native_hash(token_ids, prior_digest, page_size)
 

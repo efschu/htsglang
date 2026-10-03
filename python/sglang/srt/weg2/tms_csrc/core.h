@@ -152,7 +152,115 @@ public:
         return last_resume_seq_;
     }
 
+    //: PAUSE-SUB (30.09., NF y4h): THE LAST ``pause`` CALL'S PASS-3 SPLIT.
+    //:
+    //: The sleeper's ``pause_ms`` on the 3080 D ranks is ~28 ms per ~1 GiB tag
+    //: (5090: ~6), with the device idle before it (``sync_ms=0`` on every tag),
+    //: and P's pause on the SAME card costs a third per byte. What differs is
+    //: the mapping count: D's expert banks are span-mapped (H95c, one handle
+    //: per lattice cell).  ``allocations`` = the tag's allocations, ``unmaps``
+    //: = cuMemUnmap calls (= extents + stock mappings), ``unmap_ms`` /
+    //: ``release_ms`` the two driver calls' own clocks summed, ``total_ms`` the
+    //: whole ``pause`` (walks and the backup copy included).  Same contract as
+    //: ``resume_stats``: ``tag_out`` is the tag the numbers BELONG TO, the
+    //: return value the record sequence, **0 = no pause recorded**.
+    inline uint64_t pause_stats(char* tag_out, size_t tag_len,
+                                uint64_t* allocations, uint64_t* unmaps,
+                                double* unmap_ms, double* release_ms, double* total_ms) {
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        if (tag_out != nullptr && tag_len > 0) {
+            size_t n = last_pause_tag_.size() < (tag_len - 1) ? last_pause_tag_.size() : (tag_len - 1);
+            memcpy(tag_out, last_pause_tag_.c_str(), n);
+            tag_out[n] = '\0';
+        }
+        if (allocations != nullptr) *allocations = last_pause_allocations_;
+        if (unmaps != nullptr) *unmaps = last_pause_unmaps_;
+        if (unmap_ms != nullptr) *unmap_ms = last_pause_unmap_ms_;
+        if (release_ms != nullptr) *release_ms = last_pause_release_ms_;
+        if (total_ms != nullptr) *total_ms = last_pause_total_ms_;
+        return last_pause_seq_;
+    }
+
+    //: PAUSE-MAPS (30.09., patch 5): ONE cuMemUnmap per contiguous run of a
+    //: span-mapped allocation's extents instead of one per extent.  Off = the
+    //: patch-4 walk call for call.  Returns the state after the call.
+    inline bool set_pause_coalesce(bool on) {
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        pause_coalesce_ = on;
+        return pause_coalesce_;
+    }
+
+    //: PAUSE-MAPS: the last ``pause`` call's extent census -- ``extents`` =
+    //: the H95c extents it released, ``runs`` = the coalesced cuMemUnmap calls
+    //: that covered two or more of them, ``fallbacks`` = runs the driver
+    //: refused as one range (then unmapped extent by extent, as patch 4),
+    //: ``coalesce`` = the switch as that pause saw it.  Contract of
+    //: ``pause_stats``: ``tag_out`` = the tag the numbers belong to, return =
+    //: the same record sequence, 0 = no pause recorded.
+    inline uint64_t pause_maps_stats(char* tag_out, size_t tag_len, uint64_t* extents,
+                                     uint64_t* runs, uint64_t* fallbacks, int* coalesce) {
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        if (tag_out != nullptr && tag_len > 0) {
+            size_t n = last_pause_tag_.size() < (tag_len - 1) ? last_pause_tag_.size() : (tag_len - 1);
+            memcpy(tag_out, last_pause_tag_.c_str(), n);
+            tag_out[n] = '\0';
+        }
+        if (extents != nullptr) *extents = last_pause_extents_;
+        if (runs != nullptr) *runs = last_pause_runs_;
+        if (fallbacks != nullptr) *fallbacks = last_pause_fallbacks_;
+        if (coalesce != nullptr) *coalesce = last_pause_coalesce_ ? 1 : 0;
+        return last_pause_seq_;
+    }
+
 private:
+    //: PAUSE-SUB: the per-call accumulator of ``pause``'s pass 3 (under the
+    //: metadata mutex, which ``pause`` holds).
+    struct PauseSub {
+        uint64_t allocations = 0;
+        uint64_t unmaps = 0;
+        double unmap_ms = 0.0;
+        double release_ms = 0.0;
+        //: PAUSE-MAPS
+        uint64_t extents = 0;
+        uint64_t runs = 0;
+        uint64_t fallbacks = 0;
+    };
+    //: One timed cuMemUnmap + cuMemRelease pair, counted into ``sub``.
+    CUresult timed_unmap_release(void* va, size_t size, CUmemGenericAllocationHandle h, PauseSub* sub);
+#if defined(USE_CUDA)
+    //: PAUSE-MAPS: release every extent of a span-mapped allocation, one
+    //: cuMemUnmap per contiguous run (a run the driver refuses falls back to
+    //: the per-extent walk).  Returns the first failing CUresult.
+    CUresult unmap_extents_coalesced(void* ptr, const std::vector<Weg2SpanExtent>& extents, PauseSub* sub);
+#endif
+    bool pause_coalesce_ = false;
+    inline void note_pause(const std::string& tag, const PauseSub& sub,
+                           const std::chrono::steady_clock::time_point& t0) {
+        last_pause_tag_ = tag;
+        last_pause_allocations_ = sub.allocations;
+        last_pause_unmaps_ = sub.unmaps;
+        last_pause_unmap_ms_ = sub.unmap_ms;
+        last_pause_release_ms_ = sub.release_ms;
+        last_pause_extents_ = sub.extents;
+        last_pause_runs_ = sub.runs;
+        last_pause_fallbacks_ = sub.fallbacks;
+        last_pause_coalesce_ = pause_coalesce_;
+        last_pause_total_ms_ =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++last_pause_seq_;
+    }
+    std::string last_pause_tag_;
+    uint64_t last_pause_allocations_ = 0;
+    uint64_t last_pause_unmaps_ = 0;
+    double last_pause_unmap_ms_ = 0.0;
+    double last_pause_release_ms_ = 0.0;
+    double last_pause_total_ms_ = 0.0;
+    uint64_t last_pause_extents_ = 0;
+    uint64_t last_pause_runs_ = 0;
+    uint64_t last_pause_fallbacks_ = 0;
+    bool last_pause_coalesce_ = false;
+    uint64_t last_pause_seq_ = 0;
+
     //: The recorder S7 calls from ``resume``, between the passes it separates.
     //: ``t0`` is taken before pass 1 and ``t1`` between pass 1 and pass 2, so
     //: ``map_ms`` is the MAP phase alone and ``copy_ms`` is pass 2's issue plus

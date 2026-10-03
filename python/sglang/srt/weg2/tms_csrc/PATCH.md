@@ -1,4 +1,4 @@
-# Vendored torch_memory_saver 0.0.9.post1 csrc (MIT, fzyzcjy) with THREE patches
+# Vendored torch_memory_saver 0.0.9.post1 csrc (MIT, fzyzcjy) with FIVE patches
 
 Source: the PyPI sdist `torch_memory_saver-0.0.9.post1.tar.gz` (the version
 installed in /spinning/htsglang-gpu/.venv, a binary wheel that ships no csrc).
@@ -72,3 +72,36 @@ behaviour unchanged.  Used by `weg2/d_seat_vram.py` (SGLANG_OPT_WEG2_D_SEAT_VRAM
 D's GDN temporal state maps the slots of the phase's n seats, the expert bank
 the rows those seats' pages fund.  Desk proof: the unit test builds these
 sources against a mock driver (`test_weg2_d_seat_vram_h95c.py`, section 5).
+
+## Patch 4 -- PAUSE-SUB, the pause's own split (30.09., NF y4h)
+
+`core.{h,cpp}` and `entrypoint.cpp` changed, instrument only.  `pause` pass 3
+makes the same cuMemUnmap/cuMemRelease calls in the same order; each pair now
+runs on its own clocks (`timed_unmap_release`), and the call records
+`(tag, allocations, unmaps, unmap_ms, release_ms, total_ms)`.  New entrypoint
+`tms_pause_stats(tag, len, &allocations, &unmaps, &unmap_ms, &release_ms,
+&total_ms)` with the `tms_resume_stats` contract (tag written back, 0 = no
+pause recorded).  Why: D's `pause_ms` on the 3080 ranks is ~28 ms per ~1 GiB
+tag against ~6 ms on the 5090 with `sync_ms=0` on every tag, and P's pause on
+the same card costs a third per byte -- the suspect is D's H95c extent count,
+which no line carried.  The scheduler prints it as `WEG2-PAUSE-SUB`.  Desk
+proof against the mock driver: `test_weg2_pause_overlap_0930.py`.
+
+## Patch 5 -- PAUSE-MAPS, one cuMemUnmap per run of extents (30.09., NF y4i)
+
+`core.{h,cpp}` and `entrypoint.cpp` changed.  With the flag set
+(`tms_set_pause_coalesce(1)`, pushed by `weg2/pause_maps.py` under
+`SGLANG_WEG2_ENABLE_PAUSE_COALESCE_UNMAP`, default off) `pause` pass 3
+releases a span-mapped allocation's extents sorted by offset, cut into runs
+of back-to-back extents: a run of two or more is ONE `cuMemUnmap` over its
+whole range (the driver accepts a range covering several adjacent mappings
+-- the CUDA samples' multi-device mmap frees its striped range so), then each
+handle is `cuMemRelease`d.  A run the driver refuses as one range is unmapped
+extent by extent -- the patch-4 walk -- and counted.  Stock allocations and
+the flag off: patch 4 call for call.  New entrypoint
+`tms_pause_maps_stats(tag, len, &extents, &runs, &fallbacks, &coalesce)`
+(contract of `tms_pause_stats`, same sequence).  Why: y4i's 3080 D tags make
+31-64 calls for 10-12 allocations (H95c lattice cells, one handle each) at
+~0.1-1 ms per call; the lattice must stay (a live shrink keeps only whole
+extents), the number of calls need not.  Desk proof against the mock driver:
+`test_weg2_pause_maps_0930.py`.

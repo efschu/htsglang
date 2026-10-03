@@ -145,6 +145,38 @@ def p_nosync_on() -> bool:
     return os.environ.get(P_NOSYNC_ENV, "") == "1"
 
 
+#: D-CACHE-NOSYNC (#281, 29.09.): the CACHE-PATH half of P-NOSYNC for group D.
+#:
+#: MEASURED (z30u, 29.09., rc12z30u -e2cut, 83 post-wake passes per rank): D
+#: TP0 ``prepare_ms`` median 1421 ms, linear in the admitted prefix (~5.6 ms per
+#: 1000 hit tokens; 43k -> 184 ms, 345k -> 1880 ms), while TP1/TP2 of the same
+#: passes read 3 / 79 ms. TP0 is the one Form A rank with a mamba pool, and
+#: ``prepare_for_extend`` there runs three of the sites P-NOSYNC already names
+#: -- ``HybridReqToTokenPool.alloc``'s blocking mapping write,
+#: ``MambaSlotAllocator``'s scalar slot write and the #924D ``.tolist()`` in
+#: ``_collect_deferred_mamba_cow_and_clear`` -- each a host wait on the
+#: schedule stream, right behind the #988 park loadback that ``START-LOADING``
+#: queued a moment earlier. The workers have no mamba pool and wait for nothing.
+#:
+#: Only the cache path: the FLA / flashinfer forward-plan sites stay on
+#: ``p_nosync_on`` (group P's own switch), so D's forward is untouched.
+#: Unset = the stock code paths, byte-identical.
+D_CACHE_NOSYNC_ENV = "SGLANG_WEG2_D_CACHE_NOSYNC"
+
+
+def cache_path_nosync_on() -> bool:
+    """The cache-path sites of P-NOSYNC (mamba slot write, hybrid mapping
+    write, #924D note, #923 row check, move_indices): on under P-NOSYNC (group
+    P) or D-CACHE-NOSYNC (group D). Read per call."""
+    return p_nosync_on() or os.environ.get(D_CACHE_NOSYNC_ENV, "") == "1"
+
+
+def launcher_env_d_cache_nosync() -> Dict[str, str]:
+    """The group-D environment of D-CACHE-NOSYNC. ONE place for profile and
+    tests."""
+    return {D_CACHE_NOSYNC_ENV: "1"}
+
+
 def launcher_env_p_host_overlap() -> Dict[str, str]:
     """The group-P environment ``--p-host-overlap`` adds. ONE place, read by the
     launcher and pinned by the tests, so the two halves cannot drift."""

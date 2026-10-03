@@ -114,6 +114,7 @@ from sglang.srt.managers.weg2_idle_vote import (
     lap_clock,
     log_fresh_read,
     log_stale_drop,
+    own_work as _weg2_own_work,
     refusal_detail,
     stale_detail,
     stale_reason,
@@ -196,6 +197,7 @@ from sglang.srt.managers.io_struct import (
     VramBudgetReqInput,
     VramBudgetReqOutput,
     Weg2ParkRunningReqInput,
+    Weg2ParkWindowReqInput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -232,8 +234,22 @@ from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import weg2_d_hostgap as _d_hostgap
 from sglang.srt.layers.quantization import gguf_path_census as _gguf_path_census
 from sglang.srt.weg2 import p_trim_end_anchor as _weg2_trim
+from sglang.srt.weg2 import flush_verdict as _weg2_flush_verdict  # z30j PP0 flush verdict
+from sglang.srt.managers import weg2_flush_nonblock as _weg2_flush_nonblock  # B1 (30.09.)
 from sglang.srt.weg2 import fork_anchor as _weg2_fork
+from sglang.srt.weg2 import twin_anchor as _weg2_twin_anchor  # TWIN ANCHOR (y4a 16-28)
+from sglang.srt.weg2 import d_park_read as _weg2_park_read  # PARK-RETAIN READ
+from sglang.srt.weg2 import resume_via_p as _weg2_rvp  # RESUME-VIA-P
+from sglang.srt.weg2 import progress_beacon as _weg2_beacon  # FP forward-progress beacon
+from sglang.srt.weg2.vision_verdict import Weg2VisionVerdict  # H125f vision verdict on the chain
 from sglang.srt.weg2 import extend_trim as _weg2_extend_trim  # rc12g extend chunk cap
+from sglang.srt.weg2 import d_seat_vram as _weg2_d_seat_vram  # D-MEM-SCHED stage between wakes
+from sglang.srt.weg2 import d_transient_lend as _weg2_d_transient_lend  # D-TRANSIENT-LEND
+from sglang.srt.weg2 import d_seat_rewake as _weg2_d_seat_rewake  # D-SEAT-REWAKE: live seat re-plan
+from sglang.srt.weg2 import skip_first as _weg2_skip_first  # E2 in a mixed wake cohort
+from sglang.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #639 ballot (skip: deferred)
+from sglang.srt.weg2 import short_read as _weg2_short_read  # held short wake reads
+from sglang.srt.weg2 import tail_adopt as _weg2_tail_adopt
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -593,6 +609,77 @@ def _arriving_prefill_tokens(inflight, _already_queued=None, exclude=None) -> in
 #: #1290 vote publishes (see `_prefetch_deferral_refusal_reason`).
 _DEFER_REASON_RATE = "rate_limited"
 _DEFER_REASON_SHORTFALL = "host_pool_shortfall"
+#: HP1: the longest pass interval between two re-issues of one group-arm
+#: mark (`Scheduler._hp1_group_retry_due`).
+_HP1_RETRY_MAX_INTERVAL = 16
+
+
+def _hp1_group_retry_due(sched, req) -> bool:
+    """HP1: is this pass one on which a GROUP-arm mark re-issues its read?
+
+    rc12z20 weg2-8-2: one host_pool_shortfall mark re-issued the store
+    read -- intake re-match plus the #580 vote collective -- on EVERY
+    scheduler pass for 64 s (638 group truncations, 22 M tokens
+    attempted); the decode round's host share went from ~13 to ~32 ms
+    (sched_ms 3 -> 24). A group cut does not heal pass by pass.
+
+    The back-off is counted in RETRY PASSES of this mark (1, 2, 4, 8, 16,
+    then every 16th), never in wall time: the retry set and its order are
+    rank-identical by construction (see `_retry_deferred_prefetches`) and
+    so is this count, so every rank skips and enters the vote together.
+    A fresh mark (``prefetch_defer_since`` changed) restarts at 1. The
+    RATE arm is untouched. A skipped pass still runs the arm's re-defer
+    step (rank-local, no collective), so the #1317k standstill bound keeps
+    counting passes, not retries.
+    """
+    if getattr(req, "prefetch_deferred", None) not in (
+        _DEFER_REASON_SHORTFALL,
+        _DEFER_REASON_STORE_SHORT,
+    ):
+        return True
+    key = getattr(req, "prefetch_defer_since", None)
+    if getattr(req, "_hp1_retry_key", None) != key:
+        req._hp1_retry_key = key
+        req._hp1_retry_seen = 0
+    n = int(getattr(req, "_hp1_retry_seen", 0) or 0) + 1
+    req._hp1_retry_seen = n
+    interval = min(_HP1_RETRY_MAX_INTERVAL, 1 << (n.bit_length() - 1))
+    if n % interval == 0:
+        return True
+    # A skipped pass is still a pass of this mark: it goes through the arm's
+    # own re-defer step (attempts, the #1317k stall witness and its named
+    # terminal exits) exactly as a retry that came back cut again -- only the
+    # store read and its vote are not re-issued. So the standstill bound keeps
+    # counting passes and exits on the same pass it did before.
+    _arm = getattr(sched, "_apply_group_shortfall_deferral", None)
+    if callable(_arm):
+        _arm(
+            req,
+            str(getattr(req, "rid", "?"))[:8],
+            getattr(req, "_prefetch_span_tokens", None),
+            True,
+            "retry_backoff",
+            reason=str(getattr(req, "prefetch_deferred", None)),
+        )
+    else:
+        _note = getattr(sched, "_weg2_note_prefetch_progress", None)
+        if callable(_note):
+            _note(req)
+    skipped = getattr(sched, "_hp1_retry_skipped", 0) + 1
+    sched._hp1_retry_skipped = skipped
+    if skipped <= 8 or skipped % 1024 == 0:
+        logger.info(
+            "HP1 DEFER-RETRY BACKOFF rid=%s mark=%s pass=%d interval=%d "
+            "(skipped=%d): the group-cut read is re-voted on a pass back-off, "
+            "not every pass",
+            str(getattr(req, "rid", "?"))[:16],
+            getattr(req, "prefetch_deferred", None),
+            n,
+            interval,
+            skipped,
+        )
+    return False
+
 #: #1324: the THIRD producer of the same deferral, and the reason it is a
 #: separate NAME rather than a reuse of ``host_pool_shortfall``. Both mean "the
 #: read landed holding less than the request needs, and the moment it leaves
@@ -757,6 +844,19 @@ def _weg2_store_tail_min_tokens(req) -> Optional[int]:
     return 1 if getattr(req, "_weg2_store_delivered", None) is not None else None
 
 
+def _prefetch_namespace_kw(tree_cache, req) -> dict:
+    """The request's namespace for the unified tree's storage prefetch
+    (``prefetch_namespace``: the span is keyed and inserted under the
+    request's extra_key, not the root anchor's None -- NF 09292034 salted
+    requests re-prefilled their whole prompt on D). {} for the legacy trees,
+    whose signature does not take it."""
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    if isinstance(tree_cache, UnifiedRadixCache):
+        return {"extra_key": req.extra_key}
+    return {}
+
+
 def _weg2_store_short_remainder(req) -> Optional[int]:
     """Tokens D prefills if ``req`` is admitted on what its short read
     materialised (device-resident prefix after the read); None = no stamp."""
@@ -786,6 +886,181 @@ def _weg2_store_short_tail_x(sched) -> int:
     except ValueError:
         cap = 0
     return min(x, cap) if (x > 0 and cap > 0) else x
+
+
+#: rc12y (28.09., D-Log weg2-16-42, 00:07:35-00:13:24): ONE store read of
+#: 46850 tokens terminated 192 short (delivered 46656, deliverable 46848)
+#: 692 times in 6 minutes -- DEFERRED attempt=1 -> retry re-issues ->
+#: ``#1068 PREFETCH LANDED verdict=issued`` clears the mark -> the re-read
+#: terminates short again -> a FRESH mark. The progress witness only runs on
+#: a mark that survives into a second observation, so it never ran; the X
+#: gate held the request (X-DEFER bound_s=inf) until the front's deadman
+#: (BUSY-STARVED). No writer was coming: the tail lay beyond what D's
+#: previous turn (weg2-13-41, ``#1469 RETAIN ... cache_len=None value=False``)
+#: had put into the store, and P was asleep. This bound counts the FRESH
+#: store-short marks of a request whose delivered prefix did not grow; it is
+#: carried on the request, so the mark's clear cannot reset it. Passes, not
+#: seconds (every rank marks off the group-synced record in the same pass);
+#: not counted while this group sleeps (P can still publish then, xsn344).
+STORE_SHORT_MAX_CYCLES_ENV = "SGLANG_WEG2_STORE_SHORT_MAX_CYCLES"
+
+
+def _weg2_store_short_max_cycles() -> int:
+    """How many fresh store-short marks without growth a request may take
+    before the fallback (``#1068 DEFERRED`` per rid at most this many);
+    env-overridable, floor 1, default 4."""
+    try:
+        return max(1, int(os.environ.get(STORE_SHORT_MAX_CYCLES_ENV, "4")))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _weg2_store_short_cycle(sched, req) -> int:
+    """Count one FRESH store-short mark of ``req``; returns how many in a row
+    delivered no more than the best before (1 = the delivered prefix grew)."""
+    delivered = int(getattr(req, "_weg2_store_delivered", 0) or 0)
+    best = getattr(req, "_weg2_store_short_cycle_best", None)
+    if best is None or delivered > int(best):
+        req._weg2_store_short_cycle_best = delivered
+        req._weg2_store_short_cycles = 1
+        return 1
+    n = int(getattr(req, "_weg2_store_short_cycles", 0) or 0)
+    from sglang.srt.weg2 import retain_publish as _rp
+
+    if not _rp.dormant_standstill_holds(getattr(sched, "weg2_dormant", False)):
+        n += 1
+    req._weg2_store_short_cycles = n
+    return n
+
+
+#: WT (28.09.): switch of the post-wake no-writer exit, default on; 0 = the
+#: store-short bound applies to settled requests as to every other.
+WAKE_SHORT_DECIDE_ENV = "SGLANG_WEG2_WAKE_SHORT_DECIDE"
+
+
+def _weg2_x_floor_credit_on() -> bool:
+    """H98x: the X gate credits the group usable floor -- Form A only (there
+    the floor is every rank's admission depth; on a classic group it is taken
+    from the head walk and never exceeds it). Group-uniform: the env switch
+    and the installed role plan are the same on every rank."""
+    if not envs.SGLANG_WEG2_ENABLE_X_FLOOR_CREDIT.get():
+        return False
+    return bool(tp_match_floor.form_a_follow_active())
+
+
+def _weg2_settled_this_wake(sched, req) -> bool:
+    """WT (28.09., NF rc12z22 D 14:56:26-29, weg2-4-11): a request the group
+    released from the dormant hold / #1471 settle of THIS wake has had its
+    writer question answered -- D is awake, so P sleeps, and the settle waited
+    for P's visible writes (P4b ``wait``) or decided there was none. A
+    store-short read of it at admission has no writer left: re-reading it
+    (five times, 128 tokens each, 3 s) cannot grow it. Group-uniform: the
+    release is the group MIN in hold order and the wake counter moves on every
+    rank at the same resume; ``weg2_dormant`` is the W25 group flag."""
+    if (os.environ.get(WAKE_SHORT_DECIDE_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    if getattr(sched, "weg2_dormant", False):
+        return False
+    seq = getattr(sched, "_weg2_wake_seq", None)
+    return seq is not None and getattr(req, "_weg2_settled_wake", None) == seq
+
+
+def _weg2_store_short_reroute(sched, req, span, site: str, cause: str, detail: str = "") -> str:
+    """W88 CYCLE (29.09., NF dauer09290232 D 03:21:06-14, weg2-122-144): the
+    store-short exit whose remainder is OVER X falls back BY NAME to the depth
+    the store delivered, instead of answering the client 503.
+
+    The request goes to its admission with the mark cleared; the X gate prices
+    it with the group's match (the delivered prefix) and, over X, refuses it by
+    name: a streamed request is kept on D and P prefills its context
+    (RESUME-VIA-P, ``x_refusal_midstream``), any other one gets the W50 the
+    front re-routes through P before its first byte. Either way P READS what
+    the store holds and prefills only the rest -- never a prefill over X on D
+    (the gate has no exemption left), and never a recompute from 0 while a
+    readable prefix exists. W88 stays the answer of the other arm
+    (``host_pool_shortfall``: our own staging pool, not a missing prefix).
+    ``'expired'``."""
+    from sglang.srt.mem_cache.match_refusal_census import (
+        note_prefetch_gate as _note_prefetch_gate,
+    )
+
+    sched._clear_prefetch_deferral_fields(req)
+    req._weg2_store_short_fallback = True
+    _note_prefetch_gate("defer_expired")
+    n = getattr(sched, "_weg2_store_short_reroutes", 0) + 1
+    sched._weg2_store_short_reroutes = n
+    remainder = _weg2_store_short_remainder(req)
+    logger.warning(
+        "W88-REROUTE rid=%s cause=%s delivered=%d remainder=%d X=%d span=%s "
+        "site=%s %s n=%d -- the store read ended short and the remainder "
+        "exceeds X: released to the X gate on the delivered prefix, which "
+        "re-routes it through P by name (RESUME-VIA-P / W50); not a 503",
+        str(getattr(req, "rid", "?"))[:16], cause,
+        int(getattr(req, "_weg2_store_delivered", 0) or 0),
+        -1 if remainder is None else int(remainder),
+        _weg2_store_short_tail_x(sched), span, site, detail, n,
+    )
+    return "expired"
+
+
+def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Optional[str]:
+    """The bounded exit of a store-short read that stopped growing: None =
+    still within the bound (defer as before). Past it, a remainder within X
+    (or no X riegel) is released to admission -- the matched prefix is taken
+    and D extends the rest; the X gate prices it with the group's match, so a
+    remainder the mamba validator widens past X is refused there by name
+    (W50, the front re-routes). A remainder over X takes the named W88 of the
+    windowed path, as the witness's own terminal does."""
+    if reason != _DEFER_REASON_STORE_SHORT:
+        return None
+    cycles = _weg2_store_short_cycle(sched, req)
+    settled = _weg2_settled_this_wake(sched, req)
+    # WT: no writer after this wake's settle -- the first short read decides
+    bound = 0 if settled else _weg2_store_short_max_cycles()
+    if cycles <= bound:
+        return None
+    x = _weg2_store_short_tail_x(sched)
+    remainder = _weg2_store_short_remainder(req)
+    tail = -1 if remainder is None else int(remainder)
+    delivered = int(getattr(req, "_weg2_store_delivered", 0) or 0)
+    rid = str(getattr(req, "rid", "?"))[:16]
+    if x > 0 and (remainder is None or remainder > x) and _weg2_windowed_path(sched):
+        # W88 CYCLE (29.09.): over X is a RE-ROUTE, not a 503 -- see
+        # `_weg2_store_short_reroute`.
+        return _weg2_store_short_reroute(
+            sched, req, span=span, site=site, cause="over_x",
+            detail=f"cycles={cycles} bound={bound}",
+        )
+    from sglang.srt.mem_cache.match_refusal_census import (
+        note_prefetch_gate as _note_prefetch_gate,
+    )
+
+    sched._clear_prefetch_deferral_fields(req)
+    req._weg2_store_short_fallback = True
+    _note_prefetch_gate("defer_expired")
+    sched._weg2_store_short_fallbacks = getattr(sched, "_weg2_store_short_fallbacks", 0) + 1
+    logger.warning(
+        "PREFETCH-DEFER-FALLBACK rid=%s delivered=%d tail=%d X=%d cycles=%d "
+        "bound=%d reason=" + ("settled_no_writer" if settled else "no_writer_progress")
+        + " span=%s site=%s n=%d -- the store "
+        "read terminated short %d times in a row without delivering more; no "
+        "writer is filling the tail, so the matched prefix is taken and D "
+        "extends the rest (the X gate prices it with the group's match)",
+        rid, delivered, tail, x, cycles, bound, span, site,
+        sched._weg2_store_short_fallbacks, cycles,
+    )
+    return "expired"
+
+
+def _weg2_zero_read_settle_on() -> bool:
+    """PK2's zero-read settle belongs to the 27B immediate park
+    (``SGLANG_WEG2_D_PARK_IMMEDIATE`` / ``ModelProfile.d_park_immediate``),
+    not to every D: NF (27.09., Fork A on #1004) saw it settle zero reads on
+    NF-D against its 12288 riegel -- a behaviour change nobody asked for there.
+    Off = a zero read waits out the #1471 bound, exactly as before PK2."""
+    from sglang.srt.weg2.form import d_park_immediate_state
+
+    return bool(d_park_immediate_state()[0])
 
 
 def _weg2_store_short_recompute(sched, req, reason: str, span) -> Optional[str]:
@@ -890,6 +1165,60 @@ def _weg2_producer_wake_verdict(sched, req) -> str:
     return "complete"
 
 
+def _weg2_settle_writer_action(sched, req) -> str:
+    """P4b: the settle hold's action for one parked request (weg2/settle_writer):
+    ``poll`` (unchanged 2 s re-read) until the read was seen short once, then
+    ``wait`` / ``reread`` / ``decide`` / ``poll`` by who can still write it.
+    A named line on every change of the writer state."""
+    if not getattr(req, "_1471_short", False):
+        return "poll"
+    from sglang.srt.weg2 import settle_writer as _sw
+
+    prev = getattr(req, "_1471w_state", None)
+    t = time.monotonic()
+    if prev is not None and t - float(getattr(req, "_1471w_t", 0.0) or 0.0) < 0.1:
+        now_state = prev  # the hand-off directory is listed at most every 100 ms per request
+    else:
+        try:
+            now_state = _sw.observe(req)
+        except Exception as exc:  # noqa: BLE001 - unknown = the old poll, never a guess
+            logger.info("#1471w SETTLE-WRITER rid=%s n/a (%s: %s) -- 2 s re-read as before",
+                        str(getattr(req, "rid", "?"))[:12], type(exc).__name__, exc)
+            return "poll"
+        req._1471w_t = t
+    act, ack = _sw.step(prev, now_state, getattr(req, "_1471w_ack", None))
+    act = _sw.gate_action(act, req)  # NW: a budget-refused read has not run -- no "no writer"
+    req._1471w_state = now_state
+    req._1471w_ack = ack
+    if now_state != prev:
+        _what = {
+            "wait": "a writer is at work: no re-read until its ack",
+            "reread": "the writer's ack is in: re-read now",
+            "decide": "no writer can fill the rest: decided now",
+            "poll": "a writer without a visible ack: the 2 s re-read stays",
+        }[act]
+        logger.info("#1471w SETTLE-WRITER rid=%s writer=%s prev=%s action=%s -- %s",
+                    str(getattr(req, "rid", "?"))[:12], now_state, prev, act, _what)
+    return act
+
+
+def _weg2_settle_no_writer_line(sched, req, now: float) -> None:
+    """P4b: the named line of a no-writer release (remainder, X, route)."""
+    from sglang.srt.weg2 import settle_writer as _sw
+
+    records = getattr(getattr(sched, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
+    rem = _sw.remainder(req, records)
+    x = _weg2_store_short_tail_x(sched)
+    logger.info(
+        "#1471w SETTLE-NO-WRITER rid=%s remainder=%s X=%d route=%s held_s=%.1f re_reads=%d -- no "
+        "hand-off chain, no tail part and none under write: nothing can fill the rest, so the "
+        "request goes to admission now (D prefills within X; over X the X gate refuses by name "
+        "and the front re-routes via P)",
+        str(getattr(req, "rid", "?"))[:12], "?" if rem is None else rem, x, _sw.route(rem, x),
+        now - float(getattr(req, "_1471_since", now)), int(getattr(req, "_1456_n", 0) or 0),
+    )
+
+
 def _weg2_store_tail_settles(sched, req) -> bool:
     """#1324 x #1471 (weg2rc2): a request parked at the wake whose SHORT store
     read leaves a remainder within X is SETTLED -- D prefills the remainder (the
@@ -900,9 +1229,39 @@ def _weg2_store_tail_settles(sched, req) -> bool:
     before -- over X (weg2xsn229, 4095 of 98210) the request waits for its read."""
     if not _weg2_store_short_tail_on():
         return False
+    from sglang.srt.weg2 import tail_adopt as _ta_zr2
+
+    if _ta_zr2.window_above_delivered(req):
+        return False  # ZR-2: an agreed END window lies above the short read -- wait for the re-read
+    from sglang.srt.weg2 import settle_writer as _sw
+
+    if _sw.budget_pending(req):
+        # NW (30.09.): the read the budget refused has not run this wake; a
+        # remainder taken off an older stamp would prefill against an empty host.
+        return False
     x = _weg2_store_short_tail_x(sched)
     remainder = _weg2_store_short_remainder(req)
+    if (remainder is None and getattr(req, "_1471_short", False)
+            and _weg2_zero_read_settle_on()):
+        # PK2 (metal dkr27bparkdraftbar1w209270645, 27.09.): a ZERO answer
+        # (#1478: deliverable=0, so no #1324 stamp) is a read that delivered
+        # nothing -- D prefills the WHOLE span. Within X that is D's to do now
+        # (law 4 holds); unstamped, the flip-parked A (418 tokens) sat the whole
+        # 20.1 s settle bound out and was then prefilled from 0 anyway. Over X
+        # it still waits for its read, exactly as before.
+        remainder = _weg2_span_tokens(req)
     return x > 0 and remainder is not None and remainder <= x
+
+
+def _weg2_span_tokens(req) -> Optional[int]:
+    """The request's whole context in tokens (what D prefills on a zero read)."""
+    ids = getattr(req, "full_untruncated_fill_ids", None)
+    if ids is not None:
+        return len(ids)
+    try:
+        return len(req.origin_input_ids or ()) + len(req.output_ids or ())
+    except (AttributeError, TypeError):
+        return None
 
 
 def _weg2_windowed_path(sched) -> bool:
@@ -939,6 +1298,431 @@ def _weg2_windowed_path(sched) -> bool:
 def _weg2_dormant_admit_armed() -> bool:
     """#1443: accept-and-hold while dormant (default on)."""
     return os.environ.get("SGLANG_WEG2_DORMANT_ADMIT", "1") == "1"
+
+
+#: #823 HEAD-VOTE ANCHOR line count (module-level: the vote runs on scheduler
+#: doubles in the #823/#610 harnesses, which carry only the reduce's members).
+_HEAD_VOTE_ANCHOR_N = [0]
+
+
+def _len_or_zero(x) -> int:
+    """``len(x)`` for a list or a tensor, 0 for None -- never ``x or ()``: the
+    truth value of an empty tensor raises (27B rc12z9 D 08:23:24, all three
+    ranks, `_head_vote_len`'s log line on a request with no device prefix)."""
+    return 0 if x is None else len(x)
+
+
+def _head_vote_len(req) -> int:
+    """#823 vote for one head rid: the prefix the admission can MATERIALIZE.
+
+    ``num_matched_prefix_tokens`` is ``len(prefix_indices) + host_hit_length``.
+    Both terms MISS a device-resident node that carries no recurrent state
+    and sits BELOW a host chain: the mamba validator cuts the device match
+    at the deepest node with a state (``last_device_node``), and the host
+    walk (``FullComponent.finalize_match_result``) sums only ``host_value``
+    from ``best_match_node`` up to that cut -- a node whose host rows were
+    released after its load-back (``#248 LOADED-HOST-RELEASE``) counts in
+    neither. The load-back keeps such a node (it is on the device) and the
+    request materializes the whole path to ``best_match_node``, whose depth
+    is ``state_anchor_depth`` (#1040: every component, the mamba validator
+    included, accepted it).
+
+    27B rc12z7b (1961f756ad), D 07:47:28, rid weg2-11-10: the sibling
+    weg2-10-9 was loaded to the device and released its host rows one pass
+    earlier; weg2-11-10 then matched device 0 + host 9466 = 9466 of a 9535
+    span whose first 69 tokens were that device node (``matched=69
+    loaded=9466 ... materialized=9535``). The group vote was 9466, the X
+    gate priced 71 uncached, and the vision guard refused an image ending at
+    9528 with W123 (covered=9466). The vote is now the larger of the two,
+    capped like ``num_matched_prefix_tokens`` at the max prefix length;
+    still MIN-reduced over the group, so every rank reads one number."""
+    n = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+    anchor = getattr(req, "state_anchor_depth", None)
+    if anchor is None or int(anchor) <= n:
+        return n
+    try:
+        cap = int(req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)))
+    except Exception:  # noqa: BLE001 - a req without the method keeps the old vote
+        return n
+    vote = max(n, min(int(anchor), cap))
+    if vote > n:
+        _HEAD_VOTE_ANCHOR_N[0] += 1
+        k = _HEAD_VOTE_ANCHOR_N[0]
+        if k <= 16 or k % 256 == 0:
+            logger.info(
+                "#823 HEAD-VOTE ANCHOR rid=%s matched=%d (device %d + host %d) "
+                "anchor_depth=%d vote=%d (n=%d): a device node without a state "
+                "below the host chain counts toward the materializable prefix",
+                str(getattr(req, "rid", "?"))[:16], n,
+                _len_or_zero(getattr(req, "prefix_indices", None)),
+                int(getattr(req, "host_hit_length", 0) or 0), int(anchor), vote, k,
+            )
+    return vote
+
+
+def _weg2_device_idle(sched) -> bool:
+    """RW: nothing runs and nothing is in flight on this rank's device -- the
+    only state in which the pool tables may be rewritten from the host
+    (a replay promotes into them). Replicated: every rank of the lockstep
+    group has the same running batch, last batch and result queue."""
+    rb = getattr(sched, "running_batch", None)
+    if rb is not None and not rb.is_empty():
+        return False
+    lb = getattr(sched, "last_batch", None)
+    if lb is not None and not lb.is_empty():
+        return False
+    if getattr(sched, "enable_overlap", False) and len(getattr(sched, "result_queue", ()) or ()):
+        return False
+    return getattr(sched, "chunked_req", None) is None
+
+
+def _weg2_resume_warm_tick(sched) -> int:
+    """RW (expert_offload.ResumeWarm): warm queued layers while a wake read is
+    still settling and the device is idle; the settle over = the rest is
+    skipped (the eager sync fetches it as today). Never raises."""
+    try:
+        from sglang.srt.layers.moe.expert_offload import resume_warm
+
+        rw = resume_warm()
+        if not rw.pending():
+            return 0
+        if getattr(sched, "weg2_dormant", False):
+            return 0  # the flip is not over: never in the leg (x147)
+        # "settle over" only once this wake's hold was released (open_settle in
+        # _weg2_release_dormant_hold, the same resume on every rank); before
+        # that an empty settle is "not built yet", not "done".
+        if rw.settle_open and not getattr(sched, "weg2_post_wake_settle", None):
+            rw.cancel("settle_done")
+            return 0
+        if not _weg2_device_idle(sched):
+            return 0
+        return rw.tick()
+    except Exception as exc:  # noqa: BLE001 -- a hint never breaks a pass
+        logger.warning("RW RESUME-WARM tick skipped: %s", exc)
+        return 0
+
+
+def _weg2_resume_first_token_note(sched, batch) -> bool:
+    """RW instrument (NF's three numbers, one line per wake): wake -> first
+    decode forward, the resume leg's duration, and the first eager extend's
+    syncs, beside the warm's own counts."""
+    if not getattr(sched, "_rw_first_token_open", False):
+        return False
+    try:
+        mode = getattr(batch, "forward_mode", None)
+        if mode is None or not mode.is_decode():
+            return False
+        import time as _t
+
+        sched._rw_first_token_open = False
+        wake = getattr(sched, "_weg2_last_wake_t", None)
+        t0 = getattr(sched, "_weg2_resume_t0", None)
+        from sglang.srt.layers.moe.expert_offload import resume_warm
+
+        rw = resume_warm()
+        rw.cancel("first_decode")
+        logger.info(
+            "RW WAKE-FIRST-TOKEN wake_to_first_decode_ms=%.0f leg_ms=%.0f %s "
+            "(RW: experts of the resumes warmed after the legs; the leg must not grow, "
+            "the first extend's eager syncs must fall)",
+            -1.0 if wake is None else (_t.perf_counter() - wake) * 1000.0,
+            -1.0 if (wake is None or t0 is None) else (wake - t0) * 1000.0,
+            rw.fields(),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("RW WAKE-FIRST-TOKEN n/a: %s", exc)
+        return False
+
+
+def _weg2_wake_cohort_note(sched, batch) -> bool:
+    """L1 instrument (weg2/wake_cohort.WakeLedger): one line per wake, when
+    every request of the wake's cohort is in a decode batch."""
+    ledger = getattr(sched, "_weg2_wake_ledger", None)
+    if ledger is None or not ledger.open:
+        return False
+    try:
+        mode = getattr(batch, "forward_mode", None)
+        if mode is None or not mode.is_decode():
+            return False
+        from sglang.srt.weg2 import wake_cohort as _wc
+
+        line = ledger.decode_seen([r.rid for r in batch.reqs], _wc.monotonic(), _wc.enabled())
+        if line:
+            logger.info(line)
+        return bool(line)
+    except Exception as exc:  # noqa: BLE001 -- an instrument never breaks a pass
+        ledger.open = False
+        logger.warning("WEG2-WAKE-COHORT n/a: %s", exc)
+        return False
+
+
+def _weg2_decode_first_note(sched, batch) -> None:
+    """F3 (weg2/d_park_runtime.note_decode_round): count the decode rounds
+    since the wake -- the D park gate's decode-first window closes on them."""
+    if not getattr(sched, "_weg2_wake_seq", None):
+        return
+    try:
+        from sglang.srt.weg2 import d_park_runtime
+
+        d_park_runtime.note_decode_round(sched, batch)
+    except Exception as exc:  # noqa: BLE001 -- a counter never breaks a pass
+        logger.warning("F3 DECODE-FIRST round note n/a: %s", exc)
+
+
+#: FA (28.09.): switch of the prefetch span's anchor start, default on; 0 = the
+#: span starts at ``len(prefix_indices) + host_hit_length`` as before.
+PREFETCH_FROM_ANCHOR_ENV = "SGLANG_WEG2_PREFETCH_FROM_ANCHOR"
+_PREFETCH_FROM_ANCHOR_N = [0]
+
+
+def _weg2_prefetch_span_start(sched, req, matched_len: int) -> int:
+    """FA (28.09., NF rc12z22 D 14:56:01/26, weg2-4-11 / weg2-8-15 / weg2-10-16 /
+    weg2-11-18): where the store read of ``req`` must START.
+
+    ``len(prefix_indices) + host_hit_length`` misses a device node without a
+    recurrent state below the host chain (``_head_vote_len``'s rc12z7b case):
+    the mamba validator cuts the device match to 0, the host walk sums only the
+    host part, so weg2-10-16 read ``matched=50944 (device 0 + host 50944)``
+    while its host chain -- ``last_host_node`` IS ``best_match_node``, whose
+    depth is ``state_anchor_depth`` -- ended at 69184 (18240 device + 50944
+    host, KV and Mamba state complete). The span then started at 50944 with the
+    hash chain of 69184: keys that exist nowhere (``#1472 READ-TRACE asked=286
+    readable=0 why=no-file``, the same first stem again 25 s later for
+    weg2-4-11), a store-short read and 5 s of X-DEFER while nothing was
+    missing. The read starts at the chain's end, as its last hash says.
+
+    Group D (no PP) only: the #1400 told arithmetic on group P counts from its
+    own registration and stays as it was. Rank-local like the term it
+    replaces; the registration still goes through the group vote (#580/HP1)."""
+    if (os.environ.get(PREFETCH_FROM_ANCHOR_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return matched_len
+    ps = getattr(sched, "ps", None)
+    if ps is not None and int(getattr(ps, "pp_size", 1) or 1) > 1:
+        return matched_len
+    if getattr(getattr(sched, "tree_cache", None), "cache_controller", None) is None:
+        return matched_len  # last_host_node is the DEVICE node then, not the anchor
+    anchor = getattr(req, "state_anchor_depth", None)
+    if anchor is None or int(anchor) <= int(matched_len):
+        return matched_len
+    _PREFETCH_FROM_ANCHOR_N[0] += 1
+    k = _PREFETCH_FROM_ANCHOR_N[0]
+    if k <= 16 or k % 256 == 0:
+        logger.info(
+            "FA PREFETCH-FROM-ANCHOR rid=%s matched=%d (device %d + host %d) anchor=%d (n=%d): "
+            "the store read starts at the host chain's end, where its last hash is",
+            str(getattr(req, "rid", "?"))[:16], int(matched_len),
+            _len_or_zero(getattr(req, "prefix_indices", None)),
+            int(getattr(req, "host_hit_length", 0) or 0), int(anchor), k,
+        )
+    return int(anchor)
+
+
+_PRESENCE_PROBE_N = [0]
+
+
+def _weg2_presence_keys(sched, req, matched_len: int, n_tokens: int):
+    """H108: P's hand-off keys (#1442) for the span the #950 presence probe
+    asks about, and their source -- ``(keys, "handoff")`` or ``(None, "own")``.
+
+    The same resolution the registration below the probe uses
+    (``resolve_chain`` + ``keys_for_span``), so the probe and the fetch key
+    the same pages. A missing hand-off file is retried on every call and
+    never cached (xsn331: the first registration on D can race P's write)."""
+    rid = getattr(req, "rid", None)
+    if not (isinstance(rid, str) and rid.startswith("weg2-")) or n_tokens <= 0:
+        return None, "own"
+    try:
+        from sglang.srt.weg2 import handoff as _ho
+        from sglang.srt.weg2.handoff_keys import keys_for_span, resolve_chain
+
+        span = keys_for_span(
+            resolve_chain(req, _ho.read),
+            int(matched_len),
+            int(n_tokens),
+            int(getattr(sched, "page_size", 1) or 1),
+        )
+    except Exception as exc:  # noqa: BLE001 -- the hand-off is a shortcut, never a gate
+        logger.info("H108 PRESENCE-KEYS n/a rid=%s (%s: %s)", rid, type(exc).__name__, exc)
+        return None, "own"
+    return (span, "handoff") if span else (None, "own")
+
+
+def _weg2_store_presence(
+    sched, req, probe, tokens, last_hash, prefix_keys, matched_len: int, generation: int
+) -> bool:
+    """H108 (rc12z25 D 16:56:02, weg2-72-124 W16 4317 > 4096): the #950
+    presence verdict, asked with the keys the fetch reads with.
+
+    The probe used to hash its own chain from ``last_hash``. It runs only when
+    ``last_host_node`` is not backuped -- on D that is a D-own node, whose
+    hash is the tree's bigram convention -- so the chain met none of P's
+    plain-convention keys: 0 with P's pages and end anchor in the store, TP0
+    entered the #580 vote with nothing (`#915 ... vote_negative ... need=0`,
+    `[#915 prefetch-gate] anchor=` +1 on TP0 only) and the group recomputed
+    the P leg's tail on D. All 7 short after-P legs of rc12z25 had this shape.
+
+    Cached per (generation, span, hand-off coverage): a hand-off record that
+    lands after a negative verdict changes the key and is asked again."""
+    keys, src = _weg2_presence_keys(sched, req, matched_len, len(tokens))
+    key = (int(generation), int(matched_len), len(tokens), len(keys) if keys else 0)
+    cached = getattr(req, "_pp_store_presence_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    # Q-460 SALT-ISOLATION: asked in the request's namespace (cache_salt /
+    # extra_key) -- the unsalted chain is another tenant's pages.
+    _ek = getattr(req, "extra_key", None)
+    _ns = {"extra_key": _ek} if _ek is not None else {}
+    if keys:
+        pages = probe(tokens, last_hash, prefix_keys, page_keys=keys, **_ns)
+    else:
+        pages = probe(tokens, last_hash, prefix_keys, **_ns)
+    present = bool(pages)
+    req._pp_store_presence_cache = (key, present)
+    tree = getattr(sched, "tree_cache", None)
+    if tree is not None:
+        from sglang.srt.mem_cache.unified_radix_cache import PRESENCE_SRC_ATTR
+
+        srcs = getattr(tree, PRESENCE_SRC_ATTR, None)
+        if srcs is None:
+            srcs = {}
+            setattr(tree, PRESENCE_SRC_ATTR, srcs)
+        srcs[str(getattr(req, "rid", ""))] = src
+        while len(srcs) > 4096:
+            srcs.pop(next(iter(srcs)))
+    _PRESENCE_PROBE_N[0] += 1
+    n = _PRESENCE_PROBE_N[0]
+    if n <= 64 or n % 256 == 0 or (src == "handoff" and not present):
+        logger.info(
+            "H108 PRESENCE-PROBE rid=%s keys=%s covered=%d span_tokens=%d matched=%d "
+            "pages=%d present=%s (n=%d): the #950 verdict this rank carries into the "
+            "#580 vote, asked with the keys the fetch reads with",
+            str(getattr(req, "rid", "?"))[:16], src, len(keys) if keys else 0,
+            len(tokens), int(matched_len), int(pages or 0), present, n,
+        )
+    return present
+
+
+#: QUIESCE-EMPTY-CACHE (02.10., N6d ..._ec4d492f58: WEG2-SLEEP-SUB rpc_flush
+#: empty_cache=21 ms per P flush beside tree_reset): the /flush_cache RPC (the
+#: front's quiesce, ``zero_kv`` None) of a Weg-2 group empties the torch caching
+#: allocator. It is the ONLY empty_cache before the flip legs on PP0 -- PP0's
+#: release flush is refused by the PENDING idle lap and skips its own, and the
+#: sleep's sleep_complete empty_cache runs after the legs (it released 0 MiB on
+#: every N6d sleep). Kept by default; every Weg-2 flush now prints what it gave
+#: back and what it cost ('WEG2-FLUSH-EMPTY-CACHE site= ms= released_mib='), so
+#: the next boot says whether the quiesce's call buys VRAM for the waking group.
+#: SGLANG_WEG2_QUIESCE_EMPTY_CACHE=0 skips it on the quiesce RPC (the release's
+#: flush and sleep_complete keep theirs).
+_WEG2_QUIESCE_EMPTY_CACHE_ENV = "SGLANG_WEG2_QUIESCE_EMPTY_CACHE"
+
+
+def _weg2_flush_empty_cache(zero_kv, tp_group_verdict) -> None:
+    """flush_cache's empty_cache, instrumented on Weg-2 groups (see above)."""
+    if not (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip():
+        current_platform.empty_cache()
+        return
+    site = "release" if zero_kv is False else "rpc"
+    if site == "rpc" and str(os.environ.get(_WEG2_QUIESCE_EMPTY_CACHE_ENV, "1") or "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        logger.info("WEG2-FLUSH-EMPTY-CACHE site=rpc skipped (%s=0: the quiesce leaves the "
+                    "allocator cache to the release's flush and sleep_complete)",
+                    _WEG2_QUIESCE_EMPTY_CACHE_ENV)
+        return
+    try:
+        dev = torch.get_device_module()
+        r0, a0 = int(dev.memory_reserved()), int(dev.memory_allocated())
+    except Exception:  # noqa: BLE001 -- no reading: the call still runs
+        r0 = a0 = None
+    t0 = time.perf_counter()
+    current_platform.empty_cache()
+    ms = (time.perf_counter() - t0) * 1000.0
+    try:
+        r1 = int(torch.get_device_module().memory_reserved()) if r0 is not None else None
+    except Exception:  # noqa: BLE001
+        r1 = None
+    if r0 is None or r1 is None:
+        logger.info("WEG2-FLUSH-EMPTY-CACHE site=%s ms=%.1f released_mib=n/a", site, ms)
+        return
+    mib = 1024.0 * 1024.0
+    logger.info("WEG2-FLUSH-EMPTY-CACHE site=%s ms=%.1f released_mib=%.1f reserved_mib=%.0f->%.0f "
+                "allocated_mib=%.0f tp_group_verdict=%d (torch caching allocator of this rank; "
+                "the untagged reserve handed back to the driver before the flip legs)",
+                site, ms, (r0 - r1) / mib, r0 / mib, r1 / mib, a0 / mib, int(bool(tp_group_verdict)))
+
+
+def _weg2_parked_owned_prefetch_of(sched) -> frozenset:
+    """PDFLIP-A: open prefetch records of requests in D's park list (empty off
+    D's park, without HiCache, or on any error -- the old verdict stands)."""
+    try:
+        from sglang.srt.managers.weg2_sleep_drain import parked_owned_prefetch
+
+        tc = getattr(sched, "tree_cache", None)
+        if not getattr(sched, "enable_hierarchical_cache", False) or tc is None:
+            return frozenset()
+        return parked_owned_prefetch(
+            parked=getattr(sched, "weg2_d_parked", None) or (),
+            ongoing_prefetch=getattr(tc, "ongoing_prefetch", None) or ())
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+#: DP-NACHLAUF 02.10. (N5u fcf0366fdb, every P>D): the sleep path reset P's
+#: pools TWICE -- the front's quiesce /flush_cache (rpc_flush alloc_clear 37-66
+#: ms) and, milliseconds later, the kv release's own flush (release_flush
+#: alloc_clear 30-52 ms) on a group that ran nothing in between. The release
+#: flush (zero_kv=False) skips the tree/pool reset when this rank's last reset
+#: is still current: no forward since, nothing waiting or running, the tree
+#: as the reset left it. Rank-local (the #1268 idle verdict is voted before the reset either
+#: way). Unset = on; 0/false/no/off = the release always resets.
+_WEG2_RELEASE_DEDUP_ENV = "SGLANG_WEG2_RELEASE_FLUSH_DEDUP"
+
+
+def _weg2_release_dedup_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(_WEG2_RELEASE_DEDUP_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _weg2_tree_sig(tree):
+    """What a reset leaves (the #243 hand-off chain may stay): sizes + root fan-out."""
+    root = getattr(tree, "root_node", None)
+    return (int(tree.evictable_size() or 0), int(tree.protected_size() or 0),
+            len(getattr(root, "children", None) or ()) if root is not None else -1)
+
+
+def _weg2_note_reset(sched) -> None:
+    try:
+        sched._weg2_last_reset_fwd = int(getattr(sched, "forward_ct", -1))
+        sched._weg2_last_reset_sig = _weg2_tree_sig(sched.tree_cache)
+    except Exception:  # noqa: BLE001
+        sched._weg2_last_reset_fwd = None
+
+
+def _weg2_release_reset_redundant(sched, zero_kv) -> bool:
+    """True only for the release flush (zero_kv is False) right after a
+    reset nothing has touched since."""
+    if zero_kv is not False or not _weg2_release_dedup_on():
+        return False
+    try:
+        last = getattr(sched, "_weg2_last_reset_fwd", None)
+        if last is None or int(last) != int(getattr(sched, "forward_ct", -2)):
+            return False
+        if list(getattr(sched, "waiting_queue", None) or []):
+            return False
+        rb = getattr(sched, "running_batch", None)
+        if rb is not None and hasattr(rb, "is_empty") and not rb.is_empty():
+            return False
+        if _weg2_tree_sig(sched.tree_cache) != getattr(sched, "_weg2_last_reset_sig", None):
+            return False
+    except Exception:  # noqa: BLE001 -- any doubt: reset as before
+        return False
+    n = getattr(sched, "_weg2_release_dedup_n", 0) + 1
+    sched._weg2_release_dedup_n = n
+    if n <= 8 or n % 64 == 0:
+        logger.info("WEG2-RELEASE-FLUSH-DEDUP n=%d fwd=%s: the quiesce flush's reset is current (no forward, "
+                    "tree as reset, empty queues) -- the release leg skips the second reset (%s=0 restores it)",
+                    n, getattr(sched, "forward_ct", "?"), _WEG2_RELEASE_DEDUP_ENV)
+    return True
 
 
 class Scheduler(
@@ -2182,6 +2966,20 @@ class Scheduler(
         model_runner.note_post_capture_leftover(
             draft_solo_pool_bytes=self._solo_draft_kv_pool_bytes()
         )
+        # BOOTZEIT 3 stage 0: every free-memory reading this rank's sizing
+        # depends on is taken; an early-started D may create its context now
+        # (no-op without SGLANG_WEG2_P_MEM_SIZED_DIR).
+        from sglang.srt.weg2.d_early_start import (
+            note_p_memory_sized,
+            start_free_read_journal,
+        )
+
+        note_p_memory_sized(
+            self.ps.pp_rank, self.ps.tp_rank, getattr(model_runner, "_weg2_used_by_me_gb", None)
+        )
+        # ... and from here until the first wake every free-memory read of this
+        # rank is journaled (SGLANG_WEG2_FREE_READ_JOURNAL; early vs serial diff)
+        start_free_read_journal(self.ps.pp_rank, self.ps.tp_rank)
         # #485 residency census (env-gated, read-only): the same point, seen
         # from the CUT's side. note_post_capture_leftover above answers "how
         # much is left"; this answers "what is here, and who owns it", which
@@ -2389,6 +3187,14 @@ class Scheduler(
         # H103: the run-time-T FLA l2norm kernel loaded BEFORE the sampling
         # warmup's barrier and the first sleep (behind H101's rows prewarm).
         self.warm_fla_l2norm()
+        # P-COLD: the QSA indexer's TileLang prefill kernels built BEFORE the
+        # sampling warmup's barrier and the first sleep (rc12z30c: PP1 compiled
+        # them inside the first real forward, ~9 s of fwd_ms=12783).
+        self.warm_qsa_mqa_tilelang()
+        # P-PREWARM: the PLE admission armed and the MoE router's first call
+        # made BEFORE the sampling warmup's barrier and the first sleep
+        # (SGLANG_WEG2_ENABLE_TARGETED_PREWARM; each skips, named, while off).
+        self.warm_targeted_prewarm()
         # #603b: LAST in this method, after every worker, pool, backend and
         # graph exists. The warmup ends in a group barrier, so it must sit at a
         # point every rank reaches exactly once with the model fully built.
@@ -2411,6 +3217,29 @@ class Scheduler(
             dtype=self.model_config.dtype,
             device=self.tp_worker.device,
         )
+
+    def warm_qsa_mqa_tilelang(self):
+        """P-COLD: delegate to qsa/mqa_prewarm.run_boot_prewarm (rank-local, no
+        collective; the #603b barrier right after pairs the ranks up)."""
+        from sglang.srt.layers.attention.qsa.mqa_prewarm import run_boot_prewarm
+
+        runner = getattr(self.tp_worker, "model_runner", None)
+        run_boot_prewarm(
+            model=getattr(runner, "model", None),
+            device=self.tp_worker.device,
+        )
+
+    def warm_targeted_prewarm(self):
+        """P-PREWARM: delegate to models/qwen4_exp_ple_admit.run_boot_prewarm
+        and layers/moe/router_prewarm.run_boot_prewarm (rank-local, no
+        collective; the #603b barrier right after pairs the ranks up)."""
+        from sglang.srt.layers.moe.router_prewarm import run_boot_prewarm as warm_router
+        from sglang.srt.models.qwen4_exp_ple_admit import run_boot_prewarm as warm_ple
+
+        runner = getattr(self.tp_worker, "model_runner", None)
+        model = getattr(runner, "model", None)
+        warm_ple(model=model)
+        warm_router(model=model, dtype=self.model_config.dtype, device=self.tp_worker.device)
 
     def warm_sampling_backend(self):
         """#603b: make the sampling JIT kernels resident BEFORE serving starts.
@@ -2496,6 +3325,13 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             ipc_channels=self.ipc_channels,
+            # FD (rc12o27 b1): a /flush_cache on a released group is refused.
+            is_dormant=lambda: bool(getattr(self, "weg2_dormant", False)),
+            # z30j: PP0 decides a forwarded flush once; followers follow it.
+            park_forwarded=lambda req: _weg2_flush_verdict.follower_park(self, req),
+            on_decided=lambda req, ok, detail: _weg2_flush_verdict.pp0_record(self, req, ok, detail),
+            # QUIESCE-PENDING: the refused verdict's text names a PENDING lap
+            refusal_detail=lambda: getattr(self, "_weg2_last_flush_refusal", "") or "",
         )
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
@@ -3143,6 +3979,8 @@ class Scheduler(
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (Weg2ParkRunningReqInput, self.handle_weg2_park_running),
+                (Weg2ParkWindowReqInput, self.handle_weg2_park_window),
+                (Weg2VisionVerdict, self.handle_weg2_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
@@ -3406,6 +4244,7 @@ class Scheduler(
                 if self.idle_sleeper is not None:
                     self.idle_sleeper.reset()
                 result = self.run_batch(batch)
+                _weg2_decode_first_note(self, batch)  # F3: decode rounds since the wake
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -3438,6 +4277,10 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
             _stage_sync(f"result-{tmp_batch.forward_mode.name}")
             _h58_span("result_ms", _h58_t0)
+
+        # nf-pd-post: the last batch's result was processed in the iteration
+        # that launched it (weg2/skip_first.result_now) -- nothing to pop for it.
+        last_result_done = False
 
         while True:
             if self.gracefully_exit:
@@ -3478,7 +4321,8 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                if not last_result_done:
+                    pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
                 # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
@@ -3497,6 +4341,9 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
                 self._weg2_post_wake_pass_log(batch)  # Wake-Parallel item 2
+                _weg2_resume_first_token_note(self, batch)  # RW: one line per wake
+                _weg2_wake_cohort_note(self, batch)  # L1: wake -> last cohort member's first decode
+                _weg2_decode_first_note(self, batch)  # F3: decode rounds since the wake
             else:
                 batch_result = None
 
@@ -3513,11 +4360,17 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not last_result_done:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            # nf-pd-post: a skip-extend batch (no target forward) is processed
+            # now -- P's token streams before the next pass's TP recv and launch.
+            last_result_done = _weg2_skip_first.result_now(batch, batch_result)
+            while last_result_done and self.result_queue:  # FIFO up to this batch
+                pop_and_process()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -3733,6 +4586,164 @@ class Scheduler(
 
 
 
+    def _form_a_tp_exchange(self, site: str, payload):
+        """H105: one small broadcast from the attention host (TP rank 0) under
+        the #1028d blocked-recv stamp, so a peer that never arrives is named by
+        the watchdog (``chain-recv/<site>``) instead of read as a silent wedge.
+        The host passes its payload, a worker ``None``; every rank returns the
+        host's."""
+        from sglang.srt.utils import broadcast_pyobj
+
+        self._note_pp_chain_blocked(site, time.monotonic())
+        try:
+            out = broadcast_pyobj(
+                [payload] if payload is not None else [],
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        finally:
+            self._note_pp_chain_blocked(None, None)
+        return out[0] if out else None
+
+    def _form_a_tp_gather(self, site: str, payload):
+        """#239 S3d: :meth:`_form_a_tp_exchange` for a verdict EVERY rank
+        contributes to (the token cut): an all-gather over the TP cpu group,
+        in TP order, under the same blocked-recv stamp."""
+        self._note_pp_chain_blocked(site, time.monotonic())
+        try:
+            out = [None] * len(self.tp_group.ranks)
+            torch.distributed.all_gather_object(out, payload, group=self.tp_cpu_group)
+        finally:
+            self._note_pp_chain_blocked(None, None)
+        return out
+
+    def _form_a_is_host(self) -> Optional[bool]:
+        """H105: None off a Form A follow group (tp 1, pp > 1, switch off);
+        else whether this rank is the attention host. The host must be the
+        broadcast source (TP rank 0) -- anything else is a named stop."""
+        if self.ps.tp_size <= 1 or self.ps.pp_size > 1:
+            return None
+        from sglang.srt.managers import tp_match_floor as _tmf
+
+        if not _tmf.form_a_follow_active():
+            return None
+        is_host = not _tmf.this_rank_follows()
+        if is_host != (self.tp_group.rank == self.tp_group.ranks[0]):
+            raise _tmf.FormAAdmissionSplit(
+                f"H105 RU FORM-A ADMISSION HOST-NOT-SOURCE tp_rank={self.tp_group.rank} "
+                f"src={self.tp_group.ranks[0]} is_host={is_host}: the attention "
+                "host must be TP rank 0, the source of the admission broadcast."
+            )
+        return is_host
+
+    def _form_a_admission_follow_fn(self):
+        """H105: the callable `PrefillAdder.add_one_req` hands its gate verdict
+        to on a Form A group (None elsewhere -- every gate stays rank-local)."""
+        is_host = self._form_a_is_host()
+        if is_host is None:
+            return None
+        from sglang.srt.managers import tp_match_floor as _tmf
+
+        from sglang.srt.rank_role import form_a_token_cut_active
+
+        def _exchange(payload):
+            return self._form_a_tp_exchange("form-a-admission/tp<-verdict", payload)
+
+        # #239 S3d: under the token cut every rank's gate counts (MIN).
+        _gather = None
+        if form_a_token_cut_active():
+
+            def _gather(payload):
+                return self._form_a_tp_gather("form-a-admission/tp<->verdict", payload)
+
+        # H106 (rc12z23 D 15:28:40-15:36:12): the host's load-back drain and
+        # its deadlock verdict ride this verdict (tp_match_floor docstring).
+        _tree = getattr(self, "tree_cache", None)
+        _drain_rides = _gather is None and _tree is not None
+        _watch = None
+        if is_host and _gather is None:
+            _watch = getattr(self, "_h106_wedge_watch", None)
+            if _watch is None:
+                from sglang.srt.environ import envs
+
+                _watch = self._h106_wedge_watch = _tmf.FormAAdmissionWedgeWatch(
+                    envs.SGLANG_WEG2_FORM_A_DEADLOCK_STOP_S.get()
+                )
+
+        def _worker_drain(host_drained):
+            # The worker's own leaf set, whole -- the host drained its whole set
+            # (the replicas hold the same leaves); the gate's lock on
+            # req.last_node keeps the matched prefix here as it does on the host.
+            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+            ev = int(_tree.evictable_size())
+            got = _tree.evict(EvictParams(num_tokens=ev)) if ev > 0 else None
+            logger.info(
+                "H106 FORM-A LOADBACK-DRAIN FOLLOW host_drained=%d evictable=%d "
+                "evicted=%d: the attention host drained its evictable leaves for "
+                "a refused load-back; this worker drains alike so the group floor "
+                "sees the room",
+                int(host_drained), ev,
+                int(getattr(got, "num_tokens_evicted", 0) or 0),
+            )
+
+        def _follow(req, gate, price=None, budget=None):
+            local = _tmf.ADMISSION_ADMIT if gate is None else gate.name
+            drained, stop = 0, ""
+            if is_host and _drain_rides:
+                # set by add_one_req around ITS host-first load-back only
+                drained = int(getattr(req, "_h106_host_drained", 0) or 0)
+                req._h106_host_drained = 0
+            if _watch is not None:
+                rb = getattr(self, "running_batch", None)
+                running_empty = (
+                    rb is not None
+                    and rb.is_empty()
+                    and getattr(self, "chunked_req", None) is None
+                )
+                stop = _watch.observe(
+                    req.rid, local, price, budget,
+                    running_empty=running_empty, now=time.monotonic(),
+                )
+            code = _tmf.form_a_admission_verdict(
+                req.rid,
+                local,
+                is_host=is_host,
+                exchange=_exchange,
+                price=price,
+                budget=budget,
+                gather=_gather,
+                drained=drained,
+                stop=stop,
+                on_host_drain=_worker_drain if _drain_rides else None,
+            )
+            return None if code == _tmf.ADMISSION_ADMIT else AddReqResult[code]
+
+        # H105b (rc12z20 D 12:55:34, weg2-36-145): the host runs its host
+        # load-back BEFORE it sends the verdict, so a load-back WAIT on the
+        # host (no device room, anchor given back) rides the same broadcast.
+        # Under the token cut the verdict is a gather of real gates on every
+        # rank -- unchanged there.
+        _follow.host_decides_load_back = bool(is_host) and _gather is None
+        return _follow
+
+    def _form_a_extend_set_riegel(self, can_run_list) -> None:
+        """H105 riegel after the admission loop: the host's built extend set
+        against this rank's; a split is a named stop before the forward."""
+        is_host = self._form_a_is_host()
+        if is_host is None:
+            return
+        from sglang.srt.managers import tp_match_floor as _tmf
+
+        _tmf.form_a_extend_set_check(
+            _tmf.form_a_extend_set(can_run_list),
+            is_host=is_host,
+            exchange=lambda p: self._form_a_tp_exchange(
+                "form-a-admission/tp<-extend-set", p
+            ),
+        )
+
     def init_request_receiver(self) -> None:
         # #1233 (WEG 2, S0): both were built only under the flip, to let an
         # ARMED rank stop taking work at a quiescent boundary. Nothing arms
@@ -3742,6 +4753,16 @@ class Scheduler(
         # and takes the direct upstream path.
         self.pp_flip_counters = None
         self.pp_chain_receiver = None
+        # Fix B (weg2/p_row_authority.py, SGLANG_WEG2_P_ROW_AUTHORITY, default
+        # OFF): on group P the #631 row form is re-armed -- counters BEFORE the
+        # receiver (the receiver publishes its consumed count through them),
+        # then the named start check. Off: both stay None, byte for byte.
+        from sglang.srt.weg2 import p_row_authority as _prow
+
+        if _prow.applies(self):
+            self.pp_flip_counters = _prow.build_counters(self)
+            self.pp_chain_receiver = _prow.build_chain_receiver(self, self.pp_flip_counters)
+            _prow.start_check(self)
         # WEG2 VISION (user design 2026-09-24): PP0 of a transient P group
         # encodes images in its OWN process, on its KV tail, before the
         # admission (weg2/vision_rank_runner.py). False on every other boot
@@ -3771,6 +4792,13 @@ class Scheduler(
             self._weg2_vision_rank_stage = arm_rank_stage(self)
             if self._weg2_vision_rank_stage:
                 _vision_origin_aborts = lambda: take_origin_aborts(self)  # noqa: E731
+            else:
+                # H125f: a follower of a transient P group holds image
+                # requests until PP0's verdict reaches it (vision_verdict)
+                from sglang.srt.weg2 import vision_verdict as _vv
+                from sglang.srt.weg2.vision_rank_runner import transient_p_boot
+
+                self._weg2_vision_follower_gate = transient_p_boot() and _vv.arm(self)
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -3801,7 +4829,7 @@ class Scheduler(
             # #1233 (WEG 2, S0): None, the value every non-flip boot already
             # passed. The receiver falls back to the direct
             # ``point_to_point_pyobj`` call, i.e. the upstream intake path.
-            chain_receiver=None,
+            chain_receiver=self.pp_chain_receiver,
             # #824 W5(b): mark the DIRECT chain receive. That branch runs on
             # every boot, and it was the last blocking PP receive with no
             # marker at all.
@@ -5368,14 +6396,29 @@ class Scheduler(
     # Delegation only (large-class-style): the bookkeeping moves live in
     # weg2/d_park_runtime.py, the verdicts in weg2/d_seats.py.
 
+    def handle_weg2_vision_verdict(self, recv_req):
+        """H125f: PP0's vision verdict, dispatched on every PP stage."""
+        from sglang.srt.weg2.vision_verdict import absorb
+
+        absorb(self, recv_req)
+        return None
+
     def handle_weg2_park_running(self, recv_req):
         """H91b: ``POST /weg2/park_running`` -- park every running D request
         before D's sleep (d_park_runtime.park_running)."""
-        from sglang.srt.weg2 import d_park_runtime
+        from sglang.srt.weg2 import d_park_runtime, park_window_gate
 
+        park_window_gate.clear(self, "park")  # the window fired: its deadline is spent
         return d_park_runtime.park_running(
             self, recv_req, late_hold_armed=_weg2_dormant_admit_armed()
         )
+
+    def handle_weg2_park_window(self, recv_req) -> None:
+        """PARK-WINDOW-GATE: the front's open collect window (deadline and D's
+        cost line) or its clear; no reply (weg2/park_window_gate)."""
+        from sglang.srt.weg2 import park_window_gate
+
+        park_window_gate.note(self, recv_req)
 
     def weg2_d_hold_parked(self) -> int:
         """H91b: the sleep leg's dormant point -- parked requests enter the
@@ -5383,6 +6426,12 @@ class Scheduler(
         from sglang.srt.weg2 import d_park_runtime
 
         return d_park_runtime.hold_parked(self, hold_armed=_weg2_dormant_admit_armed())
+
+    def _weg2_park_l3_defer_hold_read(self, req) -> bool:
+        """#248: the dormant hold intake only looks ``req`` up (weg2.park_l3)."""
+        from sglang.srt.weg2 import park_l3
+
+        return park_l3.defer_hold_read(self, req)
 
     def _weg2_d_park_hold_late(self, req) -> bool:
         """H91c3-2: a hand-off reaching D after park_running is held behind
@@ -5405,6 +6454,11 @@ class Scheduler(
         from sglang.srt.weg2 import d_park_runtime
 
         return d_park_runtime.admission(self, running_batch)
+
+    def _weg2_sa_exclude_displaced(self, prefetch_verdicts) -> None:
+        from sglang.srt.weg2 import d_park_runtime
+
+        d_park_runtime.exclude_displaced(self, prefetch_verdicts)
 
     def _weg2_d_park_abort(self, recv_req) -> int:
         from sglang.srt.weg2 import d_park_runtime
@@ -5479,6 +6533,16 @@ class Scheduler(
         if _weg2_pp_producer_awake(self):
             # TK: group P after the wake is the PRODUCER -- never parked.
             return _weg2_producer_wake_verdict(self, req)
+        if getattr(req, "_weg2_248_read_at_wake", False):
+            # #248: looked up only -- no read in the sleep, nothing to top up;
+            # the wake issues it (weg2.park_l3.issue_deferred_reads)
+            return "complete"
+        from sglang.srt.weg2 import settle_writer as _sw
+
+        if _sw.budget_pending(req):
+            # NW (30.09., y3u weg2-30-52/31-53): the last read was REFUSED by the
+            # host budget -- nothing registered, nothing read. Not short: unread.
+            return self._weg2_refetch_budget(req, now, allow_reissue)
         if not self.tree_cache.check_prefetch_progress(req.rid):
             return "reading"
         reason = self._weg2_note_store_shortfall(req)
@@ -5538,7 +6602,8 @@ class Scheduler(
         if 0 < _tail <= self.WEG2_TAIL_RECOMPUTE_TOKENS and int(getattr(req, "_1456_n", 0) or 0) >= 1:
             req._1471_short = False
             logger.info("#x38 SETTLE-TAIL rid=%s tail=%d tokens <= %d after %d re-read(s) (%s): "
-                        "released -- the extend computes the tail",
+                        "released -- D-NORECOMPUTE sends it through RESUME-VIA-P (no D compute "
+                        "after a flip)",
                         str(req.rid)[:12], _tail, self.WEG2_TAIL_RECOMPUTE_TOKENS,
                         int(getattr(req, "_1456_n", 0) or 0), reason)
             return "complete"
@@ -5550,7 +6615,10 @@ class Scheduler(
             req._1471_short = False
             return "complete"
         req._1471_short = True
-        if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
+        if (now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0
+                and not _weg2_short_read.reread_now(req, _have2)):
+            # a read reaped short with its span in the store is re-read at the
+            # next tick while it moves (weg2/short_read.py); else the 2 s timer
             return "wait"
         if not allow_reissue:
             # weg2xsn296 (Task #9, xsn287 class): the re-read is a TP
@@ -5563,6 +6631,7 @@ class Scheduler(
             return "due"
         req._1456_last = now
         req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
+        _weg2_short_read.note_reissue(req, _have2)
         clear = getattr(self, "_clear_prefetch_deferral_fields", None)
         if clear is not None:
             clear(req)  # the shortfall mark is ours to re-issue, not the drain's
@@ -5573,7 +6642,46 @@ class Scheduler(
         if req._1456_n <= 4 or req._1456_n % 16 == 0:
             logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short; "
                         "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)
+        if _sw.note_read_verdict(req, verdict, now, tree=self.tree_cache):
+            return "budget"  # NW: refused, not issued -- never a read in flight
         return "reissued"
+
+    def _weg2_refetch_budget(self, req, now: float, allow_reissue: bool) -> str:
+        """NW (30.09.): one settle/hold step of a request whose last store read
+        the host budget REFUSED (weg2/settle_writer.py): "wait" while this
+        rank's budget is still full or the retry interval runs, "due" when it
+        may be re-read (the caller takes the group MIN -- the read is a
+        collective), then the re-read: "reissued", or "budget" when refused
+        again. Never "complete": nothing of this read reached the host."""
+        from sglang.srt.weg2 import settle_writer as _sw
+
+        req._1471_short = True
+        try:
+            limited = bool(self.tree_cache.cache_controller.prefetch_rate_limited())
+        except Exception:  # noqa: BLE001 - no budget readable: retry on the interval
+            limited = False
+        if not _sw.budget_retry_due(req, now, limited):
+            return "wait"
+        if not allow_reissue:
+            return "due"
+        req._1456_last = now
+        req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
+        clear = getattr(self, "_clear_prefetch_deferral_fields", None)
+        if clear is not None:
+            clear(req)
+        plan = weg2_store_told.refetch_plan(self, req)
+        if plan is None or plan == weg2_store_told.REFETCH_SKIP:
+            verdict = self._prefetch_kvcache(req)
+        else:
+            verdict = self._prefetch_kvcache(req, limit_tokens=int(plan))
+        refused = _sw.note_read_verdict(req, verdict, now, tree=self.tree_cache)
+        n = int(getattr(self, "_1471b_n", 0) or 0) + 1
+        self._1471b_n = n
+        if n <= 16 or n % 64 == 0:
+            logger.info("#1471b BUDGET-REREAD rid=%s n=%d verdict=%s refused=%s (n_all=%d): the read the "
+                        "host budget refused is re-issued now that it has room", str(req.rid)[:12],
+                        req._1456_n, verdict, refused, n)
+        return "budget" if refused else "reissued"
 
     def _weg2_group_min_ints(self, vals):
         """#1479b: element-wise MIN of small ints over the TP cpu group;
@@ -5705,6 +6813,22 @@ class Scheduler(
                 _ev()
         except Exception as exc:  # noqa: BLE001
             logger.info("#1471 SETTLE hicache events n/a (%s: %s)", type(exc).__name__, exc)
+        # #248f (30.09., NF y4b ep18): hold reads waiting for arena room are
+        # issued as the older reads leave the settle (arrival order); while
+        # they wait they are neither re-read, voted, nor released.
+        _cap_wait = []
+        try:
+            from sglang.srt.weg2 import park_l3 as _pl3f
+
+            _pl3f.issue_capacity_waiters(self, settle)
+            _cap_wait = [r for r in settle if _pl3f.capacity_waiting(r)]
+        except Exception as exc:  # noqa: BLE001 -- a failed issue leaves them waiting
+            logger.warning("#248f WAKE-READ capacity issue n/a (%s: %s)", type(exc).__name__, exc)
+        if _cap_wait:
+            _ids = {id(r) for r in _cap_wait}
+            settle = [r for r in settle if id(r) not in _ids]
+            if not settle:
+                return 0
         now = time.monotonic()
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         keep, release = [], []
@@ -5712,15 +6836,42 @@ class Scheduler(
         # weg2xsn296: the re-read is a collective -- verdict first (no side
         # effects), group MIN on "due", then re-issue the agreed set on every
         # rank in the same pass (see _weg2_hold_refetch).
-        _pre = []
-        for req in settle:
+        # P4b (28.09., rc12z17-s0 weg2-2-17/4-36/5-37): who can still fill a
+        # read seen short -- no writer: decide now, never another re-read; a
+        # writer at work: wait for its ack; the ack: re-read now, past the 2 s
+        # timer (weg2/settle_writer.py). Rank-local facts; every verdict built
+        # on them goes through the group MIN below.
+        from sglang.srt.weg2 import settle_writer as _sw_nw
+
+        _acts = [_weg2_settle_writer_action(self, req) for req in settle]
+        # P4b-fix (28.09.): the writer view is RANK-LOCAL -- a rank that never read the
+        # hand-off record before the wake removed it sees "none" while its peers see P's
+        # hand-off. "decide" must not veto the group's re-read then (it did: 0 in the due
+        # MIN stopped every re-read and the request sat the 20 s bound out). It is neutral
+        # (1) in the due vote and votes separately whether it has no writer; the group skips
+        # the re-read only when EVERY rank decides. One collective: [due..., decide...].
+        _pre, _dec = [], []
+        for req, _act in zip(settle, _acts):
+            if _act == "wait":
+                _pre.append(0)  # a writer at work: a re-read cannot see pages still being written
+                _dec.append(0)
+                continue
+            if _act == "decide":
+                _pre.append(1)  # neutral in the MIN: never vetoes a peer's re-read
+                _dec.append(1)
+                continue
+            _dec.append(0)
+            if _act == "reread":
+                req._1456_last = 0.0  # the ack is the clock, not the 2 s timer
             try:
                 _pre.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
             except Exception:  # noqa: BLE001
                 _pre.append(0)
         _gmin0 = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
-        _agreed_due = _gmin0(_pre)
-        for req, _ok in zip(settle, _agreed_due):
+        _votes = _gmin0(_pre + _dec)
+        _n = len(settle)
+        _agreed_due = [int(bool(d) and not a) for d, a in zip(_votes[:_n], _votes[_n:])]
+        for req, _ok, _act in zip(settle, _agreed_due, _acts):
             try:
                 state = _refetch(req, now, allow_reissue=bool(_ok))
                 if state == "due":
@@ -5729,18 +6880,97 @@ class Scheduler(
                 logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
                             type(exc).__name__, exc)
                 state = "complete"
+            # NW (30.09.): a re-read the budget refused has not spent the writer's ack
+            _sw_nw.keep_ack_if_unread(req, _act)
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
+            # P4b: no writer and no read in flight = decided now (the bound would
+            # release the same request "as it is" 20 s later).
+            # a re-read the group issued this tick is a read in flight, on this rank too
+            # NW: a read the budget refused has not run -- "no writer" is not proven;
+            # a read that came back whole is "complete", not a no-writer decision
+            _no_writer = (_act == "decide"
+                          and state not in ("reading", "reissued", "budget", "complete")
+                          and not _sw_nw.budget_pending(req))
+            if _no_writer:
+                state = "no-writer"
             # weg2rc2: a remainder within X is D's to prefill -- settled now, not at the bound.
             _local.append((req, state, lapsed,
-                           state == "complete" or lapsed or _weg2_store_tail_settles(self, req)))
+                           state == "complete" or lapsed or _no_writer
+                           or _weg2_store_tail_settles(self, req)))
         _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
-        _agreed = _gmin([x[3] for x in _local])  # #1471e
+        # L1 (28.09.): the post-wake cohort (weg2/wake_cohort.py) -- a ready member whose own
+        # extend is the 1.5-2.2 s expert pass waits (<= 1 s) while a sibling read of this settle
+        # is still in flight. Its vote rides the SAME MIN as the release flags; asked only when
+        # the replicated settle holds >= 2 (a wake of one never waits).
+        from sglang.srt.weg2 import wake_cohort as _wc
+
+        _flags = [x[3] for x in _local]
+        _cohort_hold = False
+        if _wc.asks(settle):
+            # L1b (28.09.): the cap bounds the HOLD, so its clock starts when the first member of
+            # this wake was ready on this rank, not at the wake -- from the wake it charged the
+            # ~1 s reads to the hold (rc12z29b 20:11-: holds=0 in all 11 wakes). Rank-local
+            # clock, it feeds the vote only.
+            _seq = getattr(self, "_weg2_wake_seq", None)
+            _ra = getattr(self, "_weg2_cohort_ready_at", None)
+            if any(_flags) and (_ra is None or _ra[0] != _seq):
+                _ra = (_seq, now)
+                self._weg2_cohort_ready_at = _ra
+            _since = _ra[1] if (_ra is not None and _ra[0] == _seq) else now
+            _records = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None)
+            try:
+                _hv = _wc.hold_vote([(x[0], x[1], x[3]) for x in _local], _since, now, records=_records)
+            except Exception as _exc:  # noqa: BLE001
+                # L1 (EG 28.09.): the vote is a hint -- a raise counts as RELEASE (0), so this rank
+                # still sends its flags into the MIN (no desync, no dead rank) and the group releases
+                _hv = 0
+                _said = getattr(self, "_weg2_cohort_vote_err_rids", None)
+                if _said is None:
+                    _said = self._weg2_cohort_vote_err_rids = set()
+                _new = [str(getattr(r, "rid", "?")) for r in settle if str(getattr(r, "rid", "?")) not in _said]
+                if _new:
+                    _said.update(_new)
+                    logger.warning("WEG2-WAKE-COHORT VOTE-ERROR rids=%s %s: %s -- voted release (0); the "
+                                   "group releases the ready members as without the cohort",
+                                   [r[:16] for r in _new], type(_exc).__name__, _exc)
+            _v = _gmin(_flags + [_hv])  # #1471e
+            _agreed, _cohort_hold = _v[:-1], bool(_v[-1]) and any(_v[:-1])
+        else:
+            _agreed = _gmin(_flags)  # #1471e
+        _ledger = getattr(self, "_weg2_wake_ledger", None)
+        if _ledger is not None:
+            _ledger.note_hold(now, _cohort_hold)
+        if _cohort_hold:
+            _n_ready = sum(1 for a in _agreed if a)
+            _agreed = [0] * len(_agreed)
+            if getattr(self, "_weg2_cohort_said", None) != getattr(self, "_weg2_wake_seq", None):
+                self._weg2_cohort_said = getattr(self, "_weg2_wake_seq", None)
+                logger.info("WEG2-WAKE-COHORT HOLD ready=%d parked=%d since_ready_ms=%.0f cap_ms=%.0f "
+                            "price_ms=%.0f (a sibling read is in flight; the ready members join its extend)",
+                            _n_ready, len(settle), (now - _since) * 1000.0, _wc.cap_s() * 1000.0,
+                            _wc.price_s() * 1000.0)
         for (req, state, lapsed, _r), ok in zip(_local, _agreed):
             if ok:
+                req._weg2_settled_wake = getattr(self, "_weg2_wake_seq", None)  # WT
                 release.append((req, state, lapsed))
             else:
                 keep.append(req)
-        self.weg2_post_wake_settle = keep
+        # D-NORECOMPUTE (user law 02.10.): a released SHORT read whose tail no
+        # agreed F4/E2 window adopts goes through RESUME-VIA-P, never to D's extend
+        try:
+            from sglang.srt.weg2 import d_norecompute as _dnr
+
+            if _dnr.enabled() and release:
+                _rel2 = []
+                for _r, _s, _l in release:
+                    _rem = _dnr.d_would_compute(_r)
+                    if _rem > 0 and _dnr.divert(self, _r, _rem):
+                        continue
+                    _rel2.append((_r, _s, _l))
+                release = _rel2
+        except Exception as exc:  # noqa: BLE001 -- the release stands, named
+            logger.warning("WEG2 D-NORECOMPUTE n/a (%s: %s) -- released as before", type(exc).__name__, exc)
+        self.weg2_post_wake_settle = keep + _cap_wait
         if release:
             try:  # #1461: back under the strict claim law
                 _cc = self.tree_cache.cache_controller
@@ -5749,7 +6979,15 @@ class Scheduler(
             except Exception:  # noqa: BLE001
                 pass
             self.waiting_queue.extend(r for r, _s, _l in release)
+            try:  # #248: a wake read that completed drops its hand-off keys
+                from sglang.srt.weg2 import park_l3 as _pl3
+
+                _pl3.after_release([r for r, _s, _l in release])
+            except Exception:  # noqa: BLE001
+                pass
             for _r, _s, _l in release:
+                if _s == "no-writer":
+                    _weg2_settle_no_writer_line(self, _r, now)
                 logger.info("#1471 SETTLE-RELEASE rid=%s state=%s lapsed=%s held_after_wake_s=%.1f",
                             str(_r.rid)[:12], _s, _l, now - float(getattr(_r, "_1471_since", now)))
         return len(release)
@@ -5759,10 +6997,22 @@ class Scheduler(
         the waiting queue in arrival order. Called by the resume handler
         AFTER flush_cache, so the idle witness saw an empty queue."""
         hold = getattr(self, "weg2_dormant_hold", None) or []
+        # WT: this wake's number (every rank runs this at the same resume)
+        self._weg2_wake_seq = int(getattr(self, "_weg2_wake_seq", 0) or 0) + 1
+        try:  # RW: this wake's settle is open (an empty settle = over, from now on)
+            from sglang.srt.layers.moe.expert_offload import resume_warm as _rw
+
+            _rw().open_settle()
+        except Exception:  # noqa: BLE001 -- a hint never breaks the wake
+            pass
         try:  # xsn329/330: the handed-over keys served the hold; the wake re-admits from the tree
             from sglang.srt.managers import cache_controller as _cc
             from sglang.srt.weg2 import handoff as _ho
             for _r in hold:
+                if getattr(_r, "_weg2_248_read_at_wake", False) or getattr(_r, "_weg2_248_read_issued", False):
+                    # #248: its read is issued now -- or, F22 WAKE-READ-EARLY, was issued at
+                    # the legs' start -- the keys serve it (park_l3.after_release)
+                    continue
                 _rid = getattr(_r, "rid", None)
                 _cc.WEG2_HANDOFF_PAGE_KEYS.pop(_rid, None)
                 _cc.WEG2_HANDOFF_OFF.pop(_rid, None)
@@ -5774,8 +7024,24 @@ class Scheduler(
                     pass
         except Exception:  # noqa: BLE001
             pass
+        try:  # PARK-WINDOW-GATE: a window of the last D phase never outlives the wake
+            from sglang.srt.weg2 import park_window_gate as _pwg
+
+            _pwg.clear(self, "wake")
+        except Exception:  # noqa: BLE001
+            pass
         if not hold:
             return 0
+        # #248: the held requests whose intake only looked them up are read
+        # NOW, in hold order on every rank (reference, pin, host tree); the
+        # verdicts below park them in the #1471 settle until complete.
+        try:
+            from sglang.srt.weg2 import park_l3 as _pl3
+
+            _pl3.note_hold_order(hold)  # #248e: the kept pages leave in hold order
+            _pl3.issue_deferred_reads(self, hold)
+        except Exception as exc:  # noqa: BLE001 -- a failed issue is a short read: the settle re-reads
+            logger.warning("#248 WAKE-READ n/a (%s: %s)", type(exc).__name__, exc)
         # #1471: ONLY A COMPLETE READ JOINS THE QUEUE AT THE WAKE.  weg2xsn229
         # (P --max-running-requests 2): the read issued at the hold ended
         # short (4095 of 98210), the refetch was issued, and the wake queued
@@ -5792,6 +7058,9 @@ class Scheduler(
         # from a rank-local timer; "due" parks the request (the settle tick
         # re-issues it group-uniformly).
         for _r in list(hold):
+            if getattr(_r, "_weg2_248f_capacity_wait", False):  # #248f: unread, parked
+                _states.append("capacity")
+                continue
             try:
                 _state = _refetch(_r, _now, allow_reissue=False)
                 if _state == "due":
@@ -5801,11 +7070,20 @@ class Scheduler(
                             str(getattr(_r, "rid", "?"))[:12], type(exc).__name__, exc)
                 _state = "complete"
             _states.append(_state)
+        try:  # L1 instrument: this wake's cohort, wake -> its last member's first decode
+            from sglang.srt.weg2 import wake_cohort as _wc
+
+            if getattr(self, "_weg2_wake_ledger", None) is None:
+                self._weg2_wake_ledger = _wc.WakeLedger()
+            self._weg2_wake_ledger.arm(self._weg2_wake_seq, [str(r.rid) for r in hold], _now)
+        except Exception:  # noqa: BLE001 -- an instrument never blocks the wake
+            pass
         _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
         # weg2rc2: a short read whose remainder fits in X is settled -- D
         # prefills the remainder (#1324 tail) instead of parking for 20 s.
         _tail = [_weg2_store_tail_settles(self, _r) for _r in list(hold)]
-        _agreed = _gmin([st == "complete" or t for st, t in zip(_states, _tail)])  # #1471e
+        _agreed = _gmin([(st == "complete" or t) and st != "capacity"
+                         for st, t in zip(_states, _tail)])  # #1471e, #248f
         for _r, ok, st, t in zip(list(hold), _agreed, _states, _tail):
             if ok and t and st != "complete":
                 logger.info("#1471 SETTLE-TAIL rid=%s delivered=%s remainder=%s -- released at the "
@@ -5814,9 +7092,17 @@ class Scheduler(
                             _weg2_store_short_remainder(_r))
         for _r, ok in zip(list(hold), _agreed):
             if ok:
+                _r._weg2_settled_wake = self._weg2_wake_seq  # WT
                 released.append(_r)
             else:
-                _r._1471_since = _now
+                try:  # NW (30.09.): this wake's writer view starts fresh (P may have written again)
+                    from sglang.srt.weg2 import settle_writer as _sw_nw
+
+                    # #287 NEED0 (b): a budget-refused read keeps its settle clock over wakes
+                    _r._1471_since = _sw_nw.settle_since_for_wake(_r, _now)
+                    _sw_nw.reset_for_wake(_r)
+                except Exception:  # noqa: BLE001
+                    _r._1471_since = _now
                 parked.append(_r)
         hold.clear()
         if parked:
@@ -5836,6 +7122,12 @@ class Scheduler(
         # the wake does not flush any more, so the requests join the queue
         # as they are -- their device load follows at scheduling.
         self.waiting_queue.extend(released)
+        try:  # #248: a wake read already complete drops its hand-off keys
+            from sglang.srt.weg2 import park_l3 as _pl3
+
+            _pl3.after_release(released)
+        except Exception:  # noqa: BLE001
+            pass
         n = len(released)
         logger.info("#1443 DORMANT-RELEASE %d held request(s) queued after the wake (prefetch ran during the flip -- #1455)", n)
         return n
@@ -6361,6 +7653,9 @@ class Scheduler(
         # have asked about an empty span and answered about nothing.
         _last_hash = last_host_node.get_last_hash_value()
         _matched_len = len(req.prefix_indices) + req.host_hit_length
+        # FA: from the host chain's END (its last hash), not from the sum that
+        # misses a state-less device node below it
+        _matched_len = _weg2_prefetch_span_start(self, req, _matched_len)
         # #1039 WHY THIS SPAN ENDS ONE PAGE SHORT OF A NODE'S OWN ANCHOR, AND WHY
         # THAT IS ACCEPTED RATHER THAN FIXED HERE.
         # `_compute_max_prefix_len` is input_len - 1 (schedule_batch.py:1715, an
@@ -6401,6 +7696,13 @@ class Scheduler(
         # extra pass after the wake). Pure function of the prompt ids and the
         # env: the same span on every rank. Group P keeps its span.
         _match_end = _weg2_fork_match_end(req, _match_end)
+        # PARK-RETAIN READ (weg2/d_park_read.py, SGLANG_WEG2_PARK_READ_CAP,
+        # default on): a flip-parked request reads back exactly what its park
+        # retained -- the KV above the mamba track point was freed, never
+        # written, and a read asking for it could only end short (27B weg2-2-5,
+        # NF weg2-1-13: 20 s settle each). Pure function of the ids and the
+        # retained key: the same span on every rank.
+        _match_end = _weg2_park_read.park_match_end(req, _match_end)
         _new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]
         # #1068 (spec A12.2): the request's OWN span, stamped rank-locally
         # before any verdict is taken, so the UNDEFERRABLE exit of the
@@ -6465,19 +7767,18 @@ class Scheduler(
                     current_generation as _current_generation,
                 )
 
-                _key = (
-                    int(_current_generation()),
+                # H108: asked with P's hand-off keys where they cover the
+                # span, and re-asked when that coverage changes.
+                store_present = _weg2_store_presence(
+                    self,
+                    req,
+                    _probe,
+                    _new_input_tokens,
+                    _last_hash,
+                    _prefix_keys,
                     _matched_len,
-                    len(_new_input_tokens),
+                    _current_generation(),
                 )
-                _cached = getattr(req, "_pp_store_presence_cache", None)
-                if _cached is not None and _cached[0] == _key:
-                    store_present = _cached[1]
-                else:
-                    store_present = bool(
-                        _probe(_new_input_tokens, _last_hash, _prefix_keys)
-                    )
-                    req._pp_store_presence_cache = (_key, store_present)
             # The verdict enters the EXISTING #580 vote as this rank's local
             # term. Never a new early return, never a new collective -- a
             # rank-local answer that skipped the vote is the #580 desync.
@@ -6517,6 +7818,7 @@ class Scheduler(
         # xsn328/329: read with P's handed-over page keys (#1442) -- D's own
         # hashes of the same prompt matched P's for the first 64 tokens only,
         # so the dormant hold's re-reads answered zero until the wake.
+        _weg2_hb_handoff = False  # HANDBACK: P's #1442 chain present for this rid
         try:
             if new_input_tokens and isinstance(req.rid, str) and req.rid.startswith("weg2-"):
                 from sglang.srt.managers import cache_controller as _cc
@@ -6530,6 +7832,11 @@ class Scheduler(
                 # reads the file (weg2_store_told, handoff_keys.adopt_pp0_decision);
                 # the tree's own reader is told so through WEG2_HANDOFF_OFF.
                 _hd = resolve_chain(req, _ho.read)
+                _weg2_hb_handoff = bool(_hd)
+                if _weg2_hb_handoff:  # ZR: a P hand-off comes back with 0 tokens computed again
+                    from sglang.srt.weg2.handback_claim import ORIGIN_HANDOFF, note_origin
+
+                    note_origin(req.rid, ORIGIN_HANDOFF)
                 if getattr(req, _HK_OFF, False):
                     _cc.WEG2_HANDOFF_OFF[req.rid] = True
                     while len(_cc.WEG2_HANDOFF_OFF) > 4096:
@@ -6557,7 +7864,25 @@ class Scheduler(
         # xsn437 STORE-SHORT TAIL: a read that completes an earlier short store
         # read may be smaller than the prefetch threshold ({} = unchanged call).
         _tail_min = _weg2_store_tail_min_tokens(req)
+        # PARK-RETAIN READ: the park's retained span is read even below the
+        # prefetch threshold (27B: 255 bigram pages -- the only copy of the
+        # anchor -- were revoked as "too few" on every re-read).
+        _park_min = _weg2_park_read.park_read_min_tokens(req)
+        if _park_min is not None:
+            _tail_min = _park_min if _tail_min is None else min(int(_tail_min), int(_park_min))
+        # TS (y4a death 03:36:24): a read bounded by a told is prescribed --
+        # the #915 threshold does not refuse it (follower need 64 < 256).
+        _tail_min = weg2_store_told.told_read_min_tokens(limit_tokens, _tail_min)
+        # HANDBACK (NF 12 boots: 33x '#915 PREFETCH REFUSED vote_negative
+        # need=64..255 keys=handoff', D prefilled P's pages again): a hand-off
+        # read is read whatever its length (weg2/handback_claim.py).
+        from sglang.srt.weg2.handback_claim import handback_min_tokens
+
+        _hb_min = handback_min_tokens(has_handoff=_weg2_hb_handoff)
+        if _hb_min is not None:
+            _tail_min = _hb_min if _tail_min is None else min(int(_tail_min), int(_hb_min))
         _tail_kw = {"min_tokens": _tail_min} if _tail_min is not None else {}
+        _tail_kw.update(_prefetch_namespace_kw(self.tree_cache, req))
         if group_decides:
             self.tree_cache.prefetch_from_storage(
                 req.rid,
@@ -6566,6 +7891,9 @@ class Scheduler(
                 last_hash,
                 prefix_keys,
                 locally_eligible=locally_eligible,
+                # HP1: the span's absolute start, so a Form A group votes ENDS
+                # (the rest of the tree ignores it off Form A).
+                span_base=int(_matched_len),
                 **_tail_kw,
             )
             # H99: on a Form A expert worker the span bookkeeping is the host's
@@ -6771,7 +8099,18 @@ class Scheduler(
             # line names the host-pool room the verdict was taken against.
             _population = getattr(req, "_969c_population", None)
             _available_before = self._host_pool_available_size()
-            if weg2_store_told.armed(self):
+            # #248: a request entering the dormant hold is LOOKED UP only --
+            # no store read, no arena reference, no pin over the flip (rc12s:
+            # 5213 of 5461 KV slots held by a sleeping D). Its read runs at
+            # the wake (``weg2.park_l3``).
+            _defer_248 = bool(
+                getattr(self, "weg2_dormant", False)
+                and _weg2_dormant_admit_armed()
+                and self._weg2_park_l3_defer_hold_read(req)
+            )
+            if _defer_248:
+                _pf_verdict = "deferred:248-read-at-wake"
+            elif weg2_store_told.armed(self):
                 # #1400: PP0 registers and holds; a follower holds and
                 # registers later with PP0's told span (module docstring).
                 from sglang.srt.mem_cache.match_refusal_census import (
@@ -6801,7 +8140,8 @@ class Scheduler(
             # (stamped residents AND re-issued occupants).
             # Grep: "#969C READMIT-PREFETCH".
             req._969c_verdict = _pf_verdict
-            self._apply_prefetch_deferral(req, _pf_verdict, site="intake")
+            if not _defer_248:
+                self._apply_prefetch_deferral(req, _pf_verdict, site="intake")
             try:
                 from sglang.srt.managers.phase_purity import (
                     SEAM_READMIT_ATTR as _SRA,
@@ -6937,6 +8277,8 @@ class Scheduler(
             recv_req.input_ids,
             self.chunked_prefill_size,
             dormant=bool(getattr(self, "weg2_dormant", False)),
+            start_hint=getattr(recv_req, "start_hint", -1),
+            page_size=int(getattr(self, "page_size", 1) or 1),
         )
 
     def readmit_seam_residents(
@@ -7631,14 +8973,17 @@ class Scheduler(
             f"that is not loading is refused BY NAME rather than served by "
             f"prefilling this group over its own --tp-prefill-max-tokens bound."
         )
+        # #249: which rank's pool set the group MIN of this rid's last trim
+        _cut_fn = getattr(getattr(self, "tree_cache", None), "prefetch_cut_terms", None)
+        cut = _cut_fn(rid) if callable(_cut_fn) else "min_rank=?"
         logger.error(
             "%s %s rid=%s arm=%s span=%s site=%s "
-            "no_progress_passes=%d bound_passes=%d witness=%s n=%d -- terminal, "
+            "no_progress_passes=%d bound_passes=%d witness=%s n=%d %s -- terminal, "
             "answered 503; never admitted over X (denominator: every deferred "
             "store read this exit answered)",
             code, name, rid[:16], arm, span, site, passes,
             self._weg2_prefetch_stall_passes(), terms,
-            self._weg2_store_load_failed,
+            self._weg2_store_load_failed, cut,
         )
         refused_id = id(req)
         self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
@@ -8058,6 +9403,12 @@ class Scheduler(
             )
             return "undeferrable"
         if not marked:
+            # rc12y: a store-short read that is marked afresh every pass (the
+            # retry's re-issue clears each mark as LANDED) never reaches the
+            # witness below; the bound counts those fresh marks instead.
+            _fallback = _weg2_store_short_fallback(self, req, reason, span, site)
+            if _fallback is not None:
+                return _fallback
             req.prefetch_deferred = reason
             req.prefetch_defer_attempts = 1
             req.prefetch_defer_passes = 0
@@ -8116,6 +9467,13 @@ class Scheduler(
                 _tail = _weg2_store_short_recompute(self, req, reason, span)
                 if _tail is not None:
                     return _tail
+                if reason == _DEFER_REASON_STORE_SHORT:
+                    # W88 CYCLE: a missing prefix is P's to fill, by name
+                    return _weg2_store_short_reroute(
+                        self, req, span=span, site=site, cause="standstill",
+                        detail="no_progress_passes=%d" % int(
+                            getattr(req, "_weg2_no_progress_passes", 0) or 0),
+                    )
                 return self._weg2_store_load_terminal(
                     req, arm=reason, span=span, site=site
                 )
@@ -8265,11 +9623,14 @@ class Scheduler(
             if reason is not None:
                 self._drop_prefetch_deferral(req, reason, site="retry")
                 continue
+            if not _hp1_group_retry_due(self, req):
+                continue
             verdict = self._prefetch_kvcache(req)
             req._969c_verdict = verdict
             self._apply_prefetch_deferral(req, verdict, site="retry")
             retried += 1
         return retried
+
 
     def _admission_held_for_deferred_prefetch(self, req) -> bool:
         """True when the admission loop must skip ``req`` this pass.
@@ -8665,7 +10026,7 @@ class Scheduler(
                 return
         except Exception:  # noqa: BLE001
             return
-        span = int(len(getattr(req, "prefix_indices", ()) or ()))
+        span = int(_len_or_zero(getattr(req, "prefix_indices", None)))
         rid = str(getattr(req, "rid", "?"))
         try:
             release_kv_cache(req, self.tree_cache, is_insert=True)
@@ -8711,11 +10072,37 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
                 self._pending_chunked_abort_delay = 0
             return
-        from sglang.srt.weg2.pp_abort import countdown_step
-        _apply, _left = countdown_step(getattr(self, "_pending_chunked_abort_delay", 0))
-        if not _apply:
-            self._pending_chunked_abort_delay = _left
-            return  # xsn324: this stage still launches this pass's chunk
+        from sglang.srt.weg2.pp_abort import countdown_step, follower_row_verdict
+        # #791C: a follower under the #631 row authority follows PP0's
+        # forwarded schedule of THIS pass (received before this plan), not a
+        # local pass count -- see weg2.pp_abort.follower_row_verdict.
+        try:
+            from sglang.srt.weg2 import p_row_authority as _prow_791c
+
+            _row_791c = follower_row_verdict(
+                getattr(self.ps, "pp_rank", 0),
+                _prow_791c.applies(self),
+                self._pp_scheduled_extents(),
+                req.rid,
+                pp0_drained=bool(getattr(self, "_791c_pp0_drained", False)),
+            )
+        except Exception:  # noqa: BLE001 - the verdict never blocks the old rule
+            _row_791c = None
+        if _row_791c is False:
+            return  # #791C: PP0's schedule still names this chunk (or no frame yet)
+        if _row_791c is None:
+            _apply, _left = countdown_step(getattr(self, "_pending_chunked_abort_delay", 0))
+            if not _apply:
+                self._pending_chunked_abort_delay = _left
+                return  # xsn324: this stage still launches this pass's chunk
+        else:
+            logger.info(
+                "WEG2-PP-CHUNKED-ABORT applied rid=%s pp_rank=%s: %s (#791C, row authority)",
+                req.rid, getattr(self.ps, "pp_rank", 0),
+                "PP0 voted idle in a #1268 lap (liveness release)"
+                if getattr(self, "_791c_pp0_drained", False)
+                else "PP0's forwarded schedule no longer names it",
+            )
 
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
@@ -8783,8 +10170,11 @@ class Scheduler(
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
-    def _update_uniform_pool_budget(self) -> None:
+    def _update_uniform_pool_budget(self, running_batch=None) -> None:
         """MIN-reduce this iteration's pool headroom across the TP group.
+
+        ``running_batch``: the pass's running batch after the prefill merge
+        (W-SEAT, see ``_local_admit_limit``); None reads ``self.running_batch``.
 
         The rank-uniform counterpart to ``token_to_kv_pool_allocator.
         available_size()``, which under uneven DCP/TP differs per rank
@@ -8924,6 +10314,15 @@ class Scheduler(
             # path. The host and mamba floors are a different axis and keep
             # their None; only the evict floor is being made total here.
             self._publish_uniform_evict_floor(local_avail)
+            # SF (b23 #1004): on pp > 1 this "group min" is THIS rank's own
+            # value and the ranks that must agree are not in the group; the
+            # load-back reads the mark and loads in the same pass instead of
+            # retrying next pass (weg2/pp_slot_fidelity.py). Switch off: no mark.
+            from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+            _sf.mark_floor_scope(getattr(self, "tree_cache", None), _sf.pp_size_of(self) > 1)
+            if _sf.pp_size_of(self) > 1:
+                _sf.ensure_relief_provider(self)  # SF-X: the rank-local extend net
             self._publish_uniform_host_floor(None)
             self._publish_uniform_mamba_floor(None)
             # #791b: one rank -- nothing to diverge from, ballot off, the
@@ -9095,7 +10494,7 @@ class Scheduler(
         # derived from the uniform avail would still diverge.
         _limit_at = len(vals)
         vals = vals + tp_head_congruence.build_admit_limit_payload(
-            self._local_admit_limit()
+            self._local_admit_limit(running_batch)
         )
         # #1203 (family A1): THE SEAM-TRANSPORT PREMISE rides this reduce too,
         # as ONE AND-slot, and it is placed HERE for the reason the corridor
@@ -9560,8 +10959,9 @@ class Scheduler(
                         str(rid)[:16], exc, self._head_vote_unpriced,
                     )
                 continue
-            matches[rid] = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+            matches[rid] = _head_vote_len(req)
         return canonical, matches
+
 
     def _tp_head_enforcer_gate(self) -> tp_head_congruence.GateVerdict:
         """#823 W9: is the group's batch-formation decision in force, and WHY.
@@ -9657,6 +11057,7 @@ class Scheduler(
         self,
         running_bs: int,
         head_inputs: Optional[tp_head_congruence.UniformHeadInputs],
+        slot_held: int = 0,
     ) -> int:
         """#823 W9 COUNT arm: how many of the head this rank may admit.
 
@@ -9680,7 +11081,11 @@ class Scheduler(
         accounting event per pass, matching the order arm, rather than one
         per queued request.
         """
-        local = self.get_num_allocatable_reqs(running_bs)
+        local = (
+            self.get_num_allocatable_reqs(running_bs, slot_held)
+            if slot_held
+            else self.get_num_allocatable_reqs(running_bs)
+        )
         gate = self._tp_head_enforcer_gate()
         limit, source = tp_head_congruence.admit_limit_decision(
             local,
@@ -9862,7 +11267,7 @@ class Scheduler(
             tp_head_congruence.degradation_is_a_defect(gate.enabled, source),
         )
 
-    def _local_admit_limit(self) -> Optional[int]:
+    def _local_admit_limit(self, running=None) -> Optional[int]:
         """#823 W9: this rank's vote for HOW MANY of the head may be admitted.
 
         Its own slot rather than a derivation from the availability floor,
@@ -9870,13 +11275,55 @@ class Scheduler(
         ``admission_limiter.current`` -- rank-local floating state the
         availability reduce does not capture. ``None`` means "no opinion" and
         rides as the sentinel, leaving every rank's local limit untouched.
+
+        W-SEAT (29.09., z30x2 base 11:48:10Z): ``running`` is THE PASS'S
+        running batch, handed in by ``get_next_batch_to_run``. Its merge
+        rebinds the LOCAL ``running_batch`` to the just-finished extend batch
+        when the running batch was empty (``running_batch = last_batch``);
+        ``self.running_batch`` still names the old empty batch until the
+        event loop stores the plan. Read from ``self`` the vote counted 0
+        running while the admission loop counted 1, and the COUNT arm takes
+        the group vote as the limit (``admit_limit_decision``): a D phase of
+        n=2 seats admitted two more beside the merged one and died on
+        ``Weg2DSeatOverrun`` (a batch of 3).
         """
         try:
-            running = getattr(self, "running_batch", None)
+            if running is None:
+                running = getattr(self, "running_batch", None)
             running_bs = len(running.reqs) if running is not None else 0
+            held = self._chunk_rest_slot_held(running)
+            if held:
+                return int(self.get_num_allocatable_reqs(running_bs, held))
             return int(self.get_num_allocatable_reqs(running_bs))
         except Exception:  # noqa: BLE001 - a vote may never break the reduce
             return None
+
+    def _chunk_rest_slot_held(self, running) -> int:
+        """CHUNK-REST: 1 when this pass's chunked continuation already holds
+        its request slot outside the running batch (it enters can_run_list
+        through ``add_chunked_req``), else 0 -- the vote's copy of the count
+        arm's ``slot_held``. Single-stage groups only: under PP a seam refusal
+        can keep the continuation out of the list, and a vote that gave its
+        slot back would then over-admit; there the vote stays the lower
+        number and the MIN keeps the group at it. Rank-uniform: the chunked
+        continuation is the same request on every rank."""
+        if getattr(getattr(self, "ps", None), "pp_size", 1) != 1:
+            return 0
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is None or getattr(chunked, "req_pool_idx", None) is None:
+            return 0
+        reqs = getattr(running, "reqs", None) or ()
+        return 0 if any(r is chunked for r in reqs) else 1
+
+    @staticmethod
+    def _carried_slot_held(can_run_list, multi_anchor_tails: bool) -> int:
+        """CHUNK-REST, count arm: the members already in can_run_list at the
+        top of the queue loop that hold their request slot (the chunked
+        continuation). 0 with anchor tails armed: ``_carried_n`` already
+        takes every carried member out of the count there."""
+        if multi_anchor_tails:
+            return 0
+        return sum(1 for r in can_run_list if getattr(r, "req_pool_idx", None) is not None)
 
     def _publish_uniform_evict_floor(
         self, min_avail: Optional[int], max_avail: Optional[int] = None
@@ -9924,6 +11371,12 @@ class Scheduler(
         tree = getattr(self, "tree_cache", None)
         if tree is None:
             return
+        # SF (b23 #1004): a floor published here is a GROUP value (or None);
+        # the single-rank path re-marks it as local right after this call
+        # (weg2/pp_slot_fidelity.py). Switch off: nothing is written.
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.mark_floor_scope(tree, False)
         # #1045 OPTION A: THE FLOOR IS PUBLISHED UNCONDITIONALLY ON A GROUP.
         #
         # It used to stay None whenever the pools happened to AGREE this
@@ -10507,6 +11960,7 @@ class Scheduler(
         self.process_pending_weg2_park()  # Punkt 2 (18.09.)
         if getattr(self, "weg2_d_parked", None):
             self._weg2_d_park_tick()  # H91b
+        _weg2_resume_warm_tick(self)  # RW: experts of the resumes, after the legs, never waited for
         if getattr(self, "weg2_post_wake_settle", None):
             self._weg2_post_wake_settle_tick()  # #1471
 
@@ -10522,6 +11976,17 @@ class Scheduler(
         # ack count across the TP group.
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
+        # D-MEM-SCHED: the KV stage between wakes, after the acks above (an
+        # ended request's pages go only once backed); rank-symmetric like them
+        # D-SEAT-REWAKE: the phase's seat count n follows the waiting requests
+        # (grow at once) and the free seats (shrink past the measured re-plan
+        # price); only when it did not move does the D-MEM-SCHED stage tick
+        # run -- one live re-plan per iteration, rank-symmetric (both verdicts
+        # are replicated)
+        # D-TRANSIENT-LEND: extend work pending -> the lent rows go back
+        # first, before the stage tick and the #794 width vote read the card
+        _weg2_d_transient_lend.round_start(self)
+        _weg2_d_seat_rewake.round_boundary(self)
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
@@ -10778,7 +12243,9 @@ class Scheduler(
         # Unconditional and pre-branch, like the call above: every rank
         # reaches this line exactly once per iteration, so the collective
         # count stays rank-uniform no matter which branch is taken later.
-        self._update_uniform_pool_budget()
+        # W-SEAT: the COUNT vote reads THIS pass's running batch -- the merge
+        # above may have rebound it away from `self.running_batch`.
+        self._update_uniform_pool_budget(running_batch)
 
         # #583 collective census. Same placement argument as the reduce above:
         # every rank reaches this line exactly once per iteration, so the
@@ -11155,6 +12622,7 @@ class Scheduler(
             # set, are enumerated in `prefill_blocked_here`'s docstring rather
             # than papered over here.
             new_batch = None
+            self._admission_decline_note = "gate=phase_prefill_blocked"  # BA: named, not stale
         elif (
             self.congruent_prefill_lane is not None
             and not self.congruent_prefill_lane.allow_prefill(
@@ -11173,6 +12641,12 @@ class Scheduler(
             # argument the spill tick makes; a rank-local input here would
             # split the ranks across mismatched collective counts.
             new_batch = None
+            self._admission_decline_note = "gate=congruent_lane_cadence"  # BA
+        elif _weg2_skip_first.hold_prefill_after_skip(last_batch, running_batch):
+            # E2 in a mixed wake cohort: the skip batch's tokens go out with
+            # this decode round before the next extend (rank-uniform)
+            new_batch = None
+            self._admission_decline_note = "gate=weg2_skip_first_decode"
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -11325,10 +12799,48 @@ class Scheduler(
             # nothing left to compare.
 
         self._note_round_build_outcome(ret, running_batch)
+        # D-TRANSIENT-LEND: the booked transient is expert rows between two
+        # extends -- returned here before an extend runs, lent after SETTLE
+        # decode rounds; the verdict is the batch's kind (rank-symmetric)
+        _weg2_d_transient_lend.on_batch(self, ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
 
-    def get_num_allocatable_reqs(self, running_bs):
+    def _weg2_note_lost_anchors(self) -> None:
+        """ANCHOR-LOST: the Mamba anchors this flush's reset drops (device
+        only, no host copy -- a write-through the pin budget or the arena
+        claim refused, '#1421 BACKUP-REFUSED why=mamba_pin|mamba_claim').
+        Kept in ``_weg2_anchors_lost`` until the sleep leg's answer carries
+        them to the front, which then stops crediting presence at those
+        depths (weg2/front.py ``SpanLRU.retract_lost_anchors``)."""
+        probe = getattr(self.tree_cache, "weg2_unbacked_anchors", None)
+        if probe is None:
+            return
+        try:
+            lost = probe()
+        except Exception as exc:  # noqa: BLE001 - an instrument never blocks a flush
+            logger.warning("WEG2-ANCHOR-LOST probe raised: %s: %s", type(exc).__name__, exc)
+            return
+        if not lost:
+            return
+        ledger = getattr(self, "_weg2_anchors_lost", None)
+        if ledger is None:
+            ledger = self._weg2_anchors_lost = []
+        ledger.extend(int(d) for d, _rid in lost)
+        logger.warning(
+            "WEG2-ANCHOR-LOST at=flush n=%d depths=%s rids=%s (device Mamba anchors without "
+            "a host copy; the reset drops them and the front retracts presence credit at "
+            "these depths)",
+            len(lost), [d for d, _ in lost][:16], [r for _, r in lost][:16],
+        )
+
+    def weg2_take_anchors_lost(self) -> List[int]:
+        """The depths noted since the last sleep answer, cleared on read."""
+        lost = sorted(set(getattr(self, "_weg2_anchors_lost", None) or ()))
+        self._weg2_anchors_lost = []
+        return lost
+
+    def get_num_allocatable_reqs(self, running_bs, slot_held: int = 0):
         # #287: the floating admission limit joins the existing bounds as one
         # more min(). Without --max-running-requests-ceiling the limiter holds
         # the same max_running_requests that pp_max_micro_batch_size was
@@ -11353,7 +12865,13 @@ class Scheduler(
         # default path below is the pre-change expression unchanged.
         parked = self._parked_carrier_discount(running_bs)
         res = limit - max(0, running_bs - parked)
-        res = min(res, self.req_to_token_pool.available_size())
+        # CHUNK-REST (postflip-admit, 28.09.): a candidate that already HOLDS
+        # its request slot -- the chunked continuation -- is counted by the
+        # caller as a can_run_list member AND is missing from
+        # available_size(); ``slot_held`` gives the slot back once, so six
+        # seats carry six requests (bridge 19:51:39: 4 running + weg2-16-53's
+        # rest -> available 1, list 1 -> 'batch_full_break' for weg2-16-54).
+        res = min(res, self.req_to_token_pool.available_size() + max(0, int(slot_held)))
         # THE SECOND BOUND EXISTS BECAUSE THE FIRST ONE STOPPED BINDING.
         # available_size() above is the REQUEST-slot count -- HybridReqToToken
         # Pool does not override it -- so nothing in this expression has ever
@@ -11390,6 +12908,11 @@ class Scheduler(
         when profiling raises at init), so a None must fall back to the
         static size rather than be handed on as a chunk width.
         """
+        # SF (b23 #1004): the budget plan is this pass's only -- cleared here,
+        # noted by _p_chunk_policy_width, consumed by the adder's move hook.
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.clear_budget(self)
         # --p-layer-split dynamic: on PP0 the joint plan (chunk widths AND
         # per-chunk cut) owns the width; downstream ranks run PP0's #791
         # extents anyway. 0 -> the paths below.
@@ -11420,20 +12943,18 @@ class Scheduler(
         """--p-layer-split dynamic, PP0: this forward's width from the joint
         chunk+cut plan (``LeaderCursor.next_width``), for the same request
         ``_p_chunk_policy_width`` would size. 0 on any failure (static path)."""
-        req = self.chunked_req
-        if req is None:
-            queue = getattr(self, "waiting_queue", None) or []
-            if not queue:
-                return 0
-            req = queue[0]
+        # Fix A (27.09., P group death 08:14:59Z): the position is rank-identical
+        # -- chunked request: its prefix; queued head: its published told or 0,
+        # never its local registration match (weg2/p_budget_head.py).
+        from sglang.srt.weg2 import p_budget_head as _pbh
+
         try:
-            fill = getattr(req, "full_untruncated_fill_ids", None)
-            end = len(fill) if fill is not None and len(fill) else (
-                len(req.origin_input_ids) + len(getattr(req, "output_ids", ()) or ())
-            )
-            prefix = getattr(req, "prefix_indices", None)
-            pos = 0 if prefix is None else len(prefix)
+            head = _pbh.budget_head(self)
+            if head is None:
+                return 0
+            req, pos, end = head.req, head.pos, head.end
             width = rt.leader_width(req.rid, pos, end)
+            _pbh.note_new_head(self, head, width, "layer_split")
         except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
             n = getattr(self, "_p_layer_split_errors", 0) + 1
             self._p_layer_split_errors = n
@@ -11457,21 +12978,19 @@ class Scheduler(
         policy IS the plan's ceiling (the launcher prices the corridor at it).
         Any failure returns 0: the caller then takes the static path.
         """
+        from sglang.srt.weg2 import p_budget_head as _pbh
         from sglang.srt.weg2.p_chunk_policy import forward_budget
 
         queue = getattr(self, "waiting_queue", None) or []
-        req = self.chunked_req
-        if req is None:
-            if not queue:
-                return 0
-            req = queue[0]
         try:
-            fill = getattr(req, "full_untruncated_fill_ids", None)
-            end = len(fill) if fill is not None and len(fill) else (
-                len(req.origin_input_ids) + len(getattr(req, "output_ids", ()) or ())
-            )
-            prefix = getattr(req, "prefix_indices", None)
-            pos = 0 if prefix is None else len(prefix)
+            # Fix A (27.09., P group death 08:14:59Z): rank-identical position --
+            # chunked request: its prefix; queued head: its published told or 0
+            # (weg2/p_budget_head.py). The pre-fix len(prefix_indices) of a queued
+            # head was rank-local (a TW twin's registration match lives on PP0 only).
+            head = _pbh.budget_head(self)
+            if head is None:
+                return 0
+            req, pos, end = head.req, head.pos, head.end
             if getattr(self, "_p_chunk_stream", False):
                 # H92 (NF): plan the stream -- the head's rest plus every
                 # waiting request's rest -- and take its first width as this
@@ -11479,7 +12998,9 @@ class Scheduler(
                 from sglang.srt.weg2.p_chunk_nf import stream_end
 
                 end = stream_end(pos, end, (r for r in queue if r is not req))
-            width = forward_budget(self._p_chunk_planner, req.rid, pos, end)
+            width = forward_budget(self._p_chunk_planner, req.rid, pos, end,
+                                   queued=head.src != "chunked")
+            _pbh.note_new_head(self, head, width, "chunk_policy")
         except Exception as exc:  # noqa: BLE001 - a plan must never stop a pass
             n = getattr(self, "_p_chunk_policy_errors", 0) + 1
             self._p_chunk_policy_errors = n
@@ -11491,7 +13012,13 @@ class Scheduler(
                 )
             return 0
         cap = int(self.chunked_prefill_size or 0)
-        return min(int(width), cap) if cap > 0 else int(width)
+        out = min(int(width), cap) if cap > 0 else int(width)
+        # SF (b23 #1004): remember where this budget was planned, so a #988
+        # prefix move to another start replans (weg2/pp_slot_fidelity.py).
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.note_budget(self, head, out)
+        return out
 
     def _log_dynamic_chunk_engagement(self, dynamic_size: int, history_len: int):
         """ENGAGEMENT PROOF for the dynamic-chunking arm, at INFO.
@@ -11648,7 +13175,7 @@ class Scheduler(
             # awake overshoot is charged to its budget, so #656 has no reason
             # to narrow). Any mismatch that still reaches the ring is refused
             # by name in model_runner (PPWidthDivergenceRefused), never run.
-            if not pp_row_carrier_present(self):
+            if not pp_row_carrier_present(self, term="corridor"):
                 _n = getattr(self, "_corridor_width_disarmed_calls", 0) + 1
                 self._corridor_width_disarmed_calls = _n
                 if _n == 1 or _n % 500 == 0:
@@ -11832,6 +13359,7 @@ class Scheduler(
             # value never reaches a verdict on a multi-rank boot. Solo boots
             # (tp_size == 1) price locally, which is replicated by
             # construction there.
+            self._weg2_x_terms = (total, None, None, None)
             return max(0, (total - len(req.prefix_indices)) - host_hit)
         gm = int(group_match)
         if gm > total:
@@ -11922,6 +13450,50 @@ class Scheduler(
                     int(gsm) - gm, total, max(0, total - gm),
                     max(0, total - priced_match), n,
                 )
+        # #1424d: the group's USABLE match (the RU/H98 floor, planted for
+        # this plan call from the same packed reduce) is the depth every rank
+        # actually admits -- a proof cut or a zeroed anchor lies below the
+        # head term. The extent D would prefill is priced from the floor, so
+        # a cut whose rest exceeds X is refused by name (W50 -> X-REQUEUE /
+        # RESUME-VIA-P over P) instead of being prefilled on D over X.
+        floor = tp_match_floor.group_usable_for(
+            self.tree_cache, str(getattr(req, "rid", "") or "")
+        )
+        if floor is not None and floor < priced_match:
+            self._weg2_x_floor_priced = getattr(self, "_weg2_x_floor_priced", 0) + 1
+            n = self._weg2_x_floor_priced
+            if n <= 16 or n % 64 == 0:
+                logger.info(
+                    "#1424d X-PRICE-FLOOR rid=%s head=%d floor=%d uncached=%d n=%d (the group "
+                    "admits the usable floor, so the extent is priced from it)",
+                    str(getattr(req, "rid", "?"))[:16], priced_match, floor,
+                    max(0, total - floor), n,
+                )
+            priced_match = floor
+        elif floor is not None and floor > priced_match and _weg2_x_floor_credit_on():
+            # H98x (30.09., NF y4b D 03:50:21, weg2-14-27): on a Form A group the
+            # usable floor is the depth every rank ADMITS -- the host votes its
+            # admission match (H105b), a worker its KV reach, and admission
+            # takes every rank there (group_floor_cap / RU FORM-A FOLLOW). The
+            # head arm is no such depth there: a worker's own walk is refused by
+            # the mamba bytes it does not hold (#904 MambaComponent:absent) and
+            # votes 0, so the head MIN was 0 and W31 priced the whole prompt
+            # (head=0 store=0 floor=109440, 110438 tokens) -- W50, and P
+            # re-prefilled a prefix resident on D. Credit the floor: the extent
+            # D prefills is total - floor, a replicated term of the same reduce.
+            self._weg2_x_floor_credited = getattr(self, "_weg2_x_floor_credited", 0) + 1
+            n = self._weg2_x_floor_credited
+            if n <= 16 or n % 64 == 0:
+                logger.info(
+                    "H98x X-FLOOR-CREDIT rid=%s head=%d store=%s floor=%d total=%d "
+                    "uncached=%d n=%d (Form A: the group admits the usable floor; "
+                    "the head arm is a worker's mamba-refused walk, not a depth)",
+                    str(getattr(req, "rid", "?"))[:16], gm,
+                    "-" if gsm is None else int(gsm), floor, total,
+                    max(0, total - floor), n,
+                )
+            priced_match = floor
+        self._weg2_x_terms = (total, gm, None if gsm is None else int(gsm), floor)
         return max(0, total - priced_match)
 
     def _weg2_host_carry_tokens(self) -> int:
@@ -12102,7 +13674,10 @@ class Scheduler(
                 if cached is not None and cached[0] == key:
                     pages = int(cached[1])
                 else:
-                    pages = int(probe(span, last_hash, prefix_keys) or 0)
+                    # Q-460 SALT-ISOLATION: the request's namespace
+                    _ek = getattr(req, "extra_key", None)
+                    _ns = {"extra_key": _ek} if _ek is not None else {}
+                    pages = int(probe(span, last_hash, prefix_keys, **_ns) or 0)
                     req._weg2_store_match_cache = (key, pages)
                 # The probe counts PAGES; the arm votes TOKENS, because the
                 # extent it prices is a token count. Clamped to the span so a
@@ -12386,7 +13961,16 @@ class Scheduler(
         # is group-agreed; absent a mark the read is simply still in flight.
         _defer_reason = getattr(req, "prefetch_deferred", None) or "prefetch_pending"
         if verdict == tp_head_congruence.X_DEFER:
-            if n <= 5 or n % 200 == 0:
+            # BA (28.09.): the global count hid every rid after the fifth pass --
+            # NF 14:56:27-31 showed weg2-4-11 only while weg2-10-16/11-18 waited
+            # unnamed. The first defer of each rid speaks too.
+            _first = not getattr(req, "_weg2_x_defer_said", False)
+            if _first:
+                try:
+                    req._weg2_x_defer_said = True
+                except Exception:  # noqa: BLE001
+                    pass
+            if n <= 5 or n % 200 == 0 or _first:
                 logger.info(
                     "WEG2 X-DEFER rid=%s reason=%s age_s=%.2f "
                     "bound_s=%.2f replicated_term=group verdict=defer "
@@ -12492,6 +14076,29 @@ class Scheduler(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
             str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
         )
+        if verdict == "admit":
+            _weg2_rvp.clear_capacity_park(req)  # #248h: its re-read landed
+        if verdict == "W31":
+            # #1471b (z30m 03:19-03:22, weg2-116-141): three W31s priced the
+            # WHOLE prompt right after every rank had read 28096/4352/36800 of
+            # it, and the lines that name the term that did it were all past
+            # their throttles. Every W31 now names its terms (group head,
+            # store arm, usable floor) and THIS rank's own usable vote with
+            # its reason -- the MIN's zero is on the rank whose line says 0.
+            from sglang.srt.managers import tp_match_floor as _tmf
+
+            _t = getattr(self, "_weg2_x_terms", None) or (None, None, None, None)
+            _v = _tmf.vote_reason(str(getattr(req, "rid", "") or ""))
+            logger.warning(
+                "WEG2 X-GATE-TERMS rid=%s total=%s head=%s store=%s floor=%s "
+                "uncached=%d my_vote=%s my_raw=%s why=%s (W31: the group priced "
+                "total - min(max(head, store), floor); this rank's usable vote "
+                "entered that floor's MIN)",
+                str(getattr(req, "rid", "?"))[:16], _t[0], _t[1], _t[2], _t[3],
+                uncached,
+                None if _v is None else _v[1], None if _v is None else _v[0],
+                None if _v is None else _v[2],
+            )
         return verdict == "W31"
 
     def _weg2_answer_x_refusals(self, refused: List[Req], head_inputs=None) -> None:
@@ -12505,8 +14112,40 @@ class Scheduler(
         x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
         refused_ids = {id(r) for r in refused}
         self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
-        for req in refused:
+        # #248h (30.09., NF y4b weg2-32-72): a refusal that follows a store read
+        # cut short by D's own capacity, while the store holds the context, is
+        # parked on D for a re-read -- one group verdict (the list is the
+        # group's; the local terms are MIN-reduced like every park release).
+        _cap_park = [False] * len(refused)
+        if any(_weg2_rvp.capacity_park_precondition(r) for r in refused):  # replicated terms
+            _cap_local = [_weg2_rvp.capacity_park_candidate(r, x, sched=self) for r in refused]
+            _cap_park = [bool(f) for f in self._weg2_group_min_flags(_cap_local)]
+        for _i, req in enumerate(refused):
             uncached = self.weg2_uncached_extent(req, head_inputs)
+            if _cap_park[_i]:
+                _tc = getattr(self, "tree_cache", None)
+                if _tc is not None:
+                    release_admission_acquired_mamba_slot(req, _tc, site="weg2_x_refusal_cappark")
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                elif self.enable_hierarchical_cache:
+                    self.tree_cache.terminate_prefetch(req.rid)
+                _weg2_rvp.park_for_capacity(self, req, uncached, x)
+                continue
+            # RESUME-VIA-P (weg2/resume_via_p.py): a STREAMED request that has
+            # generated tokens is not aborted -- its client holds text, the
+            # front cannot re-route it. D keeps it parked, P prefills its
+            # context, D continues the same stream after the flip back.
+            if _weg2_rvp.eligible(req, sched=self):  # KRIT3: attempts per D wake
+                _tc = getattr(self, "tree_cache", None)
+                if _tc is not None:
+                    release_admission_acquired_mamba_slot(req, _tc, site="weg2_x_refusal_rvp")
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                elif self.enable_hierarchical_cache:
+                    self.tree_cache.terminate_prefetch(req.rid)
+                _weg2_rvp.keep_on_d(self, req, uncached, x)
+                continue
             message = (
                 f"W50 Weg2TpPrefillExceeded: this group may prefill at most {x} uncached "
                 f"tokens itself (--tp-prefill-max-tokens); this request's extent after "
@@ -12565,11 +14204,20 @@ class Scheduler(
             return None
         return len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0)
 
-    def _weg2_vision_d_verdict(self, req: Req, head_inputs=None) -> str:
+    def _weg2_vision_d_verdict(self, req: Req, head_inputs=None, batch_empty: bool = True) -> str:
         """WEG2 VISION (D side): admit / defer / refuse one request. A rid
         the group has no covered length for is DEFERRED -- never admitted on
         this rank's own number (an admitted image position is a dead group)
-        and never refused on it."""
+        and never refused on it.
+
+        W123 (V2 dfce479f08, weg2-2-14): the covered prefix is the page
+        anchor (1024), but an image ending in the partial last page
+        (4..1027) is covered by P's adopted TAIL, which the admission takes
+        only AFTER this verdict. The group-agreed tail is read here (not
+        taken) and the image is admitted when it ends before the first
+        position the target computes; ``req._weg2_vision_need`` hands that
+        bound to the admission, which re-checks it after ``plan_adopt``."""
+        from sglang.srt.weg2 import tail_adopt as _ta
         from sglang.srt.weg2 import vision_d_guard as _vdg
 
         if not _vdg.image_spans(req):
@@ -12577,8 +14225,18 @@ class Scheduler(
         defers = getattr(self, "_weg2_vision_d_defers", None)
         if defers is None:
             defers = self._weg2_vision_d_defers = {}
+        if getattr(req, "_weg2_vision_tail_lost", False):
+            # the admission found the tail no longer takeable (belt below)
+            return _vdg.bounded(_vdg.REFUSE, str(req.rid), defers)
+        req._weg2_vision_need = _vdg.image_end(req)
+        covered = self._weg2_vision_d_covered(req, head_inputs)
+        # the admission's plan_adopt reads the prefix AFTER the load-back,
+        # i.e. the covered length -- peek with the same number
+        tail_start, tail_wait = (None, False) if covered is None else _ta.peek_target_start(
+            req, int(covered), batch_empty=batch_empty
+        )
         return _vdg.bounded(
-            _vdg.verdict(req, self._weg2_vision_d_covered(req, head_inputs)),
+            _vdg.verdict(req, covered, tail_start=tail_start, tail_wait=tail_wait),
             str(req.rid),
             defers,
         )
@@ -12593,8 +14251,35 @@ class Scheduler(
         self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
         for req in refused:
             covered = self._weg2_vision_d_covered(req, head_inputs)
-            message = _vdg.refusal_message(req, covered)
-            logger.error("%s rid=%s covered=%s", _vdg.W_NOT_IN_PREFIX, req.rid, covered)
+            if not _vdg.reroute_eligible(req) and _weg2_rvp.eligible(req, sched=self, vision=True):
+                # VISION after the first byte: D keeps the stream parked, the
+                # front's P leg sends the ORIGINAL request (image included, P has
+                # the tower), D resumes once P's pages cover the image and
+                # prefills only the streamed output tail itself. Bounded by
+                # RESUME-VIA-P's attempts; the drain skips it (_rvp_inflight).
+                _tc = getattr(self, "tree_cache", None)
+                if _tc is not None:
+                    release_admission_acquired_mamba_slot(req, _tc, site="weg2_vision_rvp")
+                if self.enable_hicache_storage:
+                    self.tree_cache.release_aborted_request(req.rid)
+                elif self.enable_hierarchical_cache:
+                    self.tree_cache.terminate_prefetch(req.rid)
+                _fill = getattr(req, "full_untruncated_fill_ids", None)
+                _weg2_rvp.keep_on_d(
+                    self, req, max(0, (0 if _fill is None else len(_fill)) - int(covered or 0)),
+                    int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0),
+                    reason=_weg2_rvp.REASON_VISION)
+                continue
+            if _vdg.reroute_eligible(req):
+                # (B) NF rc12z10 weg2-2-12: nothing streamed yet -> back through P
+                # with the original request (image included), W123 named inside.
+                message = _vdg.reroute_message(req, covered)
+                logger.warning("%s rid=%s covered=%s -> W50 reroute through P (nothing "
+                               "streamed yet; the front's X-REQUEUE bound ends it by name)",
+                               _vdg.W_NOT_IN_PREFIX, req.rid, covered)
+            else:
+                message = _vdg.refusal_message(req, covered)
+                logger.error("%s rid=%s covered=%s", _vdg.W_NOT_IN_PREFIX, req.rid, covered)
             _tc = getattr(self, "tree_cache", None)
             if _tc is not None:
                 release_admission_acquired_mamba_slot(req, _tc, site="weg2_vision_d_refusal")
@@ -12646,6 +14331,10 @@ class Scheduler(
             from sglang.srt.weg2.vision_rank_runner import vision_rank_pass
 
             _vision_parked = vision_rank_pass(self)
+        elif getattr(self, "_weg2_vision_follower_gate", False):
+            from sglang.srt.weg2.vision_verdict import follower_pass
+
+            _vision_parked = follower_pass(self)
         try:
             try:
                 ret, running_batch = self._get_new_batch_prefill_raw(
@@ -13396,6 +15085,10 @@ class Scheduler(
         rid = str(getattr(req, "rid", "") or "")
         if not rid:
             return None
+        if getattr(req, "_weg2_store_short_fallback", False):
+            # rc12y: released by the bound (PREFETCH-DEFER-FALLBACK) -- the
+            # short record stays, and must not raise a fresh mark every pass.
+            return None
         # #1400: a PP (prefill) group is the PRODUCER of what the store lacks.
         # A read that terminated short of the span it asked for is a PARTIAL
         # HIT to admit -- the remainder is this group's own prefill -- never
@@ -13420,11 +15113,32 @@ class Scheduler(
             return None
         delivered = int(outcome.materialized)
         deliverable = int(outcome.deliverable)
+        # HFB (rc12z21 D 13:35:14, weg2-8-34, PrefetchBallotDigestMismatch):
+        # on a Form A END-vote read `materialized` counts from each rank's
+        # OWN span start -- TP0 13376 (base 12544/15104), the workers 9536 /
+        # 12096 (base 16384). The store-short cycle bound and the remainder
+        # fed on it saw growth on the workers and none on TP0: only TP0 took
+        # 'cycles=5 > bound=4 ... over_x' -> W88 503, its queue emptied, the
+        # workers kept the rid, and the next ballot's digest split. The
+        # reduced END is the group's one answer (25920 / 28480 on all three
+        # ranks) and it is the absolute prompt depth the remainder needs.
+        _synced_end = getattr(outcome, "synced_end", None)
+        if _synced_end is not None:
+            # both ends absolute: the span END is the group's too (#580 END vote)
+            _dend = getattr(outcome, "deliverable_end", None)
+            deliverable = (int(_dend) if _dend is not None
+                           else deliverable + int(_synced_end) - int(outcome.synced))
+            delivered = int(_synced_end)
         # The witness term, written BEFORE the arm reads it: a re-read that
         # gains nothing leaves this value unchanged and the standstill count
         # advances, which is what ends the wait honestly.
         req._weg2_store_delivered = delivered
+        req._weg2_store_deliverable = deliverable  # #248h: what the store holds
         self._weg2_store_short_seen = getattr(self, "_weg2_store_short_seen", 0) + 1
+        # DASHBOARD-AUS-IPC (30.09., FEHLT 5): the tokens these incomplete reads
+        # delivered and could have delivered, summed (rankstats cache block)
+        self._weg2_store_short_delivered = getattr(self, "_weg2_store_short_delivered", 0) + delivered
+        self._weg2_store_short_deliverable = getattr(self, "_weg2_store_short_deliverable", 0) + deliverable
         n = self._weg2_store_short_seen
         if n <= 8 or n % 64 == 0:
             logger.warning(
@@ -14077,6 +15791,11 @@ class Scheduler(
         # H91b: on group D the parked requests come first and hold the seats
         # they return to (weg2/d_seats.admission_gate); None = stock loop.
         _d_park_gate = self._weg2_d_park_admission(running_batch)
+        # E2: the END-state hand-offs lead the pass (weg2/skip_first.py)
+        self.waiting_queue, _skip_first_rids = _weg2_skip_first.order(
+            self.waiting_queue, _weg2_tail_adopt.skip_joinable
+        )
+        self._weg2_sa_exclude_displaced(prefetch_verdicts)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -14303,6 +16022,26 @@ class Scheduler(
             # same rid set as the two above.
             scheduled_last_chunk=self._pp_scheduled_last_chunk(),
         )
+        # H105: on a Form A group the attention host's gate verdict is the
+        # group's (None elsewhere: every gate in add_one_req stays rank-local).
+        adder.form_a_admission_follow = self._form_a_admission_follow_fn()
+        # ED (rc12o b1): on a Form A group only the host's vote decides (H105);
+        # a worker keeps the reported evictable count so its local extend
+        # arithmetic is the pre-ED one (mem_cache/evict_frontier_census.py).
+        try:
+            from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+            _is_host = self._form_a_is_host() if adder.form_a_admission_follow is not None else None
+            setattr(self.tree_cache, _ef.EXEMPT_ATTR, _is_host is False)
+        except Exception:  # noqa: BLE001 -- a slotted tree keeps the default
+            pass
+        # SF (b23 #1004): a #988 prefix move replans the chunk budget at the moved
+        # prefix (None: switch off / no plan policy -> nothing installed).
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf_hook = _sf.replan_hook(self, adder)
+        if _sf_hook is not None:
+            adder.sf_replan_after_move = _sf_hook
         # #996 THIS RANK'S OWN CAP, captured beside the floor. Printed by
         # APPENDING to the existing census line -- the previous revision put a
         # SECOND emission next to it and flipped the death form, which is the
@@ -14732,16 +16471,24 @@ class Scheduler(
         # for the rest of a burst (SGLANG_WEG2_P_BURST_ASSEMBLY_MS). Unarmed:
         # 0 carried, the full queue -- the stock loop.
         _carried_n = len(adder.can_run_list) if adder.multi_anchor_tails else 0
+        _slot_held = self._carried_slot_held(adder.can_run_list, adder.multi_anchor_tails)
         _burst_hold = None
         if adder.multi_anchor_tails and _count_veto:
             _burst_hold = self._weg2_burst_assembly_hold(adder, running_batch)
+        # WEG2 D-HOL (weg2/hol_overtake.py): a head that does not fit the free KV
+        # no longer ends the round for everyone behind it (group D only)
+        from sglang.srt.weg2 import hol_overtake as _hol_mod
+
+        _hol = _hol_mod.HolPass(self)
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if _burst_hold is not None:  # fnFL2 H42b: the burst is still assembling
                 _note_skip("weg2_burst_assembly", req.rid)
                 continue
             if _d_park_gate is not None:  # H91b: parked first, newcomers wait
-                _d_skip = _d_park_gate.skip(req)
+                # AP: the parked requests already admitted THIS pass hold no seat
+                _d_skip = _d_park_gate.skip(req, admitted=[str(_r.rid) for _r in adder.can_run_list],
+                                            skip_extend=str(req.rid) in _skip_first_rids)
                 if _d_skip is not None:
                     _note_skip(_d_skip, req.rid)
                     continue
@@ -14816,7 +16563,9 @@ class Scheduler(
             # STOP. See `rank_local_count_veto_applies`.
             if _count_veto and len(
                 adder.can_run_list
-            ) >= self._uniform_allocatable_reqs(running_bs, _head_inputs) + _carried_n:
+            ) >= self._uniform_allocatable_reqs(
+                running_bs, _head_inputs, _slot_held
+            ) + _carried_n:
                 running_batch.batch_is_full = True
                 self._pp_batch_full_setter = "count_arm"
             _disagg_full = False
@@ -14932,7 +16681,7 @@ class Scheduler(
             # takes without waiting -- #969Z's uniform, wireless verdict --
             # and the flip-form terms stay exactly as they were where the
             # carrier exists. Resolved ONCE per call, like the kill switch.
-            _pp0_may_withhold = _pp_group and pp_row_carrier_present(self)
+            _pp0_may_withhold = _pp_group and pp_row_carrier_present(self, term="withhold")
             # #1175: the group-completion gate, resolved ONCE per request
             # so the kill switch cannot flip mid-loop and split the pass.
             _group_completion_enabled = _pp0_may_withhold and _group_completion_on()
@@ -15192,16 +16941,39 @@ class Scheduler(
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
                 continue
+            # PARK-WINDOW-GATE (29.09.): while the front's collect window is
+            # open, no extend whose forward ends after its deadline -- the park
+            # must not wait for it. Inert without a window (every term replicated).
+            if getattr(self, "_weg2_park_window", None) is not None:
+                from sglang.srt.weg2 import park_window_gate as _pwg
+
+                _pw_unc = int(self.weg2_uncached_extent(req, _head_inputs))
+                if _pwg.defers(self, req, uncached=_pw_unc,
+                               prefix_tokens=max(0, len(req.fill_ids) - _pw_unc),
+                               batch_empty=not adder.can_run_list,
+                               running_n=len(self.running_batch.reqs)):
+                    _note_skip("weg2_park_window", req.rid)
+                    continue
             # WEG2 VISION (D side): priced like W31 -- the GROUP's match, no
             # new collective -- so the verdict is the same on every rank.
             if getattr(self, "_weg2_vision_d_guard", False):
-                _vd = self._weg2_vision_d_verdict(req, _head_inputs)
+                _vd = self._weg2_vision_d_verdict(
+                    req, _head_inputs, batch_empty=not adder.can_run_list
+                )
                 if _vd == "defer":
                     _note_skip("weg2_vision_defer", req.rid)
                     continue
                 if _vd == "refuse":
                     _note_skip("weg2_vision_refused", req.rid)
                     _v_refused.append(req)
+                    continue
+            # W102 SKIP (P, PP0): a request staged without a tower because its
+            # images lay in the prefix -- admitted only while that still holds
+            if getattr(req, "_weg2_vision_skip", False):
+                from sglang.srt.weg2.vision_rank_runner import skip_still_covered
+
+                if not skip_still_covered(self, req):
+                    _note_skip("weg2_vision_skip_refuted", req.rid)
                     continue
 
             # #791 PP ADMISSION UNIFORMITY. Every PP stage independently
@@ -15288,7 +17060,7 @@ class Scheduler(
                     # PP0's prefix alone. pp_row_carrier_present is the same
                     # fact the follower half keys on; byte-identical where
                     # the carrier exists.
-                    if pp_row_carrier_present(self):
+                    if pp_row_carrier_present(self, term="floor_clamp"):
                         # #631 ROW AUTHORITY: the telling half is alive again
                         # (downstream builds from the row it receives BEFORE
                         # planning), so PP0's learned-floor clamp is
@@ -15544,9 +17316,18 @@ class Scheduler(
                 # more and mean less.
                 consume_seam_grant(req)
 
+            _hol_go_on = False
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
+                    # SP (partial park, KV trigger; weg2/d_park_runtime.displace_for_age):
+                    # the first request this pass could not fund; read -- through a
+                    # group MIN -- by the next pass's admission.
+                    if getattr(self, "_weg2_sa_no_token", None) is None:
+                        self._weg2_sa_no_token = str(req.rid)
+                    _hol_go_on = _hol.may_overtake(req)
+                    if _hol_go_on:
+                        pass  # D-HOL backfill: later requests that fit the free KV still run
+                    elif self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
@@ -15650,10 +17431,22 @@ class Scheduler(
                                     count,
                                 )
                 _note_skip(f"add_result_{res.name}", req.rid)
+                if _hol_go_on:
+                    continue
                 break
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        if _hol.head is not None:
+            _hol.finish([r for r in adder.can_run_list
+                         if str(getattr(r, "rid", "")) != _hol.head])
+
+        # H105 RIEGEL: the built extend set is the host's, or the group stops
+        # by name here -- never a decode on one rank against an extend on the
+        # others (dpr 08:51:31, 5,5 min to the watchdog). Skipped on a pass
+        # whose loop raised a schedule refusal: that rank stops below anyway.
+        if schedule_refusal is None:
+            self._form_a_extend_set_riegel(adder.can_run_list)
 
         # C11: answer the requests this pass refused by name. AFTER the loop,
         # because the loop iterates `waiting_queue` in place.
@@ -15761,7 +17554,15 @@ class Scheduler(
             return None, running_batch
 
         can_run_set = set(can_run_list)
+        # L2 (28.09., NF rc12z26 18:06:05): a pass admitted 2 of 5 ready requests with
+        # `admit=-` -- the skip census was published only for EMPTY passes. A partial pass
+        # names its skips too, on its own field (the ADMIT lines keep their "-").
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        self._admission_partial_note = "admitted=%d left=%d %s" % (
+            len(can_run_list), len(self.waiting_queue),
+            ",".join(f"{k}={v}(first={_skip_first_rid[k][:16]})" for k, v in sorted(_skips.items()))
+            if _skips else "no_skip",
+        )
         _p_intake.settle_told(self, self.waiting_queue)  # H91a: admitted/aborted verdicts go
 
         # #791 PP ADMISSION UNIFORMITY: PP0 publishes this pass's admission
@@ -16015,6 +17816,7 @@ class Scheduler(
             )
         )
         new_batch.weg2_anchor_tail_bodies = _tails_in_batch
+        new_batch.weg2_skip_extend = bool(adder.weg2_skip_extend_taken)
         # #861k: CARRY THE TRANSPORT CLAIM TO THE BATCH, so the conformance
         # detector can judge the MEASURED bytes against it at emit time. The
         # seam stamp itself is one-shot and was spent above; this flag is the
@@ -16035,6 +17837,11 @@ class Scheduler(
 
         _wk_t3 = time.perf_counter()  # init_new done
         self._weg2_ready_ms = (_wk_t3 - _wk_t2b) * 1000.0
+        # TWIN ANCHOR (weg2/twin_anchor.py): the boundaries of twins still
+        # queued behind this batch's requests (None when off / none queued)
+        new_batch.weg2_twin_bounds = _weg2_twin_anchor.batch_bounds(
+            can_run_list, self.waiting_queue, page=self.page_size
+        )
         new_batch.prepare_for_extend()
         _wk_t4 = time.perf_counter()
         if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
@@ -16789,6 +18596,10 @@ class Scheduler(
         divergence must crash the group at the single site that owns the
         decision -- not be compensated for here, one rank at a time.
         """
+        # nf-pd-post: a deferred #639 ballot is decided before any forward
+        # that can enter a collective (a skip batch runs none)
+        if _prefix_lens_check.has_deferred() and not getattr(batch, "weg2_skip_extend", False):
+            _prefix_lens_check.resolve_deferred()
         return self._run_batch_forward(batch, pp_proxy_tensors)
 
     def _run_batch_forward(
@@ -16799,6 +18610,9 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        # FP (weg2/progress_beacon.py): the front's /health reads this rank's
+        # forward progress off a 32-byte mmap -- a busy group is not a dead one.
+        _weg2_beacon.beat_start(self.forward_ct)
         self._weg2_d_seat_guard(batch)  # H95c W-SEAT: never wider than the phase's n
 
         # #861 fix (b): a request admitted on a cached prefix whose DRAFT rows
@@ -16878,6 +18692,18 @@ class Scheduler(
                     round_id=int(batch.forward_iter),
                     bs=int(_bs),
                     rows=int(_bs) * int(_rows or 1),
+                    # #239 S3f: the requests' KV lengths (host lists), for the
+                    # bs x depth A/B; None unless SGLANG_DEBUG_DECODE_ROUND_DEPTH
+                    depth=(
+                        _drl.round_depth(
+                            [
+                                len(r.origin_input_ids) + len(r.output_ids)
+                                for r in batch.reqs
+                            ]
+                        )
+                        if _drl.depth_on
+                        else None
+                    ),
                 )
 
         # #1233 (WEG 2, S0): the draft worker used to start COLD after a
@@ -16918,6 +18744,7 @@ class Scheduler(
                 self.token_to_kv_pool_allocator,
                 self.page_size,
                 self.forward_stream,
+                tree_cache=self.tree_cache,
             )
         # Pairing objective (#274 slice D): publish this batch's grain shape
         # for the lane's pairing policy. Read-only for the policy, one tuple
@@ -17419,6 +19246,7 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        _weg2_beacon.beat_done(getattr(self, "forward_ct", 0))
 
         # #485 transient census: one strided, read-only driver query, labelled
         # with the load state that produced it. On every default boot this is
@@ -17441,6 +19269,10 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
+        # nf-pd-post: a skip batch's #639 ballot is decided after its result
+        # (P's token) went out (layers/dcp/prefix_lens_check.resolve_deferred)
+        if _prefix_lens_check.has_deferred():
+            _prefix_lens_check.resolve_deferred()
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:
@@ -17558,9 +19390,11 @@ class Scheduler(
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
-            self.tree_cache.clear_storage_backend()
-            logger.info("Hierarchical cache cleared successfully!")
-            if_success = True
+            # L3P: a persistent L3 store refuses without force (W166, named)
+            if_success = bool(self.tree_cache.clear_storage_backend(
+                force=bool(getattr(recv_req, "force", False))))
+            if if_success:
+                logger.info("Hierarchical cache cleared successfully!")
         else:
             logging.warning("Hierarchical cache is not enabled.")
             if_success = False
@@ -17575,6 +19409,9 @@ class Scheduler(
             _wu_chk(join=False)
         if getattr(self, "weg2_dormant", False) and getattr(self, "weg2_dormant_hold", None):
             self._weg2_hold_refetch()  # #1456
+        # B1 part 1 (D-IDLE-PUBLISH): the nodes the flip's flush would publish,
+        # published while D has nothing to run (replicated gate, no clock).
+        _weg2_flush_nonblock.idle_publish(self)
         if not self.is_fully_idle():
             # #547: no batch to run, but work is queued somewhere (waiting
             # queue, grammar, disagg, hicache drain). That is the loaded path
@@ -17849,6 +19686,9 @@ class Scheduler(
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
         idle &= len(self.waiting_queue) == 0
+        # (d) an async vision stage holds a KV-tail lease on PP0: never idle
+        # (no sleep may release the pool under the tower's views)
+        idle &= getattr(self, "_weg2_vision_inflight", None) is None
 
         if not for_health_check:
             # Grammar queue and prefill inflight queue may not produce batch
@@ -18125,6 +19965,7 @@ class Scheduler(
         # node is un-backed, join the write-throughs (bounded by the existing
         # write-back drain), then reset.  SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=0
         # restores the old form.
+        self._weg2_last_flush_refusal = ""  # QUIESCE-PENDING: only THIS flush's refusal names a lap
         if (
             self.enable_hierarchical_cache
             and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
@@ -18137,25 +19978,67 @@ class Scheduler(
                 _t0 = time.perf_counter()
                 _issued = 0
                 _stats = {}
-                for _round in range(64):
-                    _stats = _sweep(max_issue=256) or {}
-                    _issued += int(_stats.get("issued", 0) or 0)
-                    if int(_stats.get("unbacked", 0) or 0) == 0:
-                        break
-                    if _wc is not None:
-                        _wc(write_back=True)  # free the pins, then sweep again
-                    if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
-                        break
-                if _wc is not None:
-                    _wc(write_back=True)
+                # B1 (weg2_flush_nonblock part 2): the quiesce issues, the sleep
+                # leg drains -- unless a node is left un-issued (then #1470 as before)
+                _b1_nowait = not _weg2_flush_nonblock.quiesce_sweep_blocking(
+                    self, {}, tp_group_verdict)
+                # kvs2 W3 (boot ...kvdemandbar1dauer09291534): the poll's own
+                # publish work is not the idle lap's age (weg2_idle_vote.own_work).
+                # D-NORECOMPUTE (a): a full mamba arena at the flush spills a
+                # foreign intermediate anchor to L3 instead of losing this one
+                _spill_tc = self.tree_cache
+                _spill_prev = getattr(_spill_tc, "_weg2_flush_spill", False)
+                try:
+                    _spill_tc._weg2_flush_spill = True
+                    with _weg2_own_work():
+                        for _round in range(64):
+                            _stats = _sweep(max_issue=256) or {}
+                            _issued += int(_stats.get("issued", 0) or 0)
+                            if int(_stats.get("unbacked", 0) or 0) == 0:
+                                break
+                            if _b1_nowait:
+                                if not _weg2_flush_nonblock.quiesce_sweep_blocking(
+                                        self, _stats, tp_group_verdict):
+                                    break
+                                _b1_nowait = False  # a node left un-issued: the #1470 loop
+                            # kvs2 W3: a round that issued nothing with nothing in
+                            # flight cannot be followed by one that does -- no pin
+                            # frees, no write lands. Measured: 4 such rounds of
+                            # 1.2 s per poll (issued=0 unbacked_left=37, arena
+                            # full), 4.6-5.0 s ahead of the idle read on every poll.
+                            if (int(_stats.get("issued", 0) or 0) == 0
+                                    and int(_stats.get("pending", 0) or 0) == 0):
+                                break
+                            if _wc is not None:
+                                _wc(write_back=True)  # free the pins, then sweep again
+                            if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
+                                break
+                        if _wc is not None and not _b1_nowait:
+                            _wc(write_back=True)
+                finally:
+                    try:
+                        _spill_tc._weg2_flush_spill = _spill_prev
+                    except Exception:  # noqa: BLE001 -- a stand-in tree
+                        pass
                 logger.info(
                     "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
-                    "(un-backed nodes published and their write-throughs joined BEFORE the reset)",
-                    _issued, _stats.get("unbacked"), _stats.get("in_flight_after"),
-                    (time.perf_counter() - _t0) * 1000.0)
+                    "(un-backed nodes published and their write-throughs joined BEFORE the reset)%s",
+                    _issued, _stats.get("unbacked"), _stats.get("pending"),
+                    (time.perf_counter() - _t0) * 1000.0,
+                    " -- B1 NONBLOCK: issued, not joined here; the sleep leg drains them "
+                    "before its reset" if _b1_nowait else "")
         group_idle, verdict_detail = self.group_idle_verdict(
             tp_group_verdict=tp_group_verdict
         )
+        # B1 (weg2_flush_nonblock part 2): a quiesce whose only blockers are
+        # the group's own publish answers "quiesced" and keeps the tree; the
+        # sleep leg drains, publishes, joins and resets before the kv pause.
+        _b1_quiesced = _weg2_flush_nonblock.quiesce_verdict(
+            self, group_idle, tp_group_verdict
+        )
+        if _b1_quiesced is not None:
+            logger.info("%s | #1268 group verdict: %s", _b1_quiesced, verdict_detail)
+            return True
         if group_idle:
             # fnFL2 H63d (#1470b): the reset below restarts the storage
             # pipeline and drops every store write still queued behind the one
@@ -18165,11 +20048,20 @@ class Scheduler(
             # blockers -- x169: hicache_backup(5) on PP1/PP2 in the same
             # second, D's store read short by 11776 tokens.  Join them first.
             self._weg2_join_store_writes_before_reset()
+            self._weg2_note_lost_anchors()
             self.cur_batch_for_debug = None
             self.last_batch = None
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
+            if _weg2_release_reset_redundant(self, zero_kv):
+                # DP-NACHLAUF RELEASE-FLUSH-DEDUP: the quiesce /flush_cache
+                # reset this rank moments ago and it ran nothing since --
+                # the release leg's second reset is skipped (rank-local;
+                # the #1268 verdict above is unchanged)
+                pass
+            else:
+                self.tree_cache.reset()
+                self.req_to_token_pool.clear()
+                self.token_to_kv_pool_allocator.clear()
+                _weg2_note_reset(self)
             if self._flush_zero_kv_wanted(zero_kv):
                 # Default part of the flush (opt-out env): the post-flush
                 # state must equal a fresh boot, whose pools are torch.zeros.
@@ -18182,7 +20074,7 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                current_platform.empty_cache()
+                _weg2_flush_empty_cache(zero_kv, tp_group_verdict)
             if envs.SGLANG_FLUSH_SCRUB_FREE_MEMORY.get():
                 self._flush_scrub_free_memory()
             # Per-DP-group leader logs once: ranks within a DP group are
@@ -18206,6 +20098,8 @@ class Scheduler(
                 f"| #1268 group verdict: {verdict_detail}"
             )
             success = False
+            # QUIESCE-PENDING: the flush wrapper names a PENDING lap in the answer
+            self._weg2_last_flush_refusal = str(verdict_detail or "")
         return success
 
     def _weg2_join_store_writes_before_reset(self) -> None:
@@ -18225,6 +20119,10 @@ class Scheduler(
                 "it BEFORE the reset rebuilds the queue; left>0 = the bound or a dead backup "
                 "thread, those pages miss in the store)",
                 drained, left, waited_ms)
+
+    def _weg2_parked_owned_prefetch(self) -> frozenset:
+        """PDFLIP-A: open prefetch records of requests in D's park list."""
+        return _weg2_parked_owned_prefetch_of(self)
 
     def group_idle_verdict(self, tp_group_verdict: bool = False) -> Tuple[bool, str]:
         """#1268: is THE GROUP idle -- not "is this rank idle".
@@ -18304,8 +20202,18 @@ class Scheduler(
         answer unchanged -- so a single-rank engine and every stock path are
         byte-identical.
         """
-        my_idle = self.is_fully_idle()
-        own = ", ".join(self.idle_blockers()) or "none"
+        # PDFLIP-A: the open store reads of D's park list do not hold the
+        # quiesce (weg2_sleep_drain.parked_owned_prefetch); empty off D's park.
+        _pk = _weg2_parked_owned_prefetch_of(self)
+        my_idle = self.is_fully_idle(exempt_prefetch=_pk) if _pk else self.is_fully_idle()
+        own = ", ".join(self.idle_blockers(exempt_prefetch=_pk) if _pk else self.idle_blockers()) or "none"
+        if _pk:
+            _n = getattr(self, "_weg2_parked_prefetch_n", 0) + 1
+            self._weg2_parked_prefetch_n = _n
+            if _n <= 8 or _n % 64 == 0:
+                logger.info("WEG2-QUIESCE-PARKED-PREFETCH rids=%s n=%d: store reads of D's park list "
+                            "are not a quiesce term (held by the sleep, re-read at the wake; the "
+                            "release reset joins them)", sorted(r[:12] for r in _pk), _n)
 
         pp_size = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1)
         pp_rank = int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0)
@@ -18384,7 +20292,14 @@ class Scheduler(
         # (`weg2/front.py`, `Front.quiesce`), so a non-200 simply keeps the
         # poll going and the LAST body is what a W3 refusal prints.
         outstanding = getattr(self, "_weg2_vote_outstanding", None)
-        if outstanding is None or not envs.SGLANG_WEG2_QUIESCE_FAST.get():
+        # 27B rc12z21 park boot (flip epoch=5, 293 stale laps, W3): the guard
+        # below is ON by itself (SGLANG_WEG2_IDLE_VOTE_NO_REWANT), not only
+        # with the fast poll -- at the 50 ms poll a lap slower than the poll
+        # was dropped every time.
+        if outstanding is None or not (
+            envs.SGLANG_WEG2_QUIESCE_FAST.get()
+            or envs.SGLANG_WEG2_IDLE_VOTE_NO_REWANT.get()
+        ):
             self._weg2_vote_wanted = True
         else:
             # fnFL2 H111: a poll that finds its lap still on the ring does NOT
@@ -18429,6 +20344,7 @@ class Scheduler(
 
         _check("running_batch", self.running_batch.is_empty())
         _check("chunked_req", self.chunked_req is None)
+        _check("vision_async", getattr(self, "_weg2_vision_inflight", None) is None)
         _check("anchor_tails", not getattr(self, "anchor_tails", None))
         _check("dllm_staging", not self.dllm_manager.any_staging_reqs())
         _check(
@@ -18622,20 +20538,25 @@ class Scheduler(
         So the set is "every KV pool that currently holds pages", not "the
         scheduler's pool".
         """
-        from sglang.srt.mem_cache.memory_pool import zero_kv_data_buffers
+        from sglang.srt.mem_cache.memory_pool import zero_kv_data_buffers, zero_wide_stats_take
 
         zeroed = 0
         skipped = 0
+        zero_wide_stats_take()
+        _t0 = time.perf_counter()
         for pool in self._kv_pools_for_flush():
             if not getattr(pool, "backing_is_resident", True):
                 skipped += 1
                 continue
             zeroed += zero_kv_data_buffers(pool)
         current_platform.synchronize()
+        _zs = zero_wide_stats_take()
         logger.info(
-            "flush: zeroed %d KV data buffers (%d unbacked layout(s) skipped)",
+            "flush: zeroed %d KV data buffers (%d unbacked layout(s) skipped) "
+            "wide=%d narrow=%d bytes=%d ms=%.1f (DP-NACHLAUF SGLANG_WEG2_ZERO_WIDE)",
             zeroed,
             skipped,
+            _zs["wide"], _zs["narrow"], _zs["bytes"], (time.perf_counter() - _t0) * 1000.0,
         )
 
     def _kv_pools_for_flush(self):
@@ -18828,6 +20749,30 @@ class Scheduler(
             "token_capacity": int(self.max_total_num_tokens),
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
+        # ARRIVAL-SEAT (weg2/arrival_seat_rule.py): D's free KV for the front's
+        # seat verdict -- the allocator's free rows plus what the tree could
+        # evict. A reading only; nothing decides here.
+        try:
+            ret["weg2_kv"] = {
+                "available": int(self.token_to_kv_pool_allocator.available_size()),
+                "evictable": int(self.tree_cache.evictable_size()),
+                "capacity": int(self.max_total_num_tokens),
+            }
+            # NF-STAU (29.09.): the KV ladder's ceiling and the global used
+            # tokens -- the front's fit test counts against the ladder, not
+            # the mapped stage (D-MEM-SCHED grows it at the admission).
+            from sglang.srt.weg2.d_seat_vram import kv_ladder_reading
+
+            _lad = kv_ladder_reading(self)
+            if _lad:
+                ret["weg2_kv"].update(_lad)
+            # NF-STAU-KV (30.09.): the decode clip D's own admission reserves
+            # per request -- the front's KV need asks the same, not max_tokens.
+            from sglang.srt.weg2.arrival_seat_rule import d_decode_clip
+
+            ret["weg2_kv"]["decode_clip"] = d_decode_clip()
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the info route
+            pass
         # #287: the effective figure is the limiter's floating value. Without
         # a ceiling the limiter holds max_running_requests, so this key keeps
         # reporting exactly what it reported before.
@@ -18883,6 +20828,15 @@ class Scheduler(
 
         if _weg2_prefill_clock.armed(self.server_args):
             ret[_weg2_prefill_clock.INTERNAL_STATE_KEY] = _weg2_prefill_clock.snapshot()
+        # X-COST-LINE: this rank's per-forward prefill cost -- D's under load,
+        # and P's from the rank answering /get_server_info (PP0, the
+        # bottleneck stage on both lines); weg2/prefill_clock.py.
+        from sglang.srt.managers.weg2_memory_saver import weg2_group_name as _weg2_group
+
+        if _weg2_prefill_clock.cost_published(
+            armed=_weg2_prefill_clock.armed(self.server_args), group=_weg2_group()
+        ):
+            ret[_weg2_prefill_clock.COST_STATE_KEY] = _weg2_prefill_clock.cost_snapshot()
 
         if (
             not self.spec_algorithm.is_none()
@@ -19578,17 +21532,35 @@ class Scheduler(
             _sp.WEG2_ADMIT_T["lb_n"] = 0
         except Exception:  # noqa: BLE001
             _lb_ms, _lb_n = -1.0, -1
+        # read_ms resets what it reads: read each pass term ONCE, for the line
+        # and for rankstats.last_post_wake alike.
+        _sched_ms, _run_ms = _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms")
+        _pf_ms, _pi_ms = _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms")
+        _gap_ms = ((now - prev) * 1000.0) if prev is not None else -1.0
         logger.info(
             "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
             "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f ready_ms=%.0f "
-            "addreq=[%s] init_load_back_ms=%.0f/%d init_next_round=[%s] "
+            "addreq=[%s] init_load_back_ms=%.0f/%d init_next_round=[%s] waiting=%d admit=%s admit_partial=%s "
             "(gap = wall since the previous pass; schedule = get_next_batch_to_run incl. the three "
-            "prefill terms; run is the launch, the forward itself overlaps)",
-            n, mode, bs, ((now - prev) * 1000.0) if prev is not None else -1.0,
-            _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms"),
-            _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
+            "prefill terms; run is the launch, the forward itself overlaps; admit = the admission's "
+            "own gate / skip census of this pass, BA 28.09.)",
+            n, mode, bs, _gap_ms, _sched_ms, _run_ms, _pf_ms, _pi_ms,
             _g[0], _g[1], _g[2], float(getattr(self, '_weg2_ready_ms', -1.0) or -1.0), _addreq, _lb_ms, _lb_n, _initr,
+            len(getattr(self, "waiting_queue", None) or ()),
+            str(getattr(self, "_admission_decline_note", None) or "-")[:240],
+            str(getattr(self, "_admission_partial_note", None) or "-")[:240],
         )
+        # DASHBOARD-AUS-IPC: the same census as rankstats.last_post_wake (one
+        # assignment here; the rankstats timer writes it -- never a decode round).
+        from sglang.srt.weg2 import rankstats as _weg2_rankstats
+
+        _weg2_rankstats.note_post_wake({
+            "n": n, "mode": mode, "bs": bs, "t": round(_t.time(), 3), "gap_ms": round(_gap_ms, 1),
+            "schedule_ms": _sched_ms, "run_ms": _run_ms, "prefetch_ms": _pf_ms, "proc_input_ms": _pi_ms,
+            "admission_ms": _g[0], "init_new_ms": _g[1], "prepare_ms": _g[2],
+            "waiting": len(getattr(self, "waiting_queue", None) or ()),
+        })
+        self._admission_partial_note = None
 
     def _weg2_arm_wake_round_census(self) -> None:
         """fnFL2 H23: the first pass after the wake arms DECODE-ROUND-COST
@@ -19716,12 +21688,25 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
-                # xsn324: on PP the chunk pipeline stops at the same chunk on
-                # every stage -- stage r keeps launching pp_size-1-r passes.
-                from sglang.srt.weg2.pp_abort import chunked_abort_delay
+                from sglang.srt.weg2.pp_abort import chunked_abort_delay, row_authority_of
+                _row_791c = row_authority_of(self)
                 self._pending_chunked_abort_delay = chunked_abort_delay(
-                    getattr(self.ps, "pp_size", 1), getattr(self.ps, "pp_rank", 0))
-                if self._pending_chunked_abort_delay:
+                    getattr(self.ps, "pp_size", 1), getattr(self.ps, "pp_rank", 0),
+                    row_authority=_row_791c)
+                # xsn324: on PP the chunk pipeline stops at the same chunk on
+                # every stage. Under the #631 row authority stage r keeps
+                # launching pp_size-1-r passes (PP0's countdown; the followers
+                # follow PP0's forwarded schedule, #791C). #791C-NF: without it
+                # the request wire is pass-aligned -- every stage reads this
+                # abort before planning the same chunk -- so every stage
+                # applies it at receipt (weg2.pp_abort module docstring).
+                if _row_791c is False:
+                    logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied at receipt -- the request wire delivers the abort to every stage in the pass PP0 read it, so no stage launches a chunk after it (#791C-NF, no row authority)",
+                                chunked_req.rid, getattr(self.ps, "pp_rank", 0))
+                elif _row_791c and getattr(self.ps, "pp_rank", 0) > 0:
+                    logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied when PP0's forwarded schedule stops naming it (#791C, row authority)",
+                                chunked_req.rid, getattr(self.ps, "pp_rank", 0))
+                elif self._pending_chunked_abort_delay:
                     logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied in %d pass(es) so the stages stop at the same chunk (xsn324)",
                                 chunked_req.rid, getattr(self.ps, "pp_rank", 0), self._pending_chunked_abort_delay)
         # fnFL2 H42: an END-ANCHOR tail is finished with abort after its final
@@ -20446,6 +22431,17 @@ def run_scheduler_process(
         pp_rank,
         dp_rank,
     )
+    # NUMPY-THP-SERVE (27B z30y11): no numpy MADV_HUGEPAGE in a rank process --
+    # a 2 MiB first touch compacts synchronously and migrates the shared arena
+    # under every rank (see gguf_numpy_hugepage.numpy_hugepage_off_for_serving).
+    try:
+        from sglang.srt.model_loader.gguf_numpy_hugepage import (
+            numpy_hugepage_off_for_serving,
+        )
+
+        numpy_hugepage_off_for_serving(f"scheduler tp={tp_rank} pp={pp_rank}")
+    except Exception:  # noqa: BLE001 - a page-size hint never stops a rank
+        logger.warning("[NUMPY-THP] switch failed", exc_info=True)
     parent_process = psutil.Process().parent()
 
     # VRAM flight recorder (#605). Armed here and nowhere later: this is the
@@ -20458,6 +22454,14 @@ def run_scheduler_process(
 
     flight_recorder.arm_process_trace(rank=tp_rank)
     flight_recorder.mark("process_start", rank=tp_rank)
+
+    # BOOTZEIT 3 stage 0: an early-started group D holds HERE, before the
+    # rank's first CUDA call, until group P's KV is sized (a context created
+    # between P's two free-memory readings is charged to P). No-op without
+    # the gate env.
+    from sglang.srt.weg2.d_early_start import wait_stage0_from_env
+
+    wait_stage0_from_env()
 
     # #1056: wrap the Triton loader chokepoint BEFORE any kernel can be built,
     # so no first-loader of this process can slip in ahead of the window. Every
@@ -20517,6 +22521,28 @@ def run_scheduler_process(
             dp_rank,
         )
 
+        # VRAM-Vertrag M2: the scheduler (paused tags, the runners' pools) is
+        # what the rank's VRAM actual attributes against from here on; bound
+        # before boot_complete so that mark is the first complete one.
+        from sglang.srt.weg2 import vram_actual as _weg2_vram_actual
+
+        _weg2_vram_actual.bind_scheduler(scheduler)
+        # DASHBOARD-AUS-IPC: the rank's counters for the rigdash, from a timer
+        # thread that only reads them (switch SGLANG_WEG2_ENABLE_RANKSTATS).
+        from sglang.srt.weg2 import rankstats as _weg2_rankstats
+
+        _weg2_rankstats.maybe_start(scheduler, tp_rank=tp_rank, pp_rank=pp_rank)
+        # DASHBOARD-AUS-IPC C5: the pool and seat counters into the RankState
+        # record (rewrites the attach record once; boot time, not a round).
+        try:
+            from sglang.srt.weg2 import rank_state as _weg2_rank_state
+
+            _weg2_rank_state.note_capacity(
+                kv_tokens=getattr(scheduler, "max_total_num_tokens", None),
+                seats=getattr(scheduler, "max_running_requests", None),
+            )
+        except Exception as e:  # noqa: BLE001 - display record, never the boot
+            logger.info("IPC RANK-STATE capacity not written (%s: %s)", type(e).__name__, e)
         # #605: every runner in this process is now up, so this is the first
         # moment a snapshot shows the WHOLE boot -- under speculative decoding
         # the target and the NEXTN draft each capture graphs, and a snapshot
@@ -20555,6 +22581,15 @@ def run_scheduler_process(
     except Exception as scheduler_exc:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        # DASHBOARD-AUS-IPC A14: the stop as a record in this rank's rankstats
+        # file, written HERE -- before the #1223 hold and before the SIGQUIT
+        # below end the group; the front publishes it as `rank_stop`.
+        try:
+            from sglang.srt.weg2 import rankstats as _weg2_rankstats
+
+            _weg2_rankstats.note_stop(scheduler_exc)
+        except Exception:  # noqa: BLE001 - a record may not mask the death
+            pass
         # #1223 HOLD AT THE WALL (env-gated, default OFF, no-op without
         # SGLANG_DEBUG_HOLD=1). Placed HERE -- after the traceback is logged,
         # before every census and before `parent_process.send_signal(SIGQUIT)`
@@ -20573,6 +22608,25 @@ def run_scheduler_process(
             )
         except Exception:  # noqa: BLE001 - diagnostics may not mask the death
             logger.warning("#1223: debug hold unavailable")
+        # RANK-DEATH (30.09., y4u D TP1 15:18:30Z; lifecycle "serving" until the
+        # deadman's crash verdict 78 s later): the boot's lifecycle goes `dead`
+        # FROM HERE, through the one state writer -- after the #1223 hold (a
+        # held rank is inspected, not torn down), before the census and the
+        # SIGQUIT below. First cause wins; never raises.
+        try:
+            from sglang.srt.environ import envs as _rd_envs
+            from sglang.srt.weg2 import state_file as _rd_state
+
+            if _rd_state.note_rank_death(
+                _rd_envs.WEG2_STATE_DIR.get() or None,
+                group=(os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() or None,
+                tp_rank=tp_rank, pp_rank=pp_rank, exc=scheduler_exc,
+                detail=traceback.strip().splitlines()[-1] if traceback else "",
+            ):
+                logger.error("WEG2 RANK-DEATH lifecycle=dead written (origin rank, code %s)",
+                             _rd_state.RANK_EXCEPTION_CODE)
+        except Exception:  # noqa: BLE001 - a record may not mask the death
+            pass
         # #1058b: the census goes out HERE, ahead of every signal, not only in
         # the `finally` below. `parent_process.send_signal(SIGQUIT)` and the
         # opt-in `os.killpg(..., SIGKILL)` a few lines down can both end this

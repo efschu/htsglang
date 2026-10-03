@@ -19,8 +19,8 @@ ids are outside the staging range; #718 index axis). Desk, real objects, 94795
 tokens: pop loop 143-156 ms, cat 32-42 ms, unique 2-4 ms, free 0.5-6 ms; the
 producer (the prefetch thread on metal, GIL held) 142-184 ms.
 
-THE FIX, behind SGLANG_HICACHE_DRAIN_BUDGET=<tokens per round> (0/unset = off,
-the unchanged path):
+THE FIX, behind SGLANG_HICACHE_DRAIN_BUDGET=<tokens per round> (default
+DEFAULT_BUDGET since 29.09.; "0" = off, the unchanged path):
 
 1. A release is ONE queue entry (the whole index tensor), not one per page:
    the producer and the drain's per-entry cost disappear.
@@ -64,9 +64,19 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+#: DEFAULT ON (29.09., Leistungsschalter nach Metallnachweis): the 27B runs
+#: 16384 since 24.09. (max release round 34 ms, boot dkr27browauthority
+#: 09292016). NF ran without it and paid the unbounded drain on the scheduler
+#: thread -- y3m 09292136 D TP0 max release round 220 ms at 21:42, 1191 ms at
+#: 21:49 (214848 rows), growing with the agent contexts: the post-wake pass
+#: that reaps the reads stalls ~1 s (POST-WAKE-PASS schedule_ms 953) and every
+#: finished read waits for it (LOAD-DEVICE harvest_ms 0.7-2.2 s). "0" = off.
+DEFAULT_BUDGET = 16384
+
+
 def drain_budget_tokens() -> int:
     """Rows per release queue and round; 0 = the unbounded (unchanged) drain."""
-    return _int_env(ENV_BUDGET, 0)
+    return _int_env(ENV_BUDGET, DEFAULT_BUDGET)
 
 
 def coalesce_host_releases() -> bool:

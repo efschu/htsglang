@@ -70,6 +70,8 @@ from sglang.srt.managers.weg2_sleep_drain import (
     drain_until_group_verdict,
     hold_owned_prefetch,
     refusal_message,
+    sleep_flush_until_reset,
+    tree_device_held,
 )
 from sglang.srt.mem_cache.hicache_collective import collective_rank_desc
 from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
@@ -130,11 +132,29 @@ def _weg2_group_stop_on_leg_failure(fn):
 
     @functools.wraps(fn)
     def wrapper(self, recv_req):
+        # L3-REUSE 0928: the L3 write-behind is quiet while a leg runs here
+        # (and after a sleep leg until the wake) -- the legs own the arena and
+        # the lanes. The existing leg bracket, no new clock.
+        _l3wb_ok = False
         try:
-            return fn(self, recv_req)
+            from sglang.srt.mem_cache import l3_write_behind as _l3wb
+
+            _l3wb.leg_enter(fn.__name__, getattr(self, "scheduler", None))
+        except Exception:  # noqa: BLE001 - never the leg
+            _l3wb = None
+        try:
+            out = fn(self, recv_req)
+            _l3wb_ok = True
+            return out
         except Exception as exc:
             self._weg2_leg_failed(f"{fn.__name__} FAILED on this rank", exc)
             raise
+        finally:
+            if _l3wb is not None:
+                try:
+                    _l3wb.leg_exit(fn.__name__, _l3wb_ok)
+                except Exception:  # noqa: BLE001
+                    pass
 
     return wrapper
 
@@ -168,6 +188,7 @@ TMS_RING_GRANULE_BYTES = 2 * 1024 * 1024
 from sglang.srt.weg2 import host_ledger as hl  # noqa: E402
 from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
 from sglang.srt.weg2 import ring_guard  # noqa: E402
+from sglang.srt.weg2 import tag_stall_sentinel as _tag_stall  # noqa: E402
 from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 
 #: The POPULATION token every ``WEG2-FLIP-TAG`` line carries, read back by
@@ -527,6 +548,20 @@ class Weg2LegLedger:
             self._done.popitem(last=False)
 
 
+def _weg2_anchors_lost_for_leg(updater: Any, what: str) -> List[int]:
+    """ANCHOR-LOST: this rank's dropped Mamba anchors for the group fence, on
+    the release leg only (the flush that drops them precedes it);
+    read-and-clear on the scheduler. [] on every other leg and wherever there
+    is no scheduler ledger (fence harnesses, stock engines)."""
+    if not str(what).startswith("release"):
+        return []
+    take = getattr(getattr(updater, "scheduler", None), "weg2_take_anchors_lost", None)
+    try:
+        return list(take()) if take is not None else []
+    except Exception:  # noqa: BLE001 - the answer never fails on an instrument
+        return []
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
@@ -556,6 +591,19 @@ class SchedulerWeightUpdaterManager:
     #: this far -- died on ``AttributeError`` in the assignment itself on all
     #: three P ranks.
     _weg2_last_inject_cover: Any = None
+    #: BOOTZEIT 3 (A), #108 under the per-tag collect (#1374): the first
+    #: wake's cover ACCUMULATED over every tag -- ``{"filled": {tag: n},
+    #: "expected": n, "names": set}``. The single-value field above holds the
+    #: LAST tag only, and the per-tag wake returned before the #108 settle ever
+    #: ran, so under ``--weg2-d-adopt on`` the placeholder guard could never
+    #: fall. None outside a placeholder wake.
+    _weg2_adopt_acc: Any = None
+    #: PAUSE-OVERLAP (0a78051a4d): the per-tag resident-byte census taken ONCE
+    #: before an overlapped sleep loop, read by the deposit's gap check while a
+    #: pause runs; None outside such a loop. The fourth time for the slots
+    #: lesson above: y4j-po (30.09. 10:42:44Z) died on AttributeError in the
+    #: assignment on all three D ranks at the first sleep with the switch on.
+    _weg2_resident_prefetch: Any = None
     #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
     #: wake, empty when there is none.  Written by
     #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
@@ -563,6 +611,11 @@ class SchedulerWeightUpdaterManager:
     #: rank instead of killing the owner alone.  A FIELD for the fourth time in
     #: this class, for the reason the three comments above give.
     weg2_store_rescan_failure: str = ""
+    #: 28.09. (flip regression wake-kv -> dc 0.3 s -> 4.8 s): the wake's store
+    #: rescan walks the whole persistent L3 (700k files, ~6.8 us/file) and ran
+    #: INSIDE the resume RPC. With SGLANG_WEG2_STORE_RESCAN_ASYNC (default on)
+    #: it runs on this thread; the release leg joins it and votes its verdict.
+    weg2_store_rescan_thread: Any = None
     #: C16: this rank's card, resolved once.  ``"unset"`` is distinct from
     #: ``None``, which is the resolved answer "no card key" -- so an
     #: unresolvable card is not re-resolved (and re-logged) on every tag.
@@ -747,6 +800,12 @@ class SchedulerWeightUpdaterManager:
     _weg2_kv_resumed_epoch: object = None  # Wake-Parallel: flip epoch whose kv_cache tms resume (the RESUME half) already ran
     _weg2_leg_min_free_mib: object = None  # xsn323: the LOWEST card-free (MiB) seen at a tag claim of this rank's last wake legs
     _weg2_leg_min_free_epoch: object = None  # the epoch that minimum belongs to (reset at the first claim of a new epoch)
+    #: y7o WEG2-LEG-ORDER: flip epoch whose first claim was logged (resp. whose
+    #: 'n/a' line was). FIELDS, not ad-hoc attributes -- slots=True: y7t logged
+    #: 0 LEG-ORDER lines because the assignment itself raised, and y7u died on
+    #: all ranks when the 'n/a' branch assigned the second one.
+    _weg2_leg_order_epoch: object = None
+    _weg2_leg_order_na_epoch: object = None
     _weg2_graph_deferred: bool = False    # Wake-Parallel: cuda_graph resume deferred to the weights call
     _weg2_weights_epoch_done: object = None  # Wake-Parallel: flip epoch whose weight legs are collected
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
@@ -1521,6 +1580,11 @@ class SchedulerWeightUpdaterManager:
         tag a no-op instead of a gap -- while an UNMEASURABLE absence keeps
         the refusal, because nothing then vouches that the bytes are elsewhere.
         """
+        # PAUSE-OVERLAP: the census taken before the sleep loop (every tag
+        # mapped then) -- a running pause holds the saver's mutex.
+        _pre = getattr(self, "_weg2_resident_prefetch", None)
+        if _pre is not None and tag in _pre:
+            return _pre[tag]
         adapter = getattr(self, "memory_saver_adapter", None)
         getter = getattr(adapter, "tag_bytes", None)
         if getter is None:
@@ -1791,7 +1855,31 @@ class SchedulerWeightUpdaterManager:
             logger.info("%s", census.format_line())
         else:
             logger.warning("%s", census.format_line())
+        self._weg2_free_sleep_staging()
         self._weg2_log_sleep_residue(census, tags)
+
+    def _weg2_free_sleep_staging(self) -> None:
+        """+254 MiB fix (a): drop the lazily re-created device stages at the
+        sleep (weg2/sleep_staging.py); one line with the MiB freed. Never raises."""
+        try:
+            import os
+
+            from sglang.srt.weg2 import sleep_staging as _ss
+
+            if not os.environ.get("SGLANG_WEG2_GROUP") or not _ss.enabled():
+                return
+            model = getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)
+            freed = _ss.free_staging(model)
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info("WEG2-SLEEP-STAGING freed %s (re-created on first use after the wake, "
+                        "inside the serving phase; %s=0 keeps them)", _ss.format_freed(freed), _ss.ENV)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("WEG2-SLEEP-STAGING skipped (%s: %s)", type(exc).__name__, str(exc)[:160])
 
     def _weg2_log_sleep_residue(self, census: Any, tags: Optional[List[str]]) -> None:
         """weg2xsn296: name what is STILL on the card after the sleep and dump
@@ -1838,6 +1926,14 @@ class SchedulerWeightUpdaterManager:
                     snap = path
                 except Exception as exc:  # noqa: BLE001
                     snap = f"failed:{type(exc).__name__}"
+                # +254 MiB fix (c): who holds the largest untagged live blocks
+                try:
+                    from sglang.srt.weg2 import sleep_staging as _ss
+
+                    for _line in _ss.holder_report(torch.cuda.memory._snapshot(), top=4, depth=3):
+                        logger.info("WEG2-SLEEP-HOLDER sleep=%d %s", n, _line)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("WEG2-SLEEP-HOLDER skipped (%s: %s)", type(exc).__name__, str(exc)[:160])
             logger.info(
                 "WEG2-SLEEP-RESIDUE sleep=%d untagged_live=%d MiB tagged=%d MiB torch_active=%d MiB "
                 "torch_reserved=%d MiB nvml_proc_used=%s MiB outside_torch=%s MiB snapshot=%s "
@@ -2041,21 +2137,59 @@ class SchedulerWeightUpdaterManager:
         if line:
             logger.info("%s", line)
 
-    def _weg2_rearm_defer_armed(self) -> bool:
-        """H31b: defer the extra rows past the first token? Only on the
-        DECODE group (its MoE layers run the device pool; P's prefill plans
-        on the host with full residency and would land every layer at once)."""
+    def _weg2_rearm_defer_armed(self):
+        """H31b: defer the extra rows past the first token? True on the
+        DECODE group (its MoE layers run the device pool). P's prefill plans
+        on the host with full residency and lands every layer at once: a
+        group named in REARM_DEFER_HOST_GROUPS gets ``DEFER_HOST`` (#284 --
+        the rows load behind the rearm, the next forward waits them), any
+        other group False (the serial rearm)."""
         from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.expert_offload import DEFER_HOST
 
-        return bool(envs.SGLANG_WEG2_REARM_DEFER.get()) and self._weg2_group_name() == "D"
+        if not bool(envs.SGLANG_WEG2_REARM_DEFER.get()):
+            return False
+        group = self._weg2_group_name()
+        if group == "D":
+            return True
+        hosts = {g.strip() for g in str(envs.SGLANG_WEG2_REARM_DEFER_HOST_GROUPS.get() or "").split(",")}
+        return DEFER_HOST if group in hosts else False
+
+    def _weg2_defer_host_fill_start(self) -> bool:
+        """#284b: issue the DEFER_HOST rows once the wake has no host wait left.
+
+        y3j 09291933 (#284 on, 22 D->P wakes): the rows went on the side stream
+        at the rearm, and the next host wait of the same wake paid them again
+        -- per rank static_import == the serial rearm it replaced (PP1 1146 vs
+        1262 ms, PP2 685 vs 716, PP0 134 vs 238), so the P wake stayed at
+        2.6 s. The kv RPC holds one more (the lmem restore's cuCtxSetLimit,
+        a device-idle wait). Behind both, i.e. once the kv_cache is resumed
+        and the admission seams admit, nothing on this wake waits the copy:
+        it runs while PP0 computes its first chunk (y3p: kv-RPC end -> PP1's
+        first forward 1.51..4.60 s, median 2.90, against PP1's ~1.3 s fill),
+        and the forward still waits the events (``DeferredRowsFill.tick``,
+        which also starts the fill itself when this call never ran).
+
+        Returns True when it issued rows. A dormant group (the weights RPC of
+        a late-kv wake) waits for the RPC that clears the dormancy."""
+        from sglang.srt.layers.moe.expert_offload import deferred_rows_fill
+
+        scheduler = self.scheduler
+        if scheduler is None or scheduler.weg2_dormant:
+            return False
+        return deferred_rows_fill().start_host_planned(
+            why="after the wake's last host wait (#284b: kv resumed, admission open), "
+                "before the next forward")
 
     def _weg2_rearm_defer_settle(self) -> None:
         """H31b: before the first pause of a sleep -- wait for a running
         deferred fill and forget what is pending (the next wake rewrites the
         tables). Only a module lookup when nothing is pending."""
-        from sglang.srt.layers.moe.expert_offload import deferred_rows_fill
+        from sglang.srt.layers.moe.expert_offload import deferred_rows_fill, resume_warm
 
         deferred_rows_fill().settle()
+        # RW-FINISH (#287): warm copies still in flight land before the pauses
+        resume_warm().settle()
 
     def _weg2_zero_local_scratch(self, models) -> list:
         """fnFL2 v43: zero the runtime-built parameters (Marlin workspaces)
@@ -2921,6 +3055,119 @@ class SchedulerWeightUpdaterManager:
             logger.warning("WEG2-H111B pair lanes unreadable -> lockstep", exc_info=True)
             return []
 
+    @contextmanager
+    def _weg2_pause_overlap_scope(self, recv_req, weights_tags, h111b):
+        """PAUSE-OVERLAP of ONE sleep leg (weg2/pause_overlap.py), or None.
+
+        None (the per-tag chain, call for call) unless
+        SGLANG_WEG2_ENABLE_SLEEP_PAUSE_OVERLAP is on for this group, the leg
+        is a flip deposit whose on-card lane tags are readable, and H111b is
+        not running it (that form already moves the lanes, not the pause).
+        While armed, the saver's per-tag byte census the deposit's gap check
+        reads is taken ONCE before the loop (every tag is still mapped then),
+        so the loop never waits on the saver's mutex a running pause holds.
+        """
+        from sglang.srt.weg2 import pause_overlap as po
+
+        if h111b is not None or not po.overlap_on(self._weg2_group_name()):
+            yield None
+            return
+        flip_index = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
+        diag = self._weg2_xchg_diag_tags(flip_index)
+        if diag is None:
+            logger.info("%s off for this leg: on-card lane tags unreadable "
+                        "(flip_index=%s) -- the per-tag chain", po.LINE, flip_index)
+            yield None
+            return
+        dev = self._weg2_device_index()
+
+        def _thread_init():
+            if int(dev) >= 0:
+                torch.cuda.set_device(int(dev))
+
+        self._weg2_resident_prefetch = {
+            t: self._weg2_tag_resident_bytes(t) for t in weights_tags}
+        look = po.PauseOverlap(diag, thread_init=_thread_init)
+        failed = False
+        try:
+            yield look
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            self._weg2_resident_prefetch = None
+            if failed:
+                # the loop's own exception names the fault; a pause that
+                # also raised is logged, never allowed to replace it
+                try:
+                    look.close()
+                except Exception:  # noqa: BLE001
+                    logger.exception("%s: the pending pause raised as well", po.LINE)
+            else:
+                look.close()
+                logger.info("%s diag=%s", look.summary(), ",".join(sorted(diag)) or "-")
+
+    def _weg2_xchg_diag_tags(self, flip_index: int):
+        """PAUSE-OVERLAP: the tags this rank deposits on its ON-CARD (diagonal)
+        lane in this flip -- a set (empty = none), or None when the plan cannot
+        be read (the caller then keeps the chain). The same source-hook plan
+        and the same grouping as ``_weg2_xchg_deposit_pair_lanes``; every desc
+        kind counts, so the set is never smaller than the lane's."""
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+        try:
+            if not wx.exchange_armed() or int(flip_index) < 0:
+                return None
+            group = self._weg2_group_name()
+            rank = self._weg2_rank()
+            if not group or rank is None or int(rank) < 0:
+                return None
+            if not wx.leg_enabled(sh.HOOK_SOURCE, group):
+                return None
+            plan, _reason = self._weg2_shadow_plan(
+                sh.HOOK_SOURCE, group, int(rank), agreed=None,
+                require_agreement=False)
+            if plan is None:
+                return None
+            by = bx.group_descs_by_pair(list(plan.descs))
+            return {str(getattr(d, "tag", "")) for d in by.get(None, [])}
+        except Exception:  # noqa: BLE001 -- unreadable = the chain, never a crash
+            logger.warning("WEG2-PAUSE-OVERLAP diag tags unreadable -> chain", exc_info=True)
+            return None
+
+    def _weg2_pause_sub_line(self, tag: str, pause_ms: float) -> None:
+        """PAUSE-SUB (30.09.): the saver's own split of the pause just made --
+        allocations, cuMemUnmap calls, unmap and release clocks. Absent (stock
+        hook, or the record is another tag's): no line, never a zero."""
+        getter = getattr(getattr(self, "memory_saver_adapter", None), "pause_stats", None)
+        if getter is None:
+            return
+        try:
+            st = getter(tag)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the leg
+            return
+        if not st:
+            return
+        # PAUSE-MAPS (patch 5): the extent census of the same record
+        from sglang.srt.weg2 import pause_maps as _pm
+
+        maps = None
+        mgetter = getattr(self.memory_saver_adapter, "pause_maps_stats", None)
+        if mgetter is not None:
+            try:
+                maps = mgetter(tag)
+            except Exception:  # noqa: BLE001 -- an instrument never breaks the leg
+                maps = None
+        logger.info(
+            "WEG2-PAUSE-SUB tag=%s allocs=%d unmaps=%d unmap_ms=%.1f release_ms=%.1f "
+            "native_ms=%.1f pause_ms=%.1f%s (unmaps = cuMemUnmap calls: stock mappings + "
+            "H95c extents, one per coalesced run under PAUSE-MAPS; native_ms = the "
+            "saver's whole pause call)",
+            tag, st["allocations"], st["unmaps"], st["unmap_ms"], st["release_ms"],
+            st["total_ms"], float(pause_ms), _pm.sub_suffix(maps))
+
     def _weg2_xchg_wake_source_gap(self, tag, *, cdescs_present: bool,
                                    resident_bytes: Optional[int] = None,
                                    ) -> Optional[str]:
@@ -3563,7 +3810,39 @@ class SchedulerWeightUpdaterManager:
             self._weg2_last_inject_cover = (len(_cdescs or ()), _erwartet)
         except (AttributeError, TypeError):
             self._weg2_last_inject_cover = (0, 0)
+        self._weg2_adopt_accumulate(tag, plan, _cdescs)
         return bool(_cdescs)
+
+    def _weg2_adopt_accumulate(self, tag, plan, cdescs) -> None:
+        """BOOTZEIT 3 (A): the #108 cover summed over the per-tag collects.
+
+        Only while this rank holds placeholders (the first wake under
+        ``--weg2-d-adopt on``); a no-op otherwise. ``filled`` is keyed by tag
+        so a tag collected twice is not counted twice; ``expected`` is the
+        whole plan (the same on every call); ``names`` are the parameters the
+        legs actually wrote -- the uncovered check in :meth:`_weg2_adopt_settle`
+        compares them against every tensor this rank holds.
+        """
+        try:
+            from sglang.srt.weg2 import adopt as _adopt
+
+            if not _adopt.weights_are_placeholder():
+                return
+        except ImportError:
+            return
+        try:
+            acc = self._weg2_adopt_acc
+            if not isinstance(acc, dict):
+                acc = {"filled": {}, "expected": 0, "names": set()}
+            descs = list(cdescs or ())
+            acc["filled"][str(tag)] = len(descs)
+            acc["expected"] = max(int(acc["expected"]),
+                                  len(getattr(plan, "descs", ()) or ()))
+            acc["names"].update(str(getattr(d, "param_name", "")) for d in descs
+                                if int(getattr(d, "src_rank", -1)) >= 0)
+            self._weg2_adopt_acc = acc
+        except (AttributeError, TypeError, ValueError):
+            pass
 
     def _weg2_adopt_cover(self) -> tuple:
         """(gefuellt, erwartet) fuer #108 -- aus der KARTE, nicht geschaetzt.
@@ -3587,12 +3866,65 @@ class SchedulerWeightUpdaterManager:
         rechnet.
         """
         try:
+            acc = getattr(self, "_weg2_adopt_acc", None)
+            if isinstance(acc, dict) and acc.get("filled"):
+                return (int(sum(acc["filled"].values())), int(acc["expected"]))
             letzter = getattr(self, "_weg2_last_inject_cover", None)
             if isinstance(letzter, tuple) and len(letzter) == 2:
                 return int(letzter[0]), int(letzter[1])
         except (TypeError, ValueError):
             pass
         return 0, 0
+
+    def _weg2_adopt_uncovered(self) -> list:
+        """Tensors this rank holds that no leg of the first wake wrote.
+
+        The cover above counts descriptors of the PLAN; a tensor that has no
+        descriptor at all (the peer does not hold it, or the plan files it
+        elsewhere) is invisible to it and would keep its dummy bytes while
+        the guard falls -- the one failure #108 exists to prevent. Empty when
+        the accumulated names are unknown (then the count decides alone).
+        """
+        acc = getattr(self, "_weg2_adopt_acc", None)
+        if not isinstance(acc, dict) or not acc.get("names"):
+            return []
+        try:
+            live = {str(name) for (_region, name) in self._weg2_rank_param_table()}
+        except Exception:  # noqa: BLE001 -- no table: the count decides alone
+            return []
+        return sorted(live - set(acc["names"]))
+
+    def _weg2_adopt_settle(self) -> None:
+        """#108: after the first wake's collect, the placeholder guard falls
+        -- or stays. ONE place for both wake shapes (whole plan and the
+        per-tag collect of #1374), so neither can skip it."""
+        try:
+            from sglang.srt.weg2 import adopt as _adopt
+        except ImportError:
+            return
+        if not _adopt.weights_are_placeholder():
+            return
+        _filled, _expected = self._weg2_adopt_cover()
+        _uncovered = self._weg2_adopt_uncovered()
+        _mode = str(os.environ.get("SGLANG_WEG2_D_ADOPT_UNCOVERED", "refuse")
+                    ).strip().lower()
+        if _uncovered:
+            logger.warning(
+                "#108 ADOPT-UNCOVERED n=%d first=%s mode=%s -- these tensors "
+                "got no bytes from the first flip and still hold the dummy "
+                "load", len(_uncovered), _uncovered[:12], _mode)
+        if _uncovered and _mode != "log":
+            _adopt.mark_adopted(0, max(1, int(_expected)))
+        else:
+            _adopt.mark_adopted(_filled, _expected)
+        if not _adopt.weights_are_placeholder():
+            self._weg2_adopt_acc = None
+        logger.info(
+            "#108 ADOPT-COVER filled=%d expected=%d uncovered=%d -> %s",
+            _filled, _expected, len(_uncovered),
+            "PLATZHALTER GELOEST, dieser Rang rechnet"
+            if not _adopt.weights_are_placeholder()
+            else f"RIEGEL BLEIBT ({_adopt.placeholder_reason()})")
 
     def _weg2_wake_reload_weights(self) -> None:
         """Fill the weight pages the resume recommitted, by whatever carries them.
@@ -3649,6 +3981,10 @@ class SchedulerWeightUpdaterManager:
                     "WEG2-XCHG INJECT per-tag=done -- the resume loop "
                     "collected each tag beside its own resume (#1374); this "
                     "once-per-wake entry stands down rather than re-injecting")
+                # BOOTZEIT 3 (A): the #108 settle ran only on the whole-plan
+                # path below; under the per-tag collect it was skipped and a
+                # placeholder rank could never answer.
+                self._weg2_adopt_settle()
                 return
             self._weg2_xchg_inject_weights()
             # #108 ERSTBOOT-ADOPTION: hier faellt der Riegel -- oder er bleibt.
@@ -3661,20 +3997,7 @@ class SchedulerWeightUpdaterManager:
             # alle, bleibt der Riegel stehen und der Rang verweigert weiter --
             # ein halb gefuelltes Modell rechnet, und das ist schlimmer als
             # eines, das nicht antwortet.
-            try:
-                from sglang.srt.weg2 import adopt as _adopt
-
-                if _adopt.weights_are_placeholder():
-                    _filled, _expected = self._weg2_adopt_cover()
-                    _adopt.mark_adopted(_filled, _expected)
-                    logger.info(
-                        "#108 ADOPT-COVER filled=%d expected=%d -> %s",
-                        _filled, _expected,
-                        "PLATZHALTER GELOEST, dieser Rang rechnet"
-                        if not _adopt.weights_are_placeholder()
-                        else f"RIEGEL BLEIBT ({_adopt.placeholder_reason()})")
-            except ImportError:
-                pass
+            self._weg2_adopt_settle()
             return
         server_args = self._weg2_server_args()
 
@@ -4072,6 +4395,7 @@ class SchedulerWeightUpdaterManager:
             "card": self._weg2_card_uuid() or "unknown",
             "leg_ms": float(leg_ms),
             "per_tag": dict(per_tag or {}),
+            "anchors_lost": _weg2_anchors_lost_for_leg(self, what),
             "waves_published": wx.waves_digest(wx.published_waves() or ()),
             "waves_planned": wx.waves_digest(wx.planned_waves() or ()),
         }
@@ -4125,9 +4449,69 @@ class SchedulerWeightUpdaterManager:
                 f"(slowest of {len(votes)} rank(s) in this leg)"
             )
         )
-        return {"per_tag": merged, "critical_path": critical}
+        lost = sorted({int(d) for v in votes for d in (v.get("anchors_lost") or ())})
+        return {"per_tag": merged, "critical_path": critical, "anchors_lost": lost}
+
+    def _weg2_anchors_lost_for(self, what: str) -> List[int]:
+        return _weg2_anchors_lost_for_leg(self, what)
+
+    def _weg2_pause_l3_evictor(self) -> None:
+        """L3 evict off-path: park this group's background L3 evictor at the sleep entry (see the call site)."""
+        sch = self.scheduler
+        tc = getattr(sch, "tree_cache", None)
+        if tc is None or not getattr(sch, "enable_hierarchical_cache", False):
+            return
+        backend = getattr(getattr(tc, "cache_controller", None), "storage_backend", None)
+        pause = getattr(backend, "pause_background_eviction", None)
+        if pause is None:
+            return
+        # NF review 3 (B): NOT swallowed -- a failed park is the named stop Weg2L3EvictorPauseRefused, raised here,
+        # before the dormant marker (no-op without the evictor thread)
+        pause()
 
     def _weg2_rescan_store_index(self) -> None:
+        """The wake's store rescan, OFF the resume RPC by default (28.09.).
+
+        Measured on the 27B line (WEG2-WAKE-TAIL store_rescan=, flip timeline
+        wake-kv -> dc): 225 ms at 41,869 files (13:00), 1,692 at 262,182,
+        3,826 at 410,733, 4,748 at 700,338 (18:51) -- linear in the persistent
+        L3 store's file count, and every millisecond of it on the flip's
+        critical path, because the RPC answers only after the rescan.
+
+        ``LRUFileEvictor.rescan`` already walks WITHOUT its lock and carries
+        over keys this process reserves during the walk (MUST_FIX 5), so it
+        may run beside the awake group's writes; the sibling group is asleep.
+        The W8b verdict it can record moves from the resume fence to the NEXT
+        leg's fence: :meth:`_weg2_join_store_rescan` joins the thread at the
+        release leg and that fence votes it through the same C15 ok-bit -- one
+        owner's finding still stops every rank, one leg later, and the awake
+        phase in between evicts against the previous (stale) index, the same
+        degradation a skipped rescan already has.
+        ``SGLANG_WEG2_STORE_RESCAN_ASYNC=0`` restores the in-RPC walk.
+        """
+        if str(os.environ.get("SGLANG_WEG2_STORE_RESCAN_ASYNC", "1")).strip() == "0":
+            self._weg2_rescan_store_index_sync()
+            return
+        self._weg2_join_store_rescan("wake (previous rescan)")
+        th = threading.Thread(target=self._weg2_rescan_store_index_sync,
+                              name="weg2-store-rescan", daemon=True)
+        self.weg2_store_rescan_thread = th
+        th.start()
+        logger.info("WEG2-STORE-RESCAN async at wake: walking the L3 store on thread %s, off the "
+                    "resume RPC; its W8b verdict is voted at the next release fence", th.name)
+
+    def _weg2_join_store_rescan(self, where: str) -> None:
+        th = self.weg2_store_rescan_thread
+        if th is None:
+            return
+        t0 = time.perf_counter()
+        th.join()
+        self.weg2_store_rescan_thread = None
+        waited = (time.perf_counter() - t0) * 1000
+        if waited >= 1.0:
+            logger.info("WEG2-STORE-RESCAN joined at %s: waited %.0f ms for the walk", where, waited)
+
+    def _weg2_rescan_store_index_sync(self) -> None:
         """Re-read the L3 store directory into the LRU index at this wake.
 
         #1295: ``HiCacheStorage.rescan_eviction_index`` was written as THE
@@ -4206,7 +4590,8 @@ class SchedulerWeightUpdaterManager:
             "does not scan; %d B are staging/partial files "
             "(instrument: os.scandir + os.stat over the store, charged at "
             "max(st_blocks*512, st_size) -- the #410 unit, not apparent size) "
-            "in %.0f ms",
+            "in %.0f ms (mode %s: journal = only the lines written since the "
+            "last wake, walk = the whole directory)",
             census.get("indexed_entries", 0),
             census.get("seen_entries", 0),
             census.get("indexed_bytes", 0),
@@ -4216,6 +4601,7 @@ class SchedulerWeightUpdaterManager:
             census.get("foreign_bytes", 0),
             census.get("staging_bytes", 0),
             (time.perf_counter() - t0) * 1000,
+            census.get("mode", "walk"),
         )
 
     def _weg2_drain_hicache_before_sleep(
@@ -4287,20 +4673,46 @@ class SchedulerWeightUpdaterManager:
                 )
             )
 
+    def _weg2_sleep_flush(self) -> int:
+        """Q-570: the release leg's ``flush_cache(zero_kv=False)``, run until
+        no rank's radix tree holds a device value (``weg2_sleep_drain.
+        sleep_flush_until_reset``). B1 (``WEG2-FLUSH-NONBLOCK quiesced``) hands
+        the tree reset to this flush; its idle verdict is rank-local, and NF
+        y8s D TP1 refused it (``hicache_backup(2)``, the flush's own #1470
+        publish) while TP0/TP2 reset -- the refusal was dropped, the pause
+        followed, and the wake's #1455 restore cleared the pools under the kept
+        tree (#924 MAMBA SLOT ALIASING, free_and_cached=22). Called on EVERY
+        rank of the group (the held bit and the drain are collectives). Returns
+        the retries used; raises W120b before any pause otherwise."""
+        sch = self.scheduler
+        tc = getattr(sch, "tree_cache", None) if sch is not None else None
+        if tc is None:
+            self.flush_cache(zero_kv=False)
+            return 0
+        return sleep_flush_until_reset(
+            flush=lambda: self.flush_cache(zero_kv=False),
+            tree=tc,
+            drain=self._weg2_drain_hicache_before_sleep,
+            log=logger,
+        )
+
     def _weg2_hold_owned_prefetch(self) -> frozenset:
         """H91e: the open prefetch records of the #1443 dormant hold (empty
         while the group is awake) -- see ``weg2_sleep_drain.hold_owned_prefetch``."""
         sch = self.scheduler
         if sch is None:
             return frozenset()
-        return hold_owned_prefetch(
+        _op = getattr(getattr(sch, "tree_cache", None), "ongoing_prefetch", None) or ()
+        owned = hold_owned_prefetch(
             dormant=bool(getattr(sch, "weg2_dormant", False)),
             hold=getattr(sch, "weg2_dormant_hold", None) or (),
-            ongoing_prefetch=getattr(
-                getattr(sch, "tree_cache", None), "ongoing_prefetch", None
-            )
-            or (),
+            ongoing_prefetch=_op,
         )
+        # PDFLIP-A: the reads of D's park list are not a sleep term either
+        from sglang.srt.managers.weg2_sleep_drain import parked_owned_prefetch
+
+        return owned | parked_owned_prefetch(
+            parked=getattr(sch, "weg2_d_parked", None) or (), ongoing_prefetch=_op)
 
     def _weg2_sleep_idle(self) -> bool:
         """The release leg's idle assert. H91e: with the dormant hold's own
@@ -5645,7 +6057,9 @@ class SchedulerWeightUpdaterManager:
                 ext = sp._pp_load_back_extent(req)
                 if not ext:
                     logger.info("WEG2-PRELOAD rid=%s no host extent (device hit %d)",
-                                str(getattr(req, "rid", "?"))[:12], len(getattr(req, "prefix_indices", []) or []))
+                                str(getattr(req, "rid", "?"))[:12],
+                                0 if getattr(req, "prefix_indices", None) is None
+                                else len(req.prefix_indices))  # SL: no bool() of a tensor
                     continue
                 res = tree.inc_lock_ref(req.last_node)
                 dec = res.to_dec_params() if tree.is_tree_cache() else None
@@ -6768,6 +7182,20 @@ class SchedulerWeightUpdaterManager:
         sched = self.scheduler
         if sched is None:
             return False
+        # Q-570 tripwire: clearing the pools under a tree that still references
+        # device slots puts every one of them on BOTH credit sides (NF y8s TP1:
+        # free_and_cached=22, #924 MAMBA SLOT ALIASING at the first idle pass).
+        # The sleep leg guarantees a device-free tree (_weg2_sleep_flush); a
+        # tree that still holds one here is refused by name, before any clear.
+        held_full, held_mamba = tree_device_held(getattr(sched, "tree_cache", None))
+        if held_full or held_mamba:
+            raise RuntimeError(
+                f"W26b Weg2WakeTreeHeld: the radix tree kept across the sleep still holds "
+                f"device values (full={held_full} mamba={held_mamba}); the #1455 restore "
+                f"would clear req_to_token/mamba/allocator under them (#924 MAMBA SLOT "
+                f"ALIASING). The sleep flush of this rank did not reset its tree -- nothing "
+                f"was cleared."
+            )
         try:
             sched.req_to_token_pool.clear()
             sched.token_to_kv_pool_allocator.clear()
@@ -8457,6 +8885,29 @@ class SchedulerWeightUpdaterManager:
         finally:
             if _b1 is not None:
                 _b1.clear_credit_wait()
+        # y7o (02.10.): the FIRST claimed tag of this leg names what the
+        # co-located sleeper had published when it was granted -- the metal
+        # proof of the front's WEG2-LEG-ORDER (wake_credit.lockstep_claims):
+        # via=counter means the published balance covered it, no card path.
+        try:
+            if getattr(self, "_weg2_leg_order_epoch", None) != epoch:
+                self._weg2_leg_order_epoch = epoch
+                _st = credit.read() or {}
+                logger.info(
+                    "WEG2-LEG-ORDER card=%s first_claim=%s paused_first=%s waited_ms=%.0f "
+                    "via=%s published_mib=%d need_mib=%d",
+                    self._weg2_card_uuid() or "unknown", tag,
+                    ",".join(str(t) for t in _st.get("tags", [])) or "-",
+                    float(rec.get("waited_s", 0.0)) * 1000,
+                    "counter" if int(rec.get("available_bytes", 0) or 0) >= 0 else "card-overdraw",
+                    int(_st.get("credit_bytes", 0) or 0) // MIB_, int(need_bytes) // MIB_)
+        except Exception as _lo_exc:  # noqa: BLE001 -- an instrument, never a gate
+            # LAYER-REST-1002: y7t carried 0 of these lines on 18 legs and the
+            # bare `pass` said nothing about why -- name it, once per leg.
+            if getattr(self, "_weg2_leg_order_na_epoch", None) != epoch:
+                self._weg2_leg_order_na_epoch = epoch
+                logger.info("WEG2-LEG-ORDER n/a tag=%s (%s: %s)", tag,
+                            type(_lo_exc).__name__, _lo_exc)
         # xsn323: remember the tightest point of these legs. The kv-first gate
         # of the NEXT wake reads it: kv_cache resumed before the legs must not
         # eat the free space the legs' tags need (5090: free 9028 MiB at
@@ -8562,6 +9013,14 @@ class SchedulerWeightUpdaterManager:
         # state the first attempt left it, and refusing there would turn a safe
         # no-op into a group death.
         self._weg2_raise_pending_seam_refusal()  # #1450
+        # DP-NACHLAUF: the last decode rounds reach the log before the sleep,
+        # not after the next wake (DecodeRoundLog.drain_blocking; log only)
+        try:
+            _drl = getattr(getattr(self.scheduler, "metrics_reporter", None), "decode_round_log", None)
+            if _drl is not None:
+                _drl.drain_blocking()
+        except Exception:  # noqa: BLE001 -- a log drain never breaks the sleep
+            pass
         replay = self._weg2_leg_replay("release", recv_req)
         _weg2_ph_t = [time.perf_counter()]
         _weg2_ph_l = []
@@ -8638,6 +9097,36 @@ class SchedulerWeightUpdaterManager:
         # verdict over that group first and raises W120 on every rank alike.
         self._weg2_drain_hicache_before_sleep()
         _weg2_ph("drain_hicache")
+        if self._weg2_group_name() == "D":
+            # RW: the LRU owners of every pool layer, BEFORE any pause (the
+            # tables live under a paused tag); ids only, no expert bytes.
+            try:
+                from sglang.srt.layers.moe.expert_offload import resume_warm as _rw
+
+                _m = getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)
+                if _m is not None:
+                    _rw().snapshot([_m])
+            except Exception as _exc:  # noqa: BLE001 -- the warm is a hint, never a sleep refusal
+                logger.warning("RW RESUME-WARM snapshot skipped: %s", _exc)
+            _weg2_ph("rw_snapshot")
+            # #276: the D phase ends here -- its heat record, before any pause
+            # (off unless SGLANG_DEBUG_MOE_HEAT names a directory; never raises)
+            from sglang.srt.layers.moe import pool_heat as _heat
+
+            _heat.flush(
+                [getattr(getattr(getattr(self, "tp_worker", None), "model_runner", None), "model", None)],
+                rank=self._weg2_rank(), group="D", reason="sleep",
+                phase_index=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
+            )
+            # #239 S3f: the rank's miss cost of this phase (off unless
+            # SGLANG_WEG2_OWNED_MISS_RECORD names a directory; never raises)
+            from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+
+            _miss_cost.flush(
+                rank=self._weg2_rank(), group="D", reason="sleep",
+                model=getattr(self._weg2_server_args(), "model_path", None),
+                phase_index=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
+            )
 
         assert (
             self._weg2_sleep_idle()
@@ -8751,7 +9240,10 @@ class SchedulerWeightUpdaterManager:
             if _pls is not None:
                 _pls.on_sleep()
                 logger.info("%s", _pls.census_line())
-            self.flush_cache(zero_kv=False)
+            # Q-570 (NF y8s TP1 09:53:43): the flush's verdict is rank-local and
+            # its refusal was dropped here -- TP1 paused with device values in its
+            # tree while TP0/TP2 had reset. No rank pauses with one (group-reduced).
+            self._weg2_sleep_flush()
             # AH (--p-attn-head-split): the helper mirror lives in this region;
             # reset the split rule and drain the helper before it is unmapped,
             # so no request ever continues on a mirror from before the flip.
@@ -8772,6 +9264,9 @@ class SchedulerWeightUpdaterManager:
             # walking into prepare_for_extend.  ONE flag on the object that
             # owns the pools; cleared after resume(KV_CACHE) below.
             if scheduler is not None:
+                # L3 evict off-path (NF review 2): the sleeping group's background L3 evictor parks BEFORE the
+                # dormant marker -- after it the sibling owns the store. No-op when the switch is off.
+                self._weg2_pause_l3_evictor()
                 scheduler.weg2_dormant = True
                 logger.info(
                     "WEG2-DORMANT set: kv_cache paused, admission seams refuse "
@@ -8797,8 +9292,14 @@ class SchedulerWeightUpdaterManager:
             ):
                 self._hibernate_park_weights(recv_req)
             if not family_paused_before:
-                self.stashed_model_static_state = _export_static_state(
-                    self.tp_worker.model_runner.model
+                from sglang.srt.weg2 import sleep_staging as _ss
+
+                # +254 MiB fix (b): the stash sleeps on the HOST (64 MiB on NF
+                # PP0 no pause covered); the wake's import copies it back.
+                self.stashed_model_static_state = (
+                    _ss.export_static_state_host(self.tp_worker.model_runner.model)
+                    if _ss.enabled() and os.environ.get("SGLANG_WEG2_GROUP")
+                    else _export_static_state(self.tp_worker.model_runner.model)
                 )
             torch.distributed.barrier(self.tp_cpu_group)
             # The PCIe serialisation lock is taken AFTER the barrier and around
@@ -8928,10 +9429,17 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_flip_index_now = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
             except Exception:  # noqa: BLE001 -- the stubs carry no epoch: the counter seq stays
                 pass
+            # PAUSE-MAPS (patch 5): the saver's unmap form for this leg's
+            # pauses -- one cuMemUnmap per contiguous run of H95c extents
+            # (switch on) or per extent (off, the walk call for call).
+            from sglang.srt.weg2 import pause_maps as _weg2_pause_maps
+
+            _weg2_pause_maps.arm(self.memory_saver_adapter)
             # fnFL2 H111b: the pair lanes one tag ahead of the pause
             # (weg2/deposit_lookahead.py); the scope yields None = lockstep.
             with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)), \
-                    self._weg2_h111b_scope(recv_req, weights_tags) as _h111b:
+                    self._weg2_h111b_scope(recv_req, weights_tags) as _h111b, \
+                    self._weg2_pause_overlap_scope(recv_req, weights_tags, _h111b) as _po:
                 _t_prev_end = None
                 logger.info("WEG2-SLEEP-PRELOOP ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
                 for _h111b_i, tag in enumerate(weights_tags):
@@ -8947,6 +9455,18 @@ class SchedulerWeightUpdaterManager:
                     # needs can run -- which is the ordering boot weg2xsn30
                     # did not have. The buffer holds a whole tag (Option 1),
                     # so this completes without its collector.
+                    # TAG-STALL-SENTINEL (NF y3z ep52: PP0 5.4 s process-wide
+                    # still at the first tag of P's sleep): the GIL sampler
+                    # (weg2/stall_sampler) writes every thread's stack if this
+                    # tag outlives SGLANG_WEG2_TAG_STALL_SENTINEL_S; late_ms
+                    # names a stall that held the GIL in C.
+                    _stall = _tag_stall.arm(tag, rank=self._weg2_rank(),
+                                            group=self._weg2_group_name())
+                    if _po is not None:
+                        # PAUSE-OVERLAP: an on-card-lane deposit waits for the
+                        # pending pause (and its credit) -- the chain's view
+                        # of this card; any other deposit runs beside it.
+                        _po.before_deposit(tag)
                     _t_dep0 = time.perf_counter()
                     _gap_ms = ((_t_dep0 - _t_prev_end) * 1000
                                if _t_prev_end is not None else 0.0)
@@ -8971,35 +9491,50 @@ class SchedulerWeightUpdaterManager:
                     except Exception:  # noqa: BLE001 -- no device: nothing to wait for
                         pass
                     _sync_ms = (time.perf_counter() - _t_sync0) * 1000
-                    t_tag = time.perf_counter()
-                    self.memory_saver_adapter.pause(tag)
-                    weg2_per_tag[tag] = [
-                        float(tag_bytes.get(tag, 0)),
-                        (time.perf_counter() - t_tag) * 1000,
-                    ]
-                    _t_cr0 = time.perf_counter()
-                    if credit is not None:
-                        # The device bytes this tag's pause just gave back --
-                        # the same number, from the same instrument, that the
-                        # waking rank is waiting on.
-                        credit.publish(tag, tag_bytes.get(tag, 0))
-                    if _h111b is not None:
-                        _h111b.advance(_h111b_i)  # H111b: lanes may take the next tag
-                    _t_prev_end = time.perf_counter()
-                    # 2026-09-15 (Nutzer-Order: die Schlaefer-Schleife je Tag
-                    # messen): deposit = plan filter + gap check + lanes,
-                    # pause = tms unmap, credit = publish, gap = the loop's own
-                    # work between the previous tag's credit and this deposit.
-                    logger.info(
-                        "WEG2-SLEEP-TAG-TIME tag=%s deposit_ms=%.0f sync_ms=%.0f pause_ms=%.0f "
-                        "credit_ms=%.0f gap_ms=%.0f total_ms=%.0f t0=%.3f t=%.3f",
-                        tag, (_t_sync0 - _t_dep0) * 1000, _sync_ms,
-                        weg2_per_tag[tag][1], (_t_prev_end - _t_cr0) * 1000,
-                        _gap_ms, (_t_prev_end - _t_dep0) * 1000,
-                        # wall-clock stamps (order point 2 timeline): the
-                        # front log is wall-clock ms, so the legs align on it
-                        time.time() - (time.perf_counter() - _t_dep0),
-                        time.time())
+
+                    def _weg2_pause_step(tag=tag, _t_dep0=_t_dep0, _t_sync0=_t_sync0,
+                                         _sync_ms=_sync_ms, _gap_ms=_gap_ms,
+                                         _h111b_i=_h111b_i):
+                        t_tag = time.perf_counter()
+                        self.memory_saver_adapter.pause(tag)
+                        weg2_per_tag[tag] = [
+                            float(tag_bytes.get(tag, 0)),
+                            (time.perf_counter() - t_tag) * 1000,
+                        ]
+                        _t_cr0 = time.perf_counter()
+                        if credit is not None:
+                            # The device bytes this tag's pause just gave back --
+                            # the same number, from the same instrument, that the
+                            # waking rank is waiting on.
+                            credit.publish(tag, tag_bytes.get(tag, 0))
+                        if _h111b is not None:
+                            _h111b.advance(_h111b_i)  # H111b: lanes may take the next tag
+                        _t_end = time.perf_counter()
+                        # 2026-09-15 (Nutzer-Order: die Schlaefer-Schleife je Tag
+                        # messen): deposit = plan filter + gap check + lanes,
+                        # pause = tms unmap, credit = publish, gap = the loop's own
+                        # work between the previous tag's credit and this deposit.
+                        # PAUSE-OVERLAP: total/t then end at THIS tag's credit,
+                        # which may lie inside the next tag's deposit.
+                        logger.info(
+                            "WEG2-SLEEP-TAG-TIME tag=%s deposit_ms=%.0f sync_ms=%.0f pause_ms=%.0f "
+                            "credit_ms=%.0f gap_ms=%.0f total_ms=%.0f t0=%.3f t=%.3f",
+                            tag, (_t_sync0 - _t_dep0) * 1000, _sync_ms,
+                            weg2_per_tag[tag][1], (_t_end - _t_cr0) * 1000,
+                            _gap_ms, (_t_end - _t_dep0) * 1000,
+                            # wall-clock stamps (order point 2 timeline): the
+                            # front log is wall-clock ms, so the legs align on it
+                            time.time() - (time.perf_counter() - _t_dep0),
+                            time.time())
+                        self._weg2_pause_sub_line(tag, weg2_per_tag[tag][1])
+                        return _t_end
+
+                    if _po is None:
+                        _t_prev_end = _weg2_pause_step()
+                    else:
+                        _po.submit(tag, _weg2_pause_step)
+                        _t_prev_end = time.perf_counter()
+                    _tag_stall.disarm(_stall)  # names the dump if it fired
             # #1360b: ONE `WEG2-RING NEED` LINE PER SAVED TAG, not per
             # ring-carried tag.  The loop above guards the `weights_*` family
             # because those are the tags whose bytes the peer has to release --
@@ -9059,6 +9594,18 @@ class SchedulerWeightUpdaterManager:
             # 2026-09-15: the depositor confirms every outstanding drain
             # (the last `depth` tags per lane) and frees its on-card staging.
             self._weg2_xchg_drain_outstanding()
+            # W109b: tags spilled out of a credit cycle are fed from host
+            # memory behind the pauses; the leg is whole once they are through
+            # (every tag is paused now, so no waker still waits on this rank).
+            _b1_bl = getattr(self, "_weg2_bar1", None)
+            if _b1_bl is not None and hasattr(_b1_bl, "join_backlog"):
+                _bl_why = _b1_bl.join_backlog(WEG2_GROUP_FENCE_BUDGET_S)
+                if _bl_why:
+                    from sglang.srt.weg2 import weight_exchange as _wx_bl
+
+                    raise _wx_bl.Weg2XchgPlanDisagree(
+                        f"W68 Weg2XchgPlanDisagree: W109b backlog of this sleep leg "
+                        f"refused: {_bl_why}")
             logger.info(
                 "WEG2-CHUNK-BYTES sleep tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, "
                 "/proc/self/status; CROSS-CHECK ONLY -- tms_tag_bytes above is the instrument, and this "
@@ -9144,13 +9691,34 @@ class SchedulerWeightUpdaterManager:
 
         if weg2_memory_saver_on:
             self._weg2_log_dc_breakdown("release tags=%s" % (list(tags),))  # #1446
+        # 28.09.: the async wake rescan (see _weg2_rescan_store_index) ends
+        # before this group sleeps, and its W8b verdict rides THIS fence's
+        # ok-bit -- read-and-clear, exactly as the resume fence does.
+        self._weg2_join_store_rescan("release")
+        store_failure = self.weg2_store_rescan_failure
+        self.weg2_store_rescan_failure = ""
         report: Dict[str, Any] = {}
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(
                 "release tags=%s" % (list(tags),),
+                ok=not store_failure,
+                failure=store_failure,
                 per_tag=weg2_per_tag,
                 leg_ms=weg2_leg_ms,
             )
+        if store_failure and not report:
+            raise Weg2WakeRefused(store_failure)
+        # 28.09.: the L3 journal's fsync, on a thread AFTER this leg's fence --
+        # never inside the sleep RPC (a flip is never slowed); the write-ahead
+        # order already makes an unsynced tail harmless (store_journal.py)
+        try:
+            _tc = getattr(self.scheduler, "tree_cache", None)
+            _ev = getattr(getattr(getattr(_tc, "cache_controller", None), "storage_backend", None),
+                          "_evictor", None)
+            if _ev is not None and hasattr(_ev, "journal_sync_async"):
+                _ev.journal_sync_async()
+        except Exception:  # noqa: BLE001
+            pass
 
         # C17: the group's answer carries what the group moved.  ``per_tag``
         # falls back to THIS rank's own numbers when there was no group to
@@ -9163,11 +9731,17 @@ class SchedulerWeightUpdaterManager:
             critical_path=(report.get("critical_path") or None)
             if weg2_memory_saver_on
             else None,
+            anchors_lost=(report.get("anchors_lost") or None)
+            if weg2_memory_saver_on
+            else None,
         ))
 
     @_weg2_group_stop_on_leg_failure
     @_vram_peak_leg("resume")
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        from sglang.srt.weg2.d_early_start import stop_free_read_journal
+
+        stop_free_read_journal()  # BOOTZEIT 3: journal window = stage 0 .. first wake
         # #1285: see the release leg.  This one is the sharper case -- the wake's
         # very first mutation below drops each tag from the offload set, which
         # raises KeyError on a repeat, so without this the retry kills the group.
@@ -9175,6 +9749,13 @@ class SchedulerWeightUpdaterManager:
         replay = self._weg2_leg_replay("resume", recv_req)
         _weg2_ph_t = [time.perf_counter()]
         _weg2_ph_l = []
+        # F22 (29.09.): sub-counters inside three WAKE-TAIL phases that grew
+        # against x178 (median z30w-park vs x178: reload 111/44, dest_hook_compare
+        # 123/13, store_rescan 146/1 ms) -- printed as WEG2-WAKE-TAIL-SUB
+        _weg2_sub = {}
+
+        def _weg2_sub_t(name, t0):
+            _weg2_sub[name] = _weg2_sub.get(name, 0.0) + (time.perf_counter() - t0) * 1000
         
         def _weg2_ph(name):
             _n = time.perf_counter()
@@ -9183,19 +9764,36 @@ class SchedulerWeightUpdaterManager:
 
         if replay is not None:
             return replay
+        if self.scheduler is not None:
+            self.scheduler._weg2_resume_t0 = time.perf_counter()  # RW instrument: the leg's start
+        # KRIT3 (weg2/resume_via_p.py): a resume is a wake -- P ran in between;
+        # RESUME-VIA-P counts its attempts per wake, not per refusal.
+        try:
+            from sglang.srt.weg2 import resume_via_p as _weg2_rvp_wake
+
+            _weg2_rvp_wake.note_wake(getattr(self, "scheduler", None))
+        except Exception:  # noqa: BLE001 -- an instrument, never the wake
+            pass
         # H95: the P->D wake's kv_cache resume carries handoff_n/parked_n
         # (front rule 2); D's phase seat count follows from it on every rank.
         _phase_seats = None
+        # WT (30.09.): the kv call's first phase mark is cg_resume, so it carried
+        # everything before the graph resume (y4f median 99 ms vs rc12g 9 ms, the
+        # remap itself 3 ms) -- the seat/reshard work gets its own sub-counter.
+        _sub_t0 = time.perf_counter()
         if getattr(recv_req, "handoff_n", None) is not None:
             _note_seats = getattr(getattr(self, "scheduler", None), "weg2_d_note_wake_seats", None)
             if callable(_note_seats):
                 _phase_seats = _note_seats(recv_req)
+        _weg2_sub_t("wake_seats", _sub_t0)
         # H95c: BEFORE any tag of this request resumes -- the posts of the
         # phase's seats become pages (the first request of a wake without a
         # count: the cap form). A no-op unless SGLANG_OPT_WEG2_D_SEAT_VRAM on D.
+        _sub_t0 = time.perf_counter()
         _seat_vram = getattr(getattr(self, "scheduler", None), "weg2_d_seat_vram_wake", None)
         if callable(_seat_vram):
             _seat_vram(recv_req, _phase_seats)
+        _weg2_sub_t("seat_vram", _sub_t0)
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}
@@ -9269,6 +9867,18 @@ class SchedulerWeightUpdaterManager:
                 logger.info("WEG2-WAKE-KV-FIT skipped (%s: %s)", type(_exc).__name__, _exc)
                 _kv_floor = 0
             _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
+            if _unfit is not None and _kv_free is not None:
+                # z30y7: the sleeper's leg runs concurrently and may still be
+                # releasing -- wait for the card (bounded), then decide
+                from sglang.srt.weg2.wake_kv import kv_fit_wait_s, wait_for_kv_fit
+
+                _unfit_first = _unfit
+                _unfit, _kv_free, _waited = wait_for_kv_fit(
+                    self._weg2_free_bytes, _kv_need, _kv_floor, wait_s=kv_fit_wait_s())
+                logger.warning(
+                    "WEG2-WAKE-KV-FIT-WAIT epoch=%s first: %s -> after %.2f s: %s",
+                    _kv_epoch, _unfit_first, _waited,
+                    "fits (free=%d MiB), resuming" % (int(_kv_free or 0) >> 20) if _unfit is None else _unfit)
             # xsn410 (20.09.): THE GROUP VERDICT SITS HERE, BETWEEN THE RESUME AND
             # THE CLEAR HALF. Placed after the clear half (xsn409's fix), it
             # deadlocked: the two resumed ranks ran the clear half's collective
@@ -9291,6 +9901,7 @@ class SchedulerWeightUpdaterManager:
                     _kv_epoch, _unfit,
                 )
                 return self._weg2_kv_group_verdict(False, _kv_epoch)
+            _t_kv = time.perf_counter()
             try:
                 self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             except Weg2TmsResumeRefused as _exc:
@@ -9300,6 +9911,17 @@ class SchedulerWeightUpdaterManager:
                     _kv_epoch, _exc,
                 )
                 return self._weg2_kv_group_verdict(False, _kv_epoch)
+            # #251c/d §6.4: the resume's own price per stage (log only)
+            try:
+                from sglang.srt.weg2.d_seat_vram import PHASE_ATTR as _PHASE_ATTR
+                from sglang.srt.weg2.wake_kv import kv_resume_time_line
+
+                logger.info("%s", kv_resume_time_line(
+                    (time.perf_counter() - _t_kv) * 1000, _kv_need, _kv_free,
+                    self._weg2_free_bytes() if _kv_free is not None else None,
+                    getattr(self.scheduler, _PHASE_ATTR, None), _kv_epoch))
+            except Exception as _exc:  # noqa: BLE001 -- an instrument never stops a wake
+                logger.info("WEG2-WAKE-KV-TIME skipped (%s: %s)", type(_exc).__name__, _exc)
             if not self._weg2_kv_group_verdict(True, _kv_epoch):
                 return False  # a sibling refused: the verdict paused this rank's pool again
             self._weg2_kv_resumed_epoch = _kv_epoch
@@ -9375,6 +9997,18 @@ class SchedulerWeightUpdaterManager:
                 # fnFL2x36: the standstill pass bound gets a grace of one
                 # stall window from here (scheduler._weg2_note_prefetch_progress)
                 scheduler._weg2_last_wake_t = time.perf_counter()
+                # RW: one WAKE-FIRST-TOKEN line per wake -- ONLY when the wake has
+                # parked work (the dormant hold or a queued request). NF rc12z26
+                # 18:32: every request was aborted before the wake, the first
+                # decode was a health check 114 s later, and the line printed
+                # wake_to_first_decode_ms=116342 as if the wake had been slow.
+                _rw_work = (len(getattr(scheduler, "weg2_dormant_hold", None) or ())
+                            + len(getattr(scheduler, "weg2_post_wake_settle", None) or ())
+                            + len(getattr(scheduler, "waiting_queue", None) or ()))
+                scheduler._rw_first_token_open = _rw_work > 0
+                if not _rw_work:
+                    logger.info("RW WAKE-FIRST-TOKEN kein Resume: the wake holds no parked or "
+                                "queued request -- no wake-to-first-decode measured for this wake")
                 logger.info(
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
@@ -9400,10 +10034,14 @@ class SchedulerWeightUpdaterManager:
                 _iw = getattr(scheduler, "_weg2_intake_watch", None)
                 if _iw is not None:
                     _iw.reset()
+                _sub_t0 = time.perf_counter()
                 self._weg2_rescan_store_index()
+                _weg2_sub_t("rescan", _sub_t0)
                 _rel = getattr(scheduler, "_weg2_release_dormant_hold", None)  # #1443
                 if callable(_rel):
+                    _sub_t0 = time.perf_counter()
                     _rel()
+                    _weg2_sub_t("hold_release", _sub_t0)
                 _weg2_ph("store_rescan")
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     for queue_name in (
@@ -9432,15 +10070,20 @@ class SchedulerWeightUpdaterManager:
             return True
 
         _weg2_kv_done = False
+        _weg2_kv_refusal = ""
         from sglang.srt.weg2.wake_kv import wake_kv_plan as _wk_plan
         _kv_epoch = getattr(recv_req, "epoch", None)
         _kv_in = GPU_MEMORY_TYPE_KV_CACHE in tags
         # xsn410: the fit is PER RANK (xsn377: TP1 funded, TP0 never) but the plan
         # must be the GROUP's, because the resume half now carries a collective --
         # one rank on "early" beside a sibling on "late" would deadlock there.
-        _fundable = (self._weg2_wake_kv_first_ok(tags) if _kv_in else False)
+        _sub_t0 = time.perf_counter()
+        # FLIPCYCLE H6: a fused weights+kv call asks for the late site only
+        _fundable = (self._weg2_wake_kv_first_ok(tags)
+                     if _kv_in and not getattr(recv_req, "kv_late", None) else False)
         if _kv_in:
             _fundable = self._weg2_kv_group_all(_fundable, "WAKE-KV-FIRST fundable")
+        _weg2_sub_t("kv_plan_vote", _sub_t0)
         _plan = _wk_plan(
             kv_in_tags=_kv_in,
             weights_in_tags=any(is_weights_family_tag(t) for t in tags),
@@ -9485,6 +10128,7 @@ class SchedulerWeightUpdaterManager:
             t_graph = time.perf_counter()
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
             _weg2_ph("cg_resume")
+            _weg2_sub_t("cg_remap", t_graph)
             graph_ms = (time.perf_counter() - t_graph) * 1000
             graph_bytes = self._weg2_tag_bytes(GPU_MEMORY_TYPE_CUDA_GRAPH)
             # WAKE INVARIANT FOR THE GRAPH TAG, the exact mirror of the
@@ -9548,6 +10192,25 @@ class SchedulerWeightUpdaterManager:
             # Same lock, same reason as the sleep leg above.
             t_w0 = time.perf_counter()
             _weg2_ph("pre_leg")
+            # F22 WAKE-READ-EARLY: the #248 hold reads start beside the legs
+            # (host-only aux-thread reads); off = issued at DORMANT-RELEASE.
+            if self.scheduler is not None:
+                try:
+                    from sglang.srt.weg2 import park_l3 as _pl3_early
+
+                    _pl3_early.issue_reads_at_wake_begin(self.scheduler)
+                except Exception as _early_exc:  # noqa: BLE001 -- the release issues what is left
+                    logger.warning("#248 WAKE-READ-EARLY n/a (%s: %s) -- the release issues it",
+                                   type(_early_exc).__name__, _early_exc)
+                # TAIL-STAGE-EARLY: the hold's E2 tail staging beside the legs
+                # (weg2/tail_adopt.stage_early; off = the first post-wake check)
+                try:
+                    from sglang.srt.weg2 import tail_adopt as _ta_early
+
+                    _ta_early.stage_at_wake_begin(self.scheduler)
+                except Exception as _ta_exc:  # noqa: BLE001 -- the post-wake check stages it
+                    logger.warning("WEG2-TAIL-STAGE-EARLY n/a (%s: %s)", type(_ta_exc).__name__, _ta_exc)
+                _weg2_ph("read_early")
             shm0 = self._weg2_rss_shmem_mib()
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
             # H31: the Platztausch pad+extra rows, issued per tag behind its
@@ -9587,6 +10250,10 @@ class SchedulerWeightUpdaterManager:
                 # 2026-09-15 (Punkt 2, SGLANG_WEG2_WAKE_OVERLAP default 1)
                 _wake_worker = None
                 _wake_futs = []
+                from sglang.srt.weg2 import wake_runahead as _weg2_runahead
+
+                _ra_any = _weg2_runahead.runahead_any_on()
+                _ra_waited = [0.0, 0]
                 if _weg2_wake_overlap_armed():
                     from concurrent.futures import ThreadPoolExecutor as _TPE
                     # 18.09. (xsn367): TWO collects in flight -- the flip's critical chain
@@ -9878,8 +10545,11 @@ class SchedulerWeightUpdaterManager:
                             # found no VRAM and the chain wedged (W68 at the
                             # sleeper's drain wait). Resume t+1 may overlap
                             # collect t, nothing further: wait for t-1 here.
-                            if len(_wake_futs) > _n_wake_workers:
-                                _wake_futs[-(_n_wake_workers + 1)][1].result()
+                            # WAKE-RUNAHEAD-ANY (weg2/wake_runahead.py): off = the
+                            # FIFO wait for the collect bound+1 places back
+                            _ra_waited[0] += _weg2_runahead.bound_wait(
+                                _wake_futs, _n_wake_workers, _ra_any)
+                            _ra_waited[1] += 1
                         else:
                             self._weg2_bar1_register(tag)
                             self._weg2_turns_register(tag)
@@ -9938,9 +10608,10 @@ class SchedulerWeightUpdaterManager:
                     except BaseException as _fexc:  # noqa: BLE001
                         _errs.append((_ftag, _fexc))
                 _wake_worker.shutdown(wait=True)
-                logger.info("WEG2-WAKE-OVERLAP collects=%d joined_ms=%.0f errors=%d",
+                logger.info("WEG2-WAKE-OVERLAP collects=%d joined_ms=%.0f errors=%d "
+                            "runahead=%s runahead_wait_ms=%.0f",
                             len(_wake_futs), (time.perf_counter() - _t_join) * 1000,
-                            len(_errs))
+                            len(_errs), "any" if _ra_any else "fifo", _ra_waited[0] * 1000)
                 if _errs:
                     raise _errs[0][1]
             # xsn265/266: the collector is the LAST reader of every lane it
@@ -9956,6 +10627,17 @@ class SchedulerWeightUpdaterManager:
                 logger.info("WEG2-SEQ lane-release skipped: %r", _rel_exc)
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             _weg2_ph("leg_collects")
+            # TAIL-STAGE-AFTER-LEGS: the other site of TAIL-STAGE-EARLY --
+            # behind the last weight collect, so the staging threads no
+            # longer compete with the collectors (tail_adopt.stage_site).
+            if self.scheduler is not None:
+                try:
+                    from sglang.srt.weg2 import tail_adopt as _ta_late
+
+                    _ta_late.stage_at_wake_begin(self.scheduler, site=_ta_late.SITE_LEGS_END)
+                except Exception as _ta_late_exc:  # noqa: BLE001 -- the post-wake check stages it
+                    logger.warning("WEG2-TAIL-STAGE-EARLY n/a at legs end (%s: %s)",
+                                   type(_ta_late_exc).__name__, _ta_late_exc)
             # fnFL2 v43: THE WEIGHTS-SIDE MIRROR of the graph tag's
             # `_weg2_zero_graph_scratch` above, and for the identical reason.
             # `marlin_make_workspace` registers a semaphore array as a
@@ -10023,6 +10705,14 @@ class SchedulerWeightUpdaterManager:
                     _m, prefetch=_rearm_pf, defer=_defer, sync=False)
                 _rl += int(_l)
                 _rz += int(_z)
+            # #284 DEFER_HOST: the rows of the host-planned layers are NOT
+            # issued here any more (#284b): every host wait still ahead of this
+            # wake -- the static import below (a pageable H2D) and the kv RPC's
+            # lmem restore (cuCtxSetLimit, a device-idle wait) -- queued behind
+            # them and paid the whole copy again (y3j 09291933: PP1 reload
+            # 1262 -> 16 ms, static_import 11 -> 1146 ms, P wake unchanged).
+            # They go on the side stream at _weg2_defer_host_fill_start, once
+            # the admission is open; the next forward still waits the events.
             if _scratch:
                 # residue_nonzero: lock entries the recycled pages handed back
                 # NON-ZERO, counted before the memset (27B 2026-09-25: the
@@ -10035,6 +10725,20 @@ class SchedulerWeightUpdaterManager:
                     len(_scratch), self._weg2_scratch_residue[0],
                     self._weg2_scratch_residue[1], _scratch[0],
                 )
+            if self._weg2_group_name() == "D":
+                # RW: the warm is ARMED here and RUNS after the legs, in the
+                # scheduler's idle settle passes -- nothing is copied in the leg.
+                try:
+                    from sglang.srt.layers.moe.expert_offload import resume_warm as _rw
+
+                    _rw().arm(_early)
+                except Exception as _exc:  # noqa: BLE001
+                    logger.warning("RW RESUME-WARM arm skipped: %s", _exc)
+                # #276: the counters live under a paused tag -- a new D phase
+                # counts from zero (no-op when the heat record is off)
+                from sglang.srt.layers.moe import pool_heat as _heat
+
+                _heat.reset(list(_early) + list(_late))
             if _rl:
                 _pf_rows = _pf_join.rows if _pf_join is not None else 0
                 _deferred = deferred_rows_fill().rows_pending()
@@ -10097,7 +10801,9 @@ class SchedulerWeightUpdaterManager:
                 "tms_tag_bytes above is the instrument)",
                 weights_tags, self._weg2_rss_shmem_mib() - shm0, shm0, self._weg2_rss_shmem_mib(),
             )
+            _sub_t0 = time.perf_counter()
             torch.distributed.barrier(self.tp_cpu_group)
+            _weg2_sub_t("legs_barrier", _sub_t0)
             family_complete = not any(
                 is_weights_family_tag(t) for t in self.offload_tags
             )
@@ -10114,12 +10820,16 @@ class SchedulerWeightUpdaterManager:
                 # disk BEFORE the static-state import, so the stash exported
                 # from the live model at sleep stays the last writer for the
                 # buffers.  Both only once the WHOLE family is mapped again.
+                _sub_t0 = time.perf_counter()
                 self._weg2_wake_reload_weights()
+                _weg2_sub_t("reload_weights", _sub_t0)
                 _weg2_ph("reload")
+                _sub_t0 = time.perf_counter()
                 _import_static_state(
                     self.tp_worker.model_runner.model,
                     self.stashed_model_static_state,
                 )
+                _weg2_sub_t("static_import", _sub_t0)
                 del self.stashed_model_static_state
                 # #1273 S5b: the DESTINATION half.  This hook runs after
                 # family_complete and after the reload, so whatever DID
@@ -10154,12 +10864,14 @@ class SchedulerWeightUpdaterManager:
                     if t != GPU_MEMORY_TYPE_CUDA_GRAPH
                     and not is_weights_family_tag(t)
                 ]
+                _sub_t0 = time.perf_counter()
                 self._weg2_shadow_destination_leg(
                     recv_req,
                     reserve_bytes=sum(self._weg2_tag_bytes(t)
                                       for t in pending_tags),
                     ring_ms=sum(float(v[1]) for v in weg2_per_tag.values()),
                 )
+                _weg2_sub_t("dest_leg", _sub_t0)
                 # STEP 6c: THE SHADOW COMPARE (#1342 S1b -- moved here out of
                 # `_weg2_wake_reload_weights`, where it was parked at the end of
                 # the DISK-REFILL branch and therefore unreachable on the
@@ -10179,7 +10891,9 @@ class SchedulerWeightUpdaterManager:
                 # dressed as a finding.
                 # `test_the_compare_comes_after_the_reload_in_the_wake_path`
                 # pins the order; mutant M11 pulls it above the reload.
+                _sub_t0 = time.perf_counter()
                 self._weg2_xchg_shadow_compare()
+                _weg2_sub_t("shadow_compare", _sub_t0)
                 _weg2_ph("dest_hook_compare")
                 # #1350 SEAM GRADER, destination side.  THE SAME PLACEMENT RULE
                 # the two hooks above follow, and for the same reason: this is
@@ -10221,6 +10935,18 @@ class SchedulerWeightUpdaterManager:
             if _weg2_kv_ok:
                 self._weg2_kv_epoch_done = _kv_epoch
                 self._weg2_kv_deferred = False
+            elif GPU_MEMORY_TYPE_KV_CACHE in tags:
+                # z30y7: the front's kv call used to get 200 here -- "WEG2-FLIP done
+                # woke=P" while P stayed DORMANT; the next request waited in the
+                # dormant hold forever (outstanding P=1, no line). A kv call whose
+                # resume was refused FAILS, named, through the same group fence the
+                # store verdict rides (every rank; the front sees non-200 -> W4).
+                from sglang.srt.weg2.wake_kv import kv_fit_wait_s as _kvw
+
+                _weg2_kv_refusal = (
+                    "W114 Weg2KvResumeRefused epoch=%s: the kv_cache resume was refused "
+                    "after the bounded fit wait (%.0f s) -- this group stays DORMANT; the "
+                    "wake is not done" % (_kv_epoch, _kvw()))
 
         report: Dict[str, Any] = {}
         # #1295 MUST_FIX 2: THE STORE VERDICT RIDES THE FENCE THAT IS ALREADY
@@ -10234,6 +10960,8 @@ class SchedulerWeightUpdaterManager:
         # inherit it.
         store_failure = self.weg2_store_rescan_failure
         self.weg2_store_rescan_failure = ""
+        if _weg2_kv_refusal:
+            store_failure = (store_failure + "; " if store_failure else "") + _weg2_kv_refusal
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(
                 "resume tags=%s" % (list(tags),),
@@ -10244,11 +10972,19 @@ class SchedulerWeightUpdaterManager:
             )
             _weg2_ph("fence")
             logger.info("WEG2-WAKE-TAIL ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
+            if _weg2_sub:
+                logger.info("WEG2-WAKE-TAIL-SUB ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_sub.items())
+                            + " (F22: reload = legs_barrier + reload_weights; dest_hook_compare = static_import"
+                            " + dest_leg + shadow_compare + rest; store_rescan = rescan + hold_release + rest;"
+                            " WT: kv call cg_resume = wake_seats + seat_vram + kv_plan_vote + cg_remap + rest)")
         if store_failure and not report:
             # The fence did not gather: no memory saver, no cpu group, or
             # world <= 1. A single-rank engine cannot disagree with itself, so
             # here -- and only here -- the local raise IS the group-wide stop.
             raise Weg2WakeRefused(store_failure)
+        # #284b: the last statement before the answer -- behind the fence and
+        # every host wait of this wake (a no-op while the group is dormant).
+        self._weg2_defer_host_fill_start()
 
         return self._weg2_leg_commit("resume", recv_req, ResumeMemoryOccupationReqOutput(
             per_tag=(report.get("per_tag") or weg2_per_tag or None)
@@ -10354,7 +11090,12 @@ def _export_static_state(model):
 
 
 def _import_static_state(model, static_params):
+    # WT (30.09.): a pinned host stash (sleep_staging.export_static_state_host)
+    # copies asynchronously on the current stream; the next forward is ordered
+    # behind it, and the pinned block stays owned by the caching host allocator
+    # until the copies that read it have completed.
+    non_blocking = bool(static_params.get("pinned", False))
     with torch.inference_mode():
         self_named_buffers = dict(model.named_buffers())
         for name, tensor in static_params["buffers"]:
-            self_named_buffers[name][...] = tensor
+            self_named_buffers[name].copy_(tensor, non_blocking=non_blocking)

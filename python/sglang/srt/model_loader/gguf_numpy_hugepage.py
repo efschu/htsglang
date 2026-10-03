@@ -142,6 +142,54 @@ def numpy_hugepage_off_for_gguf_load(
         switch(previous)
 
 
+def numpy_hugepage_off_for_serving(
+    where: object = None,
+    switch: Optional[Callable[[bool], bool]] = None,
+) -> bool:
+    """NUMPY-THP-SERVE: numpy's MADV_HUGEPAGE hint off for the WHOLE rank
+    process, not only for the GGUF load above (which restores numpy's default
+    afterwards, so every array the server allocated later kept the hint).
+
+    27B z30y11 (b4946aa966, 30.09.): P PP0's L3 write-behind pass ran 77.8 s
+    (cpu_ms=77776.8, slices=0) and PP0's sleep leg waited for it at the group
+    fence -- flip epoch 6, 48.1 s; four sleep flushes waited 10.3-12.9 s the
+    same way. perf of the write-behind threads (P PP0, D TP0) over 152 s: sys
+    31.4 s / 18.8 s, top frame ``arena_complete_census`` ->
+    ``do_huge_pmd_anonymous_page`` -> ``__alloc_pages_direct_compact`` ->
+    ``migrate_pages`` -> TLB shootdown (``smp_call_function_many_cond``
+    26.7 %): the census writes into four fresh ``np.empty(720896)`` arrays
+    (5.5 MiB each, >= numpy's 4 MiB hint threshold) every pass; with the
+    host's THP ``defrag=madvise`` each 2 MiB first touch compacts in the
+    faulting thread, and the compaction migrates the shared arena's shmem
+    pages -- mapped by all six ranks, so every one of them takes the
+    shootdowns and waits on the migration entries. D TP0's park-demote
+    thread showed the same frames (``default_malloc``).
+
+    Returns True when it switched the hint off. ``SGLANG_WEG2_NUMPY_HUGEPAGE=1``
+    keeps numpy's setting (pre-fix A/B arm). ``switch`` is injectable for tests.
+    """
+    from sglang.srt.environ import envs
+
+    thp = f"host THP enabled={thp_mode('enabled')} defrag={thp_mode('defrag')}"
+    if bool(envs.SGLANG_WEG2_NUMPY_HUGEPAGE.get()):
+        logger.info(
+            "[NUMPY-THP] %s: SGLANG_WEG2_NUMPY_HUGEPAGE=1 -- numpy keeps its own "
+            "MADV_HUGEPAGE setting while serving (pre-fix behaviour; %s).", where, thp)
+        return False
+    if switch is None:
+        switch = numpy_madvise_hugepage_switch()
+    if switch is None:
+        logger.info("[NUMPY-THP] %s: this numpy has no _set_madvise_hugepage (%s).", where, thp)
+        return False
+    previous = bool(switch(False))
+    logger.info(
+        "[NUMPY-THP] %s: numpy MADV_HUGEPAGE OFF for the whole rank process (was %s; %s) "
+        "-- host numpy arrays >= 4 MiB fault 4 KiB pages, no direct compaction that "
+        "migrates the shared arena under every rank. SGLANG_WEG2_NUMPY_HUGEPAGE=1 keeps "
+        "numpy's setting.", where, "on" if previous else "off", thp)
+    return True
+
+
 def numpy_hugepage_off_during_load(load_model: Callable) -> Callable:
     """Decorator for a loader's ``load_model(self, ...)``: the whole call runs
     inside :func:`numpy_hugepage_off_for_gguf_load`, in whatever process calls

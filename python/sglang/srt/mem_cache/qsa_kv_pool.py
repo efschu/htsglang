@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 
 
@@ -56,6 +58,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         quant_method=None,
         post_capture_active: bool = False,
         qsa_slot_space: Optional[int] = None,
+        qsa_index_on_rank: bool = True,
         **fork_pool_kwargs,
     ):
         # #37500 port: this line's HybridLinearKVPool takes extra keyword
@@ -157,18 +160,54 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_rope_position_buffer = torch.zeros(
             (ring_slots, 3), dtype=torch.int64, device=device
         )
+        if not qsa_index_on_rank:
+            # #239 S0: a Form A expert worker runs no indexer -- its attention
+            # modules are host-only -- so it keeps no compressed index. An
+            # empty per-layer list is the shape the HiCache assembler and the
+            # cache controller already read as "no sidecar on this rank".
+            # The pending ring and the RoPE row above stay (bytes, not MiB):
+            # tail adopt and the flip carry name them per pool.
+            self.qsa_compressed_flat = torch.zeros(
+                (0,), dtype=self.index_state_dtype, device=device
+            )
+            self.qsa_compressed_k_buffer_pool = []
+            k_size, v_size = self.get_kv_size_bytes()
+            self.mem_usage = (k_size + v_size) / GB
+            return
         # One contiguous allocation behind per-layer views: every layer's
         # compressed pages are addressable from a single base pointer.
-        self.qsa_compressed_flat = torch.zeros(
-            (
-                len(full_attention_layer_ids),
-                self.qsa_compressed_capacity
-                * self.qsa_index_kv_heads
-                * self.qsa_index_head_dim,
-            ),
-            dtype=self.index_state_dtype,
-            device=device,
-        )
+        # #251c: under D's KV stage form the keys live in the kv_cache tag
+        # beside the KV they index, so their top-stage pages can be unmapped
+        # like the KV's (weg2/d_seat_vram.kv_stage_born); off, and on a Form A
+        # worker (its keys are no stage page), byte-identical.
+        from sglang.srt.weg2 import d_seat_vram as _dsv
+
+        _staged = _dsv.kv_stage_trims_here(int(size))
+        with (
+            self.full_kv_pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE)
+            if _staged
+            else nullcontext()
+        ):
+            self.qsa_compressed_flat = torch.zeros(
+                (
+                    len(full_attention_layer_ids),
+                    self.qsa_compressed_capacity
+                    * self.qsa_index_kv_heads
+                    * self.qsa_index_head_dim,
+                ),
+                dtype=self.index_state_dtype,
+                device=device,
+            )
+        if _staged:
+            self.qsa_compressed_flat = _dsv.kv_stage_born(
+                self.qsa_compressed_flat,
+                pool_size=int(size),
+                page_size=int(page_size),
+                name="qsa_compressed",
+                tokens_per_slot=self.qsa_compress_ratio,
+                layers=len(full_attention_layer_ids),
+                slots=self.qsa_compressed_capacity,
+            )
         self.qsa_compressed_k_buffer_pool = [
             self.qsa_compressed_flat[layer_offset].view(
                 self.qsa_compressed_capacity,

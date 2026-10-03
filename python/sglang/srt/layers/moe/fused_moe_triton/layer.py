@@ -434,6 +434,24 @@ def ct_method_transposes(method) -> bool:
 CT_WORKER_TRANSPOSED_ATTR = "_ct_worker_transposed"
 
 
+def ct_h2d_rows(layer):
+    """BOOTZEIT 5d: the expert rows the presplit's copy to the card needs --
+    the ones this rank read (``store_adopt.repack_rows``: all but the
+    H2-vetoed, pad row kept) -- or None for all. z30w-park D TP0 read 29 of
+    201 rows per layer and copied all 201 (h2d 3.76 s over 48 layers). A
+    layer without an expert count (a test stand-in) copies everything."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_LOAD_H2D_READ_ROWS.get():
+        return None
+    num_local = getattr(layer, "num_local_experts", None)
+    if not num_local:
+        return None
+    from sglang.srt.layers.moe.store_adopt import repack_rows
+
+    return repack_rows(layer, int(num_local))
+
+
 def transpose_done_in_worker(layer) -> bool:
     """Hat der Lade-Worker die Shards DIESES Layers schon transponiert? (#68e)
 
@@ -1523,6 +1541,7 @@ class FusedMoE(torch.nn.Module):
 
         from sglang.srt.layers.moe.expert_offload import (
             expert_offload_release_totals,
+            expert_store_clock,
         )
         from sglang.srt.model_loader.loader import device_loading_context
 
@@ -1538,7 +1557,14 @@ class FusedMoE(torch.nn.Module):
         )
 
         before = expert_offload_release_totals()
+        clock0 = expert_store_clock()
         t0 = time.perf_counter()
+        # BOOTZEIT 3 (29.09.): the presplit is ~45 % of the loader thread
+        # (rc12z30o3: PP0 26.8 of 60 s); split it (instrument only):
+        # h2d = device_loading_context enter (pageable [E] copy to the card),
+        # repack = process_weights_after_loading minus the host store,
+        # exit = the context's exit, release = pool release + empty_cache.
+        t_body = t_repack = t0
         # fnFL2x5: IN THE LAYER'S CHUNK, like the loader's own post-load pass
         # (loader.py: `weight_chunk_scope(layer_id_from_module_name(name))`).
         # This repack runs DURING load_weights, i.e. in the BASE weights tag,
@@ -1558,15 +1584,28 @@ class FusedMoE(torch.nn.Module):
             reason="ct-stream-presplit"
         ):
             if state.get("device_ctx", True):
-                with device_loading_context(self, state["device"]):
+                _h2d_rows = ct_h2d_rows(self)
+                # the presplit checks every row it takes against this cut
+                self._h2d_cut_rows = _h2d_rows
+                _ctx = (
+                    device_loading_context(self, state["device"])
+                    if _h2d_rows is None
+                    else device_loading_context(self, state["device"], rows=_h2d_rows)
+                )
+                with _ctx:
+                    t_body = time.perf_counter()
                     self.quant_method.process_weights_after_loading(self)
+                    t_repack = time.perf_counter()
             else:
                 # H68b (NVFP4 Marlin door): the scheme reads its host-staged
                 # experts one at a time itself, so the loader must NOT first
                 # copy the whole [E] stack to the card -- that copy is the
                 # transient this door exists to avoid. The compressed-tensors
                 # state carries no key and keeps the path above.
+                t_body = time.perf_counter()
                 self.quant_method.process_weights_after_loading(self)
+                t_repack = time.perf_counter()
+        t_exit = time.perf_counter()
         # The repack's [E] transients are freed but stay reserved in the
         # caching allocator; hand them back so the next layer's copy-in and
         # the KV pool are sized against real free memory, not the cache.
@@ -1587,7 +1626,20 @@ class FusedMoE(torch.nn.Module):
 
         release_active_tag_pools(reason="ct-stream-presplit")
         torch.cuda.empty_cache()
+        # BOOTZEIT 5c: this layer's host stack is gone (the context above has
+        # exited) -- now the next layer's store files may open beside the
+        # load (layers/moe/store_prefetch.py; SGLANG_OPT_LOAD_STORE_PREFETCH).
+        self.__dict__.pop("_h2d_cut_rows", None)  # this layer's cut is spent
+        _next = self.__dict__.pop("_store_prefetch_next", None)
+        if _next is not None:
+            from sglang.srt.layers.moe import store_prefetch as _sp
+
+            _sp.prefetch_next(getattr(self, "layer_id", None), **_next)
+        t_end = time.perf_counter()
         after = expert_offload_release_totals()
+        clock1 = expert_store_clock()
+        store_open = clock1["open_s"] - clock0["open_s"]
+        store_write = clock1["write_s"] - clock0["write_s"]
         presplit = getattr(self, "_moe_offload_presplit", None) or {}
         buf_bytes = sum(b.numel() * b.element_size() for b, _ in presplit.values())
         rows = {a: tuple(b.shape) for a, (b, _) in presplit.items()}
@@ -1595,7 +1647,10 @@ class FusedMoE(torch.nn.Module):
             "[ct-stream-presplit] layer %s: repack + presplit at load "
             "(%.2f GiB of weight VRAM released, %.2f GiB to the pinned host "
             "pool, %.1f s) | resident buffers %.2f GiB %s | torch allocated "
-            "%.2f GiB reserved %.2f GiB",
+            "%.2f GiB reserved %.2f GiB | split h2d=%.2f repack=%.2f "
+            "store_open=%.2f store_write=%.2f exit=%.2f release=%.2f s | "
+            "repack marlin=%.2f scales=%.2f presplit=%.2f rows=%d/%d | "
+            "reclaim gc=%.2f found=%d trim=%.2f s",
             getattr(self, "layer_id", "?"),
             (after.device_bytes - before.device_bytes) / 2**30,
             (after.host_bytes - before.host_bytes) / 2**30,
@@ -1604,6 +1659,20 @@ class FusedMoE(torch.nn.Module):
             rows,
             torch.cuda.memory_allocated() / 2**30,
             torch.cuda.memory_reserved() / 2**30,
+            t_body - t0,
+            max(0.0, (t_repack - t_body) - store_open - store_write),
+            store_open,
+            store_write,
+            t_exit - t_repack,
+            t_end - t_exit,
+            clock1.get("marlin_s", 0.0) - clock0.get("marlin_s", 0.0),
+            clock1.get("scales_s", 0.0) - clock0.get("scales_s", 0.0),
+            clock1.get("presplit_s", 0.0) - clock0.get("presplit_s", 0.0),
+            clock1.get("rows_repacked", 0) - clock0.get("rows_repacked", 0),
+            clock1.get("rows_total", 0) - clock0.get("rows_total", 0),
+            clock1.get("gc_s", 0.0) - clock0.get("gc_s", 0.0),
+            clock1.get("gc_found", 0) - clock0.get("gc_found", 0),
+            clock1.get("trim_s", 0.0) - clock0.get("trim_s", 0.0),
         )
         if _snap and int(getattr(self, "layer_id", -1)) in (2, 6):
             # OOM hunt (fn1g-fn1k): +1.17 GiB per presplit layer on the card

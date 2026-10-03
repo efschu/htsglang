@@ -58,22 +58,38 @@ def image_spans(req: Any) -> List[Tuple[int, int]]:
     """Every multimodal placeholder span of the request, (start, end) inclusive."""
     mm = getattr(req, "multimodal_inputs", None)
     spans: List[Tuple[int, int]] = []
-    for it in getattr(mm, "mm_items", None) or []:
-        for off in getattr(it, "offsets", None) or []:
+    items = getattr(mm, "mm_items", None)
+    for it in (() if items is None else items):
+        offs = getattr(it, "offsets", None)  # a list today; never truth-tested
+        for off in (() if offs is None else offs):
             spans.append((int(off[0]), int(off[1])))
     return spans
 
 
-def verdict(req: Any, covered: Optional[int]) -> str:
-    """``admit`` when every placeholder lies inside the covered prefix (or
-    there is none), ``defer`` when the group has no covered length for this
-    rid yet, ``refuse`` when D would have to encode a placeholder."""
+def image_end(req: Any) -> int:
+    """One past the last placeholder position, 0 without images."""
     spans = image_spans(req)
-    if not spans:
+    return (max(end for _, end in spans) + 1) if spans else 0
+
+
+def verdict(req: Any, covered: Optional[int], tail_start: Optional[int] = None,
+            tail_wait: bool = False) -> str:
+    """``admit`` when every placeholder lies before the first position D's
+    target computes -- the covered prefix, or the adopted tail's start when
+    the group took P's tail (``tail_adopt.peek_target_start``) -- ``defer``
+    when the group has no covered length for this rid yet or the tail would
+    cover the image in an empty batch, ``refuse`` when D would have to encode
+    a placeholder."""
+    end = image_end(req)
+    if not end:
         return ADMIT
     if covered is None:
         return DEFER
-    return ADMIT if max(end for _, end in spans) < int(covered) else REFUSE
+    if end <= int(covered):
+        return ADMIT
+    if tail_start is not None and end <= int(tail_start):
+        return ADMIT
+    return DEFER if tail_wait else REFUSE
 
 
 def bounded(verdict_now: str, rid: str, defers: Dict[str, int]) -> str:
@@ -103,3 +119,82 @@ def refusal_message(req: Any, covered: Optional[int]) -> str:
         f"spans tokens {first[0]}..{first[1]} -- the P leg's pages did not reach D's "
         f"store read. Refused by name instead of reaching _require_visual."
     )
+
+
+#: (B) safety net switch: an image D cannot cover on a request that has sent no
+#: byte yet goes back through P (X-REQUEUE) instead of W123. Default on; "0"
+#: = the plain W123 as before.
+REROUTE_ENV = "SGLANG_WEG2_VISION_D_REROUTE"
+
+
+def reroute_enabled(env=None) -> bool:
+    import os
+
+    e = os.environ if env is None else env
+    return (e.get(REROUTE_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def reroute_eligible(req: Any, env=None) -> bool:
+    """(B) NF rc12z10 08:40:07Z weg2-2-12 (image 6290..9528 of 9537, P's END
+    anchor failed, D covered 0 -> W123 to the client): a request that has
+    generated NOTHING yet can go back through P with its ORIGINAL body --
+    image included, P has the tower -- which is the front's X-REQUEUE, keyed
+    on D's W50 refusal. An already streamed one cannot: RESUME-VIA-P's P leg
+    carries input_ids alone (``resume_via_p.eligible`` excludes multimodal),
+    so it keeps the named W123. Replicated: output_ids is the group's."""
+    if not reroute_enabled(env):
+        return False
+    out = getattr(req, "output_ids", None)
+    return (0 if out is None else len(out)) == 0
+
+
+def reroute_message(req: Any, covered: Optional[int]) -> str:
+    """The W50 refusal the front re-routes through P (``x_refusal_marker_in``
+    and the extent sentence ``_d_refusal_extent`` parses), W123 named inside.
+    The front's bound ends it: a second refusal after a P leg is its W35/W53."""
+    fill = getattr(req, "full_untruncated_fill_ids", None)
+    total = 0 if fill is None else len(fill)
+    extent = max(0, total - int(covered or 0))
+    return (
+        f"W50 Weg2TpPrefillExceeded (vision reroute): group D cannot serve this request "
+        f"itself; this request's extent after prefix matching is {extent}. "
+        f"Re-routed through the prefill group, which has the vision tower -- "
+        f"{refusal_message(req, covered)}"
+    )
+
+
+# -- the draft side (V2 death 11:20:26, weg2-14-72) ---------------------------------
+_DRAFT_NO_EMBEDS_N = [0]
+
+
+def note_draft_mm_without_embeds(input_embeds: Any, forward_batch: Any) -> bool:
+    """True when an MTP draft extend carries multimodal inputs but no
+    ``mm_input_embeds`` -- the caller then embeds its ids like any text
+    extend instead of asserting.
+
+    Upstream's MTP heads reuse the TARGET's input embeddings of an mm extend
+    (``general_mm_embed_routine`` leaves them in ``forward_batch.mm_input_embeds``)
+    and assert they exist. On a group without a tower that assumption breaks
+    where no target forward ran: V2 (dfce479f08) died at 11:20:26 in
+    ``_forward_skip_extend`` (E2, P's END state adopted, no target forward)
+    -> ``_draft_extend_for_prefill`` -> ``qwen4_exp_mtp._prepare_input_embeds``
+    ``assert input_embeds is not None`` on weg2-14-72 (image at the front,
+    5837 tokens). The draft only proposes -- the verifier decides -- so the
+    placeholder ids' own embeddings are a sound input, the form DFlash always
+    uses (models/dflash.py). Never an assert death; counted and named."""
+    if input_embeds is not None:
+        return False
+    _DRAFT_NO_EMBEDS_N[0] += 1
+    n = _DRAFT_NO_EMBEDS_N[0]
+    if n <= 8 or n % 256 == 0:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "W102 VISION-DRAFT NO-MM-EMBEDS n=%d mode=%s bs=%s (an mm extend reached "
+            "the MTP draft without target embeddings -- no tower on this group, or no "
+            "target forward (E2 skip): the draft embeds the ids, the verifier decides)",
+            n,
+            getattr(getattr(forward_batch, "forward_mode", None), "name", "?"),
+            getattr(forward_batch, "batch_size", "?"),
+        )
+    return True

@@ -1110,6 +1110,18 @@ def safetensors_weights_iterator(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
 
+    if pread and pread_stream_enabled(direct_io):
+        # 27B-ODIRECT-STREAM 0927: the same bounded stream, readers from
+        # SGLANG_LOAD_KEY_WORKERS (default 1, as the per-file path).
+        try:
+            _kw = max(1, int(os.environ.get("SGLANG_LOAD_KEY_WORKERS", "1") or "1"))
+        except ValueError:
+            _kw = 1
+        yield from pread_safetensors_stream(
+            hf_weights_files, should_load, direct_io=direct_io, workers=_kw,
+        )
+        return
+
     for st_file in tqdm(
         hf_weights_files,
         desc="Loading safetensors checkpoint shards",
@@ -1529,6 +1541,631 @@ def pread_safetensors_file(st_file: str, should_load=None, post_load=None,
     return result
 
 
+#: O_DIRECT STREAM (27B-ODIRECT-STREAM 0927). Boot b23 (27b-park-odirect-draft,
+#: rc12g-flat, 27.09.): --weight-loader-disable-mmap --weight-loader-direct-io +
+#: SGLANG_WEIGHT_LOADER_PREAD=1 ran the container into its 76g cap (oom_kill 3,
+#: anon+shmem 72,5 GiB) before serving; NF x32 (23.09.) showed the same anon
+#: spike. The pread path returned ONE DICT PER FILE and the multi-thread
+#: iterator kept (max_workers + 1) files in flight: 9 x up to 4,86 GiB of
+#: shard as anonymous memory at once. The stream below reads TENSORS, not
+#: files: a pool of ``workers`` readers fills fresh CPU tensors in the exact
+#: yield order of the per-file path (file order, then name order inside each
+#: file), and a byte window caps what is read but not yet handed to the
+#: consumer -- in flight <= max(budget, largest single tensor), independent of
+#: the shard size. With direct_io every read goes through O_DIRECT (one 16-MiB
+#: aligned bounce per reader thread), so the page cache stays empty.
+STREAM_ENV = "SGLANG_WEIGHT_LOADER_PREAD_STREAM"
+STREAM_BUDGET_ENV = "SGLANG_WEIGHT_LOADER_STREAM_MIB"
+_STREAM_BUDGET_DEFAULT_MIB = 1024
+STREAM_MARKER = "WEG2-LOAD-STREAM"
+
+
+def pread_stream_enabled(direct_io: bool) -> bool:
+    """``SGLANG_WEIGHT_LOADER_PREAD_STREAM``: 1 on, 0 off; unset = on exactly
+    when ``direct_io`` is (the O_DIRECT route is the one that hit the cap; the
+    buffered pread path keeps its measured per-file form byte for byte)."""
+    raw = str(os.environ.get(STREAM_ENV, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return bool(direct_io)
+
+
+def _stream_budget_bytes() -> int:
+    try:
+        mib = int(os.environ.get(STREAM_BUDGET_ENV, "") or _STREAM_BUDGET_DEFAULT_MIB)
+    except ValueError:
+        mib = _STREAM_BUDGET_DEFAULT_MIB
+    return max(1, mib) << 20
+
+
+def _rss_anon_bytes() -> int:
+    """This process's RssAnon (bytes); -1 where /proc does not say."""
+    try:
+        with open("/proc/self/status", "rb") as f:
+            for line in f:
+                if line.startswith(b"RssAnon:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return -1
+
+
+class StreamStats:
+    """What one stream did -- the instrument line's numbers, and the tests'."""
+
+    def __init__(self, budget: int, workers: int):
+        self.budget = int(budget)
+        self.workers = int(workers)
+        self.files = 0
+        self.tensors = 0
+        self.bytes = 0
+        self.inflight = 0
+        self.inflight_peak = 0
+        self.max_tensor = 0
+        self.direct_readers = 0
+        self.buffered_readers = 0
+        self.anon_start = _rss_anon_bytes()
+        self.anon_peak = self.anon_start
+        self.t0 = None
+        self.seconds = 0.0
+
+    #: NF-Bootzeit (rc12z15 PP0, 28.09.): one /proc/self/status read PER
+    #: TENSOR was 69 % of the consumer's samples (LOAD-PROFILE weight_utils.py
+    #: _rss_anon_bytes 46.8 % + 22.4 %) over 135 032 NF tensors -- the
+    #: instrument, not the disk, bounded the O_DIRECT load (0.59 GB/s).
+    #: Sampled at most every ANON_SAMPLE_S; the last tensor is always sampled.
+    ANON_SAMPLE_S = 0.05
+
+    def sample_anon(self, force: bool = False) -> None:
+        import time as _t
+
+        now = _t.perf_counter()
+        last = getattr(self, "_anon_last", None)
+        if not force and last is not None and now - last < self.ANON_SAMPLE_S:
+            return
+        self._anon_last = now
+        a = _rss_anon_bytes()
+        if a > self.anon_peak:
+            self.anon_peak = a
+
+    def line(self) -> str:
+        gbs = self.bytes / self.seconds / 1e9 if self.seconds > 0 else 0.0
+        delta = (self.anon_peak - self.anon_start) / (1 << 20) if self.anon_start >= 0 else -1
+        return (
+            f"{STREAM_MARKER} files={self.files} tensors={self.tensors} "
+            f"bytes={self.bytes} s={self.seconds:.2f} GB/s={gbs:.2f} "
+            f"workers={self.workers} budget_mib={self.budget >> 20} "
+            f"inflight_peak_mib={self.inflight_peak / (1 << 20):.1f} "
+            f"max_tensor_mib={self.max_tensor / (1 << 20):.1f} "
+            f"anon_peak_delta_mib={delta:.0f} readers=direct:{self.direct_readers},"
+            f"buffered:{self.buffered_readers} (in flight <= max(budget, largest tensor); "
+            f"anon delta = RssAnon peak minus start, sampled per tensor)"
+        )
+
+
+#: BOOTZEIT (A) 0928: COALESCED RUNS. The per-tensor stream above issues one
+#: pread per tensor in NAME order -- measured on NF rc12z30c: PP0 0,56 GB/s,
+#: the load thread waits 52-65 % on its readers, while the disk (Samsung
+#: MZWLJ1T9HBJR, XFS) delivers 3,56 GB/s O_DIRECT sequential at bs 4M (fio,
+#: 1..8 jobs). Two reasons: 135 032 tensors per NF load (median 25 KB), and a
+#: safetensors file is laid out in dtype SECTIONS, each section sorted by name
+#: -- so name order jumps between sections on every tensor and no two
+#: consecutive preads touch neighbouring bytes (26 of 17 008 adjacent).
+#:
+#: Here every file's wanted tensors are grouped by FILE OFFSET into runs of at
+#: most ``COALESCE_ENV`` MiB (holes up to ``COALESCE_GAP_ENV`` KiB are read
+#: through), each run is ONE aligned O_DIRECT read into its own buffer, and the
+#: tensors are copied out of it in the reader thread. The yield order, the
+#: bytes, the ``should_load`` verdicts (asked once per name, up front) and
+#: ``post_load`` are those of the per-tensor path; only the route into memory
+#: changes. Model-agnostic: dense (27B TP3/PP3, DFlash2) and MoE checkpoints
+#: take the same path. The byte window counts RUN bytes from submission to the
+#: yield of the run's last tensor; a run the next tensor needs is always
+#: submitted, so the window can be exceeded by at most one run per open dtype
+#: section. Host transient per loading rank <= window + workers x run buffer;
+#: with O_DIRECT the page cache stays empty (nothing fills the cgroup).
+COALESCE_ENV = "SGLANG_WEIGHT_LOADER_COALESCE_MIB"
+COALESCE_GAP_ENV = "SGLANG_WEIGHT_LOADER_COALESCE_GAP_KIB"
+_COALESCE_GAP_DEFAULT_KIB = 256
+COALESCE_MARKER = "WEG2-LOAD-COALESCE"
+
+
+def coalesce_run_bytes() -> int:
+    """Run cap in bytes; 0 (the default) keeps the per-tensor stream."""
+    try:
+        mib = int(os.environ.get(COALESCE_ENV, "") or 0)
+    except ValueError:
+        mib = 0
+    return max(0, mib) << 20
+
+
+def _coalesce_gap_bytes() -> int:
+    try:
+        kib = int(os.environ.get(COALESCE_GAP_ENV, "") or _COALESCE_GAP_DEFAULT_KIB)
+    except ValueError:
+        kib = _COALESCE_GAP_DEFAULT_KIB
+    return max(0, kib) << 10
+
+
+#: BOOTZEIT 3 Stufe 2b: which tensors travel P -> D through the page cache.
+#: Everything but the routed experts (H2 store adopt carries those) -- dense
+#: attention/MLP, embed, lm_head, norms, the draft. Both groups classify with
+#: this one predicate, so a byte P kept is a byte D asks for.
+def shared_cache_mode() -> str:
+    from sglang.srt.environ import envs
+
+    mode = str(envs.SGLANG_WEIGHT_LOADER_SHARED_CACHE.get() or "").strip().lower()
+    return mode if mode in ("keep", "drop") else ""
+
+
+def is_shared_cache_tensor(name: str) -> bool:
+    return ".experts." not in name
+
+
+class _Run:
+    __slots__ = ("path", "base", "start", "end", "items", "first", "future", "left",
+                 "shared")
+
+    def __init__(self, path, base, start, end, idx, shared=False):
+        self.shared = bool(shared)
+        self.path = path
+        self.base = base
+        self.start = start  # relative to the data section (safetensors offsets)
+        self.end = end
+        self.items = [idx]
+        self.first = idx
+        self.future = None
+        self.left = 0
+
+    @property
+    def nbytes(self) -> int:
+        return self.end - self.start
+
+
+def plan_coalesced_runs(hf_weights_files, should_load, cap: int, gap: int,
+                        shared_class=None):
+    """Yield-order items and the runs that carry them.
+
+    items[i] = [name, path, base, info, verdict, run or None]; runs are sorted by
+    the first item that needs them. ``should_load`` is asked exactly once per
+    name, in yield order. ``shared_class`` (BOOTZEIT 3 Stufe 2b), when given,
+    keeps shared and non-shared tensors in separate runs and marks each run."""
+    items, runs = [], []
+    for path in hf_weights_files:
+        header, base = read_safetensors_header(path)
+        wanted = []
+        for name in sorted(header.keys()):
+            info = header[name]
+            verdict = True if should_load is None else should_load(name)
+            if not verdict:
+                continue
+            items.append([name, path, base, info, verdict, None])
+            off0, off1 = info["data_offsets"]
+            if verdict != "meta" and int(off1) > int(off0):
+                wanted.append(len(items) - 1)
+        wanted.sort(key=lambda i: int(items[i][3]["data_offsets"][0]))
+        cur = None
+        for i in wanted:
+            off0, off1 = (int(x) for x in items[i][3]["data_offsets"])
+            cls = bool(shared_class(items[i][0])) if shared_class is not None else False
+            if (cur is not None and off0 >= cur.end and off0 - cur.end <= gap
+                    and off1 - cur.start <= cap and cur.shared == cls):
+                cur.end = off1
+                cur.items.append(i)
+                cur.first = min(cur.first, i)
+            else:
+                cur = _Run(path, base, off0, off1, i, shared=cls)
+                runs.append(cur)
+            items[i][5] = cur
+    runs.sort(key=lambda r: r.first)
+    for r in runs:
+        r.left = len(r.items)
+    return items, runs
+
+
+def _resident_bytes(fd: int, offset: int, length: int) -> int:
+    """Bytes of [offset, offset+length) of ``fd`` already in the page cache
+    (mincore over a read-only map of the range); 0 when it cannot tell."""
+    import ctypes
+    import mmap as _mm
+
+    page = _mm.PAGESIZE
+    lo = offset & ~(page - 1)
+    span = offset + length - lo
+    if span <= 0:
+        return 0
+    try:
+        # ACCESS_COPY: a private map is writable for ctypes and never written,
+        # so every page mincore sees is the file's page-cache page
+        m = _mm.mmap(fd, span, access=_mm.ACCESS_COPY, offset=lo)
+    except (OSError, ValueError):
+        return 0
+    anchor = None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        npages = (span + page - 1) // page
+        vec = (ctypes.c_ubyte * npages)()
+        anchor = ctypes.c_char.from_buffer(m)
+        rc = libc.mincore(ctypes.c_void_p(ctypes.addressof(anchor)),
+                          ctypes.c_size_t(span), vec)
+        if rc != 0:
+            return 0
+        return min(length, page * sum(1 for v in vec if v & 1))
+    except Exception:  # noqa: BLE001 -- an instrument, never a load killer
+        return 0
+    finally:
+        del anchor
+        try:
+            m.close()
+        except BufferError:
+            pass
+
+
+def _shared_cache_after_read(fd: int, offset: int, length: int, mode: str,
+                             counters, path: str = "") -> None:
+    """keep: leave the range cached for the next group, up to the budget;
+    drop: this group is the last reader -- hand the pages back now.
+    A kept range is recorded (path, offset, length) for the launcher's release
+    after D is ready (weg2/shared_cache_release.py)."""
+    from sglang.srt.environ import envs
+
+    advice = None
+    with counters["lock"]:
+        if mode == "keep":
+            cap = max(0, int(envs.SGLANG_WEIGHT_LOADER_SHARED_CACHE_MAX_MIB.get() or 0)) << 20
+            if counters["shared_kept_bytes"] + length <= cap:
+                counters["shared_kept_bytes"] += length
+                counters.setdefault("shared_kept_ranges", []).append((path, offset, length))
+            else:
+                counters["shared_over_budget_bytes"] += length
+                advice = "dontneed"
+        else:
+            counters["shared_dropped_bytes"] += length
+            advice = "dontneed"
+    if advice and hasattr(os, "posix_fadvise"):
+        try:
+            os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+
+
+def _write_shared_cache_manifest(counters) -> None:
+    """keep: the ranges this stream left in the page cache, for the launcher's
+    release after D is ready. No manifest directory (launched outside the weg2
+    launcher) = nothing written; a failed write is logged, never a load error."""
+    from sglang.srt.environ import envs
+    from sglang.srt.weg2 import shared_cache_release as _scr
+
+    d = envs.SGLANG_WEIGHT_LOADER_SHARED_CACHE_MANIFEST.get() or ""
+    if not d:
+        return
+    try:
+        path = _scr.write_keep_manifest(d, counters["shared_kept_ranges"],
+                                        counters["shared_kept_bytes"])
+        logger.info("%s SHARED-CACHE manifest %s ranges=%d kept_mib=%.0f", COALESCE_MARKER,
+                    path, len(counters["shared_kept_ranges"]),
+                    counters["shared_kept_bytes"] / 2**20)
+    except OSError as e:
+        logger.warning("%s SHARED-CACHE manifest NOT written (%s): the kept ranges "
+                       "stay until the kernel reclaims them", COALESCE_MARKER, e)
+
+
+def _read_run(run: "_Run", direct_io: bool, post_load, counters) -> dict:
+    """ONE aligned read of the run's byte range; the tensors copied out of it."""
+    import mmap as _mm
+
+    a = (run.base + run.start) & ~(_DIRECT_ALIGN - 1)
+    b = run.base + run.end
+    length = (b - a + _DIRECT_ALIGN - 1) & ~(_DIRECT_ALIGN - 1)
+    fd = -1
+    direct = False
+    share = counters.get("share_mode", "") if run.shared else ""
+    if direct_io and not share:
+        try:
+            fd = os.open(run.path, os.O_RDONLY | getattr(os, "O_DIRECT", 0o40000))
+            direct = True
+        except OSError as err:
+            if run.path not in _DIRECT_FALLBACK_WARNED:
+                _DIRECT_FALLBACK_WARNED.add(run.path)
+                logger.warning("weight loader: O_DIRECT refused on %s (%s); reading it "
+                               "BUFFERED (page cache) instead", run.path, err)
+    if fd < 0:
+        fd = os.open(run.path, os.O_RDONLY)
+    buf = _mm.mmap(-1, length)  # anonymous => page aligned, as O_DIRECT needs
+    mv = memoryview(buf)
+    try:
+        got = 0
+        need = b - a
+        if share == "drop":
+            # the metal proof that the byte was read ONCE: how much of this
+            # range the first reader left in the page cache
+            hit = _resident_bytes(fd, a, need)
+            with counters["lock"]:
+                counters["shared_hit_bytes"] += hit
+        while got < need:
+            n = os.preadv(fd, [mv[got:length]], a + got)
+            if n <= 0:
+                raise IOError(f"short read in {run.path} at {a + got}: need {need - got} more")
+            got += n
+        if share:
+            _shared_cache_after_read(fd, a, need, share, counters, path=run.path)
+        src = torch.frombuffer(buf, dtype=torch.uint8)
+        out = {}
+        for i in run.items:
+            name, _path, base, info, _v, _r = counters["items"][i]
+            off0, off1 = (int(x) for x in info["data_offsets"])
+            lo = base + off0 - a
+            t = src[lo : lo + (off1 - off0)].clone()
+            t = t.view(_SAFETENSORS_DTYPES[info["dtype"]]).reshape(
+                tuple(int(x) for x in info["shape"]))
+            if post_load is not None:
+                t = post_load(name, t)
+            out[i] = t
+        del src
+        with counters["lock"]:
+            counters["read_bytes"] += got
+            counters["direct" if direct else "buffered"] += 1
+        return out
+    finally:
+        mv.release()
+        try:
+            buf.close()
+        except BufferError:
+            pass  # a frombuffer view still alive: the GC closes it
+        os.close(fd)
+
+
+def _coalesced_stream(hf_weights_files, should_load, post_load, direct_io, st, log):
+    import threading
+    import time as _time
+
+    cap = coalesce_run_bytes()
+    gap = _coalesce_gap_bytes()
+    st.t0 = _time.perf_counter()
+    share_mode = shared_cache_mode()
+    items, runs = plan_coalesced_runs(
+        hf_weights_files, should_load, cap, gap,
+        shared_class=is_shared_cache_tensor if share_mode else None)
+    st.files += len(hf_weights_files)
+    # BOOTZEIT 3 (29.09.): wait_read_s = the consumer of this generator
+    # blocked on a read that had not landed yet (disk-bound); consume_s = the
+    # time the consumer held the tensor before asking for the next one
+    # (consumer-bound). Their sum is the stream's wall; which one dominates
+    # says whether a faster disk path or a faster consumer is the lever.
+    counters = {"items": items, "lock": threading.Lock(), "read_bytes": 0,
+                "direct": 0, "buffered": 0, "wait_read_s": 0.0, "consume_s": 0.0,
+                "share_mode": share_mode, "shared_kept_bytes": 0,
+                "shared_over_budget_bytes": 0, "shared_dropped_bytes": 0,
+                "shared_hit_bytes": 0}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=st.workers)
+    nxt = 0
+    try:
+        for i, (name, _path, _base, info, verdict, run) in enumerate(items):
+            # submit every run the window allows, and ALWAYS the ones up to i
+            while nxt < len(runs) and (
+                runs[nxt].first <= i or st.inflight + runs[nxt].nbytes <= st.budget
+            ):
+                r = runs[nxt]
+                r.future = ex.submit(_read_run, r, direct_io, post_load, counters)
+                st.inflight += r.nbytes
+                st.inflight_peak = max(st.inflight_peak, st.inflight)
+                st.max_tensor = max(st.max_tensor, r.nbytes)
+                nxt += 1
+            if verdict == "meta":
+                yield name, torch.empty(tuple(int(x) for x in info["shape"]),
+                                        dtype=_SAFETENSORS_DTYPES[info["dtype"]], device="meta")
+                continue
+            if run is None:  # zero-byte tensor
+                yield name, torch.empty(tuple(int(x) for x in info["shape"]),
+                                        dtype=_SAFETENSORS_DTYPES[info["dtype"]])
+                continue
+            _tw = _time.perf_counter()
+            got = run.future.result()  # an exception MUST surface
+            counters["wait_read_s"] += _time.perf_counter() - _tw
+            t = got.pop(i)
+            run.left -= 1
+            if run.left == 0:
+                st.inflight -= run.nbytes
+                run.future = None
+            off0, off1 = info["data_offsets"]
+            st.tensors += 1
+            st.bytes += int(off1) - int(off0)
+            st.sample_anon()
+            _tc = _time.perf_counter()
+            yield name, t
+            counters["consume_s"] += _time.perf_counter() - _tc
+            del t
+    finally:
+        for r in runs:
+            if r.future is not None:
+                r.future.cancel()
+        ex.shutdown(wait=True)
+        st.seconds = _time.perf_counter() - st.t0
+        st.sample_anon(force=True)
+        st.direct_readers = counters["direct"]
+        st.buffered_readers = counters["buffered"]
+        if share_mode == "keep" and counters.get("shared_kept_ranges"):
+            _write_shared_cache_manifest(counters)
+        if log:
+            gbs = counters["read_bytes"] / st.seconds / 1e9 if st.seconds > 0 else 0.0
+            logger.info(
+                "%s runs=%d cap_mib=%d gap_kib=%d read_bytes=%d used_bytes=%d "
+                "waste_pct=%.1f s=%.2f read_GB/s=%.2f workers=%d reads=direct:%d,buffered:%d "
+                "wait_read_s=%.2f consume_s=%.2f",
+                COALESCE_MARKER, len(runs), cap >> 20, gap >> 10, counters["read_bytes"],
+                st.bytes, 100.0 * (counters["read_bytes"] - st.bytes) / max(1, counters["read_bytes"]),
+                st.seconds, gbs, st.workers, counters["direct"], counters["buffered"],
+                counters["wait_read_s"], counters["consume_s"])
+            if share_mode:
+                logger.info(
+                    "%s SHARED-CACHE mode=%s kept_mib=%.0f over_budget_mib=%.0f "
+                    "dropped_mib=%.0f hit_mib=%.0f disk_bytes=%d (BOOTZEIT 3 Stufe 2b: "
+                    "non-expert bytes P->D through the page cache; hit = found cached "
+                    "by D; read_bytes above counts every byte preadv returned, cache "
+                    "hits included -- disk_bytes = read_bytes - hit)",
+                    COALESCE_MARKER, share_mode,
+                    counters["shared_kept_bytes"] / 2**20,
+                    counters["shared_over_budget_bytes"] / 2**20,
+                    counters["shared_dropped_bytes"] / 2**20,
+                    counters["shared_hit_bytes"] / 2**20,
+                    counters["read_bytes"] - counters["shared_hit_bytes"])
+            logger.info(st.line())
+
+
+def pread_safetensors_stream(
+    hf_weights_files: List[str],
+    should_load=None,
+    post_load=None,
+    direct_io: bool = False,
+    workers: int = 1,
+    budget_bytes: Optional[int] = None,
+    stats: Optional[StreamStats] = None,
+    log: bool = True,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Yield ``(name, tensor)`` of every file, tensor by tensor, with a bounded
+    in-flight byte window (see STREAM_ENV's block above).
+
+    Same yield order and same tensors as reading each file with
+    :func:`pread_safetensors_file` and yielding ``sorted(result)`` -- the order
+    the per-file iterators have always produced. ``should_load`` / "meta" and
+    ``post_load`` (run in the reader thread, as #68b) are honoured alike. A
+    tensor the consumer still holds is the consumer's memory; the window only
+    counts what was read and not yet handed over.
+    """
+    import threading
+
+    workers = max(1, int(workers))
+    budget = int(budget_bytes) if budget_bytes is not None else _stream_budget_bytes()
+    st = stats if stats is not None else StreamStats(budget, workers)
+    st.budget, st.workers = budget, workers
+
+    if coalesce_run_bytes() > 0:
+        yield from _coalesced_stream(
+            hf_weights_files, should_load, post_load, direct_io, st, log,
+        )
+        return
+
+    # The plan: (file, name, info) in yield order; skips resolved up front.
+    plan = []
+    for st_file in hf_weights_files:
+        header, base = read_safetensors_header(st_file)
+        st.files += 1
+        for name in sorted(header.keys()):
+            plan.append((st_file, base, name, header[name]))
+
+    local = threading.local()
+    readers = []  # every (fd, direct) opened, closed in the finally
+    readers_lock = threading.Lock()
+
+    def _reader(path):
+        cur = getattr(local, "cur", None)
+        if cur is not None and cur[0] == path:
+            return cur[1], cur[2]
+        if cur is not None:  # this thread moved on: give the old file back now
+            _close_one(cur)
+        fd = os.open(path, os.O_RDONLY)
+        direct = _DirectReader.open(path) if direct_io else None
+        ent = (path, fd, direct)
+        with readers_lock:
+            readers.append(ent)
+            if direct is not None:
+                st.direct_readers += 1
+            else:
+                st.buffered_readers += 1
+        local.cur = ent
+        return fd, direct
+
+    def _close_one(ent):
+        with readers_lock:
+            if ent not in readers:
+                return
+            readers.remove(ent)
+        _path, fd, direct = ent
+        try:
+            if direct is not None:
+                direct.close()
+        finally:
+            os.close(fd)
+
+    def _read(item, verdict):
+        path, base, name, info = item
+        fd, direct = _reader(path)
+        # the verdict was taken ONCE, in the planning thread: should_load is
+        # never called twice for a name (a filter may count what it answers)
+        t = _pread_one_key(fd, base, name, info, lambda _n, _v=verdict: _v, direct)
+        if t is not None and post_load is not None:
+            t = post_load(name, t)
+        return t
+
+    def _cost(item):
+        off0, off1 = item[3]["data_offsets"]
+        return max(0, int(off1) - int(off0))
+
+    import time as _time
+
+    st.t0 = _time.perf_counter()
+    cond = threading.Condition()
+    pending = collections.deque()
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    idx = 0
+    held_verdict = {}
+    try:
+        while idx < len(plan) or pending:
+            # Fill the window: never more than `budget` in flight, but always
+            # at least one tensor (a tensor larger than the budget still loads).
+            while idx < len(plan):
+                item = plan[idx]
+                c = _cost(item)
+                if idx in held_verdict:
+                    verdict = held_verdict.pop(idx)
+                else:
+                    verdict = True if should_load is None else should_load(item[2])
+                if not verdict:
+                    idx += 1
+                    continue
+                if verdict == "meta":
+                    c = 0
+                with cond:
+                    if pending and st.inflight + c > budget:
+                        held_verdict[idx] = verdict  # asked once; kept for the next fill
+                        break
+                    st.inflight += c
+                    st.inflight_peak = max(st.inflight_peak, st.inflight)
+                st.max_tensor = max(st.max_tensor, c)
+                pending.append((item[2], c, ex.submit(_read, item, verdict)))
+                idx += 1
+            if not pending:
+                break
+            name, c, fut = pending.popleft()
+            t = fut.result()  # an exception MUST surface (a half-read set loads silently wrong)
+            with cond:
+                st.inflight -= c
+            if t is None:
+                continue
+            st.tensors += 1
+            st.bytes += c
+            st.sample_anon()
+            yield name, t
+            del t
+    finally:
+        for _n, _c, f in pending:
+            f.cancel()
+        ex.shutdown(wait=True)
+        with readers_lock:
+            left = list(readers)
+        for ent in left:
+            try:
+                _close_one(ent)
+            except OSError:
+                pass
+        st.seconds = _time.perf_counter() - st.t0
+        st.sample_anon(force=True)
+        if log:
+            logger.info(st.line())
+
+
 def buffered_multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
@@ -1572,6 +2209,14 @@ def buffered_multi_thread_safetensors_weights_iterator(
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+    if pread and pread_stream_enabled(direct_io):
+        # 27B-ODIRECT-STREAM 0927: tensors, not files -- in flight bounded by
+        # the byte window instead of (max_workers + 1) whole shards.
+        yield from pread_safetensors_stream(
+            hf_weights_files, should_load, direct_io=direct_io, post_load=post_load,
+            workers=max_workers,
+        )
+        return
 
     def _load_file(st_file: str):
         if pread:

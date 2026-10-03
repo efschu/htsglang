@@ -830,6 +830,11 @@ class HiMambaRadixCache(MambaRadixCache):
                     _tok, _bpt, _t0 = _m
                     _ms = float(start_event.elapsed_time(finish_event))
                     _mib = _tok * _bpt / (1 << 20)
+                    from sglang.srt.weg2 import rank_timing as _rank_timing  # stdlib only
+
+                    # RANK-TIMING (rankstats cache.loadback_*): the landed events' ms
+                    _rank_timing.note_loadback(_ms, pages=-(-int(_tok) // max(1, int(self.page_size))),
+                                               nbytes=int(_tok) * int(_bpt))
                     logger.info(
                         "WEG2-LOAD-DEVICE tokens=%d mib=%.0f gpu_ms=%.0f wall_ms=%.0f "
                         "GB/s=%.2f (bytes = tokens x 2 x layers x cell on THIS rank; "
@@ -2126,11 +2131,14 @@ class HiMambaRadixCache(MambaRadixCache):
             hicache_storage_pass_prefix_keys,
         )
 
-    def clear_storage_backend(self) -> bool:
+    def clear_storage_backend(self, force: bool = False) -> bool:
         if self.enable_storage:
             try:
                 if hasattr(self.cache_controller.storage_backend, "clear"):
-                    self.cache_controller.storage_backend.clear()
+                    from sglang.srt.mem_cache.hicache_storage import clear_storage
+
+                    if not clear_storage(self.cache_controller.storage_backend, force=force):
+                        return False
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )

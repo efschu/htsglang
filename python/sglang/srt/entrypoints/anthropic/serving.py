@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessageEndDelta,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
+    AnthropicSglExt,
     AnthropicStreamEvent,
     AnthropicUsage,
     ContentBlockDeltaEvent,
@@ -222,6 +223,29 @@ def _anthropic_usage_from_openai(
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
         )
     return AnthropicUsage(**usage_fields)
+
+
+def _resumable_depth(openai_obj) -> Optional[int]:
+    """#59: ``sglext.weg2_resumable_depth`` of an OpenAI response or stream
+    chunk, or None (0 is a measured value and is kept)."""
+    ext = getattr(openai_obj, "sglext", None)
+    return getattr(ext, "weg2_resumable_depth", None) if ext is not None else None
+
+
+def _sglext_of(openai_obj) -> Optional[AnthropicSglExt]:
+    """The Anthropic ``sglext`` for an OpenAI response or stream chunk: #59's
+    resumable depth and, when the request asked, the cached-token tier split.
+    None when neither is set (the field is then absent, exclude_none)."""
+    depth = _resumable_depth(openai_obj)
+    ext = getattr(openai_obj, "sglext", None)
+    details = getattr(ext, "cached_tokens_details", None) if ext is not None else None
+    if depth is None and details is None:
+        return None
+    return AnthropicSglExt(
+        weg2_resumable_depth=depth,
+        cached_tokens_details=details.model_dump() if details is not None else None,
+        weg2_seq_hash=getattr(ext, "weg2_seq_hash", None) if ext is not None else None,
+    )
 
 
 def _resolve_stop_sequence(
@@ -513,8 +537,16 @@ class AnthropicServing:
 
         def _convert_assistant_thinking_blocks(
             blocks: list[AnthropicContentBlock],
-        ) -> Optional[str]:
-            """Re-wrap prior-turn thinking blocks in the parser's own tokens.
+        ) -> tuple[Optional[str], Optional[str]]:
+            """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
+
+            At most one is set: encoders that frame the reasoning channel take
+            it as ``reasoning_content``, everything else gets it re-wrapped and
+            spliced into content. On the HF chat-template path that includes
+            every template rendering ``reasoning_content`` itself (fork, see
+            ``OpenAIServingChat.supports_native_reasoning_history``), so the
+            template sees what an OpenAI chat request would hand it and the
+            follow-up prompt extends the tokens the model generated.
 
             ``redacted_thinking`` carries encrypted bytes that no local
             parser can interpret. It is SKIPPED with a warning rather than
@@ -545,11 +577,15 @@ class AnthropicServing:
                 if block.type == "thinking" and block.thinking
             ]
             if not thinking_parts:
-                return None
+                return None, None
+
+            reasoning_text = "\n".join(thinking_parts)
+            if self.openai_serving_chat.supports_native_reasoning_history():
+                return reasoning_text, None
 
             try:
-                return self.openai_serving_chat.wrap_reasoning_history(
-                    "\n".join(thinking_parts)
+                return None, self.openai_serving_chat.wrap_reasoning_history(
+                    reasoning_text
                 )
             except ValueError as e:
                 logger.warning(
@@ -557,7 +593,7 @@ class AnthropicServing:
                     len(thinking_parts),
                     e,
                 )
-                return None
+                return None, None
 
         system_parts: list[str] = []
         if anthropic_request.system:
@@ -640,7 +676,11 @@ class AnthropicServing:
             tool_calls: list[dict] = []
 
             if msg.role == "assistant":
-                reasoning_history = _convert_assistant_thinking_blocks(msg.content)
+                reasoning_content, reasoning_history = (
+                    _convert_assistant_thinking_blocks(msg.content)
+                )
+                if reasoning_content is not None:
+                    openai_msg["reasoning_content"] = reasoning_content
                 if reasoning_history is not None:
                     content_parts.append({"type": "text", "text": reasoning_history})
 
@@ -802,6 +842,14 @@ class AnthropicServing:
         # on every rank. Absent stays absent: the server then mints its own.
         if anthropic_request.rid is not None:
             request_data["rid"] = anthropic_request.rid
+        if anthropic_request.return_cached_tokens_details:
+            request_data["return_cached_tokens_details"] = True
+        # Q-460 SALT-ISOLATION: the namespace reaches the chat layer, which
+        # folds it into ``extra_key`` (serving_base._compute_extra_key)
+        for _ns_field in ("cache_salt", "extra_key"):
+            _ns_val = getattr(anthropic_request, _ns_field, None)
+            if _ns_val:
+                request_data[_ns_field] = _ns_val
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
@@ -1194,6 +1242,9 @@ class AnthropicServing:
         matched_stop: Any = None
         accumulated_text: list[str] = []
         final_usage: Optional[AnthropicUsage] = None
+        # #59: the OpenAI stream's sglext chunk carries it; message_delta
+        # forwards it as a top-level sglext (the Weg-2 front's reader).
+        final_sglext: Optional[AnthropicSglExt] = None
         message_started = False
         had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -1662,6 +1713,7 @@ class AnthropicServing:
                             stop_sequence=matched_sequence,
                         ),
                         usage=final_usage or AnthropicUsage(output_tokens=0),
+                        sglext=final_sglext,
                     )
                 )
 
@@ -1698,6 +1750,9 @@ class AnthropicServing:
                 for frame in _flush_on_error("api_error", "Stream processing error"):
                     yield frame
                 return
+
+            if _sglext_of(chunk) is not None:
+                final_sglext = _sglext_of(chunk)
 
             if chunk.usage is not None:
                 # ``include_input=True`` because message_start now ships
@@ -1982,6 +2037,7 @@ class AnthropicServing:
                 include_input=True,
                 include_output=True,
             ),
+            sglext=_sglext_of(response),
         )
 
     def _convert_openai_error_response(self, response) -> JSONResponse:

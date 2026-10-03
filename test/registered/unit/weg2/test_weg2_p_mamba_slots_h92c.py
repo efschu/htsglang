@@ -307,10 +307,13 @@ class TestLauncherSeamH92c:
         assert len(card) == 3 and all("-> PASST |" in c for c in card)
         assert "(4 Sitze, hier 8)" in card[0] and "+274 MiB" in card[0]
 
-    def test_a_computed_deficit_at_eight_seats_refuses_w132(self):
-        with pytest.raises(lc.Weg2LaunchRefused, match="W132 Weg2PCardChunkOom"):
-            self._run("--max-running-requests 8", 8, (0.40, 0.70, 0.733887),
-                      mamba_slots=32, mamba_mib_per_slot=SLOT_MIB)
+    def test_a_computed_deficit_at_eight_seats_is_capped(self):
+        # YaRN x2 (28.09.): das Defizit ist gerechnet (Mamba-Term) -- die Stufe
+        # wird auf ihre Decke gekappt statt verweigert; die Karte danach passt.
+        card = self._run("--max-running-requests 8", 8, (0.40, 0.70, 0.733887),
+                         mamba_slots=32, mamba_mib_per_slot=SLOT_MIB)
+        assert len(card) == 6 and "STIRBT" in card[0]
+        assert all("-> PASST |" in c for c in card[3:]) and "f 0.3940" in card[3]
 
     def test_without_the_term_it_still_entfaellt(self):
         card = self._run("--max-running-requests 8", 8, BB2)

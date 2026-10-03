@@ -94,6 +94,22 @@ def _1469_note(kind: str, _uncapped: bool = False, **kw) -> None:
         pass
 
 
+_NO_PROGRESS_N = 0
+
+
+def _mamba_evict_no_progress(request: int, freed: int) -> None:
+    """A full LRU round freed nothing (every leaf refused): the eviction ends
+    short instead of circling. Sampled: first 16, then every 256th."""
+    global _NO_PROGRESS_N
+    _NO_PROGRESS_N += 1
+    n = _NO_PROGRESS_N
+    if n <= 16 or n % 256 == 0:
+        logger.warning(
+            "MAMBA-EVICT NO-PROGRESS n=%d request=%d freed=%d: a whole LRU round "
+            "freed nothing (every device leaf refused its eviction) -- ending "
+            "short instead of restarting the walk", n, request, freed)
+
+
 class MambaLoadBackUnservable(Exception):
     """#968 FIX-4: the GDN half of a host load-back cannot be served.
 
@@ -346,6 +362,11 @@ class MambaComponent(TreeComponent):
                 try:
                     n = getattr(MambaComponent, "_host_resume_count", 0) + 1
                     MambaComponent._host_resume_count = n
+                    # E2 (rankstats cache.mamba_tok): the depths the line
+                    # samples (n == 1 or n % 8), summed for every acceptance.
+                    MambaComponent._host_resume_tok = getattr(
+                        MambaComponent, "_host_resume_tok", 0
+                    ) + int(depth)
                     if n == 1 or n % 8 == 0:
                         logger.info(
                             "MAMBA-HOST-RESUME n=%d: anchor accepted at depth=%d on a "
@@ -916,10 +937,16 @@ class MambaComponent(TreeComponent):
                 host_lru.remove_node(node)
 
         # After device tombstone: if only host_value remains, insert into host LRU
+        # Y8P-HOSTLOCK-LRU (NF y8p D TP1/TP2 03.10. 08:57:45, node 266: "mamba host-locked node(s)
+        # on the host LRU" killed both ranks at the idle sanity walk right after a D park): a
+        # host-locked node (#1417 prefetch pin) is OFF the host LRU by design -- the last host
+        # unlock (`release_component_lock(lock_host=True)`) files it. Device eviction of such a
+        # node must not file it here.
         if (
             target is EvictLayer.DEVICE
             and cd.value is None
             and cd.host_value is not None
+            and cd.host_lock_ref == 0
         ):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)
@@ -933,6 +960,14 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
         x = lru.get_lru_no_lock()
+        # M1s rc12z30j: the D-leaf branch restarts at the LRU end whenever its
+        # successor left the list -- and at the list head (get_prev -> None)
+        # too. With every leaf's backup refused nothing ever leaves the list,
+        # so the walk circled forever (TP1/TP2 01:04:50-01:07, 16189 refusals)
+        # while TP0 waited in the extend's all-reduce. A new round only runs
+        # if the last one freed something; otherwise the eviction ends short
+        # and the caller's under-delivery check names it.
+        round_mark = tracker[ct]
         while tracker[ct] < request and x is not None and lru.in_list(x):
             assert x.component_data[ct].value is not None
             # #1470b: the un-backed-skip tried here on weg2xsn228 crashed PP0
@@ -946,6 +981,11 @@ class MambaComponent(TreeComponent):
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_device_leaf(x, tracker)
                 if not lru.in_list(x_next):
+                    if x_next is None:
+                        if tracker[ct] == round_mark:
+                            _mamba_evict_no_progress(request, tracker[ct])
+                            break
+                        round_mark = tracker[ct]
                     x_next = lru.get_lru_no_lock()
                 x = x_next
             else:
@@ -998,6 +1038,11 @@ class MambaComponent(TreeComponent):
                 vlen = len(value)
                 self.cache.component_evictable_size_[ct] -= vlen
                 self.cache.component_protected_size_[ct] += vlen
+                # ED (mem_cache/evict_frontier_census.py): a mamba lock pins
+                # this node alone; its FULL rows stay counted as evictable.
+                from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+                _ef.note_aux_lock(self.cache, node, True)
             cd.lock_ref += 1
         if self.cache._pin_trace_every:
             self.cache.record_pin_trace_mamba("inc", host=lock_host)
@@ -1070,6 +1115,9 @@ class MambaComponent(TreeComponent):
                 vlen = len(value)
                 self.cache.component_evictable_size_[ct] += vlen
                 self.cache.component_protected_size_[ct] -= vlen
+                from sglang.srt.mem_cache import evict_frontier_census as _ef
+
+                _ef.note_aux_lock(self.cache, node, False)
             cd.lock_ref -= 1
             if self.cache._pin_trace_every:
                 self.cache.record_pin_trace_mamba("dec", host=False)
@@ -1895,6 +1943,19 @@ class MambaComponent(TreeComponent):
             target_node = (
                 insert_result.inserted_host_node if insert_result is not None else None
             )
+            if target_node is None and loaded and host_indices is not None:
+                # PREFETCH ANCHOR ATTACH (NF y5a 30.09., weg2-19-28): the read
+                # claimed 665 pages with its anchor at page 664 (#1028B FETCH
+                # CAP anchors_in_range mamba (9, 664)), but the sibling's
+                # load had put that KV on the DEVICE first (#988 LOADBACK
+                # weg2-18-24 -> 43520, state only at 43520): the host insert
+                # found the whole span in the tree, inserted no host node, and
+                # the anchor was released here. The next match walked 43200
+                # KV tokens without one state ("#928 REFUSING ... NONE-ON-
+                # THIS-PATH") and 43396 tokens went back to P. The node the
+                # insert ENDED at is exactly the anchor's depth (the walk
+                # split it there); a node without any state takes the anchor.
+                target_node = self._prefetch_anchor_target(insert_result)
             if (
                 host_indices is None
                 or target_node is None
@@ -1915,6 +1976,56 @@ class MambaComponent(TreeComponent):
                     host_lru.insert_mru(target_node)
             if insert_result is not None:
                 insert_result.mamba_exist = False
+
+    def _prefetch_anchor_target(self, insert_result) -> Optional[UnifiedTreeNode]:
+        """PREFETCH ANCHOR ATTACH: the existing node at the read's end, when it
+        carries no Mamba state on device or host (a node WITH one keeps it;
+        the read's copy is then released as before). Switch
+        SGLANG_WEG2_PREFETCH_ANCHOR_ATTACH (default on)."""
+        if insert_result is None or not envs.SGLANG_WEG2_PREFETCH_ANCHOR_ATTACH.get():
+            return None
+        node = getattr(insert_result, "matched_end_node", None)
+        if node is None or node is self.cache.root_node:
+            return None
+        cd = node.component_data[self.component_type]
+        if cd.value is not None or cd.host_value is not None:
+            return None
+        cls = type(self)
+        _depth = getattr(self.cache, "weg2_node_depth", lambda _n: None)(node)
+        # y5h (NF rc12z30y5h 30.09., D TP1/TP2 20:30:30Z "node 540 mamba host
+        # present but Full.host_value=None"): this branch is reached exactly
+        # when the end node has NO Full host copy (a node with one is
+        # ``inserted_host_node`` already), so the bare attach below broke the
+        # tree law "aux host requires Full host" every time. The node first
+        # adopts the read's own KV rows for its span as its Full host copy;
+        # where it cannot, the anchor is dropped -- the caller releases the
+        # slot to the pool (append_host_mem_release), nothing is hung.
+        why = None
+        _adopt = getattr(self.cache, "weg2_adopt_read_rows_for_anchor", None)
+        if node.component_data[ComponentType.FULL].host_value is None:
+            why = _adopt(node, insert_result) if callable(_adopt) else "full_unbacked"
+        if why is not None:
+            cls._anchor_attach_drop_n = getattr(cls, "_anchor_attach_drop_n", 0) + 1
+            k = cls._anchor_attach_drop_n
+            if k <= 16 or k % 256 == 0:
+                logger.info(
+                    "WEG2 PREFETCH-ANCHOR-ATTACH dropped n=%d node=%s depth=%s why=%s (the end "
+                    "node has no Full host copy and cannot take the read's rows; the anchor "
+                    "is released to the pool, never hung without Full host)",
+                    k, getattr(node, "id", "?"), _depth, why,
+                )
+            return None
+        cls._anchor_attach_n = getattr(cls, "_anchor_attach_n", 0) + 1
+        n = cls._anchor_attach_n
+        if n <= 16 or n % 256 == 0:
+            logger.info(
+                "WEG2 PREFETCH-ANCHOR-ATTACH n=%d node=%s depth=%s adopted_kv=%d (the read's span was "
+                "already in the tree without a state; its anchor stays at the node, not released; "
+                "the node's Full host copy = the read's rows for its span)",
+                n, getattr(node, "id", "?"), _depth,
+                int(getattr(insert_result, "anchor_adopted_tokens", 0) or 0),
+            )
+        return node
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]

@@ -660,6 +660,9 @@ def _choose_lines(flip_ratchet):
             ring_bytes=int(43.54 * GIB), ring_span1_bytes=int(20.0 * GIB),
             cg_current_bytes=int(9.0 * GIB), reclaimable_bytes=int(3.0 * GIB),
             cg_ceiling_bytes=int(123.78 * GIB), s_gb_d=4,
+            # 2026-10-01: CT999 specimen without a Docker cap -> the lxcfs
+            # fallback, so the line still grades against the 95.90 mark.
+            cg_ceiling_source="lxcfs MemTotal FALLBACK (CT999 specimen, no Docker cap)",
             flip_ratchet=flip_ratchet,
         )
         return list(lines)

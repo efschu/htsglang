@@ -404,7 +404,10 @@ def test_weights_leg_first_then_kv_leg_with_n_grows_the_bank_in_place():
         assert pool._weg2_seat_keep == 7
         # experts (mapped): grown in place (now=True) and ON in the device tables
         grow = [c for c in tms.calls if c[2]]
-        assert grow and all(c[1] == ((0, dsv.align_up((10 + k) * 4096, 4096)),) for c in grow)
+        # S1-Wisch: the plan is cut at the lattice of all phases -- one prefix, many cells
+        end = dsv.align_up((10 + k) * 4096, 4096)
+        assert grow and all(c[1][0][0] == 0 and c[1][-1][1] == end and dsv.span_bytes(c[1]) == end
+                            for c in grow)
         for c in caches:
             assert c._pool_tables.seat_on == k
             assert c._pool_tables.row_key.tolist()[10:10 + k] == [-1] * k
@@ -569,7 +572,7 @@ def test_the_scheduler_delegates_and_the_resume_calls_before_the_tags():
     for name in ("seat_vram_wake", "seat_cap", "seat_guard"):
         assert callable(getattr(d_park_runtime, name, None)), name
     src = open(sch.__file__).read()
-    i = src.index("    def get_num_allocatable_reqs(self, running_bs):")
+    i = src.index("    def get_num_allocatable_reqs(self, running_bs")
     body = src[i:i + 1200]
     assert "_seat_cap = self._weg2_d_seat_cap()" in body
     assert "limit = min(limit, _seat_cap)" in body
@@ -846,10 +849,15 @@ def test_dry_run_of_the_x177_form_writes_the_rows_into_env_d():
     with mock.patch.object(L, "d_replayssm_spec_plan_form", lambda _ns: er.ReplaySSMSpecForm(
             ring_len=16, draft_tokens=4, max_running=6, ssm_dtype="bfloat16")):
         lines = L.d_seat_table_lines(ns, er, kw, "D")
-    assert any("H95c Laufzeit-Zeilen [133, 140, 141]" in ln for ln in lines if "n=1:" in ln)
-    assert any("H95c Laufzeit-Zeilen [120, 140, 141]" in ln for ln in lines if "n=6:" in ln)
-    assert L.parse_group_env(ns.env_d)["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "14,0,0"
-    assert L.parse_group_env(ns.env_d)["SGLANG_OPT_WEG2_D_SEAT_VRAM"] == "1"
+    assert any("H95c Laufzeit-Zeilen [133, 142, 143]" in ln for ln in lines if "n=1:" in ln)
+    assert any("H95c Laufzeit-Zeilen [120, 142, 143]" in ln for ln in lines if "n=6:" in ln)
+    # #251c: the KV stage form adds its stage rows to TP0's seat rows (and
+    # takes them from its scratch) -- the H95c seat rows themselves are 14
+    env = L.parse_group_env(ns.env_d)
+    stage = int(env.get("SGLANG_WEG2_D_KV_STAGE_ROWS", "0"))
+    # #239 S3g floor: a byteless Form A worker holds no KV (no QSA keys), no stage rows
+    assert env["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"] == "%d,0,0" % (14 + stage)
+    assert env["SGLANG_OPT_WEG2_D_SEAT_VRAM"] == "1"
 
 
 def test_the_launcher_default_and_an_operators_word():

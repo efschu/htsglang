@@ -47,7 +47,8 @@ same refutation: the weg2sb5g figures it quotes are "3 served out of 53
 re-offer ran.
 
 THE FIX: W53 moves to the SECOND refusal, where W35 already stands, and W35's
-bare 503 becomes W53's named, measured 413.  W52 (`carrier_est > carrier_max`)
+bare 503 becomes W53's named, measured refusal (503 + Retry-After inside
+the form, 413 only over it -- `refusal_status`, rc12z30d 21:11:35).  W52 (`carrier_est > carrier_max`)
 stays terminal at n=1 -- that one is STRUCTURAL, no pass can move it, which is
 exactly the distinction round 1 lost.  No new bookkeeping, no new counter, no
 second store read.  W53 becomes a SUBSET of W35 (its population), so both
@@ -241,7 +242,9 @@ def test_arm_a_salad_an_empty_handback_is_terminal_only_after_the_re_offer():
 
     chars/token 2.78 < 3.0, so the front UNDER-estimates.  The store never
     hands anything back, so the one re-offer is spent and the SECOND refusal
-    is the named, measured 413.  RED at the parent for the placement: the
+    is the named, measured W53 -- a 503 with Retry-After, because the store
+    not handing back is state and the prompt is inside the form (rc12z30d
+    21:11:35; 413 only over the form, `refusal_status`).  RED at the parent for the placement: the
     parent refuses at n=1 after a single P prefill, which is exactly the lap
     that would have deleted weg2-28-259 had the estimate fallen the other way.
     """
@@ -256,7 +259,7 @@ def test_arm_a_salad_an_empty_handback_is_terminal_only_after_the_re_offer():
             assert t["measured"] > t["est"], t  # the front under-estimates
             h.d.refuse_real_for["sa"] = 9  # the store never hands anything back
             status, text = await asyncio.wait_for(h.post("sa", chars=BODY_CHARS), 30.0)
-            assert status == 413, (status, text[:400])
+            assert status == 503, (status, text[:400])  # state, inside the form
             assert HANDBACK_NAME in text
             assert h.front.counters["W53_Weg2StoreHandbackFailed"] == 1
             # THE PLACEMENT: the terminal is the SECOND refusal, and W53 is a
@@ -289,7 +292,7 @@ def test_arm_b_natural_prose_is_the_same_fault_and_must_reach_the_same_verdict()
             assert t["measured"] < t["est"], t  # the front OVER-estimates
             h.d.refuse_real_for["na"] = 9
             status, text = await asyncio.wait_for(h.post("na", chars=BODY_CHARS), 30.0)
-            assert status == 413, (status, text[:400])
+            assert status == 503, (status, text[:400])  # state, inside the form
             assert HANDBACK_NAME in text
             assert h.front.counters["W53_Weg2StoreHandbackFailed"] == 1
             assert h.front.counters["W35_Weg2XReQueueLoop"] == 1
@@ -458,13 +461,13 @@ def test_mutant_arm_d_a_carrier_exceeds_arrival_never_ran_a_leg_one():
                                    idle_layout="D") as h:
             h.d.refuse_real_for["ce"] = 9
             status, text = await asyncio.wait_for(h.post("ce", chars=BODY_CHARS), 30.0)
-            assert status == 503, (status, text[:400])
-            assert "W35 Weg2XReQueueLoop" in text, text[:400]
-            assert h.front.counters["route_carrier_exceeds"] == 1
+            # Law 02.10. (P's KV stages cover D's max session): the
+            # CARRIER-EXCEEDS route is deleted -- the arrival takes P's leg 1;
+            # over this harness's tiny carrier the refusal is the named W52.
+            assert h.front.counters["route_carrier_exceeds"] == 0
+            assert h.p.gen_marks.count("ce") >= 1, ("P ran its leg 1", h.p.gen_marks)
+            assert status in (413, 503), (status, text[:400])
             assert h.front.counters.get("W53_Weg2StoreHandbackFailed", 0) == 0
-            assert h.front.counters["W35_Weg2XReQueueLoop"] == 1
-            assert h.p.gen_marks.count("ce") == 0, (
-                "CARRIER-EXCEEDS runs no leg 1 at all", h.p.gen_marks)
 
     asyncio.run(body())
 
@@ -477,7 +480,9 @@ def test_mutant_arm_d_served_on_the_re_offer_is_still_served():
         async with MeasuredHarness(p_cpt=SALAD_CPT, d_cpt=SALAD_CPT,
                                    awake="P", p_concurrency=2, d_bs=4,
                                    tp_prefill_max_tokens=5000,
-                                   carrier_max_tokens=1000,
+                                   # law 02.10.: the carrier holds D's session
+                                   # (P-COVERS-D-SESSION); below it W52 refuses
+                                   carrier_max_tokens=10 ** 6,
                                    flip_min_work_tokens=1,
                                    idle_layout="D") as h:
             h.d.refuse_real_for["cf"] = 1
@@ -552,11 +557,27 @@ def test_mutant_w53_can_never_fire_on_the_first_refusal():
                 for n in ast.walk(node)
                 if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Subscript)]
 
+    # SK-X (NF rc12t weg2-6-30, 28.09.): the gate is `if terminal:` with
+    # `terminal = n > 1 and (leg1_ran or n > 2)` -- W35/W53 need a P leg that
+    # actually ran ("after a full P prefill"). What this pin protects is
+    # unchanged and asserted here: the terminal gate still requires `n > 1`
+    # as a conjunct, so W53 can never fire on the first refusal.
+    def _n_gt_1(expr):
+        return (isinstance(expr, ast.Compare) and isinstance(expr.left, ast.Name)
+                and expr.left.id == "n" and isinstance(expr.ops[0], ast.Gt)
+                and isinstance(expr.comparators[0], ast.Constant)
+                and expr.comparators[0].value == 1)
+
+    terminal_defs = [s for s in fn.body
+                     if isinstance(s, ast.Assign) and len(s.targets) == 1
+                     and isinstance(s.targets[0], ast.Name) and s.targets[0].id == "terminal"]
+    assert len(terminal_defs) == 1, "one definition of the terminal verdict"
+    tdef = terminal_defs[0].value
+    assert isinstance(tdef, ast.BoolOp) and isinstance(tdef.op, ast.And) and any(
+        _n_gt_1(v) for v in tdef.values), "terminal must require n > 1 (never the first refusal)"
     guards = [s for s in fn.body
-              if isinstance(s, ast.If) and isinstance(s.test, ast.Compare)
-              and isinstance(s.test.left, ast.Name) and s.test.left.id == "n"
-              and isinstance(s.test.ops[0], ast.Gt)]
-    assert len(guards) == 1, "the `if n > 1:` guard is the only terminal gate"
+              if isinstance(s, ast.If) and isinstance(s.test, ast.Name) and s.test.id == "terminal"]
+    assert len(guards) == 1, "the `if terminal:` guard is the only terminal gate"
     guard = guards[0]
     outside = [c for s in fn.body if s is not guard for c in incs(s)]
 

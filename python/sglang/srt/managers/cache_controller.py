@@ -22,6 +22,7 @@ import time
 
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from sglang.srt.managers import weg2_p_overlap as _weg2_p_overlap
+from sglang.srt.managers.weg2_min_hit import revoke_threshold  # PARK-RETAIN READ
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -44,6 +45,7 @@ from sglang.srt.mem_cache.hicache_collective import (
     bounded_wait,
 )
 from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
+from sglang.srt.mem_cache import probe_hold as _probe_hold
 
 
 # #1402: module-level on purpose -- the harness doubles bind curated
@@ -107,8 +109,83 @@ from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
+
+def _read_stages(operation) -> dict:
+    """H2D phase 1 (a): CPU ms per read sub-stage of ONE prefetch operation
+    (aux thread): find, adopt (#257 probe hold), ref, l3fill, resolve (arena
+    page get), kv (the whole page get), draft_wait, extra (hybrid pools:
+    mamba anchor / sidecars). Written by the read, printed once by
+    ``_read_stages_line``. Instrument only."""
+    rs = getattr(operation, "_weg2_rs", None)
+    if rs is None:
+        rs = {}
+        try:
+            operation._weg2_rs = rs
+        except Exception:  # noqa: BLE001 -- an operation without a dict: count nothing
+            pass
+    return rs
+
+
+_READ_STAGES_N = [0]
+
+
+def _read_stages_line(operation, total_ms: float) -> None:
+    """One ``WEG2-READ-STAGES`` line per read (the first 16, then every read
+    of >= 64 pages or >= 50 ms): where the aux thread's read time goes."""
+    try:
+        rs = getattr(operation, "_weg2_rs", None) or {}
+        pages = int(rs.get("pages", 0))
+        _READ_STAGES_N[0] += 1
+        if not (_READ_STAGES_N[0] <= 16 or pages >= 64 or total_ms >= 50.0):
+            return
+        parts = " ".join(
+            f"{k}_ms={float(rs[k]):.0f}" for k in
+            ("find", "adopt", "ref", "l3fill", "resolve", "kv", "draft_wait", "extra") if k in rs)
+        logger.info(
+            "WEG2-READ-STAGES req=%s pages=%d l3fill_pages=%d total_ms=%.0f %s "
+            "(aux-thread CPU ms of the read: kv = the whole arena page get incl. "
+            "find/adopt/ref/l3fill/resolve; extra = hybrid pools; no H2D here)",
+            getattr(operation, "request_id", "?"), pages, int(rs.get("l3fill_pages", 0)),
+            total_ms, parts,
+        )
+    except Exception:  # noqa: BLE001 -- an instrument never breaks a read
+        pass
+
+def _note_l3_read(controller, operation) -> None:
+    """RANK-TIMING (rankstats ``cache.l3`` / ``cache.prefetch``): one store read
+    at its end -- read ms (the read's own clock), issue -> end ms, pages landed,
+    bytes (pages x the host pool's bytes per token). The aux thread's own
+    stamps; an instrument never breaks a read."""
+    try:
+        from sglang.srt.weg2 import rank_timing as _rank_timing  # stdlib only
+
+        tok = int(operation.completed_tokens)
+        ps = max(1, int(controller.page_size))
+        spt = int(getattr(controller.mem_pool_host, "size_per_token", 0) or 0)
+        _rank_timing.note_l3_read(
+            (operation.read_end_time - operation.read_start_time) * 1000.0,
+            pages=tok // ps, nbytes=tok * spt,
+            prefetch_ms=(operation.read_end_time - float(operation.start_time)) * 1000.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 device_module = get_device_module()
 
+
+
+def _l3_rank_identity_or_none(server_args):
+    """L3P: the persistent-store rank identity, or None (no server_args, or
+    it cannot be resolved -- the store then records nothing and checks
+    nothing, which is the pre-L3P behaviour)."""
+    if server_args is None:
+        return None
+    try:
+        from sglang.srt.mem_cache.hicache_storage import l3_rank_identity
+
+        return l3_rank_identity(server_args)
+    except Exception:  # noqa: BLE001
+        return None
 
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
@@ -507,21 +584,31 @@ CLAIM_VOTE_ABSTAIN = 1 << 30
 PREFETCH_CLAIM_REDUCE_BOUND_S = 120.0
 
 
-def encode_claim_vote(count: int, abstain: bool) -> list:
+def encode_claim_vote(count: int, abstain: bool, min_only: bool = False) -> list:
     """The packed vote of one rank: ``[claim, -claim]`` for a voter, the
     abstain sentinel in BOTH slots for a rank that holds no bytes -- it can
-    win neither the min nor the max, so the extremes come from voters alone."""
+    win neither the min nor the max, so the extremes come from voters alone.
+    ``min_only`` (#239 S3h): a rank that holds PART of every page (a KV worker
+    under the token cut) votes its claim into the min and abstains from the
+    max -- its claim is not capped by the host's mamba anchor, so it may
+    exceed the host's without the stores disagreeing."""
     if abstain:
         return [CLAIM_VOTE_ABSTAIN, CLAIM_VOTE_ABSTAIN]
+    if min_only:
+        return [int(count), CLAIM_VOTE_ABSTAIN]
     return [int(count), -int(count)]
 
 
 def decode_claim_vote(packed) -> tuple:
     """``(min, max)`` over the VOTERS of one MIN-reduced packed vector; a
-    group in which every rank abstained holds nothing and decodes to 0."""
+    group in which every rank abstained holds nothing and decodes to 0. A
+    group whose only max voters abstained (every voter min-only) decodes
+    to ``(min, min)``."""
     lo, neg_hi = int(packed[0]), int(packed[1])
     if lo >= CLAIM_VOTE_ABSTAIN:
         return 0, 0
+    if neg_hi >= CLAIM_VOTE_ABSTAIN:
+        return lo, lo
     return lo, -neg_hi
 
 
@@ -530,6 +617,81 @@ def claim_vote_abstains(controller) -> bool:
     ``abstains_from_claim_vote``; every other tier votes its own claim."""
     backend = getattr(controller, "storage_backend", None)
     return bool(getattr(backend, "abstains_from_claim_vote", False))
+
+
+def claim_vote_min_only(controller) -> bool:
+    """#239 S3h: a Form A worker that OWNS full-attention rows under the token
+    cut (real file backend, KV window only) votes in the min arm alone. Its
+    claim counts the KV pages it can read; the host's claim is capped at its
+    deepest mamba anchor (the worker holds no recurrent state). Both are
+    honest answers about DIFFERENT parts of the same page, so the group takes
+    the MIN (see :func:`settle_claim_split`), never the worker's larger count
+    as a disagreement."""
+    if claim_vote_abstains(controller):
+        return False
+    from sglang.srt.rank_role import kv_only_rank
+
+    return bool(kv_only_rank())
+
+
+def rank_holds_gdn_state(controller) -> bool:
+    """The RankState record's ``has_mamba_pool`` (W7 GDN-blob applicability):
+    this rank's device pool carries a mamba pool AND the rank holds GDN
+    state. Rank form (28.09.): a KV-only rank (:func:`kv_only_rank`) never
+    does -- the weight rank owns it, and the lane's one-slot placeholder
+    pool is not a blob the gate may demand."""
+    pool = getattr(getattr(controller, "mem_pool_device_hybrid", None), "mamba_pool", None)
+    if pool is None:
+        return False
+    from sglang.srt.rank_role import kv_only_rank
+
+    return not kv_only_rank()
+
+
+def split_host_state_pools(controller, transfers) -> tuple:
+    """#239 Blocker 5 (rc12z30d -st-cut, D log 21:11:02): ``(own, host)`` of a
+    transfer list. On a Form A worker that owns KV token rows under the cut
+    (:func:`claim_vote_min_only`) every non-KV pool -- the mamba anchor, the
+    QSA / draft sidecars -- is the ATTENTION HOST's state: the worker's pools
+    for it are byteless (``refuse_kv_worker_sidecar_bytes``) and its store
+    holds none of it. Asked of the worker's store, that pool answered "no
+    anchor anywhere" and capped the worker's KV claim to 0 (``#1028B FETCH
+    CAP kv=264 claimed=0 ... by=mamba``), so the group MIN was 0 and D
+    re-prefilled everything. Such a pool is the host's to answer; the worker
+    answers only for its KV rows, exactly as S3h's min-only vote says.
+    Everywhere else: ``(transfers, [])``, byte-identical."""
+    transfers = list(transfers or [])
+    if not transfers or not claim_vote_min_only(controller):
+        return transfers, []
+    own = [t for t in transfers if t.name == PoolName.KV]
+    host = [t for t in transfers if t.name != PoolName.KV]
+    return own, host
+
+
+#: #239 S3h: the line of a claim split the token cut settles by MIN.
+CLAIM_CUT_MIN_ADOPT_MARKER = "#239 S3h CLAIM MIN-ADOPT (Schnitt)"
+
+
+def settle_claim_split(min_claim: int, max_claim: int, rid, *, cut_active: bool) -> int:
+    """The group's claim from one packed vote. Equal extremes: that claim.
+    Under the token cut the host and the KV workers hold different parts of
+    each page (host: mamba/QSA/draft, workers: their KV rows), so a worker
+    below the host is a shorter prefix the WHOLE group adopts (slower, never
+    wrong: the rest is re-prefilled) -- named, rank-uniform, because every
+    rank decodes the same reduced vector. Without the cut the L8 law stands:
+    a split is :func:`assert_draft_claims_agree`'s STOP."""
+    mn, mx = int(min_claim), int(max_claim)
+    if mn == mx:
+        return mn
+    if cut_active:
+        logger.warning(
+            "%s rid=%s per_rank_claim=[%d, %d] (min over host+KV workers, max over "
+            "the host's anchor-capped claim): every rank proceeds with %d",
+            CLAIM_CUT_MIN_ADOPT_MARKER, rid, mn, mx, mn,
+        )
+        return mn
+    assert_draft_claims_agree(mn, mx, rid)
+    return mn
 
 
 def resolve_draft_claim(kv_pages: int, draft_pages: int, chunk_pages: int, reprobe):
@@ -608,6 +770,23 @@ def resolve_draft_claim(kv_pages: int, draft_pages: int, chunk_pages: int, repro
 #: (ranks-never-disagree) crash-stop form: the helper raises, it never
 #: returns.
 STORAGE_THREAD_JOIN_BOUND_S = 10.0
+
+#: WAKE-PARALLEL (28.09., NF rc12z22 D 14:56:23): the store->host reads of the
+#: operations the prefetch loop hands over run on this many aux threads instead
+#: of one. The five reads the wake issued for its parked requests ran one after
+#: the other (WEG2-LOAD-DEVICE queue_ms 364 / 1028 / 1859 / 2402 / 2750 for
+#: read_ms 681 / 854 / 557 / 350 / 378) -- the last one waited 2.75 s for four
+#: reads it shares nothing with. ``1`` = the single aux thread as before.
+PREFETCH_IO_WORKERS_ENV = "SGLANG_HICACHE_PREFETCH_IO_WORKERS"
+PREFETCH_IO_WORKERS_DEFAULT = 4
+
+
+def prefetch_io_workers() -> int:
+    try:
+        n = int(os.environ.get(PREFETCH_IO_WORKERS_ENV, "") or PREFETCH_IO_WORKERS_DEFAULT)
+    except ValueError:
+        return PREFETCH_IO_WORKERS_DEFAULT
+    return max(1, min(16, n))
 
 
 class StorageStopResult(NamedTuple):
@@ -933,6 +1112,138 @@ WEG2_HANDOFF_PAGE_KEYS: dict = {}  # rid -> P's page keys for the span the dorma
 WEG2_HANDOFF_OFF: dict = {}
 
 
+def probe_hold_pin(controller, operation, hash_value, hit_tokens=None) -> int:
+    """#257 (a): reference the probe's reported pages that are COMPLETE
+    in the arena (probe_hold.pin). No arena, no hold -- a Form A worker's
+    byteless pool and every non-arena backend pass through unchanged.
+
+    A module function, not a method: ``prefetch_thread_func`` is driven
+    unbound over controller stand-ins (#1233/H51/xsn392 suites), and a new
+    method on the class is an AttributeError there -- measured, three suites
+    red on 1961f756ad. Everything is read with getattr, so a stand-in without
+    an arena pool returns 0 before it touches ``storage_backend`` or
+    ``page_size`` (``hit_tokens`` cuts the keys to the probe's hit here, after
+    that check, for the same reason)."""
+    pool = getattr(controller, "mem_pool_host", None)
+    if (
+        not hash_value
+        or not getattr(pool, "arena_read", False)
+        or getattr(controller, "storage_backend", None) is None
+        or operation.is_terminated()
+    ):
+        return 0
+    if hit_tokens is not None:
+        hash_value = hash_value[: int(hit_tokens) // int(controller.page_size)]
+        if not hash_value:
+            return 0
+    try:
+        if not pool.ensure_bound(controller.storage_backend, role="kv"):
+            return 0
+        stems = weg2_suffixed_stems(controller.storage_backend, hash_value)
+        return _probe_hold.pin(operation, pool, stems)
+    except Exception:  # noqa: BLE001 - a hold is an improvement, never a wall
+        logger.warning("#257 PROBE-HOLD pin failed; the read runs without a hold", exc_info=True)
+        return 0
+
+
+def refuse_kv_worker_sidecar_bytes(mem_pool_host) -> None:
+    """#239 S4b (F14): a Form A worker that owns token rows carries exactly ONE
+    byte-holding host pool -- the KV anchor. Its sidecars (QSA index, draft,
+    mamba) stay byteless: those states are the attention host's. A sidecar
+    WITH bytes on such a worker would be addressed by the worker's KV ids,
+    whose space is the arena's (staging + slots x page + placeholders) and
+    not the sidecar's fixed row count -- the #249 BYTELESS-GROW shape, where
+    a skip is right only because nothing is there. Refused by name at attach
+    instead of trusted."""
+    from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+
+    if not isinstance(mem_pool_host, HostPoolGroup):
+        return
+    anchor = mem_pool_host.anchor_entry
+    carrying = [
+        f"{entry.name}({int(entry.host_pool.size_per_token)} B/token)"
+        for entry in mem_pool_host.entries
+        if entry is not anchor and int(entry.host_pool.size_per_token) > 0
+    ]
+    if carrying:
+        raise RuntimeError(
+            "#239 F14 KV-WORKER SIDECAR-BYTES REFUSED: this Form A worker owns KV "
+            f"token rows and also holds bytes in {', '.join(carrying)}. Under the "
+            "token cut only the KV anchor carries bytes on a worker; a sidecar "
+            "keyed by the worker's (arena) KV ids with its own fixed row count "
+            "would read or write beside its rows."
+        )
+
+
+def canonical_kv_owner_rows_for(owner_ctx, page_size, canonical_kv_page) -> Optional[tuple]:
+    """#239 S4b (F14): ``(page_size, S, lo, hi)`` when the owner rule runs on
+    PAGED pools with the canonical page (the token cut: a page is written by
+    every owner, each its own rows), else None -- the page-1 owner form and
+    every non-owner boot stay as they are."""
+    if owner_ctx is None or canonical_kv_page is None or int(page_size) == 1:
+        return None
+    S, lo, hi = (int(x) for x in owner_ctx)
+    logger.info(
+        "#239 F14 OWNER-ROWS: page %d, S=%d, this rank owns token rows "
+        "[%d, %d) of every page%s.",
+        int(page_size),
+        S,
+        lo,
+        hi,
+        " -- NONE: its KV page reads and writes abstain" if hi == lo else "",
+    )
+    return (int(page_size), S, lo, hi)
+
+
+def weg2_publish_rank_state(
+    ctl,
+    *,
+    form_a_worker: bool,
+    canonical_on: bool,
+    canonical_kv_built: bool,
+    canonical_blob_built: bool,
+    has_mamba_pool: bool,
+    owner_ctx: Optional[tuple],
+) -> None:
+    """IPC Phase 1: the facts the launcher half of W7/W10 decides on, as a
+    versioned record instead of the '#706 ... active' lines it counted
+    (rc12z29d: the F14 worker line was not among the counted strings, and
+    a clean D group was refused as 'kv x1 blob x1'). Every rank writes,
+    a rank owning zero token rows included. No record without a directory
+    from the launcher. A module function, not a method: the storage-config
+    builder is also driven on bare stand-ins of the controller."""
+    from sglang.srt.environ import envs
+    from sglang.srt.weg2.rank_state import build_rank_state, write_rank_state
+
+    state_dir = envs.SGLANG_WEG2_RANK_STATE_DIR.get()
+    if not state_dir:
+        return
+    seq = getattr(ctl, "_weg2_rank_state_seq", 0) + 1
+    ctl._weg2_rank_state_seq = seq
+    state = build_rank_state(
+        group=(os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper(),
+        tp_rank=ctl.tp_rank,
+        tp_size=ctl.tp_size,
+        pp_rank=ctl.pp_rank,
+        pp_size=ctl.pp_size,
+        form_a_worker=form_a_worker,
+        canonical_on=canonical_on,
+        canonical_kv_built=canonical_kv_built,
+        canonical_blob_built=canonical_blob_built,
+        has_mamba_pool=has_mamba_pool,
+        page_size=ctl.page_size,
+        owner_ctx=owner_ctx,
+        seq=seq,
+    )
+    # VRAM-Vertrag M2: the attach record carries the rank's VRAM actual
+    # (weg2/vram_actual.py); SGLANG_WEG2_VRAM_ACTUAL off = the record unchanged.
+    from sglang.srt.weg2 import vram_actual
+
+    state = vram_actual.attach(state, state_dir)
+    path = write_rank_state(state, state_dir)
+    logger.info("IPC RANK-STATE written %s: %s", path, state.to_json())
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -1060,6 +1371,9 @@ class HiCacheController:
         # loop holds it, and the tree's `ongoing_prefetch` stays the record.
         self._prefetch_current: Optional[PrefetchOperation] = None
         self._prefetch_io_current: Optional[PrefetchOperation] = None
+        # WAKE-PARALLEL: every operation an aux thread holds (id -> op); the
+        # pointer above stays the one most recently taken
+        self._prefetch_io_inflight: dict = {}
         # Operations a loop consumed AFTER the stop event was set (one counter
         # per loop, single writer each); summed into the RESET JOIN line.
         self._prefetch_drained_after_stop = 0
@@ -1232,6 +1546,14 @@ class HiCacheController:
         # #1068 (A12.4): a fresh pipeline holds nothing and has drained nothing.
         self._prefetch_current = None
         self._prefetch_io_current = None
+        self._prefetch_io_inflight = {}
+        # HICACHE-NEVER-SLOW: the L3 write-behind yields while a load is queued
+        try:
+            from sglang.srt.mem_cache import l3_write_behind as _l3wb
+
+            _l3wb.register_load_probe(self.storage_loads_pending)
+        except Exception:  # noqa: BLE001 -- the gate is an improvement, never a wall
+            pass
         self._prefetch_drained_after_stop = 0
         self._prefetch_io_drained_after_stop = 0
 
@@ -1293,6 +1615,8 @@ class HiCacheController:
         # first _start_storage_threads has not published these pointers yet.
         take(getattr(self, "_prefetch_current", None))
         take(getattr(self, "_prefetch_io_current", None))
+        for op in list((getattr(self, "_prefetch_io_inflight", None) or {}).values()):
+            take(op)  # WAKE-PARALLEL: every aux thread's operation
         for op in seen.values():
             op.mark_terminate()
         return len(seen)
@@ -1357,7 +1681,8 @@ class HiCacheController:
             if hasattr(self, "backup_queue"):
                 self.backup_queue.put_nowait(None)
             if hasattr(self, "prefetch_buffer"):
-                self.prefetch_buffer.put_nowait(None)
+                for _ in range(max(1, len(getattr(self, "prefetch_io_aux_threads", None) or ()))):
+                    self.prefetch_buffer.put_nowait(None)
         except Exception:
             pass
 
@@ -1367,8 +1692,12 @@ class HiCacheController:
             threads.append(("prefetch", self.prefetch_thread))
         if hasattr(self, "backup_thread"):
             threads.append(("backup", self.backup_thread))
-        if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(("prefetch_io_aux", self.prefetch_io_aux_thread))
+        _aux = list(getattr(self, "prefetch_io_aux_threads", None) or ())
+        if hasattr(self, "prefetch_io_aux_thread") and not any(
+                t is self.prefetch_io_aux_thread for t in _aux):
+            _aux.insert(0, self.prefetch_io_aux_thread)
+        for _k, _t in enumerate(_aux):
+            threads.append(("prefetch_io_aux" if _k == 0 else f"prefetch_io_aux{_k}", _t))
 
         for _, t in threads:
             try:
@@ -1440,13 +1769,21 @@ class HiCacheController:
         # the per-page owner rule needs page_size == 1 (a multi-token page
         # would span owner ranks). Fail fast instead of silently writing an
         # allocation-dependent (corrupt) store (task #60).
+        # #239 S4b (F14): the paged owner form -- every owner writes its own
+        # token rows of each page (``canonical_kv_owner_rows``) -- lifts the
+        # page_size limit; without it a page would still span owners.
+        owner_rows = (
+            self.storage_config.canonical_kv_owner_rows
+            if self.storage_config.dcp_owner_mode
+            else None
+        )
         if self.storage_config.dcp_owner_mode:
             if storage_backend != "file":
                 raise NotImplementedError(
                     "Weighted uneven-DCP HiCache storage currently supports "
                     f"only the 'file' backend, got '{storage_backend}'."
                 )
-            if self.page_size != 1:
+            if self.page_size != 1 and owner_rows is None:
                 raise NotImplementedError(
                     "Weighted uneven-DCP HiCache storage requires page_size == 1, "
                     f"got {self.page_size}."
@@ -1468,7 +1805,11 @@ class HiCacheController:
             # page_size tokens per slot; only weighted uneven-DCP ownership
             # (one page spanning two owner ranks) rules it out -- and that case
             # is already refused above. Qwen4Exp/QSA needs page_size >= 32.
-            if self.page_size != 1 and self.storage_config.dcp_owner_mode:
+            if (
+                self.page_size != 1
+                and self.storage_config.dcp_owner_mode
+                and owner_rows is None
+            ):
                 raise NotImplementedError(
                     "The #706 canonical KV page requires page_size == 1 under "
                     f"weighted uneven DCP (dcp_owner_mode), got {self.page_size}."
@@ -1484,12 +1825,17 @@ class HiCacheController:
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
-            from sglang.srt.rank_role import this_rank_is_form_a_worker
+            from sglang.srt.rank_role import (
+                form_a_worker_holds_kv,
+                this_rank_is_form_a_worker,
+            )
 
-            if this_rank_is_form_a_worker():
+            if this_rank_is_form_a_worker() and not form_a_worker_holds_kv():
                 # fnFL2 v16 (21.09.): no attention layer, no bytes in the
                 # canonical page -- the worker claims every page and moves
                 # nothing, so the tp-group MIN reduces settle on the host.
+                # #239 S4b (F14): a worker that OWNS token rows under the cut
+                # takes the real backend below, with its KV window only.
                 from sglang.srt.mem_cache.hicache_storage import FormAWorkerNullStorage
 
                 self.storage_backend = FormAWorkerNullStorage(self.storage_config)
@@ -1684,9 +2030,39 @@ class HiCacheController:
         canonical_kv_page = None
         canonical_mamba_blob = None
         canonical_qsa_page = None
-        from sglang.srt.rank_role import this_rank_is_form_a_worker
+        from sglang.srt.rank_role import kv_only_rank, this_rank_is_form_a_worker
 
-        if this_rank_is_form_a_worker():
+        canonical_on = server_args is not None and bool(
+            getattr(server_args, "hicache_canonical_kv_page", False)
+        )
+        if kv_only_rank() and canonical_on:
+            # #239 S4b (F14): a worker that owns token rows under the cut holds
+            # every full-attention layer with the full kv heads -- a whole-page
+            # window, cut to its rows below. No mamba blob, no QSA page, no
+            # draft: those stay the attention host's. Rank form (28.09.): the
+            # same for a weightless-lane KV rank (kv_only_rank), whose
+            # placeholder mamba pool is no GDN state to publish.
+            from sglang.srt.mem_cache.canonical_page_store import (
+                build_page_window,
+                resolve_attn_layer_ids,
+            )
+
+            model_config = server_args.get_model_config()
+            attn_layer_ids = resolve_attn_layer_ids(model_config)
+            self._canonical_server_args = server_args
+            self._canonical_model_config = model_config
+            self._canonical_attn_layer_ids = [int(i) for i in attn_layer_ids]
+            canonical_kv_page = build_page_window(
+                attn_layer_ids, self.mem_pool_device_hybrid, self.mem_pool_host
+            )
+            refuse_kv_worker_sidecar_bytes(self.mem_pool_host)
+            logger.info(
+                "#239 F14 KV-WORKER-WINDOW: Form A worker owns token rows %s of "
+                "every %d-token page; KV page window only (no mamba/QSA/draft).",
+                self._dcp_owner_ctx(),
+                self.page_size,
+            )
+        elif this_rank_is_form_a_worker():
             # fnFL2 v16 (21.09.): the canonical page store refuses a rank
             # without attention layers a window; the worker rides the null
             # storage backend instead (attach_storage_backend).
@@ -1751,6 +2127,22 @@ class HiCacheController:
             )
             canonical_qsa_page = self._canonical_qsa_window(attn_layer_ids)
 
+        owner_ctx = self._dcp_owner_ctx()
+        canonical_kv_owner_rows = (
+            None
+            if owner_ctx is None
+            else canonical_kv_owner_rows_for(owner_ctx, self.page_size, canonical_kv_page)
+        )
+        weg2_publish_rank_state(
+            self,
+            form_a_worker=this_rank_is_form_a_worker(),
+            canonical_on=canonical_on,
+            canonical_kv_built=canonical_kv_page is not None,
+            canonical_blob_built=canonical_mamba_blob is not None,
+            has_mamba_pool=rank_holds_gdn_state(self),
+            owner_ctx=owner_ctx,
+        )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -1764,6 +2156,7 @@ class HiCacheController:
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             model_identity_hash=model_identity_hash,
+            l3_rank_identity=_l3_rank_identity_or_none(server_args),
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
@@ -1776,7 +2169,21 @@ class HiCacheController:
             canonical_kv_page=canonical_kv_page,
             canonical_mamba_blob=canonical_mamba_blob,
             canonical_qsa_page=canonical_qsa_page,
+            canonical_kv_owner_rows=canonical_kv_owner_rows,
         )
+
+    def page_owner_mask_ctx(self) -> Optional[tuple]:
+        """The owner ctx a store backup masks WHOLE PAGES with, or None.
+
+        The page-1 owner form (task #60) writes a page only on its owner
+        rank. #239 S4b (F14): under the paged owner form every rank writes
+        every page -- its own token rows, cut by the owner-row window, and a
+        rank that owns none abstains in the backend -- so there is no page
+        mask, and no node has to be skipped for lack of device indices."""
+        ctx = self._dcp_owner_ctx()
+        if ctx is None or self.storage_config.canonical_kv_owner_rows is not None:
+            return None
+        return ctx
 
     def _canonical_qsa_window(self, attn_layer_ids):
         """This rank's layer window in the canonical QSA index page (23.09.,
@@ -2408,7 +2815,7 @@ class HiCacheController:
         if rows.numel() == 0:
             return False
         if (
-            _weg2_p_overlap.p_nosync_on()
+            _weg2_p_overlap.cache_path_nosync_on()  # #281: D too
             and rows.is_cuda
             and self._dcp_owner_ctx() is None
         ):
@@ -2530,7 +2937,7 @@ class HiCacheController:
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
                 if (
-                    _weg2_p_overlap.p_nosync_on()
+                    _weg2_p_overlap.cache_path_nosync_on()  # #281: D too
                     and device_indices.is_cuda
                     and not host_indices.is_cuda
                 ):
@@ -3331,7 +3738,26 @@ class HiCacheController:
         stems = weg2_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
         import numpy as _np
         _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
+        _rs = _read_stages(operation)
+        _rs["find"] = _rs.get("find", 0.0) + (time.perf_counter() - _t0) * 1000.0
+        _ta = time.perf_counter()
+        # #257 (a): pages the probe HOLDS are read from the held slot -- the
+        # probe's reference becomes the read's, no second reference is taken
+        _page0 = 0
+        _held = None
+        if getattr(operation, "probe_pins", None) is not None:
+            _page0 = int(operation.completed_tokens) // int(self.page_size)
+            _held = _probe_hold.adopt(operation, _page0, len(hash_values))
+        if _held is not None:
+            _fs = _np.asarray(_fs, dtype=_np.int64).copy()
+            _st = _np.asarray(_st).copy()
+            _hm = _held >= 0
+            _fs[_hm] = _held[_hm]
+            _st[_hm] = 2
+        else:
+            _hm = _np.zeros(int(_fs.shape[0]), dtype=bool)
         _t1 = time.perf_counter()
+        _rs["adopt"] = _rs.get("adopt", 0.0) + (_t1 - _ta) * 1000.0
         slots = []
         # #1439b: the leading run of COMPLETE slots is referenced in ONE C
         # call (xsn200: one ref per page in a Python loop was 7 %); only the
@@ -3339,26 +3765,65 @@ class HiCacheController:
         _bad = _np.flatnonzero((_fs < 0) | (_st != 2))
         lead = int(_bad[0]) if _bad.size else int(_fs.shape[0])
         if lead:
-            got = pool.arena.ref_slots_np(_fs[:lead], +1)
-            if got == lead:
+            _need = _fs[:lead][~_hm[:lead]]
+            got = pool.arena.ref_slots_np(_need, +1) if _need.size else 0
+            if got == int(_need.size):
                 slots = _fs[:lead].tolist()
             else:
-                pool.arena.ref_slots_np(_fs[:lead], -1)  # undo the partial refs, take the slow path
+                pool.arena.ref_slots_np(_need, -1)  # undo the partial refs, take the slow path
                 lead = 0
-        for i in range(lead, int(_fs.shape[0])):
-            slot, state = int(_fs[i]), int(_st[i])
-            if slot < 0 or state != 2:
-                # #1433: not in the L2 -- ask the L3. A page on disk is read
-                # straight into a fresh slot and completed; only then is the
-                # prefix really over.
-                _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
-                fill = _fill_fn(pool.arena, [stems[i]], int(pool._page_bytes))[0] if callable(_fill_fn) else None
-                if fill is None:
-                    break
-                slot = fill
-            if pool.arena.ref_slots([slot], +1) != 1:
-                break  # evicted between find and ref: the prefix ends here
-            slots.append(slot)
+        # L3-FAST (28.09.): every page past the complete lead that is not in
+        # the L2 is asked of the L3 in ONE fill (claims, parallel reads and
+        # completions batched in arena_fill_from_disk) instead of one fill per
+        # page -- the 27B boots read 1.4-3.2k tokens/s this way against 10-115k
+        # the disk gives. The prefix is walked exactly as before: it ends at
+        # the first page the L3 cannot give or the first reference that fails.
+        # EG review: (b) the L2 pages found past the lead are referenced
+        # BEFORE the fill -- its arena-full eviction could otherwise take a
+        # found, not yet referenced prefix page and end the prefix early;
+        # (a) nothing past the first gap is read -- the first failed
+        # reference ends the list here, the first page neither in L2 nor on
+        # disk ends it in the fill (prefix=True).
+        _n = int(_fs.shape[0])
+        _end = _n
+        _pre = {}
+        _need = []
+        for i in range(lead, _n):
+            if _hm[i]:
+                continue
+            s_ = int(_fs[i])
+            if s_ >= 0 and int(_st[i]) == 2:
+                if pool.arena.ref_slots([s_], +1) == 1:
+                    _pre[i] = s_
+                    continue
+                _end = i  # evicted between find and ref: the prefix ends here
+                break
+            _need.append(i)
+        _fills = {}
+        _tf = time.perf_counter()
+        if _need:
+            _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
+            if callable(_fill_fn):
+                _got = _fill_fn(pool.arena, [stems[i] for i in _need], int(pool._page_bytes), prefix=True)
+                _fills = dict(zip(_need, _got))
+        _tf1 = time.perf_counter()
+        _rs["l3fill"] = _rs.get("l3fill", 0.0) + (_tf1 - _tf) * 1000.0
+        _rs["l3fill_pages"] = _rs.get("l3fill_pages", 0) + len(_need)
+        for i in range(lead, _end):
+            if _hm[i]:
+                slots.append(int(_fs[i]))  # #257: held since the probe
+                continue
+            if i in _pre:
+                slots.append(_pre.pop(i))
+                continue
+            # #1433: not in the L2 -- the L3 fill above read it (or not)
+            fill = _fills.get(i)
+            if fill is None or pool.arena.ref_slots([fill], +1) != 1:
+                break  # not on disk / evicted between fill and ref: the prefix ends here
+            slots.append(fill)
+        if _pre:
+            # referenced ahead, past where the prefix ended: given back
+            pool.arena.ref_slots_np(_np.asarray(list(_pre.values()), dtype=_np.int64), -1)
         if not slots:
             # xsn314/322/326: the dormant hold's re-reads answered ZERO for
             # pages P had completed (PP2's ack flips COMPLETE within ~4 s),
@@ -3379,8 +3844,12 @@ class HiCacheController:
                             getattr(getattr(pool, "arena", None), "path", type(getattr(pool, "arena", None)).__name__))
             return 0
         _t2 = time.perf_counter()
+        _rs["ref"] = _rs.get("ref", 0.0) + ((_t2 - _t1) - (_tf1 - _tf)) * 1000.0
+        _probe_hold.consumed(operation, _page0, len(slots))
         pool.resolve_rows(host_indices, slots)
         _t3 = time.perf_counter()
+        _rs["resolve"] = _rs.get("resolve", 0.0) + (_t3 - _t2) * 1000.0
+        _rs["pages"] = _rs.get("pages", 0) + len(slots)
         # Task #3: ONE increment per batch. `increment` is a lock + an add;
         # 262k of them per re-admission (xsn246 ARENA-GET) is a Python
         # loop on the read path's critical section. A terminated
@@ -3463,9 +3932,14 @@ class HiCacheController:
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            _rs = _read_stages(operation)
+            _tk = time.perf_counter()
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            _rs["kv"] = _rs.get("kv", 0.0) + (time.perf_counter() - _tk) * 1000.0
             if _draft_fut is not None:
+                _tw = time.perf_counter()
                 flags = _draft_fut.result()
+                _rs["draft_wait"] = _rs.get("draft_wait", 0.0) + (time.perf_counter() - _tw) * 1000.0
                 if flags is not None and self._draft_read_broke_the_claim(
                     operation, i, flags
                 ):
@@ -3571,10 +4045,22 @@ class HiCacheController:
                 # the operation itself (stop already set), or the pointer was
                 # published before `_terminate_inflight_prefetch` read it.
                 self._prefetch_io_current = operation
+                _inflight = getattr(self, "_prefetch_io_inflight", None)
+                if _inflight is not None:
+                    _inflight[id(operation)] = operation
                 if self.storage_stop_event.is_set():
                     operation.mark_terminate()
                     self._prefetch_io_drained_after_stop += 1
+                _probe_hold.expire_if_stale(operation, getattr(self, "mem_pool_host", None))
+                # #257 (iii): the read's own clock (WEG2-LOAD-DEVICE splits
+                # queue / read / harvest wait with it)
+                operation.read_start_time = time.monotonic()
                 self._page_transfer(operation)
+                operation.read_end_time = time.monotonic()
+                _read_stages_line(operation, (operation.read_end_time - operation.read_start_time) * 1000.0)
+                _note_l3_read(self, operation)  # RANK-TIMING: rankstats cache.l3 / prefetch
+                # #257: what the read did not take, the probe gives back
+                _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-end")
                 # operation terminated by controller, release pre-allocated memory
                 # W35: this thread runs across cutovers, so the slots it
                 # releases may have been opened under an older binding.
@@ -3609,6 +4095,10 @@ class HiCacheController:
                     except Exception:  # noqa: BLE001
                         pass
                     try:
+                        _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="read-failed")
+                    except Exception:  # noqa: BLE001 - a release may not re-kill
+                        logger.error("#257 PROBE-HOLD release of a failed operation raised", exc_info=True)
+                    try:
                         self.append_host_mem_release(
                             operation.host_indices[operation.completed_tokens :],
                             generation=getattr(operation, "binding_generation", None),
@@ -3622,7 +4112,14 @@ class HiCacheController:
                         )
                 continue
             finally:
-                self._prefetch_io_current = None
+                _inflight = getattr(self, "_prefetch_io_inflight", None)
+                if _inflight is None:
+                    self._prefetch_io_current = None
+                else:
+                    if operation is not None:
+                        _inflight.pop(id(operation), None)
+                    # WAKE-PARALLEL: the pointer names an operation still held, if any
+                    self._prefetch_io_current = next(iter(list(_inflight.values())), None)
 
     @property
     def prefetch_capacity_fraction(self) -> float:
@@ -3762,6 +4259,10 @@ class HiCacheController:
         pools = getattr(self.storage_backend, "registered_pools", None)
         if not pools or PoolName.MAMBA not in pools:
             return None
+        if claim_vote_min_only(self):
+            # #239 Blocker 5: a KV-row worker holds no recurrent state -- the
+            # anchor is the host's; its presence is its KV rows alone.
+            return None
         return [
             PoolTransfer(
                 name=PoolName.MAMBA,
@@ -3771,7 +4272,9 @@ class HiCacheController:
         ]
 
     @_pass_timed("_1474_probe_ms")  # #1474
-    def store_presence_pages(self, token_ids, last_hash, prefix_keys=None) -> int:
+    def store_presence_pages(
+        self, token_ids, last_hash, prefix_keys=None, page_keys=None, extra_key=None
+    ) -> int:
         """#950: how many pages the STORE holds for this span, by CONTENT KEY.
 
         THE PRECONDITION REPLACEMENT. `Scheduler._prefetch_kvcache` gated the
@@ -3821,15 +4324,39 @@ class HiCacheController:
         holding the pages, which declines the fetch rather than issuing one that
         cannot land -- and the decline is NAMED, so "we could not ask" never
         reads as "it is not there".
+
+        H108 (rc12z25 D 16:56:02, weg2-72-124 W16 4317 > 4096): ``page_keys``
+        is P's hand-off chain for this span (#1442, ``keys_for_span``), spliced
+        exactly as ``_storage_hit_query`` splices it -- P's keys for the pages
+        it covers, own hashes after. Without it the probe hashed its own chain
+        from ``last_hash``, and on a D-own node (never written through, so the
+        caller came here at all) that hash is the tree's bigram convention: the
+        chain met none of P's keys, the probe answered 0 with every page and
+        the end anchor in the store, TP0 entered the #580 vote with nothing
+        and the group recomputed the whole P leg tail on D.
         """
         if not token_ids:
             return 0
         try:
+            # Q-460 SALT-ISOLATION: the request's namespace seeds a chain
+            # from the root -- the key the fetch (a RadixKey carrying
+            # extra_key) and P's write-through (the node's key) use. A
+            # plain id list lost it: the probe answered for the unsalted
+            # chain, i.e. for another tenant's pages.
+            if extra_key is None:
+                extra_key = getattr(token_ids, "extra_key", None)
+            if not last_hash and extra_key is not None:
+                from sglang.srt.mem_cache.utils import namespace_root_hash
+
+                last_hash = namespace_root_hash(extra_key)
             page_hashes = self.get_hash_str(
                 list(token_ids), last_hash, page_size=self.page_size
             )
             if not page_hashes:
                 return 0
+            _k = min(len(page_keys), len(page_hashes)) if page_keys else 0
+            if _k > 0:
+                page_hashes = [str(k) for k in page_keys[:_k]] + list(page_hashes[_k:])
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=list(prefix_keys) if prefix_keys else None
             )
@@ -3953,15 +4480,41 @@ class HiCacheController:
                 logger.error("could not signal the parent: %s: %s", type(e).__name__, e)
         os.kill(os.getpid(), signal.SIGQUIT)
 
+    def storage_loads_pending(self) -> int:
+        """Store->host loads queued (prefetch queue, the aux thread's buffer)
+        or in flight on the aux thread -- the L3 write-behind's yield signal."""
+        n = int(getattr(getattr(self, "prefetch_queue", None), "qsize", lambda: 0)())
+        n += int(getattr(getattr(self, "prefetch_buffer", None), "qsize", lambda: 0)())
+        _inflight = getattr(self, "_prefetch_io_inflight", None)
+        if _inflight:
+            n += len(_inflight)
+        elif getattr(self, "_prefetch_io_current", None) is not None:
+            n += 1
+        return n
+
+    def _start_prefetch_io_workers(self) -> list:
+        """WAKE-PARALLEL: n aux threads take the operations off
+        ``prefetch_buffer``; the first keeps its old name for the join."""
+        self.prefetch_io_aux_threads = [
+            threading.Thread(target=self.prefetch_io_aux_func, daemon=True,
+                             name=f"hicache-prefetch-io-{k}")
+            for k in range(prefetch_io_workers())
+        ]
+        self.prefetch_io_aux_thread = self.prefetch_io_aux_threads[0]
+        for _t in self.prefetch_io_aux_threads:
+            _t.start()
+        if len(self.prefetch_io_aux_threads) > 1:
+            logger.info("WAKE-PARALLEL prefetch io workers=%d (%s; 1 = one aux thread as before)",
+                        len(self.prefetch_io_aux_threads), PREFETCH_IO_WORKERS_ENV)
+        return self.prefetch_io_aux_threads
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
         """
         self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_io_aux_thread.start()
+        # class-bound: the loop is driven with bare stand-ins in its tests
+        HiCacheController._start_prefetch_io_workers(self)
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
@@ -3982,6 +4535,8 @@ class HiCacheController:
                     operation.mark_terminate()
                     self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+                # #257 (a): hold what the probe reports until the read
+                probe_hold_pin(self, operation, hash_value, storage_hit_count)
                 # fnFL2x22: the FORM is agreed over the group first (one
                 # scalar MAX), never read off this rank alone -- see
                 # CLAIM_VOTE_ABSTAIN for the boot that measured the mismatch.
@@ -3991,13 +4546,20 @@ class HiCacheController:
                     # the group's is a named STOP, not a silent MIN (Q11).
                     # A rank holding no bytes (Form A worker) abstains: it
                     # adopts the voters' MIN below instead of setting the MAX.
+                    # #239 S3h: a KV worker under the token cut votes in the
+                    # min arm only (claim_vote_min_only).
                     packed = torch.tensor(
-                        encode_claim_vote(storage_hit_count, claim_vote_abstains(self)),
+                        encode_claim_vote(storage_hit_count, claim_vote_abstains(self),
+                                          min_only=claim_vote_min_only(self)),
                         dtype=torch.int,
                     )
                     self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
                     _mn, _mx = decode_claim_vote(packed)
-                    if _mn != _mx and operation.request_id in getattr(self, "weg2_hold_rids", ()):
+                    from sglang.srt.rank_role import form_a_token_cut_active as _cut_active
+
+                    if _mn != _mx and _cut_active():
+                        settle_claim_split(_mn, _mx, operation.request_id, cut_active=True)
+                    elif _mn != _mx and operation.request_id in getattr(self, "weg2_hold_rids", ()):
                         # #1461 (boot weg2xsn216): a probe issued for a request in
                         # the DORMANT HOLD reads a store that P is still writing --
                         # the ranks' probes land ms apart and differ (TP2 94207 vs
@@ -4025,9 +4587,12 @@ class HiCacheController:
                 # the probe.
                 operation.probed_hit_tokens = int(storage_hit_count)
 
-                if storage_hit_count < self.prefetch_threshold:
+                if storage_hit_count < revoke_threshold(self, operation):
                     # not to prefetch if not enough benefits
+                    # (PARK-RETAIN READ: a read the caller priced below the
+                    # threshold keeps its own floor, managers/weg2_min_hit.py)
                     self.draft_cold_spans.pop(operation.request_id, None)
+                    _probe_hold.release(operation, getattr(self, "mem_pool_host", None), 0, reason="revoke")
                     self.prefetch_revoke_queue.put(operation.request_id)
                     # #1068 (A12.5 addition, decided in the slice 4 fix): the
                     # LOST-REVOKE-AT-QUIESCE candidate is MOOT on every
@@ -4075,6 +4640,9 @@ class HiCacheController:
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
+                    # #257: the group read ends at the MIN -- holds above it go back now
+                    _probe_hold.release(operation, getattr(self, "mem_pool_host", None),
+                                        storage_hit_count // self.page_size, reason="group-min")
                     # free the pre-allocated memory for pages that are not hit
                     self.append_host_mem_release(
                         operation.host_indices[storage_hit_count:]
@@ -4360,13 +4928,24 @@ class HiCacheController:
             found = dpool.arena.find_slots(stems)
             rows = (_hi_pages.cpu() - int(dpool.staging_rows)).tolist()
             flags, slots, hits = [], [], 0
-            for i, (slot, state) in enumerate(found):
-                if slot < 0 or state != 2:  # #1433: L3 -> L2 for the draft page too
-                    _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
-                    fill = _fill_fn(dpool.arena, [stems[i]], int(dpool._page_bytes))[0] if callable(_fill_fn) else None
-                    if fill is not None:
-                        slot, state = fill, 2
-                ok = slot >= 0 and state == 2 and dpool.arena.ref_slots([slot], +1) == 1
+            # L3-FAST: the draft pages missing in the L2 in ONE fill (batched, parallel reads)
+            # EG review (b): the found draft pages are referenced BEFORE the
+            # fill, so its arena-full eviction cannot take them
+            _dref = {i: s_ for i, (s_, st_) in enumerate(found)
+                     if s_ >= 0 and st_ == 2 and dpool.arena.ref_slots([s_], +1) == 1}
+            _dneed = [i for i in range(len(found)) if i not in _dref]
+            _dfill = {}
+            _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
+            if _dneed and callable(_fill_fn):
+                _dfill = dict(zip(_dneed, _fill_fn(dpool.arena, [stems[i] for i in _dneed],
+                                                   int(dpool._page_bytes))))
+            for i in range(len(found)):
+                if i in _dref:
+                    slot, ok = _dref[i], True
+                else:  # #1433: L3 -> L2 for the draft page too
+                    slot = _dfill.get(i)
+                    ok = slot is not None and dpool.arena.ref_slots([slot], +1) == 1
+                    slot = slot if slot is not None else -1
                 slots.append(slot if ok else -1)
                 flags.append(bool(ok))
                 hits += int(ok)

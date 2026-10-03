@@ -56,10 +56,13 @@ per layer and tail) and the graph pool (shared by every bs) stay at the cap.
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 PARK_ENV = "SGLANG_WEG2_D_PARK"
 #: mirrors ``corridor_guard.GROUP_ENV`` / ``retract_retain.GROUP_ENV``.
@@ -137,7 +140,16 @@ def awake_requeue_s(env: Optional[Mapping[str, str]] = None) -> float:
 
 
 def _arrival(req) -> float:
-    """FCFS position; a request that never passed the queue sorts last."""
+    """FCFS position; a request that never passed the queue sorts last.
+    SA (#244, weg2/seat_age.py): with SGLANG_WEG2_SEAT_ROTATE on, the FRONT
+    arrival (the rid's counter) -- the one order over running, parked and
+    waiting requests the user's design names; replicated (the rid)."""
+    from sglang.srt.weg2 import seat_age as _sa
+
+    if _sa.enabled():
+        age = _sa.rid_age(getattr(req, "rid", ""))
+        if age != _sa.UNKNOWN_AGE:
+            return float(age)
     seq = getattr(req, "kv_arrival_seq", None)
     return float("inf") if seq is None else float(seq)
 
@@ -180,7 +192,24 @@ def retraction_order(reqs: Sequence, *, spec_active: bool) -> Optional[List[int]
     n = len(reqs)
     if n == 0:
         return []
-    by_protection = sorted(range(n), key=lambda i: session_priority_key(reqs[i]), reverse=True)
+    from sglang.srt.weg2 import seat_age as _sa
+
+    if _sa.enabled():
+        # SA (4): the park victim is the YOUNGEST -- kvso's protection key
+        # with its AGE term read from the one SA age (``_arrival``: the front
+        # arrival, D's ``kv_arrival_seq`` only where the rid carries no
+        # counter). The spill class and the fast lane keep their rank above
+        # age: a 'never' session / a fast-lane request is not made a park
+        # victim by SA, a 'preferred' one still parks first. No second age.
+        from sglang.srt.managers.kv_session_offload import spill_class_rank
+
+        def _sa_key(r):
+            return (spill_class_rank(r), 1 if getattr(r, "is_fast_lane", False) else 0,
+                    -_arrival(r))
+
+        by_protection = sorted(range(n), key=lambda i: _sa_key(reqs[i]), reverse=True)
+    else:
+        by_protection = sorted(range(n), key=lambda i: session_priority_key(reqs[i]), reverse=True)
     if not spec_active:
         return by_protection
     youngest = by_protection[-1]
@@ -221,15 +250,61 @@ class AdmissionGate:
     """
 
     barrier: bool = False
+    #: SA: the front-arrival age of the oldest parked request still waiting
+    oldest_parked_age: Optional[float] = None
     blocked: FrozenSet[str] = frozenset()
     note: str = ""
+    #: AP (28.09.): the parked rids IN the queue that may resume this pass --
+    #: the queue serves them first (``order_waiting``); once every one of them
+    #: is admitted THIS pass, a newcomer behind them takes no parked seat.
+    parked_in_queue: FrozenSet[str] = frozenset()
+    #: parked requests OUTSIDE the queue (post-wake settle, deferred): their
+    #: seats stay held for the whole pass, as before
+    parked_outside: int = 0
+    #: F3 (29.09.): flip-parked rids whose tail extend waits this pass behind
+    #: the wake's first decode round (:class:`DecodeFirst`)
+    deferred: FrozenSet[str] = frozenset()
+    #: F3: the wake whose members pass the barrier while ``deferred`` holds
+    #: (their seats are the wake's ``handoff_n``, counted at the wake)
+    cohort_wake: Optional[int] = None
 
-    def skip(self, req) -> Optional[str]:
-        """Census key when ``req`` is skipped this pass, else None."""
+    def skip(self, req, admitted=None, skip_extend: bool = False) -> Optional[str]:
+        """Census key when ``req`` is skipped this pass, else None.
+        ``admitted``: the rids already in this pass's batch (None = the old
+        static barrier). ``skip_extend``: ``req`` takes P's END state this
+        pass (weg2/skip_first.py) -- it runs no forward and its seat is the
+        wake's own (``note_wake_seats`` counts hand-offs and parked alike), so
+        the barrier that keeps parked seats from newcomers does not hold it."""
         site = park_site(req)
         if site is not None:
-            return "weg2_d_park_older_live" if str(req.rid) in self.blocked else None
-        return "weg2_d_park_first" if self.barrier else None
+            if str(req.rid) in self.blocked:
+                return "weg2_d_park_older_live"
+            return "weg2_d_park_decode_first" if str(req.rid) in self.deferred else None
+        if not self.barrier or skip_extend:
+            return None
+        if self.deferred and self.cohort_wake is not None and in_wake_cohort(req, self.cohort_wake):
+            # F3: a member of THIS wake goes ahead of the deferred resume; the
+            # resume keeps its seat (the wake counted handoff_n + parked_n)
+            return None
+        # AP (NF rc12z29b 20:18:16, wake 3): 2 flip-parked resumes were
+        # admitted, and the 3 hold arrivals of the SAME wake waited a whole
+        # extra 1.8-s extend pass as "newcomers" although their seats were
+        # free -- the barrier stood on parked requests that were already in
+        # the batch. The barrier keeps a seat for a parked request that is
+        # still WAITING; one that is admitted in this pass waits for nothing.
+        if (admitted is not None and ap_enabled() and not self.blocked
+                and not self.parked_outside and self.parked_in_queue
+                and self.parked_in_queue <= set(admitted)):
+            return None
+        # SA (#244): the barrier holds back only newcomers YOUNGER than the
+        # oldest parked request still waiting -- an older one (a waiter a
+        # displacement made room for, a deferred parked one) goes first.
+        from sglang.srt.weg2 import seat_age as _sa
+
+        if _sa.enabled() and self.oldest_parked_age is not None:
+            if _arrival(req) < self.oldest_parked_age:
+                return None
+        return "weg2_d_park_first"
 
 
 @dataclass
@@ -241,19 +316,38 @@ class ResumeBook:
     margin_tokens: int = -1
     steps: int = RESUME_STEPS_DEFAULT
     _hyst: Dict[str, object] = field(default_factory=dict)
+    #: who armed the margin: "env" (RESUME_MARGIN_ENV) or "arrival-seat"
+    source: str = "env"
+    _told: set = field(default_factory=set)
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "ResumeBook":
+        """ARRIVAL-SEAT (user rule 29.09. ~19:40Z, y3j needle weg2-40-151):
+        with the rule on and no explicit margin, the margin is 0 -- a
+        pressure-parked request resumes as soon as it FITS (avail - need >= 0
+        for ``steps`` passes), the same seat+KV verdict the rule gives an
+        arrival. "Resume when no older request is live" alone parked the
+        needle behind an 11-minute agent turn while its 64k fit beside it.
+        The older-first order stays for the case the KV does not pay."""
         env = os.environ if env is None else env
-        try:
-            margin = int(str(env.get(RESUME_MARGIN_ENV, "-1")).strip())
-        except ValueError:
-            margin = -1
+        source = "env"
+        raw = env.get(RESUME_MARGIN_ENV)
+        if raw is None or not str(raw).strip():
+            from sglang.srt.weg2 import arrival_seat_rule as _asr
+
+            margin = 0 if _asr.enabled(env) else -1
+            if margin == 0:
+                source = "arrival-seat"
+        else:
+            try:
+                margin = int(str(raw).strip())
+            except ValueError:
+                margin = -1
         try:
             steps = int(str(env.get(RESUME_STEPS_ENV, RESUME_STEPS_DEFAULT)).strip())
         except ValueError:
             steps = RESUME_STEPS_DEFAULT
-        return cls(margin_tokens=margin, steps=max(1, steps))
+        return cls(margin_tokens=margin, steps=max(1, steps), source=source)
 
     def early_ok(self, rid: str, *, avail_tokens: int, need_tokens: int) -> bool:
         if self.margin_tokens < 0:
@@ -265,10 +359,102 @@ class ResumeBook:
             h = self._hyst[rid] = RestoreHysteresis(self.steps)
         return bool(h.update(int(avail_tokens) - int(need_tokens) >= self.margin_tokens))
 
+    def note_resume(self, rid: str, *, avail_tokens: int, need_tokens: int) -> None:
+        """The marker of an early resume the arrival rule armed, once per rid."""
+        if self.source != "arrival-seat" or rid in self._told:
+            return
+        self._told.add(rid)
+        logger.info(
+            "WEG2 ARRIVAL-SEAT PRESSURE-RESUME rid=%s avail=%d need=%d steps=%d -- an older "
+            "request is live but this one fits now: it resumes beside it (no wait behind "
+            "the older one while its KV pays)", rid, int(avail_tokens), int(need_tokens),
+            int(self.steps))
+
     def forget(self, live_rids: Iterable[str]) -> None:
         keep = set(live_rids)
         for rid in [r for r in self._hyst if r not in keep]:
             del self._hyst[rid]
+        self._told &= keep
+
+
+#: WT: set on every request the wake released (at the wake or from the #1471
+#: settle) to that wake's number -- replicated, the release is a group MIN.
+COHORT_ATTR = "_weg2_settled_wake"
+DECODE_FIRST_ENV = "SGLANG_WEG2_ENABLE_D_DECODE_FIRST"
+DECODE_FIRST_TAIL_ENV = "SGLANG_WEG2_D_DECODE_FIRST_TAIL"
+DECODE_FIRST_ROUNDS_ENV = "SGLANG_WEG2_D_DECODE_FIRST_ROUNDS"
+
+
+def in_wake_cohort(req, wake_seq) -> bool:
+    return wake_seq is not None and getattr(req, COHORT_ATTR, None) == wake_seq
+
+
+def _env_int(env: Optional[Mapping[str, str]], name: str, default: int) -> int:
+    if env is None:
+        from sglang.srt.environ import envs
+
+        return int(getattr(envs, name).get())
+    try:
+        return int(str(env.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def decode_first_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """F3, default off (``SGLANG_WEG2_ENABLE_D_DECODE_FIRST``)."""
+    if env is None:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_ENABLE_D_DECODE_FIRST.get())
+    return str(env.get(DECODE_FIRST_ENV, "0")).strip().lower() not in _OFF + ("",)
+
+
+@dataclass(frozen=True)
+class DecodeFirst:
+    """F3 (29.09., FLIPZEIT-VERLAUF-0929.md): one pass's post-wake facts.
+
+    Flip time is P end -> the first DECODE token. Under agent load D's wake
+    releases the flip-parked requests first (``order_waiting``) and the
+    barrier holds every hand-off of the same wake behind them; a parked
+    request's resume extends its tail above the last Mamba anchor -- on NF-D a
+    ~2 s eager expert pass for 33-128 tokens, 5.4 s for 1-4k -- and the first
+    decode of every held request waited for all of it (rc12z4 ep9: resume
+    2500 ms, SETTLE-RELEASE held_after_wake_s=3.0, first decode 8.3 s after
+    the flip began). F3 lets the wake's members extend and decode FIRST: a
+    flip-parked resume whose tail exceeds ``tail_over`` waits (keeping its
+    seat) while members of this wake still wait for their extend or their
+    first decode round, at most ``max_rounds`` decode rounds after the wake.
+    A tail <= ``tail_over`` (1-8 tokens, ~12 ms, the #259 4c form) is not
+    deferred -- it rides the first pass.
+
+    Every field is replicated: the wake number, the decode rounds since the
+    wake (every rank runs the same batches), the running and settle lists
+    (group-MIN verdicts) and the tails (the park's resumable depth, #59b)."""
+
+    wake_seq: Optional[int]
+    rounds: int
+    running_n: int
+    settle_cohort_n: int
+    tails: Mapping[str, int]
+    tail_over: int = 8
+    max_rounds: int = 32
+
+    def defer(self, parked_waiting: Sequence, waiting: Sequence, blocked) -> FrozenSet[str]:
+        if self.wake_seq is None or self.rounds >= self.max_rounds:
+            return frozenset()
+        cand = [
+            r for r in parked_waiting
+            if park_site(r) == SITE_FLIP and str(r.rid) not in blocked
+            and int(self.tails.get(str(r.rid), self.tail_over + 1)) > self.tail_over
+        ]
+        if not cand:
+            return frozenset()
+        members = [r for r in waiting if park_site(r) is None and in_wake_cohort(r, self.wake_seq)]
+        if not members and self.running_n <= 0:
+            return frozenset()  # nothing would decode sooner: never idle for a resume
+        if self.rounds > 0 and not members and self.settle_cohort_n <= 0:
+            return frozenset()  # every member of the wake has decoded
+        return frozenset(str(r.rid) for r in cand)
 
 
 def admission_gate(
@@ -278,6 +464,7 @@ def admission_gate(
     pending_outside: Sequence = (),
     avail_tokens: Optional[int] = None,
     resume_book: Optional[ResumeBook] = None,
+    decode_first: Optional[DecodeFirst] = None,
 ) -> AdmissionGate:
     """The stage-1 rule, per pass.
 
@@ -308,15 +495,37 @@ def admission_gate(
                 getattr(r, "output_ids", None) or ()
             )
             if resume_book.early_ok(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need):
+                resume_book.note_resume(str(r.rid), avail_tokens=int(avail_tokens), need_tokens=need)
                 continue
         blocked.add(str(r.rid))
     if resume_book is not None:
         resume_book.forget(str(r.rid) for r in parked_waiting)
+    deferred = (
+        decode_first.defer(parked_waiting, waiting, blocked) if decode_first is not None else frozenset()
+    )
     note = (
         f"gate=weg2_d_park(parked_waiting={len(parked_waiting)} "
-        f"parked_outside={len(parked_outside)} blocked={len(blocked)})"
+        f"parked_outside={len(parked_outside)} blocked={len(blocked)}"
+        + (f" decode_first={len(deferred)}" if deferred else "") + ")"
     )
-    return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note)
+    _waiting_parked = [r for r in parked_waiting if str(r.rid) not in blocked] or parked_waiting
+    oldest = min((_arrival(r) for r in _waiting_parked + parked_outside), default=None)
+    return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
+                         oldest_parked_age=oldest,
+                         parked_in_queue=frozenset(str(r.rid) for r in parked_waiting),
+                         parked_outside=len(parked_outside),
+                         deferred=deferred,
+                         cohort_wake=decode_first.wake_seq if deferred else None)
+
+
+AP_ENV = "SGLANG_WEG2_D_PARK_BARRIER_ADMITTED"
+
+
+def ap_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """AP (28.09.), default ON: the park barrier lifts in the pass that
+    admitted every parked request of the queue; 0 = the static barrier."""
+    e = os.environ if env is None else env
+    return str(e.get(AP_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
 def awake_requeue_due(parked: Sequence, *, now: float, bound_s: float) -> bool:

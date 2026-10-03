@@ -199,6 +199,19 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         )
 
+        self._bind_data_refs()
+        self._init_write_back_staging_buffers()
+
+    def _bind_data_refs(self) -> None:
+        """Per-layer views of ``kv_buffer`` and their pointer vectors.
+
+        #760 (rc12z4-vis, D TP1/TP2 06:24:47): taken ONCE at construction,
+        these outlived the buffer they view when #249 re-shaped a byteless
+        pool (``_regrow_byteless_buffer``, 353600 -> 436032 rows at 06:24:34).
+        The #760 seam guard reads its host capacity from ``k_data_refs`` and
+        refused the legal backup of weg2-0-14 into grown row 365887 as
+        ``dst indices out of bounds ... capacity 353600``. Bound here, and
+        re-bound by every re-shape, so views and buffer never disagree."""
         if self.layout == "page_first":
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
@@ -219,7 +232,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
-        self._init_write_back_staging_buffers()
 
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
@@ -302,6 +314,28 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device_pool.device,
         )
         self.staging_v_buffer = torch.empty_like(self.staging_k_buffer)
+
+    def _regrow_byteless_buffer(self) -> None:
+        """#249: a byteless pool's id space moved (``HostKVCache._grow_byteless``
+        or the ``clear()`` back to the synced size). Its buffer holds 0 bytes;
+        it is re-shaped to the new id count so no index of the grown range is
+        ever out of bounds on a tensor op. Nothing is pinned or copied."""
+        if not getattr(self, "byteless", False) or self.kv_buffer is None:
+            return
+        if self.layout == "layer_first":
+            dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+        elif self.layout == "page_first":
+            dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+        elif self.layout == "page_first_direct":
+            dims = (2, self.page_num, self.layer_num, self.page_size, self.head_num, self.head_dim)
+        elif self.layout == "page_head":
+            dims = (2, self.page_num, self.head_num, self.page_size, self.layer_num, self.head_dim)
+        else:
+            return
+        self.kv_buffer = torch.empty(dims, dtype=self.dtype, device=self.kv_buffer.device)
+        # #760: the per-layer views were cut from the old buffer
+        if getattr(self, "k_data_refs", None) is not None:
+            self._bind_data_refs()
 
     @property
     def k_buffer(self):
@@ -837,7 +871,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             name="MiniMax index-K host pool",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
         logger.info(
             "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",
@@ -1423,11 +1457,14 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool, role: str = "kv") -> ty
     """
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
-    from sglang.srt.rank_role import this_rank_is_form_a_worker
+    from sglang.srt.rank_role import form_a_worker_holds_kv, this_rank_is_form_a_worker
 
     if (
         os.environ.get("SGLANG_HICACHE_ARENA_HOST", "0") == "1"
-        and not this_rank_is_form_a_worker()  # no attention, no arena (as the mamba chooser)
+        # no attention, no arena (as the mamba chooser) -- except a worker
+        # that OWNS token rows under the token cut (#239 S4b F14): its KV
+        # lives in the one L2 like the host's did
+        and (not this_rank_is_form_a_worker() or (role == "kv" and form_a_worker_holds_kv()))
         and (role == "kv" or int(device_pool.page_size) == 1)
     ):
         # #1424 Stufe 3: rows beyond the staging ring are arena slots

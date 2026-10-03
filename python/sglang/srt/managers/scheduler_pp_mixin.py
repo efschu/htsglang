@@ -25,6 +25,7 @@ from sglang.srt.distributed.pp_typed_channel import (
 )
 from sglang.srt.weg2 import p_layer_split as _pls_S  # --p-layer-split row key
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt
+from sglang.srt.weg2 import flush_verdict as _flush_verdict  # z30j PP0 flush verdict
 from sglang.srt.distributed.pp_object_recv import get_or_create_frame
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
 from sglang.srt.managers import anchor_tails as _anchor_tails
@@ -1317,7 +1318,9 @@ def _999_geom(scheduler, mb_id: int):
         er = getattr(r, "extend_range", None) if r is not None else None
         if er is None:
             return (-1, -1, -1)
-        return (str(r.rid)[:8], int(er.start), int(er.end))
+        # 27.09. (P group death 08:14:59Z): 12 characters -- with 8 ('weg2-50-')
+        # two different requests of one front epoch printed as the same rid.
+        return (str(r.rid)[:12], int(er.start), int(er.end))
     except Exception:  # noqa: BLE001
         return (-1, -1, -1)
 
@@ -4110,6 +4113,154 @@ def pp_pass_retraction_reason_of(holder, mb_id: int) -> Optional[str]:
 
 
 
+def weg2_791c_release_on_idle_vote(self, vote) -> None:
+    """#791C LIVENESS: a follower under the row authority keeps a chunked
+    request whose abort it received until PP0's forwarded schedule stops
+    naming it. If PP0 then launches no further pass (idle queue, the
+    quiesce before a flip), no frame ever comes -- and a frameless cycle
+    skips the plan (PLAN BYPASS), so ``process_pending_chunked_abort``
+    never runs: the request, its pool row and KV would stay, and
+    ``is_fully_idle`` (``chunked_req is None``) would keep this rank's vote
+    not-idle, so the front's quiesce ends in W3.
+
+    The group-uniform release is this vote: PP0 attached its own slot
+    before the vote left it, and an IDLE PP0 slot means PP0 applied its
+    abort and every pass it launched completed the ring -- every frame that
+    named the rid ran here. Applied only when this rank's own microbatches
+    are drained too (else the next lap; the front polls). No collective.
+    A MODULE function on purpose: the #1268 lap tests drive
+    ``_weg2_vote_attach_own_slot`` on stand-ins that are no Scheduler; every
+    read here is a ``getattr`` with a default, so a stand-in returns at once."""
+    req = getattr(self, "_pending_chunked_abort_req", None)
+    if req is None or int(getattr(self.ps, "pp_rank", 0) or 0) == 0:
+        return
+    try:
+        from sglang.srt.weg2 import p_row_authority as _prow
+        from sglang.srt.weg2.pp_abort import pp0_idle_in_vote
+
+        if not _prow.applies(self) or not pp0_idle_in_vote(getattr(vote, "slots", ())):
+            return
+        if not self._pp_microbatches_drained():
+            return
+    except Exception:  # noqa: BLE001 - the release never blocks the vote
+        return
+    self._791c_pp0_drained = True
+    try:
+        self.process_pending_chunked_abort()
+    finally:
+        self._791c_pp0_drained = False
+
+
+_LBV_N = [0]
+
+
+def weg2_loadback_drain_on_idle_vote(self) -> int:
+    """LOAD-BACK LIVENESS (27B rc12z28 boot ...09281851, 19:02:32-19:04:03, W3):
+    a follower's load-back ack is drained by ``loading_check`` inside
+    ``check_hicache_events`` -- which runs in ``_get_new_batch_prefill_raw``,
+    i.e. only on a PLANNED pass. Under the row authority a frameless cycle skips
+    the plan (PLAN BYPASS), so after PP0's last pass (weg2-24-49's #988 load-back,
+    issued on PP1/PP2 in that pass) no follower ever polled its finished ack:
+    ``ongoing_load_back`` kept 1 entry, ``idle_blockers`` said
+    ``hicache_load_back(1)`` on PP1 and PP2 in every lap, and the P->D quiesce
+    ended in W3 90 s later.
+
+    The poll is rank-local by construction (#737: ``_count_ready_acks`` drains
+    only this rank's own finished events, no collective), so the vote may run
+    it: a follower under the row authority whose microbatches are drained
+    drains its finished load-back acks right before it attaches its slot --
+    the slot then says what is true. Nothing is waited on (an unfinished event
+    stays and votes not-idle, as before). A MODULE function for the lap tests'
+    stand-ins, like :func:`weg2_791c_release_on_idle_vote`. Returns the drained
+    count."""
+    tc = getattr(self, "tree_cache", None)
+    pending = getattr(tc, "ongoing_load_back", None)
+    if not pending or int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0) == 0:
+        return 0
+    check = getattr(tc, "loading_check", None)
+    if not callable(check):
+        return 0
+    try:
+        from sglang.srt.weg2 import p_row_authority as _prow
+
+        if not _prow.applies(self) or not self._pp_microbatches_drained():
+            return 0
+        before = len(pending)
+        check()
+        drained = before - len(getattr(tc, "ongoing_load_back", None) or ())
+    except Exception:  # noqa: BLE001 - the drain never blocks the vote
+        logger.warning("WEG2-LOADBACK-DRAIN-ON-VOTE raised; the slot votes on the undrained state",
+                       exc_info=True)
+        return 0
+    if drained > 0:
+        _LBV_N[0] += 1
+        if _LBV_N[0] <= 16 or _LBV_N[0] % 256 == 0:
+            logger.info("WEG2-LOADBACK-DRAIN-ON-VOTE pp_rank=%d drained=%d left=%d (n=%d): the "
+                        "follower's finished load-back acks, polled at the #1268 vote -- a "
+                        "frameless cycle skips the plan that polls them", int(self.ps.pp_rank),
+                        drained, len(getattr(tc, "ongoing_load_back", None) or ()), _LBV_N[0])
+    return drained
+
+
+_WTV_N = [0]
+
+
+def weg2_writethrough_drain_on_idle_vote(self) -> int:
+    """WRITE-THROUGH LIVENESS (27B rc12z30x2 boot dkr27browauthoritybar1fs09290956,
+    424346f693, 09:59:40-10:01:10, W3): the write-through twin of
+    :func:`weg2_loadback_drain_on_idle_vote`.
+
+    A follower's write-through ack is drained by ``writing_check`` inside
+    ``check_hicache_events`` -- only on a PLANNED pass -- or by the blocking
+    ``#1465 WRITE-BACK DRAIN`` of the ``#1470 FLUSH-PUBLISH`` block at the top
+    of ``flush_cache``. Until 6218d74b35 every follower ran ``flush_cache`` on
+    every forwarded /flush_cache poll, and that drain joined its in-flight
+    write-throughs as a side effect (bb82fbcb68 boot ...09290020: #1465 on
+    PP1 80x, PP2 80x, not one ``hicache_write_through`` blocker). Since
+    6218d74b35 a follower PARKS the stamped flush and runs it only on PP0's
+    ``passed`` verdict. PP1's RETAIN-PUBLISH of weg2-0-2 (``issued=1
+    in_flight_after=1``, the last pass before the P->D quiesce) was then
+    polled by nobody: frameless cycles skip the plan, the flush never ran,
+    every #1268 lap voted ``hicache_write_through(1)`` on PP1 (14746 lines),
+    PP0 refused every flush on that lap, and the follower waited for a
+    ``passed`` that its own vote prevented -- a circular wait that ended in
+    ``WEG2 STOP W3 Weg2DrainWitnessDisagreement`` 90 s later.
+
+    The poll is rank-local where the tree is the #737 form
+    (``_count_ready_acks``: this rank's own finished events, no collective);
+    the legacy HiRadixCache ``writing_check`` carries a MIN all_reduce and is
+    never triggered from here. Nothing is waited on: an unfinished write
+    stays and votes not-idle, as before. Returns the drained count."""
+    tc = getattr(self, "tree_cache", None)
+    pending = getattr(tc, "ongoing_write_through", None)
+    if not pending or int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0) == 0:
+        return 0
+    check = getattr(tc, "writing_check", None)
+    if not callable(check) or not callable(getattr(tc, "_count_ready_acks", None)):
+        return 0
+    try:
+        from sglang.srt.weg2 import p_row_authority as _prow
+
+        if not _prow.applies(self) or not self._pp_microbatches_drained():
+            return 0
+        before = len(pending)
+        check()
+        drained = before - len(getattr(tc, "ongoing_write_through", None) or ())
+    except Exception:  # noqa: BLE001 - the drain never blocks the vote
+        logger.warning("WEG2-WRITETHROUGH-DRAIN-ON-VOTE raised; the slot votes on the undrained state",
+                       exc_info=True)
+        return 0
+    if drained > 0:
+        _WTV_N[0] += 1
+        if _WTV_N[0] <= 16 or _WTV_N[0] % 256 == 0:
+            logger.info("WEG2-WRITETHROUGH-DRAIN-ON-VOTE pp_rank=%d drained=%d left=%d (n=%d): the "
+                        "follower's finished write-through acks, polled at the #1268 vote -- a "
+                        "frameless cycle skips the plan and a parked flush (z30j verdict) skips "
+                        "the #1465 drain that polled them", int(self.ps.pp_rank),
+                        drained, len(getattr(tc, "ongoing_write_through", None) or ()), _WTV_N[0])
+    return drained
+
+
 class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -4821,6 +4972,7 @@ class SchedulerPPMixin:
                     pp_bulletin.clear_after_plan(self)
                 elif _pre_proxy is not None:
                     _dn2 = getattr(self, "_pp_row_deliver_trace_n", 0)
+                    _prow_t0 = time.perf_counter()  # Fix B P-ROW-COST
                     if _dn2 <= 50:
                         try:
                             with torch.profiler.record_function(
@@ -4854,6 +5006,10 @@ class SchedulerPPMixin:
                         finally:
                             if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
                                 pp_bulletin.clear_after_plan(self)
+                    if getattr(self, "_weg2_p_row_only", False):
+                        from sglang.srt.weg2 import p_row_authority as _prow
+
+                        _prow.note_plan(self, (time.perf_counter() - _prow_t0) * 1000.0)
                 else:
                     try:
                         with torch.profiler.record_function("get_next_batch_to_run"):
@@ -5584,6 +5740,12 @@ class SchedulerPPMixin:
                         self.launch_event
                     )
 
+                # hc_combine holder (NF rc12z14 10:02:57Z): the stage output of this pass
+                # (``result.pp_hidden_states_proxy_tensors``) has had its last read -- the
+                # proxy send above; the transport keeps what it still sends (P2PWork.payload,
+                # the torch Work). Without this line the frame kept it until the NEXT forward,
+                # i.e. across a whole sleep served at the top of the next pass.
+                result = None
                 self.pp_outputs = next_pp_outputs
 
                 # #788: flush THIS pass's request-chain send only after
@@ -5845,6 +6007,12 @@ class SchedulerPPMixin:
                             stamp=self._pp_proxy_stamp(mb_id, None),
                         )
 
+                # hc_combine holder (NF rc12z14 10:02:57Z): the stage output of this pass
+                # (``result.pp_hidden_states_proxy_tensors``) has had its last read -- the
+                # proxy send above; the transport keeps what it still sends (P2PWork.payload,
+                # the torch Work). Without this line the frame kept it until the NEXT forward,
+                # i.e. across a whole sleep served at the top of the next pass.
+                result = None
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
@@ -6059,6 +6227,12 @@ class SchedulerPPMixin:
                             stamp=self._pp_proxy_stamp(mb_id, None),
                         )
 
+                # hc_combine holder (NF rc12z14 10:02:57Z): the stage output of this pass
+                # (``result.pp_hidden_states_proxy_tensors``) has had its last read -- the
+                # proxy send above; the transport keeps what it still sends (P2PWork.payload,
+                # the torch Work). Without this line the frame kept it until the NEXT forward,
+                # i.e. across a whole sleep served at the top of the next pass.
+                result = None
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
@@ -6229,6 +6403,11 @@ class SchedulerPPMixin:
             _wire_reqs = recv_reqs
             if weg2_store_told.armed(self) and weg2_store_told.is_pp0(self):
                 _wire_reqs = weg2_store_told.pp0_publish(self, recv_reqs)
+                # RO: the rids P can only skip (held/paced) for the front's
+                # dispatch cap -- bookkeeping, nothing on the wire changes.
+                from sglang.srt.weg2 import p_read_overlap as _ro
+
+                _ro.export(self)
             # fnFL2 H42c: PP0's pass clock rides list m, and PP0 decides pass
             # m's burst hold on the SAME value its followers will read
             # (anchor_tails H42c note; x161's rank-local clocks split slots).
@@ -6239,6 +6418,10 @@ class SchedulerPPMixin:
                 _wire_reqs = _anchor_tails.stamp_burst_clock(
                     _wire_reqs, self._weg2_burst_clock
                 )
+            # z30j: PP0 stamps the flushes it forwards and puts the verdicts it
+            # decided last pass at the front of the wire (weg2/flush_verdict.py).
+            if self.pp_group.is_first_rank:
+                _wire_reqs = _flush_verdict.pp0_wire(self, _wire_reqs)
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
@@ -6265,6 +6448,12 @@ class SchedulerPPMixin:
         # leaves `recv_reqs` before dispatch on EVERY rank -- it is a lap, not
         # a request, and `process_input_requests` has no handler for it.
         recv_reqs = self._weg2_vote_after_forward(recv_reqs)
+        # z30j: a follower applies PP0's flush verdicts (already forwarded
+        # onward above) to the flushes it parked, before this pass's dispatch.
+        if not self.pp_group.is_first_rank:
+            recv_reqs = _flush_verdict.follower_absorb(
+                self, recv_reqs, self.flush_wrapper.apply_pp0_verdict
+            )
         # fnFL2 H42c: a follower takes PP0's pass clock off the list after
         # relaying it; pass-scoped (None when absent, and the burst verdict
         # then stops by name rather than read this rank's own clock).
@@ -6373,8 +6562,12 @@ class SchedulerPPMixin:
                     exc,
                 )
         rank = int(self.ps.pp_rank)
+        weg2_791c_release_on_idle_vote(self, vote)
+        weg2_loadback_drain_on_idle_vote(self)
+        weg2_writethrough_drain_on_idle_vote(self)
         if attach_slot(vote, rank, self.is_fully_idle(), ", ".join(self.idle_blockers()) or "none"):
             log_verdict(vote, rank)
+
 
     def _weg2_vote_maybe_stamp(self: Scheduler, recv_reqs: List) -> None:
         """PP0 only: mint a numbered vote when one is wanted and none is out.
@@ -9330,6 +9523,50 @@ class SchedulerPPMixin:
                     ]
                 except Exception:  # noqa: BLE001 - peek is advisory only
                     _missing = []
+                # #791T -- THE FRAME MUST NOT OVERTAKE ITS STORE-TOLD EITHER
+                # (rc12z20 27B proof boot 13:03:27, PP2 weg2-0-8): the request
+                # hop (r24) had landed, so the rid was LOCATABLE and the check
+                # above let the frame through -- but PP0's Weg2StoreTold (r25)
+                # rides the same request chain one hop later and was still in
+                # flight. The plan then skipped the rid (weg2_store_told_pending)
+                # and the forwarded schedule died as #791 UNEXECUTABLE. A queued
+                # rid that the told gate would skip right now is the same "hop in
+                # flight" as an unlocatable one: same defer, same chain hedge,
+                # same RowDeferCap bound and named stop. Never a drop, never a
+                # plan without the told.
+                _told_missing = []
+                if _row_raw is not None:
+                    try:
+                        from sglang.srt.weg2 import p_intake as _p_intake_791t
+
+                        _queued = {
+                            getattr(r, "rid", None): r for r in self.waiting_queue
+                        }
+                        _told_missing = [
+                            e.rid
+                            for e in _peek.entries
+                            if e.admitted
+                            and not e.retracted
+                            and e.rid not in _missing
+                            and e.rid in _queued
+                            and _p_intake_791t.told_pending(self, _queued[e.rid])
+                        ]
+                    except Exception:  # noqa: BLE001 - peek is advisory only
+                        _told_missing = []
+                if _told_missing:
+                    stats["defer_told"] = stats.get("defer_told", 0) + 1
+                    if stats["defer_told"] <= 8 or stats["defer_told"] % 1024 == 0:
+                        logger.info(
+                            "#791T ROW-PROBE DEFER slot=%s: frame's row admits %d "
+                            "rid(s) whose Weg2StoreTold has not reached this rank "
+                            "(first=%s) -- the told hop is still in flight; frame "
+                            "left in the inbox (defer_told=%d).",
+                            mb_id,
+                            len(_told_missing),
+                            str(_told_missing[0])[:8],
+                            stats["defer_told"],
+                        )
+                    _missing = list(_missing) + list(_told_missing)
                 if _missing:
                     stats["defer_rid"] = stats.get("defer_rid", 0) + 1
                     _dr = stats["defer_rid"]
@@ -9354,6 +9591,15 @@ class SchedulerPPMixin:
                         _cap = RowDeferCap()
                         self._pp_row_defer_cap = _cap
                     _verdict = _cap.observe(mb_id, _missing, token=stamp)
+                    if not _verdict.defer and _told_missing:
+                        _trace("defer_told_cap")
+                        raise PpRowDeferCapExceeded(
+                            "#791T STORE-TOLD HOP OVERDUE: the frame's row admits "
+                            f"rid(s) {','.join(str(r)[:8] for r in _told_missing[:4])} "
+                            "whose Weg2StoreTold never reached this rank within the "
+                            "row-defer lap cap (the request is queued here, its "
+                            "told is not) -- " + str(_verdict.message)
+                        )
                     if not _verdict.defer:
                         # RAENGE-NIE-UNEINS: a detected disagreement is a
                         # bounded, named stop -- never a compensation. This

@@ -55,6 +55,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.utils import spawn_payload
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -735,7 +736,11 @@ class Engine(EngineScoreMixin, EngineBase):
                         proc = mp.Process(
                             target=run_scheduler_process_func,
                             args=(
-                                server_args,
+                                # NF-Bootzeit H1: by file reference -- inline,
+                                # a ServerArgs above the pipe size held this
+                                # loop in proc.start() until the child had
+                                # imported the main module (ranks 4-8 s apart).
+                                spawn_payload.by_reference(server_args),
                                 port_args,
                                 gpu_id,
                                 tp_rank,

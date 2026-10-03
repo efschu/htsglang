@@ -321,6 +321,12 @@ def decompose_mamba_budget_post(total_gb: float, components: dict):
 #: (its per_req is 0 by construction).
 PP_STAGE_NO_MAMBA_STATE_SLOTS = 1 << 30
 
+#: #239 S3a: the owner-block unit a Form A rank with token share 0 AND a KV
+#: cell of 0 contributes to the group MIN-reduce -- it holds nothing that spans
+#: the context, so it bounds nothing. Large enough that any funding rank wins
+#: the MIN, small enough that `unit * S` stays inside int64.
+_ZERO_SHARE_UNBOUNDED_UNIT = 1 << 40
+
 logger = logging.getLogger(__name__)
 
 
@@ -1031,6 +1037,7 @@ class ModelRunnerKVCacheMixin:
             )
             budget_gb = budget_mib / 1024.0
             used_by_me_gb = pre_model_load_memory - available_gpu_memory
+            self._weg2_used_by_me_gb = used_by_me_gb  # BOOTZEIT 3 stage-0 check line
             rest_memory = budget_gb - used_by_me_gb
             budget_posts.append(("weights + runtime state", used_by_me_gb))
             rest_memory, _reserve_post = self._gapped_corridor_holdback(rest_memory)
@@ -4813,9 +4820,14 @@ class ModelRunnerKVCacheMixin:
                     extra_args["use_mla"] = self.use_mla_backend
                 else:
                     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+                    from sglang.srt.rank_role import this_rank_is_form_a_worker
 
                     _kv_pool_class = QSATokenToKVPool
                     extra_args.update(
+                        # #239 S0: a Form A worker runs no indexer -- no
+                        # compressed index, so no HiCache sidecar either
+                        # (hybrid_pool_assembler registers none for it).
+                        qsa_index_on_rank=not this_rank_is_form_a_worker(),
                         qsa_index_kv_heads=_qsa_profile.kv_heads,
                         qsa_index_head_dim=_qsa_profile.head_dim,
                         qsa_compress_ratio=_qsa_profile.compress_ratio,
@@ -5221,6 +5233,17 @@ class ModelRunnerKVCacheMixin:
                 "and --kv-cache-dtype != fp4_e2m1."
             )
 
+        # #251c: under D's KV stage form the allocator hands out only stage
+        # S0's pages until the first wake picks a stage (every rank, the same
+        # cap -- the pool is VIRTUALLY the top stage, see _config_from_budget).
+        # The decode capture that follows asks for its row floor over these
+        # pools (d_seat_vram.capture_floor_rows).
+        if not self.is_draft_worker:
+            from sglang.srt.weg2 import d_seat_vram as _dsv
+
+            _dsv.kv_stage_boot_cap(self.token_to_kv_pool_allocator, self.page_size)
+            _dsv.note_capture_context(self)
+
     def _hybrid_kv_token_cap(self: ModelRunner) -> Optional[int]:
         """Physically reachable ceiling on max_total_num_tokens for hybrid
         mamba/GDN + attention models (#79).
@@ -5372,7 +5395,9 @@ class ModelRunnerKVCacheMixin:
         )
         return cap
 
-    def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
+    def _apply_token_constraints(
+        self: ModelRunner, token_capacity: int, *, kv_cell_bytes: Optional[int] = None
+    ) -> int:
         """Apply external constraints to token capacity: user cap, PP sync,
         and the hybrid mamba/attention physical ceiling (#79).
 
@@ -5424,7 +5449,19 @@ class ModelRunnerKVCacheMixin:
             ratios = get_cp_token_ratios()
             split_factor = cp_token_split_factor(self.dcp_size)
             ratio_r = ratios[get_parallel().attn_dcp_rank]
-            local_unit = int(token_capacity) // int(ratio_r)
+            if int(ratio_r) == 0:
+                # #239 S3a: a Form A rank that owns no full-attention token.
+                # Its capacity was priced per GLOBAL token
+                # (pool_configurator.zero_token_share_cell), so it bounds C
+                # directly: unit = capacity // S. A cell of 0 (a worker at
+                # share 0: no index, no draft) bounds nothing.
+                local_unit = (
+                    _ZERO_SHARE_UNBOUNDED_UNIT
+                    if kv_cell_bytes == 0
+                    else int(token_capacity) // int(split_factor)
+                )
+            else:
+                local_unit = int(token_capacity) // int(ratio_r)
             if getattr(self.server_args, "kv_reshard_vectors", None):
                 # #297 fitted ceiling: C must fit EVERY declared reshard
                 # vector on EVERY rank, not only the boot vector. One
@@ -6193,6 +6230,16 @@ class ModelRunnerKVCacheMixin:
             return
         if get_world_group().world_size <= 1:
             _skip("world size is 1, so there is no split to optimise")
+            return
+        if getattr(self.server_args, "rank_role", None):
+            # #239 S3a: the Form A token cut is the planner's, solved together
+            # with the expert residency (S2b), and it may give a rank 0 --
+            # whose capacity is per GLOBAL token and which this proportional
+            # optimiser would divide by. Rank-uniform (server args).
+            _skip(
+                "the Form A token cut (--rank-role, #239) is the planner's; "
+                "the proportional optimiser does not model a rank with share 0"
+            )
             return
         active = get_cp_token_ratios()
         if not active or len(active) != self.dcp_size:
@@ -7869,9 +7916,24 @@ class ModelRunnerKVCacheMixin:
             "n/a" if _frac is None else f"{_frac:.3%}",
         )
         config = configurator.calculate_pool_sizes(budget_bytes, self.page_size)
-        max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
+        max_tokens = self._apply_token_constraints(
+            config.max_total_num_tokens,
+            kv_cell_bytes=getattr(configurator, "_cell_size", None),
+        )
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
+        # #251c: D's KV stage form sizes the pool VIRTUALLY at the top stage;
+        # its pages are stage S0's (the budget must hold S0 on the attention
+        # host, else a named refusal). Off: unchanged.
+        from sglang.srt.weg2 import d_seat_vram as _dsv
+
+        max_tokens = _dsv.kv_stage_pool_tokens(
+            max_tokens, is_form_a_worker=bool(getattr(self, "is_form_a_worker", False)),
+            is_draft_worker=bool(getattr(self, "is_draft_worker", False)),
+            # MTP/EAGLE drafts write at the target's slot ids; the DFlash solo
+            # host keeps its own allocator (see kv_stage_pool_tokens)
+            draft_shares_slots=not bool(getattr(self, "is_draft_solo_host", False)),
+        )
         if max_tokens != config.max_total_num_tokens:
             config = configurator.calculate_pool_sizes_from_max_tokens(
                 max_tokens, self.page_size

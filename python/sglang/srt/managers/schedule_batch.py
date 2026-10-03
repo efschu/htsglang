@@ -118,6 +118,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.thinking_budget import THINKING_BUDGET_INTERNAL_KEY
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
+from sglang.srt.weg2 import turn_anchor as _weg2_turn
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 if TYPE_CHECKING:
@@ -169,6 +170,38 @@ def _weg2_fork_track(req, prefix_len: int, end: int, chunk: int,
                 "(at or below the generation prompt; chunk grid %d)",
                 n, str(getattr(req, "rid", "?"))[:16], prefix_len, end,
                 default_aligned, t, chunk,
+            )
+    return t
+
+
+def _weg2_claim_track(req, tree_cache, prefix_len: int, end: int, chunk: int,
+                      default_aligned: int) -> Optional[int]:
+    """CLAIM ANCHOR (dynpf 0929, weg2-24-38): group P's extend track for the
+    step that crosses the deepest page its store reader claims, or None = keep
+    the default. The default lands on the step's last grid point, floor_page(N)
+    for the step reaching the end -- one page past a bigram reader's claim
+    floor_page(N-2) whenever N % page is 0 or 1, so the read fell back to the
+    previous chunk anchor (``#1028B FETCH CAP kv=256 claimed=128``, by=mamba).
+    Only on the NF keying (bigram, node units == tokens the state consumed) and
+    a paged tree; a P-trim request keeps its own N-1 geometry. The predicate
+    is ``tail_handoff.claim_anchor_end`` -- the same one the #1481 END-ANCHOR
+    probe marks with (dynpf-Praefix 0929)."""
+    from sglang.srt.weg2 import fork_anchor as _fa
+    from sglang.srt.weg2 import tail_handoff as _th
+
+    claim = _th.claim_anchor_end(req, tree_cache)
+    if claim is None:
+        return None
+    t = _fa.track_target(prefix_len, end, claim, chunk, default_aligned)
+    if t is not None:
+        n = globals().get("_WEG2_CLAIM_TRACK_N", 0) + 1
+        globals()["_WEG2_CLAIM_TRACK_N"] = n
+        if n & (n - 1) == 0:
+            logger.info(
+                "WEG2 CLAIM-ANCHOR TRACK n=%d rid=%s step=[%d,%d) anchor %d -> %d "
+                "(the deepest page a bigram reader of N=%d claims; chunk grid %d)",
+                n, str(getattr(req, "rid", "?"))[:16], prefix_len, end,
+                default_aligned, t, len(req.origin_input_ids), chunk,
             )
     return t
 
@@ -3163,6 +3196,56 @@ def _group_world_size() -> int:
         return 1
 
 
+#: #281 WEG2-PREPARE-PARTS: where ``prepare_for_extend`` spends its time.
+#: z30u measured D TP0 ``prepare_ms`` linear in the admitted prefix (~5.6 ms
+#: per 1000 hit tokens) and nothing inside the function said which line.
+#: "1" = host wall per segment (perf_counter only, no device call);
+#: "2" = additionally the device work PENDING on the current stream at entry,
+#: timed by one synchronize (diagnosis only: it moves that wait out of the
+#: segments, it does not remove it). Unset = the function is unchanged.
+PREPARE_PARTS_ENV = "SGLANG_WEG2_PREPARE_PARTS"
+
+
+class _PrepareParts:
+    __slots__ = ("_t", "_parts", "_entry_sync_ms")
+
+    @classmethod
+    def begin(cls) -> Optional["_PrepareParts"]:
+        mode = os.environ.get(PREPARE_PARTS_ENV, "")
+        if mode not in ("1", "2"):
+            return None
+        pp = cls()
+        pp._entry_sync_ms = -1.0
+        if mode == "2" and torch.cuda.is_available():
+            t = time.perf_counter()
+            torch.cuda.current_stream().synchronize()
+            pp._entry_sync_ms = (time.perf_counter() - t) * 1000.0
+        pp._parts = []
+        pp._t = time.perf_counter()
+        return pp
+
+    def mark(self, name: str) -> None:
+        now = time.perf_counter()
+        self._parts.append((name, (now - self._t) * 1000.0))
+        self._t = now
+
+    def finish(self, batch, prefix_lens) -> None:
+        self.mark("tail")
+        try:
+            logger.info(
+                "WEG2-PREPARE-PARTS bs=%d prefix_tokens=%d extend_tokens=%d "
+                "entry_sync_ms=%.1f %s (host wall per segment of "
+                "prepare_for_extend; entry_sync = device work pending on the "
+                "current stream at entry, -1 = not probed)",
+                len(prefix_lens), int(sum(prefix_lens)),
+                int(getattr(batch, "extend_num_tokens", 0) or 0),
+                self._entry_sync_ms,
+                " ".join(f"{n}={ms:.1f}" for n, ms in self._parts),
+            )
+        except Exception:  # noqa: BLE001 - an instrument may never break prepare
+            pass
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -3209,6 +3292,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # (Scheduler.anchor_tails); excluded from the running-batch merge when the
     # batch returns as last_batch, like `chunked_req`. Empty unless armed.
     weg2_anchor_tail_bodies: Tuple = ()
+    # E2 (H24): every request of this extend batch took P's END state -- no
+    # target forward ran; the next pass decodes first (weg2/skip_first.py)
+    weg2_skip_extend: bool = False
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
@@ -3270,6 +3356,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # TURN ANCHOR (weg2/turn_anchor.py): this extend's second tracks, or None
+    weg2_turn_tracks: Optional[Any] = None
+    # TWIN ANCHOR (weg2/twin_anchor.py): rid -> twin boundaries of this new
+    # prefill batch (stamped by the scheduler before prepare_for_extend), or None
+    weg2_twin_bounds: Optional[Any] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -3533,6 +3624,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        _pp = _PrepareParts.begin()  # #281 WEG2-PREPARE-PARTS; None = off
         self.forward_mode = ForwardMode.EXTEND
         server_args = get_server_args()
 
@@ -3657,7 +3749,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert_prefix_lens_rank_uniform,
         )
 
-        assert_prefix_lens_rank_uniform(prefix_lens)
+        # nf-pd-post: a skip-extend batch runs no target forward; its ballot
+        # is issued here and decided after its result (prefix_lens_check)
+        assert_prefix_lens_rank_uniform(prefix_lens, defer=self.weg2_skip_extend)
         extend_lens = [r.extend_range.length for r in reqs]
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
@@ -3681,6 +3775,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
 
+        if _pp is not None:
+            _pp.mark("head")
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
@@ -3730,6 +3826,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 alloc_for_extend(self)
             )
 
+        if _pp is not None:
+            _pp.mark("alloc")
         # Set fields
         input_embeds = []
         all_replace_embeds: List[torch.Tensor] = []
@@ -3742,6 +3840,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        # TURN ANCHOR: the token id when armed on this process, else None
+        _turn_tok = (
+            _weg2_turn.armed(server_args)
+            if server_args.enable_mamba_extra_buffer()
+            else None
+        )
+        _turn_desc = None
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_range.length
@@ -3901,6 +4006,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
+                if _turn_tok is not None:
+                    # TURN ANCHOR: a second track where the prompt's last
+                    # message starts, when this step holds it (weg2/turn_anchor.py)
+                    _turn_desc = _weg2_turn.note_step(
+                        batch=self,
+                        desc=_turn_desc,
+                        req=req,
+                        row=i,
+                        prefix=pre_len,
+                        end=seq_len,
+                        track_mask=bool(track_entry.track_mask),
+                        main_track=req.mamba_last_track_seqlen,
+                        chunk=server_args.mamba_cache_chunk_size,
+                        page=self.token_to_kv_pool_allocator.page_size,
+                        tok=_turn_tok,
+                        twin_bounds=(self.weg2_twin_bounds or {}).get(req.rid, ()),
+                        # FORK TRACK: PP0's told fork (P-FORK-CUT), a track
+                        # there when this step runs through it uncut
+                        fork_told=int(getattr(req, "_weg2_fork_told", 0) or 0),
+                    )
 
             if self.return_logprob:
                 # Find input logprob token ids.
@@ -4017,10 +4142,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
+            self.weg2_turn_tracks = _turn_desc
 
+        if _pp is not None:
+            _pp.mark("reqs")
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
             self._collect_deferred_mamba_cow_and_clear(reqs)
+        if _pp is not None:
+            _pp.mark("mamba_cow")
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -4030,6 +4160,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+        if _pp is not None:
+            _pp.finish(self, prefix_lens)
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -4111,6 +4243,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # chunk in absolute terms (78886 + 15*64 on 26-66).
                     mamba_track_seqlen = _fork_t + 1
                     mamba_track_seqlen_aligned = _fork_t
+
+            # CLAIM ANCHOR (group P): the step crossing the store reader's
+            # deepest claim tracks AT it -- a mid-step grid point, the same +1
+            # as the fork track above.
+            _claim_t = _weg2_claim_track(
+                req, getattr(self, "tree_cache", None), len(req.prefix_indices),
+                len(req.prefix_indices) + req.extend_range.length,
+                mamba_cache_chunk_size, mamba_track_seqlen_aligned,
+            )
+            if _claim_t is not None:
+                mamba_track_seqlen = _claim_t + 1
+                mamba_track_seqlen_aligned = _claim_t
 
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
@@ -4261,7 +4405,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # per rid at the moment it is established. `src` is the tree
                 # anchor's slot, `dst` this request's own -- if a later probe's
                 # dst equals a slot some node still names, #1190 is #924.
-                from sglang.srt.managers.weg2_p_overlap import p_nosync_on
+                from sglang.srt.managers.weg2_p_overlap import (
+                    cache_path_nosync_on as p_nosync_on,  # #281 D-CACHE-NOSYNC
+                )
                 from sglang.srt.mem_cache.allocator.mamba import (
                     note_924d,
                     slot_trail_on,
@@ -4889,6 +5035,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.weg2_turn_tracks = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -4990,6 +5137,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.weg2_turn_tracks = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -5086,6 +5234,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            weg2_turn_tracks=self.weg2_turn_tracks,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

@@ -307,6 +307,9 @@ class LoadClass:
     bs: int = 1
     ctx: int = 0  # per request, tokens
     label: str = ""
+    #: code | prose | thinking when the front knows it; None = unknown (the
+    #: measured decision then asks every text of the matrix, worst case)
+    text: Optional[str] = None
 
     def key(self) -> str:
         return self.label or (f"{self.kind}-bs{self.bs}-{self.ctx // 1024}k" if self.kind == "decode"
@@ -493,22 +496,195 @@ def shard_map(geom: DGeometry, spec: ReshardSpec, preset: str) -> Dict[str, List
     return {"mlp.intermediate": offs}
 
 
+# ---------------------------------------------------------------------------
+# The MEASURED decision: FormMeasures v3 cells instead of the model (29.09.)
+# ---------------------------------------------------------------------------
+#
+# User 29.09. ~07:30Z: "nach jedem flip von P->D man 'weiss' ja vorher schon wie
+# viel bs kommen wird bei welcher kontexttiefe" -- the preset of the coming D
+# epoch is read from the measured round of each candidate form at (bs, depth,
+# text), not from DCalib (the sum model was refuted for INT8 on metal, the
+# segment model is calibrated on bs1/bs2 only).  Rules (form_measures module
+# doc): a missing cell is MISSING -- never interpolated, the preset in force
+# stays and the gap is named; an "unmoeglich" cell (not startable, beyond the
+# form's KV) is never picked; the depth is bucketed UP; a switch needs the
+# spec's hysteresis ``min_gain`` against the preset in force, in EVERY text
+# asked (the front often does not know the text: then all texts of the matrix,
+# worst case).  D-prefill has no cell (the matrix is decode rounds): the preset
+# in force stays.
+#
+# Which form carries which preset: the form's ``weights`` axis names its MLP
+# unit vector (``58,25,25/mlp=652,218,218``, record FORM_MATRIX_AXES[int8]);
+# a candidate is a form whose other axes equal the boot form's (the token
+# placement, transport, spec, precision and roles are boot facts -- only the
+# MLP vector changes at a wake) and whose MLP vector is a preset of the spec.
+
+MLP_AXIS_TAG = "mlp="
+
+
+def mlp_of_weights_axis(weights: Optional[object]) -> Optional[Tuple[int, ...]]:
+    """``'58,25,25/mlp=652,218,218'`` -> ``(652, 218, 218)``; no MLP part -> None."""
+    if weights is None:
+        return None
+    for part in str(weights).split("/"):
+        if part.startswith(MLP_AXIS_TAG):
+            try:
+                return tuple(int(x) for x in part[len(MLP_AXIS_TAG):].split(","))
+            except ValueError:
+                raise ReshardError(f"weights axis {weights!r}: MLP part is not an int vector") from None
+    return None
+
+
+def _without_mlp(axes: Mapping[str, object]) -> Dict[str, object]:
+    out = dict(axes)
+    w = out.get("weights")
+    if w is not None:
+        out["weights"] = "/".join(p for p in str(w).split("/") if not p.startswith(MLP_AXIS_TAG))
+    return out
+
+
+@dataclass(frozen=True)
+class MeasuredChoice:
+    preset: str
+    form: Optional[str]
+    reason: str
+    #: worst-case (over the texts asked) relative gain against the preset in
+    #: force; None when nothing was compared
+    gain: Optional[float] = None
+    #: "<form>@<text>@<depth>/bs<n>" of every cell that was needed and missing
+    missing: Tuple[str, ...] = ()
+
+
+class MeasuredForms:
+    """The measured side of :class:`LeaderCursor`: the matrix of the model
+    profile, the store and the identity of THIS boot, and the map preset ->
+    form.  Built once per boot; pure."""
+
+    def __init__(self, spec: ReshardSpec, matrix, store, identity, boot_form: str,
+                 temp: str = "warm"):
+        from sglang.srt.weg2 import form_measures as fm
+
+        self.fm, self.spec, self.matrix, self.store, self.identity = fm, spec, matrix, store, identity
+        self.temp = temp
+        forms = {f.name: f for f in matrix.forms}
+        if boot_form not in forms:
+            raise ReshardError(f"boot form {boot_form!r} not in the matrix ({sorted(forms)})")
+        bf = forms[boot_form]
+        boot_mlp = mlp_of_weights_axis(bf.axes.get("weights"))
+        if boot_mlp != tuple(spec.preset(spec.boot).mlp):
+            raise ReshardError(f"boot form {boot_form!r} carries MLP {boot_mlp}, the spec boots "
+                               f"{spec.boot}={tuple(spec.preset(spec.boot).mlp)}")
+        by_mlp = {tuple(p.mlp): p.name for p in spec.presets}
+        rest = _without_mlp(bf.axes)
+        #: preset name -> FormSpec (only forms that differ from the boot form in the MLP vector alone)
+        self.form_of: Dict[str, object] = {}
+        for f in matrix.forms:
+            mlp = mlp_of_weights_axis(f.axes.get("weights"))
+            if mlp is None or _without_mlp(f.axes) != rest or mlp not in by_mlp:
+                continue
+            name = by_mlp[mlp]
+            if name in self.form_of:
+                raise ReshardError(f"preset {name} carried by two forms ({self.form_of[name].name}, {f.name})")
+            self.form_of[name] = f
+
+    def _cell_ms(self, f, bs: int, depth: str, text: str):
+        """('ms', value) | ('impossible', why) | ('missing', label)."""
+        ax = dict(f.axes)
+        ax.update({"form": f.name, "bs": int(bs), "depth": depth, "text": text, "temp": self.temp})
+        st, why = self.fm.structural_state(self.matrix, f, ax)
+        if st is not None:
+            return "impossible", why
+        c = self.store.lookup(self.identity, **ax)
+        if c is not None and c.state.startswith("unmoeglich"):
+            return "impossible", c.reason
+        if c is not None and c.state == self.fm.STATE_MEASURED:
+            return "ms", float(c.round_ms_median)
+        return "missing", f"{f.name}@{text}@{depth}/bs{bs}"
+
+    def choose(self, load: LoadClass, current: str) -> MeasuredChoice:
+        if load.kind != "decode":
+            return MeasuredChoice(current, None, f"{load.key()}: D-prefill has no cell, preset in force stays")
+        try:
+            depth = self.fm.depth_label(int(load.ctx))
+        except self.fm.FormMeasuresError as exc:
+            return MeasuredChoice(current, None, f"{load.key()}: {exc}")
+        texts = (load.text,) if load.text else tuple(self.matrix.texts)
+        cur_f = self.form_of.get(current)
+        if cur_f is None:
+            return MeasuredChoice(current, None, f"preset in force {current!r} has no form in the matrix")
+        missing: List[str] = []
+        cur_ms: Dict[str, float] = {}
+        for t in texts:
+            kind, v = self._cell_ms(cur_f, load.bs, depth, t)
+            if kind == "ms":
+                cur_ms[t] = v
+            elif kind == "missing":
+                missing.append(v)
+            else:
+                return MeasuredChoice(current, cur_f.name, f"{load.key()}: form in force impossible here ({v}), "
+                                                           f"stays (the admission, not the resplit, owns this)")
+        if len(cur_ms) != len(texts):
+            return MeasuredChoice(current, cur_f.name, f"{load.key()}@{depth}: cell of the form in force missing, "
+                                                       f"stays", missing=tuple(missing))
+        best: Optional[Tuple[float, str]] = None
+        for name in (p.name for p in self.spec.presets):
+            f = self.form_of.get(name)
+            if f is None or name == current:
+                continue
+            gains = []
+            for t in texts:
+                kind, v = self._cell_ms(f, load.bs, depth, t)
+                if kind != "ms":
+                    if kind == "missing":
+                        missing.append(v)
+                    gains = None
+                    break
+                gains.append((cur_ms[t] - v) / cur_ms[t])
+            if gains is None:
+                continue
+            g = min(gains)
+            if best is None or g > best[0] + 1e-12:
+                best = (g, name)
+        if best is None:
+            return MeasuredChoice(current, cur_f.name, f"{load.key()}@{depth}: no other measured form",
+                                  missing=tuple(missing))
+        g, name = best
+        if g >= self.spec.min_gain:
+            return MeasuredChoice(name, self.form_of[name].name,
+                                  f"{load.key()}@{depth}: {self.form_of[name].name} {g * 100:+.1f}% "
+                                  f"(>= min_gain {self.spec.min_gain * 100:.1f}%)", gain=g, missing=tuple(missing))
+        return MeasuredChoice(current, cur_f.name,
+                              f"{load.key()}@{depth}: best other {self.form_of[name].name} {g * 100:+.1f}% "
+                              f"< min_gain {self.spec.min_gain * 100:.1f}%, stays", gain=g, missing=tuple(missing))
+
+
 class LeaderCursor:
-    """The one decider (front / TP0 at the wake).  Epochs strictly increase."""
+    """The one decider (front / TP0 at the wake).  Epochs strictly increase.
+
+    With ``measured`` (a :class:`MeasuredForms`) the decision reads measured
+    cells; without it, the model (unchanged)."""
 
     def __init__(self, geom: DGeometry, cal: DCalib, spec: ReshardSpec,
-                 token_share: Sequence[float]):
+                 token_share: Sequence[float], measured: Optional[MeasuredForms] = None):
         spec.validate(geom)
         self.geom, self.cal, self.spec = geom, cal, spec
         self.token_share = tuple(token_share)
         self.current = spec.boot
         self.epoch = -1
+        if measured is not None and measured.spec.digest() != spec.digest():
+            raise ReshardError("measured forms were built for another spec")
+        self.measured = measured
+        self.last_choice: Optional[MeasuredChoice] = None
 
     def decide(self, epoch: int, load: LoadClass) -> ReshardRow:
         if epoch <= self.epoch:
             raise ReshardDivergence(f"D-RESHARD leader epoch {epoch} not after {self.epoch}")
         if self.spec.policy == POLICY_OFF:
             name, why = self.spec.boot, "off"
+        elif self.measured is not None:
+            ch = self.measured.choose(load, self.current)
+            self.last_choice = ch
+            name, why = ch.preset, "measured:" + ch.reason.replace(" ", "_")
         else:
             name = choose(self.geom, self.cal, self.spec.base, self.spec.presets, load,
                           self.token_share, self.current, self.spec.min_gain)

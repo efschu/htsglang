@@ -104,16 +104,28 @@ def scaled_spans(ratios: Sequence[int], total: int) -> List[int]:
     """Die Experten JE RANG, auf ``total`` skaliert -- wie der Server rechnet.
 
     ``--rank-moe-ratio`` ist ein VERHAELTNIS, keine Stueckzahl: 183,137,168
-    summiert 488. Der letzte Rang bekommt den Rest, damit die Summe exakt
-    ``total`` ist und keine Id zwischen zwei Baendern verschwindet.
+    summiert 488. Die Summe ist exakt ``total``, keine Id verschwindet
+    zwischen zwei Baendern.
+
+    #239 rc12z29c-Blocker 2 (rc12z29c D-Laden, 'Platztausch-Karte nennt 61
+    residente Zeilen fuer Layer 0 Rang 1'): hier stand ``round`` je Rang und
+    der Rest auf dem letzten. Der Rang schneidet sein Fenster aber mit
+    ``distributed.utils.partition_units`` (groesster Rest, Gleichstand zum
+    kleineren Rang; fused_moe_triton/layer.py ``tp_partition_offset/size``
+    mit units = num_experts). Fuer 183,137,168 treffen sich beide zufaellig
+    (192,144,176); fuer den geloesten D-Vektor 215,113,160 nicht: Karte
+    226,119,167, Rang 226,118,168 (TP2 lo=344 im D-Log). Die Karte schreibt
+    auf, was der Rang tut -- also rechnet sie mit DERSELBEN Funktion.
+    ``allow_zero``: ein Verhaeltnis 0 besitzt nichts (fuer positive Gewichte
+    byte-gleich zur klassischen Teilung).
     """
     r = [max(0, int(x)) for x in ratios]
     s = sum(r)
     if s <= 0 or total <= 0:
         return [0] * len(r)
-    out = [round(x * total / s) for x in r[:-1]]
-    out.append(total - sum(out))
-    return out
+    from sglang.srt.distributed.utils import partition_units
+
+    return [int(x) for x in partition_units(int(total), r, allow_zero=True)]
 
 
 def bounds(spans: Sequence[int]) -> List[int]:

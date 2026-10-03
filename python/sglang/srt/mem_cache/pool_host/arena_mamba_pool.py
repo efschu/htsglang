@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Optional, Sequence
 
 import torch
 
 from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost
+from sglang.srt.mem_cache.storage.file.hicache_arena import free_named
 from sglang.srt.weg2 import ple_state
 from sglang.srt.mem_cache.pool_host.arena_pool import (
     PLACEHOLDERS,
@@ -48,6 +50,59 @@ def _arena_state_load_block_bytes() -> int:
         return max(1 << 20, int(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD_BLOCK_BYTES", str(256 << 20))))
     except ValueError:
         return 256 << 20
+
+
+#: DP-NACHLAUF 02.10. (N5p b6a6a5c08d, every 27B boot of the day): one
+#: start_loading carries TWO mamba transfers on this pool (``WEG2-ARENA-STATE-
+#: LOAD n=1``/``n=2`` per load, ``mamba.pre_n=66`` = 2 x 33 layers). The single
+#: ``_state_loaded_key`` held only the LAST layer-0 key, so on every layer > 0
+#: both transfers missed it and ran the per-layer path -- ``device_indices
+#: .cpu()`` (a host wait on the load stream, queued behind the KV H2D) and
+#: pageable copies: PP0 ``mamba=206`` against 9 ms of timed sub-stages,
+#: growing with the KV tokens at ~7 GB/s (2164 tok 52 ms ... 77824 tok 218 ms).
+#: Every key whose layer-0 state load ran is remembered (the last 8). Unset =
+#: on; 0/false/no/off = the single key.
+ENV_MAMBA_STATE_KEYS = "SGLANG_WEG2_MAMBA_STATE_KEYS"
+
+
+def mamba_state_keys_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_MAMBA_STATE_KEYS, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _state_key_loaded(pool, key) -> bool:
+    if getattr(pool, "_state_loaded_key", None) == key:
+        return True
+    return mamba_state_keys_on() and key in (getattr(pool, "_state_loaded_keys", None) or ())
+
+
+def _state_key_note(pool, key) -> None:
+    pool._state_loaded_key = key
+    keys = getattr(pool, "_state_loaded_keys", None)
+    if keys is None:
+        keys = pool._state_loaded_keys = []
+    if key in keys:
+        keys.remove(key)
+    keys.append(key)
+    del keys[:-8]
+
+
+def _state_key_drop(pool, key) -> None:
+    pool._state_loaded_key = None
+    keys = getattr(pool, "_state_loaded_keys", None)
+    if keys and key in keys:
+        keys.remove(key)
+
+
+def _load_sub(pool) -> dict:
+    """H2D phase 1 (a): CPU ms of the mamba state load's sub-stages, summed
+    over one start_loading; the hybrid host pool folds them into the
+    ``WEG2-START-LOADING components_ms`` line as ``mamba.<stage>`` and clears
+    them. Instrument only."""
+    sub = getattr(pool, "_weg2_load_sub", None)
+    if sub is None:
+        sub = pool._weg2_load_sub = {}
+    return sub
 
 
 def merge_state_extents(comp):
@@ -101,6 +156,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._arena_init_fields()
+        # +254 MiB fix (a): the device state stage is dropped at a sleep
+        from sglang.srt.weg2 import sleep_staging as _ss
+
+        _ss.register_mamba_pool(self)
 
     def _arena_init_fields(self) -> None:
         self.staging_rows = int(self.size)
@@ -206,6 +265,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         self._slot_view = _buf_all[data_off:data_off + A * slot_bytes].view(A, slot_bytes)
         self._state_stage = None
         self._state_loaded_key = None
+        self._state_loaded_keys = []
         self._layout = {"L": L, "t_shape": t_shape, "conv_shape": conv_shape, "width": width,
                         "t_ext": [(int(t_ext[l][0]), int(t_ext[l][1])) for l in range(L)],
                         "c_ext": [[(int(c_ext[3 * l + j][0]), int(c_ext[3 * l + j][1])) for j in range(3)] for l in range(L)]}
@@ -234,6 +294,9 @@ class ArenaMambaPoolHost(MambaPoolHost):
             self._pinned[:] = True
             logger.info("#1436 mamba arena pre-pinned: %.2f GiB in %.1f s", total / (1 << 30), _time.perf_counter() - t0)
         self.arena = arena
+        from sglang.srt.weg2 import handoff_pending as _hp248e
+
+        _hp248e.bind_arena(self, arena)  # #248e: the clock evict finds the anchor order
         self.arena_slots = A
         self.id_space = self.staging_rows + A + PLACEHOLDERS
         logger.info("#1427 mamba arena host pool bound staging=%d slots=%d layers=[%d,%d) extents=%d",
@@ -251,6 +314,13 @@ class ArenaMambaPoolHost(MambaPoolHost):
     _pend_mark = ArenaMHAHostPool._pend_mark
     _pend_pop = ArenaMHAHostPool._pend_pop
     _pending_mask = None   # the mamba pool keeps the dict only (1 state per node)
+    # #231: only the mamba anchor arena reaps orphaned direct claims (its anchor
+    # claims are decided per P rank); a form without arena anchor claims (27B:
+    # host_anchor_slots) never claims here, so there is nothing to reap.
+    _weg2_reaps_orphan_claims = True
+    #: #243: a pending hand-off keeps its END anchor in this arena (the last
+    #: chain keys), not every intermediate anchor on its path
+    _weg2_handoff_keep = "anchor"
 
     def _stems(self, hashes, suffix: str = ""):
         from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -263,6 +333,27 @@ class ArenaMambaPoolHost(MambaPoolHost):
         if slots is None:
             return None
         return torch.tensor([self.staging_rows + s for s in slots], dtype=torch.int64)
+
+    def anchor_held(self, last_hash) -> Optional[bool]:
+        """y6b (review a54a22e54d F1): does the anchor written under
+        ``last_hash`` still have its bytes somewhere -- a COMPLETE arena slot,
+        or an L3 copy (the clock evict writes one before it frees an
+        unreferenced slot, #257 (d); a copy it could not write is ``lost``)?
+        A detached anchor-only write (KV only in the store) hands its reference
+        back at the ack, so its slot is a clock candidate from then on; this is
+        how the tree learns that a ``weg2_anchor_secured`` mark no longer holds.
+        One C lookup; the L3 index (#1459) only when the arena misses. None =
+        cannot tell (unbound pool, backend without a stat)."""
+        if self.arena is None or self._backend is None or last_hash is None:
+            return None
+        stem = self._stems([last_hash])[0]
+        slot, state = self.arena.find_slots([stem])[0]
+        if slot >= 0 and state == 2:
+            return True
+        stat = getattr(self._backend, "_stat_stems", None)
+        if not callable(stat):
+            return None
+        return stem in stat([stem])
 
     # -- fnFL2 H19: anchor displacement -----------------------------------------------
     def settled_anchor_slots(self, host_value: Optional[torch.Tensor]) -> Optional[list]:
@@ -280,10 +371,70 @@ class ArenaMambaPoolHost(MambaPoolHost):
         return rows
 
     def drop_unreferenced(self, slots: Sequence[int]) -> int:
-        """Free the displaced anchors' slots once no rank references them."""
+        """Free the displaced anchors' slots once no rank references them.
+
+        #257 (ii): an inner chunk anchor displaced here was dropped with no
+        disk copy (arena_drop_unreferenced) -- with NF's anchor interval 0 the
+        inner anchors live only in this 32-slot arena, and every fork below
+        one re-prefilled from the previous surviving anchor (27B 62e7b80aed:
+        8 of 20 clamps). The rank whose release leaves a slot unreferenced now
+        pins it, gives it an L3 copy through the claim's own disk half
+        (HiCacheFile.arena_secure_to_disk: already on disk -> nothing written),
+        unpins and drops. A slot another rank still references is left to
+        that rank's drop -- the last releaser writes, once."""
         if self.arena is None or not slots:
             return 0
-        return self.arena.drop_unreferenced(list(slots))
+        slots = [int(s) for s in slots]
+        self._secure_before_drop(slots)
+        return self.arena.drop_unreferenced(slots)
+
+    def _secure_before_drop(self, slots) -> dict:
+        arena = self.arena
+        out = {"on_disk": 0, "written": 0, "lost": 0}
+        try:
+            idle = [s for s, r in zip(slots, arena.slot_refs(slots)) if r == 0]
+        except Exception as exc:  # noqa: BLE001 - loud; the drop below still re-checks
+            logger.warning("#257 ANCHOR-DROP refs unreadable (%r): %d slot(s) not secured", exc, len(slots))
+            return out
+        pinned = []
+        for s in idle:
+            # the pin holds the slot COMPLETE while it is written (a CLAIMED
+            # slot is never dropped, so it needs no copy)
+            if arena.ref_slots([s], +1) != 1:
+                continue
+            stem = arena.slot_stem(s)
+            if stem and arena.find_slots([stem])[0] == (s, 2):
+                pinned.append(s)
+            else:
+                arena.ref_slots([s], -1)
+        if not pinned:
+            return out
+        try:
+            secure = getattr(self._backend, "arena_secure_to_disk", None)
+            if callable(secure):
+                total = int(arena.slot_bytes)
+                res = secure(arena, [(s, None, None, total) for s in pinned])
+                for k in out:
+                    out[k] += int(res.get(k, 0))
+            else:
+                out["lost"] += len(pinned)
+        except Exception as exc:  # noqa: BLE001 - loud, counted as lost
+            logger.warning("#257 ANCHOR-DROP disk copy failed (%r): %d anchor(s)", exc, len(pinned))
+            out["lost"] += len(pinned) - out["on_disk"] - out["written"]
+        finally:
+            arena.ref_slots(pinned, -1)
+        ArenaMHAHostPool._257_dropped_without_l3 = (
+            getattr(ArenaMHAHostPool, "_257_dropped_without_l3", 0) + out["lost"])
+        ArenaMHAHostPool._257_written_to_l3 = (
+            getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + out["written"])
+        n = getattr(ArenaMambaPoolHost, "_257_anchor_drop_n", 0) + 1
+        ArenaMambaPoolHost._257_anchor_drop_n = n
+        if n <= 16 or n % 64 == 0 or out["lost"]:
+            logger.info("#257 ANCHOR-DROP n=%d anchors=%d l3=on_disk:%d,written:%d dropped_without_l3=%d "
+                        "(total written=%d dropped_without_l3=%d)",
+                        n, len(pinned), out["on_disk"], out["written"], out["lost"],
+                        ArenaMHAHostPool._257_written_to_l3, ArenaMHAHostPool._257_dropped_without_l3)
+        return out
 
     def is_arena_id(self, i: int) -> bool:
         return self.staging_rows <= int(i) < self.staging_rows + self.arena_slots
@@ -512,10 +663,13 @@ class ArenaMambaPoolHost(MambaPoolHost):
         if getattr(self, "_state_dev_stage", None) is None or self._state_dev_stage.shape[0] < bb \
                 or self._state_dev_stage.shape[1] != row_bytes or self._state_dev_stage.device != dev:
             self._state_dev_stage = torch.empty((bb, row_bytes), dtype=torch.uint8, device=dev)
+        _sub = _load_sub(self)
+        _ta = time.perf_counter()
         slots_cpu = slots.to("cpu", dtype=torch.int64)
         # SGLANG_HICACHE_LOAD_ASYNC_INDEX: pinned + non_blocking instead of a
         # pageable `.to(dev)` (a host wait on the forward-fenced load stream).
         didx = index_to_device_async(didx, dev) if load_index_async() else didx.to(dev)
+        _sub["idx"] = _sub.get("idx", 0.0) + (time.perf_counter() - _ta) * 1000.0
         e_c = int(self.conv_dtype.itemsize)
         t_shape = tuple(lay["t_shape"]); conv_shape = tuple(lay["conv_shape"]); width = int(lay["width"])
         L = int(lay["L"])
@@ -523,6 +677,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
             b = min(B, n - start)
             sl = slots_cpu[start:start + b]
             dev_stage = self._state_dev_stage[:b]
+            _tb = time.perf_counter()
             if dma:
                 _state_block_dma(self._slot_view, dev_stage, sl.tolist(), runs)
             else:
@@ -530,6 +685,8 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 for (cur, off, ln) in comp:
                     torch.index_select(self._slot_view[:, off:off + ln], 0, sl, out=stage[:, cur:cur + ln])
                 dev_stage.copy_(stage, non_blocking=_pin)
+            _tc = time.perf_counter()
+            _sub["issue"] = _sub.get("issue", 0.0) + (_tc - _tb) * 1000.0
             d_b = didx[start:start + b]
             k = 0
             for l in range(L):
@@ -545,8 +702,11 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     row[:, ch0:ch0 + n_j] = dev_stage[:, cur_j:cur_j + ln_j].contiguous().view(self.conv_dtype).view(b, n_j, width)
                     ch0 += n_j
                 dst_c.index_copy_(0, d_b, row)
+            _sub["split"] = _sub.get("split", 0.0) + (time.perf_counter() - _tc) * 1000.0
             if _pin and not dma and start + b < n:
+                _td = time.perf_counter()
                 torch.cuda.current_stream(dev).synchronize()  # the stage is reused by the next block
+                _sub["sync"] = _sub.get("sync", 0.0) + (time.perf_counter() - _td) * 1000.0
         global _STATE_LOAD_N
         _STATE_LOAD_N += 1
         if _STATE_LOAD_N <= 8 or _STATE_LOAD_N % 64 == 0:
@@ -564,7 +724,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         slots = hi[sel] - self.staging_rows
         if _arena_state_load_on() and getattr(self, "_slot_view", None) is not None:
             key = (id(host_indices), id(device_indices), int(host_indices.numel()), int(device_indices.numel()))
-            if layer_id != 0 and self._state_loaded_key == key:
+            if layer_id != 0 and _state_key_loaded(self, key):
                 rest = (~is_arena).nonzero(as_tuple=True)[0]
                 if rest.numel():
                     super().load_to_device_per_layer(
@@ -573,6 +733,8 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 return  # every layer came with the state load at layer 0
             if layer_id == 0:
                 try:
+                    _sub = _load_sub(self)
+                    _ts = time.perf_counter()
                     if load_index_async():
                         # SGLANG_HICACHE_LOAD_ASYNC_INDEX: the device rows stay on
                         # the card (selected there when not every row is an arena
@@ -582,13 +744,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
                                  else _select_rows_async(device_indices, is_arena))
                     else:
                         _didx = device_indices.cpu()[sel]
+                    _sub["select"] = _sub.get("select", 0.0) + (time.perf_counter() - _ts) * 1000.0
                     self._load_states_all_layers(device_pool, slots, _didx)
-                    self._state_loaded_key = key
+                    _state_key_note(self, key)
                     if ple_state.enabled():
                         # H63c: the anchors' PLE side states into the same
                         # targets, on the load stream (before the PLE read's join);
                         # the rows are selected on the card, never `.cpu()`
+                        _tp = time.perf_counter()
                         ple_state.side_read(self.arena, device_pool, slots.tolist(), device_indices, sel)
+                        _sub["ple"] = _sub.get("ple", 0.0) + (time.perf_counter() - _tp) * 1000.0
                     rest = (~is_arena).nonzero(as_tuple=True)[0]
                     if rest.numel():
                         super().load_to_device_per_layer(
@@ -597,7 +762,18 @@ class ArenaMambaPoolHost(MambaPoolHost):
                     return
                 except Exception as exc:  # noqa: BLE001 -- one named fallback to the per-layer path
                     logger.warning("WEG2-ARENA-STATE-LOAD failed (%s: %s); per-layer path", type(exc).__name__, exc)
-                    self._state_loaded_key = None
+                    _state_key_drop(self, key)
+        # DP-NACHLAUF: the per-layer path (host waits) -- on the line as
+        # mamba.perlayer / perlayer_n, so a key miss can never hide again
+        _tpl = time.perf_counter()
+        try:
+            self._load_layer_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend, sel, slots, is_arena)
+        finally:
+            _subp = _load_sub(self)
+            _subp["perlayer"] = _subp.get("perlayer", 0.0) + (time.perf_counter() - _tpl) * 1000.0
+            _subp["perlayer_n"] = _subp.get("perlayer_n", 0.0) + 1.0
+
+    def _load_layer_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend, sel, slots, is_arena):
         dst_t = device_pool.mamba_cache.temporal[layer_id]
         dev = dst_t.device
         didx = device_indices.cpu()[sel].to(dev)
@@ -640,9 +816,18 @@ class ArenaMambaPoolHost(MambaPoolHost):
             freed += int(super().free(staging))
         if rows:
             pend = [s for s in rows if s in self._pending]
-            fresh = [s for s in pend if self._pending.pop(s)[1]]
+            fresh, joined, jgens = [], [], []
+            for s in pend:
+                g, is_fresh = self._pending.pop(s)[:2]
+                if is_fresh:
+                    fresh.append(s)
+                else:
+                    joined.append(s)
+                    jgens.append(g)
+            if joined:
+                self.arena.unclaim(joined, jgens)   # #231: a join freed unwritten is no longer open
             if fresh:
-                self.arena.free_slots(fresh)
+                free_named(self.arena, fresh, "mamba_free_pending")
             keep = [s for s in rows if s not in pend]
             if keep:
                 self.arena.ref_slots(keep, -1)

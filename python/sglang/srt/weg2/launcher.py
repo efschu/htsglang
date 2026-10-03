@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
 import json
 import math
 import os
@@ -84,6 +85,10 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+from sglang.srt.weg2 import budget_rest as _budget_rest
+from sglang.srt.weg2 import rank_state as rank_state_mod
+from sglang.srt.weg2 import shared_cache_release as shared_cache_release_mod
+from sglang.srt.weg2 import state_file as state_file_mod
 # WEG2-FORM (24.09.): the boot's form axes -- ONE resolver, ONE line, ONE env.
 from sglang.srt.weg2 import form as weg2_form
 
@@ -102,10 +107,12 @@ def _pconst(name: str, profile: Optional[str] = None):
 # Task #58: the arming variable's name comes from the module that READS it, so
 # the publisher and the reader cannot drift into two spellings of one key.
 from sglang.srt.weg2.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
+from sglang.srt.weg2 import topology as _topo
 from sglang.srt.weg2 import (
     checkpoint_census,
     corridor_budget,
     host_ledger,
+    card_identity,
     ring_table,
     seam_digest,
     weight_exchange,
@@ -173,6 +180,11 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 #: that has to be at least as large as a pool that already lives in RAM.
 #: SGLANG_WEG2_STORE_ROOT: see the rig-path block above.
 STORE_ROOT = os.environ.get("SGLANG_WEG2_STORE_ROOT") or "/spinning/hicache-weg2"
+#: W57 (28.09.): whether the store root was TOLD (SGLANG_WEG2_STORE_ROOT) or is
+#: the rig default above. A launcher run without it measured the ZFS pool under
+#: /spinning (171 GiB free, 93 % full) instead of the NF store the container
+#: mounts from XFS [/l3/nf] (1.3 TB free) and refused the store by W57.
+STORE_ROOT_TOLD = bool(os.environ.get("SGLANG_WEG2_STORE_ROOT"))
 #: C18: where the per-card host-ring files live under the MAP_SHARED form.  A
 #: tmpfs, because the granules must be shared PAGES (both co-located rank
 #: processes map the same file), not a disk-backed file.  THIS COMMENT IS THE
@@ -256,6 +268,16 @@ CORRIDOR_MIB = 1024 + D_AWAKE_OVERSHOOT_MIB
 #: first sleep by the front.  Plus D's open BAR1 windows (deviation above).
 DC_EXPECT_5090_MIB = 1848
 DC_EXPECT_3080_MIB = 1442
+#: HW-GENERIC 1002: the two expectations above BY CALIBRATION CLASS
+#: (weg2/card_identity.py) -- the selector, so no reader picks one by a name
+#: substring. A class absent here has no expectation: printed UNCALIBRATED.
+DC_EXPECT_MIB_BY_CLASS = {"RTX5090": DC_EXPECT_5090_MIB, "RTX3080": DC_EXPECT_3080_MIB}
+
+
+def dc_expect_mib(card) -> Optional[int]:
+    """The spec-1.6 dormant-residue EXPECTATION of ``card``'s calibration
+    class, or None (uncalibrated class: no expectation, never the 3080's)."""
+    return DC_EXPECT_MIB_BY_CLASS.get(card_identity.calibration_class(card) or "")
 #: MEASURED on boot weg2ls1b2 (2026-09-07 07:11:55-58Z, NVML per-process at
 #: group D's first sleep, tags kv_cache+weights, NEXTN draft + TP decode
 #: graphs resident): D_c(D) = 2228 MiB on the 5090, 1922 MiB on each 3080 --
@@ -449,6 +471,210 @@ def dc_residue_from_record(
                  + ", ".join(parts) + " MiB")
 
 
+P_DORMANT_EXPECT_ENV = "SGLANG_WEG2_D_EXPECT_P_RECORD"
+#: How many of the newest group-P boots (same calibration identity, same weight
+#: form, every card measured) the expectation takes the per-card MAXIMUM over.
+#: Measured scatter of this record under ONE P form (Next Flash, 28./29.09.,
+#: profile family -st/-st-cut/-odx, 30 boots): nvml1 1286-1414, nvml0 680-764,
+#: nvml2 666-1012 MiB; about one boot in four carries a +250..+350 MiB outlier
+#: on one card (09281447 nvml2 1012, 09290450/0500 nvml2 924). Eight boots are
+#: the last ~2-6 h of the serving loop: an outlier is inside the window with
+#: ~90 % (1 - 0.75^8), and the window stays within today's P form (the older
+#: form of 27.09., 1850/1130/1120, is a different P and ages out). A maximum
+#: of measurements, not a reserve: no margin is added on top.
+P_DORMANT_EXPECT_N = 8
+
+
+def p_dormant_records(profile: Optional[str],
+                      accept: Optional[Callable[[dict], bool]]
+                      ) -> Optional[List[Dict[str, object]]]:
+    """The group-P dormant-image records the D expectation may price from --
+    READ ONLY where they are used. ``None`` without reading on every profile
+    whose expectation stays the legacy term (``d_expect_from_p_records``
+    False: a broken or foreign sidecar must not touch a boot that never uses
+    the value -- 27B review, 'Riegel hinter dem, was er sichert') and without
+    a calibration identity (no identity = no foreign model's record). A
+    malformed sidecar reads as ``[]`` (UNMEASURED), never as an exception.
+    Since 29.09. the 27B reads them too (its row switched the expectation)."""
+    if not d_expect_from_p_records(profile) or accept is None:
+        return None
+    return host_ledger.read_measured_records(measured_record_path(), "P", accept=accept)
+
+
+def dormant_max_from_records(
+    recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
+    n: int = P_DORMANT_EXPECT_N, group: str = "P",
+) -> Tuple[Optional[Dict[str, int]], str]:
+    """A group's MEASURED dormant VRAM residue per card (``group`` names it in
+    the provenance; the caller reads that group's records): the per-card MAXIMUM
+    over the newest ``n`` group-P dormant-image records (one per boot) that
+    the front stamped at P's first sleep (``vram_residue_mib``, the same
+    field #1444 reads for group D), measured under the SAME weight form and
+    carrying a positive value for EVERY card of this boot.
+
+    ``(per-uuid MiB, provenance naming n, the boots and the maximum)``;
+    ``(None, why)`` when no such record exists (UNMEASURED -- the caller names
+    its fallback). A record of another form or missing a card is skipped by
+    name, never merged partially. Priced BARE, no margin: the real D pass
+    after P's sleep charges the launcher's own reading of the same residue
+    bare too (``budgets_from_dc(cards, dc_p, ...)``), and the served growth of
+    P's dormant image has its own term (``served_dormant_growth``). This is
+    the one reader for "D's budget after P's sleep" before P has slept -- the
+    expectation passes and an early D start read it here, not from a second
+    source."""
+    if not recs:
+        return None, f"no group-{group} dormant-image record in the sidecar"
+    by_boot: Dict[str, Dict[str, object]] = {}
+    skipped = []
+    for rec in sorted((r for r in recs if isinstance(r, dict)),
+                      key=lambda r: str(r.get("at", "")), reverse=True):
+        tag = str(rec.get("boot_tag", "?"))
+        if tag in by_boot:
+            continue
+        form = str(rec.get("vram_residue_form", "") or "")
+        vals = rec.get("vram_residue_mib") or {}
+        if form != str(weight_source) or not isinstance(vals, dict):
+            skipped.append(f"{tag} (form {form!r})")
+            continue
+        miss = [c for c in cards if not isinstance(vals.get(c.uuid), (int, float))
+                or isinstance(vals.get(c.uuid), bool) or vals.get(c.uuid) <= 0]
+        if miss:
+            skipped.append(f"{tag} (no residue for nvml{miss[0].nvml_index})")
+            continue
+        by_boot[tag] = rec
+        if len(by_boot) >= int(n):
+            break
+    if not by_boot:
+        return None, (f"no group-{group} record measured under form {str(weight_source)!r} on "
+                      f"every card (skipped: {', '.join(skipped[:4]) or 'none'})")
+    out: Dict[str, int] = {}
+    parts = []
+    for c in cards:
+        vals = [int(r["vram_residue_mib"][c.uuid]) for r in by_boot.values()]
+        out[c.uuid] = max(vals)
+        parts.append(f"nvml{c.nvml_index} {out[c.uuid]} (min {min(vals)})")
+    return out, (f"MAX over the newest {len(by_boot)} of N={int(n)} group-{group} records form "
+                 f"{str(weight_source)!r}: " + ", ".join(parts) + " MiB; boots "
+                 + ", ".join(by_boot))
+
+
+def p_dormant_from_records(
+    recs: Optional[Sequence[Dict[str, object]]], cards: Sequence[Card], weight_source: str,
+    n: int = P_DORMANT_EXPECT_N,
+) -> Tuple[Optional[Dict[str, int]], str]:
+    """Group P's measured dormant residue for D's expectation budget
+    (:func:`dormant_max_from_records` over group-P records)."""
+    return dormant_max_from_records(recs, cards, weight_source, n, group="P")
+
+
+D_RESERVE_RECORD_ENV = "SGLANG_WEG2_D_RESERVE_RECORD_MAX"
+
+
+def d_reserve_from_records_or_census(
+    cards: Sequence[Card], dc_expect_d: Mapping[str, int], census_reserve: Mapping[str, int],
+    d_max: Optional[Mapping[str, int]], slack_mib: int, record_priced: bool,
+) -> Tuple[Dict[str, int], List[str]]:
+    """Group D's dormant-residue RESERVE per card on the census-priced profile
+    (Next Flash): what P's budget subtracts, the front's ``--dc-reserve`` and
+    the W19 bolt at D's first sleep grade.
+
+    With D records of this identity and form (``d_max`` = per-card maximum over
+    the newest boots, :func:`dormant_max_from_records`): that maximum +
+    :data:`DC_RECORD_MARGIN_MIB` + slack -- the same margin the single #1444
+    record carried. The census is only reported. Before (still without
+    records): per card the larger of the newest record and the xchg census.
+    rc12z30r3: census 1140/1538 (nvml0/2) against D records 612-680, so P's
+    budget carried ~460/860 MiB per 3080 for a D residue that was never there
+    -- VRAM that belongs to P's resident experts. The fnFL2x111 lesson (an
+    OLDER census undercut a NEWER record -> W19) holds: a maximum of recent
+    same-form measurements, never a single low sample.
+    ``SGLANG_WEG2_D_RESERVE_RECORD_MAX=0`` keeps the old rule."""
+    out = dict(dc_expect_d)
+    won: List[str] = []
+    use_max = (d_max is not None
+               and os.environ.get(D_RESERVE_RECORD_ENV, "1").strip() != "0")
+    for c in cards:
+        if c.uuid not in census_reserve:
+            continue
+        census = int(census_reserve[c.uuid])
+        if use_max:
+            out[c.uuid] = int(d_max[c.uuid]) + DC_RECORD_MARGIN_MIB + int(slack_mib)
+            won.append(f"nvml{c.nvml_index}=record-max({out[c.uuid]}; census {census} reported)")
+            continue
+        record = int(dc_expect_d[c.uuid]) if record_priced else 0
+        if record > census:
+            out[c.uuid] = record
+            won.append(f"nvml{c.nvml_index}=record({record})>census({census})")
+        else:
+            out[c.uuid] = census
+            won.append(f"nvml{c.nvml_index}=census({census})>=record({record})")
+    return out, won
+
+
+def d_expect_dormant_other(
+    cards: Sequence[Card], dc_expect_d: Mapping[str, int],
+    p_recs: Optional[Sequence[Dict[str, object]]], weight_source: str, profile: Optional[str],
+) -> Tuple[Dict[str, int], str]:
+    """``dormant_other`` of group D's EXPECTATION budget (the map pass and the
+    dry pass, both before P has slept): what group P leaves on each card
+    while D runs.
+
+    Before (and still on every profile whose D residue is not census-priced,
+    i.e. the 27B, whose dormant_other IS its resident draft): D's own dormant
+    reserve moved by the window difference, ``dc_expect_d + P_WINDOWS_MIB -
+    D_WINDOWS_MIB`` -- D's residue standing in for P's. rc12z30r3 (29.09.,
+    Next Flash, token cut): that booked 2054/1188/1586 MiB (nvml1/0/2) where
+    P's measured residue was 1252-1326/646-718/630-980; the map pass solved
+    the D form (S3f ownership, FR_D, scratch) 540-960 MiB per card short, and
+    the real pass could not raise it any more (the map is built from it), so
+    the gap sat free all run.
+
+    A profile whose row sets ``d_expect_from_p_records`` (Next Flash; the
+    27B since 29.09. -- its legacy term booked ~2.1 GiB on the 5090 against
+    a measured P residue of 1104-1240 MiB) with same-identity group-P
+    records: the maximum of P's measured residue over the newest
+    ``P_DORMANT_EXPECT_N`` boots (:func:`p_dormant_from_records`). Anything
+    else: the legacy term, with the reason named. The switch is its own
+    registry field, not ``d_residue_census`` (the reserve question).
+    ``SGLANG_WEG2_D_EXPECT_P_RECORD=0`` forces the legacy term.
+
+    DANGER DIRECTION (P holds more after serving than the records say): the
+    real pass prices the launcher's own reading after P's sleep, and the
+    pinned form is CHECKED against that budget in ``log_d_rank_vram_solve``
+    -- the scratch is capped to the planner's edge (named), and a form that
+    still does not fit is refused by name (W122 ``Weg2LaunchRefused``), never
+    started into an OOM. ``D-EXPECT CHECK`` names each card's difference."""
+    legacy = {c.uuid: int(dc_expect_d[c.uuid]) + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}
+    if not d_expect_from_p_records(profile):
+        why = "legacy (profile's dormant_other is D's reserve + windows)"
+    elif os.environ.get(P_DORMANT_EXPECT_ENV, "1").strip() == "0":
+        why = f"legacy ({P_DORMANT_EXPECT_ENV}=0)"
+    else:
+        meas, why = p_dormant_from_records(p_recs, cards, weight_source)
+        if meas is not None:
+            vram_view().note_asleep("P", cards, meas, f"RECORD({why})")
+            return meas, why
+        why = f"legacy (UNMEASURED: {why})"
+    vram_view().note_asleep("P", cards, legacy, f"MODEL(dc_expect_d + windows; {why})")
+    return legacy, why
+
+
+def d_expect_check_lines(cards: Sequence[Card], expected: Optional[Mapping[str, int]],
+                         dc_p: Mapping[str, int]) -> List[str]:
+    """The real pass, after P's sleep: P's measured residue against what the
+    expectation priced, per card. ``[]`` when no expectation was priced here.
+    UNDER means the pinned D form gets less than it was solved for -- the
+    solve that follows caps the scratch or refuses (W122) by name."""
+    if not expected:
+        return []
+    parts = []
+    for c in cards:
+        e, m = int(expected.get(c.uuid, 0)), int(dc_p.get(c.uuid, 0))
+        parts.append(f"nvml{c.nvml_index} P real {m} vs expectation {e} MiB "
+                     f"({'UNDER by ' + str(m - e) if m > e else 'ok, ' + str(e - m) + ' spare'})")
+    return ["D-EXPECT CHECK (after P's sleep): " + "; ".join(parts)]
+
+
 def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     """Group D's MEASURED dormant residue for this card, on THIS form.
 
@@ -465,19 +691,32 @@ def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     """
     name = str(getattr(card, "name", ""))
     xchg = str(weight_source) == WEIGHT_SOURCE_EXCHANGE
-    # UNIFY S3: the published profile's row (weg2/form.py), not the 27B alias.
-    xchg_triple = _pconst("DC_MEASURED_D_XCHG_MIB")
-    if "5090" in name:
-        return xchg_triple[1] if xchg else _pconst("DC_MEASURED_D_5090_MIB")
-    if "3080" in name:
-        return xchg_triple[0] if xchg else _pconst("DC_MEASURED_D_3080_MIB")
+    # HW-GENERIC 1002: selected by CALIBRATION CLASS (model + arch + VRAM
+    # tier, weg2/card_identity.py), never by a name substring -- a 10 GB RTX
+    # 3080 used to borrow the 20 GB card's residue here.
+    cls = card_identity.calibration_class(card)
+    sel = DC_MEASURED_D_BY_CLASS.get(cls or "")
+    if sel is not None:
+        # UNIFY S3: the published profile's row (weg2/form.py), not the 27B alias.
+        const_name, xchg_index = sel
+        return _pconst("DC_MEASURED_D_XCHG_MIB")[xchg_index] if xchg else _pconst(const_name)
     raise Weg2LaunchRefused(
-        f"W19 dormant-residue reserve: board {name!r} (nvml"
-        f"{getattr(card, 'nvml_index', '?')}) is named by neither DC_MEASURED_D_* "
-        "nor DC_MEASURED_D_XCHG_* -- both triples are measurements of this rig's "
-        "1x5090 + 2x3080 inventory, and a third model's dormant residue is not a "
-        "property either of them has.  Measure it, do not borrow it."
+        f"W19 dormant-residue reserve ({card_identity.CODE_UNCALIBRATED}): board {name!r} (nvml"
+        f"{getattr(card, 'nvml_index', '?')}, {card_identity.card_key(card)}) belongs to no "
+        "calibrated class of DC_MEASURED_D_* / DC_MEASURED_D_XCHG_* (measured on: "
+        + ", ".join(sorted(DC_MEASURED_D_BY_CLASS)) + ") -- a third card's dormant residue "
+        "is not a property either of them has.  Measure it, do not borrow it."
     )
+
+
+#: HW-GENERIC 1002: calibration class -> (the record constant of the serving
+#: form, the index into DC_MEASURED_D_XCHG_MIB of the exchange form). The
+#: xchg triple is in NVML order of the reference rig (nvml0 3080, nvml1 5090,
+#: nvml2 3080): the 5090 reads index 1, both 3080s read index 0 -- as before.
+DC_MEASURED_D_BY_CLASS = {
+    "RTX5090": ("DC_MEASURED_D_5090_MIB", 1),
+    "RTX3080": ("DC_MEASURED_D_3080_MIB", 0),
+}
 #: Flags that only make sense while barlink owns the group's collectives.
 #: Each takes a value except the bare --barlink itself.
 BARLINK_FLAGS_WITH_VALUE = (
@@ -833,9 +1072,11 @@ DFLASH_PRODUCE_ENV = "SGLANG_WEG2_DFLASH_PRODUCE"
 #: ``--enable-linear-replayssm-spec``: its GDN target verify runs the compact
 #: spec ring instead of per-draft intermediate states, and the freed
 #: "speculative intermediate state" post goes to D's KV pool (27B desk, not an
-#: NF value: -0.41 GiB post / +0.41 GiB KV per rank at 18/6 heads, mrr 2). OFF
-#: BY DEFAULT until the metal gate (see d_replayssm_spec_line) has passed -- off
-#: leaves argv_d and the D pricing byte-identical. P never gets it: P runs no
+#: NF value: -0.41 GiB post / +0.41 GiB KV per rank at 18/6 heads, mrr 2). The
+#: CODE default (no registry row) is off -- off leaves argv_d and the D pricing
+#: byte-identical; the booted profile's row (``ModelProfile.replayssm``, both
+#: rows True since the metal: 27B xsn436, NF x172/x174) sets it for an unset
+#: flag (apply_profile_arg_defaults, 29.09.). P never gets it: P runs no
 #: target verify.
 D_REPLAYSSM_SPEC_DEFAULT = "off"
 _SPEC_FORM: Dict[str, object] = {
@@ -1357,9 +1598,34 @@ _P_CHUNK: Dict[str, object] = {"policy": P_CHUNK_POLICY_DEFAULT, "spec": None, "
 #: model is used as calibrated (spec byte-identical); only warning lines added.
 P_POWER_SCALE_DEFAULT = "off"
 P_POWER_SCALE_LAWS = ("off", "linear", "power")
-#: The card class of each P stage: PP0 on the 5090, PP1/PP2 on the 3080s
-#: (order_cards; the builtin/fit models name no cards).
-P_STAGE_CARD_CLASSES = ("RTX5090", "RTX3080", "RTX3080")
+#: The card class of each P stage OF THE CALIBRATION RIG the builtin chunk
+#: model was fitted on (PP0 on the 5090, PP1/PP2 on the 3080s) -- a property
+#: of that RECORD, not of the live rig. HW-GENERIC 1002: the live stages'
+#: classes come from :func:`p_stage_live_classes` (order_cards + card
+#: identity); a stage whose live class differs from its calibration class is
+#: named by :func:`p_stage_class_mismatch_lines`.
+P_STAGE_CARD_CLASSES = card_identity.REFERENCE_INVENTORY
+
+
+def p_stage_live_classes(stages: int) -> List[Optional[str]]:
+    """The live calibration-class label of each P stage (``order_cards``
+    order); ``None`` per stage when NVML cannot answer (never refuses)."""
+    try:
+        cards = order_cards(resolve_cards())
+    except Exception:  # noqa: BLE001 - a label, never a boot blocker
+        return [None] * stages
+    return [card_identity.class_label(cards[r]) if r < len(cards) else None for r in range(stages)]
+
+
+def p_stage_class_mismatch_lines(stages: int, live: Optional[Sequence[Optional[str]]] = None) -> List[str]:
+    """One line per P stage whose live card class is not the class the
+    builtin/fitted chunk model was calibrated on (the power comparison of
+    row 27 is then between different cards: UNCALIBRATED, named)."""
+    live = list(p_stage_live_classes(stages) if live is None else live)
+    cal = list(P_STAGE_CARD_CLASSES[:stages]) + [P_STAGE_CARD_CLASSES[-1]] * max(0, stages - 3)
+    return [f"P-STAGE-CLASS PP{r}: live {lv} vs calibration {cv} -- the chunk model's timings and "
+            f"power limit are a measurement of {cv}, not of this card ({card_identity.CODE_UNCALIBRATED})"
+            for r, (lv, cv) in enumerate(zip(live, cal)) if lv is not None and lv != cv]
 
 
 def p_chunk_model_power_limits(src: str, stages: int) -> Tuple[Optional[List[Optional[float]]], str]:
@@ -1419,7 +1685,7 @@ def p_stage_power_current(stages: int) -> Tuple[List[Optional[float]], List[str]
         c = cards[r] if r < len(cards) else None
         w = cur.get(c.uuid, (None, ""))[0] if c is not None else None
         vals.append(None if w is None else float(w))
-        labels.append(f"PP{r}" + (f"(nvml{c.nvml_index} {_pl.card_class(c.name)})" if c is not None else ""))
+        labels.append(f"PP{r}" + (f"(nvml{c.nvml_index} {card_identity.class_label(c)})" if c is not None else ""))
     return vals, labels
 
 
@@ -1439,6 +1705,10 @@ def apply_p_power_check(ns, models, source: str, src: str):
     cur, labels = p_stage_power_current(n)
     verdicts = _pl.check(labels, cal or [None] * n, cur, law, alpha)
     lines = _pl.verdict_lines("p-chunk-model", verdicts, law, alpha, cal_src)
+    # HW-GENERIC 1002: a stage on another card class than the model's
+    # calibration stage is named beside the power verdicts (empty on the
+    # reference rig).
+    lines = list(lines) + p_stage_class_mismatch_lines(n)
     _P_CHUNK["power_lines"] = tuple(lines)
     if not any(v.factor != 1.0 for v in verdicts):
         return models, source
@@ -2013,6 +2283,23 @@ def d_reshard_env() -> Dict[str, str]:
 D_GC_FREEZE_DEFAULT = "off"
 
 
+def apply_p_gc_warn_default(ns) -> Optional[str]:
+    """30.09. (NF y3z ep52: PP0 stood still 5.4 s process-wide at the first
+    tag of P's sleep; a gen-2 GC is one candidate): group P's schedulers arm
+    the GC warning at 0.5 s by default -- ``SGLANG_WEG2_GC_WARN_SECS`` into
+    ``ns.env_p`` unless --env-p states it (=0 turns it off). Returns the line
+    naming it, or None."""
+    from sglang.srt.weg2 import gc_instrument as _gci
+
+    env_p = str(getattr(ns, "env_p", "") or "")
+    if _gci.WARN_ENV in parse_group_env(env_p):
+        return None
+    ns.env_p = set_group_env(env_p, _gci.WARN_ENV, f"{_gci.P_GC_WARN_DEFAULT_S:g}")
+    return (f"WEG2-GC P warn: --env-p {_gci.WARN_ENV}={_gci.P_GC_WARN_DEFAULT_S:g} (every P "
+            f"scheduler logs a GC collection over {_gci.P_GC_WARN_DEFAULT_S:g} s after boot; "
+            f"--env-p {_gci.WARN_ENV}=0 = off)")
+
+
 def d_gc_env(ns) -> Dict[str, str]:
     from sglang.srt.weg2 import gc_instrument as _gci
 
@@ -2389,19 +2676,22 @@ def d_replayssm_spec_line() -> str:
     the ON arm must pass before it may become the default."""
     if not d_replayssm_spec():
         return (
-            "WEG2 D-REPLAYSSM-SPEC: off -- STANDARD FORM: group D's GDN target "
-            "verify writes per-draft intermediate states (the 'speculative "
-            "intermediate state' post); --d-replayssm-spec on is the A/B arm"
+            "WEG2 D-REPLAYSSM-SPEC: off -- group D's GDN target verify writes "
+            "per-draft intermediate states (the 'speculative intermediate state' "
+            "post); explicit --d-replayssm-spec off, or a registry row without "
+            "replayssm"
         )
     accept = "DFLASH" if spec_form_is_dflash() else "MTP (NEXTN)"
     return (
-        "WEG2 D-REPLAYSSM-SPEC: on -- A/B ARM, METAL GATE PENDING: group D runs "
+        "WEG2 D-REPLAYSSM-SPEC: on -- METAL GATE PASSED (27B xsn436 D-KV +21/+13 %, "
+        "NF x172/x174), the registry row's form (replayssm) unless the flag says "
+        "off: group D runs "
         f"--enable-linear-replayssm-spec (ring L={d_replayssm_spec_ring_len()}, "
         f"verify window {d_verify_window()}, fold every commit, bf16 checkpoint "
         "with hi/lo compensation). Expect in D's log: 'GDN ReplaySSM SPEC ring "
         "allocated' and 'ReplaySSM spec ring: 'speculative intermediate state' "
         "priced at ...' per rank, the KV budget posts line with the smaller post, "
-        "and a smaller 'Mamba Cache is allocated' line. Gate before any default: "
+        "and a smaller 'Mamba Cache is allocated' line. The gate it passed: "
         f"{accept} acceptance length vs the off arm, needle MATCH at 262k, greedy "
         "A/B on fixed prompts (first tokens identical, logprob drift), a 4-8k "
         "token generation without degeneration."
@@ -2557,6 +2847,493 @@ def apply_d_seat_expert_rows(ns, er, rows, seat_vram, label) -> List[str]:
             % (head, item, fixed_txt)]
 
 
+#: #251c: the --env-d keys of D's KV stage form (the launcher's form values)
+D_KV_STAGE_KEYS = ("SGLANG_WEG2_D_KV_STAGE_TOKENS", "SGLANG_WEG2_D_KV_STAGE_ROWS",
+                   "SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS")
+#: #251d: the operator's switch -- the stage follows the wake's demand alone
+D_KV_STAGE_BY_DEMAND_KEY = "SGLANG_WEG2_D_KV_STAGE_BY_DEMAND"
+#: #239 S3g: the stage rows per D rank under the token cut (every KV rank)
+D_KV_STAGE_ROWS_BY_RANK_KEY = "SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK"
+
+
+def d_kv_stage_tokens_named(ns) -> Optional[Tuple[int, ...]]:
+    """#239 S3h: the KV stage tokens the operator names in --env-d
+    (``SGLANG_WEG2_D_KV_STAGE_TOKENS``), or None when the D group's env does
+    not name them (the launcher would then write its own stage form)."""
+    raw = parse_group_env(str(getattr(ns, "env_d", "") or "")).get(D_KV_STAGE_KEYS[0])
+    if raw is None:
+        return None
+    try:
+        return tuple(int(float(x)) for x in str(raw).split(",") if x.strip())
+    except ValueError:
+        return ()
+
+
+#: 29.09.: the lowest KV stage and the step of the stages below the booked S0
+D_KV_STAGE_FLOOR_KEY = "SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS"
+
+
+def d_kv_stage_floor_tokens(env: Mapping[str, str]) -> int:
+    """29.09. (Nutzer 12:35Z, Grundgesetz): the floor stage below S0 in tokens --
+    stages floor, 2 x floor, ... below the booked S0 (0 = none, byte-identical).
+    The D group's env wins over the environ default."""
+    raw = (env or {}).get(D_KV_STAGE_FLOOR_KEY)
+    if raw is None:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS.get() or 0))
+    try:
+        return max(0, int(float(str(raw).strip() or 0)))
+    except ValueError:
+        return 0
+
+
+def d_kv_stage_by_demand(env: Mapping[str, str]) -> bool:
+    """#251d: SGLANG_WEG2_D_KV_STAGE_BY_DEMAND in the D group's env; a D env that
+    does not name it gets the rank's own default (environ.py, ON since 29.09.),
+    so the launcher prices the form the rank will run."""
+    raw = (env or {}).get(D_KV_STAGE_BY_DEMAND_KEY)
+    if raw is None:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.get())
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def kv_stage_wave_cap(ns, er, tab, max_by: Sequence[int], env: Mapping[str, str],
+                      head: str) -> Tuple[Optional[int], List[str]]:
+    """#251d: the overflow-wave cap the captured decode steps need under the
+    highest stage per seat count ``max_by``. A form that lowers a batch's
+    capture floor adds waves (``tab.extra_waves``); the step needs
+    max(``tab.capture_waves``) of them, and below that its own bound refuses
+    the capture on TP0 ('Step ids exceed the LRU rows plus the staging rows')
+    -- rc12z22's SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES=2 against 3 for S1 at
+    n=5/6. The launcher's own cap (derived, or not written at all) is raised;
+    a cap told in --env-d is refused by name (W169). (None, []) = nothing to
+    change: no extra wave, or the cap already carries it (the default table
+    adds none)."""
+    if not any(int(e) > 0 for e in tab.extra_waves(max_by)):
+        return None, []
+    need = max(tab.capture_waves(max_by))
+    have = er.pool_overflow_waves(env)
+    if need <= have:
+        return None, []
+    if er.POOL_OVERFLOW_WAVES_ENV in env and not getattr(ns, "d_pool_waves_derived", False):
+        raise Weg2DKvStageWavesRefused(
+            "W169 Weg2DKvStageWavesRefused: die Stufenform (hoechste Stufe je Sitzzahl %s) "
+            "braucht %d Ueberlaufwellen je bs %s, --env-d nennt %s=%s -- der Capture "
+            "verweigerte auf TP0 ('Step ids exceed ...'); keine Stufenform geschrieben"
+            % (list(max_by), need, list(tab.capture_waves(max_by)),
+               er.POOL_OVERFLOW_WAVES_ENV, env.get(er.POOL_OVERFLOW_WAVES_ENV)))
+    return need, ["%s: WELLEN (#251d) %s %d -> %d (Launcher-Ableitung): die Stufenform senkt "
+                  "den Capture-Floor, Wellen je bs %s statt %s -- ohne die Anhebung verweigert "
+                  "der Capture auf TP0" % (head, er.POOL_OVERFLOW_WAVES_ENV, have, need,
+                                          list(tab.capture_waves(max_by)), list(tab.waves))]
+
+
+def rank_wave_floor(demand: Sequence[int], scratch_after: Sequence[int],
+                    capture_on: Sequence[int], waves: int) -> Tuple[List[str], List[int]]:
+    """#239 S3g floor, ONE formula for the planner and the rank: the captured
+    step of the cap's seats routes D_r = min(ids, E - R) ids over
+    C_r = LRU + staging (the scratch AFTER the stage rows moved into the seat
+    rows) + capture_on[r] (the seat/stage rows the capture counts ON: the
+    rank's capture floor where it has KV cells, #251c; 0 where it has none --
+    'seat rows ... OFF until a D phase funds them'), in at most ``waves``
+    waves: D_r <= waves x C_r on EVERY rank. Returns (one line per rank with
+    its air ``waves x C - D``, the ranks that break it)."""
+    lines, bad = [], []
+    for r, (d, c0, on) in enumerate(zip(demand, scratch_after, capture_on)):
+        c = int(c0) + int(on)
+        air = int(waves) * c - int(d)
+        lines.append("rang%d D %d <= %d x (%d + %d) = %d, Luft %d%s"
+                     % (r, int(d), int(waves), int(c0), int(on), int(waves) * c, air,
+                        "" if air >= 0 else " -- BRICHT"))
+        if air < 0:
+            bad.append(r)
+    return lines, bad
+
+
+def kv_stage_wave_floor(group, rows, fits, max_by: Sequence[int], waves_cap: int,
+                        head: str) -> List[str]:
+    """#239 S3g floor (rc12z30b 28.09. 20:09:07): ``rank_wave_floor`` over the
+    form the launcher writes. D_r from the seat table at the cap (ids of the
+    cap's seats, E - R of the rank); the scratch after the move (a KV rank
+    gives its stage rows to its seat rows); capture_on[r] = a KV rank's
+    capture floor at the cap's batch (rows + seat extra - the stage rows of
+    the highest stage the cap may take, as ``d_seat_vram.capture_floors``),
+    0 on every rank without a stage table (no KV, no cells, no floor). A
+    rank given stage rows the plan stages no KV for is refused as well: its
+    runtime would build no cells and count them OFF. Refuses by name (W171)
+    before any rank is launched; the lines name each rank's air."""
+    last = rows[-1]
+    n = len(last.scratch_given)
+    staged = {int(t.host_rank): t for t in group.tables}
+    fit_by = {int(f.rank): f for f in fits}
+    cap = len(rows)
+    demand, after, on = [], [], []
+    for r in range(n):
+        c = int(last.scratch_given[r])
+        f = fit_by.get(r)
+        E = int(f.local_experts) if f is not None else 0
+        demand.append(min(int(last.ids_per_step), max(E - (int(last.max_rows[r]) - c), 0)))
+        t = staged.get(r)
+        if t is None:
+            after.append(c)
+            on.append(0)
+            continue
+        # the scratch the rank RUNS (SGLANG_MOE_SCRATCH_SLOTS as written:
+        # the low rows a floor ladder funds are NEW bank rows, only the rest
+        # leaves the scratch) = its 'C=LRU+staging'; on = its capture floor,
+        # the rows of the cap's top stage -- the two numbers the rank's H95
+        # line prints (y6n TP2: 46 + 0, where the old split read 38 + 9)
+        a = c - (int(t.rows) - int(getattr(t, "low_rows", 0) or 0))
+        after.append(a)
+        j = min(int(max_by[cap - 1]), len(t.tokens) - 1)
+        on.append(int(t.capacity[cap - 1][j]) - a)
+    lines, bad = rank_wave_floor(demand, after, on, int(waves_cap))
+    # the smaller batches of a KV rank: its floor can sit lower (a stage the
+    # cap never takes) -- the table's per-batch waves, the same floor rule
+    bad += [r for r, t in sorted(staged.items())
+            if r not in bad and max(t.capture_waves(max_by)) > int(waves_cap)]
+    host = int(group.host.host_rank)
+    orphan = [r for r in staged if r != host and er_trim_cell(fit_by.get(r), host) <= 0]
+    if bad or orphan:
+        raise Weg2DKvStageWavesRefused(
+            "W171 Weg2DKvStageWavesRefused: Wellenboden je D-Rang gebrochen %s%s -- %s; "
+            "keine Stufenform geschrieben"
+            % (["rang%d" % r for r in bad],
+               " / Stufenzeilen ohne KV auf %s" % (["rang%d" % r for r in orphan],)
+               if orphan else "", "; ".join(lines)))
+    return ["%s: WELLENBODEN JE RANG (#239 S3g-Boden, D <= W x (LRU+Staging+Capture-Boden)) %s"
+            % (head, "; ".join(lines))]
+
+
+D_KV_STAGE_LRU_FLOOR_ENV = "SGLANG_WEG2_D_KV_STAGE_LRU_FLOOR"
+D_KV_STAGE_LRU_FLOOR_MARKER = "LRU-UNTERGRENZE (#251c, gemessener Spitzenbedarf)"
+#: re-solves the floor may ask for in one pass (the second one checks the first)
+D_KV_STAGE_LRU_FLOOR_ROUNDS = 2
+
+
+def d_pool_peak_record(profile: Optional[str] = None
+                       ) -> Tuple[Optional[List[int]], Optional[List[int]], str]:
+    """``D_POOL_PEAK_NONRES_ROWS`` (the measured maximum of the MOE-POOL-DEMAND
+    ``max_nonres_per_step`` per D rank) with ``D_POOL_PEAK_NONRES_SPAN_ROWS``
+    (E - R of the form it was measured on), or ``(None, None, "")`` -- no
+    floor, the stage solve stays byte-identical (27B has no such record)."""
+    try:
+        peak = [int(v) for v in _pconst("D_POOL_PEAK_NONRES_ROWS", profile)]
+        span = [int(v) for v in _pconst("D_POOL_PEAK_NONRES_SPAN_ROWS", profile)]
+    except (KeyError, TypeError, ValueError):
+        return None, None, ""
+    if not peak or len(peak) != len(span):
+        return None, None, ""
+    return peak, span, _pconst_boots("D_POOL_PEAK_NONRES_ROWS", profile)
+
+
+def kv_stage_lru_floor(group, rows, fits, max_by: Sequence[int], peak: Sequence[int],
+                       span: Sequence[int], source: str, head: str
+                       ) -> Tuple[Dict[int, int], List[str]]:
+    """(3) 29.09.: the measured peak pool demand as the LRU floor of the stage
+    solve. A KV rank's stage rows are LRU rows in S0; a wake to S_j unmaps
+    ``stage_rows[j]`` of them. The wave rule prices the step at
+    min(b x verify x top_k, E - R) with waves -- the MEASURED peak of
+    non-resident ids per step (MOE-POOL-DEMAND, rc12z30r3: TP2 43 of C 48)
+    is the demand the extra wave hits. Floor per KV rank: the fewest rows any
+    allowed (n, stage) of the written form leaves (``capacity[n][max_by[n]]``)
+    >= the peak, scaled from the measured span E - R to this form's
+    (first order: the non-resident ids of a step grow with the non-resident
+    span). Short by d rows -> the scratch grows by ceil(d / (1 - p)) with
+    p = peak / span: a row moved from resident to scratch widens the span by
+    one row, so the need grows by p per row. Returns ({rank: rows to add},
+    lines); an empty dict when every KV rank holds its peak."""
+    last = rows[-1]
+    fit_by = {int(f.rank): f for f in fits}
+    cap = len(rows)
+    add: Dict[int, int] = {}
+    parts: List[str] = []
+    for t in group.tables:
+        r = int(t.host_rank)
+        if r >= len(peak) or r >= len(last.scratch_given):
+            continue
+        f = fit_by.get(r)
+        E = int(f.local_experts) if f is not None else 0
+        C = int(last.scratch_given[r])
+        span_now = max(E - (int(last.max_rows[r]) - C), 0)
+        p = min(float(peak[r]) / int(span[r]), 1.0) if int(span[r]) > 0 else 1.0
+        need = min(int(math.ceil(p * span_now - 1e-9)), span_now, int(last.ids_per_step))
+        j_by = [min(int(max_by[i]), len(t.tokens) - 1) for i in range(cap)]
+        lru = min(int(t.capacity[i][j_by[i]]) for i in range(cap))
+        text = ("rang%d Spitze %d bei Spanne %d -> Bedarf %d bei Spanne %d (E %d - R %d), "
+                "LRU bis S%d min %d" % (r, int(peak[r]), int(span[r]), need, span_now, E,
+                                        E - span_now, max(j_by), lru))
+        if need > lru:
+            k = int(math.ceil((need - lru) / max(1.0 - p, 0.05) - 1e-9))
+            add[r] = k
+            text += " < %d -> Scratch +%d (Bedarf +%.3f je Zeile)" % (need, k, p)
+        else:
+            text += " >= %d, haelt" % need
+        parts.append(text)
+    return add, ["%s: %s (%s aus %s): %s" % (
+        head, D_KV_STAGE_LRU_FLOOR_MARKER, "D_POOL_PEAK_NONRES_ROWS", source or "Record",
+        "; ".join(parts) or "kein KV-Rang")]
+
+
+def er_trim_cell(fit, host_rank: int) -> int:
+    """The planner's trim cell of a fit (0 without one)."""
+    if fit is None:
+        return 0
+    from sglang.srt.planner import expert_residency as er
+
+    return int(er.kv_stage_trim_cell(fit, host_rank))
+
+
+def operator_kv_stage_max(raw: Optional[str], cap: int, stages: int) -> Optional[Tuple[int, ...]]:
+    """The operator's highest stage per seat count, or None when --env-d does
+    not name it. Refuses by name what the table cannot take."""
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        vals = tuple(int(x) for x in str(raw).split(",") if x.strip())
+    except ValueError:
+        vals = ()
+    if len(vals) != int(cap) or any(v < 0 or v >= int(stages) for v in vals):
+        raise Weg2DKvStageMaxRefused(
+            "W168 Weg2DKvStageMaxRefused: --env-d %s=%s passt nicht zur Stufentabelle "
+            "(%d Sitzzahlen, Stufen 0..%d) -- keine Stufenform geschrieben"
+            % (D_KV_STAGE_KEYS[2], raw, int(cap), int(stages) - 1))
+    return vals
+
+
+def _drop_group_env(spec: str, key: str) -> str:
+    return ";".join(x for x in str(spec or "").split(";")
+                    if x.strip() and x.split("=", 1)[0].strip() != key)
+
+
+def _rank_vec(raw: Optional[str], n: int) -> List[int]:
+    vals = [int(float(x)) for x in str(raw or "").split(",") if x.strip()]
+    if len(vals) == 1:
+        vals = vals * n
+    return (vals + [0] * n)[:n] if vals else [0] * n
+
+
+def kv_stage_cut_workers(kv_token_shares, host_rank: int = 0) -> List[int]:
+    """#239 S3g (28.09.): the D ranks other than the attention host that hold
+    full-attention KV under the token cut -- every worker with a share > 0,
+    and (a cut the planner still solves: 'owned', 'maxmin', 'joint') every
+    worker, since any of them may get one. [] without a cut."""
+    if kv_token_shares is None:
+        return []
+    if isinstance(kv_token_shares, str):
+        vec = None
+        if kv_token_shares.startswith("owned:"):
+            try:
+                vec = [float(x) for x in kv_token_shares[len("owned:"):].split(",") if x.strip()]
+            except ValueError:
+                vec = None
+        if vec is None:
+            return [-1]  # unsolved: some worker, not yet known which
+    else:
+        vec = [float(x) for x in kv_token_shares]
+    return [r for r, s in enumerate(vec) if r != int(host_rank) and float(s) > 0.0]
+
+
+def apply_d_kv_stage_form(ns, er, rows, seat_vram, plan, label, *, verify_tokens: int,
+                          top_k: int, host_rank: int = 0, kv_token_shares=None) -> List[str]:
+    """#251c: D's KV stage form into --env-d (before build_env reads it) --
+    the stage tokens, the stage rows (TP0 moves them from its scratch into its
+    seat rows: SGLANG_MOE_SCRATCH_SLOTS[0] - rows, SGLANG_WEG2_D_SEAT_EXPERT_ROWS
+    [0] + rows, so the boot maps the same bank) and the highest stage per seat
+    count (``expert_residency.kv_stage_table``, default: no extra wave).
+    An operator's SGLANG_WEG2_D_KV_STAGE_TOKENS wins (a single stage = off);
+    an operator's SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS replaces the default
+    highest stage per seat count (the A/B arm), checked against the table.
+    Returns the lines to log; ``d_kv_stage_undo`` reverses it for a second
+    solve pass."""
+    head = "%s FRACTION-SOLVE %s D-KV-STUFEN (#251c)" % (D_RANK_SOLVE_MARKER, label)
+    ns._d_kv_stage_lru_raise = None
+    env_raw = str(getattr(ns, "env_d", "") or "")
+    env = parse_group_env(env_raw)
+    if D_KV_STAGE_KEYS[0] in env:
+        return ["%s: --env-d nennt %s=%s selbst -- keine Stufenform vom Launcher"
+                % (head, D_KV_STAGE_KEYS[0], env[D_KV_STAGE_KEYS[0]])]
+    fits = list(getattr(plan, "fits", None) or ())
+    cut_workers = kv_stage_cut_workers(kv_token_shares, host_rank)
+    staged = [f.rank for f in fits
+              if f.rank != host_rank and er.kv_stage_trim_cell(f, host_rank) > 0]
+    missing = [r for r in cut_workers if r not in staged]
+    if missing:
+        # 28.09. (M1 prep): the stage form sizes EVERY rank's KV pool at the top
+        # stage (kv_stage_pool_tokens); a worker holding FA KV under the cut
+        # trims it only with its own stage rows (S3g), i.e. with its trim cell
+        # in the plan. A cut the plan does not carry per rank: no form.
+        return ["%s: entfaellt unter dem Token-Schnitt %s -- KV-haltende Worker %s ohne "
+                "Trim-Zelle im Plan bekaemen ihren FA-KV-Pool auf der obersten Stufe "
+                "ungetrimmt (Stufen je KV-Rang: S3g braucht den geloesten Schnitt); "
+                "D faehrt fest %s Token"
+                % (head, kv_token_shares, "(noch ungeloest)" if cut_workers == [-1]
+                   else "Rang %s" % ",".join(str(r) for r in cut_workers),
+                   next((int(f.kv_tokens) for f in fits if f.rank == host_rank),
+                        "die gebuchten"))]
+    why: List[str] = []
+    floor_tokens = d_kv_stage_floor_tokens(env)
+    group = er.kv_stage_group(rows, seat_vram, fits, verify_tokens=int(verify_tokens),
+                              top_k=int(top_k), host_rank=host_rank, why=why,
+                              floor_tokens=floor_tokens)
+    if group is None:
+        return ["%s: entfaellt -- %s" % (head, "; ".join(why) or "ohne Grund")]
+    tab = group.host
+    op_raw = env.get(D_KV_STAGE_KEYS[2])
+    op_max = operator_kv_stage_max(op_raw, len(tab.max_by_seats), len(tab.tokens))
+    max_by = group.max_by_seats if op_max is None else op_max
+    by_demand = d_kv_stage_by_demand(env)
+    if by_demand:
+        # #251d: no table -- every stage at every seat count (the rank does not
+        # read the row either; it is written so the capture line names it)
+        max_by = tuple(len(tab.tokens) - 1 for _ in tab.max_by_seats)
+    waves_to, waves_lines = kv_stage_wave_cap(ns, er, group, max_by, env, head)
+    # the cap the captured steps run with: the launcher's raise, else the
+    # H95 cap the seat table was solved at (the env the launcher derives)
+    waves_lines = waves_lines + kv_stage_wave_floor(
+        group, rows, fits, max_by,
+        int(waves_to) if waves_to is not None
+        else max(er.pool_overflow_waves(env), int(rows[-1].waves)), head)
+    # (3) 29.09.: the measured peak as the LRU floor of every allowed stage;
+    # a short rank gets its scratch raised and the solve runs again
+    # (log_d_rank_vram_solve), so FR_D moves the rows from resident to scratch
+    _peak, _span, _peak_src = d_pool_peak_record(getattr(ns, "profile", None))
+    if _peak is not None:
+        if os.environ.get(D_KV_STAGE_LRU_FLOOR_ENV, "1").strip() == "0":
+            waves_lines = waves_lines + ["%s: %s aus (%s=0)" % (
+                head, D_KV_STAGE_LRU_FLOOR_MARKER, D_KV_STAGE_LRU_FLOOR_ENV)]
+        else:
+            _add, _floor_lines = kv_stage_lru_floor(group, rows, fits, max_by, _peak, _span,
+                                                    _peak_src, head)
+            waves_lines = waves_lines + _floor_lines
+            ns._d_kv_stage_lru_raise = _add or None
+    n = len(rows[-1].scratch_given)
+    scratch = _rank_vec(env.get("SGLANG_MOE_SCRATCH_SLOTS"), n)
+    seat_raw = env.get("SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
+    seat = _rank_vec(seat_raw, n)
+    # every KV rank moves its stage rows from its scratch into its seat rows;
+    # the rows a floor below S0 funds (low_rows) are NEW rows of the bank (the
+    # KV they replace is born unmapped), so only the rest leaves the scratch
+    for t in group.tables:
+        scratch[t.host_rank] -= t.rows - int(getattr(t, "low_rows", 0) or 0)
+        seat[t.host_rank] += t.rows
+    items = {
+        "SGLANG_MOE_SCRATCH_SLOTS": ",".join(str(x) for x in scratch),
+        "SGLANG_WEG2_D_SEAT_EXPERT_ROWS": ",".join(str(x) for x in seat),
+        D_KV_STAGE_KEYS[0]: ",".join(str(t) for t in tab.tokens),
+        D_KV_STAGE_KEYS[1]: str(tab.rows),
+        D_KV_STAGE_KEYS[2]: ",".join(str(j) for j in max_by),
+    }
+    worker_tabs = group.tables[1:]
+    if worker_tabs:
+        items[D_KV_STAGE_ROWS_BY_RANK_KEY] = ",".join(str(x) for x in group.rows_by_rank)
+    if waves_to is not None:
+        items[er.POOL_OVERFLOW_WAVES_ENV] = str(int(waves_to))
+    for k, v in items.items():
+        env_raw = set_group_env(env_raw, k, v)
+    ns.env_d = env_raw
+    vram_view().note_d_stages(group)
+    ns._d_kv_stage_written = {"host": host_rank, "rows": tab.rows, "seat_raw": seat_raw,
+                              "op_max": op_raw if op_max is not None else None,
+                              "worker_rows": {int(t.host_rank): int(t.rows)
+                                              for t in worker_tabs},
+                              "cut_workers": [int(r) for r in cut_workers]}
+    if waves_to is not None:
+        ns._d_kv_stage_written["waves_raw"] = env.get(er.POOL_OVERFLOW_WAVES_ENV)
+    caps = " ".join("n=%d:%s" % (i + 1, "/".join(str(c) for c in cs))
+                    for i, cs in enumerate(tab.capacity))
+    # the A/B candidate (main 28.09.): S1 wherever the default keeps S0 -- the
+    # waves it adds per bs, priced by the capture floor (not written)
+    cand = tuple(max(1, int(j)) if len(tab.tokens) > 1 else 0 for j in group.max_by_seats)
+    cand_extra = group.extra_waves(cand)
+    op_line = [] if op_max is None else [
+        "%s: OPERATOR %s=%s statt der Voreinstellung %s -- Zusatzwellen je bs %s "
+        "(Voreinstellung %s); im Rang: '#251 WAKE-RESHARD CAPTURE-FLOOR ... max_by_seats %s'"
+        % (head, D_KV_STAGE_KEYS[2], ",".join(str(j) for j in op_max),
+           ",".join(str(j) for j in group.max_by_seats), list(group.extra_waves(op_max)),
+           list(group.extra_waves(group.max_by_seats)), list(op_max))]
+    if by_demand:
+        op_line.append(
+            "%s: BEDARF (#251d) %s=1 -- keine Tabelle je Sitzzahl: jede Stufe %s bei jeder "
+            "Sitzzahl, der Wake nimmt die kleinste, die die KV-Tokens seiner Sitze haelt "
+            "(%s geschrieben, im Rang nicht gelesen%s); Zusatzwellen je bs %s in JEDER Phase "
+            "(auch S0) -- der Preis, den der A/B-Boot misst"
+            % (head, D_KV_STAGE_BY_DEMAND_KEY, list(tab.tokens), D_KV_STAGE_KEYS[2],
+               "" if op_max is None else ", Operator-Wert %s ersetzt" % op_raw,
+               list(group.extra_waves(max_by))))
+    op_line.extend(waves_lines)
+    if worker_tabs:
+        # #239 S3g: the stage rows of every KV rank, booked as residency in S0
+        op_line.extend(er.describe_kv_stage_residency(group, marker=D_RANK_SOLVE_MARKER,
+                                                      label=label))
+        op_line.append(
+            "%s: JE KV-RANG (#239 S3g) %s=%s -- hoechste Stufe je Sitzzahl = MIN ueber die "
+            "KV-Raenge %s (Host %s, %s); jeder Rang trimmt seine Voll-Attention-KV auf S0 und "
+            "schneidet am Wake seine eigenen Stufenzeilen"
+            % (head, D_KV_STAGE_ROWS_BY_RANK_KEY, items[D_KV_STAGE_ROWS_BY_RANK_KEY],
+               list(group.max_by_seats), list(tab.max_by_seats),
+               ", ".join("Rang %d %s" % (t.host_rank, list(t.max_by_seats))
+                         for t in worker_tabs)))
+    return [
+        "%s: --env-d %s (Stufen %s Tok, KV-Zelle %d B/Tok, Stufenzeile %.1f MiB: "
+        "S1..S%d nehmen %s Zeilen; TP0 Scratch %d -> %d, Sitzzeilen %s -> %s -- die "
+        "Stufenzeilen sind in S0 LRU-Zeilen, der Boot mappt dieselbe Bank)"
+        % (head, ";".join("%s=%s" % kv for kv in items.items()), list(tab.tokens),
+           tab.kv_cell_bytes, tab.row_mib, len(tab.tokens) - 1, list(tab.stage_rows[1:]),
+           tab.scratch, tab.scratch - tab.rows, seat_raw or "0",
+           items["SGLANG_WEG2_D_SEAT_EXPERT_ROWS"]),
+        "%s: hoechste Stufe je Sitzzahl %s (Voreinstellung ohne Zusatzwelle -- Variante B, "
+        "bis die Wellenmessung eine Zusatzwelle preist); Zeilen je (n, S0/S1/S2) %s gegen "
+        "den Bedarf %s; der Capture zaehlt je bs die wenigsten Zeilen, die eine erlaubte "
+        "Phase hat (#251 CAPTURE-FLOOR)" % (head, list(group.max_by_seats), caps,
+                                            list(tab.need)),
+        "%s: A/B-Kandidat Zwischenform (S1 bis zur Kappe) SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS=%s "
+        "-- Zusatzwellen je bs %s (Default: %s); nicht geschrieben, fuer --env-d im A/B"
+        % (head, ",".join(str(j) for j in cand), list(cand_extra),
+           list(group.extra_waves(group.max_by_seats))),
+    ] + op_line
+
+
+def d_kv_stage_undo(ns) -> None:
+    """#251c: take back this launcher's own stage form (a second solve pass
+    prices the bank as priced and writes the form again)."""
+    w = getattr(ns, "_d_kv_stage_written", None)
+    if not w:
+        return
+    vram_view().note_d_stages(None)
+    env_raw = str(getattr(ns, "env_d", "") or "")
+    env = parse_group_env(env_raw)
+    h, rows_ = int(w["host"]), int(w["rows"])
+    scratch = [int(float(x)) for x in env.get("SGLANG_MOE_SCRATCH_SLOTS", "").split(",")
+               if x.strip()]
+    given = {h: rows_}
+    given.update({int(r): int(x) for r, x in (w.get("worker_rows") or {}).items()})
+    if any(r < len(scratch) for r in given):
+        for r, x in given.items():
+            if r < len(scratch):
+                scratch[r] += x
+        env_raw = set_group_env(env_raw, "SGLANG_MOE_SCRATCH_SLOTS",
+                                ",".join(str(x) for x in scratch))
+    if w.get("seat_raw") is None:
+        env_raw = _drop_group_env(env_raw, "SGLANG_WEG2_D_SEAT_EXPERT_ROWS")
+    else:
+        env_raw = set_group_env(env_raw, "SGLANG_WEG2_D_SEAT_EXPERT_ROWS", str(w["seat_raw"]))
+    for k in D_KV_STAGE_KEYS + (D_KV_STAGE_ROWS_BY_RANK_KEY,):
+        env_raw = _drop_group_env(env_raw, k)
+    if w.get("op_max") is not None:  # the operator's value is not the launcher's to take back
+        env_raw = set_group_env(env_raw, D_KV_STAGE_KEYS[2], str(w["op_max"]))
+    if "waves_raw" in w:  # #251d: the wave cap this form raised goes back too
+        from sglang.srt.planner.expert_residency import POOL_OVERFLOW_WAVES_ENV
+
+        env_raw = (_drop_group_env(env_raw, POOL_OVERFLOW_WAVES_ENV) if w["waves_raw"] is None
+                   else set_group_env(env_raw, POOL_OVERFLOW_WAVES_ENV, str(w["waves_raw"])))
+    ns.env_d = env_raw
+    ns._d_kv_stage_written = None
+
+
 def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
     """H95: the D-FRACTION-SOLVE once per seat count n = 1..seats (the SAME
     ``plan_d_residency`` with ``seats=n`` -- seat_rebook re-books the posts;
@@ -2582,10 +3359,14 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
         if top_k <= 0:
             return []
 
+        plans = {}
+
         def plan_for(n):
-            return er.plan_d_residency(
-                **plan_kwargs, seats=n,
-                replayssm_spec=msgspec.structs.replace(form, max_running=n))
+            if n not in plans:
+                plans[n] = er.plan_d_residency(
+                    **plan_kwargs, seats=n,
+                    replayssm_spec=msgspec.structs.replace(form, max_running=n))
+            return plans[n]
 
         seat_vram = d_seat_vram_plan_form(ns, er, plan_kwargs, cfg, form)
         rows = er.seat_table(
@@ -2594,7 +3375,13 @@ def d_seat_table_lines(ns, er, plan_kwargs, label) -> List[str]:
         out = list(er.describe_seat_table(rows, marker=D_RANK_SOLVE_MARKER, label=label))
         if seat_vram is not None:
             out.extend(apply_d_seat_expert_rows(ns, er, rows, seat_vram, label))
+            out.extend(apply_d_kv_stage_form(
+                ns, er, rows, seat_vram, plan_for(int(seats)), label,
+                verify_tokens=int(form.draft_tokens), top_k=top_k,
+                kv_token_shares=plan_kwargs.get("kv_token_shares")))
         return out
+    except Weg2DKvStageMaxRefused:
+        raise  # the operator's A/B arm does not fit: named stop, not a quiet default
     except Exception as exc:  # noqa: BLE001 -- an informational table never kills a launch
         return ["%s FRACTION-SOLVE %s D-SITZE (H95) Tabelle entfaellt: %s: %s"
                 % (D_RANK_SOLVE_MARKER, label, type(exc).__name__, exc)]
@@ -3403,6 +4190,61 @@ P_PREFILL_ACTIVATION_RESERVE_MIB = 1024.0
 #: on PP2 draws 3.19 GiB (x118 02:36:24, and x145/x146 without a draft on P).
 P_PREFILL_TRANSIENT_SUPPORT = _p_card.P_TRANSIENT_SUPPORT_FNFL2
 
+#: #242: the profile's OWN measured prefill transient per P stage, MiB, at the
+#: chunk :data:`P_ACTIVATION_RECORD_CHUNK` (``profile_records_data/<profile>
+#: .json``). Where a profile carries it, the record REPLACES the builtin
+#: support point of that chunk (H94: RECORD > BUILTIN): the runtime's post
+#: (``P_PREFILL_TRANSIENT_ENV``) and the pool model book the SAME bytes per
+#: stage. The builtin point (fnFL2x118..x146, 3697/3287/3267) was taken with
+#: one sequence per chunk; the NF Dauerlauf of 28.09. packs two to five
+#: sequences into one 16k chunk, and PP0 then draws 4594 MiB while PP1/PP2 stay
+#: at 2945/2941 (planner definition peak - allocated, every WEG2-VRAM-PEAK
+#: chunk window of 15 boots).
+P_ACTIVATION_RECORD = "P_ACTIVATION_MIB"
+P_ACTIVATION_RECORD_CHUNK = 16384
+
+
+def p_activation_record(profile: Optional[str] = None) -> Tuple[Optional[Tuple[float, ...]], str]:
+    """``(P_ACTIVATION_MIB per P stage, 'boot ...')`` of ``profile``, or
+    ``(None, "")`` where the profile never measured it (27B today: its
+    support, env and pool model stay byte-identical)."""
+    try:
+        vals = tuple(float(v) for v in _pconst(P_ACTIVATION_RECORD, profile))
+    except KeyError:
+        return None, ""
+    return vals, _pconst_boots(P_ACTIVATION_RECORD, profile)
+
+
+def p_transient_support(profile: Optional[str] = None, *, card: bool = False):
+    """#242: the support table the launcher prices from -- the builtin one,
+    with the point at :data:`P_ACTIVATION_RECORD_CHUNK` replaced by the
+    profile's ``P_ACTIVATION_MIB`` record where it carries one.
+
+    ``card=True`` (the P-KARTE): the LARGER of the builtin point and the record
+    per stage. The card's reference K0 was normalised against the builtin point
+    of its own boots (fnFL2x163-165); a record BELOW it would hand the card
+    headroom its reference never had (PP1 lands at 86 MiB card free on the
+    metal of 28.09., the card predicts 1274), a record ABOVE it is a load state
+    the reference never saw (PP0 with two to five sequences in one chunk). Until
+    the card reference is re-measured on this form (--p-card-reference-logs),
+    only the second direction may reach it.
+    """
+    base = P_PREFILL_TRANSIENT_SUPPORT
+    rec, boots = p_activation_record(profile)
+    if rec is None or len(rec) != base.n_stages or P_ACTIVATION_RECORD_CHUNK not in base.chunks:
+        return base
+    points = []
+    for p in base.points:
+        if p.chunk != P_ACTIVATION_RECORD_CHUNK:
+            points.append(p)
+            continue
+        mib = tuple(max(a, b) for a, b in zip(p.mib, rec)) if card else tuple(rec)
+        source = "record %s (%s)" % (P_ACTIVATION_RECORD, boots or "no boots named")
+        if card:
+            source += " max builtin %s" % p.source
+        points.append(_p_card.TransientPoint(chunk=p.chunk, mib=mib, source=source))
+    return _p_card.TransientSupport(model=base.model, points=tuple(points))
+
 #: The runtime's residual post for exactly this transient
 #: (``model_runner_kv_cache_mixin.PREFILL_TRANSIENT_ENV``): a comma vector,
 #: MiB per rank, that the sizer subtracts from ``rest`` before the KV pool.
@@ -3411,12 +4253,13 @@ P_PREFILL_TRANSIENT_SUPPORT = _p_card.P_TRANSIENT_SUPPORT_FNFL2
 P_PREFILL_TRANSIENT_ENV = "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"
 
 
-def p_prefill_transient_vector_mib(chunk_tokens: int) -> Tuple[float, ...]:
+def p_prefill_transient_vector_mib(chunk_tokens: int, profile: Optional[str] = None) -> Tuple[float, ...]:
     """Group P's MEASURED prefill transient for ``chunk_tokens``, MiB per
     stage (#114, H41) -- linear between the measured support points; a chunk
-    outside them is REFUSED by name (W131), never extrapolated."""
+    outside them is REFUSED by name (W131), never extrapolated. #242: the
+    profile's ``P_ACTIVATION_MIB`` record replaces its support point."""
     try:
-        return _p_card.transient_vector_mib(P_PREFILL_TRANSIENT_SUPPORT, int(chunk_tokens))
+        return _p_card.transient_vector_mib(p_transient_support(profile), int(chunk_tokens))
     except _p_card.PChunkUnmeasured as exc:
         raise Weg2LaunchRefused(str(exc)) from None
 
@@ -3511,6 +4354,26 @@ def p_prefill_activation_reserve_mib(pinned: Optional[float], chunk_tokens: int)
     return max(
         float(P_PREFILL_ACTIVATION_RESERVE_MIB),
         max(p_prefill_transient_vector_mib(chunk_tokens)),
+    )
+
+
+def p_prefill_activation_reserve_by_stage_mib(
+    pinned: Optional[float], chunk_tokens: int, profile: Optional[str] = None
+) -> Tuple[float, ...]:
+    """#242: the pool model's activation post PER STAGE -- ``()`` (the scalar
+    of :func:`p_prefill_activation_reserve_mib` on every stage, 27B
+    byte-identical) unless the profile carries ``P_ACTIVATION_MIB``. Then each
+    stage books its own measured transient, at least the reference 1024 MiB,
+    exactly what the runtime books per rank from ``P_PREFILL_TRANSIENT_ENV``
+    (the PP-POOL-JOIN of the two is then a join of equal posts). A pinned
+    ``--pp-cut-activation-reserve-mib`` pins every stage."""
+    if pinned is not None or p_activation_record(profile)[0] is None:
+        return ()
+    if int(chunk_tokens) < P_PREFILL_TRANSIENT_SUPPORT.chunks[0]:
+        return ()
+    return tuple(
+        max(float(P_PREFILL_ACTIVATION_RESERVE_MIB), float(v))
+        for v in p_prefill_transient_vector_mib(chunk_tokens, profile)
     )
 
 
@@ -3790,6 +4653,25 @@ CALIBRATION_PREFIX_TOKENS = 4096
 #: is what makes the optimum a FUNCTION of the design prefix rather than a
 #: constant, and it is cited to its record rather than written as a literal.
 ATTN_ANCHOR_MS = 400.0
+#: HW-GENERIC 1002: the calibration class ATTN_ANCHOR_MS was measured on.
+ATTN_ANCHOR_CARD_CLASS = "RTX3080"
+
+
+def attn_anchor_stage(cards: Sequence["Card"]) -> int:
+    """The first P stage whose card is of :data:`ATTN_ANCHOR_CARD_CLASS`.
+    No such card: refused BY NAME (HW-UNCALIBRATED) -- the anchor is a
+    measurement of that class, and pricing another card's attention layer
+    with it would be a borrow."""
+    for i, c in enumerate(cards):
+        if card_identity.calibration_class(c) == ATTN_ANCHOR_CARD_CLASS:
+            return i
+    raise Weg2LaunchRefused(
+        f"{card_identity.CODE_UNCALIBRATED}: the P-cut deep attention anchor (--pp-cut-attn-anchor-ms, "
+        f"{ATTN_ANCHOR_MS:g} ms/layer) was measured on class {ATTN_ANCHOR_CARD_CLASS}; no P stage "
+        "carries that class (" + ", ".join(card_identity.class_label(c) for c in cards)
+        + "). Measure the anchor on this rig (a 262k-prefix chunk on the slowest stage) -- not borrowed.")
+
+
 ATTN_ANCHOR_PREFIX_TOKENS = 262144
 
 #: DESIGN DEPTH FALLBACK. When no boot log carries a prefill census the design
@@ -4078,6 +4960,511 @@ class Weg2LaunchRefused(RuntimeError):
     pass
 
 
+class Weg2DKvStageMaxRefused(Weg2LaunchRefused):
+    """#251c: the operator's SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS does not fit
+    the launcher's stage table (one entry per seat count 1..cap, each a stage
+    index of the table). Named, never quietly replaced by the default -- an
+    A/B arm that silently runs the other arm measures nothing."""
+
+
+class Weg2DKvStageWavesRefused(Weg2DKvStageMaxRefused):
+    """#251d: the stage form lowers a batch's capture floor below what the
+    overflow-wave cap told in --env-d serves -- the capture would refuse the
+    boot on TP0. Named here instead (a subclass, so d_seat_table_lines lets it
+    through like W168)."""
+
+
+class Weg2TokenCutNotWired(Weg2LaunchRefused):
+    """#239 S2: ``--d-kv-token-cut`` (form ``kv=qsa_forma_dcp``) is PLANNED
+    -- the D solve prices the token cut, the dry run prints it -- but the
+    runtime half is not built: a Form A worker attends nothing (seam F5, S3
+    wires the worker attention over its KV share). A real boot is refused
+    here, before any rank loads, instead of booting a KV split nobody reads.
+    """
+
+
+#: #239: the marker of the refusal and of the dry-run line.
+KV_TOKEN_CUT_MARKER = "#239 KV-TOKEN-SCHNITT"
+
+
+def d_kv_token_cut(ns):
+    """#239: what ``--d-kv-token-cut`` hands the D solve: ``None`` (off),
+    ``expert_residency.KV_TOKEN_CUT_MAXMIN`` / ``KV_TOKEN_CUT_JOINT`` (S2b), or
+    the stated ratio vector."""
+    from sglang.srt.planner import expert_residency as _er
+
+    raw = str(getattr(ns, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
+              or weg2_form.KV_TOKEN_CUT_OFF).strip()
+    if raw == weg2_form.KV_TOKEN_CUT_OFF:
+        return None
+    if raw in (_er.KV_TOKEN_CUT_MAXMIN, _er.KV_TOKEN_CUT_JOINT, _er.KV_TOKEN_CUT_OWNED):
+        return raw
+    if raw.startswith(_er.KV_TOKEN_CUT_OWNED_FORCED_PREFIX):
+        # #239 M1b: shares forced, ownership + FR_D solved by the planner
+        try:
+            _er.owned_cut_request(raw)
+        except ValueError as exc:
+            raise Weg2LaunchRefused(f"{KV_TOKEN_CUT_MARKER}: {exc}") from None
+        return raw
+    try:
+        vec = [float(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        vec = []
+    if not vec or any(x < 0 for x in vec) or sum(vec) <= 0:
+        raise Weg2LaunchRefused(
+            f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {raw!r} is neither "
+            f"{weg2_form.KV_TOKEN_CUT_OFF!r}, {_er.KV_TOKEN_CUT_MAXMIN!r}, "
+            f"{_er.KV_TOKEN_CUT_JOINT!r}, {_er.KV_TOKEN_CUT_OWNED!r} nor a ratio "
+            f"vector of the D ranks")
+    return tuple(vec)
+
+
+def d_kv_dtype_bytes(ns) -> int:
+    """#239: bytes per KV element on D -- ``--kv-cache-dtype`` of extra_d,
+    else the profile row's ``kv_dtype`` (fp8 = 1, anything else 2)."""
+    dtype = _argv_scalar(getattr(ns, "extra_d", ""), "--kv-cache-dtype") or ""
+    if not dtype:
+        row = weg2_form.profile_row(getattr(ns, "profile", "") or "")
+        dtype = str(getattr(row, "kv_dtype", "") or "") if row is not None else ""
+    return 1 if dtype.lower().startswith("fp8") else 2
+
+
+def refuse_unwired_token_cut(ns, boot_form) -> None:
+    """#239 S2/S3e: a real boot of ``kv=qsa_forma_dcp`` stops here, by name,
+    while a seam it stands on (``rank_role.TOKEN_CUT_SEAMS``) is unwired. The
+    refusal names the seams from the register, so it lifts when -- and only
+    when -- the last of them is marked built."""
+    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "dry_run", False):
+        return
+    from sglang.srt import rank_role
+
+    missing = rank_role.unwired_token_cut_seams()
+    if missing == ("F14",) and getattr(ns, "weg2_disable_hicache", False):
+        # #239 S4a: F14 is the worker's bytes in the HOST TIER and the store;
+        # a boot without either (--weg2-disable-hicache: no L2, no L3, #1386)
+        # has no such bytes, so the runtime half is complete for it.
+        print(f"{KV_TOKEN_CUT_MARKER} F14-FREI (kein Host-Tier): --d-kv-token-cut "
+              f"{ns.d_kv_token_cut} bootet mit --weg2-disable-hicache; F14 (Host-Tier/"
+              "Store des KV-Workers) ist offen und wird hier nicht betreten.", flush=True)
+        return
+    if not missing:
+        return
+    raise Weg2TokenCutNotWired(
+        f"{KV_TOKEN_CUT_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} (form kv=qsa_forma_dcp) "
+        f"is planned but not wired -- Form A seam(s) {', '.join(missing)} unwired "
+        f"({'; '.join(rank_role.SEAMS[m].what for m in missing)}; #239 S3d/S3e). "
+        "--dry-run prints the planned cut; a real boot needs every seam built.")
+
+
+class Weg2TokenCutFlipNotWired(Weg2LaunchRefused):
+    """#239 S3h: a FLIP boot under the token cut (``kv=qsa_forma_dcp`` with P)
+    in a form whose P->D hand-off is not wired.
+
+    The wired form (S3h, 28.09.): the hand-off rides the ONE arena L2 and the
+    canonical page store. P writes whole geometry-neutral pages (#706); a D
+    worker that owns rows reads exactly its extents of them through its own
+    L2 binding (S4b part 3, ArenaMHAHostPool with owner rows) and its KV
+    window of the file backend (part 2); tail adopt is per owner (part 5);
+    the claim of every wake-path prefetch is the group MIN (the worker votes
+    in the min arm only, ``cache_controller.claim_vote_min_only``); the wake
+    credit is taken per rank against its own card at run time (the KV resume
+    EARLY only when the card funds it, else after the legs). A flip boot
+    WITHOUT a host tier (``--weg2-disable-hicache``) has no carrier for the
+    cut's rows and stops here by name; ``--d-only`` (H87) boots either way.
+    """
+
+
+#: #239 S3h: the marker of the flip riegel line (refusal and allowance).
+KV_TOKEN_CUT_FLIP_MARKER = "#239 S3h FLIP UNTER KV-TOKEN-SCHNITT"
+
+
+def refuse_flip_under_token_cut(ns, boot_form) -> Optional[str]:
+    """#239 S3h: the flip boot (P and D) of ``kv=qsa_forma_dcp``.
+
+    None for every other form and for ``--d-only``. A flip boot with a host
+    tier is the wired form: the line names what carries the cut and is
+    returned. A flip boot without one is refused by name (a dry run prints
+    the line with 'would refuse' and returns it; a real boot raises
+    :class:`Weg2TokenCutFlipNotWired`).
+
+    The KV stages (29.09., S3h lifted where S3g holds): ONE operator-named
+    stage passes as before. Stages the operator does not name are the
+    launcher's to write (#251c + S3g: stage rows per KV rank, each from its
+    own trim cell) -- this riegel runs before the plan, so it lets them
+    through provisionally and ``refuse_flip_stage_form_without_trim_cells``
+    decides after the FRACTION-SOLVE. More than one operator-named stage stays
+    refused: the launcher writes no per-rank rows for them, a KV worker would
+    meet the top stage untrimmed."""
+    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "d_only", False):
+        return None
+    from sglang.srt import rank_role
+
+    why = []
+    missing = rank_role.unwired_token_cut_seams()
+    if missing:
+        why.append("seam(s) %s unwired (%s)" % (
+            ", ".join(missing), "; ".join(rank_role.SEAMS[m].what for m in missing)))
+    if getattr(ns, "weg2_disable_hicache", False):
+        why.append(
+            "--weg2-disable-hicache: the P->D hand-off under the cut rides the "
+            "arena L2 and the canonical store (the D workers read their owner "
+            "rows of P's pages), and this boot has neither")
+    stages = d_kv_stage_tokens_named(ns)
+    if stages is not None and len(stages) != 1:
+        why.append(
+            "the D KV stage form is operator-named with %d stages %s -- the "
+            "launcher writes no stage rows per KV rank for it (S3g: each KV "
+            "worker trims only with its own trim cell in the plan), a KV-holding "
+            "worker would build its pool for the top stage; name ONE stage "
+            "(--env-d %s=<tokens>) or leave it to the launcher"
+            % (len(stages), list(stages), D_KV_STAGE_KEYS[0]))
+    if why:
+        msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
+               "(form kv=qsa_forma_dcp) in a FLIP boot refused -- "
+               + " | ".join(why) + ". The cut boots with --d-only either way.")
+        if getattr(ns, "dry_run", False):
+            print(msg + " (dry run: would refuse)", flush=True)
+            return msg
+        raise Weg2TokenCutFlipNotWired(msg)
+    stage_text = (
+        f"({D_KV_STAGE_KEYS[0]}={stages[0]}) " if stages is not None else
+        "(KV-Stufen vom Launcher: Stufenzeilen je KV-Rang aus seiner Trim-Zelle, "
+        "S3g -- Entscheid nach dem FRACTION-SOLVE, ohne Trim-Zelle je KV-Worker "
+        "benannte Verweigerung) ")
+    msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} ERLAUBT: --d-kv-token-cut {ns.d_kv_token_cut} "
+           + stage_text +
+           "im Flip-Boot -- Traeger: das eine Arena-L2 und der kanonische "
+           "Seitenspeicher (P schreibt ganze Seiten, die KV-Worker lesen ihre "
+           "Owner-Zeilen, Tail-Adopt je Owner), Claim = Gruppen-MIN (Worker nur "
+           "im MIN-Arm), Wake-Kredit je Rang gegen die eigene Karte. Metall-Marker: "
+           "'#239 F14 KV-WORKER-WINDOW' auf TP1/TP2, 'WEG2-WAKE-KV-FIRST' je Rang, "
+           "kein 'DRAFT-DISAGREE'.")
+    print(msg, flush=True)
+    return msg
+
+
+def refuse_flip_stage_form_without_trim_cells(ns, boot_form, log) -> Optional[str]:
+    """#239 S3h after the FRACTION-SOLVE (29.09.): the flip boot under the
+    token cut whose KV stages the operator left to the launcher.
+
+    Called right before every flip D start (dry run, real), after the last
+    D solve wrote -- or dropped -- the stage form. None for every other form,
+    for ``--d-only`` and for an operator-named stage (the pre-plan riegel
+    decided those). Otherwise every rank the cut gives FA KV must carry its
+    own stage rows in the written form (``_d_kv_stage_written``: the rows
+    from its trim cell, ``kv_stage_trim_cell``); a dropped form or a KV
+    worker without rows is refused by name -- the flip boot does not fall
+    back to fixed tokens silently. A dry run prints 'would refuse' and returns
+    the line; a real boot raises :class:`Weg2TokenCutFlipNotWired`."""
+    if boot_form is None or boot_form.kv != "qsa_forma_dcp" or getattr(ns, "d_only", False):
+        return None
+    w = getattr(ns, "_d_kv_stage_written", None)
+    if not w and d_kv_stage_tokens_named(ns) is not None:
+        return None  # operator-named (one stage, the riegel let it through)
+    why = None
+    if not w:
+        why = ("keine Stufenform geschrieben (Zeile 'D-KV-STUFEN (#251c): entfaellt' im "
+               "FRACTION-SOLVE nennt den Grund) -- die KV-Worker haben keine Trim-Zelle im "
+               "Plan; feste Token nur mit genau EINER benannten Stufe (--env-d %s=<tokens>)"
+               % D_KV_STAGE_KEYS[0])
+    else:
+        cut = [int(r) for r in (w.get("cut_workers") or ())]
+        rows = {int(r): int(x) for r, x in (w.get("worker_rows") or {}).items()}
+        if -1 in cut:
+            why = "der Schnitt ist ungeloest -- welche Worker KV halten, ist nicht bekannt"
+        else:
+            lacking = [r for r in cut if rows.get(r, 0) <= 0]
+            if lacking:
+                why = ("KV-Worker Rang %s ohne eigene Stufenzeilen (Trim-Zelle) in der "
+                       "geschriebenen Form %s -- er baute seinen FA-KV-Pool auf der obersten "
+                       "Stufe ungetrimmt" % (",".join(str(r) for r in lacking), rows))
+    if why:
+        msg = (f"{KV_TOKEN_CUT_FLIP_MARKER}: --d-kv-token-cut {ns.d_kv_token_cut} "
+               "(form kv=qsa_forma_dcp) in a FLIP boot refused -- KV-Stufen: " + why
+               + ". The cut boots with --d-only either way.")
+        if getattr(ns, "dry_run", False):
+            log(msg + " (dry run: would refuse)")
+            return msg
+        raise Weg2TokenCutFlipNotWired(msg)
+    per_rank = " ".join("rang%d: %d" % (r, rows[r]) for r in sorted(rows))
+    msg = (f"{KV_TOKEN_CUT_FLIP_MARKER} STUFEN ERLAUBT: jeder KV-Worker %s traegt seine "
+           "Stufenzeilen aus der eigenen Trim-Zelle (%s; TP0 %d) -- S3g greift im Flip-Boot. "
+           "Metall-Marker: '#251c KV-STAGE form=' mit trims_here=True auf TP0 UND den "
+           "KV-Workern, 'D-KV-STUFEN RESIDENZ (#239 S3g) rang1/rang2' im FRACTION-SOLVE, "
+           "kein 'Weg2DSeatVramRefused ... holds full-attention KV', kein W171."
+           % (",".join(str(r) for r in cut), per_rank, int(w["rows"])))
+    log(msg)
+    return msg
+
+
+#: #239 S3f: the marker of the published ownership.
+D_OWNER_MARKER = "D-EIGENTUM (#239 S3f)"
+
+
+def d_seat_table_form(plan, kv_cut_kw: dict, fractions):
+    """#239 S3f: what the H95 seat table solves at every seat count. Under an
+    owned cut (``owned`` / ``owned:<v>``) the planner has SOLVED ownership,
+    cut and FR_D once; the seat table recomputes exactly that form (the cut
+    as a fixed vector, FR_D as solved) and never re-solves the ownership --
+    a second owned solve starts from the already published vector as its x1
+    base and refuses every row (dry run 28.09. 17:50Z, 'keine tragbare Form
+    ... Eigentum ab 215,113,160'). Any other cut: unchanged."""
+    from sglang.srt.planner import expert_residency as _er
+
+    if (not kv_cut_kw or not _er.owned_cut_request(kv_cut_kw.get("kv_token_shares"))[0]
+            or not getattr(plan, "solved_owner_ratio", None)):
+        return dict(kv_cut_kw), [float(x) for x in fractions]
+    out = dict(kv_cut_kw)
+    out["kv_token_shares"] = tuple(float(x) for x in plan.kv_token_cut)
+    fr = plan.solved_fractions or fractions
+    return out, [float(x) for x in fr]
+
+
+def publish_d_owner_ratio(ns, plan, label: str, log) -> List[float]:
+    """#239 S3f: the ownership vector the planner solved under
+    ``--d-kv-token-cut owned`` goes to ``--extra-d --rank-moe-ratio`` (the one
+    place it lives for group D; argparse keeps the last copy, so every copy is
+    replaced), and the before/after into ``ns._d_owner_solve`` for the
+    record. Returns the new vector as floats for the caller's later readers."""
+    from sglang.srt.weg2 import draft_post as _dp
+
+    before = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    if getattr(ns, "_d_owner_stated", None) is None:
+        # the STATED vector, kept once: a second solve pass (dry-run and real
+        # call, the d-only expectation) starts from it again, never from its
+        # own published answer (Form A baseline of the x1 rule stays fixed)
+        ns._d_owner_stated = [str(x) for x in before]
+    before = list(ns._d_owner_stated)
+    new = [int(x) for x in plan.solved_owner_ratio]
+    ns.extra_d = _dp.replace_vector_flag(getattr(ns, "extra_d", "") or "",
+                                         "--rank-moe-ratio", new)
+    rec = dict(plan.owner_record)
+    rec["label"] = label
+    rec["stated_ratios"] = [str(x) for x in before]
+    ns._d_owner_solve = rec
+    log(f"{D_RANK_SOLVE_MARKER} {label} {D_OWNER_MARKER} veroeffentlicht: --extra-d "
+        f"--rank-moe-ratio {','.join(str(x) for x in new)} (vorher "
+        f"{','.join(str(x) for x in before)}; der Planer setzt das Eigentum, kein Handwert)")
+    return [float(x) for x in new]
+
+
+#: VRAM loop P1c (28.09., user: "macht der Planer es besser und die Werte werden
+#: nicht uebernommen?" -- yes: FRACTION-SOLVE D computed DECKE 0.062/0.586/0.491
+#: against the profile's 0.060/0.510/0.480 in every NF boot, ~1.3 GiB idle on
+#: nv0). The planner OWNS FR_D: its edge wins; a profile value binds only as a
+#: named cap (``SGLANG_WEG2_FR_D_CAP`` in --env-d). Default ON.
+FR_D_CEILING_ENV = "SGLANG_WEG2_FR_D_CEILING"
+FR_D_CAP_ENV = "SGLANG_WEG2_FR_D_CAP"
+#: P0 (torch cache cap) must be armed in the SAME D group: the edge leaves ~0 MiB
+#: after KV, and without a bounded cache the allocator swing (0.7-3.5 GiB,
+#: WEG2-VRAM-PEAK rc12z26) takes that memory back at the next peak.
+TORCH_CACHE_CAP_ENV = "SGLANG_WEG2_TORCH_CACHE_CAP"
+FR_D_CEILING_MARKER = "FR-D-DECKE (VRAM-Loop P1c)"
+
+
+def d_fr_ceiling_adopt(plan, fractions, env_d: Mapping[str, str], owned: bool,
+                       map_built: bool = False
+                       ) -> Tuple[Optional[List[float]], List[str]]:
+    """The fraction group D boots with when the planner's edge is higher than
+    the stated FR_D, or ``(None, lines)`` when the stated one stays.
+
+    Never under an owned cut (#239 S3f publishes FR_D itself) and never over a
+    fraction the planner already solved (S2b). Raises only: a rank whose edge
+    is below its stated FR is the W122/scratch-cap path's business, not this
+    one's. Every rank is named, adopted or not.
+
+    rc12z30b: never after the Platztausch map is built (``map_built``) -- the
+    map read FR_D from --extra-d before P started, and a raised FR_D after it
+    is a D form the map does not describe (the rc12z29b death class)."""
+    given = [float(x) for x in fractions]
+    if str(env_d.get(FR_D_CEILING_ENV, "1")).strip() == "0":
+        return None, [f"{FR_D_CEILING_MARKER}: {FR_D_CEILING_ENV}=0 -- gegeben {given} bleibt"]
+    if owned or getattr(plan, "solved_fractions", ()) or getattr(plan, "solved_owner_ratio", ()):
+        return None, []
+    fits = list(getattr(plan, "fits", ()) or ())
+    if len(fits) != len(given) or any(f.ceiling_fraction is None for f in fits):
+        return None, [f"{FR_D_CEILING_MARKER}: keine Kante auf jedem Rang -- gegeben {given} bleibt"]
+    ceil = [float(f.ceiling_fraction) for f in fits]
+    cap_raw = str(env_d.get(FR_D_CAP_ENV, "")).strip()
+    cap: Optional[List[float]] = None
+    if cap_raw:
+        try:
+            cap = [float(x) for x in cap_raw.split(",")]
+        except ValueError:
+            cap = None
+        if cap is None or len(cap) != len(given):
+            return None, [f"{FR_D_CEILING_MARKER}: {FR_D_CAP_ENV}={cap_raw!r} unlesbar -- "
+                          f"gegeben {given} bleibt"]
+    new = []
+    lines = []
+    for r, (g, c) in enumerate(zip(given, ceil)):
+        target = min(c, cap[r]) if cap is not None else c
+        val = max(g, target)
+        new.append(val)
+        why = ("Decke" if cap is None or c <= cap[r] else f"Decke {c:.3f} gekappt auf "
+               f"{FR_D_CAP_ENV} {cap[r]:.3f}")
+        lines.append(f"{FR_D_CEILING_MARKER} rang{r}: gegeben {g:.3f} -> {val:.3f} ({why}"
+                     + (", Decke unter gegeben: bleibt" if c < g else "") + ")")
+    if all(abs(a - b) < 5e-4 for a, b in zip(new, given)):
+        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke = gegeben, nichts zu uebernehmen"]
+    if str(env_d.get(TORCH_CACHE_CAP_ENV, "0")).strip() != "1":
+        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke NICHT uebernommen: P0 aus "
+                              f"({TORCH_CACHE_CAP_ENV}!=1 in --env-d) -- ohne gedeckelten "
+                              f"Allokator-Cache nimmt der Cache-Swing den Platz an der naechsten "
+                              f"Spitze zurueck; gegeben {given} bleibt"]
+    if map_built:
+        return None, lines + [f"{FR_D_CEILING_MARKER}: Decke NICHT uebernommen: die "
+                              f"Platztausch-Karte ist schon aus FR_D {given} gebaut -- "
+                              f"eine hoehere FR_D danach waere eine Form, die die Karte "
+                              f"nicht beschreibt"]
+    return new, lines
+
+
+def d_form_solved_by_planner(ns) -> bool:
+    """#239 rc12z29c: the D solve sets D's ownership and/or FR_D itself (an
+    owned cut, S2b joint, S2 maxmin: ``--d-kv-token-cut`` names a mode, not a
+    vector). Then that form must be solved BEFORE the Platztausch map is
+    built, because the map's D phase (window per rank, resident ids) and its P
+    phase (the common prefix, the store slots) are both functions of it."""
+    return isinstance(d_kv_token_cut(ns), str)
+
+
+def d_fr_ceiling_before_map(ns) -> bool:
+    """R2 (28.09.): the P1c FR-D ceiling moves FR_D, and FR_D is a function
+    the Platztausch map is built from -- so where P1c is ARMED (default on,
+    P0 ``SGLANG_WEG2_TORCH_CACHE_CAP=1`` in --env-d, a MoE D form with an
+    ownership and an FR vector in --extra-d) the D form is solved and pinned
+    BEFORE the map, from the expectation budgets, exactly like an owned /
+    joint / maxmin form (#239 rc12z29c). After the map it would be refused
+    (a514587c52, W170) and NF stayed on the profile's FR_D with ~1.3 GiB idle
+    on nv0. A form the planner solves itself is already pinned there."""
+    if d_form_solved_by_planner(ns):
+        return False
+    env_d = parse_group_env(getattr(ns, "env_d", "") or "")
+    if str(env_d.get(FR_D_CEILING_ENV, "1")).strip() == "0":
+        return False
+    if str(env_d.get(TORCH_CACHE_CAP_ENV, "0")).strip() != "1":
+        return False
+    extra_d = getattr(ns, "extra_d", "") or ""
+    return bool(_argv_vector(extra_d, "--rank-moe-ratio")
+                and _argv_vector(extra_d, "--rank-moe-resident-fraction"))
+
+
+def pin_d_form_for_map(ns, log) -> Optional[dict]:
+    """#239 rc12z29c: freeze the D form the Platztausch map is built from.
+
+    rc12z29b (f833fcbb2d, -st-cut) died at D's load, TP1: 'Platztausch-Karte:
+    Layer 0 Phase D nennt Ids ausserhalb dieses Rangs (lokal [-33, ...],
+    lo=226)' -- the map was built (publish_expert_map, before P starts) from
+    the STATED --rank-moe-ratio 183,137,168, the owned solve (after P's sleep)
+    published 215,113,160 into --extra-d, and D's expert window followed the
+    published one. The map cannot follow afterwards: P loaded its common
+    prefix and store slots from it. So the form is solved once before the map
+    (``d_form_solved_by_planner``), the map reads the published vectors, and
+    every later D solve checks exactly that form (fixed cut, fixed ownership,
+    fixed FR_D) against the measured budgets -- a form that no longer fits is
+    refused by name (W122/W130), never re-solved under a map that describes
+    another one. Returns the pinned form (also on ``ns._d_map_form``)."""
+    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    fr = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
+    cut = getattr(ns, "_d_solved_cut", None)
+    # R2: a form without a token cut (the P1c pin) pins cut None -- only a
+    # cut that was ASKED for and not published leaves the form unpinned
+    if not ratios or not fr or (not cut and d_kv_token_cut(ns) is not None):
+        log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) NICHT GEPINNT: der Solve "
+            f"vor der Karte hat keinen Schnitt/Vektor veroeffentlicht (ratio {ratios}, "
+            f"FR_D {fr}, Schnitt {cut}) -- die Karte liest die Vektoren, die jetzt in "
+            f"--extra-d stehen")
+        return None
+    form = {"ratios": [str(x) for x in ratios], "fractions": [str(x) for x in fr],
+            "cut": tuple(float(x) for x in cut) if cut else None}
+    ns._d_map_form = form
+    log(f"{D_RANK_SOLVE_MARKER} KARTE-FORM (#239 rc12z29c) GEPINNT: die Platztausch-Karte "
+        f"baut Phase D aus --rank-moe-ratio {','.join(form['ratios'])}, FR_D "
+        f"{','.join(form['fractions'])}, Token-Schnitt "
+        f"{list(form['cut']) if form['cut'] else 'keiner'} -- dieselben "
+        f"Vektoren, die D's Expertenfenster liest; jeder spaetere D-Solve prueft genau "
+        f"diese Form gegen sein Budget und loest sie nicht neu")
+    return form
+
+
+#: #239 S3a: the D argv that carries the planner's token cut to the runtime
+#: (server_args._resolve_form_a_dcp -> rank_role.resolve_dcp_under_host_kv).
+D_TOKEN_CUT_FLAGS = (
+    "--uneven-token-vector",
+    "--uneven-token-vector-role",
+    "--uneven-token-vector-provenance",
+)
+#: The provenance the runtime's #797 register sees: the planner, this boot.
+D_TOKEN_CUT_PROVENANCE = "planner-239-token-cut"
+
+
+def d_token_cut_vector(plan_cut, stated) -> Optional[Tuple[int, ...]]:
+    """#239 S3a: the integer token vector D runs, or None (no cut).
+
+    ``plan_cut`` is the planner's solved cut (``maxmin``/``joint``, already in
+    /``KV_TOKEN_SHARE_GRID``); a stated ratio vector (``stated``) goes onto the
+    same grid by largest remainder, zeros kept -- a 0 is a layout here.
+    """
+    from sglang.srt.distributed.utils import partition_units
+    from sglang.srt.planner import expert_residency as _er
+
+    if plan_cut:
+        return tuple(int(x) for x in plan_cut)
+    if not isinstance(stated, tuple) or not stated:
+        return None
+    return tuple(
+        partition_units(
+            _er.KV_TOKEN_SHARE_GRID,
+            [int(round(float(x) * 10**6)) for x in stated],
+            allow_zero=True,
+        )
+    )
+
+
+def publish_d_token_cut(ns, vector, label: str) -> Optional[str]:
+    """#239 S3a: ship the token cut to group D (``ns.extra_d``), or refuse.
+
+    An operator ``--d-uneven-token-vector`` next to a planned cut is a second
+    statement of the same fact; which one the runtime would read is argparse
+    order, so it is refused by name. Returns the log line, None when there is
+    no cut to ship.
+    """
+    if vector is None:
+        return None
+    if getattr(ns, "d_uneven_token_vector", None):
+        raise Weg2LaunchRefused(
+            f"{KV_TOKEN_CUT_MARKER}: --d-uneven-token-vector "
+            f"{ns.d_uneven_token_vector} and the planned token cut "
+            f"{list(vector)} (--d-kv-token-cut {ns.d_kv_token_cut}) both state "
+            "D's token ownership. Drop one: a stated vector goes through "
+            "--d-kv-token-cut, which prices it.")
+    toks = shlex.split(str(getattr(ns, "extra_d", "") or ""))
+    out: List[str] = []
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in D_TOKEN_CUT_FLAGS:
+            i += 2
+            continue
+        if any(t.startswith(f + "=") for f in D_TOKEN_CUT_FLAGS):
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    out += [
+        D_TOKEN_CUT_FLAGS[0], ",".join(str(int(v)) for v in vector),
+        D_TOKEN_CUT_FLAGS[1], "pin",
+        D_TOKEN_CUT_FLAGS[2], D_TOKEN_CUT_PROVENANCE,
+    ]
+    ns.extra_d = shlex.join(out)
+    return (
+        f"{KV_TOKEN_CUT_MARKER} {label} (#239 S3a) an D: --uneven-token-vector "
+        f"{','.join(str(int(v)) for v in vector)} role=pin provenance="
+        f"{D_TOKEN_CUT_PROVENANCE} -- der Planer-Schnitt ist die Laufzeit-Form "
+        "(dcp = Raenge, jeder Rang haelt die kv-Koepfe seiner Token)")
+
+
 class Weg2StoreDiskRefused(Weg2LaunchRefused):
     """W57: the disk cannot fund ``max_size + min_free`` for this boot's store.
 
@@ -4109,6 +5496,15 @@ class Card:
     #: it -- that the awake budget omits this term is a SEPARATE open finding
     #: (weg2/refute/lens2.md sec 3), deliberately not changed here.
     reserved_mib: int = 0
+    #: HW-GENERIC 1002: the NVML properties identity and order are decided on
+    #: (weg2/card_identity.py). ``None`` = NVML did not report it; a card
+    #: without ``cc`` never passes ``resolve_cards`` (arch gate, HW-ARCH).
+    cc: Optional[Tuple[int, int]] = None
+    bar1_total_mib: Optional[int] = None
+    pcie_max_gen: Optional[int] = None
+    pcie_max_width: Optional[int] = None
+    mem_bus_width_bits: Optional[int] = None
+    mem_clock_max_mhz: Optional[int] = None
 
 
 @dataclass
@@ -4185,6 +5581,13 @@ class BootState:
     #: ``nvmlN`` limit/max/default W and the max SM clock. Every time or rate a
     #: later reader takes from this boot is only comparable at this limit.
     power_limits: Dict[str, object] = field(default_factory=dict)
+    #: YaRN x2 (28.09.): die W132-FR_P-KAPPUNG dieses Boots (vorher/nachher je
+    #: Stufe, gekappte Stufen, Zeilen); leer = keine Stufe gekappt.
+    p_fr_cap: Dict[str, object] = field(default_factory=dict)
+    #: #239 S3f: the D ownership solve of this boot (``--d-kv-token-cut
+    #: owned``): stated and solved ``--rank-moe-ratio``, cut, FR_D, miss time
+    #: per rank against Form A; empty = no owned solve.
+    d_owner_solve: Dict[str, object] = field(default_factory=dict)
 
 
 def _now() -> str:
@@ -4217,10 +5620,25 @@ def resolve_cards() -> List[Card]:
     carve-out term, which this launcher now needs, so the copy is gone rather
     than grown.
     """
-    return [
-        Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib)
+    cards = [
+        Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib,
+             cc=getattr(d, "compute_capability", None),
+             bar1_total_mib=(None if getattr(d, "bar1_total_bytes", None) is None
+                             else int(d.bar1_total_bytes) // (1 << 20)),
+             pcie_max_gen=getattr(d, "pcie_max_gen", None),
+             pcie_max_width=getattr(d, "pcie_max_width", None),
+             mem_bus_width_bits=getattr(d, "mem_bus_width_bits", None),
+             mem_clock_max_mhz=getattr(d, "mem_clock_max_mhz", None))
         for d in nvml_registry.list_devices()
     ]
+    # HW-GENERIC 1002: THE arch gate, once, at the one card-list producer --
+    # every boot path (main, p_stage_power_current, xchg_census) reads its
+    # cards here. sm_86 / sm_120 only; anything else refused BY NAME.
+    try:
+        card_identity.arch_gate(cards)
+    except card_identity.CardInventoryRefused as exc:
+        raise Weg2LaunchRefused(str(exc)) from exc
+    return cards
 
 
 def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
@@ -4246,16 +5664,122 @@ def record_card_power(records: List[Dict], cards: List[Card], log) -> None:
         log(_pl.boot_line({"launcher_card": i}, p, why or "card not in the NVML power snapshot"))
 
 
-def order_cards(cards: List[Card]) -> List[Card]:
-    """CUDA ordinal order: the 5090 first (rank 0 / PP0 / TP0), then the 3080s
-    by NVML index.  Never a fixed index: resolved by name per launch."""
-    big = [c for c in cards if "5090" in c.name]
-    small = sorted([c for c in cards if "3080" in c.name], key=lambda c: c.nvml_index)
-    if len(big) != 1 or len(small) != 2:
-        raise Weg2LaunchRefused(
-            f"NVML inventory is not 1x5090 + 2x3080: {[(c.nvml_index, c.name) for c in cards]}"
-        )
-    return [big[0], small[0], small[1]]
+#: HW-GENERIC 1002: the launcher flags (dest names) and the --extra-p/-d,
+#: --env-p/-d tokens that carry a POSITIONAL per-card vector (ordinal i =
+#: the i-th card of order_cards). Each is a measurement or a pin of the
+#: inventory the profile was written for (HW-KOPPLUNG-AUDIT-1002.md 2).
+POSITIONAL_VECTOR_FLAGS = (
+    "d_foreign_context_mib", "d_nontorch_mib", "pp_stage_ratio", "pp_attn_stage_ratio",
+    "pp_cut_expert_device_fraction", "pp_cut_expert_lru_rows", "user_reserve_mib",
+    "d_reserve_mib", "pp_cut_reserve_mib", "d_reshard_presets", "p_barlink_bar1_window_mib",
+)
+POSITIONAL_VECTOR_TOKENS = (
+    "--rank-role", "--rank-tp-ratio", "--rank-moe-ratio", "--rank-moe-resident-fraction",
+    "--rank-user-reserve-mib", "--rank-gpu-memory-mib", "--pp-stage-ratio",
+    "--pp-attn-stage-ratio", "SGLANG_MOE_SCRATCH_SLOTS=", "SGLANG_MOE_RESIDENT_EXPERT_FRACTION=",
+    "SGLANG_WEG2_L15_MIB=", "SGLANG_WEG2_EXTEND_TRIM_MIB=",
+)
+
+
+def positional_inputs_present(ns) -> List[str]:
+    """The positional per-card inputs this launch carries (flag dests set to
+    something other than their parser default + vector tokens found in
+    --extra-p/-d and --env-p/-d)."""
+    out: List[str] = []
+    defaults = build_parser().parse_args(["--tree", "/", "--tag", "x"])
+    for dest in POSITIONAL_VECTOR_FLAGS:
+        v = getattr(ns, dest, None)
+        if v not in (None, "", [], ()) and v != getattr(defaults, dest, None):
+            out.append("--" + dest.replace("_", "-"))
+    blob = " ".join(str(getattr(ns, k, "") or "") for k in ("extra_p", "extra_d", "env_p", "env_d"))
+    for tok in POSITIONAL_VECTOR_TOKENS:
+        if tok in blob and tok.rstrip("=") not in out:
+            out.append(tok.rstrip("="))
+    env_l15 = os.environ.get("SGLANG_WEG2_L15_MIB", "")
+    if env_l15 and env_l15.strip().lower() != "auto" and "SGLANG_WEG2_L15_MIB" not in out:
+        out.append("SGLANG_WEG2_L15_MIB")
+    return out
+
+
+def records_inventory(profile: str) -> Tuple[Tuple[str, ...], str]:
+    """(the inventory the profile's MEASURED records were taken on, its source)."""
+    from sglang.srt.weg2 import profile_records as _pr
+
+    inv = _pr.inventory_of(str(profile))
+    if inv is not None:
+        return inv, f"profile_records_data/{profile}.json inventory"
+    return card_identity.REFERENCE_INVENTORY, (
+        f"profile {profile!r} records declare no inventory: every record of this tree "
+        "was measured on the reference rig")
+
+
+def calibrated_inventory(ns) -> Tuple[Tuple[str, ...], str]:
+    """(the inventory the profile's positional VECTORS (argv/env) were
+    measured on, its source): ``--profile-inventory``, else the records'."""
+    explicit = card_identity.parse_inventory(getattr(ns, "profile_inventory", ""))
+    if explicit is not None:
+        return explicit, "--profile-inventory"
+    prof = getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE
+    return records_inventory(str(prof))
+
+
+def inventory_check_line(ns, cards: Sequence["Card"]) -> str:
+    """The HW-INVENTORY line; raises Weg2LaunchRefused (HW-UNCALIBRATED) when
+    the live ordered inventory is not the one the profile's positional
+    measured RECORDS were taken on, or not the one its positional VECTORS
+    (argv/env, ``--profile-inventory``) were written for. Two checks: a
+    profile that names a foreign inventory does not make the reference
+    rig's records hold there."""
+    from sglang.srt.weg2 import profile_records as _pr
+
+    prof = str(getattr(ns, "profile", None) or weg2_form.DEFAULT_PROFILE)
+    rec_inv, rec_src = records_inventory(prof)
+    vec_inv, vec_src = calibrated_inventory(ns)
+    rec_what = sorted({r.name for r in _pr.records(prof) if _pr.is_positional(r.value, len(rec_inv))})
+    vec_what = positional_inputs_present(ns)
+    msgs = []
+    if vec_src == "--profile-inventory":
+        m = card_identity.uncalibrated_message(cards, vec_inv, vec_what,
+                                               f"profile {prof!r} vectors ({vec_src})")
+        if m is not None:
+            msgs.append(m)
+        m = card_identity.uncalibrated_message(cards, rec_inv, rec_what,
+                                               f"profile {prof!r} measured records ({rec_src})")
+        if m is not None:
+            msgs.append(m)
+    else:
+        m = card_identity.uncalibrated_message(cards, rec_inv, rec_what + vec_what,
+                                               f"profile {prof!r} ({rec_src})")
+        if m is not None:
+            msgs.append(m)
+    if msgs:
+        raise Weg2LaunchRefused(" || ".join(msgs))
+    return ("HW-INVENTORY " + "; ".join(f"ordinal {i}: {card_identity.describe(c)}"
+                                        for i, c in enumerate(cards))
+            + f" -- calibrated inventory [{','.join(rec_inv)}] ({rec_src}"
+            + (f"; vectors: {vec_src}" if vec_src == "--profile-inventory" else "") + ") MATCH")
+
+
+#: HW-GENERIC 1002 Stage 1: the release topology is P = PP3 / D = TP3 (argv
+#: below, Form A from the profile), so a launch needs exactly this many cards.
+#: Stage 2 derives it from the inventory (HW-GENERISCH-SM86-SM120-1002.md).
+WEG2_CARD_COUNT = 3
+
+
+def order_cards(cards: List[Card], expect_count: Optional[int] = WEG2_CARD_COUNT) -> List[Card]:
+    """CUDA ordinal order (rank 0 / PP0 / TP0 first), from NVML PROPERTIES
+    (weg2/card_identity.py): biggest NVML total first, then nameplate DRAM
+    bandwidth, then NVML index. On the reference rig that is the 5090 first,
+    then the 3080s by NVML index -- the order the name-based predecessor
+    produced, byte for byte. Never a fixed index, never a name substring.
+
+    Refuses BY NAME (HW-COUNT) an inventory of another size than
+    ``expect_count`` (the topology is fixed at PP3/TP3 in Stage 1). The arch
+    gate (HW-ARCH) runs once in :func:`resolve_cards`."""
+    try:
+        return card_identity.order_cards(cards, expect_count, gate=False)
+    except card_identity.CardInventoryRefused as exc:
+        raise Weg2LaunchRefused(str(exc)) from exc
 
 
 def log_power_limits(state: BootState, cards: List[Card], log, *,
@@ -4455,6 +5979,10 @@ def wait_ready(port: int, pid: int, deadline_s: float, log: Log, name: str, proc
         if code == 200:
             dt = time.time() - t0
             log(f"R1 READY group={name} port={port} after {dt:.1f} s")
+            if name in ("P", "D"):
+                boot_state_write(log, fields={f"groups.{name}.state": "ready",
+                                              f"groups.{name}.ready_ts": round(time.time(), 3)},
+                                 event=("group_ready", {"group": name, "port": port, "after_s": round(dt, 1)}))
             return dt
         last = f"{code} {body[:80]!r}"
         time.sleep(3)
@@ -4877,6 +6405,18 @@ def shm_residue_sweep(
             "refused": {}, "archive": archive, "sems_unlinked": sem_gone}
 
 
+def d_only_bind_argv(front_host: str) -> List[str]:
+    """#239 M1s (rc12z30g D-only, 28.09.): with --d-only there is NO front, so
+    group D on :30032 IS the client surface. common_flags binds every group to
+    127.0.0.1 (the groups sit behind the front), and inside the container the
+    Docker port forward cannot reach a loopback-only socket -- host_acceptance
+    serve_d waited forever and the probes had to go in by nsenter. D-only binds
+    where the front would have: --front-host (default 0.0.0.0, user order
+    2026-09-10). Appended after common_flags, so it is the last --host argparse
+    reads; a flip boot never calls this."""
+    return ["--host", str(front_host)]
+
+
 def refuse_if_front_unbindable(log: Log, host: str, port: int, dry: bool) -> None:
     """Pre-spawn probe: can the front bind ``host:port`` at all?
 
@@ -5069,13 +6609,70 @@ class StoreDiskPlan:
     min_free_bytes: int
     fs_free_bytes: int
     fs_total_bytes: int
+    #: L3P: bytes the REUSED persistent directory already occupies (0 for a
+    #: fresh one). They are this store's own, inside its cap, so the disk
+    #: check credits them instead of charging them a second time.
+    reused_bytes: int = 0
+    #: W57: the path statvfs measured (the store directory when it exists,
+    #: else its root), and the filesystem /proc/mounts names for it
+    fs_path: str = ""
+    fs_type: str = ""
+    fs_mount: str = ""
+    #: W57: the store's filesystem is one SGLANG_WEG2_STORE_REFUSE_FS names
+    #: (a dry run carries on with a warning; a real boot never gets here)
+    fs_refused: bool = False
+
+    @property
+    def growth_bytes(self) -> int:
+        """What the store may still GROW by: max_size minus its own bytes."""
+        return max(0, self.max_size_bytes - min(self.reused_bytes, self.max_size_bytes))
 
     @property
     def needed_bytes(self) -> int:
-        return self.max_size_bytes + self.min_free_bytes
+        return self.growth_bytes + self.min_free_bytes
+
+    def disk_line(self, verdict: str) -> str:
+        """W57's one line: where it measured, on what, and the arithmetic."""
+        g = host_ledger.GIB
+        return (f"W57 STORE-DISK {verdict}: path={self.fs_path} fs={self.fs_type or '?'} "
+                f"mount={self.fs_mount or '?'} free={self.fs_free_bytes / g:.2f} GiB "
+                f"reused={self.reused_bytes / g:.2f} GiB max_size={self.max_size_bytes / g:.2f} "
+                f"GiB growth={self.growth_bytes / g:.2f} GiB min_free={self.min_free_bytes / g:.2f} "
+                f"GiB needed={self.needed_bytes / g:.2f} GiB (needed = growth + min_free, "
+                f"growth = max_size - reused)")
 
     def extra_config(self) -> str:
         return store_extra_config(self.max_size_bytes, self.min_free_bytes)
+
+
+def fs_of(path: str, mounts_text: Optional[str] = None) -> Tuple[str, str, str]:
+    """W57: (mount point, fs type, source) of the filesystem holding ``path``
+    -- the longest /proc/mounts mount point above its nearest existing
+    ancestor. ("", "", "") when /proc/mounts is unreadable."""
+    p = os.path.abspath(str(path or "/"))
+    while p != "/" and not os.path.exists(p):
+        p = os.path.dirname(p)
+    real = os.path.realpath(p)
+    if mounts_text is None:
+        try:
+            with open("/proc/mounts") as fh:
+                mounts_text = fh.read()
+        except OSError:
+            return "", "", ""
+
+    def _unesc(v: str) -> str:
+        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), v)
+
+    best = ("", "", "")
+    for ln in mounts_text.splitlines():
+        parts = ln.split()
+        if len(parts) < 3:
+            continue
+        src, mnt, typ = _unesc(parts[0]), _unesc(parts[1]), parts[2]
+        inside = real == mnt or real.startswith(mnt.rstrip("/") + "/") or mnt == "/"
+        if inside and len(mnt) >= len(best[0]):
+            best = (mnt, typ, src)
+    return best
 
 
 def plan_store(
@@ -5085,8 +6682,10 @@ def plan_store(
     kv_mib_per_token_per_attn_layer: float,
     sidecar_factor: float = STORE_SIDECAR_FACTOR,
     min_free_gib: float = STORE_DISK_MIN_FREE_GIB,
-    root: str = STORE_ROOT,
+    root: Optional[str] = None,
     store_max_gb: float = 0.0,
+    directory_name: Optional[str] = None,
+    dry: Optional[bool] = None,
 ) -> StoreDiskPlan:
     """Size the store from THE P POOL, and check the DISK can fund it.
 
@@ -5144,12 +6743,37 @@ def plan_store(
     else:
         max_size = int(math.ceil(pool_bytes * float(sidecar_factor)))
     min_free = int(round(float(min_free_gib) * host_ledger.GIB))
+    if root is None:
+        # W57 (28.09.): the rig default is a path on the ZFS pool; a launcher
+        # that was not told where its store lives measures THAT disk, not the
+        # store's (the NF store is a bind of XFS [/l3/nf] into the container).
+        if not STORE_ROOT_TOLD:
+            mnt, typ, src = fs_of(STORE_ROOT)
+            raise Weg2StoreDiskRefused(
+                f"W57 Weg2StoreDiskRefused: no store root told -- SGLANG_WEG2_STORE_ROOT "
+                f"is unset, and the launcher's default {STORE_ROOT} lives on fs={typ or '?'} "
+                f"mount={mnt or '?'} ({src or '?'}), which need not be the disk the store "
+                f"is on; nothing was measured. Set SGLANG_WEG2_STORE_ROOT to the store's "
+                f"own root (the container: /var/lib/htsglang/hicache-weg2 with the store "
+                f"volume mounted)."
+            )
+        root = STORE_ROOT
     os.makedirs(root, exist_ok=True)
-    st = os.statvfs(root)
+    directory = f"{root}/{directory_name or tag}"
+    # W57: measure where the store IS -- its own directory when it exists (a
+    # store directory may itself be a mount), else the root it will be made in
+    probe = directory if os.path.isdir(directory) else root
+    st = os.statvfs(probe)
     free = st.f_bavail * st.f_frsize
     total = st.f_blocks * st.f_frsize
+    fs_mount, fs_type, _fs_src = fs_of(probe)
+    # L3P: a persistent directory's own bytes are inside its cap -- the disk
+    # has to fund only what the store may still GROW by (``growth_bytes``).
+    reused = 0
+    if directory_name and os.path.isdir(directory):
+        reused = _tree_bytes(directory)[0]
     plan = StoreDiskPlan(
-        directory=f"{root}/{tag}",
+        directory=directory,
         p_pool_tokens=int(p_pool_tokens),
         cell_bytes=cell_bytes,
         p_pool_bytes=pool_bytes,
@@ -5158,12 +6782,34 @@ def plan_store(
         min_free_bytes=min_free,
         fs_free_bytes=free,
         fs_total_bytes=total,
+        reused_bytes=reused,
+        fs_path=probe,
+        fs_type=fs_type,
+        fs_mount=fs_mount,
+        fs_refused=(dry is not None
+                    and fs_type in set(envs.SGLANG_WEG2_STORE_REFUSE_FS.get() or ())),
     )
+    if plan.fs_refused:
+        # W57 (user 28.09.: "L3 gehoert auf XFS, nie ZFS"): the container
+        # layer or the ZFS pool is not the told store disk -- its free space
+        # says nothing about the store. A dry run warns (the caller's line);
+        # ``dry=None`` (not a launch: a sizing question) never gets here.
+        if not dry:
+            raise Weg2StoreDiskRefused(
+                f"W57 Weg2StoreDiskRefused: store on {fs_type}, not the told disk -- "
+                f"{plan.disk_line('REFUSED')}. SGLANG_WEG2_STORE_ROOT={root} resolves to "
+                f"fs={fs_type} (SGLANG_WEG2_STORE_REFUSE_FS="
+                f"{','.join(envs.SGLANG_WEG2_STORE_REFUSE_FS.get() or ())}); mount the store "
+                f"volume (XFS) at the store root, or empty the variable to allow it."
+            )
+        return plan
     if plan.needed_bytes > free:
         raise Weg2StoreDiskRefused(
             f"W57 Weg2StoreDiskRefused: the filesystem hosting {root} cannot fund this "
-            f"boot's store. NEEDED {plan.needed_bytes / host_ledger.GIB:.2f} GiB = "
-            f"max_size {max_size / host_ledger.GIB:.2f} GiB (P pool "
+            f"boot's store. {plan.disk_line('REFUSED')}. "
+            f"NEEDED {plan.needed_bytes / host_ledger.GIB:.2f} GiB = growth "
+            f"{plan.growth_bytes / host_ledger.GIB:.2f} GiB of max_size "
+            f"{max_size / host_ledger.GIB:.2f} GiB (P pool "
             f"{plan.p_pool_tokens} tokens x {cell_bytes} B/token = "
             f"{pool_bytes / host_ledger.GIB:.2f} GiB x sidecar factor "
             f"{sidecar_factor:.2f}) + min_free {min_free / host_ledger.GIB:.2f} GiB, "
@@ -5202,6 +6848,690 @@ def prepare_store(log: Log, plan: StoreDiskPlan, dry: bool) -> str:
     return plan.directory
 
 
+#: L3P (user 2026-09-27: "der l3 hicache wird jedesmal verworfen, oder? der soll
+#: natürlich persistent sein"): the disk store is the RETENTION tier, so it is
+#: one directory per model that every boot reattaches to, not one per boot tag.
+#: Named ``l3-<model>-<hash of the model path>``; the prefix is what the sweep
+#: spares. What keeps a reused page honest is the KEY, not the directory: every
+#: page key carries compute_model_identity_hash (model path, revision, dtype,
+#: quantization, kv_cache_dtype, uneven-TP vectors), so a page written in
+#: another byte format is a clean miss, never a wrong hit.
+L3_PERSIST_PREFIX = "l3-"
+
+
+def l3_persist_enabled(env=None) -> bool:
+    """L3P: ``SGLANG_WEG2_L3_PERSIST`` (default on; 0 = the per-boot store,
+    swept at the next boot, exactly as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_L3_PERSIST", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+#: L3P: bump when the ON-DISK page format changes incompatibly (the #706
+#: geometry-neutral canonical page is generation 706); a new generation gets
+#: a new directory instead of a MixedGenerationError on a reused one.
+L3_PERSIST_GENERATION = "706"
+L3_IDENTITY_FILE = "L3_IDENTITY.json"
+#: YaRN x2: how the runtime applies a rope override (hf_transformers.config.
+#: apply_model_override_args, nested sub-config merge). Bump when that changes.
+L3_ROPE_APPLY = "merge-v1"
+
+
+def _l3_extra_flag(extra: str, flag: str) -> str:
+    """The value argparse will keep for ``flag`` in a shell-split EXTRA string
+    (the LAST occurrence), or ""."""
+    try:
+        toks = shlex.split(extra or "")
+    except ValueError:
+        return str(extra or "")
+    val = ""
+    for i, t in enumerate(toks):
+        if t == flag and i + 1 < len(toks):
+            val = toks[i + 1]
+        elif t.startswith(flag + "="):
+            val = t[len(flag) + 1:]
+    return val
+
+
+def l3_weights_fingerprint(model: str) -> str:
+    """L3P N4: sha1 over (name, size, mtime_ns) of the checkpoint's weight
+    files -- a checkpoint swapped IN PLACE at the same path is a new identity.
+    Top level of the model directory (or the file itself for a GGUF path);
+    stat only, nothing is read."""
+    real = os.path.realpath(str(model or ""))
+    rows = []
+    try:
+        if os.path.isfile(real):
+            st = os.stat(real)
+            rows.append((os.path.basename(real), st.st_size, st.st_mtime_ns))
+        else:
+            with os.scandir(real) as it:
+                for e in it:
+                    if e.name.endswith((".safetensors", ".gguf", ".bin", ".pt", ".pth")) and e.is_file():
+                        st = e.stat()
+                        rows.append((e.name, st.st_size, st.st_mtime_ns))
+    except OSError:
+        return ""
+    rows.sort()
+    return hashlib.sha1(repr(rows).encode()).hexdigest()
+
+
+def l3_persist_identity(model: str, profile: str = "", form_kv: str = "",
+                        kv_cache_dtype: str = KV_CACHE_DTYPE, extra_p: str = "",
+                        extra_d: str = "", vision: str = "") -> dict:
+    """L3P: what a persistent store is FOR. User 2026-09-27: "aber natürlich
+    zwischen 27b und nf verschiedene L3 caches. sonst knallts" -- one model,
+    one directory. Beside the checkpoint (path, config sha, weight-file stat
+    fingerprint) it carries every launcher-side input that changes the BYTES
+    of a page without changing its key: the KV dtype (the line's constant and
+    an EXTRA override of either group), the effective
+    ``--json-model-override-args`` of both groups (rope_scaling / YaRN: the
+    key hashes token ids only), and the vision mode. The rank adds what only
+    it knows (dtype, quantization, revision) in ``L3_RANK_IDENTITY.<group>``
+    and refuses a mismatch there."""
+    real = os.path.realpath(str(model or ""))
+    cfg_sha = ""
+    try:
+        with open(model_config_path(model), "rb") as f:
+            cfg_sha = hashlib.sha1(f.read()).hexdigest()
+    except Exception:  # noqa: BLE001 -- a GGUF or unreadable config: the path still separates
+        pass
+    kv = str(kv_cache_dtype or "")
+    kv_p = _l3_extra_flag(extra_p, "--kv-cache-dtype") or kv
+    kv_d = _l3_extra_flag(extra_d, "--kv-cache-dtype") or kv
+
+    def _sha(v: str) -> str:
+        return hashlib.sha1(v.encode()).hexdigest()[:16] if v else ""
+
+    ident = {
+        "model_path": real,
+        "model_config_sha1": cfg_sha,
+        "weights_fp": l3_weights_fingerprint(model),
+        "profile": str(profile or ""),
+        "form_kv": str(form_kv or ""),
+        "kv_cache_dtype": kv if kv_p == kv_d == kv else f"P={kv_p},D={kv_d}",
+        "override_p": _sha(_l3_extra_flag(extra_p, "--json-model-override-args")),
+        "override_d": _sha(_l3_extra_flag(extra_d, "--json-model-override-args")),
+        "vision": str(vision or ""),
+        "generation": L3_PERSIST_GENERATION,
+    }
+    # YaRN x2 (28.09.): the rope the pages were rotated with, by name -- the
+    # override's rope/position part (rope_scaling, rope_parameters,
+    # max_position_embeddings; top level and text_config), canonical, and the
+    # way the runtime applies it (L3_ROPE_APPLY: f37d83617d merges a nested
+    # text_config override key by key; before it, the same string replaced the
+    # sub-config). Only when an override names a rope -- a store without one
+    # keeps its identity (and its directory) byte for byte.
+    rope_p = _l3_rope_view(_l3_extra_flag(extra_p, "--json-model-override-args"))
+    rope_d = _l3_rope_view(_l3_extra_flag(extra_d, "--json-model-override-args"))
+    if rope_p or rope_d:
+        ident["rope"] = rope_p if rope_p == rope_d else f"P={rope_p},D={rope_d}"
+        ident["rope_apply"] = L3_ROPE_APPLY
+    return ident
+
+
+def l3_persistent_store(directory: str) -> bool:
+    """L3P: ``directory`` is a persistent L3 store (its ``l3-`` name or its
+    identity file) -- no teardown and no sweep may remove it."""
+    d = str(directory or "").rstrip("/")
+    return bool(d) and (
+        os.path.basename(d).startswith(L3_PERSIST_PREFIX)
+        or os.path.isfile(os.path.join(d, L3_IDENTITY_FILE))
+    )
+
+
+def l3_persist_dir_name(identity: dict) -> str:
+    """L3P: ``l3-<profile>-<model>-<identity10>``; the readable part names the
+    model, the digest separates everything else the identity carries."""
+    base = os.path.basename(str(identity.get("model_path", "")).rstrip("/")) or "model"
+    label = "-".join(x for x in (identity.get("profile") or "", base) if x)
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:80]
+    digest = hashlib.sha1(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:10]
+    return f"{L3_PERSIST_PREFIX}{label}-{digest}"
+
+
+def l3_persist_check_identity(directory: str, identity: dict, dry: bool) -> str:
+    """L3P: the directory's own identity file must match; returns "new" /
+    "match". A mismatch is REFUSED BY NAME -- a store is never shared by two
+    identities, whatever its name says."""
+    path = os.path.join(directory, L3_IDENTITY_FILE)
+    try:
+        with open(path) as f:
+            have = json.load(f)
+    except FileNotFoundError:
+        have = None
+    except (OSError, ValueError) as exc:
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-PERSIST identity file {path} unreadable "
+            f"({type(exc).__name__}: {exc}); refusing to reuse a store whose owner "
+            f"cannot be proven. Move the directory aside or set SGLANG_WEG2_L3_PERSIST=0.")
+    if have is None:
+        if not dry:
+            os.makedirs(directory, exist_ok=True)
+            tmp = path + ".w"
+            with open(tmp, "w") as f:
+                json.dump(identity, f, sort_keys=True, indent=1)
+            os.replace(tmp, path)
+        return "new"
+    if have != identity:
+        diff = sorted(k for k in set(have) | set(identity) if have.get(k) != identity.get(k))
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-PERSIST store {directory} belongs to another "
+            f"identity (differs in {diff}: store {[have.get(k) for k in diff]} vs this boot "
+            f"{[identity.get(k) for k in diff]}). Two models never share an L3 store "
+            f"(user 2026-09-27). Move the directory aside or set SGLANG_WEG2_L3_PERSIST=0.")
+    return "match"
+
+#: L3-REVOKE (28.09., rc12z17): a persistent store cannot tell a page computed
+#: with broken weights from a good one -- the identity separates what was
+#: CONFIGURED, not what a running boot COMPUTED. rc12z17 (103bfdf29a) wiped
+#: D-TP0's live expert bank at its first S1 wake (10:51:24Z, n=4, rows +33 ->
+#: +23: tms_set_spans(now=True) released the one extent that held every row)
+#: and served garbage until the stop; every page it wrote in that window had
+#: the store's own identity and would have been reused as a hit. The operator
+#: names such a window in ``L3_REVOKED.json`` (``l3_revoke_window``); the next
+#: attach, before any rank starts, MOVES every ``.bin`` written inside it (by
+#: mtime -- a page is written once, whole, via tmp+rename) into the sibling
+#: ``<store>.revoked``. Moved, never deleted (deleting is the user's).
+L3_REVOKED_FILE = "L3_REVOKED.json"
+L3_REVOKED_SUFFIX = ".revoked"
+
+
+def _l3_revoked_path(directory: str) -> str:
+    return os.path.join(directory, L3_REVOKED_FILE)
+
+
+def l3_revoked_windows(directory: str) -> List[Tuple[float, float, str]]:
+    """L3-REVOKE: the store's revoked write windows ``(from, to, reason)`` in
+    unix seconds, [] without a record. An unreadable or malformed record is
+    REFUSED BY NAME (W57): a revocation that cannot be read must not turn
+    into silent reuse of the pages it names."""
+    path = _l3_revoked_path(directory)
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-REVOKE record {path} unreadable "
+            f"({type(exc).__name__}: {exc}); the pages it names cannot be told apart. "
+            f"Fix the record (python -m sglang.srt.weg2.l3_store_audit revoke) or move "
+            f"the directory aside.")
+    out: List[Tuple[float, float, str]] = []
+    try:
+        for w in raw["windows"]:
+            t0, t1 = float(w["from_unix"]), float(w["to_unix"])
+            if not t0 <= t1:
+                raise ValueError(f"from {t0} after to {t1}")
+            out.append((t0, t1, str(w.get("reason", ""))))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-REVOKE record {path} malformed "
+            f"({type(exc).__name__}: {exc}); expected "
+            f'{{"windows": [{{"from_unix": s, "to_unix": s, "reason": "..."}}]}}.')
+    return out
+
+
+def l3_revoke_window(directory: str, from_unix: float, to_unix: float, reason: str) -> dict:
+    """L3-REVOKE: add a revoked write window to the store's record (atomic
+    replace). Pages are MOVED at the next attach, not here -- a store in use
+    by a running boot is never walked from outside."""
+    if not float(from_unix) <= float(to_unix):
+        raise ValueError(f"from {from_unix} after to {to_unix}")
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(directory)
+    wins = l3_revoked_windows(directory)
+    rec = {"windows": [{"from_unix": a, "to_unix": b, "reason": r} for a, b, r in wins]}
+    rec["windows"].append({
+        "from_unix": float(from_unix), "to_unix": float(to_unix), "reason": str(reason),
+        "from_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(from_unix))),
+        "to_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(to_unix))),
+        "recorded_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+    path = _l3_revoked_path(directory)
+    tmp = path + ".w"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, sort_keys=True, indent=1)
+    os.replace(tmp, path)
+    return rec
+
+
+def _l3_rope_view(override: str) -> str:
+    """The rope/position part of a ``--json-model-override-args`` value
+    (``rope_scaling``/``rope_parameters``/``max_position_embeddings``, top
+    level and ``text_config``), canonical JSON; "" without one."""
+    if not override:
+        return ""
+    try:
+        args = json.loads(override)
+    except (TypeError, ValueError):
+        return override  # unparseable: compared verbatim
+    if not isinstance(args, dict):
+        return ""
+    keys = ("rope_scaling", "rope_parameters", "max_position_embeddings")
+    view = {k: args[k] for k in keys if k in args}
+    txt = args.get("text_config")
+    if isinstance(txt, dict):
+        sub = {k: txt[k] for k in keys if k in txt}
+        if sub:
+            view["text_config"] = sub
+    return json.dumps(view, sort_keys=True) if view else ""
+
+
+def l3_persist_check_rope(extra_p: str, extra_d: str) -> None:
+    """L3-REVOKE companion (#259): P and D write and read the SAME pages (one
+    L2, one L3; the key hashes token ids only). A rope override on one group
+    and not the other (YaRN x2 on D alone) gives both groups the same keys for
+    KV rotated at different positions -- refused by name before the store is
+    touched, instead of a directory identity that records both and shares
+    them."""
+    p = _l3_rope_view(_l3_extra_flag(extra_p, "--json-model-override-args"))
+    d = _l3_rope_view(_l3_extra_flag(extra_d, "--json-model-override-args"))
+    if p != d:
+        raise Weg2StoreDiskRefused(
+            f"W57 Weg2StoreDiskRefused: L3-PERSIST P and D rotate differently "
+            f"(P rope {p or 'config'} vs D rope {d or 'config'}); they share every "
+            f"L2/L3 page by token-id key, so one group would read the other's KV at "
+            f"the wrong positions. Give both --extra-p and --extra-d the same rope "
+            f"override, or set SGLANG_WEG2_L3_PERSIST=0.")
+
+
+def _l3_move_revoked(directory: str, root: str, name: str, dry: bool) -> bool:
+    """Move one revoked page into ``<directory>.revoked`` (same relative path)."""
+    if dry:
+        return True
+    src = os.path.join(root, name)
+    rel = os.path.relpath(src, directory)
+    dst = os.path.join(directory.rstrip("/") + L3_REVOKED_SUFFIX, rel)
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.replace(src, dst)
+        return True
+    except OSError:
+        return False
+
+
+L3_SUFFIX_REGISTRY = "L3_SUFFIXES"
+
+
+def l3_registered_suffixes(directory: str) -> Optional[Tuple[str, ...]]:
+    """L3P N1: the union of every group's scan suffixes the ranks recorded in
+    ``<dir>/L3_SUFFIXES.<group>.json`` (written by HiCacheFile at attach), or
+    None when no group has recorded yet (first boot of this store)."""
+    out: List[str] = []
+    found = False
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for n in names:
+        if not (n.startswith(L3_SUFFIX_REGISTRY + ".") and n.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(directory, n)) as f:
+                out.extend(str(x) for x in json.load(f).get("suffixes", []))
+            found = True
+        except (OSError, ValueError, AttributeError):
+            continue
+    return tuple(dict.fromkeys(x for x in out if x)) if found else None
+
+
+def l3_persist_attach(log: Log, directory: str, dry: bool) -> Tuple[int, int, int]:
+    """L3P: reattach this boot to the persistent store; returns
+    ``(files, bytes, removed)``.
+
+    Before any rank starts (so nothing here sits inside a rank collective),
+    from the store's persistent index (``_l3_attach_from_index``, 28.09.) --
+    ONE walk only when the index is unusable, exactly when the ranks walk:
+    counts the ``.bin`` pages a previous boot left (the
+    ``L3-PERSIST`` line is the acceptance marker) and removes
+    - the ``<final>.tmp.<uuid>`` staging files a crashed writer left behind --
+      no writer of this store is alive yet, so a staging file here is
+      abandoned by construction;
+    - ORPHAN pages (N1): a ``.bin`` whose stem ends in a suffix NO group
+      scans (``L3_SUFFIXES.*``, the groups' own records from the previous
+      boot). No evictor indexes them, so they would sit against the cap as
+      foreign bytes forever; the key already made them unreachable (e.g. a
+      changed uneven-TP ratio moves the identity hash in every key). Without
+      any record yet they are counted, never removed.
+    Canonical partials are NOT touched: HiCacheFile's attach sweep keeps the
+    resumable ones by marker.
+
+    It also publishes the GROUP-WIDE attach epoch (N2,
+    ``SGLANG_WEG2_L3_EPOCH``): every rank of both groups grades "inherited"
+    against the same instant, not against its own start time.
+
+    H8, named: ``/clear_hicache_storage_backend`` clears the WHOLE persistent
+    store (every page of this identity), exactly as it always cleared the
+    per-boot one; the identity and suffix records survive (they are not
+    ``.bin`` pages).
+    """
+    epoch = time.time()
+    if not dry:
+        os.environ["SGLANG_WEG2_L3_EPOCH"] = f"{epoch:.6f}"
+        os.environ.pop("SGLANG_WEG2_L3_INHERITED_SUFFIXES", None)
+    files = nbytes = removed = orphans = orphan_bytes = 0
+    t0 = time.monotonic()
+    if not os.path.isdir(directory):
+        log(f"L3-PERSIST fresh dir={directory} (no previous store) epoch={epoch:.3f}")
+        return 0, 0, 0
+    known = l3_registered_suffixes(directory)
+    revoked = l3_revoked_windows(directory)
+    rev_n = rev_bytes = rev_failed = 0
+    if not dry:
+        # N1: the suffixes the previous boot's groups scanned, published ONCE
+        # for every rank -- a page under one of them that this rank's own
+        # group does not scan is the sibling's (or this group's before an
+        # identity-hash drift): inherited. Anything else unindexed still
+        # counts against W8b (a blind filter on this boot's own writes).
+        if known:
+            os.environ["SGLANG_WEG2_L3_INHERITED_SUFFIXES"] = json.dumps(list(known))
+        else:
+            os.environ.pop("SGLANG_WEG2_L3_INHERITED_SUFFIXES", None)
+    # 28.09. (operator order): the same answer from the store's persistent
+    # index (snapshot + journals) -- the directory is walked only when the
+    # ranks would walk it too (snapshot missing/broken, another kernel boot).
+    from sglang.srt.mem_cache.storage.file import store_journal as _sj
+
+    if _sj.enabled():
+        got = _l3_attach_from_index(log, directory, dry, epoch, known, revoked)
+        if got is not None:
+            return got
+    # NF metal rc12z30c: this walk is THE one walk of the boot -- the full map
+    # it sees is persisted as the snapshot at once, so no rank walks after it
+    snap_items: Optional[List[Tuple[float, str, int]]] = (
+        [] if _sj.enabled() and not dry else None)
+
+    def _keep(st, name):
+        if snap_items is not None:
+            snap_items.append((st.st_mtime, name[:-4], max(st.st_blocks * 512, st.st_size)))
+
+    for root, _dirs, names in os.walk(directory):
+        for name in names:
+            p = os.path.join(root, name)
+            if ".tmp." in name:
+                if not dry:
+                    try:
+                        os.unlink(p)
+                        removed += 1
+                    except OSError:
+                        pass
+                continue
+            if not name.endswith(".bin"):
+                continue
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            size = st.st_blocks * 512
+            if revoked and any(t0 <= st.st_mtime <= t1 for t0, t1, _r in revoked):
+                if _l3_move_revoked(directory, root, name, dry):
+                    rev_n += 1
+                    rev_bytes += size
+                else:
+                    rev_failed += 1
+                    _keep(st, name)  # still on disk: the map must name it
+                continue
+            if known is not None and not name[:-4].endswith(known):
+                orphans += 1
+                orphan_bytes += size
+                if not dry:
+                    try:
+                        os.unlink(p)
+                        removed += 1
+                    except OSError:
+                        _keep(st, name)
+                continue
+            files += 1
+            nbytes += size
+            _keep(st, name)
+    walk_s = time.monotonic() - t0
+    if snap_items is not None:
+        snap_items.sort(key=lambda it: it[0])
+        try:
+            with _sj.snapshot_lock(directory):
+                _n, _b, _gone = _sj.persist(directory, snap_items, len(snap_items), int(epoch))
+            log(f"L3-PERSIST SNAPSHOT written by the one walk: {_n} files, {_b} B, "
+                f"{_gone} journal(s) of earlier boots folded in -- the ranks load it, none walks")
+        except (OSError, ValueError) as exc:
+            log(f"L3-PERSIST snapshot NOT written ({type(exc).__name__}: {exc}) -- the first "
+                f"rank walks once under the store lock")
+    log(
+        f"L3-PERSIST {'reuse' if files else 'fresh'} dir={directory} files={files} bytes={nbytes} "
+        f"({nbytes / host_ledger.GIB:.2f} GiB) orphans={orphans} ({orphan_bytes / host_ledger.GIB:.2f} GiB, "
+        + ("no suffix record yet: counted, kept" if known is None else
+           f"suffix in no group's record: {'would be ' if dry else ''}removed")
+        + f") staging+orphans_removed={removed}"
+        + (f" revoked={rev_n} ({rev_bytes / host_ledger.GIB:.2f} GiB, "
+           f"{'would be ' if dry else ''}moved to {directory.rstrip('/') + L3_REVOKED_SUFFIX}"
+           f"{f', {rev_failed} NOT moved (kept out of the count, still on disk)' if rev_failed else ''}"
+           f"; windows {[(time.strftime('%H:%M:%SZ', time.gmtime(a)), time.strftime('%H:%M:%SZ', time.gmtime(b)), r) for a, b, r in revoked]})"
+           if revoked else "")
+        + f" walk_s={walk_s:.1f} epoch={epoch:.3f}"
+        + (" (DRY-RUN: nothing removed)" if dry else "")
+        + " -- the ranks seed the L3 index and the evictor ledger from it at attach"
+    )
+    return files, nbytes, removed
+
+
+def _l3_attach_from_index(log: Log, directory: str, dry: bool, epoch: float,
+                          known: Optional[Tuple[str, ...]],
+                          revoked: List[Tuple[float, float, str]]
+                          ) -> Optional[Tuple[int, int, int]]:
+    """``l3_persist_attach`` without the walk: the pages, their bytes and
+    mtimes come from the persistent index (store_journal.load_index, the load
+    the ranks make). Same removals, derived instead of found:
+
+    - staging files: a write that died leaves its ``<final>.tmp.<uuid>`` only
+      after its ``R`` line with no ``C``/``A`` -- the open intents; their
+      staging names are globbed, nothing else is looked at;
+    - ORPHAN pages: indexed stems in no group's suffix record;
+    - revoked pages: indexed mtime inside a revoked window.
+
+    Every page removed or moved gets an ``E`` line in a launcher journal filed
+    under the PREVIOUS epoch, so the ranks' load (which replays every earlier
+    boot's journal) and the D owner's compaction see it -- the index never
+    keeps an entry the launcher unlinked. ``None`` = the index is unusable:
+    the caller walks, as the ranks will.
+    """
+    import glob
+
+    from sglang.srt.mem_cache.storage.file import store_journal as _sj
+
+    t0 = time.monotonic()
+
+    def _stat(stem):
+        try:
+            st = os.lstat(_sj.page_path(directory, stem))
+        except (OSError, ValueError):  # ValueError: a stem os.* cannot name (NUL byte)
+            return None
+        return (st.st_mtime, st.st_blocks * 512)
+
+    intents: List[str] = []
+    items, why = _sj.load_index(directory, stat_size=_stat, open_intents=intents)
+    if items is None:
+        log(f"L3-PERSIST index unusable ({why}) -- ONE walk of dir={directory}")
+        return None
+    jn = None  # opened at the first E line: an attach that removes nothing files no journal
+    now = time.time()
+
+    def _gone(size, stem):
+        nonlocal jn
+        if jn is None:
+            jn = _sj.JournalWriter(directory, "launcher", epoch=int(epoch) - 1)
+        jn.write("E", now, size, stem)
+    files = nbytes = removed = orphans = orphan_bytes = 0
+    rev_n = rev_bytes = rev_failed = 0
+    # 30.09. (27B dual1f 9pb9ex, launcher 101 % CPU in glob for minutes): one glob per open intent
+    # re-listed the intent's whole shard (~3200 names) -- 1.4M journal lines x 256 shards. List every
+    # directory ONCE and look the staging names up there; same files removed, O(entries) not O(intents x shard).
+    _listing: Dict[str, Dict[str, List[str]]] = {}
+
+    def _staging(final_path: str) -> List[str]:
+        d, base = os.path.split(final_path)
+        by_final = _listing.get(d)
+        if by_final is None:
+            by_final = {}
+            try:
+                names = os.listdir(d)
+            except OSError:
+                names = []
+            for n in names:
+                i = n.find(".tmp.")
+                if i > 0:
+                    by_final.setdefault(n[:i], []).append(os.path.join(d, n))
+            _listing[d] = by_final
+        return by_final.get(base, [])
+
+    def _shard_final(stem: str) -> str:
+        # the backend's shard rule WITHOUT page_path's existence probes: an open intent's page
+        # usually does not exist (the write died), and page_path then globs ALL shards per stem
+        pre = stem[:2]
+        shard = pre if len(pre) == 2 and all(c in "0123456789abcdef" for c in pre) else "zz"
+        return os.path.join(directory, shard, f"{stem}.bin")
+
+    for stem in intents:
+        final = _shard_final(stem)
+        for p in {final, os.path.join(directory, f"{stem}.bin")}:
+            for tmp in _staging(p):
+                if not dry:
+                    try:
+                        os.unlink(tmp)
+                        removed += 1
+                    except OSError:
+                        pass
+                    if jn is None:  # the shard changed: a journal write after it
+                        jn = _sj.JournalWriter(directory, "launcher", epoch=int(epoch) - 1)
+    dropped: List[str] = []
+    for stem, (mtime, size) in items.items():
+        if revoked and any(a <= mtime <= b for a, b, _r in revoked):
+            path = _sj.page_path(directory, stem)
+            if _l3_move_revoked(directory, os.path.dirname(path), os.path.basename(path), dry):
+                rev_n += 1
+                rev_bytes += size
+                if not dry:
+                    _gone(size, stem)
+                    dropped.append(stem)
+            else:
+                rev_failed += 1
+            continue
+        if known is not None and not stem.endswith(known):
+            orphans += 1
+            orphan_bytes += size
+            if not dry:
+                try:
+                    os.unlink(_sj.page_path(directory, stem))
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    continue  # still on disk: its entry stays
+                _gone(size, stem)
+                dropped.append(stem)
+            continue
+        files += 1
+        nbytes += size
+    if jn is not None:
+        jn.sync()
+    snap_note = ""
+    if not dry:
+        # the launcher is the boot's snapshot writer: the loaded map minus
+        # what it just removed, earlier boots' journals folded in -- before
+        # any rank starts, so every rank loads ONE snapshot and replays nothing
+        for stem in dropped:
+            items.pop(stem, None)
+        try:
+            with _sj.snapshot_lock(directory):
+                _n, _b, _jg = _sj.persist(
+                    directory, ((m, st, b) for st, (m, b) in items.items()), len(items),
+                    int(epoch))
+            snap_note = f" snapshot rewritten ({_n} files, {_jg} journal(s) folded in)"
+        except (OSError, ValueError) as exc:
+            snap_note = (f" snapshot NOT rewritten ({type(exc).__name__}: {exc}; the E lines "
+                         f"above carry the removals)")
+    log(
+        f"L3-PERSIST {'reuse' if files else 'fresh'} dir={directory} files={files} bytes={nbytes} "
+        f"({nbytes / host_ledger.GIB:.2f} GiB) orphans={orphans} ({orphan_bytes / host_ledger.GIB:.2f} GiB, "
+        + ("no suffix record yet: counted, kept" if known is None else
+           f"suffix in no group's record: {'would be ' if dry else ''}removed")
+        + f") staging+orphans_removed={removed} (staging of {len(intents)} open intent(s))"
+        + (f" revoked={rev_n} ({rev_bytes / host_ledger.GIB:.2f} GiB, "
+           f"{'would be ' if dry else ''}moved to {directory.rstrip('/') + L3_REVOKED_SUFFIX}"
+           f"{f', {rev_failed} NOT moved (kept out of the count, still on disk)' if rev_failed else ''})"
+           if revoked else "")
+        + f" index_s={time.monotonic() - t0:.2f} source=index ({why}), no walk{snap_note}"
+        + f" epoch={epoch:.3f}"
+        + (" (DRY-RUN: nothing removed)" if dry else "")
+        + " -- the ranks seed the L3 index and the evictor ledger from it at attach"
+    )
+    return files, nbytes, removed
+
+
+L3_CAP_FILE = "L3_CAP.json"
+
+
+def l3_persist_disk_sum(log: Log, root: str, directory: str, max_size_bytes: int,
+                        min_free_bytes: int, own_bytes: int, dry: bool) -> int:
+    """L3P, user 2026-09-27 "L3, jeder 150gb": every model's store has its own
+    cap, and they share ONE disk. Records this store's cap and size
+    (``L3_CAP.json``) and checks that what ALL stores may still grow by fits
+    the disk: sum over stores of (cap - bytes at its last attach) + min_free
+    <= free now. The other stores' bytes are as of THEIR last boot (named, not
+    re-walked). Over budget is a named WARNING with the numbers, never a
+    silent cap: a sibling store may never grow to its cap. Returns the
+    shortfall in bytes (0 = fits)."""
+    rec = {"max_size_bytes": int(max_size_bytes), "bytes_at_attach": int(own_bytes),
+           "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if not dry:
+        try:
+            tmp = os.path.join(directory, L3_CAP_FILE + ".w")
+            with open(tmp, "w") as f:
+                json.dump(rec, f)
+            os.replace(tmp, os.path.join(directory, L3_CAP_FILE))
+        except OSError as exc:
+            log(f"L3-PERSIST cap record not written ({type(exc).__name__}: {exc})")
+    growth = max(0, int(max_size_bytes) - int(own_bytes))
+    parts = [f"own={os.path.basename(directory)} grow={growth / 1e9:.1f} GB"]
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        names = []
+    for n in names:
+        d = os.path.join(root, n)
+        if not n.startswith(L3_PERSIST_PREFIX) or d == directory:
+            continue
+        if n.endswith(L3_REVOKED_SUFFIX):
+            parts.append(f"{n}=revoked pages held aside (no store; the user deletes)")
+            continue
+        try:
+            with open(os.path.join(d, L3_CAP_FILE)) as f:
+                o = json.load(f)
+            g = max(0, int(o["max_size_bytes"]) - int(o["bytes_at_attach"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            parts.append(f"{n}=no cap record")
+            continue
+        growth += g
+        parts.append(f"{n} grow={g / 1e9:.1f} GB (as of {o.get('utc', '?')})")
+    try:
+        st = os.statvfs(root)
+        free = st.f_bavail * st.f_frsize
+    except OSError:
+        log("L3-PERSIST DISK-SUM unreadable (statvfs failed) -- NOT checked")
+        return 0
+    need = growth + int(min_free_bytes)
+    short = max(0, need - free)
+    log(
+        f"L3-PERSIST DISK-SUM {'WARN' if short else 'ok'}: all L3 stores may still grow "
+        f"{growth / 1e9:.1f} GB + min_free {min_free_bytes / 1e9:.1f} GB = {need / 1e9:.1f} GB "
+        f"against {free / 1e9:.1f} GB free on {root}"
+        + (f" -- SHORT by {short / 1e9:.1f} GB: the disk cannot hold every store at its cap; "
+           f"lower --store-max-gb or free space (nothing is capped silently)" if short else "")
+        + f" [{'; '.join(parts)}]"
+    )
+    return short
+
+
 def sweep_store_residue(log: Log, keep: str, dry: bool, root: str = STORE_ROOT) -> int:
     """Remove PREVIOUS boots' store directories under :data:`STORE_ROOT`.
 
@@ -5217,7 +7547,10 @@ def sweep_store_residue(log: Log, keep: str, dry: bool, root: str = STORE_ROOT) 
     except OSError:
         log(f"store residue: {root} unreadable -- NOT swept, and not read as empty")
         return 0
+    # L3P: a persistent store (``l3-*``, this model's or another's) is never
+    # residue -- only the per-boot tag directories are.
     stale = [n for n in names if os.path.join(root, n) != keep
+             and not n.startswith(L3_PERSIST_PREFIX)
              and os.path.isdir(os.path.join(root, n))]
     if not stale:
         log(f"store residue: none under {root} (fresh store per boot)")
@@ -5613,7 +7946,9 @@ def common_flags(
         # from the model path by default and overridable by flag; never a
         # constant, because a constant here is a silent identity swap.
         "--served-model-name", served_model_name(model),
-        "--rank-gpu-id", "0,1,2",
+        # HW-GENERIC 1002 S2 (enabling): one rank per card in order_cards
+        # order -- the topology's rank map, "0,1,2" on the N=3 release.
+        "--rank-gpu-id", _topo.rank_gpu_id_csv(WEG2_CARD_COUNT),
         "--skip-server-warmup",
         "--kv-cache-dtype", KV_CACHE_DTYPE,
         "--context-length", str(CONTEXT_LENGTH_TOKENS),
@@ -5825,7 +8160,9 @@ def argv_p(
         # the size of P's req_to_token_pool (R-13), which is why it is
         # resolved before the budget solve and printed with it.
         "--max-running-requests", str(p_bs),
-        "--tp-size", "1", "--pp-size", "3",
+        # HW-GENERIC 1002 S2 (enabling): P = PP<N> over every card (TP1);
+        # from the topology, "--pp-size 3" on the N=3 release.
+        "--tp-size", "1", "--pp-size", str(_topo.release_topology(WEG2_CARD_COUNT).p_pp),
         # #692 MICROBATCH DEPTH, group P only -- group D runs pp_size=1 and a
         # pipeline depth is meaningless there. STATED even at 0 so the argv is
         # an honest statement of what the boot runs, and published ONCE as a
@@ -6286,7 +8623,9 @@ def argv_d(
         # residency without the number appearing. The value follows the
         # overlap choice exactly -- it is not a second knob.
         "--mamba-radix-cache-strategy", "no_buffer" if disable_overlap else "extra_buffer",
-        "--tp-size", "3", "--pp-size", "1",
+        # HW-GENERIC 1002 S2 (enabling): D = TP<N> (PP1) over every card;
+        # from the topology, "--tp-size 3" on the N=3 release.
+        "--tp-size", str(_topo.release_topology(WEG2_CARD_COUNT).d_tp), "--pp-size", "1",
         # OVERLAP SCHEDULE ON for D -- by ABSENCE of the disable flag, which
         # is the only way to have it: there is no --enable-overlap-schedule.
         # Every gate that forces it off was checked against THIS argv and
@@ -6962,6 +9301,234 @@ def _argv_scalar(extra: str, flag: str):
         elif tok.startswith(flag + "="):
             gefunden = tok[len(flag) + 1:]
     return gefunden
+
+
+#: P-COVERS-D-SESSION (user law 02.10. ~07:55Z): the boot-refusal marker.
+P_COVERS_D_SESSION_MARK = "P-COVERS-D-SESSION"
+
+
+def d_session_tokens(extra_d: str, max_kv_per_request: int) -> int:
+    """D's maximum decode session: the ``--max-kv-per-request`` group D runs
+    with (its ``--extra-d`` value wins, argparse keeps the last)."""
+    raw = _argv_scalar(extra_d, "--max-kv-per-request")
+    try:
+        return int(raw) if raw is not None else int(max_kv_per_request)
+    except (TypeError, ValueError):
+        return int(max_kv_per_request)
+
+
+def p_covers_d_session(argv_p_shipped: Sequence[str], d_session: int) -> Tuple[bool, str]:
+    """LAW (user 02.10. ~07:55Z): "kann nie passieren, weil P ja bis 262k
+    prefillen kann und eine einzelne D session nur maximal 262k haben kann.
+    das selbe gilt fuer yarn ... deswegen ja die stufen in P". P's KV stage
+    (its ``--max-total-tokens`` pool) and its per-request cap
+    (``--max-kv-per-request``) must each hold D's maximum session, so no
+    request is ever D's to prefill for a capacity reason (the CARRIER-EXCEEDS
+    route is deleted). Returns ``(ok, line)``; a term the shipped P argv does
+    not name is printed as unnamed, never assumed."""
+    d = int(d_session)
+    cap = _last_flag_value(argv_p_shipped, "--max-kv-per-request")
+    pool = _last_flag_value(argv_p_shipped, "--max-total-tokens")
+    short = []
+    for name, raw in (("P --max-kv-per-request", cap), ("P --max-total-tokens (KV stage)", pool)):
+        if raw is None:
+            continue
+        try:
+            if int(raw) < d:
+                short.append(f"{name}={int(raw)} < D session {d}")
+        except ValueError:
+            continue
+    line = (f"{P_COVERS_D_SESSION_MARK} D session (--max-kv-per-request)={d} "
+            f"P cap={cap if cap is not None else 'unnamed'} "
+            f"P stage pool={pool if pool is not None else 'unnamed'}")
+    if short:
+        return False, (line + " REFUSED: " + "; ".join(short) + " -- P must prefill every "
+                       "request D can hold (no D prefill for capacity, law 02.10.); raise P's "
+                       "stage (YaRN 524k / 786k) or lower D's --max-kv-per-request")
+    return True, line + " ok"
+
+
+def carrier_covers_d_session(carrier_max: int, d_session: int) -> Tuple[bool, str]:
+    """LAW 02.10. (second half): the carrier (D's host staging read, the
+    window loop's transit) must hold D's maximum session too -- below it the
+    front's W52 would refuse a prompt D can hold. Returns ``(ok, line)``."""
+    c, d = int(carrier_max), int(d_session)
+    line = f"{P_COVERS_D_SESSION_MARK} carrier_max={c} D session={d}"
+    if c > 0 and c < d:
+        return False, (line + " REFUSED: the carrier is below D's session -- raise D's L2 "
+                       "(it is derived from --max-kv-per-request) or lower --max-kv-per-request")
+    return True, line + " ok"
+
+
+def yarn_context_tokens(override_json) -> Optional[int]:
+    """YaRN x2 (27.09.): the context a YaRN rope override stretches the model
+    to -- ``original_max_position_embeddings x factor`` of a ``rope_type``
+    ``yarn`` block in ``--json-model-override-args`` (in ``text_config`` or at
+    the top level, ``rope_parameters`` or ``rope_scaling``); None without one.
+    The runtime derives the same number (``get_context_length``)."""
+    if not override_json:
+        return None
+    try:
+        args = json.loads(override_json) if isinstance(override_json, str) else dict(override_json)
+    except (TypeError, ValueError):
+        return None
+    for scope in (args.get("text_config"), args):
+        if not isinstance(scope, dict):
+            continue
+        for key in ("rope_parameters", "rope_scaling"):
+            rope = scope.get(key)
+            if (isinstance(rope, dict) and rope.get("rope_type", rope.get("type")) == "yarn"
+                    and rope.get("original_max_position_embeddings") and rope.get("factor")):
+                return int(int(rope["original_max_position_embeddings"]) * float(rope["factor"]))
+    return None
+
+
+def group_context_tokens(ns, group: str) -> Tuple[int, str]:
+    """YaRN x2 (27.09.): the context group ``group`` ('p'/'d') is launched
+    with, and where it comes from. argparse keeps the LAST ``--context-length``
+    and the group's ``--extra-*`` follows the common flags
+    (``CONTEXT_LENGTH_TOKENS``), so an extra value is the group's; without one
+    a YaRN override in the extra stretches it; else the rig's common value."""
+    extra = getattr(ns, f"extra_{group}", "") or ""
+    raw = _argv_scalar(extra, "--context-length")
+    if raw is not None:
+        try:
+            return int(raw), f"--extra-{group} --context-length"
+        except ValueError:
+            pass
+    yarn = yarn_context_tokens(_argv_scalar(extra, "--json-model-override-args"))
+    if yarn:
+        return yarn, f"--extra-{group} YaRN override (original x factor)"
+    return CONTEXT_LENGTH_TOKENS, "CONTEXT_LENGTH_TOKENS"
+
+
+def group_kv_tokens(ns, group: str) -> Tuple[int, str]:
+    """YaRN x2 (27.09.): the KV tokens the form of group ``group`` must hold
+    -- its context (#77: the whole context is the duty), or its
+    ``--max-total-tokens`` pool where that is larger. Replaces the fixed
+    CONTEXT_LENGTH_TOKENS of the D solve: a 524288 form priced at 262144
+    'fitted' by 3.5 GiB on TP0 it does not have."""
+    ctx, src = group_context_tokens(ns, group)
+    raw = _argv_scalar(getattr(ns, f"extra_{group}", "") or "", "--max-total-tokens")
+    try:
+        pool = int(raw) if raw is not None else 0
+    except ValueError:
+        pool = 0
+    if pool > ctx:
+        return pool, f"--extra-{group} --max-total-tokens (> context {ctx} from {src})"
+    return ctx, src
+
+
+def _rope_cache_cols(cfg: dict) -> int:
+    """Columns of the cos/sin cache ``get_rope`` builds for this config: the
+    rotary dim = head_dim x partial_rotary_factor (text sub-config first, the
+    v5 ``rope_parameters`` or the top level for the factor). 0 = unreadable."""
+    text = cfg.get("text_config") or cfg
+    head_dim = text.get("head_dim") or (
+        int(text["hidden_size"]) // int(text["num_attention_heads"])
+        if text.get("hidden_size") and text.get("num_attention_heads") else 0)
+    rope = text.get("rope_parameters") or text.get("rope_scaling") or {}
+    factor = rope.get("partial_rotary_factor", text.get("partial_rotary_factor", 1.0))
+    try:
+        return int(int(head_dim) * float(factor if factor is not None else 1.0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def p_rope_context_delta_mib(ns, n_stages: int) -> Tuple[Tuple[float, ...], Optional[str]]:
+    """YaRN x2 27B (29.09.): the per-stage VRAM the EAGER RoPE cos/sin cache
+    grows by when group P boots a longer context than the one its per-stage
+    posts (``--pp-cut-stage-fixed-mib``, P_PP_STAGE_FIXED_MIB) were read at.
+
+    ``reserve_rope_cache_for_long_sequences`` sizes every cache to the context
+    (fp32, ``rows x rotary_dim``) in ``load_model``, i.e. BEFORE the KV pool is
+    sized, so the growth comes straight out of the pool. MEASURED at 262144
+    (dkr27browauthoritybar1fs09290956, P): 'MRotaryEmbedding 262528x64 float32
+    64.1 MiB' on PP0/PP1/PP2 and the DFlash2 draft's 'RotaryEmbedding
+    262528x128 float32 128.2 MiB' on PP2 (the draft sits cold on the last
+    stage). At 524288 the pool model would otherwise price PP0 +64 MiB and PP2
+    +192 MiB too optimistic -- 4.1k / 24.6k tokens under the cap+chunk floor
+    it promised (per_request_max > realised pool). Delta = (ctx - 262144) x
+    cols x 4 B; target on every stage, the DFLASH draft on the last one.
+    ``((0,)*n, None)`` at or below 262144 -- every x1 form is byte-identical."""
+    zero = tuple(0.0 for _ in range(int(n_stages)))
+    if n_stages <= 0:
+        return zero, None
+    ctx, src, extra_rows, tcols, dcols, dname = _rope_context_terms(ns, "p")
+    if extra_rows <= 0:
+        return zero, None
+    per_col = extra_rows * 4 / (1024.0 * 1024.0)
+    delta = [tcols * per_col for _ in range(int(n_stages))]
+    delta[-1] += dcols * per_col
+    line = (f"PP-CUT ROPE-KONTEXT (YaRN x2 27B): P context {ctx} (from {src}) > {CONTEXT_LENGTH_TOKENS} "
+            f"(the posts' context) -> eager cos/sin cache +{extra_rows} rows x 4 B: target {tcols} cols "
+            f"= +{tcols * per_col:.1f} MiB on every stage"
+            + (f", draft {dname} {dcols} cols = +{dcols * per_col:.1f} MiB on the last stage" if dcols else "")
+            + f"; stage_fixed += {[round(x, 1) for x in delta]} MiB")
+    return tuple(delta), line
+
+
+def _rope_context_terms(ns, group: str):
+    """The ONE reading behind every RoPE-context delta (P pool floor, W11/W11b, D's dormant reserve):
+    ``(ctx, src, extra_rows, target_cols, draft_cols, draft_name)`` for group ``group``; extra_rows <= 0 at or
+    below 262144 (the rig's posts and records were measured there), and then no config is read."""
+    ctx, src = group_context_tokens(ns, group)
+    extra_rows = int(ctx) - CONTEXT_LENGTH_TOKENS
+    if extra_rows <= 0:
+        return ctx, src, extra_rows, 0, 0, None
+    tcols, dcols, dname = _rope_cols(ns)
+    return ctx, src, extra_rows, tcols, dcols, dname
+
+
+def _rope_cols(ns) -> Tuple[int, int, Optional[str]]:
+    """Cos/sin cache columns of the target and (DFLASH) the draft -- context-free; read from the configs."""
+    try:
+        tcols = _rope_cache_cols(_model_config(str(ns.model)))
+    except (OSError, ValueError, KeyError):
+        tcols = 0
+    dcols, dname = 0, None
+    if str(getattr(ns, "spec_form", "") or "").upper() == "DFLASH":
+        dpath = str(getattr(ns, "dflash_draft_path", "") or DFLASH_DRAFT_PATH_DEFAULT)
+        try:
+            dcols = _rope_cache_cols(_model_config(dpath))
+            dname = os.path.basename(dpath.rstrip("/"))
+        except (OSError, ValueError, KeyError):
+            dcols = 0
+    return tcols, dcols, dname
+
+
+def d_rope_context_delta_mib(ns, from_ctx: int = CONTEXT_LENGTH_TOKENS) -> Tuple[float, Optional[str]]:
+    """YaRN x2 27B (29.09., zw4skn W19 at the first P wake): group D's per-rank share of the RoPE context
+    growth, from the SAME reading as :func:`p_rope_context_delta_mib`. D is TP -- every rank builds the whole
+    target's cos/sin cache AND the DFlash draft's -- and both stay resident while D sleeps, so D's dormant
+    residue (the x1 record behind ``dc_expect_d``) grows by (target + draft cols) x extra rows x 4 B on every
+    card. MEASURED dkr27browauthorityyarn2bar1fs09291825 (z30y3g, 524288): D_c(D) 2146 / 1718 / 1718 against the
+    reserve 2106 / 1678 / 1678 built from the x1 record 1786 / 1358 / 1358 + 256 + 64 -> W19. ``(0.0, None)`` at
+    or below 262144: every x1 reserve is byte-identical.
+
+    ``from_ctx`` = the context the residue it is added to was MEASURED at (a record stamps
+    ``vram_residue_context_tokens`` when it is not 262144; the constants are 262144): the delta is the
+    difference, so a record measured at 524288 prices 0 for a 524288 boot and a NEGATIVE delta for an x1 boot
+    (its own residue already carries the larger caches)."""
+    ctx, src = group_context_tokens(ns, "d")
+    if int(ctx) == int(from_ctx) or (int(ctx) <= CONTEXT_LENGTH_TOKENS and int(from_ctx) <= CONTEXT_LENGTH_TOKENS):
+        return 0.0, None
+    tcols, dcols, dname = _rope_cols(ns)
+    rows = int(ctx) - int(from_ctx)
+    per_col = rows * 4 / (1024.0 * 1024.0)
+    delta = (tcols + dcols) * per_col
+    return delta, (f"D ROPE-KONTEXT (YaRN x2 27B): D context {ctx} (from {src}) vs {int(from_ctx)} (the dormant "
+                   f"residue's measured context) -> {rows:+d} rows x 4 B x (target {tcols} + draft "
+                   f"{dname or '-'} {dcols}) cols = {delta:+.1f} MiB per D rank, resident in the dormant image")
+
+
+def p_rope_draft_delta_mib(ns) -> float:
+    """YaRN x2 27B (29.09., heu5g3 W11b death): the DFlash draft's share of :func:`p_rope_context_delta_mib`
+    -- the SAME function, read at two stages (target on both, the draft only on the last), so the W11 draft
+    budget and the W11b build accounting price exactly the MiB the P pool floor already priced. 0.0 at or
+    below 262144 (every x1 form byte-identical) and without a DFLASH draft."""
+    delta, _line = p_rope_context_delta_mib(ns, 2)
+    return max(0.0, float(delta[-1]) - float(delta[0]))
 
 
 def _argv_vector(extra: str, flag: str):
@@ -7971,6 +10538,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # zaehlen"). Gemessen w128: Hotset 1 Id -> 511 Store-Slots;
               # die Karte rechnet fuer dieselbe Form 354.
               expert_map_path: str = "",
+              # H2c: wessen Checkpoint und Karte die Store-Sentinels dieses
+              # Boots belegen (expert_store.compute_identity); BEIDE Gruppen
+              # dieselbe Zeichenkette, sonst adoptiert D nichts.
+              expert_store_identity: str = "",
               # Task #58: which vision form this boot runs. Published as
               # SGLANG_WEG2_VISION for the P group ONLY (see below).
               vision: str = VISION_OFF,
@@ -8070,6 +10641,12 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     if expert_map_path:
         # BEIDE Gruppen, derselbe Pfad -- das ist der ganze Punkt der Karte.
         env["SGLANG_MOE_EXPERT_MAP"] = expert_map_path
+    # H2c: Launcher-Ausgabe wie die Karte -- ohne Karte keine Identitaet, und
+    # ein Wert aus der Shell des Operators darf nie einen fremden Store adeln.
+    if expert_map_path and expert_store_identity:
+        env["SGLANG_MOE_EXPERT_STORE_IDENTITY"] = expert_store_identity
+    else:
+        env.pop("SGLANG_MOE_EXPERT_STORE_IDENTITY", None)
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
     # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
     # by ring_table from the previous boot's own lines, and the whole family is
@@ -8406,7 +10983,8 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
             env.setdefault(
                 P_PREFILL_TRANSIENT_ENV,
                 ",".join(
-                    "%.0f" % v for v in p_prefill_transient_vector_mib(P_CHUNKED_PREFILL_TOKENS)
+                    "%.0f" % v for v in p_prefill_transient_vector_mib(
+                        P_CHUNKED_PREFILL_TOKENS, getattr(boot_form, "profile", None) or None)
                 ),
             )
     else:
@@ -8502,7 +11080,8 @@ _CARD_FREE_RE = tolerant_compile(r"WEG2 DRAFT-KV-PRODUCER armed .*card_free_mib=
 P_DRAFT_BUILD_ACCOUNTING_TOL_MIB = 256.0
 
 
-def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = None) -> Dict[str, object]:
+def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = None,
+                         rope_ctx_mib: float = 0.0) -> Dict[str, object]:
     """W11 (#1233 fix 2, second instrument added in fix 6): the producer's
     build on P's last stage, graded by TWO independent readings of the L2 line.
 
@@ -8527,6 +11106,12 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
     """
     budget = (float(_pconst("P_DRAFT_RESIDENT_BUDGET_MIB")) if budget_mib is None
               else float(budget_mib))
+    # YaRN x2 27B (heu5g3, 29.09.): the draft's eager RoPE cache grows with the context BEYOND the budget's
+    # 262144 (p_rope_draft_delta_mib): resident +128 MiB at 524288 (262528 -> 524672 rows x 128 cols fp32), and
+    # its build writes it once more through the allocator (NVML +254 MiB, unaccounted 149.5 -> 275.5). The budget
+    # takes the delta, the accounting explains the same delta once. 0 at x1: byte-identical.
+    rope_ctx = max(0.0, float(rope_ctx_mib or 0.0))
+    budget += rope_ctx
     tol = P_DRAFT_RESIDENT_TOL_MIB if tol_mib is None else float(tol_mib)
     out: Dict[str, object] = {
         "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
@@ -8537,6 +11122,8 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
         "resident_ok": False, "accounted": False, "ok": False,
     }
+    if rope_ctx > 0:
+        out["rope_ctx_mib"] = rope_ctx
     try:
         with open(log_p, errors="replace") as f:
             for line in f:
@@ -8622,10 +11209,10 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         other_live = out.get("other_live_mib")
         other_live = 0.0 if other_live is None or float(other_live) < 0 else float(other_live)
         if torch_cached >= 0:
-            out["unaccounted_mib"] = delta - (r + other_live + torch_cached + outside)
+            out["unaccounted_mib"] = delta - (r + other_live + torch_cached + outside + rope_ctx)
             out["cache_term"] = "torch_total"
         else:
-            out["unaccounted_mib"] = delta - (r + other_live + released + pooled + outside)
+            out["unaccounted_mib"] = delta - (r + other_live + released + pooled + outside + rope_ctx)
             out["cache_term"] = "tag_pool+head_released"
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
@@ -8664,7 +11251,7 @@ def gate_w10(log_p: str, log_d: str, log, *, p_produces_draft_pages: bool) -> Di
     return w10
 
 
-def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
+def gate_w11(log_p: str, log: Log, rope_ctx_mib: float = 0.0) -> Dict[str, object]:
     """THE LAUNCHER'S W11 GATE, both instruments and both refusals.
 
     Grades group P's last-stage draft build from its log (see
@@ -8693,7 +11280,7 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         _w11_budget = float(
             sum(dflash_draft_family_bytes(str(_SPEC_FORM["draft_path"])).values())
         ) / float(1 << 20)
-    w11 = check_draft_resident(log_p, budget_mib=_w11_budget)
+    w11 = check_draft_resident(log_p, budget_mib=_w11_budget, rope_ctx_mib=rope_ctx_mib)
     log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
         f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
         f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
@@ -8701,7 +11288,9 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         f"+ outside_torch_mib={w11['outside_torch_mib']} "
         f"+ default_pool_inactive_mib={w11['default_pool_inactive_mib']} "
         f"+ other_live_mib={w11.get('other_live_mib')} "
-        f"+ unaccounted_mib={w11['unaccounted_mib']} cache_term={w11.get('cache_term')} "
+        + (f"+ rope_ctx_mib={w11['rope_ctx_mib']:.1f} (YaRN draft RoPE context, budget and build) "
+           if w11.get("rope_ctx_mib") else "")
+        + f"+ unaccounted_mib={w11['unaccounted_mib']} cache_term={w11.get('cache_term')} "
         f"card_free_mib={w11.get('card_free_mib')} "
         f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
         f"ok={w11['ok']}")
@@ -8960,6 +11549,9 @@ class LaunchGuard:
                 nr = pr.get("nonreclaim_gib")
                 if nr is not None:
                     f, sh = pr.get("file_gib"), pr.get("shmem_gib")
+                    # W98 z30w: in the Docker form /proc/meminfo is the HOST's;
+                    # the pool and the ceiling come from this cgroup.
+                    free, free_src, ceiling = host_ledger.latch_free_pool(pr)
                     line = self._latch.observe(
                         time.time(), float(nr),
                         cushion_gib=(
@@ -8967,7 +11559,9 @@ class LaunchGuard:
                             else float(f) - float(sh)
                         ),
                         shmem_gib=None if sh is None else float(sh),
-                        free_gib=pr.get("memfree_gib"),
+                        free_gib=free,
+                        ceiling_gib=ceiling,
+                        free_source=free_src,
                     )
                     self.ticks += 1
                     if line is not None:
@@ -9342,6 +11936,21 @@ def weg2_weights_cpu_backup_ring_kw(
     return 0, 0, True
 
 
+def pinned_reserve_line(ledger_gib, ledger_src: str = "") -> str:
+    """29.09.: the WEG2-HOST PINNED-RESERVE line -- the reserve the ranks'
+    pinned-host checks will ACTUALLY use (read back through
+    pinned_host_reserve(), after the export) with its source: env (explicit
+    SGLANG_PINNED_HOST_RESERVE_GIB), ledger (the host ledger's measured
+    margin) or native (10 GiB, no finite cgroup); plus the number the
+    ledger's PINNED WALL was priced with, so a mismatch is visible."""
+    from sglang.srt.mem_cache import pinned_host_budget as _phb
+
+    gib, kind, detail = _phb.pinned_host_reserve_effective()
+    wall = "none (no finite memory.max)" if ledger_gib is None else f"{float(ledger_gib):.2f} GiB ({ledger_src})"
+    return (f"WEG2-HOST PINNED-RESERVE effective={gib:.2f} GiB source={kind} ({detail}) "
+            f"ledger_wall_reserve={wall}")
+
+
 def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
@@ -9349,6 +11958,15 @@ def choose_host_ledger(
     d_draft_host_gib: float = 0.0,
     memhist_gib: float = 0.0,
     memhist_run_only: bool = False,
+    l3_index_gib: float = 0.0,
+    # 29.09. (Planer post COLD_TIER_SHM): the tmpfs expert store, GiB, both
+    # moments -- `cold_tier_shm_post` sizes it from the map, never from df.
+    cold_tier_shm_gib: float = 0.0,
+    # 29.09.: the groups' own env (--env-d, --env-p); the arena term reads
+    # its sizes through it, not through the launcher env alone.
+    group_envs: Optional[Sequence[Dict[str, str]]] = None,
+    # 29.09.: the host census posts of this model|form (host_census.ledger_terms)
+    census: Optional[Dict[str, object]] = None,
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
@@ -9666,9 +12284,15 @@ def choose_host_ledger(
         # rc12d: the torch allocation history (weg2/memhist.py) -- 5.4 GiB of
         # host nobody booked when it was armed from rank start in P and D.
         memhist_gib=float(memhist_gib), memhist_run_only=bool(memhist_run_only),
+        # 28.09.: the L3 store's RAM index (ledger post 'l3_index'), every owner.
+        l3_index_gib=float(l3_index_gib),
+        # 29.09.: the tmpfs expert store (Planer post COLD_TIER_SHM).
+        cold_tier_shm_gib=float(cold_tier_shm_gib),
+        # 29.09.: measured non-rank anon / lane ring / arena sidecar / hand-off
+        census=census,
         # #1451: no arena on a --weg2-disable-hicache boot -- the term charged
         # 33.6 GiB there too (test_weg2_hicache_disabled_1386 M=2400 unfundable)
-        **(_weg2_arena_ledger_terms(model_dir) if (model_dir and not hicache_disabled) else {}),  # #1432
+        **(_weg2_arena_ledger_terms(model_dir, group_envs) if (model_dir and not hicache_disabled) else {}),  # #1432
         # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
         # block for exactly the reason the block exists (boot weg2sn6a died of
         # a price() call that had drifted from choose()'s keywords): a term
@@ -9744,6 +12368,13 @@ def choose_host_ledger(
         d_only=bool(d_only),
         reference_model_ok=_ref_ok,
         reference_model_why=_ref_why,
+        # 29.09. NF1c (H87): the footprint keys the margin's OWN-MODEL
+        # residual rows; only read when the checkpoint is not the reference
+        # (form.footprint_key is cached per checkpoint stamp).
+        model_footprint=(
+            (weg2_form.footprint_key(model_dir)[0] or "")
+            if (model_dir and _ref_ok is False) else ""
+        ),
         # #1273 S6: the exchange's own pinned host carrier.  The ARM STRINGS
         # decide it here, at the one ledger call site, and not inside the
         # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
@@ -9843,15 +12474,181 @@ def choose_host_ledger(
 #: KV-page and the GDN-blob marker of that rank (fnFL2 v18, 21.09.: D READY
 #: with 1 host + 2 workers was refused "kv x1 blob x1, need 3 each").
 FORM_A_WORKER_CANONICAL_MARKER = "this rank is a Form A expert worker (no attention layer) -- no page window"
+#: #239 S3h/F14 (rc12z29d, 28.09. 20:34:28Z): under the KV token cut a Form A
+#: worker that owns token rows builds a whole-page KV window
+#: (cache_controller, F14 branch) and says so with THIS line instead of the
+#: no-window one. It is that rank's canonical KV page; it holds no GDN blob
+#: (the recurrent state stays the attention host's), so like the no-window
+#: line it stands in for the blob marker of that rank. W7/W10 counted only the
+#: old line and refused the first cut boot that reached READY:
+#: "D logged kv x1 blob x1, need 3 each" (TP0 #706 lines + 2 F14 workers).
+FORM_A_KV_WORKER_CANONICAL_MARKER = "#239 F14 KV-WORKER-WINDOW: Form A worker owns token rows"
 
 
 def canonical_marker_counts(path: str) -> tuple:
     """(kv, blob, workers): the #706 KV-page and GDN-blob markers of a group
-    log, each worker line counted once into both."""
+    log, each worker line (no-window or F14 KV window) counted once into both."""
+    # IPC-LOG-EXCEPTION: comparison number only -- canonical_state_gate decides on the
+    # RankState records and merely REPORTS a disagreement ('IPC MISMATCH').
     n_kv = count_marker(path, "#706 canonical KV page active")
     n_blob = count_marker(path, "canonical GDN blob active")
-    n_worker = count_marker(path, FORM_A_WORKER_CANONICAL_MARKER)
+    n_worker = (count_marker(path, FORM_A_WORKER_CANONICAL_MARKER)
+                + count_marker(path, FORM_A_KV_WORKER_CANONICAL_MARKER))
     return n_kv + n_worker, n_blob + n_worker, n_worker
+
+
+def d_kv_worker_ranks(extra_d: str) -> List[int]:
+    """#239 F14: the Form A workers (``--rank-tp-ratio`` 0) that own token rows
+    under the cut D runs (``--uneven-token-vector``) -- exactly the ranks that
+    must build a canonical KV window. Empty without a cut or outside Form A."""
+    toks = _argv_vector(extra_d or "", "--uneven-token-vector")
+    tp = _argv_vector(extra_d or "", "--rank-tp-ratio")
+    if not toks or not tp or len(toks) != len(tp):
+        return []
+    try:
+        return [r for r, (t, w) in enumerate(zip(toks, tp))
+                if float(w) == 0.0 and float(t) > 0.0]
+    except ValueError:
+        return []
+
+
+_STATE_MISSING_LOGGED: set = set()
+
+
+def boot_state_dir() -> Optional[str]:
+    """IPC §2.2: the boot's state/<boot_id>/ directory (WEG2_STATE_DIR, mounted by
+    the arm), or None -- then the launcher writes no state and the rank records
+    stay next to the group logs."""
+    return envs.WEG2_STATE_DIR.get() or None
+
+
+def boot_state_write(log: Log, state: Optional[str] = None, *, cause: Optional[dict] = None,
+                     fields: Optional[dict] = None, event: Optional[Tuple[str, dict]] = None) -> None:
+    """Write the launcher's own fields of state.json through the ONE shared writer
+    (weg2/state_file.py, writer=launcher: groups.*, invariants.*, loading/ready,
+    dead with origin launcher|rank). The host writer creates the file; while it
+    does not exist the launcher says so once and writes nothing. A write the
+    order forbids (another writer is already further) is a no-op there, never an
+    error here."""
+    d = boot_state_dir()
+    if not d:
+        return
+    if not os.path.exists(os.path.join(d, "state.json")):
+        if d not in _STATE_MISSING_LOGGED:
+            _STATE_MISSING_LOGGED.add(d)
+            log(f"IPC STATE: {d}/state.json missing -- the host writer creates it; the launcher writes no state")
+        return
+    try:
+        if state is not None or cause is not None or fields:
+            state_file_mod.transition(d, state, cause=cause, fields=fields, writer="launcher")
+        if event is not None:
+            state_file_mod.add_event(d, event[0], event[1], writer="launcher")
+    except OSError as e:
+        log(f"IPC STATE WRITE FAILED ({type(e).__name__}): {e}")
+
+
+_CAUSE_RE = re.compile(r"\b(W\d+[a-z]?)\s+(Weg2[A-Za-z0-9]+)")
+
+
+def refusal_cause(e: BaseException) -> dict:
+    """A launcher refusal as §2.2 cause: code = W-number + name (never the bare
+    W-number, 27B requirement 6), origin launcher, the full text."""
+    msg = str(e)
+    m = _CAUSE_RE.search(msg)
+    if m:
+        code, name = f"{m.group(1)}_{m.group(2)}", m.group(2)
+    else:
+        name = type(e).__name__
+        code = f"{_w_code_of(e)}_{name}"
+    return state_file_mod.make_cause(code, "launcher", msg, name=name, exception_type=type(e).__name__)
+
+
+def rank_state_dir_for(spec: GroupSpec) -> str:
+    """Where group ``spec``'s ranks write their RankState: rankstate/<G> inside the
+    boot's state directory (§2.2), else next to the group log (Phase 1)."""
+    d = boot_state_dir()
+    if d:
+        return os.path.join(d, "rankstate", spec.name)
+    return rank_state_mod.rank_state_dir_for_log(spec.log)
+
+
+def canonical_state_gate(spec: GroupSpec, expected: int, log: Log,
+                         kv_owner_ranks: Sequence[int] = ()) -> None:
+    """IPC Phase 1: the launcher half of W7/W10 decided on the ranks'
+    RankState records (weg2/rank_state.py), not on counted log lines.
+
+    rc12z29d (28.09. 20:29Z) booted D clean and was refused as 'kv x1 blob
+    x1': under the uneven-DCP cut the Form A workers print '#239 F14
+    KV-WORKER-WINDOW' and the count knew only the older worker line. The log
+    count still runs beside the records and a disagreement is REPORTED
+    ('IPC MISMATCH'), but it no longer decides."""
+    state_dir = rank_state_dir_for(spec)
+    states, bad = rank_state_mod.read_group_states(state_dir)
+    verdict = rank_state_mod.grade_canonical(states, expected, group=spec.name)
+    for b in bad:
+        verdict.ok = False
+        verdict.reasons.append(f"unreadable record {b}")
+    # #239 F14 (a33ee80394), kept under the records: a worker the launcher's own
+    # argv gives token rows must REPORT the KV page as applicable and active --
+    # a rank that under-reports applicability would otherwise pass as 'n/a'.
+    _by_tp = {s.tp_rank: s for s in states if s.pp_rank == 0}
+    for r in kv_owner_ranks:
+        s = _by_tp.get(int(r))
+        if s is None or not (s.kv_page_applicable and s.kv_page_active):
+            verdict.ok = False
+            verdict.reasons.append(
+                f"tp{r} owns token rows under the cut but reports kv "
+                f"{'missing' if s is None else f'applicable={s.kv_page_applicable} active={s.kv_page_active}'}")
+    log(f"W7/W10 launcher half, group {spec.name} RankState ({state_dir}): {verdict.line()}")
+    rank_vram_display(spec, log, states=states)
+    # IPC-LOG-EXCEPTION: reported, never decides (see canonical_marker_counts).
+    n_kv, n_blob, n_worker = canonical_marker_counts(spec.log)
+    if (n_kv, n_blob) != (verdict.n_kv, verdict.n_blob):
+        log(f"IPC MISMATCH W7/W10 group {spec.name}: log count kv x{n_kv} blob x{n_blob} "
+            f"(worker lines x{n_worker}) vs RankState kv x{verdict.n_kv} blob x{verdict.n_blob} "
+            f"-- the records decide, the log count is reported only")
+    boot_state_write(log, fields={
+        f"groups.{spec.name}.ranks": [json.loads(s.to_json()) for s in states],
+        f"groups.{spec.name}.rankstate_dir": state_dir,
+        f"invariants.W7_W10_CanonicalWindow.{spec.name}": {
+            "verdict": "pass" if verdict.ok else "refuse",
+            "per_rank": [{"rank": k, "state": v} for k, v in sorted(verdict.by_rank.items())],
+            "why": verdict.line()},
+    })
+    if not verdict.ok:
+        raise Weg2LaunchRefused(
+            f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half, RankState): "
+            f"group {spec.name} {verdict.line()}")
+
+
+def rank_vram_display(spec: GroupSpec, log: Log, states: Optional[list] = None) -> int:
+    """VRAM-Vertrag M2, DISPLAY ONLY: the ranks' RankState ``vram`` blocks
+    (weg2/vram_actual.py) as one human line per rank, and -- when re-read
+    later than the W7/W10 gate -- the fresh records into
+    ``groups.<G>.ranks`` of state.json. Nothing here decides; a rank without
+    a block (SGLANG_WEG2_VRAM_ACTUAL off) is simply not shown. Returns the
+    number of blocks shown."""
+    fresh = states is None
+    if fresh:
+        states, _bad = rank_state_mod.read_group_states(rank_state_dir_for(spec))
+    from sglang.srt.weg2 import vram_actual as vram_actual_mod
+
+    n = 0
+    for s in sorted(states, key=lambda x: x.rank_key):
+        if s.vram_refused is not None:
+            # a finding, never a refusal: the record's other facts stand
+            log(f"VRAM-ACTUAL-BLOCK-REFUSED group {spec.name} {s.rank_key}: {s.vram_refused}")
+            boot_state_write(log, event=("vram_actual_block_refused", {
+                "group": spec.name, "rank": s.rank_key, "code": "VRAM_ACTUAL_BLOCK_REFUSED",
+                "why": s.vram_refused}))
+        if s.vram is None:
+            continue
+        n += 1
+        log(f"VRAM-ACTUAL group {spec.name} {s.rank_key}: "
+            f"{vram_actual_mod.VramBlock.from_dict(s.vram).line()}")
+    if fresh and n:
+        boot_state_write(log, fields={f"groups.{spec.name}.ranks": [json.loads(s.to_json()) for s in states]})
+    return n
 
 
 def count_marker(path: str, marker: str) -> int:
@@ -9879,6 +12676,17 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
         shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv)))
     if dry:
         return
+    # IPC Phase 1: the ranks write their RankState next to the group log;
+    # records of an earlier launch into the same log path are removed first,
+    # so a record the launcher grades is always THIS launch's.
+    _rs_dir = rank_state_dir_for(spec)
+    _rs_old = rank_state_mod.clear_rank_state_dir(_rs_dir)
+    spec.env[rank_state_mod.RANK_STATE_ENV] = _rs_dir
+    log(f"group {spec.name} rank state -> {_rs_dir}" + (f" ({_rs_old} record(s) of an earlier launch removed)" if _rs_old else ""))
+    if spec.name in ("P", "D"):
+        # W98 (z30u): Stufe 2b's keeper writes its kept ranges here; the
+        # launcher drops exactly those once D is ready (release_shared_cache).
+        spec.env[shared_cache_release_mod.MANIFEST_ENV] = shared_cache_release_mod.manifest_dir_for(spec.log)
     fh = open(spec.log, "ab")
     _logged_argv = ' '.join(shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv))
     fh.write(f"=== WEG2 group {spec.name} launched {_now()} ===\nargv: {_logged_argv}\n".encode())
@@ -9888,11 +12696,61 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     spec.pid = p.pid
     spec.proc = p
     log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log}")
+    if spec.name in ("P", "D"):
+        # Nutzer 29.09.: rigdash liest daraus „aktiv“ je Schalter (argv redigiert wie im Log).
+        boot_state_write(log, "loading", fields={f"groups.{spec.name}": {
+            "state": "loading", "pids": [p.pid], "ready_ts": None, "rankstate_dir": _rs_dir, "ranks": [],
+            "launch": state_file_mod.launch_snapshot(admin_key_mod.redact_argv(spec.argv), spec.env),
+            "form": group_form_block(spec.env)}})
+
+
+def group_form_block(env) -> Optional[dict]:
+    """DASHBOARD-AUS-IPC (e): the boot form this group was handed (the one
+    :data:`weg2_form.FORM_ENV` every rank reads), as ``groups.<G>.form`` -- the
+    rigdash's start form then comes from state.json, not from the log's
+    WEG2-FORM line. ``None`` = no weg2 form published (teardown, desk test)."""
+    f = weg2_form.current_form(env)
+    if f is None:
+        return None
+    return {**f.axes(), "profile": f.profile, "model": f.model, "describe": f.describe()}
+
+
+def front_launch_fields(argv: Sequence[str], env: Dict[str, str]) -> dict:
+    """Nutzer 29.09. (rigdash „komplette Startflags inkl. ENV“): state.json
+    launch.front = das exec'te argv der Front (redigiert wie im Log) + ihre Umgebung."""
+    return {"launch.front": state_file_mod.launch_snapshot(admin_key_mod.redact_argv(argv), env)}
+
+
+def release_shared_cache(spec_d: GroupSpec, log: Log) -> Optional[dict]:
+    """W98 (z30u): BOOTZEIT 3 Stufe 2b's kept ranges dropped AFTER group D is
+    ready -- D's take-over is over, so the boot time does not pay for it. One
+    measured line (advised vs evicted by mincore, memory.current before/after)
+    plus the event ``shared_cache_release`` in state.json's events. No manifest
+    = 2b was off = nothing to do, nothing said."""
+    d = shared_cache_release_mod.manifest_dir_for(spec_d.log)
+    if not os.path.isdir(d):
+        return None
+    try:
+        rec = shared_cache_release_mod.release(d, read_pressure=host_ledger.read_cgroup_pressure)
+    except Exception as e:  # noqa: BLE001 -- a lost release costs cache, never the boot
+        log(f"{shared_cache_release_mod.MARKER} FAILED ({type(e).__name__}): {e}")
+        return None
+    if rec is None:
+        return None
+    log(shared_cache_release_mod.line(rec))
+    boot_state_write(log, event=("shared_cache_release", rec))
+    return rec
 
 
 def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, tag: str, name: str, dry: bool) -> int:
     out = f"{GPU_ARB}/deadman_{tag}_{name}.out"
-    cmd = f"GRACE_S=600 PROBE_S={probe_s} setsid {DEADMAN} {shlex.quote(boot_log)} {port} {shlex.quote(pattern)} > {shlex.quote(out)} 2>&1 & echo $!"
+    # IPC Phase 2 (IPC-VERBRAUCHER-27B A4/N4): the deadman writes its verdict into the
+    # boot's state (event deadman_verdict + stop_request.json) through the ONE writer,
+    # and reads READY from groups.<G>.state -- WEG2_STATE_DIR is inherited; these name
+    # the group, the interpreter and the writer file (the image has no sglang on PATH).
+    ipc = (f"WEG2_DEADMAN_GROUP={shlex.quote(name)} WEG2_PY={shlex.quote(sys.executable)} "
+           f"WEG2_STATE_FILE_PY={shlex.quote(state_file_mod.__file__)} ")
+    cmd = f"{ipc}GRACE_S=600 PROBE_S={probe_s} setsid {DEADMAN} {shlex.quote(boot_log)} {port} {shlex.quote(pattern)} > {shlex.quote(out)} 2>&1 & echo $!"
     if dry:
         log(f"DRY-RUN: would arm deadman: {cmd}")
         return 0
@@ -10050,6 +12908,23 @@ def _stop_helper_pid(pid: int, expect: str = "boot_deadman") -> str:
         return "gone"
 
 
+def census_entry_for_pricing(record_path: str, key: str, *, model: str,
+                             evidence_dir: str) -> Tuple[Optional[Dict[str, object]], str]:
+    """29.09. NF1d: the host census entry the ledger prices from, ``(entry, line)``.
+
+    A record that predates ``shm_total_max_gib`` (the peak of the SUM at one
+    instant) gets it rebuilt from this key's own memts
+    (host_census.backfill_shm_total) -- only for a checkpoint that is NOT the
+    reference: the 27B record stays byte for byte, and no model named (a desk
+    caller) touches nothing."""
+    from sglang.srt.weg2 import host_census as _hc
+
+    if model and weg2_form.reference_model_verdict(model, host_ledger.REFERENCE_MODEL)[0] is False:
+        entry, line = _hc.backfill_shm_total(record_path, key, evidence_dir)
+        return (dict(entry) if entry is not None else None), line
+    return _hc.load_record(record_path).get(key), ""
+
+
 def memts_csv_path(tag: str) -> str:
     return f"{GPU_ARB}/memts_weg2_{tag}.csv"
 
@@ -10156,7 +13031,40 @@ def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> floa
     return dt
 
 
-def _weg2_arena_ledger_terms(model: str) -> dict:
+def _group_env_value(name: str, group_envs, default: str) -> str:
+    """29.09.: ``name`` as the RANKS see it -- the group env (--env-p/--env-d,
+    applied over the launcher env by build_env) wins; when both groups set it
+    differently the larger one prices (the ONE arena is shared). The launcher
+    env only when no group sets it (ENV-LAUNCHER != RANG)."""
+    vals = [str(e[name]) for e in (group_envs or ()) if e and str(e.get(name, "") or "")]
+    if vals:
+        return max(vals, key=float)
+    return str(os.environ.get(name, default) or default)
+
+
+def arena_gib_into_groups(ns, group_envs, gib: float) -> List[str]:
+    """29.09.: write a ledger-derived arena size into every group env that
+    names SGLANG_HICACHE_ARENA_GIB (``ns.env_p``/``ns.env_d`` and the parsed
+    dicts the ledger prices from), so ranks and ledger read the same number.
+    Groups that do not name it inherit the launcher env. Returns the groups
+    rewritten."""
+    key, val, done = "SGLANG_HICACHE_ARENA_GIB", f"{float(gib):g}", []
+    for attr in ("env_d", "env_p"):
+        spec = str(getattr(ns, attr, "") or "")
+        if key in parse_group_env(spec):
+            setattr(ns, attr, set_group_env(spec, key, val))
+            done.append(attr)
+    for e in group_envs or ():
+        if e is not None and key in e:
+            e[key] = val
+    return done
+
+
+#: model -> the arena page widths `_weg2_arena_ledger_terms` last priced
+_ARENA_BOOKED_WIDTHS: Dict[str, List[int]] = {}
+
+
+def _weg2_arena_ledger_terms(model: str, group_envs=None) -> dict:
     """#1432: the L2 arena's host bytes and the REAL fallback pool sizes, for
     the ledger. Sizes come from the same environment the child processes get
     (SGLANG_HICACHE_ARENA_GIB / _MAMBA_SLOTS / _STAGING_GB, SGLANG_WEG2_MAMBA_
@@ -10164,7 +13072,12 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
     (all attention layers), one draft slot per KV slot (one layer cell), one
     mamba slot per canonical GDN blob (hicache_migrate.qwen3_5_mamba_spec,
     bf16 states -- 78,446,592 B on Qwen3.8-27B, checked against the arena
-    file). Empty dict when the arena host tier is off."""
+    file). Empty dict when the arena host tier is off.
+
+    29.09. (z30w-park): the sizes are read through ``_group_env_value`` --
+    the NF arm sets ARENA_GIB=4 / MAMBA_SLOTS=32 in the group env only, and
+    the launcher env's defaults (22 / 140) priced the arena at 23.75 GiB
+    against 6.27 GiB measured in /dev/shm."""
     import logging as _logging
     if os.environ.get("SGLANG_HICACHE_ARENA_HOST", "1") != "1":
         return {}
@@ -10178,12 +13091,21 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         from sglang.srt.planner import pp_cut as _pp_cut
         cell = int(_pp_cut.kv_mib_per_token_per_attn_layer_from_config(cfg, "fp8_e4m3", n_layers) * (1 << 20))
         kv_page = cell * n_attn
-        kv_gib = float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "22") or 22)
-        kv_slots = max(1024, int(kv_gib * (1 << 30)) // max(1, kv_page))
+        from sglang.srt.mem_cache.pool_host.arena_pool import arena_slots_for
+        kv_gib = float(_group_env_value("SGLANG_HICACHE_ARENA_GIB", group_envs, "22"))
+        kv_slots = arena_slots_for(kv_gib, kv_page)
+        # 29.09.: the ranks cut the arena in CANONICAL pages when the env
+        # names one (HiCacheFile._arena_for: slots = GIB // canonical KV
+        # extents; z30w wrote arena-786432.bin = 5461 x 64-token pages). The
+        # count follows that page; the terms below stay in tokens (one KV
+        # slot = one token, the draft 1:1), so the bytes are the same.
+        _canon_page = int(float(_group_env_value("SGLANG_HICACHE_ARENA_KV_PAGE_BYTES", group_envs, "0") or 0))
+        if _canon_page > 0 and kv_page > 0 and _canon_page % kv_page == 0:
+            kv_slots = arena_slots_for(kv_gib, _canon_page) * (_canon_page // kv_page)
         from sglang.srt.mem_cache.hicache_migrate import qwen3_5_mamba_spec
         blob = qwen3_5_mamba_spec(text_cfg, num_linear_layers=n_lin, units=1,
                                   temporal_itemsize=2, conv_itemsize=2).total_bytes if n_lin else 0
-        mamba_slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "140") or 140)
+        mamba_slots = int(float(_group_env_value("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", group_envs, "140")))
         # xsn267 (17.09.): under --spec-form DFLASH the draft slot is the
         # DFlash draft's own page -- draft_layers x (K+V) x draft kv heads x
         # head_dim x kv itemsize (5 x 2 x 8 x 128 x 1 = 10240 B, the
@@ -10210,14 +13132,20 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         arena_bytes = kv_slots * kv_page + draft_slots * draft_cell + mamba_slots * blob
         out = dict(
             arena_gib=arena_bytes / (1 << 30),
-            staging_gb=float(os.environ.get("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05") or 0.05),
-            anchor_mib=int(os.environ.get("SGLANG_WEG2_MAMBA_ANCHOR_MIB", "100") or 100),
+            staging_gb=float(_group_env_value("SGLANG_HICACHE_ARENA_STAGING_GB", group_envs, "0.05")),
+            anchor_mib=int(float(_group_env_value("SGLANG_WEG2_MAMBA_ANCHOR_MIB", group_envs, "100"))),
         )
         _logging.getLogger("weg2.launcher").info(
             "WEG2-ARENA-LEDGER kv=%d slots x %d B + draft %d x %d B + mamba %d x %d B = %.2f GiB "
             "(term arena_gib); fallback pools staging=%s GB anchor=%s MiB",
             kv_slots, kv_page, draft_slots, draft_cell, mamba_slots, blob, out["arena_gib"],
             out["staging_gb"], out["anchor_mib"])
+        # 29.09. (host census): the arena FILE widths this term prices, so the
+        # census can tell a sidecar width (the QSA index page) from them
+        _pt = (_canon_page // kv_page) if (_canon_page > 0 and kv_page > 0
+                                           and _canon_page % kv_page == 0) else 1
+        _ARENA_BOOKED_WIDTHS[str(model)] = [w for w in (
+            kv_page * _pt, (draft_cell * _pt) if draft_slots else 0, blob) if w]
         return out
     except Exception as exc:  # noqa: BLE001 - a mispriced arena is refused, never guessed
         raise Weg2LaunchRefused(f"W108 Weg2ArenaLedgerRefused: the arena term could not be derived: {exc!r}")
@@ -10603,6 +13531,214 @@ def d_awake_rest(cards: List[Card], profile: Optional[str] = None) -> Tuple[Opti
     return [None if v is None else int(v) for v in vals], _pconst_boots("D_AWAKE_REST_MIB", profile)
 
 
+def budget_rest_from_records(profile: Optional[str] = None) -> bool:
+    """VRAM-GRUNDGESETZ 29.09.: the profile row's ``budget_rest_from_records``
+    (qwen27b on, nextflash off) unless ``SGLANG_WEG2_BUDGET_REST_RECORD`` is set."""
+    row = weg2_form.profile_row(profile if profile is not None else weg2_form.DEFAULT_PROFILE)
+    return _budget_rest.switch_on(bool(getattr(row, "budget_rest_from_records", False)))
+
+
+def booked_rest_kwargs(cards: List[Card], profile: Optional[str] = None,
+                       group: str = "D", log: Optional[Log] = None,
+                       capped: bool = False) -> Dict[str, object]:
+    """The ``booked_rest_mib`` / ``booked_rest_provenance`` kwargs of
+    :func:`budgets_from_dc` for ``group`` -- ``{}`` (budgets byte-identical)
+    when the switch is off or the profile carries no record for the group
+    (then ``log`` says so once, by name: UNMEASURED, legacy terms stand).
+
+    ``capped`` (WEG2-ALLOC-OVERHANG, P0 torch cache cap armed for the group,
+    :func:`torch_cache_cap_armed`): the CAPPED rest
+    ``<G>_AWAKE_REST_CAPPED_MIB`` (non-torch + allocation overhang + kept
+    cache) where the profile carries it -- the general allocator cache is
+    then torch's to release under the cap, not a post; without that record
+    the uncapped rest stands (named)."""
+    if not budget_rest_from_records(profile):
+        return {}
+    name = _budget_rest.record_name(group)
+    if capped:
+        cname = _budget_rest.capped_record_name(group)
+        try:
+            _pconst(cname, profile)
+            name = cname
+        except KeyError:
+            if log is not None:
+                log(f"{_budget_rest.OVERHANG_MARKER} group={group}: torch cache cap armed but the "
+                    f"profile carries no {cname} -- the uncapped rest {name} stands (named); "
+                    f"measure with python -m sglang.srt.weg2.budget_rest --capped")
+    try:
+        vals = list(_pconst(name, profile))
+    except KeyError:
+        if log is not None:
+            log(f"{_budget_rest.MARKER} {_budget_rest.SOURCE_UNMEASURED} group={group}: the "
+                f"profile carries no {name} -- floor + user reserve + awake_overshoot "
+                f"{D_AWAKE_OVERSHOOT_MIB} + overshoot record stand (named, not measured); "
+                f"measure with python -m sglang.srt.weg2.budget_rest")
+        return {}
+    try:
+        res = _budget_rest.resolve(vals, _pconst_boots(name, profile), len(cards), group, name)
+    except ValueError as exc:
+        raise Weg2LaunchRefused(f"{_budget_rest.MARKER}: {exc}") from None
+    return {"booked_rest_mib": list(res.values), "booked_rest_provenance": res.provenance}
+
+
+def torch_cache_cap_armed(ns) -> bool:
+    """P0 (weg2/torch_cache_cap.py) armed for group D: ``SGLANG_WEG2_TORCH_CACHE_CAP=1``
+    in --env-d -- after :func:`apply_profile_torch_cache_cap_default` that is
+    the registry row's default unless --env-d named the switch itself."""
+    return str(parse_group_env(getattr(ns, "env_d", "") or "").get(TORCH_CACHE_CAP_ENV, "0")
+               ).strip() == "1"
+
+
+def apply_profile_torch_cache_cap_default(ns) -> Optional[str]:
+    """WEG2-ALLOC-OVERHANG: the registry row's ``torch_cache_cap`` into
+    ``ns.env_d`` (SGLANG_WEG2_TORCH_CACHE_CAP=1) unless --env-d states the
+    switch itself (=0 turns it off). Written INTO ``ns.env_d`` so every
+    reader (the D solve's cap vector, the budget's capped rest, P1c, the
+    rank) sees ONE value. Returns the line naming it, or None."""
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    if row is None or not bool(getattr(row, "torch_cache_cap", False)):
+        return None
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if TORCH_CACHE_CAP_ENV in parse_group_env(env_d):
+        return None
+    ns.env_d = set_group_env(env_d, TORCH_CACHE_CAP_ENV, "1")
+    return (f"{_budget_rest.OVERHANG_MARKER} registry {row.id}: --env-d {TORCH_CACHE_CAP_ENV}=1 "
+            f"(P0 torch cache cap on the physical line, D books the capped rest; --env-d "
+            f"{TORCH_CACHE_CAP_ENV}=0 = the uncapped form)")
+
+
+#: LEISTUNGSSCHALTER (user rule 29.09.): the marker of the line naming the
+#: registry row's per-group switch defaults written into --env-p/--env-d.
+GROUP_SWITCH_DEFAULTS_MARKER = "WEG2-LEISTUNGSSCHALTER"
+
+
+def apply_profile_group_switch_defaults(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """LEISTUNGSSCHALTER (user rule 29.09. ~10:15Z: proven on metal -> default
+    on in the code): the registry row's ``group_switch_defaults`` (weg2/form.py)
+    into ``ns.env_p`` / ``ns.env_d``. A key that group's env already states,
+    or that the launcher's own environment carries (an operator export, which
+    build_env hands every group), is left alone -- an explicit value always
+    wins, =0 turns the switch off. Written INTO the group env so every reader
+    (the D solve, the ranks; build_env applies --env-* last) sees ONE value.
+    Returns the line naming what was written, or None (qwen27b: nothing)."""
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    rows = dict(getattr(row, "group_switch_defaults", None) or {}) if row is not None else {}
+    if not rows:
+        return None
+    env_os = canonical_env(dict(os.environ if environ is None else environ))
+    wrote: List[str] = []
+    for group, attr in (("P", "env_p"), ("D", "env_d")):
+        spec = str(getattr(ns, attr, "") or "")
+        stated = parse_group_env(spec)
+        for key, val in rows.get(group, {}).items():
+            if key in stated or key in env_os:
+                continue
+            spec = set_group_env(spec, key, str(val))
+            wrote.append(f"{group}:{key}={val}")
+        setattr(ns, attr, spec)
+    if not wrote:
+        return None
+    return (f"{GROUP_SWITCH_DEFAULTS_MARKER} registry {row.id} (default on after the metal proof; "
+            f"a stated --env-p/--env-d or exported value wins): " + " ".join(wrote))
+
+
+def apply_profile_d_kv_token_cut_default(ns, argv_words: Sequence[str]) -> Optional[str]:
+    """#239 LEISTUNGSSCHALTER: an UNSET ``--d-kv-token-cut`` takes the registry
+    row's ``d_kv_token_cut`` (nextflash ``owned``; qwen27b ``off``). Applied
+    BEFORE the form is resolved (the kv axis derives from the flag), and only
+    where the boot can run the cut -- else the code default ``off`` stays:
+    D states Form A worker roles (``derive_kv`` refuses the cut without them),
+    no other ``--form-kv`` is stated, and a flip boot has its host tier and at
+    most one operator-named KV stage (``refuse_flip_under_token_cut``). Returns
+    the line naming the default, or None."""
+    if getattr(ns, "teardown", False):
+        return None
+    if weg2_form.flag_given(argv_words, "--d-kv-token-cut"):
+        return None
+    if str(getattr(ns, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
+           or weg2_form.KV_TOKEN_CUT_OFF) != weg2_form.KV_TOKEN_CUT_OFF:
+        return None
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    want = str(getattr(row, "d_kv_token_cut", weg2_form.KV_TOKEN_CUT_OFF)
+               or weg2_form.KV_TOKEN_CUT_OFF) if row is not None else weg2_form.KV_TOKEN_CUT_OFF
+    if want == weg2_form.KV_TOKEN_CUT_OFF:
+        return None
+    stated_kv = getattr(ns, "form_kv", None)
+    if stated_kv and stated_kv != "qsa_forma_dcp":
+        return None
+    roles = weg2_form.flag_values(shlex.split(str(getattr(ns, "extra_d", "") or "")), "--rank-role")
+    if not roles or "worker" not in [r.strip() for r in roles[-1].split(",")]:
+        return None
+    if not getattr(ns, "d_only", False):
+        if getattr(ns, "weg2_disable_hicache", False):
+            return None
+        stages = d_kv_stage_tokens_named(ns)
+        if stages is not None and len(stages) != 1:
+            return None
+    ns.d_kv_token_cut = want
+    return (f"{KV_TOKEN_CUT_MARKER} registry {row.id}: --d-kv-token-cut {want} "
+            "(default on after the metal proof; --d-kv-token-cut off = the uncut Form A)")
+
+
+#: SCHALTER-HALBPORT 1002: the line naming a --weg2-vision the registry row set
+VISION_DEFAULT_MARKER = "WEG2-VISION-DEFAULT"
+
+
+def apply_profile_vision_default(ns, argv_words: Sequence[str]) -> Optional[str]:
+    """SCHALTER-HALBPORT 1002: an UNSET ``--weg2-vision`` takes the registry
+    row's ``vision`` where the row says so (``vision_arg_default``: nextflash
+    ``transient``, as every NF boot ran it, nf-int4.env:229). qwen27b states
+    nothing here (its profiles give the flag), so its parser default ``off``
+    stands. Applied BEFORE the form is resolved (the vision axis reads the
+    flag). A given flag always wins. Returns the line naming the default, or
+    None."""
+    if getattr(ns, "teardown", False) or weg2_form.flag_given(argv_words, "--weg2-vision"):
+        return None
+    if str(getattr(ns, "weg2_vision", VISION_OFF) or VISION_OFF) != VISION_OFF:
+        return None
+    row = weg2_form.profile_row(getattr(ns, "profile", None))
+    if row is None or not getattr(row, "vision_arg_default", False):
+        return None
+    want = str(row.vision or VISION_OFF)
+    if want == VISION_OFF or want not in VISION_CHOICES:
+        return None
+    ns.weg2_vision = want
+    return (f"{VISION_DEFAULT_MARKER} registry {row.id}: --weg2-vision {want} "
+            "(the row's vision; a given --weg2-vision wins)")
+
+
+#: PR (30.09.): group D's paired miss record is ON by default -- the records
+#: root of the line under the evidence dir (``<root>/<model_id>/owned_miss``,
+#: layers.moe.pool_miss_cost.record_dir_for). --env-d
+#: SGLANG_WEG2_OWNED_MISS_RECORD=<dir> names another root; an empty value
+#: turns it off.
+OWNED_MISS_RECORD_ENV = "SGLANG_WEG2_OWNED_MISS_RECORD"
+
+
+def owned_miss_record_root() -> str:
+    return os.path.join(EVIDENCE_DIR, "records", "weg2")
+
+
+def apply_owned_miss_record_default(ns) -> Optional[str]:
+    """PR: ``SGLANG_WEG2_OWNED_MISS_RECORD`` into ``ns.env_d`` unless --env-d
+    states it (every reader -- the D ranks, ``d_owned_miss_ms`` -- sees ONE
+    value). Returns the line naming it, or None."""
+    env_d = str(getattr(ns, "env_d", "") or "")
+    if OWNED_MISS_RECORD_ENV in parse_group_env(env_d):
+        return None
+    root = owned_miss_record_root()
+    ns.env_d = set_group_env(env_d, OWNED_MISS_RECORD_ENV, root)
+    return (f"D-EIGENTUM MISS-RECORD (#239 S3f, PR): --env-d {OWNED_MISS_RECORD_ENV}={root} "
+            f"(D ranks write paired prefill miss records at their sleep; the owned solve reads "
+            f"them as RECORD from K={_owned_miss_min_paired()} paired forwards per rank)")
+
+
+def _owned_miss_min_paired() -> int:
+    from sglang.srt.planner import expert_residency as _er
+
+    return int(_er.OWNED_MISS_MIN_PAIRED_FORWARDS)
+
+
 def d_fixed_record(profile: Optional[str] = None) -> Tuple[Optional[List[Optional[float]]], str]:
     """``D_FIXED_MIB`` of the profile (the #145 fixed post measured on the
     form that runs today), or ``(None, "")`` -- the builtin reference stands."""
@@ -10621,6 +13757,86 @@ def d_activation_record(profile: Optional[str] = None) -> Tuple[Optional[List[Op
     except KeyError:
         return None, ""
     return [None if v is None else float(v) for v in vals], _pconst_boots("D_ACTIVATION_MIB", profile)
+
+
+def d_owned_miss_ms(ns, *, env_d: Mapping[str, str], host: int
+                    ) -> Tuple[Optional[Tuple[float, float]], str]:
+    """#239 S3f Miss-Record (29.09.): the owned solve's cost per missed expert
+    row (host, worker). RECORD = the D ranks' own records in group D's
+    ``SGLANG_WEG2_OWNED_MISS_RECORD`` directory (``layers.moe.pool_miss_cost``)
+    > LOG-BOOTSTRAP (sidecar entry of ``weg2.tools.owned_miss_record``, "aus
+    Log (Uebergang)", dropped once a rank record exists) > BUILTIN (profile
+    constant ``OWNED_MISS_MS``) > UNMEASURED. The env names the records root
+    of the line; the records of this model lie in its
+    ``<model_id>/owned_miss`` (``pool_miss_cost.record_dir_for``). ``(None, "")`` when nothing is
+    measured -- the solve then keeps its seed, byte-identical."""
+    from sglang.srt.planner import expert_residency as _er
+
+    # getattr like every other ns reader of this module (d_pool_peak_record,
+    # profile_row): a namespace without profile/model is the default profile.
+    profile = getattr(ns, "profile", None)
+    model = str(getattr(ns, "model", "") or "")
+    try:
+        builtin = list(_pconst("OWNED_MISS_MS", profile))
+        builtin_src = _pconst_boots("OWNED_MISS_MS", profile)
+    except (KeyError, TypeError):
+        builtin, builtin_src = None, ""
+    from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+
+    root = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip()
+    rank_dir = _miss_cost.record_dir_for(root, model) if root else None
+    ms, tier, src = _er.resolve_owned_miss_ms(
+        _er.read_owned_miss_records(measured_record_path()),
+        rank_records=_er.read_owned_miss_rank_records(rank_dir), host=int(host),
+        model=model, builtin=builtin, builtin_source=builtin_src)
+    if tier == _er.OWNED_MISS_UNMEASURED:
+        # PR: the seed stays -- the line still names a too-young RECORD's count
+        return None, src if "RECORD zu jung" in src else ""
+    return ms, src
+
+
+def d_owned_miss_ms_rank(ns, *, env_d: Mapping[str, str], n: int
+                         ) -> Tuple[Optional[Tuple[float, ...]], str]:
+    """01.10. (owned cut from the profiles): the cost per missed expert row
+    of EVERY D rank from its own paired records (each card at its own link:
+    NF D TP1 = NVML0 3080 x4, TP2 = NVML2 3080 x8 -- the (host, worker) pair
+    of :func:`d_owned_miss_ms` pools both 3080s into one worker cost).
+    ``(None, "")`` without a full window on every rank."""
+    from sglang.srt.layers.moe import pool_miss_cost as _miss_cost
+    from sglang.srt.planner import expert_residency as _er
+
+    model = str(getattr(ns, "model", "") or "")
+    root = str(env_d.get("SGLANG_WEG2_OWNED_MISS_RECORD", "") or "").strip()
+    if not root:
+        return None, ""
+    got = _er.owned_miss_per_rank_from_records(
+        _er.read_owned_miss_rank_records(_miss_cost.record_dir_for(root, model)),
+        n=int(n), model=model)
+    if got is None:
+        return None, ""
+    return got
+
+
+def d_owned_heat_records(ns, *, env_d: Mapping[str, str]) -> Tuple[List[dict], str]:
+    """01.10. (owned cut from the profiles): the #276 heat records of group
+    D's ``SGLANG_DEBUG_MOE_HEAT`` directory -- the owned solve's non-resident
+    demand (``plan_d_residency`` maps them to a routed-lane share per global
+    expert). The directory is the line's per-checkpoint heat directory (the
+    profile names it); ``([], "")`` when it is unset."""
+    import glob
+    import json as _json
+
+    root = str(env_d.get("SGLANG_DEBUG_MOE_HEAT", "") or "").strip()
+    if not root or not os.path.isdir(root):
+        return [], ""
+    recs = []
+    for path in sorted(glob.glob(os.path.join(root, "moe_heat_*.json"))):
+        try:
+            with open(path) as fh:
+                recs.append(_json.load(fh))
+        except (OSError, ValueError):
+            continue
+    return recs, root
 
 
 def d_overshoot_record(profile: Optional[str] = None) -> Tuple[Optional[List[int]], str]:
@@ -10715,6 +13931,40 @@ def d_extend_trim_env(ledger, fits, growth_mib: Optional[Sequence[Optional[float
     return _et.launcher_thresholds(ledger.floor_mib, [act[r] for r in range(n)], growth_mib)
 
 
+def d_lend_floor_env(ledger) -> str:
+    """D-TRANSIENT-LEND: ``SGLANG_WEG2_D_LEND_FLOOR_MIB`` = the card ledger's
+    near-OOM floor per rank (MiB, rounded up)."""
+    return ",".join(str(int(math.ceil(float(f)))) for f in ledger.floor_mib)
+
+
+D_ONLY_LABEL = "D(d-only, expectation)"
+
+
+def d_only_solve(ns, cards, dc_mib, log, *, user_reserve_by_card, p_split, chunk_layers):
+    """The --d-only pass priced with the SAME terms as the map pass (dormant
+    growth, driver carve, awake rest) and handed its card terms, so the #145
+    card ledger exists and ``log_d_rank_vram_solve`` writes EXTEND-TRIM and
+    EXTEND-STUECKELUNG here too. Without them the map pass wrote both, restored
+    env_d, and this pass wrote neither: kvstage-donly (29.09. 11:02Z) ran with
+    0 trims and its allocator cache climbed to 3.4-3.8 GiB per rank -- a D-solo
+    boot measured a card the flip boot never has."""
+    terms: List[Dict[str, object]] = []
+    rest = d_awake_rest(cards, ns.profile)
+    budgets = budgets_from_dc(
+        cards, dc_mib, log, D_ONLY_LABEL,
+        corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
+        user_reserve_by_card=user_reserve_by_card,
+        **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"),
+                   served_dormant_growth(cards, ns.profile))),
+        charge_driver_carve=budget_charges_driver_carve(ns.profile),
+        driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
+        awake_rest_mib=rest[0], awake_rest_provenance=rest[1], terms_out=terms)
+    log_d_rank_vram_solve(ns, cards, budgets, log, D_ONLY_LABEL,
+                          p_split=p_split, chunk_layers=chunk_layers,
+                          card_terms=(terms if rest[0] is not None else None))
+    return budgets
+
+
 def set_group_env(spec: str, key: str, value: str) -> str:
     """``spec`` ('KEY=VAL;...') with ``key`` set to ``value`` (appended when
     absent); every other entry keeps its text and its place."""
@@ -10752,12 +14002,113 @@ def budget_charges_driver_carve(profile: Optional[str] = None) -> bool:
     return bool(getattr(row, "budget_charges_driver_carve", False))
 
 
+def driver_carve_charged(card, min_total_mib: int) -> bool:
+    """Is the driver carve booked on ``card`` (with the profile's carve switch on)?
+
+    The ``min_total_mib`` scope (27B b1 death) is a MEASURED decision about
+    the reference rig's classes: the 27B corridor pass was SATISFIED on the
+    20 GB RTX 3080s with their carve already in predicted_free, and bound on
+    the 5090. HW-GENERIC 1002: it therefore holds for those calibration
+    classes only; a card of any other class books its NVML-reported carve
+    (a measured, unallocatable term -- not a margin), because no measurement
+    says its corridor already absorbs it."""
+    if card_identity.calibration_class(card) is None:
+        return True
+    return int(card.total_mib) >= int(min_total_mib or 0)
+
+
 def driver_carve_min_total_mib(profile: Optional[str] = None) -> int:
     """The profile row's ``driver_carve_min_total_mib`` (27B b1 death): the
     carve is charged only on cards with at least this NVML total; 0 (and an
     unknown profile) = every card."""
     row = weg2_form.profile_row(profile if profile is not None else weg2_form.DEFAULT_PROFILE)
     return int(getattr(row, "driver_carve_min_total_mib", 0) or 0)
+
+
+def _d_early_start_armed(ns) -> bool:
+    """BOOTZEIT 3: the one resolution of ``--weg2-d-early-start``.
+
+    'auto' (the default since the series 29.09., dearly z30x2) is on for the
+    profiles whose row carries a metal proof (``d_early_start_proven``: Next
+    Flash) and off for every other one, so the 27B line boots serial exactly
+    as before until its own proof boot ran with an explicit 'on'."""
+    mode = str(getattr(ns, "weg2_d_early_start", "off") or "off")
+    if mode == "auto":
+        return d_early_start_proven(getattr(ns, "profile", None))
+    return mode == "on"
+
+
+class Weg2DEarlyStartUnreviewed(Weg2LaunchRefused):
+    """W185: an explicit early D start on a profile whose D expectation is
+    still the legacy term (``d_expect_from_p_records`` False): D would be
+    planned from D's own reserve standing in for P's residue (NF z30r3:
+    540-960 MiB per card short; 27B: ~1 GiB on the 5090), and the gate only
+    checks planned <= measured, it never re-solves D."""
+
+
+def refuse_d_early_start_unreviewed(ns) -> None:
+    """W185, called before group P starts: a named refusal, never a silent off.
+
+    27B (29.09.): with ``d_expect_from_p_records`` the 27B plans the early D
+    from P's records, so an explicit 'on' boots (the proof boot); 'auto'
+    stays off there until ``d_early_start_proven``. The 27B review's reader
+    concern (ns.env_d/_d_owner_solve between launch_group(P) and #5) holds on
+    this tree without a reader: only the early branch itself and the
+    refusal's restore touch them in that window."""
+    if (str(getattr(ns, "weg2_d_early_start", "off")) == "on"
+            and not d_expect_from_p_records(ns.profile)):
+        raise Weg2DEarlyStartUnreviewed(
+            f"W185 Weg2DEarlyStartUnreviewed: --weg2-d-early-start on with profile "
+            f"{ns.profile or weg2_form.DEFAULT_PROFILE!r}, whose D expectation is the legacy "
+            f"term (registry d_expect_from_p_records=False): the early D would be planned "
+            f"from D's own reserve, not P's measured residue. Boot with 'off' (byte-identical).")
+
+
+def _group_rank_count(argv: Sequence[str]) -> int:
+    """Scheduler ranks one group spawns: --tp-size x --pp-size of its argv."""
+    toks = list(argv)
+    return int(_last_flag_value(toks, "--tp-size") or 1) * int(_last_flag_value(toks, "--pp-size") or 1)
+
+
+def d_early_stage0_watch(gate: str, sized_dir: str, expected_p_ranks: int, d_pid_fn,
+                         d_alive_fn, p_alive_fn, vram_fn, names: Mapping[str, str],
+                         result: Dict[str, object], log: Log, poll_s: float = 1.0,
+                         clock=time.monotonic, sleep=time.sleep) -> None:
+    """BOOTZEIT 3 stage 0, launcher side: sample the early D's VRAM per card
+    until every P rank reports sized, then write the stage-0 gate. ``go`` only
+    if D held 0 MiB on every card meanwhile (else P's used_by_me holds D's
+    context: refuse, D exits, the serial path starts D later)."""
+    from sglang.srt.weg2 import d_early_start as _des
+
+    held: Dict[str, int] = {}
+    t0 = clock()
+    while True:
+        try:
+            now = vram_fn(d_pid_fn())
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            now = {}
+            log(f"{_des.STAGE0_MARKER} VRAM sample failed ({type(e).__name__}: {e}); counted as no reading")
+        for u, v in now.items():
+            held[u] = max(held.get(u, 0), int(v))
+        records = _des.read_p_sized(sized_dir)
+        verdict, lines = _des.stage0_verdict(records, expected_p_ranks, held, names)
+        if verdict is None and not (d_alive_fn() and p_alive_fn()):
+            verdict, lines = False, lines + ["a group exited before P was sized"]
+        if verdict is not None:
+            for ln in lines:
+                log(f"{_des.STAGE0_MARKER} {ln}")
+            waited = clock() - t0
+            _des.write_gate(gate, _des.VERDICT_GO if verdict else _des.VERDICT_REFUSE,
+                            "; ".join(lines), measured=held)
+            log(f"{_des.STAGE0_MARKER} {'GO' if verdict else 'REFUSE'} after {waited:.1f} s -- "
+                + ("D creates its CUDA contexts now" if verdict else "early D exits; D starts serially"))
+            result.update({"verdict": _des.VERDICT_GO if verdict else _des.VERDICT_REFUSE,
+                           "waited_s": round(waited, 1), "d_held_mib": dict(held),
+                           "p_used_by_me_mib": {f"pp{r.get('pp_rank')}tp{r.get('tp_rank')}": r.get("used_by_me_mib")
+                                                for r in records}})
+            boot_state_write(log, event=("d_early_stage0", dict(result)))
+            return
+        sleep(poll_s)
 
 
 def budgets_from_dc(
@@ -10777,10 +14128,22 @@ def budgets_from_dc(
     awake_rest_mib: Optional[List[Optional[int]]] = None,
     awake_rest_provenance: str = "",
     terms_out: Optional[List[Dict[str, object]]] = None,
+    booked_rest_mib: Optional[Sequence[Optional[int]]] = None,
+    booked_rest_provenance: str = "",
 ) -> List[int]:
     """Per card the budget of group ``label``; ``terms_out`` (a list) receives
     the terms per card in order, for the #145 card ledger (rc12c: the card
-    side prices the SAME terms, so budget and card cannot disagree)."""
+    side prices the SAME terms, so budget and card cannot disagree).
+
+    ``booked_rest_mib`` (VRAM-GRUNDGESETZ 29.09., weg2/budget_rest.py): per
+    card the MEASURED awake rest beyond the budget line (record
+    ``<G>_AWAKE_REST_BOOKED_MIB``). Where it is given the card's budget is
+    ``total - driver carve - dormant_other - growth - rest`` and NOTHING else:
+    the rest contains the floor's transient, and the user reserve, the
+    builtin awake overshoot, a budget-relative overshoot and the awake rest of
+    the form are what it replaces -- no reserve is charged beside it. A
+    ``None`` entry is UNMEASURED: that card keeps the terms below, and its
+    line says so by name."""
     out = []
     # #1257c: ONE derivation, per card, for the group this budget is for.
     # ``user_reserve_by_card`` is the operator's external headroom (default 0);
@@ -10792,10 +14155,57 @@ def budgets_from_dc(
     # day D is measured. Both are printed from here on, because an operator
     # who greps ``group=D`` must find the dry pass too.
     group = corridor_guard.normalise_group(label)
-    floors = corridor_budget.floors_for_cards(cards, label, user_reserve_by_card)
+    booked = [None] * len(cards) if booked_rest_mib is None else list(booked_rest_mib)
+    if len(booked) != len(cards):
+        raise Weg2LaunchRefused(
+            f"{_budget_rest.MARKER}: {len(booked)} booked rests for {len(cards)} cards "
+            f"({booked_rest_provenance}) -- a partial vector never prices a card it never saw")
+    _reserve_eff = user_reserve_by_card
+    if any(v is not None for v in booked):
+        # the reserve is not charged on a card whose measured rest is booked
+        # (the rest is what consumed it); the floor lines still print it
+        _reserve_eff = {c.uuid: (0 if booked[i] is not None
+                                 else int((user_reserve_by_card or {}).get(c.uuid, 0)))
+                        for i, c in enumerate(cards)}
+    floors = corridor_budget.floors_for_cards(cards, label, _reserve_eff)
+    _terms_seen: List[Dict[str, object]] = []  # VRAM-VERTRAG M1: the pass's view
     for i, c in enumerate(cards):
         over = int(overshoot_mib[i]) if overshoot_mib is not None else 0
         cf = floors[c.uuid]
+        if booked[i] is not None:
+            rest_b = int(booked[i])
+            grow = int(dormant_growth_mib[i]) if dormant_growth_mib is not None else 0
+            carve = int(getattr(c, "reserved_mib", 0) or 0)
+            b = ((c.total_mib - carve - dc_mib[c.uuid] - grow - rest_b) // 8) * 8
+            out.append(b)
+            _terms_seen.append(dict(
+                total=int(c.total_mib), carve=carve, floor=0,
+                dormant=int(dc_mib[c.uuid]) + grow, growth=grow, awake=rest_b,
+                awake_source=f"{_budget_rest.SOURCE_RECORD} {booked_rest_provenance}".strip()))
+            if terms_out is not None:
+                terms_out.append({k: v for k, v in _terms_seen[-1].items() if k != "growth"})
+            _res = int((user_reserve_by_card or {}).get(c.uuid, 0))
+            log(
+                f"budget {label} group={group} ordinal={i} "
+                f"nvml_idx={c.nvml_index} {c.name}: "
+                f"{b} MiB = total {c.total_mib} - driver_carve {carve} (NVML reserved) "
+                f"- dormant_other {dc_mib[c.uuid]}"
+                + (f" - served_dormant_growth {grow} ({dormant_growth_provenance})" if grow else "")
+                + f" - awake_rest_booked {rest_b} ({_budget_rest.SOURCE_RECORD} "
+                f"{booked_rest_provenance}; replaces corridor floor transient "
+                f"{int(cf.mib)} (source={cf.source}), user reserve {_res}, awake_overshoot "
+                f"{D_AWAKE_OVERSHOOT_MIB}"
+                + (f", measured_awake_overshoot {over}" if over else "")
+                + ") MiB"
+            )
+            log(cf.line)
+            continue
+        if booked_rest_mib is not None:
+            log(f"{_budget_rest.MARKER} {_budget_rest.SOURCE_UNMEASURED} group={group} "
+                f"pass={label} ordinal={i} nvml{c.nvml_index}: no measured awake rest in "
+                f"{booked_rest_provenance or 'the record'} -- this card keeps floor + reserve "
+                f"{int((user_reserve_by_card or {}).get(c.uuid, 0))} + awake_overshoot "
+                f"{D_AWAKE_OVERSHOOT_MIB} + overshoot {over} (named, not measured)")
         # rc12c (NF Dauerlauf, D TP0 died at 29.2 GiB under budgets 29624 /
         # 29144 / 28288): where the awake rest is MEASURED against the booked
         # form (D_AWAKE_REST_MIB, weg2/d_awake_rest.py) it is the whole
@@ -10820,21 +14230,22 @@ def budgets_from_dc(
         # 27B b1 death: a profile may scope the carve to its big cards
         # (driver_carve_min_total_mib; 0 = every card, the NF row).
         carve = (int(getattr(c, "reserved_mib", 0) or 0)
-                 if charge_driver_carve and int(c.total_mib) >= int(driver_carve_min_total_mib or 0) else 0)
+                 if charge_driver_carve and driver_carve_charged(c, driver_carve_min_total_mib) else 0)
         awake = int(rest) if rest is not None else 0
         b = c.total_mib - corridor - dc_mib[c.uuid] - grow - over - carve - awake
         b = (b // 8) * 8
         out.append(b)
+        _terms_seen.append(dict(
+            total=int(c.total_mib), carve=carve, floor=int(cf.mib),
+            dormant=int(dc_mib[c.uuid]) + grow, growth=grow,
+            awake=(awake if rest is not None else awake_builtin + over),
+            awake_source=(
+                f"D_AWAKE_REST_MIB {awake_rest_provenance}".strip() if rest is not None
+                else f"awake_overshoot {awake_builtin}"
+                + (f" + measured_awake_overshoot {over}" if over else "")),
+        ))
         if terms_out is not None:
-            terms_out.append(dict(
-                total=int(c.total_mib), carve=carve, floor=int(cf.mib),
-                dormant=int(dc_mib[c.uuid]) + grow,
-                awake=(awake if rest is not None else awake_builtin + over),
-                awake_source=(
-                    f"D_AWAKE_REST_MIB {awake_rest_provenance}".strip() if rest is not None
-                    else f"awake_overshoot {awake_builtin}"
-                    + (f" + measured_awake_overshoot {over}" if over else "")),
-            ))
+            terms_out.append({k: v for k, v in _terms_seen[-1].items() if k != "growth"})
         log(
             f"budget {label} group={group} ordinal={i} "
             f"nvml_idx={c.nvml_index} {c.name}: "
@@ -10851,6 +14262,7 @@ def budgets_from_dc(
         )
         log(cf.line)
     if not corridor_constrain:
+        vram_view().note_budget(label, cards, out, out, _terms_seen)
         return out
     # #1257c THE INSTALL GATE. The corridor pass may lower a budget only where
     # SOMEBODY PRICED THE FLOOR -- a measured transient, an explicit reserve,
@@ -10870,6 +14282,7 @@ def budgets_from_dc(
         )
         for cf in floors.values():
             log(cf.line)
+        vram_view().note_budget(label, cards, out, out, _terms_seen)
         return out
     # #1257 -- THE CORRIDOR LAW AS A HARD CONSTRAINT, applied here and nowhere
     # else so this function stays the one producer of a budget number.  The
@@ -10888,7 +14301,66 @@ def budgets_from_dc(
     )
     for line in solve.lines:
         log(line)
+    vram_view().note_budget(label, cards, out, list(solve.budgets), _terms_seen)
     return list(solve.budgets)
+
+
+#: VRAM-VERTRAG M1 (29.09.): the budget passes' view (weg2/vram_plan_view.py),
+#: one per launcher run; ``main`` resets it with the profile's pins.
+_VRAM_VIEW = None
+#: the known-token sets the VRAM-PLAN-PFLICHT line evaluates (one short
+#: request, bs2 x 128k, the kvs2 load bs2 x 240k that filled the P arena)
+VRAM_DEMAND_PROBES = (("1x32k", (32768,)), ("2x128k", (131072, 131072)),
+                      ("2x240k", (245760, 245760)))
+
+
+def vram_view():
+    global _VRAM_VIEW
+    if _VRAM_VIEW is None:
+        from sglang.srt.weg2 import vram_plan_view as _vpv
+
+        _VRAM_VIEW = _vpv.PlanView()
+    return _VRAM_VIEW
+
+
+def vram_plan_emit(ns, cards: Sequence[Card], pass_name: str, log: Log, *,
+                   d_label: Optional[str] = None, group: str = "D") -> Optional[dict]:
+    """M1: lay the pass's solver outputs into ``weg2.vram_plan/1``, write it to
+    the boot's state directory (vram_plan-<pass>.json + vram_plan.json) and log
+    the one human line plus the terms that moved since the previous pass. A
+    VIEW: it changes no budget, argv or bolt, and a view that fails is named,
+    never raised into the boot."""
+    from sglang.srt.weg2 import vram_plan as _vp
+
+    view = vram_view()
+    try:
+        view.note_inputs(ns)
+        plan = view.build(pass_name, cards, boot_id=str(getattr(ns, "tag", "") or ""),
+                          rev=str(os.environ.get("HTSGLANG_REV", "") or ""), d_label=d_label)
+    except Exception as exc:  # noqa: BLE001 -- the view never kills a launch
+        log(f"VRAM-PLAN pass={pass_name} failed: {type(exc).__name__}: {exc}")
+        return None
+    log(_vp.plan_line(plan))
+    if plan.get("demand"):
+        log(_vp.demand_line(plan, VRAM_DEMAND_PROBES))
+    prev = view.last
+    if prev is not None:
+        moved = _vp.diff_plans(prev, plan)
+        if moved:
+            log("VRAM-PLAN-DIFF %s -> %s: %d Terme%s %s" % (
+                prev["pass"], pass_name, len(moved), ":" if moved else "",
+                "; ".join("%s %s->%s" % m for m in moved[:16])
+                + (" ..." if len(moved) > 16 else "")))
+    view.last = plan
+    d = boot_state_dir()
+    if d:
+        try:
+            _vp.write_plan(d, plan, state_file_mod.write_json_atomic)
+        except OSError as exc:
+            log(f"VRAM-PLAN pass={pass_name} write failed ({type(exc).__name__}): {exc}")
+        boot_state_write(log, fields={f"groups.{group}.launch.vram_plan_id": plan["plan_id"],
+                                      f"groups.{group}.launch.vram_plan_pass": pass_name})
+    return plan
 
 
 def _max_running_requests(model: str, group: str = "D", bs: int = DEFAULT_D_BS) -> int:
@@ -11424,6 +14896,19 @@ def d_overhead_calibration(
         if sorted(kv) != list(range(n)):
             skipped += 1
             continue
+        # 28.09. (VRAM loop, P1b): an expert-offload D (--rank-moe-resident-fraction,
+        # the NF Form A) is NOT priced by this row planner -- PerfCostModel books
+        # every expert resident (TP0 ~164 GiB at ratio 1,0,0) and the KV-less
+        # Form A workers report cell 0, so no overhead can come out of it. Its
+        # budget is the MEASURED-D budget line + FRACTION-SOLVE D (H8), which
+        # already read this model's own records. Named, not a cell mismatch.
+        if "--rank-moe-resident-fraction" in fm:
+            return None, (
+                f"{os.path.basename(d_log)}: expert-offload D (--rank-moe-resident-fraction "
+                f"{fm['--rank-moe-resident-fraction']}, --rank-tp-ratio "
+                f"{fm.get('--rank-tp-ratio', 'auto')}) -- this row planner prices every expert "
+                f"resident, so it does not apply; D's budget comes from the MEASURED-D budget "
+                f"line and FRACTION-SOLVE D (this model's records D_FIXED_MIB/D_ACTIVATION_MIB)")
         ratio = fm.get("--rank-tp-ratio", "auto")
         if ratio == "auto":
             weights = list(_gcd_reduce(budgets))
@@ -13325,6 +16810,17 @@ def fork_anchor_env(token: Optional[int], p_trim: bool) -> Dict[str, str]:
     return {_fa.TOKEN_ENV: str(int(token))}
 
 
+def turn_anchor_env(token: Optional[int]) -> Dict[str, str]:
+    """``--turn-anchor-token``: group P's environment for the TURN ANCHOR
+    (weg2/turn_anchor.py; {} when off -- the byte-identity guarantee). Group
+    D reads nothing new: the anchor is a regular store node at a page."""
+    if token is None:
+        return {}
+    if int(token) <= 0:
+        raise SystemExit(f"--turn-anchor-token must be a positive token id, got {token}")
+    return {"SGLANG_WEG2_TURN_ANCHOR_TOKEN": str(int(token))}
+
+
 def p_host_overlap_env(overlap: bool, hostgap: bool) -> Dict[str, str]:
     """Group P's extra environment for ``--p-host-overlap`` / ``--p-hostgap``.
 
@@ -13602,30 +17098,91 @@ def calib_log_accept_of(ns) -> Optional[Callable[[str], bool]]:
     return ident.accepts_log if ident is not None else None
 
 
-#: UNIFY S3: argparse defaults that are MEASURED constants of one model. The
-#: parser's default is the 27B row (the launcher's default --profile); after
-#: parsing, an UNSET flag takes the booted profile's row. A given flag, or a
-#: value that is no longer the parser default (argparse abbreviations), wins.
-PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str], object]], ...] = (
+def _profile_row_or_27b(profile: Optional[str]):
+    return weg2_form.profile_row(profile) or _PROFILE_27B
+
+
+#: UNIFY S3: argparse defaults that come from the booted MODEL'S REGISTRY ROW
+#: (weg2/form.py PROFILES) -- the ONE mechanism for "the row is the default of
+#: this CLI flag". Two kinds:
+#:  * MEASURED constants of one model: the parser's default is the 27B row (the
+#:    launcher's default --profile);
+#:  * BEST-FORM fields (user rule 29.09. ~10:15Z: a switch proven on metal is
+#:    default-on in the code, not only in the docker profile): the parser's
+#:    default stays the code default (off / fixed / capacity), the row turns it
+#:    on -- ``replayssm`` -> --d-replayssm-spec.
+#: After parsing, an UNSET flag takes the booted profile's row. A given flag,
+#: or a value that is no longer the parser default (argparse abbreviations),
+#: wins. Each entry: (flag, dest, of(profile, ns) -> the row's value).
+PROFILE_ARG_DEFAULTS: Tuple[Tuple[str, str, Callable[[str, object], object]], ...] = (
     ("--pp-cut-measured-ms-per-layer", "pp_cut_measured_ms_per_layer",
-     lambda p: _pconst("MEASURED_MS_PER_LAYER", p)),
+     lambda p, ns: _pconst("MEASURED_MS_PER_LAYER", p)),
     ("--pp-cut-stage-fixed-mib", "pp_cut_stage_fixed_mib",
-     lambda p: _pconst("P_PP_STAGE_FIXED_MIB", p)),
+     lambda p, ns: _pconst("P_PP_STAGE_FIXED_MIB", p)),
     ("--pp-cut-mamba-mib-per-linear-layer-per-slot", "pp_cut_mamba_mib_per_linear_layer_per_slot",
-     lambda p: float(_pconst("P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", p))),
-    ("--store-sidecar-factor", "store_sidecar_factor", store_sidecar_factor_of),
+     lambda p, ns: float(_pconst("P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT", p))),
+    ("--store-sidecar-factor", "store_sidecar_factor", lambda p, ns: store_sidecar_factor_of(p)),
+    # H64 (27B xsn436: D-KV +21/+13 %, not slower, user 24.09. ~20:47Z "ja
+    # einschalten"; NF x172/x174: TP0 -396 MiB, 257k needle MATCH): both rows
+    # carry replayssm=True, every profile passed --d-replayssm-spec on.
+    ("--d-replayssm-spec", "d_replayssm_spec",
+     lambda p, ns: "on" if _profile_row_or_27b(p).replayssm else "off"),
+    # P chunk policy: the row's chunk.policy on its chunk.default_formats
+    # (qwen27b dynamic on INT8, chunkab rc9j 128k -13.6 %) -- and only when
+    # the flags make that form RUNNABLE (_p_chunk_dynamic_runnable: the rc9j
+    # form ran with --p-prefill-graph 512); NF row fixed.
+    ("--p-chunk-policy", "p_chunk_policy",
+     lambda p, ns: (_row_format_default(p, ns, _profile_row_or_27b(p).chunk.policy,
+                                        _profile_row_or_27b(p).chunk.default_formats,
+                                        P_CHUNK_POLICY_DEFAULT)
+                    if _p_chunk_dynamic_runnable(ns) else P_CHUNK_POLICY_DEFAULT)),
+    # 27B row 24b: bandwidth on the formats the row measured it on (INT8).
+    ("--d-token-placement", "d_token_placement",
+     lambda p, ns: _row_format_default(p, ns, _profile_row_or_27b(p).d_token_placement,
+                                       _profile_row_or_27b(p).d_token_placement_formats,
+                                       D_TOKEN_PLACEMENT_DEFAULT)),
 )
+
+
+def _p_chunk_dynamic_runnable(ns) -> bool:
+    """Whether --p-chunk-policy dynamic can run with ``ns``'s other flags --
+    the refusals of :func:`apply_p_chunk_policy`, read from the parsed flags
+    (the graph is installed later): the plan's baseline width (--p-chunk-fixed,
+    else the --p-prefill-graph bucket, else CHUNKED_PREFILL_TOKENS 4096) and its
+    floor (--p-chunk-min, else that width) must not exceed --p-chunk-max, and
+    the graph bucket neither. The measured form (27b.env, chunkab rc9j) is
+    dynamic WITH --p-prefill-graph 512; without a graph the baseline 4096 is
+    above the default max 2048 and the launcher would refuse the boot -- so a
+    registry default of dynamic applies only where it is runnable."""
+    bucket = int(getattr(ns, "p_prefill_graph", 0) or 0)
+    cap = int(getattr(ns, "p_chunk_max", P_CHUNK_MAX_DEFAULT) or P_CHUNK_MAX_DEFAULT)
+    fixed = int(getattr(ns, "p_chunk_fixed", 0) or 0) or bucket or CHUNKED_PREFILL_TOKENS
+    low = int(getattr(ns, "p_chunk_min", 0) or 0) or fixed
+    return 0 < low <= cap and not (bucket and cap < bucket)
+
+
+def _row_format_default(profile, ns, row_value, formats, code_default):
+    """A best-form value the row measured on some checkpoint FORMATS only: the
+    row's value when the booted checkpoint's registry format
+    (weg2_form.format_of, by calibration identity) is one of them, else the
+    code default."""
+    fmt = weg2_form.format_of(profile, str(getattr(ns, "model", "") or ""))
+    return row_value if fmt and fmt in formats else code_default
 
 
 def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
     """Rewrite the unset :data:`PROFILE_ARG_DEFAULTS` to ``ns.profile``'s row;
-    returns the dests that changed (none for the 27B and, today, for NF, whose
-    rows borrow these 27B measurements)."""
+    returns the dests that changed (for the 27B its best-form fields; for NF
+    since #242 its own stage-fixed post and mamba rate, MEASURED_MS_PER_LAYER
+    still borrowed, and its best-form fields)."""
     parser_default = {
         "pp_cut_measured_ms_per_layer": MEASURED_MS_PER_LAYER,
         "pp_cut_stage_fixed_mib": P_PP_STAGE_FIXED_MIB,
         "pp_cut_mamba_mib_per_linear_layer_per_slot": P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT,
         "store_sidecar_factor": STORE_SIDECAR_FACTOR,
+        "d_replayssm_spec": D_REPLAYSSM_SPEC_DEFAULT,
+        "p_chunk_policy": P_CHUNK_POLICY_DEFAULT,
+        "d_token_placement": D_TOKEN_PLACEMENT_DEFAULT,
     }
     profile = getattr(ns, "profile", None) or PROFILE_QWEN27B
     changed: List[str] = []
@@ -13634,11 +17191,21 @@ def apply_profile_arg_defaults(ns, argv_words: Sequence[str]) -> List[str]:
             continue
         if getattr(ns, dest) != parser_default[dest]:
             continue
-        want = of(profile)
+        want = of(profile, ns)
         if want != getattr(ns, dest):
             setattr(ns, dest, want)
             changed.append(dest)
     return changed
+
+
+def profile_arg_defaults_line(ns, changed: Sequence[str]) -> Optional[str]:
+    """The launcher's one line naming every CLI default the registry row set
+    (None when the row changed nothing)."""
+    if not changed:
+        return None
+    parts = ", ".join(f"{d}={getattr(ns, d, None)!r}" for d in changed)
+    return (f"WEG2-PROFILE-ARG-DEFAULTS (registry row {getattr(ns, 'profile', '') or PROFILE_QWEN27B}; "
+            f"unset flags only, a given flag wins): {parts}")
 
 
 def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
@@ -14801,6 +18368,44 @@ def shipped_line(
 D_RANK_SOLVE_MARKER = "D-RANK VRAM (#145)"
 
 
+#: VRAM-VERTRAG M1: the pass a D solve's label belongs to (anything else, the
+#: early start's expectation, is ``d_early``)
+_VRAM_PASS_BY_LABEL = {"D(Karte, Erwartung)": "map", "D(dry, expectation)": "dry",
+                       "D(d-only, expectation)": "d_only", "D": "d"}
+
+
+def d_record_torch_caps(ns, cards: List[Card], budgets_d: Sequence[int], log,
+                        label: str) -> Optional[List[int]]:
+    """WEG2-ALLOC-OVERHANG: the P0 cap vector from the RECORDS, for a D solve
+    whose verdict books no foreign/non-torch term (the 27B: its verdict's
+    ``verfuegbar`` is the NVML total, so ``verfuegbar - floor`` never binds --
+    31788 / 19661 / 19661 MiB against a torch reach of ~29.4 / 18.6 / 18.4 GiB).
+
+    Per card ``budget + rest - OTHER`` (:func:`budget_rest.torch_caps`), where
+    ``rest`` is what this pass's budget booked (the capped rest while the cap
+    is armed) and OTHER is ``D_TORCH_CAP_OTHER_MIB``. ``None`` (the caller
+    keeps the verdict's cap) for the d-only pass (no P: the record is the flip
+    form's), a profile without OTHER, or a card the rest record does not price."""
+    if label == D_ONLY_LABEL:
+        return None
+    try:
+        others = list(_pconst(_budget_rest.other_record_name("D"), ns.profile))
+    except KeyError:
+        return None
+    kw = booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns))
+    rests = kw.get("booked_rest_mib")
+    if rests is None or len(others) != len(cards):
+        return None
+    caps = _budget_rest.torch_caps([int(b) for b in budgets_d], list(rests),
+                                   [None if o is None else int(o) for o in others])
+    if caps is not None:
+        log(f"{_budget_rest.OVERHANG_MARKER} {label} caps "
+            + ", ".join(f"rang{i} {b} + {r} - {o} = {c}"
+                        for i, (b, r, o, c) in enumerate(zip(budgets_d, rests, others, caps)))
+            + f" MiB ({kw.get('booked_rest_provenance', '')})")
+    return caps
+
+
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                           label: str, *, p_split=None, chunk_layers=None,
                           card_terms: Optional[Sequence[Dict[str, object]]] = None) -> None:
@@ -14828,8 +18433,17 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     """
     from sglang.srt.planner import pp_cut as _pp_cut
 
+    # #251c: a second pass (dry-run expectation, then the real budgets) prices
+    # the bank as priced, not as the first pass's stage form re-split it
+    d_kv_stage_undo(ns)
     n = len(list(budgets_d))
     fehlend: List[str] = []
+
+    def _plan_without_solve() -> None:
+        # M1: a pass whose solve does not run (27B dense, half geometry, an
+        # unreadable reference) still writes its plan -- the D closure is then
+        # named open, never dropped with the pass.
+        vram_plan_emit(ns, cards, _VRAM_PASS_BY_LABEL.get(label, "d_early"), log, d_label=label)
 
     def _vec(attr: str, name: str):
         raw = str(getattr(ns, attr, "") or "").strip()
@@ -14871,6 +18485,28 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     )
     _korridor_riss = [v.rank for v in verdikte if not v.corridor_ok]
     drueber = [v.rank for v in verdikte if not v.fits]
+    # VRAM loop P0 (28.09.): with SGLANG_WEG2_TORCH_CACHE_CAP=1 in --env-d every
+    # D rank caps its caching allocator at the verdict's verfuegbar minus the
+    # corridor floor -- the booked size, not a reserve (weg2/torch_cache_cap.py).
+    if str(parse_group_env(getattr(ns, "env_d", "") or "").get(TORCH_CACHE_CAP_ENV, "0")
+           ).strip() == "1":
+        from sglang.srt.weg2 import torch_cache_cap as _tcc
+
+        _rec_caps = (d_record_torch_caps(ns, cards, budgets_d, log, label)
+                     if fremd is None and nicht_torch is None else None)
+        if _rec_caps is not None:
+            _caps = ",".join(str(int(x)) for x in _rec_caps)
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)
+            log(f"{D_RANK_SOLVE_MARKER} {label} P0 {_tcc.MARKER} {_tcc.MIB_ENV}={_caps} "
+                f"({_budget_rest.OVERHANG_MARKER}: physische Linie je Rang = Budget + gebuchter "
+                f"Rest - {_budget_rest.other_record_name('D')} = total - carve - dormant_other - "
+                f"nicht-torch; das Verdikt bucht hier kein fremd/nicht-torch)")
+        else:
+            _caps = _tcc.launcher_caps(verdikte, _floor)
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", _tcc.MIB_ENV, _caps)
+            log(f"{D_RANK_SOLVE_MARKER} {label} P0 {_tcc.MARKER} {_tcc.MIB_ENV}={_caps} (verfuegbar "
+                f"minus Korridor-Floor {_floor:.0f} MiB je Rang; der torch-Allokator leert seinen "
+                f"Cache, bevor er die Linie ueberschreitet)")
     log(
         "%s VERDIKT %s: %s%s"
         % (
@@ -14905,6 +18541,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     if _skips:
         for _x in _skips:
             log(f"{D_RANK_SOLVE_MARKER} {label}: {_x}")
+        _plan_without_solve()
         return
     luecken: List[str] = []
     ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
@@ -14927,6 +18564,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         log(f"{D_RANK_SOLVE_MARKER} FRACTION-SOLVE {label} ENTFAELLT: "
             f"{', '.join(luecken)} fehlt/passt nicht zu {n} Raengen. Eine "
             f"halbe Geometrie loest nichts (#91), also rechnet hier nichts.")
+        _plan_without_solve()
         return
     # H8: DIE METALLREGELN. Die alte Decke rechnete gegen die KARTE mit
     # ``fraction x Spanne + Scratch`` Zeilen und ohne KV/Aktivierung -- sie
@@ -14946,6 +18584,46 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
     _act_rec, _act_src = (d_activation_record(ns.profile) if card_terms is not None
                           else (None, ""))
     _derive_waves = bool(getattr(ns, "d_pool_waves_derived", False))
+    # #239 S3f Miss-Record: measured cost per missed expert row, else the seed
+    _miss_ms, _miss_src = d_owned_miss_ms(
+        ns, env_d=_env_d,
+        host=next((i for i, v in enumerate(tp_ratio) if float(v) > 0), 0))
+    if _miss_ms is not None:
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
+            f"{_miss_ms[0]:g}/{_miss_ms[1]:g} ms je Zeile (Host/Worker) aus {_miss_src} "
+            f"statt der Saat")
+    elif _miss_src:
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN (#239 S3f): "
+            f"Saat -- {_miss_src}")
+    # 01.10.: the same records per rank -- each card at its own link
+    _miss_rank, _miss_rank_src = d_owned_miss_ms_rank(ns, env_d=_env_d, n=n)
+    _heat_recs, _heat_root = d_owned_heat_records(ns, env_d=_env_d)
+    if _miss_rank is not None:
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM FEHLGRIFF-KOSTEN JE RANG (01.10.): "
+            f"{'/'.join('%.4f' % x for x in _miss_rank)} ms je Zeile (TP0..TP{n - 1}) "
+            f"aus {_miss_rank_src}")
+    # #239: the token cut of the full-attention KV (None = off, byte-identical)
+    _kv_cut = d_kv_token_cut(ns)
+    _pinned = getattr(ns, "_d_map_form", None)
+    if _pinned:
+        # #239 rc12z29c: the Platztausch map was built from this form (P loaded
+        # it) -- check exactly it: fixed cut, ownership and FR_D from --extra-d
+        _kv_cut = tuple(_pinned["cut"]) if _pinned.get("cut") else None
+        log(f"{D_RANK_SOLVE_MARKER} {label} KARTE-FORM (#239 rc12z29c): geprueft, nicht neu "
+            f"geloest -- Eigentum {','.join(_pinned['ratios'])}, FR_D "
+            f"{','.join(_pinned['fractions'])}, Schnitt "
+            f"{list(_kv_cut) if _kv_cut else 'keiner'} (die Form der Karte)")
+    elif _er.owned_cut_request(_kv_cut)[0] and getattr(ns, "_d_owner_stated", None):
+        # #239 S3f: every pass solves the ownership from the STATED vector
+        ratios = list(ns._d_owner_stated)
+    _kv_cut_kw = ({} if _kv_cut is None else
+                  dict(kv_token_shares=_kv_cut, kv_dtype_bytes=d_kv_dtype_bytes(ns)))
+    # YaRN x2 (27.09.): the KV duty is the D form's own context (#77), not
+    # the rig's fixed 262144 -- a 524288 form priced at 262144 "fitted".
+    _d_kv, _d_kv_src = group_kv_tokens(ns, "d")
+    if _d_kv != CONTEXT_LENGTH_TOKENS:
+        log(f"{D_RANK_SOLVE_MARKER} {label} KV-PFLICHT {_d_kv} Token aus {_d_kv_src} "
+            f"(statt {CONTEXT_LENGTH_TOKENS}): der KV-Posten jedes Rangs ist damit bepreist")
     try:
         plan = _er.plan_d_residency(
             model_path=ns.model,
@@ -14956,7 +18634,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             rank_tp_ratio=",".join(tp_ratio),
             env_d=_env_d,
             reference_logs=ns.d_residency_reference_logs,
-            kv_tokens=CONTEXT_LENGTH_TOKENS,
+            kv_tokens=_d_kv,
             label=label,
             marker=D_RANK_SOLVE_MARKER,
             # H33: die KARTEN-Bilanz (Posten ausserhalb des Budgets, W130).
@@ -14975,6 +18653,13 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             activation_record_mib=_act_rec,
             activation_record_source=_act_src,
             derive_waves=_derive_waves,
+            owned_miss_ms=_miss_ms,
+            owned_miss_source=_miss_src,
+            owned_miss_ms_rank=_miss_rank,
+            owned_miss_rank_source=_miss_rank_src,
+            owned_heat_records=_heat_recs,
+            owned_heat_source=_heat_root,
+            **_kv_cut_kw,
         )
         if _ledger is not None and plan.refusal is not None and plan.fits:
             # THE CONSUMER FOLLOWS THE BOOKED BUDGET (rc12c): lower the
@@ -14997,7 +18682,7 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     rank_tp_ratio=",".join(tp_ratio),
                     env_d=_env_d,
                     reference_logs=ns.d_residency_reference_logs,
-                    kv_tokens=CONTEXT_LENGTH_TOKENS,
+                    kv_tokens=_d_kv,
                     label=label,
                     marker=D_RANK_SOLVE_MARKER,
                     card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
@@ -15011,6 +18696,13 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     activation_record_mib=_act_rec,
                     activation_record_source=_act_src,
                     derive_waves=_derive_waves,
+                    owned_miss_ms=_miss_ms,
+                    owned_miss_source=_miss_src,
+                    owned_miss_ms_rank=_miss_rank,
+                    owned_miss_rank_source=_miss_rank_src,
+                    owned_heat_records=_heat_recs,
+                    owned_heat_source=_heat_root,
+                    **_kv_cut_kw,
                 )
         if d_stated_seats(ns) is not None:
             for _ln in d_seat_lines(ns):
@@ -15020,9 +18712,57 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         # benannt; die Verweigerung unten kommt nur aus einer GERECHNETEN Bilanz.
         log(f"{D_RANK_SOLVE_MARKER} FRACTION-SOLVE {label} failed: "
             f"{type(_exc).__name__}: {_exc}")
+        _plan_without_solve()
         return
     for line in plan.lines:
         log(line)
+    if plan.solved_owner_ratio:
+        # #239 S3f: the ownership is the planner's -- published before FR_D
+        # and the token vector, and every later reader of --rank-moe-ratio
+        # (seat table, Platztausch map, geometry) sees the same vector.
+        ratios = publish_d_owner_ratio(ns, plan, label, log)
+    if plan.solved_fractions:
+        # #239 S2b: FR_D is the planner's -- the D group runs the edge it solved
+        # together with the token cut (the stated FR was only the start point).
+        from sglang.srt.weg2 import draft_post as _dp
+
+        ns.extra_d = _dp.replace_vector_flag(getattr(ns, "extra_d", "") or "",
+                                             "--rank-moe-resident-fraction",
+                                             plan.solved_fractions)
+        ns.env_d = _dp.replace_env_vector(getattr(ns, "env_d", "") or "",
+                                          "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
+                                          plan.solved_fractions)
+        log(f"{D_RANK_SOLVE_MARKER} {label} FR-D (#239 S2b) veroeffentlicht: "
+            f"--extra-d --rank-moe-resident-fraction "
+            f"{','.join(_dp._fmt(x) for x in plan.solved_fractions)} (vorher "
+            f"{','.join(str(x) for x in fr_d)}), Token-Schnitt {list(plan.kv_token_cut)}/"
+            f"{_er.KV_TOKEN_SHARE_GRID}")
+    # VRAM loop P1c (28.09.): the planner's edge wins over the stated FR_D
+    # (outside an owned cut and an S2b solve), coupled to P0 in this group.
+    _fr_new, _fr_lines = d_fr_ceiling_adopt(
+        plan, fr_d, _env_d, bool(_er.owned_cut_request(_kv_cut)[0]),
+        map_built=bool(_pinned or getattr(ns, "_expert_map_path", "")))
+    for _ln in _fr_lines:
+        log(f"{D_RANK_SOLVE_MARKER} {label} {_ln}")
+    if _fr_new is not None:
+        from sglang.srt.weg2 import draft_post as _dp
+
+        ns.extra_d = _dp.replace_vector_flag(getattr(ns, "extra_d", "") or "",
+                                             "--rank-moe-resident-fraction", _fr_new)
+        ns.env_d = _dp.replace_env_vector(getattr(ns, "env_d", "") or "",
+                                          "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", _fr_new)
+        _env_d = parse_group_env(ns.env_d)
+        log(f"{D_RANK_SOLVE_MARKER} {label} {FR_D_CEILING_MARKER} veroeffentlicht: --extra-d "
+            f"--rank-moe-resident-fraction {','.join(_dp._fmt(x) for x in _fr_new)} (vorher "
+            f"{','.join(str(x) for x in fr_d)}; der Planer setzt FR_D, das Profil ist nur "
+            f"noch benannte Obergrenze {FR_D_CAP_ENV})")
+        fr_d = [float(x) for x in _fr_new]
+    # #239 S3a: the cut itself goes to D as the runtime's token vector.
+    ns._d_solved_cut = tuple(getattr(plan, "kv_token_cut", ()) or ()) or None
+    _cut_line = publish_d_token_cut(
+        ns, d_token_cut_vector(getattr(plan, "kv_token_cut", ()), _kv_cut), label)
+    if _cut_line:
+        log(f"{D_RANK_SOLVE_MARKER} {_cut_line}")
     if plan.overflow_waves is not None and plan.overflow_waves != _er.pool_overflow_waves(_env_d):
         # rc12e: the D group runs the waves its solved form needs.
         ns.env_d = set_group_env(getattr(ns, "env_d", "") or "",
@@ -15030,16 +18770,18 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
         _env_d = parse_group_env(ns.env_d)
     # H95: the seats are dynamic 1..--d-bs per D phase -- the same solve per
     # seat count n (seat_rebook re-books the seat posts), one line each.
+    # #239 S3f: under an owned cut the table recomputes the solved form.
+    _seat_cut_kw, _seat_fr = d_seat_table_form(plan, _kv_cut_kw, fr_d)
     for _ln in d_seat_table_lines(ns, _er, dict(
             model_path=ns.model,
             budgets_mib=[float(b) for b in budgets_d],
             ratios=[float(x) for x in ratios],
-            fractions=[float(x) for x in fr_d],
+            fractions=_seat_fr,
             scratch_rows=[int(x) for x in scratch],
             rank_tp_ratio=",".join(tp_ratio),
             env_d=_env_d,
             reference_logs=ns.d_residency_reference_logs,
-            kv_tokens=CONTEXT_LENGTH_TOKENS,
+            kv_tokens=_d_kv,
             label=label,
             marker=D_RANK_SOLVE_MARKER,
             card_reference_logs=getattr(ns, "d_card_reference_logs", "") or "",
@@ -15051,11 +18793,63 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             activation_record_mib=_act_rec,
             activation_record_source=_act_src,
             derive_waves=_derive_waves,
+            owned_miss_ms=_miss_ms,
+            owned_miss_source=_miss_src,
+            owned_miss_ms_rank=_miss_rank,
+            owned_miss_rank_source=_miss_rank_src,
+            owned_heat_records=_heat_recs,
+            owned_heat_source=_heat_root,
+            **_seat_cut_kw,
     ), label):
         log(_ln)
     if plan.refusal is not None:
         log(f"{D_RANK_SOLVE_MARKER} {plan.refusal}")
         raise Weg2LaunchRefused(plan.refusal)
+    _lru_add = getattr(ns, "_d_kv_stage_lru_raise", None)
+    ns._d_kv_stage_lru_raise = None
+    _own_add = {r: int(k) for r, k in enumerate(getattr(plan, "owned_scratch_raise", ()) or ())
+                if int(k) > 0}
+    if _own_add:
+        # 01.10. (y6n): the owned solve's wave floor needs these scratch rows
+        # (rows from resident to scratch, FR_D already solved with them) --
+        # the same raise-and-solve-again as the #251c LRU floor
+        log(f"{D_RANK_SOLVE_MARKER} {label} D-EIGENTUM GRENZEN: Wellenboden braucht Scratch "
+            + ", ".join("rang%d +%d" % (r, k) for r, k in sorted(_own_add.items())))
+        _lru_add = {r: max(int((_lru_add or {}).get(r, 0)), int(_own_add.get(r, 0)))
+                    for r in set(_lru_add or {}) | set(_own_add)}
+    if _lru_add:
+        # (3) 29.09.: a KV rank's LRU falls below its measured peak at an
+        # allowed stage -- raise its scratch and solve again, so the planner
+        # moves the rows from resident to scratch (FR_D) before the map pins
+        _round = int(getattr(ns, "_d_kv_stage_lru_round", 0) or 0)
+        _what = ", ".join("rang%d +%d" % (r, k) for r, k in sorted(_lru_add.items()))
+        if _pinned:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: Scratch {_what} "
+                f"waere noetig, die Karte ist gebaut -- nicht neu geloest (die Spitze kostet "
+                f"eine Zusatzwelle)")
+        elif _round >= D_KV_STAGE_LRU_FLOOR_ROUNDS:
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: nach {_round} "
+                f"Runden noch {_what} -- nicht erreicht, die Spitze kostet eine Zusatzwelle")
+        else:
+            d_kv_stage_undo(ns)
+            _base = _rank_vec(parse_group_env(getattr(ns, "env_d", "") or "")
+                              .get("SGLANG_MOE_SCRATCH_SLOTS"), n)
+            _new = [int(x) + int(_lru_add.get(r, 0)) for r, x in enumerate(_base)]
+            ns.env_d = set_group_env(getattr(ns, "env_d", "") or "", "SGLANG_MOE_SCRATCH_SLOTS",
+                                     ",".join(str(x) for x in _new))
+            log(f"{D_RANK_SOLVE_MARKER} {label} {D_KV_STAGE_LRU_FLOOR_MARKER}: Scratch {_what} "
+                f"-> SGLANG_MOE_SCRATCH_SLOTS {','.join(str(x) for x in _base)} -> "
+                f"{','.join(str(x) for x in _new)}, neu geloest (Runde {_round + 1}; der Planer "
+                f"senkt FR_D, die Zeilen gehen von resident nach Scratch)")
+            ns._d_kv_stage_lru_round = _round + 1
+            # the map pass restores env_d; the raised scratch is part of the
+            # form the map pins (FR_D was solved with it), so it outlives it
+            ns._d_kv_stage_lru_scratch = list(_new)
+            try:
+                return log_d_rank_vram_solve(ns, cards, budgets_d, log, label, p_split=p_split,
+                                             chunk_layers=chunk_layers, card_terms=card_terms)
+            finally:
+                ns._d_kv_stage_lru_round = _round
     if _ledger is not None and plan.fits:
         # rc12e: D's extend trims the allocator cache when the card holds
         # less than floor + booked activation (WEG2-EXTEND-CACHE-TRIM).
@@ -15069,6 +18863,16 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                       if _growth is not None else "floor + gebuchte Aktivierung je Rang")
             log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-TRIM SGLANG_WEG2_EXTEND_TRIM_MIB={_trim} "
                 f"({_gtext}; darunter leert D vor dem Extend den Allokator-Cache)")
+        # D-TRANSIENT-LEND: the near-OOM edge per rank, down to which D lends
+        # its booked transient as expert rows between extends; a value named
+        # in --env-d wins
+        _env_d = getattr(ns, "env_d", "") or ""
+        if "SGLANG_WEG2_D_LEND_FLOOR_MIB" not in parse_group_env(_env_d):
+            _lend = d_lend_floor_env(_ledger)
+            ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_D_LEND_FLOOR_MIB", _lend)
+            log(f"{D_RANK_SOLVE_MARKER} {label} TRANSIENT-LEND SGLANG_WEG2_D_LEND_FLOOR_MIB={_lend} "
+                f"(Karten-Boden je Rang; zwischen zwei Extends werden die Bytes darueber "
+                f"Expertenzeilen, vor dem Extend zurueckgegeben)")
         # rc12g: the extend chunk follows the card after the trim
         # (WEG2-EXTEND-STUECKELUNG); a value named in --env-d wins.
         _rate, _rate_src = d_extend_growth_per_row_record(ns.profile)
@@ -15090,6 +18894,15 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
                     f"{' (aus --env-d, Vorrang)' if _given else ''} "
                     f"(Rate aus D_EXTEND_GROWTH_PER_ROW_MIB {_rate}, boots {_rate_src}; D kappt den "
                     f"Extend-Chunk auf floor((card_free_post - 300) / Rate), MIN ueber TP)")
+    _w = getattr(ns, "_d_kv_stage_written", None) or {}
+    _stage_rows = dict((_w.get("worker_rows") or {}))
+    if _w:
+        _stage_rows[int(_w.get("host", 0))] = int(_w.get("rows", 0))
+    vram_view().note_d_solve(label, cards, plan.fits,
+                             objective=str(getattr(ns, "d_tp_objective", "") or ""),
+                             kv_tokens_max=int(_d_kv), seats=d_stated_seats(ns),
+                             stage_rows=_stage_rows, fixed_src=_fixed_src, act_src=_act_src)
+    vram_plan_emit(ns, cards, _VRAM_PASS_BY_LABEL.get(label, "d_early"), log, d_label=label)
     log_wake_credit_solve(ns, cards, plan.fits, log, label,
                           p_split=p_split, chunk_layers=chunk_layers)
 
@@ -15213,7 +19026,15 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
         n_layers=int(fits[0].n_layers), ratios=ratios, p_rows=p_rows, d_rows=d_rows,
         slot_mib=float(fits[0].slot_mib),
         p_resident=[_er.resident_rows(num_experts, float(f)) for f in fr_pp],
-        d_resident=[int(f.resident_rows) for f in fits])
+        d_resident=[int(f.resident_rows) for f in fits],
+        # #239 S3h2: under the KV token cut the kv_cache tag per rank (KV pool
+        # from the SOLVED cut + the mamba state pool); None without the cut.
+        kv_first_mib=([float(f.kv_mib) + float(f.mamba_mib) for f in fits]
+                      if all(float(getattr(f, "kv_token_share", -1.0)) >= 0.0 for f in fits)
+                      else None),
+        kv_cut_shares=([float(f.kv_token_share) for f in fits]
+                       if all(float(getattr(f, "kv_token_share", -1.0)) >= 0.0 for f in fits)
+                       else None))
     if wplan.refusal is not None:
         log(f"{_wc.MARKER} {wplan.refusal}")
         raise Weg2LaunchRefused(wplan.refusal)
@@ -15224,7 +19045,8 @@ def log_wake_credit_solve(ns, cards: List[Card], fits, log, label: str, *,
 def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
                              chunk_layers: int, n_layers: int, ratios, p_rows, d_rows,
                              slot_mib: float, p_resident=None,
-                             d_resident=None) -> Optional[str]:
+                             d_resident=None, kv_first_mib=None,
+                             kv_cut_shares=None) -> Optional[str]:
     """H34: der Wake P->D der geplanten Form, je Karte in Millisekunden.
 
     fnFL2x141: im P->D-Wake wartet D TP2 (nvml2) 73-94 ms an weights_4 und
@@ -15263,6 +19085,10 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
             # (dieselbe Env, aus der der D-FRACTION-SOLVE seine liest).
             dense_repack=_er.dense_repack_outside_pool(
                 parse_group_env(getattr(ns, "env_d", "") or "")),
+            # #242r: die Geometrie des PP-Cut-Solves fuer den Umschnitt
+            recut_geometry=getattr(ns, "_pcut_recut_geometry", None),
+            # #239 S3h2: the KV-first verdict per rank under the token cut
+            kv_first_mib=kv_first_mib, kv_cut_shares=kv_cut_shares,
         )
     except (KeyError, ValueError, IndexError) as _exc:
         log(f"{_wpd.MARKER} {_wpd.DIRECTION} {label} failed: {type(_exc).__name__}: {_exc}")
@@ -15279,6 +19105,67 @@ def log_wake_credit_solve_pd(ns, cards: List[Card], log, label: str, *, p_split,
             f"(SGLANG_WEG2_ENABLE_PD_CREDIT_REFUSAL=0) -- der Boot geht weiter")
         return None
     return pplan.refusal
+
+
+def publish_store_identity(model: str, map_path: str, log) -> str:
+    """H2c: die Identitaet des geteilten Expertenstores fuer diesen Boot.
+
+    Ein Sentinel ``*.written.json`` sagte bis hier nur "diese Plaetze sind
+    geschrieben" -- nicht mit welchem Checkpoint und welcher Slot-Karte. Der
+    Store ueberlebt den Prozess; ein Boot mit anderem Checkpoint oder anderen
+    FR/``--rank-moe-ratio`` haette mit D-Store-Adopt (H2) fremde Bytes als
+    eigene Experten gelesen. Deshalb war H2 im Profil aus
+    (ENTSCHEIDUNGEN-0927, 28.09.: "Expertenstore-Identitaet ist VORBEDINGUNG").
+
+    Ohne Karte ``""``: dann gibt es keine Slot-Zuordnung, und store_adopt
+    bleibt inaktiv. Ein Fehler beim Rechnen ist ebenfalls ``""`` -- das ist
+    die sichere Richtung (D liest vom Checkpoint), nie eine halbe Identitaet.
+    """
+    if not map_path:
+        log("H2c STORE-IDENTITY ENTFAELLT: keine Experten-Karte -> D-Store-Adopt inaktiv")
+        return ""
+    from sglang.srt.layers.moe import expert_store as _es
+
+    try:
+        ident = _es.compute_identity(model, map_path)
+    except OSError as exc:
+        log("H2c STORE-IDENTITY ENTFAELLT: %s: %s -> D-Store-Adopt inaktiv"
+            % (type(exc).__name__, exc))
+        return ""
+    log("H2c STORE-IDENTITY id=%s model=%s map=%s (beide Gruppen; ein Sentinel "
+        "ohne diese Identitaet belegt nichts)" % (ident or "-", model, map_path))
+    return ident
+
+
+EXPERT_MAP_DIR_ENV = "SGLANG_WEG2_EXPERT_MAP_DIR"
+
+
+def expert_map_dir(evidence_dir: str, log) -> str:
+    """Where the expert maps (#107 Platztausch, V1) are written: the evidence
+    dir when this process can write it, else a NAMED writable fallback
+    (``SGLANG_WEG2_EXPERT_MAP_DIR``, default ``<tmp>/weg2-expert-maps``).
+
+    Dry runs against a container's evidence tree (owned by the container's
+    user) printed 'WEG2-EXPERT-MAP failed: PermissionError' and published no
+    map -- so the dry run never showed the map the boot would build. Both
+    groups read the map by the path in their env, so any directory this
+    launcher can write and the ranks can read is correct; the redirect is
+    logged so a reader never looks for the map in the wrong place."""
+    try:
+        os.makedirs(evidence_dir, exist_ok=True)
+    except OSError:
+        pass
+    if os.path.isdir(evidence_dir) and os.access(evidence_dir, os.W_OK | os.X_OK):
+        return evidence_dir
+    import tempfile
+
+    alt = (os.environ.get(EXPERT_MAP_DIR_ENV)
+           or os.path.join(tempfile.gettempdir(), "weg2-expert-maps"))
+    os.makedirs(alt, exist_ok=True)
+    log(f"WEG2-EXPERT-MAP-DIR {evidence_dir} is not writable by this process -> "
+        f"maps go to {alt} ({EXPERT_MAP_DIR_ENV}); both groups read them by the "
+        f"path in their env")
+    return alt
 
 
 def publish_expert_map(ns, model: str, evidence_dir: str, log,
@@ -15321,14 +19208,7 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
         from sglang.srt.planner import pp_cut as _pp_cut
         from sglang.srt.layers.moe import expert_map as _em
 
-        ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
-        fr_tp = _argv_vector(getattr(ns, "extra_d", ""),
-                             "--rank-moe-resident-fraction")
-        _fp_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "")
-        fr_pp = (_csv_floats(_fp_text) if _fp_text else
-                 [float(x) for x in (_argv_vector(
-                     getattr(ns, "extra_p", ""),
-                     "--rank-moe-resident-fraction") or [])])
+        ratios, fr_tp, fr_pp = expert_map_vectors(ns)
         luecken = []
         if not ratios:
             luecken.append("--rank-moe-ratio (extra_d)")
@@ -15367,36 +19247,25 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
         # der Ids (geschachtelt). Sie braucht den REALISIERTEN P-Layer-Split,
         # weil P's Residenz je STUFE gilt und ein Rang seinen Layer ueber die
         # Stufe adressiert (unter tp=1 ist moe_tp_rank fuer alle Stufen 0).
-        _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
-        if _stages and len(_stages) == len(fr_pp) and not _mirror:
-            _layer_stage = [s for s, n in enumerate(_stages) for _ in range(n)]
-            karte = _em.build_nested(
-                total=total,
-                ratios=[int(float(x)) for x in ratios],
-                fr_pp=[float(x) for x in fr_pp],
-                fr_tp=[float(x) for x in fr_tp],
-                p_layer_stage=_layer_stage,
-                pad_tp=1,
-            )
-        else:
-            if not _mirror:
-                log("#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt "
-                    "nicht zu %d P-Fractions -- Version-1-Karte wie bisher"
-                    % (_stages or "unbekannt", len(fr_pp)))
-            karte = _em.build(total=total,
-                              ratios=[int(float(x)) for x in ratios],
-                              fr_pp=[float(x) for x in fr_pp],
-                              fr_tp=[float(x) for x in fr_tp],
-                              mirror=_mirror)
+        karte, _layer_stage = build_expert_karte(total, ratios, fr_pp, fr_tp,
+                                                 p_stage_layers, _mirror)
+        if _layer_stage is None and not _mirror:
+            _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
+            log("#107 PLATZTAUSCH-KARTE ENTFAELLT: P-Layer-Split %s passt "
+                "nicht zu %d P-Fractions -- Version-1-Karte wie bisher"
+                % (_stages or "unbekannt", len(fr_pp)))
         grund = _em.refuse_if_inconsistent(karte)
         if grund:
             log("#107 EXPERTEN-KARTE VERWORFEN (nicht geschrieben): %s" % grund)
             return ""
         _refuse_unbuilt_platztausch_buffers(karte, chunk_layers=chunk_layers)
-        os.makedirs(evidence_dir, exist_ok=True)
-        pfad = os.path.join(evidence_dir, f"expert_map_{ns.tag}.json")
+        pfad = os.path.join(expert_map_dir(evidence_dir, log), f"expert_map_{ns.tag}.json")
         with open(pfad, "w") as fh:
             _json.dump(karte, fh)
+        # #239 rc12z29c-Blocker 2: die D-Form, die diese Karte beschreibt --
+        # jeder D-Start wird dagegen geprueft (refuse_d_form_off_the_map)
+        ns._expert_map_d_form = {"ratios": [str(x) for x in ratios],
+                                 "fractions": [str(x) for x in fr_tp]}
         if _em.is_nested(karte):
             _pp = karte["phases"]["P"]
             _dp = karte["phases"]["D"]
@@ -15457,6 +19326,221 @@ def publish_expert_map(ns, model: str, evidence_dir: str, log,
     except BaseException as _exc:  # noqa: BLE001 -- eine Karte kippt nie den Boot
         log("#107 EXPERTEN-KARTE failed: %s: %s" % (type(_exc).__name__, _exc))
         return ""
+
+
+def expert_map_vectors(ns) -> Tuple[List[str], List[str], List[float]]:
+    """(--rank-moe-ratio, FR_D, FR_P) exactly as :func:`publish_expert_map`
+    reads them -- one reader, so the host ledger's store post
+    (:func:`planned_expert_store_bytes`) sizes the store the map will build."""
+    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    fr_tp = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
+    _fp_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "")
+    fr_pp = (_csv_floats(_fp_text) if _fp_text else
+             [float(x) for x in (_argv_vector(
+                 getattr(ns, "extra_p", ""), "--rank-moe-resident-fraction") or [])])
+    return ratios, fr_tp, fr_pp
+
+
+def build_expert_karte(total, ratios, fr_pp, fr_tp, p_stage_layers, mirror: bool = False):
+    """(karte, p_layer_stage) -- the Version-2 (Platztausch) map when the
+    realised P layer split matches FR_P, else the Version-1 map with
+    p_layer_stage None. The ONE build both the map writer and the ledger's
+    dry sizing call."""
+    from sglang.srt.layers.moe import expert_map as _em
+
+    _stages = [int(x) for x in (p_stage_layers or []) if int(x) > 0]
+    if _stages and len(_stages) == len(fr_pp) and not mirror:
+        _layer_stage = [s for s, n in enumerate(_stages) for _ in range(n)]
+        return _em.build_nested(
+            total=total,
+            ratios=[int(float(x)) for x in ratios],
+            fr_pp=[float(x) for x in fr_pp],
+            fr_tp=[float(x) for x in fr_tp],
+            p_layer_stage=_layer_stage,
+            pad_tp=1,
+        ), _layer_stage
+    return _em.build(total=total,
+                     ratios=[int(float(x)) for x in ratios],
+                     fr_pp=[float(x) for x in fr_pp],
+                     fr_tp=[float(x) for x in fr_tp],
+                     mirror=mirror), None
+
+
+#: 29.09. (Planer post COLD_TIER_SHM): filesystems whose pages are shmem --
+#: unevictable without swap, charged to the cgroup that touched them.
+COLD_TIER_SHM_FS = ("tmpfs", "ramfs")
+#: The map may move the store after the first pricing (the D form is pinned
+#: for the map, #239 rc12z29c); a move above this re-prices the ledger.
+COLD_TIER_REPRICE_EPS_GIB = 0.01
+COLD_TIER_MARKER = "WEG2-HOST-LEDGER COLD-TIER"
+
+
+def expert_store_dir_of(ns) -> str:
+    """The expert store directory the RANKS get: --env-d, then --env-p, then
+    the launcher's own environment (ENV-LAUNCHER != RANG -- the NF arm sets it
+    in the group env only)."""
+    from sglang.srt.layers.moe.expert_store import STORE_DIR_ENV
+
+    for spec in (getattr(ns, "env_d", ""), getattr(ns, "env_p", "")):
+        v = parse_group_env(spec or "").get(STORE_DIR_ENV)
+        if v:
+            return str(v)
+    return str(os.environ.get(STORE_DIR_ENV, "") or "")
+
+
+def planned_expert_store_bytes(ns, model: str, p_stage_layers=None,
+                               karte_path: str = "") -> Tuple[Optional[int], str]:
+    """The expert store's size from its DIMENSIONING source, never from df:
+    store slots per layer x MoE layers x row bytes. ``karte_path`` = the map
+    as written (after the D form is pinned); else the map is dry-built from
+    the same vectors :func:`publish_expert_map` reads. (None, why) when no
+    map could be built -- the ranks then size their store themselves."""
+    from sglang.srt.planner import pp_cut as _pp_cut
+
+    _terms = []
+
+    def terms():
+        if not _terms:
+            _terms.append(_pp_cut.checkpoint_weight_terms(model))
+        return _terms[0]
+
+    if karte_path:
+        with open(karte_path) as fh:
+            karte = json.load(fh)
+        src = f"map {karte_path}"
+    else:
+        ratios, fr_tp, fr_pp = expert_map_vectors(ns)
+        if not (ratios and fr_tp and fr_pp):
+            return None, "no map vectors (--rank-moe-ratio / FR_D / FR_P) -- no map, no sized store"
+        _mirror = str(os.environ.get("WEG2_EXPERT_MAP_MIRROR", "0")).strip() in ("1", "true", "True", "on")
+        karte, _ls = build_expert_karte(int(terms().num_experts), ratios, fr_pp, fr_tp,
+                                        p_stage_layers, _mirror)
+        src = "map dry-built from the vectors publish_expert_map reads"
+    # the row the P cut priced (ns._expert_row_mib, same checkpoint terms) --
+    # read only once a map exists: a dense checkpoint has no rows to price
+    row = float(getattr(ns, "_expert_row_mib", 0.0) or 0.0) * _pp_cut.MIB
+    if row <= 0:
+        row = float(terms().expert_layer_weight_bytes) / max(1, int(terms().num_experts))
+    slots = int(karte["slots"])
+    layers = len(karte.get("p_layer_stage") or []) or int(terms().n_layers)
+    return int(slots * layers * row), (f"slots {slots} x {layers} layers x "
+                                       f"{row / _pp_cut.MIB:.3f} MiB/row ({src})")
+
+
+def cold_tier_shm_post(ns, model: str, p_stage_layers=None, karte_path: str = "",
+                       mounts_text: Optional[str] = None) -> Tuple[float, str]:
+    """29.09. Planer post COLD_TIER_SHM -> ledger term ``cold_tier_shm_gib``
+    (GiB, both moments): the expert store when its directory is on a tmpfs.
+
+    MEASURED z30w-park (29.09. 09:12Z, Docker memory.max 84 GiB): shmem 53.36
+    GiB of which /dev/shm 7.9 -- the store (/mnt/nf-experts, a per-boot tmpfs
+    mount, map 'Store ~39.2 GiB') was the largest host post and priced
+    nowhere; the ledger said 47.72 against 79.46 nonreclaim.
+
+    Bytes the tmpfs already holds are credited: they are in the ledger's
+    origin reading (nonreclaim now) and must not be charged twice."""
+    store_dir = expert_store_dir_of(ns)
+    if not store_dir:
+        return 0.0, (f"{COLD_TIER_MARKER} post cold_tier_shm 0.00 GiB: no expert store "
+                     f"(SGLANG_MOE_EXPERT_STORE_DIR not in --env-d/--env-p/env)")
+    mnt, fs, _src = fs_of(store_dir, mounts_text)
+    if fs not in COLD_TIER_SHM_FS:
+        return 0.0, (f"{COLD_TIER_MARKER} post cold_tier_shm 0.00 GiB: store {store_dir} on "
+                     f"fs={fs or '?'} mount={mnt or '?'} -- page cache, reclaimable, not a post")
+    planned, how = planned_expert_store_bytes(ns, model, p_stage_layers, karte_path)
+    if planned is None:
+        return 0.0, (f"{COLD_TIER_MARKER} post cold_tier_shm UNPRICED: store {store_dir} is "
+                     f"{fs} (shmem) but {how}")
+    resident = _tree_bytes(store_dir)[0] if os.path.exists(store_dir) else 0
+    post = max(0, planned - resident) / host_ledger.GIB
+    return post, (f"{COLD_TIER_MARKER} post cold_tier_shm {post:.2f} GiB = planned "
+                  f"{planned / host_ledger.GIB:.2f} GiB ({how}) - already resident "
+                  f"{resident / host_ledger.GIB:.2f} GiB (in the origin reading); store "
+                  f"{store_dir} on {fs} mount={mnt}, both moments")
+
+
+class Weg2DFormOffTheMap(Weg2LaunchRefused):
+    """W170 (#239 rc12z29c-Blocker 2): group D is about to start with a MoE
+    ownership (--rank-moe-ratio) or FR_D (--rank-moe-resident-fraction /
+    SGLANG_MOE_RESIDENT_EXPERT_FRACTION) other than the one the Platztausch
+    map was built from. P loaded its common prefix and store slots from that
+    map, so D would load a form the map does not describe and die at load
+    ('Platztausch-Karte nennt N residente Zeilen ...'), minutes later."""
+
+
+#: The env the D ranks read FR_D from (resident_fraction.resident_fraction_for_rank).
+D_FR_ENV = "SGLANG_MOE_RESIDENT_EXPERT_FRACTION"
+
+
+def _same_vector(a, b) -> bool:
+    try:
+        fa, fb = [float(x) for x in a], [float(x) for x in b]
+    except (TypeError, ValueError):
+        return False
+    return len(fa) == len(fb) and all(abs(x - y) <= 1e-9 for x, y in zip(fa, fb))
+
+
+def refuse_d_form_off_the_map(ns, log) -> None:
+    """W170: the D form a D start carries must be the map's (#239 rc12z29c).
+
+    Called right before every D env/argv is built (d-only, dry run, real). A
+    no-op without a published map. Reads what D will actually read: the
+    ratio and FR in --extra-d and FR in --env-d. Whatever moved it after the
+    map (a later solve, the P1c FR-D ceiling, an operator edit) is refused by
+    name here, never discovered by D's loader."""
+    form = getattr(ns, "_expert_map_d_form", None)
+    if not form:
+        return
+    ratios = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-ratio")
+    fr = _argv_vector(getattr(ns, "extra_d", ""), "--rank-moe-resident-fraction")
+    env_fr_text = parse_group_env(getattr(ns, "env_d", "") or "").get(D_FR_ENV)
+    moved = []
+    if not _same_vector(ratios or [], form["ratios"]):
+        moved.append(f"--rank-moe-ratio {ratios} (Karte {form['ratios']})")
+    if not _same_vector(fr or [], form["fractions"]):
+        moved.append(f"--rank-moe-resident-fraction {fr} (Karte {form['fractions']})")
+    if env_fr_text is not None and not _same_vector(
+            [x for x in str(env_fr_text).split(",") if x.strip()], form["fractions"]):
+        moved.append(f"--env-d {D_FR_ENV}={env_fr_text} (Karte {form['fractions']})")
+    if moved:
+        raise Weg2DFormOffTheMap(
+            "W170 Weg2DFormOffTheMap: D would start with a form the Platztausch map "
+            "does not describe -- " + "; ".join(moved) + ". P loaded its prefix and "
+            "store slots from the map; D would die at load. Fix the solve that "
+            "moved it, not the map (#239 rc12z29c)")
+    log(f"KARTE-FORM (#239 rc12z29c) D-START geprueft: --rank-moe-ratio "
+        f"{','.join(form['ratios'])}, FR_D {','.join(form['fractions'])} = die Form der Karte")
+
+
+def repoint_store_geometry_at_pinned_form(xchg_env: Dict[str, str], form: dict,
+                                          total: int, log) -> None:
+    """#239 rc12z29c-Blocker 2: the geometry published from --extra-d BEFORE
+    the pre-map D solve (#106 STORE-GEOMETRY, #134 bands, the V1 map) carries
+    the stated vectors -- rc12z29c's D log still printed '#96 STORE-SLOTS
+    rank=2 ... ratios=[183, 137, 168] fracs=[0.06, 0.51, 0.48]'. With the
+    Platztausch map that line is only a diagnostic (the map is the slot
+    authority), but a run whose map fails falls back to exactly these values.
+    So every geometry published from the vectors follows the pinned form."""
+    from sglang.srt.layers.moe import expert_map as _em
+
+    ratios, fracs = list(form["ratios"]), list(form["fractions"])
+    if "SGLANG_MOE_EXPERT_STORE_GEOMETRY" in xchg_env:
+        was = xchg_env["SGLANG_MOE_EXPERT_STORE_GEOMETRY"]
+        xchg_env["SGLANG_MOE_EXPERT_STORE_GEOMETRY"] = f"{','.join(ratios)}|{','.join(fracs)}"
+        log(f"WEG2-STORE-GEOMETRY shared={xchg_env['SGLANG_MOE_EXPERT_STORE_GEOMETRY']} "
+            f"source=KARTE-FORM (#239 rc12z29c; vorher {was} aus dem genannten Vektor)")
+    if "SGLANG_WEG2_EXPERT_BAND_SIZE" in xchg_env:
+        _bs, _bc = _em.band_geometry([int(float(x)) for x in ratios], int(total))
+        if _bs > 0:
+            xchg_env["SGLANG_WEG2_EXPERT_BAND_SIZE"] = str(_bs)
+            xchg_env["SGLANG_WEG2_EXPERT_BANDS"] = str(_bc)
+        else:
+            xchg_env.pop("SGLANG_WEG2_EXPERT_BAND_SIZE", None)
+            xchg_env.pop("SGLANG_WEG2_EXPERT_BANDS", None)
+        log(f"WEG2-EXPERT-BAND size={_bs} count={_bc} aus der KARTE-FORM (#239 rc12z29c)")
+    if xchg_env.pop(_em.MAP_ENV, None) is not None:
+        log("WEG2-EXPERT-MAP (V1, aus dem genannten Vektor) verworfen (#239 rc12z29c): "
+            "die Karte kommt aus publish_expert_map und der gepinnten Form")
 
 
 def _refuse_unbuilt_platztausch_buffers(karte: dict, *,
@@ -15570,10 +19654,22 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                    fracs: Sequence[float], lru_rows: Sequence[int],
                    stage_layers: Sequence[int], kv_mib, num_experts: int,
                    row_mib: float, mamba_slots: int = 0,
-                   mamba_mib_per_slot: Sequence[float] = ()) -> None:
+                   mamba_mib_per_slot: Sequence[float] = (),
+                   layer_kinds: Optional[Sequence[str]] = None,
+                   dense_mib_per_layer: Optional[float] = None,
+                   mamba_mib_per_linear_layer_per_slot: Optional[float] = None,
+                   ) -> Optional[List[float]]:
     """H41: ``PP-CUT ACTIVATION`` (T_s(chunk) je Stufe mit Quelle) und
     ``PP-CUT P-KARTE`` (Kopfraum je Stufe im Chunk-Forward); W132, wenn eine
     Stufe unter near-OOM faellt, W131 fuer einen ungemessenen Chunk.
+
+    YaRN x2 (28.09.): FR_P ist die OBERGRENZE, nicht der exakte Wert. Reisst
+    eine Stufe die Karte, kappt der Launcher NUR diese Stufe auf ihre Karten-
+    Decke (``p_card_fr_cap``), rechnet die Karte mit der Kappung noch einmal
+    und schreibt sie an die drei Stellen, an denen FR_P lebt (wie der
+    H25-Post). Rueckgabe: die gekappten Fractions, None = unveraendert.
+    Verweigert bleibt W132, wenn eine Stufe keine Decke hat (nicht einmal ein
+    residenter Experte plus Scratch) oder die Karte auch gekappt reisst.
 
     Eine Referenz, die nicht zu DIESER Form passt (anderes Modell, anderer
     Schnitt, fehlender KV-Preis oder Draft-Posten), laesst die Karten-Bilanz
@@ -15581,7 +19677,8 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     """
     from sglang.srt.weg2 import draft_post as _dp
 
-    support = P_PREFILL_TRANSIENT_SUPPORT
+    # #242: max(builtin, record) per stage -- see p_transient_support(card=True).
+    support = p_transient_support(getattr(ns, "profile", None) or None, card=True)
     name = os.path.basename(os.path.normpath(str(model)))
     # H87: a footprint-identical derivative carries the support's measurement.
     if name != support.model and not weg2_form.reference_model_verdict(
@@ -15616,9 +19713,13 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
                     getattr(ns, "p_card_over_logs", "") or "").split(",") if x.strip()]:
                 with open(path, errors="replace") as fh:
                     over.append((os.path.basename(path), fh.read()))
+            # #242b: Logs der Mehr-Sequenz-Form messen aus den H55-Fenstern
+            # (Ein-Sequenz-Chunk-0, Grundstand-Wachstum), sonst mischt die
+            # Hochwassermarke die Last in das Wachstum mit der Tiefe.
             reference = _p_card.p_card_reference_from_logs(
                 boots, stage_layers=stage_layers, row_mib=row_mib,
-                support=support, model=name, over_boots=over, d_logs=d_logs)
+                support=support, model=name, over_boots=over, d_logs=d_logs,
+                windows=_p_card.logs_carry_seq_windows(boots))
             if d_logs:
                 co_tenant = _p_card.merge_co_tenant(
                     co_tenant,
@@ -15658,12 +19759,26 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
     # volle Kontext (262144, NF-Pflicht). Das Chunk-Wachstum SAETTIGT
     # (fnFL2x160: nach Chunk 3, gemessen ueber 16 Chunks), also ist die
     # 262k-Kante die 97k-Kante. LMEM des Run-Writes: 0 mit dem H47-Fix.
-    prompt = int(getattr(ns, "p_card_prompt_tokens", 0) or 0) or CONTEXT_LENGTH_TOKENS
+    prompt = int(getattr(ns, "p_card_prompt_tokens", 0) or 0) or group_context_tokens(ns, "p")[0]
     lmem_fixed = _p_card.arena_write_lmem_fixed()
+    # #242r: ein anderer Schnitt als der gemessene wird UMGERECHNET (K0 je
+    # Stufe um Dense und Mamba der wandernden Layer); geht das nicht, VERWEIGERT
+    # die Karte mit Namen (W167) statt still zu entfallen.
+    recut_from = None
+    if tuple(int(x) for x in stage_layers) != tuple(reference.stage_layers):
+        recut_from = tuple(reference.stage_layers)
+        try:
+            reference = _p_card.recut_reference(
+                reference, stage_layers, layer_kinds=layer_kinds,
+                dense_mib_per_layer=dense_mib_per_layer,
+                mamba_mib_per_linear_layer_per_slot=mamba_mib_per_linear_layer_per_slot)
+        except _p_card.PCutRecutRefused as exc:
+            log(f"{_p_card.CARD_MARKER} {exc}")
+            raise Weg2LaunchRefused(str(exc)) from None
 
-    def _solve(tokens):
+    def _solve(tokens, fractions=fracs):
         return _p_card.solve_p_card(
-            reference=reference, support=support, fractions=fracs,
+            reference=reference, support=support, fractions=fractions,
             lru_rows=lru_rows, stage_layers=stage_layers, chunk=int(chunk_tokens),
             kv_mib=[float(x) for x in kv_mib], num_experts=int(num_experts),
             row_mib=float(row_mib), draft_on_p=draft_on_p,
@@ -15684,10 +19799,119 @@ def p_card_verdict(ns, cards, log, *, model: str, chunk_tokens: int,
         return
     for fit in fits:
         log(_p_card.describe_p_card(fit, reference))
+    vram_view().note_p_card(cards, fits, fracs, lru_rows, reference.source, num_experts=int(num_experts))
+    if recut_from is not None:
+        log(_p_card.recut_card_line(
+            recut_from, stage_layers, fits, dense_mib_per_layer=float(dense_mib_per_layer),
+            mamba_mib_per_linear_layer=float(mamba_mib_per_linear_layer_per_slot or 0.0)
+            * int(reference.mamba_slots)))
     refusal = _p_card.p_card_refusal_text(fits, reference, chunk=int(chunk_tokens))
-    if refusal is not None:
+    if refusal is None:
+        return None
+    cap = p_card_fr_cap(fits, fracs, int(num_experts), lru_rows)
+    if cap.refusal:
+        refusal = "%s -- %s" % (refusal, cap.refusal)
         log(f"{_p_card.CARD_MARKER} {refusal}")
         raise Weg2LaunchRefused(refusal)
+    capped = _solve(prompt, cap.fractions)
+    for fit in capped:
+        log(_p_card.describe_p_card(fit, reference))
+    vram_view().note_p_card(cards, capped, cap.fractions, lru_rows, reference.source, num_experts=int(num_experts))
+    again = _p_card.p_card_refusal_text(capped, reference, chunk=int(chunk_tokens))
+    if again is not None:
+        again = "%s -- auch nach %s %s" % (again, P_FR_CAP_MARKER, "; ".join(cap.lines))
+        log(f"{_p_card.CARD_MARKER} {again}")
+        raise Weg2LaunchRefused(again)
+    publish_p_fractions(ns, cap.fractions)
+    ns._w132_fr_cap = {
+        "fr_p_before": [float(x) for x in fracs],
+        "fr_p_after": [float(x) for x in cap.fractions],
+        "stages": list(cap.stages),
+        "lines": list(cap.lines),
+        "chunk": int(chunk_tokens),
+        "prompt": int(capped[0].prompt_tokens) if capped else int(prompt),
+    }
+    for line in cap.lines:
+        log(f"{P_FR_CAP_MARKER} {line}")
+    log(f"{P_FR_CAP_MARKER} FR_P {[round(float(x), 4) for x in fracs]} -> "
+        f"{ns.pp_cut_expert_device_fraction} (published to --pp-cut-expert-device-"
+        f"fraction, --extra-p --rank-moe-resident-fraction, --env-p "
+        f"SGLANG_MOE_RESIDENT_EXPERT_FRACTION; die uebrigen Stufen exakt wie gegeben)")
+    return list(cap.fractions)
+
+
+#: YaRN x2 (28.09.): die Zeile der Kappung. Bewusst 'W132-...' mit Bindestrich:
+#: der Arm zaehlt nach dem Dry-Run ``W[0-9]+ `` als Verweigerung
+#: (test_no_h57_line_is_counted_as_a_w_line_by_the_arm) -- eine Kappung ist
+#: keine.
+P_FR_CAP_MARKER = "PP-CUT W132-FR_P-KAPPUNG"
+
+
+class PFrCap(NamedTuple):
+    fractions: Tuple[float, ...]
+    stages: Tuple[int, ...]
+    lines: Tuple[str, ...]
+    refusal: str
+
+
+def p_card_fr_cap(fits, fracs: Sequence[float], num_experts: int,
+                  lru_rows: Sequence[int]) -> PFrCap:
+    """FR_P als Obergrenze: jede Stufe, die die Karte reisst, auf ihre
+    Karten-Decke (``PCardFit.ceiling_fraction`` = groesste Fraction, deren
+    Puffer in die tragbaren Zeilen passt); jede andere Stufe EXAKT wie gegeben.
+
+    Untergrenze ist die bestehende Mindestresidenz der Stufe:
+    ``largest_fraction_for_rows`` gibt None, wenn die Karte nicht einmal EINEN
+    residenten Experten plus ihren Scratch traegt -- dann bleibt W132 mit Namen
+    (``refusal``), statt auf 0 zu kappen. Ebenso, wenn die Decke nicht unter
+    der gegebenen Fraction liegt (dann liegt der Mangel nicht an den Zeilen,
+    und Kappen haelfe nicht)."""
+    from sglang.srt.planner import expert_residency as _er
+
+    new = [float(x) for x in fracs]
+    stages, lines, why = [], [], []
+    for fit in fits:
+        if not fit.refused:
+            continue
+        s = int(fit.stage)
+        short = float(fit.near_oom_mib) - float(fit.headroom_mib)
+        ceil = fit.ceiling_fraction
+        if ceil is None:
+            why.append(
+                "stage%d (%s): keine Kappung -- die Karte traegt nicht einmal einen "
+                "residenten Experten plus Scratch %d (Mindestresidenz, "
+                "largest_fraction_for_rows), es fehlen %.0f MiB"
+                % (s, fit.card, int(lru_rows[s]), short))
+            continue
+        if float(ceil) >= float(fracs[s]):
+            why.append(
+                "stage%d (%s): keine Kappung -- die Karten-Decke f %.3f liegt nicht "
+                "unter der gegebenen f %.4f, der Mangel (%.0f MiB) liegt nicht an den "
+                "Experten-Zeilen" % (s, fit.card, float(ceil), float(fracs[s]), short))
+            continue
+        new[s] = float(ceil)
+        stages.append(s)
+        rows_new = _er.buffer_rows(local_experts=int(num_experts), fraction=float(ceil),
+                                   scratch_rows=int(lru_rows[s]))
+        lines.append(
+            "stage%d (%s): f %.4f -> %.3f (%d -> %d Zeilen, Decke %d Zeilen): Kopfraum "
+            "am letzten Chunk %.0f MiB < near-OOM %.0f, es fehlen %.0f MiB (Chunk-Index "
+            "%d, Prompt %d); FR_P ist die Obergrenze, der Planer kappt"
+            % (s, fit.card, float(fracs[s]), float(ceil), int(fit.buffer_rows), rows_new,
+               int(fit.ceiling_max_rows), float(fit.headroom_mib), float(fit.near_oom_mib),
+               short, int(fit.last_chunk_index), int(fit.prompt_tokens)))
+    return PFrCap(tuple(new), tuple(stages), tuple(lines), "; ".join(why))
+
+
+def publish_p_fractions(ns, fracs: Sequence[float]) -> None:
+    """FR_P an die DREI Stellen, an denen es lebt (arm_fnFL2.sh: "FR_P steht
+    an DREI Stellen"; dieselben wie ``apply_p_draft_post``)."""
+    from sglang.srt.weg2 import draft_post as _dp
+
+    ns.pp_cut_expert_device_fraction = ",".join(_dp._fmt(x) for x in fracs)
+    ns.extra_p = _dp.replace_vector_flag(ns.extra_p, "--rank-moe-resident-fraction", fracs)
+    ns.env_p = _dp.replace_env_vector(getattr(ns, "env_p", ""),
+                                      "SGLANG_MOE_RESIDENT_EXPERT_FRACTION", fracs)
 
 
 def solve_p_cut(
@@ -15950,7 +20174,7 @@ def solve_p_cut(
                 lru_rows=rows,
                 reserve_mib_by_stage=_reserve_p,
             ) if _reserve_p is not None else None
-            _ueber = [i for i, (f, m) in enumerate(
+            _stages_over_cap = [i for i, (f, m) in enumerate(
                 zip(fracs, _frec if _frec is not None else _fmax)) if f > m]
             log(
                 "PP-CUT FRACTION-SOLVE (#140): budgets %s MiB, layers %s, "
@@ -15966,7 +20190,7 @@ def solve_p_cut(
                     ["%.3f" % f for f in _fmax], ["%.3f" % f for f in fracs],
                     ((" | MIT KV-RESERVE: %s" % ["%.3f" % f for f in _frec])
                      if _frec is not None else "")
-                    + ((" -- DARUEBER auf Stufe(n) %s" % _ueber) if _ueber else ""),
+                    + ((" -- DARUEBER auf Stufe(n) %s" % _stages_over_cap) if _stages_over_cap else ""),
                 )
             )
         except BaseException as _exc:  # noqa: BLE001 -- eine Zahl kippt nie den Boot
@@ -15991,7 +20215,20 @@ def solve_p_cut(
         # Puffer, KV, die Chunk-Transiente T_s(chunk) und den Draft.
         # H92c: und um die Mamba-Slots dieses Boots gegen die der Referenz
         # (Slots x 1.5588 MiB x lineare Layer der Stufe).
-        p_card_verdict(
+        # #242r: die Geometrie des Umschnitts, EINMAL hier (Layer-Typen des
+        # Checkpoints, Dense je Layer, Mamba je linearem Layer, KV je
+        # Attention-Layer) -- P-KARTE und der Wake-Kredit P->D lesen dieselbe.
+        _kv_attn = None
+        if _kv_p is not None:
+            _kv_attn = next((float(k) / int(a) for k, a in zip(_kv_p, _attn) if int(a) > 0), None)
+        ns._pcut_recut_geometry = {
+            "layer_kinds": [str(k) for k in kinds] if kinds else None,
+            "dense_mib_per_layer": float(mean_layer_mib),
+            "mamba_mib_per_linear_layer": float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot)
+            * int(_p_mamba_slots),
+            "kv_mib_per_attn_layer": _kv_attn,
+        }
+        _capped = p_card_verdict(
             ns, cards, log,
             model=model,
             chunk_tokens=int(chunk_tokens),
@@ -16005,8 +20242,27 @@ def solve_p_cut(
             mamba_mib_per_slot=p_mamba_mib_per_slot_by_stage(
                 kinds, _stage_layers_for_solve,
                 float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot)),
+            layer_kinds=[str(k) for k in kinds] if kinds else None,
+            dense_mib_per_layer=float(mean_layer_mib),
+            mamba_mib_per_linear_layer_per_slot=float(ns.pp_cut_mamba_mib_per_linear_layer_per_slot),
         )
+        if _capped is not None:
+            # W132-FR_P-KAPPUNG: das Pool-Modell unten bepreist dieselbe
+            # Fraction, die jetzt im argv steht.
+            fracs = list(_capped)
+            layer_mib_by_stage = tuple(
+                mean_layer_mib
+                + (terms.expert_layer_weight_bytes * float(f) + row_bytes * float(r)) / _pp_cut.MIB
+                for f, r in zip(fracs, rows)
+            )
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
+    # YaRN x2 27B (29.09.): the posts were read at 262144; a longer P context
+    # grows the eager RoPE cache before the pool is sized (p_rope_context_delta_mib).
+    _stage_fixed = tuple(_csv_floats(ns.pp_cut_stage_fixed_mib))
+    _rope_delta, _rope_line = p_rope_context_delta_mib(ns, len(_stage_fixed))
+    if _rope_line is not None:
+        log(_rope_line)
+        _stage_fixed = tuple(float(v) + float(d) for v, d in zip(_stage_fixed, _rope_delta))
     model_pool = _pp_cut.PhasePoolModel(
         free_mib=tuple(float(b) for b in budgets_p),
         # The FAMILY split of weights is deliberately averaged: a stage's
@@ -16026,7 +20282,7 @@ def solve_p_cut(
         # this the model charged the per-LAYER weight half plus a 1229 MiB
         # arming floor and nothing else, and boot weg2sb5f published 499,967
         # tokens for the cut group P then sized at 304,655 (+64.1 %).
-        stage_fixed_mib=tuple(_csv_floats(ns.pp_cut_stage_fixed_mib)),
+        stage_fixed_mib=_stage_fixed,
         # #114: priced from the chunk P boots with (see the log line below),
         # never the reference boots' 1024 on a wider chunk.
         # --p-prefill-graph (27B): the SAME vector the ranks book (env_p, see
@@ -16039,6 +20295,11 @@ def solve_p_cut(
         attn_head_split_mib=_p_ah_post_vector(ns, len(budgets_p), chunk_tokens, model),
         activation_reserve_mib=p_prefill_activation_reserve_mib(
             ns.pp_cut_activation_reserve_mib, int(chunk_tokens)
+        ),
+        # #242: per stage where the profile measured it (P_ACTIVATION_MIB).
+        activation_reserve_mib_by_stage=p_prefill_activation_reserve_by_stage_mib(
+            ns.pp_cut_activation_reserve_mib, int(chunk_tokens),
+            getattr(ns, "profile", None) or None,
         ),
         # #1257c: None = follow the reserve (the runtime charges exactly it);
         # a number = the operator pinned it.
@@ -16206,9 +20467,11 @@ def solve_p_cut(
         )
 
     measured_attn = _pp_cut.attention_counts(families, incumbent)
-    anchor_stage = next(
-        (i for i, c in enumerate(cards) if "5090" not in c.name), len(cards) - 1
-    )
+    # HW-GENERIC 1002: the stage whose card is of the class the deep
+    # attention anchor (ATTN_ANCHOR_MS, "a 3080 ... 0.4 s per chunk") was
+    # measured on -- by calibration class, not "the first card that is not a
+    # 5090". On the reference rig that is stage 1, as before.
+    anchor_stage = attn_anchor_stage(cards)
     family_cost, family_prov = _pp_cut.family_costs_from_measurement(
         measured_ms_per_layer=ms,
         measured_counts=incumbent,
@@ -16386,6 +20649,26 @@ def solve_p_cut(
             else "max(reference 1024, binding stage)",
         )
     )
+    if model_pool.activation_reserve_mib_by_stage:
+        _rec, _rec_boots = p_activation_record(getattr(ns, "profile", None) or None)
+        log(
+            "PP-CUT activation post (#242): PER STAGE %s MiB (record %s %s at chunk "
+            "%d, %s) -- charged in place of the one scalar %.1f above, the same "
+            "vector group P's ranks book as %s; the P-KARTE takes max(builtin, "
+            "record) %s"
+            % (
+                ["%.1f" % v for v in model_pool.activation_reserve_mib_by_stage],
+                P_ACTIVATION_RECORD,
+                list(_rec or ()),
+                P_ACTIVATION_RECORD_CHUNK,
+                _rec_boots or "no boots named",
+                float(model_pool.activation_reserve_mib),
+                P_PREFILL_TRANSIENT_ENV,
+                [list(pt.mib) for pt in p_transient_support(
+                    getattr(ns, "profile", None) or None, card=True).points
+                 if pt.chunk == P_ACTIVATION_RECORD_CHUNK][0],
+            )
+        )
     log(
         "PP-CUT budget posts (the boot's own list, MiB/rank): "
         "weights+runtime = %.1f/layer x n + stage_fixed %s; corridor holdback "
@@ -16771,6 +21054,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "WEG2-HOST-LEDGER ARM line's xchg_bounce= field). "
                          "Required with --prior-cushion-min-gib.")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--profile-inventory", default="",
+        help="HW-GENERIC 1002: the card inventory (calibration-class labels in card order, "
+             "weg2/card_identity.py, e.g. 'RTX5090,RTX3080,RTX3080') the profile's positional "
+             "vectors were measured on. Default: the inventory the profile's measured records "
+             "declare (profile_records_data/<profile>.json 'inventory'). A live inventory that "
+             "differs is refused BY NAME (HW-UNCALIBRATED) -- positional measurements of other "
+             "cards are never borrowed.")
     ap.add_argument("--debug-hold", choices=["none", "P", "D", "both"], default="none")
     # #1236: --store-min-gib IS DELETED. It was a FLOOR on how much of the host
     # RAM leftover the store tmpfs had to get, and there is no RAM leftover to
@@ -16913,6 +21204,20 @@ def build_parser() -> argparse.ArgumentParser:
     # Wer einen Term weglaesst, bekommt ihn im Druck als FEHLT benannt --
     # kein geratener Default, weil ein geratener Default hier genau die
     # Zahl waere, um die es geht.
+    ap.add_argument(
+        "--d-kv-token-cut", default="off",
+        help="#239 (uneven-DCP-KV, release feature): cut D's full-attention KV "
+             "by TOKENS over the Form A ranks (form kv=qsa_forma_dcp). 'off' "
+             "(default, byte-identical), 'maxmin' (the D solve picks the shares: "
+             "max-min of the relative row ceiling, in 64ths) or a ratio vector "
+             "per D rank; 'joint' (S2b) also sets FR_D at every rank's edge "
+             "(max-min of the resident expert share per card); 'owned' (S3f, the "
+             "target form) holds the attention host at share 0 and solves the "
+             "workers' shares, FR_D and the MoE ownership (--rank-moe-ratio) "
+             "together (min max miss time, x1 rule). A flip boot under the cut "
+             "(S3h) needs the host tier and exactly one D KV stage "
+             "(--env-d SGLANG_WEG2_D_KV_STAGE_TOKENS=<tokens>), else it is "
+             "refused by name (--d-only boots it either way).")
     ap.add_argument(
         "--d-foreign-context-mib", default="",
         help="#145 Term (b): je D-RANG (ordinal) der VRAM, den die SCHLAFENDE "
@@ -17136,13 +21441,15 @@ def build_parser() -> argparse.ArgumentParser:
              "values, and the launcher names the form in one line (WEG2 DFLASH-PRODUCE-ON-P).")
     ap.add_argument(
         "--d-replayssm-spec", choices=["off", "on"], default=D_REPLAYSSM_SPEC_DEFAULT,
-        help="27B ReplaySSM package. 'on' gives group D --enable-linear-replayssm-spec "
+        help="27B ReplaySSM package. DEFAULT: the booted profile's registry row "
+             "(weg2/form.py replayssm: qwen27b and nextflash on, proven on metal); "
+             "the parser value 'off' is the code default without a row. "
+             "'on' gives group D --enable-linear-replayssm-spec "
              "(+ --linear-replayssm-cache-len, a power of two >= 16 and >= the draft "
              "window): D's GDN target verify runs the compact spec ring instead of "
              "per-draft intermediate states and the freed 'speculative intermediate "
              "state' post goes to D's KV pool; the launcher's D pricing follows the "
-             "same switch. 'off' (default until the metal gate named on the WEG2 "
-             "D-REPLAYSSM-SPEC line has passed) leaves argv_d byte-identical. Group "
+             "same switch. 'off' leaves argv_d byte-identical. Group "
              "P never gets it (P runs no target verify). NF line (H64): the draft "
              "window is group D's --speculative-num-draft-tokens as --extra-d ships "
              "it (the Next-Flash MTP runs 4 over the constants' 3); the D planner "
@@ -17213,7 +21520,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--d-token-placement", choices=["capacity", "bandwidth"], default=D_TOKEN_PLACEMENT_DEFAULT,
         help="Group D: where NEW KV tokens land (27B uneven DCP only; weg2/d_token_placement.py, "
-             "DYN_D_RESHARD.md sec. 13). 'capacity' (default) = today, env byte-identical. "
+             "DYN_D_RESHARD.md sec. 13). DEFAULT: the booted profile's registry row "
+             "(weg2/form.py d_token_placement on its d_token_placement_formats: qwen27b "
+             "bandwidth on the INT8 checkpoint, proven on metal); every other checkpoint and "
+             "NF: 'capacity' = today, env byte-identical. "
              "'bandwidth' = the allocator interleaves its free slot ids so new tokens go to the "
              "ranks by effective bandwidth while the pool has room, by free capacity once a "
              "rank's class would pass --d-token-fill-switch; stored KV never moves. Refused "
@@ -17280,7 +21590,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--p-chunk-policy", choices=["fixed", "dynamic"], default=P_CHUNK_POLICY_DEFAULT,
         help="Group P prefill chunk width (27B and NF line, weg2/p_chunk_policy.py). "
-             "'fixed' (the default for this release candidate) = today: every forward "
+             "DEFAULT: the booted profile's registry row (weg2/form.py chunk.policy on its "
+             "chunk.default_formats: qwen27b dynamic on the INT8 checkpoint, proven on metal "
+             "with --p-prefill-graph 512), where the other flags make it runnable (a P "
+             "prefill graph bucket <= --p-chunk-max); every other case and NF: 'fixed'. "
+             "'fixed' = today: every forward "
              "takes --chunked-prefill-size; argv, env and the P form key are "
              "byte-identical. 'dynamic' = a per-request plan priced on a per-stage "
              "time model as a pipeline (flow shop): a middle size from the ladder "
@@ -17437,6 +21751,16 @@ def build_parser() -> argparse.ArgumentParser:
              "its own prefill anchor at or below it. Needs --p-trim-end-anchor. Adds "
              "SGLANG_WEG2_FORK_ANCHOR_TOKEN to both groups; default off = argv and "
              "env byte-identical.")
+    ap.add_argument(
+        "--turn-anchor-token", type=int, default=None, metavar="ID",
+        help="TURN ANCHOR (NF, weg2/turn_anchor.py): the chat template's turn-start "
+             "token id (<|im_start|> = 248045 on Qwen3.8-27B and NF). Group P then "
+             "also snapshots the recurrent state where the prompt's LAST message "
+             "starts (a second extend track in the same forward, no extra forward) "
+             "and inserts it as an anchor -- where the next turn and a client's side "
+             "request fork (y3m weg2-50-71: FETCH CAP lost=16 pages behind the "
+             "END anchor). Adds SGLANG_WEG2_TURN_ANCHOR_TOKEN to group P only; "
+             "default off = argv and env byte-identical.")
     ap.add_argument(
         "--fp8-uniform-marlin", action="store_true",
         help="27B line, an FP8 checkpoint (Qwen/Qwen3.8-27B-FP8, block 128x128) on "
@@ -17875,6 +22199,29 @@ def build_parser() -> argparse.ArgumentParser:
              "Store (sonst ueberschreibt sein dummy-Presplit P's echte "
              "Experten) und rechnet keinen Forward, bis der Erstflip "
              "VOLLSTAENDIG gedeckt hat. 'off' ist byte-identisch zu vorher.",
+    )
+    ap.add_argument(
+        "--weg2-p-free-read-journal", choices=("on", "off"), default="off",
+        help="BOOTZEIT 3 (29.09., 27B-Auflage): jede Lesung des freien Kartenspeichers "
+             "durch P von 'P kv sized' bis zum ersten Wake als JSONL je Rang "
+             "(p_free_reads_<tag>/), fuer den Vergleich frueher gegen seriellen Start "
+             "(python -m sglang.srt.weg2.d_early_start EARLY SERIAL). Mit "
+             "--weg2-d-early-start on immer an. Nur Instrument, aendert keine Entscheidung.",
+    )
+    ap.add_argument(
+        "--weg2-d-early-start", choices=("auto", "on", "off"), default="auto",
+        help="BOOTZEIT 3 (29.09.): 'auto' (Default seit der Serie 29.09., dearly "
+             "z30x2: serving 205 statt 226 s) = an, wo die Registry einen "
+             "Metallbeleg traegt (d_early_start_proven: Next Flash), sonst aus "
+             "(27B bis zu seinem Beleg-Boot). 'on' erlaubt W185 auf jedem Profil "
+             "mit d_expect_from_p_records (NF, 27B). 'on' startet Gruppe D ZUSAMMEN mit P statt "
+             "nach P-READY + sleep(P) + D-Plan (z30r3: D-Init 30 s, davor 8 s "
+             "Schlaf+Plan). D plant aus den Erwartungs-Budgets (Planer-Sitz: "
+             "Record statt DC_EXPECT) und wartet VOR seinem Gewichtsladen an "
+             "einem Gate (weg2/d_early_start.py). Nach sleep(P) misst der "
+             "Launcher wie bisher und schreibt 'go' nur, wenn jedes geplante "
+             "D-Budget <= dem gemessenen ist; sonst 'refuse', D beendet sich und "
+             "startet seriell wie bisher. 'off' ist byte-identisch zu vorher.",
     )
     ap.add_argument(
         "--weg2-xchg-legs", choices=list(weight_exchange.XCHG_LEGS_CHOICES),
@@ -18679,6 +23026,43 @@ def d_park_split_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Opt
             "SGLANG_WEG2_D_PARK_IMMEDIATE off" % (front_src, d_src))
 
 
+#: VISION-SYNC LAW (user 02.10. ~08:00Z, both lines): the switches that would
+#: let a vision stage outlive its pass (weg2/vision_rank_runner: the async
+#: stage and its PP0 row term). Either one ON is refused at launch, by name.
+VISION_ASYNC_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_WEG2_VISION_ASYNC",
+    "SGLANG_WEG2_P_ROW_VISION_ASYNC",
+)
+VISION_SYNC_LAW = (
+    "VISION-SYNC LAW (user 02.10. ~08:00Z, both lines): vision runs ONLY synchronously, BEFORE "
+    "the real prefill; spare VRAM goes to MoE experts (NF) and to the L15 cache (27B), never "
+    "to a vision tower that sits there across passes")
+
+
+def vision_async_refusal(ns, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """VISION-SYNC LAW: the refusal line when :data:`VISION_ASYNC_SWITCHES` are
+    set ON in the launcher's own environment (which build_env and the front
+    inherit) or in ``--env-p`` / ``--env-d``; None when every one is unset or
+    off (an explicit 0/false/no/off is the law's own value and passes). Any
+    spelling of a switch's rename family counts."""
+    env = dict(os.environ if environ is None else environ)
+    scopes = (
+        ("launcher env", env),
+        ("--env-p", parse_group_env(str(getattr(ns, "env_p", "") or ""))),
+        ("--env-d", parse_group_env(str(getattr(ns, "env_d", "") or ""))),
+    )
+    hits: List[str] = []
+    for where, scope in scopes:
+        for name in VISION_ASYNC_SWITCHES:
+            raw = weg2_form._explicit_env(scope, name)
+            if raw is not None and raw.lower() not in ("0", "false", "no", "off"):
+                hits.append(f"{where} {name}={raw}")
+    if not hits:
+        return None
+    return ("WEG2 VISION-ASYNC refused: %s -- %s. Unset it (the code default is the synchronous "
+            "stage) or set it 0" % (", ".join(hits), VISION_SYNC_LAW))
+
+
 def apply_profile_d_bs_default(ns, argv: Sequence[str]) -> int:
     """H91b/H95 (Nutzer-Design 25.09.): ``--profile nextflash`` without an
     explicit ``--d-bs`` runs D with up to ``DEFAULT_D_BS_NEXTFLASH`` (6) seats
@@ -18765,17 +23149,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # H91b/H95: the Next-Flash form's own D seat bound (6, dynamic 1..6 per
     # phase) and its pool waves, before anything reads --d-bs or --env-d.
     apply_profile_d_bs_default(ns, list(sys.argv[1:] if argv is None else argv))
+    _p_gc_line = apply_p_gc_warn_default(ns)  # NF y3z ep52: gen-2 GC on P named
+    if _p_gc_line:
+        print(_p_gc_line, flush=True)
     _h95_waves_line = apply_profile_d_pool_waves_default(ns)
     if _h95_waves_line:
         print(_h95_waves_line, flush=True)
     _h95c_line = apply_profile_d_seat_vram_default(ns)
     if _h95c_line:
         print(_h95c_line, flush=True)
+    _p0_line = apply_profile_torch_cache_cap_default(ns)  # WEG2-ALLOC-OVERHANG
+    if _p0_line:
+        print(_p0_line, flush=True)
+    if not ns.teardown:
+        # LEISTUNGSSCHALTER (user rule 29.09.): the row's per-group switch
+        # defaults and its --d-kv-token-cut, before any reader of --env-* or
+        # of the kv axis (resolve_form below).
+        _ls_line = apply_profile_group_switch_defaults(ns)
+        if _ls_line:
+            print(_ls_line, flush=True)
+        _cut_line = apply_profile_d_kv_token_cut_default(
+            ns, list(sys.argv[1:] if argv is None else argv))
+        if _cut_line:
+            print(_cut_line, flush=True)
+        _vis_default_line = apply_profile_vision_default(
+            ns, list(sys.argv[1:] if argv is None else argv))
+        if _vis_default_line:
+            print(_vis_default_line, flush=True)
+    _miss_rec_line = apply_owned_miss_record_default(ns)  # PR: paired miss record
+    if _miss_rec_line:
+        print(_miss_rec_line, flush=True)
     if not ns.teardown:
         _park_split = d_park_split_refusal(ns)  # 27B park (RV B5): front and D must agree
         if _park_split:
             print(_park_split, flush=True)
             raise SystemExit(_park_split)
+        _vis_async = vision_async_refusal(ns)  # VISION-SYNC LAW (user 02.10.)
+        if _vis_async:
+            print(_vis_async, flush=True)
+            raise SystemExit(_vis_async)
+    # VRAM-VERTRAG M1: the profile's hand pins, read before any solver
+    # publishes into --extra-*/--env-* (every one is planner debt: OVERRIDE)
+    from sglang.srt.weg2 import vram_plan_view as _vpv
+
+    vram_view().reset(overrides=_vpv.profile_pins(ns), identity={
+        "profile": str(getattr(ns, "profile", "") or ""),
+        "model": os.path.basename(str(getattr(ns, "model", "") or "").rstrip("/")),
+        "tag": str(getattr(ns, "tag", "") or "")})
     _sf_on, _sf_src = standard_form_resolved(ns)
     if _sf_on or _sf_src.startswith("env "):
         print("WEG2-STANDARD-FORM (NF H91, profile field standard_form): %s (%s) -- D seats per "
@@ -18807,8 +23227,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(prefix_switches_announce(ns, boot_form), flush=True)
         # UNIFY S3: argparse defaults that are MEASURED constants follow the
         # profile's registry row (unset flags only).
-        apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv))
+        _pad_line = profile_arg_defaults_line(
+            ns, apply_profile_arg_defaults(ns, list(sys.argv[1:] if argv is None else argv)))
+        if _pad_line:
+            print(_pad_line, flush=True)
     ns.weg2_boot_form = boot_form
+    # #239 S2: a planned-but-unwired token cut never reaches a rank.
+    refuse_unwired_token_cut(ns, boot_form)
+    # #239 S3h: the cut runs D-only until the P->D hand-off under it is built.
+    refuse_flip_under_token_cut(ns, boot_form)
     # H87: the #114/H41 calibration identity by memory footprint, decided once
     # here where the checkpoint PATH is known (build_env sees only its name).
     _h87_alias_line = (note_calibration_footprint_alias(ns.model)
@@ -18997,6 +23424,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if calib_identity is not None:
             log("WEG2-PROFILE calibration identity (" + boot_form.profile + "): a measured "
                 "source counts only when its boot ran " + calib_identity.describe())
+            _head_gap = calib_identity.head_unresolvable_line()
+            if _head_gap:
+                log(_head_gap)
         if _h87_alias_line:
             log(_h87_alias_line)
         log("#114 P-PREFILL-TRANSIENT (form " + boot_form.describe() + "): "
@@ -19041,6 +23471,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     refuse_if_front_unbindable(log, ns.front_host, PORT_FRONT, dry)
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
+    # HW-GENERIC 1002: the profile's positional records and vectors hold only
+    # for the inventory they were measured on -- checked once, here, before
+    # any of them is read. The reference rig passes silently-identically.
+    log(inventory_check_line(ns, cards))
     state.cards = [c.__dict__ for c in cards]
     record_card_power(state.cards, cards, log)
     if not dry:
@@ -19242,6 +23676,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         measured_record_path(), accept=_dc_accept).get("D")
     _dc_from_record, _dc_record_prov = dc_residue_from_record(
         _dc_rec_d, cards, ns.weg2_weight_source)
+    # D-EXPECT: group P's measured dormant residue, same calibration identity,
+    # read only where the expectation uses it (27B: not read at all).
+    _p_dormant_recs = p_dormant_records(ns.profile, calib_sample_accept)
     if _dc_rec_d is None and calib_sample_accept is not None:
         _dc_record_prov = (
             f"no group-D dormant-image record MEASURED ON {boot_form.model} under "
@@ -19254,13 +23691,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{' '.join(a + '=' + getattr(boot_form, a) for a in weg2_form.RESIDUE_AXES)}]")
     if calib_identity is not None and calib_identity.uses_d_capture_set:
         _dc_record_prov += f" [capture set --max-running-requests {int(d_bs)}]"
+    # YaRN x2 27B: D's RoPE context stays resident while D sleeps; the records/constants were measured at
+    # 262144 -> the same reading's D share on every card (0 at x1: byte-identical).
+    _d_rope_from = (int((_dc_rec_d or {}).get("vram_residue_context_tokens") or CONTEXT_LENGTH_TOKENS)
+                    if _dc_from_record is not None else CONTEXT_LENGTH_TOKENS)
+    _d_rope_mib, _d_rope_line = d_rope_context_delta_mib(ns, _d_rope_from)
+    _d_rope_add = int(math.ceil(_d_rope_mib)) if _d_rope_mib != 0 else 0
     dc_expect_d = {
         c.uuid: (
             _dc_from_record[c.uuid] if _dc_from_record is not None
             else dc_measured_d_mib(c, ns.weg2_weight_source)
-        ) + slack_mib
+        ) + slack_mib + _d_rope_add
         for c in cards
     }
+    if _d_rope_line:
+        log(_d_rope_line + f" -> dormant reserve += {_d_rope_add} MiB per card")
     log(f"#1444 DC-RESIDUE group=D source="
         f"{'RECORD' if _dc_from_record is not None else 'CONSTANT'}: {_dc_record_prov}; "
         f"reserve incl. {slack_mib} MiB slack = "
@@ -19336,17 +23781,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # Flip. Eine aeltere Census unterbietet keine neuere Messung derselben
             # Form: je Karte gewinnt die GROESSERE der beiden gepreisten Reserven,
             # und die Zeile darunter nennt, welche.
-            _won: List[str] = []
-            for c in cards:
-                if c.uuid in _xr:
-                    _census_reserve = int(_xr[c.uuid]) + slack_mib
-                    _record_reserve = int(dc_expect_d[c.uuid]) if _dc_from_record is not None else 0
-                    if _record_reserve > _census_reserve:
-                        dc_expect_d[c.uuid] = _record_reserve
-                        _won.append(f"nvml{c.nvml_index}=record({_record_reserve})>census({_census_reserve})")
-                    else:
-                        dc_expect_d[c.uuid] = _census_reserve
-                        _won.append(f"nvml{c.nvml_index}=census({_census_reserve})>=record({_record_reserve})")
+            # D-RESERVE 29.09.: the maximum over the newest D records of this
+            # identity and form wins over the (older) census when records exist.
+            _d_recs = (host_ledger.read_measured_records(
+                measured_record_path(), "D", accept=_dc_accept)
+                if _dc_accept is not None else [])
+            _d_max, _d_max_why = dormant_max_from_records(
+                _d_recs, cards, ns.weg2_weight_source, group="D")
+            log(f"D-RESERVE RECORD-MAX: {_d_max_why}")
+            dc_expect_d, _won = d_reserve_from_records_or_census(
+                cards, dc_expect_d,
+                {u: int(v) + slack_mib for u, v in _xr.items()},
+                _d_max, slack_mib, _dc_from_record is not None)
             state.dc_expect_d = dc_expect_d
             log("dormant residue RESERVE for group D (census-korrigiert, neuere Messung "
                 "unterbietet die aeltere nicht): "
@@ -19375,9 +23821,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "CORRIDOR-FLOOR line and infer the ordering from it; after this line "
         "nobody has to."
     )
+    vram_view().note_asleep("D", cards, dc_expect_d,
+                            "MODEL(dc_expect_d: D reserve = record or census + margin + slack)")
     budgets_p = budgets_from_dc(
         cards, dc_expect_d, log, "P", overshoot_mib=list(_pconst("P_OVERSHOOT_MIB", ns.profile)),
-        overshoot_provenance="boot weg2ls2b2",
+        # #240: whose measurement the line charges -- the profile's own record
+        # (NF: measured at the card), not the 27B boot it used to name for
+        # every profile.
+        overshoot_provenance=_pconst_boots("P_OVERSHOOT_MIB", ns.profile) or "boot weg2ls2b2",
         user_reserve_by_card=user_reserve_by_card,
     )
     state.budgets["P"] = budgets_p
@@ -19399,6 +23850,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens,
         user_reserve_by_card=user_reserve_by_card, power_reading=power_reading,
     )
+    state.p_fr_cap = dict(getattr(ns, "_w132_fr_cap", None) or {})
     # --p-prefill-graph-calibration: the table is valid only for the cut it
     # was measured on (Agent PG2 26.09.). Checked HERE, once, for all P ranks;
     # no table = no-op. On a mismatch the table is dropped and the cut solved
@@ -19415,6 +23867,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # UNIFY S9: the P chunk model is a per-stage table of ONE cut as well
     # (record pp_layer_ratio); checked on the final cut, after the graph's.
     p_chunk_model_cut_check(ns, cut, log)
+    vram_plan_emit(ns, cards, "p_budget", log, group="P")
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
     # 1b' (moved here by the argv slice's FIX 2) -- P's PP LAYER SPLIT, of the
     # cut group P is ACTUALLY LAUNCHED WITH.  Read off PCutFacts, where
@@ -20055,7 +24508,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 import json as _json
 
-                _mp = os.path.join(getattr(ns, "evidence_dir", EVIDENCE_DIR),
+                _mp = os.path.join(expert_map_dir(getattr(ns, "evidence_dir", EVIDENCE_DIR), log),
                                    f"expert_map_{ns.tag}.json")
                 with open(_mp, "w") as _fh:
                     _json.dump(_karte, _fh)
@@ -20118,6 +24571,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"WEG2-MEMHIST ledger post memhist {_memhist_gib:.2f} GiB "
             f"({'run moment only' if _memhist_run_only else 'both moments'}): {_memhist_prov}")
 
+    # 28.09. (user order): the L3 store's RAM index is a host post -- entries
+    # (snapshot header, else the file count of the ONE walk the first boot
+    # makes) x RAM_BYTES_PER_ENTRY, once per owner (one per group).
+    from sglang.srt.mem_cache.storage.file import store_journal as _store_journal
+
+    _l3_idx_ident = (l3_persist_identity(ns.model, getattr(ns, "profile", ""),
+                                         getattr(ns, "form_kv", "") or "",
+                                         extra_p=getattr(ns, "extra_p", "") or "",
+                                         extra_d=getattr(ns, "extra_d", "") or "",
+                                         vision=str(getattr(ns, "weg2_vision", "") or ""))
+                     if l3_persist_enabled() else None)
+    _l3_idx_owners = 1 if getattr(ns, "d_only", False) else 2
+    _l3_idx_n, _l3_idx_src = (
+        _store_journal.index_entries(f"{STORE_ROOT}/{l3_persist_dir_name(_l3_idx_ident)}")
+        if _l3_idx_ident and _store_journal.enabled() else (0, "no persistent L3 (per-boot store)"))
+    _l3_index_gib = _l3_idx_n * _store_journal.RAM_BYTES_PER_ENTRY * _l3_idx_owners / (1 << 30)
+    log(f"WEG2-HOST-LEDGER L3 INDEX post l3_index {_l3_index_gib:.2f} GiB = {_l3_idx_n} entries "
+        f"({_l3_idx_src}) x {_store_journal.RAM_BYTES_PER_ENTRY} B x {_l3_idx_owners} owner(s), "
+        f"both moments; grows with the store up to its cap between boots")
+
+    # 29.09. (Planer post COLD_TIER_SHM): the tmpfs expert store, sized from the
+    # map the ranks will load (dry-built here, re-priced below once written).
+    _ledger_group_envs = [parse_group_env(getattr(ns, "env_d", "") or ""),
+                          parse_group_env(getattr(ns, "env_p", "") or "")]
+    _cold_tier_shm_gib, _cold_tier_line = cold_tier_shm_post(
+        ns, ns.model, getattr(state, "p_stage_layers", None))
+    log(_cold_tier_line)
+    # 29.09. (host census): what this model|form was MEASURED to hold outside
+    # the ranks and outside store/arena -- a record, never a constant; the
+    # front keeps it current (sample_live every 60 s, max-merged).
+    from sglang.srt.weg2 import host_census as _hc
+
+    _census_key = _hc.census_key(
+        host_ledger.checkpoint_digest(ns.model)[0] or "",
+        (getattr(ns, "weg2_boot_form", None).env_value()
+         if getattr(ns, "weg2_boot_form", None) is not None else ""))
+    _census_record = f"{EVIDENCE_DIR}/{_hc.RECORD_NAME}"
+    _census_entry, _bf_line = census_entry_for_pricing(
+        _census_record, _census_key, model=ns.model, evidence_dir=EVIDENCE_DIR)
+    if _bf_line:
+        log(_bf_line)
+    _census_terms = _hc.ledger_terms(_census_entry)
+    log(_hc.census_line(_census_key, _census_terms))
+
     def _price_host_ledger():
         """#1453: the ONE ledger pricing, callable twice (see below)."""
         return choose_host_ledger(
@@ -20125,6 +24622,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ring_plan.host_weights_span1_bytes, ring_plan.provenance,
             d_draft_host_gib=d_draft_host_mib / 1024.0,
             memhist_gib=_memhist_gib, memhist_run_only=_memhist_run_only,
+            l3_index_gib=_l3_index_gib,
+            cold_tier_shm_gib=_cold_tier_shm_gib,
+            group_envs=_ledger_group_envs,
+            census=_census_terms,
             # #1390: NAMED, not left to choose_host_ledger's own literal
             # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
             # would keep reading the real box even under a test's mock.
@@ -20210,12 +24711,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ledger prices once more -- the boot then funds itself without the
     # --host-ledger-deviation it needed before (weg2xsn207: 93.15 vs 93.00).
     _arena_new, _arena_why = arena_from_ledger(
-        float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "22") or 22),
-        _arm_run_peak_gib(arm), getattr(ns, "host_riegel_gib", None),
+        float(_group_env_value("SGLANG_HICACHE_ARENA_GIB", _ledger_group_envs, "22")),
+        # 29.09.: the latch the ledger derived (a flag only tightens it)
+        _arm_run_peak_gib(arm), getattr(arm, "riegel_effective", getattr(ns, "host_riegel_gib", None)),
         enabled=(os.environ.get("SGLANG_WEG2_ARENA_FROM_LEDGER", "1") == "1" and not hicache_disabled))
     log("#1453 L2-ARENA FROM LEDGER: " + _arena_why)
     if _arena_new is not None:
         os.environ["SGLANG_HICACHE_ARENA_GIB"] = f"{_arena_new:g}"
+        # 29.09. (arena8 09291303): a group that names the arena overrides the
+        # launcher env in build_env, so the new size goes where the ranks and
+        # the ledger read it -- otherwise the ledger re-prices a number no rank gets.
+        arena_gib_into_groups(ns, _ledger_group_envs, _arena_new)
         arm, reap_headroom_gib, lines, cg = _price_host_ledger()
         log("#1453 L2-ARENA FROM LEDGER: re-priced with arena %.2f GiB -> run_peak %s GiB"
             % (_arena_new, _fmt_gib(_arm_run_peak_gib(arm))))
@@ -20223,6 +24729,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for ln in lines:
         log(ln)
     state.ledger_lines = lines
+    # 29.09. (z30x2-yarn2): ONE pinned-host reserve for the ledger and the
+    # ranks. The ledger bounded its run peak by memory.max minus this number
+    # (PINNED WALL); the ranks' HiCache pools now read it too, through
+    # pinned_host_reserve(). An explicit SGLANG_PINNED_HOST_RESERVE_GIB wins
+    # and is left untouched; without a finite cgroup nothing is exported.
+    _pin_gib, _pin_src = getattr(arm, "pinned_reserve", (None, ""))
+    from sglang.srt.mem_cache import pinned_host_budget as _phb
+    if _pin_gib is not None and not (os.environ.get(_phb.PINNED_HOST_RESERVE_ENV) or "").strip():
+        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_ENV] = f"{float(_pin_gib):.4f}"
+        os.environ[_phb.PINNED_HOST_RESERVE_LEDGER_SOURCE_ENV] = str(_pin_src or "")
+    log(pinned_reserve_line(_pin_gib, _pin_src))
     state.reap_headroom_gib = reap_headroom_gib
 
     # #1269 fix 4 follow-up: KEEP THE PREFLIGHT'S OWN ANON READING. `cg` is the
@@ -20253,6 +24770,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # before the ring, so the pool this store must cover is known here without
     # moving anything.  The ledger ran first only because the ARC line prices
     # itself against the reap headroom the ledger computes.
+    _l3_ident = (l3_persist_identity(ns.model, getattr(ns, "profile", ""),
+                                     getattr(ns, "form_kv", "") or "",
+                                     extra_p=getattr(ns, "extra_p", "") or "",
+                                     extra_d=getattr(ns, "extra_d", "") or "",
+                                     vision=str(getattr(ns, "weg2_vision", "") or ""))
+                 if l3_persist_enabled() else None)
     store_plan = plan_store(
         ns.tag,
         cut.pool_tokens,
@@ -20261,8 +24784,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sidecar_factor=ns.store_sidecar_factor,
         store_max_gb=ns.store_max_gb,
         min_free_gib=ns.store_disk_min_free_gib,
+        directory_name=(l3_persist_dir_name(_l3_ident) if _l3_ident else None),
+        dry=dry,
     )
     store_cfg = store_plan.extra_config()
+    log(store_plan.disk_line(
+        "WARN store on %s, not the told disk (dry run: not refused, the space check "
+        "is skipped)" % store_plan.fs_type if store_plan.fs_refused else "ok"))
     log(
         f"WEG2-STORE: dir={store_plan.directory} ON DISK (ZFS dataset, plain directory "
         f"-- #1236 user ruling 2026-09-09: 'normales hicaching mit lvl2 und lvl3', the "
@@ -20304,6 +24832,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(arc_preflight_line(read_arc_state(), store_plan, reap_headroom_gib))
     log(store_read_cost_line(store_plan, max_kv_per_request))
     sweep_store_residue(log, store_plan.directory, dry)
+    if _l3_ident:
+        # identity FIRST: a store of another identity is refused before this
+        # boot touches a single file in it.
+        l3_persist_check_rope(getattr(ns, "extra_p", "") or "", getattr(ns, "extra_d", "") or "")
+        _l3_state = l3_persist_check_identity(store_plan.directory, _l3_ident, dry)
+        log(f"L3-PERSIST identity={_l3_state} dir={store_plan.directory} "
+            f"{json.dumps(_l3_ident, sort_keys=True)}")
+        _l3_files, _l3_bytes, _ = l3_persist_attach(log, store_plan.directory, dry)
+        l3_persist_disk_sum(log, os.path.dirname(store_plan.directory), store_plan.directory,
+                            store_plan.max_size_bytes, store_plan.min_free_bytes, _l3_bytes, dry)
     store_dir = prepare_store(log, store_plan, dry)
     state.store_dir = store_dir
     state.store_max_size_bytes = store_plan.max_size_bytes
@@ -20313,11 +24851,77 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
     # ring (block 1b- above); only ``env_p`` stays here, because it is the
     # one thing in this step that genuinely needs the armed ring.
+    # #239 rc12z29c: a form the D solve sets itself (owned / joint / maxmin cut)
+    # is solved HERE, from the expectation budgets, before the map is built --
+    # the map's D windows and P's common prefix are functions of it, and P
+    # loads the map before D's measured budgets exist.
+    # R2 (28.09.): so is a P1c FR-D ceiling (d_fr_ceiling_before_map) -- its
+    # FR_D is published here, the map and STORE-GEOMETRY read exactly it.
+    if ((d_form_solved_by_planner(ns) or d_fr_ceiling_before_map(ns))
+            and not getattr(ns, "_d_map_form", None)):
+        # only the form's vectors outlive this pass; its env writes (scratch
+        # cap, seat rows, stage form, waves, trims) come from the real budgets
+        _env_d_before = str(getattr(ns, "env_d", "") or "")
+        _map_terms: List[Dict[str, object]] = []
+        _map_other, _map_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
+        ns._d_expect_other = (_map_other if not _map_other_why.startswith("legacy") else None)
+        log("D-EXPECT DORMANT-OTHER D(Karte, Erwartung): " + ", ".join(f"nvml{c.nvml_index} {_map_other[c.uuid]}" for c in cards) + f" MiB -- {_map_other_why}")
+        _map_budgets = budgets_from_dc(cards, _map_other, log, "D(Karte, Erwartung)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)), terms_out=_map_terms)
+        log_d_rank_vram_solve(ns, cards, _map_budgets, log, "D(Karte, Erwartung)",
+                              p_split=p_split, chunk_layers=chunk_layers,
+                              card_terms=(_map_terms if d_awake_rest(cards, ns.profile)[0] is not None else None))
+        _pin = pin_d_form_for_map(ns, log)
+        ns.env_d = _env_d_before
+        ns._d_kv_stage_written = None
+        _lru_scratch = getattr(ns, "_d_kv_stage_lru_scratch", None)
+        if _lru_scratch:
+            # (3) 29.09.: FR_D of the pinned form was solved with this scratch
+            ns.env_d = set_group_env(ns.env_d, "SGLANG_MOE_SCRATCH_SLOTS",
+                                     ",".join(str(int(x)) for x in _lru_scratch))
+            log(f"{D_RANK_SOLVE_MARKER} D(Karte, Erwartung) {D_KV_STAGE_LRU_FLOOR_MARKER}: "
+                f"SGLANG_MOE_SCRATCH_SLOTS={','.join(str(int(x)) for x in _lru_scratch)} "
+                f"gehoert zur gepinnten Form (FR_D mit ihm geloest) -- gilt fuer alle "
+                f"weiteren Passes")
+        if _pin:
+            from sglang.srt.weg2 import draft_post as _dp
+
+            ns.env_d = _dp.replace_env_vector(ns.env_d, "SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
+                                              [float(x) for x in _pin["fractions"]])
+            repoint_store_geometry_at_pinned_form(
+                xchg_env, _pin,
+                int((_argv_vector(getattr(ns, "extra_d", ""), "--num-experts") or [512])[0]), log)
+
     # #107: EINMAL bauen, BEIDE Gruppen bekommen denselben Pfad.
     _emap = publish_expert_map(ns, ns.model, ns.evidence_dir, log,
                                p_stage_layers=getattr(state, "p_stage_layers", None),
                                chunk_layers=chunk_layers)
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap)
+    # rc12z30b: the map read FR_D from --extra-d now; a later D solve must not move it
+    ns._expert_map_path = _emap
+    # 29.09.: the map is written -- the store post from the map as the ranks
+    # load it. The D form pinned for the map (#239) moves the store (z30w:
+    # ratios 183,137,168 -> 191,153,144); a move re-prices the ledger here,
+    # before any argv reads `arm` and before any rank starts.
+    if _emap:
+        _ct_after, _ct_line_after = cold_tier_shm_post(
+            ns, ns.model, getattr(state, "p_stage_layers", None), karte_path=_emap)
+        log(_ct_line_after)
+        if abs(_ct_after - _cold_tier_shm_gib) > COLD_TIER_REPRICE_EPS_GIB:
+            log(f"{COLD_TIER_MARKER} RE-PRICE: the written map moved the post "
+                f"{_cold_tier_shm_gib:.2f} -> {_ct_after:.2f} GiB -- the ledger prices again")
+            _cold_tier_shm_gib = _ct_after
+            arm, reap_headroom_gib, lines, cg = _price_host_ledger()
+            state.cgroup = dict(cg)
+            for ln in lines:
+                log(ln)
+            state.ledger_lines = lines
+            state.reap_headroom_gib = reap_headroom_gib
+    # 29.09.: the front samples the census live (widths known once the arena
+    # term has run inside the pricing above)
+    ns._host_census = {"record": _census_record, "key": _census_key,
+                       "store_dir": expert_store_dir_of(ns),
+                       "widths": list(_ARENA_BOOKED_WIDTHS.get(str(ns.model), []))}
+    _estore_id = publish_store_identity(ns.model, _emap, log)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
     # H125: the host-RAM price of `--weg2-vision-source ram`, named where the
     # P env is built (the line is empty, and nothing is logged, for `disk`).
     _vis_line = vision_source_host_line(
@@ -20356,6 +24960,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _fork_env = fork_anchor_env(getattr(ns, "fork_anchor_token", None),
                                 bool(getattr(ns, "p_trim_end_anchor", False)))
     env_p.update(_fork_env)
+    # TURN ANCHOR (weg2/turn_anchor.py): {} when off; group P only.
+    _turn_env = turn_anchor_env(getattr(ns, "turn_anchor_token", None))
+    env_p.update(_turn_env)
+    if _turn_env:
+        log("WEG2 TURN-ANCHOR: on (--turn-anchor-token %s) -- group P snapshots the "
+            "recurrent state where a prompt's last message starts as a second extend "
+            "track and inserts it as its own anchor (rank lines 'WEG2 TURN-ANCHOR "
+            "TRACK', 'WEG2 TURN-ANCHOR INSERT')" % ns.turn_anchor_token)
     if _fork_env:
         log("WEG2 FORK-ANCHOR: on (--fork-anchor-token %s) -- group P cuts a leg-1 "
             "prompt before its generation prompt, group D reads the store up to the "
@@ -20673,6 +25285,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"WEG2-P-FORM CONFIRMED key={shipped_key} on the argv actually shipped "
         f"(the ring was gated on this same key before the host-ledger arm "
         f"existed; the sentinel terms are proven inert, not assumed to be)")
+    # P-COVERS-D-SESSION (law 02.10.): a named refusal, never a D prefill
+    _cov_ok, _cov_line = p_covers_d_session(
+        shipped_argv_p, d_session_tokens(ns.extra_d, max_kv_per_request))
+    log(_cov_line)
+    if not _cov_ok:
+        raise Weg2LaunchRefused(_cov_line)
     spec_p = GroupSpec("P", PORT_P, transport_argv(shipped_argv_p, ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     log(w38_armed_line(spec_p.argv))
@@ -20692,8 +25310,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "zero-remainder: group P holds the last token of every prefill back into its own chunk (SGLANG_WEG2_END_ANCHOR=1) so the GDN anchor D resumes from sits at N-1; "
         "costs P one 1-token pass per request and serialises whole-fit prompts behind the one chunked request per pass",
         "zero-remainder: /flush_cache publishes un-backed nodes before the idle witness on both groups (SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1); the quiesce then waits for those backups",
-        "zero-remainder: a BATCH prompt longer than group D's host staging pool can carry (launcher-measured from D's log, x0.9 prefetch bound) is served by ONE prefill on D "
-        "(front route CARRIER-EXCEEDS, no leg 1) -- served and single-prefill, but NOT a zero-remainder leg 2; the windowed prefetch that would lift it is the next round",
+        # y7d (9bdfe50185) still declared the deleted CARRIER-EXCEEDS route here
+        # ("served by ONE prefill on D, no leg 1"); 9bdfe50185 removed it.
+        "zero-remainder: no D single-prefill route -- every BATCH prompt takes P's leg 1 (CARRIER-EXCEEDS deleted, P-COVERS-D-SESSION law 02.10.); "
+        "a boot whose P prefill stages do not cover D's session is refused by name above, never served by a D prefill",
         "zero-remainder: BATCH streams are priced post hoc via stream_options.include_usage (one standard trailing usage chunk reaches the client)",
     ]
     log(early_read_provenance())
@@ -20709,9 +25329,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # gebaut wie im Dry-Run aus der Erwartung -- P's Ruherest bleibt eingeplant, also exakt die
         # D-Form des Flip-Boots. Kein Flip heisst: D muss jede ungecachte Laenge selbst prefillen,
         # der W50-Riegel steht deshalb auf dem Kontext statt auf X.
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(d-only, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
-        log_d_rank_vram_solve(ns, cards, budgets_d, log, "D(d-only, expectation)",
-                              p_split=p_split, chunk_layers=chunk_layers)
+        budgets_d = d_only_solve(ns, cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log,
+                                 user_reserve_by_card=user_reserve_by_card,
+                                 p_split=p_split, chunk_layers=chunk_layers)
         d_ratio = d_tp_ratio_decision(
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
@@ -20721,10 +25341,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
+        refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         _sg = ";".join(f"{k}={v}" for k, v in sorted(env_d.items()) if str(k).startswith("SGLANG_"))
         log(f"WEG2-GROUP-ENV D: {_sg or '(leer)'}")
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_only_bind_argv(ns.front_host), d_bs, max_kv_per_request, max_kv_per_request, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
         state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
         launch_group(spec_d, tree, log, dry)
         if dry:
@@ -20740,10 +25361,91 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             time.sleep(5)
         log(f"WEG2-LAUNCH D-ONLY group D exited rc={spec_d.proc.returncode}")
         return int(spec_d.proc.returncode or 0)
+    # 5-prep. THE D PLAN AS ONE FUNCTION (BOOTZEIT 3): the serial path calls it
+    # with P's measured dormant footprint after sleep(P), the early start with
+    # the expectation before P loads. Its body is the former inline block,
+    # unchanged but for the two names (dc_src, label) and the extra env.
+    def _d_spec_from(dc_src, label, extra_env=None):
+        _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
+        _rest, _rest_prov = d_awake_rest(cards, ns.profile)
+        _over, _over_prov = d_overshoot_record(ns.profile)
+        _d_terms: List[Dict[str, object]] = []
+        budgets_d = budgets_from_dc(
+            cards, dc_src, log, label, overshoot_mib=_over,
+            overshoot_provenance=_over_prov,
+            corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
+            user_reserve_by_card=user_reserve_by_card,
+            dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
+            charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
+            awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
+            **booked_rest_kwargs(cards, ns.profile, "D", log, capped=torch_cache_cap_armed(ns)),
+        )
+        state.budgets["D"] = budgets_d
+        if label == "D":  # the real pass: P's residue as measured after sleep(P)
+            vram_view().note_asleep("P", cards, dc_src, "RECORD(NVML je PID nach sleep(P))")
+        log_d_rank_vram_solve(ns, cards, budgets_d, log, label,
+                              p_split=p_split, chunk_layers=chunk_layers,
+                              card_terms=(_d_terms if _rest is not None else None))
+        state.d_owner_solve = dict(getattr(ns, "_d_owner_solve", None) or {})
+        d_ratio = d_tp_ratio_decision(
+            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
+            d_bs, getattr(ns, "env_d", "") or "",
+            user_reserve_by_card=user_reserve_by_card,
+            overhead_mib_by_rank=d_overhead_mib,
+        )
+        log(d_ratio.line)
+        log(d_ratio.op_line)
+        log(d_tokvec.line)
+        refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "weg2_boot_form", None), log)
+        refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
+        env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
+        env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
+        env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
+        env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
+        env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
+        env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
+        env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
+                                     bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
+        # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
+        #
+        # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
+        # Dry-Run-Log, also das, was der Boot WIRKLICH startet. Er konnte bisher
+        # keine einzige Env pruefen, weil der Launcher sie nirgends druckt:
+        # `grep SGLANG_MOE_EXPERT_STORE_DIR dry_*.log` gibt 0 Treffer, obwohl sie
+        # gesetzt IST. Ein Pruefer, der am falschen Ort misst, meldet Luecken,
+        # die es nicht gibt, und uebersieht die echten.
+        env_d.update(extra_env or {})  # BOOTZEIT 3: the early start's gate paths; {} serially
+        for _g, _e in (("P", env_p), ("D", env_d)):
+            _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
+                           if str(k).startswith("SGLANG_"))
+            log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
+        return spec_d, budgets_d
+
+    refuse_d_early_start_unreviewed(ns)  # W185, before any group starts
+    _early_sized_dir = None
+    if _d_early_start_armed(ns):
+        from sglang.srt.weg2 import d_early_start as _des
+
+        _early_sized_dir = os.path.join(os.path.dirname(os.path.abspath(state.logs["D"])),
+                                        f"d_early_p_sized_{ns.tag}")
+        os.makedirs(_early_sized_dir, exist_ok=True)
+        for _old in os.listdir(_early_sized_dir):
+            os.unlink(os.path.join(_early_sized_dir, _old))
+        spec_p.env[_des.P_SIZED_DIR_ENV] = _early_sized_dir  # stage 0: P ranks report sized
+    if _d_early_start_armed(ns) or str(getattr(ns, "weg2_p_free_read_journal", "off")) == "on":
+        from sglang.srt.weg2 import d_early_start as _des
+
+        _journal_dir = os.path.join(os.path.dirname(os.path.abspath(state.logs["P"])),
+                                    f"p_free_reads_{ns.tag}")
+        spec_p.env[_des.FREE_READ_JOURNAL_ENV] = _journal_dir
+        log(f"{_des.FREE_READ_MARKER} P journals its free-memory reads -> {_journal_dir}")
     launch_group(spec_p, tree, log, dry)
     if dry:
         _dry_terms: List[Dict[str, object]] = []
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), terms_out=_dry_terms)
+        _dry_other, _dry_other_why = d_expect_dormant_other(cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
+        log("D-EXPECT DORMANT-OTHER D(dry, expectation): " + ", ".join(f"nvml{c.nvml_index} {_dry_other[c.uuid]}" for c in cards) + f" MiB -- {_dry_other_why}")
+        budgets_d = budgets_from_dc(cards, _dry_other, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card, **dict(zip(("dormant_growth_mib", "dormant_growth_provenance"), served_dormant_growth(cards, ns.profile))), charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile), **dict(zip(("awake_rest_mib", "awake_rest_provenance"), d_awake_rest(cards, ns.profile))), **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)), terms_out=_dry_terms)
         # #145 AN BEIDEN STELLEN -- siehe #114 direkt darunter: es gibt ZWEI
         # Stellen, an denen budgets_d entsteht, und eine Fassung, die nur die
         # untere trifft, fehlt genau im Dry-Run, wo das Gate sie sucht.
@@ -20758,7 +25460,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
+        refuse_flip_stage_form_without_trim_cells(ns, getattr(ns, "weg2_boot_form", None), log)
+        refuse_d_form_off_the_map(ns, log)  # W170, #239 rc12z29c
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap, expert_store_identity=_estore_id)
         env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
         env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
         env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
@@ -20784,6 +25488,107 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             x_ceiling_tokens=front_x_ceiling)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
+    # BOOTZEIT 3 (--weg2-d-early-start): D starts NOW, planned from the
+    # expectation, and holds before its weight load until _d_early_verdict
+    # below has compared that plan with P's measured dormant footprint.
+    _early_d = None
+    if _d_early_start_armed(ns):
+        from sglang.srt.weg2 import d_early_start as _des
+
+        _early_snap = (getattr(ns, "env_d", ""), getattr(ns, "_d_kv_stage_written", None),
+                       getattr(ns, "_d_owner_solve", None))
+        _early_gate = os.path.join(os.path.dirname(os.path.abspath(state.logs["D"])),
+                                   f"d_early_gate_{ns.tag}.json")
+        try:
+            os.unlink(_early_gate)
+        except FileNotFoundError:
+            pass
+        # dormant_other = the planner seat's ONE selector (D-EXPECT, 9f74489683):
+        # P's measured residue from the record on Next Flash, else the legacy term
+        _early_other, _early_other_why = d_expect_dormant_other(
+            cards, dc_expect_d, _p_dormant_recs, ns.weg2_weight_source, ns.profile)
+        log("D-EXPECT DORMANT-OTHER D(frueh, Erwartung): " + ", ".join(
+            f"nvml{c.nvml_index} {_early_other[c.uuid]}" for c in cards) + f" MiB -- {_early_other_why}")
+        # the D-EXPECT CHECK after P's sleep compares against the plan D was
+        # started with; a map pass (NF) already published the same selector's
+        # value, the 27B runs none -- publish it here then (display only)
+        if (getattr(ns, "_d_expect_other", None) is None
+                and not _early_other_why.startswith("legacy")):
+            ns._d_expect_other = _early_other
+        _early_stage0 = os.path.join(os.path.dirname(_early_gate), f"d_early_stage0_{ns.tag}.json")
+        try:
+            os.unlink(_early_stage0)
+        except FileNotFoundError:
+            pass
+        _early_spec, _early_budgets = _d_spec_from(
+            _early_other, "D(frueh, Erwartung)",
+            {_des.GATE_ENV: _early_gate, _des.STAGE0_ENV: _early_stage0})
+        state.argv["D"] = " ".join(shlex.quote(a) for a in _early_spec.argv)
+        launch_group(_early_spec, tree, log, dry)
+        log(f"{_des.MARKER} LAUNCH group D with P (planned budgets {_early_budgets} MiB, "
+            f"gate {_early_gate}); D holds before its CUDA context until P is sized "
+            f"({_early_stage0}) and before its load until the verdict after sleep(P)")
+        _early_stage0_result: Dict[str, object] = {}
+        threading.Thread(
+            target=d_early_stage0_watch, name="bz3-d-early-stage0", daemon=True,
+            args=(_early_stage0, _early_sized_dir, _group_rank_count(spec_p.argv),
+                  lambda: session_pids(_early_spec.pid), lambda: _early_spec.proc.poll() is None,
+                  lambda: spec_p.proc.poll() is None, nvml_process_mib,
+                  {c.uuid: f"nvml{c.nvml_index}" for c in cards}, _early_stage0_result, log),
+        ).start()
+        _early_d = (_early_spec, _early_budgets, _early_gate, _early_snap, _early_stage0_result)
+
+    def _d_early_verdict(early, dc_measured):
+        """go -> the running early D; refuse -> None (it exits, the caller starts D serially)."""
+        from sglang.srt.weg2 import d_early_start as _des
+
+        spec, planned, gate, snap, stage0 = early
+        _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
+        _rest, _rest_prov = d_awake_rest(cards, ns.profile)
+        _over, _over_prov = d_overshoot_record(ns.profile)
+        measured = budgets_from_dc(
+            cards, dc_measured, log, "D(gemessen, Gate)", overshoot_mib=_over,
+            overshoot_provenance=_over_prov,
+            corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
+            user_reserve_by_card=user_reserve_by_card,
+            dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
+            charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
+            awake_rest_mib=_rest, awake_rest_provenance=_rest_prov,
+            **booked_rest_kwargs(cards, ns.profile, "D", capped=torch_cache_cap_armed(ns)),
+        )
+        uuids = [c.uuid for c in cards]
+        names = {c.uuid: f"nvml{c.nvml_index}" for c in cards}
+        ok, lines = _des.budget_verdict(dict(zip(uuids, planned)), dict(zip(uuids, measured)), names)
+        rc = spec.proc.poll() if spec.proc is not None else None
+        if rc is not None:
+            ok, lines = False, lines + [f"early D exited before the gate rc={rc}"]
+        if stage0.get("verdict") != _des.VERDICT_GO:
+            ok, lines = False, lines + [f"stage 0 not go ({stage0.get('verdict', 'no verdict yet')})"]
+        for _ln in lines:
+            log(f"{_des.MARKER} {_ln}")
+        if ok:
+            _des.write_gate(gate, _des.VERDICT_GO, "planned <= measured on every card",
+                            dict(zip(uuids, planned)), dict(zip(uuids, measured)))
+            state.budgets["D"] = planned
+            log(f"{_des.MARKER} GO -- D loads now with the plan it was started with")
+            return spec
+        _des.write_gate(gate, _des.VERDICT_REFUSE, "; ".join(lines),
+                        dict(zip(uuids, planned)), dict(zip(uuids, measured)))
+        log(f"{_des.MARKER} REFUSE -- early D exits, D starts serially from the measured budgets")
+        try:
+            spec.proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            spec.proc.kill()
+            spec.proc.wait(timeout=30)
+        # the group leads its own session (launch_group): its scheduler ranks
+        # must not outlive it on the cards the serial D is about to take
+        try:
+            os.killpg(spec.proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        ns.env_d, ns._d_kv_stage_written, ns._d_owner_solve = snap
+        return None
+
     state.pids["P"] = spec_p.pid
     _write_state(state)
     register_boot_group(ns.tag, "P", spec_p.pid, log)  # H135b
@@ -20809,11 +25614,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "this arm runs under prints neither marker. P's own health check "
             "already confirmed it booted clean to READY.")
     else:
-        n_kv = count_marker(spec_p.log, "#706 canonical KV page active")
-        n_blob = count_marker(spec_p.log, "canonical GDN blob active")
-        log(f"W7/W10 launcher half, group P log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob} (need >= 3 each: three ranks)")
-        if n_kv < 3 or n_blob < 3:
-            raise Weg2LaunchRefused(f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half): P logged kv x{n_kv} blob x{n_blob}, need 3 each")
+        canonical_state_gate(spec_p, 3, log)
 
     # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
     # This is the one sleep on this box that is NOT interleaved: group D does
@@ -20852,70 +25653,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dc_p.setdefault(c.uuid, 0)
     mem = nvml_memory(cards)
     for c in cards:
-        exp = DC_EXPECT_5090_MIB if "5090" in c.name else DC_EXPECT_3080_MIB
+        exp = dc_expect_mib(c)
+        _exp_txt = (f"expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
+                    f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; "
+                    if exp is not None else
+                    f"expectation UNCALIBRATED ({card_identity.card_key(c)}: no spec-1.6 class; ")
         log(
             f"WEG2-DC group=P nvml{c.nvml_index} {c.name}: measured {dc_p[c.uuid]} MiB per-process "
             f"(pids {sorted(pids_p)}) card used {mem[c.uuid].tenant_used_mib} MiB by processes "
             f"(instrument {mem[c.uuid].tenant_used_instrument}; card free {mem[c.uuid].free_mib} MiB allocatable, "
-            f"{mem[c.uuid].reserved_mib} MiB driver-reserved); expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
-            f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; the launcher derives D from the MEASUREMENT, record 1f B6)"
+            f"{mem[c.uuid].reserved_mib} MiB driver-reserved); " + _exp_txt
+            + "the launcher derives D from the MEASUREMENT, record 1f B6)"
         )
     state.dc_measured_p = dc_p
+    # BOOTZEIT 3: the free-read journal's cut (P's first sleep is over here) and,
+    # with an early D, D's bytes on each card measured per PID -- the known term
+    # a deviating P reader would have to carry (never an estimate).
+    _p_sleep_evt: Dict[str, object] = {"t": time.time(), "dc_p_mib": dict(dc_p)}
+    if _early_d is not None:
+        try:
+            _p_sleep_evt["d_early_foreign_mib"] = nvml_process_mib(session_pids(_early_d[0].pid))
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            _p_sleep_evt["d_early_foreign_mib"] = f"unmeasured ({type(e).__name__}: {e})"
+        log(f"BZ3 D-EARLY-FOREIGN after sleep(P): D per-PID MiB {_p_sleep_evt['d_early_foreign_mib']}")
+    boot_state_write(log, event=("p_first_sleep_done", _p_sleep_evt))
+    for _ln in d_expect_check_lines(cards, getattr(ns, "_d_expect_other", None), dc_p):
+        log(_ln)
 
     # 5. group D
-    _grow, _grow_prov = served_dormant_growth(cards, ns.profile)
-    _rest, _rest_prov = d_awake_rest(cards, ns.profile)
-    _over, _over_prov = d_overshoot_record(ns.profile)
-    _d_terms: List[Dict[str, object]] = []
-    budgets_d = budgets_from_dc(
-        cards, dc_p, log, "D", overshoot_mib=_over,
-        overshoot_provenance=_over_prov,
-        corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
-        user_reserve_by_card=user_reserve_by_card,
-        dormant_growth_mib=_grow, dormant_growth_provenance=_grow_prov,
-        charge_driver_carve=budget_charges_driver_carve(ns.profile), driver_carve_min_total_mib=driver_carve_min_total_mib(ns.profile),
-        awake_rest_mib=_rest, awake_rest_provenance=_rest_prov, terms_out=_d_terms,
-    )
-    state.budgets["D"] = budgets_d
-    log_d_rank_vram_solve(ns, cards, budgets_d, log, "D",
-                          p_split=p_split, chunk_layers=chunk_layers,
-                          card_terms=(_d_terms if _rest is not None else None))
-    d_ratio = d_tp_ratio_decision(
-        ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
-        d_bs, getattr(ns, "env_d", "") or "",
-        user_reserve_by_card=user_reserve_by_card,
-        overhead_mib_by_rank=d_overhead_mib,
-    )
-    log(d_ratio.line)
-    log(d_ratio.op_line)
-    log(d_tokvec.line)
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns), expert_map_path=_emap)
-    env_d.update(store_short_tail_env(x_tokens, d_x_tokens))  # 27B RC7-X / UNIFY S7
-    env_d.update(d_reshard_env())  # --d-reshard: {} under 'off'
-    env_d.update(d_gc_env(ns))  # --d-gc-freeze: {} under 'off'
-    env_d.update(d_token_placement_env())  # --d-token-placement: {} under 'capacity'
-    env_d.update(d_kv_evict_env())  # --d-kv-evict-for-placement: {} under 'off'
-    env_d.update(fork_anchor_env(getattr(ns, "fork_anchor_token", None),
-                                 bool(getattr(ns, "p_trim_end_anchor", False))))  # {} when off
-    # #114: DIE EFFEKTIVE GRUPPEN-ENV GEHOERT INS LOG.
-    #
-    # Der Verdrahtungs-Check (weg2/verdrahtung_check.sh) liest das
-    # Dry-Run-Log, also das, was der Boot WIRKLICH startet. Er konnte bisher
-    # keine einzige Env pruefen, weil der Launcher sie nirgends druckt:
-    # `grep SGLANG_MOE_EXPERT_STORE_DIR dry_*.log` gibt 0 Treffer, obwohl sie
-    # gesetzt IST. Ein Pruefer, der am falschen Ort misst, meldet Luecken,
-    # die es nicht gibt, und uebersieht die echten.
-    for _g, _e in (("P", env_p), ("D", env_d)):
-        _sg = ";".join(f"{k}={v}" for k, v in sorted((_e or {}).items())
-                       if str(k).startswith("SGLANG_"))
-        log(f"WEG2-GROUP-ENV {_g}: {_sg or '(leer)'}")
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d) + d_reshard_argv(d_ratio.flags, shlex.split(ns.extra_d)), d_bs, max_kv_per_request, d_x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile, d_adopt=_d_adopt_armed(ns), vision=ns.weg2_vision), ns.transport), state.logs["D"], env_d)
-    state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
-    launch_group(spec_d, tree, log, dry)
+    spec_d = None
+    if _early_d is not None:
+        spec_d = _d_early_verdict(_early_d, dc_p)
+    if spec_d is None:
+        spec_d, _ = _d_spec_from(dc_p, "D")
+        state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
+        launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
     _write_state(state)
     register_boot_group(ns.tag, "D", spec_d.pid, log)  # H135b
     state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
+    if not dry:
+        release_shared_cache(spec_d, log)  # W98 (z30u): 2b's kept ranges, after D's take-over
     # #1386 FOLLOW-UP 2: the mirror of group P's same skip above -- D's
     # cache_controller never builds under `hicache_disabled` either (D is a
     # plain MambaRadixCache then, same as P), so it prints neither marker.
@@ -20924,11 +25702,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "never builds either (enable_hierarchical_cache is False) -- no "
             "canonical-page/GDN-blob emitter to grade, same as group P above.")
     else:
-        n_kv, n_blob, n_worker = canonical_marker_counts(spec_d.log)
-        log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}"
-            + (f" (of which {n_worker} Form A expert worker(s): no attention layer, no page window, null storage tier -- fnFL2 v18)" if n_worker else ""))
-        if n_kv < 3 or n_blob < 3:
-            raise Weg2LaunchRefused(f"W7/W10 (launcher half): D logged kv x{n_kv} blob x{n_blob}, need 3 each")
+        canonical_state_gate(spec_d, 3, log,
+                             kv_owner_ranks=d_kv_worker_ranks(getattr(ns, "extra_d", "") or ""))
+        # VRAM-Vertrag M2 (display only): P's blocks again, now carrying its
+        # first sleep leg -- the per-PID source of the plan's asleep.P
+        rank_vram_display(spec_p, log)
     # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
     # store is one carrier; a spec-less group keys pages by unigram unless
     # SGLANG_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
@@ -20957,6 +25735,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "NEXTN head) and immaterial without a store to key.")
     else:
         _forced = "#1233 HICACHE BIGRAM KEYS FORCED"
+        # IPC-LOG-EXCEPTION: W9 still reads the forced-bigram LINE (Phase 2 rest, producer
+        # side: RankState schema 2 `store_key_scheme`, IPC-STATE-PLAN §2.1).
         _p_bigram = ("--speculative-algorithm" in spec_p.argv) or count_marker(spec_p.log, _forced) >= 1
         _d_bigram = ("--speculative-algorithm" in spec_d.argv) or count_marker(spec_d.log, _forced) >= 1
         log(f"W9 launch-time key-scheme gate: P bigram={_p_bigram} (forced lines {count_marker(spec_p.log, _forced)}) "
@@ -21031,6 +25811,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # tier) hold no carrier; their plain pool is synced to the attention
         # host's staging ring and prints 0.9 x that, while the host prints the
         # arena's capacity -- they abstain, as they do in the prefetch vote.
+        # IPC-LOG-EXCEPTION: W45 still reads worker and '#915 PREFETCH LIMIT' lines (Phase 2
+        # rest, IPC-STATE-PLAN R1: RankState role + `carrier_prefetch_limit_tokens`).
         _abstain = _cc.form_a_worker_ranks(spec_d.log)
         _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor,
                           abstain_ranks=_abstain)
@@ -21059,6 +25841,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"group D is awake and serving -- SHORT is four conjuncts, so while D sleeps a sub-floor prompt "
             f"queues to BATCH and round-trips as well")
     state.carrier_max_tokens = carrier_max_tokens
+    if not hicache_disabled:
+        # P-COVERS-D-SESSION (law 02.10.): the measured carrier holds D's session
+        # too (no capacity route to a D prefill exists any more)
+        _cc_ok, _cc_line = carrier_covers_d_session(
+            carrier_max_tokens, d_session_tokens(ns.extra_d, int(ns.max_kv_per_request
+                                                                or CONTEXT_LENGTH_TOKENS)))
+        log(_cc_line)
+        if not _cc_ok:
+            raise Weg2LaunchRefused(_cc_line)
     log(f"D-ADMIT STORE-READ GATE (FIX 4, round 4): the budget is group D's OWN #915 reading "
         f"(available/occupied/limit via /server_info hicache_prefetch), not a launcher-derived "
         f"proxy; front --d-admit-max-tokens "
@@ -21101,13 +25892,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # UNIFY S6 (27B c60a5d387f): under p_draft=cold P builds the producer
         # but writes NO draft pages -- W10 is skipped by name (identities still
         # logged); W11 still grades the cold-resident draft bytes.
+        # IPC-LOG-EXCEPTION: W10-drafter / W11 still read drafter identity and draft-build
+        # lines (Phase 2 rest: RankState schema 2 `drafter`, `draft_build`).
         gate_w10(spec_p.log, spec_d.log, log,
                  p_produces_draft_pages=p_produces_draft_pages())
         # #1233 fix 2: W11 DRAFT-RESIDENT gate. The last stage's pool is priced
         # against a budgeted draft residue (P_DRAFT_RESIDENT_BUDGET_MIB); the L2
         # line carries the MEASURED one. Over budget = the corridor derivation is refuted by this
         # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
-        gate_w11(spec_p.log, log)
+        # IPC-LOG-EXCEPTION: W11 (see W10 above).
+        gate_w11(spec_p.log, log, rope_ctx_mib=p_rope_draft_delta_mib(ns))
+    # IPC-LOG-EXCEPTION: display only (class A), decides nothing; metric bar1_window_clip_total later.
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
 
@@ -21189,6 +25984,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
+    # L3-INDEX PRICE (02.10.): the front asks the shared L3 stem index with the
+    # groups' own page-key scheme and arena dir (group_env's values, so the
+    # credit is what P/D read).
+    if ns.hicache_bigram_keys:
+        fenv["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
+    else:
+        fenv.pop("SGLANG_HICACHE_BIGRAM_KEYS", None)
+    fenv.setdefault("SGLANG_HICACHE_ARENA_DIR", f"/dev/shm/weg2-arena-{ns.tag}")
     # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
     # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
     #
@@ -21206,6 +26009,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # der teuerste Blindflug im ganzen Boot. Die Gruppen selbst sind nicht
     # betroffen (ihre Logger flushen je Zeile); es geht allein um die Front.
     fenv["PYTHONUNBUFFERED"] = "1"
+    # FH (b1): the front's health poller finds a held rank (#1223) by its dump;
+    # hand it the dir the groups write to (read only by front_health).
+    if env_p.get("SGLANG_DEBUG_HOLD_DIR") and not fenv.get("SGLANG_DEBUG_HOLD_DIR"):
+        fenv["SGLANG_DEBUG_HOLD_DIR"] = env_p["SGLANG_DEBUG_HOLD_DIR"]
     # RG (operator 26.09.): the prefix switches the ranks got from build_env,
     # the same call on the front's env (SGLANG_WEG2_FRONT_SPAN_INFLIGHT is the
     # front's own; all five as on metal: ENV-IM-RANG front = 1).
@@ -21236,6 +26043,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ffh = open(front_log, "ab")
     fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
     state.pids["front"] = fp.pid
+    boot_state_write(log, fields=front_launch_fields(front_argv, fenv))
     # H135b: the front into the state json AND the registry at once -- until the
     # LAUNCHED write below (behind wait_ready and the deadmen) a guard-run
     # `--teardown` would not know the front by pid.
@@ -21285,6 +26093,26 @@ def xchg_census_is_reserve(profile: Optional[str]) -> bool:
     No/unknown profile = the launcher default (``--profile`` qwen27b)."""
     row = weg2_form.profile_row(profile or weg2_form.DEFAULT_PROFILE)
     return bool(getattr(row, "d_residue_census", False))
+
+
+def d_expect_from_p_records(profile: Optional[str]) -> bool:
+    """Does D's EXPECTATION budget (before P's first sleep) price P's measured
+    dormant residue from the records? The registry row decides
+    (``ModelProfile.d_expect_from_p_records``); independent of the reserve
+    question :func:`xchg_census_is_reserve` answers. No/unknown profile = the
+    launcher default (``--profile`` qwen27b)."""
+    row = weg2_form.profile_row(profile or weg2_form.DEFAULT_PROFILE)
+    return bool(getattr(row, "d_expect_from_p_records", False))
+
+
+def d_early_start_proven(profile: Optional[str]) -> bool:
+    """``--weg2-d-early-start auto`` = on for this profile: the registry row
+    carries a metal proof (``ModelProfile.d_early_start_proven``) AND prices
+    the early plan from P's records. No/unknown profile = the launcher
+    default (qwen27b)."""
+    row = weg2_form.profile_row(profile or weg2_form.DEFAULT_PROFILE)
+    return (bool(getattr(row, "d_early_start_proven", False))
+            and d_expect_from_p_records(profile))
 
 
 def xchg_form_dormant_reserve(
@@ -21426,6 +26254,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--vision", str(getattr(ns, "weg2_vision", VISION_OFF)),
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
         "--weight-form", str(ns.weg2_weight_source),  # #1444: stamps the record
+    ] + (["--d-residue-context-tokens", str(group_context_tokens(ns, "d")[0])]  # YaRN x2: x1 argv unchanged
+         if group_context_tokens(ns, "d")[0] > CONTEXT_LENGTH_TOKENS else []) + [
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
     ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + [
@@ -21466,6 +26296,14 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     # and the front then prints no split rather than an invented one.
     if anon_preboot_bytes > 0:
         argv += ["--anon-preboot-bytes", str(int(anon_preboot_bytes))]
+    # 29.09.: the host census record the front keeps current (absent = off)
+    _hcn = getattr(ns, "_host_census", None)
+    if _hcn:
+        argv += ["--host-census-record", str(_hcn["record"]), "--host-census-key", str(_hcn["key"])]
+        if _hcn.get("store_dir"):
+            argv += ["--host-census-store-dir", str(_hcn["store_dir"])]
+        if _hcn.get("widths"):
+            argv += ["--host-census-arena-widths", ",".join(str(int(w)) for w in _hcn["widths"])]
     if ns.min_dwell_ms is not None:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
     # 27B idle policy (b)/(c): emitted only when set, so a boot without them
@@ -21515,9 +26353,16 @@ def state_path(state: BootState) -> str:
 
 
 def _write_state(state: BootState) -> None:
+    # IPC (27B requirement 8, 28.09.): atomic -- a reader (teardown, the
+    # arms, a watcher) must never see a half-written boot file.
     os.makedirs(_operator_dir(GPU_ARB), exist_ok=True)
-    with open(state_path(state), "w") as f:
+    path = state_path(state)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
         json.dump(state.__dict__, f, indent=1, default=str)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 #: #1248: first W-code substring in a refusal message, for the one-line
@@ -21627,7 +26472,15 @@ def teardown(path: str, report: dict | None = None) -> int:
     # ran, e.g. after a crash. These are DISK bytes -- nothing freed here was
     # ever charged to the host reap ledger.
     store_dir = st.get("store_dir", "")
-    if store_dir and os.path.isdir(store_dir):
+    if store_dir and os.path.isdir(store_dir) and l3_persistent_store(store_dir):
+        # L3P-TEARDOWN (27B rc12z7b b1 08:01Z: 6.5 GB / 172795 files removed
+        # here, b5 found `identity=new files=0`): a persistent L3 store is
+        # the one thing a teardown must NOT remove -- it is what the next
+        # boot reattaches to. Only the per-boot store of the pre-L3P form
+        # (no identity file, no ``l3-`` name) goes.
+        alloc, _apparent, count = _tree_bytes(store_dir)
+        print(f"store dir {store_dir} KEPT (L3 persistent: {alloc} B allocated, {count} files)")
+    elif store_dir and os.path.isdir(store_dir):
         alloc, _apparent, count = _tree_bytes(store_dir)
         shutil.rmtree(store_dir, ignore_errors=True)
         print(f"store dir {store_dir} removed ({alloc} B allocated, {count} files; DISK, "
@@ -21800,10 +26653,16 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
     refusal before any spawn still takes the fast exit below unchanged,
     because ``_ACTIVE_BOOT_STATE.pids`` is still empty at that point.
     """
+    def _say(line: str) -> None:
+        print(f"[{_now()}] {line}", flush=True)
+
     try:
-        return main(argv)
+        rc = main(argv)
     except REFUSALS as e:
         print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
+        # IPC §2.2: the refusal is the boot's cause, written where the arm reads
+        # it -- not only printed for a later grep.
+        boot_state_write(_say, "dead", cause=refusal_cause(e))
         # #1275 fix 2 (3): the KILLER path drops the key too. weg2sb5 refused
         # here and left its key file behind -- a boot that never served, whose
         # secret outlived it. Both exits, or the guarantee is only half true.
@@ -21835,6 +26694,14 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
             flush=True,
         )
         return 2
+    except Exception as e:
+        # Not a refusal: a launcher crash. Named in state.json, then re-raised
+        # unchanged (traceback and exit code stay what they were).
+        boot_state_write(_say, "dead", cause=state_file_mod.make_cause(
+            f"LAUNCHER_EXCEPTION_{type(e).__name__}", "launcher", repr(e), exception_type=type(e).__name__))
+        raise
+    boot_state_write(_say, event=("launcher_done", {"rc": rc}))
+    return rc
 
 
 if __name__ == "__main__":

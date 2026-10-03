@@ -32,6 +32,42 @@ THE RULE (PP0 only; switch ``SGLANG_WEG2_P_TWIN_DEFER``, default off):
   3. the FRIST -- ``SGLANG_WEG2_P_TWIN_WAIT_S`` (120 s) after intake, or when
      the twin left the queue, it is released as an ordinary request (plain
      told, byte-for-byte the pre-TW path).
+  4. NO GAIN, NO WAIT (28.09., NF rc12z30e ca2a9706ec, P log
+     ...09282117_ca2a9706ec_0928_211748): a hybrid model resumes only at a
+     Mamba anchor, and a sibling writes anchors only at its chunk ends and at
+     its END ANCHOR ``floor((len - 1) / page) * page`` ('WEG2 END-ANCHOR ...
+     anchor=20032 target=20032'). An anchor the sibling writes past ``shared``
+     is off the twin's path, one at or below the sibling's own start depth
+     ``s0`` is there for the twin already. So the sibling brings the twin
+     something only if ``s0 < end <= shared`` or a whole chunk fits into
+     ``(s0, shared]`` (``shared - s0 >= chunked_prefill_size``). Specimen
+     weg2-8-30 (20171 tokens, shared 20029 with weg2-8-29 of 20033 tokens,
+     s0 16384): '#TW TWIN-RELEASE ... waited_s=6.34', then 'TWIN-TOLD
+     head=16384' and 3787 tokens computed from 16384 -- exactly what it would
+     have computed without the wait. 6 of that boot's 8 deferrals had this
+     shape (0-7, 2-10, 2-11, 8-30, 12-35, 30-63: 51 s of held twins, 0 tokens
+     saved); the two that gained (23-50, 37-68: the finished sibling's end
+     anchor 49536 / 81600 at or below shared) keep holding. ``s0`` is the
+     sibling's prefix when PP0 first sees it admitted (in flight, not in the
+     waiting queue); a sibling never seen admitted is undecidable and holds
+     as before, unless neither its end nor a whole chunk can land inside
+     ``shared``. A twin whose sources all bring nothing registers at intake
+     ('#TW TWIN-NO-GAIN ... at=intake'); a pass that learns ``s0`` releases
+     a held one as an ordinary request ('... at=release').
+
+  5. PROMISE, NOT HOPE (30.09., NF y4a weg2-16-28 / weg2-12-19; TWIN ANCHOR,
+     weg2/twin_anchor.py): with the twin anchor armed a twin is held only
+     behind a source that PROMISED an anchor at or below ``shared``: its end
+     anchor (``end <= shared``), a chunk end (``shared - s0 >= chunk``), or
+     the twin boundary ``B = floor_page(shared - 1)`` the source tracks as an
+     extra extend track -- promised once its step holding ``B`` was planned
+     with the track (``twin_anchor.status`` planned/written), provisionally
+     while the source has not planned past ``B`` and its start can still lie
+     below it (queued: its registered head < ``B``). A source whose start is
+     past ``B``, or that planned ``B``'s step without the track, promises
+     nothing: no source with a promise -> the twin registers at once
+     ('#TW TWIN-NO-COMMIT', at=intake or at=release -- a provisional promise
+     is resolved at the source's first plan, one pass). Switch off: rule 4.
 
 RANK AGREEMENT. Nothing new is decided off PP0. A follower already holds
 every request until PP0's told arrives on the request wire (#1400,
@@ -73,6 +109,7 @@ VERDICT_DEFERRED = "declined:weg2_twin_deferred"
 #: release reasons
 REL_PUBLISHED = "published"
 REL_DEADLINE = "deadline"
+REL_NO_GAIN = "no_gain"
 
 _ATTR = "_weg2_twin_state"
 _LOG_FIRST = 8
@@ -99,6 +136,14 @@ def _env_int(name: str, default: int, env=None) -> int:
         return default
 
 
+def _pos_int(v, default: int) -> int:
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
 def _env_float(name: str, default: float, env=None) -> float:
     env = os.environ if env is None else env
     try:
@@ -113,6 +158,8 @@ class _Wait:
     sources: List[Any]
     since: float
     shared: int
+    #: rule 4: rid -> leading ids shared with THAT source (``shared`` is the max)
+    shared_by: Dict[str, int] = field(default_factory=dict)
     #: PP0 pass / monotonic time at which the LAST source was first seen finished
     done_pass: Optional[int] = None
     done_t: Optional[float] = None
@@ -124,15 +171,31 @@ class _State:
     wait_s: float
     settle_s: float
     settle_passes: int
+    #: rule 4: the page the end anchor is floored to, and the chunk budget
+    #: (0 = unchunked: no anchor between a sibling's start and its end)
+    page: int = 1
+    chunk: int = 0
     waits: Dict[str, _Wait] = field(default_factory=dict)
+    #: rule 4: rid -> prefix length when PP0 first saw it admitted (s0)
+    s0: Dict[str, int] = field(default_factory=dict)
     #: PP0: rids released as twins whose told is still to be published
     twin_pp0: Dict[str, int] = field(default_factory=dict)
     #: follower: rids whose absorbed told is a twin (absolute) told
     twin_follower: Dict[str, int] = field(default_factory=dict)
     passes: int = 0
+    #: #56: the in-flight requests PP0 saw at its last look (id -> req), and
+    #: the ones that FINISHED since, rid -> (req, pass, t), kept for the settle
+    #: window only: a twin arriving right after its sibling's finish is held
+    #: until the sibling's retain publish (its end anchor) has landed.
+    last_seen: Dict[int, Any] = field(default_factory=dict)
+    recent: Dict[str, Tuple[Any, int, float]] = field(default_factory=dict)
+    #: rule 5: promises are asked (twin anchor armed on this process)
+    promise: bool = False
     n_defer: int = 0
+    n_recent: int = 0
     n_release: int = 0
     n_deadline: int = 0
+    n_no_gain: int = 0
 
 
 def state(scheduler) -> Optional[_State]:
@@ -148,6 +211,9 @@ def state(scheduler) -> Optional[_State]:
             wait_s=_env_float(ENV_WAIT_S, DEFAULT_WAIT_S),
             settle_s=_env_float(ENV_SETTLE_MS, DEFAULT_SETTLE_MS) / 1000.0,
             settle_passes=max(1, pp_size),
+            page=_pos_int(getattr(scheduler, "page_size", 1), 1),
+            chunk=_pos_int(getattr(scheduler, "chunked_prefill_size", 0), 0),
+            promise=_twin_anchor_armed(),
         )
         logger.warning(
             "#TW P-TWIN-DEFER ARMED rank pp=%s min_tokens=%d wait_s=%g settle_ms=%g "
@@ -202,9 +268,24 @@ def _batch_reqs(batch) -> Iterable[Any]:
     return getattr(batch, "reqs", None) or ()
 
 
+def _dormant_hold(scheduler) -> List[Any]:
+    """TW-WAKE (#294, NF y5a dmatrix 6x65602): the requests P took in while it
+    SLEPT -- ``Scheduler._add_request_to_queue`` registers their store read
+    (the #1400 intake, where TW asks) and then parks them in
+    ``weg2_dormant_hold`` instead of the waiting queue until the wake."""
+    return list(getattr(scheduler, "weg2_dormant_hold", None) or ())
+
+
 def inflight(scheduler) -> List[Any]:
     """Every request PP0 knows as in flight on P and not finished: queued,
-    the chunked one, the running batch, the PP microbatch rings."""
+    the dormant hold (TW-WAKE), the chunked one, the running batch, the PP
+    microbatch rings.
+
+    TW-WAKE (#294, y5a 17:56:08Z): weg2-52-75..80, six identical 65602-token
+    prompts, reached P while it slept ('PLE-PREFETCH admit ... dormant=1').
+    The dormant hold was not in this set, so 52-76 found no sibling at its
+    intake, registered its store read at told 0 and prefilled all 65602
+    tokens again -- six times in a row, 68 s of P, not one #TW line."""
     seen, out = set(), []
 
     def add(r):
@@ -217,6 +298,8 @@ def inflight(scheduler) -> List[Any]:
         out.append(r)
 
     for r in list(getattr(scheduler, "waiting_queue", None) or ()):
+        add(r)
+    for r in _dormant_hold(scheduler):
         add(r)
     add(getattr(scheduler, "chunked_req", None))
     for r in _batch_reqs(getattr(scheduler, "running_batch", None)):
@@ -234,6 +317,189 @@ def _say(n: int) -> bool:
     return n <= _LOG_FIRST or n % _LOG_EVERY == 0
 
 
+def _settled(st: "_State", done_pass: int, done_t: float, now: float) -> bool:
+    return st.passes - done_pass >= st.settle_passes and now - done_t >= st.settle_s
+
+
+def _refresh_recent(st: "_State", scheduler, now: float) -> List[Any]:
+    """#56 (NF rc12z 09280209, 03:15:02 PP0: ``WEG2 END-ANCHOR rid=weg2-20-25
+    anchor=37952``, the same second ``#1416 STORE-TOLD ANCHOR-CLAMP
+    rid=weg2-21-27 completed=37952 anchored=30528``): a sibling that has just
+    FINISHED on PP0 is no longer in flight, but its end anchor is not yet in
+    the store (the retain publish is the step TW's own settle waits for). A
+    twin arriving in that window registered at once, its store read found the
+    KV pages and no anchor, and told fell back to the previous anchor. Record
+    the requests that left the in-flight set FINISHED since the last look,
+    keep them for the settle window, and return the current in-flight set."""
+    cur = inflight(scheduler)
+    ids_now = {id(r) for r in cur}
+    _note_s0(st, scheduler, cur)
+    for key, r in st.last_seen.items():
+        if key in ids_now:
+            continue
+        fin = getattr(r, "finished", None)
+        if callable(fin) and fin() and len(st.recent) < _FLAG_CAP:
+            st.recent[str(getattr(r, "rid", ""))] = (r, st.passes, now)
+    st.last_seen = {id(r): r for r in cur}
+    for rid in [k for k, (_r, p, t) in st.recent.items() if _settled(st, p, t, now)]:
+        st.recent.pop(rid, None)
+    return cur
+
+
+def _rid(r) -> str:
+    return str(getattr(r, "rid", ""))
+
+
+def _note_s0(st: "_State", scheduler, cur: List[Any]) -> None:
+    """Rule 4: the prefix a request holds when PP0 first sees it admitted
+    (in flight, out of the waiting queue) -- its start depth ``s0``; every
+    anchor it writes later lies above it. Kept while the rid is in flight,
+    just finished, or a source of a held twin."""
+    queued = {id(r) for r in (getattr(scheduler, "waiting_queue", None) or ())}
+    queued.update(id(r) for r in _dormant_hold(scheduler))  # TW-WAKE: held, not admitted
+    for r in cur:
+        if id(r) in queued:
+            continue
+        rid = _rid(r)
+        if rid and rid not in st.s0 and len(st.s0) < _FLAG_CAP:
+            # prefix_indices is a torch tensor on the metal: never its truth
+            # value (rc12z30i 27B P 00:04:33Z died on `tensor or ()`)
+            _pi = getattr(r, "prefix_indices", None)
+            try:
+                st.s0[rid] = 0 if _pi is None else len(_pi)
+            except TypeError:
+                pass
+    if len(st.s0) > len(cur) + len(st.recent):
+        keep = {_rid(r) for r in cur} | set(st.recent)
+        for w in st.waits.values():
+            keep.update(_rid(s) for s in w.sources)
+        for rid in [k for k in st.s0 if k not in keep]:
+            st.s0.pop(rid, None)
+
+
+def _gain(st: "_State", src, shared: int) -> Optional[bool]:
+    """Rule 4: can ``src`` (in flight or finished) put an anchor inside the
+    twin's usable band (s0, shared]? True / False / None = not decidable yet
+    (``s0`` unknown: never seen admitted)."""
+    n = len(_ids(src))
+    end = ((n - 1) // st.page) * st.page if n > 0 else 0
+    whole_chunk_fits = st.chunk > 0 and shared >= st.chunk
+    s0 = st.s0.get(_rid(src))
+    if s0 is None:
+        if end > shared and not whole_chunk_fits:
+            return False  # neither its end nor a whole chunk can land inside
+        return None
+    if s0 < end <= shared:
+        return True
+    return bool(st.chunk > 0 and shared - s0 >= st.chunk)
+
+
+def _twin_anchor_armed() -> bool:
+    """Rule 5 runs where the source half can keep the promise: the twin
+    anchor switch and the turn anchor's second track on this process."""
+    try:
+        from sglang.srt.weg2 import turn_anchor as _ta
+        from sglang.srt.weg2 import twin_anchor as _ta2
+
+        return bool(_ta2.armed()) and _ta.armed() is not None
+    except Exception:  # noqa: BLE001 - an accelerator, never a wall
+        return False
+
+
+#: rule 5 promise kinds; PROVISIONAL is resolved at the source's first plan
+PROMISE_END = "end"
+PROMISE_CHUNK = "chunk"
+PROMISE_BOUNDARY = "boundary"
+PROMISE_PROVISIONAL = "boundary?"
+
+
+def _planned_end(src) -> Optional[int]:
+    """End of the source's latest planned step (its fill ids), or None."""
+    fill = getattr(src, "fill_ids", None)
+    try:
+        return len(fill) if fill is not None and len(fill) > 0 else None
+    except TypeError:
+        return None
+
+
+def _promise(st: "_State", src, shared: int) -> Optional[Tuple[str, int]]:
+    """Rule 5: ``(kind, position)`` of the anchor ``src`` promises at or below
+    ``shared`` for its twin, or None (no promise: nobody waits for it)."""
+    from sglang.srt.weg2 import twin_anchor as _tw
+
+    n = len(_ids(src))
+    end = ((n - 1) // st.page) * st.page if n > 0 else 0
+    rid = _rid(src)
+    s0 = st.s0.get(rid)
+    if 0 < end <= shared and (s0 is None or s0 < end):
+        return PROMISE_END, end
+    if s0 is not None and st.chunk > 0 and shared - s0 >= st.chunk:
+        return PROMISE_CHUNK, s0 + ((shared - s0) // st.chunk) * st.chunk
+    b = _tw.boundary(shared, st.page)
+    if not (0 < b < n):
+        return None
+    status = _tw.status(rid, b)
+    if status in ("planned", "written"):
+        return PROMISE_BOUNDARY, b
+    if status == "declined":
+        return None
+    fin = getattr(src, "finished", None)
+    if callable(fin) and fin():
+        return None  # finished without the track
+    if s0 is None:
+        return (PROMISE_PROVISIONAL, b) if registered_head(src) < b else None
+    if s0 >= b:
+        return None
+    done = _planned_end(src)
+    if done is not None and done == b:
+        return PROMISE_CHUNK, b  # the planned step ends exactly there: its own anchor
+    if done is not None and done > b:
+        return None  # its step holding B was planned without the track
+    return PROMISE_PROVISIONAL, b
+
+
+def _keeps(st: "_State", src, shared: int) -> Optional[bool]:
+    """A source a twin may wait for: rule 5 (promise) when armed, rule 4
+    (gain) otherwise."""
+    if st.promise:
+        return _promise(st, src, shared) is not None
+    return _gain(st, src, shared)
+
+
+def _say_no_commit(st: "_State", rid: str, w_shared: Dict[str, int], srcs, at: str) -> None:
+    st.n_no_gain += 1
+    if _say(st.n_no_gain):
+        logger.info(
+            "#TW TWIN-NO-COMMIT rid=%s at=%s sources=%s page=%d chunk=%d (n=%d): no "
+            "source promised an anchor <= shared (end, chunk end or twin boundary "
+            "track) -- registered as an ordinary request, no wait.",
+            rid[:12], at,
+            [(_rid(s)[:12], w_shared.get(_rid(s)), st.s0.get(_rid(s)),
+              _tw_anchor_boundary(w_shared.get(_rid(s), 0), st.page)) for s in srcs],
+            st.page, st.chunk, st.n_no_gain,
+        )
+
+
+def _tw_anchor_boundary(shared: int, page: int) -> int:
+    from sglang.srt.weg2 import twin_anchor as _tw
+
+    return _tw.boundary(shared, page)
+
+
+def _say_no_gain(st: "_State", rid: str, w_shared: Dict[str, int], at: str) -> None:
+    st.n_no_gain += 1
+    if _say(st.n_no_gain):
+        logger.info(
+            "#TW TWIN-NO-GAIN rid=%s at=%s sources=%s page=%d chunk=%d (n=%d): no "
+            "source writes an anchor in (its start, shared] -- a hybrid model "
+            "resumes only at an anchor, so waiting reads nothing; registered as an "
+            "ordinary request.",
+            rid[:12], at,
+            [(k[:12], sh, st.s0.get(k)) for k, sh in w_shared.items()],
+            st.page, st.chunk, st.n_no_gain,
+        )
+
+
 def intake_defer(scheduler, req) -> bool:
     """PP0 intake: True = hold ``req`` without registering its store read."""
     st = state(scheduler)
@@ -242,24 +508,63 @@ def intake_defer(scheduler, req) -> bool:
     rid = str(getattr(req, "rid", ""))
     if len(_ids(req)) < st.min_tokens:
         return False
+    now = _now()
+    live = _refresh_recent(st, scheduler, now)
+    # TW-WAKE: a twin that is itself deferred computes nothing before its own
+    # source finished -- it is no source (y5a: 77..80 wait behind 75 only and
+    # are released together with 76, not one after another).
     sources = [
-        s for s in inflight(scheduler)
+        s for s in live
         if s is not req and str(getattr(s, "rid", "")) != rid
+        and _rid(s) not in st.waits
         and is_twin(s, req, st.min_tokens)
     ]
-    if not sources:
+    # #56: siblings that finished within the settle window count too; their
+    # finish is the start of the settle (not this intake).
+    recent = [
+        (r, p, t) for k, (r, p, t) in st.recent.items()
+        if r is not req and k != rid and is_twin(r, req, st.min_tokens)
+    ]
+    if not sources and not recent:
         st.waits.pop(rid, None)
         return False
-    shared = max(shared_prefix_len(_ids(s), _ids(req)) for s in sources)
-    st.waits[rid] = _Wait(req=req, sources=sources, since=_now(), shared=shared)
+    all_src = sources + [r for r, _p, _t in recent]
+    shared_by = {_rid(s): shared_prefix_len(_ids(s), _ids(req)) for s in all_src}
+    # Rule 4: a source that cannot put an anchor into the twin's band is no
+    # reason to wait. Rule 5 (armed): only a source that PROMISED one is.
+    gain_src = [s for s in all_src if _keeps(st, s, shared_by[_rid(s)]) is not False]
+    if not gain_src:
+        st.waits.pop(rid, None)
+        if st.promise:
+            _say_no_commit(st, rid, shared_by, all_src, "intake")
+        else:
+            _say_no_gain(st, rid, shared_by, "intake")
+        return False
+    keep = {id(s) for s in gain_src}
+    sources = [s for s in sources if id(s) in keep]
+    recent = [(r, p, t) for r, p, t in recent if id(r) in keep]
+    all_src = gain_src
+    shared = max(shared_by[_rid(s)] for s in all_src)
+    w = _Wait(req=req, sources=all_src, since=now, shared=shared, shared_by=shared_by)
+    if not sources:
+        w.done_pass = max(p for _r, p, _t in recent)
+        w.done_t = max(t for _r, _p, t in recent)
+        st.n_recent += 1
+    st.waits[rid] = w
     st.n_defer += 1
+    dormant = bool(getattr(scheduler, "weg2_dormant", False))
+    held_ids = {id(r) for r in _dormant_hold(scheduler)}
+    if dormant or any(id(s) in held_ids for s in sources):
+        st.n_defer_wake = getattr(st, "n_defer_wake", 0) + 1
     if _say(st.n_defer):
         logger.info(
-            "#TW TWIN-DEFER rid=%s len=%d shared=%d sources=%s (n=%d): store read "
-            "held until the sibling finished; admission skips it meanwhile, "
-            "nothing else waits.",
+            "#TW TWIN-DEFER rid=%s len=%d shared=%d sources=%s just_finished=%s p_dormant=%d "
+            "sources_in_hold=%s (n=%d): store read held until the sibling finished and its "
+            "publish settled; admission skips it meanwhile, nothing else waits.",
             rid[:12], len(_ids(req)), shared,
-            [str(getattr(s, "rid", "?"))[:12] for s in sources], st.n_defer,
+            [str(getattr(s, "rid", "?"))[:12] for s in sources],
+            [str(getattr(r, "rid", "?"))[:12] for r, _p, _t in recent], int(dormant),
+            [str(getattr(s, "rid", "?"))[:12] for s in sources if id(s) in held_ids], st.n_defer,
         )
     return True
 
@@ -269,6 +574,17 @@ def is_deferred(scheduler, rid: str) -> bool:
     return bool(st) and str(rid) in st.waits
 
 
+def tick(scheduler) -> None:
+    """Top of EVERY PP0 pass (``weg2_store_told.pp0_publish``, before any early
+    return): count the pass and note who finished since the last one (#56).
+    Nothing when the switch is off; O(in-flight) host bookkeeping otherwise."""
+    st = state(scheduler)
+    if not st:
+        return
+    st.passes += 1
+    _refresh_recent(st, scheduler, _now())
+
+
 def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
     """Top of a PP0 pass: the held twins whose wait is over, as
     ``(req, twin)``; ``twin`` False = the Frist fired (ordinary request).
@@ -276,15 +592,29 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
     st = getattr(scheduler, _ATTR, None)
     if not st:
         return []
-    st.passes += 1
+    now = _now()
     if not st.waits:
         return []
-    now = _now()
     out: List[Tuple[Any, bool]] = []
     for rid in list(st.waits):
         w = st.waits[rid]
         if rid not in queued:
             st.waits.pop(rid, None)
+            continue
+        # Rule 4: drop the sources that turned out to bring nothing (their
+        # start depth is known now); none left -> no reason to wait.
+        _before = list(w.sources)
+        w.sources = [
+            s for s in w.sources
+            if _keeps(st, s, w.shared_by.get(_rid(s), w.shared)) is not False
+        ]
+        if not w.sources:
+            st.waits.pop(rid, None)
+            if st.promise:
+                _say_no_commit(st, rid, w.shared_by, _before, "release")
+            else:
+                _say_no_gain(st, rid, w.shared_by, "release")
+            out.append((w.req, False))
             continue
         pending = [
             s for s in w.sources
@@ -293,11 +623,7 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
         if not pending and w.done_pass is None:
             w.done_pass, w.done_t = st.passes, now
         reason = None
-        if (
-            not pending
-            and st.passes - w.done_pass >= st.settle_passes
-            and now - w.done_t >= st.settle_s
-        ):
+        if not pending and _settled(st, w.done_pass, w.done_t, now):
             reason = REL_PUBLISHED
         elif now - w.since >= st.wait_s:
             reason = REL_DEADLINE

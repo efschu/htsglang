@@ -338,6 +338,113 @@ def checkpoint_tensors(shard: str, selector: Callable[[str], bool]) -> List[Ckpt
     return out
 
 
+# ---------------------------------------------------------------------------
+# VISION-LOAD-WARM-1002: the tower's index once per rank, the extent warmed
+# ---------------------------------------------------------------------------
+# y7t P log 15:05:22 (NF, fc03626e0e): ``W102 ... legs_ms=(build 47, load 493,
+# encode 1317, attach 0, teardown 398)``; y7o 14:0x: load 584 / 508. Measured
+# on CPU at the desk (02.10., same checkpoint, same ZFS): find_tower_shard
+# 94-104 ms (the 47-shard index JSON, parsed on EVERY stage), the header 10 ms,
+# the 856 MiB extent O_DIRECT 270 ms, from a warm ARC 87-100 ms, a cold
+# RWF_NOWAIT read EAGAIN in ~0 ms, a cold buffered read 4 threads 255-276 ms.
+
+_TOWER_INDEX: Dict[str, Tuple[str, Tuple[Any, ...], List["CkptTensor"]]] = {}
+_TOWER_INDEX_LOCK = threading.Lock()
+
+
+def _stat_key(*paths: str) -> Tuple[Any, ...]:
+    out: List[Any] = []
+    for p in paths:
+        st = os.stat(p)
+        out.extend((p, int(st.st_size), int(st.st_mtime_ns)))
+    return tuple(out)
+
+
+def tower_index(model_dir: str, find: Callable[[str], str],
+                selector: Callable[[str], bool]) -> Tuple[str, List["CkptTensor"], bool]:
+    """(shard, the tower's checkpoint tensors, from the cache?) -- parsed once
+    per process and model dir, re-parsed when the index file or the shard
+    changed on disk (size or mtime). ``find`` is ``find_tower_shard``."""
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    with _TOWER_INDEX_LOCK:
+        hit = _TOWER_INDEX.get(model_dir)
+    if hit is not None:
+        shard, key, tensors = hit
+        try:
+            if _stat_key(index, shard) == key:
+                return shard, tensors, True
+        except OSError:
+            pass
+    shard = find(model_dir)
+    tensors = checkpoint_tensors(shard, selector)
+    try:
+        key = _stat_key(index, shard)
+    except OSError:
+        return shard, tensors, False
+    with _TOWER_INDEX_LOCK:
+        _TOWER_INDEX[model_dir] = (shard, key, tensors)
+    return shard, tensors, False
+
+
+def tensors_extent(tensors: Sequence["CkptTensor"]) -> Tuple[int, int]:
+    """[lo, hi) of the tensors' bytes in their shard, lo on DIRECT_ALIGN."""
+    lo = min(t.file_offset for t in tensors) // DIRECT_ALIGN * DIRECT_ALIGN
+    hi = max(t.file_offset + t.nbytes for t in tensors)
+    return lo, hi
+
+
+#: the warm read: threads x chunk of transient host buffer (not pinned, not
+#: torch: an anonymous mmap per thread, unmapped when the thread ends)
+WARM_THREADS = 4
+WARM_CHUNK = 8 * MIB
+
+
+def warm_host_cache(path: str, lo: int, hi: int, threads: int = WARM_THREADS,
+                    chunk: int = WARM_CHUNK) -> int:
+    """VISION-LOAD-WARM-1002: read ``path[lo:hi)`` BUFFERED so the host cache
+    (ZFS ARC on this rig; the page cache elsewhere) holds it, ``threads``
+    readers interleaved by ``chunk``. The bytes read land in a throwaway
+    buffer; nothing is kept in this process. Returns the bytes read."""
+    import mmap
+
+    total = [0] * max(1, int(threads))
+    errs: List[BaseException] = []
+
+    def _one(j: int) -> None:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError as exc:
+            errs.append(exc)
+            return
+        buf = mmap.mmap(-1, chunk)
+        try:
+            mv = memoryview(buf)
+            pos = lo + j * chunk
+            while pos < hi:
+                want = min(chunk, hi - pos)
+                got = os.preadv(fd, [mv[:want]], pos)
+                if got <= 0:
+                    break
+                total[j] += got
+                pos += len(total) * chunk
+            mv.release()
+        except OSError as exc:
+            errs.append(exc)
+        finally:
+            os.close(fd)
+            buf.close()
+
+    ths = [threading.Thread(target=_one, args=(j,), name=f"weg2-vision-warm-{j}", daemon=True)
+           for j in range(len(total))]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    if errs and not sum(total):
+        raise errs[0]
+    return sum(total)
+
+
 def _alloc_bounce(nbytes: int, pinned: bool) -> torch.Tensor:
     """A bounce buffer whose ADDRESS is ``DIRECT_ALIGN``-aligned (O_DIRECT
     needs it; cudaHostAlloc is page-aligned anyway, a plain CPU tensor is
@@ -368,11 +475,31 @@ class DirectReadReport:
     direct: bool = False
     pinned: bool = False
     host_cache_emptied: bool = False
+    #: VISION-LOAD-WARM-1002: bytes / chunks served from the host cache (ZFS
+    #: ARC / page cache) by a ``RWF_NOWAIT`` read instead of the O_DIRECT one
+    cached_bytes: int = 0
+    cached_chunks: int = 0
+
+
+def _read_cached(fd: int, view: memoryview, pos: int, need: int) -> int:
+    """VISION-LOAD-WARM-1002: one chunk from the host cache ONLY (``RWF_NOWAIT``:
+    the kernel answers from ARC / page cache or refuses with EAGAIN, it never
+    goes to the disk). Returns the bytes read, 0 when the chunk is not wholly
+    cached (or the flag is unsupported) -- the caller then reads it O_DIRECT."""
+    flag = getattr(os, "RWF_NOWAIT", None)
+    if flag is None:
+        return 0
+    try:
+        got = os.preadv(fd, [view], pos, flag)
+    except OSError:
+        return 0
+    return got if got >= need else 0
 
 
 def read_into(shard: str, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
               bounce_bytes: int = BOUNCE_BYTES, bounce_count: int = BOUNCE_COUNT,
-              stream: Optional[Any] = None, direct: bool = True) -> DirectReadReport:
+              stream: Optional[Any] = None, direct: bool = True,
+              cached_first: bool = False) -> DirectReadReport:
     """Read the planned checkpoint tensors straight into their destination
     tensors (the slab views), through ``bounce_count`` bounce buffers.
 
@@ -389,6 +516,14 @@ def read_into(shard: str, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
     tower extent, which refuses O_DIRECT by construction; it is opened
     buffered on purpose and without the fallback warning, and the report
     says ``direct=False``.
+
+    ``cached_first`` (VISION-LOAD-WARM-1002, direct reads only): each chunk is
+    first asked of the host cache with ``RWF_NOWAIT`` through a second,
+    buffered fd -- the front warms ARC when an image request arrives
+    (``front_vision_warm``) -- and only a chunk the cache does not hold
+    whole is read O_DIRECT. Measured on the rig's ZFS (CPU, 02.10.): the
+    856 MiB NF tower extent O_DIRECT 270 ms, from a warm ARC 87-100 ms; a
+    cold chunk answers EAGAIN in microseconds.
     """
     rep = DirectReadReport()
     if not plan:
@@ -410,6 +545,7 @@ def read_into(shard: str, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
         fd, rep.direct = _open_direct(shard)
     else:
         fd, rep.direct = os.open(shard, os.O_RDONLY), False
+    cfd = os.open(shard, os.O_RDONLY) if (cached_first and rep.direct) else None
     ordered = sorted(plan, key=lambda p: p[0].file_offset)
     try:
         pos, i = start, 0
@@ -422,7 +558,16 @@ def read_into(shard: str, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
                 want = (want + DIRECT_ALIGN - 1) // DIRECT_ALIGN * DIRECT_ALIGN
                 want = min(want, (size - pos + DIRECT_ALIGN - 1) // DIRECT_ALIGN * DIRECT_ALIGN)
             view = memoryview(bufs[slot].numpy())[:want]
-            got = os.preadv(fd, [view], pos)
+            got = (_read_cached(cfd, view, pos, min(want, end - pos))
+                   if cfd is not None else 0)
+            if got > 0:
+                if got < want and pos + got < end:
+                    got = 0  # never leaves an unaligned position for O_DIRECT
+                else:
+                    rep.cached_bytes += got
+                    rep.cached_chunks += 1
+            if got <= 0:
+                got = os.preadv(fd, [view], pos)
             if got <= 0:
                 raise VisionRankStageRefused(f"{shard}: read returned {got} at {pos}")
             chunk_end = pos + got
@@ -448,6 +593,8 @@ def read_into(shard: str, plan: Sequence[Tuple[CkptTensor, torch.Tensor]], *,
             i += 1
     finally:
         os.close(fd)
+        if cfd is not None:
+            os.close(cfd)
         for ev in events:
             if ev is not None:
                 ev.synchronize()

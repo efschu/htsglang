@@ -185,8 +185,8 @@ def test_dry_run_of_the_x177_form_for_one_to_six_seats():
 
     x177 = table([118, 48, 48])
     assert [r.max_rows for r in x177] == [
-        (136, 140, 141), (133, 140, 141), (130, 140, 141),
-        (127, 140, 141), (123, 140, 141), (120, 140, 141)]
+        (136, 142, 143), (133, 142, 143), (130, 142, 143),
+        (127, 142, 143), (123, 142, 143), (120, 142, 143)]  # #239 S0: Worker ohne QSA-Schluessel (768 B/Token), +192 MiB je Worker
     assert [r.waves_given for r in x177][1:] == [(1, 2, 2)] + [(2, 2, 2)] * 4
     assert x177[5].host_mamba_mib == pytest.approx(2134.5)
     assert x177[5].host_spec_mib == pytest.approx(133.9)

@@ -111,6 +111,21 @@ class TheDefaultIsTheUnchangedPath(_EnvCase):
 
 
 class TheDrainReportsWhatTheGroupAgreed(_EnvCase):
+    """The unbudgeted drain ("0": SGLANG_HICACHE_DRAIN_BUDGET is on by default
+    since 29.09.; the budgeted counts are test_hicache_drain_budget_27b's)."""
+
+    def setUp(self):
+        super().setUp()
+        self._budget = os.environ.get("SGLANG_HICACHE_DRAIN_BUDGET")
+        os.environ["SGLANG_HICACHE_DRAIN_BUDGET"] = "0"
+
+    def tearDown(self):
+        if self._budget is None:
+            os.environ.pop("SGLANG_HICACHE_DRAIN_BUDGET", None)
+        else:
+            os.environ["SGLANG_HICACHE_DRAIN_BUDGET"] = self._budget
+        super().tearDown()
+
     def _cc(self):
         return types.SimpleNamespace(prefetch_revoke_queue=Queue(), ack_backup_queue=Queue(),
                                      host_mem_release_queue=Queue(),

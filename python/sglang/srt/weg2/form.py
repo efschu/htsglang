@@ -27,7 +27,8 @@ typed twice):
 ``draft``    dflash | mtp | none    -- ``--spec-form`` (DFLASH | NEXTN)
 ``p_draft``  compute | cold | none  -- ``--draft-kv-on-p`` x ``--dflash-produce-on-p``
                                        x ``--weg2-disable-hicache``
-``kv``       paged_dcp | qsa_forma  -- Form A (a ``worker`` rank role on D)
+``kv``       paged_dcp | qsa_forma | qsa_forma_dcp -- Form A (a ``worker`` rank role on D);
+                                       _dcp: + ``--d-kv-token-cut`` (#239)
 ``flip``     family | resident      -- ``--flip-weights``
 ``vision``   off | resident | transient -- ``--weg2-vision``
 
@@ -78,7 +79,7 @@ AXIS_VALUES: Dict[str, Tuple[str, ...]] = {
     "experts": ("none", "resident", "offload"),
     "draft": ("dflash", "mtp", "none"),
     "p_draft": ("compute", "cold", "none"),
-    "kv": ("paged_dcp", "qsa_forma"),
+    "kv": ("paged_dcp", "qsa_forma", "qsa_forma_dcp"),
     "flip": ("family", "resident"),
     "vision": ("off", "resident", "transient"),
 }
@@ -157,18 +158,24 @@ END_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
 MAMBA_ANCHOR_SWITCHES: Dict[str, Dict[str, object]] = {
     "deepest": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": -1,
                 "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 0,
-                "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0},
+                "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0,
+                "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": False},
     # UNIFY S7/S8: the 27B mechanism is in the tree now (34965fc3fa: group P
     # anchors every 4096 tokens whatever the chunk, at most 4 per path) -- the
     # profile carries the 27B arm's values (docker 27b.env), an explicit env
-    # still wins. INNER_ANCHOR_RELEASE stays arm-set (it is also the S2 alias
-    # of the carrier hold).
+    # still wins. 29.09. (registry = the metal form): the INNER-anchor release
+    # half of SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE (c255e10ddb, group P only)
+    # is part of this form -- every 27B profile since 24.09. set it to 1
+    # (27b.env), the proof boot w109290020 ran it; its carrier-hold half is
+    # ModelProfile.mamba_carrier_hold (True on qwen27b for the same reason).
     "grid4096": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0,
                  "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 4096,
-                 "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 4},
+                 "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 4,
+                 "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": True},
     "none": {"SGLANG_WEG2_MAMBA_ARENA_RID_ANCHORS": 0,
              "SGLANG_WEG2_MAMBA_ANCHOR_INTERVAL": 0,
-             "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0},
+             "SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH": 0,
+             "SGLANG_WEG2_MAMBA_INNER_ANCHOR_RELEASE": False},
 }
 
 
@@ -234,6 +241,13 @@ class Chunk:
     #: "model-key" (NF H92: the *.pchunk.json whose model_key is this
     #: checkpoint's, weg2/p_chunk_nf.py)
     dynamic_source: str = "stage-model"
+    #: the registry FORMATS on which the launcher's DEFAULT for an unset
+    #: --p-chunk-policy is ``policy`` (launcher apply_profile_arg_defaults,
+    #: :func:`format_of`); every other checkpoint keeps the code default
+    #: ``fixed``. The launcher's --p-chunk-max/-model/-mscale defaults (2048 /
+    #: builtin-int8 / int8) ARE the INT8 measurement's form, so only INT8 takes
+    #: ``dynamic`` from here; NVFP4 states its own model/mscale in its profile.
+    default_formats: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -292,9 +306,41 @@ PREFIX_SWITCHES: Tuple[Tuple[str, str], ...] = (
     ("front_span_inflight", "SGLANG_WEG2_FRONT_SPAN_INFLIGHT"),  # #49
     ("told_group_fallback", "SGLANG_WEG2_TOLD_GROUP_FALLBACK"),  # PF
 )
+#: 27B row 24h (Agent HG, 26.09.): the three D host-gap levers, measured ONLY
+#: together (one registry field, ``d_hostgap_levers``). EARLY_DRAFT and
+#: ACCEPT_SYNC_FUSED act only in the DFLASH worker and only with the deferred
+#: length read (SGLANG_WEG2_D_DEFER_SEQ_LENS_CPU, inert without it);
+#: CANON_ORDER is the rank-bit-equality fix of the BAR1 oneshot reduction
+#: (rank-uniform: every rank of a group reads the same form).
+HG_SWITCHES: Tuple[str, ...] = (
+    "SGLANG_WEG2_D_EARLY_DRAFT",
+    "SGLANG_DFLASH_ACCEPT_SYNC_FUSED",
+    "SGLANG_BARLINK_BAR1_CANON_ORDER",
+)
 #: the one of them P and D must run identically (Befund M: the rendered
 #: prompt, hence the prefix keys, differ otherwise)
 PREFIX_SWITCH_P_EQ_D: Tuple[str, ...] = ("SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE",)
+#: SCHALTER-HALBPORT 1002 (/spinning/gpu-arb/docs/SCHALTER-HALBPORT-AUDIT-1002.md):
+#: env switches a row states as its DEFAULT, field -> the env name(s) it sets
+#: (:meth:`ModelProfile.switch_defaults`). A field left ``None`` states nothing:
+#: the switch keeps the code default (or what another field derives, e.g. the
+#: HG bundle for CANON_ORDER) and the row's :data:`PROFILE_SWITCH_DEFAULTS`
+#: carry no key for it -- the qwen27b row states none of them and stays byte-
+#: identical. The readers take the row's value when the env is unset or blank
+#: (an explicit value always wins), on P, D and the front alike (all three
+#: carry the published form).
+STATED_SWITCHES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("p_anchor_presence", ("SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE",)),
+    ("admission_wedge_recovery_s", ("SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS",)),
+    ("hicache_load_async_index", ("SGLANG_HICACHE_LOAD_ASYNC_INDEX",)),
+    ("vision_flip_urgent", ("SGLANG_WEG2_VISION_FLIP_URGENT",)),
+    ("bar1_canon_order", ("SGLANG_BARLINK_BAR1_CANON_ORDER",)),
+    ("vram_peak_fast_read", ("SGLANG_VRAM_PEAK_FAST_READ",)),
+    ("front_dc_off_path", ("SGLANG_WEG2_DC_OFF_PATH",)),
+    ("front_quiesce_fast", ("SGLANG_WEG2_QUIESCE_FAST",)),
+    ("front_ctl_kick", ("SGLANG_WEG2_CTL_KICK_ARRIVAL", "SGLANG_WEG2_CTL_KICK_AFTER_FLIP")),
+    ("census_o1_evict", ("SGLANG_WEG2_CENSUS_O1_EVICT",)),
+)
 
 
 @dataclass(frozen=True)
@@ -347,8 +393,8 @@ class ModelProfile:
     #: 27B #49 agent span on the front (SGLANG_WEG2_ENABLE_AGENT_SPAN, NF P49
     #: c1988ff84f): tools priced first, a D serve holds its prompt_tokens for
     #: its epoch, prefix priced in measured tokens. Operator 26.09.: the 27B
-    #: line ran it unswitched since RC9 (S7c); NF off until the NF seat
-    #: releases it with a boot tag.
+    #: line ran it unswitched since RC9 (S7c); NF released 02.10. by the NF
+    #: seat (X-CREDIT-1002, see the nextflash row).
     agent_span: bool
     #: NF H91 STANDARD FORM (user design 25.09.; NF H91b/c/c2/d, H95 B/c):
     #: the front's phase policy (P phase cap 6 + overlap plan against P's pool,
@@ -401,6 +447,26 @@ class ModelProfile:
     #: the 27B census (weg2xsn246: 1622 MiB on the 5090) is below every 27B D
     #: residue record (2074-2150 MiB), so taking it would under-reserve D.
     d_residue_census: bool = False
+    #: D-EXPECT (29.09.): group D's EXPECTATION budget (map pass, dry pass,
+    #: early D start -- all before P's first sleep) prices ``dormant_other``
+    #: from group P's MEASURED dormant residue (the per-card maximum over the
+    #: newest same-identity P records, ``launcher.p_dormant_from_records``)
+    #: instead of the legacy term ``dc_expect_d + P_WINDOWS_MIB - D_WINDOWS_MIB``
+    #: (D's own reserve standing in for P's). Its own switch, NOT
+    #: ``d_residue_census``: that one answers the RESERVE question (D's census
+    #: vs the weg2xsn14 constant), this one only which residue stands for P
+    #: before P has slept -- the real pass after P's sleep charges the
+    #: launcher's own reading of that same residue on both rows. 27B: the
+    #: legacy term booked ~2.1 GiB on the 5090 against a measured P residue of
+    #: 1104-1240 MiB (dkr27b 28./29.09.), i.e. an early D planned from it
+    #: would carry ~1 GiB less KV than the serial one.
+    d_expect_from_p_records: bool = False
+    #: BOOTZEIT 3: ``--weg2-d-early-start auto`` arms the early D start on this
+    #: profile. Only after a metal proof of the early start ON THIS PROFILE
+    #: (NF: dearly z30x2 424346f693, serving 205 s vs 226 s, needle MATCH,
+    #: 23c84bbe85). An explicit ``on`` needs only ``d_expect_from_p_records``
+    #: (W185), so the proof boot can be run.
+    d_early_start_proven: bool = False
     #: NF H92c: group P's mamba pool in the P pool model = the
     #: --max-mamba-cache-size P's argv states (what the runtime allocates),
     #: instead of the demand formula ceil(p_bs x 2 x 1.25). Operator rule
@@ -415,18 +481,20 @@ class ModelProfile:
     #: H91b flip park, POST /weg2/park_running) and the front flips to P; the
     #: parked ones resume first after the flip back. Only the FLIP park -- the
     #: pressure park, D seats and the MTP draft carry stay with
-    #: ``standard_form``. qwen27b off until a metal boot measures it (then the
-    #: operator turns the row on); nextflash off (its wait bound is the NF
-    #: seat's). Switch SGLANG_WEG2_D_PARK_IMMEDIATE (explicit value wins).
+    #: ``standard_form``. ON on both rows (operator 28.09.; qwen27b measured
+    #: 27.09. under agent load, nextflash already parks through its standard
+    #: form -- the immediate trigger comes on top of its 60 s wait bound).
+    #: Switch SGLANG_WEG2_D_PARK_IMMEDIATE (explicit value wins).
     d_park_immediate: bool = False
     #: X-EXACT (user decision 26.09. ~19:00Z, memory d2p-sofort-flippen-und-
     #: x-exakt-0926): the front prices a request's PENDING tokens exactly --
     #: the group's own tokenizer and chat template at the front, minus the
     #: MEASURED cached-on-D token prefix (weg2/front_tokens.py); X holds
     #: exactly for that count, no 1.3*X band. Off = the chars/3 pricing byte
-    #: for byte. Both rows off until an agent-load boot has measured it
-    #: (X-EXACT-ERR / X-EXACT-TOKENS); then the operator turns the row on.
-    #: Switch SGLANG_WEG2_FRONT_EXACT_TOKENS (explicit value wins).
+    #: for byte. Both rows were off until an agent-load boot had measured it
+    #: (X-EXACT-ERR / X-EXACT-TOKENS): nextflash on since V1 (27.09.), qwen27b
+    #: on since w109290020 (29.09.). Switch SGLANG_WEG2_FRONT_EXACT_TOKENS
+    #: (explicit value wins).
     front_exact_tokens: bool = False
     #: rc12b D TP0 OOM (27.09. 00:26:34Z): the D budget starts at NVML total
     #: and never took the driver carve (Card.reserved_mib, 519 MiB on the
@@ -445,6 +513,106 @@ class ModelProfile:
     #: for no measured need; the 5090 alone costs ~0.3 % (W55: cut 552 MiB ->
     #: world_pool 559232 -> 557472).
     driver_carve_min_total_mib: int = 0
+    #: Fix B (weg2/p_row_authority.py): SGLANG_WEG2_P_ROW_AUTHORITY, the #631
+    #: row form on group P (effective on pp>1 only). Operator 27.09.: the
+    #: default turns only after a clean metal proof under agent load -- met by
+    #: w109290020 (29.09.), qwen27b on since; nextflash off. An explicit env
+    #: wins (=0 turns the 27B row off).
+    p_row_authority: bool = False
+    #: VRAM-GRUNDGESETZ (user 19.09. / 29.09.: no reserve, only measured
+    #: transients; desk/27b-no-reserve-0929, weg2/budget_rest.py): group D's
+    #: budget books the MEASURED awake rest ``D_AWAKE_REST_BOOKED_MIB`` (max
+    #: over the newest boots of the form) INSTEAD of corridor floor + user
+    #: reserve + awake_overshoot 404 + D_OVERSHOOT_MIB. A card the record does
+    #: not price keeps those terms, named UNMEASURED on its budget line.
+    #: qwen27b on (record of the eight newest row-authority boots); nextflash
+    #: off -- it prices D's awake excess as D_AWAKE_REST_MIB (form-relative,
+    #: rc12c) and its reserve is 0 already. SGLANG_WEG2_BUDGET_REST_RECORD=0
+    #: turns it off (byte-identical budgets).
+    budget_rest_from_records: bool = False
+    #: WEG2-ALLOC-OVERHANG (desk/27b-d-alloc-overhang-0929) on P0 (5f33ec18836a,
+    #: weg2/torch_cache_cap.py): the row's default for SGLANG_WEG2_TORCH_CACHE_CAP
+    #: in --env-d (an explicit --env-d value wins, =0 turns it off). Armed on a
+    #: profile that carries ``D_TORCH_CAP_OTHER_MIB`` and
+    #: ``D_AWAKE_REST_CAPPED_MIB`` (weg2/budget_rest.py --capped), the D budget
+    #: books the CAPPED rest (non-torch + allocation overhang + kept cache)
+    #: instead of ``D_AWAKE_REST_BOOKED_MIB`` -- the general allocator cache
+    #: (897/944/1122 MiB at the tightest instants) stops being a post and goes
+    #: to the KV pool -- and each D rank caps torch at the physical line
+    #: ``budget + rest - OTHER``. qwen27b: OFF until the measurement cell
+    #: (Leistungsschalter rule 29.09.: default AN after the metal proof, in the
+    #: same commit as the proof); nextflash off (its verdict prices the cap).
+    torch_cache_cap: bool = False
+    #: 27B row 24h (HG): :data:`HG_SWITCHES` on as ONE bundle -- they were
+    #: measured only together: dkr27bint8dhgbar1dhg109261456 against
+    #: dkr27bbar1i8h109261444 (rc9dwin bfc6bd87e2), step time better at all 24
+    #: points (10k warm code bs1 -2.9 %, bs2 -2.6 %, prose bs1 -4.4 %, bs2
+    #: -4.2 %; 240k -3.4/-2.3 %), needle MATCH. qwen27b on since the user rule
+    #: of 29.09. (proven on metal -> default on in the code); nextflash off:
+    #: its D is MTP (EARLY_DRAFT/ACCEPT_SYNC_FUSED never act there) and
+    #: CANON_ORDER would change its BAR1 reduction order unproven. An
+    #: explicitly set env wins per switch.
+    d_hostgap_levers: bool = False
+    #: 27B row 24b: --d-token-placement (weg2/d_token_placement.py) -- where
+    #: group D's NEW KV tokens land. The launcher's DEFAULT for an unset flag
+    #: on a checkpoint whose registry format is in ``d_token_placement_formats``
+    #: (launcher apply_profile_arg_defaults, :func:`format_of`); every other
+    #: format keeps the code default ``capacity``. qwen27b bandwidth on INT8:
+    #: rc9meas INT8 with R, depth gain -1.1 ... -3.1 % at 128k/240k against the
+    #: baseline (i8rt dkr27bint8drtbar109261117 vs i8h dkr27bbar1mwh09261051);
+    #: NVFP4 +0.2 ... -0.8 % (no gain: stays capacity); FP8/GGUF unmeasured.
+    #: nextflash capacity (the launcher refuses bandwidth for NF).
+    d_token_placement: str = "capacity"
+    d_token_placement_formats: Tuple[str, ...] = ()
+    #: LEISTUNGSSCHALTER (user rule 29.09. ~10:15Z: proven on metal -> default
+    #: on in the code; "Profilzeile ist kein Ersatz"): per-GROUP rank switches
+    #: whose value differs between P and D, or that are sizes, with the value
+    #: the metal ran. The launcher writes each one into ``--env-p`` /
+    #: ``--env-d`` unless that group's env or the launcher's own environment
+    #: already states it (an explicit value always wins; launcher
+    #: ``apply_profile_group_switch_defaults``), so the D solve and the ranks
+    #: read ONE value -- the torch_cache_cap / H95 pattern. {} = none (the
+    #: qwen27b row: its groups stay byte-identical).
+    group_switch_defaults: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    #: #239 --d-kv-token-cut: the launcher's DEFAULT for an unset flag on this
+    #: row (launcher ``apply_profile_d_kv_token_cut_default``, applied before
+    #: the form is resolved, and only where the boot can run it: Form A worker
+    #: roles on D, no other --form-kv stated, a flip boot with a host tier).
+    #: ``off`` = the code default (qwen27b).
+    d_kv_token_cut: str = "off"
+    #: SCHALTER-HALBPORT 1002: the row's ``vision`` is the launcher's DEFAULT for
+    #: an unset ``--weg2-vision`` (``launcher.apply_profile_vision_default``,
+    #: before the form is resolved). nextflash on: every NF boot runs
+    #: ``transient`` (nf-int4.env:229). qwen27b off: its profiles state the flag
+    #: (27b.env transient, 27b-gguf off); the row stays byte-identical.
+    vision_arg_default: bool = False
+    #: SCHALTER-HALBPORT 1002, :data:`STATED_SWITCHES` (``None`` = not stated by
+    #: this row, the code default stands):
+    #: K1 SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE (front) -- 'WEG2 P-ANCHOR-PRESENCE'.
+    p_anchor_presence: Optional[bool] = None
+    #: SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS (ranks) -- 'ADMISSION-WEDGE
+    #: recovery armed after 2.0s'.
+    admission_wedge_recovery_s: Optional[float] = None
+    #: SGLANG_HICACHE_LOAD_ASYNC_INDEX (P and D ranks) -- 'HICACHE-LOAD-ASYNC-INDEX
+    #: armed', WEG2-START-LOADING mamba.idx=0.
+    hicache_load_async_index: Optional[bool] = None
+    #: SGLANG_WEG2_VISION_FLIP_URGENT (front) -- 'WEG2 VISION-FLIP-URGENT on'.
+    vision_flip_urgent: Optional[bool] = None
+    #: SGLANG_BARLINK_BAR1_CANON_ORDER alone (ranks), over the value the HG
+    #: bundle derives -- 'oneshot all_reduce in canonical rank order'.
+    bar1_canon_order: Optional[bool] = None
+    #: SGLANG_VRAM_PEAK_FAST_READ (ranks) -- 'VRAM-PEAK-FAST-READ armed'.
+    vram_peak_fast_read: Optional[bool] = None
+    #: SGLANG_WEG2_DC_OFF_PATH (front) -- 'WEG2-FLIPFAST ... dc_off_path=on',
+    #: 'WEG2-DC-OFFPATH epoch='.
+    front_dc_off_path: Optional[bool] = None
+    #: SGLANG_WEG2_QUIESCE_FAST (front and P ranks) -- 'WEG2-QUIESCE-FAST group='.
+    front_quiesce_fast: Optional[bool] = None
+    #: SGLANG_WEG2_CTL_KICK_ARRIVAL + _AFTER_FLIP (front) -- 'WEG2-FLIPFAST
+    #: kick_arrival=on kick_after_flip=on', 'WEG2-FLIPFAST kick why='.
+    front_ctl_kick: Optional[bool] = None
+    #: SGLANG_WEG2_CENSUS_O1_EVICT (ranks) -- 'KR CENSUS-O1-EVICT armed'.
+    census_o1_evict: Optional[bool] = None
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -465,7 +633,17 @@ class ModelProfile:
         for fld, env_name in PREFIX_SWITCHES:
             out[env_name] = bool(getattr(self, fld))
         out["SGLANG_WEG2_D_PARK_IMMEDIATE"] = bool(self.d_park_immediate)
+        out["SGLANG_WEG2_P_ROW_AUTHORITY"] = bool(self.p_row_authority)
         out["SGLANG_WEG2_FRONT_EXACT_TOKENS"] = bool(self.front_exact_tokens)
+        for env_name in HG_SWITCHES:
+            out[env_name] = bool(self.d_hostgap_levers)
+        # SCHALTER-HALBPORT 1002: only what the row states (None adds no key).
+        for fld, env_names in STATED_SWITCHES:
+            val = getattr(self, fld)
+            if val is None:
+                continue
+            for env_name in env_names:
+                out[env_name] = val if isinstance(val, bool) else float(val)
         # NF R12: Form A groups exist only on a qsa_forma D (it also needs an
         # installed Form A role plan at run time).
         out["SGLANG_WEG2_ENABLE_FORM_A_HOST_SHADOW"] = self.d_layout == "qsa_forma"
@@ -509,6 +687,62 @@ _NEXTFLASH_CONSTANTS: Dict[str, Measured] = _constants_from_records(PROFILE_NEXT
 #: the rig's checkpoint directory (the registry's checkpoint/draft paths)
 _MC = "/spinning/llm_stuff/club-3090/models-cache/"
 
+#: LEISTUNGSSCHALTER NF class (a) (user rule 29.09. ~10:15Z, inventory
+#: /spinning/gpu-arb/docs/LEISTUNGSSCHALTER-INVENTAR-0929.md "(a) belegt"):
+#: per group, the value the running NF profile (nf-h91-dpr-sa-vis-adopt-st-cut-
+#: vsync-odx-2b-swr-e2cut-z30y2-arr-wre-ta-dh-ml-ef-rwf-pfo-pw-hc-tse-srw-tsw-
+#: dres.env) gave each group -- the row :attr:`ModelProfile.group_switch_defaults`
+#: of nextflash. Every reader below is an NF-only path (QSA attention, PLE,
+#: Form A, expert offload, the MTP tail hand-off) or reached only through this
+#: row; the qwen27b row carries none.
+#:   P_TAIL_FOLD (H63/H63d) x177 burst 22.80 s (x176 27.01 s, -16 %), P only.
+#:   TAIL_KEEP_MIB 512 (H63b) x177, P+D (the inventory names 512 for nextflash).
+#:   PLE_STATE_HANDOFF (H63c) x177 digest P==D installed=yes, P+D.
+#:   QSA_FP8_DECODE=ptx + QSA_ROWS_FUSED_EAGER (H65) x170 bit-identical, P 97k
+#:     25.37 s (x169 27.14 s), P only (as the arm ran).
+#:   FORCE_QSA_ROWS_CONFIG inf=64/8/2 (H65) x170 P only. D's arm line
+#:     (sm120:32=32/8/2,...,inf=64/8/2) IS the built-in sm120 table
+#:     (sparse_attn._SM120_ROWS_CONFIGS, H101) -- not repeated here.
+#:   PLE_STAGE_AUTONOMOUS/_BEHIND_REPLAY/_BONUS_EARLY + PLE decode pread
+#:     PROCS/THREADS 8 (H73) x176 code 121.6/130.1 tok/s (x172 104.5/114.6), D.
+#:   FORM_A_PLE_FULL_VOCAB (H69b) x172 PLE hit 2048/2048 (correctness), D.
+#:   UNEVEN_MOE_EXPERT_SHARD -- the NF form (F2, uneven experts), P+D.
+#:   HC_MIXER_INT8 (#46) census fn7l 1.19 GiB BF16 mixer per rank -> INT8, P+D.
+#:   WEIGHT_LOADER_COALESCE_MIB 32 z30o3 boot 280 s (z30n 300 s), P+D (only
+#:     the pread stream reads it).
+#:   D_PARK_END (F4) z30w-park flip time median 7.06 -> 5.13 s, D.
+#:   CUT_WORKER_END (F4b) z30u part A 2.01 s under the cut, D.
+_NF_LS_BOTH: Dict[str, str] = {
+    "SGLANG_WEG2_TAIL_KEEP_MIB": "512",
+    "SGLANG_WEG2_PLE_STATE_HANDOFF": "1",
+    "SGLANG_UNEVEN_MOE_EXPERT_SHARD": "1",
+    "SGLANG_HC_MIXER_INT8": "1",
+    "SGLANG_WEIGHT_LOADER_COALESCE_MIB": "32",
+}
+NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
+    "P": dict(_NF_LS_BOTH, **{
+        "SGLANG_WEG2_ENABLE_P_TAIL_FOLD": "1",
+        "SGLANG_FORCE_QSA_ROWS_CONFIG": "inf=64/8/2",
+        "SGLANG_WEG2_QSA_FP8_DECODE": "ptx",
+        "SGLANG_WEG2_QSA_ROWS_FUSED_EAGER": "1",
+    }),
+    "D": dict(_NF_LS_BOTH, **{
+        "SGLANG_WEG2_FORM_A_PLE_FULL_VOCAB": "1",
+        "SGLANG_WEG2_PLE_STAGE_BEHIND_REPLAY": "1",
+        "SGLANG_WEG2_PLE_STAGE_AUTONOMOUS": "1",
+        "SGLANG_WEG2_PLE_STAGE_BONUS_EARLY": "1",
+        "SGLANG_QWEN4_PLE_DECODE_PREAD_PROCS": "8",
+        "SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS": "8",
+        "SGLANG_WEG2_ENABLE_CUT_WORKER_END": "1",
+        "SGLANG_WEG2_ENABLE_D_PARK_END": "1",
+        # SCHALTER-HALBPORT 1002 (audit section 6): the row's store_short_tail
+        # is off, but every NF boot runs it on D (nf-int4.env NF_ENV_D_FORM) and
+        # off on P (0x W88 on NF-P in 10 boots: no need shown) -- per group here,
+        # so the profile line can go.
+        "SGLANG_WEG2_STORE_SHORT_TAIL": "1",
+    }),
+}
+
 
 PROFILES: Dict[str, ModelProfile] = {
     PROFILE_QWEN27B: ModelProfile(
@@ -539,10 +773,23 @@ PROFILES: Dict[str, ModelProfile] = {
         d_layout="paged_dcp",
         page_size=1,
         kv_dtype="auto",
-        chunk=Chunk(grid=0, policy="dynamic", model="builtin-int8", tokens=2048),
+        # P chunk policy dynamic as the launcher default on INT8 (user rule
+        # 29.09.; chunkab rc9j A fixed dkr27bbar1chunka09260010 vs B dynamic
+        # dkr27bint8chunkBbar109260034: 128k 36.59 -> 31.62 s (-13.6 %), 32k
+        # 4.68 -> 4.35 s, 2k/8k equal, needle 3/3 per step). FP8/GGUF
+        # unmeasured -> fixed; NVFP4 keeps its own profile flags.
+        chunk=Chunk(grid=0, policy="dynamic", model="builtin-int8", tokens=2048,
+                    default_formats=("int8",)),
         end_anchor="trim",
         mamba_anchor="grid4096",
-        mamba_carrier_hold=False,
+        # 29.09. (registry = the metal form, inventory 27B contradiction 1): the
+        # row said False ("the 27B A form: end anchors released at the reset"),
+        # but every 27B profile since 24.09. sets SGLANG_WEG2_MAMBA_INNER_ANCHOR_
+        # RELEASE=1 (27b.env), the environ.py alias that ARMS the hold -- so
+        # every 27B boot ran it, the agent-load proof w109290020 (bb82fbcb68,
+        # 0 tracebacks) and z30x2 included. The row now names that form; an
+        # explicit SGLANG_WEG2_ENABLE_MAMBA_CARRIER_HOLD / alias =0 still wins.
+        mamba_carrier_hold=True,
         # OPERATOR 26.09. (RM): on. Every 27B profile (27b.env and all derived
         # docker profiles) sets SGLANG_WEG2_DENSE_REPACK_OUTSIDE_POOL=1, the RC9
         # metal ran with it; the repack lands in the default pool since
@@ -598,16 +845,53 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=(),
         constants=_QWEN27B_CONSTANTS,
         d_residue_census=False,
-        # 27B park (user 26.09.): OFF until measured on the metal under agent
-        # load (profiles/27b-park-draft.env turns it on per env).
-        d_park_immediate=False,
-        # X-EXACT (user 26.09.): OFF until an agent-load boot measured it.
-        front_exact_tokens=False,
+        # D-EXPECT for the 27B (29.09.): P's measured residue, not the legacy
+        # term; the early start stays off under 'auto' until a 27B metal boot
+        # with an explicit '--weg2-d-early-start on' proved it.
+        d_expect_from_p_records=True,
+        d_early_start_proven=False,
+        # 27B park (user 26.09., memory d2p-sofort-flippen-und-x-exakt-0926:
+        # "D->P nicht warten, sofort flippen, laufende Decodes parken"): ON since
+        # the registry default (operator 28.09., after rc12z21 b1 stalled its
+        # D->P flip draining two decodes from 13:44:38). Measured on the metal
+        # under agent load: dkr27bparkodirectdraft 27.09. 09:57 (34 PARK-RUNNING
+        # immediate-over-x, 33 PARK-RESUME, 70 flips) and 12:26 (15/15, 33
+        # flips), needle 97k MATCH after the park round trips in both.
+        d_park_immediate=True,
+        # X-EXACT (user 26.09.): ON since the agent-load proof (user rule 29.09.
+        # ~10:15Z: proven on metal -> default on in the code). w109290020
+        # (bb82fbcb68, 29.09. 00:20-00:54Z, 30 min agent load): X-EXACT-TOKENS
+        # 108x match=1, 1x match=0 (a W50 midstream reroute, tokens_group >
+        # tokens_front expected there); chars/3 had over-priced dkr27brc10bar1
+        # agent09261821 by median +11.5 % (up to +60 %, c0347b7e4f).
+        front_exact_tokens=True,
         # 27B b1 death (27.09. 06:57:17Z): the D budget books the driver carve
         # (518 MiB, NVML reserved) -- on the 5090 only (32607 MiB board; the
         # 3080s are 20480), see driver_carve_min_total_mib.
         budget_charges_driver_carve=True,
         driver_carve_min_total_mib=32000,
+        # HG (row 24h): proven together in dhg09261456 -- see the field.
+        d_hostgap_levers=True,
+        # row 24b: bandwidth on INT8 only (rc9meas -1.1 ... -3.1 % in depth).
+        # --d-reshard stays off (wake-seg + drq: gain at 6 of 24 points, the
+        # drq preset has no A/B of its own -- inventory class b).
+        d_token_placement="bandwidth",
+        d_token_placement_formats=("int8",),
+        # Fix B (#631): the agent-load proof w109290020 (dkr27browauthority
+        # bar1w109290020, bb82fbcb68, 29.09. 00:20-00:54Z): K0 RowAuthority
+        # Incomplete/PpChainRecvStalled/proxy frame 0, SLOT DISAGREEMENT/W27/
+        # UNEXECUTABLE 0; K1 P-ROW-AUTHORITY armed 3, ROW-DELIVER 300, DISABLED
+        # 0; K2 P-ROW-COST PP2 plan_ms p50 1.7 / p90 6.3, drained = delivered =
+        # 840, vanish 0; K3 PACED-ADMIT 24. RISK: z30x2 died under it at the
+        # P->D flip (write-through drain); its fix 4e15b21564 awaits z30x3.
+        p_row_authority=True,
+        # VRAM-GRUNDGESETZ 29.09.: D books its measured awake rest
+        # (D_AWAKE_REST_BOOKED_MIB, 8 boots) instead of reserve + 404 + 489.
+        budget_rest_from_records=True,
+        # WEG2-ALLOC-OVERHANG 29.09.: P0 torch cache cap + capped rest. OFF
+        # until the measurement cell (27b-row-authority-p0, one boot); AN in
+        # the commit that carries its proof.
+        torch_cache_cap=False,
     ),
     PROFILE_NEXTFLASH: ModelProfile(
         id=PROFILE_NEXTFLASH,
@@ -617,7 +901,9 @@ PROFILES: Dict[str, ModelProfile] = {
             # Memory DRAFT-ZUORDNUNG: DFlash2 is the 27B's draft only, NF = MTP.
             "draft": ("mtp",),
             "p_draft": ("compute", "none"),
-            "kv": ("qsa_forma",),
+            # #239: the token-cut full-attention KV (release feature) is a
+            # value of this profile; it boots only with --d-kv-token-cut.
+            "kv": ("qsa_forma", "qsa_forma_dcp"),
         },
         arch="moe",
         experts=Experts(store="offload", swap="platztausch", store_dir="/mnt/nf-experts",
@@ -655,18 +941,48 @@ PROFILES: Dict[str, ModelProfile] = {
         store_short_tail=False,
         bigram_anchor_exact=True,
         warm_min_dwell=True,
-        # NF P49: off until the NF seat releases #49 with a boot tag
-        agent_span=False,
+        # NF P49: released by X-CREDIT-1002 (NF seat, 02.10.). Boot
+        # dkrnfint4bar1dauer10020634 (5b46b8842e, #49 off): a FINISHED D leg 2
+        # credited only its admission hit, so every agent follow-up kept the
+        # predecessor's delta as uncached -- weg2-26-45 credit 50688 (26-44's
+        # cached_tokens) pending 4582 > X=3647 -> LONG, P prefilled 1510 of a
+        # 53760 hit; 24-40 45824 / 4339 > 3602 -> LONG, P prefilled 2291. The
+        # premises hold on NF: the Flash-Next template renders <tools> first
+        # (chat_template.jinja:57-67), D sends weg2_resumable_depth on every
+        # finish (#59 RESUMABLE mode=form-a-dcp-min). Metal tag: the next NF
+        # boot on desk/nf-x-credit-inflight-1002.
+        agent_span=True,
         standard_form=True,
-        # RG 26.09.: off until the NF seat releases them with a boot tag (the
-        # NF group env stays byte-identical).
-        inline_system_in_place=False,
-        told_probe_tree_key=False,
-        told_paced=False,
-        p_twin_defer=False,
+        # NF-MZ (29.09., y3m boot ...dauer09292136, 375f44975e): released.
+        # Claude Code 2.1.280 sends role:"system" (api_system) messages
+        # mid-conversation -- mcp_instructions_delta + auto_mode arrive once
+        # the MCP servers are connected, i.e. right before turn 2. Hoisted
+        # into the head system turn they re-render every token behind the
+        # system text: SESSION-PREFIX weg2-2-8 common=3844 of 14970 and
+        # weg2-2-9 common=3861 of 18699 (= the head segment minus
+        # "<|im_end|>\n"; X-EXACT reused=11124/14836 = every later segment
+        # byte-equal), P cached 0 on both. Rendered in place, turn N stays a
+        # token prefix of turn N+1. P, D and the front take the row alike.
+        inline_system_in_place=True,
+        # NF-TK (HS 27.09., NF rc12t 09271756: 0 of 41 P legs cached -- every
+        # P read with loaded>0 was clamped to told=0 by "#1416 STORE-TOLD
+        # ANCHOR-CLAMP ... anchored=0", because with TK off the clamp hashed
+        # unigram ids while NF's MTP tree keys bigram -- the 27B #1416d class).
+        # TK only together with PACED (#211: TK alone = the single-phase
+        # follower busy-wait, -15 % PP0 prefill on rc11b) and TW; PF stays off.
+        # On the NF P cut PP0 carries the heaviest store share (7/12 KV slots,
+        # 61 % of the GDN blob), so a follower's read ends inside PP0's pacing
+        # window and the residual admission wait (#1400 STORE-TOLD WAITED)
+        # has no structural cause.
+        told_probe_tree_key=True,
+        told_paced=True,
+        p_twin_defer=True,
         front_span_inflight=False,
         told_group_fallback=False,
-        vision="off",
+        # SCHALTER-HALBPORT 1002 (audit section 6): every NF boot runs
+        # --weg2-vision transient (nf-int4.env:229); the row said off. It is the
+        # launcher default for an unset flag (vision_arg_default below).
+        vision="transient",
         context_tokens=262144,
         records=RecordKey(fields=("checkpoint", "form", "power_limit")),
         early_read_flags=False,
@@ -680,9 +996,16 @@ PROFILES: Dict[str, ModelProfile] = {
         prefill_transient_checkpoints=("Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist",),
         constants=_NEXTFLASH_CONSTANTS,
         d_residue_census=True,
+        # D-EXPECT 9f74489683 (was keyed on d_residue_census) and BOOTZEIT 3
+        # proven on metal (dearly z30x2 424346f693, 23c84bbe85): auto = on.
+        d_expect_from_p_records=True,
+        d_early_start_proven=True,
         p_mamba_slots_from_argv=True,
-        # NF keeps its H91 wait bound (standard_form); the NF seat decides.
-        d_park_immediate=False,
+        # User decision 26.09. ("Wartegrenze 0, sofort flippen + parken") holds for
+        # BOTH models (operator 28.09.): the immediate park fires at once for a
+        # queued request over X; the H91 60 s wait bound stays as the fallback for
+        # the rest. An explicit SGLANG_WEG2_D_PARK_IMMEDIATE=0 in a profile wins.
+        d_park_immediate=True,
         # X-EXACT (user 26.09., "gilt fuer 27B und NF"): ON with V1 (NF seat,
         # 27.09.) together with the D-side PLE pread gather (nf-h91-vis.env
         # NF_ENV_D_FORM). rc12g front log: chars/3 priced the uncached extent
@@ -694,6 +1017,50 @@ PROFILES: Dict[str, ModelProfile] = {
         front_exact_tokens=True,
         # rc12b OOM: the D budget books the driver carve (NF seat, 27.09.).
         budget_charges_driver_carve=True,
+        # LEISTUNGSSCHALTER NF (a) (LEISTUNGSSCHALTER-INVENTAR-0929.md): the
+        # values of the running profile nf-h91-...-tsw-dres (NF_ENV_P_FORM /
+        # NF_ENV_D_FORM / NF_ENV_D, _form), per group as they ran.
+        group_switch_defaults=NEXTFLASH_GROUP_SWITCH_DEFAULTS,
+        # #239 uneven-DCP-KV (user 28.09.: release feature): z30m-z30w and
+        # every NF flip boot since run --d-kv-token-cut owned (z30w 112 flips).
+        d_kv_token_cut="owned",
+        # SCHALTER-HALBPORT 1002 (NF seat, 02.10.; audit SCHALTER-HALBPORT-
+        # AUDIT-1002.md): switches NF ran only through profile lines, or not at
+        # all although nothing in NF's form argues against them. An explicit
+        # env still wins (=0 turns one off).
+        vision_arg_default=True,
+        # K1 (audit 2.2): built on NF evidence (a59c95ae36, z30u: 77 LONG
+        # follow-ups prefilled < 2k on P, 69 on exactly one P END-ANCHOR
+        # depth), released only on the 27B line (02adfaadee: z30y11-13, 0
+        # deaths, W50-REROUTE 0). Front-only; the credit is the max of the
+        # entry's readings (TokenSpans.record_store_anchor), not added to the
+        # d_inflight / d_served credit.
+        p_anchor_presence=True,
+        # audit 2.5: NF y6o ...10012132 D: 'ADMISSION-WEDGE ... NO first token
+        # for 121.0s', recovery only after the 60 s default on top of the
+        # 20 s alarm. 27B LS12 hauenh ran 2.0 (armed P3/D3, never fired).
+        admission_wedge_recovery_s=2.0,
+        # audit 2.6 + section 6: NF-D ran it (nf-int4.env NF_ENV_D_FORM,
+        # mamba.idx=0); NF-P 10020634 START-LOADING mamba.idx p90 795 ms, max
+        # 1034 ms, 31.6 s scheduler time per boot. Same bytes, same rows, same
+        # stream order -- only the host wait goes (arena_pool.load_index_async).
+        hicache_load_async_index=True,
+        # audit 2.7: NF boots --weg2-vision transient; a P-only request
+        # (image) satisfies the D->P flip-economics latch on its own.
+        vision_flip_urgent=True,
+        # audit 2.9: the BAR1 oneshot sums 0..R-1 on every rank (bit-equal
+        # ranks); same reads, no extra barrier (reduceNPhaseCanon). The other
+        # two HG switches stay off on NF (DFLASH worker only).
+        bar1_canon_order=True,
+        # audit 2.11: the allocator peak read without memory_stats()' flatten.
+        vram_peak_fast_read=True,
+        # audit section 6: NF ran these only through nf-int4.env _form lines
+        # (DC_OFF_PATH :270, QUIESCE_FAST :273, CTL_KICK_* :268-269,
+        # CENSUS_O1_EVICT :276, KR e17bd548b5).
+        front_dc_off_path=True,
+        front_quiesce_fast=True,
+        front_ctl_kick=True,
+        census_o1_evict=True,
     ),
 }
 
@@ -725,6 +1092,9 @@ PROFILE_EXPECT: Dict[str, Dict[str, Tuple[str, ...]]] = {
 #: :func:`publish_prefix_switches`).
 #: SGLANG_WEG2_D_PARK_IMMEDIATE (``d_park_immediate``, 27B park 26.09.).
 #: SGLANG_WEG2_FRONT_EXACT_TOKENS (``front_exact_tokens``, X-EXACT 26.09.).
+#: :data:`HG_SWITCHES` (``d_hostgap_levers``, 27B row 24h, on 29.09.).
+#: :data:`STATED_SWITCHES` (SCHALTER-HALBPORT 1002; only a row that states one
+#: carries its key -- nextflash).
 PROFILE_SWITCH_DEFAULTS: Dict[str, Dict[str, object]] = {
     pid: prof.switch_defaults() for pid, prof in PROFILES.items()
 }
@@ -888,7 +1258,7 @@ def _prefix_field(name: str) -> str:
 
 def _explicit_env(env: Mapping[str, str], name: str) -> Optional[str]:
     """The explicitly set value of ``name`` in ``env`` -- any spelling of its
-    rename family (name_compat: SGLANG_/FLLIPER_ ...) counts, the tree's own
+    rename family (name_compat: legacy and renamed env prefix ...) counts, the tree's own
     spelling first; ``None`` when unset or blank."""
     from sglang.srt.name_compat import canonical_env_name
 
@@ -1022,6 +1392,24 @@ def profile_switch_default(name: str, fallback, environ: Optional[Mapping[str, s
     if isinstance(fallback, int):
         return int(val)
     return val
+
+
+def format_of(profile: Optional[str], model: str) -> str:
+    """The registry FORMAT of checkpoint ``model`` under ``profile``'s row --
+    the format whose ``checkpoint`` has the same calibration identity
+    (:func:`model_key`, the directory / file name; the rig mounts every
+    checkpoint under the registry's path). ``""`` for an unknown profile or a
+    checkpoint the row does not list: a caller then keeps its code default
+    (the conservative direction -- a derivative or a new export never inherits
+    a best form measured on another checkpoint)."""
+    row = profile_row(profile)
+    key = model_key(model)
+    if row is None or not key:
+        return ""
+    for name, wf in row.formats.items():
+        if wf.checkpoint and model_key(wf.checkpoint) == key:
+            return name
+    return ""
 
 
 def current_profile(environ: Optional[Mapping[str, str]] = None) -> Optional[ModelProfile]:
@@ -1411,9 +1799,27 @@ def expert_evidence(
     return facts, offload
 
 
-def derive_kv(extra_d: Sequence[str]) -> Tuple[str, str]:
+#: #239: the launcher switch that cuts D's full-attention KV by tokens over
+#: the Form A ranks (``off`` | ``maxmin`` | a ratio vector).
+KV_TOKEN_CUT_OFF = "off"
+
+
+def derive_kv(extra_d: Sequence[str], token_cut: str = KV_TOKEN_CUT_OFF) -> Tuple[str, str]:
     roles = flag_values(extra_d, "--rank-role")
-    if roles and "worker" in [r.strip() for r in roles[-1].split(",")]:
+    form_a = bool(roles) and "worker" in [r.strip() for r in roles[-1].split(",")]
+    cut = str(token_cut or KV_TOKEN_CUT_OFF).strip()
+    if cut != KV_TOKEN_CUT_OFF:
+        if not form_a:
+            _refuse(
+                f"--d-kv-token-cut {cut} cuts the full-attention KV over the Form A "
+                "ranks (#239), but D states no worker rank role -- without Form A "
+                "the KV axis is paged_dcp and SGLANG_UNEVEN_DCP already splits it"
+            )
+        return "qsa_forma_dcp", (
+            f"--rank-role {roles[-1]} (extra_d) + --d-kv-token-cut {cut}: "
+            "Form A, full-attention KV cut by tokens (#239)"
+        )
+    if form_a:
         return "qsa_forma", f"--rank-role {roles[-1]} (extra_d): Form A"
     return "paged_dcp", "no worker rank role on D"
 
@@ -1621,7 +2027,8 @@ def resolve_form(
         # cold/compute half too.
         sources["p_draft"] = f"{sources['p_draft']}; {why}"
 
-    kv, kv_src = derive_kv(extra_d)
+    kv, kv_src = derive_kv(
+        extra_d, str(getattr(ns, "d_kv_token_cut", KV_TOKEN_CUT_OFF) or KV_TOKEN_CUT_OFF))
     sources["kv"] = kv_src
 
     flip = str(getattr(ns, "flip_weights", "family") or "family")
@@ -2069,6 +2476,20 @@ class CalibrationIdentity:
             except OSError:
                 return None
         return None
+
+    def head_unresolvable_line(self) -> Optional[str]:
+        """The loud line when the ``line`` term cannot read the tree's HEAD;
+        None when it can (or the term is not used). Without HEAD only the
+        declared line heads can prove a boot's commit, so every record measured
+        on a newer tip is silently priced as CONSTANT -- a git-archive dry-run
+        tree put 27B-P 1040 MiB low that way (29.09., z30j vs x27ra)."""
+        if not self.uses_line or _repo_head(self.repo):
+            return None
+        heads = ", ".join(h[:10] for h in self.line_heads) or "none"
+        return (f"RECORD-IDENTITY UNRESOLVABLE: tree {self.repo} has no readable git HEAD "
+                f"(no .git?) -- the line term proves only boots on the declared heads "
+                f"({heads}); every record measured on a newer commit falls to CONSTANT. "
+                f"Run on a git checkout of the tree.")
 
     def describe(self) -> str:
         parts = [f"checkpoint {model_key(self.model)}"]

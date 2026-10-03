@@ -48,6 +48,7 @@ import argparse
 import asyncio
 import collections
 import contextvars
+import functools
 import gc
 import hashlib
 import importlib
@@ -58,8 +59,9 @@ import re
 import statistics
 import subprocess
 import time
+import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 from aiohttp import (
     ClientConnectionError,
@@ -72,6 +74,38 @@ from aiohttp import (
 )
 
 from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xsn272
+
+
+# MM-XPRICE: front_tokens is imported lazily here as everywhere in this module
+def _ft_mm_expand(*args):
+    from sglang.srt.weg2.front_tokens import mm_expand
+
+    return mm_expand(*args)
+
+
+def _dt():
+    """PREFIX-DIVERGE-TEXT helpers (lazy, like front_tokens)."""
+    from sglang.srt.weg2 import front_diverge_text
+
+    return front_diverge_text
+
+
+def _ft_mm_d_cached(*args):
+    from sglang.srt.weg2.front_tokens import mm_d_cached
+
+    return mm_d_cached(*args)
+
+
+def _ft_mm_learn(*args):
+    from sglang.srt.weg2.front_tokens import mm_learn
+
+    return mm_learn(*args)
+
+
+def _FtCount(**kw):
+    from sglang.srt.weg2.front_tokens import Count
+
+    return Count(**kw)
 from sglang.srt.weg2.intake_stall import STALL_MARK as _INTAKE_STALL_MARK  # H91 part C
 
 #: weg2xsn291: the least a woken group keeps the cards even when fairness or
@@ -94,9 +128,20 @@ from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import idle_clock as _idle_clock_mod  # #55 F2: idle clock lock
 from sglang.srt.weg2 import prefill_clock  # UNIFY S4 (H85): D's prefill clock reader (stdlib only)
 from sglang.srt.weg2 import dp_wait as _dp_wait  # R28: DP-WAIT instrument
 from sglang.srt.weg2 import phase_policy  # H91 part C
+from sglang.srt.weg2 import front_gc_guard as _gcg  # GC-GUARD 02.10.
+from sglang.srt.weg2 import arrival_seat_rule as _asr  # ARRIVAL-SEAT (user 29.09.)
+from sglang.srt.weg2 import p_read_overlap as _ro  # RO: P computes while a store read runs
+from sglang.srt.weg2 import resume_via_p as _rvp  # RESUME-VIA-P
+from sglang.srt.weg2 import usage_true as _ut  # USAGE-TRUE: the client sees the prefill really computed
+from sglang.srt.weg2 import handoff_seam as _hs  # #243 seam: HANDOFF-LOST reroute + rid-end drop
+from sglang.srt.weg2 import session_trace as _st  # SESSION-TRACE: session hash + shared prefix
+# DASHBOARD-IPC 01.10. (stdlib only, imported HERE: no first import on the loop, weg2rc2)
+from sglang.srt.weg2 import front_requests as _frq  # front.flip / d_activity / ttft_by_via / request_done
+from sglang.srt.weg2 import front_metrics as _fmet  # weg2_req Influx push (TSDB-DELTA 1c, default off)
 
 logger = logging.getLogger("weg2.front")
 
@@ -136,10 +181,21 @@ X_EXACT_VERDICT_NOTE = ("; X-EXACT: uncached, est_prompt and carrier_est are the
 #: 3.5.4, the #111 link-seam bound reused).  No code reads it except the
 #: argparse default -- the runtime reads ``Front.drain_deadline_s``.
 DRAIN_DEADLINE_DEFAULT_S = 120.0
+#: y3k-korr 09292034: the park cause (and D reason) of a POST /weg2/flip from D
+MANUAL_FLIP_PARK_CAUSE = "manual-flip"
 #: Spec C10/K5: the recorded PRE-BARLINK break-even inputs (record 1l/1o
 #: weg2zr2 pair) that produce X's fallback.  Only the FRONT's default; the
 #: launcher recomputes from this boot's own lines and tells the front (C2).
 X_FALLBACK_TOKENS = 22000
+def x_k_flip_enabled() -> bool:
+    """SGLANG_WEG2_X_K_FLIP (X-K-FLIP, 30.09.): the flip price is amortised over
+    THIS flip's riders, not over the boot's mean P phase."""
+    try:
+        return bool(envs.SGLANG_WEG2_X_K_FLIP.get())
+    except Exception:  # noqa: BLE001 -- an unknown switch is off
+        return False
+
+
 def flip_price_ms(rec: dict, *, exclude_drain: bool) -> Tuple[float, float]:
     """27B DPWAIT (row 28): what one completed flip record costs as a round-trip price.
 
@@ -174,6 +230,22 @@ def quiesce_poll_s() -> Tuple[float, bool]:
     if not envs.SGLANG_WEG2_QUIESCE_FAST.get():
         return 0.05, False
     return max(1, int(envs.SGLANG_WEG2_QUIESCE_FAST_POLL_MS.get())) / 1000.0, True
+
+
+#: QUIESCE-PENDING (02.10.): the words of PP0's answer while its idle vote is
+#: on the ring (Scheduler.group_idle_verdict, #1268) -- undecided, not idle.
+QUIESCE_PENDING_MARK = "GROUP VERDICT PENDING"
+
+
+def quiesce_pending_poll_s(poll_s: float, fast: bool) -> Optional[float]:
+    """QUIESCE-PENDING: the re-poll interval after a PENDING answer, or None
+    (the poll interval stays). Armed only where PP0 never re-wants a lap still
+    on the ring (H111 fast form or SGLANG_WEG2_IDLE_VOTE_NO_REWANT), so a poll
+    during the lap reads it, never spoils it; never longer than ``poll_s``."""
+    ms = int(envs.SGLANG_WEG2_QUIESCE_PENDING_POLL_MS.get() or 0)
+    if ms <= 0 or not (fast or envs.SGLANG_WEG2_IDLE_VOTE_NO_REWANT.get()):
+        return None
+    return min(float(poll_s), ms / 1000.0)
 
 
 #: fnFL2 v22: how long the quiesce waits for /health_generate proxies the
@@ -474,9 +546,13 @@ def install_gc_pause_probe(threshold_ms: float = GC_PAUSE_LOG_MS) -> Callable[[s
             return
         ms = (time.perf_counter() - t0) * 1000.0
         if ms >= threshold_ms:
-            logger.warning("WEG2-FRONT GC-PAUSE generation=2 ms=%.0f collected=%s frozen=%d -- the event "
-                           "loop was held that long; a front whose module heap is frozen (H78) should "
-                           "not print this line", ms, info.get("collected"), gc.get_freeze_count())
+            # GC-GUARD: trigger=guard is the guard's own pass in a quiet moment;
+            # trigger=auto with the guard armed is a pass CPython (or a library's
+            # gc.collect()) started by itself -- the line to look at.
+            logger.warning("WEG2-FRONT GC-PAUSE generation=2 ms=%.0f collected=%s frozen=%d trigger=%s -- "
+                           "the event loop was held that long; a front whose module heap is frozen "
+                           "(H78) should not print this line", ms, info.get("collected"),
+                           gc.get_freeze_count(), "guard" if _gcg.guard_collecting() else "auto")
 
     gc.callbacks.append(_probe)
     return _probe
@@ -495,6 +571,19 @@ def record_identity_from_spec(spec: str):
 
     return _form.calibration_identity(
         kv["model"], kv["evidence"], _form.current_form(), repo=kv.get("repo", ""))
+
+
+def park_form_key() -> str:
+    """PARK-COLLECT-WINDOW: the round-trip record's key -- the published form's
+    checkpoint (its directory name) and residue axes, so a qwen27b boot and a
+    nextflash boot never seed each other's collect window; "" without a form."""
+    from sglang.srt.weg2 import form as _form
+
+    boot_form = _form.current_form()
+    if boot_form is None:
+        return ""
+    axes = ",".join(f"{a}={getattr(boot_form, a)}" for a in _form.RESIDUE_AXES)
+    return f"{_form.model_key(boot_form.model)}|{axes}"
 
 
 class SidecarView:
@@ -599,6 +688,101 @@ MIB = 1024 * 1024
 FLIP_LEG_FORM = "interleave"
 
 
+def anchors_lost(body: str) -> List[int]:
+    """ANCHOR-LOST: the Mamba-anchor depths D's sleep flush dropped, from
+    the release leg's answer (``anchors_lost``, weight_updater / io_struct).
+    [] when the answer carries none or is not this tree's JSON."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(payload, dict):
+        return []
+    out = []
+    for d in payload.get("anchors_lost") or ():
+        try:
+            if int(d) > 0:
+                out.append(int(d))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out))
+
+
+def retract_lost_anchors(spans: Any, depths: Sequence[int]) -> List[str]:
+    """ANCHOR-LOST: drop every presence entry whose credit stood on an
+    anchor D's sleep dropped -- its #59 depth cap (or, without a cap, its
+    measured ``cached_tokens``) is one of ``depths``. The KV of that prefix
+    comes back from the store after the wake, the anchor does not, and a
+    hybrid model resumes at an anchor only: kept, the entry routes the next
+    turn SHORT onto D, whose X-gate then refuses the whole prompt (bridge
+    f833 19:51:43 weg2-16-54: front price 2349, D's extent 38291, W31 ->
+    W50 reroute after a 17-s wait for a D seat). Works on :class:`SpanLRU`
+    and ``front_tokens.TokenSpans`` alike (``entries`` + ``depth_caps``).
+    Returns the retracted keys."""
+    lost = {int(d) for d in depths or () if int(d) > 0}
+    if not lost or spans is None:
+        return []
+    _drop_seq = getattr(spans, "drop_seq_depths", None)  # SEQ-HASH (02.10.)
+    if callable(_drop_seq):
+        _drop_seq(lost)
+    entries = getattr(spans, "entries", None)
+    caps = getattr(spans, "depth_caps", None)
+    if entries is None or caps is None:
+        return []
+    gone = []
+    raw = getattr(spans, "raw_depths", None) or {}
+    for key, entry in list(entries.items()):
+        cap = caps.get(key)
+        ct = int(entry[1]) if len(entry) > 1 else 0
+        # X-CREDIT-FINISHED-1002: a K2-clamped entry by D's unclamped depth too
+        if ((cap is not None and int(cap) in lost) or (cap is None and ct in lost)
+                or (raw.get(key) is not None and int(raw[key]) in lost)):
+            raw.pop(key, None)
+            entries.pop(key, None)
+            caps.pop(key, None)
+            unflag = getattr(spans, "_unflag_inflight", None)  # D-INFLIGHT
+            if unflag is not None:
+                unflag(key)
+            gone.append(key)
+    return gone
+
+
+#: PARK-HANDBACK: the reason of a held record the park hands back to P.
+PARK_HANDBACK_REASON = "park_handback"
+
+
+def park_held_rids(body: str) -> List[str]:
+    """D's park answer: the rids it holds UNSTARTED (``held``: queued, never
+    admitted -- no park site); [] when absent or unreadable."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return []
+    held = payload.get("held") if isinstance(payload, dict) else None
+    if not isinstance(held, list):
+        return []
+    return [str(r) for r in held if isinstance(r, str)]
+
+
+def park_resumable_depths(body: str) -> Dict[str, int]:
+    """#59b: ``{rid: depth}`` of D's park answer (``weg2_resumable_depth``,
+    http_server ``/weg2/park_running``); {} when absent or unreadable."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return {}
+    got = payload.get("weg2_resumable_depth") if isinstance(payload, dict) else None
+    if not isinstance(got, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for rid, d in got.items():
+        try:
+            out[str(rid)] = max(0, int(d))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
     """``(tags this group completed, the per-tag map, the critical-path note)``.
 
@@ -631,6 +815,39 @@ def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
         if isinstance(v, (list, tuple)) and len(v) >= 2
     }
     return sorted(clean), clean, str(crit)
+
+
+#: #1317c's progress read (``/get_server_info`` -> ``weg2_decode_progress``)
+#: had NO timeout of its own, only the shared session's 3600 s: in NF z30w-park
+#: the drain hung on a dead P ring inside it and a blind DEADMAN_FLIP_STALL
+#: (epoch 113) came instead of a named W3. A live group answers the read
+#: between two scheduler iterations, so one forward pass bounds it; the
+#: longest measured is a P 16k chunk on PP0, ~5.6 s (x135, #117). Twice that:
+#: a live P mid-chunk never trips it, a dead one is named within 12 s -- well
+#: inside the flip-stall watch. Not 2 s: that would stop a healthy P that is
+#: merely in its chunk.
+PROGRESS_READ_TIMEOUT_S = 12.0
+
+
+class Weg2ProgressUnreachable(Exception):
+    """The progress read of ``group`` got no answer within
+    :data:`PROGRESS_READ_TIMEOUT_S` -- a diagnosis, never retried."""
+
+    def __init__(self, group: str, url: str):
+        super().__init__(f"group {group} ({url}) no /get_server_info answer "
+                         f"within {PROGRESS_READ_TIMEOUT_S:.0f} s")
+        self.group = group
+        self.url = url
+
+
+def _loop_running() -> bool:
+    """W3-STOP: ``do_stop`` is called from the loop and from sync test
+    code; only inside a running loop is there a current task to spare."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 class Weg2Stop(Exception):
@@ -812,10 +1029,10 @@ def vision_flip_urgent(env=None) -> bool:
     serve (an image under ``--weg2-vision transient``, see ``Pending.p_only``)
     satisfies the D->P flip-economics latch on its own. Default off = the
     pre-xsn438 latch, under which such a request waits for X* of text or for
-    the fairness switch (weg2xsn438: 45 s)."""
-    src = os.environ if env is None else env
-    raw = src.get(VISION_FLIP_URGENT_ENV, "0")
-    return str(raw if raw is not None else "0").strip().lower() in ("1", "true", "yes", "on")
+    the fairness switch (weg2xsn438: 45 s). Unset or blank: the published
+    form's registry row (SCHALTER-HALBPORT 1002: nextflash on; off for a row
+    that states nothing and without a form)."""
+    return _env_switch_on_or_profile(VISION_FLIP_URGENT_ENV, env)
 
 
 #: verdicts of :func:`vision_verdict`
@@ -910,6 +1127,40 @@ def front_span_inflight_line() -> str:
             "content event, only while the agent span is on)"
             % (int(front_span_inflight()), int(bool(envs.SGLANG_WEG2_ENABLE_AGENT_SPAN.get())),
                os.getpid()))
+
+
+#: DP-NACHLAUF 02.10. (N5d D->P epoch 25: leg 1 dispatched at the flip's done,
+#: PP0's store prefetch then queued 1333 ms + read 206 ms + harvest 73 ms, the
+#: followers' reads came later still -- all of it after the wake): at a D->P
+#: flip's BEGIN the front posts leg 1 of the queue head (up to p_concurrency)
+#: to the DORMANT P. P accepts and holds it (#1443 DORMANT-HOLD, the path D's
+#: leg 2 takes on every P->D flip): tokenised ids and the store prefetch run on
+#: P's prefetch threads while the weight legs run; the wake releases the held
+#: request and only the device load is left. The P drain awaits the leg it
+#: finds in flight instead of posting it again. Default ON since 02.10. (metal
+#: 27B N5q..N6e: LEG1-EARLY + #1443 DORMANT-HOLD every D>P; NF y8b d019aa8e1e /
+#: y8c 71da6e387c: LEG1-EARLY 10x, 0 deaths); SGLANG_WEG2_LEG1_EARLY=0 disarms it.
+LEG1_EARLY_ENV = "SGLANG_WEG2_LEG1_EARLY"
+
+
+def leg1_early_on(env: Optional[dict] = None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(LEG1_EARLY_ENV, "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def leg1_early_candidates(queue, limit: int) -> list:
+    """The queue head the P drain would dispatch first (at most ``limit``):
+    a leg 1 to run (not CARRIER-EXCEEDS, not D-direct), its client still
+    there, none already in flight."""
+    out = []
+    for p in list(queue):
+        if len(out) >= max(0, int(limit)):
+            break
+        if (getattr(p, "skip_leg1", False) or getattr(p, "d_direct", False)
+                or getattr(p, "client_gone", False) or getattr(p, "_leg1_early", None) is not None):
+            continue
+        out.append(p)
+    return out
 
 
 def request_text(payload: dict, tools_first: Optional[bool] = None) -> str:
@@ -1064,14 +1315,27 @@ class SpanLRU:
         # key -> (text, cached_tokens, prompt_tokens, held_epoch)
         self.entries: collections.OrderedDict[
             str, Tuple[str, int, int, Optional[int]]] = collections.OrderedDict()
+        #: #59: key -> D's ``weg2_resumable_depth`` for that entry (the
+        #: deepest prefix D can actually resume from: its deepest held Mamba
+        #: anchor, group-uniform). Beside ``entries``, their tuple unchanged;
+        #: no key = no cap (D did not send the field -- the old credit).
+        self.depth_caps: Dict[str, int] = {}
         #: the witness of the last pricing answer, for the ROUTE-VERDICT label
         #: only (``none`` / ``d_leg2_cached`` / ``d_served_epoch``); nothing
         #: decides on it.
         self.last_src = "none"
 
     def record_presence(self, text: str, cached_tokens: int, prompt_tokens: int = 0,
-                        held_epoch: Optional[int] = None) -> None:
+                        held_epoch: Optional[int] = None,
+                        resumable_depth: Optional[int] = None) -> None:
         """One MEASURED cached-on-D outcome for ``text``.
+
+        #59: ``resumable_depth`` is D's ``weg2_resumable_depth`` from the same
+        response (None = D did not send it). It CAPS every credit this entry
+        gives -- the measured ``cached_tokens`` and the #49 held prompt alike:
+        D holds KV past its deepest Mamba anchor, but a hybrid model can only
+        resume at an anchor (rc12z weg2-12-61: credit 55424, D's extent 37952).
+        A depth of 0 is a measurement of nothing resumable and retracts.
 
         ``cached_tokens`` is a D leg-2 response's own ``cached_tokens``.
         NAMED ``record_presence`` and not ``record`` on purpose: the old name
@@ -1097,17 +1361,23 @@ class SpanLRU:
             return
         key = hashlib.sha1(text.encode()).hexdigest()
         self.entries.pop(key, None)
+        self.depth_caps.pop(key, None)
         if not self.agent_span:
             # NF (P49) switch off: the rc2.1l entry -- the presence witness only.
             prompt_tokens, held_epoch = 0, None
         ct = max(0, int(cached_tokens))
         pt = max(0, int(prompt_tokens or 0))
         held = held_epoch if (held_epoch is not None and pt > 0) else None
+        if resumable_depth is not None and int(resumable_depth) <= 0:
+            return  # #59: D can resume none of it -- a measured zero retracts
         if ct <= 0 and held is None:
             return
         self.entries[key] = (text, ct, pt, held)
+        if resumable_depth is not None:
+            self.depth_caps[key] = int(resumable_depth)
         while len(self.entries) > self.cap:
-            self.entries.popitem(last=False)
+            old_key, _ = self.entries.popitem(last=False)
+            self.depth_caps.pop(old_key, None)
 
     def record_inflight(self, text: str, prompt_tokens: int, held_epoch: int) -> None:
         """#49 rest: D has prefilled ``text`` (its leg 2 delivered its first
@@ -1127,9 +1397,31 @@ class SpanLRU:
         old = self.entries.pop(key, None)
         ct = old[1] if old else 0
         pt = max(1, int(prompt_tokens or 0), old[2] if old else 0)
+        if old is None:
+            # #59 A (operator 28.09.): a NEW text in flight is credited at most
+            # to the anchor depth already known for its prefix before the leg;
+            # none known -> 0 until the finish sets D's real depth.
+            self.depth_caps[key] = self.known_prefix_depth(text, exclude=key)
         self.entries[key] = (text, ct, pt, int(held_epoch))
+        # #59: an old entry's depth cap stays (it bounds that measured ct);
+        # the finish's record_presence replaces it with D's new depth.
         while len(self.entries) > self.cap:
-            self.entries.popitem(last=False)
+            old_key, _ = self.entries.popitem(last=False)
+            self.depth_caps.pop(old_key, None)
+
+    def known_prefix_depth(self, text: str, exclude: Optional[str] = None) -> int:
+        """#59 A: the resumable depth already known for a prefix of ``text`` --
+        the ``depth_cap`` of the CAPPED entry with the longest common prefix,
+        bounded by that prefix (floor of its chars/3 tokens: a depth past the
+        shared part is not on this text's prefix). 0 = no depth known."""
+        best_cp, depth = 0, 0
+        for key, (etext, _ct, _pt, _held) in self.entries.items():
+            if key == exclude or key not in self.depth_caps:
+                continue
+            cp = common_prefix_len(etext, text)
+            if cp > best_cp:
+                best_cp, depth = cp, int(self.depth_caps[key])
+        return max(0, min(depth, int(best_cp / CHARS_PER_TOKEN)))
 
     def uncached_tokens(self, text: str, est_prompt: int,
                         epoch: Optional[int] = None) -> Tuple[int, bool]:
@@ -1145,12 +1437,15 @@ class SpanLRU:
         best: Optional[int] = None
         src = "none"
         n = len(text)
-        for etext, ct, pt, held_epoch in self.entries.values():
+        for key, (etext, ct, pt, held_epoch) in self.entries.items():
             cp = common_prefix_len(etext, text)
             if cp <= 0:
                 continue
             held = epoch is not None and held_epoch is not None and held_epoch == epoch
             credit = max(ct, pt) if held else ct
+            cap = self.depth_caps.get(key)
+            if cap is not None:
+                credit = min(credit, cap)  # #59: never past D's deepest anchor
             if credit <= 0:
                 continue
             frac = cp / max(1, len(etext))
@@ -1305,6 +1600,299 @@ def d_prefill_seconds(body: Any) -> Optional[float]:
             except (TypeError, ValueError):
                 return None
             return s if s > 0 else None
+    return None
+
+
+def d_resumable_depth(body: Any) -> Optional[int]:
+    """#59: D's ``weg2_resumable_depth`` for this leg 2, or None.
+
+    The group-uniform depth D can actually RESUME this prompt from after the
+    leg (its deepest held Mamba anchor, or device + state_aligned_extent) --
+    ``meta_info`` on ``/generate``, ``sglext`` on the OpenAI wire, like
+    ``weg2_prefill_s``. None when neither carries it: the credit is then the
+    old one (``cached_tokens`` / the #49 held prompt), unchanged."""
+    if not isinstance(body, dict):
+        return None
+    for holder in (body.get("meta_info"), body.get("sglext")):
+        if isinstance(holder, dict) and holder.get("weg2_resumable_depth") is not None:
+            try:
+                return max(0, int(holder["weg2_resumable_depth"]))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def d_seq_mark(body: Any) -> Optional[str]:
+    """SEQ-HASH (02.10.): D's ``weg2_seq_hash`` mark for this leg 2, or None
+    (``meta_info`` on ``/generate``, ``sglext`` on both chat wires)."""
+    if not isinstance(body, dict):
+        return None
+    for holder in (body.get("meta_info"), body.get("sglext")):
+        if isinstance(holder, dict) and isinstance(holder.get("weg2_seq_hash"), str):
+            return holder["weg2_seq_hash"]
+    return None
+
+
+def d_seq_mark_stream_tail(tail: bytes) -> Optional[str]:
+    """:func:`d_seq_mark` of the last streamed chunk that carries it."""
+    for raw in reversed(tail.split(b"\n")):
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]" or b"weg2_seq_hash" not in data:
+            continue
+        try:
+            js = json.loads(data)
+        except Exception:  # noqa: BLE001
+            continue
+        got = d_seq_mark(js)
+        if got is None and isinstance(js, dict):
+            # Anthropic: the sglext rides inside the message_delta / message
+            for k in ("message", "delta"):
+                got = d_seq_mark(js.get(k)) if isinstance(js.get(k), dict) else None
+                if got:
+                    break
+        if got is not None:
+            return got
+    return None
+
+
+def park_seq_marks(body: str) -> Dict[str, str]:
+    """SEQ-HASH: ``{rid: mark}`` of D's park answer ({} when absent)."""
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return {}
+    got = payload.get("weg2_seq_hash") if isinstance(payload, dict) else None
+    if not isinstance(got, dict):
+        return {}
+    return {str(k): v for k, v in got.items() if isinstance(v, str)}
+
+
+def d_resumable_depth_stream_tail(tail: bytes) -> Optional[int]:
+    """#59: :func:`d_resumable_depth` of the LAST streamed chunk that carries
+    it (the finish chunk), scanning the retained tail from the end."""
+    for raw in reversed(tail.split(b"\n")):
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]" or b"weg2_resumable_depth" not in data:
+            continue
+        try:
+            js = json.loads(data)
+        except Exception:  # noqa: BLE001
+            continue
+        got = d_resumable_depth(js)
+        if got is not None:
+            return got
+    return None
+
+
+#: RANKSTATS-S3 "DASHBOARD-GRAFIKEN" Feld 2: the cache tiers a served row splits
+#: its ``cached`` into (CachedTokensDetails: device / host / storage).
+CACHED_TIERS = ("device", "host", "storage")
+
+
+def cached_tier_of(body: Any) -> Optional[Dict[str, int]]:
+    """``{device, host, storage}`` of this answer's cached tokens, or None.
+
+    The scheduler's CachedTokensDetails (output_streamer
+    ``get_cached_tokens_details``) rides in ``meta_info`` on ``/generate``, in
+    ``sglext`` on the OpenAI wire, or in ``usage.prompt_tokens_details``. None
+    when no holder carries it: the served row then adds nothing to its tiers
+    (the sum stays in ``cached``), never a guessed split. ``storage`` is absent
+    without an L3 backend and counts 0."""
+    if not isinstance(body, dict):
+        return None
+    usage = body.get("usage")
+    ptd = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    for holder in (body.get("meta_info"), body.get("sglext"), ptd):
+        det = holder.get("cached_tokens_details") if isinstance(holder, dict) else None
+        if isinstance(det, dict):
+            try:
+                return {k: max(0, int(det.get(k) or 0)) for k in CACHED_TIERS}
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+#: The wires on which the front ASKS its internal hops for the tier split
+#: (``return_cached_tokens_details``, Operator 29.09.). ``/generate`` carries
+#: ``meta_info.cached_tokens_details`` unasked and is left alone.
+CACHED_TIER_ASK_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/messages")
+
+
+def payload_namespace(payload: Any) -> Tuple[bool, Optional[str]]:
+    """Q-530 SALT-ISOLATION (port of 27B Q-460): ``(known, extra_key)`` of a client
+    payload -- the KV namespace the groups run it under (serving_base.
+    _compute_extra_key: cache_salt + extra_key concatenated). ``known`` is False
+    for a key only the group can form (a LoRA adapter folds its id into the
+    key at the tokenizer manager): such a request is isolated (fail closed)."""
+    if not isinstance(payload, dict):
+        return True, None
+    if payload.get("lora_path"):
+        return False, None
+    model = payload.get("model")
+    if isinstance(model, str) and ":" in model:
+        return False, None            # model "base:adapter" selects a LoRA
+    parts = []
+    for k in ("cache_salt", "extra_key"):
+        v = payload.get(k)
+        if v:
+            if not isinstance(v, str):
+                return False, None
+            parts.append(v)
+    return True, ("".join(parts) if parts else None)
+
+
+def cached_tier_asked(payload: Any) -> bool:
+    """Did this request body (the CLIENT's) ask for the tier split itself?"""
+    return isinstance(payload, dict) and bool(payload.get("return_cached_tokens_details"))
+
+
+def with_cached_tier_ask(payload: dict, path: str) -> dict:
+    """The body of an internal P/D hop: the client's, plus the tier ask. A new
+    dict -- the client's body is never mutated (a re-route re-sends it)."""
+    if path not in CACHED_TIER_ASK_PATHS or cached_tier_asked(payload):
+        return payload
+    out = dict(payload)
+    out["return_cached_tokens_details"] = True
+    return out
+
+
+_SGLEXT_KEY_RE = re.compile(rb'"sglext"\s*:\s*\{')
+_TIER_MEMBER_RE = re.compile(rb'"cached_tokens_details"\s*:\s*\{[^{}]*\}')
+
+
+def _json_obj_end(buf: bytes, start: int) -> int:
+    """Index after the JSON object opening at ``buf[start] == '{'`` (strings
+    and escapes respected); -1 when it does not close inside ``buf``."""
+    depth, i, n, in_str = 0, start, len(buf), False
+    while i < n:
+        c = buf[i]
+        if in_str:
+            if c == 0x5C:  # backslash
+                i += 1
+            elif c == 0x22:
+                in_str = False
+        elif c == 0x22:
+            in_str = True
+        elif c == 0x7B:
+            depth += 1
+        elif c == 0x7D:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def _drop_member(buf: bytes, start: int, end: int) -> bytes:
+    """Remove the object member ``buf[start:end]`` (``"key":value``) with its
+    separating comma, so the object reads as if it never had it."""
+    j = start - 1
+    while j >= 0 and buf[j] in b" \t\r\n":
+        j -= 1
+    if j >= 0 and buf[j] == 0x2C:
+        return buf[:j] + buf[end:]
+    k = end
+    while k < len(buf) and buf[k] in b" \t\r\n":
+        k += 1
+    if k < len(buf) and buf[k] == 0x2C:
+        return buf[:start] + buf[k + 1:]
+    return buf[:start] + buf[end:]
+
+
+def _strip_tier_doc(doc: bytes, path: str, stream: bool) -> Optional[bytes]:
+    """One JSON document (a body or one SSE data line) as D writes it WITHOUT
+    ``return_cached_tokens_details``; None = D would not have sent this stream
+    event at all. Byte surgery on D's own bytes -- nothing else is re-serialized.
+
+    Both wires drop unset members: ``SglExt`` serializes without its None fields
+    and the responses drop a None ``sglext`` (openai/protocol.py 527/561/595;
+    the Anthropic adapter serializes exclude_none). So the member goes, and what
+    D would have written for the REST follows D's own rule: OpenAI non-stream
+    builds sglext only for ``routed_experts or weg2_prefill_s or
+    weg2_resumable_depth is not None`` (serving_chat 1414), OpenAI stream emits
+    the sglext chunk only for ``routed_experts is not None or
+    weg2_resumable_depth is not None`` (serving_chat 1309), Anthropic drops an
+    empty sglext (``_sglext_of``)."""
+    m = _SGLEXT_KEY_RE.search(doc)
+    if m is None:
+        return doc
+    obj_start = m.end() - 1
+    obj_end = _json_obj_end(doc, obj_start)
+    if obj_end < 0:
+        return doc
+    ext_bytes = doc[obj_start:obj_end]
+    tm = _TIER_MEMBER_RE.search(ext_bytes)
+    if tm is None:
+        return doc
+    rest = _drop_member(ext_bytes, tm.start(), tm.end())
+    try:
+        left = json.loads(rest)
+    except ValueError:
+        return doc
+    if path == "/v1/messages":
+        empty = not left
+    elif stream:
+        empty = left.get("routed_experts") is None and left.get("weg2_resumable_depth") is None
+    else:
+        empty = not (left.get("routed_experts") or left.get("weg2_prefill_s")
+                     or left.get("weg2_resumable_depth") is not None)
+    if not empty:
+        return doc[:obj_start] + rest + doc[obj_end:]
+    if stream and path != "/v1/messages":
+        return None                                  # D writes no sglext chunk at all
+    return _drop_member(doc, m.start(), obj_end)
+
+
+def strip_cached_tier(data: bytes, path: str, stream: bool) -> bytes:
+    """What the client gets: D's answer without the tier split the FRONT asked
+    for (the caller checks the client did not ask itself). A body, or the END
+    of a stream (every SSE event after the finish marker, read once, never per
+    decode chunk). Bytes without the key come back untouched."""
+    if b"cached_tokens_details" not in data:
+        return data
+    if not stream:
+        return _strip_tier_doc(data, path, False)
+    out = []
+    for event in data.split(b"\n\n"):
+        if b"cached_tokens_details" not in event:
+            out.append(event)
+            continue
+        lines = event.split(b"\n")
+        for i, line in enumerate(lines):
+            if line.startswith(b"data:") and b"cached_tokens_details" in line:
+                head = b"data: " if line.startswith(b"data: ") else b"data:"
+                doc = _strip_tier_doc(line[len(head):], path, True)
+                if doc is None:
+                    lines = None
+                    break
+                lines[i] = head + doc
+        if lines is not None:
+            out.append(b"\n".join(lines))
+    return b"\n\n".join(out)
+
+
+def cached_tier_stream_tail(tail: bytes) -> Optional[Dict[str, int]]:
+    """:func:`cached_tier_of` of the LAST streamed chunk that carries it."""
+    for raw in reversed(tail.split(b"\n")):
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]" or b"cached_tokens_details" not in data:
+            continue
+        try:
+            js = json.loads(data)
+        except Exception:  # noqa: BLE001
+            continue
+        got = cached_tier_of(js)
+        if got is not None:
+            return got
     return None
 
 
@@ -1593,7 +2181,7 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
                       carrier_max: int, carrier_exact: bool = False) -> str:
     """#1290: WHICH ROUTE CAN SERVE THIS REQUEST -- decided ONCE, up front.
 
-    Returns one of ``short`` / ``long`` / ``carrier_single`` / ``none``.
+    Returns one of ``short`` / ``long`` / ``none`` (``carrier_single`` is deleted, law 02.10.).
 
     THE TWO BOUNDS ASK DIFFERENT QUESTIONS OF DIFFERENT TOKEN BASES, and
     conflating them is the defect this function exists to end:
@@ -1676,10 +2264,15 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
     # ruling ("exemption + 413 band stay until A is proven on metal"). It is
     # not introduced by this commit and it is not hidden by it.
     if not fits_carrier:
-        # The store cannot be read into D, so the two-leg route is out: only a
-        # single prefill on D could serve it -- and only if D can prefill it.
-        if fits_d_prefill:
-            return "carrier_single"
+        # LAW (user 02.10. ~07:55Z): P's KV stages (262k, 524k YaRN, 786k)
+        # always cover D's maximum decode session, so no prompt is ever D's
+        # to prefill for a capacity reason -- the CARRIER-EXCEEDS route
+        # ("carrier_single", one prefill on D) is deleted; above the carrier
+        # the two-leg P route serves it and the window loop streams it (the
+        # launcher refuses a boot whose carrier or P stage is below D's
+        # session, P-COVERS-D-SESSION). Measured: 0 routes on all 12 NF boots
+        # of 02.10. (carrier 373536 > 262144).
+        return "long"
         # A TERMINAL REFUSAL MAY NOT REST ON AN ESTIMATE (#1290, round 2).
         # `carrier_est` is `len(text) / CARRIER_CHARS_PER_TOKEN` whenever the
         # front has no EXACT prompt-token count for this text -- and it never
@@ -1801,6 +2394,37 @@ async def _first_stream_chunk(r) -> Optional[bytes]:
     return None
 
 
+class _RosHeld(Exception):
+    """ROS: the front learned (needs-p file) that D HOLDS this not-yet-committed
+    stream -- the lookahead ends as a refusal (X-REQUEUE)."""
+
+
+#: ROS: how often a lookahead waiting on D looks at the held flag.
+ROS_POLL_S = 0.5
+
+
+async def _read_chunk_watched(r, stop: Callable[[], bool], poll_s: Optional[float] = None) -> Optional[bytes]:
+    """One ``readany`` of D's stream (None = end), raising :class:`_RosHeld`
+    as soon as ``stop()`` says D holds the request -- asked before the read
+    and at every poll while it waits. The read is polled, not timed out: a
+    held D sends nothing but pings, a live D's chunk returns at once."""
+    if stop():
+        raise _RosHeld()
+    poll_s = ROS_POLL_S if poll_s is None else poll_s
+    task = asyncio.ensure_future(r.content.readany())
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=poll_s)
+            if done:
+                chunk = task.result()
+                return chunk or None
+            if stop():
+                raise _RosHeld()
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 #: Q0-B: how far past the envelope the re-route lookahead may read on the
 #: Anthropic wire, before it gives up and commits the stream to the client.
 #: Bounded in BOTH dimensions so a well-behaved stream can never be delayed
@@ -1815,7 +2439,7 @@ ANTHROPIC_LOOKAHEAD_MAX_BYTES = 65536
 ANTHROPIC_CONTENT_MARKERS = (b"content_block_delta", b"content_block_start")
 
 
-async def _anthropic_refusal_lookahead(r) -> Tuple[Optional[bytes], bool]:
+async def _anthropic_refusal_lookahead(r, stop: Optional[Callable[[], bool]] = None) -> Tuple[Optional[bytes], bool]:
     """(buffered head, refused) for a streamed Anthropic leg 2.
 
     Q0-B, measured 2026-09-09 on boot weg2sn5m: ``_first_stream_chunk`` above
@@ -1839,7 +2463,9 @@ async def _anthropic_refusal_lookahead(r) -> Tuple[Optional[bytes], bool]:
     """
     head = bytearray()
     for _ in range(ANTHROPIC_LOOKAHEAD_MAX_CHUNKS):
-        chunk = await _first_stream_chunk(r)
+        # ROS: ``stop`` given = the read is watched for D's hold (see
+        # _read_chunk_watched); None = the one-__anext__ read, as before.
+        chunk = await (_first_stream_chunk(r) if stop is None else _read_chunk_watched(r, stop))
         if chunk is None:
             break
         head.extend(chunk)
@@ -1862,6 +2488,171 @@ def stream_has_content(head: Optional[bytes], path: str) -> bool:
     if path == "/v1/messages":
         return any(m in head for m in ANTHROPIC_CONTENT_MARKERS)
     return b"data:" in head
+
+
+def stream_chunk_is_work(chunk: Optional[bytes], path: str) -> bool:
+    """FW-PING (NF fqnsdm 01.10.): does a leg-2 chunk carry D's WORK -- token
+    content (:func:`stream_has_content`) or the end of the answer
+    (:func:`stream_finish_seen`)? A keepalive is not work: D's Anthropic adapter
+    sends ``event: ping`` after 5 s of silence (anthropic/serving.py
+    PING_INTERVAL_SECONDS), an OpenAI-wire keepalive is a ``:`` comment line,
+    the ``message_start`` envelope precedes D's prefill. Measured: P->D flips
+    28/30 read first_work 5.3 s from the ping of a stream parked in a long
+    extend, while D's first decode round came 0.4-0.5 s after done."""
+    return stream_has_content(chunk, path) or (bool(chunk) and stream_finish_seen(chunk))
+
+
+def inband_error_before_content(head: Optional[bytes], path: str) -> Optional[str]:
+    """EB (NF rc12q 16:26:57, weg2-14-52): D answered a streamed leg 2 with a
+    NAMED error before any content -- there ``W88 Weg2StoreLoadNotProgressing
+    arm=host_pool_shortfall ... terminal, answered 503`` -- and the front
+    committed a 200 carrying no text (SERVED status=200 prompt_tokens=0
+    completion_tokens=0). The non-stream twin (weg2-14-53) got its 503. Returns
+    the error text when the buffered head holds an error event and no content,
+    else None. Anthropic: ``event: error`` without a content event; OpenAI /
+    generate: a first ``data:`` chunk carrying ``"error"`` and no ``"choices"``/
+    ``"text"``."""
+    if not head:
+        return None
+    if path == "/v1/messages":
+        if b"event: error" not in head or any(m in head for m in ANTHROPIC_CONTENT_MARKERS):
+            return None
+    else:
+        if b'"error"' not in head or b'"choices"' in head or b'"text"' in head:
+            return None
+    return head.decode(errors="replace")[:600]
+
+
+def _terminal_named_enabled(env=None) -> bool:
+    """TN (NF rc12s KRIT3): ``SGLANG_WEG2_LEG2_TERMINAL_NAMED`` (default on; 0 =
+    a committed stream ends as D left it)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_LEG2_TERMINAL_NAMED", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def leg2_terminal_reason(tail: Optional[bytes], path: str, finished: bool) -> Optional[str]:
+    """TN (NF rc12s 17:35:47, weg2-3-16 / weg2-3-18): why a COMMITTED stream is
+    ending without an answer, or None. ``W50``: D's named X refusal arrived after
+    the first byte (the re-route is impossible, the client already holds the
+    stream). ``error:<W-code>``: any other error event of D in the stream (W88
+    store read not progressing, a 503 abort...). ``truncated``: D's stream ended
+    without the end-of-answer marker --
+    only on the OpenAI / Anthropic wires, whose marker :func:`stream_finish_seen`
+    reads; /generate's ``finish_reason`` is an object there, so it is not judged."""
+    if not tail:
+        return None
+    text = tail.decode(errors="replace")
+    if x_refusal_marker_in(text):
+        return "W50"
+    # KRIT3 (NF rc12t weg2-4-16 18:08:55): EVERY named D error after the
+    # commit, not only W50 -- there D's store read did not progress (W88
+    # Weg2StoreLoadNotProgressing ... terminal, answered 503) on a stream that
+    # RESUME-VIA-P held, and the front booked verdict=serve 0/0.
+    if stream_error_event_in(tail, path):
+        m = _W_CODE_RE.search(text[text.rfind("error"):] if "error" in text else text)
+        return f"error:{m.group(1)}" if m else "error"
+    if not finished and path != "/generate":
+        return "truncated"
+    return None
+
+
+_W_CODE_RE = re.compile(r"\b(W\d{1,3}[a-z]?)\s+Weg2[A-Za-z]+")
+
+
+def stream_error_event_in(tail: Optional[bytes], path: str) -> bool:
+    """TN: does the stream already carry an error event the client can read?"""
+    if not tail:
+        return False
+    if path == "/v1/messages":
+        return b"event: error" in tail
+    return b'"error"' in tail
+
+
+def named_error_chunk(path: str, message: str) -> bytes:
+    """TN: one error event in the wire of ``path`` (Anthropic ``event: error``,
+    else an OpenAI-style ``data: {"error": ...}`` chunk)."""
+    if path == "/v1/messages":
+        # W88/W50 529: the 503 type, never overloaded_error (= 529 to the client)
+        body = {"type": "error", "error": {"type": STATE_REFUSAL_ANTHROPIC_TYPE, "message": message}}
+        return b"event: error\ndata: " + json.dumps(body).encode() + b"\n\n"
+    body = {"error": {"message": message, "type": "overloaded_error", "code": 503}}
+    return b"data: " + json.dumps(body).encode() + b"\n\n"
+
+
+#: How long a client should wait before re-sending a request the front refused
+#: from STATE (a store hand-back that did not land, a blocked hand-off, a
+#: re-offer loop). One flip pair clears most of those; the number is a hint in
+#: the Retry-After header, never a bound the front enforces.
+STATE_REFUSAL_RETRY_AFTER_S = 5
+
+
+#: W88/W50 529 (29.09., NF dauer09290232 front 03:21:06 weg2-122-144/-126-148
+#: ``LEG2-TERMINAL-NAMED reason=error:W88 ... error_event=forwarded``, 03:22:09
+#: weg2-116-141 ``reason=W50``; D: "Forwarding upstream stream error
+#: (overloaded_error): W88 ...", "... terminal, answered 503"): on the Anthropic
+#: wire ``overloaded_error`` IS the 529 -- Claude Code classifies an error by
+#: that type (a stream has no status to read), reads it as "API overloaded" and
+#: gives up. A state or read refusal is a 503 with Retry-After, so on this wire
+#: it carries Anthropic's 5xx type. ``overloaded_error`` is never a W-code's.
+STATE_REFUSAL_ANTHROPIC_TYPE = "api_error"
+
+_OVERLOADED_TYPE_RE = re.compile(rb'("type"\s*:\s*)"overloaded_error"')
+
+
+def restate_inband_refusal(chunk: bytes, path: str) -> bytes:
+    """W88/W50 529: D's NAMED refusal on the Anthropic wire (an ``event: error``
+    whose message carries a W-code) leaves the front as the 503 type
+    (``STATE_REFUSAL_ANTHROPIC_TYPE``), never ``overloaded_error`` (529).
+    Anything else -- content, an unnamed error, the OpenAI wire -- passes
+    byte for byte."""
+    if path != "/v1/messages" or not chunk or b"overloaded_error" not in chunk:
+        return chunk
+    if b"event: error" not in chunk and b'"type":"error"' not in chunk and b'"type": "error"' not in chunk:
+        return chunk
+    if not _W_CODE_RE.search(chunk.decode(errors="replace")):
+        return chunk
+    return _OVERLOADED_TYPE_RE.sub(
+        lambda m: m.group(1) + b'"' + STATE_REFUSAL_ANTHROPIC_TYPE.encode() + b'"', chunk)
+
+
+def refusal_status(measured_tokens: Optional[int], static_capacity: int) -> int:
+    """HTTP status of a NAMED terminal refusal: 413 only for a real size fault.
+
+    413 says "this request is too large for this server" -- Claude Code reads
+    it as "Request too large" and abandons the whole agent, so it may only be
+    sent when a MEASURED length (an exact prompt-token count, never the char
+    estimate) exceeds a STATIC capacity of the form (``carrier_max_tokens``,
+    fixed at launch). Every other refusal -- the store handed nothing back, D
+    refused a request well inside the form's capacity, the state of a group
+    blocked the hand-off -- is a condition that can change, so it is a 503
+    with Retry-After (rc12z30d 21:11:35: W53 answered 413 for a 17,053-token
+    prompt against carrier_max 314,553, and the agent died on a state fault).
+    """
+    if measured_tokens is None or int(static_capacity) <= 0:
+        return 503
+    return 413 if int(measured_tokens) > int(static_capacity) else 503
+
+
+def refusal_response(path: str, code: str, detail: str, status: int,
+                     extra: Optional[Dict[str, object]] = None) -> web.Response:
+    """A named refusal in the wire of ``path``: the Anthropic error object on
+    ``/v1/messages``, the OpenAI one elsewhere, the W-code and the full detail
+    in both; 503 carries Retry-After, 413 does not (a retry cannot help)."""
+    if path == "/v1/messages":
+        body: Dict[str, object] = {
+            "type": "error",
+            "error": {"type": ("request_too_large" if status == 413
+                               else STATE_REFUSAL_ANTHROPIC_TYPE),
+                      "message": detail},
+            "code": code}
+    else:
+        body = {"error": {"message": detail,
+                          "type": "invalid_request_error" if status == 413 else "overloaded_error",
+                          "code": code}}
+    body.update(extra or {})
+    headers = {} if status == 413 else {"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
+    return web.json_response(body, status=status, headers=headers)
 
 
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
@@ -1965,6 +2756,100 @@ def flip_escape_verdict(
         f"controller's own guard skips every iteration while it is not "
         f"'serving'). No retry; recovery = teardown + relaunch",
     )
+
+
+def _eb_enabled(env=None) -> bool:
+    """EB: ``SGLANG_WEG2_LEG2_ERROR_BEFORE_CONTENT`` (default on; 0 = commit the
+    200 as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_LEG2_ERROR_BEFORE_CONTENT", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _eb_reroute_enabled(env=None) -> bool:
+    """EB: ``SGLANG_WEG2_LEG2_ERROR_REROUTE`` (default on): a named D error
+    before content re-routes the rid through P once; 0 = answer 503."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_LEG2_ERROR_REROUTE", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def p_phase_arrival(awake: str, state: str, flip_dst: Optional[str]) -> bool:
+    """P-BATCH-ALL: an arrival in a P phase -- P awake (serving or flipping
+    away: the flip to D has not begun when ``flip_dst`` is not D), or D
+    flipping to P. The cut-off is the begin of the P->D flip
+    (``state == "flipping"`` and ``flip_dst == "D"``): from then on the
+    arrival is D's (SHORT-IN-FLIP), no reverse flip."""
+    if state == "flipping":
+        return flip_dst == "P"
+    return awake == "P"
+
+
+def _short_keep_enabled(env=None) -> bool:
+    """SK: ``SGLANG_WEG2_SHORT_KEEP_PRESENCE`` (default on; 0 = a SHORT that
+    falls through is queued BATCH and prefilled on P, as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_SHORT_KEEP_PRESENCE", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _seat_rotate_enabled(env=None) -> bool:
+    """#244: ``SGLANG_WEG2_SEAT_ROTATE`` (default on; 0 = the parked resume
+    first, as before)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_SEAT_ROTATE", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _flip_single_flight_enabled(env=None) -> bool:
+    """FS: ``SGLANG_WEG2_FLIP_SINGLE_FLIGHT`` (default on; 0 = no guard)."""
+    e = os.environ if env is None else env
+    raw = (e.get("SGLANG_WEG2_FLIP_SINGLE_FLIGHT", "") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _flip_single_flight(body):
+    """FS (27B rc12o27 b1, 13:11:50-55Z): ONE flip at a time.
+
+    A POST /weg2/flip (the acceptance probe) began P->D at 13:11:50 while the
+    controller's P-drain ran (state still 'serving', the handler's only gate);
+    the drain ended at 13:11:53.435 and the controller called flip('P','D')
+    too -- a second flip of the same epoch, whose quiesce polled /flush_cache
+    beside the first flip's legs. One of its flushes (13:11:53.581) queued
+    behind the first flip's release; PP1/PP2 ran it on the released pools ->
+    illegal memory access, group P dead.
+
+    With SGLANG_WEG2_FLIP_SINGLE_FLIGHT on (default): a flip while another is
+    open, or of a group that is not the awake one, is skipped by name
+    (``WEG2-FLIP SKIPPED``); the caller's loop decides again on the state the
+    open flip leaves. ``0`` = no guard. ``functools.wraps`` keeps
+    ``inspect.getsource(Front.flip)`` the body's source.
+    """
+    import functools
+
+    @functools.wraps(body)
+    async def flip(self, src: str, dst: str) -> None:
+        if not _flip_single_flight_enabled():
+            return await body(self, src, dst)
+        reason = None
+        if getattr(self, "_flip_open", False):
+            reason = "another flip is open"
+        elif getattr(self, "awake", src) != src:
+            reason = f"{src} is not awake (awake={getattr(self, 'awake', '?')})"
+        if reason is not None:
+            self.counters["flip_skipped_concurrent"] += 1
+            logger.warning(
+                "WEG2-FLIP SKIPPED epoch=%s sleep=%s wake=%s: %s -- one flip at a time "
+                "(FS, rc12o27 b1: a second flip's quiesce flushed P after the first one's release)",
+                getattr(self, "epoch", "?"), src, dst, reason)
+            return
+        self._flip_open = True
+        try:
+            return await body(self, src, dst)
+        finally:
+            self._flip_open = False
+
+    return flip
 
 
 def health_is_serving_fact(http_200: bool, process_alive: bool) -> bool:
@@ -2296,7 +3181,10 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
     tag table (``--wake-credit-plan``), this free sample and the waker's
     corridor floors. A cycle-free order comes back UNCHANGED; a cycling one
     is replaced by ``wake_credit.credit_order``'s funded order, or kept with
-    a W126 note when no order is funded (the planner refused such a form).
+    a W126 note when no order is funded (the planner refused such a form) --
+    since 02.10. (SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT, NF y6u) replaced by
+    the order funded at the smallest free uplift when that is not the given
+    one, still with the W126 note.
 
     No table for this direction, the lever off, or an unreadable floor: the
     order as given, and ``why`` says so."""
@@ -2326,9 +3214,23 @@ def credit_pause_order(order: List[str], why: str, plan: Optional[Dict[str, Any]
     # promise and the front's order are the same question.
     search = bool(envs.SGLANG_WEG2_ENABLE_FLIP_ORDER_CREDIT_SEARCH.get()
                   or (plan or {}).get(_wc.SEARCH_KEY))
+    _double = not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get()
+    # y7o (02.10.): D->P only -- the first claim of each P stage behind the
+    # co-located D pauses that fund it (wake_credit.lockstep_claims).
+    _lockstep = ("%s->%s" % (src, dst) == "D->P"
+                 and envs.SGLANG_WEG2_ENABLE_FLIP_ORDER_LOCKSTEP.get())
     new, note = _wc.front_order(
         order, table, free_mib=free, floor_mib=floors,
-        double_staging=not envs.SGLANG_WEG2_CREDIT_LIVE_STAGING.get(), search=search)
+        double_staging=_double, search=search,
+        least_deficit=envs.SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT.get(),
+        lockstep_first=_lockstep)
+    if _lockstep:
+        try:
+            for _line in _wc.front_leg_order_lines(new, table, free_mib=free, floor_mib=floors,
+                                                   double_staging=_double):
+                logger.info("%s src=%s", _line, src)
+        except Exception as exc:  # noqa: BLE001 -- an instrument, never the order
+            logger.warning("WEG2-LEG-ORDER n/a (%s: %s)", type(exc).__name__, exc)
     return new, why + ", " + note
 
 
@@ -2403,6 +3305,9 @@ class Group:
     outstanding: Dict[str, float] = field(default_factory=dict)
     health_fail_streak: int = 0
     served: int = 0
+    #: FH: the poller's last facts (front_health.GroupFacts), None before the
+    #: first poll and always None with SGLANG_WEG2_FRONT_HEALTH_FACTS=0.
+    health_facts: Optional[Any] = None
 
     @property
     def phase(self) -> str:
@@ -2411,7 +3316,8 @@ class Group:
 
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
-                        stats: Optional[Dict[str, int]] = None) -> int:
+                        stats: Optional[Dict[str, int]] = None,
+                        extra=None, poll_s: float = 0.0, cap_exempt=None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -2436,6 +3342,20 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
 
     ``stats`` (optional) is filled with ``dispatched``, ``peak_n``,
     ``peak_tokens`` and ``pool_holds`` for the drain's P-PHASE line.
+
+    FLIPCYCLE H5 (02.10., ``cap_exempt``): once the phase cap is reached, a
+    queued item for which ``cap_exempt(item)`` is True (a SHORT, est_uncached
+    <= X) is still dispatched -- taken out of the queue wherever it stands, in
+    queue order, under the same overlap plan. Without it the cap stranded the
+    SHORT in the queue and D prefilled it after the P->D flip with every seat
+    stalled (y6z ep 2, weg2-1-7: 25 tokens, 2.03 s D pass). ``stats`` then also
+    counts ``short_rides``. The LONG items keep waiting for the next P phase.
+
+    RO (weg2.p_read_overlap): ``extra(items)`` gets the in-flight items and
+    returns how many dispatches may go beyond ``limit`` (one per leg P only
+    holds for its store read); with it the pool also wakes every ``poll_s``
+    while legs are in flight, not only on a completion. ``stats`` then also
+    counts ``overlap_dispatched``.
     """
     inflight: Dict[Any, int] = {}
     inflight_tokens = 0
@@ -2446,38 +3366,79 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     # law 2) in Task-id order, i.e. shuffled. Within one round they go in
     # dispatch order, which is the queue's (arrival) order.
     seq: Dict[Any, int] = {}
+    items: Dict[Any, Any] = {}
     rounds = 0
     if stats is not None:
-        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds"):
+        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched",
+                  "short_rides"):
             stats.setdefault(k, 0)
+
+    def _exempt_index() -> Optional[int]:
+        if cap_exempt is None:
+            return None
+        for i, q in enumerate(queue):
+            try:
+                if cap_exempt(q):
+                    return i
+            except Exception:  # noqa: BLE001 - a predicate error never stops the drain
+                return None
+        return None
+
+    def _cap() -> int:
+        if extra is None or len(inflight) < limit:
+            return limit
+        try:
+            return limit + max(0, int(extra(list(items.values()))))
+        except Exception:  # noqa: BLE001 - the instrument never stops the drain
+            return limit
+
     while True:
         dispatched = False
-        while queue and len(inflight) < limit and may_dispatch():
+        while queue and len(inflight) < _cap() and may_dispatch():
+            idx = 0
+            ride = False
             if phase_policy.phase_cap_reached(dispatched_total, max_dispatch):
-                break
-            c = int(cost(queue[0])) if (cost is not None and budget > 0) else 0
+                idx = _exempt_index()
+                if idx is None:
+                    break
+                ride = True
+            c = int(cost(queue[idx])) if (cost is not None and budget > 0) else 0
             if not phase_policy.p_overlap_admits(inflight_tokens, len(inflight), c, budget):
                 if stats is not None:
                     stats["pool_holds"] += 1
                 break
-            t = asyncio.ensure_future(one(queue.popleft()))
+            _beyond = len(inflight) >= limit
+            if idx == 0:
+                item = queue.popleft()
+            else:
+                item = queue[idx]
+                del queue[idx]
+            if ride and stats is not None:
+                stats["short_rides"] += 1
+            t = asyncio.ensure_future(one(item))
             inflight[t] = c
+            items[t] = item
             seq[t] = dispatched_total
             inflight_tokens += c
             dispatched_total += 1
             dispatched = True
             if stats is not None:
                 stats["dispatched"] = dispatched_total
+                if _beyond:
+                    stats["overlap_dispatched"] += 1
                 stats["peak_n"] = max(stats["peak_n"], len(inflight))
                 stats["peak_tokens"] = max(stats["peak_tokens"], inflight_tokens)
         if dispatched:
             rounds += 1
         if not inflight:
             return rounds
-        done, _pending = await asyncio.wait(set(inflight), return_when=asyncio.FIRST_COMPLETED)
+        done, _pending = await asyncio.wait(
+            set(inflight), return_when=asyncio.FIRST_COMPLETED,
+            timeout=(poll_s if (extra is not None and poll_s > 0 and queue) else None))
         for t in sorted(done, key=seq.__getitem__):
             inflight_tokens -= inflight.pop(t, 0)
             seq.pop(t, None)
+            items.pop(t, None)
             on_done(t.result())
 
 
@@ -2499,7 +3460,10 @@ class Pending:
     est_uncached: int = 0
     span_known: bool = False
     leg1_prompt_tokens: int = 0
-    skip_leg1: bool = False  # #1233 route CARRIER-EXCEEDS: one prefill on D, no leg 1
+    #: no leg 1: an SK SHORT kept in a D phase (its D admission prefills it).
+    #: The CARRIER-EXCEEDS route that set it is deleted (law 02.10.: P's KV
+    #: stages cover D's max session); a P drain gives it a leg 1 back.
+    skip_leg1: bool = False
     leg1_done: bool = False
     #: weg2xsn272: P refused this leg 1 as WEG2-INTAKE-STALL (its pool cannot
     #: admit the request while it keeps the backlog for D); requeued at the
@@ -2511,6 +3475,9 @@ class Pending:
     posted_evt: Optional[asyncio.Event] = None
     #: C12: how often D refused this rid with W31.  A second one is W35.
     x_requeues: int = 0
+    #: H102: the client closed its connection before its answer; nothing is
+    #: dispatched for it any more (no leg 1, no hand-off to D).
+    client_gone: bool = False
     #: MF-3: the tokens of this prompt whose prefix the front's OWN ROUTING
     #: PROBE already priced as store-resident, captured at arrival because
     #: the probe's source (:class:`SpanLRU`) is mutated by this very request
@@ -2530,9 +3497,32 @@ class Pending:
     #: (Front._x_idle_regrant) serves it on D once D is idle and quiet.
     #: Only set under SGLANG_WEG2_X_IDLE_REGRANT (profile qwen27b).
     x_deferred: bool = False
+    #: #246b (NF y4c 04:39:57): the X this request was ROUTED on when the route
+    #: was LONG (the X-SOLO band floor X_busy while D was busy, else the live
+    #: X); phase_policy.needs_p() reads it: above it the request needs P. 0 =
+    #: not routed long / switch off.
+    x_routed: int = 0
     #: set when that drain handed it to D: its leg 2 then runs exactly as the
     #: SHORT route's (pending=None -- no leg 1 ever ran for it).
     d_direct: bool = False
+    #: SK (#243, NF rc12r weg2-12-39 / weg2-13-44): a SHORT verdict with a
+    #: measured D presence that fell through to the queue IN A D PHASE (gate
+    #: timeout, seats): kept for D -- no leg 1 -- and re-priced at its D
+    #: admission when a flip lay between. P-BATCH-ALL (02.10.): never while
+    #: P is awake; a P drain gives a kept SHORT its leg 1 back.
+    short_kept: bool = False
+    #: SK: the front epoch the price was taken in.
+    price_epoch: int = -1
+    #: SK-X (W35 class, NF rc12t weg2-6-30): D refused this kept SHORT before
+    #: the first byte -- its presence expired with the reroute. The TokenSpans
+    #: record count at that instant: only D evidence recorded AFTER it may
+    #: price the rid back to D (``_sk_admission_reprice``). None = no void.
+    sk_void_seq: Optional[int] = None
+    #: SK-X: P's leg 1 actually ran for this rid (P answered 200). W35 "after
+    #: a full P prefill" is only true when it did.
+    leg1_ran: bool = False
+    #: #244: when leg 1 finished and the request started waiting for a D seat.
+    t_ready: float = 0.0
     #: xsn438: only group P can serve this request -- an image under
     #: ``--weg2-vision transient`` (W102): its embeddings are attached on P's
     #: PP0 and D carries no tower. Its route is ``long`` by RULE, not by
@@ -2540,11 +3530,55 @@ class Pending:
     #: could take it. Read by ``_flip_economics_ok`` under
     #: SGLANG_WEG2_VISION_FLIP_URGENT.
     p_only: bool = False
+    #: MM-XPRICE: one past the image positions in the front's exact ids (0 =
+    #: no image or not priced exactly); a P-only request whose store credit
+    #: reaches it is re-priced as text (``_x_exact_reprice_queue``).
+    mm_image_end: int = 0
     #: R28: the arrival snapshot of a request queued while D was awake, i.e.
     #: one that waits for a D->P flip; printed once as ``WEG2 DP-WAIT`` at
     #: the ``WEG2-FLIP done`` that ends the wait, then cleared. Instrument
     #: only -- nothing routes, admits or flips on it.
     dp_arrival: Optional[_dp_wait.DpArrival] = None
+    #: RESUME-VIA-P (weg2/resume_via_p.py): a P-only leg 1 that prefills the
+    #: context of a request D keeps parked mid-stream; no leg 2 follows (D
+    #: still holds the client's stream).
+    resume_via_p: bool = False
+    #: #243 seam (weg2/handoff_seam.py): how often this rid went back to P
+    #: because its hand-off was LOST while it waited for a D seat. Bounded at
+    #: one -- a second loss over X ends the rid by name (W35), never sent to D.
+    handoff_lost_reroutes: int = 0
+
+
+#: H102 (#23p, dkrnfbar1agent0925): A CLIENT THAT HANGS UP BEFORE ITS ANSWER
+#: NEVER REACHED P. Leg 1 runs in the controller task, the handler only awaits
+#: the request's future, and aiohttp 3.14 does not cancel a handler on a
+#: hang-up (``handler_cancellation`` is off under ``web.run_app``; its
+#: ``connection_lost`` only sets an exception on the already-read body). So P
+#: prefilled for a dead client to the end -- up to 262k tokens -- and only
+#: leg 2 fell on ``ClientConnectionResetError``. aiohttp offers no disconnect
+#: event for a handler that is not reading, but the request's transport is
+#: ``None`` (``BaseProtocol.connection_lost``) or closing from that moment
+#: on; the per-request watcher reads it every tick.
+CLIENT_GONE_TICK_S = 0.2
+
+
+class Weg2ClientGone(Exception):
+    """H102: the client closed its connection before its answer was sent."""
+
+
+def client_gone(request: "web.BaseRequest") -> bool:
+    """H102: True once the client's connection is lost or closing."""
+    if not hasattr(request, "transport"):
+        return False  # not an aiohttp request (a test double): no connection to watch
+    tr = request.transport
+    return tr is None or tr.is_closing()
+
+
+def response_complete(request: "web.BaseRequest") -> bool:
+    """H102: True once the whole answer was written (``write_eof``). A
+    hang-up after that is not a client-gone case -- H61/H61b own the
+    hang-ups inside leg 2 and after the end."""
+    return bool(getattr(getattr(request, "writer", None), "_eof", False))
 
 
 class Seat:
@@ -2588,6 +3622,9 @@ class Seat:
         self.held = False
         self.front._d_seat.release()
         self.front._d_seats_live.discard(self)
+        _ps = getattr(self.front, "_park_stuck", None)
+        if _ps is not None:
+            _ps().done(self.rid)  # #287 NEED0 (c): the rid left D
         self.front.counters["d_seat_released"] += 1
         # L3: the "wenn ein slot frei wird, wird nachgezogen" instrument.
         logger.info(
@@ -2943,11 +3980,38 @@ DC_OFF_PATH_ENV = "SGLANG_WEG2_DC_OFF_PATH"
 CTL_TICK_S = 0.2
 #: The reasons a kick may name -- one per switch, refused by name otherwise.
 CTL_KICK_REASONS = {"arrival": CTL_KICK_ARRIVAL_ENV, "after_flip": CTL_KICK_AFTER_FLIP_ENV}
+#: DONE-KICK (02.10.): the third reason. Its switch is an environ.py default (on),
+#: not a form-registry row, so it lives beside ``_kick_on`` (``_kick_done_queued``).
+CTL_KICK_DONE_QUEUED = "done_queued"
+CTL_KICK_DONE_QUEUED_ENV = "SGLANG_WEG2_CTL_KICK_DONE_QUEUED"
 
 
 def _env_switch_on(name: str) -> bool:
     return str(os.environ.get(name, "0")).strip().lower() in ("1", "true", "yes", "on")
 
+
+def _env_switch_on_or_profile(name: str, env=None) -> bool:
+    """An explicitly set switch keeps its parse (1/true/yes/on); unset or blank
+    takes the published form's registry row (weg2/form.py
+    PROFILE_SWITCH_DEFAULTS -- SCHALTER-HALBPORT 1002: nextflash DC_OFF_PATH,
+    CTL_KICK_*, VISION_FLIP_URGENT on), off without a form or for a row that
+    states nothing."""
+    src = os.environ if env is None else env
+    raw = src.get(name)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    from sglang.srt.weg2.form import profile_switch_default
+
+    return bool(profile_switch_default(name, False, src))
+
+
+
+def _decode_collect_window_s() -> float:
+    """DECODE-COLLECT window (user 02.10.); 0 = the old path, byte for byte."""
+    try:
+        return max(0.0, float(envs.SGLANG_WEG2_DECODE_COLLECT_WINDOW_S.get() or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
 
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
@@ -3029,6 +4093,8 @@ class Front:
         self.store_dir = store_dir
         self.dc_reserve = dc_reserve
         self.weight_form = str(weight_form or "")  # #1444: stamps the dormant record
+        # YaRN x2 27B: set from --d-residue-context-tokens after construction (main); 0 = not stamped
+        self.d_residue_context_tokens = 0
         self.w_s = w_s
         self.epoch = 0
         #: #1350: the non-reclaimable reading (anon+shmem+slab_unreclaimable)
@@ -3071,6 +4137,8 @@ class Front:
         # cached-on-D TOKEN prefix (weg2/front_tokens.py). Off = chars/3 pricing,
         # byte for byte; nothing below is constructed or imported then.
         self.x_exact = bool(envs.SGLANG_WEG2_FRONT_EXACT_TOKENS.get())
+        #: FRONT-PREWARM: the front's start, the clock of the ``warming`` bound
+        self._x_exact_t0 = time.monotonic()
         self.ftok = None
         self.tspans = None
         #: rid -> (pending priced, tokens counted, witness) for X-EXACT-ERR
@@ -3079,7 +4147,12 @@ class Front:
             from sglang.srt.weg2.front_tokens import FrontTokens, TokenSpans
 
             self.ftok = FrontTokens()
-            self.tspans = TokenSpans(agent_span=self.spans.agent_span)
+            self.tspans = TokenSpans(agent_span=self.spans.agent_span,
+                                     anchor_page=envs.SGLANG_WEG2_FRONT_ANCHOR_PAGE.get())
+        #: L3-INDEX PRICE (02.10.): the page-granular store prefix of an arrival
+        #: (weg2/front_store.py), opened after the tokenizer; None = no credit.
+        self.store_probe = None
+        self._store_probe_why = "not opened"
         # NF (P49): a boot with the switch on says so once. Off prints nothing,
         # so an off boot's front log keeps the pre-P49 lines (the arm's env
         # line is the off witness).
@@ -3211,6 +4284,8 @@ class Front:
         self.idle_layout = "P" if str(idle_layout).upper().startswith("P") else "D"
         # MF-1: the IDLE-REST line's edge trigger (see _idle_disposition).
         self._idle_rest_shown = False
+        # #55 F2: graphics-clock lock after idle_s at rest in this layout; None = off (the default).
+        self._idle_clock = _idle_clock_mod.from_env()
         # 27B idle policy (user order 24.09., three settings beside --idle-layout):
         # (b) --d-short-drain-tokens N: a queued backlog made ONLY of SHORT
         #     requests (each <= X, law 4) totalling <= N is handed to D instead of
@@ -3289,8 +4364,10 @@ class Front:
         # 27B flipfast: read ONCE, like every other front switch; the startup
         # line names all three (flipfast_line), so a boot's log says which ran.
         self._kick_on: Dict[str, bool] = {
-            why: _env_switch_on(env) for why, env in CTL_KICK_REASONS.items()}
-        self._dc_off_path = _env_switch_on(DC_OFF_PATH_ENV)
+            why: _env_switch_on_or_profile(env) for why, env in CTL_KICK_REASONS.items()}
+        # DONE-KICK (02.10.): default on (environ.py), read once like the others.
+        self._kick_done_queued = bool(envs.SGLANG_WEG2_CTL_KICK_DONE_QUEUED.get())
+        self._dc_off_path = _env_switch_on_or_profile(DC_OFF_PATH_ENV)
         # The kick event is created lazily in the running loop (_ctl_evt), so a
         # Front built outside a loop -- the unit tests, main() -- binds nothing.
         self._ctl_evt_obj: Optional[asyncio.Event] = None
@@ -3376,6 +4453,62 @@ class Front:
         self._park_unsupported = False
         #: rule 3: ONE park attempt per D phase (the epoch that made it).
         self._park_attempt_epoch = -1
+        #: PARK-CYCLE DWELL: the D phase (epoch) that began by resuming parked
+        #: requests -- its immediate park waits for both flips' price.
+        self._park_resume_epoch = -1
+        # PARK-DECODE-DWELL: time of the first chunk D streamed in epoch _d_decode_epoch
+        self._d_decode_epoch = -1
+        self._d_decode_t0 = 0.0
+        #: PARK-COLLECT-WINDOW: every D phase's wake -> first decoded chunk (ms,
+        #: the resume part of a flip round trip), oldest first; the first is cold.
+        self._resume_ms_log: List[float] = []
+        #: PARK-COLLECT-WINDOW: the D phase (epoch) whose collect hold is named.
+        self._park_collect_epoch = -1
+        #: PARK-WINDOW-GATE: (epoch, left_ms, line key) of the last open window
+        #: sent to D, None = none open there.
+        self._park_window_sent: Optional[tuple] = None
+        #: PARK-COLLECT-WINDOW: checkpoint x form of this boot (the round-trip
+        #: record's key, qwen27b and nextflash never share one); "" = no form.
+        self._park_form_key = park_form_key()
+        #: PARK-COLLECT-WINDOW: the newest recorded round trip of this form,
+        #: x until this boot measured its own; None = none recorded.
+        self._park_rt_seed: Optional[dict] = (
+            phase_policy.read_park_round_trip(self.measured_record, self._park_form_key)
+            if (envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
+                or envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get()) else None)
+        #: PARK-COLLECT-WINDOW: round trips this boot appended to the sidecar.
+        self._park_rt_written = 0
+        #: X-COST-LINE: the ``(boot, seq)`` head of D's per-forward prefill
+        #: cost ring at the last ``/get_server_info`` read (prefill_clock).
+        self._d_cost_mark: Optional[Tuple[str, int]] = None
+        #: X-COST-LINE: D's prefill forwards ``(n, prefix, ms)``, newest last --
+        #: the live fit's rows (read on every leg-2 read, under any load).
+        self._d_cost_rows: Deque[Tuple[int, int, float]] = collections.deque(maxlen=64)
+        #: X-COST-LINE: the whole boot's forwards (bounded), the fallback fit
+        #: when the recent window has no spread (27B review of 800bb82ac6).
+        self._d_cost_all: Deque[Tuple[int, int, float]] = collections.deque(maxlen=4096)
+        #: X-COST-LINE: requests each P phase prefilled (the amortisation k).
+        self._p_phase_k: Deque[int] = collections.deque(maxlen=self.X_SAMPLE_WINDOW)
+        #: X-COST-LINE: the newest fitted line of this checkpoint x form, the
+        #: seed until this boot fitted its own; None = none recorded.
+        self._x_cost_seed: Optional[dict] = (
+            phase_policy.read_x_cost_line(self.measured_record, self._park_form_key)
+            if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get() else None)
+        #: X-COST-LINE: P's prefill forwards on PP0 ``(n, prefix, ms)`` and
+        #: the head of P's ring at the last read -- P's side of the break-even.
+        self._p_cost_mark: Optional[Tuple[str, int]] = None
+        self._p_cost_rows: Deque[Tuple[int, int, float]] = collections.deque(maxlen=64)
+        self._p_cost_all: Deque[Tuple[int, int, float]] = collections.deque(maxlen=4096)
+        #: X-COST-LINE: P's newest recorded line of this checkpoint x form.
+        self._x_cost_seed_p: Optional[dict] = (
+            phase_policy.read_x_cost_line(self.measured_record, self._park_form_key, "P")
+            if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get() else None)
+        #: X-COST-LINE: fitted lines this boot appended to the sidecar, per group.
+        self._x_cost_written: Dict[str, int] = {"D": 0, "P": 0}
+        #: X-COST-LINE: the in-flight P ring reads (held so they are not collected).
+        self._p_cost_tasks: Set["asyncio.Task"] = set()
+        #: X-COST-LINE: which inputs were missing at the last NO-SOLVE.
+        self._x_cost_last_missing: List[str] = []
         #: H91c3-3: the D phase's seat count n (H95) this front sent at the
         #: last P->D wake; None before the first one (no seat cap known).
         self._d_phase_n: Optional[int] = None
@@ -3393,6 +4526,8 @@ class Front:
         #: the D phase (epoch) whose immediate park was held by the dwell
         #: already named (one WEG2 PARK-IMMEDIATE-DWELL line per phase).
         self._park_immediate_dwell_epoch = -1
+        #: #1416i: wall time of the latest PARK-IMMEDIATE-DWELL hold decision.
+        self._park_dwell_held_t: Optional[float] = None
         #: UNIFY (operator 26.09.): the NF H91 standard form on this front --
         #: rule 2's hand-over term and handoff_n/parked_n on D's wake. qwen27b
         #: off: the 27B front byte-identical (profile field standard_form).
@@ -3435,13 +4570,23 @@ class Front:
         wait for or count them. For P, and for a D with nothing parked, this
         is the ledger itself."""
         parked = getattr(self, "_d_parked", None) or {}
-        if g.name != "D" or not parked:
+        # RVP-DRAIN (27B rc12z7b 07:51:45Z, weg2-12-22/14-23/14-25/14-27): a
+        # request D refused mid-stream (W50-REROUTE) is HELD by D -- stream
+        # open, nothing running -- until P prefills it in the P-only leg the
+        # front queued (``_rvp_inflight``). It needs exactly THIS D->P flip,
+        # so the drain may never wait for it: it did, the window counted the
+        # last decode's tokens as progress (DRAIN WAITING), the flip re-began
+        # on the same four and the group sat in `flipping` with 10 requests
+        # waiting.
+        rvp = getattr(self, "_rvp_inflight", None) or set()
+        if g.name != "D" or (not parked and not rvp):
             return list(g.outstanding)
         # Part B re-queues a parked request no sleep followed after
         # PARK_REQUEUE_S: from then on it runs on D again and counts here.
         now = time.time()
         return [r for r in g.outstanding
-                if r not in parked or phase_policy.parked_lapsed(parked[r], now)]
+                if r not in rvp
+                and (r not in parked or phase_policy.parked_lapsed(parked[r], now))]
 
     def _drop_lapsed_parks(self) -> None:
         """Rule 3 with part B's clock: D awake and serving, and a parked
@@ -3454,6 +4599,7 @@ class Front:
         for r in lapsed:
             self._d_parked.pop(r, None)
         if lapsed:
+            Front._rb_resume(self, lapsed, "lapsed")  # DASHBOARD-IPC: D re-queued them (part B)
             self.counters["d_parked_lapsed"] += len(lapsed)
             logger.warning("WEG2 PARK-LAPSED epoch=%d n=%d rids=%s -- parked %.0f s ago and no sleep "
                            "followed; D re-queued them (part B) and the front counts them as "
@@ -3488,8 +4634,349 @@ class Front:
             inflight = int(self._handoff_in_flight())
         except Exception:  # noqa: BLE001 -- a partial front has no seat state
             inflight = 0
-        return {"handoff_n": len(held) + len(ready) + max(0, inflight),
-                "parked_n": len(parked)}
+        out = {"handoff_n": len(held) + len(ready) + max(0, inflight),
+               "parked_n": len(parked)}
+        try:
+            defer = Front._seat_rotate_plan(self, parked, ready)
+        except Exception as e:  # noqa: BLE001 -- a plan never breaks the wake
+            logger.warning("SEAT-ROTATE plan failed: %r", e)
+            defer = []
+        if defer:
+            out["parked_n"] = len(parked) - len(defer)
+            out["park_defer_rids"] = list(defer)
+        kv = Front._wake_phase_kv_tokens(self, parked, held, ready, defer, out)
+        if kv > 0:
+            out["phase_kv_tokens"] = kv
+        return out
+
+    def _wake_phase_kv_tokens(self, parked, held, ready, defer, fields) -> int:
+        """#251c: the KV tokens of the D phase this wake opens -- what D's KV
+        stage (``d_seat_vram.choose_form_stage``) must hold. The front's OWN
+        count, the one its D seat gate already charges: a seated request by
+        its seat (``d_seat_need`` at grant: realised prompt tokens once leg 1
+        answered, the arrival estimate before), a waiting one by the same
+        function. The phase's seats in D's order -- the parked ones it resumes
+        first, the ones it holds, the hand-offs in flight, then the waiting
+        ones -- summed over the first n = ``d_phase_seats`` (the rest wait for
+        a seat, their KV is not this phase's). Prompt extent only: the decode
+        growth inside the phase is not priced here (the stage granule is its
+        slack, above the top stage the youngest parks). 0 = nothing priced;
+        the field is then left off and D keeps S0 exactly as without it."""
+        seat_tokens: Dict[str, int] = {}
+        for s in list(getattr(self, "_d_seats_live", None) or ()):
+            seat_tokens[s.rid] = seat_tokens.get(s.rid, 0) + int(getattr(s, "tokens", 0) or 0)
+        D = (getattr(self, "groups", None) or {}).get("D")
+        outstanding = getattr(D, "outstanding", None) or {}
+        defer = set(defer or ())
+        order = [seat_tokens.get(r, 0) for r in parked if r not in defer]
+        order += [seat_tokens.get(r, 0) for r in held]
+        order += [t for r, t in seat_tokens.items() if r not in outstanding and r not in parked]
+        order += [d_seat_need(getattr(p, "est_prompt", 0), getattr(p, "leg1_prompt_tokens", 0))[0]
+                  for p in ready]
+        n = phase_policy.d_phase_seats(fields["handoff_n"], fields["parked_n"],
+                                       int(getattr(self, "d_bs", 0) or len(order) or 1))
+        return int(sum(order[:n]))
+
+    def _seat_rotate_note_resume(self, parked) -> None:
+        """#244: at PARK-RESUME, which parked ones resumed (the dwell) and
+        which were deferred (the fairness count); the plan was taken at this
+        flip's begin (``_seat_last_defer``)."""
+        defer = set(getattr(self, "_seat_last_defer", None) or ())
+        if getattr(self, "_seat_resumed_epoch", None) is None:
+            self._seat_resumed_epoch, self._seat_defer_n = {}, {}
+        for r in parked:
+            if r in defer:
+                self._seat_defer_n[r] = self._seat_defer_n.get(r, 0) + 1
+            else:
+                self._seat_resumed_epoch[r] = self.epoch
+                self._seat_defer_n.pop(r, None)
+        if defer:
+            logger.info("WEG2 PARK-RESUME-DEFERRED epoch=%d n=%d rids=%s (#244: their seats went to "
+                        "requests waiting past the bound)", self.epoch, len(defer), sorted(defer)[:8])
+        self._seat_last_defer = ()
+
+    def _seat_rotate_plan(self, parked, ready) -> List[str]:
+        """SA (#244 rebuilt to the user's design, weg2/seat_age.py): at the P->D
+        wake the D seats go by FRONT ARRIVAL (the rid's counter) over the parked
+        and the waiting requests (leg 1 done, in ``_ready_for_d``) -- oldest
+        first, ``--d-bs`` seats. A parked request without a seat is deferred:
+        its front seat is released (``D-REFILL freed_by=rotate``) and D treats it
+        as ordinary waiting work, placed by age (it moves in as soon as the
+        older ones leave). One ``SEAT-ROTATE`` line per deferred one. KV
+        backfill is the admitter's (it holds D's reading). Returns the
+        deferred parked rids."""
+        from sglang.srt.weg2 import seat_age as _sa
+
+        if not _sa.enabled() or not parked:
+            return []
+        waiters = [p for p in ready if getattr(p, "leg1_done", False)
+                   and not (getattr(p, "fut", None) is not None and p.fut.done())]
+        if not waiters:
+            return []
+        seats = int(getattr(self, "d_bs", 0) or 0) or len(parked)
+        chosen = set(_sa.plan_seats([(r, 0) for r in parked] + [(p.rid, 0) for p in waiters], seats))
+        deferred = _sa.by_age([r for r in parked if r not in chosen])
+        takers = _sa.by_age([p for p in waiters if p.rid in chosen])
+        now = time.time()
+        epoch = int(getattr(self, "epoch", 0))
+        out = []
+        for k, r_out in enumerate(deferred):
+            p_in = takers[k] if k < len(takers) else None
+            if p_in is None:
+                break
+            out.append(r_out)
+            self.counters["seat_rotate"] += 1
+            waited = now - (float(getattr(p_in, "t_ready", 0.0) or 0.0) or float(p_in.t_arrive))
+            logger.warning("WEG2 SEAT-ROTATE rid_in=%s rid_out=%s reason=age waited_s=%.1f epoch=%d "
+                           "(arrival order: the older request takes the seat of the younger parked one; "
+                           "it waits on D as ordinary work and moves in when a seat frees)",
+                           p_in.rid, r_out, waited, epoch)
+            for _st in list(getattr(self, "_d_seats_live", ()) or ()):
+                if getattr(_st, "rid", None) == r_out:
+                    _st.release("rotate")
+        return out
+
+    # -- RESUME-VIA-P (weg2/resume_via_p.py) ---------------------------------
+    def _rvp_state(self) -> None:
+        if getattr(self, "_rvp_dir", None) is None:
+            self._rvp_dir = _rvp.needs_p_dir(getattr(self, "tag", "") or "") if _rvp.enabled() else ""
+            self._rvp_p_done: Dict[str, Tuple[float, float]] = {}
+            self._front_price: Dict[str, int] = {}
+            # ROS: rids whose leg-2 stream is still in the lookahead (nothing
+            # committed to the client), and the held ones the lookahead must
+            # answer with X-REQUEUE.
+            self._leg2_lookahead: Set[str] = set()
+            self._rvp_requeue: Dict[str, dict] = {}
+            # ROS-1P (NF rc12p): ONE path per rid. rids whose client stream
+            # ended (no P-only leg may start for them any more) and rids with a
+            # P-only leg queued or in flight (a second needs-p is the same hold).
+            self._rvp_ended: Dict[str, float] = {}
+            self._rvp_inflight: Set[str] = set()
+            # VISION hold: the ORIGINAL (path, payload) of every leg-2 stream in
+            # flight, for a P leg that must carry the image (bounded, dropped at
+            # the stream's end).
+            self._rvp_bodies: Dict[str, Tuple[str, dict]] = {}
+
+    def _note_front_price(self, rid: str, uncached: int) -> None:
+        """The front's route-time price of a rid, for the W50-REROUTE line."""
+        self._rvp_state()
+        self._front_price[str(rid)] = int(uncached)
+        while len(self._front_price) > 4096:
+            self._front_price.pop(next(iter(self._front_price)))
+
+    def _rvp_take(self) -> int:
+        """Take D's needs-P requests and queue a P-only leg 1 for each. One
+        scandir of a small directory per controller pass; nothing when off."""
+        self._rvp_state()
+        if not self._rvp_dir:
+            return 0
+        reqs = _rvp.take_requests(self._rvp_dir)
+        now = time.time()
+        for r in reqs:
+            rid = str(r.get("rid") or "")
+            ids = [int(t) for t in (r.get("input_ids") or ())]
+            if not rid or not ids:
+                continue
+            # ROS-1P (NF rc12p, weg2-9-39): a held-uncommitted stream is NOT
+            # re-queued any more -- the requeue started a second path for the
+            # rid while D kept its park (D streamed 154 tokens on the old
+            # stream, the requeued leg 2 answered an empty 200). D holds, P
+            # prefills, D continues the one stream; the lookahead just keeps
+            # reading it. Same P-only leg as mid-stream.
+            if rid in self._rvp_ended:
+                self.counters["rvp_after_end_dropped"] += 1
+                logger.warning("RESUME-VIA-P needs-p rid=%s dropped: its client stream already "
+                               "ended (no P-only leg for a finished stream)", rid)
+                continue
+            if rid in self._rvp_inflight:
+                self.counters["rvp_duplicate_dropped"] += 1
+                logger.info("RESUME-VIA-P needs-p rid=%s dropped: a P-only leg for it is already "
+                            "queued or running (one path per rid)", rid)
+                continue
+            _path = "held-uncommitted" if rid in self._leg2_lookahead else "midstream"
+            if r.get("reason") == _rvp.REASON_VISION:
+                # VISION after the first byte: P must see the IMAGE -- its leg is
+                # the ORIGINAL request (leg1 sends max_tokens=1). P renders the same
+                # prompt ids (same template/tokenizer, image pad values from the
+                # image hash), so D's read of its prompt finds P's pages; the
+                # streamed output tail is text and D prefills it itself.
+                body = self._rvp_bodies.get(rid)
+                if body is None:
+                    self.counters["rvp_vision_no_body"] += 1
+                    logger.error("RESUME-VIA-P vision rid=%s: no original body on this front (not a "
+                                 "stream it serves) -- aborting D's hold by name", rid)
+                    self._rvp_abort_task = asyncio.ensure_future(self._rvp_abort_d(rid))
+                    continue
+                v_path, v_payload = body
+                v_payload = dict(v_payload)
+                v_payload["rid"] = rid
+                p = Pending(rid=rid, path=v_path, payload=v_payload, text=f"\x00rvp:{rid}",
+                            t_arrive=now, fut=asyncio.get_event_loop().create_future(),
+                            est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
+                            span_known=True, p_only=True, resume_via_p=True)
+                self.counters["rvp_vision"] += 1
+            else:
+                payload = {"rid": rid, "input_ids": ids,
+                           "sampling_params": {"max_new_tokens": 1, "temperature": 0.0}}
+                # Q-530 SALT-ISOLATION: P prefills D's context in the rid's own
+                # namespace -- D reads it back under that key (D's needs-P record,
+                # else the arrival's note). Without it P's pages land under None.
+                _ek = r.get("extra_key")
+                if _ek is None:
+                    _note = (self.__dict__.get("_ns_ek") or {}).get(rid)
+                    _ek = _note[1] if _note is not None and _note[0] else None
+                if _ek is not None:
+                    payload["extra_key"] = str(_ek)
+                    logger.info("WEG2 NS-ISOLATED rvp rid=%s ns=salted (Q-530: the needs-P leg runs "
+                                "in the request's namespace)", rid)
+                p = Pending(rid=rid, path="/generate", payload=payload, text=f"\x00rvp:{rid}",
+                            t_arrive=now, fut=asyncio.get_event_loop().create_future(),
+                            est_prompt=len(ids), est_uncached=int(r.get("d_extent") or len(ids)),
+                            span_known=True, p_only=True, resume_via_p=True)
+            self.queue.append(p)
+            self._rvp_inflight.add(rid)
+            self.counters["rvp_rerouted"] += 1
+            if str(r.get("reason", "")).startswith("x_refusal_midstream"):
+                self.counters["route_reroute_midstream"] = self.counters.get("route_reroute_midstream", 0) + 1  # FEHLT 8
+            logger.warning(
+                "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%d reason=%s path=%s "
+                "tokens=%d attempt=%s -- D kept the stream and parked the request; P prefills its "
+                "context (P-only leg 1, /generate), D resumes after the flip back",
+                rid, self._front_price.get(rid, "?"), int(r.get("d_extent") or 0),
+                r.get("reason", "?"), _path, len(ids), r.get("attempt", "?"))
+            if int(r.get("attempt") or 1) > 1:
+                # KRIT3: the one further sequential P leg after a refusal that
+                # followed RESUME-VIA-P (weg2/resume_via_p.py MAX_ATTEMPTS).
+                self.counters["rvp_attempt2"] += 1
+                logger.warning("RESUME-VIA-P attempt=%s rid=%s: D refused it again after its P leg "
+                               "(d_extent=%d) -- one more sequential P leg; a refusal after this "
+                               "one ends the stream by name", r.get("attempt"), rid,
+                               int(r.get("d_extent") or 0))
+        if reqs:
+            self._kick_controller("arrival")
+        return len(reqs)
+
+    def _rvp_p_finished(self, p: "Pending") -> None:
+        """P's leg 1 of a RESUME-VIA-P request is done: no leg 2 (D holds the
+        stream); the stream's next chunk closes the record.
+
+        ROS-1P (NF rc12p: 13 of 19 p-done lines followed "leg1 on P returned
+        400: Duplicate request ID"): p-done only for a leg that SUCCEEDED
+        (``leg1_done``). A failed leg logs ``RESUME-VIA-P p-failed`` and aborts
+        D's parked request by name -- the client gets an error, not a wait."""
+        self._rvp_state()
+        self._rvp_inflight.discard(p.rid)
+        if not getattr(p, "leg1_done", False):
+            self.counters["rvp_p_failed"] += 1
+            err = None
+            try:
+                err = p.fut.exception() if p.fut.done() else None
+            except Exception:  # noqa: BLE001 -- a cancelled fut
+                err = None
+            logger.error("RESUME-VIA-P p-failed rid=%s: P's prefill leg did not succeed (%s); "
+                         "aborting D's parked request by name", p.rid, err)
+            if not p.fut.done():
+                p.fut.set_result(None)
+            if p.rid not in self._rvp_ended:
+                self._rvp_abort_task = asyncio.ensure_future(self._rvp_abort_d(p.rid))
+            return
+        if p.rid in self._rvp_ended:
+            self.counters["rvp_p_done_after_end"] += 1
+            logger.info("RESUME-VIA-P p-done rid=%s after its stream ended -- dropped", p.rid)
+            if not p.fut.done():
+                p.fut.set_result(None)
+            return
+        now = time.time()
+        p_ms = (now - float(p.t_arrive)) * 1000.0
+        self._rvp_p_done[p.rid] = (now, p_ms)
+        while len(self._rvp_p_done) > 1024:
+            self._rvp_p_done.pop(next(iter(self._rvp_p_done)))
+        if not p.fut.done():
+            p.fut.set_result(None)
+        logger.info("RESUME-VIA-P p-done rid=%s p_ms=%.0f (reroute -> P prefill done, flips "
+                    "included) tokens=%d", p.rid, p_ms, int(p.est_prompt))
+
+    async def _rvp_abort_d(self, rid: str) -> None:
+        """ROS-1P: the named abort of D's parked request after a failed P leg."""
+        try:
+            code, body = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+            logger.error("RESUME-VIA-P p-failed rid=%s -> /abort_request on D: %s %s", rid, code,
+                         str(body)[:200])
+        except Exception as e:  # noqa: BLE001
+            logger.error("RESUME-VIA-P p-failed rid=%s -> /abort_request on D raised: %s", rid, e)
+
+    def _rvp_stream_begin(self, rid: str) -> None:
+        """ROS-1P: a leg 2 for ``rid`` starts (a fresh X-REQUEUE re-enters leg 2
+        under the same rid) -- its earlier end no longer applies."""
+        if getattr(self, "_rvp_ended", None) is not None:
+            self._rvp_ended.pop(rid, None)
+
+    def _rvp_stream_end(self, rid: str) -> None:
+        """ROS-1P (NF rc12p: weg2-10-44 ran 3x on P, weg2-10-42 2x, 44.6 s of P
+        for finished streams; WAIT-BOUND named weg2-10-42 2 min after it was
+        served): the client stream of ``rid`` ended, however it ended. Drop
+        every RESUME-VIA-P record of it, its needs-p file and its queued P-only
+        legs; mark it so no P-only leg starts for it any more."""
+        if getattr(self, "_rvp_dir", None) is None:
+            return
+        self._rvp_p_done.pop(rid, None)
+        self._rvp_requeue.pop(rid, None)
+        self._leg2_lookahead.discard(rid)
+        getattr(self, "_rvp_bodies", {}).pop(rid, None)
+        self._rvp_ended[rid] = time.time()
+        while len(self._rvp_ended) > 4096:
+            self._rvp_ended.pop(next(iter(self._rvp_ended)))
+        dropped = 0
+        for q in list(self.queue):
+            if getattr(q, "resume_via_p", False) and q.rid == rid:
+                self.queue.remove(q)
+                self._rvp_inflight.discard(rid)
+                if not q.fut.done():
+                    q.fut.set_result(None)
+                dropped += 1
+        if self._rvp_dir:
+            try:
+                os.remove(os.path.join(self._rvp_dir, f"{rid}.json"))
+                dropped += 1
+            except OSError:
+                pass
+        if dropped:
+            self.counters["rvp_orphans_dropped"] += dropped
+            logger.info("RESUME-VIA-P stream-end rid=%s: %d orphan(s) dropped (queued P-only "
+                        "leg / needs-p file)", rid, dropped)
+
+    def _ros_lookahead_begin(self, rid: str) -> Optional[Callable[[], bool]]:
+        """ROS: register ``rid``'s leg-2 lookahead (nothing committed to the
+        client yet); returns the lookahead's stop test, or None when ROS or
+        RESUME-VIA-P is off (the old reads, byte for byte)."""
+        if not (_rvp.enabled() and _rvp.open_stream_enabled()):
+            return None
+        self._rvp_state()
+        if not self._rvp_dir:
+            return None
+        self._leg2_lookahead.add(rid)
+
+        def _stop() -> bool:
+            if rid not in self._rvp_requeue:
+                self._rvp_take()  # one scandir; D's hold lands within a poll
+            return rid in self._rvp_requeue
+
+        return _stop
+
+    def _ros_lookahead_end(self, rid: str) -> Optional[dict]:
+        """ROS: the lookahead is over (the next statement commits or re-routes):
+        unregister and return D's held record for ``rid``, if one came."""
+        self._leg2_lookahead.discard(rid)
+        return self._rvp_requeue.pop(rid, None)
+
+    def _rvp_resumed(self, rid: str) -> None:
+        rec = self._rvp_p_done.pop(rid, None)
+        if rec is None:
+            return
+        t_done, p_ms = rec
+        self.counters["rvp_resumed"] += 1
+        logger.info("RESUME-VIA-P done rid=%s p_ms=%.0f d_resume_ms=%.0f (the client's stream "
+                    "moved again)", rid, p_ms, (time.time() - t_done) * 1000.0)
 
     def _immediate_park_due(self, D: Group, now: float) -> Optional["Pending"]:
         """27B PARK: the queued request that fires the immediate park now, or
@@ -3499,12 +4986,71 @@ class Front:
         decodes the parked requests for at least the price of its flip."""
         if self._park_attempt_epoch == self.epoch or not self._flip_ledger(D):
             return None
+        if _decode_collect_window_s() > 0.0:
+            # DECODE-COLLECT (user 02.10.): the window wins over every park rule
+            dc = self._decode_collect(now)
+            if dc == "hold":
+                return None
+            if dc == "D":
+                self._dc_hand_to_d(now)  # the small set: D prefills it now
+                return None
+            if dc == "P":
+                live = [q for q in self.queue if not q.fut.done()]
+                if not live or not self._dc_p_seat_gate(now):
+                    return None  # SEAT GATE: no free seat on D -> no prefill on P
+                return min(live, key=lambda q: float(q.t_arrive))
         p = phase_policy.immediate_park_trigger(self.queue, int(self.tp_prefill_max_tokens))
         if p is None:
+            if envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():  # off: nothing touched
+                self._park_window_send(D, -1)
             return None
         need_ms, prov = self._derived_min_dwell_ms("D", "P")
+        if envs.SGLANG_WEG2_PARK_NO_DWELL.get():
+            # PARK-NO-DWELL (user 02.10.): the arrival is prefilled at once -- no
+            # dwell, no collect window, no floor; the running decodes park now.
+            self.counters["park_no_dwell"] = self.counters.get("park_no_dwell", 0) + 1
+            if self.__dict__.get("_park_no_dwell_epoch") != self.epoch:
+                self._park_no_dwell_epoch = self.epoch
+                logger.info("WEG2 PARK-NO-DWELL epoch=%d rid=%s awake_ms=%d running=%d would_hold_ms=%d "
+                            "(%s) floor_ms=%d -- a request over X arrived: D's decodes park now, no "
+                            "dwell (SGLANG_WEG2_PARK_NO_DWELL)", self.epoch, p.rid,
+                            int((now - self.t_awake) * 1000.0), len(self._flip_ledger(D)),
+                            int(max(need_ms, FAIRNESS_DWELL_FLOOR_MS)), prov, int(FAIRNESS_DWELL_FLOOR_MS))
+            return p
+        collect = envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
+        # PARK-CYCLE DWELL: a D phase that began by resuming parked requests is
+        # priced at the whole park cycle (both flips), not at one flip.
+        # PARK-COLLECT-WINDOW replaces it and PARK-DECODE-DWELL: its ski price
+        # already charges the round trip, per running stream (27B review 29.09.).
+        resumed = getattr(self, "_park_resume_epoch", -1) == self.epoch
+        if resumed and phase_policy.park_cycle_dwell_on() and not collect:
+            back_ms, back_prov = self._derived_min_dwell_ms("P", "D")
+            need_ms = phase_policy.park_cycle_dwell_ms(need_ms, back_ms, True)
+            prov = f"{prov}+cycle:{back_prov}={int(back_ms)}ms"
         awake_s = now - self.t_awake
-        if not phase_policy.immediate_park_dwell_ok(awake_s, need_ms, FAIRNESS_DWELL_FLOOR_MS):
+        if phase_policy.park_decode_dwell_on() and not collect:
+            # PARK-DECODE-DWELL (NF rc12z22 14:52-14:58): the cycle is both flips
+            # plus this phase's resume, and it is counted from D's first decoded
+            # chunk -- not from the wake, which the resume's reload ate.
+            back_ms, back_prov = self._derived_min_dwell_ms("P", "D")
+            seen = getattr(self, "_d_decode_epoch", -1) == self.epoch
+            resume_ms = (self._d_decode_t0 - self.t_awake) * 1000.0 if seen else 0.0
+            if not resumed or not phase_policy.park_cycle_dwell_on():
+                need_ms = need_ms + back_ms
+                prov = f"{prov}+back:{back_prov}={int(back_ms)}ms"
+            need_ms = need_ms + max(0.0, resume_ms)
+            prov = f"{prov}+resume={int(resume_ms)}ms decode-clock"
+            decode_s = (now - self._d_decode_t0) if seen else None
+            _duty = phase_policy.park_decode_duty()
+            prov = f"{prov} duty={_duty:.2f}"
+            dwell_ok = phase_policy.park_decode_dwell_ok(awake_s, decode_s, need_ms,
+                                                         FAIRNESS_DWELL_FLOOR_MS, _duty)
+        else:
+            dwell_ok = phase_policy.immediate_park_dwell_ok(awake_s, need_ms, FAIRNESS_DWELL_FLOOR_MS)
+        if not dwell_ok:
+            # DP-WAIT (#1416i): the wall time of the latest dwell hold -- the
+            # requests whose hold spans it name min-dwell, not only d-work
+            self._park_dwell_held_t = time.time()
             if self._park_immediate_dwell_epoch != self.epoch:
                 self._park_immediate_dwell_epoch = self.epoch
                 self.counters["park_immediate_dwell_holds"] += 1
@@ -3513,9 +5059,140 @@ class Front:
                             "phase", self.epoch, p.rid, int(awake_s * 1000.0), int(need_ms), prov,
                             int(FAIRNESS_DWELL_FLOOR_MS))
             return None
+        if collect:
+            # PARK-COLLECT-WINDOW (NF z30w-park 08:31-08:46, user 29.09.): D keeps
+            # decoding while the pending P work collects for the window; the park
+            # comes at its end, or earlier when D runs nothing or a hard cap binds.
+            x_tok = int(self.tp_prefill_max_tokens)
+            # the queued requests that need P, read by the park trigger's own reader
+            items = [(float(q.t_arrive), int(q.est_uncached)) for q in self.queue
+                     if phase_policy.immediate_park_trigger([q], x_tok) is not None]
+            threshold = int(envs.SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS.get()) or x_tok
+            round_trip_s, rt_src = self._park_collect_window_s()
+            n_running = len(self._flip_ledger(D))
+            timer = rt_src == "flag"
+            # ski rental: a park stalls every running stream for one round trip
+            price_s = round_trip_s if timer else round_trip_s * max(1, n_running)
+            fire, why, t_start, left_s = phase_policy.park_collect_window(
+                items, now, self.t_awake, n_running, price_s, threshold, timer=timer,
+                max_requests=self.p_phase_max_requests, pool_tokens=self.p_pool_tokens,
+                wait_bound_s=self.d_wait_bound_s)
+            # PARK-WINDOW-GATE: an open window (t_start set, holding) tells D its
+            # deadline; FIRE parks (D clears there), anything else clears it.
+            if not fire and envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():
+                self._park_window_send(D, int(left_s * 1000.0) if t_start is not None else -1)
+            if not fire:
+                if self._park_collect_epoch != self.epoch:
+                    self._park_collect_epoch = self.epoch
+                    self.counters["park_collect_holds"] += 1
+                    logger.info("WEG2 PARK-COLLECT-WINDOW HOLD epoch=%d rid=%s why=%s running=%d "
+                                "queued_p=%d uncached=%d threshold=%d round_trip_s=%.2f (%s) "
+                                "price_s=%.1f left_s=%.1f -- D keeps decoding, the pending P work "
+                                "collects", self.epoch, p.rid, why, n_running, len(items),
+                                sum(u for _, u in items), threshold, round_trip_s, rt_src, price_s,
+                                left_s)
+                return None
+            self.counters[f"park_collect_{why.replace('-', '_')}"] += 1
+            logger.info("WEG2 PARK-COLLECT-WINDOW FIRE epoch=%d rid=%s why=%s running=%d queued_p=%d "
+                        "uncached=%d collected_s=%.1f", self.epoch, p.rid, why, n_running, len(items),
+                        sum(u for _, u in items), (now - t_start) if t_start is not None else 0.0)
         return p
 
-    async def _wait_bound_park(self, wait_s: Optional[float], immediate: Optional["Pending"] = None) -> str:
+    def _park_window_send(self, D: Group, left_ms: int) -> None:
+        """PARK-WINDOW-GATE (27B decision 29.09. ~13:55Z): the open collect
+        window's deadline and D's X-COST-LINE to group D (``left_ms < 0`` clears
+        a window sent before). The window stays the one decision site; D only
+        refuses to START an extend that would end after it, so the park never
+        waits for one (weg2/park_window_gate). Fire and forget; off = nothing."""
+        if not envs.SGLANG_WEG2_ENABLE_PARK_WINDOW_GATE.get():
+            return
+        from sglang.srt.weg2 import park_window_gate as _pwg
+
+        line = None
+        if left_ms >= 0:
+            line, _src = self._x_cost_line_of(self._d_cost_rows, self._d_cost_all,
+                                              self._x_cost_seed)
+        body, self._park_window_sent = _pwg.front_message(
+            self._park_window_sent, epoch=self.epoch, left_ms=left_ms, line=line)
+        if body is None or self.session is None:
+            return
+        self.counters["park_window_sent" if left_ms >= 0 else "park_window_cleared"] += 1
+
+        async def _post() -> None:
+            try:
+                code, _ = await self.rpc(D, _pwg.PATH, body, 5)
+                logger.info("WEG2 PARK-WINDOW-GATE sent epoch=%d left_ms=%d status=%d",
+                            int(body["epoch"]), int(body["left_ms"]), code)
+            except Exception as e:  # noqa: BLE001 -- a lost window costs the gain only
+                logger.info("WEG2 PARK-WINDOW-GATE send failed: %r", e)
+
+        tasks = self.__dict__.setdefault("_park_window_tasks", set())
+        task = asyncio.ensure_future(_post())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _park_collect_window_s(self) -> Tuple[float, str]:
+        """PARK-COLLECT-WINDOW: one flip round trip in seconds and its source,
+        the unit of the SKI-RENTAL price (user decision 29.09.; the caller
+        charges it once per running stream) -- K7's D->P and P->D prices plus
+        the last D phase's wake -> first decoded chunk. RECORD > UNMEASURED
+        before this boot measured one: the newest round trip of this
+        checkpoint x form, else 0 (the immediate park, named).
+        SGLANG_WEG2_PARK_COLLECT_WINDOW_S overrides all of it as a fixed timer
+        (source "flag")."""
+        override = envs.SGLANG_WEG2_PARK_COLLECT_WINDOW_S.get()
+        if override is not None:
+            return float(override), "flag"
+        dp_ms, pd_ms, resume_ms, src = self._park_warm_legs_ms()
+        live = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
+        if live is not None:
+            return live, f"ski-live:{src}"
+        if self._park_rt_seed is not None:
+            return (float(self._park_rt_seed["round_trip_s"]),
+                    f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}")
+        return 0.0, f"ski-unmeasured:{self._park_form_key or 'no-form'}"
+
+    def _park_warm_legs_ms(self) -> Tuple[float, float, Optional[float], str]:
+        """PARK-COLLECT-WINDOW: the round trip's three legs from WARM samples
+        only (27B review 29.09.): K7's D->P and P->D as H34b's median of the
+        last flips after the boot's first, and the median wake -> first chunk
+        of the last D phases after the first. One slow sample cannot move the
+        price, and the cold first park (JIT, pinning) is never in it."""
+        window = int(envs.SGLANG_WEG2_MIN_DWELL_WINDOW.get())
+        dp_ms, dp_src = warm_min_dwell_ms(self.flip_log, "D", "P", window=window)
+        pd_ms, pd_src = warm_min_dwell_ms(self.flip_log, "P", "D", window=window)
+        resume_ms = phase_policy.warm_resume_ms(self._resume_ms_log, window)
+        n_warm = max(0, len(self._resume_ms_log) - 1)
+        resume_src = "none-warm" if resume_ms is None else f"{int(resume_ms)}ms:n={min(n_warm, window)}"
+        return dp_ms, pd_ms, resume_ms, f"{dp_src}+{pd_src}+resume={resume_src}"
+
+    def _note_park_round_trip(self) -> None:
+        """PARK-COLLECT-WINDOW: append this boot's first WARM round trips (the
+        medians of :meth:`_park_warm_legs_ms`) to the sidecar -- the next boot's
+        seed of the same checkpoint x form. Built at D's first decoded chunk,
+        written by the H78 writer thread."""
+        if (not (envs.SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW.get()
+                 or envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get())
+                or not self._park_form_key or not self.measured_record
+                or self._park_rt_written >= phase_policy.PARK_ROUND_TRIP_RECORDS):
+            return
+        dp_ms, pd_ms, resume_ms, _ = self._park_warm_legs_ms()
+        if phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms) is None:
+            return  # nothing warm yet: the cold first park never becomes a record
+        self._park_rt_written += 1
+        now = time.time()
+        rec = phase_policy.park_round_trip_record(
+            form_key=self._park_form_key, dp_ms=dp_ms, pd_ms=pd_ms,
+            resume_ms=float(resume_ms), boot_tag=str(self.tag), commit=self.commit,
+            at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)) + ",%03d" % int((now % 1) * 1000))
+        logger.info("WEG2 PARK-ROUND-TRIP epoch=%d round_trip_s=%.2f dp_ms=%d pd_ms=%d resume_ms=%d "
+                    "form=%s -> sidecar (the next boot's collect window of this form)", self.epoch,
+                    rec["round_trip_s"], int(dp_ms), int(pd_ms), int(resume_ms),
+                    self._park_form_key)
+        self._sidecar_submit(host_ledger.append_measured_record, self.measured_record, rec)
+
+    async def _wait_bound_park(self, wait_s: Optional[float], immediate: Optional["Pending"] = None,
+                               cause: str = "over-x") -> str:
         """Rule 3: the wait bound fired in the D phase -- park D's running
         decodes and let the controller flip.
 
@@ -3534,14 +5211,30 @@ class Front:
         running = self._flip_ledger(D)
         self.admit_d = False
         now = time.time()
-        if immediate is not None:
+        if cause == MANUAL_FLIP_PARK_CAUSE:
+            # y3k-korr 09292034: a POST /weg2/flip from D closed admission and
+            # waited in the drain for a decode it never parked (13,4 s, then
+            # 17,9 s -> DEADMAN_FLIP_STALL). Parked like the policy flip's.
+            self.counters["park_manual_flip"] += 1
+            logger.warning(
+                "WEG2 MANUAL-FLIP PARK epoch=%d running=%d ready_for_d=%d queue=%d -- "
+                "admission to D closed for this phase, %s", self.epoch, len(running),
+                len(self._ready_for_d), len(self.queue),
+                "parking the running decodes, then the manual flip to P" if running
+                else "nothing running: the manual flip follows without a park")
+        elif immediate is not None:
             # 27B PARK (user 26.09.): not a bound -- the arrival itself fires.
             self.counters["park_immediate_fired"] += 1
+            if cause != "over-x":
+                self.counters[f"park_immediate_{cause}"] += 1
             logger.warning(
-                "WEG2 PARK-IMMEDIATE FIRED epoch=%d rid=%s est_uncached=%d X=%d p_only=%s "
+                "WEG2 PARK-IMMEDIATE FIRED epoch=%d cause=%s rid=%s est_uncached=%d X=%d X_busy=%d "
+                "x_deferred=%s p_only=%s "
                 "x_requeues=%d waited_s=%.1f awake_s=%.1f running=%d ready_for_d=%d queue=%d -- "
                 "admission to D closed for this phase, %s",
-                self.epoch, immediate.rid, int(immediate.est_uncached), int(self.tp_prefill_max_tokens),
+                self.epoch, cause, immediate.rid, int(immediate.est_uncached),
+                int(self.tp_prefill_max_tokens), int(self._x_band_floor()),
+                bool(getattr(immediate, "x_deferred", False)),
                 bool(getattr(immediate, "p_only", False)), int(getattr(immediate, "x_requeues", 0) or 0),
                 max(0.0, now - float(immediate.t_arrive)), max(0.0, now - float(self.t_awake)),
                 len(running), len(self._ready_for_d), len(self.queue),
@@ -3549,7 +5242,9 @@ class Front:
                 else "nothing running: the flip to P follows without a park")
         else:
             self.counters["wait_bound_fired"] += 1
-            oldest = max(self.queue, key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
+            # ROS-1P: a served / finished request (future done) is not waiting.
+            oldest = max((p for p in self.queue if not p.fut.done()),
+                         key=lambda p: phase_policy.d_phase_wait_s(p.t_arrive, self.t_awake, now),
                          default=None)
             logger.warning(
                 "WEG2 WAIT-BOUND FIRED epoch=%d oldest_rid=%s waited_s=%.1f bound_s=%.1f "
@@ -3570,7 +5265,8 @@ class Front:
             return "unsupported"
         body = phase_policy.park_body(
             self.epoch, self.d_wait_bound_s,
-            reason=phase_policy.PARK_REASON_IMMEDIATE if immediate is not None else None)
+            reason=(MANUAL_FLIP_PARK_CAUSE if cause == MANUAL_FLIP_PARK_CAUSE
+                    else phase_policy.PARK_REASON_IMMEDIATE if immediate is not None else None))
         # H91c3-1: the park's stamp is taken BEFORE the RPC. D stamps its park
         # while serving the RPC and re-queues it after PARK_REQUEUE_S on its
         # own clock; a front stamp taken after the answer ran that clock late
@@ -3579,6 +5275,9 @@ class Front:
         # comes no later than D's re-queue. The stamp is written only for the
         # rids D confirms: a failed/unsupported park writes none (withdrawn).
         t_park = time.time()
+        # DASHBOARD-IPC: the D->P flip's Vorlauf starts with its park RPC (front.flip)
+        if Front._flip_phase(self).vorlauf("D>P", f"park:{body['reason']}", t_park):
+            Front._ipc_live_kick(self)
         try:
             code, text = await self.rpc(D, phase_policy.PARK_PATH, body, phase_policy.PARK_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001 -- a failed park falls back, never kills the phase
@@ -3604,6 +5303,12 @@ class Front:
             return "failed"
         known = [r for r in rids if r in D.outstanding]
         unknown = [r for r in rids if r not in D.outstanding]
+        # X-CREDIT-INFLIGHT-1002: the park's #59b depths cap in-flight presence.
+        self._d_inflight_park(park_resumable_depths(text))
+        # SEQ-HASH (02.10.): the parked legs' sequence marks at their #59b depths
+        self._seq_park(park_seq_marks(text))
+        # PARK-HANDBACK: prefill D holds unstarted goes to P's batch
+        self._park_handback(park_held_rids(text) + [r for r in self._flip_ledger(D) if r not in rids])
         # H91c3-2: a hand-off already in ``D.outstanding`` whose leg 2 had not
         # reached D's scheduler when the park came (tokenizer / HTTP pipe) is
         # in neither of D's lists. A D that answers ``late_hold`` holds every
@@ -3617,9 +5322,24 @@ class Front:
             late = [r for r in self._flip_ledger(D) if r not in rids]
         for r in known + late:
             self._d_parked[r] = t_park
+        _ps = getattr(self, "_park_stuck", None)  # #287 NEED0 (c): the streak, as IPC
+        if _ps is not None:
+            _ps().note_park(known + late)
+        for r in known + late:  # DASHBOARD-IPC: one `park` event per episode (at its resume)
+            Front._req_book(self).park(r, t_park, f"wait_bound:{body['reason']}", self.epoch)
+        Front._rb_changed(self)
         self.counters["d_parked"] += len(known) + len(late)
         self.counters["d_parked_in_flight"] += len(late)
         still = self._flip_ledger(D)
+        if still:
+            # PARK-SETTLE (28.09.): a park that leaves D work running is PARTIAL --
+            # the D->P drain then waits for those decodes (27.09. 10:24:34: 171 s for
+            # the request that fired the park). Named, so a boot shows it by count.
+            self.counters["park_partial"] += 1
+            logger.warning(
+                "WEG2 PARK-PARTIAL epoch=%d still_running=%s late_hold=%s -- the drain waits for "
+                "these decodes; D's park should have taken them (settle, late hand-off)",
+                self.epoch, still[:8], phase_policy.park_late_hold(code, text))
         logger.warning(
             "WEG2 PARK-RUNNING epoch=%d reason=%s status=%d parked=%d rids=%s unknown_to_front=%s "
             "in_flight_held=%s still_running=%s rpc_s=%.2f -- parked requests stay in flight "
@@ -3627,6 +5347,8 @@ class Front:
             "before the new ones; the D->P drain waits only for still_running",
             self.epoch, body["reason"], code, len(known) + len(late), known[:8], unknown[:8],
             late[:8], still[:8], time.time() - t_park)
+        # D->P flip time (user definition): D's decodes stopped with this park
+        self._ipc_dp_clock().note_park(self.epoch, t_park, (time.time() - t_park) * 1000.0)
         return "parked"
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
@@ -3915,24 +5637,9 @@ class Front:
         if reading is None:
             self._d_token_hold_rid = None
             return False
-        need, need_source = d_seat_need(est_tokens, realised_tokens)
-        charged = self._d_charged_since(reading["t"])
-        raw_available = int(reading["available"]) - charged
-        limit = int(reading["limit"])
-        occupied = int(reading["occupied"]) + charged
-        if self.d_admit_max_tokens is not None:
-            # The operator ceiling bounds the SAME quantity, never replaces it.
-            raw_available = min(raw_available, self.d_admit_max_tokens - occupied)
-        # THE CLAMP, and the over-charge kept rather than swallowed by it: the
-        # comparison below wants "rows this request may have", which cannot be
-        # less than none, while the diagnosis wants "by how much the
-        # extrapolation has overshot the reading it hangs on".  Two questions,
-        # so two numbers -- folding them into one signed integer is what put
-        # `available=-1663` on a line whose reader had no way to tell an
-        # exhausted pool from a stale anchor.
-        available = max(0, raw_available)
-        over_charged = max(0, -raw_available)
-        if need <= available and occupied < limit:
+        fits, need, need_source, available, over_charged, limit, occupied, charged = (
+            self._d_budget_terms(est_tokens, reading, realised_tokens))
+        if fits:
             self._d_token_hold_rid = None
             return False
         self.counters["d_admit_token_held"] += 1
@@ -3954,6 +5661,56 @@ class Front:
                 self._d_inflight_tokens(), self.seats_free(), held,
             )
         return True
+
+    def _ready_for_d_drop(self, q: "Pending") -> None:
+        """Remove ``q`` from ``_ready_for_d`` BY IDENTITY. ``deque.remove``
+        compares with ``Pending.__eq__`` (dataclass, field by field): it can
+        drop a different request with equal fields and walks every field of
+        every entry before it (a partial Pending raised AttributeError there,
+        test_weg2_sched_fix3_0907 a1)."""
+        for i, r in enumerate(self._ready_for_d):
+            if r is q:
+                del self._ready_for_d[i]
+                return
+
+    def _d_budget_terms(self, est_tokens: int, reading: Dict[str, Any],
+                        realised_tokens: int = 0) -> Tuple[bool, int, str, int, int, int, int, int]:
+        """The ONE derivation of the #915 seat-vs-pool terms, shared by the
+        gate (:meth:`_d_token_budget_blocks`) and the SA backfill probe
+        (:meth:`_d_budget_fits`): ``(fits, need, need_source, available,
+        over_charged, limit, occupied, charged)``. Pure -- no counter, no
+        hold-rid, no line."""
+        need, need_source = d_seat_need(est_tokens, realised_tokens)
+        charged = self._d_charged_since(reading["t"])
+        raw_available = int(reading["available"]) - charged
+        limit = int(reading["limit"])
+        occupied = int(reading["occupied"]) + charged
+        if self.d_admit_max_tokens is not None:
+            # The operator ceiling bounds the SAME quantity, never replaces it.
+            raw_available = min(raw_available, self.d_admit_max_tokens - occupied)
+        # THE CLAMP, and the over-charge kept rather than swallowed by it: the
+        # comparison below wants "rows this request may have", which cannot be
+        # less than none, while the diagnosis wants "by how much the
+        # extrapolation has overshot the reading it hangs on".  Two questions,
+        # so two numbers -- folding them into one signed integer is what put
+        # `available=-1663` on a line whose reader had no way to tell an
+        # exhausted pool from a stale anchor.
+        available = max(0, raw_available)
+        over_charged = max(0, -raw_available)
+        fits = need <= available and occupied < limit
+        return fits, need, need_source, available, over_charged, limit, occupied, charged
+
+    def _d_budget_fits(self, est_tokens: int, reading: Optional[Dict[str, Any]],
+                       realised_tokens: int = 0) -> bool:
+        """SA backfill PROBE: would this request pass the gate now? The gate's
+        own terms (:meth:`_d_budget_terms`) and its two open-gate cases, but
+        side-effect free -- probing candidates must not count
+        ``d_admit_token_held`` or flip the D-SEAT-WAIT hold rid (one line per
+        probe and 50 ms pass). The request finally seated still goes through
+        the ONE ``_d_token_budget_blocks`` call of the admitter."""
+        if self.d_admit_max_tokens == 0 or not self._d_seats_live or reading is None:
+            return True
+        return self._d_budget_terms(est_tokens, reading, realised_tokens)[0]
 
     def _sync_batch_gate(self) -> None:
         """THE ONLY writer of ``_batch_gate`` (C5).
@@ -3980,7 +5737,10 @@ class Front:
         # rpc_keepalive: the client's idle bound sits below the groups'.
         self.session = ClientSession(timeout=ClientTimeout(total=3600),
                                      connector=rpc_connector(),
-                                     trace_configs=[make_rpc_trace_config()])
+                                     trace_configs=[make_rpc_trace_config(),
+                                                    # #55 F2: the group request waits for the async unlock
+                                                    *_idle_clock_mod.trace_configs(
+                                                        getattr(self, "_idle_clock", None))])
         _ka_client, _ka_server, _ka_src = rpc_keepalive()
         logger.info("WEG2-FRONT RPC-KEEPALIVE client=%s server=%.1f s (%s) -- a pooled connection "
                     "idle longer than the client bound is closed, never written into; the groups "
@@ -3993,6 +5753,8 @@ class Front:
         # #1262 tier 3 -- the deadman's third signal, see flip_stall_check.
         app["flip_stall"] = asyncio.create_task(self.flip_stall_sampler())
         app["host_watermark"] = asyncio.create_task(self.host_watermark_sampler())
+        # DASHBOARD-AUS-IPC (b): the front's own keys under state.json `front`.
+        app["ipc_front"] = asyncio.create_task(self.ipc_front_writer())
         # H75 (x174): resolve_x_live imports the launcher module on its first
         # call, i.e. inside the first completed flip, and that import costs
         # 5-7 s. On the event loop it froze the whole front for that long
@@ -4011,6 +5773,18 @@ class Front:
         # H78: a full GC pass holds the loop ~220 ms in this heap; the launcher
         # prewarm freezes the module heap, and this names any pass still slow.
         app["gc_pause_probe"] = install_gc_pause_probe()
+        # GC-GUARD (02.10., N5q epoch 4: a 92 ms full pass between the P>D done and
+        # the D>P begin): no automatic generation-2 pass; the due one runs where no
+        # flip and no queued verdict waits, and the warm-up end freezes again.
+        if envs.SGLANG_WEG2_FRONT_GC_GUARD.get():
+            _g = _gcg.GcGuard(max_defer_s=envs.SGLANG_WEG2_FRONT_GC_MAX_DEFER_S.get())
+            if _g.arm():
+                self._gc_guard_obj = _g
+                app["gc_guard"] = asyncio.create_task(self.gc_guard_sampler())
+                app["gc_warm_freeze"] = asyncio.create_task(self._gc_warm_freeze(app))
+        else:
+            logger.info("WEG2-FRONT GC-GUARD armed=0 reason=switch-off (SGLANG_WEG2_FRONT_GC_GUARD=0: "
+                        "CPython's own schedule, as before)")
         logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound, 0 = off) "
                     "carrier_max_tokens=%d p_concurrency=%d d_bs=%d X=%d flip_min_work_tokens=%d "
                     "idle_layout=%s min_dwell_ms=%s drain_deadline_s=%.0f d_admit_max_tokens=%d "
@@ -4030,6 +5804,41 @@ class Front:
         logger.info("%s", front_span_inflight_line())
         # 27B idle policy: the resting layout and the two hold/drain settings.
         logger.info("%s", self.idle_policy_line())
+
+    #: GC-GUARD: the startup tasks whose objects the warm-up freeze takes along.
+    GC_WARM_TASKS = ("launcher_prewarm", "flip_imports_prewarm", "sidecar_prewarm", "x_exact")
+
+    def _gc_critical(self) -> Tuple[bool, bool]:
+        """GC-GUARD: (critical, flipping). Critical = a flip is open or a queued
+        verdict waits for one -- the moments the D>P Vorlauf is made of."""
+        flipping = getattr(self, "state", None) == "flipping"
+        return flipping or bool(getattr(self, "queue", None)), flipping
+
+    async def gc_guard_sampler(self) -> None:
+        """GC-GUARD: ask the guard every POLL_S whether the due full pass may run now."""
+        g = self.__dict__.get("_gc_guard_obj")
+        if g is None:
+            return
+        told = False
+        while True:
+            await asyncio.sleep(_gcg.POLL_S)
+            try:
+                critical, flipping = Front._gc_critical(self)
+                g.step(critical, flipping)
+            except Exception as e:  # noqa: BLE001 -- an instrument-grade helper never kills the front
+                if not told:
+                    told = True
+                    logger.warning("WEG2-FRONT GC-GUARD step failed: %r (the guard keeps trying)", e)
+
+    async def _gc_warm_freeze(self, app) -> None:
+        """GC-GUARD: once every warm-up task ended (ready or failed), freeze what
+        it built -- the H78 freeze ran before the X-EXACT stack was loaded."""
+        g = self.__dict__.get("_gc_guard_obj")
+        tasks = [app[k] for k in self.GC_WARM_TASKS if app.get(k) is not None]
+        if tasks:
+            await asyncio.wait(tasks)
+        if g is not None:
+            g.warm_freeze("+".join(k for k in self.GC_WARM_TASKS if app.get(k) is not None) or "startup")
 
     async def _prewarm_launcher_import(self) -> None:
         """H75: import ``sglang.srt.weg2.launcher`` off the event loop.
@@ -4051,15 +5860,96 @@ class Front:
                     time.monotonic() - t0)
 
     # -- X-EXACT (user 26.09. ~19:00Z): exact pending tokens ------------------
+    #: BOOT-START HOLD bound: the longest a route decision waits for the front
+    #: tokenizer (y7d: load_s=10.1 after the first group answered).
+    X_EXACT_HOLD_MAX_S = 30.0
+
+    def _x_exact_ready_event(self) -> asyncio.Event:
+        """BOOT-START HOLD: set once the front tokenizer's load ENDED (ready or
+        failed); created lazily in the running loop."""
+        evt = self.__dict__.get("_x_exact_ready_evt")
+        if evt is None:
+            evt = self.__dict__["_x_exact_ready_evt"] = asyncio.Event()
+        return evt
+
     async def _x_exact_boot(self) -> None:
+        """BOOT-START HOLD (y7d 08:57:43, weg2-0-2..0-4 priced by chars/3 with
+        ``reason=tokenizer_loading`` and flipped for 24..170 real tokens): the
+        load runs, and whatever its end, the route decisions held behind it
+        are released (:meth:`_x_exact_await_tokenizer`)."""
+        try:
+            await self._x_exact_boot_load()
+        finally:
+            self._x_exact_ready_event().set()
+            if envs.SGLANG_WEG2_FRONT_TOKENIZER_PREWARM.get():
+                ft = self.__dict__.get("ftok")
+                t0 = self.__dict__.get("_x_exact_t0")
+                logger.info(
+                    "WEG2 FRONT-PREWARM done after %.1f s state=%s load_s=%.1f warm_ms=%.0f%s "
+                    "probe=%s -- /weg2/state reports serving from now: a host waiting for it "
+                    "sends its first request into a warm front (tokenizer stack loaded, L3 "
+                    "presence probe open), no X-EXACT-HOLD",
+                    (time.monotonic() - t0) if t0 is not None else -1.0,
+                    getattr(ft, "state", "none"), float(getattr(ft, "load_s", 0.0) or 0.0),
+                    float(getattr(ft, "warm_ms", 0.0) or 0.0),
+                    (" warm_failed=" + ft.warm_why) if getattr(ft, "warm_why", "") else "",
+                    "open" if self.__dict__.get("store_probe") is not None
+                    else self.__dict__.get("_store_probe_why", "not opened"))
+
+    def _reported_state(self) -> str:
+        """FRONT-PREWARM: what /weg2/state calls the front. ``warming`` while the
+        boot's X-EXACT load runs (tokenizer stack + L3 presence probe) and the
+        X_EXACT_HOLD_MAX_S bound since the front's start has not passed; else
+        the front's own state, which this never changes."""
+        if (self.state == "serving" and self.__dict__.get("x_exact")
+                and envs.SGLANG_WEG2_FRONT_TOKENIZER_PREWARM.get()):
+            evt = self.__dict__.get("_x_exact_ready_evt")
+            t0 = self.__dict__.get("_x_exact_t0")
+            if not (evt is not None and evt.is_set()) and t0 is not None \
+                    and time.monotonic() - t0 < self.X_EXACT_HOLD_MAX_S:
+                return "warming"
+        return self.state
+
+    async def _x_exact_await_tokenizer(self, rid: str) -> None:
+        """BOOT-START HOLD: an arrival while the front tokenizer is still
+        loading waits for it -- the ROUTE DECISION waits, the request is
+        accepted and nothing else in the front does. It is never priced by
+        chars/3 because the tokenizer was loading (a failed load still falls
+        back by name: ``reason=tokenizer_failed``). Costs a boot's first
+        arrivals the rest of the ~10 s load; a chars/3 LONG costs them a flip
+        pair."""
+        ft = self.ftok
+        if ft is None or ft.state not in ("unloaded", "loading"):
+            return
+        t0 = time.monotonic()
+        self.counters["x_exact_held"] += 1
+        # HOLD-BOUND (02.10.): never unbounded. The load waits for a group's
+        # /get_server_info with no end of its own (and a front whose startup
+        # hook never ran has no load at all), so the hold ends after
+        # X_EXACT_HOLD_MAX_S whatever the load does: the route decision then
+        # falls back by name (X-EXACT-FALLBACK reason=tokenizer_loading).
+        try:
+            await asyncio.wait_for(self._x_exact_ready_event().wait(), self.X_EXACT_HOLD_MAX_S)
+        except asyncio.TimeoutError:
+            self.counters["x_exact_hold_timeout"] += 1
+            logger.warning("WEG2 X-EXACT-HOLD-TIMEOUT rid=%s waited_ms=%.0f state=%s bound_s=%.0f -- "
+                           "the front tokenizer did not finish loading within the bound; this route "
+                           "decision goes on without it (chars/3, by name), the load continues",
+                           rid, (time.monotonic() - t0) * 1000.0, ft.state, self.X_EXACT_HOLD_MAX_S)
+            return
+        logger.info("WEG2 X-EXACT-HOLD rid=%s waited_ms=%.0f state=%s (the route decision waited "
+                    "for the front tokenizer; a boot-start arrival is never priced by chars/3 "
+                    "because the tokenizer was loading)", rid, (time.monotonic() - t0) * 1000.0,
+                    ft.state)
+
+    async def _x_exact_boot_load(self) -> None:
         """Load D's rendering stack into the front, off the event loop.
 
         The tokenizer path and every rendering setting come from a group's own
         ``/get_server_info`` (the same server args its tokenizer manager
         runs), so there is one source for the profile's tokenizer: the group.
         Startup only: retried every 5 s until a group answers, then never
-        again. Until READY every request is priced by chars/3 and says so
-        (``X-EXACT-FALLBACK reason=tokenizer_loading``)."""
+        again. Until READY every route decision waits (BOOT-START HOLD)."""
         t0 = time.monotonic()
         tries = 0
         info: Dict[str, Any] = {}
@@ -4114,28 +6004,136 @@ class Front:
             info.get("chat_template_default_kwargs"), info.get("reasoning_parser"),
             info.get("tool_call_parser"), int(is_mm),
             int(bool(envs.SGLANG_ANTHROPIC_INLINE_SYSTEM_IN_PLACE.get())), ft.why, ft.load_s)
+        self._store_probe_info = info
+        await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)
+
+    #: L3-INDEX PRICE: a probe that could not open is retried at most this often
+    STORE_PROBE_RETRY_S = 30.0
+
+    def _store_probe_open(self) -> None:
+        """L3-INDEX PRICE: join the shared L3 stem index the ranks opened (worker
+        thread). Page size and hybrid-ness from the group's server args; the
+        bigram key scheme and the arena dir from the env the launcher hands the
+        front (the groups' own values)."""
+        from sglang.srt.weg2.front_store import open_store_presence
+
+        info = self.__dict__.get("_store_probe_info") or {}
+        self._store_probe_t = time.monotonic()
+        arena_dir = os.environ.get("SGLANG_HICACHE_ARENA_DIR")
+        if arena_dir is None:
+            arena_dir = f"/dev/shm/weg2-arena-{self.tag}"  # the launcher's group default
+        spec = str(info.get("speculative_algorithm") or "").upper()
+        bigram = (os.environ.get("SGLANG_HICACHE_BIGRAM_KEYS", "") == "1"
+                  or spec in ("EAGLE", "EAGLE3", "NEXTN", "DFLASH", "STANDALONE"))
+        probe, why = open_store_presence(
+            store_dir=self.store_dir, arena_dir=arena_dir.strip(),
+            page_size=int(info.get("page_size") or envs.SGLANG_WEG2_FRONT_ANCHOR_PAGE.get()),
+            bigram=bigram, hybrid=bool(info.get("uses_mamba_radix_cache")))
+        self.store_probe, self._store_probe_why = probe, why
+        if probe is not None:
+            logger.info("WEG2 L3-INDEX-PRICE armed %s -- an arrival's credit is the page-granular "
+                        "L2/L3 store prefix of its exact ids (keys as P/D read them), earlier boots "
+                        "and this one alike (src=l3_index, or src=l2_arena when only L2 proves it)",
+                        why)
+        else:
+            logger.warning("WEG2 L3-INDEX-PRICE n/a: %s -- no store credit at arrival (retried "
+                           "every %.0f s)", why, self.STORE_PROBE_RETRY_S)
+
+    async def _store_probe_depth(self, rid: str, ids: Any, timeout_s: float,
+                                 extra_key: Optional[str] = None) -> Tuple[int, str]:
+        """L3-INDEX / L2-ARENA PRICE: (the store depth of ``ids`` in tokens,
+        the tier it needs -- ``l3_index`` or ``l2_arena``); (0, "none") = none
+        or not askable. Asked in the front tokenizer's worker thread.
+        ``extra_key`` (Q-530): the request's namespace -- the depth of THAT
+        namespace's chain, never another tenant's pages."""
+        ft = self.ftok
+        if self.__dict__.get("store_probe") is None:
+            t = self.__dict__.get("_store_probe_t")
+            if t is None or time.monotonic() - t < self.STORE_PROBE_RETRY_S:
+                return 0, "none"
+            await asyncio.get_running_loop().run_in_executor(ft.executor, self._store_probe_open)
+            if self.store_probe is None:
+                return 0, "none"
+        try:
+            d = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    ft.executor,
+                    (self.store_probe.depth if extra_key is None else
+                     functools.partial(self.store_probe.depth, extra_key=extra_key)), ids),
+                timeout=max(0.05, timeout_s))
+        except Exception as e:  # noqa: BLE001 -- no credit, named; the price stands
+            self.counters["l3_index_price_failed"] += 1
+            logger.info("WEG2 L3-INDEX-PRICE rid=%s FAILED %s: %s (no store credit)",
+                        rid, type(e).__name__, str(e)[:160])
+            return 0, "none"
+        self.counters["l3_index_probes"] += 1
+        if d.tokens > 0:
+            logger.info("WEG2 L3-INDEX-PRESENCE rid=%s tier=%s depth=%d pages=%d l3_pages=%d "
+                        "kv_pages=%d tokens=%d probe_ms=%.1f probe=%s asked=%d (the shared L2/L3 "
+                        "store holds these leading pages with their anchor -- what P/D read for "
+                        "this prompt)",
+                        rid, d.tier, d.tokens, d.pages, d.l3_pages, d.kv_pages, int(ids.size), d.ms,
+                        getattr(d, "form", "list"), int(getattr(d, "asked", 0)))
+        elif int(ids.size) > int(getattr(self, "tp_prefill_max_tokens", 0) or 0) > 0:
+            # PRESENCE-ZERO (02.10., N6i weg2-0-2: no presence line, read as "the
+            # probe never ran"): a prompt over X that the store holds NOTHING of
+            # says so -- the probe ran, the answer was 0 (pages / anchors named).
+            self.counters["l3_index_zero"] += 1
+            logger.info("WEG2 L3-INDEX-PRESENCE rid=%s tier=none depth=0 kv_pages=%d tokens=%d probe_ms=%.1f "
+                        "probe=%s asked=%d (the probe ran: the shared L2/L3 store holds no anchored "
+                        "leading page of this prompt -- a credit it gets later is not the store's)",
+                        rid, int(getattr(d, "kv_pages", 0)), int(ids.size), d.ms,
+                        getattr(d, "form", "list"), int(getattr(d, "asked", 0)))
+        return int(d.tokens), str(d.tier)
 
     async def _x_exact_price(self, rid: str, path: str, payload: Any, text: str,
                              est_uncached: int, est_prompt: int, multimodal: bool = False):
         """The exact pricing of one arrival, or None (then the chars/3 figures
         stand, and the line below says why). Runs the count in the front
         tokenizer's worker thread; the event loop only awaits it."""
+        await self._x_exact_await_tokenizer(rid)
         ft = self.ftok
         reason = None
         if ft is None or ft.state != "ready":
             reason = "tokenizer_" + (ft.state if ft is not None else "none")
-        elif multimodal:
-            reason = "multimodal"  # image/video/embeds: D's mm processor expands them
+        elif multimodal and not (isinstance(payload, dict)
+                                 and path in ("/v1/messages", "/v1/chat/completions")
+                                 and getattr(ft, "image_token_id", None) is not None
+                                 and hasattr(ft, "count_mm")):
+            # image/video/embeds outside the chat paths: D's mm processor expands them
+            reason = "multimodal"
         elif not isinstance(payload, dict) or path not in ("/v1/messages", "/v1/chat/completions",
                                                                "/generate"):
             reason = "path"
         c = None
+        mm = None
+        mm_keys: List[str] = []
         t0 = time.monotonic()
         if reason is None:
             try:
-                c = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(ft.executor, ft.count, path, payload),
+                got = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        ft.executor, ft.count_mm if multimodal else ft.count, path, payload),
                     timeout=envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0)
+                if multimodal:
+                    # MM-XPRICE (front_tokens): the compact render, expanded with
+                    # each image's REALISED token count -- or the fallback below
+                    # when an image was never served (its tower must run anyway)
+                    c0, mm_keys = got
+                    self._mm_note_rid(rid, c0.ids, mm_keys)
+                    # CONTEXT-GATE: the compact render is a LOWER bound of the prompt
+                    lb = self.__dict__.setdefault("_x_exact_lb", collections.OrderedDict())
+                    lb[rid] = int(c0.n)
+                    while len(lb) > 1024:
+                        lb.popitem(last=False)
+                    mm = _ft_mm_expand(c0.ids, ft.image_token_id, mm_keys, self._mm_ktok())
+                    if mm is None:
+                        reason = "multimodal-unseen-image"
+                    else:
+                        c = _FtCount(n=int(mm.ids.size), ids=mm.ids, ms=c0.ms,
+                                     reused=c0.reused, encoded=c0.encoded)
+                else:
+                    c = got
             except asyncio.TimeoutError:
                 reason = "timeout"
             except Exception as e:  # noqa: BLE001 -- the estimate stands, named
@@ -4143,27 +6141,328 @@ class Front:
         wait_ms = (time.monotonic() - t0) * 1000.0
         if c is None:
             self.counters["x_exact_fallback"] += 1
+            self._x_exact_note_fallback(rid, reason)
             logger.info("WEG2 X-EXACT-FALLBACK rid=%s reason=%s est_uncached=%d est_prompt=%d "
-                        "(chars/3 estimate stands for this request) wait_ms=%.1f",
-                        rid, reason, est_uncached, est_prompt, wait_ms)
+                        "(chars/3 estimate stands for this request) wait_ms=%.1f%s",
+                        rid, reason, est_uncached, est_prompt, wait_ms,
+                        (" images=%d known=%d (MM-XPRICE: an image's token count is learned "
+                         "from the first group leg that serves it)"
+                         % (len(mm_keys), sum(1 for k in mm_keys if k in self._mm_ktok())))
+                        if reason == "multimodal-unseen-image" else "")
             return None
         ft.remember(text, c.ids)
+        self._sess_prefix(rid, c.ids)  # SESSION-TRACE
+        # L3-INDEX PRICE (y7d weg2-0-2 / 2-19): the page-granular store prefix
+        # of these exact ids, earlier boots and this one -- a store fact like
+        # P's END-ANCHOR, recorded before the measured prefix is read.
+        # MM-XPRICE: the store's page keys hold the REAL ids -- an image
+        # request is probed only up to its first image (surrogates beyond)
+        # Q-530 SALT-ISOLATION: a namespaced request (cache_salt / extra_key) is
+        # priced from ITS namespace's store chain alone. The token spans (D
+        # readings, END-ANCHORs, seq marks) are keyed by ids only, so such a
+        # request neither takes nor gives span credit. A key only the group can
+        # form (LoRA): no credit at all.
+        ns_known, ns = payload_namespace(payload)
+        isolated = (not ns_known) or ns is not None
+        l3, tier = 0, "none"
+        if ns_known:
+            l3, tier = await self._store_probe_depth(
+                rid, c.ids if mm is None else c.ids[: mm.first_image],
+                envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0
+                - (time.monotonic() - t0), extra_key=ns)
+        if l3 > 0 and (isolated or self.tspans.record_store_depth(c.ids, l3, source=tier) > 0):
+            self.counters["l3_index_credit"] += 1
+            self.counters["l3_index_credit_tokens"] += int(l3)
+            if tier == "l2_arena":
+                self.counters["l2_arena_credit"] += 1
+        if mm is not None and not isolated:
+            # MM-PERSIST-1002: the image pages are keyed by the group's pad
+            # value, which the probe above cannot ask -- a restored anchor can
+            # (Q-530: not for a namespaced request -- the anchors are unsalted)
+            self._mm_persist_credit(rid, c.ids, mm_keys, mm, l3)
         # the epoch is read AFTER the count: a flip during it ends the held credit
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
-        pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
+        if isolated:
+            self.counters["ns_isolated_priced"] += 1
+            logger.info("WEG2 NS-ISOLATED rid=%s ns=%s store_depth=%d tier=%s (Q-530: priced from its "
+                        "own namespace's store chain; no token-span credit taken or given)",
+                        rid, "salted" if ns_known else "unknown", int(l3), tier)
+            credit = max(0, min(int(l3), int(c.ids.size)))
+            pending, known, src = max(0, int(c.ids.size) - credit), credit > 0, \
+                (tier if credit > 0 else "none")
+        else:
+            pending, credit, known, src = self.tspans.pending(c.ids, epoch=epoch)
         self._x_exact_rid[rid] = (pending, c.n, src)
         while len(self._x_exact_rid) > 4096:
             self._x_exact_rid.popitem(last=False)
         self.counters["x_exact_priced"] += 1
+        mm_cached = False
+        mm_tag = ""
+        d_reach = d_floor = 0
+        if mm is not None:
+            # IMAGE-CACHED-1002: an image is cached for D only inside what D's
+            # OWN admission covers -- the credit, never past D's page floor of
+            # the prompt (D computes [floor, n) itself, front_tokens.mm_d_reach)
+            covered, d_reach, d_floor = _ft_mm_d_cached(mm.ends, int(credit), int(c.n),
+                                                         self._d_page_size())
+            mm_cached = covered == mm.n_images
+            self.counters["x_exact_mm_priced"] += 1
+            if mm_cached:
+                self.counters["x_exact_mm_cached"] += 1
+            mm_tag = " d_reach=%d mm=1 mm_cached=%d/%d image_end=%d" % (
+                d_reach, covered, mm.n_images, mm.image_end)
         logger.info("WEG2 X-EXACT-PRICE rid=%s pending=%d tokens=%d credit=%d src=%s known=%d "
                     "(EXACT: D's tokenizer+template, minus the MEASURED cached-on-D token prefix) "
                     "chars3_uncached=%d chars3_prompt=%d delta=%+d count_ms=%.1f wait_ms=%.1f "
-                    "reused=%d encoded=%d",
+                    "reused=%d encoded=%d%s",
                     rid, pending, c.n, credit, src, int(known), est_uncached, est_prompt,
-                    est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded)
+                    est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded, mm_tag)
+        self._prefix_diverge(rid, c.ids, pending, credit, src, l3, payload=payload)
         from types import SimpleNamespace
 
-        return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src)
+        return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
+                               mm=mm is not None, mm_cached=mm_cached,
+                               image_end=(mm.image_end if mm is not None else 0),
+                               d_reach=d_reach, d_floor=d_floor)
+
+    def _d_page_size(self) -> int:
+        """IMAGE-CACHED-1002: the groups' KV page size (their server info: NF 64,
+        27B 1) -- the grain of D's admission prefix. Unknown (info not read yet)
+        = 1, i.e. no floor beyond the one computed token (the pre-1002 price)."""
+        info = self.__dict__.get("_store_probe_info") or {}
+        try:
+            page = int(info.get("page_size") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        return page if page > 0 else 1
+
+    #: VISION-LOAD-WARM-1002: a warm read finished this recently is not repeated
+    VISION_WARM_FRESH_S = 10.0
+
+    def _vision_warm(self, rid: str) -> str:
+        """VISION-LOAD-WARM-1002: read the tower's checkpoint extent BUFFERED in
+        a front thread, so the host cache (ZFS ARC) holds it when P's PP0 stage
+        loads the tower after the flip (``read_into(cached_first=True)``:
+        warm 87-100 ms against 270 ms O_DIRECT for the NF 856 MiB extent,
+        measured at the desk). Before the prefill, synchronous to nothing: the
+        stage reads O_DIRECT whatever the cache does not hold whole. Returns
+        what it did (``started`` | ``busy`` | ``fresh`` | ``off`` | ``no_model``)."""
+        if not envs.SGLANG_WEG2_ENABLE_VISION_LOAD_WARM.get():
+            return "off"
+        st = self.__dict__.setdefault("_vision_warm_state", {"busy": False, "t": None})
+        if st["busy"]:
+            return "busy"
+        if st["t"] is not None and time.monotonic() - st["t"] < self.VISION_WARM_FRESH_S:
+            return "fresh"
+        info = self.__dict__.get("_store_probe_info") or {}
+        model_dir = str(info.get("model_path") or "")
+        if not model_dir or not os.path.isdir(model_dir):
+            if not st.get("named"):
+                st["named"] = True
+                logger.info("W102 Weg2VisionStage VISION-WARM rid=%s n/a: no model dir from the "
+                            "group's server info yet (%r) -- the stage reads O_DIRECT", rid, model_dir)
+            return "no_model"
+        st["busy"] = True
+        import threading
+
+        def _job() -> None:
+            t0 = time.monotonic()
+            try:
+                from sglang.srt.planner.vision_stage_load import find_tower_shard, is_vision_weight
+                from sglang.srt.weg2 import vision_rank_stage as vrs
+
+                shard, tensors, _hit = vrs.tower_index(model_dir, find_tower_shard, is_vision_weight)
+                lo, hi = vrs.tensors_extent(tensors)
+                n = vrs.warm_host_cache(shard, lo, hi)
+                self.counters["vision_warm"] += 1
+                logger.info("W102 Weg2VisionStage VISION-WARM rid=%s read_mib=%.1f ms=%.0f "
+                            "threads=%d shard=%s (the tower extent is in the host cache for "
+                            "P's stage, which reads it RWF_NOWAIT before O_DIRECT)",
+                            rid, n / (1 << 20), (time.monotonic() - t0) * 1e3,
+                            vrs.WARM_THREADS, os.path.basename(shard))
+            except Exception as e:  # noqa: BLE001 -- the stage reads O_DIRECT, named
+                self.counters["vision_warm_failed"] += 1
+                logger.warning("W102 Weg2VisionStage VISION-WARM rid=%s FAILED %s: %s (the stage "
+                               "reads O_DIRECT)", rid, type(e).__name__, str(e)[:200])
+            finally:
+                st["t"] = time.monotonic()
+                st["busy"] = False
+
+        threading.Thread(target=_job, name="weg2-vision-warm", daemon=True).start()
+        return "started"
+
+    def _w102_image_uncached(self, rid: str, xx: Any) -> str:
+        """IMAGE-CACHED-1002: name WHY an exactly priced image request is not
+        served from D's prefix (the W102 rule then sends it to P): ``floor`` --
+        the image ends inside the page D's own admission recomputes, so no
+        credit and no anchor can serve it on D (NF page 64, y7n weg2-2-6:
+        128 tokens, image_end=110, floor 64); ``credit`` -- the measured /
+        store prefix stops inside or before the image."""
+        why = "floor" if int(xx.d_floor) < int(xx.image_end) else "credit"
+        self.counters["w102_image_uncached_" + why] += 1
+        logger.info(
+            "W102 Weg2VisionStage rid=%s image-uncached why=%s image_end=%d d_reach=%d "
+            "(credit=%d src=%s, D admission floor=%d of n=%d at page=%d): D would compute "
+            "image positions -> P", rid, why, int(xx.image_end), int(xx.d_reach),
+            int(xx.credit), xx.src, int(xx.d_floor), int(xx.n), self._d_page_size())
+        return why
+
+    # -- CONTEXT-GATE ---------------------------------------------------------------------
+    # y7i (e7a70285bd), front log ..._1002_111831.front.log, 11:32-11:33Z: an
+    # OpenWebUI request priced est_prompt=365462 by chars/3 (a base64 image inside
+    # a TEXT field, tokenized as text) was routed LONG, flipped D->P, P answered
+    # 400 "The input (358446 tokens) is longer than the model's context length
+    # (262144 tokens)", and the client retried every ~12 s with a new rid
+    # (weg2-14-50, 15-51, 17-52, ...): a flip pair each, and D's running
+    # weg2-14-48 parked (PARK-IMMEDIATE) and resumed every time.
+
+    #: chars/3 over-counts up to +60 % (X-EXACT module note) -- a chars/3 ESTIMATE
+    #: refuses only past this factor; an exact count (or its lower bound) at once
+    CONTEXT_GATE_EST_MARGIN = 1.6
+    #: base64 tokenizes at ~chars/3 (y7i: est 365462, P 358446) -- an estimate made
+    #: of an inline data URI is close to the real count
+    CONTEXT_GATE_DATAURI_MARGIN = 1.15
+    _DATAURI_RE = re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+
+    def _context_len(self) -> int:
+        """The groups' context length: their server info, else the checkpoint's."""
+        info = self.__dict__.get("_store_probe_info") or {}
+        v = info.get("context_length")
+        if isinstance(v, int) and v > 0:
+            return v
+        v = getattr(getattr(self, "ftok", None), "context_len", None)
+        return int(v) if isinstance(v, int) and v > 0 else 0
+
+    def _context_gate(self, rid: str, text: str, xx: Any, est_prompt: int):
+        """400 for a request the groups would refuse as over-context, else None."""
+        uri_chars = 0
+        if "data:image/" in text:
+            uris = self._DATAURI_RE.findall(text)
+            uri_chars = sum(len(u) for u in uris)
+            if uri_chars:
+                self.counters["inline_datauri"] += 1
+                logger.info("WEG2 INLINE-DATAURI rid=%s chars=%d uris=%d (a base64 image inside a "
+                            "TEXT field: the groups tokenize it as text, never as an image)",
+                            rid, uri_chars, len(uris))
+        lb = (self.__dict__.get("_x_exact_lb") or {}).pop(rid, None)
+        ctx = self._context_len()
+        if ctx <= 0:
+            return None
+        if xx is not None:
+            tokens, how, limit = int(xx.n), "exact", ctx
+        elif lb:
+            tokens, how, limit = int(lb), "exact-lower-bound", ctx
+        else:
+            margin = (self.CONTEXT_GATE_DATAURI_MARGIN if uri_chars * 2 > len(text)
+                      else self.CONTEXT_GATE_EST_MARGIN)
+            tokens, how, limit = int(est_prompt), "chars3", int(ctx * margin)
+        if tokens <= limit:
+            return None
+        self.counters["context_gate_refused"] += 1
+        logger.warning("WEG2 CONTEXT-GATE REFUSED rid=%s tokens=%d ctx=%d by=%s (400 before any "
+                       "route, seat, flip or park -- the groups refuse it anyway)",
+                       rid, tokens, ctx, how)
+        return web.json_response({"error": {
+            "message": (f"The input ({tokens} tokens) is longer than the model's context "
+                        f"length ({ctx} tokens)."),
+            "type": "BadRequestError", "param": None, "code": 400}}, status=400)
+
+    # -- MM-XPRICE (front_tokens): image token counts as the groups realised them --------
+    def _mm_ktok(self) -> Dict[str, int]:
+        """image key -> its token count, learned from served legs (front-local).
+        MM-PERSIST-1002: seeded once from the store's table (earlier boots)."""
+        m = self.__dict__.get("_mm_ktok_map")
+        if m is None:
+            m = self.__dict__["_mm_ktok_map"] = {}
+            pers = self._mm_persist()
+            if pers is not None:
+                m.update(pers.ktok())
+        return m
+
+    def _mm_persist(self) -> Any:
+        """MM-PERSIST-1002: the image table of the store directory
+        (weg2/front_mm_persist.py), opened once; None when switched off."""
+        if "_mm_persist_obj" in self.__dict__:
+            return self.__dict__["_mm_persist_obj"]
+        pers = None
+        if envs.SGLANG_WEG2_ENABLE_FRONT_MM_PERSIST.get():
+            from sglang.srt.weg2.front_mm_persist import MMPersist
+
+            pers = MMPersist.open(str(getattr(self, "store_dir", "") or ""))
+            n_anchors = sum(len(r["anchors"]) for r in pers.images.values())
+            logger.info("WEG2 MM-PERSIST opened %s: %s images=%d anchors=%d (image token counts "
+                        "and store anchors of image prompts from earlier boots; an anchor is "
+                        "credited only while the live store proves the pages before the image)",
+                        pers.path or "-", pers.why, len(pers.images), n_anchors)
+        self.__dict__["_mm_persist_obj"] = pers
+        return pers
+
+    def _mm_persist_flush(self) -> None:
+        """Write the table when it changed -- in the front tokenizer's worker
+        thread (FIFO with the pricing; a few KB of JSON), never on the loop."""
+        pers = self.__dict__.get("_mm_persist_obj")
+        snap = pers.snapshot() if pers is not None else None
+        if snap is None:
+            return
+        from sglang.srt.weg2.front_mm_persist import write_snapshot
+
+        ft = getattr(self, "ftok", None)
+        ex = getattr(ft, "executor", None)
+        if ex is None:
+            write_snapshot(*snap)
+        else:
+            ex.submit(write_snapshot, *snap)
+
+    def _mm_note_rid(self, rid: str, compact: Any, keys: Sequence[str]) -> None:
+        if not keys:
+            return
+        od = self.__dict__.setdefault("_mm_rid_info", collections.OrderedDict())
+        od[rid] = (compact, list(keys))
+        while len(od) > 1024:
+            od.popitem(last=False)
+
+    def _mm_ids(self, rid: str) -> Any:
+        """The expansion of a noted image request, None while an image's K is unknown."""
+        info = (self.__dict__.get("_mm_rid_info") or {}).get(rid)
+        ft = getattr(self, "ftok", None)
+        if info is None or ft is None:
+            return None
+        return _ft_mm_expand(info[0], getattr(ft, "image_token_id", None), info[1], self._mm_ktok())
+
+    def _mm_learn(self, rid: str, text: str, realised: int) -> None:
+        """A P leg 1 of an image request served ``realised`` prompt tokens (P's
+        prompt, never a resumed D reading): the one image of it the front did
+        not know has K = the rest. The request's ids are remembered from then
+        on, so P's END-ANCHOR and every later presence record price it."""
+        info = (self.__dict__.get("_mm_rid_info") or {}).get(rid)
+        ft = getattr(self, "ftok", None)
+        if info is None or ft is None:
+            return
+        compact, keys = info
+        ktok = self._mm_ktok()
+        relearn = ""
+        if (int(realised or 0) > 0 and len(set(keys)) == 1 and keys[0] in ktok
+                and int(compact.size) - len(keys) + len(keys) * int(ktok[keys[0]]) != int(realised)):
+            # MM-PERSIST-1002: a KNOWN count the group contradicts (a restored
+            # one from another processor setting) is learned again, not kept
+            relearn = " relearned_from=%d" % int(ktok[keys[0]])
+            ktok = {k: v for k, v in ktok.items() if k != keys[0]}
+        got = _ft_mm_learn(int(compact.size), keys, ktok, int(realised or 0))
+        if got is not None:
+            key, k = got
+            self._mm_ktok()[key] = int(k)
+            self.counters["x_exact_mm_learned"] += 1
+            pers = self._mm_persist()
+            if pers is not None and pers.note_k(key, int(k)):
+                self._mm_persist_flush()
+            logger.info("WEG2 X-EXACT-MM-LEARN rid=%s image=%s tokens=%d realised=%d compact=%d "
+                        "images=%d%s (the image's token count as P served it; later requests "
+                        "carrying it are priced exactly)", rid, key[:12], int(k), int(realised),
+                        int(compact.size), len(keys), relearn)
+        if ft.ids_for(text) is None:
+            exp = self._mm_ids(rid)
+            if exp is not None:
+                ft.remember(text, exp.ids)
 
     def _x_exact_reprice_queue(self, why: str) -> int:
         """Re-price every queued request whose price can still move, against
@@ -4176,25 +6475,61 @@ class Front:
         here. Not re-priced: a request whose leg 1 is done or skipped, a
         P-only one, one D refused over X (``x_requeues``: D's own extent
         stands) and one priced by the chars/3 fallback (no ids). Routing
-        eligibility is NOT changed -- only the number. Returns the count."""
+        eligibility changes only on a crossing DOWN to <= X (STORE-PRESENCE
+        02.10.: it becomes d_eligible, a SHORT). Returns the count."""
         if not self.x_exact or self.ftok is None or self.tspans is None:
             return 0
         epoch = self.epoch if self.awake == "D" and self.state == "serving" else None
         x = int(self.tp_prefill_max_tokens)
         n = 0
         for p in self.queue:
-            if (p.leg1_done or p.skip_leg1 or p.p_only or p.x_requeues):
+            # MM-XPRICE: a P-only image request is re-priced too -- the store
+            # may hold its image now (STORE-PRESENCE of the leg that served it)
+            mm_rid = p.p_only and p.rid in (self.__dict__.get("_mm_rid_info") or {})
+            if (p.leg1_done or p.skip_leg1 or (p.p_only and not mm_rid) or p.x_requeues):
                 continue
+            if Front._ns_isolated(self, p.rid):
+                continue  # Q-530: a namespaced request keeps its own store price
             ids = self.ftok.ids_for(p.text)
+            if ids is None and mm_rid:
+                exp = self._mm_ids(p.rid)
+                if exp is not None:
+                    self.ftok.remember(p.text, exp.ids)
+                    p.mm_image_end = int(exp.image_end)
+                    ids = exp.ids
             if ids is None:
                 continue
             new, _credit, _known, src = self.tspans.pending(ids, epoch=epoch)
+            # IMAGE-CACHED-1002: cached for D only inside D's own admission reach
+            _n_mm, _reach, _floor = (_ft_mm_d_cached([int(p.mm_image_end)], int(_credit),
+                                                     int(ids.size), self._d_page_size())
+                                     if p.p_only and int(getattr(p, "mm_image_end", 0) or 0) > 0
+                                     else (0, 0, 0))
+            if _n_mm:
+                p.p_only = False
+                self.counters["x_exact_mm_reprice_cached"] += 1
+                logger.info("W102 Weg2VisionStage rid=%s image-cached at reprice (why=%s credit=%d "
+                            ">= image_end=%d src=%s): priced as text, no flip of its own "
+                            "d_reach=%d floor=%d",
+                            p.rid, why, int(_credit), int(p.mm_image_end), src, _reach, _floor)
             old = int(p.est_uncached)
             if new == old:
                 continue
             p.est_uncached = int(new)
             n += 1
             self.counters["x_exact_repriced"] += 1
+            if (old > x >= new and not p.d_eligible and not p.reroutes
+                    and not getattr(p, "x_deferred", False) and not getattr(p, "intake_stalled", False)):
+                # STORE-PRESENCE (02.10.): the new price crosses X downwards on a
+                # realised store prefix -- the request is a SHORT now, so a D
+                # phase may admit it (QUEUED-SHORT) instead of waking P for it
+                # (y6y weg2-1-7: priced 105048 in a P phase, left by the P-phase
+                # cap, flip_now at the P->D flip for 24 real tokens). In a P
+                # phase P's batch still takes it (P-BATCH-ALL).
+                p.d_eligible = True
+                if getattr(p, "x_routed", 0):
+                    p.x_routed = 0
+                self.counters["x_exact_reprice_short"] += 1
             logger.info("WEG2 X-EXACT-REPRICE rid=%s why=%s est_uncached %d -> %d X=%d "
                         "crossed=%s src=%s epoch=%s (queued request re-priced against the "
                         "current measured cached-on-D prefix; routing flags unchanged)",
@@ -4202,6 +6537,326 @@ class Front:
                         ("down" if old > x >= new else "up" if new > x >= old else "no"),
                         src, epoch)
         return n
+
+    def _sk_admission_reprice(self, p: "Pending") -> bool:
+        """SK (#243 (a), NF rc12r weg2-12-39: D-ADMIT priced 186 from a D
+        reading taken before a flip, D's extent was 76602). A kept SHORT whose
+        price is from an earlier front epoch is re-priced against the CURRENT
+        measured cached-on-D prefix (X-EXACT). Still <= X: admitted to D with
+        the new price. Over X: the presence is gone -- it goes back to the
+        queue as an ordinary BATCH request (leg 1 on P). Returns True when it
+        was moved to P. No re-price possible (no exact tokenizer): admitted
+        unchanged, D's own gate stands."""
+        if (int(getattr(p, "price_epoch", -1)) == int(self.epoch)
+                and getattr(p, "sk_void_seq", None) is None):
+            return False
+        if not self.x_exact or self.ftok is None or self.tspans is None:
+            return False
+        ids = self.ftok.ids_for(p.text)
+        if ids is None:
+            return False
+        # SK-X (W35 class, NF rc12t weg2-6-30): D refused this rid before the
+        # first byte (W50 / x_refusal reroute) -- the presence it was kept on
+        # expired with that refusal. Only D evidence recorded AFTER it counts
+        # (``since_seq``); without a fresh confirmation the P reroute stands.
+        void = getattr(p, "sk_void_seq", None)
+        if Front._ns_isolated(self, p.rid):
+            # Q-530: no span credit for a namespaced request -- its store price
+            # stands; after a D refusal nothing confirms it (the whole prompt)
+            new, src = (int(ids.size), "none") if void is not None else (int(p.est_uncached), "ns_store")
+        elif void is None:
+            new, _credit, _known, src = self.tspans.pending(ids, epoch=self.epoch)
+        else:
+            new, _credit, _known, src = self.tspans.pending(ids, epoch=self.epoch, since_seq=void)
+        old = int(p.est_uncached)
+        x = int(self.tp_prefill_max_tokens)
+        p.est_uncached = int(new)
+        p.price_epoch = int(self.epoch)
+        self.counters["short_kept_repriced"] += 1
+        to_p = int(new) > x
+        if void is not None:
+            src = f"{src}(fresh-after-reroute)"
+        logger.info("WEG2 SHORT-KEPT-REPRICE rid=%s est_uncached %d -> %d X=%d src=%s epoch=%d -> %s "
+                    "(a flip lay between the price and the D admission)", p.rid, old, int(new), x, src,
+                    self.epoch, "P (presence gone: leg 1 on P)" if to_p else "D")
+        if not to_p:
+            return False
+        p.short_kept = False
+        p.skip_leg1 = False
+        p.d_direct = False
+        self.queue.append(p)
+        self.counters["short_kept_to_p"] += 1
+        return True
+
+    def _hl_check(self, p: "Pending", where: str) -> bool:
+        """#243 seam (weg2/handoff_seam.py): True when ``p`` -- leg 1 ran, it
+        waits for a D seat -- had its hand-off LOST and D would have to prefill
+        more than X of it; it is then back in the queue for a FRESH leg 1 on P
+        (the caller takes it out of ``_ready_for_d``). This is the queue
+        re-entry X-REQUEUE ends with (seat none, d_eligible/d_direct cleared,
+        R28 ``reroute``, a controller kick); the X-REQUEUE entry itself answers
+        a refused LEG 2 and needs its request and seat, which a rid still
+        awaiting its admission does not have yet. Its W31/W35 counter is not
+        touched: the bound here is ``handoff_lost_reroutes`` (one); a second
+        loss over X ends the rid by name (W35, 503 before any stream) -- it
+        is never sent to D to be refused there (D never prefills over X)."""
+        if not _hs.enabled():
+            return False
+        if (not p.leg1_done or p.skip_leg1 or p.d_direct or p.resume_via_p or p.p_only
+                or p.fut.done()):
+            return False
+        st = _hs.status(p.rid)
+        if int(st.get("page_size") or 0) > 0:  # DASHBOARD-IPC: request_done kv_pages / park pages
+            Front._req_book(self).page_size = int(st["page_size"])
+        x = int(self.tp_prefill_max_tokens)
+        prompt = int(p.leg1_prompt_tokens or 0) or int(p.est_prompt)
+        terms = _hs.lost_terms(st, prompt, x)
+        if terms is None:
+            return False
+        credit, uncached, over_x = terms
+        noted = self.__dict__.setdefault("_hl_noted", set())
+        # P-BATCH-ALL (user 02.10.): a lost hand-off is an error case -- its
+        # prefill goes back to P's batch (the next P drain), not to a D
+        # prefill, whatever its size. Only a SECOND loss under X stays on D
+        # (bounded: no third P leg, no terminal for a tail D may compute).
+        if not over_x and p.handoff_lost_reroutes >= 1:
+            if p.rid not in noted:
+                noted.add(p.rid)
+                self.counters["handoff_lost_kept_d"] += 1
+                logger.warning(
+                    "WEG2 HANDOFF-LOST-KEPT rid=%s first_lost_page=%d page_size=%d credit=%d "
+                    "uncached=%d X=%d reroutes=%d where=%s -- lost a second time: D prefills the "
+                    "lost tail itself (<= X, law 4; bounded, no third P leg)", p.rid, st["first_lost_page"], st["page_size"], credit,
+                    uncached, x, p.handoff_lost_reroutes, where)
+            return False
+        if p.handoff_lost_reroutes >= 1:
+            # Second loss over X: D never prefills over X (user veto) and the
+            # front never sends a rid there on purpose to let D's X gate refuse
+            # it -- the rid ends NAMED before its stream exists (a 503 from
+            # handle_generate's own answer to a failed future), W35 like a
+            # second X refusal.
+            noted.discard(p.rid)
+            _hs.drop(p.rid, "terminal_w35")
+            self.counters["W35_Weg2XReQueueLoop"] += 1
+            self.counters["handoff_lost_terminal"] += 1
+            msg = (f"W35 Weg2XReQueueLoop rid={p.rid}: its hand-off was lost a second time while it "
+                   f"waited for a D seat (first_lost_page={st['first_lost_page']} credit={credit} "
+                   f"uncached={uncached} > X={x}); D never prefills over X -- refused by name "
+                   f"rather than a third P prefill; retry the request")
+            logger.error("WEG2 HANDOFF-LOST-TERMINAL rid=%s first_lost_page=%d credit=%d uncached=%d "
+                         "X=%d reroutes=%d where=%s -- %s", p.rid, st["first_lost_page"], credit,
+                         uncached, x, p.handoff_lost_reroutes, where, msg)
+            if not p.fut.done():
+                p.fut.set_exception(_hs.Weg2HandoffLost(msg))
+            return True
+        noted.discard(p.rid)
+        _hs.drop(p.rid, "reroute_fresh")
+        p.handoff_lost_reroutes += 1
+        p.leg1_done = False
+        p.seat = None
+        p.d_eligible = p.d_direct = False
+        p.est_uncached = int(uncached)
+        self.counters["handoff_lost_reroutes"] += 1
+        logger.warning(
+            "WEG2 HANDOFF-LOST-REROUTE rid=%s first_lost_page=%d credit=%d path=fresh-P "
+            "(uncached=%d %s X=%d, page_size=%d pages=%d where=%s waited_s=%.1f) -- the hand-off "
+            "was lost while the rid waited for a D seat; leg 1 runs again on P (P's batch, "
+            "never a D prefill)",
+            p.rid, st["first_lost_page"], credit, uncached, ">" if over_x else "<=", x,
+            st["page_size"], st["pages"], where, max(0.0, time.time() - p.t_arrive))
+        # The oldest request: back at the HEAD, as an intake stall is (law 2).
+        self.queue.appendleft(p)
+        self._dp_mark(p, "reroute")  # R28
+        self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
+        return True
+
+    def _sess_note(self, rid: str, request, payload) -> None:
+        """SESSION-TRACE (weg2/session_trace.py): the session of ``rid`` as a
+        10-hex hash, one line per rid; never the id, never text."""
+        try:
+            raw, src = _st.session_raw(getattr(request, "headers", None), payload)
+            sess = _st.short(raw)
+            m = self.__dict__.setdefault("_sess_by_rid", {})
+            m[rid] = sess
+            while len(m) > 4096:
+                m.pop(next(iter(m)))
+            Front._req_book(self).session(rid, sess)  # DASHBOARD-IPC: session_id + turn
+            logger.info("WEG2 SESSION rid=%s sess=%s src=%s", rid, sess or "-", src)
+        except Exception:  # noqa: BLE001 -- an instrument, never the route
+            pass
+
+    def _sess_tag(self, rid: str) -> str:
+        """`` sess=<hash>`` for a SERVED line (empty without one)."""
+        sess = (self.__dict__.get("_sess_by_rid") or {}).get(str(rid))
+        return f" sess={sess}" if sess else ""
+
+    def _sess_prefix(self, rid: str, ids) -> None:
+        """SESSION-TRACE: the common token prefix with the same session's
+        previous prompt (front tokenizer ids, the X-EXACT count's own)."""
+        try:
+            sess = (self.__dict__.get("_sess_by_rid") or {}).get(str(rid))
+            if not sess:
+                return
+            sp = self.__dict__.get("_sess_prefixes")
+            if sp is None:
+                sp = self._sess_prefixes = _st.SessionPrefixes()
+            got = sp.note(sess, rid, ids)
+            if got is None:
+                logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=- common=0 prompt=%d "
+                            "prev_prompt=0 (first prompt of this session seen by this front)",
+                            rid, sess, len(ids))
+                return
+            prev_rid, common, prev_len = got
+            # NF-STAU-KV: the ARRIVAL-SEAT KV need credits the prefix shared
+            # with this previous turn while it RUNS on D (bounded, oldest out)
+            sprev = self.__dict__.setdefault("_sess_prev", collections.OrderedDict())
+            sprev[str(rid)] = (str(prev_rid), int(common))
+            while len(sprev) > 4096:
+                sprev.popitem(last=False)
+            logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=%s common=%d prompt=%d "
+                        "prev_prompt=%d (front token ids: where this prompt leaves the session's "
+                        "previous one)", rid, sess, prev_rid, common, len(ids), prev_len)
+        except Exception:  # noqa: BLE001 -- an instrument, never the price
+            pass
+
+    def _prefix_diverge(self, rid: str, ids, pending: int, credit: int, src: str,
+                        l3: int, payload: Any = None) -> None:
+        """PREFIX-DIVERGE (NF y7l 99d1977a63, 02.10.): where a priced prompt
+        leaves the earlier prompt it shares the longest token prefix with,
+        against the credit the store/D gave it -- on every arrival that
+        prefills more than X (a P leg), the one line that tells "the client
+        sent a different prefix" (``client_diverged``) from "a prefix an
+        earlier prompt had was not readable" (``store_short``).
+
+        y7l, by hand from the store journal: weg2-4-18 (pending 71949)
+        left weg2-2-7 inside its first 3328 tokens, weg2-8-20 (pending 87034)
+        left weg2-6-19 at 78208; the first page each P read missed was born
+        8-18 s later by the request's own prefill. Front-only, sessionless,
+        never a price input; an instrument never raises."""
+        try:
+            rp = self.__dict__.get("_recent_prompts")
+            if rp is None:
+                from sglang.srt.weg2.front_tokens import RecentPrompts
+
+                rp = self._recent_prompts = RecentPrompts()
+            if ids is None or int(ids.size) == 0:
+                return
+            x = int(getattr(self, "tp_prefill_max_tokens", 0) or 4096)
+            if int(pending) > x:
+                from sglang.srt.weg2.front_tokens import reprefill_verdict
+
+                page = int(getattr(getattr(self, "tspans", None), "anchor_page", 0) or 64)
+                lcp, prev_rid, prev_len, prev_t = rp.best(ids, exclude_rid=str(rid))
+                verdict, lost = reprefill_verdict(int(credit), lcp, page)
+                self.counters["prefix_diverge_" + verdict] += 1
+                self.counters["prefix_diverge_" + verdict + "_tokens"] += int(lost)
+                age = (time.time() - prev_t) if prev_t is not None else -1.0
+                (logger.warning if verdict == "store_short" else logger.info)(
+                    "WEG2 PREFIX-DIVERGE rid=%s verdict=%s prompt=%d credit=%d src=%s l3=%d "
+                    "pending=%d best_prev=%s prev_prompt=%d prev_age_s=%.1f common=%d "
+                    "common_page=%d lost=%d (front token ids against the last %d priced "
+                    "prompts: client_diverged = no earlier prompt shares more than the credit, "
+                    "the client changed its text at token `common`; store_short = an earlier "
+                    "prompt shares `common` but the store/D credited only `credit` -- pages "
+                    "lost or not yet written, or no Mamba anchor in between)",
+                    rid, verdict, int(ids.size), int(credit), src, int(l3), int(pending),
+                    prev_rid or "-", int(prev_len), age, int(lcp), int(lcp) // page * page,
+                    int(lost), rp.cap)
+                # PREFIX-DIVERGE-TEXT: only where an earlier prompt shares at least a
+                # page (a new conversation has nothing to compare)
+                if (prev_rid is not None and int(lcp) >= page
+                        and max(int(lost), int(pending)) > _dt().MIN_TOKENS):
+                    try:
+                        self._prefix_diverge_text(rid, ids, prev_rid, int(lcp), payload)
+                    except Exception:  # noqa: BLE001 -- an instrument, never the price
+                        pass
+            rp.note(str(rid), ids)
+            self._prefix_diverge_digest(rid, payload)
+        except Exception:  # noqa: BLE001 -- an instrument, never the price
+            pass
+
+    def _ft_worker(self, fn) -> None:
+        """Run ``fn`` in the front tokenizer's worker (FIFO behind the counts,
+        so a digest noted earlier is there for a later job); inline when the
+        tokenizer has no executor (desk tests)."""
+        ex = self.ftok.executor
+        if ex is None:
+            fn()
+        else:
+            ex.submit(fn)
+
+    def _prefix_diverge_digest(self, rid: str, payload: Any) -> None:
+        """PREFIX-DIVERGE-TEXT: the message digest of this request, beside its
+        ids (the hashing runs in the worker; the loop only snapshots the
+        message list and the render knobs)."""
+        if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+            return
+        msgs = list(payload["messages"])
+        knobs = {k: payload[k] for k in _dt().RENDER_KNOBS if k in payload}
+        rp = self._recent_prompts
+
+        def job():
+            try:
+                rp.note_meta(str(rid), _dt().payload_digest(msgs, knobs))
+            except Exception:  # noqa: BLE001 -- an instrument
+                pass
+
+        self._ft_worker(job)
+
+    def _prefix_diverge_text(self, rid: str, ids, prev_rid: str, common: int,
+                             payload: Any) -> None:
+        """PREFIX-DIVERGE-TEXT (NF y7n cad1bf38f9, 02.10.): one line with the
+        decoded text of both prompts around ``common``, the segment / message
+        it falls into and the client payloads compared message by message --
+        "the client sent a different history" vs "our render of the same
+        history differs" (see front_diverge_text). Worker thread, logged when
+        done; never raises, never a price input."""
+        rp = self._recent_prompts
+        prev = rp.items.get(str(prev_rid))
+        tok = self.ftok._tok
+        if prev is None or tok is None:
+            return
+        prev_ids = prev[0]
+        msgs = list(payload["messages"]) if isinstance(payload, dict) and \
+            isinstance(payload.get("messages"), list) else None
+        knobs = ({k: payload[k] for k in _dt().RENDER_KNOBS if k in payload}
+                 if msgs is not None else None)
+
+        def job():
+            try:
+                cur_meta = _dt().payload_digest(msgs, knobs) if msgs is not None else None
+                body = _dt().diverge_text_line(
+                    tok=tok, rid=str(rid), prev_rid=str(prev_rid), prev_ids=prev_ids,
+                    cur_ids=ids, common=int(common), cur_messages=msgs,
+                    prev_meta=rp.meta.get(str(prev_rid)), cur_meta=cur_meta)
+                self.counters["prefix_diverge_text"] += 1
+                logger.info("WEG2 PREFIX-DIVERGE-TEXT %s (front ids decoded around `common`; "
+                            "hint: client_changed = a client message/knob at or before the "
+                            "divergence differs, render_only = identical messages rendered to "
+                            "different tokens)", body)
+            except Exception as e:  # noqa: BLE001 -- an instrument, named
+                logger.info("WEG2 PREFIX-DIVERGE-TEXT rid=%s FAILED %s: %s", rid,
+                            type(e).__name__, str(e)[:160])
+
+        self._ft_worker(job)
+
+    def _hl_sweep(self) -> int:
+        """#243 seam: every controller pass reads the hand-off state of every
+        rid waiting for a D seat (a scandir-cheap read on NF's side) and moves
+        a LOST one over X to P at once instead of at its admission. The
+        admitter's head may be one of them: it re-checks that its head is
+        still ``p`` after the seat wait (FIX 1) and gives the seat back."""
+        if not self._ready_for_d or not _hs.enabled():
+            return 0
+        moved = [p for p in list(self._ready_for_d) if self._hl_check(p, "sweep")]
+        if not moved:
+            return 0
+        ids = {id(p) for p in moved}
+        keep = [p for p in self._ready_for_d if id(p) not in ids]
+        self._ready_for_d.clear()
+        self._ready_for_d.extend(keep)
+        self._sync_batch_gate()
+        return len(moved)
 
     def _x_exact_tokens_check(self, rid: str, group: str, prompt_tokens: int) -> None:
         got = self._x_exact_rid.get(rid)
@@ -4212,13 +6867,515 @@ class Front:
         logger.info("WEG2 X-EXACT-TOKENS rid=%s group=%s tokens_front=%d tokens_group=%d match=%d",
                     rid, group, got[1], int(prompt_tokens), int(int(prompt_tokens) == got[1]))
 
+    def _retract_lost_anchors(self, depths: Sequence[int]) -> None:
+        """ANCHOR-LOST: D slept and its flush dropped these anchors; no
+        presence entry may credit them any more (both span stores)."""
+        if not depths:
+            return
+        gone = retract_lost_anchors(self.spans, depths)
+        gone_t = retract_lost_anchors(getattr(self, "tspans", None), depths)
+        logger.info(
+            "WEG2 PRESENCE-ANCHOR-LOST depths=%s retracted=%d token_spans=%d (D's sleep flush "
+            "dropped these Mamba anchors; their KV presence is no credit)",
+            list(depths)[:16], len(gone), len(gone_t),
+        )
+
+    def _note_resumable_depth(self, rid: str, pt: int, ct: int, held: bool,
+                              depth: Optional[int]) -> None:
+        """#59: one line when D's ``weg2_resumable_depth`` caps the credit
+        this leg records (old = what the front would have credited: the
+        measured ``cached_tokens``, or the whole prompt under #49's held
+        epoch; new = the cap). Absent field: counted, no line."""
+        if depth is None:
+            self.counters["presence_depth_absent"] += 1
+            return
+        old = max(int(ct), int(pt)) if held else int(ct)
+        if int(depth) >= old:
+            self.counters["presence_depth_uncapped"] += 1
+            return
+        self.counters["presence_depth_capped"] += 1
+        logger.info("WEG2 PRESENCE-DEPTH-CAP rid=%s credit %d -> %d (D weg2_resumable_depth=%d, "
+                    "cached_tokens=%d prompt_tokens=%d held=%d; D resumes only from its deepest "
+                    "held Mamba anchor, #59)", rid, old, int(depth), int(depth), int(ct), int(pt),
+                    int(held))
+
+    def _ns_note(self, rid: str, payload) -> None:
+        """Q-530 SALT-ISOLATION: the request's namespace ``(known, extra_key)``
+        (payload_namespace), kept per rid (bounded) so that every recording site
+        and the resume-via-P leg know it, even when the exact count falls back."""
+        try:
+            m = self.__dict__.setdefault("_ns_ek", collections.OrderedDict())
+            m[str(rid)] = payload_namespace(payload)
+            while len(m) > 4096:
+                m.popitem(last=False)
+        except Exception:  # noqa: BLE001 -- no note = the default namespace
+            pass
+
+    def _ns_isolated(self, rid: Any) -> bool:
+        """Q-530 SALT-ISOLATION: ``rid`` runs in a namespace of its own
+        (cache_salt / extra_key) or in one the front cannot know (LoRA): its
+        D readings and P anchors are never recorded into the token spans
+        (keyed by ids alone), and it is never re-priced from them. A rid the
+        front holds no note for is the default namespace."""
+        got = (self.__dict__.get("_ns_ek") or {}).get(str(rid))
+        return got is not None and ((not got[0]) or got[1] is not None)
+
+    def _p_anchor_presence(self, rid: str, text: str, pending: Any) -> int:
+        """PREFILL-EINBRUCH-0929 K1 (switch SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE).
+
+        NF z30u: 77 follow-up turns routed LONG prefilled < 2k new tokens on
+        P; 71 of their P hits sat exactly on the page floor of an earlier P
+        prompt (P's END-ANCHOR), and for 47 of those the witness's leg 2 on D
+        had not finished when they were priced -- so the front, which credits
+        only finished D readings (#1324, #59 A: in flight = 0), priced the
+        whole prompt. weg2-8-21: pending 4624 -> LONG, P prefilled 976 on a
+        26496 store hit.
+
+        Called at the first content of an ``after_p`` leg 2: D has resumed
+        from P's anchor, so the publish is complete and readable -- not the
+        in-flight write-through #1324 refused to credit. Returns the anchor."""
+        if not self.x_exact or self.tspans is None:
+            return 0
+        if Front._ns_isolated(self, rid):
+            return 0  # Q-530: a namespaced anchor credits no other tenant
+        ids = self.ftok.ids_for(text)
+        p_pt = int(getattr(pending, "leg1_prompt_tokens", 0) or 0)
+        anchor = self.tspans.record_store_anchor(ids, p_pt)
+        if anchor <= 0:
+            return 0
+        self.counters["p_anchor_presence"] += 1
+        self.counters["p_anchor_presence_tokens"] += anchor
+        logger.info("WEG2 P-ANCHOR-PRESENCE rid=%s anchor=%d p_prompt=%d tokens_front=%d epoch=%d "
+                    "(D resumed P's END-ANCHOR at its first content: a store presence every "
+                    "later text on this prefix is priced against)",
+                    rid, anchor, p_pt, int(ids.size), self.epoch)
+        self._x_exact_reprice_queue("p_anchor")
+        return anchor
+
+    def _seq_record(self, rid: str, ids: Any, mark: Optional[str], where: str) -> bool:
+        """SEQ-HASH (02.10.): record D's sequence mark of ``rid`` (prompt ``ids``)."""
+        from sglang.srt.managers import weg2_seq_hash as _sh
+
+        ts = getattr(self, "tspans", None)
+        got = _sh.parse(mark)
+        if ts is None or ids is None or got is None:
+            return False
+        if Front._ns_isolated(self, rid):
+            return False  # Q-530: a namespaced sequence credits no other tenant
+        depth, digest = got
+        if not ts.record_seq(ids, depth, digest):
+            return False
+        self.counters["seq_marks"] += 1
+        logger.info("WEG2 SEQ-MARK rid=%s where=%s depth=%d prompt=%d past_prompt=%d (D's anchor on "
+                    "prompt + output; a follow-up extending this sequence is credited to it)",
+                    rid, where, depth, int(ids.size), depth - int(ids.size))
+        return True
+
+    def _seq_park(self, marks: Dict[str, str]) -> int:
+        """SEQ-HASH: the park answer's marks for the legs it parked."""
+        if not marks or not getattr(self, "x_exact", False) or getattr(self, "ftok", None) is None:
+            return 0
+        texts = self.__dict__.get("_leg2_text") or {}
+        n = 0
+        for rid, mark in marks.items():
+            text = texts.get(rid)
+            if text is None:
+                continue
+            n += int(self._seq_record(rid, self.ftok.ids_for(text), mark, "park"))
+        if n:
+            self._x_exact_reprice_queue("seq_mark")
+        return n
+
+    def _park_handback(self, rids: Sequence[str]) -> List[str]:
+        """PARK-HANDBACK (user 02.10.: while P is awake every prefill is P's):
+        a D-prefill leg (no P leg 1, ``_d_prefill_legs``) that D holds
+        UNSTARTED at a park -- its ``held`` list, or a leg the front sent that
+        D's park lists nowhere (in the pipe, the late hold) -- and whose stream
+        is still in the lookahead (nothing committed to the client) is handed
+        back: the lookahead ends (ROS stop), the leg closes (D's hold aborts,
+        d_park_runtime.park_abort) and the request joins P's queue; it reaches
+        D under E2 (HANDBACK d_compute=0). y6x weg2-12-39: posted 0.6 s before
+        PARK-IMMEDIATE, held ('in_flight_held'), D prefilled 954 tokens after
+        the flip. A committed stream or a non-stream leg stays held (named)."""
+        legs = self.__dict__.get("_d_prefill_legs") or {}
+        if not rids or not legs:
+            return []
+        self._rvp_state()
+        look = getattr(self, "_leg2_lookahead", set())
+        out = []
+        for rid in dict.fromkeys(str(r) for r in rids):
+            if rid not in legs:
+                continue
+            if rid not in look:
+                self.counters["park_handback_committed"] += 1
+                logger.warning("WEG2 PARK-HANDBACK rid=%s kept=committed (D holds a D-prefill leg "
+                               "unstarted but its stream is committed or not streamed -- it stays "
+                               "held, D prefills it after the flip)", rid)
+                continue
+            self._rvp_requeue[rid] = {"rid": rid, "reason": PARK_HANDBACK_REASON,
+                                      "d_extent": int(self._front_price.get(rid, 0) or 0),
+                                      "x": int(self.tp_prefill_max_tokens)}
+            self.counters["park_handback"] += 1
+            out.append(rid)
+            logger.info("WEG2 PARK-HANDBACK rid=%s epoch=%d (D held this prefill unstarted at the "
+                        "park; its leg closes and P's batch takes it -- D gets it under E2, "
+                        "d_compute=0)", rid, self.epoch)
+        return out
+
+    async def _requeue_park_handback(self, request: web.Request, rid: str, payload: dict, text: str,
+                                     stream: bool, pending: Optional["Pending"],
+                                     seat: Optional["Seat"]) -> web.StreamResponse:
+        """PARK-HANDBACK: the closed leg's request joins P's queue as a normal
+        leg 1 (no X refusal: no W50 / x_requeues count), then its leg 2 again."""
+        p = pending
+        if p is None:
+            _n_hb = len(text) // int(CHARS_PER_TOKEN) + 1
+            if getattr(self, "x_exact", False) and getattr(self, "ftok", None) is not None:
+                _ids_hb = self.ftok.ids_for(text)
+                if _ids_hb is not None:
+                    _n_hb = int(_ids_hb.size)
+            p = Pending(rid, request.path, payload, text, time.time(),
+                        asyncio.get_event_loop().create_future(),
+                        est_prompt=_n_hb, est_uncached=_n_hb, span_known=False)
+        else:
+            p.fut = asyncio.get_event_loop().create_future()
+            p.t_arrive = time.time()
+        if seat is not None:
+            seat.release("park_handback")
+        # one path per rid (ROS-1P, NF rc12p: a closed leg alone left D's park
+        # standing): D drops its hold by name before P's leg 1 reuses the rid
+        try:
+            code, body = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+        except Exception as e:  # noqa: BLE001 -- the closed leg is the fallback abort
+            code, body = 0, f"{type(e).__name__}: {e}"
+        logger.info("WEG2 PARK-HANDBACK rid=%s abort_on_d=%s %s -> P's batch", rid, code,
+                    str(body)[:120])
+        p.seat = None
+        self._to_p_batch(p, "park_handback")
+        p.d_eligible = False
+        self.queue.append(p)
+        self._dp_mark(p, "reroute")  # R28
+        self._kick_controller("arrival")
+        try:
+            await p.fut
+        except Weg2Stop as e:
+            return web.json_response({"error": str(e)}, status=503)
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
+        self._mark_posted(p)
+        return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
+
+    def _to_p_batch(self, p: "Pending", where: str) -> None:
+        """P-BATCH-ALL: ``p`` gets a normal leg 1 on P (no D prefill)."""
+        was = ("short_kept" if getattr(p, "short_kept", False)
+               else "d_direct" if getattr(p, "d_direct", False) else "queued")
+        p.skip_leg1 = False
+        p.short_kept = False
+        p.d_direct = False
+        p.leg1_done = False
+        self.counters["p_batch_from_d"] += 1
+        logger.info("WEG2 P-BATCH-TAKES rid=%s was=%s where=%s est_uncached=%d epoch=%d (P is awake: "
+                    "its whole prefill runs on P, the prefix read from the shared store; D gets it "
+                    "under the E2 contract, d_compute=0)", p.rid, was, where,
+                    int(getattr(p, "est_uncached", 0) or 0), self.epoch)
+
+    def _p_batch_takes_d_prefill(self) -> int:
+        """P-BATCH-ALL (user 02.10.): at the start of a P drain, every request
+        still waiting for a D PREFILL -- a D-phase decision (SK SHORT-KEPT,
+        D-SHORT-DRAIN, ARRIVAL-SEAT QUEUED-SHORT / SHORT-IN-FLIP, X-IDLE-REGRANT:
+        ``d_direct``, no leg 1 ran) that D did not admit before the D->P flip
+        -- leaves ``_ready_for_d`` for P's queue, in arrival order. Queued kept
+        SHORTs get their leg 1 back. A request P already prefilled
+        (``leg1_done``, not ``d_direct``) stays. Returns the number moved."""
+        moved = []
+        ready = getattr(self, "_ready_for_d", None)
+        if ready:
+            keep = []
+            for p in ready:
+                if (getattr(p, "d_direct", False) and not getattr(p, "resume_via_p", False)
+                        and not getattr(p, "p_only", False)
+                        and (getattr(p, "fut", None) is None or not p.fut.done())):
+                    moved.append(p)
+                else:
+                    keep.append(p)
+            if moved:
+                ready.clear()
+                ready.extend(keep)
+                for p in moved:
+                    self._to_p_batch(p, "ready_for_d")
+                merged = sorted(list(self.queue) + moved, key=lambda q: q.t_arrive)
+                self.queue.clear()
+                self.queue.extend(merged)
+                self._sync_batch_gate()
+        n = len(moved)
+        for p in self.queue:
+            if getattr(p, "short_kept", False):
+                self._to_p_batch(p, "queue")
+                n += 1
+        return n
+
+    def _d_inflight_presence(self, rid: str, text: str, pending: Any, via: str) -> int:
+        """X-CREDIT-INFLIGHT-1002 (switch SGLANG_WEG2_ENABLE_D_INFLIGHT_PRESENCE).
+
+        NF boot ...10020634 (5b46b8842e): 16 of 30 P leg-1s prefilled 150-2700
+        tokens (< X) but were priced over X, because the credit (#1324) took
+        only FINISHED D readings while the prefix sat on D under a leg 2 still
+        decoding. weg2-14-23: 'X-EXACT-PRICE pending=11755 tokens=31723
+        credit=19968 src=d_leg2_cached ... reused=31566' -> LONG, flip pair,
+        P prefilled 171, TTFT 8.7 s; weg2-12-20 (31566) had produced its
+        first content on D at 06:39:51.9 and finished only at 06:40:44.
+
+        Called at the first content of a D leg 2: D holds the prompt now (it
+        read P's END-ANCHOR or prefilled it itself). Records the page-floor
+        anchor (P's leg-1 prompt for an after_p leg) as ``d_inflight``
+        presence and re-prices the queue. Returns the anchor (0 = none)."""
+        if (not getattr(self, "x_exact", False) or getattr(self, "tspans", None) is None
+                or getattr(self, "ftok", None) is None):
+            return 0
+        if Front._ns_isolated(self, rid):
+            return 0  # Q-530: a namespaced in-flight anchor credits no other tenant
+        ids = self.ftok.ids_for(text)
+        if ids is None:
+            self.counters["presence_d_inflight_no_ids"] += 1
+            return 0
+        p_pt = int(getattr(pending, "leg1_prompt_tokens", 0) or 0) if pending is not None else 0
+        if p_pt <= 0:
+            # Only a leg D resumed from P's END-ANCHOR: that anchor is a store
+            # fact D just read. A prompt D prefilled itself anchors on its
+            # prefill TRACK, which the front cannot see in flight (NF 10020634:
+            # 8 of 54 in-flight '#1469 RETAIN ... value=True' below the page
+            # floor, up to 1.9k -- weg2-4-7 19509 -> 17728); its finish
+            # reading (#59 depth, d_served_epoch / d_served_anchor) covers it.
+            self.counters["presence_d_inflight_no_p_anchor"] += 1
+            return 0
+        anchor = self.tspans.record_d_inflight(rid, ids, p_pt)
+        if anchor <= 0:
+            return 0
+        self.counters["presence_d_inflight"] += 1
+        self.counters["presence_d_inflight_tokens"] += anchor
+        logger.info("WEG2 PRESENCE-INFLIGHT rid=%s via=%s anchor=%d tokens_front=%d p_prompt=%d "
+                    "epoch=%d presence_src=d_inflight (D produced this leg 2's first content: "
+                    "the prompt's end anchor is realised on D while it decodes; replaced by "
+                    "the finish reading, capped by a #59b park depth, retracted when the "
+                    "leg ends without one or by ANCHOR-LOST)",
+                    rid, via, anchor, int(ids.size), p_pt, self.epoch)
+        self._x_exact_reprice_queue("d_inflight")
+        return anchor
+
+    def _d_inflight_end(self, rid: str) -> None:
+        """D-INFLIGHT: the leg 2 of ``rid`` ended; an in-flight entry no
+        finish reading replaced is retracted (only realised readings credit)."""
+        ts = getattr(self, "tspans", None)
+        if ts is None or not hasattr(ts, "end_d_inflight"):
+            return
+        gone = ts.end_d_inflight(rid)
+        if gone > 0:
+            self.counters["presence_d_inflight_retracted"] += 1
+            logger.info("WEG2 PRESENCE-INFLIGHT-END rid=%s retracted anchor=%d (the leg 2 ended "
+                        "without D's finish reading -- no realised presence stands for it)",
+                        rid, gone)
+
+    def _d_inflight_park(self, depths: Dict[str, int]) -> None:
+        """D-INFLIGHT x #59b: D's park answer names the depth each parked
+        request resumes from -- a realised in-flight D reading. An in-flight
+        entry is capped there; 0 retracts it."""
+        ts = getattr(self, "tspans", None)
+        if not depths or ts is None or not hasattr(ts, "park_cap"):
+            return
+        changed = 0
+        for rid, depth in depths.items():
+            got = ts.park_cap(rid, depth)
+            if got is None or got[0] == got[1]:
+                continue
+            changed += 1
+            self.counters["presence_d_inflight_park_capped"] += 1
+            logger.info("WEG2 PRESENCE-INFLIGHT-PARK rid=%s credit %d -> %d (D's #59b park "
+                        "depth=%d: the parked leg resumes from there)", rid, got[0], got[1], depth)
+        if changed:
+            self._x_exact_reprice_queue("d_inflight_park")
+
+    #: X-EXACT-BACKFILL (27B 74e51fb2c4, ported to NF 02.10.): the fallback reasons whose count
+    #: gives the RIGHT ids once the tokenizer is ready (multimodal / path / a payload the count
+    #: raised on would not)
+    X_EXACT_BACKFILL_REASONS = ("tokenizer_loading", "timeout")
+
+    def _x_exact_note_fallback(self, rid: str, reason: Optional[str]) -> None:
+        """Remember why ``rid`` was priced by chars/3 (X-EXACT-BACKFILL)."""
+        fb = self.__dict__.get("_x_exact_fallback_rid")
+        if fb is None:
+            fb = self.__dict__["_x_exact_fallback_rid"] = collections.OrderedDict()
+        fb[rid] = str(reason)
+        while len(fb) > 4096:
+            fb.popitem(last=False)
+
+    async def _x_exact_backfill(self, rid: str, path: str, payload: Any, text: str) -> None:
+        """X-EXACT-BACKFILL: a request priced by the chars/3 fallback because the front
+        tokenizer was still LOADING (or the count timed out) never got its token ids, so every
+        presence record of its own legs (P's store anchor, D's in-flight anchor, D's finish
+        reading) wrote nothing and its follow-ups priced credit=0. NF y6y (0e1967fd36): the six
+        requests before 'X-EXACT READY' (weg2-0-1..0-5, 1-6) were every session's base prefix;
+        weg2-4-10 / 5-11 / 5-12 / 10-17 priced src=none and went LONG for 257 / 135 / 220 / 12
+        real tokens. Counts it once (at its P leg 1, else at leg 2) with the same
+        ``ftok.count(path, payload)``; the routing of this request is unchanged."""
+        fb = self.__dict__.get("_x_exact_fallback_rid")
+        reason = fb.pop(rid, None) if fb else None
+        if reason not in self.X_EXACT_BACKFILL_REASONS:
+            return
+        ft = getattr(self, "ftok", None)
+        if (ft is None or getattr(ft, "state", None) != "ready" or not isinstance(payload, dict)
+                or ft.ids_for(text) is not None):
+            return
+        t0 = time.monotonic()
+        try:
+            c = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(ft.executor, ft.count, path, payload),
+                timeout=envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0)
+        except Exception as e:  # noqa: BLE001 -- the leg runs as before, named
+            self.counters["x_exact_backfill_failed"] += 1
+            logger.info("WEG2 X-EXACT-BACKFILL rid=%s reason=%s FAILED %s: %s (no presence records "
+                        "for this request's legs)", rid, reason, type(e).__name__, str(e)[:160])
+            return
+        ft.remember(text, c.ids)
+        self.counters["x_exact_backfilled"] += 1
+        logger.info("WEG2 X-EXACT-BACKFILL rid=%s reason=%s tokens=%d count_ms=%.1f wait_ms=%.1f (priced by "
+                    "chars/3 at arrival; its exact ids now feed this request's presence records)",
+                    rid, reason, c.n, c.ms, (time.monotonic() - t0) * 1000.0)
+
+    def _p_leg1_store_note(self, rid: str, text: str, prompt_tokens: int) -> None:
+        """STORE-PRESENCE: a P leg 1 served in this P phase; its END-ANCHOR is in the shared
+        store once P's sleep flush publishes (see :meth:`_p_flush_store_presence`). An image
+        request's token count is learned here first (MM-XPRICE: its ids exist from then on)."""
+        if not getattr(self, "x_exact", False) or getattr(self, "tspans", None) is None:
+            return
+        self._mm_learn(rid, text, prompt_tokens)
+        served = self.__dict__.setdefault("_p_phase_served", collections.OrderedDict())
+        served[rid] = (text, int(prompt_tokens or 0))
+        while len(served) > 1024:
+            served.popitem(last=False)
+
+    def _p_flush_store_presence(self, lost: Sequence[int] = ()) -> int:
+        """STORE-PRESENCE (user law 02.10.: the credit is the STORE prefix, L2/L3 are shared --
+        no group-local presence). P's sleep leg returned 200: its flush published every
+        un-backed node BEFORE the reset ('#1470 FLUSH-PUBLISH ... unbacked_left=0', 26 of 26 on
+        y6y P), so the END-ANCHOR of every P leg 1 of the phase is readable from L2/L3 by either
+        group. Each is recorded as a store presence (``src=store_anchor``), beyond the epoch, before
+        any D leg 2 of the phase has content. y6y weg2-8-13: P wrote weg2-5-11's END-ANCHOR
+        105344 at 07:51:02 ('WEG2 END-ANCHOR ... anchor=105344'), the P flush ran 07:51:04, D's
+        first content came only at 07:51:07.15 -- 8-13 was priced at 07:51:06.956 with credit 0
+        (LONG, P prefilled 162 on a 105344 hit). An anchor the flush reports lost is skipped."""
+        served = self.__dict__.get("_p_phase_served")
+        ts = getattr(self, "tspans", None)
+        ft = getattr(self, "ftok", None)
+        if not served or ts is None or ft is None:
+            if served:
+                served.clear()
+            return 0
+        lost_set = {int(d) for d in lost or ()}
+        n, tokens, rids = 0, 0, []
+        for rid, (text, pt) in list(served.items()):
+            if Front._ns_isolated(self, rid):
+                self.counters["store_presence_ns_isolated"] += 1
+                continue  # Q-530: its END-ANCHOR lies in its own namespace's chain
+            ids = ft.ids_for(text)
+            if ids is None:
+                self.counters["store_presence_no_ids"] += 1
+                continue
+            n_eff = min(int(ids.size), int(pt)) if int(pt) > 0 else int(ids.size)
+            if ts.own_anchor(n_eff) in lost_set:
+                continue
+            anchor = ts.record_store_anchor(ids, pt, source="store_anchor")
+            if anchor > 0:
+                n += 1
+                tokens += anchor
+                rids.append(f"{rid}:{anchor}")
+                self._mm_persist_anchor(rid, ids, anchor)
+        served.clear()
+        self._mm_persist_flush()
+        self.counters["store_presence"] += n
+        self.counters["store_presence_tokens"] += tokens
+        if n:
+            logger.info("WEG2 STORE-PRESENCE src=p_flush n=%d epoch=%d anchors=%s (P's sleep flush "
+                        "published these END-ANCHORs to L2/L3: a store prefix either group reads -- "
+                        "priced as src=store_anchor)", n, self.epoch, rids[:16])
+            self._x_exact_reprice_queue("store_presence")
+        return n
+
+    def _mm_persist_anchor(self, rid: str, ids: Any, depth: int) -> None:
+        """MM-PERSIST-1002: P's flush published ``ids[:depth]`` of an image
+        request to the store -- kept for the next boot when the anchor covers
+        its last image (a shallower one the L3-INDEX probe proves anyway)."""
+        info = (self.__dict__.get("_mm_rid_info") or {}).get(rid)
+        if info is None:
+            return
+        pers = self._mm_persist()
+        exp = self._mm_ids(rid)
+        if pers is None or exp is None or int(depth) < int(exp.image_end):
+            return
+        if pers.note_anchor(info[1], ids, int(depth)):
+            self.counters["mm_persist_anchors"] += 1
+            logger.info("WEG2 MM-PERSIST anchor rid=%s images=%s depth=%d image_end=%d (the store "
+                        "holds this image prompt to the depth; kept for the next boot)",
+                        rid, [k[:12] for k in info[1]], int(depth), int(exp.image_end))
+
+    def _mm_persist_credit(self, rid: str, ids: Any, keys: Sequence[str], mm: Any,
+                           store_depth: int) -> int:
+        """MM-PERSIST-1002: the depth a restored anchor credits ``ids`` (front
+        ids of an image prompt), recorded as a store depth (src=mm_persist);
+        0 = none. Only past the request's last image (a shallower prefix the
+        L3-INDEX probe prices itself) and only while the live store still
+        proves every full page before the first image."""
+        pers = self._mm_persist()
+        if pers is None or not keys or getattr(self, "store_probe", None) is None:
+            return 0
+        depth = pers.credit(keys, ids)
+        if depth < int(mm.image_end):
+            return 0
+        from sglang.srt.weg2.front_mm_persist import preimage_verified
+
+        ok, need = preimage_verified(int(store_depth), int(mm.first_image), self._d_page_size())
+        if not ok:
+            self.counters["mm_persist_refuted"] += 1
+            logger.info("WEG2 MM-PERSIST-CREDIT rid=%s REFUSED depth=%d: the store proves %d of the "
+                        "%d tokens before the first image (pages evicted -- no credit, and the "
+                        "image's anchors are dropped)", rid, depth, int(store_depth), need)
+            if pers.drop_anchors(keys):
+                self._mm_persist_flush()
+            return 0
+        got = self.tspans.record_store_depth(ids, depth, source="mm_persist")
+        if got > 0:
+            self.counters["mm_persist_credit"] += 1
+            self.counters["mm_persist_credit_tokens"] += int(got)
+            logger.info("WEG2 MM-PERSIST-CREDIT rid=%s depth=%d image_end=%d first_image=%d "
+                        "store_preimage=%d/%d images=%s (an earlier boot's P flush published this "
+                        "image prompt to the store; credited as a store depth, src=mm_persist)",
+                        rid, got, int(mm.image_end), int(mm.first_image), int(store_depth),
+                        need, [k[:12] for k in keys])
+        return got
+
     def _x_exact_record(self, rid: str, text: str, pt: int, ct: int, pending: Any,
-                        held_epoch: Optional[int]) -> None:
+                        held_epoch: Optional[int], resumable_depth: Optional[int] = None,
+                        seq_mark: Optional[str] = None) -> None:
         """D leg 2 finished: feed the token spans with D's MEASURED reading and
         log the residual error of this request's exact price. NO BAND: the
         error is printed, never folded back into the routing bound."""
-        self.tspans.record_presence(self.ftok.ids_for(text), ct, prompt_tokens=pt,
-                                    held_epoch=held_epoch)
+        ids = self.ftok.ids_for(text)
+        clamps = self.tspans.own_text_clamps
+        clamped_tokens = self.tspans.own_text_clamped_tokens
+        if not Front._ns_isolated(self, rid):  # Q-530: a namespaced reading credits no other tenant
+            self.tspans.record_presence(ids, ct, prompt_tokens=pt,
+                                        held_epoch=held_epoch, resumable_depth=resumable_depth)
+        self._seq_record(rid, ids, seq_mark, "finish")  # SEQ-HASH (02.10.)
+        if self.tspans.own_text_clamps != clamps:
+            # PREFILL-EINBRUCH-0929 K2: a parked + resumed leg 2 counts its
+            # decoded tokens as prompt; the entry credits its own end anchor.
+            self.counters["presence_own_text_clamped"] += 1
+            self.counters["presence_own_text_clamped_tokens"] += (
+                self.tspans.own_text_clamped_tokens - clamped_tokens)
+            logger.info("WEG2 PRESENCE-OWN-TEXT-CLAMP rid=%s tokens_front=%d cached_d=%d prompt_d=%d "
+                        "depth_d=%s credited=%d (D's reading reaches past this text -- a D-park "
+                        "resume counts its decoded tokens as prompt; the entry credits at most "
+                        "the end anchor of its own prompt)", rid, int(ids.size), int(ct), int(pt),
+                        resumable_depth, self.tspans.own_anchor(int(ids.size)))
         self._x_exact_reprice_queue("presence")
         got = self._x_exact_rid.pop(rid, None)
         if got is None:
@@ -4376,6 +7533,13 @@ class Front:
         probe = app.get("gc_pause_probe")
         if probe is not None and probe in gc.callbacks:
             gc.callbacks.remove(probe)
+        for k in ("gc_guard", "gc_warm_freeze"):  # GC-GUARD
+            t = app.get(k)
+            if t:
+                t.cancel()
+        _g = self.__dict__.get("_gc_guard_obj")
+        if _g is not None:
+            _g.disarm()
         if self.session:
             await self.session.close()
 
@@ -4462,6 +7626,7 @@ class Front:
                 # level test below reuses, so the two can never disagree about
                 # the reading they graded.
                 _pr_fast = host_ledger.read_cgroup_pressure()
+                self._flip_cushion_note(_pr_fast)  # W98 (z30u): the per-flip cushion course
                 _nr = _pr_fast.get("nonreclaim_gib")
                 if _nr is not None:
                     # #1361b THE CUSHION REACHES THE LATCH, or the criterion is
@@ -4477,6 +7642,9 @@ class Front:
                     # disagree about the moment they describe.
                     _file = _pr_fast.get("file_gib")
                     _shm = _pr_fast.get("shmem_gib")
+                    # W98 z30w: pool + ceiling from THIS cgroup in the Docker form
+                    # (host /proc/meminfo there); CT999 unchanged.
+                    _free, _free_src, _ceiling = host_ledger.latch_free_pool(_pr_fast)
                     _line = rate_latch.observe(
                         time.time(), float(_nr),
                         # cushion = file - shmem: cgroup-v2 `file` INCLUDES
@@ -4489,7 +7657,11 @@ class Front:
                             else float(_file) - float(_shm)
                         ),
                         shmem_gib=None if _shm is None else float(_shm),
-                        free_gib=_pr_fast.get("memfree_gib"),
+                        free_gib=_free,
+                        ceiling_gib=_ceiling,
+                        free_source=_free_src,
+                        # W98 dmatrix: the arena is a writer with a known end
+                        bounded_shm=host_ledger.arena_fill_gib(self.tag),
                     )
                     if _line is not None and "RATE-GAP" in _line:
                         # Blindness is a finding, never silence -- but it is not
@@ -4547,6 +7719,11 @@ class Front:
                     verdict = host_ledger.watermark_breach_verdict(
                         int(current),
                         margin=margin,
+                        # 29.09.: a finite memory.max (Docker) is the mark;
+                        # CT999 ('max') keeps the recorded 95.90.
+                        watermark_gib=host_ledger.reap_mark_gib(
+                            None if pr.get("max_gib") is None
+                            else int(float(pr["max_gib"]) * host_ledger.GIB)),
                         nonreclaim_gib=pr.get("nonreclaim_gib"),
                         file_reclaimable_gib=pr.get("file_reclaimable_gib"),
                         cgroup_anon_bytes=host_ledger.read_cgroup_anon_bytes(),
@@ -4570,19 +7747,780 @@ class Front:
     def do_stop(self, name: str, detail: str) -> None:
         if self.state == "STOP":
             return
+        state_before = self.state
         self.stop = Weg2Stop(name, detail)
         self.state = "STOP"
         self.counters["stop"] += 1
         logger.error("WEG2 STOP %s -- %s", name, detail)
+        Front._dp_ppfwd_stop(self, "front_stop")  # FLIPZEIT D>P: an open reading ends missing
+        _fwc = self.__dict__.get("_ipc_fw_clock")
+        _fw_none = _fwc.flush("front_stop") if _fwc is not None else None
+        if _fw_none is not None:  # FEHLT 3: the last flip's woken group never worked
+            self._ipc_publish("flip_first_work", _fw_none)
+        if self.__dict__.get("_flip_phase_obj") is not None:  # DASHBOARD-IPC: no flip after a STOP
+            self._flip_phase_obj.abort(time.time(), "front_stop")
+            Front._ipc_live_kick(self)
         for p in list(self.queue) + list(self._ready_for_d):
             if not p.fut.done():
                 p.fut.set_exception(self.stop)
         self.queue.clear()
         self._ready_for_d.clear()
         self._sync_batch_gate()
+        # W3-STOP (kvs2 09291223): the requests already on a leg are answered
+        # too -- their handlers are cancelled and reply 503 with this name
+        # (handle_generate); a group that wedged the flip never answers them
+        current = asyncio.current_task() if _loop_running() else None
+        inflight = 0
+        for t in list(self.__dict__.get("_generate_tasks", ())):
+            if t is current or t.done():
+                continue
+            t._weg2_stop_cancel = True
+            t.cancel()
+            inflight += 1
+        if inflight:
+            logger.error("WEG2 STOP IN-FLIGHT %s -- %d request(s) on a leg answered 503", name, inflight)
+        self._publish_stop_state(name, detail, state_before)
+
+    def _enter_state(self, new: str) -> bool:
+        """W98-STOP-FINAL: the ONE way ``state`` leaves serving/flipping. STOP is
+        final -- nothing sets it back (z30u 07:14:10: a flip that was open when
+        W98 fired wrote "serving" over the STOP and the boot served 136 more
+        requests). False = STOP holds, nothing changed."""
+        if self.state == "STOP":
+            return False
+        self.state = new
+        return True
+
+    def _flip_cushion_open(self, src: str, dst: str) -> None:
+        """W98 (z30u): the host cushion over this flip, begin -> done, on the
+        rate latch's own readings (weg2/flip_cushion.py). Instrument only."""
+        from sglang.srt.weg2 import flip_cushion as _fc
+
+        try:
+            w = self.__dict__.get("_flip_cushion_win")
+            if w is None:
+                w = _fc.FlipCushionWindow(
+                    _fc.cg_max_gib_of(host_ledger.read_cgroup()),
+                    host_ledger.RATE_LATCH_CUSHION_FLOOR_GIB)
+                self._flip_cushion_win = w
+            w.open(epoch=getattr(self, "epoch", 0), src=src, dst=dst,
+                   pr=host_ledger.read_cgroup_pressure())
+        except Exception as e:  # noqa: BLE001 -- an instrument never breaks a flip
+            logger.debug("WEG2-FLIP-CUSHION not opened: %s: %s", type(e).__name__, e)
+
+    def _flip_cushion_close(self) -> None:
+        """One WEG2-FLIP-CUSHION line per completed flip, and the same record
+        as the event ``flip_cushion`` in the boot's events.jsonl -- written by
+        the sidecar thread, never on the flip."""
+        from sglang.srt.weg2 import flip_cushion as _fc
+        from sglang.srt.weg2 import front_state_ipc
+
+        w = self.__dict__.get("_flip_cushion_win")
+        if w is None or not w.is_open:
+            return
+        try:
+            rec = w.close(host_ledger.read_cgroup_pressure())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("WEG2-FLIP-CUSHION not closed: %s: %s", type(e).__name__, e)
+            return
+        if rec is None:
+            return
+        logger.info("%s", _fc.line(rec))
+        self.__dict__.setdefault("flip_cushion_log", collections.deque(maxlen=256)).append(rec)
+        d = envs.WEG2_STATE_DIR.get() or None
+        if d:
+            self._sidecar_submit(front_state_ipc.publish_flip_cushion, d, rec)
+
+    def _flip_cushion_note(self, pr: Dict[str, Any]) -> None:
+        w = self.__dict__.get("_flip_cushion_win")
+        if w is not None:
+            w.note(pr)
+
+    def _refuse_flip_in_stop(self, src: str, dst: str, when: str) -> None:
+        self.counters["flip_refused_stop"] += 1
+        Front._flip_phase(self).abort(time.time(), f"refused_stop:{when}")  # DASHBOARD-IPC
+        Front._ipc_live_kick(self)
+        logger.error(
+            "WEG2-FLIP REFUSED-STOP epoch=%s sleep=%s wake=%s (%s): the front is in STOP "
+            "(%s) -- a named teardown is final, no flip after it",
+            getattr(self, "epoch", "?"), src, dst, when, getattr(self, "stop", None))
+
+    # ---------------- DASHBOARD-AUS-IPC (a)/(b): flip + front keys as records ----------------
+    def _ipc_submit(self, fn: Callable[..., Any], *args: Any) -> None:
+        """One state-dir write in the front's own IPC thread (BOUNDED FIFO, never on
+        the loop, never on the flip): a blocked writer drops the oldest entries
+        (front.ipc_dropped) instead of piling up RAM. A failed write is counted
+        and logged, never raised."""
+        w = self.__dict__.get("_ipc_writer")
+        if w is None:
+            from sglang.srt.weg2 import front_state_ipc
+            w = self.__dict__["_ipc_writer"] = front_state_ipc.BoundedWriter(
+                on_error=self._ipc_failed)
+        w.submit(fn, *args)
+
+    def _ipc_failed(self, fn: Callable[..., Any], e: Exception) -> None:
+        logger.warning("WEG2 IPC WRITE FAILED %s: %s: %s", getattr(fn, "__name__", fn),
+                       type(e).__name__, e)
+
+    def _ipc_publish(self, typ: str, data: dict) -> None:
+        """An event of the front into the boot's events.jsonl; no state dir = no-op."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        d = envs.WEG2_STATE_DIR.get() or None
+        if d:
+            self._ipc_submit(front_state_ipc.publish_event, d, typ, data)
+
+    def _ipc_first_work_clock(self):
+        from sglang.srt.weg2 import front_state_ipc
+
+        c = self.__dict__.get("_ipc_fw_clock")
+        if c is None:
+            c = self.__dict__["_ipc_fw_clock"] = front_state_ipc.FirstWorkClock()
+        return c
+
+    def _ipc_dp_clock(self):
+        """D->P flip time, the user's definition (front_state_ipc.DpFlipClock)."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        c = self.__dict__.get("_ipc_dp_clk")
+        if c is None:
+            c = self.__dict__["_ipc_dp_clk"] = front_state_ipc.DpFlipClock()
+        return c
+
+    def _group_beacons(self, group: str) -> Optional[Dict[int, Tuple[int, int, int]]]:
+        """PDFLIP-E3: ``group``'s progress beacons (None = off / unreadable;
+        {} = readable, no rank has run a forward yet)."""
+        try:
+            from sglang.srt.weg2 import progress_beacon as _fp
+
+            if not _fp.enabled():
+                return None
+            d = _fp.beacon_dir(getattr(self, "tag", "") or "")
+            g = self.groups.get(group)
+            if not d or g is None or not g.sid:
+                return None
+            return _fp.read_group(d, group, g.sid)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the flip
+            return None
+
+    async def _watch_d_first_forward(self, snap: Dict[int, Tuple[int, int, int]], t_done: float,
+                                     period_s: float = 0.01, bound_s: float = 120.0) -> None:
+        """PDFLIP-E3: P->D first decode token from D's beacons -- the end of D's
+        first forward after the flip (its forward_ct rose and t_done passed
+        t_start: that forward's tokens are out; baseline = the reading at awake,
+        else at done). Only while the stream clock
+        still waits (a streamed chunk wins); the earliest rank counts."""
+        clk = self._ipc_first_work_clock()
+        t_end = time.time() + bound_s
+        while clk.waits_for("D") and time.time() < t_end:
+            cur = await asyncio.to_thread(Front._group_beacons, self, "D") or {}
+            best = None
+            approx = False
+            for pid, (ct, ts, td) in cur.items():
+                ct0, _ts0, td0 = (int(v) for v in snap.get(pid, (0, 0, 0)))
+                # beat_done sits in process_batch_result: a t_done newer than the done
+                # reading after forward_ct rose = the first result (token) out of D.
+                # Under the overlap loop that done is stamped with forward_ct+1, so a
+                # rise of 2 is still the first result; more means a poll was missed.
+                if int(ct) <= ct0 or int(td) <= max(td0, 0):
+                    continue
+                t = float(td) / 1e9
+                if int(ct) - ct0 > 2:
+                    t, approx = max(min(t, float(ts) / 1e9), t_done), True
+                best = t if best is None else min(best, t)
+            if best is not None:
+                Front._ipc_first_work_at(self, "D", "d_first_forward_done" + ("_approx" if approx else ""),
+                                         None, max(best, t_done))
+                return
+            await asyncio.sleep(period_s)
+
+    def _ipc_first_work_at(self, group: str, what: str, rid: Optional[str], ts: float) -> None:
+        """PDFLIP-E3: the woken D's first work at a MEASURED time ``ts`` (its
+        first forward's end from the beacon), not at the call's now. D only:
+        the D->P end is the PpForwardProbe's (FLIPZEIT D>P, _dp_ppfwd_*)."""
+        c = self.__dict__.get("_ipc_fw_clock")
+        if c is None or not c.waits_for(group):
+            return
+        ev = c.seen(group, what, rid, float(ts))
+        if ev is not None:
+            self._ipc_publish("flip_first_work", ev)
+            Front._flip_phase(self).first_work(time.time(), what, at=float(ts))
+            Front._ipc_live_kick(self)
+
+    def _ipc_first_work_seen(self, group: str, what: str, rid: Optional[str],
+                             chunk: Optional[bytes] = None, path: str = "") -> None:
+        """The woken group's first work after a flip -> one ``flip_first_work`` event
+        (the flip time from the front's one clock). Cheap when nothing is armed.
+        ``chunk`` given (a D stream chunk): only a chunk that carries work counts,
+        never a keepalive (FW-PING, :func:`stream_chunk_is_work`)."""
+        c = self.__dict__.get("_ipc_fw_clock")
+        if c is None or not c.waits_for(group):  # per D chunk: one compare while nothing is armed
+            return
+        if chunk is not None and not stream_chunk_is_work(chunk, path):
+            return
+        # DASHBOARD-IPC 01.10.: D content before `done` is this flip's work only
+        # for a leg 2 dispatched in this flip (FirstWorkClock.seen)
+        _l2 = Front._req_book(self).leg2_dispatch_of(rid) if group == "D" and rid is not None else None
+        now = time.time()
+        ev = c.seen(group, what, rid, now, leg2_dispatch_ts=_l2)
+        if ev is not None and group == "P":
+            # FLIPZEIT D>P (02.10.): the dispatch only arms the reading; the
+            # event and the flip phase's end wait for PP0's first forward
+            Front._dp_ppfwd_first_work(self, ev)
+            return
+        if ev is not None:
+            self._ipc_publish("flip_first_work", ev)
+            Front._flip_phase(self).first_work(now, what)
+            Front._ipc_live_kick(self)
+
+    # ---------------- FLIPZEIT D>P END (user order 02.10.) ----------------
+    # FLIPZEIT = last token of the outgoing phase -> first token of the incoming
+    # one ("... zu erstes Token Decode oder PREFILL BATCH BEGINN"). For D->P the
+    # end is the BEGIN OF THE FIRST FORWARD ON THE FIRST P PIPELINE STAGE (PP0)
+    # after the wake: the PP0 rank's progress beacon
+    # (<arena>/progress/P-pid<pid>.bin, t_start_ns) at its first forward_ct rise
+    # after flip_done. It ends flip_user_time (prefill_start_ts,
+    # prefill_start_source="pp_first_forward"), the D->P flip_first_work and the
+    # front's flip phase (front.flip Nachlauf). The PP-last stage's first
+    # forward rides along as flip_user_time.pp_last_start_ts (the pipeline fill
+    # is prefill). Unavailable -> "missing" and no value; NEVER the leg-1
+    # dispatch. Log marker: WEG2-FLIP-PPFWD.
+    def _dp_ppfwd_arm(self, t_flip0: Optional[float] = None) -> None:
+        """At a D->P ``flip_done``: read the woken group P's first/last-stage
+        baseline and start the probe thread. ``t_flip0``: the flip's begin (the
+        caller's own stamp; ``self._flip_t0`` is already cleared by then --
+        Y8P-PPFWD-ARM-RACE-2). Never raises (an instrument never breaks a flip)."""
+        from sglang.srt.weg2 import progress_beacon as _fp
+
+        _old = self.__dict__.pop("_dp_ppfwd", None)  # a pending first work is THIS flip's: kept
+        if _old is not None:
+            _old.stop("rearmed")
+        try:
+            g = (getattr(self, "groups", None) or {}).get("P")
+            name = getattr(g, "name", None) or "P"
+            sid = int(getattr(g, "sid", 0) or 0)
+            d = _fp.beacon_dir(getattr(self, "tag", "") or "") if _fp.enabled() else ""
+            probe = _fp.PpForwardProbe(d, name, sid)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("WEG2-FLIP-PPFWD epoch=%d stage=first prefill_start_source=missing "
+                           "reason=probe_error %s: %s", int(getattr(self, "epoch", 0) or 0), type(e).__name__, e)
+            ev = self.__dict__.pop("_dp_ppfwd_pending", None)
+            if ev is not None:
+                Front._dp_ppfwd_publish(self, ev, {"missing": f"probe_error {type(e).__name__}"})
+            return
+        probe.epoch = int(getattr(self, "epoch", 0) or 0)
+        probe.t_done = time.time()
+        # Y8P-PPFWD-ARM-RACE-2 (NF y8s 03.10. 09:32:06, epoch 5: armed with baseline ct 18, first
+        # stage reported the SECOND chunk, +3.19 s): `flip()` clears `self._flip_t0` at its end,
+        # BEFORE this arm (front.py "the flip is closed"), so the attribute read gave None and
+        # resolve_started_after never ran. The begin stamp comes in as an argument.
+        _t0 = t_flip0 if t_flip0 else getattr(self, "_flip_t0", None)
+        if _t0:   # Y8P-PPFWD-ARM-RACE: a P forward that began after flip_begin but before this arm
+            probe.resolve_started_after(int(float(_t0) * 1e9))
+            _hit = probe.results.get("first")
+            if _hit and _hit.get("armed_in_forward"):
+                # the marker of a resolved race (probe_nf_y8s.py counts it): P's first forward began
+                # between flip_begin and this arm and was read from the baseline, not waited for
+                logger.info("WEG2-FLIP-PPFWD ARM-RACE resolved epoch=%d group=%s pp_first_pid=%s forward_ct=%s "
+                            "prefill_start_ts=%.3f done_to_forward_ms=%d (Y8P-PPFWD-ARM-RACE: the first forward "
+                            "began before `done`)", probe.epoch, name, _hit.get("pid"), _hit.get("ct"),
+                            _hit["ts"], round((_hit["ts"] - probe.t_done) * 1000.0))
+        self.__dict__["_dp_ppfwd"] = probe
+        if probe.result is None:
+            logger.info("WEG2-FLIP-PPFWD armed epoch=%d group=%s pp_first=%s pp_last=%s baseline_forward_ct=%s",
+                        probe.epoch, name, dict(probe.stages["first"]), dict(probe.stages["last"]),
+                        {**probe.baseline["first"], **probe.baseline["last"]})
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        def _cb(stage, res, _probe=probe):  # the probe thread (or here, already resolved)
+            if loop is not None and not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(Front._dp_ppfwd_resolved, self, _probe, stage)
+                except RuntimeError:
+                    pass
+
+        probe.start(_cb)
+
+    def _dp_ppfwd_log(self, probe, stage: str) -> None:
+        logged = probe.__dict__.setdefault("_logged", set())
+        r = probe.results.get(stage)
+        if stage in logged or r is None:
+            return
+        logged.add(stage)
+        if r.get("ts") is None:
+            logger.warning("WEG2-FLIP-PPFWD epoch=%d stage=%s %s=missing reason=%s%s", probe.epoch, stage,
+                           "prefill_start_source" if stage == "first" else "pp_last_start",
+                           r.get("missing"),
+                           " (no D->P flip time; never the leg-1 dispatch)" if stage == "first" else "")
+        elif stage == "first":
+            logger.info("WEG2-FLIP-PPFWD epoch=%d stage=first prefill_start_source=pp_first_forward "
+                        "prefill_start_ts=%.3f pid=%s pp_rank=%s forward_ct=%s done_to_forward_ms=%d",
+                        probe.epoch, r["ts"], r.get("pid"), r.get("pp_rank"), r.get("ct"),
+                        round((r["ts"] - probe.t_done) * 1000.0))
+        else:
+            f = probe.results.get("first") or {}
+            logger.info("WEG2-FLIP-PPFWD epoch=%d stage=last pp_last_start_ts=%.3f pid=%s pp_rank=%s "
+                        "forward_ct=%s pp_fill_ms=%s", probe.epoch, r["ts"], r.get("pid"), r.get("pp_rank"),
+                        r.get("ct"), "-" if f.get("ts") is None else round((r["ts"] - f["ts"]) * 1000.0))
+
+    def _dp_ppfwd_resolved(self, probe, stage: str = "first") -> None:
+        """On the loop: a stage has its reading -- for the FIRST stage (the end)
+        a waiting D->P ``flip_first_work`` is published and the flip phase closes."""
+        if self.__dict__.get("_dp_ppfwd") is not probe:
+            return
+        Front._dp_ppfwd_log(self, probe, stage)
+        if stage != "first":
+            return
+        ev = self.__dict__.pop("_dp_ppfwd_pending", None)
+        if ev is not None:
+            Front._dp_ppfwd_publish(self, ev, probe.result)
+
+    def _dp_ppfwd_publish(self, ev: dict, res: Optional[dict]) -> None:
+        from sglang.srt.weg2 import front_state_ipc as _fsi
+
+        out = _fsi.FirstWorkClock.dp_end(ev, res)
+        self._ipc_publish("flip_first_work", out)
+        Front._flip_phase(self).first_work(time.time(), out.get("what"), at=out.get("prefill_start_ts"))
+        Front._ipc_live_kick(self)
+
+    def _dp_ppfwd_first_work(self, ev: dict) -> None:
+        """The first leg 1 after a D->P flip was dispatched: publish its
+        ``flip_first_work`` once PP0's forward is read (now, if it is)."""
+        probe = self.__dict__.get("_dp_ppfwd")
+        if probe is not None and probe.result is not None:
+            Front._dp_ppfwd_log(self, probe, "first")
+            Front._dp_ppfwd_publish(self, ev, probe.result)
+            return
+        # before `done` (no probe yet) or the forward not yet seen: wait for it
+        self.__dict__["_dp_ppfwd_pending"] = ev
+
+    def _dp_ppfwd_settle(self) -> Tuple[Optional[dict], Optional[dict]]:
+        """At the first leg 1's end: ``(first, last)`` stage readings (one more
+        read now). A leg 1 P served with no rise seen is ``missing`` -- not a value."""
+        probe = self.__dict__.get("_dp_ppfwd")
+        if probe is None:
+            res = {"missing": "no_probe"}  # the flip never reached done, or the probe failed
+            ev = self.__dict__.pop("_dp_ppfwd_pending", None)
+            if ev is not None:
+                Front._dp_ppfwd_publish(self, ev, res)
+            return res, dict(res)
+        probe.poll()
+        if not probe.done():
+            probe.stop("no_rise_by_leg1_end")
+        for stage in ("first", "last"):
+            Front._dp_ppfwd_resolved(self, probe, stage)
+        return probe.results["first"], probe.results["last"]
+
+    def _dp_ppfwd_stop(self, reason: str) -> None:
+        """No more reading for the last D->P flip (next flip, STOP): an open
+        probe ends ``missing``; a waiting ``flip_first_work`` is published."""
+        probe = self.__dict__.pop("_dp_ppfwd", None)
+        ev = self.__dict__.pop("_dp_ppfwd_pending", None)
+        if probe is not None:
+            probe.stop(reason)
+            for stage in ("first", "last"):
+                Front._dp_ppfwd_log(self, probe, stage)
+        if ev is not None:
+            Front._dp_ppfwd_publish(self, ev, probe.result if probe is not None else {"missing": reason})
+
+    # ---------------- DASHBOARD-IPC 01.10.: phase live, TTFT per via, sessions ----------------
+    def _req_book(self):
+        """Every request's timeline (weg2/front_requests.RequestBook)."""
+        b = self.__dict__.get("_req_book_obj")
+        if b is None:
+            b = self.__dict__["_req_book_obj"] = _frq.RequestBook(time.time())
+        return b
+
+    def _flip_phase(self):
+        """``front.flip`` (weg2/front_requests.FlipPhase)."""
+        fp = self.__dict__.get("_flip_phase_obj")
+        if fp is None:
+            fp = self.__dict__["_flip_phase_obj"] = _frq.FlipPhase()
+        return fp
+
+    def _rb_changed(self) -> None:
+        """After a book mutation on the loop: D's activity changed -> one live write."""
+        b = self.__dict__.get("_req_book_obj")
+        if b is not None and b.activity is not self.__dict__.get("_ipc_live_act"):
+            Front._ipc_live_kick(self)
+
+    def _ipc_live_kick(self) -> None:
+        """``front.flip`` / ``front.d_activity`` now, not at the next 5 s beat:
+        ONE coalesced write in the IPC thread (a write already queued reads the
+        newest snapshot when it runs). Never a write on the loop or the flip."""
+        if self.__dict__.get("_ipc_live_pending"):
+            return
+        d = envs.WEG2_STATE_DIR.get() or None
+        if not d:
+            return
+        self.__dict__["_ipc_live_pending"] = True
+        Front._ipc_submit(self, functools.partial(Front._ipc_live_write, self), d)
+
+    def _ipc_live_write(self, d: str) -> None:
+        """Runs in the IPC thread: both snapshots are replaced (never mutated) on
+        the loop, so each read here is one consistent value."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        self.__dict__["_ipc_live_pending"] = False
+        b = Front._req_book(self)
+        self.__dict__["_ipc_live_act"] = b.activity
+        front_state_ipc.publish_front_fields(
+            d, {"flip": Front._flip_phase(self).snap, "d_activity": b.activity_block()})
+
+    def _rb_publish_park(self, ev: Optional[dict]) -> None:
+        if ev is not None:
+            self._ipc_publish("park", ev)
+
+    def _rb_resume(self, rids, why: str) -> None:
+        """The parks of ``rids`` end (D runs them again): one ``park`` event each."""
+        b = self.__dict__.get("_req_book_obj")
+        if b is None:
+            return
+        now = time.time()
+        for r in list(rids):
+            Front._rb_publish_park(self, b.resume(r, now, why, getattr(self, "epoch", 0)))
+        Front._rb_changed(self)
+
+    def _rb_done(self, rid: str, status: Any) -> None:
+        """The handler's end: ``request_done`` (+ the ``park`` of a park still
+        open) into events.jsonl, and the optional ``weg2_req`` push."""
+        b = self.__dict__.get("_req_book_obj")
+        if b is None:
+            return
+        common = (self.__dict__.get("_sess_prev") or {}).get(str(rid))
+        rec, park_ev = b.done(rid, time.time(), status, getattr(self, "epoch", 0), common)
+        Front._rb_publish_park(self, park_ev)
+        if rec is None:
+            return
+        self._ipc_publish("request_done", rec)
+        Front._rb_changed(self)
+        if envs.SGLANG_WEG2_METRICS_PUSH_URL.get():
+            Front._ipc_submit(self, functools.partial(Front._ipc_req_push, self), rec)
+
+    def _ipc_pusher(self):
+        """TSDB-DELTA 1c: the Influx pusher (env set), its writes in the IPC thread."""
+        p = self.__dict__.get("_ipc_pusher_obj")
+        if p is None:
+            url = envs.SGLANG_WEG2_METRICS_PUSH_URL.get()
+            if not url:
+                return None
+            p = self.__dict__["_ipc_pusher_obj"] = _fmet.InfluxPusher(url, submit=functools.partial(Front._ipc_submit, self))
+        return p
+
+    def _ipc_req_push(self, rec: dict) -> None:
+        """Runs in the IPC thread: one ``weg2_req`` line, bundled ~2 s."""
+        p = Front._ipc_pusher(self)
+        if p is None:
+            return
+        tags, fields = _frq.influx_req_fields(rec)
+        tags["model"] = envs.SGLANG_WEG2_METRICS_MODEL.get() or None
+        ts = rec.get("end_ts")
+        p.add(_fmet.influx_line("weg2_req", tags, fields,
+                          ts_ns=int(float(ts) * 1e9) if ts is not None else None))
+        p.maybe_flush()
+
+    def _flip_vorlauf_reason(self, src: str, dst: str) -> str:
+        """Why this flip was decided, from the front's own state at ``flip()``."""
+        # getattr: partial test fronts (as the rest of the flip path)
+        queue = getattr(self, "queue", None)
+        if src == "D":
+            return "backlog" if queue else "idle"
+        D = (getattr(self, "groups", None) or {}).get("D")
+        if getattr(self, "_ready_for_d", None):
+            return "handoff"
+        if getattr(self, "_d_parked", None):
+            return "parked"
+        if D is not None and getattr(self, "dormant_admit", False) and D.outstanding:
+            return "dormant_held"
+        return "p_phase_end" if queue else "idle"
+
+    def _ipc_out_book(self):
+        """Every open request's arrival and last token (front_state_ipc.OutstandingBook)."""
+        b = self.__dict__.get("_ipc_out_book_obj")
+        if b is None:
+            from sglang.srt.weg2.front_state_ipc import OutstandingBook
+
+            b = self.__dict__["_ipc_out_book_obj"] = OutstandingBook()
+        return b
+
+    def ipc_out_wrap(self, handler):
+        """The rid-end of the outstanding book: every return, exception and
+        cancel of the generate handler takes the rid out (the #243 seam's rid)."""
+        import functools
+
+        @functools.wraps(handler)
+        async def _wrapped(request):
+            status: Any = None
+            try:
+                resp = await handler(request)
+                status = getattr(resp, "status", None)
+                return resp
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
+            except BaseException as e:
+                status = f"error:{type(e).__name__}"
+                raise
+            finally:
+                try:
+                    rid = request.get(_hs.RID_KEY)
+                except Exception:  # noqa: BLE001
+                    rid = None
+                if rid:
+                    self._ipc_out_book().end(rid)
+                    try:  # DASHBOARD-IPC: request_done (+ an open park) -- never the answer's fault
+                        Front._rb_done(self, rid, status)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("WEG2 request_done not built rid=%s: %s: %s", rid, type(e).__name__, e)
+        return _wrapped
+
+    def _park_stuck(self):
+        """#287 NEED0 (c): the per-rid park streak (weg2/park_stuck.py)."""
+        ps = self.__dict__.get("_park_stuck_obj")
+        if ps is None:
+            from sglang.srt.weg2.park_stuck import ParkStuck
+
+            ps = self.__dict__["_park_stuck_obj"] = ParkStuck()
+        return ps
+
+    def _ipc_front_fields(self) -> dict:
+        """The front's own keys under state.json `front` (never the host's mirror keys)."""
+        out: Dict[str, Any] = {"ts": round(time.time(), 3)}
+        out["outstanding_by_group"] = {g.name: len(g.outstanding) for g in self.groups.values()}
+        out["served"] = {g.name: g.served for g in self.groups.values()}
+        out["served_tokens"] = dict(self.__dict__.get("_ipc_served_tokens") or {})
+        out["d_phase_n"] = getattr(self, "_d_phase_n", None)
+        out["d_parked_n"] = len(getattr(self, "_d_parked", None) or {})
+        # FEHLT 1 (30.09.; 27B d_phase_n null): D's seats on EVERY front. A
+        # standard-form wake fixes n (H95c: handoff_n + parked_n, capped at
+        # --d-bs); a front whose wakes carry no seat count (27B) or before the
+        # first wake has --d-bs seats -- the source says which.
+        _pn = out["d_phase_n"]
+        out["d_seats"] = {"n": int(_pn) if _pn is not None else int(getattr(self, "d_bs", 0) or 0),
+                          "cap": int(getattr(self, "d_bs", 0) or 0),
+                          "parked_n": out["d_parked_n"],
+                          "source": ("wake_phase_seats" if _pn is not None else "d_bs")}
+        # FEHLT 4 (30.09.): D's cached tokens split by the front's own served
+        # rows -- the P->D hand-off (a rid whose leg 1 ran on P: D_after_P) and
+        # the prefix D found without one (D minus D_after_P); cumulative
+        _st = out["served_tokens"]
+        _d_c = int(((_st.get("D") or {}).get("cached")) or 0)
+        _h_c = int(((_st.get("D_after_P") or {}).get("cached")) or 0)
+        out["d_cached_tokens"] = {"total": _d_c, "handoff": _h_c, "d_prefix_hit": max(0, _d_c - _h_c)}
+        # #287 NEED0 (c): parked over N D phases without output (weg2/park_stuck.py)
+        out["d_park_stuck"] = self._park_stuck().block(envs.SGLANG_WEG2_PARK_STUCK_PHASES.get())
+        health = {}
+        for g in self.groups.values():
+            f = getattr(g, "health_facts", None)
+            health[g.name] = {"http_ok": getattr(f, "http_ok", None) if f is not None else None,
+                              "alive": getattr(f, "alive", None) if f is not None else None,
+                              "streak": int(getattr(g, "health_fail_streak", 0) or 0),
+                              "ts": round(getattr(f, "t", 0.0) or 0.0, 3) if f is not None else None}
+        out["groups"] = health
+        tally = self.__dict__.get("_ipc_error_tally")
+        out["errors"] = tally.snapshot() if tally is not None else None
+        w = self.__dict__.get("_ipc_writer")
+        out["ipc"] = {"queue": w.depth() if w else 0, "max": w.maxlen if w else None,
+                      "dropped": w.dropped if w else 0, "failed": w.failed if w else 0}
+        # DASHBOARD-IPC 01.10.: the phase live, TTFT per via with its parts, the book
+        _rb = Front._req_book(self)
+        out["flip"] = Front._flip_phase(self).snap
+        out["d_activity"] = _rb.activity_block()
+        out["ttft_by_via"] = _rb.ttft_block()
+        _fwc = self.__dict__.get("_ipc_fw_clock")
+        _push = self.__dict__.get("_ipc_pusher_obj")
+        out["request_book"] = {
+            "open": len(_rb.rows), "dropped": _rb.dropped, "page_size": _rb.page_size,
+            "first_work_stale_skipped": _fwc.stale_skipped if _fwc is not None else 0,
+            "push": (None if _push is None else
+                     {"points": _push.points, "dropped": _push.dropped, "errors": _push.errors,
+                      "writes": _push.writes})}
+        if _asr.enabled():
+            # ARRIVAL-SEAT: the rule's verdict counters (state.json front.arrival_seat)
+            out["arrival_seat"] = _asr.state_block(self.counters, self._asr_st()["waiters"], True)
+            out["arrival_seat"]["ttft_by_via"] = out["ttft_by_via"]  # the dashboard seat's wish (4.)
+        # FEHLT 8 (30.09., DASHBOARD-AUS-IPC-INVENTAR): the prefill site per request,
+        # exact -- rigdash derived it from the leg counts (5 s behind, blind to reroutes)
+        out["routes"] = routes_block(self.counters, getattr(self, "_route_x_live", None))
+        # y4y 17:05:40Z (two burst requests 300 s without a token beside a served
+        # anchor stream): the oldest open request and the ones longest without a
+        # token, for the progress watcher's HAENGT-EINZEL
+        _gp, _gd = self.groups.get("P"), self.groups.get("D")
+        out.update(self._ipc_out_book().block(
+            time.time(), [(q.rid, q.t_arrive) for q in list(getattr(self, "queue", None) or ())],
+            dict(getattr(_gp, "outstanding", None) or {}), dict(getattr(_gd, "outstanding", None) or {}),
+            list((getattr(self, "_d_parked", None) or {}).keys()),
+            getattr(self, "state", None) == "flipping"))
+        return out
+
+    def _ipc_group_health_observe(self, g) -> None:
+        """(A12) one ``group_health`` event when a group's health verdict CHANGES
+        (the first poll counts as a change): ok / busy / failing / held / dead,
+        from the poll's own GroupFacts. Unchanged polls write nothing."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        f = getattr(g, "health_facts", None)
+        if f is None:
+            return
+        verdict = front_state_ipc.group_health_verdict(f.http_ok, f.alive, f.streak, f.hold is not None)
+        prev = self.__dict__.setdefault("_ipc_gh_prev", {})
+        if prev.get(g.name) == verdict:
+            return
+        was = prev.get(g.name)
+        prev[g.name] = verdict
+        self._ipc_publish("group_health", {
+            "group": g.name, "verdict": verdict, "prev": was, "http_ok": bool(f.http_ok),
+            "alive": bool(f.alive), "streak": int(f.streak or 0),
+            "hold_pid": getattr(f.hold, "pid", None) if f.hold is not None else None,
+            "ts": round(float(f.t or time.time()), 3)})
+        # (A14) a verdict turning failing/held/dead: the stops the group's ranks
+        # recorded on their death path -> ``rank_stop`` events, in the IPC thread.
+        if verdict in front_state_ipc.RANK_STOP_VERDICTS:
+            d = envs.WEG2_STATE_DIR.get() or None
+            if d:
+                seen = self.__dict__.setdefault("_ipc_rank_stops_seen", set())
+                self._ipc_submit(front_state_ipc.publish_rank_stops, d, g.name, seen)
+
+    def _ipc_note_served(self, group: str, prompt: int, cached: int, completion: int,
+                         cached_tier: Optional[Dict[str, int]] = None) -> None:
+        st = self.__dict__.setdefault("_ipc_served_tokens", {})
+        row = st.setdefault(group, {"n": 0, "prompt": 0, "cached": 0, "completion": 0})
+        row["n"] += 1
+        row["prompt"] += int(prompt or 0)
+        row["cached"] += int(cached or 0)
+        row["completion"] += int(completion or 0)
+        # Feld 2: only an answer that carried CachedTokensDetails adds to the
+        # tiers; the row grows the key with the first such answer.
+        if cached_tier is not None:
+            tiers = row.setdefault("cached_tier", {k: 0 for k in CACHED_TIERS})
+            for k in CACHED_TIERS:
+                tiers[k] += int(cached_tier.get(k) or 0)
+
+    def _ipc_note_served_d(self, pending: Any, prompt: int, cached: int, completion: int,
+                           cached_tier: Optional[Dict[str, int]], rid: Optional[str] = None) -> None:
+        """Leg 2's served row, and -- when P's leg 1 ran for THIS rid -- the same
+        numbers again under ``D_after_P`` (RANKSTATS-S3 "DASHBOARD-GRAFIKEN" Feld 1):
+        D's ``cached`` there is the P->D hand-off, not a cache hit made before the
+        request. A subset of ``D``, cumulative, never reset."""
+        self._ipc_note_served("D", prompt, cached, completion, cached_tier)
+        self._ipc_dp_clock().note_d_served(time.time())  # D->P flip time: D's last served leg 2
+        # FEHLT 8 (state.json front.routes): the prefill site of THIS request,
+        # the X-EXACT-ERR `via` classification, counted once per served leg 2
+        # (that site is reached only on an _x_exact_rid hit; this one sees all)
+        _rc = route_counter_of(pending)
+        self.counters[_rc] = self.counters.get(_rc, 0) + 1
+        if pending is not None and pending.leg1_ran:
+            self._ipc_note_served("D_after_P", prompt, cached, completion, cached_tier)
+        if rid is not None:  # DASHBOARD-IPC: request_done's D numbers
+            Front._req_book(self).d_served(rid, prompt, cached, completion, cached_tier,
+                                      handoff=bool(pending is not None and pending.leg1_ran))
+
+    async def ipc_front_writer(self, period_s: float = 5.0) -> None:
+        """(b) every ``period_s``: the front's keys into state.json `front` through
+        state_file (writer front). No state dir = the task ends at once."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        d = envs.WEG2_STATE_DIR.get() or None
+        if not d:
+            return
+        # front.errors: this process's ERROR/CRITICAL records, structured from the
+        # record objects (weg2/rankstats.ErrorTally), never parsed from a log line.
+        from sglang.srt.weg2 import rankstats as _rankstats
+
+        self.__dict__["_ipc_error_tally"] = _rankstats.install_error_tally()
+        while True:
+            await asyncio.sleep(period_s)
+            try:
+                fields = self._ipc_front_fields()
+            except Exception as e:  # noqa: BLE001 -- an instrument never stops the front
+                logger.debug("WEG2 IPC front fields not built: %s: %s", type(e).__name__, e)
+                continue
+            self._ipc_submit(front_state_ipc.publish_front_fields, d, fields)
+            _p = self.__dict__.get("_ipc_pusher_obj")
+            if _p is not None:  # TSDB 1c: the last points of a quiet minute go out too
+                _p.maybe_flush()
+
+    def _publish_stop_state(self, name: str, detail: str, state_before: str) -> None:
+        """IPC §2.2 (user law: control never over log lines): the STOP into the
+        boot's state directory -- event ``front_stop`` and the A5 stop request,
+        through the one writer (weg2/state_file.py). No state directory = no-op;
+        a failed write is logged, never a second failure of the teardown."""
+        from sglang.srt.weg2 import front_state_ipc
+
+        d = envs.WEG2_STATE_DIR.get() or None
+        if not d:
+            return
+        try:
+            out = front_state_ipc.publish_front_stop(
+                d, name=name, detail=detail, state_before=state_before,
+                epoch=getattr(self, "epoch", None), awake=getattr(self, "awake", None))
+            logger.error("WEG2 STOP STATE %s -> %s", name, out)
+        except Exception as e:  # noqa: BLE001 -- the teardown stands without the file
+            logger.error("WEG2 STOP STATE WRITE FAILED %s: %s: %s", name, type(e).__name__, e)
 
     # ---------------- HTTP handlers ----------------
     async def handle_health(self, request: web.Request) -> web.Response:
+        from sglang.srt.weg2 import front_health as _fh
+
+        # FRONT-PREWARM truthful readiness (y8f): while /weg2/state says
+        # ``warming`` -- the boot's tokenizer load still holds the first route
+        # decision -- /health must not announce serving. The launcher's
+        # ``wait_ready`` calls READY on the first 200 (weg2/launcher.py), and
+        # boot y8c announced serving 11.8 s before the load ended: the first
+        # arrival stalled 12818 ms behind the BOOT-START HOLD. The gate rides
+        # ``_reported_state()``: the switch off or the load ended -> 200 at
+        # once; a flip reads ``flipping``, STOP reads 503 as before; and the
+        # X_EXACT_HOLD_MAX_S bound inside ``_reported_state()`` bounds this
+        # gate, so a load that never ends cannot suppress READY forever.
+        reported = self._reported_state()
+        if reported == "warming":
+            return web.json_response(
+                {"state": reported, "awake": self.awake, "epoch": self.epoch,
+                 "prewarm": "front tokenizer load running; same state /weg2/state calls warming"},
+                status=503)
+        if _fh.enabled():
+            return await self._handle_health_facts()
+        return await self._handle_health_old()
+
+    async def _handle_health_facts(self) -> web.Response:
+        """FH: 503 when STOP or any group is unhealthy by the poller's facts
+        (weg2/front_health.py). A group without fresh facts is probed live and
+        judged by the old rule (non-200 = 503)."""
+        from sglang.srt.weg2 import front_health as _fh
+
+        now = time.time()
+        results: dict = {}
+        facts_out: dict = {}
+        unhealthy: dict = {}
+        for g in self.groups.values():
+            f = g.health_facts
+            if f is None or now - f.t > _fh.STALE_S:
+                ok = await self._probe_group_health(g, _fh.PROBE_TIMEOUT_S)
+                results[g.name] = 200 if ok else "error: live probe"
+                facts_out[g.name] = {"source": "live", "http_ok": ok}
+                if not ok:
+                    unhealthy[g.name] = "live /health probe failed (no fresh poller facts)"
+                continue
+            reason = _fh.unhealthy_reason(f, self.state)
+            results[g.name] = 200 if reason is None else 503
+            facts_out[g.name] = {
+                "source": "poller", "http_ok": f.http_ok, "process_alive": f.alive,
+                "streak": f.streak, "age_s": round(now - f.t, 1),
+                "hold": None if f.hold is None else {
+                    "pid": f.hold.pid, "exception": f.hold.exception, "dump": f.hold.path},
+            }
+            if reason is not None:
+                unhealthy[g.name] = reason
+        ok = not unhealthy and self.state != "STOP"
+        results.update({"state": self.state, "awake": self.awake, "epoch": self.epoch,
+                        "stop": str(self.stop) if self.stop else None,
+                        "facts": facts_out, "unhealthy": unhealthy})
+        return web.json_response(results, status=200 if ok else 503)
+
+    async def _handle_health_old(self) -> web.Response:
         results = {}
         for g in self.groups.values():
             try:
@@ -4615,12 +8553,29 @@ class Front:
 
     def state_dict(self) -> dict:
         return {
-            "tag": self.tag, "state": self.state, "awake": self.awake, "epoch": self.epoch,
+            "tag": self.tag, "state": self._reported_state(), "awake": self.awake,
+            "epoch": self.epoch,
             "stop": str(self.stop) if self.stop else None, "admit_d": self.admit_d,
             "queue": len(self.queue),
             "outstanding": {g.name: len(g.outstanding) for g in self.groups.values()},
             "served": {g.name: g.served for g in self.groups.values()},
             "counters": dict(self.counters),
+            # PREFILL-EINBRUCH-0929: the X-price presence repairs as numbers per
+            # boot (count + tokens), so the metal read needs no log line.
+            "presence_price": {
+                "own_text_clamped": int(self.counters["presence_own_text_clamped"]),
+                "own_text_clamped_tokens": int(self.counters["presence_own_text_clamped_tokens"]),
+                "p_anchor_presence": int(self.counters["p_anchor_presence"]),
+                "p_anchor_presence_tokens": int(self.counters["p_anchor_presence_tokens"]),
+                "d_inflight": int(self.counters["presence_d_inflight"]),
+                "d_inflight_tokens": int(self.counters["presence_d_inflight_tokens"]),
+                "d_inflight_retracted": int(self.counters["presence_d_inflight_retracted"]),
+                "d_inflight_park_capped": int(self.counters["presence_d_inflight_park_capped"]),
+                # L3-INDEX PRICE (02.10.): arrivals credited by the store's page prefix
+                "l3_index": int(self.counters["l3_index_credit"]),
+                "l3_index_tokens": int(self.counters["l3_index_credit_tokens"]),
+                "l2_arena": int(self.counters["l2_arena_credit"]),  # of them: L2-only depth
+            },
             "corridor_min_mib": {k: dict(v) for k, v in self.corridor_min.items()},
             # Same instrument and band as the WEG2-CORRIDOR log line: a reader
             # of this dict must not have to guess which "free" it holds.  Both
@@ -4727,6 +8682,135 @@ class Front:
             logger.warning("WEG2 P-INTAKE-STALL rid=%s /abort_request on P raised: %s",
                            p.rid, exc)
 
+    # ---------------- H102: the client hung up before its answer ----------------
+    def _arm_client_watch(self, request: web.Request, rid: str,
+                          p: Optional[Pending] = None) -> None:
+        """H102: one watcher task per request, armed where the request enters
+        the queue or goes to D. It ends by itself when the answer was written
+        or once it has acted on a hang-up."""
+        if not envs.SGLANG_WEG2_ENABLE_CLIENT_GONE_ABORT.get():
+            return
+        tasks = self.__dict__.setdefault("_client_watch_tasks", set())
+        task = asyncio.ensure_future(self._client_watch(request, rid, p))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _queued_pending(self, rid: str) -> Optional[Pending]:
+        for q in self.queue:
+            if q.rid == rid:
+                return q
+        return None
+
+    async def _client_watch(self, request: web.Request, rid: str,
+                            p: Optional[Pending]) -> None:
+        try:
+            while True:
+                await asyncio.sleep(CLIENT_GONE_TICK_S)
+                if response_complete(request):
+                    return
+                if p is None:
+                    # A W31 re-queue gives a SHORT its Pending only later; it
+                    # always passes through the queue, where it is found.
+                    p = self._queued_pending(rid)
+                if client_gone(request):
+                    await self._on_client_gone(rid, p)
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- a watcher never takes the front down
+            logger.warning("WEG2-CLIENT-GONE rid=%s watcher failed: %r", rid, e)
+
+    def _client_state(self, rid: str, p: Optional[Pending]) -> str:
+        """H102: where a request lives, in the order it moves:
+        ``queued`` (front queue) -> ``p-leg1`` (popped by the drain: waiting
+        for a P slot, or its leg 1 in ``P.outstanding``) -> ``handoff``
+        (leg 1 done, ``_ready_for_d``) -> ``d`` (leg 2 on D) / ``parked``
+        (H91c: D parked it on the wait bound). ``done`` = the handler has
+        already answered."""
+        parked = getattr(self, "_d_parked", None) or {}
+        if rid in parked:
+            return "parked"
+        if p is not None and any(q is p for q in self.queue):
+            return "queued"
+        if rid in self.groups["P"].outstanding:
+            return "p-leg1"
+        if p is not None and any(q is p for q in self._ready_for_d):
+            return "handoff"
+        if rid in self.groups["D"].outstanding:
+            return "d"
+        if p is not None and not p.fut.done() and not p.leg1_done:
+            return "p-leg1"
+        if p is not None and p.fut.done() and not p.fut.cancelled() and p.fut.exception() is None:
+            return "d"   # handed to D, leg 2 not entered yet
+        if p is None:
+            return "d"   # SHORT / CARRIER-EXCEEDS: armed at leg 2
+        return "done"
+
+    async def _on_client_gone(self, rid: str, p: Optional[Pending]) -> None:
+        """H102: cancel the work behind a client that left. One line per
+        request, ``WEG2-CLIENT-GONE rid=... state=... action=...``."""
+        state = self._client_state(rid, p)
+        self.counters[f"client_gone_{state}"] += 1
+        if state == "done":
+            return
+        action = "none"
+        if p is not None and state in ("queued", "p-leg1", "handoff"):
+            p.client_gone = True
+        if state == "queued":
+            # BY IDENTITY: deque.remove compares with Pending.__eq__ (dataclass,
+            # field by field) and could take an equal-fielded other request.
+            for i, q in enumerate(self.queue):
+                if q is p:
+                    del self.queue[i]
+                    break
+            action = "dequeued"
+        elif state == "handoff":
+            self._ready_for_d_drop(p)
+            self._sync_batch_gate()
+            action = "dropped-before-d"
+        elif state == "p-leg1" and rid not in self.groups["P"].outstanding:
+            action = "leg1-skipped"
+        if (p is not None and state in ("queued", "p-leg1", "handoff")
+                and not p.fut.done()):
+            p.fut.set_exception(Weg2ClientGone(f"WEG2-CLIENT-GONE rid={rid} state={state}"))
+        if state == "p-leg1" and rid in self.groups["P"].outstanding:
+            # The intake-stall path: /abort_request on P's HTTP server (PP0);
+            # AbortReq reaches every rank through the recv broadcast (#1460
+            # CTRL-FWD, WEG2-PP-CHUNKED-ABORT). Idempotent where it is gone.
+            try:
+                code, _b = await self.rpc(self.groups["P"], "/abort_request", {"rid": rid}, 30)
+                action = f"abort-p status={code}"
+            except Exception as exc:  # noqa: BLE001
+                action = f"abort-p raised={type(exc).__name__}"
+        elif state == "parked":
+            # H91c: D holds the parked request while P runs; it is released
+            # on D the same way (D's /abort_request, TP broadcast).
+            getattr(self, "_d_parked", {}).pop(rid, None)
+            try:
+                code, _b = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+                action = f"abort-d-park status={code}"
+            except Exception as exc:  # noqa: BLE001
+                action = f"abort-d-park raised={type(exc).__name__}"
+        elif state == "d":
+            # 27B rc12z21 13:42-13:51 (weg2-0-8 / weg2-1-13, 35789 / 39729
+            # completion tokens for clients that had left at 13:44): relying
+            # on "leg 2's next write to the client fails" holds for a STREAM
+            # only. A NON-stream leg 2 writes nothing before D's end, so D
+            # decoded to the end for nobody and held the D->P drain for
+            # minutes. Abort on D by rid, stream or not -- the same call the
+            # parked branch makes; idempotent where the stream's write error
+            # already aborted it, and a hang-up after D's end is "done" above.
+            if p is not None:
+                p.client_gone = True
+            try:
+                code, _b = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
+                action = f"abort-d status={code}"
+            except Exception as exc:  # noqa: BLE001
+                action = f"abort-d raised={type(exc).__name__}"
+        logger.warning("WEG2-CLIENT-GONE rid=%s state=%s action=%s wait_s=%.1f (H102)",
+                       rid, state, action,
+                       max(0.0, time.time() - p.t_arrive) if p is not None else 0.0)
+
     async def handle_abort(self, request: web.Request) -> web.Response:
         payload = await request.json()
         rid = payload.get("rid")
@@ -4747,6 +8831,42 @@ class Front:
                 return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": str(e)}, status=503)
+
+    def stop_guard(self, handler):
+        """W3-STOP (kvs2 boot 09291223): a STOP answers every request in
+        flight, not only the queued ones. MEASURED (front 12:32:58 STOP W3,
+        then 12:39:32): ``do_stop`` failed the queue and ``_ready_for_d``, but
+        rid weg2-0-2 was on its leg 2 (D asleep, the flip stalled) and its
+        handler waited on D for 6.5 min -- the host's probe (timeout 1800 s)
+        waited with it, never reached the hold loop that reads
+        ``stop_request.json``, and the boot stood in ``flipping`` until a
+        manual ``docker stop``. The wrapped handler registers its task;
+        ``do_stop`` cancels them and each answers 503 with the STOP's name (a
+        stream already started is closed instead -- its status line is sent).
+        Bound once in ``main`` around ``handle_generate``, like the #243 seam."""
+
+        @functools.wraps(handler)
+        async def guarded(request: web.Request) -> web.StreamResponse:
+            task = asyncio.current_task()
+            live = self.__dict__.setdefault("_generate_tasks", set())
+            if task is not None:
+                live.add(task)
+            try:
+                return await handler(request)
+            except asyncio.CancelledError:
+                if (self.state != "STOP" or task is None
+                        or not getattr(task, "_weg2_stop_cancel", False)
+                        or request.get("weg2_prepared")):
+                    raise
+                uncancel = getattr(task, "uncancel", None)
+                if callable(uncancel):
+                    uncancel()
+                self.counters["stop_inflight_answered"] += 1
+                return web.json_response({"error": f"WEG2 STOP {self.stop}"}, status=503)
+            finally:
+                live.discard(task)
+
+        return guarded
 
     async def handle_generate(self, request: web.Request) -> web.StreamResponse:
         if self.state == "STOP":
@@ -4784,6 +8904,9 @@ class Front:
                 "PP0 of the group runs the transient tower before its admission "
                 "and attaches precomputed_embeddings before the prefill",
                 f"weg2-{self.epoch}-{self._rid + 1}", int(_img))
+            # VISION-LOAD-WARM-1002: the tower extent into the host cache NOW,
+            # while the request is priced and the D->P flip runs
+            self._vision_warm(f"weg2-{self.epoch}-{self._rid + 1}")
         elif _verdict != VERDICT_ROUTE and _verdict != VERDICT_REFUSE_EMBEDS:
             # #1356 THE REFUSAL IS LOGGED, NOT ONLY RETURNED. Without this line
             # W101 existed solely in the caller's response body: `grep W101
@@ -4824,6 +8947,12 @@ class Front:
                 {"error": f"W125 Weg2InputEmbedsRefused: {_why}"}, status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
+        _hs.note_request_rid(request, rid)  # #243 seam: the rid-end drop reads it
+        self._ipc_out_book().arrive(rid, time.time())  # state.json front.oldest_outstanding_*
+        Front._req_book(self).arrive(rid, time.time(), self.epoch)  # DASHBOARD-IPC: request_done / TTFT
+        if _asr.enabled():
+            self._asr_arrival_note(rid)  # NF-STAU: the TTFT clocks start here
+        self._sess_note(rid, request, payload)  # SESSION-TRACE
         # UNIFY S7 (27B RC7-X): the arrival time the idle re-grant's quiet
         # window reads ("did anything arrive in the last window").
         self._x_last_arrival = time.time()
@@ -4859,6 +8988,16 @@ class Front:
         # ever saw a prefill.
         presence_src = ((getattr(self.spans, "last_src", None) or "d_leg2_cached")
                         if known else "none")
+        # PRICE-BARRIER: an arrival whose chars/3 price is a LONG candidate is
+        # announced to the SHORTs priced beside it -- from HERE, before the
+        # BOOT-START HOLD, so arrivals one hold releases are priced as a group.
+        # Q-530 SALT-ISOLATION: the namespace is noted at the arrival, so every
+        # recording site knows it even when the exact count falls back
+        Front._ns_note(self, rid, payload)
+        _pb_fut = Front._pb_register(self, rid, remainder) if self.x_exact else None
+        # EARLY-FLIP: D idle and a chars/3 price far over X -> the D->P flip begins
+        # NOW, beside the count and the probe below; it awaits this verdict
+        _ef = Front._early_flip_maybe(self, rid, remainder) if self.x_exact else None
         # X-EXACT: the count replaces the chars/3 figures (off: never entered).
         _xx = None
         if self.x_exact:
@@ -4868,10 +9007,22 @@ class Front:
             if _xx is not None:
                 remainder, est_prompt, known = _xx.pending, _xx.n, _xx.known
                 store_span, presence_src = _xx.credit, _xx.src
+        # CONTEXT-GATE (y7i e7a70285bd, 11:32-11:33Z): an over-context request
+        # is answered 400 HERE -- before any verdict, seat, flip or park.
+        _ctx_refusal = self._context_gate(rid, text, _xx, est_prompt)
+        if _ctx_refusal is not None:
+            Front._pb_resolve(self, rid, _pb_fut, "none", 0)
+            return _ctx_refusal
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
         stream = bool(payload.get("stream"))
+        # y5c: a non-stream rid shows the front no token before its end -- the
+        # IPC rows say so (stream 0) instead of a stall they cannot see
+        self._ipc_out_book().stream(rid, stream)
+        Front._req_book(self).stream(rid, stream)
+        Front._req_book(self).est_prompt(rid, est_prompt)
+        self._park_stuck().note_stream(rid, stream)
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
         if _xx is not None:
             exact = _xx.n
@@ -4882,8 +9033,12 @@ class Front:
         # was 1.7x D's own prefill cap, which D then refused by construction.
         # The verdict names the two bases so a reader never has to work out
         # which number each bound was compared against.
+        # X-K-FLIP: the X this arrival is routed on amortises the round trip
+        # over the flip it would take -- itself plus the riders queued for P
+        # now -- not over the boot's mean P phase (switch off: the X in force).
+        _x_arrival = self._x_for_flip(1 + self._x_riders(), rid, "route")
         route = serviceable_route(remainder, carrier_est,
-                                  self.tp_prefill_max_tokens,
+                                  _x_arrival,
                                   self.carrier_max_tokens,
                                   carrier_exact=exact is not None)
         # Task #58: AN IMAGE REQUEST GOES TO P, whatever the length term says.
@@ -4898,7 +9053,25 @@ class Front:
         # `none` is NOT overridden: a request that fits nowhere still fits
         # nowhere, and saying otherwise would turn an honest admission refusal
         # into a late failure deep in P.
-        if _verdict == VERDICT_STAGE and route != "none" and route != "long":
+        # MM-XPRICE (y7h-noH4 weg2-1-5 / weg2-4-18): an image whose every
+        # position the shared store already holds needs no tower and no P
+        # prefill -- it is priced and routed like text. D admits it only with
+        # the image inside its covered prefix (vision_d_guard, W123 + reroute
+        # through P otherwise).
+        _mm_cached = bool(_xx is not None and getattr(_xx, "mm_cached", False))
+        if _verdict == VERDICT_STAGE and _mm_cached:
+            self.counters["w102_image_cached"] += 1
+            logger.info(
+                "W102 Weg2VisionStage rid=%s image-cached (credit=%d >= image_end=%d) -- "
+                "route %s stands: no tower, priced as text d_reach=%d floor=%d",
+                rid, int(_xx.credit), int(_xx.image_end), route,
+                int(_xx.d_reach), int(_xx.d_floor))
+        elif _verdict == VERDICT_STAGE and _xx is not None and getattr(_xx, "mm", False):
+            # IMAGE-CACHED-1002: the uncached verdict names its why before the rule
+            self._w102_image_uncached(rid, _xx)
+        _route_vision_p_only = False
+        if _verdict == VERDICT_STAGE and not _mm_cached and route != "none" and route != "long":
+            _route_vision_p_only = True
             logger.info(
                 "W102 Weg2VisionStage rid=%s -- route %s -> long (P): an image "
                 "request is prefilled on P by rule; its embeddings are "
@@ -4911,7 +9084,7 @@ class Front:
         # batched over P) would take ~35 s. Below/at the start X and above the
         # live X nothing changes; `x_route` is the X this request was actually
         # routed on, and every line below prints it.
-        x_route = self.tp_prefill_max_tokens
+        x_route = _x_arrival
         _x_floor = self._x_band_floor()
         # UNIFY S7 (27B RC7-X): a band request the singleton rule sends to P
         # is DEFERRED (Pending.x_deferred) -- the idle re-grant may still serve
@@ -4934,6 +9107,11 @@ class Front:
         # cost a reader a whole wrong causal chain -- "None was read as
         # exceeds". Nothing read None as a number; the line simply never
         # showed the number. Instrument-text-lies, class A.
+        self._note_front_price(rid, remainder)  # RESUME-VIA-P: the W50-REROUTE line's front_price
+        self._route_x_live = int(x_route)  # FEHLT 8: the X the last ROUTE-VERDICT decided with
+        # USAGE-DETAILS: x_short = SHORT only by the live X above the band floor
+        self._usage_route_note(rid, "x_short" if route == "short" and remainder > _x_floor else route,
+                               self.epoch)
         logger.info(
             "WEG2 ROUTE-VERDICT rid=%s verdict=%s uncached=%d (base for X=%d, "
             "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the MEASURED "
@@ -4949,14 +9127,26 @@ class Front:
             # so the line stays rc2.1l's byte for byte when it is off.
             ("; #49 d_served_epoch = prompt_tokens of a text D served in this epoch"
              if getattr(self.spans, "agent_span", False) else "")
+            # X-CREDIT-INFLIGHT-1002: named only on a d_inflight verdict
+            + ("; d_inflight = the end anchor of a prompt a still-decoding D leg 2 "
+               "holds (realised at its first content)" if presence_src == "d_inflight" else "")
+            + ("; d_served_anchor = the end anchor of a text D served in an earlier "
+               "epoch, capped by D's resumable depth (a store load, not a prefill)"
+               if presence_src == "d_served_anchor" else "")
             + (X_EXACT_VERDICT_NOTE if _xx is not None else ""),
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text),
         )
+        Front._pb_resolve(self, rid, _pb_fut, route, remainder)  # PRICE-BARRIER: the verdict, for the SHORTs waiting on it
+        if _ef is not None:
+            # EARLY-FLIP: the verdict for the flip already under way; not LONG ->
+            # its abort settles (D serving again) before this request is routed
+            await Front._early_flip_verdict(self, _ef, route, rid)
         if route == "none":
-            # TERMINAL AT ADMISSION, and 4xx because it is the request that
-            # does not fit this server, not the server that failed.  sb5f
+            # TERMINAL AT ADMISSION, and 4xx only when the request provably
+            # does not fit this server (`refusal_status`: an EXACT count over
+            # the static carrier bound); on an estimate it is 503.  sb5f
             # spent a median 22.0 s per request discovering this by round trip
             # and answered 503, which reads as "try again" for a condition
             # that cannot change.
@@ -4973,43 +9163,18 @@ class Front:
                 f"tokens, or raise --tp-prefill-max-tokens / the carrier bound."
             )
             logger.error("%s", detail)
-            return web.json_response(
-                {"error": detail, "uncached": remainder,
+            # 413 only on the EXACT count: an estimate over the carrier is not
+            # a measured size fault, so it is a 503 the client may retry.
+            return refusal_response(
+                request.path, NO_ROUTE_NAME, detail,
+                refusal_status(carrier_est if exact is not None else None,
+                               self.carrier_max_tokens),
+                {"uncached": remainder,
                  "x_tokens": self.tp_prefill_max_tokens,
                  "carrier_est": carrier_est,
-                 "carrier_max": self.carrier_max_tokens},
-                status=413)
-        if route == "carrier_single":
-            self.counters["route_carrier_exceeds"] += 1
-            logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill carrier_est=%d (%s) > carrier_max=%d "
-                           "est_prompt=%d exact=%s "
-                           "(group D host staging pool bound: the store cannot be read into D for a prompt this long; "
-                           "ONE prefill on D, no leg 1, no double prefill; uncached=%d vs X=%d, checked #1290)",
-                           rid, carrier_est,
-                           "exact" if exact is not None else "ESTIMATE from chars, never terminal",
-                           self.carrier_max_tokens, est_prompt, exact,
-                           remainder, self.tp_prefill_max_tokens)
-            if self.awake == "D" and self.admit_d and self.state == "serving":
-                seat = await self._acquire_short_seat(rid, carrier_est)
-                if seat is not None:
-                    self._log_admit(rid, source="short", t_arrive=time.time())
-                    return await self.leg2(request, rid, payload, text, stream, pending=None,
-                                           single_prefill=True, seat=seat)
-            fut = asyncio.get_event_loop().create_future()
-            p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
-                        est_uncached=remainder, span_known=known,
-                        skip_leg1=True, store_span_est=store_span)
-            self.queue.append(p)
-            self._dp_mark(p, "carrier")  # R28
-            self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
-            try:
-                await fut
-            except Weg2Stop as e:
-                return web.json_response({"error": str(e)}, status=503)
-            except Exception as e:  # noqa: BLE001
-                return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
-            self._mark_posted(p)
-            return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
+                 "carrier_max": self.carrier_max_tokens})
+        # CARRIER-EXCEEDS (one prefill on D, no leg 1) is deleted -- law 02.10.:
+        # P's KV stages cover D's max session; serviceable_route never names it.
         short_ok = route == "short"
         # L10 (C9): the front's X verdict, LABELLED as the estimate it is --
         # price_remainder is len(text)/3.0 minus an LRU prefix guess, with no
@@ -5022,11 +9187,24 @@ class Front:
         # RC2 review (idle policy b): why a SHORT falls through to BATCH. Only
         # D's own #915 refusal is recorded -- see `d_eligible` below.
         short_refused: List[str] = []
-        if self.awake == "D" and self.admit_d and self.state == "serving" and short_ok:
+        # PRICE-BARRIER: a SHORT D would admit NOW waits for the LONG candidates
+        # being priced beside it; one went LONG -> it rides that LONG's P phase.
+        _pb_to_p = None
+        _pb_waited_ms = 0.0  # PRICE-BARRIER: printed on every SHORT -> D / to_p line (0 = no wait)
+        if (short_ok and self.__dict__.get("_pb_inflight") and self.awake == "D"
+                and self.admit_d and self.state == "serving"
+                and envs.SGLANG_WEG2_PRICE_BARRIER.get() and Front._pb_seat_free(self)):
+            _pb_to_p, _pb_waited_ms = await Front._price_barrier(self, rid)
+        if (_pb_to_p is None and self.awake == "D" and self.admit_d and self.state == "serving"
+                and short_ok):
             # UNIFY S7 (27B Review V (3)): D's load at the grant, read BEFORE
             # the seat is taken (the seat itself is not work).
             _x_busy_at_grant = self._d_holds_work()
-            seat = await self._acquire_short_seat(rid, est_prompt, short_refused)
+            seat = await (self._acquire_short_seat(rid, est_prompt, short_refused,
+                                                   max_tokens=_asr.max_tokens_of(payload),
+                                                   uncached=remainder)
+                          if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
+                          else self._acquire_short_seat(rid, est_prompt, short_refused))
             if seat is not None:
                 if self.x_split:
                     self._note_x_grant(
@@ -5036,9 +9214,10 @@ class Front:
                 # #1324: `span_known=True` used to stand alone here and read as
                 # an assurance about the store. The witness is named instead.
                 logger.info("WEG2-ROUTE rid=%s SHORT -> D est_prompt=%d remainder=%d "
-                            "presence_span=%d presence_src=%s",
-                            rid, est_prompt, remainder, store_span, presence_src)
+                            "presence_span=%d presence_src=%s price_barrier_waited_ms=%.0f",
+                            rid, est_prompt, remainder, store_span, presence_src, _pb_waited_ms)
                 self._log_admit(rid, source="short", t_arrive=time.time())
+                self._arm_client_watch(request, rid)  # H102
                 return await self.leg2(request, rid, payload, text, stream, pending=None, seat=seat)
         # #1290: NAME THE P ROUTE. `route == "long"` is X < uncached <=
         # carrier -- the case P exists for -- and it was counted only as
@@ -5052,17 +9231,56 @@ class Front:
         self.counters["route_batch"] += 1
         if route == "long":
             self.counters["route_long"] += 1
-            logger.info(
-                "WEG2-ROUTE rid=%s LONG -> P leg 1 (uncached=%d > X=%d, so D "
-                "cannot prefill it; carrier_est=%d <= carrier_max=%d, so P's "
-                "KV can come back to D) est_prompt=%d queue=%d",
-                rid, remainder, x_route, carrier_est,
-                self.carrier_max_tokens, est_prompt, len(self.queue))
-        if self.awake != "D" and short_ok:
+            if _route_vision_p_only:
+                # the vision rule, not the X comparison, sent it to P (y8a
+                # weg2-10-22 printed 'uncached=724 > X=6074')
+                logger.info(
+                    "WEG2-ROUTE rid=%s LONG -> P leg 1 reason=vision_p_only (an image is "
+                    "prefilled on P by rule; uncached=%d X=%d not compared) carrier_est=%d "
+                    "<= carrier_max=%d est_prompt=%d queue=%d",
+                    rid, remainder, x_route, carrier_est,
+                    self.carrier_max_tokens, est_prompt, len(self.queue))
+            else:
+                logger.info(
+                    "WEG2-ROUTE rid=%s LONG -> P leg 1 (uncached=%d > X=%d, so D "
+                    "cannot prefill it; carrier_est=%d <= carrier_max=%d, so P's "
+                    "KV can come back to D) est_prompt=%d queue=%d",
+                    rid, remainder, x_route, carrier_est,
+                    self.carrier_max_tokens, est_prompt, len(self.queue))
+        # SK (#243): a SHORT verdict whose price rests on a MEASURED D presence
+        # is not re-prefilled on P when it falls through (weg2-12-39: 76602
+        # tokens again on P for an uncached remainder of 186). It keeps its
+        # queue place, skips leg 1 and waits for D; its D admission re-prices
+        # it if a flip lay between (see _sk_admission_reprice).
+        # P-BATCH-ALL (user 02.10. ~07:45Z, strict phase batch): the SHORT
+        # price only decides whether a D phase wakes P. While P is awake or
+        # waking, EVERY prefill joins P's batch -- its prefix comes from the
+        # shared store (L2/L3, written by either group), never "kept for D"
+        # (y6x weg2-15-52: kept, D prefilled 207 tokens after the P->D flip
+        # with three decodes stalled behind it). SK keeps only a D-phase
+        # fall-through.
+        _p_phase = p_phase_arrival(self.awake, self.state, getattr(self, "_flip_dst", None))
+        _sk = (short_ok and _short_keep_enabled() and int(store_span or 0) > 0
+               and not short_refused and presence_src not in ("", "none", None)
+               and not _p_phase and _pb_to_p is None)
+        if _pb_to_p is not None:
+            # PRICE-BARRIER: priced beside a LONG that flips D to P -- the SHORT
+            # joins that P phase's batch (leg 1 on P, prefix from the shared
+            # store) instead of a D extend the flip would park at once.
+            self.counters["price_barrier_to_p"] += 1
+            logger.info("WEG2 PRICE-BARRIER rid=%s outcome=to_p sibling=%s sibling_uncached=%d "
+                        "uncached=%d waited_ms=%.0f -- a LONG over X was priced beside this SHORT: "
+                        "it joins P's batch with it (no D extend, no park; SGLANG_WEG2_PRICE_BARRIER)",
+                        rid, _pb_to_p[0], int(_pb_to_p[1]), remainder, _pb_waited_ms)
+        elif _p_phase and short_ok:
             # L4/R-10: law 1 read literally means every arrival during a P
             # drain is queued BATCH, SHORT ones included.  Counted here,
             # printed by the drain (n=0 printed too), never discovered.
             self.counters["short_behind_p"] += 1
+            logger.info("WEG2 SHORT-TO-P rid=%s: SHORT verdict (uncached=%d presence=%d src=%s) "
+                        "arrived while P is %s -- joins P's batch (leg 1 on P, the prefix read "
+                        "from the shared store)", rid, remainder, store_span, presence_src,
+                        "awake" if self.awake == "P" else "waking")
         elif self.awake == "D" and not short_ok:
             # L5: a BATCH arrival during a D phase -- named and left; it is
             # served by the NEXT P phase, whose epoch this line names.
@@ -5071,11 +9289,17 @@ class Front:
         p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
                         est_uncached=remainder, span_known=known,
                     store_span_est=store_span,
+                    # SK (#243): see _sk above -- no leg 1, D keeps it.
+                    skip_leg1=_sk, short_kept=_sk, price_epoch=int(self.epoch),
                     # xsn438: routed `long` by the W102 rule above, not by
                     # length -- only P can serve it (Pending.p_only).
-                    p_only=_verdict == VERDICT_STAGE,
+                    p_only=_verdict == VERDICT_STAGE and not _mm_cached,
+                    mm_image_end=(int(getattr(_xx, "image_end", 0) or 0) if _xx is not None else 0),
                     # UNIFY S7 (27B RC7-X): queued by the busy/idle split, not by the phase.
                     x_deferred=_x_band_deferred and not short_refused,
+                    # #246b: needs P above the X it was routed on (ARRIVAL-SEAT)
+                    x_routed=(int(x_route) if route == "long"
+                              and envs.SGLANG_WEG2_ENABLE_X_ROUTED_NEEDS_P.get() else 0),
                     # 27B idle policy (b): only a request whose OWN route is SHORT
                     # may later be handed to D by --d-short-drain-tokens -- and
                     # only when it is queued because of the PHASE (the field's
@@ -5087,9 +9311,42 @@ class Front:
                     # also the ones that fit -- until D's running decodes end,
                     # up to --drain-deadline-s each. Today's path keeps it here.
                     d_eligible=short_ok and not short_refused)
-        self.queue.append(p)
+        if _pb_to_p is not None:
+            p.d_eligible = False  # PRICE-BARRIER: it rides the LONG's P phase, never handed back to D
+        if _sk and self.awake == "D" and self.admit_d and self.state == "serving":
+            # SK: D is awake -- the kept SHORT waits in D's own admission line,
+            # BEHIND the batch work that held the gate (no overtaking, no flip
+            # to P for it, no leg 1).
+            p.d_direct = True
+            self._ready_for_d.append(p)
+            self._sync_batch_gate()
+            self.counters["short_kept_d"] += 1
+            logger.info("WEG2 SHORT-KEPT rid=%s uncached=%d presence=%d epoch=%d: the SHORT fell "
+                        "through (gate held / seats / phase) and waits for a D seat behind the batch "
+                        "work -- its D presence is kept, no leg 1 on P", rid, remainder, store_span,
+                        self.epoch)
+        elif (_asr.enabled() and short_ok and not short_refused and self.state == "flipping"
+              and getattr(self, "_flip_dst", None) == "D"):
+            # y4y 17:05:48 (weg2-45-64/65, ~775 tokens each): a SHORT arriving
+            # while P flips to D was queued BATCH for P (awake was still P);
+            # under ARRIVAL-SEAT nothing owned that queue -- its candidates are
+            # the entries that need P -- and FLIP-ECONOMICS held 300 s. The
+            # flip's TARGET is D: the SHORT waits in D's admission line, like
+            # an arrival one flip later, no leg 1.
+            p.d_direct = True
+            self._ready_for_d.append(p)
+            self._sync_batch_gate()
+            self.counters["arrival_seat_short_in_flip"] += 1
+            logger.info("%s rid=%s verdict=%s SHORT-IN-FLIP uncached=%d X=%d epoch=%d: arrived while the flip "
+                        "to D runs -- queued for D (its admission line), not BATCH for P", _asr.MARKER, rid,
+                        _asr.D_PREFILL, remainder, int(self.tp_prefill_max_tokens), self.epoch)
+        else:
+            if _sk:
+                self.counters["short_kept_queue"] += 1
+            self.queue.append(p)
         self._dp_mark(p, "long" if route == "long" else "batch")  # R28
         self._kick_controller("arrival")  # 27B flipfast F2 (no-op when off)
+        self._arm_client_watch(request, rid, p)  # H102
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
         self._maybe_ple_admit_hint(p)  # fnFL2 H43
@@ -5112,21 +9369,41 @@ class Front:
         (weg2/ple_admit_hint.py). Fire and forget; never delays the route."""
         if not envs.SGLANG_WEG2_PLE_ADMIT_HINT.get():
             return
-        from sglang.srt.weg2.ple_admit_hint import HINT_PATH, ple_hint_body, ple_hint_wanted
+        from sglang.srt.weg2.ple_admit_hint import (
+            HINT_PATH,
+            ple_hint_body,
+            ple_hint_skip_reason,
+            ple_hint_span,
+            ple_hint_wanted,
+        )
 
         if not ple_hint_wanted(awake=self.awake, skip_leg1=p.skip_leg1):
             return
-        body = ple_hint_body(p.path, p.payload)
+        # 02.10. (NF y7l): P's first chunk starts at the store span the route
+        # priced (PP0's told) -- the hint reads THAT window, not the tail
+        span = ple_hint_span(span_known=bool(getattr(p, "span_known", False)),
+                             store_span_est=int(getattr(p, "store_span_est", 0) or 0))
+        body = ple_hint_body(p.path, p.payload, start_hint=span)
         g = self.groups.get("P")
         if body is None or g is None or self.session is None:
+            # NF z30k: a wanted hint that is not sent is counted by name -- the
+            # /v1/messages hints were dropped here without a trace.
+            why = (ple_hint_skip_reason(p.path, p.payload) if body is None
+                   else ("no-group-P" if g is None else "no-session"))
+            self.counters["ple_hint_skipped"] += 1
+            n = self.counters["ple_hint_skipped"]
+            if n <= 8 or n % 256 == 0:
+                logger.info("WEG2 PLE-HINT SKIPPED rid=%s path=%s why=%s (n=%d)",
+                            p.rid, p.path, why, n)
             return
 
         async def _post() -> None:
             t0 = time.time()
             try:  # rpc: the admin bearer token rides along (#1275)
                 code, _ = await self.rpc(g, HINT_PATH, body, 30)
-                logger.info("WEG2 PLE-HINT rid=%s awake=%s status=%d ms=%.0f",
-                            p.rid, self.awake, code, (time.time() - t0) * 1000.0)
+                logger.info("WEG2 PLE-HINT rid=%s awake=%s status=%d ms=%.0f start_hint=%s",
+                            p.rid, self.awake, code, (time.time() - t0) * 1000.0,
+                            "tail" if span is None else span)
             except Exception as e:  # noqa: BLE001 -- a lost hint costs the gain only
                 logger.info("WEG2 PLE-HINT rid=%s failed: %r", p.rid, e)
 
@@ -5146,9 +9423,37 @@ class Front:
 
     def _x_band_floor(self) -> int:
         """UNIFY S4: the X-SOLO band's floor as applied -- ``--x-busy-tokens``
-        (27B X_busy), else the start X (H84), never above the X in force."""
+        (27B X_busy), else the start X (H84), never above the X in force.
+
+        PDFLIP-B (N5d 1002_124821, 7 of 7 D->P flips by 12:56 PARK-IMMEDIATE
+        over-x at est_uncached 1942-18825): with the excursion price on
+        (SGLANG_WEG2_X_EXCURSION_PRICE, X-COST-LINE) the live X already prices
+        what a D-direct prefill costs against the excursion -- and an excursion
+        stops D's running decodes too, for a whole flip pair plus P compute. A
+        band floor under it (4096, the start X) routed 7.7k-token turns to P
+        whenever D decoded anything (X-SOLO verdict=p reason=d_outstanding=2,
+        X_live=10674) and fired the immediate park for them: a flip pair every
+        ~10 s. So the floor IS the live X there (no band)."""
+        if Front._x_excursion_band_off(self):
+            return max(0, int(self.tp_prefill_max_tokens))
         xb = self.x_start_tokens if getattr(self, "x_busy_tokens", None) is None else self.x_busy_tokens
         return max(0, min(int(xb), int(self.tp_prefill_max_tokens)))
+
+    def _x_excursion_band_off(self) -> bool:
+        """PDFLIP-B: the band floor follows the live X (helper shared with NF).
+
+        NF (cherry-pick of 98b8168d66): this line has no
+        SGLANG_WEG2_X_EXCURSION_PRICE -- its X-COST-LINE price is the ski price
+        (the measured warm D->P + P->D legs + the resume, else the record of
+        this form), i.e. the round trip both directions, so the switch reads as
+        on where it does not exist."""
+        try:
+            _exc = getattr(envs, "SGLANG_WEG2_X_EXCURSION_PRICE", None)
+            return bool((_exc is None or _exc.get())
+                        and envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get()
+                        and envs.SGLANG_WEG2_X_BAND_FOLLOWS_PRICE.get())
+        except Exception:  # noqa: BLE001
+            return False
 
     def _x_solo_busy(self) -> Optional[str]:
         """H84: None when the system is otherwise EMPTY, else what is in it.
@@ -5293,6 +9598,8 @@ class Front:
         self.queue.clear()
         for p in moved:
             p.d_direct = True
+            if p.x_deferred:  # USAGE-DETAILS: the band request is served on D after all
+                self._usage_route_note(p.rid, "x_short", self.epoch)
             self._ready_for_d.append(p)
         self._sync_batch_gate()
         self.counters["x_idle_regrant_requests"] += len(moved)
@@ -5304,8 +9611,200 @@ class Front:
                     [p.rid for p in moved][:8], max(0.0, now - min(p.t_arrive for p in moved)))
         return "moved"
 
+    # -- EARLY-FLIP (02.10.) -----------------------------------------------------------
+    def _early_flip_maybe(self, rid: str, est_uncached: int):
+        """EARLY-FLIP: begin the D->P flip now for ``rid`` -- only with D idle and a
+        chars/3 price >= the factor x X; returns the handle the verdict resolves,
+        or None (the old path: the flip waits for the verdict)."""
+        try:
+            if not envs.SGLANG_WEG2_EARLY_FLIP.get():
+                return None
+            x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+            factor = float(envs.SGLANG_WEG2_EARLY_FLIP_X_FACTOR.get())
+            if x <= 0 or int(est_uncached or 0) < factor * x:
+                return None
+            if (getattr(self, "dual_layout", False) or self.awake != "D" or self.state != "serving"
+                    or not self.admit_d or getattr(self, "_flip_open", False)
+                    or self.__dict__.get("_early_flip_open") is not None):
+                return None
+            D = self.groups["D"]
+            if (self.queue or self._ready_for_d or self._flip_ledger(D) or D.outstanding
+                    or self._handoff_in_flight()):
+                return None  # D IDLE only: nothing to park, nothing handed over
+        except Exception:  # noqa: BLE001 -- a partial front: the old path
+            return None
+        from types import SimpleNamespace
+
+        loop = asyncio.get_running_loop()
+        h = SimpleNamespace(rid=rid, gate=loop.create_future(), t_begin=time.time(),
+                                  t_verdict=None, task=None, est=int(est_uncached), x=x)
+        self.__dict__["_early_gate"] = h
+        self.__dict__["_early_flip_open"] = h
+        self.counters["early_flip_begin"] += 1
+        logger.info("WEG2-EARLY-FLIP begin rid=%s est_uncached=%d X=%d factor=%.1f (D idle; drain + "
+                    "quiesce run beside the count and the probe, the first sleep RPC waits for the "
+                    "verdict; SGLANG_WEG2_EARLY_FLIP)", rid, int(est_uncached), x, factor)
+        h.task = asyncio.ensure_future(self.flip("D", "P"))
+        h.task.add_done_callback(lambda _t, h=h: self.__dict__.get("_early_flip_open") is h
+                                 and self.__dict__.pop("_early_flip_open", None))
+        me = asyncio.current_task()
+        if me is not None:
+            # a handler that ends before its verdict (client gone, refusal, error)
+            me.add_done_callback(lambda _t, h=h: h.gate.done() or h.gate.set_result(False))
+        return h
+
+    async def _early_flip_verdict(self, h, route: str, rid: str) -> None:
+        """EARLY-FLIP: resolve the flip's gate with this arrival's verdict; not
+        LONG -> wait until the aborted flip has handed D back (bounded)."""
+        long_ = route == "long"
+        if not h.gate.done():
+            h.t_verdict = time.time()
+            h.gate.set_result(bool(long_))
+        if long_ or h.task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(h.task),
+                                   envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0 + 5.0)
+        except Exception as e:  # noqa: BLE001 -- the route below reads whatever state is left
+            logger.warning("WEG2-EARLY-FLIP rid=%s: the aborted flip did not settle: %r", rid, e)
+
+    async def _early_flip_gate(self, h, t_flip0: float) -> bool:
+        """EARLY-FLIP, inside the flip after the quiesce: the verdict, then the
+        same economics and MIN-DWELL the controller asks -- True = go on."""
+        t_wait0 = time.time()
+        try:
+            go = bool(await asyncio.wait_for(asyncio.shield(h.gate),
+                                             envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0 + 1.0))
+        except asyncio.TimeoutError:
+            h.why = "verdict-timeout"
+            return False
+        h.why = "verdict-not-long"
+        if not go:
+            return False
+        if not self._flip_economics_ok(False):
+            h.why = "economics-hold"
+            return False
+        if not self._dwell_ok("D", "P", False, work_exhausted=True, oldest_wait_s=0.0):
+            h.why = "min-dwell-hold"
+            return False
+        now = time.time()
+        t_v = h.t_verdict or now
+        saved_ms = (min(t_v, t_wait0) - t_flip0) * 1000.0
+        self.counters["early_flip_go"] += 1
+        logger.info("WEG2-EARLY-FLIP go rid=%s epoch=%d verdict_after_begin_ms=%.0f gate_wait_ms=%.0f "
+                    "saved_ms=%.0f (drain + quiesce done before the verdict existed)", h.rid, self.epoch,
+                    (t_v - t_flip0) * 1000.0, (now - t_wait0) * 1000.0, saved_ms)
+        # DP-NACHLAUF: the trigger was queued after the begin -- its leg 1 goes to
+        # the dormant P now, as the begin would have posted it
+        if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
+            for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
+                _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
+                self.counters["leg1_early"] += 1
+                logger.info("WEG2 LEG1-EARLY rid=%s epoch=%d (posted at the EARLY-FLIP go, before "
+                            "the first sleep RPC)", _ep.rid, self.epoch)
+        return True
+
+    def _early_flip_abort(self, h, src: str, dst: str) -> None:
+        """EARLY-FLIP: nothing slept -- D is awake and serving again, the flip's
+        bookkeeping is closed as if it had not begun (no epoch, no done)."""
+        now = time.time()
+        self._enter_state("serving")
+        self._flip_dst = None
+        try:
+            self._flip_cushion_close()
+        except Exception:  # noqa: BLE001 -- an instrument
+            pass
+        self._flip_t0 = None
+        self._flip_stage = "none"
+        self._flip_marks = {}
+        for clk in (self._ipc_dp_clock(), self._ipc_first_work_clock()):
+            if hasattr(clk, "_armed"):
+                clk._armed = None
+        Front._flip_phase(self).abort(now, "early-flip-" + str(getattr(h, "why", "abort")))
+        Front._ipc_live_kick(self)
+        self.counters["early_flip_abort"] += 1
+        logger.warning("WEG2-EARLY-FLIP abort rid=%s epoch=%d why=%s after_ms=%.0f -- no sleep RPC went "
+                       "out: D stays awake and serves (its quiesce flushed the radix; the prefix comes "
+                       "back from L2/L3)", h.rid, self.epoch, getattr(h, "why", "?"),
+                       (now - h.t_begin) * 1000.0)
+
+    # -- PRICE-BARRIER (02.10., N5x 16:23:41) ---------------------------------------
+    #: an arrival whose chars/3 uncached price is above this share of X is a LONG
+    #: candidate (chars/3 undercounts by up to ~1/3: N5x weg2-0-2 50929 est, 74148 exact)
+    PRICE_BARRIER_CANDIDATE_FRACTION = 0.5
+
+    def _pb_register(self, rid: str, est_uncached: int) -> Optional["asyncio.Future"]:
+        """PRICE-BARRIER: announce a LONG-candidate arrival; resolved at its verdict."""
+        if not envs.SGLANG_WEG2_PRICE_BARRIER.get():
+            return None
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        if x <= 0 or int(est_uncached or 0) <= self.PRICE_BARRIER_CANDIDATE_FRACTION * x:
+            return None
+        fut = asyncio.get_running_loop().create_future()
+        fut._pb_t0 = time.monotonic()  # a pricing that never reached its verdict ages out
+        self.__dict__.setdefault("_pb_inflight", {})[rid] = fut
+        task = asyncio.current_task()
+        if task is not None:
+            # a handler that ends before its verdict (client gone, refusal, error)
+            # resolves "none" -- no SHORT waits for a pricing that will not come
+            task.add_done_callback(lambda _t, r=rid, f=fut: Front._pb_resolve(self, r, f, "none", 0))
+        return fut
+
+    def _pb_seat_free(self) -> bool:
+        """The SHORT would be admitted to D now (a seat is free); unreadable -> no barrier."""
+        try:
+            return self.seats_free() > 0
+        except Exception:  # noqa: BLE001 -- a partial front: the old path
+            return False
+
+    def _pb_resolve(self, rid: str, fut: Optional["asyncio.Future"], route: str, uncached: int) -> None:
+        if fut is None:
+            return
+        self.__dict__.get("_pb_inflight", {}).pop(rid, None)
+        if not fut.done():
+            fut.set_result((str(route), int(uncached or 0)))
+
+    async def _price_barrier(self, rid: str) -> Tuple[Optional[Tuple[str, int]], float]:
+        """PRICE-BARRIER: wait for the LONG candidates still being priced (a
+        snapshot, this rid excluded); return (``(sibling rid, uncached)`` of the
+        first that went LONG or None, waited ms). None in flight costs nothing;
+        else the wait ends at the LAST sibling verdict or the first LONG one --
+        their own pricing time (count + store probe), never a grace: a sibling's
+        pricing is itself bounded by the X-EXACT timeout, and so is this wait."""
+        t0 = time.monotonic()
+        bound = envs.SGLANG_WEG2_FRONT_EXACT_TIMEOUT_MS.get() / 1000.0 + 0.25
+        reg = self.__dict__.get("_pb_inflight") or {}
+        for r in [r for r, f in reg.items() if t0 - getattr(f, "_pb_t0", t0) > bound]:
+            reg.pop(r, None)  # cancelled or refused before its verdict: never waited for again
+        inflight = {r: f for r, f in reg.items() if r != rid and not f.done()}
+        if not inflight:
+            return None, 0.0
+        self.counters["price_barrier_waits"] += 1
+        by_fut = {f: r for r, f in inflight.items()}
+        pending = set(by_fut)
+        hit = None
+        while pending and hit is None:
+            left = bound - (time.monotonic() - t0)
+            if left <= 0:
+                break
+            done, pending = await asyncio.wait(pending, timeout=left,
+                                               return_when=asyncio.FIRST_COMPLETED)
+            for f in done:
+                route, unc = f.result()
+                if route == "long" and hit is None:
+                    hit = (by_fut[f], unc)
+        ms = (time.monotonic() - t0) * 1000.0
+        outcome = "to_p" if hit else ("timeout" if pending else "to_d")
+        self.counters[f"price_barrier_{outcome if outcome != 'to_p' else 'long_seen'}"] += 1
+        logger.info("WEG2 PRICE-BARRIER rid=%s waited_ms=%.0f siblings=%d outcome=%s sibling=%s "
+                    "(the SHORT's D admission waited for the LONG candidates priced beside it)",
+                    rid, ms, len(inflight), outcome, hit[0] if hit else "-")
+        return hit, ms
+
     async def _acquire_short_seat(self, rid: str, est_tokens: int = 0,
-                                  refused: Optional[List[str]] = None) -> Optional[Seat]:
+                                  refused: Optional[List[str]] = None,
+                                  max_tokens: Optional[int] = None,
+                                  uncached: Optional[int] = None) -> Optional[Seat]:
         """A SHORT arrival's seat -- behind the BATCH gate (C5/R-16).
 
         Returns ``None`` when the request must fall through to route BATCH:
@@ -5327,7 +9826,22 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
-        if self._d_phase_seats_full(rid):
+        if _decode_collect_window_s() > 0.0:
+            # DECODE-COLLECT: D decodes -> this SHORT waits for the window; the
+            # set's route decides (P: route BATCH, the flip takes it)
+            if await self._decode_collect_short(rid, uncached if uncached is not None else est_tokens) == "P":
+                return None
+            if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                return None
+        if self._d_direct_yields(rid):
+            return None  # FLIPCYCLE H5b: the flip comes anyway -- ride P's batch
+        if _asr.enabled():
+            # ARRIVAL-SEAT (b): no seat free or D's KV short -> wait for the
+            # next free seat in arrival order, never the P detour (H91c3-3's
+            # SEATS-FULL -> BATCH is off with the rule).
+            if not await self._arrival_seat_wait(rid, est_tokens, max_tokens, uncached=uncached):
+                return None
+        elif self._d_phase_seats_full(rid):
             # H91c3-3: D's seat cap n is full -- fall through to route BATCH
             # (the P queue, where the wait bound sees it), the return
             # contract this method already has.
@@ -5340,12 +9854,1133 @@ class Front:
             if refused is not None:
                 refused.append("d_budget")
             return None
+        if self._d_direct_yields(rid):
+            return None  # FLIPCYCLE H5b: a P-bound request queued while it waited
         await self._d_seat.acquire()
         if (not (self.awake == "D" and self.admit_d and self.state == "serving")
-                or self._d_phase_seats_full(rid, own_seat=True)):
+                or (not _asr.enabled() and self._d_phase_seats_full(rid, own_seat=True))):
             self._d_seat.release()
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
+
+    # ------------------------------------------------------------------ ARRIVAL-SEAT
+    # User rule 29.09. ~19:40Z (weg2/arrival_seat_rule.py): D's decode seats stay
+    # filled in parallel. One decision site while D is awake: a free seat whose KV
+    # fits takes the arrival NOW (D prefill <= X at the next round boundary, else
+    # the immediate flip); no seat -> no flip, the arrival waits for the next seat
+    # in arrival order; the wait bound parks the youngest running decode. Off:
+    # none of the methods below is called.
+
+    # ------------------------------------------------------------------ DECODE-COLLECT
+    # User rule 02.10. ~19:07Z (both models): while D decodes, arriving prefills
+    # are collected for SGLANG_WEG2_DECODE_COLLECT_WINDOW_S; then the set goes
+    # to D (summed uncached <= X, nothing P-only) or, by one flip, to P.
+
+    def _dc_window_s(self) -> float:
+        return _decode_collect_window_s()
+
+    def _dc_decoding(self) -> bool:
+        """D is awake, serving and runs decodes (parked ones excluded)."""
+        if not (self.awake == "D" and self.state == "serving"):
+            return False
+        D = self.groups.get("D") if isinstance(self.groups, dict) else None
+        return bool(D is not None and self._flip_ledger(D))
+
+    def _dc_st(self) -> dict:
+        st = self.__dict__.setdefault("_dc_state", {"epoch": None})
+        if st.get("epoch") != self.epoch:
+            st.clear()
+            st.update(epoch=self.epoch, t_open=None, t_rel=float(getattr(self, "t_awake", 0.0) or 0.0),
+                      shorts={}, route=None, wid=0)
+        return st
+
+    def _decode_collect(self, now: float, live_q: Optional[List["Pending"]] = None) -> Optional[str]:
+        """DECODE-COLLECT, the one decision site: ``"hold"`` while the window
+        is open, ``"D"``/``"P"`` once it released (``"P"`` stays for the rest
+        of this D phase -- the flip takes everything queued), ``None`` when the
+        window is off or D was not decoding when the prefill arrived."""
+        win = self._dc_window_s()
+        if win <= 0.0:
+            return None
+        st = self._dc_st()
+        if st["route"] == "P":
+            return "P"
+        if live_q is None:
+            live_q = [p for p in self.queue if not p.fut.done()]
+        fresh = [p for p in live_q if float(getattr(p, "t_arrive", now) or now) > st["t_rel"]]
+        if st["t_open"] is None:
+            if not (fresh or st["shorts"]) or not self._dc_decoding():
+                return None
+            ts = [float(getattr(p, "t_arrive", now) or now) for p in fresh] + [t for t, _ in st["shorts"].values()]
+            st["t_open"] = min(ts) if ts else now
+        x_tok = int(self.tp_prefill_max_tokens)
+        unc = [int(getattr(p, "est_uncached", 0) or 0) for p in fresh] + [u for _, u in st["shorts"].values()]
+        n, tokens = len(unc), sum(unc)
+        waited = max(0.0, now - st["t_open"])
+        decoding = self._dc_decoding()
+        p_bound = any(phase_policy.immediate_park_trigger([p], x_tok) is not None
+                      or bool(getattr(p, "p_only", False)) for p in fresh)
+        try:
+            dcheck = max(0.0, float(envs.SGLANG_WEG2_DECODE_COLLECT_D_CHECK_S.get() or 0.0))
+        except (TypeError, ValueError):
+            dcheck = 0.0
+        stage = "window" if decoding else "d-idle"
+        if waited < win and decoding:
+            if 0.0 < dcheck < win and waited >= dcheck and not p_bound and tokens <= x_tok:
+                stage = "dcheck"  # a small set: D prefills it now
+            else:
+                if 0.0 < dcheck < win and waited >= dcheck and st.get("dcheck_wid") != st["wid"]:
+                    st["dcheck_wid"] = st["wid"]
+                    self.counters["decode_collect_dcheck_hold"] += 1
+                    logger.info("WEG2 DECODE-COLLECT dcheck n=%d tokens=%d X=%d waited_s=%.1f p_bound=%s -- "
+                                "over X: collects on to %.1f s", n, tokens, x_tok, waited, p_bound, win)
+                if st.get("hold_wid") != st["wid"]:
+                    st["hold_wid"] = st["wid"]
+                    self.counters["decode_collect_hold"] += 1
+                    logger.info("WEG2 DECODE-COLLECT hold n=%d tokens=%d X=%d waited_s=%.1f window_s=%.1f "
+                                "d_check_s=%.1f epoch=%d -- D decodes on, the arriving prefills collect",
+                                n, tokens, x_tok, waited, win, dcheck, self.epoch)
+                return "hold"
+        if stage == "window" and 0.0 < dcheck < win:
+            route = "P"  # user ~19:13Z: "ansonsten wartet er auf die 15er grenze und flippt"
+        else:
+            route = "P" if (p_bound or tokens > x_tok) else "D"
+        st.update(route=route, t_rel=now, t_open=None, shorts={}, wid=st["wid"] + 1,
+                  rel_rids=[p.rid for p in fresh])  # route D: the set _dc_hand_to_d moves
+        self.counters["decode_collect_release_" + route] += 1
+        logger.info("WEG2 DECODE-COLLECT release n=%d tokens=%d X=%d waited_s=%.1f route=%s stage=%s p_bound=%s "
+                    "epoch=%d", n, tokens, x_tok, waited, route, stage, p_bound, self.epoch)
+        return route
+
+    def _dc_p_seat_gate(self, now: float) -> bool:
+        """DECODE-COLLECT SEAT GATE (user 02.10. ~20:25Z): may the collected set
+        flip to P now? Only while D has a free seat after the flip back
+        (ARRIVAL-SEAT's own count: running minus parked, hand-offs, ready,
+        grants); the P phase then dispatches at most that many (``_dc_p_cap``,
+        oldest first). False: no seat -- the set keeps waiting."""
+        if not envs.SGLANG_WEG2_DECODE_COLLECT_SEAT_GATE.get():
+            return True
+        taken, n = self._arrival_seat_taken()
+        free = max(0, int(n) - int(taken))
+        st = self._dc_st()
+        if free <= 0:
+            if st.get("seat_hold_wid") != st["wid"]:
+                st["seat_hold_wid"] = st["wid"]
+                self.counters["decode_collect_seat_hold"] += 1
+                logger.info("WEG2 DECODE-COLLECT seat-gate hold taken=%d n=%d epoch=%d -- route P, but D has no "
+                            "free seat: no prefill on P; the set waits for a seat or the wait bound",
+                            taken, n, self.epoch)
+            return False
+        self._dc_p_cap = free
+        if st.get("seat_flip_wid") != st["wid"]:
+            st["seat_flip_wid"] = st["wid"]
+            self.counters["decode_collect_seat_flip"] += 1
+            logger.info("WEG2 DECODE-COLLECT seat-gate flip free=%d taken=%d n=%d epoch=%d -- P prefills at most "
+                        "%d (the free seats), oldest first", free, taken, n, self.epoch, free)
+        return True
+
+    async def _dc_no_seat_step(self, D: "Group", live_q: List["Pending"], bound: float,
+                               now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+        """SEAT GATE, route P without a free D seat: no flip of its own. The
+        ARRIVAL-SEAT room rules decide -- AGE PLAN: the oldest one's
+        displacement plan (the fewest youngest decodes park, then it flips with
+        P capped at one); else (c): past the wait bound the youngest running
+        decode parks and frees a seat for the next tick."""
+        if _asr.age_plan_enabled():
+            x_tok = int(self.tp_prefill_max_tokens)
+            cands = [q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None] or live_q
+            res = await self._arrival_seat_step_age(cands, x_tok, now)
+            if res[0] and res[2] is not None:
+                self._dc_p_cap = 1  # the displacement made room for one
+            return res
+        st = self._asr_st()
+        wait_s = _asr.oldest_wait_s([p.t_arrive for p in live_q] + list(st["waiters"].values()),
+                                    self.t_awake, now)
+        if _asr.bound_fired(wait_s, bound):
+            await self._arrival_seat_park_youngest(D, wait_s, bound, now)
+        return False, not self.admit_d, None
+
+    async def _decode_collect_short(self, rid: str, uncached: int) -> Optional[str]:
+        """DECODE-COLLECT for a SHORT arrival on the D seat path: ``None`` = no
+        window (as before), else the released route ("P": fall through to
+        route BATCH, the flip takes it)."""
+        win = self._dc_window_s()
+        if win <= 0.0:
+            return None
+        st = self._dc_st()
+        if st["route"] == "P":
+            return "P"
+        if st["t_open"] is None and not self._dc_decoding():
+            return None
+        now = time.time()
+        st["shorts"][rid] = (now, int(uncached or 0))
+        wid, epoch = st["wid"], self.epoch
+        deadline = now + win + float(getattr(self, "drain_deadline_s", 30.0) or 30.0)
+        while time.time() < deadline:
+            route = self._decode_collect(time.time())
+            if self.epoch != epoch or not (self.awake == "D" and self.state == "serving"):
+                return "P"
+            if route in ("D", "P") and self._dc_st()["wid"] != wid:
+                return self._dc_st()["route"] if self._dc_st()["route"] == "P" else route
+            if route is None:
+                return None
+            await asyncio.sleep(0.05)
+        return "D"
+
+    def _dc_hand_to_d(self, now: float) -> int:
+        """DECODE-COLLECT route D (user ~19:12Z: D prefills "die kleine menge
+        angefallene token" at once): every queued entry of the released set --
+        SHORT or not (band / x_deferred, budget-refused SHORT), each and their
+        sum <= X by the release -- goes to D's admission line now, while D
+        decodes on; no wait for an idle D (X-IDLE-REGRANT / D-SHORT-DRAIN).
+        The SHORTs held on the seat path take their own seats. Returns the
+        number moved."""
+        st = self._dc_st()
+        rel = set(st.pop("rel_rids", None) or ())
+        if not rel or not (self.awake == "D" and self.state == "serving" and self.admit_d):
+            return 0
+        x = int(self.tp_prefill_max_tokens)
+
+        def _g(p, k, d=None):  # partial test doubles
+            return getattr(p, k, d)
+        cands = sorted((p for p in self.queue if p.rid in rel and not p.fut.done()),
+                       key=lambda p: float(_g(p, "t_arrive", now) or now))
+        moved, total = [], 0
+        for p in cands:
+            u = int(_g(p, "est_uncached", 0) or 0)
+            if (_g(p, "p_only", False) or _g(p, "intake_stalled", False) or _g(p, "leg1_done", False)
+                    or _g(p, "reroutes", 0) or _g(p, "x_requeues", 0) or u < 0 or total + u > x):
+                continue
+            total += u
+            moved.append(p)
+        for p in moved:
+            try:
+                self.queue.remove(p)
+            except ValueError:
+                continue
+            p.d_direct = True
+            if _g(p, "x_deferred", False) and hasattr(self, "_usage_route_note"):
+                self._usage_route_note(p.rid, "x_short", self.epoch)  # USAGE: served on D after all
+            self._ready_for_d.append(p)
+        if moved:
+            if hasattr(self, "_sync_batch_gate"):
+                self._sync_batch_gate()
+            self.counters["decode_collect_to_d"] += len(moved)
+            logger.info("WEG2 DECODE-COLLECT to-d n=%d tokens=%d X=%d rids=%s epoch=%d -- route=D: the "
+                        "collected set goes to D's admission line now, D decodes on", len(moved), total,
+                        x, [p.rid for p in moved][:8], self.epoch)
+        return len(moved)
+
+    def _asr_st(self) -> dict:
+        return self.__dict__.setdefault("_asr_state", {
+            "waiters": {}, "parked": {}, "granted": {}, "kv": None, "park_t": 0.0, "park_cooldown": 0.0,
+            "flip_rid": None, "wait_rid": None, "wait_why": None, "fits": {},
+        })
+
+    #: NF-STAU: arrival stamps kept for the TTFT clocks (bounded, oldest out)
+    ASR_ARRIVALS_KEPT = 4096
+
+    def _asr_arrival_note(self, rid: str) -> None:
+        d = self.__dict__.setdefault("_asr_arrive", collections.OrderedDict())
+        d[rid] = time.time()
+        while len(d) > self.ASR_ARRIVALS_KEPT:
+            d.popitem(last=False)
+
+    def _asr_arrival_of(self, rid: str, pop: bool = False) -> Optional[float]:
+        d = self.__dict__.get("_asr_arrive")
+        if not d:
+            return None
+        return d.pop(rid, None) if pop else d.get(rid)
+
+    def _asr_verdict_ms(self, rid: str, t_arrive: Optional[float], now: Optional[float] = None) -> float:
+        """NF-STAU (user 29.09.: "decode sofort nach ankunft des requests zwecks
+        ttf"): arrival -> the rule's deciding verdict, once per rid, into the
+        IPC counters (state.json front.arrival_seat.verdict_*)."""
+        t0 = t_arrive if t_arrive is not None else self._asr_arrival_of(rid)
+        if t0 is None:
+            return -1.0
+        ms = max(0.0, ((now or time.time()) - float(t0)) * 1000.0)
+        _asr.note_ms(self.counters, "verdict", ms)
+        return ms
+
+    def _asr_clear_parked(self, why: str) -> None:
+        """NF-STAU (y3m 21:48:39 -> 22:02:16): a youngest-parked rid stayed in
+        the rule's parked set after D ran it again (PARK-RESUME at 21:56:50,
+        then bs1 until 22:05) -- the rule then counted D's one running decode
+        as no seat (``taken=0``) and found no victim for (c), so its bound
+        never parked anything and the head waited 5 min. A flip back to D
+        resumes every park, and D re-queues a park no sleep followed
+        (``PARK_REQUEUE_S``, part B): both end the rule's park too."""
+        st = self.__dict__.get("_asr_state")
+        if not st or not st["parked"]:
+            return
+        n = len(st["parked"])
+        st["parked"].clear()
+        logger.info("%s PARKED-CLEAR n=%d why=%s (the youngest-parked decodes run again: they "
+                    "hold seats and are victims of (c) again)", _asr.MARKER, n, why)
+
+    def _arrival_seat_taken(self) -> Tuple[int, int]:
+        """(taken, n): the D seats this phase owes -- D's running ledger (minus
+        the youngest-parked and the wait-bound-parked), the hand-offs in flight
+        and the prefilled requests still waiting for a front seat -- against the
+        phase's seat count (H95c ``_d_phase_n``, else ``--d-bs``)."""
+        n = getattr(self, "_d_phase_n", None) or self.d_bs
+        if _d_seat_rewake_on():
+            # D-SEAT-REWAKE: D grows its phase seats live at the next round
+            # boundary when a request it can hold finds them taken -- the
+            # seats this rule counts are D's cap (--d-bs), not the wake's n
+            n = self.d_bs
+        D = self.groups["D"]
+        st = self._asr_st()
+        parked, granted = st["parked"], st["granted"]
+        ready = [p for p in self._ready_for_d if getattr(p, "fut", None) is None or not p.fut.done()]
+        running = [r for r in self._flip_ledger(D) if r not in parked]
+        # a grant between this rule's verdict and its Seat (the caller still
+        # awaits the store-budget reading) holds its seat already: no second
+        # waiter may take it in that window. Settled once the rid runs or holds
+        # a Seat (then the hand-off term counts it); a lost grant lapses at 10 s.
+        now = time.time()
+        seat_rids = {s.rid for s in (getattr(self, "_d_seats_live", ()) or ())}
+        for r in [r for r, t in granted.items() if r in D.outstanding or r in seat_rids or now - t > 10.0]:
+            granted.pop(r, None)
+        return (len(running) + max(0, self._handoff_in_flight()) + len(ready) + len(granted), int(n))
+
+    async def _arrival_seat_kv_fetch(self, gen: int) -> Optional[Dict[str, Any]]:
+        """One ``/server_info`` read of D's free KV. It lands in the cache only
+        while no KV park invalidated the readings since it was asked for
+        (``gen``): a read D answered before the park would describe the room
+        the park has just changed."""
+        st = self._asr_st()
+        t0 = time.time()
+        got = None
+        try:
+            async with self.session.get(f"{self.groups['D'].url}/server_info",
+                                        timeout=ClientTimeout(total=2.0)) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    for s in (body.get("internal_states") or []):
+                        got = s.get("weg2_kv") or got
+                        if got:
+                            break
+        except Exception:  # noqa: BLE001 -- no reading: the seat count decides
+            got = None
+        if int(st.get("kv_gen", 0)) == int(gen):
+            st["kv"] = (t0, got)
+        return got
+
+    def _asr_kv_invalidate(self) -> None:
+        """The next KV test reads D afresh (and waits for it): after a KV park."""
+        st = self._asr_st()
+        st["kv"] = None
+        st["kv_gen"] = int(st.get("kv_gen", 0)) + 1
+
+    async def _arrival_seat_kv_reading(self) -> Optional[Dict[str, Any]]:
+        """D's free KV (``/server_info`` internal_states[0].weg2_kv), at most 1 s
+        old; None when D does not publish it (the seat plan alone decides).
+
+        KV READ BUDGET (01.10., NF D->P flip bfpgwv): D answers /server_info
+        only at its scheduler pass boundary -- a D prefill pass runs 3-6.6 s
+        there -- and the park RPC of the flip_now this reading decides waits
+        for a boundary too. Awaited in the controller tick, the read put the
+        park one whole D pass later (weg2-14-90: `kv=unread` after the 2.0 s
+        timeout at 18:36:46.07, D's pass had ended at 45.64, the park waited
+        for the next one: rpc 5.14 s). An older reading is refreshed in the
+        background; the tick waits for it at most the budget and otherwise
+        decides on the last reading D gave (the refresh lands for the next
+        tick). No reading at all (boot, or after a KV park) waits as before."""
+        st = self._asr_st()
+        now = time.time()
+        cached = st.get("kv")
+        if cached is not None and now - cached[0] <= 1.0:
+            return cached[1]
+        gen = int(st.get("kv_gen", 0))
+        pending = st.get("kv_task")
+        if pending is None or pending[0] != gen or pending[1].done():
+            pending = (gen, asyncio.ensure_future(self._arrival_seat_kv_fetch(gen)))
+            st["kv_task"] = pending
+        task = pending[1]
+        if cached is None:
+            return await asyncio.shield(task)
+        budget = _asr.kv_read_budget_s()
+        if not task.done() and budget > 0:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=budget)
+            except asyncio.TimeoutError:
+                pass
+        if task.done():
+            got = task.result()
+            if int(st.get("kv_gen", 0)) == gen:
+                return got
+        self.counters["arrival_seat_kv_stale"] += 1
+        st["kv_stale_ms"] = int(round((now - cached[0]) * 1000.0))
+        return cached[1]
+
+    async def _arrival_seat_fits(self, est_prompt: int, max_tokens: Optional[int],
+                                 rid: Optional[str] = None,
+                                 uncached: Optional[int] = None) -> Tuple[bool, str]:
+        fits, why, _deficit = await self._arrival_seat_kv(est_prompt, max_tokens, rid, uncached)
+        return fits, why
+
+    def _asr_shared_credit(self, rid: Optional[str], est_prompt: int,
+                           uncached: Optional[int]) -> int:
+        """NF-STAU-KV: the prefix ``rid`` shares with its session's previous
+        turn while that turn RUNS on D (not parked: a parked turn's pages are
+        evictable and already in D's free reading)."""
+        if rid is None:
+            return 0
+        got = (self.__dict__.get("_sess_prev") or {}).get(str(rid))
+        if not got:
+            return 0
+        prev_rid, common = got
+        running = (prev_rid in self._flip_ledger(self.groups["D"])
+                   and prev_rid not in self._asr_st()["parked"])
+        return _asr.shared_prefix_credit(est_prompt, uncached, common, running)
+
+    async def _arrival_seat_kv(self, est_prompt: int, max_tokens: Optional[int],
+                               rid: Optional[str] = None,
+                               uncached: Optional[int] = None) -> Tuple[bool, str, int]:
+        """``(fits, why, deficit)`` of the ARRIVAL-SEAT KV test.
+
+        NF-STAU-KV (30.09., Klasse J; y3u weg2-38-56 need=141854 = 77854 +
+        64000 > free=131820, 13.6 s wait, 47 tokens decoded): the need is
+        what D's own admission asks -- the prompt minus the prefix a RUNNING
+        turn of the same session already holds on D, plus the decode term
+        clipped like D's ``PrefillAdder`` (``weg2_kv.decode_clip``); growth
+        past it is D's elastic pressure park, never a front-side worst case."""
+        reading = await self._arrival_seat_kv_reading()
+        clip = reading.get("decode_clip") if reading else None
+        if clip is None:
+            clip = _asr.default_decode_clip()
+        reserve = _asr.decode_reserve(max_tokens, _asr.default_reserve())
+        decode = _asr.decode_part(max_tokens, _asr.default_reserve(), clip)
+        shared = self._asr_shared_credit(rid, est_prompt, uncached)
+        need = _asr.kv_need(max(0, int(est_prompt or 0) - shared), decode)
+        fits, why = _asr.kv_fits(need, reading)
+        free = _asr.kv_free(reading)
+        deficit = 0 if (fits or free is None) else int(need) - int(free)
+        if shared or decode < reserve:
+            why = "%s [need = prompt %d - shared %d + decode %d of max_tokens %d, D clip %s]" % (
+                why, int(est_prompt or 0), shared, decode, reserve, clip)
+        st = self._asr_st()
+        stale_ms = st.pop("kv_stale_ms", None)
+        if stale_ms is not None:
+            why = "%s kv_age_ms=%d (D inside a pass: the last reading decides, its refresh lands next tick)" % (
+                why, stale_ms)
+        st["need_terms"] = (shared, decode, reserve)
+        return fits, why, deficit
+
+    def _asr_note_need_terms(self) -> None:
+        """Counters for the two honest terms of the verdict just granted."""
+        terms = self._asr_st().pop("need_terms", None)
+        if not terms:
+            return
+        shared, decode, reserve = terms
+        self.counters["arrival_seat_kv_shared_tokens"] += int(shared)
+        if decode < reserve:
+            self.counters["arrival_seat_kv_decode_clipped"] += 1
+
+    async def _arrival_seat_kv_displace(self, head_rid: str, head_arrival: Optional[float],
+                                        deficit: int, now: float) -> Optional[str]:
+        """NF-STAU-KV (user rule #246 "Ältester rückt nach und verdrängt
+        Jüngere"): the head has a free seat but its KV does not fit -- the
+        youngest running decode that arrived AFTER it parks at its round
+        boundary (span retained), at once instead of after the 60 s bound (c).
+        One park per KV tick (the reading is re-taken before the next one);
+        never an older request, never a park that cannot cover the deficit."""
+        st = self._asr_st()
+        if now - float(st.get("kv_park_t", 0.0)) < float(st.get("kv_park_cooldown", 0.0)):
+            return None
+        D = self.groups["D"]
+        running = [r for r in self._flip_ledger(D) if r not in st["parked"] and r != head_rid]
+        arrivals = {}
+        for r in running:
+            t = self._asr_arrival_of(r)
+            if t is not None:
+                arrivals[r] = t
+        tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+        victim = _asr.kv_displace_victim(head_arrival, running, arrivals, tokens, deficit)
+        if victim is None:
+            return None
+        got = await self._arrival_seat_park(D, victim, _asr.REASON_KV, now, "kv_park",
+                                            park_cooldown=_asr.KV_PARK_COOLDOWN_S)
+        if got is not None:
+            self.counters["arrival_seat_kv_displace"] += 1
+            self._asr_kv_invalidate()  # the next KV test reads D after the park
+            logger.warning("%s KV-DISPLACE rid=%s head=%s deficit=%d younger_tokens_lb=%d -- the head's KV "
+                           "does not fit a free seat: the youngest decode that arrived after it parks at "
+                           "its round boundary (span retained) and the head takes the room (#246)",
+                           _asr.MARKER, victim, head_rid, int(deficit),
+                           sum(tokens.get(r, 0) for r in arrivals if arrivals[r] > float(head_arrival)))
+        else:
+            self.counters["arrival_seat_kv_displace_refused"] += 1
+        return got
+
+    def _arrival_seat_age_verdict(self, head_rid: str, head_arrival: Optional[float],
+                                  seat_is_free: bool, deficit: int) -> Optional[List[str]]:
+        """AGE PLAN (Nutzer 30.09. ~14:40Z/14:45Z), the FRONT's half: may the
+        oldest waiter go to D although it does not fit now? ``_asr.displace_plan``
+        over the running decodes that arrived after it, on the front's own
+        (lower-bound) prices. ``None``: older running requests block it -- it
+        stays here and younger ones that fit are backfilled. ``[]``: it fits.
+        A non-empty plan: displacing younger decodes can make it fit -- it is
+        handed to D, and D ALONE decides the displacement on its real KV and
+        seat cap (``d_park_runtime.displace_for_age``: SEAT-AGE seat trigger,
+        KV trigger with ``victims_needed`` -- only the youngest, only as many
+        as needed, only when that is enough). The front parks nothing here:
+        one displacement logic, on D."""
+        st = self._asr_st()
+        running = [r for r in self._flip_ledger(self.groups["D"]) if r not in st["parked"] and r != head_rid]
+        arrivals = {}
+        for r in running:
+            t = self._asr_arrival_of(r)
+            if t is not None:
+                arrivals[r] = t
+        tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+        plan = _asr.displace_plan(head_arrival, seat_is_free, deficit, running, arrivals, tokens)
+        plans = st.setdefault("age_plan", {})
+        key = "none" if plan is None else ("fits" if not plan else "displace")
+        if plans.get(head_rid) != key:
+            plans[head_rid] = key
+            if plan is None:
+                self.counters["arrival_seat_age_blocked_by_elders"] += 1
+            logger.info("%s head=%s plan=%s seat_free=%s deficit=%d younger_victims_by_front_price=%s -- %s",
+                        _asr.AGE_MARKER, head_rid, key, bool(seat_is_free), int(deficit), plan or [],
+                        "older running requests block it: it waits here, younger ones that fit are "
+                        "backfilled" if plan is None else
+                        ("it fits" if not plan else
+                         "it goes to D; D's SEAT-AGE decides the displacement on its real KV"))
+        return plan
+
+    def _d_direct_yields(self, rid: str) -> bool:
+        """FLIPCYCLE H5b (02.10.): no D-direct prefill when the D->P flip is
+        already foreseeable -- a request that needs P is queued. A D pass with
+        >= 8 new tokens streams the routed experts of all 48 layers (1.2-3.8 s,
+        pool.host_fetch at the link floor) and the park of that flip waits the
+        whole pass behind it (y6z park RPC p90 1872 ms: ep 8 1.87 s, ep 22
+        1.96 s behind a D-direct SHORT). The SHORT rides P's batch instead (its
+        prefix from the shared store); the flip it waited for comes anyway.
+        Unforeseeable (the P-bound arrival lands DURING the pass) stays the
+        pass: a running forward is not cut."""
+        if not envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD.get():
+            return False
+        try:
+            # only a P-bound request that FITS (seat and KV, the ARRIVAL-SEAT step's
+            # own reading) makes the flip foreseeable; a seat- or KV-blocked one
+            # does not flip, and the SHORT waits for its seat on D (rule 29.09.)
+            # read, never create (the ARRIVAL-SEAT-off path keeps no state)
+            fits = (getattr(self, "__dict__", {}).get("_asr_state") or {}).get("fits") or {}
+            # PBOUND-FLIP-NOW: every queued request that needs P flips now -- the
+            # flip is foreseeable for each of them, fitting a D seat or not
+            pbound = bool(envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get())
+            cands = [q for q in self._asr_live_p_cands()
+                     if getattr(q, "rid", None) != rid
+                     and (pbound or fits.get(getattr(q, "rid", None)) is True)]
+        except Exception:  # noqa: BLE001 - a reading never blocks the route
+            return False
+        if not cands:
+            return False
+        self.counters["d_direct_yield"] += 1
+        logger.info("WEG2-FLIPCYCLE stage=park_wait rid=%s ms=0 floor_ms=0 yield=d_direct "
+                    "p_bound=%s epoch=%d (H5b: a D->P flip is foreseeable, this SHORT joins P's "
+                    "batch instead of a 1.2-3.8 s D pass the park would wait behind)",
+                    rid, getattr(cands[0], "rid", "?"), self.epoch)
+        return True
+
+    def _asr_live_p_cands(self) -> List["Pending"]:
+        """The queued requests that need P (the step's candidates)."""
+        x_tok = int(self.tp_prefill_max_tokens)
+        live_q = [p for p in self.queue if not p.fut.done()]
+        return [q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None]
+
+    async def _asr_older_blocked(self, rid: str, t_mine: float, seat_is_free: bool) -> bool:
+        """AGE PLAN: may ``rid`` take a seat past the requests OLDER than it?
+        Only when every older waiter -- the D-prefill waiters and the queued
+        requests that need P -- is blocked: it does not fit AND displacing
+        younger decodes cannot make it fit (its elders block it). An older one
+        that fits, or that its plan is making fit, keeps its right of way."""
+        st = self._asr_st()
+        plans = st.setdefault("age_plan", {})
+        fits_of = st.setdefault("fits", {})
+        for r, t in list(st["waiters"].items()):
+            if r != rid and t < t_mine:
+                if fits_of.get(r) is not False or plans.get(r) != "none":
+                    return False
+        for q in self._asr_live_p_cands():
+            t = float(getattr(q, "t_arrive", 0.0) or 0.0)
+            if t >= t_mine:
+                continue
+            if envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get():
+                return False    # PBOUND-FLIP-NOW: an older request that needs P is never "blocked"
+            f2, _why, d2 = await self._arrival_seat_kv(
+                int(getattr(q, "est_prompt", 0) or 0), _asr.max_tokens_of(getattr(q, "payload", None)),
+                q.rid, int(getattr(q, "est_uncached", 0) or 0))
+            if seat_is_free and f2:
+                return False
+            running = [x for x in self._flip_ledger(self.groups["D"]) if x not in st["parked"]]
+            arrivals = {x: self._asr_arrival_of(x) for x in running if self._asr_arrival_of(x) is not None}
+            tokens = {s.rid: int(s.tokens) for s in (getattr(self, "_d_seats_live", ()) or ())}
+            if _asr.displace_plan(self._asr_arrival_of(q.rid) or t, seat_is_free, d2 if not f2 else 0,
+                                  running, arrivals, tokens) is not None:
+                return False
+        return True
+
+    async def _arrival_seat_wait(self, rid: str, est_tokens: int, max_tokens: Optional[int],
+                                 uncached: Optional[int] = None) -> bool:
+        """ARRIVAL-SEAT (a)/(b) for an arrival D prefills itself (uncached <= X):
+        True as soon as a seat is free, its KV need fits and it is the OLDEST
+        seat waiter (arrival order, #244/#246); until then it waits here -- no P
+        detour, no flip request. False when the phase changed under the wait
+        (D asleep or admission closed by a flip): the caller routes BATCH, which
+        the flip being taken anyway serves."""
+        st = self._asr_st()
+        waiters = st["waiters"]
+        fits_of = st.setdefault("fits", {})
+        waiters[rid] = time.time()
+        told = None
+        age_plan = _asr.age_plan_enabled()
+        bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
+        try:
+            while True:
+                if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                    return False
+                head = min(waiters.items(), key=lambda kv: kv[1])[0]
+                taken, n = self._arrival_seat_taken()
+                free = _asr.seat_free(taken, n)
+                if age_plan:
+                    # AGE PLAN (30.09. ~14:40Z/14:45Z): one decision per tick
+                    if await self._arrival_seat_wait_age(rid, est_tokens, max_tokens, uncached,
+                                                         waiters[rid], free, taken, n):
+                        return True
+                    await asyncio.sleep(0.05)
+                    continue
+                fits, why, deficit = (await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
+                                      if free else (True, "no seat", 0))
+                fits_of[rid] = bool(free and fits)
+                if free and not fits and head == rid:
+                    # NF-STAU-KV (#246): the head displaces a younger decode
+                    await self._arrival_seat_kv_displace(
+                        rid, self._asr_arrival_of(rid) or waiters[rid], deficit, time.time())
+                backfill = False
+                if free and fits and head != rid:
+                    # #246 KV backfill: every older waiter is blocked by its KV (a
+                    # free seat it cannot use) and the head has not waited the bound
+                    older = [r for r, t in waiters.items() if t < waiters[rid]]
+                    backfill = (all(fits_of.get(r) is False for r in older)
+                                and _asr.backfill_allowed(time.time() - max(waiters[head], self.t_awake),
+                                                          bound))
+                if free and fits and (head == rid or backfill):
+                    st["granted"][rid] = time.time()
+                    self.counters["arrival_seat_d_prefill"] += 1
+                    self._asr_note_need_terms()
+                    if backfill:
+                        self.counters["arrival_seat_backfill"] += 1
+                    ms = self._asr_verdict_ms(rid, None)
+                    logger.info("%s rid=%s verdict=%s taken=%d n=%d %s%s waited_s=%.2f arrival_to_verdict_ms=%.0f "
+                                "(D prefills it at its next round boundary)", _asr.MARKER, rid, _asr.D_PREFILL,
+                                taken, n, why, ("; backfill past head %s" % head) if backfill else "",
+                                time.time() - waiters[rid], ms)
+                    return True
+                why_wait = "kv" if (free and not fits) else ("order" if free else "seat")
+                if told != why_wait:
+                    told = why_wait
+                    self.counters["arrival_seat_wait_kv" if why_wait == "kv" else "arrival_seat_wait_seat"] += 1
+                    logger.info("%s rid=%s verdict=%s why=%s taken=%d n=%d %s (no flip, no P detour: it takes "
+                                "the next free seat in arrival order)", _asr.MARKER, rid, _asr.WAIT_SEAT,
+                                why_wait, taken, n, why)
+                await asyncio.sleep(0.05)
+        finally:
+            waiters.pop(rid, None)
+            fits_of.pop(rid, None)
+            if age_plan:
+                st.setdefault("age_plan", {}).pop(rid, None)
+                st.setdefault("age_told", {}).pop(rid, None)
+
+    async def _arrival_seat_wait_age(self, rid: str, est_tokens: int, max_tokens: Optional[int],
+                                     uncached: Optional[int], t_mine: float, free: bool,
+                                     taken: int, n: int) -> bool:
+        """AGE PLAN, one tick of a D-prefill waiter: True = granted.
+
+        It may act only when every OLDER waiter is blocked by its own elders
+        (:meth:`_asr_older_blocked`). Acting: it fits (a seat and its KV) ->
+        granted (a backfill when an older one waits); it does not fit but
+        displacing younger decodes can make it fit -> granted too, and D's
+        SEAT-AGE decides that displacement (the front parks nothing); its
+        elders block it -> it waits, younger ones backfill. No time bound
+        ends the backfill."""
+        st = self._asr_st()
+        fits_of = st.setdefault("fits", {})
+        fits_kv, why, deficit = await self._arrival_seat_kv(est_tokens, max_tokens, rid, uncached)
+        terms = st.get("need_terms")
+        fits = bool(free and fits_kv)
+        if not free:
+            why = "no seat; %s" % why
+        fits_of[rid] = fits
+        older = [r for r, t in st["waiters"].items() if r != rid and t < t_mine]
+        older_p = [q for q in self._asr_live_p_cands()
+                   if float(getattr(q, "t_arrive", 0.0) or 0.0) < t_mine]
+        first = not older and not older_p
+        eligible = first or await self._asr_older_blocked(rid, t_mine, free)
+        st["need_terms"] = terms
+        arrival = self._asr_arrival_of(rid) or t_mine
+        plan = None
+        if not fits:
+            plan = self._arrival_seat_age_verdict(rid, arrival, free, 0 if fits_kv else deficit)
+        to_d = bool(plan)   # does not fit, but D can make it fit by displacing younger ones
+        if eligible and (fits or to_d):
+            st["granted"][rid] = time.time()
+            self.counters["arrival_seat_d_prefill"] += 1
+            self._asr_note_need_terms()
+            if not first and fits:
+                self.counters["arrival_seat_backfill"] += 1
+            if to_d:
+                self.counters["arrival_seat_age_to_d"] += 1
+            ms = self._asr_verdict_ms(rid, None)
+            logger.info("%s rid=%s verdict=%s taken=%d n=%d %s%s waited_s=%.2f arrival_to_verdict_ms=%.0f "
+                        "(D prefills it at its next round boundary)", _asr.MARKER, rid, _asr.D_PREFILL,
+                        taken, n, why,
+                        ("; AGE PLAN: to D, D's SEAT-AGE displaces younger ones for it" if to_d else
+                         "" if first else "; backfill: every older waiter is blocked by its elders (AGE PLAN)"),
+                        time.time() - t_mine, ms)
+            return True
+        why_wait = "order" if fits else ("kv" if free else "seat")
+        told = st.setdefault("age_told", {})
+        if told.get(rid) != why_wait:
+            told[rid] = why_wait
+            self.counters["arrival_seat_wait_kv" if why_wait == "kv" else "arrival_seat_wait_seat"] += 1
+            logger.info("%s rid=%s verdict=%s why=%s taken=%d n=%d %s (AGE PLAN: an older waiter keeps "
+                        "its right of way, or it waits for its plan)", _asr.MARKER, rid, _asr.WAIT_SEAT,
+                        why_wait, taken, n, why)
+        return False
+
+    async def _arrival_seat_step(self, D: "Group", now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+        """ARRIVAL-SEAT, the controller's D-phase decision: ``(wait_fired,
+        fairness_fired, immediate)`` for the code below it. (c) first: the oldest
+        waiter (queue for P + seat waiters) past the bound parks the youngest
+        running decode -- never a flip. Then the queue head that needs P: a free
+        seat whose KV fits flips NOW (``immediate``, the running decodes park at
+        the round boundary); otherwise nothing flips."""
+        st = self._asr_st()
+        for r in [r for r in st["parked"] if r not in D.outstanding]:
+            st["parked"].pop(r, None)
+        # NF-STAU: D re-queued a youngest park no sleep followed (part B's
+        # clock) -- it runs again, the rule must count it again.
+        lapsed = [r for r, t in st["parked"].items() if phase_policy.parked_lapsed(t, now)]
+        if lapsed:
+            for r in lapsed:
+                st["parked"].pop(r, None)
+            Front._rb_resume(self, lapsed, "lapsed")  # DASHBOARD-IPC
+            logger.info("%s PARKED-CLEAR n=%d why=lapsed rids=%s", _asr.MARKER, len(lapsed), lapsed[:4])
+        bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
+        live_q = [p for p in self.queue if not p.fut.done()]
+        dc = self._decode_collect(now, live_q) if _decode_collect_window_s() > 0.0 else None
+        if dc == "hold":
+            return False, not self.admit_d, None  # DECODE-COLLECT: no flip, no D seat yet
+        if dc == "D":
+            self._dc_hand_to_d(now)  # route D: the non-SHORTs <= X too, not only d_eligible
+        if dc == "P":
+            if not live_q:
+                return False, not self.admit_d, None  # the released SHORTs are on their way to the queue
+            if not self._dc_p_seat_gate(now):
+                return await self._dc_no_seat_step(D, live_q, bound, now)
+            head = min(live_q, key=lambda q: float(getattr(q, "t_arrive", now) or now))
+            if st["flip_rid"] != head.rid:
+                st["flip_rid"] = head.rid
+                self.counters["arrival_seat_flip_now"] += 1
+                logger.warning("%s rid=%s verdict=%s DECODE-COLLECT route=P queued=%d -- the collected set "
+                               "goes to P: D pauses its decodes and flips now", _asr.MARKER, head.rid,
+                               _asr.FLIP_NOW, len(live_q))
+            return True, True, head
+        # y4y: a queued SHORT has an owner -- D, as a d_prefill verdict (the
+        # candidates below are only the entries that need P)
+        handed = self._asr_queued_short_to_d(live_q, now) if live_q else []
+        if handed:
+            live_q = [p for p in live_q if all(p is not h for h in handed)]
+        wait_s = _asr.oldest_wait_s([p.t_arrive for p in live_q] + list(st["waiters"].values()),
+                                    self.t_awake, now)
+        age_plan = _asr.age_plan_enabled()
+        if _asr.bound_fired(wait_s, bound) and not age_plan:
+            # AGE PLAN on: no blanket park (Nutzer 30.09. ~14:45Z "nicht
+            # pauschal den jüngeren verdrängen") -- the plan displaces only the
+            # fewest youngest that make the oldest fit, and at once.
+            await self._arrival_seat_park_youngest(D, wait_s, bound, now)
+        x_tok = int(self.tp_prefill_max_tokens)
+        cands = ([q for q in live_q if phase_policy.immediate_park_trigger([q], x_tok) is not None]
+                 if live_q else [])
+        if not cands:
+            # y4y NET: the wait bound fires for EVERY queued entry, a
+            # non-candidate too -- an entry no rule takes must not wait for
+            # ever behind FLIP-ECONOMICS (300 s there); fired, the flip to P
+            # takes the backlog (the fairness bound's path)
+            q_wait = _asr.oldest_wait_s([p.t_arrive for p in live_q], self.t_awake, now)
+            if live_q and _asr.bound_fired(q_wait, bound):
+                head = min(live_q, key=lambda q: float(q.t_arrive))
+                if st.get("wait_any_rid") != head.rid:
+                    st["wait_any_rid"] = head.rid
+                    self.counters["arrival_seat_wait_any"] += 1
+                    logger.warning("%s rid=%s WAIT-BOUND-ANY waited=%.1f s >= bound %.0f s uncached=%d "
+                                   "d_eligible=%s -- a queued entry no rule took: the bound fires (flip to P)",
+                                   _asr.MARKER, head.rid, q_wait, bound,
+                                   int(getattr(head, "est_uncached", 0) or 0),
+                                   bool(getattr(head, "d_eligible", False)))
+                return True, True, None
+            return False, not self.admit_d, None
+        if envs.SGLANG_WEG2_PBOUND_FLIP_NOW.get():
+            return self._asr_pbound_flip_now(cands, x_tok, now)
+        if age_plan:
+            return await self._arrival_seat_step_age(cands, x_tok, now)
+        p = cands[0]
+        taken, n = self._arrival_seat_taken()
+        free = _asr.seat_free(taken, n)
+        deficit = 0
+        if free:
+            fits, why, deficit = await self._arrival_seat_kv(
+                int(getattr(p, "est_prompt", 0) or 0), _asr.max_tokens_of(getattr(p, "payload", None)),
+                p.rid, int(getattr(p, "est_uncached", 0) or 0))
+        else:
+            fits, why = False, "no seat"
+        # #246b: the X the head was routed on (X_busy band floor) decides D vs P
+        _x_p = int(getattr(p, "x_routed", 0) or 0)
+        v = _asr.verdict(free, fits, int(getattr(p, "est_uncached", 0) or 0),
+                         min(x_tok, _x_p) if _x_p > 0 else x_tok)
+        if 0 < _x_p < x_tok:
+            why = "%s x_routed=%d (routed LONG on the X_busy band floor)" % (why, _x_p)
+        head = p
+        displaced = None
+        if v == _asr.WAIT_SEAT and free and not fits:
+            # NF-STAU-KV (#246): strict arrival order first -- the head parks a
+            # younger decode for its room; backfill only when no younger one can
+            displaced = await self._arrival_seat_kv_displace(
+                p.rid, self._asr_arrival_of(p.rid) or float(getattr(p, "t_arrive", now)), deficit, now)
+        if v == _asr.WAIT_SEAT and free and not fits and len(cands) > 1 and displaced is None:
+            # #246 KV backfill: the head's KV does not fit a free seat -- a later
+            # arrival (arrival order among the fitting ones) that fits takes it.
+            # The head is asked first on every tick; past the bound backfill
+            # stops and (c) displaces for the head.
+            head_wait = now - max(float(head.t_arrive), float(self.t_awake))
+            if _asr.backfill_allowed(head_wait, bound):
+                for q in cands[1:]:
+                    f2, why2 = await self._arrival_seat_fits(
+                        int(getattr(q, "est_prompt", 0) or 0),
+                        _asr.max_tokens_of(getattr(q, "payload", None)),
+                        q.rid, int(getattr(q, "est_uncached", 0) or 0))
+                    if f2:
+                        p, fits, v = q, True, _asr.FLIP_NOW
+                        why = "%s; backfill past head %s (%s, waited %.1f s)" % (why2, head.rid, why, head_wait)
+                        break
+        if v == _asr.FLIP_NOW and (self._asr_min_dwell_held(p, D, now)
+                                   or Front._asr_k7_dwell_held(self, p, now)):
+            return False, not self.admit_d, None
+        if v == _asr.FLIP_NOW:
+            if st["flip_rid"] != p.rid:
+                st["flip_rid"] = p.rid
+                self.counters["arrival_seat_flip_now"] += 1
+                self._asr_note_need_terms()
+                if p is not head:
+                    self.counters["arrival_seat_backfill"] += 1
+                ms = self._asr_verdict_ms(p.rid, getattr(p, "t_arrive", None), now)
+                logger.warning("%s rid=%s verdict=%s uncached=%d X=%d taken=%d n=%d %s arrival_to_verdict_ms=%.0f "
+                               "-- D pauses its decodes at the round boundary and flips to P now (no collect "
+                               "window)", _asr.MARKER, p.rid, v, int(getattr(p, "est_uncached", 0) or 0), x_tok,
+                               taken, n, why, ms)
+            return True, True, p
+        why_wait = "kv" if (free and not fits) else "seat"
+        if st["wait_rid"] != p.rid or st.get("wait_why") != why_wait:
+            # NF-STAU: logged again when the REASON changes (y3m: weg2-50-66's
+            # one line said "no seat" while it waited 5 min on the KV test)
+            st["wait_rid"], st["wait_why"] = p.rid, why_wait
+            self.counters["arrival_seat_wait_kv" if why_wait == "kv" else "arrival_seat_wait_seat"] += 1
+            logger.info("%s rid=%s verdict=%s why=%s uncached=%d X=%d taken=%d n=%d %s -- no flip: it waits for "
+                        "the next free seat in arrival order", _asr.MARKER, p.rid, v, why_wait,
+                        int(getattr(p, "est_uncached", 0) or 0), x_tok, taken, n, why)
+        return False, not self.admit_d, None
+
+    def _asr_pbound_flip_now(self, cands: List["Pending"], x_tok: int,
+                             now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+        """PBOUND-FLIP-NOW (user law 02.10. "Request kommt = sofort Prefill"):
+        the OLDEST queued request that needs P (LONG over X, P-only/vision,
+        requeued, carrier) flips D->P now. It never needed a D seat or D KV
+        before P prefills it -- the P->D re-admission seats it -- so neither
+        the seat/KV verdict nor the K7/MIN-DWELL hold applies (y8a weg2-10-22:
+        229 s on 'wait_seat why=kv', 17 younger requests admitted past it)."""
+        st = self._asr_st()
+        p = min(cands, key=lambda c: float(getattr(c, "t_arrive", now) or now))
+        waited = now - max(float(getattr(p, "t_arrive", now) or now), float(self.t_awake))
+        if waited > 2.0 and st.get("pbound_stall_rid") != p.rid:
+            st["pbound_stall_rid"] = p.rid
+            self.counters["arrival_seat_pbound_stall"] += 1
+            logger.warning("%s PBOUND-STALL rid=%s waited=%.1f s uncached=%d p_only=%s -- a request that "
+                           "needs P waits on an awake D: it flips now", _asr.MARKER, p.rid, waited,
+                           int(getattr(p, "est_uncached", 0) or 0), bool(getattr(p, "p_only", False)))
+        if st["flip_rid"] != p.rid:
+            st["flip_rid"] = p.rid
+            self.counters["arrival_seat_flip_now"] += 1
+            self.counters["arrival_seat_pbound_flip_now"] += 1
+            taken, n = self._arrival_seat_taken()
+            ms = self._asr_verdict_ms(p.rid, getattr(p, "t_arrive", None), now)
+            logger.warning("%s rid=%s verdict=%s PBOUND-FLIP-NOW uncached=%d X=%d p_only=%s taken=%d n=%d "
+                           "arrival_to_verdict_ms=%.0f -- D pauses its decodes at the round boundary and "
+                           "flips to P now (no seat/KV test, no dwell)", _asr.MARKER, p.rid, _asr.FLIP_NOW,
+                           int(getattr(p, "est_uncached", 0) or 0), x_tok,
+                           bool(getattr(p, "p_only", False)), taken, n, ms)
+        return True, True, p
+
+    def _asr_k7_dwell_held(self, p: "Pending", now: float) -> bool:
+        """PDFLIP-B on NF: the ARRIVAL-SEAT flip_now passes K7's derived
+        min-dwell BEFORE it parks D -- as 27B's _immediate_park_due does -- so
+        MIN-DWELL's ``overridden_by=park`` (admission closed by this phase's own
+        park) is never a flip below the dwell. Without it the park fired at any
+        awake time and the override let the flip through after the 2 s fairness
+        floor (27B N5d: overridden_by=fairness after 6.6 s awake, need 12.6 s).
+        True = hold: D keeps decoding, the arrival keeps its place. Off with
+        SGLANG_WEG2_X_BAND_FOLLOWS_PRICE=0 (or no flip log: a test double).
+
+        IDLE D NEVER HOLDS (user law 02.10.: Flipzeit = last token of the
+        outgoing phase -> first token of the incoming one; 27B D>P Vorlauf
+        1.6-2.2 s = min-dwell holding an idle D): the dwell exists only so D's
+        running decodes progress. With no decode running on D (the front's own
+        flip ledger of D minus the requests this step parked) a hold is pure
+        Vorlauf -- the flip goes at once (``K7-DWELL skip ... d_running=0``)."""
+        if not hasattr(self, "flip_log") or not Front._x_excursion_band_off(self):
+            return False
+        need, prov = Front._derived_min_dwell_ms(self, "D", "P")
+        awake_ms = (float(now) - float(self.t_awake)) * 1000.0
+        if awake_ms >= need:
+            return False
+        st = self._asr_st()
+        D = (getattr(self, "groups", None) or {}).get("D")
+        d_running = 0 if D is None else sum(
+            1 for r in self._flip_ledger(D) if r not in st.get("parked", ()))
+        if d_running == 0:
+            if st.get("k7_dwell_skip_told") != (p.rid, self.epoch):
+                st["k7_dwell_skip_told"] = (p.rid, self.epoch)
+                self.counters["arrival_seat_k7_dwell_skip_idle"] += 1
+                logger.info("%s K7-DWELL skip rid=%s d_running=0 awake_ms=%d min_dwell_ms=%d epoch=%d "
+                            "(idle D: the dwell would be pure Vorlauf)", _asr.MARKER, p.rid,
+                            int(awake_ms), int(need), self.epoch)
+            return False
+        self._park_dwell_held_t = time.time()  # DP-WAIT (#1416i): hold_by=min-dwell
+        if st.get("k7_dwell_told") != (p.rid, self.epoch):
+            st["k7_dwell_told"] = (p.rid, self.epoch)
+            self.counters["arrival_seat_k7_dwell_hold"] += 1
+            logger.info("%s K7-DWELL hold rid=%s d_running=%d awake_ms=%d min_dwell_ms=%d provenance=%s "
+                        "epoch=%d -- PDFLIP-B: the flip to P waits for the derived min-dwell before the "
+                        "park; D keeps decoding, the arrival keeps its place and seat", _asr.MARKER, p.rid,
+                        d_running, int(awake_ms), int(need), prov, self.epoch)
+        return True
+
+    def _asr_min_dwell_held(self, p: "Pending", D: "Group", now: float) -> bool:
+        """ARRIVAL-SEAT MIN-DWELL (NF-Operator 30.09., y5c 19:17-19:21Z:
+        weg2-0-2 parked 6x by flip_now, park 4 at 19:19:52 came 1.1 s after its
+        resume at 19:19:50; 91 s decoded, 83 s parked, client gone at 235 s):
+        True = this flip_now waits. The decodes D resumed in THIS D phase
+        (#244's ``_seat_resumed_epoch``, resumed at the wake that began it)
+        must have decoded since that resume at least one measured flip round
+        trip (:meth:`_flip_round_trip_price`, the X-COST-LINE / K_FLIP price).
+        No resumed decode running, the switch off, or no price measured yet
+        (named once): no hold. The waiting arrival keeps its place and its
+        seat (the AGE PLAN reads it as fitting); nothing is rerouted."""
+        if not _asr.min_dwell_enabled():
+            return False
+        epochs = getattr(self, "_seat_resumed_epoch", None) or {}
+        t_res = float(self.t_awake)
+        resumed = {r: t_res for r, e in epochs.items() if e == self.epoch}
+        if not resumed:
+            return False
+        st = self._asr_st()
+        running = [r for r in self._flip_ledger(D) if r not in st["parked"]]
+        if not any(r in resumed for r in running):
+            return False
+        need_s, src = self._flip_round_trip_price()
+        if need_s is None:
+            if st.get("min_dwell_unmeasured") != self.epoch:
+                st["min_dwell_unmeasured"] = self.epoch
+                logger.info("%s MIN-DWELL unmeasured rid=%s src=%s epoch=%d -- no round trip measured "
+                            "yet (no record of this form): no hold, never a constant", _asr.MARKER,
+                            p.rid, src, self.epoch)
+            return False
+        hold = _asr.min_dwell_hold(resumed, running, now, need_s)
+        if hold is None:
+            return False
+        victim, dwell = hold
+        # DP-WAIT (#1416i): a request whose wait spans this hold names min-dwell
+        self._park_dwell_held_t = time.time()
+        if st.get("min_dwell_told") != (p.rid, self.epoch):
+            st["min_dwell_told"] = (p.rid, self.epoch)
+            self.counters["arrival_seat_min_dwell_hold"] += 1
+            logger.warning("%s MIN-DWELL hold rid=%s dwell_s=%.2f need_s=%.2f src=%s resumed_rid=%s "
+                           "resumed_n=%d epoch=%d -- the flip to P waits until the resumed decodes "
+                           "decoded one round trip (ski rental); the arrival keeps its place and seat",
+                           _asr.MARKER, p.rid, dwell, need_s, src, victim,
+                           sum(1 for r in running if r in resumed), self.epoch)
+        return True
+
+    def _p_phase_short_rides(self, p: "Pending") -> bool:
+        """FLIPCYCLE H5 (02.10.): a queued request the P phase takes past its
+        cap -- the same SHORT a D phase would prefill itself (QUEUED-SHORT's
+        filter: route verdict SHORT, uncached <= X, no vision stage, never
+        re-queued, not P-only). Its prefill is P's while P is awake (E2: no D
+        prefill after the flip); it still needs a D seat for its decode, as the
+        QUEUED-SHORT would have."""
+        def _g(k, d=None):
+            return getattr(p, k, d)
+        if not _g("d_eligible", False) or _g("intake_stalled", False) or _g("leg1_done", False):
+            return False
+        if _g("reroutes", 0) or _g("x_requeues", 0) or _g("p_only", False) or _g("x_deferred", False):
+            return False
+        if _g("client_gone", False):
+            return False
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        return 0 <= int(_g("est_uncached", 0) or 0) <= x
+
+    def _asr_queued_short_to_d(self, live_q: List["Pending"], now: float) -> List["Pending"]:
+        """ARRIVAL-SEAT: every queued SHORT whose own route verdict was SHORT
+        (``d_eligible``: uncached <= X, no vision stage, never re-queued) goes
+        to D's admission line like an arrival -- the verdict d_prefill, no
+        flip, no leg 1 (the drain's filter, per request: law 4 holds for each,
+        an arrival's measure). Only while D admits and serves."""
+        if not (self.admit_d and self.state == "serving" and self.awake == "D"):
+            return []
+        d_busy = getattr(self, "x_split", False) and self._d_holds_work()
+        x = self._x_band_floor() if d_busy else int(self.tp_prefill_max_tokens)
+        def _g(p, k, d=None):  # getattr: partial test doubles (phase_policy's convention)
+            return getattr(p, k, d)
+        moved = [p for p in live_q
+                 if _g(p, "d_eligible", False) and not _g(p, "intake_stalled", False)
+                 and not _g(p, "leg1_done", False) and not _g(p, "reroutes", 0)
+                 and not _g(p, "x_requeues", 0) and not _g(p, "p_only", False)
+                 and not _g(p, "x_deferred", False) and 0 <= int(_g(p, "est_uncached", 0) or 0) <= x]
+        for p in moved:
+            try:
+                self.queue.remove(p)
+            except ValueError:
+                continue
+            p.d_direct = True
+            self._ready_for_d.append(p)
+            self.counters["arrival_seat_d_prefill"] += 1
+            self.counters["arrival_seat_queue_to_d"] += 1
+            logger.info("%s rid=%s verdict=%s QUEUED-SHORT uncached=%d X=%d waited=%.1f s -- a queued SHORT "
+                        "goes to D's admission line like an arrival (no flip, no leg 1)", _asr.MARKER, p.rid,
+                        _asr.D_PREFILL, int(p.est_uncached), x, max(0.0, now - float(p.t_arrive)))
+        if moved:
+            self._sync_batch_gate()
+        return moved
+
+    async def _arrival_seat_step_age(self, cands: List["Pending"], x_tok: int,
+                                     now: float) -> Tuple[bool, bool, Optional["Pending"]]:
+        """AGE PLAN, the step for the queued requests that need P, in arrival
+        order: the first one whose elders all are blocked acts -- it fits ->
+        the flip now (a backfill past blocked elders); it does not fit -> its
+        displacement plan (the fewest youngest younger decodes, else nobody,
+        and the next younger one may backfill)."""
+        st = self._asr_st()
+        taken, n = self._arrival_seat_taken()
+        free = _asr.seat_free(taken, n)
+        ordered = sorted(cands, key=lambda c: float(getattr(c, "t_arrive", 0.0) or 0.0))
+        first = ordered[0]
+        for q in ordered:
+            t_q = float(getattr(q, "t_arrive", now) or now)
+            fits_kv, why, deficit = await self._arrival_seat_kv(
+                int(getattr(q, "est_prompt", 0) or 0), _asr.max_tokens_of(getattr(q, "payload", None)),
+                q.rid, int(getattr(q, "est_uncached", 0) or 0))
+            terms = st.get("need_terms")
+            fits = bool(free and fits_kv)
+            st.setdefault("fits", {})[q.rid] = fits
+            older_waiter = any(t < t_q for t in st["waiters"].values())
+            if (q is not first or older_waiter) and not await self._asr_older_blocked(q.rid, t_q, free):
+                break                                   # an older one keeps its right of way
+            st["need_terms"] = terms
+            plan = (None if fits else self._arrival_seat_age_verdict(
+                q.rid, self._asr_arrival_of(q.rid) or t_q, free, 0 if fits_kv else deficit))
+            _x_p = int(getattr(q, "x_routed", 0) or 0)
+            # a plan = D can make it fit by displacing younger ones: admissible
+            v = _asr.verdict(True if plan else free, True if plan else fits_kv,
+                             int(getattr(q, "est_uncached", 0) or 0),
+                             min(x_tok, _x_p) if _x_p > 0 else x_tok)
+            if v == _asr.FLIP_NOW and (self._asr_min_dwell_held(q, self.groups["D"], now)
+                                       or Front._asr_k7_dwell_held(self, q, now)):
+                return False, not self.admit_d, None    # MIN-DWELL: it keeps its place and seat
+            if v == _asr.FLIP_NOW:
+                if st["flip_rid"] != q.rid:
+                    st["flip_rid"] = q.rid
+                    self.counters["arrival_seat_flip_now"] += 1
+                    self._asr_note_need_terms()
+                    if q is not first and fits:
+                        self.counters["arrival_seat_backfill"] += 1
+                    if plan:
+                        self.counters["arrival_seat_age_to_d"] += 1
+                    ms = self._asr_verdict_ms(q.rid, getattr(q, "t_arrive", None), now)
+                    logger.warning("%s rid=%s verdict=%s uncached=%d X=%d taken=%d n=%d %s%s "
+                                   "arrival_to_verdict_ms=%.0f -- D pauses its decodes at the round "
+                                   "boundary and flips to P now (no collect window)", _asr.MARKER, q.rid, v,
+                                   int(getattr(q, "est_uncached", 0) or 0), x_tok, taken, n, why,
+                                   "" if q is first else "; backfill past blocked elders (AGE PLAN)", ms)
+                return True, True, q
+            if fits or plan:
+                break                                   # admissible, not over X: waits as before
+            # plan None: its elders block it -> the next younger one may backfill
+        why_wait = "kv" if free else "seat"
+        if st["wait_rid"] != first.rid or st.get("wait_why") != why_wait:
+            st["wait_rid"], st["wait_why"] = first.rid, why_wait
+            self.counters["arrival_seat_wait_kv" if why_wait == "kv" else "arrival_seat_wait_seat"] += 1
+            logger.info("%s rid=%s verdict=%s why=%s taken=%d n=%d -- no flip: AGE PLAN (the oldest acts "
+                        "first; younger ones only past elders blocked by theirs)", _asr.MARKER, first.rid,
+                        _asr.WAIT_SEAT, why_wait, taken, n)
+        return False, not self.admit_d, None
+
+    async def _arrival_seat_park_youngest(self, D: "Group", wait_s: float, bound: float,
+                                          now: float) -> Optional[str]:
+        """ARRIVAL-SEAT (c): park the YOUNGEST running decode (last admitted to a
+        D seat) at its round boundary on D -- one per bound interval; its front
+        seat is released so the oldest waiter takes it. Returns the parked rid."""
+        st = self._asr_st()
+        if now - float(st["park_t"]) < float(st["park_cooldown"]):
+            return None
+        running = [r for r in self._flip_ledger(D) if r not in st["parked"]]
+        victim = _asr.youngest_running(getattr(self, "_d_admit_t", None) or {}, running)
+        if victim is None:
+            return None
+        got = await self._arrival_seat_park(D, victim, _asr.REASON_YOUNGEST, now, "park",
+                                            park_cooldown=float(bound), bound=bound)
+        if got is not None:
+            self.counters["arrival_seat_youngest_park"] += 1
+            logger.warning("%s YOUNGEST-PARK rid=%s oldest_wait_s=%.1f bound_s=%.1f running=%d -- the youngest "
+                           "decode pauses at its round boundary; its seat goes to the oldest waiter (#246)",
+                           _asr.MARKER, victim, float(wait_s or 0.0), float(bound), len(running))
+            return victim
+        self.counters["arrival_seat_youngest_park_refused"] += 1
+        return None
+
+    async def _arrival_seat_park(self, D: "Group", victim: str, reason: str, now: float, key: str,
+                                 park_cooldown: float, bound: Optional[float] = None) -> Optional[str]:
+        """One named running decode parks at its round boundary on D (SA (3)'s
+        pressure shape): the one park RPC of ARRIVAL-SEAT (c) (``key`` "park")
+        and of the KV displacement (``key`` "kv_park"), each with its own
+        clock. Its front seat is released; the rule counts it parked. Returns
+        the rid, or None when D refused (asked again after 0.5 s)."""
+        st = self._asr_st()
+        if bound is None:
+            bound = self.d_wait_bound_s if self.d_wait_bound_s > 0 else float(self.w_s)
+        body = dict(phase_policy.park_body(self.epoch, bound, reason=reason))
+        body["youngest"] = victim
+        try:
+            code, text = await self.rpc(D, phase_policy.PARK_PATH, body, phase_policy.PARK_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001 -- a failed park is retried, never kills the phase
+            code, text = 0, f"{type(e).__name__}: {e}"
+        verdict, rids, why = phase_policy.park_verdict(code, text)
+        st[key + "_t"] = now
+        if verdict == phase_policy.PARK_PARKED and victim in rids:
+            st["parked"][victim] = now
+            Front._req_book(self).park(victim, now, f"arrival_seat:{reason}", self.epoch)  # DASHBOARD-IPC
+            Front._rb_changed(self)
+            st[key + "_cooldown"] = float(park_cooldown)
+            for s in list(getattr(self, "_d_seats_live", ()) or ()):
+                if s.rid == victim:
+                    s.release("arrival-seat-%s" % reason)
+            return victim
+        st[key + "_cooldown"] = 0.5
+        logger.info("%s PARK refused rid=%s reason=%s verdict=%s status=%s %s -- asked again next tick",
+                    _asr.MARKER, victim, reason, verdict, code, why or (text or "")[:160])
+        return None
 
     def _d_phase_seats_full(self, rid: str, own_seat: bool = False) -> bool:
         """H91c3-3: are the D phase's n seats (H95, ``d_seats.phase_seats`` of
@@ -5364,6 +10999,12 @@ class Front:
         n = getattr(self, "_d_phase_n", None)
         if self.d_wait_bound_s <= 0 or not n:
             return False
+        if _d_seat_rewake_on():
+            # D-SEAT-REWAKE (NF-Operator 30.09.): the wake's n moves live -- a
+            # request past it must reach D, whose WAITING queue is what the
+            # GROW reads; sent to P it was invisible to D. Full = D's cap, the
+            # admitter's seats (as ``_arrival_seat_taken`` counts them).
+            n = self.d_bs
         D = self.groups["D"]
         ready = [p for p in self._ready_for_d if getattr(p, "fut", None) is None or not p.fut.done()]
         taken = (len(self._flip_ledger(D)) + max(0, self._handoff_in_flight()) + len(ready)
@@ -5383,7 +11024,8 @@ class Front:
         from sglang.srt.weg2.retain_publish import d_accepts_leg2 as _acc
         return _acc(self.awake, self.state, self.dormant_admit)   # xsn347: also during the P->D flip
 
-    def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None) -> None:
+    def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None,
+                   t_ready: float = 0.0) -> None:
         """L2.  ``rank`` is this admission's ORDINAL in the current epoch.
 
         Deviation from the spec's wording, stated: the spec asks for the
@@ -5396,8 +11038,16 @@ class Front:
             rank = self._admitted_this_epoch
         self._admitted_this_epoch += 1
         self.counters["d_admits"] += 1  # R28: DP-WAIT d_admitted_during_wait
-        logger.info("WEG2 D-ADMIT rid=%s seat=%d/%d rank=%d oldest_wait_s=%.1f source=%s",
-                    rid, self._seats_in_use(), self.d_bs, rank, max(0.0, time.time() - t_arrive), source)
+        now = time.time()
+        # #244: the seat order "youngest = last admitted to a D seat".
+        if getattr(self, "_d_admit_t", None) is None:
+            self._d_admit_t = {}
+        self._d_admit_t[rid] = now
+        while len(self._d_admit_t) > 4096:
+            self._d_admit_t.pop(next(iter(self._d_admit_t)))
+        _sw = max(0.0, now - (t_ready if t_ready else t_arrive))
+        logger.info("WEG2 D-ADMIT rid=%s seat=%d/%d rank=%d oldest_wait_s=%.1f source=%s seat_wait_s=%.1f",
+                    rid, self._seats_in_use(), self.d_bs, rank, max(0.0, now - t_arrive), source, _sw)
 
     async def d_admitter(self) -> None:
         """Law 2: admit the OLDEST first, ``--d-bs`` at a time, refill on a
@@ -5446,6 +11096,14 @@ class Front:
                     continue
                 if not self._ready_for_d:
                     continue
+                # SA (#244, weg2/seat_age.py): the D line in front-arrival order.
+                from sglang.srt.weg2 import seat_age as _sa
+
+                if _sa.enabled() and len(self._ready_for_d) > 1:
+                    _ordered = _sa.by_age(self._ready_for_d)
+                    if [id(q) for q in _ordered] != [id(q) for q in self._ready_for_d]:
+                        self._ready_for_d.clear()
+                        self._ready_for_d.extend(_ordered)
                 p = self._ready_for_d[0]
                 if p.fut.done():
                     # Already resolved, failed or cancelled (leg 1 error, an
@@ -5454,12 +11112,54 @@ class Front:
                     self._sync_batch_gate()
                     self.counters["d_admit_skipped_done"] += 1
                     continue
+                # SK (#243 (a)): a kept SHORT priced in an earlier epoch is
+                # re-priced before it takes a D seat; gone presence -> P.
+                if getattr(p, "short_kept", False) and self._sk_admission_reprice(p):
+                    self._ready_for_d.popleft()
+                    self._sync_batch_gate()
+                    continue
+                # #243 seam: a hand-off LOST while it waited is not given a seat
+                # when D would have to prefill more than X of it -- fresh on P.
+                if self._hl_check(p, "admit"):
+                    self._ready_for_d.popleft()
+                    self._sync_batch_gate()
+                    continue
                 # FIX 7: the realised count when leg 1 has answered for this
                 # rid, the arrival estimate only for a cold one -- and the
                 # SAME number is charged to the seat below, so the gate and
                 # `_d_charged_since` cannot price one request two ways.
+                _reading = await self._d_reading_if_armed()
+                if (_sa.enabled() and len(self._ready_for_d) > 1
+                        and not self._d_budget_fits(p.est_prompt, _reading,
+                                                    p.leg1_prompt_tokens)):
+                    # SA backfill: the older head does not fit D's free KV; the
+                    # first younger one that does may run (no idle capacity).
+                    # The older keeps its place at the head for the next seat.
+                    # PROBES ONLY (_d_budget_fits, pure): the one gate call
+                    # below prices the request that is then seated, with the
+                    # same derivation the Seat charge uses (FIX 7 C3e).
+                    for _q in list(self._ready_for_d)[1:8]:
+                        if _q.fut.done():
+                            continue
+                        # SK (#243 (a)) holds for a backfilled one too: a kept
+                        # SHORT is re-priced before it can take a seat; gone
+                        # presence -> P (the re-price queued it there).
+                        if getattr(_q, "short_kept", False) and self._sk_admission_reprice(_q):
+                            self._ready_for_d_drop(_q)
+                            self._sync_batch_gate()
+                            continue
+                        if self._d_budget_fits(_q.est_prompt, _reading,
+                                               _q.leg1_prompt_tokens):
+                            self._ready_for_d_drop(_q)
+                            self._ready_for_d.appendleft(_q)
+                            self.counters["seat_age_backfill"] += 1
+                            logger.info("WEG2 SEAT-AGE BACKFILL rid_in=%s older_blocked=%s (the older "
+                                        "request does not fit D's free KV; the younger fits and runs)",
+                                        _q.rid, p.rid)
+                            p = _q
+                            break
                 if self._d_token_budget_blocks(p.rid, p.est_prompt,
-                                               await self._d_reading_if_armed(),
+                                               _reading,
                                                p.leg1_prompt_tokens):
                     # FIX 4a: the seat is not even reached -- taking one and
                     # holding it while the tokens are unavailable would block
@@ -5482,12 +11182,20 @@ class Front:
                     self._d_seat.release()
                     self.counters["d_admit_skipped_done"] += 1
                     continue
+                if self._hl_check(p, "seat"):
+                    # #243 seam: the seat wait is the longest part of the wait
+                    # (255 s on NF rc12r) -- read again with the seat in hand.
+                    self._d_seat.release()
+                    self._ready_for_d.popleft()
+                    self._sync_batch_gate()
+                    continue
                 self._ready_for_d.popleft()
                 self._sync_batch_gate()
                 p.seat = Seat(self, p.rid, "batch",
                               tokens=d_seat_need(p.est_prompt, p.leg1_prompt_tokens)[0])
                 p.posted_evt = asyncio.Event()
-                self._log_admit(p.rid, source="batch", t_arrive=p.t_arrive)
+                self._log_admit(p.rid, source="batch", t_arrive=p.t_arrive,
+                                t_ready=getattr(p, "t_ready", 0.0))
                 p.fut.set_result(True)
                 try:
                     await asyncio.wait_for(p.posted_evt.wait(), POST_BARRIER_S)
@@ -5520,6 +11228,8 @@ class Front:
         at the head, ends the drain and flips (weg2xsn272). ``bound`` 0 =
         today's unbounded await. getattr: partial test fronts have no flag.
         """
+        # DASHBOARD-AUS-IPC (a): the first leg 1 dispatched after a D->P flip.
+        self._ipc_first_work_seen("P", "p_leg1_dispatch", getattr(p, "rid", None))
         bound = float(getattr(self, "p_leg1_stall_s", 0.0) or 0.0)
         if bound <= 0:
             return await post
@@ -5538,7 +11248,12 @@ class Front:
                 t_evidence = max(t_evidence, getattr(self, "_p_leg1_done_t", 0.0))
                 if now - t_sample >= 10.0:
                     t_sample = now
-                    prog = await self._weg2_decode_progress(self.groups["P"])
+                    try:
+                        prog = await self._weg2_decode_progress(self.groups["P"])
+                    except Weg2ProgressUnreachable as e:
+                        # the leg-1 stall bound decides here; an unread counter is an absence
+                        logger.warning("WEG2 P-LEG1 progress unreadable: %s", e)
+                        prog = None
                     if prog is not None:
                         if last_prog is not None and prog != last_prog:
                             t_evidence = now
@@ -5578,9 +11293,10 @@ class Front:
             payload.pop("max_completion_tokens", None)
         g.outstanding[p.rid] = time.time()
         t0 = time.time()
+        Front._req_book(self).leg1_dispatch(p.rid, t0)  # DASHBOARD-IPC: queue_ms ends, p_prefill starts
 
         async def _post() -> Tuple[int, bytes]:
-            async with self.session.post(f"{g.url}{p.path}", json=payload) as resp:
+            async with self.session.post(f"{g.url}{p.path}", json=with_cached_tier_ask(payload, p.path)) as resp:
                 return resp.status, await resp.read()
 
         try:
@@ -5589,6 +11305,7 @@ class Front:
             status, body = await self._leg1_bounded(p, _post())
             if status != 200:
                 raise RuntimeError(f"leg1 on P returned {status}: {body[:300]!r}")
+            p.leg1_ran = True  # SK-X: the W35 premise "after a full P prefill"
             try:
                 js = json.loads(body)
             except Exception:  # noqa: BLE001
@@ -5610,6 +11327,9 @@ class Front:
             # for P's own device tier, and its `prompt_tokens` speaks for
             # a prefill, not for a landing. The witness is D's own
             # `cached_tokens` on leg 2, recorded there.
+            # (W38 is gone since #1400/#1416; the landing is proven at D's
+            # first content of leg 2 -- `_p_anchor_presence`, behind
+            # SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.)
             #
             # `_note_exact` DOES stay: `prompt_tokens` is a TOKENISATION
             # fact (this text is 109,132 tokens), it feeds `carrier_est`,
@@ -5627,8 +11347,35 @@ class Front:
             # and there is nothing to correct here; above the cap the front
             # refuses at admission, before P's prefill is spent.
             g.served += 1
-            logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d",
-                        p.rid, pt, ct, time.time() - t0, self.epoch)
+            self._ipc_note_served("P", pt, ct, 0, cached_tier_of(js))
+            # DASHBOARD-IPC: leg 1's end (P's end for the P->D flip time) and its numbers
+            _t1 = time.time()
+            Front._req_book(self).leg1_done(p.rid, _t1, pt, ct, cached_tier_of(js), d_prefill_seconds(js))
+            Front._ipc_first_work_clock(self).note_p_end(_t1)
+            # D->P flip time (user definition, 02.10.): the first leg 1 after a
+            # D->P flip publishes it; its END is the begin of the first forward
+            # on the FIRST P pipeline stage (PP0) after `done` (progress beacon;
+            # the PP-last stage's start rides along as pp_last_start_ts) --
+            # `missing` without that reading, never this leg's dispatch or
+            # its end minus P's prefill time.
+            _dpc = self._ipc_dp_clock()
+            if _dpc.armed():
+                _dp = _dpc.first_prefill(p.rid, t0, *Front._dp_ppfwd_settle(self))
+                if _dp is not None:
+                    self._ipc_publish("flip_user_time", _dp)
+            logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d%s",
+                        p.rid, pt, ct, time.time() - t0, self.epoch, self._sess_tag(p.rid))
+            # STORE-PRESENCE: ids for a fallback-priced rid, and P's END-ANCHOR for the flush
+            await self._x_exact_backfill(p.rid, p.path, p.payload, p.text)
+            self._p_leg1_store_note(p.rid, p.text, pt)
+            # USAGE-TRUE: every P leg of the rid (re-route, X-REQUEUE, park
+            # hand-back, RESUME-VIA-P alike) adds what P really computed; leg 2
+            # corrects the client's cached count with it. (Leg 2 starts only
+            # after leg 1 returned, so noting it last changes nothing.)
+            self._p_leg_note(p.rid, pt, ct, _ut.tier_split_of(js))
+            # USAGE-DETAILS: a rid that went through P is served LONG (a
+            # re-route of a SHORT verdict included), from this epoch on
+            self._usage_route_note(p.rid, "long", self.epoch, keep_same=True)
         finally:
             g.outstanding.pop(p.rid, None)
 
@@ -5683,6 +11430,168 @@ class Front:
         self.counters["p_prefill_requests"] += 1
         self.counters["p_prefix_tokens_in_store"] += max(0, int(p.store_span_est))
         self.counters["p_prefix_tokens_reused"] += max(0, int(leg1_cached_tokens))
+
+    # -- USAGE-TRUE (weg2/usage_true.py) -------------------------------------
+    def _p_leg_note(self, rid: str, prompt_tokens: int, cached_tokens: int,
+                    tiers: Optional[Dict[str, int]] = None) -> None:
+        """One P leg of ``rid`` ran: add what P computed (prompt - cached).
+        ``tiers``: the tier split P reported for its cache hit (the last P
+        leg's wins). Bounded; an entry ends with the client relay of leg 2."""
+        led = self.__dict__.setdefault("_p_legs_computed", collections.OrderedDict())
+        n, legs, _tiers = led.pop(rid, (0, 0, None))
+        led[rid] = (n + max(0, int(prompt_tokens or 0) - int(cached_tokens or 0)), legs + 1, tiers)
+        while len(led) > 4096:
+            led.popitem(last=False)
+
+    def _p_leg_tiers(self, rid: str) -> Optional[Dict[str, int]]:
+        led = self.__dict__.get("_p_legs_computed")
+        e = led.get(rid) if led else None
+        return None if e is None else e[2]
+
+    # -- USAGE-DETAILS (weg2/usage_true.py) -----------------------------------
+    def _usage_route_note(self, rid: str, route: str, epoch: int, keep_same: bool = False) -> None:
+        """The route of ``rid`` as its last verdict named it, with that
+        verdict's epoch (``keep_same``: an unchanged route keeps its epoch)."""
+        d = self.__dict__.setdefault("_usage_route", collections.OrderedDict())
+        cur = d.get(rid)
+        if keep_same and cur is not None and cur[0] == route:
+            return
+        d.pop(rid, None)
+        d[rid] = (str(route), int(epoch))
+        while len(d) > 4096:
+            d.popitem(last=False)
+
+    def _d_admit_open(self, rid: str, t0: float) -> list:
+        """A leg 2 is admitted to D: its prefill window opens (closed at its
+        first content, else at its end) -- another stream's gap that overlaps
+        it is a ``prefill_d`` interruption."""
+        h = self.__dict__.get("_d_admit_hist")
+        if h is None:
+            h = self.__dict__["_d_admit_hist"] = collections.deque(maxlen=512)
+        e = [str(rid), float(t0), None]
+        h.append(e)
+        return e
+
+    def _usage_details(self, rid: str, stream: bool, obj: dict, reading, p_computed: Optional[int],
+                       t_leg2: float, clock: Optional["_ut.TokenClock"] = None,
+                       tiers: Optional[Dict[str, int]] = None,
+                       reasoning_text: str = "",
+                       first_content: Optional[Tuple[Optional[float], Optional[float]]] = None,
+                       ) -> Dict[str, Dict[str, Any]]:
+        """``usage.total_tokens_details`` (+ the tier split, the reasoning
+        count) of one client answer; logs ``WEG2-USAGE-DETAILS`` once.
+
+        ``flips``: flips begun between the arrival and now (the last token).
+        ``sleep`` / ``sleep_s`` / ``sleep_causes``: the decode's interruptions
+        -- on a stream the token gaps :func:`usage_true.attribute_gaps` names,
+        on a body the flip/park windows overlapping the leg. Never-measured
+        values are omitted, never guessed."""
+        now = time.time()
+        book = Front._req_book(self)
+        row = book._row(rid)
+        arr = row.get("arrival_ts") if row else None
+        since = arr if arr is not None else t_leg2
+        fp = Front._flip_phase(self)
+        flip_w = fp.windows(since, now)
+        park_w = book.park_windows_of(rid, now)
+        det: Dict[str, Any] = {"flips": fp.begun(since, now)}
+        if stream:
+            adm = [(e[1], e[2] if e[2] is not None else now)
+                   for e in (self.__dict__.get("_d_admit_hist") or ())
+                   if e[0] != rid and (e[2] is None or e[2] >= since)]
+            n, s, causes, unnamed = _ut.attribute_gaps(clock or _ut.TokenClock(), flip_w, park_w, adm)
+            for ms in unnamed:
+                self.counters["usage_gap_unnamed"] += 1
+                logger.info("WEG2-USAGE-GAP-UNNAMED rid=%s ms=%d", rid, ms)
+        else:
+            n, s, causes = _ut.attribute_windows(t_leg2, now, flip_w, park_w)
+        det["sleep"], det["sleep_s"], det["sleep_causes"] = int(n), round(float(s), 3), causes
+        if row is not None and arr is not None and row.get("first_dispatch_ts") is not None:
+            det["queue_s"] = round(max(0.0, float(row["first_dispatch_ts"]) - float(arr)), 3)
+        if stream:
+            # the LEG2-FIRST-CONTENT clock (its arrival when it had one)
+            t_fc, a_fc = first_content if first_content is not None else (None, None)
+            if t_fc is None and clock is not None:
+                t_fc = clock.first
+            a_fc = a_fc if a_fc is not None else arr
+            if t_fc is not None and a_fc is not None:
+                det["ttft_s"] = round(max(0.0, float(t_fc) - float(a_fc)), 3)
+        det["p_computed"] = int(p_computed or 0)
+        det["d_computed"] = int(reading[3]) if reading else 0
+        decode_s = None
+        if stream and clock is not None and clock.first is not None:
+            decode_s = max(0.0, (clock.last - clock.first) - s)
+        elif not stream:
+            ps = d_prefill_seconds(obj)
+            if ps is not None:
+                decode_s = max(0.0, (now - t_leg2) - ps - s)
+        if decode_s is not None:
+            det["decode_s"] = round(decode_s, 3)
+            comp = _ut.completion_of(obj)
+            if decode_s > 0 and comp:
+                det["decode_tps"] = round(comp / decode_s, 2)
+        for holder in (obj.get("meta_info"), obj.get("sglext")):
+            if isinstance(holder, dict) and holder.get("spec_accept_length") is not None:
+                try:
+                    det["spec_accept"] = round(float(holder["spec_accept_length"]), 3)
+                except (TypeError, ValueError):
+                    pass
+                break
+        route = (self.__dict__.get("_usage_route") or {}).get(rid)
+        if route is not None:
+            det["route"], det["route_epoch"] = route[0], route[1]
+        adds: Dict[str, Dict[str, Any]] = {"total_tokens_details": det}
+        anth = _ut.wire_of(obj) == "anthropic"
+        if tiers and p_computed is not None and reading:
+            # a flipped request: P's split, trimmed (l3 -> l2 -> device) to sum
+            # to the corrected cached count the client sees. A D-only rid never
+            # gets here -- its split is D's own (the ledger is per rid).
+            tiers = _ut.trim_tiers(tiers, _ut.true_cached(reading[0], reading[1], p_computed)[0])
+        if tiers:
+            if anth:
+                det.update(tiers)  # no standard object on the Anthropic wire
+            else:
+                adds["prompt_tokens_details"] = dict(tiers)
+        u = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+        ctd = u.get("completion_tokens_details")
+        have = (isinstance(ctd, dict) and ctd.get("reasoning_tokens")) or u.get("reasoning_tokens")
+        tok = getattr(getattr(self, "ftok", None), "_tok", None)
+        if not have and reasoning_text and tok is not None:
+            try:
+                nr = len(tok.encode(reasoning_text, add_special_tokens=False))
+            except Exception:  # noqa: BLE001 -- an instrument never breaks serving
+                nr = None
+            if nr is not None:
+                if anth:
+                    det["reasoning_tokens"] = nr
+                else:
+                    adds["completion_tokens_details"] = {"reasoning_tokens": nr}
+        self.counters["usage_details"] += 1
+        logger.info("WEG2-USAGE-DETAILS rid=%s %s%s", rid, _ut.details_log_fields(det),
+                    "".join(f" {k}.{mk}={mv}" for k, m in adds.items()
+                            if k != "total_tokens_details" for mk, mv in m.items()))
+        return adds
+
+    def _p_leg_computed(self, rid: str) -> Optional[int]:
+        """Tokens P computed for ``rid`` over all its P legs; None = no P leg
+        ran (the client relay is then byte-identical)."""
+        led = self.__dict__.get("_p_legs_computed")
+        e = led.get(rid) if led else None
+        return None if e is None else int(e[0])
+
+    def _usage_true_done(self, rid: str, reading: Optional[Tuple[int, int, int, int]],
+                         p_computed: Optional[int]) -> None:
+        """The client relay of ``rid`` ended: one WEG2-USAGE-TRUE line when a
+        P leg ran and a usage reading went out; the ledger entry ends."""
+        led = self.__dict__.get("_p_legs_computed")
+        e = led.pop(rid, None) if led else None
+        if p_computed is None or reading is None:
+            return
+        prompt, d_cached, cached_client, d_computed = reading
+        self.counters["usage_true_corrected"] += 1
+        logger.info("WEG2-USAGE-TRUE rid=%s prompt=%d p_computed=%d d_computed=%d cached_client=%d "
+                    "(was %d) p_legs=%d", rid, prompt, int(p_computed), d_computed, cached_client,
+                    d_cached, int(e[1]) if e else 0)
 
     def _note_exact(self, text: str, prompt_tokens: int) -> None:
         if prompt_tokens <= 0:
@@ -5740,6 +11649,26 @@ class Front:
                    pending: Optional[Pending], single_prefill: bool = False,
                    seat: Optional[Seat] = None) -> web.StreamResponse:
         g = self.groups["D"]
+        # PARK-HANDBACK: a leg whose prefill D would run (no P leg 1); a park
+        # hands it back to P while D holds it unstarted (finally drops it)
+        if (pending is None or getattr(pending, "d_direct", False)) and not single_prefill:
+            self.__dict__.setdefault("_d_prefill_legs", {})[rid] = time.time()
+        _lt = self.__dict__.setdefault("_leg2_text", collections.OrderedDict())  # SEQ-HASH
+        _lt[rid] = text
+        while len(_lt) > 512:
+            _lt.popitem(last=False)
+        if (envs.SGLANG_WEG2_ENABLE_CLIENT_GONE_ABORT.get() and client_gone(request)
+                and not response_complete(request)):
+            # H102 (#58): the client left before its leg 2 was posted (a SHORT
+            # waiting at its gate or seat, a hand-off the watcher had not
+            # ticked yet) -- D is not asked to prefill for it. The seat goes
+            # straight back (the refill point leg 2's finally would be).
+            self.counters["client_gone_pre_d"] += 1
+            if seat is not None:
+                seat.release("client_gone")
+            logger.warning("WEG2-CLIENT-GONE rid=%s state=pre-d action=not-admitted wait_s=%.1f (H102)",
+                           rid, max(0.0, time.time() - pending.t_arrive) if pending is not None else 0.0)
+            return web.json_response({"error": f"WEG2-CLIENT-GONE rid={rid} state=pre-d"}, status=499)
         g.outstanding[rid] = time.time()
         # #1289 round 2: THE SOLO WITNESS for the r_D sample below. `r_D` is
         # D's PREFILL rate -- tokens over the wall of a prefill D ran ALONE --
@@ -5751,6 +11680,9 @@ class Front:
         _solo_adm0 = self._d_admissions
         _solo_entry = len(g.outstanding) == 1
         t0 = time.time()
+        Front._req_book(self).leg2_dispatch(rid, t0)  # DASHBOARD-IPC: d_first_token starts, D prefills
+        Front._rb_changed(self)
+        _adm = self._d_admit_open(rid, t0)  # USAGE-DETAILS: D's prefill window for this leg
         # UNIFY S7 (27B Review V (3)): the X this rid's SHORT grant was decided
         # on (None for a BATCH / re-granted / re-queued leg 2, or switch off).
         _x_grant = self._x_grants.pop(rid, None)
@@ -5804,6 +11736,8 @@ class Front:
                 logger.warning("WEG2 X R_D-PROBE-ERROR rid=%s %s: %s (no sample)",
                                rid, type(e).__name__, e)
 
+        # X-EXACT-BACKFILL: a request priced by chars/3 while the tokenizer loaded gets its ids now
+        await self._x_exact_backfill(rid, request.path, payload, text)
         if pending is not None and pending.skip_leg1:
             single_prefill = True
         if (stream and pending is not None and request.path.startswith("/v1/")
@@ -5822,7 +11756,19 @@ class Front:
             so["include_usage"] = True
             payload["stream_options"] = so
         try:
-            async with self.session.post(f"{g.url}{request.path}", json=payload) as r:
+            if getattr(self, "_rvp_dir", None) is not None:
+                self._rvp_stream_begin(rid)  # ROS-1P
+                if stream:
+                    # VISION hold: the original body, for a P leg with the image
+                    bodies = self._rvp_bodies
+                    bodies[rid] = (request.path, payload)
+                    while len(bodies) > 256:
+                        bodies.pop(next(iter(bodies)))
+            # Feld 2 (Operator 29.09.): the internal hop asks for the tier split;
+            # the client gets it only if it asked itself (strip below).
+            _strip_tier = not cached_tier_asked(payload) and request.path in CACHED_TIER_ASK_PATHS
+            async with self.session.post(f"{g.url}{request.path}",
+                                         json=with_cached_tier_ask(payload, request.path)) as r:
                 # FIX 2 (round 1): LAW 4's RE-ROUTE IS DECIDED BEFORE THE
                 # RESPONSE IS COMMITTED, ON BOTH WIRE SHAPES.  The check used
                 # to sit below the `if stream:` branch, which returns; so for
@@ -5858,12 +11804,42 @@ class Front:
                     # (measured, boot weg2sn5m). Read to the first CONTENT
                     # event instead, bounded; everything read is forwarded
                     # verbatim below.
-                    if request.path == "/v1/messages":
-                        first_chunk, _refused = await _anthropic_refusal_lookahead(r)
-                    else:
-                        first_chunk = await _first_stream_chunk(r)
-                        _refused = first_chunk is not None and x_refusal_marker_in(
-                            first_chunk.decode(errors="replace")
+                    # ROS (weg2/resume_via_p.py ENV_OPEN_STREAM): D holds EVERY
+                    # streamed refusal; while this lookahead runs nothing has
+                    # reached the client, so a hold seen here is answered with
+                    # the X-REQUEUE a fresh refusal gets. None = the old reads.
+                    _ros_stop = self._ros_lookahead_begin(rid)
+                    try:
+                        if request.path == "/v1/messages":
+                            first_chunk, _refused = await _anthropic_refusal_lookahead(r, _ros_stop)
+                        elif _ros_stop is None:
+                            first_chunk = await _first_stream_chunk(r)
+                            _refused = first_chunk is not None and x_refusal_marker_in(
+                                first_chunk.decode(errors="replace")
+                            )
+                        else:
+                            first_chunk = await _read_chunk_watched(r, _ros_stop)
+                            _refused = first_chunk is not None and x_refusal_marker_in(
+                                first_chunk.decode(errors="replace")
+                            )
+                    except _RosHeld:
+                        first_chunk, _refused = None, False
+                    finally:
+                        _ros_rec = self._ros_lookahead_end(rid) if _ros_stop is not None else None
+                    if _ros_rec is not None and _ros_rec.get("reason") == PARK_HANDBACK_REASON:
+                        # PARK-HANDBACK: D held this unstarted prefill at a park;
+                        # closing this leg aborts D's hold, P's batch takes it
+                        g.outstanding.pop(rid, None)
+                        return await self._requeue_park_handback(
+                            request, rid, payload, text, stream, pending, seat)
+                    if _ros_rec is not None:
+                        # held while uncommitted (also when the lookahead ended
+                        # in the same tick): the refusal D would have sent.
+                        self.counters["W50_stream_held_requeued"] += 1
+                        g.outstanding.pop(rid, None)
+                        return await self._requeue_after_x_refusal(
+                            request, rid, payload, text, stream, pending, seat,
+                            _rvp.held_refusal_body(_ros_rec),
                         )
                     if _refused:
                         self.counters["W50_stream_inband_requeued"] += 1
@@ -5871,18 +11847,73 @@ class Front:
                         return await self._requeue_after_x_refusal(
                             request, rid, payload, text, stream, pending, seat, first_chunk
                         )
+                # EB (NF rc12q weg2-14-52): a named D error before any content is
+                # the group's answer, not a stream -- nothing has reached the
+                # client yet, so it gets the status the non-stream twin gets
+                # (503) instead of a 200 with no text. X refusals were handled
+                # above (re-route); this is every other named refusal (W88...).
+                if stream and r.status == 200 and early_body is None and _eb_enabled():
+                    _eb = inband_error_before_content(first_chunk, request.path)
+                    if _eb is not None:
+                        self.counters["leg2_inband_error_before_content"] += 1
+                        g.outstanding.pop(rid, None)
+                        if _eb_reroute_enabled():
+                            # Operator 27.09.: the client gets an ANSWER -- the
+                            # rid goes through P once (the existing X-REQUEUE:
+                            # leg 1 on P, leg 2 on D; a second refusal ends as
+                            # the named W35). D's path is closed (it answered
+                            # terminally, this leg's connection ends here) --
+                            # one path per rid (ROS-1P).
+                            logger.error(
+                                "WEG2 LEG2-ERROR-BEFORE-CONTENT rid=%s path=%s: D answered the stream with "
+                                "a named error before any content; re-routed through P once (no empty "
+                                "200) -- %r", rid, request.path, _eb[:300])
+                            return await self._requeue_after_x_refusal(
+                                request, rid, payload, text, stream, pending, seat,
+                                _eb.encode(errors="replace"))
+                        logger.error(
+                            "WEG2 LEG2-ERROR-BEFORE-CONTENT rid=%s path=%s: D answered the stream with a "
+                            "named error before any content; the client gets 503, not an empty 200 -- %r",
+                            rid, request.path, _eb[:300])
+                        return web.json_response(
+                            {"type": "error",
+                             "error": {"type": STATE_REFUSAL_ANTHROPIC_TYPE,
+                                       "message": f"WEG2 group D refused rid={rid} before any content: "
+                                                  f"{_eb[:400]}"}},
+                            status=503,
+                            headers={"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)})
                 _has_content = (stream and r.status == 200 and early_body is None
                                 and stream_has_content(first_chunk, request.path))
+                _fc: Dict[str, Optional[float]] = {"t": None, "arr": None}  # USAGE-DETAILS: ttft_s
                 if _has_content:
+                    _adm[2] = time.time()  # USAGE-DETAILS: D's prefill of this leg is done
                     # #49 rest, INSTRUMENT (routing unchanged): D's first
                     # content for this leg. Joined by rid with the
                     # ROUTE-VERDICT line (the arrival), it is the
                     # arrival-to-first-token the agent-load boot measures.
-                    logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f",
-                                rid, self.epoch, ("d_direct" if pending is None
-                                                 else "d_single" if single_prefill else "after_p"),
-                                (time.time() - t0) * 1000.0)
-                if _has_content and front_span_inflight() and self.spans.agent_span:
+                    # NF-STAU: arrival -> first token (the user's TTFT), IPC too
+                    _t_arr = self._asr_arrival_of(rid, pop=True)
+                    _fc["t"], _fc["arr"] = time.time(), _t_arr
+                    _ttft = -1.0
+                    if _t_arr is not None:
+                        _ttft = max(0.0, (time.time() - _t_arr) * 1000.0)
+                        _asr.note_ms(self.counters, "ttft", _ttft)
+                    _via = ("d_direct" if pending is None
+                            else "d_single" if single_prefill else "after_p")
+                    logger.info("WEG2 LEG2-FIRST-CONTENT rid=%s epoch=%d via=%s leg2_ms=%.0f ttft_ms=%.0f",
+                                rid, self.epoch, _via, (time.time() - t0) * 1000.0, _ttft)
+                    # DASHBOARD-IPC: the TTFT per via and its parts (front.ttft_by_via)
+                    Front._req_book(self).first_token(rid, time.time(), _via)
+                    Front._rb_changed(self)
+                    # DASHBOARD-AUS-IPC (a): D's first content after a P->D flip = first decode token.
+                    self._ipc_first_work_seen("D", "decode_token", rid)
+                    # X-CREDIT-INFLIGHT-1002: the prompt is realised on D now;
+                    # before the #49 record below, which keeps this anchor.
+                    if (getattr(self, "x_exact", False)
+                            and envs.SGLANG_WEG2_ENABLE_D_INFLIGHT_PRESENCE.get()):
+                        self._d_inflight_presence(rid, text, pending, _via)
+                if (_has_content and front_span_inflight() and self.spans.agent_span
+                        and not Front._ns_isolated(self, rid)):  # Q-530: no cross-tenant credit
                     # #49 rest: D has produced this leg's first content, so it
                     # has PREFILLED the whole prompt into its radix, where a
                     # concurrent request with this prefix matches it (boot
@@ -5902,10 +11933,17 @@ class Front:
                         self.tspans.record_inflight(self.ftok.ids_for(text), self.epoch)
                         self._x_exact_reprice_queue("inflight")
                     self.counters["span_inflight_credited"] += 1
+                if (_has_content and pending is not None and not single_prefill
+                        and envs.SGLANG_WEG2_ENABLE_P_ANCHOR_PRESENCE.get()):
+                    self._p_anchor_presence(rid, text, pending)
                 if stream:
-                    resp = web.StreamResponse(status=r.status)
+                    resp = web.StreamResponse(
+                        status=r.status,
+                        headers=({"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)}
+                                 if r.status == 503 else None))
                     resp.content_type = r.content_type
                     await resp.prepare(request)
+                    request["weg2_prepared"] = True   # W3-STOP: a STOP closes this stream, no 503 after it
                     tail = bytearray()
                     # Q0-B: the Anthropic prompt count arrives ONCE, at the
                     # head of the stream, and the bounded tail below trims the
@@ -5957,28 +11995,106 @@ class Front:
                     # closes, D stops decoding for a client that is gone).
                     client_io = {"gone": False, "finished": False, "early": False,
                                  "err": None, "deadline": 0.0}
+                    # Feld 2: the client only ever gets COMPLETE SSE events; a
+                    # trailing partial one waits for the next read (a chunk that
+                    # ends on an event boundary -- D's normal case -- is one
+                    # endswith, nothing held, nothing parsed). From the finish
+                    # marker on, the written events lose the tier split the
+                    # front asked for (the sglext chunk / message_delta, whose
+                    # head must not have left before the marker). H61's hang-up
+                    # timing is unchanged: the finish event still leaves before
+                    # D's usage.
+                    tier_carry: Optional[bytearray] = bytearray() if _strip_tier else None
+                    # USAGE-TRUE: once a P leg is known for this rid (before the
+                    # stream or, RESUME-VIA-P, during it) the client's copy of
+                    # every usage event carries the prefill really computed; the
+                    # tail and the usage reader above keep D's raw bytes.
+                    usage_fix: Dict[str, Any] = {"c": None, "p": None, "open": True, "det": None}
+                    # USAGE-DETAILS: the client API wires carry the detail
+                    # object on their final usage; /generate only the fix.
+                    _det_on = request.path in CACHED_TIER_ASK_PATHS and r.status == 200
+                    _tclock = _ut.TokenClock()
+                    _want_rsn = getattr(getattr(self, "ftok", None), "_tok", None) is not None
+
+                    def _details(obj: dict, reading) -> Dict[str, Dict[str, Any]]:
+                        _pc = usage_fix["p"]
+                        tiers = (self._p_leg_tiers(rid) if _pc is not None
+                                 else _ut.tier_split_stream_tail(bytes(tail)))
+                        _rs = usage_fix["c"].reasoning if usage_fix["c"] is not None else None
+                        usage_fix["det"] = self._usage_details(
+                            rid, True, obj, reading, _pc, t0, _tclock, tiers,
+                            "".join(_rs or ()), (_fc["t"], _fc["arr"]))
+                        return usage_fix["det"]
+
+                    async def _emit(chunk: bytes) -> None:
+                        p_now = self._p_leg_computed(rid) if usage_fix["open"] else None
+                        if usage_fix["c"] is None and p_now is None and not _det_on:
+                            await _write_client(chunk)  # no P leg: D's bytes as they are
+                            return
+                        if not usage_fix["open"]:
+                            await _write_client(chunk)  # after D's end (TN): as is
+                            return
+                        if usage_fix["c"] is None:
+                            usage_fix["c"] = _ut.StreamCorrector(want_reasoning=_det_on and _want_rsn)
+                        if p_now is not None:
+                            usage_fix["p"] = p_now
+                        chunk = usage_fix["c"].feed(chunk, usage_fix["p"],
+                                                    _details if _det_on and usage_fix["det"] is None else None)
+                        if chunk:
+                            await _write_client(chunk)
+
+                    async def _write_client(chunk: bytes) -> None:
+                        if chunk and r.status == 200:
+                            # FEHLT 3: ANY D content after a P->D flip is its first
+                            # work -- a resumed stream too, not only a new leg's
+                            # first chunk (one dict read while nothing is armed); 200 only.
+                            # FW-PING: content or the end only, never D's keepalive ping
+                            self._ipc_first_work_seen("D", "decode_token", rid,
+                                                      chunk=chunk, path=request.path)
+                        try:
+                            await resp.write(chunk)
+                        except ConnectionError as e:
+                            # aiohttp's ClientConnectionResetError is a
+                            # ConnectionResetError; the drain waiter's
+                            # "Connection lost" is a plain ConnectionError.
+                            client_io["gone"] = True
+                            if not client_io["finished"]:
+                                client_io["early"] = True
+                                client_io["err"] = e
+                                client_io["deadline"] = time.monotonic() + H61B_END_GRACE_S
 
                     async def _push(chunk: bytes) -> None:
                         if anth is not None:
                             anth.feed(chunk)
+                        if usage_fix["open"] and stream_has_content(chunk, request.path):
+                            _tclock.note(time.time())  # USAGE-DETAILS: the token stream's gaps
                         _scan_from = max(0, len(tail) - 64)
                         tail.extend(chunk)
                         if not client_io["finished"] and stream_finish_seen(bytes(tail[_scan_from:])):
                             client_io["finished"] = True
+                        # PARK-DECODE-DWELL: the first chunk D streams in this D
+                        # phase starts the park's decode clock (one compare per chunk).
+                        if self.awake == "D" and self._d_decode_epoch != self.epoch:
+                            self._d_decode_epoch = self.epoch
+                            self._d_decode_t0 = time.time()
+                            self._resume_ms_log.append((self._d_decode_t0 - self.t_awake) * 1000.0)
+                            self._note_park_round_trip()
                         if len(tail) > 262144:
                             del tail[:-131072]
                         if not client_io["gone"]:
-                            try:
-                                await resp.write(chunk)
-                            except ConnectionError as e:
-                                # aiohttp's ClientConnectionResetError is a
-                                # ConnectionResetError; the drain waiter's
-                                # "Connection lost" is a plain ConnectionError.
-                                client_io["gone"] = True
-                                if not client_io["finished"]:
-                                    client_io["early"] = True
-                                    client_io["err"] = e
-                                    client_io["deadline"] = time.monotonic() + H61B_END_GRACE_S
+                            if tier_carry is not None:
+                                if tier_carry or not chunk.endswith(b"\n\n"):
+                                    tier_carry.extend(chunk)
+                                    cut = tier_carry.rfind(b"\n\n")
+                                    if cut < 0:
+                                        return
+                                    chunk = bytes(tier_carry[:cut + 2])
+                                    del tier_carry[:cut + 2]
+                                if client_io["finished"]:
+                                    chunk = strip_cached_tier(chunk, request.path, True)
+                                    if not chunk:
+                                        return
+                            await _emit(chunk)
 
                     async def _next_d_chunk() -> bytes:
                         # Same reads as `r.content.iter_any()`; bounded by the
@@ -5995,20 +12111,54 @@ class Front:
 
                     if early_body is not None:
                         # A non-200 whose body this method already consumed
-                        # for the refusal test: forward it verbatim.
-                        await _push(early_body)
+                        # for the refusal test: forward it (W88/W50 529: a
+                        # named refusal restated as the 503 type).
+                        await _push(restate_inband_refusal(early_body, request.path))
                     else:
                         if first_chunk is not None:
-                            await _push(first_chunk)
+                            self._ipc_out_book().token(rid, time.time())
+                            await _push(restate_inband_refusal(first_chunk, request.path))
                         while True:
                             chunk = await _next_d_chunk()
                             if not chunk:
                                 break
-                            await _push(chunk)
+                            if getattr(self, "_rvp_p_done", None) and rid in self._rvp_p_done:
+                                self._rvp_resumed(rid)
+                            self._park_stuck().note_output(rid)  # #287 NEED0 (c): progress
+                            self._ipc_out_book().token(rid, time.time())  # front.outstanding_stalest
+                            await _push(restate_inband_refusal(chunk, request.path))
+                    if tier_carry and not client_io["gone"]:
+                        await _emit(strip_cached_tier(bytes(tier_carry), request.path, True))
+                    tier_carry = None  # D has ended: anything pushed after this (TN) goes out as is
+                    if usage_fix["c"] is not None and not client_io["gone"]:
+                        _uc_rest = usage_fix["c"].flush(
+                            usage_fix["p"], _details if _det_on and usage_fix["det"] is None else None)
+                        if _uc_rest:
+                            await _write_client(_uc_rest)
+                    usage_fix["open"] = False  # USAGE-TRUE: D has ended, TN goes out as is
                     if client_io["gone"] and not client_io["finished"]:
                         # The client left and D's stream ended without an end
                         # marker: not served, exactly as before H61b.
                         raise client_io["err"]
+                    if not client_io["gone"] and _terminal_named_enabled():
+                        # TN (NF rc12s KRIT3, weg2-3-16/-18): a committed stream
+                        # that ends WITHOUT an answer ends NAMED -- never a bare
+                        # 200 the client reads as an empty answer.
+                        _tn = leg2_terminal_reason(bytes(tail), request.path, client_io["finished"])
+                        if _tn is not None:
+                            _had = stream_error_event_in(bytes(tail), request.path)
+                            if not _had:
+                                await _push(named_error_chunk(
+                                    request.path,
+                                    f"{X_REFUSAL_NAME if _tn == 'W50' else 'W164 Weg2Leg2Truncated'} "
+                                    f"rid={rid}: group D ended this stream without an answer "
+                                    f"({'named X refusal after the first byte' if _tn == 'W50' else 'no end-of-answer marker'}); "
+                                    f"the request was not completed -- retry it"))
+                            self.counters["leg2_terminal_named"] += 1
+                            logger.error(
+                                "WEG2 LEG2-TERMINAL-NAMED rid=%s reason=%s path=%s error_event=%s -- the "
+                                "committed stream ended without an answer and ends named, not as a bare 200",
+                                rid, _tn, request.path, "forwarded" if _had else "synthesized")
                     if not client_io["gone"]:
                         try:
                             await resp.write_eof()
@@ -6052,20 +12202,39 @@ class Front:
                         # tokenisation fact (`carrier_est`); `ct` is what D
                         # did not have to prefill, and it is the only measured
                         # answer to "can D serve this text back".
-                        self.spans.record_presence(text, ct, prompt_tokens=pt,
-                                                   held_epoch=(self.epoch if r.status == 200 and priced
-                                                               and not x_inband else None))
+                        # #59: capped by D's resumable depth (finish chunk).
+                        _held = r.status == 200 and priced and not x_inband
+                        _depth = d_resumable_depth_stream_tail(bytes(tail))
+                        self._note_resumable_depth(rid, pt, ct, _held, _depth)
+                        if not Front._ns_isolated(self, rid):  # Q-530: no cross-tenant credit
+                            self.spans.record_presence(text, ct, prompt_tokens=pt,
+                                                       held_epoch=(self.epoch if _held else None),
+                                                       resumable_depth=_depth)
                         self._note_exact(text, pt)
                         if self.x_exact:
                             self._x_exact_record(rid, text, pt, ct, pending,
-                                                 (self.epoch if r.status == 200 and priced
-                                                  and not x_inband else None))
+                                                 (self.epoch if _held else None),
+                                                 resumable_depth=_depth,
+                                                 seq_mark=d_seq_mark_stream_tail(bytes(tail)))
                     dterms = await self._draft_terms(g, None, rid=rid, uncached=max(0, pt - ct),
                                                      mark=_pfc_mark0)
-                    logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
-                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
+                    self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_stream_tail(bytes(tail)), rid=rid)
+                    Front._req_book(self).d_prefill_s(rid, dterms.get("prefill_s"))
+                    logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
+                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                                 rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
-                                dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
+                                dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"],
+                                self._sess_tag(rid))
+                    if _det_on and usage_fix["det"] is None and priced:
+                        # USAGE-DETAILS: no usage event reached the client (none
+                        # asked for, or it left) -- the line is still written
+                        _rd = _ut.true_cached(pt, ct, usage_fix["p"] or 0)
+                        self._usage_details(
+                            rid, True, {"usage": {"prompt_tokens": pt, "completion_tokens": comp}},
+                            (pt, ct, _rd[0], _rd[1]), usage_fix["p"], t0, _tclock,
+                            None, "", (_fc["t"], _fc["arr"]))
+                    self._usage_true_done(rid, usage_fix["c"].reading if usage_fix["c"] is not None else None,
+                                          usage_fix["p"])
                     # UNIFY S4 (H85): the streamed leg samples r_D too (it never did).
                     if r.status == 200 and priced and not x_inband:
                         _sample_r_d(pt, ct, verdict, dterms)
@@ -6092,12 +12261,15 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
+                self._ipc_note_served_d(pending, pt, ct, comp, cached_tier_of(js), rid=rid)
                 dterms = await self._draft_terms(g, js, rid=rid, uncached=max(0, pt - ct),
                                                  mark=_pfc_mark0)
+                Front._req_book(self).d_prefill_s(rid, dterms.get("prefill_s"))
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
-                            "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
+                            "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
-                            dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
+                            dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"],
+                            self._sess_tag(rid))
                 # #1271 (b): r_D SAMPLE, and ONLY from a prefill D ran ALONE.
                 # A concurrent leg-2 wall would be a latency and must never
                 # enter this deque (#1271 (a)).
@@ -6145,14 +12317,20 @@ class Front:
                     # did not come back.
                     # #49: a 200 D served (not a re-route) leaves the whole
                     # prompt in D's radix for this epoch.
-                    self.spans.record_presence(text, ct, prompt_tokens=pt,
-                                               held_epoch=(self.epoch if r.status == 200 and priced
-                                                           and verdict != "reroute" else None))
+                    # #59: capped by D's resumable depth (the body's field).
+                    _held = r.status == 200 and priced and verdict != "reroute"
+                    _depth = d_resumable_depth(js)
+                    self._note_resumable_depth(rid, pt, ct, _held, _depth)
+                    if not Front._ns_isolated(self, rid):  # Q-530: no cross-tenant credit
+                        self.spans.record_presence(text, ct, prompt_tokens=pt,
+                                                   held_epoch=(self.epoch if _held else None),
+                                                   resumable_depth=_depth)
                     self._note_exact(text, pt)
                     if self.x_exact:
                         self._x_exact_record(rid, text, pt, ct, pending,
-                                             (self.epoch if r.status == 200 and priced
-                                              and verdict != "reroute" else None))
+                                             (self.epoch if _held else None),
+                                             resumable_depth=_depth,
+                                             seq_mark=d_seq_mark(js))
                 if r.status == 200 and pending is not None and verdict == "reroute":
                     self.counters["reroute"] += 1
                     pending.reroutes += 1
@@ -6176,6 +12354,8 @@ class Front:
                         await pending.fut
                     except Weg2Stop as e:
                         return web.json_response({"error": str(e)}, status=503)
+                    except Weg2ClientGone as e:  # H102: the client left during the re-route
+                        return web.json_response({"error": str(e)}, status=499)
                     self._mark_posted(pending)
                     return await self.leg2(request, rid, payload, text, stream, pending, seat=pending.seat)
                 if r.status == 200 and pending is not None and verdict == "W16":
@@ -6187,6 +12367,29 @@ class Front:
                     self.counters["cross_group_prefix_hits"] += 1
                 if not self.identity_checked and pending is not None:
                     self.check_identity()
+                if r.status == 503:
+                    # W88/W50 529: D's non-stream refusal leaves as a 503 with
+                    # Retry-After and the 503 type, never as overloaded_error.
+                    return web.Response(body=restate_inband_refusal(body, request.path),
+                                        status=503, content_type=r.content_type,
+                                        headers={"Retry-After": str(STATE_REFUSAL_RETRY_AFTER_S)})
+                if _strip_tier:
+                    body = strip_cached_tier(body, request.path, False)
+                if r.status == 200:
+                    # USAGE-TRUE: the client's copy carries the prefill really
+                    # computed (P legs + D); USAGE-DETAILS: the client API
+                    # wires carry the detail object on their usage.
+                    _pc = self._p_leg_computed(rid)
+                    _ut_det = None
+                    if request.path in CACHED_TIER_ASK_PATHS:
+                        _tiers = self._p_leg_tiers(rid) if _pc is not None else _ut.tier_split_of(js)
+
+                        def _ut_det(obj, reading, _tiers=_tiers):
+                            return self._usage_details(rid, False, obj, reading, _pc, t0, None, _tiers,
+                                                       _ut._reasoning_piece(obj))
+                    if _pc is not None or _ut_det is not None:
+                        body, _ut_reading = _ut.correct_doc(body, _pc, _ut_det, stream=False)
+                        self._usage_true_done(rid, _ut_reading, _pc)
                 return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Weg2Stop:
             raise
@@ -6195,10 +12398,21 @@ class Front:
             logger.error("WEG2 leg2 rid=%s failed: %s: %s", rid, type(e).__name__, e)
             return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
         finally:
+            if _adm[2] is None:
+                _adm[2] = time.time()  # USAGE-DETAILS: a leg without content ends its window here
             g.outstanding.pop(rid, None)
+            (self.__dict__.get("_d_prefill_legs") or {}).pop(rid, None)  # PARK-HANDBACK
+            self._d_inflight_end(rid)  # X-CREDIT-INFLIGHT-1002
+            Front._req_book(self).leg2_end(rid, time.time())  # DASHBOARD-IPC: front.d_activity
+            Front._rb_changed(self)
             # H91 part C: a parked request that ends (served, aborted, failed)
             # is no longer parked either.
             (getattr(self, "_d_parked", None) or {}).pop(rid, None)
+            # ROS-1P: every RESUME-VIA-P trace of the rid ends with its stream.
+            # (An X-REQUEUE re-enters leg 2 NESTED inside this one and ends
+            # first; ending twice is idempotent.)
+            if stream:
+                self._rvp_stream_end(rid)
             if seat is not None:
                 # C4: THE refill point.  Every exit of leg 2 -- served,
                 # refused, raised, cancelled -- passes here, so a freed seat
@@ -6267,9 +12481,13 @@ class Front:
         # there, so this is not a prose-only effect.
         #
         # So the terminal MOVES TO THE SECOND REFUSAL, where W35 already
-        # stands, and W35's bare 503 becomes this named, measured 413 --
-        # which is what #1291 actually wanted (name it, 4xx not 503) minus
-        # the lap it should never have skipped. Cost, stated honestly: the
+        # stands, and W35's bare 503 becomes this named, measured refusal --
+        # which is what #1291 actually wanted (name it) minus the lap it
+        # should never have skipped. Its STATUS is not the name's: the store
+        # not handing back is state, so it answers 503 + Retry-After, and 413
+        # only when the measured count exceeds the form's static capacity
+        # (`refusal_status`; rc12z30d 21:11:35, 413 on a state fault killed
+        # the client's agent). Cost, stated honestly: the
         # salad class spends its second P prefill again (13 on sb5h).
         # Benefit: the re-offer that sometimes pays is no longer deleted
         # before it is placed.
@@ -6328,15 +12546,31 @@ class Front:
             logger.error("%s", detail)
             if seat is not None:
                 seat.release(NO_ROUTE_NAME)
-            return web.json_response(
-                {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+            return refusal_response(
+                request.path, NO_ROUTE_NAME, detail,
+                refusal_status(carrier_est, self.carrier_max_tokens),
+                {"x_tokens": self.tp_prefill_max_tokens,
                  "carrier_est": carrier_est,
-                 "carrier_max": self.carrier_max_tokens},
-                status=413)
+                 "carrier_max": self.carrier_max_tokens})
+        # SK-X (W35 class, NF rc12t weg2-6-30): W35 says "a second time AFTER
+        # A FULL P PREFILL". A rid whose P leg never ran (a kept SHORT whose
+        # first reroute skipped leg 1) gets the regular P reroute instead --
+        # once: a third refusal is W35 whatever ran (the bound stays).
+        leg1_ran = bool(getattr(pending, "leg1_ran", False)) if pending is not None else False
+        terminal = n > 1 and (leg1_ran or n > 2)
+        if n > 1 and not terminal:
+            self.counters["x_requeue_p_never_ran"] += 1
+        _verdict = ("requeue" if not terminal else ("W53" if handback_empty else "W35"))
         logger.warning(
-            "WEG2 X-REQUEUE rid=%s n=%d verdict=%s", rid, n,
-            "requeue" if n <= 1 else ("W53" if handback_empty else "W35"))
-        if n > 1:
+            "WEG2 X-REQUEUE rid=%s n=%d verdict=%s%s", rid, n, _verdict,
+            (" (P never ran for this rid: not W35, the regular P reroute)"
+             if n > 1 and not terminal else ""))
+        self._rvp_state()
+        logger.warning(
+            "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%s reason=x_refusal path=fresh n=%d "
+            "verdict=%s -- refused before the first byte: re-routed through P (leg 1, then leg 2)",
+            rid, self._front_price.get(str(rid), "?"), d_extent, n, _verdict)
+        if terminal:
             # W35 counts the POPULATION -- every rid D refused a second time
             # after a full P prefill. W53 is the SUBSET of those for which
             # D's own number shows the store handed nothing back. So
@@ -6373,14 +12607,19 @@ class Front:
                 logger.error("%s", detail)
                 if seat is not None:
                     seat.release(HANDBACK_NAME)
-                return web.json_response(
-                    {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+                # W53 is a STATE fault (the store did not hand P's prefill
+                # back), not a size fault: 413 only when P's MEASURED count
+                # exceeds the form's static capacity (rc12z30d 21:11:35 sent
+                # 413 for 17,053 tokens against carrier_max 314,553).
+                return refusal_response(
+                    request.path, HANDBACK_NAME, detail,
+                    refusal_status(measured_whole, self.carrier_max_tokens),
+                    {"x_tokens": self.tp_prefill_max_tokens,
                      "est_uncached": pending.est_uncached,
                      "leg1_prompt_tokens": measured_whole,
                      "d_extent": d_extent,
                      "carrier_max": self.carrier_max_tokens,
-                     "leg1_done": True},
-                    status=413)
+                     "leg1_done": True})
             logger.error("W35 Weg2XReQueueLoop rid=%s: D refused this rid with W31 a second time after a full "
                          "P prefill; refusing by name rather than a third pass. D said: %s",
                          rid, body.decode(errors="replace")[:400])
@@ -6434,6 +12673,27 @@ class Front:
         else:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
+            # NF-STAU-KV (y3v 01:09:44 weg2-28-58, 66.2 s hold): the kept SHORT
+            # had passed the P drain with skip_leg1 (leg1_done=True, no leg 1
+            # ran); re-routed "through P (leg 1, then leg 2)" it kept the flag,
+            # so needs_p() said no and the ARRIVAL-SEAT step never saw it --
+            # no verdict, no flip, D decoded with free seats until an unrelated
+            # arrival flipped 66 s later. Its leg 1 is ahead of it again, as
+            # every other reroute path (HANDOFF-LOST, INTAKE-STALL) says.
+            p.leg1_done = False
+            if getattr(p, "short_kept", False) or getattr(p, "sk_void_seq", None) is not None:
+                # SK-X (W35 class, NF rc12t weg2-6-30): D refused a kept SHORT
+                # before the first byte. Its presence expires with this
+                # refusal: no longer kept, leg 1 runs on P. Only D evidence
+                # recorded after now may price it back to D.
+                p.short_kept = False
+                p.skip_leg1 = False
+                p.sk_void_seq = int(getattr(self.tspans, "seq", 0) or 0) if self.tspans is not None else 0
+                self.counters["short_kept_void_reroute"] += 1
+                logger.warning("WEG2 SHORT-KEPT-VOID rid=%s n=%d d_extent=%s reason=x_refusal (D refused the "
+                               "kept SHORT before the first byte: its presence expired with the reroute -- "
+                               "leg 1 on P; only a fresh D confirmation may price it back to D)",
+                               rid, n, d_extent)
         # Review V A2: THE BACKLOG IS PRICED AT D's MEASURED EXTENT when D said
         # it. D refused because its extent after match_prefix exceeded its
         # riegel; the char estimate above can sit BELOW the live X (and so
@@ -6529,9 +12789,34 @@ class Front:
                     out["prefill_src"] = "server_info"
             self._d_prefill_mark = prefill_clock.advance(
                 getattr(self, "_d_prefill_mark", None), prefill_clock.mark_of(_pfc))
+            self._note_cost_rows(info.get(prefill_clock.COST_STATE_KEY), "D")
         except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
             logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
         return out
+
+    def _note_cost_rows(self, block: Any, side: str) -> None:
+        """X-COST-LINE: take group ``side``'s prefill forwards published since
+        the last read (prefill_clock.cost_since) as rows of its cost line.
+        Every forward counts, whatever else the group ran -- the ring holds
+        prefill forwards only. A ring that wrapped between two reads is
+        counted, not hidden."""
+        if side == "D":
+            new, self._d_cost_mark, lost = prefill_clock.cost_since(block, self._d_cost_mark)
+            rows, every, tag = self._d_cost_rows, self._d_cost_all, "x_cost_rows"
+        else:
+            new, self._p_cost_mark, lost = prefill_clock.cost_since(block, self._p_cost_mark)
+            rows, every, tag = self._p_cost_rows, self._p_cost_all, "x_cost_p_rows"
+        if lost:
+            self.counters[f"{tag}_lost"] += lost
+        for r in new:
+            try:
+                row = (int(r["n"]), int(r.get("cached", 0) or 0), float(r["ms"]))
+            except (KeyError, TypeError, ValueError):
+                self.counters[f"{tag}_bad"] += 1
+                continue
+            rows.append(row)
+            every.append(row)
+            self.counters[tag] += 1
 
     def check_identity(self) -> None:
         """W9 from the store directory: exactly ONE identity suffix on disk.
@@ -6737,9 +13022,15 @@ class Front:
         caller as an ABSENCE, so it can keep the old residency behaviour
         instead of reading "no progress" out of a failed HTTP call and
         manufacturing the very W2 this change exists to prevent.
+
+        No answer within :data:`PROGRESS_READ_TIMEOUT_S` is not an absence but
+        a group that cannot serve a read between two forward passes:
+        :class:`Weg2ProgressUnreachable`, for the caller to name.
         """
         try:
-            async with self.session.get(f"{g.url}/get_server_info") as r:
+            async with self.session.get(
+                    f"{g.url}/get_server_info",
+                    timeout=ClientTimeout(total=PROGRESS_READ_TIMEOUT_S)) as r:
                 info = await r.json() if r.status == 200 else None
             if isinstance(info, list) and info:
                 info = info[0]
@@ -6750,6 +13041,8 @@ class Front:
                 info = st[0]
             blk = info.get("weg2_decode_progress")
             return blk if isinstance(blk, dict) else None
+        except asyncio.TimeoutError as e:
+            raise Weg2ProgressUnreachable(g.name, g.url) from e
         except Exception as e:  # noqa: BLE001 - an instrument never breaks the flip
             logger.debug("weg2 decode progress unavailable: %s: %s", type(e).__name__, e)
             return None
@@ -6775,6 +13068,10 @@ class Front:
         _now = time.time()
         keep = {r for r in g.outstanding if g.name == "D" and r in h91_held
                 and not phase_policy.parked_lapsed(h91_held[r], _now)}
+        # RVP-DRAIN: a W50-held request waits for the P leg this flip starts --
+        # never aborted here (see `_flip_ledger`).
+        if g.name == "D":
+            keep |= {r for r in g.outstanding if r in (getattr(self, "_rvp_inflight", None) or set())}
         parked = sorted(r for r in g.outstanding if r not in keep)
         if not parked:
             return True
@@ -6819,19 +13116,46 @@ class Front:
         emitted tokens or ran forward passes is a WAIT, not a refusal.
         """
         t0 = time.time()
-        before = await self._weg2_decode_progress(g)
         self._drain_progress = None
         # H91 part C: requests D PARKED on the wait bound are not waited for
         # (they continue in D's next phase); `_flip_ledger` is the ledger
         # itself whenever nothing is parked.
         _ledger = getattr(self, "_flip_ledger", None)
+        if (envs.SGLANG_WEG2_ENABLE_DRAIN_EMPTY_SKIP.get()
+                and not (_ledger(g) if _ledger is not None else g.outstanding)):
+            # FLIPCYCLE H1 (02.10.): nothing to wait for -> no window -> the
+            # progress witness (#1317c) is never read. Its blocking
+            # /get_server_info cost D->P p50 81 / p90 400 ms on y6z right after
+            # the park, while D's scheduler ran the post-park publish.
+            self.counters["drain_empty_skip"] += 1
+            logger.info("WEG2-FLIPCYCLE stage=drain group=%s epoch=%d ms=0 floor_ms=0 "
+                        "skipped=ledger-empty (H1: no progress read)", g.name, getattr(self, "epoch", -1))
+            return True
+        try:
+            before = await self._weg2_decode_progress(g)
+        except Weg2ProgressUnreachable as e:
+            self._stop_progress_unreachable(e)
+            return False
         while (_ledger(g) if _ledger is not None else g.outstanding):
             if time.time() - t0 > self.drain_deadline_s:
-                after = await self._weg2_decode_progress(g)
+                try:
+                    after = await self._weg2_decode_progress(g)
+                except Weg2ProgressUnreachable as e:
+                    self._stop_progress_unreachable(e)
+                    return False
                 self._drain_progress = weg2_drain_progress_delta(before, after)
                 return False
             await asyncio.sleep(0.02)  # #1455: 250 ms poll was a quarter of the drain
         return True
+
+    def _stop_progress_unreachable(self, e: "Weg2ProgressUnreachable") -> None:
+        """The drain witness could not be read: stop by name on the W3 path
+        (the group's own entry rank did not answer), no retry, no flip."""
+        self.counters["W3_progress_unreachable"] += 1
+        self.do_stop("W3 Weg2DrainWitnessUnreachable",
+                     f"{e} -- the drain witness (#1317c) of group {e.group} cannot be read, its "
+                     f"entry rank does not answer between two forward passes; stopping by "
+                     f"name instead of a blind DEADMAN_FLIP_STALL (NF z30w-park epoch 113)")
 
     async def quiesce(self, g: Group) -> Tuple[bool, str]:
         """Witness B: poll /flush_cache (200 iff the GROUP's is_fully_idle,
@@ -6860,11 +13184,21 @@ class Front:
                 "proxy(ies) before the flush (fnFL2 v22)", g.name, waited[0], waited[1]
             )
         poll_s, fast = quiesce_poll_s()
+        pending_s = quiesce_pending_poll_s(poll_s, fast)
         polls = 0
+        pending_polls = 0
+        t_pending = None
         while time.time() - t0 < QUIESCE_DEADLINE_S:
             code, body = await self.rpc(g, "/flush_cache", None, 60)
             polls += 1
             if code == 200:
+                if pending_polls:
+                    logger.info(
+                        "WEG2-QUIESCE-PENDING group=%s pending_polls=%d interval_ms=%.0f "
+                        "first_pending_to_200_ms=%.0f (the idle vote was on the ring: re-polled "
+                        "after %.0f ms instead of %.0f, SGLANG_WEG2_QUIESCE_PENDING_POLL_MS)",
+                        g.name, pending_polls, pending_s * 1000.0,
+                        (time.time() - t_pending) * 1000.0, pending_s * 1000.0, poll_s * 1000.0)
                 if fast:
                     logger.info(
                         "WEG2-QUIESCE-FAST group=%s polls=%d ms=%.0f interval_ms=%.0f "
@@ -6874,6 +13208,15 @@ class Front:
                         poll_s * 1000.0)
                 return True, body
             last = body
+            if pending_s is not None and QUIESCE_PENDING_MARK in str(body or ""):
+                # QUIESCE-PENDING: the lap is on the ring -- its landing is read by
+                # the next poll, so that poll goes out at once (#1268 unchanged:
+                # undecided stays not idle, only a 200 ends this loop)
+                pending_polls += 1
+                if t_pending is None:
+                    t_pending = time.time()
+                await asyncio.sleep(pending_s)
+                continue
             await asyncio.sleep(poll_s)  # #1455: the P flush RPC answers in ~5 ms; 500 ms poll cost ~1 s per flip
         return False, last
 
@@ -6987,6 +13330,8 @@ class Front:
             # RC1: D's residue belongs to its capture set (--max-running-requests
             # = this front's --d-bs); P's sample stays as it was.
             vram_residue_capture_bs=(getattr(self, "d_bs", None) if group == "D" else None),
+            # YaRN x2 27B: D's residue names its context when it is not the rig's 262144 (launcher-given)
+            vram_residue_context_tokens=(getattr(self, "d_residue_context_tokens", 0) or None) if group == "D" else None,
             load_witness={
                 "queued": len(self.queue),
                 "outstanding": sum(
@@ -7150,9 +13495,32 @@ class Front:
                 self.measured_record, e,
             )
 
+    @_flip_single_flight
     async def flip(self, src: str, dst: str) -> None:
+        # W98-STOP-FINAL (z30u 07:14:10): a STOP is a named teardown, and no flip
+        # may run after it -- refused BEFORE any effect, the clock unlock
+        # included. (getattr: partial test fronts carry no `state`.)
+        if getattr(self, "state", None) == "STOP":
+            self._refuse_flip_in_stop(src, dst, "before the flip")
+            return
+        # DASHBOARD-IPC (front.flip): the decision -- a D->P park RPC already opened it
+        if Front._flip_phase(self).vorlauf(f"{src}>{dst}", Front._flip_vorlauf_reason(self, src, dst), time.time()):
+            Front._ipc_live_kick(self)
+        # #55 F2: unlock the clocks BEFORE anything of the flip runs -- both groups' legs use the cards.
+        _ic = getattr(self, "_idle_clock", None)
+        if _ic is not None:
+            await _ic.before_flip()
         S, D = self.groups[src], self.groups[dst]
-        self.state = "flipping"
+        # EARLY-FLIP: this D->P flip began before its trigger's verdict (see
+        # _early_flip_maybe); it awaits that verdict before the first sleep RPC
+        _early = self.__dict__.pop("_early_gate", None) if (src, dst) == ("D", "P") else None
+        if not self._enter_state("flipping"):
+            # the STOP landed while the clock unlock was awaited
+            self._refuse_flip_in_stop(src, dst, "during the clock unlock")
+            return
+        # y4y: an arrival during the flip asks WHERE the flip goes, not only who is awake
+        self._flip_dst = dst
+        self._flip_cushion_open(src, dst)
         t_flip0 = time.time()
         # #1262 tier 3: the open flip's identity, for `flip_stall_check`. Not
         # cleared on the exits below -- every one of them leaves `state` at
@@ -7162,20 +13530,53 @@ class Front:
         self._flip_stage = "drain"
         self._flip_marks["drain"] = time.time()
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
+        _dk = self.__dict__.pop("_done_kick_at", None)
+        if _dk is not None and src == "D" and _dk[0] == self.epoch:
+            # DONE-KICK: how long the done -> begin took (the controller's pass,
+            # whatever latch held it) -- the instrument of the fix.
+            logger.info("WEG2-FLIP DONE-KICK begin epoch=%d done_to_begin_ms=%.0f queue=%d",
+                        self.epoch, (t_flip0 - _dk[1]) * 1000.0, len(self.queue))
+        # DASHBOARD-AUS-IPC (a): the begin as a record (IPC thread, not on the flip).
+        # The woken group's first work is timed from here (armed at the begin, not at
+        # `done`: with the tail overlap D can stream before the front logs `done`).
+        self._ipc_publish("flip_begin", {"epoch_before": self.epoch, "sleep": src, "wake": dst,
+                                         "flip_begin_ts": round(t_flip0, 3)})
+        # FLIPZEIT D>P (02.10.): the previous D->P flip's PP reading ends here
+        Front._dp_ppfwd_stop(self, "next_flip_before_forward")
+        _fw_none = self._ipc_first_work_clock().arm(self.epoch + 1, src, dst, t_flip0)
+        Front._flip_phase(self).layer(f"{src}>{dst}", t_flip0, Front._flip_vorlauf_reason(self, src, dst))
+        Front._ipc_live_kick(self)
+        if src == "D" and dst == "P":
+            _live = [q.t_arrive for q in self.queue if getattr(q, "fut", None) is None or not q.fut.done()]
+            self._ipc_dp_clock().begin(self.epoch, t_flip0, min(_live) if _live else None)
+            # DP-NACHLAUF: leg 1 of the queue head goes to the dormant P now
+            if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
+                for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
+                    _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
+                    self.counters["leg1_early"] += 1
+                    logger.info("WEG2 LEG1-EARLY rid=%s epoch=%d (posted at the D->P flip's begin; "
+                                "P holds it dormant, its store prefetch runs beside the legs)",
+                                _ep.rid, self.epoch)
+        if _fw_none is not None:  # FEHLT 3: the previous flip's woken group never worked
+            self._ipc_publish("flip_first_work", _fw_none)
         # H91 part C rule 2: the wake message to D carries the hand-off count
         # (`handoff_n`, plus `parked_n`) on its kv_cache resume -- every one of
         # the three sites below. Unbound call: partial test fronts work too.
         # UNIFY: only the standard form carries the seat counts (qwen27b: {}).
         _wake_extra = (Front._wake_handoff_fields(self, dst)
                        if getattr(self, "standard_form", True) else {})
+        self._seat_last_defer = tuple(_wake_extra.get("park_defer_rids", ()) or ())  # #244
         if _wake_extra:
             # H91c3-3: the phase's n as D derives it (the same pure function)
             self._d_phase_n = phase_policy.d_phase_seats(
                 _wake_extra["handoff_n"], _wake_extra["parked_n"], self.d_bs)
-            logger.info("WEG2 HANDOFF-N epoch=%d wake=%s handoff_n=%d parked_n=%d (the requests the "
+            logger.info("WEG2 HANDOFF-N epoch=%d wake=%s handoff_n=%d parked_n=%d "
+                        "phase_kv_tokens=%s (the requests the "
                         "P phase that just ended handed over, and the wait-bound-parked ones D "
-                        "resumes first; carried on the kv_cache resume to D, H91 part C)",
-                        self.epoch, dst, _wake_extra["handoff_n"], _wake_extra["parked_n"])
+                        "resumes first; carried on the kv_cache resume to D, H91 part C; "
+                        "phase_kv_tokens = their prompt KV, D's #251c stage demand)",
+                        self.epoch, dst, _wake_extra["handoff_n"], _wake_extra["parked_n"],
+                        _wake_extra.get("phase_kv_tokens", "-"))
         # #1350 READING 1 OF 2, at a moment this front already owns. Only at
         # epoch 0: the term is the step the FIRST waking of each group adds, it
         # SATURATES after the first pair (weg2xsn20: 3.16 of 4.46 GiB in the
@@ -7195,6 +13596,8 @@ class Front:
             )
         # 1. drain (W1/W2)
         if not await self.drain(S):
+            if self.state == "STOP":  # W3 Weg2DrainWitnessUnreachable: no W1, no abort, no flip
+                return
             # #1317c PROGRESS BEFORE VERDICT. A window in which D made decode
             # progress is a WAIT, not a refusal: under the standing user law
             # (#1011, "er decoded zuende ... und flippt dann zurueck") a
@@ -7223,7 +13626,7 @@ class Front:
                     self.drain_deadline_s, self.drain_refusals_in_a_row,
                 )
                 self.drain_refusals_in_a_row = 0
-                self.state = "serving" if self.state != "STOP" else "STOP"
+                self._enter_state("serving")
                 return
             if not await self._abort_parked_on_drain(S, src):
                 self.drain_refusals_in_a_row += 1
@@ -7234,7 +13637,7 @@ class Front:
                              self.counters.get("suspended_now", 0), self.drain_refusals_in_a_row)
                 if self.drain_refusals_in_a_row >= 3:
                     self.do_stop("W2 Weg2DrainStuck", f"three W1 in a row on {src}: {sorted(S.outstanding)[:8]}")
-                self.state = "serving" if self.state != "STOP" else "STOP"
+                self._enter_state("serving")
                 return
         self.drain_refusals_in_a_row = 0
         # 2. quiesce + double witness (W3)
@@ -7255,6 +13658,12 @@ class Front:
                          f"{wv}: front ledger {sorted(S.outstanding)} vs group({src}) "
                          f"flush_cache (reduced over every rank, #1268) -> {msg[:400]!r}")
             return
+        if _early is not None:
+            # EARLY-FLIP: drain + quiesce ran beside the trigger's pricing; nothing
+            # has slept yet -- the verdict decides whether the first sleep RPC goes
+            if not await Front._early_flip_gate(self, _early, t_flip0):
+                Front._early_flip_abort(self, _early, src, dst)
+                return
         t_q = time.time()
         # 3. THE GATHERED LEGS (C9, spec Amendment A1-1).  src.pause(kv_cache)
         # first, then ONE /release_memory_occupation to S and ONE
@@ -7317,6 +13726,11 @@ class Front:
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
             return
+        # ANCHOR-LOST (y6z 08:24:41): the KV release leg runs the flush that drops
+        # un-backed anchors, so ITS answer carries them (the group fence reads the
+        # ledger once and clears it) -- the family leg's answer came back empty
+        # and the front retracted nothing (13 lost on D, 0 PRESENCE-ANCHOR-LOST).
+        _kv_lost = anchors_lost(body)
         family = list(self.weights_tags)
         # #1233 fix 4 ON THE RING FORM.  The tight-card-first order survives the
         # move to gathered legs (C9); the serial per-tag RPC loop it used to
@@ -7399,6 +13813,7 @@ class Front:
         flip_epoch = credit_epoch(self.boot_epoch, self.epoch)
         t_gather0 = time.perf_counter()
         _kv_task = None   # fnFL2x83: the kv wake chained on the waker's leg (gathered form only)
+        _kv_fused = False  # FLIPCYCLE H6: set by the gathered form only
         if self.weights_resident:
             # Scheibe 6a: no weights family to move -- both layouts stay mapped.
             s_code = w_code = 200
@@ -7435,6 +13850,12 @@ class Front:
             # call after the legs -- either way the held requests' loads overlap
             # the legs. The post-legs kv call below stays (idempotent per epoch).
             from sglang.srt.weg2.wake_kv import early_send_on as _kv_early_on
+            # FLIPCYCLE H6: kv_cache rides the waker's weights leg (late site)
+            _kv_fused = bool(envs.SGLANG_WEG2_ENABLE_WAKE_KV_FUSED.get()) and not bool(_kv_early_on())
+            _w_payload = dict({"tags": list(pause_order) + ([KV_TAG] if _kv_fused else []),
+                               "epoch": flip_epoch}, **_wake_extra)
+            if _kv_fused:
+                _w_payload["kv_late"] = True
             _legs = [
                 self.timed_rpc(S, "/release_memory_occupation",
                                {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
@@ -7451,8 +13872,17 @@ class Front:
                 # the interleave happened to return the natural order, which is
                 # why leg 0 never showed it. `family` (natural order) remains
                 # the permutation check's reference above.
-                self.timed_rpc(D, "/resume_memory_occupation",
-                               {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
+                # WT2 (30.09., NF y4g): the WEIGHTS leg carries the seat counts
+                # too. Without them D's first request of the wake set the cap
+                # form (S0, 10 bank rows) on the paused bank, the tags mapped
+                # it, and the kv leg that carried n then moved the LIVE bank
+                # (10 -> 20/16/15 or -> 6/7 rows: device sync behind the draft
+                # unpark's 1.5 GB H2D, unmap/map of 144-576 cells): seat_vram
+                # median ~140 ms, 611/1482 ms, inside cg_resume. With n on
+                # the first request the bank is planned while paused and
+                # mapped once by its tag; the kv leg changes nothing
+                # (d_seat_vram.on_wake: has_n). {} for P and for qwen27b.
+                self.timed_rpc(D, "/resume_memory_occupation", _w_payload, RPC_TIMEOUT_S),
             ]
             _kv_early = bool(_kv_early_on())
             if _kv_early:
@@ -7474,7 +13904,7 @@ class Front:
             _w_task = _leg_tasks[-1]
             (w_code, w_body, w_ms) = await _w_task
             _kv_task = None
-            if w_code == 200:
+            if w_code == 200 and not _kv_fused:
                 self._flip_marks["wake-kv-issued"] = time.time()
                 _kv_task = asyncio.ensure_future(self.leg_rpc(
                     D, "/resume_memory_occupation",
@@ -7488,6 +13918,12 @@ class Front:
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
         w_done, w_per_tag, w_crit = completed_tags(w_body)
+        _lost_all = sorted(set(anchors_lost(s_body)) | set(_kv_lost))
+        if src == "D":
+            self._retract_lost_anchors(_lost_all)
+        elif src == "P" and s_code == 200:
+            # STORE-PRESENCE: P's flush published its END-ANCHORs (L2/L3, shared)
+            self._p_flush_store_presence(_lost_all)
         sleep_ms += s_ms
         wake_ms += w_ms
         if s_code != 200 or w_code != 200:
@@ -7542,7 +13978,14 @@ class Front:
         t0 = time.time()
         self._flip_stage = "wake-kv"
         self._flip_marks["wake-kv"] = time.time()
-        if _kv_task is not None:
+        if _kv_fused:
+            # FLIPCYCLE H6: the weights leg resumed kv_cache at its late site; a
+            # refused resume made that leg non-200 (z30y7) and stopped above
+            code, body = w_code, w_body
+            logger.info("WEG2-FLIPCYCLE stage=wake-kv dir=%s>%s epoch=%d ms=0 floor_ms=0 fused=1 "
+                        "(H6: kv_cache resumed inside the waker's weights leg, no second RPC)",
+                        src, dst, self.epoch)
+        elif _kv_task is not None:
             # fnFL2x83: issued the moment the waker's weights leg returned
             code, body = await _kv_task
         else:
@@ -7555,6 +13998,9 @@ class Front:
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
             return
+        if dst == "D":
+            # PDFLIP-E3: D's beacons at awake -- its first result may land before done
+            self.__dict__["_pd_dsnap"] = (Front._group_beacons(self, "D"), float(t_w))
         # #1455: the residue measurement (NVML + host image) runs AFTER the wake answered -- it is
         # instrumentation, not a precondition; ~250 ms off the critical path.
         # 27B flipfast F1: and once nothing gates on it any more, OFF the flip
@@ -7608,7 +14054,15 @@ class Front:
         self.awake = dst
         self.epoch += 1
         self.admit_d = True
-        self.state = "serving"
+        if not self._enter_state("serving"):
+            # W98-STOP-FINAL (z30u 07:14:10 -> 136 requests served after a W98):
+            # a STOP that fell INTO this flip stays the end state. The bookkeeping
+            # below still runs -- the legs happened, `awake`/`epoch` are facts.
+            self.counters["flip_ended_in_stop"] += 1
+            logger.error(
+                "WEG2-FLIP ENDED-IN-STOP epoch=%d slept=%s woke=%s stop=%s -- the STOP "
+                "was raised while this flip ran; the front stays in STOP (no return "
+                "to serving after a named teardown)", self.epoch, src, dst, self.stop)
         if self.x_exact:
             # X-EXACT: a held (#49) credit is bound to its epoch -- re-price
             # the queue against the new one (PK's needs_p reads est_uncached).
@@ -7627,7 +14081,15 @@ class Front:
                         "requests before the new ones)", self.epoch, len(_h91_parked),
                         sorted(_h91_parked)[:8])
             self.counters["d_parked_resumed"] += len(_h91_parked)
+            self._park_resume_epoch = self.epoch
+            Front._seat_rotate_note_resume(self, list(_h91_parked))  # #244
             _h91_parked.clear()
+        if dst == "D":
+            self._asr_clear_parked("flip-to-D")  # NF-STAU: D resumed every park
+            # DASHBOARD-IPC: every park the front booked ends with D awake again
+            _rb = self.__dict__.get("_req_book_obj")
+            if _rb is not None:
+                Front._rb_resume(self, _rb.parked(), "flip_to_d")
         # 27B flipfast F3: after a D->P flip the controller that awaits it starts
         # P's drain at once instead of one tick later (no-op with the switch off).
         # NOT after P->D: nothing on D waits for the controller there (leg 2 is
@@ -7635,6 +14097,14 @@ class Front:
         # the admitter for requests still in _ready_for_d.
         if dst == "P":
             self._kick_controller("after_flip")
+        elif Front._done_kick_due(self):
+            # DONE-KICK (02.10., N5q epoch 4): P-bound work queued while this
+            # P->D flip ran (its arrival kick was spent on a controller pass that
+            # saw state=flipping). Wake the controller now: the D-branch decision
+            # -- economics, MIN-DWELL, fairness, the hand-off window -- runs
+            # unchanged, only not one 0.2 s tick later. Held like the arrival
+            # kick while prefilled requests wait in _ready_for_d.
+            Front._done_kick(self, dst)
         # #1262 tier 3: the flip is closed, so there is nothing open to stall.
         self._flip_t0 = None
         self._flip_stage = "none"
@@ -7648,6 +14118,20 @@ class Front:
             logger.info("WEG2-FLIP-TIMELINE epoch=%d slept=%s woke=%s ms-from-begin: %s done@%.0f "
                         "(stage@t = the moment that stage BEGAN; the D readmission continues on D after done)",
                         self.epoch, src, dst, _parts, (self.t_awake - _b) * 1000)
+            # FLIPCYCLE (02.10.): each serial stage with its physics floor, one
+            # line per stage (FLIPZYKLUS-PHYSIK-NF-1002.md): software stages 0,
+            # the legs the x4 link's bytes / rate (SGLANG_WEG2_FLIPCYCLE_LEGS_FLOOR_MS)
+            _ends = [k for k in _order if k in _m] + ["done"]
+            _at = dict(_m)
+            _at["done"] = self.t_awake
+            _legs_floor = int(envs.SGLANG_WEG2_FLIPCYCLE_LEGS_FLOOR_MS.get())
+            for _i, _k in enumerate(_ends[:-1]):
+                _ms = (_at[_ends[_i + 1]] - _at[_k]) * 1000
+                logger.info("WEG2-FLIPCYCLE stage=%s dir=%s>%s epoch=%d ms=%.0f floor_ms=%d",
+                            {"gathered-legs": "legs"}.get(_k, _k), src, dst, self.epoch, _ms,
+                            _legs_floor if _k == "gathered-legs" else 0)
+            logger.info("WEG2-FLIPCYCLE stage=total dir=%s>%s epoch=%d ms=%.0f floor_ms=%d",
+                        src, dst, self.epoch, (self.t_awake - _b) * 1000, _legs_floor)
         except Exception:  # noqa: BLE001 -- a timeline never breaks a flip
             pass
         _dp_drain_end = self._flip_marks.get("quiesce")  # R28: drain(S) returned here
@@ -7693,6 +14177,26 @@ class Front:
             # while it is in flight (dc_mib {} until then, never a fake zero).
             rec["dc_off_path"] = True
         self.flip_log.append(rec)
+        # DASHBOARD-AUS-IPC (a): the flip_log record as `flip_done` (same begin stamp).
+        from sglang.srt.weg2 import front_state_ipc as _fsi
+        self._ipc_publish("flip_done", _fsi.flip_done_payload(rec, t_flip0))
+        self._ipc_first_work_clock().done(time.time())  # FEHLT 3: pairs with one flip_first_work
+        self._ipc_dp_clock().done(time.time())
+        if src == "P" and dst == "D":
+            # PDFLIP-E3 (N5f first P->D 13:30:17: non-stream requests, no D chunk the
+            # front could time): D's first forward after done from D's beacons
+            _dsnap, _dt0 = self.__dict__.pop("_pd_dsnap", None) or (None, 0.0)
+            if _dsnap is None or time.time() - _dt0 > 300.0:   # none / left over from an aborted flip
+                _dsnap, _dt0 = Front._group_beacons(self, "D"), time.time()
+            if _dsnap is not None:
+                _dt = asyncio.get_running_loop().create_task(
+                    Front._watch_d_first_forward(self, _dsnap, _dt0))
+                self._dc_tasks.add(_dt)
+                _dt.add_done_callback(self._dc_tasks.discard)
+        Front._flip_phase(self).done(time.time())  # DASHBOARD-IPC: Layer -> Nachlauf
+        if src == "D" and dst == "P":
+            Front._dp_ppfwd_arm(self, t_flip0)  # FLIPZEIT D>P: P's first stage's first forward from here
+        Front._ipc_live_kick(self)
         if dc_off_path:
             _t = asyncio.get_running_loop().create_task(self._dc_reading_off_path(src, S.sid, rec))
             self._dc_tasks.add(_t)
@@ -7730,6 +14234,7 @@ class Front:
                     rec["sleep_leg_ms"], rec["wake_leg_ms"], rec["overlap_ms"], rec["overlap_pct"],
                     rec["critical_path"], rec["flip_ms"], len(self.weights_tags),
                     "off-path" if dc_off_path else dc)
+        self._flip_cushion_close()
         if src == "D" and dst == "P":
             self._dp_report(t_flip0, _dp_drain_end)
 
@@ -7766,7 +14271,8 @@ class Front:
             p.dp_arrival = None
             try:
                 dec = _dp_wait.decompose(a, t_flip0, t_drain_end, self.t_awake)
-                by = _dp_wait.hold_by(a, self.counters)
+                by = _dp_wait.hold_by(a, self.counters, t_flip0=t_flip0,
+                                      dwell_held_t=getattr(self, "_park_dwell_held_t", None))
                 logger.info("%s", _dp_wait.line(
                     p.rid, self.epoch, a, dec, by, self.counters, p.est_prompt,
                     p.est_uncached, p.store_span_est, p.span_known))
@@ -7806,6 +14312,37 @@ class Front:
                 return ms, prov
         return 0.0, "none-first-flip"
 
+    def _k7_dwell_idle_skip(self, awake_ms: float, need_ms: float) -> bool:
+        """K7-DWELL skip on the classic D-branch (27B 02.10., N5j; the seat
+        path has its own, :meth:`_asr_k7_dwell_held`): IDLE D NEVER HOLDS. The
+        D->P min-dwell exists only so D's running decodes progress; with none
+        running (the flip ledger of D), no hand-off in flight and nothing
+        prefilled in ``_ready_for_d`` a hold is pure Vorlauf, so the flip goes
+        at once. Switch SGLANG_WEG2_K7_DWELL_IDLE_SKIP (default on)."""
+        if not envs.SGLANG_WEG2_K7_DWELL_IDLE_SKIP.get():
+            return False
+        D = self.groups.get("D") if isinstance(getattr(self, "groups", None), dict) else None
+        if D is None:
+            return False
+        _fl = getattr(self, "_flip_ledger", None)
+        d_running = len(_fl(D)) if callable(_fl) else len(getattr(D, "outstanding", None) or ())
+        _hof = getattr(self, "_handoff_in_flight", None)
+        handoff = max(0, int(_hof())) if callable(_hof) else 0
+        ready = len(getattr(self, "_ready_for_d", None) or ())
+        if d_running or handoff or ready:
+            return False
+        _c = getattr(self, "counters", None)
+        if isinstance(_c, dict):
+            _c["arrival_seat_k7_dwell_skip_idle"] = _c.get("arrival_seat_k7_dwell_skip_idle", 0) + 1
+        if getattr(self, "_k7_skip_told", None) != getattr(self, "epoch", -1):
+            self._k7_skip_told = getattr(self, "epoch", -1)
+            q = getattr(self, "queue", None) or ()
+            logger.info("WEG2 ARRIVAL-SEAT K7-DWELL skip rid=%s d_running=0 awake_ms=%d min_dwell_ms=%d "
+                        "epoch=%d handoff=0 ready_for_d=0 (idle D: the dwell would be pure Vorlauf)",
+                        getattr(q[0], "rid", "-") if q else "-", int(awake_ms), int(need_ms),
+                        int(getattr(self, "epoch", -1)))
+        return True
+
     def _dwell_ok(self, src: str, dst: str, fairness_fired: bool,
                   work_exhausted: bool, oldest_wait_s: float) -> bool:
         """C8, with its two NAMED overrides.
@@ -7818,7 +14355,17 @@ class Front:
         need, prov = self._derived_min_dwell_ms(src, dst)
         awake_ms = (time.time() - self.t_awake) * 1000.0
         overridden = "none"
-        if fairness_fired:
+        if src == "D" and awake_ms < need and Front._k7_dwell_idle_skip(self, awake_ms, need):
+            # K7-DWELL skip on the classic D-branch: the dwell amortises a flip
+            # over D's decodes -- an idle D has none, holding it only delays P work
+            overridden = "d_idle"
+        elif fairness_fired and getattr(self, "_park_attempt_epoch", None) == self.epoch \
+                and Front._x_excursion_band_off(self):
+            # PDFLIP-B: admission was closed by this phase's own park, whose trigger
+            # already passed the derived min-dwell (_immediate_park_due) -- not a
+            # fairness wait (N5d: overridden_by=fairness with oldest_wait_s=0.0)
+            overridden = "park"
+        elif fairness_fired:
             overridden = "fairness"
         elif work_exhausted and self.w_s > 0 and oldest_wait_s >= self.w_s:
             overridden = "work"
@@ -7827,7 +14374,12 @@ class Front:
         # request P can never hold, the D->P legs ran into W35/W68 and both
         # groups died. A floor under every override: the woken group keeps
         # the cards for at least FAIRNESS_DWELL_FLOOR_MS.
-        ok = awake_ms >= need or (
+        if (src == "D" and overridden in ("park", "fairness") and envs.SGLANG_WEG2_PARK_NO_DWELL.get()
+                and getattr(self, "_park_attempt_epoch", None) == self.epoch):
+            # PARK-NO-DWELL: this D phase already parked its decodes for an arrival
+            # over X -- the flip that serves it follows at once, no floor
+            overridden = "park_no_dwell"
+        ok = awake_ms >= need or overridden in ("d_idle", "park_no_dwell") or (
             overridden != "none" and awake_ms >= FAIRNESS_DWELL_FLOOR_MS
         )
         logger.info("WEG2 MIN-DWELL src=%s dst=%s awake_ms=%d derived_from_flip_ms=%d overridden_by=%s "
@@ -7945,6 +14497,8 @@ class Front:
             derive_x_star,
         )
 
+        if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
+            return self._resolve_x_cost_line()
         s = self._x_samples
         if not (s["r_d"] and s["r_p"] and s["flip_s"]):
             missing = [k for k in ("r_d", "r_p", "flip_s") if not s[k]]
@@ -8015,6 +14569,225 @@ class Front:
         )
         return x
 
+    def _x_cost_line_of(self, rows: Deque[Tuple[int, int, float]],
+                        every: Deque[Tuple[int, int, float]], seed: Optional[dict]
+                        ) -> Tuple[Optional[dict], str]:
+        """One group's cost line and its source: LIVE fit over the recent
+        ``rows`` > the WHOLE BOOT's fit over ``every`` (the window lacked the
+        spread, 27B review of 800bb82ac6) > RECORD ``seed`` of this checkpoint
+        x form > ``None``. Every fallback names why the step before refused."""
+        def _fit(src):
+            return phase_policy.fit_cost_line(
+                src, min_tokens=envs.SGLANG_WEG2_X_COST_FIT_MIN_TOKENS.get(),
+                min_samples=envs.SGLANG_WEG2_X_COST_FIT_MIN_SAMPLES.get(),
+                min_spread=envs.SGLANG_WEG2_X_COST_FIT_MIN_SPREAD.get(),
+                min_big=envs.SGLANG_WEG2_X_COST_FIT_MIN_BIG.get())
+
+        line, why = _fit(rows)
+        if line is not None:
+            return line, f"live:{why}:n={line['n']}"
+        line, why_all = _fit(every)
+        if line is not None:
+            return line, f"boot:{why_all}:n={line['n']}(window {why})"
+        if seed is not None:
+            return seed, f"record:{seed['boot_tag']}@{seed['at']}(window {why}; boot {why_all})"
+        return None, f"none(window {why}; boot {why_all})"
+
+    def _flip_round_trip_price(self) -> Tuple[Optional[float], str]:
+        """The measured flip round trip in seconds and its source -- X-COST-
+        LINE's (and so K_FLIP's) price, and ARRIVAL-SEAT MIN-DWELL's need: the
+        WARM legs of this boot (K7's D->P + P->D medians + the wake -> first
+        chunk) > the RECORD of this checkpoint x form > None (unmeasured,
+        named). Never a constant."""
+        dp_ms, pd_ms, resume_ms, legs_src = self._park_warm_legs_ms()
+        price = phase_policy.park_round_trip_s(dp_ms, pd_ms, resume_ms)
+        if price is not None:
+            return price, f"ski-live:{legs_src}"
+        if self._park_rt_seed is not None:
+            return (float(self._park_rt_seed["round_trip_s"]),
+                    f"ski-record:{self._park_rt_seed['boot_tag']}@{self._park_rt_seed['at']}")
+        return None, f"none:{legs_src}"
+
+    def _x_cost_inputs(self) -> Tuple[Optional[dict], str, Optional[float], str, float, str]:
+        """X-COST-LINE's inputs with their sources: ``(line, line_src, price_s,
+        price_src, k, k_src)``. Every one is LIVE > RECORD of this checkpoint x
+        form > missing (``None``) -- never a constant; ``k`` without any
+        measurement is 1 (no amortisation), named as such."""
+        line, line_src = self._x_cost_line_of(self._d_cost_rows, self._d_cost_all,
+                                              self._x_cost_seed)
+        price, price_src = Front._flip_round_trip_price(self)  # class-bound: tests drive it on a namespace
+        cap = float(self.p_phase_max_requests) if self.p_phase_max_requests else float("inf")
+        if self._p_phase_k:
+            k = min(cap, max(1.0, statistics.mean(self._p_phase_k)))
+            k_src = f"live:mean-of-{len(self._p_phase_k)}"
+        elif self._x_cost_seed is not None and float(self._x_cost_seed.get("k", 0) or 0) >= 1.0:
+            k = min(cap, float(self._x_cost_seed["k"]))
+            k_src = "record"
+        else:
+            k, k_src = 1.0, "none(1=no-amortisation)"
+        self._x_k_hist = (k, k_src)
+        if x_k_flip_enabled():
+            # X-K-FLIP: the X in force is the LONE request's (k_flip=1); the
+            # riders of a flip are priced per decision (_x_for_flip). The
+            # boot's mean P phase is shown, never amortised over.
+            return line, line_src, price, price_src, 1.0, f"flip:1(lone) hist={k:.2f}[{k_src}] display-only"
+        return line, line_src, price, price_src, k, k_src
+
+    def _resolve_x_cost_line(self) -> Optional[int]:
+        """X-COST-LINE's re-solve (see phase_policy): X* from D's cost line at
+        the depth D prefills at, the ski round trip amortised over k, and P's
+        own cost line on PP0 (compute-honest; the drain r_P only while P has
+        neither a fit nor a record, named). Clamped to [the fitted range's
+        lower edge, the ceiling] -- below the lowest measured forward the line
+        is extrapolation, so that edge, not 4096, is the floor. Prints every
+        input with its source."""
+        line, line_src, price, price_src, k, k_src = self._x_cost_inputs()
+        line_p, line_p_src = self._x_cost_line_of(self._p_cost_rows, self._p_cost_all,
+                                                  self._x_cost_seed_p)
+        r_p_s = self._x_samples["r_p"]
+        missing = [name for name, v in (("d_cost_line", line), ("round_trip", price),
+                                        ("p_cost_line_or_r_p", line_p or r_p_s or None))
+                   if v is None]
+        if missing:
+            if missing != self._x_cost_last_missing:
+                self._x_cost_last_missing = missing
+                logger.warning(
+                    "WEG2 X COST-LINE NO-SOLVE: no %s yet, so X stays at %d (line=%s price=%s "
+                    "k=%.2f[%s] P line=%s r_P n=%d)", " and ".join(missing),
+                    self.tp_prefill_max_tokens, line_src, price_src, k, k_src, line_p_src,
+                    len(r_p_s))
+            return None
+        self._x_cost_last_missing = []
+        r_p = statistics.median(r_p_s) if r_p_s else None
+        p_src = (f"P line a={float(line_p['a_ms']):.0f}ms b={float(line_p['b_ms']):.3f} "
+                 f"c={float(line_p['c_ms']):.4f} [{line_p_src}]" if line_p is not None
+                 else f"r_P drain={r_p:.0f} (median of {len(r_p_s)}; P line {line_p_src})")
+        live_prefix = [p for n, p, _ in self._d_cost_rows
+                       if n >= envs.SGLANG_WEG2_X_COST_FIT_MIN_TOKENS.get()]
+        prefix = (statistics.median(live_prefix) if live_prefix
+                  else float(line.get("prefix_med", 0) or 0))
+
+        def _solve(depth: float) -> Tuple[Optional[float], str]:
+            return phase_policy.solve_x_cost_line(
+                price_s=price, k=k, line=line, r_p=r_p, prefix_tokens=depth, line_p=line_p)
+
+        x_star, why = _solve(prefix)
+        prev = self.tp_prefill_max_tokens
+        if x_star is None:
+            logger.warning("WEG2 X COST-LINE held: %s -- X stays %d (line=%s)", why, prev, line_src)
+            return None
+        floor = int(line["n_lo"])
+        x_bound = min(max(x_star, floor), self.x_ceiling_tokens)
+        clamp = ("ceiling" if x_star > self.x_ceiling_tokens
+                 else "floor" if x_star < floor else "none")
+        # 27B review of 800bb82ac6: one re-solve moves X by at most MAX_STEP.
+        x, limited = phase_policy.x_step_limited(
+            x_bound, prev, envs.SGLANG_WEG2_X_COST_MAX_STEP.get())
+        x = min(max(x, floor), self.x_ceiling_tokens)
+        if limited:
+            clamp += "+hysteresis"
+            self.counters["x_cost_step_limited"] += 1
+        self.tp_prefill_max_tokens = x
+        if self._x_min_work_follows:
+            self.flip_min_work_tokens = x
+        self._x_solve_ctx = {"price": price, "line": line, "line_p": line_p, "r_p": r_p,
+                             "prefix": prefix, "floor": floor, "ceiling": self.x_ceiling_tokens}
+        self.counters["x_resolves"] += 1
+        bands = ", ".join(
+            "%dk:%s" % (d // 1000, "-" if xb is None else "inf" if xb == float("inf") else int(xb))
+            for d in (2048, 32768, 97280, 245760) for xb in (_solve(d)[0],))
+        logger.info(
+            "WEG2 X COST-LINE RE-SOLVE X=%d <- X_prev=%d X*=%.0f (%s) clamp=%s floor=%d (fitted "
+            "range n %d..%d) ceiling=%d | D line a=%.0fms b=%.3fms/tok c=%.4fms/tok/kprefix "
+            "[%s] at prefix=%d | price=%.2fs [%s] / k=%.2f [%s] | %s | X* by depth {%s}",
+            x, prev, x_star, why, clamp, floor, int(line["n_lo"]), int(line["n_hi"]),
+            self.x_ceiling_tokens, float(line["a_ms"]), float(line["b_ms"]),
+            float(line["c_ms"]), line_src, int(prefix), price, price_src, k, k_src, p_src, bands)
+        k_rec = getattr(self, "_x_k_hist", (k, k_src))[0]  # the sidecar keeps the measured mean
+        self._note_x_cost_line(line, line_src, k_rec, "D")
+        if line_p is not None:
+            self._note_x_cost_line(line_p, line_p_src, k_rec, "P")
+        return x
+
+    def _x_riders(self) -> int:
+        """X-K-FLIP: the requests queued for P right now that a flip would
+        carry beside a new arrival (live, uncached work left, not handed to D)."""
+        n = 0
+        for q in self.queue:
+            fut = getattr(q, "fut", None)
+            if fut is not None and fut.done():
+                continue
+            if getattr(q, "d_direct", False) or int(getattr(q, "est_uncached", 0) or 0) <= 0:
+                continue
+            n += 1
+        return n
+
+    def _x_for_flip(self, k_flip: int, rid: str = "", site: str = "") -> int:
+        """X-K-FLIP: the X of a flip that carries ``k_flip`` requests -- the
+        round trip amortised over THIS flip's riders, on the last re-solve's
+        lines at its depth, clamped to its floor and never above the lone
+        request's X (the X in force). Switch off, no solve yet or k_flip <= 1:
+        the X in force. Named in one line whenever riders lower it."""
+        x1 = int(self.tp_prefill_max_tokens)
+        ctx = getattr(self, "_x_solve_ctx", None)
+        if not x_k_flip_enabled() or ctx is None or int(k_flip) <= 1:
+            return x1
+        cap = float(self.p_phase_max_requests) if self.p_phase_max_requests else float("inf")
+        k = min(cap, float(k_flip))
+        x_star, why = phase_policy.solve_x_cost_line(
+            price_s=ctx["price"], k=k, line=ctx["line"], r_p=ctx["r_p"],
+            prefix_tokens=ctx["prefix"], line_p=ctx["line_p"])
+        if x_star is None:
+            return x1
+        xk = int(min(max(x_star, ctx["floor"]), ctx["ceiling"], x1))
+        if xk < x1:
+            self.counters["x_k_flip_lowered"] += 1
+            hist = getattr(self, "_x_k_hist", (0.0, "none"))
+            logger.info("WEG2 X-FLIP-K site=%s rid=%s k_flip=%d (1 + %d queued for P) X_k=%d X_1=%d "
+                        "(%s) k_hist=%.2f[%s] display-only -- the round trip is amortised over this "
+                        "flip's riders", site, rid, int(k_flip), int(k_flip) - 1, xk, x1, why,
+                        float(hist[0]), hist[1])
+        return xk
+
+    def _note_x_cost_line(self, line: dict, line_src: str, k: float, side: str) -> None:
+        """X-COST-LINE: append this boot's first LIVE fitted lines of group
+        ``side`` to the sidecar -- the next boot's seed of the same checkpoint
+        x form. A line taken from the record is never written back as new."""
+        if (not line_src.startswith(("live:", "boot:")) or not self._park_form_key
+                or not self.measured_record
+                or self._x_cost_written[side] >= phase_policy.X_COST_LINE_RECORDS):
+            return
+        self._x_cost_written[side] += 1
+        now = time.time()
+        rec = phase_policy.x_cost_line_record(
+            form_key=self._park_form_key, line=line, k=k, boot_tag=str(self.tag),
+            commit=self.commit, side=side,
+            at=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)) + ",%03d" % int((now % 1) * 1000))
+        logger.info("WEG2 X COST-LINE RECORD side=%s a=%.0f b=%.3f c=%.4f n=%d k=%.2f form=%s -> "
+                    "sidecar (the next boot's seed of this form)", side, rec["a_ms"], rec["b_ms"],
+                    rec["c_ms"], rec["n"], rec["k"], self._park_form_key)
+        self._sidecar_submit(host_ledger.append_measured_record, self.measured_record, rec)
+
+    async def _read_p_cost(self) -> None:
+        """X-COST-LINE: after a P drain, take P's prefill forwards (PP0, the
+        rank answering ``/get_server_info``) as rows of P's cost line. Runs as
+        its own task -- a slow or absent answer never delays the flip; a
+        failed read is counted, never a zero row."""
+        try:
+            async with self.session.get(f"{self.groups['P'].url}/get_server_info",
+                                        timeout=ClientTimeout(total=PROGRESS_READ_TIMEOUT_S)) as r:
+                info = await r.json() if r.status == 200 else {}
+            if isinstance(info, list) and info:
+                info = info[0]
+            st = info.get("internal_states") if isinstance(info, dict) else None
+            block = st[0].get(prefill_clock.COST_STATE_KEY) if (
+                isinstance(st, list) and st and isinstance(st[0], dict)) else None
+        except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
+            self.counters["x_cost_p_read_errors"] += 1
+            logger.debug("P cost ring unavailable: %s: %s", type(e).__name__, e)
+            return
+        self._note_cost_rows(block, "P")
+
     def _flip_economics_ok(self, fairness_fired: bool) -> bool:
         """C7/L13: is the queued work worth a round trip?
 
@@ -8031,6 +14804,10 @@ class Front:
         queued_uncached = sum(int(p.est_uncached) for p in self.queue)
         queued_tokens = sum(int(p.est_prompt) for p in self.queue)
         threshold = self.flip_min_work_tokens
+        if Front._x_excursion_band_off(self):
+            # PDFLIP-B: the line says "X*" -- under the excursion price it IS the
+            # live X (N5d printed threshold=4096 beside X=10674)
+            threshold = max(int(threshold), int(self.tp_prefill_max_tokens))
         # xsn438: WORK D CAN NEVER DO IS NOT PRICED AGAINST D DOING IT. X*
         # amortises 2*flip_s against the alternative of D prefilling the
         # queued work itself (law 4). Text queued on D's watch has that
@@ -8119,12 +14896,20 @@ class Front:
         claimed a rest the front was in the act of leaving.  A flip announces
         itself with ``WEG2-FLIP begin``; ``IDLE-REST`` now means what it says.
         """
+        ic = getattr(self, "_idle_clock", None)  # tests build Front without __init__
         if not at_rest:
             self._idle_rest_shown = False
+            if ic is not None:
+                ic.note_busy("controller-busy")
             return "busy"
         if awake != self.idle_layout:
             self._idle_rest_shown = False
+            if ic is not None:
+                ic.note_busy("controller-flip")
             return "flip"
+        if ic is not None:
+            # #55 F2: rest in the configured layout; the lock waits idle_s and for nothing in flight.
+            ic.note_rest(queued=len(self.queue) + len(self._ready_for_d), serving=self.state == "serving")
         if not self._idle_rest_shown:
             self._idle_rest_shown = True
             logger.info("WEG2 IDLE-REST layout=%s configured=%s reason=%s queue=0 ready_for_d=%d "
@@ -8223,11 +15008,13 @@ class Front:
         """The three switches as one line, printed at startup."""
         on = lambda b: "on" if b else "off"  # noqa: E731
         return ("WEG2-FLIPFAST kick_arrival=%s kick_after_flip=%s dc_off_path=%s tick_s=%.2f "
-                "(%s / %s / %s; off = the controller sleeps its full tick and the post-wake "
+                "kick_done_queued=%s "
+                "(%s / %s / %s / %s; off = the controller sleeps its full tick and the post-wake "
                 "residue reading runs on the flip, exactly as before)" % (
                     on(self._kick_on["arrival"]), on(self._kick_on["after_flip"]),
-                    on(self._dc_off_path), CTL_TICK_S,
-                    CTL_KICK_ARRIVAL_ENV, CTL_KICK_AFTER_FLIP_ENV, DC_OFF_PATH_ENV))
+                    on(self._dc_off_path), CTL_TICK_S, on(getattr(self, "_kick_done_queued", False)),
+                    CTL_KICK_ARRIVAL_ENV, CTL_KICK_AFTER_FLIP_ENV, DC_OFF_PATH_ENV,
+                    CTL_KICK_DONE_QUEUED_ENV))
 
     def _ctl_evt(self) -> asyncio.Event:
         loop = asyncio.get_running_loop()
@@ -8247,13 +15034,17 @@ class Front:
         would not have run -- every latch (economics, dwell, fairness, the
         hand-off window) is evaluated exactly as on a tick.
         """
-        if why not in CTL_KICK_REASONS:
-            raise ValueError(f"unknown controller kick reason {why!r}; known: {sorted(CTL_KICK_REASONS)}")
+        if why not in CTL_KICK_REASONS and why != CTL_KICK_DONE_QUEUED:
+            raise ValueError(f"unknown controller kick reason {why!r}; known: "
+                             f"{sorted(set(CTL_KICK_REASONS) | {CTL_KICK_DONE_QUEUED})}")
         # getattr: a Front assembled without __init__ (the unit tests' partial
         # fronts) has no switches -- that is the default path, a no-op.
-        if not (getattr(self, "_kick_on", None) or {}).get(why):
+        if why == CTL_KICK_DONE_QUEUED:
+            if not getattr(self, "_kick_done_queued", False):
+                return
+        elif not (getattr(self, "_kick_on", None) or {}).get(why):
             return
-        if why == "arrival" and getattr(self, "_ready_for_d", None):
+        if why in ("arrival", CTL_KICK_DONE_QUEUED) and getattr(self, "_ready_for_d", None):
             # Prefilled requests still wait for a D seat. The D->P decision does
             # not read _ready_for_d (only D.outstanding + the hand-off window),
             # so an early pass could flip D away before d_admitter's next 50 ms
@@ -8267,13 +15058,42 @@ class Front:
             return
         self.counters[f"ctl_kick_{why}"] += 1
         evt.set()
+        # the metal proof of the kick switches (27B LS12 da8464b9f0), since the
+        # counters live only in /weg2/state -- one line per reason at 1, 2, 4,
+        # 8 ... kicks. Both switches off: never reached, no line.
+        k = int(self.counters[f"ctl_kick_{why}"])
+        if k & (k - 1) == 0:
+            logger.info("WEG2-FLIPFAST kick why=%s n=%d kicked=%d held_ready_for_d=%d "
+                        "(the controller woke before its %.2f s tick)", why, k,
+                        int(self.counters["ctl_kicked"]),
+                        int(self.counters["ctl_kick_held_ready_for_d"]), CTL_TICK_S)
+
+    def _done_kick_due(self) -> bool:
+        """DONE-KICK: a P->D flip closes with P-bound work queued and the switch on."""
+        if not getattr(self, "_kick_done_queued", False):
+            return False
+        return bool(getattr(self, "queue", None)) and getattr(self, "state", None) == "serving"
+
+    def _done_kick(self, dst: str) -> None:
+        """DONE-KICK: name it, remember the done stamp for the begin line, kick."""
+        held0 = int(self.counters.get("ctl_kick_held_ready_for_d", 0))
+        self._kick_controller(CTL_KICK_DONE_QUEUED)
+        held = int(self.counters.get("ctl_kick_held_ready_for_d", 0)) > held0
+        q = self.queue
+        if not held:
+            self.__dict__["_done_kick_at"] = (int(self.epoch), time.time())
+        logger.info("WEG2-FLIP DONE-KICK epoch=%d woke=%s queue=%d head=%s held_ready_for_d=%d "
+                    "(P-bound work queued during the flip: the controller decides now, not at "
+                    "its next %.2f s tick; economics and MIN-DWELL unchanged)",
+                    int(self.epoch), dst, len(q), getattr(q[0], "rid", "-") if q else "-",
+                    int(held), CTL_TICK_S)
 
     async def _ctl_wait(self) -> None:
         """The controller's tick. Both kick switches off: ``asyncio.sleep(CTL_TICK_S)``,
         today's path. Either on: the same bound, ended early by a kick; a kick
         set while the controller was busy ends the next wait at once."""
         kick_on = getattr(self, "_kick_on", None) or {}
-        if not (kick_on.get("arrival") or kick_on.get("after_flip")):
+        if not (any(kick_on.values()) or getattr(self, "_kick_done_queued", False)):
             await asyncio.sleep(CTL_TICK_S)
             return
         evt = self._ctl_evt()
@@ -8452,7 +15272,20 @@ class Front:
         # prefill -- boot weg2xsn214 measured a 3 s GPU-idle gap per 100k
         # request between one prefill and the next.
         _ahead = max(0, int(os.environ.get("SGLANG_WEG2_P_QUEUE_AHEAD", "1") or 0))
-        sem = asyncio.Semaphore(self.p_concurrency + _ahead)
+        # RO (weg2.p_read_overlap): a leg P only holds for its store read (or
+        # its twin's, or its pacing window) frees one extra slot, at most
+        # _ro_max; the semaphore is sized for them, the pool enforces the cap.
+        _ro_max = _ro.max_extra() if _ro.enabled() else 0
+        _ro_state = None
+        if _ro_max > 0:
+            try:
+                _ro_state = _ro.ReadState(urllib.parse.urlparse(self.groups["P"].url).port)
+            except Exception:  # noqa: BLE001
+                _ro_state, _ro_max = None, 0
+        sem = asyncio.Semaphore(self.p_concurrency + _ahead + _ro_max)
+        logger.info("WEG2 P-READ-OVERLAP max_extra=%d state=%s (RO: legs P holds for a store "
+                    "read free a dispatch slot each; 0 = the p_concurrency+ahead cap alone)",
+                    _ro_max, getattr(_ro_state, "path", None))
         await self._adopt_first_flip()
         while True:
             # 27B flipfast F2/F3: the 0.2 s tick, ended early by a kick when a
@@ -8461,6 +15294,8 @@ class Front:
             try:
                 if self.state != "serving":
                     continue
+                self._hl_sweep()  # #243 seam: lost hand-offs of waiting rids -> P
+                self._rvp_take()
                 if self.awake == "D":
                     D = self.groups["D"]
                     _now = time.time()
@@ -8491,6 +15326,10 @@ class Front:
                             (p.t_arrive for p in self.queue), self.t_awake, time.time())
                         wait_fired = phase_policy.wait_bound_fired(wait_s, self.d_wait_bound_s)
                         fairness_fired = wait_fired or not self.admit_d
+                    elif _asr.enabled():
+                        # ARRIVAL-SEAT (b): the fairness switch pre-empts no D
+                        # phase; the rule's own bound (c) replaces it below.
+                        fairness_fired = not self.admit_d
                     else:
                         fairness_fired = self._fairness_switch(oldest, "batch")
                     # 27B PARK (user 26.09.): "Wartegrenze 0" -- a queued request
@@ -8498,7 +15337,12 @@ class Front:
                     # dwell and the fairness floor aside); it pre-empts like the
                     # fairness bound. Off (the class default): nothing changes.
                     immediate: Optional[Pending] = None
-                    if self.d_park_immediate and not wait_fired and self.queue:
+                    if _asr.enabled():
+                        # ARRIVAL-SEAT: the one decision site while D is awake.
+                        # The collect window and the window gate are never
+                        # consulted (inert); X-COST-LINE only supplies X.
+                        wait_fired, fairness_fired, immediate = await self._arrival_seat_step(D, _now)
+                    elif self.d_park_immediate and not wait_fired and self.queue:
                         immediate = self._immediate_park_due(D, _now)
                         if immediate is not None:
                             wait_fired = fairness_fired = True
@@ -8582,6 +15426,16 @@ class Front:
                         if not self._dwell_ok("D", "P", fairness_fired, work_exhausted=d_work_exhausted,
                                               oldest_wait_s=time.time() - (oldest or time.time())):
                             continue
+                        # PK2 (metal ...09270712 epoch 28, 27.09.): under the immediate
+                        # park a D->P flip NEVER drains running decodes -- whatever
+                        # decided it (fairness bound, economics, an admission closed
+                        # earlier). The flip's drain waited 65.7 s for two agent
+                        # decodes (6198 / 11133 tokens) after the fairness switch
+                        # fired; parked, they resume first after the flip back.
+                        if (getattr(self, "d_park_immediate", False) and self.queue
+                                and self._flip_ledger(D)):
+                            await self._wait_bound_park(None, immediate=self.queue[0],
+                                                        cause="before-flip")
                         await self.flip("D", "P")
                     continue
                 # awake == P: prefill the backlog until empty (#1011 PP exit
@@ -8600,6 +15454,8 @@ class Front:
                 # dispatches, the stalled request stays at the head) and the
                 # flip below follows because the queue is not empty.
                 self._p_intake_stalled = False
+                # P-BATCH-ALL: prefill queued for D before this P phase joins it
+                self._p_batch_takes_d_prefill()
                 short_behind_p0 = self.counters.get("short_behind_p", 0)
                 # MF-3: the same delta idiom as `short_behind_p0` -- the
                 # epoch's terms are read off the running counters rather than
@@ -8617,13 +15473,24 @@ class Front:
                     self.p_pool_tokens,
                     min(self.p_concurrency + _ahead, self.p_phase_max_requests or (self.p_concurrency + _ahead)))
                 async def one(p: Pending) -> Pending:
-                    if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
-                        p.leg1_done = True
-                        return p
+                    if getattr(p, "short_kept", False) or p.skip_leg1:
+                        # P-BATCH-ALL: P is awake -- every prefill is P's (a
+                        # kept SHORT; no CARRIER-EXCEEDS skip any more, law 02.10.)
+                        self._to_p_batch(p, "drain")
                     async with sem:
+                        if p.client_gone:  # H102: its client left while it waited for a P slot
+                            return p
                         try:
-                            await self.leg1(p)
+                            _early = getattr(p, "_leg1_early", None)
+                            if _early is not None:
+                                # DP-NACHLAUF: posted at the flip's begin -- await it
+                                await _early
+                            else:
+                                await self.leg1(p)
                         except Exception as e:  # noqa: BLE001
+                            if p.client_gone:  # H102: aborted on P for a client that left
+                                self.counters["leg1_client_gone"] += 1
+                                return p
                             if is_intake_stall(e) and not is_too_large(e):
                                 await self._requeue_intake_stalled(p, e)
                                 return p
@@ -8654,8 +15521,15 @@ class Front:
                     nonlocal _drain_uncached, prefilled
                     if p.intake_stalled:
                         return  # weg2xsn272: back in the queue, not ready for D
+                    if p.client_gone:
+                        return  # H102: its client left; never handed to D
+                    if p.resume_via_p:
+                        self._rvp_p_finished(p)
+                        prefilled += 1
+                        return
                     _drain_uncached += int(p.est_uncached)
                     if not p.fut.done():
+                        p.t_ready = time.time()  # #244 seat_wait_s
                         self._ready_for_d.append(p)
                         self._sync_batch_gate()
                         prefilled += 1
@@ -8668,16 +15542,49 @@ class Front:
                 # 29.5 s again -- the 3 s store probe was back on every
                 # second request).  The pool refills the moment ONE leg
                 # finishes, so P always has the next request queued.
+                # DECODE-COLLECT SEAT GATE: the flip that brought P here was armed
+                # for the free D seats -- P prefills at most that many this phase
+                _dc_cap = int(self.__dict__.pop("_dc_p_cap", 0) or 0)
+                _max_dispatch = self.p_phase_max_requests
+                if _dc_cap > 0:
+                    _max_dispatch = min(_max_dispatch, _dc_cap) if _max_dispatch else _dc_cap
+                    logger.info("WEG2 DECODE-COLLECT seat-gate p-cap=%d epoch=%d queued=%d -- this P phase "
+                                "prefills at most the free D seats", _max_dispatch, self.epoch, len(self.queue))
                 passes = await _p_drain_pool(
                     self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
                     lambda: self.state == "serving" and not self._p_intake_stalled,
                     # H91 part C rule 1: at most p_phase_max_requests leave the
                     # queue in this P phase, overlapping only as far as their
                     # est_prompt fits P's unified pool (0 = off, law 1 as before).
-                    max_dispatch=self.p_phase_max_requests,
+                    max_dispatch=_max_dispatch,
                     cost=lambda p: phase_policy.p_request_cost(
                         p.est_prompt, p.leg1_prompt_tokens, p.skip_leg1),
-                    budget=self.p_pool_tokens, stats=_phase_stats)
+                    budget=self.p_pool_tokens, stats=_phase_stats,
+                    extra=(None if _ro_state is None else
+                           (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
+                    poll_s=_ro.POLL_S,
+                    # FLIPCYCLE H5: the phase cap never strands a SHORT
+                    # (the seat gate's cap is hard: a SHORT needs a D seat too)
+                    cap_exempt=(self._p_phase_short_rides
+                                if envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0
+                                else None))
+                if _phase_stats.get("short_rides"):
+                    self.counters["p_phase_short_rides"] += _phase_stats["short_rides"]
+                    logger.info(
+                        "WEG2-FLIPCYCLE stage=d_prefill_after_flip epoch=%d ms=0 floor_ms=0 "
+                        "avoided=%d dispatched=%d cap=%d (H5: SHORTs past the P phase cap rode "
+                        "P's batch instead of a D prefill after the P->D flip -- each such D "
+                        "pass cost 1.2-2.2 s with every seat stalled, y6z d_extend)",
+                        self.epoch, _phase_stats["short_rides"], _phase_stats["dispatched"],
+                        self.p_phase_max_requests)
+                if _phase_stats.get("overlap_dispatched"):
+                    self.counters["p_read_overlap"] += _phase_stats["overlap_dispatched"]
+                    logger.info("WEG2 P-READ-OVERLAP epoch=%d overlap_dispatched=%d dispatched=%d "
+                                "peak_n=%d base=%d (RO: dispatched while P held legs for their "
+                                "store reads -- P computed them instead of idling)",
+                                self.epoch, _phase_stats["overlap_dispatched"],
+                                _phase_stats["dispatched"], _phase_stats["peak_n"],
+                                self.p_concurrency + _ahead)
                 if passes and (self.p_phase_max_requests or self.p_pool_tokens):
                     _cap_hit = phase_policy.phase_cap_reached(
                         _phase_stats["dispatched"], self.p_phase_max_requests)
@@ -8705,6 +15612,14 @@ class Front:
                     _drain_s = time.time() - t_drain0
                     if _drain_s > 0 and _drain_uncached > 0:
                         self.note_x_sample("r_p", _drain_uncached / _drain_s)
+                    if prefilled > 0:
+                        # X-COST-LINE: the requests this P phase carried (k).
+                        self._p_phase_k.append(int(prefilled))
+                    if envs.SGLANG_WEG2_ENABLE_X_COST_LINE.get():
+                        # X-COST-LINE: P's forwards of this drain, as a task.
+                        _pc = asyncio.get_running_loop().create_task(self._read_p_cost())
+                        self._p_cost_tasks.add(_pc)
+                        _pc.add_done_callback(self._p_cost_tasks.discard)
                     logger.info("WEG2 P-DRAIN epoch=%d prefilled=%d arrived_during=%d p_concurrency=%d "
                                 "passes=%d queue_at_exit=%d drain_s=%.1f",
                                 self.epoch, prefilled, max(0, prefilled - queue_at_entry),
@@ -8712,7 +15627,7 @@ class Front:
                     # L4/R-10: the counted consequence of law 1 -- SHORT work
                     # that arrived while P was draining and had to queue
                     # BATCH.  n=0 is printed too, so absence is a reading.
-                    logger.info("WEG2 SHORT-BEHIND-P epoch=%d n=%d oldest_wait_s=%.1f",
+                    logger.info("WEG2 SHORT-TO-P epoch=%d n=%d oldest_wait_s=%.1f",
                                 self.epoch, self.counters.get("short_behind_p", 0) - short_behind_p0,
                                 oldest_short)
                     # MF-3 (L15): what group P's disarmed store read cost THIS
@@ -8779,7 +15694,7 @@ class Front:
                     logger.exception("controller error: %s", e)
 
     def group_dead_should_stop(self, *, state: str, ok: bool, alive: bool,
-                               streak: int) -> bool:
+                               streak: int, hold: bool = False) -> bool:
         """W17's gate, ONE decision for the poller.
 
         #1378 xsn39 (measured): the flip legs RUN in the groups' event loops
@@ -8792,7 +15707,14 @@ class Front:
         authority for a stuck flip, and the deadman covers the front itself.
         The stop stays armed for every non-flipping state (a dead group at
         idle is a fact, not a phase).
+
+        FH (b1): a rank held at its wall (#1223 DEBUG-HOLD, a named stop) is
+        a dead group in EVERY state and at the first sighting -- its HTTP
+        stays 200 and its session alive for the whole hold (weg2/front_health.py).
+        ``hold`` is only ever True with SGLANG_WEG2_FRONT_HEALTH_FACTS on.
         """
+        if hold:
+            return True
         if streak < 2:
             return False
         if health_is_serving_fact(ok, alive):
@@ -8809,7 +15731,92 @@ class Front:
             return False
         return True
 
+    async def _probe_group_health(self, g: "Group", timeout_s: float) -> bool:
+        try:
+            async with self.session.get(f"{g.url}/health", timeout=ClientTimeout(total=timeout_s)) as r:
+                return r.status == 200
+        except Exception:  # noqa: BLE001
+            return False
+
     async def health_poller(self) -> None:
+        from sglang.srt.weg2 import front_health as _fh
+
+        if not _fh.enabled():
+            return await self._health_poller_old()
+        dirs = _fh.hold_dirs()
+        logger.info(
+            "WEG2-HEALTH-FACTS armed: poll=%.0fs probe_timeout=%.0fs (concurrent), hold dirs=%s; "
+            "front /health answers from these facts (SGLANG_WEG2_FRONT_HEALTH_FACTS=0 = the old live probe)",
+            _fh.POLL_S, _fh.PROBE_TIMEOUT_S, dirs,
+        )
+        while True:
+            await asyncio.sleep(_fh.POLL_S)
+            await self.health_poll_once(dirs)
+
+    async def health_poll_once(self, dirs) -> None:
+        """FH: one poll of both groups -- HTTP concurrently, session, hold dump."""
+        from sglang.srt.weg2 import front_health as _fh
+
+        groups = list(self.groups.values())
+        oks = await asyncio.gather(
+            *(self._probe_group_health(g, _fh.PROBE_TIMEOUT_S) for g in groups)
+        )
+        from sglang.srt.weg2 import progress_beacon as _fp
+
+        _fp_dir = _fp.beacon_dir(getattr(self, "tag", "") or "") if _fp.enabled() else ""
+        _fp_prev = getattr(self, "_fp_prev", None)
+        if _fp_prev is None:
+            _fp_prev = self._fp_prev = {}
+        for g, ok in zip(groups, oks):
+            alive = _sid_alive(g.sid)
+            hold = _fh.find_hold(g.sid, self.t0, dirs)
+            # FP: read every poll so the previous snapshot is always the last poll's.
+            _fp_why = None
+            if _fp_dir:
+                _cur = _fp.read_group(_fp_dir, g.name, g.sid)
+                _fp_why = _fp.progress(_fp_prev.get(g.name, {}), _cur)
+                _fp_prev[g.name] = _cur
+            if ok and alive and hold is None:
+                g.health_fail_streak = 0
+                g.health_facts = _fh.GroupFacts(True, True, 0, None, time.time())
+                continue
+            if not ok and alive and hold is None and _fp_why is not None:
+                # FP (weg2/progress_beacon.py): the group computes -- a slow
+                # /health behind a long forward is not a failure; no streak.
+                g.health_fail_streak = 0
+                g.health_facts = _fh.GroupFacts(False, True, 0, None, time.time())
+                self.counters["health_busy"] += 1
+                _nb = self.counters["health_busy"]
+                if _nb <= 12 or _nb % 64 == 0:
+                    logger.info("WEG2-HEALTH-BUSY group=%s http_ok=False progress=%s (n=%d): the group "
+                                "computes; not counted toward the streak", g.name, _fp_why, _nb)
+                continue
+            g.health_fail_streak += 1
+            g.health_facts = _fh.GroupFacts(bool(ok), bool(alive), g.health_fail_streak, hold, time.time())
+            n = g.health_fail_streak
+            if n <= 12 or n % 12 == 0:
+                logger.warning(
+                    "WEG2-HEALTH group=%s http_ok=%s process_alive=%s streak=%d hold=%s",
+                    g.name, ok, alive, n,
+                    "-" if hold is None else f"pid={hold.pid} exception={hold.exception!r} dump={hold.path}",
+                )
+            if self.group_dead_should_stop(
+                state=self.state, ok=ok, alive=alive, streak=n, hold=hold is not None,
+            ):
+                if hold is not None:
+                    self.do_stop(
+                        "W17 Weg2GroupDead",
+                        f"group {g.name}: a rank is held at its wall (#1223 DEBUG-HOLD pid={hold.pid}: "
+                        f"{hold.exception}; dump {hold.path}) -- a held rank serves no request, "
+                        f"http_ok={ok} process_alive={alive} say nothing about it",
+                    )
+                else:
+                    self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {n}x and process_alive={alive} (a 200 alone is a transport fact)")
+        # DASHBOARD-AUS-IPC (A12): a verdict change of any group as an event.
+        for g in groups:
+            self._ipc_group_health_observe(g)
+
+    async def _health_poller_old(self) -> None:
         while True:
             await asyncio.sleep(15)
             for g in self.groups.values():
@@ -9002,10 +16009,50 @@ class Front:
                                       "code": "W115"}, status=409)
         src, dst = self.awake, ("P" if self.awake == "D" else "D")
         self.admit_d = False
+        if src == "D":
+            # the drain waits only for what the park leaves running (#1011:
+            # a decode is never cut, so an unparked one held the flip)
+            await self._wait_bound_park(None, cause=MANUAL_FLIP_PARK_CAUSE)
         await self.flip(src, dst)
         if self.awake == "P" and self.state == "serving":
-            await self.flip("P", "D")
+            skip = Front._manual_return_skip_reason(self)
+            if skip is not None:
+                # MANUAL-FLIP RETURN-SKIP (L15 boot dac8b62b8c 14:43:03.794: LONG
+                # weg2-2-4, 133401 uncached, arrived during the probe's D->P half;
+                # the return P->D ran at 03.935 with queue=1 and the LONG got its
+                # own D->P 2.2 s later). P work waits: P stays awake, the
+                # controller serves it and flips back on its own.
+                self.counters["manual_flip_return_skip"] += 1
+                logger.info("WEG2 MANUAL-FLIP RETURN-SKIP reason=%s epoch=%d queue=%d -- P-bound work waits: "
+                            "P stays awake, no return half", skip, int(self.epoch), len(self.queue))
+                # DONE-KICK 02.10.: "manual_return_skip" was no known reason --
+                # _kick_controller refused it with a ValueError AFTER the flip
+                # (the POST answered 500); P's drain is the after_flip kick's job
+                # (flip("D","P") above already set it; a repeat is a no-op).
+                self._kick_controller("after_flip")
+            else:
+                await self.flip("P", "D")
         return web.json_response(self.state_dict())
+
+    def _manual_return_skip_reason(self) -> Optional[str]:
+        """MANUAL-FLIP RETURN-SKIP: why the manual round trip's return half P->D
+        is skipped, or None (it runs as before). P-bound work = a request P holds
+        (P's outstanding ledger) or a queued request that needs P -- the immediate
+        park's own reader (:func:`phase_policy.immediate_park_trigger`, LONG /
+        BATCH / p_only / requeued over X). Switch
+        SGLANG_WEG2_MANUAL_FLIP_RETURN_SKIP (default on)."""
+        if not envs.SGLANG_WEG2_MANUAL_FLIP_RETURN_SKIP.get():
+            return None
+        P = (getattr(self, "groups", None) or {}).get("P")
+        n_out = len(getattr(P, "outstanding", None) or ()) if P is not None else 0
+        if n_out:
+            return f"p_outstanding n={n_out}"
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        q = phase_policy.immediate_park_trigger(getattr(self, "queue", None) or (), x)
+        if q is not None:
+            return (f"queue_p rid={getattr(q, 'rid', '-')} "
+                    f"uncached={int(getattr(q, 'est_uncached', 0) or 0)} x={x}")
+        return None
 
     def _manual_flip_refusal(self) -> Optional[str]:
         """#1493: the two readings behind :func:`manual_flip_residency_refusal`.
@@ -9034,6 +16081,67 @@ class Front:
             return None
 
 
+#: FEHLT 8: the counters behind state.json ``front.routes``
+ROUTE_COUNTERS = {"d_direct": "route_d_direct", "via_p": "route_via_p", "d_drain": "route_d_drain",
+                  "reroute_midstream": "route_reroute_midstream"}
+
+
+def route_counter_of(pending) -> str:
+    """The X-EXACT-ERR ``via`` of a served leg 2 as a counter name: no pending =
+    the SHORT route straight to D; a pending handed to D without a leg 1 = the
+    D drain (``d_direct``); else the request came through P."""
+    if pending is None:
+        return ROUTE_COUNTERS["d_direct"]
+    if getattr(pending, "d_direct", False):
+        return ROUTE_COUNTERS["d_drain"]
+    return ROUTE_COUNTERS["via_p"]
+
+
+def routes_block(counters, x_live) -> dict:
+    """state.json ``front.routes``: cumulative counts per prefill site, the
+    mid-stream reroutes to P, and the X of the last route verdict."""
+    out = {k: int(counters.get(c, 0) or 0) for k, c in ROUTE_COUNTERS.items()}
+    out["x_live"] = None if x_live is None else int(x_live)
+    return out
+
+
+def _d_seat_rewake_on() -> bool:
+    """D-SEAT-REWAKE (weg2/d_seat_rewake.py), the front's half."""
+    try:
+        return bool(envs.SGLANG_WEG2_D_SEAT_REWAKE.get())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def start_host_census_sampler(record: str, key: str, store_dir: str,
+                              widths: List[int], period_s: float = 60.0, boot: str = ""):
+    """29.09.: keep the host census record current (host_census.py). A daemon
+    thread, off the watermark loop: a smaps walk over ~40 processes that map a
+    39 GiB store is not a 0.5 s-cadence read. One line per changed peak.
+    30.09. CENSUS-FIXPUNKT: ``boot`` (the front's --tag) files every sample
+    under this boot too -- the per-boot history the ledger books from."""
+    import threading
+
+    from sglang.srt.weg2 import host_census as _hc
+
+    def _run():
+        warned = False
+        while True:
+            time.sleep(period_s)
+            try:
+                c = _hc.sample_live(store_dir=store_dir, arena_booked_widths=widths)
+                ent = _hc.merge_into_record(record, key, c, boot=boot)
+                logger.info("%s", _hc.census_line(key, _hc.ledger_terms(ent)))
+            except Exception as exc:  # noqa: BLE001 -- an instrument never kills the front
+                if not warned:
+                    logger.warning("%s sampler failed (once): %r", _hc.CENSUS_MARKER, exc)
+                    warned = True
+
+    t = threading.Thread(target=_run, name="weg2-host-census", daemon=True)
+    t.start()
+    return t
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prefill", required=True)
@@ -9047,6 +16155,9 @@ def main():
     ap.add_argument("--decode-sid", type=int, default=0)
     ap.add_argument("--dc-reserve", default="", help="uuid=mib,uuid=mib")
     ap.add_argument("--weight-form", default="", help="#1444: weight source form stamped into the dormant record")
+    ap.add_argument("--d-residue-context-tokens", type=int, default=0,
+                    help="YaRN x2 27B: group D's context, stamped into D's dormant record when it is not 262144 "
+                         "(0 = not stamped: every x1 record stays byte-identical)")
     ap.add_argument("--fairness-w-s", type=float, default=45.0,
                     help="A1-1: the ONLY sanctioned pre-emption of a P drain or a D exhaustion. "
                          "Seconds the oldest waiter may wait before the front stops admitting new "
@@ -9073,8 +16184,8 @@ def main():
                          "(pending tokens > X) while D decodes parks D's running decodes via POST "
                          "/weg2/park_running at once (behind min-dwell and the fairness floor) and flips "
                          "to P; the parked ones resume first after the flip back. Unset = "
-                         "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (qwen27b off "
-                         "until measured). D needs the same switch (its flip park).")
+                         "SGLANG_WEG2_D_PARK_IMMEDIATE / the profile's d_park_immediate (on for qwen27b "
+                         "and nextflash). D needs the same switch (its flip park).")
     ap.add_argument("--p-leg1-stall-s", type=float, default=None,
                     help="H91 part C: a leg 1 older than this while P showed no work for as long (no "
                          "leg 1 completed, P's progress counters unchanged) is aborted on P and "
@@ -9185,6 +16296,13 @@ def main():
                          "and that level requires the admin key once one is configured. A path, "
                          "not a value, so the key does not appear in this process's argv too.")
     ap.add_argument("--commit", default="", help="#1233 fix 8: the tip this boot runs, stamped into every measurement")
+    ap.add_argument("--host-census-record", default="",
+                    help="29.09.: the host census record (host_census.py) this front keeps "
+                         "current -- every 60 s one sample_live, max-merged under "
+                         "--host-census-key. Empty = off.")
+    ap.add_argument("--host-census-key", default="")
+    ap.add_argument("--host-census-store-dir", default="")
+    ap.add_argument("--host-census-arena-widths", default="")
     ap.add_argument("--anon-preboot-bytes", type=int, default=0,
                     help="#1269 fix 3: cgroup memory.stat `anon` measured by the "
                          "launcher preflight BEFORE this boot existed. The only "
@@ -9246,10 +16364,16 @@ def main():
                   d_wait_bound_s=args.d_wait_bound_s,
                   p_leg1_stall_s=args.p_leg1_stall_s,
                   d_park_immediate=args.d_park_immediate == "on")
+    front.d_residue_context_tokens = int(getattr(args, "d_residue_context_tokens", 0) or 0)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:
         front._anon_preboot_bytes = int(args.anon_preboot_bytes)
+    if args.host_census_record and args.host_census_key:
+        start_host_census_sampler(
+            args.host_census_record, args.host_census_key, args.host_census_store_dir,
+            [int(w) for w in args.host_census_arena_widths.split(",") if w.strip()],
+            boot=str(args.tag or ""))
     # #1275: say ONCE whether this boot has the live levers, and say it with the
     # PATH and a redaction -- never the key. The front log is world-readable and
     # is routinely pasted into records.
@@ -9259,7 +16383,8 @@ def main():
                 args.admin_key_file or "(none)",
                 admin_key_mod.redact(front.admin_key),
                 "REACHABLE" if front.admin_key else "unreachable (groups started without --admin-api-key)")
-    app = web.Application(client_max_size=1024**3)
+    app = web.Application(client_max_size=1024**3,
+                          middlewares=_idle_clock_mod.middlewares(front._idle_clock))  # #55 F2
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)
     app.router.add_get("/health", front.handle_health)
@@ -9274,6 +16399,14 @@ def main():
         app.router.add_get(path, front.handle_passthrough_get)
     for path in PASSTHROUGH_POST:
         app.router.add_post(path, front.handle_passthrough_post)
+    # #243 seam: the wrapper is the one rid-end site that drops the rid's
+    # hand-off marks (weg2/handoff_seam.py:wrap_handler) -- bound once, here,
+    # before the routes take the handler.
+    front.handle_generate = _hs.wrap_handler(front.handle_generate)
+    # the outstanding book's rid-end (state.json front.oldest_outstanding_*)
+    front.handle_generate = front.ipc_out_wrap(front.handle_generate)
+    # W3-STOP: a STOP answers the handlers in flight (Front.stop_guard).
+    front.handle_generate = front.stop_guard(front.handle_generate)
     for path in FORWARD_PATHS:
         app.router.add_post(path, front.handle_generate)
     # rename transition: the old and the new flip-front route prefixes both answer (compat_shims)

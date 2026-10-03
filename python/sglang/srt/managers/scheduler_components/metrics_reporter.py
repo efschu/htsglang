@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import tempfile
@@ -27,6 +28,71 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
 from sglang.srt.utils.collective_clock import CollectiveClock, collective_clock
 from sglang.srt.utils.device_timer import DeviceTimer, SplitDeviceTimer
+
+
+class MissWindowTimer(SplitDeviceTimer):
+    """PR (30.09.): the per-rank prefill timer with the pool miss window of
+    ``layers.moe.pool_miss_cost`` around the same forward -- the rows the
+    forward's host-plan fetches load and their own ``pool.host_fetch`` spans
+    travel in ONE interval, so the prefill line pairs them or drops them
+    together. Off (no record dir): the window is a dict nobody fills."""
+
+    def _report(self):
+        """FEHLT 7 (30.09., Dashboard-Plausi-Audit Zeile 4): as DeviceTimer's,
+        plus ``since_prev_end`` -- the device time from the PREVIOUS prefill
+        interval's end event to this one's. PP0 measured a 67-token chunk at
+        1876 ms that ended 0.13 s after the 16k chunk before it: its window
+        opened while the predecessor still ran. ``min(t, since_prev_end)`` is
+        the chunk's own span, without the wait behind the predecessor.
+        Query-only, like the base: both events completed."""
+        while len(self._intervals) > 0:
+            interval = self._intervals[0]
+            if not interval.end_event.query():
+                break
+            self._intervals.popleft()
+            elapsed = interval.elapsed_time() / 1000.0
+            prev = getattr(self, "_prev_end_event", None)
+            since_prev = None
+            if prev is not None:
+                try:
+                    since_prev = prev.elapsed_time(interval.end_event) / 1000.0
+                except Exception:  # noqa: BLE001 -- unreadable pair: no own span
+                    since_prev = None
+            self._prev_end_event = interval.end_event
+            for reporter in self._reporters:
+                reporter(t=elapsed, since_prev_end=since_prev, **interval.metadata)
+
+    @contextlib.contextmanager
+    def wrap(self, metadata):
+        from sglang.srt.layers.moe import pool_miss_cost
+
+        holder: dict = {}
+        pool_miss_cost.open_window(holder)
+        with SplitDeviceTimer.wrap(self, {**metadata, "miss_window": holder}):
+            try:
+                yield
+            finally:
+                pool_miss_cost.close_window()
+
+
+def _note_paired_miss(families, miss_window) -> None:
+    """PR/PR2: a PAIRED, split-known prefill duration hands its own
+    ``pool.host_fetch`` ms and span count, with the rows its window's host-plan
+    fetches loaded, to the miss record (refused there unless the span count is
+    the window's fetch count). Never raises."""
+    if miss_window is None:
+        return
+    try:
+        from sglang.srt.layers.moe import pool_miss_cost
+
+        ms, n = 0.0, 0
+        for name, stat in (families or {}).items():
+            if str(name).split(":")[-1] == pool_miss_cost.HOST_FETCH_FAMILY:
+                ms += float(stat.total_ms)
+                n += int(stat.count)
+        pool_miss_cost.note_paired(fetch_ms=ms, fetch_count=n, window=miss_window)
+    except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
+        pass
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
@@ -382,12 +448,35 @@ class RankPrefillLog:
         # same one seen again; it is monotone and never reset, so a wrap or a
         # missed read shows up as a gap rather than as a repeat.
         self.last_split_seq: int = 0
+        # RANKSTATS §3 (DASHBOARD-AUS-IPC, 29.09.): the same numbers the line
+        # carries, summed and never reset, so the rigdash reads C1/E1 from the
+        # rankstats file instead of the log. Plain adds after the line is
+        # emitted; the rankstats timer thread only reads this dict.
+        # ``compute_ms``/``wait_ms`` sum only the split-known flushes
+        # (``split_ms`` is their gpu-ms), so compute+wait never mixes with a
+        # graph-covered forward's unsplit time.
+        self.cum: dict = {
+            "chunks": 0, "new_tokens": 0, "cached_tokens": 0, "gpu_ms": 0.0,
+            "split_ms": 0.0, "compute_ms": 0.0, "wait_ms": 0.0, "bubble_ms": 0.0,
+            # FEHLT 7: the chunks' OWN spans (without the wait behind the
+            # predecessor) and their compute part; ``own_n`` counts the chunks
+            # whose own span was readable (the first one of a rank is not)
+            "own_ms": 0.0, "compute_only_ms": 0.0, "own_n": 0,
+            "last": None,
+        }
+
+    def _cum_untimed(self, new_tokens: int, cached_tokens: int) -> None:
+        c = self.cum
+        c["chunks"] += 1
+        c["new_tokens"] += int(new_tokens or 0)
+        c["cached_tokens"] += int(cached_tokens or 0)
 
     @property
     def has_pending(self) -> bool:
         return bool(self._pending)
 
-    def _on_duration(self, t: float, collective_slot=None, **_kwargs) -> None:
+    def _on_duration(self, t: float, collective_slot=None, miss_window=None, since_prev_end=None,
+                     **_kwargs) -> None:
         wait_s = None
         families = None
         if self.clock is not None:
@@ -402,7 +491,7 @@ class RankPrefillLog:
             if collective_slot is not None and collective_slot.graph_capture_skipped:
                 wait_s = None
                 families = None
-        self._durations.append((t, wait_s, families))
+        self._durations.append((t, wait_s, families, miss_window, since_prev_end))
 
     def record(
         self,
@@ -421,6 +510,7 @@ class RankPrefillLog:
                 new_tokens,
                 cached_tokens,
             )
+            self._cum_untimed(new_tokens, cached_tokens)
 
     def _drain_untimed(self) -> None:
         """Emit the queued records without a duration, and drop the durations.
@@ -437,6 +527,7 @@ class RankPrefillLog:
                 new_tokens,
                 cached_tokens,
             )
+            self._cum_untimed(new_tokens, cached_tokens)
 
     def _refuse_pairing(self, skew: int) -> None:
         """Announce once, then stop attaching durations on this rank.
@@ -496,6 +587,9 @@ class RankPrefillLog:
         # trailing gap belongs to.
         bubble_ms = 0.0
         bubble_mb = None
+        # FEHLT 7: the folded chunks' own spans (None once one is unreadable)
+        own_s = 0.0
+        own_wait_s = 0.0
         for _ in range(k):
             n, c, graphed, bub = self._pending.popleft()
             if bub is not None:
@@ -503,11 +597,19 @@ class RankPrefillLog:
                 bubble_mb = bub[1]
             new_tokens += n
             cached_tokens += c
-            t, w, fams = self._durations.popleft()
+            t, w, fams, *_mw = self._durations.popleft()
+            miss_window = _mw[0] if _mw else None
+            since_prev = _mw[1] if len(_mw) > 1 else None
             gpu_s += t
+            if own_s is not None and since_prev is not None:
+                own_s += min(float(t), max(float(since_prev), 0.0))
+                own_wait_s += float(w or 0.0)
+            else:
+                own_s = None
             if graphed or w is None:
                 split_known = False
             else:
+                _note_paired_miss(fams, miss_window)
                 wait_s += w
                 for name, stat in (fams or {}).items():
                     slot_acc = family_acc.get(name)
@@ -516,6 +618,25 @@ class RankPrefillLog:
                     else:
                         slot_acc[0] += stat.total_ms
                         slot_acc[1] += stat.count
+        try:  # L1 (weg2/wake_cohort): the measured extend price bounds the post-wake cohort hold
+            from sglang.srt.weg2 import wake_cohort as _wc
+
+            if k == 1:
+                _wc.note_extend(new_tokens, gpu_s * 1000.0)
+        except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
+            pass
+        try:  # P-MINIFWD (weg2/p_minifwd_hold): the measured lone-rest price bounds the told wait
+            from sglang.srt.weg2 import p_minifwd_hold as _mh
+
+            _mh.note_forward(new_tokens, k, gpu_s * 1000.0)
+        except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
+            pass
+        try:  # X-COST-LINE (weg2/prefill_clock): the measured numbers, never the parsed line
+            from sglang.srt.weg2 import prefill_clock as _pfc
+
+            _pfc.note_batch_cost(new_tokens, cached_tokens, gpu_s * 1000.0, k)
+        except Exception:  # noqa: BLE001 -- an instrument feed never breaks the line
+            pass
         line = (
             "Prefill rank batch, #new-token: %d, #cached-token: %d, "
             "#chunks: %d, gpu-ms: %.1f"
@@ -558,6 +679,34 @@ class RankPrefillLog:
         self.last_gpu_ms = gpu_s * 1000.0
         self.last_wait_ms = (wait_s * 1000.0) if split_known else None
         self.last_split_known = split_known
+        c = self.cum
+        c["chunks"] += k
+        c["new_tokens"] += new_tokens
+        c["cached_tokens"] += cached_tokens
+        c["gpu_ms"] += gpu_s * 1000.0
+        c["bubble_ms"] += bubble_ms
+        compute_ms = None
+        if split_known:
+            compute_ms = max(gpu_s - wait_s, 0.0) * 1000.0
+            c["split_ms"] += gpu_s * 1000.0
+            c["compute_ms"] += compute_ms
+            c["wait_ms"] += wait_s * 1000.0
+        # FEHLT 7: own = the window without the wait behind the predecessor;
+        # compute_only = own minus the collective wait (split known only)
+        own_ms = None if own_s is None else own_s * 1000.0
+        compute_only_ms = (None if own_ms is None or not split_known
+                           else max(own_ms - own_wait_s * 1000.0, 0.0))
+        if own_ms is not None:
+            c["own_ms"] += own_ms
+            c["own_n"] += k
+            if compute_only_ms is not None:
+                c["compute_only_ms"] += compute_only_ms
+        c["last"] = {"t": round(time.time(), 3), "new": new_tokens,
+                     "gpu_ms": round(gpu_s * 1000.0, 1),
+                     "compute_ms": None if compute_ms is None else round(compute_ms, 1),
+                     "own_ms": None if own_ms is None else round(own_ms, 1),
+                     "behind_prev_ms": None if own_ms is None else round(max(gpu_s * 1000.0 - own_ms, 0.0), 1),
+                     "compute_only_ms": None if compute_only_ms is None else round(compute_only_ms, 1)}
         if split_known:
             # Advanced only for a reading a consumer may legitimately count.
             # A graph-covered flush leaves the sequence where it was, so the
@@ -633,6 +782,16 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        # RANKSTATS §3 (C3): lifetime EWMA of the logged accept len/rate and
+        # the last logged graph flag / running count; None until first logged.
+        self.accept_len_ewma = None
+        self.accept_rate_ewma = None
+        self.last_cuda_graph = None
+        self.last_running_reqs = None
+        # C2: the last prefill report's #pending-token (every rank, pre-gate).
+        self.last_pending_tokens = None
+        # C2: the last report's full token usage (the pool stats the line prints).
+        self.last_full_token_usage = None
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -712,7 +871,7 @@ class SchedulerMetricsReporter:
         if getattr(self.scheduler, "device", "") != "cuda":
             return
         self.rank_prefill_log.clock = collective_clock()
-        self.rank_prefill_log.timer = SplitDeviceTimer(
+        self.rank_prefill_log.timer = MissWindowTimer(
             reporter=self.rank_prefill_log._on_duration,
             clock=self.rank_prefill_log.clock,
         )
@@ -1157,6 +1316,7 @@ class SchedulerMetricsReporter:
         # Before the logging-rank gate: the online estimator runs on the rank
         # that carries the lanes, which is not necessarily the logging rank.
         self.prefill_tokens_total += int(prefill_stats.log_input_tokens or 0)
+        self.last_pending_tokens = getattr(prefill_stats, "num_pending_tokens", None)
         # #861k: the wrong-layout detector, also before the gate -- the
         # conformance counters are rank-local and every rank runs the same
         # batch, so every rank keeps its own honest count.
@@ -1183,6 +1343,7 @@ class SchedulerMetricsReporter:
         )
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        self.last_full_token_usage = pool_stats.full_token_usage
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
@@ -1376,6 +1537,7 @@ class SchedulerMetricsReporter:
         num_running_reqs = len(batch.reqs)
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        self.last_full_token_usage = pool_stats.full_token_usage
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 
         if RECORD_STEP_TIME:
@@ -1482,6 +1644,18 @@ class SchedulerMetricsReporter:
                 f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
             )
 
+        # RANKSTATS §3 (C3): the values this line prints, kept for the
+        # rankstats timer (read-only there); EWMA over the log intervals.
+        if spec_accept_length:
+            a = 0.2
+            self.accept_len_ewma = (
+                float(spec_accept_length) if self.accept_len_ewma is None
+                else (1 - a) * self.accept_len_ewma + a * float(spec_accept_length))
+            self.accept_rate_ewma = (
+                float(spec_accept_rate) if self.accept_rate_ewma is None
+                else (1 - a) * self.accept_rate_ewma + a * float(spec_accept_rate))
+        self.last_cuda_graph = bool(can_run_cuda_graph)
+        self.last_running_reqs = num_running_reqs
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "

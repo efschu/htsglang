@@ -1,6 +1,12 @@
 {
  "profile": "nextflash",
  "what": "Measured records of the Qwen3.8-Flash-Next profile. Every row NF never measured is BORROWED from qwen27b by name (UNIFY_PLAN Risiko (c)); an NF record of the same name replaces it.",
+ "inventory": [
+  "RTX5090",
+  "RTX3080",
+  "RTX3080"
+ ],
+ "inventory_why": "HW-GENERIC 1002: the card inventory (weg2/card_identity.py calibration classes, card order = order_cards) every POSITIONAL record below was measured on -- the reference rig nvml1 RTX 5090 32607 MiB sm120, nvml0/nvml2 RTX 3080 20480 MiB sm86. A launch on other cards is refused HW-UNCALIBRATED instead of borrowing them.",
  "records": [
   {
    "name": "P_DRAFT_RESIDENT_BUDGET_MIB",
@@ -55,16 +61,17 @@
   {
    "name": "D_AWAKE_REST_MIB",
    "value": [
-    3186,
+    2672,
     null,
     null
    ],
-   "provenance": "rc12c: what the awake D rank holds BEYOND its booked form, measured against the form and never against the budget (weg2/d_awake_rest.py): demand at the edge (torch OOM line: capacity - free - other processes + refused request) - the form's posts (W+R + mamba + spec + activation + 262144 x cell, same log). TP0: rc12 3129 and 3077, rc12b 3039, rc12c 3186 -- under budgets 29624/29624/29144/28288 the rest stays 3039-3186 (the budget-relative D_OVERSHOOT_MIB it replaces went 428/353/826/1798: no fixpoint). Covers CUDA graphs 498, untagged 2036-2340, unreusable allocator/private-pool cache, unattributed 331-362 at the edge. LOWER bound (the rank died there). 3080 ranks: no edge on NF, not measured (null: the builtin 404 stays there).",
+   "provenance": "y5a (30.09., same checkpoint, NF-Operator decision): 3186 - 514 = 2672 on TP0. The rank's tightest moment of the whole y5a boot (WEG2-VRAM-PEAK, min over windows of min(card_free_start, card_free_end) - transient_mib) was 1281 MiB free on the 5090 (round, 17:45:00Z, transient 708; chunk 1437, idle 1847, flip 1747) while the plan booked awake 3186 + floor 767: 1281 - 767 = 514 MiB of the booked rest were never held above the corridor floor. The floor stays; the rest moves to experts (VRAM law). NOT a new edge measurement: an upper bound of what y5a's load held; the rc12c edge value below stays the history. 3080 ranks unchanged (booked 404, measured 440/422 transient). -- WAS: rc12c: what the awake D rank holds BEYOND its booked form, measured against the form and never against the budget (weg2/d_awake_rest.py): demand at the edge (torch OOM line: capacity - free - other processes + refused request) - the form's posts (W+R + mamba + spec + activation + 262144 x cell, same log). TP0: rc12 3129 and 3077, rc12b 3039, rc12c 3186 -- under budgets 29624/29624/29144/28288 the rest stays 3039-3186 (the budget-relative D_OVERSHOOT_MIB it replaces went 428/353/826/1798: no fixpoint). Covers CUDA graphs 498, untagged 2036-2340, unreusable allocator/private-pool cache, unattributed 331-362 at the edge. LOWER bound (the rank died there). 3080 ranks: no edge on NF, not measured (null: the builtin 404 stays there).",
    "boots": [
     "dkrnfh91bar1dauer09262249",
     "dkrnfh91bar1dauer09262302",
     "dkrnfh91bar1dauer09270007",
-    "dkrnfh91bar1dauer09270103"
+    "dkrnfh91bar1dauer09270103",
+    "dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2arrwretadhmlefrwfpfopwhctsesrwtswbar1dauer09301740"
    ],
    "kind": "memory",
    "power_limit_w": null,
@@ -90,12 +97,13 @@
   {
    "name": "D_EXTEND_GROWTH_MIB",
    "value": [
-    2304,
-    null,
-    null
+    2434,
+    2176,
+    1728
    ],
-   "provenance": "rc12f: what ONE D extend window adds to torch reserved on D-TP0 = peak_reserved of the window that holds the extend's peak minus reserved at the window's start (WEG2-VRAM-PEAK), max over the extends with >= 512 rows (weg2/extend_trim.extend_growth_mib): rc12e (f078f89a08) 03:39:12 rows=4096 transient 920 -> +2304 (card_free 2371 -> 67), 03:41:23 +2272, 03:33:37 +2026 (retry); rc12d (227ae1becd) 02:37:45 +1974, 02:41:14 +1852 (retry); rc12c/rc12b below. The allocator lays new segments on top of a cache it cannot reuse: growth/transient 2.0-2.5 on the 4096-row extends, so the booked activation (1104) under-prices the extend's card cost. Measured against the window start, never against the trim threshold: a trim empties the cache and the growth that follows is the extend's real segment demand, bounded -- no ratchet. The trim threshold is floor + max(activation, this). 3080 ranks: not measured (null: floor + activation stays).",
+   "provenance": "rc12f: what ONE D extend window adds to torch reserved on D-TP0 = peak_reserved of the window that holds the extend's peak minus reserved at the window's start (WEG2-VRAM-PEAK), max over the extends with >= 512 rows (weg2/extend_trim.extend_growth_mib): rc12e (f078f89a08) 03:39:12 rows=4096 transient 920 -> +2304 (card_free 2371 -> 67), 03:41:23 +2272, 03:33:37 +2026 (retry); rc12d (227ae1becd) 02:37:45 +1974, 02:41:14 +1852 (retry); rc12c/rc12b below. The allocator lays new segments on top of a cache it cannot reuse: growth/transient 2.0-2.5 on the 4096-row extends, so the booked activation (1104) under-prices the extend's card cost. Measured against the window start, never against the trim threshold: a trim empties the cache and the growth that follows is the extend's real segment demand, bounded -- no ratchet. The trim threshold is floor + max(activation, this). 29.09. (z30x2 flip boot dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30x2bar1dauer09291130, 424346f693, D.log _0929_113056, trim ON 3071/1724/1725): the same measure per rank, reserved at a window's start = reserved_mib of the rank's previous WEG2-VRAM-PEAK line -- TP0 11:44:39 4063 rows +2434 (transient 1296), 11:40:17 4096 +2184; TP1 11:40:17 4096 +2176 (transient 930), 11:44:39 4063 +2066 (retry); TP2 11:44:39 4063 +1728 (transient 897, retry), 11:40:17 4096 +1724 (retry). The 3080 ranks grow 1.9-2.3x their transient like TP0 did; with the null they trimmed at floor + 1024 = 1724/1725, too low: card_free fell to 16 (TP1) / 78 (TP2) MiB under the floors 700/701 with 4 alloc retries. TP0 takes the new maximum (2434 > 2304). Threshold now floor + growth = 3201/2876/2429.",
    "boots": [
+    "dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30x2bar1dauer09291130",
     "dkrnfh91bar1dauer09270311",
     "dkrnfh91bar1dauer09270212",
     "dkrnfh91bar1dauer09270103",
@@ -124,6 +132,263 @@
    "kind": "memory",
    "power_limit_w": null,
    "power_limit_source": "not a power-dependent quantity (bytes per extend row)"
+  },
+  {
+   "name": "D_POOL_PEAK_NONRES_ROWS",
+   "value": [
+    89,
+    32,
+    43
+   ],
+   "provenance": "rc12z30r3 (ad95392095, boot dkrnfh91dprsavisadoptstcutvsyncodxbz3bar1dauer09290548, 29.09. 05:48Z, flip steady state, SGLANG_DEBUG_MOE_POOL_DEMAND=64): maximum of 'MOE-POOL-DEMAND (H95) ... max_nonres_per_step' per D rank over 117 lines each (TP0 89 of C 100, TP1 32 of C 48, TP2 43 of C 48; over_C_steps 0). Stage form off in that boot (SGLANG_WEG2_D_KV_STAGE_TOKENS=262144), so C was the whole LRU. The floor of the stage solve (launcher kv_stage_lru_floor) scales it by the non-resident span of the form it prices (D_POOL_PEAK_NONRES_SPAN_ROWS).",
+   "boots": [
+    "dkrnfh91dprsavisadoptstcutvsyncodxbz3bar1dauer09290548"
+   ],
+   "kind": "census",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (expert ids a step routes)"
+  },
+  {
+   "name": "D_POOL_PEAK_NONRES_SPAN_ROWS",
+   "value": [
+    204,
+    61,
+    94
+   ],
+   "provenance": "the non-resident span E - R per D rank of the form D_POOL_PEAK_NONRES_ROWS was measured on (dkrnfh91dprsavisadoptstcutvsyncodxbz3bar1dauer09290548 front 'FRACTION-SOLVE D rang<r>': E 227/128/160, R 23/67/66; POOL-SCHRITT 'Pflicht je Rang [204, 61, 94] = min(Ids, E-R)').",
+   "boots": [
+    "dkrnfh91dprsavisadoptstcutvsyncodxbz3bar1dauer09290548"
+   ],
+   "kind": "geometry",
+   "power_limit_w": null,
+   "power_limit_source": "not a power-dependent quantity (a row count of the form)"
+  },
+  {
+   "name": "P_ACTIVATION_MIB",
+   "value": [
+    5984,
+    2952,
+    2944
+   ],
+   "provenance": "#242: group P's prefill transient per P stage at chunk 16384, planner definition peak_allocated - allocated after the chunk (p_card_chunk ChunkWindow.transient_planner_mib), maximum over EVERY WEG2-VRAM-PEAK phase=chunk window of 62 NF boots 26.-28.09. (cut 29,11,8, FR_P 0.324/0.637/0.734, chunk 16384), rounded up to 8 MiB. LOAD STATE = sequences in ONE chunk (the rank's last '#969N ADMIT bs=' before the window): PP0 bs1 3441 (n=306, rows 16384), bs2 4394, bs3 5310 (dkrnfh91dprsabar1dauer09271947 20:30:27, rows 16320), bs4 5979 (dkrnfh91visbar1dauer09271103 11:09:50, rows 16300), bs5 3947 (11182 rows); PP1 2945 and PP2 2941 in every bs (n~2800). COVERAGE: bs 1..5 per chunk seen, bs6 in one chunk (6 seats) NOT seen -- not extrapolated. ELASTIC: freed after the forward (the allocator keeps it reserved). Replaces the builtin 16384 support point 3697/3287/3267 (fnFL2x118..x146, one sequence per chunk): the runtime post and the pool model book it per stage; the P-KARTE takes max(builtin, record).",
+   "boots": [
+    "dkrnfh91visbar1dauer09271103",
+    "dkrnfh91dprsabar1dauer09271947",
+    "dkrnfh91dprsavisbar1dauer09280831",
+    "dkrnfh91bar1dauer09270212"
+   ],
+   "kind": "memory",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "POWER-LIMIT line of every named boot: nvml0=230 nvml1=400 nvml2=230 W",
+   "pp_layer_ratio": [
+    29,
+    11,
+    8
+   ],
+   "n": 62
+  },
+  {
+   "name": "P_PP_STAGE_FIXED_MIB",
+   "value": "1584.0,527.1,1065.4",
+   "provenance": "#242: per-stage non-layer weight + runtime state of THIS checkpoint, recovered as the runtime's own 'KV budget posts' weights + runtime state (16.836/10.475/9.221 GiB = 17240.1/10726.4/9442.3 MiB, identical on every 28.09. NF boot of this FR) minus the pool model's per-layer term at the same FR and cut (PP-CUT POOL TERM 539.87/927.21/1047.11 MiB/layer x 29/11/8, recovered from PP-POOL-JOIN priced_per_rank 796942/778073/653934 x cell 7168/3072/2048 B). With it the PP-POOL-JOIN of the 11:11 boot joins priced and realised available bytes to <= 2 MiB/rank (before: -758/-988/-2883 MiB -- the 27B row 2342/1106/3518 carried a draft head on the last stage that NF's P no longer holds, H25). One FR measured: a boot at another FR_P re-checks it (Metall-Marker PP-POOL-JOIN).",
+   "boots": [
+    "dkrnfh91dprsavisnoadopts0bar1dauer09281111",
+    "dkrnfh91dprsavisbar1dauer09280831"
+   ],
+   "kind": "memory",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "POWER-LIMIT line of every named boot: nvml0=230 nvml1=400 nvml2=230 W",
+   "pp_layer_ratio": [
+    29,
+    11,
+    8
+   ],
+   "n": 2
+  },
+  {
+   "name": "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
+   "value": 1.5602,
+   "provenance": "#242: the runtime's 'mamba state pool + speculative intermediate state + prefill activation reserve' post (1.072/0.390/0.292 GiB; spec 0 and activation 0 on P since the transient has its own post) over linear layers x slots (22/8/6 x 32): 1.5594/1.5602/1.5573 MiB per linear layer per slot, maximum 1.5602 -- the 27B row measured 1.5588, same GDN state geometry.",
+   "boots": [
+    "dkrnfh91dprsavisnoadopts0bar1dauer09281111",
+    "dkrnfh91dprsavisbar1dauer09280831"
+   ],
+   "kind": "memory",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "not a power-dependent quantity (bytes of the GDN state)",
+   "n": 6
+  },
+  {
+   "name": "P_OVERSHOOT_MIB",
+   "value": [
+    452,
+    397,
+    0
+   ],
+   "provenance": "#240: group P's awake footprint beyond its budget per P ordinal, measured at the CARD (CUDA context and every non-torch byte included, the part a torch-only peak_reserved never sees): excess = corridor + booked overshoot - free card at the window peak (card_free_mib - (peak_reserved - reserved) of every WEG2-VRAM-PEAK window), and the record is the part the corridor's builtin awake_overshoot 404 does not carry: max(0, excess - 404), so the free card at the observed peak lands on the measured floor instead of below it. Assumes the P footprint follows its budget 1:1 (FR_P residency fills it) -- the conservative side. Worst window per ordinal: PP0 +856 excess (free 1523 MiB, 7d507357b9 14:47, chunk) -> 452; PP1 +801 (free 698, dwell30 14:59, chunk) -> 397; PP2 +74 at most (free >= 1700 in every boot) -> 0. Replaces the 27B row [920, 0, 512] (boot weg2ls2b2) the NF line borrowed since 76f8debf2c: PP0 budget +468, PP1 -397, PP2 +512 against it. Coverage: 10 boots x 69-596 windows per rank, chunk/idle/flip/round phases, cut 29,11,8, bs 1..5 in a chunk; bs6 in one chunk not seen. The P activation is booked inside the budget (P_ACTIVATION_MIB, #242), so a heavier chunk raises the torch peak inside the budget, not this excess.",
+   "boots": [
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281209",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281220",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281322",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281447",
+    "dkrnfh91dprsavisnoadoptstdwell30bar1dauer09281459",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281515",
+    "dkrnfh91dprsavisnoadoptstdwell30bar1dauer09281540",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281617",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281752",
+    "dkrnfh91dprsavisnoadoptstbar1dauer09281938"
+   ],
+   "kind": "memory",
+   "power_limit_w": {
+    "RTX5090": 400.0,
+    "RTX3080": 230.0
+   },
+   "power_limit_source": "not a power-dependent quantity (bytes outside the budget)",
+   "n": 10
+  },
+  {
+   "name": "FORM_MATRIX_AXES",
+   "kind": "geometry",
+   "fmt": "int4",
+   "provenance": "Planer-Sitz 29.09., abgestimmt mit dem Architektur-Sitz (VRAM-VERTRAG-0929.md §3.3 'NF-Formen D'; FORM-MESSMATRIX-ENTWURF-0929.md). Formen = D-Formen der NF-Linie (-e2cut-z30w-park / -z30x-frp). capacity = RECHNUNG aus dem OVERRIDE-Pin --max-total-tokens 262144 (bs x Tiefe <= 262144), wird ab M1 aus vram_plan kv.tokens gelesen; keine Messung",
+   "value": {
+    "forms": {
+     "A": {
+      "arm": "e2cut-z30w-park",
+      "axes": {
+       "roles": "host,worker,worker",
+       "weights": "1,0,0",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "S0",
+       "owned_cut": "round"
+      }
+     },
+     "A_T3232": {
+      "arm": null,
+      "axes": {
+       "roles": "host,worker,worker",
+       "weights": "1,0,0",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "S0",
+       "owned_cut": "round",
+       "tokens": "0,32,32"
+      }
+     },
+     "A_T0": {
+      "arm": "st-vsync",
+      "axes": {
+       "roles": "host,worker,worker",
+       "weights": "1,0,0",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "S0",
+       "tokens": "tp0"
+      }
+     },
+     "A_ST": {
+      "arm": null,
+      "startable": false,
+      "why_not": "bis M1 D-solo -kvstage gruen (Stufenleiter unter dem Schnitt, S3g/S3h, Stufen vom Planer statt STAGE_TOKENS-Pin)",
+      "axes": {
+       "roles": "host,worker,worker",
+       "weights": "1,0,0",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "ladder",
+       "owned_cut": "round"
+      }
+     },
+     "B": {
+      "arm": null,
+      "startable": false,
+      "why_not": "Entscheid 29.09. 00:05Z: nicht vorgesehen, bis ein gemessener Bedarf da ist",
+      "axes": {
+       "roles": "same",
+       "weights": "dense_tp",
+       "transport": "bar1",
+       "spec": "mtp3",
+       "kv_stage": "S0"
+      }
+     }
+    },
+    "bs": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ],
+    "depths": [
+     "2k",
+     "10k",
+     "32k",
+     "97k",
+     "240k",
+     "257k"
+    ],
+    "texts": [
+     "code",
+     "prose",
+     "thinking"
+    ],
+    "temps": [
+     "warm"
+    ],
+    "capacity": {
+     "A": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 2,
+      "240k": 1,
+      "257k": 1
+     },
+     "A_T3232": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 2,
+      "240k": 1,
+      "257k": 1
+     },
+     "A_T0": {
+      "2k": 6,
+      "10k": 6,
+      "32k": 6,
+      "97k": 2,
+      "240k": 1,
+      "257k": 1
+     }
+    },
+    "cell_attributes": [
+     "tokens(A: Planer, Trockenlauf 29.09. 0,44,20)",
+     "fr_d",
+     "scratch_rows",
+     "moe_ratio(Profil 183,137,168 = OVERRIDE; Planer 215,121,152)"
+    ],
+    "identity_terms": [
+     "model",
+     "precision",
+     "cards",
+     "links",
+     "power_limit_w",
+     "moe_ratio",
+     "p_chunk",
+     "graph_buckets"
+    ]
+   }
   }
  ],
  "borrow": {
@@ -132,11 +397,8 @@
    "DC_MEASURED_D_5090_MIB",
    "DC_MEASURED_D_3080_MIB",
    "DC_MEASURED_D_XCHG_MIB",
-   "P_OVERSHOOT_MIB",
    "CALIBRATION_LAYERS",
    "MEASURED_MS_PER_LAYER",
-   "P_PP_STAGE_FIXED_MIB",
-   "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
    "X_RECORDED_R_D_TOKS",
    "X_RECORDED_R_P_TOKS",
    "X_RECORDED_FLIP_S",

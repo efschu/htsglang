@@ -23,7 +23,11 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import (
+    chat_encoding,
+    encoding_dsv4,
+    encoding_dsv32,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -65,6 +69,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
 )
+from sglang.srt.managers import weg2_resumable_depth
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -1137,6 +1142,7 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        resumable_depths = {}
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
@@ -1166,6 +1172,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                # #59: only the finishing output carries it.
+                if content["meta_info"].get("weg2_resumable_depth") is not None:
+                    resumable_depths[index] = content["meta_info"]
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
@@ -1296,7 +1305,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            # #59: the Weg-2 front reads the last data line that names it.
+            sglext_resumable = weg2_resumable_depth.from_meta_infos(
+                list(resumable_depths.values())
+            )
+            # SEQ-HASH: the finishing output's sequence mark (first choice that has one)
+            sglext_seq = next((mi.get("weg2_seq_hash") for mi in resumable_depths.values()
+                               if isinstance(mi, dict) and mi.get("weg2_seq_hash")), None)
+
+            if (
+                sglext_routed is not None
+                or sglext_details is not None
+                or sglext_resumable is not None
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1305,6 +1326,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        weg2_resumable_depth=sglext_resumable,
+                        weg2_seq_hash=sglext_seq,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1392,12 +1415,24 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         # H84: only a Weg-2 D group puts weg2_prefill_s into meta_info.
         weg2_prefill_s = first_ret["meta_info"].get("weg2_prefill_s")
+        # #59: MIN over the choices that carry it (0 is sent -- `is not None`).
+        resumable_depth = weg2_resumable_depth.from_meta_infos(
+            [r["meta_info"] for r in ret]
+        )
         response_sglext = None
-        if routed_experts or cached_tokens_details or weg2_prefill_s:
+        seq_hash = first_ret["meta_info"].get("weg2_seq_hash")  # SEQ-HASH
+        if (
+            routed_experts
+            or cached_tokens_details
+            or weg2_prefill_s
+            or resumable_depth is not None
+        ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
                 weg2_prefill_s=weg2_prefill_s,
+                weg2_resumable_depth=resumable_depth,
+                weg2_seq_hash=seq_hash,
             )
 
         for idx, ret_item in enumerate(ret):
@@ -1782,6 +1817,25 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.reasoning_effort != "none"
         ):
             request.skip_special_tokens = False
+
+    def supports_native_reasoning_history(self) -> bool:
+        """Whether the chat encoder takes history as ``reasoning_content`` rather
+        than via :meth:`wrap_reasoning_history`; see
+        :func:`chat_encoding.spec_owns_reasoning_history` for why.
+
+        Fork extension: on the HF chat-template path (no custom spec) the answer
+        is also yes when the loaded template renders ``reasoning_content``
+        itself (:func:`chat_encoding.template_owns_reasoning_history`), so
+        ``/v1/messages`` hands the template the same messages as an equivalent
+        ``/v1/chat/completions`` request would.
+        """
+        spec = self.chat_encoding_spec
+        if chat_encoding.spec_owns_reasoning_history(spec):
+            return True
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        return chat_encoding.template_owns_reasoning_history(
+            getattr(tokenizer, "chat_template", None)
+        )
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.

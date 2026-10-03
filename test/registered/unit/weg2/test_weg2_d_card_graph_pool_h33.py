@@ -408,7 +408,7 @@ def test_the_launcher_refuses_x128_and_the_h30_rungs_before_a_rank_loads(
         _launcher_ns(tmp_path / "x141", "0.06,0.44,0.365", "82,48,48"), cards,
         LIVE_BUDGETS, lines.append, "D")
     head = [ln for ln in lines if "KARTE D (H33" in ln]
-    assert head and "KARTEN-DECKE je Rang ['0.067', '0.634', '0.519']" in head[0], lines
+    assert head and "KARTEN-DECKE je Rang ['0.067', '0.648', '0.525']" in head[0], lines
     # dieselbe Antwort aus den Logs selbst (--d-card-reference-logs)
     logs = ",".join(os.path.join(FIX, b + ".D.lines") for b in ("fnFL2x141", "fnFL2x144"))
     lines = []

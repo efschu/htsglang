@@ -80,12 +80,11 @@ def test_every_other_route_is_unchanged():
     assert route(500, 20_000, SPEC_X, SPEC_CARRIER_MAX) == "short"
     # long below the carrier: X < uncached <= carrier, the pre-existing P route
     assert route(18_453, 20_000, SPEC_X, SPEC_CARRIER_MAX) == "long"
-    # above the carrier but D CAN prefill it: the single prefill still stands
-    assert route(500, SPEC_CARRIER_EST, SPEC_X, SPEC_CARRIER_MAX) == "carrier_single"
+    # above the carrier, D could prefill it: law 02.10. (P's KV stages cover
+    # D's max session) deleted the D single prefill -- the P route serves it
+    assert route(500, SPEC_CARRIER_EST, SPEC_X, SPEC_CARRIER_MAX) == "long"
     # bounds disabled
-    # x_tokens=0 disables D's cap, so D can prefill anything -- and above the
-    # carrier that is still the single-prefill route, unchanged.
-    assert route(60_000, 100_000, 0, SPEC_CARRIER_MAX) == "carrier_single"
+    assert route(60_000, 100_000, 0, SPEC_CARRIER_MAX) == "long"
     assert route(60_000, 100_000, SPEC_X, 0) == "long"
 
 

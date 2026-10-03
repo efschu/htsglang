@@ -145,15 +145,16 @@ def test_072_on_tp1_dies_at_the_kv_pool_and_062_does_not():
     assert good.verdict == "PASST"
 
 
-def test_052_on_tp2_misses_the_262k_it_served_117376():
+def test_052_on_tp2_keeps_the_x100_rest_and_no_longer_owes_262k_keys():
     """Bug regression x100: TP2 bei 0.52 ueberlebte den KV-Pool mit 0.084 GiB
-    Rest und servierte 117376 Token -- die Rechnung muss denselben Rest nennen
-    und die Fraction wegen der 262k-Pflicht verweigern."""
+    Rest und servierte 117376 Token -- die Rechnung nennt denselben Rest. Die
+    262k, die x100 dort verfehlte, waren QSA-Schluessel (768 B/Token); seit
+    #239 S0 baut ein Form-A-Worker keine, er schuldet keine KV mehr."""
     fit = _solve((0.006, 0.62, 0.52))[2]
     assert abs(fit.pre_kv_rest_mib - 0.084 * 1024) <= 3
-    assert fit.verdict == "262K VERFEHLT"
+    assert fit.kv_mib == 0.0 and fit.verdict == "PASST"
     text = er.refusal_text(_solve((0.006, 0.62, 0.52)), label="D")
-    assert text is not None and text.startswith("W122 ") and "rang2" in text
+    assert text is None or "rang2" not in text
 
 
 @pytest.mark.parametrize("budgets", [LIVE_BUDGETS, (29424, 18184, 17784)])
@@ -289,5 +290,6 @@ def test_the_launcher_refuses_x98_before_a_rank_loads(tmp_path, monkeypatch):
             lines.append,
             "D",
         )
-    assert any("DECKE je Rang ['0.098', '0.634', '0.519']" in ln for ln in lines), lines
+    # #239 S0: Worker ohne QSA-Schluessel (768 B/Token), +192 MiB je Worker
+    assert any("DECKE je Rang ['0.098', '0.648', '0.525']" in ln for ln in lines), lines
     assert not any(ln.startswith("W122") for ln in lines)

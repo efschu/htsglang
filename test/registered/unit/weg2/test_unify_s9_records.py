@@ -51,7 +51,12 @@ OLD_27B = {
 class TestRecordsAreTheOldLiterals(unittest.TestCase):
     def test_qwen27b_constants_unchanged(self):
         row = F.PROFILES["qwen27b"]
-        self.assertEqual(set(row.constants), set(OLD_27B))
+        # desk/27b-no-reserve-0929: a NEW measurement, not a changed literal --
+        # D's awake rest beyond its budget line (weg2/budget_rest.py)
+        # desk/27b-d-alloc-overhang-0929: two more NEW measurements (the rest's
+        # posts under the P0 torch cache cap, weg2/budget_rest.py --capped)
+        self.assertEqual(set(row.constants) - {"D_AWAKE_REST_BOOKED_MIB", "D_TORCH_CAP_OTHER_MIB",
+                                               "D_AWAKE_REST_CAPPED_MIB"}, set(OLD_27B))
         for n, v in OLD_27B.items():
             got = row.constant(n)
             self.assertEqual(got, v, n)
@@ -67,14 +72,21 @@ class TestRecordsAreTheOldLiterals(unittest.TestCase):
         # (D_OVERSHOOT_MIB, a ratchet without fixpoint) -- neither its own
         # nor a borrowed D_OVERSHOOT_MIB any more
         self.assertNotIn("D_OVERSHOOT_MIB", row.constants)
-        self.assertEqual(row.constant("D_AWAKE_REST_MIB"), (3186, None, None))
+        # y5a (30.09.): 3186 (rc12c edge) - 514 (TP0's tightest y5a moment above the floor)
+        self.assertEqual(row.constant("D_AWAKE_REST_MIB"), (2672, None, None))
         self.assertEqual(row.constant("D_FIXED_MIB"), (7442, 1036, 914))
         got = dict(F.borrowed_constants("nextflash"))
-        self.assertEqual(set(got), set(OLD_27B) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "D_OVERSHOOT_MIB"})
+        # #242 (28.09.): P's stage-fixed post and mamba rate measured on NF;
+        # #240: P's awake overshoot measured at the NF card
+        self.assertEqual(set(got), set(OLD_27B) - {"P_DRAFT_RESIDENT_BUDGET_MIB", "D_OVERSHOOT_MIB",
+                                                   "P_PP_STAGE_FIXED_MIB",
+                                                   "P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT",
+                                                   "P_OVERSHOOT_MIB"})
+        self.assertEqual(row.constant("P_OVERSHOOT_MIB"), (452, 397, 0))
         self.assertEqual(set(got.values()), {"qwen27b"})
         for n in got:
             self.assertEqual(row.constant(n), OLD_27B[n], n)
-        self.assertIn("16 constant row(s) BORROWED", F.borrowed_constants_line("nextflash"))
+        self.assertIn("13 constant row(s) BORROWED", F.borrowed_constants_line("nextflash"))
 
     def test_launcher_aliases(self):
         if L is None:

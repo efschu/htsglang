@@ -1302,6 +1302,9 @@ def _apply_stack_result(
 ) -> None:
     cache.host_pool_group = result.host_pool_group
     cache.cache_controller = result.cache_controller
+    if isinstance(result.cache_controller, HybridCacheController):
+        # SA: this tree cuts a short read to the anchor the read votes
+        result.cache_controller.short_read_anchor_consumer = True
 
     for ct, host_pool in result.component_host_pools.items():
         cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]

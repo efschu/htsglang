@@ -80,6 +80,9 @@ _STATE: Dict[str, Any] = {
     # ``reset_peak_memory_stats`` nor this module resets them)
     "retries0": None,
     "ooms0": None,
+    # VRAM-Vertrag M2: the largest batch (seats n) a window saw -- an int
+    # compare per forward, the window end hands it to weg2/vram_actual
+    "seats": 0,
 }
 
 #: H59: the two cumulative allocator counters the line reports as a delta per
@@ -160,8 +163,11 @@ def _delta(now: Optional[int], start: Optional[int]) -> str:
     return "na" if now is None or start is None else str(max(0, int(now) - int(start)))
 
 
-def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time) -> Optional[str]:
-    """Close the open window: read, fold, re-base, print. Returns the line."""
+def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time, *,
+           rows: int = 0, leg: Optional[str] = None) -> Optional[str]:
+    """Close the open window: read, fold, re-base, print. Returns the line.
+    VRAM-Vertrag M2: the window's peaks also go to the rank's RankState
+    ``vram`` block (max per state key, written only on a change)."""
     try:
         pa, pr, a, r, retries, ooms = _stats(cuda)
     except Exception as exc:  # noqa: BLE001
@@ -209,6 +215,12 @@ def _close(cuda, rank: int, phase: str, extra: str = "", clock=time.time) -> Opt
         f"alloc_retries_total={'na' if retries is None else retries}"
     )
     logger.info(line)
+    seats = int(_STATE.get("seats") or 0)
+    _STATE["seats"] = 0
+    from sglang.srt.weg2 import vram_actual
+
+    vram_actual.on_window(phase, peak_alloc=pa, peak_reserved=pr, start_alloc=start_alloc,
+                          rows=rows, leg=leg, seats=seats)
     return line
 
 
@@ -233,14 +245,18 @@ def on_forward_end(runner, forward_batch, cuda) -> Optional[str]:
     rank = _rank_of(runner)
     _STATE["rank"] = rank
     is_verify = bool(getattr(mode, "is_target_verify", lambda: False)())
+    bs = getattr(forward_batch, "batch_size", 0) or 0
     if mode.is_extend() and not is_verify:
         ids = getattr(forward_batch, "input_ids", None)
         rows = int(ids.shape[0]) if ids is not None else -1
         if _STATE["rounds"]:
             _close(cuda, rank, "round")
-        return _close(cuda, rank, "chunk", f" rows={rows}")
+        _STATE["seats"] = int(bs)
+        return _close(cuda, rank, "chunk", f" rows={rows}", rows=max(0, rows))
     if mode.is_decode() or is_verify:
         _STATE["rounds"] += 1
+        if bs > _STATE["seats"]:
+            _STATE["seats"] = int(bs)
         t0 = _STATE["t0"]
         if _STATE["rounds"] >= _round_every() or (t0 is not None and time.time() - t0 >= ROUND_WINDOW_MAX_S):
             return _close(cuda, rank, "round")
@@ -318,7 +334,8 @@ def flip_leg(leg: str):
             finally:
                 try:
                     _close(cuda, rank, "flip",
-                           f" leg={leg} rpc_ms={(time.perf_counter() - t) * 1000:.0f} rpc={ok}")
+                           f" leg={leg} rpc_ms={(time.perf_counter() - t) * 1000:.0f} rpc={ok}",
+                           leg=leg)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("%s leg skipped: %s", MARKER, exc)
 

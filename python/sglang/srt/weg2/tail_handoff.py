@@ -55,6 +55,7 @@ import itertools
 import logging
 import os
 import threading
+import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
@@ -111,14 +112,62 @@ def fold_enabled() -> bool:
     return bool(envs.SGLANG_WEG2_ENABLE_P_TAIL_FOLD.get()) and skip_extend_enabled()
 
 
-def fold_applies(n_tokens: int, page_size: int) -> bool:
+def fold_applies(n_tokens: int, page_size: int, start: Optional[int] = None,
+                 claim: Optional[int] = None, grid: Optional[int] = None) -> bool:
     """H63: may the tail of an N-token prompt run inside its last chunk?
-    Only where the last chunk's extra_buffer track lands on the same page
-    anchor the cut would give, floor_page(N) == floor_page(N-1), i.e. N not a
-    page multiple; at N % page == 0 the fold would anchor at N (one token
-    deeper than any reader may claim) and the cut stays."""
+    Where the last chunk's extra_buffer track lands on the same page anchor
+    the cut would give, floor_page(N) == floor_page(N-1), i.e. N not a page
+    multiple. At N % page == 0 the default track anchors at N (one token
+    deeper than any reader may claim); the fold then applies only where the
+    CLAIM ANCHOR track (``schedule_batch._weg2_claim_track``) moves that
+    anchor onto the reader's claim N - page INSIDE this last chunk
+    ``[start, N)`` (:func:`page_end_fold_applies`), otherwise the cut stays."""
     page = int(page_size or 1)
-    return fold_enabled() and page > 1 and int(n_tokens) % page != 0
+    if not (fold_enabled() and page > 1):
+        return False
+    if int(n_tokens) % page != 0:
+        return True
+    return page_end_fold_applies(n_tokens, page, start, claim, grid)
+
+
+def track_grid(page_size: int) -> int:
+    """The grid the extend track moves on (``server_args.mamba_cache_chunk_size``
+    = max(FLA chunk, page)); the page where no server args exist (desk)."""
+    page = max(1, int(page_size or 1))
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        g = int(getattr(get_server_args(), "mamba_cache_chunk_size", 0) or 0)
+    except Exception:  # noqa: BLE001 -- desk callers without a server
+        g = 0
+    return g if g > 0 else page
+
+
+def page_end_fold_applies(n_tokens: int, page_size: int, start: Optional[int],
+                          claim: Optional[int], grid: Optional[int] = None) -> bool:
+    """P-MINIFWD (y3r 09292330, SGLANG_WEG2_TAIL_FOLD_PAGE_END): the fold of a
+    page-multiple prompt. The END-ANCHOR split held its last 4 tokens back
+    (``WEG2 END-ANCHOR SPLIT ... 32828 of 32832``): a forward of its own for
+    the tail (1.37-1.57 s on PP0) and, because the body [.., N-4) was then
+    TRUNCATED, no co-admission of a waiting request -- the 60/124-token body
+    remainder ran alone too (weg2-74 chain: six 124-token forwards of
+    1.1 s each, their successors' chunk 0 shrank to 16320). The split existed
+    only to put the recurrent anchor at N - page, where a bigram reader of
+    N claims (floor_page(N-2)). The CLAIM ANCHOR track puts it there inside
+    the last chunk when that chunk starts below the claim on the track grid:
+    ``start < claim < N`` and ``(claim - start) % grid == 0`` -- exactly
+    ``fork_anchor.track_target(start, N, claim, grid, N) == claim``. Anything
+    else (no claim: not group P / not the bigram keying / a P-trim request; a
+    last chunk starting at or above the claim) keeps the split."""
+    if not envs.SGLANG_WEG2_TAIL_FOLD_PAGE_END.get():
+        return False
+    if start is None or claim is None:
+        return False
+    n, page, s, c = int(n_tokens), int(page_size), int(start), int(claim)
+    g = int(grid) if grid else track_grid(page)
+    if c != n - page or not (s < c < n) or g <= 0:
+        return False
+    return (c - s) % g == 0
 
 
 # -- geometry (pure) -------------------------------------------------------------
@@ -138,6 +187,121 @@ def tail_cut(n_tokens: int, grain: int) -> int:
 
 def page_floor(pos: int, page_size: int) -> int:
     return int(pos) // int(page_size) * int(page_size)
+
+
+def reader_claim_end(n_tokens: int, page_size: int, bigram: bool) -> int:
+    """CLAIM ANCHOR (0929): the deepest page boundary a store reader of an
+    N-token prompt asks for -- the upstream match leaves one token to forward
+    (``_compute_max_prefix_len`` = N-1 raw tokens) and a bigram key of r raw
+    tokens holds r-1 units, both floored to the page: floor_page(N-1), or
+    floor_page(N-2) under bigram keys. A recurrent anchor deeper than this is
+    never reached by that reader (dynpf 0929, weg2-24-38: anchor at 16448,
+    claim 16384, read capped at the 8192 chunk anchor)."""
+    units = int(n_tokens) - 1 - (1 if bigram else 0)
+    return page_floor(max(0, units), max(1, int(page_size or 1)))
+
+
+def claim_anchor_end(req, tree_cache) -> Optional[int]:
+    """CLAIM ANCHOR (0929): the store reader's claim for ``req`` wherever group
+    P files its recurrent anchor for that reader, else None.
+
+    ONE predicate for the two sides of the hand-back anchor: the extend track
+    that PUTS the anchor at the claim (``schedule_batch._weg2_claim_track``)
+    and the #1233/#1481 END-ANCHOR probe that MARKS the anchor the reader can
+    reach (``UnifiedRadixCache._weg2_note_end_anchor``). Two predicates would
+    let the track move the anchor while the mark still aims one page deeper
+    (dynpf-Praefix 0929: after 80fa726f31 every N % 64 in {0, 1} probed N-1,
+    found the claim anchor, printed ok=False and marked nothing).
+
+    Only group P, the NF keying (bigram, node units == tokens the state
+    consumed), a paged tree, no P-trim request (its own N-1 geometry)."""
+    if (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() != "P" or tree_cache is None:
+        return None
+    page = int(getattr(tree_cache, "page_size", 1) or 1)
+    if page <= 1 or not getattr(tree_cache, "bigram_anchor_exact", False):
+        return None
+    from sglang.srt.weg2.p_trim_end_anchor import TRIM_ATTR
+
+    if getattr(req, TRIM_ATTR, None) is not None:
+        return None
+    ids = getattr(req, "origin_input_ids", None)
+    if ids is None:
+        return None
+    return reader_claim_end(len(ids), page, True)
+
+
+#: F4 (#259 4c): the part name prefix of a D-park END part ("dpark<tp>-<pid>").
+PARK_PART = "dpark"
+
+
+def is_park_part(part: str) -> bool:
+    return str(part).startswith(PARK_PART)
+
+
+def _is_park_file(path: str) -> bool:
+    return f".tail.{PARK_PART}" in os.path.basename(path)
+
+
+def park_end_enabled() -> bool:
+    """F4, default off (SGLANG_WEG2_ENABLE_D_PARK_END), on top of E2 (the
+    resume of a parked request is the skip of its END state)."""
+    return bool(envs.SGLANG_WEG2_ENABLE_D_PARK_END.get()) and skip_extend_enabled()
+
+
+def park_ids(req) -> List[int]:
+    """The tokens a running D request has CONSUMED: its prompt and every
+    output token but the last (sampled, not yet fed to the model)."""
+    out = list(req.output_ids or ())
+    return list(req.origin_input_ids) + out[:-1]
+
+
+def park_spec(rid: str, ids: Sequence[int], extra_key: Optional[str], window_from: int,
+              grain: int) -> Optional[TailSpec]:
+    """F4: the END hand-off of a parked request -- the state after all
+    ``len(ids)`` consumed tokens, the KV rows from ``window_from`` (a page
+    boundary the resume re-enters at or after, D's #59b anchor) to the end.
+    None when nothing lies between (the resume is already short)."""
+    n = len(ids)
+    if n < 2 or int(grain) < 1:
+        return None
+    cut = tail_cut(n, grain)
+    prefix = int(window_from)
+    if prefix < 0 or cut <= prefix:
+        return None
+    return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
+
+
+def park_window_from(cut: int, page_size: int, window_tokens: int, anchor: Optional[int] = None,
+                     max_rows: int = 0) -> Tuple[int, str]:
+    """F4 PARK-ANCHOR (0929): where the park's row window starts, and why.
+
+    The default is ``window_tokens`` (two mamba track intervals) below the
+    cut's page -- the resume of a request that DECODED re-enters at its last
+    decode track point, at most one interval below the end. A request D
+    prefilled DIRECTLY re-enters at the anchor its EXTEND tracked (the fork /
+    turn anchor at the extend's start, y3p ep6 weg2-4-8: extend 2304 -> 4445
+    tracked 2368), a whole D-direct extend below the end: the default window
+    [3904, 4444) missed it, the resume logged
+    ``adopt=skipped:prefix:2368!in[3904,4444)`` and D computed the 2077 tokens
+    again (3.9 s behind the wake). ``anchor`` (the group-uniform depth the
+    retaining retraction leaves, ``d_park_runtime._park_anchors``) widens the
+    window down to that anchor's page, so the resume's prefix lies inside it.
+    Never narrower than the default. ``max_rows`` > 0 (D's X, the largest
+    extend D computes directly) bounds the widening: an anchor lag beyond one
+    D-direct extend plus the default window is no D-direct park, the window
+    stays the default (``capped``) and the resume extends as before.
+
+    Returns (window_from, 'default' | 'anchor' | 'capped')."""
+    page = max(1, int(page_size or 1))
+    default = max(0, page_floor(cut, page) - page_floor(int(window_tokens), page))
+    if anchor is None or int(anchor) < 0:
+        return default, "default"
+    at = page_floor(int(anchor), page)
+    if at >= default:
+        return default, "default"
+    if int(max_rows) > 0 and int(cut) - at > int(max_rows) + (int(cut) - default):
+        return default, "capped"
+    return at, "anchor"
 
 
 def tail_key(ids: Sequence[int], cut: int, extra_key: Optional[str]) -> str:
@@ -178,6 +342,40 @@ def spec_for(rid: str, ids: Sequence[int], extra_key: Optional[str], page_size: 
     return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
 
 
+def fold_spec(rid: str, ids: Sequence[int], extra_key: Optional[str], page_size: int, grain: int,
+              claim: Optional[int] = None) -> Optional[TailSpec]:
+    """H63 END-only hand-off of an N-token prompt (the tail fold): the END
+    section [page_prefix, N) + the state after N + P's token IS the whole
+    hand-off, so -- unlike ``spec_for`` (E1: rows [floor_page(c), c) + the
+    state at c) -- a spec exists even when no row lies below the cut.
+
+    SHORT TAIL (y3r 09292330, SGLANG_WEG2_TAIL_FOLD_SHORT): ``spec_for`` is
+    None whenever c = floor_grain(N-1) sits ON a page boundary, i.e. N % page
+    in 1..grain; P published no part for 23 of 53 finished prompts (every one
+    of them N % 64 in {1, 2, 4}), D ran 'TAIL-READY verdict=no_parts' and a
+    real extend of 1-65 tokens: 0.6-0.7 s for 2 tokens (a cold expert pass),
+    1.5-2.4 s for 65, 19.9 s of EXTEND run_ms over the 17 wakes >= 2 s.
+
+    ``page_prefix`` is where D's store read re-enters: the reader's claim
+    (``claim_anchor_end``, the bigram NF keying floor_page(N-2): N-65 for
+    N % 64 == 1, where the CLAIM ANCHOR track put P's recurrent anchor), else
+    floor_page(c) as in ``spec_for``. Everywhere ``spec_for`` has a spec the
+    two agree (floor_page(floor_grain(N-1)) == floor_page(N-2) unless N-1 is
+    a page multiple), so the published geometry of those prompts is
+    unchanged."""
+    n = len(ids)
+    page = int(page_size or 1)
+    if n < 2 or page <= 1 or int(grain) >= page:
+        return None
+    cut = tail_cut(n, grain)
+    if not envs.SGLANG_WEG2_TAIL_FOLD_SHORT.get():
+        return spec_for(rid, ids, extra_key, page, grain)
+    prefix = page_floor(cut, page) if claim is None else int(claim)
+    if prefix < 0 or prefix % page or prefix > cut or cut >= n:
+        return None
+    return TailSpec(rid=str(rid), n_tokens=n, page_prefix=prefix, cut=cut, key=tail_key(ids, cut, extra_key))
+
+
 def extend_range(spec: TailSpec) -> Tuple[int, int]:
     """D's extend after an adopted tail: [c, N)."""
     return spec.cut, spec.n_tokens
@@ -205,8 +403,12 @@ def agree_cut(page_prefix: int, cut: int, local_ok: bool, reduce_min: Callable[[
 def digest(tensors: Sequence[torch.Tensor]) -> str:
     """SEAM-digest style: sha1 over the raw bytes of CPU tensors, in order."""
     h = hashlib.sha1()
+    no_copy = envs.SGLANG_OPT_WEG2_TAIL_READ_MMAP.get()
     for t in tensors:
-        h.update(t.detach().contiguous().view(torch.uint8).numpy().tobytes())
+        a = t.detach().contiguous().view(torch.uint8).numpy()
+        # hashlib takes the buffer as is; tobytes() was a second full copy
+        # of every tensor on the heap (same bytes either way)
+        h.update(a.reshape(-1) if no_copy else a.tobytes())
     return h.hexdigest()[:16]
 
 
@@ -463,21 +665,51 @@ def write_part(spec: TailSpec, part: str, fa: Dict[int, Tuple[torch.Tensor, ...]
     return header
 
 
+#: TAIL-STAGE-WORKER (30.09.): the staging thread's own clock of this part
+#: reader -- read (torch.load) and digest ms, per thread, reset per rid
+_STAGE_CLOCK = threading.local()
+
+
+def stage_clock_reset() -> None:
+    _STAGE_CLOCK.read_ms = 0.0
+    _STAGE_CLOCK.digest_ms = 0.0
+
+
+def stage_clock() -> Tuple[float, float]:
+    return float(getattr(_STAGE_CLOCK, "read_ms", 0.0)), float(getattr(_STAGE_CLOCK, "digest_ms", 0.0))
+
+
+def _clock_add(name: str, t0: float) -> None:
+    setattr(_STAGE_CLOCK, name, getattr(_STAGE_CLOCK, name, 0.0) + (time.perf_counter() - t0) * 1000.0)
+
+
 def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[dict], str]:
     """Load a part; with ``check_digest`` compare both sections against the
     publish digests. (bundle, '') or (None, reason) -- 'unreadable' or
     'digest_MISMATCH' (the reader then keeps the page-prefix resume: a wrong
     row is never applied)."""
     _j, ppath = part_paths(header.spec.rid, header.part)
+    t_read = time.perf_counter()
     try:
-        bundle = torch.load(ppath, map_location="cpu")
+        if envs.SGLANG_OPT_WEG2_TAIL_READ_MMAP.get():
+            # views of the part file's tmpfs pages: no anonymous copy of the
+            # bundle (a rank keeps only its rows, pin_memory copies those);
+            # an unlink or replace of the part leaves this mapping intact
+            bundle = torch.load(ppath, map_location="cpu", mmap=True)
+        else:
+            bundle = torch.load(ppath, map_location="cpu")
     except (OSError, RuntimeError, EOFError):
         logger.warning("WEG2-TAIL part unreadable: %s", ppath, exc_info=True)
         return None, "unreadable"
-    if check_digest and (
+    finally:
+        _clock_add("read_ms", t_read)
+    t_dig = time.perf_counter()
+    bad = check_digest and (
         digest(_fa_order(bundle["fa"])) != header.fa_digest
         or digest(_gdn_order(bundle["gdn"])) != header.gdn_digest
-    ):
+    )
+    _clock_add("digest_ms", t_dig)
+    if bad:
         logger.warning("WEG2-TAIL DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
         return None, "digest_MISMATCH"
     return bundle, ""
@@ -489,11 +721,14 @@ def end_digest_refusal(header: TailHeader, bundle: dict) -> str:
     end, sec = header.end, bundle.get("end")
     if end is None or sec is None:
         return "end_missing"
-    if (
+    t_dig = time.perf_counter()
+    bad = (
         digest(_fa_order(sec["fa"])) != end.fa_digest
         or digest(_gdn_order(sec["gdn"])) != end.gdn_digest
         or digest(ring_order(sec["ring"], sec["rope"])) != end.ring_digest
-    ):
+    )
+    _clock_add("digest_ms", t_dig)
+    if bad:
         logger.warning("WEG2-TAIL END DIGEST MISMATCH rid=%s part=%s", header.spec.rid, header.part)
         return "end_digest_MISMATCH"
     return ""
@@ -504,15 +739,16 @@ def verify_part(header: TailHeader) -> Optional[dict]:
     return read_part(header, check_digest=True)[0]
 
 
-def remove(rid: str) -> None:
+def remove(rid: str, parks: bool = False) -> None:
     """Remove the FINISHED part files of `rid`. A ``*.tmp`` is a write in
     flight on some rank -- its writer renames it or removes it itself; taking
-    it away is the fnNV4f2 FileNotFoundError (H81)."""
+    it away is the fnNV4f2 FileNotFoundError (H81). F4: a D-park part stays
+    unless ``parks`` (P's prune never takes D's park across its phase)."""
     d = _dir()
     if not d:
         return
     for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
-        if _is_tmp(p):
+        if _is_tmp(p) or (_is_park_file(p) and not parks):
             continue
         try:
             os.remove(p)
@@ -534,6 +770,8 @@ def census(d: str) -> Tuple[Dict[str, float], Dict[str, int]]:
     newest: Dict[str, float] = {}
     size: Dict[str, int] = {}
     for p in glob.glob(os.path.join(d, "*.tail.*")):
+        if _is_park_file(p):
+            continue  # F4: a D-park part is D's own, never aged by P's budget
         rid = os.path.basename(p).split(".tail.", 1)[0]
         try:
             st = os.stat(p)
@@ -703,19 +941,21 @@ def _capture_state(req, req_to_token_pool, allocator, page_size: int, stream) ->
 _FOLD_N = [0]
 
 
-def arm_fold(reqs, allocator, page_size: int, stream) -> int:
+def arm_fold(reqs, allocator, page_size: int, stream, tree_cache=None) -> int:
     """Scheduler entry (every extend batch, before its forward; H63): under
     the tail fold register an END-only capture for each request whose extend
     reaches the end of its prompt -- its last chunk carries the tail, so no
     stash at c ever happens and ``publish_rows`` needs the capture (and the
-    forward stream the END gather is ordered on) from here. Never raises into
-    the scheduler; returns how many were registered."""
+    forward stream the END gather is ordered on) from here. ``tree_cache``
+    names the reader's claim (``claim_anchor_end``), the page the END section
+    starts at. Never raises into the scheduler; returns how many were
+    registered."""
     if not fold_enabled():
         return 0
     n = 0
     for req in reqs:
         try:
-            if _arm_fold_one(req, allocator, page_size, stream):
+            if _arm_fold_one(req, allocator, page_size, stream, tree_cache):
                 n += 1
         except Exception as exc:  # noqa: BLE001 -- no capture = no part = D's page resume, named
             logger.warning("WEG2-TAIL-FOLD arm failed rid=%s (%s: %s)", getattr(req, "rid", "?"),
@@ -723,13 +963,16 @@ def arm_fold(reqs, allocator, page_size: int, stream) -> int:
     return n
 
 
-def _arm_fold_one(req, allocator, page_size: int, stream) -> bool:
+def _arm_fold_one(req, allocator, page_size: int, stream, tree_cache=None) -> bool:
     if not _is_p_request(req) or getattr(req, "extend_range", None) is None:
         return False
     fill = req.full_untruncated_fill_ids
-    if int(req.extend_range.end) != len(fill) or not fold_applies(len(fill), page_size):
+    claim = claim_anchor_end(req, tree_cache)
+    if int(req.extend_range.end) != len(fill) or not fold_applies(
+            len(fill), page_size, start=int(req.extend_range.start), claim=claim):
         return False
-    spec = spec_for(req.rid, req.origin_input_ids, req.extra_key, page_size, _grain_of(allocator, page_size))
+    spec = fold_spec(req.rid, req.origin_input_ids, req.extra_key, page_size, _grain_of(allocator, page_size),
+                     claim=claim)
     if spec is None or spec.n_tokens != len(fill):
         return False
     _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn={}, event=None, stream=stream, e1=False)
@@ -817,6 +1060,37 @@ def _fa_rows(kvpool, rows: torch.Tensor, groups: Optional[int] = None,
             out[int(gid)] = (k, v, c)
         else:
             out[int(gid)] = (k, v)
+    return out
+
+
+def _fa_rows_owned(kvpool, rows: torch.Tensor, groups: Optional[int], owner,
+                   host: Callable[[torch.Tensor], torch.Tensor] = None) -> Dict[int, Tuple[torch.Tensor, ...]]:
+    """F4b: ``_fa_rows`` under the Form A token cut. K and V of the GLOBAL
+    slots ``rows`` in P's full-row layout, filled at the rows this rank OWNS
+    (read from their compact slot, ``tail_adopt.owner_rows`` -- the backends'
+    write rule) and zero elsewhere, so the group's parts OR together into the
+    full rows; the QSA compressed groups only where the pool keeps them (the
+    indexer's rank)."""
+    from sglang.srt.weg2.tail_adopt import owner_rows
+
+    host = host or _to_host
+    full = kvpool.full_kv_pool
+    compressed = bool(getattr(kvpool, "qsa_compressed_k_buffer_pool", None))
+    ratio = _qsa_ratio(kvpool) if compressed else 0
+    loc, keep = owner_rows(rows, owner)
+    out: Dict[int, Tuple[torch.Tensor, ...]] = {}
+    for gid, local in sorted(kvpool.full_attention_layer_id_mapping.items()):
+        parts = []
+        for buf in (full.k_buffer[local], full.v_buffer[local]):
+            t = torch.zeros((int(rows.numel()),) + tuple(buf.shape[1:]), dtype=buf.dtype, device=buf.device)
+            if int(loc.numel()):
+                tb = t.view(torch.uint8)
+                tb[keep.to(buf.device)] = buf.view(torch.uint8).index_select(0, loc.to(buf.device))
+            parts.append(host(t))
+        if ratio:
+            slots = group_slots(rows.to(full.k_buffer[local].device), ratio, groups)
+            parts.append(host(kvpool.qsa_compressed_k_buffer_pool[local].index_select(0, slots)))
+        out[int(gid)] = tuple(parts)
     return out
 
 
@@ -948,7 +1222,8 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload]
         if end is not None and end.event is not None:
             end.event.synchronize()  # the forward-stream gather has landed
         header = write_part(spec, part, fa, gdn, end=end, n_parts=n_parts, e1=e1, ple=ple)
-        _prune(spec.rid, part)
+        if not is_park_part(part):  # F4: D's park never prunes P's hand-offs
+            _prune(spec.rid, part)
         # H63c: the PLE rows as P handed them over (D prints the same digest)
         if ple is not None and e1:
             ple_state.log_state("P", "e1", spec.rid, spec.cut, ple)
@@ -988,6 +1263,214 @@ def _write_and_log(spec: TailSpec, part: str, fa, gdn, end: Optional[EndPayload]
         e.gdn_digest, e.ring_digest, spec.rows, spec.cut, header.nbytes, spec.key, header.fa_digest,
         header.gdn_digest, _PUBLISH_N[0],
     )
+
+
+_PARK_N = [0]
+
+
+def park_end_refusal(req, owner=None, page_size: int = 0) -> str:
+    """F4: '' when this running request's END state can be parked, else why
+    not (named in the park line; the resume then extends as today).
+    ``owner``: this rank's token-cut owner rows (tail_adopt.cut_owner), the
+    same on every rank in its presence."""
+    from sglang.srt.distributed.utils import uneven_dcp_active
+    from sglang.srt.weg2 import tail_adopt
+
+    if not park_end_enabled():
+        return "off"
+    if not req.output_ids:
+        return "no_sampled_token"
+    if req.return_logprob or req.return_hidden_states:
+        return "logprob_or_hidden_requested"
+    if bool(uneven_dcp_active()):
+        # uneven DCP compacts KV rows per rank: only under the Form A token
+        # cut, whose owner rows the resume takes the E2 way (F4b)
+        if owner is None:
+            return "uneven_dcp"
+        if not tail_adopt.cut_worker_end_enabled():
+            return "cut_worker_end_off"
+        if int(page_size or 1) % int(owner[0]):
+            # a token's owner is its slot % S: stable across the park only
+            # while S divides the page (slot = page base + token % page)
+            return f"cut_period:{int(owner[0])}"
+    if req.mamba_pool_idx is None or req.req_pool_idx is None:
+        return "no_slots"
+    return ""
+
+
+def publish_park_end(req, req_to_token_pool, allocator, page_size: int, part: str, n_parts: int,
+                     window_tokens: int, anchor: Optional[int] = None,
+                     max_rows: int = 0) -> Tuple[str, object]:
+    """F4 (#259 4c), D's park_running, BEFORE the retaining retraction frees
+    the request's slots: gather this rank's END state of a running request --
+    the KV (+ complete QSA groups) rows from ``floor_page(cut) - window`` to the
+    last consumed token (or from the resume ``anchor``'s page when that lies
+    deeper, :func:`park_window_from`, PARK-ANCHOR), the open group's ring
+    rows, the GDN/PLE slot (state after every consumed token) -- on the
+    current stream, and write it as an END-only part of the rid from a background thread (P's hand-off format and
+    directory). The resume is then E2's skip: no tail extend. Only the layers
+    this rank HOLDS are written (a Form-A expert worker writes an empty part,
+    so the manifest completes). Never raises; returns ('' or the refusal, the
+    gather's event)."""
+    try:
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang.srt.weg2 import tail_adopt
+
+        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+            return "no_mamba_pool", None
+        kvpool = allocator.get_kvcache()
+        held = tail_adopt.held_shapes(kvpool, req_to_token_pool)
+        why = park_end_refusal(req, held.owner, page_size)
+        if why:
+            return why, None
+        ids = park_ids(req)
+        page = int(page_size or 1)
+        grain = _grain_of(allocator, page)
+        cut = tail_cut(len(ids), grain)
+        window_from, window_why = park_window_from(cut, page, window_tokens, anchor, max_rows)
+        spec = park_spec(str(req.rid), ids, req.extra_key, window_from, grain)
+        if spec is None:
+            return "no_tail", None
+        ratio = _qsa_ratio(kvpool)
+        rows, groups, ring_rows = end_geometry(spec, ratio)
+        kv = req_to_token_pool.req_to_token[int(req.req_pool_idx), spec.page_prefix:spec.n_tokens].to(torch.int64)
+        fa: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        ring: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        rope = None
+        # a Form-A expert worker holds no attention rows (0-head pool, no
+        # indexer); under the token cut (F4b) it holds its owned K/V rows and
+        # the ring/groups are the indexer rank's alone
+        indexer = held.owner is None or bool(held.qsa_ratio)
+        if held.fa and held.owner is not None:
+            fa = {g: t for g, t in _fa_rows_owned(kvpool, kv, groups, held.owner).items() if g in held.fa}
+        elif held.fa:
+            fa = {g: t for g, t in _fa_rows(kvpool, kv, groups=groups, host=_to_host).items() if g in held.fa}
+        if held.fa and indexer:
+            ring, rope = _ring_rows(kvpool, req.req_pool_idx, ring_rows)
+            ring = {g: t for g, t in ring.items() if g in held.fa}
+            if not ring:
+                rope = None
+        gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
+        if held.gdn:
+            gdn = {g: t for g, t in _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx).items()
+                   if g in held.gdn}
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx) if held.gdn else None
+        event = _record(None)
+        end = EndPayload(
+            first_token=int(req.output_ids[-1]), key=tail_key(ids, spec.n_tokens, req.extra_key),
+            rows=rows, groups=groups, ring_rows=ring_rows, fa=fa, gdn=gdn, ring=ring, rope=rope,
+            event=event, ple=ple,
+        )
+        _clear_for_park(spec.rid, _part_index(part))
+        threading.Thread(target=_write_and_log, args=(spec, part, {}, {}, end, int(n_parts), False),
+                         daemon=True, name="weg2-park-end").start()
+        _PARK_N[0] += 1
+        logger.info(
+            "F4 PARK-END rid=%s n_tokens=%d rows_from=%d cut=%d rows=%d groups=%d ring_rows=%d "
+            "first_token=%d fa_layers=%d gdn_layers=%d part=%s of=%d window=%s anchor=%s (n=%d)",
+            spec.rid, spec.n_tokens, spec.page_prefix, spec.cut, rows, groups, ring_rows, end.first_token,
+            len(fa), len(gdn), part, int(n_parts), window_why, "-" if anchor is None else int(anchor),
+            _PARK_N[0],
+        )
+        return "", event
+    except Exception as exc:  # noqa: BLE001 -- no park part = the resume extends as today
+        logger.warning("F4 PARK-END failed rid=%s (%s: %s)", getattr(req, "rid", "?"), type(exc).__name__, exc)
+        return f"raised:{type(exc).__name__}", None
+
+
+def park_end_barrier(events) -> float:
+    """F4: the gathers are enqueued on the stream the park's retraction and
+    the sleep's release follow; the rows must be on the host before the
+    D->P flip frees them. Waits for the recorded events and returns the
+    milliseconds (named in the park line: a measured wait, ~ms per request)."""
+    import time as _time
+
+    t = _time.perf_counter()
+    for ev in events:
+        if ev is not None:
+            ev.synchronize()
+    return (_time.perf_counter() - t) * 1000.0
+
+
+def _clear_for_park(rid: str, own_index: str) -> None:
+    """F4: before a park part of ``rid`` is written, P's leftover parts and
+    THIS rank's own earlier park part go (either would mix into the
+    manifest). Another rank's park part is never touched: it may be the one
+    it just wrote for this very park."""
+    d = _dir()
+    if not d:
+        return
+    own = f".tail.{own_index}-"
+    for p in glob.glob(os.path.join(d, f"{glob.escape(rid)}.tail.*")):
+        if _is_tmp(p) or (_is_park_file(p) and own not in os.path.basename(p)):
+            continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def remove_park(rid: str) -> None:
+    """F4: the group decided on the rid's park parts -- nothing reads them again."""
+    threading.Thread(target=remove, args=(str(rid),), kwargs={"parks": True}, daemon=True,
+                     name="weg2-park-end-rm").start()
+
+
+def _park_files() -> List[Tuple[str, str]]:
+    """F4: (rid, path) of every finished park part in the store."""
+    d = _dir()
+    if not d:
+        return []
+    out = []
+    for p in glob.glob(os.path.join(d, f"*.tail.{PARK_PART}*")):
+        if _is_tmp(p) or not _is_park_file(p):
+            continue
+        out.append((os.path.basename(p).split(".tail.", 1)[0], p))
+    return out
+
+
+def remove_parks_aborted(rid: str, abort_all: bool = False) -> int:
+    """F4 leak (29.09.): the abort reaches D's park parts as it reaches the
+    park (``d_park_runtime.park_abort``, the same prefix match as the
+    scheduler's queues): an aborted rid is never resumed, so no adopt verdict
+    (``remove_park``) will take its parts. Every rank of D sees the same
+    abort; a file a sibling removed first is simply gone. Returns the files
+    removed."""
+    n = 0
+    for owner, p in _park_files():
+        if abort_all or (rid and owner.startswith(rid)):
+            try:
+                os.remove(p)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def reap_orphan_parks(live_rids, own_index: str) -> Tuple[int, List[str]]:
+    """F4 leak (29.09.): at every D park, THIS rank's park parts whose rid D
+    no longer holds -- finished without an adopt verdict, re-routed to P,
+    aborted on a path the abort hook did not see. The census rule of H63b
+    (``census`` / ``_prune``) ages P's parts; this is its D-side twin for the
+    park parts that census deliberately skips. Only this rank's own parts
+    (``own_index`` = ``dpark<tp>``), never a rid in flight (H81). The live set
+    is the scheduler's replicated state, so every rank reaps the same rids.
+    Returns (files removed, rids)."""
+    own = f".tail.{own_index}-"
+    live = {str(r) for r in live_rids}
+    busy = _inflight_rids()
+    n, rids = 0, []
+    for owner, p in _park_files():
+        if own not in os.path.basename(p) or owner in live or owner in busy:
+            continue
+        try:
+            os.remove(p)
+            n += 1
+            if owner not in rids:
+                rids.append(owner)
+        except OSError:
+            pass
+    return n, rids
 
 
 # -- D side: readiness (the adoption itself lives in weg2/tail_adopt.py) -------------

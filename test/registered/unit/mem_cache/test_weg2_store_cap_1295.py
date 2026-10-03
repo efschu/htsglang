@@ -57,6 +57,7 @@ import re
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
@@ -143,6 +144,9 @@ def _weight_updater_source() -> tuple:
 class TestStoreCapBoundsTheDirectory(CustomTestCase):
     """The falsifier: two owners, one directory, one cap."""
 
+    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); with the default-on background
+    # evictor the post-condition is timing-dependent (1 of 3 runs red); background path: test_l3_evict_offpath_reset_join_0929.py
+    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_two_owners_over_one_directory_hold_one_cap(self):
         """THE #1295 SHAPE AT DESK SCALE.
 
@@ -262,6 +266,9 @@ class TestStoreCapBoundsTheDirectory(CustomTestCase):
             )
             self.assertEqual(me.stats()["foreign_indexed_bytes"], 20 * page)
 
+    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); the default-on background
+    # path is covered by test_l3_evict_offpath_reset_join_0929.py
+    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_a_directory_the_sibling_alone_fills_starves_this_owner_by_name(self):
         """The bound this fix buys, and its PRICE, stated as a test.
 
@@ -371,12 +378,19 @@ class TestStoreCapBoundsTheDirectory(CustomTestCase):
 
             owner = _owner(d, (SHARED,), cap, iter_staging=_iter_staging)
             st = owner.stats()
+            # 28.09.: the owner's own write journal (store_journal.py) is a
+            # non-page file under the store too, and counted like one
+            # (and, since the one-walk fix, the store's L3_INDEX.lock -- ZFS
+            # books an empty file one 512 B block)
+            jn = [os.path.join(d, n) for n in os.listdir(d)
+                  if n.endswith(".jnl") or n == "L3_INDEX.lock"]
+            jn_bytes = sum(max(os.stat(p).st_blocks * 512, os.stat(p).st_size) for p in jn)
             self.assertEqual(
                 st["staging_bytes"],
-                15 * page,
+                15 * page + jn_bytes,
                 "staging/partial files are still outside the cap's population",
             )
-            self.assertEqual(st["directory_bytes"], 15 * page)
+            self.assertEqual(st["directory_bytes"], 15 * page + jn_bytes)
             _fill(owner, d, [f"n{i:04d}{SHARED}" for i in range(20)], page)
             self.assertLessEqual(
                 _dir_allocated_bytes(d, ".bin") + 15 * page,
@@ -586,6 +600,9 @@ class TestStoreCapRefusalIsNamedAndCounted(CustomTestCase):
             "the staging walk itself is gone",
         )
 
+    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); the default-on background
+    # path is covered by test_l3_evict_offpath_reset_join_0929.py
+    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_an_eviction_run_leaves_a_proof_line_at_info(self):
         """``0 reclaimed lines`` was a log-level artefact, not a zero.
 
@@ -713,7 +730,13 @@ class TestWakeRescanIsWired(CustomTestCase):
             ev = _owner(d, (SHARED,), 40 * page, iter_existing=_iter_existing)
             holder["ev"] = ev
             probed.clear()
-            ev.rescan()
+            # this test grades the WALK; since 28.09. a wake reads the write
+            # journal instead unless SGLANG_WEG2_STORE_JOURNAL=0
+            os.environ["SGLANG_WEG2_STORE_JOURNAL"] = "0"
+            try:
+                ev.rescan()
+            finally:
+                os.environ.pop("SGLANG_WEG2_STORE_JOURNAL", None)
             self.assertTrue(probed, "the walk never ran, so nothing was graded")
             self.assertTrue(
                 all(probed),
@@ -748,7 +771,9 @@ class TestTheWakeVerdictIsVotedNotRaised(CustomTestCase):
         fake = types.SimpleNamespace(
             scheduler=scheduler, weg2_store_rescan_failure=""
         )
-        return SchedulerWeightUpdaterManager._weg2_rescan_store_index, fake
+        # 28.09.: the verdict logic is the walk's (the wake itself now
+        # starts it on a thread, see test_weg2_flip_rescan_async_0928)
+        return SchedulerWeightUpdaterManager._weg2_rescan_store_index_sync, fake
 
     def test_a_blind_wake_records_the_verdict_and_does_not_raise(self):
         """The rank-local death must not happen; the verdict must survive."""
@@ -874,7 +899,7 @@ class TestTheWakeVerdictIsVotedNotRaised(CustomTestCase):
                 n
                 for n in ast.walk(tree)
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and n.name == "_weg2_rescan_store_index"
+                and n.name == "_weg2_rescan_store_index_sync"
             ),
             None,
         )

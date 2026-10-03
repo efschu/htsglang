@@ -27,6 +27,27 @@ def keys_for_span(page_keys: Optional[Sequence[str]], matched_len: int, n_tokens
     return [str(k) for k in page_keys[p0:p0 + n_pages]]
 
 
+def fallback_page_offset(n_ids: Optional[int], prefetch_length: int, page_size: int,
+                         span_base: Optional[int] = None) -> Optional[int]:
+    """First page of the tree's fallback slice (operation.weg2_page_keys).
+    With ``span_base`` (the caller's matched length) the span starts there.
+    Without it, ``n_ids - prefetch_length`` -- only right for an untrimmed
+    tail read: a read trimmed or truncated at its END (fork/told trim, host
+    pool truncation) shifts that start by the trimmed length and hands the
+    store the keys of later pages (27B 01.10.: KV and Mamba shifted)."""
+    page = int(page_size)
+    if page <= 0:
+        return None
+    if span_base is not None:
+        base = int(span_base)
+        if base < 0 or base % page:
+            return None
+        return base // page
+    if n_ids is None:
+        return None
+    return (int(n_ids) - int(prefetch_length)) // page
+
+
 def first_mismatch(a: Sequence[str], b: Sequence[str]) -> Optional[int]:
     for i, (x, y) in enumerate(zip(a, b)):
         if x != y:
@@ -51,6 +72,11 @@ def first_mismatch(a: Sequence[str], b: Sequence[str]) -> Optional[int]:
 #: req attribute: PP0 used no hand-off chain -- this rank must not read one.
 OFF_ATTR = "_weg2_handoff_off"
 CHAIN_ATTR = "_weg2_handoff_page_keys"
+#: P4b-fix (28.09.): sticky "this rank read P's hand-off record for this rid" -- the
+#: record is removed at the wake (scheduler._weg2_release_dormant_hold) and the chain
+#: attribute can be cleared (adopt_pp0_decision), but P prefilled the rid either way;
+#: weg2/settle_writer.observe counts it as the chain (p-handoff, never "no writer").
+SEEN_ATTR = "_weg2_handoff_seen"
 
 
 def chain_digest(chain: Optional[Sequence[str]]) -> str:
@@ -78,6 +104,11 @@ def resolve_chain(req, reader) -> Optional[List[str]]:
         chain = list(rec.get("page_keys") or []) if rec else None
         if chain:
             setattr(req, CHAIN_ATTR, chain)
+    if chain:
+        try:
+            setattr(req, SEEN_ATTR, True)
+        except Exception:  # noqa: BLE001 - a frozen double
+            pass
     return list(chain) if chain else None
 
 

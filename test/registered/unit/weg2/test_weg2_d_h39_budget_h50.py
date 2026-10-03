@@ -313,7 +313,7 @@ def test_the_dry_run_of_the_x155_form(tmp_path, monkeypatch):
 
     lines = run("edge", 121)  # PASST: kein W122/W130/W126
     head = [ln for ln in lines if "KARTE D(dry, expectation) (H33" in ln]
-    assert head and "Zeilen [133, 137, 134] = SCRATCH <= [121, 63, 49]" in head[0], lines
+    assert head and "Zeilen [133, 138, 136] = SCRATCH <= [121, 64, 51]" in head[0], lines
     assert "fnFL2x151 + fnFL2x158" in head[0] and "H39 an" in head[0]
     assert any("P->D D(dry, expectation) card1" in ln and "FERTIG" in ln for ln in lines)
     with pytest.raises(launcher.Weg2LaunchRefused, match=r"^W130 Weg2DCardNearOom"):

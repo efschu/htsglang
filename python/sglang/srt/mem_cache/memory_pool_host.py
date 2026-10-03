@@ -592,7 +592,7 @@ class MambaPoolHost(HostKVCache):
             name=self.budget_label,
             flag="--hicache-mamba-host-mib (or --hicache-size / --hicache-ratio)",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
         logger.info(
             "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
@@ -1273,7 +1273,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             name=f"V4 paged host pool {pool_name}",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
@@ -1630,6 +1630,31 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def set_from_flat_data_pages(self, indices, data_pages) -> None:
+        """#1416g: the pages of one read in one indexed copy per layer (the
+        per-page setter is layer_num small copies per page -- the QSA index
+        sidecar of a 90k prefix is 1409 pages)."""
+        n = len(indices)
+        if n == 0:
+            return
+        if isinstance(data_pages, torch.Tensor):
+            flat = data_pages.reshape(n, -1)
+        else:
+            flat = torch.stack([p.reshape(-1) for p in data_pages])
+        data = flat.view(self.dtype).reshape(n, self.layer_num, self.item_bytes)
+        rows = torch.tensor(
+            [int(i) // self.slot_page_size for i in indices], dtype=torch.int64
+        )
+        if self.layout == "layer_first":
+            for i in range(self.layer_num):
+                self.kv_buffer[i].index_copy_(0, rows, data[:, i])
+        elif self.layout == "page_first":
+            self.kv_buffer.index_copy_(0, rows, data)
+        elif self.layout == "page_first_direct":
+            self.kv_buffer.index_copy_(0, rows, data.unsqueeze(2))
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
     def get_page_buffer_meta(self, indices):
         ptr_list = []
         rows = self._to_page_indices(indices).tolist()
@@ -1698,7 +1723,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             name=f"V4 state host pool {pool_name}",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
@@ -2198,6 +2223,18 @@ class HostPoolGroup:
         return getattr(self.anchor_entry.host_pool, "arena", None)
 
     @property
+    def _page_bytes(self) -> int:
+        """Bytes of one page in ``arena`` -- the ANCHOR pool's, because
+        ``arena`` above is the anchor pool's arena (a mamba entry's arena has
+        its own page size and is never the one named here). rc12z
+        (786d2f615d, D TP0 01:33:06 and P PP0): ``_arena_page_get``'s L3 fill
+        (#1433) read ``pool._page_bytes`` on this group, which fell to
+        ``__getattr__`` -> AttributeError, #1033d refused the whole read, and
+        every prefix evicted to disk was re-prefilled (weg2-24-93, 69937
+        tokens). Workers hold the arena pool itself and read back fine."""
+        return int(self.anchor_entry.host_pool._page_bytes)
+
+    @property
     def staging_rows(self) -> int:
         return int(getattr(self.anchor_entry.host_pool, "staging_rows", self.anchor_entry.host_pool.size))
 
@@ -2482,6 +2519,13 @@ class HostPoolGroup:
             )
             _k = str(getattr(transfer, "name", None) or type(entry.host_pool).__name__)
             _acc[_k] = _acc.get(_k, 0.0) + (time.perf_counter() - _t) * 1000.0
+            # H2D phase 1 (a): the pool's own sub-stages (mamba: select, idx,
+            # issue, split, sync, ple) ride in the same components line.
+            _sub = getattr(entry.host_pool, "_weg2_load_sub", None)
+            if _sub:
+                for _sk, _sv in _sub.items():
+                    _acc[f"{_k}.{_sk}"] = _acc.get(f"{_k}.{_sk}", 0.0) + _sv
+                _sub.clear()
 
     def backup_from_device_all_layer(
         self,
@@ -2491,13 +2535,15 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
-        # 1. Anchor (KV) backup
-        self.anchor_entry.host_pool.backup_from_device_all_layer(
-            self.anchor_entry.device_pool,
-            host_indices,
-            device_indices,
-            io_backend,
-        )
+        # 1. Anchor (KV) backup -- none for an ANCHOR-ONLY write (the KV is
+        # already backed; only the Mamba anchor travels as an extra pool)
+        if host_indices is None or host_indices.numel() > 0:
+            self.anchor_entry.host_pool.backup_from_device_all_layer(
+                self.anchor_entry.device_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+            )
         # 2. Extra pool backup
         for transfer in pool_transfers or []:
             entry = self._entry_for_transfer(transfer, "backup")
@@ -2542,9 +2588,10 @@ class HostPoolGroup:
         """H2: :meth:`backup_from_device_all_layer` for an op every pool of
         which accepted its device indices on the card -- same order (anchor
         first, then the extra pools), same pools, no index normalisation."""
-        self.anchor_entry.host_pool.backup_from_device_indices(
-            self.anchor_entry.device_pool, host_indices, device_indices
-        )
+        if host_indices is None or host_indices.numel() > 0:  # ANCHOR-ONLY: no KV rows
+            self.anchor_entry.host_pool.backup_from_device_indices(
+                self.anchor_entry.device_pool, host_indices, device_indices
+            )
         for transfer in pool_transfers or []:
             entry = self._entry_for_transfer(transfer, "backup")
             entry.host_pool.backup_from_device_indices(
@@ -2603,7 +2650,7 @@ class DSAIndexerPoolHost(HostKVCache):
             name="DSA indexer host pool",
             flag="--hicache-size / --hicache-ratio",
             requested_bytes=requested_bytes,
-            reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
+            reserve_bytes=None,  # the configured OS reserve (pinned_host_reserve)
         )
         logger.info(
             "Allocating %.2f GB host memory for DSA indexer (layout=%s).",

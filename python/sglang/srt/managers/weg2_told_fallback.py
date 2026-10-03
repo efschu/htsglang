@@ -107,6 +107,9 @@ HARVEST_MAX_PER_SRC = 8
 REASON_ACKS = "acks"
 REASON_MISMATCH = "mismatch"
 REASON_FRIST = "frist"
+#: item 180: where a follower's re-ask of PP0 went (follower_reask)
+ROUTE_PF = "pf-ack"
+ROUTE_NONE = "none"
 
 _LOG_FIRST = 8
 _LOG_EVERY = 256
@@ -329,6 +332,101 @@ def pp0_forget(scheduler, rid: str) -> None:
     _pp0_open_map(scheduler).pop(str(rid), None)
 
 
+#: item 220: ``rid -> told`` PP0 admitted (told > 0) and has not seated yet
+RETRACT_ADMITTED_MAX = 1024
+
+
+def _admitted_map(scheduler) -> Dict[str, int]:
+    d = getattr(scheduler, "_weg2_fb_admitted", None)
+    if d is None:
+        d = scheduler._weg2_fb_admitted = {}
+    return d
+
+
+def _late_map(scheduler) -> Dict[str, int]:
+    d = getattr(scheduler, "_weg2_fb_late", None)
+    if d is None:
+        d = scheduler._weg2_fb_late = {}
+    return d
+
+
+def pp0_watching(scheduler) -> bool:
+    """True while PP0 holds an admitted-at-told rid a late ack could still
+    retract: the publish pass keeps harvesting the ack stream for it."""
+    return bool(getattr(scheduler, "_weg2_fb_admitted", None))
+
+
+def pp0_retract_due(scheduler, queued, parked) -> List[Tuple[str, int, int]]:
+    """W27-UNIFORM (item 220, residual of item 180): the answer path for a
+    short reach a follower finds AFTER the Admit. Returns ``(rid, told, own)``
+    for every rid PP0 retracts to told=0 in THIS pass (the caller puts one
+    ``Admit(0, fallback)`` on the wire and applies it to PP0 itself, exactly
+    like a Frist fallback).
+
+    Rank-uniform by construction: only PP0 decides, and only from PP0-local
+    facts -- a follower's late ack differing from the told PP0 admitted, and
+    the rid still in PP0's own waiting queue (PP0 has not seated it, so no
+    rank has: every rank seats at PP0's pass plus its plan lag, and the wire
+    keeps its order). A rid PP0 seated already is TOO LATE: nothing is put on
+    the wire (a retract after PP0's seat would be the rank-local split), the
+    follower's hold stays and the #1233 W27 guard names it. No reserve, and
+    PP0 never waits for a follower, so the follower's hold cannot deadlock
+    against it. Admitted rids that left the queue are forgotten here."""
+    admitted = _admitted_map(scheduler)
+    late = _late_map(scheduler)
+    out: List[Tuple[str, int, int]] = []
+    for rid in list(late):
+        own = late[rid]
+        told = admitted.get(rid)
+        if told is None:
+            late.pop(rid, None)
+            continue
+        if rid in queued:
+            late.pop(rid, None)
+            admitted.pop(rid, None)
+            out.append((rid, int(told), int(own)))
+        elif rid not in parked:
+            late.pop(rid, None)
+            admitted.pop(rid, None)
+            n = _bump(scheduler, "_pf_retract_late_n")
+            if _say(n):
+                logger.error(
+                    "PF TOLD-RETRACT TOO LATE rid=%s told=%d follower_reach=%d (n=%d): PP0 "
+                    "seated this rid already -- no rank-uniform answer is possible any more, "
+                    "nothing is put on the wire; the follower's hold stays and the #1233 W27 "
+                    "guard names the split", rid[:8], told, own, n,
+                )
+    for rid in list(admitted):
+        if rid not in queued and rid not in parked:
+            admitted.pop(rid, None)  # seated or gone: nothing left to retract
+    while len(admitted) > RETRACT_ADMITTED_MAX:
+        admitted.pop(next(iter(admitted)), None)
+    return out
+
+
+def pp0_retract_applied(scheduler, rid: str, told: int, own: int) -> None:
+    """PP0 applies its own retract (same as the Frist fallback: its read is
+    released, its admission compares 0 with 0) and names it."""
+    rid = str(rid)
+    release_own_read(scheduler, rid)
+    try:
+        from sglang.srt.managers import weg2_store_told as _st
+
+        _st.forget_unreached(scheduler, rid)
+    except Exception:  # noqa: BLE001 - bookkeeping
+        pass
+    (getattr(scheduler, "_weg2_told_kept", None) or {}).pop(rid, None)
+    (getattr(scheduler, "_weg2_store_told_satisfied", None) or {}).pop(rid, None)
+    n = _bump(scheduler, "_pf_retract_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-RETRACT rid=%s told=%d -> 0 follower_reach=%d (n=%d): a follower's tree "
+            "stayed short of the admitted told after the Admit and PP0 had not seated the "
+            "rid yet -- PP0 switches it to told=0 for EVERY rank on the Admit channel "
+            "(fallback marker); P recomputes the prefix", rid[:8], told, own, n,
+        )
+
+
 def pp0_harvest(scheduler) -> int:
     """Take every ack that has landed off the standing receives (no wait)."""
     open_map = _pp0_open_map(scheduler)
@@ -340,7 +438,23 @@ def pp0_harvest(scheduler) -> int:
         for rid, own in ack.reads:
             o = open_map.get(str(rid))
             if o is None:
-                continue  # decided (or dropped) already: late ack
+                # item 220: a follower's re-ask (item 180) of a rid PP0
+                # admitted at told that has NOT been seated yet is a retract
+                # candidate; PP0 decides it at its next publish
+                # (pp0_retract_due), never here
+                adm = _admitted_map(scheduler).get(str(rid))
+                if adm is not None and int(own) != int(adm):
+                    _late_map(scheduler)[str(rid)] = int(own)
+                    continue
+                # decided (or dropped) already: late ack (item 180: also a
+                # follower's re-ask of an already admitted rid -- named)
+                k = _bump(scheduler, "_pf_ack_late_n")
+                if _say(k):
+                    logger.warning(
+                        "PF TOLD-ACK LATE rank=%s rid=%s own=%s (n=%d): PP0 decided this "
+                        "rid already -- the ack changes nothing", ack.rank, str(rid)[:8], own, k,
+                    )
+                continue
             o.acks[int(ack.rank)] = int(own)
             n += 1
     if n:
@@ -368,6 +482,10 @@ def pp0_decide(scheduler, rid: str, now: float) -> Optional[Tuple[int, str]]:
 def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: str, now: float, published_at: float) -> None:
     o = _pp0_open_map(scheduler).pop(str(rid), None)
     acks = dict(o.acks) if o is not None else {}
+    if int(told_final) > 0:
+        # item 220: PP0 admitted at told; until it seats the rid, a follower's
+        # late re-ask can still switch it to told=0 (pp0_retract_due)
+        _admitted_map(scheduler)[str(rid)] = int(told_final)
     if reason == REASON_ACKS:
         n = _bump(scheduler, "_pf_admit_acks_n")
         if _say(n):
@@ -446,6 +564,23 @@ def follower_note_registered(scheduler, req) -> None:
         st.registered[rid] = req
 
 
+def follower_reask(scheduler, rid: str, told: int, live: int) -> str:
+    """W27-UNIFORM (item 180): a follower whose LIVE tree stays short of
+    PP0's told (``weg2_store_told.follower_hold_unreached``) re-asks PP0
+    instead of seating on its own tree: its reach (``live``) goes out on the
+    PF ack stream like any terminated read's, and PP0's rule stands -- an ack
+    that differs from told means told=0 for EVERY rank (``pp0_decide``). The
+    follower decides nothing; it holds until PP0 answers
+    (``follower_release``) or its tree reaches told. ``ROUTE_NONE`` = the
+    boot has no ack stream (PF off: no follower state), nothing is sent."""
+    st = _fstate(scheduler)
+    if st is None:
+        return ROUTE_NONE
+    st.outbox = [e for e in st.outbox if e[0] != str(rid)]
+    st.outbox.append((str(rid), int(live)))
+    return ROUTE_PF
+
+
 def follower_forget(scheduler, rid: str) -> None:
     st = _fstate(scheduler)
     if st is None:
@@ -464,6 +599,14 @@ def follower_release(scheduler, rid: str) -> None:
     rid = str(rid)
     follower_forget(scheduler, rid)
     release_own_read(scheduler, rid)
+    # item 180: the rank-uniform answer ends a hold for a tree short of told
+    try:
+        from sglang.srt.managers import weg2_store_told as _st
+
+        _st.forget_unreached(scheduler, rid)
+    except Exception:  # noqa: BLE001 - bookkeeping
+        pass
+    (getattr(scheduler, "_weg2_told_kept", None) or {}).pop(rid, None)
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
     if satisfied:
         satisfied.pop(rid, None)
@@ -499,7 +642,103 @@ def own_prefix(scheduler, req, rid: str, told: int) -> int:
     own = int(_st._completed_prefix(scheduler.tree_cache, rid))
     if _is_follower_twin(scheduler, rid):
         own += _twin.registered_head(req)
-    return own
+    return _resumable_own(scheduler, req, rid, own)
+
+
+def _resumable_own(scheduler, req, rid: str, own: int) -> int:
+    """ACK-RESUMABLE (N1 dkr27browauthoritybar1fs10010740, PP1 07:46:10Z,
+    weg2-10-16): a follower's read can complete the told KV span while its
+    tree holds no recurrent state at that depth -- PP1 acked 17406 and then
+    refused its own resume (``#928 ... best_value_len=0``), so PP0 admitted at
+    told and the group died in #968 after a 19 s #1175 wait. The ack names
+    what this rank's admission can actually RESUME from (the told-fidelity
+    probe, the #928 rule read-only): KV without an anchor at its end acks
+    less than told, and PP0 answers told=0 for EVERY rank (PF) -- a
+    rank-agreed re-prefill instead of a group death. No probe = no verdict
+    (the KV count stands, as before)."""
+    if own <= 0:
+        return own
+    try:
+        from sglang.srt.managers import weg2_told_fidelity as _tf
+
+        # W27-UNIFORM (open point (b) of item 025): the rank's OWN admission
+        # reach -- capped match plus the #988 load-back's state-aligned extent
+        # -- not PP0's plain TF probe: host KV whose end carries no recurrent
+        # state loads back only to the anchor below it, and the ack must say so
+        # (PP0 then answers told=0 for every rank) instead of acking a depth
+        # this rank's admission stops short of (START-SPLIT, PPWidthDivergence).
+        res = _tf.rank_resumable(scheduler, req, int(own))
+    except Exception:  # noqa: BLE001 - a probe never breaks the ack
+        return own
+    if res is None or int(res) >= own:
+        return _room_own(scheduler, req, rid, own)
+    n = _bump(scheduler, "_pf_ack_unresumable_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-ACK UNRESUMABLE rank pp=%s rid=%s kv=%d resumable=%d (n=%d): this "
+            "rank's read completed the KV span but its tree cannot resume there (no "
+            "recurrent state at the end) -- the ack says so and PP0 answers told=0 for "
+            "every rank instead of admitting a prefix this rank cannot materialise",
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(res), n,
+        )
+    return int(res)
+
+
+def _loadback_rows(scheduler, req, told: int) -> Optional[int]:
+    """Rows this rank's admission must load back to hold ``told``: the matched
+    depth that is HOST-only (the device part is held already). None = no probe."""
+    try:
+        tree = getattr(scheduler, "tree_cache", None)
+        match = getattr(tree, "match_prefix", None)
+        ids = getattr(req, "full_untruncated_fill_ids", None)
+        if ids is None or len(ids) == 0:
+            ids = getattr(req, "origin_input_ids", None)
+        if tree is None or not callable(match) or ids is None or len(ids) == 0:
+            return None
+        from sglang.srt.managers.weg2_store_told import _probe_key
+        from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+
+        key, _bigram = _probe_key(scheduler, req, ids, int(told))
+        mr = match(MatchPrefixParams(key=key))
+        _di = getattr(mr, "device_indices", None)
+        dev = 0 if _di is None else int(_di.numel() if hasattr(_di, "numel") else len(_di))
+        return max(0, min(int(told), dev + int(getattr(mr, "host_hit_length", 0) or 0)) - dev)
+    except Exception:  # noqa: BLE001 - a probe never breaks the ack
+        return None
+
+
+def _room_own(scheduler, req, rid: str, own: int) -> int:
+    """ACK-ROOM (dual1k dkr27bnvfp4dual1kbar1fs10010950, PP1 09:55:20Z, rid
+    weg2-0-10, a fork twin): the follower's read reproduced told=16383 and its
+    tree could resume there (host KV + anchor), but the head was HOST-only on
+    this rank (PP0/PP2 held it on the device) and the load-back found no room:
+    ``SF LOADBACK-ROOM PP-RESIDUAL kv_tokens=12288 avail=1717 evictable=0`` --
+    a concurrent 61440-token prefill held the pool. PP0 had admitted at told,
+    so #968 followed at once. The ack names 0 when this rank cannot hold the
+    told's load-back even with every evictable row freed: PP0 answers told=0
+    for EVERY rank (a rank-agreed re-prefill, chunked from 0) instead of a
+    group death. Read-only (nothing evicted here); no probe = no verdict."""
+    rows = _loadback_rows(scheduler, req, own)
+    if not rows:
+        return own
+    try:
+        tree = scheduler.tree_cache
+        alloc = getattr(tree, "token_to_kv_pool_allocator", None)
+        room = int(alloc.available_size()) + int(tree.evictable_size())
+    except Exception:  # noqa: BLE001 - no allocator readable: no verdict
+        return own
+    if room >= int(rows):
+        return own
+    n = _bump(scheduler, "_pf_ack_no_room_n")
+    if n <= 32 or n % _LOG_EVERY == 0:
+        logger.warning(
+            "PF TOLD-ACK NO-ROOM rank pp=%s rid=%s told=%d loadback_rows=%d room=%d (n=%d): "
+            "this rank holds the told span on its HOST only and cannot load it back even "
+            "with every evictable row freed -- the ack says 0 and PP0 answers told=0 for "
+            "every rank instead of an SF LOADBACK-ROOM residual and #968 after PP0 admitted",
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(rows), room, n,
+        )
+    return 0
 
 
 def _progress_free(tree) -> bool:
@@ -531,6 +770,12 @@ def follower_pump(scheduler) -> None:
             break  # a collective here would be the #580 class; the Frist decides
         if not tree.check_prefetch_progress(rid):
             continue
+        if getattr(st.registered[rid], "_weg2_early_told", None) is not None:
+            # DP-NACHLAUF (N5p): an early read -- settle it against told first
+            from sglang.srt.managers import weg2_store_told as _st
+
+            if not _st.follower_early_settle_now(scheduler, st.registered[rid], rid, told):
+                continue  # short: the told-limited read acks when it ends
         req = st.registered.pop(rid)
         st.expect.pop(rid, None)
         st.outbox.append((rid, own_prefix(scheduler, req, rid, told)))

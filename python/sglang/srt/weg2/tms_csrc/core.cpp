@@ -3,6 +3,7 @@
 #include "macro.h"
 #include "api_forwarder.h"
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <string>
@@ -407,6 +408,81 @@ int TorchMemorySaver::alloc_info(void* ptr, uint64_t* size, uint64_t* mapped, ui
     return 0;
 }
 
+#if defined(USE_CUDA)
+//: PAUSE-SUB: one cuMemUnmap + cuMemRelease pair on their own clocks.  The
+//: release is skipped when the unmap failed (the caller's CURESULT_CHECK then
+//: names the unmap's code, as before).
+CUresult TorchMemorySaver::timed_unmap_release(void* va, size_t size, CUmemGenericAllocationHandle h,
+                                               PauseSub* sub) {
+    auto t0 = std::chrono::steady_clock::now();
+    CUresult rc = cuMemUnmap((CUdeviceptr) va, size);
+    auto t1 = std::chrono::steady_clock::now();
+    sub->unmaps += 1;
+    sub->unmap_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (rc != CUDA_SUCCESS) {
+        return rc;
+    }
+    rc = cuMemRelease(h);
+    sub->release_ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    return rc;
+}
+
+//: PAUSE-MAPS (patch 5): the extents of ONE allocation (one VA reservation),
+//: sorted by offset and cut into runs of back-to-back extents.  A run of two
+//: or more goes to the driver as ONE cuMemUnmap over its whole range (the
+//: CUDA samples' multi-device mmap unmaps a range of several adjacent
+//: cuMemMap mappings in one call), then every handle of the run is released.
+//: A run the driver refuses as one range is unmapped extent by extent, i.e.
+//: exactly the patch-4 walk, and counted as a fallback.  The VA reservation
+//: is never touched.
+CUresult TorchMemorySaver::unmap_extents_coalesced(void* ptr, const std::vector<Weg2SpanExtent>& extents,
+                                                   PauseSub* sub) {
+    std::vector<Weg2SpanExtent> sorted(extents);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const Weg2SpanExtent& a, const Weg2SpanExtent& b) { return a.offset < b.offset; });
+    sub->extents += (uint64_t) sorted.size();
+    CUresult first = CUDA_SUCCESS;
+    size_t i = 0;
+    while (i < sorted.size()) {
+        size_t j = i + 1;
+        size_t end = sorted[i].offset + sorted[i].size;
+        while (j < sorted.size() && sorted[j].offset == end) {
+            end += sorted[j].size;
+            ++j;
+        }
+        CUresult rc = CUDA_ERROR_UNKNOWN;
+        if (j - i >= 2) {
+            auto t0 = std::chrono::steady_clock::now();
+            rc = cuMemUnmap((CUdeviceptr) ((char*) ptr + sorted[i].offset), end - sorted[i].offset);
+            auto t1 = std::chrono::steady_clock::now();
+            sub->unmaps += 1;
+            sub->unmap_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (rc == CUDA_SUCCESS) {
+                sub->runs += 1;
+                for (size_t k = i; k < j; ++k) {
+                    CUresult rr = cuMemRelease(sorted[k].handle);
+                    if (rr != CUDA_SUCCESS && first == CUDA_SUCCESS) first = rr;
+                }
+                sub->release_ms +=
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+            } else {
+                sub->fallbacks += 1;
+            }
+        }
+        if (rc != CUDA_SUCCESS) {
+            for (size_t k = i; k < j; ++k) {
+                CUresult rr = timed_unmap_release((char*) ptr + sorted[k].offset, sorted[k].size,
+                                                  sorted[k].handle, sub);
+                if (rr != CUDA_SUCCESS && first == CUDA_SUCCESS) first = rr;
+            }
+        }
+        i = j;
+    }
+    return first;
+}
+#endif
+
 void TorchMemorySaver::pause(const std::string& tag) {
 #if defined(USE_ROCM)
     ROCmHIPImplementation::rocm_pause(tag, allocation_metadata_, allocator_metadata_mutex_);
@@ -425,6 +501,8 @@ void TorchMemorySaver::pause(const std::string& tag) {
     // The ORDER is load-bearing and is what T4 pins: no page may be unmapped
     // before the copy that reads it has completed, so the single sync lies
     // strictly between pass 1 and pass 3.
+    const auto weg2_pause_t0 = std::chrono::steady_clock::now();   // PAUSE-SUB
+    PauseSub weg2_pause_sub;
     std::vector<void*> matched_ptrs;
     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
         void *ptr = it->first;
@@ -503,12 +581,27 @@ void TorchMemorySaver::pause(const std::string& tag) {
             continue;
         }
 
+        // PAUSE-SUB: the same calls in the same order as before, each pair on
+        // its own clock (weg2_unmap_all's walk, inlined to be timed).
+        weg2_pause_sub.allocations += 1;
         if (metadata.weg2_extents.empty()) {
-            CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
-            CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+            CURESULT_CHECK(timed_unmap_release(ptr, metadata.size, metadata.allocHandle, &weg2_pause_sub));
+        } else if (pause_coalesce_) {
+            // PAUSE-MAPS: one cuMemUnmap per contiguous run of extents.
+            CUresult first = unmap_extents_coalesced(ptr, metadata.weg2_extents, &weg2_pause_sub);
+            metadata.weg2_extents.clear();
+            CURESULT_CHECK(first);
         } else {
             // H95c: every extent of a span-mapped allocation goes back.
-            CURESULT_CHECK(weg2_unmap_all(ptr, metadata));
+            weg2_pause_sub.extents += (uint64_t) metadata.weg2_extents.size();
+            CUresult first = CUDA_SUCCESS;
+            for (size_t i = 0; i < metadata.weg2_extents.size(); ++i) {
+                const Weg2SpanExtent& e = metadata.weg2_extents[i];
+                CUresult rc = timed_unmap_release((char*) ptr + e.offset, e.size, e.handle, &weg2_pause_sub);
+                if (rc != CUDA_SUCCESS && first == CUDA_SUCCESS) first = rc;
+            }
+            metadata.weg2_extents.clear();
+            CURESULT_CHECK(first);
         }
 
         metadata.state = AllocationState::PAUSED;
@@ -523,6 +616,7 @@ void TorchMemorySaver::pause(const std::string& tag) {
                   << std::endl;
 #endif
     }
+    note_pause(tag, weg2_pause_sub, weg2_pause_t0);   // PAUSE-SUB
 #else
     #error "USE_PLATFORM is not set"
 #endif

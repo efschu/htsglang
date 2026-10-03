@@ -17,7 +17,7 @@ def _peel(written_seq, ongoing):
     t.cache_controller = types.SimpleNamespace(write_policy="write_back")
     t.ongoing_write_through = ongoing
     seq = list(written_seq)
-    t.write_backup = lambda n, write_back=False: (calls.append("write"), seq.pop(0))[1]
+    t.write_backup = lambda n, write_back=False, **kw: (calls.append("write"), seq.pop(0))[1]
     t.writing_check = lambda write_back=False: calls.append("drain")
     t._evict_to_host = lambda n, tr: calls.append("evict")
     node = types.SimpleNamespace(backuped=False, id=1)

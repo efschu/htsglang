@@ -127,12 +127,24 @@ class PreadDirect(_Base):
 
 class MultiThreadIterator(_Base):
     def test_pread_branch_forwards_direct_io(self):
-        with mock.patch.object(wu, "pread_safetensors_file",
-                               wraps=wu.pread_safetensors_file) as spy:
+        # 27B-ODIRECT-STREAM 0927: pread + direct_io streams by default (the
+        # per-file form held (max_workers + 1) whole shards -> b23 hit its cap);
+        # the stream carries direct_io. SGLANG_WEIGHT_LOADER_PREAD_STREAM=0 keeps
+        # the per-file form, which forwards it as before.
+        with mock.patch.object(wu, "pread_safetensors_stream",
+                               wraps=wu.pread_safetensors_stream) as spy:
+            os.environ.pop(wu.STREAM_ENV, None)
             got = dict(wu.buffered_multi_thread_safetensors_weights_iterator(
                 [self.path], max_workers=2, pread=True, direct_io=True))
         self._same(got)
         self.assertTrue(spy.call_args.kwargs.get("direct_io"))
+        with mock.patch.dict(os.environ, {wu.STREAM_ENV: "0"}), \
+                mock.patch.object(wu, "pread_safetensors_file",
+                                  wraps=wu.pread_safetensors_file) as spy2:
+            got = dict(wu.buffered_multi_thread_safetensors_weights_iterator(
+                [self.path], max_workers=2, pread=True, direct_io=True))
+        self._same(got)
+        self.assertTrue(spy2.call_args.kwargs.get("direct_io"))
 
     def test_disable_mmap_branch_honours_direct_io(self):
         with mock.patch.object(wu, "read_file_direct",

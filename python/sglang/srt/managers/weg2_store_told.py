@@ -70,6 +70,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from sglang.srt.managers import weg2_told_fallback as _fb
+from sglang.srt.managers import weg2_told_fidelity as _tf  # TF told fidelity
 from sglang.srt.weg2 import p_twin_defer as _twin
 from sglang.srt.weg2 import prefix_trace as _pt
 
@@ -111,6 +112,22 @@ class Weg2StoreTold:
     #: adopts it instead of deciding from its own file read. None = an old
     #: sender (the follower decides itself, as before).
     keys_digest: Optional[str] = None
+
+
+#: P-FORK-CUT (weg2.p_fork_cut) wire attribute of a told: the absolute token
+#: depth at which the request's truncating chunk ends -- PP0's verdict, decided
+#: once at the publish from PP0's store probe / tree match. Set only when there
+#: is a cut (like PF's ``ack``), so a told without one stays byte-identical on
+#: the wire. Every rank's adder cuts at exactly this value and at nothing
+#: rank-local (z30j: a cut read from PP0's own probe split PP0 4608 / PP1
+#: 16384 -> W27).
+WIRE_FORK = "fork"
+
+
+def _with_fork(told, fork: int):
+    if fork > 0:
+        setattr(told, WIRE_FORK, int(fork))
+    return told
 
 
 @dataclass
@@ -158,6 +175,9 @@ def armed(scheduler) -> bool:
     if value:
         scheduler._weg2_store_told = {}
         scheduler._weg2_store_held = {}
+        #: P-FORK-CUT: rid -> the told fork (PP0: published, follower: absorbed);
+        #: `admission` hands it to the request.
+        scheduler._weg2_store_fork = {}
         # #1416e: resolved ONCE, read on PP0 only -- a follower follows the
         # `paced` flag of the object PP0 put on the wire, never its own env,
         # so a launcher that armed the switch on one rank only cannot split
@@ -230,6 +250,107 @@ def _rid(req) -> str:
     return str(getattr(req, "rid", ""))
 
 
+#: DP-NACHLAUF 02.10. (N5d D->P epoch 25, weg2-24-93): a follower registered
+#: its store read only after PP0's terminated read was published as the told --
+#: PP0 queue 1333 ms + read 206 ms, THEN PP1/PP2 queue ~495 ms + read ~176 ms,
+#: serialised down the pipe before the first prefill forward. With this switch a
+#: follower registers its own read AT INTAKE, beside PP0's; the told stays the
+#: authority for the depth (it caps or confirms, it no longer starts the read):
+#: own == told -> admitted as before; own > told -> the rank holds more than
+#: told (SATISFIED, the match is capped at told, as #1400 xsn141); own < told
+#: -> the told-limited read of #1400 is registered then, as before. A rank that
+#: cannot reach told refuses by name exactly as before (RAENGE-NIE-UNEINS).
+#: "over" is SATISFIED only for an ABSOLUTE told (twin / TK absolute: the
+#: follower's own head is added, the quantities are comparable); a span-relative
+#: told the early read overshot meets #1400's own MISMATCH refusal, by name.
+#: Not with dual-share. N5p (b6a6a5c08d, armed, 0 FOLLOWER-EARLY-READ lines):
+#: the 27B form runs the paced told with the PF group fallback, which this
+#: gate excluded -- since then the early read is settled against the paced
+#: read-ahead where the PF ack is formed (``follower_early_settle_now`` from
+#: ``weg2_told_fallback.follower_pump``): equal / over(absolute) ack told at
+#: once, short registers the told-limited read and acks when it ends, a
+#: relative overshoot acks its own count and PF answers told=0 by name.
+#: DEFAULT ON since 02.10. (metal 27B N5t..N6e: FOLLOWER-EARLY-SETTLE at=ack on
+#: every follower, TOLD-ACKED 0.46 -> 0.02-0.05 s; NF y8b d019aa8e1e / y8c
+#: 71da6e387c: FOLLOWER-EARLY-READ 32x on P, 0 deaths);
+#: SGLANG_WEG2_FOLLOWER_EARLY_READ=0 restores the told-first order the #1400
+#: desk tests pin.
+ENV_FOLLOWER_EARLY_READ = "SGLANG_WEG2_FOLLOWER_EARLY_READ"
+
+
+def follower_early_read_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_FOLLOWER_EARLY_READ, "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _early_reads(scheduler) -> Dict[str, float]:
+    d = getattr(scheduler, "_weg2_follower_early", None)
+    if d is None:
+        d = scheduler._weg2_follower_early = {}
+    return d
+
+
+def _follower_early_allowed(scheduler) -> bool:
+    # ABSOLUTE tolds only (TK, SGLANG_WEG2_TOLD_ABSOLUTE): the follower's own
+    # head + span is then the quantity PP0's told names, so an overshooting
+    # early read is SATISFIED at told instead of a span-relative MISMATCH
+    return (follower_early_read_on() and _absolute_armed()
+            and os.environ.get("SGLANG_WEG2_DUAL_SHARE", "").strip() != "1")
+
+
+def follower_early_settle_now(scheduler, req, rid: str, told: int) -> bool:
+    """DP-NACHLAUF (N5p): the paced/PF form settles the follower's terminated
+    early read when its ack is formed, not at the Admit (the Admit only comes
+    after the acks). True = ack now (equal / over / refuse: the ack then names
+    the count and PP0 decides); False = ``short``: the told-limited read was
+    registered, the ack follows when it terminates."""
+    req._weg2_early_told = None
+    tree = scheduler.tree_cache
+    own = int(_completed_prefix(tree, rid) or 0)
+    tst = getattr(scheduler, getattr(_twin, "_ATTR", "_weg2_twin_state"), None)
+    absolute = bool(tst) and str(rid) in (getattr(tst, "twin_follower", None) or {})
+    if absolute:
+        own = _twin.registered_head(req) + own
+    how = follower_early_settle(scheduler, req, told, own, absolute=absolute)
+    n = getattr(scheduler, "_weg2_follower_early_settled", 0) + 1
+    scheduler._weg2_follower_early_settled = n
+    if _log_due(n) or how != "equal":
+        logger.info("#1400 FOLLOWER-EARLY-SETTLE rid=%s pp=%s told=%d own=%d -> %s at=ack (n=%d)",
+                    _rt(rid), scheduler.ps.pp_rank, int(told), int(own), how, n)
+    return how != "short"
+
+
+def follower_early_settle(scheduler, req, told: int, own: int, absolute: bool = False) -> str:
+    """The told against a follower's EARLY read (own completed prefix):
+    ``"equal"`` (admit as #1400 does), ``"over"`` (absolute told only: this
+    rank holds more than told -- SATISFIED at told, its credit popped),
+    ``"refuse"`` (a span-relative told the read overshot: #1400's MISMATCH
+    refusal follows in the admission), ``"short"`` (register the #1400
+    told-limited read now; the admission then waits for it)."""
+    rid = _rid(req)
+    tree = scheduler.tree_cache
+    if int(own) == int(told):
+        return "equal"
+    if int(own) > int(told) and not absolute:
+        return "refuse"
+    if int(own) > int(told):
+        try:
+            _pop_credit_keep_pin(tree, rid)
+        except Exception:  # noqa: BLE001
+            pass
+        satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
+        if satisfied is None:
+            satisfied = scheduler._weg2_store_told_satisfied = {}
+        satisfied[rid] = int(told)
+        return "over"
+    try:
+        _pop_credit_keep_pin(tree, rid)
+    except Exception:  # noqa: BLE001
+        pass
+    _follower_register(scheduler, req, told, early=False)
+    return "short"
+
+
 def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     """The intake step. PP0: register as today and hold. Follower: hold only;
     the registration happens in :func:`follower_absorb` with PP0's told."""
@@ -267,6 +388,17 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
         # order, but a re-queued request can find its told already stored):
         # register now with the told span.
         return _follower_register(scheduler, req, told)
+    if _follower_early_allowed(scheduler):
+        # DP-NACHLAUF: the follower's own read starts now, beside PP0's
+        _ev = scheduler._prefetch_kvcache(req)
+        if str(_ev).startswith("issued"):
+            _early_reads(scheduler)[rid] = time.monotonic()
+        n = getattr(scheduler, "_weg2_follower_early_n", 0) + 1
+        scheduler._weg2_follower_early_n = n
+        if _log_due(n):
+            logger.info("#1400 FOLLOWER-EARLY-READ rid=%s verdict=%s pp=%s (n=%d): the store read "
+                        "starts at intake, beside PP0's; the told caps or confirms it",
+                        _rt(rid), _ev, scheduler.ps.pp_rank, n)
     held[rid] = req
     note_gate(GATE_HELD)
     return f"declined:{GATE_HELD}"
@@ -282,6 +414,28 @@ def follower_limit_tokens(tree, told: int) -> int:
     return int(told) + bigram
 
 
+def told_read_min_tokens(limit_tokens: Optional[int], tail_min: Optional[int]) -> Optional[int]:
+    """TS (NF y4a b547263cb8, death 03:36:24, rid weg2-50-159): the smallest
+    read a registration may issue. A read bounded by a TOLD (``limit_tokens``:
+    a follower's #1400 registration, a told refetch plan) is PRESCRIBED -- PP0
+    already admitted that prefix -- so the #915 ``prefetch_threshold`` (256),
+    which prices whether opening a FRESH read is worth it, does not apply: 1.
+    Otherwise the caller's own minimum (store-short tail, park read) or None
+    = the tree's threshold, unchanged.
+
+    The seam: PP0 registered 50-159 at head 94080 (span 10241 >= 256), its
+    read matched 1152 host tokens and loaded 64 from the store: told 95296.
+    One pass later PP1/PP2 registered at told with their host walk already at
+    95232 (the source's pages had landed): need 64 < 256, ``#915 PREFETCH
+    REFUSED reason=too_short``, ``FOLLOWER REGISTRATION DECLINED``, then
+    ``Weg2StoreToldMismatch told=95296 own_prefix=95232`` on both followers,
+    W17 GroupDead. Same page keys, same store: the follower CAN read the 64
+    tokens PP0 read; it only refused to open the read."""
+    if limit_tokens is not None:
+        return 1
+    return tail_min
+
+
 def prefix_cap_tokens(tree, told: int) -> int:
     """TK (#1419 with told > 0): the RAW-token cap that lets the radix match
     reach exactly ``told`` KEYS. ``_weg2_cap_key_limit`` feeds it to
@@ -292,7 +446,16 @@ def prefix_cap_tokens(tree, told: int) -> int:
     return follower_limit_tokens(tree, told)
 
 
-def _follower_register(scheduler, req, told: int) -> str:
+def _follower_register(scheduler, req, told: int, early: bool = True) -> str:
+    if early:
+        # DP-NACHLAUF: an early read of this rid is in flight or done -- the
+        # told settles against it at admission instead of starting a read
+        if _early_reads(scheduler).pop(_rid(req), None) is not None:
+            req._weg2_early_told = int(told)
+            if getattr(scheduler, "_weg2_fb_follower", None) is not None:
+                # PF: the ack reports this read (settled at the ack, N5p)
+                _fb.follower_note_registered(scheduler, req)
+            return "early:own_read"
     if getattr(scheduler, "_weg2_fb_follower", None) is not None:
         # PF: whatever this registration's outcome (issued, satisfied,
         # declined), its read state is what PP0's fallback asked for.
@@ -358,11 +521,23 @@ def _log_due(n: int) -> bool:
 
 def _local_prefix(req) -> int:
     """Tokens this rank already holds for ``req`` (device + host tier), the
-    same two terms ``_prefetch_kvcache`` subtracts before it reads."""
+    same two terms ``_prefetch_kvcache`` subtracts before it reads.
+
+    SL (NF rc12u 09271905, weg2-4-7 19:11:06): ``len(prefix_indices or [])``
+    asked ``bool()`` of the torch tensor the live match stores there, which
+    raises for more than one element; the ``except`` below turned that into 0
+    on EVERY real request. So "FOLLOWER SATISFIED LOCALLY" never fired on metal
+    (27B 09271525: 24 DECLINED, 0 SATISFIED) and a follower that already held
+    the told span (PP1 "#1442 HANDOFF-KEYS REG matched=39232 new=1", told
+    39232, "#915 PREFETCH REFUSED reason=too_short") was named "cannot load
+    what PP0 admitted". The twin told got through (its admission adds the
+    registered head); a plain told on that shape -- PP0 re-read what its
+    followers still hold, xsn141 -- would have reached the named MISMATCH.
+    ``len()`` of the object itself, no truthiness."""
     try:
-        return int(len(getattr(req, "prefix_indices", []) or [])) + int(
-            getattr(req, "host_hit_length", 0) or 0
-        )
+        pi = getattr(req, "prefix_indices", None)
+        n = 0 if pi is None else int(len(pi))
+        return n + int(getattr(req, "host_hit_length", 0) or 0)
     except Exception:  # noqa: BLE001 - a double without the fields holds nothing
         return 0
 
@@ -395,12 +570,24 @@ def _probe_key(scheduler, req, ids, told: int):
     ``told`` counts KEYS, so a bigram span needs ``told + 1`` raw tokens
     (the same +1 as ``follower_limit_tokens``); P's handed-over page keys
     (#1442), when registered for this rid, replace the covered prefix
-    exactly as ``_storage_hit_query`` does."""
+    exactly as ``_storage_hit_query`` does.
+
+    R5 (rc12z2 e8a2cd2dc5, P 03:26:41, rid weg2-44-76): the ids go in as
+    ``array('q')`` -- the tree's own key form. A list made every TF probe
+    (``weg2_told_fidelity.pp0_admissible``) die in ``RadixKey.match``
+    (``AssertionError((array.array, list))``, 10 of 10 on that boot, "#TF
+    told-fidelity probe skipped"), so PP0 never saw that its own anchor at
+    told was gone: it put Admit(37952) on the wire, refused its own resume
+    (#928, admitted 0) while PP1 resumed at 37952 -- W27 START-SPLIT. The
+    store hash reads arrays alike (``compute_node_hash_values`` hashes the
+    tree's array keys)."""
+    from array import array
+
     from sglang.srt.mem_cache.radix_cache import RadixKey
 
     tree = getattr(scheduler, "tree_cache", None)
     bigram = bool(getattr(tree, "is_eagle", False))
-    raw = list(ids[: int(told) + (1 if bigram else 0)])
+    raw = array("q", ids[: int(told) + (1 if bigram else 0)])
     key = RadixKey(raw, extra_key=getattr(req, "extra_key", None), is_bigram=bigram)
     return key, bigram
 
@@ -500,7 +687,7 @@ def _adopt_keys(scheduler, req) -> None:
                         rid8(req), digest, verdict, n)
 
 
-def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None):
+def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None, extra_key=None):
     """#1416c (boot xsn174): ``store_presence_pages`` asks the store about
     the FIRST ``STORAGE_BATCH_SIZE`` (128) pages only -- a 98,550-token span
     whose anchor sits on its last page answered 0, so told was clamped to 0
@@ -509,12 +696,19 @@ def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None):
     ``batch_exists_v2`` over every page key with the tree's component
     transfers (the mamba anchor is the trailing-pages pool). None = the
     question could not be asked.
+
+    Q-460 SALT-ISOLATION: ``extra_key`` (the request's namespace) seeds a
+    plain id list's chain; a RadixKey carries its own.
     """
     try:
-        # a RadixKey (#1416d) goes in as is -- the hash reads its bigram flag;
-        # a plain id list keeps the pre-#1416d call.
+        # a RadixKey (#1416d) goes in as is -- the hash reads its bigram flag
+        # and its namespace; a plain id list keeps the pre-#1416d call.
+        from sglang.srt.mem_cache.utils import namespace_root_hash
+
+        _ek = extra_key if extra_key is not None else getattr(ids, "extra_key", None)
         hashes = cc.get_hash_str(
-            ids if not isinstance(ids, list) else list(ids), None, page_size=page_size
+            ids if not isinstance(ids, list) else list(ids),
+            namespace_root_hash(_ek), page_size=page_size
         )
         if not hashes:
             return 0
@@ -531,6 +725,35 @@ def _anchored_pages_full_span(cc, ids, page_size: int, handoff_keys=None):
     except Exception as exc:  # noqa: BLE001 - see the docstring
         logger.warning("#1416c full-span anchor probe unavailable: %r", exc)
         return None
+
+
+#: DP-NACHLAUF 02.10. (N5x 5ddc067a81, warm D->P, 73k store hit): every
+#: store read (PP0 + the followers' early reads) finished DURING the flip, yet
+#: PF TOLD-ACKED came 0.19-0.23 s after the wake -- the followers sat 214 ms
+#: in '#1460 CHAIN-RECV blocked' for PP0's first pass, whose told clamp
+#: (#1416d TOLD-PROBE) re-hashed all 73728 pages and ran a full
+#: batch_exists_v2 on the scheduler thread: the same anchor-clamped question
+#: the prefetch thread had answered a second earlier (queue_parts exists
+#: 207-232 ms). When the read completed EXACTLY that answer's span, the clamp
+#: is the identity (an anchor sits at told, the read pinned it) and the probe
+#: is skipped; a short or truncated read, or no recorded answer, probes as
+#: before. Unset = on; 0/false/no/off = always probe.
+ENV_CLAMP_REUSE = "SGLANG_WEG2_TOLD_CLAMP_REUSE"
+
+
+def told_clamp_reuse_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_CLAMP_REUSE, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def note_probe_hit(cc, rid, pages) -> None:
+    """The prefetch probe's anchor-clamped hit (pages) for ``rid``."""
+    if rid is None:
+        return
+    d = cc.__dict__.setdefault("_weg2_probe_hit_pages", {})
+    d[str(rid)] = int(pages or 0)
+    while len(d) > 512:
+        d.pop(next(iter(d)))
 
 
 def _anchor_clamp(scheduler, req, told: int) -> int:
@@ -554,6 +777,20 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
         if cc is None or not callable(getattr(cc, "get_hash_str", None)) or not ids:
             return int(told)
         page_size = int(getattr(cc, "page_size", 1) or 1)
+        _hits = getattr(cc, "_weg2_probe_hit_pages", None)
+        _hit = _hits.pop(str(_rid(req)), None) if isinstance(_hits, dict) else None
+        if told_clamp_reuse_on() and _hit is not None and int(told) == int(_hit) * page_size:
+            n = getattr(scheduler, "_1416d_reuse_n", 0) + 1
+            try:
+                scheduler._1416d_reuse_n = n
+            except Exception:  # noqa: BLE001
+                pass
+            if _log_due(n):
+                logger.info("#1416d TOLD-PROBE rid=%s told=%d reused=prefetch_hit pages=%d (n=%d): the read "
+                            "completed the prefetch probe's anchored span -- no second probe (DP-NACHLAUF)",
+                            rid8(req), int(told), int(_hit), n)
+            return int(told)
+        _t_probe = time.perf_counter()
         if _tree_key_probe_armed():
             key, bigram = _probe_key(scheduler, req, ids, told)
             pages = _anchored_pages_full_span(
@@ -567,11 +804,13 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
             if _log_due(n):
                 logger.info(
                     "#1416d TOLD-PROBE rid=%s told=%d keys=%d bigram=%s pages=%s "
-                    "(n=%d): the clamp asks the store with the fetch's key form",
+                    "(n=%d): the clamp asks the store with the fetch's key form ms=%.1f prefetch_hit=%s",
                     rid8(req), int(told), len(key), bigram, pages, n,
+                    (time.perf_counter() - _t_probe) * 1000.0, _hit,
                 )
         else:
-            pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size)
+            pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size,
+                                              extra_key=getattr(req, "extra_key", None))
         if pages is None:
             # the full-span question could not be asked: no clamp (the
             # pre-#1416 number; #1419 caps every rank's match to told, so a
@@ -677,6 +916,36 @@ def _pp0_told_any(scheduler, tree, req, rid: str, twin: bool):
     return _pp0_told(scheduler, tree, req, rid), False
 
 
+def _ple_admit_at_told(scheduler, req, told: int, absolute: bool) -> None:
+    """#1416h: PP0's told names where the request's first chunk starts; the
+    PLE gather of that chunk starts now, beside the followers' reads and
+    PP0's pacing, instead of at token 0 at intake (dropped as cached_prefix
+    in 31 of 33 z30e admissions) or cold inside the forward (mean 186 ms,
+    max 510 ms on PP0). No-op unless an admitting PLE gather lives here."""
+    try:
+        from sglang.srt.models.qwen4_exp_ple_admit import (
+            admit_ple_request,
+            ple_admission_armed,
+        )
+
+        if not ple_admission_armed():
+            return
+        head = _twin.registered_head(req)
+        told = max(0, int(told))
+        start = told if absolute else head + told
+        if told <= 0:
+            start = head
+        admit_ple_request(
+            req,
+            getattr(scheduler, "chunked_prefill_size", None),
+            dormant=bool(getattr(scheduler, "weg2_dormant", False)),
+            start=start,
+            source="told",
+        )
+    except Exception:  # noqa: BLE001 -- a prefetch hint never stops the told
+        logger.debug("#1416h PLE admit at told failed", exc_info=True)
+
+
 def _parked(scheduler) -> set:
     """TK path 4: rids that left the waiting queue only for the dormant hold
     (#1443/#1455) or the post-wake settle (#1471). They come back through the
@@ -694,6 +963,13 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     held rids into ``Weg2StoreTold`` objects appended to the outgoing list.
     Returns the list to SEND; the caller keeps dispatching ``recv_reqs``."""
     held: Dict[str, Any] = scheduler._weg2_store_held
+    # TW (#56): every PP0 pass counts and notes the siblings that finished,
+    # also when nothing is held -- a twin arriving right after its sibling's
+    # finish is held until that finish settled (the end anchor published).
+    _twin.tick(scheduler)
+    # P-MINIFWD: a lone final rest waits (bounded, measured) for the read of a
+    # queued request, so this pass's told carries it into the same forward.
+    _minifwd_hold(scheduler, recv_reqs)
     paced_on = bool(getattr(scheduler, "_weg2_told_paced_on", False))
     if paced_on:
         return _pp0_publish_paced(scheduler, recv_reqs)
@@ -702,12 +978,14 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     told_map: Dict[str, int] = scheduler._weg2_store_told
     tree = scheduler.tree_cache
     queued = {_rid(r) for r in scheduler.waiting_queue}
+    parked = _parked(scheduler)
     # TW: held fork twins whose sibling finished (or whose Frist ran out)
     # register their store read NOW, exactly as the intake would have.
-    for _treq, _is_twin in _twin.release_due(scheduler, queued):
+    # TW-WAKE: a twin deferred while P slept sits in the dormant hold (then the
+    # settle), not in the queue -- it is still waiting, not gone.
+    for _treq, _is_twin in _twin.release_due(scheduler, queued | parked):
         _twin_register(scheduler, _treq, _is_twin)
     out: List[Weg2StoreTold] = []
-    parked = _parked(scheduler)
     for rid in list(held):
         req = held[rid]
         if rid not in queued:
@@ -730,10 +1008,12 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             continue
         twin = _twin.take_pp0_twin(scheduler, rid)
         told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
+        _ple_admit_at_told(scheduler, req, told, absolute)
         told_map[rid] = told
         held.pop(rid, None)
-        out.append((Weg2StoreToldTwin if twin else Weg2StoreTold)(
-            rid=rid, told=told, absolute=absolute, keys_digest=_pp0_keys_digest(req)))
+        out.append(_with_fork((Weg2StoreToldTwin if twin else Weg2StoreTold)(
+            rid=rid, told=told, absolute=absolute, keys_digest=_pp0_keys_digest(req)),
+            _pp0_fork(scheduler, req, rid)))
         n = getattr(scheduler, "_weg2_store_told_published", 0) + 1
         scheduler._weg2_store_told_published = n
         if _log_due(n):
@@ -749,6 +1029,119 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     if not out:
         return recv_reqs
     return list(recv_reqs) + out
+
+
+def _read_open(scheduler, tree, rid: str, held: Dict[str, Any]) -> bool:
+    """P-MINIFWD: ``rid`` is held by #1400 with its store read still running
+    (the publish loop would skip it only for that reason)."""
+    req = held.get(rid)
+    if req is None or _twin.is_deferred(scheduler, rid):
+        return False
+    if getattr(req, "prefetch_deferred", None) is not None:
+        return False
+    entry = (getattr(tree, "ongoing_prefetch", None) or {}).get(rid)
+    return entry is not None and getattr(entry, "operation", None) is not None
+
+
+def _read_terminable(tree, rid: str) -> bool:
+    """P-MINIFWD: would ``check_prefetch_progress(rid)`` terminate now? The
+    same predicate without the termination (``can_terminate_prefetch`` is
+    collective-free on the tp_size 1 form this module arms on)."""
+    entry = (getattr(tree, "ongoing_prefetch", None) or {}).get(rid)
+    if entry is None:
+        return True
+    op = getattr(entry, "operation", None)
+    if op is None or getattr(op, "host_indices", None) is None:
+        return True
+    from sglang.srt.weg2 import tail_adopt
+
+    return bool(tree.can_terminate_prefetch(op, tail_hold=tail_adopt.vote_hold(rid)))
+
+
+def _minifwd_rest(scheduler) -> Optional[int]:
+    """P-MINIFWD: the carried chunked request's next piece when it is final."""
+    from sglang.srt.managers import schedule_policy as _sp
+    from sglang.srt.weg2 import p_minifwd_hold as _mh
+    from sglang.srt.weg2 import tail_handoff as _th
+
+    req = getattr(scheduler, "chunked_req", None)
+    if req is None:
+        return None
+    fill = len(req.full_untruncated_fill_ids)
+    er = getattr(req, "extend_range", None)
+    # P-MINIFWD-HOLD fired 0x on metal (y3v 15, y3w 4 'skipped (RuntimeError:
+    # Boolean value of Tensor with more than one value is ambiguous)'): the
+    # prefix indices are a device TENSOR, and ``tensor or ()`` asks its truth
+    # value -- every pass that reached this line dropped the hold. Length only.
+    prefix = getattr(req, "prefix_indices", None)
+    done = max(int(getattr(er, "end", 0) or 0), 0 if prefix is None else len(prefix))
+    page = int(getattr(scheduler, "page_size", 1) or 1)
+    split = False
+    if _sp._WEG2_END_ANCHOR and fill - done >= 2:
+        claim = _th.claim_anchor_end(req, getattr(scheduler, "tree_cache", None))
+        split = not _th.fold_applies(fill, page, start=done, claim=claim)
+    return _mh.final_rest(fill, done, getattr(scheduler, "chunked_prefill_size", None), split)
+
+
+def _minifwd_hold(scheduler, recv_reqs: List) -> None:
+    """P-MINIFWD adapter (weg2/p_minifwd_hold.py): read the pass state, let
+    the pure verdict decide, wait if it says so. Never raises into the pass."""
+    from sglang.srt.weg2 import p_minifwd_hold as _mh
+
+    if not _mh.enabled():
+        return
+    try:
+        held: Dict[str, Any] = scheduler._weg2_store_held
+        # cheapest facts first: no carried request or nobody held -> no import,
+        # no probe, the pass runs exactly as before
+        if not held or getattr(scheduler, "chunked_req", None) is None:
+            return
+        tree = scheduler.tree_cache
+        told_map: Dict[str, int] = scheduler._weg2_store_told
+        queued = [_rid(r) for r in scheduler.waiting_queue]
+        control = any(type(r).__name__ in _mh.CONTROL_KINDS for r in (recv_reqs or ()))
+        bound = _mh.wait_bound_s()
+        verdict = _mh.decide(
+            rest=_minifwd_rest(scheduler),
+            queued=queued,
+            admissible=lambda rid: rid in told_map and rid not in held,
+            open_read=lambda rid: _read_open(scheduler, tree, rid, held),
+            control=control,
+            bound_s=bound,
+        )
+        if not verdict.wait:
+            return
+        outcome, rid, waited = _mh.wait(verdict.rids, lambda r: _read_terminable(tree, r), bound)
+        _mh.log_hold(_rid(scheduler.chunked_req), verdict, outcome, rid, waited, bound)
+    except Exception as exc:  # noqa: BLE001 -- the hold is an optimisation, the pass must run
+        logger.warning("P-MINIFWD-HOLD skipped (%s: %s)", type(exc).__name__, exc)
+
+
+def _note_fork(scheduler, rid: str, fork) -> None:
+    """P-FORK-CUT: keep the told's fork until this rank admits ``rid``."""
+    forks = getattr(scheduler, "_weg2_store_fork", None)
+    if forks is None:
+        forks = scheduler._weg2_store_fork = {}
+    fork = int(fork or 0)
+    if fork > 0:
+        forks[rid] = fork
+    else:
+        forks.pop(rid, None)
+    if len(forks) > 256:
+        queued = {_rid(r) for r in scheduler.waiting_queue}
+        for k in [k for k in forks if k != rid and k not in queued]:
+            forks.pop(k, None)
+
+
+def _pp0_fork(scheduler, req, rid: str) -> int:
+    """P-FORK-CUT: PP0 decides the fork depth ONCE, at the told it publishes,
+    from its own store probe and tree match; the told carries the number to
+    every follower (0 = no cut anywhere)."""
+    from sglang.srt.weg2 import p_fork_cut
+
+    fork = p_fork_cut.pp0_fork_verdict(req, int(getattr(scheduler, "page_size", 1) or 1))
+    _note_fork(scheduler, rid, fork)
+    return fork
 
 
 def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
@@ -784,6 +1177,8 @@ def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
                     early.pop(k, None)
         else:
             told_map[rid] = told
+        # P-FORK-CUT: PP0's fork verdict, the only one this rank cuts at.
+        _note_fork(scheduler, rid, getattr(item, WIRE_FORK, 0))
         if getattr(item, "twin", False) or getattr(item, "absolute", False):
             # TW: an absolute twin told (read-ahead or single-phase alike);
             # TK: every absolute told takes the same follower mark.
@@ -889,8 +1284,25 @@ def pace_window_s(own_read_s: float, told: int) -> float:
     factor = _env_float(ENV_PACE_FACTOR, PACE_FACTOR_DEFAULT)
     rate = _env_float(ENV_PACE_S_PER_100K, PACE_S_PER_100K_DEFAULT)
     cap = _env_float(ENV_PACE_CAP_S, PACE_CAP_S_DEFAULT)
+    if int(told) <= 0:
+        # #57: nothing to read on any follower (see pace_read_tokens)
+        return 0.0
     est = max(factor * max(0.0, float(own_read_s)), rate * max(0, int(told)) / 100000.0)
     return min(cap, est)
+
+
+def pace_read_tokens(told: int, head: int, absolute: bool) -> int:
+    """#57 (NF rc12v 09272047: told=1728 paced 8.5-8.9 s): the tokens a
+    follower actually reads for ``told``. An ABSOLUTE told counts from token 0
+    and the registration's device head (``registered_head``, stamped on every
+    rank by ``_prefetch_kvcache``) is already local -- the followers answered
+    "#1400 FOLLOWER SATISFIED LOCALLY ... local_prefix=2496: nothing to read"
+    while PP0 paced them for 1.25 x its own intake-to-poll time (6.82 s of 16k
+    chunk passes, not a read). A span-relative told IS the read span."""
+    told = max(0, int(told))
+    if not absolute:
+        return told
+    return max(0, told - max(0, int(head)))
 
 
 @dataclass
@@ -900,6 +1312,8 @@ class _Pace:
     published_at: float
     published_pass: int
     window_s: float
+    #: TF: the told's unit (absolute keys vs span-relative), for the Admit check.
+    absolute: bool = True
 
 
 def _pace_intake_t(scheduler) -> Dict[str, float]:
@@ -923,12 +1337,52 @@ def _early(scheduler) -> Dict[str, int]:
     return d
 
 
+# #1416f IDLE ADMIT (NF z30e ca2a9706ec, boot
+# ...stvsyncbar1dauer09282117): the window guards ONE thing -- a follower's
+# bounded admission wait stopping OTHER work in pipeline flight on its stage
+# (the #1416e risk block above). The first request after a P wake has none:
+# every P leg of that boot waited the full window with the whole pipeline
+# empty. weg2-8-29: PP0's own read 831 ms, window 1.04 s (1.25 x), the
+# followers' reads 49/71 ms -> ~1 s of three idle GPUs before the forward
+# (wake -> first PP0 forward 2.18 s); over 27 legs wake -> forward
+# 0.45-2.18 s, the window 0.17-1.04 s of it. With nothing in flight the
+# follower's residual wait costs nothing (its read overlaps PP0's own forward,
+# >= 1 s on this form), so PP0 admits in the next pass -- the read-ahead still
+# precedes its Admit by one pass. Anything in flight, or a ring this helper
+# cannot read, keeps the window. Off: SGLANG_WEG2_DISABLE_TOLD_PACE_IDLE_SKIP=1.
+
+
+def _pace_idle_skip_armed() -> bool:
+    from sglang.srt.environ import envs
+
+    return not envs.SGLANG_WEG2_DISABLE_TOLD_PACE_IDLE_SKIP.get()
+
+
+def pipeline_idle(scheduler) -> bool:
+    """True only when PP0 provably has nothing in pipeline flight: every ring
+    slot empty (``mbs``), no running batch in any slot (``running_mbs``), no
+    chunked request. A missing ring reads as busy (the window stays)."""
+    mbs = getattr(scheduler, "mbs", None)
+    running = getattr(scheduler, "running_mbs", None)
+    if not isinstance(mbs, (list, tuple)) or not isinstance(running, (list, tuple)):
+        return False
+    if any(b is not None for b in mbs):
+        return False
+    for rb in running:
+        if rb is not None and not rb.is_empty():
+            return False
+    if getattr(scheduler, "chunked_req", None) is not None:
+        return False
+    return True
+
+
 def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     """PP0, paced form: publish read-aheads for terminated reads, then the
     Admits whose window has passed. Never waits."""
     held: Dict[str, Any] = scheduler._weg2_store_held
     pacing = _pacing(scheduler)
-    if not held and not pacing:
+    fb_watch = bool(getattr(scheduler, "_weg2_told_fallback_on", False)) and _fb.pp0_watching(scheduler)
+    if not held and not pacing and not fb_watch:
         return recv_reqs
     told_map: Dict[str, int] = scheduler._weg2_store_told
     tree = scheduler.tree_cache
@@ -939,16 +1393,26 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
     scheduler._weg2_told_pass_n = pass_n
     fb_on = bool(getattr(scheduler, "_weg2_told_fallback_on", False))
     fb_parked = set()
-    if fb_on and pacing:
+    if fb_on and (pacing or fb_watch):
         # PF: the followers' read acks that have landed (no wait), BEFORE
         # the verdicts below read them.
         _fb.pp0_harvest(scheduler)
         fb_parked = _parked(scheduler)
+    out: List[Any] = []
+    if fb_on and fb_watch:
+        # item 220: a follower found its tree short of an ADMITTED told; PP0
+        # (alone) retracts it to told=0 for every rank while it has not
+        # seated the rid itself.
+        for r_rid, r_told, r_own in _fb.pp0_retract_due(scheduler, queued, _parked(scheduler)):
+            _fb.pp0_retract_applied(scheduler, r_rid, r_told, r_own)
+            retract = Weg2StoreAdmit(rid=r_rid, told=0)
+            setattr(retract, _fb.WIRE_FALLBACK, 1)
+            told_map[r_rid] = 0
+            out.append(retract)
     # TW: held fork twins whose sibling finished (or whose Frist ran out)
     # register their store read now (the paced read clock starts here).
-    for _treq, _is_twin in _twin.release_due(scheduler, queued):
+    for _treq, _is_twin in _twin.release_due(scheduler, queued | _parked(scheduler)):  # TW-WAKE
         _twin_register(scheduler, _treq, _is_twin)
-    out: List[Any] = []
     # (a) Admits first: an entry created in THIS pass is never admitted in it,
     # so the read-ahead always precedes its Admit by at least one pass.
     for rid in list(pacing):
@@ -977,6 +1441,12 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             if verdict is None:
                 continue
             told_final, reason = verdict
+            if told_final > 0:
+                # TF: the Admit is PP0's own admission -- told=0 for every rank
+                # when PP0's tree cannot resume at it (weg2_told_fidelity).
+                _tf_told, _ = _tf.pp0_verdict(scheduler, p.req, told_final, p.absolute)
+                if _tf_told != told_final:
+                    told_final, reason = _tf_told, "told_fidelity"
             pacing.pop(rid, None)
             _fb.pp0_note_verdict(scheduler, rid, p.told, told_final, reason, now, p.published_at)
             admit = Weg2StoreAdmit(rid=rid, told=told_final)
@@ -989,8 +1459,31 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             out.append(admit)
             continue
         if now - p.published_at < p.window_s:
-            continue
+            if not (_pace_idle_skip_armed() and pipeline_idle(scheduler)):
+                continue
+            n_idle = getattr(scheduler, "_1416f_idle_n", 0) + 1
+            scheduler._1416f_idle_n = n_idle
+            if _log_due(n_idle):
+                logger.info(
+                    "#1416f PACED-IDLE-ADMIT rid=%s told=%d window=%.2fs waited=%.2fs saved=%.2fs "
+                    "passes=%d (n=%d): nothing in pipeline flight, the followers' reads "
+                    "overlap PP0's forward",
+                    _rt(rid), p.told, p.window_s, now - p.published_at,
+                    p.window_s - (now - p.published_at), pass_n - p.published_pass, n_idle,
+                )
         pacing.pop(rid, None)
+        # TF (rc12k27 b1, weg2-10-95): the Admit names what PP0 ITSELF admits
+        # in this pass. Its own tree cannot resume at told -> told=0 for every
+        # rank (PF fallback marker: every read released, every stage prefills
+        # from 0) BEFORE any follower adopts -- never a start split.
+        _tf_told, _tf_own = _tf.pp0_verdict(scheduler, p.req, p.told, p.absolute)
+        if _tf_told != p.told:
+            _fb.release_own_read(scheduler, rid)
+            admit = Weg2StoreAdmit(rid=rid, told=_tf_told)
+            setattr(admit, _fb.WIRE_FALLBACK, 1)
+            told_map[rid] = _tf_told
+            out.append(admit)
+            continue
         told_map[rid] = p.told
         out.append(Weg2StoreAdmit(rid=rid, told=p.told))
         n = getattr(scheduler, "_1416e_admit_n", 0) + 1
@@ -1021,18 +1514,35 @@ def _pp0_publish_paced(scheduler, recv_reqs: List) -> List:
             continue
         twin = _twin.take_pp0_twin(scheduler, rid)
         told, absolute = _pp0_told_any(scheduler, tree, req, rid, twin)
+        _ple_admit_at_told(scheduler, req, told, absolute)
         _cls = Weg2StoreToldTwin if twin else Weg2StoreTold
         _extra = {"absolute": absolute, "keys_digest": _pp0_keys_digest(req)}
+        _fork = _pp0_fork(scheduler, req, rid)
         held.pop(rid, None)
         own_read_s = now - intake_t.pop(rid, now)
         if told <= 0:
             # nothing to read on any rank: single-phase, as before
             told_map[rid] = told
-            out.append(_cls(rid=rid, told=told, **_extra))
+            out.append(_with_fork(_cls(rid=rid, told=told, **_extra), _fork))
             continue
-        window = pace_window_s(own_read_s, told)
-        pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window)
-        ahead = _cls(rid=rid, told=told, paced=True, **_extra)
+        # #57: pace the READ, not the told -- the part below PP0's registered
+        # head is on every rank already (rank-uniform: PP0 decides alone,
+        # the followers follow the wire as before).
+        _read_tokens = pace_read_tokens(told, _twin.registered_head(req), bool(absolute))
+        window = pace_window_s(own_read_s, _read_tokens)
+        if _read_tokens < told:
+            n57 = getattr(scheduler, "_57_head_n", 0) + 1
+            scheduler._57_head_n = n57
+            if _log_due(n57):
+                logger.info(
+                    "#57 PACED-READ rid=%s told=%d head=%d read=%d own_read=%.2fs window=%.2fs "
+                    "(n=%d): the window paces the span beyond the registered head only",
+                    _rt(rid), int(told), _twin.registered_head(req), _read_tokens,
+                    own_read_s, window, n57,
+                )
+        pacing[rid] = _Pace(req=req, told=told, published_at=now, published_pass=pass_n, window_s=window,
+                            absolute=bool(absolute))
+        ahead = _with_fork(_cls(rid=rid, told=told, paced=True, **_extra), _fork)
         if fb_on:
             # PF: ask the followers for their read state (wire marker, set
             # only here) and start the Frist.
@@ -1095,6 +1605,272 @@ def _follower_admit(scheduler, item: Weg2StoreAdmit) -> None:
         )
 
 
+def _pop_credit_keep_pin(tree, rid: str) -> int:
+    """TOLD-PIN (N1 dkr27browauthoritybar1fs10010740, PP1 07:46:10Z, rid
+    weg2-10-16): the told admission consumes this rank's loaded count, but the
+    request is often NOT seated in that visit (``H91 STORE-TOLD KEPT``: the
+    verdict stands, the adder admits it in a later pass). The plain
+    ``pop_prefetch_loaded_tokens`` also released the #1417 span pin -- and
+    with it the recurrent anchor the read brought (ANCHOR-PIN 341d089831) --
+    so between the visits the anchor was evictable: PP1 then found
+    ``#928 REFUSING resume ... match_tokens=17406 best_value_len=0``, local=0
+    against PP0's scheduled 17406, waited 19 s (#1175) and stopped the group
+    (#968 PREFIX MATERIALISATION SHORTFALL). The credit is popped here; the
+    pin stays until the request leaves the queue (``p_intake.settle_told``
+    releases it with the kept verdict) or the read is aborted."""
+    pins = getattr(tree, "_prefetch_span_pins", None)
+    if not pins or str(rid) not in pins:
+        return int(tree.pop_prefetch_loaded_tokens(rid) or 0)
+    (getattr(tree, "_weg2_dormant_done", None) or {}).pop(str(rid), None)
+    return int(tree.prefetch_loaded_tokens_by_reqid.pop(rid, 0) or 0)
+
+
+#: W27-UNIFORM switch (default ON): a follower's admission at an absolute told
+#: checks its LIVE tree, not only its read's completion record; 0 = the record
+#: alone (pre-fix, byte for byte).
+ENV_REACH_TOLD = "SGLANG_WEG2_FOLLOWER_REACH_TOLD"
+
+
+def follower_reach_told_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_REACH_TOLD, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _unreached(scheduler, create: bool = False):
+    m = getattr(scheduler, "_w27u_unreached", None)
+    if m is None and create:
+        m = scheduler._w27u_unreached = {}
+    return m
+
+
+def reach_unresolved(scheduler, rid) -> Optional[tuple]:
+    """(told, live[, route]) when the last :func:`follower_reach_told` of
+    ``rid`` ended with this rank's live tree still short of PP0's told
+    (re-read budget spent or the re-read did not bring it), else None."""
+    m = _unreached(scheduler)
+    return m.get(str(rid)) if m else None
+
+
+def _mark_unreached(scheduler, rid, told, live, prior) -> None:
+    """Record the unresolved shortness; a rid already re-asked keeps its route."""
+    _unreached(scheduler, create=True)[str(rid)] = (int(told), int(live)) + tuple(
+        prior[2:] if prior else ()
+    )
+
+
+def forget_unreached(scheduler, rid) -> None:
+    """The rid left this rank's admission (aborted / admitted / PP0 answered
+    told=0): its unresolved mark and its re-read budget go with it."""
+    for attr in ("_w27u_unreached", "_w27u_wait_spent_s"):
+        m = getattr(scheduler, attr, None)
+        if m:
+            m.pop(str(rid), None)
+    named = getattr(scheduler, "_w27u_spent_named", None)
+    if named:
+        named.discard(str(rid))
+
+
+def follower_hold_unreached(scheduler, req, site: str) -> bool:
+    """W27-UNIFORM (item 180): True = this follower's tree is STILL short of
+    PP0's told after the bounded re-read, and it must not seat the request
+    on its own tree: the caller holds the request this pass (skipped like a
+    told that has not arrived yet) and the rank re-asks PP0 (the PF ack
+    stream, rank-uniform: PP0 alone answers told=0 for every rank). Admitting
+    at told over a shorter tree is the PP0-vs-follower width split W27 exists
+    to prevent; refusing here would be a new rank-local verdict. The hold ends
+    when the live tree reaches told (checked every visit, no further wait), PP0
+    answers told=0 (``follower_release``) or the request leaves the queue.
+    One log line names the outcome (first hold of a rid, then every 256th)."""
+    rid = _rid(req)
+    un = reach_unresolved(scheduler, rid)
+    if un is None:
+        return False
+    t, live = int(un[0]), int(un[1])
+    first = len(un) < 3
+    if first:
+        route = _fb.follower_reask(scheduler, rid, t, live)
+        _unreached(scheduler, create=True)[rid] = (t, live, route)
+    else:
+        route = un[2]
+    n = getattr(scheduler, "_w27u_hold_n", 0) + 1
+    scheduler._w27u_hold_n = n
+    if first or n % 256 == 0:
+        logger.error(
+            "W27-UNIFORM FOLLOWER HELD rank pp=%s rid=%s told=%d live=%d site=%s route=%s "
+            "(n=%d): this rank's tree stays short of PP0's told after the bounded re-read -- "
+            "NOT seated on its own tree (that is the PP0-vs-follower width split); the "
+            "request is held this pass and PP0 is re-asked (%s); the hold ends when the "
+            "tree reaches told, PP0 answers told=0 for every rank, or the request leaves",
+            scheduler.ps.pp_rank, _rt(rid), t, live, site, route, n,
+            "PF ack queued: PP0 answers told=0 for all ranks"
+            if route == _fb.ROUTE_PF
+            else "no PF ack channel on this boot: no uniform answer can arrive, the #1233 W27 guard stays the stop",
+        )
+    return True
+
+
+def hold_revisit(scheduler, req, rid: str, told: int, note_skip):
+    """A held request visits :func:`admission` again: (True, value) = the
+    visit is settled here (``value`` None = still held, else the credit of an
+    admission whose tree now reaches told), (False, None) = not a held rid,
+    continue with the normal path."""
+    un = reach_unresolved(scheduler, rid)
+    if un is None:
+        return False, None
+    if int(told) <= 0:
+        # PP0 answered told=0 (fallback Admit): nothing to reach, normal path
+        forget_unreached(scheduler, rid)
+        return False, None
+    live = _tf.rank_resumable(scheduler, req, int(told))
+    if live is not None and int(live) < int(told):
+        _unreached(scheduler)[rid] = (int(un[0]), int(live)) + tuple(un[2:])
+        follower_hold_unreached(scheduler, req, "revisit")
+        note_skip(SKIP_TOLD_PENDING, rid)
+        return True, None
+    # the live tree reaches told (or cannot be asked): admit at told like PP0
+    forget_unreached(scheduler, rid)
+    scheduler._weg2_store_told.pop(rid, None)
+    (getattr(scheduler, "_weg2_store_told_satisfied", None) or {}).pop(rid, None)
+    _twin.take_follower_twin(scheduler, rid)
+    credit = _pop_credit_keep_pin(scheduler.tree_cache, rid)
+    logger.warning(
+        "W27-UNIFORM FOLLOWER HOLD RELEASED rank pp=%s rid=%s told=%d live=%s: this rank's "
+        "tree reaches PP0's told again -- admitted at told like PP0",
+        scheduler.ps.pp_rank, _rt(rid), int(told), live,
+    )
+    return True, credit
+
+
+def _hold_restore(scheduler, rid: str, told: int, satisfied: bool) -> None:
+    """The visit that ends in a hold consumed the marks the next visit needs."""
+    scheduler._weg2_store_told[rid] = int(told)
+    _twin.note_follower_twin(scheduler, rid)
+    if satisfied:
+        sat = getattr(scheduler, "_weg2_store_told_satisfied", None)
+        if sat is None:
+            sat = scheduler._weg2_store_told_satisfied = {}
+        sat[rid] = int(told)
+
+
+def follower_reach_told(scheduler, req, told: int, own: int, site: str = "admission") -> int:
+    """W27-UNIFORM (NF e124d8f431, P 02.10. 22:37:12Z weg2-58-576 and
+    23:05:11Z weg2-6-77 -- the two deaths of that image): a FOLLOWER admits
+    an absolute told only when its OWN TREE reaches it; when it does not, the
+    follower re-reads the missing span from the store (PP0 read the same keys
+    a pass ago) and waits for it here -- PP0 stays the authority, the
+    follower follows, no rank refuses.
+
+    THE BREAK. The follower's early read (DP-NACHLAUF, default ON since
+    20cd343551) ran at intake, BEFORE PP0 released the twin (``#TW
+    TWIN-DEFER``): it read the whole span into this rank's host tier (576:
+    matched=0 loaded=16640; 77: on top of its sibling 76's host read,
+    matched=13184 loaded=3712). By the time PP0's twin told came (10-17 s
+    later) the sibling had been released (``PF TOLD-FALLBACK ABSORBED`` --
+    the abort path unpins its host span) and prefilled from 0, and the
+    early read's span no longer resumed past the sibling's twin anchor. The
+    settle compared PP0's told with the read's COMPLETION RECORD
+    (``FOLLOWER-EARLY-SETTLE told=16896 own=16896 -> equal``), the admission
+    match then reached only the device head 13184, no ``#988 LOADBACK`` on
+    PP1/PP2 -- PP0 loaded back to 16640 / 16896 and sent 194 / 174 rows for
+    the followers' 3650 / 3886: ``PPWidthDivergenceRefused`` (START-SPLIT),
+    group dead. PP0 asks its own tree before the Admit (TF); the followers
+    never asked theirs.
+
+    Returns the own prefix the caller compares with told: ``told`` when the
+    tree reaches it (now or after the re-read), else ``own`` unchanged (the
+    record; the old behaviour -- the W27 guard names a remaining split, no new
+    refusal here)."""
+    rid = _rid(req)
+    try:
+        if is_pp0(scheduler) or int(told) <= 0 or not follower_reach_told_on():
+            return own
+    except Exception:  # noqa: BLE001 - a stand-in without ps
+        return own
+    live = _tf.rank_resumable(scheduler, req, int(told))
+    if live is None or int(live) >= int(told):
+        forget_unreached(scheduler, rid)
+        return own
+    tree = scheduler.tree_cache
+    prior = reach_unresolved(scheduler, rid)
+    n = getattr(scheduler, "_w27u_short_n", 0) + 1
+    scheduler._w27u_short_n = n
+    # a rid already held (item 180) asks again every pass: name it once
+    (logger.debug if prior is not None else logger.warning)(
+        "W27-UNIFORM FOLLOWER TREE SHORT rank pp=%s rid=%s told=%d own_record=%d live=%d "
+        "site=%s (n=%d): this rank's tree no longer reaches PP0's told (the read's record "
+        "does); re-reading [%d, %d) from the store before admitting -- PP0's prefix stands",
+        scheduler.ps.pp_rank, _rt(rid), int(told), int(own), int(live), site, n,
+        int(live), int(told),
+    )
+    try:
+        _pop_credit_keep_pin(tree, rid)
+    except Exception:  # noqa: BLE001
+        pass
+    satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
+    if satisfied:
+        satisfied.pop(rid, None)
+    # (c) the wait is bounded PER RID across visits: a verdict kept over many
+    # passes (H91) re-asks this gate every pass, and a read that never comes
+    # must not stall the scheduler WAIT_CAP_S per pass -- WAIT_CAP_S is the
+    # whole stall budget this rid may cost, spent across all its re-reads.
+    spent_map = getattr(scheduler, "_w27u_wait_spent_s", None)
+    if spent_map is None:
+        spent_map = scheduler._w27u_wait_spent_s = {}
+    budget = WAIT_CAP_S - float(spent_map.get(rid, 0.0))
+    if budget <= 0:
+        _mark_unreached(scheduler, rid, told, live, prior)
+        # named once per rid (a held rid asks again every pass)
+        named = getattr(scheduler, "_w27u_spent_named", None)
+        if named is None:
+            named = scheduler._w27u_spent_named = set()
+        first_spent = rid not in named
+        named.add(rid)
+        (logger.error if first_spent else logger.debug)(
+            "W27-UNIFORM FOLLOWER RE-READ BUDGET SPENT rank pp=%s rid=%s told=%d live=%d "
+            "site=%s (n=%d): %.0f ms already waited for this rid (cap %.0f ms) -- no further "
+            "wait, the #1233 W27 guard will name the split at the forward",
+            scheduler.ps.pp_rank, _rt(rid), int(told), int(live), site, n,
+            float(spent_map.get(rid, 0.0)) * 1e3, WAIT_CAP_S * 1e3,
+        )
+        return own
+    t0 = time.monotonic()
+    capped = False
+    verdict = _follower_register(scheduler, req, int(told), early=False)
+    if str(verdict).startswith("issued"):
+        deadline = t0 + budget
+        while not tree.check_prefetch_progress(rid):
+            if time.monotonic() > deadline:
+                capped = True
+                break  # named below: the tree is still short
+            time.sleep(0.002)
+    wait_s = time.monotonic() - t0
+    spent_map[rid] = float(spent_map.get(rid, 0.0)) + wait_s
+    if satisfied:
+        satisfied.pop(rid, None)
+    after = _tf.rank_resumable(scheduler, req, int(told))
+    if after is not None and int(after) < int(told):
+        _mark_unreached(scheduler, rid, told, after, prior)
+        logger.error(
+            "W27-UNIFORM FOLLOWER STILL SHORT rank pp=%s rid=%s told=%d live=%d verdict=%s "
+            "wait=%.0f ms%s (n=%d): the re-read did not bring this rank's tree to PP0's told "
+            "-- the #1233 W27 guard will name the split at the forward",
+            scheduler.ps.pp_rank, _rt(rid), int(told), int(after), verdict, wait_s * 1e3,
+            " CAPPED(%.0f ms)" % (WAIT_CAP_S * 1e3) if capped else "", n,
+        )
+        return own
+    spent_map.pop(rid, None)
+    forget_unreached(scheduler, rid)
+    n2 = getattr(scheduler, "_w27u_reread_n", 0) + 1
+    scheduler._w27u_reread_n = n2
+    logger.warning(
+        "W27-UNIFORM FOLLOWER RE-READ rank pp=%s rid=%s told=%d live=%s verdict=%s "
+        "wait=%.0f ms site=%s (n=%d): this rank's tree reaches PP0's told again -- admitted "
+        "at told like PP0",
+        scheduler.ps.pp_rank, _rt(rid), int(told), after, verdict, wait_s * 1e3, site, n2,
+    )
+    return int(told)
+
+
 def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional[int]:
     """The admission gate on every rank. ``None`` = skip this pass (verdict
     outstanding). Otherwise this rank's loaded credit, after its completed
@@ -1105,6 +1881,14 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     if told is None:
         note_skip(SKIP_TOLD_PENDING, rid)
         return None
+    # item 180: a request held for a tree short of told is re-checked, not re-run
+    _settled, _value = hold_revisit(scheduler, req, rid, told, note_skip)
+    if _settled:
+        return _value
+    # P-FORK-CUT: the told's fork rides onto the request on every rank alike
+    # (PP0 published it, the followers absorbed it); the adder cuts only there.
+    forks = getattr(scheduler, "_weg2_store_fork", None) or {}
+    req._weg2_fork_told = int(forks.pop(rid, 0) or 0)
     tree = scheduler.tree_cache
     # #1419: told bounds this rank's radix match (schedule_batch
     # _weg2_cap_key_limit) so no rank -- PP0 included -- admits more than told.
@@ -1113,13 +1897,39 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         req._weg2_prefix_cap = prefix_cap_tokens(tree, told)
     except Exception:  # noqa: BLE001
         pass
+    if getattr(req, "_weg2_early_told", None) is not None:
+        # DP-NACHLAUF: settle the follower's early read against the told
+        req._weg2_early_told = None
+        _dl = time.monotonic() + WAIT_CAP_S
+        while not tree.check_prefetch_progress(rid):
+            if time.monotonic() > _dl:
+                break   # the wait below names the stuck read
+            time.sleep(0.002)
+        _own = _completed_prefix(tree, rid)
+        _tst = getattr(scheduler, getattr(_twin, "_ATTR", "_weg2_twin_state"), None)
+        _abs = bool(_tst) and str(rid) in (getattr(_tst, "twin_follower", None) or {})
+        if _abs:
+            _own = _twin.registered_head(req) + int(_own)
+        _how = follower_early_settle(scheduler, req, told, _own, absolute=_abs)
+        n = getattr(scheduler, "_weg2_follower_early_settled", 0) + 1
+        scheduler._weg2_follower_early_settled = n
+        if _log_due(n) or _how != "equal":
+            logger.info("#1400 FOLLOWER-EARLY-SETTLE rid=%s pp=%s told=%d own=%d -> %s (n=%d)",
+                        _rt(rid), scheduler.ps.pp_rank, int(told), int(_own), _how, n)
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None) or {}
     if rid in satisfied:
         # registered nothing because it already held the span (see
         # _follower_register): admit at told, no read to wait for.
         satisfied.pop(rid, None)
         told_map.pop(rid, None)
-        _twin.take_follower_twin(scheduler, rid)
+        if _twin.take_follower_twin(scheduler, rid):
+            # W27-UNIFORM: "holds the span" was the read's record -- the
+            # tree must still reach told when this rank admits.
+            follower_reach_told(scheduler, req, told, int(told), site="satisfied")
+            if follower_hold_unreached(scheduler, req, "satisfied"):
+                _hold_restore(scheduler, rid, told, satisfied=True)
+                note_skip(SKIP_TOLD_PENDING, rid)
+                return None
         return 0
     # The single-phase form waits here for a read registered THIS pass (the
     # stage stops for it); the paced form (#1416e) registered it a window
@@ -1141,7 +1951,14 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         # TW: an absolute twin told -- this rank's own prefix is the head its
         # registration matched plus the span its read completed.
         own = _twin.registered_head(req) + int(own)
-    credit = int(tree.pop_prefetch_loaded_tokens(rid) or 0)
+        if int(own) == int(told):
+            # W27-UNIFORM: the record says told; the tree must say it too.
+            own = follower_reach_told(scheduler, req, told, int(own), site="admission")
+            if follower_hold_unreached(scheduler, req, "admission"):
+                _hold_restore(scheduler, rid, told, satisfied=False)
+                note_skip(SKIP_TOLD_PENDING, rid)
+                return None
+    credit = _pop_credit_keep_pin(tree, rid)
     told_map.pop(rid, None)
     if own != told:
         raise Weg2StoreToldMismatch(

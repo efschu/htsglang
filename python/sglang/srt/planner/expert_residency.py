@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import msgspec
 
@@ -343,6 +343,8 @@ _RX_REFUSED = re.compile(
     r"\+ runtime state ([0-9.]+) GiB; prefill activation reserve ([0-9.]+) GiB"
 )
 _RX_CELL = re.compile(_TP + r" KV pool sizing: available_bytes=\d+ .*?cell_size=(\d+),")
+#: #239 (Karten-Gutschrift): die KV-Token, fuer die der Pool gebaut wurde.
+_RX_KV_TOKENS = re.compile(_TP + r" KV Cache is allocated\. .*?#tokens: (\d+)")
 _RX_DRAFT = re.compile(
     _TP + r" \[vram-census\] pp0tp\d+-draft after load: model tensors on device "
     r"[0-9.]+ GiB = \{([^}]*)\}"
@@ -361,6 +363,7 @@ def _observe_boot(text: str, *, n_layers: int) -> Dict[str, Dict[int, float]]:
             "cell",
             "draft_experts",
             "draft_vocab",
+            "kv_tokens",
         )
     }
     layer_of: Dict[int, int] = {}
@@ -389,6 +392,10 @@ def _observe_boot(text: str, *, n_layers: int) -> Dict[str, Dict[int, float]]:
         m = _RX_CELL.search(line)
         if m:
             obs["cell"][int(m.group(1))] = float(m.group(2))
+            continue
+        m = _RX_KV_TOKENS.search(line)
+        if m:
+            obs["kv_tokens"][int(m.group(1))] = float(m.group(2))
             continue
         m = _RX_DRAFT.search(line)
         if m:
@@ -560,6 +567,14 @@ class DRankResidency(msgspec.Struct, frozen=True, kw_only=True):
     kv_mib: float
     ceiling_fraction: Optional[float]
     ceiling_max_rows: int
+    #: #239: this rank's share of the token-cut full-attention KV; -1 = the
+    #: cut is not modelled (every rank priced with its reference cell).
+    kv_token_share: float = -1.0
+    #: #239 S3g floor (rc12z30b 28.09. 20:09:07): bytes per GLOBAL token of
+    #: this rank's full-attention KV share under the cut (share x FA cell) --
+    #: the only KV a Form A worker holds and trims; 0 = none (no cut, or a
+    #: worker the cut gives no share).
+    kv_stage_cell_bytes: int = 0
 
     @property
     def pre_kv_rest_mib(self) -> float:
@@ -598,6 +613,1367 @@ class DRankResidency(msgspec.Struct, frozen=True, kw_only=True):
         return self.verdict != "PASST"
 
 
+def reference_kv_cells_s0(reference: DRankReference) -> Tuple[int, ...]:
+    """#239 S0 (e56d78a4ab): the per-token KV cell a D rank of this boot
+    builds, from a Form A reference measured BEFORE S0.
+
+    The shipped references (fnFL2x98-100, x151/x158) price a Form A worker at
+    768 B/token -- 12 layers x 64 B compressed QSA index keys. Since S0 a Form
+    A worker builds no QSA index (``qsa_index_on_rank = not
+    this_rank_is_form_a_worker()``, :func:`kv_stage_trim_cell` names the same
+    768 B as "no tensor on the card"): rc12z30w (0929_082743, TP1/TP2 'KV
+    pool sizing: cell_size=12288', ONE pool of share x 262144 tokens) holds
+    no key bytes on a worker. Booking them charged 262144 x 768 B = 192 MiB
+    per 3080 that no allocation ever takes -- VRAM the expert rows were owed
+    (freier-kv-platz-gehoert-experten). A worker's cell here is 0; the host
+    cell stays the measurement. A reference that is not Form A with ONE
+    attention host is returned unchanged."""
+    cells = tuple(int(c) for c in reference.kv_cell_bytes)
+    try:
+        tp = [int(x) for x in str(reference.rank_tp_ratio).split(",") if x.strip()]
+    except ValueError:
+        return cells
+    hosts = [r for r, v in enumerate(tp) if v > 0]
+    if len(tp) != len(cells) or len(hosts) != 1:
+        return cells
+    return tuple(c if r == hosts[0] else 0 for r, c in enumerate(cells))
+
+
+def kv_token_cut_cells(
+    reference: DRankReference,
+    shares: Sequence[float],
+    dcp_cell_bytes: int,
+) -> Tuple[float, ...]:
+    """#239: the per-token KV cell of every D rank once the full-attention KV
+    is cut by TOKENS over the ranks (uneven DCP under Form A).
+
+    The reference is a Form A measurement: its attention host held the whole
+    full-attention KV (``dcp_cell_bytes`` of its cell) plus the parts that stay
+    on the host whatever the cut is (indexer, draft KV); a worker's cell is
+    what it builds without attention. Cut by ``shares`` (a VECTOR OF RATIOS,
+    normalised here -- rank-ratios-sind-verhaeltnis), rank r costs::
+
+        (reference cell_r - dcp_cell if r held the full KV else cell_r)
+            + share_r x dcp_cell
+
+    with ``cell_r`` from :func:`reference_kv_cells_s0` (a worker's is 0 since S0).
+
+    Refused, not guessed: a reference with more than one attention host (its
+    cell already is a DCP slice), a share vector of the wrong length, a
+    negative share or an all-zero one, and a cut larger than the host cell.
+    """
+    n = len(reference.kv_cell_bytes)
+    if len(shares) != n:
+        raise ValueError(
+            "kv_token_cut_cells: %d D ranks, but %d KV token shares" % (n, len(shares))
+        )
+    if any(float(s) < 0.0 for s in shares) or sum(float(s) for s in shares) <= 0.0:
+        raise ValueError("kv_token_cut_cells: shares %s are not a ratio vector" % (list(shares),))
+    tp = [int(x) for x in str(reference.rank_tp_ratio).split(",") if x.strip()]
+    hosts = [r for r, v in enumerate(tp) if v > 0]
+    if len(tp) != n or len(hosts) != 1:
+        raise ValueError(
+            "kv_token_cut_cells: the reference %s (rank-tp-ratio %s) is not a Form A "
+            "measurement with ONE attention host -- its cells cannot be re-cut"
+            % (reference.source, reference.rank_tp_ratio)
+        )
+    host = hosts[0]
+    if int(dcp_cell_bytes) <= 0 or int(dcp_cell_bytes) > int(reference.kv_cell_bytes[host]):
+        raise ValueError(
+            "kv_token_cut_cells: the token-cut cell %d B is not part of the host cell %d B"
+            % (int(dcp_cell_bytes), int(reference.kv_cell_bytes[host]))
+        )
+    total = sum(float(s) for s in shares)
+    s0 = reference_kv_cells_s0(reference)
+    cells = []
+    for r in range(n):
+        fixed = float(s0[r]) - (float(dcp_cell_bytes) if r == host else 0.0)
+        cells.append(fixed + float(shares[r]) / total * float(dcp_cell_bytes))
+    return tuple(cells)
+
+
+#: #239: the resolution of the planner's token cut -- shares are whole
+#: sixty-fourths (the page grid of the NF D group is 64 tokens, and a finer
+#: vector would promise a split the owner stripes cannot realise).
+KV_TOKEN_SHARE_GRID = 64
+#: #239: ``--d-kv-token-cut maxmin`` -- the planner solves the shares itself.
+KV_TOKEN_CUT_MAXMIN = "maxmin"
+#: #239 S2b: ``--d-kv-token-cut joint`` -- the planner solves the shares AND
+#: sets FR_D at every rank's edge (FR setzt der Planer, Nutzer 27.09.).
+KV_TOKEN_CUT_JOINT = "joint"
+
+
+def fa_kv_token_cell_bytes(text_cfg: Mapping[str, object], kv_dtype_bytes: int) -> int:
+    """#239: bytes per token of the FULL-ATTENTION KV -- the part of a Form A
+    host cell the token cut moves (K+V of every full-attention layer).
+
+    From the checkpoint, not a hand value: the full-attention layers of
+    ``layer_types`` (else every ``full_attention_interval``-th layer), times
+    K+V, times ``num_key_value_heads x head_dim``, times the KV dtype. NF:
+    12 x 2 x 2 x 256 x 1 (fp8) = 12288, the 1.50 + 1.50 GB the rc12r TP0 log
+    names for 262144 tokens. Refused when the geometry is not there.
+    """
+    kinds = list(text_cfg.get("layer_types") or ())
+    if kinds:
+        n_fa = sum(1 for k in kinds if k == "full_attention")
+    else:
+        interval = int(text_cfg.get("full_attention_interval") or 0)
+        layers = int(text_cfg.get("num_hidden_layers") or 0)
+        n_fa = layers // interval if interval > 0 else 0
+    kv_heads = int(text_cfg.get("num_key_value_heads") or 0)
+    head_dim = int(text_cfg.get("head_dim") or 0)
+    if n_fa <= 0 or kv_heads <= 0 or head_dim <= 0 or int(kv_dtype_bytes) <= 0:
+        raise ValueError(
+            "fa_kv_token_cell_bytes: no full-attention KV geometry in the config "
+            "(full-attention layers %d, kv heads %d, head_dim %d, dtype %d B)"
+            % (n_fa, kv_heads, head_dim, int(kv_dtype_bytes))
+        )
+    return n_fa * 2 * kv_heads * head_dim * int(kv_dtype_bytes)
+
+
+def _relative_ceiling(fit: "DRankResidency") -> float:
+    return float(fit.ceiling_max_rows) / float(max(1, fit.buffer_rows))
+
+
+def resident_edge_share(fit: "DRankResidency") -> float:
+    """#239 S2b: the share of this rank's local experts that stay RESIDENT at
+    its edge -- ``min(ceiling rows - scratch, E - 2) / E`` (the same bound as
+    :func:`largest_fraction_for_rows`; negative = not even the scratch fits).
+    Independent of the driven fraction, non-increasing in the rank's KV share,
+    and comparable between a 5090 and a 3080 (a card is judged by the part of
+    ITS experts it holds, not by raw rows)."""
+    E = int(fit.local_experts)
+    rows = min(int(fit.ceiling_max_rows) - int(fit.scratch_rows), E - 2)
+    return float(rows) / float(max(1, E))
+
+
+def solve_kv_token_shares(
+    solve: Callable[[Sequence[int]], Sequence["DRankResidency"]],
+    n_ranks: int,
+    grid: int = KV_TOKEN_SHARE_GRID,
+    score: Optional[Callable[["DRankResidency"], float]] = None,
+) -> Tuple[Tuple[int, ...], float]:
+    """#239: the token cut the planner chooses -- MAX-MIN of the relative row
+    ceiling (ceiling / the buffer rows the rank's fraction asks for), in whole
+    ``1/grid`` shares; the regeln kein-bindender-rang (no rank is the fixed
+    one) and d-kv-gesamtpool (the shares cover the whole context once).
+
+    ``solve(shares)`` is the D solve for one share vector. A rank's ceiling
+    depends on its OWN share only (its KV is ``tokens x cell(share)``), so each
+    rank is priced once per grid step (``k`` for the rank, ``grid - k`` parked
+    on a neighbour, read back only for the rank itself). The shares are then
+    handed out one sixty-fourth at a time to the rank that stays highest after
+    taking it (ties: the lower rank). With every score non-increasing in its
+    own share this reaches the max-min optimum -- a unit that would drop a rank
+    below the optimum is only handed out when every rank already holds all it
+    can at the optimum, and those hold at least ``grid`` -- and it spreads the
+    slack instead of parking it on one card. Returns ``(shares, min score)``.
+
+    ``score`` (S2b) replaces the relative ceiling, e.g. with
+    :func:`resident_edge_share` when FR_D follows the cut.
+    """
+    value = score or _relative_ceiling
+    n, g = int(n_ranks), int(grid)
+    if n < 1 or g < 1:
+        raise ValueError("solve_kv_token_shares: %d ranks, grid %d" % (n, g))
+    score: List[List[float]] = []
+    for r in range(n):
+        row = []
+        for k in range(g + 1):
+            vec = [0] * n
+            vec[r] = k
+            if k < g:
+                vec[(r + 1) % n] += g - k
+            if n == 1:
+                vec = [g]
+            row.append(value(solve(vec)[r]))
+        for k in range(g):
+            if row[k + 1] > row[k] + 1e-9:
+                raise ValueError(
+                    "solve_kv_token_shares: rank %d ceiling rises with its KV share "
+                    "(%d/%d -> %.3f, %d/%d -> %.3f) -- the solve is not monotone"
+                    % (r, k, g, row[k], k + 1, g, row[k + 1])
+                )
+        score.append(row)
+
+    take = [0] * n
+    for _ in range(g):
+        nxt = max(range(n), key=lambda r: (score[r][take[r] + 1], -r) if take[r] < g else (-1.0, -r))
+        take[nxt] += 1
+    return tuple(take), min(score[r][take[r]] for r in range(n))
+
+
+def solve_joint_cut(
+    solve: Callable[[Sequence[int]], Sequence["DRankResidency"]],
+    fractions: Sequence[float],
+    n_ranks: int,
+    grid: int = KV_TOKEN_SHARE_GRID,
+) -> Tuple[Tuple[int, ...], float, Tuple[float, ...], Tuple["DRankResidency", ...]]:
+    """#239 S2b: token cut AND FR_D in one solve.
+
+    The ceiling of a rank does not depend on its fraction, so the cut is the
+    max-min of :func:`resident_edge_share` over the shares, and FR_D is then
+    every rank's edge (``ceiling_fraction``) at that cut -- FR follows the
+    budget instead of being a stated start value (FR setzt der Planer). A rank
+    with no edge keeps its driven fraction; the W122 line then names it.
+    Returns ``(cut, min resident share, FR_D, fits at the cut)``.
+    """
+    cut, low = solve_kv_token_shares(solve, n_ranks, grid, score=resident_edge_share)
+    edge = tuple(solve(cut))
+    fr = tuple(
+        float(f.ceiling_fraction) if f.ceiling_fraction is not None
+        else float(fractions[f.rank])
+        for f in edge
+    )
+    return tuple(cut), low, fr, edge
+
+
+#: #239 S3f: ``--d-kv-token-cut owned`` -- the target form of the uneven-DCP
+#: KV (Nutzer 28.09.): the attention host holds NO full-attention KV (share 0;
+#: QSA index, Mamba and draft stay on it), the workers carry it, and the MoE
+#: OWNERSHIP vector (``--rank-moe-ratio``) is a free variable of the solve
+#: next to the workers' shares and FR_D -- expert ownership moves to the host
+#: card the KV frees. The ownership is the planner's, never a hand value.
+KV_TOKEN_CUT_OWNED = "owned"
+#: #239 M1b (main 28.09.): ``owned:<vector>`` -- the planner solves ownership
+#: and FR_D as for ``owned``, the workers' shares are FORCED to the vector
+#: (a measurement arm: the attention/LSE posts per share are what M1 records).
+#: The x1 rule is then reported, not enforced -- the arm measures a form the
+#: solve might not pick.
+KV_TOKEN_CUT_OWNED_FORCED_PREFIX = "owned:"
+
+
+def owned_cut_request(kv_token_shares) -> Tuple[bool, Optional[Tuple[float, ...]]]:
+    """#239: (is this an owned solve, the forced worker shares or None)."""
+    if kv_token_shares == KV_TOKEN_CUT_OWNED:
+        return True, None
+    if isinstance(kv_token_shares, str) and kv_token_shares.startswith(
+            KV_TOKEN_CUT_OWNED_FORCED_PREFIX):
+        raw = kv_token_shares[len(KV_TOKEN_CUT_OWNED_FORCED_PREFIX):]
+        try:
+            vec = tuple(float(x) for x in raw.split(",") if x.strip())
+        except ValueError:
+            vec = ()
+        if not vec or any(x < 0 for x in vec) or sum(vec) <= 0:
+            raise ValueError("plan_d_residency: KV token cut %r: 'owned:' needs a share "
+                             "vector of the D ranks" % kv_token_shares)
+        return True, vec
+    return False, None
+
+#: #239 S3f: cost of ONE expert row a decode round misses, per MoE layer, ms,
+#: (attention host, worker). SEED, UNMEASURED: plan_s3_251 §1 from H29/x138
+#: (5090 x16 ~0.1, 3080 x8 ~0.2). The M1 boot (S4a) writes the record that
+#: replaces it (RECORD > BUILTIN > UNMEASURED, H94).
+OWNED_MISS_MS_PER_ROW_SEED: Tuple[float, float] = (0.1, 0.2)
+OWNED_MISS_MS_SOURCE_SEED = "Saat UNMEASURED (plan_s3_251 §1, H29/x138)"
+#: #239 S3f miss record (29.09., z30w: the round rule moved misses from the
+#: 5090 to TP1 and the round got slower at bs1/bs2 -- the solve steered on
+#: the seed). The measured cost of one missed row per MoE layer and card:
+#:
+#: * RECORD -- written by the D RANKS themselves at their sleep
+#:   (``layers.moe.pool_miss_cost``, ``SGLANG_WEG2_OWNED_MISS_RECORD=<dir>``):
+#:   PR2 (30.09.): per timed prefill forward, its host-plan fetch device ms /
+#:   the rows the SAME fetches loaded (``pairing`` = OWNED_MISS_PAIRING), counted
+#:   only from OWNED_MISS_MIN_PAIRED_FORWARDS paired forwards per rank;
+#: * LOG-BOOTSTRAP -- ``weg2.tools.owned_miss_record`` from one D log, the
+#:   TRANSITION ("aus Log (Uebergang)") until the first rank record exists;
+#:   it ranks under every rank record and is dropped once one is there;
+#: * BUILTIN -- the profile constant ``OWNED_MISS_MS``;
+#: * UNMEASURED -- the seed above (H94 rule, one tier more).
+OWNED_MISS_KIND = "owned_miss_ms"
+OWNED_MISS_RANK_KIND = "owned_miss_rank"
+OWNED_MISS_RECORD = "RECORD"
+OWNED_MISS_LOG_BOOTSTRAP = "LOG-BOOTSTRAP"
+OWNED_MISS_BUILTIN = "BUILTIN"
+OWNED_MISS_UNMEASURED = "UNMEASURED"
+OWNED_MISS_LOG_PROVENANCE = "aus Log (Uebergang)"
+#: rank records within this span before the youngest one form one measurement
+#: (a boot's phases); older ones belong to another form and are not mixed in
+OWNED_MISS_RANK_WINDOW_S = 6 * 3600.0
+
+
+def read_owned_miss_records(path: Optional[str]) -> List[Dict[str, object]]:
+    """The log-bootstrap entries (``owned_miss_ms``) of the sidecar; a missing
+    or broken sidecar is an ABSENCE (``[]``), never a zero."""
+    if not path:
+        return []
+    import json
+
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    entries = data.get("samples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict) and e.get("kind") == OWNED_MISS_KIND]
+
+
+def read_owned_miss_rank_records(directory: Optional[str]) -> List[Dict[str, object]]:
+    """The rank records the D ranks wrote (``pool_miss_cost.flush``); a missing
+    directory or an unreadable file is skipped, never read as a zero."""
+    if not directory:
+        return []
+    import json
+    import os
+
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if not (name.startswith("owned_miss_") and name.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(directory, name)) as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("kind") == OWNED_MISS_RANK_KIND:
+            out.append(rec)
+    return out
+
+
+def _owned_miss_pair(value: object) -> Optional[Tuple[float, float]]:
+    try:
+        pair = tuple(float(x) for x in value)  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return None
+    if len(pair) != 2 or not all(x > 0 for x in pair):
+        return None
+    return pair  # type: ignore[return-value]
+
+
+def _owned_miss_model_ok(model: Optional[str], entry_model: object) -> bool:
+    """H87: a record speaks for the checkpoint it was measured on, or for one
+    with the same memory footprint (``weg2.form.footprint_key``)."""
+    if entry_model is None or model is None:
+        return entry_model is None
+    if str(entry_model).rstrip("/") == str(model).rstrip("/"):
+        return True
+    import os
+
+    if os.path.basename(str(entry_model).rstrip("/")) == os.path.basename(str(model).rstrip("/")):
+        return True
+    try:
+        from sglang.srt.weg2 import form as _form
+
+        mine, _ = _form.footprint_key(str(model))
+        theirs, _ = _form.footprint_key(str(entry_model))
+    except Exception:  # noqa: BLE001 -- an unreadable checkpoint is no match
+        return False
+    return mine is not None and mine == theirs
+
+
+#: PR (30.09.): a rank record counts only in the PAIRED form of
+#: ``layers.moe.pool_miss_cost`` (PR2: one timed prefill forward's host-plan
+#: fetch ms against the rows THE SAME fetches loaded) -- the older scopes mixed
+#: graphed decode rows into the denominator (v1) or paired foreign halves (v2).
+OWNED_MISS_PAIRING = "prefill_hostfetch_v3"
+#: PR: RECORD beats the seed only from this many paired forwards on EVERY rank
+#: of the youngest window; fewer stay the seed, and the line names the count.
+OWNED_MISS_MIN_PAIRED_FORWARDS = 16
+
+
+def _owned_miss_paired_window(records: Sequence[Mapping[str, object]], model: Optional[str]):
+    mine = []
+    for r in records:
+        if r.get("kind") != OWNED_MISS_RANK_KIND or not _owned_miss_model_ok(model, r.get("model")):
+            continue
+        if r.get("pairing") != OWNED_MISS_PAIRING:
+            continue
+        try:
+            t, rank = float(r["time_unix"]), int(r["rank"])
+            fetch, rows, n = float(r["fetch_ms"]), int(r["miss_rows"]), int(r["rounds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if fetch > 0 and rows > 0 and n > 0:
+            mine.append((t, rank, fetch, rows, n))
+    if not mine:
+        return []
+    newest = max(t for t, *_ in mine)
+    return [m for m in mine if m[0] >= newest - OWNED_MISS_RANK_WINDOW_S]
+
+
+def owned_miss_paired_counts(records: Sequence[Mapping[str, object]], *,
+                             model: Optional[str] = None) -> Dict[int, int]:
+    """PR: paired forwards per rank in the youngest window (empty = none)."""
+    out: Dict[int, int] = {}
+    for _t, rank, _f, _r, n in _owned_miss_paired_window(records, model):
+        out[rank] = out.get(rank, 0) + int(n)
+    return out
+
+
+def owned_miss_from_rank_records(
+    records: Sequence[Mapping[str, object]], *, host: int, model: Optional[str] = None,
+    min_forwards: int = OWNED_MISS_MIN_PAIRED_FORWARDS,
+) -> Optional[Tuple[Tuple[float, float], str]]:
+    """``((host ms, worker ms), source)`` from the ranks' own PAIRED records of
+    this model -- the youngest window (``OWNED_MISS_RANK_WINDOW_S``), host =
+    the attention host's rank, worker = the miss-weighted cost of the others
+    -- or ``None`` when the window lacks the host or every worker, or when a
+    rank of it has fewer than ``min_forwards`` paired forwards."""
+    window = [m[:4] for m in _owned_miss_paired_window(records, model)]
+    if not window:
+        return None
+    counts = owned_miss_paired_counts(records, model=model)
+    if any(n < int(min_forwards) for n in counts.values()):
+        return None
+    hf = sum(f for _, r, f, _ in window if r == int(host))
+    hr = sum(n for _, r, _, n in window if r == int(host))
+    wf = sum(f for _, r, f, _ in window if r != int(host))
+    wr = sum(n for _, r, _, n in window if r != int(host))
+    if hr <= 0 or wr <= 0:
+        return None
+    return (hf / hr, wf / wr), "RECORD Rang-Records (%d Phasen-Records, %d+%d Zeilen)" % (
+        len(window), hr, wr)
+
+
+def resolve_owned_miss_ms(
+    records: Sequence[Mapping[str, object]] = (),
+    *,
+    rank_records: Sequence[Mapping[str, object]] = (),
+    host: int = 0,
+    model: Optional[str] = None,
+    builtin: Optional[Sequence[float]] = None,
+    builtin_source: str = "",
+) -> Tuple[Tuple[float, float], str, str]:
+    """``(ms per missed row (host, worker), tier, source)`` for the owned
+    solve: the ranks' own RECORD, else the LOG-BOOTSTRAP (youngest log entry
+    of this model, named "aus Log (Uebergang)" -- ignored as soon as any rank
+    record exists), else the BUILTIN profile constant, else the seed, named
+    UNMEASURED. An entry without two positive costs is skipped, never read as
+    a zero."""
+    from_ranks = owned_miss_from_rank_records(rank_records, host=host, model=model)
+    if from_ranks is not None:
+        return from_ranks[0], OWNED_MISS_RECORD, from_ranks[1]
+    counts = owned_miss_paired_counts(rank_records, model=model)
+    young = ("; RECORD zu jung: gepaarte Forwards je Rang %s < K=%d"
+             % (dict(sorted(counts.items())), OWNED_MISS_MIN_PAIRED_FORWARDS)) if counts else ""
+    best: Optional[Tuple[str, Tuple[float, float], Mapping[str, object]]] = None
+    for e in records:
+        if e.get("kind", OWNED_MISS_KIND) != OWNED_MISS_KIND:
+            continue
+        pair = _owned_miss_pair(e.get("miss_ms_per_row"))
+        if pair is None or not _owned_miss_model_ok(model, e.get("model")):
+            continue
+        at = str(e.get("at") or "")
+        if best is None or at >= best[0]:
+            best = (at, pair, e)
+    if best is not None:
+        e = best[2]
+        return best[1], OWNED_MISS_LOG_BOOTSTRAP, "%s %s (%s, %s Runden)%s" % (
+            OWNED_MISS_LOG_PROVENANCE, e.get("source") or e.get("boot_tag") or "?",
+            best[0] or "?", e.get("rounds", "?"), young)
+    pair = _owned_miss_pair(builtin) if builtin is not None else None
+    if pair is not None:
+        return pair, OWNED_MISS_BUILTIN, "BUILTIN %s%s" % (builtin_source or "OWNED_MISS_MS", young)
+    return OWNED_MISS_MS_PER_ROW_SEED, OWNED_MISS_UNMEASURED, OWNED_MISS_MS_SOURCE_SEED + young
+def owned_miss_per_rank_from_records(
+    records: Sequence[Mapping[str, object]], *, n: int, model: Optional[str] = None,
+    min_forwards: int = OWNED_MISS_MIN_PAIRED_FORWARDS,
+) -> Optional[Tuple[Tuple[float, ...], str]]:
+    """01.10. (owned cut from the profiles): ms per missed row for EVERY rank
+    ``0..n-1`` from the ranks' own PAIRED records of the youngest window --
+    each card at its own link (NF D: TP1 = NVML0 3080 x4 0.473, TP2 = NVML2
+    3080 x8 0.217 ms/row, y6k records 01.10.; the (host, worker) pair pooled
+    both 3080s into 0.314). ``None`` when a rank is missing or has fewer than
+    ``min_forwards`` paired forwards -- then the pair stands."""
+    window = [m[:4] for m in _owned_miss_paired_window(records, model)]
+    if not window:
+        return None
+    counts = owned_miss_paired_counts(records, model=model)
+    if any(int(counts.get(r, 0)) < int(min_forwards) for r in range(int(n))):
+        return None
+    out = []
+    for r in range(int(n)):
+        f = sum(x for _, rk, x, _ in window if rk == r)
+        rows = sum(x for _, rk, _, x in window if rk == r)
+        if rows <= 0 or f <= 0:
+            return None
+        out.append(f / rows)
+    return tuple(out), "RECORD je Rang (%d Phasen-Records, Zeilen %s)" % (
+        len(window), [sum(x for _, rk, _, x in window if rk == r) for r in range(int(n))])
+
+
+#: 01.10. (owned cut from the profiles): the decode batch-size mix the owned
+#: solve weights its round by -- the steady rounds of D-TP0 on y6k -dres
+#: (01.10. 18:22-19:00Z, agent load, dround.py): bs1 513, bs2 2143, bs3 2160
+#: (bs4-6 = 638 rounds folded out: the seat count the gate holds is 1..3 most
+#: of the hour). ``SGLANG_WEG2_OWNED_BS_WEIGHTS`` = "1:w,2:w,..." replaces it,
+#: "bs1" = the old bs1-only objective.
+OWNED_BS_WEIGHTS_DEFAULT: Tuple[Tuple[int, float], ...] = ((1, 0.107), (2, 0.446), (3, 0.447))
+OWNED_BS_WEIGHTS_SOURCE = "y6k -dres 01.10. 18:22-19:00Z, D-TP0 Runden bs1 513 / bs2 2143 / bs3 2160"
+#: the batch sizes the x1 guard holds ("nothing slows bs1/bs2")
+OWNED_X1_BS: Tuple[int, ...] = (1, 2)
+OWNED_BASE_MODES = ("derive", "stated")
+
+
+def owned_bs_weights() -> Tuple[Optional[Tuple[Tuple[int, float], ...]], str]:
+    """``(weights, source)`` of the owned solve's batch-size mix; ``(None,
+    ...)`` = the bs1-only objective. A malformed value is refused."""
+    from sglang.srt.environ import envs
+
+    raw = (envs.SGLANG_WEG2_OWNED_BS_WEIGHTS.get() or "").strip()
+    if not raw:
+        return OWNED_BS_WEIGHTS_DEFAULT, OWNED_BS_WEIGHTS_SOURCE
+    if raw.lower() == "bs1":
+        return None, "SGLANG_WEG2_OWNED_BS_WEIGHTS=bs1 (nur bs1, alter Solve)"
+    out = []
+    for part in raw.split(","):
+        b, _, w = part.partition(":")
+        try:
+            bs, wt = int(b), float(w)
+        except ValueError:
+            raise ValueError("SGLANG_WEG2_OWNED_BS_WEIGHTS=%r: '<bs>:<weight>,...'" % raw)
+        if bs < 1 or wt < 0:
+            raise ValueError("SGLANG_WEG2_OWNED_BS_WEIGHTS=%r: bs >= 1, weight >= 0" % raw)
+        out.append((bs, wt))
+    tot = sum(w for _, w in out)
+    if tot <= 0:
+        raise ValueError("SGLANG_WEG2_OWNED_BS_WEIGHTS=%r: weights sum to 0" % raw)
+    return tuple((b, w / tot) for b, w in out), "SGLANG_WEG2_OWNED_BS_WEIGHTS=%s" % raw
+
+
+def owned_base_mode() -> str:
+    """``derive`` (default): the planner derives the Form-A ownership itself;
+    ``stated``: the --rank-moe-ratio given to the launcher is the Form-A base
+    (the old hand base, an explicit override)."""
+    from sglang.srt.environ import envs
+
+    v = (envs.SGLANG_WEG2_OWNED_BASE.get() or "derive").strip().lower()
+    if v not in OWNED_BASE_MODES:
+        raise ValueError("SGLANG_WEG2_OWNED_BASE=%r: one of %s" % (v, "/".join(OWNED_BASE_MODES)))
+    return v
+
+
+#: #239 S3f (main 28.09.): the ATTENTION and LSE posts of T_r, named, SEED,
+#: UNMEASURED -- without them the solve saw only expert misses and put the
+#: whole FA-KV on one worker (desk probe 524k: cut 0/64/0). Per full-attention
+#: layer and decode round, a rank that holds KV rows pays
+#:   floor (kernel launch + latency, independent of its share)
+#:   + query rows x share x cost of attending the whole sparse top-k,
+#: and with a cut every rank pays the LSE merge collectives (A, T, Q, M of
+#: F5, issued on all ranks). Seeds: per query row and FA layer over the full
+#: top-k (indexer_budget 2048), 3080 ~0.0026 ms from H65 (QSA prefill 42 ms
+#: per 16k chunk and layer), 5090 half; floor 0.02 ms; LSE 0.045 ms per FA
+#: layer (plan_s3_251 §1: 30-60 us, H28 floor 12 us). M1 (DECODE-ROUND-COST
+#: with the workers' attention share) writes the record that replaces them.
+OWNED_ATTN_MS_PER_ROW_SEED: Tuple[float, float] = (0.0013, 0.0026)
+OWNED_ATTN_FLOOR_MS_SEED = 0.02
+OWNED_LSE_MS_PER_LAYER_SEED = 0.045
+OWNED_ATTN_SOURCE_SEED = "Saat UNMEASURED (H65 QSA 3080, 5090 halb; Boden 0,02; LSE 0,045 ms/FA-Layer)"
+
+#: #239 S3f: the search grid -- ownership moves in steps of 8 ratio units
+#: (a quarter of the smallest NF band), the workers' KV shares in 64ths
+#: stepped by 4 (the page grid stays the runtime's).
+OWNED_RATIO_STEP = 8
+OWNED_SHARE_STEP = 4
+#: #239 S3f: the ranked estimates re-solved exactly (the memo's span may
+#: round one expert differently than the full vector's)
+OWNED_EXACT_CHECKS = 64
+#: #239 S3f round guard (29.09., Befund z30n/z30r3 gegen z30k): the x1 rule
+#: keeps every WORKER at or below its Form-A miss time and lets the HOST take
+#: the rest -- on metal the host then became the rank the synchronized round
+#: waits for (TP0 misses per seat +18..23 %, round bs1 +2.8..5.6 ms against
+#: Form A). ``workers`` (default) is the x1 rule as before; ``round`` reports
+#: x1 but does not enforce it: feasible is every form with an edge on every
+#: rank, ranked by the synchronized round (max T_r over ALL ranks, then the
+#: next-worst rank -- :func:`owned_rank_key`, #287 -- then the sum, then the
+#: ownership move).
+OWNED_X1_ENV = "SGLANG_WEG2_OWNED_CUT_X1"
+OWNED_X1_SCOPES = ("workers", "round")
+
+
+def owned_x1_scope() -> str:
+    """#239 S3f: the x1 scope of the owned solve (``SGLANG_WEG2_OWNED_CUT_X1``,
+    default ``workers``); an unknown value is refused, never guessed."""
+    import os
+
+    v = (os.environ.get(OWNED_X1_ENV) or "workers").strip().lower()
+    if v not in OWNED_X1_SCOPES:
+        raise ValueError("%s=%r: one of %s" % (OWNED_X1_ENV, v, "/".join(OWNED_X1_SCOPES)))
+    return v
+
+
+class OwnedCut(msgspec.Struct, frozen=True, kw_only=True):
+    """#239 S3f: the planner's owned form, or why there is none."""
+
+    ratios: Tuple[int, ...]
+    cut: Tuple[int, ...]
+    fractions: Tuple[float, ...]
+    fits: Tuple["DRankResidency", ...]
+    #: the bs1 miss time per rank of the chosen form and of Form A (no cut,
+    #: stated ownership), ms per round.
+    round_ms: Tuple[float, ...]
+    base_ratios: Tuple[int, ...]
+    base_round_ms: Tuple[float, ...]
+    candidates: int
+    feasible: int
+    #: M1b: the shares were forced (``owned:<vector>``); ``x1_ok`` says
+    #: whether the forced form keeps the x1 rule (reported, not enforced).
+    forced: bool = False
+    x1_ok: bool = True
+    #: budget solves the search ran (the per-rank memo) and its wall time, s
+    solves: int = 0
+    elapsed_s: float = 0.0
+    #: 01.10.: T_r per decode batch size of the chosen form and of Form A
+    #: (``((bs, (T_0, T_1, ...)), ...)``), the bs mix it was weighted by and
+    #: the weighted round (sum over bs of weight x max_r T_r), ms
+    round_ms_by_bs: Tuple[Tuple[int, Tuple[float, ...]], ...] = ()
+    base_round_ms_by_bs: Tuple[Tuple[int, Tuple[float, ...]], ...] = ()
+    bs_weights: Tuple[Tuple[int, float], ...] = ()
+    objective_ms: float = 0.0
+    base_objective_ms: float = 0.0
+    #: 01.10. (y6n, Koordinator): candidates the hard limits refused (pool
+    #: step, wave floor at the wave cap, top KV stage -- :func:`owned_wave_floor`),
+    #: the limits they were held to, and whether the solve kept the base
+    #: ownership because the best other one gained less than ``switch_gain``
+    guard_refused: int = 0
+    guard: Tuple[Tuple[str, object], ...] = ()
+    stayed: bool = False
+    best_other_objective_ms: float = 0.0
+    #: scratch rows per rank the chosen form needs on top of the given ones
+    #: for the wave floor (:func:`owned_scratch_raise`); empty = none
+    scratch_raise: Tuple[int, ...] = ()
+
+
+def owned_miss_rows(fit: "DRankResidency", *, num_experts: int, ids_per_step: int) -> float:
+    """#239 S3f: expected expert rows a round misses on this rank, per MoE
+    layer -- the rows it cannot hold at its edge (``E - min(ceiling, E)``)
+    times the chance that a uniformly routed step touches a given expert,
+    ``1 - (1 - 1/N)^ids``. Uniform routing is named, not measured (the #45
+    oracle dump would sharpen it)."""
+    E = int(fit.local_experts)
+    held = min(int(fit.ceiling_max_rows), E)
+    p = 1.0 - (1.0 - 1.0 / float(max(1, num_experts))) ** int(max(1, ids_per_step))
+    return float(max(0, E - held)) * p
+
+
+#: #276 heat record kind (``layers.moe.pool_heat.RECORD_KIND``), read here
+#: without importing the layer module
+OWNED_HEAT_KIND = "moe_heat"
+
+
+def owned_heat_from_records(
+    records: Sequence[Mapping[str, object]], *, num_experts: int,
+) -> Optional[Tuple[Tuple[float, ...], str]]:
+    """01.10. (owned cut from the profiles): the routed-lane share of every
+    GLOBAL expert from the #276 heat records of this checkpoint (one record
+    per D rank and phase, local ids mapped by the layer's ``global_lo``; the
+    pad row is not an expert). Shares sum to 1 over the experts; ``None``
+    without a record that counted a lane -- then the solve stays uniform
+    (named in its line)."""
+    lanes = [0] * int(num_experts)
+    recs = 0
+    for r in records:
+        if r.get("kind") != OWNED_HEAT_KIND:
+            continue
+        used = False
+        for layer in r.get("layers") or ():
+            lo = layer.get("global_lo")
+            counts = layer.get("counts") or ()
+            if lo is None:
+                continue
+            n = len(counts) - (1 if layer.get("pad") else 0)
+            for i in range(max(0, n)):
+                g = int(lo) + i
+                if 0 <= g < len(lanes) and int(counts[i]) > 0:
+                    lanes[g] += int(counts[i])
+                    used = True
+        recs += int(used)
+    tot = float(sum(lanes))
+    if tot <= 0:
+        return None
+    return (tuple(x / tot for x in lanes),
+            "HITZE-RECORD (%d Records, %d Lanes)" % (recs, int(tot)))
+
+
+def owned_miss_rows_heat(fit: "DRankResidency", *, span: Tuple[int, int],
+                         heat: Sequence[float], ids_per_step: int) -> float:
+    """01.10.: :func:`owned_miss_rows` with the measured heat instead of
+    uniform routing -- the rank holds its ``min(ceiling, E)`` hottest experts
+    of its global span ``[lo, hi)``, every colder one is missed with
+    ``1 - (1 - s_e)^ids`` (``s_e`` = its share of the routed lanes)."""
+    lo, hi = int(span[0]), int(span[1])
+    held = min(int(fit.ceiling_max_rows), int(fit.local_experts))
+    cold = sorted((float(heat[g]) for g in range(lo, min(hi, len(heat)))), reverse=True)[held:]
+    ids = int(max(1, ids_per_step))
+    return float(sum(1.0 - (1.0 - min(1.0, s_e)) ** ids for s_e in cold))
+
+
+def owned_spans(ratios: Sequence[int], num_experts: int) -> Tuple[Tuple[int, int], ...]:
+    """The contiguous global span of every rank for an ownership vector (the
+    largest-remainder split the runtime uses, rank order)."""
+    sizes = expert_span_by_rank(num_experts=int(num_experts), ratios=list(ratios))
+    out, lo = [], 0
+    for sz in sizes:
+        out.append((lo, lo + int(sz)))
+        lo += int(sz)
+    return tuple(out)
+
+
+def owned_round_ms(fits: Sequence["DRankResidency"], *, host: int, num_experts: int,
+                   ids_per_step: int, n_layers: int,
+                   miss_ms: Tuple[float, float] = OWNED_MISS_MS_PER_ROW_SEED,
+                   shares: Optional[Sequence[int]] = None, fa_layers: int = 0,
+                   rows_per_round: int = 1, merged: bool = False,
+                   attn_ms: Tuple[float, float] = OWNED_ATTN_MS_PER_ROW_SEED,
+                   attn_floor_ms: float = OWNED_ATTN_FLOOR_MS_SEED,
+                   lse_ms: float = OWNED_LSE_MS_PER_LAYER_SEED,
+                   miss_ms_rank: Optional[Sequence[float]] = None,
+                   heat: Optional[Sequence[float]] = None,
+                   spans: Optional[Sequence[Tuple[int, int]]] = None) -> Tuple[float, ...]:
+    """#239 S3f: T_r = missed rows x MoE layers x cost per row of the card,
+    plus (``fa_layers`` > 0) the attention post of the rank's KV share
+    ``shares`` (floor + rows x share x cost per row, only where the share is
+    > 0) and, when ``merged`` (a token cut), the LSE merge on every rank.
+    ``miss_ms_rank`` (01.10.) prices each rank at its own card's cost per
+    missed row instead of the (host, worker) pair; ``heat`` + ``spans``
+    price the missed rows from the measured heat (:func:`owned_miss_rows_heat`)."""
+    total = float(sum(shares)) if shares else 0.0
+    out = []
+    for f in fits:
+        own = f.rank == host
+        cost = (float(miss_ms_rank[f.rank]) if miss_ms_rank is not None
+                else float(miss_ms[0] if own else miss_ms[1]))
+        rows = (owned_miss_rows_heat(f, span=spans[f.rank], heat=heat, ids_per_step=ids_per_step)
+                if heat is not None and spans is not None
+                else owned_miss_rows(f, num_experts=num_experts, ids_per_step=ids_per_step))
+        t = rows * int(n_layers) * cost
+        if int(fa_layers) > 0 and total > 0:
+            share = float(shares[f.rank]) / total
+            if share > 0:
+                t += int(fa_layers) * (float(attn_floor_ms) + int(rows_per_round) * share
+                                       * float(attn_ms[0] if own else attn_ms[1]))
+            if merged:
+                t += int(fa_layers) * float(lse_ms)
+        out.append(t)
+    return tuple(out)
+
+
+def owned_rank_key(ms: Sequence[float]) -> Tuple[Tuple[float, ...], float]:
+    """#287: how the owned solve ranks two forms by their T_r -- the T_r sorted
+    descending and compared lexicographically (leximax: the max first, then
+    the next-worst rank, ...), then the sum.
+
+    The old key was (max, sum). Whenever the host binds the max (every NF
+    boot of 29./30.09.: TP0 35.92 ms at bs1), every worker split ties on it,
+    and the sum cannot break the tie: the KV rows one 3080 gives up are the
+    rows the other takes, at the same cost per row (y3j 09291933 [7.35, 26.11]
+    and korr 09292034 [5.17, 28.29] both 33.46; 09300002 [5.17, 30.46] vs
+    [7.35, 28.28], both 35.63). The pick fell to rounding and to the lexical
+    order of the share vector -- the KV onto TP2 up to its x1 edge, TP2's
+    FR_D 0.393 -> 0.256 (62 -> 40 D-resident experts). bs1 did not move; from
+    bs2 on TP2 missed 2.5x (1.1 -> 2.2-3.8 per layer and forward at bs3, same
+    replayed load) and bound the synchronized round: bs3 42 -> 55-61 ms. The
+    next-worst rank is the one that binds as the seats fill, so it breaks the
+    tie; the bs1 objective (the max) is untouched."""
+    v = tuple(sorted((round(float(x), 9) for x in ms), reverse=True))
+    return v, round(float(sum(ms)), 9)
+
+
+def _compositions(total: int, parts: int, step: int):
+    if parts == 1:
+        yield (int(total),)
+        return
+    for t in range(0, int(total) + 1, int(step)):
+        for rest in _compositions(int(total) - t, parts - 1, step):
+            yield (t,) + rest
+
+
+def owned_ratio_vectors(base: Sequence[int], host: int, *, step: int = OWNED_RATIO_STEP,
+                        max_shift: Optional[int] = None) -> Tuple[Tuple[int, ...], ...]:
+    """#239 S3f: every ownership vector with the host's entry raised by a
+    multiple of ``step`` taken from the workers in steps of ``step`` (the sum
+    stays; no worker below 1). ``max_shift`` defaults to half the workers'
+    ownership."""
+    base = [int(x) for x in base]
+    workers = [r for r in range(len(base)) if r != host]
+    cap = sum(base[w] for w in workers) // 2 if max_shift is None else int(max_shift)
+    out = []
+    for shift in range(0, cap + 1, int(step)):
+        for take in _compositions(shift, len(workers), step):
+            vec = list(base)
+            vec[host] += shift
+            for w, t in zip(workers, take):
+                vec[w] -= t
+            if all(vec[w] >= 1 for w in workers):
+                out.append(tuple(vec))
+    return tuple(out)
+
+
+def owned_ratio_vectors_free(base: Sequence[int], *, step: int = OWNED_RATIO_STEP,
+                             max_shift: Optional[int] = None) -> Tuple[Tuple[int, ...], ...]:
+    """#239 S3f (main 28.09. 19:0xZ): EVERY ownership vector around ``base``
+    -- each entry moved by a multiple of ``step`` in either direction, at
+    most ``max_shift`` per rank (default: half the workers' ownership, the
+    old host-only bound), the sum kept, no rank below 1. The host may GIVE
+    ownership and the workers may trade among themselves; the host-only
+    space (:func:`owned_ratio_vectors`) was a search bound, not physics.
+    Ordered by the ownership moved (sum |delta| / 2), then lexically."""
+    base = [int(x) for x in base]
+    n = len(base)
+    total = sum(base)
+    cap = (sum(base) - max(base)) // 2 if max_shift is None else int(max_shift)
+    st = int(step)
+    ranges = [[base[r] + d for d in range(-(cap // st) * st, cap + 1, st) if base[r] + d >= 1]
+              for r in range(n)]
+    out = []
+
+    def _rec(r, acc, used):
+        if r == n - 1:
+            last = total - used
+            if last in set(ranges[r]):
+                out.append(tuple(acc + [last]))
+            return
+        for v in ranges[r]:
+            _rec(r + 1, acc + [v], used + v)
+
+    _rec(0, [], 0)
+    out.sort(key=lambda v: (sum(abs(a - b) for a, b in zip(v, base)), v))
+    return tuple(out)
+
+
+def solve_owned_cut(
+    solve_at: Callable[[Sequence[int], Optional[Sequence[int]]], Sequence["DRankResidency"]],
+    base_ratios: Sequence[int],
+    host: int,
+    *,
+    num_experts: int,
+    n_layers: int,
+    ids_per_step: int,
+    miss_ms: Tuple[float, float] = OWNED_MISS_MS_PER_ROW_SEED,
+    grid: int = KV_TOKEN_SHARE_GRID,
+    ratio_step: int = OWNED_RATIO_STEP,
+    share_step: int = OWNED_SHARE_STEP,
+    max_shift: Optional[int] = None,
+    card_rows: Optional[Callable[[Sequence["DRankResidency"]], Optional[Sequence[int]]]] = None,
+    fa_layers: int = 0,
+    rows_per_round: int = 1,
+    forced_shares: Optional[Sequence[float]] = None,
+    x1_scope: str = "workers",
+    bs_weights: Optional[Sequence[Tuple[int, float]]] = None,
+    miss_ms_rank: Optional[Sequence[float]] = None,
+    x1_bs: Sequence[int] = OWNED_X1_BS,
+    heat: Optional[Sequence[float]] = None,
+    seats_cap: int = 0,
+    waves_cap: int = 0,
+    stage_tokens: int = 0,
+    stage_row_bytes: int = 0,
+    stage_floor_tokens: int = 0,
+    switch_gain: float = 0.0,
+) -> OwnedCut:
+    """#239 S3f: ownership, token cut and FR_D in one solve.
+
+    ``solve_at(ratios, shares)`` is the D budget solve for one ownership
+    vector and one share vector (``None`` = no cut, Form A). The host's
+    share is 0 (the target form); the workers' shares run over the grid in
+    ``share_step``s, the ownership over :func:`owned_ratio_vectors`.
+
+    Objective (plan_s3_251 §1, not S2b's max-min): the smallest max_r T_r
+    of :func:`owned_round_ms` at bs1, ties by the next-worst rank
+    (:func:`owned_rank_key`, #287), then by the sum, then by the smaller
+    ownership move. Feasible: every rank has an edge with room for its
+    scratch plus two rows, and the x1 rule -- no worker carries more miss
+    time than it does in Form A with the stated ownership (the workers are
+    the critical path, H28/H29; the cut must not buy host rows with worker
+    residency). FR_D is every rank's edge at the chosen form.
+
+    ``card_rows(fits)`` (optional) is the CARD's edge per rank (H33 / the
+    rc12c ledger, W130): the rank's edge is the smaller of budget and card,
+    so the solve never picks a form the card check then refuses.
+
+    01.10. (owned cut from the profiles): ``bs_weights`` ((bs, weight), ...)
+    makes the objective the decode mix the line runs -- sum over bs of
+    weight x max_r T_r(bs), T_r(bs) with bs x the ids and verify rows of one
+    seat -- instead of bs1 alone (agent load holds D at bs2-3; bs1 was 11 %
+    of the steady rounds on y6k). The x1 guard then holds at every bs of
+    ``x1_bs`` ("nothing slows bs1/bs2"). ``miss_ms_rank`` prices each rank at
+    its own card's measured cost per missed row. Without both the solve is
+    the bs1 solve as before.
+
+    01.10. (y6n, Koordinator): with ``seats_cap`` and ``waves_cap`` every
+    candidate must hold :func:`owned_wave_floor` -- the pool step and the
+    wave floor at the line's wave cap with the top KV stage
+    (``stage_tokens`` above S0 at ``stage_row_bytes`` per stage row) mapped;
+    a form that needs more waves or a lower top stage is not tragbar. With
+    ``switch_gain`` > 0 the solve keeps the base ownership unless the best
+    other one is more than that fraction faster (weighted round).
+    """
+    base = tuple(int(x) for x in base_ratios)
+    if bs_weights:
+        _bsw = tuple((int(b), float(w)) for b, w in bs_weights if float(w) > 0)
+    else:
+        _bsw = ((1, 1.0),)
+    _bss = tuple(sorted({b for b, _ in _bsw} | {1}))
+    _x1_set = {int(x) for x in x1_bs}
+    _x1_bss = tuple(b for b in _bss if b in _x1_set) if bs_weights else (1,)
+
+    def _edge(fits):
+        cap = card_rows(fits) if card_rows is not None else None
+        out = []
+        for i, f in enumerate(fits):
+            rows = int(f.ceiling_max_rows)
+            if cap is not None and i < len(cap):
+                rows = min(rows, int(cap[i]))
+            E, S = int(f.local_experts), int(f.scratch_rows)
+            frac = largest_fraction_for_rows(local_experts=E, scratch_rows=S, max_rows=rows)
+            out.append(_EdgeFit(rank=f.rank, local_experts=E, scratch_rows=S,
+                                ceiling_max_rows=rows, ceiling_fraction=frac,
+                                trim_cell=_edge_trim_cell(f, host)))
+        return tuple(out)
+
+    n = len(base)
+    workers = [r for r in range(n) if r != host]
+    kw = dict(host=host, num_experts=num_experts, n_layers=n_layers, miss_ms=miss_ms,
+              fa_layers=fa_layers, miss_ms_rank=miss_ms_rank, heat=heat)
+
+    def _by_bs(fits, shares, merged, rat):
+        # T_r per batch size: bs seats route bs x ids and verify bs x rows
+        spans = owned_spans(rat, num_experts) if heat is not None else None
+        return {b: owned_round_ms(fits, shares=shares, merged=merged,
+                                  ids_per_step=int(ids_per_step) * b,
+                                  rows_per_round=int(rows_per_round) * b, spans=spans, **kw)
+                for b in _bss}
+
+    def _objective(by):
+        return sum(w * max(by[b]) for b, w in _bsw)
+
+    base_fits = _edge(tuple(solve_at(base, None)))
+    # Form A: the host attends over the whole KV, no merge
+    base_by = _by_bs(base_fits, tuple(1 if r == host else 0 for r in range(len(base))), False,
+                     base)
+    base_ms = base_by[1]
+    shares_list = []
+    forced = forced_shares is not None
+    if forced:
+        vec = [float(x) for x in forced_shares]
+        if len(vec) != n or vec[host] != 0 or sum(vec) <= 0:
+            raise ValueError("solve_owned_cut: forced shares %r need %d ranks and host "
+                             "share 0" % (forced_shares, n))
+        tot = sum(vec)
+        shares_list.append(tuple(int(round(x * int(grid) / tot)) for x in vec))
+    else:
+        for take in _compositions(int(grid), len(workers), int(share_step)):
+            vec = [0] * n
+            for w, t in zip(workers, take):
+                vec[w] = t
+            shares_list.append(tuple(vec))
+    import time as _time
+
+    t0 = _time.monotonic()
+    solves = 0
+    # a rank's edge and T_r depend on its own (ownership, share) only -- the
+    # budget and the card are per rank; the expert span is the ratio's share
+    # of the (fixed) sum, up to rounding. The memo keeps one budget solve per
+    # (rank, ownership, share); the chosen form is re-solved exactly below.
+    memo: Dict[Tuple[int, int, int], Tuple["_EdgeFit", Dict[int, float]]] = {}
+
+    def _exact(rat, sh):
+        nonlocal solves
+        solves += 1
+        fits = _edge(tuple(solve_at(rat, sh)))
+        return fits, _by_bs(fits, sh, True, rat)
+
+    def _terms(rat, sh):
+        keys = [(r, int(rat[r]), int(sh[r])) for r in range(n)]
+        if any(k not in memo for k in keys):
+            fits, by = _exact(rat, sh)
+            for i, (k, f) in enumerate(zip(keys, fits)):
+                memo[k] = (f, {b: by[b][i] for b in _bss})
+        return [memo[k] for k in keys]
+
+    guard_on = int(seats_cap) > 0 and int(waves_cap) > 0
+    guard_refused = 0
+
+    def _raise_of(fits):
+        return owned_scratch_raise(
+            fits, ids_cap=int(ids_per_step) * int(seats_cap), waves=int(waves_cap),
+            stage_tokens=int(stage_tokens), stage_row_bytes=int(stage_row_bytes),
+            stage_floor_tokens=int(stage_floor_tokens))
+
+    def _verdict(fits, by):
+        nonlocal guard_refused
+        if any(f.ceiling_fraction is None or f.ceiling_max_rows < f.scratch_rows + 2
+               for f in fits):
+            return None
+        if guard_on and _raise_of(fits) is None:
+            guard_refused += 1
+            return None
+        x1 = not any(by[b][w] > base_by[b][w] + 1e-9 for b in _x1_bss for w in workers)
+        if not x1 and not forced and x1_scope != "round":
+            return None
+        return x1
+
+    def _key(x1, by, move, rat, sh):
+        # bs1 alone: the weighted term is constant, the order is the old
+        # (x1, leximax, sum, move) one
+        obj = round(_objective(by), 9) if bs_weights else 0.0
+        return (0 if (x1 or not ranks_x1) else 1, obj, owned_rank_key(by[1]), move,
+                tuple(rat), tuple(sh))
+
+    # round guard: x1 is reported, the synchronized round alone ranks
+    ranks_x1 = x1_scope != "round"
+
+    ranked = []
+    cand = feas = 0
+    for rat in owned_ratio_vectors_free(base, step=ratio_step, max_shift=max_shift):
+        move = sum(abs(a - b) for a, b in zip(rat, base)) // 2
+        for sh in shares_list:
+            cand += 1
+            terms = _terms(rat, sh)
+            fits = tuple(f for f, _ in terms)
+            by = {b: tuple(t[b] for _, t in terms) for b in _bss}
+            x1 = _verdict(fits, by)
+            if x1 is None:
+                continue
+            feas += 1
+            # forced: a form keeping x1 wins over one that breaks it
+            ranked.append(_key(x1, by, move, rat, sh))
+    ranked.sort()
+    best = None
+    for key in ranked[:OWNED_EXACT_CHECKS]:
+        rat, sh = key[4], key[5]
+        fits, by = _exact(rat, sh)
+        x1 = _verdict(fits, by)
+        if x1 is None:
+            continue
+        exact_key = _key(x1, by, key[3], rat, sh)
+        if best is None or exact_key < best[0]:
+            best = (exact_key, rat, sh, fits, by)
+        if best is not None and best[0][:3] <= key[:3]:
+            break  # no later estimate can beat the exact best
+    stayed = False
+    other_obj = 0.0
+    if best is not None and float(switch_gain) > 0 and tuple(best[1]) != base:
+        # the best form that keeps the base ownership (any cut): the vector
+        # moves only for more than switch_gain of the weighted round
+        stay = None
+        for key in ranked:
+            if tuple(key[4]) != base:
+                continue
+            fits_s, by_s = _exact(key[4], key[5])
+            x1_s = _verdict(fits_s, by_s)
+            if x1_s is None:
+                continue
+            k_s = _key(x1_s, by_s, key[3], key[4], key[5])
+            if k_s[0] > best[0][0]:
+                continue  # x1 lost: never trade x1 for staying
+            stay = (k_s, key[4], key[5], fits_s, by_s)
+            break
+        if stay is not None:
+            other_obj = _objective(best[4])
+            if other_obj > _objective(stay[4]) * (1.0 - float(switch_gain)):
+                best, stayed = stay, True
+    elapsed = _time.monotonic() - t0
+    _bs_rec = tuple(_bsw) if bs_weights else ()
+    _base_by_t = tuple((b, tuple(base_by[b])) for b in _bss)
+    _guard = ((("seats", int(seats_cap)), ("waves", int(waves_cap)),
+               ("stage_tokens", int(stage_tokens)), ("stage_row_bytes", int(stage_row_bytes)))
+              + ((("stage_floor_tokens", int(stage_floor_tokens)),)
+                 if int(stage_floor_tokens) > 0 else ())
+              if guard_on else ())
+    if best is None:
+        return OwnedCut(ratios=(), cut=(), fractions=(), fits=(), round_ms=(),
+                        base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=0,
+                        solves=solves, elapsed_s=round(elapsed, 2),
+                        base_round_ms_by_bs=_base_by_t, bs_weights=_bs_rec,
+                        base_objective_ms=_objective(base_by), guard_refused=guard_refused,
+                        guard=_guard)
+    key, rat, sh, fits, by = best
+    fr = tuple(float(f.ceiling_fraction) for f in fits)
+    raise_ = _raise_of(fits) if guard_on else None
+    if raise_ is not None and any(raise_):
+        # the rows stay, the split moves: FR_D at the edge with the raised
+        # scratch (the miss model prices rows, not the split -- T_r unchanged)
+        fr = tuple(float(largest_fraction_for_rows(
+            local_experts=int(f.local_experts), scratch_rows=int(f.scratch_rows) + int(a),
+            max_rows=int(f.ceiling_max_rows)) or 0.0) for f, a in zip(fits, raise_))
+    return OwnedCut(ratios=tuple(rat), cut=tuple(sh), fractions=fr, fits=(), round_ms=by[1],
+                    base_ratios=base, base_round_ms=base_ms, candidates=cand, feasible=feas,
+                    forced=forced, x1_ok=key[0] == 0, solves=solves,
+                    elapsed_s=round(elapsed, 2),
+                    round_ms_by_bs=tuple((b, tuple(by[b])) for b in _bss),
+                    base_round_ms_by_bs=_base_by_t, bs_weights=_bs_rec,
+                    objective_ms=_objective(by), base_objective_ms=_objective(base_by),
+                    guard_refused=guard_refused, guard=_guard, stayed=stayed,
+                    best_other_objective_ms=other_obj,
+                    scratch_raise=tuple(raise_) if raise_ is not None and any(raise_) else ())
+
+
+class OwnedBase(msgspec.Struct, frozen=True, kw_only=True):
+    """01.10.: the Form-A ownership the planner derived (no hand base)."""
+
+    ratios: Tuple[int, ...]
+    seed: Tuple[int, ...]
+    round_ms_by_bs: Tuple[Tuple[int, Tuple[float, ...]], ...]
+    objective_ms: float
+    seed_objective_ms: float
+    iterations: int
+    candidates: int
+    solves: int
+
+
+def derive_owned_base(
+    solve_at: Callable[[Sequence[int], Optional[Sequence[int]]], Sequence["DRankResidency"]],
+    seed_ratios: Sequence[int],
+    host: int,
+    *,
+    num_experts: int,
+    n_layers: int,
+    ids_per_step: int,
+    miss_ms: Tuple[float, float] = OWNED_MISS_MS_PER_ROW_SEED,
+    miss_ms_rank: Optional[Sequence[float]] = None,
+    card_rows: Optional[Callable[[Sequence["DRankResidency"]], Optional[Sequence[int]]]] = None,
+    fa_layers: int = 0,
+    rows_per_round: int = 1,
+    bs_weights: Optional[Sequence[Tuple[int, float]]] = None,
+    ratio_step: int = OWNED_RATIO_STEP,
+    max_iter: int = 8,
+    heat: Optional[Sequence[float]] = None,
+) -> OwnedBase:
+    """01.10. (user: the planner proposes the expert split from the hardware
+    and model profile, not a hand value): the Form-A ownership -- no KV cut,
+    the host attends over the whole KV -- that minimises the decode-mix
+    round (sum over bs of weight x max_r T_r(bs)), every rank at its edge.
+    The search walks the WHOLE ownership grid (:func:`owned_ratio_vectors_free`
+    with no shift bound: every vector of the seed's sum on its ``ratio_step``
+    lattice, no rank below 1) -- a bounded neighbourhood stopped in local
+    optima that depended on the seed (01.10. rechnung: seeds 183,137,168 /
+    240,100,148 ended 5 ms apart). The seed fixes only the sum and the
+    lattice phase; single-expert steps around the lattice optimum then refine
+    it (``max_iter`` rounds). The owned solve holds its x1 guard against
+    THIS form, not against a stated vector."""
+    bsw = (tuple((int(b), float(w)) for b, w in bs_weights if float(w) > 0)
+           if bs_weights else ((1, 1.0),))
+    bss = tuple(sorted({b for b, _ in bsw} | {1}))
+    n = len(seed_ratios)
+    shares = tuple(1 if r == host else 0 for r in range(n))
+    solves = 0
+    cand = 0
+    memo: Dict[Tuple[int, ...], Optional[Tuple[Dict[int, Tuple[float, ...]], float]]] = {}
+
+    def _eval(rat):
+        nonlocal solves
+        rat = tuple(int(x) for x in rat)
+        if rat in memo:
+            return memo[rat]
+        solves += 1
+        fits = tuple(solve_at(rat, None))
+        cap = card_rows(fits) if card_rows is not None else None
+        edged = []
+        for i, f in enumerate(fits):
+            rows = int(f.ceiling_max_rows)
+            if cap is not None and i < len(cap):
+                rows = min(rows, int(cap[i]))
+            E, S = int(f.local_experts), int(f.scratch_rows)
+            frac = largest_fraction_for_rows(local_experts=E, scratch_rows=S, max_rows=rows)
+            if frac is None or rows < S + 2:
+                memo[rat] = None
+                return None
+            edged.append(_EdgeFit(rank=f.rank, local_experts=E, scratch_rows=S,
+                                  ceiling_max_rows=rows, ceiling_fraction=frac))
+        by = {b: owned_round_ms(edged, host=host, num_experts=num_experts,
+                                ids_per_step=int(ids_per_step) * b, n_layers=n_layers,
+                                miss_ms=miss_ms, miss_ms_rank=miss_ms_rank, heat=heat,
+                                spans=owned_spans(rat, num_experts) if heat is not None else None,
+                                shares=shares, fa_layers=fa_layers,
+                                rows_per_round=int(rows_per_round) * b, merged=False)
+              for b in bss}
+        obj = sum(w * max(by[b]) for b, w in bsw)
+        memo[rat] = (by, obj)
+        return memo[rat]
+
+    def _rank(rat):
+        got = _eval(rat)
+        if got is None:
+            return None
+        by, obj = got
+        return (round(obj, 9), owned_rank_key(by[1]),
+                sum(abs(a - b) for a, b in zip(rat, seed_ratios)), tuple(rat))
+
+    seed = tuple(int(x) for x in seed_ratios)
+    center = seed
+    best = _rank(center)
+    # the whole lattice once, then single-expert steps around the best until
+    # nothing moves (the lattice phase must not pick the optimum)
+    it = 0
+    for rat in owned_ratio_vectors_free(center, step=ratio_step, max_shift=sum(seed)):
+        cand += 1
+        k = _rank(rat)
+        if k is not None and (best is None or k < best):
+            best = k
+    while best is not None and it < int(max_iter):
+        it += 1
+        moved = False
+        for rat in owned_ratio_vectors_free(best[3], step=1, max_shift=int(ratio_step)):
+            cand += 1
+            k = _rank(rat)
+            if k is not None and k < best:
+                best, moved = k, True
+        if not moved:
+            break
+    if best is None:
+        raise ValueError("derive_owned_base: no Form-A ownership around %s has an edge on "
+                         "every rank" % (list(seed),))
+    by, obj = memo[best[3]]
+    seed_got = _eval(seed)
+    return OwnedBase(ratios=best[3], seed=seed,
+                     round_ms_by_bs=tuple((b, tuple(by[b])) for b in bss),
+                     objective_ms=obj,
+                     seed_objective_ms=seed_got[1] if seed_got is not None else float("inf"),
+                     iterations=it, candidates=cand, solves=solves)
+
+
+class _EdgeFit(NamedTuple):
+    """#239 S3f: a rank's edge as the owned solve sees it (min of budget and
+    card rows)."""
+
+    rank: int
+    local_experts: int
+    scratch_rows: int
+    ceiling_max_rows: int
+    ceiling_fraction: Optional[float]
+    #: bytes per global token a KV stage above S0 maps on this rank
+    #: (:func:`kv_stage_trim_cell`; 0 = no KV here)
+    trim_cell: int = 0
+
+
+def _edge_trim_cell(fit, host: int) -> int:
+    """:func:`kv_stage_trim_cell` for a budget fit that may not carry the KV
+    fields (the owned solve's test edges): 0 then."""
+    if int(fit.rank) == int(host):
+        return int(getattr(fit, "kv_cell_bytes", 0) or 0)
+    return int(getattr(fit, "kv_stage_cell_bytes", 0) or 0)
+
+
+#: 01.10. (y6n): the gain the owned solve needs over the base ownership
+#: before it moves the vector -- 3 % of the binding (weighted) miss time; a
+#: smaller gain is inside the boot-to-boot spread and keeps the base
+OWNED_SWITCH_GAIN = 0.03
+
+
+def owned_wave_floor(
+    fits: Sequence["_EdgeFit"], *, ids_cap: int, waves: int, stage_tokens: int = 0,
+    stage_row_bytes: int = 0, stage_floor_tokens: int = 0,
+) -> Tuple[str, ...]:
+    """01.10. (y6n, Koordinator): the hard limits of a D form the owned solve
+    may pick, ONE formula with the launcher's #239 S3g floor
+    (``launcher.rank_wave_floor`` over ``kv_stage_table``): at the seat cap a
+    captured step routes D_r = min(ids_cap, E - R) ids over the rank's rows at
+    the TOP KV stage, C_r - ceil(stage_tokens x trim_cell / stage_row), in at
+    most ``waves`` waves (the H95 cap the line runs, not a raised one). A rank
+    without KV keeps its whole scratch (the H95 pool step, D <= W x C). The
+    top stage alone decides whether every seat count reaches it; with a floor
+    ladder (``stage_floor_tokens`` = the KV span between the floor and S0, born
+    unmapped) its rows count from the floor minus the rows that span funds
+    (:func:`kv_stage_net_rows`) -- the floor rows do NOT fully fund themselves
+    when the span is not whole rows (y6n 01.10. 21:07:02, TP2: 12 rows, not 11).
+
+    y6n (desk/nf-y6n-1001 @ b0bf738b39, dry run 20:18Z): 190,127,171 / cut
+    0,52,12 gave TP1 E 134, R 64, C 44, trim cell 9984 B -> 21 rows at
+    524288 tokens, D 70 > 2 x 21: four waves and the top stage 7 (262144
+    tokens) for the whole group. Returns one entry per breaking rank."""
+    out = []
+    for f in fits:
+        E, C = int(f.local_experts), int(f.scratch_rows)
+        R = max(int(f.ceiling_max_rows) - C, 0)
+        d = min(int(ids_cap), max(E - R, 0))
+        cell = int(getattr(f, "trim_cell", 0) or 0)
+        stage = kv_stage_net_rows(int(stage_tokens), int(stage_floor_tokens), cell,
+                                  int(stage_row_bytes)) if int(stage_tokens) > 0 else 0
+        cap = C - stage
+        if cap <= 0 or d > int(waves) * cap:
+            out.append("rang%d D %d > %d x (%d - %d Stufenzeilen) = %d"
+                       % (int(f.rank), d, int(waves), C, stage, int(waves) * max(cap, 0)))
+    return tuple(out)
+
+
+def owned_scratch_raise(
+    fits: Sequence["_EdgeFit"], *, ids_cap: int, waves: int, stage_tokens: int = 0,
+    stage_row_bytes: int = 0, stage_floor_tokens: int = 0,
+) -> Optional[Tuple[int, ...]]:
+    """01.10. (y6n): the scratch each rank needs so that :func:`owned_wave_floor`
+    holds at its edge -- the rows stay (budget and card fix ``R + S``), the
+    split moves from resident to scratch, as the #251c LRU floor does
+    (``launcher`` "der Planer senkt FR_D, die Zeilen gehen von resident nach
+    Scratch"). Per rank the smallest C >= the given scratch with
+    min(ids_cap, E - rows + C) <= W x (C - stage rows), i.e.
+    C >= min(ceil((E - rows + W x stage) / (W - 1)), stage + ceil(ids_cap / W));
+    returns the raise per rank (0 = holds as given), None when a rank cannot
+    hold it with R >= 0 (the form is not tragbar at this wave cap)."""
+    W = int(waves)
+    out = []
+    for f in fits:
+        E, C, rows = int(f.local_experts), int(f.scratch_rows), int(f.ceiling_max_rows)
+        cell = int(getattr(f, "trim_cell", 0) or 0)
+        stage = kv_stage_net_rows(int(stage_tokens), int(stage_floor_tokens), cell,
+                                  int(stage_row_bytes)) if int(stage_tokens) > 0 else 0
+        gap = E - rows
+        c2 = stage + -(-int(ids_cap) // max(W, 1))
+        if W > 1:
+            c1 = -(-(gap + W * stage) // (W - 1))
+        else:
+            c1 = 0 if gap + stage <= 0 else c2
+        need = max(C, min(c1, c2), stage + 1)
+        if need > rows or need > E:
+            return None
+        out.append(need - C)
+    return tuple(out)
+
+
+def owned_form_limits(env_d: Mapping[str, str], *, text_cfg: Mapping[str, object], terms,
+                      seats: Optional[int], kv_tokens: int, rank_tp_ratio: str,
+                      n_ranks: int) -> Dict[str, int]:
+    """01.10. (y6n): the hard limits :func:`solve_owned_cut` holds every
+    candidate to, from what the line runs: the seat cap, the H95 wave cap of
+    --env-d (``SGLANG_OPT_MOE_POOL_OVERFLOW_WAVES``, the derived 2 on
+    nextflash -- never a raised one), and with the H95c seat VRAM armed the
+    top KV stage (S0 + S0 x the last stage step, ``kv_stage_group``'s
+    default) at the stage row the runtime unmaps (expert row minus its
+    scales, :func:`seat_vram_form`)."""
+    out = {"seats_cap": int(seats or 1), "waves_cap": int(pool_overflow_waves(env_d or {}))}
+    armed = str((env_d or {}).get("SGLANG_OPT_WEG2_D_SEAT_VRAM", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+    row = float(getattr(terms, "expert_layer_weight_bytes", 0.0) or 0.0) / max(
+        1, int(getattr(terms, "num_experts", 0) or 0))
+    if armed and row > 0:
+        form = seat_vram_form(text_cfg, ssm_dtype=None, rank_tp_ratio=str(rank_tp_ratio or ""),
+                              n_ranks=int(n_ranks), expert_row_bytes=row,
+                              moe_layers=int(terms.n_layers))
+        small = int(form.small_row_bytes) if form is not None else 0
+        out["stage_tokens"] = int(round(int(kv_tokens) * float(KV_STAGE_TOP_STEP)))
+        out["stage_row_bytes"] = (int(round(row)) - small) * int(terms.n_layers)
+        # 01.10. (y6n): the floor ladder below S0 (kv_stage_table's floor_tokens):
+        # its unmapped span funds rounded-down rows, the top stage's rows count
+        # from the floor -- as the launcher's table and the rank's cells do
+        fl = owned_stage_floor_tokens(env_d)
+        if 0 < fl < int(kv_tokens):
+            out["stage_floor_tokens"] = int(kv_tokens) - fl
+    return out
+
+
+def owned_stage_floor_tokens(env_d: Mapping[str, str]) -> int:
+    """SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS of the D group's env, else the
+    environ default (the launcher's ``d_kv_stage_floor_tokens``)."""
+    raw = (env_d or {}).get("SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS")
+    if raw is None:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_FLOOR_TOKENS.get() or 0))
+    try:
+        return max(0, int(float(str(raw).strip() or 0)))
+    except ValueError:
+        return 0
+
+
+#: the last stage step of ``kv_stage_group`` (S0 x (1 + 1.0) = the top stage)
+KV_STAGE_TOP_STEP = 1.0
+
+
 def solve_d_rank_residency(
     *,
     budgets_mib: Sequence[float],
@@ -613,6 +1989,8 @@ def solve_d_rank_residency(
     vocab_mib: float,
     share_embed: bool,
     kv_tokens: int,
+    kv_token_shares: Optional[Sequence[float]] = None,
+    kv_dcp_cell_bytes: int = 0,
 ) -> Tuple[DRankResidency, ...]:
     """Je D-Rang die Bilanz gegen SEIN Budget und die Decke.
 
@@ -625,8 +2003,19 @@ def solve_d_rank_residency(
     ``vocab_delta_r`` ist auf dem Draft-Host ``-vocab`` wenn die Referenz
     die eigene Tabelle hielt und dieser Boot sie teilt, ``+vocab`` im
     umgekehrten Fall, sonst 0.
+
+    #239: ``kv_token_shares`` (Verhaeltnisvektor je Rang) bucht die
+    Voll-Attention-KV (``kv_dcp_cell_bytes`` je Token) nach dem Token-Schnitt
+    (:func:`kv_token_cut_cells`); ohne ihn bleibt die Rechnung byte-gleich.
     """
     n = len(budgets_mib)
+    cut_cells: Optional[Tuple[float, ...]] = None
+    cut_shares: Tuple[float, ...] = ()
+    if kv_token_shares is not None:
+        cut_cells = kv_token_cut_cells(reference, kv_token_shares, kv_dcp_cell_bytes)
+        total = sum(float(s) for s in kv_token_shares)
+        cut_shares = tuple(float(s) / total for s in kv_token_shares)
+    ref_cells = reference_kv_cells_s0(reference)
     for name, vec in (
         ("fractions", fractions),
         ("ratios", ratios),
@@ -657,7 +2046,10 @@ def solve_d_rank_residency(
             delta = (
                 -float(vocab_mib) if reference.draft_vocab_held else float(vocab_mib)
             )
-        kv_mib = float(kv_tokens) * float(reference.kv_cell_bytes[r]) / MIB
+        cell = (
+            float(ref_cells[r]) if cut_cells is None else cut_cells[r]
+        )
+        kv_mib = float(kv_tokens) * cell / MIB
         posts = (
             reference.fixed_mib[r]
             + delta
@@ -690,12 +2082,15 @@ def solve_d_rank_residency(
                 spec_mib=float(reference.spec_mib[r]),
                 activation_mib=float(reference.activation_mib[r]),
                 kv_tokens=int(kv_tokens),
-                kv_cell_bytes=int(reference.kv_cell_bytes[r]),
+                kv_cell_bytes=int(round(cell)),
                 kv_mib=kv_mib,
                 ceiling_fraction=largest_fraction_for_rows(
                     local_experts=E, scratch_rows=S, max_rows=max_rows
                 ),
                 ceiling_max_rows=max_rows,
+                kv_token_share=cut_shares[r] if cut_cells is not None else -1.0,
+                kv_stage_cell_bytes=(int(round(cut_shares[r] * float(kv_dcp_cell_bytes)))
+                                     if cut_cells is not None else 0),
             )
         )
     return tuple(out)
@@ -708,8 +2103,8 @@ def describe_rank(fit: DRankResidency) -> str:
         "rang%d: Ratio %g -> Spanne %d + Pad %d = E %d, Scratch %d (Staging %d liegt "
         "darin, kein eigener Posten), f %.3f -> R %d, Puffer min(R+S,E) = %s Zeilen x %d Layer x "
         "%.3f MiB = %.0f MiB | fest %.0f%s + mamba %.0f + spec %.0f + Aktivierung "
-        "%.0f + KV %d Token x %d B = %.0f MiB | Budget %.0f -> Rest vor KV %.0f, nach "
-        "KV %.0f MiB (%d Token erreichbar) -> %s | DECKE f %s (<= %d Zeilen)"
+        "%.0f + KV %d Token x %d B%s = %.0f MiB | Budget %.0f -> Rest vor KV %.0f, nach "
+        "KV %.0f MiB (%s) -> %s | DECKE f %s (<= %d Zeilen)"
         % (
             fit.rank,
             fit.ratio,
@@ -735,11 +2130,17 @@ def describe_rank(fit: DRankResidency) -> str:
             fit.activation_mib,
             fit.kv_tokens,
             fit.kv_cell_bytes,
+            (
+                (" (Token-Schnitt, Anteil %.3f)" % fit.kv_token_share)
+                if fit.kv_token_share >= 0.0
+                else ""
+            ),
             fit.kv_mib,
             fit.budget_mib,
             fit.pre_kv_rest_mib,
             fit.kv_rest_mib,
-            fit.kv_tokens_reachable(),
+            ("%d Token erreichbar" % fit.kv_tokens_reachable()
+             if fit.kv_cell_bytes > 0 else "keine KV-Zelle auf dem Rang, #239 S0"),
             fit.verdict,
             ceiling,
             fit.ceiling_max_rows,
@@ -857,6 +2258,12 @@ class DCardReference(msgspec.Struct, frozen=True, kw_only=True):
     #: H64: die Verify-Form der Referenz-Boots (``None`` = rekurrent, sonst
     #: die Ringlaenge L des ReplaySSM-Spec-Rings), aus der Wirkung im Log.
     replayssm_spec_ring_len: Optional[int] = None
+    #: #239 (Karten-Gutschrift): die KV, die im gemessenen Kopfraum steckt --
+    #: Token des Pools und KV-Zelle je Rang ('KV Cache is allocated ...
+    #: #tokens', 'KV pool sizing ... cell_size'). 0 / () = unbekannt: dann
+    #: verschiebt ein Token-Schnitt die Karte nicht (benannt, nicht geraten).
+    kv_tokens: int = 0
+    kv_cell_bytes: Tuple[int, ...] = ()
 
 
 def d_card_reference_from_logs(
@@ -885,8 +2292,14 @@ def d_card_reference_from_logs(
     dec: Dict[int, float] = {}
     host = -1
     vocab_held = False
+    kv_geoms = set()
     for _name, text in boots:
         obs = _observe_boot(text, n_layers=n_layers)
+        toks = {int(v) for v in obs["kv_tokens"].values()}
+        kv_geoms.add((
+            toks.pop() if len(toks) == 1 else 0,
+            tuple(int(obs["cell"].get(r, 0)) for r in range(n_ranks)),
+        ))
         samples = gpl.samples_from_log(text)
         for r, ss in samples.items():
             if r not in obs["buffer"]:
@@ -935,7 +2348,20 @@ def d_card_reference_from_logs(
         draft_vocab_held=vocab_held,
         dense_repack_outside_pool=h39,
         replayssm_spec_ring_len=ring,
+        # one KV geometry in every boot (and on every rank's pool), else unknown
+        **_card_kv_geometry(kv_geoms),
     )
+
+
+def _card_kv_geometry(geoms) -> Dict[str, object]:
+    """#239: die KV-Geometrie der Karten-Referenz, wenn alle Boots dieselbe
+    gebaut haben (Token > 0, jede Zelle > 0); sonst unbekannt (leer)."""
+    if len(geoms) != 1:
+        return {}
+    tokens, cells = next(iter(geoms))
+    if int(tokens) <= 0 or not cells or any(int(c) <= 0 for c in cells):
+        return {}
+    return {"kv_tokens": int(tokens), "kv_cell_bytes": tuple(int(c) for c in cells)}
 
 
 #: Die gemessene Karten-Referenz der Next-Flash-Form-A-D-Gruppe, hergeleitet
@@ -962,6 +2388,10 @@ D_CARD_REFERENCE_FNFL2 = DCardReference(
     draft_host_rank=0,
     draft_vocab_held=False,
     dense_repack_outside_pool=False,
+    # #239: x141/x144 'KV Cache is allocated ... #tokens: 262144' und
+    # 'cell_size=14143/768/768' auf TP0/TP1/TP2
+    kv_tokens=262144,
+    kv_cell_bytes=(14143, 768, 768),
 )
 
 #: fnFL2 H50: die Karten-Referenz im H39-Zustand, von
@@ -988,6 +2418,10 @@ D_CARD_REFERENCE_FNFL2_H39 = DCardReference(
     draft_host_rank=0,
     draft_vocab_held=False,
     dense_repack_outside_pool=True,
+    # #239: x151/x158 'KV Cache is allocated ... #tokens: 262144' und
+    # 'cell_size=14143/768/768' auf TP0/TP1/TP2
+    kv_tokens=262144,
+    kv_cell_bytes=(14143, 768, 768),
 )
 
 #: Die eingebauten Referenzen je Baum-Zustand (H50): gewaehlt wird nach
@@ -1352,6 +2786,20 @@ class DResidencyPlan(msgspec.Struct, frozen=True, kw_only=True):
     #: rc12e: die aus der geloesten Form abgeleiteten Ueberlaufwellen
     #: (``derive_waves``); ``None`` = nicht abgeleitet, die Env gilt.
     overflow_waves: Optional[int] = None
+    #: #239 S2b: FR_D, die der Planer mit dem Token-Schnitt setzt (leer =
+    #: die gefahrene FR gilt); der Launcher schreibt sie in die D-Argumente.
+    solved_fractions: Tuple[float, ...] = ()
+    #: #239: der geloeste Token-Schnitt in 64steln (leer = kein Schnitt/gegeben).
+    kv_token_cut: Tuple[int, ...] = ()
+    #: #239 S3f: der Eigentumsvektor (``--rank-moe-ratio``), den der Planer
+    #: unter ``owned`` setzt (leer = der gegebene gilt).
+    solved_owner_ratio: Tuple[int, ...] = ()
+    #: #239 S3f: vorher/nachher fuer den Record (leer = kein owned-Solve).
+    owner_record: Tuple[Tuple[str, object], ...] = ()
+    #: 01.10. (y6n): Scratch-Zeilen je Rang, die die geloeste Form fuer den
+    #: Wellenboden ueber dem gegebenen Scratch braucht (leer = keine); der
+    #: Launcher hebt SGLANG_MOE_SCRATCH_SLOTS und loest neu (#251c-Weg)
+    owned_scratch_raise: Tuple[int, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -2125,6 +3573,314 @@ def seat_expert_rows_value(rows: Sequence[SeatTableRow]) -> Optional[str]:
     return ",".join(str(v) for v in vals)
 
 
+class KvStageTable(msgspec.Struct, frozen=True, kw_only=True):
+    """#251c: D's KV stage form on the attention host (Form A TP0), for the
+    launcher -- GERECHNET; the runtime recomputes every (n, stage) cell over
+    its real tensors and refuses a form its pages cannot fund.
+
+    The stages trade expert rows for KV: the boot maps S0's KV and ``rows``
+    stage rows ON (they are scratch rows moved into the seat rows, so the boot
+    books exactly the priced bank); a stage j > 0 unmaps ``stage_rows[j]`` of
+    them for its KV prefix. ``max_by_seats[n-1]``: the highest stage a phase
+    of n seats may take -- the DEFAULT keeps every captured batch at the waves
+    it has without stages (variant B: no extra wave), until a measurement
+    prices an extra wave."""
+
+    tokens: Tuple[int, ...]
+    #: the rows stage j's KV above S0 unmaps (0 for S0)
+    stage_rows: Tuple[int, ...]
+    #: the stage rows ON in the boot form: the top stage's rows + 1 (the
+    #: runtime's exact granule arithmetic; a spare row is an LRU row at S2)
+    rows: int
+    max_by_seats: Tuple[int, ...]
+    #: per n: the rows (LRU + staging) the n-seat phase needs for the waves
+    #: its batches have without stages, and per (n, j) the rows it would have
+    need: Tuple[int, ...]
+    capacity: Tuple[Tuple[int, ...], ...]
+    scratch: int
+    host_rank: int
+    row_mib: float
+    kv_cell_bytes: int
+    #: per batch b: the ids' row demand D(b) and today's (stage-free) waves
+    demand: Tuple[int, ...] = ()
+    waves: Tuple[int, ...] = ()
+    #: 29.09. (Grundgesetz, stages below the booked S0): the rows the unbooked
+    #: KV between the floor stage and the booked S0 funds -- ON at the floor,
+    #: an addition to the booked bank (``rows`` includes them)
+    low_rows: int = 0
+
+    def capture_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        """Per batch b = 1..cap: the waves b's captured step needs under a
+        ``max_by_seats`` row -- the capture floor of b is the fewest rows of
+        ANY phase n >= b at its highest stage (a 6-seat phase at S1 replays
+        the bs2 graph too), exactly as ``d_seat_vram.capture_floors``."""
+        out = []
+        cap = len(self.capacity)
+        for b in range(1, cap + 1):
+            rows = min(self.capacity[n - 1][min(int(max_by_seats[n - 1]),
+                                                len(self.tokens) - 1)]
+                       for n in range(b, cap + 1))
+            d = self.demand[b - 1]
+            out.append(max(1, -(-d // max(1, rows))) if d > 0 else 1)
+        return tuple(out)
+
+    def extra_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        """Per batch b = 1..cap: the waves a ``max_by_seats`` row adds to b's
+        captured step over today's (``capture_waves`` minus ``waves``)."""
+        return tuple(w - t for w, t in zip(self.capture_waves(max_by_seats), self.waves))
+
+
+def kv_stage_rows_from(span_tokens: int, cell_bytes: int, row_bytes: int) -> int:
+    """#251c: the stage rows a KV span of ``span_tokens`` above the BORN stage
+    unmaps -- ``ceil(span x cell / row)``, one ceil over the whole span from
+    the born stage (the floor when one is set), exactly the rank's
+    ``stage_vram_cells`` arithmetic (the budget is the born form). 0 without a
+    span, a cell or a row."""
+    if int(span_tokens) <= 0 or int(cell_bytes) <= 0 or int(row_bytes) <= 0:
+        return 0
+    return -(-int(span_tokens) * int(cell_bytes) // int(row_bytes))
+
+
+def kv_stage_net_rows(stage_tokens: int, floor_span_tokens: int, cell_bytes: int,
+                      row_bytes: int) -> int:
+    """#251c, 01.10. (y6n): the rows a rank's scratch gives up for the KV of
+    the stage ``stage_tokens`` above S0 when ``floor_span_tokens`` of KV below
+    S0 are born unmapped (the floor ladder): the stage rows from the floor
+    (:func:`kv_stage_rows_from`) minus the rows the unmapped span funds
+    (rounded DOWN, ``KvStageTable.low_rows``). Without a floor the plain
+    ``ceil(stage x cell / row)``; with one it is that or one more -- the
+    remainder the rounded-down low rows leave unfunded."""
+    fs = max(0, int(floor_span_tokens))
+    total = kv_stage_rows_from(int(stage_tokens) + fs, cell_bytes, row_bytes)
+    low = (fs * int(cell_bytes) // int(row_bytes)) if fs and int(row_bytes) > 0 else 0
+    return max(0, int(total) - int(low))
+
+
+def kv_stage_table(
+    rows: Sequence[SeatTableRow], form: SeatVramForm, *, kv_cell_bytes: int, kv_tokens: int,
+    local_experts: int, verify_tokens: int, top_k: int, host_rank: int = 0,
+    steps: Sequence[float] = (0.5, 1.0), staging_rows: int = 0,
+    why: Optional[List[str]] = None, floor_tokens: int = 0,
+) -> Optional[KvStageTable]:
+    """#251c: the stage form over the H95 seat table (n = 1..cap).
+
+    Stage tokens: S0 = ``kv_tokens`` (the priced 262k), then S0 x (1 + step).
+    A stage row is an expert row minus its scales (the parts the runtime can
+    unmap: ``expert_row_bytes - small_row_bytes`` per MoE layer).
+
+    The wave rule, per batch b: today a captured step of b seats routes
+    D(b) = min(b x verify x top_k, E - R) ids over C = scratch rows in
+    W(b) = ceil(D(b) / C) waves, i.e. it needs ceil(D(b) / W(b)) rows. A phase
+    of n seats replays every b <= n; at stage j it has C + seat_extra(n) -
+    stage_rows[j] rows. The highest j with that >= the need of every b <= n is
+    ``max_by_seats[n-1]`` -- no batch gains a wave. None when the geometry is
+    incomplete (no KV cell, no scratch) or when the scratch cannot give the top
+    stage's rows and keep its staging (C - S <= staging); ``why`` (a list)
+    then gets the reason with its numbers."""
+    def _none(reason: str) -> None:
+        if why is not None:
+            why.append(reason)
+        return None
+
+    if not rows or int(kv_cell_bytes) <= 0 or int(kv_tokens) <= 0:
+        return _none("keine KV-Zelle (Zeilen %d, kv_cell_bytes %d, kv_tokens %d)"
+                     % (len(rows or ()), int(kv_cell_bytes), int(kv_tokens)))
+    h = int(host_rank)
+    last = rows[-1]
+    if h >= len(last.scratch_given):
+        return _none("kein Scratch fuer Rang %d in der Sitz-Tabelle" % h)
+    C = int(last.scratch_given[h])
+    R = int(last.max_rows[h]) - C
+    row_bytes = (int(form.expert_row_bytes) - int(form.small_row_bytes)) * int(form.moe_layers)
+    if C <= 0 or row_bytes <= 0:
+        return _none("keine Scratch-Geometrie (Scratch %d, Stufenzeile %d B)" % (C, row_bytes))
+    t0 = int(kv_tokens)
+    up = (t0,) + tuple(t0 + int(round(t0 * float(s))) for s in steps)
+    # 29.09. (Nutzer 12:35Z, Grundgesetz): stages BELOW the booked S0 at the
+    # floor's granularity (floor, 2 x floor, ... < S0). The booked plan still
+    # prices S0's KV; the KV between the floor and S0 is born unmapped and its
+    # bytes fund ``low`` more expert rows (rounded DOWN: never a byte more than
+    # the unmapped KV). The stage rows count from the floor -- the born form the
+    # rank's cells are measured against (``d_seat_vram.stage_vram_cells``: the
+    # budget is the boot form at tokens[0] with ``rows`` ON), ONE ceil over the
+    # whole span (``kv_stage_rows_from``). S0 and every stage above keep
+    # today's rows wherever the floor span is whole rows; where it is not, the
+    # remainder the rounded-down ``low`` left unfunded costs that stage one
+    # row (y6n 01.10. 21:07:02, TP2: low 8 of 8.96 + ceil(10.24) = 19 counted,
+    # ceil(19.2) = 20 cut at the top -> the cell funded 0 rows, the table 1,
+    # the capture C 46 x 2 waves < 93 ids).
+    fl = int(floor_tokens or 0)
+    below = tuple(range(fl, t0, fl)) if 0 < fl < t0 else ()
+    cell = int(kv_cell_bytes)
+    low = ((t0 - below[0]) * cell // row_bytes) if below else 0
+    tokens = below + up
+    stage_rows = tuple(kv_stage_rows_from(int(t) - int(tokens[0]), cell, row_bytes)
+                       for t in tokens)
+    S = int(stage_rows[-1]) + 1
+    if C + low - S <= max(1, int(staging_rows)):
+        return _none(
+            "Scratch zu klein fuer die oberste Stufe: C %d - S %d = %d <= Staging %d "
+            "(Stufen %s Token, Stufenzeilen %s bei %d B/Token und %.1f MiB/Zeile) -- "
+            "D faehrt fest %d Token"
+            % (C, S, C - S, max(1, int(staging_rows)), ",".join(str(t) for t in tokens),
+               ",".join(str(r) for r in stage_rows), int(kv_cell_bytes), row_bytes / 2**20, t0))
+    E = int(local_experts)
+    per_seat = int(verify_tokens) * int(top_k)
+    need_b, demand, waves = [], [], []
+    for b in range(1, len(rows) + 1):
+        d = min(b * per_seat, max(E - R, 0))
+        w = max(1, -(-d // C))
+        need_b.append(-(-d // w) if d > 0 else 0)
+        demand.append(d)
+        waves.append(w)
+    need, cap_rows, max_by = [], [], []
+    for n, row in enumerate(rows, start=1):
+        need_n = max(need_b[:n])
+        extra = int(row.seat_extra[h]) if row.seat_extra and h < len(row.seat_extra) else 0
+        caps = tuple(C + low + extra - int(r) for r in stage_rows)
+        need.append(need_n)
+        cap_rows.append(caps)
+        max_by.append(max([j for j, c in enumerate(caps) if c >= need_n] or [0]))
+    return KvStageTable(
+        tokens=tokens, stage_rows=stage_rows, rows=S, max_by_seats=tuple(max_by),
+        need=tuple(need), capacity=tuple(cap_rows), scratch=C, host_rank=h,
+        row_mib=round(row_bytes / MIB, 2), kv_cell_bytes=int(kv_cell_bytes),
+        demand=tuple(demand), waves=tuple(waves), low_rows=int(low))
+
+
+def kv_stage_trim_cell(fit: "DRankResidency", host_rank: int = 0) -> int:
+    """#239 S3g: the bytes per GLOBAL token a KV stage above S0 maps on this
+    rank -- the "Trim-Zelle". The attention host trims every KV tensor it has
+    (its whole cell, #251c). A Form A worker holds NO QSA keys
+    (``qsa_index_on_rank = not this_rank_is_form_a_worker()``, #239 S0) -- the
+    768 B/token its cell prices are no tensor on the card -- so it stages only
+    its token-cut full-attention share (share x FA cell). rc12z30b (28.09.
+    20:09:07, -st, no cut): S3g/(d) gave each byteless worker 3 stage rows for
+    those phantom keys; nothing was born trimmed there ('KV-STAGE ... born=0'),
+    the worker computed no capture floor and captured with the rows OFF --
+    TP2 C 45 x 2 waves < 92 ids, 'Step ids exceed the LRU rows plus the
+    staging rows'. 0 = no KV to stage."""
+    if int(fit.rank) == int(host_rank):
+        return int(fit.kv_cell_bytes)
+    return int(getattr(fit, "kv_stage_cell_bytes", 0) or 0)
+
+
+class KvStageGroup(msgspec.Struct, frozen=True, kw_only=True):
+    """#239 S3g: the KV stage form over EVERY rank that holds KV -- one
+    :class:`KvStageTable` per KV rank (the attention host first), each from
+    the same function (``kv_stage_table``) with the rank's own trim cell and
+    scratch. The stage tokens and the highest stage per seat count are
+    REPLICATED (every rank chooses the same stage at the wake); the stage rows
+    are per rank. In S0 a rank's stage rows are rows of its expert bank --
+    booked as residency in the FRACTION-SOLVE (scratch -> seat rows, no new
+    byte); a wake to S_j unmaps ``stage_rows[j]`` of them over the H95c row
+    switch (``set_seat_rows_on``) for the stage's KV. Form A: the host's table
+    is #251c's (ROWS=33); a byteless worker holds no KV and gets no table."""
+
+    tables: Tuple[KvStageTable, ...]
+    n_ranks: int
+
+    @property
+    def host(self) -> KvStageTable:
+        return self.tables[0]
+
+    @property
+    def tokens(self) -> Tuple[int, ...]:
+        return self.host.tokens
+
+    @property
+    def rows(self) -> int:
+        return self.host.rows
+
+    @property
+    def rows_by_rank(self) -> Tuple[int, ...]:
+        out = [0] * int(self.n_ranks)
+        for t in self.tables:
+            out[int(t.host_rank)] = int(t.rows)
+        return tuple(out)
+
+    @property
+    def max_by_seats(self) -> Tuple[int, ...]:
+        """Per n: the highest stage EVERY KV rank keeps at its waves."""
+        return tuple(min(int(t.max_by_seats[i]) for t in self.tables)
+                     for i in range(len(self.host.max_by_seats)))
+
+    @property
+    def waves(self) -> Tuple[int, ...]:
+        return tuple(max(int(t.waves[i]) for t in self.tables)
+                     for i in range(len(self.host.waves)))
+
+    def capture_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        per = [t.capture_waves(max_by_seats) for t in self.tables]
+        return tuple(max(w[i] for w in per) for i in range(len(per[0])))
+
+    def extra_waves(self, max_by_seats: Sequence[int]) -> Tuple[int, ...]:
+        per = [t.extra_waves(max_by_seats) for t in self.tables]
+        return tuple(max(w[i] for w in per) for i in range(len(per[0])))
+
+
+def kv_stage_group(
+    rows: Sequence[SeatTableRow], form: SeatVramForm, fits: Sequence["DRankResidency"], *,
+    verify_tokens: int, top_k: int, host_rank: int = 0, steps: Sequence[float] = (0.5, 1.0),
+    why: Optional[List[str]] = None, floor_tokens: int = 0,
+) -> Optional[KvStageGroup]:
+    """#239 S3g: :class:`KvStageGroup` over the FRACTION-SOLVE's ``fits`` --
+    the host's table as in #251c, then one per worker whose trim cell is > 0
+    (the token cut gave it a full-attention share). Every table takes the
+    host's S0 (the tokens are the group's) and the same stage steps. None
+    (``why`` gets the rank and the reason) when a KV rank's table cannot be
+    built: its scratch cannot give its top stage's rows and keep its staging
+    -- a stage one rank cannot fund is a stage no rank may choose."""
+    fits = list(fits or ())
+    host = next((f for f in fits if int(f.rank) == int(host_rank)), None)
+    if host is None:
+        if why is not None:
+            why.append("kein Attention-Host %d im Plan" % host_rank)
+        return None
+    tables = []
+    for f in [host] + sorted((f for f in fits if int(f.rank) != int(host_rank)
+                              and kv_stage_trim_cell(f, host_rank) > 0),
+                             key=lambda f: int(f.rank)):
+        sub: List[str] = []
+        t = kv_stage_table(
+            rows, form, kv_cell_bytes=kv_stage_trim_cell(f, host_rank),
+            kv_tokens=int(host.kv_tokens), local_experts=int(f.local_experts),
+            verify_tokens=int(verify_tokens), top_k=int(top_k), host_rank=int(f.rank),
+            steps=steps, staging_rows=int(f.staging_rows), why=sub,
+            floor_tokens=int(floor_tokens))
+        if t is None:
+            if why is not None:  # the host's reason reads as in #251c
+                why.append(("" if f is host else "Rang %d: " % int(f.rank))
+                           + ("; ".join(sub) or "ohne Grund"))
+            return None
+        tables.append(t)
+    n = max(len(rows[-1].scratch_given) if rows else 0, 1 + max(int(f.rank) for f in fits))
+    return KvStageGroup(tables=tuple(tables), n_ranks=n)
+
+
+def describe_kv_stage_residency(group: KvStageGroup, *, marker: str, label: str) -> Tuple[str, ...]:
+    """#239 S3g, one FRACTION-SOLVE line per KV rank: its stage rows booked as
+    residency in S0 and what each stage takes of them for its KV."""
+    out = []
+    for t in group.tables:
+        space = (int(t.tokens[-1]) - int(t.tokens[0])) * int(t.kv_cell_bytes) / MIB
+        low = int(getattr(t, "low_rows", 0) or 0)
+        out.append(
+            "%s FRACTION-SOLVE %s D-KV-STUFEN RESIDENZ (#239 S3g) rang%d: %d Stufenzeilen "
+            "(%.1f MiB) sind in S0 Experten-Zeilen der Bank (Scratch %d -> %d, Sitzzeilen +%d, "
+            "%s) fuer den ungemappten Stufenraum %.1f MiB (Trim-Zelle %d B/Tok x "
+            "%d Tok); S1..S%d schneiden %s davon am Wake ab (H95c-Zeilenschaltung) -- GERECHNET"
+            % (marker, label, int(t.host_rank), int(t.rows), int(t.rows) * float(t.row_mib),
+               # the scratch the rank is given: the low rows are NEW bank rows
+               # (their KV below S0 is born unmapped), only the rest leaves it
+               int(t.scratch), int(t.scratch) - (int(t.rows) - low), int(t.rows),
+               ("%d davon neu aus dem ungemappten KV unter S0" % low) if low
+               else "kein neues Byte", space,
+               int(t.kv_cell_bytes), int(t.tokens[-1]) - int(t.tokens[0]),
+               len(t.tokens) - 1, list(t.stage_rows[1:])))
+    return tuple(out)
+
+
 def seat_table(
     plan_for_seats, *, seats_max: int, verify_tokens: int, top_k: int, waves: int,
     host_rank: int = 0, seat_vram: Optional[SeatVramForm] = None,
@@ -2293,8 +4049,39 @@ def plan_d_residency(
     activation_record_mib: Optional[Sequence[Optional[float]]] = None,
     activation_record_source: str = "",
     derive_waves: bool = False,
+    kv_token_shares: object = None,
+    kv_dcp_cell_bytes: int = 0,
+    kv_dtype_bytes: int = 0,
+    owned_miss_ms: Optional[Sequence[float]] = None,
+    owned_miss_source: str = "",
+    owned_miss_ms_rank: Optional[Sequence[float]] = None,
+    owned_miss_rank_source: str = "",
+    owned_heat_records: Optional[Sequence[Mapping[str, object]]] = None,
+    owned_heat_source: str = "",
 ) -> DResidencyPlan:
     """Der D-FRACTION-SOLVE mit den Metallregeln, fuer ``launcher``.
+
+    01.10. (Eigentum aus den Profilen): ``owned_miss_ms_rank`` = die Kosten
+    je verfehlter Zeile JE RANG (jede Karte an ihrem Link, aus den
+    Rang-Records); der Eigentums-Solve gewichtet die Runde nach dem
+    Decode-bs-Mix (:func:`owned_bs_weights`) und leitet die Form-A-Basis
+    selbst ab (:func:`owned_base_mode` ``derive``), statt den Handvektor als
+    Basis zu nehmen. ``owned_heat_records`` (#276-Hitze-Records desselben
+    Checkpoints, :func:`owned_heat_from_records`) ersetzen die
+    Gleichverteilung der Fehlgriffe; ohne Record bleibt sie benannt.
+
+    #239 S3f Miss-Record (29.09.): ``owned_miss_ms`` = die Kosten je
+    verfehlter Expertenzeile (Host, Worker) aus :func:`resolve_owned_miss_ms`
+    mit ``owned_miss_source``; ohne sie rechnet der Eigentums-Solve mit der
+    Saat wie bisher (byte-gleich).
+
+    #239: ``kv_token_shares`` + ``kv_dcp_cell_bytes`` bucht den Token-Schnitt
+    der Voll-Attention-KV ueber die D-Raenge (uneven DCP unter Form A, siehe
+    :func:`kv_token_cut_cells`); ohne sie bleibt die Rechnung byte-gleich.
+    ``kv_token_shares == KV_TOKEN_CUT_MAXMIN`` (S2): der Planer waehlt die
+    Anteile selbst (:func:`solve_kv_token_shares`); ``kv_dcp_cell_bytes`` 0
+    heisst dann: aus der Config (:func:`fa_kv_token_cell_bytes` mit
+    ``kv_dtype_bytes``).
 
     rc12c: ``fixed_record_mib`` = der feste Rang-Posten aus dem Record des
     Profils (``D_FIXED_MIB``, gemessen auf der Form, die heute faehrt); ein
@@ -2492,28 +4279,344 @@ def plan_d_residency(
     vocab = draft_vocab_mib(
         vocab_size=int(text_cfg["vocab_size"]), hidden_size=int(text_cfg["hidden_size"])
     )
-    fits = solve_d_rank_residency(
-        budgets_mib=budgets_mib,
-        fractions=fractions,
-        ratios=ratios,
-        scratch_rows=scratch_rows,
-        staging_rows=staging,
-        num_experts=int(terms.num_experts),
-        pad_rows=1,
-        n_layers=int(terms.n_layers),
-        slot_bytes=slot_bytes,
-        reference=ref,
-        vocab_mib=vocab,
-        share_embed=share,
-        kv_tokens=int(kv_tokens),
-    )
-    dcp_note = (
-        " KV-Anteil: SGLANG_UNEVEN_DCP ist an, der Token-Schnitt je Rang ist hier NICHT "
-        "modelliert -- jeder Rang ist mit dem vollen Kontext bepreist (Obergrenze des "
-        "KV-Postens)."
-        if _env_true(env_d, "SGLANG_UNEVEN_DCP")
-        else " KV-Anteil: kein uneven DCP, jeder Rang haelt den vollen Kontext."
-    )
+    cut_lines: Tuple[str, ...] = ()
+    if kv_token_shares is not None and int(kv_dcp_cell_bytes) <= 0:
+        kv_dcp_cell_bytes = fa_kv_token_cell_bytes(text_cfg, int(kv_dtype_bytes))
+
+    def _solve(shares, fr=None, rat=None):
+        return solve_d_rank_residency(
+            budgets_mib=budgets_mib,
+            fractions=fractions if fr is None else fr,
+            ratios=ratios if rat is None else rat,
+            scratch_rows=scratch_rows,
+            staging_rows=staging,
+            num_experts=int(terms.num_experts),
+            pad_rows=1,
+            n_layers=int(terms.n_layers),
+            slot_bytes=slot_bytes,
+            reference=ref,
+            vocab_mib=vocab,
+            share_embed=share,
+            kv_tokens=int(kv_tokens),
+            kv_token_shares=shares,
+            kv_dcp_cell_bytes=int(kv_dcp_cell_bytes),
+        )
+
+    solved_fr: Tuple[float, ...] = ()
+    solved_cut: Tuple[int, ...] = ()
+    solved_owner: Tuple[int, ...] = ()
+    solved_raise: Tuple[int, ...] = ()
+    owner_record: Tuple[Tuple[str, object], ...] = ()
+    owner_refusal: Optional[str] = None
+    _owned, _forced_shares = owned_cut_request(kv_token_shares)
+    if _owned:
+        # #239 S3f: host share 0, ownership + workers' shares + FR_D solved
+        # (M1b: shares forced by 'owned:<vector>', ownership + FR_D solved).
+        tp = [int(x) for x in str(rank_tp_ratio).split(",") if x.strip()]
+        hosts = [r for r, v in enumerate(tp) if v > 0]
+        if len(hosts) != 1:
+            raise ValueError(
+                "plan_d_residency: 'owned' needs ONE attention host, rank-tp-ratio %s"
+                % rank_tp_ratio)
+        host = hosts[0]
+        verify = replayssm_spec.draft_tokens if replayssm_spec is not None else 1
+        ids = int(verify) * int(text_cfg.get("num_experts_per_tok") or 1)
+        _kinds = list(text_cfg.get("layer_types") or ())
+        fa_layers = (sum(1 for k in _kinds if k == "full_attention") if _kinds else
+                     int(text_cfg.get("num_hidden_layers") or 0)
+                     // max(1, int(text_cfg.get("full_attention_interval") or 0) or 1))
+        base_rat = [int(round(float(x))) for x in ratios]
+        def _card_rows(cut_fits):
+            # the card's edge per rank, from the same check the plan ends with
+            if card_ledger is not None:
+                cs = solve_d_card_ledger(fits=cut_fits, ledger=card_ledger)
+            else:
+                _, cs, _ = _plan_d_card(
+                    fits=cut_fits, model_path=model_path, rank_tp_ratio=rank_tp_ratio,
+                    card_reference_logs=card_reference_logs, n_layers=int(terms.n_layers),
+                    slot_bytes=slot_bytes, vocab_mib=vocab, share_embed=share, label=label,
+                    marker=marker, dense_repack=dense_repack, replayssm_spec=replayssm_spec,
+                    spec_per_req_mib=(spec_rebook.per_req_mib if spec_rebook is not None
+                                      else None),
+                    text_cfg=text_cfg, act_dtype=act_dtype, seat_rb=seat_rb,
+                    seat_graph_mib=seat_graph_mib, kv_token_cut=True)
+            return tuple(int(c.ceiling_max_rows) for c in cs) if cs else None
+
+        _x1_scope = owned_x1_scope()
+        _miss_ms = (tuple(float(x) for x in owned_miss_ms) if owned_miss_ms is not None
+                    else OWNED_MISS_MS_PER_ROW_SEED)
+        _miss_src = (owned_miss_source or "ohne Herkunft") if owned_miss_ms is not None \
+            else OWNED_MISS_MS_SOURCE_SEED
+        _miss_rank = (tuple(float(x) for x in owned_miss_ms_rank)
+                      if owned_miss_ms_rank is not None
+                      and len(owned_miss_ms_rank) == len(base_rat) else None)
+        _bs_w, _bs_src = owned_bs_weights()
+        _heat_got = (owned_heat_from_records(owned_heat_records,
+                                             num_experts=int(terms.num_experts))
+                     if owned_heat_records else None)
+        _heat = _heat_got[0] if _heat_got is not None else None
+        _heat_src = ("%s in %s" % (_heat_got[1], owned_heat_source or "ohne Herkunft")
+                     if _heat_got is not None
+                     else "gleichverteilt (kein Hitze-Record dieses Checkpoints)")
+        _base_mode = owned_base_mode()
+        _stated_base = list(base_rat)
+        _base_lines: Tuple[str, ...] = ()
+        if _base_mode == "derive" and _forced_shares is None:
+            try:
+                _ob = derive_owned_base(
+                    lambda rat, sh: _solve(sh, None, rat), base_rat, host,
+                    num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
+                    ids_per_step=ids, miss_ms=_miss_ms, miss_ms_rank=_miss_rank,
+                    card_rows=_card_rows, fa_layers=fa_layers, rows_per_round=int(verify),
+                    bs_weights=_bs_w, heat=_heat)
+            except ValueError as exc:
+                # no Form A with an edge on every rank: the stated vector
+                # stays the base, named -- a planner gap never stops a boot
+                _ob = None
+                _base_lines = (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM BASIS (01.10.): keine Form A mit Kante "
+                    "auf jedem Rang ableitbar (%s) -- Basis bleibt --rank-moe-ratio %s"
+                    % (marker, label, exc, ",".join(str(x) for x in base_rat)),
+                )
+            if _ob is not None:
+                base_rat = list(_ob.ratios)
+                _base_lines = (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM BASIS (01.10., Planer statt Hand): Form A "
+                    "abgeleitet --rank-moe-ratio %s (Saat %s, nur Startpunkt) -- Runde gewichtet "
+                    "%.2f ms (Saat %.2f), T_r je bs %s; %d Runden, %d Kandidaten, %d Budget-"
+                    "Loesungen; Kosten je Zeile %s; bs-Mix %s (%s); Routing %s"
+                    % (marker, label, ",".join(str(x) for x in _ob.ratios),
+                       ",".join(str(x) for x in _ob.seed), _ob.objective_ms,
+                       _ob.seed_objective_ms,
+                       " ".join("bs%d %s" % (b, ["%.2f" % x for x in ms])
+                                for b, ms in _ob.round_ms_by_bs),
+                       _ob.iterations, _ob.candidates, _ob.solves,
+                       ("je Rang %s (%s)" % (["%.3f" % x for x in _miss_rank],
+                                             owned_miss_rank_source or "ohne Herkunft"))
+                       if _miss_rank is not None else "%s (%s)" % (
+                           "/".join("%g" % x for x in _miss_ms), _miss_src),
+                       (" ".join("bs%d %.3f" % (b, w) for b, w in _bs_w) if _bs_w else "nur bs1"),
+                       _bs_src, _heat_src),
+                )
+        _lim = owned_form_limits(env_d, text_cfg=text_cfg, terms=terms, seats=seats,
+                                 kv_tokens=int(kv_tokens), rank_tp_ratio=rank_tp_ratio,
+                                 n_ranks=len(base_rat))
+
+        def _owned_from(b):
+            return solve_owned_cut(
+                lambda rat, sh: _solve(sh, None, rat), b, host,
+                num_experts=int(terms.num_experts), n_layers=int(terms.n_layers),
+                ids_per_step=ids, miss_ms=_miss_ms, card_rows=_card_rows, fa_layers=fa_layers,
+                rows_per_round=int(verify), forced_shares=_forced_shares,
+                x1_scope=_x1_scope, bs_weights=_bs_w, miss_ms_rank=_miss_rank, heat=_heat,
+                switch_gain=OWNED_SWITCH_GAIN, **_lim)
+
+        sol = _owned_from(base_rat)
+        if tuple(int(x) for x in base_rat) != tuple(int(x) for x in _stated_base):
+            # 01.10. (y6n, Koordinator): the derived base wins only when its
+            # FINAL form beats the stated base's final form by more than
+            # OWNED_SWITCH_GAIN of the weighted round -- otherwise the
+            # profile's vector stays (y6n: derive 157,151,180 ended at 134.60
+            # ms against 127.15 from 183,137,168)
+            sol_st = _owned_from(_stated_base)
+            if sol_st.feasible and (not sol.feasible or sol.objective_ms > sol_st.objective_ms
+                                    * (1.0 - OWNED_SWITCH_GAIN)):
+                _base_lines = _base_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM BASIS (01.10.): die abgeleitete Basis %s "
+                    "endet bei %s ms gegen %.2f ms aus --rank-moe-ratio %s (Schwelle %.0f %%) "
+                    "-- Basis bleibt die gesetzte"
+                    % (marker, label, ",".join(str(x) for x in base_rat),
+                       "%.2f" % sol.objective_ms if sol.feasible else "keiner tragbaren Form",
+                       sol_st.objective_ms, ",".join(str(x) for x in _stated_base),
+                       100.0 * OWNED_SWITCH_GAIN),
+                )
+                sol = sol_st
+                base_rat = list(_stated_base)
+        owner_record = (
+            ("base_ratios", list(sol.base_ratios)),
+            ("base_round_ms", [round(x, 3) for x in sol.base_round_ms]),
+            ("ratios", list(sol.ratios)),
+            ("cut", list(sol.cut)),
+            ("fractions", [round(x, 4) for x in sol.fractions]),
+            ("round_ms", [round(x, 3) for x in sol.round_ms]),
+            ("miss_ms_per_row", list(_miss_ms)),
+            ("miss_ms_source", _miss_src),
+            ("attn_ms_per_row", list(OWNED_ATTN_MS_PER_ROW_SEED)),
+            ("attn_floor_ms", OWNED_ATTN_FLOOR_MS_SEED),
+            ("lse_ms_per_layer", OWNED_LSE_MS_PER_LAYER_SEED),
+            ("attn_source", OWNED_ATTN_SOURCE_SEED),
+            ("fa_layers", fa_layers),
+            ("ids_per_step", ids),
+            ("candidates", sol.candidates),
+            ("feasible", sol.feasible),
+            ("solves", sol.solves),
+            ("elapsed_s", sol.elapsed_s),
+            ("forced_shares", list(_forced_shares) if _forced_shares else None),
+            ("x1_ok", sol.x1_ok),
+            ("x1_scope", _x1_scope),
+            ("target_over_form_a_ms", round(max(sol.round_ms) - max(sol.base_round_ms), 3)
+             if sol.round_ms else None),
+            ("kv_tokens", int(kv_tokens)),
+            ("base_mode", _base_mode),
+            ("stated_ratios", _stated_base),
+            ("miss_ms_per_rank", list(_miss_rank) if _miss_rank is not None else None),
+            ("miss_ms_rank_source", owned_miss_rank_source if _miss_rank is not None else None),
+            ("bs_weights", [list(x) for x in sol.bs_weights] or None),
+            ("round_ms_by_bs", [[b, [round(x, 3) for x in ms]] for b, ms in sol.round_ms_by_bs]),
+            ("base_round_ms_by_bs",
+             [[b, [round(x, 3) for x in ms]] for b, ms in sol.base_round_ms_by_bs]),
+            ("objective_ms", round(sol.objective_ms, 3)),
+            ("routing", _heat_src),
+            ("base_objective_ms", round(sol.base_objective_ms, 3)),
+            ("limits", dict(sol.guard) or None),
+            ("limits_refused", sol.guard_refused),
+            ("stayed_on_base", sol.stayed),
+            ("scratch_raise", list(sol.scratch_raise) or None),
+        )
+        if sol.feasible:
+            ratios = [float(x) for x in sol.ratios]
+            solved_owner = tuple(sol.ratios)
+            solved_raise = tuple(sol.scratch_raise)
+            solved_fr = tuple(sol.fractions)
+            kv_token_shares = tuple(sol.cut)
+            solved_cut = tuple(sol.cut)
+            cut_lines = (
+                "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f): --rank-moe-ratio %s -> %s, "
+                "KV-Token-Schnitt %s/%d (Host 0), FR_D %s an der Kante -- Fehlgriff-Zeit "
+                "bs1 je Rang %s ms (Form A %s), max %.2f gegen %.2f; x1-Regel: %s; "
+                "%d Kandidaten (Eigentum frei in beide Richtungen, auch Worker unter "
+                "sich, in %der-Schritten), %d tragbar, %d Budget-Loesungen in %.1f s; "
+                "Kosten je Zeile %s ms (%s), "
+                "%d Ids je Schritt, gleichverteilt (benannt); Attention+LSE je Rang "
+                "(%d FA-Layer, %s); %d Token KV Pflicht"
+                % (marker, label, ",".join(str(x) for x in sol.base_ratios),
+                   ",".join(str(x) for x in sol.ratios), list(sol.cut), KV_TOKEN_SHARE_GRID,
+                   ["%.3f" % x for x in sol.fractions],
+                   ["%.2f" % x for x in sol.round_ms], ["%.2f" % x for x in sol.base_round_ms],
+                   max(sol.round_ms), max(sol.base_round_ms),
+                   ("kein Worker ueber Form A" if sol.x1_ok else
+                    ("gemeldet, nicht erzwungen (%s=round: die Runde entscheidet)" % OWNED_X1_ENV
+                     if _x1_scope == "round" else
+                     "VERLETZT (Schnitt erzwungen, Messarm M1b)")) + (
+                       " -- Schnitt ERZWUNGEN %s" % list(_forced_shares) if _forced_shares
+                       else ""),
+                   sol.candidates, OWNED_RATIO_STEP, sol.feasible, sol.solves,
+                   sol.elapsed_s,
+                   "/".join("%g" % x for x in _miss_ms),
+                   _miss_src, ids, fa_layers, OWNED_ATTN_SOURCE_SEED,
+                   int(kv_tokens)),
+            )
+            cut_lines = _base_lines + cut_lines
+            if sol.guard or sol.stayed:
+                _g = dict(sol.guard)
+                cut_lines = cut_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM GRENZEN (01.10., y6n): %s%s"
+                    % (marker, label,
+                       ("Pool-Schritt + Wellenboden bei %d Sitzen, hoechstens %d Wellen, "
+                        "oberste KV-Stufe +%d Token (Stufenzeile %.1f MiB) hart im Solve -- "
+                        "%d Kandidaten verworfen%s" % (
+                            _g.get("seats", 0), _g.get("waves", 0), _g.get("stage_tokens", 0),
+                            _g.get("stage_row_bytes", 0) / MIB, sol.guard_refused,
+                            ("; Scratch je Rang +%s (Zeilen von resident nach Scratch, FR_D oben "
+                             "schon damit)" % list(sol.scratch_raise))
+                            if sol.scratch_raise else ""))
+                       if _g else "ohne harte Grenzen",
+                       ("; Eigentum bleibt %s: beste andere Form %.2f ms gegen %.2f (< %.0f %%)"
+                        % (",".join(str(x) for x in sol.ratios), sol.best_other_objective_ms,
+                           sol.objective_ms, 100.0 * OWNED_SWITCH_GAIN)) if sol.stayed else ""),
+                )
+            if sol.bs_weights:
+                cut_lines = cut_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM T_r JE BS (01.10.): %s -- Form A %s; "
+                    "Runde gewichtet %.2f ms (Form A %.2f), x1 bei bs %s"
+                    % (marker, label,
+                       " ".join("bs%d %s" % (b, ["%.2f" % x for x in ms])
+                                for b, ms in sol.round_ms_by_bs),
+                       " ".join("bs%d %s" % (b, ["%.2f" % x for x in ms])
+                                for b, ms in sol.base_round_ms_by_bs),
+                       sol.objective_ms, sol.base_objective_ms,
+                       ",".join(str(b) for b in OWNED_X1_BS)),
+                )
+            if max(sol.round_ms) > max(sol.base_round_ms) + 1e-9:
+                # main 28.09.: the x1 rule holds per worker, but the min-max
+                # objective ends above Form A -- named, so the record keeps it
+                cut_lines = cut_lines + (
+                    "%s FRACTION-SOLVE %s D-EIGENTUM (#239 S3f) ZIELFORM max T_r %.2f > "
+                    "Form A max %.2f: +%.2f ms je Runde bs1 (Rang %d, Fehlgriff-Kosten %s); "
+                    "die beste Form des ganzen Suchraums (%d Kandidaten, Eigentum "
+                    "in beide Richtungen) -- keine haelt x1 und Form A zugleich"
+                    % (marker, label, max(sol.round_ms), max(sol.base_round_ms),
+                       max(sol.round_ms) - max(sol.base_round_ms),
+                       sol.round_ms.index(max(sol.round_ms)), _miss_src, sol.candidates),
+                )
+        else:
+            owner_refusal = (
+                "%s (%s): D-EIGENTUM (#239 S3f) -- keine tragbare Form mit Host-Anteil 0: "
+                "%d Kandidaten (Eigentum um %s frei in %der-Schritten, Worker-Anteile in "
+                "%der-Schritten), keine mit Kante auf jedem Rang und ohne Mehr-Fehlgriffe "
+                "eines Workers gegen Form A (%s ms)"
+                % (marker, label, sol.candidates, ",".join(str(x) for x in sol.base_ratios),
+                   OWNED_RATIO_STEP, OWNED_SHARE_STEP,
+                   ["%.2f" % x for x in sol.base_round_ms])
+                + (" -- %d davon an den harten Grenzen verworfen (%s)"
+                   % (sol.guard_refused, dict(sol.guard)) if sol.guard_refused else ""))
+            # the derived base is printed even when no cut form carries
+            cut_lines = _base_lines
+            kv_token_shares = None
+    if isinstance(kv_token_shares, str):
+        if kv_token_shares not in (KV_TOKEN_CUT_MAXMIN, KV_TOKEN_CUT_JOINT):
+            raise ValueError(
+                "plan_d_residency: KV token cut %r is neither %r, %r, %r nor a ratio vector"
+                % (kv_token_shares, KV_TOKEN_CUT_MAXMIN, KV_TOKEN_CUT_JOINT, KV_TOKEN_CUT_OWNED)
+            )
+        joint = kv_token_shares == KV_TOKEN_CUT_JOINT
+        if joint:
+            cut, low, solved_fr, edge = solve_joint_cut(_solve, fractions, n)
+        else:
+            cut, low = solve_kv_token_shares(_solve, n)
+        cut_lines = (
+            "%s FRACTION-SOLVE %s KV-TOKEN-SCHNITT (#239 %s): Anteile %s/%d je Rang "
+            "(max-min %s, kleinste %.3f; Voll-Attention-KV %d B/Token, %d Token)"
+            % (marker, label, "S2b" if joint else "S2", list(cut), KV_TOKEN_SHARE_GRID,
+               "des residenten Experten-Anteils je Karte an der Kante" if joint
+               else "der relativen Zeilen-Decke Decke/Puffer",
+               low, int(kv_dcp_cell_bytes), int(kv_tokens)),
+        )
+        kv_token_shares = cut
+        solved_cut = tuple(cut)
+        if joint:
+            cut_lines = cut_lines + (
+                "%s FRACTION-SOLVE %s FR-D (#239 S2b): der Planer setzt FR_D %s an die "
+                "Kante je Rang (gefahren %s) -- resident %s von %s Experten, "
+                "Decke %s Zeilen%s"
+                % (marker, label, ["%.3f" % x for x in solved_fr],
+                   ["%.3f" % float(x) for x in fractions],
+                   [max(0, min(f.ceiling_max_rows - f.scratch_rows, f.local_experts - 2))
+                    for f in edge],
+                   [f.local_experts for f in edge],
+                   [f.ceiling_max_rows for f in edge],
+                   "" if all(f.ceiling_fraction is not None for f in edge) else
+                   " -- KEINE Kante auf Rang %s, dort bleibt die gefahrene FR (W122)"
+                   % [f.rank for f in edge if f.ceiling_fraction is None]),
+            )
+    fits = _solve(kv_token_shares, solved_fr or None)
+    if kv_token_shares is not None:
+        dcp_note = (
+            " KV-Anteil (#239): Token-Schnitt der Voll-Attention-KV (%d B/Token) je Rang "
+            "%s, der Host-Rest der Zelle bleibt auf dem Host."
+            % (
+                int(kv_dcp_cell_bytes),
+                ["%.3f" % f.kv_token_share for f in fits],
+            )
+        )
+    elif _env_true(env_d, "SGLANG_UNEVEN_DCP"):
+        dcp_note = (
+            " KV-Anteil: SGLANG_UNEVEN_DCP ist an, der Token-Schnitt je Rang ist hier NICHT "
+            "modelliert -- jeder Rang ist mit dem vollen Kontext bepreist (Obergrenze des "
+            "KV-Postens)."
+        )
+    else:
+        dcp_note = " KV-Anteil: kein uneven DCP, jeder Rang haelt den vollen Kontext."
     head = (
         "%s FRACTION-SOLVE %s (Pufferregel, H8): Budget je Rang %s MiB, %d Layer x "
         "%.3f MiB/Zeile, %d Experten nach --rank-moe-ratio %s + 1 Pad-Zeile, Scratch "
@@ -2547,7 +4650,7 @@ def plan_d_residency(
             dcp_note,
         )
     )
-    lines = (head,) + seat_lines + spec_lines + fixed_lines + tuple(
+    lines = (head,) + cut_lines + seat_lines + spec_lines + fixed_lines + tuple(
         "%s FRACTION-SOLVE %s %s" % (marker, label, describe_rank(f)) for f in fits
     )
     waves = pool_overflow_waves(env_d)
@@ -2623,7 +4726,8 @@ def plan_d_residency(
             else None
         )
         refusals = [
-            t for t in (refusal_text(fits, label=label), card_refusal, step_refusal) if t
+            t for t in (refusal_text(fits, label=label), card_refusal, step_refusal,
+                        owner_refusal) if t
         ]
         return DResidencyPlan(
             lines=lines + card_lines,
@@ -2631,6 +4735,11 @@ def plan_d_residency(
             fits=fits,
             card_fits=cards,
             overflow_waves=derived_waves,
+            solved_fractions=solved_fr,
+            kv_token_cut=solved_cut,
+            solved_owner_ratio=solved_owner,
+            owner_record=owner_record,
+            owned_scratch_raise=solved_raise,
         )
     card_lines, cards, card_refusal = _plan_d_card(
         fits=fits,
@@ -2652,9 +4761,11 @@ def plan_d_residency(
         act_dtype=act_dtype,
         seat_rb=seat_rb,
         seat_graph_mib=seat_graph_mib,
+        kv_token_cut=kv_token_shares is not None,
     )
     refusals = [
-        t for t in (refusal_text(fits, label=label), card_refusal, step_refusal) if t
+        t for t in (refusal_text(fits, label=label), card_refusal, step_refusal,
+                    owner_refusal) if t
     ]
     return DResidencyPlan(
         lines=lines + card_lines,
@@ -2662,6 +4773,11 @@ def plan_d_residency(
         fits=fits,
         card_fits=cards,
         overflow_waves=derived_waves,
+        solved_fractions=solved_fr,
+        kv_token_cut=solved_cut,
+        solved_owner_ratio=solved_owner,
+        owner_record=owner_record,
+        owned_scratch_raise=solved_raise,
     )
 
 
@@ -2806,6 +4922,37 @@ def _card_reference_for(
     return ref, ""
 
 
+def card_kv_cut_shift(
+    ref: DCardReference, fits: Sequence[DRankResidency]
+) -> Tuple[Optional[Tuple[float, ...]], str]:
+    """#239: die Karten-Verschiebung je Rang unter dem Token-Schnitt, MiB:
+    ``ref_tokens x ref_cell_r - kv_tokens_r x kv_cell_r`` (positiv = frei
+    gewordene KV). Exakt aus beiden Geometrien, nicht aus dem Anteil
+    geschaetzt: was auf dem Host bleibt (QSA-Schluessel, der Nicht-FA-Teil der
+    Zelle), hebt sich auf. ``(None, warum)``, wenn die Referenz ihre KV nicht
+    nennt -- dann bleibt die Karte, benannt."""
+    n = len(fits)
+    if int(ref.kv_tokens) <= 0 or len(ref.kv_cell_bytes) != n:
+        return None, (
+            "ENTFAELLT -- die Karten-Referenz %s nennt ihre KV nicht (Token %d, Zellen %s); "
+            "die Karte bleibt die Form-A-Messung, der Host bekommt KEINE Gutschrift"
+            % (ref.source, int(ref.kv_tokens), list(ref.kv_cell_bytes)))
+    shift = []
+    parts = []
+    for fit in fits:
+        r = fit.rank
+        ref_mib = float(ref.kv_tokens) * float(ref.kv_cell_bytes[r]) / MIB
+        run_mib = float(fit.kv_tokens) * float(fit.kv_cell_bytes) / MIB
+        shift.append(round(ref_mib - run_mib, 1))
+        parts.append("rang%d %d x %d B = %.0f -> %d x %d B = %.0f MiB (%+.0f)" % (
+            r, int(ref.kv_tokens), int(ref.kv_cell_bytes[r]), ref_mib, int(fit.kv_tokens),
+            int(fit.kv_cell_bytes), run_mib, ref_mib - run_mib))
+    return tuple(shift), (
+        "Referenz %s ist Form A (Host-KV im gemessenen Kopfraum); Kopfraum/Decode-frei je "
+        "Rang um Referenz-KV - KV dieses Boots verschoben: %s -- GERECHNET aus beiden "
+        "Geometrien" % (ref.source, "; ".join(parts)))
+
+
 def _plan_d_card(
     *,
     fits: Sequence[DRankResidency],
@@ -2825,10 +4972,17 @@ def _plan_d_card(
     act_dtype: Optional[str] = None,
     seat_rb: Optional[SeatRebook] = None,
     seat_graph_mib: Optional[Sequence[float]] = None,
+    kv_token_cut: bool = False,
 ) -> Tuple[Tuple[str, ...], Tuple[DCardFit, ...], Optional[str]]:
     """H33: die Karten-Bilanz neben der Budget-Bilanz. Eine unlesbare Referenz
     verweigert nicht, sie wird benannt (wie H8); verweigert wird nur aus einer
-    GERECHNETEN Bilanz."""
+    GERECHNETEN Bilanz.
+
+    #239 ``kv_token_cut``: die Referenz ist eine Form-A-Messung, ihr Kopfraum
+    traegt die KV des Hosts. Unter dem Token-Schnitt verschiebt sich jede
+    Karte exakt um (Referenz-KV - KV dieses Boots) = ref_tokens x ref_cell_r -
+    kv_tokens x kv_cell_r (:func:`card_kv_cut_shift`): der Host bekommt die
+    abgegebene Voll-Attention-KV gutgeschrieben, die Worker tragen ihre."""
     from sglang.srt.managers.corridor_guard import (
         NEAR_OOM_MIB,
         corridor_band_floor_mib,
@@ -2934,6 +5088,26 @@ def _plan_d_card(
             ),
         )
         shift_line = shift_line + seat_line
+    kv_shift, kv_line = card_kv_cut_shift(ref, fits)
+    # #239 S0: without a cut the cells still move -- a Form A worker of the
+    # pre-S0 card reference held QSA keys this boot does not build.
+    kv_moved = kv_shift is not None and any(abs(s) >= 0.05 for s in kv_shift)
+    if kv_token_cut or kv_moved:
+        if kv_shift is not None:
+            ref = msgspec.structs.replace(
+                ref,
+                headroom0_mib=tuple(
+                    round(h + s, 1) for h, s in zip(ref.headroom0_mib, kv_shift)
+                ),
+                peak_mib=tuple(round(pk - s, 1) for pk, s in zip(ref.peak_mib, kv_shift)),
+                free_decode0_mib=tuple(
+                    None if f is None else round(f + s, 1)
+                    for f, s in zip(ref.free_decode0_mib, kv_shift)
+                ),
+            )
+        shift_line = shift_line + ("%s KARTE %s %s: %s" % (
+            marker, label, "KV-SCHNITT (#239)" if kv_token_cut else "KV-ZELLE (#239 S0)",
+            kv_line),)
     floor = float(corridor_band_floor_mib())
     cards = solve_d_card(
         fits=fits,

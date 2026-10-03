@@ -43,6 +43,7 @@ from sglang.srt.models.mtp_vocab_share import (
 )
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.weg2.vision_d_guard import note_draft_mm_without_embeds
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -540,8 +541,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
+                and not note_draft_mm_without_embeds(input_embeds, forward_batch)
             ):
-                assert input_embeds is not None
                 last_indices = (
                     forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
                 ).long()

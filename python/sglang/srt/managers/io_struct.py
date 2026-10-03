@@ -1421,7 +1421,8 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
 
 
 class ClearHiCacheReqInput(BaseReq, kw_only=True):
-    pass
+    #: L3P: a persistent L3 store is only cleared with force (HiCacheFile.clear)
+    force: bool = False
 
 
 class ClearHiCacheReqOutput(BaseReq, kw_only=True):
@@ -1430,6 +1431,9 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    # z30j: PP0's stamp on the request chain; a follower waits for PP0's
+    # verdict on this seq instead of deciding the flush itself (weg2/flush_verdict.py).
+    weg2_flush_seq: Optional[int] = None
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
@@ -1637,6 +1641,10 @@ class Weg2ParkRunningReqInput(BaseReq, kw_only=True):
 
     epoch: int = 0
     reason: str = ""
+    #: ARRIVAL-SEAT (c): park ONLY this rid (the front's youngest running
+    #: decode) at the round boundary, in the SEAT-AGE pressure shape; empty =
+    #: park every running request (H91b).
+    youngest: str = ""
 
 
 class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
@@ -1651,6 +1659,28 @@ class Weg2ParkRunningReqOutput(BaseReq, kw_only=True):
     #: flight) is held behind it until the sleep -- the front counts its
     #: in-flight hand-offs as parked. False = the pre-H91c3 answer.
     late_hold: bool = False
+    #: #59b: {rid: the group-uniform depth each parked request resumes from}
+    #: (weg2_resumable_depth.park_depths); empty = nothing named, and the
+    #: front keeps its old price.
+    weg2_resumable_depth: Dict[str, int] = {}
+    #: SEQ-HASH (02.10.): {rid: "<depth>:<hash>"} of each parked request's whole
+    #: sequence up to its #59b depth -- filled by the tokenizer manager (it holds
+    #: prompt + output ids; the scheduler computes nothing for it).
+    weg2_seq_hash: Dict[str, str] = {}
+
+
+class Weg2ParkWindowReqInput(BaseReq, kw_only=True):
+    """PARK-WINDOW-GATE (29.09.): the front's open collect window, ``POST
+    /weg2/park_window`` to group D -- ``left_ms`` until the window's deadline
+    (``< 0`` clears it) and D's X-COST-LINE (``a_ms + (b_ms + c_ms * p_k) * n``).
+    No reply; D admits no extend whose forward ends after the deadline
+    (weg2/park_window_gate)."""
+
+    epoch: int = 0
+    left_ms: int = -1
+    a_ms: float = 0.0
+    b_ms: float = 0.0
+    c_ms: float = 0.0
 
 
 class PlePrefetchHintReqInput(BaseReq, kw_only=True):
@@ -1659,6 +1689,9 @@ class PlePrefetchHintReqInput(BaseReq, kw_only=True):
     PLE read of its first chunk now (no reply, a pure prefetch)."""
 
     input_ids: List[int] = []
+    #: 02.10.: the front's store span of this request (where P's first chunk
+    #: will start, before P's page floor); -1 = unknown (tail window)
+    start_hint: int = -1
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
@@ -2025,6 +2058,10 @@ class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
     #: The rank and card that took longest in this leg, as a printable note --
     #: the critical path of L5.  Same collective, same denominator.
     critical_path: Optional[str] = None
+    #: ANCHOR-LOST: token depths of the Mamba anchors this sleep's flush
+    #: dropped (device only, no host copy), union over the group's ranks.
+    #: The front stops crediting presence at them.  None = nothing lost.
+    anchors_lost: Optional[List[int]] = None
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
@@ -2050,6 +2087,21 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # (weg2/d_seats.phase_seats). None on every other resume.
     handoff_n: Optional[int] = None
     parked_n: Optional[int] = None
+    # #251c: the KV tokens the phase's requests hold when D wakes (handed-off
+    # plus resumed-first parked, the front's own count); D's KV stage is the
+    # smallest that holds it (weg2/d_seat_vram.choose_stage). Same object on
+    # every rank. None on every other resume and from a front without stages.
+    phase_kv_tokens: Optional[int] = None
+    # #244 SEAT-ROTATE: wait-bound-parked rids D does NOT resume first this
+    # phase (the front gives their seats to requests waiting past the bound);
+    # D treats them as ordinary waiting work (weg2/d_park_runtime). Same object
+    # on every rank. None on every other resume.
+    park_defer_rids: Optional[List[str]] = None
+    # FLIPCYCLE H6 (02.10.): the front sends kv_cache WITH the weights family on
+    # the waker's leg and asks for the LATE site (after the legs) -- never the
+    # early resume before them (xsn315/317/318: barlink lost its peer mapping
+    # under a kv region remapped before the legs). None on every other resume.
+    kv_late: Optional[bool] = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):

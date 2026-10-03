@@ -1659,6 +1659,26 @@ def a2a_rounds(largest_block: int, slot: int) -> int:
 
 
 
+CANON_ORDER_ENV = "SGLANG_BARLINK_BAR1_CANON_ORDER"
+
+
+def canon_order_on() -> bool:
+    """SGLANG_BARLINK_BAR1_CANON_ORDER: an explicitly set value decides as
+    always (anything but 0/no/off/false arms); unset or blank takes the
+    published form's profile default (27B row 24h,
+    ``ModelProfile.d_hostgap_levers``: qwen27b on, nextflash off; no form:
+    off). Rank-uniform: every rank of a group inherits the same form env."""
+    raw = os.environ.get(CANON_ORDER_ENV, "")
+    if raw.strip():
+        return raw not in ("0", "no", "off", "false")
+    try:
+        from sglang.srt.weg2.form import profile_switch_default
+
+        return bool(profile_switch_default(CANON_ORDER_ENV, False))
+    except Exception:  # noqa: BLE001 -- no form module: the code default off
+        return False
+
+
 def bar1_algo_code(algo: str, canon_order: bool = False) -> int:
     """The ``algo`` integer ``bar1_all_reduce`` takes: 0 mesh, 1 ring,
     2 oneshot, 3 oneshot in canonical rank order
@@ -2201,9 +2221,7 @@ class BarlinkBar1Transport:
         #: ranks. 1 = every rank sums in rank order 0..R-1 (kernel
         #: reduceNPhaseCanon; same reads, no extra barrier). Default off =
         #: the old order. Rank-uniform (must be set on every rank alike).
-        self.canon_order = os.environ.get(
-            "SGLANG_BARLINK_BAR1_CANON_ORDER", ""
-        ) not in ("", "0", "no", "off", "false")
+        self.canon_order = canon_order_on()
         if self.canon_order:
             logger.info(
                 "barlink-BAR1: oneshot all_reduce in canonical rank order "

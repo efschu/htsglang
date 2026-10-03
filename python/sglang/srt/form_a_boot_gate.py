@@ -47,6 +47,7 @@ def declare_layer_collectives(
     host_dense_is_unsharded: bool,
     host_uses_moe_exchange: bool,
     moe_input_carrier: Optional[str] = None,
+    form_a_dcp_merge: Optional[str] = None,
 ) -> List[CollectiveOp]:
     """What THIS rank will issue for one decoder layer.
 
@@ -70,6 +71,7 @@ def declare_layer_collectives(
         host_uses_moe_exchange=host_uses_moe_exchange,
         host_dense_is_unsharded=host_dense_is_unsharded,
         moe_input_carrier=moe_input_carrier,
+        form_a_dcp_merge=form_a_dcp_merge,
     )
     return trace.ops
 
@@ -133,6 +135,7 @@ def gate_form_a_boot(
     host_uses_moe_exchange: bool,
     attention_every: int = 4,
     moe_input_carrier: Optional[str] = None,
+    form_a_dcp_merge: Optional[str] = None,
 ) -> None:
     """The whole gate: both layer shapes, checked once, before forward one.
 
@@ -160,5 +163,6 @@ def gate_form_a_boot(
             host_dense_is_unsharded=host_dense_is_unsharded,
             host_uses_moe_exchange=host_uses_moe_exchange,
             moe_input_carrier=moe_input_carrier,
+            form_a_dcp_merge=form_a_dcp_merge,
         )
         assert_ranks_agree(plan, rank, ops, gather)

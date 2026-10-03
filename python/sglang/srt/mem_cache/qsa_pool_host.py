@@ -26,6 +26,8 @@ the last writer would win.
 
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Sequence
 
 import torch
@@ -35,6 +37,8 @@ from sglang.srt.mem_cache.canonical_page_store import (
     CanonicalPageError,
 )
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+logger = logging.getLogger(__name__)
 
 
 def qsa_index_bytes_per_token(device_pools, page_size: int) -> int:
@@ -136,7 +140,129 @@ class QSAPagedHostPool(DeepSeekV4PagedHostPool):
         if present and host_indices.numel() % self.slot_page_size:
             # Partial groups would need ring state; restored prefixes end on pages.
             raise ValueError("QSA HiCache transfers must contain complete KV pages")
+        if present and not self._host_rows_in_range(host_indices):
+            return False
         return present
+
+    #: H106 (rc12z15): transfers a Form A worker skipped, and their pages
+    _formA_skip_n = 0
+    _formA_skip_pages = 0
+
+    #: H106b: the transfer the skip lines are folded into (one merged load or
+    #: backup -- ``CacheOperation.merge_ops`` joins the requests, so no rid is
+    #: visible here; the ``#988 LOADBACK rid=`` line of the same pass names it)
+    _h106_open = None
+    _h106_suppressed = 0
+    _h106_transfers = 0
+    #: a periodic line after this many folded calls
+    H106_PERIODIC = 256
+    #: PA review of 1bab093912: the load thread and the backup thread both
+    #: reach the skip; the open transfer and every counter change under this
+    #: lock, and the direction is the calling thread's own
+    _h106_lock = threading.Lock()
+    _h106_tls = threading.local()
+
+    def load_to_device_per_layer(self, *args, **kwargs):
+        QSAPagedHostPool._h106_tls.dir = "load"
+        return super().load_to_device_per_layer(*args, **kwargs)
+
+    def backup_from_device_all_layer(self, *args, **kwargs):
+        QSAPagedHostPool._h106_tls.dir = "backup"
+        return super().backup_from_device_all_layer(*args, **kwargs)
+
+    def backup_from_device_indices(self, *args, **kwargs):
+        QSAPagedHostPool._h106_tls.dir = "backup"
+        return super().backup_from_device_indices(*args, **kwargs)
+
+    def _h106_note_skip(self, pages: int, hi: int, lo: int) -> None:
+        """H106b (rc12z17, 10:50:22Z): one line per skipped TRANSFER and
+        direction, not per layer call -- the load path calls this pool once per
+        layer with the same ids (dozens of lines in one second). A call with
+        the same (direction, first id, pages) as the open transfer is folded
+        into it; a new one prints its line with the previous transfer's sums
+        (calls, pages_total); every H106_PERIODIC folded calls a counter line
+        with suppressed_since_last_print. The key carries the pool: two
+        sidecar pools skipping the same ids are two transfers (PA review)."""
+        cls = QSAPagedHostPool
+        d = getattr(cls._h106_tls, "dir", "?")
+        key = (self.pool_name, d, int(lo), int(pages))
+        with cls._h106_lock:
+            cls._formA_skip_n += 1
+            cls._formA_skip_pages += int(pages)
+            cur = cls._h106_open
+            if cur is not None and cur["key"] == key:
+                cur["calls"] += 1
+                cur["pages_total"] += int(pages)
+                cls._h106_suppressed += 1
+                if cls._h106_suppressed % cls.H106_PERIODIC == 0:
+                    logger.warning(
+                        "H106 FORM-A SIDECAR SKIP (periodic) pool=%s dir=%s transfers=%d "
+                        "skipped_calls=%d pages_total=%d suppressed_since_last_print=%d",
+                        self.pool_name, d, cls._h106_transfers, cls._formA_skip_n,
+                        cls._formA_skip_pages, cls.H106_PERIODIC,
+                    )
+                return
+            prev = ""
+            if cur is not None:
+                prev = " prev(dir=%s calls=%d pages_total=%d)" % (
+                    cur["key"][1], cur["calls"], cur["pages_total"])
+            cls._h106_open = {"key": key, "calls": 1, "pages_total": int(pages)}
+            cls._h106_transfers += 1
+            transfers, skip_n, skip_pages = (
+                cls._h106_transfers, cls._formA_skip_n, cls._formA_skip_pages)
+        logger.warning(
+            "H106 FORM-A SIDECAR SKIP pool=%s dir=%s pages=%d host_page_max=%d "
+            "host_pages=%d min_id=%d transfer=%d%s (skipped_calls=%d "
+            "pages_total=%d; further calls of this transfer are folded): the "
+            "byteless KV anchor grew its ids (#249), this pool did not; a Form A "
+            "worker never reads its QSA rows, so nothing is transferred.",
+            self.pool_name, d, int(pages), int(hi), int(self.num_host_pages), int(lo),
+            transfers, prev, skip_n, skip_pages,
+        )
+
+    def _host_rows_in_range(self, host_indices) -> bool:
+        """H106 (rc12z15 f49f7bddd2, D 10:22:39, TP1+TP2 at once): the KV
+        anchor of a Form A worker is BYTELESS and, under #249 (9996780367),
+        grows its id space past the synced size instead of refusing -- rc12z15
+        ``#249 BYTELESS-GROW pool=MHATokenToKVPoolHost rows 353600 -> 373504``
+        at the wake that read six held prompts (63360 + 17536 + 105664 +
+        17664 + 63488 + 105792 = 373504 ids). This pool is addressed by the
+        KV's ids (``indices_from_pool=KV``) but was sized ONCE from the KV's
+        size at assembly (5525 pages = 353600 ids) with real 4 KiB rows and
+        does not grow: the tail of weg2-0-4 named page >= 5525, the host slice
+        came back EMPTY and ``transfer_kv_direct`` died on ``output with shape
+        [1, 4096] doesn't match the broadcast shape [0, 4096]`` (the kernel
+        branches would have written past the pinned buffer instead).
+
+        A Form A worker runs no dense chain (``form_a_worker_forward``: the
+        host alone holds attention, the QSA indexer and KV; the worker's KV
+        pool is 0 B and its storage tier the null backend), so its QSA rows
+        are never read: an out-of-range transfer there is skipped by name.
+        On any other rank the same shape would be a wrong index for real
+        bytes -- a named stop, never a silent skip. Per-rank local copy, no
+        collective on this path, so skipping changes no group sequence."""
+        try:
+            if host_indices.numel() == 0:
+                return True
+            hi = int(host_indices.max()) // int(self.slot_page_size)
+            lo = int(host_indices.min())
+        except Exception:  # noqa: BLE001 - an index we cannot read is left to the kernel
+            return True
+        if lo >= 0 and hi < int(self.num_host_pages):
+            return True
+        from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+        pages = int(host_indices.numel()) // int(self.slot_page_size)
+        if this_rank_is_form_a_worker():
+            self._h106_note_skip(pages, hi, lo)
+            return False
+        raise RuntimeError(
+            f"H106 SIDECAR HOST INDEX OUT OF RANGE pool={self.pool_name} "
+            f"host_page_max={hi} host_pages={int(self.num_host_pages)} min_id={lo} "
+            f"pages={pages}: this rank holds real QSA bytes and a KV id names a "
+            "row this pool does not have -- copying it would be a wrong index for "
+            "the attention; stopping by name instead."
+        )
 
 
 def build_qsa_index_window(

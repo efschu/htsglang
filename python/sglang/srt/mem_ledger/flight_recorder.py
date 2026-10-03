@@ -236,6 +236,15 @@ BOOT_PHASES: Tuple[Tuple[str, str], ...] = (
 )
 
 
+#: VRAM-Vertrag M2 (§3.4 "nach Laden, nach KV, nach Capture"): the boot posts
+#: :func:`mark` forwards to the RankState ``vram`` block. ``pre_weight_load``
+#: freezes the CUDA-context baseline (context + NCCL, nothing loaded yet);
+#: ``boot_complete`` is the first mark with every runner of the process up.
+VRAM_ACTUAL_PHASES = frozenset(
+    {"pre_weight_load", "weights_loaded", "kv_pool_sized", "capture_end", "boot_complete"}
+)
+
+
 # ---------------------------------------------------------------------------
 # Source 2: process-start allocation recording
 # ---------------------------------------------------------------------------
@@ -747,7 +756,16 @@ def mark(
     Appended, never rewritten: a rank that dies at graph capture must still
     leave behind every boundary it did reach. That is the difference between a
     flight recorder and a report.
+
+    VRAM-Vertrag M2: the boot posts in :data:`VRAM_ACTUAL_PHASES` also reach
+    the rank's RankState ``vram`` block (weg2/vram_actual.py) -- armed by
+    SGLANG_WEG2_VRAM_ACTUAL, independent of :data:`DIR_ENV`, which no weg2
+    arm sets.
     """
+    if phase in VRAM_ACTUAL_PHASES:
+        from sglang.srt.weg2 import vram_actual
+
+        vram_actual.on_mark(str(phase))
     directory = directory or os.environ.get(DIR_ENV)
     if not directory:
         return None

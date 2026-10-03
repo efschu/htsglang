@@ -212,11 +212,15 @@ _AR_CENSUS_BROKEN = False
 class RoundAcc:
     """One round's folded brackets, before it is readable."""
 
-    __slots__ = ("round_id", "bs", "rows", "spans", "categories", "wall")
+    __slots__ = ("round_id", "bs", "rows", "spans", "categories", "wall", "depth")
 
-    def __init__(self, round_id: int, bs: int, rows: int) -> None:
+    def __init__(self, round_id: int, bs: int, rows: int,
+                 depth: Optional[Tuple[int, int, int]] = None) -> None:
         self.round_id = int(round_id)
         self.bs = int(bs)
+        #: #239 S3f: (min, median, max) KV length of the running requests,
+        #: or None (SGLANG_DEBUG_DECODE_ROUND_DEPTH off).
+        self.depth = depth
         #: Rows SUBMITTED this round, never rows accepted. See the module
         #: docstring's join-key section for why the distinction is load
         #: bearing against the ladder's completion count.
@@ -243,8 +247,12 @@ class DecodeRoundLog:
     MAX_PENDING_ROUNDS: int = 64
 
     def __init__(self, clock=None, rank: int = 0) -> None:
+        from sglang.srt.environ import envs
+
         self.clock = clock
         self.rank = int(rank)
+        #: #239 S3f: price every round's request depth (host lists only)
+        self.depth_on = bool(envs.SGLANG_DEBUG_DECODE_ROUND_DEPTH.get())
         #: Set by the scheduler at the round boundary; read by every bracket
         #: opened inside that round. ``None`` = not in a decode round, and
         #: every bracket is then a no-op, which is how prefill forwards and
@@ -265,6 +273,21 @@ class DecodeRoundLog:
         self.last_compute_ms: Optional[float] = None
         self.last_split_known: bool = False
         self.last_seq: int = 0
+        #: RANKSTATS §3 (DASHBOARD-AUS-IPC, 29.09.): emitted rounds and their
+        #: gpu-ms, summed and never reset, total and per batch size
+        #: ``{bs: [rounds, gpu_ms]}``. Written after the line in ``_emit``;
+        #: the rankstats timer thread only reads them (D1/C3 from the IPC).
+        self.cum_rounds: int = 0
+        self.cum_gpu_ms: float = 0.0
+        self.cum_by_bs: dict = {}
+        #: DASHBOARD-AUS-IPC (30.09., Inventar FEHLT 6): the batch size of the
+        #: last emitted round (None before the first) -- the decode tile's bs
+        self.last_bs = None
+        #: FLIPZEIT (02.10., user definition D>P = end of the last D decode round
+        #: -> first P prefill chunk): the wall-clock END of the last round, the
+        #: same base as rankstats prefill.last.t (time.time()) -- round open
+        #: (``acc.wall``, the 't:' of the Decode rank batch line) + its gpu-ms.
+        self.last_end_t = None
         #: fnFL2 H23: DECODE-ROUND-COST for the first rounds after a Weg-2
         #: wake. Inert until ``arm_wake_census``.
         self.wake_census = WakeRoundCensus(rank=self.rank)
@@ -286,7 +309,17 @@ class DecodeRoundLog:
 
     # -- round boundary --------------------------------------------------
 
-    def begin_round(self, round_id: int, bs: int, rows: int) -> None:
+    @staticmethod
+    def round_depth(kv_lens: List[int]) -> Optional[Tuple[int, int, int]]:
+        """#239 S3f: ``(min, median, max)`` of the running requests' KV
+        lengths, or None for an empty batch."""
+        if not kv_lens:
+            return None
+        s = sorted(int(x) for x in kv_lens)
+        return s[0], s[len(s) // 2], s[-1]
+
+    def begin_round(self, round_id: int, bs: int, rows: int,
+                    depth: Optional[Tuple[int, int, int]] = None) -> None:
         """Open round ``round_id`` and read whatever earlier rounds are ready.
 
         The flush happens BEFORE the new round is opened, so the reading of
@@ -303,7 +336,7 @@ class DecodeRoundLog:
         self.host_split.on_round_open(round_id=round_id, mono=t0 / 1e9)
         self._retire_open()
         self.flush()
-        self._open = RoundAcc(round_id, bs, rows)
+        self._open = RoundAcc(round_id, bs, rows, depth)
         self.round_id = int(round_id)
         self._overhead_ns += time.perf_counter_ns() - t0
 
@@ -420,6 +453,44 @@ class DecodeRoundLog:
             self._pending.pop(round_id)
             self._emit(acc, results)
 
+    #: DP-NACHLAUF 02.10. (N6i f501e462d0, 27B D): rounds 285-331 (18:14:46-47)
+    #: reached the log only at 18:15:28, after the NEXT wake -- flush() is
+    #: query-only, the last rounds' events were not yet readable at the last
+    #: idle flush, and a sleeping group runs no more rounds or idle ticks.
+    #: drain_blocking() is called at the head of the sleep leg (the group is
+    #: quiesced, so the device sync costs nothing): retire the open round,
+    #: wait for the device, emit everything pending. Unset = on; 0/false/no/
+    #: off = no drain (the lines follow at the next activity, as before).
+    DRAIN_AT_SLEEP_ENV = "SGLANG_WEG2_DECODE_LOG_DRAIN_AT_SLEEP"
+
+    def drain_blocking(self, sync=None) -> int:
+        """Emit every pending round now; returns how many were emitted."""
+        import os as _os
+
+        if str(_os.environ.get(self.DRAIN_AT_SLEEP_ENV, "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+            return 0
+        self._retire_open()
+        if not self._pending:
+            return 0
+        before = len(self._pending)
+        if sync is None:
+            try:
+                import torch
+
+                sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+            except Exception:  # noqa: BLE001
+                sync = lambda: None  # noqa: E731
+        try:
+            sync()
+        except Exception:  # noqa: BLE001 -- the drain never breaks the sleep
+            pass
+        self.flush()
+        n = before - len(self._pending)
+        if n:
+            logger.info("DECODE-ROUND-LOG drained n=%d left=%d at=sleep (%s=0 restores the lazy flush)",
+                        n, len(self._pending), self.DRAIN_AT_SLEEP_ENV)
+        return n
+
     def _snapshot_pending(self) -> None:
         """#1302. Take the reading of every round that cannot be READ yet.
 
@@ -520,6 +591,9 @@ class DecodeRoundLog:
                 graphed_fwd,
                 len(results),
             ]
+        if acc.depth is not None:
+            line += ", depth: %d/%d/%d"
+            args += list(acc.depth)
         logger.info(line, *args)
 
         self.last_round_ms = round_ms
@@ -529,12 +603,26 @@ class DecodeRoundLog:
         if split_known:
             self.last_seq += 1
 
+        self.last_end_t = float(acc.wall) + round_ms / 1000.0
         self._overhead_rounds += 1
         self._overhead_gpu_ms += round_ms
+        self.cum_rounds += 1
+        self.cum_gpu_ms += round_ms
+        self.last_bs = acc.bs
+        slot_bs = self.cum_by_bs.get(acc.bs)
+        if slot_bs is None:
+            self.cum_by_bs[acc.bs] = [1, round_ms]
+        else:
+            slot_bs[0] += 1
+            slot_bs[1] += round_ms
         if split_known and family_acc:
             # fnFL2 H28: BARLINK-ROUND-CENSUS every N rounds; no-op unless
             # SGLANG_WEG2_AR_ROUND_CENSUS.
             _ar_round_census(self.rank, family_acc)
+            # #239 S3f PR (30.09.): a decode round no longer feeds the miss
+            # record -- its sync-window misses cannot be told from graphed
+            # rounds'; the record pairs timed prefill forwards
+            # (layers.moe.pool_miss_cost.note_paired).
         if self.wake_census.armed:
             self.wake_census.on_round(
                 round_id=acc.round_id,

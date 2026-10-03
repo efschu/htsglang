@@ -98,8 +98,17 @@ def trace_layer(
     host_uses_moe_exchange: bool,
     host_dense_is_unsharded: bool,
     moe_input_carrier: Optional[str] = None,
+    form_a_dcp_merge: Optional[str] = None,
 ) -> None:
     """Model ONE decoder layer's collectives for one rank.
+
+    #239 S3c, a fifth switch: `form_a_dcp_merge` ("ar" | "a2a", None = no
+    token cut). Under Form A x the token cut every rank owns a token range of
+    the full-attention KV, so an attention layer issues -- on EVERY rank, in
+    this order, before the MoE carrier -- A (k/v gather), T (top-k gather),
+    Q (q gather) and M (the LSE merge, all-reduce or all-to-all by
+    SGLANG_DCP_LSE_MERGE). Declared in the attending shape (decode / verify);
+    an extend without prefix stops after A on every rank alike.
 
     FOUR switches now. The fourth, `moe_input_carrier`, is the slice-6a
     worker-forward finding: see `FormAWorkerWithoutMoeInput`. It is one op
@@ -146,6 +155,21 @@ def trace_layer(
             trace.issue("all_reduce", f"layer{layer_id}.o_proj", "hidden")
         else:
             trace.issue("all_reduce", f"layer{layer_id}.linear_attn", "hidden")
+
+    # #239 S3c: the full-attention step of the token cut, on every rank.
+    if form_a_dcp_merge is not None and is_attention_layer:
+        if form_a_dcp_merge not in ("ar", "a2a"):
+            raise ValueError(
+                f"form_a_dcp_merge={form_a_dcp_merge!r}; the LSE merge is 'ar' or 'a2a'"
+            )
+        trace.issue("all_gather", f"layer{layer_id}.dcp_kv", "kv")
+        trace.issue("all_gather", f"layer{layer_id}.dcp_topk", "topk")
+        trace.issue("all_gather", f"layer{layer_id}.dcp_q", "q")
+        trace.issue(
+            "all_to_all" if form_a_dcp_merge == "a2a" else "all_reduce",
+            f"layer{layer_id}.dcp_lse",
+            "lse",
+        )
 
     # The MoE INPUT carrier. Every rank is here: the host publishes its
     # value, a worker contributes zeros (an all-reduce whose other addends

@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.name_compat import tolerant_compile
@@ -384,8 +384,259 @@ def search_order(order: Sequence[str], cards: Sequence[WakeCard], *,
     return cur + tail, run, moves
 
 
+def _greedy_order(order: Sequence[str], cards: Sequence[WakeCard], *,
+                  pinned_tail: Sequence[str] = PINNED_TAIL,
+                  **sim) -> Tuple[Optional[List[str]], Optional[WakeRun], str]:
+    """Der gierige Praefix-Bau von :func:`credit_order`: ``(ordnung, lauf, "")``
+    wenn die fertige Ordnung VOLL durchlaeuft, sonst ``(None, None, warum)``."""
+    order = list(order)
+    tail = [t for t in order if t in set(pinned_tail)]
+    prefix: List[str] = []
+    rest = [t for t in order if t not in set(pinned_tail)]
+    while rest:
+        pick = None
+        for cand in rest:
+            if simulate(prefix + [cand], cards, **sim).complete:
+                pick = cand
+                break
+        if pick is None:
+            return None, None, ("credit order: NO order funds the wake (stuck after %s of %d "
+                                "tags) -- given order kept" % (len(prefix), len(order)))
+        prefix.append(pick)
+        rest.remove(pick)
+    prefix += tail
+    full = simulate(prefix, cards, **sim)
+    if full.complete:
+        return prefix, full, ""
+    return None, None, ("credit order: the greedy order %s still ends in a cycle under "
+                        "run-ahead staging -- given order kept" % prefix)
+
+
+#: LEAST-DEFICIT (02.10., NF y6u D->P 2->3 / 4->5): the uniform free uplift
+#: per card, in MiB, at which :func:`least_deficit_order` asks again whether
+#: SOME order is funded. A question to the model, never a reservation: the
+#: uplift is not booked anywhere and the order is all that leaves.
+LEAST_DEFICIT_UPLIFT_MIB = (256, 512, 1024, 1536, 2048, 3072, 4096)
+
+
+def least_deficit_order(order: Sequence[str], cards: Sequence[WakeCard], *,
+                        pinned_tail: Sequence[str] = PINNED_TAIL,
+                        uplifts: Sequence[float] = LEAST_DEFICIT_UPLIFT_MIB,
+                        **sim) -> Optional[Tuple[List[str], float]]:
+    """Wenn KEINE Ordnung am gemessenen ``free`` traegt: die Ordnung, die mit
+    dem kleinsten gleichmaessigen Aufschlag je Karte traegt -- oder None.
+
+    y6u (01.10. 23:47:31Z, driver_free {0: 1281, 1: 2212, 2: 1269}): der
+    gierige Bau fand am gemessenen free nichts, die gegebene Ordnung blieb
+    stehen -- und lief auf dem Metall genau in ihren Zyklus (sleeper1
+    weights_15 -> waker2, sleeper2 weights_11 -> waker1; W109b-Spill nach
+    1,5-1,9 s Deposit-Stall). Das Modell ist dort pessimistisch (die
+    Tag-Tabelle des Planers kennt die Groesse der D-Tags vom Boot-Anfang,
+    nicht die gewachsene, siehe ``front_order``), also ist "keine traegt"
+    keine Aussage ueber das Metall -- wohl aber, WELCHE Ordnung dem Tragen am
+    naechsten ist: die gegebene erst ab +2048..3072 MiB, die umgestellte ab
+    +512. Diese Funktion gibt die Ordnung zurueck, die am frueheren Aufschlag
+    traegt; traegt die GEGEBENE an derselben Stufe, bleibt sie (die bewiesene
+    Form behaelt ihren Pfad), ebenso wenn bis zur letzten Stufe keine traegt.
+    Rueckgabe ``(ordnung, aufschlag_mib)``."""
+    order = list(order)
+    for up in uplifts:
+        lifted = [replace(wc, free_mib=float(wc.free_mib) + float(up)) for wc in cards]
+        if simulate(order, lifted, **sim).complete:
+            return None
+        found, _run, _why = _greedy_order(order, lifted, pinned_tail=pinned_tail, **sim)
+        if found is not None:
+            return (found, float(up)) if found != order else None
+    return None
+
+
+#: Marker der Lockstep-Ordnung (NF y7o, 02.10.), EIN Token fuer ``grep -c``.
+LEG_ORDER_MARKER = "WEG2-LEG-ORDER"
+
+
+def first_claim(order: Sequence[str], wc: WakeCard) -> Optional[int]:
+    """Position des ersten Tags, den der Waker dieser Karte braucht (None = keiner)."""
+    for k, t in enumerate(order):
+        if float(wc.demand_mib.get(t, 0.0) or 0.0) > 0.0:
+            return k
+    return None
+
+
+def lockstep_offer(order: Sequence[str], cards: Sequence[WakeCard], card: int, k: int, *,
+                   depth: int = STAGING_DEPTH, double_staging: bool = False,
+                   **_sim) -> Tuple[float, float, List[str]]:
+    """Was das Gate der Karte ``card`` an Position ``k`` bietet, wenn NUR die
+    Pausen zaehlen, die nicht auf diesen Claim warten koennen.
+
+    NF y7o (02.10. 14:06:19-20, D->P ep3/9/11/13): PP2's erster Tag
+    ``weights_14`` (4014 MiB) stand an Position 3; D TP2 hatte bis dahin
+    ``weights_0/9/1/14`` pausiert (4292 MiB publiziert, 406 MiB Staging
+    gebucht -> Saldo 3885, 128 zu wenig), der Kartenweg brauchte free >= 4014
+    + 858. Die NAECHSTE Pause von TP2 (``weights_10``, Deposit zu PP1 auf
+    Karte 0) hing an PP1's Grant, PP1 an TP1, TP1 am Deposit von
+    ``weights_14`` zu PP2 -- ein Konvoi ueber drei Raenge, 0,9-1,3 s je
+    erster Claim. ``simulate`` sieht das nicht als Fehler (der Fixpunkt
+    laeuft durch), nur als Wartezeit.
+
+    Gezaehlt werden die Pausen des co-lokierten Schlaefers an Positionen
+    ``< k`` und die an ``k`` selbst, wenn der Tag NUR Eigentuemer auf dieser
+    Karte hat (On-card-Staging endet ohne Kollektor). Staging und Gate wie
+    :func:`simulate`. Rueckgabe ``(angebot, bedarf, pausiert_davor)``."""
+    by = {wc.card: wc for wc in cards}
+    wc = by[int(card)]
+    # Tags der Release-Tabelle, die NICHT in der Ordnung stehen (NF: D TP0's
+    # ``weights_draft``, 1556 MiB), gibt der Schlaefer vor dem Familien-Loop
+    # frei (DRAFT-PARK) -- y7o PP0 ``weights_0``: ``published=1556`` vor der
+    # ersten Familien-Pause. Sie decken also jeden Claim.
+    in_order = set(order)
+    pre = [t for t, v in wc.release_mib.items()
+           if t not in in_order and float(v or 0.0) > 0.0]
+    freed = sum(float(wc.release_mib[t]) for t in pre)
+    consumed = 0.0
+    ring: List[float] = []
+    paused: List[str] = list(pre)
+    for j in range(int(k) + 1):
+        t = order[j]
+        own = _owners(cards, t)
+        if wc.card in own:
+            b = float(wc.oncard_mib.get(t, 0.0) or 0.0)
+            if b > 0.0:
+                ring.append(b)
+        rel = float(wc.release_mib.get(t, 0.0) or 0.0)
+        if j < int(k):
+            consumed += float(wc.demand_mib.get(t, 0.0) or 0.0)
+            if rel > 0.0:
+                freed += rel
+                paused.append(t)
+        elif rel > 0.0 and all(o == wc.card for o in own):
+            freed += rel
+            paused.append(t)
+    st = sum(sorted(ring, reverse=True)[:depth])
+    counter = freed - consumed - st
+    alloc = wc.free_mib + counter - wc.floor_mib
+    offer = max(min(counter, alloc), alloc - (st if double_staging else 0.0))
+    return offer, float(wc.demand_mib.get(order[int(k)], 0.0) or 0.0), paused
+
+
+def short_claims(order: Sequence[str], cards: Sequence[WakeCard],
+                 **sim) -> List[Tuple[int, int, str, float, float]]:
+    """Alle Claims, die :func:`lockstep_offer` NICHT deckt:
+    ``(position, karte, tag, angebot, bedarf)``, nach Position."""
+    out = []
+    for wc in cards:
+        for k, t in enumerate(order):
+            if float(wc.demand_mib.get(t, 0.0) or 0.0) <= 0.0:
+                continue
+            offer, need, _p = lockstep_offer(order, cards, wc.card, k, **sim)
+            if offer + 1e-9 < need:
+                out.append((k, wc.card, t, offer, need))
+    return sorted(out)
+
+
+def _deficits(order: Sequence[str], cards: Sequence[WakeCard], **sim) -> Dict[Tuple[int, str], float]:
+    """``(karte, tag) -> Fehlbetrag`` jedes Claims (0 = gedeckt)."""
+    out: Dict[Tuple[int, str], float] = {}
+    for wc in cards:
+        for k, t in enumerate(order):
+            if float(wc.demand_mib.get(t, 0.0) or 0.0) <= 0.0:
+                continue
+            offer, need, _p = lockstep_offer(order, cards, wc.card, k, **sim)
+            out[(wc.card, t)] = max(0.0, need - offer)
+    return out
+
+
+#: Hoechstens so viele Einzelzuege je Flip (je Karte hoechstens einer reicht
+#: fuer den ersten Claim; die Schranke haelt die Front-Rechnung kurz).
+LOCKSTEP_ROUNDS = 6
+
+
+def lockstep_claims(order: Sequence[str], cards: Sequence[WakeCard], *,
+                    pinned_tail: Sequence[str] = PINNED_TAIL,
+                    rounds: int = LOCKSTEP_ROUNDS,
+                    **sim) -> Tuple[List[str], List[str]]:
+    """Der ERSTE Claim jedes Wakers steht hinter den Pausen, die ihn decken
+    (NF y7o, Konvoi -- siehe :func:`lockstep_offer`).
+
+    Fuer jede Karte, deren erster Claim nach :func:`lockstep_offer` nicht
+    gedeckt ist, der kleinste Einzelzug (ein Tag an eine andere Stelle, der
+    Basis-Tag bleibt hinten), nach dem er gedeckt ist -- genommen nur, wenn
+    KEIN Claim irgendeiner Karte dabei einen groesseren Fehlbetrag bekommt
+    und :func:`simulate` nicht schlechter wird (eine durchlaufende Ordnung
+    bleibt durchlaufend). Der Zug kann den Claim nach hinten schieben oder
+    einen Tag, dessen Pause ihn deckt, vor ihn ziehen; welcher, entscheidet
+    allein die kleinste Verschiebung. Kein Byte Reserve, kein Deckel, kein
+    Floor-Abzug: nur die Reihenfolge. Rueckgabe ``(ordnung, notizen)``; eine
+    Ordnung mit gedeckten ersten Claims kommt UNVERAENDERT zurueck."""
+    pinned = set(pinned_tail)
+    tail = [t for t in order if t in pinned]
+    cur = [t for t in order if t not in pinned]
+    base = simulate(cur + tail, cards, **sim)
+    notes: List[str] = []
+    for _ in range(max(0, int(rounds))):
+        defs = _deficits(cur + tail, cards, **sim)
+        target = None
+        for wc in sorted(cards, key=lambda w: (first_claim(cur, w) or 0, w.card)):
+            k = first_claim(cur, wc)
+            if k is not None and defs.get((wc.card, cur[k]), 0.0) > 1e-9:
+                target = (wc, cur[k])
+                break
+        if target is None:
+            break
+        wc, t = target
+        cands = []
+        for i in range(len(cur)):
+            for j in range(len(cur)):
+                if i != j:
+                    cands.append((abs(i - j), i, j))
+        taken = None
+        for _d, i, j in sorted(cands):
+            cand = list(cur)
+            cand.insert(j, cand.pop(i))
+            k2 = first_claim(cand, wc)
+            if k2 is None or cand[k2] != t:
+                continue
+            offer, need, paused = lockstep_offer(cand + tail, cards, wc.card, k2, **sim)
+            if offer + 1e-9 < need:
+                continue
+            d2 = _deficits(cand + tail, cards, **sim)
+            if any(v > defs.get(key, 0.0) + 1e-6 for key, v in d2.items()):
+                continue
+            run = simulate(cand + tail, cards, **sim)
+            if base.complete and not run.complete:
+                continue
+            taken = (i, j, cand, run, offer, need, paused)
+            break
+        if taken is None:
+            notes.append("card%d first_claim=%s SHORT %.0f MiB: no single move funds it without "
+                         "a larger deficit elsewhere -- kept" % (wc.card, t, defs[(wc.card, t)]))
+            break
+        i, j, cand, run, offer, need, paused = taken
+        notes.append("card%d first_claim=%s: %s %d->%d (offer %.0f >= need %.0f after %s)"
+                     % (wc.card, t, cur[i], i, j, offer, need, ",".join(paused)))
+        cur, base = cand, run
+    return cur + tail, notes
+
+
+def leg_order_lines(order: Sequence[str], cards: Sequence[WakeCard], **sim) -> List[str]:
+    """Je Karte EINE Zeile: der erste Claim des Wakers und die Tags, die der
+    co-lokierte Schlaefer davor pausiert -- der Beweis der Ordnung am Metall."""
+    lines = []
+    for wc in sorted(cards, key=lambda w: w.card):
+        k = first_claim(order, wc)
+        if k is None:
+            continue
+        offer, need, paused = lockstep_offer(order, cards, wc.card, k, **sim)
+        short = [t for _k, c, t, _o, _n in short_claims(order, cards, **sim) if c == wc.card]
+        lines.append("%s card=%d first_claim=%s pos=%d paused_first=%s offer_mib=%.0f need_mib=%.0f "
+                     "lockstep=%s short_claims=%s"
+                     % (LEG_ORDER_MARKER, wc.card, order[k], k, ",".join(paused), offer, need,
+                        "funded" if offer + 1e-9 >= need else "SHORT", ",".join(short) or "-"))
+    return lines
+
+
 def credit_order(order: Sequence[str], cards: Sequence[WakeCard], *,
                  pinned_tail: Sequence[str] = PINNED_TAIL, search: bool = False,
+                 least_deficit: bool = False,
                  **sim) -> Tuple[List[str], WakeRun, str]:
     """Eine Ordnung, in der immer ein Waker Kredit hat -- oder die gegebene.
 
@@ -404,48 +655,44 @@ def credit_order(order: Sequence[str], cards: Sequence[WakeCard], *,
     Simulationen weiter; erst wenn auch die keine traegt, bleibt die gegebene
     stehen. Planer-Riegel (``verdict_lines``) und Front (``front_order``)
     rufen beide diese Funktion -- dieselbe Frage an beiden Seiten der Naht.
+
+    ``least_deficit`` (02.10., SGLANG_WEG2_FLIP_ORDER_LEAST_DEFICIT, nur die
+    Front): traegt auch danach keine Ordnung, nicht die gegebene stehen
+    lassen, wenn :func:`least_deficit_order` eine findet, die dem Tragen
+    naeher ist. Der Lauf bleibt der am GEMESSENEN free (unvollstaendig, der
+    W126-Text der Front bleibt); der Riegel des Planers fragt ohne.
     """
     order = list(order)
     base = simulate(order, cards, **sim)
     if base.complete:
         return order, base, "credit order: the given order funds every wake step (unchanged)"
-    tail = [t for t in order if t in set(pinned_tail)]
-    prefix: List[str] = []
-    rest = [t for t in order if t not in set(pinned_tail)]
-    greedy_why = ""
-    while rest:
-        pick = None
-        for cand in rest:
-            if simulate(prefix + [cand], cards, **sim).complete:
-                pick = cand
-                break
-        if pick is None:
-            greedy_why = ("credit order: NO order funds the wake (stuck after %s of %d tags) -- "
-                          "given order kept" % (len(prefix), len(order)))
-            break
-        prefix.append(pick)
-        rest.remove(pick)
-    if not greedy_why:
-        prefix += tail
-        full = simulate(prefix, cards, **sim)
-        if full.complete:
-            return prefix, full, (
-                "credit order: the given order ends in a credit cycle %s; reordered so every "
-                "wake step is funded" % _chain_text(base.chain))
-        greedy_why = ("credit order: the greedy order %s still ends in a cycle under run-ahead "
-                      "staging -- given order kept" % prefix)
-    if not search:
-        return order, base, greedy_why
-    found, run, moved = search_order(order, cards, pinned_tail=pinned_tail, **sim)
-    if not run.complete:
-        return order, base, greedy_why.replace(
+    found, full, greedy_why = _greedy_order(order, cards, pinned_tail=pinned_tail, **sim)
+    if found is not None and full is not None:
+        return found, full, (
+            "credit order: the given order ends in a credit cycle %s; reordered so every "
+            "wake step is funded" % _chain_text(base.chain))
+    if search:
+        found, run, moved = search_order(order, cards, pinned_tail=pinned_tail, **sim)
+        if run.complete:
+            return found, run, (
+                "credit order: the given order ends in a credit cycle %s; the greedy prefix build "
+                "found none (prefixes know no sleeper run-ahead), the full-simulation search (H54) "
+                "funds every wake step after %d single-tag move(s)"
+                % (_chain_text(base.chain), moved))
+        greedy_why = greedy_why.replace(
             " -- given order kept",
             "; the full-simulation search (H54) found none either -- given order kept")
-    return found, run, (
-        "credit order: the given order ends in a credit cycle %s; the greedy prefix build "
-        "found none (prefixes know no sleeper run-ahead), the full-simulation search (H54) "
-        "funds every wake step after %d single-tag move(s)"
-        % (_chain_text(base.chain), moved))
+    if least_deficit:
+        ld = least_deficit_order(order, cards, pinned_tail=pinned_tail, **sim)
+        if ld is not None:
+            new, up = ld
+            return new, simulate(new, cards, **sim), greedy_why.replace(
+                " -- given order kept",
+                "; LEAST-DEFICIT: this order is funded from +%d MiB free per card on, the given "
+                "order (%s at the measured free) not at that uplift -- reordered instead of "
+                "keeping the given order (y6u: kept, it cycled and W109b spilled after 1.5-1.9 s)"
+                % (int(up), _chain_text(base.chain)))
+    return order, base, greedy_why
 
 
 def _chain_text(chain: Sequence[Tuple[int, int, str]]) -> str:
@@ -697,6 +944,85 @@ def tag_layers_by_stage(p_split: Sequence[int], chunk_layers: int, n_tags: int
     return out
 
 
+def per_layer_mib(tags: Mapping[str, float], layers: Mapping[str, int]) -> float:
+    """#242r: MiB je Layer einer Stufe aus ihren Layer-Tags (volle Baender,
+    sonst alle), ``layers`` = Layer je Tag auf dieser Stufe."""
+    full = [t for t in tags if t in layers and layers[t] == max(layers.values())]
+    ks = full or [t for t in tags if t in layers]
+    n = sum(int(layers[t]) for t in ks)
+    return sum(float(tags[t]) for t in ks) / float(n) if n else 0.0
+
+
+def recut_reference(ref: WakeReference, p_split: Sequence[int], *, chunk_layers: int,
+                    n_layers: int) -> WakeReference:
+    """#242r: die gemessene Referenz des ersten Wakes D->P auf einen anderen
+    P-Schnitt umgerechnet. Die D-Seite (Tags je Chunk, Staging, free beim
+    Flip-Start, P-Floors) haengt nicht am P-Schnitt -- P schlaeft beim Flip-Start
+    und hat seinen kv_cache freigegeben. Neu verteilt werden die P-Tags: Tag t
+    auf Stufe s = Layer von t auf s x P-Bedarf je Layer DIESER Stufe (bei den
+    Referenzzeilen; die Pufferregel verschiebt danach wie immer); der
+    Nicht-Layer-Tag ``weights`` bleibt bei seiner Stufe. Das On-card-Staging je
+    D-Rang folgt seinem gemessenen Verhaeltnis Staging/D-Tag an der neuen
+    Eigentuemerschaft. Nicht umrechenbar -> ``ValueError`` mit W167."""
+    from sglang.srt.planner import p_card_chunk as _pc
+
+    new_split = tuple(int(x) for x in p_split)
+    ref_split = reference_p_split(ref, int(n_layers))
+    if ref_split is None:
+        raise ValueError(
+            "%s: %s -- die Referenz %s nennt ihren Schnitt nicht (keine 'MoE expert-offload "
+            "active on layer'-Zeilen); Schnitt %s nicht umrechenbar"
+            % (_pc.RECUT_REFUSAL_CODE, MARKER, ref.source, _pc.split_text(new_split)))
+    _pc.recut_check(ref_split, new_split, ["x"] * int(n_layers), MARKER)
+    n_tags = int(math.ceil(int(n_layers) / int(chunk_layers)))
+    old = tag_layers_by_stage(ref_split, chunk_layers, n_tags)
+    new = tag_layers_by_stage(new_split, chunk_layers, n_tags)
+    p_tags = []
+    for s in range(len(new_split)):
+        d = per_layer_mib(ref.p_tags[s], old[s])
+        tags = {t: round(nl * d, 3) for t, nl in new[s].items()}
+        if "weights" in ref.p_tags[s]:
+            tags["weights"] = ref.p_tags[s]["weights"]
+        p_tags.append(tags)
+    onc = []
+    for s in range(len(new_split)):
+        rel, meas = ref.d_tags[s], ref.d_oncard[s]
+        ratios = sorted(meas[t] / rel[t] for t in meas
+                        if rel.get(t, 0) > 0 and sum(1 for q in ref.p_tags if q.get(t, 0) > 0) == 1)
+        r = ratios[len(ratios) // 2] if ratios else 0.0
+        o = {}
+        for t, need in p_tags[s].items():
+            tot = sum(q.get(t, 0.0) for q in p_tags) or need
+            o[t] = round(rel.get(t, 0.0) * r * need / tot, 3)
+        onc.append(o)
+    firsts, b = [], 0
+    for n in new_split:
+        firsts.append(b)
+        b += n
+    return replace(ref, source="%s RECUT %s->%s" % (ref.source, _pc.split_text(ref_split),
+                                                    _pc.split_text(new_split)),
+                   p_tags=tuple(p_tags), d_oncard=tuple(onc), p_first_layers=tuple(firsts))
+
+
+_RX_CARD_VERDICT = re.compile(r"(card\d+) .*?-> (\w+)(?:, engste Luft (-?\d+) MiB)?")
+
+
+def recut_credit_line(ref_split: Sequence[int], p_split: Sequence[int], lines: Sequence[str],
+                      refusal: Optional[str], label: str) -> str:
+    """#242r: ``PP-CUT RECUT ref=<Schnitt> -> <Schnitt> WAKE-CREDIT D->P``: Kredit je Karte."""
+    from sglang.srt.planner import p_card_chunk as _pc
+
+    per = []
+    for ln in lines:
+        m = _RX_CARD_VERDICT.search(ln)
+        if m and ln.startswith("%s %s card" % (MARKER, label)):
+            per.append("%s %s%s" % (m.group(1), m.group(2),
+                                    "" if m.group(3) is None else " engste Luft %s MiB" % m.group(3)))
+    return "%s ref=%s -> %s WAKE-CREDIT D->P %s: %s -> %s" % (
+        _pc.RECUT_MARKER, _pc.split_text(ref_split), _pc.split_text(p_split), label,
+        " | ".join(per) or "-", "VERWEIGERT" if refusal else "PASST")
+
+
 def planned_cards(ref: WakeReference, *, p_rows: Sequence[int], d_rows: Sequence[int],
                   slot_mib: float, p_split: Sequence[int], chunk_layers: int,
                   n_layers: int) -> List[WakeCard]:
@@ -868,6 +1194,22 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
     }
     _model_note = _model_same_footprint(model, key, have)
     diff = [k for k in key if key[k] != have.get(k)]
+    recut_from = None
+    if diff == ["p_split"]:
+        # #242r: NUR der Schnitt weicht ab -> die Referenz wird umgerechnet
+        # (P-Tags je Band auf die neuen Stufen); geht das nicht, VERWEIGERT
+        # der Riegel mit Namen statt still zu entfallen.
+        try:
+            if not isinstance(key["p_split"], tuple):
+                raise ValueError(
+                    "W167 Weg2PCutRecutRefused: %s %s -- der Schnitt der Referenz %s ist %s"
+                    % (MARKER, label, ref.source, key["p_split"]))
+            ref = recut_reference(ref, have["p_split"], chunk_layers=int(chunk_layers),
+                                  n_layers=int(n_layers))
+        except ValueError as exc:
+            return WakeCreditPlan(lines=("%s %s %s" % (MARKER, label, exc),), refusal=str(exc))
+        recut_from = key["p_split"]
+        diff = []
     if diff:
         return WakeCreditPlan(lines=(
             "%s %s ENTFAELLT: die Referenz %s gilt fuer %s, diese Form hat %s -- eine "
@@ -892,6 +1234,10 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
         head += "; " + _model_note
     lines, refusal, _chosen = verdict_lines(ref.order, cards, label=label, reorder=reorder,
                                             search=search, double_staging=double_staging)
+    if recut_from is not None:
+        head += "; #242r Referenz umgerechnet %s -> %s" % (
+            ",".join(str(x) for x in recut_from), ",".join(str(x) for x in p_split))
+        lines = list(lines) + [recut_credit_line(recut_from, p_split, lines, refusal, label)]
     front_plan: Dict[str, object] = {"D->P": [
         {"card": wc.card, "release": dict(wc.release_mib), "demand": dict(wc.demand_mib),
          "oncard": dict(wc.oncard_mib), "sleeper": wc.sleeper, "waker": wc.waker}
@@ -902,22 +1248,16 @@ def plan_wake_credit(*, model: str, p_split: Sequence[int], chunk_layers: int,
                           front_plan=front_plan)
 
 
-def front_order(pause_order: Sequence[str], plan_cards: Sequence[Mapping[str, object]], *,
-                free_mib: Mapping[int, float], floor_mib: Mapping[int, float],
-                double_staging: bool, search: bool = False) -> Tuple[List[str], str]:
-    """Die Front: die Kredit-Ordnung fuer DIESEN Flip, gegen die live
-    gemessenen ``free``/Floors und die Tag-Tabelle des Planers. ``search``:
-    wie im Riegel (H54), die Suche ueber volle Simulationen nach dem gierigen
-    Bau.
-
-    Rueckgabe ``(ordnung, warum)``; eine unvollstaendige Tabelle (Karte ohne
-    free-Lesung, Tag der Ordnung ohne Eintrag) laesst die Ordnung stehen und
-    sagt warum -- nie eine halbe Rechnung."""
+def front_cards(pause_order: Sequence[str], plan_cards: Sequence[Mapping[str, object]], *,
+                free_mib: Mapping[int, float], floor_mib: Mapping[int, float]
+                ) -> Tuple[Optional[List[WakeCard]], str]:
+    """Die Karten der Front-Rechnung, oder ``(None, warum)`` bei einer
+    unvollstaendigen Tabelle."""
     cards: List[WakeCard] = []
     for pc in plan_cards:
         c = int(pc["card"])  # type: ignore[arg-type]
         if c not in free_mib or c not in floor_mib:
-            return list(pause_order), "credit order SKIPPED: card %d has no free/floor reading" % c
+            return None, "credit order SKIPPED: card %d has no free/floor reading" % c
         cards.append(WakeCard(card=c, free_mib=float(free_mib[c]), floor_mib=float(floor_mib[c]),
                               release_mib=dict(pc.get("release") or {}),  # type: ignore[arg-type]
                               demand_mib=dict(pc.get("demand") or {}),  # type: ignore[arg-type]
@@ -928,9 +1268,47 @@ def front_order(pause_order: Sequence[str], plan_cards: Sequence[Mapping[str, ob
         known |= set(wc.release_mib) | set(wc.demand_mib)
     unknown = [t for t in pause_order if t not in known]
     if unknown:
-        return list(pause_order), "credit order SKIPPED: tags %s not in the plan table" % unknown
+        return None, "credit order SKIPPED: tags %s not in the plan table" % unknown
+    return cards, ""
+
+
+def front_leg_order_lines(order: Sequence[str], plan_cards: Sequence[Mapping[str, object]], *,
+                          free_mib: Mapping[int, float], floor_mib: Mapping[int, float],
+                          double_staging: bool) -> List[str]:
+    """:func:`leg_order_lines` fuer die gewaehlte Front-Ordnung (leer bei
+    unvollstaendiger Tabelle)."""
+    cards, _why = front_cards(order, plan_cards, free_mib=free_mib, floor_mib=floor_mib)
+    if cards is None:
+        return []
+    return leg_order_lines(order, cards, double_staging=double_staging)
+
+
+def front_order(pause_order: Sequence[str], plan_cards: Sequence[Mapping[str, object]], *,
+                free_mib: Mapping[int, float], floor_mib: Mapping[int, float],
+                double_staging: bool, search: bool = False,
+                least_deficit: bool = False,
+                lockstep_first: bool = False) -> Tuple[List[str], str]:
+    """Die Front: die Kredit-Ordnung fuer DIESEN Flip, gegen die live
+    gemessenen ``free``/Floors und die Tag-Tabelle des Planers. ``search``:
+    wie im Riegel (H54), die Suche ueber volle Simulationen nach dem gierigen
+    Bau. ``lockstep_first`` (NF y7o, SGLANG_WEG2_FLIP_ORDER_LOCKSTEP_FIRST):
+    danach :func:`lockstep_first_claims` -- der erste Claim jedes Wakers
+    steht hinter den Pausen, die ihn decken.
+
+    Rueckgabe ``(ordnung, warum)``; eine unvollstaendige Tabelle (Karte ohne
+    free-Lesung, Tag der Ordnung ohne Eintrag) laesst die Ordnung stehen und
+    sagt warum -- nie eine halbe Rechnung."""
+    cards, skipped = front_cards(pause_order, plan_cards, free_mib=free_mib, floor_mib=floor_mib)
+    if cards is None:
+        return list(pause_order), skipped
     order, run, why = credit_order(pause_order, cards, double_staging=double_staging,
-                                   search=search)
+                                   search=search, least_deficit=least_deficit)
+    if lockstep_first:
+        moved, notes = lockstep_claims(order, cards, double_staging=double_staging)
+        if notes:
+            order = moved
+            run = simulate(order, cards, double_staging=double_staging)
+            why += "; LOCKSTEP (y7o): " + "; ".join(notes)
     by = {wc.card: wc for wc in cards}
     detail = " | ".join(card_line(by[cs.card], cs) for cs in run.cards)
     if not run.complete:

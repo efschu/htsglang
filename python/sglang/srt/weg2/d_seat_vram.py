@@ -62,8 +62,8 @@ from __future__ import annotations
 import logging
 import math
 import os
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,10 @@ GROUP_ENV = "SGLANG_WEG2_GROUP"
 POOL_GRAPH_MODE_ENV = "SGLANG_MOE_OFFLOAD_GRAPH_MODE"
 LINE_MARK = "WEG2 D-SEAT-VRAM (H95c)"
 REFUSAL_CODE = "W-SEAT Weg2DSeatOverrun"
+#: S1-Wisch (rc12z17 28.09.): a live apply that would release mapped bytes
+WIPE_CODE = "W-SEAT-WIPE"
+#: one line per live apply: extents kept, cells freed / mapped, wiped=0
+LIVE_MARK = "WEG2 D-SEAT-VRAM LIVE-SPANS"
 _MIB = float(1 << 20)
 
 
@@ -84,6 +88,20 @@ class Weg2DSeatVramRefused(RuntimeError):
     """The seat-form expert bank could not be trimmed to its cap form."""
 
 
+class Weg2DSeatVramNoMemory(Weg2DSeatVramRefused):
+    """A live ``tms_set_spans`` answered rc=2 (cuMemCreate out of memory)."""
+
+
+#: torch_memory_saver's rc for a map the card cannot back (cuMemCreate OOM)
+TMS_RC_OUT_OF_MEMORY = 2
+
+
+class Weg2DSeatVramWipe(Weg2DSeatVramRefused):
+    """W-SEAT-WIPE: a live span plan would release an extent holding bytes it
+    keeps. Never swallowed into "no controller on this rank" (``controller``):
+    a rank whose pages would be remapped fresh stops by name."""
+
+
 # ---------------------------------------------------------------------------
 # switch
 # ---------------------------------------------------------------------------
@@ -93,6 +111,16 @@ def switch_on() -> bool:
     from sglang.srt.environ import envs
 
     return bool(envs.SGLANG_OPT_WEG2_D_SEAT_VRAM.get())
+
+
+def _rewake_on() -> bool:
+    """D-SEAT-REWAKE (weg2/d_seat_rewake.py): the live seat re-plan."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_D_SEAT_REWAKE.get())
+    except Exception:  # noqa: BLE001 -- an unreadable switch is off
+        return False
 
 
 def armed(env: Optional[Dict[str, str]] = None) -> bool:
@@ -120,6 +148,64 @@ def extra_rows_for_rank(rank: int, raw: Optional[str] = None) -> int:
     if len(vals) == 1:
         return vals[0]
     return vals[rank] if 0 <= int(rank) < len(vals) else 0
+
+
+def lend_on() -> bool:
+    """D-TRANSIENT-LEND (weg2/d_transient_lend.py): the switch AND the elastic
+    rows (its diagnostic stop stops the lend too)."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_D_TRANSIENT_LEND.get()) and elastic_on()
+
+
+def lend_armed() -> bool:
+    """The lend can run: switched on AND the launcher wrote the floor (the
+    near-OOM edge it lends down to). Without the floor the bank keeps its
+    lattice and nothing is lent -- byte-identical to before."""
+    if not lend_on():
+        return False
+    from sglang.srt.environ import envs
+
+    return bool(str(envs.SGLANG_WEG2_D_LEND_FLOOR_MIB.get() or "").strip())
+
+
+def lend_head_rows_for_rank(rank: int, raw: Optional[str] = None) -> int:
+    """``SGLANG_WEG2_D_LEND_HEAD_ROWS`` for one MoE TP rank (one value = every
+    rank); 0 unless the lend is armed (``lend_armed``)."""
+    if raw is None:
+        if not lend_armed():
+            return 0
+        from sglang.srt.environ import envs
+
+        raw = envs.SGLANG_WEG2_D_LEND_HEAD_ROWS.get() or ""
+    return extra_rows_for_rank(rank, raw)
+
+
+def lend_floor_mib_for_rank(rank: int, raw: Optional[str] = None) -> Optional[float]:
+    """The near-OOM edge of this D rank (``SGLANG_WEG2_D_LEND_FLOOR_MIB``),
+    None when the launcher wrote none -- no lend then, nothing is guessed."""
+    if raw is None:
+        from sglang.srt.environ import envs
+
+        raw = envs.SGLANG_WEG2_D_LEND_FLOOR_MIB.get()
+    parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    if not parts:
+        return None
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if len(vals) == 1:
+        return vals[0]
+    return vals[rank] if 0 <= int(rank) < len(vals) else None
+
+
+def lend_lattice(x_max: int, step: int) -> Tuple[int, ...]:
+    """The row counts a lend may end at: every ``step`` rows and the top."""
+    x_max, step = int(x_max), int(step)
+    if x_max <= 0 or step <= 0:
+        return ()
+    return tuple(sorted(set(range(step, x_max + 1, step)) | {x_max}))
 
 
 # ---------------------------------------------------------------------------
@@ -166,22 +252,56 @@ class SlotTensorGeom:
         return int(self.layers) * int(self.slots) * int(self.slot_bytes)
 
 
-def slot_spans(g: SlotTensorGeom, keep: int, granule: int) -> Tuple[Tuple[int, int], ...]:
+def split_at(ranges: Sequence[Tuple[int, int]], points: Iterable[int]) -> Tuple[Tuple[int, int], ...]:
+    """``ranges`` cut at every point strictly inside one of them."""
+    pts = sorted({int(p) for p in points})
+    out: List[Tuple[int, int]] = []
+    for lo, hi in ranges:
+        cur = int(lo)
+        for p in pts:
+            if cur < p < int(hi):
+                out.append((cur, p))
+                cur = p
+        out.append((cur, int(hi)))
+    return tuple(out)
+
+
+def slot_spans(g: SlotTensorGeom, keep: int, granule: int,
+               cuts: Sequence[int] = ()) -> Tuple[Tuple[int, int], ...]:
     """The mapped ranges that keep slots ``[0, keep)`` of every layer:
     OUTWARD-rounded per layer (a granule holding one live byte stays), plus
     the allocation's slack behind the tensor (the caching allocator may place
-    a small block there). ``keep >= slots``: the whole allocation."""
+    a small block there). ``keep >= slots``: the whole allocation.
+
+    ``cuts`` (S1-Wisch, rc12z17 28.09.): the keep values a later phase may
+    take. The saver maps ONE extent per range and a live ``tms_set_spans``
+    keeps only extents wholly inside one range of the new plan -- every other
+    extent is released and its range mapped FRESH, i.e. its bytes are gone.
+    Cut at every layer start and at every such keep, each extent is one cell
+    of a lattice all these plans share: a live shrink frees whole cells above
+    the new end and never drops a cell it keeps."""
     alloc = int(g.alloc_bytes)
-    if int(keep) >= int(g.slots):
-        return ((0, alloc),)
     sb, S = int(g.slot_bytes), int(g.slots)
-    ranges = []
+    if int(keep) >= S:
+        ranges: Tuple[Tuple[int, int], ...] = ((0, alloc),)
+    else:
+        rl = []
+        for layer in range(int(g.layers)):
+            lo = layer * S * sb
+            rl.append((align_down(lo, granule), min(alloc, align_up(lo + max(0, int(keep)) * sb, granule))))
+        if alloc > g.tensor_bytes:
+            rl.append((align_down(g.tensor_bytes, granule), alloc))
+        ranges = _coalesce(rl)
+    if not cuts:
+        return ranges
+    points = []
     for layer in range(int(g.layers)):
         lo = layer * S * sb
-        ranges.append((align_down(lo, granule), min(alloc, align_up(lo + max(0, int(keep)) * sb, granule))))
+        points.append(align_down(lo, granule))
+        points.extend(min(alloc, align_up(lo + int(c) * sb, granule)) for c in cuts if 0 < int(c) < S)
     if alloc > g.tensor_bytes:
-        ranges.append((align_down(g.tensor_bytes, granule), alloc))
-    return _coalesce(ranges)
+        points.append(align_down(g.tensor_bytes, granule))
+    return split_at(ranges, points)
 
 
 @dataclass(frozen=True)
@@ -196,13 +316,40 @@ class RowTensorGeom:
     alloc_bytes: int
 
 
-def row_spans(g: RowTensorGeom, rows_on: int, granule: int) -> Tuple[Tuple[int, int], ...]:
+def row_spans(g: RowTensorGeom, rows_on: int, granule: int,
+              cuts: Sequence[int] = ()) -> Tuple[Tuple[int, int], ...]:
     """The mapped prefix for ``rows_on`` rows (outward rounded); every row a
-    kernel may touch lies in it. ``rows_on >= rows_max``: the allocation."""
+    kernel may touch lies in it. ``rows_on >= rows_max``: the allocation.
+
+    ``cuts`` (S1-Wisch, rc12z17 28.09.): the row counts a later phase may map.
+    rc12z17 10:51:24 had the LIVE bank mapped as ONE extent ``[0, R+C+33)``
+    and shrank it to ``R+C+23`` -- the saver released that extent (it is not
+    inside the smaller plan) and mapped the prefix fresh: residents, staging
+    and LRU rows of all 48 layers were gone, D decoded with uninitialised
+    experts (accept 2.3 -> 1.05) and its next sleep handed them to the store.
+    Cut at every such row count, a shrink releases only whole cells above the
+    new end."""
     alloc = int(g.alloc_bytes)
-    if int(rows_on) >= int(g.rows_max):
-        return ((0, alloc),)
-    return ((0, min(alloc, align_up(int(rows_on) * int(g.row_bytes), granule))),)
+    rb = int(g.row_bytes)
+    end = alloc if int(rows_on) >= int(g.rows_max) else min(alloc, align_up(int(rows_on) * rb, granule))
+    if not cuts:
+        return ((0, end),)
+    return split_at(((0, end),), (min(alloc, align_up(int(c) * rb, granule)) for c in cuts if int(c) > 0))
+
+
+def straddling(prev: Sequence[Tuple[int, int]],
+               new: Sequence[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    """The first mapped extent of ``prev`` a live apply of ``new`` would
+    release WITH bytes the new plan keeps -- neither wholly inside one range
+    of ``new`` (kept, core.cpp ``set_spans``) nor disjoint from all of them
+    (freed whole). None: the apply keeps every byte it keeps."""
+    for a, b in prev:
+        if any(lo <= a and b <= hi for lo, hi in new):
+            continue
+        if all(b <= lo or a >= hi for lo, hi in new):
+            continue
+        return (int(a), int(b))
+    return None
 
 
 def phase_slot_limit(size: int, n: int, cap: int) -> int:
@@ -282,6 +429,718 @@ def seat_vram_rows(
             n=n, slot_limit=lim, extra_rows=k, mamba_mapped=m_n,
             expert_mapped=expert(k), mamba_cap=m_cap, expert_cap=e_cap))
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# #251c: the attention host's KV pool as the THIRD post (KV stages)
+# ---------------------------------------------------------------------------
+#
+# Form A keeps the whole KV on TP0. A KV stage S_j maps the token prefix
+# [0, T_j) of every KV tensor; the pages a stage above S0 maps come out of
+# the expert bank's tail rows, exactly the way H95c hands the pages of empty
+# seats to extra expert rows. The virtual ranges stay at the top stage (the
+# graphs), the boot form is S0 with ``boot_rows_on`` stage rows ON -- the form
+# the planner prices -- and every (n, j) cell maps at most what it maps.
+
+
+@dataclass(frozen=True)
+class KvTensorGeom:
+    """A token-indexed KV tensor (``SlotTensorGeom`` at the TOP stage) and how
+    tokens become its slots: a paged K/V buffer holds ``tokens + page`` rows
+    (``token_pad`` = page, ``token_ratio`` = 1); the QSA compressed keys hold
+    one slot per ``ratio`` tokens of the same padded space."""
+
+    geom: SlotTensorGeom
+    token_ratio: int = 1
+    token_pad: int = 0
+    #: #239 S3g: (cp_S, cp_ratio) of a rank holding its owner share of a
+    #: token-cut FA pool -- global slot L sits at row (L // S) * ratio + (L %
+    #: S - lo), so the first T global tokens live in the first
+    #: ``dcp_compact_pool_rows(T)`` = (T // S + 1) * ratio rows. (0, 0) = the
+    #: whole context on this rank (every other pool), byte-identical.
+    owner_block: Tuple[int, int] = (0, 0)
+
+    def slots_for(self, tokens: int) -> int:
+        S, ratio = (int(x) for x in self.owner_block)
+        if S > 0 and ratio > 0:
+            need = (int(tokens) // S + 1) * ratio + int(self.token_pad)
+            return max(0, min(int(self.geom.slots), need))
+        need = -(-(int(tokens) + int(self.token_pad)) // max(1, int(self.token_ratio)))
+        return max(0, min(int(self.geom.slots), need))
+
+
+def kv_mapped_bytes(kv_tensors: Sequence[KvTensorGeom], tokens: int, granule: int) -> int:
+    return sum(span_bytes(slot_spans(k.geom, k.slots_for(tokens), granule)) for k in kv_tensors)
+
+
+@dataclass(frozen=True)
+class StageCell:
+    """One (n seats, KV stage j) phase form. ``extra_rows`` = the expert rows
+    ON (k), ``mamba_keep`` = the slots per layer the GDN pool maps
+    (``pool_size + 1`` = its cap form); ``feasible`` = some k >= 0 keeps the
+    mapped total within the boot form's."""
+
+    n: int
+    stage: int
+    tokens: int
+    slot_limit: int
+    mamba_keep: int
+    extra_rows: int
+    mamba_mapped: int
+    expert_mapped: int
+    kv_mapped: int
+    cap_mapped: int
+    feasible: bool
+    #: k with the GDN pool in its cap form (it cannot shrink while it is
+    #: mapped and live -- H95c's rule); -1 = the stage needs the GDN pages
+    rows_full: int = -1
+    #: D-SEAT-REWAKE: k with the GDN pool mapped for n seats (``slot_limit +
+    #: 1``), -1 at the cap or when it does not fit -- what a live stage move
+    #: books when the live pool IS that shrunk form (a live re-seat made it)
+    rows_shrunk: int = -1
+
+    @property
+    def mapped(self) -> int:
+        return int(self.mamba_mapped) + int(self.expert_mapped) + int(self.kv_mapped)
+
+
+def stage_vram_cells(
+    slot_tensors: Sequence[SlotTensorGeom],
+    row_tensors: Sequence[RowTensorGeom],
+    kv_tensors: Sequence[KvTensorGeom],
+    *,
+    cap: int,
+    pool_size: int,
+    extra_max: int,
+    stage_tokens: Sequence[int],
+    boot_rows_on: int = 0,
+    granule: int = GRANULE_DEFAULT,
+) -> Dict[Tuple[int, int], StageCell]:
+    """Every (n, j): the largest k whose expert pages, with the GDN slots of n
+    seats and the KV prefix of stage j, stay within the BOOT form (n = cap,
+    j = 0, ``boot_rows_on`` rows ON). The GDN pool shrinks only when that buys
+    a row (else it keeps its cap form -- nothing to hand over, H95c's rule).
+    ``kv_tensors=()``, one stage and ``boot_rows_on=0`` give H95c's k(n)."""
+    cap = max(1, int(cap))
+    stages = [int(t) for t in stage_tokens] or [0]
+
+    def mamba(keep: int) -> int:
+        return sum(span_bytes(slot_spans(g, keep, granule)) for g in slot_tensors)
+
+    def expert(k: int) -> int:
+        return sum(span_bytes(row_spans(g, g.rows_boot + k, granule)) for g in row_tensors)
+
+    x_max = max(0, int(extra_max))
+    if row_tensors:
+        x_max = min(x_max, min(int(g.rows_max) - int(g.rows_boot) for g in row_tensors))
+    else:
+        x_max = 0
+    k_boot = max(0, min(int(boot_rows_on), x_max))
+    m_cap = mamba(int(pool_size) + 1)
+    budget = m_cap + expert(k_boot) + kv_mapped_bytes(kv_tensors, stages[0], granule)
+    ex = [expert(k) for k in range(x_max + 1)]
+
+    def best_k(fixed: int) -> int:
+        k = -1
+        while k < x_max and fixed + ex[k + 1] <= budget:
+            k += 1
+        return k
+
+    out: Dict[Tuple[int, int], StageCell] = {}
+    for n in range(1, cap + 1):
+        lim = phase_slot_limit(pool_size, n, cap)
+        m_n = mamba(lim + 1)
+        for j, tokens in enumerate(stages):
+            kv = kv_mapped_bytes(kv_tensors, tokens, granule)
+            k_shrunk = best_k(m_n + kv) if n < cap else -1
+            k_full = best_k(m_cap + kv)
+            if k_shrunk > k_full:
+                k, keep, m = k_shrunk, lim + 1, m_n
+            else:
+                k, keep, m = k_full, int(pool_size) + 1, m_cap
+            out[(n, j)] = StageCell(
+                n=n, stage=j, tokens=tokens, slot_limit=lim, mamba_keep=keep,
+                extra_rows=max(0, k), mamba_mapped=m, expert_mapped=ex[max(0, k)],
+                kv_mapped=kv, cap_mapped=budget, feasible=k >= 0, rows_full=k_full,
+                rows_shrunk=k_shrunk)
+    return out
+
+
+@dataclass(frozen=True)
+class StageChoice:
+    stage: int
+    tokens: int
+    demand: Optional[int]
+    over: bool  # demand above the chosen (= highest usable) stage: the youngest parks
+    reason: str
+
+
+def choose_stage(
+    cells: Dict[Tuple[int, int], StageCell],
+    n: int,
+    demand_tokens: Optional[int],
+    *,
+    min_rows_on: int = 0,
+) -> StageChoice:
+    """#251c (Nutzer: Leistung geht vor): the SMALLEST stage whose tokens hold
+    the phase's demand, among the stages the n-seat form can fund with at least
+    ``min_rows_on`` expert rows ON (the captured waves' floor). The stage rises
+    only when the next wake's demand exceeds the KV and falls as soon as it
+    fits again; above the highest usable stage the highest one is taken and
+    the youngest parks (H91, ``over``). A pure function of the wake request --
+    every rank takes the same stage. No demand on the wake (an older front):
+    S0, the boot form."""
+    usable = sorted(
+        j for (m, j), c in cells.items()
+        if m == n and c.feasible and c.extra_rows >= int(min_rows_on)
+    )
+    if not usable:
+        usable = [0]
+    t = {j: cells[(n, j)].tokens for j in usable if (n, j) in cells}
+    if demand_tokens is None:
+        j0 = 0 if 0 in t else usable[0]
+        return StageChoice(j0, t.get(j0, 0), None, False, "no demand on the wake: S0")
+    d = int(demand_tokens)
+    for j in usable:
+        if t.get(j, 0) >= d:
+            return StageChoice(j, t[j], d, False, "smallest stage holding the demand")
+    top = usable[-1]
+    return StageChoice(top, t.get(top, 0), d, True,
+                       "demand above the highest usable stage: the youngest parks")
+
+
+@dataclass(frozen=True)
+class StageForm:
+    """#251c, REPLICATED: the launcher's form values -- the stages' tokens,
+    the stage rows ON in the boot form, and the highest stage a phase of n
+    seats may take. Every rank of D reads the same --env-d, so every rank
+    chooses the same stage from these and the wake request alone (the 3080
+    workers hold no KV and no cells; TP0 checks the table against its pages,
+    ``check_form_against_cells``)."""
+
+    tokens: Tuple[int, ...]
+    rows_on: int = 0
+    max_by_seats: Tuple[int, ...] = ()
+    #: #251d (SGLANG_WEG2_D_KV_STAGE_BY_DEMAND): no table -- every stage is
+    #: open to every n, the wake's demand alone picks it (choose_form_stage)
+    by_demand: bool = False
+
+    def max_stage(self, n: int) -> int:
+        top = len(self.tokens) - 1
+        if self.by_demand or not self.max_by_seats:
+            return top
+        i = min(max(1, int(n)), len(self.max_by_seats)) - 1
+        return max(0, min(top, int(self.max_by_seats[i])))
+
+
+def _ints(raw) -> Tuple[int, ...]:
+    out = []
+    for p in str(raw or "").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except ValueError:
+            return ()
+    return tuple(out)
+
+
+def stage_form(env: Optional[Dict[str, str]] = None) -> Optional[StageForm]:
+    """The armed stage form of this D process, or None (off, not group D, or
+    fewer than two stages -- then everything is H95c, byte-identical)."""
+    if not armed(env):
+        return None
+    from sglang.srt.environ import envs
+
+    tokens = tuple(sorted({t for t in _ints(envs.SGLANG_WEG2_D_KV_STAGE_TOKENS.get()) if t > 0}))
+    if len(tokens) < 2:
+        return None
+    rows_on = max(0, int(envs.SGLANG_WEG2_D_KV_STAGE_ROWS.get() or 0))
+    by_rank = _ints(envs.SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK.get())
+    if by_rank:
+        # #239 S3g: every KV rank funds its own stages; this rank's entry
+        r = _this_rank()
+        rows_on = max(0, int(by_rank[r])) if 0 <= r < len(by_rank) else 0
+    return StageForm(
+        tokens=tokens,
+        rows_on=rows_on,
+        max_by_seats=_ints(envs.SGLANG_WEG2_D_KV_STAGE_MAX_BY_SEATS.get()),
+        by_demand=bool(envs.SGLANG_WEG2_D_KV_STAGE_BY_DEMAND.get()),
+    )
+
+
+def form_seats_text(form: StageForm):
+    """The highest stage per seat count as the capture/stage lines name it."""
+    if form.by_demand:
+        return "by demand (every stage at every n)"
+    return list(form.max_by_seats) or "all"
+
+
+def choose_form_stage(form: StageForm, n: int, demand_tokens: Optional[int]) -> StageChoice:
+    """``choose_stage`` over the replicated form: stages 0..max_stage(n)."""
+    top = form.max_stage(n)
+    if demand_tokens is None:
+        return StageChoice(0, form.tokens[0], None, False, "no demand on the wake: S0")
+    d = int(demand_tokens)
+    for j in range(top + 1):
+        if form.tokens[j] >= d:
+            return StageChoice(j, form.tokens[j], d, False, "smallest stage holding the demand")
+    return StageChoice(top, form.tokens[top], d, True,
+                       "demand above the highest usable stage: the youngest parks")
+
+
+def check_form_against_cells(form: StageForm, cells: Dict[Tuple[int, int], StageCell],
+                             cap: int) -> None:
+    """TP0 at its first wake: every stage the form lets a phase of n seats
+    take must be fundable by this rank's pages. The workers choose from the
+    same form without cells, so a table TP0 cannot honour is refused by name
+    here instead of being quietly lowered on one rank (RAENGE-NIE-UNEINS)."""
+    bad = [(n, j) for n in range(1, int(cap) + 1) for j in range(form.max_stage(n) + 1)
+           if not cells.get((n, j), None) or not cells[(n, j)].feasible]
+    if bad:
+        raise Weg2DSeatVramRefused(
+            "%s: the stage form promises (n seats, stage) %s that this rank's pages "
+            "cannot fund (stage tokens %s, stage rows %d) -- the launcher's table and "
+            "the attention host's geometry disagree; nothing was mapped"
+            % (LINE_MARK, bad[:6], list(form.tokens), form.rows_on))
+
+
+def capture_floors(form: StageForm, cells: Dict[Tuple[int, int], StageCell],
+                   cap: int) -> Tuple[int, ...]:
+    """#251c, the capture floor per batch size b = 1..cap: the fewest expert
+    rows ON (k) in any phase a batch of b can replay in -- n >= b seats at a
+    stage the form lets n take. The graph of b is captured with these rows
+    counted as ON (``expert_pool_device.pool_row_capacity``), so its wave count
+    holds in every such phase; the launcher's ``max_by_seats`` decides how low
+    it goes (a stage that would add a wave is simply not allowed at n)."""
+    out = []
+    for b in range(1, int(cap) + 1):
+        ks = [cells[(n, j)].extra_rows for n in range(b, int(cap) + 1)
+              for j in range(form.max_stage(n) + 1) if (n, j) in cells]
+        out.append(max(0, min(ks)) if ks else 0)
+    return tuple(out)
+
+
+#: S3g floor: the refusal of a rank that carries stage rows but staged no KV
+STAGE_ROWS_NO_KV_CODE = "W-STAGE-ROWS-NO-KV"
+
+
+def check_stage_rows_have_kv(form: Optional[StageForm],
+                             cells: Dict[Tuple[int, int], StageCell],
+                             per_rank: Optional[bool] = None) -> None:
+    """#239 S3g floor, before the capture counts anything: a rank the launcher
+    gave its own stage rows (``form.rows_on`` > 0) must have a KV tensor born
+    trimmed to S0 -- the cells are its stages. Without cells no capture floor
+    exists, the captured step counts the stage rows OFF while the planner
+    priced them ON in S0 (rc12z30b 28.09. 20:09:07, TP2: C 45 x 2 waves < 92
+    ids, 'Step ids exceed the LRU rows plus the staging rows'). Named here
+    instead of that anonymous death inside the capture. Only S3g's per-rank
+    rows (SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK) are a rank's OWN rows; without
+    them ``rows_on`` is the attention host's (#251c), which a Form A worker
+    reads but never carries (its seat rows are 0)."""
+    if per_rank is None:
+        from sglang.srt.environ import envs
+
+        per_rank = bool(_ints(envs.SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK.get()))
+    if form is None or not per_rank or int(form.rows_on) <= 0 or cells:
+        return
+    raise Weg2DSeatVramRefused(
+        "%s %s: this rank carries %d stage rows (SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK / "
+        "_ROWS) but no KV tensor was born trimmed to S0 -- nothing here grows at a stage, "
+        "and the captured decode steps would count those rows OFF while the planner priced "
+        "them ON in S0. A Form A worker holds KV only under the token cut (its FA share; "
+        "never QSA keys) -- the launcher must give it no stage rows otherwise"
+        % (LINE_MARK, STAGE_ROWS_NO_KV_CODE, int(form.rows_on)))
+
+
+#: #251c: the model runner whose pools the capture floor is computed over
+#: (``note_capture_context``, after the KV pool exists, before the capture),
+#: and the floors, computed once at the first captured MoE step.
+_CAPTURE: Dict[str, object] = {"runner": None, "floors": None}
+
+
+def note_capture_context(runner) -> None:
+    """The KV mixin, once its pools exist: the capture that follows may ask
+    for the floors (``capture_floor_rows``). A no-op without a stage form."""
+    if stage_form() is None:
+        return
+    _CAPTURE["runner"] = runner
+    _CAPTURE["floors"] = None
+
+
+def _capture_floor_table() -> Tuple[int, ...]:
+    floors = _CAPTURE.get("floors")
+    if floors is not None:
+        return floors  # type: ignore[return-value]
+    runner = _CAPTURE.get("runner")
+    floors = ()
+    if runner is not None:
+        sa = getattr(runner, "server_args", None)
+        cap = int(getattr(sa, "max_running_requests", 0) or 0)
+        # a refusal of the form (check_form_against_cells) stops the boot here,
+        # at the capture, by name -- before any phase could run on it
+        ctl = SeatVram.from_runtime(cap=max(1, cap),
+                                    req_to_token_pool=getattr(runner, "req_to_token_pool", None),
+                                    model=getattr(runner, "model", None))
+        check_stage_rows_have_kv(ctl.form, ctl.cells)
+        if ctl.form is not None and ctl.cells:
+            floors = capture_floors(ctl.form, ctl.cells, ctl.cap)
+            logger.info("%s CAPTURE-FLOOR rows ON per bs %s (stages %s, max_by_seats %s): the "
+                        "captured decode steps count these seat/stage rows as ON",
+                        STAGE_MARK, list(floors), list(ctl.form.tokens),
+                        form_seats_text(ctl.form))
+    _CAPTURE["floors"] = floors
+    return floors
+
+
+def capture_floor_rows(n_ids: int, per_seat_ids: Optional[int]) -> int:
+    """#251c: the rows ON the captured MoE step of ``n_ids`` routed ids may
+    count on. The batch is ``ceil(n_ids / per_seat_ids)`` (verify tokens x
+    top-k per seat; a draft step routes fewer ids per seat, its batch reads
+    SMALLER and its floor lower -- never too high). Past the seat cap (an
+    extend shape) or without a form/cells: 0, the live count."""
+    if not per_seat_ids or int(per_seat_ids) <= 0 or stage_form() is None:
+        return 0
+    floors = _capture_floor_table()
+    if not floors:
+        return 0
+    b = max(1, -(-int(n_ids) // int(per_seat_ids)))
+    return int(floors[b - 1]) if b <= len(floors) else 0
+
+
+def _form_a_worker() -> bool:
+    """This process is a Form A expert worker (rank_role's installed plan)."""
+    try:
+        from sglang.srt.rank_role import this_rank_is_form_a_worker
+    except ImportError:
+        return False
+    return bool(this_rank_is_form_a_worker())
+
+
+def _form_a_worker_holds_kv() -> bool:
+    """#239: this process is a Form A worker with a full-attention KV share."""
+    try:
+        from sglang.srt.rank_role import form_a_worker_holds_kv
+    except ImportError:
+        return False
+    return bool(form_a_worker_holds_kv())
+
+
+def _this_rank() -> int:
+    """#239 S3g: this process's D TP rank (the rank role's, else the TP
+    group's; 0 when neither is up -- a classic single-rank boot)."""
+    from sglang.srt import rank_role
+
+    if getattr(rank_role, "_INSTALLED_PLAN", None) is not None:
+        return int(getattr(rank_role, "_INSTALLED_RANK", 0))
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return int(get_tensor_model_parallel_rank())
+    except Exception:  # noqa: BLE001 -- no TP group: a single rank
+        return 0
+
+
+def kv_owner_block() -> Tuple[int, int]:
+    """#239 S3g: (cp_S, cp_ratio) of this rank's owner share under the token
+    cut, (0, 0) off the weighted lane -- the geometry ``KvTensorGeom`` maps a
+    stage's global tokens to this rank's compacted rows with."""
+    try:
+        from sglang.srt.distributed.utils import uneven_dcp_owner_bounds
+    except ImportError:
+        return (0, 0)
+    b = uneven_dcp_owner_bounds()
+    if b is None:
+        return (0, 0)
+    S, lo, hi = (int(x) for x in b)
+    return (S, hi - lo) if hi > lo else (0, 0)
+
+
+def _worker_stages_here() -> bool:
+    """#239 S3g: a Form A worker the launcher gave its own stage rows
+    (SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK, this rank's entry > 0) stages its
+    KV like the host: born at S0, grown at the wake from those rows."""
+    from sglang.srt.environ import envs
+
+    form = stage_form()
+    return (form is not None and int(form.rows_on) > 0
+            and bool(_ints(envs.SGLANG_WEG2_D_KV_STAGE_ROWS_BY_RANK.get())))
+
+
+def owner_block_for(pool_size: int) -> Tuple[int, int]:
+    """#239 S3g: (cp_S, cp_ratio) when ``pool_size`` is this rank's compacted
+    owner share of the top stage -- ``dcp_compact_pool_rows(top)`` = (top // S
+    + 1) x ratio rows of a token-cut FA pool (a worker's, or the host's under a
+    cut that gives it a share); (0, 0) for every pool that holds the whole
+    context (Form A's host KV, the QSA keys, the draft KV) -- byte-identical."""
+    form = stage_form()
+    S, ratio = kv_owner_block()
+    if form is None or S <= 0 or ratio <= 0 or ratio >= S:
+        return (0, 0)
+    return (S, ratio) if int(pool_size) == (int(form.tokens[-1]) // S + 1) * ratio else (0, 0)
+
+
+def kv_stage_trims_here(pool_size: int) -> bool:
+    """#251c: this rank trims its KV tensors to S0 at birth -- the stage form
+    is armed, the pool is the top stage's, and this is NOT a Form A worker.
+    rc12z11 (590fa56a02, 28.09. 09:01Z and 09:09Z): the workers' QSA keys were
+    trimmed like TP0's KV. The stage pages are TP0's only (the planner prices
+    them there); a worker's tensors stay H95c's, byte for byte.
+
+    #239 S3g: a compacted token-cut FA pool (``owner_block_for``) is the top
+    stage's too. A worker trims only with its own stage rows
+    (``_worker_stages_here``) -- then every KV tensor it holds, its QSA keys
+    included: they follow the stage as the planner books them (S0), grown at
+    the wake from the worker's rows. rc12z11's fault (a worker trimming with
+    no rows to grow from, and under the fill kernel) cannot recur: no rows,
+    no trim; the birth syncs before a page goes (``_sync_before_unmap``)."""
+    form = stage_form()
+    if form is None:
+        return False
+    top = int(pool_size) >= form.tokens[-1] or owner_block_for(pool_size) != (0, 0)
+    if not _form_a_worker():
+        return top
+    return top and _worker_stages_here()
+
+
+def kv_stage_boot_rows(pool_size: int, page_size: int) -> Optional[int]:
+    """#251c: the rows a stage-form pool keeps mapped from its birth to the
+    first wake (S0's tokens + the page), None where this rank trims nothing.
+    #239 S3g: a compacted owner-share pool keeps S0's compacted rows + the page."""
+    if not kv_stage_trims_here(pool_size):
+        return None
+    form = stage_form()
+    return stage_mapped_rows(pool_size, int(form.tokens[0]), page_size)
+
+
+def bound_stage_rows(pool, rows: int) -> None:
+    """#251c: tell a KV pool (and a hybrid pool's full-attention pool) which
+    rows its stage keeps mapped -- through MHATokenToKVPool.set_stage_backed_rows,
+    whose ``safe_zero_rows`` / ``_committed_row_bound`` read it. Never assign
+    ``safe_zero_rows``: it is a property (rc12z13 died on exactly that)."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+    subs = [pool]
+    if isinstance(pool, HybridLinearKVPool):
+        subs.append(pool.full_kv_pool)
+    for sub in subs:
+        if isinstance(sub, MHATokenToKVPool):
+            sub.set_stage_backed_rows(rows)
+
+
+def stage_mapped_rows(pool_size: int, tokens: int, page_size: int) -> int:
+    """#239 S3g: the rows a pool of ``pool_size`` keeps mapped at a stage of
+    ``tokens`` -- the stage's tokens + the page (#251c), or on a token-cut
+    FA pool (``owner_block_for``) the stage's compacted rows + the page."""
+    S, ratio = owner_block_for(pool_size)
+    if S > 0:
+        return (int(tokens) // S + 1) * ratio + int(page_size)
+    return int(tokens) + int(page_size)
+
+
+def bound_stage_tokens(pool, tokens: int, page_size: int) -> None:
+    """#239 S3g: ``bound_stage_rows`` with each (sub-)pool's own geometry --
+    a hybrid pool's FA sub-pool may be a compacted owner share while the
+    draft's pool holds the whole context."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+    subs = [pool]
+    if isinstance(pool, HybridLinearKVPool):
+        subs.append(pool.full_kv_pool)
+    for sub in subs:
+        if isinstance(sub, MHATokenToKVPool):
+            sub.set_stage_backed_rows(
+                stage_mapped_rows(int(getattr(sub, "size", 0) or 0), tokens, page_size))
+
+
+def kv_stage_pool_tokens(max_tokens: int, *, is_form_a_worker: bool = False,
+                         is_draft_worker: bool = False, draft_shares_slots: bool = True) -> int:
+    """#251c ``_config_from_budget``: the KV pool's rows are the TOP stage's
+    (virtual -- the graphs keep one address range); the pages behind them are
+    S0's (``kv_stage_born``). The budget must hold S0 on the attention host:
+    below it the boot form the planner priced does not fit, refused by name.
+    A Form A worker holds no KV: its (replicated) allocator takes the same
+    rows without a budget check -- its page ids stay in step with TP0's --
+    and none of its tensors is trimmed (``kv_stage_trims_here``). Off:
+    ``max_tokens`` unchanged."""
+    form = stage_form()
+    if form is None:
+        return int(max_tokens)
+    if is_draft_worker and not draft_shares_slots:
+        # review 28.09. (#251c (c)): a draft pool is sized at the top stage and
+        # born with only S0's pages, but only the TARGET's allocator is capped
+        # to S0 (kv_stage_boot_cap). That is sound only while the draft writes
+        # at the target's slot ids (MTP/EAGLE share the allocator). A draft
+        # with its OWN allocator (the DFlash solo host) would hand out ids above
+        # S0 onto unmapped pages -- refused by name at the boot instead.
+        raise Weg2DSeatVramRefused(
+            "%s: the KV stage form needs the draft to write at the target's slot ids; this "
+            "draft worker has its own allocator (solo host), whose ids are not capped to "
+            "stage S0 -- turn the stage form off (SGLANG_WEG2_D_KV_STAGE_TOKENS) for this "
+            "draft form" % LINE_MARK)
+    is_form_a_worker = bool(is_form_a_worker) or _form_a_worker()
+    if is_form_a_worker and _form_a_worker_holds_kv() and not _worker_stages_here():
+        # 28.09. (M1 prep): this worker holds full-attention KV under the token
+        # cut; its compacted FA pool follows max_total, and nothing here trims
+        # it -- the top stage would be mapped whole (+100 % FA KV at S0 x 2).
+        raise Weg2DSeatVramRefused(
+            "%s: the KV stage form %s reached a Form A worker that holds full-attention "
+            "KV under the token cut -- its pool would be mapped at the top stage, "
+            "untrimmed; stages per KV rank are S3g. Run the cut with one stage "
+            "(SGLANG_WEG2_D_KV_STAGE_TOKENS=<kv tokens>) until then"
+            % (LINE_MARK, list(form.tokens)))
+    if not is_form_a_worker and int(max_tokens) < form.tokens[0]:
+        raise Weg2DSeatVramRefused(
+            "%s: the KV budget holds %d tokens, below stage S0 = %d -- the boot form "
+            "the planner priced does not fit this rank" % (LINE_MARK, int(max_tokens),
+                                                         form.tokens[0]))
+    return int(form.tokens[-1])
+
+
+#: the attention host's KV tensors, trimmed to S0 the moment they are born
+#: (``kv_stage_born``), in birth order: (data_ptr, geometry). Process-local;
+#: TP0 only (a Form A worker trims none, ``kv_stage_trims_here``).
+_KV_BORN: List[Tuple[int, KvTensorGeom]] = []
+#: the span plan each of them was born with, keyed (data_ptr, geometry, stage
+#: tokens, granule) -- a key that also names what the plan was computed from:
+#: the saver mapped one extent per range, the controller checks them at its build
+_KV_BORN_SPANS: Dict[tuple, Tuple[Tuple[int, int], ...]] = {}
+
+
+def kv_stage_born(t, *, pool_size: int, page_size: int, name: str = "kv",
+                  tokens_per_slot: int = 1, layers: int = 1, slots: Optional[int] = None,
+                  spans: Optional["TmsSpans"] = None, granule: Optional[int] = None):
+    """#251c: a KV tensor of a stage-form pool keeps its TOP-stage range but
+    only S0's pages -- trimmed right here, one tensor at a time, so the boot
+    never holds the top stage's pages (~3.5 GiB on NF) even for an instant.
+    Every other tensor passes through untouched (no form, another pool size).
+    ``layers``/``slots``: a layer-major ``[L, slots x ...]`` tensor (the QSA
+    compressed keys: one slot per ``tokens_per_slot`` tokens)."""
+    form = stage_form()
+    if form is None or t is None or not t.numel() or not kv_stage_trims_here(pool_size):
+        return t
+    spans = tms() if spans is None else spans
+    info = spans.info(t.data_ptr()) if spans.available else None
+    if info is None:
+        raise Weg2DSeatVramRefused(
+            "%s: the KV tensor %s (%.1f MiB) is not a saver allocation -- its "
+            "top-stage pages could not be unmapped and would sit on the card "
+            "unpriced. Turn SGLANG_OPT_WEG2_D_SEAT_VRAM off for this boot."
+            % (LINE_MARK, name, t.numel() * t.element_size() / _MIB))
+    g = int(granule or granule_for(t.device))
+    n_slots = int(slots if slots is not None else t.shape[0])
+    slot_bytes = (t.numel() * t.element_size()) // max(1, int(layers) * n_slots)
+    geom = KvTensorGeom(
+        SlotTensorGeom(name, int(layers), n_slots, int(slot_bytes), int(info.size)),
+        token_ratio=int(tokens_per_slot), token_pad=int(page_size),
+        # #239 S3g: a token-cut FA pool holds its owner share, compacted
+        owner_block=owner_block_for(pool_size))
+    # the tensor was born by torch.zeros: its fill kernel may still be in
+    # flight. Unmapping under it is a GPU fault that surfaces at the next
+    # sync (rc12z11 TP1/TP2: KvRowCap._apply, exit -6) or as a dead context
+    # at the next launch (rc12z11 TP0: segfault in fill_kernel_cuda). H95c's
+    # apply_stage synchronizes before a page goes; the birth must as well.
+    _sync_before_unmap(t)
+    # PA review of 1bab093912: born UNCUT, the per-layer ranges of a small
+    # layer-major tensor (the QSA keys: layers far below the 2 MiB granule)
+    # coalesce into one extent across the stage lattice, and the first live
+    # KV move (S0 -> S1 with the KV mapped) stops with W-SEAT-WIPE mid-run.
+    # Born at the lattice (``SeatVram.kv_spans``' cuts), every extent is a cell.
+    born = slot_spans(geom.geom, geom.slots_for(form.tokens[0]), g,
+                      cuts=[geom.slots_for(tk) for tk in form.tokens])
+    rc = spans.set_spans(t.data_ptr(), born, now=True)
+    if rc != 0:
+        raise Weg2DSeatVramRefused("%s: trimming the KV tensor %s to stage S0 failed "
+                                   "(tms_set_spans rc=%d)" % (LINE_MARK, name, rc))
+    _KV_BORN.append((int(t.data_ptr()), geom))
+    _KV_BORN_SPANS[(int(t.data_ptr()), geom, tuple(form.tokens), g)] = tuple(born)
+    return t
+
+
+def kv_stage_boot_cap(allocator, page_size: int) -> Optional[int]:
+    """#251c: the allocator of a stage-form pool hands out only S0's pages
+    until the first wake says otherwise (every rank, replicated). Returns the
+    page cap, None when off."""
+    form = stage_form()
+    if form is None or allocator is None:
+        return None
+    pages = _engage_kv_cap(allocator, form.tokens[0], page_size)
+    log_kv_stage_boot(form, allocator, pages)
+    return pages
+
+
+def log_kv_stage_boot(form: "StageForm", allocator, cap_pages: int) -> None:
+    """One line per rank at the boot (rc12z13: no line said whether TP0 had
+    trimmed to S0 and the workers had not): the form, whether this rank trims,
+    the KV tensors born trimmed with their mapped bytes against the VA the
+    top stage reserves, and the allocator cap."""
+    spans = tms()
+    va = mapped = 0
+    for ptr, _geom in _KV_BORN:
+        info = spans.info(ptr) if spans.available else None
+        if info is not None:
+            va += int(info.size)
+            mapped += int(info.mapped)
+    logger.info(
+        "#251c KV-STAGE form=%s trims_here=%s born=%d mapped=%.1f/%.1f MiB cap_pages=%d/%d "
+        "(S0 %d tokens; a Form A worker trims only its token-cut FA pool, S3g)",
+        "/".join(str(t) for t in form.tokens),
+        bool(_KV_BORN) or kv_stage_trims_here(form.tokens[-1]), len(_KV_BORN),
+        mapped / _MIB, va / _MIB,
+        int(cap_pages), int(getattr(allocator, "num_pages", 0) or 0), form.tokens[0])
+
+
+def _sync_before_unmap(t) -> None:
+    """Every kernel that may still write ``t`` is done before a page of it is
+    unmapped (a CPU tensor -- the unit tests' -- has none)."""
+    if getattr(t, "is_cuda", False):
+        import torch
+
+        torch.cuda.synchronize(t.device)
+
+
+def _engage_kv_cap(allocator, tokens: int, page_size: int) -> int:
+    from sglang.srt.managers.kv_backing_relief import KvRowCap
+
+    cap = getattr(allocator, "_weg2_kv_stage_cap", None)
+    if cap is None:
+        cap = KvRowCap(allocator)
+        allocator._weg2_kv_stage_cap = cap
+    pages = int(tokens) // max(1, int(page_size))
+    if pages >= int(getattr(allocator, "num_pages", pages)):
+        if cap.engaged:
+            cap.release()
+        return pages
+    # KvRowCap.engage only ever withholds MORE (it moves free ids above the
+    # cap out of the free lists); a stage that rises must first hand back
+    # what the lower cap held, then withhold above the new one
+    if cap.engaged and cap.cap is not None and pages > int(cap.cap):
+        cap.release()
+    cap.engage(pages)
+    return pages
+
+
+def max_live_page(allocator) -> int:
+    """The highest page id a request holds (0 = none): every id that is in
+    no free list and not withheld. Replicated like the allocator itself."""
+    import torch
+
+    n = int(getattr(allocator, "num_pages", 0) or 0)
+    if n <= 0:
+        return 0
+    live = torch.ones(n + 1, dtype=torch.bool)
+    live[0] = False
+    for name in ("free_pages", "release_pages"):
+        ids = getattr(allocator, name, None)
+        if ids is not None and ids.numel():
+            live[ids.detach().to("cpu", torch.int64)] = False
+    cap = getattr(allocator, "_weg2_kv_stage_cap", None)
+    held = getattr(cap, "_withheld", None) if cap is not None else None
+    if held is not None and held.numel():
+        live[held.to("cpu", torch.int64)] = False
+    idx = torch.nonzero(live).flatten()
+    return int(idx.max()) if idx.numel() else 0
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +1243,8 @@ def presplit_seat_rows(layer) -> int:
         return 0
     if str(os.environ.get(POOL_GRAPH_MODE_ENV, "")).strip().lower() != "pool":
         return 0
-    x = extra_rows_for_rank(int(getattr(layer, "moe_tp_rank", 0) or 0))
+    rank = int(getattr(layer, "moe_tp_rank", 0) or 0)
+    x = extra_rows_for_rank(rank)
     if x <= 0:
         return 0
     if not tms().available:
@@ -393,7 +1253,14 @@ def presplit_seat_rows(layer) -> int:
             "saver has no span map (tms_set_spans, tms_csrc patch 3) -- the bank stays "
             "at its cap form, no seat rows", LINE_MARK, x)
         return 0
-    return int(x)
+    # D-TRANSIENT-LEND: a virtual head above the planner's seat rows (VA only);
+    # the capture floor and the stage cells never count it (seat_lend_head)
+    head = lend_head_rows_for_rank(rank)
+    try:
+        layer._weg2_seat_lend_head = int(head)
+    except AttributeError:  # a slotted test double: no head
+        head = 0
+    return int(x) + int(head)
 
 
 def seat_expert_buffer(*, rows: int, extra: int, tail: Tuple[int, ...], dtype, device,
@@ -469,6 +1336,14 @@ class PhaseState:
     done: bool = False
     slot_limit: Optional[int] = None
     note: str = ""
+    #: #251c: the phase's KV stage (None without a stage form), its tokens,
+    #: the wake's demand and whether it exceeds the highest usable stage
+    stage: Optional[int] = None
+    stage_tokens: Optional[int] = None
+    demand: Optional[int] = None
+    over: bool = False
+    #: D-SEAT-REWAKE: this rank's measured ms of the wake's page apply
+    apply_ms: Optional[float] = None
 
 
 @dataclass
@@ -481,6 +1356,9 @@ class PhaseApplied:
     expert_mapped: int
     cap_mapped: int
     note: str = ""
+    #: #251c: the stage this rank mapped and its KV prefix
+    stage: Optional[int] = None
+    kv_mapped: int = 0
 
 
 @dataclass
@@ -500,16 +1378,152 @@ class SeatVram:
     applied: Optional[PhaseApplied] = None
     #: the MambaPool whose ``reset_state`` must zero only mapped slots
     mamba_pool: object = None
+    #: NF1c 09291739: the GDN slots that HAVE pages -- the keep of the last
+    #: plan actually set on the (paused) pool, None = every slot. A live apply
+    #: never re-plans the pool, so it never moves this (``_plan_mamba``).
+    mamba_keep: Optional[int] = None
+    #: #251c: the KV tensors born trimmed (``kv_stage_born``), the stage form,
+    #: the KV pools whose flush must stay in the mapped prefix, the cells
+    kv_tensors: List[_Managed] = field(default_factory=list)
+    form: Optional[StageForm] = None
+    kv_pools: List[object] = field(default_factory=list)
+    cells: Dict[Tuple[int, int], StageCell] = field(default_factory=dict)
+    #: the expert rows ON as last applied (the bank is born at k = 0)
+    rows_on: int = 0
+    #: S1-Wisch (rc12z17 28.09.): every k a phase of this rank can take -- the
+    #: bank's span plans are cut at ``rows_boot + k`` for all of them
+    row_cut_ks: Tuple[int, ...] = ()
+    #: D-MEM-SCHED (27B condition 1): rows displaced / turned on again by a
+    #: live apply, and the milliseconds its stream syncs took
+    evicted_rows: int = 0
+    refilled_rows: int = 0
+    sync_ms: float = 0.0
+    #: coldest-first moves (27B): bank bytes copied and the milliseconds the
+    #: copy + table writes took up to the sync that lands them (> 1 ms per
+    #: round: the copy goes to the copy stream with an event)
+    bytes_copied: int = 0
+    copy_ms: float = 0.0
+    #: D-SEAT-REWAKE: the last live re-seat's pause in parts (ms)
+    last_reseat_parts: Dict[str, float] = field(default_factory=dict)
+    #: D-TRANSIENT-LEND: the virtual head above the planner's seat rows (VA
+    #: only, never in a cell), the bank's top, the rows ON a lend started
+    #: from (None = nothing lent) and the rows lent / given back in total
+    lend_head: int = 0
+    x_max: int = 0
+    lent_from: Optional[int] = None
+    lent_rows: int = 0
+    returned_rows: int = 0
+    #: the last span plan set on each managed allocation; after its tag's
+    #: resume or a live apply it IS the saver's extents (one per range)
+    spans_by_ptr: Dict[int, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
 
     def __post_init__(self):
         x_max = min((int(getattr(c, "seat_rows", 0)) for c in self.caches), default=0)
+        # D-TRANSIENT-LEND: the head is VA for a lend only -- the phase table
+        # and the stage cells see the planner's rows (byte-identical form)
+        head = min((int(getattr(c, "seat_lend_head", 0) or 0) for c in self.caches), default=0)
+        self.lend_head = max(0, min(int(head), x_max))
+        self.x_max = int(x_max)
+        x_cells = x_max - self.lend_head
         self.rows = seat_vram_rows(
             [m.geom for m in self.slot_tensors], [m.geom for m in self.row_tensors],
-            cap=self.cap, pool_size=self.pool_size, extra_max=x_max, granule=self.granule)
+            cap=self.cap, pool_size=self.pool_size, extra_max=x_cells, granule=self.granule)
+        if self.form is not None and self.kv_tensors:
+            self.cells = stage_vram_cells(
+                [m.geom for m in self.slot_tensors], [m.geom for m in self.row_tensors],
+                [m.geom for m in self.kv_tensors], cap=self.cap, pool_size=self.pool_size,
+                extra_max=x_cells, stage_tokens=self.form.tokens,
+                boot_rows_on=self.form.rows_on, granule=self.granule)
+            check_form_against_cells(self.form, self.cells, self.cap)
+        # F5 (27B 28.09.): a rank with its own stage rows but no KV cells is
+        # refused at the wake too, not only at the capture
+        check_stage_rows_have_kv(self.form, self.cells)
+        ks = {0, int(self.form.rows_on) if self.form is not None else 0}
+        ks.update(int(r.extra_rows) for r in self.rows)
+        for c in self.cells.values():
+            ks.add(int(c.extra_rows))
+            if int(c.rows_full) >= 0:
+                ks.add(int(c.rows_full))
+        if lend_armed():
+            # D-TRANSIENT-LEND: a lend ends on the lattice, so it and its
+            # return release whole cells only (S1-Wisch) from any phase's k
+            from sglang.srt.environ import envs
+
+            ks.update(lend_lattice(x_max, int(envs.SGLANG_WEG2_D_LEND_STEP_ROWS.get())))
+        self.row_cut_ks = tuple(sorted(k for k in ks if 0 <= k <= max(0, x_max)))
+        # the extents the birth trims left (seat_expert_buffer: the cap form's
+        # rows; kv_stage_born: stage S0), both one range per span, no cuts
+        for m in self.row_tensors:
+            self.spans_by_ptr.setdefault(int(m.ptr), row_spans(m.geom, m.geom.rows_boot, self.granule))
+        if self.form is not None:
+            for m in self.kv_tensors:
+                born = _KV_BORN_SPANS.get(
+                    (int(m.ptr), m.geom, tuple(self.form.tokens), int(self.granule)))
+                if born is None:
+                    born = slot_spans(m.geom.geom, m.geom.slots_for(self.form.tokens[0]),
+                                      self.granule)
+                self.spans_by_ptr.setdefault(int(m.ptr), tuple(born))
+                # PA review: a birth extent across the lattice would stop the
+                # first live KV move mid-run -- stop at the build instead
+                cut = straddling(self.spans_by_ptr[int(m.ptr)],
+                                 self.kv_spans(m, self.form.tokens[0]))
+                if cut is not None:
+                    raise Weg2DSeatVramWipe(
+                        "%s %s at the controller's build: the KV tensor %s was born with the "
+                        "extent [%d, %d) across the stage lattice -- the first live KV move "
+                        "would release it and map it fresh. Stopped before the first phase."
+                        % (LINE_MARK, WIPE_CODE, m.geom.geom.name, cut[0], cut[1]))
+
+    def bank_spans(self, m: "_Managed", k: int) -> Tuple[Tuple[int, int], ...]:
+        """The bank tensor's plan for ``k`` rows ON, cut at every k a phase
+        can take (``row_spans`` cuts)."""
+        return row_spans(m.geom, m.geom.rows_boot + int(k), self.granule,
+                         cuts=[m.geom.rows_boot + c for c in self.row_cut_ks])
+
+    def kv_spans(self, m: "_Managed", tokens: int) -> Tuple[Tuple[int, int], ...]:
+        """A KV tensor's plan for a stage of ``tokens``, cut at every stage."""
+        cuts = [m.geom.slots_for(t) for t in self.form.tokens] if self.form is not None else []
+        return slot_spans(m.geom.geom, m.geom.slots_for(tokens), self.granule, cuts=cuts)
+
+    def refuse_wipes(self, plans: Sequence[Tuple[int, str, Tuple[Tuple[int, int], ...], bool]]) -> None:
+        """Before this apply moves anything: a live plan that would release an
+        extent holding bytes the plan keeps stops by name (the saver maps a
+        released range FRESH -- rc12z17's wiped bank). This apply's plans,
+        tables and pages are untouched then; what the wake did before the
+        apply (``on_wake``: the phase limit, the KV cap) stays done."""
+        for ptr, name, spans, live in plans:
+            prev = self.spans_by_ptr.get(int(ptr))
+            if not live or prev is None:
+                continue
+            cut = straddling(prev, spans)
+            if cut is not None:
+                raise Weg2DSeatVramWipe(
+                    "%s %s: a live apply would release the mapped extent [%d, %d) of %s, "
+                    "whose bytes the new plan keeps -- the saver maps a released range "
+                    "fresh (rc12z17 10:51:24: the whole expert bank). No plan, table or "
+                    "page of this apply moved; the wake's phase limit and KV cap were "
+                    "already set." % (LINE_MARK, WIPE_CODE, cut[0], cut[1], name))
+
+    def set_plan(self, ptr: int, name: str, spans: Tuple[Tuple[int, int], ...], *,
+                 live: bool, census: Optional[Dict[str, int]] = None) -> None:
+        """``tms_set_spans`` of one managed allocation, recorded; a live one
+        counts its extents kept / cells freed / cells mapped into ``census``."""
+        prev = self.spans_by_ptr.get(int(ptr))
+        if live and census is not None and prev is not None:
+            kept = [e for e in prev if any(lo <= e[0] and e[1] <= hi for lo, hi in spans)]
+            census["kept"] += len(kept)
+            census["freed"] += sum(1 for a, b in prev if all(b <= lo or a >= hi for lo, hi in spans))
+            census["mapped"] += sum(1 for r in spans if r not in kept)
+            census["tensors"] += 1
+        rc = self.spans.set_spans(ptr, spans, now=live)
+        if rc != 0:
+            cls = Weg2DSeatVramNoMemory if (live and rc == TMS_RC_OUT_OF_MEMORY) else Weg2DSeatVramRefused
+            raise cls("%s: tms_set_spans(%s, now=%s) rc=%d" % (LINE_MARK, name, live, rc))
+        self.spans_by_ptr[int(ptr)] = tuple(spans)
 
     @classmethod
     def from_runtime(cls, *, cap: int, req_to_token_pool, model, spans: Optional[TmsSpans] = None,
-                     granule: Optional[int] = None) -> "SeatVram":
+                     granule: Optional[int] = None, kv_pools: Sequence[object] = ()) -> "SeatVram":
         spans = tms() if spans is None else spans
         pool = getattr(req_to_token_pool, "mamba_pool", None)
         pool_size = int(getattr(pool, "size", 0) or 0)
@@ -543,18 +1557,342 @@ class SeatVram:
                 row_tensors.append(_Managed(buf.data_ptr(), RowTensorGeom(
                     "%s.%s" % (getattr(cache.layer, "layer_id", "?"), attr), rows_boot,
                     rows_boot + x, row_bytes, int(info.size))))
+        form = stage_form()
+        kv_tensors = [_Managed(ptr, geom) for ptr, geom in _KV_BORN] if form is not None else []
         return cls(cap=int(cap), pool_size=pool_size, slot_tensors=slot_tensors,
                    row_tensors=row_tensors, caches=caches, fixed_bytes=int(fixed),
-                   spans=spans, granule=g, mamba_pool=pool)
+                   spans=spans, granule=g, mamba_pool=pool, kv_tensors=kv_tensors,
+                   form=form, kv_pools=list(kv_pools))
 
     def row_for(self, n: int) -> SeatVramRow:
         return self.rows[max(1, min(int(n), self.cap)) - 1]
+
+    def _plan_mamba(self, infos, keep: int) -> None:
+        """The GDN pool's plan for ``keep`` slots -- set on a PAUSED pool only
+        (mapped at its tag's resume); a live pool keeps the pages it has.
+
+        ``MambaPool.reset_state`` (the flush at the wake and before the next
+        sleep) zeroes only ``[:, :_weg2_seat_keep]``, so that value must name
+        the pages the pool HAS, not the form this apply wanted: NF1c 09291739
+        the D-MEM-SCHED tick's live S1 -> S0 wrote None ("keeps its cap form")
+        over a pool mapped for one seat (slots 1..7); the sleep flush zeroed
+        the whole temporal -> FillFunctor<BFloat16> device exception on the
+        unmapped tail, 58 GB GPU coredump, abort in torch.cuda.synchronize."""
+        planned = False
+        rewake = _rewake_on()
+        for m, info in zip(self.slot_tensors, infos):
+            if info is not None and not info.active:
+                # D-SEAT-REWAKE: the plan is cut at every keep a phase can take,
+                # so a live shrink frees whole cells and never wipes a kept one
+                sp = (slot_spans(m.geom, keep, self.granule, cuts=self.mamba_cut_keeps())
+                      if rewake else slot_spans(m.geom, keep, self.granule))
+                rc = self.spans.set_spans(m.ptr, sp, now=False)
+                if rc != 0:
+                    raise Weg2DSeatVramRefused("%s: tms_set_spans(%s) rc=%d"
+                                               % (LINE_MARK, m.geom.name, rc))
+                if rewake:
+                    self.spans_by_ptr[int(m.ptr)] = tuple(sp)
+                planned = True
+        if planned:
+            self.mamba_keep = None if keep > self.pool_size else int(keep)
+        if self.mamba_pool is not None and self.slot_tensors:
+            self.mamba_pool._weg2_seat_keep = self.mamba_keep
+
+    def apply_stage(self, n: int, stage: int) -> PhaseApplied:
+        """#251c: the pages of a phase of ``n`` seats at KV stage ``stage``
+        (``stage_vram_cells``): the GDN slots, the KV prefix and the expert
+        rows ON move together, the total never above the boot form. Paused
+        allocations get a plan (mapped at their tag's resume), mapped ones move
+        in place. A LIVE bank that shrinks turns its rows OFF in the tables
+        first and synchronizes before a page goes (a row a kernel may still
+        read is never unmapped); one that grows maps first, then turns ON.
+        Every plan is cut at the lattice of all phases (``bank_spans`` /
+        ``kv_spans``): a live move releases only whole cells above the new
+        end -- rc12z17's single-extent bank was released WHOLE by the shrink
+        33 -> 23 and mapped fresh (``refuse_wipes`` stops that by name)."""
+        import torch
+
+        n = max(1, min(int(n), self.cap))
+        j = max(0, min(int(stage), len(self.form.tokens) - 1))
+        cell = self.cells[(n, j)]
+        notes = []
+        k, keep = int(cell.extra_rows), int(cell.mamba_keep)
+        infos = [self.spans.info(m.ptr) for m in self.slot_tensors]
+        live_gdn = any(i is not None and i.active for i in infos)
+        if live_gdn and _rewake_on():
+            # D-SEAT-REWAKE: the live GDN pool is whatever the wake or a live
+            # re-seat mapped for THIS phase's n -- the stage move books the
+            # rows that fit beside exactly those pages (never the cap form's
+            # GDN, whose cells a SHRINK gave back to the experts) and moves
+            # no GDN page (the re-seat alone does, at its own round)
+            live_keep = self.pool_size + 1 if self.mamba_keep is None else int(self.mamba_keep)
+            if live_keep <= self.pool_size and cell.rows_shrunk >= 0 and live_keep == cell.slot_limit + 1:
+                k, keep = int(cell.rows_shrunk), live_keep
+                notes.append("the GDN pool is live for %d seats: rows beside it" % n)
+            else:
+                # the cap form (or a keep this n does not name): the rows that
+                # fit beside the cap form's GDN -- never more than the pages hold
+                if cell.rows_full < 0:
+                    raise Weg2DSeatVramRefused(
+                        "%s: stage S%d at n=%d needs the GDN pages of the empty seats but the "
+                        "Mamba pool is mapped (live) in its cap form" % (LINE_MARK, j, n))
+                k, keep = int(cell.rows_full), live_keep
+                if live_keep <= self.pool_size:
+                    notes.append("the live GDN pool keeps %d slots, not n=%d's %d: rows of the cap "
+                                 "form" % (live_keep - 1, n, cell.slot_limit))
+        elif keep <= self.pool_size and live_gdn:
+            if cell.rows_full < 0:
+                raise Weg2DSeatVramRefused(
+                    "%s: stage S%d at n=%d needs the GDN pages of the empty seats but the "
+                    "Mamba pool is mapped (live) -- the stage was chosen for a wake whose "
+                    "pool must already be paused" % (LINE_MARK, j, n))
+            notes.append("the Mamba pool is mapped (live): it keeps its cap form")
+            k, keep = int(cell.rows_full), self.pool_size + 1
+        experts_live = any(
+            (lambda i: i is not None and i.active)(self.spans.info(m.ptr))
+            for m in self.row_tensors)
+        tokens = int(self.form.tokens[j])
+        kv_plans = []
+        for m in self.kv_tensors:
+            info = self.spans.info(m.ptr)
+            kv_plans.append((m, self.kv_spans(m, tokens), info is not None and info.active))
+        bank_plans = []
+        for m in self.row_tensors:
+            info = self.spans.info(m.ptr)
+            bank_plans.append((m, self.bank_spans(m, k), info is not None and info.active))
+        self.refuse_wipes([(m.ptr, m.geom.geom.name, sp, lv) for m, sp, lv in kv_plans]
+                          + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
+        shrink = k < int(self.rows_on)
+        if shrink:
+            self._rows_off_live(k, experts_live)
+        self._plan_mamba(infos, keep)
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        # D-MEM-SCHED: a LIVE KV prefix that shrinks between rounds -- every
+        # kernel that may still read a page above the new end is done first
+        # (the runtime tick only shrinks below pages no request holds)
+        was = self.applied.stage if self.applied is not None else None
+        if (was is not None and tokens < int(self.form.tokens[int(was)])
+                and any(lv for _m, _sp, lv in kv_plans)
+                and torch.cuda.is_initialized()):
+            self._timed_sync()
+        # RB (NF y3w e033a931db, D 01:45:51, S7 -> S8 at incoming=77427):
+        # RELEASE BEFORE MAP. The KV prefix used to be mapped first and the
+        # expert bank released after it, so a grow that the planner paid
+        # with expert rows (rows_on 15/12 -> 6) needed the rows' pages AND
+        # the new KV pages at once. TP0/TP1 had the slack (card_free 2535 MiB
+        # on TP0), TP2 (3080, card_free 758 MiB) did not:
+        # ``WEG2-TMS-RESUME cuMemCreate FAILED rc=2 (out of memory)
+        # size=37748736`` -> Weg2DSeatVramRefused -> W17 group dead. The
+        # cell table never books more than the boot form, so with the
+        # shrinking side released first the growing side always fits:
+        # a bank that shrinks gives its cells back before the KV maps, a KV
+        # that shrinks (the loop order below, unchanged) before the bank maps.
+        if shrink:
+            self._set_bank_plans(bank_plans, census)
+        for m, sp, live in kv_plans:
+            self.set_plan(m.ptr, m.geom.geom.name, sp, live=live, census=census)
+        page = int(self.kv_tensors[0].geom.token_pad) if self.kv_tensors else 0
+        for pool in self.kv_pools:
+            # zero_kv_data_buffers (the idle flush) writes only mapped rows --
+            # #239 S3g: each pool's own (a token-cut FA pool: compacted)
+            bound_stage_tokens(pool, tokens, page)
+        if not shrink:
+            k = self._grow_bank_elastic(bank_plans, k, census)
+            for cache in self.caches:
+                cache.set_seat_rows_on(k, device_write=experts_live)
+        log_live_spans(census, n=n, stage=j, rows_from=int(self.rows_on), rows_to=k,
+                       mamba_keep=self.mamba_keep, order="bank-first" if shrink else "kv-first")
+        if experts_live:
+            if k < int(self.rows_on):
+                self.evicted_rows += int(self.rows_on) - k
+            else:
+                self.refilled_rows += k - int(self.rows_on)
+        self.rows_on = k
+        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
+        applied = PhaseApplied(
+            n=n, extra_rows=k,
+            mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep, self.granule))
+                             for m in self.slot_tensors),
+            expert_mapped=sum(span_bytes(row_spans(m.geom, m.geom.rows_boot + k, self.granule))
+                              for m in self.row_tensors),
+            cap_mapped=int(cell.cap_mapped), note="; ".join(notes), stage=j,
+            kv_mapped=int(cell.kv_mapped))
+        self.applied = applied
+        return applied
+
+    def _set_bank_plans(self, bank_plans, census) -> None:
+        for m, sp, live in bank_plans:
+            self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
+
+    def _grow_bank_elastic(self, bank_plans, k: int, census) -> int:
+        """A growing bank takes the rows the card CAN back (y4g b8e559c3e3, D TP1
+        07:48:04, S8 -> S6 with rows_on 6 -> k: the KV prefix released first
+        (RB), yet ``WEG2-TMS-RESUME cuMemCreate FAILED rc=2 size=4194304`` on
+        the bank -> Weg2DSeatVramRefused -> W17 group dead; the same death in
+        e033a931db 09300130). Expert rows are elastic by law: a row the card
+        cannot map stays in the host store and the rank keeps decoding. On
+        rc=2 the rows ON above the current ``rows_on`` are halved until the map
+        fits; tensors already mapped for the larger count give the extra cells
+        back (their rows were never turned ON). At ``rows_on`` nothing new is
+        mapped, so a refusal there is a real one and stops by name."""
+        floor, want = int(self.rows_on), int(k)
+        while True:
+            plans = bank_plans if k == want else [
+                (m, self.bank_spans(m, k), live) for m, _sp, live in bank_plans]
+            try:
+                self._set_bank_plans(plans, census)
+            except Weg2DSeatVramNoMemory as exc:
+                if k <= floor:
+                    raise
+                k_next = floor + (k - floor) // 2
+                logger.warning(
+                    "%s BANK-GROW-ELASTIC rows_on %d->%d refused (%s); retrying with %d rows "
+                    "(the rows above stay in the host store)", LINE_MARK, floor, k, exc, k_next)
+                k = k_next
+                continue
+            if k != want:
+                logger.warning("%s BANK-GROW-ELASTIC rows_on %d -> %d of %d wanted (card short)",
+                               LINE_MARK, floor, k, want)
+            return k
+
+    def _rows_off_live(self, k: int, experts_live: bool) -> None:
+        """Turn bank rows OFF (coldest first) on a live bank: sync, then the
+        copies and table writes of every layer, then a sync that lands them
+        before the next forward and before a page goes."""
+        import time
+
+        import torch
+
+        live_cuda = experts_live and any(
+            getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
+                    "is_cuda", False) for c in self.caches)
+        # D-MEM-SCHED (27B 29.09.): every kernel that may still read a
+        # row -- source or coldest-first destination -- is done before a
+        # byte moves; the copies and the table writes of EVERY layer then
+        # land (second sync) before the next forward reads the routing
+        # and before a page of the dropped rows goes
+        if live_cuda:
+            self._timed_sync()
+        moved0 = self._bank_bytes_copied()
+        t0 = time.perf_counter()
+        for cache in self.caches:
+            cache.set_seat_rows_on(k, device_write=experts_live)
+        if live_cuda:
+            torch.cuda.synchronize()
+        ms = (time.perf_counter() - t0) * 1000.0
+        moved = self._bank_bytes_copied() - moved0
+        if moved > 0:
+            self.bytes_copied += moved
+            self.copy_ms += ms
+        elif live_cuda:
+            self.sync_ms += ms
+
+    def _bank_bytes_copied(self) -> int:
+        return sum(int(getattr(c, "_weg2_bank_bytes_copied", 0) or 0) for c in self.caches)
+
+    def warm_rows(self) -> int:
+        """KV-STAGE warm refill: rows the grows refilled with the experts the
+        shrink before sent away (summed over the layers)."""
+        return sum(int(getattr(c, "_weg2_seat_warmed", 0)) for c in self.caches)
+
+    def _timed_sync(self) -> None:
+        import time
+
+        import torch
+
+        t0 = time.perf_counter()
+        torch.cuda.synchronize()
+        self.sync_ms += (time.perf_counter() - t0) * 1000.0
+
+    def _bank_bytes_at(self, k: int) -> int:
+        """The bytes the bank's pages hold with ``k`` seat rows ON."""
+        return sum(span_bytes(self.bank_spans(m, k)) for m in self.row_tensors)
+
+    def _bank_live(self) -> bool:
+        return any((lambda i: i is not None and i.active)(self.spans.info(m.ptr))
+                   for m in self.row_tensors)
+
+    def lend_target(self, budget_bytes: int) -> int:
+        """D-TRANSIENT-LEND: the largest lattice k above ``rows_on`` whose bank
+        pages cost at most ``budget_bytes`` more than now; ``rows_on`` when no
+        step fits (pure arithmetic, no CUDA)."""
+        base = int(self.rows_on)
+        have = self._bank_bytes_at(base)
+        best = base
+        for c in self.row_cut_ks:
+            if c <= base or c > int(self.x_max):
+                continue
+            if self._bank_bytes_at(c) - have <= int(budget_bytes):
+                best = int(c)
+        return best
+
+    def lend(self, budget_bytes: int) -> int:
+        """D-TRANSIENT-LEND (user law 10:20Z): card bytes free between two
+        extends become expert rows. Only a LIVE bank of an applied phase
+        lends; the rows grow like every grow of this class -- map first, then
+        ON (no sync, no kernel reads a moved byte), halved if the card says
+        no (``_grow_bank_elastic``). The phase cell is not touched: the lend
+        rides above it until ``unlend`` or the next phase move. Returns the
+        rows added."""
+        if self.applied is None or not self.row_tensors or not self._bank_live():
+            return 0
+        base = int(self.rows_on)
+        want = self.lend_target(budget_bytes)
+        if want <= base:
+            return 0
+        plans = [(m, self.bank_spans(m, want), True) for m in self.row_tensors]
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        k = self._grow_bank_elastic(plans, want, census)
+        for cache in self.caches:
+            cache.set_seat_rows_on(k, device_write=True)
+        if k > base:
+            if self.lent_from is None:
+                self.lent_from = base
+            self.refilled_rows += k - base
+            self.lent_rows += k - base
+        self.rows_on = int(k)
+        applied = self.applied
+        log_live_spans(census, n=applied.n, stage=applied.stage, rows_from=base,
+                       rows_to=int(k), mamba_keep=self.mamba_keep, order="lend")
+        return int(k) - base
+
+    def unlend(self) -> int:
+        """D-TRANSIENT-LEND: the lent rows go back before anything that needs
+        the bytes (an extend, a stage move): rows OFF coldest first, sync,
+        then the cells above the phase's k are released (whole lattice cells,
+        S1-Wisch). Returns the rows given back."""
+        if self.lent_from is None:
+            return 0
+        base = int(self.lent_from)
+        cur = int(self.rows_on)
+        self.lent_from = None
+        if cur <= base:
+            return 0
+        live = self._bank_live()
+        plans = [(m, self.bank_spans(m, base), live) for m in self.row_tensors]
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in plans])
+        self._rows_off_live(base, live)
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        self._set_bank_plans(plans, census)
+        self.evicted_rows += cur - base
+        self.returned_rows += cur - base
+        self.rows_on = base
+        applied = self.applied
+        log_live_spans(census, n=applied.n if applied is not None else 0,
+                       stage=applied.stage if applied is not None else None,
+                       rows_from=cur, rows_to=base, mamba_keep=self.mamba_keep, order="return")
+        return cur - base
 
     def apply(self, n: int) -> PhaseApplied:
         """The pages of a phase of ``n`` seats (``n`` = cap: the cap form).
         Called BEFORE the saver resumes the tag of a paused allocation (its
         plan is set) and at any time for a mapped one (the expert bank grows
-        or shrinks in place)."""
+        or shrinks in place). A live shrink goes as in ``apply_stage``: rows
+        OFF in the tables first, synchronize, then the pages (PA review of
+        1bab093912: the pages went first here)."""
+        import torch
+
         n = max(1, min(int(n), self.cap))
         notes = []
         k = self.row_for(n).extra_rows if (self.slot_tensors and self.row_tensors) else 0
@@ -567,30 +1905,33 @@ class SeatVram:
             notes.append("the Mamba pool is mapped (live) at this request: it cannot "
                          "shrink, no seat rows this phase")
             k, keep = 0, self.pool_size + 1
-        for m, info in zip(self.slot_tensors, infos):
-            if info is not None and not info.active:
-                rc = self.spans.set_spans(m.ptr, slot_spans(m.geom, keep, self.granule), now=False)
-                if rc != 0:
-                    raise Weg2DSeatVramRefused("%s: tms_set_spans(%s) rc=%d"
-                                               % (LINE_MARK, m.geom.name, rc))
-        if self.mamba_pool is not None and self.slot_tensors:
-            # MambaPool.reset_state (the flush at the wake and before the next
-            # sleep) zeroes only the slots that have pages
-            self.mamba_pool._weg2_seat_keep = None if keep > self.pool_size else int(keep)
-        experts_live = False
+        self._plan_mamba(infos, keep)
+        bank_plans = []
         for m in self.row_tensors:
             info = self.spans.info(m.ptr)
-            live = info is not None and info.active
-            experts_live = experts_live or live
-            rc = self.spans.set_spans(
-                m.ptr, row_spans(m.geom, m.geom.rows_boot + k, self.granule), now=live)
-            if rc != 0:
-                raise Weg2DSeatVramRefused("%s: tms_set_spans(%s, now=%s) rc=%d"
-                                           % (LINE_MARK, m.geom.name, live, rc))
+            bank_plans.append((m, self.bank_spans(m, k), info is not None and info.active))
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
+        experts_live = any(lv for _m, _sp, lv in bank_plans)
+        shrink = int(k) < int(self.rows_on)
+        if shrink:
+            for cache in self.caches:
+                cache.set_seat_rows_on(k, device_write=experts_live)
+            if experts_live and any(
+                    getattr(getattr(getattr(c, "_pool_tables", None), "row_key", None),
+                            "is_cuda", False) for c in self.caches):
+                torch.cuda.synchronize()
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        for m, sp, live in bank_plans:
+            self.set_plan(m.ptr, m.geom.name, sp, live=live, census=census)
         # the tables: written now when the bank is mapped (the wake's rearm
         # already ran), else recorded for the rearm's reinit
-        for cache in self.caches:
-            cache.set_seat_rows_on(k, device_write=experts_live)
+        if not shrink:
+            for cache in self.caches:
+                cache.set_seat_rows_on(k, device_write=experts_live)
+        log_live_spans(census, n=n, stage=None, rows_from=int(self.rows_on), rows_to=int(k),
+                       mamba_keep=self.mamba_keep)
+        self.rows_on = int(k)
+        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
         applied = PhaseApplied(
             n=n, extra_rows=int(k),
             mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep, self.granule))
@@ -598,6 +1939,122 @@ class SeatVram:
             expert_mapped=sum(span_bytes(row_spans(m.geom, m.geom.rows_boot + k, self.granule))
                               for m in self.row_tensors),
             cap_mapped=int(self.row_for(self.cap).cap_mapped), note="; ".join(notes))
+        self.applied = applied
+        return applied
+
+    def mamba_cut_keeps(self) -> Tuple[int, ...]:
+        """D-SEAT-REWAKE: every GDN keep a phase of this rank can take (n =
+        1..cap, every stage cell) -- the lattice the Mamba plans are cut at."""
+        ks = {int(r.slot_limit) + 1 for r in self.rows}
+        ks.update(int(c.mamba_keep) for c in self.cells.values())
+        return tuple(sorted(k for k in ks if 0 < k <= self.pool_size))
+
+    def reseat_target(self, n: int, stage: Optional[int]) -> Tuple[int, int]:
+        """``(k, keep)`` of a phase of ``n`` seats: the expert rows ON and the
+        GDN slots per layer mapped (``pool_size + 1`` = every slot) -- the stage
+        cell when the stage form holds, else the H95c row."""
+        n = max(1, min(int(n), self.cap))
+        if stage is not None and self.cells:
+            cell = self.cells[(n, int(stage))]
+            return int(cell.extra_rows), int(cell.mamba_keep)
+        row = self.row_for(n)
+        k = int(row.extra_rows) if (self.slot_tensors and self.row_tensors) else 0
+        return k, ((int(row.slot_limit) + 1) if k > 0 else self.pool_size + 1)
+
+    def reseat_live(self, n: int, stage: Optional[int]) -> PhaseApplied:
+        """D-SEAT-REWAKE: the pages of a LIVE phase move from n seats to ``n``
+        (Nutzer 30.09.: "D sleeped ohne wirklich runterzufahren und waket
+        sofort wieder mit mehr sitzen"). Nothing sleeps: the GDN pool keeps the
+        cells of its slots in use and maps / frees only the cells of the seats
+        that come or go; the expert bank gives rows back or takes them.
+
+        GROW (more GDN slots): the bank's rows go OFF coldest first (sync,
+        copies, sync) and its cells are released BEFORE the GDN cells map --
+        release before map (RB), the card never holds both. SHRINK: a sync
+        (no kernel reads a freed slot), the GDN cells above the new keep go,
+        then the bank grows elastically (a row the card cannot back stays in
+        the host store). Every plan is cut at the lattice (``refuse_wipes``
+        stops a plan that would release a kept cell before anything moves)."""
+        n = max(1, min(int(n), self.cap))
+        k, keep = self.reseat_target(n, stage)
+        cur_keep = self.pool_size + 1 if self.mamba_keep is None else int(self.mamba_keep)
+        keep_eff = min(int(keep), self.pool_size + 1)
+        grow = keep_eff > cur_keep
+        mamba_plans = [(m, slot_spans(m.geom, keep_eff, self.granule, cuts=self.mamba_cut_keeps()))
+                       for m in self.slot_tensors]
+        bank_plans = [(m, self.bank_spans(m, k), True) for m in self.row_tensors]
+        self.refuse_wipes([(m.ptr, m.geom.name, sp, True) for m, sp in mamba_plans]
+                          + [(m.ptr, m.geom.name, sp, lv) for m, sp, lv in bank_plans])
+        census = {"kept": 0, "freed": 0, "mapped": 0, "tensors": 0}
+        rows_from = int(self.rows_on)
+        import time as _time
+
+        # the decode pause in parts (the metal's 200 ms bound, per term):
+        # off_copy = rows OFF (coldest-first copies + table writes), unmap =
+        # cells released, map = cells mapped (+ rows ON), sync = device syncs
+        parts = {"off_copy_ms": 0.0, "unmap_ms": 0.0, "map_ms": 0.0, "sync_ms": 0.0}
+
+        def _off(k_to: int) -> None:
+            s0, t = self.sync_ms, _time.perf_counter()
+            self._rows_off_live(k_to, True)
+            wall = (_time.perf_counter() - t) * 1000.0
+            ds = max(0.0, self.sync_ms - s0)
+            parts["sync_ms"] += ds
+            parts["off_copy_ms"] += max(0.0, wall - ds)
+
+        def _timed(key: str, fn) -> None:
+            t = _time.perf_counter()
+            fn()
+            parts[key] += (_time.perf_counter() - t) * 1000.0
+
+        def _map_gdn() -> None:
+            for m, sp in mamba_plans:
+                self.set_plan(m.ptr, m.geom.name, sp, live=True, census=census)
+
+        if grow:
+            if k < rows_from:
+                _off(k)
+                _timed("unmap_ms", lambda: self._set_bank_plans(bank_plans, census))
+            _timed("map_ms", _map_gdn)
+        else:
+            import torch
+
+            if torch.cuda.is_initialized():
+                s0 = self.sync_ms
+                self._timed_sync()  # no kernel may still read a slot whose cells go
+                parts["sync_ms"] += self.sync_ms - s0
+            _timed("unmap_ms", _map_gdn)
+            if k > rows_from:
+                t_map = _time.perf_counter()
+                k = self._grow_bank_elastic(bank_plans, k, census)
+                for cache in self.caches:
+                    cache.set_seat_rows_on(k, device_write=True)
+                parts["map_ms"] += (_time.perf_counter() - t_map) * 1000.0
+            elif k < rows_from:
+                _off(k)
+                _timed("unmap_ms", lambda: self._set_bank_plans(bank_plans, census))
+        self.last_reseat_parts = dict(parts)
+        self.mamba_keep = None if keep_eff > self.pool_size else int(keep_eff)
+        if self.mamba_pool is not None and self.slot_tensors:
+            self.mamba_pool._weg2_seat_keep = self.mamba_keep
+        if k < rows_from:
+            self.evicted_rows += rows_from - k
+        elif k > rows_from:
+            self.refilled_rows += k - rows_from
+        self.rows_on = int(k)
+        self.lent_from = None  # D-TRANSIENT-LEND: a phase move ends any lend
+        log_live_spans(census, n=n, stage=stage, rows_from=rows_from, rows_to=int(k),
+                       mamba_keep=self.mamba_keep, order="bank-first" if grow else "mamba-first")
+        prev = self.applied
+        applied = PhaseApplied(
+            n=n, extra_rows=int(k),
+            mamba_mapped=sum(span_bytes(slot_spans(m.geom, keep_eff, self.granule))
+                             for m in self.slot_tensors),
+            expert_mapped=sum(span_bytes(row_spans(m.geom, m.geom.rows_boot + k, self.granule))
+                              for m in self.row_tensors),
+            cap_mapped=int(prev.cap_mapped) if prev is not None else 0,
+            note="live reseat", stage=stage if stage is None else int(stage),
+            kv_mapped=int(prev.kv_mapped) if prev is not None else 0)
         self.applied = applied
         return applied
 
@@ -613,6 +2070,24 @@ class SeatVram:
                self.fixed_bytes / _MIB)
             for r in self.rows
         ]
+
+
+def log_live_spans(census: Dict[str, int], *, n: int, stage: Optional[int], rows_from: int,
+                   rows_to: int, mamba_keep: Optional[int] = None, order: str = "-") -> None:
+    """The metal marker of a live apply (none when every allocation was
+    paused: a plan moves no byte). ``wiped=0`` by construction --
+    ``refuse_wipes`` stopped the apply otherwise."""
+    if not census.get("tensors"):
+        return
+    logger.info(
+        "%s n=%d stage=%s rows_on %d->%d tensors=%d extents_kept=%d cells_freed=%d "
+        "cells_mapped=%d wiped=0 mamba_keep=%s order=%s (a live move releases whole lattice "
+        "cells only; mamba_keep = the GDN slots with pages = the flush's reset range, all = "
+        "cap form -- a live apply never moves it; order = which side moved first, RB: the "
+        "shrinking side always releases before the growing side maps)",
+        LIVE_MARK, int(n), "-" if stage is None else "S%d" % int(stage), int(rows_from),
+        int(rows_to), census["tensors"], census["kept"], census["freed"], census["mapped"],
+        "all" if mamba_keep is None else int(mamba_keep), order)
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +2107,31 @@ def _req_pool(sched):
     return getattr(runner, "req_to_token_pool", None) or getattr(sched, "req_to_token_pool", None)
 
 
+def _kv_pools(sched) -> List[object]:
+    """#251c: the KV pools of this rank's target and draft runners."""
+    out = []
+    runners = [getattr(getattr(sched, "tp_worker", None), "model_runner", None)]
+    draft = getattr(sched, "draft_worker", None)
+    for attr in ("model_runner", "draft_model_runner"):
+        runners.append(getattr(draft, attr, None))
+    for r in runners:
+        pool = getattr(r, "token_to_kv_pool", None)
+        if pool is not None and all(pool is not q for q in out):
+            out.append(pool)
+    return out
+
+
+def _kv_allocator(sched):
+    runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    return (getattr(sched, "token_to_kv_pool_allocator", None)
+            or getattr(runner, "token_to_kv_pool_allocator", None))
+
+
+def _page_size(sched) -> int:
+    runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
+    return int(getattr(sched, "page_size", None) or getattr(runner, "page_size", None) or 1)
+
+
 def controller(sched) -> Optional[SeatVram]:
     """This rank's page controller, built on first use; None when nothing on
     this rank is seat-proportional (the 3080 workers) or a piece is missing."""
@@ -641,9 +2141,12 @@ def controller(sched) -> Optional[SeatVram]:
     runner = getattr(getattr(sched, "tp_worker", None), "model_runner", None)
     try:
         ctl = SeatVram.from_runtime(cap=_cap_of(sched), req_to_token_pool=_req_pool(sched),
-                                    model=getattr(runner, "model", None))
+                                    model=getattr(runner, "model", None),
+                                    kv_pools=_kv_pools(sched))
         if not ctl.slot_tensors and not ctl.row_tensors:
             ctl = None
+    except Weg2DSeatVramWipe:
+        raise  # pages that would be remapped fresh: a stop, never "no controller"
     except Exception as exc:  # noqa: BLE001 -- a missing piece names itself, never guesses
         logger.warning("%s: no page controller on this rank: %s: %s", LINE_MARK,
                        type(exc).__name__, exc)
@@ -695,11 +2198,70 @@ def on_wake(sched, recv_req, seats) -> Optional[PhaseState]:
             allocator.set_phase_limit(None)
     st.n, st.slot_limit, st.done = target, limit, True
     st.has_n = n is not None
+    # 1b. REPLICATED (#251c): the KV stage -- the form values and the wake's
+    # demand only, and the allocator's page cap that makes it safe
+    form = stage_form()
+    stage = None
+    if form is not None:
+        demand = getattr(recv_req, "phase_kv_tokens", None) if n is not None else None
+        choice = choose_form_stage(form, n_phys, demand)
+        stage = choice.stage
+        kv_alloc = _kv_allocator(sched)
+        page = _page_size(sched)
+        live = max_live_page(kv_alloc) if kv_alloc is not None else 0
+        while stage < len(form.tokens) - 1 and form.tokens[stage] // page < live:
+            stage += 1
+        if stage > form.max_stage(n_phys):
+            # the captured waves only hold in stages the form lets n take
+            # (capture_floors); replicated inputs -> every rank stops alike
+            raise Weg2DSeatVramRefused(
+                "%s: KV pages up to %d are still held at the wake and need stage S%d, "
+                "above the S%d the form allows %d seats -- the captured decode waves "
+                "would not hold there; nothing was mapped" % (
+                    LINE_MARK, live, stage, form.max_stage(n_phys), n_phys))
+        if stage != choice.stage:
+            st.note = ("KV pages up to %d still held at the wake: stage S%d instead of S%d"
+                       % (live, stage, choice.stage))
+        if kv_alloc is not None:
+            _engage_kv_cap(kv_alloc, form.tokens[stage], page)
+        st.stage, st.stage_tokens = stage, form.tokens[stage]
+        st.demand, st.over = choice.demand, bool(choice.over)
     # 2. RANK-LOCAL: the pages
+    import time as _time
+
+    _t_apply = _time.perf_counter()
     ctl = controller(sched)
-    applied = ctl.apply(n_phys) if ctl is not None else None
+    if ctl is None:
+        applied = None
+    elif stage is not None and ctl.cells:
+        applied = ctl.apply_stage(n_phys, stage)
+    else:
+        applied = ctl.apply(n_phys)
+    # D-SEAT-REWAKE: the wake's own page re-plan, measured (the first price)
+    st.apply_ms = (_time.perf_counter() - _t_apply) * 1000.0 if ctl is not None else None
     logger.info("%s", phase_line(st, applied, ctl))
+    if _rewake_on() and st.apply_ms is not None:
+        logger.info("WEG2 D-SEAT-REWAKE WAKE-APPLY n=%d ms=%.1f rows_on=%s mamba_keep=%s (the wake's page "
+                    "re-plan, measured: the first price of a live re-plan)", st.n, st.apply_ms,
+                    getattr(ctl, "rows_on", None), getattr(ctl, "mamba_keep", None))
+    if stage is not None:
+        line = stage_line(st, applied)
+        if form.by_demand:
+            line += " form=demand"  # #251d: no table, the demand alone chose
+        logger.info("%s", line)
     return st
+
+
+STAGE_MARK = "#251 WAKE-RESHARD"
+
+
+def stage_line(st: PhaseState, applied: Optional[PhaseApplied]) -> str:
+    """The #251c metal marker, one per wake that carries a stage."""
+    return "%s n=%d stage=S%d tokens=%d demand=%s over=%s kv_mib=%s rows_on=%s epoch=%s" % (
+        STAGE_MARK, st.n, int(st.stage), int(st.stage_tokens or 0),
+        "-" if st.demand is None else int(st.demand), "yes" if st.over else "no",
+        "-" if applied is None else "%.1f" % (applied.kv_mapped / _MIB),
+        "-" if applied is None else int(applied.extra_rows), st.epoch)
 
 
 def phase_line(st: PhaseState, applied: Optional[PhaseApplied], ctl: Optional[SeatVram]) -> str:
@@ -739,3 +2301,566 @@ def guard(sched, batch) -> None:
             "%s: a forward batch of %d requests in a D phase of n=%d seats (epoch %s) -- "
             "the posts of seats above n are not mapped (slots 1..%s); the admission cap "
             "should have held it" % (REFUSAL_CODE, bs, cap, st.epoch, st.slot_limit))
+
+
+# ---------------------------------------------------------------------------
+# D-MEM-SCHED (29.09.): the stage BETWEEN wakes -- the gap (a) of #251c/d
+# ---------------------------------------------------------------------------
+
+MEM_SCHED_ATTR = "_weg2_d_mem_sched"
+
+
+def elastic_on() -> bool:
+    """User law 10:20Z: default ON; the one switch is a diagnostic stop."""
+    from sglang.srt.environ import envs
+
+    return not bool(envs.SGLANG_WEG2_DISABLE_D_ELASTIC_ROWS.get())
+
+
+def _req_tokens(req) -> int:
+    return len(getattr(req, "origin_input_ids", None) or ()) + len(
+        getattr(req, "output_ids", None) or ())
+
+
+#: y3j 09291933: the tick found an extend batch its merge had not taken yet
+UNMERGED_MARK = "WEG2 D-MEM-SCHED UNMERGED-EXTEND"
+_UNMERGED_N = [0]
+
+
+def _unmerged_extend(sched, running) -> list:
+    """The requests of the extend batch that ran last and is not merged yet.
+
+    The tick runs at the top of ``get_next_batch_to_run``, BEFORE the merge
+    of ``last_batch`` into the running batch. After every extend its
+    requests are in neither the running batch nor the queue, so the census
+    read them as gone: y3j 09291933 D 20:02:20 -- the wake's extend held
+    weg2-27-76 (23168) and the needle weg2-40-151 (64072), the tick saw
+    used=0, an END event and a pending shrink to S0 (cap 32768) while live
+    pages reached 87296; the bs2 decode found no page below the cap, the
+    retraction emptied the batch (solo-OOM on the last) and the pressure
+    park left the needle behind the older agent turn until its client gave
+    up (MISS, empty answer). The same shape at 19:41:57 and 19:43:52.
+    Replicated like the rest of the census: every D rank ran the same batch."""
+    last = getattr(sched, "last_batch", None)
+    mode = getattr(last, "forward_mode", None)
+    if last is None or mode is None or not mode.is_extend():
+        return []
+    have = {id(r) for r in running}
+    out = []
+    for r in list(getattr(last, "reqs", None) or ()):
+        if id(r) in have:
+            continue
+        fin = getattr(r, "finished", None)
+        if callable(fin) and fin():
+            continue
+        out.append(r)
+        have.add(id(r))
+    return out
+
+
+def _demand_lists(sched) -> Tuple[list, list]:
+    """REPLICATED (27B condition 2): the running requests (with the chunked
+    one and an extend batch the merge has not taken yet) and the queued
+    requests the next admission can take -- the request lists are the same
+    on every D rank, the page lists are not (#603)."""
+    running = list(getattr(getattr(sched, "running_batch", None), "reqs", None) or ())
+    chunked = getattr(sched, "chunked_req", None)
+    if chunked is not None and all(chunked is not r for r in running):
+        running.append(chunked)
+    extra = _unmerged_extend(sched, running)
+    if extra:
+        running.extend(extra)
+        _UNMERGED_N[0] += 1
+        n = _UNMERGED_N[0]
+        if n <= 20 or n % 200 == 0:
+            logger.info(
+                "%s n=%d rids=%s tokens=%d -- the extend batch that ran last is not merged "
+                "yet at this tick: its requests hold their pages (no end event, no shrink "
+                "below them)", UNMERGED_MARK, n, [str(getattr(r, "rid", ""))[:16] for r in extra],
+                sum(_req_tokens(r) for r in extra))
+    queue = getattr(sched, "waiting_queue", None) or ()
+    return running, _admissible_queue(queue, _cap_of(sched) - len(running))
+
+
+def global_demand(sched) -> Tuple[int, int, frozenset]:
+    """REPLICATED (27B condition 2): the tokens the running requests hold,
+    the tokens the queue head wants, the running rids -- the request lists
+    are the same on every D rank, the page lists are not (#603). The
+    requests of an extend batch the merge has not taken yet run too."""
+    running, admissible = _demand_lists(sched)
+    used = sum(_req_tokens(r) for r in running)
+    incoming = sum(_req_tokens(r) for r in admissible)
+    return used, incoming, frozenset(getattr(r, "rid", id(r)) for r in running)
+
+
+def _clip_max_new() -> int:
+    """``CLIP_MAX_NEW_TOKENS`` of ``schedule_policy`` (the same env var)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return int(envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get())
+    except Exception:  # noqa: BLE001 -- a desk double without environ: the default
+        return int(os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096") or 4096)
+
+
+def _req_max_new(req, clip: int) -> int:
+    sp = getattr(req, "sampling_params", None)
+    mx = getattr(sp, "max_new_tokens", None)
+    if mx is None:
+        return 0
+    out = len(getattr(req, "output_ids", None) or ())
+    return max(0, min(int(mx) - out, int(clip)))
+
+
+def _new_token_ratio(sched) -> float:
+    tracker = getattr(sched, "new_token_ratio_tracker", None)
+    v = getattr(tracker, "current", None)
+    if v is None:
+        v = getattr(sched, "new_token_ratio", None)
+    try:
+        return max(0.0, float(v)) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+#: NF y3z 0930_023308 ep44/ep58: the stage the census held while the gate refused
+GATE_PRICE_MARK = "WEG2 D-MEM-SCHED GATE-PRICE"
+
+
+def admission_reserve(sched, running, admissible) -> int:
+    """REPLICATED: what the admission gate charges beyond the census while a
+    request is queued -- ``PrefillAdder``'s ``rem_total_token_offset`` (every
+    running request's ``min(max_new - out, CLIP) * new_token_ratio``) plus
+    each candidate's ``min(max_new - out, CLIP) + page`` (``add_one_req``).
+
+    NF y3z 0930_023308 (30.09.): ep44 02:53:25 at S6 (229376) the census
+    needed 144571 + 78477 + air 4120 = 227168 and held; the attention host
+    priced weg2-42-101 at 82637 against a budget of 78336 (5 decode
+    reservations, 6469) -- NO_TOKEN at a free seat, batch-full until
+    weg2-41-100 ended 4 s later. ep58 02:58:12 the same at S5 with two free
+    seats (63071 > 59392, 8,1 s). S7..S9 were on the ladder (S7 at 02:52:15).
+    Zero with nothing queued: a reservation never moves an expert row on its
+    own. Inputs are request fields and the scheduler's ratio. The ratio is
+    RANK-LOCAL (y6h 10011531, see :func:`_agree_reserve`), so the caller
+    agrees the result over the group before the machine steps on it."""
+    if not admissible:
+        return 0
+    clip = _clip_max_new()
+    page = max(1, _page_size(sched))
+    ratio = _new_token_ratio(sched)
+    run = sum(int(math.ceil(_req_max_new(r, clip) * ratio)) for r in running)
+    return run + sum(_req_max_new(r, clip) + page for r in admissible)
+
+
+#: y6h 10011531: the group's reservation differed from this rank's
+RESERVE_AGREE_MARK = "WEG2 D-MEM-SCHED RESERVE-AGREE"
+_RESERVE_AGREE_N = [0]
+
+
+def _agree_reserve(sched, admissible, reserve: int) -> int:
+    """The gate reservation as ONE group number: MAX over the D ranks.
+
+    NF y6h 10011531 (01.10. 16:07:53): ``new_token_ratio`` is rank-local --
+    TP0 priced the queue at 4964, TP1/TP2 at 6592 for the same requests, so
+    the replicated machine split: TP0 S6->S7 ("grow to hold 261597"), the
+    workers S6->S8 ("grow to hold 263225"). From there the ranks took
+    different control paths and every D rank wedged at 16:07:56 in the
+    ``drain_retired_prefetch`` all_reduce (outstanding=4, no token, until the
+    VORSTOPP). MAX is the gate's own direction: the rank that charges more
+    is the one whose admission would refuse.
+
+    Entered only with something queued (``admissible`` is a request list,
+    the same on every D rank), so a decode round with an empty queue pays no
+    collective."""
+    if not admissible:
+        return int(reserve)
+    gmin = getattr(sched, "_weg2_group_min_ints", None)
+    if gmin is None:
+        return int(reserve)
+    agreed = -int(gmin([-int(reserve)])[0])
+    if agreed != int(reserve):
+        _RESERVE_AGREE_N[0] += 1
+        n = _RESERVE_AGREE_N[0]
+        if n <= 20 or n % 200 == 0:
+            logger.info("%s n=%d local=%d group=%d ratio=%.4f -- the reservation the stage "
+                        "machine steps on is the group's, not this rank's",
+                        RESERVE_AGREE_MARK, n, int(reserve), agreed, _new_token_ratio(sched))
+    return agreed
+
+
+def kv_ladder_reading(sched) -> Optional[Dict[str, int]]:
+    """NF-STAU (29.09.): D's KV LADDER for the front's KV fit test (ARRIVAL-SEAT),
+    published on ``/server_info`` ``weg2_kv`` -- IPC, never a log line.
+
+    ``ladder_ceiling``: the highest stage D-MEM-SCHED may grow to this phase
+    (its ``stage_tokens[-1]``; before its first tick the stage form's
+    ``max_stage(n)``), ``ladder_stage``: the mapped stage, ``ladder_used``:
+    the global tokens the running requests hold (:func:`global_demand`, the
+    same census the machine steps on). The front tested against the MAPPED
+    stage (available + evictable) -- y3m 22:03:44 "kv need=130563 >
+    free=54016" at S3/S4 with ~77k used while the ladder reached 524288:
+    no KV shortage, a wrong size. None when no ladder runs (off, asleep, no
+    stage form, elastic stop) -- the reading then stays what it was."""
+    if not armed() or not elastic_on() or getattr(sched, "weg2_dormant", False):
+        return None
+    form = stage_form()
+    if form is None:
+        return None
+    ms = getattr(sched, MEM_SCHED_ATTR, None)
+    st = getattr(sched, PHASE_ATTR, None)
+    if ms is not None and getattr(ms, "stage_tokens", None):
+        ceiling = int(ms.stage_tokens[-1])
+        stage = int(ms.stage_tokens[min(int(ms.stage), len(ms.stage_tokens) - 1)])
+    else:
+        n = 1
+        if st is not None and int(getattr(st, "cap", 0) or 0) > 0:
+            n = max(1, min(int(st.n or st.cap), int(st.cap)))
+        ceiling = int(form.tokens[form.max_stage(n)])
+        stage = int(getattr(st, "stage_tokens", 0) or form.tokens[0]) if st is not None else int(form.tokens[0])
+    used, _incoming, _rids = global_demand(sched)
+    return {"ladder_ceiling": ceiling, "ladder_stage": stage, "ladder_used": int(used)}
+
+
+#: y3j 09291933: the admission gate a grown stage re-opened
+REOPEN_MARK = "WEG2 D-MEM-SCHED ADMIT-REOPEN"
+_REOPEN_N = [0]
+
+
+def _reopen_admission(sched) -> None:
+    """A grown (or cap-lifted) stage has room the last admission did not
+    see: its NO_TOKEN set ``batch_is_full``, and upstream clears that only
+    when a request finishes -- a whole decode later (y3j: 6 s per request
+    after the wake, 32k bs4). The grow is the event that frees the room, so
+    it re-opens the gate; the admission in this same iteration re-asks."""
+    rb = getattr(sched, "running_batch", None)
+    if rb is None or not getattr(rb, "batch_is_full", False):
+        return
+    rb.batch_is_full = False
+    _REOPEN_N[0] += 1
+    n = _REOPEN_N[0]
+    if n <= 20 or n % 200 == 0:
+        queue = getattr(sched, "waiting_queue", None) or ()
+        logger.info("%s n=%d queue=%d -- the stage grew: the batch-full gate of the last "
+                    "NO_TOKEN no longer holds", REOPEN_MARK, n, len(queue))
+
+
+def _admissible_queue(queue, free_seats: int) -> list:
+    """The queued requests the next admission can take: one per free seat,
+    at least the head. y3j 09291933 (bs4 x 32k after the wake): with only the
+    head as ``incoming`` the stage grew by ONE request per NO_TOKEN, and the
+    batch-full gate held the next one until a whole decode had ended -- the
+    four first tokens came 6 s apart (flip time 19-26 s for the last)."""
+    return list(queue[: max(1, int(free_seats))]) if len(queue) else []
+
+
+def _air(sched) -> int:
+    from sglang.srt.weg2.d_mem_sched import air_tokens
+
+    args = getattr(sched, "server_args", None)
+    chunk = int(getattr(args, "chunked_prefill_size", 0) or 0)
+    verify = int(getattr(args, "speculative_num_draft_tokens", 0) or 1)
+    return air_tokens(max(0, chunk), _cap_of(sched), verify)
+
+
+def _group_floor_tokens(sched) -> int:
+    """The group's highest live KV page in tokens -- MAX over the ranks, one
+    collective, entered only when the replicated machine may shrink."""
+    alloc = _kv_allocator(sched)
+    local = max_live_page(alloc) * _page_size(sched) if alloc is not None else 0
+    gmin = getattr(sched, "_weg2_group_min_ints", None)
+    if gmin is None:
+        return int(local)
+    return -int(gmin([-int(local)])[0])
+
+
+#: NF1d 09291811: the line a pending shrink's cap is handed back to the
+#: mapped stage because the ids below it cannot pay the group's demand
+CAP_LIFT_MARK = "WEG2 D-MEM-SCHED CAP-LIFT"
+
+
+def free_tokens_below(allocator, tokens: int, page_size: int) -> Optional[int]:
+    """Rank-local: the tokens of the FREE page ids at or below the cap of
+    ``tokens`` (the only ids an allocation under that cap can take); None
+    when the allocator shows no free lists (then nothing is decided)."""
+    page = max(1, int(page_size))
+    lim = int(tokens) // page
+    seen, n = False, 0
+    for name in ("free_pages", "release_pages"):
+        ids = getattr(allocator, name, None)
+        if ids is None or not hasattr(ids, "numel"):
+            continue
+        seen = True
+        if ids.numel():
+            n += int((ids <= lim).sum())
+    return n * page if seen else None
+
+
+def _group_room_below(sched, alloc, tokens: int, need: int) -> bool:
+    """REPLICATED verdict (MIN over the ranks, one collective): may a pending
+    shrink keep its cap at ``tokens``, i.e. do the free ids below it pay
+    ``need`` on EVERY rank? Entered only under a replicated condition
+    (pending shrink AND demand), so every rank enters it alike. Evictable
+    tree pages below the cap are NOT counted: the peel frees leaves in LRU
+    order, and the leaves of a long cached sequence sit ABOVE the cap
+    (NF1d: the pool received 0 of 246080 evictable tokens)."""
+    room = free_tokens_below(alloc, tokens, _page_size(sched))
+    ok = 1 if (room is None or room >= int(need)) else 0
+    gmin = getattr(sched, "_weg2_group_min_ints", None)
+    if gmin is None:
+        return bool(ok)
+    return bool(int(gmin([ok])[0]))
+
+
+#: NF y6k 01.10.: the re-check census line (one per FLOOR_CHECK_EVERY ticks)
+FLOOR_CHECK_MARK = "WEG2 D-MEM-SCHED FLOOR-CHECK"
+FLOOR_CHECK_EVERY = 512
+_SLACK_CAP = 1 << 40
+
+
+def _recheck_max() -> int:
+    from sglang.srt.environ import envs
+
+    try:
+        return max(1, int(envs.SGLANG_WEG2_D_MEM_RECHECK_ROUNDS.get()))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _floor_room_state(ms) -> dict:
+    """The re-check bookkeeping rides on the (replicated) machine: a new wake
+    epoch builds a new machine and so starts from fresh reads."""
+    fr = getattr(ms, "_weg2_floor_room", None)
+    if fr is None:
+        fr = {"floor": None, "room": None, "lifted_since": False, "ticks": 0,
+              "floor_reads": 0, "floor_cached": 0, "room_reads": 0, "room_cached": 0}
+        ms._weg2_floor_room = fr
+    return fr
+
+
+def _floor_for_shrink(sched, ms, fr, ended: bool) -> int:
+    """The floor ``MemSched.step`` asks for -- only on a path that shrinks.
+
+    NF y6k 01.10.: a pending shrink re-read the group floor every decode
+    round (max_live_page copies the free lists device->host = a sync of the
+    decode stream, plus one group collective): 32 % of the D-TP0 scheduler,
+    host gap 9 ms/round. While the SAME shrink stays pending the floor can
+    only FALL (new pages go below the pending cap, which sits below the
+    floor), so the last read is an upper bound and blocks nothing it should
+    not. It is re-read after 1, 2, 4, ... up to SGLANG_WEG2_D_MEM_RECHECK_ROUNDS
+    rounds (all inputs replicated: the round count, the pending stage), and at
+    once on an end event. While the cap is lifted to the stage (pages may go
+    above the old floor) the cached rounds answer with the mapped stage
+    itself: no shrink, never one below a live page."""
+    k = _recheck_max()
+    rnd = int(getattr(ms, "_round", 0))
+    c = fr.get("floor")
+    if (k > 1 and not ended and ms.pending is not None and c is not None
+            and c["pending"] == ms.pending and rnd < c["next"]):
+        fr["floor_cached"] += 1
+        if fr.get("lifted_since"):
+            return int(ms.stage_tokens[ms.stage])
+        return int(c["value"])
+    value = int(_group_floor_tokens(sched))
+    fr["floor_reads"] += 1
+    gap = 1
+    if c is not None and c["pending"] == ms.pending and c["value"] == value:
+        gap = min(k, max(1, int(c["gap"]) * 2))
+    fr["floor"] = {"pending": ms.pending, "value": value, "next": rnd + gap, "gap": gap}
+    fr["lifted_since"] = bool(getattr(ms, "_cap_lifted", False))
+    return value
+
+
+def _room_ok(sched, ms, fr, alloc, cap_tokens: int, need: int, incoming: int,
+             n_running: int, page: int) -> bool:
+    """``_group_room_below`` with the same replicated re-check: a pure decode
+    round (no incoming) under an unchanged pending cap reuses the last group
+    verdict while the group's MIN slack (free tokens below the cap minus the
+    need) cannot have been used up -- each running request takes at most
+    ceil(r * R / page) new pages in r rounds of R tokens (R = verify tokens
+    + 1). A new demand, a new running set or a new cap re-reads at once."""
+    k = _recheck_max()
+    rnd = int(getattr(ms, "_round", 0))
+    key = (ms.pending, int(cap_tokens), int(need), int(n_running))
+    c = fr.get("room")
+    if k > 1 and int(incoming) <= 0 and c is not None and c["key"] == key and rnd < c["next"]:
+        fr["room_cached"] += 1
+        return bool(c["ok"])
+    room = free_tokens_below(alloc, cap_tokens, _page_size(sched))
+    slack = _SLACK_CAP if room is None else min(_SLACK_CAP, int(room) - int(need))
+    ok_local = 1 if slack >= 0 else 0
+    gmin = getattr(sched, "_weg2_group_min_ints", None)
+    res = [ok_local, slack] if gmin is None else list(gmin([ok_local, slack]))
+    fr["room_reads"] += 1
+    ok = bool(int(res[0]))
+    min_slack = int(res[1]) if len(res) > 1 else 0
+    gap = 0
+    if ok and min_slack > 0:
+        pg = max(1, int(page))
+        args = getattr(sched, "server_args", None)
+        per_round = max(1, int(getattr(args, "speculative_num_draft_tokens", 0) or 1)) + 1
+        n = max(1, int(n_running))
+        pages_each = min_slack // (n * pg)          # new pages each request may still take
+        safe = (pages_each * pg) // per_round        # rounds before any could need more
+        prev = c["gap"] if (c is not None and c["key"] == key) else 0
+        gap = min(k, safe, max(1, int(prev) * 2))
+    elif not ok:
+        # a lift keeps the cap at the mapped stage (more room, not less):
+        # re-read on the same back-off, the lift ends on a fresh verdict
+        prev = c["gap"] if (c is not None and c["key"] == key) else 0
+        gap = min(k, max(1, int(prev) * 2))
+    fr["room"] = {"key": key, "ok": ok, "next": rnd + gap, "gap": max(1, gap)}
+    return ok
+
+
+#: 27B 29.09.: iterations the tick left at its first checks (P, the 27B, a
+#: D without stage form) -- no collective, no sync, no allocation there
+TICK_NOOP_ATTR = "_weg2_d_mem_tick_noop"
+
+
+def _tick_noop(sched) -> None:
+    try:
+        setattr(sched, TICK_NOOP_ATTR, int(getattr(sched, TICK_NOOP_ATTR, 0) or 0) + 1)
+    except (AttributeError, TypeError):  # a slotted test double: nothing to count on
+        pass
+    return None
+
+
+def runtime_tick(sched):
+    """Once per scheduler iteration of an AWAKE D (after the write-through
+    acks are flushed): the KV stage follows the global demand between wakes
+    -- grow when used + incoming + air reaches the stage, shrink at once on
+    a finish / abort / park (only below pages no request and no unbacked
+    tree node holds), otherwise after K rounds with a stage gap. The same
+    stage form and ``apply_stage`` as the wake (#251c/d); the expert rows of
+    the stage's cell go OFF coldest first and come back lazily. Returns the
+    step, or None when nothing runs (not armed, the stop, asleep, no stage)."""
+    if not armed() or not elastic_on() or getattr(sched, "weg2_dormant", False):
+        return _tick_noop(sched)
+    st = getattr(sched, PHASE_ATTR, None)
+    if st is None or st.stage is None or not st.done:
+        return _tick_noop(sched)
+    form = stage_form()
+    if form is None:
+        return _tick_noop(sched)
+    from sglang.srt.weg2.d_mem_sched import MemSched
+
+    n = max(1, min(int(st.n or st.cap), int(st.cap)))
+    tokens = tuple(form.tokens[: form.max_stage(n) + 1])
+    ms = getattr(sched, MEM_SCHED_ATTR, None)
+    if ms is None or ms.stage_tokens != tokens or getattr(ms, "_epoch", None) != st.epoch:
+        counters = dict(ms.counters) if ms is not None else None
+        ms = MemSched(stage_tokens=tokens, air_tokens=_air(sched),
+                      stage=min(int(st.stage), len(tokens) - 1))
+        if counters:
+            ms.counters.update(counters)
+        ms._epoch = st.epoch
+        ms._rids = None
+        setattr(sched, MEM_SCHED_ATTR, ms)
+    running, admissible = _demand_lists(sched)
+    used = sum(_req_tokens(r) for r in running)
+    incoming = sum(_req_tokens(r) for r in admissible)
+    rids = frozenset(getattr(r, "rid", id(r)) for r in running)
+    # NF y3z ep44/ep58 (30.09.): the machine grows for what the GATE charges,
+    # not for the bare census -- else it holds a stage the gate refuses in
+    reserve = _agree_reserve(sched, admissible, admission_reserve(sched, running, admissible))
+    ended = ms._rids is not None and bool(ms._rids - rids)
+    ms._rids = rids
+    fr = _floor_room_state(ms)
+    fr["ticks"] += 1
+    floor_box = [0]
+
+    def _floor():
+        floor_box[0] = _floor_for_shrink(sched, ms, fr, ended)
+        return floor_box[0]
+
+    before, pending_before = ms.stage, ms.pending
+    # the floor is asked for only on a path that shrinks (MemSched calls it)
+    step = ms.step(used, incoming + reserve, ended=ended, floor_tokens=_floor)
+    floor = floor_box[0]
+    if step.changed:
+        fr["floor"] = fr["room"] = None
+    alloc = _kv_allocator(sched)
+    page = _page_size(sched)
+    # NF1d 09291811 (z30y3f): a pending shrink caps new pages below the wanted
+    # stage -- sound only while the ids below it can pay the demand. After the
+    # 245k cell the end event left pending S0 (cap 32768, floor 248832: the
+    # retained tree); the first bs2 cell's 2113 tokens fit S0, so nothing
+    # cancelled the pending shrink, but every id below 32768 was the tree's
+    # and every leaf the peel freed sat above the cap: "EVICTION
+    # UNDER-DELIVERED ... the pool received 0", Prefill out of memory on all
+    # three D ranks. The stage is still MAPPED above the cap, so while the
+    # group has demand the cap goes back to the stage unless the free ids
+    # below it pay (replicated verdict); with no demand it returns to pending.
+    lifted_before = bool(getattr(ms, "_cap_lifted", False))
+    lifted = False
+    need = 0
+    if ms.pending is not None and alloc is not None and (incoming > 0 or used > 0):
+        chunk = int(getattr(getattr(sched, "server_args", None), "chunked_prefill_size", 0) or 0)
+        first = min(int(incoming), chunk) if chunk > 0 else int(incoming)
+        need = first + len(rids) * max(1, page)
+        lifted = not _room_ok(sched, ms, fr, alloc, tokens[ms.pending], need, incoming,
+                              len(rids), page)
+    ms._cap_lifted = lifted
+    if lifted:
+        fr["lifted_since"] = True
+    elif lifted_before:
+        fr["floor"] = None                      # the lift ended: read the floor afresh
+    if fr["ticks"] % FLOOR_CHECK_EVERY == 0:
+        logger.info(
+            "%s ticks=%d floor_reads=%d floor_cached=%d room_reads=%d room_cached=%d "
+            "collectives=%d pending=S%s lifted=%s recheck_max=%d",
+            FLOOR_CHECK_MARK, fr["ticks"], fr["floor_reads"], fr["floor_cached"],
+            fr["room_reads"], fr["room_cached"], fr["floor_reads"] + fr["room_reads"],
+            "-" if ms.pending is None else ms.pending, "yes" if lifted else "no",
+            _recheck_max())
+    if not step.changed:
+        if lifted != lifted_before and alloc is not None:
+            want = ms.stage if lifted else ms.pending
+            if want is None:
+                want = ms.stage
+            _engage_kv_cap(alloc, tokens[want], page)
+            if lifted:
+                _reopen_admission(sched)
+            logger.info(
+                "%s pending=S%s stage=S%d cap=%d used=%d incoming=%d need=%d lifted=%s -- %s",
+                CAP_LIFT_MARK, "-" if ms.pending is None else ms.pending, ms.stage,
+                tokens[want], used, incoming, need, "yes" if lifted else "no",
+                "the free ids below the pending cap do not pay the demand: the mapped "
+                "stage pays it" if lifted else "no demand left: the pending cap again")
+            return step
+        if ms.pending != pending_before and alloc is not None:
+            # a shrink the floor blocks: new pages go below the wanted stage.
+            # A pending shrink the need CANCELS (pending -> None, the stage
+            # holds) hands the cap back up to the mapped stage -- rc12z30y2
+            # 09291559 D: the end-event shrink S1->S0 waited on weg2-2-10's
+            # retained page 517, the cap went to 32768, the queue head
+            # weg2-4-11 (33633 tokens, 33024 its locked prefix) cleared the
+            # pending shrink and the cap stayed at 32768 -- available_size 0
+            # on every rank, #1045 floor 0, H105 host_budget 0 for 13 min.
+            want = ms.pending if (ms.pending is not None and not lifted) else ms.stage
+            _engage_kv_cap(alloc, tokens[want], page)
+            logger.info(
+                "%s cap=%d pending S%s->S%s stage=S%d used=%d incoming=%d floor=%d -- %s",
+                ms.line(), tokens[want],
+                "-" if pending_before is None else pending_before,
+                "-" if ms.pending is None else ms.pending, ms.stage, used, incoming,
+                floor, step.reason)
+        return step
+    if alloc is not None:
+        _engage_kv_cap(alloc, tokens[ms.pending if (ms.pending is not None and not lifted)
+                                     else ms.stage], page)
+    ctl = controller(sched)
+    applied = ctl.apply_stage(n, ms.stage) if (ctl is not None and ctl.cells) else None
+    st.stage, st.stage_tokens = ms.stage, tokens[ms.stage]
+    if ms.stage > before:
+        _reopen_admission(sched)
+    logger.info("%s from=S%d to=S%d used=%d incoming=%d ended=%s floor=%d -- %s%s gate_reserve=%d",
+                ms.line(), before, ms.stage, used, incoming, "yes" if ended else "no", floor,
+                step.reason,
+                "" if ctl is None else (" evicted_rows=%d refilled_rows=%d warm_rows=%d "
+                                        "sync_ms=%.1f bytes_copied=%d copy_ms=%.1f rows_on=%s")
+                % (ctl.evicted_rows, ctl.refilled_rows, ctl.warm_rows(), ctl.sync_ms,
+                   ctl.bytes_copied, ctl.copy_ms,
+                   "-" if applied is None else int(applied.extra_rows)),
+                int(reserve))
+    return step

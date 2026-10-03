@@ -32,6 +32,10 @@ _KW = dict(
     ring_bytes=int(30.4 * GIB), ring_span1_bytes=int(15.0 * GIB),
     cg_current_bytes=int(9.0 * GIB), reclaimable_bytes=int(3.0 * GIB),
     cg_ceiling_bytes=int(123.78 * GIB), s_gb_d=4,
+    # 2026-10-01: a finite cgroup memory.max is now the reap mark itself; this
+    # specimen is the CT999 host without a Docker cap, so it names the lxcfs
+    # fallback and keeps grading against the recorded 95.90 watermark.
+    cg_ceiling_source="lxcfs MemTotal FALLBACK (CT999 specimen, no Docker cap)",
 )
 
 
@@ -68,13 +72,16 @@ class DeviationIsBothOrNeither1360(CustomTestCase):
 
 
 class TheTwoHardRefusalsStand1360(CustomTestCase):
-    def test_a_latch_at_or_above_the_hard_bound_refuses(self):
-        """A latch above the bound cannot fire before the bound is crossed."""
-        with self.assertRaises(hl.Weg2HostDeviationRefused) as cm:
-            _choose(deviation_reason="r", riegel_gib=99.0)
-        msg = str(cm.exception)
-        self.assertIn("--host-riegel-gib", msg)
-        self.assertIn("AT OR ABOVE the hard bound", msg)
+    def test_a_latch_above_the_hard_bound_takes_the_derivation(self):
+        """A latch above the bound cannot fire before the bound is crossed.
+        29.09. (27B z30y W97, memory.max 76): the latch is derived from the
+        mark (mark minus the measured margin); a fixed flag above it is
+        replaced by the derivation and named in one line instead of W97."""
+        arm, _h, lines = _choose(deviation_reason="r", riegel_gib=99.0)
+        rl = [ln for ln in lines if ln.startswith(hl.RIEGEL_MARKER)]
+        self.assertEqual(len(rl), 1, lines)
+        self.assertIn("--host-riegel-gib 99.00", rl[0])
+        self.assertLess(arm.riegel_effective, 99.0)
 
     def test_a_predicted_peak_at_or_above_the_reap_watermark_refuses(self):
         """The bound is soft; the WATERMARK is where the kernel reaped."""
@@ -147,7 +154,8 @@ class SizingIsUntouched1360(CustomTestCase):
         arm, _h, _l = _choose(deviation_reason="r", riegel_gib=93.0)
         plain = hl.price(
             int(123.78 * GIB), int(110.0 * GIB), 1, 150,
-            flip_ratchet=hl.resolve_flip_ratchet_gib(None), **_KW,
+            flip_ratchet=hl.resolve_flip_ratchet_gib(None),
+            **{k: v for k, v in _KW.items() if k != "cg_ceiling_source"},
         )
         skip = {"run_origin_source", "base_source", "flip_ratchet_source",
                 "launch_worst_case_margin_source"}

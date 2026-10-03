@@ -31,6 +31,8 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable, Iterable, List, Optional, Set, Tuple
 
+from sglang.srt.mem_cache.storage.file import store_journal as _sj
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.weg2_store_gates import (
     check_index_coverage,
@@ -68,13 +70,78 @@ _EMPTY_CENSUS = {
     # attach only, so over a boot that attaches once they are a component the
     # cap could not see at all.
     "staging_bytes": 0,
+    # L3P: unindexed files a previous boot of the same identity left in a
+    # persistent store (another group's private suffix); named, and outside
+    # the W8b denominator -- see ``_l3p_inherited``.
+    "inherited_bytes": 0,
+    "inherited_entries": 0,
 }
+
+def _l3p_inheritance_from_env() -> Tuple[float, Tuple[str, ...]]:
+    """L3P: ``(epoch, suffixes)`` the launcher published
+    (``SGLANG_WEG2_L3_EPOCH``, ``SGLANG_WEG2_L3_INHERITED_SUFFIXES``); ``(0.0,
+    ())`` when either is missing or unreadable -- then nothing is inherited."""
+    import json as _json
+
+    try:
+        epoch = float(os.environ.get("SGLANG_WEG2_L3_EPOCH", "") or 0.0)
+        sfx = _json.loads(os.environ.get("SGLANG_WEG2_L3_INHERITED_SUFFIXES", "") or "[]")
+        sfx = tuple(str(x) for x in sfx if x)
+    except (ValueError, TypeError):
+        return 0.0, ()
+    if epoch <= 0 or not sfx:
+        return 0.0, ()
+    return epoch, sfx
+
 
 # How often an eviction run may print its proof line, in seconds. Suppressed
 # runs are counted and printed with the next line (denominator law: a
 # rate-limited emitter that prints no suppressed count turns a throttle into
 # an apparent zero).
 _EVICT_LOG_INTERVAL_S = 10.0
+#: EVICT_OFFPATH: a lock-held batch of the background evictor ends after this many victims OR this much lock
+#: time, whichever comes first (~28 us per unlink on the rig's L3, S1 29.09.: 6.3 GB / ~170k files in 4.8 s).
+#: A reserve()/commit() behind it waits one batch -- at most one unlink past the time bound -- never a run.
+_BG_EVICT_BATCH = 256
+
+
+#: L3-PAIR (30.09., NF y3u 5bedac26f1): the per-page sidecars that the claim takes as ALL_PAGES
+#: (``batch_exists_v2``: a KV page without one is worth nothing). The tag is ``PoolName.QSA_INDEXER``
+#: with its dot, exactly as ``HiCacheFile._get_component_key`` builds the stem: ``{hash}.qsa_indexer{sfx}``
+#: beside the KV page ``{hash}{sfx}``. Literal here so this module stays free of the backend import;
+#: the unit test pins it to the enum.
+_PAIR_SIDECAR_TAGS: Tuple[str, ...] = (".qsa_indexer",)
+
+
+def _sidecar_kv_twin(stem: str) -> Optional[str]:
+    """The KV page stem an ALL_PAGES sidecar stem belongs to, or None.
+
+    ``{h}.qsa_indexer{sfx}`` -> ``{h}{sfx}``. The page hash carries no dot, so
+    the tag must be the FIRST dot of the stem (a model name in the suffix,
+    ``_Qwen3.8-...``, has dots of its own)."""
+    for tag in _PAIR_SIDECAR_TAGS:
+        i = stem.find(tag)
+        if i > 0 and stem.find(".") == i:
+            return stem[:i] + stem[i + len(tag):]
+    return None
+
+
+def _kv_sidecar_twins(stem: str) -> Tuple[str, ...]:
+    """The ALL_PAGES sidecar stems of a KV page stem (``{h}{sfx}``), or ().
+
+    A KV page stem has no dot before the suffix's leading underscore; every
+    component stem (``{h}.mamba...``, ``{h}.qsa_indexer...``) has one."""
+    u = stem.find("_")
+    d = stem.find(".")
+    if u <= 0 or (0 <= d < u):
+        return ()
+    return tuple(stem[:u] + tag + stem[u:] for tag in _PAIR_SIDECAR_TAGS)
+
+
+class Weg2L3EvictorPauseRefused(RuntimeError):
+    """NF review 3 (B): the background L3 evictor could not be parked at the sleep entry (named stop)."""
+
+_BG_EVICT_BATCH_S = 0.005
 # Above this, a wake re-scan says so. A PRICE TAG, NOT A BOUND: crossing it
 # changes nothing about the scan (see ``rescan`` on why a deadline here would
 # make a rank-uniform verdict depend on wall clock).
@@ -185,6 +252,11 @@ class LRUFileEvictor:
             lambda stem: os.path.join(self.file_path, f"{stem}.bin")
         )
         self._iter_existing = iter_existing or self._iter_existing_flat
+        # L3P (N1/N2): what counts as INHERITED is published by the launcher
+        # once for every rank, before any rank starts: the group-wide attach
+        # epoch and the suffixes the previous boot's groups scanned. Unset =
+        # nothing is inherited (the old behaviour).
+        self._l3_epoch, self._l3_inherited_suffixes = _l3p_inheritance_from_env()
         # #1295 round 2, SHOULD_FIX 8: the ``.bin`` walk above is not the whole
         # directory. ``HiCacheFile`` writes every page through a
         # ``<final>.tmp.<uuid>`` staging file and reaps orphaned partials BY AGE
@@ -232,6 +304,21 @@ class LRUFileEvictor:
         self._is_storage_owner = (not self._writes_shared_keys) or (
             tp_rank == 0 and pp_rank == 0 and attn_cp_rank == 0
         )
+        # 28.09. THE INDEX IS PERSISTED IN THE STORE (store_journal.py): every
+        # writing rank of a shared-key store appends write-ahead lines to its own
+        # journal; an attach loads snapshot + journals instead of walking, the
+        # wake reads the other journals' new lines, and the D group's owner
+        # rewrites the snapshot and compacts. SGLANG_WEG2_STORE_JOURNAL=0: walk.
+        self._journal: Optional[_sj.JournalWriter] = None
+        self._journal_reader: Optional[_sj.JournalReader] = None
+        self._journal_items: Optional[list] = None
+        self._journal_source = ""
+        if self._writes_shared_keys and _sj.enabled():
+            _group = (os.environ.get("SGLANG_WEG2_GROUP", "") or "g").strip() or "g"
+            self._journal = _sj.JournalWriter(
+                file_path, f"{_group}-t{tp_rank}-p{pp_rank}-c{attn_cp_rank}")
+            if self._is_storage_owner and not self._journal.failed:
+                self._journal_reader = _sj.JournalReader(file_path, self._journal.path)
 
         # suffixed_key -> allocated disk bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -320,6 +407,26 @@ class LRUFileEvictor:
         self._min_free_refusals: int = 0
         self._last_evict_log = 0.0
         self._evict_runs_suppressed = 0
+        # EVICT_OFFPATH (29.09.): the bulk eviction leaves reserve() for a thread no reset joins (see environ).
+        self._evict_offpath = bool(envs.SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH.get())
+        # L3-PAIR (30.09.): a KV page's QSA index page shares its lifetime (see _evict_one_lru_locked).
+        self._pair_evict = bool(envs.SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT.get())
+        self._pair_deferred = 0      # sidecar victims kept because their KV page is on disk
+        self._pair_with_kv = 0       # sidecars unlinked in the same step as their KV page
+        self._pair_logged = (0, 0)
+        self._bg_evict_event = threading.Event()
+        self._bg_evict_thread: Optional[threading.Thread] = None
+        self._bg_evict_runs = 0
+        self._bg_evict_reclaimed = 0
+        self._last_bg_evict_log = 0.0
+        # NF review 2 (29.09.): pause/drain/resume. _bg_cv guards _bg_paused/_bg_busy; a batch starts only while
+        # not paused, and drain() returns once no batch is running -- so a paused evictor touches nothing.
+        self._bg_cv = threading.Condition()
+        # NF review 3 (A): holds by reason, not one bool -- a transient walk hold ("walk", "seed") must not lift
+        # the sleep hold ("dormant"); the evictor runs only while NO hold is set. "dormant" is a flag (set at the
+        # sleep entry, cleared only by the wake rescan); the others count (nested walks).
+        self._bg_holds: dict = {}
+        self._bg_busy = False
 
         self._load_config(extra_config or {})
 
@@ -404,17 +511,19 @@ class LRUFileEvictor:
                 self.file_path, self.max_size_bytes, self.min_free_bytes
             )
             if self._scan_population_is_group_wide:
-                scanned = self._census_existing_files()
+                scanned = self._attach_census()
                 self._check_index_coverage()
 
         if not self._eviction_enabled:
+            self._journal_items = None  # a non-owner graded; it keeps no index
             return
 
         self._clamp_max_size_to_fs()
 
         if scanned is None:
-            scanned = self._census_existing_files()
+            scanned = self._attach_census()
         self._install_census(scanned)
+        self._journal_after_attach()
         # W8b: the index is what the cap is enforced against, so a cap over a
         # fraction of the directory is not a cap. Armed only for a shared-key
         # store: where every rank legitimately owns its own suffixed files,
@@ -443,7 +552,9 @@ class LRUFileEvictor:
             f"under the shared #706 suffix -- counted, never unlinked here; 0 "
             f"at attach by construction and non-zero only after a wake "
             f"re-scan), staging={self._staging_bytes} B, "
-            f"directory={self._directory_bytes_locked()} B"
+            f"directory={self._directory_bytes_locked()} B, "
+            f"census_walk_s={(getattr(self, '_scan_census', None) or {}).get('walk_s', 0)}, "
+            f"inherited={(getattr(self, '_scan_census', None) or {}).get('inherited_bytes', 0)} B"
         )
 
     def _load_config(self, extra: dict) -> None:
@@ -745,6 +856,29 @@ class LRUFileEvictor:
         *,
         owner_writes_whole_file: bool = True,
     ) -> bool:
+        """Write-ahead ``R`` line, then :meth:`_reserve_impl`; ``A`` on refusal.
+
+        Every write path (whole-file rename, canonical extents, QSA/mamba blobs)
+        reserves before it touches the disk, so this one hook puts the intent
+        in the journal before any file changes (store_journal.py, CRASH ORDER).
+        """
+        jn = getattr(self, "_journal", None)
+        if jn is not None:
+            jn.write("R", time.time(), int(value_bytes), suffixed_key)
+        ok = self._reserve_impl(suffixed_key, value_bytes, key,
+                                owner_writes_whole_file=owner_writes_whole_file)
+        if not ok and jn is not None:
+            jn.write("A", time.time(), 0, suffixed_key)
+        return ok
+
+    def _reserve_impl(
+        self,
+        suffixed_key: str,
+        value_bytes: int,
+        key: str = "",
+        *,
+        owner_writes_whole_file: bool = True,
+    ) -> bool:
         """Admit a new write of ``value_bytes``, evicting LRU victims as needed.
 
         On success the key is pre-reserved at MRU and flagged in-flight so a
@@ -836,9 +970,22 @@ class LRUFileEvictor:
                     # own. Evicting its whole index would cost the cache and
                     # buy nothing, so refuse first and keep the pages.
                     return self._refuse_cap_unholdable_locked(value_bytes, key)
-                self._evict_locked(value_bytes)
+                if self._evict_offpath:
+                    # Only what THIS write needs, down to the cap itself -- the rest of the way to cap x ratio is
+                    # the background evictor's, off the thread the flush joins.
+                    self._evict_locked(value_bytes,
+                                       target=max(0, self.max_size_bytes - value_bytes))
+                    self._kick_bg_evictor_locked()
+                else:
+                    self._evict_locked(value_bytes)
                 if (self._directory_bytes_locked() + value_bytes) > self.max_size_bytes:
                     return self._refuse_cap_unholdable_locked(value_bytes, key)
+            elif self._evict_offpath and self.max_size_bytes > 0 and (
+                self._directory_bytes_locked() + value_bytes
+            ) > self._bg_evict_high_mark_locked():
+                # Past the midpoint between cap x ratio and the cap: start the background run early, so a write
+                # rarely meets the cap at all.
+                self._kick_bg_evictor_locked()
             # Free-space watermark.
             if self.min_free_bytes > 0 and not self._enforce_free_space_locked(
                 value_bytes
@@ -900,6 +1047,17 @@ class LRUFileEvictor:
     l3_index = None
 
     def commit(self, suffixed_key: str) -> None:
+        # 28.09.: the page's journal line, from EVERY writing rank (a non-owner
+        # returns below, and its pages are exactly what the owner's journal
+        # read must learn about).
+        _jst = None
+        _jn = getattr(self, "_journal", None)
+        if _jn is not None:
+            try:
+                _jst = os.stat(self._path_for_stem(suffixed_key))
+                _jn.write("C", _jst.st_mtime, self._allocated_size(_jst), suffixed_key)
+            except OSError:
+                _jst = None
         _idx = getattr(self, "l3_index", None)
         if _idx is not None:
             try:
@@ -920,7 +1078,8 @@ class LRUFileEvictor:
             return
         actual = None
         try:
-            actual = self._allocated_size(os.stat(self._path_for_stem(suffixed_key)))
+            actual = self._allocated_size(
+                _jst if _jst is not None else os.stat(self._path_for_stem(suffixed_key)))
         except OSError:
             pass  # gone or unreadable; keep the reservation's estimate
         with self._lock:
@@ -933,6 +1092,8 @@ class LRUFileEvictor:
 
     def abort(self, suffixed_key: str) -> None:
         """Release a reservation whose write failed: drop it and refund the bytes."""
+        if getattr(self, "_journal", None) is not None:
+            self._journal.write("A", time.time(), 0, suffixed_key)
         if not self._eviction_enabled:
             return
         with self._lock:
@@ -992,6 +1153,16 @@ class LRUFileEvictor:
 
     def clear(self) -> None:
         """Reset all bookkeeping after the backend has removed the files."""
+        # NF review 2/3: a transient walk hold (the backend took a "clear" hold before its removal, released here);
+        # the sleep hold stays -- a clear during dormancy must not wake the sleeping owner's evictor
+        self.pause_background_eviction(reason="walk")
+        try:
+            self._clear_impl()
+        finally:
+            self.resume_background_eviction(reason="walk")
+            self.resume_background_eviction(reason="clear")  # the backend's hold, taken before its removal
+
+    def _clear_impl(self) -> None:
         with self._lock:
             self._lru.clear()
             self._pending_writes.clear()
@@ -1003,6 +1174,11 @@ class LRUFileEvictor:
             self._foreign_indexed_bytes = 0
             self._staging_bytes = 0
             self._scan_census = dict(_EMPTY_CENSUS)
+        # the backend's clear removed the journals too
+        if self._journal is not None:
+            self._journal.reopen()
+        if self._journal_reader is not None:
+            self._journal_reader.mark()
 
     def _fs_stats(self) -> Optional[tuple]:
         """(total, available) bytes for the filesystem; None if unavailable."""
@@ -1155,15 +1331,32 @@ class LRUFileEvictor:
         index, because a second index over one directory is exactly the twin
         bookkeeping F7 removes.
         """
+        # 28.09.: where every other journal ends NOW -- lines appended during
+        # the walk are read again at the next wake, and applying them twice is
+        # a no-op (a known stem is not re-counted, an unlinked one is gone).
+        if getattr(self, "_journal_reader", None) is not None:
+            self._journal_reader.mark()
+        collect = getattr(self, "_journal_collect", None)
         entries: List[Tuple[float, str, int]] = []
         seen_bytes = 0
         seen_entries = 0
+        inherited_bytes = 0
+        inherited_entries = 0
+        persistent = self._l3p_persistent()
+        _t0 = time.monotonic()
         for stem, st in self._iter_existing():
             size = self._allocated_size(st)
             seen_bytes += size
             seen_entries += 1
+            if collect is not None:
+                collect.append((st.st_mtime, stem, size))
             # Only files this index is responsible for.
             if not self._scan_suffixes or not stem.endswith(self._scan_suffixes):
+                if (persistent and self._l3_inherited_suffixes
+                        and st.st_mtime < self._l3_epoch
+                        and stem.endswith(self._l3_inherited_suffixes)):
+                    inherited_bytes += size
+                    inherited_entries += 1
                 continue
             entries.append((st.st_mtime, stem, size))
         entries.sort(key=lambda e: e[0])  # oldest first
@@ -1181,6 +1374,9 @@ class LRUFileEvictor:
             # these entries this owner already knew about.
             "foreign_indexed_bytes": 0,
             "staging_bytes": staging_bytes,
+            "inherited_bytes": inherited_bytes,
+            "inherited_entries": inherited_entries,
+            "walk_s": round(time.monotonic() - _t0, 3),
         }
         self._staging_bytes = staging_bytes
         # #1295: MEASURED ALWAYS, ENFORCED ONLY WHERE ONE OWNER ANSWERS FOR THE
@@ -1274,13 +1470,36 @@ class LRUFileEvictor:
         decision and not a new mystery.
         """
         census = self.index_coverage()
+        # L3P: a persistent store of this identity holds the OTHER group's
+        # private-suffix pages from earlier boots. They are not a blind scan
+        # filter (the defect W8b exists for) -- they are inherited, owned and
+        # evicted by that group's own owner. Graded outside the denominator
+        # and named, so the 83.7 %-blind defect on THIS boot's writes is still
+        # caught at the wake re-scan.
+        inh_b = int(census.get("inherited_bytes", 0) or 0)
+        inh_n = int(census.get("inherited_entries", 0) or 0)
+        if inh_n:
+            logger.info(
+                "L3-PERSIST W8b graded without %d inherited file(s) (%d B) a previous "
+                "boot of this identity left under a suffix this group does not scan "
+                "(store %s; seen %d B / %d files, indexed %d B / %d files)",
+                inh_n, inh_b, self.file_path, census["seen_bytes"],
+                census["seen_entries"], census["indexed_bytes"], census["indexed_entries"])
         check_index_coverage(
             store_path=self.file_path,
             indexed_bytes=census["indexed_bytes"],
-            seen_bytes=census["seen_bytes"],
+            seen_bytes=census["seen_bytes"] - inh_b,
             indexed_entries=census["indexed_entries"],
-            seen_entries=census["seen_entries"],
+            seen_entries=census["seen_entries"] - inh_n,
         )
+
+    def _l3p_persistent(self) -> bool:
+        """L3P: is this a persistent store the launcher proved (identity file
+        present, switch not off)?"""
+        raw = (os.environ.get("SGLANG_WEG2_L3_PERSIST", "") or "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return os.path.isfile(os.path.join(self.file_path, "L3_IDENTITY.json"))
 
     def index_coverage(self) -> dict:
         """How much of the directory this evictor's byte cap actually bounds.
@@ -1339,7 +1558,27 @@ class LRUFileEvictor:
         """
         if not self._eviction_enabled:
             return self.index_coverage()
+        # NF review 2: no background unlink between the snapshot/read_delta and the install -- the walk and the
+        # journal read run without _lock, and a file the walk saw and the evictor then removed would come back as
+        # a phantom entry (presence says "there", prefetch hits ENOENT, _total_bytes too high -> over-eviction).
+        self.pause_background_eviction(reason="walk")
+        try:
+            return self._rescan_impl()
+        finally:
+            # the wake rescan is the one place the sleep hold ends (NF review 3 A), after the install.
+            # NF review 4 (1): it ends here even when _rescan_impl raises -- accepted, because a failed wake rescan
+            # stops the group anyway (W4 Weg2WakeRefused via the C15 ok-bit), so no dormant owner is left evicting.
+            self.resume_background_eviction(reason="dormant")
+            self.resume_background_eviction(reason="walk")
+
+    def _rescan_impl(self) -> dict:
         t0 = time.monotonic()
+        if self._journal_reader is not None and _sj.enabled():
+            recs, nbytes = self._journal_reader.read_delta()
+            for note in self._journal_reader.notes:
+                logger.warning(f"HiCacheFile journal: {note} -- followed from where it is now; "
+                               f"an entry whose file is gone is struck at its next ENOENT")
+            return self._journal_apply(recs, nbytes, t0)
         with self._lock:
             # Adopted at attach, or written by this process: this owner's.
             own_known = set(self._lru) - self._foreign_indexed
@@ -1393,6 +1632,226 @@ class LRUFileEvictor:
         )
         return census
 
+    def _journal_apply(self, records, nbytes: int, t0: float) -> dict:
+        """The wake's index update from the other writers' journal lines.
+
+        Same classification as the walk: a new stem under this group's suffixes
+        is indexed as the sibling's (counted, never unlinked -- this owner did
+        not write it, else it would already be indexed); any other stem is a
+        directory byte this index does not cover. An ``E`` removes. A line that
+        names a page whose file is gone is harmless: the index only ever COUNTS
+        and UNLINKS (FileNotFoundError is a drop), the read path never asks it.
+        """
+        added = removed = 0
+        with self._lock:
+            c = dict(getattr(self, "_scan_census", None) or _EMPTY_CENSUS)
+            for _t, op, size, stem in records:
+                if op not in ("C", "E"):
+                    continue  # R/A: intents, resolved by their C/A (or at the next load)
+                indexed = (not self._scan_suffixes) or stem.endswith(self._scan_suffixes)
+                if op == "C":
+                    if indexed:
+                        prev = self._lru.get(stem)
+                        if prev is None:
+                            self._lru[stem] = size
+                            self._total_bytes += size
+                            self._foreign_indexed.add(stem)
+                            self._foreign_indexed_bytes += size
+                            c["indexed_bytes"] = c.get("indexed_bytes", 0) + size
+                            c["indexed_entries"] = c.get("indexed_entries", 0) + 1
+                            c["seen_bytes"] = c.get("seen_bytes", 0) + size
+                            c["seen_entries"] = c.get("seen_entries", 0) + 1
+                            added += 1
+                        elif prev != size and stem not in self._pending_writes:
+                            self._lru[stem] = size
+                            self._total_bytes += size - prev
+                            if stem in self._foreign_indexed:
+                                self._foreign_indexed_bytes += size - prev
+                            c["indexed_bytes"] = c.get("indexed_bytes", 0) + size - prev
+                            c["seen_bytes"] = c.get("seen_bytes", 0) + size - prev
+                    else:
+                        if self._writes_shared_keys:
+                            self._enforced_foreign_bytes += size
+                        c["foreign_bytes"] = c.get("foreign_bytes", 0) + size
+                        c["seen_bytes"] = c.get("seen_bytes", 0) + size
+                        c["seen_entries"] = c.get("seen_entries", 0) + 1
+                        added += 1
+                else:  # "E"
+                    if indexed:
+                        prev = self._lru.get(stem)
+                        if prev is not None and stem not in self._pending_writes:
+                            del self._lru[stem]
+                            self._total_bytes -= prev
+                            if stem in self._foreign_indexed:
+                                self._foreign_indexed.discard(stem)
+                                self._foreign_indexed_bytes -= prev
+                            c["indexed_bytes"] = max(0, c.get("indexed_bytes", 0) - prev)
+                            c["indexed_entries"] = max(0, c.get("indexed_entries", 0) - 1)
+                            c["seen_bytes"] = max(0, c.get("seen_bytes", 0) - prev)
+                            c["seen_entries"] = max(0, c.get("seen_entries", 0) - 1)
+                            removed += 1
+                    else:
+                        if self._writes_shared_keys:
+                            self._enforced_foreign_bytes = max(0, self._enforced_foreign_bytes - size)
+                        c["foreign_bytes"] = max(0, c.get("foreign_bytes", 0) - size)
+                        c["seen_bytes"] = max(0, c.get("seen_bytes", 0) - size)
+                        c["seen_entries"] = max(0, c.get("seen_entries", 0) - 1)
+                        removed += 1
+            # the index is the truth for what it covers -- this owner's own
+            # writes since the last census included, which no journal line of
+            # another writer carries; the unindexed remainder is what the lines
+            # moved it to
+            unindexed_entries = max(0, c.get("seen_entries", 0) - c.get("indexed_entries", 0))
+            c["indexed_bytes"] = self._total_bytes
+            c["indexed_entries"] = len(self._lru)
+            c["seen_bytes"] = self._total_bytes + c.get("foreign_bytes", 0)
+            c["seen_entries"] = len(self._lru) + unindexed_entries
+            seen = c["seen_bytes"]
+            c["fraction"] = (c["indexed_bytes"] / seen) if seen > 0 else 1.0
+            c["foreign_indexed_bytes"] = self._foreign_indexed_bytes
+            c["mode"] = "journal"
+            c["journal_records"] = len(records)
+            c["walk_s"] = round(time.monotonic() - t0, 3)
+            self._scan_census = c
+            census = self.index_coverage()
+        if self._writes_shared_keys:
+            check_index_coverage(
+                store_path=self.file_path,
+                indexed_bytes=census["indexed_bytes"],
+                seen_bytes=census["seen_bytes"],
+                indexed_entries=census["indexed_entries"],
+                seen_entries=census["seen_entries"],
+            )
+        logger.info(
+            f"HiCacheFile eviction index updated from the journal at wake: "
+            f"{len(records)} line(s) ({nbytes} B) from "
+            f"{len(self._journal_reader.state)} journal(s), +{added}/-{removed} files, "
+            f"{census['indexed_entries']} of {census['seen_entries']} files indexed, "
+            f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)"
+        )
+        return census
+
+    # -- persistent index (store_journal.py) --------------------------------
+
+    def _attach_census(self) -> List[Tuple[float, str, int]]:
+        """The attach census: from snapshot + journals when they hold, else ONE
+        walk for the whole store. NF metal rc12z30c: launcher, PP0-2 and D TP0
+        each walked (5 walks, one directory). Now the launcher writes the
+        snapshot (l3_persist_attach); a rank that still finds none takes the
+        store's lock, looks again, and only the first one walks -- writing the
+        full map of the directory it walked -- while the others load it."""
+        if getattr(self, "_journal", None) is None:
+            return self._census_existing_files()
+        t0 = time.monotonic()
+        items, why = self._journal_load()
+        if items is None:
+            with _sj.snapshot_lock(self.file_path):
+                items, why2 = self._journal_load()
+                if items is None:
+                    return self._attach_walk(why2 or why)
+            why = f"{why2} (behind the one walk: {why})"
+        return self._attach_from_items(items, why, t0)
+
+    def _attach_walk(self, why: str) -> List[Tuple[float, str, int]]:
+        """The one walk (caller holds the store lock): the census, and the
+        full map of the directory persisted as the snapshot at once."""
+        logger.info(f"HiCacheFile index: FULL WALK at attach -- {why}")
+        self._journal_collect = []
+        try:
+            entries = self._census_existing_files()
+            collected = self._journal_collect
+        finally:
+            self._journal_collect = None
+        self._journal_source = f"walk ({why})"
+        collected.sort(key=lambda it: it[0])
+        self._journal_write_snapshot(collected, len(collected))
+        return entries
+
+    def _attach_from_items(self, items, why: str, t0: float) -> List[Tuple[float, str, int]]:
+        class _St:
+            __slots__ = ("st_mtime", "st_size", "st_blocks")
+
+            def __init__(self, m, n):
+                self.st_mtime, self.st_size, self.st_blocks = m, n, 0
+
+        real = self._iter_existing
+        self._iter_existing = lambda: ((stem, _St(m, n)) for stem, (m, n) in items.items())
+        try:
+            entries = self._census_existing_files()
+        finally:
+            self._iter_existing = real
+        self._journal_source = why
+        logger.info(f"HiCacheFile index LOADED at attach: {why}, {len(items)} files, "
+                    f"{(time.monotonic() - t0) * 1000:.0f} ms (no directory walk)")
+        return entries
+
+    def _journal_load(self):
+        """``(items, provenance)`` from snapshot + journals, or ``(None, why)``."""
+        epoch = _sj.attach_epoch()
+
+        def _stat(stem):
+            try:
+                st = os.stat(self._path_for_stem(stem))
+            except OSError:
+                return None
+            return (st.st_mtime, self._allocated_size(st))
+
+        return _sj.load_index(
+            self.file_path, own_path=self._journal.path if self._journal is not None else None,
+            skip_epoch_from=epoch if epoch > 0 else None, stat_size=_stat)
+
+    def _journal_after_attach(self) -> None:
+        """Every owner sets where its journal reads start (this boot's journals
+        from offset 0; the snapshot writer already persisted and compacted)."""
+        self._journal_items = None
+        if self._journal_reader is None:
+            return
+        epoch = _sj.attach_epoch()
+        self._journal_reader.mark(epoch_below=epoch if epoch > 0 else None)
+
+    def _journal_write_snapshot(self, items, n: int) -> None:
+        """Whoever walked persists the full map at once (the caller holds the
+        store lock) -- streamed from ``items`` (R4) -- and folds the earlier
+        boots' journals in. Any group: the first process that needs the
+        index is the one that walks (P starts before D)."""
+        epoch = _sj.attach_epoch()
+        try:
+            n, nbytes, gone = _sj.persist(self.file_path, items, n, epoch)
+            logger.info(f"HiCacheFile index SNAPSHOT written: {n} files, {nbytes} B "
+                        f"({self._journal_source}); {gone} journal(s) of earlier boots compacted; "
+                        f"host RAM of this index ~{n * _sj.RAM_BYTES_PER_ENTRY / (1 << 20):.0f} MiB "
+                        f"({_sj.RAM_BYTES_PER_ENTRY} B/entry) per owner")
+        except (OSError, ValueError) as e:
+            logger.warning(f"HiCacheFile index snapshot NOT written ({e}); the next attach walks")
+
+    def forget(self, stems) -> int:
+        """ENOENT at a read: these indexed pages have no file. Struck, and an
+        ``E`` line so the sibling's index strikes them too. Returns the count."""
+        n = 0
+        now = time.time()
+        with self._lock:
+            for stem in stems:
+                prev = self._lru.get(stem)
+                if prev is None or stem in self._pending_writes:
+                    continue
+                del self._lru[stem]
+                self._total_bytes -= prev
+                if stem in self._foreign_indexed:
+                    self._foreign_indexed.discard(stem)
+                    self._foreign_indexed_bytes -= prev
+                n += 1
+                if self._journal is not None:
+                    self._journal.write("E", now, prev, stem)
+        return n
+
+    def journal_sync_async(self) -> None:
+        """fsync this rank's journal on a thread -- called after the sleep leg
+        committed, never inside it (a flip is never slowed)."""
+        jn = getattr(self, "_journal", None)
+        if jn is None:
+            return
+        threading.Thread(target=jn.sync, name="weg2-l3-journal-fsync", daemon=True).start()
+
     def _path_for_stem(self, stem: str) -> str:
         """The file this stem names. One join, so the evictor, the
         accounting and the pin ledger all stat the same path."""
@@ -1441,6 +1900,23 @@ class LRUFileEvictor:
             # the space is not there, rather than looping forever.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
+        if self._pair_evict:
+            twin = _sidecar_kv_twin(evict_stem)
+            if twin is not None and self._kv_twin_on_disk_locked(twin):
+                # L3-PAIR (30.09., NF y3u 5bedac26f1, weg2-0-5): the QSA index
+                # page is worth nothing without its KV page and the KV page
+                # nothing without it (batch_exists_v2 takes it ALL_PAGES). The
+                # two files kept separate recencies -- a KV rewrite or read
+                # moved the KV page, never its index page (store index at the
+                # attach: QSA 21:41:25 at position 46 of 174419, KV 00:10:24 at
+                # 139279) -- so D's owner unlinked 8 index pages at 00:35:43
+                # whose KV pages stayed, D's resume capped at 47 of 1996 pages,
+                # W50 midstream, P re-prefilled 127813 tokens (32.49 s).
+                # Same skip-and-repin as a pin: the index page leaves in the
+                # step that unlinks its KV page (_unlink_pair_sidecars_locked).
+                self._lru[evict_stem] = evict_size
+                self._pair_deferred += 1
+                return "skipped", 0
         # The INJECTED resolver, not a flat join: this backend hands the
         # evictor `path_for_stem=self._existing_path`, which knows the sharded
         # layout. A flat join here misses the file, `os.remove` fails, the
@@ -1459,17 +1935,83 @@ class LRUFileEvictor:
                     pass
             if self._on_evict is not None:
                 self._on_evict(evict_stem)
+            if self._journal is not None:
+                self._journal.write("E", time.time(), evict_size, evict_stem)
         except FileNotFoundError:
             freed = 0  # file already gone; still drop the stale index entry
             if self._on_evict is not None:
                 self._on_evict(evict_stem)
+            if self._journal is not None:
+                self._journal.write("E", time.time(), evict_size, evict_stem)
         except OSError as e:
             logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
             self._lru[evict_stem] = evict_size
             self._lru.move_to_end(evict_stem, last=False)
             return "stop", 0
         self._total_bytes -= evict_size
+        if self._pair_evict:
+            freed += self._unlink_pair_sidecars_locked(evict_stem)
         return "evicted", freed
+
+    def _kv_twin_on_disk_locked(self, kv_stem: str) -> bool:
+        """Is the KV page of a sidecar victim still on disk? This owner's index
+        first; a KV page only the sibling group indexes (or one written after
+        this owner's attach) is asked of the file itself. Caller holds _lock."""
+        if kv_stem in self._lru:
+            return True
+        try:
+            return os.path.exists(self._path_for_stem(kv_stem))
+        except Exception:  # noqa: BLE001 - no answer is no protection, the old path
+            return False
+
+    def _unlink_pair_sidecars_locked(self, kv_stem: str) -> int:
+        """L3-PAIR: unlink the ALL_PAGES sidecars of a KV page this step just
+        unlinked -- the same bookkeeping as a victim (index, #1459 L3 index,
+        on_evict, journal ``E``, bytes). Skips what a victim would skip: an
+        in-flight write, the sibling group's page, a pinned page. Returns the
+        bytes freed. Caller holds _lock."""
+        freed = 0
+        for tw in _kv_sidecar_twins(kv_stem):
+            size = self._lru.get(tw)
+            if size is None or tw in self._pending_writes or tw in self._foreign_indexed:
+                continue
+            if self._pins is not None and self._pins.is_pinned(tw):
+                continue
+            try:
+                os.remove(self._path_for_stem(tw))
+                freed += size
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning(f"HiCacheFile pair eviction failed for {tw}: {e}")
+                continue
+            del self._lru[tw]
+            _idx = getattr(self, "l3_index", None)
+            if _idx is not None:
+                try:
+                    _idx.remove([tw])  # #1459
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._on_evict is not None:
+                self._on_evict(tw)
+            if self._journal is not None:
+                self._journal.write("E", time.time(), size, tw)
+            self._total_bytes -= size
+            self._pair_with_kv += 1
+        return freed
+
+    def _pair_report(self) -> None:
+        """One line when the L3-PAIR counters moved since the last one (rides
+        the eviction reports' rate limit)."""
+        cur = (self._pair_deferred, self._pair_with_kv)
+        if not self._pair_evict or cur == self._pair_logged:
+            return
+        self._pair_logged = cur
+        logger.info(
+            "L3-PAIR EVICT deferred=%d with_kv=%d (the QSA index page of a KV page on disk "
+            "is never the victim; it is unlinked in the step that unlinks its KV page -- "
+            "SGLANG_HICACHE_L3_SIDECAR_PAIR_EVICT)", cur[0], cur[1],
+        )
 
     def _evict_while(self, should_continue) -> int:
         """Evict oldest non-pending entries while ``should_continue(reclaimed)``.
@@ -1493,7 +2035,151 @@ class LRUFileEvictor:
             attempts_left = len(self._lru)
         return reclaimed
 
-    def _evict_locked(self, needed_bytes: int) -> None:
+    def _bg_evict_high_mark_locked(self) -> int:
+        """EVICT_OFFPATH wake mark: halfway between cap x ratio and the cap."""
+        low = int(self.max_size_bytes * self.eviction_ratio)
+        return low + (self.max_size_bytes - low) // 2
+
+    def _kick_bg_evictor_locked(self) -> None:
+        """EVICT_OFFPATH: wake (and on first use start) the background evictor. Caller holds ``_lock``."""
+        if self._bg_evict_thread is None or not self._bg_evict_thread.is_alive():
+            self._bg_evict_thread = threading.Thread(
+                target=self._bg_evictor_loop, name="l3_evictor", daemon=True)
+            self._bg_evict_thread.start()
+        self._bg_evict_event.set()
+
+    @property
+    def _bg_paused(self) -> bool:
+        return any(v > 0 for v in self._bg_holds.values())
+
+    def pause_background_eviction(self, timeout: Optional[float] = None, reason: str = "walk") -> bool:
+        """NF review 2: stop the background evictor at a batch boundary and wait until it is parked.
+
+        Called at the sleep entry BEFORE the dormant marker (the sleeping group must not unlink on a store its
+        sibling is about to own -- ``rescan``'s docstring rules out two owners evicting at once) and at the start
+        of ``rescan``/``clear`` (their walk / journal read run without ``_lock`` and must not see a file vanish
+        between snapshot and install). Returns True once no batch runs. No-op (True) without the thread.
+        """
+        with self._bg_cv:
+            if reason == "dormant":
+                self._bg_holds["dormant"] = 1
+            else:
+                self._bg_holds[reason] = self._bg_holds.get(reason, 0) + 1
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while self._bg_busy:
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    return False
+                self._bg_cv.wait(left)
+        return True
+
+    def resume_background_eviction(self, reason: str = "walk") -> None:
+        """NF review 2/3: lift ONE hold of ``reason`` (``"dormant"`` clears the sleep hold -- only the wake rescan
+        does that); the evictor runs again once no hold is left, re-kicked when the directory is still past the
+        wake mark, since a kick during the pause may have been consumed."""
+        with self._bg_cv:
+            was = self._bg_paused
+            if reason == "dormant":
+                self._bg_holds.pop("dormant", None)
+            elif self._bg_holds.get(reason, 0) > 0:
+                self._bg_holds[reason] -= 1
+            now_free = was and not self._bg_paused
+            self._bg_cv.notify_all()
+        if now_free and self._evict_offpath and self._bg_evict_thread is not None:
+            with self._lock:
+                if self.max_size_bytes > 0 and self._directory_bytes_locked() > self._bg_evict_high_mark_locked():
+                    self._kick_bg_evictor_locked()
+
+    def pause_for_sleep(self, timeout: float = 10.0) -> None:
+        """NF review 3 (B): the SLEEP hold, before the dormant marker. Without the background thread a no-op; with
+        it, a drain that does not complete within ``timeout`` is a NAMED stop (:class:`Weg2L3EvictorPauseRefused`)
+        -- the group must not go dormant while its evictor may still unlink on the store its sibling takes over."""
+        if self._bg_evict_thread is None:
+            with self._bg_cv:
+                self._bg_holds["dormant"] = 1  # a later first kick parks at once
+            return
+        if not self.pause_background_eviction(timeout=timeout, reason="dormant"):
+            raise Weg2L3EvictorPauseRefused(
+                f"W-L3E Weg2L3EvictorPauseRefused: the background L3 evictor on {self.file_path!r} did not park "
+                f"within {timeout:.1f} s at the sleep entry (a batch still unlinking); the group does not go "
+                f"dormant with its evictor live on the store the sibling group owns next"
+            )
+
+    def _bg_evictor_loop(self) -> None:
+        """EVICT_OFFPATH: bring the directory down to cap x ratio in batches of ``_BG_EVICT_BATCH`` victims.
+
+        Each victim goes through the SAME ``_evict_one_lru_locked`` under the SAME ``_lock`` as before -- index,
+        l3_index, on_evict and the journal ``E`` line change together with the unlink, so no reader is ever handed
+        an index entry whose file this loop removed without it. The lock is dropped between batches, so a
+        ``reserve()`` (the backup thread the #1068 RESET JOIN waits for) waits at most one batch.
+        """
+        while True:
+            self._bg_evict_event.wait()
+            self._bg_evict_event.clear()
+            t0, reclaimed, before = time.monotonic(), 0, None
+            while True:
+                with self._bg_cv:
+                    while self._bg_paused:
+                        self._bg_cv.wait()
+                    self._bg_busy = True
+                try:
+                    step = self._bg_evict_batch(before)
+                finally:
+                    with self._bg_cv:
+                        self._bg_busy = False
+                        self._bg_cv.notify_all()
+                if step is None:
+                    break
+                before, got, stuck = step
+                reclaimed += got
+                if stuck:
+                    break  # nothing evictable left (pending / sibling / pinned): the cap path names it
+                time.sleep(0)  # let a waiting reserve() take the lock between batches
+            if before is None:
+                continue
+            self._bg_evict_report(t0, reclaimed, before)
+
+    def _bg_evict_batch(self, before: Optional[int]):
+        """One lock-held batch; None when the directory is at or under cap x ratio, else
+        ``(before, reclaimed, stuck)``."""
+        with self._lock:
+            if self.max_size_bytes <= 0:
+                return None
+            target = int(self.max_size_bytes * self.eviction_ratio)
+            cur = self._directory_bytes_locked()
+            if before is None:
+                before = cur
+            if cur <= target:
+                return None
+            n, t_b = [0], time.monotonic()
+
+            def more(_r, n=n, target=target, t_b=t_b):
+                n[0] += 1
+                return (n[0] == 1 or (n[0] <= _BG_EVICT_BATCH
+                                      and time.monotonic() - t_b < _BG_EVICT_BATCH_S)) \
+                    and self._directory_bytes_locked() > target
+
+            got = self._evict_while(more)
+            return before, got, (got == 0 and self._directory_bytes_locked() > target)
+
+    def _bg_evict_report(self, t0: float, reclaimed: int, before: int) -> None:
+        with self._lock:
+            self._bg_evict_runs += 1
+            self._bg_evict_reclaimed += reclaimed
+            after = self._directory_bytes_locked()
+            now = time.monotonic()
+            if (now - self._last_bg_evict_log) < _EVICT_LOG_INTERVAL_S:
+                return
+            self._last_bg_evict_log = now
+        logger.info(
+            f"HiCacheFile EVICTION-BG on {self.file_path!r}: reclaimed {reclaimed} B in "
+            f"{(time.monotonic() - t0) * 1000:.0f} ms (batches <= {_BG_EVICT_BATCH} or {_BG_EVICT_BATCH_S * 1000:.0f} ms, off the reset-joined "
+            f"threads); directory {before} -> {after} B toward cap {self.max_size_bytes} B x ratio "
+            f"{self.eviction_ratio:.2f}; runs {self._bg_evict_runs}, total {self._bg_evict_reclaimed} B"
+        )
+        self._pair_report()
+
+    def _evict_locked(self, needed_bytes: int, target: Optional[int] = None) -> None:
         """Evict LRU entries until DIRECTORY + needed <= cap*ratio.
 
         Caller holds _lock. #1295: the low-water mark is measured over the
@@ -1509,7 +2195,8 @@ class LRUFileEvictor:
         """
         if self.max_size_bytes <= 0:
             return
-        target = max(0, int(self.max_size_bytes * self.eviction_ratio) - needed_bytes)
+        if target is None:
+            target = max(0, int(self.max_size_bytes * self.eviction_ratio) - needed_bytes)
         before = self._directory_bytes_locked()
         reclaimed = self._evict_while(lambda _: self._directory_bytes_locked() > target)
         # EXECUTION PROOF AT INFO, not debug. On the boot of record the only
@@ -1537,3 +2224,4 @@ class LRUFileEvictor:
             f"a suffix this group does not scan + {self._staging_bytes} B "
             f"staging; {suppressed} further run(s) suppressed since the last line"
         )
+        self._pair_report()

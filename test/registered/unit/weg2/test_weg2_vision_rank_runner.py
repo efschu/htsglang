@@ -197,6 +197,45 @@ def test_a_tail_in_use_is_W105_and_nothing_moves(tmp_path):
     assert list(built[0].parameters()) == []
 
 
+def test_a_stage_while_a_batch_is_in_flight_never_touches_its_pages_H125e(tmp_path):
+    """H125e: the stage now runs while microbatches are in flight. Their KV
+    pages are out of the free list, and the tail is reserved from the free
+    list only, so the tower's pages are disjoint from every in-flight batch's
+    pages by construction; the in-flight rows keep their bytes."""
+    _write_model(tmp_path)
+    s = _stage_sched()
+    alloc = s.token_to_kv_pool_allocator
+    kv = alloc.get_kvcache()
+    in_flight = alloc.free_pages[:3].clone()          # an admitted batch's pages (front)
+    alloc.free_pages = alloc.free_pages[3:]
+    for layer in kv.k_buffer:
+        layer[in_flight] = 7                           # its KV bytes
+    free_before = alloc.free_pages.clone()
+    out = _run(s, [_req("r", [_Item()])], tmp_path)
+    assert out.ok, out.detail
+    lo = NUM_PAGES - out.tail_pages + 1
+    tail = set(range(lo, NUM_PAGES + 1))
+    assert tail.isdisjoint(set(in_flight.tolist()))
+    for layer in kv.k_buffer:
+        assert bool((layer[in_flight] == 7).all())     # untouched
+    assert torch.equal(torch.sort(alloc.free_pages)[0], torch.sort(free_before)[0])
+
+
+def test_a_batch_in_flight_on_the_tail_is_W105_not_a_shared_page_H125e(tmp_path):
+    _write_model(tmp_path)
+    s = _stage_sched()
+    alloc = s.token_to_kv_pool_allocator
+    kv = alloc.get_kvcache()
+    held = torch.tensor([NUM_PAGES], dtype=alloc.free_pages.dtype)  # in flight, in the tail
+    alloc.free_pages = alloc.free_pages[alloc.free_pages != NUM_PAGES]
+    for layer in kv.k_buffer:
+        layer[held] = 9
+    out = _run(s, [_req("r", [_Item()])], tmp_path, place=vrs.PLACE_KVTAIL)
+    assert not out.ok and out.code == vrr.W_NO_ROOM
+    for layer in kv.k_buffer:
+        assert bool((layer[held] == 9).all())
+
+
 def test_an_encode_failure_is_W107_and_the_pages_come_back(tmp_path):
     _write_model(tmp_path)
     s = _stage_sched()
@@ -283,16 +322,38 @@ def test_an_idle_pp0_stages_every_pending_image_with_one_load(stage_calls):
     assert vrr.vision_rank_pass(s) == [] and len(calls) == 1  # staged: nothing pending
 
 
-def test_a_busy_pp0_holds_EVERY_waiting_request_until_it_drained(stage_calls):
+def test_a_busy_pp0_stages_in_this_pass_and_holds_nothing_H125e(stage_calls):
+    """H125e (V1 dkrnfh91visbar1dauer09270822, #1004 SLOT DISAGREEMENT):
+    with microbatches in flight the old pass held EVERY waiting request until
+    PP0 drained. PP0 then cycled its in-flight slots alone while PP1, drained
+    earlier, parked on the next slot, and PP0 admitted the held work two slots
+    later than the follower that took its row. Admissible work is admitted in
+    the pass that finds it: the stage runs now, nothing is parked."""
     calls, _ = stage_calls
     queue = [_req("t1"), _req("i1", [_Item()]), _req("t2")]
     s = _pass_sched(queue, idle=False)
+    s._pp_microbatches_drained = lambda: False  # fwd in flight, as on the metal
     parked = vrr.vision_rank_pass(s)
-    assert calls == [] and s.waiting_queue == []
-    assert [r.rid for _, r in parked] == ["t1", "i1", "t2"]
-    s.waiting_queue.append(_req("new"))  # arrived during the admission
-    vrr.vision_unpark(s, parked)
-    assert [r.rid for r in s.waiting_queue] == ["t1", "i1", "t2", "new"]
+    assert parked == []
+    assert calls == [["i1"]] and s._weg2_vision_runs == 1
+    assert [r.rid for r in s.waiting_queue] == ["t1", "i1", "t2"]
+    assert vrr.unstaged_items(s.waiting_queue[1]) == []  # staged: admissible now
+
+
+def test_a_chunked_request_in_flight_does_not_defer_the_stage_H125e(stage_calls):
+    calls, _ = stage_calls
+    s = _pass_sched([_req("i1", [_Item()])])
+    s.chunked_req = object()
+    assert vrr.vision_rank_pass(s) == [] and calls == [["i1"]]
+
+
+def test_only_a_refused_image_is_held_and_text_beside_it_is_not_H125e(stage_calls):
+    calls, verdict = stage_calls
+    verdict["ok"] = False
+    s = _pass_sched([_req("t1"), _req("i1", [_Item()]), _req("t2")], idle=False)
+    parked = vrr.vision_rank_pass(s)
+    assert [r.rid for _, r in parked] == ["i1"]
+    assert [r.rid for r in s.waiting_queue] == ["t1", "t2"]
 
 
 def test_a_refused_stage_aborts_by_name_and_is_never_restaged(stage_calls):
@@ -391,3 +452,200 @@ def test_captured_vit_graphs_are_refused(monkeypatch):
     s = _arm_sched()
     assert vrr.arm_rank_stage(s, env=P_TRANSIENT) is True
     assert "SGLANG_VIT_ENABLE_CUDA_GRAPH" in s._weg2_vision_arm_refusal
+
+
+def test_the_two_long_legs_are_split_in_the_outcome_and_the_line(tmp_path, caplog):
+    """(d) Befund 28.09.: 27B W102 run=1 legs encode 1773 / teardown 434 ms --
+    the line now says where: encode first vs rest, teardown strip / gc / sync
+    / tail / empty_cache. Instrument only: the stage's result is unchanged."""
+    import logging
+
+    _write_model(tmp_path)
+    s = _stage_sched()
+    out = _run(s, [_req("r1", [_Item(4), _Item(2)])], tmp_path)
+    assert out.ok, out.detail
+    assert set(out.encode_ms) == {"first", "rest"}
+    assert set(out.teardown_ms) == {"strip", "gc", "sync", "tail", "empty_cache"}
+    assert abs(sum(out.teardown_ms.values()) - out.legs_ms["teardown"]) < 5.0
+    with caplog.at_level(logging.INFO, logger=vrr.logger.name):
+        vrr.log_outcome(out, ["r1"], 1)
+    line = next(r.getMessage() for r in caplog.records if "encode_split_ms=" in r.getMessage())
+    assert "teardown_split_ms=(" in line and "gc " in line and "first " in line
+
+
+# --------------------------------------------------- (d) the async stage --
+
+
+class _ManualPool:
+    """The worker thread under the test's hand: submit() records the job,
+    finish() runs it and completes the future."""
+
+    def __init__(self):
+        from concurrent.futures import Future
+
+        self._Future = Future
+        self.jobs = []
+
+    def submit(self, fn):
+        f = self._Future()
+        self.jobs.append((fn, f))
+        return f
+
+    def finish(self):
+        for fn, f in self.jobs:
+            f.set_result(fn())
+        self.jobs = []
+
+
+def _async_sched(tmp_path, queue):
+    s = _pass_sched(queue)
+    alloc = _Alloc(_kv())
+    s.token_to_kv_pool_allocator = alloc
+    s.server_args = types.SimpleNamespace(model_path=str(tmp_path))
+    s._weg2_vision_source = None
+    return s, alloc
+
+
+def test_async_holds_the_lease_over_two_passes_and_gives_it_back_after_attach(tmp_path, monkeypatch):
+    """(d) user decision 28.09.: the KV-tail LEASE is held while the encode
+    runs; the admission sees those pages as used (they are out of the free
+    list), the image request is held out, other work is admitted in the same
+    pass; after the attach the lease goes back and the request is admitted."""
+    # VISION-SYNC LAW (user 02.10.): async is off by default; the async code
+    # stays and is exercised with the switch stated on.
+    monkeypatch.setenv(vrr.VISION_ASYNC_ENV, "1")
+    _write_model(tmp_path)
+    pool = _ManualPool()
+    monkeypatch.setattr(vrr, "_async_pool", lambda: pool)
+    monkeypatch.setattr(vrr, "build_tower_meta", _build())
+    monkeypatch.setattr(vrr, "_rank_device", lambda: torch.device("cpu"))
+    img, txt = _req("img", [_Item(4)]), _req("txt")
+    s, alloc = _async_sched(tmp_path, [img, txt])
+    full = alloc.free_pages.clone()
+    for _pass in range(2):
+        parked = vrr.vision_rank_pass(s)
+        assert [r.rid for _, r in parked] == ["img"]          # held, the text is not
+        assert vrr.vision_async_inflight(s)
+        lease = s._weg2_vision_inflight.res
+        assert lease.pages > 0
+        assert int((alloc.free_pages >= lease.lo_page).sum()) == 0   # the admission sees them used
+        vrr.vision_unpark(s, parked)
+    assert s._weg2_vision_inflight.passes == 1   # held one pass beyond the start
+    pool.finish()
+    parked = vrr.vision_rank_pass(s)
+    assert parked == []                                        # attached: admitted now
+    assert not vrr.vision_async_inflight(s)
+    assert img.multimodal_inputs.mm_items[0].precomputed_embeddings is not None
+    assert torch.equal(alloc.free_pages, full)                 # the lease is back
+    assert s._weg2_vision_runs == 1
+
+
+def test_async_off_is_the_synchronous_stage(tmp_path, monkeypatch, stage_calls):
+    calls, _ = stage_calls
+    monkeypatch.setenv(vrr.VISION_ASYNC_ENV, "0")
+    s = _pass_sched([_req("img", [_Item(4)])])
+    assert vrr.vision_rank_pass(s) == []
+    assert calls == [["img"]] and not vrr.vision_async_inflight(s)
+
+
+def test_vision_sync_law_unset_is_the_synchronous_stage_even_where_async_is_admissible(
+        tmp_path, monkeypatch, stage_calls):
+    """VISION-SYNC LAW (user 02.10. ~08:00Z, both lines): vision runs ONLY
+    synchronously, before the real prefill. Red on 0e1967fd36: the code default
+    was async ON, and a single-stage group (async admissible) held the image out
+    of the pass on a KV-tail lease. Now unset = the synchronous stage."""
+    calls, _ = stage_calls
+    monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
+    assert vrr.vision_async_on() is False
+    assert vrr.vision_async_on({}) is False and vrr.vision_async_on({vrr.VISION_ASYNC_ENV: ""}) is False
+    assert vrr.vision_async_on({vrr.VISION_ASYNC_ENV: "1"}) is True   # the code stays reachable
+    _write_model(tmp_path)
+    pool = _ManualPool()
+    monkeypatch.setattr(vrr, "_async_pool", lambda: pool)
+    monkeypatch.setattr(vrr, "build_tower_meta", _build())
+    monkeypatch.setattr(vrr, "_rank_device", lambda: torch.device("cpu"))
+    s, _ = _async_sched(tmp_path, [_req("img", [_Item(4)]), _req("txt")])
+    assert vrr.vision_async_admissible(s)[0]           # single stage: async WOULD be admissible
+    assert vrr.vision_rank_pass(s) == []               # nothing held across a pass
+    assert calls == [["img"]] and not vrr.vision_async_inflight(s) and pool.jobs == []
+
+
+def test_a_group_with_a_lease_is_never_idle():
+    import inspect
+    from sglang.srt.managers import scheduler as sm
+
+    src = inspect.getsource(sm.Scheduler.is_fully_idle)
+    assert '_weg2_vision_inflight' in src
+    assert '"vision_async"' in inspect.getsource(sm.Scheduler.idle_blockers)
+
+
+def _pp3_async_sched(tmp_path, monkeypatch, *, row_only=False):
+    """A PP0 of a 3-stage group with everything the async start needs."""
+    _write_model(tmp_path)
+    pool = _ManualPool()
+    monkeypatch.setattr(vrr, "_async_pool", lambda: pool)
+    monkeypatch.setattr(vrr, "build_tower_meta", _build())
+    s, _ = _async_sched(tmp_path, [_req("img", [_Item(4)]), _req("txt")])
+    s.ps = types.SimpleNamespace(pp_size=3, pp_rank=0)
+    s.pp_flip_counters = None
+    if row_only:
+        from sglang.srt.weg2 import p_row_authority as prow
+
+        setattr(s, prow.ROW_ONLY_ATTR, True)
+    return s, pool
+
+
+def test_async_is_not_taken_where_the_followers_plan_for_themselves(tmp_path, monkeypatch,
+                                                                     stage_calls, caplog):
+    """NF rc12z30c -st, 28.09. 20:48:53Z: '#631 ROW AUTHORITY DISABLED' on the
+    followers, PP0 held weg2-6-33 for the async stage, PP1/PP2 admitted it
+    ('#969 EXTENT n=9 fwd=1') and waited for a frame PP0 never owed -> '#973
+    RING COMMIT TIMEOUT' 120 s later. Without a row carrier PP0 must not
+    withhold: the synchronous stage stages and admits in the same pass."""
+    import logging
+
+    calls, _ = stage_calls
+    # VISION-SYNC LAW (user 02.10.): async is off by default; the async code
+    # stays and is exercised with the switch stated on.
+    monkeypatch.setenv(vrr.VISION_ASYNC_ENV, "1")
+    monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
+    s, pool = _pp3_async_sched(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=vrr.logger.name):
+        parked = vrr.vision_rank_pass(s)
+        vrr.vision_rank_pass(types.SimpleNamespace(**{**vars(s), "waiting_queue": []}))
+    assert parked == []                              # nothing held out: every rank admits it
+    assert calls == [["img"]] and not vrr.vision_async_inflight(s) and pool.jobs == []
+    said = [r.getMessage() for r in caplog.records if vrr.W_ASYNC_NOT_ADMISSIBLE in r.getMessage()]
+    assert len(said) == 1 and "pp_size=3" in said[0]
+
+
+@pytest.mark.parametrize("row_only", [False, True])
+def test_vision_sync_law_the_27b_and_nf_p_stage_stays_what_it_was(tmp_path, monkeypatch,
+                                                                   stage_calls, row_only):
+    """Identity guard (green on 0e1967fd36 AND after): a PP0 of a 3-stage P --
+    the 27B's (row form on, p_row_authority) and NF's (row form off) -- with
+    no switch set stages synchronously and admits in the same pass, exactly as
+    before the VISION-SYNC LAW made it structural. Before, it got there through
+    the async gate's refusal (one W102b line); now async is off outright."""
+    calls, _ = stage_calls
+    monkeypatch.delenv(vrr.VISION_ASYNC_ENV, raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
+    s, pool = _pp3_async_sched(tmp_path, monkeypatch, row_only=row_only)
+    assert vrr.vision_rank_pass(s) == []                 # nothing held out of the pass
+    assert calls == [["img"]] and not vrr.vision_async_inflight(s) and pool.jobs == []
+
+
+def test_async_on_the_row_form_needs_its_own_term(tmp_path, monkeypatch, stage_calls):
+    calls, _ = stage_calls
+    # VISION-SYNC LAW (user 02.10.): async is off by default; the async code
+    # stays and is exercised with the switch stated on.
+    monkeypatch.setenv(vrr.VISION_ASYNC_ENV, "1")
+    monkeypatch.delenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", raising=False)
+    s, pool = _pp3_async_sched(tmp_path, monkeypatch, row_only=True)
+    assert vrr.vision_rank_pass(s) == [] and calls == [["img"]]     # term off: synchronous
+    monkeypatch.setenv("SGLANG_WEG2_P_ROW_VISION_ASYNC", "1")
+    s2, pool2 = _pp3_async_sched(tmp_path, monkeypatch, row_only=True)
+    parked = vrr.vision_rank_pass(s2)
+    assert [r.rid for _, r in parked] == ["img"] and vrr.vision_async_inflight(s2)
+    assert len(pool2.jobs) == 1 and calls == [["img"]]              # no second sync stage

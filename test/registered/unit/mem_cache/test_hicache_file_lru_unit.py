@@ -220,6 +220,9 @@ class TestCapBasedEviction(HiCacheFileLRUTestBase):
         self.assertEqual(b._evictor._total_bytes, 0)
         self.assertEqual(len(b._evictor._lru), 0)
 
+    # the INLINE eviction contract (SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH=0); the default-on background
+    # path is covered by test_l3_evict_offpath_reset_join_0929.py
+    @mock.patch.dict(os.environ, {"SGLANG_HICACHE_FILE_BACKEND_EVICT_OFFPATH": "0"})
     def test_eviction_ratio_drops_to_watermark(self):
         # ratio=0.5 -> evict down to ~50% of the cap before adding.
         b = self.make_backend(max_size=str(4 * _UNIT), eviction_ratio=0.5)

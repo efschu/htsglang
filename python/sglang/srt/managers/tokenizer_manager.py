@@ -89,7 +89,8 @@ from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.multimodal.lane_support import image_requests_unsupported_reason
 from sglang.srt.multimodal.mm_utils import has_valid_data
-from sglang.srt.managers import shutdown_gate
+from sglang.srt.managers import shutdown_gate, weg2_resumable_depth
+from sglang.srt.managers import weg2_seq_hash as _weg2_seq_hash
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.shutdown_gate import ServerShuttingDown
@@ -260,6 +261,8 @@ class ReqState:
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
+    # SEQ-HASH (02.10.): a Weg-2 D group's prompt ids (the finish / park mark)
+    weg2_prompt_ids: Optional[List[int]] = None
 
 
 def _slice_streaming_output_meta_info(
@@ -767,6 +770,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    elif int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0) > 0:
+                        # SEQ-HASH: a Weg-2 D group hashes prompt + output at the finish
+                        state.weg2_prompt_ids = tokenized_obj.input_ids
                     self._send_one_request(tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
                         yield response
@@ -2347,6 +2353,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     weg2_prefill_s = getattr(recv_obj.time_stats[i], "weg2_prefill_s", 0.0)
                     if weg2_prefill_s > 0.0:
                         meta_info["weg2_prefill_s"] = weg2_prefill_s
+                    # #59: the depth the next turn can resume from (the front
+                    # caps its presence credit there); absent = old price.
+                    resumable = weg2_resumable_depth.meta_value(recv_obj.time_stats[i])
+                    if resumable is not None:
+                        meta_info[weg2_resumable_depth.FIELD] = resumable
+                        # SEQ-HASH: the whole sequence up to that depth (prompt + output)
+                        _sm = _weg2_seq_hash.mark(
+                            _weg2_seq_hash.sequence(
+                                state.prompt_token_ids or getattr(state, "weg2_prompt_ids", None),
+                                state.output_ids),
+                            resumable) if resumable > 0 else None
+                        if _sm:
+                            meta_info[_weg2_seq_hash.FIELD] = _sm
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)

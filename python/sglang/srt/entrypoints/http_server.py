@@ -161,6 +161,7 @@ from sglang.srt.managers.io_struct import (
     VertexGenerateReqInput,
     VramBudgetReqInput,
     Weg2ParkRunningReqInput,
+    Weg2ParkWindowReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -1425,17 +1426,38 @@ async def weg2_park_running(obj: Annotated[Weg2ParkRunningReqInput, Body()], req
         ret = await _global_state.tokenizer_manager.weg2_park_running(obj)
     except Exception as e:
         return _create_error_response(e)
+    body = {
+        "success": ret.success,
+        "parked": list(ret.parked),
+        "held": list(ret.held),
+        "late_hold": bool(getattr(ret, "late_hold", False)),
+        "epoch": ret.epoch,
+        "message": ret.message,
+    }
+    # #59b: {rid: depth} each parked request resumes from; absent = old price.
+    resumable = getattr(ret, "weg2_resumable_depth", None)
+    if resumable:
+        body["weg2_resumable_depth"] = dict(resumable)
+    seq_marks = getattr(ret, "weg2_seq_hash", None)  # SEQ-HASH (02.10.)
+    if seq_marks:
+        body["weg2_seq_hash"] = dict(seq_marks)
     return ORJSONResponse(
-        {
-            "success": ret.success,
-            "parked": list(ret.parked),
-            "held": list(ret.held),
-            "late_hold": bool(getattr(ret, "late_hold", False)),
-            "epoch": ret.epoch,
-            "message": ret.message,
-        },
+        body,
         status_code=200 if ret.success else HTTPStatus.CONFLICT,
     )
+
+
+@app.api_route("/weg2/park_window", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def weg2_park_window(obj: Annotated[Weg2ParkWindowReqInput, Body()], request: Request):
+    """PARK-WINDOW-GATE: the front's open collect window for group D (body
+    {"epoch", "left_ms", "a_ms", "b_ms", "c_ms"}; left_ms < 0 clears). One-way
+    to the scheduler, which broadcasts it to every rank of the group."""
+    try:
+        _global_state.tokenizer_manager._dispatch_to_scheduler(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse({"sent": True, "left_ms": obj.left_ms}, status_code=200)
 
 
 @app.api_route("/weg2/ple_prefetch_hint", methods=["POST"])
@@ -1455,6 +1477,7 @@ async def weg2_ple_prefetch_hint(raw_request: Request):
             serving_completion=raw_request.app.state.openai_serving_completion,
             encode=tm.tokenizer.encode,
             raw_request=raw_request,
+            serving_anthropic=raw_request.app.state.anthropic_serving,
         )
     except Exception as e:
         return _create_error_response(e)
@@ -1545,9 +1568,10 @@ async def list_external_corpora():
 
 @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def clear_hicache_storage_backend_deprecated():
-    """Deprecated: use POST /hicache/storage-backend/clear."""
-    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+async def clear_hicache_storage_backend_deprecated(force: bool = False):
+    """Deprecated: use POST /hicache/storage-backend/clear. ``?force=1`` also
+    clears a persistent L3 store (refused otherwise, W166)."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage(force=force)
     return Response(
         content=(
             "Deprecated endpoint. Use POST /hicache/storage-backend/clear.\n"
@@ -1561,9 +1585,10 @@ async def clear_hicache_storage_backend_deprecated():
 # curl -s -X POST http://127.0.0.1:30000/clear_hicache_storage_backend
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def clear_hicache_storage_backend():
-    """Clear the hierarchical cache storage backend."""
-    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
+async def clear_hicache_storage_backend(force: bool = False):
+    """Clear the hierarchical cache storage backend. ``?force=1`` also clears a
+    persistent L3 store (refused otherwise, W166)."""
+    ret = await _global_state.tokenizer_manager.clear_hicache_storage(force=force)
     return Response(
         content="Hierarchical cache storage backend cleared.\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,

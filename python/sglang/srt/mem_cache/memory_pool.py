@@ -1532,7 +1532,8 @@ class MambaPool:
         raw = getattr(self, "_raw", None)
         if raw is not None:
             # Envelope layout: conv/temporal are views into one byte buffer.
-            raw.zero_()
+            # DP-NACHLAUF: through a wide view (zero_wide_, same bytes)
+            zero_wide_(raw)
         else:
             for conv in self.mamba_cache.conv:
                 conv.zero_()
@@ -2097,9 +2098,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # P-NOSYNC (managers/weg2_p_overlap.py): `alloc` writes the mamba
         # mapping rows without a host wait on the stream. Read once; off =
         # the stock write, unchanged.
-        from sglang.srt.managers.weg2_p_overlap import p_nosync_on
+        # D-CACHE-NOSYNC (#281): group D asks the same cache-path switch.
+        from sglang.srt.managers.weg2_p_overlap import cache_path_nosync_on
 
-        self._nosync = p_nosync_on()
+        self._nosync = cache_path_nosync_on()
         # Bound by the radix cache at construction (`bind_tree_cache`) so the
         # allocation sites below can evict cached checkpoints before declaring
         # the pool exhausted. None until then (and for pool-only unit setups),
@@ -3021,6 +3023,71 @@ def maybe_poison_pool_data(tensors, source: str, row_limit=None) -> None:
     )
 
 
+def _kv_stage_born(pool, t: torch.Tensor, name: str) -> torch.Tensor:
+    """#251c: a K/V buffer of D's stage-form pool keeps its top-stage range and
+    only stage S0's pages (weg2/d_seat_vram.kv_stage_born); every other pool's
+    buffer passes through untouched."""
+    from sglang.srt.weg2.d_seat_vram import kv_stage_born, kv_stage_boot_rows
+
+    rows = max(1, int(t.shape[0]))
+    t = kv_stage_born(
+        t,
+        pool_size=int(pool.size),
+        page_size=int(pool.page_size),
+        name=name,
+        tokens_per_slot=max(1, (int(pool.size) + int(pool.page_size)) // rows),
+    )
+    stage_rows = kv_stage_boot_rows(int(pool.size), int(pool.page_size))
+    if stage_rows is not None:
+        pool.set_stage_backed_rows(stage_rows)
+    return t
+
+
+#: DP-NACHLAUF 02.10. (N5m/N5p/N5q, EVERY D wake): the wake restore's re-zero
+#: cost TP0 85-95 ms and TP1/TP2 169-189 ms (5090/3080 = the bandwidth ratio,
+#: so device-bound) for ~8-10 GB per rank -- ~100 / ~46 GB/s, a few percent of
+#: what the cards write. The fill ran element-wise over fp8 (KV) and uint8
+#: (mamba envelope) tensors: one byte per element. A contiguous buffer is
+#: zeroed through an int64 view of the same bytes instead (8x fewer elements,
+#: identical result); a strided or odd-sized one keeps the plain zero_() and is
+#: counted, so a strided layout cannot hide. Unset = on; 0/false/no/off = the
+#: per-dtype zero_() everywhere.
+ZERO_WIDE_ENV = "SGLANG_WEG2_ZERO_WIDE"
+_ZERO_WIDE_STATS = {"wide": 0, "narrow": 0, "bytes": 0}
+
+
+def zero_wide_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(ZERO_WIDE_ENV, "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def zero_wide_(t: torch.Tensor) -> bool:
+    """Zero ``t`` in place; True when it went through a wide (int64/int32)
+    view of its bytes, False when the plain ``zero_()`` ran."""
+    n = int(t.numel()) * int(t.element_size())
+    _ZERO_WIDE_STATS["bytes"] += n
+    if n and zero_wide_on() and t.is_contiguous():
+        for wide in (torch.int64, torch.int32):
+            w = wide.itemsize if hasattr(wide, "itemsize") else torch.empty((), dtype=wide).element_size()
+            if n % w == 0 and t.data_ptr() % w == 0 and t.element_size() < w:
+                try:
+                    t.reshape(-1).view(torch.uint8).view(wide).zero_()
+                    _ZERO_WIDE_STATS["wide"] += 1
+                    return True
+                except RuntimeError:
+                    break
+    t.zero_()
+    _ZERO_WIDE_STATS["narrow"] += 1
+    return False
+
+
+def zero_wide_stats_take() -> dict:
+    out = dict(_ZERO_WIDE_STATS)
+    for k in _ZERO_WIDE_STATS:
+        _ZERO_WIDE_STATS[k] = 0
+    return out
+
+
 def zero_kv_data_buffers(kvcache) -> int:
     """Zero the KV data buffers of ``kvcache`` (and its sub-pools) in place;
     returns the number of buffers zeroed.
@@ -3059,9 +3126,9 @@ def zero_kv_data_buffers(kvcache) -> int:
                 bufs = [bufs]
             for t in bufs:
                 if limit is None:
-                    t.zero_()
+                    zero_wide_(t)
                 else:
-                    t[: int(limit)].zero_()
+                    zero_wide_(t[: int(limit)])
                 zeroed += 1
     return zeroed
 
@@ -3359,6 +3426,10 @@ class MHATokenToKVPool(KVCache):
         #: unmapped. Empty = fully resident; a full set = fully released.
         self._released_layers = set()
         self._post_capture_owner = None
+        # #251c: the rows D's KV stage keeps mapped (set_stage_backed_rows),
+        # None off. Must exist before _create_buffers: a tensor born trimmed
+        # sets it (_kv_stage_born).
+        self._stage_backed_rows = None
         # #330 dial: chunked physical commits make the tail releasable at
         # runtime; None keeps one handle per extension (stock post-capture).
         self._vmm_commit_chunk_bytes = vmm_commit_chunk_bytes
@@ -3590,12 +3661,20 @@ class MHATokenToKVPool(KVCache):
                 else:
                     k_shape, v_shape = self._kv_buffer_shapes()
                     self.k_buffer = [
-                        torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
+                        _kv_stage_born(
+                            self,
+                            torch.zeros(k_shape, dtype=self.store_dtype, device=self.device),
+                            f"k{i}",
+                        )
+                        for i in range(self.layer_num)
                     ]
                     self.v_buffer = [
-                        torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
-                        for _ in range(self.layer_num)
+                        _kv_stage_born(
+                            self,
+                            torch.zeros(v_shape, dtype=self.store_dtype, device=self.device),
+                            f"v{i}",
+                        )
+                        for i in range(self.layer_num)
                     ]
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
@@ -4021,6 +4100,16 @@ class MHATokenToKVPool(KVCache):
         """
         return not self._released_layers
 
+    def set_stage_backed_rows(self, rows) -> None:
+        """#251c: the rows of each K/V buffer D's KV stage keeps mapped, or
+        None (no stage). The saver trims these tensors itself -- there is no
+        VMM owner whose watermark would say so -- so the stage is the backing
+        this pool reports: ``_committed_row_bound`` and ``safe_zero_rows`` take
+        it, and nothing that honours them writes an unmapped row. rc12z13 died
+        in the first wake assigning ``safe_zero_rows`` itself (a property since
+        #656, 65432cea6d); the bound is set HERE, the property reads it."""
+        self._stage_backed_rows = None if rows is None else int(rows)
+
     @property
     def safe_zero_rows(self):
         """Rows of each K/V buffer a kernel may legally write, or None.
@@ -4050,7 +4139,9 @@ class MHATokenToKVPool(KVCache):
         owner = self._post_capture_owner
         specs = getattr(owner, "_specs", None) if owner is not None else None
         if not specs:
-            return None
+            # #251c: token-major buffers, one row per token -- the stage's
+            # rows as they are (None off: the whole tensor is backed)
+            return self._stage_backed_rows
         tokens = int(self.size) + int(self.page_size)
         watermark = self._committed_row_bound()
         if watermark is not None:
@@ -4115,9 +4206,12 @@ class MHATokenToKVPool(KVCache):
         were minted at a larger backing and outlived a shrink.
         """
         owner = self._post_capture_owner
-        if owner is None:
-            return None
-        return int(owner.uniform_backed_tokens)
+        bound = None if owner is None else int(owner.uniform_backed_tokens)
+        # #251c: D's KV stage bounds the mapped rows like a watermark does
+        stage = self._stage_backed_rows
+        if stage is not None:
+            bound = stage if bound is None else min(bound, stage)
+        return bound
 
     @property
     def reserved_backing_rows(self) -> int:
@@ -6269,7 +6363,13 @@ def move_kv_cache_native(
             v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
-@triton.jit
+# ``N`` (rows written this forward) is a runtime scalar, not a constexpr: as a
+# constexpr every distinct extend length compiled/loaded its own variant on the
+# hot path (y8a D: 91 cold loads on TP0 in ~15 min, each opening a barlink JIT
+# cold-build window). It only bounds ``pid``; the grid is already ``(N,)``.
+# do_not_specialize also drops Triton's ==1 / %16 integer specialization, so a
+# single kernel serves every length.
+@triton.jit(do_not_specialize=["N"])
 def masked_set_kv_buffer_kernel(
     k_ptr,
     v_ptr,
@@ -6278,7 +6378,7 @@ def masked_set_kv_buffer_kernel(
     loc_ptr,
     mask_ptr,
     bound,
-    N: tl.constexpr,
+    N,
     H: tl.constexpr,
     D: tl.constexpr,
     CHUNK: tl.constexpr,

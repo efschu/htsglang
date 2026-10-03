@@ -49,6 +49,29 @@ from sglang.srt.weg2 import front as front_mod
 from sglang.srt.weg2 import launcher as L
 from sglang.srt.weg2.front import Front
 
+
+# X-COST-LINE is the default since 29.09. (27B z30y metal proof); this module
+# pins the solo-r_D re-solve it was written for -- the =0 path, still valid.
+_XCL_KEY = "SGLANG_WEG2_ENABLE_X_COST_LINE"
+_XCL_SAVED = None
+
+
+def setup_module(module=None):
+    global _XCL_SAVED
+    import os as _os
+
+    _XCL_SAVED = _os.environ.get(_XCL_KEY)
+    _os.environ[_XCL_KEY] = "0"
+
+
+def teardown_module(module=None):
+    import os as _os
+
+    if _XCL_SAVED is None:
+        _os.environ.pop(_XCL_KEY, None)
+    else:
+        _os.environ[_XCL_KEY] = _XCL_SAVED
+
 START_X = 4096            # the launcher's X on x177 (source=flag), D's riegel
 CEILING = 12288           # the arm's --x-ceiling-tokens
 X177_R_D_WARM = 1036.0    # 3827 tok / 3.69 s, D gpu-ms
@@ -469,3 +492,13 @@ def _tokenizer_meta_info(x_tokens: int) -> dict:
 def test_red_first_meta_info_carries_weg2_prefill_s_on_a_weg2_d_only():
     assert _tokenizer_meta_info(START_X)["weg2_prefill_s"] == pytest.approx(3.17)
     assert "weg2_prefill_s" not in _tokenizer_meta_info(0)
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")

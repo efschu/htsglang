@@ -2080,6 +2080,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             raise
 
+        # VRAM loop P0 (28.09.): bound the caching allocator to this rank's
+        # booked size (weg2/torch_cache_cap.py); off unless the launcher armed it.
+        if self.device == "cuda":
+            from sglang.srt.weg2 import torch_cache_cap as _tcc
+
+            _tcc.arm(self.tp_rank, self.pp_rank, self.gpu_id)
+
         # Mixed-architecture rigs (bug #208): nvidia-cutlass-dsl picks its
         # compile target ONCE per process from driver device 0, not from the
         # device this rank just selected, and that same string keys its JIT
@@ -2497,6 +2504,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return draft_format
 
     def load_model(self):
+        # BOOTZEIT 3: an early-started group D waits for P asleep before the
+        # first byte and the avail-mem reading (no-op without the gate env).
+        from sglang.srt.weg2.d_early_start import wait_gate_from_env
+
+        wait_gate_from_env()
         tic_total = time.perf_counter()
         if os.environ.get("SGLANG_LOAD_MEMSNAP_DIR"):
             # frames for the [vram-census] segment report / snapshot after load
@@ -4192,18 +4204,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_attention_backend(self):
         """Init attention kernel backend."""
         if getattr(self, "is_form_a_worker", False):
-            # FORM A (fnFA7 20.09.): a worker has no attention layers and a
-            # head share of 0 -- a real backend cannot even be constructed
-            # (flashinfer's should_use_tensor_core divides by the kv-head
-            # count). The worker backend answers the per-forward
-            # bookkeeping as no-ops and refuses any real attention by name.
-            from sglang.srt.form_a_construction import FormAWorkerAttnBackend
+            # FORM A (fnFA7 20.09.) / #239 S3c: a worker builds no real
+            # attention backend -- unless it owns a token range of the
+            # full-attention KV under the token cut. The choice lives in
+            # form_a_dcp_wiring (frozen file: orchestration only).
+            from sglang.srt.form_a_dcp_wiring import form_a_worker_attn_backend
 
             # The per-mode name stamps are normally resolved inside
             # _get_attention_backend, which a worker never calls (fnFA9).
-            self.prefill_attention_backend_str = "form_a_worker"
-            self.decode_attention_backend_str = "form_a_worker"
-            self.attn_backend = FormAWorkerAttnBackend(self)
+            worker_attn = form_a_worker_attn_backend(self)
+            self.prefill_attention_backend_str = worker_attn.name
+            self.decode_attention_backend_str = worker_attn.name
+            self.attn_backend = worker_attn.backend
         elif self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
@@ -5432,10 +5444,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.distributed import get_tp_group
 
         group = get_tp_group()
+        # #239 S3c: this rank's backend decides whether its full-attention
+        # layers join A/T/Q/M -- declared from the object that runs them, so a
+        # rank whose backend did not take the token cut disagrees HERE.
+        from sglang.srt.form_a_dcp_wiring import form_a_dcp_merge_of
+
         gate_form_a_boot(
             plan,
             self.tp_rank,
             group.all_gather_object,
+            form_a_dcp_merge=form_a_dcp_merge_of(self.attn_backend),
             worker_skips_dense=True,
             host_dense_is_unsharded=True,
             # Slice 3's host-centric exchange stays behind its switch; the
@@ -5507,6 +5525,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens = int(input_ids.shape[0])
         if num_tokens == 0:
             return ModelRunnerOutput(logits_output=None, can_run_graph=False)
+        # #239 M1s: this eager entry bypasses the eager runner's metadata init
+        from sglang.srt.form_a_dcp_wiring import prepare_form_a_worker_eager_forward
+
+        prepare_form_a_worker_eager_forward(self.attn_backend, forward_batch)
         self.run_form_a_worker_route(forward_batch, num_tokens)
         return ModelRunnerOutput(logits_output=None, can_run_graph=False)
 
@@ -5537,6 +5559,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "without the plan this rank cannot even name the host it "
                 "would receive the MoE input from."
             )
+        # #239 S3c: under the token cut this worker joins every
+        # full-attention layer's A [, T, Q, M] (form_a_dcp_wiring).
+        from sglang.srt.form_a_dcp_wiring import form_a_worker_attention_step
+
+        attention, attention_layer_ids = form_a_worker_attention_step(
+            self.attn_backend, forward_batch, self.token_to_kv_pool
+        )
         return run_form_a_worker_layers(
             self._form_a_moe_blocks(),
             num_tokens=int(num_tokens),
@@ -5545,6 +5574,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=forward_batch.input_ids.device,
             forward_batch=forward_batch,
             host_rank=int(host_rank),
+            attention=attention,
+            attention_layer_ids=attention_layer_ids,
         )
 
     def _forward_raw(
@@ -5728,7 +5759,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             pp_proxy_tensors=pp_proxy_tensors,
                         )
                     return ModelRunnerOutput(logits_output=None, can_run_graph=True)
-                with self._decode_round_segment("decode", graphed=False):
+                # WI (NF y3u-y3z: "Prefill rank timing DISABLED ... drifted -9"
+                # on TP1/TP2 of every boot): the worker's eager prefill is
+                # bracketed by the per-rank prefill timer like the host's
+                # (the eager runner / PCG sites), so its line pairs 1:1.
+                rank_ctx = (
+                    self.prefill_rank_timer.wrap(metadata={"category": "extend"})
+                    if self.prefill_rank_timer
+                    and forward_batch.forward_mode.is_plain_prefill()
+                    else contextlib.nullcontext()
+                )
+                with self._decode_round_segment("decode", graphed=False), rank_ctx:
                     return self._forward_form_a_worker(forward_batch)
 
             mode_check = (

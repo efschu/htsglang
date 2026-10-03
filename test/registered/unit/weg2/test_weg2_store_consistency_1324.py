@@ -197,7 +197,8 @@ def test_the_route_verdict_names_the_presence_witness():
 
 def test_above_the_carrier_cap_is_still_refused_at_admission():
     """M7: the over-cap 413 is law and is untouched by this build."""
-    assert serviceable_route(50, 300000, SN6S_X, SN6S_CARRIER_MAX) == "carrier_single"
+    # law 02.10.: no D single prefill above the carrier any more (P route)
+    assert serviceable_route(50, 300000, SN6S_X, SN6S_CARRIER_MAX) == "long"
     assert serviceable_route(300000, 300000, SN6S_X, SN6S_CARRIER_MAX) == "long"
 
 
@@ -516,17 +517,18 @@ def test_a_store_that_stops_delivering_is_refused_by_name(caplog):
     with caplog.at_level(logging.WARNING, logger=sched_mod.logger.name):
         for _ in range(s._weg2_prefetch_stall_passes() + 3):
             outcomes.append(s._weg2_note_store_shortfall(r))
-            if outcomes[-1] == "failed":
+            if outcomes[-1] in ("failed", "expired"):
                 break
-    assert outcomes[-1] == "failed", (
-        f"a standstill must end in the named refusal; got {outcomes[-1]!r}"
+    # W88 CYCLE (29.09.): the store-short standstill ends NAMED, but in the
+    # re-route through P (user 29.09.: no request dies of a read error; the
+    # X gate, which has no exemption, refuses the remainder by name).
+    assert outcomes[-1] == "expired", (
+        f"a standstill must end in the named re-route; got {outcomes[-1]!r}"
     )
-    assert "W88 Weg2StoreLoadNotProgressing" in caplog.text
-    assert r not in s.waiting_queue, "the refused request leaves the queue"
+    assert "W88 Weg2StoreLoadNotProgressing" not in caplog.text
+    assert "W88-REROUTE" in caplog.text and "cause=standstill" in caplog.text
+    assert r in s.waiting_queue, "the request goes to the X gate, not away"
     assert r.prefetch_deferred is None
-    assert "store_prefix_short" in caplog.text, (
-        "the terminal line must name which arm stood still"
-    )
 
 
 # --------------------------------------------------------------------------

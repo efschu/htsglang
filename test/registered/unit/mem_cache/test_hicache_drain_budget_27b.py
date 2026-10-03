@@ -127,8 +127,13 @@ def _queued_rows(q):
 
 
 class TheDefaultPathIsUnchanged(_EnvCase):
-    """The cause, on the unchanged path: page size 1 = one queue entry per
-    token, and one round drains the whole agreed count."""
+    """The cause, on the unchanged path ("0" since the default went on,
+    29.09.): page size 1 = one queue entry per token, and one round drains the
+    whole agreed count."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ[ENV_BUDGET] = "0"
 
     def test_a_span_is_one_entry_per_token_and_one_round_drains_it_all(self):
         pool, cc = _real_p_cc()
@@ -142,11 +147,25 @@ class TheDefaultPathIsUnchanged(_EnvCase):
     def test_garbage_and_nonpositive_budgets_are_off(self):
         from sglang.srt.mem_cache import hicache_drain_budget as hdb
 
-        for v in ("x", "0", "-5", ""):
+        for v in ("0", "-5"):
             os.environ[ENV_BUDGET] = v
             self.assertEqual(hdb.drain_budget_tokens(), 0, v)
             self.assertFalse(hdb.coalesce_host_releases(), v)
             self.assertEqual(hdb.drain_ack_budget(), 0, v)
+
+    def test_unset_or_garbage_is_the_default_budget(self):
+        """29.09. (y3m NF: max release round 1191 ms without the budget; the 27B
+        runs 16384): the budget is ON unless "0" says otherwise."""
+        from sglang.srt.mem_cache import hicache_drain_budget as hdb
+
+        for v in (None, "", "x"):
+            if v is None:
+                os.environ.pop(ENV_BUDGET, None)
+            else:
+                os.environ[ENV_BUDGET] = v
+            self.assertEqual(hdb.drain_budget_tokens(), 16384, v)
+            self.assertTrue(hdb.coalesce_host_releases(), v)
+            self.assertEqual(hdb.drain_ack_budget(), 32, v)
 
     def test_the_default_call_passes_no_budget(self):
         c = _cache(_hybrid_cc(_RecordingPool()))
@@ -295,6 +314,7 @@ class AcksBeyondTheBudgetWaitInTheirQueue(_EnvCase):
         return c, cc, released
 
     def test_default_drains_every_agreed_ack_in_one_round(self):
+        os.environ[ENV_BUDGET] = "0"
         c, cc, released = self._backup_cache(100)
         c.drain_storage_control_queues()
         self.assertEqual(len(released), 100)
@@ -398,6 +418,7 @@ class TheBudgetIsRankUniform(_EnvCase):
 class TheInstrumentNamesThePart(_EnvCase):
     def test_the_timing_line_carries_the_parts_of_the_max_round(self):
         os.environ["SGLANG_HICACHE_ROUND_TIMING"] = "4"
+        os.environ[ENV_BUDGET] = "0"
         pool, cc = _real_p_cc()
         c = _cache(cc)
         c.check_hicache_events()

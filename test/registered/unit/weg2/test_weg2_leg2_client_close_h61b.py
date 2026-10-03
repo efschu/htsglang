@@ -54,6 +54,18 @@ from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 PROMPT_TEXT = "the prompt text of a 12.7k agent turn"
+
+
+def _booked(front):
+    """The presence the leg booked for PROMPT_TEXT: the entry's MEASURED
+    cached_tokens. Read from the entry, not ``SpanLRU.span_tokens`` (a reader
+    whose #49 arm caps by the chars/3 estimate of this short text -- 9, not
+    12668 -- so the pin held only with the agent span off; nextflash runs it
+    since X-CREDIT-1002)."""
+    import hashlib
+
+    e = front.spans.entries.get(hashlib.sha1(PROMPT_TEXT.encode()).hexdigest())
+    return (int(e[1]), True) if e is not None else (0, False)
 PROMPT, CACHED = 12672, 12668
 HANG_UP_PAUSE = 0.3  # long enough for the client's FIN to reach the front
 # TOLERANT ON PURPOSE: the parent tree has no grace constant, and these tests
@@ -259,7 +271,7 @@ def _assert_served_and_booked(front, seen):
     assert front.groups["D"].served == 1
     # The presence witness is D's own cached share, read from the usage the
     # client never saw.
-    assert front.spans.span_tokens(PROMPT_TEXT) == (CACHED, True)
+    assert _booked(front) == (CACHED, True)
     assert seen.get("d_completed") is True
 
 
@@ -337,7 +349,7 @@ def test_messages_hang_up_mid_answer_still_aborts_d_after_the_grace():
     assert front.counters["test_handler_done"] == 1
     assert front.counters["leg2_failures"] == 1
     assert front.groups["D"].served == 0
-    assert front.spans.span_tokens(PROMPT_TEXT) == (0, False)
+    assert _booked(front) == (0, False)
     assert seen.get("d_completed") is not True
     assert seen.get("d_aborted") is True
     # Bounded: D stops within the grace (plus slack), not at the end of its answer.

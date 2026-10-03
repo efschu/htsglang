@@ -1654,6 +1654,18 @@ def create_admission_wedge_watchdog(
     """
 
     poll = make_admission_wedge_poller(scheduler)
+    # the metal proof of SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS (27B LS12
+    # da8464b9f0; NF registry default 2.0 since SCHALTER-HALBPORT 1002): the
+    # threshold this watchdog will use, once, and only when the env or the
+    # profile overrides the default (otherwise no line, the log as it was).
+    _override = envs.SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS.get()
+    if _override is not None and _override > 0:
+        logger.info(
+            "%s recovery armed after %.1fs of continuous alarm "
+            "(SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS=%s, %s; default %.0fs; alarm itself after %.0fs)",
+            ADMISSION_WEDGE, _admission_wedge_recovery_threshold(), _override,
+            "env" if envs.SGLANG_ADMISSION_WEDGE_RECOVERY_SECONDS.is_set() else "profile",
+            ADMISSION_WEDGE_RECOVERY_SECONDS, ADMISSION_WEDGE_SECONDS)
 
     # #799: an optional stop, for callers that must be able to END this
     # thread. In serving the thread is daemon and lives for the process, so

@@ -191,7 +191,94 @@ def advance(mark: Optional[Tuple[str, int]],
     return (head[0], max(mark[1], head[1]))
 
 
+# ---------------------------------------------------------------------------
+# X-COST-LINE (29.09., third part of the ski-rental decision): D's prefill cost
+# PER FORWARD, measured under load.
+#
+# WHY. The per-request clock above is a WALL span (first chunk's forward entry
+# to the last chunk's finish). With other requests decoding on D their decode
+# rounds interleave with the chunks and land inside that span, so the front
+# may only use it on a SOLO leg -- and under agent load a solo leg of >= 2048
+# uncached tokens almost never happens: NF z30w 09290827 gave 3 R_D lines in
+# 32 min, all ``verdict=short``, and X stayed at its carried-in 4096 with
+# ``X NO-SOLVE: no r_d`` (the same on 27B row-authority 09290020).
+#
+# WHAT. The metrics reporter's ``Prefill rank batch ... gpu-ms`` is the
+# CUDA-event span of the prefill forward(s) it folds. Mixed chunk is off on
+# this line, so a prefill forward carries prefill work only; the running
+# decodes are their own forwards (``Decode rank batch``). That span is D's
+# prefill share whatever else D is doing -- no solo guard needed. Same
+# quantity as the solo clock where both exist (z30w, solo legs: 624 tok
+# 2700.8 gpu-ms vs weg2_prefill_s 2.735 s; 1574 tok 3883.3 vs 3.922 s).
+#
+# IPC, NOT A LOG. The reporter hands its own measured numbers to
+# :func:`note_batch_cost` BEFORE it formats the line; nothing is ever parsed
+# back out of a log line, and a muted logger fills the ring all the same.
+# The front reads the ring on the SAME ``/get_server_info`` read as the clock
+# above (its own ``(boot, seq)`` mark) and fits D's cost line over it.
+# Recorded on every process (the reporter has no server_args), published only
+# by the armed D group -- a bounded deque append per prefill forward.
+# ---------------------------------------------------------------------------
+
+#: The internal-state key of the per-forward prefill cost ring.
+COST_STATE_KEY = "weg2_prefill_cost"
+
+_COST_RING: Deque[Dict[str, Any]] = collections.deque(maxlen=RING_MAX)
+_COST_SEQ = 0
+
+
+def note_batch_cost(new_tokens: int, cached_tokens: int, gpu_ms: float, chunks: int = 1) -> None:
+    """Record one flushed ``Prefill rank batch`` (``chunks`` folded forwards)
+    from the reporter's own measurement. A line without a measured duration is
+    no record -- never a zero cost."""
+    global _COST_SEQ
+    try:
+        n, ms = int(new_tokens), float(gpu_ms)
+    except (TypeError, ValueError):
+        return
+    if n <= 0 or not ms > 0.0:
+        return
+    _COST_SEQ += 1
+    _COST_RING.append({"seq": _COST_SEQ, "n": n, "cached": int(cached_tokens or 0),
+                       "ms": round(ms, 3), "chunks": max(1, int(chunks or 1))})
+
+
+def cost_published(*, armed: bool, group: str) -> bool:
+    """Whether this server publishes the cost ring: the armed D group, and
+    group P (its X-COST-LINE r_P, read after each P drain) -- any rank that
+    carries a Weg-2 group name. A stock engine publishes nothing."""
+    return bool(armed) or bool((group or "").strip())
+
+
+def cost_snapshot() -> Dict[str, Any]:
+    """The published cost block: ``{"boot", "seq" (head), "recent"}``."""
+    return {"boot": BOOT, "seq": _COST_SEQ, "recent": [dict(r) for r in _COST_RING]}
+
+
+def cost_since(block: Any, mark: Optional[Tuple[str, int]]
+               ) -> Tuple[list, Optional[Tuple[str, int]], int]:
+    """The FRONT's reader of the cost ring: ``(records newer than mark, new
+    mark, lost)``. ``lost`` counts records that left the ring before this read
+    (named by the caller, never silently skipped). A first read or a D restart
+    takes the whole ring: every record is a real forward of THAT D process."""
+    head = mark_of(block)
+    if head is None:
+        return [], mark, 0
+    after = mark[1] if (mark is not None and mark[0] == head[0]) else 0
+    new = []
+    for r in block.get("recent") or ():
+        try:
+            if isinstance(r, dict) and int(r.get("seq", 0) or 0) > after:
+                new.append(r)
+        except (TypeError, ValueError):
+            continue
+    lost = max(0, head[1] - after - len(new))
+    return new, advance(mark, head), lost
+
+
 def _reset_for_tests() -> None:
-    global _SEQ
+    global _SEQ, _COST_SEQ
     _RING.clear()
     _SEQ = 0
+    _COST_RING.clear()
+    _COST_SEQ = 0

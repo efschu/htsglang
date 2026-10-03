@@ -74,6 +74,12 @@ class FakeClock:
     def time(self) -> float:
         return self.t
 
+    def perf_counter(self) -> float:
+        # FLIPCYCLE H3 (defc5088a5): the park times its own phases with the
+        # module's ``time.perf_counter`` -- the stand-in for the time module
+        # has to carry it (production passes the real module)
+        return self.t
+
 
 @pytest.fixture
 def clock(monkeypatch):

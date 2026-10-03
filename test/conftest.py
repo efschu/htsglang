@@ -2,7 +2,8 @@
 
 Currently:
 * neutralize process-wide torch state leaked during collection;
-* fail the run if it wrote to the cross-session GPU arbitration paths (#438).
+* fail the run if it wrote to the cross-session GPU arbitration paths (#438);
+* refuse an uncapped run while a rig boot is live (RIG-RAM GUARD, y7e 02.10.).
 """
 
 import os
@@ -59,6 +60,25 @@ def _arb_state():
 
 def pytest_sessionstart(session):
     session.config._arb_state_at_start = _arb_state()
+    # RIG-RAM GUARD (02.10., y7e W3 at 09:45Z): no uncapped run while a rig boot
+    # is live -- only the xdist controller decides (workers inherit its cgroup)
+    if not os.environ.get("PYTEST_XDIST_WORKER"):
+        try:
+            import importlib.util
+
+            _p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "python", "sglang", "test", "rig_ram_guard.py")
+            _spec = importlib.util.spec_from_file_location("_rig_ram_guard", _p)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            verdict = _mod.verdict
+        except Exception:  # noqa: BLE001 - a tree without the guard runs as before
+            verdict = None
+        why = verdict() if verdict is not None else None
+        if why:
+            import pytest
+
+            pytest.exit(why, returncode=3)
 
 
 def pytest_sessionfinish(session, exitstatus):

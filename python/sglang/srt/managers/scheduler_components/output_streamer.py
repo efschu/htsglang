@@ -15,6 +15,7 @@ import zmq
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.managers import weg2_resumable_depth
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
@@ -149,6 +150,10 @@ class SchedulerOutputStreamer:
         # H84: a Weg-2 D group reports each request's own prefill time on its
         # finishing output (meta_info weg2_prefill_s); decode outputs unchanged.
         weg2_prefill_report = self.server_args.tp_prefill_max_tokens > 0
+        if weg2_prefill_report:
+            # #59: the depth the next turn can resume from, on the same
+            # finishing outputs (the finish's insert already ran).
+            weg2_resumable_depth.stamp_stream(self.tree_cache, reqs, skip_req, self.ps)
         for req in reqs:
             if req is skip_req:
                 continue

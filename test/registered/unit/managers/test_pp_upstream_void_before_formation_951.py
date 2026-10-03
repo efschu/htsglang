@@ -173,7 +173,7 @@ def _holder(
     h.process_pending_weg2_park = lambda: None  # Punkt 2 (18.09.): the park hook at the step head
     h._abort_on_waiting_timeout = lambda: None
     h._abort_on_running_timeout = lambda rb: None
-    h._update_uniform_pool_budget = lambda: None
+    h._update_uniform_pool_budget = lambda running_batch=None: None
     h._census_tick = lambda: None
     h._corridor_trace_tick = lambda: None
     h._flight_serving_tick = lambda: None

@@ -262,9 +262,11 @@ def test_credit_is_the_measured_share_capped_by_the_token_lcp():
     ts.record_presence(prev, cached_tokens=8000, prompt_tokens=10000, held_epoch=None)
     new = _ids((0, 9000), (50000, 53000))  # shares 9000 tokens, 3000 new
     assert ts.pending(new) == (12000 - 8000, 8000, True, "d_leg2_cached")
-    # D measured more than the two texts share -> the LCP bounds it
+    # D measured more than the two texts share: its anchor (9990) is past the
+    # divergence (9000) -- PX 28.09.: no credit, the divergence point is no
+    # anchor (was (3000, 9000): the weg2-14-37 W50 shape)
     ts.record_presence(prev, cached_tokens=9990, prompt_tokens=10000)
-    assert ts.pending(new)[:2] == (3000, 9000)
+    assert ts.pending(new)[:2] == (12000, 0)
 
 
 def test_held_credit_only_in_its_epoch_and_a_zero_retracts():
@@ -395,13 +397,16 @@ def test_the_measured_d_prefix_is_subtracted(caplog):
     assert _route(f2, _payload(100)) == "short"  # exactly X pending
 
 
-def test_not_ready_falls_back_to_the_estimate_by_name(caplog):
+def test_a_failed_load_falls_back_to_the_estimate_by_name(caplog):
+    """BOOT-START HOLD (y7d): only a load that ENDED without a tokenizer
+    falls back to chars/3 -- by name; a loading one holds the decision
+    (test_weg2_l3_index_price_1002)."""
     f = _front(True)
-    f.ftok.state = "loading"
+    f.ftok.state = "failed"
     with caplog.at_level(logging.INFO, logger="weg2.front"):
         assert _route(f, _payload(3 * X + 600)) == "long"  # chars/3 decides
     msgs = [r.getMessage() for r in caplog.records]
-    assert any(m.startswith("WEG2 X-EXACT-FALLBACK") and "reason=tokenizer_loading" in m
+    assert any(m.startswith("WEG2 X-EXACT-FALLBACK") and "reason=tokenizer_failed" in m
                for m in msgs)
     assert f.counters["x_exact_fallback"] == 1
 
@@ -452,8 +457,8 @@ def test_off_constructs_and_imports_nothing():
 
 
 # ---------------------------------------------------------------------------
-# (6) registry: qwen27b off until measured, nextflash on (V1, NF seat
-# 27.09.); explicit wins -- SGLANG_WEG2_FRONT_EXACT_TOKENS=0 as container env
+# (6) registry: qwen27b on since w109290020 (29.09.), nextflash on (V1, NF
+# seat 27.09.); explicit wins -- SGLANG_WEG2_FRONT_EXACT_TOKENS=0 as container env
 # turns the NF row off again (the V1 fallback without a rebuild)
 # ---------------------------------------------------------------------------
 
@@ -470,15 +475,15 @@ def _form_env(profile):
                        flip="family", vision="off", profile=profile, model="m").env_value()
 
 
-def test_qwen27b_row_off_nextflash_row_on():
-    assert FM.PROFILES["qwen27b"].front_exact_tokens is False
-    assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][XE] is False
+def test_qwen27b_row_on_nextflash_row_on():
+    assert FM.PROFILES["qwen27b"].front_exact_tokens is True
+    assert FM.PROFILE_SWITCH_DEFAULTS["qwen27b"][XE] is True
     assert FM.PROFILES["nextflash"].front_exact_tokens is True
     assert FM.PROFILE_SWITCH_DEFAULTS["nextflash"][XE] is True
 
 
 @pytest.mark.parametrize("profile,explicit,row_on,want", [
-    ("qwen27b", None, False, False), ("nextflash", None, False, True), (None, None, False, False),
+    ("qwen27b", None, False, True), ("nextflash", None, False, True), (None, None, False, False),
     ("qwen27b", None, True, True),    # the operator turns the row on -> on without an env
     ("nextflash", None, True, True),
     ("qwen27b", "1", False, True), ("qwen27b", "0", True, False), (None, "1", False, True),
@@ -512,15 +517,28 @@ def _queued(f, rid, text, n, est, **kw):
     return p, ids
 
 
+def test_an_inflight_text_without_a_known_depth_does_not_reprice(caplog):
+    """#59 A (operator 28.09.): its twin's first content alone credits nothing when no
+    resumable depth is known for the prefix -- the queued price and the park stand."""
+    f = _front(True)
+    f.ftok = _FakeTokens(1)
+    p, ids = _queued(f, "weg2-1-2", "twin", X + 500, X + 500)
+    f.tspans.record_inflight(ids[:X + 300], f.epoch)
+    assert f._x_exact_reprice_queue("inflight") == 0
+    assert p.est_uncached == X + 500
+    assert PP.immediate_park_trigger(f.queue, X) is p
+
+
 def test_a_new_d_credit_reprices_the_queue_and_needs_p_follows(caplog):
     f = _front(True)
     f.ftok = _FakeTokens(1)
     p, ids = _queued(f, "weg2-1-2", "twin", X + 500, X + 500)
     assert PP.immediate_park_trigger(f.queue, X) is p  # priced over X: the park would fire
     with caplog.at_level(logging.INFO, logger="weg2.front"):
-        # its twin's first content: D now holds the first X+300 tokens (#49 in-flight)
-        f.tspans.record_inflight(ids[:X + 300], f.epoch)
-        assert f._x_exact_reprice_queue("inflight") == 1
+        # its twin's finish: D holds the first X+300 tokens and can resume there (#59 depth)
+        f.tspans.record_presence(ids[:X + 300], X + 300, prompt_tokens=X + 300,
+                                 held_epoch=f.epoch, resumable_depth=X + 300)
+        assert f._x_exact_reprice_queue("presence") == 1
     assert p.est_uncached == 200
     assert PP.immediate_park_trigger(f.queue, X) is None  # 200 pending: no park, no flip
     line = [r.getMessage() for r in caplog.records if "X-EXACT-REPRICE" in r.getMessage()][0]
@@ -568,7 +586,14 @@ def test_off_never_reprices_and_the_hooks_sit_behind_the_switch():
     assert f._x_exact_reprice_queue("epoch") == 0 and f.queue[0].est_uncached == 99
     src = inspect.getsource(F.Front)
     assert "if self.x_exact:\n            # X-EXACT: a held (#49) credit is bound to its epoch" in src
-    assert src.count("self._x_exact_reprice_queue(") == 3
+    # 4th: _p_anchor_presence (PREFILL-EINBRUCH-0929 K1), returns before it when x_exact is off
+    # 5th/6th: _d_inflight_presence / _d_inflight_park (X-CREDIT-INFLIGHT-1002):
+    # the first returns before it when x_exact is off, the second needs a
+    # tspans entry (None when x_exact is off)
+    # 7th: _p_flush_store_presence (STORE-PRESENCE 1002), returns before it
+    # without tspans (None when x_exact is off)
+    # 8th: _seq_park (SEQ-HASH 1002), returns before it when x_exact is off
+    assert src.count("self._x_exact_reprice_queue(") == 8
 
 
 def test_the_w31_requeue_counts_the_whole_prompt_exactly():
@@ -579,3 +604,13 @@ def test_the_w31_requeue_counts_the_whole_prompt_exactly():
     j = src.index("p = Pending(", i)
     body = src[i:j]
     assert "if self.x_exact:" in body and "_est = int(_ids.size)" in body
+
+
+import pytest as _pytest_110  # noqa: E402
+
+
+@_pytest_110.fixture(autouse=True)
+def _arrival_seat_rule_off_110(monkeypatch):
+    """110: SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE is default ON on the NF line;
+    this file pins the pre-rule front it was written against (=0 is that path)."""
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")

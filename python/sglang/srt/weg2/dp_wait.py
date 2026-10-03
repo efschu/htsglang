@@ -80,9 +80,17 @@ def decompose(a: DpArrival, t_flip0: float, t_drain_end: Optional[float],
     return {"wait_s": wait, "hold_s": hold, "drain_s": drain, "flip_s": flip}
 
 
-def hold_by(a: DpArrival, counters: Mapping[str, int]) -> str:
+def hold_by(a: DpArrival, counters: Mapping[str, int], *, t_flip0: Optional[float] = None,
+            dwell_held_t: Optional[float] = None) -> str:
     """What the hold consisted of, '+'-joined; ``flip-open`` when the request
-    arrived inside an open D->P flip (it had no hold of its own)."""
+    arrived inside an open D->P flip (it had no hold of its own).
+
+    #1416i: the immediate park's dwell (``WEG2 PARK-IMMEDIATE-DWELL``) holds
+    the flip too, and it logs once per D phase -- usually BEFORE a later
+    arrival, so no counter rises for that arrival. z30e: weg2-32-64 held
+    3.1 s ``hold_by=d-work`` while the dwell (awake 3502 of 6050 ms) was the
+    reason. ``dwell_held_t`` is the wall time of the latest dwell hold the
+    front decided; inside [arrival, flip begin] it names ``min-dwell``."""
     if a.flipping:
         return "flip-open"
     rose = {k: int(counters.get(k, 0) or 0) - a.snap.get(k, 0) for k in SNAP_KEYS}
@@ -91,7 +99,11 @@ def hold_by(a: DpArrival, counters: Mapping[str, int]) -> str:
         parts.append("d-work")
     if rose["fairness_bound_hits"] > 0:
         parts.append("fairness")
-    if rose["min_dwell_holds"] > 0:
+    dwell_in_hold = (
+        dwell_held_t is not None and t_flip0 is not None
+        and a.t <= float(dwell_held_t) <= float(t_flip0)
+    )
+    if rose["min_dwell_holds"] > 0 or dwell_in_hold:
         parts.append("min-dwell")
     if rose["weg2_drain_waiting"] > 0 or rose["W1_Weg2DrainRefused"] > 0:
         parts.append("flip-returned")
