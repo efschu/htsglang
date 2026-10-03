@@ -197,6 +197,7 @@ from sglang.srt.managers.io_struct import (
     VramBudgetReqInput,
     VramBudgetReqOutput,
     Weg2ParkRunningReqInput,
+    Weg2DualPLendReqInput,
     Weg2ParkWindowReqInput,
     sock_send,
 )
@@ -4064,6 +4065,7 @@ class Scheduler(
                 (VramBudgetReqInput, self.handle_vram_budget),
                 (Weg2ParkRunningReqInput, self.handle_weg2_park_running),
                 (Weg2ParkWindowReqInput, self.handle_weg2_park_window),
+                (Weg2DualPLendReqInput, self.handle_weg2_dual_p_lend),
                 (Weg2VisionVerdict, self.handle_weg2_vision_verdict),
                 (PlePrefetchHintReqInput, self.handle_ple_prefetch_hint),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
@@ -6512,6 +6514,19 @@ class Scheduler(
         from sglang.srt.weg2 import park_window_gate
 
         park_window_gate.note(self, recv_req)
+
+    def handle_weg2_dual_p_lend(self, recv_req) -> None:
+        """Q-660 DUAL-AWAKE-LEND: the front's stage-1 loan order -- P, awake
+        with its KV released, lends its freed device bytes to the card pool
+        ("lend") or takes them back ("reclaim"); no reply
+        (weg2/dual_p_kv_stage.awake_lend / awake_reclaim)."""
+        from sglang.srt.weg2 import dual_p_kv_stage
+
+        why = getattr(recv_req, "why", "") or "front"
+        if getattr(recv_req, "action", "lend") == "reclaim":
+            dual_p_kv_stage.awake_reclaim(self, why)
+        else:
+            dual_p_kv_stage.awake_lend(self, why)
 
     def weg2_d_hold_parked(self) -> int:
         """H91b: the sleep leg's dormant point -- parked requests enter the

@@ -153,27 +153,30 @@ def test_stage_1_comes_first_and_stage_2_only_after_p_released_everything():
     out = _ticks(st, [dict(pressure=5, p_committed=900),     # D short, P holds KV -> stage 1
                       dict(pressure=5, p_committed=900),     # P still releasing: no sleep
                       dict(pressure=5, p_committed=900),
-                      dict(pressure=5, p_committed=0),       # released, held 1
+                      dict(pressure=5, p_committed=0),       # released -> Q-660: lend at once, awake
+                      dict(pressure=5, p_committed=0),       # held 1
                       dict(pressure=5, p_committed=0)])      # held 2 -> stage 2
     acts = [a for a, _ in out]
-    assert acts == ["stop", None, None, None, "sleep"], acts
-    assert "stage=1" in out[0][1] and "stage=2" in out[4][1] and "p_state=sleeping" in out[4][1]
+    assert acts == ["stop", None, None, "lend", None, "sleep"], acts
+    assert "stage=1" in out[0][1] and "stage=1-lend" in out[3][1]
+    assert "stage=2" in out[5][1] and "p_state=sleeping" in out[5][1]
 
 
 def test_without_the_capability_stage_2_says_unavailable_once():
     st = DP.PressureStages(sleep_capable=False, sleep_after=1)
-    out = _ticks(st, [dict(pressure=5, p_committed=1), dict(pressure=5), dict(pressure=5)])
-    assert [a for a, _ in out] == ["stop", None, None]
-    assert out[1][1].endswith("stage=2 d_need=5 freed=0 p_state=stopped unavailable (weights resident)")
-    assert out[2][1] is None
+    out = _ticks(st, [dict(pressure=5, p_committed=1), dict(pressure=5), dict(pressure=5), dict(pressure=5)])
+    assert [a for a, _ in out] == ["stop", "lend", None, None]
+    assert out[2][1].endswith("stage=2 d_need=5 freed=0 p_state=lent unavailable (weights resident)")
+    assert out[3][1] is None
 
 
 def test_the_host_floor_refuses_stage_2_by_name():
     assert DP.host_allows_sleep(17 * GiB, W_B) and not DP.host_allows_sleep(15 * GiB, W_B)
     st = DP.PressureStages(sleep_capable=True, sleep_after=1)
-    out = _ticks(st, [dict(pressure=5, p_committed=1), dict(pressure=5, host_ok=False)])
-    assert out[1][0] is None and "refused host_ram" in out[1][1]
-    assert st.p_state == "stopped"
+    out = _ticks(st, [dict(pressure=5, p_committed=1), dict(pressure=5), dict(pressure=5, host_ok=False)])
+    assert out[1][0] == "lend"
+    assert out[2][0] is None and "refused host_ram" in out[2][1]
+    assert st.p_state == "lent"
 
 
 def test_stopped_returns_only_when_a_grant_plus_the_look_ahead_is_free():
@@ -189,11 +192,12 @@ def test_asleep_p_returns_only_after_a_seat_ended_and_the_weights_fit():
     st = DP.PressureStages(sleep_capable=True, sleep_after=1)
     big = W_B + STEP_B + AIR_B
     out = _ticks(st, [dict(pressure=5, p_committed=1, seats_done=3), dict(pressure=5, seats_done=3),
+                      dict(pressure=5, seats_done=3),
                       dict(free_min=big, seats_done=3),         # no seat ended since the sleep
                       dict(free_min=big - 1, seats_done=4),     # a seat ended, the weights do not fit
                       dict(free_min=big, seats_done=4)])
-    assert [a for a, _ in out] == ["stop", "sleep", None, None, "wake"]
-    assert "from=sleep" in out[4][1] and st.p_state == "serving"
+    assert [a for a, _ in out] == ["stop", "lend", "sleep", None, None, "wake"]
+    assert "from=sleep" in out[5][1] and st.p_state == "serving"
 
 
 def _stage_mutant(fixed, back):

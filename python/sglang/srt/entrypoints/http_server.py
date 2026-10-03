@@ -161,6 +161,7 @@ from sglang.srt.managers.io_struct import (
     VertexGenerateReqInput,
     VramBudgetReqInput,
     Weg2ParkRunningReqInput,
+    Weg2DualPLendReqInput,
     Weg2ParkWindowReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
@@ -1458,6 +1459,21 @@ async def weg2_park_window(obj: Annotated[Weg2ParkWindowReqInput, Body()], reque
     except Exception as e:
         return _create_error_response(e)
     return ORJSONResponse({"sent": True, "left_ms": obj.left_ms}, status_code=200)
+
+
+@app.api_route("/weg2/dual_p_lend", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def weg2_dual_p_lend(obj: Annotated[Weg2DualPLendReqInput, Body()], request: Request):
+    """Q-660 DUAL-AWAKE-LEND: the front's stage-1 loan order to group P (body
+    {"action": "lend"|"reclaim", "why"}). One-way to the scheduler; every P rank
+    lends or reclaims on its own card and republishes its stage file."""
+    if obj.action not in ("lend", "reclaim"):
+        return ORJSONResponse({"error": "action must be lend or reclaim"}, status_code=HTTPStatus.BAD_REQUEST)
+    try:
+        _global_state.tokenizer_manager._dispatch_to_scheduler(obj)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse({"sent": True, "action": obj.action}, status_code=200)
 
 
 @app.api_route("/weg2/ple_prefetch_hint", methods=["POST"])

@@ -15190,7 +15190,10 @@ class Front:
         # a running pass. The pressure is read first, every tick.
         pressure = self._dual_pressure_tick() if self.dual_kv_ledgers else 0
         if self.dual_kv_ledgers:
-            self._dual_stage_tick(pressure)                 # D PRIORITY: stage 1 -> 2 -> resume
+            # D PRIORITY: stage 1 -> lend -> 2 -> reclaim/resume. Q-660: the tick's
+            # pressure includes D's own shortage (ledger demand, id space, arena),
+            # so a leg 1 in flight pauses on it too, not only on the ledger's bytes
+            pressure = max(pressure, self._dual_stage_tick(pressure))
         if pressure > 0:
             self._dual_pause_inflight(pressure)
         t = self._dual_task
@@ -15259,7 +15262,7 @@ class Front:
             # D's unmet request on this card (card_kv_ledger.request: need - grant)
             d_short = max(d_short, int(st.demand.get("D", 0) or 0))
         tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
-        grant, per_tok, weights, step_tok = 0, 0.0, 0, 0
+        grant, per_tok, weights, step_tok, lent = 0, 0.0, 0, 0, 0
         stages = []
         for r in range(3):
             try:
@@ -15273,6 +15276,18 @@ class Front:
             per_tok = max(per_tok, step_b / max(1, int(t.get("step") or 1)))
             step_tok = max(step_tok, int(t.get("step") or 0))
             weights += int(t.get("weights_bytes") or 0)
+            lent += int(t.get("lent") or 0)
+        # Q-660: D's shortage the ledger does not see -- its id space nearly full
+        # or the Mamba arena full (D's tick publishes both; dual y8v stood at
+        # 0.96 / 112 of 112 with free ledger bytes and no stage ever fired)
+        from sglang.srt.weg2 import dual_d_priority as _ddp
+
+        sig_short, sig_why = _ddp.d_signal_short(_ddp.read_d_signal(_ddp.d_signal_file(tag)), now=time.time(),
+                                                 unit=grant, id_threshold=_ddp.d_id_threshold())
+        if sig_why and sig_why != getattr(self, "_dual_d_signal_why", ""):
+            logger.warning("WEG2 DUAL-KV-PRESSURE d_signal %s -- D is short beyond the ledger bytes", sig_why)
+        self._dual_d_signal_why = sig_why
+        d_short = max(d_short, sig_short)
         # D's look-ahead: one extend chunk plus one decode round of every seat with
         # the draft's tokens (d_mem_sched.air_tokens), from the launcher
         # (SGLANG_WEG2_DUAL_D_AIR_TOKENS); without it one P lattice step (4096 >=
@@ -15295,7 +15310,7 @@ class Front:
             card_room.append((int(st.free), int(t.get("lent") or 0) + step_b + int(air_tok * tok_b)))
         return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
                 "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights,
-                "card_room": card_room if stages else None, "d_short": d_short}
+                "card_room": card_room if stages else None, "d_short": d_short, "p_lent": lent}
 
     #: env: the metal probe of stage 2 (one sleep + wake of P in the first idle
     #: stretch, no pressure needed) -- seconds P stays asleep; unset/0 = off
@@ -15342,17 +15357,19 @@ class Front:
             return True
         return state == "sleeping"
 
-    def _dual_stage_tick(self, pressure: int) -> None:
+    def _dual_stage_tick(self, pressure: int) -> int:
+        """One stage tick; returns the pressure the stages acted on (the
+        ledger's plus D's own shortage) for the pump's pause of leg 1."""
         from sglang.srt.weg2 import dual_d_priority as _ddp
 
         if self._dual_p_sleep_probe_tick(pressure):
-            return
+            return int(pressure)
         stages = self._dual_stages()
         try:
             rd = self._dual_p_stage_reading()
         except Exception as exc:  # noqa: BLE001 -- a failed reading keeps the stage, never acts on a guess
             logger.warning("WEG2 DUAL-KV-PRESSURE reading failed: %r", exc)
-            return
+            return int(pressure)
         # D PRIORITY: the stages read D's SHORTFALL, not only the ledger's pressure on
         # P. card_kv_ledger.arbitrate caps that pressure at what P still commits, so
         # it reads 0 the moment stage 1 is complete (P released everything) although
@@ -15363,20 +15380,24 @@ class Front:
         d_short = int(rd.pop("d_short", 0) or 0)
         pressure = max(int(pressure), d_short)
         host_ok = True
-        if stages.p_state == "stopped" and stages.sleep_capable and pressure > 0:
+        if stages.p_state == "lent" and stages.sleep_capable and pressure > 0:
             host_ok = _ddp.host_allows_sleep(_mem_available_bytes(), rd["weights_bytes"])
         action, line = stages.tick(pressure=pressure, seats_done=int(self.counters.get("d_seat_done", 0)),
                                    host_ok=host_ok, **rd)
         if line:
             logger.warning("%s", line)
         if action is None:
-            return
-        self.counters["dual_kv_pressure_%s" % {"stop": "stage1", "sleep": "stage2", "resume": "resume",
+            return pressure
+        self.counters["dual_kv_pressure_%s" % {"stop": "stage1", "lend": "lend", "sleep": "stage2",
+                                               "reclaim": "reclaim", "resume": "resume",
                                                "wake": "wake"}[action]] += 1
         if action == "sleep":
             asyncio.get_running_loop().create_task(self._dual_p_sleep())
         elif action == "wake":
             asyncio.get_running_loop().create_task(self._dual_p_wake())
+        elif action in ("lend", "reclaim"):
+            asyncio.get_running_loop().create_task(self._dual_p_lend(action, line or ""))
+        return pressure
 
     def _dual_p_held_by_stage(self) -> bool:
         st = getattr(self, "_dual_stages_obj", None)
@@ -15415,6 +15436,21 @@ class Front:
                          f"P's sleep leg {n} failed HTTP {code}: {body[:400]!r} -- VRAM state undefined")
             return
         logger.warning("WEG2 DUAL-KV-PRESSURE stage=2 p_state=sleeping leg=%d tags=%d done", n, len(tags))
+
+    async def _dual_p_lend(self, action: str, why: str = "") -> None:
+        """Q-660 stage 1 completed: P, awake with its KV released, lends its
+        freed device bytes to every card pool ("lend") or takes them back
+        ("reclaim"); each P rank acts on its own card (dual_p_kv_stage.awake_lend
+        / awake_reclaim) and republishes its stage file. A failed RPC only
+        loses the loan -- P keeps holding nothing, D never retracts."""
+        code, body = await self.leg_rpc(self.groups["P"], "/weg2/dual_p_lend",
+                                        {"action": action, "why": str(why)[:200]}, RPC_TIMEOUT_S)
+        if code != 200:
+            self.counters["dual_kv_pressure_%s_failed" % action] += 1
+            logger.warning("WEG2 DUAL-KV-PRESSURE %s RPC failed HTTP %s: %s -- the stage stays, the next "
+                           "tick reads the stage files", action, code, str(body)[:300])
+            return
+        logger.warning("WEG2 DUAL-KV-PRESSURE stage=1-%s sent to P", action)
 
     async def _dual_p_wake(self) -> None:
         n = int(getattr(self, "_dual_p_sleep_n", 0) or 0)

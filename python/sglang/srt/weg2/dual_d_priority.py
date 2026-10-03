@@ -212,42 +212,142 @@ def host_allows_sleep(mem_available: int, weights_bytes: int, floor: int = HOST_
     return int(mem_available) - int(weights_bytes) >= int(floor)
 
 
+# -- Q-660: D's shortage beyond the ledger bytes --------------------------------
+#
+# Dual y8v (fs10031504, 15:20:53): D stood at "full token usage 0.96" (its 1M-row id
+# space, locked) and the shared Mamba arena was full (ARENA-REF-CENSUS complete=112
+# of 112) while the card ledgers showed free bytes -- no ledger demand, so no stage
+# ever fired. D publishes both readings (``publish_d_signal``, D's tick); the front
+# counts either as D pressure next to the ledger's demand.
+
+D_SIGNAL_ID_ENV = "SGLANG_WEG2_DUAL_D_ID_PRESSURE"
+#: D's id space this full (rows used and not evictable / all rows) presses P
+D_SIGNAL_ID_DEFAULT = 0.90
+#: the arena presses P when at most this many slots are left
+D_SIGNAL_ARENA_MARGIN = 2
+#: a D reading older than this is no reading (D stopped publishing)
+D_SIGNAL_MAX_AGE_S = 5.0
+#: D publishes at most this often
+D_SIGNAL_EVERY_S = 0.5
+
+
+def d_signal_file(tag: str, root: str = "/dev/shm") -> str:
+    import hashlib
+
+    return os.path.join(root, "wkvd-%s.json" % hashlib.sha1(str(tag).encode()).hexdigest()[:10])
+
+
+def d_id_threshold(env=None) -> float:
+    e = os.environ if env is None else env
+    try:
+        v = float(e.get(D_SIGNAL_ID_ENV, "") or D_SIGNAL_ID_DEFAULT)
+    except ValueError:
+        return D_SIGNAL_ID_DEFAULT
+    return v if 0.0 < v <= 1.0 else D_SIGNAL_ID_DEFAULT
+
+
+def d_signal_short(sig: Optional[dict], *, now: float, unit: int, id_threshold: float = D_SIGNAL_ID_DEFAULT,
+                   arena_margin: int = D_SIGNAL_ARENA_MARGIN) -> Tuple[int, str]:
+    """D's published reading -> (pressure bytes, why). ``unit``: the bytes one
+    reason counts as (one P grant step, so stage 1 sees real pressure); 0 when
+    D is not short or the reading is missing/stale."""
+    if not sig:
+        return 0, ""
+    try:
+        if float(now) - float(sig.get("ts", 0.0)) > D_SIGNAL_MAX_AGE_S:
+            return 0, ""
+        why = []
+        frac = float(sig.get("id_frac", 0.0) or 0.0)
+        if frac >= float(id_threshold):
+            why.append("id_space=%.2f" % frac)
+        slots = int(sig.get("arena_slots", 0) or 0)
+        complete = int(sig.get("arena_complete", 0) or 0)
+        if slots > 0 and complete >= slots - int(arena_margin):
+            why.append("arena=%d/%d" % (complete, slots))
+    except (TypeError, ValueError):
+        return 0, ""
+    return (max(1, int(unit)), ",".join(why)) if why else (0, "")
+
+
+def publish_d_signal(path: str, *, id_frac: float, arena_complete: int, arena_slots: int, now: float) -> None:
+    import json
+
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump({"ts": float(now), "id_frac": float(id_frac), "arena_complete": int(arena_complete),
+                   "arena_slots": int(arena_slots)}, f)
+    os.replace(tmp, path)
+
+
+def read_d_signal(path: str) -> Optional[dict]:
+    import json
+
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+#: Q-660: calm ticks (no pressure on P) before an awake loan of stage 1 comes back
+RECLAIM_AFTER_TICKS_ENV = "SGLANG_WEG2_DUAL_P_RECLAIM_AFTER_TICKS"
+#: 10 x the front's 0.2 s tick = 2 s without D pressure (or sooner: a D seat ended)
+RECLAIM_AFTER_TICKS_DEFAULT = 10
+
+
 class PressureStages:
     """The P side of D priority, REPLICATED nowhere (the front alone decides;
     P's ranks only execute RPCs). Pure: the caller feeds one reading per tick and
     executes the returned action -- ``stop`` (pause leg 1 at its chunk boundary,
-    P releases its KV), ``sleep`` (P parks its weights in host RAM), ``resume``
-    (the paused head may go back), ``wake`` (P maps its weights back) -- and
-    prints the returned line.
+    P releases its KV), ``lend`` (Q-660: P, awake and released, lends its freed
+    device bytes to the card pool), ``sleep`` (P parks its weights in host RAM),
+    ``reclaim`` (the awake loan back), ``resume`` (the paused head may go back),
+    ``wake`` (P maps its weights back) -- and prints the returned line.
 
-    Order is the law: stage 2 only after stage 1 completed (P commits 0 bytes on
-    every card) and the pressure held ``sleep_after`` ticks more. Return only
-    with hysteresis: no pressure, and the card's free bytes cover one whole P
-    grant step plus D's look-ahead; from sleep additionally the P weights and a
-    D seat that finished since P went to sleep."""
+    Order is the law (user rules 01.10. and 03.10. "wenn auf D kv knapp wird,
+    gibt P seinen kv auf"): stage 1 = stop, and -- once P commits 0 bytes on
+    every card -- lend at once, awake; stage 2 (sleep) only when the pressure
+    still holds ``sleep_after`` ticks after the loan. D never retracts. Return
+    only with hysteresis: from the loan after ``reclaim_after`` calm ticks or a
+    D seat that ended, with the card's free bytes covering the loan plus one P
+    grant step and D's look-ahead -- P prefills again only once the loan is
+    back (``p_lent`` 0); from sleep additionally the P weights and a D seat that
+    finished since P went to sleep."""
 
-    def __init__(self, sleep_capable: bool, sleep_after: int = SLEEP_AFTER_TICKS_DEFAULT):
+    def __init__(self, sleep_capable: bool, sleep_after: int = SLEEP_AFTER_TICKS_DEFAULT,
+                 reclaim_after: int = RECLAIM_AFTER_TICKS_DEFAULT):
         self.sleep_capable = bool(sleep_capable)
         self.sleep_after = max(1, int(sleep_after))
+        self.reclaim_after = max(1, int(reclaim_after))
         self.p_state = "serving"
         self._held = 0
+        self._calm = 0
         self._seat_mark = 0
+        self._lend_seat_mark = 0
         self._said = set()
-        self.counts = {"stage1": 0, "stage2": 0, "resume": 0, "wake": 0, "unavailable": 0, "refused": 0}
+        self.counts = {"stage1": 0, "lend": 0, "stage2": 0, "reclaim": 0, "resume": 0, "wake": 0,
+                       "unavailable": 0, "refused": 0}
 
     def _line(self, stage: str, d_need: int, freed: int, extra: str = "") -> str:
         return "%s stage=%s d_need=%d freed=%d p_state=%s%s" % (LINE, stage, int(d_need), int(freed),
                                                                   self.p_state, extra)
 
+    @staticmethod
+    def _room(card_room, free_min: int, need: int) -> bool:
+        if card_room is not None:
+            return bool(card_room) and all(int(f) >= int(n) for f, n in card_room)
+        return int(free_min) >= int(need)
+
     def tick(self, *, pressure: int, p_committed: int, free_min: int, p_grant_bytes: int,
              d_air_bytes: int, seats_done: int, weights_bytes: int = 0,
-             host_ok: bool = True,
+             host_ok: bool = True, p_lent: int = 0,
              card_room: Optional[Sequence[Tuple[int, int]]] = None) -> Tuple[Optional[str], Optional[str]]:
-        """``card_room``: per card (free bytes, bytes the wake needs there = that
-        card's loan + one P grant step + D's look-ahead). The wake from sleep is
-        judged PER CARD -- the loan sits on each card separately (gmps12: 7.96 /
-        3.22 / 3.51 GB), and a total against the tightest card's free can never
-        hold on a 3080 (budget 6.4 GB). Without it, the old total formula."""
+        """``card_room``: per card (free bytes, bytes the return needs there = that
+        card's loan + one P grant step + D's look-ahead). The return is judged PER
+        CARD -- the loan sits on each card separately (gmps12: 7.96 / 3.22 / 3.51
+        GB), and a total against the tightest card's free can never hold on a 3080
+        (budget 6.4 GB). Without it, the old total formula. ``p_lent``: the bytes
+        P's stages still lend (sleep + awake loan, from the stage files)."""
         pressure, p_committed, free_min = int(pressure), int(p_committed), int(free_min)
         if self.p_state == "serving":
             if pressure > 0:
@@ -262,6 +362,21 @@ class PressureStages:
                 if p_committed > 0:
                     self._held = 0                     # stage 1 not complete yet
                     return None, None
+                # stage 1 complete (P commits 0 B on every card): lend at once, awake (Q-660)
+                self.p_state = "lent"
+                self._held = 0
+                self._calm = 0
+                self._lend_seat_mark = int(seats_done)
+                self.counts["lend"] += 1
+                return "lend", self._line("1-lend", pressure, 0)
+            if free_min >= int(p_grant_bytes) + int(d_air_bytes):
+                self.p_state = "serving"
+                self.counts["resume"] += 1
+                return "resume", self._line("resume", 0, free_min)
+            return None, None
+        if self.p_state == "lent":
+            if pressure > 0:
+                self._calm = 0
                 self._held += 1
                 if self._held < self.sleep_after:
                     return None, None
@@ -281,16 +396,35 @@ class PressureStages:
                 self._seat_mark = int(seats_done)
                 self.counts["stage2"] += 1
                 return "sleep", self._line("2", pressure, int(weights_bytes))
-            if free_min >= int(p_grant_bytes) + int(d_air_bytes):
+            self._held = 0
+            self._calm += 1
+            calm = self._calm >= self.reclaim_after or int(seats_done) > self._lend_seat_mark
+            if calm and self._room(card_room, free_min, int(p_grant_bytes) + int(d_air_bytes)):
+                self.p_state = "reclaiming"
+                self._calm = 0
+                self.counts["reclaim"] += 1
+                return "reclaim", self._line("1-reclaim", 0, free_min)
+            return None, None
+        if self.p_state == "reclaiming":
+            if int(p_lent) <= 0:
+                if pressure > 0:                       # the loan is back but D presses again
+                    self.p_state = "stopped"
+                    self._held = 0
+                    return None, None
                 self.p_state = "serving"
                 self.counts["resume"] += 1
-                return "resume", self._line("resume", 0, free_min)
+                return "resume", self._line("resume", 0, free_min, " from=lend")
+            if pressure > 0:                           # the loan stays with D: lent again
+                self.p_state = "lent"
+                self._calm = 0
+                return None, None
+            self._calm += 1
+            if self._calm >= self.reclaim_after:       # D still held part of the loan: ask again
+                self._calm = 0
+                return "reclaim", self._line("1-reclaim", 0, free_min, " retry")
             return None, None
         # sleeping
-        if card_room is not None:
-            room_ok = bool(card_room) and all(int(f) >= int(n) for f, n in card_room)
-        else:
-            room_ok = free_min >= int(weights_bytes) + int(p_grant_bytes) + int(d_air_bytes)
+        room_ok = self._room(card_room, free_min, int(weights_bytes) + int(p_grant_bytes) + int(d_air_bytes))
         if pressure <= 0 and int(seats_done) > self._seat_mark and room_ok:
             self.p_state = "serving"
             self.counts["wake"] += 1
