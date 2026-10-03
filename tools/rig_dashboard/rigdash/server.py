@@ -9,6 +9,9 @@ Routes
                       P<->D-Vergleich; ?ver=<ver> antwortet {same: true}, solange gleich
   GET /api/history    Verlauf (history.py): ?model=27B|NF&range=15m|1h|6h|24h|7d
   GET /api/health     liveness of the dashboard itself
+  GET /api/hwprofil   Hardwareprofil flliper.hardware/1 (Auftrag 950, nur rig, nur LAN)
+  POST /api/hwprofil/measure   {cards:[nvml,...]}: gpuq-Fenster buchen und messen; pending = nur Status
+  POST /api/hwprofil/cancel    wartendes Fenster zurückgeben
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, history, imagechanges, ipcboot, kartenplan, launchview, live, redact, sampler, sources, vmpush, weg2line
+from . import energy, features, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live, redact, sampler, sources, vmpush, weg2line
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -41,6 +44,8 @@ STATIC_FILES = {
 #: Kartenplaner (Item 510): nur Rig-Ausgabe (Entwicklungsstand), im Release 404
 DEV_STATIC_FILES = {
     "/kartenplan.js": ("kartenplan.js", "application/javascript; charset=utf-8"),
+    # Profil-Editor S2 (Auftrag 950): Anzeige des Hardwareprofils, vom Editor-Reiter eingehängt
+    "/hwprofil.js": ("hwprofil.js", "application/javascript; charset=utf-8"),
 }
 
 
@@ -227,6 +232,11 @@ class App:
         self.src = sources.SourcesReader(self.ring_store) if self.sup is not None else sources.Sources(cfg)
         self.weg2 = weg2line.Weg2Lines(cfg["docker_ssh"], args.release_profile or [])
         self.kartenplaner = kartenplan.Kartenplaner()
+        # Profil-Editor S2 (Auftrag 950): Hardwareprofil lesen, im gebuchten gpuq-Fenster messen
+        self.hwprofil = hwprofil.HwProfil(
+            gpuq=args.gpuq, tree=getattr(args, "hw_tree", None), measure_tree=getattr(args, "hw_measure_tree", None),
+            python=getattr(args, "hw_python", None), prefix=shlex.split(getattr(args, "hw_prefix", "") or ""),
+            state_dir=args.state_dir or None, edition=getattr(args, "edition", "rig") or "rig")
         self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
                        else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
@@ -526,9 +536,49 @@ def make_handler(app: App):
                 return self._json(dict(app.weg2.dry_run(built), ok=True, line=built))
             return self._send(404, "not found", "text/plain")
 
+        def _hwprofil(self, method):
+            """Profil-Editor S2: nur Rig-Ausgabe, nur LAN (die Route bucht GPU-Fenster und startet einen Messlauf)."""
+            if app.edition == "release":
+                return self._send(404, "not found", "text/plain")
+            if self._via_proxy():
+                return self._json({"ok": False, "error": "Hardwareprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
+            path = self.path.split("?", 1)[0]
+            if method == "GET" and path == "/api/hwprofil":
+                return self._json(app.hwprofil.get())
+            if method == "POST" and path in ("/api/hwprofil/measure", "/api/hwprofil/cancel"):
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > 4096:
+                    raise ValueError("Body zu groß")
+                try:
+                    req = json.loads(self.rfile.read(n).decode() or "{}") if n else {}
+                except ValueError:
+                    raise ValueError('Body muss JSON sein: {"cards": [0, 1, 2]}')
+                if not isinstance(req, dict):
+                    raise ValueError("Body muss ein JSON-Objekt sein")
+                if path.endswith("/cancel"):
+                    return self._json(app.hwprofil.cancel())
+                out = app.hwprofil.measure(req)
+                return self._json(out, 200 if out.get("ok") else 409)
+            return self._send(404, "not found", "text/plain")
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            try:
+                if path.startswith("/api/hwprofil/"):
+                    return self._hwprofil("POST")
+                return self._send(404, "not found", "text/plain")
+            except BrokenPipeError:
+                return None
+            except ValueError as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
+            except Exception as e:
+                return self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             try:
+                if path == "/api/hwprofil":
+                    return self._hwprofil("GET")
                 if path in ("/", "/index.html"):
                     with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
                         return self._send(200, edition_page(fh.read(), app.edition), "text/html; charset=utf-8")
@@ -649,6 +699,14 @@ def main(argv=None):
                     help="the operator's per-image change list (rev -> fixes, expected gain, metal status)")
     ap.add_argument("--features", default=features.DEFAULT_PATH,
                     help="the feature list (built / in image / active / gain; im Image and aktiv are computed here)")
+    ap.add_argument("--hw-tree", default=os.environ.get("HWPROFIL_TREE"),
+                    help="Planer-Baum (<baum>/python) mit sglang/srt/rigmon/hardware_profile.py: Hardwareprofil lesen (Auftrag 950)")
+    ap.add_argument("--hw-measure-tree", default=os.environ.get("HWPROFIL_MEASURE_TREE"),
+                    help="voller sglang-Baum (<baum>/python) für den Messlauf; leer = --hw-tree (dann muss card_probe darin liegen)")
+    ap.add_argument("--hw-python", default=os.environ.get("HWPROFIL_PYTHON"),
+                    help="Interpreter mit torch + sgl_kernel für den Messlauf (Kindprozess, außerhalb dieses Prozesses)")
+    ap.add_argument("--hw-prefix", default=os.environ.get("HWPROFIL_PREFIX", ""),
+                    help="Befehlspräfix des Messlaufs, z. B. 'systemd-run --scope -q -p MemoryMax=6G' (eigener cgroup-Rahmen)")
     ap.add_argument("--features-repo", default=features.DEFAULT_REPO,
                     help="git repo holding the image revs and feature commits")
     ap.add_argument("--release-profile", action="append", default=[],
