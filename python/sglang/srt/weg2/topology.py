@@ -85,6 +85,14 @@ class TopologyContext:
     l15_mib: str = ""
     #: positional per-card vectors this launch carries: name -> entry count
     vectors: Mapping[str, int] = field(default_factory=dict)
+    #: HW-P1c: the LIVE inventory (calibration-class labels in card order), the
+    #: inventory the profile's vectors were written for, and the one its
+    #: measured records were taken on; () = unknown (then nothing is derivable)
+    live_inventory: Tuple[str, ...] = ()
+    vector_inventory: Tuple[str, ...] = ()
+    record_inventory: Tuple[str, ...] = ()
+    #: BAR1 total (MiB) of each live card in card order, None = not reported
+    bar1_mib: Tuple[Optional[int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,15 @@ class TopologyRefused(RuntimeError):
 # PLAN_HWGEN_N_KARTEN_1003 section 2a/2d/2e)
 
 
+def _form_a(profile: str) -> bool:
+    """The profile's D attention layout is Form A (host + workers; a registry
+    row field, not a profile NAME)."""
+    from sglang.srt.weg2 import form as _form
+
+    row = _form.profile_row(profile) if profile else None
+    return bool(row is not None and getattr(row, "d_layout", "") == "qsa_forma")
+
+
 def _b_single(n: int, ctx: TopologyContext) -> List[Blocker]:
     if n >= MIN_CARDS:
         return []
@@ -131,7 +148,7 @@ def _b_single(n: int, ctx: TopologyContext) -> List[Blocker]:
         out.append(Blocker("DUAL-1", "launcher resolve_dual_layout",
                            "dual on one card = two engines with the same weights under MPS, i.e. "
                            "chunked prefill in one engine with two contexts; not a mode"))
-    if str(ctx.profile) == "nextflash":
+    if _form_a(ctx.profile):
         out.append(Blocker("FORM-A-1", "managers/rank_role.py Form A >= 2 ranks",
                            "NF Form A needs a host and at least one worker; a one-card NF needs "
                            "expert offload from the host store (plan P4)"))
@@ -153,27 +170,28 @@ def _b_xchg_region(n: int, ctx: TopologyContext) -> List[Blocker]:
         return []   # the ring arm creates no exchange region
     from sglang.srt.weg2 import weight_exchange_region as _wxr
 
-    if int(_wxr.N_CARDS) == n and len(_wxr.CROSS_PAIRS) == n * (n - 1):
+    # HW-P1c: the region's geometry is a function of N (geometry / configure);
+    # a blocker only where it cannot be laid out for this count.
+    problems = _wxr.layout_problems(n)
+    if not problems:
         return []
-    return [Blocker("XCHG-REGION",
-                    f"weg2/weight_exchange_region.py N_CARDS={_wxr.N_CARDS}, "
-                    f"{len(_wxr.CROSS_PAIRS)} fixed CROSS_PAIRS",
-                    f"the host exchange region is laid out for {_wxr.N_CARDS} cards; "
-                    f"{n} cards need {n * (n - 1)} directed pairs "
-                    "(--weg2-weight-source exchange; the launcher sizes it n(n-1), the module "
-                    f"lays out {len(_wxr.CROSS_PAIRS)})")]
+    return [Blocker("XCHG-REGION", "weg2/weight_exchange_region.py geometry(n)",
+                    f"the host exchange region cannot be laid out for {n} cards: "
+                    + "; ".join(problems))]
 
 
 def _b_bar1_windows(n: int, ctx: TopologyContext) -> List[Blocker]:
     if n < MIN_CARDS:
         return []   # no flip groups on one card (SINGLE-MODE names it)
-    where = "launcher P_BARLINK_BAR1_WINDOW_MIB '24,PP_0=96', D windows 16+32+40"
-    if ctx.dual:
-        where += ", DUAL_P_BARLINK_BAR1_WINDOW_MIB '16,PP_0=64'"
-    return [Blocker("BAR1-WINDOW", where,
-                    f"the BAR1 group windows are constants sized for 2 peers per card on a "
-                    f"256 MiB BAR with PP0 on a big BAR; {n} cards = {n - 1} peer(s) per card, "
-                    "no feasibility check against the measured bar1_total_mib yet (plan P1c/K3)")]
+    from sglang.srt.weg2 import bar1_windows as _bw
+
+    # HW-P1c (K3): the windows are derived from N and the MEASURED BAR1 of the
+    # cards (weg2/bar1_windows.py); a blocker only where they cannot fit.
+    pl = _bw.plan(n, ctx.bar1_mib, dual=ctx.dual)
+    if pl.ok:
+        return []
+    return [Blocker("BAR1-WINDOW", "weg2/bar1_windows.py plan(); launcher P/D --barlink-bar1-window-mib",
+                    pl.why)]
 
 
 def _b_dual_front(n: int, ctx: TopologyContext) -> List[Blocker]:
@@ -181,25 +199,29 @@ def _b_dual_front(n: int, ctx: TopologyContext) -> List[Blocker]:
         return []   # no flip groups on one card (SINGLE-MODE names it)
     if not ctx.dual:
         return []
-    return [Blocker("DUAL-FRONT-STAGES", "weg2/front.py dual KV loan: for r in range(3)",
-                    f"the dual KV loan reads P's stage files 0..2; P has {n} stages "
-                    "(plan P7, behind the dual gate only)")]
+    # HW-P1c: the dual KV loan reads one stage file per card (front.py reads
+    # max(3, len(dual_kv_ledgers)) of them; a missing file is skipped), so it is
+    # correct for every N >= 2. Nothing blocks here; the dual's own vectors and
+    # records are judged by their probes.
+    return []
 
 
 def _b_pp_cut_floor(n: int, ctx: TopologyContext) -> List[Blocker]:
     if n < MIN_CARDS:
         return []   # no flip groups on one card (SINGLE-MODE names it)
-    if str(ctx.profile) != "qwen27b":
-        return []
-    from sglang.srt.weg2 import DEFAULT_PP_ORDERED_CUT
+    from sglang.srt.weg2 import DEFAULT_PP_ORDERED_CUT, pp_ordered_cut_for
 
-    if len(DEFAULT_PP_ORDERED_CUT) == n:
+    # HW-P1c: the ordered cut (user order 2026-09-09) is a floor for exactly its
+    # own stage count; any other P group has NO floor by rule
+    # (launcher.resolve_pool_floor n_stages) and the solver ranks the unfloored
+    # makespan. A blocker only if the rule is missing or contradicts the tuple.
+    got = pp_ordered_cut_for(n)
+    if got is None and n != len(DEFAULT_PP_ORDERED_CUT):
         return []
-    return [Blocker("PP-CUT-FLOOR",
-                    "weg2/__init__.py DEFAULT_PP_ORDERED_CUT="
-                    + ",".join(str(x) for x in DEFAULT_PP_ORDERED_CUT),
-                    f"the 27B pool floor of the PP cut is a {len(DEFAULT_PP_ORDERED_CUT)}-stage "
-                    f"tuple; P = PP{n} has no floor")]
+    if got is not None and len(got) == n:
+        return []
+    return [Blocker("PP-CUT-FLOOR", "weg2/__init__.py pp_ordered_cut_for",
+                    f"the 27B pool floor of the PP cut has no rule for P = PP{n}")]
 
 
 def _b_pp_cut_pin(n: int, ctx: TopologyContext) -> List[Blocker]:
@@ -217,6 +239,14 @@ def _b_pp_cut_pin(n: int, ctx: TopologyContext) -> List[Blocker]:
     bad = [p for p in pin if len(p) != n]
     if not bad:
         return []
+    # HW-P1c: a pin holds only for its own stage count. For another N it is
+    # DROPPED (inventory_view FLAG_POLICY cut-pin) and the planner's cut solver
+    # (planner/pp_cut.py: layers x card rates x budgets) derives the cut. A
+    # blocker only where the drop is not wired for the pinned flag.
+    from sglang.srt.weg2 import inventory_view as _iv
+
+    if all(_iv.FLAG_POLICY.get(f) == _iv.CUT_PIN for f in ("--pp-stage-ratio", "--pp-attn-stage-ratio")):
+        return []
     return [Blocker("PP-CUT-PIN",
                     f"weg2/form.py {ctx.profile}.formats[{ctx.weight_format!r}].p_cut_pin",
                     "the format's P cut is pinned as "
@@ -225,11 +255,17 @@ def _b_pp_cut_pin(n: int, ctx: TopologyContext) -> List[Blocker]:
 
 
 def _b_vectors(n: int, ctx: TopologyContext) -> List[Blocker]:
-    bad = sorted((k, int(v)) for k, v in (ctx.vectors or {}).items() if int(v) != n)
+    from sglang.srt.weg2 import inventory_view as _iv
+
+    live, cal = tuple(ctx.live_inventory), tuple(ctx.vector_inventory)
+    bad = sorted((k, int(v)) for k, v in (ctx.vectors or {}).items() if int(v) != n
+                 and not (live and cal and _iv.vector_derivable(k, int(v), cal, live)))
     if not bad:
         return []
     return [Blocker("PROFILE-VECTORS", "profile argv/env positional vectors",
-                    f"per-card vectors written for another card count: "
+                    f"per-card vectors written for another inventory that cannot be derived for "
+                    f"this one (derivation needs every live card to have a measured twin of its "
+                    f"class and a policy for the vector): "
                     + ", ".join(f"{k} ({v} entries)" for k, v in bad)
                     + f"; this launch has {n} cards")]
 
@@ -239,6 +275,7 @@ def _b_l15(n: int, ctx: TopologyContext) -> List[Blocker]:
         return []   # no flip groups on one card (SINGLE-MODE names it)
     if not ctx.l15:
         return []
+    from sglang.srt.weg2 import inventory_view as _iv
     from sglang.srt.weg2 import l15_plan as _l15
 
     keys: List[int] = []
@@ -248,17 +285,32 @@ def _b_l15(n: int, ctx: TopologyContext) -> List[Blocker]:
     except ValueError:
         keys = []   # identity keys: resolved (and refused by name) against the cards later
     beyond = [k for k in keys if k >= n]
+    if mode_is_auto(ctx.l15_mib) or not keys:
+        return []   # auto / identity keys: no ordinal of the 3-card rig is named
+    # HW-P1c: ordinal posts are derived by class from the inventory they were
+    # measured on (inventory_view.derive_l15_override); a blocker only where
+    # that is impossible (a card without a measured twin, no inventory known).
+    cal, live = tuple(ctx.record_inventory), tuple(ctx.live_inventory)
+    if cal and live and _iv.l15_derivable(ctx.l15_mib, cal, live):
+        return []
     what = ("the L1.5 posts are per-ordinal measurements of the 3-card rig (CAP0 proven on "
-            "exactly one rank, K9)")
+            "exactly one rank, K9) and are not derivable for this inventory (every live card "
+            "needs a measured twin of its class holding a post)")
     if beyond:
         what += "; " + ", ".join(f"c{k}" for k in beyond) + f" names no card of {n}"
     return [Blocker("L15-POSTS", "SGLANG_WEG2_L15_MIB " + (repr(ctx.l15_mib) if ctx.l15_mib else "auto"),
                     what)]
 
 
+def mode_is_auto(value: str) -> bool:
+    v = str(value or "").strip().lower()
+    return v in ("", "auto")
+
+
 def _b_records(n: int, ctx: TopologyContext) -> List[Blocker]:
     if not ctx.profile:
         return []
+    from sglang.srt.weg2 import inventory_view as _iv
     from sglang.srt.weg2 import profile_records as _pr
 
     try:
@@ -267,15 +319,26 @@ def _b_records(n: int, ctx: TopologyContext) -> List[Blocker]:
     except Exception:  # noqa: BLE001 - a record file problem is named elsewhere (inventory check)
         return []
     width = len(inv) if inv is not None else 3
-    if width == n:
+    if width == n and (not ctx.live_inventory or tuple(ctx.live_inventory) == tuple(inv or ())):
         return []
-    names = sorted({r.name for r in recs if _pr.is_positional(r.value, width)})
-    if not names:
+    pos = [(r.name, r.value) for r in recs if _pr.is_positional(r.value, width)]
+    if not pos:
         return []
+    # HW-P1c: positional records are DERIVED for a live subset of the cards
+    # they were measured on (weg2/inventory_view.py); a blocker names the
+    # records that are not.
+    if inv is not None and ctx.live_inventory:
+        bad = list(_iv.assess_records(pos, tuple(inv), tuple(ctx.live_inventory)).underivable)
+    else:
+        bad = [p[0] for p in pos]
+    if not bad:
+        return []
+    names = sorted(bad)
     return [Blocker("RECORDS-NVEC", f"weg2/profile_records_data/{ctx.profile}.json",
-                    f"{len(names)} measured records are {width}-vectors of one inventory "
-                    f"({', '.join(names[:4])}{', ...' if len(names) > 4 else ''}); {n} cards need "
-                    "a calibration boot that writes N-vectors (plan K1/P2)")]
+                    f"{len(names)} measured records are {width}-vectors of one inventory that cannot "
+                    f"be derived for this one ({', '.join(names[:4])}{', ...' if len(names) > 4 else ''}); "
+                    f"{n} cards of this inventory need a calibration boot that writes their records "
+                    "(plan K1/P3a)")]
 
 
 def _b_metal(n: int, ctx: TopologyContext) -> List[Blocker]:
