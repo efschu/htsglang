@@ -359,6 +359,8 @@ def forget_left_queue(scheduler, req, why: str) -> List[str]:
         held.pop(rid, None)
         dropped.append("held")
         _return_untold_dual_grant(scheduler, req, why)
+    if _forget_intake_t(scheduler, rid, held):
+        dropped.append("intake_t")
     if dropped:
         n = getattr(scheduler, "_q580_forget_n", 0) + 1
         scheduler._q580_forget_n = n
@@ -371,6 +373,27 @@ def forget_left_queue(scheduler, req, why: str) -> List[str]:
                 ",".join(dropped), n,
             )
     return dropped
+
+
+def _forget_intake_t(scheduler, rid: str, held) -> bool:
+    """Q-693 (dual P only): PP0's paced-intake stamp of ``rid`` leaves with the
+    request. It is not a told record and outlived the abort: the next
+    instance's ``setdefault`` inherited the old stamp, its own_read_s covered
+    the whole gap, and the PF deadline (intake + TOTAL_S) lay in the past --
+    'PF TOLD-FALLBACK ... reason=frist after<0.3s', a full re-prefill. Kept
+    while another queued object still holds the rid."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return False
+    stamps = getattr(scheduler, "_weg2_told_intake_t", None)
+    if not isinstance(stamps, dict) or rid not in stamps:
+        return False
+    other = held.get(rid) if isinstance(held, dict) else None
+    if other is not None and _queued_obj(scheduler, other):
+        return False
+    stamps.pop(rid, None)
+    return True
 
 
 def _return_untold_dual_grant(scheduler, req, why: str) -> None:

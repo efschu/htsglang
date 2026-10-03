@@ -80,6 +80,7 @@ from __future__ import annotations
 import logging
 import os
 import pickle
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -453,6 +454,7 @@ def follower_forget(scheduler, rid: str) -> None:
     rid = str(rid)
     st.expect.pop(rid, None)
     st.registered.pop(rid, None)
+    _room_hold_end(scheduler, rid, "verdict")  # Q-693: PP0 decided before the held ack
     if st.outbox:
         st.outbox = [e for e in st.outbox if e[0] != rid]
 
@@ -487,9 +489,9 @@ def _is_follower_twin(scheduler, rid: str) -> bool:
     return bool(st) and str(rid) in st.twin_follower
 
 
-def own_prefix(scheduler, req, rid: str, told: int) -> int:
+def own_prefix(scheduler, req, rid: str, told: int) -> Optional[int]:
     """What ``weg2_store_told.admission`` will compare with told -- read,
-    never consumed."""
+    never consumed. None = Q-693 ROOM-HOLD (dual P only): no ack yet."""
     from sglang.srt.managers import weg2_store_told as _st
     from sglang.srt.weg2 import p_twin_defer as _twin
 
@@ -502,7 +504,7 @@ def own_prefix(scheduler, req, rid: str, told: int) -> int:
     return _resumable_own(scheduler, req, rid, own)
 
 
-def _resumable_own(scheduler, req, rid: str, own: int) -> int:
+def _resumable_own(scheduler, req, rid: str, own: int) -> Optional[int]:
     """ACK-RESUMABLE (N1 dkr27browauthoritybar1fs10010740, PP1 07:46:10Z,
     weg2-10-16): a follower's read can complete the told KV span while its
     tree holds no recurrent state at that depth -- PP1 acked 17406 and then
@@ -558,7 +560,7 @@ def _loadback_rows(scheduler, req, told: int) -> Optional[int]:
         return None
 
 
-def _room_own(scheduler, req, rid: str, own: int) -> int:
+def _room_own(scheduler, req, rid: str, own: int) -> Optional[int]:
     """ACK-ROOM (dual1k dkr27bnvfp4dual1kbar1fs10010950, PP1 09:55:20Z, rid
     weg2-0-10, a fork twin): the follower's read reproduced told=16383 and its
     tree could resume there (host KV + anchor), but the head was HOST-only on
@@ -579,7 +581,10 @@ def _room_own(scheduler, req, rid: str, own: int) -> int:
     except Exception:  # noqa: BLE001 - no allocator readable: no verdict
         return own
     if room >= int(rows):
+        _room_hold_end(scheduler, rid, "room")
         return own
+    if _room_hold(scheduler, req, rid, own, int(rows), room):
+        return None  # Q-693 (dual only): ack held, re-read at the next pump
     n = _bump(scheduler, "_pf_ack_no_room_n")
     if n <= 32 or n % _LOG_EVERY == 0:
         logger.warning(
@@ -590,6 +595,117 @@ def _room_own(scheduler, req, rid: str, own: int) -> int:
             getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(rows), room, n,
         )
     return 0
+
+
+# Q-693 ACK-ROOM HOLD (27B NVFP4 dual fs10031727 bc2bd121c0, 37 NO-ROOM acks;
+# PP1 17:42:58 weg2-0-183 told=68096 room=3735): the follower's pool was full of
+# its PREDECESSOR weg2-0-182, whose last chunk (extend=147) this rank had
+# admitted in the same second and which released its rows one pass later (full
+# token usage 0.98 -> 0.51). The ack said 0 on that transient and PP0 re-
+# prefilled 68664 tokens (~15 s). With a predecessor in flight whose rows cover
+# the shortfall the ack is HELD (the read stays registered) and re-read at the
+# next pump; it says 0 only on a stable shortage. PP0's Frist bounds the hold:
+# an ack that never comes is PP0's told=0 at the Frist, the verdict of today.
+# The dual1k check stays: a CONCURRENT prefill (chunks still to admit on a P
+# that runs more than one request) is not a predecessor and is not counted.
+ROOM_HOLD_MARK = "PF TOLD-ACK ROOM-HOLD"
+_ROOM_HOLD_ATTR = "_q693_room_hold"
+
+
+def _inflight_reqs(scheduler, req) -> List[Any]:
+    """Every request this rank holds rows for, other than ``req``, once."""
+    out: List[Any] = []
+    seen = {id(req)}
+
+    def _take(r) -> None:
+        if r is not None and id(r) not in seen:
+            seen.add(id(r))
+            out.append(r)
+
+    for ring in ("mbs", "running_mbs"):
+        for b in getattr(scheduler, ring, None) or ():
+            for r in getattr(b, "reqs", None) or ():
+                _take(r)
+    for r in getattr(getattr(scheduler, "running_batch", None), "reqs", None) or ():
+        _take(r)
+    _take(getattr(scheduler, "chunked_req", None))
+    for r in getattr(scheduler, "_pp_chunked_req_before_by_slot", None) or ():
+        _take(r)
+    return out
+
+
+def _serial(scheduler) -> bool:
+    mrr = getattr(scheduler, "max_running_requests", None)
+    if mrr is None:
+        mrr = getattr(getattr(scheduler, "server_args", None), "max_running_requests", None)
+    try:
+        return mrr is not None and int(mrr) <= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def inflight_release_rows(scheduler, req) -> int:
+    """Rows the PREDECESSORS in flight on this rank hold now and hand back to the
+    tree (evictable) when they finish, before ``req`` can be admitted: requests
+    whose last chunk this rank has admitted, and -- on a serial P (max running
+    requests 1), where nothing runs beside ``req`` -- every request in flight. A
+    predecessor with chunks to go allocates them first and frees all of it, so
+    room + its held rows is the room after it (rows held = len(fill_ids))."""
+    serial = _serial(scheduler)
+    rows = 0
+    for r in _inflight_reqs(scheduler, req):
+        fill = len(getattr(r, "fill_ids", None) or ())
+        origin = len(getattr(r, "origin_input_ids", None) or ())
+        if fill <= 0:
+            continue
+        if serial or (origin > 0 and fill >= origin):
+            rows += fill
+    return rows
+
+
+def _room_hold(scheduler, req, rid: str, own: int, rows: int, room: int) -> bool:
+    """Q-693 (dual P only): True = hold this ack, the shortfall is a predecessor
+    in flight that releases it."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return False
+    if not any(r is req for r in (getattr(scheduler, "waiting_queue", None) or ())):
+        _room_hold_end(scheduler, rid, "left_queue")
+        return False  # aborted / gone here: nothing to hold for
+    pending = inflight_release_rows(scheduler, req)
+    if pending <= 0 or room + pending < rows:
+        _room_hold_end(scheduler, rid, "stable")
+        return False
+    holds = getattr(scheduler, _ROOM_HOLD_ATTR, None)
+    if holds is None:
+        holds = {}
+        setattr(scheduler, _ROOM_HOLD_ATTR, holds)
+    if rid not in holds:
+        holds[rid] = time.monotonic()
+        n = _bump(scheduler, "_q693_room_hold_n")
+        if n <= 32 or n % _LOG_EVERY == 0:
+            logger.warning(
+                "%s rank pp=%s rid=%s told=%d loadback_rows=%d room=%d predecessor_rows=%d (n=%d): "
+                "the pool is short only by a predecessor still in flight on this rank -- the ack "
+                "is held and re-read every pass instead of 0 (Q-693; PP0's Frist bounds it)",
+                ROOM_HOLD_MARK, getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, rows,
+                room, pending, n,
+            )
+    return True
+
+
+def _room_hold_end(scheduler, rid: str, how: str) -> None:
+    holds = getattr(scheduler, _ROOM_HOLD_ATTR, None)
+    if not holds or rid not in holds:
+        return
+    t0 = holds.pop(rid)
+    logger.warning(
+        "%s END rank pp=%s rid=%s how=%s held_s=%.2f (room = the predecessor released; stable = "
+        "the shortage outlived it, ack 0; verdict = PP0 decided first, its Frist)",
+        ROOM_HOLD_MARK, getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), str(rid)[:12], how,
+        time.monotonic() - t0,
+    )
 
 
 def _progress_free(tree) -> bool:
@@ -627,9 +743,12 @@ def follower_pump(scheduler) -> None:
 
             if not _st.follower_early_settle_now(scheduler, st.registered[rid], rid, told):
                 continue  # short: the told-limited read acks when it ends
-        req = st.registered.pop(rid)
+        own = own_prefix(scheduler, st.registered[rid], rid, told)
+        if own is None:
+            continue  # Q-693 ROOM-HOLD (dual P only): re-read at the next pump
+        st.registered.pop(rid)
         st.expect.pop(rid, None)
-        st.outbox.append((rid, own_prefix(scheduler, req, rid, told)))
+        st.outbox.append((rid, own))
     ch = _channel(scheduler)
     if not st.outbox:
         ch.pump()
