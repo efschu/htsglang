@@ -1590,6 +1590,10 @@ def _weg2_prefetch_span_start(sched, req, matched_len: int) -> int:
 
 
 _PRESENCE_PROBE_N = [0]
+#: Q-650 (dual y8v 15:20:53): a rid held behind a refused fetch re-probes every
+#: pass; its handoff-miss line is printed once per (rid, matched) head plus
+#: every 256th repeat, with the repeat count.
+_PRESENCE_MISS_ONCE = None
 
 
 def _weg2_presence_keys(sched, req, matched_len: int, n_tokens: int):
@@ -1661,9 +1665,18 @@ def _weg2_store_presence(
         srcs[str(getattr(req, "rid", ""))] = src
         while len(srcs) > 4096:
             srcs.pop(next(iter(srcs)))
+    global _PRESENCE_MISS_ONCE
     _PRESENCE_PROBE_N[0] += 1
     n = _PRESENCE_PROBE_N[0]
-    if n <= 64 or n % 256 == 0 or (src == "handoff" and not present):
+    miss = src == "handoff" and not present
+    if miss:
+        if _PRESENCE_MISS_ONCE is None:
+            from sglang.srt.weg2.dual_anchor_release import OncePer
+
+            _PRESENCE_MISS_ONCE = OncePer(every=256)
+        head = (str(getattr(req, "rid", "?")), int(matched_len))
+        miss = _PRESENCE_MISS_ONCE(head)
+    if n <= 64 or n % 256 == 0 or miss:
         logger.info(
             "H108 PRESENCE-PROBE rid=%s keys=%s covered=%d span_tokens=%d matched=%d "
             "pages=%d present=%s (n=%d): the #950 verdict this rank carries into the "

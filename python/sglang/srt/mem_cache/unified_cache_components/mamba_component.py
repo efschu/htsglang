@@ -368,7 +368,18 @@ class MambaComponent(TreeComponent):
                     MambaComponent._host_resume_tok = getattr(
                         MambaComponent, "_host_resume_tok", 0
                     ) + int(depth)
-                    if n == 1 or n % 8 == 0:
+                    # Q-650 (dual y8v 15:21: ~28,000 lines/min, the same 7
+                    # depths re-matched every pass for one held rid): one line
+                    # per depth, then every 4096th acceptance.
+                    seen = MambaComponent.__dict__.get("_host_resume_seen")
+                    if seen is None:
+                        seen = MambaComponent._host_resume_seen = set()
+                    first = int(depth) not in seen
+                    if first:
+                        if len(seen) >= 4096:
+                            seen.clear()
+                        seen.add(int(depth))
+                    if first or n % 4096 == 0:
                         logger.info(
                             "MAMBA-HOST-RESUME n=%d: anchor accepted at depth=%d on a "
                             "HOST-backed state (device copy evicted); this match "

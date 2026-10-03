@@ -12374,6 +12374,28 @@ class Front:
             if self.queue and not g.outstanding:
                 self._kick_controller("arrival")
 
+    async def _q650_anchor_owed_hold(self, rid: str, n: int) -> None:
+        """Q-650 ANCHOR-OWED (dual y8v 15:20:18-15:21:49, W53 for every long
+        request): the re-queue below sends `rid` through P leg 1 again, and P
+        can only hand it over with an END anchor in the mamba arena. While
+        group D's room reading says the arena has no unpinned slot left, a
+        second P prefill lands in the same full arena and ends W53 -- so the
+        rid waits (bounded) for the room D's Q-650 release makes. Dual layout
+        only; no reading, a stale one or a free arena = no wait."""
+        if not self.dual_layout:
+            return
+        from sglang.srt.weg2 import dual_anchor_release as _dar
+
+        outcome, held_s = await _dar.wait_anchor_room(
+            _dar.read_room, sleep=asyncio.sleep, clock=time.monotonic)
+        if outcome == "free":
+            return
+        self.counters["q650_anchor_owed_" + outcome] += 1
+        logger.warning(
+            "%s ANCHOR-OWED rid=%s n=%d outcome=%s held_s=%.1f (the arena had no slot for P's END "
+            "anchor; the second P leg waited for the room D gives back instead of prefilling into "
+            "the same full arena)", _dar.MARKER_D, rid, n, outcome, held_s)
+
     async def _requeue_after_x_refusal(self, request: web.Request, rid: str, payload: dict, text: str,
                                        stream: bool, pending: Optional[Pending], seat: Optional[Seat],
                                        body: bytes) -> web.StreamResponse:
@@ -12576,6 +12598,7 @@ class Front:
             if seat is not None:
                 seat.release("W35")
             return web.json_response({"error": f"W35 Weg2XReQueueLoop rid={rid}"}, status=503)
+        await self._q650_anchor_owed_hold(rid, n)
         p = pending
         if p is None:
             # A SHORT (or CARRIER-EXCEEDS) arrival the front mis-priced: it

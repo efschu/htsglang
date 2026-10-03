@@ -5438,6 +5438,55 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                        kept_pending=kept, claim_ok=mrows is not None, depth=depth)
         return mrows
 
+    # -- Q-650: group D of the dual layout gives its anchor references back ----
+    # (weg2/dual_anchor_release.py: y8v 10031504 15:20 D held 111-112 of the
+    # 112 slots, P's END anchors found no slot -> W50 -> X-REQUEUE -> W53)
+
+    def _weg2_dual_d_held(self, mp) -> list:
+        """D's tree nodes whose mamba host value addresses arena slots."""
+        out = []
+        stack = list(self.root_node.children.values())
+        while stack:
+            n = stack.pop()
+            stack.extend(n.children.values())
+            hv = n.component_data[ComponentType.MAMBA].host_value
+            if hv is not None and hv.numel() > 0 and mp.is_arena_id(int(hv.min())):
+                out.append(n)
+        return out
+
+    def _weg2_dual_d_tick(self) -> None:
+        """Q-650: every D_TICK_ROUNDS HICACHE rounds (a rank-lockstep counter),
+        dual D reads the arena's pin count, gives back its least recently used
+        settled anchors down to its cap / until P has room, and publishes the
+        room for the front's ANCHOR-OWED hold. Host bookkeeping, no collective;
+        never raises into the round."""
+        if not _dar.armed_d():
+            return
+        if int(getattr(self, "_1028_round", 0)) % _dar.D_TICK_ROUNDS:
+            return
+        try:
+            mp = self._weg2_mamba_pool()
+            arena = getattr(mp, "arena", None) if mp is not None else None
+            if arena is None:
+                return
+            slots = int(arena.slots)
+            pinned = arena.ref_census()[0]
+            held = self._weg2_dual_d_held(mp)
+            need = _dar.d_release_need(slots=slots, pinned=pinned, d_held=len(held))
+            released = _dar.d_release_pass(
+                held, need=need,
+                releasable=lambda n: self._weg2_dual_releasable(n, mp),
+                release=self._weg2_dual_release_ref,
+                age=lambda n: n.last_access_time)
+            if released:
+                pinned = arena.ref_census()[0]
+            _dar.log_d(released=released, need=need, d_held=len(held) - released, pinned=pinned,
+                       slots=slots, candidates=len(held))
+            if int(self.cache_controller.tp_rank) == 0:
+                _dar.publish_room(slots=slots, pinned=pinned, d_held=len(held) - released)
+        except Exception as exc:  # noqa: BLE001 -- a release never takes the round down
+            logger.warning("%s tick raised %s: %s", _dar.MARKER_D, type(exc).__name__, exc)
+
     #: FLUSH-SPILL: anchors spilled to L3 and freed at sleep flushes (per process)
     _weg2_flush_spill_n = 0
 
@@ -8349,12 +8398,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # H108: the key source of this rank's #950 presence probe (handoff /
         # own), "-" when the rank was eligible without asking.
         _keys = (getattr(self, PRESENCE_SRC_ATTR, None) or {}).get(str(req_id), "-")
+        # Q-650 (y8v 15:20:53): a held rid re-asks every pass -- one line per
+        # (rid, reason, need) head plus every 256th repeat, with the count;
+        # the rid in full (``[:8]`` printed weg2-0-121 as weg2-0-1).
+        _once = self.__dict__.get("_weg2_915_once")
+        if _once is None:
+            _once = self.__dict__["_weg2_915_once"] = _dar.OncePer(every=256)
+        _head = (str(req_id), str(reason), int(t["need"]))
+        if not _once(_head):
+            return
         logger.warning(
             "#915 PREFETCH REFUSED reason=%s rid=%s need=%d available=%d "
             "threshold=%d occupied=%d limit=%d pool_id=%d epoch=%d phase=%s "
-            "generation=%d keys=%s",
+            "generation=%d keys=%s repeats=%d",
             reason,
-            str(req_id)[:8],
+            str(req_id),
             t["need"],
             t["available"],
             t["threshold"],
@@ -8365,6 +8423,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             t["phase"],
             t["generation"],
             _keys,
+            _once.count(_head),
         )
 
     def _log_prefetch_truncated(
@@ -11318,6 +11377,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
         except Exception:  # noqa: BLE001 - a probe may never break the round
             pass
+        if _dar.armed_d():
+            self._weg2_dual_d_tick()   # Q-650: dual D gives anchor references back
         _timing_every = _hicache_round_timing_every()
         _t0 = time.perf_counter() if _timing_every else 0.0
         # Reap the previous round's PP-sync sends before issuing new ones.
