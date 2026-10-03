@@ -25,7 +25,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
-from . import energy, features, health, history, imagechanges, ipcboot, kartenplan, launchview, live, profil, redact, sampler, sources, vmpush, weg2line
+from . import (energy, features, health, history, imagechanges, ipcboot, kartenplan, launchview, live, modellprofil, profil, redact,
+               sampler, sources, vmpush, weg2line)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -42,7 +43,13 @@ STATIC_FILES = {
 DEV_STATIC_FILES = {
     "/kartenplan.js": ("kartenplan.js", "application/javascript; charset=utf-8"),
     "/profil.js": ("profil.js", "application/javascript; charset=utf-8"),
+    # PROFIL-EDITOR S3 (Auftrag 960): das kleine Modul hinter "Modellprofil erstellen" (die Oberfläche baut Auftrag 930)
+    "/modellprofil.js": ("modellprofil.js", "application/javascript; charset=utf-8"),
 }
+#: Körper einer POST-Anfrage: Pfad und ein paar Optionen, nie mehr
+MAX_POST_BODY = 64 * 1024
+#: so viel eines zu großen Körpers wird noch gelesen und verworfen, damit die 400-Antwort beim Client ankommt
+MAX_POST_DRAIN = 1 << 20
 
 
 def _version():
@@ -233,6 +240,8 @@ class App:
             kartenplaner=self.kartenplaner,
             release_dir=getattr(args, "profiles_release_dir", None) or profil.DEFAULT_RELEASE_DIR,
             user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR)
+        # Modellprofil schätzen (S3): liest nur config.json und Kopfzeilen unter den Modellwurzeln
+        self.modellprofil = modellprofil.ModelEstimator(roots=getattr(args, "model_root", None) or None)
         self.energy = (energy.EnergyReader(self.ring_store, live.BUCKET_S) if self.sup is not None
                        else energy.EnergyBook(args.state_dir or None, live.BUCKET_S))
         self.imgchg = imagechanges.ImageChanges(args.image_changes)
@@ -552,43 +561,33 @@ def make_handler(app: App):
                 return self._json({"ok": False, "error": str(e)}, 400)
             return self._send(404, "not found", "text/plain")
 
-        def do_POST(self):
-            path = self.path.split("?", 1)[0]
+        def _profil_post(self, path, n, raw):
+            """POST /api/profil/*: the body was read by do_POST (at most MAX_POST_DRAIN bytes)."""
+            bad = self._profil_guard()
+            if bad:
+                return self._json({"ok": False, "error": bad[1]}, bad[0]) if bad[0] != 404 else self._send(404, "not found", "text/plain")
+            if n > profil.MAX_BODY:
+                return self._json({"ok": False, "error": "Anfrage zu groß"}, 413)
             try:
-                if not path.startswith("/api/profil/"):
-                    return self._send(404, "not found", "text/plain")
-                bad = self._profil_guard()
-                if bad:
-                    return self._json({"ok": False, "error": bad[1]}, bad[0]) if bad[0] != 404 else self._send(404, "not found", "text/plain")
-                n = int(self.headers.get("Content-Length") or 0)
-                if n > profil.MAX_BODY:
-                    return self._json({"ok": False, "error": "Anfrage zu groß"}, 413)
-                try:
-                    body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
-                except ValueError:
-                    return self._json({"ok": False, "error": "Körper ist kein JSON"}, 400)
-                if not isinstance(body, dict):
-                    return self._json({"ok": False, "error": "Körper muss ein JSON-Objekt sein"}, 400)
-                ed = app.profil
-                if path == "/api/profil/load":
-                    return self._json(ed.load(str(body.get("kind", "")), str(body.get("name", ""))))
-                if path == "/api/profil/edit":
-                    return self._json(ed.edit(body.get("doc"), body.get("edits") or []))
-                if path == "/api/profil/save":
-                    return self._json(ed.save(body.get("doc"), str(body.get("name", ""))))
-                if path == "/api/profil/delete":
-                    return self._json(ed.delete(str(body.get("name", ""))))
-                if path == "/api/profil/export":
-                    return self._json(ed.export_env(body.get("doc")))
-                if path == "/api/profil/dry":
-                    return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
-                return self._send(404, "not found", "text/plain")
-            except BrokenPipeError:
-                return None
-            except (profil.ProfilError, ValueError) as e:
-                return self._json({"ok": False, "error": str(e)}, 400)
-            except Exception as e:
-                return self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except ValueError:
+                return self._json({"ok": False, "error": "Körper ist kein JSON"}, 400)
+            if not isinstance(body, dict):
+                return self._json({"ok": False, "error": "Körper muss ein JSON-Objekt sein"}, 400)
+            ed = app.profil
+            if path == "/api/profil/load":
+                return self._json(ed.load(str(body.get("kind", "")), str(body.get("name", ""))))
+            if path == "/api/profil/edit":
+                return self._json(ed.edit(body.get("doc"), body.get("edits") or []))
+            if path == "/api/profil/save":
+                return self._json(ed.save(body.get("doc"), str(body.get("name", ""))))
+            if path == "/api/profil/delete":
+                return self._json(ed.delete(str(body.get("name", ""))))
+            if path == "/api/profil/export":
+                return self._json(ed.export_env(body.get("doc")))
+            if path == "/api/profil/dry":
+                return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
+            return self._send(404, "not found", "text/plain")
 
         def do_GET(self):
             path = self.path.split("?", 1)[0]
@@ -646,6 +645,13 @@ def make_handler(app: App):
                             raise ValueError("q= muss JSON sein: {profile, cards:[{card, pcie:{gen,lanes,rebar,chipset}}], host_patched}")
                         return self._json(app.kartenplaner.plan(req))
                     return self._send(404, "not found", "text/plain")
+                if path == "/api/modellprofil/modelle":
+                    # welche Modellverzeichnisse unter den Wurzeln liegen (nur stat); wie das Schätzen nur im LAN und nicht im Release
+                    if app.edition == "release":
+                        return self._send(404, "not found", "text/plain")
+                    if self._via_proxy():
+                        return self._json({"ok": False, "error": "Modellprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
+                    return self._json(app.modellprofil.models())
                 if path in DEV_STATIC_FILES and app.edition != "release":
                     name, ctype = DEV_STATIC_FILES[path]
                     with open(os.path.join(STATIC, name), "rb") as fh:
@@ -691,6 +697,37 @@ def make_handler(app: App):
             except Exception as e:
                 return self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
 
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            try:
+                # den Körper zuerst lesen (nie ungelesen schließen: das Ende mit ungelesenen Bytes wird ein TCP-RST, der die Antwort verschluckt)
+                n = max(0, int(self.headers.get("Content-Length") or 0))
+                raw = self.rfile.read(min(n, MAX_POST_DRAIN)) if n > 0 else b""
+                if path == "/api/modellprofil/schaetzen":
+                    # PROFIL-EDITOR S3: Modellpfad -> flliper.model/1.  Liest Dateien des Hosts: nur im LAN, nicht im Release.
+                    if app.edition == "release":
+                        return self._send(404, "not found", "text/plain")
+                    if self._via_proxy():
+                        return self._json({"ok": False, "error": "Modellprofil nur im LAN (http://192.168.0.88:8890/)"}, 403)
+                    if n > MAX_POST_BODY:
+                        raise ValueError("Anfrage zu groß (%d Byte, höchstens %d)" % (n, MAX_POST_BODY))
+                    try:
+                        req = json.loads(raw.decode("utf-8") or "null")
+                    except (ValueError, UnicodeDecodeError):
+                        raise ValueError("Körper muss JSON sein: {path, draft_path?, kv_dtype?, mamba_ssm_dtype?, gguf_file?, registry?}")
+                    return self._json(app.modellprofil.estimate(req))
+                if path.startswith("/api/profil/"):
+                    return self._profil_post(path, n, raw)
+                return self._send(404, "not found", "text/plain")
+            except BrokenPipeError:
+                return None
+            except (ValueError, profil.ProfilError) as e:
+                return self._json({"ok": False, "error": str(e)}, 400)
+            except modellprofil.ModellprofilUnavailable as e:
+                return self._json({"ok": False, "error": str(e)}, 503)
+            except Exception as e:
+                return self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+
     return H
 
 
@@ -722,6 +759,9 @@ def main(argv=None):
     ap.add_argument("--profile-dir", default=profil.DEFAULT_USER_DIR,
                     help="where the Profil editor keeps user profiles (JSON): ONE place for the dashboard and the container entrypoint, "
                          "env FLLIPER_PROFILES_DIR, default /var/lib/flliper/profiles")
+    ap.add_argument("--model-root", action="append", default=[],
+                    help="Verzeichnis, unter dem Modelle liegen dürfen (Modellprofil schätzen; wiederholbar; env RIGDASH_MODEL_ROOTS; "
+                         "Standard: der Modell-Cache des Rigs)")
     ap.add_argument("--release-profile", action="append", default=[],
                     help="profile name offered by the start-line wizard (repeatable; the unit names the release ones)")
     ap.add_argument("--edition", choices=EDITIONS, default=os.environ.get("RIGDASH_EDITION", "rig"),

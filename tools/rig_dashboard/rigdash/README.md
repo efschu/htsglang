@@ -353,3 +353,22 @@ auf 1..6 gewählten Karten (Katalog `kartenplan_catalog.py`, PCIe je Karte: Gen,
   (`overlap_mib` / `hard_over_mib`). Live-NVML-Balken können nicht überlaufen und bleiben unverändert.
 * Ansehen ohne den Dienst: `python3 -m rigdash.kartenplan_preview --port 18890 --tree <baum>/python`, dann `http://127.0.0.1:18890/#t=kartenplan`.
 * Deploy-Vorschlag: `deploy/install_510.sh --check` / `deploy/install_510.sh` (Lead).
+
+
+## Modellprofil schätzen (PROFIL-EDITOR S3, Auftrag 960, Nutzer 03.10.: „button zum modelprofil erstellen und werte aus dem modell am desk schätzen“)
+
+`POST /api/modellprofil/schaetzen` mit `{"path": "<Modellverzeichnis oder .gguf>", "draft_path"?, "kv_dtype"?: "auto|fp8_e4m3",
+"mamba_ssm_dtype"?: "float32|bfloat16", "gguf_file"?, "registry"?: true|"kennung"}` liefert `{ok, profile, registry_fields?, elapsed_s, cached}`;
+`profile` ist `flliper.model/1` (jeder Wert `{v, src}` mit Quelle `config|Index|geschätzt|stat`), `registry_fields` die aus dem Schätzprofil
+abgeleiteten Felder einer `form.ModelProfile`-Zeile.  `GET /api/modellprofil/modelle` listet die Modellverzeichnisse unter den Wurzeln (nur `stat`).
+
+* **Der Schätzer ist nicht hier.**  `sglang/srt/weg2/model_profile.py` (reine Standardbibliothek) wird wie das Gate des Kartenplaners per Dateipfad aus
+  dem Planer-Baum geladen (`MODELLPROFIL_TREE`, sonst `KARTENPLAN_TREE`, sonst die Kandidaten in `kartenplan.TREE_CANDIDATES` und `<repo>/python`).
+  Fehlt die Datei im Baum, antwortet die Route 503 mit dem Namen der Datei.  Der Baum unter `tests/fixtures/modellprofil/` ist eine Kopie von
+  `desk/profil-s3-modell-1003`.
+* **Gelesen wird nur `config.json` und die Kopfzeilen** (8 Byte + JSON je Shard bzw. der GGUF-Kopf), nie ein Gewicht.  Der Pfad muss unter einer
+  Modellwurzel liegen (`--model-root`, wiederholbar, oder `RIGDASH_MODEL_ROOTS`; Standard `/spinning/llm_stuff/club-3090/models-cache`); relative
+  Pfade, `..`, NUL und Symlinks aus der Wurzel hinaus werden mit 400 abgewiesen.  Antworten werden je Pfad und Dateistand (Größe, mtime) gemerkt.
+* **Nur im LAN und nicht im Release:** über den Proxy 403, Edition `release` 404 (die Route liest Dateien des Hosts).  Körper höchstens 64 KiB.
+* `static/modellprofil.js` (`window.ModellProfil`): `liste()`, `schaetzen(path, opts)`, `zeilen(profil)` (Zeilen `{gruppe, label, wert, roh, src, hinweis}`),
+  `tabelle(profil)` (HTML-Baustein, escaped), `bytes(n)`.  Die Oberfläche baut Auftrag 930; dieses Modul zeichnet nichts selbst.

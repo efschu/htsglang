@@ -59,7 +59,7 @@ TREE_CANDIDATES = (
     os.path.abspath(os.path.join(HERE, "..", "..", "..", "python")),
 )
 NEEDED = ("profile_json.py", "refusals.py")
-MAX_BODY = 4 << 20
+MAX_BODY = 1 << 20
 
 
 class ProfilError(ValueError):
