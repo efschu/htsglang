@@ -67,22 +67,19 @@ def _h(code, title, why, source, by):
 
 REGISTER: Tuple[Refusal, ...] = (
     # ------------------------------------------------------------------ Wert-Ablehnungen
-    _v("HW-COUNT", "Kartenzahl passt nicht zum Profil",
-       "Das Profil nennt die Kartenzahl (PROFILE_CARD_COUNT, Topologie P = PPn / D = TPn); der Planer vergleicht eine Zahl mit der "
-       "sichtbaren Zahl. Das ist ein Wert-Urteil über das Profil, kein Fehler der Hardware.",
-       "weg2/card_identity.py order_cards; launcher.order_cards", "launcher",
-       "Der Start läuft mit den sichtbaren Karten. Positions-Vektoren des Profils (Länge = Kartenzahl) passen dann meist nicht; "
-       "die nächste Verweigerung kommt aus dem ersten Vektor mit falscher Länge."),
+    _v("HW-COUNT", "Kartenzahl ist nicht die bewiesene / nicht zum Profil",
+       "Das Profil nennt die Kartenzahl (PROFILE_CARD_COUNT, Topologie P = PPn / D = TPn) bzw. der Planer kennt fuer N nur den Beweisstand "
+       "(topology.plan_topology, blockers); er vergleicht eine Zahl mit der sichtbaren Zahl. Ein Wert-Urteil ueber Zahlen und Beweisstand, "
+       "kein Fehler der Hardware.",
+       "weg2/topology.py plan_topology (HW-COUNT mit Blockern); weg2/card_identity.py order_cards; launcher.topology_check_line, launcher.order_cards", "launcher",
+       "Der Start läuft mit den sichtbaren Karten. Die genannten Blocker (Positions-Vektoren, BAR1-Fenster, PP-Schnitt-Boden, Records) bleiben bestehen; "
+       "die nächste Verweigerung kommt aus dem ersten davon, den der Launcher prüft."),
     _v("HW-UNCALIBRATED", "Karteninventar ist nicht das gemessene",
        "Die Positions-Messwerte des Profils (Budgets, Raten, Rest) gelten für ein anderes Inventar. Der Planer weigert sich, "
        "fremde Messungen zu leihen. Das ist ein Urteil über die Güte der Zahlen, nicht über die Möglichkeit zu starten.",
        "weg2/card_identity.py uncalibrated_message; launcher.inventory_check_line", "launcher",
        "Die Zahlen des Profils werden auf das fremde Inventar angewendet, als wären sie dafür gemessen (Boot-Log trägt FORCED-PAST). "
        "Zu erwarten: Fehlbudgets, im schlechten Fall OOM beim Laden oder Graph-Aufbau."),
-    _v("HW-TOPOLOGY", "Kartenzahl liegt außerhalb der bewiesenen Topologien",
-       "topology.plan_topology kennt nur bewiesene Kartenzahlen (PROVEN_CARD_COUNTS); alles andere ist ein Urteil über den Beweisstand.",
-       "weg2/topology.py plan_topology", "planner-gate",
-       "Der Planer-Aufruf im Dashboard zeigt es an; der Launcher dieser Linie ruft plan_topology noch nicht (S7)."),
     _v("HOST-MEM", "Host-Speicher unter der Schwelle",
        "Eine Schwelle (host_ledger-Preflight, MemAvailable >= 40 GiB) gegen einen gemessenen Wert: Kapazität, kein Fehler.",
        "launcher.host_preflight", "launcher",
@@ -121,6 +118,11 @@ REGISTER: Tuple[Refusal, ...] = (
        "docker/entrypoint.sh (MEMORY)", "entrypoint",
        "Der Start läuft mit weniger freiem Host-Speicher (siehe HOST-MEM)."),
     # ------------------------------------------------------------------ nicht forcebar
+    _h("HW-TOPOLOGY", "Kartenzahl ausserhalb von 2..8: es gibt gar keine Flip-Topologie",
+       "Keine Wert-Ablehnung: topology.plan_topology kennt fuer N ausserhalb [MIN_CARDS, MAX_CARDS_BAR1] keine Topologie (P/D-Form, BAR1-Fenster, "
+       "Pipeline), es gibt nichts, womit weitergestartet werden koennte. Ein N innerhalb des Bereichs, das nur noch nicht bewiesen ist, heisst "
+       "HW-COUNT und ist forcebar.",
+       "weg2/topology.py plan_topology; launcher.topology_check_line", "launcher"),
     _h("HW-ARCH", "Compute-Capability ohne Kernel im Image",
        "Keine Wert-Ablehnung: das Image trägt nur Code für sm_86 und sm_120 (Wheel 86;120a). Eine andere Architektur hat keinen "
        "ausführbaren Kernel, und der Entrypoint verweigert sie schon heute ausdrücklich immer. Force würde einen Absturz im ersten "

@@ -39,6 +39,7 @@ PROFILE_LINE=nf
 PROFILE_STATUS=abgenommen
 PROFILE_CARD_COUNT=3
 PROFILE_REQUIRED_PATHS=("/a b" /c)
+PROFILE_DRAFT_X=${HTSGLANG_DRAFT:-dflt}
 _x=1
 PROFILE_ARGS=(--model /m --p-bs 2 --pp-stage-ratio 29,11,8 --p-hostgap
               "--extra-p=--rank-moe-ratio 183,137,168 --max-running-requests=2"
@@ -48,6 +49,7 @@ export SGLANG_TOP=top
 profile_form_env() {
   _form SGLANG_F1 1
   _form SGLANG_F2 "two words"
+  _form SGLANG_TAGGED "pre-${HTSGLANG_TAG}-post"
 }
 profile_instr_env() {
   _form SGLANG_I1 1
@@ -94,13 +96,36 @@ class SyntheticRoundTrip(unittest.TestCase):
         self.assertEqual(var["PROFILE_REQUIRED_PATHS"]["values"], ["/a b", "/c"])
         self.assertNotIn("_x", var)                                   # only PROFILE_* are facts
         self.assertEqual([e["name"] for e in d["exports"]], ["SGLANG_TOP"])
-        self.assertEqual([(r["name"], r["value"]) for r in d["form"]], [("SGLANG_F1", "1"), ("SGLANG_F2", "two words")])
+        self.assertEqual([(r["name"], r["value"]) for r in d["form"]],
+                         [("SGLANG_F1", "1"), ("SGLANG_F2", "two words"), ("SGLANG_TAGGED", "pre-${HTSGLANG_TAG}-post")])
         self.assertEqual([r["name"] for r in d["instr"]], ["SGLANG_I1"])
         # the INSTRUMENTS=1 variant differs and is carried, not lost
         self.assertIn("instruments1", d)
         flags1 = [e.get("flag") for e in d["instruments1"]["args"]]
         self.assertIn("--p-chunk-policy", flags1)
         self.assertIn({"name": "SGLANG_INSTR_ONLY", "value": "yes"}, d["instruments1"]["exports"])
+
+    def test_runtime_placeholders_survive_the_round_trip(self):
+        """The boot tag is set by the entrypoint BEFORE it sources a profile: frozen at import it would be empty (found by the
+        entrypoint equality test on nf-int4's SGLANG_MOE_COLD_TIER_INSTANCE). It stays an expansion, resolved at run time."""
+        d = PJ.import_env(self.path("base"))
+        text = PJ.render_env(d)
+        self.assertIn("_form SGLANG_TAGGED 'pre-'\"${HTSGLANG_TAG}\"'-post'", text)
+        out = os.path.join(self.dir, "ph.env")
+        with open(out, "w") as fh:
+            fh.write(text)
+        raw = PJ.dump_env(out, "0")
+        self.assertEqual(dict(raw["form"])["SGLANG_TAGGED"], "pre-@@HTSGLANG_TAG@@-post")        # the dump runs with a sentinel
+        env = dict(os.environ, HTSGLANG_TAG="dkr42")
+        got = PJ.subprocess.run(["bash", "-c", 'source "$1"; _form() { echo "$1=$2"; }; profile_form_env', "x", out], capture_output=True, text=True, env=env).stdout
+        self.assertIn("SGLANG_TAGGED=pre-dkr42-post", got)
+        os.unlink(out)
+
+    def test_caller_switches_are_named_not_hidden(self):
+        d = PJ.import_env(self.path("base"))
+        self.assertEqual(d["meta"]["caller_switches"], ["HTSGLANG_DRAFT"])
+        self.assertEqual({v["name"]: v.get("value") for v in d["vars"]}["PROFILE_DRAFT_X"], "dflt")        # baked with its default
+        self.assertEqual(PJ.import_env(self.path("alias"))["meta"]["caller_switches"], ["HTSGLANG_DRAFT"])   # found through source
 
     def test_alias_resolves_its_source_and_redefinition(self):
         d = PJ.import_env(self.path("alias"))

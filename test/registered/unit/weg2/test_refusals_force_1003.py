@@ -64,7 +64,7 @@ class Register(Base):
             self.assertTrue(r.source and r.enforced_by, r.code)
 
     def test_what_the_user_named_is_not_forceable(self):
-        for c in ("HW-ARCH", "KARTE-BELEGT", "SHM-BELEGT", "MODELL-FEHLT", "PORT-BELEGT"):
+        for c in ("HW-ARCH", "HW-TOPOLOGY", "KARTE-BELEGT", "SHM-BELEGT", "MODELL-FEHLT", "PORT-BELEGT"):
             self.assertFalse(R.by_code(c).forcebar, c)
         for c in ("HW-COUNT", "HW-UNCALIBRATED", "D-BUDGET", "P-CARD", "HOST-MEM", "WAKE-CREDIT"):
             self.assertTrue(R.by_code(c).forcebar, c)
@@ -137,13 +137,34 @@ class LauncherWiring(Base):
     def test_hw_count_refused_without_force_passes_with_force(self):
         two = rig()[:2]
         with self.assertRaises(L.Weg2LaunchRefused) as cm:
-            L.order_cards(two)
+            L.order_cards(two, 3)                                  # a caller that needs exactly N (HW-P1a: no count gate by default)
         self.assertIn("HW-COUNT", str(cm.exception))
         R.arm(True)
-        ordered = L.order_cards(two)
+        ordered = L.order_cards(two, 3)
         self.assertEqual(len(ordered), 2)
         self.assertEqual(CI.class_label(ordered[0]), "RTX5090")
         self.assertEqual([x["code"] for x in R.forced_list()], ["HW-COUNT"])
+
+    def test_topology_check_unproven_n_is_a_value_refusal_no_topology_is_not(self):
+        ns = ns_for()
+        two = L.order_cards(rig()[:2])
+        with self.assertRaises(L.Weg2LaunchRefused) as cm:
+            L.topology_check_line(ns, two)
+        self.assertIn("HW-COUNT", str(cm.exception))                # N=2 is inside 2..8, not proven: a value refusal
+        R.arm(True)
+        line = L.topology_check_line(ns, two)
+        self.assertTrue(line.startswith("HW-TOPOLOGY N=2: not proven, started with --force"), line)
+        self.assertEqual([x["code"] for x in R.forced_list()], ["HW-COUNT"])
+        one = L.order_cards(rig()[:1])
+        with self.assertRaises(L.Weg2LaunchRefused) as cm2:           # no flip topology exists for 1 card: --force does not help
+            L.topology_check_line(ns, one)
+        self.assertIn("HW-TOPOLOGY", str(cm2.exception))
+
+    def test_the_reference_rig_topology_line_is_unchanged_under_force(self):
+        line = L.topology_check_line(ns_for(), L.order_cards(rig()))
+        R.arm(True)
+        self.assertEqual(L.topology_check_line(ns_for(), L.order_cards(rig())), line)
+        self.assertEqual(R.forced_list(), [])
 
     def test_hw_uncalibrated_refused_without_force_passes_with_force_and_the_line_says_so(self):
         three_090 = [card(i, "NVIDIA GeForce RTX 3090", 24576, (8, 6)) for i in range(3)]
