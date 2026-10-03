@@ -430,7 +430,7 @@ def test_y8p_arm_race_a_forward_of_the_previous_phase_is_not_taken_for_the_first
     assert r["ts"] == 100.3 and r["ct"] == 8
 
 
-def test_y8s_arm_race_2_the_front_hands_the_flip_begin_to_the_arm_not_the_cleared_attribute():
+def test_y8s_arm_race_2_the_front_hands_the_flip_begin_to_the_arm_not_the_cleared_attribute(caplog):
     """NF y8s 03.10. 09:32:06 (epoch 5, D>P 6.98 s): `flip()` sets `self._flip_t0 = None` before
     it arms the probe, so `resolve_started_after` (044316dd1a) never saw a floor -- the fix was
     dead in the real flip path (its unit tests set the attribute by hand). End to end through
@@ -454,9 +454,13 @@ def test_y8s_arm_race_2_the_front_hands_the_flip_begin_to_the_arm_not_the_cleare
         _beat(bd, "P", pids[2], 31, t_first_ns + 30_000_000)
 
     try:
-        f, sd = _run_dp_flip(arena, on_post)
+        with caplog.at_level("INFO"):
+            f, sd = _run_dp_flip(arena, on_post)
     finally:
         _kill(procs)
+    marks = [r.getMessage() for r in caplog.records if "WEG2-FLIP-PPFWD ARM-RACE resolved" in r.getMessage()]
+    assert len(marks) == 1 and "forward_ct=31" in marks[0]   # the probe's marker line (probe_nf_y8s.py counts it)
+    assert not [r for r in caplog.records if "WEG2-FLIP-PPFWD armed" in r.getMessage()]  # resolved at once, no wait
     ut = [e["data"] for e in _d._of(sd, "flip_user_time")]
     assert len(ut) == 1
     assert (ut[0]["prefill_start_source"], ut[0]["prefill_start_ts"]) == \

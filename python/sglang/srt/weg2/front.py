@@ -7921,6 +7921,14 @@ class Front:
         _t0 = t_flip0 if t_flip0 else getattr(self, "_flip_t0", None)
         if _t0:   # Y8P-PPFWD-ARM-RACE: a P forward that began after flip_begin but before this arm
             probe.resolve_started_after(int(float(_t0) * 1e9))
+            _hit = probe.results.get("first")
+            if _hit and _hit.get("armed_in_forward"):
+                # the marker of a resolved race (probe_nf_y8s.py counts it): P's first forward began
+                # between flip_begin and this arm and was read from the baseline, not waited for
+                logger.info("WEG2-FLIP-PPFWD ARM-RACE resolved epoch=%d group=%s pp_first_pid=%s forward_ct=%s "
+                            "prefill_start_ts=%.3f done_to_forward_ms=%d (Y8P-PPFWD-ARM-RACE: the first forward "
+                            "began before `done`)", probe.epoch, name, _hit.get("pid"), _hit.get("ct"),
+                            _hit["ts"], round((_hit["ts"] - probe.t_done) * 1000.0))
         self.__dict__["_dp_ppfwd"] = probe
         if probe.result is None:
             logger.info("WEG2-FLIP-PPFWD armed epoch=%d group=%s pp_first=%s pp_last=%s baseline_forward_ct=%s",
