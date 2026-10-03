@@ -7,7 +7,7 @@ Two halves:
 1. THE REGRESSION GATE. On the reference rig (nvml0 RTX 3080 20480 MiB sm86,
    nvml1 RTX 5090 32607 MiB sm120, nvml2 RTX 3080 20480 MiB sm86) every
    hardware-dependent launcher decision is IDENTICAL to the base tree
-   3fe878018d: the plan fingerprint
+   bd2e3bc22d (27B y8p, before the port): the plan fingerprint
    (``hw_generic_rig_plan_fingerprint_1002.py``) written on the base tree is
    the golden file this tree must reproduce byte for byte -- card order, CVD,
    W19 residue (both weight sources), DC expectations, the P-cut attention
@@ -40,7 +40,7 @@ from sglang.srt.weg2 import launcher as L
 from sglang.srt.weg2 import xchg_census as XC
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint_base_3fe878018d.json")
+GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint_base_bd2e3bc22d.json")
 MIB = 1 << 20
 
 
@@ -87,7 +87,7 @@ class RegressionGateReferenceRig(unittest.TestCase):
         now = json.loads(json.dumps(FP.fingerprint(), sort_keys=True, default=str))
         self.assertEqual(sorted(now), sorted(golden))
         for key in sorted(golden):
-            self.assertEqual(now[key], golden[key], f"plan fingerprint {key!r} differs from base 3fe878018d")
+            self.assertEqual(now[key], golden[key], f"plan fingerprint {key!r} differs from base bd2e3bc22d")
 
     def test_order_is_the_old_5090_first_then_3080s_by_nvml_index(self):
         o = L.order_cards(rig())

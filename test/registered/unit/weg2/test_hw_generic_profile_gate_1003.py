@@ -1,8 +1,8 @@
-"""HW-GENERIC 1003 (desk item 030-hwgen, NF line e124d8f431): the per-profile
+"""HW-GENERIC 1003 (desk item 030-hwgen, 27B line y8p bd2e3bc22d): the per-profile
 regression gate.
 
 The plan fingerprint golden (fixtures/hw_generic_1002/
-rig_plan_fingerprint_base_e7a70285bd.json) was written on the tree WITHOUT
+rig_plan_fingerprint_base_bd2e3bc22d.json) was written on the tree WITHOUT
 HW-GENERIC. This file pins, for every launcher profile file that is a release
 candidate of the NF line and of the 27B line (docker/profiles_release/*.env
 plus 27b-row-authority-cut43, 27b-nvfp4-dual1i, nf-int4-h6, nf-int4 from
@@ -32,9 +32,9 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from sglang.srt.weg2 import launcher as L
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint_base_e7a70285bd.json")
+GOLDEN = os.path.join(HERE, "fixtures", "hw_generic_1002", "rig_plan_fingerprint_base_bd2e3bc22d.json")
 DOCKER = os.environ.get("HW_GENERIC_DOCKER_DIR", "/spinning/gpu-arb/docker")
-EXTRA = ("27b-row-authority-cut43", "27b-nvfp4-dual1i", "nf-int4-h6", "nf-int4")
+EXTRA = ("27b-row-authority-cut43", "27b-nvfp4-dual1i", "27b-nvfp4-dual1m-psleep", "nf-int4-h6", "nf-int4")
 
 
 def profile_files():

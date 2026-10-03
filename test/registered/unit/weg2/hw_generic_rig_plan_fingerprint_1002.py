@@ -106,7 +106,7 @@ def fingerprint():
         pf["d_awake_rest"] = [list(rest[0]) if rest[0] is not None else None, str(rest[1])]
         try:
             posts = l15_plan.resolve_posts(prof, list(budgets), [None] * len(cards), dict(L15_ENV))
-            pf["l15_posts"] = [[p.card, p.mib, p.src, p.experts_rows_traded] for p in posts]
+            pf["l15_posts"] = [[p.card, p.mib, p.src, getattr(p, "experts_rows_traded", 0)] for p in posts]
         except Exception as exc:  # noqa: BLE001 - recorded, compared like a value
             pf["l15_posts"] = f"{type(exc).__name__}: {exc}"
         ckpt = F.profile_row("qwen27b").formats["int8"].checkpoint

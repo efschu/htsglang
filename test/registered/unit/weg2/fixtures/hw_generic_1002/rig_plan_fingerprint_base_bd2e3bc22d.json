@@ -39,26 +39,7 @@
    "boot dkrnfh91bar1dauer09262249,dkrnfh91bar1dauer09262302,dkrnfh91bar1dauer09270007,dkrnfh91bar1dauer09270103,dkrnfh91dprsavisadoptstcutvsyncodx2bswre2cutz30y2arrwretadhmlefrwfpfopwhctsesrwtswbar1dauer09301740"
   ],
   "driver_carve_min_total_mib": 0,
-  "l15_posts": [
-   [
-    0,
-    0,
-    "OVERRIDE-UNNAMED",
-    0
-   ],
-   [
-    1,
-    7616,
-    "OVERRIDE",
-    0
-   ],
-   [
-    2,
-    1792,
-    "OVERRIDE",
-    0
-   ]
-  ],
+  "l15_posts": "ValueError: resolve_posts: launch line 'nextflash' has no L1.5 (27B-only: 'qwen27b')",
   "pp_cut_stage_model_auto": [
    false,
    "-"
