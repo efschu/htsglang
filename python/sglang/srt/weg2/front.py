@@ -9252,7 +9252,12 @@ class Front:
                                                    max_tokens=_asr.max_tokens_of(payload),
                                                    uncached=remainder)
                           if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
-                          else self._acquire_short_seat(rid, est_prompt, short_refused))
+                          # Q-712 (y8vb DECODE-COLLECT tokens=137934 = sum of est_prompt, the
+                          # real rest 12413): the collect window counts the UNCACHED rest also
+                          # without ARRIVAL-SEAT -- "set <= X goes to D" was dead for every SHORT
+                          # with a large cached prefix (10 of 10 releases route=P)
+                          else self._acquire_short_seat(rid, est_prompt, short_refused,
+                                                        uncached=remainder))
             if seat is not None:
                 if self.x_split:
                     self._note_x_grant(
