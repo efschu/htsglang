@@ -2358,9 +2358,18 @@ def seq_oncard_ipc() -> bool:
 #: ONCE, and only then digested/recorded/posted (deposit) or placement-checked
 #: (collect). The handshake stays one token per unit; the collect still waits
 #: per unit before it issues that unit's copy. Env: the batch closes at
-#: SGLANG_WEG2_SEQ_SYNC_BATCH_MIB (default 64) or at
-#: SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS (default 32) units, whichever first;
+#: SGLANG_WEG2_SEQ_SYNC_BATCH_MIB (default 256) or at
+#: SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS (default 128) units, whichever first;
 #: UNITS=1 restores the per-unit form.
+#:
+#: DEFAULT 256 MiB / 128 units (item 290, 03.10.): the value was proven at the
+#: metal only in the 27B profile (xsn123); NF ran the 64/32 code default and
+#: paid 8869 syncs / 7.4 s copy_sync_ms in D boot 10020634 (~2.3-2.5k syncs at
+#: 256/128). Cost of the value: pinned host ring files only --
+#: ``cards x depth x (4 KiB + RING_SLOTS x batch)`` (NF depth 2: 1.5 -> 6.0 GiB
+#: tmpfs, +4.5 GiB, inside ``flip_ratchet_gib`` / reap_headroom 16.4 GiB,
+#: no reserve); the on-card IPC staging is sized by the TAG (``total_bytes``),
+#: not by the batch, so staging VRAM per lane does not change.
 SEQ_SYNC_BATCH_MIB_ENV = "SGLANG_WEG2_SEQ_SYNC_BATCH_MIB"
 SEQ_SYNC_BATCH_UNITS_ENV = "SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS"
 
@@ -2368,13 +2377,13 @@ SEQ_SYNC_BATCH_UNITS_ENV = "SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS"
 def seq_sync_batch() -> tuple:
     """``(max_bytes, max_units)`` of one sync batch; clamped to sane values."""
     try:
-        mib = float(os.environ.get(SEQ_SYNC_BATCH_MIB_ENV, "64"))
+        mib = float(os.environ.get(SEQ_SYNC_BATCH_MIB_ENV, "256"))
     except ValueError:
-        mib = 64.0
+        mib = 256.0
     try:
-        units = int(os.environ.get(SEQ_SYNC_BATCH_UNITS_ENV, "32"))
+        units = int(os.environ.get(SEQ_SYNC_BATCH_UNITS_ENV, "128"))
     except ValueError:
-        units = 32
+        units = 128
     return int(max(1.0, mib) * (1 << 20)), max(1, min(units, 4096))
 
 
@@ -2705,7 +2714,7 @@ def sequential_digest_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
 # FORM: (1) der Host-Puffer wird erst gemappt, wenn ein Tag wirklich den
 # Host-Weg nimmt (Depositor: IPC verweigert; Collector: der Record u0 traegt
 # kein IPC-Handle); (2) dann als RING aus R Slots a Sync-Batch
-# (``seq_sync_batch()``, 64 MiB) mit Freigabe je Batch -- aber NUR, wenn der
+# (``seq_sync_batch()``, 256 MiB) mit Freigabe je Batch -- aber NUR, wenn der
 # Collector seine Bereitschaft angezeigt hat (Ready-Datei: er steht in
 # seinem Collect, ist resumed und leert ohne weitere Bedingung). Sonst der
 # ganze Tag wie bisher: auf der Diagonale wartet das Resume des Collectors

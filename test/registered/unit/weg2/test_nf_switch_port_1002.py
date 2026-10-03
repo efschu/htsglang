@@ -197,16 +197,18 @@ def test_bar1_canon_order_default(clean, profile, explicit, want):
     assert B.canon_order_on() is want
 
 
-def test_seq_sync_batch_is_not_ported(clean):
-    """MODEL-SPECIFIC (cost): the ring files are 4 KiB + RING_SLOTS x the sync
-    batch, pinned at boot; 256 MiB on NF (depth 2) would add ~4.5 GiB pinned
-    host RAM -- a new reserve. NF keeps 64 MiB / 32 units."""
+@pytest.mark.parametrize("profile", [NF, Q, None])
+def test_seq_sync_batch_default_is_the_proven_value(clean, profile):
+    """Item 290 (03.10.): 256 MiB / 128 units is a CODE default for every
+    form (proven at the 27B metal, xsn123); it used to be 64/32 and NF ran the
+    unproven-for-it value. No registry row states it (a code default, not a
+    profile switch); see test_seq_sync_batch_default_290.py for the cost."""
     from sglang.srt.weg2 import weight_exchange_bounce as WX
 
-    _as(clean, NF)
+    _as(clean, profile)
     clean.delenv(WX.SEQ_SYNC_BATCH_MIB_ENV, raising=False)
     clean.delenv(WX.SEQ_SYNC_BATCH_UNITS_ENV, raising=False)
-    assert WX.seq_sync_batch() == (64 << 20, 32)
+    assert WX.seq_sync_batch() == (256 << 20, 128)
     assert WX.SEQ_SYNC_BATCH_MIB_ENV not in FM.PROFILE_SWITCH_DEFAULTS[NF]
 
 

@@ -151,8 +151,11 @@ class _RingBase(unittest.TestCase):
         xr.unlink_semaphores(self.nonce)
         xr.create_semaphores(self.nonce)
         self._env_before = {k: os.environ.get(k) for k in (
-            bx.SEQ_SYNC_BATCH_MIB_ENV, bx.SEQ_UNIT_DIGEST_ENV)}
+            bx.SEQ_SYNC_BATCH_MIB_ENV, bx.SEQ_SYNC_BATCH_UNITS_ENV,
+            bx.SEQ_UNIT_DIGEST_ENV)}
         os.environ[bx.SEQ_SYNC_BATCH_MIB_ENV] = "1"
+        # item 290: the code default is 128 units now; this file's geometry is 32
+        os.environ[bx.SEQ_SYNC_BATCH_UNITS_ENV] = "32"
         os.environ[bx.SEQ_UNIT_DIGEST_ENV] = "1"
         self._ov = [envs.SGLANG_WEG2_SEQ_LANE_RING_SLOTS.override(self.SLOTS),
                     envs.SGLANG_WEG2_SEQ_LANE_RING_READY_MS.override(3000)]
@@ -315,6 +318,7 @@ def _child_deposit(root, nonce, sizes, slots, conn):
     """Der Depositor als eigener Prozess: eigene Ops, eigene Quelle."""
     try:
         os.environ[bx.SEQ_SYNC_BATCH_MIB_ENV] = "1"
+        os.environ[bx.SEQ_SYNC_BATCH_UNITS_ENV] = "32"
         os.environ[bx.SEQ_UNIT_DIGEST_ENV] = "1"
         os.environ["SGLANG_WEG2_SEQ_LANE_RING_SLOTS"] = str(slots)
         os.environ["SGLANG_WEG2_SEQ_LANE_RING_READY_MS"] = "5000"

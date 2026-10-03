@@ -1532,7 +1532,7 @@ class Envs:
     SGLANG_WEG2_SEQ_LANE_RING_SLOTS = EnvInt(4)
     SGLANG_WEG2_SEQ_LANE_RING_READY_MS = EnvInt(50)
     # H46: the ring files (cards x depth x (4 KiB + RING_SLOTS x sync batch),
-    # 1.5 GiB at 3 x 2 x 256 MiB) are created, populated and cudaHostRegister'ed
+    # 6.0 GiB at 3 x 2 x 4 x 256 MiB since item 290; 1.5 GiB at 64 MiB) are created, populated and cudaHostRegister'ed
     # at boot on a daemon thread, not at the first host-path tag of a flip --
     # x148/x149/x151 paid 5.9-9.7 s per register in the first flip (same
     # bytes: 293-342 ms in x147/x150). False = mapped at first use (H44 form).
