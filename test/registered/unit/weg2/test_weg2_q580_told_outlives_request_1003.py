@@ -227,6 +227,46 @@ def test_the_new_instances_own_told_admits_on_every_rank():
     assert _admit(pp1, req3_1)[0] == 0
 
 
+def test_replay_10031032_no_fork_anchor_weg2_0_18():
+    """Second death, WITHOUT SGLANG_WEG2_FORK_ANCHOR_TOKEN (boot
+    dkr27bnvfp4dual1mpsleepbar1fs10031032, probe step 'load long2'; the log's
+    'weg2-0-1' is rid[:8] -- the #1223 dump names weg2-0-18):
+
+      10:36:33 PP0 intake weg2-0-18 (10585 tokens), its told=0 goes on the wire
+               (P-FORK-CUT TOLD fork=59 src=store) in the SAME pass the front's
+               DUAL P-PAUSE abort lands (CTRL-FWD n_wire=5: 3 AbortReq + told + Admit)
+      followers: told absorbed, abort held (#1180-W), admission visit (witness
+               n=38..41) consumes the told, WAITING-ABORT pop at 10:36:34
+      10:36:35 instance 2 (P-PAUSED requeue); PP0 registers its read (12.3 s)
+      10:36:47 PP0 '#1400 STORE-TOLD WAITED told=0' -> #969 EXTENT (0, 1024):
+               admitted on instance 1's told, its own never published
+      10:36:48 PP1 #791T x4 -> PpRowDeferCapExceeded -> W17.
+    RED on edeb022aee (PP0 admits instance 2), GREEN with Q-580."""
+    rid = "weg2-0-18"
+    pp0, pp1 = _Sched(0), _Sched(1)
+    r0, r1 = _req(10585), _req(10585)
+    r0.rid = r1.rid = rid
+    pp0.waiting_queue, pp1.waiting_queue = [r0], [r1]
+    # PP0's publish of instance 1 (told 0, fork 59) ...
+    pp0._weg2_store_told[rid] = 0
+    pp0._weg2_store_fork[rid] = 59
+    # ... and the P-PAUSE abort in the same pass: PP0 applies it at receipt
+    pp0.abort(rid)
+    # the follower absorbs the told off the same list, then visits it once
+    assert ST._follower_absorb_impl(pp1, [ST.Weg2StoreTold(rid=rid, told=0)]) == []
+    assert _admit(pp1, r1)[0] == 0                     # H91 KEPT took it
+    pp1.abort(rid)                                     # #1180-W pop
+    p_intake.settle_told(pp1, pp1.waiting_queue)
+    # instance 2
+    n0, n1 = _req(10585), _req(10585)
+    n0.rid = n1.rid = rid
+    ST.intake(pp0, n0, lambda g: None)
+    ST.intake(pp1, n1, lambda g: None)
+    pp0.waiting_queue, pp1.waiting_queue = [n0], [n1]
+    assert _admit(pp0, n0)[0] is None, "PP0 admitted instance 2 on instance 1's told (STORE-TOLD WAITED told=0)"
+    assert p_intake.told_pending(pp1, n1) is True     # and the follower waits for the SAME told
+
+
 def test_paced_window_of_the_aborted_request_is_dropped():
     s = _Sched(0)
     s._weg2_told_paced_on = True
