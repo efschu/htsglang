@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import List, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import dual_parallel as _dpar
@@ -265,6 +266,7 @@ class PKvStage:
         self._sync = sync or (lambda: None)
         self.mapped_tokens = 0
         self.cuts = None
+        self.last_grant = None  # Q-920: (monotonic time, tokens added) of the last map_granted
 
     def bytes_for(self, tokens: int) -> int:
         from sglang.srt.weg2.d_seat_vram import kv_mapped_bytes
@@ -323,6 +325,9 @@ class PKvStage:
         rank (the atomic group grant): map, no ledger request. The previous
         commitment of this rank is dropped here -- a grant is always fresh."""
         want = min(self.top, round_up(tokens, self.step))
+        # Q-920 (observability only): the grant's size and time, read by the follower's
+        # NO-ROOM line ('grant_new' = tokens this grant added to the mapping)
+        self.last_grant = (time.monotonic(), max(0, int(want) - int(self.mapped_tokens)))
         # PP0 charged this card for the whole grant; adopt it, then keep only
         # what the mapping needs. The mapping is ONE high-water level: a
         # second grant on the same level is not a second span (metal dual13

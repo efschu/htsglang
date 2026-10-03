@@ -591,8 +591,9 @@ def _room_own(scheduler, req, rid: str, own: int) -> Optional[int]:
             "PF TOLD-ACK NO-ROOM rank pp=%s rid=%s told=%d loadback_rows=%d room=%d (n=%d): "
             "this rank holds the told span on its HOST only and cannot load it back even "
             "with every evictable row freed -- the ack says 0 and PP0 answers told=0 for "
-            "every rank instead of an SF LOADBACK-ROOM residual and #968 after PP0 admitted",
+            "every rank instead of an SF LOADBACK-ROOM residual and #968 after PP0 admitted%s",
             getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(rows), room, n,
+            _noroom_detail(scheduler, rid),
         )
     return 0
 
@@ -663,6 +664,85 @@ def inflight_release_rows(scheduler, req) -> int:
     return rows
 
 
+def _int_or_none(fn) -> Optional[int]:
+    try:
+        v = fn()
+        if isinstance(v, (tuple, list)):
+            v = v[0]
+        return None if v is None else int(v)
+    except Exception:  # noqa: BLE001 - an observation never breaks the ack
+        return None
+
+
+def pool_snapshot(scheduler) -> Dict[str, Any]:
+    """Q-920 (observability, dual P only): what this rank's pool holds right now.
+    ``available`` (allocator free list), ``evictable``, ``protected`` (rows locked
+    by requests and publish pins), ``publish`` (write-through / backup nodes in
+    flight), ``usage`` = 1 - (available + evictable) / total, and the last
+    ``MAPPED-BY-GRANT``: tokens it added and its age. None = not readable."""
+    tree = getattr(scheduler, "tree_cache", None)
+    alloc = getattr(tree, "token_to_kv_pool_allocator", None)
+    avail = _int_or_none(getattr(alloc, "available_size", lambda: None))
+    evictable = _int_or_none(getattr(tree, "evictable_size", lambda: None))
+    protected = _int_or_none(getattr(tree, "protected_size", lambda: None))
+    publish = None
+    try:
+        publish = len(getattr(tree, "ongoing_write_through", None) or ()) + len(
+            getattr(tree, "ongoing_backup", None) or ())
+    except Exception:  # noqa: BLE001
+        publish = None
+    total = getattr(scheduler, "max_total_num_tokens", None)
+    if total is None:
+        total = getattr(alloc, "size", None)
+    usage = None
+    try:
+        if avail is not None and evictable is not None and total:
+            usage = round(1.0 - (avail + evictable) / float(total), 3)
+    except Exception:  # noqa: BLE001
+        usage = None
+    grant_new, grant_age = None, None
+    try:
+        from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+        lg = getattr(_dpk._actor(scheduler), "last_grant", None)
+        if lg:
+            grant_age, grant_new = round(time.monotonic() - float(lg[0]), 2), int(lg[1])
+    except Exception:  # noqa: BLE001
+        pass
+    return {"available": avail, "evictable": evictable, "protected": protected, "publish": publish,
+            "usage": usage, "grant_new": grant_new, "grant_age": grant_age}
+
+
+def _noroom_detail(scheduler, rid: str) -> str:
+    """Q-920: the dual NO-ROOM line's extra terms; "" in the flip form (its line is unchanged)."""
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed():
+        return ""
+    p = pool_snapshot(scheduler)
+    return (" | Q-920 full_rid=%s available=%s evictable=%s protected=%s pending_publish=%s usage=%s "
+            "grant_new=%s grant_age_s=%s" % (str(rid), p["available"], p["evictable"], p["protected"],
+                                              p["publish"], p["usage"], p["grant_new"], p["grant_age"]))
+
+
+NOHOLD_MARK = "PF TOLD-ACK ROOM-NOHOLD"
+
+
+def _room_nohold(scheduler, why: str, rid: str, rows: int, room: int, pending: int) -> None:
+    """Q-920 (dual P only): WHY a NO-ROOM shortfall was not held -- one capped line per refusal
+    (y8z had 0 ROOM-HOLD lines and no way to tell whether the check ran)."""
+    n = _bump(scheduler, "_q920_nohold_n")
+    if not (n <= 32 or n % _LOG_EVERY == 0):
+        return
+    p = pool_snapshot(scheduler)
+    logger.warning(
+        "%s why=%s rid=%s room=%d rows=%d pending=%d usage=%s protected=%s available=%s evictable=%s "
+        "pending_publish=%s rank pp=%s (n=%d)",
+        NOHOLD_MARK, why, str(rid), int(room), int(rows), int(pending), p["usage"], p["protected"],
+        p["available"], p["evictable"], p["publish"], getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), n,
+    )
+
+
 def _room_hold(scheduler, req, rid: str, own: int, rows: int, room: int) -> bool:
     """Q-693 (dual P only): True = hold this ack, the shortfall is a predecessor
     in flight that releases it."""
@@ -671,10 +751,13 @@ def _room_hold(scheduler, req, rid: str, own: int, rows: int, room: int) -> bool
     if not _dpk.armed():
         return False
     if not any(r is req for r in (getattr(scheduler, "waiting_queue", None) or ())):
+        _room_nohold(scheduler, "left_queue", rid, rows, room, 0)
         _room_hold_end(scheduler, rid, "left_queue")
         return False  # aborted / gone here: nothing to hold for
     pending = inflight_release_rows(scheduler, req)
     if pending <= 0 or room + pending < rows:
+        _room_nohold(scheduler, "no_predecessor" if pending <= 0 else "predecessor_too_small",
+                     rid, rows, room, pending)
         _room_hold_end(scheduler, rid, "stable")
         return False
     holds = getattr(scheduler, _ROOM_HOLD_ATTR, None)
@@ -698,6 +781,15 @@ def _room_hold(scheduler, req, rid: str, own: int, rows: int, room: int) -> bool
 def _room_hold_end(scheduler, rid: str, how: str) -> None:
     holds = getattr(scheduler, _ROOM_HOLD_ATTR, None)
     if not holds or rid not in holds:
+        if how == "stable":
+            # Q-920: a 'stable' verdict without a hold used to be silent (y8z: 0 ROOM-HOLD lines)
+            n = _bump(scheduler, "_q920_stable_nohold_n")
+            if n <= 32 or n % _LOG_EVERY == 0:
+                logger.warning(
+                    "%s END rank pp=%s rid=%s how=stable held_s=none (no hold was taken: the shortage "
+                    "was stable at the first look, ack 0) (n=%d)",
+                    ROOM_HOLD_MARK, getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), str(rid), n,
+                )
         return
     t0 = holds.pop(rid)
     logger.warning(
