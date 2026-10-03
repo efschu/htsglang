@@ -69,6 +69,21 @@ THE RULE (PP0 only; switch ``SGLANG_WEG2_P_TWIN_DEFER``, default off):
      ('#TW TWIN-NO-COMMIT', at=intake or at=release -- a provisional promise
      is resolved at the source's first plan, one pass). Switch off: rule 4.
 
+  6. SOURCE GONE (Q-690, DUAL LAYOUT ONLY: ``SGLANG_WEG2_DUAL_LAYOUT=1`` and
+     group P). 27B NVFP4 dual fs10031727 (bc2bd121c0) 17:33:21 PP0: '#TW
+     TWIN-DEFER rid=weg2-0-45 ... sources=['weg2-0-42']'; 17:33:22 0-42 was
+     taken back by the front ('WEG2-INTAKE-STALL gate=seats req_slots_free=0',
+     /abort_request, 'Q-580 TOLD-FORGET ... why=intake_stall') -- neither
+     finished nor in flight on P any more, yet ``pending`` kept counting it,
+     and 0-45 sat until the Frist ('TWIN-RELEASE reason=deadline
+     waited_s=120.00 pending_sources=1' 17:35:21): P idle 100 s, 9 requests
+     queued at the front, ADMISSION-WEDGE. In the dual layout a source that is
+     not finished and no longer in flight (``inflight`` plus the post-wake
+     settle, by identity) has LEFT: it is dropped from the wait; none left ->
+     the twin is released at once as an ordinary request ('#TW TWIN-RELEASE
+     ... reason=source_gone'), the same plain told the Frist would publish.
+     The flip form (no dual layout) is unchanged byte for byte.
+
 RANK AGREEMENT. Nothing new is decided off PP0. A follower already holds
 every request until PP0's told arrives on the request wire (#1400,
 ``declined:weg2_held``) and skips it at admission until then
@@ -110,6 +125,8 @@ VERDICT_DEFERRED = "declined:weg2_twin_deferred"
 REL_PUBLISHED = "published"
 REL_DEADLINE = "deadline"
 REL_NO_GAIN = "no_gain"
+#: Q-690 (dual layout only): every source left P unfinished (abort / requeue)
+REL_SOURCE_GONE = "source_gone"
 
 _ATTR = "_weg2_twin_state"
 _LOG_FIRST = 8
@@ -126,6 +143,16 @@ def _env_on(env=None) -> bool:
     from sglang.srt.weg2.form import prefix_switch_armed
 
     return prefix_switch_armed(ENV, env)
+
+
+def _dual_p_env(env=None) -> bool:
+    """Q-690: the dual layout's P group -- the gate of dual_p_kv_stage
+    (``flush_acks_when_idle``, ``_lend_armed``): SGLANG_WEG2_DUAL_LAYOUT=1 and
+    SGLANG_WEG2_GROUP=P. Read once per scheduler in ``state``."""
+    env = os.environ if env is None else env
+    if str(env.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() != "1":
+        return False
+    return str(env.get("SGLANG_WEG2_GROUP", "")).strip().upper() == "P"
 
 
 def _env_int(name: str, default: int, env=None) -> int:
@@ -191,11 +218,14 @@ class _State:
     recent: Dict[str, Tuple[Any, int, float]] = field(default_factory=dict)
     #: rule 5: promises are asked (twin anchor armed on this process)
     promise: bool = False
+    #: Q-690 rule 6: the dual layout's P group (boot constant)
+    dual: bool = False
     n_defer: int = 0
     n_recent: int = 0
     n_release: int = 0
     n_deadline: int = 0
     n_no_gain: int = 0
+    n_source_gone: int = 0
 
 
 def state(scheduler) -> Optional[_State]:
@@ -214,6 +244,7 @@ def state(scheduler) -> Optional[_State]:
             page=_pos_int(getattr(scheduler, "page_size", 1), 1),
             chunk=_pos_int(getattr(scheduler, "chunked_prefill_size", 0), 0),
             promise=_twin_anchor_armed(),
+            dual=_dual_p_env(),
         )
         logger.warning(
             "#TW P-TWIN-DEFER ARMED rank pp=%s min_tokens=%d wait_s=%g settle_ms=%g "
@@ -311,6 +342,22 @@ def inflight(scheduler) -> List[Any]:
             for r in _batch_reqs(b):
                 add(r)
     return out
+
+
+def _present_ids(scheduler) -> set:
+    """Q-690: identities of every request still on P unfinished -- the
+    in-flight set plus the post-wake settle (#1471; a request parked there
+    comes back through the release, it has not left)."""
+    ids = {id(r) for r in inflight(scheduler)}
+    ids.update(id(r) for r in (getattr(scheduler, "weg2_post_wake_settle", None) or ()))
+    return ids
+
+
+def _gone(src, present: set) -> bool:
+    fin = getattr(src, "finished", None)
+    if callable(fin) and fin():
+        return False
+    return id(src) not in present
 
 
 def _say(n: int) -> bool:
@@ -587,7 +634,8 @@ def tick(scheduler) -> None:
 
 def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
     """Top of a PP0 pass: the held twins whose wait is over, as
-    ``(req, twin)``; ``twin`` False = the Frist fired (ordinary request).
+    ``(req, twin)``; ``twin`` False = the Frist fired (ordinary request),
+    or (Q-690, dual layout only) every source left P unfinished.
     A twin that left the queue is forgotten (the #1400 held map drops it)."""
     st = getattr(scheduler, _ATTR, None)
     if not st:
@@ -596,11 +644,35 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
     if not st.waits:
         return []
     out: List[Tuple[Any, bool]] = []
+    present = None
     for rid in list(st.waits):
         w = st.waits[rid]
         if rid not in queued:
             st.waits.pop(rid, None)
             continue
+        if st.dual:
+            # Q-690 rule 6 (dual layout only): a source neither finished nor
+            # on P any more left (front took it back, abort) -- it publishes
+            # nothing; none left -> release at once as an ordinary request.
+            if present is None:
+                present = _present_ids(scheduler)
+            gone = [s for s in w.sources if _gone(s, present)]
+            if gone:
+                w.sources = [s for s in w.sources if not _gone(s, present)]
+                if not w.sources:
+                    st.waits.pop(rid, None)
+                    st.n_source_gone += 1
+                    if _say(st.n_source_gone):
+                        logger.info(
+                            "#TW TWIN-RELEASE rid=%s reason=%s waited_s=%.2f shared=%d "
+                            "pending_sources=0 gone=%s (n=%d): every source left P "
+                            "unfinished (abort/requeue) -- registered as an ordinary "
+                            "request",
+                            rid[:12], REL_SOURCE_GONE, now - w.since, w.shared,
+                            [_rid(s)[:12] for s in gone], st.n_source_gone,
+                        )
+                    out.append((w.req, False))
+                    continue
         # Rule 4: drop the sources that turned out to bring nothing (their
         # start depth is known now); none left -> no reason to wait.
         _before = list(w.sources)
