@@ -96,8 +96,10 @@ def kv_read_budget_s(env=None) -> float:
 
 def enabled(env=None) -> bool:
     if env is not None:
+        # unset/blank = the code default (ON on the NF line, 110): only an
+        # explicit off value disables, as the EnvBool does.
         raw = str(env.get("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "") or "").strip().lower()
-        return raw in ("1", "true", "yes", "on")
+        return raw not in ("0", "false", "no", "off")
     from sglang.srt.environ import envs
 
     return bool(envs.SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE.get())

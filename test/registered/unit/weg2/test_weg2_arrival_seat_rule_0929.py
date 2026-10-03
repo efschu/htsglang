@@ -133,7 +133,7 @@ def _on(monkeypatch):
 def test_off_is_todays_path_seats_full_goes_to_p(monkeypatch):
     """Switch off: H91c3-3 exactly as before (SEATS-FULL -> BATCH), the rule's
     state is never created."""
-    monkeypatch.delenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", raising=False)
+    monkeypatch.setenv("SGLANG_WEG2_ENABLE_ARRIVAL_SEAT_RULE", "0")
     f = _front(running=["a"], n=1)
     assert asyncio.run(f._acquire_short_seat("new", 385)) is None
     assert f.counters["short_phase_seats_full"] == 1
