@@ -106,9 +106,12 @@ class TestDualReplay(unittest.TestCase):
 
 class TestFlipBootUnchanged(unittest.TestCase):
     """NF y8c (fixtures/y8c_0cf3, a flip boot): segments and the whole timeline are the bytes the base release
-    (e5a274ddb4) produced -- hashes taken from that release."""
-    SEGS = "9eaaf927d628e92bce2c2df113ccc44da7639ef2810f17bd2cf390e76a8b5520"
-    TIMELINE = "bfc16bc2d59372230cbe30323f7457b93b591b62746fe93b9fcd72a14bb96c45"
+    (e5a274ddb4) produced -- hashes taken from that release, EXCEPT the D segments of Auftrag 880 (Nutzer 03.10. "6 token/s
+    prefill in D???"): a D segment whose chunks are all narrower than activity.WIDE_MIN_TOK (admit extends of 25..92 tokens)
+    now has tps None and carries admit_n/admit_tok.  Verified by diff against the base release: 10 of 125 segments changed (all D: 8x tps 1..181 tok/s -> None, e.g. a "1.0 tok/s" one),
+    admit keys added, tps of a segment with a wide chunk 80,9 -> 80,5 (no Dual/co key, no P/dec/flip segment touched).  Hashes below are the 880 state."""
+    SEGS = "9f948f94b6a73319d192e9ed1adb8fd9463441080cc91ff8bcf0366ad8648311"
+    TIMELINE = "4d6d259724aa83d9aaabd985cc168beba64736ccde084d1a2da325a1f63b9b72"
 
     def test_flip_boot_bytes(self):
         r = replay_boot("y8c_0cf3")

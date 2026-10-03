@@ -180,6 +180,23 @@ class TestDAdmitExtends(unittest.TestCase):
         self.assertTrue(any(x["tps"] is None and x["admit_n"] for x in d) or len(d) == len(wide))
 
 
+class TestFlipBootOnlyDSegmentsChange(unittest.TestCase):
+    """NF y8c (a flip boot): only D segments carry the new admit keys / a None rate; P, decode, flip segments stay as they were."""
+
+    def test_only_d_segments_are_touched(self):
+        from rigdash.tests.boot_replay import replay_boot
+        segs = replay_boot("y8c_0cf3")["segs"]
+        self.assertEqual(len(segs), 125)
+        for x in segs:
+            if x["k"] != "D":
+                self.assertNotIn("admit_n", x)
+        adm = [x for x in segs if x.get("admit_n")]
+        self.assertTrue(adm)
+        for x in adm:
+            self.assertEqual(x["k"], "D")
+            self.assertLess(x["admit_tok"] / x["admit_n"], activity.WIDE_MIN_TOK)
+
+
 # ----------------------------------------------------------------------------- A: the page (needs Playwright)
 try:
     from playwright.sync_api import sync_playwright   # noqa: E402

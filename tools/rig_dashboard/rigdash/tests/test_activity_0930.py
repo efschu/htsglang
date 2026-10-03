@@ -127,7 +127,8 @@ class TestInstrument(unittest.TestCase):
         self.assertAlmostEqual(full["last_burst"]["wall_tps"], 4 * CH / 15.5, delta=1.0)
         self.assertAlmostEqual(full["last_burst"]["tps_gpu"], CH / 3.0, delta=1.0)   # slowest rank PP0
         dv = ipcboot.prefill_view(self.m, "D", 60.3)
-        self.assertIsNone(dv["last_burst"]["wall_tps"])   # 1-token re-extend: no rate, not "1 tok/s"
+        self.assertIsNone(dv["last_burst"])               # 1-token re-extend: no rate, not "1 tok/s" (Auftrag 880: counted as admit)
+        self.assertGreaterEqual(dv["admit"]["ring"]["n"], 1)
         dec = ipcboot.decode_view(self.m, "D", {}, 45.3)
         self.assertAlmostEqual(dec["gen_tps"], 200.0, delta=2)
         self.assertAlmostEqual(dec["per_stream"], 100.0, delta=1)

@@ -551,8 +551,9 @@ def timeline_view(m: "activity.Model", live: bool, awake_now, now: float, boot_t
                 # (n, tokens) and the rate is "-" when the segment holds nothing wide
                 wtok = activity.spread(m.dwide, x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
                 ad = activity.admit_in(m.dadmit, x["s"], x["e"])
-                x["tok"], x["tps"] = wtok, (wtok / max(1e-3, x["e"] - x["s"]) if wtok > 0 else None)
-                x["admit_n"], x["admit_tok"] = ad["n"], ad["tok"]
+                x["tps"] = wtok / max(1e-3, x["e"] - x["s"]) if wtok > 0 else None
+                if ad["n"]:
+                    x["admit_n"], x["admit_tok"] = ad["n"], ad["tok"]
         if x.get("co") in src:
             # dual: D's work in the same stretch, by the same token model as its own segments
             ctok = activity.spread(src[x["co"]], x["s"], 1, max(1e-3, x["e"] - x["s"]))[0]
