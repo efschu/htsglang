@@ -21,6 +21,7 @@ SGLANG_WEG2_L15_HOT_SHARE=1.
 from __future__ import annotations
 
 from sglang.srt.weg2.l15_shadow import kv_pool_of as _kvp  # L15-FIX-REFILL-POOL
+from sglang.srt.weg2.l15_tree_cand import ANY_EXTRA_KEY  # L15-EXTRAKEY
 
 import json
 import os
@@ -86,19 +87,23 @@ def hint_ids(hint: dict) -> Optional[list]:
 
 
 def resolve_tree_hint(hint: dict, d0: Optional[dict], token_ids: Sequence[int],
-                      rid: str, log) -> Optional[dict]:
+                      rid: str, log, extra_key=ANY_EXTRA_KEY) -> Optional[dict]:
     """L15-TREE-FRONT, P stage: a ``tree`` hint becomes the ordinary
     ``{prev_rid, n}`` of the held tip the prompt extends, or None (named).
 
     The decision uses data every stage sees (the published descriptor's agreed
     tip spans and the prompt's own ids), so all stages resolve the same tip
-    (or all miss). A hint without the ``tree`` flag passes through unchanged."""
+    (or all miss). A hint without the ``tree`` flag passes through unchanged.
+
+    L15-EXTRAKEY (240): the tip is matched by its extra_key-free match key;
+    ``extra_key`` (admission mode: the live request's) additionally pins the
+    tip's own extra_key, the wake-mode hint (ids only) leaves it open."""
     if not hint.get("tree"):
         return hint
     from sglang.srt.weg2 import l15_tree_cand
 
     spans = (d0 or {}).get("spans", ())
-    got, tips = l15_tree_cand.match_tip(spans, token_ids)
+    got, tips = l15_tree_cand.match_tip(spans, token_ids, extra_key)
     if got is None:
         log("HOT-HANDOVER rid=%s tree-miss tips=%d depths=%s prompt=%d (no held tree tip "
             "is a prefix of the prompt: the store read serves)"
@@ -590,7 +595,8 @@ def admit_for_sched(sched, req, env, log) -> Optional[str]:
         verdict(False)
         return "share: %s" % exc
     _ids = list(getattr(req, "origin_input_ids", ()) or ())
-    hint = resolve_tree_hint(hint, d0, _ids, rid, log)
+    hint = resolve_tree_hint(hint, d0, _ids, rid, log,
+                             extra_key=getattr(req, "extra_key", None))
     if hint is None:
         verdict(False)
         return "tree: no held tip is a prefix of the prompt"
