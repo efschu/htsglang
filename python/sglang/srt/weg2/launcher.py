@@ -19013,7 +19013,7 @@ def d_record_torch_caps(ns, cards: List[Card], budgets_d: Sequence[int], log,
 D_EXTEND_CAP_RATE_RECORD = "D_EXTEND_CAP_PER_ROW_MIB"
 
 
-def _d_extend_cap_rate_env(ns, log, label: str) -> Optional[str]:
+def _d_extend_cap_rate_env(ns, log, label: str, *, capped: bool = True) -> Optional[str]:
     """WEG2-EXTEND-CAP (29.09.): with the record caps armed (the 27B, whose verdict books no
     non-torch term and so never reaches the #145 ledger's EXTEND-STUECKELUNG), the D extend
     chunk must follow the CAP, not only the card: p0-nopin (dkr27browauthorityp0nopinbar1fs09291720)
@@ -19022,7 +19022,9 @@ def _d_extend_cap_rate_env(ns, log, label: str) -> Optional[str]:
     the profile's ``D_EXTEND_CAP_PER_ROW_MIB`` -- the ALLOCATED transient per extend row under the
     cap, a different quantity from Next Flash's uncapped reserved growth -- (extend_trim.width_vote then funds the chunk
     from ``min(card_free, cap - reserved)``); a value named in --env-d wins. A profile without
-    the record: nothing written, no vote."""
+    the record: nothing written, no vote. ``capped=False`` is the Q-694 flip arm
+    (:func:`_d_extend_flip_rate_env`): same record, the vote funds the chunk from
+    ``card_free`` alone (no torch cap), and the line says so."""
     try:
         _rate = [None if v is None else float(v) for v in _pconst(D_EXTEND_CAP_RATE_RECORD, ns.profile)]
     except KeyError:
@@ -19039,11 +19041,43 @@ def _d_extend_cap_rate_env(ns, log, label: str) -> Optional[str]:
         return None
     if not _given:
         ns.env_d = set_group_env(_env_d, "SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB", _rtext)
-    log(f"{D_RANK_SOLVE_MARKER} {label} EXTEND-CAP rows_cap aus min(card_free, torch_cap - reserved): "
+    _what = ("EXTEND-CAP rows_cap aus min(card_free, torch_cap - reserved)" if capped else
+             f"{EXTEND_CAP_FLIP_MARKER} rows_cap aus card_free_post (ohne torch cache cap, Flip-Linie)")
+    log(f"{D_RANK_SOLVE_MARKER} {label} {_what}: "
         f"SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB={_rtext}{' (aus --env-d, Vorrang)' if _given else ''} "
         f"(Rate aus {D_EXTEND_CAP_RATE_RECORD} {_rate}, boots {_rate_src}; D kappt den Extend-Chunk "
         f"auf floor((post - 300) / Rate), MIN ueber TP)")
     return _rtext
+
+
+#: Q-694: the line of the uncapped (flip-layout) arm of the EXTEND-CAP rate
+EXTEND_CAP_FLIP_MARKER = "Q694 EXTEND-CAP-FLIP"
+
+
+def _d_extend_flip_rate_env(ns, log, label: str) -> Optional[str]:
+    """Q-694 (INT8 y8va, 03.10. 18:39:37Z, D-TP0 OOM): the D extend chunk follows the card on
+    the FLIP line too, not only under the P0 torch cache cap.
+
+    rc12g's chunk cap (``extend_trim.width_vote``, a vote in the #794 MIN reduce) is armed by
+    ``SGLANG_WEG2_EXTEND_GROWTH_PER_ROW_MIB``, and the launcher wrote that rate on two paths only:
+    the #145 ledger (Next Flash's ``D_EXTEND_GROWTH_PER_ROW_MIB``; the 27B is dense, its fraction
+    solve is SKIPPED) and the P0 cap branch (:func:`_d_extend_cap_rate_env`, only with
+    ``SGLANG_WEG2_TORCH_CACHE_CAP=1``; the qwen27b registry row has it off). So the 27B INT8 flip
+    boot ran with the trim threshold (``SGLANG_WEG2_EXTEND_TRIM_MIB=1200,0,0``) but no chunk cap:
+    the trim emptied the cache to 529 MiB free and the extend still went 4096 rows deep (prefix
+    70169, weg2-30-101), whose transient on TP0 measures 518-1001 MiB at 4096 rows -> barlink
+    all_reduce ``torch.empty_like`` 20 MiB with 3.44 MiB free. The #656 corridor actuator did not
+    cut it: its config price for 4096 rows is 198 MiB (a third of what TP0 takes).
+
+    Same record as the P0 branch (``D_EXTEND_CAP_PER_ROW_MIB`` 0.3091, the deep-prefix maximum of
+    the ALLOCATED transient per row; 40 boots up to 03.10. measured <= 0.2690 on every extend of
+    >= 2048 rows), so ``rows_cap = floor((card_free_post - 300) / 0.3091)``: 740 rows at the
+    death's 529 MiB. DUAL UNCHANGED: the dual layout (``--dual-layout`` / ``--dual-share``)
+    writes nothing here, byte for byte as before. A profile without the record (Next Flash):
+    nothing written."""
+    if getattr(ns, "dual_layout", False) is True or getattr(ns, "dual_share", False) is True:
+        return None
+    return _d_extend_cap_rate_env(ns, log, label, capped=False)
 
 
 def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
@@ -19148,6 +19182,10 @@ def log_d_rank_vram_solve(ns, cards: List[Card], budgets_d: Sequence[int], log,
             log(f"{D_RANK_SOLVE_MARKER} {label} P0 {_tcc.MARKER} {_tcc.MIB_ENV}={_caps} (verfuegbar "
                 f"minus Korridor-Floor {_floor:.0f} MiB je Rang; der torch-Allokator leert seinen "
                 f"Cache, bevor er die Linie ueberschreitet)")
+    else:
+        # Q-694: without the torch cap the flip line's D extend chunk follows
+        # card_free_post (the rc12g vote); the dual layout writes nothing.
+        _d_extend_flip_rate_env(ns, log, label)
     log(
         "%s VERDIKT %s: %s%s"
         % (
