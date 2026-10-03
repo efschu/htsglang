@@ -14115,8 +14115,8 @@ def d_extend_rate_fill_null(ns, rate: Sequence[Optional[float]]):
     """NF port 1003 (order 980 item 2): ``(rates, fill)`` -- ``rate`` (the profile's
     ``D_EXTEND_GROWTH_PER_ROW_MIB``) with every NULL rank given a start rate DERIVED from the
     profile's own per-rank extend growth (``D_EXTEND_GROWTH_MIB``, ratio to the recorded rank) and
-    from the checkpoint's geometry (``extend_trim.derived_rate_mib``), the larger of the two --
-    no rig constant is copied. ``fill`` is ``None`` when the record has no null rank (the
+    from the checkpoint's geometry (``extend_trim.derived_rate_mib``), and never under the profile's
+    highest recorded (measured) rate -- the largest of the three; no rig constant is written here. ``fill`` is ``None`` when the record has no null rank (the
     unchanged path, byte for byte), else a dict ``{"sources", "ranks", "geometry", "geo_err",
     "record"}`` (``ranks`` = the ranks the run-time measurement is armed on)."""
     from sglang.srt.weg2 import extend_trim as _et
@@ -14159,8 +14159,10 @@ def d_extend_rate_measure_ranks_env(ns, log, label: str, fill: dict, rtext: str)
     log(f"{D_RANK_SOLVE_MARKER} {label} {EXTEND_RATE_MARKER} source=record+derived start={rtext} "
         f"measure={'on' if _ranks and not _given else 'off'} ranks={_ranks or '-'}"
         f"{' (aus --env-d, Vorrang)' if _given else ''} safety={_et.RATE_SAFETY} ({_per_rank}; "
-        f"ratio = Rate des erfassten Rangs x D_EXTEND_GROWTH_MIB[Rang] / D_EXTEND_GROWTH_MIB[erfasster Rang], "
-        f"geometry = {fill['geometry']} aus config.json"
+        f"Start = max(record-floor, ratio, geometry): record-floor = hoechste erfasste Rate des Profils "
+        f"(kein Rang startet unter dem gemessenen Wert), ratio = Rate des erfassten Rangs x "
+        f"D_EXTEND_GROWTH_MIB[Rang] / D_EXTEND_GROWTH_MIB[erfasster Rang], "
+        f"geometry = {fill['geometry']} aus config.json (Q-694b-Formel, auf NF unter dem gemessenen Wert)"
         f"{'' if not fill['geo_err'] else ' (' + fill['geo_err'] + ')'}; je Startrang gilt "
         f"max(Start, gemessen x {_et.RATE_SAFETY}), Ratsche nur nach oben)"
         + (f" -- Rang {','.join(str(i) for i in _unarmed)}: weder Wachstums-Record noch Geometrie, "
