@@ -21,6 +21,7 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-692  dual_handback_defer.* / d_seats.admission_gate exemption / front pause requeue
   Q-693  follower untold waiting abort / PF ACK-ROOM HOLD / PP0 intake stamp / RESUME-OWN-HELD
   Q-695  #791T probe old-instance chunk / old chunk abort store release / #791C new-instance named
+  Q-697  follower waiting abort whose told rode the same PP0 list (weg2.dual_untold_abort)
   Q-696  D live cache yield + regrow hold (D tick without the dual actor) / front INTAKE-STALL
          card WAIT (drain ends as before) and STALL-BYPASS / wedge class P-KV-WAIT (no post skip)
   Q-800  DUAL-SHARE: PP0 chunk cap, share duty, D capture priority, MPS client priority,
@@ -592,6 +593,36 @@ class TestQ693FlipUnchanged:
         assert held is True
         assert f.counters.get("dual_resume_own_held", 0) == 0
         assert getattr(f, "_q693_own_held_rid", None) is None
+
+
+class TestQ697SameListFlipUnchanged:
+    """Q-697 (y9 PP1 22:06:14 weg2-0-63): a told verdict riding the SAME PP0 list as the abort
+    of its waiting request applies the abort at receipt -- dual P followers only. Every wrong
+    gate keeps the #1180-W hold and writes no list record."""
+
+    def test_same_list_told_abort_is_held_as_before(self):
+        from sglang.srt.managers import scheduler as SC
+        from sglang.srt.managers import weg2_told_fallback as FB
+        from sglang.srt.weg2 import dual_untold_abort as DU
+        from sglang.srt.weg2 import p_row_authority
+
+        rid = "weg2-0-63"
+        for env in _q693_wrong_gates():
+            with mock.patch.dict(os.environ, env), \
+                    mock.patch.object(p_row_authority, "applies", lambda s: True):
+                f = SimpleNamespace(ps=SimpleNamespace(pp_rank=1, pp_size=3), chunked_req=None,
+                                    tree_cache=SimpleNamespace(release_aborted_request=lambda r: None),
+                                    _weg2_store_told_armed=True, _weg2_store_told={}, _weg2_store_held={},
+                                    waiting_queue=[SimpleNamespace(rid=rid, req_pool_idx=None,
+                                                                   is_retracted=False)])
+                admit = ST.Weg2StoreAdmit(rid=rid, told=0)
+                setattr(admit, FB.WIRE_FALLBACK, 1)
+                abort = SC.AbortReq(rid=rid)
+                rest = ST.follower_absorb(f, [abort, admit])
+                assert rest == [abort], env
+                assert not hasattr(f, DU.LIST_ATTR), env
+                assert SC.Scheduler._weg2_defer_waiting_abort(f, abort) is True, env
+                assert sorted(f._weg2_pending_waiting_aborts) == [rid], env
 
 
 # ---------------------------------------------------------------------------------- Q-695

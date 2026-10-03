@@ -1983,6 +1983,11 @@ from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed  # noqa: E4
 
 
 def _follower_absorb_pass(scheduler, recv_reqs: List) -> List:
+    # Q-697 (dual P followers only; a no-op elsewhere): which told verdicts ride
+    # this PP0 list together with which aborts (weg2.dual_untold_abort)
+    from sglang.srt.weg2 import dual_untold_abort as _q697
+
+    _q697.note_list(scheduler, recv_reqs)
     rest = _follower_absorb_impl(scheduler, recv_reqs)
     if getattr(scheduler, "_weg2_fb_follower", None) is not None:
         # PF: report terminated reads to PP0, finish the last send; no wait.

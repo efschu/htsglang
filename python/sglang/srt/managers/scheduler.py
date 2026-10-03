@@ -10270,10 +10270,11 @@ class Scheduler(
         if not held:
             return False
         # Q-693 (dual P only): no told of it ever reached this follower, so PP0
-        # had not admitted it -- applied at receipt like PP0 does (y8y PP1 zombie)
+        # had not admitted it -- applied at receipt like PP0 does (y8y PP1 zombie);
+        # Q-697: nor did a told that rode the SAME PP0 list as this abort (y9 PP1)
         from sglang.srt.weg2 import dual_untold_abort as _q693
 
-        if _q693.applies_at_receipt(self, held):
+        if _q693.applies_at_receipt(self, held, recv_req=recv_req):
             return False
         pend = self.__dict__.setdefault("_weg2_pending_waiting_aborts", {})
         for r in held:
