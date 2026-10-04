@@ -358,6 +358,7 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.weg2 import tail_handoff
 from sglang.srt.weg2 import p_intake as _p_intake
+from sglang.srt.weg2.dual_not_named_giveback import give_back_not_named  # Q-1220
 from sglang.srt.mem_cache.common import (
     release_admission_acquired_mamba_slot,
     evict_from_tree_cache,
@@ -17534,6 +17535,13 @@ class Scheduler(
                         # requeue-for-free mechanism this loop already
                         # relies on for a capacity-driven rejection.
                         _note_skip("pp_not_named", req.rid)
+                        # Q-1220 (dual y9d2): the capacity-driven rejection
+                        # gives the COW slot of the match above back (#991
+                        # admission_revert) -- this exit did not, so a dual P
+                        # follower held one mamba slot per queued told request
+                        # that PP0 did not hold. Dual layout only; a no-op
+                        # elsewhere (weg2/dual_not_named_giveback.py).
+                        give_back_not_named(req, self.tree_cache)
                         continue
                     # reconcile_pp_admission_decision's own contract
                     # guarantees told <= this rank's local match, i.e.
