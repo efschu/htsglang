@@ -709,6 +709,54 @@ def _retry_note(rid: str, now: float) -> None:
     _RETRY[rid] = now
 
 
+#: #1640 rid -> True while its LAST evaluated grant was infeasible even with D at zero (PP0-local)
+_INFEASIBLE: dict = {}
+
+
+def _infeasible_skip_armed() -> bool:
+    """SGLANG_WEG2_DUAL_GRANT_INFEASIBLE_SKIP (default off): ``_older_waits`` ignores infeasible heads."""
+    try:
+        from sglang.srt.environ import envs
+
+        return bool(envs.SGLANG_WEG2_DUAL_GRANT_INFEASIBLE_SKIP.get())
+    except Exception:  # noqa: BLE001 -- a bad value never changes the grant path
+        return False
+
+
+def infeasible_cards(stages, covered, level_tokens: int) -> list:
+    """[(card, need, have, P, D)] of every card on which this grant stays short even if D gave back
+    everything it holds there (need > ledger free + D committed). ``need`` is what ``group_grant``
+    asks of that card (the level's bytes less what the ledger already covers for PP0's own mapping).
+    Reads only (ledger peek); any failure answers [] ('feasible'), never an exception into the round."""
+    try:
+        from sglang.srt.weg2.card_kv_ledger import peek
+
+        step = int(stages[0]["step"])
+        top = min(int(s["top"]) for s in stages)
+        k = min(top, round_up(int(level_tokens), step)) // step
+        out = []
+        for i, s in enumerate(stages):
+            need = max(0, int(s["bytes"][k]) - int(covered.get(i, 0)))
+            st = peek(s["ledger"])
+            if st is None:
+                continue
+            have = int(st.free)
+            d = int(st.committed.get("D", 0))
+            if need > have + d:
+                out.append((i, need, have, int(st.committed.get("P", 0)), d))
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _infeasible_line(rid: str, tokens: int, level_tokens: int, cards: list) -> str:
+    """'#1640 GRANT-INFEASIBLE' body: per short card the bytes asked and the pool (free + P + D)."""
+    return "rid=%s tokens=%d level_tokens=%d cards=[%s]: the grant stays short even with D at zero (only a falling level frees it)" % (
+        rid, int(tokens), int(level_tokens),
+        " ".join("%d:need=%d,pool=%d,have=%d,P=%d,D=%d" % (i, need, have + p + d, have, p, d)
+                 for i, need, have, p, d in cards))
+
+
 def _grant_short_detail(stages, covered, level_tokens: int, sum_tokens: int, older: int, hold) -> str:
     """'#1530 GRANT-SHORT' body: per card the bytes this grant asks and what the ledger has free.
     A log line only: any failure returns a short note, never an exception into the round."""
@@ -827,9 +875,20 @@ def pp0_grant(sched, req) -> Optional[int]:
         logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards%s", MARK, rid, lvl, pp,
                     (" after %d waits over %.1f s" % waited) if waited else "")
     else:
+        _lv = min(tokens, int(stages[0]["top"])) if stages else tokens
+        _inf = None
+        if _infeasible_skip_armed():
+            # evaluated on every wait only while the switch is on (a ledger peek per card); otherwise the
+            # marker is computed lazily on the log's backoff curve below
+            _inf = infeasible_cards(stages, {0: own}, _lv)
+            _INFEASIBLE[rid] = bool(_inf)
+
+        def _inf_line():
+            cards = _inf if _inf is not None else infeasible_cards(stages, {0: own}, _lv)
+            return _infeasible_line(rid, tokens, _lv, cards) if cards else None
+
         _log_wait(rid, tokens, lambda: _grant_short_detail(
-            stages, {0: own}, min(tokens, int(stages[0]["top"])) if stages else tokens, tokens,
-            len(older), None))
+            stages, {0: own}, _lv, tokens, len(older), None), infeasible=_inf_line)
     return lvl
 
 
@@ -847,10 +906,11 @@ def _now() -> float:
 
 def _reset_wait_log() -> None:
     _WAITS.clear()
+    _INFEASIBLE.clear()
     _CENSUS.update(next=0.0, iv=1.0, waits=0)
 
 
-def _log_wait(rid: str, tokens: int, detail=None) -> None:
+def _log_wait(rid: str, tokens: int, detail=None, infeasible=None) -> None:
     """At most one line per rid per second, the gap doubling each line, plus
     one census line on the same backoff. A long wait therefore goes quiet, and
     the silence watchdog can see a stall instead of a busy log."""
@@ -869,6 +929,13 @@ def _log_wait(rid: str, tokens: int, detail=None) -> None:
         if detail is not None:                    # #1530 GRANT-SHORT, on the same backoff curve
             try:
                 logger.info("#1530 GRANT-SHORT rid=%s tokens=%d %s", rid, int(tokens), detail())
+            except Exception:  # noqa: BLE001 -- a log line never reaches the round
+                pass
+        if infeasible is not None:                # #1640 GRANT-INFEASIBLE, same backoff curve (pure log)
+            try:
+                _line = infeasible()
+                if _line:
+                    logger.info("#1640 GRANT-INFEASIBLE %s", _line)
             except Exception:  # noqa: BLE001 -- a log line never reaches the round
                 pass
     else:
@@ -894,6 +961,7 @@ def _older_waits(sched, rid: str) -> list:
     held = getattr(sched, "_weg2_store_held", None) or {}
     own = _WAITS.get(rid)
     own_t = own[0] if own is not None else _now()
+    skip_inf = _infeasible_skip_armed()    # #1640: an infeasible head does not hold the younger ones back
     out = []
     for r in held.values():
         if not getattr(r, "_dual_kv_wait", False):
@@ -901,6 +969,8 @@ def _older_waits(sched, rid: str) -> list:
         k = str(getattr(r, "rid", "?"))[:16]
         e = _WAITS.get(k)
         if k != rid and e is not None and e[0] < own_t:
+            if skip_inf and _INFEASIBLE.get(k):
+                continue
             out.append((k, e[0]))
     return out
 
@@ -909,6 +979,7 @@ def _wait_granted(rid: str):
     """Forget ``rid``'s wait; returns (waits, seconds) when it had waited."""
     e = _WAITS.pop(rid, None)
     _RETRY.pop(rid, None)                      # #1530: a granted rid starts a fresh throttle
+    _INFEASIBLE.pop(rid, None)                 # #1640
     if not _WAITS:
         _CENSUS.update(next=0.0, iv=1.0, waits=0)
     return (e[3], _now() - e[0]) if e else None

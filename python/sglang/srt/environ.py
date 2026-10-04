@@ -682,6 +682,14 @@ class Envs:
     # (stop-and-go, Deadman HAENGT 2x ~90 s). With N > 0 a held rid retries at most every N ms
     # unless a card ledger record changed since its last attempt; stage tables are cached by mtime.
     SGLANG_WEG2_DUAL_GRANT_RETRY_MS = EnvInt(0)
+    # #1640 GRANT-INFEASIBLE (deskq/done/1640, E2): a request whose group grant is short on a card even if
+    # D gave back EVERYTHING it holds there (need > ledger free + D committed; card 0 of the 27B dual:
+    # ~3.1 GB pool vs 4.08 GB for level 196608) can only be released by a falling level, never by D.
+    # With the switch on, PP0's ``_older_waits`` does not count such a head, so it no longer blocks the
+    # younger grants after SGLANG_WEG2_DUAL_BYPASS_HEAD_AGE_S (hold=older-head, '0 running' wedge). PP0-local
+    # (no collective, no wall clock in the decision); the head keeps retrying itself. The marker
+    # '#1640 GRANT-INFEASIBLE' is a pure log line and is written with or without the switch. 0 = off (default).
+    SGLANG_WEG2_DUAL_GRANT_INFEASIBLE_SKIP = EnvBool(False)
     # Q-680 DUAL RESUME-STALE-LEDGER (dual y8w fs10031623 16:45:42: two P
     # followers kept 201/302 MB committed for 905 s, the front's RESUME-WAIT
     # held the whole queue): when P is idle (no leg in flight) and the only
