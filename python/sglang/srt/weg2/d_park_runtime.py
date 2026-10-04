@@ -232,8 +232,11 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     settle = list(getattr(sched, "weg2_post_wake_settle", None) or [])
     if settle:
         sched.weg2_post_wake_settle = []
+        from sglang.srt.weg2 import settle_writer as _sw_sc
+
         for req in settle:
             setattr(req, FROM_SETTLE_ATTR, True)
+            _sw_sc.note_fold(req)  # SC (#1210): the settle clock runs over the next wake
     sched.weg2_d_parked = d_seats.order_waiting(list(parked) + list(retracted) + settle + queued)
     _ph("mark")
     # HY: a retained span whose backup the full arena refused takes the
@@ -1102,10 +1105,19 @@ def admission(sched, running_batch):
         avail_tokens=avail,
         resume_book=book,
         decode_first=decode_first_facts(sched, running_batch),
+        seats=_phase_seat_n(sched),  # SB (#1210): replicated from the wake request
     )
     if gate.deferred:
         _note_decode_first(sched, gate)
     return gate if gate.barrier else None
+
+
+def _phase_seat_n(sched):
+    """SB (#1210): this D phase's seat count (``note_wake_seats``), None when
+    the wake carried none -- then no newcomer backfills past the barrier."""
+    seats = getattr(sched, "weg2_d_phase_seats", None)
+    n = getattr(seats, "n", None)
+    return int(n) if isinstance(n, int) and n > 0 else None
 
 
 #: F3: (wake_seq, decode rounds run since that wake) -- the event loop counts
