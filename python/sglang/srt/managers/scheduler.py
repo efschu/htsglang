@@ -350,6 +350,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache.hicache_collective import bounded_wait
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.rank_role import this_rank_is_form_a_worker
 from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.weg2 import tail_handoff
 from sglang.srt.weg2 import p_intake as _p_intake
@@ -12824,6 +12825,26 @@ class Scheduler(
         depths (weg2/front.py ``SpanLRU.retract_lost_anchors``)."""
         probe = getattr(self.tree_cache, "weg2_unbacked_anchors", None)
         if probe is None:
+            return
+        # FORM-A-WORKER (1304, NF y9nf5 04:54:46): a Form A worker holds no
+        # GDN/mamba state (``Mamba Cache ... ssm_state size: 0.00GB`` on
+        # TP1/TP2, 2.06GB on TP0) and no arena: its tree anchors are byteless
+        # bookkeeping whose write-through is refused by construction
+        # (``anchor_only_no_arena`` / ``mamba_pin``). Counted here they were 84
+        # ANCHOR-LOST lines (42 sleeps x TP1+TP2) while TP0, the only rank that
+        # can resume at an anchor, had 0, and each one made the front retract
+        # presence credit (PRESENCE-ANCHOR-LOST, union over ranks). TP0 alone
+        # speaks for the anchors; the rank role is the installed plan, the same
+        # answer on every rank, and the group fence still gathers (an empty
+        # list) from every rank.
+        if this_rank_is_form_a_worker():
+            _n = self.__dict__.get("_weg2_anchor_lost_worker_skips", 0) + 1
+            self._weg2_anchor_lost_worker_skips = _n
+            if _n <= 2:
+                logger.info(
+                    "WEG2-ANCHOR-LOST at=flush skipped on a Form A worker (no mamba state, no arena: "
+                    "TP0's own probe is the group's authority) n=%d", _n,
+                )
             return
         try:
             lost = probe()
