@@ -337,9 +337,17 @@ class TheWiringIsPinnedTest(unittest.TestCase):
         self.assertIn("_attempt_extend_relief", src)
         self.assertLess(
             src.index("_attempt_extend_relief"),
-            src.index("raise RuntimeError"),
+            _raise_at(src),
             "relief after the raise is relief that never runs",
         )
+
+
+def _raise_at(src):
+    # Q-710: the two raise sites are the named RuntimeError subclasses now
+    # (TokenSlotsExhausted / PrefillOutOfMemory); the pin is the same: relief first.
+    import re
+
+    return re.search(r"raise (RuntimeError|TokenSlotsExhausted|PrefillOutOfMemory)\b", src).start()
 
 
 if __name__ == "__main__":
@@ -475,6 +483,6 @@ class EveryPrefillAllocPathHasTheNetTest(unittest.TestCase):
                 src = inspect.getsource(fn)
                 self.assertLess(
                     src.index("_attempt_extend_relief"),
-                    src.index("raise RuntimeError"),
+                    _raise_at(src),
                     "relief after the raise is relief that never runs",
                 )

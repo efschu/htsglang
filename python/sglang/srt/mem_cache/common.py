@@ -585,6 +585,23 @@ def _evict_past_confiscation(tree_cache, allocator, shortfall: int) -> int:
     return delivered
 
 
+class TokenSlotsExhausted(RuntimeError):
+    """The KV token allocator could not hand out ``num_tokens`` after every
+    net (flush, peel, relief) -- the named form of the old bare
+    ``RuntimeError("Out of memory ...")``. A ``RuntimeError`` subclass, so every
+    existing handler still sees what it saw before; the name exists so the one
+    caller that can give a refusal back (``alloc_for_extend`` ->
+    ``PrefillOutOfMemory``) catches THIS and not any ``RuntimeError``."""
+
+
+class PrefillOutOfMemory(RuntimeError):
+    """Q-710 NF 1090: ``alloc_for_extend`` could not allocate the batch's extend
+    tokens ('Prefill out of memory'). Raised AFTER the request slots were
+    allocated and BEFORE a single token slot was written, so the batch can be
+    handed back whole (``weg2.oom_rollback``). Still a ``RuntimeError``: where
+    nobody rolls back, it kills the rank exactly as before."""
+
+
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
@@ -717,7 +734,7 @@ def alloc_token_slots(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        raise TokenSlotsExhausted(error_msg)
 
     # #694: charge this draw against the published floor. Reached only on
     # success, so a failed allocation never inflates the ledger. Without this
@@ -1449,7 +1466,7 @@ def alloc_paged_token_slots_extend(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        raise PrefillOutOfMemory(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
@@ -1588,7 +1605,13 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     if _alloc_page_size(batch) == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        try:
+            out_cache_loc = alloc_token_slots(
+                batch.tree_cache, batch.extend_num_tokens
+            )
+        except TokenSlotsExhausted as e:
+            # Q-710: the same named stop as the paged twin below.
+            raise PrefillOutOfMemory(str(e)) from e
     else:
         # Paged allocation - build last_loc
         # #32575: build the empty-prefix sentinel on-device; torch.tensor([-1],

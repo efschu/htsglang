@@ -4243,6 +4243,17 @@ class Envs:
     # '#1068 RESET JOIN ... detached=prefetch' / '#1068 PARK-READ-DETACH reaped'.
     # 0 = the reset joins as before.
     SGLANG_WEG2_PARK_READ_DETACH = EnvBool(True)
+    # Q-710 / Auftrag 1090 (NF y9nf 10040027 P PP0 00:42:31Z, 'Prefill out of
+    # memory' in prepare_for_extend -> RANK-DEATH, PP1/PP2 followed): on group P
+    # (tp 1, PP leader) a prefill OOM that is raised AFTER admission hands the
+    # whole admitted batch back to the waiting queue instead of killing the
+    # rank (weg2/oom_rollback.py). Marker 'Q-710 OOM-ROLLBACK'. 0 = the OOM
+    # kills the rank as before.
+    SGLANG_WEG2_OOM_ROLLBACK = EnvBool(True)
+    # Q-710: rollbacks of ONE rid before the named stop ('Q-710 OOM-ROLLBACK
+    # EXHAUSTED', the original OOM is raised): a rid that keeps coming back
+    # into a batch that does not fit is an admission defect, not a transient.
+    SGLANG_WEG2_OOM_ROLLBACK_MAX = EnvInt(8)
     # F4b (29.09., z30r3: 194x 'cut_ring_on_worker', 282x 'skipped:group_vote',
     # 0 WEG2-TAIL-SKIP-EXTEND against x178's 36): under the Form A token cut a
     # worker takes the E2 END state of a hand-off -- its owned K/V rows at

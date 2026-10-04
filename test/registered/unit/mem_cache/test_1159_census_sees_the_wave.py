@@ -138,7 +138,9 @@ def _prepare_for_extend_lineno(fn):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "prepare_for_extend"
+            # Q-710: the builder reaches prepare_for_extend through the guarded call
+            and node.func.attr
+            in ("prepare_for_extend", "_weg2_prepare_for_extend_or_hand_back")
         ):
             return node.lineno
     raise AssertionError("no prepare_for_extend() call in the batch builder")

@@ -251,6 +251,7 @@ from sglang.srt.layers.dcp import prefix_lens_check as _prefix_lens_check  # #63
 from sglang.srt.weg2 import short_read as _weg2_short_read  # held short wake reads
 from sglang.srt.weg2 import tail_adopt as _weg2_tail_adopt
 from sglang.srt.weg2 import p_layer_split_runtime as _pls_rt  # --p-layer-split dynamic (None = static)
+from sglang.srt.weg2 import oom_rollback as _oom_rb  # Q-710: prefill OOM hands the batch back
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers import anchor_tails as _anchor_tails
 from sglang.srt.managers.pp_admission_congruence import (
@@ -354,6 +355,7 @@ from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.weg2 import tail_handoff
 from sglang.srt.weg2 import p_intake as _p_intake
 from sglang.srt.mem_cache.common import (
+    PrefillOutOfMemory,
     release_admission_acquired_mamba_slot,
     evict_from_tree_cache,
     maybe_cache_unfinished_req,
@@ -16103,6 +16105,7 @@ class Scheduler(
             )
             self.anchor_tails = _tail_readd.kept
 
+        _oom_chunked_before = self.chunked_req  # Q-710: what a rolled-back pass restores
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             # #1317 C4: THE WINDOW CURSOR IS THIS ROUND, AND THE CURSOR IS THE
@@ -17849,7 +17852,12 @@ class Scheduler(
         new_batch.weg2_twin_bounds = _weg2_twin_anchor.batch_bounds(
             can_run_list, self.waiting_queue, page=self.page_size
         )
-        new_batch.prepare_for_extend()
+        if not self._weg2_prepare_for_extend_or_hand_back(
+            new_batch, can_run_list, adder, _oom_chunked_before
+        ):
+            # Q-710: the batch did not fit and was handed back whole; this pass runs nothing.
+            self._admission_decline_note = "oom_rollback"
+            return None, running_batch
         _wk_t4 = time.perf_counter()
         if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
             self._weg2_gnbp_ms = (
@@ -17936,6 +17944,32 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _weg2_prepare_for_extend_or_hand_back(
+        self, new_batch, can_run_list, adder, chunked_before
+    ) -> bool:
+        """``new_batch.prepare_for_extend()``; True = ready to run.
+
+        Q-710 / Auftrag 1090: a ``PrefillOutOfMemory`` out of the allocation (raised after
+        admission spent rows, locks and slots, before a token slot was written) hands the
+        admitted batch back to the waiting queue instead of killing the rank -- on group P,
+        tp 1, PP leader only (weg2/oom_rollback.py names every refusal; a refused rollback
+        re-raises the original error, which is the old behaviour). False = rolled back.
+        """
+        if not _oom_rb.active():
+            new_batch.prepare_for_extend()
+            return True
+        snap = _oom_rb.take_snapshot(self, can_run_list, chunked_before)
+        try:
+            new_batch.prepare_for_extend()
+        except PrefillOutOfMemory as exc:
+            why = _oom_rb.refusal_reason(self, adder, can_run_list, snap)
+            if why is not None:
+                logger.error("%s REFUSED (%s): the rank takes the OOM as before", _oom_rb.MARK, why)
+                raise
+            _oom_rb.rollback(self, can_run_list, snap, adder, exc)
+            return False
+        return True
 
     def _can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
