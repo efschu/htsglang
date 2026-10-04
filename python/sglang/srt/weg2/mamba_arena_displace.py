@@ -80,7 +80,7 @@ class RidAnchorStats(msgspec.Struct):
 
     def line(self, *, rid: str, cap: int, slots: int) -> str:
         return (
-            f"WEG2 MAMBA-ARENA rid={rid[:12]} written={self.written} "
+            f"WEG2 MAMBA-ARENA rid={rid} written={self.written} "
             f"displaced={self.displaced_share + self.displaced_full}"
             f"(share={self.displaced_share},full={self.displaced_full}) dropped={self.dropped} "
             f"refused={self.refused} held={self.held} deepest={self.deepest} "

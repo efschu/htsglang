@@ -250,8 +250,8 @@ def log_pass(
         len(readd.not_named) if readd is not None else 0,
         len(tails),
         # H42b: 16 chars -- x153b printed `weg2-8-1,weg2-8-1` for rids 11 and 14
-        ",".join(str(getattr(r, "rid", "?"))[:16] for r in minted) or "-",
-        ",".join(str(getattr(r, "rid", "?"))[:16] for r in ended) or "-",
+        ",".join(str(getattr(r, "rid", "?")) for r in minted) or "-",
+        ",".join(str(getattr(r, "rid", "?")) for r in ended) or "-",
     )
 
 

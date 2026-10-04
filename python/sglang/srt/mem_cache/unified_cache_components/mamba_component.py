@@ -895,7 +895,7 @@ class MambaComponent(TreeComponent):
                 "interval=%d -> %s counts=%s (group P: an anchor every ~interval "
                 "tokens + N-1/N; a declined boundary keeps its KV with the request "
                 "until the next anchor step)",
-                n, str(getattr(req, "rid", "?"))[:12], int(cache_len), prompt_len,
+                n, str(getattr(req, "rid", "?")), int(cache_len), prompt_len,
                 last, interval, why or "DECLINED", counts,
             )
         return why is None

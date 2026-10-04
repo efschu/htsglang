@@ -344,7 +344,7 @@ def park_for_capacity(sched, req, d_extent: int, x: int) -> None:
         "attempts=%d -- the store holds the context and D's read of it ended short on its own "
         "capacity: D keeps the stream parked and re-reads it when the arena has room (no P leg, "
         "no attempt, no W50 to the client)",
-        CAPPARK_MARK, str(req.rid)[:24], int(d_extent), int(x), delivered, deliverable,
+        CAPPARK_MARK, str(req.rid), int(d_extent), int(x), delivered, deliverable,
         now - float(getattr(req, CAPPARK_SINCE_ATTR)), capacity_park_bound_s(),
         int(getattr(req, ATTEMPTS_ATTR, 0) or 0))
 
@@ -416,6 +416,6 @@ def keep_on_d(sched, req, d_extent: int, x: int, reason: str = "x_refusal_midstr
         "attempt=%d/%d hold=%s written=%s -- D keeps the stream open and parks the request; P "
         "prefills its %d-token context, D resumes after the flip back (no abort, no bytes to the "
         "client)",
-        str(req.rid)[:24], int(d_extent), int(x), reason, n, n, max_attempts(),
+        str(req.rid), int(d_extent), int(x), reason, n, n, max_attempts(),
         "same" if same else "new", ok if rank0 else "rank>0", len(context_ids(req)))
     return ok

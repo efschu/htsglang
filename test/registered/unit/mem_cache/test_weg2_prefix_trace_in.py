@@ -45,12 +45,12 @@ def _msgs(caplog, marker):
 # -- the switch -------------------------------------------------------------
 
 
-def test_off_by_default_keeps_the_legacy_sampling_and_rid_width(caplog):
+def test_off_by_default_keeps_the_legacy_sampling_rid_always_full(caplog):
     with caplog.at_level(logging.INFO):
         assert pt.on() is False
     assert pt.min_tokens() == 1024
     assert pt.sampled(8, 8, 256) and not pt.sampled(9, 8, 256) and pt.sampled(512, 8, 256)
-    assert pt.rid_text("weg2-14-20") == "weg2-14-"
+    assert pt.rid_text("weg2-14-20") == "weg2-14-20"  # RID-FULL-LOG: never the 8-char prefix
     assert pt.walk_due("weg2-1-1", 0, 10**6) is False
     assert pt.once("x", 1) is False
     armed = _msgs(caplog, "#PT PREFIX-TRACE")
@@ -187,7 +187,7 @@ def test_store_told_rid_and_sampling_follow_the_switch(monkeypatch):
     from sglang.srt.managers import weg2_store_told as st
 
     req = SimpleNamespace(rid="weg2-14-20")
-    assert st.rid8(req) == "weg2-14-" and st._rt("weg2-14-20") == "weg2-14-"
+    assert st.rid8(req) == "weg2-14-20" and st._rt("weg2-14-20") == "weg2-14-20"  # RID-FULL-LOG
     assert st._log_due(8) and not st._log_due(9)
     _arm(monkeypatch)
     assert st.rid8(req) == "weg2-14-20" and st._rt("weg2-14-20") == "weg2-14-20"

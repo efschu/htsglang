@@ -71,7 +71,7 @@ def patched_live(monkeypatch):
 
 def test_snapshot_rows_carry_rid_length_offset_and_tail():
     rows = snapshot_rows([_Req("2ede3499aaaa", [11, 12, 13, 14], 3)])
-    assert rows == [("2ede3499", 4, 3, (12, 13, 14))]
+    assert rows == [("2ede3499aaaa", 4, 3, (12, 13, 14))]  # RID-FULL-LOG: the whole rid, not rid[:8]
 
 
 def test_snapshot_rows_survive_a_request_with_no_output_yet():

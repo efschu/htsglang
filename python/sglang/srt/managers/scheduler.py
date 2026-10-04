@@ -656,7 +656,7 @@ def _hp1_group_retry_due(sched, req) -> bool:
     if callable(_arm):
         _arm(
             req,
-            str(getattr(req, "rid", "?"))[:8],
+            str(getattr(req, "rid", "?")),
             getattr(req, "_prefetch_span_tokens", None),
             True,
             "retry_backoff",
@@ -673,7 +673,7 @@ def _hp1_group_retry_due(sched, req) -> bool:
             "HP1 DEFER-RETRY BACKOFF rid=%s mark=%s pass=%d interval=%d "
             "(skipped=%d): the group-cut read is re-voted on a pass back-off, "
             "not every pass",
-            str(getattr(req, "rid", "?"))[:16],
+            str(getattr(req, "rid", "?")),
             getattr(req, "prefetch_deferred", None),
             n,
             interval,
@@ -818,7 +818,7 @@ def _weg2_fork_match_end(req, match_end: int) -> int:
         logger.info(
             "WEG2 FORK-ANCHOR SPAN n=%d rid=%s store read ends at the fork %d, not %d "
             "(a fork-cut P leg wrote exactly that far; the tail is D's own extend)",
-            n, str(getattr(req, "rid", "?"))[:16], fork, match_end,
+            n, str(getattr(req, "rid", "?")), fork, match_end,
         )
     return fork
 
@@ -996,7 +996,7 @@ def _weg2_store_short_reroute(sched, req, span, site: str, cause: str, detail: s
         "site=%s %s n=%d -- the store read ended short and the remainder "
         "exceeds X: released to the X gate on the delivered prefix, which "
         "re-routes it through P by name (RESUME-VIA-P / W50); not a 503",
-        str(getattr(req, "rid", "?"))[:16], cause,
+        str(getattr(req, "rid", "?")), cause,
         int(getattr(req, "_weg2_store_delivered", 0) or 0),
         -1 if remainder is None else int(remainder),
         _weg2_store_short_tail_x(sched), span, site, detail, n,
@@ -1024,7 +1024,7 @@ def _weg2_store_short_fallback(sched, req, reason: str, span, site: str) -> Opti
     remainder = _weg2_store_short_remainder(req)
     tail = -1 if remainder is None else int(remainder)
     delivered = int(getattr(req, "_weg2_store_delivered", 0) or 0)
-    rid = str(getattr(req, "rid", "?"))[:16]
+    rid = str(getattr(req, "rid", "?"))
     if x > 0 and (remainder is None or remainder > x) and _weg2_windowed_path(sched):
         # W88 CYCLE (29.09.): over X is a RE-ROUTE, not a 503 -- see
         # `_weg2_store_short_reroute`.
@@ -1086,7 +1086,7 @@ def _weg2_store_short_recompute(sched, req, reason: str, span) -> Optional[str]:
     sched._weg2_store_tail_recomputed = n
     # weg2rc2: one parked request printed this line 569 times per rank in 20 s.
     # Per request: the 1st, 2nd, 4th, 8th, ... occurrence (n stays the total).
-    rid = str(getattr(req, "rid", "?"))[:16]
+    rid = str(getattr(req, "rid", "?"))
     per = getattr(sched, "_weg2_store_tail_per_rid", None)
     if per is None or len(per) > 4096:
         per = sched._weg2_store_tail_per_rid = {}
@@ -1162,7 +1162,7 @@ def _weg2_producer_wake_verdict(sched, req) -> str:
     if n <= 8 or n % 64 == 0:
         logger.info("#TK WAKE-REREAD rid=%s span=%d verdict=%s (n=%d): the hold read "
                     "answered zero; one final read of the store at the wake, no park "
-                    "(P computes what the store lacks)", str(rid)[:12], span, verdict, n)
+                    "(P computes what the store lacks)", str(rid), span, verdict, n)
     return "complete"
 
 
@@ -1184,7 +1184,7 @@ def _weg2_settle_writer_action(sched, req) -> str:
             now_state = _sw.observe(req)
         except Exception as exc:  # noqa: BLE001 - unknown = the old poll, never a guess
             logger.info("#1471w SETTLE-WRITER rid=%s n/a (%s: %s) -- 2 s re-read as before",
-                        str(getattr(req, "rid", "?"))[:12], type(exc).__name__, exc)
+                        str(getattr(req, "rid", "?")), type(exc).__name__, exc)
             return "poll"
         req._1471w_t = t
     act, ack = _sw.step(prev, now_state, getattr(req, "_1471w_ack", None))
@@ -1199,7 +1199,7 @@ def _weg2_settle_writer_action(sched, req) -> str:
             "poll": "a writer without a visible ack: the 2 s re-read stays",
         }[act]
         logger.info("#1471w SETTLE-WRITER rid=%s writer=%s prev=%s action=%s -- %s",
-                    str(getattr(req, "rid", "?"))[:12], now_state, prev, act, _what)
+                    str(getattr(req, "rid", "?")), now_state, prev, act, _what)
     return act
 
 
@@ -1215,7 +1215,7 @@ def _weg2_settle_no_writer_line(sched, req, now: float) -> None:
         "hand-off chain, no tail part and none under write: nothing can fill the rest, so the "
         "request goes to admission now (D prefills within X; over X the X gate refuses by name "
         "and the front re-routes via P)",
-        str(getattr(req, "rid", "?"))[:12], "?" if rem is None else rem, x, _sw.route(rem, x),
+        str(getattr(req, "rid", "?")), "?" if rem is None else rem, x, _sw.route(rem, x),
         now - float(getattr(req, "_1471_since", now)), int(getattr(req, "_1456_n", 0) or 0),
     )
 
@@ -1354,7 +1354,7 @@ def _head_vote_len(req) -> int:
                 "#823 HEAD-VOTE ANCHOR rid=%s matched=%d (device %d + host %d) "
                 "anchor_depth=%d vote=%d (n=%d): a device node without a state "
                 "below the host chain counts toward the materializable prefix",
-                str(getattr(req, "rid", "?"))[:16], n,
+                str(getattr(req, "rid", "?")), n,
                 _len_or_zero(getattr(req, "prefix_indices", None)),
                 int(getattr(req, "host_hit_length", 0) or 0), int(anchor), vote, k,
             )
@@ -1512,7 +1512,7 @@ def _weg2_prefetch_span_start(sched, req, matched_len: int) -> int:
         logger.info(
             "FA PREFETCH-FROM-ANCHOR rid=%s matched=%d (device %d + host %d) anchor=%d (n=%d): "
             "the store read starts at the host chain's end, where its last hash is",
-            str(getattr(req, "rid", "?"))[:16], int(matched_len),
+            str(getattr(req, "rid", "?")), int(matched_len),
             _len_or_zero(getattr(req, "prefix_indices", None)),
             int(getattr(req, "host_hit_length", 0) or 0), int(anchor), k,
         )
@@ -1598,7 +1598,7 @@ def _weg2_store_presence(
             "H108 PRESENCE-PROBE rid=%s keys=%s covered=%d span_tokens=%d matched=%d "
             "pages=%d present=%s (n=%d): the #950 verdict this rank carries into the "
             "#580 vote, asked with the keys the fetch reads with",
-            str(getattr(req, "rid", "?"))[:16], src, len(keys) if keys else 0,
+            str(getattr(req, "rid", "?")), src, len(keys) if keys else 0,
             len(tokens), int(matched_len), int(pages or 0), present, n,
         )
     return present
@@ -4491,7 +4491,7 @@ class Scheduler(
                 # took 200 ms -- name the request kind and split dispatch vs the
                 # output send back to the tokenizer.
                 logger.info("#1476 DISPATCH kind=%s rid=%s dispatch_ms=%.0f send_ms=%.0f",
-                            type(recv_req).__name__, str(getattr(recv_req, "rid", "-"))[:12], _d_ms, _s_ms)
+                            type(recv_req).__name__, str(getattr(recv_req, "rid", "-")), _d_ms, _s_ms)
         _t_fw = time.perf_counter()
         self.flush_wrapper.check_pending()
         _fw_ms = (time.perf_counter() - _t_fw) * 1000.0
@@ -6397,7 +6397,7 @@ class Scheduler(
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.info("#1445 DORMANT-HOLD abort: %d held request(s) dropped (rid=%s abort_all=%s), %d still held",
-                    len(gone), rid[:12], abort_all, len(keep))
+                    len(gone), rid, abort_all, len(keep))
         return len(gone)
 
     # ---- H91 Teil B: D seats -- the park and its resume ---------------------
@@ -6612,7 +6612,7 @@ class Scheduler(
             logger.info("#x38 SETTLE-TAIL rid=%s tail=%d tokens <= %d after %d re-read(s) (%s): "
                         "released -- D-NORECOMPUTE sends it through RESUME-VIA-P (no D compute "
                         "after a flip)",
-                        str(req.rid)[:12], _tail, self.WEG2_TAIL_RECOMPUTE_TOKENS,
+                        str(req.rid), _tail, self.WEG2_TAIL_RECOMPUTE_TOKENS,
                         int(getattr(req, "_1456_n", 0) or 0), reason)
             return "complete"
         # TK (#1400 told form, tp_size 1 = no group MIN): a follower re-reads
@@ -6649,7 +6649,7 @@ class Scheduler(
             verdict = self._prefetch_kvcache(req, limit_tokens=int(_told_plan))
         if req._1456_n <= 4 or req._1456_n % 16 == 0:
             logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short; "
-                        "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)
+                        "re-read from the registered extent)", str(req.rid), req._1456_n, reason, verdict)
         if _sw.note_read_verdict(req, verdict, now, tree=self.tree_cache):
             return "budget"  # NW: refused, not issued -- never a read in flight
         return "reissued"
@@ -6687,7 +6687,7 @@ class Scheduler(
         self._1471b_n = n
         if n <= 16 or n % 64 == 0:
             logger.info("#1471b BUDGET-REREAD rid=%s n=%d verdict=%s refused=%s (n_all=%d): the read the "
-                        "host budget refused is re-issued now that it has room", str(req.rid)[:12],
+                        "host budget refused is re-issued now that it has room", str(req.rid),
                         req._1456_n, verdict, refused, n)
         return "budget" if refused else "reissued"
 
@@ -6762,7 +6762,7 @@ class Scheduler(
             try:
                 due.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
             except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
-                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
                 due.append(0)
         _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
@@ -6775,7 +6775,7 @@ class Scheduler(
                 if _refetch(req, now, allow_reissue=True) == "reissued":
                     reissued += 1
             except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
-                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
         return reissued
 
@@ -6807,7 +6807,7 @@ class Scheduler(
             if not getattr(self, "_x36_settle_dormant_said", False):
                 self._x36_settle_dormant_said = True
                 logger.info("#x36 SETTLE dormant: %d parked request(s) kept until the next wake %s",
-                            len(settle), [str(getattr(r, "rid", "?"))[:12] for r in settle])
+                            len(settle), [str(getattr(r, "rid", "?")) for r in settle])
             return 0
         self._x36_settle_dormant_said = False
         # #1471d (weg2xsn239): a parked request stayed "reading" for the whole
@@ -6885,7 +6885,7 @@ class Scheduler(
                 if state == "due":
                     state = "wait"
             except Exception as exc:  # noqa: BLE001
-                logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?")),
                             type(exc).__name__, exc)
                 state = "complete"
             # NW (30.09.): a re-read the budget refused has not spent the writer's ack
@@ -6942,7 +6942,7 @@ class Scheduler(
                     _said.update(_new)
                     logger.warning("WEG2-WAKE-COHORT VOTE-ERROR rids=%s %s: %s -- voted release (0); the "
                                    "group releases the ready members as without the cohort",
-                                   [r[:16] for r in _new], type(_exc).__name__, _exc)
+                                   list(_new), type(_exc).__name__, _exc)
             _v = _gmin(_flags + [_hv])  # #1471e
             _agreed, _cohort_hold = _v[:-1], bool(_v[-1]) and any(_v[:-1])
         else:
@@ -6999,7 +6999,7 @@ class Scheduler(
                 if _s == "no-writer":
                     _weg2_settle_no_writer_line(self, _r, now)
                 logger.info("#1471 SETTLE-RELEASE rid=%s state=%s lapsed=%s held_after_wake_s=%.1f",
-                            str(_r.rid)[:12], _s, _l, now - float(getattr(_r, "_1471_since", now)))
+                            str(_r.rid), _s, _l, now - float(getattr(_r, "_1471_since", now)))
         return len(release)
 
     def _weg2_release_dormant_hold(self) -> int:
@@ -7077,7 +7077,7 @@ class Scheduler(
                     _state = "wait"
             except Exception as exc:  # noqa: BLE001
                 logger.info("#1471 SETTLE rid=%s wake verdict n/a (%s: %s) -- queued as it is",
-                            str(getattr(_r, "rid", "?"))[:12], type(exc).__name__, exc)
+                            str(getattr(_r, "rid", "?")), type(exc).__name__, exc)
                 _state = "complete"
             _states.append(_state)
         try:  # L1 instrument: this wake's cohort, wake -> its last member's first decode
@@ -7098,7 +7098,7 @@ class Scheduler(
             if ok and t and st != "complete":
                 logger.info("#1471 SETTLE-TAIL rid=%s delivered=%s remainder=%s -- released at the "
                             "wake: the short read's remainder fits in X, D prefills it (#1324)",
-                            str(_r.rid)[:12], getattr(_r, "_weg2_store_delivered", None),
+                            str(_r.rid), getattr(_r, "_weg2_store_delivered", None),
                             _weg2_store_short_remainder(_r))
         for _r, ok in zip(list(hold), _agreed):
             if ok:
@@ -7121,7 +7121,7 @@ class Scheduler(
                 _settle = self.weg2_post_wake_settle = []
             _settle.extend(parked)
             logger.info("#1471 SETTLE %d held request(s) parked after the wake (read still short: %s)",
-                        len(parked), [str(r.rid)[:12] for r in parked])
+                        len(parked), [str(r.rid) for r in parked])
         try:  # #1461: back under the strict claim law
             _cc = self.tree_cache.cache_controller
             for _r in released:
@@ -7189,7 +7189,7 @@ class Scheduler(
                     logger.info(
                         "#1474 INTAKE rid=%s tokens=%d total_ms=%.0f prefetch_kvcache_ms=%.0f "
                         "prefetch_from_storage_ms=%.0f presence_probe_ms=%.0f host_alloc_ms=%.0f",
-                        str(getattr(recv_req, "rid", "?"))[:12],
+                        str(getattr(recv_req, "rid", "?")),
                         len(getattr(recv_req, "input_ids", None) or ()), _tot,
                         _pt_read(self, "_1474_prefetch_ms"), _pt_read(_tc, "_1474_pfs_ms"),
                         _pt_read(_cc, "_1474_probe_ms"), _pt_read(_hp, "_1474_alloc_ms"))
@@ -8003,7 +8003,7 @@ class Scheduler(
         logger.error(
             "#915 PREFETCH UNREGISTERED rid=%s phase=%s generation=%d n=%d "
             "verdict=%s -- %s",
-            str(getattr(req, "rid", "?"))[:8],
+            str(getattr(req, "rid", "?")),
             bound_phase(),
             int(current_generation()),
             n,
@@ -8076,7 +8076,7 @@ class Scheduler(
                 "#969AD RETRACT site=%s rank=%s rid=%s fwd_ct=%s prefix_len=%s n=%d",
                 site,
                 getattr(self.ps, "pp_rank", -1),
-                str(getattr(req, "rid", "?"))[:8],
+                str(getattr(req, "rid", "?")),
                 getattr(self, "forward_ct", -1),
                 (
                     0
@@ -8175,7 +8175,7 @@ class Scheduler(
                         "available_before=%d last_host_node=%s host_hit=%s "
                         "prefix_len=%s storage_hit=%s readmit_epoch=%s",
                         _n,
-                        str(getattr(req, "rid", "?"))[:8],
+                        str(getattr(req, "rid", "?")),
                         (
                             _population
                             if _population is not None
@@ -8244,7 +8244,7 @@ class Scheduler(
                 self._1443_held_n = n
                 if n <= 8 or n % 64 == 0:
                     logger.info("#1443 DORMANT-HOLD rid=%s tokens=%d held=%d (prefetch issued during the flip; device load at the wake -- #1455)",
-                                str(req.rid)[:12], len(req.origin_input_ids or []), len(hold))
+                                str(req.rid), len(req.origin_input_ids or []), len(hold))
                 return
             if not is_retracted and self._weg2_d_park_hold_late(req):
                 return  # H91c3-2: arrived after the D park -- held behind it
@@ -8906,7 +8906,7 @@ class Scheduler(
                 logger.info("W88-DORMANT-WAIT rid=%s: standstill (%d passes) is not terminal while "
                             "this group sleeps -- P publishes at retain, in bubbles and at its sleep "
                             "flush; the pass/wall bound starts at the wake (xsn344: 2 of 4 100k "
-                            "requests were answered 503 after 5 s)", str(getattr(req, "rid", "?"))[:16], n)
+                            "requests were answered 503 after 5 s)", str(getattr(req, "rid", "?")), n)
             return "stalled"
         # Boot xsn127 (D, rids baec88b4/f4b94d87): the store read stood still
         # from 20:44:46 on, but the pass counter alone declares death -- and
@@ -8991,7 +8991,7 @@ class Scheduler(
             "no_progress_passes=%d bound_passes=%d witness=%s n=%d %s -- terminal, "
             "answered 503; never admitted over X (denominator: every deferred "
             "store read this exit answered)",
-            code, name, rid[:16], arm, span, site, passes,
+            code, name, rid, arm, span, site, passes,
             self._weg2_prefetch_stall_passes(), terms,
             self._weg2_store_load_failed, cut,
         )
@@ -9012,7 +9012,7 @@ class Scheduler(
             logger.info(
                 "#991 GIVE-BACK rid=%s site=weg2_store_load_terminal -- the COW "
                 "slot this admission's match acquired, returned on the W88 exit",
-                rid[:16],
+                rid,
             )
         try:
             if self.enable_hicache_storage:
@@ -9025,7 +9025,7 @@ class Scheduler(
             # than passed, so it is a finding and not a silence.
             logger.warning(
                 "W88 rid=%s: releasing the aborted store read raised; the "
-                "client is answered anyway", rid[:16], exc_info=True,
+                "client is answered anyway", rid, exc_info=True,
             )
         abort_req = AbortReq(
             finished_reason={
@@ -9039,7 +9039,7 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
         except Exception:
             # Tracing may never eat the answer.
-            logger.debug("W88 rid=%s: trace abort raised", rid[:16], exc_info=True)
+            logger.debug("W88 rid=%s: trace abort raised", rid, exc_info=True)
         self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
         return "failed"
 
@@ -9065,7 +9065,7 @@ class Scheduler(
             pass
         if gone:
             logger.info("#x36 FORGET-HELD rid=%s site=%s removed_from=%s",
-                        str(rid)[:12], site, ",".join(gone))
+                        str(rid), site, ",".join(gone))
 
     def _apply_prefetch_deferral(self, req, verdict: str, site: str) -> Optional[str]:
         """Route one prefetch verdict through the A12.2 deferral state machine.
@@ -9079,7 +9079,7 @@ class Scheduler(
             note_prefetch_gate as _note_prefetch_gate,
         )
 
-        rid = str(getattr(req, "rid", "?"))[:8]
+        rid = str(getattr(req, "rid", "?"))
         marked = getattr(req, "prefetch_deferred", None) is not None
         span = getattr(req, "_prefetch_span_tokens", None)
         if verdict == _VERDICT_TRUNCATED_GROUP:
@@ -9529,7 +9529,7 @@ class Scheduler(
             note_prefetch_gate as _note_prefetch_gate,
         )
 
-        rid = str(getattr(req, "rid", "?"))[:8]
+        rid = str(getattr(req, "rid", "?"))
         passes = int(getattr(req, "prefetch_defer_passes", 0) or 0)
         since = getattr(req, "prefetch_defer_since", None)
         waited = time.monotonic() - float(since) if since is not None else 0.0
@@ -9558,7 +9558,7 @@ class Scheduler(
         cleared: List[str] = []
         for req in population:
             if self._clear_prefetch_deferral_fields(req):
-                cleared.append(str(getattr(req, "rid", "?"))[:8])
+                cleared.append(str(getattr(req, "rid", "?")))
         if cleared:
             from sglang.srt.mem_cache.match_refusal_census import (
                 note_prefetch_gate as _note_prefetch_gate,
@@ -10042,7 +10042,7 @@ class Scheduler(
             release_kv_cache(req, self.tree_cache, is_insert=True)
         except Exception:  # noqa: BLE001 -- a failed park must not kill the rank
             logger.warning("WEG2-PARK rid=%s: release raised, keeping the in-place park",
-                           rid[:16], exc_info=True)
+                           rid, exc_info=True)
             return
         req.weg2_pool_parked = False
         req.weg2_parked_span = max(1, span)
@@ -10055,7 +10055,7 @@ class Scheduler(
             "WEG2-PARK n=%d rid=%s span=%d of %d: rows given back to the tree "
             "(evictable), request back at the head of the queue; resume by "
             "prefix match / load_back, admitted whole",
-            n, rid[:16], span, len(getattr(req, "origin_input_ids", ()) or ()),
+            n, rid, span, len(getattr(req, "origin_input_ids", ()) or ()),
         )
 
     def process_pending_chunked_abort(self) -> None:
@@ -10966,7 +10966,7 @@ class Scheduler(
                         "contributed ABSENT, which delays it rather than "
                         "publishing a 0 the X gate would read as an opinion "
                         "(occurrence=%d)",
-                        str(rid)[:16], exc, self._head_vote_unpriced,
+                        str(rid), exc, self._head_vote_unpriced,
                     )
                 continue
             matches[rid] = _head_vote_len(req)
@@ -12189,7 +12189,7 @@ class Scheduler(
                             int(running_batch.batch_size()),
                             getattr(self, "chunked_req", None) is not None,
                             ",".join(
-                                str(getattr(r, "rid", "?"))[:8]
+                                str(getattr(r, "rid", "?"))
                                 for r in list(getattr(running_batch, "reqs", []) or [])[:4]
                             ),
                         )
@@ -13417,7 +13417,7 @@ class Scheduler(
                     "it voted; the verdict is priced on the group term alone "
                     "and is therefore unaffected -- no rank-local quantity "
                     "enters it)",
-                    str(getattr(req, "rid", "?"))[:16], local_match, gm,
+                    str(getattr(req, "rid", "?")), local_match, gm,
                     self._weg2_x_term_priced, n,
                 )
         self._weg2_x_term_priced = getattr(self, "_weg2_x_term_priced", 0) + 1
@@ -13476,7 +13476,7 @@ class Scheduler(
                     "content key and anchor-capped; the remainder is bounded by "
                     "one chunk under the #939 law. Denominator: every X pricing "
                     "in which the store arm credited more than the tree arm)",
-                    str(getattr(req, "rid", "?"))[:16], gm, int(gsm),
+                    str(getattr(req, "rid", "?")), gm, int(gsm),
                     int(gsm) - gm, total, max(0, total - gm),
                     max(0, total - priced_match), n,
                 )
@@ -13496,7 +13496,7 @@ class Scheduler(
                 logger.info(
                     "#1424d X-PRICE-FLOOR rid=%s head=%d floor=%d uncached=%d n=%d (the group "
                     "admits the usable floor, so the extent is priced from it)",
-                    str(getattr(req, "rid", "?"))[:16], priced_match, floor,
+                    str(getattr(req, "rid", "?")), priced_match, floor,
                     max(0, total - floor), n,
                 )
             priced_match = floor
@@ -13518,7 +13518,7 @@ class Scheduler(
                     "H98x X-FLOOR-CREDIT rid=%s head=%d store=%s floor=%d total=%d "
                     "uncached=%d n=%d (Form A: the group admits the usable floor; "
                     "the head arm is a worker's mamba-refused walk, not a depth)",
-                    str(getattr(req, "rid", "?"))[:16], gm,
+                    str(getattr(req, "rid", "?")), gm,
                     "-" if gsm is None else int(gsm), floor, total,
                     max(0, total - floor), n,
                 )
@@ -14009,7 +14009,7 @@ class Scheduler(
                     "re-issue; pricing it now is the uncached=whole-prompt W31 "
                     "of boot weg2sc3. Denominator: every pass in which any "
                     "request was found pending)",
-                    str(getattr(req, "rid", "?"))[:16], _defer_reason,
+                    str(getattr(req, "rid", "?")), _defer_reason,
                     pending_ms / 1000.0, bound_s, n,
                 )
             return True
@@ -14019,7 +14019,7 @@ class Scheduler(
             "group's youngest store-read timer outlived the span's own "
             "length-priced bound, so the request is priced as it stands and W31 "
             "may fire honestly)",
-            str(getattr(req, "rid", "?"))[:16], _defer_reason,
+            str(getattr(req, "rid", "?")), _defer_reason,
             pending_ms / 1000.0, bound_s, n,
         )
         return False
@@ -14054,7 +14054,7 @@ class Scheduler(
                 logger.info(
                     "WEG2 X-GATE rid=%s uncached=? X=%d replicated_term=False "
                     "verdict=abstain_no_group_match occurrence=%d",
-                    str(getattr(req, "rid", "?"))[:16], x, self._weg2_x_abstained,
+                    str(getattr(req, "rid", "?")), x, self._weg2_x_abstained,
                 )
             return False
         uncached = self.weg2_uncached_extent(req, head_inputs)
@@ -14104,7 +14104,7 @@ class Scheduler(
         verdict = "W31" if uncached > x else "admit"
         logger.info(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
-            str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
+            str(getattr(req, "rid", "?")), uncached, x, term, verdict,
         )
         if verdict == "admit":
             _weg2_rvp.clear_capacity_park(req)  # #248h: its re-read landed
@@ -14124,7 +14124,7 @@ class Scheduler(
                 "uncached=%d my_vote=%s my_raw=%s why=%s (W31: the group priced "
                 "total - min(max(head, store), floor); this rank's usable vote "
                 "entered that floor's MIN)",
-                str(getattr(req, "rid", "?"))[:16], _t[0], _t[1], _t[2], _t[3],
+                str(getattr(req, "rid", "?")), _t[0], _t[1], _t[2], _t[3],
                 uncached,
                 None if _v is None else _v[1], None if _v is None else _v[0],
                 None if _v is None else _v[2],
@@ -14339,7 +14339,7 @@ class Scheduler(
                 self._x36_dormant_batch_said = True
                 logger.info("#x36 DORMANT: no prefill batch for %d queued request(s) while the pools are paused %s",
                             len(self.waiting_queue),
-                            [str(getattr(r, "rid", "?"))[:12] for r in self.waiting_queue[:4]])
+                            [str(getattr(r, "rid", "?")) for r in self.waiting_queue[:4]])
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         self._x36_dormant_batch_said = False
         prefill_delayer_single_pass = None
@@ -15041,7 +15041,7 @@ class Scheduler(
                             "the drain collected it here instead of never. "
                             "collected=%d ongoing_after=%d (denominator: "
                             "every open prefetch record of this rank)",
-                            str(_rid)[:8],
+                            str(_rid),
                             _n,
                             len(_ongoing),
                         )
@@ -15180,7 +15180,7 @@ class Scheduler(
                 "the X gate price the shortfall as tokens D must prefill. "
                 "Denominator: every terminated store read of this rank whose "
                 "record reports a page-floored shortfall",
-                rid[:16], delivered, deliverable, deliverable - delivered, n,
+                rid, delivered, deliverable, deliverable - delivered, n,
             )
         return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
 
@@ -15398,7 +15398,7 @@ class Scheduler(
                             "is refused on this boot; this is the quantity "
                             "the #968 fix-form fork turns on.",
                             _o,
-                            str(rid)[:8],
+                            str(rid),
                             told,
                             local_prefix,
                             told - local_prefix,
@@ -16428,7 +16428,7 @@ class Scheduler(
                 self._admission_decline_note = (
                     "loop_skips("
                     + ",".join(
-                        f"{k}={v}(first={_skip_first_rid[k][:16]})"
+                        f"{k}={v}(first={_skip_first_rid[k]})"
                         for k, v in sorted(_skips.items())
                     )
                     + ")"
@@ -16921,7 +16921,7 @@ class Scheduler(
                 _irl = getattr(self, "_weg2_gnbp_initr", None)
                 if _irl is None:
                     _irl = self._weg2_gnbp_initr = []
-                _irl.append((str(getattr(req, "rid", "?"))[:10], (time.perf_counter() - _ir_t0) * 1000.0))
+                _irl.append((str(getattr(req, "rid", "?")), (time.perf_counter() - _ir_t0) * 1000.0))
 
             # WEG2_SCHEDULING_SPEC_0907 C11/W31 -- LAW 4, ENFORCED WHERE THE
             # UNCACHED EXTENT IS REAL.
@@ -17155,7 +17155,7 @@ class Scheduler(
                                 "deleted. Applying it here would move this "
                                 "rank's prefix alone and manufacture the "
                                 "rank split. occurrence=%d",
-                                str(getattr(req, "rid", "?"))[:8],
+                                str(getattr(req, "rid", "?")),
                                 told,
                                 _n,
                             )
@@ -17252,7 +17252,7 @@ class Scheduler(
                                 "admission visit on a carrierless form that "
                                 "arrived carrying a nonzero extent; visits with "
                                 "no extent are not counted and are not events)",
-                                str(getattr(req, "rid", "?"))[:8],
+                                str(getattr(req, "rid", "?")),
                                 _dropped,
                                 len(req.prefix_indices),
                                 int(self.ps.pp_rank),
@@ -17307,7 +17307,7 @@ class Scheduler(
                     _arl = getattr(self, "_weg2_gnbp_addreq", None)
                     if _arl is None:
                         _arl = self._weg2_gnbp_addreq = []
-                    _arl.append((str(getattr(req, "rid", "?"))[:10], (time.perf_counter() - _ar_t0) * 1000.0,
+                    _arl.append((str(getattr(req, "rid", "?")), (time.perf_counter() - _ar_t0) * 1000.0,
                                  int(getattr(req, "host_hit_length", 0) or 0)))
             except PPScheduleRefused as exc:
                 # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
@@ -17574,7 +17574,7 @@ class Scheduler(
                 self._admission_decline_note = (
                     "loop_skips("
                     + ",".join(
-                        f"{k}={v}(first={_skip_first_rid[k][:16]})"
+                        f"{k}={v}(first={_skip_first_rid[k]})"
                         for k, v in sorted(_skips.items())
                     )
                     + ")"
@@ -17590,7 +17590,7 @@ class Scheduler(
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         self._admission_partial_note = "admitted=%d left=%d %s" % (
             len(can_run_list), len(self.waiting_queue),
-            ",".join(f"{k}={v}(first={_skip_first_rid[k][:16]})" for k, v in sorted(_skips.items()))
+            ",".join(f"{k}={v}(first={_skip_first_rid[k]})" for k, v in sorted(_skips.items()))
             if _skips else "no_skip",
         )
         _p_intake.settle_told(self, self.waiting_queue)  # H91a: admitted/aborted verdicts go
@@ -20243,7 +20243,7 @@ class Scheduler(
             if _n <= 8 or _n % 64 == 0:
                 logger.info("WEG2-QUIESCE-PARKED-PREFETCH rids=%s n=%d: store reads of D's park list "
                             "are not a quiesce term (held by the sleep, re-read at the wake; the "
-                            "release reset joins them)", sorted(r[:12] for r in _pk), _n)
+                            "release reset joins them)", sorted(_pk), _n)
 
         pp_size = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1)
         pp_rank = int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0)
@@ -20412,7 +20412,7 @@ class Scheduler(
                 _open = [r for r in list(tc.ongoing_prefetch) if str(r) not in exempt_prefetch]
                 _check(
                     f"hicache_prefetch({len(_open)}: "
-                    f"{','.join(str(r)[:8] for r in _open[:4])})",
+                    f"{','.join(str(r) for r in _open[:4])})",
                     len(_open) == 0,
                 )
                 _check(
@@ -21679,7 +21679,7 @@ class Scheduler(
             if _cs is not None:
                 logger.error(
                     "WEG2-INTAKE-STALL-CENSUS rid=%s pool_avail=%d %s",
-                    str(req.rid)[:16],
+                    str(req.rid),
                     int(self.token_to_kv_pool_allocator.available_size()),
                     _cs(),
                 )
@@ -21694,7 +21694,7 @@ class Scheduler(
                 self.tree_cache.terminate_prefetch(req.rid)
         except Exception:  # noqa: BLE001 -- the answer must go out regardless
             logger.warning("WEG2-INTAKE-STALL rid=%s: releasing the store read raised",
-                           str(req.rid)[:16], exc_info=True)
+                           str(req.rid), exc_info=True)
         abort_req = AbortReq(
             finished_reason={
                 "type": "abort",

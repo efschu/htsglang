@@ -58,7 +58,7 @@ def probe(site: str, batch, **extra) -> None:
         fields = {
             "mode": getattr(getattr(batch, "forward_mode", None), "name", "?"),
             "reqs": (len(reqs) if reqs is not None else "None"),
-            "rids": ",".join(str(getattr(r, "rid", "?"))[:10] for r in (reqs or [])[:4]),
+            "rids": ",".join(str(getattr(r, "rid", "?")) for r in (reqs or [])[:4]),
             "req_pool_indices": _rows(getattr(batch, "req_pool_indices", None)),
             "seq_lens": _rows(getattr(batch, "seq_lens", None)),
             "spec": type(spec).__name__ if spec is not None else "None",

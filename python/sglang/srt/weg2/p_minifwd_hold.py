@@ -190,7 +190,7 @@ def log_hold(owner_rid: str, verdict: Verdict, outcome: str, rid: Optional[str],
             "bound_ms=%.1f (measured lone rest, n_mini=%d) waiters=%d told=%d timeout=%d "
             "waited_ms_sum=%.0f: the rest runs in the waiter's chunk 0 when its told lands "
             "in this pass",
-            n, str(owner_rid)[:24], verdict.rest, outcome, rid, waited_s * 1000.0,
+            n, str(owner_rid), verdict.rest, outcome, rid, waited_s * 1000.0,
             bound_s * 1000.0, _STATE["n_mini"], len(verdict.rids), _STATE["told"],
             _STATE["timeout"], _STATE["waited_ms"],
         )

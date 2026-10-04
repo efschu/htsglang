@@ -394,7 +394,7 @@ def pp0_retract_due(scheduler, queued, parked) -> List[Tuple[str, int, int]]:
                     "PF TOLD-RETRACT TOO LATE rid=%s told=%d follower_reach=%d (n=%d): PP0 "
                     "seated this rid already -- no rank-uniform answer is possible any more, "
                     "nothing is put on the wire; the follower's hold stays and the #1233 W27 "
-                    "guard names the split", rid[:8], told, own, n,
+                    "guard names the split", rid, told, own, n,
                 )
     for rid in list(admitted):
         if rid not in queued and rid not in parked:
@@ -423,7 +423,7 @@ def pp0_retract_applied(scheduler, rid: str, told: int, own: int) -> None:
             "PF TOLD-RETRACT rid=%s told=%d -> 0 follower_reach=%d (n=%d): a follower's tree "
             "stayed short of the admitted told after the Admit and PP0 had not seated the "
             "rid yet -- PP0 switches it to told=0 for EVERY rank on the Admit channel "
-            "(fallback marker); P recomputes the prefix", rid[:8], told, own, n,
+            "(fallback marker); P recomputes the prefix", rid, told, own, n,
         )
 
 
@@ -452,7 +452,7 @@ def pp0_harvest(scheduler) -> int:
                 if _say(k):
                     logger.warning(
                         "PF TOLD-ACK LATE rank=%s rid=%s own=%s (n=%d): PP0 decided this "
-                        "rid already -- the ack changes nothing", ack.rank, str(rid)[:8], own, k,
+                        "rid already -- the ack changes nothing", ack.rank, str(rid), own, k,
                     )
                 continue
             o.acks[int(ack.rank)] = int(own)
@@ -492,7 +492,7 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
             logger.info(
                 "PF TOLD-ACKED rid=%s told=%d after=%.2fs acks=%s (n=%d): every "
                 "follower's read reproduced told -- admitted without the window",
-                rid[:8], told, now - published_at, acks, n,
+                rid, told, now - published_at, acks, n,
             )
         return
     n = _bump(scheduler, "_pf_fallback_n")
@@ -502,7 +502,7 @@ def pp0_note_verdict(scheduler, rid: str, told: int, told_final: int, reason: st
             "followers=%d (n=%d): PP0 switches the request to told=0 for EVERY "
             "rank; P recomputes the prefix instead of the group dying in "
             "STORE-TOLD WAIT EXCEEDED / MISMATCH",
-            rid[:8], told, reason, now - published_at, acks,
+            rid, told, reason, now - published_at, acks,
             int(scheduler.ps.pp_size) - 1, n,
         )
 
@@ -516,7 +516,7 @@ def release_own_read(scheduler, rid: str) -> None:
         try:
             rel(str(rid))
         except Exception as exc:  # noqa: BLE001 - never leave the verdict unapplied
-            logger.warning("PF TOLD-FALLBACK release_aborted_request(%s) raised: %r", str(rid)[:8], exc)
+            logger.warning("PF TOLD-FALLBACK release_aborted_request(%s) raised: %r", str(rid), exc)
     else:
         # a tree without the abort path: at least drop the records admission reads
         for attr in ("_prefetch_completed_tokens", "prefetch_loaded_tokens_by_reqid"):
@@ -619,7 +619,7 @@ def follower_release(scheduler, rid: str) -> None:
         logger.warning(
             "PF TOLD-FALLBACK ABSORBED rank pp=%s rid=%s (n=%d): PP0 admitted at "
             "told=0; this rank's store read was released (abort path) and it "
-            "admits at 0 like every rank", getattr(scheduler.ps, "pp_rank", "?"), rid[:8], n,
+            "admits at 0 like every rank", getattr(scheduler.ps, "pp_rank", "?"), rid, n,
         )
 
 
@@ -676,7 +676,7 @@ def _satisfied_resumable(scheduler, req, rid: str, told: int) -> int:
             "PF TOLD-ACK SATISFIED-UNRESUMABLE rank pp=%s rid=%s told=%d resumable=%d (n=%d): "
             "this rank counts the told span as held but its tree cannot resume there -- the "
             "ack says so and PP0 answers told=0 for every rank",
-            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], told, int(res), n,
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid), told, int(res), n,
         )
     return int(res)
 
@@ -715,7 +715,7 @@ def _resumable_own(scheduler, req, rid: str, own: int) -> int:
             "rank's read completed the KV span but its tree cannot resume there (no "
             "recurrent state at the end) -- the ack says so and PP0 answers told=0 for "
             "every rank instead of admitting a prefix this rank cannot materialise",
-            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(res), n,
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, int(res), n,
         )
     return int(res)
 
@@ -772,7 +772,7 @@ def _room_own(scheduler, req, rid: str, own: int) -> int:
             "this rank holds the told span on its HOST only and cannot load it back even "
             "with every evictable row freed -- the ack says 0 and PP0 answers told=0 for "
             "every rank instead of an SF LOADBACK-ROOM residual and #968 after PP0 admitted",
-            getattr(scheduler.ps, "pp_rank", "?"), str(rid)[:12], own, int(rows), room, n,
+            getattr(scheduler.ps, "pp_rank", "?"), str(rid), own, int(rows), room, n,
         )
     return 0
 
@@ -827,5 +827,5 @@ def follower_pump(scheduler) -> None:
         if _say(n):
             logger.info(
                 "PF TOLD-ACK SENT rank pp=%s seq=%d reads=%s (n=%d)",
-                scheduler.ps.pp_rank, ack.seq, [(r[:8], o) for r, o in ack.reads], n,
+                scheduler.ps.pp_rank, ack.seq, list(ack.reads), n,
             )
