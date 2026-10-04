@@ -5740,7 +5740,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if pool is None or getattr(pool, "arena", None) is None:
             return 0
         if not hasattr(pool, "secure_rows_to_l3"):
-            return 0
+            # Q-697c: the hybrid HostPoolGroup forwards only the claim calls; on the
+            # dual P layout the spill works through its anchor (arena) pool. Off
+            # the gate this is the old silent stop, unchanged.
+            from sglang.srt.weg2 import dual_arena_spill as _das
+
+            pool = _das.anchor_spill_pool(pool)
+            if pool is None:
+                return 0
         _role = _r12.role()
         if _role == "worker":
             # Form A: a worker never decides a host drop of its own (R12). Its
@@ -5808,6 +5815,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _r12.record_spill(self, node)   # every worker gives its reference back too
             released += int(host_freed or 0) // P
             spilled += 1
+        if released < int(need_pages) and _role is None:
+            # Q-697c: the dual P tree is host-only after each idle release; when the
+            # device-resident round did not cover the claim, those leaves spill too
+            # (L3 copy first; only as many as the claim is short, at least one
+            # round's minimum). Gate off: not entered.
+            from sglang.srt.weg2 import dual_arena_spill as _das
+
+            if _das.armed():
+                released += _das.spill_host_only(
+                    self, pool, max(int(need_pages) - released, self.W3_SPILL_MIN_PAGES), P, skip)["released"]
         k = getattr(self, "_w3_spill_n", 0) + 1
         self._w3_spill_n = k
         if released == 0:

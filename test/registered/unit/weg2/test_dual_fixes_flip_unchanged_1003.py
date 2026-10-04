@@ -22,6 +22,7 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-693  follower untold waiting abort / PF ACK-ROOM HOLD / PP0 intake stamp / RESUME-OWN-HELD
   Q-695  #791T probe old-instance chunk / old chunk abort store release / #791C new-instance named
   Q-697  follower waiting abort whose told rode the same PP0 list (weg2.dual_untold_abort)
+  Q-697c W3 arena spill: anchor pool of the hybrid group + host-only H-leaves (weg2.dual_arena_spill)
   Q-696  D live cache yield + regrow hold (D tick without the dual actor) / front INTAKE-STALL
          card WAIT (drain ends as before) and STALL-BYPASS / wedge class P-KV-WAIT (no post skip)
   Q-800  DUAL-SHARE: PP0 chunk cap, share duty, D capture priority, MPS client priority,
@@ -853,3 +854,28 @@ class TestQ800FlipUnchanged:
         src = inspect.getsource(SC.Scheduler)
         assert ('if getattr(self, "_dual_share_chunk", None) is not None:\n'
                 '            chunked_prefill_size = _weg2_dual_share.apply_chunk_cap(') in src
+
+
+class TestQ697cArenaSpillFlipUnchanged:
+    """Q-697c: the host-only spill and the hybrid-group anchor pool are dual P only. The
+    behavioural half (claim refused, no L3 write, no node moves, for every wrong gate) is
+    test_w3_dual_host_only_spill_q697c_1004.test_group_pool_without_the_gate_stops_as_before_flip_unchanged."""
+
+    def test_armed_only_on_dual_group_p_with_the_kv_cap(self):
+        from sglang.srt.weg2 import dual_arena_spill as DS
+
+        full = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P", PK.MAX_TOKENS_ENV: "131072"}
+        assert DS.armed(full) is True
+        for env in _wrong_gates() + [{"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"},
+                                     dict(full, SGLANG_WEG2_GROUP="D")]:
+            assert DS.armed(env) is False, env
+
+    def test_no_anchor_pool_is_reached_off_the_gate(self):
+        from sglang.srt.weg2 import dual_arena_spill as DS
+
+        class Boom:  # any attribute read past the gate raises
+            def __getattr__(self, name):
+                raise AssertionError("read %s off the gate" % name)
+
+        for env in _wrong_gates():
+            assert DS.anchor_spill_pool(Boom(), env) is None, env
