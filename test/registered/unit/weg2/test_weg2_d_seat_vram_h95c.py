@@ -874,7 +874,10 @@ def test_the_launcher_default_and_an_operators_word():
     assert L.apply_profile_d_seat_vram_default(other) is None and other.env_d == ""
     src = open(L.__file__).read()
     j = src.index("    ns = build_parser().parse_args(")  # FL6: the argv goes through _canonical_flags
-    assert "apply_profile_d_seat_vram_default(ns)" in src[j:j + 900]
+    # window = parse .. end of main's profile-default prologue (vram_view().reset), not a fixed
+    # char count: the HW-P1a card-selection block between them must not break it
+    k = src.index("    vram_view().reset(", j)
+    assert "apply_profile_d_seat_vram_default(ns)" in src[j:k]
     ns = types.SimpleNamespace(env_d="SGLANG_WEG2_D_SEAT_EXPERT_ROWS=9,0,0")
     from sglang.srt.planner import expert_residency as er
 

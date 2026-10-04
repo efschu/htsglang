@@ -185,4 +185,8 @@ def test_the_d_solve_is_told_the_seats_and_the_main_resolves_the_nf_default():
     i = src.index("replayssm_spec=d_replayssm_spec_plan_form(ns),")
     assert "seats=d_stated_seats(ns)," in src[i:i + 600]
     j = src.index("    ns = build_parser().parse_args(")  # FL6: the argv goes through _canonical_flags
-    assert "apply_profile_d_bs_default(ns," in src[j:j + 600]  # FL6 state-dir link sits before it
+    # window = from the parse to the end of main's profile-default prologue (the VRAM-VERTRAG
+    # vram_view().reset), NOT a fixed char count: blocks that sit between the parse and the
+    # defaults (FL6 state-dir link, HW-P1a card selection) must not break it
+    k = src.index("    vram_view().reset(", j)
+    assert "apply_profile_d_bs_default(ns," in src[j:k]
