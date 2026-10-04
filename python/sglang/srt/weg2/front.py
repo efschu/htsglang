@@ -15431,6 +15431,17 @@ class Front:
 
         sig_short, sig_why = _ddp.d_signal_short(_ddp.read_d_signal(_ddp.d_signal_file(tag)), now=time.time(),
                                                  unit=grant, id_threshold=_ddp.d_id_threshold())
+        if envs.SGLANG_WEG2_DUAL_D_SIGNAL_SEATS.get() and sig_why:
+            # #1540: a standing id-space/arena reading with no D seat and nothing waiting for one is not
+            # D's pressure (B9e: P slept and never woke). One front process, so the answer is the same for
+            # every rank by construction.
+            _seats = bool(self._d_seats_live) or bool(self._ready_for_d)
+            _g_short, _g_why = _ddp.d_signal_seat_gate(sig_short, sig_why, d_has_seats=_seats, armed=True)
+            if not _g_why and sig_why != getattr(self, "_dual_d_signal_idle_why", ""):
+                logger.info("WEG2 DUAL-KV-PRESSURE d_signal %s ignored -- no D seat and nothing waiting for one "
+                            "(#1540 D-SIGNAL-SEATS)", sig_why)
+            self._dual_d_signal_idle_why = sig_why if not _g_why else ""
+            sig_short, sig_why = _g_short, _g_why
         if sig_why and sig_why != getattr(self, "_dual_d_signal_why", ""):
             logger.warning("WEG2 DUAL-KV-PRESSURE d_signal %s -- D is short beyond the ledger bytes", sig_why)
         self._dual_d_signal_why = sig_why

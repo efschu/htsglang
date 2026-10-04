@@ -753,6 +753,15 @@ class Envs:
     # possible (P held while a lend is open), so this is its own observed boot.
     # Default off = front env byte for byte as before.
     SGLANG_WEG2_DUAL_FRONT_KV_TAG_FIX = EnvBool(False)
+    # #1540 D-SIGNAL-SEATS (dual front, default off): d_signal (D's id-space / Mamba-arena reading,
+    # dual_d_priority.d_signal_short) counts as pressure only while D really has work that needs the
+    # rows -- a live seat (front._d_seats_live) or a leg-1-done request waiting for one
+    # (front._ready_for_d). B9e (deskq/done/1520): with the tag fix the ladder SAW id_space 0.93-0.99
+    # (D holds cache rows, running-req 0) as pressure in every tick, P slept after the lend (stage 2)
+    # and never woke (pressure<=0 is a wake condition); only a workaround (D_ID_PRESSURE=1.0) existed.
+    # On: no live seat and nothing waiting for one -> d_signal contributes 0 (ledger bytes unchanged).
+    # Default off = byte for byte as before.
+    SGLANG_WEG2_DUAL_D_SIGNAL_SEATS = EnvBool(False)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,
