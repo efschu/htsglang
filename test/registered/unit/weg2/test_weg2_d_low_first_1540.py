@@ -12,7 +12,10 @@ DANGER DIRECTIONS guarded here:
 * on: the next allocation after frees takes the LOWEST free ids, so ``max_live_id`` falls;
 * rank agreement: the trigger is the count of allocation calls (wall time is never read) and the sort
   is a pure function of the list -- two allocators fed the same calls hold the same list;
-* the owner bias / weighted placement own the order when set: low-first stays out of their way;
+* the corridor owner BIAS still owns the order (low-first yields, loudly once);
+* WITH --d-token-placement armed (the real D boot, b9k 22:17:05Z: lf_sorts=0 because the first version
+  yielded to the placement) the sort runs, the placement re-interleaves on top of it: class mix kept,
+  lowest id first INSIDE every class;
 * only the token and paged allocator are armed; any other class is refused loudly;
 * the instrument never raises into the D tick and never changes the verdict.
 """
@@ -27,6 +30,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.weg2 import d_token_placement as TP
 from sglang.srt.weg2 import dual_d_kv_stage as D
 from sglang.srt.weg2 import dual_p_kv_stage as P
 from sglang.srt.weg2 import dual_pkvwait_instr as PI
@@ -121,11 +125,14 @@ class TestTokenAllocatorLowFirst(CustomTestCase):
         a = _tok()
         a.set_low_first(1)
         a._owner_bias = (2, 0, 1)
-        _fragment(a)
+        with self.assertLogs("sglang.srt.mem_cache.allocator.base", level="WARNING") as cm:
+            _fragment(a)                                   # N=1: the first tick already yields (once, loudly)
         before = a.free_pages.tolist()
         a.alloc(1)
         self.assertEqual(a._weg2_low_first_sorts, 0)
+        self.assertEqual(a._weg2_low_first_yield, 5)       # 4 allocs in _fragment + this one
         self.assertEqual(a.free_pages.tolist(), before[1:])
+        self.assertEqual(sum("yields to the corridor owner bias" in m for m in cm.output), 1)
 
     def test_free_group_in_flight_is_not_reordered(self):
         a = _tok()
@@ -157,6 +164,87 @@ class TestPagedAllocatorLowFirst(CustomTestCase):
         got = a.alloc(4)
         self.assertEqual(got.tolist()[0] // 4, 1)
         self.assertEqual(a._weg2_low_first_sorts, 7)               # N=1: six allocs before + this one
+
+
+PREFIX = (0, 21, 43, 64)          # the installed token vector of the rc9 D group (S = 64)
+
+
+def _placed(make, every=1):
+    """An allocator as the D boot arms it: --d-token-placement bandwidth on top (reapply far away so the
+    placement's own tick never masks what low-first does), then low-first every ``every`` calls."""
+    a = make(6400)
+    spec = TP.PlacementSpec("bandwidth", TP.RC9_EFF_BW_GBS, reapply_every=10 ** 9)
+    a.set_owner_placement(TP.OwnerPlacement(spec, prefix_fn=lambda: PREFIX))
+    if every:
+        a.set_low_first(every)
+    return a
+
+
+def _paged1(size):
+    return PagedTokenToKVPoolAllocator(size, 1, torch.int64, "cpu", None, False)
+
+
+def _churn(a):
+    """b9i shape: 40 requests of 80 ids; the upper half finishes; half that amount of new work arrives.
+    Returns (live ids, ids handed to the new work)."""
+    reqs = [a.alloc(80) for _ in range(40)]
+    for r in reqs[20:]:                    # the YOUNGER (higher-id) requests finish first
+        a.free(r)
+    new = [a.alloc(80) for _ in range(10)]
+    live = torch.cat(reqs[:20] + new)
+    return live, torch.cat(new)
+
+
+class TestWithOwnerPlacementArmed(CustomTestCase):
+    """The case b9k showed on the metal: the placement is armed, low-first must STILL sort."""
+
+    def test_the_sort_fires_with_the_placement_armed(self):
+        for make in (_tok, _paged1):
+            a = _placed(make)
+            self.assertIsNotNone(a._owner_placement)
+            _churn(a)
+            self.assertGreater(a._weg2_low_first_sorts, 0, make.__name__)     # b9k: lf_sorts=0 for ever
+            self.assertEqual(a._weg2_low_first_yield, 0)
+
+    def test_max_live_id_falls_against_placement_only(self):
+        for make in (_tok, _paged1):
+            off, on = _placed(make, every=0), _placed(make)
+            live_off, new_off = _churn(off)
+            live_on, new_on = _churn(on)
+            self.assertLess(int(new_on.max()), int(new_off.max()), make.__name__)
+            self.assertLess(P.max_live_id(on, 1), P.max_live_id(off, 1), make.__name__)
+
+    def test_class_mix_is_kept_and_order_inside_a_class_is_ascending(self):
+        a = _placed(_paged1)
+        _live, new = _churn(a)
+        cls = TP.class_of(new, PREFIX[-1], PREFIX)
+        frac = [float((cls == r).sum()) / new.numel() for r in range(3)]
+        for got, want in zip(frac, (0.437, 0.282, 0.282)):
+            self.assertAlmostEqual(got, want, delta=0.07)               # the placement's job survives
+        for r in range(3):
+            ids = new[cls == r].tolist()
+            self.assertEqual(ids, sorted(ids))                          # lowest id first INSIDE the class
+
+    def test_two_ranks_same_calls_same_list_with_the_placement(self):
+        r0, r1 = _placed(_paged1), _placed(_paged1)
+        for a in (r0, r1):
+            _churn(a)
+        self.assertEqual(r0.free_pages.tolist(), r1.free_pages.tolist())
+        self.assertEqual(r0._weg2_low_first_sorts, r1._weg2_low_first_sorts)
+
+    def test_mutant_yielding_to_the_placement_is_caught(self):
+        """The b9k bug, rebuilt: the tick that returns early when a placement is set never sorts."""
+        a = _placed(_paged1)
+        real = type(a)._weg2_low_first_tick
+
+        def yielding(self):                       # the first version: placement owns the order -> return
+            if getattr(self, "_owner_placement", None) is not None:
+                return
+            return real(self)
+
+        with mock.patch.object(type(a), "_weg2_low_first_tick", yielding):
+            _churn(a)
+        self.assertEqual(a._weg2_low_first_sorts, 0)       # the real code passes test_the_sort_fires_...
 
 
 class _FakeAlloc:
@@ -227,6 +315,8 @@ class TestLiveFloorCensus(CustomTestCase):
         self.assertTrue(out["h1"].startswith("running:weg2-0-high:row32"))
         self.assertEqual(out["free_below_need"], 16 + 0)     # ids 1..16 are below 26; the pristine tail starts at 33
         self.assertEqual(out["low_first"], 1)
+        for k in ("lf_sorts", "lf_calls", "lf_yield", "placement"):
+            self.assertIn(k, out)
 
     def test_garbage_never_raises(self):
         for sched, alloc in ((None, None), (object(), object()), (_Sched([_Req("x", 9, 4)], torch.zeros((1, 2), dtype=torch.int64)), _FakeAlloc())):

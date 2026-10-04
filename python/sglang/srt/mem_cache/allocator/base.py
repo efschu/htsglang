@@ -216,15 +216,23 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # for 62 s). Every ``every``-th allocation call the released ids are merged and the list sorted
     # ascending: PLACEMENT only, nothing is copied or freed, ``available_size()`` is unchanged.
     #
+    # WITH --d-token-placement ARMED (b9k, 22:17:05Z 'D-TOKEN-PLACEMENT armed', lf_sorts=0 for 7 min:
+    # the first version yielded to ``_owner_placement`` and never sorted): the placement is a STABLE
+    # weighted interleave of the free list per owner class, so a list sorted ascending BEFORE the
+    # interleave stays ascending INSIDE every class -- the class proportions (the placement's job) are
+    # kept, and within each class the lowest id goes first. So the sort comes first and the placement
+    # re-applies on top of it: one author of the class mix (the placement), one of the order inside a
+    # class (this).  Only the corridor owner BIAS (a different, exclusive author) still wins.
+    #
     # DETERMINISM: the trigger is the count of allocation calls on a replicated allocator (never
-    # wall time) and the sort is a pure function of the list, so every rank holds the same order.
-    # The owner bias / weighted placement own the order when set (one author of one order): this
-    # stays out of their way.
+    # wall time) and the sort is a pure function of the list (and the placement is one already), so
+    # every rank holds the same order.
 
     def set_low_first(self, every: int) -> None:
         self._weg2_low_first_every = max(0, int(every))
         self._weg2_low_first_calls = 0
         self._weg2_low_first_sorts = 0
+        self._weg2_low_first_yield = 0
 
     def _weg2_low_first_tick(self) -> None:
         every = getattr(self, "_weg2_low_first_every", 0)
@@ -235,20 +243,28 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return
         if not self.is_not_in_free_group:
             return
-        if getattr(self, "_owner_bias", None) is not None or getattr(self, "_owner_placement", None) is not None:
+        if getattr(self, "_owner_bias", None) is not None:
+            self._weg2_low_first_yield += 1
+            if self._weg2_low_first_yield == 1:
+                logger.warning("#1540 D-LOW-FIRST yields to the corridor owner bias (one author of one "
+                               "order): no ascending sort while it is set")
             return
-        pages = self.free_pages
         no_release = self.release_pages is None or not len(self.release_pages)
+        pages = self.free_pages
         if pages is None or (pages.numel() < 2 and no_release):
             return
         self._merge_and_sort_free_unbiased()
         self.free_pages, _ = torch.sort(self.free_pages)
+        if getattr(self, "_owner_placement", None) is not None:
+            # stable interleave on top of the ascending list: ascending inside every class
+            self._apply_owner_placement()
         self._weg2_low_first_sorts += 1
         n = self._weg2_low_first_sorts
         if n == 1 or n % 512 == 0:
-            logger.info("#1540 D-LOW-FIRST sorts=%d calls=%d every=%d free=%d: the free list is ascending "
-                        "again, new KV lands on the lowest ids", n, self._weg2_low_first_calls, every,
-                        int(self.free_pages.numel()))
+            logger.info("#1540 D-LOW-FIRST sorts=%d calls=%d every=%d free=%d placement=%d: the free list is "
+                        "ascending again (inside every owner class), new KV lands on the lowest ids", n,
+                        self._weg2_low_first_calls, every, int(self.free_pages.numel()),
+                        int(getattr(self, "_owner_placement", None) is not None))
 
     def register_free_listener(self, on_free, on_clear=None) -> None:
         """Subscribe to slot lifetime events: ``on_free(free_index)`` after
