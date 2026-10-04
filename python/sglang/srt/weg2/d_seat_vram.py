@@ -2725,6 +2725,36 @@ def _tick_noop(sched) -> None:
     return None
 
 
+#: Q-701: the epoch of the phase a D serves in from its boot, before any wake
+BOOT_EPOCH = "boot"
+BOOT_PHASE_MARK = "Q-701 D-MEM-SCHED BOOT-PHASE"
+
+
+def boot_phase(sched) -> Optional[PhaseState]:
+    """Q-701 (NF y9nf boot 2, D 00:49:37Z serving, never woken): the phase
+    state is made only by a wake (``on_wake``), so a D that SERVES FROM ITS
+    BOOT had none and the runtime tick -- the only thing that moves the KV
+    stage between wakes -- was a no-op. D stayed at the boot cap S0 (32768
+    tokens, ``#1045 FLOOR PUBLISHED floor=32768``) while the front sent it
+    store-cached requests on the X route (uncached 204..1934, load-back
+    88768 / 159040): ``H105 RU FORM-A ADMISSION WAIT ... host_price=163404
+    host_budget=32768`` 5604 times, 4 queued / 0 running, no forward, no
+    flip (the front saw nothing to flip for). The boot form IS a phase: the
+    cap's seats at S0, exactly what ``kv_stage_boot_cap`` engaged -- seeded
+    here once (replicated: the form and the cap), so the tick grows the stage
+    for the demand as it does after any wake. None without a stage form."""
+    form = stage_form()
+    if form is None:
+        return None
+    st = PhaseState(cap=_cap_of(sched), epoch=BOOT_EPOCH, done=True,
+                    stage=0, stage_tokens=int(form.tokens[0]))
+    setattr(sched, PHASE_ATTR, st)
+    logger.info("%s cap=%d stage=S0 tokens=%d: this D serves from its boot without a wake; the "
+                "boot form is its phase, the runtime tick moves the KV stage for the demand",
+                BOOT_PHASE_MARK, st.cap, st.stage_tokens)
+    return st
+
+
 def runtime_tick(sched):
     """Once per scheduler iteration of an AWAKE D (after the write-through
     acks are flushed): the KV stage follows the global demand between wakes
@@ -2737,6 +2767,8 @@ def runtime_tick(sched):
     if not armed() or not elastic_on() or getattr(sched, "weg2_dormant", False):
         return _tick_noop(sched)
     st = getattr(sched, PHASE_ATTR, None)
+    if st is None:
+        st = boot_phase(sched)
     if st is None or st.stage is None or not st.done:
         return _tick_noop(sched)
     form = stage_form()
