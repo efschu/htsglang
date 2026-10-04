@@ -4659,6 +4659,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         release; what was released stays a valid tree and the leaf stays, as before."""
         scratch = {ct: 0 for ct in self.tree_components}
         released = 0
+        end_anchors = 0
         for d in descendants:
             if not self._is_host_leaf(d):
                 logger.warning(
@@ -4669,6 +4670,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     released, len(descendants),
                 )
                 return
+            if getattr(d, "_weg2_end_anchor", False):
+                end_anchors += 1
             self._evict_host_leaf(d, scratch)
             released += 1
         if node.children:  # defensive: the verdict named every descendant
@@ -4680,6 +4683,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         _sf.note_unbacked_drop(
             self, node, tracker.get(BASE_COMPONENT_TYPE, 0) - before,
             subtree_nodes=released, host_tokens=int(scratch.get(BASE_COMPONENT_TYPE, 0)),
+            end_anchors=end_anchors,
         )
 
     def _evict_host_leaf(

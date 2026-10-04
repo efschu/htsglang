@@ -1000,4 +1000,4 @@ class TestQ1500UdHostChildrenFlipUnchanged:
         src = inspect.getsource(U._evict_device_leaf)
         assert src.index("unbacked_drop_allowed(self, node)") < src.index("unbacked_drop_subtree(self, node)")
         v = inspect.getsource(SF.unbacked_drop_subtree)
-        assert v.index("if not ud_host_children_enabled():") < v.index('getattr(node, "children"')
+        assert v.index("if not ud_host_children_enabled(tree=tree):") < v.index('getattr(node, "children"')
