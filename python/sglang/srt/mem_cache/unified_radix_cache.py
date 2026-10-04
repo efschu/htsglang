@@ -2213,6 +2213,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # P-HOST-OVERLAP: a deferred chunk publish names nodes of the tree being
         # destroyed; it must not outlive it (empty unless the mode is on).
         self._weg2_deferred_chunk_publish = []
+        # #1510 (B9d death 18:04:36Z, 'Sanity check FAILED: H-leaf extra' on all
+        # three P ranks): the dual end-anchor registry (rid -> end-anchor node, see
+        # weg2/dual_anchor_release.py, filled in _weg2_dual_note_end_anchor) names
+        # nodes of the tree being destroyed. It was never cleared here, so the first
+        # retain after reset+wake ran weg2_dual_release_ended ->
+        # _weg2_dual_release_ref -> _update_evictable_leaf_sets on the OLD nodes and
+        # entered them into the NEW tree's host-leaf set (3 stale nodes -> assertion).
+        # The registry exists only in the dual layout (created lazily), so this is
+        # a no-op everywhere else.
+        _dual_end_reg = getattr(self, "_weg2_dual_end_reg", None)
+        if _dual_end_reg is not None:
+            _dual_end_reg.entries.clear()
         # 27B line (24.09.): the per-path cap's waiting releases name nodes of
         # the tree being destroyed, whose copies the release above and the pool
         # resets below take back -- releasing them later would free twice.
