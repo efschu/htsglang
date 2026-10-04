@@ -189,9 +189,11 @@ class P1aTopologyFromInventory(unittest.TestCase):
 
         src = inspect.getsource(L.main)
         i = src.index("cards = order_cards(resolve_cards())")
-        self.assertLess(i, src.index("log(topology_check_line(ns, cards))"))
-        self.assertLess(src.index("log(topology_check_line(ns, cards))"),
+        self.assertLess(i, src.index("_topology_line = topology_check_line(ns, cards)"))
+        self.assertLess(src.index("_topology_line = topology_check_line(ns, cards)"),
                         src.index("log(inventory_check_line(ns, cards))"))
+        # rig-plan gate (desk 27b-int8-hw-1004): the proven count adds no launch line
+        self.assertIn("if len(cards) not in _topo.PROVEN_CARD_COUNTS:", src)
         self.assertLess(src.index("set_card_selection("), i)
 
 

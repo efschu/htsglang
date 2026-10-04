@@ -24996,8 +24996,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
     # HW-P1a 1003: the card count is the inventory's; an unrunnable one is
-    # refused here BY NAME with its concrete blockers (N = 3: one line, as before).
-    log(topology_check_line(ns, cards))
+    # refused here BY NAME with its concrete blockers. The line is printed only
+    # for a count the metal has NOT proven: on the proven reference count (N = 3)
+    # the launch output stays byte-identical to the tree without HW-P1a (the
+    # rig-plan gate of desk 27b-int8-hw-1004; the topology is derived either way).
+    _topology_line = topology_check_line(ns, cards)
+    if len(cards) not in _topo.PROVEN_CARD_COUNTS:
+        log(_topology_line)
     # HW-GENERIC 1002: the profile's positional records and vectors hold only
     # for the inventory they were measured on -- checked once, here, before
     # any of them is read. The reference rig passes silently-identically.
