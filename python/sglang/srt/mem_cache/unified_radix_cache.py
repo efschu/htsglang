@@ -5625,18 +5625,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             slots = int(arena.slots)
             pinned = arena.ref_census()[0]
             held = self._weg2_dual_d_held(mp)
-            need = _dar.d_release_need(slots=slots, pinned=pinned, d_held=len(held))
+            aged, stale, ticks_n = [], [], 0
+            aging = _dar.aging_armed()
+            if aging:
+                # #1500a ANCHOR-AGING (env-gated, default OFF): anchors no match touched for
+                # more than N ticks give their reference back first (soft: the slot stays
+                # COMPLETE until a claim takes it); the regular LRU pass asks the cap / room
+                # of what is left. Pure function of stamps + the rank-lockstep tick.
+                ticks_n = _dar.aging_ticks()
+                try:
+                    stale = _dar.aging_scan(
+                        held, tick=int(getattr(self, "_1028_round", 0)) // _dar.D_TICK_ROUNDS,
+                        ticks_n=ticks_n)
+                    aged = _dar.aging_pass(
+                        stale, releasable=lambda n: self._weg2_dual_releasable(n, mp),
+                        release=self._weg2_dual_release_ref)
+                except Exception as exc:  # noqa: BLE001 -- aging never takes the Q-650 pass down
+                    logger.warning("%s raised %s: %s (Q-650 pass runs without it)",
+                                   _dar.MARKER_AGING, type(exc).__name__, exc)
+                _aging_ids = {id(n) for n in aged}
+                held_rest = [n for n in held if id(n) not in _aging_ids]
+            else:
+                held_rest = held
+            need = _dar.d_release_need(slots=slots, pinned=pinned, d_held=len(held), stale=len(aged))
             released = _dar.d_release_pass(
-                held, need=need,
+                held_rest, need=need,
                 releasable=lambda n: self._weg2_dual_releasable(n, mp),
                 release=self._weg2_dual_release_ref,
                 age=lambda n: n.last_access_time)
-            if released:
+            if released or aged:
                 pinned = arena.ref_census()[0]
-            _dar.log_d(released=released, need=need, d_held=len(held) - released, pinned=pinned,
-                       slots=slots, candidates=len(held))
+            if aging:
+                _dar.log_aging(stale=len(stale), soft_released=len(aged), anchors=len(held) - len(aged) - released,
+                               pinned=pinned, slots=slots, ticks_n=ticks_n)
+            released_all = released + len(aged)
+            _dar.log_d(released=released, need=need, d_held=len(held) - released_all, pinned=pinned,
+                       slots=slots, candidates=len(held_rest))
             if int(self.cache_controller.tp_rank) == 0:
-                _dar.publish_room(slots=slots, pinned=pinned, d_held=len(held) - released)
+                _dar.publish_room(slots=slots, pinned=pinned, d_held=len(held) - released_all)
         except Exception as exc:  # noqa: BLE001 -- a release never takes the round down
             logger.warning("%s tick raised %s: %s", _dar.MARKER_D, type(exc).__name__, exc)
 
