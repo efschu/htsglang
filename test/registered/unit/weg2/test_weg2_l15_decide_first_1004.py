@@ -261,6 +261,14 @@ def test_scheduler_wiring_one_gather_outside_the_pre_move_try():
     assert "_l15_pre_why = _l15_dec" in tail and "_l15_kwargs = None" in tail
     assert "if _l15_agree_on and _l15_pre_why is None:" in src[retain:post + 400]
     assert "decide_ms=%.0f" in src
+    # review 1270 B2-M1: the gate reads ONLY rank-uniform state. A rank-local term (the bind result
+    # `_l15_kwargs`, `_l15_reuse`) would let one rank skip the decide gather and pair its POST gather
+    # with the peers' decide gather.
+    a = src.index("_l15_dfirst = bool(")
+    b = src.index("except NameError:", a)
+    cond = src[a:b]
+    assert "_l15_kwargs" not in cond and "_l15_reuse" not in cond and "_l15_res" not in cond
+    assert "_l15_agree_on" in cond and "_l15_pre_why is None" in cond and "decide_first_on(os.environ)" in cond
 
 
 def test_switch_off_scheduler_path_is_the_old_order():

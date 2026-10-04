@@ -63,8 +63,9 @@ class _Tree:
         return {"unbacked": 3, "issued": 1, "pending": 1, "skipped_bg": 2, "refused": 0, "issue_ms": 1.0}
 
 
-def _sched(tree=None, *, running=1, waiting=0, dormant=False, paused=False, fct=16, chunked=None):
+def _sched(tree=None, *, running=1, waiting=0, dormant=False, paused=False, fct=64, chunked=None, rank=0):
     return types.SimpleNamespace(
+        tp_rank=rank, ps=types.SimpleNamespace(tp_rank=rank),
         enable_hierarchical_cache=True, tree_cache=tree if tree is not None else _Tree(),
         running_batch=_Batch(running), waiting_queue=[object()] * waiting, chunked_req=chunked,
         anchor_tails=None, weg2_dormant=dormant, _engine_paused=paused, forward_ct=fct)
@@ -74,7 +75,8 @@ def test_switch_default_on_and_knobs():
     from sglang.srt.environ import envs
 
     assert envs.SGLANG_WEG2_PUBLISH_SWEEP_BG.get() is True
-    assert envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY.get() == 16
+    assert envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY.get() == 64
+    assert envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_TOKENS.get() == 8192
     assert envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_ISSUE.get() == 1
 
 
@@ -83,13 +85,13 @@ def test_tick_runs_one_bounded_background_pass(armed_d):
     s = _sched()
     st = nb.bg_publish_tick(s)
     assert st is not None
-    assert s.tree_cache.calls == [(1, {"background": True})]
+    assert s.tree_cache.calls == [(1, {"background": True, "bg_max_tokens": 8192})]
 
 
 def test_tick_inert_outside_its_case(armed_d, monkeypatch):
     nb = _nb()
     for kw in (dict(running=0), dict(waiting=1), dict(dormant=True), dict(paused=True),
-               dict(chunked=object()), dict(fct=15), dict(fct=0)):
+               dict(chunked=object()), dict(fct=63), dict(fct=16), dict(fct=0)):
         s = _sched(**kw)
         assert nb.bg_publish_tick(s) is None, kw
         assert s.tree_cache.calls == [], kw
@@ -104,16 +106,16 @@ def test_tick_inert_outside_its_case(armed_d, monkeypatch):
 
 def test_cadence_is_forward_ct_only_and_once_per_forward(armed_d, monkeypatch):
     nb = _nb()
-    s = _sched(fct=16)
+    s = _sched(fct=64)
     assert nb.bg_publish_tick(s) is not None
     assert nb.bg_publish_tick(s) is None          # same forward count: no repeat
-    s.forward_ct = 32
+    s.forward_ct = 128
     assert nb.bg_publish_tick(s) is not None
     monkeypatch.setenv("SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY", "4")
-    s.forward_ct = 36
+    s.forward_ct = 132
     assert nb.bg_publish_tick(s) is not None and len(s.tree_cache.calls) == 3
     monkeypatch.setenv("SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_ISSUE", "3")
-    s.forward_ct = 40
+    s.forward_ct = 136
     nb.bg_publish_tick(s)
     assert s.tree_cache.calls[-1][0] == 3
 
@@ -293,3 +295,88 @@ def test_sweep_signature_background_defaults_false():
 
     p = inspect.signature(UnifiedRadixCache.publish_unbacked_sweep).parameters
     assert p["background"].default is False
+
+
+# ---- review 1270 additions ------------------------------------------------------------
+
+def test_size_threshold_leaves_long_nodes_to_the_flush():
+    root, n = _tree()
+    n["a"].key = list(range(9000))          # a P hand-over sized node
+    fk = _Fake(root)
+    st = _sweep(fk, max_issue=64, background=True, bg_max_tokens=8192)
+    assert 1 not in fk.issued and 2 not in fk.issued and 3 not in fk.issued   # a too long, b/c wait for it
+    assert fk.issued == [7]
+    assert st["skipped_bg"] >= 3
+    # 0 = no limit
+    root, n = _tree()
+    n["a"].key = list(range(9000))
+    fk = _Fake(root)
+    _sweep(fk, max_issue=64, background=True, bg_max_tokens=0)
+    assert 1 in fk.issued
+    # the flush ignores the threshold (background False)
+    root, n = _tree()
+    n["a"].key = list(range(9000))
+    fk = _Fake(root)
+    _sweep(fk, max_issue=256, bg_max_tokens=8192)
+    assert 1 in fk.issued
+
+
+def test_background_claim_never_spills_the_arena():
+    """The bg flag is up exactly while write_backup runs under a BG sweep (the direct claim reads it
+    before _w3_arena_spill); the flush never sets it."""
+    from sglang.srt.mem_cache import unified_radix_cache as urc
+
+    seen = []
+
+    class _Rec(_Fake):
+        def write_backup(self, node):
+            seen.append(bool(getattr(self, "_weg2_bg_publish", False)))
+            return super().write_backup(node)
+
+    root, _n = _tree()
+    fk = _Rec(root)
+    _sweep(fk, max_issue=64, background=True)
+    assert seen and all(seen) and fk._weg2_bg_publish is False
+    seen.clear()
+    root, _n = _tree()
+    fk = _Rec(root)
+    _sweep(fk, max_issue=64)
+    assert seen and not any(seen)
+    src = inspect.getsource(urc.UnifiedRadixCache._weg2_direct_claim)
+    i = src.index("_w3_arena_spill(pool, len(hashes)")
+    assert 'getattr(self, "_weg2_bg_publish", False)' in src[i - 300:i]
+
+
+def test_marker_line_at_most_once_per_30s(armed_d, caplog):
+    import logging
+
+    nb = _nb()
+    s = _sched(fct=64)
+    with caplog.at_level(logging.INFO):
+        for k in range(1, 6):
+            s.forward_ct = 64 * k
+            nb.bg_publish_tick(s)
+    assert len(s.tree_cache.calls) == 5
+    assert caplog.text.count("WEG2-PUBLISH-SWEEP-BG pass=") == 1
+
+
+def test_two_ranks_take_the_same_decision_at_every_tick(armed_d):
+    """TP lockstep: both ranks see the same replicated gate inputs; the tick must decide alike at every
+    forward count and every state (a rank-local gate would split the group's publish)."""
+    nb = _nb()
+    a, b = _sched(rank=0), _sched(rank=1)
+    states = [dict(), dict(running=0), dict(waiting=2), dict(dormant=True), dict(paused=True),
+              dict(chunked=object())]
+    for fct in range(0, 400):
+        for st in states:
+            for sc in (a, b):
+                sc.forward_ct = fct
+                sc.running_batch = _Batch(st.get("running", 1))
+                sc.waiting_queue = [object()] * st.get("waiting", 0)
+                sc.weg2_dormant = st.get("dormant", False)
+                sc._engine_paused = st.get("paused", False)
+                sc.chunked_req = st.get("chunked")
+                sc._weg2_bg_publish_last_fct = None
+            ra, rb = nb.bg_publish_tick(a), nb.bg_publish_tick(b)
+            assert (ra is None) == (rb is None), (fct, st)
+    assert a.tree_cache.calls == b.tree_cache.calls and a.tree_cache.calls

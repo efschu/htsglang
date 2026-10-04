@@ -5574,7 +5574,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._1421_refused("direct_no_hashes", node)
             return False
         pre = pool.alloc_write(hashes)
-        if pre is None and self._w3_arena_spill(pool, len(hashes), claimer=node) > 0:
+        if (pre is None and not getattr(self, "_weg2_bg_publish", False)   # BG: no spill (ARENA-DROP > 100 ms)
+                and self._w3_arena_spill(pool, len(hashes), claimer=node) > 0):
             # W3-ARENA: the spill handed this rank's references back; the
             # claim's own room-making (#1427 _evict_for_claim) takes the slots
             # once no rank holds them any more (a PP peer releases at its own
@@ -6635,7 +6636,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return None
 
     def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None, chain_only: bool = False,
-                               background: bool = False) -> dict:
+                               background: bool = False, bg_max_tokens: int = 0) -> dict:
         """#1233 zero-remainder: back every un-backed device node up before a flush.
 
         The hand-back seam. The Weg-2 front quiesces a group through
@@ -6662,6 +6663,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         into a locked or in-flight ancestor). Everything else stays un-backed
         for the next pass or the flip's flush, which is unchanged
         (``background=False`` is the old walk, line for line).
+        ``bg_max_tokens`` > 0 (background only): a node longer than that many
+        tokens is left to the flush (len(key) is replicated: every rank skips
+        the same nodes). A background claim never makes room by spilling the
+        arena (``_weg2_bg_publish``: no ``_w3_arena_spill``, a full arena is a
+        named refusal, the flush retries with its spill rights).
         """
         stats = {"unbacked": 0, "issued": 0, "refused": 0, "pending": 0, "skipped_pending": 0}
         if self.cache_controller is None or self.disable:
@@ -6723,6 +6729,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             if background and (
                 node.component_data[BASE_COMPONENT_TYPE].lock_ref > 0
+                or (int(bg_max_tokens) > 0 and len(node.key) > int(bg_max_tokens))
                 or (
                     node.parent is not self.root_node
                     and not node.parent.backuped
@@ -6762,12 +6769,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stats["skipped_pending"] += 1
                 continue
             _t_iss = time.perf_counter()
+            _bg_prev = getattr(self, "_weg2_bg_publish", False)
+            self._weg2_bg_publish = bool(background)
             try:
                 got = self.write_backup(node)
             except Exception as e:  # noqa: BLE001 -- the sweep must not kill the flush
                 logger.warning("WEG2 PUBLISH-SWEEP write_backup raised on node %s: %s: %s",
                                getattr(node, "id", "?"), type(e).__name__, e)
                 got = 0
+            finally:
+                self._weg2_bg_publish = _bg_prev
             _issue_s += time.perf_counter() - _t_iss
             if got > 0:
                 stats["issued"] += 1
@@ -6791,7 +6802,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 logger.warning("WEG2-LOCK-CENSUS sweep=%d %s", n, self.weg2_lock_census_str(limit=4))
             except Exception:  # noqa: BLE001 -- the census never breaks the sweep
                 logger.warning("WEG2-LOCK-CENSUS raised", exc_info=True)
-        if stats["unbacked"] or n <= 4 or n % 64 == 0:
+        _bg_quiet = False
+        if background:
+            # review 1270 #8/#9: a between-rounds pass names itself at most once per 30 s
+            _now = time.monotonic()
+            _bg_quiet = (_now - float(getattr(UnifiedRadixCache, "_weg2_bg_sweep_log_t", -1e9))) < 30.0
+            if not _bg_quiet and stats["unbacked"]:
+                UnifiedRadixCache._weg2_bg_sweep_log_t = _now
+        if (stats["unbacked"] or n <= 4 or n % 64 == 0) and not _bg_quiet:
             logger.warning(
                 "WEG2 PUBLISH-SWEEP n=%d unbacked=%d issued=%d refused=%d skipped_pending=%d "
                 "in_flight_after=%d pins=%d/%d draft_issued=%d draft_refused=%d "
