@@ -85,6 +85,16 @@ SINCE_ATTR = "_weg2_d_park_since"
 SITE_PRESSURE = "pressure"
 SITE_FLIP = "flip"
 SITES = (SITE_PRESSURE, SITE_FLIP)
+#: Q-698 (NF y9n 10032328 D, 23:33:24-23:44:15Z: 782 SEAT-AGE DISPLACE passes,
+#: 0 decode rounds): the rid of the OLDER waiting request a SEAT-AGE displacement
+#: (``d_park_runtime.displace_for_age``) parked this victim for. While that older
+#: request still waits (queue or outside it) and something runs that can release
+#: KV for it, the victim does not resume: the ARRIVAL-SEAT early resume weighs
+#: only the victim's OWN fit, so it took back the room it was parked to give,
+#: the older one was refused NO_TOKEN again and the next pass parked the other
+#: victim for it -- two victims rotating, every pass an extend, no decode, the
+#: older one never admitted. Replicated (set by the replicated displacement).
+DISPLACED_FOR_ATTR = "_weg2_sa_displaced_for"
 
 _OFF = ("0", "false", "no", "off")
 
@@ -490,9 +500,24 @@ def admission_gate(
     exempt = _dual_defer_exempt(parked_waiting)
     live = list(running) + parked_waiting + parked_outside
     blocked = set()
+    # Q-698: the requests still waiting (queue or outside it) -- a victim parked
+    # for one of them stays parked while that one waits (no early resume either).
+    # The hold ends when the older one is admitted or gone (here), when it was
+    # refused on a D with nothing running, or when its displacement budget is
+    # spent (d_park_runtime: _lift_holds_when_idle / DISPLACE-EXHAUSTED).
+    still_waiting = {str(getattr(q, "rid", "")) for q in list(waiting) + list(pending_outside)}
+    held_for_older = 0
     for r in parked_waiting:
         if park_site(r) != SITE_PRESSURE:
             continue
+        held_for = getattr(r, DISPLACED_FOR_ATTR, None)
+        if held_for is not None:
+            if str(held_for) in still_waiting and str(held_for) != str(r.rid):
+                blocked.add(str(r.rid))
+                held_for_older += 1
+                continue
+            # the older one was admitted or is gone: the hold ends for good
+            setattr(r, DISPLACED_FOR_ATTR, None)
         mine = _arrival(r)
         older_live = any(x is not r and _arrival(x) < mine for x in live)
         if not older_live:
@@ -513,7 +538,8 @@ def admission_gate(
     note = (
         f"gate=weg2_d_park(parked_waiting={len(parked_waiting)} "
         f"parked_outside={len(parked_outside)} blocked={len(blocked)}"
-        + (f" decode_first={len(deferred)}" if deferred else "") + ")"
+        + (f" decode_first={len(deferred)}" if deferred else "")
+        + (f" held_for_older={held_for_older}" if held_for_older else "") + ")"
     )
     # Q-692: a parked request waiting for a store read (exempt) holds no seat
     # against newcomers -- neither the barrier nor the SA age nor AP count it

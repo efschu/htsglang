@@ -2743,6 +2743,27 @@ def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     return "rank idle, front still holds requests"
 
 
+def park_lapse_race(group_name: str, ledger: List[str], parked, rank_idle: bool) -> List[str]:
+    """Q-699b: the rids of a W3 'rank idle, front still holds requests' that
+    are only a PARK-LAPSE clock race -- empty when it is a real disagreement.
+
+    NF y9n 10032307 front 23:21:43.873: D parked 6 (PARK-RUNNING 23:21:15.725,
+    the front stamps ``t_park`` BEFORE the 2.59-s park RPC, 23:21:13.1), the
+    quiesce then waited 28 s for weg2-10-42 (D's #248h capacity requeue ran it
+    to its end) and returned idle 30.7 s after the front's stamp: the front's
+    part-B clock (PARK_REQUEUE_S 30) had lapsed the five parks back into its
+    ledger, D's own clock (stamped at the park, ~2.4 s later) had not yet
+    re-queued them -- D idle, holding them parked. Every rid left in the
+    ledger being a park D confirmed (``parked``) and D idle means D still holds
+    them parked: the two witnesses agree, the flip carries them over the
+    sleep as any park. A rid the front never booked as parked keeps W3."""
+    if group_name != "D" or not rank_idle or not ledger or not parked:
+        return []
+    if all(r in parked for r in ledger):
+        return list(ledger)
+    return []
+
+
 def flip_stage_report(stage: str, age_s: Optional[float]) -> str:
     """``stage_last_known=<stage> age_s=<n>`` -- NEVER a bare ``stage=``.
 
@@ -13822,7 +13843,21 @@ class Front:
         # witness A counts the flip ledger (the ledger itself when nothing is
         # parked); part B must leave D fully idle after a park for W3 to agree.
         _ledger = getattr(self, "_flip_ledger", None)
-        wv = witness_verdict(len(_ledger(S) if _ledger is not None else S.outstanding), idle)
+        _wl = list(_ledger(S) if _ledger is not None else S.outstanding)
+        wv = witness_verdict(len(_wl), idle)
+        _race = (park_lapse_race(getattr(S, "name", ""), _wl, getattr(self, "_d_parked", None) or {}, idle)
+                 if wv is not None else [])
+        if _race:
+            # Q-699b: the front's part-B lapse clock ran ahead of D's (the
+            # front stamps before the park RPC): D is idle and still holds them
+            # parked -- they stay parked for the front too and ride the sleep.
+            self.counters["w3_park_lapse_race"] += 1
+            logger.warning("Q-699b W3-PARK-LAPSE-RACE epoch=%d rids=%s: rank idle while the front's "
+                           "lapse clock (PARK_REQUEUE_S %.0f s from before the park RPC) counted these "
+                           "parks back -- D's own clock has not re-queued them, so D holds them parked; "
+                           "no disagreement, they ride the sleep as parks", self.epoch, sorted(_race)[:8],
+                           phase_policy.PARK_REQUEUE_S)
+            wv = None
         if wv is not None:
             # #1268: name it as the GROUP's verdict, because it now is one --
             # the reply carries the reduced answer and the lowest blocking rank.

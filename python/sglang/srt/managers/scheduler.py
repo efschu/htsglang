@@ -3595,6 +3595,12 @@ class Scheduler(
         """
         self.last_prefill_progress_time = ts if ts is not None else time.perf_counter()
 
+    def note_decode_progress(self, ts: Optional[float] = None) -> None:
+        """Q-698b: stamp the decode-progress clock (one decode round's result).
+        Unset until the first decode round, so a group that never decodes is
+        never judged by it (invariant_checker.prefill_livelock_verdict)."""
+        self.last_decode_progress_time = ts if ts is not None else time.perf_counter()
+
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
         self.watchdog = create_scheduler_watchdog(
@@ -6309,6 +6315,7 @@ class Scheduler(
             kv_session_offload=self.kv_session_offload,
             record_first_token_progress=self.note_first_token_progress,
             record_prefill_progress=self.note_prefill_progress,
+            record_decode_progress=self.note_decode_progress,
         )
 
     def init_req_max_new_tokens(self, req):
