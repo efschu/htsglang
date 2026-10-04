@@ -840,6 +840,20 @@ class Envs:
     # l15_pool.pool_on(os.environ) (1/true/on/yes). Default off = today's
     # per-card path byte for byte.
     SGLANG_WEG2_L15_POOL = EnvBool(False)
+    # L15-POOL S3 (docs/L15-POOL-ENTWURF-1004.md sec 3.2-3.3/4.1/7, KV only, no
+    # anchor): part switch ON TOP of SGLANG_WEG2_L15_POOL (S3 without POOL is
+    # refused by name, W-L15-POOL-S3-NEEDS-POOL). EVERY rank may overflow, not
+    # only the rank without a home segment: what does not fit a rank's own hold
+    # region lies as guest rows in the free rows of the other segments (Q3 rule:
+    # home first; guests by free area x measured link rate of the barlink matrix,
+    # the slowest card only as the last overflow), admission runs against the SUM
+    # of the segments, the hold manifest becomes v2 (guest placement + caps in
+    # the group fingerprint, so ranks that disagree on the placement fall back
+    # together), the guest rows are sampled at the wake (L15-POOL-CHECK, L15-CHECK
+    # with guest rows) and a failed park of a capped rank's overflow is a group
+    # fallback. Q2: the cap-0 rank's L2 duty (post_vote) stays. Default off = the
+    # S2 path (or today's per-card path when POOL is off) byte for byte.
+    SGLANG_WEG2_L15_POOL_S3 = EnvBool(False)
     # L15-POOL S1b (weg2/l15_pool_peak.py): the planner input P_AWAKE_PEAK_MIB
     # per card, built from measured WEG2-VRAM-PEAK windows (scripts/
     # l15_pool_peak_record.py): per card the MAXIMUM over boots/lines with its

@@ -31,7 +31,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import card_identity
-from sglang.srt.weg2.l15_pool import POOL_ENV, POOL_SHADOW_ENV, pool_on, pool_shadow_on
+from sglang.srt.weg2.l15_pool import (
+    POOL_ENV,
+    POOL_S3_ENV,
+    POOL_SHADOW_ENV,
+    pool_on,
+    pool_s3_flag,
+    pool_shadow_on,
+)
 
 L15_MASTER_ENV = "SGLANG_WEG2_L15"
 L15_MIB_ENV = "SGLANG_WEG2_L15_MIB"
@@ -353,7 +360,8 @@ def refuse_dual(argv: Sequence[str], env: Mapping[str, str]) -> Optional[str]:
     armed = [name for name, on in ((L15_MASTER_ENV, master_on(env)),
                                    (HOT_HANDOVER_ENV, handover_on(env)),
                                    (POOL_SHADOW_ENV, pool_shadow_on(env)),
-                                   (POOL_ENV, pool_on(env))) if on]
+                                   (POOL_ENV, pool_on(env)),
+                                   (POOL_S3_ENV, pool_s3_flag(env))) if on]
     if not armed:
         return None
     return (f"{DUAL_REFUSAL_CODE}: --dual-layout with {', '.join(armed)} is refused in V1: "
@@ -373,7 +381,8 @@ def refuse_not_27b(profile: str, env: Mapping[str, str]) -> Optional[str]:
     armed = [name for name, on in ((L15_MASTER_ENV, master_on(env)),
                                    (HOT_HANDOVER_ENV, handover_on(env)),
                                    (POOL_SHADOW_ENV, pool_shadow_on(env)),
-                                   (POOL_ENV, pool_on(env))) if on]
+                                   (POOL_ENV, pool_on(env)),
+                                   (POOL_S3_ENV, pool_s3_flag(env))) if on]
     if not armed:
         return None
     return (f"{NOT27B_REFUSAL_CODE}: {', '.join(armed)} on profile {profile!r} is refused: "
@@ -394,6 +403,37 @@ def refuse_pool_without_master(env: Mapping[str, str]) -> Optional[str]:
     return (f"{POOLMASTER_REFUSAL_CODE}: {POOL_ENV}=1 without {L15_MASTER_ENV}=1 is "
             "refused: the pooled hold is a part of L1.5 and every one of its hooks "
             f"sits behind the master -- set {L15_MASTER_ENV}=1 or turn {POOL_ENV} off.")
+
+
+POOLS3_REFUSAL_CODE = "W-L15-POOL-S3-NEEDS-POOL"
+
+
+def refuse_pool_s3_without_pool(env: Mapping[str, str]) -> Optional[str]:
+    """``SGLANG_WEG2_L15_POOL_S3=1`` without ``SGLANG_WEG2_L15_POOL=1``: S3 is
+    a part switch on top of the S2 pooled hold (``l15_pool.pool_s3_on`` needs
+    both), so alone it would silently do nothing -- refused BY NAME."""
+    if not pool_s3_flag(env) or pool_on(env):
+        return None
+    return (f"{POOLS3_REFUSAL_CODE}: {POOL_S3_ENV}=1 without {POOL_ENV}=1 is refused: "
+            "the S3 overflow of every rank is a part of the pooled hold and does "
+            f"nothing alone -- set {POOL_ENV}=1 or turn {POOL_S3_ENV} off.")
+
+
+POOLDEPOSIT_REFUSAL_CODE = "W-L15-POOL-DEPOSIT"
+L15_DEPOSIT_ENV = "SGLANG_WEG2_L15_DEPOSIT"
+
+
+def refuse_pool_with_deposit(env: Mapping[str, str]) -> Optional[str]:
+    """The pooled hold (S2/S3) lays guest rows into the FREE hold rows of the
+    hosting segments; the deposit region of a running P prefill
+    (``l15_deposit.deposit_region``, SGLANG_WEG2_L15_DEPOSIT=1) is exactly those
+    rows ``[held, cap)``. Until S6 makes the deposit pool-aware the two together
+    would overwrite guest rows -- refused BY NAME."""
+    if not pool_on(env) or not _switch(env, L15_DEPOSIT_ENV):
+        return None
+    return (f"{POOLDEPOSIT_REFUSAL_CODE}: {POOL_ENV}=1 with {L15_DEPOSIT_ENV}=1 is refused: "
+            "the deposit region and the pool's guest rows are the same free hold rows "
+            "(the pool-aware deposit is stage S6) -- turn one of them off.")
 
 
 def refuse_no_caps(posts: Sequence[L15Post], env: Mapping[str, str],

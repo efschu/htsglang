@@ -54,6 +54,7 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.weg2.l15_park import ParkPiece
 from sglang.srt.weg2.l15_policy import Candidate, HoldSet, _order_key, select_hold
 
 POOL_SHADOW_ENV = "SGLANG_WEG2_L15_POOL_SHADOW"
@@ -842,3 +843,330 @@ def log_sleep_shadow(sched, env: Mapping[str, str], log) -> Optional[str]:
         except Exception:  # noqa: BLE001
             pass
         return None
+
+
+# -- S3: EVERY rank may overflow; guests by free area x measured rate ---------------
+#
+# Design sec 3.2-3.3 / 4.1 / 5.2 N1-N3,N5,N7 (KV only; the anchors stay the S4
+# work).  S2 let only a rank WITHOUT a home segment park its shards in foreign
+# segments; S3 lets any rank do it: what a rank's own hold region cannot take
+# (rows beyond its cap) lies as guest rows in the FREE rows of the other
+# segments.  The plan is pure and rank-uniform (same replicated lists, same
+# rates -> same pieces), the group compares its digest (plan_fingerprint with
+# the rates digest) and the manifest v2 carries the guest list in the group
+# fingerprint.
+
+POOL_S3_ENV = "SGLANG_WEG2_L15_POOL_S3"
+
+
+def pool_s3_flag(env: Mapping[str, str]) -> bool:
+    """True when ``SGLANG_WEG2_L15_POOL_S3`` is set (1/true/on/yes), whatever
+    the pool switch says (the launcher refuses the lonely flag by name)."""
+    return str(env.get(POOL_S3_ENV, "") or "").strip().lower() in _ON_VALUES
+
+
+def pool_s3_on(env: Mapping[str, str]) -> bool:
+    """True when the S3 overflow of every rank takes effect: the part switch
+    AND the S2 pool switch (S3 never runs without POOL; the launcher refuses
+    that combination by name, ``l15_plan.refuse_pool_s3_without_pool``)."""
+    return pool_on(env) and pool_s3_flag(env)
+
+
+S3_MODE = ("POOL(S3: every rank may overflow into foreign segments, guests by free "
+           "area x measured link rate, manifest v2 with the guest list)")
+
+
+def select_hold_pool_s3(
+    candidates: Sequence[Candidate],
+    cap_rows_by_rank: Sequence[int],
+    cap_anchor_slots: int,
+) -> HoldSet:
+    """``select_hold`` against the SUM of the segments (S3): a request is held
+    when the rows of ALL its shards together fit the pool, whichever rank they
+    belong to -- a capped rank's overflow is no longer ``no_room`` but a guest.
+
+    Per rank the guest need is ``max(0, rows_r - cap_r)`` and the guest room
+    is ``max(0, cap_r - rows_r)``; summed over the ranks the need fits the
+    room exactly when ``sum(rows) <= sum(caps)`` (``max(0,x) - max(0,-x) = x``),
+    so the admission is that one inequality on the running totals.  Everything
+    else is today's policy word for word: anchorless candidates are excluded up
+    front, the order is seat > parked > served / younger / rid, the anchor
+    count cap gives ``anchor_full``, later smaller candidates may still fit.
+    The row sums are the pre-compaction estimate; the exact check on the
+    COMPACTED rows is ``l15_retain.plan_round`` (it drops the lowest-priority
+    request until :func:`pool_park_plan` places every guest row), BEFORE
+    anything moves.  No safety factor, no extra ceiling: the caps are the
+    budget."""
+    candidates = list(candidates)
+    excluded: Dict[str, Tuple[str, str]] = {
+        c.rid: (c.rid, REASON_ANCHORLESS)
+        for c in candidates
+        if c.anchor_depth != c.kv_depth
+    }
+    ordered = sorted(
+        (c for c in candidates if c.anchor_depth == c.kv_depth), key=_order_key
+    )
+    caps = [max(0, int(c)) for c in cap_rows_by_rank]
+    total_cap = sum(caps)
+    used = 0
+    admitted = []
+    for c in ordered:
+        need = sum(int(v) for v in c.rows_by_rank)
+        if used + need > total_cap:
+            excluded[c.rid] = (c.rid, REASON_POOL_FULL)
+            continue
+        if len(admitted) >= cap_anchor_slots:
+            excluded[c.rid] = (c.rid, REASON_ANCHOR_FULL)
+            continue
+        admitted.append(c)
+        used += need
+    rows_by_rank = tuple(sum(c.rows_by_rank[r] for c in admitted) for r in range(len(caps)))
+    return HoldSet(
+        rids=tuple(c.rid for c in admitted),
+        rows_by_rank=rows_by_rank,
+        anchors=len(admitted),
+        excluded=tuple(excluded.values()),
+    )
+
+
+def pool_park_plan(
+    keep_rows: Sequence[int],
+    caps: Sequence[int],
+    rates: Optional[Mapping[Tuple[int, int], float]] = None,
+    default_rate: float = 1.0,
+) -> Tuple[List[ParkPiece], Optional[str]]:
+    """``(pieces, None)`` or ``([], reason)``: the S3 guest placement.
+
+    ``keep_rows[r]``: rank r's COMPACTED keep rows of this hold (the
+    manifest's rows_by_rank); ``caps[r]``: its hold region in rows (0 = no home
+    segment).  Rank r keeps ``home_r = min(keep_r, cap_r)`` rows in place
+    (rows ``[0, home_r)``, cost 0); the overflow rows ``[home_r, keep_r)`` --
+    all of them for a cap-0 rank -- go to the FREE rows ``[home_h, cap_h)`` of
+    the other segments.  A rank that overflows has no free rows itself, so a
+    host never overflows and the pieces can never chain.
+
+    Host choice per piece (Q3 of the design, user decision 04.10.): NOT the
+    slowest card (strictly lowest mean inbound rate of the measured matrix --
+    only as the last overflow), then the larger free area x directed rate
+    (``rates[(src, host)]``), then the lower rank (deterministic).  Without
+    rates every rank is equal: largest free area first, ties to the lower
+    rank -- exactly :func:`l15_park.park_plan` for a hold in which only cap-0
+    ranks overflow (pinned by a test).  A shard may be split over several
+    hosts.  Refused by name when the free rows cannot take the whole
+    overflow (a partial park would need an L2 refill the capped rank does
+    not have).  Keyed by cap and rank, never by card name or ordinal."""
+    R = len(keep_rows)
+    if len(caps) != R:
+        return [], "keep_rows for %d ranks, caps for %d" % (R, len(caps))
+    keep = [max(0, int(x)) for x in keep_rows]
+    cap = [max(0, int(c)) for c in caps]
+    home = [min(keep[r], cap[r]) for r in range(R)]
+    free = {r: cap[r] - home[r] for r in range(R) if cap[r] - home[r] > 0}
+    cursor = {r: home[r] for r in free}
+    rt = _Rates(rates, default_rate, [r for r in range(R) if cap[r] > 0])
+    pieces: List[ParkPiece] = []
+    for src in range(R):
+        need, row = keep[src] - home[src], home[src]
+        while need > 0:
+            cands = [h for h, f in free.items() if f > 0 and h != src]
+            if not cands:
+                have = sum(max(0, v) for v in free.values())
+                return [], ("rank %d needs %d more guest rows, the other segments "
+                            "have %d free" % (src, need, have))
+            h = min(cands, key=lambda x: _host_key(rt, src, x, free[x]))
+            n = min(need, free[h])
+            pieces.append(ParkPiece(src, h, row, cursor[h], n))
+            cursor[h] += n
+            free[h] -= n
+            need -= n
+            row += n
+    return pieces, None
+
+
+def guest_tuples(pieces: Sequence) -> Tuple[Tuple[int, int, int, int, int], ...]:
+    """The manifest form of a placement: ``(src, dst, src_row, dst_row, rows)``."""
+    return tuple((int(p.src), int(p.dst), int(p.src_row), int(p.dst_row), int(p.rows))
+                 for p in pieces)
+
+
+def pieces_of(guests: Sequence[Sequence[int]]) -> List[ParkPiece]:
+    return [ParkPiece(*(int(x) for x in g)) for g in guests]
+
+
+def quantize_rates(rates: Optional[Mapping[Tuple[int, int], float]]
+                   ) -> Optional[Dict[Tuple[int, int], float]]:
+    """Three digits like ``barlink_matrix._quant`` (about 1 MB/s, well below
+    the measurement noise): a decision must not flip on the 12th digit, and
+    the digest every rank compares must not either.  Non-finite and
+    non-positive values are dropped; nothing left = None."""
+    import math
+
+    if not rates:
+        return None
+    out = {}
+    for (a, b), v in rates.items():
+        v = float(v)
+        if math.isfinite(v) and v > 0.0 and round(v, 3) > 0.0:
+            out[(int(a), int(b))] = round(v, 3)
+    return dict(sorted(out.items())) or None
+
+
+def rates_digest(rates: Optional[Mapping[Tuple[int, int], float]]) -> str:
+    """Short digest of the rates a placement was scored with (``-`` = none)."""
+    import hashlib
+
+    q = quantize_rates(rates)
+    if not q:
+        return "-"
+    blob = repr(tuple((a, b, v) for (a, b), v in sorted(q.items())))
+    return hashlib.sha1(blob.encode()).hexdigest()[:10]
+
+
+def rates_from_capacity(capacity, world: int, gi: int = -1
+                        ) -> Optional[Dict[Tuple[int, int], float]]:
+    """``{(src, dst): GB/s}`` for every directed pair of a measured matrix.
+    ``capacity(src, dst, gi)`` is ``barlink_matrix.Measurement.capacity``
+    (a measured edge wins, else min(outbound, inbound) -- its own upper-bound
+    rule); ``gi`` = -1 is the LARGEST measured size (the saturated rate, the
+    one a bulk guest transfer sees).  None when any pair is unavailable."""
+    out = {}
+    try:
+        for a in range(world):
+            for b in range(world):
+                if a != b:
+                    out[(a, b)] = float(capacity(a, b, gi))
+    except Exception:  # noqa: BLE001 -- no rates is a named state, not a crash
+        return None
+    return quantize_rates(out)
+
+
+def load_barlink_rates(env: Mapping[str, str], tp: int
+                       ) -> Tuple[Optional[Dict[Tuple[int, int], float]], str]:
+    """The measured barlink matrix of this rig as pair rates: the planner's
+    cache file (``barlink_matrix.read`` path of ``load_config``: the config's
+    ``measure.cache`` or the default) carries the last startup measurement.
+    Accepted only when it is a measurement of ``tp`` ranks; the rate of a pair
+    is read from the measurement, NEVER derived from a card name.  Returns
+    ``(rates, source)``; ``(None, "none(<why>)")`` = uniform placement.  Never
+    raises."""
+    try:
+        import json
+
+        from sglang.srt.distributed.device_communicators import barlink_matrix as bm
+
+        path = bm.load_config(env).collective.measure.cache or bm._default_cache()
+        with open(path) as fh:
+            d = json.load(fh)
+        m = bm.Measurement.from_dict(d["measurement"])
+    except Exception as exc:  # noqa: BLE001
+        return None, "none(barlink matrix unreadable: %s)" % type(exc).__name__
+    if int(m.world) != int(tp):
+        return None, "none(barlink matrix is of %d ranks, the pool has %d)" % (
+            int(m.world), int(tp))
+    gi = len(m.sizes) - 1
+    rates = rates_from_capacity(m.capacity, int(tp), gi)
+    if rates is None:
+        return None, "none(barlink matrix has no complete pair rates)"
+    return rates, "barlink-matrix(ranks=%d,sensor=%s,size_kib=%d)" % (
+        int(tp), m.sensor, int(m.sizes[gi]) >> 10)
+
+
+def resolve_rates(env: Mapping[str, str], tp: int, loader=None
+                  ) -> Tuple[Optional[Dict[Tuple[int, int], float]], str]:
+    """The pair rates of the placement and where they came from:
+
+    1. ``SGLANG_WEG2_L15_POOL_RATES`` (``"0>1=13.4,1>0=14.4"``, the explicit
+       operator input; malformed = named, no silent fallback),
+    2. the measured barlink matrix (:func:`load_barlink_rates`),
+    3. none = uniform (no card is the slowest).
+
+    Every rank resolves them itself from the same sources; the digest in the
+    plan fingerprint turns a round off everywhere when two ranks disagree."""
+    raw = env.get(POOL_RATES_ENV)
+    if raw is not None and str(raw).strip():
+        parsed = parse_rates(raw)
+        if parsed is None:
+            return None, "none(%s malformed)" % POOL_RATES_ENV
+        return quantize_rates(parsed), "env"
+    return (loader or load_barlink_rates)(env, tp)
+
+
+def capped_guest_ranks(guests: Optional[Sequence[Sequence[int]]],
+                       caps: Optional[Sequence[int]]) -> Tuple[int, ...]:
+    """Ranks WITH a home segment that have guest pieces (S3 overflow of a
+    capped rank).  Such a rank has no L2 refill path for them, so a failed
+    park-back of the group must drop the whole hold."""
+    if not guests or caps is None:
+        return ()
+    return tuple(sorted({int(g[0]) for g in guests
+                         if 0 <= int(g[0]) < len(caps) and int(caps[int(g[0])]) > 0}))
+
+
+def hosted_end(guests: Optional[Sequence[Sequence[int]]], rank: int) -> int:
+    """First row after the last guest row ``rank`` hosts (0 = hosts none)."""
+    return max([int(g[3]) + int(g[4]) for g in (guests or ()) if int(g[1]) == int(rank)]
+               + [0])
+
+
+def wake_keep_rows(rows_by_rank: Sequence[int], rank: int,
+                   guests: Optional[Sequence[Sequence[int]]]) -> int:
+    """The rows the wake's zero scrub must leave alone on ``rank``: its compact
+    prefix and, for a v2 manifest, the guest rows it hosts (they come back to
+    their owners only at the park-back, after the restore)."""
+    keep = int(rows_by_rank[rank]) if 0 <= rank < len(rows_by_rank) else 0
+    return max(keep, hosted_end(guests, rank)) if guests is not None else keep
+
+
+def guest_row_ranges(guests: Optional[Sequence[Sequence[int]]], rank: int
+                     ) -> List[Tuple[int, int]]:
+    """``[(lo, hi))`` compact-row ranges of the guest rows ``rank`` OWNS."""
+    return sorted((int(g[2]), int(g[2]) + int(g[4]))
+                  for g in (guests or ()) if int(g[0]) == int(rank))
+
+
+def _even(items: Sequence, k: int) -> List:
+    n = len(items)
+    if k <= 0 or n == 0:
+        return []
+    if n <= k:
+        return list(items)
+    return [items[(j * n) // k] for j in range(k)]
+
+
+def stratified_check_plan(plan: Sequence[tuple], ranges: Sequence[Tuple[int, int]],
+                          k: int, guest_share: float = 0.5) -> List[tuple]:
+    """The L15-CHECK sample of a rank that owns guest rows: ``plan`` entries
+    are ``(rid, compact_row, l2_slot, l2_gen)``; up to ``k`` of them, at least
+    ``guest_share`` of the sample taken from rows inside ``ranges`` (the guest
+    rows, which travelled through a foreign segment) when there are any, the
+    rest evenly over the home rows; each part evenly spaced by row.  The
+    checker then reads exactly these rows (it samples evenly again and a
+    sample of at most ``k`` entries comes back whole)."""
+    entries = sorted(plan, key=lambda e: int(e[1]))
+    in_guest = [e for e in entries
+                if any(lo <= int(e[1]) < hi for lo, hi in ranges)]
+    if not in_guest:
+        return _even(entries, k)
+    home = [e for e in entries if e not in in_guest]
+    kg = min(len(in_guest), max(1, int(k * guest_share)))
+    kh = min(len(home), max(0, k - kg))
+    kg = min(len(in_guest), k - kh)
+    return sorted(_even(in_guest, kg) + _even(home, kh), key=lambda e: int(e[1]))
+
+
+def plan_line_s3(epoch, hs: HoldSet, caps: Sequence[int], keep_rows: Sequence[int],
+                 pieces: Sequence, fp: str, n_candidates: int, rates_src: str,
+                 rates_fp: str) -> str:
+    """The S3 ``L15-POOL-PLAN``: the S2 line plus who overflows, the guest
+    pairs with their share of the pool's guests per host, and the rate source
+    the placement was scored with."""
+    base = plan_line(epoch, hs, caps, keep_rows, pieces, fp, n_candidates)
+    over = ",".join(
+        "%d:%d" % (r, max(0, int(keep_rows[r]) - max(0, int(caps[r]))))
+        for r in range(len(keep_rows)) if int(keep_rows[r]) > max(0, int(caps[r])))
+    hosts: Dict[int, int] = {}
+    for p in pieces:
+        hosts[int(p.dst)] = hosts.get(int(p.dst), 0) + int(p.rows)
+    return (base + " s3=1 overflow_rows=%s guest_on_host=%s rates_src=%s rates_fp=%s"
+            % (over or "-", ",".join("%d:%d" % kv for kv in sorted(hosts.items())) or "-",
+               rates_src, rates_fp))

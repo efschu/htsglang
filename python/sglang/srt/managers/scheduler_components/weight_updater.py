@@ -248,6 +248,20 @@ def _l15_rearm_early_reads(sched, reason: str) -> int:
 KV_CACHE_TAG_FOR_L15 = "kv_cache"
 
 
+def _l15_keep_rows_of(m, rank) -> int:
+    """The rows the wake's zero scrub leaves alone on ``rank``: its compact
+    prefix ``rows_by_rank[rank]``; for a v2 manifest (L15-POOL S3) also the
+    guest rows it hosts -- they come back to their owners only at the
+    park-back, after this restore (``l15_pool.wake_keep_rows``). A v1
+    manifest: exactly the old value."""
+    if getattr(m, "guests", None) is None:
+        return (int(m.rows_by_rank[rank])
+                if 0 <= rank < len(m.rows_by_rank) else 0)
+    from sglang.srt.weg2 import l15_pool
+
+    return l15_pool.wake_keep_rows(m.rows_by_rank, rank, m.guests)
+
+
 def _l15_refill_on(env) -> bool:
     """L15-12c-SW: the cap-0 refill kill switch, SGLANG_WEG2_L15_REFILL.
 
@@ -7416,11 +7430,9 @@ class SchedulerWeightUpdaterManager:
                                 rank)
                     return None, rank, 0, True
                 self._l15_wake_refill = True
-                keep_rows = (int(m.rows_by_rank[rank])
-                              if 0 <= rank < len(m.rows_by_rank) else 0)
+                keep_rows = _l15_keep_rows_of(m, rank)
                 return m, rank, keep_rows, True
-            keep_rows = (int(m.rows_by_rank[rank])
-                          if 0 <= rank < len(m.rows_by_rank) else 0)
+            keep_rows = _l15_keep_rows_of(m, rank)
             return m, rank, keep_rows, True
         except Exception as exc:  # noqa: BLE001 -- no signal: today's restore
             logger.info("L15-WAKE-RESTORE hold signal unavailable (%s: %s)",
@@ -7708,6 +7720,25 @@ class SchedulerWeightUpdaterManager:
             return None
         k = 64
         rank = self._weg2_rank()
+        # L15-POOL S3: guest rows travelled through a foreign segment and back;
+        # the sample covers them (at least half of it, L15-CHECK against L2 for
+        # the rows with an L2 source; the rows without one are covered by the
+        # source checksum of L15-POOL-CHECK). A rank whose rows were only
+        # refilled for the anchors (parked: no KV refill) samples ONLY its guest
+        # rows and fewer of them.
+        _s3_ranges = []
+        try:
+            from sglang.srt.weg2 import l15_pool as _l15_pool_c
+            if _l15_pool_c.pool_s3_on(os.environ) and getattr(m, "guests", None):
+                _s3_ranges = _l15_pool_c.guest_row_ranges(m.guests, rank)
+        except Exception:  # noqa: BLE001 -- no guest sample, the old sample runs
+            _s3_ranges = []
+        _s3_guest_only = bool(_s3_ranges) and bool(
+            getattr(self, "_l15_park_back_ok", False)) and bool(
+            getattr(self, "_l15_refill_done", False))
+        if _s3_guest_only:
+            self._l15_refill_done = False
+            k = 16
         if getattr(self, "_l15_refill_done", False) and os.environ.get(
                 "SGLANG_WEG2_L15_CAP0_SAMPLE", "0") != "1":
             # L15-FIX-CAP0-CHECK: this rank's rows were just copied from L2
@@ -7737,6 +7768,15 @@ class SchedulerWeightUpdaterManager:
             plan = [(str(rids[0]), row, slot, gen)
                     for row, slot, gen, _lane, rids in
                     l15_restore.owned_l2_rows(m, rank, prefix)]
+            if _s3_ranges:
+                from sglang.srt.weg2 import l15_pool as _l15_pool_c2
+                if _s3_guest_only:
+                    plan = [e for e in plan
+                            if any(lo <= int(e[1]) < hi for lo, hi in _s3_ranges)]
+                plan = _l15_pool_c2.stratified_check_plan(plan, _s3_ranges, k)
+                logger.info("L15-CHECK rank=%d s3 guest sample: %d row(s) planned "
+                            "(guest ranges %s, guest_only=%s)", rank, len(plan),
+                            _s3_ranges[:4], _s3_guest_only)
             # L15-FIX-REFILL-POOL: the same full-attention pool the refill
             # writes (the hybrid wrapper has no k_buffer)
             from sglang.srt.weg2.l15_shadow import kv_pool_of as _l15_kvp
@@ -12124,18 +12164,59 @@ class SchedulerWeightUpdaterManager:
                 # this one position); the cap-0 rank's refill then loads only
                 # its anchors from L2
                 self._l15_park_back_ok = False
+                _l15_s3_drop = False
                 try:
                     from sglang.srt.weg2 import l15_park as _l15_pk
                     if _l15_pk.park_on(os.environ):
+                        from sglang.srt.weg2 import l15_pool as _l15_pool_w
+                        _l15_s3 = _l15_pool_w.pool_s3_on(os.environ)
+                        _l15_mg = (tuple(_l15_m.guests)
+                                   if _l15_s3 and _l15_m is not None
+                                   and getattr(_l15_m, "guests", None) is not None
+                                   else None)
                         self._l15_park_back_ok = _l15_pk.park_back_at_wake(
                             self.scheduler, os.environ, logger.info,
                             epoch=int(_l15_m.epoch) if _l15_m is not None else -1,
-                            group_ok=not _weg2_kv_refusal)
+                            group_ok=not _weg2_kv_refusal,
+                            manifest_guests=_l15_mg)
+                        # L15-POOL S3: a CAPPED rank's overflow rows have no L2
+                        # refill path (only the cap-0 rank refills). A park-back
+                        # that did not land on the group (the result is
+                        # group-uniform) therefore leaves them undefined: this
+                        # rank votes no hold and the group drops the hold.
+                        if (_l15_s3 and not self._l15_park_back_ok
+                                and _l15_m is not None
+                                and _l15_pool_w.capped_guest_ranks(
+                                    getattr(_l15_m, "guests", None),
+                                    getattr(_l15_m, "caps", None))):
+                            _l15_s3_drop = True
+                            logger.info(
+                                "L15-POOL S3: park-back did not land and rank(s) %s "
+                                "with a home segment own guest rows -> vote no hold "
+                                "(group fallback, no L2 refill path for them)",
+                                list(_l15_pool_w.capped_guest_ranks(
+                                    _l15_m.guests, _l15_m.caps)))
                 except Exception as exc:  # noqa: BLE001 -- L2 refill serves
                     logger.warning("L15-PARK at=wake failed (%s: %s)",
                                    type(exc).__name__, exc)
                     self._l15_park_back_ok = False
+                    try:
+                        from sglang.srt.weg2 import l15_pool as _l15_pool_w2
+                        _l15_s3_drop = bool(
+                            _l15_pool_w2.pool_s3_on(os.environ)
+                            and _l15_m is not None
+                            and _l15_pool_w2.capped_guest_ranks(
+                                getattr(_l15_m, "guests", None),
+                                getattr(_l15_m, "caps", None)))
+                    except Exception:  # noqa: BLE001 -- vote stays as it was
+                        _l15_s3_drop = False
+                if _l15_s3_drop:
+                    # no refill for a hold this rank votes against (the helper
+                    # below returns False at once without the mark)
+                    self._l15_wake_refill = False
                 _l15_opt_failed = self._l15_optimistic_refill()
+                if _l15_s3_drop:
+                    _l15_opt_failed = True
                 _l15_wt1 = time.perf_counter()
                 if _l15_opt_failed:
                     _l15_v = self._l15_wake_check_and_decide(

@@ -70,6 +70,21 @@ class Manifest:
     spans: Tuple[HoldSpan, ...]
     rows_by_rank: Tuple[int, ...]
     anchor_slots: int
+    # MANIFEST v2 (L15-POOL S3, docs/L15-POOL-ENTWURF-1004.md sec 4.1). None =
+    # a v1 record: nothing below is written, hashed or read, so the record and
+    # its fingerprint are byte for byte the old ones (switch off). A tuple (empty
+    # allowed) = v2:
+    #   guests -- the guest placement, one ``(src, dst, src_row, dst_row, rows)``
+    #             per piece: ``src``'s compact rows ``[src_row, src_row + rows)``
+    #             lie as guests in ``dst``'s free hold rows from ``dst_row`` for
+    #             the P phase (home rows stay in their own segment and are not
+    #             listed);
+    #   caps   -- every rank's hold region in rows as the planner gave it.
+    # Both are part of the fingerprint, so ranks that disagree on WHERE a row
+    # lies (or on the segments it was planned for) fall back together -- the
+    # same hash edge as for slots and generations.
+    guests: Optional[Tuple[Tuple[int, int, int, int, int], ...]] = None
+    caps: Optional[Tuple[int, ...]] = None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -108,6 +123,28 @@ def manifest_path(group: str, rank: int, env) -> str:
     return "%s.%s.%d.json" % (override, group, rank)
 
 
+def _v2_head(m: Manifest) -> dict:
+    """The v2 fields of the record head ({} for a v1 manifest)."""
+    if m.guests is None:
+        return {}
+    return {"guests": [[int(x) for x in g] for g in m.guests],
+            "caps": [int(x) for x in (m.caps or ())]}
+
+
+def _v2_load(head: dict) -> dict:
+    """Constructor kwargs from a record head that may carry the v2 fields."""
+    if "guests" not in head:
+        return {}
+    g = head["guests"]
+    if not isinstance(g, list) or any(not isinstance(x, list) or len(x) != 5 for x in g):
+        raise ValueError("malformed L1.5 manifest: 'guests' is not a list of 5-int pieces")
+    c = head.get("caps", [])
+    if not isinstance(c, list):
+        raise ValueError("malformed L1.5 manifest: 'caps' is not a list")
+    return {"guests": tuple(tuple(int(v) for v in x) for x in g),
+            "caps": tuple(int(v) for v in c)}
+
+
 def _span_to_dict(s: HoldSpan) -> dict:
     return {
         "rid": s.rid,
@@ -132,6 +169,7 @@ def to_json(m: Manifest) -> str:
         "rows_by_rank": list(m.rows_by_rank),
         "anchor_slots": m.anchor_slots,
     }
+    obj.update(_v2_head(m))
     return json.dumps(obj, sort_keys=True)
 
 
@@ -204,6 +242,7 @@ def from_json(s: str) -> Manifest:
         spans=tuple(spans),
         rows_by_rank=_int_list(obj, "rows_by_rank", "record"),
         anchor_slots=_as_int(obj, "anchor_slots", "record"),
+        **_v2_load(obj),
     )
 
 
@@ -222,6 +261,7 @@ def to_bytes(m: Manifest) -> bytes:
     head = {"epoch": int(m.epoch), "pid": int(m.pid),
             "rows_by_rank": [int(x) for x in m.rows_by_rank],
             "anchor_slots": int(m.anchor_slots),
+            **_v2_head(m),
             "spans": [{"rid": s.rid, "depth": int(s.depth),
                        "anchor_slot": int(s.anchor_slot),
                        "anchor_l2_slot": int(s.anchor_l2_slot),
@@ -265,7 +305,8 @@ def from_bytes(raw: bytes) -> Manifest:
         return Manifest(epoch=int(head["epoch"]), pid=int(head["pid"]),
                         spans=tuple(spans),
                         rows_by_rank=tuple(int(x) for x in head["rows_by_rank"]),
-                        anchor_slots=int(head["anchor_slots"]))
+                        anchor_slots=int(head["anchor_slots"]),
+                        **_v2_load(head))
     except (KeyError, ValueError, TypeError) as exc:
         raise ValueError(f"malformed L1.5 manifest (binary): {exc}") from None
 
@@ -342,6 +383,9 @@ def fingerprint(m: Manifest) -> int:
     h = hashlib.sha256()
     head = {"epoch": int(m.epoch), "rows_by_rank": [int(x) for x in m.rows_by_rank],
             "anchor_slots": int(m.anchor_slots), "n_spans": len(m.spans)}
+    # v2 (S3): the guest placement and the planned caps are hashed too; a v1
+    # manifest hashes exactly what it always did
+    head.update(_v2_head(m))
     h.update(json.dumps(head, sort_keys=True).encode())
     for sp in sorted(m.spans, key=lambda x: x.rid):
         h.update(json.dumps({"rid": sp.rid, "depth": int(sp.depth),

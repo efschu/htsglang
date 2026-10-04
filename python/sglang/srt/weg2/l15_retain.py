@@ -246,6 +246,10 @@ class RoundPlan:
     # of the whole pool decision the group compares (``agree_pool``)
     guest_pieces: Optional[tuple] = None
     pool_fp: Optional[str] = None
+    # L15-POOL S3: the plan was made with the overflow of EVERY rank; the
+    # planned caps ride the manifest v2 (None = S2 / per-card path)
+    s3: bool = False
+    caps: Optional[tuple] = None
 
 
 def plan_round(
@@ -259,6 +263,9 @@ def plan_round(
     epoch: int,
     log: Callable[[str], None],
     pool: Optional[bool] = None,
+    s3: Optional[bool] = None,
+    rates: Optional[dict] = None,
+    rates_src: Optional[str] = None,
 ) -> Optional["RoundPlan"]:
     """Steps (1)-(2) of :func:`retain_at_sleep` (select_hold, compact_plan,
     anchor_plan). None = benign skip, nothing touched (logged as before).
@@ -269,17 +276,34 @@ def plan_round(
     (``park_plan``) before anything moves: a request without room is dropped,
     lowest priority first (reason ``pool_full``), never held half and never
     paid for in a retain the park would refuse afterwards. False = today's
-    path, byte for byte."""
+    path, byte for byte.
+
+    ``s3`` (None = ``SGLANG_WEG2_L15_POOL_S3`` with the pool on): EVERY rank
+    may overflow -- the admission runs against the SUM of the segments
+    (``select_hold_pool_s3``), a capped rank's rows beyond its hold region are
+    guest rows too, the placement is ``l15_pool.pool_park_plan`` (Q3 rule with
+    the measured pair ``rates``; ``rates=None`` = resolved from the env / the
+    barlink matrix, ``rates_src`` names where they came from) and
+    the digest every rank compares carries the rates. A capped rank never
+    gets ``keep_over_cap``-trimmed in this mode: its overflow is a guest."""
     import os as _os
 
     candidates = list(candidates)
     if pool is None:
         pool = l15_pool.pool_on(_os.environ)
+    if s3 is None:
+        s3 = l15_pool.pool_s3_on(_os.environ)
+    s3 = bool(s3) and bool(pool)
+    if s3 and rates is None:
+        rates, rates_src = l15_pool.resolve_rates(_os.environ, len(caps_rows_by_rank))
+    rates = l15_pool.quantize_rates(rates) if s3 else None
+    rates_src = (rates_src or "none") if s3 else None
     guest_pieces = None
     pool_fp = None
     # (1) who stays
     try:
-        hs = (l15_pool.select_hold_pool if pool else select_hold)(
+        hs = (l15_pool.select_hold_pool_s3 if s3 else
+              l15_pool.select_hold_pool if pool else select_hold)(
             candidates, caps_rows_by_rank, cap_anchor_slots)
         if not hs.rids:
             log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold")
@@ -301,6 +325,8 @@ def plan_round(
         trimmed = []
         _rows0 = tuple(int(x) for x in plan.rows_by_rank)
         def _home_over(pl):
+            if s3:
+                return False  # S3: a capped rank's overflow is a guest, not a trim
             return any(
                 int(caps_rows_by_rank[r]) > 0
                 and int(pl.rows_by_rank[r]) > int(caps_rows_by_rank[r])
@@ -312,6 +338,10 @@ def plan_round(
             # runs at the release, so plan and park cannot disagree)
             if not pool:
                 return None
+            if s3:
+                return l15_pool.pool_park_plan(
+                    list(pl.rows_by_rank), [int(c) for c in caps_rows_by_rank],
+                    rates)[1]
             return park_plan(list(pl.rows_by_rank),
                              [int(c) for c in caps_rows_by_rank])[1]
 
@@ -360,19 +390,29 @@ def plan_round(
         # the final plan's guest placement: the loop above ended only when
         # park_plan accepted it, so a refusal here is impossible -- if it
         # happens anyway the round is not held (never "held without room")
-        guest_pieces, _gwhy = park_plan(list(plan.rows_by_rank),
-                                        [int(c) for c in caps_rows_by_rank])
+        if s3:
+            guest_pieces, _gwhy = l15_pool.pool_park_plan(
+                list(plan.rows_by_rank), [int(c) for c in caps_rows_by_rank], rates)
+        else:
+            guest_pieces, _gwhy = park_plan(list(plan.rows_by_rank),
+                                            [int(c) for c in caps_rows_by_rank])
         if _gwhy is not None:
             log(f"L15-RETAIN skipped reason=pool-no-guest-room: {_gwhy}")
             return None
         guest_pieces = tuple(guest_pieces)
         pool_fp = l15_pool.plan_fingerprint(
             hs.rids, plan.rows_by_rank, caps_rows_by_rank, guest_pieces)
-        log(l15_pool.plan_line(epoch, hs, caps_rows_by_rank, plan.rows_by_rank,
-                               guest_pieces, pool_fp, len(candidates)))
+        if s3:
+            log(l15_pool.plan_line_s3(
+                epoch, hs, caps_rows_by_rank, plan.rows_by_rank, guest_pieces,
+                pool_fp, len(candidates), rates_src, l15_pool.rates_digest(rates)))
+        else:
+            log(l15_pool.plan_line(epoch, hs, caps_rows_by_rank, plan.rows_by_rank,
+                                   guest_pieces, pool_fp, len(candidates)))
     return RoundPlan(hs=hs, plan=plan, a_h=a_h, anchor_moves=anchor_moves,
                      new_anchors=new_anchors, guest_pieces=guest_pieces,
-                     pool_fp=pool_fp)
+                     pool_fp=pool_fp, s3=s3,
+                     caps=(tuple(int(c) for c in caps_rows_by_rank) if s3 else None))
 
 
 def manifest_of_plan(
@@ -410,6 +450,10 @@ def manifest_of_plan(
         spans=spans,
         rows_by_rank=tuple(int(x) for x in rp.plan.rows_by_rank),
         anchor_slots=int(rp.a_h),
+        # MANIFEST v2 (S3 only): the guest placement and the planned caps ride
+        # the record and its fingerprint; a v1 round writes the old record
+        guests=(l15_pool.guest_tuples(rp.guest_pieces or ()) if rp.s3 else None),
+        caps=(tuple(rp.caps or ()) if rp.s3 else None),
     )
 
 
@@ -587,7 +631,15 @@ def retain_at_sleep(
     # keep windows are EMPTY; the rows are still compacted and the manifest
     # still published (the wake refill and the group vote need both).
     cap0 = int(caps_rows_by_rank[rank]) == 0
-    kv_range = () if cap0 else ((0, int(plan.rows_by_rank[rank])),)
+    _keep_hi = int(plan.rows_by_rank[rank])
+    if rp.s3 and not cap0:
+        # S3: a capped rank's overflow is no home row (its keep window is its
+        # hold region at most); a rank that HOSTS guests keeps its whole hold
+        # region (the guests lie in the rows after its own)
+        _keep_hi = (int(caps_rows_by_rank[rank])
+                    if any(int(p.dst) == int(rank) for p in (rp.guest_pieces or ()))
+                    else min(_keep_hi, int(caps_rows_by_rank[rank])))
+    kv_range = () if cap0 else ((0, _keep_hi),)
     for buf in kv_buffers:
         set_keep(buf, kv_range)
     mamba_range = () if cap0 else ((0, int(a_h)),)

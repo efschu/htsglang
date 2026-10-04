@@ -280,6 +280,11 @@ def compare_sums(before: dict, after: dict) -> Tuple[int, int]:
     return ok, bad
 
 
+def _guest_key(pieces: Sequence[ParkPiece]):
+    return tuple((int(p.src), int(p.dst), int(p.src_row), int(p.dst_row), int(p.rows))
+                 for p in pieces)
+
+
 def agree_plan(ok: bool, fp: Optional[str], gather) -> Optional[str]:
     """Pooled park: None when every rank is ok AND holds the SAME plan
     (equal digests); else the reason. One gather. A rank that would start the
@@ -297,6 +302,34 @@ def agree(ok: bool, gather) -> bool:
     """True iff every rank of the group says ok (one host gather)."""
     votes = gather(bool(ok))
     return all(bool(v) for v in votes)
+
+
+def s3_pieces_of_manifest(m, caps: Sequence[int], env, world: int, rates=None):
+    """``(pieces, None, fp)`` or ``([], reason, None)``: the S3 park pieces are
+    the manifest v2 guest list the retain published -- never a re-plan -- and
+    they must be exactly what the same pure plan gives from the manifest's own
+    rows, this rank's caps and the rates it resolves (a rank whose caps or
+    rates change the placement turns the round off here, before any collective
+    starts); the digest the group compares is the retain's ``plan_fingerprint``."""
+    from sglang.srt.weg2 import l15_pool
+
+    if m.guests is None:
+        return [], "manifest is v1 under SGLANG_WEG2_L15_POOL_S3 (no guest list)", None
+    if m.caps is None or tuple(int(c) for c in m.caps) != tuple(int(c) for c in caps):
+        return [], "manifest caps %s differ from this rank's caps %s" % (
+            list(m.caps or ()), [int(c) for c in caps]), None
+    if rates is None:
+        rates, _src = l15_pool.resolve_rates(env, int(world))
+    rates = l15_pool.quantize_rates(rates)
+    want, why = l15_pool.pool_park_plan(list(m.rows_by_rank), list(caps), rates)
+    if why is not None:
+        return [], why, None
+    have = l15_pool.pieces_of(m.guests)
+    if l15_pool.guest_tuples(have) != l15_pool.guest_tuples(want):
+        return [], "manifest guest list differs from the plan of this rank's rates", None
+    fp = l15_pool.plan_fingerprint(
+        [sp.rid for sp in m.spans], list(m.rows_by_rank), caps, have)
+    return have, None, fp
 
 
 # -- scheduler entries --------------------------------------------------------
@@ -355,6 +388,21 @@ def _pool_line(kind: str, epoch, rank, nbytes, ms, rounds, reason="-") -> str:
                                    str(reason).replace(" ", "_")))
 
 
+def pool_check_line(epoch, rank: int, ok: int, bad: int, pieces: Sequence[ParkPiece],
+                    s3: bool = False) -> str:
+    """``L15-POOL-CHECK``: the guest-row sample of one rank at the wake.  S3
+    names what was sampled: pieces and rows this rank OWNS as guests and the
+    hosts they lay on (``guest_rows=0`` = nothing of this rank travelled)."""
+    base = ("L15-POOL-CHECK epoch=%s rank=%d ok=%d bad=%d guest_ok=%d guest_bad=%d"
+            % (epoch, rank, ok, bad, ok, bad))
+    if not s3:
+        return base
+    own = [p for p in pieces if int(p.src) == int(rank)]
+    return base + " s3=1 guest_pieces=%d guest_rows=%d hosts=%s" % (
+        len(own), sum(int(p.rows) for p in own),
+        ",".join(str(h) for h in sorted({int(p.dst) for p in own})) or "-")
+
+
 def _counting(a2a):
     box = [0]
 
@@ -385,6 +433,7 @@ def park_at_release(sched, env, log) -> Optional[int]:
 
     t0 = time.perf_counter()
     pooled = l15_pool.pool_on(env)
+    s3 = l15_pool.pool_s3_on(env)
     try:
         rank, world, gather, a2a = _group_io(sched)
     except Exception as exc:  # noqa: BLE001 -- no group, no park
@@ -401,12 +450,15 @@ def park_at_release(sched, env, log) -> Optional[int]:
         else:
             epoch = int(m.epoch)
             caps = _caps(sched, pool, world, env)
-            pieces, why = park_plan(list(m.rows_by_rank), caps)
+            if s3:
+                pieces, why, fp = s3_pieces_of_manifest(m, caps, env, world)
+            else:
+                pieces, why = park_plan(list(m.rows_by_rank), caps)
             if why is None and not pieces:
                 why = "nothing to park"
             if why is None:
                 why = bounds_refusal(pieces, rank, bufs)
-            if why is None and pooled:
+            if why is None and pooled and fp is None:
                 fp = l15_pool.plan_fingerprint(
                     [sp.rid for sp in m.spans], list(m.rows_by_rank), caps, pieces)
     except Exception as exc:  # noqa: BLE001 -- votes no
@@ -457,14 +509,19 @@ def park_at_release(sched, env, log) -> Optional[int]:
     return sent
 
 
-def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool) -> bool:
+def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
+                      manifest_guests=None) -> bool:
     """D wake (resume RPC, every D rank, one list position, before the
     cap-0 refill): bring the parked rows back. True when they are back on
     this group (the cap-0 rank then refills only its anchors from L2).
 
     S2 pooled hold: the rows that came back are checked against the source
     checksum taken at the sleep (``L15-POOL-CHECK``); one bad sample on any
-    rank = group fallback to the L2 refill (``L15-POOL-BACK ... reason=``)."""
+    rank = group fallback to the L2 refill (``L15-POOL-BACK ... reason=``).
+
+    ``manifest_guests`` (S3, the v2 manifest's guest list; None = S2): the
+    park record must list exactly these pieces, else the group falls back --
+    sleep and wake agree on WHERE every guest row lies or nothing comes back."""
     import time
 
     import torch
@@ -490,6 +547,9 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool) -> bool:
         why = "no park record"
     elif int(rec[0]) != int(epoch):
         why = "park epoch %d != hold epoch %d" % (rec[0], epoch)
+    elif manifest_guests is not None and _guest_key(rec[1]) != _guest_key(
+            [ParkPiece(*(int(x) for x in g)) for g in manifest_guests]):
+        why = "park record differs from the manifest guest list"
     if not agree(why is None, gather):
         log("L15-PARK at=wake rank=%d result=off reason=%s park_bytes=0 park_ms=%.0f"
             % (rank, why or "a peer has no park", (time.perf_counter() - t0) * 1000.0))
@@ -517,8 +577,8 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool) -> bool:
     if pooled:
         # every sampled row is a guest row in S2 (the home rows never leave
         # their segment; L15-CHECK samples them against L2)
-        log("L15-POOL-CHECK epoch=%s rank=%d ok=%d bad=%d guest_ok=%d guest_bad=%d"
-            % (epoch, rank, ck_ok, ck_bad, ck_ok, ck_bad))
+        log(pool_check_line(epoch, rank, ck_ok, ck_bad, rec[1] if rec else (),
+                            s3=manifest_guests is not None))
     if not agree(err is None, gather):
         log("L15-PARK at=wake rank=%d result=FAILED (%s) -- L2 refill"
             % (rank, err or "a peer failed"))

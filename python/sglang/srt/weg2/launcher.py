@@ -25393,6 +25393,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _poolmaster = l15_plan.refuse_pool_without_master(os.environ)
     if _poolmaster is not None:
         raise Weg2LaunchRefused(_poolmaster)
+    # L15-POOL S3 is a part switch on top of POOL -- alone it would do nothing
+    _pools3 = l15_plan.refuse_pool_s3_without_pool(os.environ)
+    if _pools3 is not None:
+        raise Weg2LaunchRefused(_pools3)
+    _pooldep = l15_plan.refuse_pool_with_deposit(os.environ)
+    if _pooldep is not None:
+        raise Weg2LaunchRefused(_pooldep)
     if l15_plan.master_on(os.environ):
         if ns.profile == weg2_form.PROFILE_QWEN27B:
             l15_base = budgets_from_dc(
@@ -25424,7 +25431,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if l15_pool.pool_on(os.environ):
                 log(l15_pool.boot_line(
                     [p.mib for p in l15_posts], [p.src for p in l15_posts],
-                    l15_keep_split.anchor_cap(os.environ), mode=l15_pool.POOL_MODE))
+                    l15_keep_split.anchor_cap(os.environ),
+                    mode=l15_pool.POOL_MODE if not l15_pool.pool_s3_on(os.environ)
+                    else l15_pool.S3_MODE))
             elif l15_pool.pool_shadow_on(os.environ):
                 log(l15_pool.boot_line(
                     [p.mib for p in l15_posts], [p.src for p in l15_posts],
