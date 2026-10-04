@@ -370,6 +370,40 @@ def floor_want(want: int, mapped: int, avail_min: int, air: int, step: int, dema
 ACTOR_ATTR = "dual_d_kv"
 
 
+def low_first_every() -> int:
+    """#1540 D-LOW-FIRST: allocation calls between two ascending sorts of D's free list (0 = off)."""
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_DUAL_D_LOW_FIRST.get()))
+    except Exception:  # noqa: BLE001 -- the switch never takes the attach down
+        return 0
+
+
+def _arm_low_first(allocator) -> int:
+    """Arm the allocator's low-first placement when the switch is on and its class calls the hook
+    (token + paged allocator); says so in the log either way. Returns the N armed (0 = not armed)."""
+    n = low_first_every()
+    if n <= 0:
+        return 0
+    if not callable(getattr(allocator, "set_low_first", None)):
+        logger.warning("%s D-LOW-FIRST requested (N=%d) but %s has no set_low_first: NOT armed", MARK, n,
+                       type(allocator).__name__)
+        return 0
+    from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+    if not isinstance(allocator, (TokenToKVPoolAllocator, PagedTokenToKVPoolAllocator)):
+        logger.warning("%s D-LOW-FIRST requested (N=%d) but %s does not call the hook: NOT armed", MARK, n,
+                       type(allocator).__name__)
+        return 0
+    allocator.set_low_first(n)
+    logger.info("%s D-LOW-FIRST armed on %s: every %d allocation calls the free list is sorted ascending "
+                "(#1540: new KV lands low, the live floor of the D shrink falls)", MARK,
+                type(allocator).__name__, n)
+    return n
+
+
 def attach(runner) -> Optional[DKvStage]:
     if not armed() or getattr(runner, "is_draft_worker", False) or not _D_BORN:
         return None
@@ -392,6 +426,7 @@ def attach(runner) -> Optional[DKvStage]:
     actor.mapped_tokens = boot
     actor._committed = boot_bytes
     actor._engage_cap(actor.allocator, boot, actor.page)
+    _arm_low_first(actor.allocator)
     setattr(runner, ACTOR_ATTR, actor)
     logger.info("%s JOIN card=%s boot_tokens=%d contributed=%d B (kept mapped) top=%d", MARK, card[-12:],
                 boot, boot_bytes, actor.top)
@@ -462,6 +497,29 @@ def _instr_shrink_blocked(sched, actor, reason: Optional[str], need: int, floor:
         _pi.emit("shrink_blocked", fields, sup)
     except Exception:  # noqa: BLE001 -- an instrument never breaks the tick
         logger.debug("%s shrink_blocked census failed", _pi.MARK, exc_info=True)
+
+
+def _instr_live_floor(sched, actor, reason: Optional[str], need: int, floor: int, live_local: int,
+                      p_wait_s: float) -> None:
+    """#1540 D-LIVE-FLOOR (log only, rate-limited like #1500i, own try): when the live floor is what keeps
+    D from giving P's card its bytes back, name the requests holding rows above the need, the highest
+    row and how many free ids lie BELOW the need (the room a low-first placement would have used)."""
+    if reason != "live_floor":
+        return
+    from sglang.srt.weg2 import dual_pkvwait_instr as _pi
+
+    sup = _pi.begin("d_live_floor")
+    if sup is None:
+        return
+    try:
+        cen = _pi.live_floor_census(sched, actor.allocator, int(need), int(actor.page))
+        fields = [("mapped", int(actor.mapped_tokens)), ("need", int(need)), ("floor", int(floor)),
+                  ("live_row", int(live_local)), ("p_wait_s", float(p_wait_s))] + list(cen.items())
+        logger.info("%s %s suppressed=%d: the live floor keeps D's rows above its need while P waits for a "
+                    "card (Q-696)", _pi.LIVE_FLOOR_MARK,
+                    " ".join("%s=%s" % (k, _pi._fmt_value(v)) for k, v in fields), int(sup))
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the tick
+        logger.debug("%s census failed", _pi.LIVE_FLOOR_MARK, exc_info=True)
 
 
 def cache_yield(sched, actor, live: Optional[Tuple[int, float]] = None, drop_order: float = -1.0) -> int:
@@ -698,6 +756,7 @@ def tick(sched) -> Optional[str]:
         _note_shrink_blocked(actor, blocked_reason, need, floor, p_wait_s)
         _instr_shrink_blocked(sched, actor, blocked_reason, need, floor, live_local, p_wait_s, holds,
                               p_missing, recent_grow, avail_min)
+        _instr_live_floor(sched, actor, blocked_reason, need, floor, live_local, p_wait_s)
     if verdict != "grow" and st is not None and (int(st.pressure.get("P", 0) or 0) > 0
                                                  or int(st.demand.get("D", 0) or 0) > 0):
         # D's demand fits what it maps (seats ended, aborted or shrunk): the pressure

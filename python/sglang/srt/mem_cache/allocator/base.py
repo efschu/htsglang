@@ -208,6 +208,48 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
 
+    # -- #1540 D-LOW-FIRST: keep the free list ascending so new work lands LOW ----
+    #
+    # Dual layout, group D: the D-KV shrink that gives P's card its bytes back stops at the highest
+    # id any request holds (``max_live_id``). Handing ids out in free-list order lets one request sit
+    # near the top of the mapped span for its whole life (b9i: page 229371 of 229376, 1.4 GB held
+    # for 62 s). Every ``every``-th allocation call the released ids are merged and the list sorted
+    # ascending: PLACEMENT only, nothing is copied or freed, ``available_size()`` is unchanged.
+    #
+    # DETERMINISM: the trigger is the count of allocation calls on a replicated allocator (never
+    # wall time) and the sort is a pure function of the list, so every rank holds the same order.
+    # The owner bias / weighted placement own the order when set (one author of one order): this
+    # stays out of their way.
+
+    def set_low_first(self, every: int) -> None:
+        self._weg2_low_first_every = max(0, int(every))
+        self._weg2_low_first_calls = 0
+        self._weg2_low_first_sorts = 0
+
+    def _weg2_low_first_tick(self) -> None:
+        every = getattr(self, "_weg2_low_first_every", 0)
+        if not every:
+            return
+        self._weg2_low_first_calls += 1
+        if self._weg2_low_first_calls % every:
+            return
+        if not self.is_not_in_free_group:
+            return
+        if getattr(self, "_owner_bias", None) is not None or getattr(self, "_owner_placement", None) is not None:
+            return
+        pages = self.free_pages
+        no_release = self.release_pages is None or not len(self.release_pages)
+        if pages is None or (pages.numel() < 2 and no_release):
+            return
+        self._merge_and_sort_free_unbiased()
+        self.free_pages, _ = torch.sort(self.free_pages)
+        self._weg2_low_first_sorts += 1
+        n = self._weg2_low_first_sorts
+        if n == 1 or n % 512 == 0:
+            logger.info("#1540 D-LOW-FIRST sorts=%d calls=%d every=%d free=%d: the free list is ascending "
+                        "again, new KV lands on the lowest ids", n, self._weg2_low_first_calls, every,
+                        int(self.free_pages.numel()))
+
     def register_free_listener(self, on_free, on_clear=None) -> None:
         """Subscribe to slot lifetime events: ``on_free(free_index)`` after
         indices return to the free set, ``on_clear()`` on a full reset.

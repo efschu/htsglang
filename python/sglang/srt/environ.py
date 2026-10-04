@@ -699,6 +699,14 @@ class Envs:
     # Inert outside SGLANG_WEG2_DUAL_LAYOUT=1 + SGLANG_WEG2_GROUP=D.
     SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S = EnvFloat(4.0)
     SGLANG_WEG2_DUAL_D_REGROW_HOLD_S = EnvFloat(5.0)
+    # #1540 D-LOW-FIRST (deskq/done/1540, 1590): D's KV allocator hands out ids in free-list order
+    # (token allocator: freed ids go to the TAIL; paged: to the head, unsorted), so ONE running request
+    # can sit on a page near the top of the mapped span and the D-KV shrink (live_floor) cannot give P's
+    # card the rest back (b9i weg2-0-50 page 229371 for 62 s, 1.4 GB). N > 0: every N-th allocation
+    # call merges the released ids and sorts the free list ascending, so new work lands low and
+    # max_live_id falls. A pure function of the replicated call count (never wall time), so every D
+    # rank holds the same list. Inert outside the dual layout + group D. 0 = off (default).
+    SGLANG_WEG2_DUAL_D_LOW_FIRST = EnvInt(0)
     # #1420r DEFER-REARM (desk 1420 point 5): D-HANDBACK-DEFER is single-shot -- the one re-read lands
     # empty while P's write-through of the tail anchor is still in flight, the second W31 spends the
     # mark and the request goes back over P (second prefill, ~58 s). N > 0 = a mark whose read has

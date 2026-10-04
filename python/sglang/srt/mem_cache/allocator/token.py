@@ -56,6 +56,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc(self, need_size: int):
         if getattr(self, "_owner_placement", None) is not None:
             self._owner_placement_tick()
+        if getattr(self, "_weg2_low_first_every", 0):
+            self._weg2_low_first_tick()
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
 

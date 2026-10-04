@@ -190,6 +190,76 @@ def _holds_rows(tensor: Any, lo: int, hi: int) -> bool:
     return bool(((tensor >= lo) & (tensor < hi)).any().item())
 
 
+LIVE_FLOOR_MARK = "#1540 D-LIVE-FLOOR"
+#: how many of the requests holding a row above the need are named in the line
+LIVE_FLOOR_TOP = 3
+
+
+def live_floor_census(sched: Any, allocator: Any, need_tokens: int, page: int = 1,
+                      top: int = LIVE_FLOOR_TOP) -> Dict[str, Any]:
+    """Who keeps D's shrink above ``need_tokens`` (this rank's own view, log only): the requests of the
+    running batch / chunked / waiting / parked list that hold ANY row at or above ``need_tokens`` (count
+    and the ``top`` highest: rid, top row, tokens), and the allocator's free ids below the need (how much
+    room a low-first placement would have had) next to its head id and released-list length. Every read is
+    guarded: a failure becomes ``err:<ExceptionName>`` in its field, never an exception. Callers are
+    rate-limited (it syncs the device a few times)."""
+    need, pg = int(need_tokens), max(1, int(page))
+    out: Dict[str, Any] = {}
+    try:
+        r2t = getattr(getattr(sched, "req_to_token_pool", None), "req_to_token", None)
+        holders = []
+        seen = 0
+        if r2t is not None:
+            groups = (
+                ("running", list(getattr(getattr(sched, "running_batch", None), "reqs", None) or ())),
+                ("chunked", [getattr(sched, "chunked_req", None)]),
+                ("waiting", list(getattr(sched, "waiting_queue", None) or ())),
+                ("parked", list(getattr(sched, "weg2_d_parked", None) or ())),
+            )
+            for state, reqs in groups:
+                for req in reqs:
+                    idx = getattr(req, "req_pool_idx", None) if req is not None else None
+                    if idx is None:
+                        continue
+                    seen += 1
+                    if seen > OWNER_SCAN_CAP:
+                        break
+                    n = len(getattr(req, "origin_input_ids", None) or ()) + len(getattr(req, "output_ids", None) or ())
+                    if n <= 0:
+                        continue
+                    row = int(r2t[int(idx), :n].max().item())
+                    if row >= need:
+                        holders.append((row, str(getattr(req, "rid", "?")), n, state))
+        holders.sort(reverse=True)
+        out["reqs_over_need"] = len(holders)
+        out["reqs_scanned"] = seen
+        for i, (row, rid, n, state) in enumerate(holders[: max(0, int(top))]):
+            out["h%d" % (i + 1)] = "%s:%s:row%d:tok%d" % (state, rid, row, n)
+    except Exception as exc:  # noqa: BLE001 -- an instrument never breaks the tick
+        out["reqs_over_need"] = "err:" + type(exc).__name__
+    try:
+        import torch
+
+        fp = getattr(allocator, "free_pages", None)
+        rp = getattr(allocator, "release_pages", None)
+        lim = (need + pg - 1) // pg                      # ids (pages) whose first token row is below need
+        below = 0
+        total = 0
+        for ids in (fp, rp):
+            if ids is not None and hasattr(ids, "numel") and ids.numel():
+                total += int(ids.numel())
+                below += int((ids < lim).sum().item())
+        out["free_total"] = total
+        out["free_below_need"] = below
+        out["free_head"] = int(fp[0].item()) * pg if fp is not None and getattr(fp, "numel", None) and fp.numel() else -1
+        out["release_n"] = int(rp.numel()) if rp is not None and hasattr(rp, "numel") else 0
+        out["low_first"] = int(getattr(allocator, "_weg2_low_first_every", 0) or 0)
+        out["lf_sorts"] = int(getattr(allocator, "_weg2_low_first_sorts", 0) or 0)
+    except Exception as exc:  # noqa: BLE001
+        out["free_total"] = "err:" + type(exc).__name__
+    return out
+
+
 def top_row_owner(sched: Any, top_row: int, page: int = 1, cap: int = OWNER_SCAN_CAP) -> Dict[str, Any]:
     """Who sits on D's topmost live row ``[top_row, top_row + page)`` (this rank's own view): a request of
     the running batch / the chunked one / the waiting queue / the parked list (``owner=req``), else a

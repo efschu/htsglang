@@ -156,6 +156,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_pages = need_size // self.page_size
         if getattr(self, "_owner_placement", None) is not None:
             self._owner_placement_tick()
+        if getattr(self, "_weg2_low_first_every", 0):
+            self._weg2_low_first_tick()
         if self.need_sort and num_pages > len(self.free_pages):
             self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
@@ -189,6 +191,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         bs = len(prefix_lens)
         if getattr(self, "_owner_placement", None) is not None:
             self._owner_placement_tick()
+        if getattr(self, "_weg2_low_first_every", 0):
+            self._weg2_low_first_tick()
         if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
         ):
@@ -237,6 +241,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         bs = len(seq_lens)
         if getattr(self, "_owner_placement", None) is not None:
             self._owner_placement_tick()
+        if getattr(self, "_weg2_low_first_every", 0):
+            self._weg2_low_first_tick()
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
 
