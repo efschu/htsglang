@@ -45,12 +45,16 @@ THE FIX (dual P only, ``dual_p_kv_stage.armed``):
      candidates, how many were released and why the rest stayed.
 
 Off the dual P layout (flip, 27B INT8, NF, dual D, anything without the gate)
-nothing here runs: the spill behaves byte for byte as before.
+nothing of Q-697c runs: the spill behaves byte for byte as before. The Q-1190 part
+at the end (D-ARENA-YIELD) runs on the dual layout only (either group).
 """
 from __future__ import annotations
 
 import heapq
 import logging
+import os
+import struct
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -149,3 +153,147 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set)
             "is host-only after each idle release)",
             MARK, k, int(want), released, leaves, candidates, unsecured, on_disk, written)
     return {"released": released, "leaves": leaves, "candidates": candidates, "unsecured": unsecured}
+
+
+# ---------------------------------------------------------------- Q-1190 D-ARENA-YIELD
+# Q-1190 (27B NVFP4 dual y9d1, boot dkr27bnvfp4dual1mpsleepsharebar1fs10040258 @507edf614c,
+# 03:07-03:16Z; analysis deskq/done/1190-dual-wedge.out). The KV L2 arena is ONE file
+# shared by group P and group D (arena-32768.bin, 720896 slots). Q-697c made P give its
+# own references back (P PP0 own_held 574601 -> 90262), but D's tree held the arena:
+# 'ARENA-REF-HOLDERS pool=FULL tree=675527 tree_in_use=0 arena_pinned=694560' on every D
+# rank -- the pages D adopted from P's hand-offs, kept as host-only leaves after each
+# cache yield, used by no request. A slot frees only when no rank of either group holds
+# it, so P's spill freed nothing ('#1427 ARENA-DROP freed=0' 2893x), every P claim
+# scanned the full arena and was refused (PASS-STALL 871x, a 31k prompt took 67-188 s),
+# P's hand-off pages and Mamba anchors did not reach the store, D refused them
+# (W50 Weg2TpPrefillExceeded) and P prefilled them a second time (W53). P had no way to
+# tell D, and the Q-697c spill is dual P only.
+#
+# THE FIX (dual layout only): a claim the arena refused after the W3/Q-697c round posts
+# its page need next to the shared arena (``<arena>.dualneed``, max semantics, like
+# R12's ``.w3need``); D's TP0 takes it in ``dual_d_kv_stage.tick`` and the need rides the
+# tick's existing group collective, so every D rank spills the SAME number of pages of
+# HOST-ONLY H-leaves (``spill_host_only``: L3 copy first, node-id order). Named lines:
+# ``Q-1190 DUAL D-ARENA-YIELD`` (D) and ``Q-1190 DUAL ARENA-NEED POSTED`` (the refusing
+# side). Off the dual layout nothing here runs and no file is written.
+
+YIELD_MARK = "Q-1190 DUAL D-ARENA-YIELD"
+POST_MARK = "Q-1190 DUAL ARENA-NEED POSTED"
+NEED_SUFFIX = ".dualneed"
+#: pages one D yield moves at least (a P claim is one node's pages; a yield that frees only
+#: that makes every next claim of the same prompt wait for the next D tick)
+D_YIELD_MIN_PAGES = 4096
+#: after a yield that released nothing, D's TP0 does not take a request for this long
+D_YIELD_EMPTY_BACKOFF_S = 0.5
+
+_Y = {"posts": 0, "yields": 0, "no_pool": 0, "quiet_until": 0.0}
+
+
+def armed_any(env=None) -> bool:
+    """The dual layout, either group (P with its KV cap, D with its KV cap)."""
+    from sglang.srt.weg2 import dual_d_kv_stage as _ddk
+
+    return armed(env) or bool(_ddk.armed(env))
+
+
+def _spill_pool(pool: Any) -> Optional[Any]:
+    """The pool that carries ``secure_rows_to_l3`` and the arena: ``pool`` itself, else
+    the hybrid group's anchor host pool. Called behind the gate only."""
+    if pool is None:
+        return None
+    if hasattr(pool, "secure_rows_to_l3") and getattr(pool, "arena", None) is not None:
+        return pool
+    hp = getattr(getattr(pool, "anchor_entry", None), "host_pool", None)
+    if hp is not None and hasattr(hp, "secure_rows_to_l3") and getattr(hp, "arena", None) is not None:
+        return hp
+    return None
+
+
+def _need_path(pool: Any) -> Optional[str]:
+    sp = _spill_pool(pool)
+    path = getattr(getattr(sp, "arena", None), "path", None)
+    return (str(path) + NEED_SUFFIX) if path else None
+
+
+def post_need(pool: Any, pages: int, env=None) -> bool:
+    """A refused arena claim of ``pages`` pages (after this rank's own spill round):
+    leave the need next to the shared arena for group D. False off the gate (nothing
+    read, nothing written) or when there is no arena path."""
+    if not armed_any(env) or int(pages) <= 0:
+        return False
+    path = _need_path(pool)
+    if path is None:
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            raw = os.pread(fd, 8, 0)
+            cur = struct.unpack("<q", raw)[0] if len(raw) == 8 else 0
+            if int(pages) > cur:
+                os.pwrite(fd, struct.pack("<q", int(pages)), 0)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        logger.warning("%s STOP post_failed path=%s: %r", POST_MARK, path, exc)
+        return False
+    _Y["posts"] += 1
+    k = _Y["posts"]
+    if k <= 8 or k % 256 == 0:
+        logger.info("%s n=%d pages=%d path=%s (the shared KV arena refused this claim after the "
+                    "rank's own spill; group D's tick takes it)", POST_MARK, k, int(pages), path)
+    return True
+
+
+def d_take_need(sched, env=None) -> int:
+    """D TP0, once per tick: the largest pending need (pages), cleared. 0 off the D gate,
+    without a tree pool, or while the last yield found nothing (backoff)."""
+    from sglang.srt.weg2 import dual_d_kv_stage as _ddk
+
+    if not _ddk.armed(env):
+        return 0
+    if time.monotonic() < _Y["quiet_until"]:
+        return 0
+    tree = getattr(sched, "tree_cache", None)
+    get = getattr(tree, "_weg2_direct_pool", None)
+    path = _need_path(get()) if callable(get) else None
+    if path is None:
+        return 0
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        return 0                          # nobody posted yet
+    try:
+        raw = os.pread(fd, 8, 0)
+        cur = struct.unpack("<q", raw)[0] if len(raw) == 8 else 0
+        if cur:
+            os.pwrite(fd, struct.pack("<q", 0), 0)
+        return max(0, int(cur))
+    finally:
+        os.close(fd)
+
+
+def d_yield_arena(sched, need: int) -> Dict[str, int]:
+    """Every D rank, with the GROUP need (the same number on every rank): spill host-only
+    H-leaves of D's tree until ``max(need, D_YIELD_MIN_PAGES)`` pages were released here.
+    The stop is named when the tree has no spill pool."""
+    tree = getattr(sched, "tree_cache", None)
+    get = getattr(tree, "_weg2_direct_pool", None)
+    pool = _spill_pool(get()) if callable(get) else None
+    if pool is None:
+        _Y["no_pool"] += 1
+        if _Y["no_pool"] <= 8 or _Y["no_pool"] % 64 == 0:
+            logger.warning("%s n=%d STOP no_spill_pool need=%d: D's tree has no arena pool with "
+                           "secure_rows_to_l3 -- nothing yielded", YIELD_MARK, _Y["no_pool"], int(need))
+        return {"released": 0, "leaves": 0, "candidates": 0, "unsecured": 0}
+    want = max(int(need), D_YIELD_MIN_PAGES)
+    got = spill_host_only(tree, pool, want, int(getattr(tree, "page_size", 1) or 1), set())
+    if got["released"] == 0:
+        _Y["quiet_until"] = time.monotonic() + D_YIELD_EMPTY_BACKOFF_S
+    _Y["yields"] += 1
+    k = _Y["yields"]
+    if k <= 8 or k % 64 == 0 or got["released"] == 0:
+        logger.info("%s n=%d need=%d want=%d released_pages=%d leaves=%d candidates=%d unsecured_kept=%d "
+                    "(a claim on the shared KV arena was refused; D gives back host-only leaves it holds "
+                    "but no request uses, L3 copy first)", YIELD_MARK, k, int(need), want, got["released"],
+                    got["leaves"], got["candidates"], got["unsecured"])
+    return got

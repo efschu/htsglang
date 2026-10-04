@@ -5630,6 +5630,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # claim of the same node)
             pre = pool.alloc_write(hashes)
         if pre is None:
+            # Q-1190: on the dual layout the arena is shared with the other group, whose
+            # tree may hold the slots (y9d1: D tree=675527 of 720896) -- the need goes next
+            # to the arena for D's tick. Off the gate: nothing read, nothing written.
+            from sglang.srt.weg2 import dual_arena_spill as _das
+
+            _das.post_need(pool, len(hashes))
             self._1421_refused("arena_claim", node)
             return False
         mxfer = mct = None

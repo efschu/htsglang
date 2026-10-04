@@ -549,11 +549,20 @@ def tick(sched) -> Optional[str]:
         actor._p_wait_since, p_wait_ms_local = None, 0
     grow_t = getattr(actor, "_grow_t", None)
     recent_grow_local = 1 if (grow_t is not None and t_now - float(grow_t) < regrow_hold_s()) else 0
+    # Q-1190: a claim the SHARED KV arena refused (P's hand-off / write-through, or D's own
+    # backup) left its page need next to the arena; TP0 takes it, the MAX rides this
+    # collective, every D rank yields the same pages of its host-only leaves
+    from sglang.srt.weg2 import dual_arena_spill as _das
+
+    arena_need_local = _das.d_take_need(sched) if int(getattr(sched, "tp_rank", 0) or 0) == 0 else 0
     # D PRIORITY: the tightest rank's free rows (MIN) and the holds (MAX) ride the
     # SAME collective -- every rank decides on the same numbers
     g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local), -int(demand_local),
                     -int(p_missing_local), int(d_avail_rows(sched, actor)), -int(d_holds(sched)),
-                    -int(p_wait_ms_local), -int(recent_grow_local)])
+                    -int(p_wait_ms_local), -int(recent_grow_local), -int(arena_need_local)])
+    arena_need = max(0, -int(g[9])) if len(g) > 9 else 0
+    if arena_need > 0:
+        _das.d_yield_arena(sched, arena_need)
     want, p_waiting, floor = -int(g[0]), -int(g[1]) > 0, -int(g[2])
     p_missing = len(g) > 4 and -int(g[4]) > 0
     avail_min = int(g[5]) if len(g) > 5 else NO_AVAIL

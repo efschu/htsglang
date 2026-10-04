@@ -879,3 +879,38 @@ class TestQ697cArenaSpillFlipUnchanged:
 
         for env in _wrong_gates():
             assert DS.anchor_spill_pool(Boom(), env) is None, env
+
+
+# ---------------------------------------------------------------------------------- Q-1190
+
+class TestQ1190DArenaYieldFlipUnchanged:
+    """Q-1190: the arena-need post (any refused KV-arena claim) and D's take/yield are dual
+    layout only. The behavioural half (claim refused as before, no '.dualneed' file, D's
+    tree untouched, for every wrong gate) is
+    test_dual_d_arena_yield_q1190_1004.test_flip_unchanged_a_refused_claim_off_the_gate_posts_nothing."""
+
+    FLIP = [{}, {"SGLANG_WEG2_GROUP": "P"}, {"SGLANG_WEG2_GROUP": "D"}, {"SGLANG_WEG2_DUAL_LAYOUT": "1"},
+            {"SGLANG_WEG2_DUAL_LAYOUT": "0", "SGLANG_WEG2_GROUP": "D", "SGLANG_WEG2_DUAL_D_KV_MAX_TOKENS": "131072"},
+            {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D"},     # no D KV cap
+            {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"}]     # no P KV cap
+
+    def test_post_and_take_read_nothing_off_the_gate(self):
+        from sglang.srt.weg2 import dual_arena_spill as DS
+
+        class Boom:  # any attribute read past the gate raises
+            def __getattr__(self, name):
+                raise AssertionError("read %s off the gate" % name)
+
+        for env in self.FLIP:
+            assert DS.armed_any(env) is False, env
+            assert DS.post_need(Boom(), 4096, env) is False, env
+            assert DS.d_take_need(Boom(), env) == 0, env
+
+    def test_the_d_tick_hook_sits_behind_the_d_actor(self):
+        # the tick returns before the Q-1190 take when the runner has no dual D actor (flip)
+        from sglang.srt.weg2 import dual_d_kv_stage as DDK
+
+        src = inspect.getsource(DDK.tick)
+        assert src.index("if actor is None:") < src.index("_das.d_take_need(sched)")
+        sched = SimpleNamespace(tp_worker=SimpleNamespace(model_runner=SimpleNamespace()))
+        assert DDK.tick(sched) is None
