@@ -17371,6 +17371,11 @@ class Scheduler(
                     # group MIN -- by the next pass's admission.
                     if getattr(self, "_weg2_sa_no_token", None) is None:
                         self._weg2_sa_no_token = str(req.rid)
+                        # Q-702 BUDGET-EINHEIT: and the adder's own numbers of
+                        # this refusal, which the SEAT-AGE verdict reads.
+                        from sglang.srt.weg2 import d_park_runtime as _dpr_q702
+
+                        _dpr_q702.note_adder_refusal(self, adder, req, running_batch)
                     _hol_go_on = _hol.may_overtake(req)
                     if _hol_go_on:
                         pass  # D-HOL backfill: later requests that fit the free KV still run

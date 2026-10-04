@@ -1124,6 +1124,10 @@ class PrefillAdder:
         )
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
+        #: Q-702 BUDGET-EINHEIT: the adder's OWN lifetime numbers of the first
+        #: refusal this pass, ``(rid, price, budget)`` -- see
+        #: ``_note_lifetime_refusal``. None = no lifetime refusal yet.
+        self.lifetime_refusal = None
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
@@ -1300,6 +1304,25 @@ class PrefillAdder:
         max_running_reqs = dllm_config.max_running_requests
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+
+    def _note_lifetime_refusal(self, req: Req, total_tokens, budget) -> None:
+        """Q-702 BUDGET-EINHEIT (NF y9nf boot ...10032328 D 23:33:28Z, SEAT-AGE
+        livelock): the first lifetime NO_TOKEN of the pass keeps the numbers the
+        adder refused on -- ``total_tokens`` (what it charged: extend + max_new +
+        page + mamba gap, or the per-chunk form) against ``rem_total_tokens``
+        (pool + evictable - running decode reserves - group floor - ledger). The
+        SEAT-AGE KV verdict reads exactly these instead of re-deriving a budget of
+        its own that omits all of that (weg2/d_park_runtime.kv_displace_would_fit).
+        Bookkeeping only: no admission decision reads it here."""
+        if self.lifetime_refusal is None:
+            self.lifetime_refusal = (str(req.rid), int(total_tokens), int(budget))
+
+    def released_by_leaving(self, req: Req) -> int:
+        """Q-702: what the lifetime budget regains when the RUNNING request
+        ``req`` leaves the batch: the decode reserve this adder charged it
+        (``rem_total_token_offset`` includes it for every running request); its
+        KV rows are the caller's term."""
+        return int(self._get_running_request_total_token_offset(req))
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -2625,7 +2648,8 @@ class PrefillAdder:
         # the first failing gate returns exactly as before.
         _fa_follow = self.form_a_admission_follow
         _gate = None
-        if total_tokens >= self.rem_total_tokens:
+        _rem_total = self.rem_total_tokens
+        if total_tokens >= _rem_total:
             # Lifetime doesn't fit VRAM: wedge -- UNLESS Prefill-Spill can admit
             # it born-spilled (input transiently fits, a host region is free),
             # or -- PS2, the strict complement -- born-spilled DEEP (not even
@@ -2634,6 +2658,7 @@ class PrefillAdder:
                 req, born_input_tokens
             ) and not self._admit_born_spilled_deep(req, born_input_tokens):
                 _gate = AddReqResult.NO_TOKEN
+                self._note_lifetime_refusal(req, total_tokens, _rem_total)
 
         if _gate is None and self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
@@ -2658,7 +2683,8 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if _gate is None and total_tokens >= self.rem_total_tokens:
+            _rem_total = self.rem_total_tokens if _gate is None else None
+            if _gate is None and total_tokens >= _rem_total:
                 # Prefill-Spill: a prompt already admitted born-spilled at the
                 # pre-lock gate stays admitted as long as its input still fits
                 # the (possibly shrunk) device budget; otherwise wedge as usual.
@@ -2667,9 +2693,10 @@ class PrefillAdder:
                 # stays admitted (its host region was reserved at the pre-lock
                 # verdict, replicated on every rank).
                 if not req.born_spilled_deep and not (
-                    req.born_spilled and born_input_tokens < self.rem_total_tokens
+                    req.born_spilled and born_input_tokens < _rem_total
                 ):
                     _gate = AddReqResult.NO_TOKEN
+                    self._note_lifetime_refusal(req, total_tokens, _rem_total)
 
             if _gate is None and self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
