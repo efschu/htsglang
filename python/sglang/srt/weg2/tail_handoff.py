@@ -945,10 +945,12 @@ def _capture_state(req, req_to_token_pool, allocator, page_size: int, stream) ->
     spec = spec_for(req.rid, ids, req.extra_key, page_size, _grain_of(allocator, page_size))
     if spec is None or int(req.extend_range.end) != spec.cut or len(req.full_untruncated_fill_ids) != spec.n_tokens:
         return False
+    # Q-702: the slot id the forward-stream gather reads, owned by that stream
+    phys = _stream_owned(_slot_ids(req_to_token_pool, req.mamba_pool_idx), stream, "e1")
     ctx = torch.cuda.stream(stream) if stream is not None else _null_ctx()
     with ctx:
-        gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
-        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx)
+        gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx, phys=phys)
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx, phys=phys)
         event = _record(stream)
     _CAPTURES[str(req.rid)] = _Capture(spec=spec, gdn=gdn, event=event, stream=stream, ple=ple)
     while len(_CAPTURES) > capture_keep():  # an aborted prompt never publishes: drop the oldest
@@ -1023,11 +1025,57 @@ def _record(stream) -> object:
     return event
 
 
-def _gdn_slot_to_host(pool, mamba_pool_idx: torch.Tensor) -> Dict[int, Tuple[torch.Tensor, ...]]:
+#: Q-702: how many gathers took their indices as stream-owned copies (log only)
+_OWNED_N = [0]
+
+
+def _stream_owned(t: torch.Tensor, stream, site: str = "") -> torch.Tensor:
+    """Q-702 (NF y9nf3 10040106, P PP1 pid 707, 01:27:59.97Z): an index tensor
+    that a gather on ``stream`` reads LATER, as this rank's own int64 copy.
+
+    The E1/E2 gathers run on the forward stream, queued behind a forward that
+    is still running (2.4 s on PP1). Their indices were VIEWS of storage the
+    scheduler thread owns on its own stream: ``req.mamba_pool_idx`` is
+    ``free_slots[:1][0]`` (allocator/mamba.py ``_do_alloc``), ``kv_indices`` a
+    row of ``req_to_token``. Right after ``publish_rows`` the finish frees the
+    slot (``free_mamba_cache``: ``req.mamba_pool_idx = None``), the caching
+    allocator hands the block back to the schedule stream -- nothing told it
+    the forward stream still reads it -- and the next stash wrote 78208 into
+    it. The gather then read 78208 against a 33-slot pool: device assert in
+    ``indexSelectSmallIndex<BFloat16, long>`` (CUDA coredump, srcSelectDimSize
+    33, sliceSize 786432), ~100 s coredump, SIGABRT, the pipeline dead.
+
+    The copy is made NOW on the current stream (where the values are valid in
+    stream order), ``stream`` waits for it (device-side, no host sync), and
+    ``record_stream`` keeps its block from reuse until ``stream`` has passed
+    the gather. Same on every rank (no rank-local decision). ``stream=None``
+    (the gather runs on the current stream, stream-ordered) needs no copy."""
+    if stream is None:
+        return t
+    own = t.to(dtype=torch.int64, copy=True)
+    if own.is_cuda:
+        stream.wait_stream(torch.cuda.current_stream(own.device))
+        own.record_stream(stream)
+    _OWNED_N[0] += 1
+    if _OWNED_N[0] <= 3 or _OWNED_N[0] % 256 == 0:
+        logger.info("Q-702 TAIL-GATHER-OWNED n=%d site=%s numel=%d (index copied on the current stream, "
+                    "bound to the gather stream by record_stream)", _OWNED_N[0], site, int(own.numel()))
+    return own
+
+
+def _slot_ids(pool, mamba_pool_idx: torch.Tensor) -> torch.Tensor:
+    """Physical id(s) of one request's mamba slot, shape [1], int64."""
+    return pool.translate_mamba_indices(mamba_pool_idx.reshape(1).to(torch.int64)).to(torch.int64)
+
+
+def _gdn_slot_to_host(pool, mamba_pool_idx: torch.Tensor,
+                      phys: Optional[torch.Tensor] = None) -> Dict[int, Tuple[torch.Tensor, ...]]:
     """Every local GDN layer's temporal + conv state of one request slot,
-    gathered on the CURRENT stream into host tensors (keyed by global id)."""
+    gathered on the CURRENT stream into host tensors (keyed by global id).
+    ``phys``: the slot's physical id already resolved (Q-702 owned copy)."""
     cache = pool.mamba_pool.mamba_cache
-    phys = pool.translate_mamba_indices(mamba_pool_idx.reshape(1).to(torch.int64))
+    if phys is None:
+        phys = _slot_ids(pool, mamba_pool_idx)
     phys = phys.to(cache.temporal.device, non_blocking=True)
     gdn: Dict[int, Tuple[torch.Tensor, ...]] = {}
     for gid, local in sorted(pool.mamba_map.items()):
@@ -1036,12 +1084,13 @@ def _gdn_slot_to_host(pool, mamba_pool_idx: torch.Tensor) -> Dict[int, Tuple[tor
     return gdn
 
 
-def _ple_rows(pool, mamba_pool_idx) -> Optional[Dict[str, torch.Tensor]]:
+def _ple_rows(pool, mamba_pool_idx, phys: Optional[torch.Tensor] = None) -> Optional[Dict[str, torch.Tensor]]:
     """H63c: the PLE side-state rows of one request slot on the CURRENT
     stream (armed, and only on the rank that runs a PLE layer), else None."""
     if not ple_state.enabled() or mamba_pool_idx is None:
         return None
-    phys = pool.translate_mamba_indices(mamba_pool_idx.reshape(1).to(torch.int64))
+    if phys is None:
+        phys = _slot_ids(pool, mamba_pool_idx)
     return ple_state.snapshot(pool, phys)
 
 
@@ -1195,12 +1244,17 @@ def _capture_end(req, kv_indices: torch.Tensor, allocator, req_to_token_pool, ca
     kvpool = allocator.get_kvcache()
     ratio = _qsa_ratio(kvpool)
     rows, groups, ring_rows = end_geometry(spec, ratio)
+    # Q-702: the finish frees the request's mamba slot and KV rows right after
+    # this returns, while the gathers below wait on the forward stream; their
+    # indices are copies owned by that stream, never views of the freed storage
+    kv_rows = _stream_owned(kv_indices[spec.page_prefix:spec.n_tokens], cap.stream, "e2_rows")
+    phys = _stream_owned(_slot_ids(req_to_token_pool, req.mamba_pool_idx), cap.stream, "e2_slot")
     ctx = torch.cuda.stream(cap.stream) if cap.stream is not None else _null_ctx()
     with ctx:
-        fa = _fa_rows(kvpool, kv_indices[spec.page_prefix:spec.n_tokens].to(torch.int64), groups=groups, host=_to_host)
+        fa = _fa_rows(kvpool, kv_rows.to(torch.int64), groups=groups, host=_to_host)
         ring, rope = _ring_rows(kvpool, req.req_pool_idx, ring_rows)
-        gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx)
-        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx)
+        gdn = _gdn_slot_to_host(req_to_token_pool, req.mamba_pool_idx, phys=phys)
+        ple = _ple_rows(req_to_token_pool, req.mamba_pool_idx, phys=phys)
         event = _record(cap.stream)
     return EndPayload(
         first_token=int(req.output_ids[-1]), key=tail_key(req.origin_input_ids, spec.n_tokens, req.extra_key),
