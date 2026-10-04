@@ -702,6 +702,10 @@ class Envs:
     # (group-uniform order on the tick collective; a parked/held request blocks it).
     SGLANG_WEG2_DUAL_D_UNBACKED_DROP_ON_WAIT = EnvBool(False)
     SGLANG_WEG2_DUAL_D_UNBACKED_DROP_WAIT_S = EnvFloat(8.0)
+    # #1430q LATER-TOLD DROPS HELD ZOMBIE (B9 14:49:55Z, weg2-0-103): dual P followers only. DEFAULT OFF = the old
+    # code path byte for byte. On: a told verdict of a later PP0 list than a held (#1180-W) waiting-queue abort takes
+    # that abort's unadmitted instance (a zombie; the told belongs to the rid's NEW instance) out of the queue, object-exact.
+    SGLANG_WEG2_DUAL_LATER_TOLD_DROP = EnvBool(False)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,

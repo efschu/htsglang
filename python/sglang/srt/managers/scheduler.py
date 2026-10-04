@@ -10298,6 +10298,7 @@ class Scheduler(
                 "WEG2-PP-WAITING-ABORT held rid=%s pp_rank=%s: still in this follower's "
                 "waiting queue -- applied when PP0's forwarded schedule decides it (#1180-W)",
                 r.rid, getattr(ps, "pp_rank", 0))
+        _q693.note_hold(self, recv_req, held)  # #1430q: records the held objects; a no-op unless the env is on
         return True
 
     def _weg2_process_waiting_aborts(self) -> None:
