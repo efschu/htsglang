@@ -12633,8 +12633,9 @@ class Front:
         self._rvp_state()
         logger.warning(
             "WEG2 W50-REROUTE rid=%s front_price=%s d_extent=%s reason=x_refusal path=fresh n=%d "
-            "verdict=%s -- refused before the first byte: re-routed through P (leg 1, then leg 2)",
-            rid, self._front_price.get(str(rid), "?"), d_extent, n, _verdict)
+            "verdict=%s route_class=%s -- refused before the first byte: re-routed through P (leg 1, then leg 2)",
+            rid, self._front_price.get(str(rid), "?"), d_extent, n, _verdict,
+            _reroute_class(self._front_price.get(str(rid)), d_extent))
         if terminal:
             # W35 counts the POPULATION -- every rid D refused a second time
             # after a full P prefill. W53 is the SUBSET of those for which
@@ -17447,3 +17448,19 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _reroute_class(front_price, d_extent) -> str:
+    """#1600 instrument only (never a decision): which price/admit gap a W50-REROUTE x_refusal is.
+
+    ``short_credit`` -- the front priced it SHORT (front_price <= 1: D-direct, from a presence
+    credit) yet D refused: the credit is not backed by what D can read (b9h weg2-0-44.. d_extent
+    70..72); ``anchor_tail`` -- priced long, D's extent below one 4096 anchor step (the 1420 TAIL
+    class); ``long`` -- the rest (arena wall / FULL). ``?`` when a number is missing."""
+    try:
+        fp, de = int(front_price), int(d_extent)
+    except (TypeError, ValueError):
+        return "?"
+    if fp <= 1:
+        return "short_credit"
+    return "anchor_tail" if 0 < de < 4096 else "long"
