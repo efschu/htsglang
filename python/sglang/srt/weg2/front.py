@@ -1022,14 +1022,21 @@ VISION_FLIP_URGENT_ENV = "SGLANG_WEG2_VISION_FLIP_URGENT"
 
 
 def vision_flip_urgent(env=None) -> bool:
-    """``SGLANG_WEG2_VISION_FLIP_URGENT=1``: a queued request that ONLY P can
+    """``SGLANG_WEG2_VISION_FLIP_URGENT``: a queued request that ONLY P can
     serve (an image under ``--weg2-vision transient``, see ``Pending.p_only``)
-    satisfies the D->P flip-economics latch on its own. Default off = the
-    pre-xsn438 latch, under which such a request waits for X* of text or for
-    the fairness switch (weg2xsn438: 45 s)."""
+    satisfies the D->P flip-economics latch on its own.
+
+    Default ON since 04.10.2026 (default-switch audit 1300, user order "alle
+    Schalter, die default an sein sollten ... ANSCHALTEN"): profile 27b.env
+    carried ``_form ... 1`` and the group env of every metal boot names it
+    (INT8 dkr27browauthoritybar1fs10040532, NVFP4 dual ...10040710); NF has it
+    on through its registry. Unset or blank = on; ``0``/``false``/``no``/``off``
+    = the pre-xsn438 latch, under which such a request waits for X* of text or
+    for the fairness switch (weg2xsn438: 45 s). It only acts on a request that
+    only P can serve, so a text-only front is byte-identical (see Front.__init__)."""
     src = os.environ if env is None else env
-    raw = src.get(VISION_FLIP_URGENT_ENV, "0")
-    return str(raw if raw is not None else "0").strip().lower() in ("1", "true", "yes", "on")
+    raw = src.get(VISION_FLIP_URGENT_ENV, "1")
+    return str(raw if raw is not None else "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 #: verdicts of :func:`vision_verdict`
@@ -4238,11 +4245,17 @@ class Front:
         # xsn438: resolved once and named once -- a switch that changes the
         # D->P latch must be readable off the front log, not inferred.
         self.vision_flip_urgent = vision_flip_urgent()
+        if (self.vision_flip_urgent and self.vision == VISION_MODE_OFF
+                and os.environ.get(VISION_FLIP_URGENT_ENV) is None):
+            # default-on has no object on a text-only front (no request is p_only
+            # there): stay byte-identical, no start line, no extra FLIP-ECONOMICS
+            # fields (H125). An explicit value keeps the old behaviour.
+            self.vision_flip_urgent = False
         # H125: named only on a boot that serves images -- a text-only front
         # (`off`, the default) logs exactly what it logged before.
         if self.vision == VISION_MODE_TRANSIENT or self.vision_flip_urgent:
             logger.info(
-                "WEG2 VISION-FLIP-URGENT %s (%s=%r, default off; vision=%s): %s",
+                "WEG2 VISION-FLIP-URGENT %s (%s=%r, default on; vision=%s): %s",
                 "on" if self.vision_flip_urgent else "off", VISION_FLIP_URGENT_ENV,
                 os.environ.get(VISION_FLIP_URGENT_ENV), self.vision,
                 "a queued request only P can serve satisfies the D->P latch on its own"

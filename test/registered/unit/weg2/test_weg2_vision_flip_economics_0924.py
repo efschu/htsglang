@@ -158,7 +158,7 @@ def test_the_line_names_both_terms(caplog):
 
 
 # ---------------------------------------------------------------- the switch
-@pytest.mark.parametrize("raw,want", [(None, False), ("", False), ("0", False), ("off", False),
+@pytest.mark.parametrize("raw,want", [(None, True), ("", True), ("0", False), ("off", False),
                                       ("1", True), ("true", True), ("on", True), ("YES", True)])
 def test_switch_resolution(raw, want):
     env = {} if raw is None else {"SGLANG_WEG2_VISION_FLIP_URGENT": raw}
@@ -173,7 +173,9 @@ def test_the_front_names_the_switch_at_start(caplog, monkeypatch):
     assert any("VISION-FLIP-URGENT on" in r.getMessage() for r in caplog.records)
     assert f.state_dict()["vision_flip_urgent"] is True
     monkeypatch.delenv("SGLANG_WEG2_VISION_FLIP_URGENT")
-    assert _front().vision_flip_urgent is False, "default off"
+    assert _front().vision_flip_urgent is True, "default on since the default-switch audit 1300 (04.10.)"
+    monkeypatch.setenv("SGLANG_WEG2_VISION_FLIP_URGENT", "0")
+    assert _front().vision_flip_urgent is False, "explicit 0 still switches it off"
 
 
 # ---------------------------------------------------------------- H125 (NF): off stays off
