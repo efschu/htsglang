@@ -20029,6 +20029,19 @@ class Scheduler(
                 # leg drains -- unless a node is left un-issued (then #1470 as before)
                 _b1_nowait = not _weg2_flush_nonblock.quiesce_sweep_blocking(
                     self, {}, tp_group_verdict)
+                # 1403 (NF nf9 1004_105315): a no-progress round of THIS quiesce
+                # (arena full, issued=0, nothing in flight) repeats identically on
+                # every front poll -- ~1.2 s of tree walk per poll (P.log 144297:
+                # sweep_ms=1221.1, four polls). While the in-flight count stands
+                # where that round left it, the sweep is skipped (SGLANG_WEG2_FLUSH_SWEEP_MEMO).
+                _memo_hit = (_weg2_flush_nonblock.sweep_memo_on()
+                             and _weg2_flush_nonblock.sweep_memo_hit(
+                                 self, self.tree_cache))
+                if _memo_hit:
+                    logger.info(
+                        "#1470 FLUSH-PUBLISH MEMO-SKIP in-flight=%d (last round "
+                        "issued 0 with nothing in flight; the count is unchanged)",
+                        _weg2_flush_nonblock.inflight_count(self.tree_cache))
                 # kvs2 W3 (boot ...kvdemandbar1dauer09291534): the poll's own
                 # publish work is not the idle lap's age (weg2_idle_vote.own_work).
                 # D-NORECOMPUTE (a): a full mamba arena at the flush spills a
@@ -20038,7 +20051,7 @@ class Scheduler(
                 try:
                     _spill_tc._weg2_flush_spill = True
                     with _weg2_own_work():
-                        for _round in range(64):
+                        for _round in (range(64) if not _memo_hit else ()):
                             _stats = _sweep(max_issue=256) or {}
                             _issued += int(_stats.get("issued", 0) or 0)
                             if int(_stats.get("unbacked", 0) or 0) == 0:
@@ -20055,6 +20068,9 @@ class Scheduler(
                             # full), 4.6-5.0 s ahead of the idle read on every poll.
                             if (int(_stats.get("issued", 0) or 0) == 0
                                     and int(_stats.get("pending", 0) or 0) == 0):
+                                if _weg2_flush_nonblock.sweep_memo_on():
+                                    _weg2_flush_nonblock.sweep_memo_set(
+                                        self, self.tree_cache)
                                 break
                             if _wc is not None:
                                 _wc(write_back=True)  # free the pins, then sweep again
