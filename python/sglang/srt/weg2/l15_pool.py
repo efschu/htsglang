@@ -294,6 +294,7 @@ def _try_place(
     seg: Dict[int, Segment],
     default_row_bytes: int,
     rates: _Rates,
+    anchor_in_kv: bool = False,
 ) -> Tuple[Optional[List[Piece]], Optional[str]]:
     """Place ONE whole request on COPIES of the free state (the caller
     commits only on success).  ``(pieces, None)`` or ``(None, reason)``."""
@@ -334,6 +335,21 @@ def _try_place(
                 pieces.append(Piece("anchor", r, r, 1, 0))
                 free_a[r] -= 1
                 continue
+            if anchor_in_kv:
+                # S4 (l15_pool_anchor): the guest share lies as bytes in the
+                # FREE KV hold rows of a host, priced in rows of that host
+                def _rows_h(h):
+                    return _ceil_div(b, max(1, row_bytes_of(h)))
+
+                cands = [h for h, f in free_kv.items()
+                         if h != r and row_bytes_of(h) > 0 and f >= _rows_h(h)]
+                if not cands:
+                    return None, REASON_ANCHOR_FULL
+                h = min(cands, key=lambda x: _host_key(rates, r, x, free_kv[x]))
+                rows = _rows_h(h)
+                pieces.append(Piece("anchor", r, h, rows, b))
+                free_kv[h] -= rows
+                continue
             cands = []
             for h, f in free_a.items():
                 sb = int(seg[h].anchor_slot_bytes) if h in seg else 0
@@ -370,6 +386,7 @@ def pool_admit(
     segments: Sequence[Segment],
     rates: Optional[Mapping[Tuple[int, int], float]] = None,
     default_rate: float = 1.0,
+    anchor_in_kv: bool = False,
 ) -> PoolVerdict:
     """Admit whole requests against the SUM of the segments.
 
@@ -409,7 +426,8 @@ def pool_admit(
             excluded.append((req.rid, REASON_ANCHORLESS))
             continue
         kv_try, a_try = dict(free_kv), dict(free_a)
-        pieces, why = _try_place(req.rows_by_rank, ab, kv_try, a_try, seg, default_rb, rt)
+        pieces, why = _try_place(req.rows_by_rank, ab, kv_try, a_try, seg, default_rb, rt,
+                                 anchor_in_kv)
         if pieces is None:
             excluded.append((req.rid, why))
             continue
@@ -442,6 +460,7 @@ def admit_candidates(
     anchor_bytes_by_rank: Optional[Sequence[int]] = None,
     rates: Optional[Mapping[Tuple[int, int], float]] = None,
     default_rate: float = 1.0,
+    anchor_in_kv: bool = False,
 ) -> PoolVerdict:
     """Today's candidate set through the pooled admission.
 
@@ -466,6 +485,7 @@ def admit_candidates(
         segments,
         rates=rates,
         default_rate=default_rate,
+        anchor_in_kv=anchor_in_kv,
     )
     if not anchorless:
         return v
@@ -506,6 +526,7 @@ def shadow_compare(
     anchor_slot_bytes_by_rank: Optional[Sequence[int]] = None,
     rates: Optional[Mapping[Tuple[int, int], float]] = None,
     cards: Optional[Sequence[int]] = None,
+    anchor_in_kv: bool = False,
 ) -> PoolShadow:
     """Run today's ``select_hold`` and the pooled admission on the SAME
     candidates and the SAME capacities.  Pure; touches nothing.  Today's
@@ -514,7 +535,7 @@ def shadow_compare(
     caps = [max(0, int(c)) for c in caps_rows_by_rank]
     today = select_hold(cands, caps, int(anchor_cap))
     segs = segments_from_caps(caps, anchor_cap, row_bytes, anchor_slot_bytes_by_rank, cards)
-    pool = admit_candidates(cands, segs, rates=rates)
+    pool = admit_candidates(cands, segs, rates=rates, anchor_in_kv=anchor_in_kv)
     return PoolShadow(
         today=today,
         pool=pool,
@@ -816,18 +837,33 @@ def log_sleep_shadow(sched, env: Mapping[str, str], log) -> Optional[str]:
         a_cap = l15_keep_split.anchor_cap(env)
         cands = l15_shadow.candidates_from(sleep_entries(sched, tp, ratios))
         ab = parse_int_list(env.get(POOL_ANCHOR_BYTES_ENV))
+        rank = int(getattr(getattr(sched, "ps", None), "tp_rank", 0) or 0)
+        # S4 correction of the S1 assumption: the head shares of one anchor are
+        # NOT equal over the ranks (27B at [2,1,1]: 37.4/18.7/18.7 MiB; even
+        # [1,1,1]: 28.1/23.4/23.4 MiB -- MambaBlobSpec.shard_for_rank). They are
+        # read from the spec cut by the head ratio vector the live pool was cut
+        # by and confirmed against this rank's own slot bytes.
+        from sglang.srt.weg2 import l15_pool_anchor
+
+        ctx, ctx_why = (None, "")
+        if ab is None or len(ab) != tp:
+            ctx, ctx_why = l15_pool_anchor.resolve_anchor_ctx(sched, env, tp, rank)
         if ab is not None and len(ab) == tp:
             slot_b, src = list(ab), "env"
+        elif ctx is not None:
+            slot_b, src = list(ctx.bytes_by_rank), ctx.src
         else:
             own = own_anchor_slot_bytes(sched)
             if own > 0:
-                slot_b, src = [own] * tp, "own-assumed-equal"
+                slot_b, src = [own] * tp, "own-assumed-equal(UNVERIFIED,wrong-for-tp>1: %s)" % (
+                    str(ctx_why)[:120].replace(" ", "_"),)
             else:
                 slot_b, src = [1] * tp, "unit-slots(bytes unknown)"
         ps = shadow_compare(
             cands, caps, a_cap, row_bytes=cell,
             anchor_slot_bytes_by_rank=slot_b,
-            rates=parse_rates(env.get(POOL_RATES_ENV)), cards=cards)
+            rates=parse_rates(env.get(POOL_RATES_ENV)), cards=cards,
+            anchor_in_kv=l15_pool_anchor.pool_s4_flag(env))
         try:
             from sglang.srt.weg2 import l15_bind  # imports torch: lazy, optional
 
@@ -1109,12 +1145,21 @@ def hosted_end(guests: Optional[Sequence[Sequence[int]]], rank: int) -> int:
 
 
 def wake_keep_rows(rows_by_rank: Sequence[int], rank: int,
-                   guests: Optional[Sequence[Sequence[int]]]) -> int:
+                   guests: Optional[Sequence[Sequence[int]]],
+                   anchor_guests: Optional[Sequence[Sequence[int]]] = None) -> int:
     """The rows the wake's zero scrub must leave alone on ``rank``: its compact
     prefix and, for a v2 manifest, the guest rows it hosts (they come back to
-    their owners only at the park-back, after the restore)."""
+    their owners only at the park-back, after the restore).  S4: the rows that
+    host anchor byte guests count too (``anchor_guests``, None = no S4 round:
+    exactly the S3 value)."""
     keep = int(rows_by_rank[rank]) if 0 <= rank < len(rows_by_rank) else 0
-    return max(keep, hosted_end(guests, rank)) if guests is not None else keep
+    if guests is None:
+        return keep
+    end = hosted_end(guests, rank)
+    if anchor_guests:
+        end = max(end, max([int(g[4]) + int(g[5]) for g in anchor_guests
+                            if int(g[1]) == int(rank)] + [0]))
+    return max(keep, end)
 
 
 def guest_row_ranges(guests: Optional[Sequence[Sequence[int]]], rank: int

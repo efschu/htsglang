@@ -181,7 +181,10 @@ def decide_first(kwargs, reuse_on: bool, cap_rows_fn: Callable[[], int],
                     cap_anchor_slots=kwargs["cap_anchor_slots"],
                     prefix=kwargs["prefix"],
                     epoch=kwargs["epoch"],
-                    log=log, pool=bool(pool))
+                    log=log, pool=bool(pool),
+                    # L15-POOL S4: the anchor pricing the scheduler resolved for
+                    # this sleep (absent = no S4 round, the S3 call)
+                    anchor_ctx=kwargs.get("anchor_ctx"))
                 cap = int(cap_rows_fn())
                 man = None
                 if planned is not None and cap <= 0:

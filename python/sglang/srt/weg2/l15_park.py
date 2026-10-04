@@ -180,7 +180,9 @@ def sidecar_path(rank: int, env) -> str:
 
 
 def write_sidecar(rank: int, env, epoch: int, pieces: Sequence[ParkPiece],
-                  sums: Optional[dict] = None) -> None:
+                  sums: Optional[dict] = None,
+                  anchor_guests: Optional[Sequence[Sequence[int]]] = None,
+                  anchor_sums: Optional[dict] = None) -> None:
     """``sums`` (S2 pooled hold only): the source-side sample checksums of the
     guest rows, kept for the wake's round-trip check; absent otherwise, so the
     record of the per-card path is unchanged byte for byte."""
@@ -194,6 +196,11 @@ def write_sidecar(rank: int, env, epoch: int, pieces: Sequence[ParkPiece],
                       for p in pieces]}
     if sums is not None:
         rec["sums"] = sums
+    if anchor_guests is not None:
+        # S4 only: the anchor byte guests and the source checksum of the shares
+        # this rank owns; absent otherwise, the S3 record byte for byte
+        rec["anchor_guests"] = [[int(x) for x in g] for g in anchor_guests]
+        rec["anchor_sums"] = anchor_sums or {}
     with open(tmp, "w") as fh:
         json.dump(rec, fh)
     os.replace(tmp, path)
@@ -332,6 +339,51 @@ def s3_pieces_of_manifest(m, caps: Sequence[int], env, world: int, rates=None):
     return have, None, fp
 
 
+def s4_plan_of_manifest(m, caps: Sequence[int], env, world: int, rank: int,
+                        kv_views, m_views, rates=None):
+    """``(anchor_guests, None, fp)`` or ``([], reason, None)``: the S4 anchor
+    guests are the manifest's list the retain published -- never a re-plan --
+    and must be exactly what the same pure plan gives from the manifest's own
+    rows, caps, pricing and anchor count (plus the KV guests, which stay the S3
+    plan); this rank's own slot bytes and the KV row bytes must be the priced
+    ones.  The digest the group compares carries all of it
+    (``l15_pool_anchor.plan_fingerprint_s4``)."""
+    from sglang.srt.weg2 import l15_pool, l15_pool_anchor
+
+    if m.anchor_guests is None or m.anchor_bytes is None:
+        return [], "manifest has no anchor guests under SGLANG_WEG2_L15_POOL_S4", None
+    if m.guests is None:
+        return [], "S4 manifest without the S3 guest list", None
+    ab = tuple(int(x) for x in m.anchor_bytes)
+    rb = int(m.anchor_row_bytes)
+    if len(ab) != int(world):
+        return [], "anchor bytes for %d ranks, group of %d" % (len(ab), world), None
+    own = sum(int(v.shape[1]) for v in m_views)
+    if own != ab[rank]:
+        return [], "this rank's slot is %d bytes, the plan priced %d" % (own, ab[rank]), None
+    if l15_pool_anchor.kv_row_bytes(kv_views) != rb:
+        return [], "KV row is %d bytes, the plan priced %d" % (
+            l15_pool_anchor.kv_row_bytes(kv_views), rb), None
+    if rates is None:
+        rates, _src = l15_pool.resolve_rates(env, int(world))
+    rates = l15_pool.quantize_rates(rates)
+    n_anchors = int(m.anchor_slots) - 1
+    kv_want, a_want, why, _code = l15_pool_anchor.pool_park_plan_s4(
+        list(m.rows_by_rank), list(caps), ab, rb, n_anchors, rates)
+    if why is not None:
+        return [], why, None
+    if l15_pool.guest_tuples(kv_want) != l15_pool.guest_tuples(
+            l15_pool.pieces_of(m.guests)):
+        return [], "manifest KV guest list differs from the plan of this rank's rates", None
+    have = l15_pool_anchor.anchor_guest_tuples(m.anchor_guests)
+    if have != l15_pool_anchor.anchor_guest_tuples(a_want):
+        return [], "manifest anchor guest list differs from the plan of this rank's rates", None
+    fp = l15_pool_anchor.plan_fingerprint_s4(
+        [sp.rid for sp in m.spans], list(m.rows_by_rank), caps,
+        l15_pool.pieces_of(m.guests), have, ab, rb, n_anchors)
+    return list(have), None, fp
+
+
 # -- scheduler entries --------------------------------------------------------
 
 def _group_io(sched):
@@ -389,7 +441,7 @@ def _pool_line(kind: str, epoch, rank, nbytes, ms, rounds, reason="-") -> str:
 
 
 def pool_check_line(epoch, rank: int, ok: int, bad: int, pieces: Sequence[ParkPiece],
-                    s3: bool = False) -> str:
+                    s3: bool = False, anchor: Optional[Tuple[int, int, int]] = None) -> str:
     """``L15-POOL-CHECK``: the guest-row sample of one rank at the wake.  S3
     names what was sampled: pieces and rows this rank OWNS as guests and the
     hosts they lay on (``guest_rows=0`` = nothing of this rank travelled)."""
@@ -398,9 +450,15 @@ def pool_check_line(epoch, rank: int, ok: int, bad: int, pieces: Sequence[ParkPi
     if not s3:
         return base
     own = [p for p in pieces if int(p.src) == int(rank)]
-    return base + " s3=1 guest_pieces=%d guest_rows=%d hosts=%s" % (
+    line = base + " s3=1 guest_pieces=%d guest_rows=%d hosts=%s" % (
         len(own), sum(int(p.rows) for p in own),
         ",".join(str(h) for h in sorted({int(p.dst) for p in own})) or "-")
+    if anchor is not None:
+        # S4: the source checksum blocks of the anchor shares this rank owns,
+        # compared after they came back (anchor_pieces = pieces it owns)
+        line += " s4=1 anchor_ok=%d anchor_bad=%d anchor_pieces=%d" % (
+            int(anchor[0]), int(anchor[1]), int(anchor[2]))
+    return line
 
 
 def _counting(a2a):
@@ -434,12 +492,16 @@ def park_at_release(sched, env, log) -> Optional[int]:
     t0 = time.perf_counter()
     pooled = l15_pool.pool_on(env)
     s3 = l15_pool.pool_s3_on(env)
+    from sglang.srt.weg2 import l15_pool_anchor
+
+    s4 = l15_pool_anchor.pool_s4_on(env)
     try:
         rank, world, gather, a2a = _group_io(sched)
     except Exception as exc:  # noqa: BLE001 -- no group, no park
         log("L15-PARK at=sleep skipped (no group: %s)" % (exc,))
         return None
     pieces, why, epoch, fp = [], None, -1, None
+    a_guests, kv_v, m_v = [], [], []
     try:
         m = l15_manifest.read(l15_manifest.manifest_path("D", rank, env))
         bufs, pool = _kv_buffers(sched)
@@ -454,9 +516,18 @@ def park_at_release(sched, env, log) -> Optional[int]:
                 pieces, why, fp = s3_pieces_of_manifest(m, caps, env, world)
             else:
                 pieces, why = park_plan(list(m.rows_by_rank), caps)
-            if why is None and not pieces:
+            if s4 and why is None:
+                kv_v = [l15_pool_anchor._rows2d(b) for b in bufs]
+                m_v = l15_pool_anchor.mamba_views(sched)
+                a_guests, why, fp = s4_plan_of_manifest(
+                    m, caps, env, world, rank, kv_v, m_v)
+                if why is None:
+                    why = l15_pool_anchor.anchor_bounds_refusal(
+                        a_guests, rank, kv_v, m_v, int(m.anchor_row_bytes),
+                        int(m.anchor_bytes[rank]))
+            if why is None and not pieces and not a_guests:
                 why = "nothing to park"
-            if why is None:
+            if why is None and pieces:
                 why = bounds_refusal(pieces, rank, bufs)
             if why is None and pooled and fp is None:
                 fp = l15_pool.plan_fingerprint(
@@ -480,13 +551,22 @@ def park_at_release(sched, env, log) -> Optional[int]:
         return None
     err = None
     sent = 0
+    a_sent = 0
     sums = None
+    a_sums = None
     run_a2a, rounds = (_counting(a2a) if pooled else (a2a, [0]))
     t_x0 = time.perf_counter()
     try:
         if pooled:
             sums = guest_sums(pieces, rank, bufs)
+        if a_guests:
+            # the SOURCE checksum of the anchor shares this rank owns, before
+            # the send (independent of L2: an anchor share has to arrive intact)
+            a_sums = l15_pool_anchor.anchor_sums_of(a_guests, rank, m_v)
         sent = run_park("out", pieces, rank, world, bufs, run_a2a, env)
+        if a_guests:
+            a_sent = l15_pool_anchor.run_anchor_park(
+                "out", a_guests, rank, world, m_v, kv_v, run_a2a, env)
         torch.cuda.current_stream().synchronize()
     except Exception as exc:  # noqa: BLE001 -- the wake refills from L2
         err = "%s: %s" % (type(exc).__name__, exc)
@@ -500,17 +580,19 @@ def park_at_release(sched, env, log) -> Optional[int]:
             log(_pool_line("OUT", epoch, rank, 0, (t_x1 - t_x0) * 1000.0, rounds[0],
                            "transport failed: %s" % (err or "a peer failed")))
         return None
-    write_sidecar(rank, env, epoch, pieces, sums=sums)
+    write_sidecar(rank, env, epoch, pieces, sums=sums,
+                  anchor_guests=(a_guests if s4 else None), anchor_sums=a_sums)
     log("L15-PARK at=sleep rank=%d result=parked epoch=%d pieces=%d park_bytes=%d "
-        "park_ms=%.0f" % (rank, epoch, len(pieces), sent,
+        "park_ms=%.0f" % (rank, epoch, len(pieces), sent + a_sent,
                           (time.perf_counter() - t0) * 1000.0))
     if pooled:
-        log(_pool_line("OUT", epoch, rank, sent, (t_x1 - t_x0) * 1000.0, rounds[0]))
-    return sent
+        log(_pool_line("OUT", epoch, rank, sent + a_sent, (t_x1 - t_x0) * 1000.0,
+                       rounds[0]))
+    return sent + a_sent
 
 
 def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
-                      manifest_guests=None) -> bool:
+                      manifest_guests=None, manifest_anchor_guests=None) -> bool:
     """D wake (resume RPC, every D rank, one list position, before the
     cap-0 refill): bring the parked rows back. True when they are back on
     this group (the cap-0 rank then refills only its anchors from L2).
@@ -540,6 +622,13 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
            (int(d.get("epoch", -1)),
             [ParkPiece(*map(int, x)) for x in d.get("pieces", ())]))
     sums_before = None if d is None else d.get("sums")
+    # S4: the anchor guests and their source checksum of the sleep (absent in an
+    # S3 / S2 record)
+    a_rec = None
+    a_sums_before = None
+    if d is not None and d.get("anchor_guests") is not None:
+        a_rec = [tuple(int(x) for x in g) for g in d["anchor_guests"]]
+        a_sums_before = d.get("anchor_sums") or {}
     why = None
     if not group_ok:
         why = "kv resume refused in the group"
@@ -550,6 +639,10 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
     elif manifest_guests is not None and _guest_key(rec[1]) != _guest_key(
             [ParkPiece(*(int(x) for x in g)) for g in manifest_guests]):
         why = "park record differs from the manifest guest list"
+    elif manifest_anchor_guests is not None and (
+            a_rec is None or [tuple(int(x) for x in g) for g in manifest_anchor_guests]
+            != a_rec):
+        why = "park record differs from the manifest anchor guest list"
     if not agree(why is None, gather):
         log("L15-PARK at=wake rank=%d result=off reason=%s park_bytes=0 park_ms=%.0f"
             % (rank, why or "a peer has no park", (time.perf_counter() - t0) * 1000.0))
@@ -560,25 +653,42 @@ def park_back_at_wake(sched, env, log, *, epoch: int, group_ok: bool,
     err = None
     sent = 0
     ck_ok = ck_bad = 0
+    a_ok = a_bad = 0
     run_a2a, rounds = (_counting(a2a) if pooled else (a2a, [0]))
     t_x0 = time.perf_counter()
     try:
         bufs, _pool = _kv_buffers(sched)
         sent = run_park("back", rec[1], rank, world, bufs, run_a2a, env)
+        if a_rec:
+            from sglang.srt.weg2 import l15_pool_anchor as _lpa
+
+            _kv_v = [_lpa._rows2d(b) for b in bufs]
+            _m_v = _lpa.mamba_views(sched)
+            sent += _lpa.run_anchor_park("back", a_rec, rank, world, _m_v, _kv_v,
+                                         run_a2a, env)
         torch.cuda.current_stream().synchronize()
         if pooled and sums_before is not None:
             ck_ok, ck_bad = compare_sums(sums_before, guest_sums(rec[1], rank, bufs))
             if ck_bad:
                 err = "guest round-trip checksum: %d of %d samples differ" % (
                     ck_bad, ck_ok + ck_bad)
+        if a_rec:
+            a_ok, a_bad = compare_sums(
+                a_sums_before, _lpa.anchor_sums_of(a_rec, rank, _m_v))
+            if a_bad and err is None:
+                err = "anchor round-trip checksum: %d of %d blocks differ" % (
+                    a_bad, a_ok + a_bad)
     except Exception as exc:  # noqa: BLE001
         err = "%s: %s" % (type(exc).__name__, exc)
     t_x1 = time.perf_counter()
     if pooled:
         # every sampled row is a guest row in S2 (the home rows never leave
         # their segment; L15-CHECK samples them against L2)
-        log(pool_check_line(epoch, rank, ck_ok, ck_bad, rec[1] if rec else (),
-                            s3=manifest_guests is not None))
+        log(pool_check_line(
+            epoch, rank, ck_ok, ck_bad, rec[1] if rec else (),
+            s3=manifest_guests is not None,
+            anchor=((a_ok, a_bad, sum(1 for g in a_rec if int(g[0]) == int(rank)))
+                    if a_rec is not None else None)))
     if not agree(err is None, gather):
         log("L15-PARK at=wake rank=%d result=FAILED (%s) -- L2 refill"
             % (rank, err or "a peer failed"))

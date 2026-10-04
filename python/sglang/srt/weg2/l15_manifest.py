@@ -85,6 +85,25 @@ class Manifest:
     # same hash edge as for slots and generations.
     guests: Optional[Tuple[Tuple[int, int, int, int, int], ...]] = None
     caps: Optional[Tuple[int, ...]] = None
+    # MANIFEST v2 + S4 (L15-POOL S4, sec 4.5): the END ANCHORS of a rank without
+    # a home segment lie as byte guests in the free hold rows of a host rank.
+    # None = no S4 (the v2/S3 record and fingerprint stay byte for byte);
+    # a tuple (empty allowed) = S4:
+    #   anchor_guests    -- ``(owner, host, a_lo, n_a, host_row_lo, host_rows,
+    #                       nbytes)`` per piece: the owner's head share of the
+    #                       anchors ``[a_lo, a_lo + n_a)`` (index into the sorted
+    #                       held anchor slots) lies as ``nbytes`` bytes in the
+    #                       host's KV hold rows ``[host_row_lo, host_row_lo +
+    #                       host_rows)``;
+    #   anchor_bytes     -- every rank's head share of ONE anchor in bytes (the
+    #                       pricing of the plan; read from the MambaBlobSpec);
+    #   anchor_row_bytes -- bytes of one KV hold row (all layers) the host rows
+    #                       are counted in.
+    # All three are part of the group fingerprint: ranks that disagree on where
+    # an anchor lies, or on what it was priced with, fall back together.
+    anchor_guests: Optional[Tuple[Tuple[int, int, int, int, int, int, int], ...]] = None
+    anchor_bytes: Optional[Tuple[int, ...]] = None
+    anchor_row_bytes: int = 0
 
 
 def _pid_alive(pid: int) -> bool:
@@ -127,8 +146,14 @@ def _v2_head(m: Manifest) -> dict:
     """The v2 fields of the record head ({} for a v1 manifest)."""
     if m.guests is None:
         return {}
-    return {"guests": [[int(x) for x in g] for g in m.guests],
-            "caps": [int(x) for x in (m.caps or ())]}
+    out = {"guests": [[int(x) for x in g] for g in m.guests],
+           "caps": [int(x) for x in (m.caps or ())]}
+    if m.anchor_guests is not None:
+        # S4: only an S4 round writes (and hashes) these keys
+        out["anchor_guests"] = [[int(x) for x in g] for g in m.anchor_guests]
+        out["anchor_bytes"] = [int(x) for x in (m.anchor_bytes or ())]
+        out["anchor_row_bytes"] = int(m.anchor_row_bytes)
+    return out
 
 
 def _v2_load(head: dict) -> dict:
@@ -141,8 +166,21 @@ def _v2_load(head: dict) -> dict:
     c = head.get("caps", [])
     if not isinstance(c, list):
         raise ValueError("malformed L1.5 manifest: 'caps' is not a list")
-    return {"guests": tuple(tuple(int(v) for v in x) for x in g),
-            "caps": tuple(int(v) for v in c)}
+    out = {"guests": tuple(tuple(int(v) for v in x) for x in g),
+           "caps": tuple(int(v) for v in c)}
+    if "anchor_guests" in head:
+        ag = head["anchor_guests"]
+        if not isinstance(ag, list) or any(
+                not isinstance(x, list) or len(x) != 7 for x in ag):
+            raise ValueError(
+                "malformed L1.5 manifest: 'anchor_guests' is not a list of 7-int pieces")
+        ab = head.get("anchor_bytes", [])
+        if not isinstance(ab, list):
+            raise ValueError("malformed L1.5 manifest: 'anchor_bytes' is not a list")
+        out["anchor_guests"] = tuple(tuple(int(v) for v in x) for x in ag)
+        out["anchor_bytes"] = tuple(int(v) for v in ab)
+        out["anchor_row_bytes"] = int(head.get("anchor_row_bytes", 0))
+    return out
 
 
 def _span_to_dict(s: HoldSpan) -> dict:

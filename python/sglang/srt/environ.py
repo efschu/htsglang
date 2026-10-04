@@ -854,6 +854,21 @@ class Envs:
     # fallback. Q2: the cap-0 rank's L2 duty (post_vote) stays. Default off = the
     # S2 path (or today's per-card path when POOL is off) byte for byte.
     SGLANG_WEG2_L15_POOL_S3 = EnvBool(False)
+    # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
+    # END anchor = a WHOLE request): part switch ON TOP of SGLANG_WEG2_L15_POOL and
+    # SGLANG_WEG2_L15_POOL_S3 (S4 without them is refused by name,
+    # W-L15-POOL-S4-NEEDS-S3). The anchor share (GDN head share, priced in bytes
+    # from the MambaBlobSpec) of a rank WITHOUT a home segment lies as a byte guest
+    # in the free KV hold rows of a host rank (same free rows as the KV guests; the
+    # Mamba hold region is too small, zeroed by every flush and ledgered); admission
+    # counts KV rows AND anchor bytes against the sum of the segments, a request
+    # whose anchor finds no room is not held at all (no half hold), the manifest v2
+    # carries the anchor guests, the pricing and the row bytes in the group
+    # fingerprint, the source checksum covers the anchor bytes, and a wake whose
+    # anchors came back from the pool loads none from L2 (no 'Mamba-Anker fehlt'
+    # re-prefill from a stale L2 generation). Q2: the L2 duty (post_vote, anchor L2
+    # identity) is unchanged. Default off = the S3 path byte for byte.
+    SGLANG_WEG2_L15_POOL_S4 = EnvBool(False)
     # L15-POOL S1b (weg2/l15_pool_peak.py): the planner input P_AWAKE_PEAK_MIB
     # per card, built from measured WEG2-VRAM-PEAK windows (scripts/
     # l15_pool_peak_record.py): per card the MAXIMUM over boots/lines with its

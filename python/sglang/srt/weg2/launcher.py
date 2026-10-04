@@ -25397,6 +25397,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _pools3 = l15_plan.refuse_pool_s3_without_pool(os.environ)
     if _pools3 is not None:
         raise Weg2LaunchRefused(_pools3)
+    _pools4 = l15_plan.refuse_pool_s4_without_s3(os.environ)
+    if _pools4 is not None:
+        raise Weg2LaunchRefused(_pools4)
     _pooldep = l15_plan.refuse_pool_with_deposit(os.environ)
     if _pooldep is not None:
         raise Weg2LaunchRefused(_pooldep)
@@ -25426,7 +25429,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for post in l15_posts:
                 log(l15_plan.post_line(post))
             # L15-POOL S1 (log only): the per-card posts seen as ONE pool.
-            from sglang.srt.weg2 import l15_keep_split, l15_pool
+            from sglang.srt.weg2 import l15_keep_split, l15_pool, l15_pool_anchor
 
             if l15_pool.pool_on(os.environ):
                 log(l15_pool.boot_line(
@@ -25434,6 +25437,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     l15_keep_split.anchor_cap(os.environ),
                     mode=l15_pool.POOL_MODE if not l15_pool.pool_s3_on(os.environ)
                     else l15_pool.S3_MODE))
+                if l15_pool_anchor.pool_s4_on(os.environ):
+                    # S4: the anchors are part of the whole request (second line,
+                    # the S3 boot line above stays as it was)
+                    log("L15-POOL-S4 mode=%s anchor_cap=%d" % (
+                        l15_pool_anchor.S4_MODE, l15_keep_split.anchor_cap(os.environ)))
             elif l15_pool.pool_shadow_on(os.environ):
                 log(l15_pool.boot_line(
                     [p.mib for p in l15_posts], [p.src for p in l15_posts],

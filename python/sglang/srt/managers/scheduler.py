@@ -20893,6 +20893,26 @@ class Scheduler(
                                     self.tree_cache),
                                 log=logger.info),
                         )
+                        # L15-POOL S4: the pricing of the anchor shares of THIS
+                        # sleep (head share bytes per rank from the MambaBlobSpec,
+                        # confirmed against this rank's own slot bytes; KV row
+                        # bytes). Rank-uniform; an S4 round without it is not
+                        # held (plan_round names the skip) -- never a half hold.
+                        try:
+                            from sglang.srt.weg2 import l15_pool_anchor as _l15_pa
+
+                            if _l15_pa.pool_s4_on(os.environ):
+                                _l15_actx, _l15_awhy = _l15_pa.resolve_anchor_ctx(
+                                    self, os.environ, _tp, _l15_rank)
+                                if _l15_actx is None:
+                                    logger.info(
+                                        "L15-POOL-S4 no anchor pricing this sleep "
+                                        "(%s): the round is not held", _l15_awhy)
+                                _l15_kwargs["anchor_ctx"] = _l15_actx
+                        except Exception as _exc:  # noqa: BLE001 -- not held
+                            logger.warning("L15-POOL-S4 pricing failed (%s: %s)",
+                                           type(_exc).__name__, _exc)
+                            _l15_kwargs["anchor_ctx"] = None
                         _l15_tt["bind"] = time.perf_counter() - _l15_tt["bind0"]
                         # L15-12c-C2: alignment probe -- chain host rows vs
                         # the seqlen-1 KV span. L15-FLIPCOST: a diagnostic

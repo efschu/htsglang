@@ -259,7 +259,8 @@ def _l15_keep_rows_of(m, rank) -> int:
                 if 0 <= rank < len(m.rows_by_rank) else 0)
     from sglang.srt.weg2 import l15_pool
 
-    return l15_pool.wake_keep_rows(m.rows_by_rank, rank, m.guests)
+    return l15_pool.wake_keep_rows(m.rows_by_rank, rank, m.guests,
+                                   getattr(m, "anchor_guests", None))
 
 
 def _l15_refill_on(env) -> bool:
@@ -697,6 +698,11 @@ class SchedulerWeightUpdaterManager:
     # L15-16 PARK: the parked rows came back at this wake (the cap-0 rank
     # then refills only its anchors from L2)
     _l15_park_back_ok: bool = False
+    # L15-POOL S4: this rank's END anchors came back from the pool at this wake
+    # (park-back landed on the group AND the guests this rank owns cover every
+    # held anchor): the refill loads no anchor from L2 (no generation check, no
+    # 'Mamba-Anker fehlt' re-prefill from a stale L2 slot)
+    _l15_anchor_back_ok: bool = False
     # L15-FIX-CAP0-CHECK: this wake's cap-0 refill landed (gen-checked); the
     # sample check of this rank then votes clean without re-reading L2
     _l15_refill_done: bool = False
@@ -7360,6 +7366,7 @@ class SchedulerWeightUpdaterManager:
         # survive into a wake whose signal did not set it.
         self._l15_wake_refill = False
         self._l15_refill_done = False
+        self._l15_anchor_back_ok = False
         if sched is None:
             return None, None, 0, False
         try:
@@ -7957,6 +7964,17 @@ class SchedulerWeightUpdaterManager:
             if parked:
                 plan = []
             if not plan and not parked:
+                return 0
+            if parked and bool(getattr(self, "_l15_anchor_back_ok", False)):
+                # L15-POOL S4: KV AND anchors of this rank came back from the
+                # pool (source checksum checked in the park-back): nothing is
+                # loaded from L2, the anchor generations are not even read -- a
+                # stale L2 slot cannot turn a held anchor into a re-prefill
+                self._l15_refill_done = True
+                logger.info("L15-REFILL rank=%d done: pool holds the whole share "
+                            "(KV rows and %d anchor(s) back from the guest rows), "
+                            "0 loaded from L2 h2d_refill=0 anchors_from_pool=%d",
+                            rank, len(m.spans), len(m.spans))
                 return 0
             ok, bad = (l15_refill.gen_check(plan, host_pool) if plan else ([], []))
             _rmark("gen")
@@ -12164,6 +12182,7 @@ class SchedulerWeightUpdaterManager:
                 # this one position); the cap-0 rank's refill then loads only
                 # its anchors from L2
                 self._l15_park_back_ok = False
+                self._l15_anchor_back_ok = False
                 _l15_s3_drop = False
                 try:
                     from sglang.srt.weg2 import l15_park as _l15_pk
@@ -12174,11 +12193,30 @@ class SchedulerWeightUpdaterManager:
                                    if _l15_s3 and _l15_m is not None
                                    and getattr(_l15_m, "guests", None) is not None
                                    else None)
+                        # L15-POOL S4: the anchor byte guests of the manifest
+                        # (None = no S4 round); the park-back moves them with
+                        # the KV guests and checks their source checksum
+                        from sglang.srt.weg2 import l15_pool_anchor as _l15_pa_w
+                        _l15_mag = (tuple(_l15_m.anchor_guests)
+                                    if _l15_pa_w.pool_s4_on(os.environ)
+                                    and _l15_m is not None
+                                    and getattr(_l15_m, "anchor_guests", None) is not None
+                                    else None)
                         self._l15_park_back_ok = _l15_pk.park_back_at_wake(
                             self.scheduler, os.environ, logger.info,
                             epoch=int(_l15_m.epoch) if _l15_m is not None else -1,
                             group_ok=not _weg2_kv_refusal,
-                            manifest_guests=_l15_mg)
+                            manifest_guests=_l15_mg,
+                            manifest_anchor_guests=_l15_mag)
+                        # the anchors of THIS rank are back from the pool exactly
+                        # when the park-back landed on the group (group-uniform)
+                        # and the pieces it owns cover every held anchor: the
+                        # refill then loads no anchor from L2
+                        self._l15_anchor_back_ok = bool(
+                            self._l15_park_back_ok and _l15_mag
+                            and _l15_pa_w.owner_covers_all_anchors(
+                                _l15_mag, self._weg2_rank(),
+                                int(_l15_m.anchor_slots) - 1))
                         # L15-POOL S3: a CAPPED rank's overflow rows have no L2
                         # refill path (only the cap-0 rank refills). A park-back
                         # that did not land on the group (the result is
@@ -12200,6 +12238,7 @@ class SchedulerWeightUpdaterManager:
                     logger.warning("L15-PARK at=wake failed (%s: %s)",
                                    type(exc).__name__, exc)
                     self._l15_park_back_ok = False
+                    self._l15_anchor_back_ok = False
                     try:
                         from sglang.srt.weg2 import l15_pool as _l15_pool_w2
                         _l15_s3_drop = bool(

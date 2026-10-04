@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import card_identity
+from sglang.srt.weg2.l15_pool_anchor import POOL_S4_ENV, pool_s4_flag
 from sglang.srt.weg2.l15_pool import (
     POOL_ENV,
     POOL_S3_ENV,
@@ -361,7 +362,8 @@ def refuse_dual(argv: Sequence[str], env: Mapping[str, str]) -> Optional[str]:
                                    (HOT_HANDOVER_ENV, handover_on(env)),
                                    (POOL_SHADOW_ENV, pool_shadow_on(env)),
                                    (POOL_ENV, pool_on(env)),
-                                   (POOL_S3_ENV, pool_s3_flag(env))) if on]
+                                   (POOL_S3_ENV, pool_s3_flag(env)),
+                                   (POOL_S4_ENV, pool_s4_flag(env))) if on]
     if not armed:
         return None
     return (f"{DUAL_REFUSAL_CODE}: --dual-layout with {', '.join(armed)} is refused in V1: "
@@ -382,7 +384,8 @@ def refuse_not_27b(profile: str, env: Mapping[str, str]) -> Optional[str]:
                                    (HOT_HANDOVER_ENV, handover_on(env)),
                                    (POOL_SHADOW_ENV, pool_shadow_on(env)),
                                    (POOL_ENV, pool_on(env)),
-                                   (POOL_S3_ENV, pool_s3_flag(env))) if on]
+                                   (POOL_S3_ENV, pool_s3_flag(env)),
+                                   (POOL_S4_ENV, pool_s4_flag(env))) if on]
     if not armed:
         return None
     return (f"{NOT27B_REFUSAL_CODE}: {', '.join(armed)} on profile {profile!r} is refused: "
@@ -417,6 +420,22 @@ def refuse_pool_s3_without_pool(env: Mapping[str, str]) -> Optional[str]:
     return (f"{POOLS3_REFUSAL_CODE}: {POOL_S3_ENV}=1 without {POOL_ENV}=1 is refused: "
             "the S3 overflow of every rank is a part of the pooled hold and does "
             f"nothing alone -- set {POOL_ENV}=1 or turn {POOL_S3_ENV} off.")
+
+
+POOLS4_REFUSAL_CODE = "W-L15-POOL-S4-NEEDS-S3"
+
+
+def refuse_pool_s4_without_s3(env: Mapping[str, str]) -> Optional[str]:
+    """``SGLANG_WEG2_L15_POOL_S4=1`` without ``SGLANG_WEG2_L15_POOL=1`` AND
+    ``SGLANG_WEG2_L15_POOL_S3=1``: S4 is a part switch on top of the S3 pool
+    (``l15_pool_anchor.pool_s4_on`` needs all three), so alone it would silently
+    do nothing -- refused BY NAME."""
+    if not pool_s4_flag(env) or (pool_on(env) and pool_s3_flag(env)):
+        return None
+    return (f"{POOLS4_REFUSAL_CODE}: {POOL_S4_ENV}=1 without {POOL_ENV}=1 and "
+            f"{POOL_S3_ENV}=1 is refused: the anchors of the pool lie in the guest "
+            "rows of the S3 overflow and do nothing alone -- set both or turn "
+            f"{POOL_S4_ENV} off.")
 
 
 POOLDEPOSIT_REFUSAL_CODE = "W-L15-POOL-DEPOSIT"
