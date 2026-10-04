@@ -345,6 +345,70 @@ def aging_pass(stale, *, releasable, release, lat=None) -> list:
     return done
 
 
+# -- #1500a ANCHOR-AGING-P (group P of the dual layout, env-gated, default OFF) ---
+# Dual B9g (1004 20:18, deskq/done/1530): D's aging took the mamba arena from 87 to 36
+# pinned of 112 and then stood still: ARENA-REF-HOLDERS pool=MAMBA tree=30 (PP0) tree_in_use=0,
+# D tree=9. What stays pinned is P's own radix tree -- P never resets in the dual layout and
+# gives references back only at a REFUSED CLAIM (Q-610 claim room) or for an ended END anchor
+# at a retain. The same soft rule as for D, on P's tree:
+#
+#  * the tick is the RETAIN COUNT (``_weg2_dual_gen``: +1 per finished request that runs
+#    ``weg2_dual_release_ended(at="retain")``), never a clock and never the P event-loop round
+#    (those spin at ~1500/s per PP rank, free-running, and differ between the PP ranks). The
+#    PP ranks of group P finish the same requests in the same order -- the premise Q-610's
+#    own retain/claim release stands on -- so the stamps, the tick and the decision are the
+#    same on every PP rank, and no collective is touched;
+#  * the age is the node's ``last_access_time`` (a logical counter): unchanged for more than
+#    N retains (the shared SGLANG_WEG2_DUAL_ANCHOR_AGING_TICKS, here in RETAINS) = stale;
+#  * only what Q-610's claim walk may give back (``_weg2_dual_releasable``: acked, no write in
+#    flight, no host lock, no running request, no standing told) AND, for an END anchor, only
+#    when its rid is done (``rid_done``; a pending hand-off is never done);
+#  * the release is soft (the slot stays COMPLETE and findable by stem until a claim needs it;
+#    the claim's room-making writes it to L3 first, #257 d). The L3 copy is NOT a gate: whether
+#    the page is on disk at this instant is a race that differs between the ranks (a release
+#    one rank takes and its peers do not is the rank-divergence class); it is only COUNTED
+#    (``unsecured`` = no L3 copy yet when the reference went), so the next boot says how many.
+
+MARKER_AGING_P = "#1500a ANCHOR-AGING-P"
+SWITCH_AGING_P = "SGLANG_WEG2_DUAL_ANCHOR_AGING_P"
+
+
+def aging_p_armed(env=None) -> bool:
+    """Group P of the dual layout AND the Q-610 switch AND SGLANG_WEG2_DUAL_ANCHOR_AGING_P
+    (default OFF). Anything unreadable = off."""
+    e = os.environ if env is None else env
+    try:
+        if not armed(e):
+            return False
+        return str(e.get(SWITCH_AGING_P, "") or "").strip().lower() in _TRUE
+    except Exception:  # noqa: BLE001 -- default OFF
+        return False
+
+
+_NP = [0]
+_AGING_P_FIRST = [True]
+
+
+def log_aging_p(*, stale: int, soft_released: int, secured: int, unsecured: int, anchors: int,
+                pinned: int, slots: int, ticks_n: int, tick: int, pp_rank=None) -> None:
+    """One line per retain that found or released a stale P anchor (the first 64, then every
+    64th) and the first one ever (proof of life)."""
+    first = _AGING_P_FIRST[0]
+    _AGING_P_FIRST[0] = False
+    if not (stale or soft_released or first):
+        return
+    _NP[0] += 1
+    n = _NP[0]
+    if first or n <= 64 or n % 64 == 0:
+        logger.info(
+            "%s stale=%d soft_released=%d secured=%d unsecured=%d anchors=%d pinned=%d/%d ticks_n=%d "
+            "tick=%d pp_rank=%s (n=%d; P tree anchors with no hit for more than ticks_n RETAINS gave "
+            "their reference back, the slots stay COMPLETE until a claim needs them -- aged by the "
+            "retain count, never wall time; unsecured = no L3 copy at release, counted not gated)",
+            MARKER_AGING_P, stale, soft_released, secured, unsecured, anchors, pinned, slots, ticks_n,
+            tick, pp_rank, n)
+
+
 _NA = [0]
 _AGING_FIRST = [True]
 

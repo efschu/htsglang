@@ -660,6 +660,10 @@ class Envs:
     # at the fastest measured D round rate).
     SGLANG_WEG2_DUAL_ANCHOR_AGING = EnvBool(False)
     SGLANG_WEG2_DUAL_ANCHOR_AGING_TICKS = EnvInt(40)
+    # #1500a ANCHOR-AGING-P: the same rule on dual group P's radix tree (P pins ~30 of the 112 mamba
+    # slots for ever after D's aging: deskq/done/1530). Age counted in RETAINS (finished requests), the
+    # same ..._TICKS value; END anchors only when their rid is done; counted L3 copy, not gated. Default OFF.
+    SGLANG_WEG2_DUAL_ANCHOR_AGING_P = EnvBool(False)
     # told-anchor hold (y9d4, weg2/dual_told_anchor_hold.py): dual group P keeps the anchor a
     # standing told names from told to admission (cap / Q-610 / inner release skip it). 0 = off.
     SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD = EnvBool(True)

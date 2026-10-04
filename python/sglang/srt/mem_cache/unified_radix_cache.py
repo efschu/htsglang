@@ -5555,6 +5555,66 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.weg2_dual_release_ended(at="retain")
         except Exception as exc:  # noqa: BLE001 -- a release never takes the retain down
             logger.warning("Q-610 DUAL-ANCHOR-RELEASE at=retain raised %s: %s", type(exc).__name__, exc)
+        self._weg2_dual_p_aging_tick()
+
+    def _weg2_dual_p_l3_secured(self, n, mp):
+        """True/False: every arena slot of `n`'s anchor has an L3 copy right now (stat only, no
+        write); None = cannot tell. A COUNT for the marker, never a gate (rank-local race)."""
+        try:
+            hv = n.component_data[ComponentType.MAMBA].host_value
+            rows = mp.settled_anchor_slots(hv)
+            stat = getattr(getattr(mp, "_backend", None), "_stat_stems", None)
+            if not rows or not callable(stat):
+                return None
+            stems = [mp.arena.slot_stem(r) for r in rows]
+            if not all(stems):
+                return False
+            return len(stat(stems)) == len(set(stems))
+        except Exception:  # noqa: BLE001 -- an instrument
+            return None
+
+    def _weg2_dual_p_aging_tick(self) -> None:
+        """#1500a ANCHOR-AGING-P (env-gated, default OFF, dual group P only): at every retain,
+        P's radix-tree anchors no match touched for more than N RETAINS give their reference
+        back softly (the slot stays COMPLETE until a claim needs it; its room-making writes it
+        to L3 first). Age = the retain count ``_weg2_dual_gen`` (identical on the PP ranks, which
+        finish the same requests in the same order; Q-610's own premise), never a clock. The
+        guard is Q-610's ``_weg2_dual_releasable`` plus 'an END anchor only once its rid is done'.
+        Host bookkeeping, no collective; never raises into the retain."""
+        if not _dar.aging_p_armed():
+            return
+        try:
+            mp = self._weg2_mamba_pool()
+            arena = getattr(mp, "arena", None) if mp is not None else None
+            if arena is None:
+                return
+            held = self._weg2_dual_d_held(mp)    # P's arena-backed tree nodes (the walk is not D-specific)
+            ticks_n = _dar.aging_ticks()
+            tick = int(getattr(self, "_weg2_dual_gen", 0))
+            stale = _dar.aging_scan(held, tick=tick, ticks_n=ticks_n)
+            counts = {"secured": 0, "unsecured": 0}
+
+            def _ok(n) -> bool:
+                if not self._weg2_dual_releasable(n, mp):
+                    return False
+                if getattr(n, "_weg2_end_anchor", False) and not _dar.rid_done(getattr(n, "weg2_anchor_rid", None)):
+                    return False
+                return True
+
+            def _give(n) -> None:
+                sec = self._weg2_dual_p_l3_secured(n, mp)
+                counts["secured" if sec else "unsecured"] += 1
+                self._weg2_dual_release_ref(n)
+
+            aged = _dar.aging_pass(stale, releasable=_ok, release=_give)
+            pinned = int(arena.ref_census()[0])
+            _dar.log_aging_p(
+                stale=len(stale), soft_released=len(aged), secured=counts["secured"],
+                unsecured=counts["unsecured"], anchors=len(held) - len(aged), pinned=pinned,
+                slots=int(arena.slots), ticks_n=ticks_n, tick=tick,
+                pp_rank=getattr(self, "pp_rank", None))
+        except Exception as exc:  # noqa: BLE001 -- aging never takes the retain down
+            logger.warning("%s tick raised %s: %s", _dar.MARKER_AGING_P, type(exc).__name__, exc)
 
     def _weg2_dual_claim_room(self, node, mp) -> tuple:
         """Q-610 claim: the arena refused `node`'s anchor. Give back every
