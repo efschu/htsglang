@@ -207,6 +207,21 @@ def test_maybe_arm_on_the_gate_returns_an_actuator_even_when_everything_fails():
     assert act2 is not None and act2.ladder.healthy_count == 0
 
 
+def test_the_real_ctypes_backend_without_a_gpu_is_a_named_fallback_not_a_crash():
+    """This box hides every GPU (CUDA_VISIBLE_DEVICES empty): the real backend cannot be made."""
+    env = {**DUAL_P, **LADDER_ENV}
+    logs, warns = [], []
+    act = G.maybe_arm(_sched(2), env, log=logs.append, warn=warns.append)          # backend=None -> CtypesBackend()
+    assert act is not None and act.ladder.healthy_count == 0 and act.ladder.info is None
+    assert any(w.startswith(S.FALLBACK + " mech=green") for w in warns)
+    assert any("serving=0" in l for l in logs) and S.green_serves(1) is False and G.force_eager() is False
+    a = act
+    sched = _launch_sched()
+    a.apply(G.Weg2DualGreenRung(1, 2, 500000))
+    ctx, stream = a.pick(sched)                                                       # every stage: the primary stream
+    assert stream is None and a.fallback_forwards == 1
+
+
 def test_maybe_arm_registers_serving_and_the_fallback_actuators_step_aside():
     env = {**DUAL_P, **LADDER_ENV}
     act = G.maybe_arm(_sched(0), env, backend=FakeBackend(170, 8), log=lambda m: None, warn=lambda m: None)

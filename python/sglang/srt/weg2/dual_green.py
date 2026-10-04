@@ -656,7 +656,7 @@ class PObsWriter:
         return True
 
 
-def read_pobs(ctl: str, ranks: Sequence[int] = (0, 1, 2), stale_s: float = 5.0,
+def read_pobs(ctl: str, ranks: Sequence[int] = tuple(range(8)), stale_s: float = 5.0,
               wall: Callable[[], float] = time.time) -> Dict[int, Dict[str, str]]:
     out: Dict[int, Dict[str, str]] = {}
     for r in ranks:
