@@ -331,7 +331,7 @@ def _front(exact):
     f.state = "serving"
     f.routed = []
 
-    async def seat(rid, est, refused=None):
+    async def seat(rid, est, refused=None, **kw):  # 1400: take the seat kwargs
         return 1
 
     async def leg2(request, rid, payload, text, stream, pending=None, **kw):

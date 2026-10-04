@@ -7,6 +7,7 @@ P-bound request is already queued, the SHORT rides P's batch instead.
 
 import collections
 import inspect
+import re
 import types
 import unittest
 
@@ -29,6 +30,15 @@ def _f(cands, fits=None):
     f._asr_live_p_cands = lambda: cands
     st = {"fits": {c.rid: True for c in cands} if fits is None else fits}
     f._asr_state = st
+    return f
+
+
+def _f_fetch():
+    """Fake with the FETCH-COST-YIELD helper bound -- the pre-existing fakes
+    (Default AUS path) never see it; only these tests wire it."""
+    f = _f([])
+    f._d_direct_yield_fetch_cost = lambda rid, uncached: (
+        front.Front._d_direct_yield_fetch_cost(f, rid, uncached))
     return f
 
 
@@ -59,7 +69,60 @@ class AForeseeableFlipYields(unittest.TestCase):
     def test_default_on_and_wired_into_the_short_seat(self):
         self.assertTrue(envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD.get())
         src = inspect.getsource(front.Front._acquire_short_seat)
-        self.assertEqual(src.count("self._d_direct_yields(rid)"), 2)
+        self.assertEqual(src.count("self._d_direct_yields(rid, uncached=uncached)"), 2)
+
+
+class BFetchCostYield(unittest.TestCase):
+    """FETCH-COST-YIELD (1369 draft, built 1400): with NO foreseeable flip, a
+    SHORT whose own D prefill is fetch-dominated rides P's batch instead.
+    Measured floor (1362): one expert-fetch wave per offloaded MoE layer
+    (48 fetches at 25..138 new tokens, 96 = two waves at 191..3072) at a
+    per-fetch median of 12.7-17.2 ms -- ~624 ms of link stall per pass."""
+
+    def test_fetch_cost_switch_off_keeps_h5b(self):
+        # Default path unchanged: with the fetch switch off, an empty candidate
+        # list still answers False straight away and the new code is never read.
+        f = _f_fetch()
+        with envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH.override(False):
+            self.assertFalse(
+                front.Front._d_direct_yields(f, "weg2-8-18", uncached=300))
+        self.assertEqual(f.counters["d_direct_yield_fetch_cost"], 0)
+
+    def test_fetch_cost_yields_at_default_budget(self):
+        self.assertFalse(envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH.get())
+        self.assertEqual(envs.SGLANG_WEG2_D_DIRECT_YIELD_FETCH_MS.get(), 600)
+        f = _f_fetch()
+        with envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH.override(True):
+            self.assertTrue(front.Front._d_direct_yields(f, "r", uncached=90))
+            self.assertEqual(f.counters["d_direct_yield_fetch_cost"], 1)
+            # 8-token floor ("a D pass with >= 8 new tokens streams the routed
+            # experts of all 48 layers"): below it the case does not apply.
+            self.assertFalse(front.Front._d_direct_yields(f, "r", uncached=5))
+            # uncached None (no front estimate) stays on D too.
+            self.assertFalse(front.Front._d_direct_yields(f, "r"))
+        self.assertEqual(f.counters["d_direct_yield_fetch_cost"], 1)
+
+    def test_fetch_cost_budget_dials_the_class(self):
+        # Budget 1300 exposes only the two-wave class (uncached >= 190,
+        # estimate 2 x 48 x 13 = 1248); budget 600 sits at the one-wave floor.
+        f = _f_fetch()
+        with envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH.override(True):
+            with envs.SGLANG_WEG2_D_DIRECT_YIELD_FETCH_MS.override(1300):
+                self.assertFalse(
+                    front.Front._d_direct_yields(f, "r", uncached=300))
+            with envs.SGLANG_WEG2_D_DIRECT_YIELD_FETCH_MS.override(600):
+                self.assertTrue(
+                    front.Front._d_direct_yields(f, "r", uncached=300))
+
+    def test_uncached_reaches_both_seat_branches_of_the_route(self):
+        # Wiring (1369 review point): the route passes the priced uncached
+        # remainder to BOTH seat paths -- the ARRIVAL-SEAT branch and the
+        # plain short-seat branch. Losing the second one would silently
+        # make the fetch rule unreachable off ASR.
+        src = inspect.getsource(front.Front.handle_generate)
+        # the lookbehind keeps the X-route's ``est_uncached=remainder`` out
+        self.assertEqual(
+            len(re.findall(r"(?<![A-Za-z_])uncached=remainder", src)), 2)
 
 
 if __name__ == "__main__":
