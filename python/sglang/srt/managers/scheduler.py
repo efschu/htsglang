@@ -4806,6 +4806,20 @@ class Scheduler(
                 from sglang.srt.weg2.vision_rank_runner import transient_p_boot
 
                 self._weg2_vision_follower_gate = transient_p_boot() and _vv.arm(self)
+        # W27 RID-SPLIT (NF nf9 04.10., weg2/intake_origin_abort.py): PP0's
+        # intake-stall drop rides the request wire, so every PP stage drops
+        # the rid in the same pass (group P origin with pp>1 only).
+        from sglang.srt.weg2 import intake_origin_abort as _ioa
+
+        self._weg2_intake_origin_aborts = _ioa.IntakeOriginAborts(
+            relay=_ioa.relay_applies(
+                group=os.environ.get("SGLANG_WEG2_GROUP"),
+                pp_size=self.ps.pp_size,
+                pp_rank=self.ps.pp_rank,
+                attn_tp_rank=self.ps.attn_tp_rank,
+                attn_cp_rank=self.ps.attn_cp_rank,
+            )
+        )
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -4853,7 +4867,10 @@ class Scheduler(
             ),
             # WEG2 VISION: PP0's named aborts of refused stages, injected at
             # the origin so every rank drops the same rids in the same pass.
-            origin_extra_reqs_hook=_vision_origin_aborts,
+            # W27 RID-SPLIT: then PP0's intake-stall drops (vision leads).
+            origin_extra_reqs_hook=_ioa.origin_hook(
+                self._weg2_intake_origin_aborts, _vision_origin_aborts
+            ),
         )
 
     def _health_check_gate(self) -> Tuple[bool, int, int]:
@@ -21687,6 +21704,13 @@ class Scheduler(
             logger.warning("WEG2-INTAKE-STALL-CENSUS raised", exc_info=True)
         refused_id = id(req)
         self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
+        # W27 RID-SPLIT (nf9 weg2-84-299): this drop is rank-local; without
+        # the row authority every follower plans from its own queue and the
+        # front's /abort_request may never come (an un-awaited LEG1-EARLY).
+        # The origin relays it on its next intake (weg2/intake_origin_abort.py).
+        _ioa = getattr(self, "_weg2_intake_origin_aborts", None)  # test doubles
+        if _ioa is not None:
+            _ioa.note(req.rid, message)
         try:
             if self.enable_hicache_storage:
                 self.tree_cache.release_aborted_request(req.rid)

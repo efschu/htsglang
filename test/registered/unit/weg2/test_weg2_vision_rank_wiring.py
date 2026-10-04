@@ -176,7 +176,9 @@ def test_the_scheduler_wires_the_hook_only_when_the_stage_is_armed():
     from sglang.srt.managers.scheduler import Scheduler
 
     src = inspect.getsource(Scheduler.init_request_receiver)
-    assert "origin_extra_reqs_hook=_vision_origin_aborts" in src
+    # W27 RID-SPLIT (04.10.): the vision hook is composed with PP0's intake-
+    # stall relay and LEADS it; with no relay the composition IS this hook.
+    assert "_ioa.origin_hook(\n                self._weg2_intake_origin_aborts, _vision_origin_aborts\n            )" in src
     assert "_vision_origin_aborts = None" in src
     assert 'os.environ.get("SGLANG_WEG2_VISION", "").strip() == "transient"' in src
 

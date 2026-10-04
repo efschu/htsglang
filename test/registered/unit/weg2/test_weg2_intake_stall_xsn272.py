@@ -65,7 +65,8 @@ def test_the_scheduler_names_the_stall_only_with_an_empty_batch_and_on_group_p()
     assert "running_batch.is_empty()" in blk and "not adder.can_run_list" in blk
     assert "self.chunked_req is None" in blk and "_weg2_intake_stall_observe(req, adder)" in blk
     j = src.index("def _weg2_intake_stall_observe")
-    body = src[j:j + 5600]  # xsn288: the authority gate's comment sits in front; xsn302: + the lock census
+    # the whole function (xsn288 gate comment, xsn302 lock census, W27 RID-SPLIT relay)
+    body = src[j:src.index("def _abort_request_now", j)]
     assert 'GROUP_ENV' in body and '!= "P"' in body                 # group P only
     assert "HTTPStatus.SERVICE_UNAVAILABLE" in body                  # W88's exit form
     assert "self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]" in body
