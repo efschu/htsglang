@@ -123,6 +123,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import ple_state
+from sglang.srt.weg2 import abort_match as _abort_match
 from sglang.srt.weg2 import tail_handoff as th
 
 logger = logging.getLogger(__name__)
@@ -761,7 +762,7 @@ def drop_aborted(rid: str, abort_all: bool = False) -> int:
     """Q-699: :func:`drop` for every staged rid an AbortReq names (the
     scheduler's own matching: ``startswith``, or all). Returns the count."""
     rid = str(rid or "")
-    gone = [r for r in set(_JOBS) | set(_AGREED) if abort_all or (rid and r.startswith(rid))]
+    gone = [r for r in set(_JOBS) | set(_AGREED) if abort_all or (rid and _abort_match.rid_hit(r, rid))]
     for r in gone:
         drop(r)
     return len(gone)

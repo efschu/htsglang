@@ -47,6 +47,7 @@ import logging
 from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from sglang.srt.environ import envs
+from sglang.srt.weg2 import abort_match as _abort_match
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +218,7 @@ def abort_targets(tails: Iterable[Any], *, rid: str, abort_all: bool) -> List[An
     return [
         t
         for t in tails
-        if abort_all or str(getattr(t, "rid", "")).startswith(str(rid))
+        if abort_all or _abort_match.rid_hit(getattr(t, "rid", ""), rid)
     ]
 
 

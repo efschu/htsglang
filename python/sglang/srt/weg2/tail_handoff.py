@@ -63,6 +63,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.weg2 import ple_state
+from sglang.srt.weg2 import abort_match as _abort_match
 
 logger = logging.getLogger(__name__)
 
@@ -1456,7 +1457,7 @@ def remove_parks_aborted(rid: str, abort_all: bool = False) -> int:
     removed."""
     n = 0
     for owner, p in _park_files():
-        if abort_all or (rid and owner.startswith(rid)):
+        if abort_all or (rid and _abort_match.rid_hit(owner, rid)):
             try:
                 os.remove(p)
                 n += 1

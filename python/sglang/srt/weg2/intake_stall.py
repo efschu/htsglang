@@ -31,6 +31,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from sglang.srt.weg2 import abort_match as _abort_match
+
 #: The refusal's name; the front matches on it in the leg-1 error text.
 STALL_MARK = "WEG2-INTAKE-STALL"
 #: weg2xsn291: the request would not fit this group's pool even EMPTY --
@@ -103,8 +105,8 @@ class IntakeStallWatch:
             self.reset()
             return
         rid = str(rid)
-        self._reported = {r for r in self._reported if not str(r).startswith(rid)}
-        if self._rid is not None and str(self._rid).startswith(rid):
+        self._reported = {r for r in self._reported if not _abort_match.rid_hit(r, rid)}
+        if self._rid is not None and _abort_match.rid_hit(self._rid, rid):
             self._rid = None
             self._since = 0.0
 

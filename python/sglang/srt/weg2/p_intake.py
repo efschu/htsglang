@@ -46,6 +46,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Optional
 
+from sglang.srt.weg2 import abort_match as _abort_match
+
 from sglang.srt.weg2.intake_stall import (
     INTAKE_FITS,
     INTAKE_IMPOSSIBLE,
@@ -255,7 +257,7 @@ def forget(scheduler, rid: Optional[str]) -> None:
     if rid is None:
         named.clear()
         return
-    for r in [r for r in named if str(r).startswith(str(rid))]:
+    for r in [r for r in named if _abort_match.rid_hit(r, rid)]:
         named.discard(r)
 
 

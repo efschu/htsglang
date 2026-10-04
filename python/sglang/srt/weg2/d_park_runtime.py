@@ -32,6 +32,7 @@ import time
 from typing import Optional
 
 from sglang.srt.managers import weg2_resumable_depth
+from sglang.srt.weg2 import abort_match as _abort_match
 from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_laps
 from sglang.srt.weg2 import handback_claim as _hb
 
@@ -1315,7 +1316,7 @@ def park_abort(sched, recv_req) -> int:
     parked = getattr(sched, "weg2_d_parked", None)
     if not parked:
         return 0
-    gone = [r for r in parked if abort_all or str(r.rid).startswith(rid)]
+    gone = [r for r in parked if abort_all or _abort_match.rid_hit(r.rid, rid)]
     if not gone:
         return 0
     ids = {id(r) for r in gone}
