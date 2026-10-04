@@ -104,6 +104,12 @@ class Manifest:
     anchor_guests: Optional[Tuple[Tuple[int, int, int, int, int, int, int], ...]] = None
     anchor_bytes: Optional[Tuple[int, ...]] = None
     anchor_row_bytes: int = 0
+    # MANIFEST v2 + S4b (L15-POOL S4b): the anchors a rank WITH a home segment
+    # keeps in its Mamba hold region; the anchors beyond it are byte pieces in
+    # ``anchor_guests`` (owner == host = the owner's own segment). None = S4 (no
+    # dynamic anchor count: the S4 record and fingerprint byte for byte); part of
+    # the group fingerprint like the three fields above.
+    anchor_cap: Optional[int] = None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -153,6 +159,8 @@ def _v2_head(m: Manifest) -> dict:
         out["anchor_guests"] = [[int(x) for x in g] for g in m.anchor_guests]
         out["anchor_bytes"] = [int(x) for x in (m.anchor_bytes or ())]
         out["anchor_row_bytes"] = int(m.anchor_row_bytes)
+        if m.anchor_cap is not None:
+            out["anchor_cap"] = int(m.anchor_cap)
     return out
 
 
@@ -180,6 +188,8 @@ def _v2_load(head: dict) -> dict:
         out["anchor_guests"] = tuple(tuple(int(v) for v in x) for x in ag)
         out["anchor_bytes"] = tuple(int(v) for v in ab)
         out["anchor_row_bytes"] = int(head.get("anchor_row_bytes", 0))
+        if "anchor_cap" in head:
+            out["anchor_cap"] = int(head["anchor_cap"])
     return out
 
 

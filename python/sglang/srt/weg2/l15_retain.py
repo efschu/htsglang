@@ -328,7 +328,13 @@ def plan_round(
     pool_fp = None
     # (1) who stays
     try:
-        if s4:
+        if s4 and anchor_ctx.anchor_cap is not None:
+            # S4b: no anchor COUNT cap -- KV rows and all anchor bytes against
+            # the sum of the free rows, in the candidate order
+            hs = l15_pool_anchor.select_hold_pool_s4b(
+                candidates, caps_rows_by_rank, anchor_ctx.bytes_by_rank,
+                anchor_ctx.row_bytes, anchor_ctx.anchor_cap)
+        elif s4:
             hs = l15_pool_anchor.select_hold_pool_s4(
                 candidates, caps_rows_by_rank, cap_anchor_slots,
                 anchor_ctx.bytes_by_rank, anchor_ctx.row_bytes)
@@ -372,7 +378,8 @@ def plan_round(
                                   reserved=PAD_SLOTS)
             return l15_pool_anchor.pool_park_plan_s4(
                 list(pl.rows_by_rank), [int(c) for c in caps_rows_by_rank],
-                anchor_ctx.bytes_by_rank, anchor_ctx.row_bytes, int(_a_h) - 1, rates)
+                anchor_ctx.bytes_by_rank, anchor_ctx.row_bytes, int(_a_h) - 1, rates,
+                anchor_cap=anchor_ctx.anchor_cap)
 
         def _guest_refusal(pl):
             # S2: every cap-0 rank's compacted rows must find guest room in
@@ -453,7 +460,7 @@ def plan_round(
             pool_fp = l15_pool_anchor.plan_fingerprint_s4(
                 hs.rids, plan.rows_by_rank, caps_rows_by_rank, guest_pieces,
                 anchor_guests, anchor_ctx.bytes_by_rank, anchor_ctx.row_bytes,
-                int(a_h) - 1)
+                int(a_h) - 1, anchor_cap=anchor_ctx.anchor_cap)
         else:
             pool_fp = l15_pool.plan_fingerprint(
                 hs.rids, plan.rows_by_rank, caps_rows_by_rank, guest_pieces)
@@ -467,6 +474,10 @@ def plan_round(
                     _codes[_w] = _codes.get(_w, 0) + 1
                 _line = l15_pool_anchor.plan_line_s4(
                     _line, anchor_guests, int(a_h) - 1, anchor_ctx, _codes)
+                if anchor_ctx.anchor_cap is not None:
+                    _line = l15_pool_anchor.plan_line_s4b(
+                        _line, anchor_guests, caps_rows_by_rank, plan.rows_by_rank,
+                        anchor_ctx.anchor_cap)
             log(_line)
         else:
             log(l15_pool.plan_line(epoch, hs, caps_rows_by_rank, plan.rows_by_rank,
@@ -524,6 +535,7 @@ def manifest_of_plan(
         anchor_bytes=(tuple(int(x) for x in rp.anchor_ctx.bytes_by_rank)
                       if rp.anchor_ctx is not None else None),
         anchor_row_bytes=(int(rp.anchor_ctx.row_bytes) if rp.anchor_ctx is not None else 0),
+        anchor_cap=(rp.anchor_ctx.anchor_cap if rp.anchor_ctx is not None else None),
     )
 
 
@@ -714,7 +726,14 @@ def retain_at_sleep(
     kv_range = () if cap0 else ((0, _keep_hi),)
     for buf in kv_buffers:
         set_keep(buf, kv_range)
-    mamba_range = () if cap0 else ((0, int(a_h)),)
+    _a_keep = int(a_h)
+    if rp.anchor_ctx is not None and rp.anchor_ctx.anchor_cap is not None:
+        # S4b: the Mamba hold region of a capped rank is anchor_cap + 1 slots
+        # (slot 0 = padding); the anchors above it were planned as byte pieces
+        # in the KV hold rows and travel with the park at the release -- a keep
+        # window above the hold region the split reserved would be refused
+        _a_keep = min(_a_keep, int(rp.anchor_ctx.anchor_cap) + 1)
+    mamba_range = () if cap0 else ((0, _a_keep),)
     for buf in mamba_buffers:
         set_keep(buf, mamba_range)
 

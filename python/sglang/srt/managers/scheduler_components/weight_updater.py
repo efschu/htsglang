@@ -12222,18 +12222,16 @@ class SchedulerWeightUpdaterManager:
                         # that did not land on the group (the result is
                         # group-uniform) therefore leaves them undefined: this
                         # rank votes no hold and the group drops the hold.
+                        # (capped_guest_ranks + S4b overflow anchor owners)
                         if (_l15_s3 and not self._l15_park_back_ok
                                 and _l15_m is not None
-                                and _l15_pool_w.capped_guest_ranks(
-                                    getattr(_l15_m, "guests", None),
-                                    getattr(_l15_m, "caps", None))):
+                                and _l15_pa_w.capped_own_ranks(_l15_m)):
                             _l15_s3_drop = True
                             logger.info(
                                 "L15-POOL S3: park-back did not land and rank(s) %s "
                                 "with a home segment own guest rows -> vote no hold "
                                 "(group fallback, no L2 refill path for them)",
-                                list(_l15_pool_w.capped_guest_ranks(
-                                    _l15_m.guests, _l15_m.caps)))
+                                list(_l15_pa_w.capped_own_ranks(_l15_m)))
                 except Exception as exc:  # noqa: BLE001 -- L2 refill serves
                     logger.warning("L15-PARK at=wake failed (%s: %s)",
                                    type(exc).__name__, exc)
@@ -12241,12 +12239,11 @@ class SchedulerWeightUpdaterManager:
                     self._l15_anchor_back_ok = False
                     try:
                         from sglang.srt.weg2 import l15_pool as _l15_pool_w2
+                        from sglang.srt.weg2 import l15_pool_anchor as _l15_pa_w2
                         _l15_s3_drop = bool(
                             _l15_pool_w2.pool_s3_on(os.environ)
                             and _l15_m is not None
-                            and _l15_pool_w2.capped_guest_ranks(
-                                getattr(_l15_m, "guests", None),
-                                getattr(_l15_m, "caps", None)))
+                            and _l15_pa_w2.capped_own_ranks(_l15_m))
                     except Exception:  # noqa: BLE001 -- vote stays as it was
                         _l15_s3_drop = False
                 if _l15_s3_drop:

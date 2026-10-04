@@ -25400,6 +25400,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _pools4 = l15_plan.refuse_pool_s4_without_s3(os.environ)
     if _pools4 is not None:
         raise Weg2LaunchRefused(_pools4)
+    _pools4b = l15_plan.refuse_pool_s4b_without_s4(os.environ)
+    if _pools4b is not None:
+        raise Weg2LaunchRefused(_pools4b)
+    from sglang.srt.weg2 import l15_pool_anchor as _l15_pa4b
+
+    for _ln in _l15_pa4b.s4b_boot_lines(os.environ):
+        log(_ln)
     _pooldep = l15_plan.refuse_pool_with_deposit(os.environ)
     if _pooldep is not None:
         raise Weg2LaunchRefused(_pooldep)

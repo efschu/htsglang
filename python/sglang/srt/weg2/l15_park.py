@@ -354,6 +354,11 @@ def s4_plan_of_manifest(m, caps: Sequence[int], env, world: int, rank: int,
         return [], "manifest has no anchor guests under SGLANG_WEG2_L15_POOL_S4", None
     if m.guests is None:
         return [], "S4 manifest without the S3 guest list", None
+    if l15_pool_anchor.pool_s4b_on(env) != (m.anchor_cap is not None):
+        # S4b is rank-uniform config: the switch and the manifest must agree on
+        # whether the anchor count is dynamic (named, before any collective)
+        return [], "S4b switch %s but the manifest anchor cap is %s" % (
+            "on" if l15_pool_anchor.pool_s4b_on(env) else "off", m.anchor_cap), None
     ab = tuple(int(x) for x in m.anchor_bytes)
     rb = int(m.anchor_row_bytes)
     if len(ab) != int(world):
@@ -369,7 +374,8 @@ def s4_plan_of_manifest(m, caps: Sequence[int], env, world: int, rank: int,
     rates = l15_pool.quantize_rates(rates)
     n_anchors = int(m.anchor_slots) - 1
     kv_want, a_want, why, _code = l15_pool_anchor.pool_park_plan_s4(
-        list(m.rows_by_rank), list(caps), ab, rb, n_anchors, rates)
+        list(m.rows_by_rank), list(caps), ab, rb, n_anchors, rates,
+        anchor_cap=m.anchor_cap)
     if why is not None:
         return [], why, None
     if l15_pool.guest_tuples(kv_want) != l15_pool.guest_tuples(
@@ -380,7 +386,7 @@ def s4_plan_of_manifest(m, caps: Sequence[int], env, world: int, rank: int,
         return [], "manifest anchor guest list differs from the plan of this rank's rates", None
     fp = l15_pool_anchor.plan_fingerprint_s4(
         [sp.rid for sp in m.spans], list(m.rows_by_rank), caps,
-        l15_pool.pieces_of(m.guests), have, ab, rb, n_anchors)
+        l15_pool.pieces_of(m.guests), have, ab, rb, n_anchors, anchor_cap=m.anchor_cap)
     return list(have), None, fp
 
 

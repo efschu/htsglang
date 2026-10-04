@@ -869,6 +869,22 @@ class Envs:
     # re-prefill from a stale L2 generation). Q2: the L2 duty (post_vote, anchor L2
     # identity) is unchanged. Default off = the S3 path byte for byte.
     SGLANG_WEG2_L15_POOL_S4 = EnvBool(False)
+    # L15-POOL S4b (docs/L15-POOL-ENTWURF-1004.md sec 5.2 N4, user idea 04.10.
+    # ~17:50Z "dynamische Anker-Anzahl"): part switch ON TOP of SGLANG_WEG2_L15_POOL,
+    # _S3 and _S4 (S4b without S4 is refused by name, W-L15-POOL-S4B-NEEDS-S4; dual /
+    # non-27B refuse it too). The anchor count is no longer capped at
+    # SGLANG_WEG2_L15_ANCHOR_CAP for the ranks WITH a home segment: the anchors
+    # beyond the cap (their Mamba hold region is anchor_cap+1 slots) lie as bytes
+    # in free KV hold rows -- first the rank's own home segment, then as a guest in
+    # the foreign segments (Q3: home first, then free area x rate, never a card
+    # name). Admission plans KV rows AND all anchor bytes of ALL ranks together
+    # against the SUM of the free rows (whole requests, all or nothing, in the
+    # candidate order): the anchor consumes rows, KV gets the rest (max KV shrinks
+    # only as far as an anchor really displaces free rows). The anchor count, the
+    # cap and the pricing ride the plan digest and the manifest v2 fingerprint; the
+    # wake reads the overflow anchors back from the hold rows (source checksum),
+    # nothing from L2. Default off = the S4 path byte for byte.
+    SGLANG_WEG2_L15_POOL_S4B = EnvBool(False)
     # L15-POOL S1b (weg2/l15_pool_peak.py): the planner input P_AWAKE_PEAK_MIB
     # per card, built from measured WEG2-VRAM-PEAK windows (scripts/
     # l15_pool_peak_record.py): per card the MAXIMUM over boots/lines with its

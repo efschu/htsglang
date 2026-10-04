@@ -45,6 +45,21 @@ together against the sum of the segments (N4 -- "Anker zaehlt in die
 Poolkapazitaet").  A capped rank keeps its own share at home (Mamba hold
 region, unchanged).
 
+S4b -- the DYNAMIC anchor count (``SGLANG_WEG2_L15_POOL_S4B``, user idea 04.10.)
+-------------------------------------------------------------------------------
+The S4 rule above leaves a capped rank (WITH a home segment) holding its anchors
+in the Mamba hold region with a FIXED count (``anchor_cap`` + 1 slots) -- a full
+zone refuses a request although the KV hold rows have room.  S4b lets the anchors
+of such a rank beyond ``anchor_cap`` lie as bytes in free KV hold rows too: first
+the rank's OWN segment (a local copy, no collective), then foreign segments (the
+same Q3 host key).  The pool is ONE row budget: admission
+(:func:`select_hold_pool_s4b`) charges KV rows and the overflow anchor rows of ALL
+ranks against the sum of the segments in the candidate order, the exact plan
+(:func:`pool_park_plan_s4` with ``anchor_cap``) puts KV guests and anchors on the
+same free rows and cursors (no row twice), ``kv_rows_left`` of the plan line is
+what the anchors left for KV.  Everything rides the manifest v2 and the plan
+digest (``anchor_cap`` is part of both); ``anchor_cap=None`` is S4 byte for byte.
+
 Pure parts (stdlib): admission, plan, fingerprint, lines.  Torch parts (lazy):
 gather/scatter of a slot stream, the source checksum, the transport (one uneven
 all_to_all per piece and 16 MiB block, like ``l15_park.run_park``).
@@ -52,6 +67,7 @@ all_to_all per piece and 16 MiB block, like ``l15_park.run_park``).
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -59,6 +75,7 @@ from sglang.srt.weg2 import l15_pool
 from sglang.srt.weg2.l15_policy import Candidate, HoldSet, _order_key
 
 POOL_S4_ENV = "SGLANG_WEG2_L15_POOL_S4"
+POOL_S4B_ENV = "SGLANG_WEG2_L15_POOL_S4B"
 _ON_VALUES = ("1", "true", "on", "yes")
 
 REASON_POOL_FULL = l15_pool.REASON_POOL_FULL
@@ -82,6 +99,45 @@ def pool_s4_on(env: Mapping[str, str]) -> bool:
     return l15_pool.pool_s3_on(env) and pool_s4_flag(env)
 
 
+def pool_s4b_flag(env: Mapping[str, str]) -> bool:
+    """True when ``SGLANG_WEG2_L15_POOL_S4B`` is set (1/true/on/yes), whatever the
+    other switches say (the launcher refuses the lonely flag by name)."""
+    return str(env.get(POOL_S4B_ENV, "") or "").strip().lower() in _ON_VALUES
+
+
+def pool_s4b_on(env: Mapping[str, str]) -> bool:
+    """True when the anchor count is dynamic: the S4b part switch AND S4 (which
+    needs the S3 pool).  S4b never runs without them."""
+    return pool_s4_on(env) and pool_s4b_flag(env)
+
+
+S4B_MODE = ("POOL(S4b: dynamic anchor count -- the anchors of the ranks WITH a home "
+            "segment beyond anchor_cap lie as byte pieces in free KV hold rows, own home "
+            "segment first, then foreign segments; KV rows and all anchor bytes are "
+            "planned together against the sum of the free rows)")
+
+def s4b_boot_lines(env: Mapping[str, str]) -> List[str]:
+    """The S4b boot line (``[]`` when the part switch is off): its mode text and
+    the anchor cap the Mamba hold region is sized for."""
+    if not pool_s4b_on(env):
+        return []
+    from sglang.srt.weg2 import l15_keep_split
+
+    return ["L15-POOL-S4B mode=%s anchor_cap=%d" % (S4B_MODE, l15_keep_split.anchor_cap(env))]
+
+
+def capped_own_ranks(manifest) -> Tuple[int, ...]:
+    """Ranks WITH a home segment that own guest rows (S3 KV overflow) or anchor
+    byte pieces (S4b overflow) in ``manifest``: no L2 refill path for them, so a
+    park-back of the group that did not land must drop the hold."""
+    if manifest is None:
+        return ()
+    caps = getattr(manifest, "caps", None)
+    return tuple(sorted(set(
+        l15_pool.capped_guest_ranks(getattr(manifest, "guests", None), caps))
+        | set(capped_anchor_overflow_ranks(getattr(manifest, "anchor_guests", None), caps))))
+
+
 S4_MODE = ("POOL(S4: whole requests -- KV and the END anchors of the ranks without a "
            "home segment lie as byte guests in the free hold rows of the hosts, "
            "admission counts both against the sum of the segments)")
@@ -94,6 +150,10 @@ class AnchorCtx:
     bytes_by_rank: Tuple[int, ...]  # head share of ONE anchor per rank, bytes
     row_bytes: int  # bytes of one KV hold row (all layers)
     src: str = ""  # where the bytes came from (env | spec(ratios=...))
+    # S4b (None = S4): the anchors a rank WITH a home segment keeps in its Mamba
+    # hold region (SGLANG_WEG2_L15_ANCHOR_CAP); anchors beyond it are byte pieces
+    # in the KV hold rows. Rank-uniform (env), part of the plan digest.
+    anchor_cap: Optional[int] = None
 
 
 def rows_for_bytes(nbytes: int, row_bytes: int) -> int:
@@ -139,6 +199,18 @@ def kv_row_bytes(kv_views) -> int:
 
 def resolve_anchor_ctx(sched, env: Mapping[str, str], tp: int, rank: int
                        ) -> Tuple[Optional[AnchorCtx], str]:
+    """:func:`_resolve_anchor_ctx` plus the S4b anchor cap when the S4b switch is
+    on (``ctx.anchor_cap`` = ``SGLANG_WEG2_L15_ANCHOR_CAP``; None = S4)."""
+    ctx, why = _resolve_anchor_ctx(sched, env, tp, rank)
+    if ctx is not None and pool_s4b_on(env):
+        from sglang.srt.weg2 import l15_keep_split
+
+        ctx = dataclasses.replace(ctx, anchor_cap=int(l15_keep_split.anchor_cap(env)))
+    return ctx, why
+
+
+def _resolve_anchor_ctx(sched, env: Mapping[str, str], tp: int, rank: int
+                        ) -> Tuple[Optional[AnchorCtx], str]:
     """The S4 pricing of THIS sleep, from the live scheduler: ``(ctx, "ok")`` or
     ``(None, reason)``.  Never raises.
 
@@ -260,6 +332,76 @@ def select_hold_pool_s4(
     )
 
 
+def anchor_rows_of_index(i: int, caps: Sequence[int], anchor_bytes: Sequence[int],
+                         row_bytes: int, anchor_cap: int) -> int:
+    """Rows the ``i``-th held anchor (0-based, in admission order) costs the
+    pool under S4b: the shares of the ranks WITHOUT a home segment always (they
+    hold no anchor at home), the shares of the ranks WITH a home segment only
+    from anchor ``anchor_cap`` on (below it they lie in the rank's Mamba hold
+    region, which costs no KV row).  ``ceil(bytes / row_bytes)`` per share: the
+    plan packs several anchors of one owner into one piece, which is never more."""
+    over = int(i) >= int(anchor_cap)
+    return sum(rows_for_bytes(int(b), row_bytes)
+               for r, b in enumerate(anchor_bytes)
+               if r < len(caps) and int(b) > 0 and (int(caps[r]) <= 0 or over))
+
+
+def select_hold_pool_s4b(
+    candidates: Sequence[Candidate],
+    cap_rows_by_rank: Sequence[int],
+    anchor_bytes_by_rank: Sequence[int],
+    row_bytes: int,
+    anchor_cap: int,
+) -> HoldSet:
+    """``select_hold_pool_s4`` with a DYNAMIC anchor count (user idea 04.10.
+    ~17:50Z): the pool is one row budget (the sum of the segments), the anchor
+    consumes rows, the KV gets the rest.  There is no anchor COUNT cap any more
+    (the S4 ``cap_anchor_slots`` bounded the Mamba hold region); what bounds the
+    anchors is the rows they take away from the KV.
+
+    Candidates are walked in today's order (seat > parked > served).  Candidate
+    ``k`` is held when its KV rows (all ranks) PLUS the anchor rows of anchor
+    ``k`` (:func:`anchor_rows_of_index`, which charges a rank with a home
+    segment only beyond ``anchor_cap``) fit in what the earlier ones left:
+    ``used + kv + anchor <= sum(caps)`` -- ONE sum over KV and anchor together,
+    so an anchor can never be counted on rows an already chosen request's KV
+    holds, and the total is never exceeded.  Reasons: ``pool_full`` (KV alone
+    does not fit), ``anchor_full`` (KV fits, not together with its anchor).  A
+    later smaller candidate may still fit.  The sums are the pre-compaction
+    estimate; the exact check is :func:`pool_park_plan_s4` on the compacted rows
+    (``plan_round``), before anything moves.  No safety factor."""
+    candidates = list(candidates)
+    excluded: Dict[str, Tuple[str, str]] = {
+        c.rid: (c.rid, REASON_ANCHORLESS) for c in candidates
+        if c.anchor_depth != c.kv_depth
+    }
+    ordered = sorted((c for c in candidates if c.anchor_depth == c.kv_depth),
+                     key=_order_key)
+    caps = [max(0, int(c)) for c in cap_rows_by_rank]
+    total_cap = sum(caps)
+    used = 0
+    admitted = []
+    for c in ordered:
+        need = sum(int(v) for v in c.rows_by_rank)
+        if used + need > total_cap:
+            excluded[c.rid] = (c.rid, REASON_POOL_FULL)
+            continue
+        a_rows = anchor_rows_of_index(len(admitted), caps, anchor_bytes_by_rank,
+                                      row_bytes, anchor_cap)
+        if need + a_rows + used > total_cap:
+            excluded[c.rid] = (c.rid, REASON_ANCHOR_FULL)
+            continue
+        admitted.append(c)
+        used += need + a_rows
+    rows_by_rank = tuple(sum(c.rows_by_rank[r] for c in admitted) for r in range(len(caps)))
+    return HoldSet(
+        rids=tuple(c.rid for c in admitted),
+        rows_by_rank=rows_by_rank,
+        anchors=len(admitted),
+        excluded=tuple(excluded.values()),
+    )
+
+
 # -- the plan: KV guests first (the S3 placement, unchanged), then the anchors -----
 
 
@@ -271,6 +413,7 @@ def pool_park_plan_s4(
     n_anchors: int,
     rates: Optional[Mapping[Tuple[int, int], float]] = None,
     default_rate: float = 1.0,
+    anchor_cap: Optional[int] = None,
 ):
     """``(kv_pieces, anchor_guests, None, None)`` or ``([], [], reason, code)``
     with ``code`` in ``pool_full`` (a KV guest row has no room) /
@@ -287,7 +430,17 @@ def pool_park_plan_s4(
     anchors ``[a_lo, a_lo + n_a)`` (anchor ``i`` = slot ``i + 1``), their
     shares serialised back to back, in ``host_rows = ceil(nbytes / row_bytes)``
     rows from ``host_row_lo``.  Refused by name when they do not fit
-    (all-or-nothing: no half hold).  Keyed by cap and rank, never by a card."""
+    (all-or-nothing: no half hold).  Keyed by cap and rank, never by a card.
+
+    ``anchor_cap`` (S4b; None = S4, the code below byte for byte): a rank WITH a
+    home segment keeps its anchors ``[0, anchor_cap)`` in its Mamba hold region;
+    the anchors ``[anchor_cap, n_anchors)`` of such a rank are byte pieces too,
+    placed home first (the free rows of its OWN segment, after the KV guests),
+    then as a guest in the foreign segments by the same Q3 key.  Every rank's
+    home-first pass runs before any foreign placement, so an owner's own free
+    rows are never taken by another owner's overflow first; all pieces continue
+    on the SAME free rows and cursors as the KV guests, so no row is ever given
+    twice (KV or anchor)."""
     R = len(keep_rows)
     if len(caps) != R:
         return [], [], "keep_rows for %d ranks, caps for %d" % (R, len(caps)), REASON_POOL_FULL
@@ -320,6 +473,12 @@ def pool_park_plan_s4(
             row += n
     guests: List[AnchorGuest] = []
     n_anchors = max(0, int(n_anchors))
+    if anchor_cap is not None:
+        g4, why4, code4 = _anchor_guests_s4b(
+            cap, anchor_bytes, int(row_bytes), n_anchors, int(anchor_cap), free, cursor, rt)
+        if why4 is not None:
+            return [], [], why4, code4
+        return pieces, g4, None, None
     for owner in range(R):
         b = int(anchor_bytes[owner])
         if cap[owner] > 0 or b <= 0 or n_anchors == 0:
@@ -344,6 +503,57 @@ def pool_park_plan_s4(
     return pieces, guests, None, None
 
 
+def _anchor_guests_s4b(cap, anchor_bytes, rb, n_anchors, anchor_cap, free, cursor, rt):
+    """``(guests, None, None)`` or ``([], reason, "anchor_full")``: the S4b anchor
+    pieces on the free rows / cursors the KV guests left (mutated in place)."""
+    R = len(cap)
+    guests: List[AnchorGuest] = []
+    nxt = {}
+    # pass 1: HOME FIRST -- a rank with a home segment puts as many whole overflow
+    # anchors as fit into the free rows of its own segment
+    for owner in range(R):
+        b = int(anchor_bytes[owner])
+        if cap[owner] <= 0 or b <= 0 or n_anchors == 0:
+            continue
+        a = min(anchor_cap, n_anchors)
+        left = n_anchors - a
+        if left > 0 and owner in free:
+            n = min(left, (free[owner] * rb) // b)
+            if n >= 1:
+                rows = rows_for_bytes(n * b, rb)
+                guests.append((owner, owner, a, n, cursor[owner], rows, n * b))
+                cursor[owner] += rows
+                free[owner] -= rows
+                a += n
+        nxt[owner] = a
+    # pass 2: the rest as guests in the FOREIGN segments (Q3 host key)
+    for owner in range(R):
+        b = int(anchor_bytes[owner])
+        if b <= 0 or n_anchors == 0:
+            continue
+        a = nxt.get(owner, 0) if cap[owner] > 0 else 0
+        if cap[owner] > 0 and owner not in nxt:
+            continue
+        left = n_anchors - a
+        while left > 0:
+            cands = [h for h, f in free.items()
+                     if h != owner and (f * rb) // b >= 1]
+            if not cands:
+                have = sum(max(0, v) for v in free.values())
+                return [], ("anchor share of rank %d (%d x %d bytes) has no room, "
+                            "the other segments have %d free rows"
+                            % (owner, left, b, have)), REASON_ANCHOR_FULL
+            h = min(cands, key=lambda x: l15_pool._host_key(rt, owner, x, free[x]))
+            n = min(left, (free[h] * rb) // b)
+            rows = rows_for_bytes(n * b, rb)
+            guests.append((owner, h, a, n, cursor[h], rows, n * b))
+            cursor[h] += rows
+            free[h] -= rows
+            left -= n
+            a += n
+    return guests, None, None
+
+
 def anchor_guest_tuples(guests: Sequence[Sequence[int]]) -> Tuple[AnchorGuest, ...]:
     return tuple(tuple(int(x) for x in g) for g in guests)  # type: ignore[misc]
 
@@ -351,21 +561,27 @@ def anchor_guest_tuples(guests: Sequence[Sequence[int]]) -> Tuple[AnchorGuest, .
 def plan_fingerprint_s4(rids: Sequence[str], rows_by_rank: Sequence[int],
                         caps: Sequence[int], pieces: Sequence,
                         guests: Sequence[Sequence[int]], anchor_bytes: Sequence[int],
-                        row_bytes: int, n_anchors: int) -> str:
+                        row_bytes: int, n_anchors: int,
+                        anchor_cap: Optional[int] = None) -> str:
     """The digest of the WHOLE pool decision the group compares: the S3 digest
     (rids, compacted keep rows, caps, KV guest pieces) plus the anchor guests,
     the pricing (share bytes per rank, row bytes) and the anchor count.  Ranks
     that planned another placement or priced it with another vector turn the
-    round off everywhere (``agree_pool``)."""
+    round off everywhere (``agree_pool``).  S4b (``anchor_cap`` not None): the
+    anchor cap is part of the decision (it says which anchors lie at home and
+    which are pieces); None = the S4 digest byte for byte."""
     import hashlib
 
-    blob = repr((
+    parts = (
         l15_pool.plan_fingerprint(rids, rows_by_rank, caps, pieces),
         anchor_guest_tuples(guests),
         tuple(int(x) for x in anchor_bytes),
         int(row_bytes),
         int(n_anchors),
-    ))
+    )
+    if anchor_cap is not None:
+        parts = parts + (("s4b", int(anchor_cap)),)
+    blob = repr(parts)
     return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
 
@@ -411,6 +627,58 @@ def plan_line_s4(base_line: str, guests: Sequence[Sequence[int]], n_anchors: int
                 ",".join("%d>%d:%d" % (o, h, b) for (o, h), b in sorted(pairs.items())) or "-",
                 ",".join(str(int(x)) for x in ctx.bytes_by_rank), int(ctx.row_bytes),
                 ctx.src or "-", ex))
+
+
+def anchor_overflow_totals(guests: Optional[Sequence[Sequence[int]]],
+                           caps: Sequence[int]) -> Tuple[int, int, int, int]:
+    """``(pieces, rows, bytes, home_rows)`` of the S4b OVERFLOW anchors: the
+    pieces owned by a rank WITH a home segment (``caps[owner] > 0``); the cap-0
+    ranks' pieces are S4's.  ``home_rows`` = the rows of those that lie in the
+    owner's own segment (host == owner)."""
+    g = [x for x in (guests or ())
+         if 0 <= int(x[0]) < len(caps) and int(caps[int(x[0])]) > 0]
+    return (len(g), sum(int(x[5]) for x in g), sum(int(x[6]) for x in g),
+            sum(int(x[5]) for x in g if int(x[0]) == int(x[1])))
+
+
+def capped_anchor_overflow_ranks(guests: Optional[Sequence[Sequence[int]]],
+                                 caps: Optional[Sequence[int]]) -> Tuple[int, ...]:
+    """Ranks WITH a home segment that own anchor byte pieces (S4b overflow).
+    They have no L2 refill path for them, so a park-back of the group that did
+    not land must drop the whole hold (same rule as ``capped_guest_ranks``)."""
+    if not guests or caps is None:
+        return ()
+    return tuple(sorted({int(g[0]) for g in guests
+                         if 0 <= int(g[0]) < len(caps) and int(caps[int(g[0])]) > 0}))
+
+
+def pool_row_budget(caps: Sequence[int], keep_rows: Sequence[int],
+                    guests: Optional[Sequence[Sequence[int]]]) -> Tuple[int, int, int, int]:
+    """``(pool_rows, kv_rows, anchor_rows, rows_left)``: the pool as ONE row
+    budget.  ``pool_rows`` = the sum of the segments, ``kv_rows`` = the held KV
+    rows of all ranks (compacted keep rows), ``anchor_rows`` = every row the
+    anchor byte pieces occupy (cap-0 owners and overflow alike), ``rows_left`` =
+    what is left for more KV.  The plan places KV and anchors on the SAME free
+    rows, so ``kv_rows + anchor_rows <= pool_rows`` always holds for a valid
+    plan (``rows_left >= 0``)."""
+    pool_rows = sum(max(0, int(c)) for c in caps)
+    kv = sum(max(0, int(x)) for x in keep_rows)
+    a = sum(int(g[5]) for g in (guests or ()))
+    return pool_rows, kv, a, pool_rows - kv - a
+
+
+def plan_line_s4b(base_line: str, guests: Sequence[Sequence[int]], caps: Sequence[int],
+                  keep_rows: Sequence[int], anchor_cap: int) -> str:
+    """The S4 ``L15-POOL-PLAN`` line plus the S4b fields: the overflow anchors of
+    the ranks with a home segment (pieces / rows / bytes, how many rows lie in
+    the owner's own segment) and ``kv_rows_left`` = the pool rows no held KV row
+    and no anchor byte piece occupies."""
+    n_p, n_r, n_b, n_h = anchor_overflow_totals(guests, caps)
+    pool_rows, kv_rows, a_rows, left = pool_row_budget(caps, keep_rows, guests)
+    return (base_line + " s4b=1 anchor_cap=%d anchor_overflow_pieces=%d "
+            "anchor_overflow_rows=%d anchor_overflow_bytes=%d anchor_overflow_home_rows=%d "
+            "pool_rows=%d kv_rows_held=%d anchor_rows=%d kv_rows_left=%d" % (
+                int(anchor_cap), n_p, n_r, n_b, n_h, pool_rows, kv_rows, a_rows, left))
 
 
 # -- torch parts ------------------------------------------------------------------
@@ -562,6 +830,25 @@ def run_anchor_park(direction: str, guests: Sequence[Sequence[int]], rank: int,
     sent = 0
     for g in guests:
         owner, host, a_lo, n_a, h_lo, h_rows, nbytes = (int(x) for x in g)
+        if owner == host:
+            # S4b: an overflow anchor in the owner's OWN segment -- a local copy
+            # between its mamba slots and its KV hold rows, no collective (every
+            # rank classifies the piece the same way, so none posts one for it;
+            # not counted in the bytes SENT over the wire)
+            if rank == owner:
+                w_own = sum(int(v.shape[1]) for v in m_views)
+                rows = range(h_lo, h_lo + h_rows)
+                if direction == "out":
+                    mat = gather_stream(m_views, _slots_of(g))
+                    flat = torch.zeros(h_rows * rb, dtype=torch.uint8,
+                                       device=kv_views[0].device)
+                    flat[:nbytes] = mat.reshape(-1)
+                    scatter_stream(kv_views, rows, flat.view(h_rows, rb))
+                else:
+                    back = gather_stream(kv_views, rows)
+                    scatter_stream(m_views, _slots_of(g),
+                                   back.reshape(-1)[:nbytes].view(n_a, w_own))
+            continue
         frm, to = (owner, host) if direction == "out" else (host, owner)
         dev = kv_views[0].device
         empty = torch.empty((0, rb), dtype=torch.uint8, device=dev)
