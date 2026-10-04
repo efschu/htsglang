@@ -656,6 +656,100 @@ def live_grant_tokens(sched, req, page: int = 1) -> int:
     return total
 
 
+# -- #1530 GRANT-RETRY throttle (SGLANG_WEG2_DUAL_GRANT_RETRY_MS, default 0 = off) ----------
+#: stage-file path -> (mtime_ns, size, parsed table): a stage table changes only at publish_stage
+_STAGE_CACHE: dict = {}
+#: rid -> (monotonic time of its last attempt, ledger signature at that attempt)
+_RETRY: dict = {}
+
+
+def _retry_ms() -> int:
+    """The throttle interval in ms; 0 (default) = every pass retries, exactly as before."""
+    try:
+        from sglang.srt.environ import envs
+
+        return max(0, int(envs.SGLANG_WEG2_DUAL_GRANT_RETRY_MS.get()))
+    except Exception:  # noqa: BLE001 -- a bad value never changes the grant path
+        return 0
+
+
+def _load_stage(path: str, cached: bool) -> dict:
+    """One stage table. ``cached``: parsed once per (mtime, size) of the file
+    (publish_stage writes tmp + os.replace, so a new table is a new inode/mtime)."""
+    import json
+
+    if not cached:
+        with open(path) as f:
+            return json.load(f)
+    st = os.stat(path)
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _STAGE_CACHE.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    with open(path) as f:
+        tab = json.load(f)
+    _STAGE_CACHE[path] = (key, tab)
+    return tab
+
+
+def _ledger_sig(stages) -> tuple:
+    """The raw record of every card ledger (a few dozen bytes each, read without the lock):
+    any commit / release / demand / pressure / lend change shows. Not the file mtime -- a
+    shared mmap write does not reliably move it. An unreadable ledger reads as None."""
+    from sglang.srt.weg2.card_kv_ledger import _SIZE
+
+    out = []
+    for s in stages or ():
+        try:
+            fd = os.open(s["ledger"], os.O_RDONLY)
+            try:
+                out.append(os.pread(fd, _SIZE, 0))
+            finally:
+                os.close(fd)
+        except (OSError, KeyError):
+            out.append(None)
+    return tuple(out)
+
+
+def _retry_throttled(rid: str, stages, ms: int, now: float) -> bool:
+    """True = skip this attempt: the rid tried less than ``ms`` ms ago and no card ledger record
+    changed since. Never longer than ``ms`` (no starvation); the first attempt of a rid always runs."""
+    e = _RETRY.get(rid)
+    if e is None:
+        return False
+    return (now - e[0]) * 1000.0 < ms and e[1] == _ledger_sig(stages)
+
+
+def _retry_note(rid: str, stages, now: float) -> None:
+    if len(_RETRY) > 4096:
+        _RETRY.clear()
+    _RETRY[rid] = (now, _ledger_sig(stages))
+
+
+def _grant_short_detail(stages, covered, level_tokens: int, sum_tokens: int, older: int, hold) -> str:
+    """'#1530 GRANT-SHORT' body: per card the bytes this grant asks and what the ledger has free.
+    A log line only: any failure returns a short note, never an exception into the round."""
+    try:
+        from sglang.srt.weg2.card_kv_ledger import peek
+
+        step = int(stages[0]["step"])
+        top = min(int(s["top"]) for s in stages)
+        k = min(top, round_up(int(level_tokens), step)) // step
+        cards = []
+        for i, s in enumerate(stages):
+            need = max(0, int(s["bytes"][k]) - int(covered.get(i, 0)))
+            st = peek(s["ledger"])
+            have = "?" if st is None else str(int(st.free))
+            cards.append("%d:need=%d,have=%s%s" % (
+                i, need, have, "" if st is None else ",P=%d,D=%d,demD=%d,presP=%d" % (
+                    int(st.committed.get("P", 0)), int(st.committed.get("D", 0)),
+                    int(st.demand.get("D", 0)), int(st.pressure.get("P", 0)))))
+        return "level=%d sum=%d older=%d hold=%s cards=[%s]" % (
+            int(level_tokens), int(sum_tokens), int(older), hold or "none", " ".join(cards))
+    except Exception as exc:  # noqa: BLE001
+        return "detail failed: %s: %s" % (type(exc).__name__, exc)
+
+
 def pp0_grant(sched, req) -> Optional[int]:
     """PP0 only: the atomic group grant for ``req``'s prompt. None = not armed
     here (no actor / not PP0); 0 = a card is short (hold the request); else the
@@ -663,20 +757,24 @@ def pp0_grant(sched, req) -> Optional[int]:
     actor = _actor(sched)
     if actor is None or int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0) != 0:
         return None
-    import json
-
     from sglang.srt.weg2.card_kv_ledger import CardKvLedger
 
     tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
     pp = int(getattr(getattr(sched, "ps", None), "pp_size", 1) or 1)
+    _ms = _retry_ms() if _dual_layout_env() else 0       # #1530: dual layout only, 0 = off
     stages = []
     for r in range(pp):
         try:
-            with open(stage_file(tag, r)) as f:
-                stages.append(json.load(f))
+            stages.append(_load_stage(stage_file(tag, r), _ms > 0))
         except OSError:
             logger.warning("%s PP0 GRANT waits: stage %d has not published its table yet", MARK, r)
             return 0
+    if _ms > 0:
+        _t_now = _now()
+        _rid0 = str(getattr(req, "rid", "?"))[:16]
+        if _retry_throttled(_rid0, stages, _ms, _t_now):
+            return 0                                      # still held; no new information since the last try
+        _retry_note(_rid0, stages, _t_now)
     # Q-630: a re-intake of a request whose earlier grant never reached the
     # followers (intake_stall/abort before the told) -- that grant is returned
     # before a new one is taken, never charged twice on a follower card.
@@ -697,7 +795,7 @@ def pp0_grant(sched, req) -> Optional[int]:
     # restated here so the bypass can never reach a flip-form PP0.
     older = _older_waits(sched, rid) if _dual_layout_env() else []
     if older and not _dpar.grant_may_bypass([t for _r, t in older], now=_now(), age_s=_dpar.head_age_s()):
-        _log_wait(rid, tokens)
+        _log_wait(rid, tokens, lambda: _grant_short_detail(stages, {}, tokens, tokens, len(older), "older-head"))
         return 0
     # Q-697b GRANT HOLD (dual P only): while a card shows D's unmet demand or a pressure
     # on P, no grant -- the bytes P released at idle-except-waiters are D's first. The
@@ -708,7 +806,7 @@ def pp0_grant(sched, req) -> Optional[int]:
     _hold = _dgw.grant_held_by_d(req, stages) if _dual_layout_env() else None
     if _hold is not None:
         _dgw.note_hold(rid, _hold, req)
-        _log_wait(rid, tokens)
+        _log_wait(rid, tokens, lambda: _grant_short_detail(stages, {}, tokens, tokens, len(older), _hold))
         return 0
     own = int(getattr(actor, "_committed", 0) or 0)    # PP0's card: the ledger covers its mapping exactly
     taken: list = []
@@ -746,7 +844,9 @@ def pp0_grant(sched, req) -> Optional[int]:
         logger.info("%s PP0 GRANT rid=%s tokens=%d on all %d cards%s", MARK, rid, lvl, pp,
                     (" after %d waits over %.1f s" % waited) if waited else "")
     else:
-        _log_wait(rid, tokens)
+        _log_wait(rid, tokens, lambda: _grant_short_detail(
+            stages, {0: own}, min(tokens, int(stages[0]["top"])) if stages else tokens, tokens,
+            len(older), None))
     return lvl
 
 
@@ -767,7 +867,7 @@ def _reset_wait_log() -> None:
     _CENSUS.update(next=0.0, iv=1.0, waits=0)
 
 
-def _log_wait(rid: str, tokens: int) -> None:
+def _log_wait(rid: str, tokens: int, detail=None) -> None:
     """At most one line per rid per second, the gap doubling each line, plus
     one census line on the same backoff. A long wait therefore goes quiet, and
     the silence watchdog can see a stall instead of a busy log."""
@@ -783,6 +883,11 @@ def _log_wait(rid: str, tokens: int) -> None:
         e[4] = 0
         e[1] = t + e[2]
         e[2] *= 2.0
+        if detail is not None:                    # #1530 GRANT-SHORT, on the same backoff curve
+            try:
+                logger.info("#1530 GRANT-SHORT rid=%s tokens=%d %s", rid, int(tokens), detail())
+            except Exception:  # noqa: BLE001 -- a log line never reaches the round
+                pass
     else:
         e[4] += 1
     if t >= _CENSUS["next"]:
@@ -820,6 +925,7 @@ def _older_waits(sched, rid: str) -> list:
 def _wait_granted(rid: str):
     """Forget ``rid``'s wait; returns (waits, seconds) when it had waited."""
     e = _WAITS.pop(rid, None)
+    _RETRY.pop(rid, None)                      # #1530: a granted rid starts a fresh throttle
     if not _WAITS:
         _CENSUS.update(next=0.0, iv=1.0, waits=0)
     return (e[3], _now() - e[0]) if e else None

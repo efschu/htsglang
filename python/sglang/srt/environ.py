@@ -672,6 +672,12 @@ class Envs:
     # then newcomers wait behind it again.
     SGLANG_WEG2_DUAL_SHORT_BYPASS_TOKENS = EnvInt(8192)
     SGLANG_WEG2_DUAL_BYPASS_HEAD_AGE_S = EnvFloat(60.0)
+    # #1530 GRANT-RETRY throttle (dual layout, PP0 only; 0 = OFF = every pass retries as before).
+    # B9g boot 5 (04.10. 20:10-20:22Z): PP0 retried 9 held legs on EVERY scheduler pass (~2000
+    # grants/s: stage JSON + ledger reads each), CPU 101 % under the GIL, forward/publish starved
+    # (stop-and-go, Deadman HAENGT 2x ~90 s). With N > 0 a held rid retries at most every N ms
+    # unless a card ledger record changed since its last attempt; stage tables are cached by mtime.
+    SGLANG_WEG2_DUAL_GRANT_RETRY_MS = EnvInt(0)
     # Q-680 DUAL RESUME-STALE-LEDGER (dual y8w fs10031623 16:45:42: two P
     # followers kept 201/302 MB committed for 905 s, the front's RESUME-WAIT
     # held the whole queue): when P is idle (no leg in flight) and the only
