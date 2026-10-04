@@ -717,6 +717,18 @@ class Envs:
     # p_lent was always 0 and P resumed 200 ms after PP0's REFUSED reclaim (1.85 GiB lent, 302 MiB free) -> OOM. On: p_lent is
     # read under the front's own --tag too (max with the old reading); a refused/open reclaim holds the resume.
     SGLANG_WEG2_DUAL_LEND_RESUME_GATE = EnvBool(False)
+    # #1495 FRONT-KV-TAG (desk 1495): the front's reads of the dual P stage files
+    # (_dual_p_stage_reading: grant/air/weights/card_room/p_lent; d_signal_file;
+    # the ANCHOR-OWED read_room) key the file names by SGLANG_WEG2_DUAL_KV_TAG or
+    # SGLANG_WEG2_TAG, which only the RANK env carries (launcher dual_share_env);
+    # the front env (fenv = dict(os.environ)) has neither, so the front reads
+    # wkvs-sha1("weg2")-ppN.json and finds nothing: the pressure ladder is BLIND in
+    # every dual boot (p_lent always 0, the resume after stage 1 goes at once).
+    # On: the launcher exports the boot's --tag as SGLANG_WEG2_DUAL_KV_TAG into the
+    # FRONT env (dual layout only). The ladder then SEES the cards: new stalls are
+    # possible (P held while a lend is open), so this is its own observed boot.
+    # Default off = front env byte for byte as before.
+    SGLANG_WEG2_DUAL_FRONT_KV_TAG_FIX = EnvBool(False)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,

@@ -14440,6 +14440,22 @@ def dual_d_air_tokens(d_bs: int, chunk: int = CHUNKED_PREFILL_TOKENS,
     return int(chunk) + max(1, int(d_bs)) * max(1, int(verify))
 
 
+def dual_front_kv_tag_env(ns, environ=None) -> dict:
+    """#1495: the front env carries the boot's --tag as SGLANG_WEG2_DUAL_KV_TAG so
+    its dual P stage-file reads (grant/air/weights/card_room/p_lent, d_signal,
+    ANCHOR-OWED) key the files like the ranks do. Only in the dual layout and only
+    with SGLANG_WEG2_DUAL_FRONT_KV_TAG_FIX=1 (default off = {} = front env as before);
+    an operator-set SGLANG_WEG2_DUAL_KV_TAG is never overwritten."""
+    environ = os.environ if environ is None else environ
+    if str(environ.get("SGLANG_WEG2_DUAL_FRONT_KV_TAG_FIX", "")).strip().lower() not in ("1", "true", "on", "yes"):
+        return {}
+    if not getattr(ns, "dual_layout", False) or not getattr(ns, "tag", None):
+        return {}
+    if environ.get("SGLANG_WEG2_DUAL_KV_TAG"):
+        return {}
+    return {"SGLANG_WEG2_DUAL_KV_TAG": str(ns.tag)}
+
+
 def dual_p_sleep_front_env(ns, d_air_tokens: int) -> Dict[str, str]:
     """The front's capability switch and D's look-ahead in tokens."""
     if not dual_p_sleep_armed(ns):
@@ -27045,6 +27061,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # D PRIORITY stage 2: the front's capability + D's look-ahead (one extend
     # chunk + one decode round of every seat with the draft's tokens)
     fenv.update(dual_p_sleep_front_env(ns, dual_d_air_tokens(d_bs)))
+    fenv.update(dual_front_kv_tag_env(ns))
     # #71 (fnFL2v96): DIE FRONT SCHREIBT IN EINE DATEI, ALSO PUFFERT PYTHON
     # BLOCKWEISE -- und ein Tod vor dem ersten vollen Block hinterlaesst NICHTS.
     #
