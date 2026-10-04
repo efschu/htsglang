@@ -154,15 +154,15 @@ class TestDeterministicFp8Gate(unittest.TestCase):
     def test_fallback_not_armed_when_flag_is_off(self):
         """An sm8x rank without the flag keeps Marlin, so no fallback."""
         with _Env(False, sm=(8, 6)):
-            with mock.patch.object(U, "fp8_native_gemm_available", lambda: False), \
-                 mock.patch.object(U, "cutlass_fp8_supported", lambda: False), \
-                 mock.patch.object(U, "can_auto_enable_marlin_fp8", lambda: True):
+            with mock.patch.object(U, "fp8_native_gemm_available", lambda *a, **k: False), \
+                 mock.patch.object(U, "cutlass_fp8_supported", lambda *a, **k: False), \
+                 mock.patch.object(U, "can_auto_enable_marlin_fp8", lambda *a, **k: True):
                 _clear()
                 self.assertFalse(U.fp8_needs_dequant_fallback())
 
     def test_fallback_untouched_on_sm120(self):
         with _Env(True, sm=(12, 0)):
-            with mock.patch.object(U, "fp8_native_gemm_available", lambda: True):
+            with mock.patch.object(U, "fp8_native_gemm_available", lambda *a, **k: True):
                 _clear()
                 self.assertFalse(U.fp8_needs_dequant_fallback())
 
