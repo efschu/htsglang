@@ -660,6 +660,12 @@ class ModelProfile:
     #: files the CLAIM ANCHOR at floor_page(N-2), NF 1160d65e1d) -> off.
     #: SGLANG_WEG2_HANDBACK_CLAIM_N (weg2/handback_claim._claim_n_on).
     handback_claim_n: bool = False
+    #: Q-711 SHORT-KEPT-BOUND: seconds a SHORT kept for D may wait in the front's
+    #: ``_ready_for_d`` without a free D seat before it moves to P's queue (the
+    #: flip triggers read only the batch queue, so a kept SHORT had no upper
+    #: bound: INT8 y8vb 137 s / 152 s). 0 = off (nextflash, byte-identical).
+    #: SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S (weg2/front._short_kept_bound).
+    short_kept_max_wait_s: float = 0.0
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -673,6 +679,7 @@ class ModelProfile:
         out["SGLANG_WEG2_STORE_SHORT_TAIL"] = bool(self.store_short_tail)
         out["SGLANG_WEG2_BIGRAM_ANCHOR_EXACT"] = bool(self.bigram_anchor_exact)
         out["SGLANG_WEG2_HANDBACK_CLAIM_N"] = bool(self.handback_claim_n)
+        out["SGLANG_WEG2_SHORT_KEPT_MAX_WAIT_S"] = float(self.short_kept_max_wait_s)
         out["SGLANG_WEG2_ENABLE_WARM_MIN_DWELL"] = bool(self.warm_min_dwell)
         out["SGLANG_WEG2_ENABLE_AGENT_SPAN"] = bool(self.agent_span)
         out["SGLANG_WEG2_STANDARD_FORM"] = bool(self.standard_form)
@@ -879,6 +886,8 @@ PROFILES: Dict[str, ModelProfile] = {
         # ... and D claims N raw tokens = N-1 units after every hand-back
         # (fe5c55041b; NF's row keeps the upstream claim, field default off).
         handback_claim_n=True,
+        # ... and a SHORT kept for D waits at most this long for a seat (Q-711).
+        short_kept_max_wait_s=30.0,
         warm_min_dwell=False,
         agent_span=True,
         standard_form=False,
