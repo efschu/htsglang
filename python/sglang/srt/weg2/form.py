@@ -340,6 +340,12 @@ STATED_SWITCHES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("front_quiesce_fast", ("SGLANG_WEG2_QUIESCE_FAST",)),
     ("front_ctl_kick", ("SGLANG_WEG2_CTL_KICK_ARRIVAL", "SGLANG_WEG2_CTL_KICK_AFTER_FLIP")),
     ("census_o1_evict", ("SGLANG_WEG2_CENSUS_O1_EVICT",)),
+    # SWITCH-DEFAULTS 1004 (user order 04.10. ~07:15Z: proven on metal -> on
+    # in the code): front + rank switches every NF profile states for all
+    # processes (nf-int4-h6-abl.env _form / export lines).
+    ("front_park_collect_window", ("SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW",)),
+    ("deposit_lane_lookahead", ("SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD",)),
+    ("d_seat_rewake", ("SGLANG_WEG2_D_SEAT_REWAKE",)),
 )
 
 
@@ -613,6 +619,12 @@ class ModelProfile:
     front_ctl_kick: Optional[bool] = None
     #: SGLANG_WEG2_CENSUS_O1_EVICT (ranks) -- 'KR CENSUS-O1-EVICT armed'.
     census_o1_evict: Optional[bool] = None
+    #: SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW (front) -- z30y collect window.
+    front_park_collect_window: Optional[bool] = None
+    #: SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD (ranks, weight_updater) -- H111b.
+    deposit_lane_lookahead: Optional[bool] = None
+    #: SGLANG_WEG2_D_SEAT_REWAKE (front + D ranks) -- SITZ-REWAKE 47539d581e.
+    d_seat_rewake: Optional[bool] = None
 
     def switch_defaults(self) -> Dict[str, object]:
         """The rank switches whose default this profile sets, DERIVED."""
@@ -722,6 +734,9 @@ _NF_LS_BOTH: Dict[str, str] = {
 NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
     "P": dict(_NF_LS_BOTH, **{
         "SGLANG_WEG2_ENABLE_P_TAIL_FOLD": "1",
+        # SWITCH-DEFAULTS 1004: P-only lines of nf-int4-h6-abl.env (NF_ENV_P)
+        "SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP": "1",
+        "SGLANG_WEG2_ENABLE_TARGETED_PREWARM": "1",
         "SGLANG_FORCE_QSA_ROWS_CONFIG": "inf=64/8/2",
         "SGLANG_WEG2_QSA_FP8_DECODE": "ptx",
         "SGLANG_WEG2_QSA_ROWS_FUSED_EAGER": "1",
@@ -735,6 +750,10 @@ NEXTFLASH_GROUP_SWITCH_DEFAULTS: Dict[str, Dict[str, str]] = {
         "SGLANG_QWEN4_PLE_DECODE_PREAD_THREADS": "8",
         "SGLANG_WEG2_ENABLE_CUT_WORKER_END": "1",
         "SGLANG_WEG2_ENABLE_D_PARK_END": "1",
+        # SWITCH-DEFAULTS 1004: D-only lines of nf-int4-h6-abl.env (NF_ENV_D)
+        "SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY": "1",
+        "SGLANG_WEG2_RESUME_WARM_FINISH": "1",
+        "SGLANG_WEG2_TAIL_STAGE_WORKER": "1",
         # SCHALTER-HALBPORT 1002 (audit section 6): the row's store_short_tail
         # is off, but every NF boot runs it on D (nf-int4.env NF_ENV_D_FORM) and
         # off on P (0x W88 on NF-P in 10 boots: no need shown) -- per group here,
@@ -1061,6 +1080,9 @@ PROFILES: Dict[str, ModelProfile] = {
         front_quiesce_fast=True,
         front_ctl_kick=True,
         census_o1_evict=True,
+        front_park_collect_window=True,
+        deposit_lane_lookahead=True,
+        d_seat_rewake=True,
     ),
 }
 

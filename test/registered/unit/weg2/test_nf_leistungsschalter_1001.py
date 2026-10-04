@@ -34,6 +34,9 @@ PROFILE_P = {
     "SGLANG_UNEVEN_MOE_EXPERT_SHARD": "1",
     "SGLANG_HC_MIXER_INT8": "1",
     "SGLANG_WEIGHT_LOADER_COALESCE_MIB": "32",
+    # SWITCH-DEFAULTS 1004: nf-int4-h6-abl.env NF_ENV_P (P only)
+    "SGLANG_WEG2_ENABLE_PREFILL_FETCH_OVERLAP": "1",
+    "SGLANG_WEG2_ENABLE_TARGETED_PREWARM": "1",
 }
 PROFILE_D = {
     "SGLANG_WEG2_TAIL_KEEP_MIB": "512",
@@ -51,6 +54,10 @@ PROFILE_D = {
     "SGLANG_WEIGHT_LOADER_COALESCE_MIB": "32",
     # SCHALTER-HALBPORT 1002: nf-int4.env NF_ENV_D_FORM (D only)
     "SGLANG_WEG2_STORE_SHORT_TAIL": "1",
+    # SWITCH-DEFAULTS 1004: nf-int4-h6-abl.env NF_ENV_D (D only)
+    "SGLANG_WEG2_ENABLE_TAIL_STAGE_EARLY": "1",
+    "SGLANG_WEG2_RESUME_WARM_FINISH": "1",
+    "SGLANG_WEG2_TAIL_STAGE_WORKER": "1",
 }
 #: a per-group value that overrides the row's form-wide default on ONE group
 #: (the row's global value is what the other group runs): STORE_SHORT_TAIL, row

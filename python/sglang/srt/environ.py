@@ -886,7 +886,9 @@ class Envs:
     # Measured x177/x178/h91v1: lockstep idle 42-156 ms and pause+credit
     # 5-7 ms x 10 tags per flip sit on PP0's chain above the 1.25 s copy-engine
     # floor. False = the lockstep, byte for byte.
-    SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD = EnvBool(False)
+    # SWITCH-DEFAULTS 1004: --profile nextflash states it ON (weg2/form.py
+    # STATED_SWITCHES); without a form / for qwen27b the default stays off.
+    SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD = EnvBool(_profile_default("SGLANG_WEG2_DEPOSIT_LANE_LOOKAHEAD", False))
     SGLANG_WEG2_DEPOSIT_LANE_AHEAD = EnvInt(1)
     # TAG-STALL-SENTINEL (30.09., NF y3z ep52: PP0 still 5.4 s process-wide at
     # the first tag of P's sleep): per sleep tag, faulthandler's C watchdog
@@ -3448,7 +3450,9 @@ class Envs:
     # re-plan round trip (ski rental, the flip policy's shape) -- the freed
     # pages go back to expert rows. Needs SGLANG_OPT_WEG2_D_SEAT_VRAM; read by
     # D's ranks AND by the front (which then counts D's seats at --d-bs).
-    SGLANG_WEG2_D_SEAT_REWAKE = EnvBool(False)
+    # SWITCH-DEFAULTS 1004: --profile nextflash states it ON (weg2/form.py
+    # STATED_SWITCHES); without a form / for qwen27b the default stays off.
+    SGLANG_WEG2_D_SEAT_REWAKE = EnvBool(_profile_default("SGLANG_WEG2_D_SEAT_REWAKE", False))
     # H95c: the extra expert rows' VIRTUAL reservation per MoE TP rank
     # ("16,0,0"), written by the launcher from the seat table (rows at n=1
     # minus rows at the --d-bs cap, GERECHNET). Only the rows the runtime's
@@ -4098,7 +4102,9 @@ class Envs:
     # (p_phase_max_requests, P's pool, d_wait_bound_s) fires at once. Off =
     # the immediate park byte for byte.
     # WINDOW_S: a fixed timer x instead of the measured price (override only).
-    SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW = EnvBool(False)
+    # SWITCH-DEFAULTS 1004: --profile nextflash states it ON (weg2/form.py
+    # STATED_SWITCHES); without a form / for qwen27b the default stays off.
+    SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW = EnvBool(_profile_default("SGLANG_WEG2_ENABLE_PARK_COLLECT_WINDOW", False))
     SGLANG_WEG2_PARK_COLLECT_WINDOW_S = EnvFloat(None)
     SGLANG_WEG2_PARK_COLLECT_THRESHOLD_TOKENS = EnvInt(0)
     # PARK-WINDOW-GATE (27B decision 29.09. ~13:55Z, F22 audit: the park RPC
