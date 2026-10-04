@@ -99,6 +99,10 @@ def main() -> int:
     ap.add_argument("--hang-s", type=float, default=20.0, help="per-chunk watchdog")
     ap.add_argument("--m", type=int, default=1024, help="P-like chunk tokens")
     ap.add_argument("--n-gemm", type=int, default=64, help="GEMM launches per P chunk")
+    ap.add_argument("--w2c-only", action="store_true",
+                    help="1330/W2c fast probe: after W1/W2/W2c write the JSON and exit (rc 1 when W2c is bad), skip W3-W8 (~5 min)")
+    ap.add_argument("--require-kernels", default="gemm_chain,flashinfer_prefill,fla_gated_delta_rule",
+                    help="W2c kernels that must RUN on every served stage: a SKIP of one of them counts as bad (a SKIP is not a pass)")
     args = ap.parse_args()
     if os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"):
         print("G1330 REFUSED CUDA_MPS_ACTIVE_THREAD_PERCENTAGE is set: the ladder cannot lift a static percentage")
@@ -313,14 +317,22 @@ def main() -> int:
 
         from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 
-        gq = rnd(1, 1024, 4, 128)
-        gk = F.normalize(rnd(1, 1024, 4, 128), p=2, dim=-1)
-        gv = rnd(1, 1024, 4, 128)
-        gb = rnd(1, 1024, 4).sigmoid()
-        gg = F.logsigmoid(rnd(1, 1024, 4))
+        T_g, Hg_g, H_g, K_g = 1024, 4, 8, 128      # q/k heads Hg, v heads H = 2 Hg (the GQA branch i_h // (H // Hg))
+        gq = rnd(1, T_g, Hg_g, K_g)
+        gk = F.normalize(rnd(1, T_g, Hg_g, K_g), p=2, dim=-1)
+        gv = rnd(1, T_g, H_g, K_g)
+        gb = rnd(1, T_g, H_g).sigmoid()
+        gg = F.logsigmoid(rnd(1, T_g, H_g))
+        # the contract of gdn_triton.TritonGDNKernel.extend: recurrent state POOL [slots,H,V,K], int32 slot index per
+        # sequence, int32 cu_seqlens; the kernel loads ``initial_state_indices`` unconditionally (None was the 04.10.
+        # 12:28Z CompilationError that turned W2c into a SKIP). The kernel updates the pool in place -> fresh pool per call.
+        gpool0 = torch.zeros(2, H_g, K_g, K_g, dtype=torch.float32, device=dev)
+        gidx = torch.zeros(1, dtype=torch.int32, device=dev)
+        gcu = torch.tensor([0, T_g], dtype=torch.int32, device=dev)
 
         def gdn():
-            r = chunk_gated_delta_rule(gq, gk, gv, gg, gb)
+            r = chunk_gated_delta_rule(gq, gk, gv, gg, gb, initial_state=gpool0.clone(), initial_state_indices=gidx,
+                                       cu_seqlens=gcu, head_first=False, use_qk_l2norm_in_kernel=True)
             return (r[0] if isinstance(r, (tuple, list)) else r).clone()
 
         cases["fla_gated_delta_rule"] = gdn
@@ -348,9 +360,18 @@ def main() -> int:
             w2c_bad += 0 if ok else 1
             w2c.setdefault(name, {})[i] = {"bitwise": bw, "max_abs_diff": md, "ok": ok}
             print(f"G1330 W2c {name} stage={i} sm={ladder.rungs[i].sm} bitwise={bw} max_abs_diff={md:.3e} within_tol={ok}")
+    for need in [k for k in args.require_kernels.split(",") if k]:
+        got = w2c.get(need, {})
+        if any(i not in got for i in served[1:]):
+            print(f"G1330 W2c FAIL-NOT-RUN {need}: ran on stages {sorted(got)} of {served[1:]} (a SKIP is not a pass)")
+            w2c_bad += 1
     print(f"G1330 W2c bad={w2c_bad} (must be 0) kernels={list(cases)}")
     out["w2c"] = w2c
     out["w2c_bad"] = w2c_bad
+    if args.w2c_only:
+        print(f"G1330 W2c-ONLY {'FAIL' if w2c_bad else 'PASS'} bad={w2c_bad} kernels={list(cases)} stages={served}")
+        _dump(args.out, out)
+        return 1 if w2c_bad else 0
 
     # ---- W3: needle (hang) test per stage ---------------------------------------------------------------------
     for i in served:
