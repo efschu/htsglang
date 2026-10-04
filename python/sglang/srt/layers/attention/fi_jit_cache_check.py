@@ -8,7 +8,7 @@ the 3 GiB cgroup cap).
 
 WHY A STANDALONE TEST REBUILDS WHAT A BOOT LOADS (the root cause, measured):
 flashinfer fixes its cache DIRECTORY at import from the visible device
-(flashinfer/jit/env.py + jit/core.py:138 -> ``0.6.14/120f`` for the 5090) but
+(flashinfer/jit/env.py + jit/core.py:138 -> ``<version>/120f`` for the 5090) but
 takes the -gencode FLAGS from FLASHINFER_CUDA_ARCH_LIST when it writes a
 module's build.ninja (jit/cpp_ext.py:210, a fresh CompilationContext). The
 sglang server sets that variable AFTER importing flashinfer --
@@ -47,14 +47,30 @@ _DTYPE_NAME = {"bf16": "bf16", "e4m3": "e4m3", "f16": "f16", "e5m2": "e5m2"}
 _GENCODE_RE = re.compile(r"-gencode=arch=compute_\w+,code=sm_\w+")
 
 
-def prefill_uri(kv: str, q: str = "bf16", o: str = "bf16", head_dim: int = 256) -> str:
-    """flashinfer 0.6.14 ``get_batch_prefill_uri`` for fa2, int32 indices, no
-    RoPE, no window, no soft cap, no fp16 QK reduction (pure string)."""
+def prefill_uri(kv: str, q: str = "bf16", o: str = "bf16", head_dim: int = 256, suffix: str = "") -> str:
+    """flashinfer ``get_batch_prefill_uri`` for fa2, int32 indices, no RoPE, no
+    window, no soft cap, no fp16 QK reduction (pure string). ``suffix`` is the
+    module-surface suffix: "" for 0.6.14; flashinfer 0.7.0's fa2 wrapper loads
+    its PRIMARY module in equal-stride mode, ``_kv_stride_equal``
+    (jit/attention/modules.py ``_BATCH_PREFILL_MODULE_URI_SUFFIX``) -- without
+    it the pre-check below would call a cached 0.7.0 module "NOT BUILT"."""
     return (
         "batch_prefill_with_kv_cache_dtype_q_%s_dtype_kv_%s_dtype_o_%s_dtype_idx_i32_"
-        "head_dim_qk_%d_head_dim_vo_%d_posenc_0_use_swa_False_use_logits_cap_False_f16qk_False"
-        % (_DTYPE_NAME[q], _DTYPE_NAME[kv], _DTYPE_NAME[o], head_dim, head_dim)
+        "head_dim_qk_%d_head_dim_vo_%d_posenc_0_use_swa_False_use_logits_cap_False_f16qk_False%s"
+        % (_DTYPE_NAME[q], _DTYPE_NAME[kv], _DTYPE_NAME[o], head_dim, head_dim, suffix)
     )
+
+
+def primary_uri_suffix() -> str:
+    """The suffix of the module ``BatchPrefillWithPagedKVCacheWrapper`` (fa2)
+    loads, read from the INSTALLED flashinfer: "" when it has no such table
+    (0.6.14), ``_kv_stride_equal`` when it has (0.7.0)."""
+    try:
+        from flashinfer.jit.attention import modules as _m
+
+        return str(getattr(_m, "_BATCH_PREFILL_MODULE_URI_SUFFIX", {}).get(("equal", "full"), ""))
+    except Exception:  # noqa: BLE001 - not importable: the 0.6.14 name
+        return ""
 
 
 def mirror_server_arch() -> str:
@@ -134,7 +150,7 @@ def check_prefill_modules(
         return False, lines + ["no ninja on PATH"]
     ok = True
     for kv in kv_dtypes:
-        uri = prefill_uri(kv)
+        uri = prefill_uri(kv, suffix=primary_uri_suffix())
         d = jit_env.FLASHINFER_JIT_DIR / uri
         so, bn = d / (uri + ".so"), d / "build.ninja"
         if not so.exists() or not bn.exists():
