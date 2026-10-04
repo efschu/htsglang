@@ -1959,6 +1959,14 @@ def _put(dst: torch.Tensor, idx: torch.Tensor, src: torch.Tensor, back: Optional
     the preallocated host buffer ``back``."""
     d = _as_bytes(dst)
     i = idx.to(device=d.device, dtype=torch.int64)
+    if i is idx:
+        # Q-1302 (Z1, the Q-702 class): no copy was made, so the index_copy_
+        # below reads the caller's block -- ``rows`` / ``groups`` / ``slot`` of
+        # an E1 install, made on the schedule stream -- LATER, on this
+        # (forward) stream. Bind it so it outlives the install (the verify
+        # thread's reference is the only other thing that did, and only with
+        # SGLANG_WEG2_TAIL_VERIFY / the stage worker on).
+        ple_state.hold_for_current_stream(i, "tail_put")
     d.index_copy_(0, i, _as_bytes(src).to(d.device, non_blocking=True))
     if back is not None:
         back.copy_(d.index_select(0, i), non_blocking=d.is_cuda)

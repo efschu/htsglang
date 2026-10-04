@@ -106,6 +106,29 @@ def _idx(slot, device) -> torch.Tensor:
     return t.reshape(-1).to(device=device, dtype=torch.long, non_blocking=True)
 
 
+#: Q-1302: how many index blocks were bound to the stream that reads them (log only)
+_BOUND_N = [0]
+
+
+def hold_for_current_stream(t, site: str = "") -> None:
+    """Q-1302 (the Q-702 class, NF y9nf3 10040106 Fall E): ``t`` is an index
+    tensor a kernel on the CURRENT stream reads LATER, whose storage belongs to
+    the scheduler thread's stream (a clone made at admission, a view of the
+    allocator's free list). When the last Python reference drops before that
+    kernel ran, the caching allocator hands the block back to its own stream
+    and the next small tensor overwrites it -- the index then reads garbage.
+    ``record_stream`` keeps the block out of reuse until this stream has passed
+    the work queued so far. No copy, no host sync, no value change; the same
+    call on every rank. A CPU tensor needs nothing (stream-less)."""
+    if not (torch.is_tensor(t) and t.is_cuda):
+        return
+    t.record_stream(torch.cuda.current_stream(t.device))
+    _BOUND_N[0] += 1
+    if _BOUND_N[0] <= 3 or _BOUND_N[0] % 256 == 0:
+        logger.info("Q-1302 STREAM-BOUND n=%d site=%s numel=%d (index block bound to the reading stream "
+                    "by record_stream)", _BOUND_N[0], site, int(t.numel()))
+
+
 def _to_host(t: torch.Tensor) -> torch.Tensor:
     """Async D2H into pinned memory on the current stream (CPU: a copy)."""
     pin = t.is_cuda
@@ -226,6 +249,9 @@ def apply_pending(pool, rids: Optional[Sequence[str]]) -> int:
         if ent is None:
             continue
         slot, rows = ent
+        # the install's index kernels queue behind the running forward, the
+        # clone was made on the schedule stream and dies with this iteration
+        hold_for_current_stream(slot, "ple_apply")
         why = install(pool, slot, rows)
         if why:
             logger.warning("WEG2-PLE-STATE install refused rid=%s (%s): the slot keeps its history", rid, why)
