@@ -5423,8 +5423,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if h is None or n is None:
             return
         try:
-            h.note_take(kind, n, self._weg2_node_end_depth(n) if depth is None else depth,
-                        bool(getattr(n, "_weg2_end_anchor", False)))
+            d = self._weg2_node_end_depth(n) if depth is None else depth
+            end = bool(getattr(n, "_weg2_end_anchor", False))
+            h.note_take(kind, n, d, end)
+            if kind != "PATH-CAP":      # the cap speaks in its own line
+                k = getattr(UnifiedRadixCache, "_weg2_take_n", 0) + 1
+                UnifiedRadixCache._weg2_take_n = k
+                told_hit = d in h.told_depths()
+                if told_hit or k <= 32 or k % 64 == 0:
+                    (logger.warning if told_hit else logger.info)(
+                        "%s TAKE %s node=%s depth=%s end_anchor=%s standing_told_at_depth=%s hold=%s "
+                        "(n=%d)", _tah.MARKER, kind, getattr(n, "id", "?"), d, end, told_hit,
+                        "on" if h.armed() else "OFF", k)
+        except Exception:  # noqa: BLE001 -- an instrument
+            pass
+
+    def _weg2_told_note_kept(self, n) -> None:
+        """F3b: the hold refused to give `n` up (Q-610 / inner release): named, rate-limited."""
+        h = getattr(self, "_weg2_told_hold", None)
+        if h is None:
+            return
+        try:
+            k = getattr(UnifiedRadixCache, "_weg2_kept_n", 0) + 1
+            UnifiedRadixCache._weg2_kept_n = k
+            if k <= 32 or k % 64 == 0:
+                d = self._weg2_node_end_depth(n)
+                logger.info("%s KEPT node=%s depth=%s end_anchor=%s rids=%s (n=%d): given back by "
+                            "Q-610/inner release otherwise", _tah.MARKER, getattr(n, "id", "?"), d,
+                            bool(getattr(n, "_weg2_end_anchor", False)),
+                            h.depths().get(d, []), k)
         except Exception:  # noqa: BLE001 -- an instrument
             pass
 
@@ -5449,6 +5476,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if mp.settled_anchor_slots(hv) is None:
             return False
         if self._weg2_told_held(n):
+            self._weg2_told_note_kept(n)
             return False
         return True
 
@@ -6113,6 +6141,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             why = "fork"
         elif self._weg2_told_held(a):
             why = "told_hold"
+            self._weg2_told_note_kept(a)
         elif cd.host_lock_ref > 0:
             why = "host_locked"
         elif getattr(a, "write_through_pending_id", None) is not None:

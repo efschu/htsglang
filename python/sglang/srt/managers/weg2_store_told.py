@@ -185,7 +185,7 @@ def armed(scheduler) -> bool:
         scheduler._weg2_store_told = {}
         scheduler._weg2_store_held = {}
         # y9d4: the tree reads this table as the anchors a told holds (dual P only)
-        _tah.attach(getattr(scheduler, "tree_cache", None), scheduler._weg2_store_told)
+        _tah.attach(getattr(scheduler, "tree_cache", None), _tah.view_of(scheduler))
         #: P-FORK-CUT: rid -> the told fork (PP0: published, follower: absorbed);
         #: `admission` hands it to the request.
         scheduler._weg2_store_fork = {}
@@ -551,7 +551,7 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     forget_rid_leftovers(scheduler.tree_cache, rid)
     if getattr(scheduler.tree_cache, "_weg2_told_hold", None) is None:
         # armed() ran before the tree existed: attach at the first intake (dual P only)
-        _tah.attach(scheduler.tree_cache, scheduler._weg2_store_told)
+        _tah.attach(scheduler.tree_cache, _tah.view_of(scheduler))
     if int(scheduler.ps.pp_rank) == 0:
         # Q-580: a told standing at PP0's intake is an earlier instance's.
         _drop_stale_pp0_told(scheduler, req, rid)

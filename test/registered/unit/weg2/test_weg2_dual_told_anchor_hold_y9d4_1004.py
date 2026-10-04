@@ -303,14 +303,14 @@ def test_hold_ends_where_the_told_ends():
     assert r.admit(T) == END_OLD                      # no hold -> the old way
 
 
-def test_max_bound_holds_the_oldest_told_entries_only(monkeypatch, caplog):
+def test_max_bound_holds_the_deepest_told_entries_only(monkeypatch, caplog):
     monkeypatch.setenv(TAH.ENV_MAX, "1")
     r = _ranks(1)[0]
     r.told["weg2-0-78"] = 24000
     with caplog.at_level(logging.WARNING):
         d = r.c._weg2_told_hold_depths(tick=True)
-    assert d == {T: ["weg2-0-77"]}
-    assert any("OVER-MAX" in x.message and "weg2-0-78" in x.message for x in caplog.records)
+    assert d == {24000: ["weg2-0-78"]}                  # the deeper (dearer) told stays
+    assert any("OVER-MAX" in x.message and "weg2-0-77" in x.message for x in caplog.records)
 
 
 def test_runs_bound_expires_the_hold_with_a_named_warning(monkeypatch, caplog):
@@ -430,7 +430,7 @@ def test_armed_attaches_the_told_table_to_the_tree(monkeypatch):
     except Exception:  # noqa: BLE001 -- only the attach is under test; later init lines need a real scheduler
         pass
     h = getattr(tree, "_weg2_told_hold", None)
-    assert h is not None and h.source is s._weg2_store_told
+    assert h is not None and h.source.scheduler is s     # the union view of the scheduler's told records
     s._weg2_store_told["weg2-0-77"] = T
     assert h.depths() == {T: ["weg2-0-77"]}
 
@@ -490,3 +490,183 @@ def test_flip_unchanged_no_hold_object_no_exemption(monkeypatch, env):
         assert r.nodes[T]._weg2_capped is True        # the cap takes it as before
     # the stamp's report is a free no-op without a hold
     TAH.report_extent(type("Q", (), {"rid": "weg2-0-77"})(), 1)
+
+
+# ---------------------------------------------------------------------------------------------
+# PACED / PF form (y9d4 ran SGLANG_WEG2_TOLD_PACED=1): _weg2_store_told is written only at the
+# Admit; between the read-ahead and the Admit the told stands in pacing (PP0), early and
+# satisfied (follower). The END-anchor insert (the cap run) falls INSIDE that window.
+# Red on 5341d338a8 (the hold read _weg2_store_told alone): the anchor is taken, admission = 16665.
+# ---------------------------------------------------------------------------------------------
+from types import SimpleNamespace as _NS  # noqa: E402
+
+PACED_RECORDS = {
+    "pp0_pacing": ("_weg2_told_pacing", lambda told: {"weg2-0-77": _NS(req=None, told=told, absolute=True)}),
+    "follower_early": ("_weg2_told_early", lambda told: {"weg2-0-77": told}),
+    "follower_satisfied": ("_weg2_store_told_satisfied", lambda told: {"weg2-0-77": told}),
+    # y9d4c: the adder's first visit pops the four records above and keeps the verdict here
+    "follower_kept": ("_weg2_told_kept", lambda told: {"weg2-0-77": _NS(req=None, told=told, credit=0)}),
+    "admitted_table": ("_weg2_store_told", lambda told: {"weg2-0-77": told}),
+}
+
+
+def _paced_rank(monkeypatch, kind, told=T):
+    """A rank whose scheduler holds the told ONLY in the named record, wired through the real
+    ``weg2_store_told.armed`` (the tree gets the union view there)."""
+    from sglang.srt.managers import weg2_store_told as ST
+
+    r = Rank({})                       # the Rank's own dict stays unused (not attached)
+    s = _Sched(r.c)
+    s.ps = type("P", (), {"pp_rank": 1 if kind.startswith("follower") else 0})()
+    monkeypatch.setattr(ST, "_resolve_armed", lambda sch: True)
+    monkeypatch.setattr(ST, "_paced_env", lambda: True)
+    try:
+        ST.armed(s)
+    except Exception:  # noqa: BLE001 -- only the attach is under test
+        pass
+    attr, mk = PACED_RECORDS[kind]
+    s._weg2_store_told.clear()         # armed() made it empty; the paced form leaves it empty
+    setattr(s, attr, mk(told))
+    r.sched = s
+    return r
+
+
+@pytest.mark.parametrize("kind", list(PACED_RECORDS))
+def test_paced_told_only_in_one_record_is_held_through_the_cap_run(monkeypatch, kind):
+    r = _paced_rank(monkeypatch, kind)
+    assert r.c._weg2_told_hold_depths() == {T: ["weg2-0-77"]}
+    assert r.insert_tail_end_anchor() == 1          # the cap bites, but not on the held anchor
+    assert r.admit(T) == T
+    assert r.state()[T] == (False, True)
+
+
+@pytest.mark.parametrize("kind", ["pp0_pacing", "follower_early", "follower_satisfied"])
+def test_paced_chain_without_hold_is_the_y9d4_loss(monkeypatch, kind):
+    monkeypatch.setenv(TAH.ENV, "0")
+    r = _paced_rank(monkeypatch, kind)
+    r.insert_tail_end_anchor()
+    assert r.admit(T) == END_OLD
+
+
+def test_paced_pp0_and_followers_decide_alike(monkeypatch):
+    ranks = [_paced_rank(monkeypatch, k) for k in ("pp0_pacing", "follower_early", "follower_satisfied")]
+    for r in ranks:
+        r.insert_tail_end_anchor()
+    st = [{d: v for d, v in r.state().items()} for r in ranks]
+    assert st[0] == st[1] == st[2]
+    assert [r.admit(T) for r in ranks] == [T] * 3
+
+
+def test_paced_admit_pops_end_the_hold(monkeypatch):
+    r = _paced_rank(monkeypatch, "follower_early")
+    s = r.sched
+    s._weg2_told_early.pop("weg2-0-77")             # the Admit's absorb: early.pop(rid)
+    assert r.c._weg2_told_hold_depths() == {}
+    s._weg2_store_told_satisfied = {"weg2-0-77": T}
+    assert r.c._weg2_told_hold_depths() == {T: ["weg2-0-77"]}
+    s._weg2_store_told_satisfied.pop("weg2-0-77")   # admission pops satisfied
+    assert r.c._weg2_told_hold_depths() == {}
+
+
+def test_paced_forget_left_queue_drops_every_record_and_the_hold(monkeypatch):
+    """Q-580 / abort: forget_left_queue pops all _TOLD_RECORDS -- the hold ends with them"""
+    from sglang.srt.managers import weg2_store_told as ST
+
+    r = _paced_rank(monkeypatch, "follower_early")
+    s = r.sched
+    s._weg2_store_told_satisfied = {"weg2-0-77": T}
+    s.waiting_queue = []
+    s._weg2_store_held = {}
+    req = _NS(rid="weg2-0-77")
+    ST.forget_left_queue(s, req, "test")
+    assert r.c._weg2_told_hold_depths() == {}
+
+
+def test_union_one_rid_counts_once_and_max_picks_by_content(monkeypatch):
+    monkeypatch.setenv(TAH.ENV_MAX, "1")
+    s = _NS(_weg2_store_told={"b": 5000}, _weg2_told_early={"b": 5000, "a": 9000},
+            _weg2_told_pacing={}, _weg2_store_told_satisfied={})
+    s2 = _NS(_weg2_store_told={}, _weg2_told_early={"a": 9000, "b": 5000},   # another dict order
+             _weg2_told_pacing={}, _weg2_store_told_satisfied={})
+    h1, h2 = TAH.Hold(TAH.ToldView(s)), TAH.Hold(TAH.ToldView(s2))
+    assert h1.depths() == h2.depths() == {9000: ["a"]}
+    assert len(TAH.ToldView(s)) == 2
+
+
+def test_paced_extent_regression_reads_the_union(monkeypatch, caplog):
+    r = _paced_rank(monkeypatch, "follower_early")
+    req = type("Q", (), {"rid": "weg2-0-77"})()
+    with caplog.at_level(logging.WARNING):
+        TAH.report_extent(req, T)
+        TAH.report_extent(req, END_OLD)
+    assert [x for x in caplog.records if "EXTENT REGRESSED" in x.message]
+
+
+def test_paced_path_cap_diag_reads_the_union(monkeypatch, caplog):
+    URC.UnifiedRadixCache._weg2_cap_n = 10_000
+    monkeypatch.setenv(TAH.ENV, "0")
+    r = _paced_rank(monkeypatch, "pp0_pacing")
+    with caplog.at_level(logging.INFO):
+        r.insert_tail_end_anchor()
+    lines = [x.message for x in caplog.records if "WEG2 PATH-CAP" in x.message]
+    assert lines and "TOLD-ANCHOR TAKEN" in lines[-1]
+
+
+def test_kept_only_q610_claim_walk_before_admit_keeps_the_anchor(monkeypatch):
+    """y9d4c weg2-0-26: the follower's records are popped by the adder's first visit, the verdict
+    stands only in _weg2_told_kept; the Q-610 claim walk (arena full) runs BEFORE the admit.
+    Red on 5341d338a8 (kept not read): the walk gives 12288/T back."""
+    r = _paced_rank(monkeypatch, "follower_kept")
+    n = r.nodes[T]
+    n._weg2_anchored = False
+    released, ended, prefix, kept = r.c._weg2_dual_claim_room(UnifiedTreeNode(TC), r.pool)
+    assert released >= 1                                  # the walk does work ...
+    assert n.component_data[M].host_value is not None     # ... but not on the told anchor
+    assert r.c._weg2_told_held(n) is True
+
+
+def test_kept_only_hold_survives_the_cap_and_ends_with_settle(monkeypatch):
+    r = _paced_rank(monkeypatch, "follower_kept")
+    r.insert_tail_end_anchor()
+    assert r.admit(T) == T
+    r.sched._weg2_told_kept.pop("weg2-0-77")              # settle_told: the rid left the queue
+    assert r.c._weg2_told_hold_depths() == {}
+
+
+def test_max_drops_the_shallow_tolds_not_the_deep_ones(monkeypatch):
+    monkeypatch.setenv(TAH.ENV_MAX, "8")
+    s = _NS(_weg2_store_told={}, _weg2_told_early={}, _weg2_told_pacing={}, _weg2_store_told_satisfied={},
+            _weg2_told_kept={"r%02d" % i: _NS(told=1000 * (i + 1)) for i in range(16)})
+    d = TAH.Hold(TAH.ToldView(s)).depths()
+    assert sorted(d) == [1000 * k for k in range(9, 17)]      # the 8 DEEPEST of 16
+    # default MAX covers a queue of 16 entirely (24 anchors x 75 MiB shared by all ranks << 112 slots)
+    monkeypatch.delenv(TAH.ENV_MAX)
+    assert len(TAH.Hold(TAH.ToldView(s)).depths()) == 16
+
+
+def test_hitless_clear_is_an_extent_regression(monkeypatch, caplog):
+    r = _paced_rank(monkeypatch, "follower_kept")
+    req = type("Q", (), {"rid": "weg2-0-77"})()
+    with caplog.at_level(logging.WARNING):
+        TAH.report_extent(req, T)
+        TAH.report_extent(req, None)                       # y9d4c: hitless_clear, extent None
+    ws = [x.message for x in caplog.records if "EXTENT REGRESSED" in x.message]
+    assert len(ws) == 1 and "hitless_clear" in ws[0] and "rid=weg2-0-77" in ws[0]
+
+
+def test_q610_take_and_kept_are_named(monkeypatch, caplog):
+    monkeypatch.setenv(TAH.ENV, "0")                      # hold off: the walk TAKES the told anchor
+    r = _paced_rank(monkeypatch, "follower_kept")
+    r.nodes[T]._weg2_anchored = False
+    with caplog.at_level(logging.INFO):
+        r.c._weg2_dual_claim_room(UnifiedTreeNode(TC), r.pool)
+    takes = [x.message for x in caplog.records if "TOLD-ANCHOR-HOLD TAKE Q-610" in x.message]
+    assert any("depth=%d" % T in m and "standing_told_at_depth=True" in m for m in takes)
+    monkeypatch.delenv(TAH.ENV)
+    caplog.clear()
+    r2 = _paced_rank(monkeypatch, "follower_kept")
+    r2.nodes[T]._weg2_anchored = False
+    with caplog.at_level(logging.INFO):
+        r2.c._weg2_dual_claim_room(UnifiedTreeNode(TC), r2.pool)
+    assert any("TOLD-ANCHOR-HOLD KEPT" in x.message and "depth=%d" % T in x.message for x in caplog.records)
+

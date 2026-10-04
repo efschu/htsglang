@@ -1617,6 +1617,10 @@ def stamp_state_aligned_extent(req) -> Optional[int]:
             setattr(req, LOAD_BACK_EXTENT_ATTR, None)
         except Exception:  # noqa: BLE001 - never break a match walk
             pass
+        # y9d4c F3b: the anchor loss ran as hitless_clear (extent None), never as a smaller set
+        from sglang.srt.weg2 import dual_told_anchor_hold as _tah0
+
+        _tah0.report_extent(req, None)
         return None
     extent = state_aligned_load_back_len(req)
     try:

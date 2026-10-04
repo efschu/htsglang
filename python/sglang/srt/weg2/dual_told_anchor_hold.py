@@ -15,11 +15,14 @@ The told is PP0's decision, every rank admits at it, and an anchor the tree
 gave up in between is a shortfall no rank can repair (raenge-nie-uneins: the
 only safe form is that the tree does not give it up).
 
-THE HOLD. The registry is the scheduler's own told table
-(``scheduler._weg2_store_told``: rid -> told, written at PP0's publish and at
-the follower's absorb, popped at the admission, at ``Q-580 TOLD-FORGET`` and at
-the abort) -- no second lifecycle to keep in step: the entry is born and dies
-where the told is. The tree reads it through :class:`Hold` and excludes from
+THE HOLD. The registry is the UNION of the scheduler's own told records
+(:class:`ToldView`): ``_weg2_store_told`` (written at the Admit), and -- the
+paced/PF form of y9d4 (SGLANG_WEG2_TOLD_PACED=1) writes nothing else until the
+Admit -- ``_weg2_told_pacing`` (PP0, read-ahead published), ``_weg2_told_early``
+(follower, read-ahead absorbed) and ``_weg2_store_told_satisfied`` (follower held
+the span). They are born where the told is born (PP0's publish, the follower's
+absorb) and die together (the Admit pops them, ``Q-580 TOLD-FORGET`` / the abort
+drop all of ``_TOLD_RECORDS``) -- no second lifecycle to keep in step. The tree reads it through :class:`Hold` and excludes from
 every anchor-GIVING-UP decision the anchor whose END depth is a told of a
 request still standing between told and admission:
 
@@ -34,13 +37,15 @@ claim-time ``ARENA-DROP`` (stage i takes only slots NO reader references): the
 exemption at the three funnels IS the ARENA-DROP exemption -- the arena does
 not know trees, so a guard there would have to guess.
 
-RANK-UNIFORM BY CONSTRUCTION. The decision reads (a) the told table, whose
-order and content are the ring's -- PP0 publishes, every follower absorbs the
-same rid -> told in the same order -- (b) the node's END depth (inserts), and
+RANK-UNIFORM BY CONSTRUCTION. The decision reads (a) the told records, whose
+CONTENT is the ring's -- PP0 publishes, every follower absorbs the same
+rid -> told (the follower's record starts one ring hop after PP0's and ends one
+hop after PP0's Admit: at the start that is the one residual window, see the
+report; the MAX bound picks by (-told, rid), never by the rank-local dict order) -- (b) the node's END depth (inserts), and
 (c) a COUNT of cap runs (one per anchoring insert, the same step on every
 rank). No clock, no lock, no arena state, no rank-local copy. The two bounds
 against a standing block are counts too: at most ``MAX`` held anchors at once
-(the oldest told entries first, i.e. insertion order) and a hold lasts at most
+(by (-told, rid) -- content, never the rank-local order of a dict) and a hold lasts at most
 ``RUNS`` cap runs; past either the OLD way applies and a named WARNING says so.
 
 DEPTH-ONLY MATCH. The hold names a depth, not a node: a request's anchor at
@@ -70,7 +75,7 @@ logger = logging.getLogger(__name__)
 ENV = "SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD"
 ENV_MAX = "SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD_MAX"
 ENV_RUNS = "SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD_RUNS"
-DEFAULT_MAX = 8
+DEFAULT_MAX = 24
 DEFAULT_RUNS = 256
 MARKER = "#1400 TOLD-ANCHOR-HOLD"
 TAKES_KEEP = 64
@@ -96,6 +101,80 @@ def _int(env, name: str, default: int) -> int:
         return max(0, int((env.get(name, "") or "").strip() or default))
     except ValueError:
         return default
+
+
+#: the scheduler's told records a told lives in from PP0's publish to the admission, in
+#: priority order (the first record that names a rid wins -- all four carry the same value for
+#: one rid; the admitted table is the final one):
+#:   _weg2_store_told            rid -> told   PP0 at the Admit's publish, follower at the Admit's absorb
+#:   _weg2_told_pacing           rid -> _Pace  PP0 from the read-ahead's publish to the Admit (``.told``)
+#:   _weg2_told_early            rid -> told   follower from the read-ahead's absorb to the Admit's absorb
+#:   _weg2_store_told_satisfied  rid -> told   follower that held the told span locally, until admission
+#:   _weg2_told_kept             rid -> _Kept  y9d4c (75 % SM, 17 s in the queue): the adder's FIRST visit
+#:                                             (p_intake.told_admission) POPS the four records above and keeps
+#:                                             the verdict here (``.told``) until settle_told sees the rid
+#:                                             leave the queue -- on a follower nothing else stands then
+TOLD_RECORDS = ("_weg2_store_told", "_weg2_told_pacing", "_weg2_told_early", "_weg2_store_told_satisfied",
+                "_weg2_told_kept")
+
+
+class ToldView:
+    """Read-only, dict-like union of the scheduler's told records (:data:`TOLD_RECORDS`).
+
+    WHY NOT ``_weg2_store_told`` ALONE (reviewer, y9d4 paced/PF form, SGLANG_WEG2_TOLD_PACED=1):
+    the paced form writes ``_weg2_store_told`` only at the Admit. Between the read-ahead and the
+    Admit the told stands in ``_weg2_told_pacing`` (PP0) and ``_weg2_told_early`` /
+    ``_weg2_store_told_satisfied`` (follower) -- and the END-anchor insert of weg2-0-72 (the cap
+    run) fell INSIDE that window (P 29035 SATISFIED -> 29067 END-ANCHOR -> PACED-ADMIT ABSORBED
+    later). The records are looked up by NAME on every read (the scheduler creates the dicts
+    lazily). Their lifecycle is already one: ``_TOLD_RECORDS`` / Q-580 TOLD-FORGET drop all of them
+    when the request leaves the queue, the Admit pops pacing/early/satisfied."""
+
+    def __init__(self, scheduler) -> None:
+        self.scheduler = scheduler
+
+    def _merged(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for attr in TOLD_RECORDS:
+            d = getattr(self.scheduler, attr, None)
+            if not isinstance(d, dict):
+                continue
+            for rid, v in list(d.items()):
+                if rid in out:
+                    continue
+                t = getattr(v, "told", v)   # _Pace carries it as an attribute
+                try:
+                    out[rid] = int(t)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def items(self):
+        return list(self._merged().items())
+
+    def get(self, rid, default=None):
+        return self._merged().get(rid, default)
+
+    def __contains__(self, rid) -> bool:
+        return rid in self._merged()
+
+    def __iter__(self):
+        return iter(self._merged())
+
+    def __len__(self) -> int:
+        return len(self._merged())
+
+
+def view_of(scheduler) -> ToldView:
+    """The scheduler's one view (stable identity: ``attach`` is idempotent on it)."""
+    v = getattr(scheduler, "_weg2_told_view", None)
+    if v is None:
+        v = ToldView(scheduler)
+        try:
+            scheduler._weg2_told_view = v
+        except Exception:  # noqa: BLE001
+            pass
+    return v
 
 
 class Hold:
@@ -124,7 +203,12 @@ class Hold:
         mx = _int(self._env, ENV_MAX, DEFAULT_MAX)
         runs = _int(self._env, ENV_RUNS, DEFAULT_RUNS)
         out: Dict[int, List[str]] = {}
-        live = [(r, int(t)) for r, t in list(self.source.items()) if int(t) > 0]
+        # sorted DEEPEST told first, then rid: the records' own order is rank-local (PP0's pacing
+        # dict vs the follower's early dict), so the MAX bound picks by CONTENT, the same set on
+        # every rank -- and past MAX it is the SHALLOW (cheap to redo) anchors that fall out, never
+        # the deepest (y9d4c: queue 13-16, ascending order dropped the most expensive tolds)
+        live = sorted(((r, int(t)) for r, t in list(self.source.items()) if int(t) > 0),
+                      key=lambda x: (-x[1], x[0]))
         if tick:
             for stale in [r for r in self.age if r not in self.source]:
                 self.age.pop(stale, None)
@@ -175,28 +259,36 @@ class Hold:
 
     def check_extent(self, rid, extent: Optional[int]) -> bool:
         """``#1042 EXTENT`` stamp of ``rid``: WARN once per rid when it falls from
-        >= told to < told while the told still stands (told .. admission).
-        Returns True when it warned."""
+        >= told to < told while the told still stands (told .. admission). ``extent``
+        None = the ``hitless_clear`` form (y9d4c: the anchor was gone, the match found no
+        host hit, the stamp cleared instead of setting a smaller number) counts as a fall
+        to 0. Returns True when it warned."""
         rid = str(rid)
         told = self.source.get(rid)
-        if told is None or extent is None:
+        if told is None:
             self.last_extent.pop(rid, None)
             return False
         told = int(told)
         prev = self.last_extent.get(rid)
-        self.last_extent[rid] = int(extent)
+        now = 0 if extent is None else int(extent)
+        cleared = extent is None
+        if cleared:
+            self.last_extent.pop(rid, None)      # nothing stands any more; a later stamp re-arms
+        else:
+            self.last_extent[rid] = now
         if len(self.last_extent) > 4096:
             for r in [r for r in self.last_extent if r not in self.source]:
                 self.last_extent.pop(r, None)
-        if prev is None or prev < told or int(extent) >= told or ("ext", rid) in self._warned:
+        if prev is None or prev < told or now >= told or ("ext", rid) in self._warned:
             return False
         self._warned.add(("ext", rid))
         same = [t for t in self.takes if t[2] == told]
         recent = same or list(self.takes)[-4:]
         logger.warning(
-            "#1042 EXTENT REGRESSED rid=%s told=%d extent %d -> %d between told and admission "
+            "#1042 EXTENT REGRESSED rid=%s told=%d extent %d -> %s%s between told and admission "
             "(hold=%s): the anchor at %d was given up. Takes at that depth: %s%s",
-            rid, told, prev, int(extent), "on" if self.armed() else "OFF", told,
+            rid, told, prev, "None" if cleared else now, " (hitless_clear)" if cleared else "",
+            "on" if self.armed() else "OFF", told,
             ["%s node=%s depth=%s end_anchor=%s" % t for t in same] or "none recorded",
             "" if same else " ; last takes (other depths, or an unattributed path: ARENA-DROP / "
             "evict / LRU): %s" % (["%s node=%s depth=%s end_anchor=%s" % t for t in recent],))
