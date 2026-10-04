@@ -1099,6 +1099,53 @@ def admission_wedge_verdict(
     )
 
 
+PREFILL_LIVELOCK = "PREFILL-LIVELOCK"
+
+
+def prefill_livelock_verdict(
+    queued: int,
+    running: int,
+    seconds_since_decode: Optional[float],
+    seconds_since_prefill_progress: Optional[float],
+    threshold: float = ADMISSION_WEDGE_SECONDS,
+):
+    """``(alarm, detail)`` for Q-698b: requests RUN but get no token, while
+    the passes are short whole extends -- a prefill livelock.
+
+    The classic verdict above calls any running request "serving", and its
+    first-token clock is stamped by every prefill completion. On NF y9n
+    10032328 D (23:33:24-23:44:15Z) both were fooled: 3 requests running,
+    every pass a 53/61-token re-extend of a resumed SEAT-AGE victim (each one
+    commits an output token -> first-token clock fresh), 0 decode rounds for
+    11 min, no ADMISSION-WEDGE line. The honest clock is the DECODE round.
+
+    Alarm: queued > 0, running > 0, no decode round for >= ``threshold`` and
+    no MIDDLE prefill chunk either (a long chunked prefill starves decode by
+    construction while it stamps the chunk clock -- that is work, not a
+    livelock). ``seconds_since_decode`` None = this group never decoded
+    (P, a fresh D): no verdict.
+    """
+    q, r = int(queued), int(running)
+    if seconds_since_decode is None:
+        return False, "no decode round on this group yet: no prefill-livelock verdict"
+    if q <= 0 or r <= 0:
+        return False, f"queued {q}, running {r}: no prefill livelock"
+    dec = float(seconds_since_decode)
+    if dec < float(threshold):
+        return False, f"decode round {dec:.1f}s ago (< {float(threshold):.1f}s)"
+    if seconds_since_prefill_progress is not None and float(seconds_since_prefill_progress) < float(threshold):
+        return False, (
+            f"no decode round for {dec:.1f}s, but a middle prefill chunk completed "
+            f"{float(seconds_since_prefill_progress):.1f}s ago: a chunked prefill runs"
+        )
+    return True, (
+        f"{ADMISSION_WEDGE} {PREFILL_LIVELOCK}: {q} queued, {r} running, and NO decode round for "
+        f"{dec:.1f}s (>= {float(threshold):.1f}s) and no middle prefill chunk -- the passes are "
+        f"whole extends whose requests never decode (first-token clock is stamped by every "
+        f"re-extend, so the classic verdict reads this as serving)"
+    )
+
+
 #: #699 wiring: how often the admission-wedge watchdog polls scheduler state.
 #: Half the alarm threshold, matching the existing forward_ct watchdog's own
 #: poll-vs-timeout ratio (see WatchdogRaw._watchdog_once), so the alarm is
@@ -1210,6 +1257,20 @@ def check_admission_wedge_once(
             scheduler._wedge_class_sample = None
     if alarm and log_on_alarm:
         logger.error(detail)
+    if not alarm and not getattr(scheduler, "weg2_dormant", False):
+        # Q-698b: REPORT ONLY. The recovery driver (corridor relief) stays on
+        # the classic alarm -- relief frees memory, a livelock is a policy loop.
+        decode_stamp = getattr(scheduler, "last_decode_progress_time", None)
+        live, live_detail = prefill_livelock_verdict(
+            queued,
+            running,
+            None if decode_stamp is None else now - decode_stamp,
+            seconds_since_prefill_progress,
+        )
+        if live:
+            detail = f"{detail} | {live_detail}"
+            if log_on_alarm:
+                logger.error(live_detail)
     return alarm, detail
 
 
