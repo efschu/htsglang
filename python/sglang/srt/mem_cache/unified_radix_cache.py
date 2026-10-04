@@ -4569,6 +4569,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
                     if _sf.unbacked_drop_allowed(self, node):
                         self._ud_drop_unbacked_leaf(node, tracker)
+                    elif getattr(self, "_weg2_dual_d_drop_order", False) and self._ud_dual_d_order_drop(
+                        node, tracker
+                    ):
+                        pass
                     else:
                         # Q-1500 (V1, dual P only; None everywhere else): the leaf
                         # carries host-only children (y9d3 P PP0: 14 refusals on node
@@ -4621,6 +4625,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
         self._evict_to_host(node, tracker)
+
+    def _ud_dual_d_order_drop(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> bool:
+        """#1390f: dual D only, only while the D tick's group-uniform drop order is set
+        (``dual_d_unbacked_drop``): drop an un-backed childless unlocked leaf. False = not dropped."""
+        from sglang.srt.weg2 import dual_d_unbacked_drop as _ud
+
+        if not _ud.drop_order_allows(self, node):
+            return False
+        before = tracker.get(BASE_COMPONENT_TYPE, 0)
+        self._ud_drop_unbacked_leaf(node, tracker)
+        _ud.note_drop(self, tracker.get(BASE_COMPONENT_TYPE, 0) - before)
+        return True
 
     def _ud_drop_unbacked_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]

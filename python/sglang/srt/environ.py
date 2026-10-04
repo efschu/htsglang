@@ -696,6 +696,12 @@ class Envs:
     # 5 s per rank and marker, no collective, no behaviour. Inert outside SGLANG_WEG2_DUAL_LAYOUT=1
     # (either group with its KV cap); 0 = no line, no cost.
     SGLANG_WEG2_DUAL_PKVWAIT_INSTR = EnvBool(True)
+    # #1390f UNBACKED-DROP (y9d4d/B9, desk analysis 1390 Fix 2): dual D only. DEFAULT OFF = the old code
+    # path byte for byte. On: while P waits for its card >= DROP_WAIT_S, the D group has no demand and no
+    # hold and the shared arena refused a claim recently, D's cache yield drops un-backed childless leaves
+    # (group-uniform order on the tick collective; a parked/held request blocks it).
+    SGLANG_WEG2_DUAL_D_UNBACKED_DROP_ON_WAIT = EnvBool(False)
+    SGLANG_WEG2_DUAL_D_UNBACKED_DROP_WAIT_S = EnvFloat(8.0)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,

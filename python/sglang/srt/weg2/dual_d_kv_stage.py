@@ -464,7 +464,7 @@ def _instr_shrink_blocked(sched, actor, reason: Optional[str], need: int, floor:
         logger.debug("%s shrink_blocked census failed", _pi.MARK, exc_info=True)
 
 
-def cache_yield(sched, actor, live: Optional[Tuple[int, float]] = None) -> int:
+def cache_yield(sched, actor, live: Optional[Tuple[int, float]] = None, drop_order: float = -1.0) -> int:
     """Evict D's whole EVICTABLE device cache (unlocked nodes only -- a live
     seat's rows are locked and stay). Backed prefixes keep their L2 copy.
     Metal dual13 (3q33cu): D held 65536 mapped rows of cache with 0 running and
@@ -485,7 +485,15 @@ def cache_yield(sched, actor, live: Optional[Tuple[int, float]] = None) -> int:
         return 0
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-    tree.evict(EvictParams(num_tokens=ev))
+    if drop_order >= 0.0:
+        # #1390f: group-uniform order of the D tick (dual_d_unbacked_drop); never on the live/hold path
+        from sglang.srt.weg2 import dual_d_unbacked_drop as _ud
+
+        n_leaves, n_tok = _ud.evict_with_order(tree, EvictParams(num_tokens=ev))
+        if n_leaves:
+            _ud.log_drop(actor, n_leaves, n_tok, float(drop_order), _arena_fill(), _pk._now())
+    else:
+        tree.evict(EvictParams(num_tokens=ev))
     _instr_cache_yield(tree, actor, ev, live)
     t = _pk._now()
     if live is not None:
@@ -519,6 +527,15 @@ def _arena_census() -> Tuple[int, int]:
             _pinned, _refs, complete = arena.ref_census()
             return int(complete), int(arena.slots)
     return 0, 0
+
+
+def _arena_fill() -> float:
+    """COMPLETE slots / slots of the arena ``_arena_census`` reads (0.0 without one); log field only."""
+    try:
+        complete, slots = _arena_census()
+        return float(complete) / float(slots) if slots else 0.0
+    except Exception:  # noqa: BLE001 -- a log field never breaks the yield
+        return 0.0
 
 
 def publish_d_signal(sched, actor) -> None:
@@ -560,6 +577,33 @@ def _note_shrink_blocked(actor, reason: Optional[str], need: int, floor: int, p_
     logger.info("%s %s reason=%s mapped=%d need=%d live_floor=%d p_wait_s=%.1f: P waits for a card and D "
                 "maps more than its work needs, the shrink cannot go now (Q-696)", MARK, SHRINK_BLOCKED_MARK,
                 reason, actor.mapped_tokens, int(need), int(floor), float(p_wait_s))
+
+
+def _drop_order_extra(actor) -> list:
+    """#1390f: the extra collective element (this rank's proposal of the LAST tick, MAX over the ranks);
+    empty with the switch off = the collective is the old one."""
+    from sglang.srt.weg2 import dual_d_unbacked_drop as _ud
+
+    if not _ud.switch_on():
+        return []
+    return [-int(bool(getattr(actor, "_drop_propose", False)))]
+
+
+def _drop_order_step(actor, g, arena_need: int, p_waiting: bool, p_wait_s: float, holds: bool) -> bool:
+    """#1390f: (1) the group value of the proposal element = the order of THIS tick, identical on every
+    rank; (2) this rank's proposal for the NEXT tick from group values only. Switch off: False, no state."""
+    from sglang.srt.weg2 import dual_d_unbacked_drop as _ud
+
+    if not _ud.switch_on():
+        return False
+    order = len(g) > 10 and -int(g[10]) > 0
+    t = _pk._now()
+    if arena_need > 0:
+        actor._arena_refused_t = t
+    last = getattr(actor, "_arena_refused_t", None)
+    arena_recent = last is not None and t - float(last) <= _ud.ARENA_RECENT_S
+    actor._drop_propose = _ud.propose(p_waiting, p_wait_s, -int(g[3]), holds, arena_recent, _ud.wait_s())
+    return order
 
 
 def tick(sched) -> Optional[str]:
@@ -608,7 +652,8 @@ def tick(sched) -> Optional[str]:
     # SAME collective -- every rank decides on the same numbers
     g = actor.gmin([-int(want_local), -int(p_wait_local), -int(live_local), -int(demand_local),
                     -int(p_missing_local), int(d_avail_rows(sched, actor)), -int(d_holds(sched)),
-                    -int(p_wait_ms_local), -int(recent_grow_local), -int(arena_need_local)])
+                    -int(p_wait_ms_local), -int(recent_grow_local), -int(arena_need_local)]
+                   + _drop_order_extra(actor))
     arena_need = max(0, -int(g[9])) if len(g) > 9 else 0
     if arena_need > 0:
         _das.d_yield_arena(sched, arena_need)
@@ -621,11 +666,12 @@ def tick(sched) -> Optional[str]:
     want = floor_want(want, actor.mapped_tokens, avail_min, air, actor.step, -int(g[3]))
     need, freed = want, 0
     live_due = p_waiting and live_yield_due(p_wait_s, live_yield_wait_s())
+    drop_ord = _drop_order_step(actor, g, arena_need, p_waiting, p_wait_s, holds)
     if p_waiting and -int(g[3]) == 0:
         # the GROUP has no running or waiting request and P waits: D's cached
         # prefix is not demand (user rule) -- every rank gives it up alike, the
         # next tick's live floor lets the shrink through
-        cache_yield(sched, actor)
+        cache_yield(sched, actor, drop_order=(p_wait_s if (drop_ord and not holds) else -1.0))
     elif live_due and not holds:
         # Q-696: D runs work, P has waited for a card past the bound -- the cache
         # is still not demand. Unlocked nodes only (a running seat's rows are
