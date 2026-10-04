@@ -19905,6 +19905,12 @@ class Scheduler(
         # published while D has nothing to run (replicated gate, no clock).
         _weg2_flush_nonblock.idle_publish(self)
         if not self.is_fully_idle():
+            # Q-697b (dual P only, returns at once elsewhere): the queue holds
+            # nothing but legs that wait for their card grant -- they hold no KV
+            # here, so the context goes back to the card pool as at full idle
+            from sglang.srt.weg2 import dual_grant_wait as _dgw_697b
+
+            _dgw_697b.release_for_grant_waiters(self)
             # #547: no batch to run, but work is queued somewhere (waiting
             # queue, grammar, disagg, hicache drain). That is the loaded path
             # as far as the idle poll is concerned -- back to the zero-poll rung.

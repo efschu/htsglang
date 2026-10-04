@@ -1164,7 +1164,12 @@ def _dual_kv_retry(scheduler) -> None:
     again; granted ones register their store read exactly as intake would."""
     held: Dict[str, Any] = scheduler._weg2_store_held
     waiting = [r for r in held.values() if getattr(r, "_dual_kv_wait", False)]
+    from sglang.srt.weg2 import dual_grant_wait as _dgw
+
     if not waiting:
+        # Q-697b: clears the waiters' marker once; a no-op in a process that
+        # never named a waiter (every flip / INT8 / NF form)
+        _dgw.publish(scheduler, ())
         return
     from sglang.srt.weg2 import dual_p_kv_stage as _dpk
 
@@ -1174,6 +1179,9 @@ def _dual_kv_retry(scheduler) -> None:
             scheduler._prefetch_kvcache(req)
             if getattr(scheduler, "_weg2_told_paced_on", False):
                 _pace_intake_t(scheduler).setdefault(_rid(req), _clock())
+    # Q-697b: the legs still held for their grant AFTER this pass's retries --
+    # the front does not pause them, the followers release for them
+    _dgw.publish(scheduler, [_rid(r) for r in waiting if getattr(r, "_dual_kv_wait", False)])
 
 
 def pp0_publish(scheduler, recv_reqs: List) -> List:

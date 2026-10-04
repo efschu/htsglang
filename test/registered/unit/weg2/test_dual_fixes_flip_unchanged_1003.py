@@ -23,6 +23,8 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
   Q-695  #791T probe old-instance chunk / old chunk abort store release / #791C new-instance named
   Q-697  follower waiting abort whose told rode the same PP0 list (weg2.dual_untold_abort)
   Q-697c W3 arena spill: anchor pool of the hybrid group + host-only H-leaves (weg2.dual_arena_spill)
+  Q-697b GRANT-WAIT: P release with only grant-waiting legs queued / front pause skip / PP0 grant hold
+         (weg2.dual_grant_wait; the behavioural half is test_weg2_q697b_dual_grant_wait_1004)
   Q-696  D live cache yield + regrow hold (D tick without the dual actor) / front INTAKE-STALL
          card WAIT (drain ends as before) and STALL-BYPASS / wedge class P-KV-WAIT (no post skip)
   Q-800  DUAL-SHARE: PP0 chunk cap, share duty, D capture priority, MPS client priority,
@@ -914,3 +916,54 @@ class TestQ1190DArenaYieldFlipUnchanged:
         assert src.index("if actor is None:") < src.index("_das.d_take_need(sched)")
         sched = SimpleNamespace(tp_worker=SimpleNamespace(model_runner=SimpleNamespace()))
         assert DDK.tick(sched) is None
+
+
+# ---------------------------------------------------------------------------------- Q-697b
+
+class TestQ697bFlipUnchanged:
+    """Q-697b: P's release for grant-waiting legs, the front's pause skip and PP0's grant hold are dual
+    group-P only (weg2/dual_grant_wait.py). Nothing -- scheduler attribute, marker file, ledger -- is read
+    or written off the gate. The behavioural half (the real Scheduler.on_idle with a waiter queued and a
+    marker naming it keeps the mapping, no idle stamp, PP0's grant ignores D's demand) is
+    test_weg2_q697b_dual_grant_wait_1004.test_flip_unchanged_*."""
+
+    ENVS = [{}, {"SGLANG_WEG2_GROUP": "P"}, {"SGLANG_WEG2_DUAL_LAYOUT": "1"},
+            {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "D"},
+            {"SGLANG_WEG2_DUAL_LAYOUT": "0", "SGLANG_WEG2_GROUP": "P"},
+            {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P", "SGLANG_WEG2_DUAL_GRANT_WAIT": "0"}]
+
+    def test_release_publish_and_hold_read_nothing_off_the_gate(self, tmp_path, monkeypatch):
+        from sglang.srt.weg2 import dual_grant_wait as G
+
+        monkeypatch.setenv("SGLANG_WEG2_P_READ_STATE_DIR", str(tmp_path))
+        G._reset_for_tests()
+
+        class Boom:  # any attribute read past the gate raises
+            def __getattr__(self, name):
+                raise AssertionError("read %s off the gate" % name)
+
+        for env in self.ENVS:
+            assert G.release_for_grant_waiters(Boom(), env) == 0, env
+            assert G.publish(Boom(), ["weg2-0-44"], env=env) is False, env
+            assert G.grant_held_by_d(Boom(), [Boom()], env=env) is None, env
+        assert G.publish(Boom(), ()) is False          # a process that never named a waiter: first line
+        assert list(tmp_path.iterdir()) == []
+
+    def test_the_flip_front_never_opens_the_marker(self, tmp_path, monkeypatch):
+        from sglang.srt.weg2 import dual_grant_wait as G
+
+        monkeypatch.setenv("SGLANG_WEG2_P_READ_STATE_DIR", str(tmp_path))
+        f = _front(dual=False)
+        assert G.front_skip_set(f) == frozenset()
+        assert not hasattr(f, "_dual_gw_state")
+
+    def test_the_idle_hook_and_the_retry_publish_sit_behind_the_gate(self):
+        from sglang.srt.managers import scheduler as _SC
+
+        src = inspect.getsource(_SC.Scheduler.on_idle)
+        assert "release_for_grant_waiters(self)" in src
+        g = inspect.getsource(__import__("sglang.srt.weg2.dual_grant_wait", fromlist=["x"]).release_for_grant_waiters)
+        assert g.index("if not dual_p(env):") < g.index("_actor(sched)")
+        r = inspect.getsource(ST._dual_kv_retry)
+        assert r.index("if not waiting:") < r.index("pp0_grant") and "_dgw.publish(scheduler, ())" in r
+

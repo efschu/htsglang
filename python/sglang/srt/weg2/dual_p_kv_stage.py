@@ -699,6 +699,17 @@ def pp0_grant(sched, req) -> Optional[int]:
     if older and not _dpar.grant_may_bypass([t for _r, t in older], now=_now(), age_s=_dpar.head_age_s()):
         _log_wait(rid, tokens)
         return 0
+    # Q-697b GRANT HOLD (dual P only): while a card shows D's unmet demand or a pressure
+    # on P, no grant -- the bytes P released at idle-except-waiters are D's first. The
+    # front's own gate for a PAUSED head is p_resume_ready; a waiter the front no longer
+    # pauses needs the same one here (bounded by SGLANG_WEG2_DUAL_GRANT_HOLD_S).
+    from sglang.srt.weg2 import dual_grant_wait as _dgw
+
+    _hold = _dgw.grant_held_by_d(req, stages) if _dual_layout_env() else None
+    if _hold is not None:
+        _dgw.note_hold(rid, _hold, req)
+        _log_wait(rid, tokens)
+        return 0
     own = int(getattr(actor, "_committed", 0) or 0)    # PP0's card: the ledger covers its mapping exactly
     taken: list = []
     lvl = group_grant(stages, tokens, lambda pth: CardKvLedger(pth, "P"), covered={0: own}, taken_out=taken)
@@ -1123,6 +1134,12 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
     if req is None and not held:
         sched._dual_abort_seen = None
         return False
+    if held:
+        # Q-697b: a held abort whose rid PP0 holds again for its grant is not applied now
+        from sglang.srt.weg2 import dual_grant_wait as _dgw
+
+        if _dgw.same_rid_waits(sched, held):
+            return False
     t = _t.time() if now is None else float(now)
     seen = getattr(sched, "_dual_abort_seen", None)
     if seen is None or seen[0] is not req or not set(held) <= set(seen[2]):

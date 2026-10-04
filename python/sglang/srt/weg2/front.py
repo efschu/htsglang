@@ -15790,8 +15790,18 @@ class Front:
         PP rank; P stops at its next chunk boundary -- the finished chunks are
         in L2 by the per-chunk write-through). ``one`` requeues the request at
         the head without failing it: it stays in leg 1, no W50, no 503."""
+        # Q-697b (dual layout only, this method already is): a leg PP0 holds for its card
+        # grant keeps no KV on P -- pausing it frees nothing and starts the abort / requeue /
+        # RESUME-WAIT / resend loop (weg2-0-44: 181-184 s). P gives its context back at
+        # idle-except-waiters (dual_grant_wait.release_for_grant_waiters) instead.
+        from sglang.srt.weg2 import dual_grant_wait as _dgw
+
+        _skip = _dgw.front_skip_set(self)
         for rid, p in list(self._dual_inflight.items()):
             if getattr(p, "dual_pause", False):
+                continue
+            if _skip and str(rid) in _skip:
+                _dgw.note_skip(self, str(rid), pressure)
                 continue
             p.dual_pause = True
             self.counters["dual_p_pauses"] += 1
