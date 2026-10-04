@@ -205,10 +205,21 @@ def d_cap(slots: int) -> int:
     return max(0, int(slots) - 2 * p_room(slots))
 
 
-def d_release_need(*, slots: int, pinned: int, d_held: int) -> int:
+def d_release_need(*, slots: int, pinned: int, d_held: int, stale: int = 0) -> int:
     """How many of its references D gives back now: down to its cap, and at
-    least enough that P finds `p_room` unpinned slots (when D holds that many)."""
+    least enough that P finds `p_room` unpinned slots (when D holds that many).
+
+    `stale` (#1500a ANCHOR-AGING, default 0 = the Q-650 rule unchanged): the
+    references the aging pass gives back in this very tick. They are already
+    gone from the reading, so the cap and the room are asked of what is left:
+    `d_held - stale` held, `pinned - stale` pinned (one slot per reference, the
+    D ranks releasing the same set). The result is the need of the regular
+    LRU pass that follows the aging pass -- aging never adds on top of a need
+    it already covered."""
     slots, pinned, d_held = int(slots), int(pinned), int(d_held)
+    stale = max(0, min(int(stale), d_held))
+    d_held -= stale
+    pinned = max(0, pinned - stale)
     if slots <= 0 or d_held <= 0:
         return 0
     over_cap = max(0, d_held - d_cap(slots))
@@ -232,6 +243,127 @@ def d_release_pass(candidates, *, need: int, releasable, release, age) -> int:
         release(node)
         done += 1
     return done
+
+
+# -- #1500a ANCHOR-AGING (group D of the dual layout, env-gated, default OFF) -----
+# Dual 1650 (ed0803afa6, 16:50-17:03, deskq/done/1500-anchor-lebensdauer.md): the
+# mamba arena was complete 111-112/112 from 16:57 and 95-111 pinned; D's tree held
+# 84-98 anchors (6.1-7.3 GiB). Q-650 is count-based (cap 84 of 112, or fewer than
+# p_room=14 unpinned slots): there is no age, an idle anchor stays pinned for
+# ever, and P paid 15x ARENA-DROP freed=0 / 11x BACKUP-REFUSED why=mamba_claim.
+#
+# THE RULE: an anchor node that no match has touched for more than N D-ticks is
+# STALE; every tick D gives the stale anchors' references back (the soft
+# release of Q-650: tombstone the host value, free the reference, the slot stays
+# COMPLETE and findable by stem until a P claim needs it -- nothing is deleted),
+# oldest first. A stale slot is exactly what the claim's room-making
+# (``_evict_for_claim`` stage i: unreferenced COMPLETE slots) may take; the
+# slots of anchors a hit refreshed stay referenced.
+#
+# AGE IS A COUNT, NEVER A CLOCK. The D ranks run the same matches and inserts, so
+# their trees, ``last_access_time`` values (a logical counter) and HICACHE round
+# counters (``_1028_round``) are replicas -- the same premise Q-650 stands on.
+# The age is stamped ON THE NODE as ``(last_access_time seen, tick of the first
+# tick that saw it)``; a changed ``last_access_time`` (any match through the node,
+# any insert) restamps. tick = ``_1028_round // D_TICK_ROUNDS``. The decision is a
+# pure function of (stamps, tick, N): no wall clock, no arena header read, no
+# per-rank file -- every rank releases the same set at the same round (a rank
+# that released something its peers kept would resolve a different resume depth:
+# the rank-divergence crash class). The `releasable` guard is Q-650's own.
+#
+# TICK RATE (measured, D logs of 1004 16:50 / 15:35 / 14:20, '#1028 HICACHE-ROUND'
+# n over wall time): 4-28 rounds/s on D, typically 6-24 -- NOT the ~300/s the
+# D_TICK_ROUNDS comment assumes. One tick = 256 rounds = ~9-60 s (typical 11-43 s;
+# Q-650 tick gaps seen 37-61 s under load). N = 40 ticks therefore means >= 6 min
+# even at the fastest measured rate (28/s), ~8.5 min at 20/s, ~19-28 min under
+# load (6-9/s): an agent turn gap of 2-5 min is never stale at any measured rate.
+# Lower N only knowing the rate of the boot at hand.
+
+MARKER_AGING = "#1500a ANCHOR-AGING"
+AGING_TICKS_DEFAULT = 40
+_TRUE = ("1", "true", "yes", "on")
+
+
+def aging_armed(env=None) -> bool:
+    """Group D of the dual layout AND the Q-610/Q-650 switch AND
+    SGLANG_WEG2_DUAL_ANCHOR_AGING (EnvBool, default OFF). Anything unreadable = off."""
+    e = os.environ if env is None else env
+    try:
+        if not armed_d(e):
+            return False
+        return str(e.get("SGLANG_WEG2_DUAL_ANCHOR_AGING", "") or "").strip().lower() in _TRUE
+    except Exception:  # noqa: BLE001 -- default OFF
+        return False
+
+
+def aging_ticks(env=None) -> int:
+    """N: ticks without a hit before an anchor is stale (SGLANG_WEG2_DUAL_ANCHOR_AGING_TICKS,
+    default 40, at least 1; garbage = the default)."""
+    e = os.environ if env is None else env
+    try:
+        n = int(str(e.get("SGLANG_WEG2_DUAL_ANCHOR_AGING_TICKS", "") or AGING_TICKS_DEFAULT).strip())
+    except (TypeError, ValueError):
+        return AGING_TICKS_DEFAULT
+    return max(1, n)
+
+
+def aging_scan(nodes, *, tick: int, ticks_n: int, lat=None) -> list:
+    """Stamp every node of `nodes` (D's arena-backed tree nodes) and return the
+    STALE ones, oldest first. A node's stamp is ``(last_access_time, tick)`` of
+    the first tick that saw that ``last_access_time``; stale = unchanged for more
+    than `ticks_n` ticks (``tick - stamped > ticks_n``). A first sight is never stale."""
+    lat = lat or (lambda n: n.last_access_time)
+    tick, ticks_n = int(tick), int(ticks_n)
+    stale = []
+    for n in nodes:
+        cur = lat(n)
+        st = getattr(n, "weg2_age_stamp", None)
+        if st is None or st[0] != cur:
+            n.weg2_age_stamp = (cur, tick)
+            continue
+        if tick - st[1] > ticks_n:
+            stale.append(n)
+    stale.sort(key=lat)
+    return stale
+
+
+def aging_pass(stale, *, releasable, release, lat=None) -> list:
+    """Soft-release every stale node `releasable(node)` allows (a running request,
+    a write in flight, a host lock, a standing told: never). Returns the nodes
+    released; their stamp is cleared (a re-adopted anchor starts fresh)."""
+    lat = lat or (lambda n: n.last_access_time)
+    done = []
+    for n in sorted(stale, key=lat):
+        if not releasable(n):
+            continue
+        release(n)
+        try:
+            n.weg2_age_stamp = None
+        except Exception:  # noqa: BLE001
+            pass
+        done.append(n)
+    return done
+
+
+_NA = [0]
+_AGING_FIRST = [True]
+
+
+def log_aging(*, stale: int, soft_released: int, anchors: int, pinned: int, slots: int, ticks_n: int) -> None:
+    """One line per tick that found or released a stale anchor (the first 64, then every
+    64th) and the first tick ever (proof of life)."""
+    first = _AGING_FIRST[0]
+    _AGING_FIRST[0] = False
+    if not (stale or soft_released or first):
+        return
+    _NA[0] += 1
+    n = _NA[0]
+    if first or n <= 64 or n % 64 == 0:
+        logger.info(
+            "%s stale=%d soft_released=%d anchors=%d pinned=%d/%d ticks_n=%d (n=%d; anchors with no "
+            "hit for more than ticks_n D ticks gave their reference back, the slots stay COMPLETE until "
+            "a claim needs them -- aged by rank-lockstep tick count, never wall time)",
+            MARKER_AGING, stale, soft_released, anchors, pinned, slots, ticks_n, n)
 
 
 def _tag(env=None) -> str:

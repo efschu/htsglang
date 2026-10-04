@@ -654,6 +654,12 @@ class Envs:
     # The pages stay COMPLETE in the arena until a claim needs their slot.
     # Inert outside SGLANG_WEG2_DUAL_LAYOUT=1 + SGLANG_WEG2_GROUP=P.
     SGLANG_WEG2_ENABLE_DUAL_ANCHOR_RELEASE = EnvBool(True)
+    # #1500a ANCHOR-AGING (weg2/dual_anchor_release.py, dual layout group D only, needs the switch
+    # above): D gives anchors no match touched for more than ..._TICKS D ticks (256 HICACHE rounds
+    # each, ~9-60 s; counted, never wall time) back softly. Default OFF; TICKS default 40 (>= 6 min
+    # at the fastest measured D round rate).
+    SGLANG_WEG2_DUAL_ANCHOR_AGING = EnvBool(False)
+    SGLANG_WEG2_DUAL_ANCHOR_AGING_TICKS = EnvInt(40)
     # told-anchor hold (y9d4, weg2/dual_told_anchor_hold.py): dual group P keeps the anchor a
     # standing told names from told to admission (cap / Q-610 / inner release skip it). 0 = off.
     SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD = EnvBool(True)
