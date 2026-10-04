@@ -439,6 +439,14 @@ class DeterminismFacts:
     #: CUDA capability per TP rank as major*10+minor, e.g. (120, 86, 86).
     #: Empty means "no CUDA ranks resolved" (CPU boot, or probing deferred).
     rank_archs: Tuple[int, ...] = ()
+    #: Whether the installed sgl_kernel wheel carries ``code=sm_89`` SASS
+    #: (``utils/wheel_sass.wheel_carries_sass((8, 9))``): True = it does, False
+    #: = demonstrably not, None = unknown. Only read for an sm89 rank. An sm89
+    #: rank WITHOUT that SASS takes the FP8-SM89-FALLBACK, i.e. the same
+    #: ``gptq_marlin_gemm`` an sm80..88 rank runs (SM89-DURCHSPIEL-1002 /
+    #: fp8_utils.can_auto_enable_marlin_fp8), so unknown counts as "no SASS":
+    #: the conservative route, as in fp8_utils.
+    wheel_sm89_sass: Optional[bool] = None
     tp_size: int = 1
     pp_size: int = 1
     dp_size: int = 1
@@ -474,7 +482,16 @@ class DeterminismFacts:
 
     @property
     def has_sm8x_rank(self) -> bool:
-        return any(80 <= a < 89 for a in self.rank_archs)
+        """A rank whose fp8 GEMM is the Marlin kernel: sm80..88, and (HW-P1
+        1301) an sm89 rank whose wheel carries no sm_89 SASS -- the same rule as
+        ``fp8_utils.deterministic_fp8_marlin_disabled``. An sm89 rank WITH the
+        SASS keeps CUTLASS and is outside the #190 exclusion; sm86 and sm120
+        decide here exactly as before."""
+        return any(80 <= a < 89 for a in self.rank_archs) or self.has_sm89_marlin_rank
+
+    @property
+    def has_sm89_marlin_rank(self) -> bool:
+        return 89 in self.rank_archs and self.wheel_sm89_sass is not True
 
 
 @dataclass(frozen=True)
@@ -673,6 +690,15 @@ def resolve_certificate(facts: DeterminismFacts) -> Certificate:
 
     if facts.has_fp8_weights and facts.has_sm8x_rank:
         exclusions.append(EXCLUSION_LIBRARY["fp8_marlin_sm8x"])
+        if facts.has_sm89_marlin_rank:
+            notes.append(
+                "fp8_marlin_sm8x also covers the sm89 rank(s) of this group: the "
+                "installed sgl_kernel wheel "
+                + ("carries no" if facts.wheel_sm89_sass is False else "was not shown to carry")
+                + " sm_89 SASS, so their fp8 GEMM is the same gptq_marlin_gemm "
+                "(FP8-SM89-FALLBACK) the sm80..88 statement is about. A wheel built "
+                "with 86;89;120a moves them to CUTLASS and out of this exclusion."
+            )
         if facts.has_fp8_moe_experts or facts.has_fbgemm_fp8:
             exclusions.append(EXCLUSION_LIBRARY["fp8_marlin_uncovered_paths"])
             # These layers have no deterministic route on this architecture at
@@ -782,7 +808,21 @@ def facts_from_server_args(
         sync_sampled_tokens=_sync_sampled_tokens_enabled(),
         cuda_graph_enabled=not bool(_get("disable_cuda_graph", False)),
         radix_cache_enabled=not bool(_get("disable_radix_cache", False)),
+        wheel_sm89_sass=_wheel_sm89_sass(rank_archs),
     )
+
+
+def _wheel_sm89_sass(rank_archs: Sequence[int]) -> Optional[bool]:
+    """The wheel fact the sm89 case needs, probed ONLY when a rank is sm89 --
+    a group without one never touches the wheel (sm86/sm120 byte-identical)."""
+    if 89 not in tuple(rank_archs):
+        return None
+    try:
+        from sglang.srt.utils import wheel_sass
+
+        return wheel_sass.wheel_carries_sass((8, 9))
+    except Exception:  # noqa: BLE001 -- unknown = conservative (Marlin route)
+        return None
 
 
 def _sync_sampled_tokens_enabled() -> bool:

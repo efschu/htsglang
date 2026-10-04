@@ -110,7 +110,26 @@ _SM120_ROWS_CONFIGS = [
     (512, (32, 4, 2)),
     (float("inf"), (64, 8, 2)),
 ]
-_ARCH_ROWS_DEFAULTS = {120: _SM120_ROWS_CONFIGS}
+
+# HW-P1 1301 (SM89-DURCHSPIEL-1002 row "QSA SGLANG_FORCE_QSA_ROWS_CONFIG"): an
+# sm_89 card (Ada) had NO entry here, so its rows launches took the device-
+# NAME keyed L20 table, i.e. the same (16, 1, 2) above 512 rows that H58/H101
+# measured as a spilling build on sm86 and sm120, and the release profiles'
+# D form only names an ``sm120:`` group. Offline compile (Triton 3.6.0,
+# ptxas 12.8, no GPU, head_dim 256, 16 q / 2 kv heads, fp8 pool, FP8_DECODE=0,
+# cuobjdump -res-usage): sm89 (16,1,2) REG 255 / STACK 472 -- bit for bit the
+# sm86 build (REG 255 / STACK 472); (32,8,2) REG 173 / STACK 0, (64,8,2)
+# REG 184 / STACK 0, (32,4,2) REG 207 / STACK 0, again equal to sm86. So the
+# sm89 default is the H101 table: ONLY the above-512-rows entry is replaced,
+# by the (64, 8, 2) build the P stages already run on the sm86 3080s via
+# ``inf=64/8/2`` (same ISA family, same SASS shape). Every band up to 512 rows
+# keeps its L20 build. What this does NOT settle is the speed: occupancy and
+# latency of (64,8,2) on a real Ada part need one A/B at the metal
+# (``SGLANG_FORCE_QSA_ROWS_CONFIG=sm89:...`` still wins over this default).
+# sm86 is unchanged on purpose (its P ranks run the arm's override, its D
+# ranks do not attend under Form A); so is sm120.
+_SM89_ROWS_CONFIGS = _SM120_ROWS_CONFIGS
+_ARCH_ROWS_DEFAULTS = {120: _SM120_ROWS_CONFIGS, 89: _SM89_ROWS_CONFIGS}
 
 
 def _device_arch() -> int:
@@ -122,8 +141,9 @@ def _device_arch() -> int:
 
 def rows_table_for_arch(arch: int):
     """The rows kernel's default (limit, (block_n, warps, stages)) table for
-    ``arch`` when no env override names it: H101's spill-free sm120 table, else
-    ``None`` (= the device-name keyed H20/L20 table of ``_get_best_config``)."""
+    ``arch`` when no env override names it: H101's spill-free sm120 table (and
+    the same table for sm89, HW-P1 1301), else ``None`` (= the device-name keyed
+    H20/L20 table of ``_get_best_config``)."""
     return _ARCH_ROWS_DEFAULTS.get(int(arch))
 
 
