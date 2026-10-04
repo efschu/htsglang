@@ -182,6 +182,14 @@
     }
     return `<details class="pf-fold" data-fold="models" ${isOpen("models", false) ? "open" : ""}><summary><b>Modell</b> · was steckt im Checkpoint? (Modellprofil am Schreibtisch schätzen)</summary>${body}${res}</details>`;
   }
+  // PROFIL-EDITOR S2 (Auftrag 950/1430): das Hardwareprofil lebt in einem eigenen Knoten, der bei jedem draw() wieder in den Reiter gehängt wird
+  // (root.innerHTML wird ersetzt; HwProfil.mount hängt seine Ereignisse an den Knoten, nicht an root)
+  let hwEl = null;
+  function drawHardware() {
+    if (!window.HwProfil) return "";
+    if (!hwEl) { hwEl = document.createElement("div"); window.HwProfil.mount(hwEl); }
+    return `<details class="pf-fold" data-fold="hw" ${isOpen("hw", false) ? "open" : ""}><summary><b>Hardware</b> · Karten und Messwerte (Hardwareprofil lesen, im gebuchten gpuq-Fenster messen)</summary><div id="pf-hwroot"></div></details>`;
+  }
   function drawExport() {
     const x = st.exp;
     if (!x) return "";
@@ -221,8 +229,11 @@
     root.innerHTML = `${top}${tip}${st.err ? `<div class="kp-verdict bad">${esc(st.err)}</div>` : ""}${st.msg ? `<div class="muted pf-note">${esc(st.msg)}</div>` : ""}
       ${body}
       <details class="pf-fold" data-fold="dry" ${isOpen("dry", false) ? "open" : ""}><summary><b>Trockenlauf</b> · welche Ablehnungen hätte der Planer?</summary>${drawCards()}${drawDry()}</details>
+      ${drawHardware()}
       ${drawModels()}
       ${drawExport()}`;
+    const hwSlot = root.querySelector("#pf-hwroot");
+    if (hwSlot && hwEl) hwSlot.appendChild(hwEl);
     if (keep) { const el = root.querySelector(`[data-k="${CSS.escape(keep)}"]`); if (el) el.focus(); }
   }
 
