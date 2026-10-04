@@ -269,6 +269,15 @@ def d_signal_short(sig: Optional[dict], *, now: float, unit: int, id_threshold: 
     return (max(1, int(unit)), ",".join(why)) if why else (0, "")
 
 
+def d_signal_seat_gate(sig_short: int, sig_why: str, *, d_has_seats: bool, armed: bool) -> Tuple[int, str]:
+    """#1540 D-SIGNAL-SEATS: D's id-space / arena reading is pressure only while D has work that needs
+    the rows. ``d_has_seats``: a live D seat or a leg-1-done request waiting for one (the front's
+    ``_d_seats_live`` / ``_ready_for_d``). Disarmed: the reading passes unchanged (the old behaviour)."""
+    if armed and not d_has_seats:
+        return 0, ""
+    return sig_short, sig_why
+
+
 def publish_d_signal(path: str, *, id_frac: float, arena_complete: int, arena_slots: int, now: float) -> None:
     import json
 
