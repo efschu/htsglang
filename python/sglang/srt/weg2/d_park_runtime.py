@@ -709,6 +709,7 @@ def _lift_holds_when_idle(sched) -> None:
         return
     no_token_rid = getattr(sched, "_weg2_sa_no_token", None)
     sched._weg2_sa_no_token = None
+    setattr(sched, NO_TOKEN_VIEW_ATTR, None)
     if not getattr(sched, "_weg2_sa_idle_armed", False):
         # the refusal read here may stem from a pass in which something still
         # ran: only a refusal from an idle pass counts (replicated: the
@@ -752,8 +753,11 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     # SP (partial park, KV trigger): the rid the adder refused with NO_TOKEN in
     # the LAST pass (Scheduler sets it; consumed here, one pass old).
     no_token_rid = getattr(sched, "_weg2_sa_no_token", None)
+    # Q-702: the adder's own numbers of that refusal travel with the rid.
+    no_token_view = getattr(sched, NO_TOKEN_VIEW_ATTR, None)
     try:
         sched._weg2_sa_no_token = None
+        setattr(sched, NO_TOKEN_VIEW_ATTR, None)
     except Exception:  # noqa: BLE001
         pass
     waiting = [q for q in sched.waiting_queue if d_seats.park_site(q) != d_seats.SITE_PRESSURE]
@@ -768,7 +772,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
             # The KV half is rank-local, so it goes through the group MIN like the KV
             # trigger (the precondition -- full seats, a candidate -- is replicated,
             # so every rank enters the collective).
-            local = kv_displace_would_fit(sched, cand[0], reqs, seat=True)
+            local = kv_displace_would_fit(sched, cand[0], reqs, seat=True, view=no_token_view)
             gm = getattr(sched, "_weg2_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
             if agreed:
@@ -788,7 +792,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                 # wenn der ältere nicht draufpasst. nicht pauschal den jüngeren verdrängen" --
                 # only when displacing the youngest seats is ENOUGH for the older one (and it
                 # does not already fit); else nobody leaves and the backfill stays.
-                local = kv_displace_would_fit(sched, cand[0], reqs)
+                local = kv_displace_would_fit(sched, cand[0], reqs, view=no_token_view)
             gm = getattr(sched, "_weg2_group_min_flags", None)
             agreed = bool(gm([local])[0]) if callable(gm) else bool(local)
             if agreed:
@@ -962,30 +966,98 @@ def _req_kv_tokens(r) -> int:
     return _n(getattr(r, "origin_input_ids", None)) + _n(getattr(r, "output_ids", None))
 
 
-def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False) -> bool:
+#: Q-702: the scheduler attribute that carries the adder's own refusal numbers
+#: next to ``_weg2_sa_no_token`` (set in the same branch, consumed in the same pass).
+NO_TOKEN_VIEW_ATTR = "_weg2_sa_no_token_view"
+
+
+def _pool_reading(sched) -> Optional[int]:
+    """available + evictable as the (legacy) verdict reads them; None = no reading."""
+    try:
+        have = int(sched.token_to_kv_pool_allocator.available_size())
+    except Exception:  # noqa: BLE001 -- no reading
+        return None
+    try:
+        have += int(sched.tree_cache.evictable_size() or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return have
+
+
+def note_adder_refusal(sched, adder, req, running_batch) -> None:
+    """Q-702 BUDGET-EINHEIT. Called by the scheduler where it keeps the first
+    NO_TOKEN rid of a pass (``_weg2_sa_no_token``): keeps what the ADDER refused
+    on -- ``price`` (its ``total_tokens``) against ``budget`` (its
+    ``rem_total_tokens``) -- plus the decode reserve it holds for each running
+    request (what a victim's leaving gives back besides its KV rows) and the pool
+    reading at that moment (to carry the number forward by the drift). The
+    verdict (:func:`kv_displace_would_fit`) then asks the adder's question, not
+    one of its own. Bookkeeping only; a missing or foreign refusal sets None and
+    the verdict keeps its legacy reading."""
+    view = None
+    if not d_seats.d_flip_park_active():
+        return  # not a D park group: nothing reads the view, nothing is kept
+    try:
+        ref = getattr(adder, "lifetime_refusal", None)
+        if ref is not None and str(ref[0]) == str(req.rid):
+            reserve = {}
+            for r in list(getattr(running_batch, "reqs", None) or []):
+                reserve[str(r.rid)] = int(adder.released_by_leaving(r))
+            view = {"rid": str(ref[0]), "price": int(ref[1]), "budget": int(ref[2]),
+                    "reserve": reserve, "pool": _pool_reading(sched)}
+    except Exception:  # noqa: BLE001 -- bookkeeping must never take a pass down
+        view = None
+    setattr(sched, NO_TOKEN_VIEW_ATTR, view)
+
+
+def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False, view=None) -> bool:
     """This rank's half of the displacement verdict (the group takes the MIN):
     KV trigger (seat=False): the older waiting request does not fit the free KV,
     and parking the youngest running seats younger than it frees enough for it.
     Seat trigger (seat=True): every seat is held, so one victim is needed for the
     seat anyway; it is taken only when the older one then also fits the KV
-    (k youngest, k >= 1). Logs the outcome (throttled)."""
+    (k youngest, k >= 1). Logs the outcome (throttled).
+
+    Q-702 BUDGET-EINHEIT (NF y9nf ...10032328 D 23:33:28Z): the budget is the
+    ADDER's. With ``view`` (its refusal of this very rid: ``price`` against
+    ``budget``, see :func:`note_adder_refusal`) the verdict asks whether the price
+    is below the budget once the k youngest are gone -- each gives back its KV rows
+    AND its decode reserve -- carried forward by the pool's drift since the
+    refusal; ``basis=adder`` in the log. The adder refuses at ``price >= budget``,
+    so the fit needs ``price + 1``. Without a matching view (no lifetime refusal
+    of this rid, a desk double) the legacy reading stands: ``basis=legacy`` -- raw
+    extend against available + evictable, which omits max_new, the page, the
+    running decode reserves, the group floor and the commitment ledger (the
+    "fits free, nobody leaves" of an older request the adder kept refusing)."""
     from sglang.srt.weg2 import seat_age as _sa
 
     older = next((q for q in getattr(sched, "waiting_queue", ()) or () if str(q.rid) == str(older_rid)), None)
     if older is None:
         return False
-    need = max(0, _req_kv_tokens(older) - _n(getattr(older, "prefix_indices", None)))
-    try:
-        avail = int(sched.token_to_kv_pool_allocator.available_size())
-    except Exception:  # noqa: BLE001 -- no reading: no displacement
-        return False
-    try:
-        avail += int(sched.tree_cache.evictable_size() or 0)
-    except Exception:  # noqa: BLE001
-        pass
     young = sorted((r for r in running if _sa.rid_age(str(r.rid)) > _sa.rid_age(str(older_rid))),
                    key=lambda r: _sa.rid_age(str(r.rid)), reverse=True)
-    k = victims_needed(need, avail, [_req_kv_tokens(r) for r in young])
+    basis = "legacy"
+    if view is not None and str(view.get("rid")) == str(older_rid):
+        need = int(view["price"]) + 1
+        avail = int(view["budget"])
+        now, then = _pool_reading(sched), view.get("pool")
+        if now is not None and then is not None:
+            avail += now - int(then)
+        reserve = view.get("reserve") or {}
+        sizes = [_req_kv_tokens(r) + int(reserve.get(str(r.rid), 0)) for r in young]
+        basis = "adder"
+    else:
+        need = max(0, _req_kv_tokens(older) - _n(getattr(older, "prefix_indices", None)))
+        try:
+            avail = int(sched.token_to_kv_pool_allocator.available_size())
+        except Exception:  # noqa: BLE001 -- no reading: no displacement
+            return False
+        try:
+            avail += int(sched.tree_cache.evictable_size() or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        sizes = [_req_kv_tokens(r) for r in young]
+    k = victims_needed(need, avail, sizes)
     if seat and k is not None:
         if not young:
             k = None                                   # no younger seat to give
@@ -994,8 +1066,8 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False) ->
     n = getattr(sched, "_sa_kv_fit_n", 0) + 1
     sched._sa_kv_fit_n = n
     if k != 1 and (n <= 8 or (n & (n - 1)) == 0):
-        logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d -> %s (n=%d)",
-                    "SEAT" if seat else "KV", str(older_rid)[:16], need, avail, len(young),
+        logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d basis=%s -> %s (n=%d)",
+                    "SEAT" if seat else "KV", str(older_rid)[:16], need, avail, len(young), basis,
                     "fits free, nobody leaves" if k == 0 else
                     "not even with all younger seats: nobody leaves, backfill stays" if k is None else
                     "%d youngest must leave (one per pass)" % k, n)
