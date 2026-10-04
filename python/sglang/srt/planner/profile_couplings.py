@@ -39,6 +39,8 @@ Einstellungen (``settings``, alles optional ausser ``stage_layers``)::
     chunk_tokens        int = 2048     Prefill-Chunk (``--chunked-prefill-size`` / ``--p-chunk-max``)
     extend_rate_mib     float          MiB je Chunk-Zeile; sonst ``model.activation.extend_rate_mib_per_row``
     mamba_slots         int = 1        Mamba/GDN-Slots (Zustand je Linear-Layer und Slot)
+    ssm_dtype           str            Zustands-Dtype (Schluessel von ``model.state.variants_mib``, z. B. bfloat16); sonst der der Config
+    activation_mib      float | [..]   GEMESSENE Aktivierungsspitze je Karte statt Chunk x Rate (Eingabe, z. B. aus einem Boot)
     moe_resident_fraction  float | [..]   residenter Expertenanteil je Stufe (1.0 = alle)
     scratch_rows        int | [..] = 0   Scratch-Zeilen je Layer (Pufferregel)
     draft               bool = False   Draft/MTP-Layer: Gewicht auf der letzten Stufe, eine Attention-Zeile KV je Stufe
@@ -72,6 +74,11 @@ __all__ = [
     "synthetic_hardware",
     "run",
     "main",
+    "BAR_SEGMENTS",
+    "stage_bar",
+    "bars_for",
+    "approx_payload",
+    "approx_terms",
 ]
 
 SCHEMA = "flliper.couplings/1"
@@ -249,14 +256,18 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
 
     # Gewichte
     w = model["weights"]
-    weights_b = _mp.stage_weight_bytes(model, counts, expert_fractions=buf_fracs, replicated=replicated)
+    weights_full = _mp.stage_weight_bytes(model, counts, expert_fractions=buf_fracs, replicated=replicated)
+    weights_dense = _mp.stage_weight_bytes(model, counts, expert_fractions=[0.0] * n, replicated=replicated)
     layer_b = _val(w["layer_bytes"])
     exp_b = _val(w["layer_expert_bytes"])
     bounds = _stage_bounds(counts)
     mtp_b = float(_val(w.get("mtp_bytes"), 0.0)) if draft else 0.0
-    if draft and "mtp" not in replicated:
-        weights_b = list(weights_b)
-        weights_b[-1] += mtp_b
+    if "mtp" in replicated:
+        mtp_b = 0.0        # schon als replizierter Posten in den Gewichten
+    draft_bytes = [0.0] * n
+    if draft:
+        draft_bytes[-1] = mtp_b
+    weights_b = [f + d for f, d in zip(weights_full, draft_bytes)]
     draft_note = "MTP-Layer auf der letzten Stufe" if draft else ""
 
     # Attention / Linear je Stufe
@@ -281,6 +292,15 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
         geo = dict(geo, kv_dtype_bytes=geo["kv_dtype_bytes"] * cell / cross)
     state_node = model["state"].get("per_linear_layer_per_slot_mib")
     state_per = float(_val(state_node, 0.0))
+    ssm = settings.get("ssm_dtype")
+    if ssm:
+        variants = model["state"].get("variants_mib") or {}
+        if ssm not in variants:
+            raise CouplingError("ssm_dtype %r ist keine Variante des Modellprofils (%s)" % (ssm, ", ".join(variants)))
+        state_per = float(variants[ssm])
+        state_node = {"v": state_per, "src": SRC_INPUT}
+    act_in = settings.get("activation_mib")
+    act_vec = _per_card(act_in, n, "activation_mib", 0.0) if act_in is not None else None
     rate_node = (model.get("activation") or {}).get("extend_rate_mib_per_row")
     rate = float(settings["extend_rate_mib"]) if settings.get("extend_rate_mib") is not None else float(_val(rate_node, 0.0))
     rate_src = SRC_INPUT if settings.get("extend_rate_mib") is not None else _src(rate_node)
@@ -290,8 +310,11 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
         kv_mib = _pp.kv_reserve_mib_per_stage(
             tokens=ctx, attn_layers_by_stage=[attn[i]], draft_attn_layers_by_stage=[draft_attn[i]], **geo)[0]
         state_mib = lin[i] * state_per * slots
-        act_mib = chunk * rate
-        w_mib = weights_b[i] / MIB
+        act_mib = act_vec[i] if act_vec is not None else chunk * rate
+        dense_mib = weights_dense[i] / MIB
+        experts_mib = (weights_full[i] - weights_dense[i]) / MIB
+        draft_mib = draft_bytes[i] / MIB
+        w_mib = dense_mib + experts_mib + draft_mib
         resident = w_mib + state_mib + act_mib + fixed[i]
         needs = resident + kv_mib
         free = budgets[i] - needs
@@ -315,11 +338,15 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
             "linear_layers": lin[i],
             "budget_mib": _term(budgets[i], budget_src, "Kartengroesse - Korridor %.0f MiB" % corridor if budget_src == SRC_DERIVED else ""),
             "terms": {
-                "weights": _term(w_mib, _src(w["total_bytes"]) if "total_bytes" in w else SRC_DEFAULT,
-                                 "Experten residente Zeilen %.0f %%" % (100 * buf_fracs[i]) if moe else ""),
+                "weights": _term(dense_mib, _src(w["total_bytes"]) if "total_bytes" in w else SRC_DEFAULT,
+                                 "dichte Gewichte der Layer + Einbettung/lm_head der Rolle"),
+                "experts": _term(experts_mib, _src(w["total_bytes"]) if "total_bytes" in w else SRC_DEFAULT,
+                                 "residente Expertenzeilen %.0f %% (Pufferregel)" % (100 * buf_fracs[i]) if moe else "keine Experten"),
+                "draft": _term(draft_mib, _src(w.get("mtp_bytes")) if draft else SRC_DEFAULT, draft_note if draft_mib else "kein Draft"),
                 "kv": _term(kv_mib, cell_src, "%d Token x %d Attention-Layer%s x %.0f B" % (ctx, attn[i], " + Draft" if draft_attn[i] else "", cell)),
                 "state": _term(state_mib, _src(state_node), "%d Linear-Layer x %.4f MiB x %d Slot(s)" % (lin[i], state_per, slots)),
-                "activation": _term(act_mib, rate_src, "%d Zeilen x %.4f MiB" % (chunk, rate)),
+                "activation": _term(act_mib, SRC_INPUT if act_vec is not None else rate_src,
+                                    "gemessene Spitze (Eingabe)" if act_vec is not None else "%d Zeilen x %.4f MiB" % (chunk, rate)),
                 "fixed": _term(fixed[i], fixed_src, "" if fixed_src == SRC_INPUT else "nicht gemessen"),
             },
             "draft_note": draft_note if i == n - 1 and draft else "",
@@ -332,6 +359,7 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
             "total_mib": totals[i],
             "kv_cell_mib": cell_mib,
             "weights_bytes": weights_b[i],
+            "weights_total_mib": round(w_mib, 3),
         })
     capped = [s["kv_capacity_tokens"] for s in stages if s["kv_capacity_tokens"] is not None]
     timed = [s["decode_ms"] for s in stages if s["decode_ms"] is not None]
@@ -343,7 +371,7 @@ def _stage_terms(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapp
         "warnings": warnings,
         "_ctx": {"cell_mib": cell_mib, "counts": counts, "attn": attn, "lin": lin, "draft_attn": draft_attn, "budgets": budgets,
                  "fixed": fixed, "rate": rate, "chunk": chunk, "slots": slots, "state_per": state_per, "E": E,
-                 "buf_fracs": buf_fracs, "scratch": scratch},
+                 "buf_fracs": buf_fracs, "scratch": scratch, "act_vec": act_vec},
     }
 
 
@@ -386,7 +414,7 @@ def c1_move_layers(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Ma
         rows.append({
             "ord": b["ord"], "label": b["label"], "layers": [b["layers"], a["layers"]],
             "attn_layers": [b["attn_layers"], a["attn_layers"]],
-            "weights_mib": [b["terms"]["weights"]["v"], a["terms"]["weights"]["v"]],
+            "weights_mib": [b["weights_total_mib"], a["weights_total_mib"]],
             "free_mib": [b["free_mib"], a["free_mib"]],
             "kv_capacity_tokens": [b["kv_capacity_tokens"], a["kv_capacity_tokens"]],
             "decode_ms": [b["decode_ms"], a["decode_ms"]],
@@ -627,12 +655,180 @@ def synthetic_hardware(cards: Sequence[Tuple[str, float, Optional[float]]]) -> D
 
 
 # ---------------------------------------------------------------------------
+# S4b (Auftrag 1432): Balken je Karte und Phase, Browser-Naeherung
+# ---------------------------------------------------------------------------
+
+#: Segmente eines Balkens in Zeichenreihenfolge: Schluessel (Term), Beschriftung, Erklaerung fuer den Tooltip
+BAR_SEGMENTS: Tuple[Tuple[str, str, str], ...] = (
+    ("weights", "Gewichte", "dichte Gewichte der Layer dieser Stufe plus Einbettung (erste Stufe) bzw. lm_head (letzte Stufe)"),
+    ("experts", "Experten (resident)", "Expertenzeilen auf der Karte nach Pufferregel min(R + Scratch, E) je Layer"),
+    ("draft", "Draft/MTP", "Gewicht der MTP-Layer auf der letzten Stufe"),
+    ("kv", "KV", "Kontextziel x Attention-Layer der Stufe (+ eine Draft-Zeile) x KV-Zelle"),
+    ("state", "Mamba/GDN-Zustand", "Linear-Layer der Stufe x Zustand je Layer und Slot x Slots"),
+    ("activation", "Aktivierung", "Chunk-Zeilen x Extend-Rate (Spitze beim Prefill)"),
+    ("fixed", "Festposten", "CUDA-Kontext, Graphen, Allokator-Reste, Seam-Staging: nur am Metall zu messen (ohne Eingabe 0)"),
+)
+
+_ORIGIN = {SRC_INPUT: "Eingabe (Nutzer/Profil)", SRC_DEFAULT: "Annahme dieser Rechnung", SRC_DERIVED: "gerechnet"}
+
+
+def _origin(src: str) -> str:
+    return _ORIGIN.get(src, "Modellprofil/Hardwareprofil (%s)" % src)
+
+
+def _clip_to_budget(segs: List[Dict[str, Any]], budget: float) -> Tuple[List[Dict[str, Any]], float, List[Dict[str, Any]]]:
+    """Segmente bis ``budget`` behalten; was darueber liegt, kommt (von hinten abgeschnitten) in die Ueberlaufliste.  Die Aufteilung
+    des Ueberlaufs auf Posten ist Darstellung, die Summe ist exakt."""
+    kept: List[Dict[str, Any]] = []
+    cut: List[Dict[str, Any]] = []
+    at = 0.0
+    for s in segs:
+        room = max(0.0, budget - at)
+        inside = min(s["mib"], room)
+        if inside > 0:
+            kept.append(dict(s, mib=round(inside, 3)))
+        beyond = s["mib"] - inside
+        if beyond > 1e-9:
+            cut.append({"key": s["key"], "label": s["label"], "mib": round(beyond, 3)})
+        at += s["mib"]
+    return kept, round(sum(c["mib"] for c in cut), 3), cut
+
+
+def stage_bar(stage: Mapping[str, Any]) -> Dict[str, Any]:
+    """Ein Karten-Balken aus einer Stufe von ``c1_layer_split``: Posten, Rest im Budget, Korridor, **Ueberlauf als eigenes rotes Segment**.
+
+    Zeichenfolge: Posten (bis zum Budget) | Rest im Budget | Korridor/Reserve (Kartengroesse - Budget).  Ueberschreitet die Summe das
+    Budget, steht der Teil darueber als Segment ``overflow`` (rot) VOR der Reserve; der Balken waechst dann ueber die Kartenkante, wenn
+    der Ueberlauf die Reserve ueberschreitet.  Kein stilles Beschneiden: ``overflow_mib`` und die betroffenen Posten stehen im Segment."""
+    budget = float(stage["budget_mib"]["v"])
+    total = float(stage["total_mib"])
+    segs = []
+    for key, label, what in BAR_SEGMENTS:
+        term = stage["terms"][key]
+        if term["v"] > 0:
+            segs.append({"key": key, "label": label, "mib": term["v"], "src": term["src"], "origin": _origin(term["src"]),
+                         "what": what + (" -- " + term["note"] if term.get("note") else "")})
+    kept, overflow, cut = _clip_to_budget(segs, budget)
+    free = max(0.0, budget - sum(s["mib"] for s in kept))
+    out = list(kept)
+    if overflow > 0:
+        out.append({"key": "overflow", "label": "Ueberlauf", "mib": overflow, "src": SRC_DERIVED, "origin": "gerechnet",
+                    "what": "Posten ueber dem Budget (%.0f MiB): %s" % (budget, ", ".join("%s %.0f MiB" % (c["label"], c["mib"]) for c in cut)),
+                    "cut": cut})
+    elif free > 0:
+        out.append({"key": "free_in_budget", "label": "Rest im Budget", "mib": round(free, 3), "src": SRC_DERIVED, "origin": "gerechnet",
+                    "what": "Budget - Posten (Obergrenze, solange Festposten nicht gemessen sind)"})
+    reserve = max(0.0, total - budget)
+    if reserve > 0:
+        out.append({"key": "corridor", "label": "Korridor/Reserve", "mib": round(reserve, 3), "src": stage["budget_mib"]["src"],
+                    "origin": _origin(stage["budget_mib"]["src"]), "what": "Kartengroesse - Budget: bleibt frei (Reserve-Semantik)"})
+    over_text = ""
+    if overflow > 0:
+        over_text = ("%s: +%.0f MiB ueber dem Budget. Der Planer lehnt ab; mit Force startet es trotzdem, zu erwarten ist OOM beim Laden "
+                     "oder beim Graphenaufbau." % (stage["label"], overflow))
+    return {"ord": stage["ord"], "label": stage["label"], "total_mib": total, "budget_mib": budget, "segments": out,
+            "free_mib": round(free, 3), "overflow_mib": overflow, "needs_mib": stage["needs_mib"], "over_text": over_text}
+
+
+def bars_for(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapping[str, Any],
+             phases: Optional[Mapping[str, Mapping[str, Any]]] = None) -> Dict[str, Any]:
+    """Balken je Karte, je Phase.  ``phases`` = ``{"P": {Einstellungen, die gelten sollen}, "D": {...}}`` (jeweils ueber ``settings`` gelegt);
+    ohne Angabe eine Phase ``alle``.  ``Spitze`` = je Karte die Phase mit dem groessten Bedarf (gleichzeitig belegt wird nie mehr)."""
+    ph_in = dict(phases) if phases else {"alle": {}}
+    per: Dict[str, Any] = {}
+    for name, over in ph_in.items():
+        s = dict(settings)
+        s.update(over or {})
+        c1 = c1_layer_split(hw, model, s)
+        per[name] = {"bars": [stage_bar(st) for st in c1["stages"]], "context_floor_tokens": c1["context_floor_tokens"],
+                     "makespan_ms": c1["makespan_ms"], "warnings": c1["warnings"]}
+    out: Dict[str, Any] = {"phases": per}
+    if len(per) > 1:
+        names = list(per)
+        peak = []
+        for i in range(len(per[names[0]]["bars"])):
+            best = max(names, key=lambda n: per[n]["bars"][i]["needs_mib"])
+            peak.append(dict(per[best]["bars"][i], from_phase=best))
+        out["Spitze"] = {"bars": peak}
+    hints = []
+    for name, ph in per.items():
+        for b in ph["bars"]:
+            if b["over_text"]:
+                hints.append(("%s-Phase: " % name if name != "alle" else "") + b["over_text"])
+    out["hints"] = hints
+    return out
+
+
+def approx_payload(hw: Mapping[str, Any], model: Mapping[str, Any], settings: Mapping[str, Any]) -> Dict[str, Any]:
+    """Alles, was der Browser fuer die sofortige Naeherung braucht (``profil_balken.js::approx``): lineare Arithmetik, kein Solver.
+    Gilt fuer eine Aenderung des LAYER-SCHNITTS bei sonst gleichen Einstellungen; Experten-Anteil, Kontext, Chunk, Budget bleiben die des Servers."""
+    t = _stage_terms(hw, model, settings)
+    ctx = t["_ctx"]
+    w = model["weights"]
+    fams = _families(model)
+    replicated = tuple(settings.get("replicated") or ())
+    rep_mib = sum(float(_val(w.get(r + "_bytes"), 0.0)) for r in replicated) / MIB
+    return {
+        "n_stages": len(ctx["counts"]),
+        "stage_layers": ctx["counts"],
+        "layer_dense_mib": [round(x / MIB, 4) for x in _val(w["layer_bytes"])],
+        "layer_expert_mib": [round(x / MIB, 4) for x in _val(w["layer_expert_bytes"])],
+        "layer_attn": [1 if f == "attn" else 0 for f in fams],
+        "embed_mib": round(float(_val(w.get("embed_bytes"), 0.0)) / MIB, 4),
+        "lm_head_mib": round(float(_val(w.get("lm_head_bytes"), 0.0)) / MIB, 4),
+        "replicated_mib": round(rep_mib, 4),
+        "draft_mib": round(float(_val(w.get("mtp_bytes"), 0.0)) / MIB, 4) if settings.get("draft") and "mtp" not in replicated else 0.0,
+        "draft_layers": 1 if settings.get("draft") else 0,
+        "buf_fracs": [round(x, 6) for x in ctx["buf_fracs"]],
+        "cell_mib": ctx["cell_mib"],
+        "context_tokens": int(settings.get("context_tokens", 262144)),
+        "chunk_rows": ctx["chunk"],
+        "extend_rate_mib": ctx["rate"],
+        "activation_mib": ctx["act_vec"],
+        "state_per_layer_mib": ctx["state_per"],
+        "slots": ctx["slots"],
+        "fixed_mib": ctx["fixed"],
+        "budget_mib": ctx["budgets"],
+        "total_mib": [s["total_mib"] for s in t["stages"]],
+    }
+
+
+def approx_terms(pl: Mapping[str, Any], stage_layers: Sequence[int]) -> List[Dict[str, float]]:
+    """Die Naeherung, Python-Referenz zu ``profil_balken.js::approx`` (dieselbe Arithmetik, Zeile fuer Zeile): je Stufe Posten und frei."""
+    n = int(pl["n_stages"])
+    counts = [int(c) for c in stage_layers]
+    if len(counts) != n or sum(counts) != len(pl["layer_dense_mib"]) or min(counts) < 0:
+        raise CouplingError("approx: stage_layers passt nicht zum Modell (%s)" % counts)
+    out, start = [], 0
+    for i, c in enumerate(counts):
+        sl = slice(start, start + c)
+        dense = sum(pl["layer_dense_mib"][sl]) + pl["replicated_mib"]
+        if i == 0:
+            dense += pl["embed_mib"]
+        if i == n - 1:
+            dense += pl["lm_head_mib"]
+        experts = pl["buf_fracs"][i] * sum(pl["layer_expert_mib"][sl])
+        draft = pl["draft_mib"] if i == n - 1 else 0.0
+        attn = sum(pl["layer_attn"][sl])
+        lin = c - attn
+        kv = pl["context_tokens"] * (attn + pl["draft_layers"]) * pl["cell_mib"]
+        state = lin * pl["state_per_layer_mib"] * pl["slots"]
+        act = pl["activation_mib"][i] if pl.get("activation_mib") is not None else pl["chunk_rows"] * pl["extend_rate_mib"]
+        fixed = pl["fixed_mib"][i]
+        need = dense + experts + draft + kv + state + act + fixed
+        out.append({"weights": dense, "experts": experts, "draft": draft, "kv": kv, "state": state, "activation": act, "fixed": fixed,
+                    "needs": need, "free": pl["budget_mib"][i] - need})
+        start += c
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Brueckenaufruf: eine JSON-Anfrage -> eine JSON-Antwort (Dashboard-Kindprozess, Auftrag 1431/1432)
 # ---------------------------------------------------------------------------
 
 
 def run(req: Mapping[str, Any]) -> Dict[str, Any]:
-    """``{"what": "compute"|"move"|"chunk"|"context", "hardware": {..}, "model": {..}, "settings": {..}, ...}`` -> Ergebnis.
+    """``{"what": "compute"|"move"|"chunk"|"context"|"bars", "hardware": {..}, "model": {..}, "settings": {..}, ...}`` -> Ergebnis.
 
     ``settings`` darf stattdessen ``server_args`` (Flag -> Wert, ``profile_json.args_dict``) tragen; ``move`` braucht ``src``/``dst``/``n``,
     ``chunk`` optional ``new_chunk_tokens``.  Eine unrechenbare Eingabe kommt als ``{"ok": False, "error": ...}`` zurueck, nie als Absturz."""
@@ -650,6 +846,8 @@ def run(req: Mapping[str, Any]) -> Dict[str, Any]:
             res = c3_chunk(hw, model, settings, new_chunk_tokens=req.get("new_chunk_tokens"))
         elif what == "context":
             res = c4_context_target(hw, model, settings)
+        elif what == "bars":
+            res = dict(bars_for(hw, model, settings, phases=req.get("phases")), approx=approx_payload(hw, model, settings))
         else:
             raise CouplingError("unbekannte Anfrage %r (compute|move|chunk|context)" % what)
         return {"ok": True, "result": res}
