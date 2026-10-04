@@ -62,7 +62,7 @@ def handback_line(rid, n_tokens: int, d_prefix: int, d_compute: int, path: str) 
     ``WEG2-HANDBACK-DEFECT`` line (below)."""
     _N[0] += 1
     line = (
-        f"{HANDBACK_MARK} rid={str(rid)[:24]} N={int(n_tokens)} d_prefix={int(d_prefix)} "
+        f"{HANDBACK_MARK} rid={str(rid)} N={int(n_tokens)} d_prefix={int(d_prefix)} "
         f"d_compute={int(d_compute)} path={path} (contract NF: E2 d_prefix = N, d_compute = 0; "
         f"else d_compute = N - d_prefix) n={_N[0]}"
     )
@@ -129,7 +129,7 @@ def defect(rid, path: str, why: str, *, n_tokens=None, d_prefix=None, d_compute=
     tokens already computed (by P, or by D before the park). Log only."""
     _DEFECT_N[0] += 1
     line = (
-        f"{DEFECT_MARK} rid={str(rid)[:24]} origin={kind or '?'} path={path} why={why} "
+        f"{DEFECT_MARK} rid={str(rid)} origin={kind or '?'} path={path} why={why} "
         f"N={'-' if n_tokens is None else int(n_tokens)} "
         f"d_prefix={'-' if d_prefix is None else int(d_prefix)} "
         f"d_compute={'-' if d_compute is None else int(d_compute)} "

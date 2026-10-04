@@ -73,7 +73,7 @@ def divert(sched: Any, req: Any, rem: int) -> bool:
     if not _rvp.eligible(req, sched=sched):
         logger.warning("%s-FALLBACK rid=%s would_compute=%d (RESUME-VIA-P not eligible: non-stream, "
                        "multimodal or attempts spent) -- released to D's extend, named",
-                       MARK, str(getattr(req, "rid", "?"))[:24], int(rem))
+                       MARK, str(getattr(req, "rid", "?")), int(rem))
         return False
     _rvp.keep_on_d(sched, req, int(rem), x, reason=REASON)
     try:
@@ -85,6 +85,6 @@ def divert(sched: Any, req: Any, rem: int) -> bool:
         pass
     logger.info("%s rid=%s would_compute=%d delivered=%s -> RESUME-VIA-P (P prefills from the store, "
                 "D resumes under E2 after the flip back; no D compute after a flip)",
-                MARK, str(getattr(req, "rid", "?"))[:24], int(rem),
+                MARK, str(getattr(req, "rid", "?")), int(rem),
                 getattr(req, "_weg2_store_delivered", None))
     return True

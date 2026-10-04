@@ -47,7 +47,7 @@ def note_reap(rid: str, requested_pages: int, hit_pages: int, completed_tokens: 
         if _N[0] <= 20 or _N[0] % 200 == 0:
             logger.info("%s rid=%s completed=%d of %d pages hit=%d (n=%d) -- the store holds the span: "
                         "the settle re-reads at its next tick, not on the 2 s timer",
-                        MARK, rid[:16], int(completed_tokens) // max(1, int(page_size)),
+                        MARK, rid, int(completed_tokens) // max(1, int(page_size)),
                         int(requested_pages), int(hit_pages), _N[0])
     else:
         _HELD.pop(rid, None)

@@ -473,8 +473,8 @@ def _say_no_commit(st: "_State", rid: str, w_shared: Dict[str, int], srcs, at: s
             "#TW TWIN-NO-COMMIT rid=%s at=%s sources=%s page=%d chunk=%d (n=%d): no "
             "source promised an anchor <= shared (end, chunk end or twin boundary "
             "track) -- registered as an ordinary request, no wait.",
-            rid[:12], at,
-            [(_rid(s)[:12], w_shared.get(_rid(s)), st.s0.get(_rid(s)),
+            rid, at,
+            [(_rid(s), w_shared.get(_rid(s)), st.s0.get(_rid(s)),
               _tw_anchor_boundary(w_shared.get(_rid(s), 0), st.page)) for s in srcs],
             st.page, st.chunk, st.n_no_gain,
         )
@@ -494,8 +494,8 @@ def _say_no_gain(st: "_State", rid: str, w_shared: Dict[str, int], at: str) -> N
             "source writes an anchor in (its start, shared] -- a hybrid model "
             "resumes only at an anchor, so waiting reads nothing; registered as an "
             "ordinary request.",
-            rid[:12], at,
-            [(k[:12], sh, st.s0.get(k)) for k, sh in w_shared.items()],
+            rid, at,
+            [(k, sh, st.s0.get(k)) for k, sh in w_shared.items()],
             st.page, st.chunk, st.n_no_gain,
         )
 
@@ -561,10 +561,10 @@ def intake_defer(scheduler, req) -> bool:
             "#TW TWIN-DEFER rid=%s len=%d shared=%d sources=%s just_finished=%s p_dormant=%d "
             "sources_in_hold=%s (n=%d): store read held until the sibling finished and its "
             "publish settled; admission skips it meanwhile, nothing else waits.",
-            rid[:12], len(_ids(req)), shared,
-            [str(getattr(s, "rid", "?"))[:12] for s in sources],
-            [str(getattr(r, "rid", "?"))[:12] for r, _p, _t in recent], int(dormant),
-            [str(getattr(s, "rid", "?"))[:12] for s in sources if id(s) in held_ids], st.n_defer,
+            rid, len(_ids(req)), shared,
+            [str(getattr(s, "rid", "?")) for s in sources],
+            [str(getattr(r, "rid", "?")) for r, _p, _t in recent], int(dormant),
+            [str(getattr(s, "rid", "?")) for s in sources if id(s) in held_ids], st.n_defer,
         )
     return True
 
@@ -643,7 +643,7 @@ def release_due(scheduler, queued) -> List[Tuple[Any, bool]]:
             logger.info(
                 "#TW TWIN-RELEASE rid=%s reason=%s waited_s=%.2f shared=%d "
                 "pending_sources=%d (n=%d)%s",
-                rid[:12], reason, now - w.since, w.shared, len(pending), n,
+                rid, reason, now - w.since, w.shared, len(pending), n,
                 "" if twin else ": FRIST -- registered as an ordinary request",
             )
         out.append((w.req, twin))

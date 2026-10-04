@@ -213,7 +213,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         # PARK-RETAIN READ: the store read of this request ends at what the
         # retraction just retained (the KV above the mamba track was freed).
         if d_park_read.stamp_parked(req) is not None:
-            logger.info("WEG2-D-PARK RETAINED rid=%s %s", str(req.rid)[:12], d_park_read.describe(req))
+            logger.info("WEG2-D-PARK RETAINED rid=%s %s", str(req.rid), d_park_read.describe(req))
     queued = list(sched.waiting_queue)
     sched.waiting_queue = []
     # PARK-SETTLE (28.09., 27B park boot 27.09. 10:24:34, rid weg2-58-201): a
@@ -285,7 +285,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
                 req, resumable.get(str(req.rid)), is_bigram=bigram
             ) is not None:
                 logger.info("WEG2-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
-                            str(req.rid)[:12], before, d_park_read.describe(req))
+                            str(req.rid), before, d_park_read.describe(req))
     _ph("clamp")
     logger.info("WEG2-FLIPCYCLE stage=park epoch=%d n=%d ms=%.0f floor_ms=%d sub=%s (H3: the park's "
                 "phases on the scheduler thread; floor = the END-state D2H)", epoch, len(retracted),
@@ -295,8 +295,8 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         "WEG2-D-PARK park_running epoch=%d reason=%s: %d running retracted (span retained, "
         "forced host write-through), parked=%s queued-behind=%s settle-folded=%s late_hold=%s -- "
         "the sleep holds them first, the wake resumes oldest first%s",
-        epoch, reason, len(retracted), [r[:12] for r in rids], [r[:12] for r in held],
-        [str(r.rid)[:12] for r in settle], late_hold,
+        epoch, reason, len(retracted), list(rids), list(held),
+        [str(r.rid) for r in settle], late_hold,
         (" (DFlash window draft: %d resume(s) re-armed like a fresh hand-off)" % rearmed
          if rearmed else ""),
     )
@@ -324,7 +324,7 @@ def hold_late_arrival(sched, req) -> bool:
     parked.append(req)
     logger.info("WEG2-D-PARK late-hold rid=%s: arrived after park_running (a hand-off in flight "
                 "at the park), held behind the park (%d in the park list) -- the front counts it "
-                "parked", str(req.rid)[:12], len(parked))
+                "parked", str(req.rid), len(parked))
     return True
 
 
@@ -346,7 +346,7 @@ def _park_end(sched, running, *, reduce_min=None) -> int:
     n_reaped, reaped = th.reap_orphan_parks(_live_rids(sched, running), f"{th.PARK_PART}{tp_rank}")
     if n_reaped:
         logger.info("F4 PARK-REAP files=%d rids=%s (parts of rids D no longer holds)",
-                    n_reaped, [r[:12] for r in reaped])
+                    n_reaped, list(reaped))
     if not running:
         return 0
     part = f"{th.PARK_PART}{tp_rank}-{os.getpid()}"
@@ -368,7 +368,7 @@ def _park_end(sched, running, *, reduce_min=None) -> int:
             part, tp_size, 2 * interval, anchor=anchor, max_rows=max_rows,
         )
         if refusal:
-            why[str(req.rid)[:12]] = refusal
+            why[str(req.rid)] = refusal
         else:
             events.append(ev)
     sync_ms = th.park_end_barrier(events) if events else 0.0
@@ -503,7 +503,7 @@ def hold_parked(sched, *, hold_armed: bool) -> int:
     hold[:] = d_seats.order_waiting(moved) + [h for h in hold if id(h) not in ids]
     logger.info("WEG2-D-PARK hold: %d parked request(s) at the head of the dormant hold %s "
                 "(prefetch issued during the flip; the wake releases them first)",
-                len(moved), [str(r.rid)[:12] for r in moved])
+                len(moved), [str(r.rid) for r in moved])
     return len(moved)
 
 
@@ -553,8 +553,8 @@ def park_tick(sched) -> int:
         sched._add_request_to_queue(req, is_retracted=True)
     mine = _to_queue_head(sched, moved)
     logger.info("WEG2-D-PARK requeue (awake): %d parked request(s) at the queue head %s%s",
-                len(mine), [str(r.rid)[:12] for r in mine],
-                (", %d back to the #1471 settle %s" % (len(back), [str(r.rid)[:12] for r in back]))
+                len(mine), [str(r.rid) for r in mine],
+                (", %d back to the #1471 settle %s" % (len(back), [str(r.rid) for r in back]))
                 if back else "")
     return len(mine) + len(back)
 
@@ -580,7 +580,7 @@ def _capacity_requeue(sched, parked) -> int:
         sched._add_request_to_queue(req, is_retracted=True)
     mine = _to_queue_head(sched, moved)
     logger.info("#248h WEG2-D-PARK requeue (capacity): %d parked request(s) at the queue head %s -- "
-                "the arena holds their re-read now", len(mine), [str(r.rid)[:12] for r in mine])
+                "the arena holds their re-read now", len(mine), [str(r.rid) for r in mine])
     return len(mine)
 
 
@@ -603,7 +603,7 @@ def note_retracted(sched, retracted_reqs) -> int:
     mine = _to_queue_head(sched, retracted_reqs)
     logger.info("WEG2-D-PARK pressure: %d youngest request(s) parked %s (span retained; "
                 "resume when no older request is live)",
-                len(mine), [str(r.rid)[:12] for r in mine])
+                len(mine), [str(r.rid) for r in mine])
     return len(mine)
 
 
@@ -644,7 +644,7 @@ def _apply_park_defer(sched) -> int:
             sched.waiting_queue = rest + mine
         logger.info("WEG2-D-PARK seat-rotate: %d parked request(s) deferred this phase %s "
                     "(not resumed first; ordinary waiting work behind the hand-offs)",
-                    len(moved), [str(r.rid)[:12] for r in moved])
+                    len(moved), [str(r.rid) for r in moved])
     return len(moved)
 
 
@@ -723,8 +723,8 @@ def _lift_holds_when_idle(sched) -> None:
     released = _release_holds(sched)
     logger.warning("Q-698 SEAT-AGE HOLD-LIFT older=%s released=%s: refused NO_TOKEN with nothing "
                    "running on D -- no running request releases KV for it; its victims resume, "
-                   "it waits for their KV", sorted(r[:16] for r in held),
-                   [r[:16] for r in released])
+                   "it waits for their KV", sorted(held),
+                   [r for r in released])
 
 
 def displace_for_age(sched, running_batch) -> Optional[str]:
@@ -809,8 +809,8 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
                            "released=%s: displacing younger seats did not get the older request "
                            "admitted -- no further victim for it; the held victims resume and it "
                            "waits for the KV the running requests release",
-                           older[:16], counts.get(older, 0), DISPLACE_MAX_PER_OLDER,
-                           [str(r)[:16] for r in released])
+                           older, counts.get(older, 0), DISPLACE_MAX_PER_OLDER,
+                           [str(r) for r in released])
         return None
     idx = next(i for i, r in enumerate(reqs) if str(r.rid) == victim_rid)
     spec = not (getattr(running_batch, "spec_algorithm", None) is None
@@ -821,7 +821,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
         if n <= 8 or (n & (n - 1)) == 0:
             logger.info("SEAT-AGE DISPLACE-WAIT older=%s youngest=%s (n=%d): under speculative "
                         "decoding only the back of the batch may leave; the youngest is not the back",
-                        older[:16], victim_rid[:16], n)
+                        older, victim_rid, n)
         return None
     victim = _displace_at(sched, running_batch, reqs, idx)
     # Q-698: the victim waits for the older one it was parked for
@@ -839,7 +839,7 @@ def displace_for_age(sched, running_batch) -> Optional[str]:
     logger.warning("SEAT-AGE DISPLACE rid_out=%s older_waiting=%s trigger=%s running=%d cap=%s "
                    "pages_out=%s: the youngest running request pauses (span retained: its KV leaves "
                    "the device only as far as the older one needs it -- LRU eviction, tail last)",
-                   victim_rid[:16], older[:16], trigger, len(reqs), cap, pages_out)
+                   victim_rid, older, trigger, len(reqs), cap, pages_out)
     return victim_rid
 
 
@@ -912,7 +912,7 @@ def park_youngest(sched, recv_req):
     sched._weg2_asr_parked = n
     logger.warning("WEG2 ARRIVAL-SEAT YOUNGEST-PARK rid=%s running_before=%d n=%d: the youngest running "
                    "decode pauses at this round boundary (span retained, pressure park); its seat goes "
-                   "to the oldest waiter (user rule #246)", rid[:16], len(reqs), n)
+                   "to the oldest waiter (user rule #246)", rid, len(reqs), n)
     return _out(True, [rid], "parked (arrival-seat youngest)")
 
 
@@ -932,7 +932,7 @@ def exclude_displaced(sched, prefetch_verdicts) -> Optional[str]:
     prefetch_verdicts[rid] = False
     logger.info("SEAT-AGE DISPLACED-THIS-PASS rid=%s: requeued after the pass's prefetch "
                 "drain; excluded from this pass's admission (not-done verdict), it "
-                "resumes from the next pass", str(rid)[:16])
+                "resumes from the next pass", str(rid))
     return rid
 
 
@@ -995,7 +995,7 @@ def kv_displace_would_fit(sched, older_rid: str, running, seat: bool = False) ->
     sched._sa_kv_fit_n = n
     if k != 1 and (n <= 8 or (n & (n - 1)) == 0):
         logger.info("SEAT-AGE %s-DISPLACE-VERDICT older=%s need=%d free=%d younger_running=%d -> %s (n=%d)",
-                    "SEAT" if seat else "KV", str(older_rid)[:16], need, avail, len(young),
+                    "SEAT" if seat else "KV", str(older_rid), need, avail, len(young),
                     "fits free, nobody leaves" if k == 0 else
                     "not even with all younger seats: nobody leaves, backfill stays" if k is None else
                     "%d youngest must leave (one per pass)" % k, n)
@@ -1205,7 +1205,7 @@ def _note_decode_first(sched, gate) -> None:
     logger.info(
         "F3 DECODE-FIRST wake=%s deferred=%s rounds=%d -- the wake's hand-offs extend and "
         "decode first; the flip-parked resume(s) keep their seat and extend after",
-        key[0], sorted(r[:12] for r in gate.deferred), rounds_since_wake(sched))
+        key[0], sorted(gate.deferred), rounds_since_wake(sched))
 
 
 def park_abort(sched, recv_req) -> int:
@@ -1223,7 +1223,7 @@ def park_abort(sched, recv_req) -> int:
         n = th.remove_parks_aborted(rid, abort_all)
         if n:
             logger.info("F4 PARK-END abort: %d park part file(s) removed (rid=%s abort_all=%s)",
-                        n, rid[:12], abort_all)
+                        n, rid, abort_all)
     # Q-699: the aborted rid's tail staging ends with it (its parts may be gone)
     try:
         from sglang.srt.weg2 import tail_adopt as _ta
@@ -1245,7 +1245,7 @@ def park_abort(sched, recv_req) -> int:
             sched.tree_cache.release_aborted_request(req.rid)
         sched.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
     logger.info("WEG2-D-PARK abort: %d parked request(s) dropped (rid=%s abort_all=%s)",
-                len(gone), rid[:12], abort_all)
+                len(gone), rid, abort_all)
     return len(gone)
 
 

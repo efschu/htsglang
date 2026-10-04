@@ -221,7 +221,7 @@ class ParkDraftLedger:
     def line(self, event: str, rid: str, nbytes: int) -> str:
         gib = float(1 << 30)
         return (
-            f"{LEDGER_LINE} event={event} rid={str(rid)[:16]} bytes={int(nbytes)} "
+            f"{LEDGER_LINE} event={event} rid={str(rid)} bytes={int(nbytes)} "
             f"held_l2={self.l2 / gib:.4f} GiB held_l3={self.l3 / gib:.4f} GiB "
             f"peak_l2={self.peak_l2 / gib:.4f} GiB live={self.live} "
             f"cap={host_cap_bytes() / gib:.3f} GiB -- anonym, ungepinnt, bedarfsweise "
@@ -317,7 +317,7 @@ class ParkDraftEntry:
                         f.write(memoryview(b.numpy()).cast("B"))
             except OSError as e:  # the RAM copy stays: the entry remains L2
                 logger.warning("%s rid=%s L3 write to %s failed (%s): kept in L2",
-                               SAVE_LINE, self.rid[:16], path, e)
+                               SAVE_LINE, self.rid, path, e)
                 return
             with self._lock:
                 if not self._state["released"] and self._state["tier"] == TIER_L2:
@@ -375,7 +375,7 @@ def drop(req, reason: str, ledger: Optional[ParkDraftLedger] = None) -> int:
     setattr(req, ENTRY_ATTR, None)
     nbytes = entry.nbytes
     entry.release()
-    logger.info("%s rid=%s reason=%s bytes=%d", DROP_LINE, str(entry.rid)[:16], reason, nbytes)
+    logger.info("%s rid=%s reason=%s bytes=%d", DROP_LINE, str(entry.rid), reason, nbytes)
     if ledger is not None:
         logger.info(ledger.line("drop", entry.rid, nbytes))
     return nbytes
@@ -421,7 +421,7 @@ def _save_one(sched, bufs, req, *, pool_idx, length: int, site: str) -> Optional
     positions, blocks = _gather_nonzero(bufs, slots)
     if int(positions.numel()) == 0:
         logger.info("%s rid=%s site=%s rows=0 of=%d bytes=0 tier=none (no draft row D "
-                    "computed yet)", SAVE_LINE, str(req.rid)[:16], site, length)
+                    "computed yet)", SAVE_LINE, str(req.rid), site, length)
         return None
     nbytes = int(sum(b.numel() for b in blocks)) + int(positions.numel()) * 8
     cap = host_cap_bytes()
@@ -434,7 +434,7 @@ def _save_one(sched, bufs, req, *, pool_idx, length: int, site: str) -> Optional
             "no HiCacheFile directory for L3")
         logger.info("%s rid=%s site=%s rows=%d of=%d bytes=%d tier=none (over the L2 cap "
                     "%d B, %s) -- resume drafts over the #993 cold rows", SAVE_LINE,
-                    str(req.rid)[:16], site, int(positions.numel()), length, nbytes, cap, why)
+                    str(req.rid), site, int(positions.numel()), length, nbytes, cap, why)
         return None
     entry = ParkDraftEntry(rid=str(req.rid), site=site, length=length,
                            positions=positions, blocks=blocks, ledger=ledger)
@@ -444,7 +444,7 @@ def _save_one(sched, bufs, req, *, pool_idx, length: int, site: str) -> Optional
         tier = TIER_L3
     setattr(req, ENTRY_ATTR, entry)
     logger.info("%s rid=%s site=%s rows=%d of=%d bytes=%d tier=%s digest=%08x ms=%.1f",
-                SAVE_LINE, str(req.rid)[:16], site, entry.rows, length, entry.nbytes, tier,
+                SAVE_LINE, str(req.rid), site, entry.rows, length, entry.nbytes, tier,
                 entry.digest, (time.perf_counter() - t0) * 1000.0)
     logger.info(ledger.line("save", entry.rid, entry.nbytes))
     return entry
@@ -518,12 +518,12 @@ def _restore_one(sched, bufs, req, entry: ParkDraftEntry) -> None:
     if pool_idx is None or n_prefix <= 0:
         logger.info("%s rid=%s rows=0 prefix=%d tier=none (no cached prefix at the "
                     "resume: the extend recomputes every draft row)", RESTORE_LINE,
-                    str(entry.rid)[:16], n_prefix)
+                    str(entry.rid), n_prefix)
         return
     blocks, tier = entry.blocks()
     if [int(b.shape[1]) for b in blocks] != [_row_bytes(b) for b in bufs] or len(blocks) != len(bufs):
         logger.warning("%s rid=%s rows=0 tier=%s REFUSED: draft geometry changed since the "
-                       "park (%s vs %s)", RESTORE_LINE, str(entry.rid)[:16], tier,
+                       "park (%s vs %s)", RESTORE_LINE, str(entry.rid), tier,
                        [int(b.shape[1]) for b in blocks], [_row_bytes(b) for b in bufs])
         return
     host_digest = _digest_blocks(blocks, entry.sample)
@@ -562,7 +562,7 @@ def _restore_one(sched, bufs, req, entry: ParkDraftEntry) -> None:
     )
     log = logger.info if ok else logger.warning
     log("%s rid=%s site=%s rows=%d of=%d zeroed=%d prefix=%d tier=%s digest=%s ms=%.1f",
-        RESTORE_LINE, str(entry.rid)[:16], entry.site, m, entry.rows, int(zpos.numel()),
+        RESTORE_LINE, str(entry.rid), entry.site, m, entry.rows, int(zpos.numel()),
         n_prefix, tier, verdict, (time.perf_counter() - t0) * 1000.0)
 
 

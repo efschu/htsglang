@@ -133,7 +133,7 @@ def _released(sched, req) -> None:
     held_ms = (_time.monotonic() - float(getattr(req, REQ_SINCE_ATTR, _time.monotonic()))) * 1000.0
     setattr(sched, HOLD_MAX_ATTR, max(float(getattr(sched, HOLD_MAX_ATTR, 0.0) or 0.0), held_ms))
     logger.info("WEG2 PARK-WINDOW-GATE released rid=%s defers=%d held_ms=%.0f window=%s",
-                str(getattr(req, "rid", "?"))[:16], n, held_ms,
+                str(getattr(req, "rid", "?")), n, held_ms,
                 "open" if getattr(sched, STATE_ATTR, None) is not None else "cleared")
     setattr(req, REQ_DEFERS_ATTR, 0)
 
@@ -176,6 +176,6 @@ def defers(sched, req, *, uncached: int, prefix_tokens: int, batch_empty: bool,
     if n <= 8 or n % 64 == 0:
         logger.info("WEG2 PARK-WINDOW-GATE defer rid=%s uncached=%d prefix=%d cost_ms=%.0f left_ms=%d "
                     "running=%d (n=%d): the forward would end after the collect window -- the park "
-                    "must not wait for it", str(getattr(req, "rid", "?"))[:16], int(uncached),
+                    "must not wait for it", str(getattr(req, "rid", "?")), int(uncached),
                     int(prefix_tokens), cost, int(window["left_ms"]), int(running_n), n)
     return True

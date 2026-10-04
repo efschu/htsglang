@@ -92,7 +92,7 @@ class HolPass:
         n = st["logged"]
         if n <= 16 or n % 64 == 0:
             logger.info("WEG2 D-HOL-OVERTAKE head=%s (blocked %d pass(es), waits for KV) admitted past it: %s "
-                        "(n=%d)", self.head[:16], st["passes"], [r[:16] for r in rids[:6]], n)
+                        "(n=%d)", self.head, st["passes"], rids[:6], n)
 
 
 def note_head_admitted(sched: Any, rid: str) -> None:

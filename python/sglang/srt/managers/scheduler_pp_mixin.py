@@ -1451,8 +1451,8 @@ def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
                         _1000_SPECIMENS.append(
                             (
                                 int(mb_id),
-                                tuple(sorted(h[:8] for h in held))[:3],
-                                tuple(sorted(str(k)[:8] for k in up))[:3],
+                                tuple(sorted(held))[:3],
+                                tuple(sorted(str(k) for k in up))[:3],
                                 # THE FIELD THAT DECIDES THE RELEASE: is the
                                 # held occupant a chunked continuation (the
                                 # mover's legality argument covers it) or a
@@ -1611,7 +1611,7 @@ def pp_slot_disagreement_message(*, pp_rank, mb_id, stamp, recv_fwd_ct, batch) -
 
     try:
         reqs = list(getattr(batch, "reqs", None) or ())
-        rids = ",".join(str(getattr(r, "rid", "?"))[:16] for r in reqs) or "-"
+        rids = ",".join(str(getattr(r, "rid", "?")) for r in reqs) or "-"
         extend = getattr(batch, "extend_num_tokens", None)
     except Exception:  # noqa: BLE001
         rids, extend = "?", None
@@ -2004,7 +2004,7 @@ def pp_parked_continuation_stamp(holder, incoming, out: Dict[str, object]) -> No
             "#968 FORWARD rank=%s out=%d rids=%s (seen=%d)",
             own_rank,
             len(merged),
-            ",".join(str(merged[r][0])[:8] for r in sorted(merged)),
+            ",".join(str(merged[r][0]) for r in sorted(merged)),
             seen,
         )
 
@@ -2365,7 +2365,7 @@ def pp_prefetch_completion_stamp(holder, incoming, out: Dict[str, object]) -> No
                 "prints as 'absent' rather than reading as zero.",
                 own_rank,
                 len(own),
-                ",".join(f"{rid[:8]}={completed}" for rid, completed, _r in own[:8]),
+                ",".join(f"{rid}={completed}" for rid, completed, _r in own[:8]),
                 seen,
             )
 
@@ -5322,7 +5322,7 @@ class SchedulerPPMixin:
                 if cur_batch:
                     try:
                         _reqs = getattr(cur_batch, "reqs", None) or []
-                        _rids = ",".join(str(getattr(r, "rid", "?"))[:8] for r in _reqs)
+                        _rids = ",".join(str(getattr(r, "rid", "?")) for r in _reqs)
                         _ext = getattr(cur_batch, "extend_num_tokens", None)
                         logger.warning(
                             "#969N ADMIT slot=%s fwd_ct=%s bs=%d extend=%s "
@@ -6340,7 +6340,7 @@ class SchedulerPPMixin:
                         getattr(getattr(self, "ps", None), "pp_rank", "?"),
                         len(_traced),
                         [type(r).__name__ for r in _traced][:4],
-                        [str(getattr(r, "rid", "?"))[:8] for r in _traced][:4],
+                        [str(getattr(r, "rid", "?")) for r in _traced][:4],
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -9133,7 +9133,7 @@ class SchedulerPPMixin:
             occupied = [(-1, ("<unreadable>",))]
         occ_txt = (
             ", ".join(
-                f"slot{_s}=[{','.join(r[:8] for r in _r) or 'no-reqs'}]"
+                f"slot{_s}=[{','.join(_r) or 'no-reqs'}]"
                 for _s, _r in occupied
             )
             or "NONE OCCUPIED"
@@ -9145,14 +9145,14 @@ class SchedulerPPMixin:
             for _rid in _rids[:4]:
                 try:
                     throttles.append(
-                        f"{_rid[:8]}(unresolved_rounds="
+                        f"{_rid}(unresolved_rounds="
                         f"{guard.unresolved_rounds(_rid) if guard else '?'},"
                         f"terminator_spent="
                         f"{guard.terminator_spent(_rid) if guard else '?'},"
                         f"offer_streak={guard.offer_streak(_rid) if guard else '?'})"
                     )
                 except Exception:  # noqa: BLE001
-                    throttles.append(f"{_rid[:8]}(<unreadable>)")
+                    throttles.append(f"{_rid}(<unreadable>)")
         thr_txt = "; ".join(throttles) or "no rid held"
 
         # #1073c: WHY THE ARM WAS TAKEN AT ALL. Boot 1077 printed "NONE
@@ -9183,30 +9183,30 @@ class SchedulerPPMixin:
         except Exception:  # noqa: BLE001
             _proxy = None
         why = (
-            f"chunked_req={'set(' + str(getattr(_chunked, 'rid', '?'))[:8] + ')' if _chunked is not None else 'None'}, "
+            f"chunked_req={'set(' + str(getattr(_chunked, 'rid', '?')) + ')' if _chunked is not None else 'None'}, "
             f"any_slot_occupied={bool(occupied)}, proxy_signal={_proxy}"
         )
         # CONTEXT, not a candidate: #1079 deleted this term from the idle
         # test, so a queued rid can no longer hold the rank on this arm.
         context = (
             f"waiting_queue={len(_wq)}"
-            f"{'[' + ','.join(r[:8] for r in _wq_rids[:4]) + ']' if _wq_rids else ''}"
+            f"{'[' + ','.join(_wq_rids[:4]) + ']' if _wq_rids else ''}"
         )
         # The throttles for the QUEUED rids too -- with an empty ring those are
         # the only rids in play, and the earlier version reported none of them.
         for _rid in _wq_rids[:4]:
             try:
                 throttles.append(
-                    f"queued:{_rid[:8]}(unresolved_rounds="
+                    f"queued:{_rid}(unresolved_rounds="
                     f"{guard.unresolved_rounds(_rid) if guard else '?'},"
                     f"terminator_spent={guard.terminator_spent(_rid) if guard else '?'},"
                     f"offer_streak={guard.offer_streak(_rid) if guard else '?'})"
                 )
             except Exception:  # noqa: BLE001
-                throttles.append(f"queued:{_rid[:8]}(<unreadable>)")
+                throttles.append(f"queued:{_rid}(<unreadable>)")
         thr_txt = "; ".join(throttles) or "no rid held and none queued"
 
-        held = tuple(r[:8] for _s, _r in occupied for r in _r)[:4]
+        held = tuple(r for _s, _r in occupied for r in _r)[:4]
         counters = getattr(self, "pp_flip_counters", None)
         receiver = getattr(self, "pp_chain_receiver", None)
         waited = time.monotonic() - float(since.get(mb_id, time.monotonic()))
@@ -9563,7 +9563,7 @@ class SchedulerPPMixin:
                             "left in the inbox (defer_told=%d).",
                             mb_id,
                             len(_told_missing),
-                            str(_told_missing[0])[:8],
+                            str(_told_missing[0]),
                             stats["defer_told"],
                         )
                     _missing = list(_missing) + list(_told_missing)
@@ -9595,7 +9595,8 @@ class SchedulerPPMixin:
                         _trace("defer_told_cap")
                         raise PpRowDeferCapExceeded(
                             "#791T STORE-TOLD HOP OVERDUE: the frame's row admits "
-                            f"rid(s) {','.join(str(r)[:8] for r in _told_missing[:4])} "
+                            f"rid(s) {','.join(str(r) for r in _told_missing[:4])}"
+                            f"{' +%d more' % (len(_told_missing) - 4) if len(_told_missing) > 4 else ''} "
                             "whose Weg2StoreTold never reached this rank within the "
                             "row-defer lap cap (the request is queued here, its "
                             "told is not) -- " + str(_verdict.message)
@@ -9622,7 +9623,7 @@ class SchedulerPPMixin:
                             "missing-set); scheduler-wide defer_rid=%d).",
                             mb_id,
                             len(_missing),
-                            str(_missing[0])[:8],
+                            str(_missing[0]),
                             _verdict.occurrence,
                             _verdict.cap,
                             _dr,
