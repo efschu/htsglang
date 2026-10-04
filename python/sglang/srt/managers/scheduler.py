@@ -6890,6 +6890,8 @@ class Scheduler(
             # NW (30.09.): a re-read the budget refused has not spent the writer's ack
             _sw_nw.keep_ack_if_unread(req, _act)
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
+            if _sw_nw.carry_holds_lapse(req, state):
+                lapsed = False  # SC (#1210): a carried clock awaits this wake's own read once
             # P4b: no writer and no read in flight = decided now (the bound would
             # release the same request "as it is" 20 s later).
             # a re-read the group issued this tick is a read in flight, on this rank too

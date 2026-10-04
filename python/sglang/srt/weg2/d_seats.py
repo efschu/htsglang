@@ -277,6 +277,10 @@ class AdmissionGate:
     #: F3: the wake whose members pass the barrier while ``deferred`` holds
     #: (their seats are the wake's ``handoff_n``, counted at the wake)
     cohort_wake: Optional[int] = None
+    #: SB (#1210): the phase's seats left after the running requests and the
+    #: seats held for every parked request still waiting (queue + outside);
+    #: None = no phase seat count known (no backfill, the barrier as before)
+    seat_room: Optional[int] = None
 
     def skip(self, req, admitted=None, skip_extend: bool = False) -> Optional[str]:
         """Census key when ``req`` is skipped this pass, else None.
@@ -314,7 +318,33 @@ class AdmissionGate:
         if _sa.enabled() and self.oldest_parked_age is not None:
             if _arrival(req) < self.oldest_parked_age:
                 return None
+        if self._backfill(admitted):
+            return None
         return "weg2_d_park_first"
+
+    def _backfill(self, admitted) -> bool:
+        """SB (#1210, NF y9nf4 1004_031945 D): the barrier stood ONLY on parked
+        requests outside the queue (#1471 settle: weg2-8-79 / weg2-8-82, their
+        store read short for good after the sleep flush lost their anchors) and
+        held the 69-token newcomer weg2-12-99 for 43 passes over 7 D phases of
+        6 seats with 1-3 running (``weg2_d_park_first=1(first=weg2-12-99)``).
+        A request outside the queue is not admitted in this pass anyway; its
+        seat stays held (``seat_room`` subtracts it), and a newcomer takes only
+        a seat beyond those -- the user's backfill rule (30.09.: a younger small
+        one runs beside the older ones it does not displace). Not while a
+        parked request IN the queue still waits or is blocked: the older one
+        gets the freed room first. Rank-uniform: the phase seats (wake
+        request), the running batch, the settle list (group-MIN) and this
+        pass's admitted list."""
+        if self.seat_room is None or admitted is None or not sb_enabled():
+            return False
+        if self.blocked or not self.parked_outside:
+            return False
+        adm = set(admitted)
+        if not self.parked_in_queue <= adm:
+            return False
+        newcomers = len(adm - set(self.parked_in_queue))
+        return self.seat_room - newcomers > 0
 
 
 @dataclass
@@ -475,6 +505,7 @@ def admission_gate(
     avail_tokens: Optional[int] = None,
     resume_book: Optional[ResumeBook] = None,
     decode_first: Optional[DecodeFirst] = None,
+    seats: Optional[int] = None,
 ) -> AdmissionGate:
     """The stage-1 rule, per pass.
 
@@ -536,7 +567,11 @@ def admission_gate(
     )
     _waiting_parked = [r for r in parked_waiting if str(r.rid) not in blocked] or parked_waiting
     oldest = min((_arrival(r) for r in _waiting_parked + parked_outside), default=None)
+    # SB (#1210): every request outside the queue (settle, dormant hold) keeps a seat
+    room = (None if seats is None else
+            int(seats) - len(running) - len(parked_waiting) - len(list(pending_outside)))
     return AdmissionGate(barrier=True, blocked=frozenset(blocked), note=note,
+                         seat_room=room,
                          oldest_parked_age=oldest,
                          parked_in_queue=frozenset(str(r.rid) for r in parked_waiting),
                          parked_outside=len(parked_outside),
@@ -545,6 +580,15 @@ def admission_gate(
 
 
 AP_ENV = "SGLANG_WEG2_D_PARK_BARRIER_ADMITTED"
+#: SB (#1210): newcomers backfill the phase's free seats while the barrier
+#: stands only on parked requests outside the queue (default on, 0 = off)
+SB_ENV = "SGLANG_WEG2_D_PARK_BARRIER_BACKFILL"
+
+
+def sb_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """SB (#1210), default ON; 0 = the barrier holds every newcomer as before."""
+    e = os.environ if env is None else env
+    return str(e.get(SB_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
 def ap_enabled(env: Optional[Mapping[str, str]] = None) -> bool:

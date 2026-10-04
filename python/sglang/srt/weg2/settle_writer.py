@@ -228,9 +228,71 @@ def settle_since_for_wake(req, now: float) -> float:
     re-stamped for ever. Every other request starts the bound at this wake,
     as before."""
     since = getattr(req, "_1471_since", None)
+    carry = getattr(req, CARRY_ATTR, None)
+    setattr(req, CARRY_ATTR, None)
+    setattr(req, CARRIED_ATTR, False)
     if budget_pending(req) and since is not None:
         return float(since)
+    if (carry is not None and carry_enabled()
+            and getattr(req, "_weg2_settled_wake", None) == carry[1]):
+        # SC (#1210): folded out of the settle into the flip park and still
+        # short at this wake -- the clock of the FIRST short wake runs on; this
+        # wake's own read is awaited once (:func:`carry_holds_lapse`).
+        setattr(req, CARRIED_ATTR, True)
+        return float(carry[0])
     return float(now)
+
+
+# ---------------------------------------------------------------------------
+# SC (#1210, 04.10., NF y9nf4 e23f7dff30 boot 1004_031945, D TP0): the sleep
+# 03:33:18 found the Mamba anchor arena full (``#1427 ARENA-CLAIM REFUSED
+# statuses=[4]`` x8, ``#1421 BACKUP-REFUSED why=mamba_claim/parent_unbacked``)
+# and dropped the park anchors of weg2-8-79 (49408) and weg2-8-82 (76032)
+# (``WEG2-ANCHOR-LOST at=flush``). Every later store read stopped at the
+# deepest host anchor (47104 / 67840) -- for good, nobody could write it --
+# yet the settle polled (``writer=p-handoff``), each park_running folded the
+# two into the flip park (``settle-folded``) and each wake re-stamped the 20-s
+# clock; no D phase (15-19 s) let it lapse: 10 wakes, 5.5 min, 427 s wall,
+# and the park barrier held a 69-token newcomer (weg2-12-99) for 262 s.
+# The bound runs over wakes for a folded request now (as #287 NEED0 for a
+# budget-refused one); the wake's own read is awaited once, so a store P did
+# complete in its phase is still read before the lapse.
+# ---------------------------------------------------------------------------
+
+#: the settle clock carried out of the settle by a flip-park fold:
+#: ``(_1471_since, _weg2_settled_wake at the fold)`` -- stale once the request
+#: was released (any release stamps ``_weg2_settled_wake``)
+CARRY_ATTR = "_1471_carry"
+#: this wake's settle clock is a carried one (cleared once its read answered)
+CARRIED_ATTR = "_1471_carried"
+CARRY_ENV = "SGLANG_WEG2_SETTLE_CLOCK_CARRY"
+
+
+def carry_enabled(env=None) -> bool:
+    """SC, default ON; 0 = every wake starts the bound anew (as before)."""
+    e = os.environ if env is None else env
+    return str(e.get(CARRY_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def note_fold(req) -> None:
+    """A settle request folded into the flip park: remember its clock."""
+    since = getattr(req, "_1471_since", None)
+    if since is None:
+        return
+    setattr(req, CARRY_ATTR, (float(since), getattr(req, "_weg2_settled_wake", None)))
+
+
+def carry_holds_lapse(req, state: str) -> bool:
+    """True while a carried clock waits for this wake's OWN read (still in
+    flight). Once that read has answered the hold is spent for this wake --
+    a later 2-s re-read never holds the lapse again (rank-local; the release
+    is the group MIN of the lapse flags)."""
+    if not getattr(req, CARRIED_ATTR, False):
+        return False
+    if state == "reading":
+        return True
+    setattr(req, CARRIED_ATTR, False)
+    return False
 
 
 def reset_for_wake(req) -> None:
