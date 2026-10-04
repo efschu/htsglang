@@ -726,6 +726,13 @@ class Envs:
     # standing still until the deadman. Decided on the host, carried by the
     # H105 verdict broadcast. 0 = never stop.
     SGLANG_WEG2_FORM_A_DEADLOCK_STOP_S = EnvFloat(120.0)
+    # POOLLEAK_INSTR (NF y9nf6 boot 3, 07:03:50Z: "[full] ... withheld=92672
+    # ... deficit of 128 row(s)" + 3 mamba slots on TP1/TP2 right after a D
+    # park): LOG-ONLY instruments, no behaviour -- per-request pool holdings
+    # and the pool ledger before/after the park's retract_all, a read-only
+    # ledger line after every park, and in the leak report the enumerated
+    # leaked full ids MINUS the KvRowCap-withheld ids (weg2/poolleak_instr.py).
+    SGLANG_WEG2_POOLLEAK_INSTR = EnvBool(False)
     # L3_WRITE_BEHIND_S (L3-REUSE 0928, NF rc12z13: the first request after a
     # boot read 399 of 512 KV pages from L3 -- the rest had been in the
     # boot's /dev/shm arena only -- and the QSA index for 47): the tick of the

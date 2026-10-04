@@ -950,6 +950,16 @@ class SchedulerInvariantChecker:
 
     def _report_leak(self, pool_name: str, token_msg: str):
         msg = f"{pool_name} memory leak detected! {token_msg}"
+        # POOLLEAK-INSTR (3), SGLANG_WEG2_POOLLEAK_INSTR (default off): the
+        # leaked full ids minus the KvRowCap-withheld ids -- the rows nobody
+        # owns, by id (y9nf6 b3: 92800 listed = 92672 withheld + 128). Log only.
+        from sglang.srt.weg2 import poolleak_instr
+
+        if poolleak_instr.enabled():
+            line = poolleak_instr.unwithheld_leak_ids(self._allocator(), self.tree_cache)
+            if line:
+                logger.error("%s", line)
+                msg += "\n" + line
         raise_error_or_warn(
             self,
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),

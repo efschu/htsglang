@@ -34,6 +34,7 @@ from typing import Optional
 from sglang.srt.managers import weg2_resumable_depth
 from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_split
 from sglang.srt.weg2 import handback_claim as _hb
+from sglang.srt.weg2 import poolleak_instr as _poolleak
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,8 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
     _park_end(sched, running)
     _ph("end")
     park_hold_yield.begin(getattr(sched, "tree_cache", None))
+    # POOLLEAK-INSTR (1): holdings + ledger before the retraction (log only)
+    _pl_before = _poolleak.park_snapshot(sched, running, phase="before-retract", epoch=epoch)
     # PARK-RETRACT-SPLIT: the retract phase split per request (release /
     # write-through backup / controller write / rest), one line per park
     retracted = (
@@ -193,6 +196,7 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         if running else []
     )
     _ph("retract")
+    _poolleak.park_snapshot(sched, running, phase="after-retract", epoch=epoch)  # (1)
     sched.running_batch.batch_is_full = False
     sched.chunked_req = None
     now = time.monotonic()
@@ -290,6 +294,8 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
                 logger.info("WEG2-D-PARK READ=RESUMABLE rid=%s cap %s -> %s",
                             str(req.rid)[:12], before, d_park_read.describe(req))
     _ph("clamp")
+    # POOLLEAK-INSTR (2): the idle equation after the park, a line, never a raise
+    _poolleak.ledger_line(sched, epoch=epoch, before=_pl_before)
     logger.info("WEG2-FLIPCYCLE stage=park epoch=%d n=%d ms=%.0f floor_ms=%d sub=%s (H3: the park's "
                 "phases on the scheduler thread; floor = the END-state D2H)", epoch, len(retracted),
                 (time.perf_counter() - _t_park0) * 1000.0, 30 * max(1, len(retracted)) // 3 or 10,
