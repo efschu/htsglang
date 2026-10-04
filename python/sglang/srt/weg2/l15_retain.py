@@ -57,6 +57,8 @@ from sglang.srt.weg2.l15_manifest import (
 )
 from sglang.srt.weg2.l15_manifest import write as manifest_write
 from sglang.srt.weg2.l15_policy import HoldSet, select_hold
+from sglang.srt.weg2 import l15_pool
+from sglang.srt.weg2.l15_park import park_plan
 
 __all__ = [
     "PAD_SLOTS",
@@ -239,6 +241,11 @@ class RoundPlan:
     anchor_moves: list
     new_anchors: Dict
     manifest: Optional[Manifest] = None
+    # L15-POOL S2 (None = the per-card path): the guest pieces the cap-0
+    # ranks' compacted rows park in (``l15_park.ParkPiece``) and the digest
+    # of the whole pool decision the group compares (``agree_pool``)
+    guest_pieces: Optional[tuple] = None
+    pool_fp: Optional[str] = None
 
 
 def plan_round(
@@ -251,13 +258,29 @@ def plan_round(
     prefix: Sequence[int],
     epoch: int,
     log: Callable[[str], None],
+    pool: Optional[bool] = None,
 ) -> Optional["RoundPlan"]:
     """Steps (1)-(2) of :func:`retain_at_sleep` (select_hold, compact_plan,
-    anchor_plan). None = benign skip, nothing touched (logged as before)."""
+    anchor_plan). None = benign skip, nothing touched (logged as before).
+
+    ``pool`` (None = ``SGLANG_WEG2_L15_POOL`` from the environment): the S2
+    pooled hold -- the cap-0 ranks' shards need guest room in the capped
+    ranks' free hold rows. The room is checked HERE on the COMPACTED rows
+    (``park_plan``) before anything moves: a request without room is dropped,
+    lowest priority first (reason ``pool_full``), never held half and never
+    paid for in a retain the park would refuse afterwards. False = today's
+    path, byte for byte."""
+    import os as _os
+
     candidates = list(candidates)
+    if pool is None:
+        pool = l15_pool.pool_on(_os.environ)
+    guest_pieces = None
+    pool_fp = None
     # (1) who stays
     try:
-        hs = select_hold(candidates, caps_rows_by_rank, cap_anchor_slots)
+        hs = (l15_pool.select_hold_pool if pool else select_hold)(
+            candidates, caps_rows_by_rank, cap_anchor_slots)
         if not hs.rids:
             log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold")
             return None
@@ -277,10 +300,25 @@ def plan_round(
         # request until every capped rank's keep fits its cap.
         trimmed = []
         _rows0 = tuple(int(x) for x in plan.rows_by_rank)
-        while hs.rids and any(
+        def _home_over(pl):
+            return any(
                 int(caps_rows_by_rank[r]) > 0
-                and int(plan.rows_by_rank[r]) > int(caps_rows_by_rank[r])
-                for r in range(len(plan.rows_by_rank))):
+                and int(pl.rows_by_rank[r]) > int(caps_rows_by_rank[r])
+                for r in range(len(pl.rows_by_rank)))
+
+        def _guest_refusal(pl):
+            # S2: every cap-0 rank's compacted rows must find guest room in
+            # the capped ranks' free hold rows (the SAME function the park
+            # runs at the release, so plan and park cannot disagree)
+            if not pool:
+                return None
+            return park_plan(list(pl.rows_by_rank),
+                             [int(c) for c in caps_rows_by_rank])[1]
+
+        _reasons = []
+        while hs.rids and (_home_over(plan) or _guest_refusal(plan) is not None):
+            _why = "keep_over_cap" if _home_over(plan) else l15_pool.REASON_POOL_FULL
+            _reasons.append(_why)
             trimmed.append(hs.rids[-1])
             keep_rids = hs.rids[:-1]
             _rows = {c.rid: c.rows_by_rank for c in candidates}
@@ -289,7 +327,7 @@ def plan_round(
                 rows_by_rank=tuple(
                     sum(int(_rows[x][r]) for x in keep_rids)
                     for r in range(len(hs.rows_by_rank))),
-                excluded=tuple(hs.excluded) + ((trimmed[-1], "keep_over_cap"),))
+                excluded=tuple(hs.excluded) + ((trimmed[-1], _why),))
             if not keep_rids:
                 break
             plan = compact_plan({rid: slots_of(rid) for rid in hs.rids},
@@ -298,7 +336,10 @@ def plan_round(
             log(f"L15-RETAIN trimmed n={len(trimmed)} rids={trimmed} "
                 f"keep_rows={_rows0} caps={tuple(int(c) for c in caps_rows_by_rank)} "
                 f"l_h={plan.l_h} "
-                f"(compacted keep rows over a capped rank's hold region)")
+                + ("(compacted keep rows over a capped rank's hold region)"
+                   if not pool else
+                   "(compacted keep rows over a capped rank's hold region or "
+                   f"without guest room for the cap-0 rows; reasons={_reasons})"))
         if not hs.rids:
             log(f"L15-RETAIN epoch={epoch} n=0 nothing_to_hold (all trimmed)")
             return None
@@ -315,7 +356,23 @@ def plan_round(
         rid: anchor_map.get(int(anchor_slot_of(rid)), int(anchor_slot_of(rid)))
         for rid in hs.rids
     }
-    return RoundPlan(hs=hs, plan=plan, a_h=a_h, anchor_moves=anchor_moves, new_anchors=new_anchors)
+    if pool:
+        # the final plan's guest placement: the loop above ended only when
+        # park_plan accepted it, so a refusal here is impossible -- if it
+        # happens anyway the round is not held (never "held without room")
+        guest_pieces, _gwhy = park_plan(list(plan.rows_by_rank),
+                                        [int(c) for c in caps_rows_by_rank])
+        if _gwhy is not None:
+            log(f"L15-RETAIN skipped reason=pool-no-guest-room: {_gwhy}")
+            return None
+        guest_pieces = tuple(guest_pieces)
+        pool_fp = l15_pool.plan_fingerprint(
+            hs.rids, plan.rows_by_rank, caps_rows_by_rank, guest_pieces)
+        log(l15_pool.plan_line(epoch, hs, caps_rows_by_rank, plan.rows_by_rank,
+                               guest_pieces, pool_fp, len(candidates)))
+    return RoundPlan(hs=hs, plan=plan, a_h=a_h, anchor_moves=anchor_moves,
+                     new_anchors=new_anchors, guest_pieces=guest_pieces,
+                     pool_fp=pool_fp)
 
 
 def manifest_of_plan(

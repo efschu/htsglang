@@ -142,7 +142,8 @@ def pre_retain_vote(planned, manifest, cap_rows: int,
 
 def decide_first(kwargs, reuse_on: bool, cap_rows_fn: Callable[[], int],
                  prefix_rank_fn: Callable[[], Tuple[int, List[int]]], gather,
-                 log: Callable[[str], None], warn: Callable[[str], None]):
+                 log: Callable[[str], None], warn: Callable[[str], None],
+                 pool: Optional[bool] = None):
     """L15-SLEEP-DECIDE-FIRST: the group's decision BEFORE the retain.
 
     ``kwargs`` is this rank's bind result (build_retain_kwargs) or None when
@@ -151,7 +152,18 @@ def decide_first(kwargs, reuse_on: bool, cap_rows_fn: Callable[[], int],
     "no" vote, never a skipped collective. Returns ``(planned, refusal)``:
     ``refusal`` is the group-uniform verdict (None = every rank retains,
     ``planned`` is this rank's RoundPlan to hand to retain_at_sleep);
-    otherwise nothing was moved on any rank."""
+    otherwise nothing was moved on any rank.
+
+    ``pool`` (None = ``SGLANG_WEG2_L15_POOL``): the S2 pooled round. The plan
+    already checked the guest room (``plan_round``); the ONE gather then also
+    carries the digest of the pool decision and a rank whose digest differs
+    from a peer's turns the round off for everyone (``agree_pool``) -- the
+    group verdict comes from the replicated list contents, never from a
+    rank-local divergence. False = the vote of 4cf740ad50, byte for byte."""
+    if pool is None:
+        from sglang.srt.weg2 import l15_pool as _pl
+
+        pool = _pl.pool_on(os.environ)
     why = None
     planned = None
     try:
@@ -169,7 +181,7 @@ def decide_first(kwargs, reuse_on: bool, cap_rows_fn: Callable[[], int],
                     cap_anchor_slots=kwargs["cap_anchor_slots"],
                     prefix=kwargs["prefix"],
                     epoch=kwargs["epoch"],
-                    log=log)
+                    log=log, pool=bool(pool))
                 cap = int(cap_rows_fn())
                 man = None
                 if planned is not None and cap <= 0:
@@ -190,7 +202,12 @@ def decide_first(kwargs, reuse_on: bool, cap_rows_fn: Callable[[], int],
         planned = None
         warn("L15-SLEEP-DECIDE-FIRST vote failed (%s)" % (exc,))
     try:
-        dec = agree(why, gather)
+        if pool:
+            from sglang.srt.weg2 import l15_pool as _pl2
+
+            dec = _pl2.agree_pool(why, getattr(planned, "pool_fp", None), gather)
+        else:
+            dec = agree(why, gather)
     except Exception as exc:  # noqa: BLE001 -- as the PRE gather
         dec = "agree failed: %s" % (exc,)
         warn("L15-SLEEP-DECIDE-FIRST gather failed (%s)" % (exc,))

@@ -57,6 +57,7 @@ from typing import (
 from sglang.srt.weg2.l15_policy import Candidate, HoldSet, _order_key, select_hold
 
 POOL_SHADOW_ENV = "SGLANG_WEG2_L15_POOL_SHADOW"
+POOL_ENV = "SGLANG_WEG2_L15_POOL"
 POOL_RATES_ENV = "SGLANG_WEG2_L15_POOL_RATES"
 POOL_ANCHOR_BYTES_ENV = "SGLANG_WEG2_L15_POOL_ANCHOR_BYTES"
 _ON_VALUES = ("1", "true", "on", "yes")
@@ -69,6 +70,11 @@ REASON_ANCHORLESS = "anchorless"
 def pool_shadow_on(env: Mapping[str, str]) -> bool:
     """True when the S1 pool SHADOW is switched on (default off)."""
     return str(env.get(POOL_SHADOW_ENV, "") or "").strip().lower() in _ON_VALUES
+
+
+def pool_on(env: Mapping[str, str]) -> bool:
+    """True when the S2 pooled hold takes effect (default off)."""
+    return str(env.get(POOL_ENV, "") or "").strip().lower() in _ON_VALUES
 
 
 # -- the model ---------------------------------------------------------------
@@ -553,8 +559,13 @@ def shadow_line(epoch, ps: PoolShadow, caps_rows_by_rank: Sequence[int],
     )
 
 
+SHADOW_MODE = "SHADOW(log-only, no behaviour change)"
+POOL_MODE = ("POOL(S2: KV hold admitted against the sum of the segments, a rank "
+             "without a home segment parks its shards in foreign segments)")
+
+
 def boot_line(mib_by_card: Sequence[int], src_by_card: Sequence[str],
-              anchor_cap: int) -> str:
+              anchor_cap: int, mode: str = SHADOW_MODE) -> str:
     """The launcher's ``L15-POOL`` line: the pool as the SUM of the per-card
     posts (the planner still sizes per card -- physically it cannot be
     otherwise -- but admission is one pool).  S1: informational only."""
@@ -564,7 +575,139 @@ def boot_line(mib_by_card: Sequence[int], src_by_card: Sequence[str],
     return (
         f"L15-POOL cards={len(mibs)} segments={segs} mib={_fmt(mibs)} "
         f"total_mib={sum(mibs)} anchor_cap={int(anchor_cap)} "
-        f"src={','.join(srcs)} mode=SHADOW(log-only, no behaviour change)"
+        f"src={','.join(srcs)} mode={mode}"
+    )
+
+
+# -- S2: admission against the SUM for the rank without a home segment ----------
+
+
+REASON_NO_ROOM = "no_room"
+REASON_KEEP_OVER_CAP = "keep_over_cap"
+
+
+def select_hold_pool(
+    candidates: Sequence[Candidate],
+    cap_rows_by_rank: Sequence[int],
+    cap_anchor_slots: int,
+) -> HoldSet:
+    """``l15_policy.select_hold`` with the pool rule for a rank that has NO home
+    segment (cap 0): its KV shards are no longer waved through ("refilled from
+    L2 at the wake") but must find GUEST rows in the capped ranks' segments --
+    the admission runs against the SUM of the free rows, not rank by rank.
+
+    Everything else is today's policy word for word: anchorless candidates are
+    excluded up front, the order is seat > parked > served / younger / rid,
+    a capped rank's own rows must fit its own remaining cap (``no_room``;
+    capped ranks overflowing into foreign segments is S3), the anchor count
+    cap gives ``anchor_full``, later smaller candidates may still fit.  New:
+    ``pool_full`` = the home rows fit but the cap-0 ranks' rows do not fit the
+    capped ranks' free rows together.  With no cap-0 rank (or no rows there)
+    the result is identical to ``select_hold`` (pinned by a test).
+
+    The row sums here are the pre-compaction estimate; the exact check on the
+    compacted rows is ``l15_retain.plan_round`` (it drops the lowest-priority
+    request until ``park_plan`` places every guest row), BEFORE anything moves.
+    No safety factor, no extra ceiling: the caps are the budget.
+    """
+    candidates = list(candidates)
+    excluded: Dict[str, Tuple[str, str]] = {
+        c.rid: (c.rid, REASON_ANCHORLESS)
+        for c in candidates
+        if c.anchor_depth != c.kv_depth
+    }
+    ordered = sorted(
+        (c for c in candidates if c.anchor_depth == c.kv_depth), key=_order_key
+    )
+    caps = [max(0, int(c)) for c in cap_rows_by_rank]
+    rem = list(caps)
+    capped = [r for r, c in enumerate(caps) if c > 0]
+    guest_used = 0
+    admitted = []
+    for c in ordered:
+        rows = list(c.rows_by_rank)
+        # a capped rank's own rows must fit its own remaining cap -- decided
+        # by the ORIGINAL cap (a full capped rank, rem == 0, blocks)
+        if any(caps[r] > 0 and v > rem[r] for r, v in enumerate(rows)):
+            excluded[c.rid] = (c.rid, REASON_NO_ROOM)
+            continue
+        need = sum(v for r, v in enumerate(rows) if caps[r] == 0)
+        free_guest = sum(rem[h] - (rows[h] if h < len(rows) else 0) for h in capped) - guest_used
+        if need > free_guest:
+            excluded[c.rid] = (c.rid, REASON_POOL_FULL)
+            continue
+        if len(admitted) >= cap_anchor_slots:
+            excluded[c.rid] = (c.rid, REASON_ANCHOR_FULL)
+            continue
+        admitted.append(c)
+        for r, v in enumerate(rows):
+            if caps[r] > 0:
+                rem[r] -= v
+        guest_used += need
+    rows_by_rank = tuple(sum(c.rows_by_rank[r] for c in admitted) for r in range(len(caps)))
+    return HoldSet(
+        rids=tuple(c.rid for c in admitted),
+        rows_by_rank=rows_by_rank,
+        anchors=len(admitted),
+        excluded=tuple(excluded.values()),
+    )
+
+
+def plan_fingerprint(rids: Sequence[str], rows_by_rank: Sequence[int],
+                     caps: Sequence[int], pieces: Sequence) -> str:
+    """A short digest of the pool decision: the held rids in order, the
+    compacted keep rows per rank, the caps and the guest pieces
+    (``src, dst, src_row, dst_row, rows``).  Every rank derives it from the
+    SAME replicated lists; the group agreement compares it, so ranks that
+    planned a different pool (a divergence that would start mismatched
+    collectives) turn the round off instead of running it."""
+    import hashlib
+
+    blob = repr((
+        tuple(str(r) for r in rids),
+        tuple(int(x) for x in rows_by_rank),
+        tuple(int(x) for x in caps),
+        tuple((int(p.src), int(p.dst), int(p.src_row), int(p.dst_row), int(p.rows))
+              for p in pieces),
+    ))
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
+
+
+def agree_pool(why: Optional[str], fp: Optional[str], gather) -> Optional[str]:
+    """The group's ONE vote of a pooled round: ``None`` when every rank votes
+    ok AND every rank that planned a pool planned the SAME one (equal
+    :func:`plan_fingerprint`); otherwise the first named refusal.  Exactly one
+    gather, whatever the local state (like ``l15_sleep_agree.agree``)."""
+    votes = gather((why, fp))
+    bad = [v[0] for v in votes if v[0] is not None]
+    if bad:
+        return str(bad[0])
+    fps = sorted({str(v[1]) for v in votes if v[1] is not None})
+    nones = sum(1 for v in votes if v[1] is None)
+    if len(fps) > 1 or (fps and nones):
+        return "pool plan diverged across ranks (fingerprints %s, %d without a plan)" % (
+            ",".join(fps), nones)
+    return None
+
+
+def plan_line(epoch, hs: HoldSet, caps: Sequence[int], keep_rows: Sequence[int],
+              pieces: Sequence, fp: str, n_candidates: int) -> str:
+    """``L15-POOL-PLAN at=sleep`` (S2, written by the planning, before anything
+    moves): what the pooled hold keeps, where the guest rows go, why the rest
+    stays out."""
+    pairs = {}
+    for p in pieces:
+        pairs[(int(p.src), int(p.dst))] = pairs.get((int(p.src), int(p.dst)), 0) + int(p.rows)
+    reasons: Dict[str, int] = {}
+    for _rid, why in hs.excluded:
+        reasons[why] = reasons.get(why, 0) + 1
+    ex = ",".join("%s:%d" % (k, reasons[k]) for k in sorted(reasons)) or "-"
+    return (
+        f"L15-POOL-PLAN at=sleep epoch={epoch} req={n_candidates} held={len(hs.rids)} "
+        f"keep_rows={_fmt(keep_rows)} caps={_fmt(caps)} "
+        f"guest_rows={sum(pairs.values())} "
+        f"guest_pairs={','.join(f'{o}>{h}:{n}' for (o, h), n in sorted(pairs.items())) or '-'} "
+        f"excluded={ex} fp={fp}"
     )
 
 

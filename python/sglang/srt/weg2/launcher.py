@@ -25389,6 +25389,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _not27b = l15_plan.refuse_not_27b(ns.profile, os.environ)
     if _not27b is not None:
         raise Weg2LaunchRefused(_not27b)
+    # L15-POOL S2: the pooled hold is a part of L1.5 -- no master, no pool
+    _poolmaster = l15_plan.refuse_pool_without_master(os.environ)
+    if _poolmaster is not None:
+        raise Weg2LaunchRefused(_poolmaster)
     if l15_plan.master_on(os.environ):
         if ns.profile == weg2_form.PROFILE_QWEN27B:
             l15_base = budgets_from_dc(
@@ -25417,7 +25421,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # L15-POOL S1 (log only): the per-card posts seen as ONE pool.
             from sglang.srt.weg2 import l15_keep_split, l15_pool
 
-            if l15_pool.pool_shadow_on(os.environ):
+            if l15_pool.pool_on(os.environ):
+                log(l15_pool.boot_line(
+                    [p.mib for p in l15_posts], [p.src for p in l15_posts],
+                    l15_keep_split.anchor_cap(os.environ), mode=l15_pool.POOL_MODE))
+            elif l15_pool.pool_shadow_on(os.environ):
                 log(l15_pool.boot_line(
                     [p.mib for p in l15_posts], [p.src for p in l15_posts],
                     l15_keep_split.anchor_cap(os.environ)))

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import card_identity
-from sglang.srt.weg2.l15_pool import POOL_SHADOW_ENV, pool_shadow_on
+from sglang.srt.weg2.l15_pool import POOL_ENV, POOL_SHADOW_ENV, pool_on, pool_shadow_on
 
 L15_MASTER_ENV = "SGLANG_WEG2_L15"
 L15_MIB_ENV = "SGLANG_WEG2_L15_MIB"
@@ -352,7 +352,8 @@ def refuse_dual(argv: Sequence[str], env: Mapping[str, str]) -> Optional[str]:
         return None
     armed = [name for name, on in ((L15_MASTER_ENV, master_on(env)),
                                    (HOT_HANDOVER_ENV, handover_on(env)),
-                                   (POOL_SHADOW_ENV, pool_shadow_on(env))) if on]
+                                   (POOL_SHADOW_ENV, pool_shadow_on(env)),
+                                   (POOL_ENV, pool_on(env))) if on]
     if not armed:
         return None
     return (f"{DUAL_REFUSAL_CODE}: --dual-layout with {', '.join(armed)} is refused in V1: "
@@ -371,13 +372,28 @@ def refuse_not_27b(profile: str, env: Mapping[str, str]) -> Optional[str]:
         return None
     armed = [name for name, on in ((L15_MASTER_ENV, master_on(env)),
                                    (HOT_HANDOVER_ENV, handover_on(env)),
-                                   (POOL_SHADOW_ENV, pool_shadow_on(env))) if on]
+                                   (POOL_SHADOW_ENV, pool_shadow_on(env)),
+                                   (POOL_ENV, pool_on(env))) if on]
     if not armed:
         return None
     return (f"{NOT27B_REFUSAL_CODE}: {', '.join(armed)} on profile {profile!r} is refused: "
             "L1.5 is a 27B-only feature (the 27B fits the VRAM whole, its free VRAM is "
             "context/cache; on NF free VRAM belongs to the MoE experts, there is no L1.5 "
             "variant). Turn the switch off for this profile.")
+
+
+POOLMASTER_REFUSAL_CODE = "W-L15-POOL-MASTER"
+
+
+def refuse_pool_without_master(env: Mapping[str, str]) -> Optional[str]:
+    """``SGLANG_WEG2_L15_POOL=1`` without the L1.5 master: every pool hook sits
+    behind the master gate, so the switch would silently do nothing -- refused
+    BY NAME (a silent off would let a boot run believing the pool holds)."""
+    if not pool_on(env) or master_on(env):
+        return None
+    return (f"{POOLMASTER_REFUSAL_CODE}: {POOL_ENV}=1 without {L15_MASTER_ENV}=1 is "
+            "refused: the pooled hold is a part of L1.5 and every one of its hooks "
+            f"sits behind the master -- set {L15_MASTER_ENV}=1 or turn {POOL_ENV} off.")
 
 
 def refuse_no_caps(posts: Sequence[L15Post], env: Mapping[str, str],

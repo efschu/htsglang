@@ -826,6 +826,20 @@ class Envs:
     # The ranks read it through l15_pool.pool_shadow_on(os.environ) (1/true/on/yes),
     # like every SGLANG_WEG2_L15* switch. Default off = today byte for byte.
     SGLANG_WEG2_L15_POOL_SHADOW = EnvBool(False)
+    # L15-POOL S2 (docs/L15-POOL-ENTWURF-1004.md sec 7, KV only, no anchor): the
+    # pooled hold takes effect. A rank with no home segment (cap 0) is no longer
+    # refused/refilled from L2 alone: the hold is admitted against the SUM of the
+    # segments (its KV shards need guest room in the capped ranks' free hold
+    # rows), the plan checks that room BEFORE the retain moves anything (a
+    # request without room is dropped, never held half), the cap-0 rank's rows
+    # park card to card in the capped ranks' segments (weg2/l15_park.py, group
+    # all_to_all) and come back at the wake; any pool failure = the group falls
+    # back to today's L2 refill. Marks: L15-POOL-OUT / L15-POOL-BACK /
+    # L15-POOL-CHECK. Only in the L15 path (SGLANG_WEG2_L15=1, 27B, never
+    # --dual-layout: refused by name). Read by the ranks through
+    # l15_pool.pool_on(os.environ) (1/true/on/yes). Default off = today's
+    # per-card path byte for byte.
+    SGLANG_WEG2_L15_POOL = EnvBool(False)
     # L15-POOL S1b (weg2/l15_pool_peak.py): the planner input P_AWAKE_PEAK_MIB
     # per card, built from measured WEG2-VRAM-PEAK windows (scripts/
     # l15_pool_peak_record.py): per card the MAXIMUM over boots/lines with its
