@@ -60,15 +60,26 @@ def park_active(env: Optional[Mapping[str, str]] = None) -> bool:
 
 
 def chunk_admit_tokens(extend_input_len: int, chunk_tokens: Optional[int],
-                       anchor_gap: int = 0) -> int:
+                       anchor_gap: int = 0, load_back: int = 0) -> int:
     """The tokens the adder charges at admission under per-chunk admission:
     the NEXT chunk (or the whole extend when it is shorter / chunking is
     off) plus the anchor gap. The rest of the request is not reserved --
-    the park funds it later."""
+    the park funds it later.
+
+    Q-700 (NF y9nf 10040027 P PP0 00:42:31Z, RANK-DEATH): the HOST LOAD-BACK
+    part of the extend is not chunked -- ``init_load_back`` puts all of it on
+    the device at admission. Charged as one chunk (min(ext, 16384)), weg2-10-83
+    (88768 loaded) and weg2-11-84 (154176) were admitted behind weg2-12-86's
+    13341-token chunk; their load-backs took 242944 rows (WEG2-ARENA-LOAD
+    dst=[16448,259391] of 262208), 2816 were left for the 13738 the batch's
+    extend allocates -> 'Prefill out of memory', evictable 0 (the loaded nodes
+    are the batch's own). ``load_back`` is charged WHOLE, the chunk only on
+    the rest."""
     ext = int(extend_input_len)
     if chunk_tokens is None or int(chunk_tokens) <= 0:
         return ext + int(anchor_gap)
-    return min(ext, int(chunk_tokens)) + int(anchor_gap)
+    lb = max(0, min(int(load_back or 0), ext))
+    return lb + min(ext - lb, int(chunk_tokens)) + int(anchor_gap)
 
 
 @dataclass(frozen=True)

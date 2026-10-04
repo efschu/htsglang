@@ -2514,8 +2514,10 @@ class PrefillAdder:
         # (today's gate) so a tight pool cannot ping-pong it.
         if _weg2_chunk_admit() and not getattr(req, "weg2_parked_span", 0):
             from sglang.srt.weg2.park import chunk_admit_tokens as _cat
+            # Q-700: the host load-back is not chunked -- charged whole
             total_tokens = (
-                _cat(cand_extend_input_len, self.rem_chunk_tokens)
+                _cat(cand_extend_input_len, self.rem_chunk_tokens,
+                     load_back=int(_pp_load_back_extent(req) or 0))
                 + max_new + self.page_size + mamba_gap_reserve
             )
         # Prefill-Spill (PS1-V1a): the born-spilled current-step demand is the
