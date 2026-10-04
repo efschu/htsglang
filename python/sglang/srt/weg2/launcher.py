@@ -113,6 +113,7 @@ from sglang.srt.weg2 import (
     corridor_budget,
     host_ledger,
     card_identity,
+    refusals,
     ring_table,
     seam_digest,
     weight_exchange,
@@ -5755,11 +5756,13 @@ def inventory_check_line(ns, cards: Sequence["Card"]) -> str:
         if m is not None:
             msgs.append(m)
     if msgs:
-        raise Weg2LaunchRefused(" || ".join(msgs))
+        # PROFIL-EDITOR S1: --force lifts HW-UNCALIBRATED (a value refusal); the line then says MISMATCH
+        refusals.refuse_value("HW-UNCALIBRATED", " || ".join(msgs), Weg2LaunchRefused)
     return ("HW-INVENTORY " + "; ".join(f"ordinal {i}: {card_identity.describe(c)}"
                                         for i, c in enumerate(cards))
             + f" -- calibrated inventory [{','.join(rec_inv)}] ({rec_src}"
-            + (f"; vectors: {vec_src}" if vec_src == "--profile-inventory" else "") + ") MATCH")
+            + (f"; vectors: {vec_src}" if vec_src == "--profile-inventory" else "")
+            + (") MISMATCH (--force)" if msgs else ") MATCH"))
 
 
 #: HW-GENERIC 1002 Stage 1: the release topology is P = PP3 / D = TP3 (argv
@@ -5781,7 +5784,9 @@ def order_cards(cards: List[Card], expect_count: Optional[int] = WEG2_CARD_COUNT
     try:
         return card_identity.order_cards(cards, expect_count, gate=False)
     except card_identity.CardInventoryRefused as exc:
-        raise Weg2LaunchRefused(str(exc)) from exc
+        # PROFIL-EDITOR S1: --force lifts the COUNT refusal (a value refusal); the arch gate does not run here
+        refusals.refuse_value("HW-COUNT", str(exc), Weg2LaunchRefused, cause=exc)
+        return card_identity.order_cards(cards, None, gate=False)
 
 
 def log_power_limits(state: BootState, cards: List[Card], log, *,
@@ -6468,12 +6473,14 @@ def host_preflight(log: Log, tag: str, dry: bool) -> None:
         return
     rc = subprocess.run([HOST_PREFLIGHT, f"{GPU_ARB}/preflight_weg2_{tag}.log"]).returncode
     if rc != 0:
-        raise Weg2LaunchRefused("BOOT REFUSED by the host-ledger preflight (#721 floor) -- see its log")
+        refusals.refuse_value("HOST-MEM", "BOOT REFUSED by the host-ledger preflight (#721 floor) -- see its log",
+                              Weg2LaunchRefused, log)
     mi = host_ledger.read_meminfo()
     avail_gib = mi["MemAvailable"] / host_ledger.GIB
     if avail_gib < 40:
         top = subprocess.run(["ps", "-eo", "rss,pid,comm", "--sort=-rss"], capture_output=True, text=True).stdout.splitlines()[:8]
-        raise Weg2LaunchRefused(f"free -g available {avail_gib:.1f} GiB < 40 GiB; top RSS holders (NOT killed):\n" + "\n".join(top))
+        refusals.refuse_value("HOST-MEM", f"free -g available {avail_gib:.1f} GiB < 40 GiB; top RSS holders (NOT killed):\n" + "\n".join(top),
+                              Weg2LaunchRefused, log)
     oom = open("/sys/fs/cgroup/memory.events").read()
     log(f"host preflight PASS: MemAvailable {avail_gib:.1f} GiB; cgroup memory.events baseline: {' '.join(oom.split())}")
     # SWAP READINESS (26.09.): the ledger's currencies assume a swapless cgroup;
@@ -21057,6 +21064,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "Required with --prior-cushion-min-gib.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
+        "--force", action="store_true",
+        help="PROFIL-EDITOR S1: start although the planner/launcher REFUSES the VALUES (capacity, VRAM, host memory, "
+             "card count, calibration of the inventory -- the 'wert' class of weg2/refusals.py). Every refusal passed "
+             "is printed as 'FORCED-PAST <CODE> <reason>'. A forced boot writes NO records. NOT lifted: the occupation "
+             "check (another process or window on a card), a missing or broken model/file, an unsupported "
+             "architecture. Container: FLLIPER_FORCE=1. On the NF tree only the codes the register lists as wired "
+             "(HW-COUNT, HW-UNCALIBRATED, HOST-MEM) are lifted; the planner's flip-path refusals keep refusing.")
+    ap.add_argument(
         "--profile-inventory", default="",
         help="HW-GENERIC 1002: the card inventory (calibration-class labels in card order, "
              "weg2/card_identity.py, e.g. 'RTX5090,RTX3080,RTX3080') the profile's positional "
@@ -23399,6 +23414,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     front_log = None if dry else f"{base}.front.log"
     log = Log(front_log)
     log(f"=== WEG2 BOOT tag={ns.tag} tree={tree} @ {tip} ({'DIRTY: ' + dirty[:200] if dirty else 'clean'}) stamp={stamp} dry={dry}")
+    if getattr(ns, "force", False):
+        # PROFIL-EDITOR S1: one switch for all VALUE refusals (weg2/refusals.py); the sink writes each one to state.json events
+        refusals.arm(True, sink=lambda code, text: boot_state_write(log, event=("forced_past", {"code": code, "text": text})))
+        log("FORCED BOOT (--force): value refusals are lifted and listed as FORCED-PAST <CODE>; this boot writes NO records; "
+            "not lifted: card occupation, missing/broken files, unsupported architecture")
     # THE PIN RESOLVER'S CONTRACT LINE, and it must stay in exactly this shape:
     # `line_gate.BOOT_TREE_RE` is `^tree\s*:\s*\S+\s+@\s+([0-9a-f]{7,40})\b`, so
     # the header above -- which carries the same two facts -- does NOT match it.
@@ -23477,6 +23497,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # for the inventory they were measured on -- checked once, here, before
     # any of them is read. The reference rig passes silently-identically.
     log(inventory_check_line(ns, cards))
+    refusals.flush(log)         # --force: refusals passed by sites without a logger (HW-COUNT); nothing otherwise
     state.cards = [c.__dict__ for c in cards]
     record_card_power(state.cards, cards, log)
     if not dry:
