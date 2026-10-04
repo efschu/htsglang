@@ -103,17 +103,23 @@ class _WriteBackController:
 
 
 class _FakeArena:
-    """The shared header as the tree sees it: ``pinned`` = the pages this tree references (one stage = one
-    holder here), ``complete`` adds slots nobody references. Counts what is read."""
+    """The shared header as the tree sees it: ``pinned`` = the pages this tree references UNION the rows
+    group D holds (``d_rows``: a slot is pinned while ANY holder references it) plus ``extra_pinned`` slots of
+    nobody in this tree. ``complete`` adds slots nobody references. Counts what is read."""
 
     def __init__(self, cache, slots=SLOTS, unreferenced=0):
         self.cache, self.slots, self.unreferenced = cache, slots, unreferenced
+        self.d_rows = set()
+        self.extra_pinned = 0
         self.stats_calls = 0
         self.census_calls = 0
 
     def _pinned(self):
-        return sum(int(n.component_data[FULL].host_value.numel()) for n in self.cache._collect_all_nodes()
-                   if n is not self.cache.root_node and n.component_data[FULL].host_value is not None)
+        rows = set(self.d_rows)
+        for n in self.cache._collect_all_nodes():
+            if n is not self.cache.root_node and n.component_data[FULL].host_value is not None:
+                rows.update(int(x) for x in n.component_data[FULL].host_value.tolist())
+        return len(rows) + self.extra_pinned
 
     def stats(self):
         self.stats_calls += 1
@@ -190,6 +196,11 @@ def _live_tokens(cache):
 
 def _fill(pool):
     return pool.arena._pinned() / float(pool.arena.slots)
+
+
+def _held_by_tree(cache):
+    return sum(int(n.component_data[FULL].host_value.numel()) for n in cache._collect_all_nodes()
+               if n is not cache.root_node and n.component_data[FULL].host_value is not None)
 
 
 def _tick(sched, now, cfg=None):
@@ -429,6 +440,168 @@ def test_a_stage_without_a_spill_pool_logs_a_rate_limited_stop(monkeypatch, capl
         assert got["released"] == 0
     stops = [r for r in caplog.records if "STOP rank=1" in r.getMessage()]
     assert 1 <= len(stops) <= 8 and len(_live(cache)) == 97
+
+
+def test_a_failing_order_or_decision_never_takes_the_pass_down(monkeypatch, caplog):
+    import logging
+
+    _env(monkeypatch, DUAL_P)
+    caplog.set_level(logging.WARNING)
+    sched, cache, pool, nodes = _stage(97)
+
+    def boom(*a, **k):
+        raise OSError("L3 disk gone")
+
+    monkeypatch.setattr(pool, "secure_rows_to_l3", boom)
+    got = D.execute(sched, D.Weg2DualArenaTrim(1, 17, 970000))           # a raise in the spill: caught, named
+    assert got["released"] == 0 and len(_live(cache)) == 97
+    assert any("STOP execute_failed" in r.getMessage() for r in caplog.records)
+    pool.arena.stats = boom                                                # a raise in PP0's header read
+    wire = ["req"]
+    out, cmd = D.pp0_stamp(sched, wire, now=1.0)
+    assert out is wire and cmd is None
+    pool.arena.stats = types.MethodType(lambda self: {"slots": 100, "complete": 97, "claimed": 0}, pool.arena)
+    monkeypatch.setattr(D, "own_held_pages", boom)                         # a raise past the header read
+    D._reset_trim_for_tests()
+    out, cmd = D.pp0_stamp(sched, wire, now=100.0)
+    assert out is wire and cmd is None
+    assert any("STOP decide_failed" in r.getMessage() for r in caplog.records)
+    cache.sanity_check()
+
+
+# ---- review 09:04Z A1: the V1 guards ---------------------------------------------------------------
+def _stays(cache, pool, nodes, k, msg):
+    got = D.spill_host_only(cache, pool, 1000, 1, set())
+    assert nodes[k].id in _live(cache) and (7000 + k) not in pool.secured, msg
+    assert got["leaves"] == len(nodes) - 1, msg
+
+
+def test_a1_a_split_nodes_pending_write_id_keeps_the_node(monkeypatch):
+    """``write_through_pending_id`` (a split node keeps the OLD id, so ``ongoing_write_through`` misses it)."""
+    _env(monkeypatch, DUAL_P)
+    sched, cache, pool, nodes = _stage(20)
+    nodes[5].write_through_pending_id = 123456
+    _stays(cache, pool, nodes, 5, "pending id")
+
+
+def test_a1_a_direct_writes_mamba_rows_in_flight_keep_the_node(monkeypatch):
+    """#1427: ``_weg2_direct_mamba_rows`` names the node -- nothing may take it."""
+    _env(monkeypatch, DUAL_P)
+    sched, cache, pool, nodes = _stage(20)
+    cache._weg2_direct_mamba_rows = {nodes[6].id: torch.tensor([1])}
+    _stays(cache, pool, nodes, 6, "mamba rows in flight")
+
+
+def test_a1_a_host_backed_end_anchor_keeps_the_node(monkeypatch):
+    """The hand-back anchor of a request D may not have read yet (``_weg2_end_anchor`` + a mamba host value);
+    a mamba DEVICE value too, so the aux-host-only guard alone would not catch it."""
+    _env(monkeypatch, DUAL_P)
+    sched, cache, pool, nodes = _stage(20)
+    nodes[7]._weg2_end_anchor = True
+    nodes[7].component_data[MAMBA].host_value = torch.tensor([42])
+    nodes[7].component_data[MAMBA].value = torch.tensor([43])
+    _stays(cache, pool, nodes, 7, "end anchor")
+    # an END-flagged node WITHOUT a mamba host value carries nothing to hold: it goes
+    nodes[8]._weg2_end_anchor = True
+    D.spill_host_only(cache, pool, 1000, 1, set())
+    assert nodes[8].id not in _live(cache)
+
+
+# ---- review 09:04Z A6: the guards that survived the first mutant round ---------------------------------
+def test_a6_an_aux_host_only_state_keeps_the_node(monkeypatch):
+    """y5h / park_l3: a mamba state that lives on the host only has no other copy -- the node keeps its host life."""
+    _env(monkeypatch, DUAL_P)
+    sched, cache, pool, nodes = _stage(20)
+    nodes[9].component_data[MAMBA].host_value = torch.tensor([77])
+    nodes[9].component_data[MAMBA].value = None
+    _stays(cache, pool, nodes, 9, "aux host-only")
+
+
+def test_a6_staging_rows_are_not_arena_slots(monkeypatch):
+    _env(monkeypatch, DUAL_P)
+    sched, cache, pool, nodes = _stage(20)
+    pool.staging_rows = 7003                                     # rows < 7003 are staging, not arena slots
+    got = D.spill_host_only(cache, pool, 1000, 1, set())
+    live = _live(cache)
+    assert all(nodes[k].id in live for k in (0, 1, 2)) and got["leaves"] == 17
+    assert not any(7000 + k in pool.secured for k in (0, 1, 2))
+
+
+def test_a6_execute_passes_the_budget_to_the_spill(monkeypatch):
+    """The brake must reach the real order (not only a direct ``spill_host_only(budget_s=...)`` call)."""
+    _env(monkeypatch, dict(DUAL_P, **{TRIM_BUDGET_S_ENV: "0.5"}))
+    sched, cache, pool, nodes = _stage(97)
+    clock = [0.0]
+
+    def slow_secure(rows, orig=pool.secure_rows_to_l3):
+        clock[0] += 0.3
+        return orig(rows)
+
+    pool.secure_rows_to_l3 = slow_secure
+    monkeypatch.setattr(D.time, "monotonic", lambda: clock[0])
+    got = D.execute(sched, D.Weg2DualArenaTrim(1, 17, 970000))
+    assert got["braked"] == 1 and got["leaves"] == 2 and len(_live(cache)) == 95
+
+
+# ---- review 09:04Z A3: the over-trim brake --------------------------------------------------------------
+def test_a3_an_order_never_exceeds_what_p_itself_holds(monkeypatch):
+    """The pin is D's: pinned 95 of 100, the formula asks 15 pages, P's own tree holds 10 -> the order is 10."""
+    _env(monkeypatch, DUAL_P)
+    sched, cache, pool, nodes = _stage(10)
+    pool.arena.extra_pinned = 85
+    cmd = _tick(sched, 0.0)
+    assert cmd is not None and cmd.want == 10, cmd
+
+
+def test_a3_orders_that_do_not_lower_the_pin_pause_the_episode_and_the_tree_is_not_emptied(monkeypatch, caplog):
+    """Group D holds the pages P gives back: P's release frees no slot. Three orders in a row without a drop
+    pause the episode (30 s, a named warning); the host tree is NOT cleared order by order."""
+    import logging
+
+    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5"}))
+    caplog.set_level(logging.INFO)
+    sched, cache, pool, nodes = _stage(60)
+    pool.arena.d_rows = {7000 + i for i in range(60)}            # D references every page P holds
+    pool.arena.extra_pinned = 35                                 # pinned = 60 + 35 = 95
+    t, cmds = 0.0, []
+    for _ in range(8):
+        c = _tick(sched, t)
+        if c is not None:
+            cmds.append(c)
+        t += 2.0
+    assert len(cmds) == 3, [c.seq for c in cmds]                 # three orders, then the pause
+    assert len(_live(cache)) == 60 - 15                          # 3 x 5 pages: not the whole tree
+    paused = [r for r in caplog.records if "PAUSED" in r.getMessage()]
+    assert len(paused) == 1 and "did not lower arena_pinned" in paused[0].getMessage()
+    assert not D._T["active"] and D._T["pauses"] == 1
+    assert _tick(sched, t + 10.0) is None                        # inside the 30 s pause (t is 16 after the loop)
+    assert _tick(sched, 16.0 + 40.0) is not None                 # pause over, still above HI: a new episode
+    assert any("START" in r.getMessage() for r in caplog.records[-6:])
+
+
+def test_a3_orders_that_do_lower_the_pin_never_pause(monkeypatch):
+    """P is the holder: every order drops the pin, no pause (the 4 orders of the capped episode)."""
+    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5"}))
+    sched, cache, pool, nodes = _stage(97)
+    t = 0.0
+    for _ in range(8):
+        _tick(sched, t)
+        t += 2.0
+    assert D._T["pauses"] == 0 and _fill(pool) <= 0.80 + 1e-9
+
+
+# ---- review 09:04Z A5: the request trace ----------------------------------------------------------------
+def test_a5_the_request_trace_does_not_see_the_order(monkeypatch):
+    import inspect
+
+    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+    cmd = D.Weg2DualArenaTrim(1, 5, 970000)
+    assert D.without_trim_order(["req", cmd]) == ["req"] and D.without_trim_order([]) == []
+    src = inspect.getsource(SchedulerPPMixin._pp_forward_and_process_input_requests)
+    assert "_traced = _das_trim.without_trim_order(_traced)" in src
+    assert src.index("without_burst_clock(recv_reqs)") < src.index("without_trim_order(_traced)") < src.index(
+        "_traced:")
 
 
 def test_the_brake_stops_the_loop_before_the_next_leaf_and_the_next_order_goes_on(monkeypatch):

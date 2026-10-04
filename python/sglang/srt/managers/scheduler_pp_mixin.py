@@ -6456,6 +6456,7 @@ class SchedulerPPMixin:
         # list while the burst window is armed; a clock is not a request and
         # would spend the 30 on idle passes.)
         _traced = _anchor_tails.without_burst_clock(recv_reqs)
+        _traced = _das_trim.without_trim_order(_traced)  # Q-1500 UD-V2: an order is not a request
         if _traced:
             _rn = getattr(self, "_pp_req_trace_n", 0) + 1
             self._pp_req_trace_n = _rn
