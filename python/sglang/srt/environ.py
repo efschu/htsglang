@@ -683,6 +683,13 @@ class Envs:
     # Inert outside SGLANG_WEG2_DUAL_LAYOUT=1 + SGLANG_WEG2_GROUP=D.
     SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S = EnvFloat(4.0)
     SGLANG_WEG2_DUAL_D_REGROW_HOLD_S = EnvFloat(5.0)
+    # #1420r DEFER-REARM (desk 1420 point 5): D-HANDBACK-DEFER is single-shot -- the one re-read lands
+    # empty while P's write-through of the tail anchor is still in flight, the second W31 spends the
+    # mark and the request goes back over P (second prefill, ~58 s). N > 0 = a mark whose read has
+    # been issued is RE-ARMED up to N times (PASS-counted, so every D rank decides alike; the wall
+    # bound stays the existing length-priced vote in ``pending``). 0 = off = the old behaviour,
+    # byte-identical. Dual D only (dual_handback_defer.armed()). The module reads os.environ itself.
+    SGLANG_WEG2_DUAL_HANDBACK_DEFER_REARM = EnvInt(0)
     # #1500i PKVWAIT-INSTR (y9d4d, desk analysis 1390 Fix 1): LOG-ONLY census lines that name why a
     # full-arena D hands no VRAM to a waiting P -- the refusal reasons of ``spill_host_only``, the
     # evictable size after the D cache yield, the owner of D's topmost live row. At most one line per

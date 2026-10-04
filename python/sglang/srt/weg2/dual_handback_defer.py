@@ -142,6 +142,55 @@ def defer_exempt(req, env=None) -> bool:
     return bool(getattr(req, X_DEFER_ATTR, False))
 
 
+REARM_LINE = "#1420r DEFER-REARM"
+REARM_ENV = "SGLANG_WEG2_DUAL_HANDBACK_DEFER_REARM"
+#: at most one REARM line per this many seconds (instrument only, rank-local clock)
+REARM_LOG_EVERY_S = 1.0
+_REARM_LAST_LOG = [None]
+
+
+def rearm_max(env=None) -> int:
+    """The re-arm limit (``SGLANG_WEG2_DUAL_HANDBACK_DEFER_REARM``); 0 = off (default)."""
+    e = os.environ if env is None else env
+    try:
+        return max(0, int((e.get(REARM_ENV, "") or "0").strip() or "0"))
+    except ValueError:
+        return 0
+
+
+def _rearm(req, st: dict, now, env=None) -> bool:
+    """#1420r: a second W31 on a mark whose store read was already issued (the read
+    landed empty: P's write-through of the tail anchor is asynchronous) re-arms the
+    mark instead of spending it, up to ``rearm_max`` times. Dual D only (``begin``
+    checked ``armed``); off (0) = False = the old single-shot behaviour.
+
+    RANK AGREEMENT (a rank divergence is forbidden): the decision reads only
+    (a) the W31 verdict that called ``begin`` -- the group's MIN-reduced match (#823),
+    so every rank is here on the same pass -- (b) ``st["issued"]``, set by ``retry``
+    from the pass-counted back-off over the replicated waiting queue, and (c) the
+    counter ``st["rearm"]``, advanced only here. No wall clock enters; the wall bound
+    stays the existing length-priced MIN vote in ``pending`` (a re-armed mark is
+    pending again, ``issued`` False). ``retry_seen`` keeps counting, so the back-off
+    keeps widening (1, 2, 4, 8, then every 8th pass)."""
+    limit = rearm_max(env)
+    done = int(st.get("rearm", 0))
+    if limit <= 0 or done >= limit:
+        return False
+    st["rearm"] = done + 1
+    st["issued"] = False
+    forget_presence(req)
+    t = float(now())
+    last = _REARM_LAST_LOG[0]
+    if last is None or t - last >= REARM_LOG_EVERY_S or done + 1 >= limit:
+        _REARM_LAST_LOG[0] = t
+        logger.warning("%s n=%d rearm=%d max=%d passes=%d retry_seen=%d tail=%d rid=%s ms=%d -- the re-read "
+                       "landed empty (P's tail write is still in flight); mark re-armed, not spent",
+                       REARM_LINE, int(st["n"]), done + 1, limit, int(st["passes"]),
+                       int(st.get("retry_seen", 0)), int(st["tail"]), str(getattr(req, "rid", "?"))[:16],
+                       int((t - float(st["t0"])) * 1000))
+    return True
+
+
 def begin(req, tail: int, *, now=time.monotonic, env=None) -> bool:
     """The X gate priced ``req`` W31. True = defer it this pass (first time: the
     mark is set); False = refuse as before (not dual D, or the mark is spent --
@@ -165,6 +214,8 @@ def begin(req, tail: int, *, now=time.monotonic, env=None) -> bool:
         return False
     st = getattr(req, MARK_ATTR, None)
     if st is not None:
+        if not st.get("spent") and not st.get("done") and st.get("issued") and _rearm(req, st, now, env):
+            return True
         if not st.get("spent"):
             st["spent"] = True
             _line(st, req, "refused", now, " -- the tail stayed unreadable past the length-priced bound; "
