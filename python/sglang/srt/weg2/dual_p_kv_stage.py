@@ -1134,12 +1134,6 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
     if req is None and not held:
         sched._dual_abort_seen = None
         return False
-    if held:
-        # Q-697b: a held abort whose rid PP0 holds again for its grant is not applied now
-        from sglang.srt.weg2 import dual_grant_wait as _dgw
-
-        if _dgw.same_rid_waits(sched, held):
-            return False
     t = _t.time() if now is None else float(now)
     seen = getattr(sched, "_dual_abort_seen", None)
     if seen is None or seen[0] is not req or not set(held) <= set(seen[2]):
@@ -1161,11 +1155,24 @@ def follower_release_aborted_chunk(sched, now: Optional[float] = None) -> bool:
     drained = getattr(sched, "_pp_microbatches_drained", None)
     if callable(drained) and not drained():
         return False
+    # Q-697b (R2/R5): the guard sits HERE, after the stamp was read and right before the abort
+    # is applied: a held abort whose rid PP0 holds again as a grant waiter (marker, which PP0
+    # publishes before it stamps) stays held -- its verdict reads the rid and would take the new
+    # instance with it. Only those rids; a chunked abort and the other holds proceed.
+    from sglang.srt.weg2 import dual_grant_wait as _dgw
+
+    conflict = _dgw.conflicting_rids(sched, held) if held else set()
+    if conflict and req is None and set(held) <= conflict:
+        return False
+    pend = getattr(sched, "_weg2_pending_waiting_aborts", None)
+    stash = {r: pend.pop(r) for r in list(pend) if str(r) in conflict} if (conflict and pend) else {}
     sched._791c_pp0_drained = True
     try:
         sched.process_pending_chunked_abort()
     finally:
         sched._791c_pp0_drained = False
+        if stash:
+            pend.update(stash)
     logger.info("%s FOLLOWER-ABORT-APPLIED rid=%s pp_rank=%s: PP0 idle since %.1f s after this rank "
                 "saw the abort, every pass it launched ran here (fwd %d >= %d; the #791C liveness "
                 "release the dual layout has no lap for)", MARK,

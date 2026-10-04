@@ -73,8 +73,10 @@ ENV = "SGLANG_WEG2_DUAL_GRANT_WAIT"
 ENV_HOLD_S = "SGLANG_WEG2_DUAL_GRANT_HOLD_S"
 HOLD_S_DEFAULT = 30.0
 #: a marker older than this names no waiter (PP0 rewrites it at least every HEARTBEAT_S)
-FRESH_S = 10.0
+FRESH_S = 30.0
 HEARTBEAT_S = 1.0
+#: at most one marker-write failure line per this many seconds
+WARN_EVERY_S = 30.0
 FILE_FMT = "weg2_p_grantwait_%d.json"
 
 RELEASE_MARK = "Q-697b DUAL GRANT-WAIT RELEASE"
@@ -128,7 +130,10 @@ _PUB: dict = {"rids": None, "t": 0.0}
 
 
 def _reset_for_tests() -> None:
+    _PUB.clear()
     _PUB.update(rids=None, t=0.0)
+    _HOLD_T0.clear()
+    _P_HELD["t"] = None
 
 
 def publish(sched, rids: Iterable[Any], now: Optional[float] = None, env=None) -> bool:
@@ -160,7 +165,12 @@ def publish(sched, rids: Iterable[Any], now: Optional[float] = None, env=None) -
         _PUB["rids"], _PUB["t"] = rids, t
         return True
     except Exception as e:  # noqa: BLE001 - an instrument never breaks the pass
-        logger.warning("%s marker write failed: %r", RELEASE_MARK, e)
+        # rate-limited: PP0 calls this every pass, a full /dev/shm must not flood the log
+        tm = time.monotonic()
+        if tm - float(_PUB.get("warn_t", -1e9)) >= WARN_EVERY_S:
+            _PUB["warn_t"] = tm
+            logger.warning("%s marker write failed: %r (further failures within %.0fs are not logged)",
+                           RELEASE_MARK, e, WARN_EVERY_S)
         return False
 
 
@@ -266,6 +276,10 @@ def release_for_grant_waiters(sched, env=None) -> int:
         return 0
     actor = _dpk._actor(sched)
     before = int(getattr(actor, "mapped_tokens", 0) or 0)
+    # R2: the marker names the waiters BEFORE PP0's idle stamp goes out. A request PP0 took in
+    # this very loop iteration is named by _dual_kv_retry only at the top of the NEXT one; a
+    # follower reading the stamp in between would not see its rid in the marker. (No-op off PP0.)
+    publish(sched, grant_waiters(sched))
     n = int(_dpk.on_idle(sched) or 0)
     if before > 0 and n > 0:
         _N["release"] += 1
@@ -280,17 +294,21 @@ def release_for_grant_waiters(sched, env=None) -> int:
     return n
 
 
-def same_rid_waits(sched, held_rids: Iterable[Any]) -> bool:
-    """Follower guard for ``follower_release_aborted_chunk``: a held abort whose rid
-    is ALSO a grant-waiting leg of PP0 (the front sent the rid again) is not applied
-    now -- the hold's verdict reads the rid, not the object, and would take the new
-    instance with it (the Q-697 zombie class). Only with a fresh marker."""
+def conflicting_rids(sched, held_rids: Iterable[Any]) -> Set[str]:
+    """Follower guard for ``follower_release_aborted_chunk``: the held-abort rids that are
+    ALSO grant-waiting legs of PP0 (the front sent the rid again). Such a hold is not applied
+    now -- its verdict reads the rid, not the object, and would take the new instance with it
+    (the Q-697 zombie class). Only with a fresh marker; the other rids are not touched."""
     if not dual_p():
-        return False
+        return set()
     st = _follower_state(sched)
     if st is None:
-        return False
-    return bool({str(r) for r in held_rids} & set(st.rids()))
+        return set()
+    return {str(r) for r in held_rids} & set(st.rids())
+
+
+def same_rid_waits(sched, held_rids: Iterable[Any]) -> bool:
+    return bool(conflicting_rids(sched, held_rids))
 
 
 # ---------------------------------------------------------------------------
@@ -305,11 +323,23 @@ def hold_s(env=None) -> float:
         return HOLD_S_DEFAULT
 
 
-def d_demand_stands(ledger_paths: Iterable[str]) -> Optional[str]:
-    """A card line when D's unmet demand or a pressure on P stands on any of the
-    stage ledgers (the signals of ``p_resume_ready``), else None."""
+#: rid -> first time its grant was held for D (the clock belongs to the RID: a resent
+#: instance does not start a new 30 s), cleared when no demand stands any more
+_HOLD_T0: dict = {}
+#: monotonic time P was last seen holding bytes on a card (None = never)
+_P_HELD: dict = {"t": None}
+#: after P was seen holding bytes, the hold still applies this long (P just released them
+#: and D's tick has not claimed them yet); beyond it a stale demand costs a request nothing
+GRACE_S = 5.0
+
+
+def d_demand_stands(ledger_paths: Iterable[str]):
+    """``(line, p_committed)``: a card line when D's unmet demand or a pressure on P stands
+    on any of the stage ledgers (the signals of ``p_resume_ready``), else None; and the sum
+    of P's committed bytes over the cards read."""
     from sglang.srt.weg2.card_kv_ledger import peek
 
+    line, p_committed = None, 0
     for pth in ledger_paths or ():
         try:
             st = peek(pth)
@@ -317,27 +347,39 @@ def d_demand_stands(ledger_paths: Iterable[str]) -> Optional[str]:
             continue
         if st is None:
             continue
+        p_committed += int(st.committed.get("P", 0) or 0)
         pressure = int(st.pressure.get("P", 0) or 0)
         demand = int(st.demand.get("D", 0) or 0)
-        if pressure > 0 or demand > 0:
-            return "pressure_on_P=%d d_demand=%d card=%s" % (pressure, demand, os.path.basename(str(pth))[-24:])
-    return None
+        if line is None and (pressure > 0 or demand > 0):
+            line = "pressure_on_P=%d d_demand=%d card=%s" % (pressure, demand, os.path.basename(str(pth))[-24:])
+    return line, p_committed
 
 
 def grant_held_by_d(req, stages, now: Optional[float] = None, env=None) -> Optional[str]:
-    """PP0, ``pp0_grant`` before the group grant: a reason string when this
-    request's grant is held back because a card shows D's demand / pressure, None
-    when the grant may be tried. Bounded: a request waits at most ``hold_s`` for
-    this (a stale ledger never wedges P). Nothing is read off the dual P layout."""
+    """PP0, ``pp0_grant`` before the group grant: a reason string when this request's grant
+    is held back because a card shows D's demand / pressure AND P holds bytes on a card (or
+    held them within GRACE_S: the bytes it just released are D's first), None when the grant
+    may be tried. With nothing to release and no recent release a standing demand is D's
+    own business (stale or not) and costs P nothing. Bounded per RID: at most ``hold_s``
+    (a stale ledger never wedges P). Nothing is read off the dual P layout."""
     if not dual_p(env):
         return None
-    why = d_demand_stands([s.get("ledger") for s in (stages or ())])
-    if why is None:
-        return None
+    why, p_committed = d_demand_stands([s.get("ledger") for s in (stages or ())])
     t = time.monotonic() if now is None else float(now)
-    t0 = getattr(req, "_dual_gw_hold_t0", None)
+    if p_committed > 0:
+        _P_HELD["t"] = t
+    rid = str(getattr(req, "rid", ""))
+    if why is None:
+        _HOLD_T0.pop(rid, None)
+        return None
+    last = _P_HELD["t"]
+    if p_committed <= 0 and (last is None or t - float(last) > GRACE_S):
+        return None
+    t0 = _HOLD_T0.get(rid)
     if t0 is None:
-        req._dual_gw_hold_t0 = t0 = t
+        if len(_HOLD_T0) > 4096:
+            _HOLD_T0.clear()
+        _HOLD_T0[rid] = t0 = t
     if t - float(t0) >= hold_s(env):
         return None
     return why
@@ -347,7 +389,7 @@ def note_hold(rid: str, why: str, req) -> None:
     _N["hold"] = _N.get("hold", 0) + 1
     c = _N["hold"]
     if c <= LOG_FIRST or c % 256 == 0:
-        t0 = getattr(req, "_dual_gw_hold_t0", None)
+        t0 = _HOLD_T0.get(str(rid))
         logger.info("%s rid=%s waited=%.1fs %s n=%d: D's demand stands on a card -- no grant now, the "
                     "bytes P released are D's first (Q-697b; bounded by %s=%.0fs)",
                     HOLD_MARK, rid, 0.0 if t0 is None else time.monotonic() - float(t0), why, c, ENV_HOLD_S,

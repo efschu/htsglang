@@ -434,7 +434,8 @@ def test_the_front_hook_is_wired_into_the_pause():
 class _Pp0:
     """The q670 fixture: three temp cards, stage files, D holds all but 96 MiB and asked for more."""
 
-    def __init__(self, monkeypatch, root):
+    def __init__(self, monkeypatch, root, p_holds=True):
+        self.p_holds = p_holds
         self.paths = []
         for r, per in enumerate((2048, 4096, 6144)):
             pth = os.path.join(root, "card%d" % r)
@@ -454,10 +455,13 @@ class _Pp0:
         card HAS room for a small P grant while D's demand still stands."""
         for pth in self.paths:
             d = K.CardKvLedger(pth, "D")
+            if self.p_holds:
+                K.CardKvLedger(pth, "P").request(50 * MIB)       # P's leftover mapping (the pressure episode)
             d.request(4096 * MIB)
             d.request(500 * MIB)
             d.release(2000 * MIB)
             assert K.peek(pth).demand["D"] > 0 and K.peek(pth).free >= 2000 * MIB
+            assert (K.peek(pth).committed["P"] > 0) == self.p_holds
 
     def sched(self):
         return types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=0, pp_size=3), waiting_queue=[],
@@ -475,7 +479,7 @@ def test_pp0_gives_no_grant_while_d_demand_stands_and_grants_once_it_is_gone(rig
     sched, req = fx.sched(), fx.req("weg2-0-44")
     assert S.pp0_grant(sched, req) == 0, "granted into D's unmet demand"
     for pth in fx.paths:
-        assert K.peek(pth).committed["P"] == 0, "a refused grant left bytes taken"
+        assert K.peek(pth).committed["P"] == 50 * MIB, "a refused grant left bytes taken"
     for pth in fx.paths:                       # D fits: its request is granted in full, demand 0
         K.CardKvLedger(pth, "D").request(10 * MIB)
         assert K.peek(pth).demand["D"] == 0
@@ -514,14 +518,35 @@ def test_a_held_abort_whose_rid_pp0_holds_again_is_not_applied(rig):
                               process_pending_chunked_abort=lambda: setattr(f, "applied", True))
     pp0 = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=0))
     _write_marker(rig, ["weg2-0-44"])
-    S.follower_release_aborted_chunk(f, now=100.0)               # sees the abort
-    S.mark_pp0_idle(pp0, now=102.0)
+    assert S.follower_release_aborted_chunk(f, now=100.0) is False      # sees the abort
+    S.mark_pp0_idle(pp0, now=102.0)                                     # PP0 idle after it
     assert S.follower_release_aborted_chunk(f, now=103.0) is False
     assert not getattr(f, "applied", False), "the hold was applied against a fresh waiting instance"
     os.unlink(_marker_path(rig))                                  # the waiter is granted: no longer named
-    assert S.follower_release_aborted_chunk(f, now=104.0) is False      # sees the abort afresh
-    S.mark_pp0_idle(pp0, now=105.0)                                     # PP0 idle after it
-    assert S.follower_release_aborted_chunk(f, now=106.0) is True and f.applied
+    assert S.follower_release_aborted_chunk(f, now=104.0) is True and f.applied
+
+
+def test_r5_the_guard_holds_only_the_conflicting_rids_back(rig):
+    """A chunked abort of ANOTHER rid and a hold whose rid is not a waiter proceed; only the conflicting
+    hold stays held (and is still there afterwards)."""
+    seen = {}
+    f = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=1), server_args=types.SimpleNamespace(port=PORT),
+                              _pending_chunked_abort_req=types.SimpleNamespace(rid="weg2-0-30"),
+                              _weg2_pending_waiting_aborts={"weg2-0-44": [None, 0], "weg2-0-50": [None, 0]},
+                              forward_ct=5, _pp_microbatches_drained=lambda: True)
+
+    def process():
+        seen["pend"] = sorted(f._weg2_pending_waiting_aborts)
+        f._pending_chunked_abort_req = None
+
+    f.process_pending_chunked_abort = process
+    pp0 = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=0))
+    _write_marker(rig, ["weg2-0-44"])
+    S.follower_release_aborted_chunk(f, now=100.0)
+    S.mark_pp0_idle(pp0, now=102.0)
+    assert S.follower_release_aborted_chunk(f, now=103.0) is True, "the chunked abort of another rid was held back"
+    assert seen["pend"] == ["weg2-0-50"], "the conflicting hold was handed to the verdict: %s" % seen
+    assert sorted(f._weg2_pending_waiting_aborts) == ["weg2-0-44", "weg2-0-50"], "the held abort was lost"
 
 
 # ------------------------------------------------------------------------------------------ FLIP UNCHANGED
@@ -588,3 +613,252 @@ def test_flip_unchanged_pp0_grant_ignores_d_demand_off_the_dual_layout(rig, monk
     fx = _Pp0(monkeypatch, str(rig))
     fx.d_short_with_room()
     assert S.pp0_grant(fx.sched(), fx.req("weg2-0-44")) > 0, "the flip-form grant waited for D's demand"
+
+
+# ------------------------------------------------------------------------------------------ review 1250
+
+def _follower_with_held_abort(rid):
+    f = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=1), server_args=types.SimpleNamespace(port=PORT),
+                              _pending_chunked_abort_req=None, _weg2_pending_waiting_aborts={rid: [None, 0]},
+                              forward_ct=5, _pp_microbatches_drained=lambda: True,
+                              process_pending_chunked_abort=lambda: setattr(f, "applied", True))
+    return f
+
+
+def test_r2_pp0_names_its_waiters_before_it_stamps_idle(rig):
+    """The review probe (/tmp/rev697b/test_rev_same_rid_window.py), made a test. PP0 took the resent rid R in this
+    loop iteration (intake -> grant waiter); the marker would name it only at the NEXT pass's _dual_kv_retry.
+    The follower holds the abort of the OLD instance of R and reads PP0's stamp: it must not apply it."""
+    R = "weg2-0-44"
+    path, _d, p = _card(str(rig), "card0", 100 * MIB, 50 * MIB)
+    f = _follower_with_held_abort(R)
+    S.follower_release_aborted_chunk(f, now=100.0)                  # the follower records the held abort
+    assert not os.path.exists(_marker_path(rig)), "precondition: the marker does not name R yet"
+    pp0 = make_rank(0, [_req(R, True)], held_waiters=[R], ledger=p, p_bytes=100 * MIB)
+    on_idle(pp0)                                                    # real on_idle: the release path stamps idle
+    assert os.path.exists(_marker_path(rig)), "PP0 stamped idle without naming its waiter"
+    assert S.follower_release_aborted_chunk(f, now=time.time() + 1) is False, \
+        "applied the held abort while PP0 holds the same rid as a waiter"
+    assert not getattr(f, "applied", False)
+
+
+def test_r2_the_guard_is_repeated_right_before_the_apply(rig):
+    """The marker may appear between the follower's first sight and its apply (the stamp is read, THEN the marker
+    changes): the guard sits after the stamp read, not before it."""
+    R = "weg2-0-44"
+    f = _follower_with_held_abort(R)
+    pp0 = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=0))
+    S.follower_release_aborted_chunk(f, now=100.0)
+    S.mark_pp0_idle(pp0, now=102.0)
+    from sglang.srt.weg2 import dual_grant_wait as G
+
+    real = G.conflicting_rids
+
+    def late(sched, held):
+        _write_marker(rig, [R])                                     # PP0 names R between the stamp read and the apply
+        return real(sched, held)
+
+    G.conflicting_rids = late
+    try:
+        assert S.follower_release_aborted_chunk(f, now=103.0) is False
+    finally:
+        G.conflicting_rids = real
+    assert not getattr(f, "applied", False)
+
+
+def test_r4_marker_write_failures_are_logged_once(rig, monkeypatch, caplog):
+    import logging
+
+    from sglang.srt.weg2 import dual_grant_wait as G
+
+    pp0 = _pp0(["weg2-0-44"])
+    monkeypatch.setenv(STATE_DIR_ENV, os.path.join(str(rig), "no", "such", "dir"))
+    with caplog.at_level(logging.WARNING):
+        for i in range(50):
+            G.publish(pp0, ["weg2-0-4%d" % (i % 3)], now=1000.0 + i)
+    assert sum("marker write failed" in m for m in caplog.messages) == 1, caplog.messages
+
+
+def test_r4_the_marker_survives_a_long_pass():
+    from sglang.srt.weg2 import dual_grant_wait as G
+
+    assert G.FRESH_S >= 30.0
+
+
+def test_r1_no_hold_when_p_holds_nothing_and_never_did(rig, monkeypatch):
+    """A fresh request under a STALE demand with P idle and empty pays nothing (no 30 s TTFT)."""
+    fx = _Pp0(monkeypatch, str(rig), p_holds=False)
+    fx.d_short_with_room()
+    assert S.pp0_grant(fx.sched(), fx.req("weg2-0-60")) > 0
+
+
+def test_r1_grace_after_p_released_then_none(rig):
+    from sglang.srt.weg2 import dual_grant_wait as G
+
+    fx_root = str(rig)
+    paths = []
+    for r in range(2):
+        pth = os.path.join(fx_root, "g%d" % r)
+        K.CardKvLedger(pth, "D").contribute(1000 * MIB, committed=0)
+        K.CardKvLedger(pth, "P").contribute(0)
+        K.CardKvLedger(pth, "P").request(50 * MIB)
+        K.CardKvLedger(pth, "D").request(950 * MIB)
+        K.CardKvLedger(pth, "D").request(100 * MIB)               # demand stands
+        paths.append(pth)
+    stages = [{"ledger": p} for p in paths]
+    req = types.SimpleNamespace(rid="weg2-0-61")
+    assert G.grant_held_by_d(req, stages, now=100.0) is not None            # P holds bytes
+    for pth in paths:
+        K.CardKvLedger(pth, "P").release(50 * MIB)                          # P released
+    assert G.grant_held_by_d(req, stages, now=101.0) is not None            # within the grace: D's first
+    assert G.grant_held_by_d(req, stages, now=100.0 + G.GRACE_S + 1) is None  # stale demand: no wait
+
+
+def test_r1_the_clock_belongs_to_the_rid_not_the_object(rig, monkeypatch):
+    """A resent instance of the same rid does not start a new 30 s; a new episode (no demand) does."""
+    from sglang.srt.weg2 import dual_grant_wait as G
+
+    fx = _Pp0(monkeypatch, str(rig))
+    fx.d_short_with_room()
+    stages = [{"ledger": p} for p in fx.paths]
+    a, b = types.SimpleNamespace(rid="weg2-0-62"), types.SimpleNamespace(rid="weg2-0-62")   # two objects, one rid
+    assert G.grant_held_by_d(a, stages, now=100.0) is not None
+    assert G.grant_held_by_d(b, stages, now=100.0 + G.hold_s() + 1) is None, "the resent instance was held again"
+    for pth in fx.paths:                                                    # D fits: the episode is over
+        K.CardKvLedger(pth, "D").request(10 * MIB)
+    assert G.grant_held_by_d(b, stages, now=200.0) is None
+    for pth in fx.paths:                                                    # a new episode
+        K.CardKvLedger(pth, "D").request(10000 * MIB)
+    assert G.grant_held_by_d(b, stages, now=300.0) is not None
+
+
+# ------------------------------------------------------------------------------------------ T1 interleavings
+
+def test_t1_release_axis_pp0_and_follower_decide_unequally_and_converge(rig):
+    """PP0 and a follower over time: a granted leg LIVE sits next to the waiter W (nobody releases); the front's
+    abort of LIVE reaches PP0 first (PP0 releases, the follower still holds LIVE: the safe direction); then the
+    follower's queue drains too and it releases."""
+    W, LIVE = "weg2-0-44", "weg2-0-45"
+    cards = [_card(str(rig), "card%d" % i, 200 * MIB, 100 * MIB) for i in range(2)]
+    pp0 = make_rank(0, [_req(W, True), _req(LIVE, False)], held_waiters=[W], ledger=cards[0][2], p_bytes=200 * MIB)
+    pp1 = make_rank(1, [_req(W, True), _req(LIVE, False)], ledger=cards[1][2], p_bytes=200 * MIB)
+    _write_marker(rig, [W])
+    on_idle(pp0), on_idle(pp1)
+    assert committed_p(cards[0][0]) == committed_p(cards[1][0]) == 200 * MIB, "released with a live leg queued"
+    pp0.waiting_queue = [r for r in pp0.waiting_queue if r.rid == W]          # LIVE aborted at PP0
+    on_idle(pp0), on_idle(pp1)
+    assert committed_p(cards[0][0]) == 0, "PP0 kept its mapping for a waiter-only queue"
+    assert committed_p(cards[1][0]) == 200 * MIB, "the follower released while LIVE was still queued there"
+    pp1.waiting_queue = [r for r in pp1.waiting_queue if r.rid == W]          # the abort reaches the follower
+    on_idle(pp1)
+    assert committed_p(cards[1][0]) == 0
+    assert K.peek(cards[0][0]).pressure["P"] == K.peek(cards[1][0]).pressure["P"] == 0
+
+
+def test_t1_release_axis_the_marker_lags_behind_pp0(rig):
+    """The follower's queue holds a rid the marker does not name yet (PP0 took it a moment ago): no release; once PP0
+    publishes it, the follower releases."""
+    W, NEW = "weg2-0-44", "weg2-0-46"
+    path, _d, p = _card(str(rig), "card0", 100 * MIB, 50 * MIB)
+    _write_marker(rig, [W])
+    pp1 = make_rank(1, [_req(W, True), _req(NEW, True)], ledger=p, p_bytes=100 * MIB)
+    on_idle(pp1)
+    assert committed_p(path) == 100 * MIB
+    _write_marker(rig, [W, NEW])
+    on_idle(pp1)
+    assert committed_p(path) == 0
+
+
+def test_t1_front_axis_a_waiter_that_gets_its_grant_is_paused_at_the_next_tick(rig):
+    """Front + marker over time: W waits (named): not paused; PP0 grants it and the marker clears: the next pressure
+    tick pauses it like any leg holding KV."""
+    from sglang.srt.weg2 import dual_grant_wait as G
+
+    f, loop = _front_with(["weg2-0-44"])
+    pp0 = _pp0(["weg2-0-44"])
+    G.publish(pp0, ["weg2-0-44"])
+    try:
+        async def tick():
+            f._dual_pause_inflight(360710144)
+            await asyncio.sleep(0.05)
+
+        loop.run_until_complete(tick())
+        assert f.aborted == [] and not any(p.dual_pause for p in f._dual_inflight.values())
+        G.publish(pp0, ())                                           # granted: no longer a waiter
+        loop.run_until_complete(tick())
+    finally:
+        loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    assert f.aborted == ["weg2-0-44"]
+
+
+def test_t1_grant_axis_release_then_d_claims_then_the_waiter_is_granted(rig, monkeypatch):
+    """P + D over time on real ledgers: P holds a leftover mapping, D is short; the waiter-only queue releases it
+    (P committed 0); the waiter's grant is held for D (grace) while the freed bytes are free; D claims them (demand
+    gone); only then the waiter is granted."""
+    fx = _Pp0(monkeypatch, str(rig))
+    for pth in fx.paths:
+        d, p = K.CardKvLedger(pth, "D"), K.CardKvLedger(pth, "P")
+        p.request(100 * MIB)
+        d.request(4096 * MIB)
+        d.request(100 * MIB)                                         # D's demand: exactly what P holds
+    W = "weg2-0-44"
+    _write_marker(rig, [W])
+    sched, req = fx.sched(), fx.req(W)
+    monkeypatch.setattr(S, "_actor", lambda s: types.SimpleNamespace(page=64, _committed=0,
+                                                                     map_granted=lambda lvl, charged=None: None))
+    assert S.pp0_grant(sched, req) == 0, "precondition: the waiter is held while P holds bytes (PP0 retries it every pass)"
+    ranks = [make_rank(i, [_req(W, True)], held_waiters=[W], ledger=K.CardKvLedger(fx.paths[i], "P"),
+                       p_bytes=100 * MIB) for i in range(3)]
+    monkeypatch.setattr(S, "_actor", lambda s: getattr(s, "actor", None))
+    for r in ranks:
+        on_idle(r)
+    for pth in fx.paths:
+        assert K.peek(pth).committed["P"] == 0, "P kept its mapping"
+        assert K.peek(pth).free >= 100 * MIB
+    monkeypatch.setattr(S, "_actor", lambda s: types.SimpleNamespace(page=64, _committed=0,
+                                                                     map_granted=lambda lvl, charged=None: None))
+    assert S.pp0_grant(sched, req) == 0, "the waiter took the bytes P just released before D did"
+    for pth in fx.paths:
+        K.CardKvLedger(pth, "D").request(100 * MIB)                  # D's tick claims the freed bytes: demand gone
+        assert K.peek(pth).demand["D"] == 0
+        K.CardKvLedger(pth, "D").release(2000 * MIB)                 # a D seat ends: room for P
+    assert S.pp0_grant(sched, req) > 0
+
+
+@pytest.mark.parametrize("state,paused", [("serving", False), ("stopped", False), ("lent", False),
+                                          ("reclaiming", False), ("sleeping", True)])
+def test_t1_every_p_stage_but_sleeping_leaves_the_waiter_unpaused(rig, state, paused):
+    f, loop = _front_with(["weg2-0-43", "weg2-0-44"])
+    _write_marker(rig, ["weg2-0-44"])
+    f._dual_stages().p_state = state
+    try:
+        async def run():
+            f._dual_pause_inflight(360710144)
+            await asyncio.sleep(0.05)
+
+        loop.run_until_complete(run())
+    finally:
+        loop.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    assert ("weg2-0-44" in f.aborted) is paused, (state, f.aborted)
+    assert "weg2-0-43" in f.aborted
+
+
+# ------------------------------------------------------------------------------------------ R3 (documented)
+
+def test_r3_a_follower_releases_once_its_early_read_terminated(rig):
+    """Review R3: with HiCache on, a follower's early read (ongoing_prefetch) keeps the rank not idle; PP0 has no
+    read for a waiter and releases at once. The follower follows with delay (the read), not never."""
+    W = "weg2-0-44"
+    path, _d, p = _card(str(rig), "card0", 100 * MIB, 50 * MIB)
+    _write_marker(rig, [W])
+    pp1 = make_rank(1, [_req(W, True)], ledger=p, p_bytes=100 * MIB)
+    pp1.enable_hierarchical_cache = True
+    pp1.tree_cache.enable_storage = True
+    pp1.tree_cache.ongoing_prefetch = {W: object()}
+    on_idle(pp1)
+    assert committed_p(path) == 100 * MIB
+    pp1.tree_cache.ongoing_prefetch = {}
+    on_idle(pp1)
+    assert committed_p(path) == 0
