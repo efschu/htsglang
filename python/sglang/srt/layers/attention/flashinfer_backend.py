@@ -2186,6 +2186,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if in_capture:
             ok, why = _fi_graph_split.flashinfer_contract_ok(w)
             lay = None
+            fi_ver = _fi_graph_split.installed_version_key()
             if ok:
                 out_bytes = torch.empty((), dtype=upd.q_data_type).element_size()
                 lay, why = _fi_graph_split.layout_from_stock(
@@ -2201,6 +2202,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         w._float_workspace_buffer.numel()
                         * w._float_workspace_buffer.element_size()
                     ),
+                    fi_version=fi_ver,
                 )
             if lay is None:
                 states[key] = None
@@ -2209,9 +2211,11 @@ class FlashInferAttnBackend(AttentionBackend):
             states[key] = _fi_graph_split.GraphSplitState(lay, list(w._plan_info))
             o = lay.offsets
             logger.info(
-                "FI-GRAPH-SPLIT armed: grid %d work items per KV head (%d q tiles x "
-                "%d chunks), partials %.1f MB at float offset %d, int region %d B at "
-                "%d, min chunk %d tokens",
+                "FI-GRAPH-SPLIT armed: on flashinfer=%s contract=ok N=%d grid %d work "
+                "items per KV head (%d q tiles x %d chunks), partials %.1f MB at float "
+                "offset %d, int region %d B at %d, min chunk %d tokens",
+                lay.fi_version,
+                lay.max_chunks,
                 lay.padded,
                 lay.padded // lay.max_chunks,
                 lay.max_chunks,
