@@ -850,6 +850,33 @@ def lent_bytes(actor) -> int:
     return int(getattr(actor, "_sleep_lent", 0) or 0) + int(getattr(actor, "_awake_lent", 0) or 0)
 
 
+LEND_GATE_MARK = "#1480 LEND-RESUME-GATE"
+#: P ranks of the dual layout (PP0..PP2), the stage files the front reads
+LEND_GATE_RANKS = 3
+
+
+def lend_gate_reading(tags: Sequence[str], ranks: int = LEND_GATE_RANKS) -> Tuple[List[Optional[int]], str]:
+    """#1480: what each P rank still lends its card pool (stage file ``lent``), read
+    under the first of ``tags`` whose file exists. ``None`` = no readable file for
+    that rank under any tag. Returns (per-rank list, tag that answered)."""
+    import json
+
+    per: List[Optional[int]] = []
+    used = ""
+    for r in range(int(ranks)):
+        val: Optional[int] = None
+        for tag in tags:
+            try:
+                with open(stage_file(tag, r)) as f:
+                    val = max(0, int(json.load(f).get("lent") or 0))
+            except (OSError, ValueError, AttributeError, TypeError):
+                continue
+            used = used or str(tag)
+            break
+        per.append(val)
+    return per, used
+
+
 def sleep_phys_before(sched) -> Optional[int]:
     """D PRIORITY stage 2, P's sleep leg: cuMemGetInfo before the release (dual P
     only, else None -- the stock leg is untouched)."""
