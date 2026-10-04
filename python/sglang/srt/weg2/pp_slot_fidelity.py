@@ -252,16 +252,53 @@ def unbacked_drop_allowed(tree, node) -> bool:
 UD_HOST_CHILDREN_ENV = "SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"
 
 
-def ud_host_children_enabled(env=None) -> bool:
+def ud_host_children_enabled(env=None, tree=None) -> bool:
     """Dual P layout only (``dual_p_kv_stage.armed``: SGLANG_WEG2_DUAL_LAYOUT=1, group P and
-    a P-KV cap); False in the flip form, NF, 27B INT8 and on dual D whatever the switch says."""
+    a P-KV cap); False in the flip form, NF, 27B INT8 and on dual D whatever the switch says.
+    Switch values: ``1`` (default, every P rank), ``pp0`` (only the tree of pipeline rank 0 -- the
+    authority whose told the followers cap to; ``tree.pp_rank``, a plain attribute of the
+    UnifiedRadixCache; without a tree the answer is the armed one), ``0`` / false / no / off."""
     e = os.environ if env is None else env
     from sglang.srt.weg2 import dual_p_kv_stage as _dpk
 
     if not _dpk.armed(e):
         return False
     raw = (e.get(UD_HOST_CHILDREN_ENV, "") or "1").strip().lower()
-    return raw not in ("0", "false", "no", "off")
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw == "pp0" and tree is not None:
+        return int(getattr(tree, "pp_rank", 0) or 0) == 0
+    return True
+
+
+def _subtree_blocked(tree, n, ongoing) -> bool:
+    """A node the drop must not release (True = keep everything, the old behaviour). Asked of the
+    leaf AND every descendant.
+
+    * in flight: ``ongoing_write_through`` by id, AND ``write_through_pending_id`` (after
+      ``_replace_pending_write_through_node`` a split node's key stays the OLD node id, so the id
+      lookup misses it), AND ``_weg2_direct_mamba_rows`` (#1427: a direct write's mamba rows in
+      flight -- nothing may take them).
+    * a host-backed END anchor (``_weg2_end_anchor`` with a mamba host value): the hand-back anchor
+      of a request D may not have read yet, which the reset path holds across one D phase on
+      purpose (``_weg2_carrier_rotate``, mamba HOLD-END-ANCHOR). Released here it would be taken
+      from under that hold, so the drop leaves such a subtree alone (the eviction then ends as it
+      did before this fix). An END-flagged node WITHOUT a mamba host value carries nothing to
+      hold and is released; the log's ``end_anchors`` counts those."""
+    nid = getattr(n, "id", None)
+    if nid in ongoing or getattr(n, "write_through_pending_id", None) is not None:
+        return True
+    if nid in (getattr(tree, "_weg2_direct_mamba_rows", None) or {}):
+        return True
+    if getattr(n, "_weg2_end_anchor", False):
+        try:
+            from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+
+            if n.component_data[ComponentType.MAMBA].host_value is not None:
+                return True
+        except Exception:  # noqa: BLE001 -- no mamba component on this tree: no END anchor to hold
+            pass
+    return False
 
 
 def unbacked_drop_subtree(tree, node):
@@ -287,30 +324,39 @@ def unbacked_drop_subtree(tree, node):
     flight. Anything else -- and the whole call off the dual P layout, off the local-PP floor, with
     the switch at 0 -- returns None and the eviction ends as it did before this fix.
 
-    RANK CONGRUENCE. The verdict is rank-local, like UD itself (the floor is this rank's own value:
-    ``unbacked_drop_allowed``'s premise) and like the Q-697c spill, which releases whatever a rank's
-    own claim refusal asks for. PP ranks hold replica trees of the same token path, so a rank that
-    drops a subtree its peers keep differs from them in CACHE CONTENT only. No collective runs
-    inside the eviction, so nothing can hang on the drop itself. What matters is who drops:
+    RANK CONGRUENCE (corrected after review 08:31Z -- an earlier text called the follower case "a named
+    stop on one request"; it is not). The verdict is rank-local, like UD itself (the floor is this
+    rank's own value) and like the Q-697c spill. No collective runs inside the eviction, so the drop
+    itself cannot hang. What matters is who drops:
       * PP0 (the y9d3 case: the rank with the smallest pool rest). PP0 is the authority -- its Admit
-        names what PP0's OWN tree can admit (weg2_told_fidelity: told = head matched in PP0's tree +
-        store span) and the followers cap their radix match to that told (#1419), so a shorter PP0
-        tree shortens the told on every rank and a follower that kept more uses the told extent.
-      * a follower (PP1/PP2), only under its own pool wall: it can end with LESS than PP0's told and
-        then needs the tail from the store (#988 LOADBACK prefix moved). Where the store has no
-        copy that is the ``#1004 SLOT DISAGREEMENT`` / HANDOFF-LOST class -- a named stop on one
-        request, against the alternative this replaces, an ``alloc_token_slots`` raise that kills
-        the rank and with it the group (W17). Not proven away; the Sollmarker for the metal boot
-        names it (``EVICT-UNBACKED-DROP SUBTREE`` on PP1/PP2 followed by #1004 = this residual)."""
+        names what PP0's OWN tree can admit (weg2_told_fidelity) and the followers cap their radix
+        match to that told (#1419), so a shorter PP0 tree shortens the told on every rank.
+      * a follower (PP1/PP2), only under its own pool wall: it can end with LESS than PP0's told.
+        What follows is NOT a refusal of one request: ``Weg2StoreToldMismatch`` / ``STORE-TOLD WAIT
+        EXCEEDED`` (managers/weg2_store_told.py) and ``#1004 SLOT DISAGREEMENT``
+        (scheduler_pp_mixin.py) are raises without a catch = a NAMED GROUP DEATH. The OOM death this
+        replaces is certain; the disagreement is only possible. That is the decision, and it is
+        switchable: ``SGLANG_WEG2_DUAL_UD_HOST_CHILDREN`` = ``1`` (all P ranks, default) / ``pp0``
+        (PP0's tree only: the safe half) / ``0`` (off).
+      * the critical case ``_weg2_store_told_satisfied`` (weg2_store_told.py, "registered nothing
+        because it already held the span"): a follower that held the told span locally registers no
+        read and its admission settles at told. Between that registration and the admission the
+        request pins nothing in the tree (the lock is taken at admission, the prefix is re-matched
+        on every pass), so a rank-local drop of exactly that span by THIS fix is possible, and the
+        admission would then raise the mismatch. It is the same exposure the tree already has to
+        every host-leaf eviction (W3 spill, host LRU) and is NOT closed here: the tree does not
+        know which request ids the scheduler holds as satisfied. Named residual; ``pp0`` removes it
+        for the followers.
+    The cache content below the leaf is lost (hand-off pages without an L3 copy)."""
     if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
         return None
-    if not ud_host_children_enabled():
+    if not ud_host_children_enabled(tree=tree):
         return None
     children = getattr(node, "children", None)
     if not children:
         return None  # a childless leaf is the plain UD case
     ongoing = getattr(tree, "ongoing_write_through", None) or {}
-    if getattr(node, "id", None) in ongoing:
+    if _subtree_blocked(tree, node, ongoing):
         return None
     pre = []
     stack = list(children.values())
@@ -320,7 +366,7 @@ def unbacked_drop_subtree(tree, node):
         if (
             not getattr(d, "evicted", False)
             or not getattr(d, "backuped", False)
-            or getattr(d, "id", None) in ongoing
+            or _subtree_blocked(tree, d, ongoing)
         ):
             return None
         for cd in d.component_data:
@@ -331,19 +377,21 @@ def unbacked_drop_subtree(tree, node):
     return pre
 
 
-def note_unbacked_drop(tree, node, tokens: int, subtree_nodes: int = 0, host_tokens: int = 0) -> None:
+def note_unbacked_drop(tree, node, tokens: int, subtree_nodes: int = 0, host_tokens: int = 0,
+                       end_anchors: int = 0) -> None:
     if subtree_nodes:
         n = _sampled(tree, "_weg2_sf_unbacked_drop_subtree")
         if n is not None:
             logger.warning(
                 "EVICT-UNBACKED-DROP SUBTREE node=%s tokens=%d freed=%d subtree_nodes=%d "
-                "subtree_host_tokens=%d (n=%d): Q-1500 dual P -- a write_back leaf whose backup the "
+                "subtree_host_tokens=%d end_anchors=%d rank=pp%s (n=%d): Q-1500 dual P -- a write_back leaf whose backup the "
                 "arena refused carried host-only children; they were released bottom-up (their arena "
                 "references went back) and the leaf dropped, instead of the eviction delivering "
                 "nothing and alloc_token_slots raising (y9d3 P PP0: rank death, W17). The cache "
                 "content below it is lost (recomputable / re-routed)",
                 getattr(node, "id", "?"), len(getattr(node, "key", []) or []), int(tokens),
-                int(subtree_nodes), int(host_tokens), n)
+                int(subtree_nodes), int(host_tokens), int(end_anchors),
+                getattr(tree, "pp_rank", "?"), n)
         return
     n = _sampled(tree, "_weg2_sf_unbacked_drop")
     if n is not None:

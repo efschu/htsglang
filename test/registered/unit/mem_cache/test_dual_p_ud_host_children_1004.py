@@ -43,7 +43,7 @@ DUAL_ENV = {
     "SGLANG_WEG2_GROUP": "P",
     "SGLANG_WEG2_DUAL_P_KV_MAX_TOKENS": "32768",
 }
-_KEYS = tuple(DUAL_ENV) + (SF.ENV, "SGLANG_WEG2_DUAL_UD_HOST_CHILDREN")
+_KEYS = tuple(DUAL_ENV) + (SF.ENV, "SGLANG_WEG2_DUAL_UD_HOST_CHILDREN", "SGLANG_EVICT_FRONTIER_REPAIR")
 
 
 class _WriteBackController:
@@ -74,6 +74,8 @@ def _host_insert(cache, tokens):
 
 def _tree():
     """265 -> 266 on the device (un-backed), host-only children below 266 (the y9d3 shape)."""
+    for k in _KEYS:
+        os.environ.pop(k, None)                                   # a second _tree() in one test
     cfg = CacheConfig(page_size=PAGE, components=(FULL, MAMBA))
     cache, alloc, r2t = build_fixture(cfg)
     cache.cache_controller = _WriteBackController()
@@ -258,6 +260,102 @@ class DualPUdHostChildren(CustomTestCase):
         self.assertEqual(len(b.children), 0)
         res = cache.evict(EvictParams(num_tokens=8))
         self.assertEqual(res.num_tokens_evicted, 8)                      # childless chain: plain UD, unchanged
+
+    # ---- review 08:31Z A1: in-flight / held states of the leaf AND of every descendant keep the subtree ----
+
+    def test_a_split_pending_write_id_on_a_descendant_or_the_leaf_keeps_the_subtree(self):
+        """After _replace_pending_write_through_node a split node's pending id is the OLD node id, so
+        the ongoing_write_through lookup by node.id misses it: write_through_pending_id is consulted."""
+        for key in (13, 5):
+            cache, alloc, n = _tree()
+            self.assertIsNotNone(SF.unbacked_drop_subtree(cache, n[5]))
+            n[key].write_through_pending_id = 99999
+            cache.ongoing_write_through[99999] = object()
+            self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]), key)
+            cache.ongoing_write_through.pop(99999)
+
+    def test_direct_mamba_rows_in_flight_keep_the_subtree(self):
+        """#1427: a direct write's mamba rows in flight (leaf or descendant) are never taken."""
+        for key in (13, 5):
+            cache, alloc, n = _tree()
+            cache._weg2_direct_mamba_rows = {n[key].id: object()}
+            self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]), key)
+
+    def test_a_host_backed_end_anchor_keeps_the_subtree_and_an_empty_one_does_not(self):
+        """The reset path holds the END anchor one D phase on purpose (_weg2_carrier_rotate, mamba
+        HOLD-END-ANCHOR); a flag without a mamba host value holds nothing."""
+        for key in (13, 5):
+            cache, alloc, n = _tree()
+            n[key]._weg2_end_anchor = True
+            n[key].component_data[MAMBA].host_value = torch.tensor([555], dtype=torch.int64)
+            self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]), key)
+        cache, alloc, n = _tree()
+        n[13]._weg2_end_anchor = True                                    # no mamba host value
+        self.assertIsNotNone(SF.unbacked_drop_subtree(cache, n[5]))
+
+    # ---- review A2: PP0-only mode ----
+
+    def test_pp0_mode_drops_on_pp0_only(self):
+        cache, alloc, n = _tree()
+        os.environ["SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"] = "pp0"
+        cache.pp_rank = 1
+        self.assertIsNone(SF.unbacked_drop_subtree(cache, n[5]))
+        self._assert_old_behaviour(cache, n, cache.evict(EvictParams(num_tokens=8)))
+        cache, alloc, n = _tree()
+        os.environ["SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"] = "pp0"
+        cache.pp_rank = 0
+        self.assertIsNotNone(SF.unbacked_drop_subtree(cache, n[5]))
+        self.assertEqual(cache.evict(EvictParams(num_tokens=8)).num_tokens_evicted, 8)
+
+    # ---- review A3: the log names the rank and the end anchors ----
+
+    def test_the_log_names_rank_and_end_anchors(self):
+        cache, alloc, n = _tree()
+        n[13]._weg2_end_anchor = True                                    # flagged, nothing to hold
+        cache.pp_rank = 2
+        with self.assertLogs("sglang.srt.weg2.pp_slot_fidelity", level="WARNING") as cm:
+            cache.evict(EvictParams(num_tokens=4))
+        line = next(m for m in cm.output if "EVICT-UNBACKED-DROP SUBTREE" in m)
+        self.assertIn("end_anchors=1", line)
+        self.assertIn("rank=pp2", line)
+        self.assertIn("subtree_nodes=2", line)
+
+    # ---- review nice-to-have: mutants M4 and M15 ----
+
+    def test_mamba_host_rows_and_lru_of_the_descendants_are_returned(self):
+        """M4: the subtree release must hand the mamba host rows back (pool stub) and take the
+        descendants off the mamba host LRU -- through _evict_host_leaf, not just deleting the edge."""
+        cache, alloc, n = _tree()
+        comp = cache.components[MAMBA]
+
+        class Pool:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, idx):
+                self.freed.append(int(idx.reshape(-1)[0]))
+                return len(idx)
+
+        pool = Pool()
+        comp._mamba_pool_host = pool
+        for k in (9, 13):
+            n[k].component_data[MAMBA].host_value = torch.tensor([100 + k], dtype=torch.int64)
+            cache.host_lru_lists[MAMBA].insert_mru(n[k])
+        res = cache.evict(EvictParams(num_tokens=8))
+        self.assertEqual(res.num_tokens_evicted, 8)
+        self.assertEqual(sorted(pool.freed), [109, 113])
+        for k in (9, 13):
+            self.assertFalse(cache.host_lru_lists[MAMBA].in_list(n[k]))
+        cache.sanity_check()
+
+    def test_the_leaf_drop_itself_does_not_lean_on_the_frontier_retry(self):
+        """M15: with the EF retry (FullComponent.drive_eviction) off, the plain eviction still pays
+        the leaf -- the hook is what delivers, not the retry that would rescue a missing one."""
+        cache, alloc, n = _tree()
+        os.environ["SGLANG_EVICT_FRONTIER_REPAIR"] = "0"
+        res = cache.evict(EvictParams(num_tokens=8))
+        self.assertEqual(res.num_tokens_evicted, 8)
+        self.assertEqual(len(cache.root_node.children), 0)
 
 
 if __name__ == "__main__":
