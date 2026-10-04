@@ -670,3 +670,247 @@ def test_q610_take_and_kept_are_named(monkeypatch, caplog):
         r2.c._weg2_dual_claim_room(UnifiedTreeNode(TC), r2.pool)
     assert any("TOLD-ANCHOR-HOLD KEPT" in x.message and "depth=%d" % T in x.message for x in caplog.records)
 
+
+
+# ---------------------------------------------------------------------------------------------
+# Reviewer y9d4c: surviving mutants M03/M04/M14/M16/M17/M19/M20/M26 (tests only, no production change)
+# ---------------------------------------------------------------------------------------------
+def test_m03_m04_defaults_and_env_overrides(monkeypatch):
+    """DEFAULT_MAX=24 / DEFAULT_RUNS=256 are what an unset environment runs with; env overrides win."""
+    assert TAH.DEFAULT_MAX == 24 and TAH.DEFAULT_RUNS == 256
+    tolds = {"r%02d" % i: _NS(told=1000 * (i + 1)) for i in range(30)}
+    s = _NS(_weg2_store_told={}, _weg2_told_early={}, _weg2_told_pacing={}, _weg2_store_told_satisfied={},
+            _weg2_told_kept=tolds)
+    # unset -> 24 of 30 held, the 6 SHALLOWEST fall out
+    d = TAH.Hold(TAH.ToldView(s)).depths()
+    assert len(d) == 24 and sorted(d)[0] == 7000 and sorted(d)[-1] == 30000
+    # blank value -> default
+    monkeypatch.setenv(TAH.ENV_MAX, "")
+    assert len(TAH.Hold(TAH.ToldView(s)).depths()) == 24
+    # override
+    monkeypatch.setenv(TAH.ENV_MAX, "3")
+    assert sorted(TAH.Hold(TAH.ToldView(s)).depths()) == [28000, 29000, 30000]
+    monkeypatch.delenv(TAH.ENV_MAX)
+    # RUNS: held through 256 ticks, expired at the 257th; the override shortens it
+    h = TAH.Hold({"weg2-0-77": T})
+    for _ in range(256):
+        assert h.depths(tick=True) == {T: ["weg2-0-77"]}
+    assert h.depths(tick=True) == {}
+    monkeypatch.setenv(TAH.ENV_RUNS, "5")
+    h = TAH.Hold({"weg2-0-77": T})
+    for _ in range(5):
+        assert h.depths(tick=True) == {T: ["weg2-0-77"]}
+    assert h.depths(tick=True) == {}
+
+
+def test_m14_take_ring_keeps_many_entries_and_names_all_at_the_depth(caplog):
+    h = TAH.Hold({"weg2-0-77": T})
+    n1, n2 = _NS(id=11), _NS(id=12)
+    h.note_take("PATH-CAP", n1, T, False)
+    h.note_take("Q-610", n2, T, False)
+    assert len(h.takes) == 2
+    for i in range(80):
+        h.note_take("INNER", _NS(id=100 + i), 1000 + i, False)
+    assert len(h.takes) == TAH.TAKES_KEEP == 64
+    h2 = TAH.Hold({"weg2-0-77": T})
+    h2.note_take("PATH-CAP", n1, T, False)
+    h2.note_take("Q-610", n2, T, False)
+    h2._env = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P"}
+    with caplog.at_level(logging.WARNING):
+        h2.check_extent("weg2-0-77", T)
+        h2.check_extent("weg2-0-77", END_OLD)
+    w = [x.message for x in caplog.records if "EXTENT REGRESSED" in x.message]
+    assert len(w) == 1 and "PATH-CAP node=11" in w[0] and "Q-610 node=12" in w[0]
+
+
+class _FakeArena:
+    def __init__(self, slots, broken=False):
+        self.slots = slots
+        self.broken = broken
+        self.slot_bytes = 78446592
+
+    def ref_census(self):
+        if self.broken:
+            raise RuntimeError("census unreadable")
+        return (98, 100, 111)
+
+    def evict_candidates(self, need, keep_lo=None):
+        return [(i, 1, 1) for i in range(int(need))]
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("slots,expect", [(112, "arena_pinned=98/112"), (4096, "arena_pinned=98/4096"),
+                                          (4097, "arena_pinned=-"), (720896, "arena_pinned=-")])
+def test_m16_arena_drop_line_names_the_mamba_arena_fill(monkeypatch, caplog, slots, expect, trace):
+    """ARENA-DROP prints arena_pinned=x/slots on the small anchor arenas (<= 4096 slots), '-' on the
+    big KV arena (no per-drop strided header read there)."""
+    from sglang.srt.mem_cache.pool_host import arena_pool as AP
+    from sglang.srt.weg2 import prefix_trace as PT
+
+    monkeypatch.setattr(PT, "_state", (trace, 1024))
+    monkeypatch.setattr(AP, "_reap_orphan_claims", lambda a: [])
+    monkeypatch.setattr(AP, "free_named", lambda *a, **k: None)
+    monkeypatch.setattr(AP._handoff_pending, "keep_for", lambda pool: None)
+    me = _NS(_weg2_reaps_orphan_claims=False, _backend=None)
+    with caplog.at_level(logging.INFO):
+        assert AP.ArenaMHAHostPool._evict_for_claim(me, _FakeArena(slots), 1) == 1
+    line = [x.message for x in caplog.records if "ARENA-DROP n=" in x.message]
+    assert line and expect in line[-1]
+
+
+def test_m17_prefix_trace_default_needs_the_dual_layout_too(monkeypatch):
+    """group P WITHOUT the dual layout (the flip / NF P group) keeps the trace off"""
+    from sglang.srt.weg2 import prefix_trace as PT
+
+    monkeypatch.delenv(PT.ENV, raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_DUAL_LAYOUT")
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
+    assert PT._read()[0] is False
+    monkeypatch.setenv("SGLANG_WEG2_DUAL_LAYOUT", "0")
+    assert PT._read()[0] is False
+    monkeypatch.setenv("SGLANG_WEG2_DUAL_LAYOUT", "1")
+    assert PT._read()[0] is True
+
+
+def test_m19_the_real_cap_run_ticks_the_clock(monkeypatch, caplog):
+    """EXPIRED arrives after RUNS REAL cap runs (_weg2_cap_path_states, even a run with nothing to take)
+    -- not only when a test calls depths(tick=True) by hand."""
+    monkeypatch.setenv(TAH.ENV_RUNS, "2")
+    r = _ranks(1)[0]
+    r.insert_tail_end_anchor()                                   # cap run 1 (takes 24000, T held)
+    tail = r.nodes[TAIL]
+    assert r.c._weg2_told_hold_depths() == {T: ["weg2-0-77"]}    # a non-tick read does not age it
+    with caplog.at_level(logging.WARNING):
+        r.c._weg2_cap_path_states(tail)                          # cap run 2: excess 0, still ticks
+        assert r.c._weg2_told_hold_depths() == {T: ["weg2-0-77"]}
+        assert not [x for x in caplog.records if "EXPIRED" in x.message]
+        r.c._weg2_cap_path_states(tail)                          # cap run 3 > RUNS
+    assert [x for x in caplog.records if "EXPIRED" in x.message and "weg2-0-77" in x.message]
+    assert r.c._weg2_told_hold_depths() == {}
+
+
+def test_m20_only_the_anchor_AT_the_told_depth_is_held(monkeypatch):
+    """END depth == told: neither a deeper nor a shallower anchor is held (a <= / >= comparison would
+    pin every anchor above or below the told)"""
+    r = _ranks(1)[0]
+    for d, n in r.nodes.items():
+        n._weg2_anchored = False
+    assert r.c._weg2_dual_releasable(r.nodes[T], r.pool) is False          # == told: held
+    assert r.c._weg2_dual_releasable(r.nodes[24000], r.pool) is True       # deeper than told: NOT held
+    assert r.c._weg2_dual_releasable(r.nodes[25000], r.pool) is True
+    assert r.c._weg2_dual_releasable(r.nodes[END_OLD], r.pool) is True     # shallower than told: NOT held
+    # PATH-CAP: only the node at the told depth is skipped; the deeper/shallower eligible ones are taken
+    r2 = _ranks(1)[0]
+    r2.told["weg2-0-77"] = 24000                                           # now 24000 is the held depth
+    r2.insert_tail_end_anchor()
+    assert r2.state()[24000] == (False, True)
+    assert r2.state()[T][0] is True                                        # shallower eligible: taken
+    # H19 victims
+    from sglang.srt.weg2 import mamba_arena_displace as mad
+    owned = [mad.OwnedAnchor(node=r.nodes[d], depth=d, rid="x", slots=[1]) for d in (END_OLD, T, 24000, 25000)]
+    assert [a.depth for a in r.c._weg2_told_unheld(owned)] == [END_OLD, 24000, 25000]
+
+
+def test_m26_extent_regression_warns_once_per_rid(monkeypatch, caplog):
+    r = _ranks(1)[0]
+    r.told["weg2-0-78"] = 24000
+    q77 = type("Q", (), {"rid": "weg2-0-77"})()
+    q78 = type("Q", (), {"rid": "weg2-0-78"})()
+    with caplog.at_level(logging.WARNING):
+        TAH.report_extent(q77, T)
+        TAH.report_extent(q77, END_OLD)      # fall 1 -> warns
+        TAH.report_extent(q77, T)            # recovers ...
+        TAH.report_extent(q77, END_OLD)      # ... falls again: NO second warning for this rid
+        TAH.report_extent(q78, 24000)
+        TAH.report_extent(q78, END_OLD)      # another rid warns for itself
+    w = [x.message for x in caplog.records if "EXTENT REGRESSED" in x.message]
+    assert len(w) == 2 and "rid=weg2-0-77" in w[0] and "rid=weg2-0-78" in w[1]
+
+
+def test_m16_arena_drop_census_failure_prints_a_question_mark(monkeypatch, caplog):
+    from sglang.srt.mem_cache.pool_host import arena_pool as AP
+    from sglang.srt.weg2 import prefix_trace as PT
+
+    monkeypatch.setattr(PT, "_state", (False, 1024))
+    monkeypatch.setattr(AP, "_reap_orphan_claims", lambda a: [])
+    monkeypatch.setattr(AP, "free_named", lambda *a, **k: None)
+    monkeypatch.setattr(AP._handoff_pending, "keep_for", lambda pool: None)
+    with caplog.at_level(logging.INFO):
+        AP.ArenaMHAHostPool._evict_for_claim(_NS(_weg2_reaps_orphan_claims=False, _backend=None),
+                                             _FakeArena(112, broken=True), 1)
+    assert [x for x in caplog.records if "ARENA-DROP n=" in x.message and "arena_pinned=?" in x.message]
+
+
+def test_m14_regression_at_the_middle_depth_names_the_middle_take(caplog):
+    h = TAH.Hold({"weg2-0-77": 12288})
+    h.note_take("PATH-CAP", _NS(id=1), 8192, False)
+    h.note_take("Q-610", _NS(id=2), 12288, False)
+    h.note_take("INNER", _NS(id=3), 16384, True)
+    with caplog.at_level(logging.WARNING):
+        h.check_extent("weg2-0-77", 12288)
+        h.check_extent("weg2-0-77", 8192)
+    w = [x.message for x in caplog.records if "EXTENT REGRESSED" in x.message]
+    assert len(w) == 1 and "Q-610 node=2 depth=12288" in w[0]
+    assert "node=1" not in w[0].split("Takes at that depth:")[1] and "node=3" not in w[0].split("Takes at that depth:")[1]
+
+
+def test_m17_more_prefix_trace_gate_shapes(monkeypatch):
+    from sglang.srt.weg2 import prefix_trace as PT
+
+    monkeypatch.delenv(PT.ENV, raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_GROUP")
+    monkeypatch.setenv("SGLANG_WEG2_DUAL_LAYOUT", "1")
+    assert PT._read()[0] is False                      # dual layout without a group
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", "p")
+    assert PT._read()[0] is True                       # lower case group P
+
+
+def test_m19_cap_off_never_ticks_and_hold_without_ticks_never_expires(monkeypatch):
+    """cap 0 (no PATH-CAP): the cap run returns before the tick -- the hold then lives by its lifecycle
+    only; the view is the scheduler's one stable object"""
+    monkeypatch.setenv("SGLANG_WEG2_MAMBA_MAX_STATES_PER_PATH", "0")
+    monkeypatch.setenv(TAH.ENV_RUNS, "1")
+    r = _ranks(1)[0]
+    r.insert_tail_end_anchor()
+    r.c._weg2_cap_path_states(r.nodes[TAIL])
+    r.c._weg2_cap_path_states(r.nodes[TAIL])
+    h = r.c._weg2_told_hold
+    assert h.age == {} and not h.expired
+    for _ in range(50):
+        assert r.c._weg2_told_hold_depths() == {T: ["weg2-0-77"]}     # non-tick reads never age it
+    s = _NS()
+    assert TAH.view_of(s) is TAH.view_of(s)
+
+
+def test_m20_told_between_anchors_holds_neither_neighbour():
+    """told=24000 over anchors 16665 / 22528 / 24000 / 25000: only 24000 is held"""
+    r = _ranks(1)[0]
+    r.told["weg2-0-77"] = 24000
+    assert r.c._weg2_told_held(r.nodes[24000]) is True
+    for d in (END_OLD, T, 25000):
+        assert r.c._weg2_told_held(r.nodes[d]) is False
+
+
+def test_pf_fallback_told_zero_overrides_satisfied_and_pacing():
+    """PF: the Admit(0) is written to _weg2_store_told (first record wins, told 0 filtered): the older
+    satisfied / pacing / early values of the same rid hold nothing"""
+    s = _NS(_weg2_store_told={"weg2-0-77": 0},
+            _weg2_store_told_satisfied={"weg2-0-77": T},
+            _weg2_told_pacing={"weg2-0-77": _NS(told=T)},
+            _weg2_told_early={"weg2-0-77": T}, _weg2_told_kept={})
+    assert TAH.Hold(TAH.ToldView(s)).depths() == {}
+    assert TAH.ToldView(s).get("weg2-0-77") == 0
+    s._weg2_store_told = {}                           # without the Admit(0) they would hold
+    assert TAH.Hold(TAH.ToldView(s)).depths() == {T: ["weg2-0-77"]}
+
+
+def test_kept_record_holds_until_settle_told(monkeypatch):
+    """the verdict stands in _weg2_told_kept after the adder's first visit popped the other records,
+    through cap runs, until settle_told drops it"""
+    r = _paced_rank(monkeypatch, "follower_kept")
+    for _ in range(3):
+        r.c._weg2_cap_path_states(r.nodes[25000])
+        assert r.c._weg2_told_hold_depths() == {T: ["weg2-0-77"]}
+    r.sched._weg2_told_kept.pop("weg2-0-77")           # settle_told: the rid left the queue
+    assert r.c._weg2_told_hold_depths() == {}
+

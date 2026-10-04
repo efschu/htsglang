@@ -5448,8 +5448,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             UnifiedRadixCache._weg2_kept_n = k
             if k <= 32 or k % 64 == 0:
                 d = self._weg2_node_end_depth(n)
-                logger.info("%s KEPT node=%s depth=%s end_anchor=%s rids=%s (n=%d): given back by "
-                            "Q-610/inner release otherwise", _tah.MARKER, getattr(n, "id", "?"), d,
+                # n counts EVALUATIONS of the release test (one per candidate node per claim walk /
+                # inner release), not events: a rising n is a sign of life, not a rate of anchors
+                logger.info("%s KEPT node=%s depth=%s end_anchor=%s rids=%s (evaluation n=%d, "
+                            "not an event count): given back by Q-610/inner release otherwise", _tah.MARKER, getattr(n, "id", "?"), d,
                             bool(getattr(n, "_weg2_end_anchor", False)),
                             h.depths().get(d, []), k)
         except Exception:  # noqa: BLE001 -- an instrument
