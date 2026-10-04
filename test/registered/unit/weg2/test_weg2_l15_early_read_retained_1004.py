@@ -319,3 +319,48 @@ def test_the_spread_asks_the_group_once_and_stays_rank_uniform(env):
     for _ in range(3):
         out += park_l3.issue_reads_at_wake_begin(s, max_n=1)
     assert [r.rid for r in out] == [NEW_A, NEW_B] and len(asks) == 1
+
+
+# review 1260 (5): the full-flush paths reset the tree too ---------------------------------------
+def test_flush_fallback_in_restore_pools_rearms_the_early_reads(env):
+    """_weg2_wake_restore_pools falls back to flush_cache() on an exception: the tree is reset after
+    the early read -- re-armed (without it the settle is blind, see the N4f test above)."""
+    _agree(env, {HELD_RID})
+    reads, tree = [], _Tree()
+    s = _sched(tree, reads, retained=True)
+    held, a, b = _hold(s, [HELD_RID, NEW_A, NEW_B])
+    park_l3.issue_reads_at_wake_begin(s)
+    tree.ongoing_prefetch.clear()
+    mgr = types.SimpleNamespace(
+        scheduler=s, _l15_wake_hold_signal=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        flush_cache=lambda: tree.reset() or True)
+    assert wu.SchedulerWeightUpdaterManager._weg2_wake_restore_pools(mgr) is True
+    assert tree.resets == 1 and park_l3.deferred(a) and park_l3.deferred(b)
+    Scheduler._weg2_release_dormant_hold(s)
+    assert reads.count(NEW_A) == 2, "re-read after the flush's reset, not a blind 'complete'"
+
+
+def test_the_wake_flush_branch_calls_the_rearm_after_the_flush():
+    import inspect
+
+    src = inspect.getsource(wu.SchedulerWeightUpdaterManager)
+    i = src.index('flushed = self.flush_cache()')
+    assert '_l15_rearm_early_reads(scheduler, "flush")' in src[i:i + 400]
+
+
+# review 1260 (6): the prediction's milliseconds are logged, behaviour unchanged ------------------
+def test_the_prediction_logs_its_milliseconds_once_per_wake(env, caplog):
+    import logging
+
+    _agree(env, {HELD_RID})
+    reads, tree = [], _Tree()
+    s = _sched(tree, reads, retained=True)
+    s._weg2_wake_seq, s.weg2_dormant = 4, True
+    _hold(s, [HELD_RID, NEW_A, NEW_B])
+    with caplog.at_level(logging.INFO, logger=park_l3.logger.name):
+        out = []
+        for _ in range(3):
+            out += park_l3.issue_reads_at_wake_begin(s, max_n=1)
+    lines = [r.getMessage() for r in caplog.records if "L15-EARLY-READ predict_ms=" in r.getMessage()]
+    assert len(lines) == 1 and "retained=True agreed=1" in lines[0]
+    assert [r.rid for r in out] == [NEW_A, NEW_B]

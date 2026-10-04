@@ -553,7 +553,19 @@ def issue_reads_at_wake_begin(sched, max_n: Optional[int] = None) -> list:
     if _wk is not None and _fc is not None and _fc[0] == _wk:
         held = _fc[1]
     else:
+        _t_pred = time.perf_counter()
         held = l15_agreed_held_rids(sched)
+        _pred_ms = (time.perf_counter() - _t_pred) * 1000.0
+        try:
+            from sglang.srt.weg2 import l15_plan as _l15p
+
+            if _l15p.master_on(os.environ):
+                # L15-EARLY-READ: what the hold prediction (manifest read + fingerprint + the
+                # group gather, which waits for the slowest rank) costs on the critical path
+                logger.info("L15-EARLY-READ predict_ms=%.0f retained=%s agreed=%d (manifest read + "
+                            "fingerprint + gather, once per wake)", _pred_ms, _retained(sched), len(held))
+        except Exception:  # noqa: BLE001 -- an instrument only
+            pass
         if _wk is not None:
             try:
                 sched._weg2_l15_early_filter = (_wk, held)

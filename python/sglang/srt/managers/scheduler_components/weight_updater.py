@@ -8076,7 +8076,9 @@ class SchedulerWeightUpdaterManager:
             raise  # W26b by name: nothing was cleared, no fallback hides it
         except Exception as exc:  # noqa: BLE001 -- fall back to the full flush, never leave pools undefined
             logger.warning("WEG2-WAKE-RESTORE failed (%s: %s) -> full flush_cache", type(exc).__name__, exc)
-            return bool(self.flush_cache())
+            _fl_ok = bool(self.flush_cache())
+            _l15_rearm_early_reads(sched, "flush")  # L15-EARLY-READ: the full flush reset the tree
+            return _fl_ok
 
     def _weg2_raise_pending_seam_refusal(self, *, join: bool = True) -> None:
         """#1450: a refusal graded behind the wake is raised here -- called at
@@ -10951,6 +10953,8 @@ class SchedulerWeightUpdaterManager:
                 # SGLANG_WEG2_WAKE_FLUSH=1 restores the full flush (tree reset).
                 if os.environ.get("SGLANG_WEG2_WAKE_FLUSH", "0") == "1":
                     flushed = self.flush_cache()
+                    # L15-EARLY-READ: the full flush reset the tree after the early hold read
+                    _l15_rearm_early_reads(scheduler, "flush")
                 else:
                     flushed = self._weg2_wake_restore_pools()
                 # H81: D's phase is over (the front drained it, #1011) -- the
