@@ -372,3 +372,26 @@ abgeleiteten Felder einer `form.ModelProfile`-Zeile.  `GET /api/modellprofil/mod
 * **Nur im LAN und nicht im Release:** über den Proxy 403, Edition `release` 404 (die Route liest Dateien des Hosts).  Körper höchstens 64 KiB.
 * `static/modellprofil.js` (`window.ModellProfil`): `liste()`, `schaetzen(path, opts)`, `zeilen(profil)` (Zeilen `{gruppe, label, wert, roh, src, hinweis}`),
   `tabelle(profil)` (HTML-Baustein, escaped), `bytes(n)`.  Die Oberfläche baut Auftrag 930; dieses Modul zeichnet nichts selbst.
+
+## Hardwareprofil messen und anzeigen (Auftrag 950, Profil-Editor S2; nur Rig-Ausgabe, nur LAN)
+
+Routen und JSON, keine Oberfläche (die baut der Profil-Editor, Auftrag 930; `static/hwprofil.js` ist das Anzeige-Modul zum Einhängen).
+
+* `GET /api/hwprofil` → `{profile, problems, window, job, gpuq, owner, window_len}`. `profile` ist `flliper.hardware/1`: eine **Sicht** (keine vierte
+  Messdatei) über den Karten-Probe-Cache (`card_probe-*.json`), das Stufe-0-Profil (`hw_profile-*.json`) und NVML. Jeder Zahlenwert ist
+  `{v, src, at, probe, note}` mit `src` = `gemessen` | `NVML` | `Datenblatt` | `geschätzt` | `nicht gemessen` (dann `v: null` und `note` = Grund).
+  Gebaut wird in `sglang/srt/rigmon/hardware_profile.py` des Planer-Baums (per Dateipfad geladen, kein `import sglang` in diesem Prozess).
+* `POST /api/hwprofil/measure` `{"cards": [<NVML-Index>, ...]}` bucht **selbst** ein gpuq-Fenster (Eigentümer `profil-editor`, nur diese Karten,
+  10 min, ohne `not_before`, exklusiv; `mib` nur wenn der Body es verlangt) und misst darin. Antwort `action`:
+  `messung_gestartet` (Kindprozess läuft, Fenster geht danach SOFORT zurück, auch nach Fehler) · `wartet` (Fenster `pending`: Status, **nichts
+  gemessen**, Buchung bleibt; erneuter Druck nimmt sie wieder auf) · `abgelehnt` (unplanbar, Karte belegt trotz Fenster, zu wenig Restzeit, gpuq weg;
+  HTTP 409) · `laeuft_bereits`. Das gpuq-Token verlässt den Prozess nie; die Buchung steht zusätzlich in `<state-dir>/hwprofil_window.json`, damit
+  ein Neustart ein verwaistes Fenster zurückgibt.
+* `POST /api/hwprofil/cancel` gibt ein wartendes Fenster zurück.
+* Kein Hintergrund-Poller: nur wer die Seite bedient fragt. Ein laufendes Fenster, das nach 180 s nicht benutzt wurde, geht beim nächsten Aufruf zurück.
+* Dienst-Parameter (Deploy durch den Lead): `--hw-tree` (gestagter Baum mit `hardware_profile.py` + `weg2/card_identity.py`, `deploy/stage_hwprofil.sh`),
+  `--hw-measure-tree` (voller sglang-Baum für den Kindprozess), `--hw-python` (Interpreter mit torch + sgl_kernel; ohne sgl_kernel bleiben die Arme
+  int8/W4A16 leer und der Lauf meldet das als Warnung), `--hw-prefix` (z. B. `systemd-run --scope -q -p MemoryMax=6G`: der Dienst hat
+  `MemoryMax=1G`, torch/CUDA gehört in einen eigenen cgroup-Rahmen). Env: `HWPROFIL_TREE`, `HWPROFIL_MEASURE_TREE`, `HWPROFIL_PYTHON`, `HWPROFIL_PREFIX`.
+* Einhängen in eine Seite: `<div id="x"></div><script src="hwprofil.js"></script><script>HwProfil.mount(document.getElementById("x"))</script>`;
+  `HwProfil.render(antwort)` liefert nur den HTML-Text.
