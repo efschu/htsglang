@@ -4414,7 +4414,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 lru = lru_dict[ct]
                 if skip_existing and lru.in_list(node):
                     continue
+                if (
+                    target is EvictLayer.HOST
+                    and lru_op is UnifiedLRUList.insert_mru
+                    and cd.host_lock_ref > 0
+                ):
+                    # 1210b HOSTLOCK-EVICT-TO-HOST (NF y9nf4 1004_031945 D TP1/TP2 04:06:42Z, node 1272:
+                    # "mamba host-locked node(s) on the host LRU" at the idle walk after the epoch-82
+                    # park): the third writer Y8P-HOSTLOCK-LRU left -- `_evict_to_host` filed a
+                    # host-locked anchor. A host-locked node stays OFF the host LRU; the last host
+                    # unlock (`release_component_lock(lock_host=True)`) files it.
+                    self._note_hostlock_lru_skip(node, ct)
+                    continue
                 lru_op(lru, node)
+
+    def _note_hostlock_lru_skip(self, node: UnifiedTreeNode, ct: ComponentType) -> None:
+        """1210b: the named line of a host-locked node kept off the host LRU (metal marker)."""
+        n = int(getattr(self, "_hostlock_lru_skip_n", 0) or 0) + 1
+        self._hostlock_lru_skip_n = n
+        if n <= 8 or n % 256 == 0:
+            logger.info(
+                "HOSTLOCK-LRU-SKIP n=%d node=%s ct=%s host_lock_ref=%d site=evict_to_host (a host-locked "
+                "aux node stays off the host LRU; its last host unlock files it)",
+                n, getattr(node, "id", "?"), getattr(ct, "name", ct),
+                int(node.component_data[ct].host_lock_ref),
+            )
 
     def evict_host(
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
