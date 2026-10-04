@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import card_identity
+from sglang.srt.weg2.l15_pool import POOL_SHADOW_ENV, pool_shadow_on
 
 L15_MASTER_ENV = "SGLANG_WEG2_L15"
 L15_MIB_ENV = "SGLANG_WEG2_L15_MIB"
@@ -350,7 +351,8 @@ def refuse_dual(argv: Sequence[str], env: Mapping[str, str]) -> Optional[str]:
     if "--dual-layout" not in argv:
         return None
     armed = [name for name, on in ((L15_MASTER_ENV, master_on(env)),
-                                   (HOT_HANDOVER_ENV, handover_on(env))) if on]
+                                   (HOT_HANDOVER_ENV, handover_on(env)),
+                                   (POOL_SHADOW_ENV, pool_shadow_on(env))) if on]
     if not armed:
         return None
     return (f"{DUAL_REFUSAL_CODE}: --dual-layout with {', '.join(armed)} is refused in V1: "
@@ -368,7 +370,8 @@ def refuse_not_27b(profile: str, env: Mapping[str, str]) -> Optional[str]:
     if str(profile).strip().lower() == LINE_QWEN27B:
         return None
     armed = [name for name, on in ((L15_MASTER_ENV, master_on(env)),
-                                   (HOT_HANDOVER_ENV, handover_on(env))) if on]
+                                   (HOT_HANDOVER_ENV, handover_on(env)),
+                                   (POOL_SHADOW_ENV, pool_shadow_on(env))) if on]
     if not armed:
         return None
     return (f"{NOT27B_REFUSAL_CODE}: {', '.join(armed)} on profile {profile!r} is refused: "

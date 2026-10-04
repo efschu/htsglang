@@ -25406,6 +25406,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ns.profile, l15_base, l15_peaks, os.environ)
             for post in l15_posts:
                 log(l15_plan.post_line(post))
+            # L15-POOL S1 (log only): the per-card posts seen as ONE pool.
+            from sglang.srt.weg2 import l15_keep_split, l15_pool
+
+            if l15_pool.pool_shadow_on(os.environ):
+                log(l15_pool.boot_line(
+                    [p.mib for p in l15_posts], [p.src for p in l15_posts],
+                    l15_keep_split.anchor_cap(os.environ)))
             # L15-NOCAP (N3f): armed with nothing to hold is a launch error,
             # not a boot window spent on cap=0 (N3c/N3e).
             _nocap = l15_plan.refuse_no_caps(l15_posts, os.environ, cards)

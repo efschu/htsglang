@@ -20575,6 +20575,22 @@ class Scheduler(
                     l15_shadow.LEDGER.note_sleep(_hs)
             except Exception as exc:  # noqa: BLE001 - shadow must never block flush
                 logger.warning("L15-SHADOW select failed (ignored): %s: %s", type(exc).__name__, exc)
+            # [L1.5 POOL SHADOW] S1 (docs/L15-POOL-ENTWURF-1004.md): log-only
+            # comparison of the pooled admission (the SUM of all segments, KV +
+            # end anchors, guests in foreign segments) with today's per-rank
+            # hold set. SGLANG_WEG2_L15_POOL_SHADOW, default off; L15 path only
+            # (master on -- --dual-layout refuses it at launch, W-L15-DUAL).
+            # No collective, no state, no behaviour change; never raises.
+            try:
+                from sglang.srt.weg2 import l15_plan as _l15_plan_ps
+                from sglang.srt.weg2 import l15_pool as _l15_pool_ps
+
+                if _l15_pool_ps.pool_shadow_on(os.environ) and _l15_plan_ps.master_on(
+                    os.environ
+                ):
+                    _l15_pool_ps.log_sleep_shadow(self, os.environ, logger.info)
+            except Exception as exc:  # noqa: BLE001 - shadow must never block flush
+                logger.warning("L15-POOL-SHADOW failed (ignored): %s: %s", type(exc).__name__, exc)
             # [L1.5 RETAIN] L15-11c: hold the priced KV prefix across this
             # sleep flush at D instead of dropping it. Master switch
             # SGLANG_WEG2_L15; off means the untouched flush below. Only the

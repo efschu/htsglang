@@ -817,6 +817,15 @@ class Envs:
     # competes for the GIL with the rest of the D>P sleep leg. 0 = build at
     # once (the pre-540 form).
     SGLANG_WEG2_L15_PLAN_WARM_DEFER_S = EnvFloat(5.0)
+    # L15-POOL S1 (docs/L15-POOL-ENTWURF-1004.md sec 7): LOG-ONLY shadow of the
+    # pooled L1.5 admission (weg2/l15_pool.py) at the D sleep flush -- what a
+    # hold against the SUM of all cards' segments (KV + end anchors, guests in
+    # foreign segments) would keep vs what the per-rank path keeps today.
+    # Emits L15-POOL-SHADOW and the launcher's L15-POOL line; changes nothing.
+    # Only in the L15 path (SGLANG_WEG2_L15=1, never --dual-layout: W-L15-DUAL).
+    # The ranks read it through l15_pool.pool_shadow_on(os.environ) (1/true/on/yes),
+    # like every SGLANG_WEG2_L15* switch. Default off = today byte for byte.
+    SGLANG_WEG2_L15_POOL_SHADOW = EnvBool(False)
     # L3FILL_JOIN_WAIT_MS (L3FILL-JOINED 30.09., NF y4a ep36 weg2-36-74): how
     # long an L3 -> L2 fill waits for a stem another writer has CLAIMED to
     # become COMPLETE before it counts as a miss. A prefix read ends at its
