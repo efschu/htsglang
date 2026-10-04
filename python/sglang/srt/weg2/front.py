@@ -17137,6 +17137,10 @@ def main():
                     help="DUAL-SHARE: floor of P's share.")
     ap.add_argument("--dual-share-actuators", default="chunk",
                     help="DUAL-SHARE: P's actuators (for the decision line; P reads its own env).")
+    ap.add_argument("--dual-green-ladder", choices=("off", "on", "hold"), default="off",
+                    help="DUAL-SHARE stage 3 (weg2/dual_green.py): the 5-stage green-context automaton "
+                         "(100/75/50/25 %, H = hold; hold is observer-only unless 'hold') with the P-STUFE log "
+                         "line. off = the matrix controller, nothing changes.")
     ap.add_argument("--dual-layout", action="store_true", default=False,
                     help="DUAL-TP3PP3 (F26): both groups stay awake, the front never flips; leg 1 "
                          "goes to P at once, leg 2 to D right after leg 1 (prefix from the store). "
@@ -17330,7 +17334,8 @@ def main():
         ctl=str(getattr(args, "dual_share_ctl", "") or ""), mode=str(getattr(args, "dual_priority", "") or ""),
         actuators=str(getattr(args, "dual_share_actuators", "chunk") or "chunk"),
         d_min_rate_tps=float(getattr(args, "dual_d_min_rate_tps", 0.0) or 0.0),
-        p_min_share=float(getattr(args, "dual_p_min_share", 0.25) or 0.25), log=logger.info)
+        p_min_share=float(getattr(args, "dual_p_min_share", 0.25) or 0.25), log=logger.info,
+        green_ladder=str(getattr(args, "dual_green_ladder", "off") or "off"))
         if front.dual_layout else None)
     front.dual_kv_ledgers = [x for x in str(getattr(args, "dual_kv_ledgers", "") or "").split(",") if x]
     if front.dual_layout:

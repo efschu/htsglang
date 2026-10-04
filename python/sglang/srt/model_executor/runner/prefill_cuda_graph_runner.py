@@ -893,6 +893,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._is_full_backend:
                 self._note_eager("layer_split", forward_batch)
             return False
+        # item 1330 (weg2/dual_green.py): below 100 % the forward runs on a green-context stream, whose SM mask a
+        # graph captured in the primary context would ignore -- eager there. False (inert) unless the ladder armed.
+        from sglang.srt.weg2.dual_green import force_eager as _dgr_force_eager
+
+        if _dgr_force_eager():
+            if self._is_full_backend:
+                self._note_eager("green_rung", forward_batch)
+            return False
         if self._is_full_backend:
             reason = self._full_graph_ineligible_reason(forward_batch)
             if reason is not None:

@@ -14511,7 +14511,8 @@ def dual_priority_armed(ns) -> bool:
     """Any DUAL-SHARE switch set (each default off)."""
     return (getattr(ns, "dual_priority", None) is not None
             or str(getattr(ns, "dual_d_capture_prio", "off")) == "on"
-            or str(getattr(ns, "dual_p_mps_low_prio", "off")) == "on")
+            or str(getattr(ns, "dual_p_mps_low_prio", "off")) == "on"
+            or str(getattr(ns, "dual_green_ladder", "off")) != "off")
 
 
 def _read_driver_text() -> Optional[str]:
@@ -14544,6 +14545,11 @@ def dual_priority_env(ns, group: str, log=None) -> Dict[str, str]:
             env[_dsh.BUCKETS_ENV] = ",".join(str(b) for b in p_prefill_graph_buckets())
         if "duty" in acts:
             env[_dsh.DUTY_ENV] = "1"
+        if str(getattr(ns, "dual_green_ladder", "off")) != "off":
+            # STAGE 3 (weg2/dual_green.py): the switch is the P rank's env, NOT inherited from the launcher's own
+            env[_dsh.GREEN_LADDER_ENV] = "1"
+            if str(getattr(ns, "dual_green_ladder", "off")) == "hold":
+                env["SGLANG_WEG2_DUAL_GREEN_HOLD"] = "1"
     if str(getattr(ns, "dual_p_mps_low_prio", "off")) == "on":
         penv, line = _dsh.mps_client_priority_env(
             mps_on=str(getattr(ns, "dual_mps", "off")) == "on", driver_text=_read_driver_text())
@@ -14564,7 +14570,9 @@ def dual_priority_front_argv(ns) -> List[str]:
             "--dual-d-min-rate-tps", f"{float(getattr(ns, 'dual_d_min_rate_tps', 0.0)):g}",
             "--dual-p-min-share", f"{float(getattr(ns, 'dual_p_min_share', 0.25)):g}",
             "--dual-share-actuators",
-            ",".join(_dsh.parse_actuators(str(getattr(ns, "dual_share_actuators", "chunk") or "chunk")))]
+            ",".join(_dsh.parse_actuators(str(getattr(ns, "dual_share_actuators", "chunk") or "chunk")))] + (
+        ["--dual-green-ladder", str(getattr(ns, "dual_green_ladder", "off"))]
+        if str(getattr(ns, "dual_green_ladder", "off")) != "off" else [])
 
 
 def refuse_dual_priority(ns) -> None:
@@ -14586,6 +14594,28 @@ def refuse_dual_priority(ns) -> None:
         raise Weg2DualLayoutRefused(f"DUAL-SHARE: --dual-p-min-share {share} outside (0, 1]")
     if float(getattr(ns, "dual_d_min_rate_tps", 0.0)) < 0.0:
         raise Weg2DualLayoutRefused("DUAL-SHARE: --dual-d-min-rate-tps must be >= 0")
+    if str(getattr(ns, "dual_green_ladder", "off")) != "off":
+        if getattr(ns, "dual_priority", None) is None:
+            raise Weg2DualLayoutRefused(
+                "DUAL-SHARE: --dual-green-ladder needs --dual-priority (the front's controller writes the stage "
+                "the green streams follow)")
+        if "green" not in acts:
+            raise Weg2DualLayoutRefused(
+                "DUAL-SHARE: --dual-green-ladder needs 'green' in --dual-share-actuators (e.g. green,duty: duty is "
+                "the named fallback for rungs the ladder cannot serve)")
+        if str(getattr(ns, "dual_mps", "off")) != "on":
+            raise Weg2DualLayoutRefused(
+                "DUAL-SHARE: --dual-green-ladder needs --dual-mps on (the green streams share the card with D "
+                "through MPS; the metal probe ran under MPS)")
+        if int(getattr(ns, "dual_p_kv_max_tokens", 0) or 0) <= 0:
+            raise Weg2DualLayoutRefused(
+                "DUAL-SHARE: --dual-green-ladder needs --dual-p-kv-max-tokens > 0 (the P-side dual gate "
+                "dual_p_kv_stage.armed() reads it: without it the ladder would silently never arm on the P ranks)")
+        if int(getattr(ns, "dual_p_sm_pct", 100)) < 100:
+            raise Weg2DualLayoutRefused(
+                "DUAL-SHARE: --dual-green-ladder and --dual-p-sm-pct below 100 exclude each other (a static MPS "
+                "percentage caps P at its CLIENT START and the ladder could never lift it: P's "
+                "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE must stay unset)")
     if (getattr(ns, "dual_priority", None) is not None and "duty" in acts
             and float(getattr(ns, "dual_p_duty", 1.0)) < 1.0):
         raise Weg2DualLayoutRefused(
@@ -21957,6 +21987,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dual-share-actuators", default="chunk",
                     help="DUAL-SHARE: comma list of P actuators: chunk (PP0's chunk cap), duty (P duty throttle "
                          "at the rung's fraction), green (stage 3, NOT built: named fallback to chunk).")
+    ap.add_argument("--dual-green-ladder", choices=("off", "on", "hold"), default="off",
+                    help="DUAL-SHARE stage 3 (weg2/dual_green.py): P's SM share as a green-context LADDER "
+                         "(100/75/50/25 % per forward, dynamic, up AND down; PP0 stamps the stage on the request "
+                         "wire so all three stages run the same one). 'on' = ladder + hold OBSERVER (the P-STUFE "
+                         "log carries would_hold), 'hold' = additionally PP0 really holds (0 %) while the arena "
+                         "is full. Needs --dual-priority, 'green' in --dual-share-actuators, --dual-mps on, "
+                         "no --dual-p-sm-pct. Default off = argv/env/launch path byte-identical.")
     ap.add_argument("--dual-d-capture-prio", choices=("off", "on"), default="off",
                     help="DUAL-SHARE stage 1a: D captures its CUDA graphs on the device's highest-priority "
                          "stream (graph nodes keep the capture stream's priority). Group D of the dual layout only.")

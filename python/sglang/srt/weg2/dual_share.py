@@ -27,10 +27,11 @@ Shape of this module (pure stdlib; torch only inside the D-capture helper):
 * stage 1 switches, each alone, default off: the D CUDA-graph capture on a
   high-priority stream (:func:`d_capture_stream`) and P's MPS client priority
   (launcher env, see ``launcher.dual_priority_env``);
-* stage 3 (green-context ladder in P) is NOT built: :func:`sm_ladder` is the
-  pure ladder arithmetic it will use, so the hardware-generic rounding is
-  tested before the metal probe M1; asking for the ``green`` actuator prints
-  the named fallback.
+* stage 3 (green-context ladder in P) lives in ``weg2/dual_green.py`` (item 1330) behind its own switch
+  (``--dual-green-ladder``, default off): the ``green`` actuator without the switch still prints the named
+  fallback below; with it the chunk cap and the duty actuator step aside for every rung the ladder serves
+  (:func:`green_serves`) and stay as the named fallback for the rest. :func:`sm_ladder` is the older pure
+  floor-rounding arithmetic; the ladder itself takes the DRIVER's group sizes (which round up).
 
 Modes (``--dual-priority``): ``p`` = rung 0 always (P full, today's physics);
 ``balanced`` / ``d`` = a static rung while D holds decodes (Env ``..._STATIC``,
@@ -74,6 +75,29 @@ DUTY_ENV = "SGLANG_WEG2_DUAL_SHARE_DUTY"
 D_CAPTURE_PRIO_ENV = "SGLANG_WEG2_DUAL_D_CAPTURE_PRIO"
 #: Profile knobs (front side), all relative units; see :func:`config_from_env`.
 ENV_PREFIX = "SGLANG_WEG2_DUAL_SHARE_"
+#: STAGE 3 (weg2/dual_green.py): "1" = the green-context ladder serves the ``green`` actuator (P env, set by the
+#: launcher from ``--dual-green-ladder``; default off = this module behaves exactly as without stage 3).
+GREEN_LADDER_ENV = "SGLANG_WEG2_DUAL_GREEN_LADDER"
+
+#: set by ``dual_green.maybe_arm`` once a ladder serves rungs: ``fn(rung) -> bool`` (True = the green stream
+#: already throttles this rung, so the chunk cap and the duty actuator must NOT throttle a second time).
+#: None (default, every process that never armed the ladder) = they act as before.
+_GREEN_SERVES: Optional[Callable[[int], bool]] = None
+
+
+def set_green_serves(fn: Optional[Callable[[int], bool]]) -> None:
+    global _GREEN_SERVES
+    _GREEN_SERVES = fn
+
+
+def green_serves(rung: int) -> bool:
+    fn = _GREEN_SERVES
+    if fn is None:
+        return False
+    try:
+        return bool(fn(int(rung)))
+    except Exception:  # noqa: BLE001 - a question to the ladder never stops a pass
+        return False
 
 READ_EVERY_S = 0.02
 #: A single duty pause never exceeds this (a stuck signal must not stall P).
@@ -562,8 +586,9 @@ def sse_events(chunk: bytes) -> int:
 def format_ctl(seq: int, d: Decision) -> str:
     tau_ms = -1 if d.tau_s is None else int(d.tau_s * 1000)
     rate = -1 if d.d_rate_tps is None else int(d.d_rate_tps * 100)
+    extra = f" starve={1 if getattr(d, 'starve', False) else 0}" if getattr(d, "green", False) else ""
     return (f"v1 seq={seq} mode={d.mode} rung={d.rung} f={d.fraction:.4f} b={d.b} seats={d.seats} "
-            f"q={int(d.q_tokens)} tau_ms={tau_ms} r_x100={rate}\n")
+            f"q={int(d.q_tokens)} tau_ms={tau_ms} r_x100={rate}{extra}\n")
 
 
 def parse_ctl(text: str) -> Optional[Dict[str, str]]:
@@ -611,6 +636,7 @@ class CtlState:
     mode: str = "p"
     seq: int = -1
     ok: bool = False
+    starve: bool = False
 
 
 class CtlReader:
@@ -659,7 +685,8 @@ class CtlReader:
         try:
             self.state = CtlState(rung=int(kv["rung"]), fraction=max(0.0, min(1.0, float(kv["f"]))),
                                   d_busy=int(kv["b"]) > 0, mode=kv.get("mode", "?"),
-                                  seq=int(kv.get("seq", -1)), ok=True)
+                                  seq=int(kv.get("seq", -1)), ok=True,
+                                  starve=int(kv.get("starve", "0")) > 0)
         except (ValueError, KeyError):
             return self._fail("ctl malformed")
         self._named = False
@@ -706,6 +733,9 @@ class ChunkCap:
         if st.fraction >= 1.0 or width is None or int(width) <= 0:
             out = width
             kind = "full"
+        elif green_serves(st.rung):
+            out = width               # the green ladder already throttles this rung: no second throttle
+            kind = "green"
         else:
             c, kind = chunk_width_for(st.fraction, self.base, self.page, self.buckets)
             out = min(int(width), c)
@@ -735,8 +765,12 @@ def maybe_chunk_cap(env: Mapping[str, str], *, first_pp_rank: bool, chunked_pref
     if not first_pp_rank:
         return None
     if "green" in acts:
-        warn(fallback_line("green", "all", "stage 3 (green-context ladder) not built -- waits for metal "
-                           "probe M1 -> chunk cap" + (" + duty" if "duty" in acts else "")))
+        if str(env.get(GREEN_LADDER_ENV, "") or "").strip() == "1":
+            log(f"{LOG_TAG} P green ladder armed (weg2/dual_green.py): the chunk cap stays only as the named "
+                "fallback for rungs the ladder cannot serve" + (" (duty likewise)" if "duty" in acts else ""))
+        else:
+            warn(fallback_line("green", "all", "stage 3 (green-context ladder) not built -- waits for metal "
+                               "probe M1 -> chunk cap" + (" + duty" if "duty" in acts else "")))
     if not chunked_prefill_size or int(chunked_prefill_size) <= 0:
         warn(fallback_line("chunk", "all", "no --chunked-prefill-size on P (no chunk to cap) -> "
                            + ("duty" if "duty" in acts else "none (P full)")))
@@ -790,6 +824,8 @@ class ShareDuty:
         self.duty = st.fraction
         if self._last_fwd_s <= 0.0 or not st.d_busy or st.fraction >= 1.0 or st.fraction <= 0.0:
             return 0.0
+        if green_serves(st.rung):
+            return 0.0                # the green ladder already throttles this rung (duty = its fallback)
         return min(MAX_SLEEP_S, self._last_fwd_s * (1.0 - st.fraction) / st.fraction)
 
     def before_forward(self) -> float:
@@ -966,17 +1002,37 @@ class FrontShare:
         self._log = log
         self._clock = clock
         self._status_t = clock()
+        self.green: Optional[str] = None       # "on" / "hold" once the green ladder front is armed (from_args)
+        self._pobs_t = -1e9
 
     @classmethod
     def from_args(cls, *, ctl: str, mode: Optional[str], actuators: str, d_min_rate_tps: float,
                   p_min_share: float, env: Optional[Mapping[str, str]] = None,
-                  log: Callable[[str], None] = logger.info) -> Optional["FrontShare"]:
+                  log: Callable[[str], None] = logger.info, green_ladder: str = "off") -> Optional["FrontShare"]:
         if not ctl or not mode:
             return None
-        cfg = config_from_env(os.environ if env is None else env, d_min_rate_tps=d_min_rate_tps,
-                              p_min_share=p_min_share)
+        e = os.environ if env is None else env
+        cfg = config_from_env(e, d_min_rate_tps=d_min_rate_tps, p_min_share=p_min_share)
         acts = parse_actuators(actuators or "chunk")
+        green = str(green_ladder or "off") != "off" and "green" in acts
+        if green:
+            # STAGE 3 (weg2/dual_green.py): the 5-stage automaton replaces the matrix controller; the tick is
+            # faster (D empty must lift the throttle within ~50 ms, not 250) unless the profile set it.
+            from sglang.srt.weg2 import dual_green as _dg
+
+            if not str(e.get(ENV_PREFIX + "TICK_S", "") or "").strip():
+                cfg = replace(cfg, tick_s=_dg.GreenConfig().tick_s)
         fs = cls(ctl=ctl, mode=mode, actuators=acts, cfg=cfg, log=log)
+        if green:
+            gcfg = _dg.GreenConfig.from_env(e)
+            fs.ctrl = _dg.GreenController(cfg, mode, gcfg, clock=fs._clock)
+            fs.d_rate = DRateMeter(window_s=0.5, clock=fs._clock)   # a short window: the round after a change
+            fs.green = str(green_ladder)
+            log(f"{LOG_TAG} GREEN ladder front armed ({green_ladder}): factors={list(gcfg.factors)} "
+                f"tsolo_ms={[list(x) for x in gcfg.tsolo_ms]} accept_len={gcfg.accept_len:g} "
+                f"desc_min_s={gcfg.desc_min_s:g} asc_ratio={gcfg.asc_ratio:g} asc_calm_s={gcfg.asc_calm_s:g} "
+                f"asc_dwell_s={gcfg.asc_dwell_s:g} table={[list(r) for r in gcfg.table]} -- stage H (hold, 0 %) is "
+                f"{'ARMED on PP0' if green_ladder == 'hold' else 'observer only (would_hold in P-STUFE)'}")
         log(f"{LOG_TAG} front controller armed mode={mode} ctl={ctl} actuators={','.join(acts)} "
             f"rungs={list(cfg.rungs)} tau_edges_s={list(cfg.tau_edges_s)} b_edges={list(cfg.b_edges)} "
             f"matrix={[list(r) for r in cfg.matrix]} static={dict(cfg.static)} deadband={cfg.deadband:g} "
@@ -1016,9 +1072,17 @@ class FrontShare:
         if p_outstanding:
             oldest = min(oldest, min(float(t) for t in p_outstanding.values()))
         rate, src = self.p_rate.rate()
+        extra: Dict[str, object] = {}
+        if self.green is not None:
+            from sglang.srt.weg2 import dual_green as _dg
+
+            if self._clock() - self._pobs_t >= 0.5:        # the P stages' observation files (SM, arena, would_hold)
+                self._pobs_t = self._clock()
+                self.ctrl.feed_pobs(_dg.read_pobs(self.ctl))
+            extra["p_idle"] = (not p_outstanding) and q <= 0
         d = self.ctrl.observe(q_tokens=q, b=len(d_outstanding) + max(0, int(d_handoff)), seats=int(seats),
                               p_rate_tps=rate,
-                              d_rate_tps=self.d_rate.rate(), oldest_age_s=max(0.0, now_wall - oldest))
+                              d_rate_tps=self.d_rate.rate(), oldest_age_s=max(0.0, now_wall - oldest), **extra)
         try:
             self.writer.update(d)
         except OSError as e:
@@ -1028,6 +1092,10 @@ class FrontShare:
                                         "a stale file and falls back to rung 0 (P full)"))
         if self.ctrl.should_log(d):
             self._log(decision_line(d, self.actuators))
+            if self.green is not None:
+                from sglang.srt.weg2 import dual_green as _dg
+
+                self._log(_dg.pstufe_line(d, self.ctrl.pobs_view()))
         now = self._clock()
         if now - self._status_t >= self.STATUS_EVERY_S:
             self._status_t = now
@@ -1053,4 +1121,5 @@ class FrontShare:
                 "d_min_rate_tps": self.ctrl.cfg.d_min_rate_tps, "p_min_share": self.ctrl.cfg.p_min_share,
                 "changes": self.ctrl.changes, "flaps": self.ctrl.flaps, "ctl": self.ctl,
                 "last_reason": d.reason if d is not None else None,
-                "tau_s": d.tau_s if d is not None else None, "dbs": d.b if d is not None else None}
+                "tau_s": d.tau_s if d is not None else None, "dbs": d.b if d is not None else None,
+                **({"green": self.green} if self.green is not None else {})}

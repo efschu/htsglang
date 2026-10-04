@@ -31,6 +31,7 @@ from sglang.srt.distributed.utils import pp_gapped_ownership_active
 from sglang.srt.managers import anchor_tails as _anchor_tails
 from sglang.srt.managers import weg2_store_told
 from sglang.srt.weg2 import dual_arena_spill as _das_trim  # Q-1500 UD-V2 arena trim (dual P only)
+from sglang.srt.weg2 import dual_green as _dgr  # item 1330 green-context ladder wire (dual P only; inert when unarmed)
 from sglang.srt.managers.weg2_idle_vote import (
     VOTE_HOME_STEP_BUDGET_S,
     WEG2_VOTE_TAG,
@@ -6457,6 +6458,8 @@ class SchedulerPPMixin:
         # would spend the 30 on idle passes.)
         _traced = _anchor_tails.without_burst_clock(recv_reqs)
         _traced = _das_trim.without_trim_order(_traced)  # Q-1500 UD-V2: an order is not a request
+        if os.environ.get(_dgr.LADDER_ENV):
+            _traced = _dgr.without_green_rung(_traced)  # item 1330: a stage order is not a request
         if _traced:
             _rn = getattr(self, "_pp_req_trace_n", 0) + 1
             self._pp_req_trace_n = _rn
@@ -6559,6 +6562,11 @@ class SchedulerPPMixin:
             _arena_trim_cmd = None
             if self.pp_group.is_first_rank:
                 _wire_reqs, _arena_trim_cmd = _das_trim.pp0_stamp(self, _wire_reqs)
+            # item 1330 (dual P only; None elsewhere): PP0's green-context stage rides the wire like the order
+            # above and the pass clock; every stage launches this pass on the SAME stage (weg2/dual_green.py).
+            _dgreen = getattr(self, "_dual_green", None)
+            if _dgreen is not None and self.pp_group.is_first_rank:
+                _wire_reqs, _ = _dgreen.pp0_stamp(_wire_reqs)
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
@@ -6614,6 +6622,13 @@ class SchedulerPPMixin:
         if not self.pp_group.is_first_rank:
             # Q-1500 UD-V2: PP0's arena-trim order (relayed above) is executed here and leaves the list
             recv_reqs = _das_trim.follower_absorb(self, recv_reqs)
+            _dgreen_f = getattr(self, "_dual_green", None)
+            if _dgreen_f is not None:
+                # item 1330: PP0's green-context stage (relayed above) is applied here and leaves the list
+                recv_reqs = _dgreen_f.follower_absorb(recv_reqs)
+            elif os.environ.get(_dgr.LADDER_ENV):
+                # the gate is armed but this rank holds no actuator: the order must still never be dispatched
+                recv_reqs = _dgr.without_green_rung(recv_reqs)
         _pp_seg(self, "in.absorb")
 
         # (i): arm in this same pass; the flip hook at the end of this
@@ -11713,9 +11728,21 @@ class SchedulerPPMixin:
         # the card (timing events on the forward stream), plus the host phases
         # since the previous launch. None when SGLANG_WEG2_P_HOSTGAP is unset.
         _gap = self._pp_gap_meter() if _pov.hostgap_on() else None
+        # item 1330 (dual P only): the forward's stream is the green stream of PP0's stage (a forward boundary is
+        # the only place the stage changes); PP0 first evaluates the hold gate (observer unless armed).
+        _dgreen_l = getattr(self, "_dual_green", None)
+        _fwd_ctx, _gc_stream = self.forward_stream_ctx, None
+        if _dgreen_l is not None:
+            _dgreen_l.before_forward(self)  # PP0: the hold gate (a no-op on a follower)
+            _fwd_ctx, _gc_stream = _dgreen_l.pick(self)
+            cur_batch._dual_green_rung = _dgreen_l.last_forward_rung  # the Prefill rank batch line's rung=
         with torch.profiler.record_function("run_batch"):
-            with self.forward_stream_ctx:
+            with _fwd_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
+                if _gc_stream is not None:
+                    # the green stream runs after everything forward_stream holds (the previous forward, whichever
+                    # stream it ran on, and the schedule stream's work)
+                    _gc_stream.wait_stream(self.forward_stream)
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",
@@ -11743,6 +11770,10 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if _gc_stream is not None:
+                    # keep forward_stream the ordered tail of every forward (the next forward, other users of
+                    # forward_stream and rung 0 all wait behind this one)
+                    self.forward_stream.wait_stream(_gc_stream)
                 if _duty_ev0 is not None:
                     _duty_ev1 = self.device_module.Event(enable_timing=True)
                     _duty_ev1.record(self.device_module.current_stream())
