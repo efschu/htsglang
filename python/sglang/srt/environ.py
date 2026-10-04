@@ -931,6 +931,16 @@ class Envs:
     # flip is foreseeable; its park would wait the whole 1.2-3.8 s D pass). It
     # rides P's batch. Off = the D pass runs and the park waits behind it.
     SGLANG_WEG2_ENABLE_D_DIRECT_YIELD = EnvBool(True)
+    # FETCH-COST-YIELD (1369 draft, weg2/front._d_direct_yield_fetch_cost): with NO
+    # foreseeable flip, yield a SHORT whose own D prefill is fetch-dominated --
+    # spill layers x per-fetch ms (1362: 48 fetches at 25..138 new tokens, 96 at
+    # 191..3072; per-fetch median 12.7-17.2 ms) beyond the budget below. Off =
+    # the H5b behaviour alone (flip foreseeability only).
+    SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH = EnvBool(False)
+    # Budget in ms for the line above. Default 600 sits AT the measured floor of
+    # the class (48 x 13.2 ms = 634 ms, 1362(3)); raising it past 1248 exposes
+    # only the two-wave SHORTs (>= ~190 uncached tokens).
+    SGLANG_WEG2_D_DIRECT_YIELD_FETCH_MS = EnvInt(600)
     # FLIPCYCLE H2 (02.10., expert_offload.DeferredRowsFill.tick): P's first
     # extend after the wake waits only for EACH layer's own deferred extra rows
     # (land_deferred_rows before that layer's MoE), not for all of them before

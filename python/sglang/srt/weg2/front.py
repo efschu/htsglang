@@ -9334,7 +9334,8 @@ class Front:
                                                    max_tokens=_asr.max_tokens_of(payload),
                                                    uncached=remainder)
                           if _asr.enabled()  # ARRIVAL-SEAT: the KV need's decode part
-                          else self._acquire_short_seat(rid, est_prompt, short_refused))
+                          else self._acquire_short_seat(rid, est_prompt, short_refused,
+                                                               uncached=remainder))
             if seat is not None:
                 if self.x_split:
                     self._note_x_grant(
@@ -9964,7 +9965,7 @@ class Front:
                 return None
             if not (self.awake == "D" and self.admit_d and self.state == "serving"):
                 return None
-        if self._d_direct_yields(rid):
+        if self._d_direct_yields(rid, uncached=uncached):
             return None  # FLIPCYCLE H5b: the flip comes anyway -- ride P's batch
         if _asr.enabled():
             # ARRIVAL-SEAT (b): no seat free or D's KV short -> wait for the
@@ -9985,7 +9986,7 @@ class Front:
             if refused is not None:
                 refused.append("d_budget")
             return None
-        if self._d_direct_yields(rid):
+        if self._d_direct_yields(rid, uncached=uncached):
             return None  # FLIPCYCLE H5b: a P-bound request queued while it waited
         await self._d_seat.acquire()
         if (not (self.awake == "D" and self.admit_d and self.state == "serving")
@@ -10482,7 +10483,7 @@ class Front:
                          "it goes to D; D's SEAT-AGE decides the displacement on its real KV"))
         return plan
 
-    def _d_direct_yields(self, rid: str) -> bool:
+    def _d_direct_yields(self, rid: str, uncached: Optional[int] = None) -> bool:
         """FLIPCYCLE H5b (02.10.): no D-direct prefill when the D->P flip is
         already foreseeable -- a request that needs P is queued. A D pass with
         >= 8 new tokens streams the routed experts of all 48 layers (1.2-3.8 s,
@@ -10509,12 +10510,49 @@ class Front:
         except Exception:  # noqa: BLE001 - a reading never blocks the route
             return False
         if not cands:
-            return False
+            # FETCH-COST-YIELD (1369 draft): only the new switch reaches the new
+            # method -- the default path (and the pre-existing test fakes) never
+            # touch it.
+            if not envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH.get():
+                return False
+            return self._d_direct_yield_fetch_cost(rid, uncached)
         self.counters["d_direct_yield"] += 1
         logger.info("WEG2-FLIPCYCLE stage=park_wait rid=%s ms=0 floor_ms=0 yield=d_direct "
                     "p_bound=%s epoch=%d (H5b: a D->P flip is foreseeable, this SHORT joins P's "
                     "batch instead of a 1.2-3.8 s D pass the park would wait behind)",
                     rid, getattr(cands[0], "rid", "?"), self.epoch)
+        return True
+
+    def _d_direct_yield_fetch_cost(self, rid: str, uncached: Optional[int]) -> bool:
+        """FETCH-COST-YIELD (draft 1369, extension of H5b): yield even when the
+        flip is NOT foreseeable, if the SHORT's own D prefill is fetch-dominated.
+        Measured floor: a D prefill fetches one wave per offloaded MoE layer
+        (1362: 48 pool.host_fetch at 25..138 new tokens; 96 = two waves at
+        191..3072) with a per-fetch median of 12.7-17.2 ms (1362(3)) --
+        48*13 ms = 624 ms of link stall per pass against ~13.5 ms of forward
+        compute without fetch (1245, quoted in 1362). Below the 8-token floor
+        ("a D pass with >= 8 new tokens streams the routed experts of all 48
+        layers", _d_direct_yields) the case does not apply, so uncached < 8
+        stays on D; uncached None (no front estimate) stays on D too. Default
+        off via SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH; the budget knob says
+        how much fetch stall is still worth the D-direct pass."""
+        if not envs.SGLANG_WEG2_ENABLE_D_DIRECT_YIELD_FETCH.get():
+            return False
+        if uncached is None or uncached < 8:
+            return False
+        # 48 layers x 13 ms = one wave, the measured floor (1362(1)); two waves
+        # from ~190 uncached tokens (1362(1): 96 fetches at 191..3072; the
+        # boundary itself is an inference from the log, not a code constant).
+        waves = 2 if uncached >= 190 else 1
+        est_ms = 48 * 13 * waves
+        budget = envs.SGLANG_WEG2_D_DIRECT_YIELD_FETCH_MS.get()
+        if est_ms < budget:
+            return False
+        self.counters["d_direct_yield_fetch_cost"] += 1
+        logger.info("WEG2-FLIPCYCLE stage=park_wait rid=%s ms=0 floor_ms=0 yield=d_direct_fetch "
+                    "uncached=%d est_fetch_ms=%d budget_ms=%d (FETCH-COST-YIELD: this SHORT's D "
+                    "pass is dominated by expert fetch; it joins P's batch instead)",
+                    rid, uncached, est_ms, budget)
         return True
 
     def _asr_live_p_cands(self) -> List["Pending"]:
