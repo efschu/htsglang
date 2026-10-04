@@ -76,8 +76,18 @@ def post_vote(res, cap_rows: int, prefix: Optional[Sequence[int]] = None,
     is known HERE, so the whole group flushes plain now instead."""
     if res is None:
         return "round did not arm"
+    return manifest_vote(getattr(res, "manifest", None), cap_rows,
+                         prefix=prefix, rank=rank)
+
+
+def manifest_vote(manifest, cap_rows: int, prefix: Optional[Sequence[int]] = None,
+                  rank: Optional[int] = None) -> Optional[str]:
+    """The part of the POST vote that reads only the manifest (the held spans
+    and their bind-time L2 identity): None = this rank can honour the hold.
+    Pure over the manifest, so the SAME verdict is available before the
+    retain moves anything (L15-SLEEP-DECIDE-FIRST, :func:`pre_retain_vote`)."""
     if int(cap_rows) <= 0:
-        spans = getattr(getattr(res, "manifest", None), "spans", ()) or ()
+        spans = getattr(manifest, "spans", ()) or ()
         missing = [str(sp.rid) for sp in spans
                    if int(getattr(sp, "anchor_l2_slot", -1)) < 0]
         if missing:
@@ -94,13 +104,99 @@ def post_vote(res, cap_rows: int, prefix: Optional[Sequence[int]] = None,
         if prefix is not None and rank is not None:
             from sglang.srt.weg2 import l15_restore
 
-            m = getattr(res, "manifest", None)
+            m = manifest
             if m is not None:
                 miss = int(l15_restore.count_missing(m, int(rank), list(prefix)))
                 if miss:
                     return ("cap-0 rank: %d owned held token(s) without an L2 "
                             "source (unbacked chain, refill impossible)" % miss)
     return None
+
+
+def decide_first_on(env=None) -> bool:
+    """L15-SLEEP-DECIDE-FIRST (default on; =0 restores the vote after the
+    retain, byte for byte the 4cf740ad50 order)."""
+    env = os.environ if env is None else env
+    return str(env.get("SGLANG_WEG2_L15_SLEEP_DECIDE_FIRST", "1")).strip() != "0"
+
+
+def pre_retain_vote(planned, manifest, cap_rows: int,
+                    prefix: Optional[Sequence[int]] = None,
+                    rank: Optional[int] = None,
+                    bind_ok: bool = True) -> Optional[str]:
+    """This rank's vote BEFORE the retain moves anything: the refusals the
+    POST vote would reach anyway, from the same planning data.
+
+    * the bind did not produce a round (``bind_ok`` False) or the planning
+      found nothing to hold (``planned`` None): retain would return None,
+      the POST vote would read "round did not arm" -> same refusal, unpaid;
+    * otherwise :func:`manifest_vote` over the manifest the retain would
+      publish (cap-0 rank: END anchor L2 identity, every owned token with an
+      L2 source) -- identical to the POST verdict for that manifest.
+
+    What stays for the POST vote: a keep arm that fails AFTER the move."""
+    if not bind_ok or planned is None:
+        return "round did not arm"
+    return manifest_vote(manifest, cap_rows, prefix=prefix, rank=rank)
+
+
+def decide_first(kwargs, reuse_on: bool, cap_rows_fn: Callable[[], int],
+                 prefix_rank_fn: Callable[[], Tuple[int, List[int]]], gather,
+                 log: Callable[[str], None], warn: Callable[[str], None]):
+    """L15-SLEEP-DECIDE-FIRST: the group's decision BEFORE the retain.
+
+    ``kwargs`` is this rank's bind result (build_retain_kwargs) or None when
+    the bind raised. Every rank calls this at the same position and posts
+    exactly ONE gather, whatever its local state -- a rank-local failure is a
+    "no" vote, never a skipped collective. Returns ``(planned, refusal)``:
+    ``refusal`` is the group-uniform verdict (None = every rank retains,
+    ``planned`` is this rank's RoundPlan to hand to retain_at_sleep);
+    otherwise nothing was moved on any rank."""
+    why = None
+    planned = None
+    try:
+        if not reuse_on:
+            why = "round did not arm"
+            if kwargs is not None:
+                from sglang.srt.weg2 import l15_retain
+
+                kwargs["candidates"] = list(kwargs["candidates"])
+                planned = l15_retain.plan_round(
+                    candidates=kwargs["candidates"],
+                    slots_of=kwargs["slots_of"],
+                    anchor_slot_of=kwargs["anchor_slot_of"],
+                    caps_rows_by_rank=kwargs["caps_rows_by_rank"],
+                    cap_anchor_slots=kwargs["cap_anchor_slots"],
+                    prefix=kwargs["prefix"],
+                    epoch=kwargs["epoch"],
+                    log=log)
+                cap = int(cap_rows_fn())
+                man = None
+                if planned is not None and cap <= 0:
+                    # only a cap-0 rank's vote reads the manifest
+                    planned.manifest = l15_retain.manifest_of_plan(
+                        planned,
+                        candidates=kwargs["candidates"],
+                        l2_of=kwargs["l2_of"],
+                        anchor_l2_of=kwargs["anchor_l2_of"],
+                        l2_lanes_of=kwargs["l2_lanes_of"],
+                        epoch=kwargs["epoch"],
+                        pid=kwargs["pid"])
+                    man = planned.manifest
+                rk, pf = prefix_rank_fn()
+                why = pre_retain_vote(planned, man, cap, prefix=pf, rank=rk)
+    except Exception as exc:  # noqa: BLE001 -- vote "no" path
+        why = "decide failed: %s" % (exc,)
+        planned = None
+        warn("L15-SLEEP-DECIDE-FIRST vote failed (%s)" % (exc,))
+    try:
+        dec = agree(why, gather)
+    except Exception as exc:  # noqa: BLE001 -- as the PRE gather
+        dec = "agree failed: %s" % (exc,)
+        warn("L15-SLEEP-DECIDE-FIRST gather failed (%s)" % (exc,))
+    if dec is not None:
+        return None, dec
+    return planned, None
 
 
 def rank_prefix(sched) -> Tuple[int, List[int]]:

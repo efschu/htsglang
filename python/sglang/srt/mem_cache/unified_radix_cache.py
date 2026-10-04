@@ -6634,7 +6634,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            getattr(node, "id", "?"), type(e).__name__, e)
             return None
 
-    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None, chain_only: bool = False) -> dict:
+    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None, chain_only: bool = False,
+                               background: bool = False) -> dict:
         """#1233 zero-remainder: back every un-backed device node up before a flush.
 
         The hand-back seam. The Weg-2 front quiesces a group through
@@ -6653,6 +6654,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         0.5 s until it answers 200 (in-flight terms zero), so successive calls
         drain what each earlier call could not pin. Called by the scheduler
         only when nothing is running or waiting (`SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1`).
+
+        ``background`` (PUBLISH-SWEEP-BG, weg2_flush_nonblock.bg_publish_tick):
+        the sweep runs BETWEEN D decode rounds with requests running, so it only
+        issues a node that no running request references (device lock_ref 0)
+        and whose parent is already backed (write_backup then does not recurse
+        into a locked or in-flight ancestor). Everything else stays un-backed
+        for the next pass or the flip's flush, which is unchanged
+        (``background=False`` is the old walk, line for line).
         """
         stats = {"unbacked": 0, "issued": 0, "refused": 0, "pending": 0, "skipped_pending": 0}
         if self.cache_controller is None or self.disable:
@@ -6697,7 +6706,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # ANCHOR-ONLY BACKUP (y5a: 16x WEG2-ANCHOR-LOST at=flush): the
                 # KV of this node is on the host / in the store, its Mamba
                 # anchor on the device only -- the reset would drop it.
-                if node is not self.root_node and self._weg2_anchor_only_candidate(node):
+                if (node is not self.root_node and not background  # BG: the flush's job
+                        and self._weg2_anchor_only_candidate(node)):
                     stats["unbacked"] += 1
                     stats["anchor_only"] = stats.get("anchor_only", 0) + 1
                     if stats["issued"] < max_issue:
@@ -6710,6 +6720,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             if node.write_through_pending_id is not None:
                 stats["skipped_pending"] += 1
+                continue
+            if background and (
+                node.component_data[BASE_COMPONENT_TYPE].lock_ref > 0
+                or (
+                    node.parent is not self.root_node
+                    and not node.parent.backuped
+                    and not node.parent.l3_present
+                )
+            ):
+                # PUBLISH-SWEEP-BG: in use by a running request, or its parent
+                # is not backed yet (write_backup would recurse into it)
+                stats["skipped_bg"] = stats.get("skipped_bg", 0) + 1
                 continue
             stats["unbacked"] += 1
             if stats["issued"] >= max_issue:
@@ -6775,11 +6797,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "in_flight_after=%d pins=%d/%d draft_issued=%d draft_refused=%d "
                 "(denominator: un-backed device nodes at this flush poll; the draft terms are "
                 "the controller's CUMULATIVE L3 draft write counts, #1233 C18) "
-                "walked=%d sweep_ms=%.1f issue_ms=%.1f",
+                "walked=%d sweep_ms=%.1f issue_ms=%.1f%s",
                 n, stats["unbacked"], stats["issued"], stats["refused"], stats["skipped_pending"],
                 stats["pending"], self._mamba_pins_held(), self._mamba_pin_budget,
                 stats["draft_issued"], stats["draft_refused"],
                 stats["walked"], stats["sweep_ms"], stats["issue_ms"],
+                # PUBLISH-SWEEP-BG: a between-rounds pass names itself (the flush's
+                # own lines stay byte-identical)
+                " bg=1 skipped_bg=%d" % stats.get("skipped_bg", 0) if background else "",
             )
         return stats
 

@@ -15869,6 +15869,11 @@ class Scheduler(
                 from sglang.srt.weg2.d_kv_evict import scheduler_step as _d_kv_evict_step
 
                 _d_kv_evict_step(self)
+            # PUBLISH-SWEEP-BG (weg2_flush_nonblock part 1b): a few un-backed
+            # finished-request nodes published between D decode rounds so the
+            # flip's flush finds a small backlog. Same group-uniform point as
+            # the evictor above; a dict/env lookup when the switch is off.
+            _weg2_flush_nonblock.bg_publish_tick(self)
 
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all
@@ -20912,6 +20917,44 @@ class Scheduler(
                 _l15_reuse  # noqa: B018 -- bound when the block above ran
             except NameError:
                 _l15_reuse = None
+            # L15-SLEEP-DECIDE-FIRST (INT8 boot 4cf740ad50: 3 sleeps paid a
+            # retain of 0.38-0.54 s and the POST vote then rolled them back
+            # with cap-0 "owned held token(s) without an L2 source"): the
+            # refusals the POST vote reaches from the MANIFEST are decided
+            # here, from the same planning data, BEFORE the retain moves
+            # anything. ONE gather at a position EVERY rank reaches (outside
+            # the pre-move try above: a rank whose bind raised votes "round
+            # did not arm" instead of skipping the gather, which would pair
+            # its POST gather with the peers' vote gather). Same condition as
+            # the POST gather, so the two stay one-to-one. Any refusal ends
+            # the round on every rank exactly like the PRE refusal: nothing
+            # moved, the POST gather is skipped (same _l15_pre_why guard).
+            # SGLANG_WEG2_L15_SLEEP_DECIDE_FIRST=0: the order of 4cf740ad50.
+            _l15_planned = None
+            _l15_dfirst = False
+            try:
+                _l15_dfirst = bool(_l15_agree_on and _l15_pre_why is None
+                                   and _l15_sa2.decide_first_on(os.environ))
+            except NameError:
+                _l15_dfirst = False
+            if _l15_dfirst:
+                _l15_tt["decide0"] = time.perf_counter()
+                from sglang.srt.weg2 import l15_shadow as _l15_shd2
+
+                _l15_planned, _l15_dec = _l15_sa2.decide_first(
+                    _l15_kwargs, _l15_reuse is not None,
+                    lambda: _l15_shd2.own_cap_rows(self, os.environ),
+                    lambda: _l15_sa2.rank_prefix(self),
+                    _l15_gather, logger.info, logger.warning)
+                _l15_tt["decide"] = time.perf_counter() - _l15_tt["decide0"]
+                if _l15_dec is not None:
+                    logger.info("L15-SLEEP-AGREE pre-retain=off reason=%s (decided "
+                                "before the retain: nothing moved, every rank "
+                                "flushes plain)", _l15_dec)
+                    _l15_pre_why = _l15_dec
+                    _l15_kwargs = None
+                    _l15_planned = None
+                    _l15_reuse = None
             if _l15_reuse is not None:
                 _l15_res = _l15_reuse
             elif _l15_kwargs is not None:
@@ -20924,6 +20967,7 @@ class Scheduler(
                     # values (the old fake kv_slots/anchor_slot writes were
                     # never read); shared visited set is owned by retain.
                     rewrite_tree=l15_bind.rewrite_tree_chain,
+                    planned=_l15_planned,
                     **_l15_kwargs
                 )
                 # L15-CHECK-SNAP (N6e bad=1 foreign at gen=1): a capped rank
@@ -21078,7 +21122,7 @@ class Scheduler(
                 logger.info(
                     "L15-SLEEP-TIMING rank=%d held=%s reuse=%s total_ms=%.0f "
                     "bind_ms=%.0f retain_ms=%.0f arm_ms=%.0f share_ms=%.0f "
-                    "pre_ms=%.0f snap_ms=%.0f post_ms=%.0f",
+                    "pre_ms=%.0f snap_ms=%.0f post_ms=%.0f decide_ms=%.0f",
                     int(getattr(getattr(self, "ps", None), "tp_rank", 0) or 0),
                     _l15_res is not None, _l15_reuse is not None,
                     (time.perf_counter() - _l15_tt["t0"]) * 1000.0,
@@ -21090,7 +21134,11 @@ class Scheduler(
                     # (inside retain_ms), post = the POST gather incl. wait
                     _l15_tt.get("pre", 0.0) * 1000.0,
                     _l15_tt.get("snap", 0.0) * 1000.0,
-                    _l15_tt.get("post", 0.0) * 1000.0)
+                    _l15_tt.get("post", 0.0) * 1000.0,
+                    # L15-SLEEP-DECIDE-FIRST: the vote before the retain (incl.
+                    # the planning, the cap-0 manifest and the wait for the
+                    # slowest rank); 0 when the switch is off
+                    _l15_tt.get("decide", 0.0) * 1000.0)
             if _l15_res is not None:
                 pass
             else:

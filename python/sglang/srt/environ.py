@@ -1023,6 +1023,17 @@ class Envs:
     SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(True)
     # the groups both parts apply to (comma list; default the D->P sleeper)
     SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
+    # PUBLISH-SWEEP-BG (04.10., INT8 boot 4cf740ad50, D->P flip layer 2.1 s ->
+    # 3.4-5.6 s): after a long D wake phase 110-121 finished-request nodes sat
+    # un-backed (D-IDLE-PUBLISH only runs when D is idle, one node per pass) and
+    # the flip's flush paid 1.9-2.8 s of write_backup issue for them. True = the
+    # same publish_unbacked_sweep also runs BETWEEN D decode rounds, every
+    # _EVERY-th forward, at most _MAX_ISSUE node(s), only nodes no running
+    # request references (device lock 0) whose parent is already backed, so the
+    # flip finds the backlog small. False = the flush alone, as in 4cf740ad50.
+    SGLANG_WEG2_PUBLISH_SWEEP_BG = EnvBool(True)
+    SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY = EnvInt(16)
+    SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_ISSUE = EnvInt(1)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).
