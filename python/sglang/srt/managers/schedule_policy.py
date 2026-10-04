@@ -917,6 +917,93 @@ def _h105c_follow_load_back(adder, req, lb_extent: int) -> torch.Tensor:
     return new_indices
 
 
+#: H105d: how often a token-cut rank voted NO_TOKEN for want of load-back room.
+_H105D_REFUSED = {"n": 0}
+
+
+def _h105d_load_back_kv_rows(best_match_node) -> int:
+    """The device rows a load-back of ``best_match_node`` allocates on THIS
+    rank: the host values of its evicted run -- exactly what
+    ``FullComponent.build_hicache_transfers(LOAD_BACK)`` gathers into
+    ``kv_xfer.host_indices`` (``load_back``'s ``kv_tokens``)."""
+    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+        BASE_COMPONENT_TYPE,
+    )
+
+    rows, cur = 0, best_match_node
+    while cur is not None and cur.evicted:
+        host_value = cur.component_data[BASE_COMPONENT_TYPE].host_value
+        if host_value is None:
+            break
+        rows += len(host_value)
+        cur = cur.parent
+    return rows
+
+
+def _h105d_cut_load_back_room(adder, req) -> bool:
+    """H105d (NF y9nf6 rc12z30y9nf6, 191228abc5, D log boot_weg2_dkrnfint4h6abl
+    bar1dauer10040608 ~158218-158410, 06:32:52Z, weg2-32-93): may THIS rank
+    vote ADMIT for a request whose host hit it must load back?
+
+    Under the #239 token cut the H105 verdict is a gather of every rank's real
+    gate (MIN), taken BEFORE the load-back -- there is no host-first load-back
+    (H105b) and no H106 drain on this path. The gate priced the load-back
+    against ``rem_total_tokens`` = available + the REPORTED evictable count;
+    on all three ranks that read 318912 (available 85568, evictable 237568),
+    the peel then delivered 7616: the frontier leaves are write_back leaves
+    whose backup the full host arena refused (R12 SHADOW-SHORT arena_claim,
+    ARENA-DROP freed=0), UD drop is local-PP only, and 200640 tokens sat
+    behind them (EVICT-FRONTIER-CENSUS behind_device_child=200640, aux_locked
+    {} -> ED subtracted nothing). Every rank took the group ADMIT, H105c
+    made its own room (available 93184 < kv 121856) and stopped by name: the
+    whole D group died for one request that could simply have waited.
+
+    The rule: on the token cut, a rank with a load-back extent makes its room
+    for its OWN load-back rows NOW (the same shortfall eviction H105c's
+    follow-room does after the vote) and votes NO_TOKEN when the live pool
+    still cannot hold them. The gather MIN keeps the rid queued on every rank;
+    no rank loads, no rank waits alone. When every rank has the room, the
+    group ADMITs and H105c's follow load-back finds it -- the H105c stop stays
+    the named stop for room that vanished between vote and load-back.
+    Off the token cut: True, untouched (the host decides, H105b/H106)."""
+    if not _pp_load_back_extent(req):
+        return True
+    from sglang.srt.rank_role import form_a_token_cut_active
+
+    if not form_a_token_cut_active():
+        return True
+    kv_rows = _h105d_load_back_kv_rows(req.best_match_node)
+    alloc = adder.token_to_kv_pool_allocator
+    available = int(alloc.available_size())
+    if kv_rows <= available:
+        return True
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+    tc = adder.tree_cache
+    reported = int(tc.evictable_size())
+    evicted = 0
+    if reported > 0:
+        res = tc.evict(EvictParams(num_tokens=min(reported, kv_rows - available)))
+        # evict() returns None on some caches (as read by H105c/H106 too)
+        evicted = int(getattr(res, "num_tokens_evicted", 0) or 0)
+        available = int(alloc.available_size())
+    if kv_rows <= available:
+        return True
+    _H105D_REFUSED["n"] += 1
+    n = _H105D_REFUSED["n"]
+    if n <= 3 or (n & (n - 1)) == 0:
+        logger.info(
+            "H105d FORM-A-CUT LOAD-BACK ROOM rid=%s kv_rows=%d available=%d "
+            "evicted=%d reported_evictable=%d rem_total_tokens=%s (n=%d): this "
+            "rank cannot hold its own load-back rows even after evicting its "
+            "shortfall; it votes NO_TOKEN and the group's MIN keeps the request "
+            "queued on every rank",
+            req.rid, kv_rows, available, evicted, reported,
+            adder.rem_total_tokens, n,
+        )
+    return False
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -2605,6 +2692,11 @@ class PrefillAdder:
                 getattr(_fa_follow, "host_decides_load_back", False)
             )
             if _fa_follow is not None and (_gate is not None or not _fa_host_first):
+                # H105d: under the token cut every rank's gate is REAL and is
+                # gathered (MIN) BEFORE any load-back -- so this rank's gate
+                # must already know whether it can pay its OWN load-back rows.
+                if _gate is None and not _h105d_cut_load_back_room(self, req):
+                    _gate = AddReqResult.NO_TOKEN
                 # H105: after every rank-local gate and BEFORE the load-back
                 # (and the tail-adopt vote behind it) -- the one point every
                 # rank of the group reaches for this rid. The host's verdict
