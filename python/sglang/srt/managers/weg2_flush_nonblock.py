@@ -52,6 +52,7 @@ TWO PARTS, each behind its own switch (default off until metal), groups
 from __future__ import annotations
 
 import logging
+import time
 from typing import Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -219,8 +220,9 @@ def bg_publish_tick(scheduler) -> Optional[dict]:
 
         every = max(1, int(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY.get()))
         cap = max(1, int(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_ISSUE.get()))
+        max_tokens = max(0, int(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_TOKENS.get()))
     except Exception:  # noqa: BLE001
-        every, cap = 16, 1
+        every, cap, max_tokens = 64, 1, 8192
     fct = int(getattr(scheduler, "forward_ct", 0) or 0)
     if fct <= 0 or fct % every != 0:
         return None
@@ -230,7 +232,8 @@ def bg_publish_tick(scheduler) -> Optional[dict]:
         return None
     scheduler._weg2_bg_publish_last_fct = fct
     try:
-        stats = scheduler.tree_cache.publish_unbacked_sweep(max_issue=cap, background=True) or {}
+        stats = scheduler.tree_cache.publish_unbacked_sweep(
+            max_issue=cap, background=True, bg_max_tokens=max_tokens) or {}
     except Exception as e:  # noqa: BLE001 -- a publisher never takes the loop down
         logger.warning("%s raised %s: %s", LINE_BG, type(e).__name__, e)
         return None
@@ -240,7 +243,10 @@ def bg_publish_tick(scheduler) -> Optional[dict]:
     if issued:
         total = int(getattr(scheduler, "_weg2_bg_publish_issued", 0) or 0) + issued
         scheduler._weg2_bg_publish_issued = total
-        if total <= 10 or total % 20 == 0:
+        # one marker line per 30 s (review 1270 #8; monotonic, log only)
+        _now = time.monotonic()
+        if _now - float(getattr(scheduler, "_weg2_bg_publish_log_t", -1e9)) >= 30.0:
+            scheduler._weg2_bg_publish_log_t = _now
             logger.info(
                 "%s pass=%d issued=%d unbacked=%s skipped_bg=%s pending=%s refused=%s "
                 "issue_ms=%s cumulative_issued=%d (D decoding: finished requests' un-backed "

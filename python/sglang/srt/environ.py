@@ -1032,7 +1032,13 @@ class Envs:
     # request references (device lock 0) whose parent is already backed, so the
     # flip finds the backlog small. False = the flush alone, as in 4cf740ad50.
     SGLANG_WEG2_PUBLISH_SWEEP_BG = EnvBool(True)
-    SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY = EnvInt(16)
+    # EVERY 64 (review 1270 #5: a BG issue is synchronous in the TP lockstep, p90 54 ms,
+    # 4.6 % of the issues > 100 ms): about one node per 2-4 s of D decode.
+    SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY = EnvInt(64)
+    # BG only publishes nodes with len(key) <= this many tokens (replicated, so every rank
+    # decides alike); a longer node (a P hand-over chain) is left to the flip's flush as
+    # before. 0 = no size limit.
+    SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_TOKENS = EnvInt(8192)
     SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_ISSUE = EnvInt(1)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
