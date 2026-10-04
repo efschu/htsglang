@@ -15455,9 +15455,55 @@ class Front:
             step_b = int(b[1]) if len(b) > 1 else 0
             tok_b = step_b / max(1, int(t.get("step") or 1))
             card_room.append((int(st.free), int(t.get("lent") or 0) + step_b + int(air_tok * tok_b)))
+        if envs.SGLANG_WEG2_DUAL_LEND_RESUME_GATE.get():
+            lent = self._dual_lend_gate_lent(lent)
         return {"p_committed": committed, "free_min": int(free or 0), "p_grant_bytes": grant,
                 "d_air_bytes": int(air_tok * per_tok), "weights_bytes": weights,
                 "card_room": card_room if stages else None, "d_short": d_short, "p_lent": lent}
+
+    #: #1480: seconds between two LEND-RESUME-GATE lines while the gate holds
+    DUAL_LEND_GATE_LOG_S = 5.0
+
+    def _dual_lend_gate_lent(self, legacy_lent: int) -> int:
+        """#1480 LEND-RESUME-GATE (SGLANG_WEG2_DUAL_LEND_RESUME_GATE, dual front,
+        default off): the bytes P's stages still lend, read under the front's own
+        --tag as well as the env tag. B9c 17:02:28Z: PP0's reclaim was refused (1.85
+        GiB lent, 302 MiB free) and the front resumed P 200 ms later -- the old
+        reading looked for the stage files under 'weg2' (the front's env has no tag),
+        found none, and said p_lent 0 (dual_d_priority.py:407-413 then resumes). The
+        answer is never below the old reading; the ranks themselves stay the truth
+        (each file is the rank's own _sleep_lent + _awake_lent)."""
+        from sglang.srt.weg2 import dual_p_kv_stage as _pk
+
+        tags: List[str] = []
+        for t in (str(getattr(self, "tag", "") or ""),
+                  os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")):
+            if t and t not in tags:
+                tags.append(t)
+        per, used = _pk.lend_gate_reading(tags)
+        files = sum(1 for x in per if x is not None)
+        total = sum(int(x) for x in per if x is not None)
+        lent = max(int(legacy_lent), total)
+        st = getattr(self, "_dual_stages_obj", None)
+        state = str(getattr(st, "p_state", "?"))
+        now = time.time()
+        if files == 0:
+            if not getattr(self, "_dual_lend_gate_blind", False):
+                self._dual_lend_gate_blind = True
+                logger.warning("%s verdict=BLIND files=0/%d tags=%s p_state=%s -- no P stage file readable, the gate "
+                               "cannot see the loan", _pk.LEND_GATE_MARK, len(per), ",".join(tags), state)
+        elif lent > 0 and state == "reclaiming":
+            self._dual_lend_gate_held = True
+            if now >= float(getattr(self, "_dual_lend_gate_next", 0.0) or 0.0):
+                self._dual_lend_gate_next = now + self.DUAL_LEND_GATE_LOG_S
+                logger.warning("%s verdict=HOLD p_lent=%d per_rank=%s files=%d/%d tag=%s legacy_p_lent=%d p_state=%s "
+                               "-- the loan is not back on every P card: P stays stopped, no resume",
+                               _pk.LEND_GATE_MARK, lent, per, files, len(per), used, int(legacy_lent), state)
+        elif lent <= 0 and getattr(self, "_dual_lend_gate_held", False):
+            self._dual_lend_gate_held = False
+            logger.warning("%s verdict=RELEASE p_lent=0 per_rank=%s files=%d/%d tag=%s p_state=%s -- every P stage "
+                           "file at lent==0, the resume may go", _pk.LEND_GATE_MARK, per, files, len(per), used, state)
+        return lent
 
     #: env: the metal probe of stage 2 (one sleep + wake of P in the first idle
     #: stretch, no pressure needed) -- seconds P stays asleep; unset/0 = off

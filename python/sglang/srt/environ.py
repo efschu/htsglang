@@ -711,6 +711,12 @@ class Envs:
     # made for when a newer instance of the same rid is queued, instead of AbortReq(rid) (prefix: both instances + the
     # new instance's told).
     SGLANG_WEG2_DUAL_POP_KEEPS_TWIN = EnvBool(False)
+    # #1480 LEND-RESUME-GATE (B9c 17:02:28Z): dual FRONT only (the P-stage ladder). DEFAULT OFF = the old code path byte for
+    # byte. On: the front's resume 'from=lend' needs every P stage file at lent==0. The front read the stage files under
+    # the tag 'weg2' (its own env carries neither SGLANG_WEG2_DUAL_KV_TAG nor SGLANG_WEG2_TAG, the P ranks' env does), so
+    # p_lent was always 0 and P resumed 200 ms after PP0's REFUSED reclaim (1.85 GiB lent, 302 MiB free) -> OOM. On: p_lent is
+    # read under the front's own --tag too (max with the old reading); a refused/open reclaim holds the resume.
+    SGLANG_WEG2_DUAL_LEND_RESUME_GATE = EnvBool(False)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,
