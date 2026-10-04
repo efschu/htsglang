@@ -407,6 +407,30 @@ def test_post_d_switch_zero_posts_nothing(tmp_path, monkeypatch):
     assert not os.path.exists(str(arena.path) + D.NEED_SUFFIX)
 
 
+def test_a_device_resident_node_is_not_a_host_only_leaf_and_stays(monkeypatch):
+    """Not backed-and-evicted (it still has a device value): outside the V2 spill, as in Q-697c."""
+    _env(monkeypatch, DUAL_P)
+    sched, cache, pool, nodes = _stage(97)
+    nodes[1].component_data[FULL].value = torch.arange(1, dtype=torch.int64)
+    got = D.spill_host_only(cache, pool, 100, 1, set())
+    assert nodes[1].id in _live(cache) and 7001 not in pool.secured
+    assert got["leaves"] == 96
+
+
+def test_a_stage_without_a_spill_pool_logs_a_rate_limited_stop(monkeypatch, caplog):
+    import logging
+
+    _env(monkeypatch, DUAL_P)
+    caplog.set_level(logging.WARNING)
+    sched, cache, pool, nodes = _stage(97, pp_rank=1)
+    cache._weg2_direct_pool = lambda: None
+    for i in range(20):
+        got = D.execute(sched, D.Weg2DualArenaTrim(i + 1, 5, 970000))
+        assert got["released"] == 0
+    stops = [r for r in caplog.records if "STOP rank=1" in r.getMessage()]
+    assert 1 <= len(stops) <= 8 and len(_live(cache)) == 97
+
+
 def test_the_brake_stops_the_loop_before_the_next_leaf_and_the_next_order_goes_on(monkeypatch):
     _env(monkeypatch, DUAL_P)
     sched, cache, pool, nodes = _stage(97)

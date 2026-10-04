@@ -385,13 +385,13 @@ class Weg2DualArenaTrim(NamedTuple):
 
 _T: Dict[str, Any] = {
     "active": False, "next_t": 0.0, "seq": 0, "episode_cmds": 0, "orders": 0, "execs": 0,
-    "reads": 0, "census_reads": 0, "no_arena": 0, "need_posts": 0, "last_fill": 0.0, "decided_t": 0.0,
+    "reads": 0, "census_reads": 0, "no_arena": 0, "need_posts": 0, "last_fill": 0.0, "decided_t": 0.0, "stops": 0,
 }
 
 
 def _reset_trim_for_tests() -> None:
     _T.update(active=False, next_t=0.0, seq=0, episode_cmds=0, orders=0, execs=0, reads=0,
-              census_reads=0, no_arena=0, need_posts=0, last_fill=0.0, decided_t=0.0)
+              census_reads=0, no_arena=0, need_posts=0, last_fill=0.0, decided_t=0.0, stops=0)
 
 
 def trim_enabled(env=None) -> bool:
@@ -538,8 +538,10 @@ def execute(sched, cmd: Weg2DualArenaTrim, env=None) -> Dict[str, int]:
     pool = _tree_pool(sched)
     rank = int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0)
     if pool is None or _r12.role() is not None:
-        logger.warning("%s n=%d STOP rank=%d seq=%d no_spill_pool_or_form_a: nothing given back here (the "
-                       "order is not executed on this stage)", TRIM_MARK, _T["execs"], rank, cmd.seq)
+        _T["stops"] = int(_T.get("stops", 0)) + 1
+        if _T["stops"] <= 8 or _T["stops"] % 64 == 0:
+            logger.warning("%s n=%d STOP rank=%d seq=%d no_spill_pool_or_form_a: nothing given back here (the "
+                           "order is not executed on this stage)", TRIM_MARK, _T["stops"], rank, cmd.seq)
         return none
     cfg = trim_cfg(env)
     t0 = time.monotonic()
