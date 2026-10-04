@@ -240,6 +240,6 @@ def format_group_fact(
     floor_txt = "none" if verdict.floor is None else str(verdict.floor)
     clamp_txt = "-" if verdict.clamp_to is None else str(verdict.clamp_to)
     return (
-        f"rid={rid[:8]} want={want} floor={floor_txt} clamp={clamp_txt} "
+        f"rid={rid} want={want} floor={floor_txt} clamp={clamp_txt} "
         f"reports=[{' '.join(parts)}] reason={verdict.reason}"
     )

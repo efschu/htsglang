@@ -2376,7 +2376,7 @@ def _demand_lists(sched) -> Tuple[list, list]:
             logger.info(
                 "%s n=%d rids=%s tokens=%d -- the extend batch that ran last is not merged "
                 "yet at this tick: its requests hold their pages (no end event, no shrink "
-                "below them)", UNMERGED_MARK, n, [str(getattr(r, "rid", ""))[:16] for r in extra],
+                "below them)", UNMERGED_MARK, n, [str(getattr(r, "rid", "")) for r in extra],
                 sum(_req_tokens(r) for r in extra))
     queue = getattr(sched, "waiting_queue", None) or ()
     return running, _admissible_queue(queue, _cap_of(sched) - len(running))

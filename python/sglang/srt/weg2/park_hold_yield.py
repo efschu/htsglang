@@ -214,7 +214,7 @@ def settle(sched, *, retracted: Sequence, parked: Sequence) -> Optional[str]:
         "%s need=%d held_by_hold=%d held_on_disk=%d refused_nodes=%d verdict=%s given_back=%s "
         "pages=%d backups_retried=%d/%d (%s)",
         MARK, need, held, sum(on_disk), len(refused), verdict,
-        [cands[i][:12] for i in pick] if pick else [], given, retried, len(refused),
+        [cands[i] for i in pick] if pick else [], given, retried, len(refused),
         "the held requests' L3-copied pages made room; the wake reads them from L3"
         if pick is not None else
         "the L3-copied held pages do not cover the need -- the refusal stands (P recomputes the park)")

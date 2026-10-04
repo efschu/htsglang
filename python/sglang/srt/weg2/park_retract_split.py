@@ -106,7 +106,7 @@ class RetractSplit:
     def line(self, epoch: int) -> str:
         release = sum(self.release_ms.values())
         other = max(0.0, self.total_ms - release)
-        per = ",".join("%s:%.0f" % (rid[:12], ms) for rid, ms in self.release_ms.items())
+        per = ",".join("%s:%.0f" % (rid, ms) for rid, ms in self.release_ms.items())
         return (
             "WEG2-PARK-RETRACT-SPLIT epoch=%d n=%d retract_ms=%.0f release_ms=%.0f [%s] "
             "backup_ms=%.0f backup_n=%d write_ms=%.0f write_n=%d backup_rest_ms=%.0f "

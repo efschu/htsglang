@@ -251,7 +251,7 @@ def test_bb3_the_held_read_keeps_running_and_the_wake_releases_it_first():
         assert wu._weg2_hold_owned_prefetch() == frozenset({RID})
         sch.weg2_dormant = False  # the wake
         assert wu._weg2_hold_owned_prefetch() == frozenset()
-        assert sch.idle_blockers() == ["hicache_prefetch(1: weg2-16-)"]
+        assert sch.idle_blockers() == ["hicache_prefetch(1: weg2-16-23)"]
         assert not wu._weg2_sleep_idle()
 
 

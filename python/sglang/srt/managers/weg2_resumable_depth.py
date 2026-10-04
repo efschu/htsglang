@@ -168,7 +168,7 @@ def park_depths(
     if int(getattr(ps, "attn_tp_rank", 0) or 0) == 0:
         logger.info(
             "#59b PARK-RESUMABLE mode=%s %s", mode,
-            " ".join("%s=%d" % (rid[:24], d) for rid, d in out.items()),
+            " ".join("%s=%d" % (rid, d) for rid, d in out.items()),
         )
     return out
 
@@ -198,7 +198,7 @@ def stamp_finished(
             seq = len(req.origin_input_ids) + len(getattr(req, "output_ids", None) or ())
             logger.info(
                 "#59 RESUMABLE rid=%s depth=%d seq=%d cached_tokens=%d mode=%s",
-                str(getattr(req, "rid", ""))[:24], ts.weg2_resumable_depth, seq,
+                str(getattr(req, "rid", "")), ts.weg2_resumable_depth, seq,
                 int(getattr(req, "cached_tokens", 0) or 0), mode,
             )
     return mode

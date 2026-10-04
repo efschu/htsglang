@@ -98,7 +98,7 @@ def defer_hold_read(sched, req) -> bool:
     sched._248_defer_n = n
     if n <= 8 or n % 64 == 0:
         logger.info("#248 HOLD-LOOKUP rid=%s chain=%s (no reference, no pin in the sleep: the read runs "
-                    "at the wake) n=%d", str(rid)[:12], len(chain) if chain else None, n)
+                    "at the wake) n=%d", str(rid), len(chain) if chain else None, n)
     return True
 
 
@@ -230,7 +230,7 @@ def issue_deferred_reads(sched, hold) -> list:
         logger.info("%s n=%d waiting=%s in_flight_pages=%d arena_slots=%d (the older hold reads of "
                     "this wake hold the arena: these wait parked in the #1471 settle, oldest "
                     "first, instead of reading short and evicting their own kept pages)",
-                    CAPWAIT_MARK, len(wait), [(str(r.rid)[:12], read_pages(sched, r)) for r in wait],
+                    CAPWAIT_MARK, len(wait), [(str(r.rid), read_pages(sched, r)) for r in wait],
                     in_flight, cap)
     return out
 
@@ -263,7 +263,7 @@ def issue_capacity_waiters(sched, settle) -> list:
         req._1471_since = now
     logger.info("%s n=%d rids=%s in_flight_pages=%d arena_slots=%s still_waiting=%d (an older hold read "
                 "was admitted and freed its arena room: the next ones in arrival order read now)",
-                CAPISSUE_MARK, len(go), [(str(r.rid)[:12], read_pages(sched, r)) for r in go],
+                CAPISSUE_MARK, len(go), [(str(r.rid), read_pages(sched, r)) for r in go],
                 in_flight, cap, len(waiters) - len(go))
     return out
 
@@ -293,12 +293,12 @@ def _issue(sched, reqs) -> list:
         out.append(req)
     if out:
         logger.info("#248 WAKE-READ issued=%d %s (the hold read runs now: reference and pin at the wake, "
-                    "the device load at admission)", len(out), [str(r.rid)[:12] for r in out])
+                    "the device load at admission)", len(out), [str(r.rid) for r in out])
     if refused:
         logger.warning("#1471b WAKE-READ BUDGET-REFUSED n=%d %s -- the host budget had no room for "
                        "these reads (the earlier hold reads hold it); they stay parked in the settle "
                        "and are re-read once it frees, never decided 'no writer' on a read that did "
-                       "not run", len(refused), [(str(r.rid)[:12], v) for r, v in refused])
+                       "not run", len(refused), [(str(r.rid), v) for r, v in refused])
     return out
 
 
@@ -499,7 +499,7 @@ def mark_parked(sched, reqs) -> int:
         try:
             chain = chain_of(tree, req) if tree is not None else []
         except Exception:  # noqa: BLE001 - an unreadable span keeps nothing (named)
-            logger.warning("#248 PARK-MARK rid=%s chain unreadable", rid[:12], exc_info=True)
+            logger.warning("#248 PARK-MARK rid=%s chain unreadable", rid, exc_info=True)
             chain = []
         if not chain:
             from sglang.srt.weg2.handoff_keys import CHAIN_ATTR
@@ -508,5 +508,5 @@ def mark_parked(sched, reqs) -> int:
         if _hp.mark_park(rid, chain, page):
             n += 1
             logger.info("#248 PARK-MARK rid=%s pages=%d (kept by order, no reference over the flip)",
-                        rid[:12], len(chain))
+                        rid, len(chain))
     return n
