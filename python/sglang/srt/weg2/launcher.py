@@ -116,6 +116,7 @@ from sglang.srt.weg2 import (
     corridor_budget,
     host_ledger,
     l15_plan,
+    l15_pool_peak,
     card_identity,
     ring_table,
     seam_digest,
@@ -25402,6 +25403,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # UNMEASURED: the pure layer prices a missing peak as a 0 post,
                 # never an estimate.
                 l15_peaks = [None] * len(cards)
+            # L15-POOL S1b: the measured per-card record as the planner input,
+            # behind SGLANG_WEG2_L15_POOL_PEAK_RECORD (default off: peaks and
+            # log untouched). On: a card without a record gets None = no share.
+            l15_peaks, _l15_peak_lines = l15_pool_peak.planner_peaks(
+                ns.profile, cards, l15_peaks, os.environ)
+            for _ln in _l15_peak_lines:
+                log(_ln)
             l15_posts = l15_plan.resolve_posts(
                 ns.profile, l15_base, l15_peaks, os.environ)
             for post in l15_posts:

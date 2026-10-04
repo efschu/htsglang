@@ -826,6 +826,16 @@ class Envs:
     # The ranks read it through l15_pool.pool_shadow_on(os.environ) (1/true/on/yes),
     # like every SGLANG_WEG2_L15* switch. Default off = today byte for byte.
     SGLANG_WEG2_L15_POOL_SHADOW = EnvBool(False)
+    # L15-POOL S1b (weg2/l15_pool_peak.py): the planner input P_AWAKE_PEAK_MIB
+    # per card, built from measured WEG2-VRAM-PEAK windows (scripts/
+    # l15_pool_peak_record.py): per card the MAXIMUM over boots/lines with its
+    # origin, never a mean, never an estimate. On: with SGLANG_WEG2_L15=1 the
+    # pool record is the only source of the peaks (no record for a card = no
+    # pool share there) and one ``L15-POOL-PEAK card=.. peak_mib=.. source=..
+    # n=..`` line per card is printed. 0 = the planner byte for byte as before.
+    # _FILE overrides weg2/profile_records_data/l15_pool_peak_<profile>.json.
+    SGLANG_WEG2_L15_POOL_PEAK_RECORD = EnvBool(False)
+    SGLANG_WEG2_L15_POOL_PEAK_RECORD_FILE = EnvStr("")
     # L3FILL_JOIN_WAIT_MS (L3FILL-JOINED 30.09., NF y4a ep36 weg2-36-74): how
     # long an L3 -> L2 fill waits for a stem another writer has CLAIMED to
     # become COMPLETE before it counts as a miss. A prefix read ends at its
