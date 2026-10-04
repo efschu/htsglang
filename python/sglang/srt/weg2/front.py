@@ -1148,6 +1148,18 @@ def leg1_early_on(env: Optional[dict] = None) -> bool:
     return str(env.get(LEG1_EARLY_ENV, "1") or "1").strip().lower() in ("1", "true", "yes", "on")
 
 
+#: Q-1368: requeues one request may take (intake stall, W31/X) before the front
+#: answers its client with the stall instead of requeueing it again. NF nf9
+#: (1004_105315): a failed LEG1-EARLY stayed on the Pending, every later P
+#: phase re-awaited the same failed future and requeued it -- ``x_requeues``
+#: had no bound. The consumed leg is cleared now; this is the backstop.
+X_REQUEUE_CAP = 8
+
+
+def x_requeue_capped(x_requeues: int) -> bool:
+    return int(x_requeues) > X_REQUEUE_CAP
+
+
 def leg1_early_candidates(queue, limit: int) -> list:
     """The queue head the P drain would dispatch first (at most ``limit``):
     a leg 1 to run (not CARRIER-EXCEEDS, not D-direct), its client still
@@ -7784,6 +7796,8 @@ class Front:
         for p in list(self.queue) + list(self._ready_for_d):
             if not p.fut.done():
                 p.fut.set_exception(self.stop)
+        for p in list(self.queue):  # Q-1368: no early leg outlives the STOP unread
+            Front._leg1_early_cancel(self, p, "stop")
         self.queue.clear()
         self._ready_for_d.clear()
         self._sync_batch_gate()
@@ -8688,13 +8702,20 @@ class Front:
         p.x_requeues += 1
         self._p_intake_stalled = True
         self.counters["p_intake_stalls"] += 1
-        self.queue.appendleft(p)
-        logger.warning(
-            "WEG2 P-INTAKE-STALL rid=%s est_prompt=%d requeued at the head "
-            "(requeues=%d, queue=%d) -- drain ends, flip to D follows: %s",
-            p.rid, int(p.est_prompt), p.x_requeues, len(self.queue),
-            str(err)[:300],
-        )
+        if x_requeue_capped(p.x_requeues):  # Q-1368: the requeue is bounded
+            self.counters["p_intake_stall_capped"] += 1
+            logger.error("WEG2 P-INTAKE-STALL-CAP rid=%s requeues=%d cap=%d: answered with the "
+                         "stall, not requeued: %s", p.rid, p.x_requeues, X_REQUEUE_CAP, str(err)[:300])
+            if not p.fut.done():
+                p.fut.set_exception(RuntimeError(f"WEG2 P-INTAKE-STALL-CAP rid={p.rid}: {err}"))
+        else:
+            self.queue.appendleft(p)
+            logger.warning(
+                "WEG2 P-INTAKE-STALL rid=%s est_prompt=%d requeued at the head "
+                "(requeues=%d, queue=%d) -- drain ends, flip to D follows: %s",
+                p.rid, int(p.est_prompt), p.x_requeues, len(self.queue),
+                str(err)[:300],
+            )
         try:
             code, _body = await self.rpc(
                 self.groups["P"], "/abort_request", {"rid": p.rid}, 30)
@@ -8702,6 +8723,84 @@ class Front:
         except Exception as exc:  # noqa: BLE001 -- P's own rank already dropped it
             logger.warning("WEG2 P-INTAKE-STALL rid=%s /abort_request on P raised: %s",
                            p.rid, exc)
+
+    # ---------------- Q-1368: a LEG1-EARLY's verdict is always read ----------------
+    # NF nf9 (1004_105315): the leg posted at the D->P begin for weg2-84-299 got
+    # P's WEG2-INTAKE-STALL 503 (11:31:29); the drain ended (cap) before it
+    # reached the rid, so nobody read the verdict -- no requeue, no
+    # /abort_request, the client waited until the W3-STOP (11:31:44) and the
+    # front logged "Task exception was never retrieved". The drain's ``one(p)``
+    # stays the reader while it holds ``p``; while ``p`` is still queued, this
+    # callback reads it.
+    def _leg1_early_watch(self, p: "Pending") -> None:
+        task = p._leg1_early
+        task.add_done_callback(lambda t, p=p: Front._leg1_early_settled(self, p, t))
+
+    def _leg1_early_settled(self, p: "Pending", task: "asyncio.Future") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()  # read: never "Task exception was never retrieved"
+        if exc is None or getattr(p, "_leg1_early", None) is not task:
+            return  # a success the drain consumes, or the drain's one(p) already awaits it
+        tasks = self.__dict__.setdefault("_leg1_early_unread_tasks", set())
+        t = asyncio.ensure_future(Front._leg1_early_unread(self, p, task, exc))
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
+
+    async def _leg1_early_unread(self, p: "Pending", task, exc: BaseException) -> None:
+        """The failed early leg of a request the drain has not taken: the same
+        verdicts as ``one(p)`` -- an intake stall is requeued at the head and
+        aborted on every P rank, anything else answers the client."""
+        if (getattr(p, "_leg1_early", None) is not task or p.client_gone or p.fut.done()
+                or not any(q is p for q in self.queue)):
+            return  # the drain's one(p) took it, or a hang-up / STOP answered it
+        p._leg1_early = None
+        for i, q in enumerate(self.queue):
+            if q is p:  # BY IDENTITY (Pending.__eq__ compares fields)
+                del self.queue[i]
+                break
+        self.counters["leg1_early_unread"] += 1
+        stall = is_intake_stall(exc) and not is_too_large(exc)
+        logger.warning("WEG2 LEG1-EARLY-UNREAD rid=%s verdict=%s epoch=%d state=%s awake=%s -- the drain "
+                       "had not reached it: %s", p.rid, "intake-stall" if stall else "failed", self.epoch,
+                       self.state, self.awake, str(exc)[:300])
+        if stall:
+            # a drain that takes p while the /abort_request is on the wire waits
+            # for it: the abort must not land on P after p's fresh leg 1
+            p._leg1_abort = asyncio.current_task()
+            try:
+                await self._requeue_intake_stalled(p, exc)
+            finally:
+                p._leg1_abort = None
+            return
+        if is_too_large(exc):
+            self.counters["p_intake_too_large"] += 1
+        self.counters["leg1_failures"] += 1
+        p.fut.set_exception(exc)
+
+    async def _leg1_abort_landed(self, p: "Pending") -> bool:
+        """The drain's one(p) before a fresh leg 1: if the /abort_request of
+        p's unread early leg is still on the wire, wait for it -- landing on P
+        after the fresh leg it would kill that one. False = the client left."""
+        ab = getattr(p, "_leg1_abort", None)
+        if ab is not None:
+            await asyncio.wait({ab})
+        return not p.client_gone
+
+    def _leg1_early_cancel(self, p: "Pending", why: str) -> bool:
+        """Cancel ``p``'s early leg while it is still in flight. True = it was
+        on P (the caller aborts the rid there)."""
+        task = getattr(p, "_leg1_early", None)
+        if task is None:
+            return False
+        p._leg1_early = None
+        if task.done():
+            return False
+        on_p = p.rid in self.groups["P"].outstanding
+        task.cancel()
+        self.counters["leg1_early_cancel"] += 1
+        logger.info("WEG2 LEG1-EARLY-CANCEL rid=%s why=%s on_p=%s", p.rid, why, on_p)
+        return on_p
 
     # ---------------- H102: the client hung up before its answer ----------------
     def _arm_client_watch(self, request: web.Request, rid: str,
@@ -8775,6 +8874,7 @@ class Front:
         if state == "done":
             return
         action = "none"
+        early_on_p = False
         if p is not None and state in ("queued", "p-leg1", "handoff"):
             p.client_gone = True
         if state == "queued":
@@ -8785,6 +8885,8 @@ class Front:
                     del self.queue[i]
                     break
             action = "dequeued"
+            # Q-1368: a LEG1-EARLY still in flight is cancelled and aborted on P
+            early_on_p = Front._leg1_early_cancel(self, p, "client-gone")
         elif state == "handoff":
             self._ready_for_d_drop(p)
             self._sync_batch_gate()
@@ -8794,13 +8896,13 @@ class Front:
         if (p is not None and state in ("queued", "p-leg1", "handoff")
                 and not p.fut.done()):
             p.fut.set_exception(Weg2ClientGone(f"WEG2-CLIENT-GONE rid={rid} state={state}"))
-        if state == "p-leg1" and rid in self.groups["P"].outstanding:
+        if (state == "p-leg1" and rid in self.groups["P"].outstanding) or early_on_p:
             # The intake-stall path: /abort_request on P's HTTP server (PP0);
             # AbortReq reaches every rank through the recv broadcast (#1460
             # CTRL-FWD, WEG2-PP-CHUNKED-ABORT). Idempotent where it is gone.
             try:
                 code, _b = await self.rpc(self.groups["P"], "/abort_request", {"rid": rid}, 30)
-                action = f"abort-p status={code}"
+                action = ("dequeued abort-p-early" if early_on_p else "abort-p") + f" status={code}"
             except Exception as exc:  # noqa: BLE001
                 action = f"abort-p raised={type(exc).__name__}"
         elif state == "parked":
@@ -8850,6 +8952,7 @@ class Front:
         for p in list(self.queue):
             if p.rid == rid or p.payload.get("rid") == rid:
                 self.queue.remove(p)
+                Front._leg1_early_cancel(self, p, "abort")  # Q-1368: no early leg left unread
                 if not p.fut.done():
                     p.fut.set_exception(web.HTTPRequestTimeout(text="aborted"))
         try:
@@ -9726,6 +9829,7 @@ class Front:
         if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
             for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
                 _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
+                Front._leg1_early_watch(self, _ep)  # Q-1368: its verdict is always read
                 self.counters["leg1_early"] += 1
                 logger.info("WEG2 LEG1-EARLY rid=%s epoch=%d (posted at the EARLY-FLIP go, before "
                             "the first sleep RPC)", _ep.rid, self.epoch)
@@ -13580,6 +13684,7 @@ class Front:
             if leg1_early_on() and not getattr(self, "dual_kv_ledgers", False):
                 for _ep in leg1_early_candidates(self.queue, self.p_concurrency):
                     _ep._leg1_early = asyncio.ensure_future(self.leg1(_ep))
+                    Front._leg1_early_watch(self, _ep)  # Q-1368: its verdict is always read
                     self.counters["leg1_early"] += 1
                     logger.info("WEG2 LEG1-EARLY rid=%s epoch=%d (posted at the D->P flip's begin; "
                                 "P holds it dormant, its store prefetch runs beside the legs)",
@@ -15527,9 +15632,12 @@ class Front:
                         try:
                             _early = getattr(p, "_leg1_early", None)
                             if _early is not None:
-                                # DP-NACHLAUF: posted at the flip's begin -- await it
+                                # DP-NACHLAUF: posted at the flip's begin; Q-1368: read once
+                                p._leg1_early = None
                                 await _early
                             else:
+                                if not await Front._leg1_abort_landed(self, p):
+                                    return p
                                 await self.leg1(p)
                         except Exception as e:  # noqa: BLE001
                             if p.client_gone:  # H102: aborted on P for a client that left
