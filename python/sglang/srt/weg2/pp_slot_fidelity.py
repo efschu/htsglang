@@ -247,7 +247,104 @@ def unbacked_drop_allowed(tree, node) -> bool:
     return True
 
 
-def note_unbacked_drop(tree, node, tokens: int) -> None:
+#: Q-1500 (V1, desk analysis 1290): the dual-P extension of UD below. Default ON, and
+#: only ever read behind ``dual_p_kv_stage.armed()``; ``0`` = UD exactly as before.
+UD_HOST_CHILDREN_ENV = "SGLANG_WEG2_DUAL_UD_HOST_CHILDREN"
+
+
+def ud_host_children_enabled(env=None) -> bool:
+    """Dual P layout only (``dual_p_kv_stage.armed``: SGLANG_WEG2_DUAL_LAYOUT=1, group P and
+    a P-KV cap); False in the flip form, NF, 27B INT8 and on dual D whatever the switch says."""
+    e = os.environ if env is None else env
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    if not _dpk.armed(e):
+        return False
+    raw = (e.get(UD_HOST_CHILDREN_ENV, "") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def unbacked_drop_subtree(tree, node):
+    """Q-1500 UD-V1 (y9d3 P PP0 07:18:49Z, desk analysis 1290): may a refused write_back leaf be
+    dropped TOGETHER WITH its host-only subtree? Returns the descendants children-first, or None.
+
+    METAL. The last device leaf (node 266, parent 265 also un-backed) had host-only CHILDREN -- the
+    hand-off tail the arena kept. ``_is_device_leaf`` calls such a node a D-leaf (it asks only for "no
+    child with a DEVICE value"), the arena refused its backup (#1421 arena_claim, 14x), UD refused it
+    for its children, the eviction delivered 22 of 1024 and ``alloc_token_slots`` raised: rank death,
+    W17. Under write_back the host-only insert is legal below an un-backed parent
+    (``_insert_helper_host``: the #841 gate is armed only for the other policies), so the state is
+    reachable by the tree's own writers (test_dual_p_ud_host_children_1004).
+
+    #841 (law: an un-backed node with children is never DELETED, its edge would orphan the backed
+    subtree) is kept, not relaxed: the children are released FIRST, bottom-up, each through the
+    host-leaf eviction (its references go back to the arena), and only then is the childless leaf
+    dropped by the existing UD path -- no edge is popped above a surviving subtree, the guard in the
+    write_through branch is untouched.
+
+    Every descendant must be a plain host-only node: evicted, host copy present, no device value in
+    any component, no device or host lock (a load-back or a prefetch pin in flight), no write in
+    flight. Anything else -- and the whole call off the dual P layout, off the local-PP floor, with
+    the switch at 0 -- returns None and the eviction ends as it did before this fix.
+
+    RANK CONGRUENCE. The verdict is rank-local, like UD itself (the floor is this rank's own value:
+    ``unbacked_drop_allowed``'s premise) and like the Q-697c spill, which releases whatever a rank's
+    own claim refusal asks for. PP ranks hold replica trees of the same token path, so a rank that
+    drops a subtree its peers keep differs from them in CACHE CONTENT only. No collective runs
+    inside the eviction, so nothing can hang on the drop itself. What matters is who drops:
+      * PP0 (the y9d3 case: the rank with the smallest pool rest). PP0 is the authority -- its Admit
+        names what PP0's OWN tree can admit (weg2_told_fidelity: told = head matched in PP0's tree +
+        store span) and the followers cap their radix match to that told (#1419), so a shorter PP0
+        tree shortens the told on every rank and a follower that kept more uses the told extent.
+      * a follower (PP1/PP2), only under its own pool wall: it can end with LESS than PP0's told and
+        then needs the tail from the store (#988 LOADBACK prefix moved). Where the store has no
+        copy that is the ``#1004 SLOT DISAGREEMENT`` / HANDOFF-LOST class -- a named stop on one
+        request, against the alternative this replaces, an ``alloc_token_slots`` raise that kills
+        the rank and with it the group (W17). Not proven away; the Sollmarker for the metal boot
+        names it (``EVICT-UNBACKED-DROP SUBTREE`` on PP1/PP2 followed by #1004 = this residual)."""
+    if not enabled() or not getattr(tree, FLOOR_LOCAL_PP_ATTR, False):
+        return None
+    if not ud_host_children_enabled():
+        return None
+    children = getattr(node, "children", None)
+    if not children:
+        return None  # a childless leaf is the plain UD case
+    ongoing = getattr(tree, "ongoing_write_through", None) or {}
+    if getattr(node, "id", None) in ongoing:
+        return None
+    pre = []
+    stack = list(children.values())
+    while stack:
+        d = stack.pop()
+        pre.append(d)
+        if (
+            not getattr(d, "evicted", False)
+            or not getattr(d, "backuped", False)
+            or getattr(d, "id", None) in ongoing
+        ):
+            return None
+        for cd in d.component_data:
+            if cd.value is not None or cd.lock_ref > 0 or cd.host_lock_ref > 0:
+                return None
+        stack.extend(d.children.values())
+    pre.reverse()  # reversed pre-order: every node after all of its descendants
+    return pre
+
+
+def note_unbacked_drop(tree, node, tokens: int, subtree_nodes: int = 0, host_tokens: int = 0) -> None:
+    if subtree_nodes:
+        n = _sampled(tree, "_weg2_sf_unbacked_drop_subtree")
+        if n is not None:
+            logger.warning(
+                "EVICT-UNBACKED-DROP SUBTREE node=%s tokens=%d freed=%d subtree_nodes=%d "
+                "subtree_host_tokens=%d (n=%d): Q-1500 dual P -- a write_back leaf whose backup the "
+                "arena refused carried host-only children; they were released bottom-up (their arena "
+                "references went back) and the leaf dropped, instead of the eviction delivering "
+                "nothing and alloc_token_slots raising (y9d3 P PP0: rank death, W17). The cache "
+                "content below it is lost (recomputable / re-routed)",
+                getattr(node, "id", "?"), len(getattr(node, "key", []) or []), int(tokens),
+                int(subtree_nodes), int(host_tokens), n)
+        return
     n = _sampled(tree, "_weg2_sf_unbacked_drop")
     if n is not None:
         logger.warning(

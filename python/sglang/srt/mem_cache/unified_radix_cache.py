@@ -4568,6 +4568,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
                     if _sf.unbacked_drop_allowed(self, node):
                         self._ud_drop_unbacked_leaf(node, tracker)
+                    else:
+                        # Q-1500 (V1, dual P only; None everywhere else): the leaf
+                        # carries host-only children (y9d3 P PP0: 14 refusals on node
+                        # 266, delivered 22 of 1024, rank death) -- release them
+                        # bottom-up, then drop the childless leaf.
+                        _sub = _sf.unbacked_drop_subtree(self, node)
+                        if _sub is not None:
+                            self._ud_drop_unbacked_subtree(node, _sub, tracker)
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
@@ -4632,6 +4640,47 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
         _sf.note_unbacked_drop(self, node, tracker.get(BASE_COMPONENT_TYPE, 0) - before)
+
+    def _ud_drop_unbacked_subtree(
+        self,
+        node: UnifiedTreeNode,
+        descendants: list,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Q-1500: UD for a refused write_back leaf that has host-only children.
+
+        ``descendants`` is ``pp_slot_fidelity.unbacked_drop_subtree``'s verdict (children
+        first). Each goes through ``_evict_host_leaf`` (its host rows / arena references go
+        back; the #841 law holds at every step: no edge is popped above a surviving
+        subtree), into a SCRATCH tracker -- host tokens are not device tokens and must not
+        inflate what this eviction reports as delivered. Then the leaf, now childless, is
+        dropped by ``_ud_drop_unbacked_leaf`` (its own #841 precondition: no children).
+        A descendant that is no host leaf any more (the tree moved under us) stops the
+        release; what was released stays a valid tree and the leaf stays, as before."""
+        scratch = {ct: 0 for ct in self.tree_components}
+        released = 0
+        for d in descendants:
+            if not self._is_host_leaf(d):
+                logger.warning(
+                    "Q-1500 UD SUBTREE stopped at node %s under %s: not a host leaf any more "
+                    "(children=%d evicted=%s backuped=%s); %d of %d descendants released, the "
+                    "leaf stays",
+                    d.id, node.id, len(d.children), d.evicted, d.backuped,
+                    released, len(descendants),
+                )
+                return
+            self._evict_host_leaf(d, scratch)
+            released += 1
+        if node.children:  # defensive: the verdict named every descendant
+            return
+        before = tracker.get(BASE_COMPONENT_TYPE, 0)
+        self._ud_drop_unbacked_leaf(node, tracker)
+        from sglang.srt.weg2 import pp_slot_fidelity as _sf
+
+        _sf.note_unbacked_drop(
+            self, node, tracker.get(BASE_COMPONENT_TYPE, 0) - before,
+            subtree_nodes=released, host_tokens=int(scratch.get(BASE_COMPONENT_TYPE, 0)),
+        )
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]

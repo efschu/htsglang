@@ -967,3 +967,37 @@ class TestQ697bFlipUnchanged:
         r = inspect.getsource(ST._dual_kv_retry)
         assert r.index("if not waiting:") < r.index("pp0_grant") and "_dgw.publish(scheduler, ())" in r
 
+
+
+# ---------------------------------------------------------------------------------- Q-1500
+
+class TestQ1500UdHostChildrenFlipUnchanged:
+    """Q-1500 UD-V1 (desk analysis 1290): a refused write_back leaf with host-only children is dropped
+    with its subtree -- on the dual P layout only. Flip / NF / 27B INT8 / dual D: UD exactly as before
+    (children -> no drop). The behavioural half is mem_cache/test_dual_p_ud_host_children_1004."""
+
+    def _tree(self):
+        child = SimpleNamespace(id=2, evicted=True, backuped=True, children={}, component_data=[])
+        node = SimpleNamespace(id=1, children={"c": child})
+        return SimpleNamespace(weg2_sf_floor_local_pp=True, ongoing_write_through={}), node
+
+    def test_gate_is_dual_p_only(self, monkeypatch):
+        for env in _wrong_gates():
+            assert SF.ud_host_children_enabled(env) is False, env
+        env = {"SGLANG_WEG2_DUAL_LAYOUT": "1", "SGLANG_WEG2_GROUP": "P", PK.MAX_TOKENS_ENV: "32768"}
+        assert SF.ud_host_children_enabled(env) is True
+        assert SF.ud_host_children_enabled({**env, SF.UD_HOST_CHILDREN_ENV: "0"}) is False
+
+    def test_verdict_is_none_off_the_gate(self):
+        tree, node = self._tree()
+        assert SF.unbacked_drop_subtree(tree, node) is None      # flip env (autouse fixture): no dual keys
+        # the plain UD still refuses a node with children, as before
+        assert SF.unbacked_drop_allowed(tree, node) is False
+
+    def test_the_eviction_hook_sits_behind_the_verdict(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache as U
+
+        src = inspect.getsource(U._evict_device_leaf)
+        assert src.index("unbacked_drop_allowed(self, node)") < src.index("unbacked_drop_subtree(self, node)")
+        v = inspect.getsource(SF.unbacked_drop_subtree)
+        assert v.index("if not ud_host_children_enabled():") < v.index('getattr(node, "children"')
