@@ -14188,6 +14188,13 @@ def resolve_dual_layout(ns) -> None:
     Refused by name: --weg2-d-adopt on (D would hold placeholders that only a
     flip fills -- and there is no flip), --dual-mps on without --dual-layout.
     Off: no-op."""
+    # Default-switch audit 1300 (04.10.2026): unset = ON exactly under --dual-share
+    # (the dual gate), OFF everywhere else; an explicit value always wins.
+    if getattr(ns, "dual_unified_kv", None) is None:
+        ns.dual_unified_kv = "on" if getattr(ns, "dual_share", False) else "off"
+        if ns.dual_unified_kv == "on":
+            print("WEG2-DUAL --dual-unified-kv on (default under --dual-share; "
+                  "--dual-unified-kv off = the explicit A/B arm)", flush=True)
     if str(getattr(ns, "dual_unified_kv", "off")) == "on" and not getattr(ns, "dual_share", False):
         raise Weg2DualLayoutRefused(
             "DUAL-TP3PP3: --dual-unified-kv on needs --dual-share (the card KV ledger lives next to "
@@ -22015,10 +22022,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "vendored torch_memory_saver allocates the host image at the pause and frees it after "
                          "the restore, tms_csrc/core.cpp -- no resting image, KEIN-DAUER-HOSTRAM). off = stage 1 "
                          "only, the front prints 'stage=2 unavailable (weights resident)'.")
-    ap.add_argument("--dual-unified-kv", choices=("off", "on"), default="off",
+    ap.add_argument("--dual-unified-kv", choices=("off", "on"), default=None,
                     help="DUAL-TP3PP3: one KV pool per card shared by P and D at runtime (user orders "
                          "30.09. 07:10Z/07:25Z; weg2/card_kv_ledger.py). P maps KV only while it "
-                         "prefills and pauses when D is short. Needs --dual-share.")
+                         "prefills and pauses when D is short. Needs --dual-share. DEFAULT: ON under "
+                         "--dual-share (every dual profile since dual1g passes `on`; the dual boots "
+                         "show the card KV ledger at work, front 'DUAL-KV-PRESSURE'), OFF otherwise; "
+                         "'off' under --dual-share is the explicit A/B arm. Resolved in "
+                         "resolve_dual_layout, so a boot without --dual-share is untouched.")
     ap.add_argument("--dual-p-kv-max-tokens", type=int, default=196608,
                     help="DUAL-TP3PP3 --dual-unified-kv: P's KV pool rows (virtual; pages from the card "
                          "pool). Each K/V buffer is born at this size and trimmed at once, so the boot "

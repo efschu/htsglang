@@ -116,7 +116,8 @@ class DualPKvStage(CustomTestCase):
         L.resolve_dual_layout(ns)
         self.assertEqual(L.dual_share_env(ns, "P")[S.MAX_TOKENS_ENV], "196608")
         self.assertNotIn(S.MAX_TOKENS_ENV, L.dual_share_env(ns, "D"))
-        off = L.build_parser().parse_args(["--tree", "/x", "--tag", "t", "--dual-share"])
+        # default-switch audit 1300 (04.10.): --dual-share alone is now unified-KV ON, so "off" is explicit
+        off = L.build_parser().parse_args(["--tree", "/x", "--tag", "t", "--dual-share", "--dual-unified-kv", "off"])
         L.resolve_dual_layout(off)
         self.assertNotIn(S.MAX_TOKENS_ENV, L.dual_share_env(off, "P"))
         with self.assertRaises(L.Weg2DualLayoutRefused):
