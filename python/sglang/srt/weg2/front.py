@@ -8806,7 +8806,13 @@ class Front:
         elif state == "parked":
             # H91c: D holds the parked request while P runs; it is released
             # on D the same way (D's /abort_request, TP broadcast).
-            getattr(self, "_d_parked", {}).pop(rid, None)
+            # W3-CLIENT-GONE (NF 063851 front 06:45:21.545-.651, weg2-0-2): the
+            # rid stays PARKED until its leg 2 ends -- the leg's ``finally``
+            # drops it from ``D.outstanding`` and ``_d_parked`` together (H91
+            # part C). Dropped here, before the abort RPC, it sat in
+            # ``D.outstanding`` un-parked for 106 ms; the D->P quiesce's flush
+            # answered idle inside that window and the flip ledger counted it
+            # as D work -> W3 Weg2DrainWitnessDisagreement, group stopped.
             try:
                 code, _b = await self.rpc(self.groups["D"], "/abort_request", {"rid": rid}, 30)
                 action = f"abort-d-park status={code}"
@@ -13690,7 +13696,10 @@ class Front:
             # The old wording ("rank(P) flush_cache") described the defect: one
             # rank's word standing for three.
             self.do_stop("W3 Weg2DrainWitnessDisagreement",
-                         f"{wv}: front ledger {sorted(S.outstanding)} vs group({src}) "
+                         # the ledger the witness judged (parks excluded); the
+                         # whole outstanding set beside it, named as such
+                         f"{wv}: front ledger {sorted(_wl)} (outstanding "
+                         f"{sorted(S.outstanding)}) vs group({src}) "
                          f"flush_cache (reduced over every rank, #1268) -> {msg[:400]!r}")
             return
         if _early is not None:
