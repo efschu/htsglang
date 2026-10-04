@@ -224,75 +224,37 @@ def _no_l2_lanes(rid: str) -> Tuple[int, ...]:
     return ()
 
 
-def retain_at_sleep(
+@dataclass
+class RoundPlan:
+    """Steps (1)-(2) of one retain round: pure planning, nothing touched.
+
+    L15-SLEEP-DECIDE-FIRST: the scheduler computes this BEFORE the group's
+    cap-0 vote, so a round the group refuses is never paid (the moves, tree
+    rewrite, host pins, reset and arm). ``manifest`` is filled lazily by
+    :func:`manifest_of_plan` (identical to what step (8) publishes)."""
+
+    hs: HoldSet
+    plan: CompactPlan
+    a_h: int
+    anchor_moves: list
+    new_anchors: Dict
+    manifest: Optional[Manifest] = None
+
+
+def plan_round(
     *,
     candidates: Iterable,
-    node_of: Callable[[str], object],
     slots_of: Callable[[str], Sequence[int]],
     anchor_slot_of: Callable[[str], int],
-    l2_of: Callable[[str], Tuple[Sequence[int], Sequence[int]]],
-    anchor_l2_of: Callable[[str], Tuple[int, int]] = _no_anchor_l2,
-    l2_lanes_of: Callable[[str], Tuple[int, ...]] = _no_l2_lanes,
-    rewrite_tree: Callable[
-        [object, Dict[int, int], Dict[int, int], set], None
-    ],
     caps_rows_by_rank: Sequence[int],
     cap_anchor_slots: int,
     prefix: Sequence[int],
-    rank: int,
     epoch: int,
-    pid: int,
-    kv_buffers,
-    mamba_buffers,
-    allocator,
-    mamba_allocator=None,
-    hold_l2_refs: Optional[
-        Callable[[Sequence[int], Sequence[int]], None]] = None,
-    reset_keep: Callable[[list], None],
-    set_keep: Callable[[object, Tuple[Tuple[int, int], ...]], None],
-    manifest_path: str,
     log: Callable[[str], None],
-) -> Optional[RetainResult]:
-    """Run the whole L1.5 retain round at D's sleep; None means "skip it".
-
-    None is returned ONLY before anything was touched: an empty hold set
-    (the caller runs today's reset) or a step 1-2 planning failure (logged as
-    "L15-RETAIN skipped reason=..."). From step 3 on, exceptions re-raise --
-    the buffers are half-moved by then and the group must not be told this
-    rank holds memory it does not.
-
-    ``node_of``/``reset_keep``/``set_keep`` are the injectable bindings to
-    the tree cache and the TMS (L15-03/L15-06); the real binding is the
-    L15-11b scheduler hook. ``l2_of(rid)`` yields the suffix's
-    ``(l2_slots, l2_gens)`` for the manifest.
-
-    ``rewrite_tree(node, kv_map, anchor_map, visited)`` is the injected
-    rewrite of the REAL tree (L15-11d): the old step (4) wrote
-    kv_slots/anchor_slot attributes that only the unit-test fakes have;
-    the real UnifiedTreeNode carries the KV indices in
-    component_data[FULL].value of every chain node and the anchor slot in
-    the mamba value, so the remap has to touch those. ``visited`` is a
-    set shared across the held requests of this call so a shared prefix
-    chain is remapped exactly once (id(node) -- UnifiedTreeNode.id is an
-    int counter, not the identity).
-    """
-    # Materialise once: select_hold (step 1) and the cand_depth map (step 8)
-    # both walk ``candidates``. A generator argument would be exhausted after
-    # step 1, and step 8 would then KeyError AFTER the buffers already moved --
-    # a half state that must re-raise, not masquerade as a benign skip.
+) -> Optional["RoundPlan"]:
+    """Steps (1)-(2) of :func:`retain_at_sleep` (select_hold, compact_plan,
+    anchor_plan). None = benign skip, nothing touched (logged as before)."""
     candidates = list(candidates)
-    # L15-FLIPCOST: per-step wall clock, printed on the L15-RETAIN line
-    import time as _time
-    _t = [_time.perf_counter()]
-    _ms: list = []
-
-    def _lap(name: str) -> None:
-        now = _time.perf_counter()
-        _ms.append("%s:%.0f" % (name, (now - _t[0]) * 1000.0))
-        _t[0] = now
-
-    _t0 = _t[0]
-
     # (1) who stays
     try:
         hs = select_hold(candidates, caps_rows_by_rank, cap_anchor_slots)
@@ -353,6 +315,126 @@ def retain_at_sleep(
         rid: anchor_map.get(int(anchor_slot_of(rid)), int(anchor_slot_of(rid)))
         for rid in hs.rids
     }
+    return RoundPlan(hs=hs, plan=plan, a_h=a_h, anchor_moves=anchor_moves, new_anchors=new_anchors)
+
+
+def manifest_of_plan(
+    rp: "RoundPlan",
+    *,
+    candidates: Iterable,
+    l2_of: Callable[[str], Tuple[Sequence[int], Sequence[int]]],
+    anchor_l2_of: Callable[[str], Tuple[int, int]],
+    l2_lanes_of: Callable[[str], Tuple[int, ...]],
+    epoch: int,
+    pid: int,
+) -> Manifest:
+    """The manifest step (8) publishes, built from the plan alone (all of it
+    is known after steps 1-2: the new slots, the bind-time L2 snapshot)."""
+    cand_depth = {c.rid: int(c.kv_depth) for c in candidates}
+    spans = tuple(
+        HoldSpan(
+            rid=rid,
+            depth=cand_depth[rid],
+            slots=tuple(int(s) for s in rp.plan.new_slots[rid]),
+            anchor_slot=rp.new_anchors[rid],
+            l2_slots=tuple(int(x) for x in l2_of(rid)[0]),
+            l2_gens=tuple(int(x) for x in l2_of(rid)[1]),
+            # L15-12c-E2a: the anchor's L2 identity for the cap-0 wake
+            anchor_l2_slot=int(anchor_l2_of(rid)[0]),
+            anchor_l2_gen=int(anchor_l2_of(rid)[1]),
+            # L15-12c-P1: the lane each held token owns in its L2 page
+            l2_lanes=tuple(int(x) for x in l2_lanes_of(rid)),
+        )
+        for rid in rp.hs.rids
+    )
+    return Manifest(
+        epoch=int(epoch),
+        pid=int(pid),
+        spans=spans,
+        rows_by_rank=tuple(int(x) for x in rp.plan.rows_by_rank),
+        anchor_slots=int(rp.a_h),
+    )
+
+
+def retain_at_sleep(
+    *,
+    candidates: Iterable,
+    node_of: Callable[[str], object],
+    slots_of: Callable[[str], Sequence[int]],
+    anchor_slot_of: Callable[[str], int],
+    l2_of: Callable[[str], Tuple[Sequence[int], Sequence[int]]],
+    anchor_l2_of: Callable[[str], Tuple[int, int]] = _no_anchor_l2,
+    l2_lanes_of: Callable[[str], Tuple[int, ...]] = _no_l2_lanes,
+    rewrite_tree: Callable[
+        [object, Dict[int, int], Dict[int, int], set], None
+    ],
+    caps_rows_by_rank: Sequence[int],
+    cap_anchor_slots: int,
+    prefix: Sequence[int],
+    rank: int,
+    epoch: int,
+    pid: int,
+    kv_buffers,
+    mamba_buffers,
+    allocator,
+    mamba_allocator=None,
+    hold_l2_refs: Optional[
+        Callable[[Sequence[int], Sequence[int]], None]] = None,
+    reset_keep: Callable[[list], None],
+    set_keep: Callable[[object, Tuple[Tuple[int, int], ...]], None],
+    manifest_path: str,
+    log: Callable[[str], None],
+    planned: Optional["RoundPlan"] = None,
+) -> Optional[RetainResult]:
+    """Run the whole L1.5 retain round at D's sleep; None means "skip it".
+
+    None is returned ONLY before anything was touched: an empty hold set
+    (the caller runs today's reset) or a step 1-2 planning failure (logged as
+    "L15-RETAIN skipped reason=..."). From step 3 on, exceptions re-raise --
+    the buffers are half-moved by then and the group must not be told this
+    rank holds memory it does not.
+
+    ``node_of``/``reset_keep``/``set_keep`` are the injectable bindings to
+    the tree cache and the TMS (L15-03/L15-06); the real binding is the
+    L15-11b scheduler hook. ``l2_of(rid)`` yields the suffix's
+    ``(l2_slots, l2_gens)`` for the manifest.
+
+    ``rewrite_tree(node, kv_map, anchor_map, visited)`` is the injected
+    rewrite of the REAL tree (L15-11d): the old step (4) wrote
+    kv_slots/anchor_slot attributes that only the unit-test fakes have;
+    the real UnifiedTreeNode carries the KV indices in
+    component_data[FULL].value of every chain node and the anchor slot in
+    the mamba value, so the remap has to touch those. ``visited`` is a
+    set shared across the held requests of this call so a shared prefix
+    chain is remapped exactly once (id(node) -- UnifiedTreeNode.id is an
+    int counter, not the identity).
+    """
+    # Materialise once: select_hold (step 1) and the cand_depth map (step 8)
+    # both walk ``candidates``. A generator argument would be exhausted after
+    # step 1, and step 8 would then KeyError AFTER the buffers already moved --
+    # a half state that must re-raise, not masquerade as a benign skip.
+    candidates = list(candidates)
+    # L15-FLIPCOST: per-step wall clock, printed on the L15-RETAIN line
+    import time as _time
+    _t = [_time.perf_counter()]
+    _ms: list = []
+
+    def _lap(name: str) -> None:
+        now = _time.perf_counter()
+        _ms.append("%s:%.0f" % (name, (now - _t[0]) * 1000.0))
+        _t[0] = now
+
+    _t0 = _t[0]
+
+    # (1)-(2) who stays, where the survivors land (pure; nothing touched)
+    rp = planned if planned is not None else plan_round(
+        candidates=candidates, slots_of=slots_of, anchor_slot_of=anchor_slot_of,
+        caps_rows_by_rank=caps_rows_by_rank, cap_anchor_slots=cap_anchor_slots,
+        prefix=prefix, epoch=epoch, log=log)
+    if rp is None:
+        return None
+    hs, plan, a_h = rp.hs, rp.plan, rp.a_h
+    anchor_moves, new_anchors = rp.anchor_moves, rp.new_anchors
 
     _lap("plan")
     # (3) rows land in the compact buffers: kv rows of THIS rank, every rank
@@ -457,30 +539,9 @@ def retain_at_sleep(
 
     _lap("keep")
     # (8) publish the hold for the group agreement
-    cand_depth = {c.rid: int(c.kv_depth) for c in candidates}
-    spans = tuple(
-        HoldSpan(
-            rid=rid,
-            depth=cand_depth[rid],
-            slots=tuple(int(s) for s in plan.new_slots[rid]),
-            anchor_slot=new_anchors[rid],
-            l2_slots=tuple(int(x) for x in l2_of(rid)[0]),
-            l2_gens=tuple(int(x) for x in l2_of(rid)[1]),
-            # L15-12c-E2a: the anchor's L2 identity for the cap-0 wake
-            anchor_l2_slot=int(anchor_l2_of(rid)[0]),
-            anchor_l2_gen=int(anchor_l2_of(rid)[1]),
-            # L15-12c-P1: the lane each held token owns in its L2 page
-            l2_lanes=tuple(int(x) for x in l2_lanes_of(rid)),
-        )
-        for rid in hs.rids
-    )
-    manifest = Manifest(
-        epoch=int(epoch),
-        pid=int(pid),
-        spans=spans,
-        rows_by_rank=tuple(int(x) for x in plan.rows_by_rank),
-        anchor_slots=int(a_h),
-    )
+    manifest = rp.manifest if rp.manifest is not None else manifest_of_plan(
+        rp, candidates=candidates, l2_of=l2_of, anchor_l2_of=anchor_l2_of,
+        l2_lanes_of=l2_lanes_of, epoch=epoch, pid=pid)
     manifest_write(manifest_path, manifest)
 
     # (9) the one line
