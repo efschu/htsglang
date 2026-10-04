@@ -10298,6 +10298,7 @@ class Scheduler(
                 "WEG2-PP-WAITING-ABORT held rid=%s pp_rank=%s: still in this follower's "
                 "waiting queue -- applied when PP0's forwarded schedule decides it (#1180-W)",
                 r.rid, getattr(ps, "pp_rank", 0))
+        _q693.note_hold(self, recv_req, held)  # #1430q: records the held objects; a no-op unless the env is on
         return True
 
     def _weg2_process_waiting_aborts(self) -> None:
@@ -10306,6 +10307,7 @@ class Scheduler(
         if not pend:
             return
         from sglang.srt.weg2.pp_abort import follower_waiting_abort_verdict
+        from sglang.srt.weg2 import dual_untold_abort as _q693_1470
 
         try:
             sched = self._pp_scheduled_extents()
@@ -10327,6 +10329,10 @@ class Scheduler(
             del pend[rid]
             logger.info("WEG2-PP-WAITING-ABORT %s rid=%s pp_rank=%s misses=%d (#1180-W)",
                         verdict, rid, getattr(self.ps, "pp_rank", 0), misses)
+            # #1470 (dual P follower, env default OFF -> False at once): a 'pop' with a newer instance of the
+            # rid queued removes only the held objects; the hold record is discarded for every verdict
+            if _q693_1470.settle_hold(self, rid, verdict):
+                continue
             if verdict in ("chunked", "pop"):
                 self._weg2_force_waiting_abort.add(rid)
                 self._abort_request_now(AbortReq(rid=rid, finished_reason=getattr(

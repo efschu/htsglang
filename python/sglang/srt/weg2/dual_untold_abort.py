@@ -72,7 +72,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,13 @@ def note_list(scheduler: Any, recv_reqs: Sequence[Any], env=None) -> None:
             setattr(scheduler, LIST_ATTR, None)
         except Exception:  # noqa: BLE001
             pass
+        return
+    # #1430q (default OFF = nothing below runs): a told verdict of a LATER list drops the held zombie
+    if later_told_drop_on(e):
+        try:
+            drop_later_told_zombies(scheduler, recv_reqs)
+        except Exception:  # noqa: BLE001 - advisory: without the drop the #1180-W hold stands (old behaviour)
+            logger.warning("#1430q LATER-TOLD-DROP raised, hold kept", exc_info=True)
 
 
 def told_in_same_list(scheduler: Any, recv_req: Any, rid: Any) -> bool:
@@ -190,3 +197,247 @@ def applies_at_receipt(scheduler: Any, held: Sequence[Any], env=None, recv_req: 
         MARK, ",".join(str(getattr(r, "rid", "?")) for r in held),
         getattr(getattr(scheduler, "ps", None), "pp_rank", "?"), n)
     return True
+
+
+# ---------------------------------------------------------------------------------------------
+# #1430q LATER-TOLD DROPS HELD ZOMBIE (27B NVFP4 dual B9, boot ...fs10041420_662e99d96c, P PP1 death
+# 14:49:55Z, desk/done/1430-b9-tod-told-hop.md). Env SGLANG_WEG2_DUAL_LATER_TOLD_DROP, DEFAULT OFF.
+#
+#   14:46:57  PP0 grants/tells instance 1 of weg2-0-103; PP1/PP2 absorb its told.
+#   14:48:33  INTAKE-STALL: PP0 pops instance 1 unadmitted (Q-580 TOLD-FORGET); the front re-sends
+#             the SAME rid as instance 2.
+#   14:48:44  PP1/PP2: the abort finds a told from an EARLIER list -> neither Q-693 nor Q-697 apply,
+#             '#1180-W held': instance 1 stays queued (the zombie).
+#   14:49:01  PP0's told for instance 2 reaches PP1; the plan hands it to the queued objects of the
+#             rid (the zombie among them), the #791T probe maps rid 103 to the object with
+#             'queued(told=-)' -> 4 laps -> PpRowDeferCapExceeded. The #1180-W verdict reads the
+#             rid ('keep' for ever once PP0 names it for instance 2), never the object.
+#
+# THE RULE. PP0 issues ONE told verdict per request instance and pops a still-unadmitted instance at
+# the abort (a chunked-aborted one gets no further verdict). A told verdict for the rid in a list
+# AFTER the list whose abort this follower holds therefore belongs to a NEW instance: the instance
+# the hold was made for is a zombie. It is taken out of the waiting queue object-exactly (identity of
+# the objects the hold recorded -- never AbortReq(rid), which matches the prefix and takes instance 2
+# along) once
+#   (a) at least ``pp_size`` PP0 lists passed since the hold: every frame PP0 launched for the old
+#       instance before it read the abort has reached this stage by then (the ring lag is
+#       pp_size-1 passes) -- a count of PP0's own lists, no wall clock, the same on every follower;
+#   (b) the zombie is still FRESH here (never admitted: no pool row, not retracted, not parked) --
+#       one that already runs is a chunked request and keeps the #1180-W path.
+# The decision reads only the list contents, the hold record and these object facts: no clock, no
+# rank-local policy. The told records themselves stay untouched (the new instance's verdict is
+# absorbed right after this call and belongs to it).
+# ---------------------------------------------------------------------------------------------
+LATER_TOLD_ENV = "SGLANG_WEG2_DUAL_LATER_TOLD_DROP"
+MARK_LATER = "#1430q LATER-TOLD-DROP"
+HOLDS_ATTR = "_q1430q_holds"
+_TRUE = ("1", "true", "yes", "on")
+
+
+def later_told_drop_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    return str(e.get(LATER_TOLD_ENV, "")).strip().lower() in _TRUE
+
+
+def _gate(env=None) -> bool:
+    """Dual P layout armed + the env on (the flip / NF / INT8 forms never get here)."""
+    e = os.environ if env is None else env
+    if not later_told_drop_on(e):
+        return False
+    if str(e.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() != "1":
+        return False
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    return bool(_dpk.armed(e))
+
+
+def _log_due(n: int) -> bool:
+    return n <= 8 or (n & (n - 1)) == 0
+
+
+POP_TWIN_ENV = "SGLANG_WEG2_DUAL_POP_KEEPS_TWIN"
+MARK_POP_TWIN = "#1470 POP-KEEPS-TWIN"
+
+
+def pop_keeps_twin_on(env=None) -> bool:
+    e = os.environ if env is None else env
+    return str(e.get(POP_TWIN_ENV, "")).strip().lower() in _TRUE
+
+
+def _pop_gate(env=None) -> bool:
+    """Dual P layout armed + the #1470 env on (the flip / NF / INT8 forms never get here)."""
+    e = os.environ if env is None else env
+    if not pop_keeps_twin_on(e):
+        return False
+    if str(e.get("SGLANG_WEG2_DUAL_LAYOUT", "")).strip() != "1":
+        return False
+    from sglang.srt.weg2 import dual_p_kv_stage as _dpk
+
+    return bool(_dpk.armed(e))
+
+
+def note_hold(scheduler: Any, recv_req: Any, held: Sequence[Any], env=None) -> None:
+    """The #1180-W hold of ``recv_req`` was just made for the queued ``held`` objects: record
+    the OBJECTS (identity) per rid. Default OFF / PP0 / off the dual P layout: nothing written."""
+    try:
+        if not (_gate(env) or _pop_gate(env)):
+            return
+        if int(getattr(getattr(scheduler, "ps", None), "pp_rank", 0) or 0) <= 0:
+            return
+        recs = scheduler.__dict__.setdefault(HOLDS_ATTR, {}) if hasattr(scheduler, "__dict__") else None
+        if recs is None:
+            return
+        for r in held:
+            rid = str(getattr(r, "rid", ""))
+            if not rid:
+                continue
+            rec = recs.get(rid)
+            if rec is None or rec["recv"] is not recv_req:
+                rec = recs[rid] = {"recv": recv_req, "objs": [], "lists": 0}
+            rec["objs"].append(r)
+    except Exception:  # noqa: BLE001 - advisory
+        pass
+
+
+def _zombies_of(rec: dict, wq: Sequence[Any]) -> List[Any]:
+    """The queued objects the hold was made for -- by IDENTITY, never by rid (a rid match would
+    take the new instance, which carries the same rid, along)."""
+    return [r for r in (wq or ()) if any(r is z for z in rec["objs"])]
+
+
+def _remove_zombie_objects(scheduler: Any, rid: str, zombies: Sequence[Any], wq: Any) -> None:
+    """Take ``zombies`` (objects, by identity) out of the waiting queue ``wq``; the told records of the rid
+    are NOT touched (they belong to the rid's newer instance)."""
+    zid = {id(z) for z in zombies}
+    for i in reversed(range(len(wq))):
+        if id(wq[i]) in zid:
+            wq.pop(i)
+    held_map = getattr(scheduler, "_weg2_store_held", None)
+    if isinstance(held_map, dict) and any(held_map.get(rid) is z for z in zombies):
+        held_map.pop(rid, None)  # the follower's intake hold of the zombie leaves with it
+    if getattr(scheduler, "enable_hicache_storage", False) and not any(
+            str(getattr(r, "rid", "")) == rid for r in wq):
+        try:
+            scheduler.tree_cache.release_aborted_request(rid)  # only when no twin shares the rid's prefetch
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def drop_later_told_zombies(scheduler: Any, recv_reqs: Sequence[Any]) -> List[str]:
+    """Called with PP0's list BEFORE its told verdicts are absorbed (``note_list``). Returns the
+    rids whose held zombie was dropped."""
+    recs = getattr(scheduler, HOLDS_ATTR, None)
+    if not recs:
+        return []
+    pend = getattr(scheduler, "_weg2_pending_waiting_aborts", None) or {}
+    verdict_rids = set()
+    for item in recv_reqs or ():
+        rid = _told_verdict_rid(item)
+        if rid is not None:
+            verdict_rids.add(rid)
+    laps = max(1, int(getattr(getattr(scheduler, "ps", None), "pp_size", 1) or 1))
+    dropped: List[str] = []
+    for rid, rec in list(recs.items()):
+        rec["lists"] += 1
+        ent = pend.get(rid)
+        if ent is None or ent[0] is not rec["recv"]:
+            recs.pop(rid, None)  # the hold was released (verdict / vote) or replaced: nothing to drop
+            continue
+        if rid not in verdict_rids:
+            continue
+        wq = getattr(scheduler, "waiting_queue", None)
+        zombies = _zombies_of(rec, wq)
+        if not zombies:
+            recs.pop(rid, None)
+            continue
+        why = None
+        if rec["lists"] < laps:
+            why = "early"
+        elif not all(_fresh(z) for z in zombies):
+            why = "admitted"
+        if why is not None:
+            n = int(getattr(scheduler, "_q1430q_skip_n", 0) or 0) + 1
+            scheduler._q1430q_skip_n = n
+            if _log_due(n):
+                logger.warning(
+                    "%s skip=%s rid=%s pp_rank=%s lists_since_hold=%d laps=%d n=%d: old #1180-W hold kept",
+                    MARK_LATER, why, rid, getattr(scheduler.ps, "pp_rank", "?"), rec["lists"], laps, n)
+            continue
+        _remove_zombie_objects(scheduler, rid, zombies, wq)
+        pend.pop(rid, None)
+        recs.pop(rid, None)
+        dropped.append(rid)
+        n = int(getattr(scheduler, "_q1430q_drop_n", 0) or 0) + 1
+        scheduler._q1430q_drop_n = n
+        if _log_due(n):
+            logger.warning(
+                "%s rid=%s pp_rank=%s dropped=%d twins_left=%d lists_since_hold=%d n=%d: a told verdict of "
+                "a LATER PP0 list than the held abort belongs to a NEW instance of this rid; the held "
+                "unadmitted instance is a zombie, taken out of the waiting queue by object (never by "
+                "rid) (#1430 B9 14:49:55 weg2-0-103)",
+                MARK_LATER, rid, getattr(scheduler.ps, "pp_rank", "?"), len(zombies),
+                sum(1 for r in wq if str(getattr(r, "rid", "")) == rid), rec["lists"], n)
+    return dropped
+
+
+# ---------------------------------------------------------------------------------------------
+# #1470 POP KEEPS TWIN (27B NVFP4 dual B9b, boot ...fs10041535_df1fa730cf, P PP1 death 15:45:30Z, rid
+# weg2-0-89; desk/done/1470-b9b-tod-row-defer.md). Env SGLANG_WEG2_DUAL_POP_KEEPS_TWIN, DEFAULT OFF.
+#
+#   15:45:29.38  front DUAL P-PAUSE (D short of KV) aborts P legs 82/85/89; PP0 pops the unadmitted 85/89
+#                at receipt (Q-580 TOLD-FORGET); PP1/PP2 hold both aborts (#1180-W: a told of an earlier
+#                list stands).
+#   15:45:29.94  the front RESUMES 89 (550 ms later): the same rid returns as instance 2 -- PP0 grants/tells it.
+#   15:45:30     PP1 pass B: instance 2 arrives (REQ RE-CONSTRUCTED instance=2) and its told is absorbed;
+#                the SAME pass's plan reaches ``misses=3`` (frames of ANOTHER rid, 82, three passes in a row)
+#                = verdict 'pop' -> ``AbortReq(rid)`` matches by PREFIX: instance 1 AND instance 2 leave the
+#                queue and Q-580 forgets the told just absorbed. PP0's frame for instance 2 (rid 89, 0..68)
+#                then names a rid this rank cannot locate -> 4 probes -> PpRowDeferCapExceeded, PP1 dead
+#                (PP2 popped alike, one pass behind).
+#
+# Q-698 (#1430q) does not cover this: it needs >= pp_size lists since the hold, while the pop needs
+# pp_size miss-frames counted from the hold pass itself -- the pop wins whenever the new told rides a
+# list that early (here lists=2 vs misses=3).
+#
+# THE RULE. PP0 popped the instances that existed when it read the abort; whatever is queued under the
+# rid afterwards is NEW. A 'pop' verdict therefore removes exactly the objects the hold recorded (never
+# AbortReq(rid)) when a different object of the rid is queued (a twin), and leaves every told record
+# alone. No twin = the old path unchanged. The decision reads the PP0-derived verdict (unchanged inputs),
+# the hold record (objects present at the abort's receipt = PP0's population at its read) and object
+# facts: no clock, no rank-local policy; the end state (old instances gone, new instance + its told
+# intact) is the one PP0 holds on every follower, whenever the new instance arrives.
+# ---------------------------------------------------------------------------------------------
+def settle_hold(scheduler: Any, rid: str, verdict: str, env=None) -> bool:
+    """The #1180-W hold of ``rid`` was just decided (``verdict``) and removed from the pending map.
+    Returns True = the 'pop' was applied here object-exactly and the caller must NOT issue AbortReq(rid);
+    False = the caller continues with the old path. Always discards the hold record. Env off: False at once."""
+    try:
+        recs = getattr(scheduler, HOLDS_ATTR, None)
+        rec = recs.pop(rid, None) if recs else None
+        if verdict != "pop" or rec is None or not _pop_gate(env):
+            return False
+        if int(getattr(getattr(scheduler, "ps", None), "pp_rank", 0) or 0) <= 0:
+            return False
+        wq = getattr(scheduler, "waiting_queue", None)
+        if wq is None:
+            return False
+        zombies = _zombies_of(rec, wq)
+        zid = {id(z) for z in zombies}
+        twins = [r for r in wq if str(getattr(r, "rid", "")) == rid and id(r) not in zid]
+        if not zombies or not twins:
+            return False  # nobody to spare: the old rid-wide abort (and its told forget) is right
+        if not all(_fresh(z) for z in zombies):
+            return False  # a zombie that already runs is a chunked request: old path
+        _remove_zombie_objects(scheduler, rid, zombies, wq)
+        n = int(getattr(scheduler, "_q1470_pop_n", 0) or 0) + 1
+        scheduler._q1470_pop_n = n
+        if _log_due(n):
+            logger.warning(
+                "%s rid=%s pp_rank=%s dropped=%d twins_kept=%d n=%d: PP0 popped the instance(s) this hold was made "
+                "for; a NEWER instance of the rid is queued -- only the held objects left (never AbortReq(rid): "
+                "its prefix match takes the new instance and its told along) (#1470 B9b 15:45:30 weg2-0-89)",
+                MARK_POP_TWIN, rid, getattr(scheduler.ps, "pp_rank", "?"), len(zombies), len(twins), n)
+        return True
+    except Exception:  # noqa: BLE001 - advisory: without it the old rid-wide pop runs
+        logger.warning("#1470 POP-KEEPS-TWIN raised, old pop kept", exc_info=True)
+        return False
