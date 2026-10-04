@@ -205,6 +205,151 @@ DATA_OFF = 1 * MIB
 DATA_BYTES = N_PAIRS * SLOTS_PER_PAIR * SLOT_BYTES
 REGION_BYTES = DATA_OFF + DATA_BYTES
 
+# --------------------------------------------------------------------------
+# HW-P1c 1003 (XCHG-REGION): THE GEOMETRY IS A FUNCTION OF THE CARD COUNT.
+#
+# User order 03.10. ~19:30Z: "unsere software muss mit beliebiger anzahl an
+# karten ... laufen". Every name above is the N = 3 value the reference rig is
+# proven on; :func:`geometry` derives the same names for any N in
+# [:data:`MIN_N_CARDS`, :data:`MAX_N_CARDS`] and :func:`configure` installs
+# them into this module. At N = 3 every derived value equals the literal
+# above (a unit test pins each one), so the reference rig's region is
+# byte-identical.
+#
+# HOW A RANK LEARNS N: from ``SGLANG_WEG2_XCHG_N_CARDS``, read ONCE at import
+# (so every module that imports this one -- transport, shadow, the manifest --
+# derives ITS dir sub-layout from the same N before it computes a constant).
+# The launcher sets it in both groups' env (:func:`prepare_region`) for N != 3
+# and calls :func:`configure` for its own process; an unset variable is 3.
+# The region header carries n_ranks / region_bytes / data_off, which
+# :meth:`XchgRegion.open` checks: a rank that disagrees about N refuses BY
+# NAME (W68) instead of addressing another layout.
+#
+# What scales with N (and nothing else changes):
+#   * the directed cross pairs: n(n-1), in the same (src, dst) order;
+#   * the slot table after the header (48 B per slot) pushes the gate rows,
+#     the matrix and the dir area to the next 4 KiB boundary when it no
+#     longer fits 4 KiB;
+#   * the matrix row carries 2 * N_RANKS cells + 5 words + the seal, rounded
+#     up to 64 B (192 B until N_RANKS = 8);
+#   * the per-rank "registered" bytes (header word 6 holds 8) move behind the
+#     boot string once N_RANKS > 8;
+#   * the dir area grows by 96 KiB per rank (the shadow manifest row) above
+#     N = 3, in whole MiB: the data area follows it.
+# --------------------------------------------------------------------------
+
+ENV_N_CARDS = "SGLANG_WEG2_XCHG_N_CARDS"
+#: the card count the reference rig and every literal above are proven on
+DEFAULT_N_CARDS = 3
+MIN_N_CARDS = 2
+#: BARLINK_BAR1_MAX_RANKS (barlink_bar1_ext.py #define 8): no group has more ranks
+MAX_N_CARDS = 8
+#: shadow manifest row (weight_exchange_shadow.MANIFEST_ROW_BYTES), per rank
+_DIR_PER_RANK_BYTES = 96 * KIB
+#: ptr table (128 KiB) + handles + on-card rows + shadow rows, with headroom
+_DIR_FIXED_BYTES = 256 * KIB
+#: one directed pair's staging bytes; a module-level product on purpose: the carrier-size
+#: ratchet (test_weg2_xchg_carrier_one_authority_1333) allows exactly one FUNCTION to
+#: multiply SLOTS_PER_PAIR by bytes
+_PAIR_DATA_BYTES = SLOTS_PER_PAIR * SLOT_BYTES
+_GEOMETRY_NAMES = (
+    "N_CARDS", "N_RANKS", "CROSS_PAIRS", "N_PAIRS", "N_SLOTS", "REGISTERED_OFF", "SLOTS_OFF",
+    "GATE_OFF", "MATRIX_OFF", "MATRIX_ROW_BYTES", "MATRIX_PAYLOAD_STRUCT", "MATRIX_SEAL_OFF",
+    "MX_PLAN_HASH", "MX_EPOCH_HASH", "MX_PID", "MX_LOCAL_OK", "MX_ONCARD_MODE",
+    "DIR_OFF", "DATA_OFF", "DATA_BYTES", "REGION_BYTES",
+)
+
+
+def _up(value: int, unit: int) -> int:
+    return -(-int(value) // int(unit)) * int(unit)
+
+
+def geometry(n_cards: int) -> Dict[str, object]:
+    """The region geometry of an ``n_cards`` launch (pure; installs nothing).
+    Raises ``ValueError`` outside [:data:`MIN_N_CARDS`, :data:`MAX_N_CARDS`]."""
+    n = int(n_cards)
+    if not MIN_N_CARDS <= n <= MAX_N_CARDS:
+        raise ValueError(
+            f"the exchange region is laid out for {MIN_N_CARDS}..{MAX_N_CARDS} cards, not {n} "
+            f"(one card has no cross pair; the BAR1 collectives address at most {MAX_N_CARDS} ranks)")
+    ranks = N_GROUPS * n
+    pairs = tuple((a, b) for a in range(n) for b in range(n) if a != b)
+    registered_off = HEADER_OFF + 6 * 8
+    slots_off = BOOT_STR_OFF + BOOT_STR_BYTES
+    if ranks > 8:
+        # header word 6 holds 8 bytes; more ranks get their own bytes behind the boot string
+        registered_off = slots_off
+        slots_off += _up(ranks, 16)
+    n_slots = len(pairs) * SLOTS_PER_PAIR
+    gate_off = max(4 * KIB, _up(slots_off + n_slots * SLOT_RECORD_BYTES, 4 * KIB))
+    # payload words: 2 cells per rank + plan hash, epoch hash, pid, local_ok, oncard mode
+    row_bytes = max(192, _up((2 * ranks + 5 + 1) * 8, 64))
+    matrix_off = max(8 * KIB, _up(gate_off + ranks * GATE_ROW_BYTES, 4 * KIB))
+    dir_off = max(64 * KIB, _up(matrix_off + ranks * row_bytes, 4 * KIB))
+    data_off = max(1 * MIB, _up(dir_off + _DIR_FIXED_BYTES + ranks * _DIR_PER_RANK_BYTES, MIB))
+    data_bytes = len(pairs) * _PAIR_DATA_BYTES
+    mx_plan = 2 * ranks
+    return {
+        "N_CARDS": n, "N_RANKS": ranks, "CROSS_PAIRS": pairs, "N_PAIRS": len(pairs),
+        "N_SLOTS": n_slots, "REGISTERED_OFF": registered_off, "SLOTS_OFF": slots_off,
+        "GATE_OFF": gate_off, "MATRIX_OFF": matrix_off, "MATRIX_ROW_BYTES": row_bytes,
+        "MATRIX_PAYLOAD_STRUCT": struct.Struct(f"<{row_bytes // 8 - 1}Q"),
+        "MATRIX_SEAL_OFF": row_bytes - 8,
+        "MX_PLAN_HASH": mx_plan, "MX_EPOCH_HASH": mx_plan + 1, "MX_PID": mx_plan + 2,
+        "MX_LOCAL_OK": mx_plan + 3, "MX_ONCARD_MODE": mx_plan + 4,
+        "DIR_OFF": dir_off, "DATA_OFF": data_off, "DATA_BYTES": data_bytes,
+        "REGION_BYTES": data_off + data_bytes,
+    }
+
+
+def layout_problems(n_cards: int) -> List[str]:
+    """What keeps an ``n_cards`` region from being laid out (empty = it can be):
+    the topology blocker's probe. Checks the derived geometry is self-consistent
+    (areas ordered and disjoint, every matrix word inside its row, the pair table
+    complete)."""
+    try:
+        g = geometry(n_cards)
+    except ValueError as exc:
+        return [str(exc)]
+    n = int(n_cards)
+    out: List[str] = []
+    if g["N_PAIRS"] != n * (n - 1):
+        out.append(f"{g['N_PAIRS']} cross pairs, {n * (n - 1)} directed pairs needed")
+    if not (g["SLOTS_OFF"] + g["N_SLOTS"] * SLOT_RECORD_BYTES <= g["GATE_OFF"]
+            and g["GATE_OFF"] + g["N_RANKS"] * GATE_ROW_BYTES <= g["MATRIX_OFF"]
+            and g["MATRIX_OFF"] + g["N_RANKS"] * g["MATRIX_ROW_BYTES"] <= g["DIR_OFF"]
+            and g["DIR_OFF"] < g["DATA_OFF"]):
+        out.append("header / slot table / gate / matrix / dir areas overlap")
+    if g["MX_ONCARD_MODE"] >= g["MATRIX_PAYLOAD_STRUCT"].size // 8:
+        out.append("the matrix row cannot hold its words")
+    if g["REGISTERED_OFF"] + g["N_RANKS"] > g["SLOTS_OFF"] and g["REGISTERED_OFF"] != HEADER_OFF + 48:
+        out.append("the registered bytes overlap the slot table")
+    return out
+
+
+def configure(n_cards: int) -> int:
+    """Install the geometry of ``n_cards`` cards into this module (the names in
+    ``_GEOMETRY_NAMES``). Returns the previous count. Idempotent; the launcher
+    calls it for its own process once the inventory is known (the ranks learn N
+    from :data:`ENV_N_CARDS` at import)."""
+    prev = int(globals().get("N_CARDS", DEFAULT_N_CARDS))
+    globals().update(geometry(n_cards))
+    return prev
+
+
+def _n_from_env() -> int:
+    raw = str(os.environ.get(ENV_N_CARDS, "") or "").strip()
+    if not raw:
+        return DEFAULT_N_CARDS
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{ENV_N_CARDS}={raw!r} is not a card count") from None
+
+
+if _n_from_env() != DEFAULT_N_CARDS:
+    configure(_n_from_env())
+
 XCHG_MAGIC = int.from_bytes(b"WEG2XCHG", "little")
 XCHG_VERSION = 2
 
@@ -824,6 +969,14 @@ class XchgRegion:
         """
         fd = os.open(path, os.O_RDWR)
         try:
+            have = os.fstat(fd).st_size
+            if have < REGION_BYTES:
+                # HW-P1c: a rank laid out for more cards than the creator's (the
+                # geometry is a function of N) would mmap past the file: refuse BY NAME
+                raise Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree path={path}: the region file is {have} bytes, this "
+                    f"build's geometry for {N_CARDS} cards needs {REGION_BYTES} ({ENV_N_CARDS} "
+                    f"disagrees between the creator and this rank)")
             mm = mmap.mmap(fd, REGION_BYTES, mmap.MAP_SHARED,
                            mmap.PROT_READ | mmap.PROT_WRITE)
         except BaseException:
@@ -2137,10 +2290,15 @@ def prepare_region(
         line = region_line(region)
         if log is not None:
             log(line)
+        env = {ENV_REGION_PATH: region.path, ENV_REGION_BOOT: str(boot_nonce)}
+        if int(N_CARDS) != DEFAULT_N_CARDS:
+            # HW-P1c: the ranks derive THEIR geometry from this at import; the
+            # reference rig's env stays byte-identical (nothing added at N = 3)
+            env[ENV_N_CARDS] = str(int(N_CARDS))
         return {
             "path": region.path,
             "boot": str(boot_nonce),
-            "env": {ENV_REGION_PATH: region.path, ENV_REGION_BOOT: str(boot_nonce)},
+            "env": env,
             "sems": len(sems),
             "line": line,
         }

@@ -395,10 +395,19 @@ def early_enabled(sched=None) -> bool:
     (``_l15_tree_retained`` is rank-uniform). A wake after a plain sleep has
     no tree to drop (L15-FIX-NOHOLD-TREE touches only a retaining rank), so
     the early read survives it -- the read runs again under L1.5 exactly then.
-    A retained hold (the wake may still keep nothing and reset) keeps the old
-    shape: no early read, the release-time read takes over. Without a
-    scheduler, or with SLEEP-AGREE off (``SGLANG_WEG2_L15_SLEEP_AGREE=0``),
-    L1.5 keeps the read off as before."""
+    A retained hold (the wake may still keep nothing and reset) kept the old
+    shape: no early read, the release-time read takes over -- until
+    L15-EARLY-READ (04.10., ``SGLANG_WEG2_L15_EARLY_READ``, default on): the
+    INT8 boot 4cf740ad50 showed that shape costs the P>D flip +0.9 s (the
+    hold wakes read after the reply, #1471 held_after_wake_s 1.3-2.4 s, a
+    second EXTEND pass). Now a retained hold early-reads exactly the rids the
+    whole group does NOT keep on the card, and only when every rank predicts
+    the same hold (:func:`issue_reads_at_wake_begin`); a tree reset the wake
+    makes after the issue (the group verdict ``fallback``, a rank's
+    no-hold drop) re-arms those reads (:func:`rearm_early_reads`) -- the N4f
+    loss, closed at its cause instead of by switching the read off.
+    Without a scheduler, or with SLEEP-AGREE off
+    (``SGLANG_WEG2_L15_SLEEP_AGREE=0``), L1.5 keeps the read off as before."""
     try:
         from sglang.srt.environ import envs
 
@@ -412,9 +421,31 @@ def early_enabled(sched=None) -> bool:
 
         if sched is None or not l15_sleep_agree.env_on(os.environ):
             return False
-        return not bool(getattr(sched, "_l15_tree_retained", False))
+        if not bool(getattr(sched, "_l15_tree_retained", False)):
+            return True
+        # L15-EARLY-READ (04.10.): a RETAINED hold keeps the early read too, but
+        # only for the rids the hold does not keep on the card and only when the
+        # whole group predicts the hold (issue_reads_at_wake_begin); a tree reset
+        # after the issue re-arms the reads (rearm_early_reads). =0 restores
+        # the release-time read under a retained hold (4cf740ad50).
+        return l15_early_read_on(os.environ)
     except Exception:  # noqa: BLE001
         return False
+
+
+#: L15-EARLY-READ: the kill switch of the early hold read under a RETAINED L1.5 hold
+L15_EARLY_READ_ENV = "SGLANG_WEG2_L15_EARLY_READ"
+
+
+def l15_early_read_on(env=None) -> bool:
+    """Default on; =0 restores the 4cf740ad50 shape (retained hold: no early read,
+    the release-time read takes over). Every D rank reads the same environment."""
+    env = os.environ if env is None else env
+    return str(env.get(L15_EARLY_READ_ENV, "1")).strip().lower() not in ("0", "false", "off", "no")
+
+
+def _retained(sched) -> bool:
+    return bool(getattr(sched, "_l15_tree_retained", False))
 
 
 def issued(req) -> bool:
@@ -522,12 +553,38 @@ def issue_reads_at_wake_begin(sched, max_n: Optional[int] = None) -> list:
     if _wk is not None and _fc is not None and _fc[0] == _wk:
         held = _fc[1]
     else:
+        _t_pred = time.perf_counter()
         held = l15_agreed_held_rids(sched)
+        _pred_ms = (time.perf_counter() - _t_pred) * 1000.0
+        try:
+            from sglang.srt.weg2 import l15_plan as _l15p
+
+            if _l15p.master_on(os.environ):
+                # L15-EARLY-READ: what the hold prediction (manifest read + fingerprint + the
+                # group gather, which waits for the slowest rank) costs on the critical path
+                logger.info("L15-EARLY-READ predict_ms=%.0f retained=%s agreed=%d (manifest read + "
+                            "fingerprint + gather, once per wake)", _pred_ms, _retained(sched), len(held))
+        except Exception:  # noqa: BLE001 -- an instrument only
+            pass
         if _wk is not None:
             try:
                 sched._weg2_l15_early_filter = (_wk, held)
             except Exception:  # noqa: BLE001 -- a stand-in scheduler: no cache
                 pass
+    if _retained(sched) and not held:
+        # L15-EARLY-READ: a retained hold the group does NOT predict as one (a
+        # rank without its manifest or vote, mixed fingerprints) ends in the
+        # fallback reset -- the read would be lost to it (N4f). Same verdict on
+        # every rank: ``held`` is the gather's result, ``_l15_tree_retained``
+        # the group's (SLEEP-AGREE). The release-time read serves it.
+        if _wk is None or getattr(sched, "_weg2_l15_early_skip_logged", None) != _wk:
+            logger.info("L15-EARLY-READ skipped: retained hold without an agreed hold prediction "
+                        "(the wake may reset the tree) -- the release reads %d rid(s)", len(hold))
+            try:
+                sched._weg2_l15_early_skip_logged = _wk
+            except Exception:  # noqa: BLE001
+                pass
+        return []
     if held:
         kept = [r for r in hold if str(getattr(r, "rid", "")) not in held]
         if len(kept) != len(hold):
@@ -540,6 +597,52 @@ def issue_reads_at_wake_begin(sched, max_n: Optional[int] = None) -> list:
         logger.info("#248 WAKE-READ-EARLY issued=%d at the weight legs' start (F22: the read runs "
                     "beside the legs, the settle finds it complete)", len(out))
     return out
+
+
+def rearm_early_reads(sched, reason: str) -> int:
+    """L15-EARLY-READ: the wake RESET the radix tree after the early hold reads
+    were issued (group verdict ``fallback``, or a rank's no-hold drop): the
+    reset released their arena references and wiped ``ongoing_prefetch`` and
+    ``prefetch_loaded_tokens_by_reqid`` -- and the #1471 settle reads an absent
+    record as "complete" (``_weg2_refetch_one``: no ``_1471_short``, no record
+    to compare), so the request would reach the X gate with nothing on the host
+    (N4f 1002_110321: W31, W50-REROUTE, ping-pong). Put every still-held request
+    that was read early back to its pre-read state -- deferred, not issued -- so
+    the release issues the read after the reset, exactly as without the early
+    read. Called only where the reset is group-uniform (the fallback act) or
+    followed by a group-uniform one; never inside a collective. Returns the
+    number of reads re-armed; never raises."""
+    n = 0
+    try:
+        hold = list(getattr(sched, "weg2_dormant_hold", None) or [])
+        for req in hold:
+            if not getattr(req, ISSUED_ATTR, False):
+                continue
+            setattr(req, ISSUED_ATTR, False)
+            setattr(req, DEFER_ATTR, True)
+            setattr(req, CAPWAIT_ATTR, False)
+            setattr(req, PAGES_ATTR, 0)
+            setattr(req, WAKE_ATTR, None)
+            if getattr(req, "prefetch_deferred", None) is not None:
+                req.prefetch_deferred = None
+            req._1471_short = False
+            for attr in ("_weg2_store_delivered", "_prefetch_span_tokens"):
+                if hasattr(req, attr):
+                    setattr(req, attr, None)
+            try:
+                from sglang.srt.weg2 import settle_writer as _sw
+
+                _sw.reset_for_wake(req)
+            except Exception:  # noqa: BLE001
+                pass
+            n += 1
+        if n:
+            logger.info("L15-EARLY-READ REARM n=%d reason=%s (the wake reset the tree after the early "
+                        "hold read: the release reads these again, never a 'complete' read of nothing)",
+                        n, reason)
+    except Exception as exc:  # noqa: BLE001 -- never break the wake
+        logger.warning("L15-EARLY-READ REARM failed (%s: %s)", type(exc).__name__, exc)
+    return n
 
 
 def after_release(reqs) -> None:

@@ -52,6 +52,7 @@ TWO PARTS, each behind its own switch (default off until metal), groups
 from __future__ import annotations
 
 import logging
+import time
 from typing import Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -163,6 +164,95 @@ def idle_publish(scheduler) -> Optional[dict]:
             "have published, published now)",
             LINE_IDLE, n, issued, stats.get("unbacked"), stats.get("pending"),
             stats.get("refused"), total)
+    return stats
+
+
+# ---- part 1b: the publisher between D decode rounds (PUBLISH-SWEEP-BG) ----------
+
+LINE_BG = "WEG2-PUBLISH-SWEEP-BG"
+
+
+def bg_publish_on() -> bool:
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG.get()) and _group_on()
+
+
+def bg_gate(scheduler) -> Optional[str]:
+    """None = a background pass may run now; else why not. Replicated state
+    only (every TP rank reaches the hook once per loop iteration)."""
+    if not getattr(scheduler, "enable_hierarchical_cache", False):
+        return "no_hicache"
+    tc = getattr(scheduler, "tree_cache", None)
+    if tc is None or not hasattr(tc, "publish_unbacked_sweep"):
+        return "no_sweep"
+    if getattr(scheduler, "weg2_dormant", False):
+        return "dormant"  # the KV pool is paused: nothing may read its pages
+    if getattr(scheduler, "_engine_paused", False):
+        return "paused"
+    rb = getattr(scheduler, "running_batch", None)
+    if rb is None or rb.is_empty():
+        return "idle"  # D-IDLE-PUBLISH's case (on_idle)
+    if len(getattr(scheduler, "waiting_queue", ()) or ()) > 0:
+        return "waiting"  # an admission is pending: no publish work before it
+    if getattr(scheduler, "chunked_req", None) is not None or getattr(scheduler, "anchor_tails", None):
+        return "chunked"
+    return None
+
+
+def bg_publish_tick(scheduler) -> Optional[dict]:
+    """One bounded background pass from the scheduler's group-uniform point
+    (after ``check_hicache_events``). The nodes the flip's flush would publish
+    (finished requests' tails, left un-backed by the write_back policy) are
+    published a few at a time WHILE D decodes, so the flush finds a small
+    backlog instead of 110-121 nodes (1.9-2.8 s of issue, INT8 boot
+    4cf740ad50). Cadence = ``forward_ct`` (replicated under TP lockstep, no
+    wall clock); at most ``..._MAX_ISSUE`` node(s) per pass; only nodes no
+    running request references whose parent is backed
+    (``publish_unbacked_sweep(background=True)``). The flush is untouched: what
+    is still un-backed at the flip is published there exactly as before, and
+    the write-throughs this issues are drained by the loop's own
+    ``check_hicache_events`` / the flush's join. Never raises."""
+    if not bg_publish_on():
+        return None
+    try:
+        from sglang.srt.environ import envs
+
+        every = max(1, int(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_EVERY.get()))
+        cap = max(1, int(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_ISSUE.get()))
+        max_tokens = max(0, int(envs.SGLANG_WEG2_PUBLISH_SWEEP_BG_MAX_TOKENS.get()))
+    except Exception:  # noqa: BLE001
+        every, cap, max_tokens = 64, 1, 8192
+    fct = int(getattr(scheduler, "forward_ct", 0) or 0)
+    if fct <= 0 or fct % every != 0:
+        return None
+    if getattr(scheduler, "_weg2_bg_publish_last_fct", None) == fct:
+        return None  # an iteration that ran no forward: once per forward count
+    if bg_gate(scheduler) is not None:
+        return None
+    scheduler._weg2_bg_publish_last_fct = fct
+    try:
+        stats = scheduler.tree_cache.publish_unbacked_sweep(
+            max_issue=cap, background=True, bg_max_tokens=max_tokens) or {}
+    except Exception as e:  # noqa: BLE001 -- a publisher never takes the loop down
+        logger.warning("%s raised %s: %s", LINE_BG, type(e).__name__, e)
+        return None
+    issued = int(stats.get("issued", 0) or 0)
+    n = int(getattr(scheduler, "_weg2_bg_publish_n", 0) or 0) + 1
+    scheduler._weg2_bg_publish_n = n
+    if issued:
+        total = int(getattr(scheduler, "_weg2_bg_publish_issued", 0) or 0) + issued
+        scheduler._weg2_bg_publish_issued = total
+        # one marker line per 30 s (review 1270 #8; monotonic, log only)
+        _now = time.monotonic()
+        if _now - float(getattr(scheduler, "_weg2_bg_publish_log_t", -1e9)) >= 30.0:
+            scheduler._weg2_bg_publish_log_t = _now
+            logger.info(
+                "%s pass=%d issued=%d unbacked=%s skipped_bg=%s pending=%s refused=%s "
+                "issue_ms=%s cumulative_issued=%d (D decoding: finished requests' un-backed "
+                "nodes published between rounds, not in the flip's flush)",
+                LINE_BG, n, issued, stats.get("unbacked"), stats.get("skipped_bg"),
+                stats.get("pending"), stats.get("refused"), stats.get("issue_ms"), total)
     return stats
 
 

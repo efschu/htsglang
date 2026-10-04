@@ -6,7 +6,8 @@ rank's environment. Unset, the full prefill graph's plan is flashinfer's own,
 byte for byte.
 
 WHY FLASHINFER CANNOT DO IT (0.6.14, data/include/flashinfer/attention/):
-* scheduler.cuh:717 ``int num_blocks_per_sm = 2;`` -- the prefill planner
+* scheduler.cuh:717 (0.7.0: still ``int num_blocks_per_sm = 2;`` and the
+  same PrefillBinarySearchKVChunkSize) ``int num_blocks_per_sm = 2;`` -- the prefill planner
   ASSUMES two CTAs per SM (the decode planners ask
   cudaOccupancyMaxActiveBlocksPerMultiprocessor): max_grid = 2 x 170 = 340 on
   the 5090, ``max_batch_size_if_split`` = 340 / 4 KV heads = 85.
@@ -47,12 +48,43 @@ wave fill at 192 x 7 = 1344 CTAs on 170 SMs) costs 44 MB of the float
 workspace, placed at its offset 0 (the stock plan only computes offsets there;
 nothing else lives in it during one attention call).
 
-CONTRACT, CHECKED rather than assumed: flashinfer 0.6.14, fa2 backend,
-page_size 1, a 15-field plan vector in the 0.6.14 order, one full-attention
-wrapper. Anything else at capture -> this module stands down for that wrapper
-and the stock plan stays (named once in the log). The GPU proof (graph split
-vs eager stock, and our arrays vs the C++ planner's own fixed-split arrays) is
+CONTRACT, CHECKED rather than assumed: a flashinfer version in
+``PLAN_FIELDS_BY_VERSION`` (0.6.14 and 0.7.0, the layout is looked up by the
+installed version, never assumed), fa2 backend, page_size 1, a 15-field plan
+vector in that version's order, one full-attention wrapper. Anything else at
+capture -> this module stands down for that wrapper and the stock plan stays
+(named once in the log). The GPU proof (graph split vs eager stock, and our
+arrays vs the C++ planner's own fixed-split arrays) is
 test/registered/unit/layers/attention/test_fi_graph_split_gpu_0924.py.
+
+PORT TO flashinfer 0.7.0 (2026-10-04; diffed 0.6.14 -> v0.7.0 and -> git
+2f3bc5ac, the 27B image's tree, header by header). What did NOT move, and why
+the same arrays / the same vector still drive run():
+* ``PrefillPlanInfo::ToVector/FromVector``: the same 15 fields, same order
+  (scheduler.cuh) -- so ``PLAN_FIELDS`` is identical for both versions;
+* ``PrefillSplitQOKVIndptr`` step 3 (request / qo-tile / kv-tile indices,
+  merge_indptr, o_indptr, ``kv_chunk_size *= page_size``): byte-identical text,
+  ``split_arrays`` is the same port;
+* ``BatchPrefillWithPagedKVCacheRun`` (now csrc/batch_prefill_paged.cuh,
+  textually included by batch_prefill.cu): the same offsets read through
+  ``GetPtrFromBaseOffset``; the kernel reads ``*kv_chunk_size_ptr``,
+  ``block_valid_mask[bx]``, ``o + (o_indptr[r] + kv_tile) * o_stride_n``
+  exactly as before; the merge kernel is unchanged apart from a NaN guard for
+  two empty states (cascade.cuh).
+What DID move (none of it touches a field this module writes):
+* ``PrefillPlan`` / ``PrefillSplitQOKVIndptr`` gain ``uniform_q_len``
+  (python always passes 0 -> the old ragged bound) and ``kv_dtype_bytes``;
+  ``FA2DetermineCtaTileQ`` gains ``head_dim_qk`` / ``kv_dtype_bytes`` (for
+  hd256 with >16 packed rows the tile is still 64; the capture reads it from
+  the stock plan anyway);
+* after git #5177 (in 2f3bc5ac, not in the PyPI 0.7.0 wheel) the STOCK
+  partials are sized ceil(padded x cta_tile_q / gqa) rows instead of
+  padded x cta_tile_q -- only the stock reservation, ours is sized by rows
+  already (``stock_eager_split_float_bytes(..., num_kv_heads=)`` models both);
+* after git #5176 the stock plan allocates ``block_valid_mask`` for every
+  graph plan (and run() reads it for every graph plan) -- we set
+  ``split_kv`` 1 and ``enable_cuda_graph`` 1 and point it at our mask, so
+  both generations read the same bytes.
 """
 
 from __future__ import annotations
@@ -67,9 +99,7 @@ GRAPH_SPLIT_ENV = "SGLANG_FI_PREFILL_GRAPH_SPLIT"
 #: Smallest KV chunk the chooser may pick inside the graph, tokens.
 GRAPH_SPLIT_MIN_CHUNK_ENV = "SGLANG_FI_PREFILL_GRAPH_SPLIT_MIN_CHUNK"
 GRAPH_SPLIT_MIN_CHUNK_DEFAULT = 512
-#: flashinfer version whose plan vector and kernel reads this module mirrors.
-FLASHINFER_VERSION = "0.6.14"
-#: PrefillPlanInfo::ToVector order (scheduler.cuh, 0.6.14).
+#: PrefillPlanInfo::ToVector order (scheduler.cuh), flashinfer 0.6.14.
 PLAN_FIELDS = (
     "padded_batch_size",
     "total_num_rows",
@@ -87,7 +117,51 @@ PLAN_FIELDS = (
     "enable_cuda_graph",
     "split_kv",
 )
+#: ... and flashinfer 0.7.0 (v0.7.0 and git 2f3bc5ac): read from its
+#: ``ToVector`` / ``FromVector`` (``vec.size() should be 15``). Written out, not
+#: aliased, so a future divergence is a one-line edit with a test that names it.
+PLAN_FIELDS_070 = (
+    "padded_batch_size",
+    "total_num_rows",
+    "total_num_rows_offset",
+    "cta_tile_q",
+    "request_indices_offset",
+    "qo_tile_indices_offset",
+    "kv_tile_indices_offset",
+    "merge_indptr_offset",
+    "o_indptr_offset",
+    "kv_chunk_size_ptr_offset",
+    "v_offset",
+    "s_offset",
+    "block_valid_mask_offset",
+    "enable_cuda_graph",
+    "split_kv",
+)
+#: The versions this module mirrors -> their plan-vector order. The contract
+#: refuses every other version; the layout is chosen by the INSTALLED one.
+PLAN_FIELDS_BY_VERSION: Dict[str, Tuple[str, ...]] = {
+    "0.6.14": PLAN_FIELDS,
+    "0.7.0": PLAN_FIELDS_070,
+}
+#: The newest mirrored version: the default of a layout built without one.
+FLASHINFER_VERSION = "0.7.0"
 _F = {name: i for i, name in enumerate(PLAN_FIELDS)}
+
+
+def _fields(fi_version: str) -> Dict[str, int]:
+    return {name: i for i, name in enumerate(PLAN_FIELDS_BY_VERSION[fi_version])}
+
+
+def version_key(version: str) -> Optional[str]:
+    """The ``PLAN_FIELDS_BY_VERSION`` key an installed ``flashinfer.__version__``
+    belongs to, or None. ``0.7.0`` / ``0.7.0+cu130`` / ``0.7.0.post1`` match
+    ``0.7.0``; ``0.7.01``, ``0.7.0rc1`` (a release candidate is not the release)
+    and ``0.6.12`` do not."""
+    ver = str(version or "")
+    for key in PLAN_FIELDS_BY_VERSION:
+        if ver == key or (ver.startswith(key) and ver[len(key)] in ".+" and not ver[len(key) + 1 :].startswith(("rc", "a", "b"))):
+            return key
+    return None
 #: Our int arrays start here inside the wrapper's int workspace (8 MiB); the
 #: stock planner's own arrays for one request slot stay below 4 KiB.
 INT_REGION_BASE = 1 << 20
@@ -136,6 +210,8 @@ class GraphSplitLayout:
     out_bytes: int
     int_base: int = INT_REGION_BASE
     float_base: int = 0
+    #: the flashinfer version whose plan-vector order ``plan_vector`` writes
+    fi_version: str = FLASHINFER_VERSION
 
     @property
     def offsets(self) -> Dict[str, int]:
@@ -169,20 +245,23 @@ class GraphSplitLayout:
         (``total_num_rows`` = the captured maximum, its device slot) and
         ``cta_tile_q``, everything else pointing at this layout."""
         o = self.offsets
+        f = _fields(self.fi_version)
         v = [int(x) for x in stock]
-        v[_F["padded_batch_size"]] = self.padded
-        v[_F["cta_tile_q"]] = self.cta_tile_q
-        v[_F["request_indices_offset"]] = o["request_indices"]
-        v[_F["qo_tile_indices_offset"]] = o["qo_tile_indices"]
-        v[_F["kv_tile_indices_offset"]] = o["kv_tile_indices"]
-        v[_F["merge_indptr_offset"]] = o["merge_indptr"]
-        v[_F["o_indptr_offset"]] = o["o_indptr"]
-        v[_F["kv_chunk_size_ptr_offset"]] = o["kv_chunk_size"]
-        v[_F["v_offset"]] = o["v"]
-        v[_F["s_offset"]] = o["s"]
-        v[_F["block_valid_mask_offset"]] = o["block_valid_mask"]
-        v[_F["enable_cuda_graph"]] = 1
-        v[_F["split_kv"]] = 1
+        if len(v) != len(f):
+            raise ValueError("plan vector has %d fields, %s has %d" % (len(v), self.fi_version, len(f)))
+        v[f["padded_batch_size"]] = self.padded
+        v[f["cta_tile_q"]] = self.cta_tile_q
+        v[f["request_indices_offset"]] = o["request_indices"]
+        v[f["qo_tile_indices_offset"]] = o["qo_tile_indices"]
+        v[f["kv_tile_indices_offset"]] = o["kv_tile_indices"]
+        v[f["merge_indptr_offset"]] = o["merge_indptr"]
+        v[f["o_indptr_offset"]] = o["o_indptr"]
+        v[f["kv_chunk_size_ptr_offset"]] = o["kv_chunk_size"]
+        v[f["v_offset"]] = o["v"]
+        v[f["s_offset"]] = o["s"]
+        v[f["block_valid_mask_offset"]] = o["block_valid_mask"]
+        v[f["enable_cuda_graph"]] = 1
+        v[f["split_kv"]] = 1
         return v
 
 
@@ -197,10 +276,17 @@ def layout_from_stock(
     out_bytes: int,
     int_workspace_bytes: int,
     float_workspace_bytes: int,
+    fi_version: str = FLASHINFER_VERSION,
 ) -> Tuple[Optional[GraphSplitLayout], str]:
-    """The capture's layout, or ``(None, reason)`` -- never a guess."""
-    if len(stock) != len(PLAN_FIELDS):
-        return None, "plan vector has %d fields, 0.6.14 has %d" % (len(stock), len(PLAN_FIELDS))
+    """The capture's layout, or ``(None, reason)`` -- never a guess.
+    ``fi_version``: the installed flashinfer's ``PLAN_FIELDS_BY_VERSION`` key
+    (``version_key(flashinfer.__version__)``)."""
+    if fi_version not in PLAN_FIELDS_BY_VERSION:
+        return None, "no plan layout for flashinfer %r (mirrored: %s)" % (fi_version, ", ".join(PLAN_FIELDS_BY_VERSION))
+    fields = PLAN_FIELDS_BY_VERSION[fi_version]
+    _F = _fields(fi_version)
+    if len(stock) != len(fields):
+        return None, "plan vector has %d fields, %s has %d" % (len(stock), fi_version, len(fields))
     if not int(stock[_F["enable_cuda_graph"]]):
         return None, "stock plan is not a cuda-graph plan"
     max_rows = int(stock[_F["total_num_rows"]])
@@ -218,6 +304,7 @@ def layout_from_stock(
         num_qo_heads=int(num_qo_heads),
         head_dim_vo=int(head_dim_vo),
         out_bytes=int(out_bytes),
+        fi_version=fi_version,
     )
     o = lay.offsets
     stock_int_top = max(
@@ -252,7 +339,8 @@ def split_arrays(
     page_size: int = 1,
 ) -> Dict[str, List[int]]:
     """flashinfer's own work-item layout for a FIXED KV chunk -- a line-by-line
-    port of PrefillSplitQOKVIndptr step 3 (scheduler.cuh, 0.6.14, non-graph,
+    port of PrefillSplitQOKVIndptr step 3 (scheduler.cuh, 0.6.14 and 0.7.0 --
+    the step is byte-identical in both --, non-graph,
     no window, page_size 1): for each request, each q tile, each KV chunk one
     work item; o_indptr advances by qo_len x chunks, merge_indptr by chunks
     per row. The kernel's own chunk count, ceil(min(kv, kv + CTA_TILE_Q) /
@@ -411,7 +499,7 @@ def apply(
 
 def _as_plan_vector(like, values: List[int]):
     """The same container type flashinfer's plan() returned (a tvm_ffi Array
-    in 0.6.14), so ``run()`` receives what it always receives."""
+    in 0.6.14 and 0.7.0), so ``run()`` receives what it always receives."""
     try:
         import tvm_ffi
 
@@ -422,6 +510,17 @@ def _as_plan_vector(like, values: List[int]):
     return list(values)
 
 
+def installed_version_key() -> Optional[str]:
+    """``version_key`` of the imported flashinfer, None when it is not mirrored
+    (or not importable)."""
+    try:
+        import flashinfer
+
+        return version_key(str(getattr(flashinfer, "__version__", "")))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def flashinfer_contract_ok(wrapper) -> Tuple[bool, str]:
     """The checks a capture runs before committing to this layout."""
     try:
@@ -430,8 +529,8 @@ def flashinfer_contract_ok(wrapper) -> Tuple[bool, str]:
         ver = str(getattr(flashinfer, "__version__", ""))
     except Exception:  # noqa: BLE001
         ver = ""
-    if not ver.startswith(FLASHINFER_VERSION):
-        return False, "flashinfer %r, this module mirrors %s" % (ver, FLASHINFER_VERSION)
+    if version_key(ver) is None:
+        return False, "flashinfer %r, this module mirrors %s" % (ver, ", ".join(PLAN_FIELDS_BY_VERSION))
     if getattr(wrapper, "_backend", None) != "fa2":
         return False, "backend %r, not fa2" % (getattr(wrapper, "_backend", None),)
     if not getattr(wrapper, "is_cuda_graph_enabled", False):
@@ -448,13 +547,29 @@ def flashinfer_contract_ok(wrapper) -> Tuple[bool, str]:
     return True, "ok"
 
 
-def stock_eager_split_float_bytes(num_qo_heads: int, work_items: int, cta_tile_q: int, head_dim_vo: int) -> int:
-    """The float workspace flashinfer 0.6.14's EAGER plan demands once it
-    splits (PrefillPlan, scheduler.cuh:772-776): tmp_v = heads x work items x
-    CTA_TILE_Q x head_dim x sizeof(float), then tmp_s, 16-aligned -- the GQA
-    over-reservation #5177 removes upstream. Sizes the GPU parity test's
-    reference plan: at 98k / 7 chunks it is 506 MiB, and a 384 MiB workspace
-    makes the C++ planner refuse ("Buffer overflow ... batch_prefill_tmp_v").
-    The graph path never plans this way (its partials are sized by rows)."""
-    rows = int(num_qo_heads) * int(work_items) * int(cta_tile_q)
+def stock_eager_split_float_bytes(
+    num_qo_heads: int,
+    work_items: int,
+    cta_tile_q: int,
+    head_dim_vo: int,
+    *,
+    num_kv_heads: Optional[int] = None,
+) -> int:
+    """The float workspace flashinfer's EAGER plan demands once it splits
+    (PrefillPlan, scheduler.cuh): tmp_v, then tmp_s, 16-aligned.
+
+    Default (``num_kv_heads`` None) = 0.6.14 and the PyPI 0.7.0 wheel:
+    tmp_v = heads x work items x CTA_TILE_Q x head_dim x sizeof(float) -- the
+    GQA over-reservation. At 98k / 7 chunks that is 506 MiB, and a 384 MiB
+    workspace makes the C++ planner refuse ("Buffer overflow ...
+    batch_prefill_tmp_v"). With ``num_kv_heads`` = flashinfer after #5177 (git
+    2f3bc5ac, the 27B image): rows = ceil(work items x CTA_TILE_Q / gqa), the
+    exact partial-row bound. The default is the larger of the two, so a
+    reference workspace sized by it fits both. The graph path never plans this
+    way (its partials are sized by rows)."""
+    if num_kv_heads is None:
+        rows = int(num_qo_heads) * int(work_items) * int(cta_tile_q)
+    else:
+        gqa = int(num_qo_heads) // int(num_kv_heads)
+        rows = int(num_qo_heads) * -(-int(work_items) * int(cta_tile_q) // gqa)
     return _align(rows * int(head_dim_vo) * 4) + rows * 4

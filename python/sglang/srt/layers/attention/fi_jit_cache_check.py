@@ -8,7 +8,7 @@ the 3 GiB cgroup cap).
 
 WHY A STANDALONE TEST REBUILDS WHAT A BOOT LOADS (the root cause, measured):
 flashinfer fixes its cache DIRECTORY at import from the visible device
-(flashinfer/jit/env.py + jit/core.py:138 -> ``0.6.14/120f`` for the 5090) but
+(flashinfer/jit/env.py + jit/core.py:138 -> ``<version>/120f`` for the 5090) but
 takes the -gencode FLAGS from FLASHINFER_CUDA_ARCH_LIST when it writes a
 module's build.ninja (jit/cpp_ext.py:210, a fresh CompilationContext). The
 sglang server sets that variable AFTER importing flashinfer --
@@ -47,14 +47,30 @@ _DTYPE_NAME = {"bf16": "bf16", "e4m3": "e4m3", "f16": "f16", "e5m2": "e5m2"}
 _GENCODE_RE = re.compile(r"-gencode=arch=compute_\w+,code=sm_\w+")
 
 
-def prefill_uri(kv: str, q: str = "bf16", o: str = "bf16", head_dim: int = 256) -> str:
-    """flashinfer 0.6.14 ``get_batch_prefill_uri`` for fa2, int32 indices, no
-    RoPE, no window, no soft cap, no fp16 QK reduction (pure string)."""
+def prefill_uri(kv: str, q: str = "bf16", o: str = "bf16", head_dim: int = 256, suffix: str = "") -> str:
+    """flashinfer ``get_batch_prefill_uri`` for fa2, int32 indices, no RoPE, no
+    window, no soft cap, no fp16 QK reduction (pure string). ``suffix`` is the
+    module-surface suffix: "" for 0.6.14; flashinfer 0.7.0's fa2 wrapper loads
+    its PRIMARY module in equal-stride mode, ``_kv_stride_equal``
+    (jit/attention/modules.py ``_BATCH_PREFILL_MODULE_URI_SUFFIX``) -- without
+    it the pre-check below would call a cached 0.7.0 module "NOT BUILT"."""
     return (
         "batch_prefill_with_kv_cache_dtype_q_%s_dtype_kv_%s_dtype_o_%s_dtype_idx_i32_"
-        "head_dim_qk_%d_head_dim_vo_%d_posenc_0_use_swa_False_use_logits_cap_False_f16qk_False"
-        % (_DTYPE_NAME[q], _DTYPE_NAME[kv], _DTYPE_NAME[o], head_dim, head_dim)
+        "head_dim_qk_%d_head_dim_vo_%d_posenc_0_use_swa_False_use_logits_cap_False_f16qk_False%s"
+        % (_DTYPE_NAME[q], _DTYPE_NAME[kv], _DTYPE_NAME[o], head_dim, head_dim, suffix)
     )
+
+
+def primary_uri_suffix() -> str:
+    """The suffix of the module ``BatchPrefillWithPagedKVCacheWrapper`` (fa2)
+    loads, read from the INSTALLED flashinfer: "" when it has no such table
+    (0.6.14), ``_kv_stride_equal`` when it has (0.7.0)."""
+    try:
+        from flashinfer.jit.attention import modules as _m
+
+        return str(getattr(_m, "_BATCH_PREFILL_MODULE_URI_SUFFIX", {}).get(("equal", "full"), ""))
+    except Exception:  # noqa: BLE001 - not importable: the 0.6.14 name
+        return ""
 
 
 def mirror_server_arch() -> str:
@@ -72,16 +88,44 @@ def mirror_server_arch() -> str:
 def substitute_gencode(build_ninja: str, want: Sequence[str]) -> str:
     """The on-disk build.ninja with its -gencode flags replaced by ``want``
     (the only arch-dependent content: a desk diff of a regenerated file against
-    an untouched one differs in exactly that line)."""
+    an untouched one differs in exactly that line).
+
+    flashinfer 0.7.0 writes the flags in TWO places (``cuda_cflags``, a list that
+    may span continuation lines, and ``cuda_arch_flags = ...``); each place holds
+    the FULL arch list. Every contiguous block of -gencode flags (consecutive
+    lines, or one line) is therefore replaced by ``want`` once. The first
+    version replaced only the first flag of the FILE and deleted every later one,
+    which emptied ``cuda_arch_flags`` and made ninja see a changed command line
+    on all steps (b9j/b9l 22:49Z: 'WOULD COMPILE [11/11]' although the cached
+    module was current). Identical flags -> text returned unchanged."""
     found = _GENCODE_RE.findall(build_ninja)
-    if not found:
+    if not found or sorted(set(found)) == sorted(set(want)):
         return build_ninja
-    out = build_ninja
-    first = True
-    for flag in found:
-        out = out.replace(flag, " ".join(want) if first else "", 1)
-        first = False
-    return out
+    joined = " ".join(want)
+    out_lines: List[str] = []
+    prev_had = False
+    for line in build_ninja.split("\n"):
+        if not _GENCODE_RE.search(line):
+            out_lines.append(line)
+            prev_had = False
+            continue
+        first = not prev_had
+        seen = [False]
+
+        def _sub(m, first=first, seen=seen):
+            if first and not seen[0]:
+                seen[0] = True
+                return joined
+            return ""
+
+        repl = _GENCODE_RE.sub(_sub, line)
+        prev_had = True
+        if repl.strip() in ("", "$"):
+            continue  # a continuation line that held only the extra flags
+        if not repl.rstrip().endswith("$"):
+            repl = repl.rstrip()
+        out_lines.append(repl)
+    return "\n".join(out_lines)
 
 
 def ninja_would_build(module_dir: str, build_ninja_text: str, ninja: str) -> Tuple[bool, str]:
@@ -134,7 +178,7 @@ def check_prefill_modules(
         return False, lines + ["no ninja on PATH"]
     ok = True
     for kv in kv_dtypes:
-        uri = prefill_uri(kv)
+        uri = prefill_uri(kv, suffix=primary_uri_suffix())
         d = jit_env.FLASHINFER_JIT_DIR / uri
         so, bn = d / (uri + ".so"), d / "build.ninja"
         if not so.exists() or not bn.exists():

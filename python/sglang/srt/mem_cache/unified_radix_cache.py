@@ -4427,7 +4427,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 lru = lru_dict[ct]
                 if skip_existing and lru.in_list(node):
                     continue
+                if (
+                    target is EvictLayer.HOST
+                    and lru_op is UnifiedLRUList.insert_mru
+                    and cd.host_lock_ref > 0
+                ):
+                    # 1210b HOSTLOCK-EVICT-TO-HOST (NF y9nf4 1004_031945 D TP1/TP2 04:06:42Z, node 1272:
+                    # "mamba host-locked node(s) on the host LRU" at the idle walk after the epoch-82
+                    # park): the third writer Y8P-HOSTLOCK-LRU left -- `_evict_to_host` filed a
+                    # host-locked anchor. A host-locked node stays OFF the host LRU; the last host
+                    # unlock (`release_component_lock(lock_host=True)`) files it.
+                    self._note_hostlock_lru_skip(node, ct)
+                    continue
                 lru_op(lru, node)
+
+    def _note_hostlock_lru_skip(self, node: UnifiedTreeNode, ct: ComponentType) -> None:
+        """1210b: the named line of a host-locked node kept off the host LRU (metal marker)."""
+        n = int(getattr(self, "_hostlock_lru_skip_n", 0) or 0) + 1
+        self._hostlock_lru_skip_n = n
+        if n <= 8 or n % 256 == 0:
+            logger.info(
+                "HOSTLOCK-LRU-SKIP n=%d node=%s ct=%s host_lock_ref=%d site=evict_to_host (a host-locked "
+                "aux node stays off the host LRU; its last host unlock files it)",
+                n, getattr(node, "id", "?"), getattr(ct, "name", ct),
+                int(node.component_data[ct].host_lock_ref),
+            )
 
     def evict_host(
         self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
@@ -5874,7 +5898,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._1421_refused("direct_no_hashes", node)
             return False
         pre = pool.alloc_write(hashes)
-        if pre is None and self._w3_arena_spill(pool, len(hashes), claimer=node) > 0:
+        if (pre is None and not getattr(self, "_weg2_bg_publish", False)   # BG: no spill (ARENA-DROP > 100 ms)
+                and self._w3_arena_spill(pool, len(hashes), claimer=node) > 0):
             # W3-ARENA: the spill handed this rank's references back; the
             # claim's own room-making (#1427 _evict_for_claim) takes the slots
             # once no rank holds them any more (a PP peer releases at its own
@@ -6983,7 +7008,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            getattr(node, "id", "?"), type(e).__name__, e)
             return None
 
-    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None, chain_only: bool = False) -> dict:
+    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None, chain_only: bool = False,
+                               background: bool = False, bg_max_tokens: int = 0) -> dict:
         """#1233 zero-remainder: back every un-backed device node up before a flush.
 
         The hand-back seam. The Weg-2 front quiesces a group through
@@ -7002,6 +7028,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         0.5 s until it answers 200 (in-flight terms zero), so successive calls
         drain what each earlier call could not pin. Called by the scheduler
         only when nothing is running or waiting (`SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1`).
+
+        ``background`` (PUBLISH-SWEEP-BG, weg2_flush_nonblock.bg_publish_tick):
+        the sweep runs BETWEEN D decode rounds with requests running, so it only
+        issues a node that no running request references (device lock_ref 0)
+        and whose parent is already backed (write_backup then does not recurse
+        into a locked or in-flight ancestor). Everything else stays un-backed
+        for the next pass or the flip's flush, which is unchanged
+        (``background=False`` is the old walk, line for line).
+        ``bg_max_tokens`` > 0 (background only): a node longer than that many
+        tokens is left to the flush (len(key) is replicated: every rank skips
+        the same nodes). A background claim never makes room by spilling the
+        arena (``_weg2_bg_publish``: no ``_w3_arena_spill``, a full arena is a
+        named refusal, the flush retries with its spill rights).
         """
         stats = {"unbacked": 0, "issued": 0, "refused": 0, "pending": 0, "skipped_pending": 0}
         if self.cache_controller is None or self.disable:
@@ -7046,7 +7085,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # ANCHOR-ONLY BACKUP (y5a: 16x WEG2-ANCHOR-LOST at=flush): the
                 # KV of this node is on the host / in the store, its Mamba
                 # anchor on the device only -- the reset would drop it.
-                if node is not self.root_node and self._weg2_anchor_only_candidate(node):
+                if (node is not self.root_node and not background  # BG: the flush's job
+                        and self._weg2_anchor_only_candidate(node)):
                     stats["unbacked"] += 1
                     stats["anchor_only"] = stats.get("anchor_only", 0) + 1
                     if stats["issued"] < max_issue:
@@ -7059,6 +7099,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             if node.write_through_pending_id is not None:
                 stats["skipped_pending"] += 1
+                continue
+            if background and (
+                node.component_data[BASE_COMPONENT_TYPE].lock_ref > 0
+                or (int(bg_max_tokens) > 0 and len(node.key) > int(bg_max_tokens))
+                or (
+                    node.parent is not self.root_node
+                    and not node.parent.backuped
+                    and not node.parent.l3_present
+                )
+            ):
+                # PUBLISH-SWEEP-BG: in use by a running request, or its parent
+                # is not backed yet (write_backup would recurse into it)
+                stats["skipped_bg"] = stats.get("skipped_bg", 0) + 1
                 continue
             stats["unbacked"] += 1
             if stats["issued"] >= max_issue:
@@ -7089,12 +7142,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stats["skipped_pending"] += 1
                 continue
             _t_iss = time.perf_counter()
+            _bg_prev = getattr(self, "_weg2_bg_publish", False)
+            self._weg2_bg_publish = bool(background)
             try:
                 got = self.write_backup(node)
             except Exception as e:  # noqa: BLE001 -- the sweep must not kill the flush
                 logger.warning("WEG2 PUBLISH-SWEEP write_backup raised on node %s: %s: %s",
                                getattr(node, "id", "?"), type(e).__name__, e)
                 got = 0
+            finally:
+                self._weg2_bg_publish = _bg_prev
             _issue_s += time.perf_counter() - _t_iss
             if got > 0:
                 stats["issued"] += 1
@@ -7118,17 +7175,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 logger.warning("WEG2-LOCK-CENSUS sweep=%d %s", n, self.weg2_lock_census_str(limit=4))
             except Exception:  # noqa: BLE001 -- the census never breaks the sweep
                 logger.warning("WEG2-LOCK-CENSUS raised", exc_info=True)
-        if stats["unbacked"] or n <= 4 or n % 64 == 0:
+        _bg_quiet = False
+        if background:
+            # review 1270 #8/#9: a between-rounds pass names itself at most once per 30 s
+            _now = time.monotonic()
+            _bg_quiet = (_now - float(getattr(UnifiedRadixCache, "_weg2_bg_sweep_log_t", -1e9))) < 30.0
+            if not _bg_quiet and stats["unbacked"]:
+                UnifiedRadixCache._weg2_bg_sweep_log_t = _now
+        if (stats["unbacked"] or n <= 4 or n % 64 == 0) and not _bg_quiet:
             logger.warning(
                 "WEG2 PUBLISH-SWEEP n=%d unbacked=%d issued=%d refused=%d skipped_pending=%d "
                 "in_flight_after=%d pins=%d/%d draft_issued=%d draft_refused=%d "
                 "(denominator: un-backed device nodes at this flush poll; the draft terms are "
                 "the controller's CUMULATIVE L3 draft write counts, #1233 C18) "
-                "walked=%d sweep_ms=%.1f issue_ms=%.1f",
+                "walked=%d sweep_ms=%.1f issue_ms=%.1f%s",
                 n, stats["unbacked"], stats["issued"], stats["refused"], stats["skipped_pending"],
                 stats["pending"], self._mamba_pins_held(), self._mamba_pin_budget,
                 stats["draft_issued"], stats["draft_refused"],
                 stats["walked"], stats["sweep_ms"], stats["issue_ms"],
+                # PUBLISH-SWEEP-BG: a between-rounds pass names itself (the flush's
+                # own lines stay byte-identical)
+                " bg=1 skipped_bg=%d" % stats.get("skipped_bg", 0) if background else "",
             )
         return stats
 

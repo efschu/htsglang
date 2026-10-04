@@ -5,9 +5,13 @@ PrefillSplitQOKVIndptr step-3 port), the captured layout pads them to q_tiles
 x N with a valid-item mask, the plan vector points run() at our region and
 keeps the stock plan's live-row fields, the replay write lands byte for byte
 in the wrapper's int workspace, the chooser uses up to N chunks on 170 SMs and
-none on 68, and the default environment is empty. The kernel half (graph split
-vs eager stock; our arrays vs the C++ planner's) is
-test_fi_graph_split_gpu_0924.py.
+none on 68, and the default environment is empty. The layout is looked up by
+the installed flashinfer version (0.6.14 and 0.7.0, 2026-10-04 port): the
+layout, plan-vector and contract cases run once per version, and the version
+table itself (what is mirrored, what is refused) is pinned. The kernel half
+(graph split vs eager stock; our arrays vs the C++ planner's) is
+test_fi_graph_split_gpu_0924.py (metal) and
+test_fi_graph_split_cpp_parity_0924.py (the planner header, host-only).
 """
 
 import math
@@ -34,10 +38,14 @@ HQ, HKV, HD = 24, 4, 256
 STOCK = [85, 512, 1568, 64, 0, 352, 704, 1584, 1056, 1072, 0, 133693440, 3664, 1, 1]
 
 
-def _layout(max_chunks=7, int_ws=8 << 20, float_ws=384 << 20):
+VERSIONS = tuple(G.PLAN_FIELDS_BY_VERSION)  # ("0.6.14", "0.7.0")
+
+
+def _layout(max_chunks=7, int_ws=8 << 20, float_ws=384 << 20, version=G.FLASHINFER_VERSION):
     return G.layout_from_stock(
         STOCK, slots=1, max_chunks=max_chunks, num_qo_heads=HQ, num_kv_heads=HKV,
-        head_dim_vo=HD, out_bytes=2, int_workspace_bytes=int_ws, float_workspace_bytes=float_ws)
+        head_dim_vo=HD, out_bytes=2, int_workspace_bytes=int_ws, float_workspace_bytes=float_ws,
+        fi_version=version)
 
 
 class TestFlashinferLayoutPort(CustomTestCase):
@@ -70,42 +78,100 @@ class TestFlashinferLayoutPort(CustomTestCase):
 
 class TestLayout(CustomTestCase):
     def test_capture_layout(self):
-        lay, why = _layout()
-        self.assertEqual(why, "ok")
-        self.assertEqual(lay.padded, 48 * 7)
-        o = lay.offsets
-        for k, v in o.items():
-            self.assertEqual(v % 16, 0, k)
-        self.assertGreaterEqual(o["request_indices"], G.INT_REGION_BASE)
-        self.assertEqual(o["v"], 0)
-        self.assertEqual(o["s"], 512 * 7 * HQ * HD * 2)
-        self.assertLess(o["float_end"], 45 * 10**6)
+        for version in VERSIONS:
+            with self.subTest(version=version):
+                lay, why = _layout(version=version)
+                self.assertEqual(why, "ok")
+                self.assertEqual(lay.fi_version, version)
+                self.assertEqual(lay.padded, 48 * 7)
+                o = lay.offsets
+                for k, v in o.items():
+                    self.assertEqual(v % 16, 0, k)
+                self.assertGreaterEqual(o["request_indices"], G.INT_REGION_BASE)
+                self.assertEqual(o["v"], 0)
+                self.assertEqual(o["s"], 512 * 7 * HQ * HD * 2)
+                self.assertLess(o["float_end"], 45 * 10**6)
 
     def test_refusals(self):
-        self.assertIsNone(G.layout_from_stock(STOCK[:14], slots=1, max_chunks=7, num_qo_heads=HQ,
-            num_kv_heads=HKV, head_dim_vo=HD, out_bytes=2, int_workspace_bytes=8 << 20,
-            float_workspace_bytes=384 << 20)[0])
-        eager = list(STOCK)
-        eager[13] = 0
-        self.assertIsNone(G.layout_from_stock(eager, slots=1, max_chunks=7, num_qo_heads=HQ,
-            num_kv_heads=HKV, head_dim_vo=HD, out_bytes=2, int_workspace_bytes=8 << 20,
-            float_workspace_bytes=384 << 20)[0])
-        self.assertIsNone(_layout(float_ws=10 << 20)[0])
-        self.assertIsNone(_layout(int_ws=1 << 20)[0])
+        for version in VERSIONS:
+            with self.subTest(version=version):
+                kw = dict(slots=1, max_chunks=7, num_qo_heads=HQ, num_kv_heads=HKV, head_dim_vo=HD, out_bytes=2,
+                          int_workspace_bytes=8 << 20, float_workspace_bytes=384 << 20, fi_version=version)
+                self.assertIsNone(G.layout_from_stock(STOCK[:14], **kw)[0])
+                self.assertIsNone(G.layout_from_stock(STOCK + [0], **kw)[0])
+                eager = list(STOCK)
+                eager[13] = 0
+                self.assertIsNone(G.layout_from_stock(eager, **kw)[0])
+                self.assertIsNone(_layout(float_ws=10 << 20, version=version)[0])
+                self.assertIsNone(_layout(int_ws=1 << 20, version=version)[0])
+                # a stock plan whose int arrays reach into our private region
+                deep = list(STOCK)
+                deep[G.PLAN_FIELDS_BY_VERSION[version].index("block_valid_mask_offset")] = G.INT_REGION_BASE
+                lay, why = G.layout_from_stock(deep, **kw)
+                self.assertIsNone(lay)
+                self.assertIn("reach", why)
+
+    def test_a_version_without_a_table_entry_is_refused_not_guessed(self):
+        for bad in ("0.6.12", "0.7.1", "", "0.6.14rc1"):
+            lay, why = _layout(version=bad)
+            self.assertIsNone(lay, bad)
+            self.assertIn("no plan layout", why)
 
     def test_plan_vector_points_at_our_region_and_keeps_the_live_rows(self):
-        lay, _ = _layout()
-        v = lay.plan_vector(STOCK)
-        o = lay.offsets
-        self.assertEqual(len(v), 15)
-        self.assertEqual(v[0], lay.padded)
-        self.assertEqual(v[1], STOCK[1])  # captured max rows (merge grid)
-        self.assertEqual(v[2], STOCK[2])  # the stock plan writes the live rows there
-        self.assertEqual(v[3], 64)
-        self.assertEqual(v[4:13], [o["request_indices"], o["qo_tile_indices"], o["kv_tile_indices"],
-                                   o["merge_indptr"], o["o_indptr"], o["kv_chunk_size"],
-                                   o["v"], o["s"], o["block_valid_mask"]])
-        self.assertEqual(v[13:], [1, 1])
+        for version in VERSIONS:
+            with self.subTest(version=version):
+                lay, _ = _layout(version=version)
+                v = lay.plan_vector(STOCK)
+                o = lay.offsets
+                self.assertEqual(len(v), 15)
+                self.assertEqual(v[0], lay.padded)
+                self.assertEqual(v[1], STOCK[1])  # captured max rows (merge grid)
+                self.assertEqual(v[2], STOCK[2])  # the stock plan writes the live rows there
+                self.assertEqual(v[3], 64)
+                self.assertEqual(v[4:13], [o["request_indices"], o["qo_tile_indices"], o["kv_tile_indices"],
+                                           o["merge_indptr"], o["o_indptr"], o["kv_chunk_size"],
+                                           o["v"], o["s"], o["block_valid_mask"]])
+                self.assertEqual(v[13:], [1, 1])
+                with self.assertRaises(ValueError):
+                    lay.plan_vector(STOCK[:14])
+
+    def test_the_vector_follows_the_versions_table_not_a_constant(self):
+        """The order comes from PLAN_FIELDS_BY_VERSION[layout.fi_version]: with
+        the table's last two fields swapped for one version, THAT version reads
+        its enable_cuda_graph from slot 14 (and the other still from 13)."""
+        stock = list(STOCK)
+        stock[13], stock[14] = 0, 1  # graph flag 0 in the real order; in a swapped table slot 14 is the graph flag
+        kw = dict(slots=1, max_chunks=7, num_qo_heads=HQ, num_kv_heads=HKV, head_dim_vo=HD, out_bytes=2,
+                  int_workspace_bytes=8 << 20, float_workspace_bytes=384 << 20)
+        for version in VERSIONS:
+            self.assertIsNone(G.layout_from_stock(stock, fi_version=version, **kw)[0], version)  # not a graph plan
+        swapped = list(G.PLAN_FIELDS_070)
+        swapped[13], swapped[14] = swapped[14], swapped[13]
+        with mock.patch.dict(G.PLAN_FIELDS_BY_VERSION, {"0.7.0": tuple(swapped)}):
+            self.assertEqual(G.PLAN_FIELDS_BY_VERSION["0.6.14"], G.PLAN_FIELDS)
+            lay, why = G.layout_from_stock(stock, fi_version="0.7.0", **kw)
+            self.assertIsNotNone(lay, why)  # 0.7.0 now reads the flag from slot 14
+            self.assertIsNone(G.layout_from_stock(stock, fi_version="0.6.14", **kw)[0])  # 0.6.14 still from 13
+
+
+class TestVersionTable(CustomTestCase):
+    def test_mirrored_versions_and_their_plan_vectors(self):
+        self.assertEqual(tuple(G.PLAN_FIELDS_BY_VERSION), ("0.6.14", "0.7.0"))
+        self.assertEqual(G.FLASHINFER_VERSION, "0.7.0")
+        for fields in G.PLAN_FIELDS_BY_VERSION.values():
+            self.assertEqual(len(fields), 15)
+            self.assertEqual(fields[0], "padded_batch_size")
+            self.assertEqual(fields[-2:], ("enable_cuda_graph", "split_kv"))
+        # 0.7.0's PrefillPlanInfo::ToVector (scheduler.cuh, v0.7.0 and 2f3bc5ac) is the 0.6.14 list
+        self.assertEqual(G.PLAN_FIELDS_070, G.PLAN_FIELDS)
+
+    def test_version_key(self):
+        for ver, want in [
+            ("0.6.14", "0.6.14"), ("0.7.0", "0.7.0"), ("0.7.0+cu130", "0.7.0"), ("0.7.0.post1", "0.7.0"),
+            ("0.6.14+local", "0.6.14"), ("0.6.12", None), ("0.7.0rc1", None), ("0.7.0.rc2", None),
+            ("0.7.01", None), ("0.7.1", None), ("0.6.140", None), ("", None), (None, None),
+        ]:
+            self.assertEqual(G.version_key(ver), want, ver)
 
 
 class TestRegionBytes(CustomTestCase):
@@ -193,20 +259,43 @@ class _ContractWrapper:
 
 
 class TestContract(CustomTestCase):
-    def _ok(self, wrapper):
-        fake = types.SimpleNamespace(__version__=G.FLASHINFER_VERSION)
+    def _ok(self, wrapper, version=G.FLASHINFER_VERSION):
+        fake = types.SimpleNamespace(__version__=version)
         with mock.patch.dict(sys.modules, {"flashinfer": fake}):
             return G.flashinfer_contract_ok(wrapper)
 
-    def test_full_attention_passes(self):
-        self.assertEqual(self._ok(_ContractWrapper()), (True, "ok"))
+    def test_full_attention_passes_on_every_mirrored_version(self):
+        for version in VERSIONS + ("0.7.0+cu130",):
+            self.assertEqual(self._ok(_ContractWrapper(), version), (True, "ok"), version)
+
+    def test_an_unmirrored_flashinfer_stands_down_and_names_both(self):
+        # the image's 2026-10-04 log line read: flashinfer '0.7.0', this module mirrors 0.6.14
+        for version in ("0.6.12", "0.7.0rc1", "0.7.1", ""):
+            ok, why = self._ok(_ContractWrapper(), version)
+            self.assertFalse(ok, version)
+            self.assertIn("this module mirrors 0.6.14, 0.7.0", why)
 
     def test_sliding_window_stands_down(self):
         # the kernel counts chunks over window_left + CTA_TILE_Q, split_arrays over kv
-        for window_left in (0, 4096):
-            ok, why = self._ok(_ContractWrapper(window_left))
+        for version in VERSIONS:
+            for window_left in (0, 4096):
+                ok, why = self._ok(_ContractWrapper(window_left), version)
+                self.assertFalse(ok)
+                self.assertIn("sliding window", why)
+
+    def test_other_backend_or_eager_wrapper_stands_down(self):
+        for attr, value, word in (("_backend", "cute-dsl-prims", "not fa2"), ("is_cuda_graph_enabled", False, "not a cuda-graph"),
+                                  ("_custom_mask_buf", object(), "custom mask")):
+            w = _ContractWrapper()
+            setattr(w, attr, value)
+            ok, why = self._ok(w, "0.7.0")
             self.assertFalse(ok)
-            self.assertIn("sliding window", why)
+            self.assertIn(word, why)
+
+    def test_installed_version_key_follows_the_imported_module(self):
+        for version, want in (("0.7.0", "0.7.0"), ("0.6.14", "0.6.14"), ("0.6.12", None)):
+            with mock.patch.dict(sys.modules, {"flashinfer": types.SimpleNamespace(__version__=version)}):
+                self.assertEqual(G.installed_version_key(), want)
 
     def test_eager_reference_reservation(self):
         # 98k / 7 chunks: 24 heads x 336 items x tile 64 x (256 x 4 + 4) B -- more
@@ -214,6 +303,13 @@ class TestContract(CustomTestCase):
         self.assertEqual(G.stock_eager_split_float_bytes(HQ, 48 * 7, 64, HD), 530546688)
         self.assertGreater(G.stock_eager_split_float_bytes(HQ, 48 * 7, 64, HD), 384 << 20)
         self.assertLess(G.stock_eager_split_float_bytes(HQ, 48 * 5, 64, HD), 384 << 20)
+
+    def test_eager_reference_reservation_after_5177_is_rows_not_packed_indices(self):
+        # flashinfer 2f3bc5ac: rows = ceil(336 x 64 / 6) = 3584; the default (0.6.14 / PyPI 0.7.0) is the upper bound
+        want = 3584 * HQ * HD * 4 + 3584 * HQ * 4
+        self.assertEqual(G.stock_eager_split_float_bytes(HQ, 48 * 7, 64, HD, num_kv_heads=HKV), want)
+        self.assertLess(want, 384 << 20)
+        self.assertGreater(G.stock_eager_split_float_bytes(HQ, 48 * 7, 64, HD), want)
 
 
 class TestJitCacheCheck(CustomTestCase):
@@ -224,6 +320,23 @@ class TestJitCacheCheck(CustomTestCase):
             "batch_prefill_with_kv_cache_dtype_q_bf16_dtype_kv_e4m3_dtype_o_bf16_dtype_idx_i32_"
             "head_dim_qk_256_head_dim_vo_256_posenc_0_use_swa_False_use_logits_cap_False_f16qk_False",
         )
+
+    def test_070_primary_module_carries_the_equal_stride_suffix(self):
+        # flashinfer 0.7.0: BatchPrefillWithPagedKVCacheWrapper (fa2) loads the equal-stride primary
+        self.assertEqual(
+            J.prefill_uri("e4m3", suffix="_kv_stride_equal"),
+            J.prefill_uri("e4m3") + "_kv_stride_equal",
+        )
+        fake_modules = types.SimpleNamespace(_BATCH_PREFILL_MODULE_URI_SUFFIX={("equal", "full"): "_kv_stride_equal"})
+        with mock.patch.dict(sys.modules, {"flashinfer.jit.attention.modules": fake_modules}), mock.patch(
+            "flashinfer.jit.attention.modules", fake_modules, create=True
+        ):
+            self.assertEqual(J.primary_uri_suffix(), "_kv_stride_equal")
+        bare = types.SimpleNamespace()
+        with mock.patch.dict(sys.modules, {"flashinfer.jit.attention.modules": bare}), mock.patch(
+            "flashinfer.jit.attention.modules", bare, create=True
+        ):
+            self.assertEqual(J.primary_uri_suffix(), "")
 
     def test_no_single_gpu_is_a_refusal_not_a_build(self):
         ok, lines = J.check_prefill_modules()
