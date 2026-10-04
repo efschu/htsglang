@@ -137,6 +137,15 @@ def call(op: str, payload: dict, *, tree_python: str, python: str = DEFAULT_PYTH
     return out
 
 
+def couplings(request: dict, *, tree_python: str, python: str = DEFAULT_PYTHON, timeout: int = 120) -> dict:
+    """Profil-Editor S4a: Kopplungen C1-C4 im Kindprozess rechnen.  ``request`` wie ``profile_couplings.run``
+    ({what: compute|move|chunk|context, hardware, model, settings | server_args}).  Antwort ``{ok, result | error}``."""
+    out = call("couplings", request, tree_python=tree_python, python=python, timeout=timeout)
+    if out.get("ok") and isinstance(out.get("result"), dict) and "ok" in out["result"]:
+        return out["result"]            # run() antwortet selbst {ok, result|error}; die Runner-Hülle nur auspacken
+    return out
+
+
 def verify_record(rec: dict, tree_python: str, python: str = DEFAULT_PYTHON) -> dict:
     """Records gegen den Planer nachrechnen: Ergebnis je Zeile {got, expected, match}."""
     rows = rederive_rows(rec)

@@ -15,6 +15,8 @@ Operationen
   gate       Karteninventar gegen das Gate des Planers (card_identity, topology): Arch, Zahl, Reihenfolge,
              Kalibrierklasse, Topologie.  Antwort: die ORIGINAL-Meldungen der Planer-Funktionen.
   rederive   D-/P-Budgets mit ``launcher.budgets_from_dc`` aus den aufgezeichneten Eingaben neu rechnen.
+  couplings  Profil-Editor S4a (Auftrag 1431): Kopplungen C1-C4 (``sglang.srt.planner.profile_couplings.run``);
+             Anfrage {what, hardware, model, settings | server_args, ...}.  Fehlt das Modul im Baum, sagt die Antwort es.
 """
 
 from __future__ import annotations
@@ -105,7 +107,16 @@ def op_rederive(req):
     return out
 
 
-OPS = {"version": op_version, "gate": op_gate, "rederive": op_rederive}
+def op_couplings(req):
+    """Profil-Editor S4a: reine Funktionen aus ``planner/profile_couplings.py`` des Baums (kein Launcher, keine GPU)."""
+    try:
+        from sglang.srt.planner import profile_couplings as PC
+    except ImportError as exc:
+        return {"ok": False, "error": "profile_couplings.py fehlt im Planer-Baum (%s)" % exc}
+    return PC.run(req)
+
+
+OPS = {"version": op_version, "gate": op_gate, "rederive": op_rederive, "couplings": op_couplings}
 
 
 def main() -> int:
