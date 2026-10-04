@@ -1224,6 +1224,13 @@ def park_abort(sched, recv_req) -> int:
         if n:
             logger.info("F4 PARK-END abort: %d park part file(s) removed (rid=%s abort_all=%s)",
                         n, rid[:12], abort_all)
+    # Q-699: the aborted rid's tail staging ends with it (its parts may be gone)
+    try:
+        from sglang.srt.weg2 import tail_adopt as _ta
+
+        _ta.drop_aborted(rid, abort_all)
+    except Exception:  # noqa: BLE001 -- bookkeeping, never the abort itself
+        pass
     parked = getattr(sched, "weg2_d_parked", None)
     if not parked:
         return 0

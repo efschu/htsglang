@@ -669,6 +669,8 @@ class _Job(msgspec.Struct):
     #: perf_counter at which the hold first kept a finished read from
     #: terminating (-1 = never held)
     held_since: float = -1.0
+    #: Q-699: perf_counter of the LAST progress check (what eviction reads)
+    t_last: float = 0.0
 
     @property
     def staged(self) -> bool:
@@ -706,6 +708,63 @@ class Agreed(msgspec.Struct):
 
 _JOBS: Dict[str, _Job] = {}
 _AGREED: Dict[str, Agreed] = {}
+
+#: Q-699 (NF y9n 10032307 D, P>D wake 23:13:44Z with 9 hand-offs held, KEEP_AGREED 8):
+#: the FIFO prune at job creation dropped the job of a rid whose prefetch was
+#: still being checked; its next check made a new job -- evicting the next rid
+#: -- with a FRESH ``t_first`` and a fresh worker submission. Every pass all 9
+#: rids were re-staged: the H45 hold (``vote_hold``, bound from ``t_first``)
+#: never lapsed, no read terminated (9 queued / 0 running for 190 s until the
+#: clients aborted), and the worker queue grew to 35397 jobs (queue_wait_ms_max
+#: 342081) -- after the aborts it read the deleted park parts for 5.5 min
+#: (90927 'part unreadable' tracebacks). Now: a job is pruned only when no
+#: check touched it for ``JOB_STALE_S`` (a prefetch that never completed), or
+#: beyond ``JOB_HARD_CAP``; the first-check time of a rid survives its job.
+JOB_STALE_S = 30.0
+JOB_HARD_CAP = 64
+_T_FIRST: Dict[str, float] = {}
+_T_FIRST_CAP = 256
+
+
+def _prune_jobs(now: float) -> None:
+    """Q-699: drop jobs no progress check touched for JOB_STALE_S (stalest
+    first) while more than KEEP_AGREED exist; beyond JOB_HARD_CAP the stalest
+    goes whatever its age. A live rid's job is never dropped under the cap."""
+    while len(_JOBS) > KEEP_AGREED:
+        rid, job = min(_JOBS.items(), key=lambda kv: kv[1].t_last)
+        if now - job.t_last < JOB_STALE_S and len(_JOBS) <= JOB_HARD_CAP:
+            return
+        _JOBS.pop(rid, None)
+
+
+def _first_check(rid: str, now: float) -> float:
+    """Q-699: the rid's first progress check, kept across its job's life (the
+    H45 bound is measured from it, so a re-made job never renews the hold)."""
+    t = _T_FIRST.get(rid)
+    if t is None:
+        t = _T_FIRST[rid] = now
+        while len(_T_FIRST) > _T_FIRST_CAP:
+            _T_FIRST.pop(next(iter(_T_FIRST)))
+    return t
+
+
+def drop(rid: str) -> None:
+    """Q-699: the rid ended on D (abort): its job, its first-check time and
+    any agreed entry go; a queued staging of it is skipped by the worker."""
+    rid = str(rid)
+    _JOBS.pop(rid, None)
+    _T_FIRST.pop(rid, None)
+    _AGREED.pop(rid, None)
+
+
+def drop_aborted(rid: str, abort_all: bool = False) -> int:
+    """Q-699: :func:`drop` for every staged rid an AbortReq names (the
+    scheduler's own matching: ``startswith``, or all). Returns the count."""
+    rid = str(rid or "")
+    gone = [r for r in set(_JOBS) | set(_AGREED) if abort_all or (rid and r.startswith(rid))]
+    for r in gone:
+        drop(r)
+    return len(gone)
 
 
 def _candidate(rid: str) -> bool:
@@ -882,7 +941,7 @@ class StageWorker:
     @staticmethod
     def _fresh() -> Dict[str, float]:
         return {"jobs": 0, "work_ms": 0.0, "read_ms": 0.0, "digest_ms": 0.0, "wait_ms_max": 0.0,
-                "submit_ms": 0.0, "released_mib": 0.0}
+                "submit_ms": 0.0, "released_mib": 0.0, "skipped": 0}
 
     def prepare(self, held: HeldShapes, page_size: int, verify: bool, seats: Optional[int] = None) -> PinArena:
         """The arena, pinned once (boot, or the first job): seats x rid_bytes."""
@@ -930,6 +989,17 @@ class StageWorker:
             rid, box, headers, held, verify, device, page_size, h, t_sub = self.q.get()
             t0 = time.perf_counter()
             self._batch["wait_ms_max"] = max(self._batch["wait_ms_max"], (t0 - t_sub) * 1000.0)
+            job = _JOBS.get(rid)
+            if job is None or job.box is not box:
+                # Q-699: the job this item was queued for is gone (voted, dropped
+                # at an abort, pruned or re-made): nobody reads this box -- the
+                # parts are not read for nothing (y9n 10032307: 35397 queued
+                # stagings, 342 s queue wait, then 5.5 min of deleted parts)
+                self._batch["skipped"] = self._batch.get("skipped", 0) + 1
+                h._done.set()
+                if self.q.empty():
+                    self._log_batch()
+                continue
             self.current = rid
             try:
                 ctx = torch.cuda.device(device) if (device is not None and self.pin) else th._null_ctx()
@@ -963,11 +1033,11 @@ class StageWorker:
         logger.info(
             "%s jobs=%d worker_issue_ms=%.1f work_ms=%.1f read_ms=%.1f digest_ms=%.1f copy_ms=%.1f "
             "queue_wait_ms_max=%.1f arena_used_mib=%.1f of %.1f peak_mib=%.1f released_mib=%.1f fallback=%d "
-            "digest=worker:pre-verdict (serial, one thread per rank; worker_issue = the scheduler thread's "
+            "skipped_stale=%d digest=worker:pre-verdict (serial, one thread per rank; worker_issue = the scheduler thread's "
             "submit cost; copy = work - read - digest: the copies into the pinned arena and the checks)",
             WORKER_LINE, int(b["jobs"]), b["submit_ms"], work, read, dig, max(0.0, work - read - dig),
             b["wait_ms_max"], (a.used() if a else 0) / _MIB, (a.nbytes if a else 0) / _MIB,
-            (a.peak if a else 0) / _MIB, b["released_mib"], _WORKER_STATS["fallback"])
+            (a.peak if a else 0) / _MIB, b["released_mib"], _WORKER_STATS["fallback"], int(b.get("skipped", 0)))
 
 
 _STAGE_WORKER: List[Optional[StageWorker]] = [None]
@@ -1021,16 +1091,18 @@ def stage(rid: str, tree_cache) -> None:
     D request once its manifest is complete (H45), in the background. Never
     raises into the tree."""
     try:
+        now = time.perf_counter()
         job = _JOBS.get(rid)
+        if job is not None:
+            job.t_last = now
         if job is not None and (job.thread is not None or job.staged):
             return
         if job is None:
             if not _candidate(rid):
                 return
-            job = _Job(box=[], t_first=time.perf_counter())
+            job = _Job(box=[], t_first=_first_check(rid, now), t_last=now)
             _JOBS[rid] = job
-            while len(_JOBS) > KEEP_AGREED:  # a prefetch that never completed
-                _JOBS.pop(next(iter(_JOBS)))
+            _prune_jobs(now)  # Q-699: a prefetch that never completed, never a live one
         headers = th.headers_for(rid)
         job.state, job.have, job.want = th.manifest_state(headers)
         job.headers = list(headers)
@@ -1235,6 +1307,7 @@ def _note_defect_why(rid: str, why: str) -> None:
 def agree(rid: str, group_vote: int) -> None:
     """After the MIN: remember the group's answer for the admission."""
     job = _JOBS.pop(rid, None)
+    _T_FIRST.pop(str(rid), None)  # Q-699: the vote ended this rid's staging
     if job is None:
         return
     # H63b: the MIN above means every rank of the group has voted, i.e.
