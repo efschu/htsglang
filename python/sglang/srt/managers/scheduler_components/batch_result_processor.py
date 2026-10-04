@@ -110,6 +110,11 @@ class SchedulerBatchResultProcessor:
     # unaffected.
     record_first_token_progress: Callable[[], None] = lambda: None
     record_prefill_progress: Callable[[], None] = lambda: None
+    # Q-698b: stamps the decode-progress clock, once per decode round result.
+    # The first-token clock cannot see a prefill livelock: every resumed
+    # request's re-extend commits an output token there (NF y9n 10032328 D:
+    # 782 victim re-extends, 0 decode rounds for 11 min, no alarm).
+    record_decode_progress: Callable[[], None] = lambda: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -862,6 +867,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        self.record_decode_progress()
         if result.copy_done is not None:
             # fnFL2 H49: the host blocked on the round's device result
             # (result_wait_ms of DECODE-HOST-PERIOD); timing only.
