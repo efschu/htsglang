@@ -55,7 +55,7 @@ import logging
 import os
 import struct
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -116,17 +116,26 @@ def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
     return True
 
 
-def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set) -> Dict[str, int]:
+def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
+                    budget_s: float = 0.0) -> Dict[str, int]:
     """Spill host-only H-leaves of a dual P tree until ``want`` pages were
-    released here (node-id order). Returns the counts; the log line names them."""
+    released here (node-id order). Returns the counts; the log line names them.
+
+    ``budget_s`` > 0 (V2 ARENA-TRIM only; the claim-driven callers pass none): a wall-clock
+    brake -- the L3 copy of a leaf is file I/O on the scheduler thread, so the loop stops
+    before the NEXT leaf once the budget is spent (``braked`` = 1 in the result)."""
     from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
 
     P = max(1, int(page_size or 1))
     heap = [(n.id, n) for n in cache._collect_all_nodes() if _eligible(cache, n, pool, skip)]
     candidates = len(heap)
     heapq.heapify(heap)
-    released = leaves = unsecured = on_disk = written = 0
+    released = leaves = unsecured = on_disk = written = braked = 0
+    t_end = (time.monotonic() + float(budget_s)) if budget_s and budget_s > 0 else None
     while heap and released < want:
+        if t_end is not None and time.monotonic() >= t_end:
+            braked = 1
+            break
         _id, node = heapq.heappop(heap)
         if not _eligible(cache, node, pool, skip):
             continue
@@ -152,7 +161,8 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set)
             "written:%d (a host-only leaf leaves L2 only with its L3 copy for every page; the dual P tree "
             "is host-only after each idle release)",
             MARK, k, int(want), released, leaves, candidates, unsecured, on_disk, written)
-    return {"released": released, "leaves": leaves, "candidates": candidates, "unsecured": unsecured}
+    return {"released": released, "leaves": leaves, "candidates": candidates, "unsecured": unsecured,
+            "braked": braked}
 
 
 # ---------------------------------------------------------------- Q-1190 D-ARENA-YIELD
@@ -296,4 +306,256 @@ def d_yield_arena(sched, need: int) -> Dict[str, int]:
                     "(a claim on the shared KV arena was refused; D gives back host-only leaves it holds "
                     "but no request uses, L3 copy first)", YIELD_MARK, k, int(need), want, got["released"],
                     got["leaves"], got["candidates"], got["unsecured"])
+    return got
+
+
+# ---------------------------------------------------------------- V2 ARENA-TRIM
+# Q-1500 UD-V2 (27B NVFP4 dual y9d3, boot ...10040710 @c2f6e819cb, P PP0 07:18:49Z; analysis
+# deskq/done/1290-dual-y9d3-oom.out Gl. 7-10, option V2). The shared KV arena filled to 98-99 %
+# pinned within five minutes of burst load and the holder was P itself: every P leg leaves its
+# whole ~31k pages as host-only leaves in P's tree, P is never idle under load (so the idle
+# release never runs), and every Q-697c spill is bound to the spilling rank's OWN claim refusal.
+# Q-1190 made D give back ~91k pages and arena_pinned rose anyway: a slot frees only when EVERY
+# holder (3 P ranks + 3 D ranks) gave its reference back, and the ranks gave back different
+# subsets at different times. At the wall every backup was refused (BACKUP-REFUSED why=arena_claim)
+# and the P pool died on its last device leaf (V1 turns that death into a cache loss; V2 keeps the
+# arena below the wall in the first place).
+#
+# THE FIX (dual P only: ``armed`` + SGLANG_WEG2_DUAL_ARENA_TRIM, default 1; 0 = off):
+#   * PP0 reads the shared arena's fill -- ``arena_pinned / slots`` from the shared header
+#     (``ShmArena.ref_census``: the one number every rank of both groups would read the same;
+#     ``stats()`` is the O(1) pre-filter: pinned <= complete) -- at most once per
+#     ..._MIN_S. Above ``_HI`` (0.90) a trim episode starts and runs until the fill is <= ``_LO``
+#     (0.80): each decision orders ``pinned - LO*slots`` pages, at most ``_MAX_PAGES`` per
+#     decision (the L3 write of a leaf is file I/O on the scheduler thread -- "HiCache bremst nie").
+#   * RANK CONGRUENCE (RAENGE-NIE-UNEINS). The decision is PP0's ALONE and rides the request wire
+#     in band, like PP0's pass clock (``anchor_tails.Weg2BurstClock``): PP0 puts ONE
+#     ``Weg2DualArenaTrim(seq, want)`` on the list it SENDS in pass m, every follower relays it and
+#     takes it off before dispatch, and every stage (PP0 after its send, a follower in its pass m
+#     after the relay) executes the SAME order -- the same ``want``, the same node-id order over
+#     replicated trees -- at the same logical pass. No follower reads the header, a clock or an
+#     env-threshold of its own, so the trigger cannot differ between P ranks. What may still
+#     differ is only what a rank CAN give (a node that rank has locked / not yet COMPLETE / not
+#     yet in its tree): it keeps that leaf, the slot stays pinned by that one rank and frees at
+#     the next order -- never an inconsistent tree: a host-only leaf with its L3 copy for every
+#     page leaving a tree is the Q-697c operation, which the claim path already ran per rank,
+#     without peers, on the metal.
+#   * Each leaf is released only after its L3 copy (``spill_host_only``, #257); a leaf without one
+#     (``unsecured``) stays. A wall-clock budget per order (``_BUDGET_S``) brakes the loop before
+#     the next leaf; the rest follows with the next order.
+#   * Backoff: an order PP0 itself could not serve (released 0) holds the next decision for
+#     ``_EMPTY_BACKOFF_S`` (the D_YIELD_EMPTY_BACKOFF_S rule).
+#   * Group D (Q-1190): every order also posts its page need for D (``post_need``, the ``.dualneed``
+#     file; max semantics, D's TP0 takes it in its next tick and every D rank gives host-only leaves,
+#     L3 copy first): a slot frees only when D's references are gone too, and the oldest pages P
+#     gives are the ones D adopted first. ..._POST_D=0 leaves D alone.
+# Off the dual P layout (flip, 27B INT8, NF, dual D, no cap) NOTHING here runs: no header read, no
+# object on the wire, the follower scan finds none.
+
+TRIM_MARK = "Q-1500 UD-V2 DUAL ARENA-TRIM"
+TRIM_ENV = "SGLANG_WEG2_DUAL_ARENA_TRIM"
+TRIM_HI_ENV = "SGLANG_WEG2_DUAL_ARENA_TRIM_HI"
+TRIM_LO_ENV = "SGLANG_WEG2_DUAL_ARENA_TRIM_LO"
+TRIM_MIN_S_ENV = "SGLANG_WEG2_DUAL_ARENA_TRIM_MIN_S"
+TRIM_MAX_PAGES_ENV = "SGLANG_WEG2_DUAL_ARENA_TRIM_MAX_PAGES"
+TRIM_BUDGET_S_ENV = "SGLANG_WEG2_DUAL_ARENA_TRIM_BUDGET_S"
+TRIM_EMPTY_BACKOFF_S_ENV = "SGLANG_WEG2_DUAL_ARENA_TRIM_EMPTY_BACKOFF_S"
+TRIM_POST_D_ENV = "SGLANG_WEG2_DUAL_ARENA_TRIM_POST_D"       # 1 (default): every order also posts the need for group D
+TRIM_HI_DEFAULT = 0.90
+TRIM_LO_DEFAULT = 0.80
+#: PP0 reads the arena header / decides at most this often (also the distance between two orders)
+TRIM_MIN_S_DEFAULT = 1.0
+#: pages one order asks for at most (an episode from 0.97 to 0.80 is several orders)
+TRIM_MAX_PAGES_DEFAULT = 8192
+#: wall-clock brake of one order's loop (the L3 write is file I/O on the scheduler thread)
+TRIM_BUDGET_S_DEFAULT = 0.25
+#: after an order PP0 could not serve at all, no decision for this long
+TRIM_EMPTY_BACKOFF_S_DEFAULT = 2.0
+
+
+class Weg2DualArenaTrim(NamedTuple):
+    """PP0's order for one pass, riding the request wire: give back ``want`` pages of host-only
+    leaves (node-id order, L3 copy first). ``fill_ppm`` is PP0's reading when it decided (for the
+    log line only -- no rank branches on it)."""
+
+    seq: int
+    want: int
+    fill_ppm: int
+
+
+_T: Dict[str, Any] = {
+    "active": False, "next_t": 0.0, "seq": 0, "episode_cmds": 0, "orders": 0, "execs": 0,
+    "reads": 0, "census_reads": 0, "no_arena": 0, "need_posts": 0, "last_fill": 0.0, "decided_t": 0.0,
+}
+
+
+def _reset_trim_for_tests() -> None:
+    _T.update(active=False, next_t=0.0, seq=0, episode_cmds=0, orders=0, execs=0, reads=0,
+              census_reads=0, no_arena=0, need_posts=0, last_fill=0.0, decided_t=0.0)
+
+
+def trim_enabled(env=None) -> bool:
+    """The dual P layout (``dual_p_kv_stage.armed``) AND the switch; the one gate of the whole V2 part."""
+    e = os.environ if env is None else env
+    if str(e.get(TRIM_ENV, "1")).strip() == "0":
+        return False
+    return armed(env)
+
+
+def _f(env, key: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(env.get(key, "") or default)
+    except ValueError:
+        v = default
+    return min(max(v, lo), hi)
+
+
+def trim_cfg(env=None) -> Dict[str, float]:
+    """The knobs, clamped: 0.05 < LO < HI <= 1.0 (a LO at or above HI would never end an episode)."""
+    e = os.environ if env is None else env
+    hi = _f(e, TRIM_HI_ENV, TRIM_HI_DEFAULT, 0.10, 1.0)
+    lo = _f(e, TRIM_LO_ENV, TRIM_LO_DEFAULT, 0.05, 1.0)
+    lo = min(lo, hi - 0.02)
+    return {
+        "hi": hi, "lo": max(0.01, lo),
+        "min_s": _f(e, TRIM_MIN_S_ENV, TRIM_MIN_S_DEFAULT, 0.0, 600.0),
+        "max_pages": int(_f(e, TRIM_MAX_PAGES_ENV, TRIM_MAX_PAGES_DEFAULT, 1, 1 << 30)),
+        "budget_s": _f(e, TRIM_BUDGET_S_ENV, TRIM_BUDGET_S_DEFAULT, 0.0, 60.0),
+        "backoff_s": _f(e, TRIM_EMPTY_BACKOFF_S_ENV, TRIM_EMPTY_BACKOFF_S_DEFAULT, 0.0, 600.0),
+    }
+
+
+def _tree_pool(sched) -> Optional[Any]:
+    tree = getattr(sched, "tree_cache", None)
+    get = getattr(tree, "_weg2_direct_pool", None)
+    return _spill_pool(get()) if callable(get) else None
+
+
+def read_fill(arena: Any, trimming: bool, hi: float) -> Tuple[Optional[int], int]:
+    """``(pinned, slots)`` of the shared arena. ``pinned`` = COMPLETE slots with a reader reference
+    (the ``arena_pinned`` of ARENA-REF-HOLDERS, the wall's number). The strided header census is
+    taken only when it can matter: ``stats()`` (O(1) counters) bounds it from above (pinned <=
+    complete); outside an episode and below HI by that bound, ``pinned`` is None."""
+    st = arena.stats()
+    slots = max(1, int(st["slots"]))
+    _T["reads"] += 1
+    if not trimming and int(st["complete"]) <= hi * slots:
+        return None, slots
+    _T["census_reads"] += 1
+    return int(arena.ref_census()[0]), slots
+
+
+def pp0_decide(sched, now: Optional[float] = None, env=None) -> Optional[Weg2DualArenaTrim]:
+    """PP0, once per pass (``pp0_stamp``): the order of this pass, or None. Reads the header at
+    most once per MIN_S; None off the gate, on a follower, without an arena."""
+    if not trim_enabled(env):
+        return None
+    ps = getattr(sched, "ps", None)
+    if int(getattr(ps, "pp_rank", 0) or 0) != 0 or int(getattr(ps, "pp_size", 1) or 1) < 2:
+        return None
+    t = time.monotonic() if now is None else float(now)
+    if t < _T["next_t"]:
+        return None
+    pool = _tree_pool(sched)
+    arena = getattr(pool, "arena", None)
+    if arena is None:
+        _T["no_arena"] += 1
+        if _T["no_arena"] <= 3:
+            logger.warning("%s n=%d STOP no_arena: the P tree has no arena pool -- no trim", TRIM_MARK,
+                           _T["no_arena"])
+        _T["next_t"] = t + 30.0
+        return None
+    cfg = trim_cfg(env)
+    _T["next_t"] = t + cfg["min_s"]
+    _T["decided_t"] = t
+    try:
+        pinned, slots = read_fill(arena, bool(_T["active"]), cfg["hi"])
+    except Exception as exc:  # noqa: BLE001 - an instrument never breaks the pass
+        logger.warning("%s STOP header_read_failed: %r", TRIM_MARK, exc)
+        _T["next_t"] = t + 30.0
+        return None
+    if pinned is None:
+        return None
+    fill = pinned / float(slots)
+    _T["last_fill"] = fill
+    if _T["active"] and fill <= cfg["lo"]:
+        _T["active"] = False
+        logger.info("%s DONE orders=%d fill=%.3f pinned=%d slots=%d (<= LO %.2f: the arena is back "
+                    "below the wall)", TRIM_MARK, _T["episode_cmds"], fill, pinned, slots, cfg["lo"])
+        return None
+    if not _T["active"]:
+        if fill <= cfg["hi"]:
+            return None
+        _T["active"], _T["episode_cmds"] = True, 0
+        logger.info("%s START fill=%.3f pinned=%d slots=%d (> HI %.2f): group P gives back host-only "
+                    "leaves down to LO %.2f, L3 copy first", TRIM_MARK, fill, pinned, slots, cfg["hi"],
+                    cfg["lo"])
+    want = min(int(cfg["max_pages"]), max(1, pinned - int(cfg["lo"] * slots)))
+    if str(os.environ.get(TRIM_POST_D_ENV, "1") if env is None else env.get(TRIM_POST_D_ENV, "1")).strip() != "0":
+        # the same beat for group D (Q-1190): a slot frees only when D's references are gone too, and
+        # the pages P gives back first (oldest) are the ones D adopted first (y9d3: D's yield alone
+        # freed nothing because P still held them -- and the other way round)
+        if post_need(pool, want, env):
+            _T["need_posts"] += 1
+    _T["seq"] += 1
+    _T["episode_cmds"] += 1
+    _T["orders"] += 1
+    return Weg2DualArenaTrim(int(_T["seq"]), int(want), int(round(fill * 1_000_000)))
+
+
+def pp0_stamp(sched, wire_reqs: Sequence[Any], now: Optional[float] = None, env=None) -> Tuple[List[Any], Optional[Weg2DualArenaTrim]]:
+    """PP0, before the chain send: ``(list to SEND, order or None)``. The dispatched list stays the
+    caller's (the ``weg2_store_told.pp0_publish`` convention). Off the gate: ``wire_reqs`` itself."""
+    cmd = pp0_decide(sched, now, env)
+    if cmd is None:
+        return wire_reqs, None
+    return list(wire_reqs or ()) + [cmd], cmd
+
+
+def follower_absorb(sched, recv_reqs: List[Any], env=None) -> List[Any]:
+    """A follower, after relaying the list onward and before dispatch: take PP0's order(s) off it and
+    execute them (in seq order). The list is returned as is when it carries none."""
+    if not recv_reqs:
+        return recv_reqs
+    cmds = [r for r in recv_reqs if isinstance(r, Weg2DualArenaTrim)]
+    if not cmds:
+        return recv_reqs
+    rest = [r for r in recv_reqs if not isinstance(r, Weg2DualArenaTrim)]
+    for c in sorted(cmds, key=lambda c: c.seq):
+        execute(sched, c, env)
+    return rest
+
+
+def execute(sched, cmd: Weg2DualArenaTrim, env=None) -> Dict[str, int]:
+    """Every P stage with the SAME order: spill host-only H-leaves of this stage's tree until
+    ``cmd.want`` pages were released here (node-id order, L3 copy first, budget-braked)."""
+    none = {"released": 0, "leaves": 0, "candidates": 0, "unsecured": 0, "braked": 0}
+    if not trim_enabled(env):
+        return none
+    from sglang.srt.mem_cache import form_a_host_shadow as _r12
+
+    tree = getattr(sched, "tree_cache", None)
+    pool = _tree_pool(sched)
+    rank = int(getattr(getattr(sched, "ps", None), "pp_rank", 0) or 0)
+    if pool is None or _r12.role() is not None:
+        logger.warning("%s n=%d STOP rank=%d seq=%d no_spill_pool_or_form_a: nothing given back here (the "
+                       "order is not executed on this stage)", TRIM_MARK, _T["execs"], rank, cmd.seq)
+        return none
+    cfg = trim_cfg(env)
+    t0 = time.monotonic()
+    got = spill_host_only(tree, pool, int(cmd.want), int(getattr(tree, "page_size", 1) or 1), set(),
+                          budget_s=cfg["budget_s"])
+    dt = time.monotonic() - t0
+    _T["execs"] += 1
+    k = _T["execs"]
+    if rank == 0 and got["released"] == 0:
+        # relative to PP0's decision clock (the same clock ``next_t`` runs on)
+        _T["next_t"] = max(_T["next_t"], float(_T.get("decided_t", 0.0)) + cfg["backoff_s"])
+    if k <= 8 or k % 64 == 0 or got["released"] == 0 or got.get("braked"):
+        logger.info("%s n=%d rank=%d seq=%d want=%d released_pages=%d leaves=%d candidates=%d "
+                    "unsecured_kept=%d braked=%d took_ms=%.1f fill=%.3f (PP0's order, the same on every P "
+                    "stage: host-only leaves, node-id order, L3 copy first; the slot frees when every "
+                    "holder of both groups gave its reference back)", TRIM_MARK, k, rank, cmd.seq,
+                    int(cmd.want), got["released"], got["leaves"], got["candidates"], got["unsecured"],
+                    int(got.get("braked", 0)), dt * 1000.0, cmd.fill_ppm / 1_000_000.0)
     return got

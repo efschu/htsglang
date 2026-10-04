@@ -30,6 +30,7 @@ from sglang.srt.distributed.pp_object_recv import get_or_create_frame
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
 from sglang.srt.managers import anchor_tails as _anchor_tails
 from sglang.srt.managers import weg2_store_told
+from sglang.srt.weg2 import dual_arena_spill as _das_trim  # Q-1500 UD-V2 arena trim (dual P only)
 from sglang.srt.managers.weg2_idle_vote import (
     VOTE_HOME_STEP_BUDGET_S,
     WEG2_VOTE_TAG,
@@ -6551,6 +6552,12 @@ class SchedulerPPMixin:
             # decided last pass at the front of the wire (weg2/flush_verdict.py).
             if self.pp_group.is_first_rank:
                 _wire_reqs = _flush_verdict.pp0_wire(self, _wire_reqs)
+            # Q-1500 UD-V2 (dual P only; returns the list untouched elsewhere): PP0's arena-trim
+            # order rides the wire like its pass clock, every stage executes the SAME order in
+            # this logical pass (weg2/dual_arena_spill.py, "V2 ARENA-TRIM").
+            _arena_trim_cmd = None
+            if self.pp_group.is_first_rank:
+                _wire_reqs, _arena_trim_cmd = _das_trim.pp0_stamp(self, _wire_reqs)
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
@@ -6565,6 +6572,10 @@ class SchedulerPPMixin:
                     async_send=True,
                 )
             _pp_seg(self, "in.send")
+            if _arena_trim_cmd is not None:
+                # PP0 serves its own order AFTER the send: the followers start theirs at once
+                _das_trim.execute(self, _arena_trim_cmd)
+                _pp_seg(self, "in.arena_trim")
             # NOTE: no blocking commit here, deliberately. Committing the
             # arm-carrying send in-pass is corpse B' (boot 13): this rank
             # blocked in _pp_commit_comm_work while its peers sat in the
@@ -6599,6 +6610,9 @@ class SchedulerPPMixin:
         # wire) and registers its held requests with the told span.
         if weg2_store_told.armed(self) and not weg2_store_told.is_pp0(self):
             recv_reqs = weg2_store_told.follower_absorb(self, recv_reqs)
+        if not self.pp_group.is_first_rank:
+            # Q-1500 UD-V2: PP0's arena-trim order (relayed above) is executed here and leaves the list
+            recv_reqs = _das_trim.follower_absorb(self, recv_reqs)
         _pp_seg(self, "in.absorb")
 
         # (i): arm in this same pass; the flip hook at the end of this
