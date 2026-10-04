@@ -749,8 +749,52 @@ class Bar1Lanes:
     def bdf(self) -> str:
         if self._bdf is None:
             from sglang.srt.distributed.device_communicators.barlink_matrix import bdf_of_card
+            # this rank's OWN device -- the one ordinal it may always ask CUDA about
             self._bdf = str(bdf_of_card(self.device))
+            self._publish_own_bdf(self._bdf)
         return self._bdf
+
+    # -- card -> PCI address WITHOUT asking CUDA about a foreign ordinal ------
+    # y7h (23c8fb584e, 10:42:56Z): ranks 1/2 see ONE device (CUDA_VISIBLE_DEVICES);
+    # bdf_of_card(<another card's launcher ordinal>) failed there ("big_cards:
+    # card 1 unreadable ... unknown-1") and left cudaErrorInvalidDevice as the
+    # thread's last error, which the next checked launch raised (D's resume:
+    # "invalid device ordinal"). Rank n of either group runs on cards[n], so the
+    # card's own process names it: each process publishes its own BDF here, and
+    # a source's mapped peer window carries the receiver's (PeerWindow.peer_bdf).
+    def _card_dir(self) -> str:
+        return os.path.join(self.root, f"weg2-bar1-{self.boot_nonce}", "cards")
+
+    def _publish_own_bdf(self, bdf: str) -> None:
+        if not bdf or bdf.startswith("unknown"):
+            return
+        try:
+            d = self._card_dir()
+            os.makedirs(d, exist_ok=True)
+            tmp = os.path.join(d, f".card{self.rank}.{os.getpid()}")
+            with open(tmp, "w") as f:
+                f.write(bdf)
+            os.replace(tmp, os.path.join(d, f"card{self.rank}.bdf"))
+        except OSError as exc:  # noqa: BLE001 -- a missing registry entry only drops an ordering hint
+            self.log(f"WEG2-BAR1 card registry: own bdf not published: {exc!r}")
+
+    def card_bdf(self, card: int) -> Optional[str]:
+        """PCI address of launcher card ``card``, or None -- never a CUDA call
+        for a card that is not this rank's own."""
+        card = int(card)
+        if card == self.rank:
+            return self.bdf()
+        for k, pair in enumerate(self.cross_pairs):
+            if int(pair[1]) == card:
+                b = getattr(self.peers.get(f"p{k}"), "peer_bdf", None)
+                if b:
+                    return str(b)
+        try:
+            with open(os.path.join(self._card_dir(), f"card{card}.bdf")) as f:
+                b = f.read().strip()
+            return b or None
+        except OSError:
+            return None
 
     def group_windows(self) -> dict:
         """{group name: payload bytes} of this process's live barlink
@@ -775,11 +819,14 @@ class Bar1Lanes:
         """Card indices whose BAR1 is big (the 5090): rank n of either group
         runs on cards[n], so the ordinal IS the card index."""
         from sglang.srt.distributed.device_communicators.barlink_bar1 import bar1_window
-        from sglang.srt.distributed.device_communicators.barlink_matrix import bdf_of_card
         out = []
         for c in sorted({int(x) for pair in self.cross_pairs for x in pair}):
             try:
-                if int(bar1_window(str(bdf_of_card(c))).size) >= BIG_BAR_MIN:
+                bdf = self.card_bdf(c)   # y7h: no bdf_of_card for a foreign ordinal
+                if bdf is None:
+                    self.log(f"WEG2-BAR1 big_cards: card {c} not named yet (no own/peer/registry bdf)")
+                    continue
+                if int(bar1_window(str(bdf)).size) >= BIG_BAR_MIN:
                     out.append(c)
             except Exception as exc:  # noqa: BLE001 -- an unreadable card is not big
                 self.log(f"WEG2-BAR1 big_cards: card {c} unreadable: {exc!r}")

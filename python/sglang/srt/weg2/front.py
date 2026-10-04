@@ -3415,7 +3415,8 @@ class Group:
 async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
                         max_dispatch: int = 0, cost=None, budget: int = 0,
                         stats: Optional[Dict[str, int]] = None,
-                        extra=None, poll_s: float = 0.0, dual_wake: bool = False) -> int:
+                        extra=None, poll_s: float = 0.0, dual_wake: bool = False,
+                        cap_exempt=None) -> int:
     """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
     ``queue`` (a deque; new arrivals appended while draining are taken too)
     the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order, and
@@ -3441,6 +3442,14 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     ``stats`` (optional) is filled with ``dispatched``, ``peak_n``,
     ``peak_tokens`` and ``pool_holds`` for the drain's P-PHASE line.
 
+    FLIPCYCLE H5 (02.10., ``cap_exempt``): once the phase cap is reached, a
+    queued item for which ``cap_exempt(item)`` is True (a SHORT, est_uncached
+    <= X) is still dispatched -- taken out of the queue wherever it stands, in
+    queue order, under the same overlap plan. Without it the cap stranded the
+    SHORT in the queue and D prefilled it after the P->D flip with every seat
+    stalled (y6z ep 2, weg2-1-7: 25 tokens, 2.03 s D pass). ``stats`` then also
+    counts ``short_rides``. The LONG items keep waiting for the next P phase.
+
     RO (weg2.p_read_overlap): ``extra(items)`` gets the in-flight items and
     returns how many dispatches may go beyond ``limit`` (one per leg P only
     holds for its store read); with it the pool also wakes every ``poll_s``
@@ -3459,8 +3468,20 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     items: Dict[Any, Any] = {}
     rounds = 0
     if stats is not None:
-        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched"):
+        for k in ("dispatched", "peak_n", "peak_tokens", "pool_holds", "overlap_dispatched",
+                  "short_rides"):
             stats.setdefault(k, 0)
+
+    def _exempt_index() -> Optional[int]:
+        if cap_exempt is None:
+            return None
+        for i, q in enumerate(queue):
+            try:
+                if cap_exempt(q):
+                    return i
+            except Exception:  # noqa: BLE001 - a predicate error never stops the drain
+                return None
+        return None
 
     def _cap() -> int:
         if extra is None or len(inflight) < limit:
@@ -3473,15 +3494,26 @@ async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch,
     while True:
         dispatched = False
         while queue and len(inflight) < _cap() and may_dispatch():
+            idx = 0
+            ride = False
             if phase_policy.phase_cap_reached(dispatched_total, max_dispatch):
-                break
-            c = int(cost(queue[0])) if (cost is not None and budget > 0) else 0
+                idx = _exempt_index()
+                if idx is None:
+                    break
+                ride = True
+            c = int(cost(queue[idx])) if (cost is not None and budget > 0) else 0
             if not phase_policy.p_overlap_admits(inflight_tokens, len(inflight), c, budget):
                 if stats is not None:
                     stats["pool_holds"] += 1
                 break
             _beyond = len(inflight) >= limit
-            item = queue.popleft()
+            if idx == 0:
+                item = queue.popleft()
+            else:
+                item = queue[idx]
+                del queue[idx]
+            if ride and stats is not None:
+                stats["short_rides"] += 1
             t = asyncio.ensure_future(one(item))
             inflight[t] = c
             items[t] = item
@@ -6495,6 +6527,7 @@ class Front:
                     "reused=%d encoded=%d%s",
                     rid, pending, c.n, credit, src, int(known), est_uncached, est_prompt,
                     est_uncached - pending, c.ms, wait_ms, c.reused, c.encoded, mm_tag)
+        self._prefix_diverge(rid, c.ids, pending, credit, src, l3)
         from types import SimpleNamespace
 
         return SimpleNamespace(pending=pending, n=c.n, known=known, credit=credit, src=src,
@@ -6942,6 +6975,53 @@ class Front:
             logger.info("WEG2 SESSION-PREFIX rid=%s sess=%s prev_rid=%s common=%d prompt=%d "
                         "prev_prompt=%d (front token ids: where this prompt leaves the session's "
                         "previous one)", rid, sess, prev_rid, common, len(ids), prev_len)
+        except Exception:  # noqa: BLE001 -- an instrument, never the price
+            pass
+
+    def _prefix_diverge(self, rid: str, ids, pending: int, credit: int, src: str,
+                        l3: int) -> None:
+        """PREFIX-DIVERGE (NF y7l 99d1977a63, 02.10.): where a priced prompt
+        leaves the earlier prompt it shares the longest token prefix with,
+        against the credit the store/D gave it -- on every arrival that
+        prefills more than X (a P leg), the one line that tells "the client
+        sent a different prefix" (``client_diverged``) from "a prefix an
+        earlier prompt had was not readable" (``store_short``).
+
+        y7l, by hand from the store journal: weg2-4-18 (pending 71949)
+        left weg2-2-7 inside its first 3328 tokens, weg2-8-20 (pending 87034)
+        left weg2-6-19 at 78208; the first page each P read missed was born
+        8-18 s later by the request's own prefill. Front-only, sessionless,
+        never a price input; an instrument never raises."""
+        try:
+            rp = self.__dict__.get("_recent_prompts")
+            if rp is None:
+                from sglang.srt.weg2.front_tokens import RecentPrompts
+
+                rp = self._recent_prompts = RecentPrompts()
+            if ids is None or int(ids.size) == 0:
+                return
+            x = int(getattr(self, "tp_prefill_max_tokens", 0) or 4096)
+            if int(pending) > x:
+                from sglang.srt.weg2.front_tokens import reprefill_verdict
+
+                page = int(getattr(getattr(self, "tspans", None), "anchor_page", 0) or 64)
+                lcp, prev_rid, prev_len, prev_t = rp.best(ids, exclude_rid=str(rid))
+                verdict, lost = reprefill_verdict(int(credit), lcp, page)
+                self.counters["prefix_diverge_" + verdict] += 1
+                self.counters["prefix_diverge_" + verdict + "_tokens"] += int(lost)
+                age = (time.time() - prev_t) if prev_t is not None else -1.0
+                (logger.warning if verdict == "store_short" else logger.info)(
+                    "WEG2 PREFIX-DIVERGE rid=%s verdict=%s prompt=%d credit=%d src=%s l3=%d "
+                    "pending=%d best_prev=%s prev_prompt=%d prev_age_s=%.1f common=%d "
+                    "common_page=%d lost=%d (front token ids against the last %d priced "
+                    "prompts: client_diverged = no earlier prompt shares more than the credit, "
+                    "the client changed its text at token `common`; store_short = an earlier "
+                    "prompt shares `common` but the store/D credited only `credit` -- pages "
+                    "lost or not yet written, or no Mamba anchor in between)",
+                    rid, verdict, int(ids.size), int(credit), src, int(l3), int(pending),
+                    prev_rid or "-", int(prev_len), age, int(lcp), int(lcp) // page * page,
+                    int(lost), rp.cap)
+            rp.note(str(rid), ids)
         except Exception:  # noqa: BLE001 -- an instrument, never the price
             pass
 
@@ -10811,6 +10891,24 @@ class Front:
                            _asr.MARKER, p.rid, dwell, need_s, src, victim,
                            sum(1 for r in running if r in resumed), self.epoch)
         return True
+
+    def _p_phase_short_rides(self, p: "Pending") -> bool:
+        """FLIPCYCLE H5 (02.10.): a queued request the P phase takes past its
+        cap -- the same SHORT a D phase would prefill itself (QUEUED-SHORT's
+        filter: route verdict SHORT, uncached <= X, no vision stage, never
+        re-queued, not P-only). Its prefill is P's while P is awake (E2: no D
+        prefill after the flip); it still needs a D seat for its decode, as the
+        QUEUED-SHORT would have."""
+        def _g(k, d=None):
+            return getattr(p, k, d)
+        if not _g("d_eligible", False) or _g("intake_stalled", False) or _g("leg1_done", False):
+            return False
+        if _g("reroutes", 0) or _g("x_requeues", 0) or _g("p_only", False) or _g("x_deferred", False):
+            return False
+        if _g("client_gone", False):
+            return False
+        x = int(getattr(self, "tp_prefill_max_tokens", 0) or 0)
+        return 0 <= int(_g("est_uncached", 0) or 0) <= x
 
     def _asr_queued_short_to_d(self, live_q: List["Pending"], now: float) -> List["Pending"]:
         """ARRIVAL-SEAT: every queued SHORT whose own route verdict was SHORT
@@ -15470,7 +15568,10 @@ class Front:
         tag = os.environ.get("SGLANG_WEG2_DUAL_KV_TAG", "") or os.environ.get("SGLANG_WEG2_TAG", "weg2")
         grant, per_tok, weights, step_tok, lent = 0, 0.0, 0, 0, 0
         stages = []
-        for r in range(3):
+        # HW-P1c 1003 (DUAL-FRONT-STAGES): one stage file per P stage = per card;
+        # at most 3 on the reference rig (range(3) as before), more cards read
+        # theirs too. A missing file is skipped below, so N < 3 needs no change.
+        for r in range(max(3, len(self.dual_kv_ledgers or ()))):
             try:
                 with open(_pk.stage_file(tag, r)) as f:
                     t = json.load(f)
@@ -16439,7 +16540,22 @@ class Front:
                 budget=self.p_pool_tokens, stats=_phase_stats,
                 extra=(None if _ro_state is None else
                        (lambda ps: _ro.extra_slots((q.rid for q in ps), _ro_state.rids(), _ro_max))),
-                poll_s=_ro.POLL_S, dual_wake=bool(self.dual_layout))
+                poll_s=_ro.POLL_S, dual_wake=bool(self.dual_layout),
+                # FLIPCYCLE H5: the phase cap never strands a SHORT -- except under the
+                # DECODE-COLLECT seat gate (``_dc_cap`` > 0): there the cap IS the free-seat
+                # count, a hard bound (head wins over the H5 port: no SHORT rides past it).
+                cap_exempt=(self._p_phase_short_rides
+                            if (envs.SGLANG_WEG2_ENABLE_P_PHASE_SHORT_RIDES.get() and _dc_cap <= 0)
+                            else None))
+            if _phase_stats.get("short_rides"):
+                self.counters["p_phase_short_rides"] += _phase_stats["short_rides"]
+                logger.info(
+                    "WEG2-FLIPCYCLE stage=d_prefill_after_flip epoch=%d ms=0 floor_ms=0 "
+                    "avoided=%d dispatched=%d cap=%d (H5: SHORTs past the P phase cap rode "
+                    "P's batch instead of a D prefill after the P->D flip -- each such D "
+                    "pass cost 1.2-2.2 s with every seat stalled, y6z d_extend)",
+                    self.epoch, _phase_stats["short_rides"], _phase_stats["dispatched"],
+                    self.p_phase_max_requests)
             if _phase_stats.get("overlap_dispatched"):
                 self.counters["p_read_overlap"] += _phase_stats["overlap_dispatched"]
                 logger.info("WEG2 P-READ-OVERLAP epoch=%d overlap_dispatched=%d dispatched=%d "
