@@ -4353,8 +4353,15 @@ class SchedulerPPMixin:
                     # stage, send-join + output from the last stage) -- xsn224's
                     # request tails read other_ms=400-700 with every named term
                     # near 0, i.e. the pass sat in exactly these two.
-                    _1466_prx = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
-                    _1466_cmt = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0)
+                    # 1447 (04.10.): _pp_process_batch_result zeroes _1463_recv_ms/_1463_commit_ms
+                    # after its PASS-TAIL line, i.e. BEFORE this block reads them on the next
+                    # slot. nf12: other_ms >= 800 equalled recv+commit of the PASS-TAIL line in
+                    # 137 of 137 passes, with commit_ms/proxy_recv_ms printed as 0 here. The
+                    # kept copies (summed since the last read here) restore the two terms.
+                    _1466_prx = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0) + float(
+                        getattr(self, "_1466_recv_keep", 0.0) or 0.0)
+                    _1466_cmt = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0) + float(
+                        getattr(self, "_1466_commit_keep", 0.0) or 0.0)
                     _1466_proc = float(getattr(self, "_1463_process_ms", 0.0) or 0.0)  # #1466c: process_batch_result
                     # #1475: the intake's own parts (weg2xsn232-235: input_ms 1.4-1.9 s
                     # on every rank in the same pass, handle_generate_request < 200 ms)
@@ -4376,6 +4383,8 @@ class SchedulerPPMixin:
                         self._1463_recv_ms = 0.0
                         self._1463_commit_ms = 0.0
                         self._1463_process_ms = 0.0
+                        self._1466_recv_keep = 0.0
+                        self._1466_commit_keep = 0.0
                     except Exception:  # noqa: BLE001
                         pass
                 except Exception:  # noqa: BLE001
@@ -11290,6 +11299,9 @@ class SchedulerPPMixin:
                         "#1463 PASS-TAIL pp_rank=%s bs=%d finished=%d recv_ms=%.0f commit_ms=%.0f process_ms=%.0f t=%.3f",
                         getattr(getattr(self, "ps", None), "pp_rank", "?"), len(_reqs), _fin,
                         _recv, _commit, _proc, time.time())
+                # 1447: keep what PASS-STALL (next slot) still has to subtract
+                self._1466_recv_keep = float(getattr(self, "_1466_recv_keep", 0.0) or 0.0) + _recv
+                self._1466_commit_keep = float(getattr(self, "_1466_commit_keep", 0.0) or 0.0) + _commit
                 self._1463_recv_ms = 0.0
                 self._1463_commit_ms = 0.0
             except Exception:  # noqa: BLE001
