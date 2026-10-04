@@ -683,6 +683,12 @@ class Envs:
     # Inert outside SGLANG_WEG2_DUAL_LAYOUT=1 + SGLANG_WEG2_GROUP=D.
     SGLANG_WEG2_DUAL_D_LIVE_YIELD_WAIT_S = EnvFloat(4.0)
     SGLANG_WEG2_DUAL_D_REGROW_HOLD_S = EnvFloat(5.0)
+    # #1500i PKVWAIT-INSTR (y9d4d, desk analysis 1390 Fix 1): LOG-ONLY census lines that name why a
+    # full-arena D hands no VRAM to a waiting P -- the refusal reasons of ``spill_host_only``, the
+    # evictable size after the D cache yield, the owner of D's topmost live row. At most one line per
+    # 5 s per rank and marker, no collective, no behaviour. Inert outside SGLANG_WEG2_DUAL_LAYOUT=1
+    # (either group with its KV cap); 0 = no line, no cost.
+    SGLANG_WEG2_DUAL_PKVWAIT_INSTR = EnvBool(True)
     # ENABLE_PARK_L3 (#248, rc12s 17:32:40: D held 5213 of 5461 KV arena slots
     # by reference while it slept -- 2 parked + 3 held requests -- and P's
     # claims found "no free slot"): a request that does not run on D (parked,

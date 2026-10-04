@@ -416,6 +416,54 @@ def d_demand(sched) -> int:
     return sum(_sv._req_tokens(r) for r in running) + sum(_sv._req_tokens(r) for r in queue)
 
 
+def _instr_cache_yield(tree, actor, ev_before: int, live) -> None:
+    """#1500i PKVWAIT-INSTR (log only, rate-limited, own try): what the evict left. ``ev_before`` is the
+    ``evicted=`` of the CACHE-YIELD lines (``evictable_size()`` BEFORE the evict); ``ev_after`` is the same
+    counter after it. ``dev_unbacked`` = write_back leaves still on the card without a host copy (the y9d4d
+    hypothesis: the full arena refuses their backup, ``unbacked_drop_allowed`` is False on a TP group)."""
+    from sglang.srt.weg2 import dual_pkvwait_instr as _pi
+
+    sup = _pi.begin("cache_yield")
+    if sup is None:
+        return
+    try:
+        sz = _pi.tree_sizes(tree)
+        fields = [("live", 0 if live is None else 1), ("ev_before", int(ev_before)), ("ev_after", sz["evictable"]),
+                  ("protected", sz["protected"]), ("mapped", int(actor.mapped_tokens))]
+        fields += list(_pi.device_leaf_census(tree).items())
+        _pi.emit("cache_yield", fields, sup)
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the yield
+        logger.debug("%s cache_yield census failed", _pi.MARK, exc_info=True)
+
+
+def _instr_shrink_blocked(sched, actor, reason: Optional[str], need: int, floor: int, live_local: int,
+                          p_wait_s: float, holds: bool, p_missing: bool, recent_grow: bool,
+                          avail_min: int) -> None:
+    """#1500i PKVWAIT-INSTR (log only, rate-limited, own try): the SHRINK-BLOCKED reason is the FIRST in a
+    fixed order (``holds`` hides ``live_floor``), so print every condition on its own plus who sits on
+    this rank's topmost live row (``live_row`` = max live id * page; the group floor is the MAX of the
+    ranks' rows, ``floor_is_local`` says whether this rank's row is it)."""
+    from sglang.srt.weg2 import dual_pkvwait_instr as _pi
+
+    sup = _pi.begin("shrink_blocked")
+    if sup is None:
+        return
+    try:
+        floor_blocks = _pk.round_up(int(floor), int(actor.step)) >= int(actor.mapped_tokens)
+        parked = getattr(sched, "weg2_d_parked", None) or ()
+        fields = [("reason", reason or "none"), ("mapped", int(actor.mapped_tokens)), ("need", int(need)),
+                  ("floor", int(floor)), ("floor_blocks", int(floor_blocks)), ("live_row", int(live_local)),
+                  ("floor_is_local", int(int(live_local) == int(floor))), ("holds", int(bool(holds))),
+                  ("parked", len(parked)), ("d_hold", int(bool(getattr(sched, "_weg2_d_hold", None)))),
+                  ("p_missing", int(bool(p_missing))), ("regrow_hold", int(bool(recent_grow))),
+                  ("p_wait_s", float(p_wait_s)), ("avail_min", int(avail_min))]
+        own = _pi.top_row_owner(sched, int(live_local), int(actor.page))
+        fields += [(k, v) for k, v in own.items() if k != "top_row"]
+        _pi.emit("shrink_blocked", fields, sup)
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the tick
+        logger.debug("%s shrink_blocked census failed", _pi.MARK, exc_info=True)
+
+
 def cache_yield(sched, actor, live: Optional[Tuple[int, float]] = None) -> int:
     """Evict D's whole EVICTABLE device cache (unlocked nodes only -- a live
     seat's rows are locked and stay). Backed prefixes keep their L2 copy.
@@ -438,6 +486,7 @@ def cache_yield(sched, actor, live: Optional[Tuple[int, float]] = None) -> int:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
     tree.evict(EvictParams(num_tokens=ev))
+    _instr_cache_yield(tree, actor, ev, live)
     t = _pk._now()
     if live is not None:
         if t >= getattr(actor, "_live_yield_log_next", 0.0):
@@ -597,9 +646,12 @@ def tick(sched) -> Optional[str]:
         # in the same second -> pressure on P -> a second P pause)
         verdict, level = "hold", actor.mapped_tokens
     if live_due and verdict != "shrink" and not freed:     # a yield tick's floor predates its eviction
-        _note_shrink_blocked(actor, shrink_blocked_reason(
+        blocked_reason = shrink_blocked_reason(
             mapped=actor.mapped_tokens, need=need, floor=floor, step=actor.step, holds=holds,
-            p_missing=p_missing, regrow_hold=recent_grow), need, floor, p_wait_s)
+            p_missing=p_missing, regrow_hold=recent_grow)
+        _note_shrink_blocked(actor, blocked_reason, need, floor, p_wait_s)
+        _instr_shrink_blocked(sched, actor, blocked_reason, need, floor, live_local, p_wait_s, holds,
+                              p_missing, recent_grow, avail_min)
     if verdict != "grow" and st is not None and (int(st.pressure.get("P", 0) or 0) > 0
                                                  or int(st.demand.get("D", 0) or 0) > 0):
         # D's demand fits what it maps (seats ended, aborted or shrunk): the pressure

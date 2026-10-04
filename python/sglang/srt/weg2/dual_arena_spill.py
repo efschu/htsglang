@@ -89,54 +89,120 @@ def anchor_spill_pool(pool: Any, env=None) -> Optional[Any]:
     return None
 
 
-def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
-    """A host-only H-leaf whose host copy may leave L2 once it has an L3 copy."""
+def _host_pages(node: Any) -> int:
+    """Host rows the node's base host value names (an instrument's weight; 0 when it has none)."""
+    try:
+        from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
+
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        return int(hv.numel()) if hv is not None else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _leaf_reason(node: Any) -> str:
+    """Why ``cache._is_host_leaf`` said no (the same checks in the same order, for the census only)."""
+    if not getattr(node, "evicted", True):
+        return "device_resident"
+    if not getattr(node, "backuped", False):
+        return "unbacked"
+    if any(getattr(cd, "host_lock_ref", 0) > 0 for cd in node.component_data):
+        return "host_locked"
+    if len(getattr(node, "children", ()) or ()) > 0:
+        return "has_children"
+    return "not_host_leaf"
+
+
+def _blocked_kind(cache: Any, node: Any) -> str:
+    """Which V1 guard of ``pp_slot_fidelity._subtree_blocked`` fired (same order; census only)."""
+    if getattr(node, "write_through_pending_id", None) is not None:
+        return "wt_pending_id"
+    if getattr(node, "id", None) in (getattr(cache, "_weg2_direct_mamba_rows", None) or {}):
+        return "direct_mamba_rows"
+    return "end_anchor"
+
+
+def _reason(cache: Any, node: Any, pool: Any, skip: set) -> Optional[str]:
+    """None = a host-only H-leaf whose host copy may leave L2 once it has an L3 copy; else the NAME of the
+    first check that refused it (the order of the checks is the decision: ``_eligible`` is exactly
+    ``_reason is None``). #1500i: the census of ``spill_host_only`` counts these."""
     from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE, _aux_components
 
-    if node is cache.root_node or id(node) in skip:
-        return False
+    if node is cache.root_node:
+        return "root"
+    if id(node) in skip:
+        return "skip"
     if not cache._is_host_leaf(node):    # evicted, backuped, no children, no host lock
-        return False
+        return _leaf_reason(node)
     cd = node.component_data[BASE_COMPONENT_TYPE]
     hv = cd.host_value
-    if hv is None or cd.value is not None or hv.numel() == 0:
-        return False
+    if hv is None or hv.numel() == 0:
+        return "no_host_value"
+    if cd.value is not None:
+        return "device_value"
     if node.id in cache.ongoing_write_through:
-        return False                      # pending write: the slots are not COMPLETE yet
+        return "write_through_ongoing"    # pending write: the slots are not COMPLETE yet
     from sglang.srt.weg2 import pp_slot_fidelity as _sf
 
     if _sf._subtree_blocked(cache, node, cache.ongoing_write_through):
         # the V1 guards (one source): write_through_pending_id (a split node keeps the OLD id), the
         # #1427 direct write's mamba rows in flight, a host-backed END anchor D may not have read yet
-        return False
+        return "blocked_" + _blocked_kind(cache, node)
     if not getattr(node, "hash_value", None):
-        return False                      # the page count cannot be checked
+        return "no_hash"                  # the page count cannot be checked
     if any(
         node.component_data[c.component_type].host_value is not None
         and node.component_data[c.component_type].value is None
         for c in _aux_components(cache)
     ):
-        return False                      # an aux state lives on the host only (anchor, park_l3)
+        return "aux_host_only"            # an aux state lives on the host only (anchor, park_l3)
     if int(hv.min()) < int(getattr(pool, "staging_rows", 0)):
-        return False                      # staging rows are not arena slots
-    return True
+        return "staging"                  # staging rows are not arena slots
+    return None
+
+
+def _eligible(cache: Any, node: Any, pool: Any, skip: set) -> bool:
+    """A host-only H-leaf whose host copy may leave L2 once it has an L3 copy."""
+    return _reason(cache, node, pool, skip) is None
 
 
 def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
-                    budget_s: float = 0.0) -> Dict[str, int]:
+                    budget_s: float = 0.0, who: str = "claim") -> Dict[str, int]:
     """Spill host-only H-leaves of a dual P tree until ``want`` pages were
     released here (node-id order). Returns the counts; the log line names them.
 
     ``budget_s`` > 0 (V2 ARENA-TRIM only; the claim-driven callers pass none): a wall-clock
     brake -- the L3 copy of a leaf is file I/O on the scheduler thread, so the loop stops
-    before the NEXT leaf once the budget is spent (``braked`` = 1 in the result)."""
+    before the NEXT leaf once the budget is spent (``braked`` = 1 in the result).
+
+    ``who`` (#1500i, log only): the caller's name in the PKVWAIT-INSTR census line -- ``claim`` (the
+    W3 claim path), ``dyield`` (D-ARENA-YIELD), ``trim`` (V2 ARENA-TRIM)."""
     from sglang.srt.mem_cache.unified_radix_cache import BASE_COMPONENT_TYPE
+    from sglang.srt.weg2 import dual_pkvwait_instr as _pi
 
     P = max(1, int(page_size or 1))
-    heap = [(n.id, n) for n in cache._collect_all_nodes() if _eligible(cache, n, pool, skip)]
+    # #1500i census of the refusals: counted in the same pass that builds the heap, only when the line will
+    # be printed (dual gate + switch + rate limit); None = no census, no cost, the pass is the old one
+    ins_marker = "spill_" + str(who)
+    ins_sup = _pi.begin(ins_marker)
+    census: Optional[Dict[str, int]] = {} if ins_sup is not None else None
+    heap = []
+    nodes_total = 0
+    cand_pages = 0
+    for n in cache._collect_all_nodes():
+        r = _reason(cache, n, pool, skip)
+        if r is None:
+            heap.append((n.id, n))
+            if census is not None:
+                cand_pages += _host_pages(n)
+        elif census is not None and r != "root":
+            _pi.count(census, r, _host_pages(n))
+        if census is not None and r != "root":
+            nodes_total += 1
     candidates = len(heap)
     heapq.heapify(heap)
     released = leaves = unsecured = on_disk = written = braked = 0
+    stale = unsec_lost = unsec_short = 0
     t_end = (time.monotonic() + float(budget_s)) if budget_s and budget_s > 0 else None
     while heap and released < want:
         if t_end is not None and time.monotonic() >= t_end:
@@ -144,11 +210,16 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
             break
         _id, node = heapq.heappop(heap)
         if not _eligible(cache, node, pool, skip):
+            stale += 1
             continue
         cd = node.component_data[BASE_COMPONENT_TYPE]
         sec = pool.secure_rows_to_l3(cd.host_value)
         if int(sec.get("lost", 0)) or int(sec.get("pages", 0)) != len(node.hash_value):
             unsecured += 1                # no L3 copy for every page, or a page not COMPLETE: it stays
+            if int(sec.get("lost", 0)):
+                unsec_lost += 1
+            else:
+                unsec_short += 1
             continue
         on_disk += int(sec.get("on_disk", 0))
         written += int(sec.get("written", 0))
@@ -167,6 +238,21 @@ def spill_host_only(cache: Any, pool: Any, want: int, page_size: int, skip: set,
             "written:%d (a host-only leaf leaves L2 only with its L3 copy for every page; the dual P tree "
             "is host-only after each idle release)",
             MARK, k, int(want), released, leaves, candidates, unsecured, on_disk, written)
+    if census is not None:
+        try:
+            fields = [("who", who), ("want", int(want)), ("released_pages", released), ("leaves", leaves),
+                      ("candidates", candidates), ("cand_pages", cand_pages), ("nodes", nodes_total),
+                      ("unsecured", unsecured), ("unsec_lost", unsec_lost), ("unsec_short", unsec_short),
+                      ("stale_pop", stale), ("braked", braked)]
+            fields += list(_pi.census_fields(census))
+            try:
+                st = pool.arena.stats()           # O(1) counters of the shared header
+                fields += [("arena_complete", int(st["complete"])), ("arena_slots", int(st["slots"]))]
+            except Exception:  # noqa: BLE001 -- a pool without an arena: the census stays without them
+                pass
+            _pi.emit(ins_marker, fields, ins_sup)
+        except Exception:  # noqa: BLE001 -- an instrument never breaks the spill
+            logger.debug("%s census failed", _pi.MARK, exc_info=True)
     return {"released": released, "leaves": leaves, "candidates": candidates, "unsecured": unsecured,
             "braked": braked}
 
@@ -302,7 +388,7 @@ def d_yield_arena(sched, need: int) -> Dict[str, int]:
                            "secure_rows_to_l3 -- nothing yielded", YIELD_MARK, _Y["no_pool"], int(need))
         return {"released": 0, "leaves": 0, "candidates": 0, "unsecured": 0}
     want = max(int(need), D_YIELD_MIN_PAGES)
-    got = spill_host_only(tree, pool, want, int(getattr(tree, "page_size", 1) or 1), set())
+    got = spill_host_only(tree, pool, want, int(getattr(tree, "page_size", 1) or 1), set(), who="dyield")
     if got["released"] == 0:
         _Y["quiet_until"] = time.monotonic() + D_YIELD_EMPTY_BACKOFF_S
     _Y["yields"] += 1
@@ -644,7 +730,7 @@ def _execute(sched, cmd: Weg2DualArenaTrim, env, none: Dict[str, int]) -> Dict[s
     t0 = time.monotonic()
     try:
         got = spill_host_only(tree, pool, int(cmd.want), int(getattr(tree, "page_size", 1) or 1), set(),
-                              budget_s=cfg["budget_s"])
+                              budget_s=cfg["budget_s"], who="trim")
     except Exception:  # noqa: BLE001 - L3 I/O or a leaf eviction failed: this order ends here, the
         # next one starts from whatever tree state each leaf's own eviction left (every leaf is evicted
         # whole or not at all); a raise would end the rank, which is what V2 exists to prevent
