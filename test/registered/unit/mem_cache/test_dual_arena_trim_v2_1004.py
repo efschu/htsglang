@@ -558,7 +558,7 @@ def test_a3_orders_that_do_not_lower_the_pin_pause_the_episode_and_the_tree_is_n
     pause the episode (30 s, a named warning); the host tree is NOT cleared order by order."""
     import logging
 
-    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5"}))
+    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5", "SGLANG_WEG2_DUAL_ARENA_TRIM_PAUSE_S": "30"}))
     caplog.set_level(logging.INFO)
     sched, cache, pool, nodes = _stage(60)
     pool.arena.d_rows = {7000 + i for i in range(60)}            # D references every page P holds
@@ -588,6 +588,67 @@ def test_a3_orders_that_do_lower_the_pin_never_pause(monkeypatch):
         _tick(sched, t)
         t += 2.0
     assert D._T["pauses"] == 0 and _fill(pool) <= 0.80 + 1e-9
+
+
+def test_neu1_during_the_pause_d_still_hears_the_need_and_the_default_pause_is_short(monkeypatch):
+    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5"}))
+    assert D.trim_cfg()["pause_s"] == 10.0
+    posts = []
+    monkeypatch.setattr(D, "post_need", lambda pool, pages, env=None: posts.append(int(pages)) or True)
+    sched, cache, pool, nodes = _stage(60)
+    pool.arena.d_rows = {7000 + i for i in range(60)}
+    pool.arena.extra_pinned = 35                                 # pinned 95, D holds everything P gives
+    t = 0.0
+    for _ in range(4):                                           # decisions 1-4: 3 orders, then the pause (t=6)
+        _tick(sched, t)
+        t += 2.0
+    assert D._T["pauses"] == 1 and len(posts) == 3               # one post per order so far
+    c = _tick(sched, t)                                          # inside the pause (t=8, until 16)
+    assert c is None and len(posts) == 4 and posts[-1] == 95 - 80    # D still hears pinned - LO*slots
+    assert _tick(sched, t + 2.0) is None and len(posts) == 5
+    assert len(_live(cache)) == 60 - 15                          # P gives nothing in the pause
+
+
+def test_neu1_the_pause_ends_when_the_header_shows_the_fill_at_or_below_hi(monkeypatch):
+    """D gave the pages after all: the next header read ends the pause, a new rise starts a new episode at once."""
+    _env(monkeypatch, dict(DUAL_P, **{TRIM_MAX_PAGES_ENV: "5", "SGLANG_WEG2_DUAL_ARENA_TRIM_PAUSE_S": "600"}))
+    sched, cache, pool, nodes = _stage(60)
+    pool.arena.d_rows = {7000 + i for i in range(60)}
+    pool.arena.extra_pinned = 35
+    t = 0.0
+    for _ in range(5):
+        _tick(sched, t)
+        t += 2.0
+    assert D._T["pause_until"] > 0
+    pool.arena.d_rows = set()                                    # D gave its references back: pinned = 45 + 35 = 80
+    pool.arena.unreferenced = 15                                 # complete = 95 > HI: the census is read (not the stats bound)
+    assert _tick(sched, t) is None and D._T["pause_until"] == 0.0
+    pool.arena.extra_pinned = 60                                 # and the arena rises again (105 > 100 slots: fine for the fake)
+    c = _tick(sched, t + 2.0)
+    assert c is not None and D._T["active"]                      # no wait for the 600 s
+
+
+def test_neu2_the_pool_lookup_the_role_and_the_config_are_inside_the_never_raise_net(monkeypatch, caplog):
+    import logging
+
+    _env(monkeypatch, DUAL_P)
+    caplog.set_level(logging.WARNING)
+    sched, cache, pool, nodes = _stage(97, pp_rank=1)
+
+    def boom(*a, **k):
+        raise RuntimeError("lookup broke")
+
+    for name in ("_tree_pool", "trim_cfg"):
+        monkeypatch.setattr(D, name, boom)
+        got = D.execute(sched, D.Weg2DualArenaTrim(1, 5, 970000))
+        assert got["released"] == 0 and len(_live(cache)) == 97
+        monkeypatch.undo()
+        _env(monkeypatch, DUAL_P)
+    from sglang.srt.mem_cache import form_a_host_shadow as r12
+
+    monkeypatch.setattr(r12, "role", boom)
+    assert D.execute(sched, D.Weg2DualArenaTrim(1, 5, 970000))["released"] == 0
+    assert len([r for r in caplog.records if "STOP execute_failed" in r.getMessage()]) == 3
 
 
 # ---- review 09:04Z A5: the request trace ----------------------------------------------------------------

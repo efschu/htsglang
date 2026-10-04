@@ -381,8 +381,8 @@ TRIM_BUDGET_S_DEFAULT = 0.25
 TRIM_EMPTY_BACKOFF_S_DEFAULT = 2.0
 #: this many orders in a row that did not lower arena_pinned pause the episode (the holder is not P's tree)
 TRIM_STALE_N_DEFAULT = 3
-#: ... for this long
-TRIM_PAUSE_S_DEFAULT = 30.0
+#: ... for this long (the pause also ends as soon as the header shows the fill at or below HI)
+TRIM_PAUSE_S_DEFAULT = 10.0
 
 
 class Weg2DualArenaTrim(NamedTuple):
@@ -398,14 +398,14 @@ class Weg2DualArenaTrim(NamedTuple):
 _T: Dict[str, Any] = {
     "active": False, "next_t": 0.0, "seq": 0, "episode_cmds": 0, "orders": 0, "execs": 0,
     "reads": 0, "census_reads": 0, "no_arena": 0, "need_posts": 0, "last_fill": 0.0, "decided_t": 0.0, "stops": 0, "errors": 0,
-    "stale": 0, "prev_pinned": None, "prev_want": 0, "pauses": 0,
+    "stale": 0, "prev_pinned": None, "prev_want": 0, "pauses": 0, "pause_until": 0.0,
 }
 
 
 def _reset_trim_for_tests() -> None:
     _T.update(active=False, next_t=0.0, seq=0, episode_cmds=0, orders=0, execs=0, reads=0,
               census_reads=0, no_arena=0, need_posts=0, last_fill=0.0, decided_t=0.0, stops=0, errors=0,
-              stale=0, prev_pinned=None, prev_want=0, pauses=0)
+              stale=0, prev_pinned=None, prev_want=0, pauses=0, pause_until=0.0)
 
 
 def trim_enabled(env=None) -> bool:
@@ -510,9 +510,21 @@ def pp0_decide(sched, now: Optional[float] = None, env=None) -> Optional[Weg2Dua
         _T["next_t"] = t + 30.0
         return None
     if pinned is None:
+        _T["pause_until"] = 0.0           # below HI by the header's own bound: a pause is over
         return None
     fill = pinned / float(slots)
     _T["last_fill"] = fill
+    if _T["pause_until"] > 0.0:
+        if t >= _T["pause_until"] or fill <= cfg["hi"]:
+            _T["pause_until"] = 0.0
+            logger.info("%s RESUME fill=%.3f pinned=%d slots=%d: pause over", TRIM_MARK, fill, pinned, slots)
+        else:
+            # paused: P gives nothing more, but D still hears the need (the pin is probably D's and D
+            # may be about to give it) -- one post per MIN_S, no order
+            if str(os.environ.get(TRIM_POST_D_ENV, "1") if env is None else env.get(TRIM_POST_D_ENV, "1")).strip() != "0":
+                if post_need(pool, max(1, pinned - int(cfg["lo"] * slots)), env):
+                    _T["need_posts"] += 1
+            return None
     if _T["active"] and fill <= cfg["lo"]:
         _T["active"] = False
         _T["stale"], _T["prev_pinned"], _T["prev_want"] = 0, None, 0
@@ -538,12 +550,12 @@ def pp0_decide(sched, now: Optional[float] = None, env=None) -> Optional[Weg2Dua
                 _T["stale"] = 0
         if _T["stale"] >= cfg["stale_n"]:
             _T["active"] = False
-            _T["next_t"] = t + cfg["pause_s"]
+            _T["pause_until"] = t + cfg["pause_s"]
             _T["pauses"] += 1
             logger.warning("%s PAUSED n=%d fill=%.3f pinned=%d slots=%d: %d orders in a row did not lower "
                            "arena_pinned (last order %d pages, pinned %s -> %d) -- the holder is not P's "
-                           "tree (group D / hand-off pins); no order for %.0f s, a new episode starts "
-                           "when the fill is above HI again", TRIM_MARK, _T["pauses"], fill, pinned, slots,
+                           "tree (group D / hand-off pins); no order for %.0f s (D keeps hearing the need), a "
+                           "new episode starts when the pause is over and the fill is above HI", TRIM_MARK, _T["pauses"], fill, pinned, slots,
                            _T["stale"], int(_T["prev_want"]), prev, pinned, cfg["pause_s"])
             _T["stale"], _T["prev_pinned"], _T["prev_want"] = 0, None, 0
             return None
@@ -600,8 +612,21 @@ def follower_absorb(sched, recv_reqs: List[Any], env=None) -> List[Any]:
 
 def execute(sched, cmd: Weg2DualArenaTrim, env=None) -> Dict[str, int]:
     """Every P stage with the SAME order: spill host-only H-leaves of this stage's tree until
-    ``cmd.want`` pages were released here (node-id order, L3 copy first, budget-braked)."""
+    ``cmd.want`` pages were released here (node-id order, L3 copy first, budget-braked).
+    Never raises: anything that fails here -- the pool lookup, the role, the config, the spill --
+    ends THIS order with a named warning (a raise would end the rank, which V2 exists to prevent)."""
     none = {"released": 0, "leaves": 0, "candidates": 0, "unsecured": 0, "braked": 0}
+    try:
+        return _execute(sched, cmd, env, none)
+    except Exception:  # noqa: BLE001
+        _T["errors"] = int(_T.get("errors", 0)) + 1
+        if _T["errors"] <= 8 or _T["errors"] % 64 == 0:
+            logger.exception("%s n=%d STOP execute_failed seq=%s", TRIM_MARK, _T["errors"],
+                             getattr(cmd, "seq", "?"))
+        return none
+
+
+def _execute(sched, cmd: Weg2DualArenaTrim, env, none: Dict[str, int]) -> Dict[str, int]:
     if not trim_enabled(env):
         return none
     from sglang.srt.mem_cache import form_a_host_shadow as _r12
