@@ -2251,6 +2251,14 @@ class Envs:
     # arena (no KV copy); the publish sweep skipped such nodes and the flush
     # reset dropped the anchor.
     SGLANG_WEG2_ANCHOR_ONLY_BACKUP = EnvBool(True)
+    # PARK-END-ANCHOR-FIRST (NF y9nf4 03:33:18, auftrag 1303): the chain of a
+    # parked request (the node its retraction ended at and every ancestor)
+    # outranks the Mamba anchors without park reference when the host arena
+    # is full: its claim spills such an anchor to L3 (secured first), and a
+    # chain INTERMEDIATE that still finds no slot goes down KV-only so the
+    # END anchor behind it is not cut off by ``parent_unbacked``. Acts only on
+    # nodes marked by ``park_running``; no park = byte for byte as before.
+    SGLANG_WEG2_PARK_END_ANCHOR_FIRST = EnvBool(True)
     # Per-request mamba checkpoint diagnostics: log match length, resume
     # length, checkpoint node/slot and cache-insert positions so a
     # nondeterministic resume (or a checkpoint at a wrong position) can be

@@ -487,6 +487,12 @@ class UnifiedTreeNode:
         # #1481: the END-ANCHOR witness marks the N-1 node (set in
         # UnifiedRadixCache._weg2_note_end_anchor).
         self._weg2_end_anchor: bool = False
+        # PARK-END-ANCHOR-FIRST (weg2/mamba_arena_displace.py, auftrag 1303):
+        # the node a parked request's retraction ended at (its resume anchor);
+        # and whether this rank gave the node's own anchor up (KV-only) so the
+        # END anchor behind it is not cut off by ``parent_unbacked``.
+        self.weg2_park_end: bool = False
+        self.weg2_park_anchor_dropped: bool = False
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -2050,6 +2056,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # P-HOST-OVERLAP: a deferred chunk publish names nodes of the tree being
         # destroyed; it must not outlive it (empty unless the mode is on).
         self._weg2_deferred_chunk_publish = []
+        self._weg2_park_end_nodes = []    # PARK-END-ANCHOR-FIRST: the marks name nodes of the dying tree
         # 27B line (24.09.): the per-path cap's waiting releases name nodes of
         # the tree being destroyed, whose copies the release above and the pool
         # resets below take back -- releasing them later would free twice.
@@ -2876,6 +2883,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # insert pushes the path over the bound.
             self._weg2_cap_after_insert()
             self._weg2_handoff_write(req, radix_key)
+            self._weg2_mark_park_end(req, radix_key)   # PARK-END-ANCHOR-FIRST (park_running only)
             self._weg2_publish_at_retain(req, radix_key)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
@@ -4813,6 +4821,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if node is self.root_node or node.evicted:
             return False
+        if getattr(node, "weg2_park_anchor_dropped", False):
+            return False    # PARK-END-ANCHOR-FIRST: given up on purpose, not retried
         if not (node.backuped or node.l3_present):
             return False
         if node.write_through_pending_id is not None:
@@ -5080,10 +5090,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # -- fnFL2 H19: the arena keeps a request's DEEPEST anchors ----------------
     def _weg2_mamba_claim(self, node, mp, last_hash):
-        """The mamba arena slot of `node`'s anchor (host ids) or None.
-        SHARE: a request at its per-rank share releases its shallowest anchor
-        first; FULL: a refused node releases one more (once per node and
-        rank) and claims again (weg2/mamba_arena_displace.py)."""
+        """The mamba arena slot of `node`'s anchor (host ids) or None. The
+        H19 rules below; then PARK-END-ANCHOR-FIRST: a claim of a park chain
+        node a full arena still refuses spills a releasable anchor without
+        park reference to L3 (see :meth:`_weg2_park_spill_room`). Without a
+        marked park the second step is not entered: the H19 answer stands."""
+        mrows = self._weg2_mamba_claim_h19(node, mp, last_hash)
+        if mrows is None and self._weg2_park_first_node(node) and self._weg2_park_spill_room(node, mp):
+            mrows = mp.alloc_write([last_hash])
+        return mrows
+
+    def _weg2_mamba_claim_h19(self, node, mp, last_hash):
+        """SHARE: a request at its per-rank share releases its shallowest
+        anchor first; FULL: a refused node releases one more (once per node
+        and rank) and claims again (weg2/mamba_arena_displace.py)."""
         rid = node.weg2_anchor_rid
         cap = _mad.rid_anchor_cap(configured=self._weg2_rid_anchor_cfg, arena_slots=mp.arena_slots)
         if rid is None or cap == 0:
@@ -5114,6 +5134,143 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mrows = mp.alloc_write([last_hash])
         self._weg2_note_anchor_claim(node, rid, st, ok=mrows is not None, held=len(owned), depth=depth, cap=cap, mp=mp)
         return mrows
+
+    # ---- PARK-END-ANCHOR-FIRST (auftrag 1303) --------------------------------
+
+    #: spills one park-chain node may ask for (the first can find every
+    #: victim still in flight; the flush retries once nothing is)
+    WEG2_PARK_SPILL_TRIES = 3
+
+    def weg2_park_first_on(self) -> bool:
+        return bool(envs.SGLANG_WEG2_PARK_END_ANCHOR_FIRST.get())
+
+    def _weg2_mark_park_end(self, req, radix_key) -> None:
+        """``park_running`` retracts ``req`` retaining its span (the request
+        carries ``mamba_arena_displace.PARK_REQ_ATTR``): the node the insert
+        ended at is the resume anchor of the parked request. Marked on every
+        rank (replicated scheduling, the same key); the chain of the mark
+        outranks the anchors without park reference when the arena is full.
+        The lookup is the one the publish path makes at every retain."""
+        if not getattr(req, _mad.PARK_REQ_ATTR, False):
+            return
+        setattr(req, _mad.PARK_REQ_ATTR, False)   # one use: the retraction's insert; a resumed finish is no park
+        if not self.weg2_park_first_on():
+            return
+        chain = self._weg2_chain_nodes_strict(radix_key)
+        if not chain:
+            return
+        end = chain[-1]
+        end.weg2_park_end = True
+        ends = self.__dict__.get("_weg2_park_end_nodes")
+        if ends is None:
+            ends = self._weg2_park_end_nodes = []
+        if end not in ends:
+            ends.append(end)
+        logger.info(
+            "WEG2 PARK-END-ANCHOR-FIRST MARK rid=%s node=%s depth=%d chain_nodes=%d park_ends=%d "
+            "(the chain outranks the anchors without park reference at the sleep's claims)",
+            str(getattr(req, "rid", "?"))[:16], getattr(end, "id", "?"),
+            self.weg2_node_depth(end), len(chain), len(ends),
+        )
+
+    def _weg2_chain_nodes_strict(self, radix_key) -> list:
+        """``_weg2_chain_nodes`` without the swallow: a lookup that raises
+        raises on the rank it happens on (the marks must not part the ranks)."""
+        mr = self.match_prefix(MatchPrefixParams(key=radix_key))
+        node = getattr(mr, "last_device_node", None) or getattr(mr, "last_host_node", None)
+        chain = []
+        while node is not None and node is not self.root_node:
+            chain.append(node)
+            node = node.parent
+        chain.reverse()
+        return chain
+
+    def _weg2_park_chain(self) -> set:
+        """``id()`` of every node on the root path of a marked park END node;
+        marks of nodes that left the tree are dropped here."""
+        ends = self.__dict__.get("_weg2_park_end_nodes")
+        if not ends:
+            return set()
+        live = [n for n in ends if n.parent is not None]
+        if len(live) != len(ends):
+            self._weg2_park_end_nodes = live
+        return _mad.park_chain_ids(live)
+
+    def _weg2_park_first_node(self, node) -> bool:
+        """True for a node on a marked park chain (never without a mark)."""
+        if not self.__dict__.get("_weg2_park_end_nodes"):
+            return False
+        if not self.weg2_park_first_on():
+            return False
+        return id(node) in self._weg2_park_chain()
+
+    def _weg2_park_note_kv_only(self, node) -> None:
+        n = getattr(UnifiedRadixCache, "_weg2_park_kv_only_n", 0) + 1
+        UnifiedRadixCache._weg2_park_kv_only_n = n
+        if n <= 24 or n % 64 == 0:
+            logger.warning(
+                "WEG2 PARK-END-ANCHOR-FIRST KV-ONLY n=%d node=%s depth=%d (an intermediate anchor of a "
+                "park chain found no arena slot: the node goes down KV-only so the chain above it, "
+                "up to the END anchor, is not cut off by parent_unbacked)",
+                n, getattr(node, "id", "?"), self.weg2_node_depth(node),
+            )
+
+    def _weg2_park_spill_room(self, node, mp) -> bool:
+        """PARK-END-ANCHOR-FIRST (NF y9nf4 1004_031945 03:33:18, D TP0): the
+        sleep found the mamba arena full -- ``#1427 ARENA-CLAIM REFUSED
+        statuses=[4]`` x8, ``#1421 BACKUP-REFUSED why=mamba_claim`` on the
+        chain nodes of the parked weg2-8-79 / weg2-8-82, the children
+        ``parent_unbacked``, ``FLUSH-SPILL victim=none`` (the H19 rules never
+        offer an untagged anchor; a D tree's anchors are all untagged) and
+        ``WEG2-ANCHOR-LOST at=flush n=20`` incl. the park END anchors 49408 /
+        76032 -- every store read of those requests stopped at the previous
+        turn's anchor.
+
+        A node of a marked park chain may take a slot from a releasable
+        anchor OFF the chain, tagged or not (shallowest first, node id breaks
+        the tie); the END node, with none off the chain, from a chain
+        INTERMEDIATE. The victim's anchor is secured to L3 first
+        (``arena_secure_to_disk``: one already on disk is not written again)
+        and released only when that worked -- no anchor is traded for
+        another, the victim's next reader takes it from the store. Returns
+        True when a slot was freed."""
+        tries = int(node.__dict__.get("_weg2_park_spill_tries", 0))
+        if tries >= self.WEG2_PARK_SPILL_TRIES:
+            return False
+        node._weg2_park_spill_tries = tries + 1
+        backend = getattr(mp, "_backend", None)
+        arena = getattr(mp, "arena", None)
+        secure = getattr(backend, "arena_secure_to_disk", None)
+        if arena is None or not callable(secure):
+            return False
+        cands = _mad.tree_anchors(root=self.root_node, anchor_of=lambda n: self._weg2_anchor_of(n, mp),
+                                  include_untagged=True)
+        cands = [a for a in cands if a.node is not node]
+        victim = _mad.pick_park_victim(cands, chain_ids=self._weg2_park_chain(),
+                                       claimer_is_end=bool(node.weg2_park_end))
+        depth = _mad.ancestor_path(target=node, root=self.root_node)[1]
+        if victim is None or not victim.slots:
+            logger.warning("WEG2 PARK-END-ANCHOR-FIRST SPILL node=%s depth=%s end=%s victim=none (no releasable "
+                           "anchor to give; the node stays un-backed, named)",
+                           getattr(node, "id", "?"), depth, bool(node.weg2_park_end))
+            return False
+        slot_bytes = int(getattr(arena, "slot_bytes", 0) or 0)
+        sec = secure(arena, [(int(s), 0, 0, slot_bytes) for s in victim.slots], writer="park_first_spill")
+        if int(sec.get("lost", 0) or 0) > 0:
+            logger.warning("WEG2 PARK-END-ANCHOR-FIRST SPILL node=%s victim_node=%s depth=%d NOT released: its "
+                           "L3 copy could not be secured (%s)", getattr(node, "id", "?"), victim.node.id,
+                           victim.depth, sec)
+            return False
+        st = self._weg2_anchor_ledger.of(victim.rid)
+        self._weg2_release_anchor(victim, mp, st, why="park_first", for_rid="park")
+        n = getattr(UnifiedRadixCache, "_weg2_park_spill_n", 0) + 1
+        UnifiedRadixCache._weg2_park_spill_n = n
+        logger.info("WEG2 PARK-END-ANCHOR-FIRST SPILL n=%d node=%s depth=%s end=%s victim_node=%s victim_rid=%s "
+                    "victim_depth=%d on_disk=%d written=%d (the park chain took a slot; the victim's anchor is on L3)",
+                    n, getattr(node, "id", "?"), depth, bool(node.weg2_park_end), victim.node.id,
+                    str(victim.rid)[:16] or "-", victim.depth, int(sec.get("on_disk", 0) or 0),
+                    int(sec.get("written", 0) or 0))
+        return True
 
     #: FLUSH-SPILL: anchors spilled to L3 and freed at sleep flushes (per process)
     _weg2_flush_spill_n = 0
@@ -5285,7 +5442,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if mxfer is not None:
             mp = self._weg2_mamba_pool()
             mrows = self._weg2_mamba_claim(node, mp, hashes[-1]) if mp is not None else None
-            if mrows is None and mp is not None and kv_only_if_mamba_refused:
+            if (mrows is None and mp is not None and not kv_only_if_mamba_refused
+                    and not getattr(node, "weg2_park_end", False) and self._weg2_park_first_node(node)):
+                # PARK-END-ANCHOR-FIRST: an INTERMEDIATE of a park chain that
+                # no slot (spill included) could serve goes down KV-only; the
+                # END anchor above it keeps its way (parent rule), and the
+                # sweep does not retry the anchor it gave up.
+                comp_xfers.pop(mct, None)
+                node.weg2_park_anchor_dropped = True
+                self._weg2_park_note_kv_only(node)
+                mxfer = None
+            elif mrows is None and mp is not None and kv_only_if_mamba_refused:
                 # P-FUND: the eviction needs this node's KV rows; the anchor
                 # has no arena slot. The node goes down KV-only -- its mamba
                 # state is freed with the device rows, like a node that never

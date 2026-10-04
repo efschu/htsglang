@@ -34,6 +34,7 @@ from typing import Optional
 from sglang.srt.managers import weg2_resumable_depth
 from sglang.srt.weg2 import d_park_draft, d_park_read, d_seats, park_hold_yield, park_retract_split
 from sglang.srt.weg2 import handback_claim as _hb
+from sglang.srt.weg2 import mamba_arena_displace as _mad_park
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +167,10 @@ def park_running(sched, recv_req, *, late_hold_armed: bool = False):
         running = list(sched.running_batch.reqs)
     for req in running:
         setattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, True)
+        # PARK-END-ANCHOR-FIRST: the retraction's insert marks the node it ends
+        # at (the park's resume anchor); its chain outranks anchors without
+        # park reference at the sleep's mamba arena claims
+        setattr(req, _mad_park.PARK_REQ_ATTR, True)
         # PARK-RETAIN READ: the retraction's insert stamps what it retains;
         # a stamp left from an earlier insert must not stand in for it.
         setattr(req, d_park_read.RETAINED_ATTR, None)
