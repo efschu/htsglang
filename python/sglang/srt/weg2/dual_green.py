@@ -102,6 +102,8 @@ HOLD_COOLDOWN_S_DEFAULT = 1.0
 HEARTBEAT_S = 1.0
 #: PP0 reads the arena header at most this often for the hold gate / the observer
 ARENA_READ_S = 1.0
+#: the status line (counters: forwards by stage, switches, fallback forwards, switch cost) at most this often
+STATUS_EVERY_S = 30.0
 
 #: front-side knobs, ``SGLANG_WEG2_DUAL_SHARE_GREEN_<NAME>`` (``dual_share.ENV_PREFIX``)
 DEFAULT_FACTORS = (4.5, 2.8, 1.5, 1.24)      # s_k: D round / D solo at stage k (rung 0: real y9d3 4.5-9x; 1-3: 5090 proxy)
@@ -725,6 +727,7 @@ class GreenActuator:
         self._stamped_key = None
         self._stamp_t = -1e9
         self._arena_t = -1e9
+        self._status_t = clock()
         self.arena: Optional[float] = None
         self.arena_kind = "n/a"
         self.verdict = HoldVerdict(False, False, "init")
@@ -817,6 +820,10 @@ class GreenActuator:
         self.last_forward_rung = eff
         self.switch_us_total += (time.perf_counter() - t0) * 1e6
         self._observe_files()
+        now = self._clock()
+        if now - self._status_t >= STATUS_EVERY_S:       # the counters, regularly (the marker's second half)
+            self._status_t = now
+            self._log(self.status_line())
         if entry is None:
             return sched.forward_stream_ctx, None
         return sched.device_module.stream(entry.stream), entry.stream
@@ -913,7 +920,11 @@ def maybe_arm(sched, env: Optional[Mapping[str, str]] = None, *, backend: Option
         return None
     ps = sched.ps
     pp_rank, pp_size = int(ps.pp_rank), int(ps.pp_size)
-    cfg = _ds.config_from_env(e)
+    try:
+        cfg = _ds.config_from_env(e)
+    except Exception as ex:  # noqa: BLE001 - a bad profile knob must not take the P rank down at init
+        warn(_ds.fallback_line("green", "all", f"profile knob invalid ({type(ex).__name__}: {ex}) -> default rungs"))
+        cfg = _ds.ShareConfig()
     try:
         be = backend if backend is not None else CtypesBackend()
     except Exception as ex:  # noqa: BLE001 - never a crash: the base actuators stay

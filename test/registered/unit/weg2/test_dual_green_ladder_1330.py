@@ -519,6 +519,21 @@ def test_the_stage_changes_only_at_a_forward_boundary():
     assert a.switches == 2 and a.by_rung == {0: 2, 2: 1}
 
 
+def test_the_status_line_with_the_counters_comes_every_30_seconds():
+    t = [0.0]
+    a = make_actuator(1, st(0, 1.0), clock=lambda: t[0])
+    sched = _launch_sched()
+    a.pick(sched)
+    assert not any("P status" in l for l in a.logs)
+    t[0] = 31.0
+    a.apply(G.Weg2DualGreenRung(1, 2, 500000))
+    a.pick(sched)
+    lines = [l for l in a.logs if "P status" in l]
+    assert len(lines) == 1 and "forwards=2" in lines[0] and "switches=1" in lines[0] and "by_rung={0: 1, 2: 1}" in lines[0]
+    a.pick(sched)
+    assert len([l for l in a.logs if "P status" in l]) == 1
+
+
 def test_a_stage_the_ladder_cannot_serve_runs_on_the_primary_stream_and_is_counted():
     a = make_actuator(1, st(0, 1.0), backend=FakeBackend(170, 8, fail_create=(85,)))
     sched = _launch_sched()
@@ -607,10 +622,48 @@ def test_the_graph_runner_asks_the_ladder_first_and_the_prefill_line_carries_the
     G._STATE["eager"] = True
     assert G.force_eager() is True
     G._STATE["eager"] = False
+
+
+def _prefill_lines(caplog, records):
+    """Drive the real RankPrefillLog: ``records`` = [(rung or None, timed)], one duration each when timed."""
+    import logging
+
     from sglang.srt.managers.scheduler_components import metrics_reporter as M
 
-    log = M.RankPrefillLog() if hasattr(M, "RankPrefillLog") else None
-    assert "rung" in inspect.getsource(M)                          # record(rung=...) / flush append `rung=`
+    class T:
+        def _report(self):
+            pass
+
+    rpl = M.RankPrefillLog()
+    rpl.timer = T()
+    with caplog.at_level(logging.INFO, logger=M.logger.name):
+        for rung, timed in records:
+            rpl.record(new_tokens=1024, cached_tokens=0, timed=timed, rung=rung)
+            if timed:
+                rpl._durations.append((0.5, 0.1, None))
+        rpl.flush()
+    return [r.getMessage() for r in caplog.records if "Prefill rank batch" in r.getMessage()]
+
+
+def test_the_prefill_rank_batch_line_carries_the_rung_only_when_the_ladder_ran(caplog):
+    base = _prefill_lines(caplog, [(None, True)])
+    assert len(base) == 1 and "rung=" not in base[0]                       # unarmed: byte-equal to before
+    caplog.clear()
+    one = _prefill_lines(caplog, [(2, True)])
+    assert one == [base[0] + " rung=2"]
+    caplog.clear()
+    folded = _prefill_lines(caplog, [(1, True), (1, True), (3, True)])      # K forwards fold into one line
+    assert len(folded) == 1 and folded[0].endswith(" rung=1/3") and "#chunks: 3" in folded[0]
+    caplog.clear()
+    untimed = _prefill_lines(caplog, [(0, False), (None, False)])
+    assert untimed[0].endswith("#chunks: 1 rung=0") and untimed[1].endswith("#chunks: 1")
+
+
+def test_report_prefill_stats_hands_the_batch_rung_to_the_line():
+    from sglang.srt.managers.scheduler_components import metrics_reporter as M
+
+    src = inspect.getsource(M.SchedulerMetricsReporter.report_prefill_stats)
+    assert 'rung=getattr(batch, "_dual_green_rung", None)' in src
 
 
 # --------------------------------------------------------------------------------------- hold gate (PP0-local)
