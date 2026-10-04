@@ -15869,6 +15869,11 @@ class Scheduler(
                 from sglang.srt.weg2.d_kv_evict import scheduler_step as _d_kv_evict_step
 
                 _d_kv_evict_step(self)
+            # PUBLISH-SWEEP-BG (weg2_flush_nonblock part 1b): a few un-backed
+            # finished-request nodes published between D decode rounds so the
+            # flip's flush finds a small backlog. Same group-uniform point as
+            # the evictor above; a dict/env lookup when the switch is off.
+            _weg2_flush_nonblock.bg_publish_tick(self)
 
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all
