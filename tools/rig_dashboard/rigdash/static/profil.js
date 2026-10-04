@@ -8,7 +8,7 @@
   if (!root) return;
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const st = { list: null, doc: null, view: null, loaded: "", mode: "einfach", search: "", filt: "alle", cards: [], dry: null, exp: null,
-               busy: false, err: null, msg: null, open: {}, fold: {}, dirty: false, started: false, models: null, mprof: null, mpath: "" };
+               busy: false, err: null, msg: null, open: {}, fold: {}, dirty: false, started: false, models: null, mprof: null, mpath: "", bars: null, barBusy: false };
   const isOpen = (id, dflt) => (id in st.fold ? st.fold[id] : dflt);
   try { const v = localStorage.getItem("rigdash.pf.view"); if (v === "einfach" || v === "experte") st.mode = v; } catch (e) { /* private window */ }
   const REL = { tauscht: "tauscht mit", braucht: "braucht", schliesst_aus: "schließt aus", abgeleitet_von: "abgeleitet von", skaliert_mit: "skaliert mit" };
@@ -30,7 +30,7 @@
   }
 
   // ------------------------------------------------------------------ Aktionen
-  function setView(j) { st.doc = j.doc; st.view = j.view; }
+  function setView(j) { st.doc = j.doc; st.view = j.view; scheduleRecompute(); }
   const doLoad = (kind, name) => run(async () => {
     const j = await api("load", { kind, name });
     setView(j); st.loaded = kind + ":" + name; st.dry = null; st.exp = null; st.dirty = false;
@@ -190,6 +190,68 @@
     if (!hwEl) { hwEl = document.createElement("div"); window.HwProfil.mount(hwEl); }
     return `<details class="pf-fold" data-fold="hw" ${isOpen("hw", false) ? "open" : ""}><summary><b>Hardware</b> · Karten und Messwerte (Hardwareprofil lesen, im gebuchten gpuq-Fenster messen)</summary><div id="pf-hwroot"></div></details>`;
   }
+  // ------------------------------------------------------------------ Balken (Auftrag 1432, S4b)
+  // Der Server rechnet die Kopplungen (/api/profil/recompute, entprellt); beim Verschieben des Layer-Schnitts zeigt der Browser sofort die
+  // lineare Näherung (ProfilBalken.approx) und ersetzt sie durch die Server-Antwort.  Gerechnet wird nur bei geöffnetem Faltbereich.
+  let barTimer = null, barSeq = 0, barsDrawn = [];
+  function stageCounts() {
+    const e = st.doc && (st.doc.args || []).find((a) => a.flag === "--pp-stage-ratio");
+    const v = e && e.values && e.values[0] ? String(e.values[0]).split(",").map((x) => parseInt(x, 10)) : null;
+    return v && v.every((x) => Number.isFinite(x)) ? v : null;
+  }
+  function scheduleRecompute() {
+    if (!st.doc || !window.ProfilBalken || !isOpen("bars", false)) return;
+    const counts = stageCounts();
+    if (st.bars && st.bars.approx && counts) {
+      try { st.bars.fast = window.ProfilBalken.approxBars(st.bars.approx, counts, st.bars.labels); } catch (e) { st.bars.fast = null; /* Schnitt passt nicht: der Server entscheidet */ }
+    }
+    clearTimeout(barTimer);
+    barTimer = setTimeout(recompute, 300);
+  }
+  async function recompute() {
+    const seq = ++barSeq;
+    st.barBusy = true; draw();
+    try {
+      const j = await api("recompute", { doc: st.doc, what: "bars" });
+      if (seq !== barSeq) return;          // veraltete Antwort: eine neuere Eingabe ist unterwegs
+      const phases = j.result.phases, names = Object.keys(phases);
+      const labels = phases[names[0]].bars.map((b) => b.label);
+      st.bars = { phases, peak: j.result.Spitze || null, hints: j.result.hints || [], approx: j.result.approx, labels, fast: null, err: null, model: j.model_path };
+    } catch (e) {
+      if (seq !== barSeq) return;
+      st.bars = Object.assign(st.bars || {}, { err: e.message, fast: null });
+    }
+    st.barBusy = false; draw();
+  }
+  function drawBars() {
+    if (!window.ProfilBalken) return "";
+    const PB = window.ProfilBalken, b = st.bars;
+    let body = "";
+    barsDrawn = [];
+    if (!isOpen("bars", false)) body = "";
+    else if (!st.doc) body = `<div class="muted pf-note">Erst ein Profil laden.</div>`;
+    else if (!b) body = `<div class="muted pf-note">${st.barBusy ? "rechnet …" : "Noch nicht gerechnet."}</div>`;
+    else {
+      const note = b.err ? `<div class="kp-verdict bad">${esc(b.err)}</div>` : "";
+      if (b.fast) {
+        barsDrawn = barsDrawn.concat(b.fast);
+        body = `${note}<div class="muted pf-note"><b>Näherung im Browser</b> (lineare Rechnung für den geänderten Layer-Schnitt; der Server rechnet gerade nach)</div>${PB.render(b.fast, { base: 0 })}`;
+      } else {
+        const names = Object.keys(b.phases).concat(b.peak ? ["Spitze"] : []);
+        names.forEach((n) => {
+          const bars = n === "Spitze" ? b.peak.bars : b.phases[n].bars, base = barsDrawn.length;
+          barsDrawn = barsDrawn.concat(bars);
+          body += `<h3 class="pf-h3">${n === "alle" ? "Profil" : esc(n) + (n === "Spitze" ? " (je Karte die größere Phase)" : "-Phase")}</h3>${PB.render(bars, { base })}`;
+        });
+        const ctxf = b.phases[Object.keys(b.phases)[0]].context_floor_tokens;
+        body = `${note}${st.barBusy ? '<div class="muted pf-note">rechnet nach …</div>' : ""}${body}` +
+          (ctxf != null ? `<div class="muted pf-note">Kontext-Boden (kleinste KV-Kapazität über die Stufen): ${ctxf.toLocaleString("de-DE")} Token</div>` : "") +
+          (b.hints && b.hints.length ? `<ul class="pf-hints">${b.hints.map((h) => `<li>${esc(h)}</li>`).join("")}</ul>` : "") +
+          `<div class="muted pf-note">Modell: <span class="mono">${esc(b.model || "")}</span>. Festposten (CUDA-Kontext, Graphen, Allokator-Reste) sind nur am Metall zu messen und stehen ohne Messung auf 0: „Rest“ ist eine Obergrenze. Die Aktivierung ist eine Geometrie-Näherung, solange keine gemessene Spitze eingetragen ist.</div>`;
+      }
+    }
+    return `<details class="pf-fold" data-fold="bars" ${isOpen("bars", false) ? "open" : ""}><summary><b>Karten-Balken</b> · was der Schnitt, die Experten und der Chunk auf jeder Karte belegen (Überlauf rot)</summary>${body}</details>`;
+  }
   function drawExport() {
     const x = st.exp;
     if (!x) return "";
@@ -230,6 +292,7 @@
       ${body}
       <details class="pf-fold" data-fold="dry" ${isOpen("dry", false) ? "open" : ""}><summary><b>Trockenlauf</b> · welche Ablehnungen hätte der Planer?</summary>${drawCards()}${drawDry()}</details>
       ${drawHardware()}
+      ${drawBars()}
       ${drawModels()}
       ${drawExport()}`;
     const hwSlot = root.querySelector("#pf-hwroot");
@@ -238,7 +301,12 @@
   }
 
   // ------------------------------------------------------------------ Ereignisse
-  root.addEventListener("toggle", (e) => { const f = e.target && e.target.dataset && e.target.dataset.fold; if (f) st.fold[f] = e.target.open; }, true);
+  root.addEventListener("toggle", (e) => {
+    const f = e.target && e.target.dataset && e.target.dataset.fold;
+    if (f) st.fold[f] = e.target.open;
+    if (f === "bars" && e.target.open && !st.bars && st.doc) scheduleRecompute();
+  }, true);
+  if (window.ProfilBalken) window.ProfilBalken.attach(root, () => barsDrawn);
   root.addEventListener("change", (e) => {
     const t = e.target;
     if (t.id === "pf-pick") return;

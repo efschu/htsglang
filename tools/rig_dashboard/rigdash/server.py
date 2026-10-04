@@ -12,6 +12,7 @@ Routes
   GET /api/hwprofil   Hardwareprofil flliper.hardware/1 (Auftrag 950, nur rig, nur LAN)
   POST /api/hwprofil/measure   {cards:[nvml,...]}: gpuq-Fenster buchen und messen; pending = nur Status
   POST /api/hwprofil/cancel    wartendes Fenster zurückgeben
+  POST /api/profil/recompute   Kopplungen/Balken zum Serverprofil (Auftrag 1432, nur rig, nur LAN): {doc, what: bars|compute|move|chunk|context, settings?, phases?}
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 from . import (energy, features, health, history, hwprofil, imagechanges, ipcboot, kartenplan, launchview, live,
-               modellprofil, profil, redact, sampler, sources, vmpush, weg2line)
+               modellprofil, profil, profil_recompute, redact, sampler, sources, vmpush, weg2line)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "static")
@@ -50,6 +51,8 @@ DEV_STATIC_FILES = {
     "/modellprofil.js": ("modellprofil.js", "application/javascript; charset=utf-8"),
     # Profil-Editor S2 (Auftrag 950): Anzeige des Hardwareprofils, vom Editor-Reiter eingehängt
     "/hwprofil.js": ("hwprofil.js", "application/javascript; charset=utf-8"),
+    # Profil-Editor S4b (Auftrag 1432): Balken je Karte mit Überlauf und Browser-Näherung
+    "/profil_balken.js": ("profil_balken.js", "application/javascript; charset=utf-8"),
 }
 #: Körper einer POST-Anfrage: Pfad und ein paar Optionen, nie mehr
 MAX_POST_BODY = 64 * 1024
@@ -247,6 +250,8 @@ class App:
             user_dir=getattr(args, "profile_dir", None) or profil.DEFAULT_USER_DIR)
         # Modellprofil schätzen (S3): liest nur config.json und Kopfzeilen unter den Modellwurzeln
         self.modellprofil = modellprofil.ModelEstimator(roots=getattr(args, "model_root", None) or None)
+        # Profil-Editor S4b (Auftrag 1432): Kopplungen/Balken im langlebigen Worker (startet erst bei der ersten Anfrage)
+        self.couplings = profil_recompute.CouplingsService(self.profil.tree, python=getattr(args, "couplings_python", None))
         # Profil-Editor S2 (Auftrag 950): Hardwareprofil lesen, im gebuchten gpuq-Fenster messen
         self.hwprofil = hwprofil.HwProfil(
             gpuq=args.gpuq, tree=getattr(args, "hw_tree", None), measure_tree=getattr(args, "hw_measure_tree", None),
@@ -599,7 +604,30 @@ def make_handler(app: App):
                 return self._json(ed.export_env(body.get("doc")))
             if path == "/api/profil/dry":
                 return self._json(ed.dry_run(body.get("doc"), body.get("cards") or [], bool(body.get("host_patched", True))))
+            if path == "/api/profil/recompute":
+                return self._profil_recompute(body)
             return self._send(404, "not found", "text/plain")
+
+        def _profil_recompute(self, body):
+            """S4b: Kopplungen und Balken für das Serverprofil im Editor.  Hardwareprofil (nur lesen, nichts messen) und Modellprofil (Desk-Schätzung,
+            gemerkt) kommen von den vorhandenen Diensten; gerechnet wird im Worker.  Fehler kommen als ``ok: false`` mit Grund, nie als Absturz."""
+            doc = body.get("doc") or {}
+            if not isinstance(doc, dict):
+                raise ValueError("doc muss ein JSON-Objekt sein")
+            hw = app.hwprofil.get()
+            if not hw.get("ok", True) or not hw.get("profile"):
+                return self._json({"ok": False, "error": "Hardwareprofil nicht verfügbar: %s" % (hw.get("error") or "leer")}, 200)
+            args_ = profil_recompute.args_of(doc)
+            vars_ = {v.get("name"): v.get("value") for v in (doc.get("vars") or []) if isinstance(v, dict)}
+            mpath = body.get("model_path") or vars_.get("PROFILE_MODEL") or args_.get("--model-path") or args_.get("--model")
+            if not mpath:
+                return self._json({"ok": False, "error": "kein Modellpfad: das Profil nennt weder PROFILE_MODEL noch --model-path"}, 200)
+            kv = args_.get("--kv-cache-dtype")
+            est = app.modellprofil.estimate({"path": str(mpath), "kv_dtype": kv if kv in ("auto", "fp8_e4m3") else None})
+            req = profil_recompute.build_request(body, hardware=hw["profile"], model=est["profile"])
+            res = app.couplings.request(req)
+            res["model_path"] = str(mpath)
+            return self._json(res, 200)
 
         def _hwprofil(self, method, n=0, raw=b""):
             """Profil-Editor S2: nur Rig-Ausgabe, nur LAN (die Route bucht GPU-Fenster und startet einen Messlauf)."""
@@ -797,6 +825,8 @@ def main(argv=None):
                     help="Planer-Baum (<baum>/python) mit sglang/srt/rigmon/hardware_profile.py: Hardwareprofil lesen (Auftrag 950)")
     ap.add_argument("--hw-measure-tree", default=os.environ.get("HWPROFIL_MEASURE_TREE"),
                     help="voller sglang-Baum (<baum>/python) für den Messlauf; leer = --hw-tree (dann muss card_probe darin liegen)")
+    ap.add_argument("--couplings-python", default=os.environ.get("RIGDASH_COUPLINGS_PYTHON"),
+                    help="Profil-Editor S4b: Python der sglang-Umgebung für den Kopplungs-Worker (Standard /spinning/htsglang-gpu/.venv/bin/python)")
     ap.add_argument("--hw-python", default=os.environ.get("HWPROFIL_PYTHON"),
                     help="Interpreter mit torch + sgl_kernel für den Messlauf (Kindprozess, außerhalb dieses Prozesses)")
     ap.add_argument("--hw-prefix", default=os.environ.get("HWPROFIL_PREFIX", ""),

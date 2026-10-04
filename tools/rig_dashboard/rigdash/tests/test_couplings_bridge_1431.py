@@ -13,6 +13,7 @@ Gepinnt:
 
 import json
 import os
+import subprocess
 import sys
 import unittest
 
@@ -23,6 +24,26 @@ from kartenplan_build import bridge as B  # noqa: E402
 
 VENDORED_TREE = os.path.join(HERE, "fixtures", "kartenplan", "planner_tree", "python")
 REAL_TREE = os.environ.get("COUPLINGS_TREE")
+
+SETUP_SCRIPT = r"""
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from sglang.srt.planner import profile_couplings as PC
+from sglang.srt.weg2 import model_profile as MP
+fx = os.path.join(sys.argv[1], "..", "test", "registered", "unit", "weg2", "fixtures", "profil_s3_1003", sys.argv[2])
+hw = PC.synthetic_hardware([("NVIDIA GeForce RTX 5090", 32607, 1400.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0), ("NVIDIA GeForce RTX 3080", 20480, 700.0)])
+print(json.dumps({"hw": hw, "model": MP.estimate(os.path.abspath(fx))}))
+"""
+
+
+def profiles_via_subprocess(tree, fixture):
+    """Hardware- und Modellprofil im KINDPROZESS bauen: der Dashboard-Testprozess darf sglang nicht importieren
+    (test_modellprofil_960::test_tree_is_found_by_file_path_not_by_import)."""
+    p = subprocess.run([sys.executable, "-c", SETUP_SCRIPT, tree, fixture], capture_output=True, text=True, timeout=120,
+                       env=dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONWARNINGS="ignore"))
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr[-600:])
+    return json.loads(p.stdout)
 
 
 def hardware():
@@ -47,17 +68,12 @@ class TestCouplingsBridge(unittest.TestCase):
 
     @unittest.skipUnless(REAL_TREE and os.path.isdir(REAL_TREE), "COUPLINGS_TREE (<py-Baum>/python mit planner/profile_couplings.py) nicht gesetzt")
     def test_real_tree_computes_and_unwraps_the_runner_envelope(self):
-        fx = os.path.join(REAL_TREE, "..", "test", "registered", "unit", "weg2", "fixtures", "profil_s3_1003", "qwen27b_int8_vocabembed")
-        sys.path.insert(0, REAL_TREE)
-        try:
-            from sglang.srt.weg2 import model_profile as MP
-            model = MP.estimate(os.path.abspath(fx))
-        finally:
-            sys.path.remove(REAL_TREE)
-        req = {"what": "compute", "hardware": hardware(), "model": model, "settings": {"stage_layers": [40, 24], "kv_dtype": "fp8_e4m3"}}
+        prof = profiles_via_subprocess(REAL_TREE, "qwen27b_int8_vocabembed")
+        model = prof["model"]
+        req = {"what": "compute", "hardware": prof["hw"], "model": model, "settings": {"stage_layers": [32, 16, 16], "kv_dtype": "fp8_e4m3"}}
         out = B.couplings(req, tree_python=REAL_TREE, python=sys.executable, timeout=180)
         self.assertTrue(out["ok"], out)
-        self.assertEqual(len(out["result"]["c1"]["stages"]), 2)
+        self.assertEqual(len(out["result"]["c1"]["stages"]), 3)
         bad = B.couplings(dict(req, settings={"stage_layers": [64]}), tree_python=REAL_TREE, python=sys.executable, timeout=180)
         self.assertFalse(bad["ok"])
         self.assertIn("vector_length", bad["error"])
