@@ -70,40 +70,52 @@ class ThrottleHelpers(CustomTestCase):
         self.assertEqual(S._retry_ms(), 0)
 
     def test_first_attempt_runs_then_throttled_until_n_ms(self):
-        self.assertFalse(S._retry_throttled("r1", self.stages, 50, 100.0))
-        S._retry_note("r1", self.stages, 100.0)
-        self.assertTrue(S._retry_throttled("r1", self.stages, 50, 100.049))
-        self.assertFalse(S._retry_throttled("r1", self.stages, 50, 100.051), "never starved past N ms")
+        self.assertFalse(S._retry_throttled("r1", 50, 100.0))
+        S._retry_note("r1", 100.0)
+        self.assertTrue(S._retry_throttled("r1", 50, 100.049))
+        self.assertFalse(S._retry_throttled("r1", 50, 100.051), "never starved past N ms")
 
     def test_n_calls_in_t_ms_give_at_most_t_over_n_attempts(self):
         attempts = 0
         for i in range(20000):                      # 2 s at 10 kHz = a spinning PP0
             now = 100.0 + i * 0.0001
-            if not S._retry_throttled("r1", self.stages, 50, now):
+            if not S._retry_throttled("r1", 50, now):
                 attempts += 1
-                S._retry_note("r1", self.stages, now)
+                S._retry_note("r1", now)
         self.assertLessEqual(attempts, 2000 // 50 + 1)
         self.assertGreaterEqual(attempts, 2000 // 50 - 1)
 
-    def test_a_ledger_change_lifts_the_throttle_at_once(self):
-        S._retry_note("r1", self.stages, 100.0)
-        self.assertTrue(S._retry_throttled("r1", self.stages, 50, 100.001))
+    def test_a_ledger_change_does_not_lift_the_throttle(self):
+        # b9h: D's ledger changes on every tick; a signature check held the throttle open (~480/s)
+        S._retry_note("r1", 100.0)
+        self.assertTrue(S._retry_throttled("r1", 50, 100.001))
         _write(self.led[1], b"\x02" * K._SIZE)      # a card freed/committed bytes
-        self.assertFalse(S._retry_throttled("r1", self.stages, 50, 100.002))
+        self.assertTrue(S._retry_throttled("r1", 50, 100.002))
+        self.assertFalse(S._retry_throttled("r1", 50, 100.051), "only the interval lifts it")
 
-    def test_unreadable_ledger_does_not_raise(self):
-        st = [{"ledger": os.path.join(self.d, "absent")}]
-        S._retry_note("r1", st, 100.0)
-        self.assertTrue(S._retry_throttled("r1", st, 50, 100.001))   # None == None: bounded by N ms only
+    def test_a_constantly_changing_ledger_still_gives_at_most_t_over_n_attempts(self):
+        attempts = 0
+        for i in range(20000):                      # 2 s at 10 kHz, the ledger rewritten every pass
+            now = 100.0 + i * 0.0001
+            _write(self.led[0], bytes([i % 251]) * K._SIZE)
+            if not S._retry_throttled("r1", 50, now):
+                attempts += 1
+                S._retry_note("r1", now)
+        self.assertLessEqual(attempts, 2000 // 50 + 1)
+        self.assertGreaterEqual(attempts, 2000 // 50 - 1)
+
+    def test_unreadable_ledger_does_not_matter(self):
+        S._retry_note("r1", 100.0)
+        self.assertTrue(S._retry_throttled("r1", 50, 100.001))   # the ledger plays no part
 
     def test_rids_are_independent(self):
-        S._retry_note("r1", self.stages, 100.0)
-        self.assertFalse(S._retry_throttled("r2", self.stages, 50, 100.001))
+        S._retry_note("r1", 100.0)
+        self.assertFalse(S._retry_throttled("r2", 50, 100.001))
 
     def test_a_granted_rid_starts_a_fresh_throttle(self):
-        S._retry_note("r1", self.stages, 100.0)
+        S._retry_note("r1", 100.0)
         S._wait_granted("r1")
-        self.assertFalse(S._retry_throttled("r1", self.stages, 50, 100.001))
+        self.assertFalse(S._retry_throttled("r1", 50, 100.001))
 
     def test_stage_cache_parses_once_and_invalidates_on_republish(self):
         p = os.path.join(self.d, "stage0.json")
@@ -182,9 +194,7 @@ class Pp0GrantThrottle(CustomTestCase):
         self.assertLessEqual(self.calls, 1000 // 50 + 1)
         self.assertGreaterEqual(self.calls, 1000 // 50 - 1)
 
-    def test_on_a_ledger_change_between_passes_retries_at_once(self):
-        calls_before = []
-
+    def test_on_a_ledger_change_between_passes_still_waits_the_interval(self):
         def gg(*a, **k):
             self.calls += 1
             return 0
@@ -201,11 +211,13 @@ class Pp0GrantThrottle(CustomTestCase):
             req, sched = _Req("weg2-0-2"), _Sched()
             for _ in range(5):
                 S.pp0_grant(sched, req)
-            calls_before.append(self.calls)
+            self.assertEqual(self.calls, 1)
             _write(self.led[0], b"\x07" * K._SIZE)
             S.pp0_grant(sched, req)
-        self.assertEqual(calls_before[0], 1)
-        self.assertEqual(self.calls, 2)
+            self.assertEqual(self.calls, 1, "a ledger change must not lift the throttle")
+            self.clock[0] += 1.001
+            S.pp0_grant(sched, req)
+            self.assertEqual(self.calls, 2)
 
 
 class GrantShortLine(CustomTestCase):

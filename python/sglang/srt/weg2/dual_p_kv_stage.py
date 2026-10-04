@@ -659,7 +659,7 @@ def live_grant_tokens(sched, req, page: int = 1) -> int:
 # -- #1530 GRANT-RETRY throttle (SGLANG_WEG2_DUAL_GRANT_RETRY_MS, default 0 = off) ----------
 #: stage-file path -> (mtime_ns, size, parsed table): a stage table changes only at publish_stage
 _STAGE_CACHE: dict = {}
-#: rid -> (monotonic time of its last attempt, ledger signature at that attempt)
+#: rid -> monotonic time of its last attempt
 _RETRY: dict = {}
 
 
@@ -692,38 +692,21 @@ def _load_stage(path: str, cached: bool) -> dict:
     return tab
 
 
-def _ledger_sig(stages) -> tuple:
-    """The raw record of every card ledger (a few dozen bytes each, read without the lock):
-    any commit / release / demand / pressure / lend change shows. Not the file mtime -- a
-    shared mmap write does not reliably move it. An unreadable ledger reads as None."""
-    from sglang.srt.weg2.card_kv_ledger import _SIZE
-
-    out = []
-    for s in stages or ():
-        try:
-            fd = os.open(s["ledger"], os.O_RDONLY)
-            try:
-                out.append(os.pread(fd, _SIZE, 0))
-            finally:
-                os.close(fd)
-        except (OSError, KeyError):
-            out.append(None)
-    return tuple(out)
-
-
-def _retry_throttled(rid: str, stages, ms: int, now: float) -> bool:
-    """True = skip this attempt: the rid tried less than ``ms`` ms ago and no card ledger record
-    changed since. Never longer than ``ms`` (no starvation); the first attempt of a rid always runs."""
+def _retry_throttled(rid: str, ms: int, now: float) -> bool:
+    """True = skip this attempt: the rid tried less than ``ms`` ms ago. A pure minimum interval:
+    no ledger signal lifts it (b9h: D's ledger changes on every tick, a signature check held the
+    throttle open at ~480 attempts/s). Never longer than ``ms`` (no starvation); the first attempt
+    of a rid always runs."""
     e = _RETRY.get(rid)
     if e is None:
         return False
-    return (now - e[0]) * 1000.0 < ms and e[1] == _ledger_sig(stages)
+    return (now - e) * 1000.0 < ms
 
 
-def _retry_note(rid: str, stages, now: float) -> None:
+def _retry_note(rid: str, now: float) -> None:
     if len(_RETRY) > 4096:
         _RETRY.clear()
-    _RETRY[rid] = (now, _ledger_sig(stages))
+    _RETRY[rid] = now
 
 
 def _grant_short_detail(stages, covered, level_tokens: int, sum_tokens: int, older: int, hold) -> str:
@@ -772,9 +755,9 @@ def pp0_grant(sched, req) -> Optional[int]:
     if _ms > 0:
         _t_now = _now()
         _rid0 = str(getattr(req, "rid", "?"))[:16]
-        if _retry_throttled(_rid0, stages, _ms, _t_now):
-            return 0                                      # still held; no new information since the last try
-        _retry_note(_rid0, stages, _t_now)
+        if _retry_throttled(_rid0, _ms, _t_now):
+            return 0                                      # still held; at most one attempt per N ms
+        _retry_note(_rid0, _t_now)
     # Q-630: a re-intake of a request whose earlier grant never reached the
     # followers (intake_stall/abort before the told) -- that grant is returned
     # before a new one is taken, never charged twice on a follower card.
