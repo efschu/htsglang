@@ -989,6 +989,11 @@ class Envs:
     SGLANG_WEG2_ENABLE_FLUSH_QUIESCE_NONBLOCK = EnvBool(True)
     # the groups both parts apply to (comma list; default the D->P sleeper)
     SGLANG_WEG2_FLUSH_NONBLOCK_GROUPS = EnvStr("D")
+    # 1403 (NF nf9 1004_105315): memoize the flush publish sweep's no-progress
+    # round across quiesce polls -- while the in-flight write-through/store count
+    # stands where that round left it, a repeat round cannot issue (kvs2 W3), so
+    # the poll skips its ~1.2 s sweep (P.log 144297 sweep_ms=1221.1 per poll).
+    SGLANG_WEG2_FLUSH_SWEEP_MEMO = EnvBool(False)
     # #287 NEED0 (c, 30.09., NF y4k weg2-0-4): the front's state.json field
     # front.d_park_stuck lists the rids parked in at least this many
     # consecutive D phases with no output in between (weg2/park_stuck.py).

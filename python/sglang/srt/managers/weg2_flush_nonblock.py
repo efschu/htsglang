@@ -208,3 +208,45 @@ def quiesce_sweep_blocking(scheduler, stats: dict, tp_group_verdict: bool) -> bo
         return True
     left = int((stats or {}).get("unbacked", 0) or 0) - int((stats or {}).get("issued", 0) or 0)
     return left > 0
+
+
+# ---- 1403 (NF nf9 1004_105315): the flush sweep's no-progress memo ------------
+
+
+def sweep_memo_on() -> bool:
+    """SGLANG_WEG2_FLUSH_SWEEP_MEMO: skip the quiesce poll's re-sweep while a
+    measured no-progress round is still in force. Default off until metal."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_WEG2_FLUSH_SWEEP_MEMO.get())
+
+
+def inflight_count(tree_cache) -> int:
+    """Replicated in-flight count: write-throughs plus store writes."""
+    if tree_cache is None:
+        return 0
+    return (len(getattr(tree_cache, "ongoing_write_through", {}) or {})
+            + len(getattr(tree_cache, "ongoing_backup", {}) or {}))
+
+
+def sweep_no_progress(stats: dict) -> bool:
+    """A round that left nodes un-backed, issued nothing and held nothing in
+    flight: by kvs2 W3 (no pin frees, no write lands) a repeat round cannot do
+    better -- across polls this is the 1.2 s sweep per quiesce poll measured on
+    nf9 (P.log 144297: unbacked=18 issued=0 sweep_ms=1221.1, every poll)."""
+    return (int((stats or {}).get("issued", 0) or 0) == 0
+            and int((stats or {}).get("pending", 0) or 0) == 0
+            and int((stats or {}).get("unbacked", 0) or 0) > 0)
+
+
+def sweep_memo_set(scheduler, tree_cache) -> None:
+    scheduler._weg2_flush_sweep_memo = inflight_count(tree_cache)
+
+
+def sweep_memo_hit(scheduler, tree_cache) -> bool:
+    """True while the in-flight count stands where the no-progress round left
+    it -- under the sweep's own gate (nothing running/waiting/chunked) every
+    un-backing and every pin release moves that count, so an unchanged count
+    means the tree and the arena are exactly as futile as they were."""
+    stamp = getattr(scheduler, "_weg2_flush_sweep_memo", None)
+    return stamp is not None and stamp == inflight_count(tree_cache)
