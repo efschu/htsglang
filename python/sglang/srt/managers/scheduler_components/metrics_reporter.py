@@ -531,16 +531,22 @@ class RankPrefillLog:
         timed: bool,
         graphed: bool = False,
         ext: Optional[list] = None,
+        rung: Optional[int] = None,
     ) -> None:
         if timed and self.timer is not None and not self.pairing_refused:
-            self._pending.append(
-                (new_tokens, cached_tokens, graphed, self.bubble.take_pending(), ext)
-            )
+            rec = (new_tokens, cached_tokens, graphed, self.bubble.take_pending(), ext)
+            if rung is not None:
+                # item 1330: the green-context stage this forward ran on, carried INSIDE the record like the
+                # bubble (the #691 pairing is positional over two queues); absent = the tuple is unchanged
+                rec += (int(rung),)
+            self._pending.append(rec)
         else:
             logger.info(
-                "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
+                "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1" + (
+                    "" if rung is None else " rung=%d"),
                 new_tokens,
                 cached_tokens,
+                *(() if rung is None else (int(rung),)),
             )
             self._cum_untimed(new_tokens, cached_tokens, ext)
 
@@ -554,10 +560,13 @@ class RankPrefillLog:
         self._durations.clear()
         while self._pending:
             new_tokens, cached_tokens, _graphed, _bubble, *_ext = self._pending.popleft()
+            _rg = _ext[1] if len(_ext) > 1 else None
             logger.info(
-                "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
+                "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1" + (
+                    "" if _rg is None else " rung=%d"),
                 new_tokens,
                 cached_tokens,
+                *(() if _rg is None else (_rg,)),
             )
             self._cum_untimed(new_tokens, cached_tokens, _ext[0] if _ext else None)
 
@@ -623,8 +632,12 @@ class RankPrefillLog:
         own_s = 0.0
         own_wait_s = 0.0
         ext_all: Optional[list] = []  # DASH-FIELDS: the folded chunks' [[rid, start, end]]
+        rungs_seen: list = []  # item 1330: the green stages of the folded forwards, in order
         for _ in range(k):
             n, c, graphed, bub, *_ext = self._pending.popleft()
+            if len(_ext) > 1 and _ext[1] is not None:
+                if not rungs_seen or rungs_seen[-1] != _ext[1]:
+                    rungs_seen.append(_ext[1])
             if ext_all is not None:
                 if _ext and _ext[0] is not None:
                     ext_all.extend(_ext[0])
@@ -707,6 +720,9 @@ class RankPrefillLog:
             # no readable wait but its host-side gap is measured all the same.
             line += " bubble_ms=%.1f (between forwards, mb=%d)"
             args += [bubble_ms, bubble_mb]
+        if rungs_seen:
+            line += " rung=%s"
+            args.append("/".join(str(r) for r in rungs_seen))
         logger.info(line, *args)
         # #363: the same numbers, kept for one structured reader instead of
         # only being formatted into a log line. ``last_split_known`` is False
@@ -1338,6 +1354,7 @@ class SchedulerMetricsReporter:
             ),
             graphed=can_run_cuda_graph,
             ext=prefill_ext(batch),  # DASH-FIELDS: host values of batch.reqs, after the forward
+            rung=getattr(batch, "_dual_green_rung", None),  # item 1330: None unless the ladder ran this forward
         )
         self.rank_prefill_log.flush()
         # #1241: the decode half is drained at the same three sites the

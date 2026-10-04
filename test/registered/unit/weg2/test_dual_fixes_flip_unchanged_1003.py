@@ -31,6 +31,9 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
          sees a hold; the full behavioural set is test_weg2_dual_told_anchor_hold_y9d4_1004
   Q-800  DUAL-SHARE: PP0 chunk cap, share duty, D capture priority, MPS client priority,
          front controller/admin route/leg hooks (weg2/dual_share.py)
+  Q-1330 DUAL-SHARE stage 3: the green-context ladder of P (weg2/dual_green.py): no actuator, no stream pick, no
+         wire object, graphs never forced eager, fallback hooks inert; the behavioural half is
+         test_dual_green_ladder_1330 (three-stage wire, launch order, mutants)
 """
 from __future__ import annotations
 
@@ -1018,4 +1021,33 @@ class TestToldAnchorHoldFlipUnchanged:
         assert TAH.attach(tree, told) is None
         assert not hasattr(tree, "_weg2_told_hold")
         TAH.report_extent(SimpleNamespace(rid="weg2-0-77"), 1)   # no hold: free, silent
+
+
+# ---------------------------------------------------------------------------------- Q-1330
+
+class TestQ1330FlipUnchanged:
+    def test_no_actuator_off_every_wrong_gate_and_the_backend_is_never_touched(self):
+        from sglang.srt.weg2 import dual_green as G
+        from sglang.srt.weg2 import dual_share as S
+
+        class Boom:
+            def __getattribute__(self, n):
+                raise AssertionError("the CUDA backend was touched in the flip form")
+
+        sched = SimpleNamespace(ps=SimpleNamespace(pp_rank=0, pp_size=3))
+        on = {S.GREEN_LADDER_ENV: "1", S.ACT_ENV: "green,duty", S.CTL_ENV: "/dev/shm/x"}
+        for env in _wrong_gates() + [{**g, **on} for g in _wrong_gates()]:
+            assert G.armed(env) is False, env
+            assert G.maybe_arm(sched, env, backend=Boom()) is None, env
+        assert G.force_eager() is False and S.green_serves(1) is False and G.ladder_switch({}) is False
+
+    def test_fallback_hooks_are_inert_and_the_plain_ctl_line_is_unchanged(self):
+        from sglang.srt.weg2 import dual_share as S
+
+        assert S._GREEN_SERVES is None
+        d = S.Decision("dynamic", 1, 0, 1, 0.75, None, 1, 6, 0.0, None, None, "x", True, False, 0, 0.0)
+        assert S.format_ctl(7, d) == "v1 seq=7 mode=dynamic rung=1 f=0.7500 b=1 seats=6 q=0 tau_ms=-1 r_x100=-1\n"
+        fs = S.FrontShare.from_args(ctl="/dev/shm/q1330-x", mode="dynamic", actuators="chunk", d_min_rate_tps=0.0,
+                                    p_min_share=0.25, env={}, log=lambda m: None)
+        assert type(fs.ctrl) is S.ShareController and fs.green is None
 

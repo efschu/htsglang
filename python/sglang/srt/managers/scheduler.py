@@ -3490,6 +3490,13 @@ class Scheduler(
             if os.environ.get(_dsh.CTL_ENV)
             else None
         )
+        # DUAL-SHARE stage 3 (weg2/dual_green.py, item 1330): P's green-context ladder. Nothing is imported or
+        # created unless the launcher set SGLANG_WEG2_DUAL_GREEN_LADDER on this P rank (--dual-green-ladder, default
+        # off); ``maybe_arm`` re-checks the dual P gate and never raises (a named fallback line, None).
+        if os.environ.get(_dsh.GREEN_LADDER_ENV):
+            from sglang.srt.weg2 import dual_green as _dual_green
+
+            self._dual_green = _dual_green.maybe_arm(self)
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
