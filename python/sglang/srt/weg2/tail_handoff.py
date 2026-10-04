@@ -683,6 +683,17 @@ def _clock_add(name: str, t0: float) -> None:
     setattr(_STAGE_CLOCK, name, getattr(_STAGE_CLOCK, name, 0.0) + (time.perf_counter() - t0) * 1000.0)
 
 
+_LOST = {"n": 0}
+
+
+def _note_lost(rid, ppath) -> None:
+    n = _LOST["n"] = _LOST["n"] + 1
+    if n <= 8 or (n & (n - 1)) == 0:
+        logger.warning("WEG2-TAIL part lost rid=%s path=%s (n=%d): the part file is gone (aborted or "
+                       "consumed) -- verdict lost, the request keeps the page-prefix resume",
+                       rid, ppath, n)
+
+
 def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[dict], str]:
     """Load a part; with ``check_digest`` compare both sections against the
     publish digests. (bundle, '') or (None, reason) -- 'unreadable' or
@@ -698,6 +709,13 @@ def read_part(header: TailHeader, check_digest: bool = True) -> Tuple[Optional[d
             bundle = torch.load(ppath, map_location="cpu", mmap=True)
         else:
             bundle = torch.load(ppath, map_location="cpu")
+    except FileNotFoundError:
+        # Q-699: the part is GONE (its request was aborted -- F4 PARK-END abort
+        # removes the park parts -- or consumed): a terminal answer, not an IO
+        # fault. The reader keeps the page-prefix resume (a 0 vote). One line,
+        # no traceback, throttled (y9n 10032307: 90927 tracebacks in 5.5 min).
+        _note_lost(header.spec.rid, ppath)
+        return None, "lost"
     except (OSError, RuntimeError, EOFError):
         logger.warning("WEG2-TAIL part unreadable: %s", ppath, exc_info=True)
         return None, "unreadable"
