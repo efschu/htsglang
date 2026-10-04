@@ -319,9 +319,9 @@ def test_overshoot_descends_one_stage_after_the_dwell_and_two_when_far_over():
     assert d.rung == 1 and d.target_ms == 100.0
     d = obs(c, clk, b=1, round_ms=150.0, dt=0.2)       # over target, but 0.2 s since the change
     assert d.rung == 1
-    d = obs(c, clk, b=1, round_ms=150.0, dt=0.4)       # 0.6 s since the change
+    d = obs(c, clk, b=1, round_ms=150.0, dt=0.9)       # 1.1 s since the change (desc_min_s 1.0)
     assert d.rung == 2 and "d_round_over" in d.reason and d.adj == 1
-    d = obs(c, clk, b=1, round_ms=260.0, dt=0.6)       # x2.6 the target: two stages, clamped at the deepest
+    d = obs(c, clk, b=1, round_ms=260.0, dt=1.1)       # x2.6 the target: two stages, clamped at the deepest
     assert d.rung == 3 and d.adj == 2
     d = obs(c, clk, b=1, round_ms=400.0, dt=1.0)       # nothing deeper than p_min_share allows
     assert d.rung == 3
@@ -329,7 +329,7 @@ def test_overshoot_descends_one_stage_after_the_dwell_and_two_when_far_over():
 
 def test_calm_ascends_one_stage_only_after_calm_dwell_and_a_passing_preview():
     c, clk, d = _entered()
-    obs(c, clk, b=1, round_ms=150.0, dt=0.6)           # -> rung 2
+    obs(c, clk, b=1, round_ms=150.0, dt=1.1)           # -> rung 2
     assert c.rung == 2
     d = obs(c, clk, b=1, round_ms=50.0, dt=0.5)        # calm starts
     assert d.rung == 2
@@ -341,7 +341,7 @@ def test_calm_ascends_one_stage_only_after_calm_dwell_and_a_passing_preview():
 
 def test_calm_with_a_failing_preview_stays_and_says_so():
     c, clk, d = _entered()
-    obs(c, clk, b=1, round_ms=150.0, dt=0.6)
+    obs(c, clk, b=1, round_ms=150.0, dt=1.1)
     assert c.rung == 2
     obs(c, clk, b=1, round_ms=70.0, dt=0.5)            # ratio exactly 0.7 = calm, but the stage-1 preview is 131 ms
     d = obs(c, clk, b=1, round_ms=70.0, dt=2.5)
@@ -358,7 +358,7 @@ def test_a_round_between_the_calm_and_the_over_line_is_the_dead_band_nothing_mov
 
 def test_flaps_are_counted_when_a_change_reverses_inside_the_window():
     c, clk, d = _entered()
-    obs(c, clk, b=1, round_ms=150.0, dt=0.6)           # down
+    obs(c, clk, b=1, round_ms=150.0, dt=1.1)           # down
     assert c.rung == 2 and c.flaps == 0
     obs(c, clk, b=1, round_ms=50.0, dt=0.5)
     obs(c, clk, b=1, round_ms=50.0, dt=2.5)            # up inside flap_window_s (10 s)
@@ -375,7 +375,7 @@ def test_a_bs_change_while_busy_moves_by_the_dwell_rule_one_stage_per_decision()
 
 def test_the_entry_after_idle_starts_fresh_the_closed_loop_state_is_gone():
     c, clk, d = _entered()
-    obs(c, clk, b=1, round_ms=260.0, dt=0.6)
+    obs(c, clk, b=1, round_ms=260.0, dt=1.1)
     assert c.adj > 0
     obs(c, clk, b=0, dt=0.1)
     d = obs(c, clk, b=1, dt=0.1)
@@ -435,7 +435,7 @@ def test_front_share_with_the_ladder_uses_the_green_controller_and_logs_pstufe(m
     fs = S.FrontShare.from_args(ctl=ctl, mode="dynamic", actuators="green,duty", d_min_rate_tps=25.0, p_min_share=0.25,
                                 env={}, log=logs.append, green_ladder="on")
     assert isinstance(fs.ctrl, G.GreenController) and fs.green == "on" and fs.ctrl.cfg.tick_s == G.GreenConfig().tick_s
-    assert fs.d_rate.window_s == 0.5
+    assert fs.d_rate.window_s == 1.0 and G.GreenConfig().desc_min_s >= 1.0
     d = fs.tick(queue=[], p_outstanding={}, d_outstanding={"r1": 1.0}, seats=6)
     assert d.rung == 1 and fs.snapshot()["green"] == "on"
     assert any(l.startswith("DUAL-SHARE mode=") for l in logs) and any(l.startswith("P-STUFE ") for l in logs)
@@ -893,6 +893,228 @@ def test_the_launch_path_off_the_gate_imports_nothing_new_at_run_time():
     assert "_dgreen_l is not None" in src and "if _gc_stream is not None" in src
 
 
+# ------------------------------------------------------------------------------- review 11:03Z follow-ups
+def _flap_sim(mod, bs, acc, T=120.0, dt=0.05):
+    """The reviewer's closed-loop simulation with a fake clock: D rounds = solo(bs) x factor(rung); the front sees the
+    EVENT COUNT of a 1.0 s window times the true tokens per round; R_min 12 tok/s (target 208 ms)."""
+    clk = Clock()
+    cfg = S.ShareConfig(d_min_rate_tps=12.0)
+    c = mod.GreenController(cfg, "dynamic", mod.GreenConfig(), clock=clk)
+    fac = (4.5, 2.8, 1.5, 1.24)
+    solo = {1: 28.0, 3: 40.0, 6: 57.0}[bs]
+    ev, nxt, t0, changes = [], clk.t, clk.t, 0
+    for i in range(int(T / dt)):
+        clk.t = t0 + i * dt
+        rnd_s = solo * fac[c.rung] / 1000.0
+        while nxt <= clk.t:
+            ev.append(nxt)
+            nxt += rnd_s
+        ev = [e for e in ev if clk.t - e <= 1.0]
+        rate = len(ev) * acc / 1.0 if ev else None
+        d = c.observe(q_tokens=3000, b=bs, seats=4, p_rate_tps=1500.0, d_rate_tps=rate, oldest_age_s=0.0)
+        changes += int(d.changed)
+    return changes
+
+
+def test_b2_the_flapping_case_of_the_review_is_bounded_by_the_window_and_the_latch():
+    # bs6 with 3.0 true tokens per round against the assumed 2.5: the base read 55 changes in 120 s (review sim6)
+    assert _flap_sim(G, 6, 3.0) <= 12
+    assert _flap_sim(G, 3, 2.0) <= 6 and _flap_sim(G, 6, 2.0) <= 6 and _flap_sim(G, 1, 3.0) <= 6
+
+
+def _drive(c, clk, round_ms, until, dt=0.2, cap=400):
+    d = None
+    for _ in range(cap):
+        d = obs(c, clk, b=1, round_ms=round_ms, dt=dt)
+        if until(d):
+            return d
+    raise AssertionError("never reached")
+
+
+def test_b2_a_descent_soon_after_an_ascent_bars_that_ascent_and_the_bar_doubles():
+    c, clk, d = _entered()                                           # stage 1 (75 %), target 100 ms
+    d = _drive(c, clk, 50.0, lambda d: d.rung == 0)                  # calm: ascends to 100 %
+    assert "d_round_calm" in d.reason and c.latches == 0
+    d = _drive(c, clk, 300.0, lambda d: d.rung > 0)                  # it was wrong: over target inside 10 s
+    assert c.latches == 1 and "asc_latched(0,30s)" in d.reason
+    assert abs(c._asc_lock[0] - clk.t - 30.0) < 1e-6
+    d = _drive(c, clk, 50.0, lambda d: "asc_locked(0" in d.reason, cap=100)    # calm again: the ascent TO 0 is barred
+    assert d.rung > 0
+    for _ in range(100):                                             # 20 s of calm: still barred, rung unchanged
+        d = obs(c, clk, b=1, round_ms=50.0, dt=0.2)
+        if clk.t > c._asc_lock[0] - 5:
+            break
+        assert d.rung > 0
+    d = _drive(c, clk, 50.0, lambda d: d.rung == 0, cap=600)         # after the 30 s it may try again
+    d = _drive(c, clk, 300.0, lambda d: d.rung > 0)                  # wrong again -> twice the bar
+    assert c.latches == 2 and "asc_latched(0,60s)" in d.reason
+    assert abs(c._asc_lock[0] - clk.t - 60.0) < 1e-6
+
+
+def test_b2_a_descent_long_after_an_ascent_is_no_flap_and_latches_nothing():
+    c, clk, d = _entered()
+    _drive(c, clk, 50.0, lambda d: d.rung == 0)
+    for _ in range(80):                                              # 16 s at ease at 100 %
+        obs(c, clk, b=1, round_ms=60.0, dt=0.2)
+    d = _drive(c, clk, 300.0, lambda d: d.rung > 0)
+    assert c.latches == 0 and "asc_latched" not in d.reason
+
+
+def test_b3_the_boot_probe_shape_has_at_least_eight_waves_and_the_old_one_timed_both_alike():
+    def waves(shape, sm):
+        tiles = (shape[0] // 128) * (shape[2] // 128)
+        return -(-tiles // sm)
+
+    for sm in (170, 128, 88, 48):
+        assert waves(G.PROBE_SHAPE_DEFAULT, sm) >= 8
+    assert waves((2048, 4096, 4096), 170) == waves((2048, 4096, 4096), 128) == 4     # the review's calculation
+    ratio_new = waves(G.PROBE_SHAPE_DEFAULT, 128) / waves(G.PROBE_SHAPE_DEFAULT, 170)
+    assert ratio_new > 1.2                                                           # 75 % rung: 16 vs 13 waves, 1.23x
+    src = inspect.getsource(G.CtypesBackend.time_stream)
+    assert src.index("torch.cuda.synchronize(dev)") < src.index("ctx = torch.cuda.stream")   # operands finished first
+    assert src.rindex("torch.cuda.synchronize(dev)") > src.index("e1.synchronize()")
+
+
+def test_b7_the_driver_struct_is_144_bytes_and_the_group_array_has_spare_slots():
+    import ctypes
+
+    assert ctypes.sizeof(G._DevResource) == G.DEV_RESOURCE_SIZEOF == 144
+    assert G.SPLIT_SPARE >= 1
+    assert "(_DevResource * (n + SPLIT_SPARE))" in inspect.getsource(G.CtypesBackend._split)
+    assert "sizeof(_DevResource) != DEV_RESOURCE_SIZEOF" in inspect.getsource(G.CtypesBackend.__init__)
+
+
+def test_b5_tp_size_above_one_is_refused_by_name_and_arms_nothing():
+    env = {**DUAL_P, **LADDER_ENV}
+    warns = []
+    sched = SimpleNamespace(ps=SimpleNamespace(pp_rank=0, pp_size=3, tp_size=2))
+    assert G.maybe_arm(sched, env, backend=FakeBackend(170, 8), warn=warns.append, log=lambda m: None) is None
+    assert len(warns) == 1 and "tp_size=2" in warns[0] and warns[0].startswith(S.FALLBACK + " mech=green")
+    sched.ps.tp_size = 1
+    assert G.maybe_arm(sched, env, backend=FakeBackend(170, 8), warn=lambda m: None, log=lambda m: None) is not None
+
+
+def test_b4_the_vram_instrument_marker_switch_line_and_status_carry_the_allocator():
+    class MemBackend(FakeBackend):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.free = [20000 << 20, 19840 << 20]
+
+        def mem_info(self):
+            return self.free.pop(0), 32000 << 20
+
+    logs = []
+    ctl = tempfile.mktemp()
+    env = {**DUAL_P, **LADDER_ENV, S.CTL_ENV: ctl}
+    act = G.maybe_arm(_sched(1), env, backend=MemBackend(170, 8), log=logs.append, warn=lambda m: None)
+    assert any("P vram pp=1 card_free_mib before=20000 after=19840 ladder_cost_mib=160" in l for l in logs)
+    snaps = iter([{"reserved_mib": 900, "alloc_mib": 400, "retries": 0}, {"reserved_mib": 1100, "alloc_mib": 420, "retries": 2}] + [
+        {"reserved_mib": 1100, "alloc_mib": 420, "retries": 2}] * 10)
+    act._vram_fn = lambda: next(snaps)
+    sched = _launch_sched()
+    act.pick(sched)                                                  # first forward: no reading yet
+    act.apply(G.Weg2DualGreenRung(1, 2, 500000))
+    act.pick(sched)                                                  # stage 0 ended -> reading 900
+    assert any("P rung 0->2" in l and "reserved_mib=900 alloc_retries=0" in l for l in logs)
+    assert act.vram_by_rung[0]["reserved_mib"] == 900
+    st_line = act.status_line()
+    assert "reserved_mib=1100 alloc_mib=420 alloc_retries=2" in st_line and "vram_by_rung" in st_line and "0:900/0" in st_line
+    G._reset_state_for_tests()
+    assert G.vram_snapshot() is None or isinstance(G.vram_snapshot(), dict)       # no CUDA here: None, never raises
+    if os.path.exists(G.pobs_path(ctl, 1)):
+        os.unlink(G.pobs_path(ctl, 1))
+
+
+# ---- review gaps M06 / M08 / hook behaviour / M10 / M11 / M16
+def test_m06_every_green_rung_is_eager_and_rung_0_is_not():
+    a = make_actuator(1, st(0, 1.0))
+    sched = _launch_sched()
+    a.pick(sched)
+    assert G.force_eager() is False
+    for rung, f, name in ((1, 0.75, "gc128"), (2, 0.5, "gc88"), (3, 0.25, "gc48")):
+        a.apply(G.Weg2DualGreenRung(rung, rung, int(f * 1e6)))
+        ctx, stream = a.pick(sched)
+        assert stream.name == name and G.force_eager() is True, rung
+    a.apply(G.Weg2DualGreenRung(9, 0, 1000000))
+    a.pick(sched)
+    assert G.force_eager() is False
+
+
+def test_m08_the_group_rounding_is_the_rungs_sm_in_the_serve_path_not_the_wanted_count():
+    be = FakeBackend(170, 8)
+    a = make_actuator(1, st(0, 1.0), backend=be)
+    r = a.ladder.rungs[2]
+    assert r.want == 85 and r.sm == 88 and r.stream.name == "gc88"       # the driver rounded 85 up to 88
+    sched = _launch_sched()
+    a.pick(sched)
+    a.apply(G.Weg2DualGreenRung(1, 2, 500000))
+    a.pick(sched)
+    assert a.active_sm == 88 and any("sm_real=88" in l for l in a.logs) and not any("sm_real=85" in l for l in a.logs)
+    ctl = tempfile.mktemp()
+    a.pobs = G.PObsWriter(ctl, 1)
+    a.apply(G.Weg2DualGreenRung(2, 3, 250000))
+    a.pick(sched)
+    assert G.read_pobs(ctl)[1]["sm"] == "48"                              # 42 wanted, 48 real
+    os.unlink(G.pobs_path(ctl, 1))
+
+
+def test_graph_runner_hook_behaviour_green_rung_answers_eager_and_the_base_answer_is_untouched():
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import PrefillCudaGraphRunner as R
+
+    noted = []
+    me = SimpleNamespace(_is_full_backend=True, _note_eager=lambda reason, fb: noted.append(reason),
+                         _full_graph_ineligible_reason=lambda fb: None)
+    fb = SimpleNamespace()
+    G._STATE["eager"] = False
+    assert R.can_run_graph(me, fb) is True and noted == []                 # unarmed / rung 0: the graph runs
+    G._STATE["eager"] = True
+    assert R.can_run_graph(me, fb) is False and noted == ["green_rung"]    # a green stream: eager, named
+    G._STATE["eager"] = False
+    assert R.can_run_graph(me, fb) is True                                 # back up to 100 %: graphs again
+
+
+def test_m10_hold_from_env_actuates_only_with_the_hold_switch_and_clamps_the_knobs():
+    assert G.HoldGate.from_env({}).actuate is False
+    assert G.HoldGate.from_env({G.HOLD_ENV: "0"}).actuate is False
+    assert G.HoldGate.from_env({S.GREEN_LADDER_ENV: "1"}).actuate is False       # the ladder switch alone never holds
+    assert G.HoldGate.from_env({G.HOLD_ENV: "1"}).actuate is True
+    g = G.HoldGate.from_env({G.HOLD_ENV: "1", G.HOLD_HI_ENV: "0.95", G.HOLD_LO_ENV: "0.99", G.HOLD_MAX_S_ENV: "9"})
+    assert g.hi == 0.95 and g.lo < g.hi and g.max_s == 9.0                        # lo clamped under hi
+    assert G.HoldGate.from_env({G.HOLD_HI_ENV: "junk"}).hi == G.HOLD_ARENA_HI_DEFAULT
+
+
+def test_m11_the_trace_filter_hides_the_stage_order_only_behind_the_switch(monkeypatch):
+    monkeypatch.setenv(S.GREEN_LADDER_ENV, "1")
+    h0, h1 = _pp_stage(0, st(1, 0.75)), _pp_stage(1, st(0, 1.0))
+    _intake(h0, [])                                                         # PP0 stamps; PP0's own list is empty
+    assert getattr(h0, "_pp_req_trace_n", 0) == 0
+    _intake(h1, h0.sent[-1])                                                # the follower's list = [stamp] only
+    assert getattr(h1, "_pp_req_trace_n", 0) == 0                           # not traced as a request
+    _intake(h1, ["req"] + h0.sent[-1])
+    assert h1._pp_req_trace_n == 1                                          # a real request still is
+    monkeypatch.delenv(S.GREEN_LADDER_ENV)
+    h2 = _pp_stage(1, st(0, 1.0))
+    del h2._dual_green
+    _intake(h2, ["req"])
+    assert h2._pp_req_trace_n == 1
+
+
+def test_m16_the_stamp_key_is_rung_and_the_fraction_rounded_to_four_digits():
+    t = [0.0]
+    a0 = make_actuator(0, st(2, 0.5), clock=lambda: t[0])
+    assert a0.pp0_stamp([])[1] is not None
+    a0.box["st"] = st(2, 0.50004)                                           # same key at 4 digits: no restamp
+    t[0] = 0.1
+    assert a0.pp0_stamp([])[1] is None
+    a0.box["st"] = st(2, 0.5002)                                            # another fraction at 4 digits: restamp
+    t[0] = 0.2
+    c = a0.pp0_stamp([])[1]
+    assert c is not None and c.f_ppm == 500200
+    a0.box["st"] = st(3, 0.5002)                                            # another rung, same fraction: restamp
+    t[0] = 0.3
+    assert a0.pp0_stamp([])[1].rung == 3
+
+
 # ----------------------------------------------------------------------------------------------- the mutants
 _SRC = inspect.getsource(G)
 
@@ -922,7 +1144,7 @@ def _gate_check(mod):
 
 
 def _dwell_check(mod):
-    """No descent 0.2 s after a change (inside desc_min_s), one after 0.6 s."""
+    """No descent 0.2 s after a change (inside desc_min_s), one after 1.1 s."""
     clk = Clock()
     c = mod.GreenController(S.ShareConfig(d_min_rate_tps=25.0), "dynamic", clock=clk)
 
@@ -934,7 +1156,7 @@ def _dwell_check(mod):
     clk.t += 1.0
     ob(0.0, None)
     early = ob(0.2, 150.0).rung
-    late = ob(0.4, 150.0).rung
+    late = ob(0.9, 150.0).rung
     return early == 1 and late == 2
 
 
@@ -1010,9 +1232,43 @@ def _fallback_check(mod):
     return (not ld.serves(0.5)) and ld.serves(0.75) and any("rung 2" in w for w in warns)        # bookkeeping alone
 
 
+def _sm_check(mod):
+    """The serve path reports the DRIVER's rounded SM count (85 wanted -> 88), never the wanted one."""
+    ld = mod.GreenLadder(FakeBackend(170, 8), FRACTIONS, probe=False, log=lambda m: None, warn=lambda m: None).build()
+
+    class R:
+        def read(self):
+            return st(2, 0.5)
+
+    a = mod.GreenActuator(ld, R(), pp_rank=1, pp_size=3, log=lambda m: None, vram_fn=lambda: None)
+    a.apply(mod.Weg2DualGreenRung(1, 2, 500000))
+    a.pick(_launch_sched())
+    return a.active_sm == 88
+
+
+def _stamp_key_check(mod):
+    ld = mod.GreenLadder(FakeBackend(170, 8), FRACTIONS, probe=False, log=lambda m: None, warn=lambda m: None).build()
+    box = {"st": st(2, 0.5)}
+
+    class R:
+        def read(self):
+            return box["st"]
+
+    t = [0.0]
+    a = mod.GreenActuator(ld, R(), pp_rank=0, pp_size=3, log=lambda m: None, clock=lambda: t[0], vram_fn=lambda: None)
+    a.pp0_stamp([])
+    box["st"] = st(2, 0.5002)
+    t[0] = 0.2
+    return a.pp0_stamp([])[1] is not None
+
+
+def _latch_check(mod):
+    return _flap_sim(mod, 6, 3.0) <= 12
+
+
 MUTANTS = [
     ("gate out", (("    if not _pk.armed(e):\n        return False\n", "    if False:\n        return False\n"),), _gate_check),
-    ("dwell out", (("desc_min_s: float = 0.5 ", "desc_min_s: float = 0.0 "),), _dwell_check),
+    ("dwell out", (("desc_min_s: float = 1.0 ", "desc_min_s: float = 0.0 "),), _dwell_check),
     ("stage mapping wrong (farthest fraction)", (("min(range(len(self.fractions)), key=lambda k: abs(", "max(range(len(self.fractions)), key=lambda k: abs("),), _mapping_check),
     ("bs direction reversed", (("((2, 1, 0), (4, 2, 1), (10 ** 9, 3, 2))", "((2, 3, 2), (4, 2, 1), (10 ** 9, 1, 0))"),), _bs_direction_check),
     ("wire only PP0 (follower ignores the stamp)", (("        for c in sorted(cmds, key=lambda c: c.seq):\n            self.apply(c)\n", "        for c in sorted(cmds, key=lambda c: c.seq):\n            pass\n"),), _wire_check),
@@ -1020,6 +1276,9 @@ MUTANTS = [
     ("hold starvation exemption out", (("        if starve:                                         # the starvation clamp wins over a hold\n", "        if False:\n"),), _starve_hold_check),
     ("hold bound out", (("            if now - self._hold_t0 >= self.max_s:\n", "            if False:\n"),), _bound_check),
     ("force_eager always False", (('    return bool(_STATE["eager"])', "    return False"),), _eager_check),
+    ("latch never bars", (("                                self._asc_lock[to] = now + lock_s\n", "                                pass\n"),), _latch_check),
+    ("serve path reports the wanted SM", (("entry.sm if entry is not None else (self.ladder.info.sm_total", "entry.want if entry is not None else (self.ladder.info.sm_total"),), _sm_check),
+    ("stamp key rung only", (("            key = (int(st.rung), round(float(st.fraction), 4))", "            key = (int(st.rung),)"),), _stamp_key_check),
     ("failed rung served as if healthy", (("                self.failed[i] = f\"{type(e).__name__}: {e}\"\n                self.counters[\"create_failed\"] += 1\n", "                self.failed[i] = f\"{type(e).__name__}: {e}\"\n                self.counters[\"create_failed\"] += 1\n                self.rungs[i] = Rung(index=i, fraction=f, want=want, sm=0, stream=None)\n"),), _fallback_check),
 ]
 

@@ -1026,7 +1026,7 @@ class FrontShare:
         if green:
             gcfg = _dg.GreenConfig.from_env(e)
             fs.ctrl = _dg.GreenController(cfg, mode, gcfg, clock=fs._clock)
-            fs.d_rate = DRateMeter(window_s=0.5, clock=fs._clock)   # a short window: the round after a change
+            fs.d_rate = DRateMeter(window_s=gcfg.d_window_s, clock=fs._clock)   # >= 1.0 s: 0.5 s read noise as overshoot (review 11:03Z)
             fs.green = str(green_ladder)
             log(f"{LOG_TAG} GREEN ladder front armed ({green_ladder}): factors={list(gcfg.factors)} "
                 f"tsolo_ms={[list(x) for x in gcfg.tsolo_ms]} accept_len={gcfg.accept_len:g} "

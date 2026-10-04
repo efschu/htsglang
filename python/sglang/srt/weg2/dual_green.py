@@ -198,6 +198,10 @@ class GreenBackend:
         """Median ms of a fixed compute load on ``stream`` (None = the primary context's current stream)."""
         raise NotImplementedError
 
+    def mem_info(self) -> Optional[Tuple[int, int]]:
+        """(free_bytes, total_bytes) of the card, or None when unknown (the VRAM instrument, B4)."""
+        return None
+
 
 class _SmRes(ctypes.Structure):
     # CUDA 12.x: smCount only; 13.x adds minSmPartitionSize, smCoscheduledAlignment, flags
@@ -215,6 +219,15 @@ class _DevResource(ctypes.Structure):
     _fields_ = [("type", ctypes.c_int), ("_internal_padding", ctypes.c_ubyte * 92), ("u", _ResUnion)]
 
 
+#: cuda.h CUdevResource: int type + 92 bytes internal padding + 48-byte union (metal probes use the same shape)
+DEV_RESOURCE_SIZEOF = 144
+#: spare group slots behind the counted ones (a driver that writes one more than it announced must not hit the heap)
+SPLIT_SPARE = 8
+#: boot-probe GEMM, the metal probe's shape (m, k, n): 2048 CTAs of 128x128 = ~12 waves on 170 SM. The old
+#: 2048x4096x4096 is 512 CTAs: ceil(512/170) = 4 waves and ceil(512/128) = 4 waves -- the masked and the full card time
+#: IDENTICALLY (ratio ~1.0) and the 75 % rung read as 'mask does not bite' (review 11:03Z). Needs >= 8 waves.
+PROBE_SHAPE_DEFAULT = (4096, 5120, 8192)
+PROBE_SHAPE_ENV = "SGLANG_WEG2_DUAL_GREEN_PROBE_SHAPE"
 _CU_DEV_RESOURCE_TYPE_SM = 1
 _CU_GREEN_CTX_DEFAULT_STREAM = 0x1
 _CU_STREAM_NON_BLOCKING = 0x1
@@ -245,6 +258,9 @@ class CtypesBackend(GreenBackend):
             "cuGreenCtxCreate": [ctypes.POINTER(v), v, ctypes.c_int, ctypes.c_uint],
             "cuGreenCtxStreamCreate": [ctypes.POINTER(v), v, ctypes.c_uint, ctypes.c_int],
         }
+        if ctypes.sizeof(_DevResource) != DEV_RESOURCE_SIZEOF:
+            raise GreenError(f"CUdevResource layout: sizeof={ctypes.sizeof(_DevResource)} != {DEV_RESOURCE_SIZEOF} "
+                             "(the driver would write past the array)")
         missing = []
         for name, argtypes in need.items():
             try:
@@ -305,7 +321,7 @@ class CtypesBackend(GreenBackend):
         if rc != 0 or nb.value == 0:
             return None, []
         n = int(nb.value)
-        groups = (_DevResource * n)()
+        groups = (_DevResource * (n + SPLIT_SPARE))()
         nb2 = ctypes.c_uint(n)
         rc = self.lib.cuDevSmResourceSplitByCount(groups, ctypes.byref(nb2), ctypes.byref(self._total),
                                                   ctypes.byref(rem), 0, ctypes.c_uint(int(want)))
@@ -333,15 +349,32 @@ class CtypesBackend(GreenBackend):
         stream = self._torch.cuda.ExternalStream(int(raw.value), device=self._torch.device(f"cuda:{self.ordinal}"))
         return int(sizes[0]), stream
 
-    def time_stream(self, stream: Any, reps: int = 16, m: int = 2048, k: int = 4096, n: int = 4096) -> float:
+    def mem_info(self) -> Optional[Tuple[int, int]]:
+        try:
+            free, total = self._torch.cuda.mem_get_info(self.ordinal)
+            return int(free), int(total)
+        except Exception:  # noqa: BLE001 - an instrument
+            return None
+
+    def time_stream(self, stream: Any, reps: int = 8, shape: Optional[Tuple[int, int, int]] = None) -> float:
         import contextlib
         import statistics
 
         torch = self._torch
+        if shape is None:
+            try:
+                shape = tuple(int(x) for x in str(os.environ.get(PROBE_SHAPE_ENV, "")).split(",")) or None
+            except ValueError:
+                shape = None
+            if not shape or len(shape) != 3:
+                shape = PROBE_SHAPE_DEFAULT
+        m, k, n = shape
         dev = torch.device(f"cuda:{self.ordinal}")
+        # the operands are made on the DEFAULT stream: finish them before another stream reads them
         a = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
         b = torch.randn(k, n, dtype=torch.bfloat16, device=dev)
         c = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
+        torch.cuda.synchronize(dev)
         ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
         out = []
         with ctx:
@@ -355,6 +388,7 @@ class CtypesBackend(GreenBackend):
                 e1.synchronize()
                 if r > 0:                        # round 0 is the warm-up
                     out.append(e0.elapsed_time(e1))
+        torch.cuda.synchronize(dev)
         del a, b, c
         return float(statistics.median(out))
 
@@ -680,6 +714,22 @@ def read_pobs(ctl: str, ranks: Sequence[int] = tuple(range(8)), stale_s: float =
 
 # ----------------------------------------------------------------------------- P side: the actuator
 
+def vram_snapshot() -> Optional[Dict[str, int]]:
+    """The process allocator as it is NOW (B4): reserved / allocated MiB and the alloc-retry count. One reading is
+    process-wide, not per stream: the per-stage rows are the readings taken when a stage went out of use."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+            return None
+        st = torch.cuda.memory_stats()
+        return {"reserved_mib": int(torch.cuda.memory_reserved()) >> 20,
+                "alloc_mib": int(torch.cuda.memory_allocated()) >> 20,
+                "retries": int(st.get("num_alloc_retries", 0))}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def default_arena_reader(sched) -> Optional[Tuple[Optional[float], str]]:
     """(fill, kind) of the shared arena as PP0 sees it, or None when there is no arena pool. ``kind`` is
     ``exact`` (the pinned census) or ``bound`` (the O(1) header bound, below the hold threshold)."""
@@ -707,6 +757,7 @@ class GreenActuator:
     def __init__(self, ladder: GreenLadder, reader: _ds.CtlReader, *, pp_rank: int, pp_size: int,
                  hold: Optional[HoldGate] = None, pobs: Optional[PObsWriter] = None,
                  arena_reader: Callable[[Any], Optional[Tuple[Optional[float], str]]] = default_arena_reader,
+                 vram_fn: Callable[[], Optional[Dict[str, int]]] = vram_snapshot,
                  clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
                  log: Callable[[str], None] = logger.info):
         self.ladder = ladder
@@ -718,6 +769,8 @@ class GreenActuator:
         self.pobs = pobs
         self._arena_reader = arena_reader
         self._clock, self._sleep, self._log = clock, sleep, log
+        self._vram_fn = vram_fn
+        self.vram_by_rung: Dict[int, Dict[str, int]] = {}   # the allocator's reading when the stage went out of use
         # wire state
         self.seq = 0                    # PP0: last stamped; followers: last absorbed
         self.rung = 0                   # wanted stage (set by apply, consumed by pick)
@@ -810,9 +863,13 @@ class GreenActuator:
             self.active_sm = entry.sm if entry is not None else (self.ladder.info.sm_total if self.ladder.info else 0)
             _STATE["eager"] = entry is not None
             self.switches += 1 if self.forwards else 0
+            vr = self._vram_fn() if self.forwards else None
+            if vr is not None:
+                self.vram_by_rung[prev] = vr
             self._log(f"{MARK} P rung {prev}->{eff} f={self.f:.2f} sm_real={self.active_sm} "
                       f"eager={1 if entry is not None else 0} seq={self.seq} pp={self.pp_rank} "
-                      f"served={1 if served else 0} switches={self.switches}")
+                      f"served={1 if served else 0} switches={self.switches}"
+                      + ("" if vr is None else f" reserved_mib={vr['reserved_mib']} alloc_retries={vr['retries']}"))
         else:
             _STATE["eager"] = entry is not None
         self.forwards += 1
@@ -890,7 +947,20 @@ class GreenActuator:
                 f"by_rung={dict(sorted(self.by_rung.items()))} fallback_forwards={self.fallback_forwards} "
                 f"stamps={self.stamps} seq={self.seq} switch_us_avg="
                 f"{(self.switch_us_total / max(1, self.forwards)):.1f} holds_polls={self.holds} "
-                f"hold_slept_s={self.hold_slept_s:.2f}")
+                f"hold_slept_s={self.hold_slept_s:.2f}" + self._vram_text())
+
+    def _vram_text(self) -> str:
+        now = self._vram_fn()
+        rows = ",".join(f"{k}:{v['reserved_mib']}/{v['retries']}" for k, v in sorted(self.vram_by_rung.items()))
+        cur = "" if now is None else f" reserved_mib={now['reserved_mib']} alloc_mib={now['alloc_mib']} alloc_retries={now['retries']}"
+        return f"{cur} vram_by_rung(reserved_mib/retries when the stage ended)=[{rows}]"
+
+
+def _mem(be: GreenBackend) -> Optional[Tuple[int, int]]:
+    try:
+        return be.mem_info()
+    except Exception:  # noqa: BLE001 - an instrument never stops the arming
+        return None
 
 
 class _DeadBackend(GreenBackend):
@@ -920,6 +990,13 @@ def maybe_arm(sched, env: Optional[Mapping[str, str]] = None, *, backend: Option
         return None
     ps = sched.ps
     pp_rank, pp_size = int(ps.pp_rank), int(ps.pp_size)
+    tp_size = int(getattr(ps, "tp_size", 1) or 1)
+    if tp_size > 1:
+        # P is tp_size 1 per stage by construction; with TP the stage's collectives run next to the narrow stream
+        # and the wire/stage reasoning is unmeasured: named, on every P rank alike (so the wire stays symmetric: none)
+        warn(_ds.fallback_line("green", "all", f"tp_size={tp_size} > 1 on this P stage (the ladder is built for "
+                               "tp_size 1) -> duty/chunk, no ladder"))
+        return None
     try:
         cfg = _ds.config_from_env(e)
     except Exception as ex:  # noqa: BLE001 - a bad profile knob must not take the P rank down at init
@@ -930,10 +1007,16 @@ def maybe_arm(sched, env: Optional[Mapping[str, str]] = None, *, backend: Option
     except Exception as ex:  # noqa: BLE001 - never a crash: the base actuators stay
         be = _DeadBackend(f"{type(ex).__name__}: {ex}")
     probe = str(e.get(PROBE_ENV, "1")).strip() != "0"
+    m0 = _mem(be)
     ladder = GreenLadder(be, cfg.rungs, probe=probe,
                          min_slowdown_frac=_envf(e, PROBE_MIN_SLOWDOWN_FRAC_ENV, 0.3, 0.0, 1.0),
                          log=log, warn=warn, rank=pp_rank).build()
+    m1 = _mem(be)
     log(ladder.marker())
+    log(f"{MARK} P vram pp={pp_rank} " + (
+        f"card_free_mib before={m0[0] >> 20} after={m1[0] >> 20} ladder_cost_mib={(m0[0] - m1[0]) >> 20} "
+        f"total_mib={m0[1] >> 20} (contexts + streams + probe cache; one reading, no stream pools yet)"
+        if m0 and m1 else "card_free_mib unreadable (backend gives no mem_info)"))
     if ladder.healthy_count == 0:
         warn(_ds.fallback_line("green", ladder.info.uuid if ladder.info else "all",
                                "no rung served -> the duty/chunk actuators take over (rung 0 = primary stream)"))
@@ -978,14 +1061,21 @@ class GreenConfig:
     factors: Tuple[float, ...] = DEFAULT_FACTORS
     tsolo_ms: Tuple[Tuple[int, float], ...] = DEFAULT_TSOLO_MS
     accept_len: float = DEFAULT_ACCEPT_LEN
-    desc_min_s: float = 0.5           # descend (more D) at once, at most this often. Spec 0.25 s, 0.5 here ON PURPOSE: the
-                                      # front's D-rate window is 0.5 s, a shorter dwell would re-read the old stage's rounds
+    desc_min_s: float = 1.0           # descend (more D) at once, at most this often. Spec 0.25 s, 1.0 here ON PURPOSE: the
+                                      # front's D-rate window is 1.0 s (review 11:03Z: 0.5 s read noise as overshoot), a
+                                      # shorter dwell would re-read the old stage's rounds
     desc_fast_ratio: float = 2.0      # round > this x target: two stages at once
     asc_ratio: float = 0.7            # ascend only when round <= this x target ...
     asc_calm_s: float = 1.5           # ... for this long ...
     asc_dwell_s: float = 2.0          # ... and this long since the last change
     table: Tuple[Tuple[int, int, int], ...] = ((2, 1, 0), (4, 2, 1), (10 ** 9, 3, 2))   # (bs <=, tau low, tau high)
     tick_s: float = 0.05
+    #: FALLBACK LATCH (B2): a descent within ``latch_window_s`` of an ascent says the ascent was wrong; that ascent
+    #: (to that stage) is barred for ``latch_base_s``, doubling at every repeat (cap ``latch_max_s``)
+    latch_window_s: float = 10.0
+    latch_base_s: float = 30.0
+    latch_max_s: float = 480.0
+    d_window_s: float = 1.0           # the front's D-rate window (FrontShare builds its DRateMeter with it)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "GreenConfig":
@@ -999,7 +1089,9 @@ class GreenConfig:
             kw["tsolo_ms"] = parse_tsolo(g("TSOLO_MS"))
         for name, key in (("ACCEPT_LEN", "accept_len"), ("DESC_MIN_S", "desc_min_s"),
                           ("DESC_FAST_RATIO", "desc_fast_ratio"), ("ASC_RATIO", "asc_ratio"),
-                          ("ASC_CALM_S", "asc_calm_s"), ("ASC_DWELL_S", "asc_dwell_s")):
+                          ("ASC_CALM_S", "asc_calm_s"), ("ASC_DWELL_S", "asc_dwell_s"),
+                          ("LATCH_WINDOW_S", "latch_window_s"), ("LATCH_BASE_S", "latch_base_s"),
+                          ("LATCH_MAX_S", "latch_max_s"), ("D_WINDOW_S", "d_window_s")):
             if g(name):
                 kw[key] = float(g(name))
         if g("TABLE"):          # "2:1:0;4:2:1;99:3:2" = bs<=, tau-low stage, tau-high stage
@@ -1090,6 +1182,10 @@ class GreenController(_ds.ShareController):
         self.adj = 0
         self._was_busy = False
         self._calm_since: Optional[float] = None
+        self._last_asc: Optional[Tuple[float, int]] = None      # (when, the stage ascended TO)
+        self._asc_lock: Dict[int, float] = {}                   # stage -> no ascent to it before this time
+        self._lock_n: Dict[int, int] = {}                       # stage -> latches so far (the doubling)
+        self.latches = 0
         self._pobs: Dict[int, Dict[str, str]] = {}
         self._last_start = 0
 
@@ -1182,6 +1278,16 @@ class GreenController(_ds.ShareController):
                         self._calm_since = None
                         if since >= g.desc_min_s and self.rung < top:
                             step = 2 if ratio > g.desc_fast_ratio else 1
+                            if (self._last_asc is not None and now - self._last_asc[0] <= g.latch_window_s
+                                    and self.rung == self._last_asc[1]):
+                                to = self._last_asc[1]                  # the ascent was wrong: bar it, doubling
+                                n = self._lock_n.get(to, 0)
+                                lock_s = min(g.latch_max_s, g.latch_base_s * (2 ** n))
+                                self._lock_n[to] = n + 1
+                                self._asc_lock[to] = now + lock_s
+                                self.latches += 1
+                                reason += f"+asc_latched({to},{lock_s:.0f}s)"
+                            self._last_asc = None
                             target = min(top, self.rung + step)
                             self.adj = target - start
                             immediate = True
@@ -1195,10 +1301,13 @@ class GreenController(_ds.ShareController):
                             model_cur = g.factors[self.rung]
                             meas = d_round / max(1.0, ts_ms)
                             scale = min(4.0, max(0.25, meas / model_cur))
-                            if g.factors[nxt] * scale * ts_ms <= target_ms:
+                            if now < self._asc_lock.get(nxt, 0.0):
+                                reason += f"+asc_locked({nxt},{self._asc_lock[nxt] - now:.0f}s)"
+                            elif g.factors[nxt] * scale * ts_ms <= target_ms:
                                 target = nxt
                                 self.adj = target - start
                                 self._calm_since = now
+                                self._last_asc = (now, nxt)
                                 immediate = True
                                 reason += f"+d_round_calm(x{ratio:.2f},preview_ok)"
                             else:
