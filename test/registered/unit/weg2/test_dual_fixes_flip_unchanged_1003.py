@@ -27,6 +27,8 @@ the pre-fix behaviour: no state written, no collective, no ledger touched, no re
          (weg2.dual_grant_wait; the behavioural half is test_weg2_q697b_dual_grant_wait_1004)
   Q-696  D live cache yield + regrow hold (D tick without the dual actor) / front INTAKE-STALL
          card WAIT (drain ends as before) and STALL-BYPASS / wedge class P-KV-WAIT (no post skip)
+  Y9D4   told-anchor hold (weg2/dual_told_anchor_hold.py): attach() is a no-op, the tree never
+         sees a hold; the full behavioural set is test_weg2_dual_told_anchor_hold_y9d4_1004
   Q-800  DUAL-SHARE: PP0 chunk cap, share duty, D capture priority, MPS client priority,
          front controller/admin route/leg hooks (weg2/dual_share.py)
 """
@@ -1001,3 +1003,19 @@ class TestQ1500UdHostChildrenFlipUnchanged:
         assert src.index("unbacked_drop_allowed(self, node)") < src.index("unbacked_drop_subtree(self, node)")
         v = inspect.getsource(SF.unbacked_drop_subtree)
         assert v.index("if not ud_host_children_enabled(tree=tree):") < v.index('getattr(node, "children"')
+
+
+class TestToldAnchorHoldFlipUnchanged:
+    """y9d4: without the dual layout (flip / NF / INT8) the hold is never attached, the tree reads
+    no hold, and the extent stamp's report is a free no-op."""
+
+    def test_attach_is_a_noop_and_nothing_is_held(self):
+        from sglang.srt.weg2 import dual_told_anchor_hold as TAH
+
+        tree = SimpleNamespace()
+        told = {"weg2-0-77": 22528}
+        assert TAH.armed() is False and TAH.dual_p() is False
+        assert TAH.attach(tree, told) is None
+        assert not hasattr(tree, "_weg2_told_hold")
+        TAH.report_extent(SimpleNamespace(rid="weg2-0-77"), 1)   # no hold: free, silent
+

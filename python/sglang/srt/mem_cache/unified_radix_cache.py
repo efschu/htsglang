@@ -209,6 +209,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.weg2 import mamba_arena_displace as _mad
 from sglang.srt.weg2 import dual_anchor_release as _dar  # Q-610
+from sglang.srt.weg2 import dual_told_anchor_hold as _tah  # told-anchor hold (y9d4)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -5352,13 +5353,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         path, depth = _mad.ancestor_path(target=node, root=self.root_node)
         owned = _mad.owned_anchors(path=path, rid=rid, anchor_of=lambda n: self._weg2_anchor_of(n, mp))
         if len(owned) >= cap:
-            victim = _mad.pick_own_victim(owned)
+            victim = _mad.pick_own_victim(self._weg2_told_unheld(owned))
             if victim is not None:
                 self._weg2_release_anchor(victim, mp, st, why="share", for_rid=rid)
                 owned = [a for a in owned if a is not victim]
         mrows = mp.alloc_write([last_hash])
         if mrows is None and not node.weg2_arena_displaced:
-            victim = self._weg2_full_victim(node, rid, owned, mp)
+            victim = self._weg2_full_victim(node, rid, self._weg2_told_unheld(owned), mp)
             if victim is not None:
                 node.weg2_arena_displaced = True
                 self._weg2_release_anchor(victim, mp, st, why="full", for_rid=rid)
@@ -5383,10 +5384,56 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             reg = self._weg2_dual_end_reg = _dar.Registry()
         reg.note(rid, node)
 
+    # -- told-anchor hold (y9d4, weg2/dual_told_anchor_hold.py) ----------------
+
+    def _weg2_told_hold_depths(self, tick: bool = False) -> dict:
+        """{END depth: [rids]} of the anchors a told between told and admission
+        keeps ({} = no hold: not dual P, switch off, nothing standing)."""
+        h = getattr(self, "_weg2_told_hold", None)
+        if h is None:
+            return {}
+        try:
+            return h.depths(tick=tick)
+        except Exception as exc:  # noqa: BLE001 -- an instrument/hold never takes the cache down
+            logger.warning("%s raised %s: %s (no hold this time)", _tah.MARKER, type(exc).__name__, exc)
+            return {}
+
+    def _weg2_node_end_depth(self, n) -> int:
+        d = 0
+        while n is not None and n is not self.root_node:
+            d += len(n.key)
+            n = n.parent
+        return d
+
+    def _weg2_told_held(self, n) -> bool:
+        """`n` is the anchor a standing told names (END depth == told)."""
+        depths = self._weg2_told_hold_depths()
+        return bool(depths) and self._weg2_node_end_depth(n) in depths
+
+    def _weg2_told_unheld(self, owned: list) -> list:
+        """H19 victims without the anchors a standing told names."""
+        depths = self._weg2_told_hold_depths()
+        if not depths:
+            return owned
+        return [a for a in owned if getattr(a, "depth", None) not in depths]
+
+    def _weg2_told_note_take(self, kind: str, n, depth=None) -> None:
+        """F3: remember which path gave an anchor up (EXTENT-REGRESSED cause)."""
+        h = getattr(self, "_weg2_told_hold", None)
+        if h is None or n is None:
+            return
+        try:
+            h.note_take(kind, n, self._weg2_node_end_depth(n) if depth is None else depth,
+                        bool(getattr(n, "_weg2_end_anchor", False)))
+        except Exception:  # noqa: BLE001 -- an instrument
+            pass
+
     def _weg2_dual_releasable(self, n, mp, claimer=None) -> bool:
         """A SETTLED arena anchor on `n` this rank may give back now: acked
         (no pending claim), no write in flight, no host lock, not a direct
-        write's rows, and no running request on the node (device lock 0)."""
+        write's rows, and no running request on the node (device lock 0).
+        The anchor a standing told names is never given back (told-anchor
+        hold)."""
         if n is None or n is self.root_node or n is claimer:
             return False
         cd = n.component_data[ComponentType.MAMBA]
@@ -5399,13 +5446,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if any(int(getattr(c, "lock_ref", 0) or 0) > 0 for c in n.component_data):
             return False
-        return mp.settled_anchor_slots(hv) is not None
+        if mp.settled_anchor_slots(hv) is None:
+            return False
+        if self._weg2_told_held(n):
+            return False
+        return True
 
     def _weg2_dual_release_ref(self, n) -> None:
         """Tombstone `n`'s mamba host value and give its arena reference back
         (the mamba HOST eviction funnel, as `_weg2_release_anchor` -- but no
         slot is dropped here: the page stays COMPLETE until a claim needs it)."""
         comp = self.components[ComponentType.MAMBA]
+        self._weg2_told_note_take("Q-610", n)
         self._evict_component_and_detach_lru(n, comp, target=EvictLayer.HOST, tracker=None)
         self._update_evictable_leaf_sets(n)
         if _r12.role() == "host":
@@ -6059,6 +6111,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             why = "end_anchor"
         elif getattr(a, "_weg2_fork", False):
             why = "fork"
+        elif self._weg2_told_held(a):
+            why = "told_hold"
         elif cd.host_lock_ref > 0:
             why = "host_locked"
         elif getattr(a, "write_through_pending_id", None) is not None:
@@ -6066,6 +6120,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         elif not (cd.host_value.numel() and mp.is_arena_id(int(cd.host_value.min()))):
             why = "not_arena"
         if why is None:
+            self._weg2_told_note_take("INNER", a)
             try:
                 mc.evict_component(a, target=EvictLayer.HOST)
             except Exception as exc:  # noqa: BLE001 -- a release never breaks an ack
@@ -6143,6 +6198,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if mc is None:
             return 0
         self._weg2_cap_drain()
+        # told-anchor hold (y9d4): one cap run = one tick of the hold's uniform
+        # clock; `held` = the END depths a standing told names (empty unless
+        # dual P with the switch on), `diag` the same set for the instruments.
+        held = self._weg2_told_hold_depths(tick=True)
+        _hold = getattr(self, "_weg2_told_hold", None)
         holders = []
         node = tail
         while node is not None and node is not self.root_node:
@@ -6152,11 +6212,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         excess = len(holders) - cap
         if excess <= 0:
             return 0
+        diag = held or (_hold.told_depths() if _hold is not None else {})
+        hdepth = {}
+        if diag:
+            _path, _tail_depth = _mad.ancestor_path(target=tail, root=self.root_node)
+            hdepth = {id(n_): d_ for n_, d_ in _path}
+            hdepth[id(tail)] = _tail_depth
         taken = []
-        kept_fork = kept_end = 0
+        kept_fork = kept_end = kept_hold = 0
         for node in reversed(holders):  # shallowest first
             if excess <= 0 or node is tail:
                 break
+            if held and hdepth.get(id(node)) in held:
+                kept_hold += 1   # the anchor a standing told names: no resume point is taken from it
+                continue
             if getattr(node, "_weg2_fork", False):
                 kept_fork += 1
                 continue
@@ -6166,6 +6235,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node._weg2_anchored = False
             node._weg2_capped = True
             taken.append(node)
+            if _hold is not None:
+                self._weg2_told_note_take("PATH-CAP", node, hdepth.get(id(node)))
             excess -= 1
         deferred = getattr(self, "_weg2_cap_deferred", None)
         if deferred is None:
@@ -6180,14 +6251,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         n = getattr(cls, "_weg2_cap_n", 0) + 1
         cls._weg2_cap_n = n
         cls._weg2_capped_total = getattr(cls, "_weg2_capped_total", 0) + len(taken)
-        if n <= 16 or n % 256 == 0:
+        # F3: a run that touches an anchor at a standing told's depth is always
+        # spoken (the n <= 16 sampling hid y9d4's cause), with node and depth.
+        _told_hit = [(getattr(x, "id", "?"), hdepth.get(id(x))) for x in taken
+                     if hdepth.get(id(x)) in diag]
+        if n <= 16 or n % 256 == 0 or kept_hold or _told_hit:
             logger.info(
                 "WEG2 PATH-CAP n=%d tail=%s holders=%d cap=%d taken=%d released_now=%d "
-                "waiting=%d kept_fork=%d kept_end=%d taken_total=%d (group P: the "
+                "waiting=%d kept_fork=%d kept_end=%d kept_told_hold=%d taken_total=%d (group P: the "
                 "shallowest anchors beyond the cap are no resume points any more; their "
-                "copies go back when free, the KV stays)",
+                "copies go back when free, the KV stays)%s",
                 n, getattr(tail, "id", "?"), len(holders), cap, len(taken), released,
-                len(deferred), kept_fork, kept_end, cls._weg2_capped_total,
+                len(deferred), kept_fork, kept_end, kept_hold, cls._weg2_capped_total,
+                (" TOLD-ANCHOR TAKEN (hold %s): nodes/depths=%s standing told=%s"
+                 % ("on" if held else "OFF", _told_hit, sorted(diag))) if _told_hit else "",
             )
         return len(taken)
 

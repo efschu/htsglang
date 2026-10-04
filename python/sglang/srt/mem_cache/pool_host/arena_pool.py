@@ -2292,15 +2292,24 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             getattr(ArenaMHAHostPool, "_257_dropped_without_l3", 0) + l3_state[2])
         ArenaMHAHostPool._257_written_to_l3 = (
             getattr(ArenaMHAHostPool, "_257_written_to_l3", 0) + l3_state[1])
+        # y9d4 F3: the fill of the arena this drop ran in (pinned = referenced slots / slots)
+        # (a strided header read: only the small anchor arenas, 112 slots on 27B; the 720k-slot
+        # KV arena prints "-" -- its census is ARENA-REF-HOLDERS' job, never a per-drop read)
+        try:
+            _fill = ("%d/%d" % (int(arena.ref_census()[0]), int(arena.slots))
+                     if int(arena.slots) <= 4096 else "-")
+        except Exception:  # noqa: BLE001 -- an instrument
+            _fill = "?"
         if _prefix_trace.on():
             # Prefix trace (IN 26.09.): uncapped, and joinable -- `dropped` are
             # the evicted slots' key128 low words (hex; key128 = blake2b-16 of
             # the store stem, hicache_arena.key128), `claim` the first stem of
             # the claim that needed the room. The keys are already in hand.
-            logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d stages=i:%d,ii:%d,iii:%d slot_bytes=%d trace=1 "
+            logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d stages=i:%d,ii:%d,iii:%d slot_bytes=%d "
+                        "arena_pinned=%s trace=1 "
                         "claim=%s dropped=%s (claim-time room without disk I/O -- H81)",
                         k, need, len(cands), stages[0], stages[1], stages[2],
-                        int(getattr(arena, "slot_bytes", 0) or 0),
+                        int(getattr(arena, "slot_bytes", 0) or 0), _fill,
                         (str(claim_stem)[:80] if claim_stem else "-"),
                         ",".join("%016x" % (int(c[1]) & 0xFFFFFFFFFFFFFFFF) for c in cands))
         else:
@@ -2308,11 +2317,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             # 8 -> 58 on PP0 of the vision boot 0928 with not one line, and
             # those were the pages a probe had just reported.
             logger.info("#1427 ARENA-DROP n=%d need=%d freed=%d stages=i:%d,ii:%d,iii:%d slot_bytes=%d "
+                        "arena_pinned=%s "
                         "l3=on_disk:%d,written:%d dropped_without_l3=%d (total written=%d "
                         "dropped_without_l3=%d; #257: a page without an L3 copy is written "
                         "before its slot is freed, target dropped_without_l3=0)",
                         k, need, len(cands), stages[0], stages[1], stages[2],
-                        int(getattr(arena, "slot_bytes", 0) or 0),
+                        int(getattr(arena, "slot_bytes", 0) or 0), _fill,
                         l3_state[0], l3_state[1], l3_state[2],
                         ArenaMHAHostPool._257_written_to_l3,
                         ArenaMHAHostPool._257_dropped_without_l3)

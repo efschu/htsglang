@@ -71,6 +71,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from sglang.srt.managers import weg2_told_fallback as _fb
 from sglang.srt.managers import weg2_told_fidelity as _tf  # TF told fidelity
+from sglang.srt.weg2 import dual_told_anchor_hold as _tah  # y9d4 told-anchor hold
 from sglang.srt.weg2 import p_twin_defer as _twin
 from sglang.srt.weg2 import prefix_trace as _pt
 
@@ -183,6 +184,8 @@ def armed(scheduler) -> bool:
     if value:
         scheduler._weg2_store_told = {}
         scheduler._weg2_store_held = {}
+        # y9d4: the tree reads this table as the anchors a told holds (dual P only)
+        _tah.attach(getattr(scheduler, "tree_cache", None), scheduler._weg2_store_told)
         #: P-FORK-CUT: rid -> the told fork (PP0: published, follower: absorbed);
         #: `admission` hands it to the request.
         scheduler._weg2_store_fork = {}
@@ -546,6 +549,9 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     held: Dict[str, Any] = scheduler._weg2_store_held
     rid = _rid(req)
     forget_rid_leftovers(scheduler.tree_cache, rid)
+    if getattr(scheduler.tree_cache, "_weg2_told_hold", None) is None:
+        # armed() ran before the tree existed: attach at the first intake (dual P only)
+        _tah.attach(scheduler.tree_cache, scheduler._weg2_store_told)
     if int(scheduler.ps.pp_rank) == 0:
         # Q-580: a told standing at PP0's intake is an earlier instance's.
         _drop_stale_pp0_told(scheduler, req, rid)

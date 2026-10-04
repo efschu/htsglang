@@ -49,6 +49,11 @@ _walk_seen: Dict[Tuple[str, int], None] = {}
 _once_seen: Dict[tuple, None] = {}
 
 
+def _dual_p_default() -> bool:
+    return ((os.environ.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip() == "1"
+            and (os.environ.get("SGLANG_WEG2_GROUP", "") or "").strip().upper() == "P")
+
+
 def _read() -> Tuple[bool, int]:
     try:
         from sglang.srt.environ import envs
@@ -61,6 +66,12 @@ def _read() -> Tuple[bool, int]:
             mn = int(os.environ.get(ENV_MIN_TOKENS, DEFAULT_MIN_TOKENS))
         except ValueError:
             mn = DEFAULT_MIN_TOKENS
+    if ENV not in os.environ and _dual_p_default():
+        # y9d4 (PREFIX-TRACE armed=0 left the cause of the #968 shortfall a
+        # suspicion): unset = ON in group P of the dual layout, where it costs
+        # log lines on P's prefix paths only (never the decode path). An
+        # explicit SGLANG_WEG2_PREFIX_TRACE=0 still turns it off.
+        on = True
     return on, max(0, mn)
 
 

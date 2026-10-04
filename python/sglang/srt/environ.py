@@ -654,6 +654,11 @@ class Envs:
     # The pages stay COMPLETE in the arena until a claim needs their slot.
     # Inert outside SGLANG_WEG2_DUAL_LAYOUT=1 + SGLANG_WEG2_GROUP=P.
     SGLANG_WEG2_ENABLE_DUAL_ANCHOR_RELEASE = EnvBool(True)
+    # told-anchor hold (y9d4, weg2/dual_told_anchor_hold.py): dual group P keeps the anchor a
+    # standing told names from told to admission (cap / Q-610 / inner release skip it). 0 = off.
+    SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD = EnvBool(True)
+    SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD_MAX = EnvInt(8)
+    SGLANG_WEG2_DUAL_TOLD_ANCHOR_HOLD_RUNS = EnvInt(256)
     # Q-670 DUAL-PARALLEL (weg2.dual_parallel; dual layout only): a request
     # counts as short at or below DUAL_SHORT_BYPASS_TOKENS uncached tokens and
     # may pass a paused or long head; a head is overtaken for at most

@@ -1624,6 +1624,11 @@ def stamp_state_aligned_extent(req) -> Optional[int]:
         _1042_note("set", req, extent)
     except Exception:  # noqa: BLE001 - never break a match walk
         pass
+    # y9d4 F3: a stamp that falls below the told still standing (dual P only; no
+    # hold object = free no-op) is named with the path that gave the anchor up.
+    from sglang.srt.weg2 import dual_told_anchor_hold as _tah
+
+    _tah.report_extent(req, extent)
     return extent
 
 
