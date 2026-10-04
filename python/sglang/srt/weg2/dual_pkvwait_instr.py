@@ -255,6 +255,9 @@ def live_floor_census(sched: Any, allocator: Any, need_tokens: int, page: int = 
         out["release_n"] = int(rp.numel()) if rp is not None and hasattr(rp, "numel") else 0
         out["low_first"] = int(getattr(allocator, "_weg2_low_first_every", 0) or 0)
         out["lf_sorts"] = int(getattr(allocator, "_weg2_low_first_sorts", 0) or 0)
+        out["lf_calls"] = int(getattr(allocator, "_weg2_low_first_calls", 0) or 0)
+        out["lf_yield"] = int(getattr(allocator, "_weg2_low_first_yield", 0) or 0)
+        out["placement"] = int(getattr(allocator, "_owner_placement", None) is not None)
     except Exception as exc:  # noqa: BLE001
         out["free_total"] = "err:" + type(exc).__name__
     return out
