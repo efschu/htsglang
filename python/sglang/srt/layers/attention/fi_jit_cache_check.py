@@ -88,16 +88,44 @@ def mirror_server_arch() -> str:
 def substitute_gencode(build_ninja: str, want: Sequence[str]) -> str:
     """The on-disk build.ninja with its -gencode flags replaced by ``want``
     (the only arch-dependent content: a desk diff of a regenerated file against
-    an untouched one differs in exactly that line)."""
+    an untouched one differs in exactly that line).
+
+    flashinfer 0.7.0 writes the flags in TWO places (``cuda_cflags``, a list that
+    may span continuation lines, and ``cuda_arch_flags = ...``); each place holds
+    the FULL arch list. Every contiguous block of -gencode flags (consecutive
+    lines, or one line) is therefore replaced by ``want`` once. The first
+    version replaced only the first flag of the FILE and deleted every later one,
+    which emptied ``cuda_arch_flags`` and made ninja see a changed command line
+    on all steps (b9j/b9l 22:49Z: 'WOULD COMPILE [11/11]' although the cached
+    module was current). Identical flags -> text returned unchanged."""
     found = _GENCODE_RE.findall(build_ninja)
-    if not found:
+    if not found or sorted(set(found)) == sorted(set(want)):
         return build_ninja
-    out = build_ninja
-    first = True
-    for flag in found:
-        out = out.replace(flag, " ".join(want) if first else "", 1)
-        first = False
-    return out
+    joined = " ".join(want)
+    out_lines: List[str] = []
+    prev_had = False
+    for line in build_ninja.split("\n"):
+        if not _GENCODE_RE.search(line):
+            out_lines.append(line)
+            prev_had = False
+            continue
+        first = not prev_had
+        seen = [False]
+
+        def _sub(m, first=first, seen=seen):
+            if first and not seen[0]:
+                seen[0] = True
+                return joined
+            return ""
+
+        repl = _GENCODE_RE.sub(_sub, line)
+        prev_had = True
+        if repl.strip() in ("", "$"):
+            continue  # a continuation line that held only the extra flags
+        if not repl.rstrip().endswith("$"):
+            repl = repl.rstrip()
+        out_lines.append(repl)
+    return "\n".join(out_lines)
 
 
 def ninja_would_build(module_dir: str, build_ninja_text: str, ninja: str) -> Tuple[bool, str]:
