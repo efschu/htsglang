@@ -289,6 +289,36 @@ def want_local_tokens(demand: int, locked: int, air: int, step: int) -> int:
     return want_tokens(max(int(demand), int(locked)), 0, air, step)
 
 
+WANT_LOCKED_ENV = "SGLANG_WEG2_DUAL_D_WANT_LOCKED"
+#: #2004: the instrument line (one per 5 s, and at once on every grow / shrink tick)
+D_WANT_MARK = "d_want"
+
+
+def want_locked_armed(env=None) -> bool:
+    """#2004 D-WANT-LOCKED: group D of the dual layout (``armed``) AND the switch (default off)."""
+    env = os.environ if env is None else env
+    if not armed(env):
+        return False
+    return str(env.get(WANT_LOCKED_ENV, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def want_locked_local_tokens(demand: int, locked: int, incoming: int, air: int, step: int) -> int:
+    """#2004 D-WANT-LOCKED (pure): the level this rank needs from the rows D HOLDS.
+
+    ``locked`` = mapped - free - evictable: every row a running seat (or a hold) occupies, a prefix the
+    seats share counted once. ``incoming`` = what the queue and the chunked request still have to
+    allocate (``d_incoming_tokens``). Their sum plus the decode/verify air (the room the next round
+    needs, unchanged) replaces ``max(demand, locked)`` -- ``demand`` adds the FULL token count of every
+    request, so six seats on one 36864-token prefix were counted six times (pt4 fs10051332: need ==
+    mapped 308634 over ~149246 occupied rows).
+
+    Capped by the old rule: this never asks for MORE than ``want_local_tokens`` did, so the pressure on
+    P cannot grow with the switch; and never for less than ``locked + incoming + air`` -- the floors of
+    the tick (``floor_want``, the live row of every rank) and the immediate grow sit behind it."""
+    old = want_local_tokens(demand, locked, air, step)
+    return min(old, want_tokens(max(0, int(locked)), max(0, int(incoming)), air, step))
+
+
 def decide(mapped: int, want: int, p_waiting: bool, below_rounds: int, step: int,
            hold: int = SHRINK_HOLD_ROUNDS, *, avail_min: Optional[int] = None, air: int = 0,
            holds: bool = False) -> Tuple[str, int]:
@@ -449,6 +479,95 @@ def d_demand(sched) -> int:
         running.append(chunked)
     queue = list(getattr(sched, "waiting_queue", None) or ())
     return sum(_sv._req_tokens(r) for r in running) + sum(_sv._req_tokens(r) for r in queue)
+
+
+def _n_prefix(req) -> int:
+    pi = getattr(req, "prefix_indices", None)
+    if pi is None:
+        return 0
+    try:
+        return len(pi)
+    except TypeError:
+        return 0
+
+
+def d_incoming_tokens(sched) -> int:
+    """#2004: the rows the queue and the chunked request have yet to ALLOCATE. Every waiting request
+    counts its full token count (its matched prefix leaves the evictable cache for the locked rows when
+    it is admitted -- over-counted on purpose, never under); the chunked request holds its computed
+    prefix (``prefix_indices``) in the locked rows already, so only the rest counts."""
+    from sglang.srt.weg2 import d_seat_vram as _sv
+
+    n = sum(_sv._req_tokens(r) for r in list(getattr(sched, "waiting_queue", None) or ()))
+    chunked = getattr(sched, "chunked_req", None)
+    if chunked is not None:
+        n += max(0, _sv._req_tokens(chunked) - _n_prefix(chunked))
+    return int(n)
+
+
+def d_locked_reading(sched, actor) -> Optional[int]:
+    """#2004: ``d_locked_rows`` with its "no reading" kept apart from a real 0 (None = the allocator has no
+    ``available_size``; a tree without the counter reads evictable 0, the stricter reading, as there)."""
+    try:
+        int(actor.allocator.available_size())
+    except Exception:  # noqa: BLE001 -- no reading: the caller keeps the old rule
+        return None
+    return d_locked_rows(sched, actor)
+
+
+def _want_locked_step(sched, actor, demand_local: int, want_old_local: int, air: int):
+    """#2004: (this rank's want, instrument info). Switch off (or no reading): ``want_old_local``
+    untouched. Never raises: an instrument or a reading that fails leaves the old want."""
+    info = {"demand": int(demand_local), "air": int(air), "mode": "off"}
+    armed_ = False
+    try:
+        armed_ = want_locked_armed()
+        locked = d_locked_reading(sched, actor)
+        if locked is None:
+            info["mode"] = "noreading" if armed_ else "off"
+            return want_old_local, info
+        incoming = d_incoming_tokens(sched)
+        want_new = want_locked_local_tokens(demand_local, locked, incoming, air, actor.step)
+        info.update(locked=int(locked), incoming=int(incoming), want_old=int(want_old_local),
+                    want_new=int(want_new), shared=int(demand_local) - int(locked))
+    except Exception:  # noqa: BLE001 -- the old want stays
+        logger.debug("%s D-WANT-LOCKED reading failed", MARK, exc_info=True)
+        return want_old_local, info
+    if armed_:
+        info["mode"] = "locked"
+        return want_new, info
+    return want_old_local, info
+
+
+def _instr_d_want(sched, actor, info, *, want: int, floor: int, avail_min: int, verdict: str, level: int,
+                  p_waiting: bool, group_demand: int) -> None:
+    """#2004 PKVWAIT-INSTR marker=d_want (log only, own try, at most one line per 5 s, a grow / shrink tick
+    always): ``demand`` (sum of every request's full tokens, this rank) against ``locked`` (rows really
+    held), ``shared`` = demand - locked (the prefix-sharing thesis: >= 20k says it is the cause),
+    ``want_old`` / ``want_new`` what the two rules ask on this rank, ``want`` the group's level after
+    floor_want and the live floor, ``mapped`` / ``avail_min`` / ``floor`` as in the shrink_blocked lines."""
+    from sglang.srt.weg2 import dual_pkvwait_instr as _pi
+
+    sup = _pi.begin(D_WANT_MARK)
+    if sup is None:
+        if verdict not in ("grow", "shrink") or not _pi.enabled():
+            return
+        sup = 0
+    try:
+        fields = [("mode", info.get("mode", "off")), ("verdict", verdict), ("mapped", int(actor.mapped_tokens)),
+                  ("demand", int(info.get("demand", 0))), ("group_demand", int(group_demand))]
+        for k in ("locked", "incoming", "shared", "want_old", "want_new"):
+            if k in info:
+                fields.append((k, int(info[k])))
+        fields += [("want", int(want)), ("level", int(level)), ("floor", int(floor)),
+                   ("avail_min", -1 if int(avail_min) >= NO_AVAIL else int(avail_min)),
+                   ("air", int(info.get("air", 0))), ("p_waiting", int(bool(p_waiting))),
+                   ("running", len(getattr(getattr(sched, "running_batch", None), "reqs", None) or ())),
+                   ("queue", len(getattr(sched, "waiting_queue", None) or ())),
+                   ("chunked", int(getattr(sched, "chunked_req", None) is not None))]
+        _pi.emit(D_WANT_MARK, fields, sup)
+    except Exception:  # noqa: BLE001 -- an instrument never breaks the tick
+        logger.debug("%s d_want census failed", _pi.MARK, exc_info=True)
 
 
 def _instr_cache_yield(tree, actor, ev_before: int, live) -> None:
@@ -735,6 +854,8 @@ def tick(sched) -> Optional[str]:
     demand_local = d_demand(sched)
     air = int(_sv._air(sched))
     want_local = want_local_tokens(demand_local, d_locked_rows(sched, actor), air, actor.step)
+    # #2004 D-WANT-LOCKED: switch off (default) = want_local stays; the info feeds the d_want line either way
+    want_local, want_info = _want_locked_step(sched, actor, demand_local, want_local, air)
     st = peek(actor.ledger.path)
     p_wait_local = 1 if (st is not None and int(st.demand.get("P", 0)) > 0) else 0
     live_local = int(_pk.max_live_id(actor.allocator, actor.page)) * int(actor.page)
@@ -823,6 +944,8 @@ def tick(sched) -> Optional[str]:
         actor.ledger.clear_pressure()
     _pk.phys_check(actor, "D")
     publish_d_signal(sched, actor)                          # Q-660: id space + arena for the front
+    _instr_d_want(sched, actor, want_info, want=want, floor=floor, avail_min=avail_min, verdict=verdict,
+                  level=level, p_waiting=p_waiting, group_demand=-int(g[3]))
     actor._below = below
     if verdict == "grow":
         actor.group_grow(level)
