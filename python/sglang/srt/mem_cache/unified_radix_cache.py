@@ -5467,6 +5467,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         "on" if h.armed() else "OFF", k)
         except Exception:  # noqa: BLE001 -- an instrument
             pass
+        # #968-RT (default off, pure log): EVERY take, with the recurrent state's
+        # host/device flags (the unbacked-parent hypothesis of the hb death is
+        # readable from this line), the standing told rids at that depth, the
+        # node's parent and span. Read-only; its own try so it can never touch
+        # the take bookkeeping above.
+        try:
+            from sglang.srt.weg2 import rank_trace_968 as _rt968
+
+            if _rt968.armed():
+                _told_rids = h.told_depths().get(d, [])
+                _par = getattr(n, "parent", None)
+                _rt968.emit(
+                    "anchor_hold_take", ",".join(str(x) for x in _told_rids) or "-",
+                    told=d if _told_rids else None, matched_prefix_len=d,
+                    src="radix", decision="TAKE-%s" % kind, node=getattr(n, "id", "?"),
+                    depth=d, end_anchor=int(end), standing_told=int(bool(_told_rids)),
+                    mamba=_rt968.mamba_flags(n), span=len(getattr(n, "key", ()) or ()),
+                    parent=getattr(_par, "id", "-"),
+                    parent_mamba=_rt968.mamba_flags(_par) if _par is not None else "-",
+                )
+        except Exception:  # noqa: BLE001 -- an instrument
+            pass
 
     def _weg2_told_note_kept(self, n) -> None:
         """F3b: the hold refused to give `n` up (Q-610 / inner release): named, rate-limited."""

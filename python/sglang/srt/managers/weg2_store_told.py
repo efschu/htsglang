@@ -74,6 +74,7 @@ from sglang.srt.managers import weg2_told_fidelity as _tf  # TF told fidelity
 from sglang.srt.weg2 import dual_told_anchor_hold as _tah  # y9d4 told-anchor hold
 from sglang.srt.weg2 import p_twin_defer as _twin
 from sglang.srt.weg2 import prefix_trace as _pt
+from sglang.srt.weg2 import rank_trace_968 as _rt968  # #968-RT instrument (default off)
 
 logger = logging.getLogger(__name__)
 
@@ -1904,6 +1905,11 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     if rid in satisfied:
         # registered nothing because it already held the span (see
         # _follower_register): admit at told, no read to wait for.
+        _rt968.emit(
+            "told_admission", rid, told=told, matched_prefix_len=satisfied.get(rid),
+            resident_rows=_rt968.resident_rows_of(req), src="satisfied_locally",
+            decision="admit_at_told", scheduler=scheduler,
+        )
         satisfied.pop(rid, None)
         told_map.pop(rid, None)
         _twin.take_follower_twin(scheduler, rid)
@@ -1930,6 +1936,11 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         own = _twin.registered_head(req) + int(own)
     credit = _pop_credit_keep_pin(tree, rid)
     told_map.pop(rid, None)
+    _rt968.emit(
+        "told_admission", rid, told=told, matched_prefix_len=own,
+        resident_rows=_rt968.resident_rows_of(req), src="store_read",
+        decision="equal" if own == told else "MISMATCH", scheduler=scheduler, own_loaded=credit,
+    )
     if own != told:
         raise Weg2StoreToldMismatch(
             f"#1400 STORE-TOLD MISMATCH rank pp={scheduler.ps.pp_rank} "
