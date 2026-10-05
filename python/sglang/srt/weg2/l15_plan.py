@@ -111,6 +111,33 @@ def noparkinit_apply(sched: Any, env: Mapping[str, str]) -> bool:
     return True
 
 
+#: L15-PARK-AFTER-FLUSH (desk 2023): the D sleep's park runs after the release RPC's flush
+PARK_AFTER_FLUSH_ENV = "SGLANG_WEG2_L15_PARK_AFTER_FLUSH"
+
+
+def park_after_flush_active(env: Mapping[str, str]) -> bool:
+    """L15-PARK-AFTER-FLUSH: True iff the D sleep's L15 park must run AFTER
+    ``_weg2_sleep_flush()`` (and no longer before it).
+
+    The release RPC (weight_updater ``release_memory_occupation``) has two park
+    positions, ``pre`` (the old one, before the flush) and ``post`` (after the flush,
+    before the kv pause); this predicate is the ONE decision both positions read, so
+    exactly one of them runs and never both. True only when ALL hold: L15 master on, the
+    new switch on, group D (P shares the release code), not the dual layout (V1 refuses
+    L15 there, W-L15-DUAL). Every term is process-env, i.e. rank-uniform on D's group:
+    all D ranks pick the same position, which the park's collectives (host gather,
+    all_to_all) require. Anything else = False = the old order, byte for byte.
+    """
+    group = str(env.get("SGLANG_WEG2_GROUP", "") or "").strip().upper()
+    dual = str(env.get("SGLANG_WEG2_DUAL_LAYOUT", "") or "").strip()
+    return bool(
+        master_on(env)
+        and _switch(env, PARK_AFTER_FLUSH_ENV)
+        and group == "D"
+        and dual != "1"
+    )
+
+
 def parse_l15_mib(value: Optional[str]) -> Tuple[str, Dict[int, int]]:
     """``SGLANG_WEG2_L15_MIB`` -> ``("auto", {})`` or ``("override", {card: mib})``.
 

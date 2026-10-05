@@ -39,6 +39,8 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 TREE_CAND_ENV = "SGLANG_WEG2_L15_TREE_CAND"
 TREE_CAND_N_ENV = "SGLANG_WEG2_L15_TREE_CAND_N"
+#: L15-TREE-CAND-DIAG (desk 2023): log-only loss census of a walk that ends empty
+TREE_CAND_DIAG_ENV = "SGLANG_WEG2_L15_TREE_CAND_DIAG"
 DEFAULT_MAX_N = 8
 RID_PREFIX = "tree:"
 # L15-EXTRAKEY (240): a tip whose key carries an extra_key (cache salt,
@@ -214,6 +216,97 @@ def l2_backed(node, root) -> bool:
                 return False
         cur = getattr(cur, "parent", None)
     return True
+
+
+def diag_on(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Default OFF; ``1``/``true``/``on`` enables the loss census line."""
+    import os
+
+    env = os.environ if env is None else env
+    return str(env.get(TREE_CAND_DIAG_ENV, "") or "").strip().lower() in (
+        "1", "true", "on")
+
+
+def loss_census(tree_cache, require_l2: bool = False) -> Dict[str, int]:
+    """L15-TREE-CAND-DIAG: where the device tips of this rank's tree are lost on
+    the way to the TREE-CAND vote. Read-only, no collective, never a decision.
+
+    Each tip (``tips_of``: device value + device mamba value, nothing such below)
+    lands in exactly ONE of three buckets, tested in the order of :func:`l2_backed`:
+
+    * ``no_mamba_host``: the tip has no mamba host row;
+    * ``no_kv_host``: a chain node has no KV host value AND no recorded L2
+      shadow (``_weg2_l2_shadow``) -- ``kv_pending`` of these have a host
+      write-through still in flight (any missing chain node with ``host_ref_counter > 0``
+      or its id in the cache's ``ongoing_write_through``), i.e. are not
+      published YET;
+    * ``l2_ok``: passes :func:`l2_backed` (what the cap-0 rank offers).
+
+    ``chain_error`` is counted ACROSS those buckets (any tip whose node keys do not
+    compose to a token chain, whatever the L2 verdict).
+
+    ``kept`` = tips this rank would vote (``l2_ok`` if ``require_l2`` else all that
+    digest). ``l2_ok`` is counted on EVERY rank, so a capped rank (which does not
+    filter) still shows how many of its tips a cap-0 rank could offer."""
+    full_t, mamba_t = _mamba_type()
+    root = getattr(tree_cache, "root_node", None)
+    tips = tips_of(tree_cache)
+    out = {"tips": len(tips), "no_mamba_host": 0, "no_kv_host": 0, "kv_pending": 0,
+           "chain_error": 0, "l2_ok": 0, "kept": 0}
+    inflight = set()
+    try:  # keyed by node id (ongoing_backup is keyed by operation id: not used)
+        inflight = set((getattr(tree_cache, "ongoing_write_through", None) or {}).keys())
+    except Exception:  # noqa: BLE001 -- a stand-in tree
+        pass
+    dig = _chain_digests(tips, root) if tips else {}
+    for n in tips:
+        try:
+            mh = n.component_data[mamba_t].host_value
+        except (AttributeError, KeyError, IndexError, TypeError):
+            mh = None
+        reason = None
+        if mh is None or len(mh) == 0:
+            reason = "no_mamba_host"
+        else:
+            cur = n
+            pending = False
+            while cur is not None and cur is not root:  # whole chain, no early exit
+                try:
+                    hv = cur.component_data[full_t].host_value
+                except (AttributeError, KeyError, IndexError, TypeError):
+                    hv = None
+                if hv is None or len(hv) == 0:
+                    sh = getattr(cur, "_weg2_l2_shadow", None)
+                    if sh is None or len(sh) != 2 or not len(sh[0]):
+                        reason = "no_kv_host"
+                        if (int(getattr(cur, "host_ref_counter", 0) or 0) > 0
+                                or getattr(cur, "id", None) in inflight):
+                            pending = True
+                cur = getattr(cur, "parent", None)
+            if pending:
+                out["kv_pending"] += 1
+        if reason is not None:
+            out[reason] += 1
+        else:
+            out["l2_ok"] += 1
+        if dig.get(id(n)) is None:
+            out["chain_error"] += 1
+            continue
+        if reason is None or not require_l2:
+            out["kept"] += 1
+    return out
+
+
+def loss_line(rank, census: Mapping[str, int], local: int, agreed: int,
+              require_l2: bool) -> str:
+    """``L15-TREE-CAND-LOSS rank=<r> local=.. agreed=.. require_l2=.. tips=.. ...``"""
+    return ("L15-TREE-CAND-LOSS rank=%s local=%d agreed=%d require_l2=%d tips=%d "
+            "no_mamba_host=%d no_kv_host=%d kv_pending=%d chain_error=%d l2_ok=%d kept=%d"
+            % (rank if rank is not None else "?", local, agreed, int(bool(require_l2)),
+               census.get("tips", 0), census.get("no_mamba_host", 0),
+               census.get("no_kv_host", 0), census.get("kv_pending", 0),
+               census.get("chain_error", 0), census.get("l2_ok", 0),
+               census.get("kept", 0)))
 
 
 class _Chain:
@@ -564,7 +657,8 @@ def agree_holdable(reqs: Sequence[object], probe: Callable[[object], Optional[st
 def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
           env: Optional[Mapping[str, str]] = None, log=None,
           require_l2: bool = False,
-          probe: Optional[Callable[[object], Optional[str]]] = None) -> List[object]:
+          probe: Optional[Callable[[object], Optional[str]]] = None,
+          rank=None) -> List[object]:
     """Local walk + the single collective + pseudo reqs; never raises.
 
     The gather is entered by every rank no matter what its local walk did
@@ -604,6 +698,13 @@ def build(tree_cache, gather: Callable[[object], List[object]], n_live: int,
                "" if err is None else " walk_failed=%s: %s" % (type(err).__name__, err),
                ",".join("%s(%d)" % (rid_of(c), c.n_tokens)
                         for c in agreed[:6])))
+    if log is not None and (not local or not agreed) and diag_on(env):
+        # L15-TREE-CAND-DIAG: log-only, after the vote -- never changes ``agreed``
+        try:
+            log(loss_line(rank, loss_census(tree_cache, require_l2), len(local),
+                          len(agreed), require_l2))
+        except Exception as exc:  # noqa: BLE001 -- a diagnostic, never an escape
+            log("L15-TREE-CAND-LOSS failed: %s: %s" % (type(exc).__name__, exc))
     reqs = [pseudo_req(c, i, len(agreed)) for i, c in enumerate(agreed)]
     if probe is None:
         return reqs

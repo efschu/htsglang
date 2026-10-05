@@ -10092,7 +10092,10 @@ class SchedulerWeightUpdaterManager:
             try:
                 from sglang.srt.weg2 import l15_park as _l15_pk
                 from sglang.srt.weg2 import l15_plan as _l15_pl2
-                if _l15_pl2.master_on(os.environ) and _l15_pk.park_on(os.environ):
+                # L15-PARK-AFTER-FLUSH: with the switch on the park runs at the
+                # `post` position below (after _weg2_sleep_flush); never at both
+                if (_l15_pl2.master_on(os.environ) and _l15_pk.park_on(os.environ)
+                        and not _l15_pl2.park_after_flush_active(os.environ)):
                     _l15_pk.park_at_release(self.scheduler, os.environ, logger.info)
             except Exception as exc:  # noqa: BLE001 -- the wake refills from L2
                 logger.warning("L15-PARK at=sleep failed (%s: %s)",
@@ -10207,6 +10210,24 @@ class SchedulerWeightUpdaterManager:
             # with one beyond its L15 hold (group-reduced, every rank retries).
             self._weg2_sleep_flush()
             _kvsub.mark("flush")
+            # L15-PARK-AFTER-FLUSH (SGLANG_WEG2_L15_PARK_AFTER_FLUSH, default off,
+            # L15 path of group D only): the park of the `pre` position above moved
+            # here. The release flush is where an idle D's retain publishes its
+            # manifest (the front's /flush_cache answered WEG2-FLUSH-NONBLOCK
+            # quiesced); parked before it, every rank voted "no manifest on this
+            # rank". Still before the kv pause (the rows are mapped) and before the
+            # dormant marker; same collectives, same try/except, same wake contract.
+            if weg2_memory_saver_on and self._weg2_group_name() == "D":
+                try:
+                    from sglang.srt.weg2 import l15_park as _l15_pk
+                    from sglang.srt.weg2 import l15_plan as _l15_pl2
+
+                    if _l15_pl2.park_after_flush_active(os.environ) and _l15_pk.park_on(
+                            os.environ):
+                        _l15_pk.park_at_release(self.scheduler, os.environ, logger.info)
+                except Exception as exc:  # noqa: BLE001 -- the wake refills from L2
+                    logger.warning("L15-PARK at=sleep failed (%s: %s)",
+                                   type(exc).__name__, exc)
             # AH (--p-attn-head-split): the helper mirror lives in this region;
             # reset the split rule and drain the helper before it is unmapped,
             # so no request ever continues on a mirror from before the flip.

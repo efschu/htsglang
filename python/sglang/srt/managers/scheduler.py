@@ -20877,6 +20877,9 @@ class Scheduler(
                                     # gather keeps those ALL ranks can hold
                                     probe=lambda _r: l15_bind.tree_probe(
                                         _r, self.tree_cache),
+                                    # L15-TREE-CAND-DIAG (off): names the rank in the line
+                                    rank=int(getattr(getattr(self, "ps", None),
+                                                     "tp_rank", 0) or 0),
                                 )
                         except Exception as _exc:  # noqa: BLE001 -- no tree candidates
                             _l15_tree_reqs = []

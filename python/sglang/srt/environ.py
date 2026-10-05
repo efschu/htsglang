@@ -994,6 +994,20 @@ class Envs:
     # dual path without L15 byte for byte today's. Read by the ranks through
     # l15_plan.noparkinit_apply(os.environ) (1/true/on).
     SGLANG_WEG2_L15_NOPARK_INIT = EnvBool(False)
+    # L15-PARK-AFTER-FLUSH (desk 2023): the D sleep's release RPC ran the L15 park
+    # (park_at_release) BEFORE its own flush; on an idle D the front's /flush_cache
+    # answers WEG2-FLUSH-NONBLOCK quiesced (no retain), the retain runs only in the
+    # release RPC's flush -> at park time there is no manifest ("no manifest on this
+    # rank") and nothing parks (7 of 9 sleeps in the 18:35Z short run). On (with
+    # SGLANG_WEG2_L15=1 + the park itself on, group D, not --dual-layout): the park runs
+    # AFTER _weg2_sleep_flush(), still before the kv pause. Default off = the old order
+    # byte for byte. Read through l15_plan.park_after_flush_active(os.environ).
+    SGLANG_WEG2_L15_PARK_AFTER_FLUSH = EnvBool(False)
+    # L15-TREE-CAND-DIAG (desk 2023): log-only. On: a rank whose TREE-CAND walk ends with
+    # local=0 or agreed=0 logs one L15-TREE-CAND-LOSS line counting its device tips per
+    # reason of loss (no mamba host row / no KV host row / no L2 shadow / chain does not
+    # compose). No collective, no behaviour change. Default off.
+    SGLANG_WEG2_L15_TREE_CAND_DIAG = EnvBool(False)
     # L15-POOL S4 (docs/L15-POOL-ENTWURF-1004.md sec 1.2/3.3/4.5/5.2 N4/7, KV AND
     # END anchor = a WHOLE request): part switch ON TOP of SGLANG_WEG2_L15_POOL and
     # SGLANG_WEG2_L15_POOL_S3 (S4 without them is refused by name,
