@@ -109,7 +109,10 @@ logger = logging.getLogger(__name__)
 #: The vote's own point-to-point stream.  NOT tag 0: that pair already carries
 #: the ``pp_typed_channel`` proxy/output messages, which are demultiplexed in
 #: band rather than by tag, so a standing frame there would misframe them.
-WEG2_VOTE_TAG = 1268
+#: int8abn-tod-1005: and NOT a small number either -- monitored_barrier on the
+#: same world cpu_group uses the collective counter as a raw p2p slot; a home
+#: receive outstanding while t1 == 1268 would swallow PP(last)'s barrier send.
+WEG2_VOTE_TAG = (1 << 30) + 1268
 
 #: One bounded step of the home receive per pass.  Small on purpose: this is a
 #: poll that must never become a wait (see the module docstring on why a
