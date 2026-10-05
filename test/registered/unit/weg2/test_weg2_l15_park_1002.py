@@ -56,7 +56,7 @@ class _World:
         self.calls = 0
 
     def a2a_for(self, rank):
-        def a2a(out, inp, osp, isp):
+        def a2a(out, inp, osp, isp, rows=None):
             self.posts[rank] = (out, inp, list(osp), list(isp))
             self.barrier.wait()
             if rank == 0:
